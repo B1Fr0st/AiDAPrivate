@@ -44,6 +44,9 @@ namespace camoufox {
 
 namespace {
 
+constexpr uint32_t kMinReadyBrowserProcessCount = 2;
+constexpr uint64_t kLaunchLateSuccessGraceMs = 8000;
+
 struct singleton_t
 {
     std::string                             session_id          = "default";
@@ -1985,6 +1988,11 @@ uint32_t browser_process_count_from_tree(const std::vector<process_tree_entry_t>
     return browser_count;
 }
 
+bool usable_browser_process_tree(const std::vector<process_tree_entry_t>& tree)
+{
+    return browser_process_count_from_tree(tree) >= kMinReadyBrowserProcessCount;
+}
+
 void populate_process_counts(bridge_status_t& s)
 {
     s.browser_instance_count = (s.browser_open && s.child_alive && s.child_pid != 0) ? 1u : 0u;
@@ -3287,6 +3295,8 @@ call_result_t call_with_deadline(const std::string& tool_name, const nlohmann::j
             bool page_verified = false;
             bool cleanup_pending = false;
             bool stop_requested = sg().stop_requested.load(std::memory_order_acquire);
+            uint32_t browser_processes = 0;
+            uint32_t child_processes = 0;
             const bool result_ok = r.success && !(r.data.is_object() && r.data.contains("error") && r.data["error"].is_string());
             if (result_ok)
             {
@@ -3295,10 +3305,13 @@ call_result_t call_with_deadline(const std::string& tool_name, const nlohmann::j
                 same_generation = sg().generation == generation;
                 same_child_pid = sg().child_pid == child_pid && child_pid != 0;
                 child_alive = same_child_pid && process_alive(child_pid);
+                const std::vector<process_tree_entry_t> health_tree = child_alive ? enumerate_process_tree(child_pid) : std::vector<process_tree_entry_t>();
+                child_processes = static_cast<uint32_t>(health_tree.size());
+                browser_processes = browser_process_count_from_tree(health_tree);
                 browser_open = sg().browser_open;
                 page_verified = sg().page_verified;
                 cleanup_pending = sg().cleanup_pending;
-                const bool health_ok = same_client && same_generation && same_child_pid && child_alive && browser_open && page_verified && !cleanup_pending && !stop_requested;
+                const bool health_ok = same_client && same_generation && same_child_pid && child_alive && browser_processes >= kMinReadyBrowserProcessCount && browser_open && page_verified && !cleanup_pending && !stop_requested;
                 if (health_ok)
                 {
                     if (r.data.is_object())
@@ -3310,11 +3323,13 @@ call_result_t call_with_deadline(const std::string& tool_name, const nlohmann::j
                     recovered = true;
                 }
             }
-            diag::log_tagged_fmt("camoufox", "call_worker_late_result_health request_id=%llu tool=%s generation=%llu child_pid=%lu success=%d recovered=%d same_client=%d same_generation=%d same_child_pid=%d child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d stop_requested=%d data_shape=%s",
+            diag::log_tagged_fmt("camoufox", "call_worker_late_result_health request_id=%llu tool=%s generation=%llu child_pid=%lu success=%d recovered=%d same_client=%d same_generation=%d same_child_pid=%d child_alive=%d child_processes=%u browser_processes=%u browser_open=%d page_verified=%d cleanup_pending=%d stop_requested=%d data_shape=%s",
                 static_cast<unsigned long long>(request_id), tool_name.c_str(),
                 static_cast<unsigned long long>(generation), static_cast<unsigned long>(child_pid),
                 result_ok ? 1 : 0, recovered ? 1 : 0, same_client ? 1 : 0, same_generation ? 1 : 0,
-                same_child_pid ? 1 : 0, child_alive ? 1 : 0, browser_open ? 1 : 0, page_verified ? 1 : 0,
+                same_child_pid ? 1 : 0, child_alive ? 1 : 0,
+                static_cast<unsigned>(child_processes), static_cast<unsigned>(browser_processes),
+                browser_open ? 1 : 0, page_verified ? 1 : 0,
                 cleanup_pending ? 1 : 0, stop_requested ? 1 : 0, json_shape(r.data).c_str());
             if (recovered)
                 publish_state(bridge_state_t::ready, {});
@@ -5087,7 +5102,10 @@ bool start_bridge(const launch_config_t& cfg)
     if (sg().state == bridge_state_t::ready && sg().client)
     {
         const bool child_alive = process_alive(sg().child_pid);
-        if (!is_driver_closed_error(sg().last_error) && sg().browser_open && sg().page_verified && sg().privacy_verified && child_alive)
+        const std::vector<process_tree_entry_t> ready_tree = child_alive ? enumerate_process_tree(sg().child_pid) : std::vector<process_tree_entry_t>();
+        const uint32_t ready_browser_processes = browser_process_count_from_tree(ready_tree);
+        const bool ready_process_tree = usable_browser_process_tree(ready_tree);
+        if (!is_driver_closed_error(sg().last_error) && sg().browser_open && sg().page_verified && sg().privacy_verified && child_alive && ready_process_tree)
         {
             const std::string mismatch_reason = privacy_relevant_launch_config_mismatch_reason(sg().active_cfg, effective_cfg);
             if (!mismatch_reason.empty())
@@ -5125,9 +5143,11 @@ bool start_bridge(const launch_config_t& cfg)
         }
         if (!ready_config_mismatch_handled)
         {
-            diag::log_tagged_fmt("camoufox", "start_bridge invalidating_unverified_ready generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d err=%s",
+            diag::log_tagged_fmt("camoufox", "start_bridge invalidating_unverified_ready generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d browser_processes=%u process_tree=%s err=%s",
                 static_cast<unsigned long long>(sg().generation), static_cast<unsigned long>(sg().child_pid),
                 static_cast<int>(child_alive), static_cast<int>(sg().browser_open), static_cast<int>(sg().page_verified),
+                static_cast<unsigned>(ready_browser_processes),
+                ready_tree.empty() ? "<empty>" : compact_process_tree(ready_tree).c_str(),
                 sg().last_error.c_str());
             auto stale_client = sg().client;
             const uint32_t stale_pid = sg().child_pid;
@@ -5686,6 +5706,37 @@ bool start_bridge(const launch_config_t& cfg)
                 [&launch_state]() { return launch_state->done; });
         }
         bool launch_done = launch_state->done;
+        if (!launch_done && !launch_cancelled_by_stop)
+        {
+            const uint32_t grace_pid = sg().child_pid;
+            const std::vector<process_tree_entry_t> grace_tree = grace_pid == 0 ? std::vector<process_tree_entry_t>() : enumerate_process_tree(grace_pid);
+            const uint32_t grace_browser_processes = browser_process_count_from_tree(grace_tree);
+            if (grace_pid != 0 && process_alive(grace_pid) && grace_browser_processes > 0)
+            {
+                const uint64_t grace_start_ms = now_ms();
+                diag::log_tagged_fmt("camoufox", "launch_browser late_success_grace_begin generation=%llu child_pid=%lu grace_ms=%llu child_processes=%u browser_processes=%u process_tree=%s",
+                    static_cast<unsigned long long>(start_generation),
+                    static_cast<unsigned long>(grace_pid),
+                    static_cast<unsigned long long>(kLaunchLateSuccessGraceMs),
+                    static_cast<unsigned>(grace_tree.size()),
+                    static_cast<unsigned>(grace_browser_processes),
+                    grace_tree.empty() ? "<empty>" : compact_process_tree(grace_tree).c_str());
+                while (!launch_state->done && !sg().stop_requested.load(std::memory_order_acquire) && now_ms() - grace_start_ms < kLaunchLateSuccessGraceMs)
+                {
+                    const uint64_t elapsed_grace = now_ms() - grace_start_ms;
+                    const uint64_t remaining_grace = elapsed_grace >= kLaunchLateSuccessGraceMs ? 0 : kLaunchLateSuccessGraceMs - elapsed_grace;
+                    launch_state->cv.wait_for(launch_lk, std::chrono::milliseconds(static_cast<int>(std::min<uint64_t>(remaining_grace, 250))),
+                        [&launch_state]() { return launch_state->done; });
+                }
+                launch_done = launch_state->done;
+                diag::log_tagged_fmt("camoufox", "launch_browser late_success_grace_end generation=%llu child_pid=%lu recovered=%d stop_requested=%d elapsed_ms=%llu",
+                    static_cast<unsigned long long>(start_generation),
+                    static_cast<unsigned long>(grace_pid),
+                    launch_done ? 1 : 0,
+                    sg().stop_requested.load(std::memory_order_acquire) ? 1 : 0,
+                    static_cast<unsigned long long>(now_ms() - grace_start_ms));
+            }
+        }
         if (!launch_done)
         {
             launch_state->cancelled = true;
@@ -6389,26 +6440,32 @@ bool is_ready()
         return false;
     }
     const bool child_alive = process_alive(sg().child_pid);
+    const std::vector<process_tree_entry_t> tree = child_alive ? enumerate_process_tree(sg().child_pid) : std::vector<process_tree_entry_t>();
+    const uint32_t browser_processes = browser_process_count_from_tree(tree);
+    const bool process_tree_ready = browser_processes >= kMinReadyBrowserProcessCount;
     bool ready = sg().state == bridge_state_t::ready &&
         sg().client != nullptr &&
         sg().browser_open &&
         sg().page_verified &&
         sg().privacy_verified &&
         child_alive &&
+        process_tree_ready &&
         !is_driver_closed_error(sg().last_error);
     if (sg().state == bridge_state_t::ready && !ready)
     {
         sg().state = bridge_state_t::error;
         if (sg().last_error.empty())
-            sg().last_error = "camoufox bridge readiness verification failed";
-        if (!child_alive || !sg().browser_open || !sg().page_verified || !sg().privacy_verified)
+            sg().last_error = child_alive && sg().browser_open && sg().page_verified && sg().privacy_verified && !process_tree_ready
+                ? "camoufox browser process tree degraded"
+                : "camoufox bridge readiness verification failed";
+        if (!child_alive || !sg().browser_open || !sg().page_verified || !sg().privacy_verified || !process_tree_ready)
             clear_page_state_locked();
     }
-    diag::log_tagged_fmt("camoufox", "is_ready result=%d state=%d generation=%llu client=%d browser_open=%d page_verified=%d privacy_verified=%d child_pid=%lu child_alive=%d err_len=%zu",
+    diag::log_tagged_fmt("camoufox", "is_ready result=%d state=%d generation=%llu client=%d browser_open=%d page_verified=%d privacy_verified=%d child_pid=%lu child_alive=%d child_processes=%u browser_processes=%u err_len=%zu",
         static_cast<int>(ready), static_cast<int>(sg().state), static_cast<unsigned long long>(sg().generation),
         static_cast<int>(sg().client != nullptr), static_cast<int>(sg().browser_open),
         static_cast<int>(sg().page_verified), static_cast<int>(sg().privacy_verified), static_cast<unsigned long>(sg().child_pid),
-        static_cast<int>(child_alive), sg().last_error.size());
+        static_cast<int>(child_alive), static_cast<unsigned>(tree.size()), static_cast<unsigned>(browser_processes), sg().last_error.size());
     return ready;
 }
 
@@ -6806,13 +6863,15 @@ bridge_status_t managed_status(const std::shared_ptr<managed_session_t>& session
     s.page_count = static_cast<uint32_t>(session->pages.size());
     s.session_count = managed_session_count();
     s.child_alive = process_alive(s.child_pid);
-    if (s.state == bridge_state_t::ready && (!s.child_alive || !s.browser_open || !s.page_verified || !s.privacy_verified))
+    populate_process_counts(s);
+    if (s.state == bridge_state_t::ready && (!s.child_alive || !s.browser_open || !s.page_verified || !s.privacy_verified || s.browser_process_count < kMinReadyBrowserProcessCount))
     {
         s.state = bridge_state_t::error;
         if (s.last_error.empty())
-            s.last_error = "camoufox managed session readiness verification failed";
+            s.last_error = s.child_alive && s.browser_open && s.page_verified && s.privacy_verified
+                ? "camoufox managed browser process tree degraded"
+                : "camoufox managed session readiness verification failed";
     }
-    populate_process_counts(s);
     return s;
 }
 
@@ -6840,15 +6899,21 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
     }
     std::shared_ptr<mcp_client::client_t> stale_reuse_client;
     uint32_t stale_reuse_pid = 0;
+    std::string stale_reuse_cleanup_reason;
     {
         std::lock_guard<std::recursive_mutex> lk(session->mtx);
-        if (session->state == bridge_state_t::ready && session->client && session->browser_open && session->page_verified && session->privacy_verified && process_alive(session->child_pid))
+        const bool child_alive = process_alive(session->child_pid);
+        const std::vector<process_tree_entry_t> ready_tree = child_alive ? enumerate_process_tree(session->child_pid) : std::vector<process_tree_entry_t>();
+        const uint32_t ready_browser_processes = browser_process_count_from_tree(ready_tree);
+        const bool ready_process_tree = ready_browser_processes >= kMinReadyBrowserProcessCount;
+        if (session->state == bridge_state_t::ready && session->client && session->browser_open && session->page_verified && session->privacy_verified && child_alive && ready_process_tree)
         {
             const std::string mismatch_reason = privacy_relevant_launch_config_mismatch_reason(session->active_cfg, effective_cfg);
             if (!mismatch_reason.empty())
             {
                 stale_reuse_client = session->client;
                 stale_reuse_pid = session->child_pid;
+                stale_reuse_cleanup_reason = std::string("managed_start_config_mismatch_") + sid;
                 session->client.reset();
                 session->child_pid = 0;
                 session->browser_open = false;
@@ -6872,9 +6937,32 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
                 return true;
             }
         }
+        else if (session->state == bridge_state_t::ready && session->client)
+        {
+            const bool stale_browser_open = session->browser_open;
+            const bool stale_page_verified = session->page_verified;
+            stale_reuse_client = session->client;
+            stale_reuse_pid = session->child_pid;
+            stale_reuse_cleanup_reason = std::string("managed_start_invalid_ready_") + sid;
+            session->client.reset();
+            session->child_pid = 0;
+            session->browser_open = false;
+            session->page_verified = false;
+            session->pages.clear();
+            clear_privacy_locked(*session);
+            session->active_page_id.clear();
+            session->active_page_url.clear();
+            session->active_page_title.clear();
+            session->last_error.clear();
+            diag::log_tagged_fmt("camoufox", "managed_start invalidating_unverified_ready session_id=%s child_pid=%lu child_alive=%d browser_open=%d page_verified=%d browser_processes=%u process_tree=%s",
+                sid.c_str(), static_cast<unsigned long>(stale_reuse_pid),
+                static_cast<int>(child_alive), static_cast<int>(stale_browser_open),
+                static_cast<int>(stale_page_verified), static_cast<unsigned>(ready_browser_processes),
+                ready_tree.empty() ? "<empty>" : compact_process_tree(ready_tree).c_str());
+        }
     }
     if (stale_reuse_pid != 0)
-        terminate_process_tree_sync(stale_reuse_pid, std::string("managed_start_config_mismatch_") + sid);
+        terminate_process_tree_sync(stale_reuse_pid, stale_reuse_cleanup_reason.empty() ? std::string("managed_start_stale_ready_") + sid : stale_reuse_cleanup_reason);
     if (stale_reuse_client)
         stale_reuse_client->disconnect();
     std::string python_path = effective_cfg.python_executable;
@@ -7608,6 +7696,7 @@ bridge_status_t get_status()
     s.last_cleanup_ms = sg().last_cleanup_ms;
     s.last_verified_ms = sg().last_verified_ms;
     s.child_alive     = process_alive(s.child_pid);
+    populate_process_counts(s);
     if (s.state == bridge_state_t::ready && is_driver_closed_error(s.last_error))
     {
         s.state = bridge_state_t::error;
@@ -7638,7 +7727,22 @@ bridge_status_t get_status()
         if (s.last_error.empty())
             s.last_error = "camoufox bridge readiness verification failed";
     }
-    populate_process_counts(s);
+    if (s.state == bridge_state_t::ready && s.browser_process_count < kMinReadyBrowserProcessCount)
+    {
+        s.state = bridge_state_t::error;
+        s.browser_open = false;
+        s.active_page_id.clear();
+        s.active_page_url.clear();
+        s.active_page_title.clear();
+        s.pages.clear();
+        s.page_count = 0;
+        s.active_profile_dir.clear();
+        s.active_profile_generated = false;
+        s.privacy_verified = false;
+        s.page_verified = false;
+        if (s.last_error.empty())
+            s.last_error = "camoufox browser process tree degraded";
+    }
     const url_log_t u = summarize_url_for_log(s.active_page_url);
     diag::log_tagged_fmt("camoufox", "get_status session_id=%s state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d calls=%llu errors=%llu profile_dir=%s profile_generated=%d active_page_id=%s page_count=%u browser_instances=%u child_processes=%u browser_processes=%u ua_policy=%s ua_override=%d webrtc_blocked=%d active_host=%s active_path=%s query=%d url_len=%zu title_len=%zu",
         s.session_id.c_str(),

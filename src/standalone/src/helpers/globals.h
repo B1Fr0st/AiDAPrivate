@@ -429,6 +429,7 @@ namespace license
 {
 	inline bool  validated       = false;
 	inline bool  checking        = false;
+	inline std::atomic<bool> activation_worker_active{false};
 	inline bool  check_failed    = false;
 	inline char  key_buf[128]    = {};
 	inline std::string error_msg;

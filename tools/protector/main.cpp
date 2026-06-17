@@ -1296,6 +1296,35 @@ inline int run(const config_t& cfg) {
         return 3;
     }
 
+    if (opt.llm_poison) {
+        protector::llm_poison::page_lure_result_t page_lures =
+            protector::llm_poison::inject_page_lures(pe, result.seed_used ^ 0xA1DA91F00D32A1DAull);
+        const uint32_t expected_poison_refs =
+            protector::llm_poison::detail::k_visible_poison_count +
+            protector::llm_poison::detail::k_spread_poison_count;
+        if (!page_lures.applied ||
+            page_lures.records_embedded == 0u ||
+            page_lures.covered_sections == 0u ||
+            page_lures.poison_refs < expected_poison_refs ||
+            page_lures.ascii_records != page_lures.records_embedded ||
+            page_lures.utf16_records != page_lures.records_embedded ||
+            static_cast<uint64_t>(page_lures.structured_records) < static_cast<uint64_t>(page_lures.records_embedded) * 2ull) {
+            const char* poison_error = protector::llm_poison::last_error();
+            std::fprintf(stderr,
+                         "[!] llm_poison .aipg injection failed: applied=%d records=%u sections=%u ascii=%u utf16=%u structured=%u poison_refs=%u/%u error=%s\n",
+                         page_lures.applied ? 1 : 0,
+                         page_lures.records_embedded,
+                         page_lures.covered_sections,
+                         page_lures.ascii_records,
+                         page_lures.utf16_records,
+                         page_lures.structured_records,
+                         page_lures.poison_refs,
+                         expected_poison_refs,
+                         (poison_error != nullptr && poison_error[0] != '\0') ? poison_error : "count contract not satisfied");
+            return 3;
+        }
+    }
+
     try {
         pe_file::recalculate_headers(pe);
     } catch (const std::bad_alloc&) {

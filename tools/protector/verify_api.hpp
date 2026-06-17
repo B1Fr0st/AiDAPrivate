@@ -117,6 +117,10 @@ inline bool is_function_lure_section_name(const char* name) {
     return name != nullptr && std::strcmp(name, ".aifn") == 0;
 }
 
+inline bool is_page_lure_section_name(const char* name) {
+    return name != nullptr && std::strcmp(name, ".aipg") == 0;
+}
+
 inline uint32_t read_u32_le(const std::vector<uint8_t>& data, size_t offset) {
     if (offset + 4u > data.size()) { return 0u; }
     return static_cast<uint32_t>(data[offset]) |
@@ -342,6 +346,7 @@ inline probe_result_t probe_p03(const context_t& c) {
         if (std::strcmp(nm, ".gehi") == 0 || std::strcmp(nm, ".epheme") == 0 || std::strcmp(nm, ".rdiag") == 0) { continue; }
         if (is_spread_ai_section_name(nm)) { continue; }
         if (is_function_lure_section_name(nm)) { continue; }
+        if (is_page_lure_section_name(nm)) { continue; }
         if (std::strcmp(nm, ".dseal") == 0 || std::strcmp(nm, ".dthunk") == 0) { continue; }
         if (std::strcmp(nm, ".licbind") == 0 || std::strcmp(nm, ".feat") == 0) { continue; }
         if (std::strcmp(nm, ".aidashr") == 0) { continue; }
@@ -1465,6 +1470,330 @@ inline probe_result_t probe_p31(const context_t& c) {
     return { "P31", ".aifn anti-AI function lure coverage", ok, buf };
 }
 
+inline probe_result_t probe_p32(const context_t& c) {
+    bool llm_declared = c.aux_found && ((c.aux.phase_flags & 0x200u) != 0u);
+    if (!llm_declared) {
+        return { "P32", ".aipg anti-AI readable page lure coverage (INFO: llm_poison bit not set)",
+                 true, "skipped" };
+    }
+    const pe_file::section_t* aipg = nullptr;
+    size_t aipg_count = 0u;
+    for (const auto& s : c.pe.sections) {
+        char nm[9] = {};
+        section_name_cstr(s.name, nm);
+        if (std::strcmp(nm, ".aipg") == 0) {
+            aipg = &s;
+            ++aipg_count;
+        }
+    }
+    if (aipg_count != 1u || aipg == nullptr) {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), "aipg_count=%zu", aipg_count);
+        return { "P32", ".aipg anti-AI readable page lure coverage", false, buf };
+    }
+    const size_t payload_size = (aipg->virtual_size != 0u && aipg->virtual_size <= aipg->data.size())
+        ? static_cast<size_t>(aipg->virtual_size)
+        : aipg->data.size();
+    const bool chars_ok = poison_section_characteristics_ok(*aipg);
+    const bool header_min_ok = payload_size >= protector::llm_poison::detail::k_aipg_header_size;
+    const uint32_t magic = read_u32_le(aipg->data, 0u);
+    const uint32_t version = read_u32_le(aipg->data, 4u);
+    const uint32_t header_size = read_u32_le(aipg->data, 8u);
+    const uint32_t record_size = read_u32_le(aipg->data, 12u);
+    const uint64_t seed = read_u64_le(aipg->data, 16u);
+    const uint64_t image_base = read_u64_le(aipg->data, 24u);
+    const uint32_t image_size = read_u32_le(aipg->data, 32u);
+    const uint32_t record_count = read_u32_le(aipg->data, 36u);
+    const uint32_t record_table_offset = read_u32_le(aipg->data, 40u);
+    const uint32_t string_pool_offset = read_u32_le(aipg->data, 44u);
+    const uint32_t string_pool_size = read_u32_le(aipg->data, 48u);
+    const uint32_t content_hash = read_u32_le(aipg->data, 52u);
+    const uint32_t covered_sections = read_u32_le(aipg->data, 56u);
+    const uint32_t poison_ref_count = read_u32_le(aipg->data, 60u);
+    const uint32_t page_size_decl = read_u32_le(aipg->data, 64u);
+    const uint32_t ascii_count = read_u32_le(aipg->data, 68u);
+    const uint32_t utf16_count = read_u32_le(aipg->data, 72u);
+    const uint32_t structured_count = read_u32_le(aipg->data, 76u);
+    const bool header_ok = header_min_ok &&
+        magic == protector::llm_poison::detail::k_aipg_magic &&
+        version == protector::llm_poison::detail::k_aipg_version &&
+        header_size == protector::llm_poison::detail::k_aipg_header_size &&
+        record_size == protector::llm_poison::detail::k_aipg_record_size &&
+        seed != 0ull &&
+        image_base == c.pe.optional_header.ImageBase &&
+        image_size != 0u &&
+        image_size <= c.pe.optional_header.SizeOfImage &&
+        page_size_decl == protector::llm_poison::detail::k_aipg_page_size;
+    const uint64_t record_table_bytes = static_cast<uint64_t>(record_count) * record_size;
+    const bool table_ok = record_count != 0u &&
+        record_size == protector::llm_poison::detail::k_aipg_record_size &&
+        range_within(record_table_offset, record_table_bytes, payload_size);
+    const bool pool_ok = string_pool_size != 0u &&
+        range_within(string_pool_offset, string_pool_size, payload_size) &&
+        static_cast<uint64_t>(string_pool_offset) >= static_cast<uint64_t>(record_table_offset) + record_table_bytes;
+    bool hash_ok = false;
+    if (payload_size >= protector::llm_poison::detail::k_aipg_header_size && content_hash != 0u) {
+        std::vector<uint8_t> tmp(aipg->data.begin(), aipg->data.begin() + payload_size);
+        tmp[52] = 0u;
+        tmp[53] = 0u;
+        tmp[54] = 0u;
+        tmp[55] = 0u;
+        uint32_t computed = fnv1a32_bytes(tmp.data(), tmp.size());
+        if (computed == 0u) { computed = 0xA1F00D32u; }
+        hash_ok = computed == content_hash;
+    }
+    auto section_virtual_span = [](const pe_file::section_t& sec) -> uint32_t {
+        return sec.virtual_size != 0u ? sec.virtual_size : sec.raw_size;
+    };
+    auto target_section_ok = [](const pe_file::section_t& sec) -> bool {
+        char nm[9] = {};
+        section_name_cstr(sec.name, nm);
+        return (sec.characteristics & IMAGE_SCN_MEM_READ) != 0u &&
+            (sec.characteristics & IMAGE_SCN_MEM_DISCARDABLE) == 0u &&
+            std::strcmp(nm, ".rdiag") != 0 &&
+            !is_spread_ai_section_name(nm) &&
+            !is_function_lure_section_name(nm) &&
+            !is_page_lure_section_name(nm);
+    };
+    struct expected_page_t {
+        uint32_t section_index;
+        uint32_t section_rva;
+        uint32_t page_rva;
+        uint32_t page_size;
+        uint32_t characteristics;
+        char section_name[9];
+    };
+    std::vector<expected_page_t> expected;
+    uint32_t expected_section_count = 0u;
+    bool expected_ok = true;
+    for (uint32_t i = 0u; i < static_cast<uint32_t>(c.pe.sections.size()); ++i) {
+        const auto& sec = c.pe.sections[i];
+        if (!target_section_ok(sec)) { continue; }
+        const uint32_t span = section_virtual_span(sec);
+        if (span == 0u) { continue; }
+        const uint64_t sec_start = sec.virtual_address;
+        const uint64_t sec_end = sec_start + static_cast<uint64_t>(span);
+        if (sec_end > 0xFFFFFFFFull) {
+            expected_ok = false;
+            break;
+        }
+        ++expected_section_count;
+        for (uint64_t page = sec_start; page < sec_end; page += protector::llm_poison::detail::k_aipg_page_size) {
+            const uint64_t remaining = sec_end - page;
+            expected_page_t e{};
+            e.section_index = i;
+            e.section_rva = sec.virtual_address;
+            e.page_rva = static_cast<uint32_t>(page);
+            e.page_size = static_cast<uint32_t>(remaining < protector::llm_poison::detail::k_aipg_page_size ? remaining : protector::llm_poison::detail::k_aipg_page_size);
+            e.characteristics = sec.characteristics;
+            section_name_cstr(sec.name, e.section_name);
+            expected.push_back(e);
+        }
+    }
+    std::sort(expected.begin(), expected.end(), [](const expected_page_t& a, const expected_page_t& b) {
+        if (a.section_index != b.section_index) { return a.section_index < b.section_index; }
+        return a.page_rva < b.page_rva;
+    });
+    const bool count_header_ok = expected_ok &&
+        record_count == expected.size() &&
+        covered_sections == expected_section_count &&
+        poison_ref_count >= protector::llm_poison::detail::k_visible_poison_count +
+            protector::llm_poison::detail::k_spread_poison_count &&
+        ascii_count == record_count &&
+        utf16_count == record_count &&
+        static_cast<uint64_t>(structured_count) >= static_cast<uint64_t>(record_count) * 2ull;
+    auto cstr_ok = [&](uint32_t offset) -> bool {
+        if (!pool_ok || offset < string_pool_offset) { return false; }
+        uint64_t pool_end64 = static_cast<uint64_t>(string_pool_offset) + string_pool_size;
+        if (offset >= pool_end64 || offset >= payload_size) { return false; }
+        const size_t pool_end = static_cast<size_t>((pool_end64 < payload_size) ? pool_end64 : payload_size);
+        for (size_t i = offset; i < pool_end; ++i) {
+            if (aipg->data[i] == 0u) { return i > offset; }
+        }
+        return false;
+    };
+    auto cstr_equals = [&](uint32_t offset, const char* text) -> bool {
+        if (!cstr_ok(offset)) { return false; }
+        const uint8_t* p = aipg->data.data() + offset;
+        size_t i = 0u;
+        while (text[i] != '\0') {
+            if (offset + i >= payload_size || p[i] != static_cast<uint8_t>(text[i])) { return false; }
+            ++i;
+        }
+        return offset + i < payload_size && p[i] == 0u;
+    };
+    auto cstr_contains = [&](uint32_t offset, const char* text) -> bool {
+        if (!cstr_ok(offset)) { return false; }
+        const size_t needle_len = std::strlen(text);
+        if (needle_len == 0u) { return true; }
+        uint64_t pool_end64 = static_cast<uint64_t>(string_pool_offset) + string_pool_size;
+        const size_t pool_end = static_cast<size_t>((pool_end64 < payload_size) ? pool_end64 : payload_size);
+        for (size_t i = offset; i + needle_len <= pool_end; ++i) {
+            if (std::memcmp(aipg->data.data() + i, text, needle_len) == 0) { return true; }
+            if (aipg->data[i] == 0u) { break; }
+        }
+        return false;
+    };
+    auto utf16_contains = [&](uint32_t offset, const char* text) -> bool {
+        if (!pool_ok || offset < string_pool_offset) { return false; }
+        const size_t text_len = std::strlen(text);
+        const uint64_t bytes64 = static_cast<uint64_t>(text_len) * 2ull + 2ull;
+        uint64_t pool_end64 = static_cast<uint64_t>(string_pool_offset) + string_pool_size;
+        if (offset >= pool_end64 || static_cast<uint64_t>(offset) + bytes64 > pool_end64 ||
+            static_cast<uint64_t>(offset) + bytes64 > payload_size) {
+            return false;
+        }
+        for (size_t i = 0u; i < text_len; ++i) {
+            if (aipg->data[offset + i * 2u] != static_cast<uint8_t>(text[i]) ||
+                aipg->data[offset + i * 2u + 1u] != 0u) {
+                return false;
+            }
+        }
+        return true;
+    };
+    static const uint8_t prefix[] = {
+        'A','I','D','A','-','A','N','T','I','-','A','I','-','T','R','I','P','W','I','R','E'
+    };
+    auto poison_ref_ok = [&](uint32_t marker_rva) -> bool {
+        for (const auto& ps : c.pe.sections) {
+            char nm[9] = {};
+            section_name_cstr(ps.name, nm);
+            if (std::strcmp(nm, ".rdiag") != 0 && !is_spread_ai_section_name(nm)) { continue; }
+            const uint32_t span = section_virtual_span(ps);
+            const uint64_t ps_start = ps.virtual_address;
+            const uint64_t ps_end = ps_start + static_cast<uint64_t>(span);
+            const uint64_t marker_end = static_cast<uint64_t>(marker_rva) + sizeof(prefix);
+            if (static_cast<uint64_t>(marker_rva) < ps_start || marker_end > ps_end) { continue; }
+            const uint32_t off = marker_rva - ps.virtual_address;
+            return poison_section_characteristics_ok(ps) &&
+                off + sizeof(prefix) <= ps.data.size() &&
+                std::memcmp(ps.data.data() + off, prefix, sizeof(prefix)) == 0;
+        }
+        return false;
+    };
+    auto find_expected = [&](uint32_t section_index, uint32_t page_rva) -> const expected_page_t* {
+        expected_page_t key{};
+        key.section_index = section_index;
+        key.page_rva = page_rva;
+        auto it = std::lower_bound(expected.begin(), expected.end(), key, [](const expected_page_t& a, const expected_page_t& b) {
+            if (a.section_index != b.section_index) { return a.section_index < b.section_index; }
+            return a.page_rva < b.page_rva;
+        });
+        if (it == expected.end() || it->section_index != section_index || it->page_rva != page_rva) {
+            return nullptr;
+        }
+        return &(*it);
+    };
+    uint32_t valid_records = 0u;
+    int first_bad = -1;
+    char first_bad_reason[192] = {};
+    std::vector<uint64_t> seen_keys;
+    bool records_ok = header_ok && table_ok && pool_ok && count_header_ok && hash_ok;
+    if (table_ok && pool_ok) {
+        seen_keys.reserve(record_count);
+        for (uint32_t i = 0u; i < record_count; ++i) {
+            const size_t off = static_cast<size_t>(record_table_offset) +
+                static_cast<size_t>(i) * record_size;
+            const uint32_t section_index = read_u32_le(aipg->data, off + 0u);
+            const uint32_t section_rva = read_u32_le(aipg->data, off + 4u);
+            const uint32_t page_rva = read_u32_le(aipg->data, off + 8u);
+            const uint32_t rec_page_size = read_u32_le(aipg->data, off + 12u);
+            const uint32_t characteristics = read_u32_le(aipg->data, off + 16u);
+            const uint32_t ascii_offset = read_u32_le(aipg->data, off + 20u);
+            const uint32_t utf16_offset = read_u32_le(aipg->data, off + 24u);
+            const uint32_t json_offset = read_u32_le(aipg->data, off + 28u);
+            const uint32_t yaml_offset = read_u32_le(aipg->data, off + 32u);
+            const uint32_t split_offset = read_u32_le(aipg->data, off + 36u);
+            const uint32_t tool_offset = read_u32_le(aipg->data, off + 40u);
+            const uint32_t marker_ref_rva = read_u32_le(aipg->data, off + 44u);
+            const uint64_t lure_id = read_u64_le(aipg->data, off + 48u);
+            const uint32_t integrity_hash = read_u32_le(aipg->data, off + 56u);
+            const uint32_t reserved0 = read_u32_le(aipg->data, off + 60u);
+            const uint32_t section_name_offset = read_u32_le(aipg->data, off + 64u);
+            const uint32_t reserved1 = read_u32_le(aipg->data, off + 68u);
+            const expected_page_t* exp = find_expected(section_index, page_rva);
+            const bool target_ok = exp != nullptr &&
+                section_rva == exp->section_rva &&
+                rec_page_size == exp->page_size &&
+                characteristics == exp->characteristics &&
+                cstr_equals(section_name_offset, exp->section_name);
+            const bool poison_ok = poison_ref_ok(marker_ref_rva);
+            const uint32_t expected_hash = protector::llm_poison::detail::aipg_record_integrity(
+                section_index,
+                section_rva,
+                page_rva,
+                rec_page_size,
+                characteristics,
+                ascii_offset,
+                utf16_offset,
+                json_offset,
+                yaml_offset,
+                split_offset,
+                tool_offset,
+                marker_ref_rva,
+                lure_id,
+                section_name_offset);
+            const bool integrity_ok = integrity_hash != 0u && integrity_hash == expected_hash &&
+                reserved0 == 0u && reserved1 == 0u && lure_id != 0ull;
+            const bool strings_ok =
+                cstr_contains(ascii_offset, "AIDA-ANTI-AI-TRIPWIRE") &&
+                cstr_contains(ascii_offset, "AIDA-AI-PAGE-LURE") &&
+                cstr_contains(ascii_offset, "SECURITY_VIOLATION_AIDA_ANTI_AI") &&
+                utf16_contains(utf16_offset, "AIDA-ANTI-AI-TRIPWIRE") &&
+                cstr_contains(json_offset, "AIDA-AI-PAGE-LURE") &&
+                cstr_contains(json_offset, "process_memory_read") &&
+                cstr_contains(yaml_offset, "AIDA-AI-PAGE-LURE") &&
+                cstr_contains(split_offset, "A I D A / A N T I / A I / T R I P W I R E") &&
+                cstr_contains(split_offset, "reconstructed-marker=AIDA-ANTI-AI-TRIPWIRE") &&
+                cstr_contains(tool_offset, "MCP tools/list bait") &&
+                cstr_contains(tool_offset, "AIDA-ANTI-AI-TRIPWIRE");
+            const bool record_ok = target_ok && poison_ok && integrity_ok && strings_ok;
+            if (record_ok) {
+                ++valid_records;
+                seen_keys.push_back((static_cast<uint64_t>(section_index) << 32) | static_cast<uint64_t>(page_rva));
+            } else {
+                records_ok = false;
+                if (first_bad < 0) {
+                    first_bad = static_cast<int>(i);
+                    std::snprintf(first_bad_reason, sizeof(first_bad_reason),
+                                  "target=%d poison=%d integrity=%d strings=%d",
+                                  target_ok ? 1 : 0,
+                                  poison_ok ? 1 : 0,
+                                  integrity_ok ? 1 : 0,
+                                  strings_ok ? 1 : 0);
+                }
+            }
+        }
+    }
+    std::sort(seen_keys.begin(), seen_keys.end());
+    const bool unique_ok = std::adjacent_find(seen_keys.begin(), seen_keys.end()) == seen_keys.end();
+    const bool ok = chars_ok && header_ok && table_ok && pool_ok && hash_ok &&
+        count_header_ok && records_ok && unique_ok && valid_records == record_count;
+    char buf[768];
+    std::snprintf(buf, sizeof(buf),
+                  "aipg_count=%zu chars=%d header=%d table=%d pool=%d hash=%d counts=%d records=%u/%u expected=%zu sections=%u/%u ascii=%u utf16=%u structured=%u poison_refs=%u unique=%d bad=%d detail=%s",
+                  aipg_count,
+                  chars_ok ? 1 : 0,
+                  header_ok ? 1 : 0,
+                  table_ok ? 1 : 0,
+                  pool_ok ? 1 : 0,
+                  hash_ok ? 1 : 0,
+                  count_header_ok ? 1 : 0,
+                  valid_records,
+                  record_count,
+                  expected.size(),
+                  covered_sections,
+                  expected_section_count,
+                  ascii_count,
+                  utf16_count,
+                  structured_count,
+                  poison_ref_count,
+                  unique_ok ? 1 : 0,
+                  first_bad,
+                  first_bad_reason[0] != '\0' ? first_bad_reason : "none");
+    return { "P32", ".aipg anti-AI readable page lure coverage", ok, buf };
+}
+
 inline verify_report_t run_probes(const context_t& c) {
     probe_result_t (*probes[])(const context_t&) = {
         probe_p01, probe_p02, probe_p03, probe_p04, probe_p05,
@@ -1472,7 +1801,7 @@ inline verify_report_t run_probes(const context_t& c) {
         probe_p11, probe_p12, probe_p13,
         probe_p14, probe_p15, probe_p16, probe_p17, probe_p18, probe_p19, probe_p20,
         probe_p21, probe_p22, probe_p23, probe_p24, probe_p25, probe_p26, probe_p27,
-        probe_p28, probe_p29, probe_p30, probe_p31
+        probe_p28, probe_p29, probe_p30, probe_p31, probe_p32
     };
     verify_report_t rep;
     for (auto fn : probes) {

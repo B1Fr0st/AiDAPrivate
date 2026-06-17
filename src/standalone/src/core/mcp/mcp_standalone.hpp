@@ -78,6 +78,7 @@ namespace mcp_standalone
         bool is_running() const { return _running.load(); }
         int  get_port() const { return _port; }
         bool register_tool(tool_def_t tool);
+        tool_result_t call_registered_tool(const std::string& name, const json& arguments, bool external_visible_only);
         tool_result_t describe_tools(const json& params);
         void write_client_configs() const;
         const std::vector<tool_def_t>& get_tools() const { return _tools; }

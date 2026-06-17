@@ -26,6 +26,7 @@ struct request_t {
     std::vector<std::pair<std::wstring, std::wstring>> headers;
     std::vector<uint8_t> body;
     uint32_t timeout_ms = 15000u;
+    size_t max_response_body_bytes = 16u * 1024u * 1024u;
 };
 
 struct response_t {

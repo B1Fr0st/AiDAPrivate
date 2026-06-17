@@ -1464,6 +1464,7 @@ struct section_skip_list {
             || name_equals(name, ".epheme")
             || name_equals(name, ".rdiag")
             || name_equals(name, ".aifn")
+            || name_equals(name, ".aipg")
             || is_ai_poison(name)
             || name_equals(name, ".dseal")
             || name_equals(name, ".dthunk")

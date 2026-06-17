@@ -2516,6 +2516,7 @@ set(AIDA_HEADERS
     src/aida_pro.hpp
     src/analysis_db.hpp
     src/anti_re.hpp
+    src/game_stealth.hpp
     src/graphrag.hpp
     src/ida_utils.hpp
     src/instance_registry.hpp
@@ -3071,7 +3072,7 @@ if(BUILD_PROTECTOR)
                          --output ${CMAKE_BINARY_DIR}/Release/protector_report.json
                          --protector $<TARGET_FILE:AiDAProtector>)
         set_tests_properties(protector_full_matrix PROPERTIES
-            PASS_REGULAR_EXPRESSION "\"probes_passed\": 31")
+            PASS_REGULAR_EXPRESSION "\"probes_passed\": 32")
     endif()
 
     option(BUILD_WBAES_TEST "Build white-box AES-128 self-test executable" ON)

@@ -1901,6 +1901,8 @@ static SimpleHttpResponse raw_https_request(
     req.method = verb ? verb : "GET";
     req.timeout_ms = static_cast<uint32_t>((timeout_sec > 0 ? timeout_sec : 15) * 1000);
     req.body.assign(req_body.begin(), req_body.end());
+    if (req.path == L"/api/download/arc/pages/bulk")
+        req.max_response_body_bytes = 64u * 1024u * 1024u;
 
     bool has_content_type = false;
     for (const auto& kv : extra_headers)
@@ -9457,6 +9459,11 @@ namespace standalone_license
             && arc_grace_remaining_ms() != 0)
             return true;
         return false;
+    }
+
+    bool is_arc_transfer_in_progress()
+    {
+        return s_arc_download_in_progress.load(std::memory_order_acquire);
     }
 
     bool validate_arc_required_exports(std::string& missing_out)

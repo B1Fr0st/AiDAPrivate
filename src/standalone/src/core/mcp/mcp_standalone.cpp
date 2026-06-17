@@ -16,6 +16,7 @@
 #include "sandbox.hpp"
 #include "../infra/critical_work_queue.hpp"
 #include "../infra/work_queue.hpp"
+#include "../runtime/manual_map_tls.hpp"
 #include "../session/analysis_session.hpp"
 #include "../../helpers/diag_log.hpp"
 #include <httplib.h>
@@ -34,6 +35,7 @@
 #include <exception>
 #include <memory>
 #include <map>
+#include <shared_mutex>
 #include <thread>
 
 namespace mcp_standalone
@@ -41,11 +43,15 @@ namespace mcp_standalone
 namespace
 {
     std::atomic<bool> g_ide_lifecycle_ready{false};
-    constexpr size_t kMcpHttpMaxQueuedRequests = 256;
-    constexpr int kMcpMaxConcurrentStreams = 8;
+    constexpr size_t kMcpHttpWorkerThreads = 48;
+    constexpr size_t kMcpHttpMaxQueuedRequests = 1024;
+    constexpr size_t kMcpBatchWorkerThreads = 48;
+    constexpr size_t kMcpBatchMaxQueuedRequests = 2048;
+    constexpr int kMcpMaxConcurrentStreams = 16;
     constexpr DWORD kSseSessionMaxAgeMs = 60u * 60u * 1000u;
     std::atomic<std::uint64_t> g_http_request_seq{0};
     std::atomic<int> g_active_http_requests{0};
+    std::atomic<std::uint64_t> g_mcp_batch_seq{0};
     std::atomic<std::uint64_t> g_stream_seq{0};
     std::atomic<int> g_active_streams{0};
     std::atomic<size_t> g_cached_external_tool_count{0};
@@ -115,6 +121,21 @@ namespace
 
     static void log_work_queue_stats(const char* context)
     {
+        const auto general = work_queue::stats();
+        diag::log_tagged_fmt("mcp_srv",
+            "%s work_queue alive=%d shutting_down=%d pool_size=%d workers=%zu pending=%zu active=%u post_attempts=%llu posted=%llu rejected=%llu started=%llu finished=%llu",
+            context ? context : "work_queue",
+            general.alive ? 1 : 0,
+            general.shutting_down ? 1 : 0,
+            general.pool_size,
+            general.workers,
+            general.pending,
+            static_cast<unsigned>(general.active),
+            static_cast<unsigned long long>(general.post_attempts),
+            static_cast<unsigned long long>(general.posted),
+            static_cast<unsigned long long>(general.rejected),
+            static_cast<unsigned long long>(general.started),
+            static_cast<unsigned long long>(general.finished));
         const auto st = critical_work_queue::stats();
         diag::log_tagged_fmt("mcp_srv",
             "%s critical_queue alive=%d shutting_down=%d pool_size=%d workers=%zu pending=%zu active=%u post_attempts=%llu posted=%llu rejected=%llu started=%llu finished=%llu",
@@ -147,100 +168,312 @@ namespace
             static_cast<unsigned long long>(svc.finished));
     }
 
-    class work_queue_task_queue final : public httplib::TaskQueue
+    class mcp_owned_executor_t
     {
     public:
-        explicit work_queue_task_queue(std::size_t max_queued_requests)
-            : _max_queued_requests(max_queued_requests)
-            , _state(std::make_shared<state_t>())
+        mcp_owned_executor_t(const char* name, std::size_t worker_count, std::size_t max_queued_requests)
+            : _name(name ? name : "mcp_executor")
+            , _worker_count(worker_count)
+            , _max_queued_requests(max_queued_requests)
         {
-            log_work_queue_stats("http_task_queue create");
+            diag::log_tagged_fmt("mcp_srv",
+                "mcp_executor_config name=%s workers=%zu max_queue=%zu",
+                _name.c_str(),
+                _worker_count,
+                _max_queued_requests);
+            start_workers();
+        }
+
+        mcp_owned_executor_t(const mcp_owned_executor_t&) = delete;
+        mcp_owned_executor_t& operator=(const mcp_owned_executor_t&) = delete;
+
+        ~mcp_owned_executor_t()
+        {
+            shutdown();
+        }
+
+        bool enqueue(std::function<void()> fn)
+        {
+            if (!fn) {
+                _rejected.fetch_add(1u, std::memory_order_acq_rel);
+                return false;
+            }
+
+            task_t task;
+            task.fn = std::move(fn);
+            task.queued_at = mcp_now_ms();
+            task.seq = _enqueued.fetch_add(1u, std::memory_order_acq_rel) + 1u;
+
+            {
+                std::lock_guard<std::mutex> lk(_mtx);
+                if (_shutdown.load(std::memory_order_acquire) || _workers.empty()) {
+                    _rejected.fetch_add(1u, std::memory_order_acq_rel);
+                    diag::log_tagged_fmt("mcp_srv",
+                        "mcp_executor_enqueue_rejected name=%s reason=%s workers=%zu queued=%zu active=%u",
+                        _name.c_str(),
+                        _shutdown.load(std::memory_order_acquire) ? "shutdown" : "no_workers",
+                        _workers.size(),
+                        _jobs.size(),
+                        static_cast<unsigned>(_active.load(std::memory_order_acquire)));
+                    return false;
+                }
+                if (_max_queued_requests > 0 && _jobs.size() >= _max_queued_requests) {
+                    _rejected.fetch_add(1u, std::memory_order_acq_rel);
+                    diag::log_tagged_fmt("mcp_srv",
+                        "mcp_executor_enqueue_rejected name=%s reason=full queued=%zu max=%zu active=%u",
+                        _name.c_str(),
+                        _jobs.size(),
+                        _max_queued_requests,
+                        static_cast<unsigned>(_active.load(std::memory_order_acquire)));
+                    return false;
+                }
+                try {
+                    _jobs.push(std::move(task));
+                } catch (...) {
+                    _rejected.fetch_add(1u, std::memory_order_acq_rel);
+                    diag::log_tagged_fmt("mcp_srv",
+                        "mcp_executor_enqueue_rejected name=%s reason=exception queued=%zu active=%u",
+                        _name.c_str(),
+                        _jobs.size(),
+                        static_cast<unsigned>(_active.load(std::memory_order_acquire)));
+                    return false;
+                }
+            }
+            _cv.notify_one();
+            return true;
+        }
+
+        void shutdown()
+        {
+            bool expected = false;
+            if (!_shutdown.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+                return;
+
+            const std::uint64_t begin = mcp_now_ms();
+            std::vector<aida::infra::win_thread::joinable_thread_t> workers;
+            std::vector<unsigned> worker_ids;
+            std::size_t queued = 0;
+            {
+                std::lock_guard<std::mutex> lk(_mtx);
+                queued = _jobs.size();
+                worker_ids.reserve(_workers.size());
+                for (const auto& worker : _workers)
+                    worker_ids.push_back(worker.id());
+                workers = std::move(_workers);
+                _workers.clear();
+            }
+            diag::log_tagged_fmt("mcp_srv",
+                "mcp_executor_shutdown_begin name=%s workers=%zu queued=%zu active=%u enqueued=%llu finished=%llu rejected=%llu",
+                _name.c_str(),
+                workers.size(),
+                queued,
+                static_cast<unsigned>(_active.load(std::memory_order_acquire)),
+                static_cast<unsigned long long>(_enqueued.load(std::memory_order_acquire)),
+                static_cast<unsigned long long>(_finished.load(std::memory_order_acquire)),
+                static_cast<unsigned long long>(_rejected.load(std::memory_order_acquire)));
+            _cv.notify_all();
+
+            const DWORD current_tid = GetCurrentThreadId();
+            for (std::size_t i = 0; i < workers.size(); ++i) {
+                auto& worker = workers[i];
+                const unsigned tid = i < worker_ids.size() ? worker_ids[i] : worker.id();
+                if (!worker.joinable())
+                    continue;
+                if (tid == current_tid) {
+                    diag::log_tagged_fmt("mcp_srv",
+                        "mcp_executor_shutdown_self_join_skipped name=%s worker_index=%zu tid=%u",
+                        _name.c_str(),
+                        i,
+                        tid);
+                    worker.detach();
+                    continue;
+                }
+                if (!worker.join_for(10000)) {
+                    std::size_t remaining_queued = 0;
+                    {
+                        std::lock_guard<std::mutex> lk(_mtx);
+                        remaining_queued = _jobs.size();
+                    }
+                    diag::log_tagged_fmt("mcp_srv",
+                        "mcp_executor_shutdown_join_timeout name=%s worker_index=%zu tid=%u elapsed_ms=%llu queued=%zu active=%u finished=%llu",
+                        _name.c_str(),
+                        i,
+                        tid,
+                        static_cast<unsigned long long>(mcp_now_ms() - begin),
+                        remaining_queued,
+                        static_cast<unsigned>(_active.load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(_finished.load(std::memory_order_acquire)));
+                    worker.join();
+                }
+            }
+
+            diag::log_tagged_fmt("mcp_srv",
+                "mcp_executor_shutdown_done name=%s elapsed_ms=%llu enqueued=%llu started=%llu finished=%llu rejected=%llu tls_failures=%llu",
+                _name.c_str(),
+                static_cast<unsigned long long>(mcp_now_ms() - begin),
+                static_cast<unsigned long long>(_enqueued.load(std::memory_order_acquire)),
+                static_cast<unsigned long long>(_started.load(std::memory_order_acquire)),
+                static_cast<unsigned long long>(_finished.load(std::memory_order_acquire)),
+                static_cast<unsigned long long>(_rejected.load(std::memory_order_acquire)),
+                static_cast<unsigned long long>(_tls_failures.load(std::memory_order_acquire)));
+        }
+
+    private:
+        struct task_t {
+            std::function<void()> fn;
+            std::uint64_t queued_at = 0;
+            std::uint64_t seq = 0;
+        };
+
+        void start_workers()
+        {
+            std::lock_guard<std::mutex> lk(_mtx);
+            _workers.reserve(_worker_count);
+            for (std::size_t i = 0; i < _worker_count; ++i) {
+                aida::infra::win_thread::joinable_thread_t worker;
+                std::string err;
+                const bool started = worker.start([this, i]() {
+                    worker_loop(i);
+                }, &err, aida::infra::win_thread::default_stack_reserve, _name.c_str());
+                if (started) {
+                    _workers.emplace_back(std::move(worker));
+                    continue;
+                }
+                _worker_failures.fetch_add(1u, std::memory_order_acq_rel);
+                diag::log_tagged_fmt("mcp_srv",
+                    "mcp_executor_worker_start_failed name=%s worker_index=%zu err='%s'",
+                    _name.c_str(),
+                    i,
+                    err.empty() ? "<none>" : err.c_str());
+            }
+            diag::log_tagged_fmt("mcp_srv",
+                "mcp_executor_workers_ready name=%s requested=%zu active_workers=%zu failures=%llu",
+                _name.c_str(),
+                _worker_count,
+                _workers.size(),
+                static_cast<unsigned long long>(_worker_failures.load(std::memory_order_acquire)));
+        }
+
+        void worker_loop(std::size_t worker_index)
+        {
+            bool thread_tls_ready = aida::manual_map_tls::ensure_current_thread();
+            if (!thread_tls_ready) {
+                _tls_failures.fetch_add(1u, std::memory_order_acq_rel);
+                diag::log_tagged_fmt("mcp_srv",
+                    "mcp_executor_tls_unavailable name=%s phase=worker_start worker_index=%zu tid=%lu",
+                    _name.c_str(),
+                    worker_index,
+                    static_cast<unsigned long>(GetCurrentThreadId()));
+            }
+
+            for (;;) {
+                task_t task;
+                std::size_t queued_after_pop = 0;
+                {
+                    std::unique_lock<std::mutex> lk(_mtx);
+                    _cv.wait(lk, [this]() {
+                        return _shutdown.load(std::memory_order_acquire) || !_jobs.empty();
+                    });
+                    if (_shutdown.load(std::memory_order_acquire) && _jobs.empty())
+                        break;
+                    task = std::move(_jobs.front());
+                    _jobs.pop();
+                    queued_after_pop = _jobs.size();
+                }
+
+                _active.fetch_add(1u, std::memory_order_acq_rel);
+                _started.fetch_add(1u, std::memory_order_acq_rel);
+                const std::uint64_t now = mcp_now_ms();
+                const std::uint64_t wait_ms = now >= task.queued_at ? now - task.queued_at : 0;
+                if (wait_ms > 100) {
+                    diag::log_tagged_fmt("mcp_srv",
+                        "mcp_executor_dispatch_delay name=%s worker_index=%zu seq=%llu wait_ms=%llu queued=%zu active=%u",
+                        _name.c_str(),
+                        worker_index,
+                        static_cast<unsigned long long>(task.seq),
+                        static_cast<unsigned long long>(wait_ms),
+                        queued_after_pop,
+                        static_cast<unsigned>(_active.load(std::memory_order_acquire)));
+                }
+
+                const bool task_tls_ready = aida::manual_map_tls::ensure_current_thread();
+                if (!task_tls_ready) {
+                    _tls_failures.fetch_add(1u, std::memory_order_acq_rel);
+                    diag::log_tagged_fmt("mcp_srv",
+                        "mcp_executor_tls_unavailable name=%s phase=task_start worker_index=%zu seq=%llu tid=%lu",
+                        _name.c_str(),
+                        worker_index,
+                        static_cast<unsigned long long>(task.seq),
+                        static_cast<unsigned long>(GetCurrentThreadId()));
+                }
+
+                try {
+                    if (task.fn)
+                        task.fn();
+                } catch (const std::exception& ex) {
+                    diag::log_tagged_fmt("mcp_srv",
+                        "mcp_executor_task_exception name=%s worker_index=%zu seq=%llu err='%s'",
+                        _name.c_str(),
+                        worker_index,
+                        static_cast<unsigned long long>(task.seq),
+                        ex.what());
+                } catch (...) {
+                    diag::log_tagged_fmt("mcp_srv",
+                        "mcp_executor_task_exception name=%s worker_index=%zu seq=%llu err='<unknown>'",
+                        _name.c_str(),
+                        worker_index,
+                        static_cast<unsigned long long>(task.seq));
+                }
+
+                _finished.fetch_add(1u, std::memory_order_acq_rel);
+                _active.fetch_sub(1u, std::memory_order_acq_rel);
+            }
+        }
+
+        const std::string _name;
+        const std::size_t _worker_count;
+        const std::size_t _max_queued_requests;
+        std::vector<aida::infra::win_thread::joinable_thread_t> _workers;
+        std::queue<task_t> _jobs;
+        std::mutex _mtx;
+        std::condition_variable _cv;
+        std::atomic<bool> _shutdown{false};
+        std::atomic<std::uint32_t> _active{0};
+        std::atomic<std::uint64_t> _enqueued{0};
+        std::atomic<std::uint64_t> _rejected{0};
+        std::atomic<std::uint64_t> _started{0};
+        std::atomic<std::uint64_t> _finished{0};
+        std::atomic<std::uint64_t> _worker_failures{0};
+        std::atomic<std::uint64_t> _tls_failures{0};
+    };
+
+    class mcp_request_task_queue final : public httplib::TaskQueue
+    {
+    public:
+        mcp_request_task_queue()
+            : _executor("mcp_http_requests", kMcpHttpWorkerThreads, kMcpHttpMaxQueuedRequests)
+        {
         }
 
         bool enqueue(std::function<void()> fn) override
         {
-            auto state = _state;
-            if (!fn || state->shutdown.load(std::memory_order_acquire))
-                return false;
-
-            std::size_t observed = state->pending.load(std::memory_order_acquire);
-            for (;;) {
-                if (_max_queued_requests > 0 && observed >= _max_queued_requests) {
-                    diag::log_tagged_fmt("mcp_srv", "http_task_queue enqueue rejected pending=%zu max=%zu",
-                        observed, _max_queued_requests);
-                    return false;
-                }
-                if (state->pending.compare_exchange_weak(
-                    observed,
-                    observed + 1,
-                    std::memory_order_acq_rel,
-                    std::memory_order_acquire)) {
-                    break;
-                }
-            }
-
-            const std::uint64_t queued_at = mcp_now_ms();
-            bool posted = critical_work_queue::post([state, queued_at, task = std::move(fn)]() mutable {
-                const std::uint64_t entered_at = mcp_now_ms();
-                const std::uint64_t delay = entered_at >= queued_at ? (entered_at - queued_at) : 0;
-                if (delay > 100) {
-                    diag::log_tagged_fmt("mcp_srv", "http_task_queue dispatch delay_ms=%llu pending=%zu tid=%lu",
-                        static_cast<unsigned long long>(delay),
-                        state->pending.load(std::memory_order_acquire),
-                        static_cast<unsigned long>(GetCurrentThreadId()));
-                }
-                try {
-                    task();
-                } catch (const std::exception& ex) {
-                    diag::log_tagged_fmt("mcp_srv", "http_task_queue task exception err='%s'", ex.what());
-                } catch (...) {
-                    diag::log_tagged("mcp_srv", "http_task_queue task exception err='<unknown>'");
-                }
-                const std::size_t left = state->pending.fetch_sub(1, std::memory_order_acq_rel) - 1;
-                if (state->shutdown.load(std::memory_order_acquire) && left == 0) {
-                    std::lock_guard<std::mutex> lk(state->mtx);
-                    state->cv.notify_all();
-                }
-            });
-            if (!posted) {
-                state->pending.fetch_sub(1, std::memory_order_acq_rel);
-                diag::log_tagged_fmt("mcp_srv", "http_task_queue critical_queue post failed pending=%zu",
-                    state->pending.load(std::memory_order_acquire));
-                log_work_queue_stats("http_task_queue post_failed");
-                return false;
-            }
-            return true;
+            return _executor.enqueue(std::move(fn));
         }
 
         void shutdown() override
         {
-            auto state = _state;
-            state->shutdown.store(true, std::memory_order_release);
-            std::unique_lock<std::mutex> lk(state->mtx);
-            while (state->pending.load(std::memory_order_acquire) != 0) {
-                if (state->cv.wait_for(lk, std::chrono::seconds(10), [state]() {
-                    return state->pending.load(std::memory_order_acquire) == 0;
-                })) {
-                    break;
-                }
-                diag::log_tagged_fmt("mcp_srv", "http_task_queue shutdown timeout pending=%zu",
-                    state->pending.load(std::memory_order_acquire));
-                log_work_queue_stats("http_task_queue shutdown waiting");
-            }
-            log_work_queue_stats("http_task_queue shutdown");
+            _executor.shutdown();
         }
 
     private:
-        struct state_t {
-            std::atomic<bool> shutdown{false};
-            std::atomic<std::size_t> pending{0};
-            std::mutex mtx;
-            std::condition_variable cv;
-        };
-
-        const std::size_t _max_queued_requests;
-        std::shared_ptr<state_t> _state;
+        mcp_owned_executor_t _executor;
     };
+
+    static mcp_owned_executor_t& mcp_batch_executor()
+    {
+        static mcp_owned_executor_t executor("mcp_jsonrpc_batch", kMcpBatchWorkerThreads, kMcpBatchMaxQueuedRequests);
+        return executor;
+    }
 
     static std::string remote_endpoint(const httplib::Request& req)
     {
@@ -823,6 +1056,263 @@ static bool is_external_mcp_tool(const tool_def_t& tool)
            !is_standalone_internal_only_tool_name(tool.name);
 }
 
+static std::shared_mutex& active_session_tool_mutex()
+{
+    static std::shared_mutex m;
+    return m;
+}
+
+static bool tool_args_select_session_target(const json& args)
+{
+    if (!args.is_object())
+        return false;
+    static const char* const keys[] = {
+        "binary_id", "session_id", "file_path", "target_pid", "process_id", "pid"
+    };
+    for (const char* key : keys) {
+        if (args.contains(key) && !args[key].is_null())
+            return true;
+    }
+    return false;
+}
+
+struct target_probe_t
+{
+    bool ok = true;
+    bool resolved = false;
+    size_t active_idx = static_cast<size_t>(-1);
+    size_t target_idx = static_cast<size_t>(-1);
+    std::string resolved_id;
+    std::string err;
+};
+
+static target_probe_t probe_target_without_switch(const json& args)
+{
+    target_probe_t probe;
+    probe.active_idx = analysis_session::active_session_idx();
+
+    if (args.is_null() || !args.is_object())
+        return probe;
+
+    std::string binary_id;
+    if (args.contains("binary_id") && args["binary_id"].is_string()) {
+        binary_id = args["binary_id"].get<std::string>();
+    } else if (args.contains("session_id") && args["session_id"].is_string()) {
+        binary_id = args["session_id"].get<std::string>();
+    }
+
+    std::string file_path;
+    if (binary_id.empty() && args.contains("file_path") && args["file_path"].is_string())
+        file_path = args["file_path"].get<std::string>();
+
+    uint32_t target_pid = 0;
+    if (binary_id.empty() && file_path.empty()) {
+        for (const char* key : {"target_pid", "process_id", "pid"}) {
+            if (!args.contains(key))
+                continue;
+            const auto& v = args[key];
+            if (v.is_number_unsigned()) {
+                target_pid = static_cast<uint32_t>(v.get<uint64_t>());
+            } else if (v.is_number_integer()) {
+                int64_t s = v.get<int64_t>();
+                if (s > 0)
+                    target_pid = static_cast<uint32_t>(s);
+            } else if (v.is_string()) {
+                std::string s = v.get<std::string>();
+                if (!s.empty()) {
+                    try { target_pid = static_cast<uint32_t>(std::stoul(s, nullptr, 0)); }
+                    catch (...) { target_pid = 0; }
+                }
+            }
+            if (target_pid != 0)
+                break;
+        }
+    }
+
+    size_t resolved_idx = static_cast<size_t>(-1);
+    if (!binary_id.empty()) {
+        size_t idx = 0;
+        if (analysis_session::find_session_by_id(binary_id, &idx)) {
+            resolved_idx = idx;
+        } else {
+            probe.ok = false;
+            probe.err = "binary_id '" + binary_id + "' not found in active sessions";
+            diag::log_tagged_fmt("mcp_standalone",
+                "probe_target binary_id='%s' not_found",
+                binary_id.c_str());
+            return probe;
+        }
+    } else if (!file_path.empty()) {
+        size_t idx = 0;
+        if (analysis_session::find_session_by_path(file_path, &idx)) {
+            resolved_idx = idx;
+        } else {
+            probe.ok = false;
+            probe.err = "file_path '" + file_path + "' not found in active sessions";
+            return probe;
+        }
+    } else if (target_pid != 0) {
+        size_t idx = 0;
+        if (analysis_session::find_session_by_pid(target_pid, &idx))
+            resolved_idx = idx;
+    }
+
+    if (resolved_idx == static_cast<size_t>(-1))
+        return probe;
+
+    probe.resolved = true;
+    probe.target_idx = resolved_idx;
+    auto sum = analysis_session::summarize_session_at(resolved_idx);
+    probe.resolved_id = sum.id;
+    return probe;
+}
+
+static bool is_analysis_session_management_tool(const std::string& name)
+{
+    return name.rfind("sessions_", 0) == 0;
+}
+
+static bool is_active_session_independent_tool(const std::string& name)
+{
+    if (name == "get_tool_descriptions" ||
+        name == "vm_bridge_manage" ||
+        name == "list_processes" ||
+        name == "disassemble_file" ||
+        name == "sandbox_execute" ||
+        is_camoufox_browser_tool_name(name)) {
+        return true;
+    }
+    if (name.rfind("burp_", 0) == 0 ||
+        name.rfind("browser_", 0) == 0 ||
+        name.rfind("gameproto_", 0) == 0 ||
+        name.rfind("net_proto_", 0) == 0 ||
+        name.rfind("net_security_", 0) == 0 ||
+        name.rfind("workflow_", 0) == 0) {
+        return true;
+    }
+    return false;
+}
+
+static tool_result_t invoke_tool_handler_unlocked(
+    const std::string& tool_name,
+    const json& arguments,
+    const std::function<tool_result_t(const json&)>& handler)
+{
+    try {
+        return handler(arguments);
+    } catch (const std::exception& e) {
+        diag::log_tagged_fmt("mcp_srv", "handle_tools_call exception tool='%s' what='%s'",
+            tool_name.c_str(), e.what());
+        return tool_result_t::error(std::string("Tool threw exception: ") + e.what());
+    } catch (...) {
+        diag::log_tagged_fmt("mcp_srv", "handle_tools_call unknown_exception tool='%s'", tool_name.c_str());
+        return tool_result_t::error("Tool threw unknown exception");
+    }
+}
+
+static tool_result_t invoke_tool_with_concurrency_policy(
+    const tool_def_t& tool,
+    const json& arguments,
+    const std::function<tool_result_t(const json&)>& handler)
+{
+    const bool session_manager = is_analysis_session_management_tool(tool.name);
+    const bool session_independent = is_active_session_independent_tool(tool.name);
+    const bool explicit_target = tool_args_select_session_target(arguments);
+
+    if (session_independent && tool.read_only && !session_manager) {
+        diag::log_tagged_fmt("mcp_srv",
+            "tool_policy_lane tool='%s' lane=independent_unlocked read_only=1 explicit_target=%d lock_wait_ms=0",
+            tool.name.c_str(),
+            explicit_target ? 1 : 0);
+        return invoke_tool_handler_unlocked(tool.name, arguments, handler);
+    }
+
+    if (session_manager || !tool.read_only) {
+        const std::uint64_t wait_start = mcp_now_ms();
+        std::unique_lock<std::shared_mutex> lk(active_session_tool_mutex());
+        const std::uint64_t wait_ms = mcp_now_ms() - wait_start;
+        const char* lane = session_manager ? "exclusive_session_manager" :
+            (session_independent ? "exclusive_independent_mutating" : "exclusive_mutating");
+        diag::log_tagged_fmt("mcp_srv",
+            "tool_policy_lane tool='%s' lane=%s read_only=%d explicit_target=%d lock_wait_ms=%llu",
+            tool.name.c_str(),
+            lane,
+            tool.read_only ? 1 : 0,
+            explicit_target ? 1 : 0,
+            static_cast<unsigned long long>(wait_ms));
+        if (!session_manager && !session_independent) {
+            std::string scope_err;
+            target_scope_t scope = resolve_target(arguments, &scope_err);
+            if (!scope.ok)
+                return tool_result_t::error(scope_err.empty() ? std::string("Unable to resolve target session") : scope_err);
+            return invoke_tool_handler_unlocked(tool.name, arguments, handler);
+        }
+        return invoke_tool_handler_unlocked(tool.name, arguments, handler);
+    }
+
+    if (!explicit_target) {
+        const std::uint64_t wait_start = mcp_now_ms();
+        std::shared_lock<std::shared_mutex> lk(active_session_tool_mutex());
+        const std::uint64_t wait_ms = mcp_now_ms() - wait_start;
+        diag::log_tagged_fmt("mcp_srv",
+            "tool_policy_lane tool='%s' lane=shared_active read_only=1 explicit_target=0 lock_wait_ms=%llu",
+            tool.name.c_str(),
+            static_cast<unsigned long long>(wait_ms));
+        std::string scope_err;
+        target_scope_t scope = resolve_target(arguments, &scope_err);
+        if (!scope.ok)
+            return tool_result_t::error(scope_err.empty() ? std::string("Unable to resolve target session") : scope_err);
+        return invoke_tool_handler_unlocked(tool.name, arguments, handler);
+    }
+
+    target_probe_t probe;
+    std::uint64_t probe_wait_ms = 0;
+    {
+        const std::uint64_t wait_start = mcp_now_ms();
+        std::shared_lock<std::shared_mutex> lk(active_session_tool_mutex());
+        probe_wait_ms = mcp_now_ms() - wait_start;
+        probe = probe_target_without_switch(arguments);
+        if (!probe.ok) {
+            diag::log_tagged_fmt("mcp_srv",
+                "tool_policy_lane tool='%s' lane=shared_target_reject read_only=1 explicit_target=1 lock_wait_ms=%llu err='%.160s'",
+                tool.name.c_str(),
+                static_cast<unsigned long long>(probe_wait_ms),
+                probe.err.c_str());
+            return tool_result_t::error(probe.err.empty() ? std::string("Unable to resolve target session") : probe.err);
+        }
+        if (!probe.resolved || probe.target_idx == probe.active_idx) {
+            diag::log_tagged_fmt("mcp_srv",
+                "tool_policy_lane tool='%s' lane=shared_explicit_no_switch read_only=1 resolved=%d active_idx=%llu target_idx=%llu lock_wait_ms=%llu",
+                tool.name.c_str(),
+                probe.resolved ? 1 : 0,
+                static_cast<unsigned long long>(probe.active_idx),
+                static_cast<unsigned long long>(probe.target_idx),
+                static_cast<unsigned long long>(probe_wait_ms));
+            std::string scope_err;
+            target_scope_t scope = resolve_target(arguments, &scope_err);
+            if (!scope.ok)
+                return tool_result_t::error(scope_err.empty() ? std::string("Unable to resolve target session") : scope_err);
+            return invoke_tool_handler_unlocked(tool.name, arguments, handler);
+        }
+    }
+
+    const std::uint64_t wait_start = mcp_now_ms();
+    std::unique_lock<std::shared_mutex> lk(active_session_tool_mutex());
+    const std::uint64_t wait_ms = mcp_now_ms() - wait_start;
+    diag::log_tagged_fmt("mcp_srv",
+        "tool_policy_lane tool='%s' lane=exclusive_target_switch read_only=1 active_idx=%llu target_idx=%llu probe_wait_ms=%llu lock_wait_ms=%llu",
+        tool.name.c_str(),
+        static_cast<unsigned long long>(probe.active_idx),
+        static_cast<unsigned long long>(probe.target_idx),
+        static_cast<unsigned long long>(probe_wait_ms),
+        static_cast<unsigned long long>(wait_ms));
+    std::string scope_err;
+    target_scope_t scope = resolve_target(arguments, &scope_err);
+    if (!scope.ok)
+        return tool_result_t::error(scope_err.empty() ? std::string("Unable to resolve target session") : scope_err);
+    return invoke_tool_handler_unlocked(tool.name, arguments, handler);
+}
+
 bool server_t::register_tool(tool_def_t tool)
 {
     if (is_standalone_ide_chat_only_tool_name(tool.name))
@@ -866,6 +1356,35 @@ bool server_t::register_tool(tool_def_t tool)
     }
     _tools.push_back(std::move(tool));
     return true;
+}
+
+tool_result_t server_t::call_registered_tool(const std::string& name, const json& arguments, bool external_visible_only)
+{
+    if (name.empty())
+        return tool_result_t::error("Missing tool name");
+
+    tool_def_t found;
+    bool found_tool = false;
+    std::function<tool_result_t(const json&)> handler_copy;
+    {
+        std::lock_guard<std::mutex> lk(_tools_mtx);
+        for (const auto& t : _tools) {
+            if (t.name != name)
+                continue;
+            if (external_visible_only && !is_external_mcp_tool(t))
+                return tool_result_t::error("Unknown tool: " + name);
+            found = t;
+            handler_copy = t.handler;
+            found_tool = true;
+            break;
+        }
+    }
+
+    if (!found_tool)
+        return tool_result_t::error("Unknown tool: " + name);
+    if (!handler_copy)
+        return tool_result_t::error("Tool has no handler: " + name);
+    return invoke_tool_with_concurrency_policy(found, arguments, handler_copy);
 }
 
 json server_t::make_result(const json& id, const json& result)
@@ -1163,7 +1682,8 @@ json server_t::handle_tools_call(const json& id, const json& params)
     if (is_standalone_ide_chat_only_tool_name(tool_name) || is_standalone_internal_only_tool_name(tool_name))
         return make_error(id, JSONRPC_INVALID_PARAMS, "Unknown tool: " + tool_name);
 
-    const tool_def_t* found = nullptr;
+    tool_def_t found;
+    bool found_tool = false;
     std::function<tool_result_t(const json&)> handler_copy;
     {
         std::lock_guard<std::mutex> lk(_tools_mtx);
@@ -1172,14 +1692,15 @@ json server_t::handle_tools_call(const json& id, const json& params)
                 if (!is_external_mcp_tool(t)) {
                     return make_error(id, JSONRPC_INVALID_PARAMS, "Unknown tool: " + tool_name);
                 }
-                found = &t;
+                found = t;
                 handler_copy = t.handler;
+                found_tool = true;
                 break;
             }
         }
     }
 
-    if (!found)
+    if (!found_tool)
     {
         diag::log_tagged_fmt("mcp_srv", "handle_tools_call unknown_tool='%s'", tool_name.c_str());
         return make_error(id, JSONRPC_INVALID_PARAMS, "Unknown tool: " + tool_name);
@@ -1188,17 +1709,7 @@ json server_t::handle_tools_call(const json& id, const json& params)
     diag::log_tagged_fmt("mcp_srv", "handle_tools_call dispatching tool='%s'", tool_name.c_str());
     cancel_scope_t scope(id);
 
-    tool_result_t tr;
-    try {
-        tr = handler_copy(arguments);
-    } catch (const std::exception& e) {
-        diag::log_tagged_fmt("mcp_srv", "handle_tools_call exception tool='%s' what='%s'",
-            tool_name.c_str(), e.what());
-        tr = tool_result_t::error(std::string("Tool threw exception: ") + e.what());
-    } catch (...) {
-        diag::log_tagged_fmt("mcp_srv", "handle_tools_call unknown_exception tool='%s'", tool_name.c_str());
-        tr = tool_result_t::error("Tool threw unknown exception");
-    }
+    tool_result_t tr = invoke_tool_with_concurrency_policy(found, arguments, handler_copy);
     diag::log_tagged_fmt("mcp_srv", "handle_tools_call result tool='%s' success=%d",
         tool_name.c_str(), (int)tr.success);
 
@@ -1445,11 +1956,99 @@ std::string handle_body(server_t* self, const std::string& body)
     if (parsed.is_array()) {
         if (parsed.empty())
             return json_dump_safe(self->make_error(nullptr, JSONRPC_INVALID_REQUEST, "Empty batch"));
-        json responses = json::array();
-        for (const auto& item : parsed) {
-            json response = self->route_request(item);
-            if (!response.is_null()) responses.push_back(response);
+
+        const std::uint64_t batch_id = g_mcp_batch_seq.fetch_add(1u, std::memory_order_acq_rel) + 1u;
+        const std::size_t batch_size = parsed.size();
+        const std::uint64_t batch_start = mcp_now_ms();
+        diag::log_tagged_fmt("mcp_srv",
+            "jsonrpc_batch_begin batch=%llu items=%zu workers=%zu max_queue=%zu",
+            static_cast<unsigned long long>(batch_id),
+            batch_size,
+            kMcpBatchWorkerThreads,
+            kMcpBatchMaxQueuedRequests);
+
+        struct batch_state_t {
+            std::vector<json> responses;
+            std::vector<unsigned char> has_response;
+            std::size_t completed = 0;
+            std::mutex mtx;
+            std::condition_variable cv;
+        };
+
+        auto state = std::make_shared<batch_state_t>();
+        state->responses.resize(batch_size);
+        state->has_response.resize(batch_size, 0);
+        std::atomic<std::size_t> inline_count{0};
+
+        auto complete_item = [state](std::size_t index, json response) {
+            {
+                std::lock_guard<std::mutex> lk(state->mtx);
+                if (!response.is_null()) {
+                    state->responses[index] = std::move(response);
+                    state->has_response[index] = 1;
+                }
+                ++state->completed;
+            }
+            state->cv.notify_one();
+        };
+
+        auto execute_item = [self, complete_item, batch_id](std::size_t index, json item) {
+            try {
+                json response = self->route_request(item);
+                complete_item(index, std::move(response));
+            } catch (const std::exception& ex) {
+                diag::log_tagged_fmt("mcp_srv",
+                    "jsonrpc_batch_item_exception batch=%llu index=%zu err='%s'",
+                    static_cast<unsigned long long>(batch_id),
+                    index,
+                    ex.what());
+                json id = item.is_object() && item.contains("id") ? item["id"] : json(nullptr);
+                complete_item(index, self->make_error(id, JSONRPC_INTERNAL_ERROR, std::string("Request failed: ") + ex.what()));
+            } catch (...) {
+                diag::log_tagged_fmt("mcp_srv",
+                    "jsonrpc_batch_item_exception batch=%llu index=%zu err='<unknown>'",
+                    static_cast<unsigned long long>(batch_id),
+                    index);
+                json id = item.is_object() && item.contains("id") ? item["id"] : json(nullptr);
+                complete_item(index, self->make_error(id, JSONRPC_INTERNAL_ERROR, "Request failed"));
+            }
+        };
+
+        auto& executor = mcp_batch_executor();
+        for (std::size_t i = 0; i < batch_size; ++i) {
+            json item = parsed[i];
+            if (!executor.enqueue([execute_item, i, item = std::move(item)]() mutable {
+                execute_item(i, std::move(item));
+            })) {
+                inline_count.fetch_add(1u, std::memory_order_acq_rel);
+                diag::log_tagged_fmt("mcp_srv",
+                    "jsonrpc_batch_enqueue_fallback batch=%llu index=%zu items=%zu",
+                    static_cast<unsigned long long>(batch_id),
+                    i,
+                    batch_size);
+                execute_item(i, parsed[i]);
+            }
         }
+
+        {
+            std::unique_lock<std::mutex> lk(state->mtx);
+            state->cv.wait(lk, [state, batch_size]() {
+                return state->completed >= batch_size;
+            });
+        }
+
+        json responses = json::array();
+        for (std::size_t i = 0; i < batch_size; ++i) {
+            if (state->has_response[i])
+                responses.push_back(std::move(state->responses[i]));
+        }
+        diag::log_tagged_fmt("mcp_srv",
+            "jsonrpc_batch_done batch=%llu items=%zu responses=%zu inline=%zu elapsed_ms=%llu",
+            static_cast<unsigned long long>(batch_id),
+            batch_size,
+            responses.size(),
+            inline_count.load(std::memory_order_acquire),
+            static_cast<unsigned long long>(mcp_now_ms() - batch_start));
         if (responses.empty()) return "";
         return json_dump_safe(responses);
     }
@@ -1664,10 +2263,11 @@ void server_t::server_thread_func(int port)
     g_cached_external_tool_count.store(0, std::memory_order_release);
     httplib::Server svr;
     svr.new_task_queue = [] {
-        return new work_queue_task_queue(kMcpHttpMaxQueuedRequests);
+        return new mcp_request_task_queue();
     };
     diag::log_tagged_fmt("mcp_srv",
-        "server_thread_func critical_queue_http_dispatch max_queue=%zu",
+        "server_thread_func mcp_owned_http_dispatch workers=%zu max_queue=%zu",
+        kMcpHttpWorkerThreads,
         kMcpHttpMaxQueuedRequests);
     svr.set_keep_alive_max_count(8);
     svr.set_keep_alive_timeout(2);
@@ -2024,7 +2624,9 @@ void server_t::server_thread_func(int port)
             return;
         }
 
-        const tool_def_t* found = nullptr;
+        tool_def_t found;
+        bool found_tool = false;
+        std::function<tool_result_t(const json&)> handler_copy;
         { std::lock_guard<std::mutex> lk(_tools_mtx);
           for (const auto& t : _tools) {
               if (t.name == tool_name) {
@@ -2033,20 +2635,20 @@ void server_t::server_thread_func(int port)
                       res.set_content(json_dump_safe({{"error", "Unknown tool: " + tool_name}}), "application/json");
                       return;
                   }
-                  found = &t;
+                  found = t;
+                  handler_copy = t.handler;
+                  found_tool = true;
                   break;
               }
           } }
 
-        if (!found) {
+        if (!found_tool) {
             res.status = 404;
             res.set_content(json_dump_safe({{"error", "Unknown tool: " + tool_name}}), "application/json");
             return;
         }
 
-        tool_result_t tr;
-        try { tr = found->handler(arguments); }
-        catch (const std::exception& e) { tr = tool_result_t::error(e.what()); }
+        tool_result_t tr = invoke_tool_with_concurrency_policy(found, arguments, handler_copy);
 
         json resp;
         resp["success"] = tr.success;

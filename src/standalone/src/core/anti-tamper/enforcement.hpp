@@ -473,12 +473,83 @@ namespace enforcement_detail {
         } catch (...) {}
     }
 
+    __declspec(noinline) static int log_enforcement_seh_exception(const char* source,
+                                                                  EXCEPTION_POINTERS* ep,
+                                                                  int round,
+                                                                  uint64_t reason_id,
+                                                                  uint32_t level)
+    {
+        DWORD code = 0;
+        ULONG flags = 0;
+        ULONG params = 0;
+        ULONG_PTR p0 = 0;
+        ULONG_PTR p1 = 0;
+        uintptr_t addr = 0;
+        uintptr_t rip = 0;
+        uintptr_t rsp = 0;
+        uintptr_t rbp = 0;
+        if (ep && ep->ExceptionRecord)
+        {
+            code = ep->ExceptionRecord->ExceptionCode;
+            flags = ep->ExceptionRecord->ExceptionFlags;
+            params = ep->ExceptionRecord->NumberParameters;
+            addr = reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress);
+            if (params > 0) p0 = ep->ExceptionRecord->ExceptionInformation[0];
+            if (params > 1) p1 = ep->ExceptionRecord->ExceptionInformation[1];
+        }
+        if (ep && ep->ContextRecord)
+        {
+            rip = static_cast<uintptr_t>(ep->ContextRecord->Rip);
+            rsp = static_cast<uintptr_t>(ep->ContextRecord->Rsp);
+            rbp = static_cast<uintptr_t>(ep->ContextRecord->Rbp);
+        }
+
+        DWORD last_err = GetLastError();
+        MEMORY_BASIC_INFORMATION addr_mbi{};
+        MEMORY_BASIC_INFORMATION rip_mbi{};
+        SIZE_T addr_vq = addr ? VirtualQuery(reinterpret_cast<void*>(addr), &addr_mbi, sizeof(addr_mbi)) : 0;
+        SIZE_T rip_vq = rip ? VirtualQuery(reinterpret_cast<void*>(rip), &rip_mbi, sizeof(rip_mbi)) : 0;
+
+        webhook::write_log_critical_fmt("enforce",
+            "%s_SEH_DETAIL code=0x%08lX round=%d level=%u reason_id=0x%016llX tid=%lu flags=0x%08lX params=%lu p0=0x%016llX p1=0x%016llX addr=0x%016llX rip=0x%016llX rsp=0x%016llX rbp=0x%016llX addr_vq=%llu addr_base=0x%016llX addr_alloc=0x%016llX addr_region=0x%llX addr_state=0x%08lX addr_protect=0x%08lX addr_type=0x%08lX rip_vq=%llu rip_base=0x%016llX rip_alloc=0x%016llX rip_region=0x%llX rip_state=0x%08lX rip_protect=0x%08lX rip_type=0x%08lX last_err=%lu",
+            source ? source : "enforcement",
+            static_cast<unsigned long>(code),
+            round,
+            level,
+            static_cast<unsigned long long>(reason_id),
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            static_cast<unsigned long>(flags),
+            static_cast<unsigned long>(params),
+            static_cast<unsigned long long>(p0),
+            static_cast<unsigned long long>(p1),
+            static_cast<unsigned long long>(addr),
+            static_cast<unsigned long long>(rip),
+            static_cast<unsigned long long>(rsp),
+            static_cast<unsigned long long>(rbp),
+            static_cast<unsigned long long>(addr_vq),
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(addr_mbi.BaseAddress)),
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(addr_mbi.AllocationBase)),
+            static_cast<unsigned long long>(addr_mbi.RegionSize),
+            static_cast<unsigned long>(addr_mbi.State),
+            static_cast<unsigned long>(addr_mbi.Protect),
+            static_cast<unsigned long>(addr_mbi.Type),
+            static_cast<unsigned long long>(rip_vq),
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(rip_mbi.BaseAddress)),
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(rip_mbi.AllocationBase)),
+            static_cast<unsigned long long>(rip_mbi.RegionSize),
+            static_cast<unsigned long>(rip_mbi.State),
+            static_cast<unsigned long>(rip_mbi.Protect),
+            static_cast<unsigned long>(rip_mbi.Type),
+            static_cast<unsigned long>(last_err));
+        return EXCEPTION_EXECUTE_HANDLER;
+    }
+
     __declspec(noinline) static DWORD seh_violation_post(int round, uint64_t reason_id)
     {
         __try {
             violation_post_impl(round, reason_id);
             return 0;
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        } __except (log_enforcement_seh_exception("violation_post", GetExceptionInformation(), round, reason_id, 0)) {
             return GetExceptionCode();
         }
     }
@@ -516,7 +587,7 @@ namespace enforcement_detail {
     {
         __try {
             seh_graduated_enforcement_round_impl(round, reason_id, level);
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        } __except (log_enforcement_seh_exception("graduated_round", GetExceptionInformation(), round, reason_id, level)) {
             char dbg[80];
             _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
                 "graduated_round_SEH code=0x%08X round=%d",

@@ -1487,6 +1487,7 @@ void helpers::render_title()
 		if (runtime_locked) {
 			license::validated = false;
 			license::checking = false;
+			license::activation_worker_active.store(false, std::memory_order_release);
 			license::check_failed = false;
 			license::error_msg = "Runtime integrity check failed. Restart AiDAStandalone.exe.";
 			s_full_test_validity_bridge_logged = false;
@@ -1506,6 +1507,7 @@ void helpers::render_title()
 			const bool recovered = !license::validated || license::check_failed || license::checking;
 			license::validated = true;
 			license::checking = false;
+			license::activation_worker_active.store(false, std::memory_order_release);
 			license::check_failed = false;
 			license::error_msg.clear();
 			s_runtime_lock_logged = false;
@@ -1514,6 +1516,7 @@ void helpers::render_title()
 				diag::log_tagged("license", "DIAG_DIALOG_RECOVERED_RUNTIME_VALIDITY");
 		} else if (license::preserve_valid_state(runtime_locked, full_test_running)) {
 			license::checking = false;
+			license::activation_worker_active.store(false, std::memory_order_release);
 			license::check_failed = false;
 			license::error_msg.clear();
 			s_runtime_lock_logged = false;
@@ -2606,12 +2609,27 @@ void helpers::render_title()
 		}
 
 		{
+			bool activation_worker_active = license::activation_worker_active.load(std::memory_order_acquire);
+			bool arc_transfer_active = standalone_license::is_arc_transfer_in_progress();
+			bool activation_progress_active = license::checking && (activation_worker_active || arc_transfer_active);
+			if (license::checking && !activation_progress_active) {
+				license::checking = false;
+				globals::ui::license_activation_phase.store(0, std::memory_order_release);
+				diag::log_tagged_fmt("license",
+					"DIAG_DIALOG_STALE_CHECKING_CLEARED worker=%d arc_transfer=%d arc_wait=%d frame=%d",
+					activation_worker_active ? 1 : 0,
+					arc_transfer_active ? 1 : 0,
+					standalone_license::is_arc_download_in_progress() ? 1 : 0,
+					ImGui::GetFrameCount());
+				activation_progress_active = false;
+			}
+
 			float eye_pad_r = 10.f;
 			float eye_w = 28.f;
 			float eye_h = 28.f;
 			ImVec2 eye_a(in_b.x - eye_pad_r - eye_w, in_a.y + (input_h - eye_h) * 0.5f);
 			ImVec2 eye_b(eye_a.x + eye_w, eye_a.y + eye_h);
-			bool eye_hov = !license::checking && ImGui::IsMouseHoveringRect(eye_a, eye_b);
+			bool eye_hov = !activation_progress_active && ImGui::IsMouseHoveringRect(eye_a, eye_b);
 			float ehv = eye_hover.tick(eye_hov, dt, aida::motion::spring::balanced);
 			if (eye_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
 				show_license = !show_license;
@@ -2654,6 +2672,10 @@ void helpers::render_title()
 			}
 		}
 
+		bool activation_worker_active = license::activation_worker_active.load(std::memory_order_acquire);
+		bool arc_transfer_active = standalone_license::is_arc_transfer_in_progress();
+		bool activation_progress_active = license::checking && (activation_worker_active || arc_transfer_active);
+
 		float btn_h = 48.f;
 		float btn_y_screen = input_y_screen + input_h + 18.f;
 		ImVec2 btn_a(input_x_screen, btn_y_screen);
@@ -2662,7 +2684,7 @@ void helpers::render_title()
 		static aida::ui::hover_state_t btn_hover;
 		static aida::ui::press_state_t btn_press;
 		static aida::ui::flash_t btn_flash;
-		bool btn_hov = !license::checking && ImGui::IsMouseHoveringRect(btn_a, btn_b);
+		bool btn_hov = !activation_progress_active && ImGui::IsMouseHoveringRect(btn_a, btn_b);
 		bool btn_held = btn_hov && (GetAsyncKeyState(VK_LBUTTON) & 0x8000);
 		float bhov_v = btn_hover.tick(btn_hov, dt, aida::motion::spring::balanced);
 		float bprs_v = btn_press.tick(btn_held, dt);
@@ -2670,7 +2692,7 @@ void helpers::render_title()
 
 		ImGui::SetCursorScreenPos(btn_a);
 		ImGui::InvisibleButton("##activate_btn", ImVec2(input_w, btn_h));
-		bool btn_clicked = ImGui::IsItemDeactivated() && ImGui::IsItemHovered() && !license::checking;
+		bool btn_clicked = ImGui::IsItemDeactivated() && ImGui::IsItemHovered() && !activation_progress_active;
 
 		float lift = bhov_v * 2.5f - bprs_v * 2.f;
 		float scl = 1.f - (1.f - 0.97f) * bprs_v;
@@ -2714,7 +2736,7 @@ void helpers::render_title()
 		}
 		if (btn_clicked) btn_flash.trigger();
 
-		if (license::checking) {
+		if (activation_progress_active) {
 			ImVec2 ring_c((cb_a.x + cb_b.x) * 0.5f, (cb_a.y + cb_b.y) * 0.5f);
 			float t_sec = aida::ui::clock::seconds() * 4.f;
 			float arc_len = 1.4f;
@@ -2737,7 +2759,7 @@ void helpers::render_title()
 				aida::ui::with_alpha(IM_COL32(255,255,255,255), la), btn_label);
 		}
 
-		if (license::checking) {
+		if (activation_progress_active) {
 			static const char* k_act_phases[] = {
 				"Resolving license server...",
 				"Verifying signature...",
@@ -2746,7 +2768,7 @@ void helpers::render_title()
 				"Sealing..."
 			};
 			int act_phase = globals::ui::license_activation_phase.load(std::memory_order_acquire);
-			if (standalone_license::is_arc_download_in_progress() && act_phase < 3)
+			if (arc_transfer_active && act_phase < 3)
 				act_phase = 3;
 			if (act_phase < 0) act_phase = 0;
 			if (act_phase > 4) act_phase = 4;
@@ -2813,11 +2835,12 @@ void helpers::render_title()
 				aida::ui::with_alpha(th.info, la), msg);
 		}
 
-		if ((enter || btn_clicked) && !license::checking && strlen(license::key_buf) > 0)
+		if ((enter || btn_clicked) && !activation_progress_active && strlen(license::key_buf) > 0)
 		{
 			const bool submit_runtime_locked = anti_tamper::state::get().violation_latched.load(std::memory_order_acquire);
 			if (license::runtime_ready(submit_runtime_locked, test_all_features::is_running())) {
 				license::checking = false;
+				license::activation_worker_active.store(false, std::memory_order_release);
 				license::check_failed = false;
 				license::error_msg.clear();
 				diag::log_tagged_fmt("license",
@@ -2829,6 +2852,7 @@ void helpers::render_title()
 				return;
 			}
 			license::checking    = true;
+			license::activation_worker_active.store(true, std::memory_order_release);
 			license::check_failed = false;
 			license::error_msg.clear();
 			globals::ui::license_activation_phase.store(0, std::memory_order_release);
@@ -2870,6 +2894,7 @@ void helpers::render_title()
 				} catch (...) {
 					license::check_failed = true;
 				}
+				license::activation_worker_active.store(false, std::memory_order_release);
 				license::checking = false;
 			});
 		}
@@ -8453,6 +8478,7 @@ void helpers::render_title()
 				if (license::preserve_valid_state(runtime_locked, test_all_features::is_running())) {
 					g_render_section = "post_bottom_license_preserve";
 					license::checking = false;
+					license::activation_worker_active.store(false, std::memory_order_release);
 					license::check_failed = false;
 					license::error_msg.clear();
 					diag::log_tagged_fmt("license",

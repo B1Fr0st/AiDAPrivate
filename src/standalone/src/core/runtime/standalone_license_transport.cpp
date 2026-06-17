@@ -825,6 +825,9 @@ bool send_once(const winhttp_api_t& api,
         }
     }
 
+    const size_t max_body = req.max_response_body_bytes > 0u
+        ? req.max_response_body_bytes
+        : 16u * 1024u * 1024u;
     resp.body.clear();
     resp.body.reserve(4096u);
     uint8_t chunk[8192];
@@ -839,8 +842,11 @@ bool send_once(const winhttp_api_t& api,
         if (!api.p_read_data(h_req, chunk, to_read, &got)) { break; }
         if (got == 0u) { break; }
         resp.body.insert(resp.body.end(), chunk, chunk + got);
-        if (resp.body.size() > 16u * 1024u * 1024u) {
+        if (resp.body.size() > max_body) {
             last_error = "winhttp_body_oversized";
+            trans_log_fmt("send_once_body_oversized body=%zu cap=%zu status=%lu elapsed_ms=%llu",
+                resp.body.size(), max_body, static_cast<unsigned long>(resp.http_status),
+                static_cast<unsigned long long>(GetTickCount64() - t0));
             api.p_close_handle(h_req);
             api.p_close_handle(h_connect);
             api.p_close_handle(h_session);

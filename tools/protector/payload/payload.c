@@ -1663,12 +1663,12 @@ static void payload_append_hex64(char* s, size_t* p, size_t cap, uint64_t v, uin
     }
 }
 
-static void payload_log_event(uint32_t event_id, uint64_t a, uint64_t b, uint64_t c) {
+static void payload_log_event_impl(uint32_t event_id, uint64_t a, uint64_t b, uint64_t c, int force) {
     payload_log_apis_t api;
     if (!payload_resolve_log_apis(&api)) {
         return;
     }
-    if (!payload_trace_enabled(&api)) {
+    if (!force && !payload_trace_enabled(&api)) {
         return;
     }
     uint16_t path[384];
@@ -1735,6 +1735,14 @@ static void payload_log_event(uint32_t event_id, uint64_t a, uint64_t b, uint64_
     uint32_t written = 0;
     api.WriteFile(h, line, (uint32_t)p, &written, 0);
     api.CloseHandle(h);
+}
+
+static void payload_log_event(uint32_t event_id, uint64_t a, uint64_t b, uint64_t c) {
+    payload_log_event_impl(event_id, a, b, c, 0);
+}
+
+static void payload_log_event_force(uint32_t event_id, uint64_t a, uint64_t b, uint64_t c) {
+    payload_log_event_impl(event_id, a, b, c, 1);
 }
 
 static uint8_t* find_packed_section(uint8_t* image_base, uint32_t* out_size) {
@@ -2571,8 +2579,36 @@ static uint32_t env_wide_basename_hash_ci(const uint16_t* w, size_t w_chars) {
     return h;
 }
 
+typedef struct env_failure_context_t {
+    uint32_t check_id;
+    uint64_t status;
+    uint64_t a;
+    uint64_t b;
+} env_failure_context_t;
+
+static void payload_record_env_failure(env_failure_context_t* ctx, uint32_t check_id, uint64_t status, uint64_t a, uint64_t b) {
+    if (ctx == 0) {
+        return;
+    }
+    ctx->check_id = check_id;
+    ctx->status = status;
+    ctx->a = a;
+    ctx->b = b;
+}
+
+static uint64_t payload_env_failure_word(const env_failure_context_t* ctx) {
+    if (ctx == 0) {
+        return 0u;
+    }
+    return ((uint64_t)ctx->check_id << 32) | (ctx->status & 0xFFFFFFFFu);
+}
+
 static void payload_log_env_check(uint32_t check_id, uint64_t status, uint64_t a, uint64_t b) {
     payload_log_event(APL_EVENT_ENV_CHECK, ((uint64_t)check_id << 32) | (status & 0xFFFFFFFFu), a, b);
+}
+
+static void payload_log_env_observed(uint32_t check_id, uint64_t status, uint64_t a, uint64_t b) {
+    payload_log_event_force(APL_EVENT_ENV_CHECK, ((uint64_t)(check_id | 0x80000000u) << 32) | (status & 0xFFFFFFFFu), a, b);
 }
 
 static int env_path_is_sep(uint16_t c) {
@@ -2656,7 +2692,13 @@ static int env_process_name_is_trusted_aida_runtime(const uint16_t* w, size_t w_
         h == 0xCF8F58E9u ||
         h == 0xB16DF3BDu ||
         h == 0x82E0E789u ||
-        h == 0x68EA95D7u;
+        h == 0x68EA95D7u ||
+        h == 0x2DDAC76Du ||
+        h == 0xCC1DE49Fu ||
+        h == 0x329BD5F8u ||
+        h == 0xEFCA8C02u ||
+        h == 0x342F49EBu ||
+        h == 0x32CEE7E9u;
 }
 
 static int env_codex_image_path_allowed(const resolved_t* r, void* pid, uint64_t* path_diag) {
@@ -2761,7 +2803,7 @@ static int env_classify_ai_analysis_process_name(const uint16_t* w, size_t w_cha
     return 0;
 }
 
-static int env_check_ai_analysis_processes(const resolved_t* r) {
+static int env_check_ai_analysis_processes(const resolved_t* r, env_failure_context_t* failure) {
     if (r == 0 || r->ntdll == 0 || r->NtAllocateVirtualMemory == 0 || r->NtFreeVirtualMemory == 0) {
         return 0;
     }
@@ -2808,8 +2850,11 @@ static int env_check_ai_analysis_processes(const resolved_t* r) {
                 detected = env_classify_ai_analysis_process_name(spi->ImageName.Buffer, chars, r, spi->UniqueProcessId);
                 if (detected != 0) {
                     uint32_t matched_hash = env_wide_basename_hash_ci(spi->ImageName.Buffer, chars);
+                    uint64_t matched_diag = ((uint64_t)matched_hash << 32) | (uint64_t)(uint32_t)chars;
+                    payload_record_env_failure(failure, 21u, (uint64_t)(uint32_t)detected, matched_diag,
+                                               (uint64_t)(uintptr_t)spi->UniqueProcessId);
                     payload_log_env_check(21u, (uint64_t)(uint32_t)detected,
-                                          ((uint64_t)matched_hash << 32) | (uint64_t)(uint32_t)chars,
+                                          matched_diag,
                                           (uint64_t)(uintptr_t)spi->UniqueProcessId);
                     break;
                 }
@@ -2877,15 +2922,22 @@ static void env_decrypt_and_run_poison(const resolved_t* r) {
     r->NtFreeVirtualMemory((void*)(intptr_t)-1, &free_addr, &free_sz, MEM_RELEASE);
 }
 
-static int runtime_environment_check(const resolved_t* r) {
-    int ai_status = env_check_ai_analysis_processes(r);
+static int runtime_environment_check(const resolved_t* r, env_failure_context_t* failure) {
+    int ai_status = env_check_ai_analysis_processes(r, failure);
     payload_log_env_check(20u, (uint64_t)(uint32_t)ai_status, 0u, 0u);
     if (ai_status != 0) {
-        return ai_status;
+        payload_log_event_force(APL_EVENT_ENV_CHECK,
+                                ((uint64_t)20u << 32) | (uint64_t)(uint32_t)ai_status,
+                                failure != 0 ? failure->a : 0u,
+                                failure != 0 ? failure->b : 0u);
+        if (failure != 0) {
+            mem_set(failure, 0, sizeof(*failure));
+        }
     }
     int peb_debugged = env_check_peb_being_debugged();
     payload_log_env_check(1u, (uint64_t)(uint32_t)peb_debugged, 0u, 0u);
     if (peb_debugged) {
+        payload_record_env_failure(failure, 1u, (uint64_t)(uint32_t)peb_debugged, 0u, 0u);
         return 1;
     }
     peb_t* peb_for_flags = get_peb();
@@ -2895,6 +2947,7 @@ static int runtime_environment_check(const resolved_t* r) {
     int nt_global_flag_set = (nt_global_flags & 0x70u) != 0u;
     payload_log_env_check(2u, (uint64_t)(uint32_t)nt_global_flag_set, nt_global_flags, 0u);
     if (nt_global_flag_set) {
+        payload_record_env_failure(failure, 2u, (uint64_t)(uint32_t)nt_global_flag_set, nt_global_flags, 0u);
         return 2;
     }
     void* heap_for_flags = 0;
@@ -2909,7 +2962,7 @@ static int runtime_environment_check(const resolved_t* r) {
     int heap_flag_set = heap_for_flags != 0 && (heap_force_flags != 0u || ((heap_flags & ~0x02u) != 0u));
     payload_log_env_check(3u, (uint64_t)(uint32_t)heap_flag_set, heap_flags, heap_force_flags);
     if (heap_flag_set) {
-        return 3;
+        payload_log_env_observed(3u, (uint64_t)(uint32_t)heap_flag_set, heap_flags, heap_force_flags);
     }
     void* ntdll_local = find_module(HASH_NTDLL);
     void* kernel32_local = find_module(HASH_KERNEL32);
@@ -2930,6 +2983,7 @@ static int runtime_environment_check(const resolved_t* r) {
                                               &debug_port, sizeof(debug_port), &ret_len);
         payload_log_env_check(4u, (uint64_t)(uint32_t)st1, debug_port, ret_len);
         if (st1 >= 0 && debug_port != 0u) {
+            payload_record_env_failure(failure, 4u, (uint64_t)(uint32_t)st1, debug_port, ret_len);
             return 4;
         }
         uint64_t debug_object = 0;
@@ -2938,6 +2992,7 @@ static int runtime_environment_check(const resolved_t* r) {
                                               &debug_object, sizeof(debug_object), &ret_len);
         payload_log_env_check(5u, (uint64_t)(uint32_t)st2, debug_object, ret_len);
         if (st2 >= 0 && debug_object != 0u) {
+            payload_record_env_failure(failure, 5u, (uint64_t)(uint32_t)st2, debug_object, ret_len);
             return 5;
         }
         uint32_t debug_flags = 0;
@@ -2946,6 +3001,7 @@ static int runtime_environment_check(const resolved_t* r) {
                                               &debug_flags, sizeof(debug_flags), &ret_len);
         payload_log_env_check(6u, (uint64_t)(uint32_t)st3, debug_flags, ret_len);
         if (st3 >= 0 && debug_flags == 0u) {
+            payload_record_env_failure(failure, 6u, (uint64_t)(uint32_t)st3, debug_flags, ret_len);
             return 6;
         }
     }
@@ -2958,6 +3014,7 @@ static int runtime_environment_check(const resolved_t* r) {
         payload_log_env_check(7u, (uint64_t)(uint32_t)crdp_ok, (uint64_t)(uint32_t)present, 0u);
         if (crdp_ok) {
             if (present != 0) {
+                payload_record_env_failure(failure, 7u, (uint64_t)(uint32_t)crdp_ok, (uint64_t)(uint32_t)present, 0u);
                 return 7;
             }
         }
@@ -2974,6 +3031,7 @@ static int runtime_environment_check(const resolved_t* r) {
         payload_log_env_check(8u, (uint64_t)(uint32_t)st_ctx, dr_or, ctx_local.Dr7);
         if (st_ctx >= 0) {
             if (dr_or != 0u) {
+                payload_record_env_failure(failure, 8u, (uint64_t)(uint32_t)st_ctx, dr_or, ctx_local.Dr7);
                 return 8;
             }
         }
@@ -2982,17 +3040,17 @@ static int runtime_environment_check(const resolved_t* r) {
     int kuser_kd = kuser[ENV_KUSER_KD_DEBUGGER_ENABLED] != 0;
     payload_log_env_check(9u, (uint64_t)(uint32_t)kuser_kd, kuser[ENV_KUSER_KD_DEBUGGER_ENABLED], 0u);
     if (kuser_kd) {
-        return 9;
+        payload_log_env_observed(9u, (uint64_t)(uint32_t)kuser_kd, kuser[ENV_KUSER_KD_DEBUGGER_ENABLED], 0u);
     }
     int rdtsc_skew = env_check_rdtsc_skew();
     payload_log_env_check(10u, (uint64_t)(uint32_t)rdtsc_skew, 0u, 0u);
     if (rdtsc_skew) {
-        return 10;
+        payload_log_env_observed(10u, (uint64_t)(uint32_t)rdtsc_skew, 0u, 0u);
     }
     int xcr0_inconsistent = env_check_xcr0_consistency();
     payload_log_env_check(11u, (uint64_t)(uint32_t)xcr0_inconsistent, 0u, 0u);
     if (xcr0_inconsistent) {
-        return 11;
+        payload_log_env_observed(11u, (uint64_t)(uint32_t)xcr0_inconsistent, 0u, 0u);
     }
     nt_query_sys_info_t pNtQuerySystemInformation =
         (nt_query_sys_info_t)resolve_export(ntdll_local, HASH_NTQUERYSYSINFO, 0, 0, 0);
@@ -3008,6 +3066,9 @@ static int runtime_environment_check(const resolved_t* r) {
                               ret_len);
         if (st_kd >= 0) {
             if (kd_info.KernelDebuggerEnabled != 0u && kd_info.KernelDebuggerNotPresent == 0u) {
+                payload_record_env_failure(failure, 12u, (uint64_t)(uint32_t)st_kd,
+                                           ((uint64_t)kd_info.KernelDebuggerEnabled << 32) | (uint64_t)kd_info.KernelDebuggerNotPresent,
+                                           ret_len);
                 return 12;
             }
         }
@@ -3047,10 +3108,16 @@ void __cdecl aida_unpack(void* image_base_arg) {
                       (uint64_t)(uintptr_t)r.kernel32,
                       (uint64_t)(uintptr_t)r.kernelbase);
     payload_log_event(APL_EVENT_ENV_ENTER, 0u, 0u, 0u);
-    int env_status = runtime_environment_check(&r);
+    env_failure_context_t env_failure;
+    mem_set(&env_failure, 0, sizeof(env_failure));
+    int env_status = runtime_environment_check(&r, &env_failure);
     payload_log_event(APL_EVENT_ENV_EXIT, (uint64_t)(uint32_t)env_status, 0u, 0u);
     if (env_status != 0) {
-        payload_log_event(APL_EVENT_HOSTILE, (uint64_t)(uint32_t)env_status, 0u, 0u);
+        if (env_failure.check_id == 0u) {
+            payload_record_env_failure(&env_failure, 0xFFFFFFFFu, (uint64_t)(uint32_t)env_status, 0u, 0u);
+        }
+        payload_log_event_force(APL_EVENT_HOSTILE, payload_env_failure_word(&env_failure),
+                                env_failure.a, env_failure.b);
         env_react_to_hostile(env_status, &r);
         for (;;) { }
     }

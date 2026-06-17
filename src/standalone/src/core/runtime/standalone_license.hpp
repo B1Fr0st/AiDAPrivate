@@ -101,6 +101,7 @@ namespace standalone_license
 
     bool is_arc_loaded();
     bool is_arc_download_in_progress();
+    bool is_arc_transfer_in_progress();
     bool validate_arc_required_exports(std::string& missing_out);
     uint64_t activation_completed_at();
     using arc_comm_bridge_callback_t = bool (*)(const arc_comm_vtable_t*, void*);

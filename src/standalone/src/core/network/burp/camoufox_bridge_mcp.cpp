@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cctype>
+#include <cstdint>
 #include <filesystem>
 #include <sstream>
 #include <string>
@@ -28,6 +29,8 @@ namespace {
 using mcp_standalone::tool_result_t;
 using nlohmann::json;
 
+constexpr uint32_t kMinReadyBrowserProcessCount = 2;
+
 const char* state_label(camoufox::bridge_state_t s)
 {
     switch (s)
@@ -38,6 +41,11 @@ const char* state_label(camoufox::bridge_state_t s)
         case camoufox::bridge_state_t::error:    return "error";
     }
     return "unknown";
+}
+
+bool bridge_process_tree_ready(const camoufox::bridge_status_t& s)
+{
+    return s.browser_process_count >= kMinReadyBrowserProcessCount;
 }
 
 json status_to_json(const camoufox::bridge_status_t& s)
@@ -94,13 +102,13 @@ json status_to_json(const camoufox::bridge_status_t& s)
     j["last_nav_ms"]      = s.last_nav_ms;
     j["last_cleanup_ms"]  = s.last_cleanup_ms;
     j["last_verified_ms"] = s.last_verified_ms;
-    j["ready"]            = s.state == camoufox::bridge_state_t::ready && s.browser_open && s.page_verified && s.privacy_verified && s.child_alive && !s.cleanup_pending;
+    j["ready"]            = s.state == camoufox::bridge_state_t::ready && s.browser_open && s.page_verified && s.privacy_verified && s.child_alive && bridge_process_tree_ready(s) && !s.cleanup_pending;
     return j;
 }
 
 bool bridge_ready(const camoufox::bridge_status_t& s)
 {
-    return s.state == camoufox::bridge_state_t::ready && s.browser_open && s.page_verified && s.privacy_verified && s.child_alive && !s.cleanup_pending;
+    return s.state == camoufox::bridge_state_t::ready && s.browser_open && s.page_verified && s.privacy_verified && s.child_alive && bridge_process_tree_ready(s) && !s.cleanup_pending;
 }
 
 void attach_privacy_status(tool_result_t& out, const camoufox::bridge_status_t& s)
@@ -967,8 +975,22 @@ tool_result_t tool_launch_browser(const json& params)
 tool_result_t tool_close_browser(const json& params)
 {
     const std::string session_id = json_string_param(params, "session_id", "default");
+    const auto before = camoufox::get_status(session_id);
+    diag::log_tagged_fmt("mcp_burp", "camoufox_close_browser entry session_id=%s state=%s generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d browser_processes=%u child_processes=%u cleanup_pending=%d",
+        session_id.c_str(), state_label(before.state), static_cast<unsigned long long>(before.generation),
+        static_cast<unsigned long>(before.child_pid), static_cast<int>(before.child_alive),
+        static_cast<int>(before.browser_open), static_cast<int>(before.page_verified),
+        static_cast<unsigned>(before.browser_process_count), static_cast<unsigned>(before.child_process_count),
+        static_cast<int>(before.cleanup_pending));
     bool ok = camoufox::stop_bridge(session_id, "camoufox_mcp.close_browser");
-    json j = status_to_json(camoufox::get_status(session_id));
+    const auto after = camoufox::get_status(session_id);
+    diag::log_tagged_fmt("mcp_burp", "camoufox_close_browser exit session_id=%s ok=%d state=%s generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d browser_processes=%u child_processes=%u cleanup_pending=%d err=%s",
+        session_id.c_str(), static_cast<int>(ok), state_label(after.state), static_cast<unsigned long long>(after.generation),
+        static_cast<unsigned long>(after.child_pid), static_cast<int>(after.child_alive),
+        static_cast<int>(after.browser_open), static_cast<int>(after.page_verified),
+        static_cast<unsigned>(after.browser_process_count), static_cast<unsigned>(after.child_process_count),
+        static_cast<int>(after.cleanup_pending), after.last_error.c_str());
+    json j = status_to_json(after);
     if (!ok)
     {
         tool_result_t out;

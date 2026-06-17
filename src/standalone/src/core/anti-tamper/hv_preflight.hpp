@@ -773,7 +773,7 @@ inline bool acquire_system_environment_privilege()
         return false;
 
     LUID luid{};
-    if (!LookupPrivilegeValueW(nullptr, SE_SYSTEM_ENVIRONMENT_NAME, &luid))
+    if (!LookupPrivilegeValueW(nullptr, L"SeSystemEnvironmentPrivilege", &luid))
     {
         CloseHandle(token);
         return false;

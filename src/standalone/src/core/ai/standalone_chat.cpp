@@ -81,6 +81,7 @@ static file_context::tracker_t s_file_tracker;
 
 
 static auto_approval::task_counters_t s_approval_counters;
+static std::mutex                     s_approval_counters_mtx;
 
 namespace {
 
@@ -174,6 +175,25 @@ struct tool_approval_t {
 tool_approval_t s_tool_approval;
 
 thread_local std::string t_tool_approval_deny_reason;
+std::atomic<uint64_t> s_tool_fanout_group_seq{0};
+
+auto_approval::task_counters_t approval_counters_snapshot()
+{
+    std::lock_guard<std::mutex> lk(s_approval_counters_mtx);
+    return s_approval_counters;
+}
+
+void reset_approval_counters()
+{
+    std::lock_guard<std::mutex> lk(s_approval_counters_mtx);
+    s_approval_counters = auto_approval::task_counters_t{};
+}
+
+void note_tool_execution_for_approval_limits()
+{
+    std::lock_guard<std::mutex> lk(s_approval_counters_mtx);
+    s_approval_counters.auto_approved_requests++;
+}
 
 void queue_mcp_services_shutdown(const char* reason, bool stop_server, bool disconnect_clients)
 {
@@ -358,9 +378,35 @@ bool tool_path_is_protected(const std::string& raw_path)
     return false;
 }
 
-bool request_tool_approval(const std::string& name, const json& arguments)
+enum class tool_approval_probe_t
 {
-    t_tool_approval_deny_reason.clear();
+    approved,
+    denied,
+    needs_prompt
+};
+
+auto_approval::settings_t current_auto_approval_settings()
+{
+    auto_approval::settings_t aa_settings;
+    aa_settings.always_allow_read_only   = g_sa_settings.auto_approve_read;
+    aa_settings.always_allow_write       = g_sa_settings.auto_approve_write;
+    aa_settings.always_allow_execute     = g_sa_settings.auto_approve_execute;
+    aa_settings.always_allow_mcp         = g_sa_settings.auto_approve_mcp;
+    aa_settings.always_allow_mode_switch = g_sa_settings.auto_approve_mode_switch;
+    aa_settings.always_allow_subtasks    = g_sa_settings.auto_approve_subtask;
+    aa_settings.max_requests             = g_sa_settings.auto_approve_max_requests;
+    aa_settings.max_cost_usd             = g_sa_settings.auto_approve_max_cost;
+    aa_settings.allowed_commands         = g_sa_settings.auto_approve_allowed_commands;
+    return aa_settings;
+}
+
+tool_approval_probe_t probe_tool_approval_without_prompt(
+    const std::string& name,
+    const json& arguments,
+    const auto_approval::task_counters_t& counters,
+    std::string& deny_reason)
+{
+    deny_reason.clear();
 
     {
         aida::agent::initialize();
@@ -378,16 +424,14 @@ bool request_tool_approval(const std::string& name, const json& arguments)
 
             if (eval_specific == aida::agent::permission_rule_t::action_t::deny ||
                 eval_tool     == aida::agent::permission_rule_t::action_t::deny) {
-                t_tool_approval_deny_reason =
-                    "Error: " + agent->name + " mode forbids this tool: " + name;
-                return false;
+                deny_reason = "Error: " + agent->name + " mode forbids this tool: " + name;
+                return tool_approval_probe_t::denied;
             }
         }
     }
 
     if (g_sa_settings.tool_auto_approve)
-        return true;
-
+        return tool_approval_probe_t::approved;
 
     if (!g_sa_settings.tool_always_allow.empty()) {
         std::istringstream ss(g_sa_settings.tool_always_allow);
@@ -395,10 +439,9 @@ bool request_tool_approval(const std::string& name, const json& arguments)
         while (std::getline(ss, tok, ',')) {
             while (!tok.empty() && tok.front() == ' ') tok.erase(tok.begin());
             while (!tok.empty() && tok.back() == ' ') tok.pop_back();
-            if (tok == name) return true;
+            if (tok == name) return tool_approval_probe_t::approved;
         }
     }
-
 
     if (!g_sa_settings.tool_always_deny.empty()) {
         std::istringstream ss(g_sa_settings.tool_always_deny);
@@ -407,59 +450,57 @@ bool request_tool_approval(const std::string& name, const json& arguments)
             while (!tok.empty() && tok.front() == ' ') tok.erase(tok.begin());
             while (!tok.empty() && tok.back() == ' ') tok.pop_back();
             if (tok == name) {
-                t_tool_approval_deny_reason =
-                    "Error: tool '" + name + "' is in the always-deny list.";
-                return false;
+                deny_reason = "Error: tool '" + name + "' is in the always-deny list.";
+                return tool_approval_probe_t::denied;
             }
         }
     }
 
+    auto_approval::settings_t aa_settings = current_auto_approval_settings();
 
-    {
-        auto_approval::settings_t aa_settings;
-        aa_settings.always_allow_read_only  = g_sa_settings.auto_approve_read;
-        aa_settings.always_allow_write      = g_sa_settings.auto_approve_write;
-        aa_settings.always_allow_execute    = g_sa_settings.auto_approve_execute;
-        aa_settings.always_allow_mcp        = g_sa_settings.auto_approve_mcp;
-        aa_settings.always_allow_mode_switch = g_sa_settings.auto_approve_mode_switch;
-        aa_settings.always_allow_subtasks   = g_sa_settings.auto_approve_subtask;
-        aa_settings.max_requests            = g_sa_settings.auto_approve_max_requests;
-        aa_settings.max_cost_usd            = g_sa_settings.auto_approve_max_cost;
-
-
-        aa_settings.allowed_commands = g_sa_settings.auto_approve_allowed_commands;
-
-
-        if (arguments.contains("path") && arguments["path"].is_string()) {
-            std::string path = arguments["path"].get<std::string>();
-            auto ignore_patterns = auto_approval::load_aidaignore(g_sa_settings.aidaignore_path);
-            if (auto_approval::matches_aidaignore(path, ignore_patterns)) {
-                t_tool_approval_deny_reason =
-                    "Error: path '" + path + "' is excluded by .aidaignore.";
-                return false;
-            }
+    if (arguments.contains("path") && arguments["path"].is_string()) {
+        std::string path = arguments["path"].get<std::string>();
+        auto ignore_patterns = auto_approval::load_aidaignore(g_sa_settings.aidaignore_path);
+        if (auto_approval::matches_aidaignore(path, ignore_patterns)) {
+            deny_reason = "Error: path '" + path + "' is excluded by .aidaignore.";
+            return tool_approval_probe_t::denied;
         }
+    }
 
+    std::string command;
+    if (name == "execute_command" && arguments.contains("command") &&
+        arguments["command"].is_string())
+        command = arguments["command"].get<std::string>();
 
-        std::string command;
-        if (name == "execute_command" && arguments.contains("command") &&
-            arguments["command"].is_string())
-            command = arguments["command"].get<std::string>();
+    const std::string arg_path = extract_tool_path_argument(name, arguments);
+    const bool file_outside_workspace = tool_path_is_outside_workspace(arg_path);
+    const bool file_is_protected      = tool_path_is_protected(arg_path);
 
-        const std::string arg_path = extract_tool_path_argument(name, arguments);
-        const bool file_outside_workspace = tool_path_is_outside_workspace(arg_path);
-        const bool file_is_protected      = tool_path_is_protected(arg_path);
+    auto decision = auto_approval::should_auto_approve(
+            name, aa_settings, counters, command,
+            file_outside_workspace, file_is_protected);
+    if (decision == auto_approval::approval_decision_t::approve)
+        return tool_approval_probe_t::approved;
+    if (decision == auto_approval::approval_decision_t::deny) {
+        deny_reason = "Error: auto-approval policy denied tool '" + name + "'.";
+        return tool_approval_probe_t::denied;
+    }
 
-        auto decision = auto_approval::should_auto_approve(
-                name, aa_settings, s_approval_counters, command,
-                file_outside_workspace, file_is_protected);
-        if (decision == auto_approval::approval_decision_t::approve)
-            return true;
-        if (decision == auto_approval::approval_decision_t::deny) {
-            t_tool_approval_deny_reason =
-                "Error: auto-approval policy denied tool '" + name + "'.";
-            return false;
-        }
+    return tool_approval_probe_t::needs_prompt;
+}
+
+bool request_tool_approval(const std::string& name, const json& arguments)
+{
+    t_tool_approval_deny_reason.clear();
+
+    std::string deny_reason;
+    const auto probe = probe_tool_approval_without_prompt(
+        name, arguments, approval_counters_snapshot(), deny_reason);
+    if (probe == tool_approval_probe_t::approved)
+        return true;
+    if (probe == tool_approval_probe_t::denied) {
+        t_tool_approval_deny_reason = deny_reason;
+        return false;
     }
 
 
@@ -704,8 +745,7 @@ std::string build_system_prompt(bool force_xml_fallback = false)
     return prompt;
 }
 
-
-std::string execute_tool(const std::string& raw_name, const json& arguments)
+std::string canonical_tool_name_for_dispatch(const std::string& raw_name)
 {
     static const std::map<std::string, std::string> alias_map = {
         {"write_to_file",      "write_file"},
@@ -715,11 +755,16 @@ std::string execute_tool(const std::string& raw_name, const json& arguments)
         {"read_file_content",  "read_file"},
         {"write_file_content", "write_file"},
     };
-    std::string name = raw_name;
-    {
-        auto it = alias_map.find(raw_name);
-        if (it != alias_map.end()) name = it->second;
-    }
+    auto it = alias_map.find(raw_name);
+    if (it != alias_map.end())
+        return it->second;
+    return raw_name;
+}
+
+
+std::string execute_tool(const std::string& raw_name, const json& arguments)
+{
+    std::string name = canonical_tool_name_for_dispatch(raw_name);
 
     (void)standalone_license::verify_entitlement_state();
     {
@@ -736,7 +781,7 @@ std::string execute_tool(const std::string& raw_name, const json& arguments)
     output_log::push(bottom_tab_t::mcp_log, "[tool] Executing: " + name);
 
 
-    s_approval_counters.auto_approved_requests++;
+    note_tool_execution_for_approval_limits();
 
 
     if (arguments.contains("path") && arguments["path"].is_string()) {
@@ -908,41 +953,12 @@ std::string execute_tool(const std::string& raw_name, const json& arguments)
         if (t.name == name) {
             mcp_standalone::tool_result_t tr;
             auto t_start = std::chrono::steady_clock::now();
-            std::string scope_err;
-            std::string scope_id_used;
-            bool scope_swapped = false;
-            {
-                static std::recursive_mutex s_dispatch_mtx;
-                std::lock_guard<std::recursive_mutex> dlk(s_dispatch_mtx);
-                mcp_standalone::target_scope_t scope =
-                    mcp_standalone::resolve_target(arguments, &scope_err);
-                if (!scope.ok) {
-                    diag::log_tagged_fmt("mcp_standalone",
-                        "dispatch tool='%s' resolve_failed err='%s'",
-                        name.c_str(), scope_err.c_str());
-                    return std::string("Error: ") + scope_err;
-                }
-                scope_id_used = scope.resolved_id;
-                scope_swapped = scope.swapped;
-                try {
-                    tr = t.handler(arguments);
-                } catch (const std::exception& e) {
-                    diag::log_tagged_fmt("mcp_standalone",
-                        "dispatch tool='%s' exception='%s'", name.c_str(), e.what());
-                    return std::string("Error: ") + e.what();
-                } catch (...) {
-                    diag::log_tagged_fmt("mcp_standalone",
-                        "dispatch tool='%s' unknown_exception", name.c_str());
-                    return "Error: Unknown exception executing tool.";
-                }
-            }
+            tr = s_mcp_server.call_registered_tool(name, arguments, false);
             auto t_end = std::chrono::steady_clock::now();
             auto dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
             diag::log_tagged_fmt("mcp_standalone",
-                "dispatch tool='%s' binary_id='%s' swapped=%d ok=%d duration_ms=%lld",
+                "dispatch tool='%s' ok=%d duration_ms=%lld",
                 name.c_str(),
-                scope_id_used.c_str(),
-                scope_swapped ? 1 : 0,
                 tr.success ? 1 : 0,
                 static_cast<long long>(dur_ms));
             std::string output = tr.text;
@@ -960,12 +976,446 @@ std::string execute_tool(const std::string& raw_name, const json& arguments)
     return "Error: Unknown tool '" + name + "'. Use the tools/list to see available tools.";
 }
 
+bool tool_name_is_serial_chat_control(const std::string& name)
+{
+    static const char* const serial_tools[] = {
+        "switch_agent",
+        "plan_enter",
+        "plan_exit",
+        "task",
+        "ask_followup_question",
+        "attempt_completion",
+        "update_todo_list",
+        "save_checkpoint",
+        "restore_checkpoint",
+        "skill",
+        "run_slash_command"
+    };
+    for (const char* serial : serial_tools) {
+        if (name == serial)
+            return true;
+    }
+    return false;
+}
+
+bool annotation_read_only_hint_true(const json& annotations)
+{
+    if (!annotations.is_object())
+        return false;
+    if (!annotations.contains("readOnlyHint") || !annotations["readOnlyHint"].is_boolean())
+        return false;
+    return annotations["readOnlyHint"].get<bool>();
+}
+
+bool tool_can_enter_fanout_group(const std::string& raw_name)
+{
+    const std::string name = canonical_tool_name_for_dispatch(raw_name);
+    if (tool_name_is_serial_chat_control(name))
+        return false;
+
+    if (name.size() > 5 && name.substr(0, 5) == "mcp::") {
+        const std::string remote_name = name.substr(5);
+        auto remote_tools = s_mcp_client_mgr.get_all_tools();
+        for (const auto& rt : remote_tools) {
+            if (rt.name == remote_name || rt.original_name == remote_name)
+                return annotation_read_only_hint_true(rt.annotations);
+        }
+        return false;
+    }
+
+    const auto& tools = s_mcp_server.get_tools();
+    for (const auto& t : tools) {
+        if (t.name == name)
+            return t.read_only && !tool_name_is_serial_chat_control(t.name);
+    }
+
+    return false;
+}
+
+struct tool_execution_request_t
+{
+    size_t      index = 0;
+    std::string id;
+    std::string name;
+    json        arguments;
+};
+
+struct tool_execution_result_t
+{
+    bool        ready = false;
+    bool        executed = false;
+    bool        is_error = false;
+    std::string text;
+};
+
+size_t tool_fanout_worker_limit(size_t group_size)
+{
+    if (group_size <= 1)
+        return group_size;
+    size_t limit = 30;
+    const unsigned int hw = std::thread::hardware_concurrency();
+    if (hw > 0)
+        limit = (std::min)(limit, static_cast<size_t>(hw));
+    limit = (std::max)(limit, static_cast<size_t>(1));
+    return (std::min)(limit, group_size);
+}
+
+bool tool_runtime_preflight(const std::string& tool_name, std::string& error_text)
+{
+    uint64_t gate = standalone_license::inline_gate_check(
+        standalone_license::gate_chat_tool_exec);
+    if (!standalone_license::verify_tool_runtime(
+            standalone_license::gate_chat_tool_exec, gate, tool_name)) {
+        error_text = "Service unavailable.";
+        return false;
+    }
+
+    if (!standalone_license::inline_proof_check_d()) {
+        error_text = "Error: Tool execution timed out.";
+        return false;
+    }
+
+    error_text.clear();
+    return true;
+}
+
+void apply_tool_repetition_guard(
+    const std::string& tool_name,
+    const json& arguments,
+    std::string& result)
+{
+    std::string repetition_msg;
+    const auto rep_decision =
+        note_tool_repetition(tool_name, arguments, repetition_msg);
+    if (rep_decision != tool_repetition_decision_t::none && !repetition_msg.empty()) {
+        post_update(ai_update_t::THINKING, repetition_msg);
+        output_log::push(bottom_tab_t::output,
+            "[ai] repetition detector: " + repetition_msg);
+        if (rep_decision == tool_repetition_decision_t::force_ask &&
+            tool_name != "ask_followup_question") {
+            result += "\n\n[repetition guard] " + repetition_msg;
+        }
+    }
+}
+
+std::vector<tool_execution_result_t> execute_approved_tool_group(
+    const std::vector<tool_execution_request_t>& group)
+{
+    std::vector<tool_execution_result_t> results(group.size());
+    if (group.empty())
+        return results;
+
+    const uint64_t group_seq = s_tool_fanout_group_seq.fetch_add(1, std::memory_order_acq_rel) + 1;
+    const size_t worker_count = tool_fanout_worker_limit(group.size());
+    const auto group_start = std::chrono::steady_clock::now();
+
+    diag::log_tagged_fmt("chat",
+        "agent_tool_fanout_group_start seq=%llu group_size=%zu workers=%zu",
+        static_cast<unsigned long long>(group_seq),
+        group.size(),
+        worker_count);
+
+    if (group.size() == 1)
+        post_update(ai_update_t::THINKING, "Calling " + group.front().name + "...");
+    else
+        post_update(ai_update_t::THINKING, "Calling " + std::to_string(group.size()) + " tools...");
+
+    std::atomic<size_t> next_index{0};
+    std::vector<aida::infra::win_thread::joinable_thread_t> workers;
+    workers.reserve(worker_count);
+
+    auto worker_body = [&](size_t worker_index) {
+            const auto worker_start = std::chrono::steady_clock::now();
+            size_t claimed = 0;
+            diag::log_tagged_fmt("chat",
+                "agent_tool_fanout_worker_start seq=%llu worker=%zu tid=%lu",
+                static_cast<unsigned long long>(group_seq),
+                worker_index,
+                GetCurrentThreadId());
+
+            for (;;) {
+                if (s_cancel.load(std::memory_order_acquire)) {
+                    diag::log_tagged_fmt("chat",
+                        "agent_tool_fanout_worker_cancel seq=%llu worker=%zu claimed=%zu",
+                        static_cast<unsigned long long>(group_seq),
+                        worker_index,
+                        claimed);
+                    break;
+                }
+
+                const size_t local_index = next_index.fetch_add(1, std::memory_order_acq_rel);
+                if (local_index >= group.size())
+                    break;
+
+                const auto& req = group[local_index];
+                const auto call_start = std::chrono::steady_clock::now();
+                diag::log_tagged_fmt("chat",
+                    "agent_tool_fanout_call_start seq=%llu worker=%zu pos=%zu original=%zu tool=%.96s",
+                    static_cast<unsigned long long>(group_seq),
+                    worker_index,
+                    local_index,
+                    req.index,
+                    req.name.c_str());
+
+                std::string result;
+                try {
+                    result = execute_tool(req.name, req.arguments);
+                } catch (const std::exception& e) {
+                    result = std::string("Error: Tool threw exception: ") + e.what();
+                    diag::log_tagged_fmt("chat",
+                        "agent_tool_fanout_call_exception seq=%llu worker=%zu pos=%zu tool=%.96s what=%.200s",
+                        static_cast<unsigned long long>(group_seq),
+                        worker_index,
+                        local_index,
+                        req.name.c_str(),
+                        e.what());
+                } catch (...) {
+                    result = "Error: Tool threw unknown exception.";
+                    diag::log_tagged_fmt("chat",
+                        "agent_tool_fanout_call_exception seq=%llu worker=%zu pos=%zu tool=%.96s what=<unknown>",
+                        static_cast<unsigned long long>(group_seq),
+                        worker_index,
+                        local_index,
+                        req.name.c_str());
+                }
+
+                const auto call_end = std::chrono::steady_clock::now();
+                auto& out = results[local_index];
+                out.ready = true;
+                out.executed = true;
+                out.text = std::move(result);
+                out.is_error = (out.text.size() >= 6 && out.text.substr(0, 6) == "Error:");
+                claimed++;
+
+                diag::log_tagged_fmt("chat",
+                    "agent_tool_fanout_call_finish seq=%llu worker=%zu pos=%zu original=%zu tool=%.96s is_error=%d cancelled=%d elapsed_ms=%lld result_len=%zu",
+                    static_cast<unsigned long long>(group_seq),
+                    worker_index,
+                    local_index,
+                    req.index,
+                    req.name.c_str(),
+                    out.is_error ? 1 : 0,
+                    s_cancel.load(std::memory_order_acquire) ? 1 : 0,
+                    static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(call_end - call_start).count()),
+                    out.text.size());
+            }
+
+            const auto worker_end = std::chrono::steady_clock::now();
+            diag::log_tagged_fmt("chat",
+                "agent_tool_fanout_worker_finish seq=%llu worker=%zu claimed=%zu cancelled=%d elapsed_ms=%lld",
+                static_cast<unsigned long long>(group_seq),
+                worker_index,
+                claimed,
+                s_cancel.load(std::memory_order_acquire) ? 1 : 0,
+                static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(worker_end - worker_start).count()));
+    };
+
+    for (size_t worker_index = 0; worker_index < worker_count; ++worker_index) {
+        aida::infra::win_thread::joinable_thread_t worker;
+        std::string err;
+        const bool started = worker.start([&, worker_index]() {
+            worker_body(worker_index);
+        }, &err, aida::infra::win_thread::default_stack_reserve, "agent_tool_fanout");
+        if (started) {
+            workers.emplace_back(std::move(worker));
+            continue;
+        }
+        diag::log_tagged_fmt("chat",
+            "agent_tool_fanout_worker_start_failed seq=%llu worker=%zu err=%.200s",
+            static_cast<unsigned long long>(group_seq),
+            worker_index,
+            err.empty() ? "<none>" : err.c_str());
+    }
+
+    if (workers.empty())
+        worker_body(0);
+
+    for (auto& worker : workers)
+        if (worker.joinable())
+            worker.join();
+
+    const auto group_end = std::chrono::steady_clock::now();
+    diag::log_tagged_fmt("chat",
+        "agent_tool_fanout_group_finish seq=%llu group_size=%zu workers=%zu cancelled=%d elapsed_ms=%lld",
+        static_cast<unsigned long long>(group_seq),
+        group.size(),
+        worker_count,
+        s_cancel.load(std::memory_order_acquire) ? 1 : 0,
+        static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(group_end - group_start).count()));
+
+    return results;
+}
+
+bool run_ordered_tool_calls(
+    const std::vector<tool_execution_request_t>& calls,
+    std::vector<tool_execution_result_t>& ordered_results)
+{
+    ordered_results.assign(calls.size(), tool_execution_result_t{});
+    std::vector<tool_execution_request_t> group;
+    auto projected_counters = approval_counters_snapshot();
+
+    auto flush_group = [&]() -> bool {
+        if (group.empty())
+            return true;
+
+        auto group_results = execute_approved_tool_group(group);
+        for (size_t i = 0; i < group.size(); ++i) {
+            tool_execution_result_t result = std::move(group_results[i]);
+            if (!result.ready) {
+                result.ready = true;
+                result.is_error = true;
+                result.text = s_cancel.load(std::memory_order_acquire)
+                    ? "Error: Tool execution cancelled."
+                    : "Error: Tool execution did not produce a result.";
+            }
+            if (result.executed)
+                apply_tool_repetition_guard(group[i].name, group[i].arguments, result.text);
+            ordered_results[group[i].index] = std::move(result);
+        }
+
+        group.clear();
+        projected_counters = approval_counters_snapshot();
+
+        if (s_cancel.load(std::memory_order_acquire)) {
+            diag::log_tagged("chat", "agent_tool_fanout_cancel_after_group");
+            return false;
+        }
+
+        return true;
+    };
+
+    for (const auto& req : calls) {
+        if (s_cancel.load(std::memory_order_acquire)) {
+            diag::log_tagged("chat", "agent_tool_fanout_cancel_before_call");
+            return false;
+        }
+
+        std::string security_error;
+        if (!tool_runtime_preflight(req.name, security_error)) {
+            if (!flush_group())
+                return false;
+            tool_execution_result_t result;
+            result.ready = true;
+            result.is_error = true;
+            result.text = security_error;
+            ordered_results[req.index] = std::move(result);
+            diag::log_tagged_fmt("chat",
+                "agent_tool_fanout_security_block original=%zu tool=%.96s reason=%.160s",
+                req.index,
+                req.name.c_str(),
+                security_error.c_str());
+            continue;
+        }
+
+        std::string deny_reason;
+        const auto approval = probe_tool_approval_without_prompt(
+            req.name, req.arguments, projected_counters, deny_reason);
+
+        if (approval == tool_approval_probe_t::approved) {
+            auto_approval::task_counters_t next_projection = projected_counters;
+            next_projection.auto_approved_requests++;
+            projected_counters = next_projection;
+            if (tool_can_enter_fanout_group(req.name)) {
+                group.push_back(req);
+                continue;
+            }
+
+            if (!flush_group())
+                return false;
+
+            if (!tool_runtime_preflight(req.name, security_error)) {
+                tool_execution_result_t result;
+                result.ready = true;
+                result.is_error = true;
+                result.text = security_error;
+                ordered_results[req.index] = std::move(result);
+                diag::log_tagged_fmt("chat",
+                    "agent_tool_fanout_serial_security_block original=%zu tool=%.96s reason=%.160s",
+                    req.index,
+                    req.name.c_str(),
+                    security_error.c_str());
+                continue;
+            }
+
+            post_update(ai_update_t::THINKING, "Calling " + req.name + "...");
+
+            tool_execution_result_t result;
+            result.ready = true;
+            result.executed = true;
+            result.text = execute_tool(req.name, req.arguments);
+            result.is_error = (result.text.size() >= 6 && result.text.substr(0, 6) == "Error:");
+            apply_tool_repetition_guard(req.name, req.arguments, result.text);
+            ordered_results[req.index] = std::move(result);
+            projected_counters = approval_counters_snapshot();
+            continue;
+        }
+
+        if (!flush_group())
+            return false;
+
+        if (approval == tool_approval_probe_t::denied) {
+            tool_execution_result_t result;
+            result.ready = true;
+            result.is_error = true;
+            result.text = deny_reason.empty()
+                ? std::string("Tool execution denied by policy.")
+                : deny_reason;
+            ordered_results[req.index] = std::move(result);
+            continue;
+        }
+
+        if (s_cancel.load(std::memory_order_acquire)) {
+            diag::log_tagged("chat", "agent_tool_fanout_cancel_before_prompt");
+            return false;
+        }
+
+        post_update(ai_update_t::THINKING, "Calling " + req.name + "...");
+
+        if (!tool_runtime_preflight(req.name, security_error)) {
+            tool_execution_result_t result;
+            result.ready = true;
+            result.is_error = true;
+            result.text = security_error;
+            ordered_results[req.index] = std::move(result);
+            diag::log_tagged_fmt("chat",
+                "agent_tool_fanout_prompt_security_block original=%zu tool=%.96s reason=%.160s",
+                req.index,
+                req.name.c_str(),
+                security_error.c_str());
+            continue;
+        }
+
+        if (!request_tool_approval(req.name, req.arguments)) {
+            const std::string& deny_text_ref = tool_approval_last_deny_reason();
+            tool_execution_result_t result;
+            result.ready = true;
+            result.is_error = true;
+            result.text = deny_text_ref.empty()
+                ? std::string("Tool execution denied by user.")
+                : deny_text_ref;
+            ordered_results[req.index] = std::move(result);
+            continue;
+        }
+
+        tool_execution_result_t result;
+        result.ready = true;
+        result.executed = true;
+        result.text = execute_tool(req.name, req.arguments);
+        result.is_error = (result.text.size() >= 6 && result.text.substr(0, 6) == "Error:");
+        apply_tool_repetition_guard(req.name, req.arguments, result.text);
+        ordered_results[req.index] = std::move(result);
+        projected_counters = approval_counters_snapshot();
+    }
+
+    return flush_group();
+}
+
 
 void run_agentic(std::string user_message,
                  std::vector<std::pair<std::string, std::string>> history)
 {
 
-    s_approval_counters = auto_approval::task_counters_t{};
+    reset_approval_counters();
 
     workflow_tools::get_repetition_detector().reset();
 
@@ -1119,57 +1569,27 @@ void run_agentic(std::string user_message,
                 return;
             }
 
+            std::vector<tool_execution_request_t> tool_requests;
+            tool_requests.reserve(calls.size());
+            for (size_t i = 0; i < calls.size(); ++i) {
+                tool_execution_request_t req;
+                req.index = i;
+                req.name = calls[i].name;
+                req.arguments = calls[i].arguments;
+                tool_requests.push_back(std::move(req));
+            }
+
+            std::vector<tool_execution_result_t> ordered_tool_results;
+            if (!run_ordered_tool_calls(tool_requests, ordered_tool_results)) {
+                post_update(ai_update_t::COMPLETE);
+                return;
+            }
+
             std::string tool_results;
-            for (auto& tc : calls) {
-                if (s_cancel.load()) {
-                    post_update(ai_update_t::COMPLETE);
-                    return;
-                }
-                post_update(ai_update_t::THINKING, "Calling " + tc.name + "...");
-
-                {
-                    uint64_t gate = standalone_license::inline_gate_check(
-                        standalone_license::gate_chat_tool_exec);
-                    if (!standalone_license::verify_tool_runtime(
-                            standalone_license::gate_chat_tool_exec, gate, tc.name)) {
-                        tool_results += "\n<tool_result name=\"" + tc.name + "\">\nService unavailable.\n</tool_result>\n";
-                        continue;
-                    }
-                }
-
-                if (!standalone_license::inline_proof_check_d()) {
-                    tool_results += "\n<tool_result name=\"" + tc.name + "\">\nError: Tool execution timed out.\n</tool_result>\n";
-                    continue;
-                }
-
-                if (!request_tool_approval(tc.name, tc.arguments)) {
-                    const std::string& deny_reason = tool_approval_last_deny_reason();
-                    const std::string  deny_text   = deny_reason.empty()
-                        ? std::string("Tool execution denied by user.")
-                        : deny_reason;
-                    tool_results += "\n<tool_result name=\"" + tc.name + "\">\n"
-                                  + deny_text
-                                  + "\n</tool_result>\n";
-                    continue;
-                }
-
-                std::string result = execute_tool(tc.name, tc.arguments);
-
-                std::string repetition_msg;
-                const auto rep_decision =
-                    note_tool_repetition(tc.name, tc.arguments, repetition_msg);
-                if (rep_decision != tool_repetition_decision_t::none && !repetition_msg.empty()) {
-                    post_update(ai_update_t::THINKING, repetition_msg);
-                    output_log::push(bottom_tab_t::output,
-                        "[ai] repetition detector: " + repetition_msg);
-                    if (rep_decision == tool_repetition_decision_t::force_ask &&
-                        tc.name != "ask_followup_question") {
-                        result += "\n\n[repetition guard] " + repetition_msg;
-                    }
-                }
-
-                tool_results += "\n<tool_result name=\"" + tc.name + "\">\n"
-                              + result
+            for (size_t i = 0; i < calls.size(); ++i) {
+                const auto& result = ordered_tool_results[i];
+                tool_results += "\n<tool_result name=\"" + calls[i].name + "\">\n"
+                              + result.text
                               + "\n</tool_result>\n";
             }
 
@@ -1506,57 +1926,29 @@ void run_agentic(std::string user_message,
         messages.push_back({{"role", "assistant"}, {"content", assistant_content}});
 
 
+        std::vector<tool_execution_request_t> tool_requests;
+        tool_requests.reserve(gen.tool_calls.size());
+        for (size_t i = 0; i < gen.tool_calls.size(); ++i) {
+            tool_execution_request_t req;
+            req.index = i;
+            req.id = gen.tool_calls[i].id;
+            req.name = gen.tool_calls[i].name;
+            req.arguments = gen.tool_calls[i].arguments;
+            tool_requests.push_back(std::move(req));
+        }
+
+        std::vector<tool_execution_result_t> ordered_tool_results;
+        if (!run_ordered_tool_calls(tool_requests, ordered_tool_results)) {
+            post_update(ai_update_t::COMPLETE);
+            return;
+        }
+
         json tool_result_content = json::array();
-        for (auto& tc : gen.tool_calls) {
-            if (s_cancel.load()) { post_update(ai_update_t::COMPLETE); return; }
-            post_update(ai_update_t::THINKING, "Calling " + tc.name + "...");
-
-
-            {
-                uint64_t gate = standalone_license::inline_gate_check(
-                    standalone_license::gate_chat_tool_exec);
-                if (!standalone_license::verify_tool_runtime(
-                        standalone_license::gate_chat_tool_exec, gate, tc.name)) {
-                    tool_result_content.push_back(
-                        standalone_ai_client_t::make_tool_result_block(tc.id, "Service unavailable.", true));
-                    continue;
-                }
-            }
-
-            if (!standalone_license::inline_proof_check_d()) {
-                tool_result_content.push_back(
-                    standalone_ai_client_t::make_tool_result_block(tc.id, "Error: Tool execution timed out.", true));
-                continue;
-            }
-
-            if (!request_tool_approval(tc.name, tc.arguments)) {
-                const std::string& deny_reason = tool_approval_last_deny_reason();
-                const std::string  deny_text   = deny_reason.empty()
-                    ? std::string("Tool execution denied by user.")
-                    : deny_reason;
-                tool_result_content.push_back(
-                    standalone_ai_client_t::make_tool_result_block(tc.id, deny_text, true));
-                continue;
-            }
-
-            std::string result = execute_tool(tc.name, tc.arguments);
-
-            std::string repetition_msg;
-            const auto rep_decision =
-                note_tool_repetition(tc.name, tc.arguments, repetition_msg);
-            if (rep_decision != tool_repetition_decision_t::none && !repetition_msg.empty()) {
-                post_update(ai_update_t::THINKING, repetition_msg);
-                output_log::push(bottom_tab_t::output,
-                    "[ai] repetition detector: " + repetition_msg);
-                if (rep_decision == tool_repetition_decision_t::force_ask &&
-                    tc.name != "ask_followup_question") {
-                    result += "\n\n[repetition guard] " + repetition_msg;
-                }
-            }
-
-            bool is_err = (result.size() >= 6 && result.substr(0, 6) == "Error:");
+        for (size_t i = 0; i < gen.tool_calls.size(); ++i) {
+            const auto& tc = gen.tool_calls[i];
+            const auto& result = ordered_tool_results[i];
             tool_result_content.push_back(
-                standalone_ai_client_t::make_tool_result_block(tc.id, result, is_err));
+                standalone_ai_client_t::make_tool_result_block(tc.id, result.text, result.is_error));
         }
 
 
@@ -2340,6 +2732,7 @@ void poll_ai_chat()
         const bool runtime_locked = anti_tamper::state::get().violation_latched.load(std::memory_order_acquire);
         if (license::preserve_valid_state(runtime_locked, test_all_features::is_running())) {
             license::checking = false;
+            license::activation_worker_active.store(false, std::memory_order_release);
             license::check_failed = false;
             license::error_msg.clear();
             diag::log_tagged_fmt("license",

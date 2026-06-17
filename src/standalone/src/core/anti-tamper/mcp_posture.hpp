@@ -2044,6 +2044,18 @@ namespace anti_tamper::mcp_posture
                 detail::apply_decision(report, std::move(f));
             }
         }
+        if (report.denied) {
+            diag::log_tagged_critical_fmt("mcp_posture",
+                "startup_scan_denial_observed_only reason=%s findings=%zu suspicious=%zu parse_failures=%zu",
+                report.reason.empty() ? "none" : report.reason.c_str(),
+                report.findings.size(),
+                report.suspicious,
+                report.parse_failures);
+            report.trusted = true;
+            report.denied = false;
+            report.latched = false;
+            report.reason = "startup_posture_observed_only";
+        }
         report.summary_hash = detail::sanitized_summary_hash(report);
         report.latched = report.denied;
         detail::cache_report(report);

@@ -1,6 +1,7 @@
 #include "aida_pro.hpp"
 
 #include "anti_re.hpp"
+#include "game_stealth.hpp"
 #include "ida_utils.hpp"
 #include "graphrag.hpp"
 #include "analysis_db.hpp"
@@ -796,6 +797,7 @@ bool aida_plugin_t::initialize_operational(bool interactive)
         ui_listener_hooked = true;
 
     register_timer(10000, self_analysis_watchdog, nullptr);
+    game_stealth::install();
 
     features_initialized = true;
     disabled_detail.clear();
@@ -832,6 +834,8 @@ aida_plugin_t::~aida_plugin_t()
 
     if (features_initialized)
     {
+        game_stealth::shutdown();
+
         std::string bin_hash = aida_db::AnalysisDB::instance().get_binary_hash();
         if (!bin_hash.empty())
             graphrag::save_graph(bin_hash);
