@@ -1442,10 +1442,12 @@ inline probe_result_t probe_p31(const context_t& c) {
         seen_packed == packed_count;
     const bool ok = chars_ok && header_ok && table_ok && pool_ok && counts_ok &&
         hash_ok && records_ok && seen_counts_ok && valid_records == record_count;
-    char buf[640];
+    char buf[768];
     std::snprintf(buf, sizeof(buf),
-                  "aifn_count=%zu chars=%d header=%d table=%d pool=%d hash=%d counts=%d records=%u/%u seen=%u/%u/%u/%u expected=%u/%u/%u/%u recomputed_tile=%u recomputed_packed=%u poison_refs=%u bad=%d detail=%s",
+                  "aifn_count=%zu bytes=%zu pool_bytes=%u chars=%d header=%d table=%d pool=%d hash=%d counts=%d records=%u/%u seen=%u/%u/%u/%u expected=%u/%u/%u/%u recomputed_tile=%u recomputed_packed=%u poison_refs=%u bad=%d detail=%s",
                   aifn_count,
+                  payload_size,
+                  string_pool_size,
                   chars_ok ? 1 : 0,
                   header_ok ? 1 : 0,
                   table_ok ? 1 : 0,
@@ -1769,10 +1771,12 @@ inline probe_result_t probe_p32(const context_t& c) {
     const bool unique_ok = std::adjacent_find(seen_keys.begin(), seen_keys.end()) == seen_keys.end();
     const bool ok = chars_ok && header_ok && table_ok && pool_ok && hash_ok &&
         count_header_ok && records_ok && unique_ok && valid_records == record_count;
-    char buf[768];
+    char buf[896];
     std::snprintf(buf, sizeof(buf),
-                  "aipg_count=%zu chars=%d header=%d table=%d pool=%d hash=%d counts=%d records=%u/%u expected=%zu sections=%u/%u ascii=%u utf16=%u structured=%u poison_refs=%u unique=%d bad=%d detail=%s",
+                  "aipg_count=%zu bytes=%zu pool_bytes=%u chars=%d header=%d table=%d pool=%d hash=%d counts=%d records=%u/%u expected=%zu sections=%u/%u ascii=%u utf16=%u structured=%u poison_refs=%u unique=%d bad=%d detail=%s",
                   aipg_count,
+                  payload_size,
+                  string_pool_size,
                   chars_ok ? 1 : 0,
                   header_ok ? 1 : 0,
                   table_ok ? 1 : 0,

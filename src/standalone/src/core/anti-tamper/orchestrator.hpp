@@ -4297,20 +4297,54 @@ inline bool start_monitors()
     return false;
 }
 
+inline void shutdown_phase_run(const char* name, void (*fn)())
+{
+    const uint64_t t0 = GetTickCount64();
+    diag::log_tagged_critical_fmt("anti_tamper", "shutdown_phase_begin name=%s tid=%lu tick=%llu",
+        name ? name : "<null>",
+        GetCurrentThreadId(),
+        static_cast<unsigned long long>(t0));
+    __try
+    {
+        fn();
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        diag::log_tagged_critical_fmt("anti_tamper", "shutdown_phase_seh name=%s code=0x%08X elapsed_ms=%llu last_error=%lu",
+            name ? name : "<null>",
+            GetExceptionCode(),
+            static_cast<unsigned long long>(GetTickCount64() - t0),
+            GetLastError());
+        return;
+    }
+    diag::log_tagged_critical_fmt("anti_tamper", "shutdown_phase_done name=%s elapsed_ms=%llu last_error=%lu",
+        name ? name : "<null>",
+        static_cast<unsigned long long>(GetTickCount64() - t0),
+        GetLastError());
+}
+
 inline void shutdown()
 {
     auto& rt = state::get();
+    diag::log_tagged_critical_fmt("anti_tamper", "shutdown_begin tid=%lu monitors_running=%d violation=%d",
+        GetCurrentThreadId(),
+        rt.monitors_running.load(std::memory_order_acquire) ? 1 : 0,
+        rt.violation_latched.load(std::memory_order_acquire) ? 1 : 0);
     rt.monitors_running.store(false);
-    integrity::periodic::stop();
-    re_detect::shutdown();
-    standalone_anti_dump::shutdown();
-    server_pages::shutdown();
-    nanomites::shutdown();
-    ai_deception::shutdown();
-    code_encrypt::shutdown();
-    packer::shutdown();
-    anti_dump::shutdown();
-    syscall::shutdown();
+    shutdown_phase_run("integrity_periodic_stop", &integrity::periodic::stop);
+    shutdown_phase_run("re_detect_shutdown", &re_detect::shutdown);
+    shutdown_phase_run("standalone_anti_dump_shutdown", &::standalone_anti_dump::shutdown);
+    shutdown_phase_run("server_pages_shutdown", &server_pages::shutdown);
+    shutdown_phase_run("nanomites_shutdown", &nanomites::shutdown);
+    shutdown_phase_run("ai_deception_shutdown", &ai_deception::shutdown);
+    shutdown_phase_run("code_encrypt_shutdown", &code_encrypt::shutdown);
+    shutdown_phase_run("packer_shutdown", &packer::shutdown);
+    shutdown_phase_run("anti_dump_shutdown", &anti_dump::shutdown);
+    shutdown_phase_run("syscall_shutdown", &syscall::shutdown);
+    diag::log_tagged_critical_fmt("anti_tamper", "shutdown_done tid=%lu monitors_running=%d violation=%d",
+        GetCurrentThreadId(),
+        rt.monitors_running.load(std::memory_order_acquire) ? 1 : 0,
+        rt.violation_latched.load(std::memory_order_acquire) ? 1 : 0);
 }
 
 }

@@ -74,6 +74,7 @@ namespace detail {
 
     static constexpr uint32_t MAX_NANOMITES = 512;
     static constexpr uint32_t kDrxSlots     = 4;
+    static constexpr DWORD kRefresherShutdownJoinMs = 1500;
 
     struct nanomite_entry_t
     {
@@ -986,7 +987,20 @@ inline void shutdown()
 
     s.refresher_stop.store(true, std::memory_order_release);
     if (s.refresher_thread.joinable())
-        s.refresher_thread.join();
+    {
+        const unsigned refresher_tid = s.refresher_thread.id();
+        if (!s.refresher_thread.join_for(detail::kRefresherShutdownJoinMs))
+        {
+            s.refresher_degraded.store(true, std::memory_order_release);
+            diag::log_tagged_fmt("nanomite",
+                "shutdown_refresher_join_timeout tid=%u timeout_ms=%lu running=%d stop=%d",
+                refresher_tid,
+                static_cast<unsigned long>(detail::kRefresherShutdownJoinMs),
+                s.refresher_running.load(std::memory_order_acquire) ? 1 : 0,
+                s.refresher_stop.load(std::memory_order_acquire) ? 1 : 0);
+            s.refresher_thread.detach();
+        }
+    }
 
     {
         std::lock_guard<std::mutex> lk(s.mtx);
