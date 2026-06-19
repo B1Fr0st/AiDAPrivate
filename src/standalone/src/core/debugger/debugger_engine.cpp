@@ -189,6 +189,14 @@ std::string symbol_name_with_offset(const std::string& name, uint64_t delta) {
 	return name + suffix;
 }
 
+std::string module_rva_fallback_name(const driver_bridge::module_info_t& module, uint64_t address) {
+	const uint64_t rva = address >= module.base ? address - module.base : 0;
+	std::string module_name = module.name.empty() ? "module" : module.name;
+	char suffix[40];
+	std::snprintf(suffix, sizeof(suffix), "!sub_%llX", static_cast<unsigned long long>(rva));
+	return module_name + suffix;
+}
+
 std::string combine_resolver_status(const std::string& pdb_status, const std::string& export_status) {
 	if (pdb_status.empty())
 		return export_status.empty() ? std::string("unresolved") : export_status;
@@ -562,9 +570,21 @@ call_stack_symbol_resolution_t resolve_call_stack_symbol(
 		return result;
 	}
 
-	result.source = "none";
-	result.status = combine_resolver_status(pdb_status, export_status);
+	result.source = "module_rva";
+	result.status = combine_resolver_status(pdb_status, export_status) + ";module_rva_fallback";
+	result.function_name = module_rva_fallback_name(*module, address);
+	result.symbol_address = address;
+	result.symbol_offset = 0;
 	result.elapsed_us = resolver_elapsed_us(t0);
+	diag::log_tagged_fmt("dbg_stack_symbol",
+		"module_rva_fallback addr=0x%llX module=%s base=0x%llX offset=0x%llX pdb_status=%s export_status=%s function=%s",
+		static_cast<unsigned long long>(address),
+		module->name.empty() ? "(none)" : module->name.c_str(),
+		static_cast<unsigned long long>(module->base),
+		static_cast<unsigned long long>(result.module_offset),
+		pdb_status.empty() ? "(empty)" : pdb_status.c_str(),
+		export_status.empty() ? "(empty)" : export_status.c_str(),
+		result.function_name.c_str());
 	log_call_stack_symbol_resolution(result);
 	return result;
 }

@@ -43,6 +43,9 @@ struct module_symbols_t {
 	uint64_t                                  load_generation = 0;
 	uint64_t                                  load_started_ms = 0;
 	uint32_t                                  load_timeout_ms = 0;
+	float                                     parse_progress = 0.0f;
+	uint64_t                                  parse_progress_ms = 0;
+	std::string                               parse_diagnostic;
 	uint64_t                                  download_total = 0;
 	uint64_t                                  download_received = 0;
 	int                                       download_percent = 0;
@@ -95,9 +98,16 @@ inline void apply_loading_timeout(const load_timeout_context_t& ctx) noexcept
 			ms.failed = true;
 			ms.parse_completed = false;
 			ms.load_failure_detail = parser_diag;
+			ms.parse_diagnostic = parser_diag;
+			ms.parse_progress_ms = ms.load_started_ms ? GetTickCount64() - ms.load_started_ms : 0;
 			ms.load_phase.clear();
 			char buf[768];
-			snprintf(buf, sizeof(buf), "Failed: PDB %s timed out after %u ms; %s", ctx.phase.c_str(), ctx.timeout_ms, parser_diag.c_str());
+			snprintf(buf, sizeof(buf), "Failed: PDB %s timed out after %u ms; progress=%.1f%% elapsed=%llu ms; %s",
+				ctx.phase.c_str(),
+				ctx.timeout_ms,
+				static_cast<double>(ms.parse_progress) * 100.0,
+				static_cast<unsigned long long>(ms.parse_progress_ms),
+				parser_diag.c_str());
 			ms.status_text = buf;
 			ev_payload.module_name = ms.module_name;
 			ev_payload.base = ms.base;
@@ -105,7 +115,7 @@ inline void apply_loading_timeout(const load_timeout_context_t& ctx) noexcept
 			ev_payload.success = false;
 			publish_event = true;
 			diag::log_tagged_fmt("symbol_store",
-				"pdb_load_timeout module=%s generation=%llu phase=%s timeout_ms=%u started_ms=%llu scheduled_ms=%llu fired_ms=%llu path='%s' file_size=%llu parser_diag=\"%s\"",
+				"pdb_load_timeout module=%s generation=%llu phase=%s timeout_ms=%u started_ms=%llu scheduled_ms=%llu fired_ms=%llu path='%s' file_size=%llu progress=%.3f progress_ms=%llu parser_diag=\"%s\"",
 				ctx.module_name.c_str(),
 				static_cast<unsigned long long>(ctx.generation),
 				ctx.phase.c_str(),
@@ -115,6 +125,8 @@ inline void apply_loading_timeout(const load_timeout_context_t& ctx) noexcept
 				static_cast<unsigned long long>(GetTickCount64()),
 				ms.pdb_path.c_str(),
 				static_cast<unsigned long long>(ms.pdb_file_size),
+				static_cast<double>(ms.parse_progress),
+				static_cast<unsigned long long>(ms.parse_progress_ms),
 				parser_diag.c_str());
 		}
 		if (publish_event)
@@ -917,6 +929,9 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 		ms.load_generation = generation;
 		ms.load_started_ms = GetTickCount64();
 		ms.load_timeout_ms = k_explicit_pdb_load_timeout_ms;
+		ms.parse_progress = 0.0f;
+		ms.parse_progress_ms = 0;
+		ms.parse_diagnostic.clear();
 		ms.downloading = false;
 		ms.download_total = 0;
 		ms.download_received = 0;
@@ -952,6 +967,12 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 				ms.load_phase = "parse";
 				ms.load_started_ms = GetTickCount64();
 				ms.load_timeout_ms = k_explicit_pdb_load_timeout_ms;
+				ms.parse_progress = 0.0f;
+				ms.parse_progress_ms = 0;
+				ms.parse_diagnostic = pdb_parser::dbghelp_load_diagnostic();
+				char status[384];
+				snprintf(status, sizeof(status), "Parsing user-supplied PDB: progress=0.0%% elapsed=0 ms; %s", ms.parse_diagnostic.c_str());
+				ms.status_text = status;
 			}
 			auto wq_before_timeout = work_queue::stats();
 			auto sq_before_timeout = work_queue::service_stats();
@@ -996,7 +1017,61 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 			pdb_parser::pdb_info_t info;
 			std::atomic<float> parse_progress{0.f};
 			std::string search_path = std::filesystem::path(path_copy).parent_path().string();
-			bool parse_ok = pdb_parser::parse_pdb(path_copy, search_path, info, &parse_progress);
+			std::atomic<bool> parse_monitor_done{false};
+			std::thread parse_monitor([&]() {
+				uint64_t last_log_ms = 0;
+				while (!parse_monitor_done.load(std::memory_order_acquire)) {
+					Sleep(1000);
+					const uint64_t now_ms = GetTickCount64();
+					const float progress_value = parse_progress.load(std::memory_order_acquire);
+					const std::string parser_diag = pdb_parser::dbghelp_load_diagnostic();
+					uint64_t elapsed = 0;
+					bool updated = false;
+					{
+						std::lock_guard<std::mutex> lk(g_state.mutex);
+						auto it = g_state.modules.find(mod_copy);
+						if (it != g_state.modules.end() && it->second.load_generation == generation && it->second.loading && it->second.load_phase == "parse") {
+							auto& ms = it->second;
+							elapsed = ms.load_started_ms ? now_ms - ms.load_started_ms : 0;
+							ms.parse_progress = progress_value;
+							ms.parse_progress_ms = elapsed;
+							ms.parse_diagnostic = parser_diag;
+							char status[512];
+							snprintf(status, sizeof(status), "Parsing user-supplied PDB: progress=%.1f%% elapsed=%llu / %u ms; %s",
+								static_cast<double>(progress_value) * 100.0,
+								static_cast<unsigned long long>(elapsed),
+								ms.load_timeout_ms,
+								parser_diag.c_str());
+							ms.status_text = status;
+							updated = true;
+						}
+					}
+					if (updated && now_ms - last_log_ms >= 5000) {
+						last_log_ms = now_ms;
+						diag::log_tagged_fmt("symbol_store",
+							"explicit_pdb_parse_progress module=%s generation=%llu path='%s' progress=%.3f elapsed_ms=%llu parser_diag=\"%s\"",
+							mod_copy.c_str(),
+							static_cast<unsigned long long>(generation),
+							path_copy.c_str(),
+							static_cast<double>(progress_value),
+							static_cast<unsigned long long>(elapsed),
+							parser_diag.c_str());
+					}
+				}
+			});
+			auto stop_parse_monitor = [&]() {
+				parse_monitor_done.store(true, std::memory_order_release);
+				if (parse_monitor.joinable())
+					parse_monitor.join();
+			};
+			bool parse_ok = false;
+			try {
+				parse_ok = pdb_parser::parse_pdb(path_copy, search_path, info, &parse_progress);
+				stop_parse_monitor();
+			} catch (...) {
+				stop_parse_monitor();
+				throw;
+			}
 			const bool parse_completed = parse_ok && info.loaded;
 			const std::string parser_status = pdb_parser::last_error();
 			const std::string parser_diag = pdb_parser::dbghelp_load_diagnostic();
@@ -1044,6 +1119,9 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 					ms.pdb_path = path_copy;
 					ms.pdb_file_size = file_size_copy;
 					ms.load_failure_detail.clear();
+					ms.parse_progress = parse_progress.load();
+					ms.parse_progress_ms = GetTickCount64() - job_start;
+					ms.parse_diagnostic = parser_diag;
 					char buf[192];
 					snprintf(buf, sizeof(buf), "Loaded from %s: %zu symbols, %zu types",
 					         std::filesystem::path(path_copy).filename().string().c_str(),
@@ -1061,6 +1139,9 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 					ms.parse_completed = false;
 					ms.load_phase.clear();
 					ms.load_failure_detail = parser_status.empty() ? parser_diag : parser_status + " | " + parser_diag;
+					ms.parse_progress = parse_progress.load();
+					ms.parse_progress_ms = GetTickCount64() - job_start;
+					ms.parse_diagnostic = parser_diag;
 					ms.status_text = pdb_parse_failure_status("Failed to parse user-supplied PDB");
 					ev_payload.module_name = ms.module_name;
 					ev_payload.base = ms.base;

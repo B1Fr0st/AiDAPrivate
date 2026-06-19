@@ -75,6 +75,8 @@ tool_result_t tool_fingerprint(const json& params)
     opt.timeout_ms = 15000;
     opt.follow_redirects = true;
     opt.enforce_scope = false;
+    opt.publish_exchange = true;
+    opt.exchange_source = "api";
     auto req = build_get_request(host, path);
     auto resp = audit_http::send(req, host, port, tls, opt);
     if (!resp.has_value())
@@ -94,24 +96,6 @@ tool_result_t tool_fingerprint(const json& params)
     }
     auto items = fingerprint(resp->resp_headers, resp->resp_body, url);
     diag::log_tagged_fmt("mcp_burp", "tech_fingerprint ok url=%s status=%d techs=%zu", url.c_str(), resp->status_code, items.size());
-    exchange_observed_t ex;
-    ex.id = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count());
-    ex.timestamp_ms = ex.id;
-    ex.method = "GET";
-    ex.scheme = scheme;
-    ex.host = host;
-    ex.port = port;
-    ex.path = path.empty() ? std::string("/") : path;
-    ex.req_headers = {{"Host", host}, {"User-Agent", "AiDA-Burp/1.0"}};
-    ex.status_code = resp->status_code;
-    ex.reason_phrase = "OK";
-    ex.resp_headers = resp->resp_headers;
-    ex.resp_body = resp->resp_body;
-    ex.latency_ms = resp->latency_ms;
-    aida::events::publish(kExchangeObservedEvent, ex);
-    diag::log_tagged_fmt("mcp_burp", "tech_fingerprint published_exchange id=%llu host=%s path=%s headers=%zu body=%zu",
-        static_cast<unsigned long long>(ex.id), ex.host.c_str(), ex.path.c_str(), ex.resp_headers.size(), ex.resp_body.size());
     json arr = json::array();
     for (const auto& t : items) arr.push_back(tech_to_json(t));
     json out;

@@ -16,8 +16,11 @@ struct send_options_t
     int     timeout_ms = 15000;
     bool    follow_redirects = false;
     int     max_redirects = 3;
+    bool    return_first_redirect = false;
     bool    enforce_scope = true;
     std::string sni_override;
+    bool    publish_exchange = false;
+    std::string exchange_source;
 };
 
 std::optional<exchange_observed_t> send(const std::vector<uint8_t>& raw_request,

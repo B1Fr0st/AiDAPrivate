@@ -2,6 +2,8 @@
 
 #include "emulation_engine.hpp"
 #include "../driver/comm.h"
+#include "standalone/src/core/mcp/mcp_standalone.hpp"
+#include "standalone/src/helpers/diag_log.hpp"
 
 #pragma warning(push)
 #pragma warning(disable: 4005)
@@ -30,6 +32,38 @@ static ZydisDecoder     g_decoder;
 static ZydisFormatter   g_formatter;
 static bool             g_zydis_initialized = false;
 static std::once_flag   g_zydis_init_flag;
+
+static std::uint64_t emu_now_ms()
+{
+    return static_cast<std::uint64_t>(GetTickCount64());
+}
+
+static bool emu_cancelled(const emulation_config_t* config, const char* phase)
+{
+    const bool cancel = mcp_standalone::current_call_cancelled();
+    const bool deadline = config && config->deadline_ms != 0 && emu_now_ms() >= config->deadline_ms;
+    if (cancel || deadline) {
+        diag::log_tagged_fmt("emulation",
+            "cancelled phase=%s cancel_token=%d deadline=%d now_ms=%llu deadline_ms=%llu",
+            phase ? phase : "<null>",
+            cancel ? 1 : 0,
+            deadline ? 1 : 0,
+            static_cast<unsigned long long>(emu_now_ms()),
+            static_cast<unsigned long long>(config ? config->deadline_ms : 0));
+        return true;
+    }
+    return false;
+}
+
+static const char* uc_mem_type_name(uc_mem_type type)
+{
+    switch (type) {
+    case UC_MEM_READ_UNMAPPED: return "read_unmapped";
+    case UC_MEM_WRITE_UNMAPPED: return "write_unmapped";
+    case UC_MEM_FETCH_UNMAPPED: return "fetch_unmapped";
+    default: return "other";
+    }
+}
 
 static void ensure_zydis_init()
 {
@@ -141,6 +175,11 @@ std::vector<std::uint8_t> driver_read_bytes(
     std::uint64_t  address,
     std::size_t    size)
 {
+    diag::log_tagged_fmt("emulation",
+        "driver_read_bytes entry address=0x%llX size=%zu pid=%u",
+        static_cast<unsigned long long>(address),
+        size,
+        device ? device->get_process_id() : 0);
     if (!device || !device->is_connected())
         return {};
 
@@ -157,12 +196,32 @@ std::vector<std::uint8_t> driver_read_bytes(
     std::size_t total_read = 0;
     for (std::size_t offset = 0; offset < size; offset += CHUNK_SIZE)
     {
+        if (mcp_standalone::current_call_cancelled()) {
+            diag::log_tagged_fmt("emulation",
+                "driver_read_bytes cancelled address=0x%llX offset=%zu total_read=%zu",
+                static_cast<unsigned long long>(address),
+                offset,
+                total_read);
+            break;
+        }
         std::size_t chunk = std::min(CHUNK_SIZE, size - offset);
         std::size_t bytes_read = 0;
+        diag::log_tagged_fmt("emulation",
+            "driver_read_bytes chunk_begin address=0x%llX offset=%zu chunk=%zu kernel=%d",
+            static_cast<unsigned long long>(address),
+            offset,
+            chunk,
+            kernel_addr ? 1 : 0);
         if (kernel_addr)
             bytes_read = device->read_kernel_raw(address + offset, buffer.data() + offset, chunk);
         else
             bytes_read = device->read_raw(address + offset, buffer.data() + offset, chunk);
+        diag::log_tagged_fmt("emulation",
+            "driver_read_bytes chunk_end address=0x%llX offset=%zu requested=%zu read=%zu",
+            static_cast<unsigned long long>(address),
+            offset,
+            chunk,
+            bytes_read);
         if (bytes_read == 0)
             break;
         if (bytes_read > chunk)
@@ -174,6 +233,10 @@ std::vector<std::uint8_t> driver_read_bytes(
     if (total_read == 0)
         return {};
     buffer.resize(total_read);
+    diag::log_tagged_fmt("emulation",
+        "driver_read_bytes exit address=0x%llX total_read=%zu",
+        static_cast<unsigned long long>(address),
+        total_read);
     return buffer;
 }
 
@@ -194,39 +257,96 @@ process_snapshot_t driver_snapshot(
     std::uint32_t pid,
     std::uint32_t tid,
     std::uint64_t region_base,
-    std::uint64_t region_size)
+    std::uint64_t region_size,
+    const emulation_config_t* config)
 {
     process_snapshot_t snap;
     snap.pid = pid;
     snap.tid = tid;
+    const bool explicit_region = region_base != 0 && region_size != 0;
+    const bool neutral_allowed = explicit_region && config && config->allow_neutral_thread_context;
+    diag::log_tagged_fmt("emulation",
+        "driver_snapshot entry pid=%u tid=%u region_base=0x%llX region_size=0x%llX neutral_allowed=%d deadline_ms=%llu",
+        pid,
+        tid,
+        static_cast<unsigned long long>(region_base),
+        static_cast<unsigned long long>(region_size),
+        neutral_allowed ? 1 : 0,
+        static_cast<unsigned long long>(config ? config->deadline_ms : 0));
 
     if (!device || !device->is_connected())
     {
         snap.error = "Driver not connected";
+        diag::log_tagged_fmt("emulation", "driver_snapshot error reason='%s'", snap.error.c_str());
         return snap;
     }
 
-
-    std::uint32_t prev_count = 0;
-    bool did_suspend = device->suspend_thread(tid, &prev_count);
-
-
     voyager::device_t::thread_context ctx{};
-    if (!device->get_thread_context(tid, ctx))
-    {
-        if (did_suspend) {
-            device->resume_thread(tid);
-            did_suspend = false;
-        }
-        if (region_base == 0 || region_size == 0)
+    bool did_suspend = false;
+    struct suspend_guard_t {
+        voyager::device_t* dev = nullptr;
+        std::uint32_t tid = 0;
+        bool active = false;
+        ~suspend_guard_t()
         {
-            snap.error = "Failed to read thread context for TID " + std::to_string(tid);
-            return snap;
+            if (active && dev) {
+                diag::log_tagged_fmt("emulation", "driver_snapshot resume_begin tid=%u", tid);
+                const bool ok = dev->resume_thread(tid);
+                diag::log_tagged_fmt("emulation", "driver_snapshot resume_end tid=%u ok=%d", tid, ok ? 1 : 0);
+            }
         }
-        ctx.rip = 0;
+        void dismiss() noexcept { active = false; }
+    } suspend_guard{device.get(), tid, false};
+
+    if (neutral_allowed && tid == 0) {
+        ctx.rip = config && config->start_address != 0 ? config->start_address : region_base;
         ctx.rsp = 0;
         ctx.rbp = 0;
         ctx.rflags = 0x202;
+        diag::log_tagged_fmt("emulation",
+            "driver_snapshot neutral_context pid=%u tid=%u rip=0x%llX",
+            pid,
+            tid,
+            static_cast<unsigned long long>(ctx.rip));
+    } else {
+        if (emu_cancelled(config, "snapshot_before_suspend")) {
+            snap.error = "Cancelled before suspending target thread";
+            return snap;
+        }
+        std::uint32_t prev_count = 0;
+        diag::log_tagged_fmt("emulation", "driver_snapshot suspend_begin tid=%u", tid);
+        did_suspend = device->suspend_thread(tid, &prev_count);
+        suspend_guard.active = did_suspend;
+        diag::log_tagged_fmt("emulation",
+            "driver_snapshot suspend_end tid=%u ok=%d prev_count=%u",
+            tid,
+            did_suspend ? 1 : 0,
+            prev_count);
+        if (emu_cancelled(config, "snapshot_after_suspend")) {
+            snap.error = "Cancelled after suspending target thread";
+            return snap;
+        }
+        diag::log_tagged_fmt("emulation", "driver_snapshot get_context_begin tid=%u", tid);
+        const bool got_context = device->get_thread_context(tid, ctx);
+        diag::log_tagged_fmt("emulation", "driver_snapshot get_context_end tid=%u ok=%d", tid, got_context ? 1 : 0);
+        if (!got_context)
+        {
+            if (!explicit_region)
+            {
+                snap.error = "Failed to read thread context for TID " + std::to_string(tid);
+                diag::log_tagged_fmt("emulation", "driver_snapshot error reason='%s'", snap.error.c_str());
+                return snap;
+            }
+            ctx.rip = config && config->start_address != 0 ? config->start_address : region_base;
+            ctx.rsp = 0;
+            ctx.rbp = 0;
+            ctx.rflags = 0x202;
+            diag::log_tagged_fmt("emulation",
+                "driver_snapshot fallback_neutral_context tid=%u rip=0x%llX explicit_region=%d",
+                tid,
+                static_cast<unsigned long long>(ctx.rip),
+                explicit_region ? 1 : 0);
+        }
     }
 
     snap.rax = ctx.rax; snap.rbx = ctx.rbx; snap.rcx = ctx.rcx; snap.rdx = ctx.rdx;
@@ -237,10 +357,21 @@ process_snapshot_t driver_snapshot(
 
 
     std::vector<voyager::detail::region_entry> regions;
-    if (region_base != 0 && region_size != 0)
+    if (explicit_region)
     {
-
-        regions = device->enumerate_memory_regions(region_base, region_base + region_size, false);
+        if (emu_cancelled(config, "snapshot_before_region_enum_explicit")) {
+            snap.error = "Cancelled before explicit region enumeration";
+            return snap;
+        }
+        diag::log_tagged_fmt("emulation",
+            "driver_snapshot region_enum_begin mode=explicit base=0x%llX end=0x%llX",
+            static_cast<unsigned long long>(region_base),
+            static_cast<unsigned long long>(region_size > UINT64_MAX - region_base ? UINT64_MAX : region_base + region_size));
+        const std::uint64_t region_end = region_size > UINT64_MAX - region_base ? UINT64_MAX : region_base + region_size;
+        regions = device->enumerate_memory_regions(region_base, region_end, false);
+        diag::log_tagged_fmt("emulation",
+            "driver_snapshot region_enum_end mode=explicit count=%zu",
+            regions.size());
     }
     else
     {
@@ -259,9 +390,19 @@ process_snapshot_t driver_snapshot(
         ranges_to_capture.push_back({rsp_start, RSP_WINDOW * 2});
 
 
+        if (emu_cancelled(config, "snapshot_before_region_enum_full")) {
+            snap.error = "Cancelled before full region enumeration";
+            return snap;
+        }
+        diag::log_tagged_fmt("emulation", "driver_snapshot region_enum_begin mode=full");
         auto all_regions = device->enumerate_memory_regions(0x10000, 0x7FFFFFFFFFFF, false);
+        diag::log_tagged_fmt("emulation", "driver_snapshot region_enum_end mode=full count=%zu", all_regions.size());
         for (const auto& r : all_regions)
         {
+            if (emu_cancelled(config, "snapshot_region_filter")) {
+                snap.error = "Cancelled while filtering memory regions";
+                return snap;
+            }
 
             if (r.state == 0x1000 && r.type == 0x1000000)
             {
@@ -292,35 +433,92 @@ process_snapshot_t driver_snapshot(
 
     for (const auto& r : regions)
     {
-        if (total_bytes + r.size > MAX_SNAPSHOT_BYTES)
+        if (emu_cancelled(config, "snapshot_region_loop")) {
+            snap.error = "Cancelled before reading memory region";
+            return snap;
+        }
+        std::uint64_t capture_base = r.base;
+        std::uint64_t capture_size = r.size;
+        if (explicit_region) {
+            const std::uint64_t requested_end = region_size > UINT64_MAX - region_base ? UINT64_MAX : region_base + region_size;
+            const std::uint64_t region_end = r.size > UINT64_MAX - r.base ? UINT64_MAX : r.base + r.size;
+            const std::uint64_t clipped_base = std::max(region_base, r.base);
+            const std::uint64_t clipped_end = std::min(requested_end, region_end);
+            if (clipped_end <= clipped_base)
+                continue;
+            capture_base = clipped_base;
+            capture_size = clipped_end - clipped_base;
+        }
+        if (capture_size == 0 || capture_size > MAX_SNAPSHOT_BYTES - total_bytes)
             break;
 
         memory_snapshot_region_t region;
-        region.base    = r.base;
-        region.size    = r.size;
+        region.base    = capture_base;
+        region.size    = capture_size;
         region.protect = r.protect;
-        region.data.resize(static_cast<std::size_t>(r.size), 0);
+        region.data.resize(static_cast<std::size_t>(capture_size), 0);
 
+        diag::log_tagged_fmt("emulation",
+            "driver_snapshot read_region_begin base=0x%llX size=0x%llX source_base=0x%llX source_size=0x%llX protect=0x%X state=0x%X total_before=%llu",
+            static_cast<unsigned long long>(capture_base),
+            static_cast<unsigned long long>(capture_size),
+            static_cast<unsigned long long>(r.base),
+            static_cast<unsigned long long>(r.size),
+            r.protect,
+            r.state,
+            static_cast<unsigned long long>(total_bytes));
 
         constexpr std::size_t CHUNK_SIZE = 65536;
-        for (std::uint64_t offset = 0; offset < r.size; offset += CHUNK_SIZE)
+        for (std::uint64_t offset = 0; offset < capture_size; offset += CHUNK_SIZE)
         {
+            if (emu_cancelled(config, "snapshot_read_chunk")) {
+                snap.error = "Cancelled while reading memory snapshot";
+                return snap;
+            }
             std::size_t chunk = static_cast<std::size_t>(
-                std::min<std::uint64_t>(CHUNK_SIZE, r.size - offset));
-            device->read_raw(r.base + offset, region.data.data() + offset, chunk);
+                std::min<std::uint64_t>(CHUNK_SIZE, capture_size - offset));
+            diag::log_tagged_fmt("emulation",
+                "driver_snapshot read_chunk_begin base=0x%llX offset=0x%llX chunk=%zu",
+                static_cast<unsigned long long>(capture_base),
+                static_cast<unsigned long long>(offset),
+                chunk);
+            const std::size_t bytes_read = device->read_raw(capture_base + offset, region.data.data() + offset, chunk);
+            diag::log_tagged_fmt("emulation",
+                "driver_snapshot read_chunk_end base=0x%llX offset=0x%llX requested=%zu read=%zu",
+                static_cast<unsigned long long>(capture_base),
+                static_cast<unsigned long long>(offset),
+                chunk,
+                bytes_read);
         }
 
-        total_bytes += r.size;
+        total_bytes += capture_size;
         snap.regions.push_back(std::move(region));
+        diag::log_tagged_fmt("emulation",
+            "driver_snapshot read_region_end base=0x%llX total=%llu regions=%zu",
+            static_cast<unsigned long long>(capture_base),
+            static_cast<unsigned long long>(total_bytes),
+            snap.regions.size());
     }
 
     snap.total_snapshot_bytes = total_bytes;
 
 
     if (did_suspend)
-        device->resume_thread(tid);
+        suspend_guard.dismiss();
+    if (did_suspend) {
+        diag::log_tagged_fmt("emulation", "driver_snapshot resume_begin tid=%u", tid);
+        const bool resumed = device->resume_thread(tid);
+        diag::log_tagged_fmt("emulation", "driver_snapshot resume_end tid=%u ok=%d", tid, resumed ? 1 : 0);
+    }
 
     snap.success = true;
+    diag::log_tagged_fmt("emulation",
+        "driver_snapshot exit pid=%u tid=%u success=1 regions=%zu total_snapshot_bytes=%llu rip=0x%llX",
+        pid,
+        tid,
+        snap.regions.size(),
+        static_cast<unsigned long long>(snap.total_snapshot_bytes),
+        static_cast<unsigned long long>(snap.rip));
     return snap;
 }
 
@@ -338,6 +536,8 @@ struct uc_trace_ctx_t {
     const std::uint8_t*         mapped_code = nullptr;
     std::size_t                 mapped_code_size = 0;
     std::uint64_t               mapped_code_base = 0;
+    std::uint32_t               invalid_page_maps = 0;
+    bool                        cancelled = false;
 };
 
 static void uc_read_regs(uc_engine* uc, trace_entry_t& entry)
@@ -412,6 +612,12 @@ static void hook_code_cb(uc_engine* uc, uint64_t address, uint32_t size, void* u
     ctx->current_rip = address;
     ctx->insn_count++;
 
+    if (emu_cancelled(ctx->config, "unicorn_hook_code"))
+    {
+        ctx->cancelled = true;
+        uc_emu_stop(uc);
+        return;
+    }
 
     if (ctx->insn_count > ctx->config->max_instructions)
     {
@@ -478,6 +684,12 @@ static void hook_mem_write_cb(uc_engine* , uc_mem_type ,
                               int64_t value, void* user_data)
 {
     auto* ctx = static_cast<uc_trace_ctx_t*>(user_data);
+    if (emu_cancelled(ctx->config, "unicorn_hook_mem_write")) {
+        ctx->cancelled = true;
+        if (ctx->uc)
+            uc_emu_stop(ctx->uc);
+        return;
+    }
     if (!ctx->config->record_mem_writes || !ctx->mem_writes)
         return;
 
@@ -492,22 +704,56 @@ static void hook_mem_write_cb(uc_engine* , uc_mem_type ,
 
 static bool hook_mem_invalid_cb(uc_engine* uc, uc_mem_type type,
                                 uint64_t address, int size,
-                                int64_t , void* )
+                                int64_t , void* user_data)
 {
+    auto* ctx = static_cast<uc_trace_ctx_t*>(user_data);
+    if (!ctx)
+        return false;
+    if (emu_cancelled(ctx->config, "unicorn_hook_mem_invalid")) {
+        ctx->cancelled = true;
+        uc_emu_stop(uc);
+        return false;
+    }
+    if (ctx->invalid_page_maps >= ctx->config->max_invalid_page_maps) {
+        diag::log_tagged_fmt("emulation",
+            "unicorn_invalid_map_cap type=%s address=0x%llX size=%d maps=%u cap=%u",
+            uc_mem_type_name(type),
+            static_cast<unsigned long long>(address),
+            size,
+            ctx->invalid_page_maps,
+            ctx->config->max_invalid_page_maps);
+        uc_emu_stop(uc);
+        return false;
+    }
+    diag::log_tagged_fmt("emulation",
+        "unicorn_invalid_memory type=%s address=0x%llX size=%d current_rip=0x%llX maps=%u cap=%u",
+        uc_mem_type_name(type),
+        static_cast<unsigned long long>(address),
+        size,
+        static_cast<unsigned long long>(ctx->current_rip),
+        ctx->invalid_page_maps,
+        ctx->config->max_invalid_page_maps);
 
     if (type == UC_MEM_READ_UNMAPPED || type == UC_MEM_FETCH_UNMAPPED)
     {
         std::uint64_t aligned = address & ~0xFFFULL;
         std::vector<std::uint8_t> zeros(0x2000, 0);
-        uc_mem_map(uc, aligned, 0x2000, UC_PROT_ALL);
-        uc_mem_write(uc, aligned, zeros.data(), zeros.size());
+        uc_err err = uc_mem_map(uc, aligned, 0x2000, UC_PROT_ALL);
+        if (err != UC_ERR_OK)
+            return false;
+        if (uc_mem_write(uc, aligned, zeros.data(), zeros.size()) != UC_ERR_OK)
+            return false;
+        ++ctx->invalid_page_maps;
         return true;
     }
 
     if (type == UC_MEM_WRITE_UNMAPPED)
     {
         std::uint64_t aligned = address & ~0xFFFULL;
-        uc_mem_map(uc, aligned, 0x2000, UC_PROT_ALL);
+        uc_err err = uc_mem_map(uc, aligned, 0x2000, UC_PROT_ALL);
+        if (err != UC_ERR_OK)
+            return false;
+        ++ctx->invalid_page_maps;
         return true;
     }
 
@@ -520,6 +766,12 @@ static void hook_mem_read_cb(uc_engine* , uc_mem_type ,
                              int64_t , void* user_data)
 {
     auto* ctx = static_cast<uc_trace_ctx_t*>(user_data);
+    if (emu_cancelled(ctx->config, "unicorn_hook_mem_read")) {
+        ctx->cancelled = true;
+        if (ctx->uc)
+            uc_emu_stop(ctx->uc);
+        return;
+    }
     if (!ctx->config->record_mem_reads || !ctx->mem_reads)
         return;
 
@@ -536,16 +788,34 @@ emulation_result_t emulate_from_snapshot(
 {
     emulation_result_t result;
     result.start_address = config.start_address != 0 ? config.start_address : snapshot.rip;
+    diag::log_tagged_fmt("emulation",
+        "emulate_from_snapshot entry pid=%u tid=%u start=0x%llX regions=%zu max_instructions=%u max_trace=%u timeout_us=%llu deadline_ms=%llu invalid_cap=%u",
+        snapshot.pid,
+        snapshot.tid,
+        static_cast<unsigned long long>(result.start_address),
+        snapshot.regions.size(),
+        config.max_instructions,
+        config.max_trace_entries,
+        static_cast<unsigned long long>(config.timeout_us),
+        static_cast<unsigned long long>(config.deadline_ms),
+        config.max_invalid_page_maps);
 
     if (snapshot.regions.empty())
     {
         result.error = "Snapshot has no memory regions";
+        diag::log_tagged_fmt("emulation", "emulate_from_snapshot error reason='%s'", result.error.c_str());
         return result;
     }
 
+    if (emu_cancelled(&config, "emulate_before_uc_open")) {
+        result.error = "Emulation cancelled before Unicorn initialization";
+        return result;
+    }
 
     uc_engine* uc = nullptr;
+    diag::log_tagged_fmt("emulation", "unicorn_open_begin");
     uc_err err = uc_open(UC_ARCH_X86, UC_MODE_64, &uc);
+    diag::log_tagged_fmt("emulation", "unicorn_open_end err=%u text='%s'", static_cast<unsigned>(err), uc_strerror(err));
     if (err != UC_ERR_OK)
     {
         result.error = std::string("Unicorn init failed: ") + uc_strerror(err);
@@ -567,6 +837,10 @@ emulation_result_t emulate_from_snapshot(
 
     for (const auto& region : snapshot.regions)
     {
+        if (emu_cancelled(&config, "unicorn_prepare_map")) {
+            result.error = "Emulation cancelled while preparing memory map";
+            return result;
+        }
 
         std::uint64_t aligned_base = region.base & ~0xFFFULL;
         std::uint64_t aligned_end  = (region.base + region.size + 0xFFF) & ~0xFFFULL;
@@ -595,11 +869,26 @@ emulation_result_t emulate_from_snapshot(
 
     for (const auto& m : to_map)
     {
+        if (emu_cancelled(&config, "unicorn_map_loop")) {
+            result.error = "Emulation cancelled before mapping memory";
+            return result;
+        }
+        diag::log_tagged_fmt("emulation",
+            "unicorn_map_begin base=0x%llX size=0x%llX",
+            static_cast<unsigned long long>(m.base),
+            static_cast<unsigned long long>(m.size));
         err = uc_mem_map(uc, m.base, static_cast<size_t>(m.size), UC_PROT_ALL);
+        diag::log_tagged_fmt("emulation",
+            "unicorn_map_end base=0x%llX size=0x%llX err=%u text='%s'",
+            static_cast<unsigned long long>(m.base),
+            static_cast<unsigned long long>(m.size),
+            static_cast<unsigned>(err),
+            uc_strerror(err));
         if (err != UC_ERR_OK)
         {
-            result.error = std::string("uc_mem_map failed at 0x") +
-                (std::ostringstream() << std::hex << m.base).str() + ": " + uc_strerror(err);
+            std::ostringstream addr;
+            addr << std::hex << m.base;
+            result.error = std::string("uc_mem_map failed at 0x") + addr.str() + ": " + uc_strerror(err);
             return result;
         }
     }
@@ -611,9 +900,27 @@ emulation_result_t emulate_from_snapshot(
 
     for (const auto& region : snapshot.regions)
     {
+        if (emu_cancelled(&config, "unicorn_write_loop")) {
+            result.error = "Emulation cancelled before writing memory";
+            return result;
+        }
         if (!region.data.empty())
         {
-            uc_mem_write(uc, region.base, region.data.data(), region.data.size());
+            diag::log_tagged_fmt("emulation",
+                "unicorn_write_begin base=0x%llX size=%zu",
+                static_cast<unsigned long long>(region.base),
+                region.data.size());
+            err = uc_mem_write(uc, region.base, region.data.data(), region.data.size());
+            diag::log_tagged_fmt("emulation",
+                "unicorn_write_end base=0x%llX size=%zu err=%u text='%s'",
+                static_cast<unsigned long long>(region.base),
+                region.data.size(),
+                static_cast<unsigned>(err),
+                uc_strerror(err));
+            if (err != UC_ERR_OK) {
+                result.error = std::string("uc_mem_write failed: ") + uc_strerror(err);
+                return result;
+            }
         }
 
 
@@ -644,6 +951,11 @@ emulation_result_t emulate_from_snapshot(
     uc_reg_write(uc, UC_X86_REG_R14, &snapshot.r14);
     uc_reg_write(uc, UC_X86_REG_R15, &snapshot.r15);
     uc_reg_write(uc, UC_X86_REG_EFLAGS, &snapshot.rflags);
+    diag::log_tagged_fmt("emulation",
+        "unicorn_registers_written rip=0x%llX rsp=0x%llX rflags=0x%llX",
+        static_cast<unsigned long long>(result.start_address),
+        static_cast<unsigned long long>(snapshot.rsp),
+        static_cast<unsigned long long>(snapshot.rflags));
 
 
     std::uint64_t start_rip = result.start_address;
@@ -680,29 +992,51 @@ emulation_result_t emulate_from_snapshot(
 
     uc_hook h_code, h_mem_write, h_mem_read, h_mem_invalid;
 
-    uc_hook_add(uc, &h_code, UC_HOOK_CODE,
+    err = uc_hook_add(uc, &h_code, UC_HOOK_CODE,
                 reinterpret_cast<void*>(&hook_code_cb), &trace_ctx, 1, 0);
+    diag::log_tagged_fmt("emulation", "unicorn_hook_add code err=%u text='%s'", static_cast<unsigned>(err), uc_strerror(err));
 
     if (config.record_mem_writes)
     {
-        uc_hook_add(uc, &h_mem_write, UC_HOOK_MEM_WRITE,
+        err = uc_hook_add(uc, &h_mem_write, UC_HOOK_MEM_WRITE,
                     reinterpret_cast<void*>(&hook_mem_write_cb), &trace_ctx, 1, 0);
+        diag::log_tagged_fmt("emulation", "unicorn_hook_add mem_write err=%u text='%s'", static_cast<unsigned>(err), uc_strerror(err));
     }
 
     if (config.record_mem_reads)
     {
-        uc_hook_add(uc, &h_mem_read, UC_HOOK_MEM_READ,
+        err = uc_hook_add(uc, &h_mem_read, UC_HOOK_MEM_READ,
                     reinterpret_cast<void*>(&hook_mem_read_cb), &trace_ctx, 1, 0);
+        diag::log_tagged_fmt("emulation", "unicorn_hook_add mem_read err=%u text='%s'", static_cast<unsigned>(err), uc_strerror(err));
     }
 
 
-    uc_hook_add(uc, &h_mem_invalid,
+    err = uc_hook_add(uc, &h_mem_invalid,
                 UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED | UC_HOOK_MEM_FETCH_UNMAPPED,
                 reinterpret_cast<void*>(&hook_mem_invalid_cb), &trace_ctx, 1, 0);
+    diag::log_tagged_fmt("emulation", "unicorn_hook_add mem_invalid err=%u text='%s'", static_cast<unsigned>(err), uc_strerror(err));
 
-
+    if (emu_cancelled(&config, "unicorn_before_start")) {
+        result.error = "Emulation cancelled before start";
+        return result;
+    }
+    diag::log_tagged_fmt("emulation",
+        "unicorn_start_begin start=0x%llX stop=0x%llX timeout_us=%llu max_instructions=%u",
+        static_cast<unsigned long long>(start_rip),
+        static_cast<unsigned long long>(config.stop_address ? config.stop_address : 0xFFFFFFFFFFFFFFFFULL),
+        static_cast<unsigned long long>(config.timeout_us),
+        config.max_instructions);
     err = uc_emu_start(uc, start_rip, config.stop_address ? config.stop_address : 0xFFFFFFFFFFFFFFFFULL,
                        config.timeout_us, config.max_instructions);
+    diag::log_tagged_fmt("emulation",
+        "unicorn_start_end err=%u text='%s' cancelled=%d insn_count=%u invalid_maps=%u hit_ret=%d hit_bp=%d",
+        static_cast<unsigned>(err),
+        uc_strerror(err),
+        trace_ctx.cancelled ? 1 : 0,
+        trace_ctx.insn_count,
+        trace_ctx.invalid_page_maps,
+        trace_ctx.hit_ret ? 1 : 0,
+        trace_ctx.hit_bp ? 1 : 0);
 
 
     std::uint64_t final_rip = 0;
@@ -751,6 +1085,19 @@ emulation_result_t emulate_from_snapshot(
         result.junk_instruction_count = analysis.junk_instructions;
     }
 
+    if (trace_ctx.cancelled || emu_cancelled(&config, "unicorn_after_start"))
+    {
+        result.error = "Emulation cancelled";
+        result.success = false;
+        diag::log_tagged_fmt("emulation",
+            "emulate_from_snapshot exit success=0 cancelled=1 total=%u trace=%zu reads=%zu writes=%zu",
+            result.total_instructions,
+            result.trace.size(),
+            result.mem_reads.size(),
+            result.mem_writes.size());
+        return result;
+    }
+
     if (err != UC_ERR_OK && !trace_ctx.hit_ret && !trace_ctx.hit_bp &&
         trace_ctx.insn_count < config.max_instructions)
     {
@@ -758,6 +1105,15 @@ emulation_result_t emulate_from_snapshot(
     }
 
     result.success = true;
+    diag::log_tagged_fmt("emulation",
+        "emulate_from_snapshot exit success=1 end=0x%llX total=%u trace=%zu reads=%zu writes=%zu reg_deltas=%zu error='%s'",
+        static_cast<unsigned long long>(result.end_address),
+        result.total_instructions,
+        result.trace.size(),
+        result.mem_reads.size(),
+        result.mem_writes.size(),
+        result.reg_deltas.size(),
+        result.error.c_str());
     return result;
 }
 
@@ -768,16 +1124,42 @@ emulation_result_t driver_snapshot_and_emulate(
     std::uint64_t snapshot_base,
     std::uint64_t snapshot_size)
 {
-    auto snapshot = driver_snapshot(pid, tid, snapshot_base, snapshot_size);
+    diag::log_tagged_fmt("emulation",
+        "driver_snapshot_and_emulate entry pid=%u tid=%u snapshot_base=0x%llX snapshot_size=0x%llX start=0x%llX deadline_ms=%llu",
+        pid,
+        tid,
+        static_cast<unsigned long long>(snapshot_base),
+        static_cast<unsigned long long>(snapshot_size),
+        static_cast<unsigned long long>(config.start_address),
+        static_cast<unsigned long long>(config.deadline_ms));
+    if (emu_cancelled(&config, "snapshot_and_emulate_entry")) {
+        emulation_result_t fail;
+        fail.error = "Cancelled before snapshot";
+        return fail;
+    }
+    auto snapshot = driver_snapshot(pid, tid, snapshot_base, snapshot_size, &config);
     if (!snapshot.success)
     {
         emulation_result_t fail;
         fail.error = "Snapshot failed: " + snapshot.error;
+        diag::log_tagged_fmt("emulation", "driver_snapshot_and_emulate snapshot_failed error='%s'", fail.error.c_str());
         return fail;
     }
 
     prepare_snapshot_for_config(snapshot, config);
-    return emulate_from_snapshot(snapshot, config);
+    if (emu_cancelled(&config, "snapshot_and_emulate_before_unicorn")) {
+        emulation_result_t fail;
+        fail.error = "Cancelled after snapshot";
+        return fail;
+    }
+    auto result = emulate_from_snapshot(snapshot, config);
+    diag::log_tagged_fmt("emulation",
+        "driver_snapshot_and_emulate exit success=%d error='%s' total=%u trace=%zu",
+        result.success ? 1 : 0,
+        result.error.c_str(),
+        result.total_instructions,
+        result.trace.size());
+    return result;
 }
 
 

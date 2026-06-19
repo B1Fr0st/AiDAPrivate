@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <exception>
@@ -37,6 +38,11 @@ namespace {
 constexpr size_t kMaxActiveAudits = 2;
 constexpr size_t kMaxGlobalInFlightRequests = 16;
 constexpr size_t kMaxPerAuditInFlightRequests = 8;
+constexpr size_t kExternalDefaultMaxConcurrentRequests = 2;
+constexpr size_t kExternalDefaultThrottleMs = 125;
+constexpr size_t kMaxTransportBackoffMs = 1500;
+constexpr size_t kWsaEnobufsPreinitCircuitThreshold = 4;
+constexpr uint32_t kWsaEnobufsCode = 10055;
 
 struct audit_runtime_t
 {
@@ -48,6 +54,9 @@ struct audit_runtime_t
     std::atomic<size_t>         active_workers{0};
     std::atomic<size_t>         queued_workers{0};
     std::atomic<size_t>         module_request_count{0};
+    std::atomic<size_t>         transport_backoff_ms{0};
+    std::atomic<size_t>         wsaenobufs_preinit_hits{0};
+    std::atomic<bool>           transport_circuit_breaker_open{false};
     std::map<std::string, std::atomic<size_t>> per_module_count;
     std::mutex                  pmc_mtx;
     std::mutex                  status_mtx;
@@ -123,12 +132,214 @@ size_t increment_pmc(audit_runtime_t& rt, const std::string& mod_id)
     return it->second.fetch_add(1) + 1;
 }
 
+std::string lower_ascii(std::string s)
+{
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return s;
+}
+
+bool parse_ipv4_parts(const std::string& host, unsigned parts[4])
+{
+    size_t start = 0;
+    for (size_t i = 0; i < 4; ++i) {
+        size_t dot = (i == 3) ? std::string::npos : host.find('.', start);
+        size_t end = (dot == std::string::npos) ? host.size() : dot;
+        if (end <= start || end - start > 3)
+            return false;
+        unsigned value = 0;
+        for (size_t p = start; p < end; ++p) {
+            if (!std::isdigit(static_cast<unsigned char>(host[p])))
+                return false;
+            value = value * 10 + static_cast<unsigned>(host[p] - '0');
+            if (value > 255)
+                return false;
+        }
+        parts[i] = value;
+        if (i < 3) {
+            if (dot == std::string::npos)
+                return false;
+            start = dot + 1;
+        }
+    }
+    return true;
+}
+
+bool is_local_or_private_host(const std::string& host)
+{
+    std::string h = lower_ascii(host);
+    if (!h.empty() && h.front() == '[' && h.back() == ']')
+        h = h.substr(1, h.size() - 2);
+    if (h == "localhost" || h == "::1" || h == "0:0:0:0:0:0:0:1")
+        return true;
+    if (h.size() > 10 && h.compare(h.size() - 10, 10, ".localhost") == 0)
+        return true;
+    unsigned parts[4]{};
+    if (!parse_ipv4_parts(h, parts))
+        return false;
+    if (parts[0] == 10 || parts[0] == 127)
+        return true;
+    if (parts[0] == 192 && parts[1] == 168)
+        return true;
+    if (parts[0] == 172 && parts[1] >= 16 && parts[1] <= 31)
+        return true;
+    if (parts[0] == 169 && parts[1] == 254)
+        return true;
+    return false;
+}
+
+std::string sanitize_transport_error(std::string error)
+{
+    for (char& c : error) {
+        if (c == '\r' || c == '\n' || c == '\t')
+            c = ' ';
+    }
+    if (error.size() > 1024)
+        error.resize(1024);
+    return error;
+}
+
+bool transport_error_is_pressure(const std::string& error)
+{
+    const std::string e = lower_ascii(error);
+    return e.find("10055") != std::string::npos ||
+           e.find("wsaenobufs") != std::string::npos ||
+           e.find("no buffer") != std::string::npos ||
+           e.find("buffer space") != std::string::npos;
+}
+
+uint32_t transport_error_code_from_error(const std::string& error)
+{
+    const std::string e = lower_ascii(error);
+    if (e.find("transport_error_code=10055") != std::string::npos ||
+        e.find("last_connect_err=10055") != std::string::npos ||
+        e.find("connect_err=10055") != std::string::npos ||
+        e.find("wsaenobufs") != std::string::npos)
+        return kWsaEnobufsCode;
+    return 0;
+}
+
+std::string transport_error_class_from_error(const std::string& error)
+{
+    const std::string e = lower_ascii(error);
+    if (e.find("transport_error_class=wsaenobufs_preinit") != std::string::npos ||
+        e.find("wsaenobufs_preinit") != std::string::npos)
+        return "wsaenobufs_preinit";
+    if (transport_error_is_pressure(error))
+        return "transport_pressure";
+    return {};
+}
+
+bool transport_error_is_wsaenobufs_preinit(const std::string& error)
+{
+    const std::string e = lower_ascii(error);
+    if (e.find("transport_error_class=wsaenobufs_preinit") != std::string::npos ||
+        e.find("wsaenobufs_preinit") != std::string::npos)
+        return true;
+    return transport_error_code_from_error(error) == kWsaEnobufsCode &&
+           (e.find("before_would_block=1") != std::string::npos ||
+            e.find("connect_stage=connect_immediate_failure") != std::string::npos ||
+            e.find("connect_stage=socket_create") != std::string::npos);
+}
+
+void raise_transport_backoff(audit_runtime_t& rt, const std::string& error)
+{
+    if (!transport_error_is_pressure(error))
+        return;
+    size_t current = rt.transport_backoff_ms.load(std::memory_order_acquire);
+    while (current < kMaxTransportBackoffMs) {
+        const size_t next = current == 0 ? 250 : (std::min)(current * 2, kMaxTransportBackoffMs);
+        if (rt.transport_backoff_ms.compare_exchange_weak(current, next, std::memory_order_acq_rel)) {
+            std::lock_guard<std::mutex> lk(rt.status_mtx);
+            rt.status.transport_backoff_ms = next;
+            rt.status.effective_throttle_ms = rt.config.request_throttle_ms + next;
+            diag::log_tagged_fmt("scanner", "transport_backoff_raise audit=%llu backoff_ms=%zu error=%s",
+                static_cast<unsigned long long>(rt.status.id), next, error.c_str());
+            return;
+        }
+    }
+}
+
+void record_transport_result(const std::shared_ptr<audit_runtime_t>& rt_ptr,
+                             bool got_response,
+                             const std::string& transport_error,
+                             const char* phase,
+                             const std::string& mod_id)
+{
+    if (!rt_ptr)
+        return;
+    const std::string safe_error = sanitize_transport_error(transport_error);
+    const uint32_t transport_code = safe_error.empty() ? 0 : transport_error_code_from_error(safe_error);
+    const std::string transport_class = safe_error.empty() ? std::string() : transport_error_class_from_error(safe_error);
+    bool notify_circuit = false;
+    {
+        std::lock_guard<std::mutex> lk(rt_ptr->status_mtx);
+        rt_ptr->status.transport_backoff_ms = rt_ptr->transport_backoff_ms.load(std::memory_order_acquire);
+        rt_ptr->status.effective_throttle_ms = rt_ptr->config.request_throttle_ms + rt_ptr->status.transport_backoff_ms;
+        rt_ptr->status.transport_circuit_breaker_threshold = kWsaEnobufsPreinitCircuitThreshold;
+        rt_ptr->status.transport_circuit_breaker_hits = rt_ptr->wsaenobufs_preinit_hits.load(std::memory_order_acquire);
+        rt_ptr->status.transport_circuit_breaker_open = rt_ptr->transport_circuit_breaker_open.load(std::memory_order_acquire);
+        if (got_response) {
+            rt_ptr->status.responses_received++;
+        } else {
+            rt_ptr->status.no_response_count++;
+            if (!safe_error.empty()) {
+                rt_ptr->status.transport_failures++;
+                rt_ptr->status.last_transport_error = safe_error;
+                if (transport_code != 0)
+                    rt_ptr->status.transport_error_code = transport_code;
+                if (!transport_class.empty())
+                    rt_ptr->status.transport_error_class = transport_class;
+                if (transport_error_is_wsaenobufs_preinit(safe_error) && rt_ptr->status.responses_received == 0) {
+                    const size_t hits = rt_ptr->wsaenobufs_preinit_hits.fetch_add(1, std::memory_order_acq_rel) + 1;
+                    rt_ptr->status.transport_circuit_breaker_hits = hits;
+                    rt_ptr->status.transport_error_code = kWsaEnobufsCode;
+                    rt_ptr->status.transport_error_class = "wsaenobufs_preinit";
+                    if (hits >= kWsaEnobufsPreinitCircuitThreshold) {
+                        const bool was_open = rt_ptr->transport_circuit_breaker_open.exchange(true, std::memory_order_acq_rel);
+                        rt_ptr->status.transport_circuit_breaker_open = true;
+                        if (!was_open) {
+                            notify_circuit = true;
+                            diag::log_tagged_fmt("scanner", "transport_circuit_open audit=%llu class=wsaenobufs_preinit code=%u hits=%zu threshold=%zu responses=%zu no_response=%zu failures=%zu last_error=%s",
+                                static_cast<unsigned long long>(rt_ptr->status.id),
+                                kWsaEnobufsCode,
+                                hits,
+                                kWsaEnobufsPreinitCircuitThreshold,
+                                rt_ptr->status.responses_received,
+                                rt_ptr->status.no_response_count,
+                                rt_ptr->status.transport_failures,
+                                rt_ptr->status.last_transport_error.c_str());
+                        }
+                    }
+                }
+            }
+        }
+        diag::log_tagged_fmt("scanner", "transport_result audit=%llu phase=%s module=%s got_response=%d responses=%zu no_response=%zu failures=%zu transport_error_code=%u transport_error_class=%s circuit_open=%d circuit_hits=%zu last_error=%s",
+            static_cast<unsigned long long>(rt_ptr->status.id),
+            phase ? phase : "",
+            mod_id.c_str(),
+            got_response ? 1 : 0,
+            rt_ptr->status.responses_received,
+            rt_ptr->status.no_response_count,
+            rt_ptr->status.transport_failures,
+            rt_ptr->status.transport_error_code,
+            rt_ptr->status.transport_error_class.c_str(),
+            rt_ptr->status.transport_circuit_breaker_open ? 1 : 0,
+            rt_ptr->status.transport_circuit_breaker_hits,
+            rt_ptr->status.last_transport_error.c_str());
+    }
+    if (notify_circuit)
+        rt_ptr->cancel_cv.notify_all();
+    if (!got_response && !safe_error.empty())
+        raise_transport_backoff(*rt_ptr, safe_error);
+}
+
 bool wait_for_inflight_slot(audit_runtime_t& rt, size_t cap)
 {
     auto& s = state();
     const size_t per_audit_cap = (std::max)(static_cast<size_t>(1), (std::min)(cap, kMaxPerAuditInFlightRequests));
     while (true) {
-        if (rt.cancel_flag.load() || s.shutting_down.load(std::memory_order_acquire)) return false;
+        if (rt.cancel_flag.load() || rt.transport_circuit_breaker_open.load(std::memory_order_acquire) || s.shutting_down.load(std::memory_order_acquire)) return false;
         size_t cur = rt.in_flight.load();
         size_t global_cur = s.global_in_flight.load(std::memory_order_acquire);
         if (cur < per_audit_cap && global_cur < kMaxGlobalInFlightRequests) {
@@ -155,6 +366,31 @@ void release_inflight(audit_runtime_t& rt)
     state().global_in_flight.fetch_sub(1, std::memory_order_acq_rel);
 }
 
+size_t issue_count_for_audit(uint64_t audit_id)
+{
+    issue_store::initialize();
+    issue_filter_t filter;
+    filter.has_audit_id = true;
+    filter.audit_id = audit_id;
+    return issue_store::list(filter).size();
+}
+
+void sync_issue_count_from_store(const std::shared_ptr<audit_runtime_t>& rt_ptr, const char* reason)
+{
+    if (!rt_ptr)
+        return;
+    const size_t stored = issue_count_for_audit(rt_ptr->status.id);
+    std::lock_guard<std::mutex> lk(rt_ptr->status_mtx);
+    if (stored > rt_ptr->status.issues_found) {
+        diag::log_tagged_fmt("scanner", "issue_count_sync audit=%llu reason=%s runtime=%zu stored=%zu",
+            static_cast<unsigned long long>(rt_ptr->status.id),
+            reason ? reason : "",
+            rt_ptr->status.issues_found,
+            stored);
+        rt_ptr->status.issues_found = stored;
+    }
+}
+
 scanner::send_fn_t make_send_fn(std::shared_ptr<audit_runtime_t> rt_ptr,
                                 const std::string& mod_id,
                                 bool count_completed,
@@ -163,10 +399,16 @@ scanner::send_fn_t make_send_fn(std::shared_ptr<audit_runtime_t> rt_ptr,
     return [rt_ptr, mod_id, count_completed, acquire_slot](const std::vector<uint8_t>& raw_req, const scanner::probe_t& probe) -> std::optional<exchange_observed_t> {
         (void)probe;
         if (rt_ptr->cancel_flag.load()) return std::nullopt;
+        if (rt_ptr->transport_circuit_breaker_open.load(std::memory_order_acquire)) {
+            diag::log_tagged_fmt("scanner", "send_fn circuit_open audit=%llu module=%s",
+                static_cast<unsigned long long>(rt_ptr->status.id), mod_id.c_str());
+            return std::nullopt;
+        }
         if (rt_ptr->config.per_module_request_cap > 0 &&
             increment_pmc(*rt_ptr, mod_id) > rt_ptr->config.per_module_request_cap) return std::nullopt;
-        if (rt_ptr->config.request_throttle_ms > 0)
-            std::this_thread::sleep_for(std::chrono::milliseconds(rt_ptr->config.request_throttle_ms));
+        const size_t throttle_ms = rt_ptr->config.request_throttle_ms + rt_ptr->transport_backoff_ms.load(std::memory_order_acquire);
+        if (throttle_ms > 0)
+            std::this_thread::sleep_for(std::chrono::milliseconds(throttle_ms));
         bool slot_acquired = false;
         if (acquire_slot) {
             slot_acquired = wait_for_inflight_slot(*rt_ptr, rt_ptr->config.max_concurrent_requests);
@@ -179,7 +421,10 @@ scanner::send_fn_t make_send_fn(std::shared_ptr<audit_runtime_t> rt_ptr,
         audit_http::send_options_t opt;
         opt.timeout_ms = rt_ptr->config.timeout_ms;
         opt.follow_redirects = rt_ptr->config.follow_redirects;
+        opt.return_first_redirect = true;
         opt.enforce_scope = rt_ptr->config.scope_only;
+        opt.publish_exchange = true;
+        opt.exchange_source = "scanner";
         const uint64_t started = now_ms();
         const auto before = collect_load_snapshot();
         diag::log_tagged_fmt("scanner", "send_fn begin audit=%llu module=%s req_len=%zu active_audits=%zu running_audits=%zu queue_depth=%zu in_flight=%zu tid=%lu",
@@ -190,11 +435,13 @@ scanner::send_fn_t make_send_fn(std::shared_ptr<audit_runtime_t> rt_ptr,
                                          rt_ptr->status.tls, opt);
         const uint64_t elapsed = now_ms() - started;
         if (observed.has_value()) {
+            record_transport_result(rt_ptr, true, std::string(), "probe", mod_id);
             diag::log_tagged_fmt("scanner", "send_fn done audit=%llu module=%s status=%d body=%zu elapsed_ms=%llu tid=%lu",
                 static_cast<unsigned long long>(rt_ptr->status.id), mod_id.c_str(), observed->status_code, observed->resp_body.size(),
                 static_cast<unsigned long long>(elapsed), static_cast<unsigned long>(GetCurrentThreadId()));
         } else {
             const std::string socket_error = audit_http::last_error();
+            record_transport_result(rt_ptr, false, socket_error, "probe", mod_id);
             diag::log_tagged_fmt("scanner", "send_fn failed audit=%llu module=%s req_len=%zu socket_error=%s elapsed_ms=%llu tid=%lu",
                 static_cast<unsigned long long>(rt_ptr->status.id), mod_id.c_str(), raw_req.size(), socket_error.c_str(),
                 static_cast<unsigned long long>(elapsed), static_cast<unsigned long>(GetCurrentThreadId()));
@@ -231,6 +478,11 @@ void run_module_for_point(std::shared_ptr<audit_runtime_t> rt_ptr,
             static_cast<unsigned long long>(rt_ptr->status.id), mod.id.c_str());
         return;
     }
+    if (rt_ptr->transport_circuit_breaker_open.load(std::memory_order_acquire)) {
+        diag::log_tagged_fmt("scanner", "run_module_for_point circuit_open early audit=%llu module=%s",
+            static_cast<unsigned long long>(rt_ptr->status.id), mod.id.c_str());
+        return;
+    }
 
     scanner::module_context_t ctx;
     ctx.audit_id = rt_ptr->status.id;
@@ -241,19 +493,26 @@ void run_module_for_point(std::shared_ptr<audit_runtime_t> rt_ptr,
     ctx.timeout_ms = rt_ptr->config.timeout_ms;
     ctx.follow_redirects = rt_ptr->config.follow_redirects;
     ctx.cancelled = [rt_ptr]() {
-        return rt_ptr->cancel_flag.load(std::memory_order_acquire);
+        return rt_ptr->cancel_flag.load(std::memory_order_acquire) ||
+               rt_ptr->transport_circuit_breaker_open.load(std::memory_order_acquire);
     };
 
     audit_http::send_options_t base_opt;
     base_opt.timeout_ms = rt_ptr->config.timeout_ms;
     base_opt.follow_redirects = rt_ptr->config.follow_redirects;
+    base_opt.return_first_redirect = true;
     base_opt.enforce_scope = rt_ptr->config.scope_only;
+    base_opt.publish_exchange = true;
+    base_opt.exchange_source = "scanner";
     if (!wait_for_inflight_slot(*rt_ptr, rt_ptr->config.max_concurrent_requests)) {
         diag::log_tagged_fmt("scanner", "run_module_for_point baseline_slot_wait_failed audit=%llu module=%s req_len=%zu tid=%lu",
             static_cast<unsigned long long>(rt_ptr->status.id), mod.id.c_str(), rt_ptr->raw_request.size(), static_cast<unsigned long>(GetCurrentThreadId()));
         return;
     }
     const uint64_t baseline_started = now_ms();
+    const size_t baseline_throttle_ms = rt_ptr->config.request_throttle_ms + rt_ptr->transport_backoff_ms.load(std::memory_order_acquire);
+    if (baseline_throttle_ms > 0)
+        std::this_thread::sleep_for(std::chrono::milliseconds(baseline_throttle_ms));
     const auto baseline_load = collect_load_snapshot();
     diag::log_tagged_fmt("scanner", "run_module_for_point baseline_begin audit=%llu module=%s req_len=%zu active_audits=%zu running_audits=%zu queue_depth=%zu in_flight=%zu tid=%lu",
         static_cast<unsigned long long>(rt_ptr->status.id), mod.id.c_str(), rt_ptr->raw_request.size(),
@@ -264,6 +523,7 @@ void run_module_for_point(std::shared_ptr<audit_runtime_t> rt_ptr,
     release_inflight(*rt_ptr);
     const uint64_t baseline_elapsed = now_ms() - baseline_started;
     if (baseline.has_value()) {
+        record_transport_result(rt_ptr, true, std::string(), "baseline", mod.id);
         ctx.baseline_latency_ms = baseline->latency_ms;
         ctx.baseline_response_body = baseline->resp_body;
         ctx.baseline_response_headers = baseline->resp_headers;
@@ -274,9 +534,15 @@ void run_module_for_point(std::shared_ptr<audit_runtime_t> rt_ptr,
             static_cast<unsigned long long>(baseline_elapsed), static_cast<unsigned long>(GetCurrentThreadId()));
     } else {
         const std::string socket_error = audit_http::last_error();
+        record_transport_result(rt_ptr, false, socket_error, "baseline", mod.id);
         diag::log_tagged_fmt("scanner", "run_module_for_point baseline_failed audit=%llu module=%s socket_error=%s elapsed_ms=%llu tid=%lu",
             static_cast<unsigned long long>(rt_ptr->status.id), mod.id.c_str(), socket_error.c_str(),
             static_cast<unsigned long long>(baseline_elapsed), static_cast<unsigned long>(GetCurrentThreadId()));
+        if (rt_ptr->transport_circuit_breaker_open.load(std::memory_order_acquire)) {
+            diag::log_tagged_fmt("scanner", "run_module_for_point circuit_open after_baseline audit=%llu module=%s",
+                static_cast<unsigned long long>(rt_ptr->status.id), mod.id.c_str());
+            return;
+        }
     }
 
     auto send_fn = make_send_fn(rt_ptr, mod.id, false, false);
@@ -286,7 +552,8 @@ void run_module_for_point(std::shared_ptr<audit_runtime_t> rt_ptr,
             static_cast<unsigned long long>(rt_ptr->status.id), mod.id.c_str());
         auto custom_send_fn = make_send_fn(rt_ptr, mod.id, true, true);
         mod.custom_run(ip, ctx, custom_send_fn);
-        if (rt_ptr->cancel_flag.load()) return;
+        sync_issue_count_from_store(rt_ptr, "custom_run");
+        if (rt_ptr->cancel_flag.load() || rt_ptr->transport_circuit_breaker_open.load(std::memory_order_acquire)) return;
         if (!mod.probes || !mod.detect) return;
     }
 
@@ -301,7 +568,7 @@ void run_module_for_point(std::shared_ptr<audit_runtime_t> rt_ptr,
         ip.kind.c_str(), ip.name.c_str(), probes.size(), probe_cap);
     int issued = 0;
     for (const auto& p : probes) {
-        if (rt_ptr->cancel_flag.load()) {
+        if (rt_ptr->cancel_flag.load() || rt_ptr->transport_circuit_breaker_open.load(std::memory_order_acquire)) {
             diag::log_tagged_fmt("scanner", "run_module_for_point probe_loop cancelled audit=%llu module=%s issued=%d",
                 static_cast<unsigned long long>(rt_ptr->status.id), mod.id.c_str(), issued);
             return;
@@ -340,6 +607,7 @@ void run_module_for_point(std::shared_ptr<audit_runtime_t> rt_ptr,
             diag::log_tagged_fmt("scanner", "run_module_for_point issue_found audit=%llu module=%s type=%s",
                 static_cast<unsigned long long>(rt_ptr->status.id), mod.id.c_str(), maybe->type_key.c_str());
             emit_issue_safe(rt_ptr, *maybe);
+            sync_issue_count_from_store(rt_ptr, "detect");
             break;
         }
     }
@@ -378,9 +646,9 @@ void run_audit(std::shared_ptr<audit_runtime_t> rt_ptr)
         static_cast<unsigned long>(GetCurrentThreadId()));
 
     for (const auto& ip : points) {
-        if (rt_ptr->cancel_flag.load()) break;
+        if (rt_ptr->cancel_flag.load() || rt_ptr->transport_circuit_breaker_open.load(std::memory_order_acquire)) break;
         for (const auto& mod : enabled) {
-            if (rt_ptr->cancel_flag.load()) break;
+            if (rt_ptr->cancel_flag.load() || rt_ptr->transport_circuit_breaker_open.load(std::memory_order_acquire)) break;
             std::shared_ptr<audit_runtime_t> captured = rt_ptr;
             scanner::module_t mod_copy = mod;
             insertion_point_t ip_copy = ip;
@@ -443,10 +711,40 @@ void run_audit(std::shared_ptr<audit_runtime_t> rt_ptr)
         rt_ptr->status.ended_ms = now_ms();
     }
     rt_ptr->cancel_cv.notify_all();
+    sync_issue_count_from_store(rt_ptr, "audit_end");
     const auto end_load = collect_load_snapshot();
-    diag::log_tagged_fmt("burp", "active_scanner audit_end id=%llu issues=%zu cancelled=%d cancel_requested=%d drained=%d active_workers=%zu in_flight=%zu active_audits=%zu running_audits=%zu queue_depth=%zu elapsed_ms=%llu tid=%lu",
+    {
+        std::lock_guard<std::mutex> lk(rt_ptr->status_mtx);
+        rt_ptr->status.transport_backoff_ms = rt_ptr->transport_backoff_ms.load(std::memory_order_acquire);
+        rt_ptr->status.effective_throttle_ms = rt_ptr->config.request_throttle_ms + rt_ptr->status.transport_backoff_ms;
+        rt_ptr->status.transport_circuit_breaker_open = rt_ptr->transport_circuit_breaker_open.load(std::memory_order_acquire);
+        rt_ptr->status.transport_circuit_breaker_hits = rt_ptr->wsaenobufs_preinit_hits.load(std::memory_order_acquire);
+        rt_ptr->status.transport_circuit_breaker_threshold = kWsaEnobufsPreinitCircuitThreshold;
+        if (rt_ptr->status.responses_received == 0 && rt_ptr->status.transport_failures > 0) {
+            diag::log_tagged_fmt("burp", "active_scanner audit_transport_failed_no_responses id=%llu completed=%zu no_response=%zu failures=%zu transport_error_code=%u transport_error_class=%s circuit_open=%d circuit_hits=%zu last_error=%s",
+                static_cast<unsigned long long>(rt_ptr->status.id),
+                rt_ptr->status.completed_probes,
+                rt_ptr->status.no_response_count,
+                rt_ptr->status.transport_failures,
+                rt_ptr->status.transport_error_code,
+                rt_ptr->status.transport_error_class.c_str(),
+                rt_ptr->status.transport_circuit_breaker_open ? 1 : 0,
+                rt_ptr->status.transport_circuit_breaker_hits,
+                rt_ptr->status.last_transport_error.c_str());
+        }
+    }
+    diag::log_tagged_fmt("burp", "active_scanner audit_end id=%llu issues=%zu responses=%zu no_response=%zu transport_failures=%zu transport_error_code=%u transport_error_class=%s circuit_open=%d circuit_hits=%zu circuit_threshold=%zu last_transport_error=%s cancelled=%d cancel_requested=%d drained=%d active_workers=%zu in_flight=%zu active_audits=%zu running_audits=%zu queue_depth=%zu elapsed_ms=%llu tid=%lu",
         static_cast<unsigned long long>(rt_ptr->status.id),
         rt_ptr->status.issues_found,
+        rt_ptr->status.responses_received,
+        rt_ptr->status.no_response_count,
+        rt_ptr->status.transport_failures,
+        rt_ptr->status.transport_error_code,
+        rt_ptr->status.transport_error_class.c_str(),
+        rt_ptr->status.transport_circuit_breaker_open ? 1 : 0,
+        rt_ptr->status.transport_circuit_breaker_hits,
+        rt_ptr->status.transport_circuit_breaker_threshold,
+        rt_ptr->status.last_transport_error.c_str(),
         rt_ptr->status.cancelled ? 1 : 0,
         rt_ptr->status.cancel_requested ? 1 : 0,
         rt_ptr->status.drained ? 1 : 0,
@@ -563,6 +861,19 @@ uint64_t enqueue_target(const std::vector<uint8_t>& raw_request,
         return 0;
     }
     audit_config_t normalized_cfg = cfg;
+    const bool external_host = !is_local_or_private_host(host);
+    if (external_host && !normalized_cfg.max_concurrent_explicit &&
+        normalized_cfg.max_concurrent_requests > kExternalDefaultMaxConcurrentRequests) {
+        diag::log_tagged_fmt("scanner", "enqueue_target external_default_concurrency url=%s host=%s requested=%zu effective=%zu",
+            url.c_str(), host.c_str(), normalized_cfg.max_concurrent_requests, kExternalDefaultMaxConcurrentRequests);
+        normalized_cfg.max_concurrent_requests = kExternalDefaultMaxConcurrentRequests;
+    }
+    if (external_host && !normalized_cfg.request_throttle_explicit &&
+        normalized_cfg.request_throttle_ms < kExternalDefaultThrottleMs) {
+        diag::log_tagged_fmt("scanner", "enqueue_target external_default_throttle url=%s host=%s requested=%zu effective=%zu",
+            url.c_str(), host.c_str(), normalized_cfg.request_throttle_ms, kExternalDefaultThrottleMs);
+        normalized_cfg.request_throttle_ms = kExternalDefaultThrottleMs;
+    }
     normalized_cfg.max_concurrent_requests = (std::max)(static_cast<size_t>(1), (std::min)(normalized_cfg.max_concurrent_requests, kMaxPerAuditInFlightRequests));
     auto rt = std::make_shared<audit_runtime_t>();
     rt->config = normalized_cfg;
@@ -575,6 +886,9 @@ uint64_t enqueue_target(const std::vector<uint8_t>& raw_request,
     rt->status.running = true;
     rt->status.started_ms = now_ms();
     rt->status.request_length = raw_request.size();
+    rt->status.effective_max_concurrent = normalized_cfg.max_concurrent_requests;
+    rt->status.effective_throttle_ms = normalized_cfg.request_throttle_ms;
+    rt->status.transport_circuit_breaker_threshold = kWsaEnobufsPreinitCircuitThreshold;
     try {
         std::lock_guard<std::mutex> lk(s.audits_mtx);
         size_t running_audits = 0;
@@ -732,6 +1046,11 @@ std::vector<audit_status_t> list_audits()
         const size_t in_flight = rt->in_flight.load(std::memory_order_acquire);
         const size_t queued_workers = rt->queued_workers.load(std::memory_order_acquire);
         std::lock_guard<std::mutex> lk(rt->status_mtx);
+        rt->status.transport_backoff_ms = rt->transport_backoff_ms.load(std::memory_order_acquire);
+        rt->status.effective_throttle_ms = rt->config.request_throttle_ms + rt->status.transport_backoff_ms;
+        rt->status.transport_circuit_breaker_open = rt->transport_circuit_breaker_open.load(std::memory_order_acquire);
+        rt->status.transport_circuit_breaker_hits = rt->wsaenobufs_preinit_hits.load(std::memory_order_acquire);
+        rt->status.transport_circuit_breaker_threshold = kWsaEnobufsPreinitCircuitThreshold;
         audit_status_t st = rt->status;
         st.cancel_requested = st.cancel_requested || rt->cancel_flag.load(std::memory_order_acquire);
         st.drained = !st.running && active_workers == 0 && in_flight == 0;
@@ -768,6 +1087,11 @@ bool get_status(uint64_t audit_id, audit_status_t& out)
     const size_t in_flight = rt->in_flight.load(std::memory_order_acquire);
     const size_t queued_workers = rt->queued_workers.load(std::memory_order_acquire);
     std::lock_guard<std::mutex> lk(rt->status_mtx);
+    rt->status.transport_backoff_ms = rt->transport_backoff_ms.load(std::memory_order_acquire);
+    rt->status.effective_throttle_ms = rt->config.request_throttle_ms + rt->status.transport_backoff_ms;
+    rt->status.transport_circuit_breaker_open = rt->transport_circuit_breaker_open.load(std::memory_order_acquire);
+    rt->status.transport_circuit_breaker_hits = rt->wsaenobufs_preinit_hits.load(std::memory_order_acquire);
+    rt->status.transport_circuit_breaker_threshold = kWsaEnobufsPreinitCircuitThreshold;
     out = rt->status;
     out.cancel_requested = out.cancel_requested || rt->cancel_flag.load(std::memory_order_acquire);
     out.drained = !out.running && active_workers == 0 && in_flight == 0;
@@ -778,15 +1102,26 @@ bool get_status(uint64_t audit_id, audit_status_t& out)
         rt->status.drained = true;
     if (out.cancel_requested)
         rt->status.cancel_requested = true;
-    diag::log_tagged_fmt("scanner", "get_status id=%llu running=%d issues=%zu completed=%zu total=%zu cancel_requested=%d drained=%d req_len=%zu queued_workers=%zu active_workers=%zu in_flight=%zu tid=%lu",
+    diag::log_tagged_fmt("scanner", "get_status id=%llu running=%d issues=%zu completed=%zu total=%zu responses=%zu no_response=%zu transport_failures=%zu transport_error_code=%u transport_error_class=%s circuit_open=%d circuit_hits=%zu circuit_threshold=%zu last_transport_error=%s cancel_requested=%d drained=%d req_len=%zu queued_workers=%zu active_workers=%zu in_flight=%zu effective_concurrency=%zu effective_throttle_ms=%zu tid=%lu",
         static_cast<unsigned long long>(audit_id), out.running ? 1 : 0,
         out.issues_found, out.completed_probes, out.total_probes,
+        out.responses_received,
+        out.no_response_count,
+        out.transport_failures,
+        out.transport_error_code,
+        out.transport_error_class.c_str(),
+        out.transport_circuit_breaker_open ? 1 : 0,
+        out.transport_circuit_breaker_hits,
+        out.transport_circuit_breaker_threshold,
+        out.last_transport_error.c_str(),
         out.cancel_requested ? 1 : 0,
         out.drained ? 1 : 0,
         out.request_length,
         queued_workers,
         active_workers,
         in_flight,
+        out.effective_max_concurrent,
+        out.effective_throttle_ms,
         static_cast<unsigned long>(GetCurrentThreadId()));
     return true;
 }

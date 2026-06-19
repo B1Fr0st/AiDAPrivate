@@ -14,6 +14,10 @@ struct sendrecv_scan_options_t {
     std::uint32_t max_modules = 32;
     std::uint64_t max_scan_bytes = 67108864;
     std::uint32_t timeout_ms = 3500;
+    std::string module_name;
+    std::uint64_t module_base = 0;
+    std::uint64_t scan_base = 0;
+    std::uint64_t scan_size = 0;
 };
 
 struct serializer_trace_options_t {

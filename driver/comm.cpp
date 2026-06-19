@@ -3591,18 +3591,25 @@ bool voyager::device_t::intercept_op(std::uint32_t operation, std::uint32_t filt
                                       std::uint32_t* out_held_count, bool* out_active) noexcept {
     const DWORD ioctl_code = ioctl_codes::IHLD();
     if (!is_connected()) {
+        SetLastError(ERROR_INVALID_HANDLE);
         diag::log_tagged_fmt("driver_comm_net",
-            "intercept_op ABORT not_connected op=%u pid=%u port=%u protocol=%u hold_id=%llu ioctl=0x%08X",
-            operation, filter_pid, filter_port, filter_protocol, static_cast<unsigned long long>(hold_id), ioctl_code);
+            "intercept_op ABORT not_connected op=%u pid=%u port=%u protocol=%u hold_id=%llu ioctl=0x%08X gle=%lu",
+            operation, filter_pid, filter_port, filter_protocol, static_cast<unsigned long long>(hold_id), ioctl_code,
+            static_cast<unsigned long>(ERROR_INVALID_HANDLE));
+        SetLastError(ERROR_INVALID_HANDLE);
         return false;
     }
 
     auto* req = static_cast<detail::intercept_request*>(
         VirtualAlloc(nullptr, sizeof(detail::intercept_request), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
     if (!req) {
-        const DWORD err = GetLastError();
+        DWORD err = GetLastError();
+        if (err == ERROR_SUCCESS)
+            err = ERROR_NOT_ENOUGH_MEMORY;
+        SetLastError(err);
         diag::log_tagged_fmt("driver_comm_net", "intercept_op ABORT alloc_failed op=%u bytes=%zu gle=%lu",
-            operation, sizeof(detail::intercept_request), err);
+            operation, sizeof(detail::intercept_request), static_cast<unsigned long>(err));
+        SetLastError(err);
         return false;
     }
 
@@ -3617,7 +3624,7 @@ bool voyager::device_t::intercept_op(std::uint32_t operation, std::uint32_t filt
         std::memcpy(req->modify_payload, modify_payload, req->modify_payload_size);
     }
 
-    SetLastError(0);
+    SetLastError(ERROR_SUCCESS);
     bool ok = send_request(ioctl_code, req, static_cast<DWORD>(sizeof(*req)));
     const DWORD gle = GetLastError();
     diag::log_tagged_fmt("driver_comm_net",
@@ -3631,6 +3638,7 @@ bool voyager::device_t::intercept_op(std::uint32_t operation, std::uint32_t filt
     }
 
     VirtualFree(req, 0, MEM_RELEASE);
+    SetLastError(ok ? ERROR_SUCCESS : gle);
     return ok;
 }
 

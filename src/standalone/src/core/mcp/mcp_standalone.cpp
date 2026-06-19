@@ -878,8 +878,25 @@ static json build_input_schema(const tool_def_t& tool)
 
     for (const auto& p : tool.params) {
         json desc;
-        desc["type"]        = p.type;
         desc["description"] = p.description;
+        if (p.type.find('|') != std::string::npos) {
+            json one_of = json::array();
+            size_t start = 0;
+            while (start <= p.type.size()) {
+                size_t end = p.type.find('|', start);
+                if (end == std::string::npos)
+                    end = p.type.size();
+                std::string type_name = p.type.substr(start, end - start);
+                if (!type_name.empty())
+                    one_of.push_back(json{{"type", type_name}});
+                if (end == p.type.size())
+                    break;
+                start = end + 1;
+            }
+            desc["oneOf"] = std::move(one_of);
+        } else {
+            desc["type"] = p.type;
+        }
         json enum_values = enum_values_from_description(p.description);
         if (!enum_values.empty())
             desc["enum"] = std::move(enum_values);
@@ -1066,7 +1083,7 @@ __declspec(noinline) static DWORD seh_sse_provider_step(
 namespace
 {
     std::mutex                                                       g_in_flight_mutex;
-    std::map<std::string, std::shared_ptr<std::atomic<bool>>>        g_in_flight_cancels;
+    std::map<std::string, cancel_token_ptr_t>                        g_in_flight_cancels;
     thread_local std::atomic<bool>*                                  tls_current_cancel_token = nullptr;
 
     std::string cancel_key_for_id(const json& id)
@@ -1079,9 +1096,9 @@ namespace
         return std::string{"j:"} + id.dump();
     }
 
-    std::shared_ptr<std::atomic<bool>> register_in_flight_call(const json& id)
+    cancel_token_ptr_t register_in_flight_call(const json& id)
     {
-        auto token = std::make_shared<std::atomic<bool>>(false);
+        auto token = make_call_cancel_token(false);
         std::lock_guard<std::mutex> lk(g_in_flight_mutex);
         g_in_flight_cancels[cancel_key_for_id(id)] = token;
         return token;
@@ -1095,29 +1112,28 @@ namespace
 
     bool signal_in_flight_cancel(const json& id)
     {
-        std::shared_ptr<std::atomic<bool>> token;
+        cancel_token_ptr_t token;
         {
             std::lock_guard<std::mutex> lk(g_in_flight_mutex);
             auto it = g_in_flight_cancels.find(cancel_key_for_id(id));
             if (it == g_in_flight_cancels.end()) return false;
             token = it->second;
         }
-        if (token) token->store(true, std::memory_order_release);
+        signal_call_cancel_token(token);
         return true;
     }
 
     struct cancel_scope_t
     {
-        json                              id;
-        std::shared_ptr<std::atomic<bool>> token;
-        std::atomic<bool>*                previous = nullptr;
+        json               id;
+        cancel_token_ptr_t token;
+        scoped_call_cancel_t scoped;
 
         cancel_scope_t(const json& request_id)
             : id(request_id)
+            , token(register_in_flight_call(id))
+            , scoped(token)
         {
-            token = register_in_flight_call(id);
-            previous = tls_current_cancel_token;
-            tls_current_cancel_token = token.get();
         }
 
         cancel_scope_t(const cancel_scope_t&) = delete;
@@ -1125,10 +1141,21 @@ namespace
 
         ~cancel_scope_t()
         {
-            tls_current_cancel_token = previous;
             unregister_in_flight_call(id);
         }
     };
+}
+
+cancel_token_ptr_t make_call_cancel_token(bool cancelled)
+{
+    auto token = std::make_shared<std::atomic<bool>>(cancelled);
+    return token;
+}
+
+void signal_call_cancel_token(const cancel_token_ptr_t& token) noexcept
+{
+    if (token)
+        token->store(true, std::memory_order_release);
 }
 
 std::atomic<bool>* current_cancel_token() noexcept
@@ -1140,6 +1167,57 @@ bool current_call_cancelled() noexcept
 {
     std::atomic<bool>* tok = tls_current_cancel_token;
     return tok && tok->load(std::memory_order_acquire);
+}
+
+scoped_call_cancel_t::scoped_call_cancel_t(cancel_token_ptr_t token)
+    : _token(std::move(token))
+{
+    if (_token) {
+        _previous = tls_current_cancel_token;
+        tls_current_cancel_token = _token.get();
+        _active = true;
+    }
+}
+
+scoped_call_cancel_t::~scoped_call_cancel_t()
+{
+    release();
+}
+
+scoped_call_cancel_t::scoped_call_cancel_t(scoped_call_cancel_t&& other) noexcept
+    : _token(std::move(other._token))
+    , _previous(other._previous)
+    , _active(other._active)
+{
+    other._previous = nullptr;
+    other._active = false;
+}
+
+scoped_call_cancel_t& scoped_call_cancel_t::operator=(scoped_call_cancel_t&& other) noexcept
+{
+    if (this != &other) {
+        release();
+        _token = std::move(other._token);
+        _previous = other._previous;
+        _active = other._active;
+        other._previous = nullptr;
+        other._active = false;
+    }
+    return *this;
+}
+
+void scoped_call_cancel_t::cancel() noexcept
+{
+    signal_call_cancel_token(_token);
+}
+
+void scoped_call_cancel_t::release() noexcept
+{
+    if (!_active)
+        return;
+    tls_current_cancel_token = _previous;
+    _previous = nullptr;
+    _active = false;
 }
 
 server_t::server_t()  = default;

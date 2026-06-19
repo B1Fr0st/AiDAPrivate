@@ -4109,6 +4109,7 @@ namespace driver_bridge
                 status().c_str(),
                 last_error().c_str(),
                 static_cast<unsigned long long>(GetTickCount64() - t0));
+            SetLastError(ERROR_INVALID_HANDLE);
             return false;
         }
         const uint32_t active = attached_pid();
@@ -6186,22 +6187,48 @@ namespace driver_bridge
         }
         if (!kernel_mode) {
             require_kernel_fail("intercept_op");
+            SetLastError(ERROR_INVALID_HANDLE);
+            diag::log_tagged_fmt("driver_bridge_net",
+                "intercept_op EXIT op=%u pid=%u port=%u proto=%u hold_id=%llu ok=0 preserved_gle=%lu attached_pid=%u kernel_mode=0 status=%s driver_error=%s elapsed_ms=%llu",
+                operation,
+                filter_pid,
+                filter_port,
+                filter_protocol,
+                static_cast<unsigned long long>(hold_id),
+                static_cast<unsigned long>(ERROR_INVALID_HANDLE),
+                attached_pid(),
+                status().c_str(),
+                last_error().c_str(),
+                static_cast<unsigned long long>(GetTickCount64() - t0));
             return false;
         }
 
         diag::log_tagged_fmt("driver_bridge_net",
-            "intercept_op ENTER op=%u pid=%u port=%u proto=%u hold_id=%llu modify_size=%u",
+            "intercept_op ENTER op=%u pid=%u port=%u proto=%u hold_id=%llu modify_size=%u attached_pid=%u kernel_mode=%d status=%s",
             operation, filter_pid, filter_port, filter_protocol,
-            static_cast<unsigned long long>(hold_id), modify_size);
+            static_cast<unsigned long long>(hold_id), modify_size,
+            attached_pid(), kernel_mode ? 1 : 0, status().c_str());
+        SetLastError(ERROR_SUCCESS);
         bool ok = device->intercept_op(operation, filter_pid, filter_port, filter_protocol,
                                        hold_id, modify_payload, modify_size,
                                        out_held_count, out_active);
-        DWORD gle = ok ? 0 : GetLastError();
+        DWORD gle = GetLastError();
+        if (!ok && gle == ERROR_SUCCESS)
+            gle = ERROR_GEN_FAILURE;
         diag::log_tagged_fmt("driver_bridge_net",
-            "intercept_op EXIT op=%u ok=%d held_count=%u active=%d gle=%lu elapsed_ms=%llu",
-            operation, ok ? 1 : 0, out_held_count ? *out_held_count : 0,
-            out_active && *out_active ? 1 : 0, static_cast<unsigned long>(gle),
+            "intercept_op EXIT op=%u pid=%u port=%u proto=%u hold_id=%llu ok=%d held_count=%u active=%d preserved_gle=%lu attached_pid=%u kernel_mode=%d status=%s driver_error=%s elapsed_ms=%llu",
+            operation, filter_pid, filter_port, filter_protocol,
+            static_cast<unsigned long long>(hold_id),
+            ok ? 1 : 0,
+            out_held_count ? *out_held_count : 0,
+            out_active && *out_active ? 1 : 0,
+            static_cast<unsigned long>(ok ? ERROR_SUCCESS : gle),
+            attached_pid(),
+            kernel_mode ? 1 : 0,
+            status().c_str(),
+            last_error().c_str(),
             static_cast<unsigned long long>(GetTickCount64() - t0));
+        SetLastError(ok ? ERROR_SUCCESS : gle);
         return ok;
     }
 

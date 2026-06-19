@@ -32,6 +32,23 @@ std::uint32_t process_id_from_params(const json& params)
     return 0;
 }
 
+std::optional<std::uint64_t> u64_from_params(const json& params, const char* name)
+{
+    if (!name || !params.contains(name))
+        return std::nullopt;
+    const auto& v = params[name];
+    if (v.is_string())
+        return sa_parse_address(v.get<std::string>());
+    if (v.is_number_unsigned())
+        return v.get<std::uint64_t>();
+    if (v.is_number_integer()) {
+        const auto n = v.get<std::int64_t>();
+        if (n >= 0)
+            return static_cast<std::uint64_t>(n);
+    }
+    return std::nullopt;
+}
+
 tool_result_t handle_find_sendrecv(const json& raw_params)
 {
     const ULONGLONG started = GetTickCount64();
@@ -41,14 +58,30 @@ tool_result_t handle_find_sendrecv(const json& raw_params)
     options.max_results = params.value("max_results", 64u);
     options.max_modules = params.value("max_modules", 32u);
     options.max_scan_bytes = params.value("max_scan_bytes", static_cast<std::uint64_t>(67108864));
-    options.timeout_ms = params.value("timeout_ms", 3500u);
+    options.timeout_ms = params.value("timeout_ms", 2500u);
+    if (params.contains("module_name") && params["module_name"].is_string())
+        options.module_name = params["module_name"].get<std::string>();
+    else if (params.contains("module") && params["module"].is_string())
+        options.module_name = params["module"].get<std::string>();
+    else if (params.contains("module_filter") && params["module_filter"].is_string())
+        options.module_name = params["module_filter"].get<std::string>();
+    if (auto v = u64_from_params(params, "module_base"))
+        options.module_base = *v;
+    if (auto v = u64_from_params(params, "scan_base"))
+        options.scan_base = *v;
+    if (auto v = u64_from_params(params, "scan_size"))
+        options.scan_size = *v;
     diag::log_tagged_fmt("net_proto",
-        "net_proto_find_sendrecv_handler_begin process_id=%u max_results=%u max_modules=%u max_scan_bytes=%llu timeout_ms=%u",
+        "net_proto_find_sendrecv_handler_begin process_id=%u max_results=%u max_modules=%u max_scan_bytes=%llu timeout_ms=%u module_name=%s module_base=0x%llX scan_base=0x%llX scan_size=0x%llX",
         options.process_id,
         options.max_results,
         options.max_modules,
         static_cast<unsigned long long>(options.max_scan_bytes),
-        options.timeout_ms);
+        options.timeout_ms,
+        options.module_name.empty() ? "<empty>" : options.module_name.c_str(),
+        static_cast<unsigned long long>(options.module_base),
+        static_cast<unsigned long long>(options.scan_base),
+        static_cast<unsigned long long>(options.scan_size));
 
     json result;
     std::string error;
@@ -198,7 +231,11 @@ void register_net_proto_tools(mcp_standalone::server_t& srv)
          {OBFSTR("max_results"), OBFSTR("number"), OBFSTR("Maximum findings, default 64, max 128."), false},
          {OBFSTR("max_modules"), OBFSTR("number"), OBFSTR("Maximum non-system modules to scan."), false},
          {OBFSTR("max_scan_bytes"), OBFSTR("number"), OBFSTR("Global byte scan cap."), false},
-         {OBFSTR("timeout_ms"), OBFSTR("number"), OBFSTR("Internal scan deadline in milliseconds, default 3500."), false}},
+         {OBFSTR("timeout_ms"), OBFSTR("number"), OBFSTR("Internal scan deadline in milliseconds, default 2500."), false},
+         {OBFSTR("module_name"), OBFSTR("string"), OBFSTR("Optional deterministic module name/path filter."), false},
+         {OBFSTR("module_base"), OBFSTR("string"), OBFSTR("Optional deterministic module base filter."), false},
+         {OBFSTR("scan_base"), OBFSTR("string"), OBFSTR("Optional scan start VA constrained to the selected module."), false},
+         {OBFSTR("scan_size"), OBFSTR("number"), OBFSTR("Optional scan byte length constrained to the selected module."), false}},
         handle_find_sendrecv, true});
 
     register_compat(srv, {

@@ -387,8 +387,11 @@ def _build_camoufox_launch_options(headless: bool, kwargs: dict[str, Any]) -> di
         print("AIDA_CAMOUFOX " + _json.dumps(payload, sort_keys=True, separators=(",", ":")), file=sys.stderr, flush=True)
     except Exception:
         pass]=]
-[=[def _camoufox_debug(event: str, **fields: Any) -> None:
-    payload = {"event": event, **fields}
+[=[def _camoufox_debug(event_name: str = "", **fields: Any) -> None:
+    safe_fields = dict(fields)
+    if "event" in safe_fields:
+        safe_fields["payload_event"] = safe_fields.pop("event")
+    payload = {"event": event_name, **safe_fields}
     try:
         line = "AIDA_CAMOUFOX " + _json.dumps(payload, sort_keys=True, separators=(",", ":"))
         print(line, file=sys.stderr, flush=True)

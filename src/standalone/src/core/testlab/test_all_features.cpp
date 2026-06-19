@@ -128,6 +128,8 @@ namespace test_all_features {
 			OutputDebugStringA(line);
 	}
 
+	void format_ui_phase_snapshot(char* out, std::size_t cap);
+
 	namespace {
 
 
@@ -316,13 +318,16 @@ namespace test_all_features {
 			const auto cq = critical_work_queue::stats();
 			const auto wq = work_queue::stats();
 			const auto sq = work_queue::service_stats();
+			char ui_phase[900] = {};
+			format_ui_phase_snapshot(ui_phase, sizeof(ui_phase));
 
 			_snprintf_s(out, cap, _TRUNCATE,
 				"run_id=%llu host_pid=%lu host_tid=%lu running=%d cancel=%d target_unavailable=%d phase=\"%.160s\" phase_age_ms=%llu "
 				"step=\"%.220s\" step_age_ms=%llu run_age_ms=%llu total=%d current=%d "
-				"pass=%d fail=%d skip=%d suspect=%d cq_alive=%d cq_shutdown=%d cq_workers=%zu cq_pending=%zu cq_active=%u cq_started=%llu cq_finished=%llu "
-				"wq_alive=%d wq_shutdown=%d wq_workers=%zu wq_pending=%zu wq_active=%u wq_started=%llu wq_finished=%llu "
-				"svc_alive=%d svc_shutdown=%d svc_workers=%zu svc_pending=%zu svc_active=%u svc_started=%llu svc_finished=%llu "
+				"pass=%d fail=%d skip=%d suspect=%d ui={%.620s} "
+				"cq_alive=%d cq_shutdown=%d cq_workers=%zu cq_pending=%zu cq_active=%u cq_active_labels=%u cq_oldest_active_ms=%llu cq_started=%llu cq_finished=%llu cq_labels=%.220s "
+				"wq_alive=%d wq_shutdown=%d wq_workers=%zu wq_pending=%zu wq_active=%u wq_active_labels=%u wq_oldest_active_ms=%llu wq_started=%llu wq_finished=%llu wq_labels=%.220s "
+				"svc_alive=%d svc_shutdown=%d svc_workers=%zu svc_pending=%zu svc_active=%u svc_active_labels=%u svc_oldest_active_ms=%llu svc_started=%llu svc_finished=%llu svc_labels=%.220s "
 				"target_pid=%u driver_attached=%d "
 				"image_base=0x%016llX target_addr=0x%016llX saved_dtb=0x%016llX",
 				static_cast<unsigned long long>(g_run_id.load(std::memory_order_acquire)),
@@ -342,27 +347,37 @@ namespace test_all_features {
 				g_failed.load(std::memory_order_acquire),
 				g_skipped.load(std::memory_order_acquire),
 				g_suspect.load(std::memory_order_acquire),
+				ui_phase[0] ? ui_phase : "<empty>",
 				cq.alive ? 1 : 0,
 				cq.shutting_down ? 1 : 0,
 				cq.workers,
 				cq.pending,
 				static_cast<unsigned>(cq.active),
+				cq.active_label_count,
+				static_cast<unsigned long long>(cq.oldest_active_ms),
 				static_cast<unsigned long long>(cq.started),
 				static_cast<unsigned long long>(cq.finished),
+				cq.active_labels.empty() ? "<none>" : cq.active_labels.c_str(),
 				wq.alive ? 1 : 0,
 				wq.shutting_down ? 1 : 0,
 				wq.workers,
 				wq.pending,
 				static_cast<unsigned>(wq.active),
+				wq.active_label_count,
+				static_cast<unsigned long long>(wq.oldest_active_ms),
 				static_cast<unsigned long long>(wq.started),
 				static_cast<unsigned long long>(wq.finished),
+				wq.active_labels.empty() ? "<none>" : wq.active_labels.c_str(),
 				sq.alive ? 1 : 0,
 				sq.shutting_down ? 1 : 0,
 				sq.workers,
 				sq.pending,
 				static_cast<unsigned>(sq.active),
+				sq.active_label_count,
+				static_cast<unsigned long long>(sq.oldest_active_ms),
 				static_cast<unsigned long long>(sq.started),
 				static_cast<unsigned long long>(sq.finished),
+				sq.active_labels.empty() ? "<none>" : sq.active_labels.c_str(),
 				g_target_pid.load(std::memory_order_acquire),
 				g_driver_attached.load(std::memory_order_acquire) ? 1 : 0,
 				static_cast<unsigned long long>(g_target_image_base.load(std::memory_order_acquire)),
@@ -988,8 +1003,7 @@ namespace test_all_features {
 						parsed_nonzero(r, "functional_context_rip") &&
 						parsed_nonzero(r, "functional_context_rsp") &&
 						parsed_nonzero(r, "functional_context_rflags")) {
-						reason = "TCTX raw_ioctl_degraded=1_functional_context_fallback_success_mixed_evidence";
-						return true;
+						return false;
 					}
 					reason = "TCTX raw_ioctl_degraded=1_without_functional_context_pass";
 					return true;
@@ -2968,7 +2982,7 @@ namespace test_all_features {
 				try {
 					auto stop_token = std::make_shared<std::atomic<bool>>(false);
 					stop = stop_token;
-					const bool posted = critical_work_queue::post([stop_token]() {
+					const bool posted = critical_work_queue::post_labeled("full_test.heartbeat", [stop_token]() {
 						while (!stop_token->load(std::memory_order_acquire)) {
 							for (int i = 0; i < 50; ++i) {
 								if (stop_token->load(std::memory_order_acquire)) return;
@@ -3352,7 +3366,7 @@ namespace test_all_features {
 		bool start_full_test_worker(HANDLE hf) {
 			const std::uint64_t queued_at = now_ms_tick();
 			log_work_queue_snapshot(hf, "start", "BEFORE full-test critical_queue post");
-			const bool posted = critical_work_queue::post([queued_at]() {
+			const bool posted = critical_work_queue::post_labeled("full_test.run_all", [queued_at]() {
 				const std::uint64_t entered_at = now_ms_tick();
 				const std::uint64_t queue_delay = entered_at >= queued_at ? (entered_at - queued_at) : 0;
 				HANDLE entry_hf = open_log_file();
@@ -3568,7 +3582,7 @@ namespace test_all_features {
 			if (!posted)
 				posted = work_queue::post(task);
 			if (!posted)
-				posted = critical_work_queue::post(std::move(task));
+				posted = critical_work_queue::post_labeled("full_test.startup_fallback", std::move(task));
 			if (!posted) {
 				DWORD err = GetLastError();
 				g_start_queued.store(false, std::memory_order_release);

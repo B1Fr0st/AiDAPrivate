@@ -107,6 +107,8 @@ void smuggling_run(const insertion_point_t& ip, const module_context_t& ctx, con
     auto t0 = std::chrono::steady_clock::now();
     audit_http::send_options_t opt;
     opt.timeout_ms = 8000;
+    opt.publish_exchange = true;
+    opt.exchange_source = "scanner";
     diag::log_tagged_fmt("mod_smuggling", "smuggling_run fetching baseline host=%s port=%d tls=%d", ctx.host.c_str(), ctx.port, ctx.tls ? 1 : 0);
     auto baseline = audit_http::send(std::vector<uint8_t>(ip.base_request.begin(), ip.base_request.end()),
                                      ctx.host, ctx.port, ctx.tls, opt);

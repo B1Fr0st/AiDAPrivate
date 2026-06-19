@@ -1,5 +1,6 @@
 #include "camoufox_bridge_mcp.hpp"
 #include "camoufox_bridge.hpp"
+#include "burp_events.hpp"
 #include "../../settings/standalone_compat.hpp"
 
 #ifdef small
@@ -11,13 +12,19 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cctype>
+#include <climits>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
+#include <initializer_list>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -296,6 +303,7 @@ bool json_has_key(const json& data, const char* key)
 }
 
 int json_int_param(const json& params, const char* name, int fallback);
+bool json_bool_param(const json& params, const char* name, bool fallback);
 std::string json_string_param(const json& params, const char* name, const std::string& fallback);
 
 tool_result_t annotate_initiator_contract_result(const json& forwarded, tool_result_t out)
@@ -591,6 +599,608 @@ json png_dimensions(const std::vector<unsigned char>& bytes)
     return out;
 }
 
+uint64_t epoch_now_ms()
+{
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
+std::atomic<uint64_t>& browser_exchange_ids()
+{
+    static std::atomic<uint64_t> ids{5000000000ULL};
+    return ids;
+}
+
+struct browser_url_t
+{
+    std::string scheme;
+    std::string host;
+    uint16_t port = 0;
+    std::string path;
+    std::string query;
+};
+
+struct burp_publish_summary_t
+{
+    size_t candidates = 0;
+    size_t published = 0;
+    size_t skipped = 0;
+    size_t duplicates = 0;
+    std::string source = "browser";
+    bool publish_enabled = true;
+    bool fallback_used = false;
+    std::vector<uint64_t> exchange_ids;
+
+    json to_json() const
+    {
+        json out;
+        out["published"] = static_cast<uint64_t>(published);
+        out["candidates"] = static_cast<uint64_t>(candidates);
+        out["skipped"] = static_cast<uint64_t>(skipped);
+        out["duplicates"] = static_cast<uint64_t>(duplicates);
+        out["source"] = source;
+        out["publish_enabled"] = publish_enabled;
+        out["fallback_used"] = fallback_used;
+        out["exchange_ids"] = json::array();
+        for (uint64_t id : exchange_ids)
+            out["exchange_ids"].push_back(id);
+        return out;
+    }
+};
+
+std::string json_string_from_any(const json& v)
+{
+    try
+    {
+        if (v.is_string())
+            return v.get<std::string>();
+        if (v.is_number_integer())
+            return std::to_string(v.get<int64_t>());
+        if (v.is_number_unsigned())
+            return std::to_string(v.get<uint64_t>());
+        if (v.is_number_float())
+        {
+            std::ostringstream oss;
+            oss << v.get<double>();
+            return oss.str();
+        }
+        if (v.is_boolean())
+            return v.get<bool>() ? "true" : "false";
+    }
+    catch (...) {}
+    return {};
+}
+
+std::string json_first_string_field(const json& obj, std::initializer_list<const char*> keys)
+{
+    if (!obj.is_object())
+        return {};
+    for (const char* key : keys)
+    {
+        auto it = obj.find(key);
+        if (it != obj.end())
+        {
+            std::string value = json_string_from_any(*it);
+            if (!value.empty())
+                return value;
+        }
+    }
+    return {};
+}
+
+int json_first_int_field(const json& obj, std::initializer_list<const char*> keys, int fallback = 0)
+{
+    if (!obj.is_object())
+        return fallback;
+    for (const char* key : keys)
+    {
+        auto it = obj.find(key);
+        if (it == obj.end())
+            continue;
+        try
+        {
+            if (it->is_number_integer())
+                return it->get<int>();
+            if (it->is_number_unsigned())
+                return static_cast<int>((std::min<uint64_t>)(it->get<uint64_t>(), static_cast<uint64_t>(INT_MAX)));
+            if (it->is_number_float())
+                return static_cast<int>(it->get<double>());
+            if (it->is_string())
+                return std::stoi(it->get<std::string>());
+        }
+        catch (...) {}
+    }
+    return fallback;
+}
+
+uint64_t json_first_u64_field(const json& obj, std::initializer_list<const char*> keys, uint64_t fallback = 0)
+{
+    if (!obj.is_object())
+        return fallback;
+    for (const char* key : keys)
+    {
+        auto it = obj.find(key);
+        if (it == obj.end())
+            continue;
+        try
+        {
+            if (it->is_number_unsigned())
+                return it->get<uint64_t>();
+            if (it->is_number_integer())
+            {
+                const int64_t v = it->get<int64_t>();
+                if (v >= 0)
+                    return static_cast<uint64_t>(v);
+            }
+            if (it->is_number_float())
+            {
+                const double v = it->get<double>();
+                if (v >= 0.0)
+                    return static_cast<uint64_t>(v);
+            }
+            if (it->is_string())
+                return static_cast<uint64_t>(std::stoull(it->get<std::string>()));
+        }
+        catch (...) {}
+    }
+    return fallback;
+}
+
+std::string uppercase_ascii_copy(std::string s)
+{
+    for (char& c : s)
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    return s;
+}
+
+bool parse_browser_url(const std::string& url, browser_url_t& out)
+{
+    out = browser_url_t{};
+    if (url.empty())
+        return false;
+    size_t scheme_pos = url.find("://");
+    size_t authority_start = 0;
+    if (scheme_pos != std::string::npos)
+    {
+        out.scheme = lower_ascii_copy(url.substr(0, scheme_pos));
+        authority_start = scheme_pos + 3;
+    }
+    else
+    {
+        out.scheme = "http";
+    }
+    size_t authority_end = url.find_first_of("/?#", authority_start);
+    if (authority_end == std::string::npos)
+        authority_end = url.size();
+    std::string authority = url.substr(authority_start, authority_end - authority_start);
+    if (authority.empty() || authority.find(' ') != std::string::npos)
+        return false;
+    if (!authority.empty() && authority.front() == '[')
+    {
+        size_t close = authority.find(']');
+        if (close == std::string::npos)
+            return false;
+        out.host = authority.substr(0, close + 1);
+        if (close + 1 < authority.size() && authority[close + 1] == ':')
+        {
+            try
+            {
+                out.port = static_cast<uint16_t>(std::stoul(authority.substr(close + 2)));
+            }
+            catch (...) { return false; }
+        }
+    }
+    else
+    {
+        size_t colon = authority.rfind(':');
+        if (colon != std::string::npos && authority.find(':') == colon)
+        {
+            out.host = authority.substr(0, colon);
+            try
+            {
+                out.port = static_cast<uint16_t>(std::stoul(authority.substr(colon + 1)));
+            }
+            catch (...) { return false; }
+        }
+        else
+        {
+            out.host = authority;
+        }
+    }
+    if (out.host.empty())
+        return false;
+    if (out.port == 0)
+        out.port = out.scheme == "https" ? 443 : 80;
+    size_t path_start = url.find('/', authority_start);
+    size_t query_start = url.find('?', authority_start);
+    size_t fragment_start = url.find('#', authority_start);
+    size_t path_end = url.size();
+    if (query_start != std::string::npos)
+        path_end = query_start;
+    if (fragment_start != std::string::npos && fragment_start < path_end)
+        path_end = fragment_start;
+    if (path_start != std::string::npos && path_start < path_end)
+        out.path = url.substr(path_start, path_end - path_start);
+    if (out.path.empty())
+        out.path = "/";
+    if (query_start != std::string::npos)
+    {
+        size_t query_end = fragment_start == std::string::npos ? url.size() : fragment_start;
+        if (query_end > query_start + 1)
+            out.query = url.substr(query_start + 1, query_end - query_start - 1);
+    }
+    return out.scheme == "http" || out.scheme == "https" || out.scheme == "ws" || out.scheme == "wss";
+}
+
+void append_header_pair(std::vector<std::pair<std::string, std::string>>& headers, const std::string& name, const std::string& value)
+{
+    if (name.empty())
+        return;
+    headers.emplace_back(name, value);
+}
+
+void append_header_pairs_from_json(const json& value, std::vector<std::pair<std::string, std::string>>& headers)
+{
+    if (value.is_object())
+    {
+        for (auto it = value.begin(); it != value.end(); ++it)
+            append_header_pair(headers, it.key(), json_string_from_any(it.value()));
+        return;
+    }
+    if (value.is_array())
+    {
+        for (const json& entry : value)
+        {
+            if (entry.is_object())
+            {
+                std::string name = json_first_string_field(entry, {"name", "key", "header", "field"});
+                std::string val = json_first_string_field(entry, {"value", "val", "content"});
+                append_header_pair(headers, name, val);
+            }
+            else if (entry.is_array() && entry.size() >= 2)
+            {
+                append_header_pair(headers, json_string_from_any(entry[0]), json_string_from_any(entry[1]));
+            }
+            else if (entry.is_string())
+            {
+                std::string line = entry.get<std::string>();
+                size_t colon = line.find(':');
+                if (colon != std::string::npos)
+                {
+                    size_t value_start = colon + 1;
+                    while (value_start < line.size() && (line[value_start] == ' ' || line[value_start] == '\t'))
+                        ++value_start;
+                    append_header_pair(headers, line.substr(0, colon), line.substr(value_start));
+                }
+            }
+        }
+        return;
+    }
+    if (value.is_string())
+    {
+        std::string block = value.get<std::string>();
+        size_t pos = 0;
+        while (pos < block.size())
+        {
+            size_t end = block.find('\n', pos);
+            std::string line = block.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+            if (!line.empty() && line.back() == '\r')
+                line.pop_back();
+            size_t colon = line.find(':');
+            if (colon != std::string::npos)
+            {
+                size_t value_start = colon + 1;
+                while (value_start < line.size() && (line[value_start] == ' ' || line[value_start] == '\t'))
+                    ++value_start;
+                append_header_pair(headers, line.substr(0, colon), line.substr(value_start));
+            }
+            if (end == std::string::npos)
+                break;
+            pos = end + 1;
+        }
+    }
+}
+
+void append_headers_from_keys(const json& obj, std::initializer_list<const char*> keys, std::vector<std::pair<std::string, std::string>>& headers)
+{
+    if (!obj.is_object())
+        return;
+    for (const char* key : keys)
+    {
+        auto it = obj.find(key);
+        if (it != obj.end())
+            append_header_pairs_from_json(*it, headers);
+    }
+}
+
+void assign_body_from_keys(const json& obj, std::initializer_list<const char*> keys, std::vector<uint8_t>& body)
+{
+    if (!obj.is_object())
+        return;
+    for (const char* key : keys)
+    {
+        auto it = obj.find(key);
+        if (it == obj.end())
+            continue;
+        std::string value = json_string_from_any(*it);
+        if (!value.empty())
+        {
+            body.assign(value.begin(), value.end());
+            return;
+        }
+    }
+}
+
+void add_candidates_from_array_key(const json& data, const char* key, std::vector<json>& out)
+{
+    if (!data.is_object())
+        return;
+    auto it = data.find(key);
+    if (it == data.end() || !it->is_array())
+        return;
+    for (const json& entry : *it)
+        out.push_back(entry);
+}
+
+std::vector<json> collect_browser_exchange_candidates(const std::string& tool_name, const json& data)
+{
+    std::vector<json> out;
+    if (tool_name == "navigate")
+    {
+        add_candidates_from_array_key(data, "response_chain", out);
+        add_candidates_from_array_key(data, "responses", out);
+        add_candidates_from_array_key(data, "chain", out);
+        if (data.is_object())
+        {
+            auto capture_it = data.find("network_capture");
+            if (capture_it != data.end() && capture_it->is_object())
+            {
+                for (const char* key : {"requests", "items", "records", "network_requests", "entries", "data", "result"})
+                    add_candidates_from_array_key(*capture_it, key, out);
+            }
+        }
+        if (data.is_object())
+            out.push_back(data);
+        return out;
+    }
+    if (data.is_array())
+    {
+        for (const json& entry : data)
+            out.push_back(entry);
+        return out;
+    }
+    if (data.is_object())
+    {
+        for (const char* key : {"requests", "items", "records", "network_requests", "entries", "data", "result"})
+            add_candidates_from_array_key(data, key, out);
+        if (tool_name == "get_network_request")
+            out.push_back(data);
+    }
+    return out;
+}
+
+size_t browser_exchange_candidate_count(const std::string& tool_name, const json& data)
+{
+    return collect_browser_exchange_candidates(tool_name, data).size();
+}
+
+std::string browser_record_url(const json& record, const json& params)
+{
+    std::string url = json_first_string_field(record, {"url", "request_url", "final_url", "target_url", "name"});
+    if (url.empty())
+        url = json_first_string_field(params, {"url", "request_url", "target_url"});
+    return url;
+}
+
+bool browser_record_to_exchange(const json& record, const json& params, const std::string& source, exchange_observed_t& ex)
+{
+    const std::string url = browser_record_url(record, params);
+    browser_url_t parsed;
+    if (!parse_browser_url(url, parsed))
+        return false;
+    ex = exchange_observed_t{};
+    ex.id = browser_exchange_ids().fetch_add(1, std::memory_order_relaxed);
+    ex.timestamp_ms = json_first_u64_field(record, {"timestamp_ms", "ts", "time_ms", "started_ms", "created_ms"}, 0);
+    if (ex.timestamp_ms == 0)
+        ex.timestamp_ms = epoch_now_ms();
+    ex.method = uppercase_ascii_copy(json_first_string_field(record, {"method", "request_method"}));
+    if (ex.method.empty())
+        ex.method = uppercase_ascii_copy(json_first_string_field(params, {"method"}));
+    if (ex.method.empty())
+        ex.method = "GET";
+    ex.scheme = parsed.scheme == "wss" ? "https" : (parsed.scheme == "ws" ? "http" : parsed.scheme);
+    ex.host = parsed.host;
+    ex.port = parsed.port;
+    ex.path = parsed.path;
+    ex.query = parsed.query;
+    ex.status_code = json_first_int_field(record, {"status", "status_code", "response_status", "final_status", "initial_status"}, 0);
+    ex.reason_phrase = json_first_string_field(record, {"status_text", "statusText", "reason", "reason_phrase"});
+    append_headers_from_keys(record, {"request_headers", "requestHeaders", "headers"}, ex.req_headers);
+    append_headers_from_keys(record, {"response_headers", "responseHeaders", "headers_response"}, ex.resp_headers);
+    assign_body_from_keys(record, {"request_body", "requestBody", "post_data", "postData"}, ex.req_body);
+    assign_body_from_keys(record, {"response_body", "responseBody", "body_text", "bodyText", "response_text"}, ex.resp_body);
+    ex.latency_ms = json_first_u64_field(record, {"latency_ms", "duration_ms", "elapsed_ms"}, 0);
+    if (ex.latency_ms == 0)
+        ex.latency_ms = json_first_u64_field(record, {"duration"}, 0);
+    ex.is_websocket = parsed.scheme == "ws" || parsed.scheme == "wss" || lower_ascii_copy(json_first_string_field(record, {"resource_type", "type"})) == "websocket";
+    ex.alpn = json_first_string_field(record, {"alpn"});
+    ex.tls_version = json_first_string_field(record, {"tls_version", "tls"});
+    ex.source = source.empty() ? "browser" : source;
+    return !ex.host.empty();
+}
+
+std::string browser_dedupe_key(const json& record, const json& params, const exchange_observed_t& ex)
+{
+    const std::string rid = json_first_string_field(record, {"request_id", "id", "network_request_id"});
+    const std::string page_id = json_first_string_field(record, {"page_id", "page"});
+    if (!rid.empty())
+        return std::string("id|") + page_id + "|" + rid;
+    std::string url = ex.scheme + "://" + ex.host;
+    if ((ex.scheme == "https" && ex.port != 443) || (ex.scheme == "http" && ex.port != 80))
+        url += ":" + std::to_string(ex.port);
+    url += ex.path;
+    if (!ex.query.empty())
+        url += "?" + ex.query;
+    return std::string("url|") + ex.method + "|" + std::to_string(ex.status_code) + "|" + url + "|" + json_first_string_field(params, {"session_id"});
+}
+
+bool remember_browser_exchange_key(const std::string& key)
+{
+    static std::mutex m;
+    static std::unordered_set<std::string> seen;
+    static std::deque<std::string> order;
+    std::lock_guard<std::mutex> lk(m);
+    if (key.empty())
+        return true;
+    if (seen.find(key) != seen.end())
+        return false;
+    seen.insert(key);
+    order.push_back(key);
+    while (order.size() > 4096)
+    {
+        seen.erase(order.front());
+        order.pop_front();
+    }
+    return true;
+}
+
+burp_publish_summary_t publish_browser_exchanges(const std::string& tool_name, const json& params, const json& data)
+{
+    burp_publish_summary_t summary;
+    summary.publish_enabled = json_bool_param(params, "publish_to_burp", true);
+    summary.source = json_string_param(params, "burp_source", "browser");
+    if (summary.source.empty())
+        summary.source = "browser";
+    const std::vector<json> candidates = collect_browser_exchange_candidates(tool_name, data);
+    summary.candidates = candidates.size();
+    if (!summary.publish_enabled)
+    {
+        summary.skipped = candidates.size();
+        return summary;
+    }
+    for (const json& candidate : candidates)
+    {
+        exchange_observed_t ex;
+        if (!browser_record_to_exchange(candidate, params, summary.source, ex))
+        {
+            ++summary.skipped;
+            continue;
+        }
+        const std::string key = browser_dedupe_key(candidate, params, ex);
+        if (!remember_browser_exchange_key(key))
+        {
+            ++summary.duplicates;
+            continue;
+        }
+        aida::events::publish(kExchangeObservedEvent, ex);
+        summary.exchange_ids.push_back(ex.id);
+        ++summary.published;
+    }
+    diag::log_tagged_fmt("mcp_burp", "browser_burp_publish tool=%s enabled=%d source=%s candidates=%zu published=%zu skipped=%zu duplicates=%zu",
+        tool_name.c_str(), summary.publish_enabled ? 1 : 0, summary.source.c_str(),
+        summary.candidates, summary.published, summary.skipped, summary.duplicates);
+    return summary;
+}
+
+void attach_burp_bridge_summary(tool_result_t& out, const burp_publish_summary_t& summary)
+{
+    if (!out.data.is_object())
+    {
+        json original = out.data;
+        out.data = json::object();
+        out.data["result"] = std::move(original);
+    }
+    out.data["burp_bridge"] = summary.to_json();
+    out.text = out.data.dump(2);
+}
+
+bool is_burp_publish_tool(const std::string& tool_name)
+{
+    return tool_name == "navigate" ||
+        tool_name == "list_network_requests" ||
+        tool_name == "get_network_request" ||
+        tool_name == "network_capture";
+}
+
+bool is_default_browser_session(const std::string& session_id)
+{
+    return session_id.empty() || lower_ascii_copy(session_id) == "default";
+}
+
+bool parse_json_text_array(const std::string& text, json& out)
+{
+    try
+    {
+        json parsed = json::parse(text);
+        if (parsed.is_array())
+        {
+            out = std::move(parsed);
+            return true;
+        }
+    }
+    catch (...) {}
+    return false;
+}
+
+json network_performance_fallback_records(const std::string& session_id, const std::string& page_id, std::string& error)
+{
+    static const char* kPerfEntriesJs = R"JS((function(){
+var out=[];
+try {
+var nav=performance.getEntriesByType('navigation') || [];
+var res=performance.getEntriesByType('resource') || [];
+function push(e, kind) {
+out.push({
+url: String(e.name || location.href || ''),
+method: 'GET',
+status: 0,
+entry_type: kind,
+initiator_type: String(e.initiatorType || kind),
+start_time: Number(e.startTime || 0),
+duration: Number(e.duration || 0),
+transfer_size: Number(e.transferSize || 0)
+});
+}
+for (var i=0;i<nav.length;i++) push(nav[i], 'navigation');
+for (var j=0;j<res.length;j++) push(res[j], 'resource');
+} catch(e) {}
+return JSON.stringify(out);
+})())JS";
+    camoufox::call_result_t fb = camoufox::evaluate_js(kPerfEntriesJs, true, session_id, page_id);
+    if (!fb.ok)
+    {
+        error = fb.error;
+        return json::array();
+    }
+    if (fb.data.is_array())
+        return fb.data;
+    if (fb.data.is_string())
+    {
+        json parsed = json::array();
+        if (parse_json_text_array(fb.data.get<std::string>(), parsed))
+            return parsed;
+    }
+    if (fb.data.is_object())
+    {
+        for (const char* key : {"value", "result", "data"})
+        {
+            auto it = fb.data.find(key);
+            if (it == fb.data.end())
+                continue;
+            if (it->is_array())
+                return *it;
+            if (it->is_string())
+            {
+                json parsed = json::array();
+                if (parse_json_text_array(it->get<std::string>(), parsed))
+                    return parsed;
+            }
+        }
+    }
+    error = "performance fallback produced no array";
+    return json::array();
+}
+
 bool write_binary_file_utf8(const std::string& path, const std::vector<unsigned char>& bytes, std::string& error)
 {
     if (path.empty())
@@ -789,6 +1399,8 @@ json camoufox_args(const json& params, bool preserve_action)
     args.erase("browser_executable");
     args.erase("server_executable");
     args.erase("server_module");
+    args.erase("publish_to_burp");
+    args.erase("burp_source");
     if (!preserve_action)
         args.erase("action");
     args.erase("operation");
@@ -1123,6 +1735,62 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
     }
     camoufox::call_result_t bridge_result = camoufox::call_tool(tool_name, args, timeout_ms, session_id);
     tool_result_t out = bridge_result_to_tool_result(bridge_result);
+    if (tool_name == "list_network_requests" && out.success && browser_exchange_candidate_count(tool_name, out.data) == 0)
+    {
+        const std::string page_id = json_string_param(params, "page_id", std::string());
+        size_t max_records = static_cast<size_t>((std::max)(json_int_param(params, "max_records", json_int_param(params, "limit", 200)), 1));
+        camoufox::call_result_t fallback_result = is_default_browser_session(session_id)
+            ? camoufox::list_network_requests(max_records)
+            : camoufox::list_network_requests(max_records, session_id, page_id);
+        size_t fallback_candidates = fallback_result.ok ? browser_exchange_candidate_count(tool_name, fallback_result.data) : 0;
+        bool performance_fallback_used = false;
+        std::string performance_fallback_error;
+        if (fallback_candidates == 0)
+        {
+            json perf_records = network_performance_fallback_records(session_id, page_id, performance_fallback_error);
+            if (perf_records.is_array() && !perf_records.empty())
+            {
+                fallback_result.ok = true;
+                fallback_result.error.clear();
+                fallback_result.data = std::move(perf_records);
+                fallback_candidates = browser_exchange_candidate_count(tool_name, fallback_result.data);
+                performance_fallback_used = fallback_candidates > 0;
+            }
+        }
+        if (fallback_candidates > 0)
+        {
+            if (!out.data.is_object())
+                out.data = json::object();
+            if (fallback_result.data.is_array())
+            {
+                out.data["requests"] = fallback_result.data;
+            }
+            else if (fallback_result.data.is_object())
+            {
+                out.data["requests"] = json::array();
+                for (const char* key : {"requests", "items", "records", "network_requests", "entries", "data", "result"})
+                {
+                    auto it = fallback_result.data.find(key);
+                    if (it != fallback_result.data.end() && it->is_array())
+                    {
+                        out.data["requests"] = *it;
+                        break;
+                    }
+                }
+                out.data["fallback_result"] = fallback_result.data;
+            }
+            out.data["count"] = static_cast<uint64_t>(fallback_candidates);
+            out.data["fallback"] = performance_fallback_used ? "browser_performance_entries" : "camoufox_bridge_list_network_requests";
+            out.text = out.data.dump(2);
+            diag::log_tagged_fmt("mcp_burp", "browser_network list fallback used session_id=%s page_id=%s candidates=%zu performance=%d",
+                session_id.c_str(), page_id.c_str(), fallback_candidates, performance_fallback_used ? 1 : 0);
+        }
+        else
+        {
+            diag::log_tagged_fmt("mcp_burp", "browser_network list fallback empty session_id=%s ok=%d err=%s perf_err=%s data_shape=%s",
+                session_id.c_str(), static_cast<int>(fallback_result.ok), fallback_result.error.c_str(), performance_fallback_error.c_str(), json_shape(fallback_result.data).c_str());
+        }
+    }
     if (tool_name == "take_screenshot")
         compact_screenshot_response(out, params);
     if (tool_name == "evaluate_js")
@@ -1131,6 +1799,38 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
     {
         if (out.data.is_null() || !out.data.is_object())
             out.data = json::object();
+        if (out.success)
+        {
+            const std::string page_id = json_string_param(params, "page_id", std::string());
+            camoufox::call_result_t captured = is_default_browser_session(session_id)
+                ? camoufox::list_network_requests(200)
+                : camoufox::list_network_requests(200, session_id, page_id);
+            capture_info["post_navigation_list_ok"] = captured.ok;
+            capture_info["post_navigation_data_shape"] = json_shape(captured.data);
+            if (!captured.ok)
+                capture_info["post_navigation_error"] = captured.error;
+            const size_t captured_candidates = captured.ok ? browser_exchange_candidate_count("list_network_requests", captured.data) : 0;
+            capture_info["post_navigation_candidates"] = static_cast<uint64_t>(captured_candidates);
+            if (captured.ok && captured_candidates > 0)
+            {
+                if (captured.data.is_array())
+                    capture_info["requests"] = captured.data;
+                else if (captured.data.is_object())
+                {
+                    for (const char* key : {"requests", "items", "records", "network_requests", "entries", "data", "result"})
+                    {
+                        auto it = captured.data.find(key);
+                        if (it != captured.data.end() && it->is_array())
+                        {
+                            capture_info["requests"] = *it;
+                            break;
+                        }
+                    }
+                }
+            }
+            diag::log_tagged_fmt("mcp_burp", "browser_navigation post_capture_list session_id=%s page_id=%s ok=%d candidates=%zu err=%s",
+                session_id.c_str(), page_id.c_str(), static_cast<int>(captured.ok), captured_candidates, captured.error.c_str());
+        }
         out.data["network_capture"] = capture_info;
     }
     const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1141,6 +1841,13 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
     if (tool_name == "compare_env" || tool_name == "check_environment")
         attach_privacy_status(out, after);
     preserve_semantic_failure(out);
+    if (out.success && is_burp_publish_tool(tool_name))
+    {
+        burp_publish_summary_t burp_summary = publish_browser_exchanges(tool_name, params, out.data);
+        if (tool_name == "list_network_requests" && out.data.is_object() && !json_string_field(out.data, "fallback").empty())
+            burp_summary.fallback_used = true;
+        attach_burp_bridge_summary(out, burp_summary);
+    }
     if (environment_probe)
     {
         const url_log_t active_url = summarize_url_for_log(after.active_page_url);
@@ -1413,7 +2120,9 @@ std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
              {"capture_from_start", "boolean", "Start network capture before navigation", false},
              {"capture_body", "boolean", "Capture response bodies", false},
              {"capture_url_pattern", "string", "Network capture URL glob", false},
-             {"include_title", "boolean", "Return page title when available", false}}, false, 60000},
+             {"include_title", "boolean", "Return page title when available", false},
+             {"publish_to_burp", "boolean", "Publish observed browser traffic to the Burp event bus; defaults to true", false},
+             {"burp_source", "string", "Source label for published browser exchanges; defaults to browser", false}}, false, 60000},
         {"browser_interaction", "Consolidated Camoufox interaction operations. Set action to click, type, or evaluate.",
             {{"action", "string", "click|type|evaluate", true},
              {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted", false},
@@ -1466,6 +2175,8 @@ std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
              {"include_body", "boolean", "Include response body", false},
              {"include_headers", "boolean", "Include request and response headers", false},
              {"max_body_size", "number", "Maximum body characters", false},
+             {"publish_to_burp", "boolean", "Publish observed browser traffic to the Burp event bus; defaults to true", false},
+             {"burp_source", "string", "Source label for published browser exchanges; defaults to browser", false},
              {"modify_headers", "object", "Headers to add or override", false},
              {"modify_body", "string", "Replacement request body", false},
              {"mock_response", "object", "Mock response object", false}}, false, 30000},

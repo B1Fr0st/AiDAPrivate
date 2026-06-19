@@ -10,9 +10,11 @@
 
 #include "active_scanner.hpp"
 #include "audit_http.hpp"
+#include "burp_logger.hpp"
 #include "issue.hpp"
 #include "passive_scanner.hpp"
 #include "scanner_module.hpp"
+#include "site_map.hpp"
 
 #include "../../settings/standalone_compat.hpp"
 #include "../../../helpers/diag_log.hpp"
@@ -21,6 +23,7 @@
 #include <cctype>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace aida {
@@ -70,8 +73,153 @@ std::vector<uint8_t> base64_decode(const std::string& s)
     return out;
 }
 
-bool build_minimal_get_request(const std::string& url, std::vector<uint8_t>& out_raw, std::string& err)
+std::string upper_ascii(std::string s)
 {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+    return s;
+}
+
+std::string header_safe(std::string s)
+{
+    for (char& c : s) {
+        unsigned char uc = static_cast<unsigned char>(c);
+        if (uc < 0x20 || uc == 0x7F)
+            c = '_';
+    }
+    return s;
+}
+
+bool header_name_equals(const std::string& name, const char* expected)
+{
+    std::string lhs = upper_ascii(name);
+    std::string rhs = upper_ascii(expected ? std::string(expected) : std::string());
+    return lhs == rhs;
+}
+
+bool has_header(const std::vector<std::pair<std::string, std::string>>& headers, const char* name)
+{
+    for (const auto& h : headers) {
+        if (header_name_equals(h.first, name))
+            return true;
+    }
+    return false;
+}
+
+bool valid_method_token(const std::string& method)
+{
+    if (method.empty() || method.size() > 32)
+        return false;
+    for (unsigned char c : method) {
+        if (std::isalnum(c))
+            continue;
+        switch (c) {
+            case '!':
+            case '#':
+            case '$':
+            case '%':
+            case '&':
+            case '\'':
+            case '*':
+            case '+':
+            case '-':
+            case '.':
+            case '^':
+            case '_':
+            case '`':
+            case '|':
+            case '~':
+                continue;
+            default:
+                return false;
+        }
+    }
+    return true;
+}
+
+bool has_crlf_header_terminator(const std::vector<uint8_t>& raw)
+{
+    if (raw.size() < 4)
+        return false;
+    for (size_t i = 0; i + 3 < raw.size(); ++i) {
+        if (raw[i] == '\r' && raw[i + 1] == '\n' && raw[i + 2] == '\r' && raw[i + 3] == '\n')
+            return true;
+    }
+    return false;
+}
+
+bool parse_headers_param(const json& params, std::vector<std::pair<std::string, std::string>>& out, std::string& err)
+{
+    if (!params.contains("headers"))
+        return true;
+    const json* value = &params["headers"];
+    json parsed;
+    if (value->is_string()) {
+        const std::string text = value->get<std::string>();
+        try {
+            parsed = json::parse(text);
+            value = &parsed;
+        } catch (...) {
+            err = "headers string must contain a JSON object or array";
+            return false;
+        }
+    }
+    if (value->is_object()) {
+        for (auto it = value->begin(); it != value->end(); ++it) {
+            if (!it.value().is_string()) {
+                err = "headers object values must be strings";
+                return false;
+            }
+            out.emplace_back(it.key(), it.value().get<std::string>());
+        }
+        return true;
+    }
+    if (value->is_array()) {
+        for (size_t i = 0; i < value->size(); ++i) {
+            const json& entry = (*value)[i];
+            if (entry.is_object()) {
+                if (!entry.contains("name") || !entry["name"].is_string() ||
+                    !entry.contains("value") || !entry["value"].is_string()) {
+                    err = "headers array objects require string name and value";
+                    return false;
+                }
+                out.emplace_back(entry["name"].get<std::string>(), entry["value"].get<std::string>());
+            } else if (entry.is_array() && entry.size() == 2 && entry[0].is_string() && entry[1].is_string()) {
+                out.emplace_back(entry[0].get<std::string>(), entry[1].get<std::string>());
+            } else {
+                err = "headers array entries must be [name,value] or {name,value}";
+                return false;
+            }
+        }
+        return true;
+    }
+    err = "headers must be an object, array, or JSON string";
+    return false;
+}
+
+bool request_body_from_params(const json& params, std::string& body, std::string& err)
+{
+    if (params.contains("body_b64") && params["body_b64"].is_string()) {
+        const std::string encoded = params["body_b64"].get<std::string>();
+        auto decoded = base64_decode(encoded);
+        if (decoded.empty() && !encoded.empty()) {
+            err = "body_b64 invalid base64";
+            return false;
+        }
+        body.clear();
+        if (!decoded.empty())
+            body.assign(reinterpret_cast<const char*>(decoded.data()), decoded.size());
+        return true;
+    }
+    if (params.contains("body") && params["body"].is_string()) {
+        body = params["body"].get<std::string>();
+        return true;
+    }
+    return true;
+}
+
+bool build_request_from_url(const json& params, std::vector<uint8_t>& out_raw, std::string& err)
+{
+    const std::string url = params["url"].get<std::string>();
     std::string scheme;
     std::string host;
     std::string path;
@@ -82,15 +230,151 @@ bool build_minimal_get_request(const std::string& url, std::vector<uint8_t>& out
     }
     if (path.empty())
         path = "/";
+    std::string body;
+    if (!request_body_from_params(params, body, err))
+        return false;
+    std::string method = params.contains("method") && params["method"].is_string()
+        ? upper_ascii(params["method"].get<std::string>())
+        : (body.empty() ? std::string("GET") : std::string("POST"));
+    if (method.empty())
+        method = "GET";
+    if (!valid_method_token(method)) {
+        err = "invalid method";
+        return false;
+    }
     std::string host_header = host;
     if ((scheme == "https" && port != 443) || (scheme != "https" && port != 80)) {
         host_header += ":";
         host_header += std::to_string(port);
     }
-    std::string req = "GET " + path + " HTTP/1.1\r\nHost: " + host_header + "\r\nUser-Agent: AiDA-MCP-Scanner/1.0\r\nAccept: */*\r\nConnection: close\r\n\r\n";
+    std::vector<std::pair<std::string, std::string>> headers;
+    if (!parse_headers_param(params, headers, err))
+        return false;
+    if (params.contains("content_type") && params["content_type"].is_string() && !has_header(headers, "Content-Type"))
+        headers.emplace_back("Content-Type", params["content_type"].get<std::string>());
+    if (!body.empty() && !has_header(headers, "Content-Type"))
+        headers.emplace_back("Content-Type", "application/x-www-form-urlencoded");
+
+    std::string req;
+    req.reserve(method.size() + path.size() + host_header.size() + body.size() + 256);
+    req += method;
+    req += " ";
+    req += path;
+    req += " HTTP/1.1\r\nHost: ";
+    req += header_safe(host_header);
+    req += "\r\nUser-Agent: AiDA-MCP-Scanner/1.0\r\nAccept: */*\r\nAccept-Encoding: identity\r\n";
+    for (const auto& h : headers) {
+        if (h.first.empty() || header_name_equals(h.first, "Host") || header_name_equals(h.first, "Content-Length"))
+            continue;
+        req += header_safe(h.first);
+        req += ": ";
+        req += header_safe(h.second);
+        req += "\r\n";
+    }
+    if (!body.empty() || method == "POST" || method == "PUT" || method == "PATCH") {
+        req += "Content-Length: ";
+        req += std::to_string(body.size());
+        req += "\r\n";
+    }
+    req += "Connection: close\r\n\r\n";
+    req += body;
     out_raw.assign(req.begin(), req.end());
-    diag::log_tagged_fmt("mcp_burp", "tool_start_audit synthesized_get url=%s host=%s port=%u path=%s req_len=%zu",
-        url.c_str(), host.c_str(), static_cast<unsigned>(port), path.c_str(), out_raw.size());
+    diag::log_tagged_fmt("mcp_burp", "tool_start_audit synthesized_request method=%s url=%s host=%s port=%u path=%s headers=%zu body_len=%zu req_len=%zu",
+        method.c_str(), url.c_str(), host.c_str(), static_cast<unsigned>(port), path.c_str(), headers.size(), body.size(), out_raw.size());
+    return true;
+}
+
+std::string exchange_request_target(const exchange_observed_t& ex)
+{
+    std::string target = ex.path.empty() ? std::string("/") : ex.path;
+    if (!target.empty() && target.front() != '/')
+        target.insert(target.begin(), '/');
+    if (!ex.query.empty()) {
+        target += "?";
+        target += ex.query;
+    }
+    return target;
+}
+
+std::string exchange_url(const exchange_observed_t& ex)
+{
+    const std::string scheme = ex.scheme.empty() ? (ex.port == 443 ? std::string("https") : std::string("http")) : ex.scheme;
+    std::string url = scheme + "://" + ex.host;
+    const bool default_port = (scheme == "https" && ex.port == 443) || (scheme == "http" && ex.port == 80) || ex.port == 0;
+    if (!default_port) {
+        url += ":";
+        url += std::to_string(ex.port);
+    }
+    url += exchange_request_target(ex);
+    return url;
+}
+
+std::string host_header_for_exchange(const exchange_observed_t& ex)
+{
+    const std::string scheme = ex.scheme.empty() ? (ex.port == 443 ? std::string("https") : std::string("http")) : ex.scheme;
+    std::string host = ex.host;
+    const bool default_port = (scheme == "https" && ex.port == 443) || (scheme == "http" && ex.port == 80) || ex.port == 0;
+    if (!default_port) {
+        host += ":";
+        host += std::to_string(ex.port);
+    }
+    return host;
+}
+
+bool build_request_from_exchange(const exchange_observed_t& ex, std::vector<uint8_t>& out_raw, std::string& out_url, std::string& err)
+{
+    if (ex.host.empty()) {
+        err = "exchange has no host";
+        return false;
+    }
+    std::string method = ex.method.empty() ? std::string("GET") : upper_ascii(ex.method);
+    if (!valid_method_token(method)) {
+        err = "exchange has invalid method";
+        return false;
+    }
+    out_url = exchange_url(ex);
+    const std::string target = exchange_request_target(ex);
+    std::string req;
+    req.reserve(method.size() + target.size() + ex.host.size() + ex.req_body.size() + 512);
+    req += method;
+    req += " ";
+    req += target;
+    req += " HTTP/1.1\r\nHost: ";
+    req += header_safe(host_header_for_exchange(ex));
+    req += "\r\n";
+    bool has_user_agent = false;
+    bool has_accept = false;
+    for (const auto& h : ex.req_headers) {
+        if (h.first.empty())
+            continue;
+        if (header_name_equals(h.first, "Host") ||
+            header_name_equals(h.first, "Content-Length") ||
+            header_name_equals(h.first, "Connection"))
+            continue;
+        if (header_name_equals(h.first, "User-Agent"))
+            has_user_agent = true;
+        if (header_name_equals(h.first, "Accept"))
+            has_accept = true;
+        req += header_safe(h.first);
+        req += ": ";
+        req += header_safe(h.second);
+        req += "\r\n";
+    }
+    if (!has_user_agent)
+        req += "User-Agent: AiDA-MCP-Scanner/1.0\r\n";
+    if (!has_accept)
+        req += "Accept: */*\r\n";
+    if (!ex.req_body.empty() || method == "POST" || method == "PUT" || method == "PATCH") {
+        req += "Content-Length: ";
+        req += std::to_string(ex.req_body.size());
+        req += "\r\n";
+    }
+    req += "Connection: close\r\n\r\n";
+    if (!ex.req_body.empty())
+        req.append(reinterpret_cast<const char*>(ex.req_body.data()), ex.req_body.size());
+    out_raw.assign(req.begin(), req.end());
+    diag::log_tagged_fmt("mcp_burp", "tool_start_audit exchange_request exchange_id=%llu method=%s url=%s headers=%zu body_len=%zu req_len=%zu",
+        static_cast<unsigned long long>(ex.id), method.c_str(), out_url.c_str(), ex.req_headers.size(), ex.req_body.size(), out_raw.size());
     return true;
 }
 
@@ -108,7 +392,7 @@ bool extract_request_payload(const json& params, std::vector<uint8_t>& out_raw, 
         return true;
     }
     if (params.contains("url") && params["url"].is_string())
-        return build_minimal_get_request(params["url"].get<std::string>(), out_raw, err);
+        return build_request_from_url(params, out_raw, err);
     err = "missing raw_request or raw_request_b64";
     return false;
 }
@@ -126,24 +410,53 @@ tool_result_t tool_start_audit(const json& p)
 {
     const uint64_t started = GetTickCount64();
     const DWORD tid = GetCurrentThreadId();
-    diag::log_tagged_fmt("mcp_burp", "tool_start_audit url=%s tid=%lu", p.contains("url") && p["url"].is_string() ? p["url"].get<std::string>().c_str() : "<missing>", static_cast<unsigned long>(tid));
-    if (!p.contains("url") || !p["url"].is_string())
-        return scanner_param_error("missing 'url'", "url", "missing_required");
+    diag::log_tagged_fmt("mcp_burp", "tool_start_audit url=%s exchange_id=%llu tid=%lu",
+        p.contains("url") && p["url"].is_string() ? p["url"].get<std::string>().c_str() : "<missing>",
+        p.contains("exchange_id") && p["exchange_id"].is_number_unsigned() ? static_cast<unsigned long long>(p["exchange_id"].get<uint64_t>()) : 0ULL,
+        static_cast<unsigned long>(tid));
     std::vector<uint8_t> raw;
     std::string err;
-    if (!extract_request_payload(p, raw, err)) {
+    std::string url = p.contains("url") && p["url"].is_string() ? p["url"].get<std::string>() : std::string();
+    if (p.contains("exchange_id")) {
+        if (!p["exchange_id"].is_number_unsigned())
+            return scanner_param_error("exchange_id must be an unsigned integer", "exchange_id");
+        const uint64_t exchange_id = p["exchange_id"].get<uint64_t>();
+        exchange_observed_t ex;
+        if (!sitemap::find_exchange(exchange_id, ex)) {
+            diag::log_tagged_fmt("mcp_burp", "tool_start_audit exchange_not_found id=%llu tid=%lu elapsed_ms=%llu",
+                static_cast<unsigned long long>(exchange_id), static_cast<unsigned long>(tid), static_cast<unsigned long long>(GetTickCount64() - started));
+            return scanner_param_error("exchange not found", "exchange_id", "exchange_not_found");
+        }
+        if (!build_request_from_exchange(ex, raw, url, err)) {
+            diag::log_tagged_fmt("mcp_burp", "tool_start_audit exchange_payload_error id=%llu err=%s tid=%lu elapsed_ms=%llu",
+                static_cast<unsigned long long>(exchange_id), err.c_str(), static_cast<unsigned long>(tid), static_cast<unsigned long long>(GetTickCount64() - started));
+            return scanner_param_error(err, "exchange_id");
+        }
+    } else if (!p.contains("url") || !p["url"].is_string()) {
+        return scanner_param_error("missing 'url'", "url", "missing_required");
+    }
+    if (raw.empty() && !extract_request_payload(p, raw, err)) {
         diag::log_tagged_fmt("mcp_burp", "tool_start_audit payload_error=%s tid=%lu elapsed_ms=%llu", err.c_str(), static_cast<unsigned long>(tid), static_cast<unsigned long long>(GetTickCount64() - started));
-        const std::string param = err == "invalid url" ? "url" : (err.find("raw_request_b64") != std::string::npos ? "raw_request_b64" : "raw_request");
+        const std::string param = err == "invalid url" ? "url" :
+            (err.find("method") != std::string::npos ? "method" :
+            (err.find("headers") != std::string::npos ? "headers" :
+            (err.find("body_b64") != std::string::npos ? "body_b64" :
+            (err.find("raw_request_b64") != std::string::npos ? "raw_request_b64" : "raw_request"))));
         return scanner_param_error(err, param);
     }
-    if (raw.size() >= 2) {
-        bool ends_dcrlf = (raw.size() >= 4 &&
-                          raw[raw.size() - 4] == '\r' && raw[raw.size() - 3] == '\n' &&
-                          raw[raw.size() - 2] == '\r' && raw[raw.size() - 1] == '\n');
-        if (!ends_dcrlf) {
-            raw.push_back('\r'); raw.push_back('\n');
+    if (raw.empty()) {
+        diag::log_tagged_fmt("mcp_burp", "tool_start_audit payload_error=empty_raw_request tid=%lu elapsed_ms=%llu",
+            static_cast<unsigned long>(tid), static_cast<unsigned long long>(GetTickCount64() - started));
+        return scanner_param_error("empty raw request", "raw_request");
+    }
+    if (!has_crlf_header_terminator(raw)) {
+        const bool ends_crlf = raw.size() >= 2 && raw[raw.size() - 2] == '\r' && raw[raw.size() - 1] == '\n';
+        if (!ends_crlf) {
             raw.push_back('\r'); raw.push_back('\n');
         }
+        raw.push_back('\r'); raw.push_back('\n');
+        diag::log_tagged_fmt("mcp_burp", "tool_start_audit appended_missing_header_terminator req_len=%zu tid=%lu",
+            raw.size(), static_cast<unsigned long>(tid));
     }
     active_scanner::audit_config_t cfg;
     if (p.contains("modules") && p["modules"].is_array()) {
@@ -152,16 +465,20 @@ tool_result_t tool_start_audit(const json& p)
     if (p.contains("scope_only") && p["scope_only"].is_boolean()) cfg.scope_only = p["scope_only"].get<bool>();
     if (p.contains("follow_redirects") && p["follow_redirects"].is_boolean()) cfg.follow_redirects = p["follow_redirects"].get<bool>();
     if (p.contains("timeout_ms") && p["timeout_ms"].is_number_integer()) cfg.timeout_ms = p["timeout_ms"].get<int>();
-    if (p.contains("max_concurrent") && p["max_concurrent"].is_number_unsigned())
+    if (p.contains("max_concurrent") && p["max_concurrent"].is_number_unsigned()) {
         cfg.max_concurrent_requests = p["max_concurrent"].get<size_t>();
-    if (p.contains("throttle_ms") && p["throttle_ms"].is_number_unsigned())
+        cfg.max_concurrent_explicit = true;
+    }
+    if (p.contains("throttle_ms") && p["throttle_ms"].is_number_unsigned()) {
         cfg.request_throttle_ms = p["throttle_ms"].get<size_t>();
+        cfg.request_throttle_explicit = true;
+    }
     if (p.contains("per_module_cap") && p["per_module_cap"].is_number_unsigned())
         cfg.per_module_request_cap = p["per_module_cap"].get<size_t>();
 
     const auto before = active_scanner::load_snapshot();
     diag::log_tagged_fmt("mcp_burp", "tool_start_audit enqueue_begin url=%s req_len=%zu active_audits=%zu running_audits=%zu queue_depth=%zu in_flight=%zu max_active=%zu tid=%lu",
-        p["url"].get<std::string>().c_str(),
+        url.c_str(),
         raw.size(),
         before.active_audits,
         before.running_audits,
@@ -169,7 +486,7 @@ tool_result_t tool_start_audit(const json& p)
         before.in_flight_requests,
         before.max_active_audits,
         static_cast<unsigned long>(tid));
-    auto id = active_scanner::enqueue_target(raw, p["url"].get<std::string>(), cfg);
+    auto id = active_scanner::enqueue_target(raw, url, cfg);
     if (id == 0) {
         const auto after = active_scanner::load_snapshot();
         const std::string last = active_scanner::last_error();
@@ -179,7 +496,7 @@ tool_result_t tool_start_audit(const json& p)
         data["success"] = false;
         data["code"] = code;
         data["error"] = last;
-        data["url"] = p["url"].get<std::string>();
+        data["url"] = url;
         data["request_length"] = raw.size();
         data["active_audits"] = after.active_audits;
         data["running_audits"] = after.running_audits;
@@ -199,6 +516,9 @@ tool_result_t tool_start_audit(const json& p)
         static_cast<unsigned long long>(GetTickCount64() - started), static_cast<unsigned long>(tid));
     json data;
     data["audit_id"] = id;
+    data["url"] = url;
+    if (p.contains("exchange_id") && p["exchange_id"].is_number_unsigned())
+        data["exchange_id"] = p["exchange_id"].get<uint64_t>();
     data["request_length"] = raw.size();
     data["active_audits"] = after.active_audits;
     data["running_audits"] = after.running_audits;
@@ -245,6 +565,22 @@ tool_result_t tool_audit_status(const json& p)
     data["total_probes"] = st.total_probes;
     data["completed_probes"] = st.completed_probes;
     data["issues_found"] = issues_found;
+    data["responses_received"] = st.responses_received;
+    data["no_response_count"] = st.no_response_count;
+    data["transport_failures"] = st.transport_failures;
+    data["last_transport_error"] = st.last_transport_error;
+    data["transport_error_code"] = st.transport_error_code;
+    data["transport_error_class"] = st.transport_error_class;
+    data["transport_circuit_breaker_open"] = st.transport_circuit_breaker_open;
+    data["transport_circuit_breaker_hits"] = st.transport_circuit_breaker_hits;
+    data["transport_circuit_breaker_threshold"] = st.transport_circuit_breaker_threshold;
+    data["effective_max_concurrent"] = st.effective_max_concurrent;
+    data["effective_throttle_ms"] = st.effective_throttle_ms;
+    data["transport_backoff_ms"] = st.transport_backoff_ms;
+    data["transport_degraded"] = st.transport_failures > 0 || (st.completed_probes > 0 && st.responses_received == 0);
+    data["scan_interpretation"] = (st.completed_probes > 0 && st.responses_received == 0 && st.transport_failures > 0)
+        ? "transport_failed_no_responses"
+        : (st.transport_failures > 0 ? "transport_degraded" : (issues_found == 0 ? "no_issues_observed" : "issues_observed"));
     data["running"] = st.running;
     data["cancelled"] = st.cancelled;
     data["cancel_requested"] = st.cancel_requested;
@@ -261,7 +597,7 @@ tool_result_t tool_audit_status(const json& p)
     data["audit_in_flight_requests"] = st.in_flight_requests;
     data["elapsed_ms"] = static_cast<unsigned long long>(GetTickCount64() - started);
     data["thread_id"] = static_cast<unsigned long>(tid);
-    diag::log_tagged_fmt("mcp_burp", "tool_audit_status ok id=%llu running=%d cancelled=%d cancel_requested=%d drained=%d runtime_issues=%zu stored_issues=%zu reported_issues=%zu req_len=%zu active_audits=%zu running_audits=%zu queue_depth=%zu in_flight=%zu elapsed_ms=%llu tid=%lu",
+    diag::log_tagged_fmt("mcp_burp", "tool_audit_status ok id=%llu running=%d cancelled=%d cancel_requested=%d drained=%d runtime_issues=%zu stored_issues=%zu reported_issues=%zu responses=%zu no_response=%zu transport_failures=%zu transport_error_code=%u transport_error_class=%s circuit_open=%d circuit_hits=%zu circuit_threshold=%zu last_transport_error=%s req_len=%zu active_audits=%zu running_audits=%zu queue_depth=%zu in_flight=%zu effective_concurrency=%zu effective_throttle_ms=%zu elapsed_ms=%llu tid=%lu",
         static_cast<unsigned long long>(id),
         (int)st.running,
         st.cancelled ? 1 : 0,
@@ -270,11 +606,22 @@ tool_result_t tool_audit_status(const json& p)
         st.issues_found,
         stored_issues,
         issues_found,
+        st.responses_received,
+        st.no_response_count,
+        st.transport_failures,
+        st.transport_error_code,
+        st.transport_error_class.c_str(),
+        st.transport_circuit_breaker_open ? 1 : 0,
+        st.transport_circuit_breaker_hits,
+        st.transport_circuit_breaker_threshold,
+        st.last_transport_error.c_str(),
         st.request_length,
         load.active_audits,
         load.running_audits,
         load.queue_depth,
         load.in_flight_requests,
+        st.effective_max_concurrent,
+        st.effective_throttle_ms,
         static_cast<unsigned long long>(GetTickCount64() - started),
         static_cast<unsigned long>(tid));
     return tool_result_t::ok(data);
@@ -300,6 +647,22 @@ tool_result_t tool_list_audits(const json&)
         e["total_probes"] = st.total_probes;
         e["completed_probes"] = st.completed_probes;
         e["issues_found"] = issues_found;
+        e["responses_received"] = st.responses_received;
+        e["no_response_count"] = st.no_response_count;
+        e["transport_failures"] = st.transport_failures;
+        e["last_transport_error"] = st.last_transport_error;
+        e["transport_error_code"] = st.transport_error_code;
+        e["transport_error_class"] = st.transport_error_class;
+        e["transport_circuit_breaker_open"] = st.transport_circuit_breaker_open;
+        e["transport_circuit_breaker_hits"] = st.transport_circuit_breaker_hits;
+        e["transport_circuit_breaker_threshold"] = st.transport_circuit_breaker_threshold;
+        e["effective_max_concurrent"] = st.effective_max_concurrent;
+        e["effective_throttle_ms"] = st.effective_throttle_ms;
+        e["transport_backoff_ms"] = st.transport_backoff_ms;
+        e["transport_degraded"] = st.transport_failures > 0 || (st.completed_probes > 0 && st.responses_received == 0);
+        e["scan_interpretation"] = (st.completed_probes > 0 && st.responses_received == 0 && st.transport_failures > 0)
+            ? "transport_failed_no_responses"
+            : (st.transport_failures > 0 ? "transport_degraded" : (issues_found == 0 ? "no_issues_observed" : "issues_observed"));
         e["running"] = st.running;
         e["cancelled"] = st.cancelled;
         e["cancel_requested"] = st.cancel_requested;
@@ -424,9 +787,8 @@ tool_result_t tool_clear_issues(const json&)
 tool_result_t tool_passive_enable(const json& p)
 {
     diag::log_tagged_fmt("mcp_burp", "tool_passive_enable enabled=%d", p.contains("enabled") && p["enabled"].is_boolean() ? (int)p["enabled"].get<bool>() : -1);
-    if (!p.contains("enabled") || !p["enabled"].is_boolean())
-        return tool_result_t::error("missing 'enabled' boolean");
-    passive_scanner::set_enabled(p["enabled"].get<bool>());
+    const bool enabled = p.contains("enabled") && p["enabled"].is_boolean() ? p["enabled"].get<bool>() : true;
+    passive_scanner::set_enabled(enabled);
     json data; data["enabled"] = passive_scanner::is_enabled();
     diag::log_tagged_fmt("mcp_burp", "tool_passive_enable ok enabled=%d", (int)passive_scanner::is_enabled());
     return tool_result_t::ok(data);
@@ -437,6 +799,8 @@ tool_result_t tool_passive_enable(const json& p)
 void register_scanner_tools(mcp_standalone::server_t& srv)
 {
     active_scanner::initialize();
+    sitemap::initialize();
+    logger::initialize();
     passive_scanner::initialize();
     issue_store::initialize();
 
@@ -445,12 +809,22 @@ void register_scanner_tools(mcp_standalone::server_t& srv)
         "Manage Burp-style active/passive scanning and issue storage. Actions: start_audit, audit_status, list_audits, cancel, list_issues, get_issue, clear_issues, passive_status, list_modules, passive_enable.",
         {{"action", "string", "start_audit|audit_status|list_audits|cancel|list_issues|get_issue|clear_issues|passive_status|list_modules|passive_enable", true},
          {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted.", false},
-         {"url", "string", "Target URL for start_audit; if no raw_request/raw_request_b64 is supplied a minimal GET request is synthesized.", false},
+         {"url", "string", "Target URL for start_audit; if no raw_request/raw_request_b64 is supplied a raw HTTP request is synthesized from url/method/body/headers.", false},
+         {"method", "string", "HTTP method for synthesized start_audit requests; defaults to GET, or POST when body/body_b64 is supplied.", false},
+         {"headers", "object|array|string", "Headers for synthesized start_audit requests as object, array of {name,value}, array pairs, or JSON string.", false},
+         {"body", "string", "Text body for synthesized start_audit requests.", false},
+         {"body_b64", "string", "Base64 body for synthesized start_audit requests.", false},
+         {"content_type", "string", "Content-Type for synthesized start_audit request bodies.", false},
          {"raw_request", "string", "Raw HTTP request for start_audit", false},
          {"raw_request_b64", "string", "Base64 raw HTTP request for start_audit", false},
+         {"exchange_id", "number", "Sitemap/logger exchange id to replay as the start_audit request.", false},
          {"audit_id", "number", "Audit id for audit_status or cancel", false},
          {"scope_only", "boolean", "Keep active audit requests constrained to Burp scope", false},
-         {"max_concurrent", "number", "Per-audit request concurrency cap", false}},
+         {"enabled", "boolean", "passive_enable toggle; defaults to true when omitted.", false},
+         {"max_concurrent", "number", "Per-audit request concurrency cap", false},
+         {"throttle_ms", "number", "Per-request throttle in milliseconds; explicit values override external-host defaults.", false},
+         {"timeout_ms", "number", "Per-request transport timeout in milliseconds.", false},
+         {"follow_redirects", "boolean", "Follow redirects in audit transport; defaults false so first-hop redirect deltas remain visible.", false}},
         [](const json& params) -> tool_result_t {
             const std::string action = compat_action_name(params);
             const json p = compat_action_payload(params);

@@ -62,6 +62,8 @@ static void run_one_location(const insertion_point_t& ip, const module_context_t
         p.marker = "param-miner";
         audit_http::send_options_t opt;
         opt.timeout_ms = ctx.timeout_ms > 0 ? ctx.timeout_ms : 10000;
+        opt.publish_exchange = true;
+        opt.exchange_source = "scanner";
         auto resp = audit_http::send(std::vector<uint8_t>(ip.base_request.begin(), ip.base_request.end()),
                                      ctx.host, ctx.port, ctx.tls, opt);
         if (!resp.has_value()) return;

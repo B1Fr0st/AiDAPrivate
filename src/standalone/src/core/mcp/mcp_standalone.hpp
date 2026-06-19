@@ -6,6 +6,7 @@
 #include <functional>
 #include <vector>
 #include <map>
+#include <memory>
 
 #include <nlohmann/json.hpp>
 
@@ -55,8 +56,33 @@ namespace mcp_standalone
         ide_chat_only    = 2
     };
 
+    using cancel_token_ptr_t = std::shared_ptr<std::atomic<bool>>;
+
+    cancel_token_ptr_t make_call_cancel_token(bool cancelled = false);
+    void signal_call_cancel_token(const cancel_token_ptr_t& token) noexcept;
     std::atomic<bool>* current_cancel_token() noexcept;
     bool current_call_cancelled() noexcept;
+
+    class scoped_call_cancel_t
+    {
+    public:
+        scoped_call_cancel_t() = default;
+        explicit scoped_call_cancel_t(cancel_token_ptr_t token);
+        ~scoped_call_cancel_t();
+        scoped_call_cancel_t(const scoped_call_cancel_t&) = delete;
+        scoped_call_cancel_t& operator=(const scoped_call_cancel_t&) = delete;
+        scoped_call_cancel_t(scoped_call_cancel_t&& other) noexcept;
+        scoped_call_cancel_t& operator=(scoped_call_cancel_t&& other) noexcept;
+        void cancel() noexcept;
+        cancel_token_ptr_t token() const noexcept { return _token; }
+
+    private:
+        void release() noexcept;
+        cancel_token_ptr_t _token;
+        std::atomic<bool>* _previous = nullptr;
+        bool _active = false;
+    };
+
     void set_ide_lifecycle_ready(bool ready) noexcept;
     bool lifecycle_authorized(std::string* reason = nullptr);
 

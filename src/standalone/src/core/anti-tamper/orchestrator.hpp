@@ -388,6 +388,75 @@ inline bool kernel_debugger_scan_confirmed_for_enforcement(const char* phase,
     return confirmed;
 }
 
+inline bool kernel_debugger_runtime_scan_retry(const char* phase,
+                                               DWORD first_scan_err,
+                                               bool activation_pending,
+                                               bool runtime_authorized,
+                                               uint64_t& debugger_pid,
+                                               DWORD& final_scan_err,
+                                               bool& retry_scan_ok,
+                                               bool& clean_query_seen)
+{
+    final_scan_err = first_scan_err;
+    retry_scan_ok = false;
+    clean_query_seen = false;
+    for (int attempt = 1; attempt <= 3; ++attempt)
+    {
+        driver_bridge::anti_debug_result_t query{};
+        SetLastError(ERROR_SUCCESS);
+        const uint64_t query_started = GetTickCount64();
+        const bool query_ok = driver_bridge::kernel_anti_debug_query(query);
+        const DWORD query_err = query_ok ? ERROR_SUCCESS : GetLastError();
+        const bool query_confirmed = query_ok &&
+            (kernel_adbg_hard_flags_present(query.result_flags) || query.detected_debugger_pid != 0);
+        clean_query_seen = clean_query_seen ||
+            (query_ok && !kernel_adbg_hard_flags_present(query.result_flags) && query.detected_debugger_pid == 0);
+        webhook::write_log_critical_fmt(
+            phase ? phase : "guard",
+            "kernel_debugger_scan_runtime_retry_query attempt=%d first_err=%lu query_ok=%d query_err=%lu query_flags=0x%08X query_pid=%llu query_confirmed=%d clean_query_seen=%d activation_pending=%d runtime_authorized=%d elapsed_ms=%llu",
+            attempt,
+            static_cast<unsigned long>(first_scan_err),
+            query_ok ? 1 : 0,
+            static_cast<unsigned long>(query_err),
+            query.result_flags,
+            static_cast<unsigned long long>(query.detected_debugger_pid),
+            query_confirmed ? 1 : 0,
+            clean_query_seen ? 1 : 0,
+            activation_pending ? 1 : 0,
+            runtime_authorized ? 1 : 0,
+            static_cast<unsigned long long>(GetTickCount64() - query_started));
+        if (query_confirmed)
+        {
+            debugger_pid = query.detected_debugger_pid;
+            return true;
+        }
+
+        Sleep(static_cast<DWORD>(15 * attempt));
+        uint64_t retry_pid = 0;
+        SetLastError(ERROR_SUCCESS);
+        const uint64_t scan_started = GetTickCount64();
+        const bool scan_ok = driver_bridge::kernel_anti_debug_scan_debuggers(&retry_pid);
+        final_scan_err = scan_ok ? ERROR_SUCCESS : GetLastError();
+        webhook::write_log_critical_fmt(
+            phase ? phase : "guard",
+            "kernel_debugger_scan_runtime_retry_scan attempt=%d first_err=%lu scan_ok=%d scan_err=%lu scan_pid=%llu clean_query_seen=%d elapsed_ms=%llu",
+            attempt,
+            static_cast<unsigned long>(first_scan_err),
+            scan_ok ? 1 : 0,
+            static_cast<unsigned long>(final_scan_err),
+            static_cast<unsigned long long>(retry_pid),
+            clean_query_seen ? 1 : 0,
+            static_cast<unsigned long long>(GetTickCount64() - scan_started));
+        if (scan_ok)
+        {
+            debugger_pid = retry_pid;
+            retry_scan_ok = true;
+            return false;
+        }
+    }
+    return false;
+}
+
 inline uint64_t run_inline_check(check_class_t which, uint64_t proof_hash = 0)
 {
     return token_chain::run_inline_check(which, proof_hash);
@@ -3792,9 +3861,40 @@ inline bool guard()
                         webhook::write_log("guard", "kernel_debugger_scan_runtime_deferred_activation_pending");
                         CFF_GOTO(guard_cff, 9);
                     }
-                    webhook::send_debug_log("guard", "kernel_debugger_scan_runtime_failed", true);
-                    enforce_violation_id(aida::reason_ids::reason_id_kernel_debugger_runtime, "kernel_debugger_scan_runtime_failed");
-                    CFF_EXIT(guard_cff);
+                    DWORD final_scan_err = scan_err;
+                    bool retry_scan_ok = false;
+                    bool clean_query_seen = false;
+                    const bool retry_confirmed = kernel_debugger_runtime_scan_retry("guard",
+                                                                                     scan_err,
+                                                                                     activation_pending,
+                                                                                     runtime_authorized,
+                                                                                     debugger_pid,
+                                                                                     final_scan_err,
+                                                                                     retry_scan_ok,
+                                                                                     clean_query_seen);
+                    if (retry_confirmed)
+                    {
+                        webhook::send_debug_log("guard", "kernel_debugger_scan_runtime_retry_confirmed", true);
+                        enforce_violation_id(aida::reason_ids::reason_id_kernel_debugger_runtime, "kernel_debugger_scan_runtime_retry_confirmed");
+                        CFF_EXIT(guard_cff);
+                    }
+                    if (retry_scan_ok)
+                    {
+                        webhook::write_log_critical_fmt("guard",
+                            "kernel_debugger_scan_runtime_recovered first_err=%lu retry_pid=%llu",
+                            static_cast<unsigned long>(scan_err),
+                            static_cast<unsigned long long>(debugger_pid));
+                    }
+                    else
+                    {
+                        webhook::write_log_critical_fmt("guard",
+                            "kernel_debugger_scan_runtime_unconfirmed_degraded first_err=%lu final_err=%lu clean_query_seen=%d runtime_authorized=%d",
+                            static_cast<unsigned long>(scan_err),
+                            static_cast<unsigned long>(final_scan_err),
+                            clean_query_seen ? 1 : 0,
+                            runtime_authorized ? 1 : 0);
+                        CFF_GOTO(guard_cff, 9);
+                    }
                 }
                 if (debugger_pid != 0)
                 {

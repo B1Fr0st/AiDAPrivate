@@ -371,6 +371,7 @@ nlohmann::json exchange_to_json(const exchange_observed_t& e, bool include_bodie
     j["alpn"]          = e.alpn;
     j["client_addr"]   = e.client_addr;
     j["client_port"]   = e.client_port;
+    j["source"]        = e.source.empty() ? "proxy" : e.source;
 
     nlohmann::json rh = nlohmann::json::array();
     for (const auto& kv : e.req_headers) {

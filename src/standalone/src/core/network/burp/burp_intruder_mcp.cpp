@@ -285,8 +285,45 @@ bool h2_parse_headers(const json& params, std::vector<std::pair<std::string, std
         diag::log_tagged_fmt("mcp_burp", "h2_send headers_parse outcome=default count=0");
         return true;
     }
+    json parsed;
+    if (value->is_string()) {
+        const auto* text = value->get_ptr<const json::string_t*>();
+        if (!text) {
+            err = h2_field_error("headers", value, "array or object", "headers string storage is unavailable");
+            return false;
+        }
+        try {
+            parsed = json::parse(*text);
+            value = &parsed;
+            diag::log_tagged_fmt("mcp_burp", "h2_send headers_parse string_json decoded_shape=%s", json_shape(parsed).c_str());
+        } catch (...) {
+            err = h2_field_error("headers", value, "array or object", "headers string must contain a JSON array or object");
+            return false;
+        }
+    }
+    if (value->is_object()) {
+        size_t index = 0;
+        for (auto it = value->begin(); it != value->end(); ++it) {
+            const std::string field = "headers." + it.key();
+            if (!it.value().is_string()) {
+                err = h2_field_error(field, &it.value(), "string", "object-style header values must be strings");
+                return false;
+            }
+            const auto* value_text = it.value().get_ptr<const json::string_t*>();
+            if (!value_text) {
+                err = h2_field_error(field, &it.value(), "string", "header value storage is unavailable");
+                return false;
+            }
+            out.push_back({ it.key(), *value_text });
+            diag::log_tagged_fmt("mcp_burp", "h2_send header_parse index=%zu shape=object-map outcome=ok name_len=%zu value_len=%zu",
+                index, it.key().size(), value_text->size());
+            ++index;
+        }
+        diag::log_tagged_fmt("mcp_burp", "h2_send headers_parse outcome=ok shape=object count=%zu", out.size());
+        return true;
+    }
     if (!value->is_array()) {
-        err = h2_field_error("headers", value, "array", "must be an array of [name,value] arrays or {name,value} objects");
+        err = h2_field_error("headers", value, "array or object", "must be an object map, an array of [name,value] arrays, or an array of {name,value} objects");
         return false;
     }
     size_t index = 0;
@@ -958,7 +995,7 @@ void register_intruder_tools(mcp_standalone::server_t& srv)
             { "port", "number", "Target port 1..65535 (default 443)", false },
             { "timeout_ms", "number", "Timeout in ms 1..120000 (default 15000)", false },
             { "pseudo_headers", "object", "Object {method, path, scheme, authority}", false },
-            { "headers", "array", "Array of [name, value] or {name, value} string pairs", false },
+            { "headers", "array|object|string", "Headers as object map, JSON string, array of [name, value], or array of {name, value} string pairs", false },
             { "body", "string", "Body text", false },
             { "body_b64", "string", "Body, base64 encoded (preferred for binary)", false },
             { "flags", "number", "uint32 bitfield: 1=END_STREAM 2=END_HEADERS 4=PADDED 8=PRIORITY", false },

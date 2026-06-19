@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <cstdint>
 #include <regex>
 #include <string>
@@ -27,6 +28,9 @@ std::vector<probe_t> sqli_probes(const insertion_point_t& ip, const module_conte
     out.push_back({base + "' AND '1'='2",   std::string(), "bool_false_quote"});
     out.push_back({base + " AND 1=1",       std::string(), "bool_true_bare"});
     out.push_back({base + " AND 1=2",       std::string(), "bool_false_bare"});
+    out.push_back({base + "' OR '1'='1'--", std::string(), "auth_or_quote_comment"});
+    out.push_back({base + "' OR 1=1--",     std::string(), "auth_or_bare_comment"});
+    out.push_back({base + "\" OR \"1\"=\"1\"--", std::string(), "auth_or_dquote_comment"});
     out.push_back({base + "'",              std::string(), "error_quote"});
     out.push_back({base + "\"",             std::string(), "error_dquote"});
     out.push_back({base + "'+SLEEP(8)--",   "_AIDA_SLEEP", "time_mysql"});
@@ -41,12 +45,98 @@ bool sql_error_text(const exchange_observed_t& resp, std::string& matched)
 {
     static const std::regex re(
         R"((SQL syntax|mysql_fetch|MySQLSyntaxError|PostgreSQL.*ERROR|PG::SyntaxError|SQLSTATE\[)"
-        R"(|ORA-\d{5}|Oracle\.DataAccess\.|System\.Data\.SqlClient|Unclosed quotation mark|SQLite3?::SQLException|sqlite3\.OperationalError|near \"\?\": syntax error))",
+        R"(|ORA-\d{5}|Oracle\.DataAccess\.|System\.Data\.SqlClient|Unclosed quotation mark|SQLite3?::SQLException|sqlite3\.OperationalError|near \"\?\": syntax error)"
+        R"(|java\.sql\.SQLException|java\.sql\.SQLSyntaxErrorException|SQLSyntaxErrorException|org\.apache\.derby|ERROR [0-9]{5}|Syntax error: Encountered)"
+        R"(|SQL grammar|BadSqlGrammarException|org\.hibernate\.exception\.SQLGrammarException|org\.h2\.jdbc|JdbcSQLSyntaxErrorException|H2 database error|JDBC exception))",
         std::regex::ECMAScript | std::regex::icase);
     std::string text(reinterpret_cast<const char*>(resp.resp_body.data()),
-                     std::min<size_t>(resp.resp_body.size(), static_cast<size_t>(8192)));
+                     std::min<size_t>(resp.resp_body.size(), static_cast<size_t>(32768)));
     std::smatch m;
     if (std::regex_search(text, m, re)) { matched = m[0].str(); return true; }
+    return false;
+}
+
+std::string body_prefix_lower(const std::vector<uint8_t>& body, size_t cap = 16384)
+{
+    const size_t n = std::min(body.size(), cap);
+    std::string out;
+    out.reserve(n);
+    for (size_t i = 0; i < n; ++i)
+        out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(body[i]))));
+    return out;
+}
+
+std::string header_value_ci(const exchange_observed_t& resp, const char* name)
+{
+    std::string target = name ? name : "";
+    std::transform(target.begin(), target.end(), target.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    for (const auto& h : resp.resp_headers) {
+        std::string hn = h.first;
+        std::transform(hn.begin(), hn.end(), hn.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (hn == target)
+            return h.second;
+    }
+    return {};
+}
+
+bool is_redirect_status(int status)
+{
+    return status >= 300 && status < 400;
+}
+
+bool body_has_auth_failure_text(const std::vector<uint8_t>& body)
+{
+    const std::string text = body_prefix_lower(body);
+    static const char* needles[] = {
+        "login failed",
+        "invalid password",
+        "invalid username",
+        "invalid credentials",
+        "authentication failed",
+        "sign in failed",
+        "incorrect password",
+        "try again"
+    };
+    for (const char* needle : needles) {
+        if (text.find(needle) != std::string::npos)
+            return true;
+    }
+    return false;
+}
+
+bool auth_bypass_delta(const exchange_observed_t& resp, const module_context_t& ctx, std::string& evidence)
+{
+    const bool baseline_known = ctx.baseline_status_code > 0 || !ctx.baseline_response_body.empty();
+    if (!baseline_known)
+        return false;
+    const bool baseline_redirect = is_redirect_status(ctx.baseline_status_code);
+    const bool resp_redirect = is_redirect_status(resp.status_code);
+    const bool baseline_failed = body_has_auth_failure_text(ctx.baseline_response_body);
+    const bool resp_failed = body_has_auth_failure_text(resp.resp_body);
+    const std::string location = header_value_ci(resp, "Location");
+    const long long body_diff = std::llabs(static_cast<long long>(resp.resp_body.size()) - static_cast<long long>(ctx.baseline_response_body.size()));
+    if (resp_redirect && !baseline_redirect && ctx.baseline_status_code > 0) {
+        evidence = "Injected SQL boolean/auth payload changed baseline status "
+                 + std::to_string(ctx.baseline_status_code) + " to redirect "
+                 + std::to_string(resp.status_code);
+        if (!location.empty())
+            evidence += " Location=" + location;
+        evidence += " body_delta=" + std::to_string(body_diff);
+        return true;
+    }
+    if (baseline_failed && !resp_failed && resp.status_code != ctx.baseline_status_code) {
+        evidence = "Injected SQL boolean/auth payload removed authentication failure text and changed status "
+                 + std::to_string(ctx.baseline_status_code) + " to "
+                 + std::to_string(resp.status_code) + " body_delta=" + std::to_string(body_diff);
+        return true;
+    }
+    if (baseline_failed && !resp_failed) {
+        if (body_diff > 64) {
+            evidence = "Injected SQL boolean/auth payload removed authentication failure text and changed response size by "
+                     + std::to_string(body_diff) + " bytes";
+            return true;
+        }
+    }
     return false;
 }
 
@@ -56,6 +146,23 @@ std::optional<issue_t> sqli_detect(const insertion_point_t& ip, const probe_t& p
     diag::log_tagged_fmt("mod_sqli", "sqli_detect entry ip=%s:%s variant=%s status=%d latency=%llums",
                          ip.kind.c_str(), ip.name.c_str(), probe.variant.c_str(),
                          resp.status_code, static_cast<unsigned long long>(resp.latency_ms));
+    if (probe.variant.rfind("auth_", 0) == 0) {
+        std::string evidence;
+        if (auth_bypass_delta(resp, ctx, evidence)) {
+            diag::log_tagged_fmt("mod_sqli", "sqli_detect FINDING auth-bypass ip=%s:%s evidence=%s",
+                                 ip.kind.c_str(), ip.name.c_str(), evidence.c_str());
+            auto iss = make_issue("sqli.auth-bypass", "SQL Injection (authentication bypass)",
+                                  severity_t::critical, confidence_t::firm, ip, probe, resp, ctx, evidence);
+            iss.description = "An SQL boolean/auth-bypass payload produced an authenticated-style response delta compared with the baseline request, consistent with credential checks being evaluated inside injectable SQL.";
+            iss.remediation = "Use parameterized queries for authentication lookups and enforce authentication state independently of SQL result shape.";
+            iss.cwe.push_back("CWE-89");
+            return iss;
+        }
+        diag::log_tagged_fmt("mod_sqli", "sqli_detect auth_ variant no bypass delta ip=%s:%s baseline_status=%d status=%d",
+                             ip.kind.c_str(), ip.name.c_str(), ctx.baseline_status_code, resp.status_code);
+        return std::nullopt;
+    }
+
     if (probe.variant.rfind("error_", 0) == 0) {
         std::string matched;
         if (sql_error_text(resp, matched)) {
@@ -112,58 +219,79 @@ void sqli_custom_run(const insertion_point_t& ip, const module_context_t& ctx, c
         return;
     }
 
-    auto fetch = [&](const std::string& payload, probe_t& used) -> std::optional<exchange_observed_t> {
+    auto fetch = [&](const std::string& payload, const std::string& variant, probe_t& used) -> std::optional<exchange_observed_t> {
         used.payload = ip.original_value + payload;
-        used.variant = "boolean";
+        used.variant = variant;
         auto built = ip.build(used.payload);
         return send(built, used);
     };
 
-    diag::log_tagged_fmt("mod_sqli", "sqli_custom_run sending bool_true probe ip=%s:%s", ip.kind.c_str(), ip.name.c_str());
-    probe_t pt; pt.payload = ""; pt.variant = "bool_true";
-    auto rt = fetch("' AND '1'='1", pt);
-    diag::log_tagged_fmt("mod_sqli", "sqli_custom_run sending bool_false probe ip=%s:%s", ip.kind.c_str(), ip.name.c_str());
-    probe_t pf; pf.payload = ""; pf.variant = "bool_false";
-    auto rf = fetch("' AND '1'='2", pf);
-    if (!rt.has_value() || !rf.has_value()) {
-        diag::log_tagged_fmt("mod_sqli", "sqli_custom_run no response for boolean probes ip=%s:%s rt=%d rf=%d",
-                             ip.kind.c_str(), ip.name.c_str(), rt.has_value() ? 1 : 0, rf.has_value() ? 1 : 0);
-        return;
-    }
-    diag::log_tagged_fmt("mod_sqli", "sqli_custom_run boolean responses true_status=%d false_status=%d true_size=%zu false_size=%zu",
-                         rt->status_code, rf->status_code, rt->resp_body.size(), rf->resp_body.size());
-    if (rt->status_code != rf->status_code && rt->status_code > 0 && rf->status_code > 0) {
-        diag::log_tagged_fmt("mod_sqli", "sqli_custom_run FINDING boolean status-diff ip=%s:%s true=%d false=%d",
-                             ip.kind.c_str(), ip.name.c_str(), rt->status_code, rf->status_code);
-        auto iss = make_issue("sqli.boolean", "SQL Injection (boolean-based)",
-                              severity_t::high, confidence_t::firm, ip, pt, *rt, ctx,
-                              std::string("Status diff: true=") + std::to_string(rt->status_code)
-                                  + " false=" + std::to_string(rf->status_code));
-        iss.description = "Two semantically opposing SQL boolean payloads produced different responses, indicating the parameter influences SQL evaluation.";
-        iss.remediation = "Parameterize all queries; never interpolate inputs into SQL text.";
-        iss.cwe.push_back("CWE-89");
-        issue_store::add(std::move(iss));
-        return;
-    }
-    double ratio = body_length_ratio(*rt, *rf);
-    long long diff = std::llabs(static_cast<long long>(rt->resp_body.size()) - static_cast<long long>(rf->resp_body.size()));
-    diag::log_tagged_fmt("mod_sqli", "sqli_custom_run body ratio=%.4f diff=%lld ip=%s:%s",
-                         ratio, diff, ip.kind.c_str(), ip.name.c_str());
-    if (ratio < 0.85 && diff > 32) {
-        diag::log_tagged_fmt("mod_sqli", "sqli_custom_run FINDING boolean body-diff ip=%s:%s true_size=%zu false_size=%zu ratio=%.4f",
-                             ip.kind.c_str(), ip.name.c_str(), rt->resp_body.size(), rf->resp_body.size(), ratio);
-        auto iss = make_issue("sqli.boolean", "SQL Injection (boolean-based)",
-                              severity_t::high, confidence_t::firm, ip, pt, *rt, ctx,
-                              std::string("Body length diff: true=") + std::to_string(rt->resp_body.size())
-                                  + " false=" + std::to_string(rf->resp_body.size())
-                                  + " ratio=" + std::to_string(ratio));
-        iss.description = "Two semantically opposing SQL boolean payloads produced substantially different response sizes, indicating injection.";
-        iss.remediation = "Parameterize all queries; never interpolate inputs into SQL text.";
-        iss.cwe.push_back("CWE-89");
-        issue_store::add(std::move(iss));
-    } else {
-        diag::log_tagged_fmt("mod_sqli", "sqli_custom_run no boolean finding ip=%s:%s ratio=%.4f diff=%lld",
-                             ip.kind.c_str(), ip.name.c_str(), ratio, diff);
+    struct pair_t { const char* true_suffix; const char* false_suffix; const char* variant; bool auth; };
+    const pair_t pairs[] = {
+        {"' AND '1'='1", "' AND '1'='2", "bool_and_quote", false},
+        {" AND 1=1", " AND 1=2", "bool_and_bare", false},
+        {"' OR '1'='1'--", "' AND '1'='2'--", "auth_or_quote_comment", true},
+        {"' OR 1=1--", "' AND 1=2--", "auth_or_bare_comment", true},
+        {"\" OR \"1\"=\"1\"--", "\" AND \"1\"=\"2\"--", "auth_or_dquote_comment", true}
+    };
+
+    for (const auto& pair : pairs) {
+        diag::log_tagged_fmt("mod_sqli", "sqli_custom_run sending pair variant=%s ip=%s:%s",
+                             pair.variant, ip.kind.c_str(), ip.name.c_str());
+        probe_t pt; pt.payload = ""; pt.variant = std::string(pair.variant) + "_true";
+        auto rt = fetch(pair.true_suffix, pt.variant, pt);
+        probe_t pf; pf.payload = ""; pf.variant = std::string(pair.variant) + "_false";
+        auto rf = fetch(pair.false_suffix, pf.variant, pf);
+        if (!rt.has_value() || !rf.has_value()) {
+            diag::log_tagged_fmt("mod_sqli", "sqli_custom_run no response for pair variant=%s ip=%s:%s rt=%d rf=%d",
+                                 pair.variant, ip.kind.c_str(), ip.name.c_str(), rt.has_value() ? 1 : 0, rf.has_value() ? 1 : 0);
+            continue;
+        }
+        diag::log_tagged_fmt("mod_sqli", "sqli_custom_run pair responses variant=%s true_status=%d false_status=%d true_size=%zu false_size=%zu baseline_status=%d",
+                             pair.variant, rt->status_code, rf->status_code, rt->resp_body.size(), rf->resp_body.size(), ctx.baseline_status_code);
+        std::string auth_evidence;
+        if (pair.auth && auth_bypass_delta(*rt, ctx, auth_evidence) && rt->status_code != rf->status_code) {
+            diag::log_tagged_fmt("mod_sqli", "sqli_custom_run FINDING auth-bypass variant=%s ip=%s:%s evidence=%s",
+                                 pair.variant, ip.kind.c_str(), ip.name.c_str(), auth_evidence.c_str());
+            auto iss = make_issue("sqli.auth-bypass", "SQL Injection (authentication bypass)",
+                                  severity_t::critical, confidence_t::firm, ip, pt, *rt, ctx, auth_evidence);
+            iss.description = "A true SQL auth-bypass payload and a false SQL control payload produced divergent authenticated-style responses, indicating credential checks are injectable.";
+            iss.remediation = "Use server-side parameter binding for authentication SQL and treat redirects/session issuance as security-sensitive scanner signals.";
+            iss.cwe.push_back("CWE-89");
+            issue_store::add(std::move(iss));
+            return;
+        }
+        if (rt->status_code != rf->status_code && rt->status_code > 0 && rf->status_code > 0) {
+            diag::log_tagged_fmt("mod_sqli", "sqli_custom_run FINDING boolean status-diff variant=%s ip=%s:%s true=%d false=%d",
+                                 pair.variant, ip.kind.c_str(), ip.name.c_str(), rt->status_code, rf->status_code);
+            auto iss = make_issue("sqli.boolean", "SQL Injection (boolean-based)",
+                                  severity_t::high, confidence_t::firm, ip, pt, *rt, ctx,
+                                  std::string("Status diff: true=") + std::to_string(rt->status_code)
+                                      + " false=" + std::to_string(rf->status_code));
+            iss.description = "Two semantically opposing SQL boolean payloads produced different responses, indicating the parameter influences SQL evaluation.";
+            iss.remediation = "Parameterize all queries; never interpolate inputs into SQL text.";
+            iss.cwe.push_back("CWE-89");
+            issue_store::add(std::move(iss));
+            return;
+        }
+        double ratio = body_length_ratio(*rt, *rf);
+        long long diff = std::llabs(static_cast<long long>(rt->resp_body.size()) - static_cast<long long>(rf->resp_body.size()));
+        diag::log_tagged_fmt("mod_sqli", "sqli_custom_run body ratio=%.4f diff=%lld variant=%s ip=%s:%s",
+                             ratio, diff, pair.variant, ip.kind.c_str(), ip.name.c_str());
+        if (ratio < 0.85 && diff > 32) {
+            diag::log_tagged_fmt("mod_sqli", "sqli_custom_run FINDING boolean body-diff variant=%s ip=%s:%s true_size=%zu false_size=%zu ratio=%.4f",
+                                 pair.variant, ip.kind.c_str(), ip.name.c_str(), rt->resp_body.size(), rf->resp_body.size(), ratio);
+            auto iss = make_issue("sqli.boolean", "SQL Injection (boolean-based)",
+                                  severity_t::high, confidence_t::firm, ip, pt, *rt, ctx,
+                                  std::string("Body length diff: true=") + std::to_string(rt->resp_body.size())
+                                      + " false=" + std::to_string(rf->resp_body.size())
+                                      + " ratio=" + std::to_string(ratio));
+            iss.description = "Two semantically opposing SQL boolean payloads produced substantially different response sizes, indicating injection.";
+            iss.remediation = "Parameterize all queries; never interpolate inputs into SQL text.";
+            iss.cwe.push_back("CWE-89");
+            issue_store::add(std::move(iss));
+            return;
+        }
     }
     diag::log_tagged_fmt("mod_sqli", "sqli_custom_run complete ip=%s:%s", ip.kind.c_str(), ip.name.c_str());
 }
@@ -174,7 +302,7 @@ bool register_self()
     m.id = "sqli";
     m.name = "SQL Injection";
     m.category = "Injection";
-    m.max_probes_per_point = 9;
+    m.max_probes_per_point = 12;
     m.probes = sqli_probes;
     m.detect = sqli_detect;
     m.custom_run = sqli_custom_run;

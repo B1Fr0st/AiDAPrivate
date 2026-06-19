@@ -45,6 +45,286 @@ def replace_in_function(text: str, function_name: str, old: str, new: str, label
     return text[:start] + block + text[next_tool:]
 
 
+def patch_browser_debug_helper(text: str) -> str:
+    if "def _camoufox_debug(event_name: str = \"\", **fields: Any) -> None:" not in text:
+        text = text.replace(
+            "def _camoufox_debug(event: str, **fields: Any) -> None:",
+            "def _camoufox_debug(event_name: str = \"\", **fields: Any) -> None:",
+            1,
+        )
+    if "payload = {\"event\": event, **fields}" in text:
+        text = text.replace(
+            "def _camoufox_debug(event_name: str = \"\", **fields: Any) -> None:\n"
+            "    payload = {\"event\": event, **fields}\n",
+            "def _camoufox_debug(event_name: str = \"\", **fields: Any) -> None:\n"
+            "    safe_fields = dict(fields)\n"
+            "    if \"event\" in safe_fields:\n"
+            "        safe_fields[\"payload_event\"] = safe_fields.pop(\"event\")\n"
+            "    payload = {\"event\": event_name, **safe_fields}\n",
+            1,
+        )
+    if "payload = {\"event\": event_name, **fields}" in text:
+        text = text.replace(
+            "def _camoufox_debug(event_name: str = \"\", **fields: Any) -> None:\n"
+            "    payload = {\"event\": event_name, **fields}\n",
+            "def _camoufox_debug(event_name: str = \"\", **fields: Any) -> None:\n"
+            "    safe_fields = dict(fields)\n"
+            "    if \"event\" in safe_fields:\n"
+            "        safe_fields[\"payload_event\"] = safe_fields.pop(\"event\")\n"
+            "    payload = {\"event\": event_name, **safe_fields}\n",
+            1,
+        )
+    if "def _camoufox_debug(event_name: str = \"\", **fields: Any) -> None:\n    payload = {\n" in text and "safe_fields = dict(fields)" not in text:
+        text = text.replace(
+            "def _camoufox_debug(event_name: str = \"\", **fields: Any) -> None:\n"
+            "    payload = {\n",
+            "def _camoufox_debug(event_name: str = \"\", **fields: Any) -> None:\n"
+            "    safe_fields = dict(fields)\n"
+            "    if \"event\" in safe_fields:\n"
+            "        safe_fields[\"payload_event\"] = safe_fields.pop(\"event\")\n"
+            "    payload = {\n",
+            1,
+        )
+    text = text.replace("\"event\": event,", "\"event\": event_name,", 1)
+    if "payload.update(fields)" in text and "safe_fields = dict(fields)" in text:
+        text = text.replace("    payload.update(fields)\n", "    payload.update(safe_fields)\n", 1)
+    for marker in ("def _camoufox_debug(event_name: str = \"\", **fields: Any) -> None:", "payload_event"):
+        if marker not in text:
+            fail(f"browser debug helper validation missing {marker}")
+    if "payload.update(fields)" in text or "\"event\": event," in text or "def _camoufox_debug(event: str" in text:
+        fail("browser debug helper validation found unsafe event field handling")
+    return text
+
+
+def patch_browser_pending_activation(text: str) -> str:
+    text = text.replace(
+        "        self._pending_page_ids_by_context: dict[str, list[str]] = {}\n",
+        "        self._pending_page_ids_by_context: dict[str, list[dict[str, Any]]] = {}\n",
+    )
+    text = text.replace(
+        "            ctx.on(\"page\", lambda page, cid=context_id: self._register_page(page, self._pop_pending_page_id(cid), True, \"context_page\", cid))\n",
+        "            ctx.on(\"page\", lambda page, cid=context_id: self._register_pending_context_page(page, cid))\n",
+    )
+    text = text.replace(
+        "            ctx.on(\"page\", lambda page, cid=context_id: self._register_page(page, None, True, \"context_page\", cid))\n",
+        "            ctx.on(\"page\", lambda page, cid=context_id: self._register_pending_context_page(page, cid))\n",
+    )
+    queue_block = '''    def _queue_pending_page_id(self, context_id: str, page_id: str | None, make_active: bool = True) -> None:
+        pid = self._slug(page_id) if page_id else ""
+        if pid:
+            cid = context_id or "default"
+            queue = self._pending_page_ids_by_context.setdefault(cid, [])
+            queue.append({"page_id": pid, "make_active": bool(make_active)})
+            _camoufox_debug(
+                "pending_page_queued",
+                session_id=self.session_id,
+                context_id=cid,
+                page_id=pid,
+                make_active=bool(make_active),
+                queue_len=len(queue),
+            )
+
+    def _pop_pending_page_id(self, context_id: str) -> dict[str, Any]:
+        cid = context_id or "default"
+        queue = self._pending_page_ids_by_context.get(cid)
+        if not queue:
+            return {"page_id": None, "make_active": True}
+        pending = queue.pop(0)
+        if not queue:
+            self._pending_page_ids_by_context.pop(cid, None)
+        if isinstance(pending, dict):
+            return {"page_id": pending.get("page_id"), "make_active": bool(pending.get("make_active", True))}
+        return {"page_id": pending, "make_active": True}
+
+    def _discard_pending_page_id(self, context_id: str, page_id: str | None) -> None:
+        pid = self._slug(page_id) if page_id else ""
+        cid = context_id or "default"
+        queue = self._pending_page_ids_by_context.get(cid)
+        if not pid or not queue:
+            return
+        before = len(queue)
+        queue[:] = [entry for entry in queue if str(entry.get("page_id") if isinstance(entry, dict) else entry) != pid]
+        if not queue:
+            self._pending_page_ids_by_context.pop(cid, None)
+        if len(queue) != before:
+            _camoufox_debug(
+                "pending_page_discarded",
+                session_id=self.session_id,
+                context_id=cid,
+                page_id=pid,
+                removed=before - len(queue),
+                queue_len=len(queue),
+            )
+
+    def _register_pending_context_page(self, page: Page, context_id: str) -> str:
+        pending = self._pop_pending_page_id(context_id)
+        preferred_id = pending.get("page_id") if isinstance(pending, dict) else None
+        make_active = bool(pending.get("make_active", True)) if isinstance(pending, dict) else True
+        pid = self._register_page(page, preferred_id, make_active, "context_page", context_id)
+        _camoufox_debug(
+            "pending_context_page_registered",
+            session_id=self.session_id,
+            context_id=context_id or "default",
+            requested_page_id=preferred_id or "",
+            page_id=pid,
+            make_active=make_active,
+            active_page_id=self.active_page_id or "",
+            page_count=len(self.pages),
+        )
+        return pid
+
+'''
+    patterns = (
+        r"    def _queue_pending_page_id\(self, context_id: str, page_id: str \| None(?:, make_active: bool = True)?\) -> None:\n.*?(?=    def _first_live_page)",
+        r"    def _queue_pending_page_id\(self, context_id: str, page_id: str \| None(?:, make_active: bool = True)?\) -> None:\n.*?(?=    def _register_page)",
+    )
+    for pattern in patterns:
+        text, count = re.subn(pattern, queue_block, text, count=1, flags=re.S)
+        if count:
+            break
+    if "self._queue_pending_page_id(requested_context_id, page_id)" in text:
+        text = text.replace("self._queue_pending_page_id(requested_context_id, page_id)", "self._queue_pending_page_id(requested_context_id, page_id, make_active)")
+    for marker in ("_register_pending_context_page", "pending_context_page_registered", "dict[str, list[dict[str, Any]]]", "self._queue_pending_page_id(requested_context_id, page_id, make_active)"):
+        if marker not in text:
+            fail(f"browser pending activation validation missing {marker}")
+    if "self._pop_pending_page_id(cid), True, \"context_page\"" in text:
+        fail("browser pending activation validation found forced active context page")
+    return text
+
+
+def patch_navigation_reset_cleanup(path: pathlib.Path, text: str) -> str:
+    if "from ..browser import _camoufox_debug" not in text:
+        if "from ..browser import _safe_text, _target_domain\n" in text:
+            text = text.replace("from ..browser import _safe_text, _target_domain\n", "from ..browser import _camoufox_debug, _safe_text, _target_domain\n", 1)
+        elif "from ..server import mcp, browser_manager\n" in text:
+            text = text.replace("from ..server import mcp, browser_manager\n", "from ..server import mcp, browser_manager\nfrom ..browser import _camoufox_debug, _safe_text\n", 1)
+        else:
+            fail(f"navigation debug import anchor missing {path}")
+    elif "_safe_text" not in text.split("from ..browser import", 1)[1].split("\n", 1)[0]:
+        text = text.replace("from ..browser import _camoufox_debug\n", "from ..browser import _camoufox_debug, _safe_text\n", 1)
+    if "close_page_prefix: str | None = None" not in text:
+        text = replace_once(
+            text,
+            "    clear_storage: bool = False,\n"
+            ") -> dict:\n",
+            "    clear_storage: bool = False,\n"
+            "    close_page_prefix: str | None = None,\n"
+            "    restore_page_id: str | None = None,\n"
+            "    close_empty_contexts: bool = True,\n"
+            ") -> dict:\n",
+            "navigation reset cleanup signature",
+        )
+    if "reset_browser_state_complete" not in text:
+        text = replace_in_function(
+            text,
+            "reset_browser_state",
+            "    result: dict[str, Any] = {\"status\": \"reset\"}\n"
+            "    try:\n",
+            "    result: dict[str, Any] = {\"status\": \"reset\"}\n"
+            "    try:\n"
+            "        result[\"active_page_before\"] = getattr(browser_manager, \"active_page_id\", None)\n"
+            "        result[\"page_count_before\"] = len(getattr(browser_manager, \"pages\", {}) or {})\n"
+            "        result[\"context_count_before\"] = len(getattr(browser_manager, \"contexts\", {}) or {})\n",
+            "navigation reset state snapshot",
+        )
+        text = replace_in_function(
+            text,
+            "reset_browser_state",
+            "        return result\n"
+            "    except Exception as e:\n"
+            "        return {\"error\": str(e)}\n",
+            "        if close_page_prefix:\n"
+            "            prefix = str(close_page_prefix)\n"
+            "            closed_pages: list[dict[str, Any]] = []\n"
+            "            close_errors: list[dict[str, Any]] = []\n"
+            "            page_ids = [\n"
+            "                pid for pid in list(getattr(browser_manager, \"pages\", {}) or {})\n"
+            "                if str(pid).startswith(prefix)\n"
+            "            ]\n"
+            "            for pid in page_ids:\n"
+            "                try:\n"
+            "                    close_result = await browser_manager.close_page(str(pid))\n"
+            "                    closed_pages.append({\n"
+            "                        \"page_id\": str(pid),\n"
+            "                        \"status\": close_result.get(\"status\") if isinstance(close_result, dict) else \"\",\n"
+            "                        \"active_page_id\": close_result.get(\"active_page_id\") if isinstance(close_result, dict) else None,\n"
+            "                    })\n"
+            "                except Exception as e:\n"
+            "                    close_errors.append({\n"
+            "                        \"page_id\": str(pid),\n"
+            "                        \"error_type\": type(e).__name__,\n"
+            "                        \"error\": _safe_text(e, 500),\n"
+            "                    })\n"
+            "            result[\"closed_pages\"] = closed_pages\n"
+            "            result[\"close_page_prefix\"] = prefix\n"
+            "            if close_errors:\n"
+            "                result[\"close_page_errors\"] = close_errors\n"
+            "        if close_empty_contexts:\n"
+            "            closed_contexts: list[str] = []\n"
+            "            context_errors: list[dict[str, Any]] = []\n"
+            "            for cid, ctx in list((getattr(browser_manager, \"contexts\", {}) or {}).items()):\n"
+            "                if str(cid) == \"default\":\n"
+            "                    continue\n"
+            "                try:\n"
+            "                    live_pages = [\n"
+            "                        page for page in list(getattr(ctx, \"pages\", []) or [])\n"
+            "                        if not browser_manager._page_closed(page)\n"
+            "                    ]\n"
+            "                    if live_pages:\n"
+            "                        continue\n"
+            "                    await ctx.close()\n"
+            "                    browser_manager._handle_context_close_event(str(cid), ctx)\n"
+            "                    closed_contexts.append(str(cid))\n"
+            "                except Exception as e:\n"
+            "                    context_errors.append({\n"
+            "                        \"context_id\": str(cid),\n"
+            "                        \"error_type\": type(e).__name__,\n"
+            "                        \"error\": _safe_text(e, 500),\n"
+            "                    })\n"
+            "            result[\"closed_contexts\"] = closed_contexts\n"
+            "            if context_errors:\n"
+            "                result[\"close_context_errors\"] = context_errors\n"
+            "        if restore_page_id:\n"
+            "            try:\n"
+            "                restore_result = await browser_manager.select_page(str(restore_page_id))\n"
+            "                result[\"restored_page_id\"] = restore_result.get(\"page_id\", restore_page_id) if isinstance(restore_result, dict) else restore_page_id\n"
+            "            except Exception as e:\n"
+            "                result[\"restore_page_error\"] = {\n"
+            "                    \"page_id\": str(restore_page_id),\n"
+            "                    \"error_type\": type(e).__name__,\n"
+            "                    \"error\": _safe_text(e, 500),\n"
+            "                }\n"
+            "        result[\"active_page_after\"] = getattr(browser_manager, \"active_page_id\", None)\n"
+            "        result[\"page_count_after\"] = len(getattr(browser_manager, \"pages\", {}) or {})\n"
+            "        result[\"context_count_after\"] = len(getattr(browser_manager, \"contexts\", {}) or {})\n"
+            "        _camoufox_debug(\n"
+            "            \"reset_browser_state_complete\",\n"
+            "            close_page_prefix=str(close_page_prefix or \"\"),\n"
+            "            restore_page_id=str(restore_page_id or \"\"),\n"
+            "            active_page_before=str(result.get(\"active_page_before\") or \"\"),\n"
+            "            active_page_after=str(result.get(\"active_page_after\") or \"\"),\n"
+            "            page_count_before=int(result.get(\"page_count_before\") or 0),\n"
+            "            page_count_after=int(result.get(\"page_count_after\") or 0),\n"
+            "            context_count_before=int(result.get(\"context_count_before\") or 0),\n"
+            "            context_count_after=int(result.get(\"context_count_after\") or 0),\n"
+            "            closed_pages=len(result.get(\"closed_pages\") or []),\n"
+            "            closed_contexts=len(result.get(\"closed_contexts\") or []),\n"
+            "            close_page_errors=len(result.get(\"close_page_errors\") or []),\n"
+            "            close_context_errors=len(result.get(\"close_context_errors\") or []),\n"
+            "            restore_failed=bool(result.get(\"restore_page_error\")),\n"
+            "        )\n"
+            "        return result\n"
+            "    except Exception as e:\n"
+            "        _camoufox_debug(\"reset_browser_state_exception\", error_type=type(e).__name__, error_summary=_safe_text(e, 800))\n"
+            "        return {\"error\": str(e)}\n",
+            "navigation reset cleanup body",
+        )
+    for marker in ("close_page_prefix: str | None = None", "reset_browser_state_complete", "closed_contexts"):
+        if marker not in text:
+            fail(f"navigation reset cleanup validation missing {marker} in {path}")
+    return text
+
+
 def patch_main(path: pathlib.Path) -> None:
     if not path.exists():
         return
@@ -313,6 +593,8 @@ def patch_navigation_launch_params(path: pathlib.Path, text: str) -> str:
 
 
 def patch_browser_launch_deadline_diagnostics(text: str) -> str:
+    if "launch_phase_deadline" not in text and "_budget_remaining_ms" in text and "_launch_debug_snapshot" in text and "launch_error_cleanup_counts" in text:
+        return text
     if "launch_phase_deadline" not in text:
         text = replace_once(
             text,
@@ -978,7 +1260,7 @@ def _target_closed_error(exc: Exception) -> bool:
 
 
 def patch_browser(path: pathlib.Path) -> None:
-    text = read_text(path)
+    text = patch_browser_debug_helper(read_text(path))
     if "self._aida_multipage_patch = 4" in text:
         updated = text
         updated = updated.replace(
@@ -1026,6 +1308,8 @@ def patch_browser(path: pathlib.Path) -> None:
             )
         updated = patch_browser_launch_deadline_diagnostics(updated)
         updated = patch_browser_camoufox_stability(updated)
+        updated = patch_browser_pending_activation(updated)
+        updated = patch_browser_debug_helper(updated)
         if updated != text:
             write_text(path, updated)
         return
@@ -1076,6 +1360,8 @@ def patch_browser(path: pathlib.Path) -> None:
             )
         updated = patch_browser_launch_deadline_diagnostics(updated)
         updated = patch_browser_camoufox_stability(updated)
+        updated = patch_browser_pending_activation(updated)
+        updated = patch_browser_debug_helper(updated)
         if updated != text:
             write_text(path, updated)
         return
@@ -1146,6 +1432,8 @@ def patch_browser(path: pathlib.Path) -> None:
             fail("browser v2 upgrade missing pending page id support")
         updated = patch_browser_launch_deadline_diagnostics(updated)
         updated = patch_browser_camoufox_stability(updated)
+        updated = patch_browser_pending_activation(updated)
+        updated = patch_browser_debug_helper(updated)
         write_text(path, updated)
         return
     text = replace_once(
@@ -1656,6 +1944,8 @@ def patch_browser(path: pathlib.Path) -> None:
         "        self._route_handlers.clear()\n",
     )
     text = patch_browser_camoufox_stability(text)
+    text = patch_browser_pending_activation(text)
+    text = patch_browser_debug_helper(text)
     for marker in ("self._aida_multipage_patch = 4", "async def list_pages", "async def resolve_page", "page_id", "active_page_id", "_pending_page_ids_by_context", "page_privacy_verified", "def _mark_page_terminal", "AIDA_CAMOUFOX_FAST_VISIBLE_FALLBACK", "aida_camoufox_bridge_20260619_2", "aida_bridge_patch_active", "aida_launch_policy_resolved", "context_close_event"):
         if marker not in text:
             fail(f"browser validation missing {marker}")
@@ -1666,6 +1956,7 @@ def patch_navigation(path: pathlib.Path) -> None:
     text = read_text(path)
     text = patch_navigation_launch_params(path, text)
     if "async def list_pages(" in text and "page_id: str | None = None" in text:
+        text = patch_navigation_reset_cleanup(path, text)
         text = patch_navigation_capture(path, text)
         text = patch_navigation_diagnostics(path, text)
         write_text(path, text)
@@ -1764,6 +2055,7 @@ def patch_navigation(path: pathlib.Path) -> None:
         fail(f"navigation page info envelope anchor missing {path}")
     if "async def list_pages(" not in text or "page_id: str | None = None" not in text:
         fail(f"navigation validation failed {path}")
+    text = patch_navigation_reset_cleanup(path, text)
     text = patch_navigation_capture(path, text)
     text = patch_navigation_diagnostics(path, text)
     write_text(path, text)
@@ -2092,6 +2384,174 @@ def patch_network(path: pathlib.Path) -> None:
             "            \"capturing\": browser_manager._capturing,\n",
             "network list envelope",
         )
+    if "async def get_request_initiator(request_id: int) -> dict:" in text and "browser_network_initiator_request_not_found" not in text:
+        legacy_block = '''@mcp.tool()
+async def get_request_initiator(request_id: int, page_id: str | None = None, marker: str | None = None) -> dict:
+    started = time.perf_counter()
+    request_marker = str(marker or "")
+    try:
+        target_entry = None
+        id_match = None
+        for entry in browser_manager._network_requests:
+            if entry.get("id") == request_id:
+                if id_match is None:
+                    id_match = entry
+                if not page_id or entry.get("page_id") == page_id:
+                    target_entry = entry
+                    break
+        if target_entry is None:
+            requested_page_id = page_id or (id_match.get("page_id") if isinstance(id_match, dict) else None)
+            return {
+                "initiator_contract": AIDA_INITIATOR_CONTRACT_V2,
+                "success": False,
+                "status": "failed",
+                "error": "browser_network_initiator_request_not_found",
+                "request_id": request_id,
+                "request_page_id": requested_page_id,
+                "resolved_page_id": requested_page_id,
+                "active_page_id": getattr(browser_manager, "active_page_id", None),
+                "request_marker": request_marker,
+                "hook_counts_before": {},
+                "hook_counts_after": {},
+                "fetch_initiator_log_count": 0,
+                "diagnostics": {
+                    "requested_page_id": page_id,
+                    "marker": request_marker,
+                    "id_match_page_id": id_match.get("page_id") if isinstance(id_match, dict) else None,
+                    "buffer_size": len(browser_manager._network_requests),
+                },
+            }
+
+        req_url = target_entry.get("url", "")
+        target_page_id = str(page_id or target_entry.get("page_id") or "")
+        try:
+            page = await browser_manager.resolve_page(target_page_id or None)
+        except Exception:
+            page = await browser_manager.get_active_page()
+        resolved_page_id = browser_manager.page_id_for(page) if hasattr(browser_manager, "page_id_for") else target_page_id
+        hook_counts_before = await _aida_network_hook_counts(page, request_marker, False)
+        escaped_url = json.dumps(req_url)
+        escaped_marker = json.dumps(request_marker)
+        result = await page.evaluate(f"""() => {{
+            const reqUrl = {escaped_url};
+            const marker = {escaped_marker};
+            function markerMatches(logUrl, log) {{
+                if (!marker) return true;
+                const haystacks = [logUrl || '', log && log.url || '', log && log.marker || '', log && log.body || ''];
+                return haystacks.some(v => String(v || '').includes(marker));
+            }}
+            function logCounts() {{
+                const xhrLog = Array.isArray(window.__mcp_xhr_log) ? window.__mcp_xhr_log : [];
+                const fetchLog = Array.isArray(window.__mcp_fetch_log) ? window.__mcp_fetch_log : [];
+                const fetchInitLog = Array.isArray(window.__mcp_fetch_initiator_log) ? window.__mcp_fetch_initiator_log : [];
+                return {{ xhr_log_count: xhrLog.length, fetch_log_count: fetchLog.length, fetch_initiator_log_count: fetchInitLog.length }};
+            }}
+            function matchUrl(logUrl) {{
+                try {{
+                    if (marker && !String(logUrl || '').includes(marker) && !String(reqUrl || '').includes(marker)) return false;
+                    if (reqUrl === logUrl || String(reqUrl || '').includes(logUrl) || String(logUrl || '').includes(reqUrl)) return true;
+                    const u1 = new URL(reqUrl, location.origin);
+                    const u2 = new URL(logUrl, location.origin);
+                    return u1.pathname === u2.pathname && u1.host === u2.host;
+                }} catch(e) {{
+                    return false;
+                }}
+            }}
+            const fetchInitLog = Array.isArray(window.__mcp_fetch_initiator_log) ? window.__mcp_fetch_initiator_log : [];
+            for (let i = fetchInitLog.length - 1; i >= 0; --i) {{
+                const entry = fetchInitLog[i] || {{}};
+                const logUrl = entry.url || '';
+                if (markerMatches(logUrl, entry) && matchUrl(logUrl)) {{
+                    return {{ url: logUrl, stack: entry.stack || null, type: entry.type || 'fetch_hook', method: entry.method, headers: entry.headers, body: entry.body, diagnostics: {{ counts: logCounts(), matched_log: 'fetch_initiator' }} }};
+                }}
+            }}
+            const fetchLog = Array.isArray(window.__mcp_fetch_log) ? window.__mcp_fetch_log : [];
+            for (let i = fetchLog.length - 1; i >= 0; --i) {{
+                const entry = fetchLog[i] || {{}};
+                const logUrl = entry.url || '';
+                if (markerMatches(logUrl, entry) && matchUrl(logUrl)) {{
+                    return {{ url: logUrl, stack: entry.stack || null, type: 'fetch_hook', method: entry.method, headers: entry.headers, body: entry.body, diagnostics: {{ counts: logCounts(), matched_log: 'fetch' }} }};
+                }}
+            }}
+            const xhrLog = Array.isArray(window.__mcp_xhr_log) ? window.__mcp_xhr_log : [];
+            for (let i = xhrLog.length - 1; i >= 0; --i) {{
+                const entry = xhrLog[i] || {{}};
+                const logUrl = entry.url || '';
+                if (markerMatches(logUrl, entry) && matchUrl(logUrl)) {{
+                    return {{ url: logUrl, stack: entry.stack || null, type: 'xhr_hook', method: entry.method, headers: entry.headers, body: entry.body, diagnostics: {{ counts: logCounts(), matched_log: 'xhr' }} }};
+                }}
+            }}
+            return {{
+                url: reqUrl,
+                stack: null,
+                type: 'unknown',
+                diagnostics: {{
+                    xhr_hook_active: !!window.__mcp_xhr_hooked,
+                    fetch_hook_active: !!window.__mcp_fetch_hooked,
+                    marker: marker || '',
+                    counts: logCounts(),
+                    hint: !window.__mcp_xhr_hooked && !window.__mcp_fetch_hooked
+                        ? 'No hooks detected. Call inject_hook_preset before navigating.'
+                        : 'Hooks active but no matching URL found in logs.'
+                }}
+            }};
+        }}""")
+        source = result.get("type", "unknown") if isinstance(result, dict) else "unknown"
+        diagnostics = result.get("diagnostics") if isinstance(result, dict) and isinstance(result.get("diagnostics"), dict) else {}
+        counts = diagnostics.get("counts") if isinstance(diagnostics.get("counts"), dict) else {}
+        hook_counts_after = await _aida_network_hook_counts(page, request_marker, False)
+        out = {
+            "initiator_contract": AIDA_INITIATOR_CONTRACT_V2,
+            "success": source not in ("unknown", None),
+            "status": "ok" if source not in ("unknown", None) else "failed",
+            "error": None if source not in ("unknown", None) else "browser_network_initiator_unknown_source",
+            "request_id": request_id,
+            "request_page_id": target_entry.get("page_id"),
+            "resolved_page_id": resolved_page_id,
+            "active_page_id": getattr(browser_manager, "active_page_id", None),
+            "request_url": req_url,
+            "request_marker": request_marker,
+            "hook_counts_before": hook_counts_before,
+            "hook_counts_after": hook_counts_after,
+            "fetch_log_count": counts.get("fetch_log_count", hook_counts_after.get("fetch_log_count", 0)),
+            "fetch_initiator_log_count": counts.get("fetch_initiator_log_count", hook_counts_after.get("fetch_initiator_log_count", 0)),
+            "xhr_log_count": counts.get("xhr_log_count", hook_counts_after.get("xhr_log_count", 0)),
+            "url": result.get("url") if isinstance(result, dict) else req_url,
+            "initiator_stack": result.get("stack") if isinstance(result, dict) else None,
+            "initiator_type": source,
+            "source": source,
+            "method": result.get("method") if isinstance(result, dict) else None,
+            "request_headers": result.get("headers") if isinstance(result, dict) else None,
+            "request_body": result.get("body") if isinstance(result, dict) else None,
+            "diagnostics": diagnostics,
+            "diagnostic": (
+                {
+                    "likely_causes": [
+                        "hook registered after SDK",
+                        "request made inside a sync-loaded SDK interceptor",
+                        "fetch_hook.js not injected",
+                    ],
+                    "recommended_action": "Use reload_with_hooks() or inject hooks before navigate.",
+                }
+                if source in ("unknown", None) else None
+            ),
+            "elapsed_ms": int((time.perf_counter() - started) * 1000),
+        }
+        if out["error"] is None:
+            out.pop("error", None)
+        return out
+    except Exception as e:
+        return {"success": False, "status": "failed", "error": "browser_network_initiator_exception", "error_type": type(e).__name__, "error_summary": _safe_text(e, 500), "initiator_contract": AIDA_INITIATOR_CONTRACT_V2, "request_id": request_id, "request_page_id": page_id, "resolved_page_id": page_id, "active_page_id": getattr(browser_manager, "active_page_id", None), "request_marker": str(marker or "")}
+'''
+        text, count = re.subn(
+            r"@mcp\.tool\(\)\nasync def get_request_initiator\(request_id: int\) -> dict:\n.*?(?=\n\n@mcp\.tool\(\)\nasync def intercept_request)",
+            legacy_block,
+            text,
+            count=1,
+            flags=re.S,
+        )
+        if count != 1:
+            fail(f"network legacy initiator replacement failed {path}")
     if "async def get_request_initiator(request_id: int, page_id: str | None = None, marker: str | None = None)" not in text:
         if "async def get_request_initiator(request_id: int, page_id: str | None = None) -> dict:" in text:
             text = text.replace(
@@ -2201,7 +2661,7 @@ def patch_network(path: pathlib.Path) -> None:
             "                    counts: logCounts(),\n",
             "network initiator unknown counts",
         )
-    if "diagnostics = result.get(\"diagnostics\") or {}" not in text:
+    if "diagnostics = result.get(\"diagnostics\") or {}" not in text and "\"initiator_contract\": AIDA_INITIATOR_CONTRACT_V2" not in text:
         text = replace_once(
             text,
             "        source = result.get(\"type\", \"unknown\")\n"
@@ -2317,6 +2777,8 @@ def patch_network(path: pathlib.Path) -> None:
 
 def patch_navigation_diagnostics(path: pathlib.Path, text: str) -> str:
     if "navigate_goto_exception" in text:
+        return text
+    if "navigation_diagnostic_snapshot" in text and "diagnostic_navigation_failure" in text:
         return text
     if "import time\n" not in text:
         text = replace_once(text, "import os\n", "import os\nimport time\n", "navigation time import")

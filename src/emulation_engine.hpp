@@ -122,6 +122,9 @@ struct emulation_config_t {
     bool          record_registers  = true;
     bool          analyze_effective_ops = true;
     std::uint64_t timeout_us       = 10000000;
+    std::uint64_t deadline_ms      = 0;
+    bool          allow_neutral_thread_context = false;
+    std::uint32_t max_invalid_page_maps = 64;
     std::set<std::uint64_t> breakpoint_addresses;
 };
 
@@ -154,7 +157,8 @@ process_snapshot_t driver_snapshot(
     std::uint32_t pid,
     std::uint32_t tid,
     std::uint64_t region_base = 0,
-    std::uint64_t region_size = 0);
+    std::uint64_t region_size = 0,
+    const emulation_config_t* config = nullptr);
 
 
 emulation_result_t emulate_from_snapshot(

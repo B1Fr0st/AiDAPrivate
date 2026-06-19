@@ -11,6 +11,7 @@
 #include "audit_http.hpp"
 #include "scope.hpp"
 
+#include "../../infra/event_bus.hpp"
 #include "../../../helpers/diag_log.hpp"
 
 #include <openssl/ssl.h>
@@ -37,6 +38,7 @@ namespace {
 
 std::mutex& err_mtx() { static std::mutex m; return m; }
 std::string& err_slot() { static std::string s; return s; }
+std::atomic<uint64_t>& exchange_ids() { static std::atomic<uint64_t> ids{1000000000ULL}; return ids; }
 
 void set_err(const std::string& msg)
 {
@@ -70,6 +72,83 @@ bool is_loopback_host(const std::string& host)
     std::string h = lower_ascii(host);
     if (h == "localhost" || h == "::1" || h == "[::1]") return true;
     return h.rfind("127.", 0) == 0;
+}
+
+const char* wsa_error_name(int err)
+{
+    switch (err) {
+    case 0: return "WSA_OK";
+    case WSAEINTR: return "WSAEINTR";
+    case WSAEBADF: return "WSAEBADF";
+    case WSAEACCES: return "WSAEACCES";
+    case WSAEFAULT: return "WSAEFAULT";
+    case WSAEINVAL: return "WSAEINVAL";
+    case WSAEMFILE: return "WSAEMFILE";
+    case WSAEWOULDBLOCK: return "WSAEWOULDBLOCK";
+    case WSAEINPROGRESS: return "WSAEINPROGRESS";
+    case WSAEALREADY: return "WSAEALREADY";
+    case WSAENOTSOCK: return "WSAENOTSOCK";
+    case WSAEDESTADDRREQ: return "WSAEDESTADDRREQ";
+    case WSAEMSGSIZE: return "WSAEMSGSIZE";
+    case WSAEPROTOTYPE: return "WSAEPROTOTYPE";
+    case WSAENOPROTOOPT: return "WSAENOPROTOOPT";
+    case WSAEPROTONOSUPPORT: return "WSAEPROTONOSUPPORT";
+    case WSAESOCKTNOSUPPORT: return "WSAESOCKTNOSUPPORT";
+    case WSAEOPNOTSUPP: return "WSAEOPNOTSUPP";
+    case WSAEPFNOSUPPORT: return "WSAEPFNOSUPPORT";
+    case WSAEAFNOSUPPORT: return "WSAEAFNOSUPPORT";
+    case WSAEADDRINUSE: return "WSAEADDRINUSE";
+    case WSAEADDRNOTAVAIL: return "WSAEADDRNOTAVAIL";
+    case WSAENETDOWN: return "WSAENETDOWN";
+    case WSAENETUNREACH: return "WSAENETUNREACH";
+    case WSAENETRESET: return "WSAENETRESET";
+    case WSAECONNABORTED: return "WSAECONNABORTED";
+    case WSAECONNRESET: return "WSAECONNRESET";
+    case WSAENOBUFS: return "WSAENOBUFS";
+    case WSAEISCONN: return "WSAEISCONN";
+    case WSAENOTCONN: return "WSAENOTCONN";
+    case WSAESHUTDOWN: return "WSAESHUTDOWN";
+    case WSAETIMEDOUT: return "WSAETIMEDOUT";
+    case WSAECONNREFUSED: return "WSAECONNREFUSED";
+    case WSAEHOSTDOWN: return "WSAEHOSTDOWN";
+    case WSAEHOSTUNREACH: return "WSAEHOSTUNREACH";
+    case WSAHOST_NOT_FOUND: return "WSAHOST_NOT_FOUND";
+    case WSATRY_AGAIN: return "WSATRY_AGAIN";
+    case WSANO_RECOVERY: return "WSANO_RECOVERY";
+    case WSANO_DATA: return "WSANO_DATA";
+    default: return "WSA_UNKNOWN";
+    }
+}
+
+const char* socket_family_name(int family)
+{
+    switch (family) {
+    case AF_INET: return "AF_INET";
+    case AF_INET6: return "AF_INET6";
+    default: return "AF_UNKNOWN";
+    }
+}
+
+std::string sockaddr_address_string(const sockaddr_storage& sa)
+{
+    char buf[INET6_ADDRSTRLEN] = {};
+    if (sa.ss_family == AF_INET) {
+        const auto* sin = reinterpret_cast<const sockaddr_in*>(&sa);
+        if (InetNtopA(AF_INET, const_cast<IN_ADDR*>(&sin->sin_addr), buf, sizeof(buf)))
+            return buf;
+    } else if (sa.ss_family == AF_INET6) {
+        const auto* sin6 = reinterpret_cast<const sockaddr_in6*>(&sa);
+        if (InetNtopA(AF_INET6, const_cast<IN6_ADDR*>(&sin6->sin6_addr), buf, sizeof(buf)))
+            return buf;
+    }
+    return {};
+}
+
+DWORD current_process_handle_count(bool& ok)
+{
+    DWORD count = 0;
+    ok = GetProcessHandleCount(GetCurrentProcess(), &count) != FALSE;
+    return count;
 }
 
 struct wsa_init_t
@@ -161,24 +240,35 @@ bool wait_socket(SOCKET s, int timeout_ms, bool for_write)
     return (pfd.revents & wanted) != 0 && (pfd.revents & POLLERR) == 0;
 }
 
-bool tcp_connect(SOCKET s, const sockaddr* sa, int sa_len, int timeout_ms, int& connect_err, int& poll_rc, short& revents, int& poll_wsa)
+bool tcp_connect(SOCKET s, const sockaddr* sa, int sa_len, int timeout_ms, int& connect_err, int& poll_rc, short& revents, int& poll_wsa, std::string& connect_stage, bool& before_would_block)
 {
     connect_err = 0;
     poll_rc = 0;
     revents = 0;
     poll_wsa = 0;
+    connect_stage = "set_nonblocking";
+    before_would_block = true;
     if (!set_nonblocking(s, true)) {
         connect_err = WSAGetLastError();
         return false;
     }
+    connect_stage = "connect";
     int rc = connect(s, sa, sa_len);
-    if (rc == 0) return true;
+    if (rc == 0) {
+        connect_stage = "connect_immediate_success";
+        before_would_block = false;
+        return true;
+    }
     int err = WSAGetLastError();
     if (err != WSAEWOULDBLOCK && err != WSAEINPROGRESS) {
+        connect_stage = "connect_immediate_failure";
         connect_err = err;
         return false;
     }
+    connect_stage = "poll_wait";
+    before_would_block = false;
     if (timeout_ms <= 0) {
+        connect_stage = "pre_poll_timeout";
         connect_err = WSAETIMEDOUT;
         return false;
     }
@@ -190,29 +280,37 @@ bool tcp_connect(SOCKET s, const sockaddr* sa, int sa_len, int timeout_ms, int& 
     if (poll_rc <= 0 || (pfd.revents & POLLNVAL) != 0) {
         poll_wsa = poll_rc < 0 ? WSAGetLastError() : 0;
         connect_err = poll_rc == 0 ? WSAETIMEDOUT : poll_wsa;
+        connect_stage = poll_rc == 0 ? "poll_timeout" : ((pfd.revents & POLLNVAL) != 0 ? "poll_invalid" : "poll_failed");
         return false;
     }
     int so_err = 0;
     int len = sizeof(so_err);
     if (getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&so_err), &len) != 0) {
+        connect_stage = "getsockopt_so_error_failed";
         connect_err = WSAGetLastError();
         return false;
     }
     connect_err = so_err;
+    connect_stage = so_err == 0 ? "connected" : "so_error";
     return so_err == 0;
 }
 
-bool tcp_connect_loopback(SOCKET s, const sockaddr* sa, int sa_len, int& connect_err)
+bool tcp_connect_loopback(SOCKET s, const sockaddr* sa, int sa_len, int& connect_err, std::string& connect_stage, bool& before_would_block)
 {
     connect_err = 0;
+    connect_stage = "blocking_connect";
+    before_would_block = true;
     set_nonblocking(s, false);
     int rc = connect(s, sa, sa_len);
     if (rc == 0) {
         set_nonblocking(s, true);
+        connect_stage = "blocking_connect_success";
+        before_would_block = false;
         return true;
     }
     connect_err = WSAGetLastError();
     set_nonblocking(s, true);
+    connect_stage = "blocking_connect_failure";
     return false;
 }
 
@@ -561,7 +659,13 @@ std::optional<exchange_observed_t> send(const std::vector<uint8_t>& raw_request,
         set_err("audit_http.send: DNS resolution failed");
         return std::nullopt;
     }
-    diag::log_tagged_fmt("audit_http", "send dns_ok host=%s port=%u", host.c_str(), static_cast<unsigned>(port));
+    const std::string resolved_ip = sockaddr_address_string(sa);
+    const char* resolved_family = socket_family_name(sa.ss_family);
+    bool handle_count_before_ok = false;
+    const DWORD handle_count_before = current_process_handle_count(handle_count_before_ok);
+    diag::log_tagged_fmt("audit_http", "send dns_ok host=%s port=%u family=%s ip=%s handle_count_ok=%d handle_count=%lu",
+        host.c_str(), static_cast<unsigned>(port), resolved_family, resolved_ip.c_str(),
+        handle_count_before_ok ? 1 : 0, static_cast<unsigned long>(handle_count_before));
 
     uint64_t t_req_start = now_ms();
     uint64_t t_steady_start = now_steady_ms();
@@ -574,6 +678,11 @@ std::optional<exchange_observed_t> send(const std::vector<uint8_t>& raw_request,
     int last_poll_rc = 0;
     short last_revents = 0;
     int last_poll_wsa = 0;
+    SOCKET last_socket = INVALID_SOCKET;
+    std::string last_connect_stage = "not_started";
+    bool last_before_would_block = false;
+    DWORD last_handle_count_after = 0;
+    bool last_handle_count_after_ok = false;
     for (int attempt = 1; attempt <= max_attempts; ++attempt) {
         const uint64_t now = now_steady_ms();
         const uint64_t elapsed = now > t_steady_start ? now - t_steady_start : 0;
@@ -581,10 +690,19 @@ std::optional<exchange_observed_t> send(const std::vector<uint8_t>& raw_request,
         const int remaining_ms = effective_timeout_ms - static_cast<int>(elapsed);
         const int attempt_timeout_ms = loopback ? std::min(remaining_ms, 250) : remaining_ms;
         SOCKET candidate = socket(sa.ss_family, SOCK_STREAM, IPPROTO_TCP);
+        last_socket = candidate;
         if (candidate == INVALID_SOCKET) {
             last_connect_err = WSAGetLastError();
-            diag::log_tagged_fmt("audit_http", "send socket_create_failed host=%s port=%u attempt=%d err=%d",
-                host.c_str(), static_cast<unsigned>(port), attempt, last_connect_err);
+            last_connect_stage = "socket_create";
+            last_before_would_block = true;
+            last_handle_count_after = current_process_handle_count(last_handle_count_after_ok);
+            diag::log_tagged_fmt("audit_http", "send socket_create_failed host=%s port=%u attempt=%d err=%d err_name=%s pid=%lu tid=%lu family=%s ip=%s socket=%llu handle_before_ok=%d handle_before=%lu handle_after_ok=%d handle_after=%lu elapsed_ms=%llu",
+                host.c_str(), static_cast<unsigned>(port), attempt, last_connect_err, wsa_error_name(last_connect_err),
+                static_cast<unsigned long>(GetCurrentProcessId()), static_cast<unsigned long>(GetCurrentThreadId()),
+                resolved_family, resolved_ip.c_str(), static_cast<unsigned long long>(candidate),
+                handle_count_before_ok ? 1 : 0, static_cast<unsigned long>(handle_count_before),
+                last_handle_count_after_ok ? 1 : 0, static_cast<unsigned long>(last_handle_count_after),
+                static_cast<unsigned long long>(now_steady_ms() - t_steady_start));
             break;
         }
         BOOL nodelay = TRUE;
@@ -596,9 +714,11 @@ std::optional<exchange_observed_t> send(const std::vector<uint8_t>& raw_request,
         int poll_rc = 0;
         short revents = 0;
         int poll_wsa = 0;
+        std::string connect_stage;
+        bool before_would_block = false;
         const bool connected = loopback
-            ? tcp_connect_loopback(candidate, reinterpret_cast<sockaddr*>(&sa), sa_len, connect_err)
-            : tcp_connect(candidate, reinterpret_cast<sockaddr*>(&sa), sa_len, attempt_timeout_ms, connect_err, poll_rc, revents, poll_wsa);
+            ? tcp_connect_loopback(candidate, reinterpret_cast<sockaddr*>(&sa), sa_len, connect_err, connect_stage, before_would_block)
+            : tcp_connect(candidate, reinterpret_cast<sockaddr*>(&sa), sa_len, attempt_timeout_ms, connect_err, poll_rc, revents, poll_wsa, connect_stage, before_would_block);
         if (connected) {
             sh.sock = candidate;
             diag::log_tagged_fmt("audit_http", "send tcp_connected host=%s port=%u tls=%d attempts=%d loopback=%d mode=%s",
@@ -610,12 +730,21 @@ std::optional<exchange_observed_t> send(const std::vector<uint8_t>& raw_request,
         last_poll_rc = poll_rc;
         last_revents = revents;
         last_poll_wsa = poll_wsa;
-        diag::log_tagged_fmt("audit_http", "send tcp_connect_failed host=%s port=%u attempt=%d/%d timeout_ms=%d connect_err=%d poll_rc=%d revents=0x%04X poll_wsa=%d elapsed_ms=%llu",
-            host.c_str(), static_cast<unsigned>(port), attempt, max_attempts, attempt_timeout_ms,
-            connect_err, poll_rc, static_cast<unsigned>(revents), poll_wsa,
-            static_cast<unsigned long long>(now_steady_ms() - t_steady_start));
+        last_connect_stage = connect_stage;
+        last_before_would_block = before_would_block;
         ::shutdown(candidate, SD_BOTH);
         closesocket(candidate);
+        last_handle_count_after = current_process_handle_count(last_handle_count_after_ok);
+        diag::log_tagged_fmt("audit_http", "send tcp_connect_failed host=%s port=%u attempt=%d/%d timeout_ms=%d connect_err=%d err_name=%s poll_rc=%d revents=0x%04X poll_wsa=%d poll_wsa_name=%s pid=%lu tid=%lu family=%s ip=%s socket=%llu connect_stage=%s before_would_block=%d handle_before_ok=%d handle_before=%lu handle_after_ok=%d handle_after=%lu elapsed_ms=%llu",
+            host.c_str(), static_cast<unsigned>(port), attempt, max_attempts, attempt_timeout_ms,
+            connect_err, wsa_error_name(connect_err), poll_rc, static_cast<unsigned>(revents), poll_wsa,
+            wsa_error_name(poll_wsa),
+            static_cast<unsigned long>(GetCurrentProcessId()), static_cast<unsigned long>(GetCurrentThreadId()),
+            resolved_family, resolved_ip.c_str(), static_cast<unsigned long long>(candidate),
+            connect_stage.c_str(), before_would_block ? 1 : 0,
+            handle_count_before_ok ? 1 : 0, static_cast<unsigned long>(handle_count_before),
+            last_handle_count_after_ok ? 1 : 0, static_cast<unsigned long>(last_handle_count_after),
+            static_cast<unsigned long long>(now_steady_ms() - t_steady_start));
 
         if (!loopback || attempt == max_attempts) break;
         const DWORD sleep_ms = static_cast<DWORD>(std::min(100, 10 * attempt));
@@ -623,11 +752,48 @@ std::optional<exchange_observed_t> send(const std::vector<uint8_t>& raw_request,
     }
 
     if (sh.sock == INVALID_SOCKET) {
-        diag::log_tagged_fmt("audit_http", "send tcp_connect_exhausted host=%s port=%u attempts=%d loopback=%d last_connect_err=%d last_poll_rc=%d last_revents=0x%04X last_poll_wsa=%d elapsed_ms=%llu",
+        if (!last_handle_count_after_ok)
+            last_handle_count_after = current_process_handle_count(last_handle_count_after_ok);
+        const bool enobufs_preinit = last_connect_err == WSAENOBUFS && last_before_would_block;
+        diag::log_tagged_fmt("audit_http", "send tcp_connect_exhausted host=%s port=%u attempts=%d loopback=%d last_connect_err=%d err_name=%s last_poll_rc=%d last_revents=0x%04X last_poll_wsa=%d poll_wsa_name=%s pid=%lu tid=%lu family=%s ip=%s socket=%llu connect_stage=%s before_would_block=%d transport_error_class=%s handle_before_ok=%d handle_before=%lu handle_after_ok=%d handle_after=%lu elapsed_ms=%llu",
             host.c_str(), static_cast<unsigned>(port), max_attempts, loopback ? 1 : 0,
-            last_connect_err, last_poll_rc, static_cast<unsigned>(last_revents), last_poll_wsa,
+            last_connect_err, wsa_error_name(last_connect_err), last_poll_rc, static_cast<unsigned>(last_revents), last_poll_wsa,
+            wsa_error_name(last_poll_wsa),
+            static_cast<unsigned long>(GetCurrentProcessId()), static_cast<unsigned long>(GetCurrentThreadId()),
+            resolved_family, resolved_ip.c_str(), static_cast<unsigned long long>(last_socket),
+            last_connect_stage.c_str(), last_before_would_block ? 1 : 0,
+            enobufs_preinit ? "wsaenobufs_preinit" : "connect_failure",
+            handle_count_before_ok ? 1 : 0, static_cast<unsigned long>(handle_count_before),
+            last_handle_count_after_ok ? 1 : 0, static_cast<unsigned long>(last_handle_count_after),
             static_cast<unsigned long long>(now_steady_ms() - t_steady_start));
-        set_err("audit_http.send: connect failed");
+        std::ostringstream oss;
+        oss << "audit_http.send: connect failed"
+            << " host=" << host
+            << " port=" << static_cast<unsigned>(port)
+            << " resolved_family=" << resolved_family
+            << " resolved_ip=" << resolved_ip
+            << " tls=" << (tls ? 1 : 0)
+            << " attempts=" << max_attempts
+            << " loopback=" << (loopback ? 1 : 0)
+            << " last_connect_err=" << last_connect_err
+            << " wsa_error_name=" << wsa_error_name(last_connect_err)
+            << " transport_error_code=" << last_connect_err
+            << " transport_error_class=" << (enobufs_preinit ? "wsaenobufs_preinit" : "connect_failure")
+            << " last_poll_rc=" << last_poll_rc
+            << " last_revents=0x" << std::hex << static_cast<unsigned>(last_revents) << std::dec
+            << " last_poll_wsa=" << last_poll_wsa
+            << " poll_wsa_name=" << wsa_error_name(last_poll_wsa)
+            << " pid=" << static_cast<unsigned long>(GetCurrentProcessId())
+            << " tid=" << static_cast<unsigned long>(GetCurrentThreadId())
+            << " socket=" << static_cast<unsigned long long>(last_socket)
+            << " connect_stage=" << last_connect_stage
+            << " before_would_block=" << (last_before_would_block ? 1 : 0)
+            << " handle_count_before_ok=" << (handle_count_before_ok ? 1 : 0)
+            << " handle_count_before=" << static_cast<unsigned long>(handle_count_before)
+            << " handle_count_after_ok=" << (last_handle_count_after_ok ? 1 : 0)
+            << " handle_count_after=" << static_cast<unsigned long>(last_handle_count_after)
+            << " elapsed_ms=" << static_cast<unsigned long long>(now_steady_ms() - t_steady_start);
+        set_err(oss.str());
         return std::nullopt;
     }
 
@@ -721,6 +887,7 @@ std::optional<exchange_observed_t> send(const std::vector<uint8_t>& raw_request,
         static_cast<unsigned long long>(latency), resp_buf.size());
 
     exchange_observed_t ex;
+    ex.id = exchange_ids().fetch_add(1, std::memory_order_relaxed);
     ex.timestamp_ms = t_req_start;
     ex.scheme = tls ? "https" : "http";
     ex.host = host;
@@ -784,7 +951,12 @@ std::optional<exchange_observed_t> send(const std::vector<uint8_t>& raw_request,
         ex.resp_body.assign(resp_buf.begin() + static_cast<std::ptrdiff_t>(body_offset), resp_buf.end());
     }
 
-    if (options.follow_redirects && options.max_redirects > 0 &&
+    if (options.return_first_redirect && (ex.status_code >= 300 && ex.status_code < 400)) {
+        diag::log_tagged_fmt("audit_http", "send redirect_first_preserved status=%d follow_redirects=%d max_redirects=%d",
+            ex.status_code, options.follow_redirects ? 1 : 0, options.max_redirects);
+    }
+
+    if (!options.return_first_redirect && options.follow_redirects && options.max_redirects > 0 &&
         (ex.status_code >= 300 && ex.status_code < 400)) {
         diag::log_tagged_fmt("audit_http", "send redirect status=%d max_redirects=%d", ex.status_code, options.max_redirects);
         for (const auto& h : ex.resp_headers) {
@@ -820,6 +992,12 @@ std::optional<exchange_observed_t> send(const std::vector<uint8_t>& raw_request,
 
     diag::log_tagged_fmt("audit_http", "send complete status=%d resp_body=%zu latency_ms=%llu",
         ex.status_code, ex.resp_body.size(), static_cast<unsigned long long>(latency));
+    if (options.publish_exchange) {
+        ex.source = options.exchange_source.empty() ? "api" : options.exchange_source;
+        aida::events::publish(kExchangeObservedEvent, ex);
+        diag::log_tagged_fmt("audit_http", "send published_exchange source=%s host=%s path=%s status=%d body=%zu",
+            ex.source.c_str(), ex.host.c_str(), ex.path.c_str(), ex.status_code, ex.resp_body.size());
+    }
     return ex;
 }
 

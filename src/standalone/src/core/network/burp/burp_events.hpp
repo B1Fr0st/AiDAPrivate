@@ -33,6 +33,7 @@ struct exchange_observed_t
     std::string                                       alpn;
     std::string                                       client_addr;
     uint16_t                                          client_port = 0;
+    std::string                                       source;
 };
 
 struct send_to_action_t

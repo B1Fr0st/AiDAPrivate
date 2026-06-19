@@ -80,6 +80,10 @@ static int                        g_loader_icon_h    = 0;
 DisasmState                       g_disasm;
 render_section_state_t            g_render_section;
 
+namespace test_all_features {
+	void format_ui_phase_snapshot(char* out, std::size_t cap);
+}
+
 namespace {
 	std::atomic<bool>          g_settings_dirty{false};
 	std::condition_variable    g_settings_cv;
@@ -6403,23 +6407,34 @@ void helpers::render_title()
 	unsigned long long last_pump_jobs_log_ms = s_last_pump_jobs_log_ms.load(std::memory_order_acquire);
 	const bool log_pump_jobs = ui_jobs_start_ms - last_pump_jobs_log_ms >= 1000ULL &&
 		s_last_pump_jobs_log_ms.compare_exchange_strong(last_pump_jobs_log_ms, ui_jobs_start_ms, std::memory_order_acq_rel);
+	char ui_phase_before[900] = {};
+	if (log_pump_jobs)
+		test_all_features::format_ui_phase_snapshot(ui_phase_before, sizeof(ui_phase_before));
 	if (log_pump_jobs) {
 		diag::log_tagged_critical_fmt("render_center",
-			"pump_ui_thread_jobs_enter view=%s view_id=%d frame=%d tid=%lu",
+			"pump_ui_thread_jobs_enter view=%s view_id=%d frame=%d tid=%lu stats={%.760s}",
 			center_view_name(globals::ui::active_center_view),
 			static_cast<int>(globals::ui::active_center_view),
 			ImGui::GetFrameCount(),
-			static_cast<unsigned long>(GetCurrentThreadId()));
+			static_cast<unsigned long>(GetCurrentThreadId()),
+			ui_phase_before[0] ? ui_phase_before : "<not-sampled>");
 	}
 	test_all_features::pump_ui_thread_jobs();
-	if (log_pump_jobs) {
+	const unsigned long long ui_jobs_wall_ms = GetTickCount64() - ui_jobs_start_ms;
+	const bool slow_pump_jobs = ui_jobs_wall_ms >= 8ULL;
+	if (log_pump_jobs || slow_pump_jobs) {
+		char ui_phase_after[900] = {};
+		test_all_features::format_ui_phase_snapshot(ui_phase_after, sizeof(ui_phase_after));
 		diag::log_tagged_critical_fmt("render_center",
-			"pump_ui_thread_jobs_exit view=%s view_id=%d elapsed_ms=%llu frame=%d tid=%lu",
+			"pump_ui_thread_jobs_exit view=%s view_id=%d wall_ms=%llu slow=%d frame=%d tid=%lu before={%.760s} after={%.760s}",
 			center_view_name(globals::ui::active_center_view),
 			static_cast<int>(globals::ui::active_center_view),
-			static_cast<unsigned long long>(GetTickCount64() - ui_jobs_start_ms),
+			static_cast<unsigned long long>(ui_jobs_wall_ms),
+			slow_pump_jobs ? 1 : 0,
 			ImGui::GetFrameCount(),
-			static_cast<unsigned long>(GetCurrentThreadId()));
+			static_cast<unsigned long>(GetCurrentThreadId()),
+			ui_phase_before[0] ? ui_phase_before : "<not-sampled>",
+			ui_phase_after[0] ? ui_phase_after : "<empty>");
 	}
 	g_render_section = "center_resolve_view";
 	auto cv = globals::ui::active_center_view;

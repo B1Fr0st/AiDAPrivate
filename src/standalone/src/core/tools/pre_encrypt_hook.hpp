@@ -9,10 +9,13 @@
 #include <chrono>
 #include <cstddef>
 #include <windows.h>
+#include <tlhelp32.h>
 #include "work_queue.hpp"
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <cstdio>
+#include <utility>
 
 #include "helpers/diag_log.hpp"
 #include "standalone_driver.hpp"
@@ -58,6 +61,28 @@ struct plaintext_capture_t {
     uint64_t module_offset = 0;
 };
 
+struct auto_hook_process_report_t {
+    uint32_t pid = 0;
+    uint32_t parent_pid = 0;
+    std::string process_name;
+    bool root = false;
+    bool alive = false;
+    bool module_enum_ok = false;
+    size_t module_count = 0;
+    bool has_nss3 = false;
+    bool has_pr_write = false;
+    uint32_t resolved_count = 0;
+    uint32_t hook_count = 0;
+    int score = 0;
+    bool selected = false;
+    bool set_active_ok = false;
+    DWORD win32_error = ERROR_SUCCESS;
+    std::string driver_error;
+    std::vector<std::string> module_hits;
+    std::vector<std::string> resolved_targets;
+    std::vector<std::string> resolve_misses;
+};
+
 struct state_t {
     std::vector<hook_target_t> targets;
     std::deque<plaintext_capture_t> captures;
@@ -71,6 +96,11 @@ struct state_t {
     size_t max_captures = 4096;
     uint32_t attached_pid = 0;
     std::vector<driver_bridge::module_info_t> cached_modules;
+    uint32_t last_auto_hook_root_pid = 0;
+    uint32_t last_auto_hook_selected_pid = 0;
+    DWORD last_auto_hook_snapshot_error = ERROR_SUCCESS;
+    std::string last_auto_hook_error;
+    std::vector<auto_hook_process_report_t> last_auto_hook_candidates;
 };
 
 inline state_t g_state;
@@ -84,9 +114,9 @@ struct known_target_t {
 };
 
 inline const known_target_t g_known_targets[] = {
+    { "nss3",      "PR_Write",         1, 2, buffer_kind_t::linear },
     { "libssl",    "SSL_write",        1, 2, buffer_kind_t::linear },
     { "ssleay32",  "SSL_write",        1, 2, buffer_kind_t::linear },
-    { "nss3",      "PR_Write",         1, 2, buffer_kind_t::linear },
     { "sspicli",   "EncryptMessage",   2, 0, buffer_kind_t::sec_buffer_desc },
     { "secur32",   "EncryptMessage",   2, 0, buffer_kind_t::sec_buffer_desc },
     { "ncrypt",    "SslEncryptPacket", 1, 2, buffer_kind_t::linear },
@@ -102,6 +132,138 @@ inline bool ci_contains(const std::string& haystack, const char* needle) {
     std::transform(lower_n.begin(), lower_n.end(), lower_n.begin(),
         [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return lower_h.find(lower_n) != std::string::npos;
+}
+
+inline std::string wide_to_utf8_local(const wchar_t* text) {
+    if (!text || !*text)
+        return {};
+    int needed = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
+    if (needed <= 1)
+        return {};
+    std::string out(static_cast<size_t>(needed - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text, -1, out.data(), needed, nullptr, nullptr);
+    return out;
+}
+
+struct process_tree_entry_t {
+    uint32_t pid = 0;
+    uint32_t parent_pid = 0;
+    std::string name;
+};
+
+inline bool pid_in_entries(const std::vector<process_tree_entry_t>& entries, uint32_t pid) {
+    for (const auto& entry : entries) {
+        if (entry.pid == pid)
+            return true;
+    }
+    return false;
+}
+
+inline bool process_alive(uint32_t pid, DWORD& out_error) {
+    out_error = ERROR_SUCCESS;
+    if (pid == 0 || pid == 4) {
+        out_error = ERROR_INVALID_PARAMETER;
+        return false;
+    }
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process) {
+        out_error = GetLastError();
+        return false;
+    }
+    DWORD exit_code = 0;
+    const BOOL got_exit = GetExitCodeProcess(process, &exit_code);
+    out_error = got_exit ? ERROR_SUCCESS : GetLastError();
+    CloseHandle(process);
+    return got_exit && exit_code == STILL_ACTIVE;
+}
+
+inline std::vector<process_tree_entry_t> enumerate_process_tree(uint32_t root_pid, DWORD& snapshot_error) {
+    snapshot_error = ERROR_SUCCESS;
+    std::vector<process_tree_entry_t> result;
+    if (root_pid == 0) {
+        snapshot_error = ERROR_INVALID_PARAMETER;
+        return result;
+    }
+
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        snapshot_error = GetLastError();
+        result.push_back({root_pid, 0, {}});
+        diag::log_tagged_fmt("pre_encrypt_hook",
+            "process_tree_snapshot_failed root_pid=%u gle=%lu",
+            root_pid,
+            static_cast<unsigned long>(snapshot_error));
+        return result;
+    }
+
+    std::vector<process_tree_entry_t> all;
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+    if (Process32FirstW(snapshot, &pe)) {
+        do {
+            process_tree_entry_t entry;
+            entry.pid = pe.th32ProcessID;
+            entry.parent_pid = pe.th32ParentProcessID;
+            entry.name = wide_to_utf8_local(pe.szExeFile);
+            all.push_back(std::move(entry));
+        } while (Process32NextW(snapshot, &pe));
+    } else {
+        snapshot_error = GetLastError();
+        diag::log_tagged_fmt("pre_encrypt_hook",
+            "process_tree_first_failed root_pid=%u gle=%lu",
+            root_pid,
+            static_cast<unsigned long>(snapshot_error));
+    }
+    CloseHandle(snapshot);
+
+    for (const auto& entry : all) {
+        if (entry.pid == root_pid) {
+            result.push_back(entry);
+            break;
+        }
+    }
+    if (result.empty())
+        result.push_back({root_pid, 0, {}});
+
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (const auto& entry : all) {
+            if (entry.pid == 0 || pid_in_entries(result, entry.pid))
+                continue;
+            if (pid_in_entries(result, entry.parent_pid)) {
+                result.push_back(entry);
+                changed = true;
+            }
+        }
+    }
+
+    diag::log_tagged_fmt("pre_encrypt_hook",
+        "process_tree_enumerated root_pid=%u count=%zu snapshot_error=%lu",
+        root_pid,
+        result.size(),
+        static_cast<unsigned long>(snapshot_error));
+    return result;
+}
+
+inline void reset_auto_hook_report(uint32_t root_pid, DWORD snapshot_error, const std::string& error) {
+    std::lock_guard<std::mutex> lock(g_state.mutex);
+    g_state.last_auto_hook_root_pid = root_pid;
+    g_state.last_auto_hook_selected_pid = 0;
+    g_state.last_auto_hook_snapshot_error = snapshot_error;
+    g_state.last_auto_hook_error = error;
+    g_state.last_auto_hook_candidates.clear();
+}
+
+inline void store_auto_hook_report(uint32_t root_pid, uint32_t selected_pid, DWORD snapshot_error,
+                                   const std::string& error,
+                                   const std::vector<auto_hook_process_report_t>& reports) {
+    std::lock_guard<std::mutex> lock(g_state.mutex);
+    g_state.last_auto_hook_root_pid = root_pid;
+    g_state.last_auto_hook_selected_pid = selected_pid;
+    g_state.last_auto_hook_snapshot_error = snapshot_error;
+    g_state.last_auto_hook_error = error;
+    g_state.last_auto_hook_candidates = reports;
 }
 
 inline uint64_t register_value(const CONTEXT& ctx, uint32_t reg_index) {
@@ -915,57 +1077,185 @@ inline bool auto_hook(uint32_t pid) {
         g_state.active.load() ? 1 : 0,
         target_pid_snapshot(),
         driver_bridge::attached_pid());
-    if (!driver_bridge::using_kernel_driver())
-        return false;
 
-    if (!driver_bridge::is_loaded())
+    if (!driver_bridge::using_kernel_driver()) {
+        reset_auto_hook_report(pid, ERROR_SUCCESS, "kernel_driver_not_connected");
         return false;
-
-    if (g_state.active.load()) {
-        std::lock_guard<std::mutex> lock(g_state.mutex);
-        if (g_state.attached_pid != 0 && g_state.attached_pid != pid)
-            return false;
+    }
+    if (!driver_bridge::is_loaded()) {
+        reset_auto_hook_report(pid, ERROR_SUCCESS, "driver_bridge_not_loaded");
+        return false;
     }
 
-    if (driver_bridge::attached_pid() != pid) {
-        bool already_attached = false;
+    DWORD snapshot_error = ERROR_SUCCESS;
+    auto process_tree = enumerate_process_tree(pid, snapshot_error);
+    std::vector<auto_hook_process_report_t> reports;
+    reports.reserve(process_tree.size());
+
+    auto score_for_target = [](const known_target_t& known) -> int {
+        if (_stricmp(known.module_pattern, "nss3") == 0 && _stricmp(known.export_name, "PR_Write") == 0)
+            return 120;
+        if (ci_contains(known.module_pattern, "libssl") || ci_contains(known.module_pattern, "ssleay32"))
+            return 70;
+        if (ci_contains(known.module_pattern, "sspicli") || ci_contains(known.module_pattern, "secur32"))
+            return 45;
+        if (ci_contains(known.module_pattern, "ncrypt"))
+            return 35;
+        if (ci_contains(known.module_pattern, "ws2_32"))
+            return 10;
+        return 1;
+    };
+
+    for (const auto& proc : process_tree) {
+        auto_hook_process_report_t report;
+        report.pid = proc.pid;
+        report.parent_pid = proc.parent_pid;
+        report.process_name = proc.name;
+        report.root = proc.pid == pid;
+        DWORD alive_error = ERROR_SUCCESS;
+        report.alive = process_alive(proc.pid, alive_error);
+        report.win32_error = alive_error;
+        if (!report.alive) {
+            diag::log_tagged_fmt("pre_encrypt_hook",
+                "auto_hook_candidate_dead pid=%u parent=%u name=%s gle=%lu",
+                report.pid,
+                report.parent_pid,
+                report.process_name.c_str(),
+                static_cast<unsigned long>(alive_error));
+            reports.push_back(std::move(report));
+            continue;
+        }
+
+        auto modules = driver_bridge::enumerate_modules_for(proc.pid);
+        report.module_count = modules.size();
+        report.module_enum_ok = !modules.empty();
+        report.driver_error = driver_bridge::last_error();
+        diag::log_tagged_fmt("pre_encrypt_hook",
+            "auto_hook_candidate_modules pid=%u parent=%u name=%s count=%zu driver_error=%s",
+            report.pid,
+            report.parent_pid,
+            report.process_name.c_str(),
+            modules.size(),
+            report.driver_error.c_str());
+
+        for (const auto& mod : modules) {
+            if (ci_contains(mod.name, "nss3"))
+                report.has_nss3 = true;
+            for (const auto& known : g_known_targets) {
+                if (!ci_contains(mod.name, known.module_pattern))
+                    continue;
+
+                std::string target_name = mod.name + "!" + known.export_name;
+                report.module_hits.push_back(target_name);
+                uint64_t func_addr = driver_bridge::resolve_export_for(proc.pid, mod.base, known.export_name);
+                if (func_addr == 0) {
+                    report.resolve_misses.push_back(target_name);
+                    diag::log_tagged_fmt("pre_encrypt_hook",
+                        "auto_hook_candidate_resolve_miss pid=%u module=%s export=%s base=0x%llX driver_error=%s",
+                        proc.pid,
+                        mod.name.c_str(),
+                        known.export_name,
+                        static_cast<unsigned long long>(mod.base),
+                        driver_bridge::last_error().c_str());
+                    continue;
+                }
+
+                char resolved[128] = {};
+                std::snprintf(resolved, sizeof(resolved), "%s@0x%llX", target_name.c_str(), static_cast<unsigned long long>(func_addr));
+                report.resolved_targets.push_back(resolved);
+                ++report.resolved_count;
+                report.score += score_for_target(known);
+                if (_stricmp(known.module_pattern, "nss3") == 0 && _stricmp(known.export_name, "PR_Write") == 0)
+                    report.has_pr_write = true;
+            }
+        }
+        if (!report.root && report.resolved_count != 0)
+            report.score += 8;
+        reports.push_back(std::move(report));
+    }
+
+    int best_score = -1;
+    size_t best_index = static_cast<size_t>(-1);
+    for (size_t i = 0; i < reports.size(); ++i) {
+        if (!reports[i].alive || reports[i].resolved_count == 0)
+            continue;
+        if (reports[i].score > best_score) {
+            best_score = reports[i].score;
+            best_index = i;
+        }
+    }
+
+    if (best_index == static_cast<size_t>(-1)) {
+        store_auto_hook_report(pid, 0, snapshot_error, "no_supported_pre_encrypt_exports_resolved", reports);
+        diag::log_tagged_fmt("pre_encrypt_hook",
+            "auto_hook_no_candidate pid=%u candidates=%zu snapshot_error=%lu",
+            pid,
+            reports.size(),
+            static_cast<unsigned long>(snapshot_error));
+        return false;
+    }
+
+    const uint32_t selected_pid = reports[best_index].pid;
+    reports[best_index].selected = true;
+
+    uint32_t active_hook_pid = 0;
+    if (g_state.active.load()) {
+        std::lock_guard<std::mutex> lock(g_state.mutex);
+        active_hook_pid = g_state.attached_pid;
+    }
+    if (active_hook_pid != 0 && active_hook_pid != selected_pid) {
+        store_auto_hook_report(pid, selected_pid, snapshot_error, "selected_child_differs_from_active_hook_pid", reports);
+        return false;
+    }
+
+    bool already_attached = driver_bridge::attached_pid() == selected_pid;
+    if (!already_attached) {
         const auto attached = driver_bridge::attached_pids();
         for (uint32_t attached_pid : attached) {
-            if (attached_pid == pid) {
+            if (attached_pid == selected_pid) {
                 already_attached = true;
                 break;
             }
         }
-        if (already_attached) {
-            if (!driver_bridge::set_active_pid(pid)) {
-                diag::log_tagged_fmt("pre_encrypt_hook",
-                    "auto_hook_set_active_failed pid=%u driver_error=%s",
-                    pid,
-                    driver_bridge::last_error().c_str());
-                return false;
-            }
-        } else if (!driver_bridge::attach(pid)) {
-            diag::log_tagged_fmt("pre_encrypt_hook",
-                "auto_hook_attach_failed pid=%u driver_error=%s",
-                pid,
-                driver_bridge::last_error().c_str());
-            return false;
-        }
+    }
+
+    bool active_ok = false;
+    if (already_attached) {
+        active_ok = driver_bridge::set_active_pid(selected_pid);
+    } else if (driver_bridge::attached_pid() == 0) {
+        active_ok = driver_bridge::attach(selected_pid);
+    } else if (driver_bridge::attach_additional(selected_pid)) {
+        active_ok = driver_bridge::set_active_pid(selected_pid);
+    }
+
+    reports[best_index].set_active_ok = active_ok;
+    reports[best_index].driver_error = driver_bridge::last_error();
+    if (!active_ok) {
+        store_auto_hook_report(pid, selected_pid, snapshot_error, "set_active_selected_pid_failed", reports);
+        diag::log_tagged_fmt("pre_encrypt_hook",
+            "auto_hook_set_active_failed root_pid=%u selected_pid=%u driver_error=%s",
+            pid,
+            selected_pid,
+            driver_bridge::last_error().c_str());
+        return false;
     }
 
     auto modules = driver_bridge::enumerate_modules();
     diag::log_tagged_fmt("pre_encrypt_hook",
-        "auto_hook_modules pid=%u count=%zu driver_error=%s",
+        "auto_hook_selected_modules root_pid=%u selected_pid=%u count=%zu driver_error=%s",
         pid,
+        selected_pid,
         modules.size(),
         driver_bridge::last_error().c_str());
-    if (modules.empty())
+    if (modules.empty()) {
+        store_auto_hook_report(pid, selected_pid, snapshot_error, "selected_pid_module_enumeration_empty", reports);
         return false;
+    }
 
     {
         std::lock_guard<std::mutex> lock(g_state.mutex);
         g_state.cached_modules = modules;
-        g_state.attached_pid = pid;
+        g_state.attached_pid = selected_pid;
     }
 
     uint32_t hooked = 0;
@@ -985,19 +1275,21 @@ inline bool auto_hook(uint32_t pid) {
             uint64_t func_addr = driver_bridge::resolve_export(mod.base, known.export_name);
             if (func_addr == 0) {
                 diag::log_tagged_fmt("pre_encrypt_hook",
-                    "auto_hook_resolve_miss pid=%u module=%s export=%s base=0x%llX",
-                    pid,
+                    "auto_hook_resolve_miss pid=%u module=%s export=%s base=0x%llX driver_error=%s",
+                    selected_pid,
                     mod.name.c_str(),
                     known.export_name,
-                    static_cast<unsigned long long>(mod.base));
+                    static_cast<unsigned long long>(mod.base),
+                    driver_bridge::last_error().c_str());
                 continue;
             }
 
             std::string hook_name = mod.name + "!" + known.export_name;
             const bool ok = hook_address_with_kind(func_addr, hook_name, known.buffer_reg, known.size_reg, known.kind);
             diag::log_tagged_fmt("pre_encrypt_hook",
-                "auto_hook_target pid=%u module=%s export=%s address=0x%llX ok=%d hooked=%u",
+                "auto_hook_target root_pid=%u selected_pid=%u module=%s export=%s address=0x%llX ok=%d hooked_before=%u",
                 pid,
+                selected_pid,
                 mod.name.c_str(),
                 known.export_name,
                 static_cast<unsigned long long>(func_addr),
@@ -1008,10 +1300,16 @@ inline bool auto_hook(uint32_t pid) {
         }
     }
 
+    reports[best_index].hook_count = hooked;
+    store_auto_hook_report(pid, selected_pid, snapshot_error, hooked > 0 ? std::string() : "hook_installation_failed", reports);
     diag::log_tagged_fmt("pre_encrypt_hook",
-        "auto_hook_done pid=%u hooked=%u",
+        "auto_hook_done root_pid=%u selected_pid=%u candidates=%zu hooked=%u selected_score=%d has_pr_write=%d",
         pid,
-        hooked);
+        selected_pid,
+        reports.size(),
+        hooked,
+        reports[best_index].score,
+        reports[best_index].has_pr_write ? 1 : 0);
     return hooked > 0;
 }
 

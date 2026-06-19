@@ -359,6 +359,397 @@ static bool read_target_c_string(std::uint64_t addr, std::size_t max_len, std::s
     return !out.empty();
 }
 
+static bool image_range_available(const std::vector<std::uint8_t>& image, std::uint64_t rva, std::uint64_t size)
+{
+    const std::uint64_t image_size = static_cast<std::uint64_t>(image.size());
+    return rva <= image_size && size <= image_size - rva;
+}
+
+template <typename T>
+static bool image_read_value(const std::vector<std::uint8_t>& image, std::uint64_t rva, T& out)
+{
+    if (!image_range_available(image, rva, sizeof(T)))
+        return false;
+    std::memcpy(&out, image.data() + static_cast<std::size_t>(rva), sizeof(T));
+    return true;
+}
+
+static bool image_read_bytes(const std::vector<std::uint8_t>& image, std::uint64_t rva, void* out, std::size_t size)
+{
+    if (out == nullptr || !image_range_available(image, rva, size))
+        return false;
+    std::memcpy(out, image.data() + static_cast<std::size_t>(rva), size);
+    return true;
+}
+
+static bool image_read_c_string(const std::vector<std::uint8_t>& image, std::uint64_t rva, std::size_t max_len, std::string& out)
+{
+    out.clear();
+    if (!image_range_available(image, rva, 1))
+        return false;
+    const std::size_t start = static_cast<std::size_t>(rva);
+    const std::size_t available = image.size() - start;
+    const std::size_t limit = std::min<std::size_t>(available, max_len);
+    out.reserve(std::min<std::size_t>(limit, 128));
+    for (std::size_t i = 0; i < limit; ++i) {
+        const std::uint8_t b = image[start + i];
+        if (b == 0)
+            return true;
+        out.push_back(static_cast<char>(b));
+    }
+    return !out.empty();
+}
+
+static bool read_module_image_for_modules_detail(const driver_bridge::module_info_t& module,
+                                                 std::vector<std::uint8_t>& image,
+                                                 std::string& status)
+{
+    image.clear();
+    status.clear();
+    constexpr std::uint64_t max_image_bytes = 64ull * 1024ull * 1024ull;
+    if (module.base == 0 || module.size == 0) {
+        status = "invalid_module_range";
+        return false;
+    }
+    if (static_cast<std::uint64_t>(module.size) > max_image_bytes) {
+        status = "module_too_large_for_fast_image";
+        return false;
+    }
+    if (!driver_bridge::read_memory(module.base, static_cast<std::size_t>(module.size), image)) {
+        status = "read_memory_failed";
+        return false;
+    }
+    if (image.size() < 0x1000) {
+        status = "image_read_too_small";
+        return false;
+    }
+    status = image.size() < static_cast<std::size_t>(module.size) ? "partial_image_read" : "complete_image_read";
+    return true;
+}
+
+static bool parse_pe_from_module_image(std::uint64_t module_base,
+                                       const std::vector<std::uint8_t>& image,
+                                       pe_parser::pe_info_t& out)
+{
+    out = {};
+    std::uint16_t dos_magic = 0;
+    if (!image_read_value(image, 0, dos_magic) || dos_magic != IMAGE_DOS_SIGNATURE)
+        return false;
+    std::uint32_t e_lfanew = 0;
+    if (!image_read_value(image, 0x3C, e_lfanew) || e_lfanew > 0x1000)
+        return false;
+    std::uint32_t nt_sig = 0;
+    if (!image_read_value(image, e_lfanew, nt_sig) || nt_sig != IMAGE_NT_SIGNATURE)
+        return false;
+
+    const std::uint64_t file_header_rva = static_cast<std::uint64_t>(e_lfanew) + sizeof(std::uint32_t);
+    std::uint16_t num_sections = 0;
+    std::uint16_t opt_header_size = 0;
+    if (!image_read_value(image, file_header_rva + 2, num_sections) ||
+        !image_read_value(image, file_header_rva + 4, out.timestamp) ||
+        !image_read_value(image, file_header_rva + 16, opt_header_size) ||
+        !image_read_value(image, file_header_rva + 18, out.characteristics))
+        return false;
+
+    const std::uint64_t opt_rva = file_header_rva + IMAGE_SIZEOF_FILE_HEADER;
+    std::uint16_t opt_magic = 0;
+    if (!image_read_value(image, opt_rva, opt_magic))
+        return false;
+    out.is_64bit = opt_magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+    if (!out.is_64bit && opt_magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC)
+        return false;
+
+    std::uint32_t ep_rva = 0;
+    if (!image_read_value(image, opt_rva + 16, ep_rva) ||
+        !image_read_value(image, opt_rva + 56, out.size_of_image))
+        return false;
+    out.entry_point = module_base + ep_rva;
+    if (image_range_available(image, opt_rva + 68, sizeof(out.subsystem)))
+        image_read_value(image, opt_rva + 68, out.subsystem);
+
+    if (out.is_64bit) {
+        if (!image_read_value(image, opt_rva + 24, out.image_base))
+            return false;
+        if (opt_header_size >= 128 && image_range_available(image, opt_rva + 124, 4)) {
+            image_read_value(image, opt_rva + 112, out.export_dir_rva);
+            image_read_value(image, opt_rva + 116, out.export_dir_size);
+            image_read_value(image, opt_rva + 120, out.import_dir_rva);
+            image_read_value(image, opt_rva + 124, out.import_dir_size);
+        }
+    } else {
+        std::uint32_t image_base32 = 0;
+        if (!image_read_value(image, opt_rva + 28, image_base32))
+            return false;
+        out.image_base = image_base32;
+        if (opt_header_size >= 112 && image_range_available(image, opt_rva + 108, 4)) {
+            image_read_value(image, opt_rva + 96, out.export_dir_rva);
+            image_read_value(image, opt_rva + 100, out.export_dir_size);
+            image_read_value(image, opt_rva + 104, out.import_dir_rva);
+            image_read_value(image, opt_rva + 108, out.import_dir_size);
+        }
+    }
+
+    if (num_sections > 96)
+        num_sections = 96;
+    const std::uint64_t section_start = opt_rva + opt_header_size;
+    for (std::uint16_t i = 0; i < num_sections; ++i) {
+        const std::uint64_t sec_rva = section_start + static_cast<std::uint64_t>(i) * IMAGE_SIZEOF_SECTION_HEADER;
+        if (!image_range_available(image, sec_rva, IMAGE_SIZEOF_SECTION_HEADER))
+            break;
+        pe_parser::section_info_t sec;
+        char sec_name[9] = {};
+        std::memcpy(sec_name, image.data() + static_cast<std::size_t>(sec_rva), 8);
+        sec.name = sec_name;
+        image_read_value(image, sec_rva + 8, sec.virtual_size);
+        image_read_value(image, sec_rva + 12, sec.virtual_address);
+        image_read_value(image, sec_rva + 16, sec.raw_size);
+        image_read_value(image, sec_rva + 36, sec.characteristics);
+        out.sections.push_back(std::move(sec));
+    }
+    return true;
+}
+
+static bool parse_exports_for_modules_detail_from_image(std::uint64_t module_base,
+                                                        const pe_parser::pe_info_t& pe,
+                                                        const std::vector<std::uint8_t>& image,
+                                                        std::vector<pe_parser::export_entry_t>& out,
+                                                        std::size_t max_entries,
+                                                        const std::chrono::steady_clock::time_point* deadline,
+                                                        bool* truncated,
+                                                        bool* deadline_hit)
+{
+    out.clear();
+    if (truncated)
+        *truncated = false;
+    if (deadline_hit)
+        *deadline_hit = false;
+    auto hit_deadline = [&]() {
+        if (truncated)
+            *truncated = true;
+        if (deadline_hit)
+            *deadline_hit = true;
+    };
+    if (pe.export_dir_rva == 0 || pe.export_dir_size == 0)
+        return true;
+    if (max_entries == 0) {
+        if (truncated)
+            *truncated = true;
+        return true;
+    }
+    if (modules_detail_deadline_expired(deadline)) {
+        hit_deadline();
+        return false;
+    }
+
+    std::uint8_t dir_buf[40] = {};
+    if (!image_read_bytes(image, pe.export_dir_rva, dir_buf, sizeof(dir_buf)))
+        return false;
+    std::uint32_t ordinal_base = 0;
+    std::uint32_t num_functions = 0;
+    std::uint32_t num_names = 0;
+    std::uint32_t addr_table_rva = 0;
+    std::uint32_t name_table_rva = 0;
+    std::uint32_t ordinal_table_rva = 0;
+    std::memcpy(&ordinal_base, dir_buf + 16, sizeof(ordinal_base));
+    std::memcpy(&num_functions, dir_buf + 20, sizeof(num_functions));
+    std::memcpy(&num_names, dir_buf + 24, sizeof(num_names));
+    std::memcpy(&addr_table_rva, dir_buf + 28, sizeof(addr_table_rva));
+    std::memcpy(&name_table_rva, dir_buf + 32, sizeof(name_table_rva));
+    std::memcpy(&ordinal_table_rva, dir_buf + 36, sizeof(ordinal_table_rva));
+    if (num_functions == 0 || num_functions > 0x10000)
+        return true;
+    if (num_names > num_functions)
+        num_names = num_functions;
+    if (addr_table_rva == 0)
+        return false;
+
+    const std::uint64_t addr_table_bytes = static_cast<std::uint64_t>(num_functions) * sizeof(std::uint32_t);
+    if (!image_range_available(image, addr_table_rva, addr_table_bytes))
+        return false;
+    std::vector<std::uint32_t> addr_table(num_functions);
+    std::memcpy(addr_table.data(), image.data() + addr_table_rva, static_cast<std::size_t>(addr_table_bytes));
+
+    std::uint32_t exp_start = pe.export_dir_rva;
+    std::uint32_t exp_end = pe.export_dir_rva + pe.export_dir_size;
+    if (exp_end < exp_start)
+        exp_end = (std::numeric_limits<std::uint32_t>::max)();
+    out.reserve(std::min<std::size_t>(static_cast<std::size_t>(num_functions), max_entries));
+    std::vector<std::int32_t> ordinal_to_output(num_functions, -1);
+    for (std::uint32_t i = 0; i < num_functions; ++i) {
+        if (out.size() >= max_entries) {
+            if (truncated)
+                *truncated = true;
+            break;
+        }
+        if (modules_detail_deadline_expired(deadline)) {
+            hit_deadline();
+            return true;
+        }
+        if (addr_table[i] == 0)
+            continue;
+        pe_parser::export_entry_t entry;
+        entry.ordinal = static_cast<std::uint16_t>(ordinal_base + i);
+        entry.rva = addr_table[i];
+        entry.address = module_base + addr_table[i];
+        entry.is_forwarded = addr_table[i] >= exp_start && addr_table[i] < exp_end;
+        ordinal_to_output[i] = static_cast<std::int32_t>(out.size());
+        out.push_back(std::move(entry));
+    }
+    if (num_names == 0 || out.empty() || name_table_rva == 0 || ordinal_table_rva == 0)
+        return true;
+    const std::uint64_t name_table_bytes = static_cast<std::uint64_t>(num_names) * sizeof(std::uint32_t);
+    const std::uint64_t ordinal_table_bytes = static_cast<std::uint64_t>(num_names) * sizeof(std::uint16_t);
+    if (!image_range_available(image, name_table_rva, name_table_bytes) ||
+        !image_range_available(image, ordinal_table_rva, ordinal_table_bytes)) {
+        if (truncated)
+            *truncated = true;
+        return true;
+    }
+    std::vector<std::uint32_t> name_ptrs(num_names);
+    std::vector<std::uint16_t> ordinals(num_names);
+    std::memcpy(name_ptrs.data(), image.data() + name_table_rva, static_cast<std::size_t>(name_table_bytes));
+    std::memcpy(ordinals.data(), image.data() + ordinal_table_rva, static_cast<std::size_t>(ordinal_table_bytes));
+
+    std::size_t unnamed = 0;
+    for (const auto& entry : out) {
+        if (entry.name.empty())
+            ++unnamed;
+    }
+    for (std::uint32_t i = 0; i < num_names && unnamed > 0; ++i) {
+        if (modules_detail_deadline_expired(deadline)) {
+            hit_deadline();
+            return true;
+        }
+        const std::uint16_t ord = ordinals[i];
+        if (ord >= num_functions)
+            continue;
+        const std::int32_t out_index = ordinal_to_output[ord];
+        if (out_index < 0)
+            continue;
+        auto& entry = out[static_cast<std::size_t>(out_index)];
+        if (!entry.name.empty())
+            continue;
+        std::string name;
+        if (image_read_c_string(image, name_ptrs[i], 512, name) && !name.empty()) {
+            entry.name = std::move(name);
+            --unnamed;
+        }
+    }
+    for (auto& entry : out) {
+        if (!entry.is_forwarded)
+            continue;
+        if (modules_detail_deadline_expired(deadline)) {
+            hit_deadline();
+            return true;
+        }
+        image_read_c_string(image, entry.rva, 512, entry.forward_name);
+    }
+    return true;
+}
+
+static bool parse_imports_for_modules_detail_from_image(std::uint64_t module_base,
+                                                        const pe_parser::pe_info_t& pe,
+                                                        const std::vector<std::uint8_t>& image,
+                                                        std::vector<pe_parser::import_entry_t>& out,
+                                                        std::size_t max_entries,
+                                                        const std::chrono::steady_clock::time_point* deadline,
+                                                        bool* truncated)
+{
+    out.clear();
+    if (truncated)
+        *truncated = false;
+    if (pe.import_dir_rva == 0 || pe.import_dir_size == 0)
+        return true;
+    if (max_entries == 0) {
+        if (truncated)
+            *truncated = true;
+        return true;
+    }
+
+    const std::uint32_t descriptor_count = std::min<std::uint32_t>(4096u, pe.import_dir_size / 20u + 1u);
+    for (std::uint32_t desc_idx = 0; desc_idx < descriptor_count; ++desc_idx) {
+        if (out.size() >= max_entries) {
+            if (truncated)
+                *truncated = true;
+            break;
+        }
+        if (modules_detail_deadline_expired(deadline)) {
+            if (truncated)
+                *truncated = true;
+            break;
+        }
+        const std::uint64_t desc_rva = static_cast<std::uint64_t>(pe.import_dir_rva) + static_cast<std::uint64_t>(desc_idx) * 20u;
+        std::uint8_t desc_buf[20] = {};
+        if (!image_read_bytes(image, desc_rva, desc_buf, sizeof(desc_buf)))
+            break;
+        std::uint32_t ilt_rva = 0;
+        std::uint32_t name_rva = 0;
+        std::uint32_t iat_rva = 0;
+        std::memcpy(&ilt_rva, desc_buf + 0, 4);
+        std::memcpy(&name_rva, desc_buf + 12, 4);
+        std::memcpy(&iat_rva, desc_buf + 16, 4);
+        if (ilt_rva == 0 && iat_rva == 0)
+            break;
+        std::string mod_name;
+        if (name_rva != 0)
+            image_read_c_string(image, name_rva, 256, mod_name);
+        const std::uint32_t lookup_rva = ilt_rva != 0 ? ilt_rva : iat_rva;
+        const std::uint32_t stride = pe.is_64bit ? 8u : 4u;
+        for (std::uint32_t thunk_idx = 0; thunk_idx < 0x10000; ++thunk_idx) {
+            if (out.size() >= max_entries) {
+                if (truncated)
+                    *truncated = true;
+                break;
+            }
+            if (modules_detail_deadline_expired(deadline)) {
+                if (truncated)
+                    *truncated = true;
+                break;
+            }
+            const std::uint64_t thunk_rva = static_cast<std::uint64_t>(lookup_rva) + static_cast<std::uint64_t>(thunk_idx) * stride;
+            std::uint64_t thunk_val = 0;
+            if (pe.is_64bit) {
+                if (!image_read_value(image, thunk_rva, thunk_val))
+                    break;
+            } else {
+                std::uint32_t thunk32 = 0;
+                if (!image_read_value(image, thunk_rva, thunk32))
+                    break;
+                thunk_val = thunk32;
+            }
+            if (thunk_val == 0)
+                break;
+
+            pe_parser::import_entry_t entry;
+            entry.module_name = mod_name;
+            entry.iat_address = module_base + iat_rva + static_cast<std::uint64_t>(thunk_idx) * stride;
+            const std::uint64_t iat_entry_rva = static_cast<std::uint64_t>(iat_rva) + static_cast<std::uint64_t>(thunk_idx) * stride;
+            if (pe.is_64bit) {
+                image_read_value(image, iat_entry_rva, entry.bound_address);
+            } else {
+                std::uint32_t bound32 = 0;
+                if (image_read_value(image, iat_entry_rva, bound32))
+                    entry.bound_address = bound32;
+            }
+            const bool is_ordinal = pe.is_64bit
+                ? (thunk_val & 0x8000000000000000ULL) != 0
+                : (thunk_val & 0x80000000ULL) != 0;
+            if (is_ordinal) {
+                entry.ordinal = static_cast<std::uint16_t>(thunk_val & 0xFFFFu);
+                char ord_buf[32];
+                std::snprintf(ord_buf, sizeof(ord_buf), "Ordinal#%u", entry.ordinal);
+                entry.function_name = ord_buf;
+            } else {
+                const std::uint32_t hint_name_rva = static_cast<std::uint32_t>(thunk_val & 0x7FFFFFFFULL);
+                image_read_value(image, hint_name_rva, entry.hint);
+                image_read_c_string(image, static_cast<std::uint64_t>(hint_name_rva) + 2u, 512, entry.function_name);
+            }
+            out.push_back(std::move(entry));
+        }
+    }
+    return true;
+}
+
 static bool parse_exports_for_modules_detail(std::uint64_t module_base,
                                              const pe_parser::pe_info_t& pe,
                                              std::vector<pe_parser::export_entry_t>& out,
@@ -3465,17 +3856,49 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                     static_cast<unsigned long long>(m.base),
                     static_cast<unsigned long long>(m.size),
                     focused_single ? 1 : 0,
-                    focused_single ? "imports_first" : "exports_first",
+                    "exports_first",
                     deadline_remaining_ms(deadline),
                     elapsed_ms());
                 pe_parser::pe_info_t pe;
+                std::vector<std::uint8_t> module_image;
+                bool module_image_ok = false;
+                long long module_image_ms = 0;
+                std::string module_image_status = "not_attempted";
+                std::string pe_source = "remote_reader";
                 const auto pe_start = std::chrono::steady_clock::now();
                 diag::log_tagged_fmt("dbg_tools",
-                    "dbg_get_modules_detail: pe_parse_begin name=%s base=0x%llX remaining_ms=%lld",
+                    "dbg_get_modules_detail: pe_parse_begin name=%s base=0x%llX remaining_ms=%lld focused=%d",
                     m.name.c_str(),
                     static_cast<unsigned long long>(m.base),
-                    deadline_remaining_ms(deadline));
-                const bool pe_ok = pe_parser::parse(m.base, pe, false);
+                    deadline_remaining_ms(deadline),
+                    focused_single ? 1 : 0);
+                bool pe_ok = false;
+                if (focused_single) {
+                    const auto image_start = std::chrono::steady_clock::now();
+                    module_image_ok = read_module_image_for_modules_detail(m, module_image, module_image_status);
+                    module_image_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - image_start).count();
+                    if (module_image_ok && parse_pe_from_module_image(m.base, module_image, pe)) {
+                        pe_ok = true;
+                        pe_source = "local_mapped_image";
+                    } else if (module_image_ok) {
+                        pe_source = "local_mapped_image_parse_failed";
+                    }
+                    diag::log_tagged_fmt("dbg_tools",
+                        "dbg_get_modules_detail: module_image_read name=%s ok=%d status=%s bytes=%zu requested=%llu elapsed_ms=%lld pe_local_ok=%d total_ms=%lld",
+                        m.name.c_str(),
+                        module_image_ok ? 1 : 0,
+                        module_image_status.c_str(),
+                        module_image.size(),
+                        static_cast<unsigned long long>(m.size),
+                        module_image_ms,
+                        pe_ok ? 1 : 0,
+                        elapsed_ms());
+                }
+                if (!pe_ok) {
+                    pe_ok = pe_parser::parse(m.base, pe, false);
+                    pe_source = pe_ok ? "remote_reader" : pe_source + "_remote_parse_failed";
+                }
                 const long long pe_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - pe_start).count();
                 long long export_ms = 0;
@@ -3492,11 +3915,23 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 bool imports_detail_complete = max_imports == 0;
                 std::size_t export_count_value = 0;
                 std::size_t import_count_value = 0;
+                const bool use_local_detail = pe_source == "local_mapped_image";
+                mj["pe_source"] = pe_source;
+                mj["detail_source"] = use_local_detail ? "local_mapped_image" : "remote_reader";
+                mj["module_image_fast_path"] = module_image_ok;
+                mj["module_image_status"] = module_image_status;
+                mj["module_image_bytes"] = module_image.size();
+                mj["module_image_read_ms"] = module_image_ms;
                 diag::log_tagged_fmt("dbg_tools",
-                    "dbg_get_modules_detail: pe_parse_done name=%s base=0x%llX ok=%d pe_ms=%lld remaining_ms=%lld sections=%zu export_rva=0x%X import_rva=0x%X",
+                    "dbg_get_modules_detail: pe_parse_done name=%s base=0x%llX ok=%d source=%s image_ok=%d image_status=%s image_bytes=%zu image_ms=%lld pe_ms=%lld remaining_ms=%lld sections=%zu export_rva=0x%X import_rva=0x%X",
                     m.name.c_str(),
                     static_cast<unsigned long long>(m.base),
                     pe_ok ? 1 : 0,
+                    pe_source.c_str(),
+                    module_image_ok ? 1 : 0,
+                    module_image_status.c_str(),
+                    module_image.size(),
+                    module_image_ms,
                     pe_ms,
                     deadline_remaining_ms(deadline),
                     pe.sections.size(),
@@ -3559,10 +3994,20 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                         diag::log_tagged_fmt("dbg_tools",
                             "dbg_get_modules_detail: export_phase_begin name=%s parser=%s max_exports=%d remaining_ms=%lld",
                             m.name.c_str(),
-                            focused_single ? "bounded" : "pe_parser",
+                            use_local_detail ? "local_mapped_image" : (focused_single ? "bounded" : "pe_parser"),
                             max_exports,
                             deadline_remaining_ms(deadline));
-                        if (focused_single) {
+                        if (use_local_detail) {
+                            exports_parse_ok = parse_exports_for_modules_detail_from_image(
+                                m.base,
+                                pe,
+                                module_image,
+                                exports,
+                                static_cast<std::size_t>(max_exports),
+                                &deadline,
+                                &exports_truncated,
+                                &export_phase_deadline);
+                        } else if (focused_single) {
                             exports_parse_ok = parse_exports_for_modules_detail(
                                 m.base,
                                 pe,
@@ -3666,17 +4111,29 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                         std::vector<pe_parser::import_entry_t> imports;
                         const auto import_start = std::chrono::steady_clock::now();
                         diag::log_tagged_fmt("dbg_tools",
-                            "dbg_get_modules_detail: import_phase_begin name=%s max_imports=%d remaining_ms=%lld",
+                            "dbg_get_modules_detail: import_phase_begin name=%s parser=%s max_imports=%d remaining_ms=%lld",
                             m.name.c_str(),
+                            use_local_detail ? "local_mapped_image" : "pe_parser",
                             max_imports,
                             deadline_remaining_ms(deadline));
-                        imports_parse_ok = pe_parser::parse_imports(
-                            m.base,
-                            pe,
-                            imports,
-                            static_cast<std::size_t>(max_imports),
-                            &deadline,
-                            &imports_truncated);
+                        if (use_local_detail) {
+                            imports_parse_ok = parse_imports_for_modules_detail_from_image(
+                                m.base,
+                                pe,
+                                module_image,
+                                imports,
+                                static_cast<std::size_t>(max_imports),
+                                &deadline,
+                                &imports_truncated);
+                        } else {
+                            imports_parse_ok = pe_parser::parse_imports(
+                                m.base,
+                                pe,
+                                imports,
+                                static_cast<std::size_t>(max_imports),
+                                &deadline,
+                                &imports_truncated);
+                        }
                         import_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::steady_clock::now() - import_start).count();
                         imports_deadline = deadline_expired(deadline);
@@ -3723,13 +4180,8 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                             deadline_remaining_ms(deadline),
                             elapsed_ms());
                     };
-                    if (focused_single) {
-                        run_import_phase();
-                        run_export_phase();
-                    } else {
-                        run_export_phase();
-                        run_import_phase();
-                    }
+                    run_export_phase();
+                    run_import_phase();
                     mj["exports"] = std::move(exp_arr);
                     mj["imports"] = std::move(imp_arr);
                 } else {

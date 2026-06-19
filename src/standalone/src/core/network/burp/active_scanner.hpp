@@ -22,6 +22,8 @@ struct audit_config_t
     size_t                     per_module_request_cap = 64;
     int                        timeout_ms = 15000;
     bool                       follow_redirects = false;
+    bool                       max_concurrent_explicit = false;
+    bool                       request_throttle_explicit = false;
 };
 
 struct audit_status_t
@@ -45,6 +47,18 @@ struct audit_status_t
     size_t        queued_workers = 0;
     size_t        active_workers = 0;
     size_t        in_flight_requests = 0;
+    size_t        responses_received = 0;
+    size_t        no_response_count = 0;
+    size_t        transport_failures = 0;
+    std::string   last_transport_error;
+    uint32_t      transport_error_code = 0;
+    std::string   transport_error_class;
+    bool          transport_circuit_breaker_open = false;
+    size_t        transport_circuit_breaker_hits = 0;
+    size_t        transport_circuit_breaker_threshold = 0;
+    size_t        effective_max_concurrent = 0;
+    size_t        effective_throttle_ms = 0;
+    size_t        transport_backoff_ms = 0;
 };
 
 struct scanner_load_t

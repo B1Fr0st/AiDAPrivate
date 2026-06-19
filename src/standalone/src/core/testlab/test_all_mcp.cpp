@@ -5373,6 +5373,7 @@ namespace {
         long long elapsed_ms = 0;
         long long queue_delay_ms = 0;
         std::string worker_phase;
+        mcp_standalone::cancel_token_ptr_t cancel_token;
     };
 
     struct timed_out_invoke_record_t {
@@ -6496,6 +6497,7 @@ namespace {
     {
         timed_invoke_result_t out;
         const auto state = std::make_shared<async_invoke_state_t>();
+        state->cancel_token = mcp_standalone::make_call_cancel_token(false);
         const bool full_log = hf != INVALID_HANDLE_VALUE && tag != nullptr && *tag != '\0';
         auto fail_dispatch = [&](std::string message) {
             timed_invoke_result_t failed;
@@ -6520,6 +6522,7 @@ namespace {
                 static_cast<unsigned long>(GetCurrentThreadId()),
                 static_cast<unsigned long long>(queued_tick));
             if (!critical_work_queue::post([state, srv, tool_name, args, queued_at, queued_tick, seq, timeout_ms]() {
+                mcp_standalone::scoped_call_cancel_t cancel_scope(state->cancel_token);
                 auto t0 = std::chrono::steady_clock::now();
                 const DWORD worker_pid = GetCurrentProcessId();
                 const DWORD worker_tid = GetCurrentThreadId();
@@ -6640,6 +6643,7 @@ namespace {
                 out.elapsed_ms = timeout_ms;
                 out.queue_delay_ms = worker_started ? queue_delay_ms : timeout_ms;
                 out.worker_phase = worker_phase;
+                mcp_standalone::signal_call_cancel_token(state->cancel_token);
                 register_timed_out_invocation(seq, tool_name, timeout_ms, queued_tick, state);
                 lk.unlock();
                 if (full_log) {
@@ -8004,6 +8008,56 @@ namespace {
         return image;
     }
 
+    std::string test_coverage_bytes_hex(const std::vector<uint8_t>& bytes) {
+        std::ostringstream os;
+        os << std::uppercase << std::hex << std::setfill('0');
+        for (uint8_t b : bytes)
+            os << std::setw(2) << static_cast<unsigned>(b);
+        return os.str();
+    }
+
+    std::vector<uint8_t> test_coverage_protected_re_domains_11_15_dispatch_driver_image() {
+        std::vector<uint8_t> image(0x5000, 0);
+        IMAGE_DOS_HEADER dos{};
+        dos.e_magic = IMAGE_DOS_SIGNATURE;
+        dos.e_lfanew = 0x80;
+        std::memcpy(image.data(), &dos, sizeof(dos));
+        IMAGE_NT_HEADERS64 nt{};
+        nt.Signature = IMAGE_NT_SIGNATURE;
+        nt.FileHeader.Machine = IMAGE_FILE_MACHINE_AMD64;
+        nt.FileHeader.NumberOfSections = 1;
+        nt.FileHeader.SizeOfOptionalHeader = static_cast<WORD>(sizeof(IMAGE_OPTIONAL_HEADER64));
+        nt.FileHeader.Characteristics = IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_LARGE_ADDRESS_AWARE;
+        nt.OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+        nt.OptionalHeader.AddressOfEntryPoint = 0x1000;
+        nt.OptionalHeader.ImageBase = 0x180000000ULL;
+        nt.OptionalHeader.SectionAlignment = 0x1000;
+        nt.OptionalHeader.FileAlignment = 0x200;
+        nt.OptionalHeader.MajorSubsystemVersion = 6;
+        nt.OptionalHeader.SizeOfImage = 0x5000;
+        nt.OptionalHeader.SizeOfHeaders = 0x400;
+        nt.OptionalHeader.Subsystem = IMAGE_SUBSYSTEM_NATIVE;
+        nt.OptionalHeader.NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
+        std::memcpy(image.data() + dos.e_lfanew, &nt, sizeof(nt));
+        IMAGE_SECTION_HEADER sh{};
+        std::memcpy(sh.Name, ".text", 5);
+        sh.Misc.VirtualSize = 0x4000;
+        sh.VirtualAddress = 0x1000;
+        sh.SizeOfRawData = 0x4000;
+        sh.PointerToRawData = 0x1000;
+        sh.Characteristics = IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ;
+        std::memcpy(image.data() + dos.e_lfanew + sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER) + sizeof(IMAGE_OPTIONAL_HEADER64), &sh, sizeof(sh));
+        std::fill(image.begin() + 0x1000, image.end(), 0x90);
+        const uint8_t entry[] = {
+            0x48, 0xB8, 0x00, 0x20, 0x00, 0x80, 0x01, 0x00, 0x00, 0x00,
+            0x48, 0x89, 0x81, 0xE0, 0x00, 0x00, 0x00,
+            0xC3
+        };
+        std::memcpy(image.data() + 0x1000, entry, sizeof(entry));
+        image[0x2000] = 0xC3;
+        return image;
+    }
+
     void test_coverage_protected_re_domains_11_15_driver_tools(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "mcp.coverage_protected_re.drv";
         test_coverage_protected_re_domains_11_15_expect(hf, tag, "drv_enumerate_ioctls",
@@ -8095,8 +8149,9 @@ namespace {
             },
             passed, failed);
 
+        const auto dispatch_fixture = test_coverage_protected_re_domains_11_15_dispatch_driver_image();
         test_coverage_protected_re_domains_11_15_expect(hf, tag, "drv_find_dispatch_table",
-            mcp_standalone::json{{"auto_select_wdm_driver", true}, {"max_auto_modules", 80}, {"timeout_ms", 5000}, {"max_candidates", 64}, {"max_entry_bytes", 32768}, {"max_entry_instructions", 4096}},
+            mcp_standalone::json{{"pe_image_hex", test_coverage_bytes_hex(dispatch_fixture)}, {"module_base", "0x180000000"}, {"driver_name", "aida_static_dispatch_fixture.sys"}, {"timeout_ms", 2000}, {"max_candidates", 16}, {"max_entry_bytes", 4096}, {"max_entry_instructions", 128}},
             true, true,
             [](const invoke_result_t& ir, std::string& reason) {
                 return test_coverage_protected_re_domains_11_15_dispatch_table_structural(ir, reason);
@@ -8292,6 +8347,10 @@ namespace {
         trace_args["max_steps"] = 8;
         trace_args["max_returned_steps"] = 8;
         trace_args["timeout_us"] = 250000;
+        trace_args["snapshot_base"] = hex_u64(vm_addr);
+        trace_args["snapshot_size"] = k_vm_fixture_size;
+        trace_args["allow_neutral_thread_context"] = true;
+        trace_args["max_invalid_page_maps"] = 4;
         test_coverage_protected_re_domains_11_15_expect(hf, tag, "vm_trace_bytecode",
             trace_args,
             true, true,
@@ -18557,6 +18616,7 @@ void test_tool_scanner_struct_manage_define(HANDLE hf, std::atomic<int>& passed,
             "parse_pdb_failed",
             "pdb load failed",
             "load failed",
+            "timed out after",
             "rejected"
         };
         for (const char* marker : terminal_markers) {
@@ -18638,7 +18698,7 @@ void test_tool_scanner_struct_manage_define(HANDLE hf, std::atomic<int>& passed,
             status_text.c_str(),
             file_evidence.c_str());
         symbol_store::load_pdb_from_explicit_path("target_protocol.exe", 0x140000000ull, 0x100000ull, pdb_path.string());
-        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(90);
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(symbol_store::k_explicit_pdb_load_timeout_ms + 10000);
         auto last_progress_log = start;
         while (std::chrono::steady_clock::now() < deadline) {
             const auto now = std::chrono::steady_clock::now();
@@ -19900,7 +19960,33 @@ void test_tool_api_monitor_start(HANDLE hf, std::atomic<int>& passed, std::atomi
     }
 
     void test_tool_network_get_socket_handles(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.network_get_socket_handles", get_server(), "network_get_socket_handles", {}, passed, failed, skipped);
+        mcp_standalone::json args;
+        args["pid"] = 0;
+        mcp_standalone::tool_result_t result;
+        auto status = test_tool_call(hf, "mcp.network_get_socket_handles", get_server(), "network_get_socket_handles", args, passed, failed, skipped, false, &result);
+        if (status == mcp_tool_call_status_t::passed) {
+            const size_t entries = result.data.is_array() ? result.data.size() : 0;
+            bool has_source = false;
+            if (result.data.is_array()) {
+                for (const auto& entry : result.data) {
+                    std::string source;
+                    if (payload_string_field(entry, "source", source) && !source.empty()) {
+                        has_source = true;
+                        break;
+                    }
+                }
+            }
+            if (entries == 0 || !has_source) {
+                log_msg(hf, "mcp.network_get_socket_handles", "FAIL -- pid=0 socket enumeration returned insufficient payload entries=%zu has_source=%d data=%s",
+                    entries,
+                    has_source ? 1 : 0,
+                    compact_json(result.data, 1200).c_str());
+                if (passed.load(std::memory_order_acquire) > 0)
+                    passed.fetch_sub(1, std::memory_order_acq_rel);
+                failed.fetch_add(1, std::memory_order_acq_rel);
+                convert_tool_pass_to_fail("network_get_socket_handles");
+            }
+        }
     }
 
     void test_tool_network_dump_tcpip(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -20331,7 +20417,34 @@ void test_tool_api_monitor_start(HANDLE hf, std::atomic<int>& passed, std::atomi
         Sleep(500);
         mcp_standalone::json args;
         args["pid"] = GetCurrentProcessId();
-        test_tool_action_call(hf, "mcp.network_bandwidth_manage.per_process", "network_bandwidth_manage", "per_process", args, passed, failed, skipped);
+        mcp_standalone::tool_result_t result;
+        auto status = test_tool_action_call(hf, "mcp.network_bandwidth_manage.per_process", "network_bandwidth_manage", "per_process", args, passed, failed, skipped, false, &result);
+        if (status == mcp_tool_call_status_t::passed) {
+            const size_t rows = result.data.is_array() ? result.data.size() : 0;
+            bool has_current_pid = false;
+            bool has_source = false;
+            if (result.data.is_array()) {
+                for (const auto& entry : result.data) {
+                    uint64_t pid = 0;
+                    std::string source;
+                    if (payload_u64_field(entry, "pid", pid) && pid == GetCurrentProcessId())
+                        has_current_pid = true;
+                    if (payload_string_field(entry, "source", source) && !source.empty())
+                        has_source = true;
+                }
+            }
+            if (rows == 0 || !has_current_pid || !has_source) {
+                log_msg(hf, "mcp.network_bandwidth_manage.per_process", "FAIL -- per-process bandwidth payload missing fixture evidence rows=%zu has_current_pid=%d has_source=%d data=%s",
+                    rows,
+                    has_current_pid ? 1 : 0,
+                    has_source ? 1 : 0,
+                    compact_json(result.data, 1200).c_str());
+                if (passed.load(std::memory_order_acquire) > 0)
+                    passed.fetch_sub(1, std::memory_order_acq_rel);
+                failed.fetch_add(1, std::memory_order_acq_rel);
+                convert_tool_pass_to_fail("network_bandwidth_manage");
+            }
+        }
         mcp_standalone::json stop_args;
         stop_args["operation"] = "stop";
         auto stopped = invoke_tool_action_bounded(get_server(), "network_bandwidth_manage", "monitor", stop_args, tool_timeout_ms("network_bandwidth_manage"));
@@ -21031,6 +21144,24 @@ void test_tool_api_monitor_start(HANDLE hf, std::atomic<int>& passed, std::atomi
             return;
         }
         pre_encrypt_hook::clear_captures();
+
+        DWORD snapshot_error = ERROR_SUCCESS;
+        auto tree = pre_encrypt_hook::enumerate_process_tree(GetCurrentProcessId(), snapshot_error);
+        bool has_self = false;
+        for (const auto& entry : tree) {
+            if (entry.pid == GetCurrentProcessId()) {
+                has_self = true;
+                break;
+            }
+        }
+        if (snapshot_error != ERROR_SUCCESS || !has_self) {
+            log_msg(hf, "mcp.network_pre_encrypt_hook", "FAIL -- process tree guard failed snapshot_error=%lu tree_count=%zu has_self=%d",
+                static_cast<unsigned long>(snapshot_error),
+                tree.size(),
+                has_self ? 1 : 0);
+            failed.fetch_add(1);
+            return;
+        }
 
         mcp_standalone::json args;
         args["operation"] = "status";
@@ -21857,14 +21988,85 @@ void test_tool_api_monitor_start(HANDLE hf, std::atomic<int>& passed, std::atomi
         failed.fetch_add(1);
     }
 
+    bool poll_burp_scanner_audit_evidence(HANDLE hf, const char* tag, uint64_t audit_id, DWORD timeout_ms, mcp_standalone::json* final_data = nullptr) {
+        const uint64_t start = GetTickCount64();
+        const uint64_t deadline = start + timeout_ms;
+        int poll = 0;
+        while (GetTickCount64() < deadline) {
+            mcp_standalone::json status_args;
+            status_args["audit_id"] = audit_id;
+            auto timed = invoke_tool_action_bounded(get_server(), "burp_scanner_manage", "audit_status", status_args, 1500, hf, tag, poll + 1);
+            const auto& ir = timed.result;
+            bool running = true;
+            bool transport_degraded = false;
+            uint64_t completed = 0;
+            uint64_t total = 0;
+            uint64_t responses = 0;
+            uint64_t issues = 0;
+            uint64_t no_response = 0;
+            uint64_t transport_failures = 0;
+            if (!timed.timed_out && ir.found && !ir.threw && ir.success) {
+                payload_bool_field(ir.data, "running", running);
+                payload_bool_field(ir.data, "transport_degraded", transport_degraded);
+                payload_u64_field(ir.data, "completed_probes", completed);
+                payload_u64_field(ir.data, "total_probes", total);
+                payload_u64_field(ir.data, "responses_received", responses);
+                payload_u64_field(ir.data, "issues_found", issues);
+                payload_u64_field(ir.data, "no_response_count", no_response);
+                payload_u64_field(ir.data, "transport_failures", transport_failures);
+                if (final_data)
+                    *final_data = ir.data;
+            }
+            const bool evidence = responses > 0 || issues > 0;
+            const bool completed_any = completed > 0 || (!running && total > 0);
+            const bool fatal_no_response = !running && completed_any && !evidence && (transport_degraded || no_response > 0 || transport_failures > 0);
+            log_msg(hf, tag, "SCANNER-POLL -- audit_id=%llu poll=%d timed_out=%d found=%d threw=%d success=%d running=%d completed=%llu total=%llu responses=%llu issues=%llu no_response=%llu transport_failures=%llu transport_degraded=%d evidence=%d fatal_no_response=%d elapsed_ms=%llu data=%s",
+                static_cast<unsigned long long>(audit_id),
+                poll,
+                timed.timed_out ? 1 : 0,
+                ir.found ? 1 : 0,
+                ir.threw ? 1 : 0,
+                ir.success ? 1 : 0,
+                running ? 1 : 0,
+                static_cast<unsigned long long>(completed),
+                static_cast<unsigned long long>(total),
+                static_cast<unsigned long long>(responses),
+                static_cast<unsigned long long>(issues),
+                static_cast<unsigned long long>(no_response),
+                static_cast<unsigned long long>(transport_failures),
+                transport_degraded ? 1 : 0,
+                evidence ? 1 : 0,
+                fatal_no_response ? 1 : 0,
+                static_cast<unsigned long long>(GetTickCount64() - start),
+                compact_json(ir.data, 900).c_str());
+            if (evidence)
+                return true;
+            if (fatal_no_response)
+                return false;
+            if (!running && completed_any)
+                return true;
+            ++poll;
+            Sleep(150);
+        }
+        return false;
+    }
+
 void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const std::string url = burp_fixture_url(hf, "mcp.burp_scanner_manage.start_audit", "/?q=test");
-        mcp_standalone::json args; args["url"] = url; args["raw_request"] = "GET /?q=test HTTP/1.1\r\nHost: 127.0.0.1\r\nUser-Agent: AiDA-Scanner-Fixture\r\nConnection: close\r\n\r\n"; args["modules"] = mcp_standalone::json::array({"host-header"}); args["per_module_cap"] = 1; args["timeout_ms"] = 3000; args["max_concurrent"] = 1;
+        const uint16_t fixture_port = g_burp_http_fixture ? g_burp_http_fixture->port : 0;
+        const std::string host_header = fixture_port ? ("127.0.0.1:" + std::to_string(static_cast<unsigned>(fixture_port))) : std::string("127.0.0.1");
+        mcp_standalone::json args; args["url"] = url; args["raw_request"] = std::string("GET /?q=test HTTP/1.1\r\nHost: ") + host_header + "\r\nUser-Agent: AiDA-Scanner-Fixture\r\nConnection: close\r\n\r\n"; args["modules"] = mcp_standalone::json::array({"host-header"}); args["per_module_cap"] = 1; args["timeout_ms"] = 3000; args["max_concurrent"] = 1;
         mcp_standalone::tool_result_t result;
         auto status = test_tool_action_call(hf, "mcp.burp_scanner_manage.start_audit", "burp_scanner_manage", "start_audit", args, passed, failed, skipped, true, &result);
         if (status == mcp_tool_call_status_t::passed) {
             json_u64_field(result.data, "audit_id", g_burp_scanner_audit_id);
-            Sleep(1000);
+            mcp_standalone::json final_status;
+            if (g_burp_scanner_audit_id == 0 || !poll_burp_scanner_audit_evidence(hf, "mcp.burp_scanner_manage.start_audit", g_burp_scanner_audit_id, 6000, &final_status)) {
+                log_msg(hf, "mcp.burp_scanner_manage.start_audit", "FAIL -- scanner audit produced no bounded response/issue/completion evidence audit_id=%llu final=%s",
+                    static_cast<unsigned long long>(g_burp_scanner_audit_id),
+                    compact_json(final_status, 1200).c_str());
+                convert_last_pass_to_fixture_failure("burp_scanner_manage", passed, failed);
+            }
         }
     }
     void test_tool_burp_scanner_manage_audit_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -23379,6 +23581,7 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
         const std::string page_suffix = std::to_string(static_cast<unsigned long long>(GetTickCount64()));
         const std::string page_a = "aida_testlab_page_a_" + page_suffix;
         const std::string page_b = "aida_testlab_page_b_" + page_suffix;
+        const std::string fixture_page = "aida_testlab_fixture_" + page_suffix;
         const std::string network_marker = "AIDA_CAMOUFOX_NET_" + page_suffix;
         const std::string network_retry_marker = "AIDA_CAMOUFOX_NET_RETRY_" + page_suffix;
         const std::string cookie_name = "aida_cookie_" + page_suffix;
@@ -23560,7 +23763,39 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
             bloxflip_diag_result.text.size(),
             compact_json(bloxflip_diag_result.data, 2000).c_str());
 
+        mcp_standalone::json fixture_page_args;
+        fixture_page_args["page_id"] = fixture_page;
+        fixture_page_args["make_active"] = true;
+        test_tool_action_call(hf, "mcp.camoufox.browser_lifecycle.new.fixture_after_external", "browser_lifecycle", "new", fixture_page_args, passed, failed, skipped);
+
+        nav_args["page_id"] = fixture_page;
+        nav_args["url"] = fixture_url;
+        test_tool_action_call(hf, "mcp.camoufox.browser_navigation.navigate.fixture_after_external", "browser_navigation", "navigate", nav_args, passed, failed, skipped);
+
+        mcp_standalone::json fixture_url_assert_args;
+        fixture_url_assert_args["page_id"] = fixture_page;
+        fixture_url_assert_args["expression"] = "(()=>({href:String(location.href||''),fixture:String(location.href||'').indexOf('AIDA_CAMOUFOX_DYNAMIC')>=0,title:document.title}))()";
+        fixture_url_assert_args["await_promise"] = true;
+        mcp_standalone::tool_result_t fixture_url_assert_result;
+        auto fixture_url_assert_status = test_tool_action_call(hf, "mcp.camoufox.browser_interaction.evaluate.fixture_url_assert", "browser_interaction", "evaluate",
+            fixture_url_assert_args, passed, failed, skipped, false, &fixture_url_assert_result);
+        const mcp_standalone::json* fixture_url_value = camoufox_eval_value(fixture_url_assert_result.data);
+        bool fixture_url_ok = false;
+        if (fixture_url_value && fixture_url_value->is_object())
+            payload_bool_field(*fixture_url_value, "fixture", fixture_url_ok);
+        if (fixture_url_assert_status != mcp_tool_call_status_t::passed || !fixture_url_ok) {
+            log_msg(hf, tag, "FAIL -- fixture page URL assertion failed after external diagnose status=%s page_id=%s data=%s",
+                mcp_status_classification_name(fixture_url_assert_status),
+                fixture_page.c_str(),
+                compact_json(fixture_url_assert_result.data, 1200).c_str());
+            record_fixture_failed_tool("browser_navigation", failed);
+        }
+
+        intercept_args["page_id"] = fixture_page;
+        test_tool_action_call(hf, "mcp.camoufox.browser_network.intercept.fixture_after_external", "browser_network", "intercept", intercept_args, passed, failed, skipped);
+
         mcp_standalone::json hook_args;
+        hook_args["page_id"] = fixture_page;
         hook_args["function_path"] = "window.aidaHookTarget";
         hook_args["mode"] = "trace";
         hook_args["log_args"] = true;
@@ -23569,6 +23804,7 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
         test_tool_action_call(hf, "mcp.camoufox.browser_hooks.hook", "browser_hooks", "hook", hook_args, passed, failed, skipped);
 
         mcp_standalone::json preset_args;
+        preset_args["page_id"] = fixture_page;
         preset_args["preset"] = "fetch";
         preset_args["persistent"] = false;
         test_tool_action_call(hf, "mcp.camoufox.browser_hooks.preset", "browser_hooks", "preset", preset_args, passed, failed, skipped);
@@ -23578,12 +23814,14 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
             preset_args, passed, failed, skipped, false, &preset_before_marker_result);
 
         mcp_standalone::json capture_clear_before_marker;
+        capture_clear_before_marker["page_id"] = fixture_page;
         capture_clear_before_marker["payload"] = mcp_standalone::json::object({{"action", "clear"}});
         mcp_standalone::tool_result_t capture_clear_result;
         auto capture_clear_status = test_tool_action_call(hf, "mcp.camoufox.browser_network.capture_clear.before_marker", "browser_network", "capture",
             capture_clear_before_marker, passed, failed, skipped, false, &capture_clear_result);
 
         mcp_standalone::json capture_restart_before_marker;
+        capture_restart_before_marker["page_id"] = fixture_page;
         capture_restart_before_marker["payload"] = mcp_standalone::json::object({
             {"action", "start"},
             {"url_pattern", "*"},
@@ -23601,7 +23839,10 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
             compact_json(capture_restart_result.data, 700).c_str());
 
         mcp_standalone::json eval_args;
-        eval_args["expression"] = "(async()=>{console.log('AIDA_CAMOUFOX_CONSOLE');localStorage.setItem('aida_storage','ok');document.cookie='" + cookie_name + "=ok; path=/';let fetch_status=0;let fetch_url='';try{const r=await fetch('/aida-fixture.js?capture=" + network_marker + "',{cache:'no-store'});fetch_status=r.status;fetch_url=r.url;await r.text();}catch(e){fetch_status=-1;}const hook_value=window.aidaHookTarget?window.aidaHookTarget('x'):'missing';return {hook_value,fetch_status,fetch_url,network_marker:'" + network_marker + "',cookie_name:'" + cookie_name + "',cookie_present:document.cookie.indexOf('" + cookie_name + "=')>=0,storage:localStorage.getItem('aida_storage')};})()";
+        eval_args["page_id"] = fixture_page;
+        const std::string network_fetch_path = "/aida-fixture.js?capture=" + network_marker;
+        const std::string network_fetch_url = burp_fixture_url(hf, tag, network_fetch_path.c_str());
+        eval_args["expression"] = "(async()=>{console.log('AIDA_CAMOUFOX_CONSOLE');localStorage.setItem('aida_storage','ok');document.cookie='" + cookie_name + "=ok; path=/';let fetch_status=0;let fetch_url='';try{const r=await fetch('" + network_fetch_url + "',{cache:'no-store'});fetch_status=r.status;fetch_url=r.url;await r.text();}catch(e){fetch_status=-1;}const hook_value=window.aidaHookTarget?window.aidaHookTarget('x'):'missing';return {hook_value,fetch_status,fetch_url,network_marker:'" + network_marker + "',cookie_name:'" + cookie_name + "',cookie_present:document.cookie.indexOf('" + cookie_name + "=')>=0,storage:localStorage.getItem('aida_storage'),page_url:String(location.href||'')};})()";
         eval_args["await_promise"] = true;
         mcp_standalone::tool_result_t eval_result;
         auto eval_status = test_tool_action_call(hf, "mcp.camoufox.browser_interaction.evaluate", "browser_interaction", "evaluate",
@@ -23647,6 +23888,7 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
         };
 
         mcp_standalone::json list_req_args;
+        list_req_args["page_id"] = fixture_page;
         list_req_args["url_contains_domain"] = "127.0.0.1";
         list_req_args["url_filter"] = network_marker;
         mcp_standalone::tool_result_t list_req_result;
@@ -23672,11 +23914,13 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
             auto retry_preset_status = test_tool_action_call(hf, "mcp.camoufox.browser_hooks.preset.retry_marker", "browser_hooks", "preset",
                 preset_args, passed, failed, skipped, false, &retry_preset_result);
             mcp_standalone::json retry_capture_clear;
+            retry_capture_clear["page_id"] = fixture_page;
             retry_capture_clear["payload"] = mcp_standalone::json::object({{"action", "clear"}});
             mcp_standalone::tool_result_t retry_clear_result;
             auto retry_clear_status = test_tool_action_call(hf, "mcp.camoufox.browser_network.capture_clear.retry_marker", "browser_network", "capture",
                 retry_capture_clear, passed, failed, skipped, false, &retry_clear_result);
             mcp_standalone::json retry_capture_restart;
+            retry_capture_restart["page_id"] = fixture_page;
             retry_capture_restart["payload"] = mcp_standalone::json::object({
                 {"action", "start"},
                 {"url_pattern", "*"},
@@ -23693,7 +23937,10 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
                 compact_json(retry_clear_result.data, 700).c_str(),
                 compact_json(retry_restart_result.data, 700).c_str());
             mcp_standalone::json recapture_eval_args;
-            recapture_eval_args["expression"] = "(async()=>{const r=await fetch('/aida-fixture.js?capture=" + network_retry_marker + "',{cache:'no-store'});await r.text();return {status:r.status,url:r.url,network_marker:'" + network_retry_marker + "'};})()";
+            recapture_eval_args["page_id"] = fixture_page;
+            const std::string retry_fetch_path = "/aida-fixture.js?capture=" + network_retry_marker;
+            const std::string retry_fetch_target_url = burp_fixture_url(hf, tag, retry_fetch_path.c_str());
+            recapture_eval_args["expression"] = "(async()=>{const r=await fetch('" + retry_fetch_target_url + "',{cache:'no-store'});await r.text();return {status:r.status,url:r.url,network_marker:'" + network_retry_marker + "',page_url:String(location.href||'')};})()";
             recapture_eval_args["await_promise"] = true;
             mcp_standalone::tool_result_t retry_eval_result;
             auto retry_eval_status = test_tool_action_call(hf, "mcp.camoufox.browser_interaction.evaluate.network_capture_retry", "browser_interaction", "evaluate",
@@ -23737,7 +23984,7 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
             mcp_standalone::json req_detail_args;
             req_detail_args["request_id"] = request_id;
             req_detail_args["marker"] = active_marker;
-            req_detail_args["page_id"] = page_a;
+            req_detail_args["page_id"] = fixture_page;
             req_detail_args["include_body"] = true;
             req_detail_args["include_headers"] = true;
             req_detail_args["max_body_size"] = 4096;
@@ -23745,7 +23992,7 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
 
             mcp_standalone::json req_init_args;
             req_init_args["request_id"] = request_id;
-            req_init_args["page_id"] = page_a;
+            req_init_args["page_id"] = fixture_page;
             req_init_args["marker"] = active_marker;
             req_init_args["url_filter"] = active_marker;
             mcp_standalone::tool_result_t req_init_result;
@@ -23773,34 +24020,44 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
         }
 
         mcp_standalone::json click_args;
+        click_args["page_id"] = fixture_page;
         click_args["selector"] = "body";
         test_tool_action_call(hf, "mcp.camoufox.click", "browser_interaction", "click", click_args, passed, failed, skipped);
 
         mcp_standalone::json type_args;
+        type_args["page_id"] = fixture_page;
         type_args["selector"] = "#aida-input";
         type_args["text"] = "camoufox direct test";
         type_args["delay"] = 1;
         test_tool_action_call(hf, "mcp.camoufox.browser_interaction.type", "browser_interaction", "type", type_args, passed, failed, skipped);
 
         mcp_standalone::json wait_args;
+        wait_args["page_id"] = fixture_page;
         wait_args["selector"] = "#aida-input";
         wait_args["timeout"] = 5000;
         test_tool_action_call(hf, "mcp.camoufox.browser_navigation.wait", "browser_navigation", "wait", wait_args, passed, failed, skipped);
 
-        test_tool_action_call(hf, "mcp.camoufox.browser_inspect.info", "browser_inspect", "info", {}, passed, failed, skipped);
+        mcp_standalone::json info_args;
+        info_args["page_id"] = fixture_page;
+        test_tool_action_call(hf, "mcp.camoufox.browser_inspect.info", "browser_inspect", "info", info_args, passed, failed, skipped);
 
         test_tool_action_call(hf, "mcp.camoufox.browser_navigation.navigate.before_reload", "browser_navigation", "navigate", nav_args, passed, failed, skipped);
 
         mcp_standalone::json reload_args;
+        reload_args["page_id"] = fixture_page;
         reload_args["wait_until"] = "load";
         test_tool_action_call(hf, "mcp.camoufox.browser_navigation.reload", "browser_navigation", "reload", reload_args, passed, failed, skipped);
 
         mcp_standalone::json screenshot_args;
+        screenshot_args["page_id"] = fixture_page;
         screenshot_args["full_page"] = false;
         test_tool_action_call(hf, "mcp.camoufox.browser_inspect.screenshot", "browser_inspect", "screenshot", screenshot_args, passed, failed, skipped);
-        test_tool_action_call(hf, "mcp.camoufox.browser_inspect.snapshot", "browser_inspect", "snapshot", {}, passed, failed, skipped);
+        mcp_standalone::json snapshot_args;
+        snapshot_args["page_id"] = fixture_page;
+        test_tool_action_call(hf, "mcp.camoufox.browser_inspect.snapshot", "browser_inspect", "snapshot", snapshot_args, passed, failed, skipped);
 
         mcp_standalone::json console_args;
+        console_args["page_id"] = fixture_page;
         console_args["keyword"] = "AIDA_CAMOUFOX";
         console_args["clear"] = false;
         test_tool_call(hf, "mcp.camoufox.get_console_logs", get_server(), "get_console_logs", console_args, passed, failed, skipped);
@@ -23816,6 +24073,7 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
         test_tool_call(hf, "mcp.camoufox.search_code", get_server(), "search_code", search_args, passed, failed, skipped);
 
         mcp_standalone::json cookies_args;
+        cookies_args["page_id"] = fixture_page;
         cookies_args["domain"] = "127.0.0.1";
         cookies_args["payload"] = mcp_standalone::json::object({{"action", "get"}});
         mcp_standalone::tool_result_t cookies_result;
@@ -23828,6 +24086,7 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
         }
 
         mcp_standalone::json cookie_refresh_eval_args;
+        cookie_refresh_eval_args["page_id"] = fixture_page;
         cookie_refresh_eval_args["expression"] = "(()=>{document.cookie='" + cookie_name + "=refresh; path=/';return {cookie_name:'" + cookie_name + "',cookie_present:document.cookie.indexOf('" + cookie_name + "=')>=0,total_cookie_chars:document.cookie.length};})()";
         cookie_refresh_eval_args["await_promise"] = true;
         test_tool_action_call(hf, "mcp.camoufox.browser_interaction.evaluate.cookie_refresh", "browser_interaction", "evaluate", cookie_refresh_eval_args, passed, failed, skipped);
@@ -23850,6 +24109,7 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
         }
 
         mcp_standalone::json storage_args;
+        storage_args["page_id"] = fixture_page;
         storage_args["storage_type"] = "local";
         test_tool_action_call(hf, "mcp.camoufox.browser_state.storage", "browser_state", "storage", storage_args, passed, failed, skipped);
 
@@ -24089,10 +24349,12 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
         }
 
         mcp_standalone::json capture_stop;
+        capture_stop["page_id"] = fixture_page;
         capture_stop["payload"] = mcp_standalone::json::object({{"action", "stop"}});
         test_tool_action_call(hf, "mcp.camoufox.browser_network.capture_stop", "browser_network", "capture", capture_stop, passed, failed, skipped);
 
         mcp_standalone::json remove_hooks_args;
+        remove_hooks_args["page_id"] = fixture_page;
         remove_hooks_args["keep_persistent"] = false;
         test_tool_action_call(hf, "mcp.camoufox.browser_hooks.remove", "browser_hooks", "remove", remove_hooks_args, passed, failed, skipped);
 
@@ -25011,9 +25273,10 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
             mcp_standalone::json args;
             args["process_id"] = g_mcp_target_pid != 0 ? g_mcp_target_pid : driver_bridge::attached_pid();
             args["max_results"] = 4;
-            args["max_modules"] = 4;
-            args["max_scan_bytes"] = 262144;
-            args["timeout_ms"] = 3500;
+            args["max_modules"] = 1;
+            args["max_scan_bytes"] = 1048576;
+            args["timeout_ms"] = 2200;
+            args["module_name"] = "AiDA_TestTarget.exe";
             test_coverage_net_thread_domains_9_10_16_case(hf, tag, find_tool, "sendrecv_bounded_scan_positive_evidence", args, 3500,
                 [hf, tag](const invoke_result_t& ir, std::string& reason) {
                     bool dependency_unavailable = true;

@@ -9,6 +9,7 @@
 #include <httplib.h>
 
 #include "crawler.hpp"
+#include "audit_http.hpp"
 #include "scope.hpp"
 #include "burp_events.hpp"
 #include "site_map.hpp"
@@ -332,6 +333,16 @@ bool path_disallowed(const std::vector<std::string>& disallows, const std::strin
     return false;
 }
 
+std::string header_safe(std::string s)
+{
+    for (char& c : s) {
+        unsigned char uc = static_cast<unsigned char>(c);
+        if (uc < 0x20 || uc == 0x7F)
+            c = '_';
+    }
+    return s;
+}
+
 bool fetch_url(const std::string& url, const std::string& user_agent, int timeout_ms,
                int& out_status, std::string& out_body, std::string& out_content_type,
                std::vector<std::pair<std::string,std::string>>& out_resp_headers,
@@ -347,39 +358,52 @@ bool fetch_url(const std::string& url, const std::string& user_agent, int timeou
     parsed_url_t p = parse_url(url);
     if (!p.valid) { out_err = "invalid url"; return false; }
 
-    const std::string base = p.scheme + "://" + p.host + ":" + std::to_string(p.port);
-    httplib::Client cli(base);
-    cli.set_connection_timeout(std::chrono::milliseconds(timeout_ms));
-    cli.set_read_timeout(std::chrono::milliseconds(timeout_ms));
-    cli.set_write_timeout(std::chrono::milliseconds(timeout_ms));
-    cli.set_follow_location(false);
-    cli.enable_server_certificate_verification(false);
-
-    httplib::Headers headers;
-    headers.emplace("User-Agent", user_agent);
-    headers.emplace("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
-    headers.emplace("Accept-Encoding", "identity");
-
     std::string path_with_query = p.path;
     if (!p.query.empty()) path_with_query += "?" + p.query;
 
+    std::string host_header = p.host;
+    if ((p.scheme == "https" && p.port != 443) || (p.scheme != "https" && p.port != 80)) {
+        host_header += ":";
+        host_header += std::to_string(p.port);
+    }
+
+    std::string req;
+    req.reserve(256 + path_with_query.size() + user_agent.size() + host_header.size());
+    req += "GET ";
+    req += path_with_query.empty() ? "/" : path_with_query;
+    req += " HTTP/1.1\r\nHost: ";
+    req += header_safe(host_header);
+    req += "\r\nUser-Agent: ";
+    req += header_safe(user_agent);
+    req += "\r\nAccept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n";
+    std::vector<uint8_t> raw(req.begin(), req.end());
+
     auto t0 = std::chrono::steady_clock::now();
-    auto res = cli.Get(path_with_query.c_str(), headers);
+    audit_http::send_options_t opt;
+    opt.timeout_ms = timeout_ms;
+    opt.follow_redirects = false;
+    opt.enforce_scope = false;
+    auto res = audit_http::send(raw, p.host, p.port, p.scheme == "https", opt);
     auto t1 = std::chrono::steady_clock::now();
     out_latency_ms = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
 
     if (!res)
     {
-        out_err = "transport error";
+        out_err = "transport error; audit_http=" + audit_http::last_error();
+        diag::log_tagged_fmt("crawler", "fetch_url transport_failed url=%s host=%s port=%u tls=%d req_len=%zu err=%s",
+            url.c_str(), p.host.c_str(), static_cast<unsigned>(p.port), p.scheme == "https" ? 1 : 0, raw.size(), out_err.c_str());
         return false;
     }
-    out_status = res->status;
-    out_body = res->body;
-    for (auto& h : res->headers)
+    out_status = res->status_code;
+    out_body.assign(reinterpret_cast<const char*>(res->resp_body.data()), res->resp_body.size());
+    out_resp_headers = res->resp_headers;
+    out_latency_ms = res->latency_ms;
+    for (auto& h : out_resp_headers)
     {
-        out_resp_headers.emplace_back(h.first, h.second);
         if (to_lower(h.first) == "content-type") out_content_type = h.second;
     }
+    diag::log_tagged_fmt("crawler", "fetch_url audit_http_ok url=%s status=%d body=%zu headers=%zu latency_ms=%llu",
+        url.c_str(), out_status, out_body.size(), out_resp_headers.size(), static_cast<unsigned long long>(out_latency_ms));
     return true;
 }
 
@@ -407,6 +431,7 @@ void push_event_for_url(const std::string& url, int status, uint64_t latency, co
     ev.latency_ms = latency;
     ev.is_h2 = false;
     ev.is_websocket = false;
+    ev.source = "crawler";
     if (!content_type.empty())
     {
         bool have_ct = false;

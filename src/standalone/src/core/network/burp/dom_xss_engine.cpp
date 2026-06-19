@@ -154,15 +154,19 @@ struct browser_page_scope_t
 
     browser_page_scope_t(const char* phase, const sentinel_t& s)
     {
+        camoufox::bridge_status_t before_status;
+        bool before_status_ok = false;
         try {
-            previous_page_id = camoufox::get_status().active_page_id;
+            before_status = camoufox::get_status();
+            before_status_ok = true;
+            previous_page_id = before_status.active_page_id;
         } catch (...) {
             previous_page_id.clear();
         }
         const std::string requested = make_dom_page_id(phase, s);
         camoufox::call_result_t r;
         try {
-            r = camoufox::new_page("default", requested, "about:blank", true);
+            r = camoufox::new_page("default", requested, "about:blank", false);
         } catch (...) {
             r.ok = false;
             r.error = "new_page threw";
@@ -170,11 +174,23 @@ struct browser_page_scope_t
         if (r.ok) {
             page_id = page_id_from_result(r, requested);
             created = !page_id.empty();
-            diag::log_tagged_fmt("dom_xss", "page_scope_create phase=%s requested_page_id=%s page_id=%s previous_page_id=%s data_shape=%s",
-                phase ? phase : "", requested.c_str(), page_id.c_str(), previous_page_id.c_str(), json_shape_local(r.data).c_str());
+            camoufox::bridge_status_t after_status;
+            bool after_status_ok = false;
+            try {
+                after_status = camoufox::get_status();
+                after_status_ok = true;
+            } catch (...) {
+            }
+            diag::log_tagged_fmt("dom_xss", "page_scope_create phase=%s requested_page_id=%s page_id=%s make_active=0 previous_page_id=%s before_ok=%d before_active=%s before_pages=%u after_ok=%d after_active=%s after_pages=%u data_shape=%s",
+                phase ? phase : "", requested.c_str(), page_id.c_str(), previous_page_id.c_str(),
+                before_status_ok ? 1 : 0, before_status.active_page_id.c_str(), static_cast<unsigned>(before_status.page_count),
+                after_status_ok ? 1 : 0, after_status.active_page_id.c_str(), static_cast<unsigned>(after_status.page_count),
+                json_shape_local(r.data).c_str());
         } else {
-            diag::log_tagged_fmt("dom_xss", "page_scope_create_failed phase=%s requested_page_id=%s previous_page_id=%s err=%s data_shape=%s",
-                phase ? phase : "", requested.c_str(), previous_page_id.c_str(), r.error.c_str(), json_shape_local(r.data).c_str());
+            diag::log_tagged_fmt("dom_xss", "page_scope_create_failed phase=%s requested_page_id=%s make_active=0 previous_page_id=%s before_ok=%d before_active=%s before_pages=%u err=%s data_shape=%s",
+                phase ? phase : "", requested.c_str(), previous_page_id.c_str(),
+                before_status_ok ? 1 : 0, before_status.active_page_id.c_str(), static_cast<unsigned>(before_status.page_count),
+                r.error.c_str(), json_shape_local(r.data).c_str());
         }
     }
 
@@ -184,15 +200,33 @@ struct browser_page_scope_t
             camoufox::call_result_t closed;
             try { closed = camoufox::close_page("default", page_id); }
             catch (...) { closed.ok = false; closed.error = "close_page threw"; }
-            diag::log_tagged_fmt("dom_xss", "page_scope_close page_id=%s ok=%d err=%s data_shape=%s",
-                page_id.c_str(), closed.ok ? 1 : 0, closed.error.c_str(), json_shape_local(closed.data).c_str());
+            camoufox::bridge_status_t after_close;
+            bool after_close_ok = false;
+            try {
+                after_close = camoufox::get_status();
+                after_close_ok = true;
+            } catch (...) {
+            }
+            diag::log_tagged_fmt("dom_xss", "page_scope_close page_id=%s ok=%d after_ok=%d after_active=%s after_pages=%u err=%s data_shape=%s",
+                page_id.c_str(), closed.ok ? 1 : 0, after_close_ok ? 1 : 0,
+                after_close.active_page_id.c_str(), static_cast<unsigned>(after_close.page_count),
+                closed.error.c_str(), json_shape_local(closed.data).c_str());
         }
         if (!previous_page_id.empty()) {
             camoufox::call_result_t selected;
             try { selected = camoufox::select_page("default", previous_page_id); }
             catch (...) { selected.ok = false; selected.error = "select_page threw"; }
-            diag::log_tagged_fmt("dom_xss", "page_scope_restore previous_page_id=%s ok=%d err=%s data_shape=%s",
-                previous_page_id.c_str(), selected.ok ? 1 : 0, selected.error.c_str(), json_shape_local(selected.data).c_str());
+            camoufox::bridge_status_t after_restore;
+            bool after_restore_ok = false;
+            try {
+                after_restore = camoufox::get_status();
+                after_restore_ok = true;
+            } catch (...) {
+            }
+            diag::log_tagged_fmt("dom_xss", "page_scope_restore previous_page_id=%s ok=%d after_ok=%d after_active=%s after_pages=%u err=%s data_shape=%s",
+                previous_page_id.c_str(), selected.ok ? 1 : 0, after_restore_ok ? 1 : 0,
+                after_restore.active_page_id.c_str(), static_cast<unsigned>(after_restore.page_count),
+                selected.error.c_str(), json_shape_local(selected.data).c_str());
         }
     }
 

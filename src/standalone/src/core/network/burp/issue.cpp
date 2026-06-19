@@ -141,7 +141,7 @@ std::string normalize_case(std::string s)
 std::string build_dedupe_key(const issue_t& i)
 {
     std::string k;
-    k.reserve(i.type_key.size() + i.host.size() + i.parameter.size() + i.path.size() + 8);
+    k.reserve(i.type_key.size() + i.host.size() + i.parameter.size() + i.path.size() + 32);
     k += normalize_case(i.type_key);
     k += '|';
     k += normalize_case(i.host);
@@ -149,6 +149,8 @@ std::string build_dedupe_key(const issue_t& i)
     k += normalize_case(i.path);
     k += '|';
     k += normalize_case(i.parameter);
+    k += '|';
+    k += std::to_string(i.audit_id);
     return k;
 }
 

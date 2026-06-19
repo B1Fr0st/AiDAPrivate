@@ -102,6 +102,7 @@ struct check_accum_t {
 };
 
 struct ui_phase_job_t {
+    std::uint64_t id = 0;
     HANDLE hf = INVALID_HANDLE_VALUE;
     std::atomic<int>* passed = nullptr;
     std::atomic<int>* failed = nullptr;
@@ -112,6 +113,8 @@ struct ui_phase_job_t {
     std::uint64_t queued_ms = 0;
     std::uint64_t started_ms = 0;
     std::uint64_t finished_ms = 0;
+    std::size_t next_step = 0;
+    std::uint64_t processed_steps = 0;
     bool started = false;
     bool done = false;
 };
@@ -120,6 +123,21 @@ std::mutex g_ui_phase_mtx;
 std::condition_variable g_ui_phase_cv;
 std::deque<std::shared_ptr<ui_phase_job_t>> g_ui_phase_jobs;
 std::atomic<DWORD> g_ui_phase_thread_id{0};
+std::atomic<std::uint64_t> g_ui_phase_next_job_id{0};
+std::atomic<std::uint64_t> g_ui_phase_active_job_id{0};
+std::atomic<DWORD> g_ui_phase_active_worker_tid{0};
+std::atomic<int> g_ui_phase_active_step_index{-1};
+std::atomic<const char*> g_ui_phase_active_step_name{"<idle>"};
+std::atomic<std::uint64_t> g_ui_phase_last_lock_wait_ms{0};
+std::atomic<std::uint64_t> g_ui_phase_last_job_run_ms{0};
+std::atomic<std::uint64_t> g_ui_phase_last_job_wait_ms{0};
+std::atomic<std::uint64_t> g_ui_phase_last_pump_wall_ms{0};
+std::atomic<std::uint64_t> g_ui_phase_last_pump_seq{0};
+std::atomic<std::uint64_t> g_ui_phase_skipped_by_budget_count{0};
+std::atomic<std::uint64_t> g_ui_phase_skipped_no_job_count{0};
+std::atomic<std::uint64_t> g_ui_phase_lock_busy_count{0};
+std::atomic<std::uint64_t> g_ui_phase_steps_processed_total{0};
+std::atomic<std::size_t> g_ui_phase_last_pending_count{0};
 
 static std::uint64_t ui_now_ms() {
     return static_cast<std::uint64_t>(GetTickCount64());
@@ -1910,60 +1928,87 @@ static void test_testlab_view_state(HANDLE hf, std::atomic<int>& passed, std::at
 
 }
 
+using ui_phase_step_fn_t = void(*)(HANDLE, std::atomic<int>&, std::atomic<int>&);
+
+struct ui_phase_step_t {
+    const char* tag;
+    ui_phase_step_fn_t fn;
+};
+
+static constexpr ui_phase_step_t k_ui_phase_steps[] = {
+    { "ui_center", test_center_view_file_open },
+    { "ui_file_browser", test_file_browser_directory_and_routes },
+    { "ui_tabs", test_file_tab_lifecycle },
+    { "ui_editor", test_code_editor_save_find_and_diff },
+    { "ui_activity", test_activity_search_recent },
+    { "ui_commands_routes", test_command_palette_and_center_views },
+    { "ui_bottom", test_bottom_log_tabs },
+    { "ui_terminal", test_terminal_buffer_lifecycle },
+    { "ui_settings_mcp", test_settings_sandbox_mcp_roundtrip },
+    { "ui_testlab", test_testlab_view_state },
+};
+
+static constexpr std::size_t k_ui_phase_step_count = sizeof(k_ui_phase_steps) / sizeof(k_ui_phase_steps[0]);
+
+static bool run_ui_phase_step(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::size_t step_index, bool(*cancelled)(), std::uint64_t job_id) {
+    if (step_index >= k_ui_phase_step_count)
+        return false;
+    const auto& step = k_ui_phase_steps[step_index];
+    const int ordinal = static_cast<int>(step_index + 1);
+    g_ui_phase_active_step_index.store(ordinal, std::memory_order_release);
+    g_ui_phase_active_step_name.store(step.tag, std::memory_order_release);
+    if (cancelled && cancelled()) {
+        log_msg(hf, "ui_phase", "cancel before job=%llu idx=%d name=%s tid=%lu",
+            static_cast<unsigned long long>(job_id),
+            ordinal,
+            step.tag,
+            static_cast<unsigned long>(GetCurrentThreadId()));
+        return false;
+    }
+    const int pass_before = passed.load(std::memory_order_acquire);
+    const int fail_before = failed.load(std::memory_order_acquire);
+    const std::uint64_t started = ui_now_ms();
+    log_msg(hf, "ui_phase", "BEGIN job=%llu idx=%d name=%s tid=%lu pass=%d fail=%d",
+        static_cast<unsigned long long>(job_id),
+        ordinal,
+        step.tag,
+        static_cast<unsigned long>(GetCurrentThreadId()),
+        pass_before,
+        fail_before);
+    step.fn(hf, passed, failed);
+    const std::uint64_t elapsed = ui_now_ms() - started;
+    g_ui_phase_last_job_run_ms.store(elapsed, std::memory_order_release);
+    const int pass_after = passed.load(std::memory_order_acquire);
+    const int fail_after = failed.load(std::memory_order_acquire);
+    log_msg(hf, "ui_phase", "END job=%llu idx=%d name=%s tid=%lu elapsed_ms=%llu pass_delta=%d fail_delta=%d pass=%d fail=%d",
+        static_cast<unsigned long long>(job_id),
+        ordinal,
+        step.tag,
+        static_cast<unsigned long>(GetCurrentThreadId()),
+        static_cast<unsigned long long>(elapsed),
+        pass_after - pass_before,
+        fail_after - fail_before,
+        pass_after,
+        fail_after);
+    return true;
+}
+
 static void phase_ui_tests_inline(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped, bool(*cancelled)()) {
     (void)skipped;
     const DWORD tid = GetCurrentThreadId();
     log_msg(hf, "ui_phase", "running standalone UI state/workflow tests tid=%lu",
         static_cast<unsigned long>(tid));
 
-    int ordinal = 0;
-    auto run = [&](const char* tag, auto&& fn) {
-        ++ordinal;
-        if (cancelled && cancelled()) {
-            log_msg(hf, "ui_phase", "cancel before idx=%d name=%s tid=%lu",
-                ordinal, tag, static_cast<unsigned long>(GetCurrentThreadId()));
-            return false;
-        }
-        int pass_before = passed.load(std::memory_order_acquire);
-        int fail_before = failed.load(std::memory_order_acquire);
-        std::uint64_t started = ui_now_ms();
-        log_msg(hf, "ui_phase", "BEGIN idx=%d name=%s tid=%lu pass=%d fail=%d",
-            ordinal, tag, static_cast<unsigned long>(GetCurrentThreadId()), pass_before, fail_before);
-        fn();
-        std::uint64_t elapsed = ui_now_ms() - started;
-        int pass_after = passed.load(std::memory_order_acquire);
-        int fail_after = failed.load(std::memory_order_acquire);
-        log_msg(hf, "ui_phase", "END idx=%d name=%s tid=%lu elapsed_ms=%llu pass_delta=%d fail_delta=%d pass=%d fail=%d",
-            ordinal,
-            tag,
-            static_cast<unsigned long>(GetCurrentThreadId()),
-            static_cast<unsigned long long>(elapsed),
-            pass_after - pass_before,
-            fail_after - fail_before,
-            pass_after,
-            fail_after);
-        return true;
-    };
-
-    if (!run("ui_center", [&]() { test_center_view_file_open(hf, passed, failed); })) return;
-
-    if (!run("ui_file_browser", [&]() { test_file_browser_directory_and_routes(hf, passed, failed); })) return;
-
-    if (!run("ui_tabs", [&]() { test_file_tab_lifecycle(hf, passed, failed); })) return;
-
-    if (!run("ui_editor", [&]() { test_code_editor_save_find_and_diff(hf, passed, failed); })) return;
-
-    if (!run("ui_activity", [&]() { test_activity_search_recent(hf, passed, failed); })) return;
-
-    if (!run("ui_commands_routes", [&]() { test_command_palette_and_center_views(hf, passed, failed); })) return;
-
-    if (!run("ui_bottom", [&]() { test_bottom_log_tabs(hf, passed, failed); })) return;
-
-    if (!run("ui_terminal", [&]() { test_terminal_buffer_lifecycle(hf, passed, failed); })) return;
-
-    if (!run("ui_settings_mcp", [&]() { test_settings_sandbox_mcp_roundtrip(hf, passed, failed); })) return;
-
-    if (!run("ui_testlab", [&]() { test_testlab_view_state(hf, passed, failed); })) return;
+    g_ui_phase_active_job_id.store(0, std::memory_order_release);
+    g_ui_phase_active_worker_tid.store(0, std::memory_order_release);
+    for (std::size_t i = 0; i < k_ui_phase_step_count; ++i) {
+        const bool ran = run_ui_phase_step(hf, passed, failed, i, cancelled, 0);
+        if (!ran)
+            break;
+        g_ui_phase_steps_processed_total.fetch_add(1u, std::memory_order_acq_rel);
+    }
+    g_ui_phase_active_step_index.store(-1, std::memory_order_release);
+    g_ui_phase_active_step_name.store("<idle>", std::memory_order_release);
 }
 
 static void fail_pending_ui_dispatch(HANDLE hf, std::atomic<int>& failed, const char* reason, DWORD worker_tid, DWORD ui_tid, std::uint64_t elapsed_ms) {
@@ -1995,6 +2040,7 @@ void phase_ui_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& faile
     }
 
     auto job = std::make_shared<ui_phase_job_t>();
+    job->id = g_ui_phase_next_job_id.fetch_add(1u, std::memory_order_acq_rel) + 1u;
     job->hf = hf;
     job->passed = &passed;
     job->failed = &failed;
@@ -2015,12 +2061,14 @@ void phase_ui_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& faile
         PostMessageW(g_hwnd, WM_NULL, 0, 0);
 
     constexpr std::uint64_t kDispatchPickupTimeoutMs = 15000;
-    log_msg(hf, "ui_phase", "queued render-thread UI tests worker_tid=%lu known_ui_tid=%lu queue_depth=%llu pickup_timeout_ms=%llu",
+    log_msg(hf, "ui_phase", "queued render-thread UI tests job=%llu worker_tid=%lu known_ui_tid=%lu queue_depth=%llu pickup_timeout_ms=%llu",
+        static_cast<unsigned long long>(job->id),
         static_cast<unsigned long>(current_tid),
         static_cast<unsigned long>(ui_tid),
         static_cast<unsigned long long>(depth),
         static_cast<unsigned long long>(kDispatchPickupTimeoutMs));
-    diag::log_tagged_fmt("ui_phase", "queued render-thread UI tests worker_tid=%lu known_ui_tid=%lu queue_depth=%llu",
+    diag::log_tagged_fmt("ui_phase", "queued render-thread UI tests job=%llu worker_tid=%lu known_ui_tid=%lu queue_depth=%llu",
+        static_cast<unsigned long long>(job->id),
         static_cast<unsigned long>(current_tid),
         static_cast<unsigned long>(ui_tid),
         static_cast<unsigned long long>(depth));
@@ -2030,11 +2078,14 @@ void phase_ui_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& faile
         if (job->done) {
             std::uint64_t elapsed = job->finished_ms >= job->queued_ms ? job->finished_ms - job->queued_ms : 0;
             DWORD actual_ui_tid = job->ui_tid;
+            const std::uint64_t steps = job->processed_steps;
             lk.unlock();
-            log_msg(hf, "ui_phase", "render-thread UI tests complete worker_tid=%lu ui_tid=%lu elapsed_ms=%llu",
+            log_msg(hf, "ui_phase", "render-thread UI tests complete job=%llu worker_tid=%lu ui_tid=%lu elapsed_ms=%llu steps=%llu",
+                static_cast<unsigned long long>(job->id),
                 static_cast<unsigned long>(current_tid),
                 static_cast<unsigned long>(actual_ui_tid),
-                static_cast<unsigned long long>(elapsed));
+                static_cast<unsigned long long>(elapsed),
+                static_cast<unsigned long long>(steps));
             return;
         }
 
@@ -2043,7 +2094,8 @@ void phase_ui_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& faile
             if (it != g_ui_phase_jobs.end())
                 g_ui_phase_jobs.erase(it);
             lk.unlock();
-            log_msg(hf, "ui_phase", "render-thread UI tests cancelled before pickup worker_tid=%lu known_ui_tid=%lu",
+            log_msg(hf, "ui_phase", "render-thread UI tests cancelled before pickup job=%llu worker_tid=%lu known_ui_tid=%lu",
+                static_cast<unsigned long long>(job->id),
                 static_cast<unsigned long>(current_tid),
                 static_cast<unsigned long>(ui_tid));
             return;
@@ -2058,7 +2110,8 @@ void phase_ui_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& faile
             DWORD last_ui_tid = g_ui_phase_thread_id.load(std::memory_order_acquire);
             lk.unlock();
             fail_pending_ui_dispatch(hf, failed, "pickup_timeout", current_tid, last_ui_tid, elapsed);
-            diag::log_tagged_fmt("ui_phase", "pickup_timeout worker_tid=%lu known_ui_tid=%lu elapsed_ms=%llu",
+            diag::log_tagged_fmt("ui_phase", "pickup_timeout job=%llu worker_tid=%lu known_ui_tid=%lu elapsed_ms=%llu",
+                static_cast<unsigned long long>(job->id),
                 static_cast<unsigned long>(current_tid),
                 static_cast<unsigned long>(last_ui_tid),
                 static_cast<unsigned long long>(elapsed));
@@ -2072,91 +2125,245 @@ void phase_ui_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& faile
 void pump_ui_thread_jobs() {
     const DWORD ui_tid = GetCurrentThreadId();
     g_ui_phase_thread_id.store(ui_tid, std::memory_order_release);
-    std::size_t initial_pending = 0;
-    {
-        std::lock_guard<std::mutex> lk(g_ui_phase_mtx);
-        initial_pending = g_ui_phase_jobs.size();
-    }
+    constexpr std::uint64_t kPumpBudgetMs = 5;
+    const std::uint64_t pump_start = ui_now_ms();
     static std::atomic<std::uint64_t> s_pump_seq{0};
     const std::uint64_t pump_seq = s_pump_seq.fetch_add(1, std::memory_order_acq_rel) + 1;
-    if (initial_pending > 0) {
-        diag::log_tagged_critical_fmt("ui_phase",
-            "pump_enter seq=%llu ui_tid=%lu pending=%llu",
-            static_cast<unsigned long long>(pump_seq),
-            static_cast<unsigned long>(ui_tid),
-            static_cast<unsigned long long>(initial_pending));
+    g_ui_phase_last_pump_seq.store(pump_seq, std::memory_order_release);
+
+    std::size_t initial_pending = 0;
+    std::shared_ptr<ui_phase_job_t> job;
+    std::size_t remaining = 0;
+    std::uint64_t lock_start = ui_now_ms();
+    std::unique_lock<std::mutex> lk(g_ui_phase_mtx, std::try_to_lock);
+    std::uint64_t lock_wait = ui_now_ms() - lock_start;
+    g_ui_phase_last_lock_wait_ms.store(lock_wait, std::memory_order_release);
+    if (!lk.owns_lock()) {
+        g_ui_phase_lock_busy_count.fetch_add(1u, std::memory_order_acq_rel);
+        g_ui_phase_last_pump_wall_ms.store(ui_now_ms() - pump_start, std::memory_order_release);
+        static std::atomic<std::uint64_t> s_last_lock_busy_log_ms{0};
+        const std::uint64_t now = ui_now_ms();
+        std::uint64_t last = s_last_lock_busy_log_ms.load(std::memory_order_acquire);
+        if (now - last >= 250 && s_last_lock_busy_log_ms.compare_exchange_strong(last, now, std::memory_order_acq_rel)) {
+            diag::log_tagged_critical_fmt("ui_phase",
+                "pump_lock_busy seq=%llu ui_tid=%lu lock_wait_ms=%llu pending_last=%llu busy_total=%llu",
+                static_cast<unsigned long long>(pump_seq),
+                static_cast<unsigned long>(ui_tid),
+                static_cast<unsigned long long>(lock_wait),
+                static_cast<unsigned long long>(g_ui_phase_last_pending_count.load(std::memory_order_acquire)),
+                static_cast<unsigned long long>(g_ui_phase_lock_busy_count.load(std::memory_order_acquire)));
+        }
+        return;
     }
 
-    for (;;) {
-        std::shared_ptr<ui_phase_job_t> job;
-        std::size_t remaining = 0;
-        {
-            std::lock_guard<std::mutex> lk(g_ui_phase_mtx);
-            if (g_ui_phase_jobs.empty())
-                break;
-            job = g_ui_phase_jobs.front();
-            g_ui_phase_jobs.pop_front();
-            remaining = g_ui_phase_jobs.size();
+    initial_pending = g_ui_phase_jobs.size();
+    g_ui_phase_last_pending_count.store(initial_pending, std::memory_order_release);
+    if (initial_pending == 0) {
+        lk.unlock();
+        g_ui_phase_skipped_no_job_count.fetch_add(1u, std::memory_order_acq_rel);
+        g_ui_phase_last_pump_wall_ms.store(ui_now_ms() - pump_start, std::memory_order_release);
+        return;
+    }
+    job = g_ui_phase_jobs.front();
+    g_ui_phase_jobs.pop_front();
+    remaining = g_ui_phase_jobs.size();
+    if (job) {
+        if (!job->started) {
             job->started = true;
-            job->ui_tid = ui_tid;
             job->started_ms = ui_now_ms();
         }
-        g_ui_phase_cv.notify_all();
+        job->ui_tid = ui_tid;
+        const std::uint64_t wait_ms = job->started_ms >= job->queued_ms ? job->started_ms - job->queued_ms : 0;
+        g_ui_phase_last_job_wait_ms.store(wait_ms, std::memory_order_release);
+        g_ui_phase_active_job_id.store(job->id, std::memory_order_release);
+        g_ui_phase_active_worker_tid.store(job->worker_tid, std::memory_order_release);
+        if (job->next_step < k_ui_phase_step_count) {
+            g_ui_phase_active_step_index.store(static_cast<int>(job->next_step + 1), std::memory_order_release);
+            g_ui_phase_active_step_name.store(k_ui_phase_steps[job->next_step].tag, std::memory_order_release);
+        } else {
+            g_ui_phase_active_step_index.store(-1, std::memory_order_release);
+            g_ui_phase_active_step_name.store("<complete>", std::memory_order_release);
+        }
+    }
+    lk.unlock();
+    g_ui_phase_cv.notify_all();
 
-        log_msg(job->hf, "ui_phase", "render-thread job start ui_tid=%lu worker_tid=%lu wait_ms=%llu remaining=%llu",
-            static_cast<unsigned long>(ui_tid),
-            static_cast<unsigned long>(job->worker_tid),
-            static_cast<unsigned long long>(job->started_ms >= job->queued_ms ? job->started_ms - job->queued_ms : 0),
-            static_cast<unsigned long long>(remaining));
-        diag::log_tagged_critical_fmt("ui_phase",
-            "job_start seq=%llu ui_tid=%lu worker_tid=%lu wait_ms=%llu remaining=%llu hf=0x%llX",
-            static_cast<unsigned long long>(pump_seq),
-            static_cast<unsigned long>(ui_tid),
-            static_cast<unsigned long>(job->worker_tid),
-            static_cast<unsigned long long>(job->started_ms >= job->queued_ms ? job->started_ms - job->queued_ms : 0),
-            static_cast<unsigned long long>(remaining),
-            static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(job->hf)));
+    if (!job) {
+        g_ui_phase_skipped_no_job_count.fetch_add(1u, std::memory_order_acq_rel);
+        g_ui_phase_active_job_id.store(0, std::memory_order_release);
+        g_ui_phase_active_worker_tid.store(0, std::memory_order_release);
+        g_ui_phase_last_pump_wall_ms.store(ui_now_ms() - pump_start, std::memory_order_release);
+        return;
+    }
 
-        if (job->passed && job->failed && job->skipped) {
-            try {
-                aida::diagnostic_exception_scope::scope_t exception_scope("test_all_features.pump_ui_thread_jobs.phase_ui_tests_inline");
-                phase_ui_tests_inline(job->hf, *job->passed, *job->failed, *job->skipped, job->cancelled);
-            } catch (...) {
-                fail_pending_ui_dispatch(job->hf, *job->failed, "cpp_exception", job->worker_tid, ui_tid, 0);
-                diag::log_tagged_critical_fmt("ui_phase",
-                    "job_cpp_exception seq=%llu ui_tid=%lu worker_tid=%lu",
-                    static_cast<unsigned long long>(pump_seq),
-                    static_cast<unsigned long>(ui_tid),
-                    static_cast<unsigned long>(job->worker_tid));
+    const std::uint64_t wait_ms = job->started_ms >= job->queued_ms ? job->started_ms - job->queued_ms : 0;
+    log_msg(job->hf, "ui_phase", "render-thread job step start seq=%llu job=%llu ui_tid=%lu worker_tid=%lu wait_ms=%llu remaining=%llu next_step=%llu budget_ms=%llu",
+        static_cast<unsigned long long>(pump_seq),
+        static_cast<unsigned long long>(job->id),
+        static_cast<unsigned long>(ui_tid),
+        static_cast<unsigned long>(job->worker_tid),
+        static_cast<unsigned long long>(wait_ms),
+        static_cast<unsigned long long>(remaining),
+        static_cast<unsigned long long>(job->next_step + 1),
+        static_cast<unsigned long long>(kPumpBudgetMs));
+    diag::log_tagged_critical_fmt("ui_phase",
+        "job_step_start seq=%llu job=%llu ui_tid=%lu worker_tid=%lu wait_ms=%llu remaining=%llu step=%llu/%llu name=%s hf=0x%llX",
+        static_cast<unsigned long long>(pump_seq),
+        static_cast<unsigned long long>(job->id),
+        static_cast<unsigned long>(ui_tid),
+        static_cast<unsigned long>(job->worker_tid),
+        static_cast<unsigned long long>(wait_ms),
+        static_cast<unsigned long long>(remaining),
+        static_cast<unsigned long long>(job->next_step + 1),
+        static_cast<unsigned long long>(k_ui_phase_step_count),
+        job->next_step < k_ui_phase_step_count ? k_ui_phase_steps[job->next_step].tag : "<complete>",
+        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(job->hf)));
+
+    bool finished = false;
+    bool requeued = false;
+    bool ran_step = false;
+    const std::uint64_t run_start = ui_now_ms();
+    if (job->passed && job->failed && job->skipped) {
+        try {
+            aida::diagnostic_exception_scope::scope_t exception_scope("test_all_features.pump_ui_thread_jobs.run_ui_phase_step");
+            if (job->next_step < k_ui_phase_step_count) {
+                ran_step = run_ui_phase_step(job->hf, *job->passed, *job->failed, job->next_step, job->cancelled, job->id);
+                if (ran_step) {
+                    ++job->next_step;
+                    ++job->processed_steps;
+                    g_ui_phase_steps_processed_total.fetch_add(1u, std::memory_order_acq_rel);
+                } else {
+                    finished = true;
+                }
+            } else {
+                finished = true;
             }
+        } catch (...) {
+            fail_pending_ui_dispatch(job->hf, *job->failed, "cpp_exception", job->worker_tid, ui_tid, 0);
+            diag::log_tagged_critical_fmt("ui_phase",
+                "job_cpp_exception seq=%llu job=%llu ui_tid=%lu worker_tid=%lu step=%llu",
+                static_cast<unsigned long long>(pump_seq),
+                static_cast<unsigned long long>(job->id),
+                static_cast<unsigned long>(ui_tid),
+                static_cast<unsigned long>(job->worker_tid),
+                static_cast<unsigned long long>(job->next_step + 1));
+            finished = true;
         }
-        else if (job->failed)
+    }
+    else {
+        if (job->failed)
             fail_pending_ui_dispatch(job->hf, *job->failed, "bad_job_state", job->worker_tid, ui_tid, 0);
+        finished = true;
+    }
 
-        {
-            std::lock_guard<std::mutex> lk(g_ui_phase_mtx);
-            job->finished_ms = ui_now_ms();
-            job->done = true;
+    const std::uint64_t run_elapsed = ui_now_ms() - run_start;
+    g_ui_phase_last_job_run_ms.store(run_elapsed, std::memory_order_release);
+    if (!finished && job->next_step >= k_ui_phase_step_count)
+        finished = true;
+
+    lock_start = ui_now_ms();
+    std::unique_lock<std::mutex> finish_lk(g_ui_phase_mtx, std::try_to_lock);
+    std::uint64_t finish_lock_wait = ui_now_ms() - lock_start;
+    if (!finish_lk.owns_lock()) {
+        g_ui_phase_lock_busy_count.fetch_add(1u, std::memory_order_acq_rel);
+        finish_lk.lock();
+        finish_lock_wait = ui_now_ms() - lock_start;
+    }
+    g_ui_phase_last_lock_wait_ms.store(finish_lock_wait, std::memory_order_release);
+    if (finished) {
+        job->finished_ms = ui_now_ms();
+        job->done = true;
+        g_ui_phase_active_job_id.store(0, std::memory_order_release);
+        g_ui_phase_active_worker_tid.store(0, std::memory_order_release);
+        g_ui_phase_active_step_index.store(-1, std::memory_order_release);
+        g_ui_phase_active_step_name.store("<idle>", std::memory_order_release);
+    } else {
+        g_ui_phase_jobs.push_back(job);
+        requeued = true;
+        g_ui_phase_skipped_by_budget_count.fetch_add(1u, std::memory_order_acq_rel);
+        if (job->next_step < k_ui_phase_step_count) {
+            g_ui_phase_active_step_index.store(static_cast<int>(job->next_step + 1), std::memory_order_release);
+            g_ui_phase_active_step_name.store(k_ui_phase_steps[job->next_step].tag, std::memory_order_release);
         }
-        g_ui_phase_cv.notify_all();
+        g_ui_phase_active_job_id.store(0, std::memory_order_release);
+        g_ui_phase_active_worker_tid.store(0, std::memory_order_release);
+    }
+    const std::size_t pending_after = g_ui_phase_jobs.size();
+    g_ui_phase_last_pending_count.store(pending_after, std::memory_order_release);
+    finish_lk.unlock();
+    g_ui_phase_cv.notify_all();
 
-        log_msg(job->hf, "ui_phase", "render-thread job end ui_tid=%lu worker_tid=%lu run_ms=%llu",
-            static_cast<unsigned long>(ui_tid),
-            static_cast<unsigned long>(job->worker_tid),
-            static_cast<unsigned long long>(job->finished_ms >= job->started_ms ? job->finished_ms - job->started_ms : 0));
-        diag::log_tagged_critical_fmt("ui_phase",
-            "job_end seq=%llu ui_tid=%lu worker_tid=%lu run_ms=%llu",
-            static_cast<unsigned long long>(pump_seq),
-            static_cast<unsigned long>(ui_tid),
-            static_cast<unsigned long>(job->worker_tid),
-            static_cast<unsigned long long>(job->finished_ms >= job->started_ms ? job->finished_ms - job->started_ms : 0));
+    if (requeued && g_hwnd)
+        PostMessageW(g_hwnd, WM_NULL, 0, 0);
+
+    const std::uint64_t pump_wall = ui_now_ms() - pump_start;
+    g_ui_phase_last_pump_wall_ms.store(pump_wall, std::memory_order_release);
+    log_msg(job->hf, "ui_phase", "render-thread job step end seq=%llu job=%llu ui_tid=%lu worker_tid=%lu run_ms=%llu wall_ms=%llu finished=%d requeued=%d ran_step=%d next_step=%llu pending=%llu lock_wait_ms=%llu",
+        static_cast<unsigned long long>(pump_seq),
+        static_cast<unsigned long long>(job->id),
+        static_cast<unsigned long>(ui_tid),
+        static_cast<unsigned long>(job->worker_tid),
+        static_cast<unsigned long long>(run_elapsed),
+        static_cast<unsigned long long>(pump_wall),
+        finished ? 1 : 0,
+        requeued ? 1 : 0,
+        ran_step ? 1 : 0,
+        static_cast<unsigned long long>(job->next_step + 1),
+        static_cast<unsigned long long>(pending_after),
+        static_cast<unsigned long long>(finish_lock_wait));
+    diag::log_tagged_critical_fmt("ui_phase",
+        "job_step_end seq=%llu job=%llu ui_tid=%lu worker_tid=%lu run_ms=%llu wall_ms=%llu finished=%d requeued=%d next_step=%llu pending=%llu lock_wait_ms=%llu skipped_budget=%llu processed_total=%llu",
+        static_cast<unsigned long long>(pump_seq),
+        static_cast<unsigned long long>(job->id),
+        static_cast<unsigned long>(ui_tid),
+        static_cast<unsigned long>(job->worker_tid),
+        static_cast<unsigned long long>(run_elapsed),
+        static_cast<unsigned long long>(pump_wall),
+        finished ? 1 : 0,
+        requeued ? 1 : 0,
+        static_cast<unsigned long long>(job->next_step + 1),
+        static_cast<unsigned long long>(pending_after),
+        static_cast<unsigned long long>(finish_lock_wait),
+        static_cast<unsigned long long>(g_ui_phase_skipped_by_budget_count.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_phase_steps_processed_total.load(std::memory_order_acquire)));
+}
+
+void format_ui_phase_snapshot(char* out, std::size_t cap) {
+    if (!out || cap == 0)
+        return;
+    out[0] = '\0';
+    std::size_t pending = g_ui_phase_last_pending_count.load(std::memory_order_acquire);
+    bool lock_busy = false;
+    std::uint64_t lock_start = ui_now_ms();
+    std::unique_lock<std::mutex> lk(g_ui_phase_mtx, std::try_to_lock);
+    const std::uint64_t lock_wait = ui_now_ms() - lock_start;
+    if (lk.owns_lock()) {
+        pending = g_ui_phase_jobs.size();
+        g_ui_phase_last_pending_count.store(pending, std::memory_order_release);
+        lk.unlock();
+    } else {
+        lock_busy = true;
     }
-    if (initial_pending > 0) {
-        diag::log_tagged_critical_fmt("ui_phase",
-            "pump_exit seq=%llu ui_tid=%lu",
-            static_cast<unsigned long long>(pump_seq),
-            static_cast<unsigned long>(ui_tid));
-    }
+    const char* step_name = g_ui_phase_active_step_name.load(std::memory_order_acquire);
+    _snprintf_s(out, cap, _TRUNCATE,
+        "ui_pending=%zu ui_lock_busy=%d ui_active_job=%llu ui_active_worker_tid=%lu ui_tid=%lu ui_step_idx=%d ui_step=\"%.96s\" ui_last_lock_wait_ms=%llu ui_snapshot_lock_wait_ms=%llu ui_last_job_wait_ms=%llu ui_last_job_run_ms=%llu ui_last_pump_wall_ms=%llu ui_last_pump_seq=%llu ui_skipped_budget=%llu ui_skipped_no_job=%llu ui_lock_busy_total=%llu ui_steps_processed=%llu",
+        pending,
+        lock_busy ? 1 : 0,
+        static_cast<unsigned long long>(g_ui_phase_active_job_id.load(std::memory_order_acquire)),
+        static_cast<unsigned long>(g_ui_phase_active_worker_tid.load(std::memory_order_acquire)),
+        static_cast<unsigned long>(g_ui_phase_thread_id.load(std::memory_order_acquire)),
+        g_ui_phase_active_step_index.load(std::memory_order_acquire),
+        step_name ? step_name : "<null>",
+        static_cast<unsigned long long>(g_ui_phase_last_lock_wait_ms.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(lock_wait),
+        static_cast<unsigned long long>(g_ui_phase_last_job_wait_ms.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_phase_last_job_run_ms.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_phase_last_pump_wall_ms.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_phase_last_pump_seq.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_phase_skipped_by_budget_count.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_phase_skipped_no_job_count.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_phase_lock_busy_count.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_phase_steps_processed_total.load(std::memory_order_acquire)));
 }
 
 }

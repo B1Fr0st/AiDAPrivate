@@ -6,6 +6,7 @@
 #include "game_protocol.hpp"
 #include "pre_encrypt_hook.hpp"
 #include "standalone_driver.hpp"
+#include "../mcp/mcp_standalone.hpp"
 #include "helpers/diag_log.hpp"
 
 #include <algorithm>
@@ -62,6 +63,7 @@ struct scan_deadline_t {
     std::chrono::steady_clock::time_point deadline;
     std::uint32_t timeout_ms = 0;
     bool hit = false;
+    bool cancelled = false;
     std::string stage = "entry";
 
     explicit scan_deadline_t(std::uint32_t ms)
@@ -76,9 +78,24 @@ struct scan_deadline_t {
         stage = next_stage ? next_stage : stage;
         if (hit)
             return true;
+        if (mcp_standalone::current_call_cancelled()) {
+            hit = true;
+            cancelled = true;
+            diag::log_tagged_fmt("net_proto",
+                "scan_deadline_cancelled stage=%s elapsed_ms=%llu timeout_ms=%u",
+                stage.c_str(),
+                static_cast<unsigned long long>(elapsed_ms()),
+                timeout_ms);
+            return true;
+        }
         if (std::chrono::steady_clock::now() < deadline)
             return false;
         hit = true;
+        diag::log_tagged_fmt("net_proto",
+            "scan_deadline_timeout stage=%s elapsed_ms=%llu timeout_ms=%u",
+            stage.c_str(),
+            static_cast<unsigned long long>(elapsed_ms()),
+            timeout_ms);
         return true;
     }
 
@@ -484,6 +501,52 @@ std::string scan_module_skip_reason(const driver_bridge::module_info_t& module)
         path.find("\\windows\\syswow64\\") != std::string::npos)
         return "system_directory_module";
     return {};
+}
+
+bool module_matches_scan_target(const driver_bridge::module_info_t& module,
+                                const sendrecv_scan_options_t& options)
+{
+    if (options.module_base != 0 && module.base != options.module_base)
+        return false;
+    if (options.module_name.empty())
+        return true;
+    const std::string wanted = lower_copy(options.module_name);
+    const std::string name = lower_copy(module.name);
+    const std::string path = lower_copy(module.path);
+    if (name == wanted || path == wanted)
+        return true;
+    if (name.find(wanted) != std::string::npos || path.find(wanted) != std::string::npos)
+        return true;
+    std::size_t slash = path.find_last_of("\\/");
+    const std::string base = slash == std::string::npos ? path : path.substr(slash + 1);
+    return base == wanted || base.find(wanted) != std::string::npos;
+}
+
+bool compute_scan_window(const driver_bridge::module_info_t& module,
+                         const sendrecv_scan_options_t& options,
+                         std::uint64_t& read_base,
+                         std::uint64_t& read_size)
+{
+    read_base = module.base;
+    read_size = module.size;
+    const std::uint64_t module_end = module.base + module.size;
+    if (module.base == 0 || module.size == 0 || module_end <= module.base)
+        return false;
+    if (options.scan_base != 0 || options.scan_size != 0) {
+        const std::uint64_t requested_base = options.scan_base != 0 ? options.scan_base : module.base;
+        const std::uint64_t requested_end = options.scan_size != 0
+            ? (options.scan_size > UINT64_MAX - requested_base ? UINT64_MAX : requested_base + options.scan_size)
+            : module_end;
+        if (requested_end <= requested_base)
+            return false;
+        const std::uint64_t clipped_base = (std::max)(module.base, requested_base);
+        const std::uint64_t clipped_end = (std::min)(module_end, requested_end);
+        if (clipped_end <= clipped_base)
+            return false;
+        read_base = clipped_base;
+        read_size = clipped_end - clipped_base;
+    }
+    return read_size >= 16;
 }
 
 std::uint64_t local_image_size(HMODULE module)
@@ -1298,6 +1361,7 @@ void add_sendrecv_result(nlohmann::json& results,
                          std::set<std::uint64_t>& seen_callsites,
                          const driver_bridge::module_info_t& module,
                          const std::vector<std::uint8_t>& bytes,
+                         std::uint64_t bytes_base,
                          const api_target_t& api,
                          std::uint64_t callsite,
                          std::uint64_t handler,
@@ -1309,10 +1373,14 @@ void add_sendrecv_result(nlohmann::json& results,
     if (results.size() >= max_results || !seen_callsites.insert(callsite).second)
         return;
 
-    const std::size_t call_off = static_cast<std::size_t>(callsite - module.base);
+    if (callsite < bytes_base)
+        return;
+    const std::size_t call_off = static_cast<std::size_t>(callsite - bytes_base);
+    if (call_off >= bytes.size())
+        return;
     std::uint64_t neighbor = adjacent;
     if (neighbor == 0)
-        neighbor = nearest_internal_call(bytes, call_off, module.base, excluded_targets, api.direction == "recv");
+        neighbor = nearest_internal_call(bytes, call_off, bytes_base, excluded_targets, api.direction == "recv");
 
     nlohmann::json r;
     r["direction"] = api.direction;
@@ -1663,14 +1731,20 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
 
     scan_deadline_t deadline(options.timeout_ms);
     diag::log_tagged_fmt("net_proto",
-        "find_sendrecv begin pid=%u max_results=%u max_modules=%u max_scan_bytes=%llu timeout_ms=%u",
+        "find_sendrecv begin pid=%u max_results=%u max_modules=%u max_scan_bytes=%llu timeout_ms=%u module_name=%s module_base=0x%llX scan_base=0x%llX scan_size=0x%llX",
         pid,
         options.max_results,
         options.max_modules,
         static_cast<unsigned long long>(options.max_scan_bytes),
-        options.timeout_ms);
+        options.timeout_ms,
+        options.module_name.empty() ? "<empty>" : options.module_name.c_str(),
+        static_cast<unsigned long long>(options.module_base),
+        static_cast<unsigned long long>(options.scan_base),
+        static_cast<unsigned long long>(options.scan_size));
     deadline.stage = "enumerate_modules";
-    auto modules = driver_bridge::enumerate_modules_for(pid);
+    std::vector<driver_bridge::module_info_t> modules;
+    if (!deadline.expired("before_enumerate_modules"))
+        modules = driver_bridge::enumerate_modules_for(pid);
     diag::log_tagged_fmt("net_proto",
         "find_sendrecv enumerate_modules_done pid=%u module_count=%zu deadline_hit=%d remaining_ms=%llu elapsed_ms=%llu",
         pid,
@@ -1701,14 +1775,17 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
         static_cast<unsigned long long>(deadline.remaining_ms()),
         static_cast<unsigned long long>(deadline.elapsed_ms()));
     if (apis.empty()) {
-        const std::string root_cause = socket_resolution.value("root_cause", deadline.hit ? std::string("socket_export_resolution_deadline") : std::string("socket_exports_unresolved"));
+        const std::string root_cause = deadline.cancelled
+            ? std::string("cancelled")
+            : socket_resolution.value("root_cause", deadline.hit ? std::string("socket_export_resolution_deadline") : std::string("socket_exports_unresolved"));
         out["process_id"] = pid;
         out["dependency_unavailable"] = true;
         out["root_cause"] = root_cause;
         out["results"] = nlohmann::json::array();
         out["result_count"] = 0;
         out["count"] = 0;
-        out["deadline_hit"] = deadline.hit;
+        out["deadline_hit"] = deadline.hit && !deadline.cancelled;
+        out["cancelled"] = deadline.cancelled;
         out["elapsed_ms"] = deadline.elapsed_ms();
         out["deadline_remaining_ms"] = deadline.remaining_ms();
         out["timeout_ms"] = options.timeout_ms;
@@ -1723,7 +1800,8 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
         out["dependency_result"] = nlohmann::json{
             {"ok", false},
             {"root_cause", root_cause},
-            {"deadline_hit", deadline.hit},
+            {"deadline_hit", deadline.hit && !deadline.cancelled},
+            {"cancelled", deadline.cancelled},
             {"stage", deadline.stage},
             {"deadline_remaining_ms", deadline.remaining_ms()},
             {"elapsed_ms", deadline.elapsed_ms()}
@@ -1734,7 +1812,8 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
             {"scanned_bytes", 0},
             {"candidate_hit_count", 0},
             {"deadline_stage", deadline.stage},
-            {"deadline_remaining_ms", deadline.remaining_ms()}
+            {"deadline_remaining_ms", deadline.remaining_ms()},
+            {"cancelled", deadline.cancelled}
         };
         out["evidence"] = nlohmann::json::array({"socket API exports not resolved from loaded-module or remote-module export tables"});
         out["limitations"] = nlohmann::json::array({
@@ -1742,10 +1821,11 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
             "no send/recv callsite results are fabricated when socket exports are unavailable"
         });
         diag::log_tagged_fmt("net_proto",
-            "find_sendrecv done pid=%u results=0 apis=0 scanned_modules=0 scanned_bytes=0 dependency_unavailable=1 root=%s deadline_hit=%d elapsed_ms=%llu stage=%s",
+            "find_sendrecv done pid=%u results=0 apis=0 scanned_modules=0 scanned_bytes=0 dependency_unavailable=1 root=%s deadline_hit=%d cancelled=%d elapsed_ms=%llu stage=%s",
             pid,
             root_cause.c_str(),
-            deadline.hit ? 1 : 0,
+            (deadline.hit && !deadline.cancelled) ? 1 : 0,
+            deadline.cancelled ? 1 : 0,
             static_cast<unsigned long long>(deadline.elapsed_ms()),
             deadline.stage.c_str());
         return true;
@@ -1787,6 +1867,12 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
                 static_cast<unsigned long long>(deadline.elapsed_ms()));
             stop_scan("deadline_before_module", "module_loop");
             break;
+        }
+        if (!module_matches_scan_target(module, options)) {
+            increment_json_counter(app_module_skip_histogram, "target_filter_mismatch");
+            if (app_module_skips.size() < 32)
+                app_module_skips.push_back(nlohmann::json{{"name", module.name}, {"base", fmt_addr(module.base)}, {"size", module.size}, {"path", module.path}, {"skip_reason", "target_filter_mismatch"}});
+            continue;
         }
         if (results.size() >= options.max_results) {
             stop_reason = "max_results_reached";
@@ -1845,38 +1931,50 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
             continue;
         }
 
+        std::uint64_t read_base = 0;
+        std::uint64_t read_span = 0;
+        if (!compute_scan_window(module, options, read_base, read_span)) {
+            increment_json_counter(app_module_skip_histogram, "scan_window_empty");
+            if (app_module_skips.size() < 32)
+                app_module_skips.push_back(nlohmann::json{{"name", module.name}, {"base", fmt_addr(module.base)}, {"size", module.size}, {"path", module.path}, {"skip_reason", "scan_window_empty"}});
+            continue;
+        }
         const std::uint64_t remaining = options.max_scan_bytes - scanned_bytes;
-        const std::size_t to_read = static_cast<std::size_t>((std::min<std::uint64_t>)(module.size, (std::min<std::uint64_t>)(remaining, 16777216)));
+        const std::size_t to_read = static_cast<std::size_t>((std::min<std::uint64_t>)(read_span, (std::min<std::uint64_t>)(remaining, 16777216)));
         std::vector<std::uint8_t> bytes;
         nlohmann::json module_diag;
         module_diag["name"] = module.name;
         module_diag["base"] = fmt_addr(module.base);
         module_diag["size"] = module.size;
         module_diag["path"] = module.path;
+        module_diag["read_base"] = fmt_addr(read_base);
+        module_diag["read_span"] = read_span;
         module_diag["requested_read_bytes"] = to_read;
         module_diag["scan_index"] = scanned_count;
         deadline.stage = "module_read";
         module_diag["deadline_remaining_ms_before_read"] = deadline.remaining_ms();
         diag::log_tagged_fmt("net_proto",
-            "find_sendrecv module_read_begin pid=%u name=%s base=%s request_bytes=%zu scanned_bytes=%llu remaining_ms=%llu elapsed_ms=%llu",
+            "find_sendrecv module_read_begin pid=%u name=%s module_base=%s read_base=%s request_bytes=%zu scanned_bytes=%llu remaining_ms=%llu elapsed_ms=%llu",
             pid,
             module.name.c_str(),
             fmt_addr(module.base).c_str(),
+            fmt_addr(read_base).c_str(),
             to_read,
             static_cast<unsigned long long>(scanned_bytes),
             static_cast<unsigned long long>(deadline.remaining_ms()),
             static_cast<unsigned long long>(deadline.elapsed_ms()));
         const ULONGLONG read_t0 = GetTickCount64();
-        const bool read_ok = driver_bridge::read_memory_for(pid, module.base, to_read, bytes);
+        const bool read_ok = !deadline.expired("before_module_read") && driver_bridge::read_memory_for(pid, read_base, to_read, bytes);
         module_diag["read_ok"] = read_ok;
         module_diag["read_elapsed_ms"] = GetTickCount64() - read_t0;
         module_diag["bytes_read"] = bytes.size();
         module_diag["deadline_remaining_ms_after_read"] = deadline.remaining_ms();
         diag::log_tagged_fmt("net_proto",
-            "find_sendrecv module_read_done pid=%u name=%s base=%s ok=%d requested_bytes=%zu bytes_read=%zu read_elapsed_ms=%llu scanned_bytes_before=%llu remaining_ms=%llu elapsed_ms=%llu",
+            "find_sendrecv module_read_done pid=%u name=%s module_base=%s read_base=%s ok=%d requested_bytes=%zu bytes_read=%zu read_elapsed_ms=%llu scanned_bytes_before=%llu remaining_ms=%llu elapsed_ms=%llu",
             pid,
             module.name.c_str(),
             fmt_addr(module.base).c_str(),
+            fmt_addr(read_base).c_str(),
             read_ok ? 1 : 0,
             to_read,
             bytes.size(),
@@ -1940,7 +2038,7 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
             static_cast<unsigned long long>(deadline.remaining_ms()),
             static_cast<unsigned long long>(deadline.elapsed_ms()));
         for (std::size_t i = 0; i + 8 <= bytes.size(); i += 1) {
-            if ((i & 0x3fffu) == 0 && deadline.expired("scan_import_slots")) {
+            if ((i & 0x0fffu) == 0 && deadline.expired("scan_import_slots")) {
                 diag::log_tagged_fmt("net_proto",
                     "find_sendrecv scan_import_slots_deadline pid=%u name=%s offset=%zu import_slots=%zu remaining_ms=%llu elapsed_ms=%llu",
                     pid,
@@ -1955,7 +2053,7 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
             const std::uint64_t ptr = le64(bytes.data() + i);
             auto it = api_by_address.find(ptr);
             if (it != api_by_address.end())
-                import_slots[module.base + i] = it->second;
+                import_slots[read_base + i] = it->second;
         }
         module_diag["import_slot_count"] = import_slots.size();
         module_diag["import_slot_scan_elapsed_ms"] = GetTickCount64() - import_slots_t0;
@@ -1986,7 +2084,7 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
             static_cast<unsigned long long>(deadline.remaining_ms()),
             static_cast<unsigned long long>(deadline.elapsed_ms()));
         for (std::size_t i = 0; i + 6 <= bytes.size(); ++i) {
-            if ((i & 0x3fffu) == 0 && deadline.expired("scan_import_thunks")) {
+            if ((i & 0x0fffu) == 0 && deadline.expired("scan_import_thunks")) {
                 diag::log_tagged_fmt("net_proto",
                     "find_sendrecv scan_import_thunks_deadline pid=%u name=%s offset=%zu thunks=%zu remaining_ms=%llu elapsed_ms=%llu",
                     pid,
@@ -2002,10 +2100,10 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
                 continue;
             std::int32_t rel = 0;
             std::memcpy(&rel, bytes.data() + i + 2, sizeof(rel));
-            const std::uint64_t slot = rel32_target(module.base + i + 6, rel);
+            const std::uint64_t slot = rel32_target(read_base + i + 6, rel);
             auto sit = import_slots.find(slot);
             if (sit != import_slots.end())
-                thunks[module.base + i] = sit->second;
+                thunks[read_base + i] = sit->second;
         }
         for (const auto& t : thunks)
             excluded_targets.insert(t.first);
@@ -2039,7 +2137,7 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
             static_cast<unsigned long long>(deadline.remaining_ms()),
             static_cast<unsigned long long>(deadline.elapsed_ms()));
         for (std::size_t i = 0; i + 6 <= bytes.size() && results.size() < options.max_results; ++i) {
-            if ((i & 0x3fffu) == 0 && deadline.expired("scan_callsites")) {
+            if ((i & 0x0fffu) == 0 && deadline.expired("scan_callsites")) {
                 diag::log_tagged_fmt("net_proto",
                     "find_sendrecv scan_callsites_deadline pid=%u name=%s offset=%zu results=%zu candidate_hits=%llu remaining_ms=%llu elapsed_ms=%llu",
                     pid,
@@ -2054,12 +2152,12 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
             }
             const api_target_t* api = nullptr;
             bool iat = false;
-            std::uint64_t callsite = module.base + i;
+            std::uint64_t callsite = read_base + i;
 
             if (bytes[i] == 0xe8 && i + 5 <= bytes.size()) {
                 std::int32_t rel = 0;
                 std::memcpy(&rel, bytes.data() + i + 1, sizeof(rel));
-                const std::uint64_t target = rel32_target(module.base + i + 5, rel);
+                const std::uint64_t target = rel32_target(read_base + i + 5, rel);
                 if (auto ait = api_by_address.find(target); ait != api_by_address.end())
                     api = ait->second;
                 else if (auto tit = thunks.find(target); tit != thunks.end())
@@ -2067,7 +2165,7 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
             } else if (bytes[i] == 0xff && bytes[i + 1] == 0x15) {
                 std::int32_t rel = 0;
                 std::memcpy(&rel, bytes.data() + i + 2, sizeof(rel));
-                const std::uint64_t slot = rel32_target(module.base + i + 6, rel);
+                const std::uint64_t slot = rel32_target(read_base + i + 6, rel);
                 if (auto sit = import_slots.find(slot); sit != import_slots.end()) {
                     api = sit->second;
                     iat = true;
@@ -2078,8 +2176,8 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
                 continue;
             ++candidate_hits;
             ++module_candidate_hits;
-            const std::uint64_t handler = find_probable_function_start(bytes, i, module.base);
-            add_sendrecv_result(results, seen_callsites, module, bytes, *api, callsite, handler, 0, iat, excluded_targets, options.max_results);
+            const std::uint64_t handler = find_probable_function_start(bytes, i, read_base);
+            add_sendrecv_result(results, seen_callsites, module, bytes, read_base, *api, callsite, handler, 0, iat, excluded_targets, options.max_results);
         }
         module_diag["callsite_scan_elapsed_ms"] = GetTickCount64() - callsites_t0;
         module_diag["candidate_hit_count"] = module_candidate_hits;
@@ -2107,11 +2205,12 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
 
     out["process_id"] = pid;
     out["dependency_unavailable"] = false;
-    out["root_cause"] = deadline.hit ? std::string("scan_deadline") : (stop_reason.empty() ? std::string("complete") : stop_reason);
+    out["root_cause"] = deadline.cancelled ? std::string("cancelled") : (deadline.hit ? std::string("scan_deadline") : (stop_reason.empty() ? std::string("complete") : stop_reason));
     out["results"] = std::move(results);
     out["result_count"] = out["results"].size();
     out["count"] = out["result_count"];
-    out["deadline_hit"] = deadline.hit;
+    out["deadline_hit"] = deadline.hit && !deadline.cancelled;
+    out["cancelled"] = deadline.cancelled;
     out["elapsed_ms"] = deadline.elapsed_ms();
     out["deadline_remaining_ms"] = deadline.remaining_ms();
     out["timeout_ms"] = options.timeout_ms;
@@ -2134,7 +2233,12 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
         {"app_modules_scanned", out["app_modules_scanned"]},
         {"scanned_bytes", scanned_bytes},
         {"deadline_stage", deadline.stage},
-        {"deadline_remaining_ms", deadline.remaining_ms()}
+        {"deadline_remaining_ms", deadline.remaining_ms()},
+        {"cancelled", deadline.cancelled},
+        {"module_filter", options.module_name},
+        {"module_base_filter", options.module_base == 0 ? nlohmann::json(nullptr) : nlohmann::json(fmt_addr(options.module_base))},
+        {"scan_base", options.scan_base == 0 ? nlohmann::json(nullptr) : nlohmann::json(fmt_addr(options.scan_base))},
+        {"scan_size", options.scan_size}
     };
     out["limitations"] = nlohmann::json::array({
         "IAT and direct relative calls are detected; custom syscall wrappers may require manual follow-up",
@@ -2143,14 +2247,15 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
         "bounded deadline returns partial diagnostics without inventing send/recv handlers"
     });
     diag::log_tagged_fmt("net_proto",
-        "find_sendrecv done pid=%u results=%u apis=%zu scanned_modules=%u scanned_bytes=%llu candidate_hits=%llu deadline_hit=%d elapsed_ms=%llu stage=%s stop=%s",
+        "find_sendrecv done pid=%u results=%u apis=%zu scanned_modules=%u scanned_bytes=%llu candidate_hits=%llu deadline_hit=%d cancelled=%d elapsed_ms=%llu stage=%s stop=%s",
         pid,
         static_cast<unsigned>(out["result_count"].get<std::size_t>()),
         apis.size(),
         scanned_count,
         static_cast<unsigned long long>(scanned_bytes),
         static_cast<unsigned long long>(candidate_hits),
-        deadline.hit ? 1 : 0,
+        (deadline.hit && !deadline.cancelled) ? 1 : 0,
+        deadline.cancelled ? 1 : 0,
         static_cast<unsigned long long>(deadline.elapsed_ms()),
         out["stage"].get<std::string>().c_str(),
         stop_reason.empty() ? "complete" : stop_reason.c_str());

@@ -61,6 +61,7 @@ struct mapped_section_t {
     std::uint64_t va = 0;
     std::uint32_t virtual_size = 0;
     std::uint32_t raw_size = 0;
+    std::uint32_t raw_pointer = 0;
     std::uint32_t characteristics = 0;
     double entropy = 0.0;
 };
@@ -396,10 +397,117 @@ inline bool read_pe_layout(std::uint32_t pid, std::uint64_t base, pe_layout_t& o
         ms.va = base + sh.VirtualAddress;
         ms.virtual_size = sh.Misc.VirtualSize;
         ms.raw_size = sh.SizeOfRawData;
+        ms.raw_pointer = sh.PointerToRawData;
         ms.characteristics = sh.Characteristics;
         out.sections.push_back(std::move(ms));
     }
     return out.entry != 0 && !out.sections.empty();
+}
+
+template <typename T>
+inline bool read_image_value(const std::vector<std::uint8_t>& image, std::uint64_t offset, T& out)
+{
+    if (offset > image.size() || image.size() - static_cast<std::size_t>(offset) < sizeof(T))
+        return false;
+    std::memcpy(&out, image.data() + static_cast<std::size_t>(offset), sizeof(T));
+    return true;
+}
+
+inline bool read_pe_layout_from_image_bytes(const std::vector<std::uint8_t>& image, std::uint64_t base_override, pe_layout_t& out)
+{
+    out = {};
+    if (image.size() < sizeof(IMAGE_DOS_HEADER))
+        return false;
+    IMAGE_DOS_HEADER dos{};
+    if (!read_image_value(image, 0, dos) || dos.e_magic != IMAGE_DOS_SIGNATURE)
+        return false;
+    if (dos.e_lfanew <= 0 || static_cast<std::uint64_t>(dos.e_lfanew) > image.size() || image.size() - static_cast<std::size_t>(dos.e_lfanew) < sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER))
+        return false;
+    DWORD sig = 0;
+    if (!read_image_value(image, static_cast<std::uint64_t>(dos.e_lfanew), sig) || sig != IMAGE_NT_SIGNATURE)
+        return false;
+    IMAGE_FILE_HEADER fh{};
+    if (!read_image_value(image, static_cast<std::uint64_t>(dos.e_lfanew) + 4, fh))
+        return false;
+    if (fh.NumberOfSections == 0 || fh.NumberOfSections > 96)
+        return false;
+    const std::uint64_t opt_off = static_cast<std::uint64_t>(dos.e_lfanew) + 4 + sizeof(IMAGE_FILE_HEADER);
+    WORD magic = 0;
+    if (!read_image_value(image, opt_off, magic))
+        return false;
+    out.is_64 = magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+    if (out.is_64) {
+        IMAGE_OPTIONAL_HEADER64 opt{};
+        if (!read_image_value(image, opt_off, opt))
+            return false;
+        out.base = base_override ? base_override : opt.ImageBase;
+        out.entry = out.base + opt.AddressOfEntryPoint;
+        out.size_of_image = opt.SizeOfImage;
+        if (IMAGE_DIRECTORY_ENTRY_IMPORT < opt.NumberOfRvaAndSizes) {
+            out.import_rva = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
+            out.import_size = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size;
+        }
+    } else {
+        IMAGE_OPTIONAL_HEADER32 opt{};
+        if (!read_image_value(image, opt_off, opt))
+            return false;
+        out.base = base_override ? base_override : opt.ImageBase;
+        out.entry = out.base + opt.AddressOfEntryPoint;
+        out.size_of_image = opt.SizeOfImage;
+        if (IMAGE_DIRECTORY_ENTRY_IMPORT < opt.NumberOfRvaAndSizes) {
+            out.import_rva = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
+            out.import_size = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size;
+        }
+    }
+    const std::uint64_t sec_off = opt_off + fh.SizeOfOptionalHeader;
+    if (sec_off > image.size() || image.size() - static_cast<std::size_t>(sec_off) < static_cast<std::size_t>(fh.NumberOfSections) * sizeof(IMAGE_SECTION_HEADER))
+        return false;
+    out.sections.reserve(fh.NumberOfSections);
+    for (WORD i = 0; i < fh.NumberOfSections; ++i) {
+        IMAGE_SECTION_HEADER sh{};
+        if (!read_image_value(image, sec_off + static_cast<std::uint64_t>(i) * sizeof(sh), sh))
+            return false;
+        mapped_section_t ms;
+        ms.name = section_name(sh);
+        ms.va = out.base + sh.VirtualAddress;
+        ms.virtual_size = sh.Misc.VirtualSize;
+        ms.raw_size = sh.SizeOfRawData;
+        ms.raw_pointer = sh.PointerToRawData;
+        ms.characteristics = sh.Characteristics;
+        out.sections.push_back(std::move(ms));
+    }
+    return out.base != 0 && out.entry != 0 && !out.sections.empty();
+}
+
+inline bool read_image_va_bytes(const std::vector<std::uint8_t>& image,
+                                const pe_layout_t& pe,
+                                std::uint64_t va,
+                                std::size_t size,
+                                std::vector<std::uint8_t>& out)
+{
+    out.clear();
+    if (image.empty() || size == 0 || va < pe.base)
+        return false;
+    const std::uint64_t rva = va - pe.base;
+    for (const auto& sec : pe.sections) {
+        const std::uint64_t sec_rva = sec.va >= pe.base ? sec.va - pe.base : 0;
+        const std::uint64_t sec_span = std::max<std::uint64_t>(sec.virtual_size, sec.raw_size);
+        if (sec_span == 0 || rva < sec_rva || rva >= sec_rva + sec_span)
+            continue;
+        const std::uint64_t in_sec = rva - sec_rva;
+        const std::uint64_t raw_off = static_cast<std::uint64_t>(sec.raw_pointer) + in_sec;
+        if (raw_off >= image.size())
+            return false;
+        const std::size_t avail = static_cast<std::size_t>(std::min<std::uint64_t>(size, image.size() - static_cast<std::size_t>(raw_off)));
+        out.assign(image.begin() + static_cast<std::ptrdiff_t>(raw_off), image.begin() + static_cast<std::ptrdiff_t>(raw_off + avail));
+        return !out.empty();
+    }
+    if (rva < image.size()) {
+        const std::size_t avail = static_cast<std::size_t>(std::min<std::uint64_t>(size, image.size() - static_cast<std::size_t>(rva)));
+        out.assign(image.begin() + static_cast<std::ptrdiff_t>(rva), image.begin() + static_cast<std::ptrdiff_t>(rva + avail));
+        return !out.empty();
+    }
+    return false;
 }
 
 inline std::vector<target_module_t> user_modules(std::uint32_t pid)
@@ -1250,35 +1358,69 @@ inline tool_result_t vm_identify(const json& params)
 
 inline tool_result_t vm_trace_bytecode(const json& params)
 {
+    diag::log_tagged_fmt("protected_re", "vm_trace_bytecode handler_entry params=%s", params.dump().c_str());
     auto chk = require_driver();
     if (!chk.success)
         return chk;
+    if (mcp_standalone::current_call_cancelled())
+        return tool_result_t::error("VM bytecode trace cancelled before parameter parsing");
     auto entry = parse_param_u64(params, "entry_va");
     if (!entry)
         entry = parse_param_u64(params, "address");
     if (!entry)
         return tool_result_t::error("entry_va is required");
     const std::uint32_t pid = requested_pid(params);
+    bool allow_neutral_context = false;
+    if (params.contains("allow_neutral_thread_context") && params["allow_neutral_thread_context"].is_boolean())
+        allow_neutral_context = params["allow_neutral_thread_context"].get<bool>();
+    if (params.contains("fixture_mode") && params["fixture_mode"].is_boolean() && params["fixture_mode"].get<bool>())
+        allow_neutral_context = true;
     std::uint32_t tid = 0;
     if (auto t = parse_param_u64(params, "tid"))
         tid = static_cast<std::uint32_t>(*t);
-    if (tid == 0) {
+    if (tid == 0 && !allow_neutral_context) {
+        if (mcp_standalone::current_call_cancelled())
+            return tool_result_t::error("VM bytecode trace cancelled before thread enumeration");
+        diag::log_tagged_fmt("protected_re",
+            "vm_trace_bytecode thread_enum_begin pid=%u active_pid=%u",
+            pid,
+            driver_bridge::attached_pid());
         auto threads = driver_bridge::enumerate_threads_for(pid);
+        diag::log_tagged_fmt("protected_re",
+            "vm_trace_bytecode thread_enum_end pid=%u count=%zu",
+            pid,
+            threads.size());
         if (!threads.empty())
             tid = threads.front().tid;
     }
-    if (pid == 0 || tid == 0)
+    if (pid == 0 || (tid == 0 && !allow_neutral_context))
         return tool_result_t::error("An attached process and a target thread are required for snapshot tracing");
     std::uint32_t max_steps = static_cast<std::uint32_t>(parse_param_u64(params, "max_steps").value_or(50000));
     max_steps = std::clamp<std::uint32_t>(max_steps, 1, 100000);
     const std::uint32_t return_limit = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(parse_param_u64(params, "max_returned_steps").value_or(1024)), 1, 4096);
 #ifdef __NT__
+    if (mcp_standalone::current_call_cancelled())
+        return tool_result_t::error("VM bytecode trace cancelled before region evidence");
+    diag::log_tagged_fmt("protected_re",
+        "vm_trace_bytecode region_evidence_begin pid=%u entry=0x%llX",
+        pid,
+        static_cast<unsigned long long>(*entry));
     const json entry_region = vm_region_evidence(pid, *entry);
     diag::log_tagged_fmt("protected_re",
-        "vm_trace_bytecode entry pid=%u tid=%u entry=0x%llX active_pid=%u max_steps=%u return_limit=%u entry_region=%s bridge_status='%s' bridge_last_error='%s'",
+        "vm_trace_bytecode region_evidence_end pid=%u entry=0x%llX region=%s",
+        pid,
+        static_cast<unsigned long long>(*entry),
+        entry_region.dump().c_str());
+    const std::uint64_t snapshot_base = parse_param_u64(params, "snapshot_base").value_or(*entry & ~0xFFFULL);
+    const std::uint64_t snapshot_size = std::clamp<std::uint64_t>(parse_param_u64(params, "snapshot_size").value_or(0x40000ULL), 0x1000ULL, 0x400000ULL);
+    diag::log_tagged_fmt("protected_re",
+        "vm_trace_bytecode entry pid=%u tid=%u neutral=%d entry=0x%llX snapshot_base=0x%llX snapshot_size=0x%llX active_pid=%u max_steps=%u return_limit=%u entry_region=%s bridge_status='%s' bridge_last_error='%s'",
         pid,
         tid,
+        allow_neutral_context ? 1 : 0,
         static_cast<unsigned long long>(*entry),
+        static_cast<unsigned long long>(snapshot_base),
+        static_cast<unsigned long long>(snapshot_size),
         driver_bridge::attached_pid(),
         max_steps,
         return_limit,
@@ -1294,7 +1436,17 @@ inline tool_result_t vm_trace_bytecode(const json& params)
     cfg.record_registers = true;
     cfg.analyze_effective_ops = true;
     cfg.timeout_us = std::min<std::uint64_t>(parse_param_u64(params, "timeout_us").value_or(15000000), 60000000);
-    auto r = emulation::driver_snapshot_and_emulate(pid, tid, cfg, *entry & ~0xFFFULL, 0x40000);
+    cfg.deadline_ms = static_cast<std::uint64_t>(GetTickCount64()) + std::max<std::uint64_t>(1000, cfg.timeout_us / 1000 + 1000);
+    cfg.allow_neutral_thread_context = allow_neutral_context;
+    cfg.max_invalid_page_maps = static_cast<std::uint32_t>(std::clamp<std::uint64_t>(parse_param_u64(params, "max_invalid_page_maps").value_or(32), 0, 4096));
+    diag::log_tagged_fmt("protected_re",
+        "vm_trace_bytecode snapshot_emulate_begin pid=%u tid=%u deadline_ms=%llu timeout_us=%llu invalid_cap=%u",
+        pid,
+        tid,
+        static_cast<unsigned long long>(cfg.deadline_ms),
+        static_cast<unsigned long long>(cfg.timeout_us),
+        cfg.max_invalid_page_maps);
+    auto r = emulation::driver_snapshot_and_emulate(pid, tid, cfg, snapshot_base, snapshot_size);
     diag::log_tagged_fmt("protected_re",
         "vm_trace_bytecode emulation_exit pid=%u tid=%u entry=0x%llX success=%d error='%s' total=%u trace=%zu reads=%zu writes=%zu reg_deltas=%zu hit_ret=%d hit_breakpoint=%d",
         pid,
@@ -1375,6 +1527,14 @@ inline tool_result_t vm_trace_bytecode(const json& params)
     out["steps"] = steps;
     if (!r.success)
         out["error"] = r.error;
+    diag::log_tagged_fmt("protected_re",
+        "vm_trace_bytecode handler_exit pid=%u tid=%u success=%d emulated=%u returned_steps=%zu cancelled=%d",
+        pid,
+        tid,
+        r.success ? 1 : 0,
+        r.total_instructions,
+        steps.size(),
+        mcp_standalone::current_call_cancelled() ? 1 : 0);
     return r.success ? tool_result_t::ok("VM bytecode trace completed", out) : tool_result_t::error("VM bytecode trace failed: " + r.error, out);
 #else
     (void)pid;
@@ -2363,6 +2523,7 @@ inline json mapped_section_json(const mapped_section_t& sec)
                 {"va", sa_format_address(sec.va)},
                 {"virtual_size", sec.virtual_size},
                 {"raw_size", sec.raw_size},
+                {"raw_pointer", sa_format_address(sec.raw_pointer)},
                 {"characteristics", sa_format_address(sec.characteristics)},
                 {"executable", executable_characteristics(sec.characteristics)}};
 }
@@ -2748,7 +2909,60 @@ inline std::vector<AsmInstr> disassemble_driver_entry_bounded(std::uint32_t pid,
     return out;
 }
 
-inline bool parse_driver_entry_assignments(std::uint32_t pid, const target_module_t& mod, const pe_layout_t& pe, json& assignments, json& diagnostics, drv_dispatch_scan_context_t& ctx)
+inline std::vector<AsmInstr> disassemble_driver_entry_image_bounded(const std::vector<std::uint8_t>& image,
+                                                                    const target_module_t& mod,
+                                                                    const pe_layout_t& pe,
+                                                                    drv_dispatch_scan_context_t& ctx,
+                                                                    json& diagnostics)
+{
+    std::vector<AsmInstr> out;
+    const std::uint32_t bytes_to_read = std::clamp<std::uint32_t>(ctx.limits.max_entry_bytes, 0x1000, 0x10000);
+    const std::uint32_t max_insns = std::clamp<std::uint32_t>(ctx.limits.max_entry_instructions, 64, 8192);
+    diagnostics["scan_window"] = json{{"base", sa_format_address(pe.entry)}, {"size", bytes_to_read}, {"end", sa_format_address(pe.entry + bytes_to_read)}};
+    diagnostics["disassembly"] = json{{"max_entry_bytes", bytes_to_read}, {"max_entry_instructions", max_insns}, {"source", "static_pe_image"}};
+    ctx.record("static_disassembly_start", json{{"module", mod.name}, {"entry", sa_format_address(pe.entry)}, {"bytes", bytes_to_read}, {"max_insns", max_insns}});
+    if (ctx.should_stop("static_driver_entry_disasm_before_read"))
+        return out;
+    std::vector<std::uint8_t> raw;
+    const bool read_ok = read_image_va_bytes(image, pe, pe.entry, bytes_to_read, raw);
+    diagnostics["disassembly"]["read_ok"] = read_ok;
+    diagnostics["disassembly"]["bytes_read"] = raw.size();
+    if (!read_ok || raw.empty()) {
+        diagnostics["disassembly"]["rejection_reason"] = read_ok ? "entry_read_empty" : "entry_read_failed";
+        ctx.record("static_disassembly_read_failed", json{{"module", mod.name}, {"read_ok", read_ok}, {"bytes_read", raw.size()}});
+        ctx.should_stop("static_driver_entry_disasm_after_read_failed");
+        return out;
+    }
+    std::size_t off = 0;
+    while (off < raw.size() && out.size() < max_insns) {
+        if ((out.size() & 0x7fu) == 0 && ctx.should_stop("static_driver_entry_disasm_loop"))
+            break;
+        const int avail = static_cast<int>(std::min<std::size_t>(15, raw.size() - off));
+        AsmInstr ins = zydis_decode_one(raw.data() + off, avail, pe.entry + off);
+        if (ins.len <= 0)
+            ins.len = 1;
+        out.push_back(ins);
+        off += static_cast<std::size_t>(ins.len);
+    }
+    diagnostics["disassembly"]["instructions_decoded"] = out.size();
+    diagnostics["disassembly"]["bytes_consumed"] = off;
+    diagnostics["disassembly"]["instruction_limit_hit"] = out.size() >= max_insns;
+    diagnostics["disassembly"]["deadline_hit"] = ctx.deadline_hit;
+    diagnostics["disassembly"]["cancelled"] = ctx.cancelled;
+    ctx.record("static_disassembly_end", json{{"module", mod.name}, {"instructions_decoded", out.size()}, {"bytes_consumed", off}, {"instruction_limit_hit", out.size() >= max_insns}});
+    diag::log_tagged_fmt("protected_re",
+        "drv_dispatch static_disasm_end module=%s decoded=%zu bytes_consumed=%zu limit_hit=%d deadline_hit=%d cancelled=%d elapsed_ms=%llu",
+        mod.name.c_str(),
+        out.size(),
+        off,
+        out.size() >= max_insns ? 1 : 0,
+        ctx.deadline_hit ? 1 : 0,
+        ctx.cancelled ? 1 : 0,
+        static_cast<unsigned long long>(ctx.elapsed_ms()));
+    return out;
+}
+
+inline bool parse_driver_entry_assignments(std::uint32_t pid, const target_module_t& mod, const pe_layout_t& pe, json& assignments, json& diagnostics, drv_dispatch_scan_context_t& ctx, const std::vector<std::uint8_t>* image_bytes = nullptr)
 {
     assignments = json::array();
     diagnostics = json::object();
@@ -2758,7 +2972,9 @@ inline bool parse_driver_entry_assignments(std::uint32_t pid, const target_modul
     diagnostics["rejection_histogram"] = json::object();
     diagnostics["last_candidate"] = nullptr;
     ctx.record("assignment_scan_start", json{{"module", mod.name}, {"base", sa_format_address(mod.base)}, {"size", mod.size}, {"entry", sa_format_address(pe.entry)}, {"budget", ctx.status()}});
-    auto insns = disassemble_driver_entry_bounded(pid, mod, pe, ctx, diagnostics);
+    auto insns = image_bytes
+        ? disassemble_driver_entry_image_bounded(*image_bytes, mod, pe, ctx, diagnostics)
+        : disassemble_driver_entry_bounded(pid, mod, pe, ctx, diagnostics);
     diagnostics["instructions_decoded"] = insns.size();
     std::map<std::string, std::uint64_t> reg_values;
     std::size_t candidate_index = 0;
@@ -2884,11 +3100,21 @@ inline bool parse_driver_entry_assignments(std::uint32_t pid, const target_modul
 
 inline tool_result_t drv_find_dispatch_table(const json& params)
 {
-    auto chk = require_driver();
+    std::string static_image_hex;
+    for (const char* key : {"pe_image_hex", "static_pe_image_hex", "fixture_pe_hex", "image_hex"}) {
+        if (params.contains(key) && params[key].is_string()) {
+            static_image_hex = params[key].get<std::string>();
+            break;
+        }
+    }
+    const bool static_image_mode = !static_image_hex.empty();
+    tool_result_t chk;
+    if (!static_image_mode)
+        chk = require_driver();
     const drv_dispatch_scan_limits_t limits = drv_dispatch_limits_from_params(params);
     drv_dispatch_scan_context_t scan_ctx(limits);
     const json scan_budget_start = scan_ctx.status();
-    if (!chk.success) {
+    if (!static_image_mode && !chk.success) {
         json out;
         out["dependency_unavailable"] = true;
         out["root_cause"] = "driver_bridge_not_connected";
@@ -2906,6 +3132,95 @@ inline tool_result_t drv_find_dispatch_table(const json& params)
             driver_bridge::attached_pid(),
             chk.text.c_str());
         return tool_result_t::error(chk.text.empty() ? "Driver bridge is not connected" : chk.text, out);
+    }
+    if (static_image_mode) {
+        std::vector<std::uint8_t> image;
+        std::string hex_error;
+        if (!hex_to_bytes_strict(static_image_hex, image, hex_error) || image.empty()) {
+            json out;
+            out["analysis_mode"] = "static_pe_image_fixture";
+            out["fixture_parser_path_available"] = true;
+            out["target_required"] = false;
+            out["rejection_reason"] = "invalid_static_pe_image_hex";
+            out["error"] = hex_error.empty() ? "static PE image hex did not decode to bytes" : hex_error;
+            out["budget"] = scan_ctx.status();
+            out["scan_budget_start"] = scan_budget_start;
+            return tool_result_t::error("Static PE image fixture could not be decoded.", out);
+        }
+        const std::uint64_t fixture_base = parse_param_u64(params, "module_base").value_or(parse_param_u64(params, "image_base").value_or(parse_param_u64(params, "base").value_or(0x180000000ULL)));
+        pe_layout_t pe;
+        if (!read_pe_layout_from_image_bytes(image, fixture_base, pe)) {
+            json out;
+            out["analysis_mode"] = "static_pe_image_fixture";
+            out["fixture_parser_path_available"] = true;
+            out["target_required"] = false;
+            out["rejection_reason"] = "static_pe_header_parse_failed";
+            out["image_size"] = image.size();
+            out["budget"] = scan_ctx.status();
+            out["scan_budget_start"] = scan_budget_start;
+            return tool_result_t::error("Static PE image fixture headers could not be parsed.", out);
+        }
+        target_module_t static_mod;
+        static_mod.pid = 0;
+        static_mod.base = pe.base;
+        static_mod.size = pe.size_of_image ? pe.size_of_image : image.size();
+        static_mod.name = params.value("driver_name", params.value("module_name", std::string("aida_static_dispatch_fixture.sys")));
+        static_mod.path = params.value("module_path", std::string("static://aida_static_dispatch_fixture.sys"));
+        static_mod.kernel = true;
+        json assignments = json::array();
+        json diagnostics = json::object();
+        parse_driver_entry_assignments(0, static_mod, pe, assignments, diagnostics, scan_ctx, &image);
+        json out;
+        out["driver_name"] = static_mod.name;
+        out["selected_module"] = target_module_json(static_mod);
+        out["module_base"] = sa_format_address(static_mod.base);
+        out["module_size"] = static_mod.size;
+        out["module_path"] = static_mod.path;
+        out["auto_selected_wdm_driver"] = false;
+        out["selection_policy"] = "deterministic static PE image fixture";
+        out["analysis_mode"] = "static_pe_image_fixture";
+        out["fixture_parser_path_available"] = true;
+        out["target_required"] = false;
+        out["dependency_unavailable"] = false;
+        out["dependency_state"] = json{{"using_kernel_driver", driver_bridge::using_kernel_driver()}, {"attached_pid", driver_bridge::attached_pid()}, {"attached_pids", driver_bridge::attached_pids()}};
+        out["scan_budget_start"] = scan_budget_start;
+        out["budget"] = scan_ctx.status();
+        out["pe_parse_ok"] = true;
+        out["pe"] = json{{"entry_rva", pe.entry >= pe.base ? sa_format_address(pe.entry - pe.base) : "unknown"},
+                         {"entry_va", sa_format_address(pe.entry)},
+                         {"size_of_image", pe.size_of_image},
+                         {"is_64", pe.is_64},
+                         {"section_count", pe.sections.size()}};
+        out["entry_section"] = section_evidence_for_va(pe, pe.entry);
+        out["entry_protection"] = json{{"queried", false}, {"reason", "static_pe_image_fixture"}, {"protect", "unknown"}};
+        out["driver_entry_va"] = sa_format_address(pe.entry);
+        out["driver_entry_rva"] = pe.entry >= pe.base ? json(sa_format_address(pe.entry - pe.base)) : json(nullptr);
+        out["dispatch_table_va"] = "driver_object+0x70";
+        out["assignments"] = assignments;
+        out["candidate_count"] = diagnostics.value("candidate_count", 0);
+        out["accepted_assignment_count"] = diagnostics.value("accepted_assignment_count", 0);
+        out["accepted_slots"] = diagnostics.value("accepted_slots", json::array());
+        out["scan_window"] = diagnostics.value("scan_window", json::object());
+        out["diagnostics"] = diagnostics;
+        out["breadcrumbs"] = scan_ctx.breadcrumbs;
+        out["deadline_hit"] = scan_ctx.deadline_hit;
+        out["cancelled"] = scan_ctx.cancelled;
+        out["handler_plausibility_policy"] = "handler must resolve inside an executable section of the selected driver image";
+        out["confidence"] = assignments.empty() ? 0.25 : std::min(0.95, 0.45 + assignments.size() * 0.04);
+        out["note"] = assignments.empty() ? "No accepted MajorFunction assignments were found in the static DriverEntry fixture." : "dispatch_table_va is expressed relative to the runtime DRIVER_OBJECT because the object pointer is not exposed by this read-only analysis path.";
+        if (assignments.empty())
+            out["rejection_reason"] = diagnostics.value("rejection_reason", std::string("no_accepted_dispatch_handlers"));
+        diag::log_tagged_fmt("protected_re",
+            "drv_dispatch static_exit accepted=%u candidates=%u deadline_hit=%d cancelled=%d elapsed_ms=%llu reason=%s",
+            out.value("accepted_assignment_count", 0u),
+            out.value("candidate_count", 0u),
+            scan_ctx.deadline_hit ? 1 : 0,
+            scan_ctx.cancelled ? 1 : 0,
+            static_cast<unsigned long long>(scan_ctx.elapsed_ms()),
+            assignments.empty() ? out.value("rejection_reason", std::string("none")).c_str() : "accepted");
+        return assignments.empty()
+            ? tool_result_t::error("Static driver dispatch assignment scan found no accepted MajorFunction assignments.", out)
+            : tool_result_t::ok("Driver dispatch assignment scan completed", out);
     }
     std::string err;
     std::optional<target_module_t> mod;

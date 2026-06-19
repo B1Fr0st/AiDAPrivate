@@ -1,7 +1,11 @@
 
 
 #define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
+#include <iphlpapi.h>
+#include <tlhelp32.h>
 
 #include "standalone_compat.hpp"
 #include "standalone_driver.hpp"
@@ -26,6 +30,8 @@
 #include <cerrno>
 #include <chrono>
 #include <climits>
+#include <cctype>
+#include <cstring>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -33,6 +39,7 @@
 #include <map>
 #include <mutex>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -235,6 +242,8 @@ static json pre_encrypt_hook_summary_locked() {
     return hooks;
 }
 
+static std::string win32_error_message(DWORD error);
+
 static json pre_encrypt_status_payload(std::uint32_t pid = 0) {
     json r;
     std::lock_guard<std::mutex> lock(pre_encrypt_hook::g_state.mutex);
@@ -249,6 +258,37 @@ static json pre_encrypt_status_payload(std::uint32_t pid = 0) {
     r["capture_count"] = static_cast<int>(pre_encrypt_hook::g_state.captures.size());
     r["armed_thread_count"] = pre_encrypt_armed_thread_count_locked();
     r["hooks"] = pre_encrypt_hook_summary_locked();
+    r["auto_hook_root_pid"] = pre_encrypt_hook::g_state.last_auto_hook_root_pid;
+    r["auto_hook_selected_pid"] = pre_encrypt_hook::g_state.last_auto_hook_selected_pid;
+    r["auto_hook_snapshot_error"] = static_cast<unsigned long>(pre_encrypt_hook::g_state.last_auto_hook_snapshot_error);
+    r["auto_hook_snapshot_message"] = win32_error_message(pre_encrypt_hook::g_state.last_auto_hook_snapshot_error);
+    r["auto_hook_error"] = pre_encrypt_hook::g_state.last_auto_hook_error;
+    json candidates = json::array();
+    for (const auto& candidate : pre_encrypt_hook::g_state.last_auto_hook_candidates) {
+        json c;
+        c["pid"] = candidate.pid;
+        c["parent_pid"] = candidate.parent_pid;
+        c["process_name"] = candidate.process_name;
+        c["root"] = candidate.root;
+        c["alive"] = candidate.alive;
+        c["module_enum_ok"] = candidate.module_enum_ok;
+        c["module_count"] = candidate.module_count;
+        c["has_nss3"] = candidate.has_nss3;
+        c["has_pr_write"] = candidate.has_pr_write;
+        c["resolved_count"] = candidate.resolved_count;
+        c["hook_count"] = candidate.hook_count;
+        c["score"] = candidate.score;
+        c["selected"] = candidate.selected;
+        c["set_active_ok"] = candidate.set_active_ok;
+        c["win32_error"] = static_cast<unsigned long>(candidate.win32_error);
+        c["win32_message"] = win32_error_message(candidate.win32_error);
+        c["driver_error"] = candidate.driver_error;
+        c["module_hits"] = candidate.module_hits;
+        c["resolved_targets"] = candidate.resolved_targets;
+        c["resolve_misses"] = candidate.resolve_misses;
+        candidates.push_back(std::move(c));
+    }
+    r["auto_hook_candidates"] = std::move(candidates);
     return r;
 }
 
@@ -279,7 +319,11 @@ static void add_driver_request_fields(json& r, bool ok, DWORD gle = GetLastError
     r["driver_request_ok"] = ok;
     r["driver_status"] = driver_bridge::status();
     r["driver_last_error"] = driver_bridge::last_error();
+    r["driver_loaded"] = driver_bridge::is_loaded();
+    r["driver_connected"] = driver_bridge::using_kernel_driver();
+    r["driver_attached_pid"] = driver_bridge::attached_pid();
     r["win32_error"] = static_cast<unsigned long>(effective_gle);
+    r["win32_message"] = win32_error_message(effective_gle);
 }
 
 static bool process_exists(std::uint32_t pid) {
@@ -292,6 +336,237 @@ static bool process_exists(std::uint32_t pid) {
     const bool alive = GetExitCodeProcess(h, &exit_code) && exit_code == STILL_ACTIVE;
     CloseHandle(h);
     return alive;
+}
+
+static std::string win32_error_message(DWORD error) {
+    if (error == ERROR_SUCCESS)
+        return "ERROR_SUCCESS";
+    char* buffer = nullptr;
+    const DWORD flags = FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS;
+    DWORD len = FormatMessageA(flags, nullptr, error, 0, reinterpret_cast<LPSTR>(&buffer), 0, nullptr);
+    if (len == 0 || !buffer)
+        return {};
+    std::string text(buffer, buffer + len);
+    LocalFree(buffer);
+    while (!text.empty() && (text.back() == '\r' || text.back() == '\n' || text.back() == ' ' || text.back() == '\t'))
+        text.pop_back();
+    return text;
+}
+
+struct socket_owner_row_t {
+    std::uint32_t pid = 0;
+    std::uint32_t protocol = 0;
+    std::uint32_t state = 0;
+    std::uint32_t local_port = 0;
+    std::uint32_t remote_port = 0;
+    std::uint32_t address_family = 0;
+    std::uint8_t local_addr[16] = {};
+    std::uint8_t remote_addr[16] = {};
+};
+
+static std::uint32_t iphelper_port(DWORD port) {
+    return static_cast<std::uint32_t>(ntohs(static_cast<u_short>(port & 0xFFFFu)));
+}
+
+static void copy_ipv4_addr(DWORD addr, std::uint8_t* out) {
+    std::memcpy(out, &addr, 4);
+}
+
+static void append_tcp4_owner_rows(std::vector<socket_owner_row_t>& rows) {
+    ULONG size = 0;
+    SetLastError(ERROR_SUCCESS);
+    DWORD rc = GetExtendedTcpTable(nullptr, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
+    diag::log_tagged_fmt("net_tools",
+        "iphelper_tcp4_size rc=%lu size=%lu message=%s",
+        static_cast<unsigned long>(rc),
+        static_cast<unsigned long>(size),
+        win32_error_message(rc).c_str());
+    if (rc != ERROR_INSUFFICIENT_BUFFER && rc != NO_ERROR)
+        return;
+    if (size == 0)
+        return;
+
+    std::vector<std::uint8_t> buffer(size);
+    rc = GetExtendedTcpTable(buffer.data(), &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
+    diag::log_tagged_fmt("net_tools",
+        "iphelper_tcp4_query rc=%lu size=%lu message=%s",
+        static_cast<unsigned long>(rc),
+        static_cast<unsigned long>(size),
+        win32_error_message(rc).c_str());
+    if (rc != NO_ERROR)
+        return;
+
+    const auto* table = reinterpret_cast<const MIB_TCPTABLE_OWNER_PID*>(buffer.data());
+    for (DWORD i = 0; i < table->dwNumEntries; ++i) {
+        const auto& row = table->table[i];
+        socket_owner_row_t out;
+        out.pid = row.dwOwningPid;
+        out.protocol = 6;
+        out.state = row.dwState;
+        out.address_family = AF_INET;
+        out.local_port = iphelper_port(row.dwLocalPort);
+        out.remote_port = iphelper_port(row.dwRemotePort);
+        copy_ipv4_addr(row.dwLocalAddr, out.local_addr);
+        copy_ipv4_addr(row.dwRemoteAddr, out.remote_addr);
+        rows.push_back(out);
+    }
+}
+
+static void append_udp4_owner_rows(std::vector<socket_owner_row_t>& rows) {
+    ULONG size = 0;
+    SetLastError(ERROR_SUCCESS);
+    DWORD rc = GetExtendedUdpTable(nullptr, &size, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0);
+    diag::log_tagged_fmt("net_tools",
+        "iphelper_udp4_size rc=%lu size=%lu message=%s",
+        static_cast<unsigned long>(rc),
+        static_cast<unsigned long>(size),
+        win32_error_message(rc).c_str());
+    if (rc != ERROR_INSUFFICIENT_BUFFER && rc != NO_ERROR)
+        return;
+    if (size == 0)
+        return;
+
+    std::vector<std::uint8_t> buffer(size);
+    rc = GetExtendedUdpTable(buffer.data(), &size, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0);
+    diag::log_tagged_fmt("net_tools",
+        "iphelper_udp4_query rc=%lu size=%lu message=%s",
+        static_cast<unsigned long>(rc),
+        static_cast<unsigned long>(size),
+        win32_error_message(rc).c_str());
+    if (rc != NO_ERROR)
+        return;
+
+    const auto* table = reinterpret_cast<const MIB_UDPTABLE_OWNER_PID*>(buffer.data());
+    for (DWORD i = 0; i < table->dwNumEntries; ++i) {
+        const auto& row = table->table[i];
+        socket_owner_row_t out;
+        out.pid = row.dwOwningPid;
+        out.protocol = 17;
+        out.state = 0;
+        out.address_family = AF_INET;
+        out.local_port = iphelper_port(row.dwLocalPort);
+        copy_ipv4_addr(row.dwLocalAddr, out.local_addr);
+        rows.push_back(out);
+    }
+}
+
+static void append_tcp6_owner_rows(std::vector<socket_owner_row_t>& rows) {
+    ULONG size = 0;
+    SetLastError(ERROR_SUCCESS);
+    DWORD rc = GetExtendedTcpTable(nullptr, &size, FALSE, AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0);
+    diag::log_tagged_fmt("net_tools",
+        "iphelper_tcp6_size rc=%lu size=%lu message=%s",
+        static_cast<unsigned long>(rc),
+        static_cast<unsigned long>(size),
+        win32_error_message(rc).c_str());
+    if (rc != ERROR_INSUFFICIENT_BUFFER && rc != NO_ERROR)
+        return;
+    if (size == 0)
+        return;
+
+    std::vector<std::uint8_t> buffer(size);
+    rc = GetExtendedTcpTable(buffer.data(), &size, FALSE, AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0);
+    diag::log_tagged_fmt("net_tools",
+        "iphelper_tcp6_query rc=%lu size=%lu message=%s",
+        static_cast<unsigned long>(rc),
+        static_cast<unsigned long>(size),
+        win32_error_message(rc).c_str());
+    if (rc != NO_ERROR)
+        return;
+
+    const auto* table = reinterpret_cast<const MIB_TCP6TABLE_OWNER_PID*>(buffer.data());
+    for (DWORD i = 0; i < table->dwNumEntries; ++i) {
+        const auto& row = table->table[i];
+        socket_owner_row_t out;
+        out.pid = row.dwOwningPid;
+        out.protocol = 6;
+        out.state = row.dwState;
+        out.address_family = AF_INET6;
+        out.local_port = iphelper_port(row.dwLocalPort);
+        out.remote_port = iphelper_port(row.dwRemotePort);
+        std::memcpy(out.local_addr, row.ucLocalAddr, 16);
+        std::memcpy(out.remote_addr, row.ucRemoteAddr, 16);
+        rows.push_back(out);
+    }
+}
+
+static void append_udp6_owner_rows(std::vector<socket_owner_row_t>& rows) {
+    ULONG size = 0;
+    SetLastError(ERROR_SUCCESS);
+    DWORD rc = GetExtendedUdpTable(nullptr, &size, FALSE, AF_INET6, UDP_TABLE_OWNER_PID, 0);
+    diag::log_tagged_fmt("net_tools",
+        "iphelper_udp6_size rc=%lu size=%lu message=%s",
+        static_cast<unsigned long>(rc),
+        static_cast<unsigned long>(size),
+        win32_error_message(rc).c_str());
+    if (rc != ERROR_INSUFFICIENT_BUFFER && rc != NO_ERROR)
+        return;
+    if (size == 0)
+        return;
+
+    std::vector<std::uint8_t> buffer(size);
+    rc = GetExtendedUdpTable(buffer.data(), &size, FALSE, AF_INET6, UDP_TABLE_OWNER_PID, 0);
+    diag::log_tagged_fmt("net_tools",
+        "iphelper_udp6_query rc=%lu size=%lu message=%s",
+        static_cast<unsigned long>(rc),
+        static_cast<unsigned long>(size),
+        win32_error_message(rc).c_str());
+    if (rc != NO_ERROR)
+        return;
+
+    const auto* table = reinterpret_cast<const MIB_UDP6TABLE_OWNER_PID*>(buffer.data());
+    for (DWORD i = 0; i < table->dwNumEntries; ++i) {
+        const auto& row = table->table[i];
+        socket_owner_row_t out;
+        out.pid = row.dwOwningPid;
+        out.protocol = 17;
+        out.state = 0;
+        out.address_family = AF_INET6;
+        out.local_port = iphelper_port(row.dwLocalPort);
+        std::memcpy(out.local_addr, row.ucLocalAddr, 16);
+        rows.push_back(out);
+    }
+}
+
+static std::vector<socket_owner_row_t> enumerate_socket_owner_rows(std::uint32_t filter_pid = 0) {
+    std::vector<socket_owner_row_t> rows;
+    append_tcp4_owner_rows(rows);
+    append_udp4_owner_rows(rows);
+    append_tcp6_owner_rows(rows);
+    append_udp6_owner_rows(rows);
+    if (filter_pid != 0) {
+        rows.erase(std::remove_if(rows.begin(), rows.end(), [filter_pid](const socket_owner_row_t& row) {
+            return row.pid != filter_pid;
+        }), rows.end());
+    }
+    diag::log_tagged_fmt("net_tools",
+        "iphelper_socket_owner_rows filter_pid=%u count=%zu",
+        filter_pid,
+        rows.size());
+    return rows;
+}
+
+static std::string socket_key(std::uint32_t pid, std::uint32_t protocol, std::uint32_t af,
+                              const std::uint8_t* local_addr, std::uint32_t local_port,
+                              const std::uint8_t* remote_addr, std::uint32_t remote_port) {
+    return std::to_string(pid) + "|" + std::to_string(protocol) + "|" + std::to_string(af) + "|" +
+        format_ip(local_addr, af) + "|" + std::to_string(local_port) + "|" +
+        format_ip(remote_addr, af) + "|" + std::to_string(remote_port);
+}
+
+static std::string tcp_state_name(std::uint32_t state);
+
+static json socket_owner_row_json(const socket_owner_row_t& row) {
+    json entry;
+    entry["handle"] = nullptr;
+    entry["handle_available"] = false;
+    entry["source"] = "ip_helper_owner_table";
+    entry["pid"] = row.pid;
+    entry["protocol"] = protocol_name(row.protocol);
+    entry["state"] = (row.protocol == 6) ? tcp_state_name(row.state) : "N/A";
+    entry["local"] = format_ip(row.local_addr, row.address_family) + ":" + std::to_string(row.local_port);
+    entry["remote"] = format_ip(row.remote_addr, row.address_family) + ":" + std::to_string(row.remote_port);
+    return entry;
 }
 
 static std::string tcp_state_name(std::uint32_t state) {
@@ -1393,29 +1668,98 @@ tool_result_t network_enumerate_wfp_callouts(const json& params)
 tool_result_t network_get_socket_handles(const json& params)
 {
     diag::log_tagged("net_tools", "network_get_socket_handles entry");
-    if (!driver_bridge::using_kernel_driver())
-        return tool_result_t::error(OBFSTR("Driver not connected."));
 
     std::uint32_t target_pid = 0;
-    if (params.contains("pid") && params["pid"].is_number())
-        target_pid = params["pid"].get<std::uint32_t>();
+    std::string parse_error;
+    if (!parse_json_u32_param(params, "pid", target_pid, parse_error))
+        return network_param_error(parse_error, "pid");
 
     diag::log_tagged_fmt("net_tools", "network_get_socket_handles target_pid=%u", target_pid);
-    auto socks = driver_bridge::get_socket_handles(target_pid);
-    diag::log_tagged_fmt("net_tools", "network_get_socket_handles count=%zu", socks.size());
+    auto owner_rows = enumerate_socket_owner_rows(target_pid);
+    const bool driver_connected = driver_bridge::using_kernel_driver();
+    if (!driver_connected) {
+        json arr = json::array();
+        for (const auto& row : owner_rows)
+            arr.push_back(socket_owner_row_json(row));
+        diag::log_tagged_fmt("net_tools",
+            "network_get_socket_handles driver_unavailable owner_rows=%zu status=%s error=%s",
+            owner_rows.size(),
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str());
+        if (arr.empty()) {
+            json d;
+            d["pid"] = target_pid;
+            d["owner_rows"] = owner_rows.size();
+            add_driver_request_fields(d, false, ERROR_INVALID_FUNCTION);
+            d["diagnostic"] = "kernel driver is not connected and IP Helper returned no socket owners";
+            return tool_result_t::error(OBFSTR("No socket owner rows available without the kernel driver."), d);
+        }
+        return tool_result_t::ok(std::to_string(arr.size()) + OBFSTR(" socket entries found via IP Helper; handle values unavailable without the kernel driver"), arr);
+    }
+
+    std::set<std::uint32_t> query_pids;
+    if (target_pid != 0) {
+        query_pids.insert(target_pid);
+    } else {
+        for (const auto& row : owner_rows) {
+            if (row.pid != 0 && row.pid != 4)
+                query_pids.insert(row.pid);
+        }
+    }
+
+    std::vector<driver_bridge::socket_info_t> socks;
+    for (std::uint32_t pid : query_pids) {
+        SetLastError(ERROR_SUCCESS);
+        auto pid_socks = driver_bridge::get_socket_handles(pid);
+        const DWORD gle = GetLastError();
+        diag::log_tagged_fmt("net_tools",
+            "network_get_socket_handles driver_query pid=%u count=%zu gle=%lu message=%s driver_error=%s",
+            pid,
+            pid_socks.size(),
+            static_cast<unsigned long>(gle),
+            win32_error_message(gle).c_str(),
+            driver_bridge::last_error().c_str());
+        socks.insert(socks.end(), pid_socks.begin(), pid_socks.end());
+    }
+    diag::log_tagged_fmt("net_tools",
+        "network_get_socket_handles driver_total=%zu owner_rows=%zu queried_pids=%zu",
+        socks.size(),
+        owner_rows.size(),
+        query_pids.size());
+
     json arr = json::array();
+    std::set<std::string> represented;
     for (const auto& s : socks) {
         json entry;
         char buf[24]; qsnprintf(buf, sizeof(buf), "0x%llX", (unsigned long long)s.handle_value);
         entry["handle"] = buf;
+        entry["handle_available"] = s.handle_value != 0;
+        entry["source"] = "driver_handle_enum";
         entry["pid"] = s.pid;
         entry["protocol"] = protocol_name(s.protocol);
         entry["state"] = (s.protocol == 6) ? tcp_state_name(s.state) : "N/A";
         entry["local"] = format_ip(s.local_addr, s.address_family) + ":" + std::to_string(s.local_port);
         entry["remote"] = format_ip(s.remote_addr, s.address_family) + ":" + std::to_string(s.remote_port);
+        represented.insert(socket_key(s.pid, s.protocol, s.address_family, s.local_addr, s.local_port, s.remote_addr, s.remote_port));
         arr.push_back(entry);
     }
-    return tool_result_t::ok(std::to_string(socks.size()) + OBFSTR(" socket handles found"), arr);
+
+    std::size_t fallback_count = 0;
+    for (const auto& row : owner_rows) {
+        const auto key = socket_key(row.pid, row.protocol, row.address_family, row.local_addr, row.local_port, row.remote_addr, row.remote_port);
+        if (represented.find(key) != represented.end())
+            continue;
+        arr.push_back(socket_owner_row_json(row));
+        represented.insert(key);
+        ++fallback_count;
+    }
+
+    diag::log_tagged_fmt("net_tools",
+        "network_get_socket_handles result entries=%zu driver_handles=%zu owner_fallback=%zu",
+        arr.size(),
+        socks.size(),
+        fallback_count);
+    return tool_result_t::ok(std::to_string(arr.size()) + OBFSTR(" socket entries found"), arr);
 }
 
 tool_result_t network_dump_tcpip(const json& params)
@@ -1745,8 +2089,6 @@ tool_result_t network_list_redirect_rules(const json&)
 tool_result_t network_intercept(const json& params)
 {
     diag::log_tagged("net_tools", "network_intercept entry");
-    if (!driver_bridge::using_kernel_driver())
-        return tool_result_t::error(OBFSTR("Driver not connected."));
     if (!params.contains("operation") || !params["operation"].is_string())
         return tool_result_t::error(OBFSTR("Missing required parameter: operation ('enable' or 'disable')"));
 
@@ -1761,12 +2103,40 @@ tool_result_t network_intercept(const json& params)
             if (p == "tcp" || p == "TCP") filter_protocol = 6;
             else if (p == "udp" || p == "UDP") filter_protocol = 17;
         }
+        if (filter_pid == 0 && filter_port == 0 && filter_protocol == 0) {
+            json r;
+            r["operation"] = "enable";
+            r["active"] = false;
+            r["held_count"] = 0;
+            r["pid"] = filter_pid;
+            r["port"] = filter_port;
+            r["protocol"] = "any";
+            r["failure_phase"] = "validate_filter";
+            r["diagnostic"] = "packet interception enable requires at least one explicit filter: pid, port, or protocol";
+            r["driver_request_attempted"] = false;
+            r["driver_request_ok"] = false;
+            r["driver_status"] = driver_bridge::status();
+            r["driver_last_error"] = driver_bridge::last_error();
+            r["driver_loaded"] = driver_bridge::is_loaded();
+            r["driver_connected"] = driver_bridge::using_kernel_driver();
+            r["driver_attached_pid"] = driver_bridge::attached_pid();
+            r["win32_error"] = static_cast<unsigned long>(ERROR_INVALID_PARAMETER);
+            r["win32_message"] = win32_error_message(ERROR_INVALID_PARAMETER);
+            diag::log_tagged_fmt("net_tools",
+                "network_intercept enable rejected phase=validate_filter pid=%u port=%u proto=%u gle=%lu driver_request_attempted=0",
+                filter_pid,
+                filter_port,
+                filter_protocol,
+                static_cast<unsigned long>(ERROR_INVALID_PARAMETER));
+            return tool_result_t::error(OBFSTR("Packet interception enable requires at least one explicit filter."), r);
+        }
+        if (!driver_bridge::using_kernel_driver())
+            return tool_result_t::error(OBFSTR("Driver not connected."));
         std::uint32_t held_count = 0; bool active = false;
         diag::log_tagged_fmt("net_tools", "network_intercept enable pid=%u port=%u proto=%u", filter_pid, filter_port, filter_protocol);
+        SetLastError(ERROR_SUCCESS);
         bool ok = driver_bridge::intercept_op(0, filter_pid, filter_port, filter_protocol, 0, nullptr, 0, &held_count, &active);
         const DWORD gle = GetLastError();
-        diag::log_tagged_fmt("net_tools", "network_intercept enable result=%d active=%d held=%u", (int)ok, (int)active, held_count);
-        if (!ok) return tool_result_t::error(OBFSTR("Failed to enable packet interception."));
         json r;
         r["operation"] = "enable";
         r["active"] = active;
@@ -1775,18 +2145,44 @@ tool_result_t network_intercept(const json& params)
         r["port"] = filter_port;
         r["protocol"] = filter_protocol == 0 ? "any" : protocol_name(filter_protocol);
         add_driver_request_fields(r, ok, gle);
+        r["driver_request_attempted"] = true;
+        diag::log_tagged_fmt("net_tools",
+            "network_intercept enable result=%d active=%d held=%u gle=%lu message=%s driver_status=%s driver_error=%s",
+            (int)ok,
+            (int)active,
+            held_count,
+            static_cast<unsigned long>(gle),
+            win32_error_message(gle).c_str(),
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str());
+        if (!ok) {
+            r["failure_phase"] = "driver_intercept_enable_ioctl";
+            r["diagnostic"] = "driver rejected packet interception enable request";
+            return tool_result_t::error(OBFSTR("Failed to enable packet interception: Win32 error ") +
+                std::to_string(static_cast<unsigned long>(gle)) + OBFSTR(" (") + win32_error_message(gle) + OBFSTR(")."), r);
+        }
         return tool_result_t::ok(OBFSTR("Packet interception enabled. Matching packets will be held for inspection."), r);
     } else if (op == "disable") {
+        if (!driver_bridge::using_kernel_driver())
+            return tool_result_t::error(OBFSTR("Driver not connected."));
+        SetLastError(ERROR_SUCCESS);
         bool ok = driver_bridge::intercept_op(1, 0, 0, 0, 0, nullptr, 0, nullptr, nullptr);
         const DWORD gle = GetLastError();
-        diag::log_tagged_fmt("net_tools", "network_intercept disable result=%d", (int)ok);
-        if (!ok) return tool_result_t::error(OBFSTR("Failed to disable packet interception."));
         auto remaining = driver_bridge::get_held_packets();
         json r;
         r["operation"] = "disable";
         r["active"] = false;
         r["remaining_held_count"] = remaining.size();
         add_driver_request_fields(r, ok, gle);
+        r["driver_request_attempted"] = true;
+        diag::log_tagged_fmt("net_tools",
+            "network_intercept disable result=%d gle=%lu message=%s remaining=%zu",
+            (int)ok,
+            static_cast<unsigned long>(gle),
+            win32_error_message(gle).c_str(),
+            remaining.size());
+        if (!ok) return tool_result_t::error(OBFSTR("Failed to disable packet interception: Win32 error ") +
+            std::to_string(static_cast<unsigned long>(gle)) + OBFSTR(" (") + win32_error_message(gle) + OBFSTR(")."), r);
         return tool_result_t::ok(OBFSTR("Packet interception disabled. All held packets released."), r);
     }
     return tool_result_t::error(OBFSTR("Invalid operation. Use 'enable' or 'disable'."));
@@ -2069,15 +2465,119 @@ tool_result_t network_bandwidth_monitor(const json& params)
 tool_result_t network_bandwidth_per_process(const json& params)
 {
     diag::log_tagged("net_tools", "network_bandwidth_per_process entry");
-    if (!driver_bridge::using_kernel_driver())
-        return tool_result_t::error(OBFSTR("Driver not connected."));
 
     std::uint32_t filter_pid = 0;
-    if (params.contains("pid") && params["pid"].is_number()) filter_pid = params["pid"].get<std::uint32_t>();
+    std::string pid_parse_error;
+    if (!parse_json_u32_param(params, "pid", filter_pid, pid_parse_error))
+        return network_param_error(pid_parse_error, "pid");
+    std::uint32_t sample_ms = 350;
+    if (params.contains("sample_ms")) {
+        std::string parse_error;
+        std::uint32_t parsed_sample_ms = sample_ms;
+        if (parse_json_u32_param(params, "sample_ms", parsed_sample_ms, parse_error)) {
+            sample_ms = parsed_sample_ms;
+        } else {
+            diag::log_tagged_fmt("net_tools",
+                "network_bandwidth_per_process sample_ms_parse_failed error=%s",
+                parse_error.c_str());
+        }
+    }
+    if (sample_ms < 50) sample_ms = 50;
+    if (sample_ms > 2000) sample_ms = 2000;
 
     diag::log_tagged_fmt("net_tools", "network_bandwidth_per_process filter_pid=%u", filter_pid);
+    if (!driver_bridge::using_kernel_driver()) {
+        auto owner_rows = enumerate_socket_owner_rows(filter_pid);
+        std::map<std::uint32_t, std::uint32_t> socket_counts;
+        for (const auto& row : owner_rows)
+            ++socket_counts[row.pid];
+        json arr = json::array();
+        for (const auto& item : socket_counts) {
+            json entry;
+            entry["pid"] = item.first;
+            entry["bytes_sent"] = 0;
+            entry["bytes_recv"] = 0;
+            entry["packets_sent"] = 0;
+            entry["packets_recv"] = 0;
+            entry["last_activity"] = 0;
+            entry["socket_count"] = item.second;
+            entry["source"] = "ip_helper_owner_table";
+            entry["monitoring_active_before"] = false;
+            entry["auto_sampled"] = false;
+            entry["sample_ms"] = 0;
+            entry["bytes_observed"] = false;
+            entry["diagnostic"] = "kernel driver is not connected; socket ownership is available but bandwidth counters are unavailable";
+            arr.push_back(entry);
+        }
+        diag::log_tagged_fmt("net_tools",
+            "network_bandwidth_per_process driver_unavailable owner_rows=%zu grouped=%zu status=%s error=%s",
+            owner_rows.size(),
+            arr.size(),
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str());
+        if (arr.empty()) {
+            json d;
+            d["filter_pid"] = filter_pid;
+            d["owner_rows"] = owner_rows.size();
+            add_driver_request_fields(d, false, ERROR_INVALID_FUNCTION);
+            d["diagnostic"] = "kernel driver is not connected and IP Helper returned no active socket owners";
+            return tool_result_t::error(OBFSTR("No per-process bandwidth rows or socket owners were available."), d);
+        }
+        return tool_result_t::ok(std::to_string(arr.size()) + OBFSTR(" processes with socket ownership data"), arr);
+    }
+
+    driver_bridge::bw_stats_t stats_before{};
+    SetLastError(ERROR_SUCCESS);
+    const bool stats_ok = driver_bridge::bw_monitor_op(2, filter_pid, &stats_before);
+    const DWORD stats_gle = GetLastError();
+    diag::log_tagged_fmt("net_tools",
+        "network_bandwidth_per_process stats_before ok=%d active=%d sent=%llu recv=%llu gle=%lu message=%s",
+        stats_ok ? 1 : 0,
+        stats_before.active ? 1 : 0,
+        static_cast<unsigned long long>(stats_before.total_bytes_sent),
+        static_cast<unsigned long long>(stats_before.total_bytes_recv),
+        static_cast<unsigned long>(stats_gle),
+        win32_error_message(stats_gle).c_str());
+
     auto procs = driver_bridge::get_bw_per_process(filter_pid);
-    diag::log_tagged_fmt("net_tools", "network_bandwidth_per_process count=%zu", procs.size());
+    bool auto_sampled = false;
+    bool auto_start_ok = false;
+    bool auto_stop_ok = false;
+    DWORD auto_start_gle = ERROR_SUCCESS;
+    DWORD auto_stop_gle = ERROR_SUCCESS;
+    if (procs.empty() && (!stats_ok || !stats_before.active)) {
+        auto_sampled = true;
+        SetLastError(ERROR_SUCCESS);
+        auto_start_ok = driver_bridge::bw_monitor_op(0, filter_pid, nullptr);
+        auto_start_gle = GetLastError();
+        diag::log_tagged_fmt("net_tools",
+            "network_bandwidth_per_process auto_sample_start ok=%d filter_pid=%u sample_ms=%u gle=%lu message=%s",
+            auto_start_ok ? 1 : 0,
+            filter_pid,
+            sample_ms,
+            static_cast<unsigned long>(auto_start_gle),
+            win32_error_message(auto_start_gle).c_str());
+        if (auto_start_ok) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(sample_ms));
+            procs = driver_bridge::get_bw_per_process(filter_pid);
+            SetLastError(ERROR_SUCCESS);
+            auto_stop_ok = driver_bridge::bw_monitor_op(1, 0, nullptr);
+            auto_stop_gle = GetLastError();
+            diag::log_tagged_fmt("net_tools",
+                "network_bandwidth_per_process auto_sample_stop ok=%d count=%zu gle=%lu message=%s",
+                auto_stop_ok ? 1 : 0,
+                procs.size(),
+                static_cast<unsigned long>(auto_stop_gle),
+                win32_error_message(auto_stop_gle).c_str());
+        }
+    }
+
+    diag::log_tagged_fmt("net_tools",
+        "network_bandwidth_per_process count=%zu auto_sampled=%d start_ok=%d stop_ok=%d",
+        procs.size(),
+        auto_sampled ? 1 : 0,
+        auto_start_ok ? 1 : 0,
+        auto_stop_ok ? 1 : 0);
     json arr = json::array();
     for (const auto& p : procs) {
         json entry;
@@ -2087,9 +2587,58 @@ tool_result_t network_bandwidth_per_process(const json& params)
         entry["packets_sent"] = p.packets_sent;
         entry["packets_recv"] = p.packets_recv;
         entry["last_activity"] = p.last_activity;
+        entry["source"] = auto_sampled ? "driver_auto_sample" : "driver_monitor";
+        entry["monitoring_active_before"] = stats_before.active;
+        entry["auto_sampled"] = auto_sampled;
+        entry["sample_ms"] = auto_sampled ? sample_ms : 0;
+        entry["bytes_observed"] = (p.bytes_sent != 0 || p.bytes_recv != 0 || p.packets_sent != 0 || p.packets_recv != 0);
         arr.push_back(entry);
     }
-    return tool_result_t::ok(std::to_string(procs.size()) + OBFSTR(" processes with bandwidth data"), arr);
+    if (arr.empty()) {
+        auto owner_rows = enumerate_socket_owner_rows(filter_pid);
+        std::map<std::uint32_t, std::uint32_t> socket_counts;
+        for (const auto& row : owner_rows)
+            ++socket_counts[row.pid];
+        for (const auto& item : socket_counts) {
+            json entry;
+            entry["pid"] = item.first;
+            entry["bytes_sent"] = 0;
+            entry["bytes_recv"] = 0;
+            entry["packets_sent"] = 0;
+            entry["packets_recv"] = 0;
+            entry["last_activity"] = 0;
+            entry["socket_count"] = item.second;
+            entry["source"] = "ip_helper_owner_table";
+            entry["monitoring_active_before"] = stats_before.active;
+            entry["auto_sampled"] = auto_sampled;
+            entry["sample_ms"] = auto_sampled ? sample_ms : 0;
+            entry["bytes_observed"] = false;
+            entry["diagnostic"] = "active sockets found but no bandwidth counters were captured during the sample window";
+            arr.push_back(entry);
+        }
+        diag::log_tagged_fmt("net_tools",
+            "network_bandwidth_per_process owner_fallback rows=%zu grouped=%zu",
+            owner_rows.size(),
+            arr.size());
+    }
+
+    if (arr.empty()) {
+        json d;
+        d["filter_pid"] = filter_pid;
+        d["stats_query_ok"] = stats_ok;
+        d["monitoring_active_before"] = stats_before.active;
+        d["auto_sampled"] = auto_sampled;
+        d["auto_start_ok"] = auto_start_ok;
+        d["auto_start_win32_error"] = static_cast<unsigned long>(auto_start_gle);
+        d["auto_start_win32_message"] = win32_error_message(auto_start_gle);
+        d["auto_stop_ok"] = auto_stop_ok;
+        d["auto_stop_win32_error"] = static_cast<unsigned long>(auto_stop_gle);
+        d["auto_stop_win32_message"] = win32_error_message(auto_stop_gle);
+        add_driver_request_fields(d, stats_ok, stats_gle);
+        return tool_result_t::error(OBFSTR("No per-process bandwidth rows or active socket owners were available."), d);
+    }
+
+    return tool_result_t::ok(std::to_string(arr.size()) + OBFSTR(" processes with bandwidth data"), arr);
 }
 
 tool_result_t network_os_fingerprint(const json& params)
@@ -3282,22 +3831,28 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 diag::log_tagged_fmt("net_tools", "network_pre_encrypt_hook auto_hook pid=%u", pid);
                 if (!pre_encrypt_hook::auto_hook(pid)) {
                     diag::log_tagged_fmt("net_tools", "network_pre_encrypt_hook auto_hook failed pid=%u", pid);
-                    return tool_result_t::error("Failed to auto-hook encryption functions in PID " + std::to_string(pid));
+                    json r = pre_encrypt_status_payload(pid);
+                    r["operation"] = "auto_hook";
+                    r["requested_pid"] = pid;
+                    r["hooked"] = false;
+                    return tool_result_t::error("Failed to auto-hook encryption functions in PID " + std::to_string(pid), r);
                 }
                 const bool started_polling = pre_encrypt_hook::start_polling();
                 if (!started_polling) {
                     DWORD err = pre_encrypt_hook::g_state.debugger_error.load();
-                    json r = pre_encrypt_status_payload(pid);
-                    r["operation"] = "auto_hook";
-                    r["started_polling"] = false;
-                    r["hooked"] = false;
-                    r["start_error"] = static_cast<unsigned long>(err);
-                    pre_encrypt_hook::unhook_all();
+                json r = pre_encrypt_status_payload(pid);
+                r["operation"] = "auto_hook";
+                r["requested_pid"] = pid;
+                r["started_polling"] = false;
+                r["hooked"] = false;
+                r["start_error"] = static_cast<unsigned long>(err);
+                pre_encrypt_hook::unhook_all();
                     return tool_result_t::error("Failed to start authorized debug capture for PID " + std::to_string(pid) +
                                                 ", error=" + std::to_string(static_cast<unsigned long>(err)), r);
                 }
                 json r = pre_encrypt_status_payload(pid);
                 r["operation"] = "auto_hook";
+                r["requested_pid"] = pid;
                 r["started_polling"] = started_polling;
                 r["hooked"] = r.value("hook_count", 0) > 0;
                 r["hooks_installed"] = r["hook_count"];

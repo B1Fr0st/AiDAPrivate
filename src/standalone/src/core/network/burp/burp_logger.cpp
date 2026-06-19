@@ -208,7 +208,10 @@ bool initialize()
     }
     r.sub = aida::events::subscribe(kExchangeObservedEvent,
         [](const exchange_observed_t& ex) {
-            record(source_t::proxy, ex);
+            source_t src = source_t::proxy;
+            if (!ex.source.empty())
+                parse_source(ex.source, src);
+            record(src, ex);
         });
     diag::log_tagged_fmt("logger", "initialize done subscribed cap=%zu", r.cap);
     return true;

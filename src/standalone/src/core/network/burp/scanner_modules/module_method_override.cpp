@@ -95,6 +95,8 @@ void method_override_run(const insertion_point_t& ip, const module_context_t& ct
     audit_http::send_options_t opt;
     opt.timeout_ms = ctx.timeout_ms > 0 ? ctx.timeout_ms : 10000;
     opt.follow_redirects = false;
+    opt.publish_exchange = true;
+    opt.exchange_source = "scanner";
 
     diag::log_tagged_fmt("mod_method", "method_override_run fetching baseline timeout=%dms", opt.timeout_ms);
     auto baseline = audit_http::send(std::vector<uint8_t>(ip.base_request.begin(), ip.base_request.end()),

@@ -9,6 +9,7 @@
 #include <tchar.h>
 #include <windowsx.h>
 #include <psapi.h>
+#include <TlHelp32.h>
 #include <algorithm>
 #include "helpers/helpers.h"
 #include "helpers/blur.h"
@@ -65,6 +66,10 @@
 
 extern "C" {
 #include <openssl/applink.c>
+}
+
+namespace test_all_features {
+    void format_ui_phase_snapshot(char* out, std::size_t cap);
 }
 
 #include <delayimp.h>
@@ -1251,6 +1256,8 @@ static uint64_t diag_fnv1a64(const void* data, size_t len)
     return h;
 }
 
+static void format_message_pump_stall_context(char* out, size_t cap);
+
 namespace aida_tracer {
     inline std::atomic<uint64_t> g_render_frame{0};
     inline std::atomic<uint64_t> g_render_last_tick_ms{0};
@@ -2026,8 +2033,10 @@ namespace aida_tracer {
                         g_peek_remove_flags.load(std::memory_order_acquire));
                 }
                 if (stall_streak == 1 || (stall_streak % 20ULL) == 0ULL) {
+                    char stall_context[4600] = {};
+                    format_message_pump_stall_context(stall_context, sizeof(stall_context));
                     diag::log_tagged_critical_fmt("tracer",
-                        "RENDER_STALL streak=%llu frame=%llu age_ms=%llu phase=%s section=%s phase_id=%llu render_tid=%lu attach=%s attach_id=%llu peek_qs=0x%08lX peek_gle=%lu peek_flags=0x%08X peek_filter=0x%llX fileless_send_defers=%llu send_only_defers=%llu send_only_flushes=%llu dispatch=%s msg=%s(0x%04X) hwnd=0x%llX wp=0x%llX lp=0x%llX wndproc=%s msg=%s(0x%04X) hwnd=0x%llX wp=0x%llX lp=0x%llX dx_frame=%llu dx_age_ms=%llu dx_dd=0x%llX dx_dev=0x%llX dx_ctx=0x%llX dx_rtv=0x%llX dx_lists=%llu dx_draw_cmds=%llu dx_vtx=%llu dx_idx=%llu dx_callbacks=%llu dx_reset_callbacks=%llu dx_first_cb=0x%llX dx_cb_data=0x%llX dx_first_tex=0x%llX dx_tex_hash=0x%016llX dx_max_elem=%llu dx_bad=0x%08lX dx_bad_at=%d,%d dx_disp1000=%d,%d dx_fb1000=%d,%d dx_removed=0x%08lX present_frame=%llu present_age_ms=%llu present_sc=0x%llX present_hr=0x%08lX tracer_tid=%lu",
+                        "RENDER_STALL streak=%llu frame=%llu age_ms=%llu phase=%s section=%s phase_id=%llu render_tid=%lu attach=%s attach_id=%llu peek_qs=0x%08lX peek_gle=%lu peek_flags=0x%08X peek_filter=0x%llX fileless_send_defers=%llu send_only_defers=%llu send_only_flushes=%llu dispatch=%s msg=%s(0x%04X) hwnd=0x%llX wp=0x%llX lp=0x%llX wndproc=%s msg=%s(0x%04X) hwnd=0x%llX wp=0x%llX lp=0x%llX dx_frame=%llu dx_age_ms=%llu dx_dd=0x%llX dx_dev=0x%llX dx_ctx=0x%llX dx_rtv=0x%llX dx_lists=%llu dx_draw_cmds=%llu dx_vtx=%llu dx_idx=%llu dx_callbacks=%llu dx_reset_callbacks=%llu dx_first_cb=0x%llX dx_cb_data=0x%llX dx_first_tex=0x%llX dx_tex_hash=0x%016llX dx_max_elem=%llu dx_bad=0x%08lX dx_bad_at=%d,%d dx_disp1000=%d,%d dx_fb1000=%d,%d dx_removed=0x%08lX present_frame=%llu present_age_ms=%llu present_sc=0x%llX present_hr=0x%08lX tracer_tid=%lu ctx={%.3600s}",
                         (unsigned long long)stall_streak,
                         (unsigned long long)frame,
                         (unsigned long long)age_ms,
@@ -2085,7 +2094,8 @@ namespace aida_tracer {
                         static_cast<unsigned long long>(present_age),
                         static_cast<unsigned long long>(g_present_swapchain.load(std::memory_order_acquire)),
                         static_cast<unsigned long>(g_present_hr.load(std::memory_order_acquire)),
-                        GetCurrentThreadId());
+                        GetCurrentThreadId(),
+                        stall_context[0] ? stall_context : "<empty>");
                     const bool shutdown_context = is_shutdown_stall_context(phase_name, dispatch_msg, wndproc_msg);
                     const bool sustained_hang = age_ms >= 10000ULL && (stall_streak == 32ULL || (stall_streak % 120ULL) == 0ULL);
                     if (render_tid != 0 && sustained_hang && !shutdown_context)
@@ -2935,8 +2945,9 @@ static void format_work_queue_crash_snapshot(char* out, size_t cap)
     out[0] = 0;
     const auto work = work_queue::stats();
     const auto service = work_queue::service_stats();
+    const auto critical = critical_work_queue::stats();
     _snprintf_s(out, cap, _TRUNCATE,
-        "work{alive=%d shutdown=%d workers=%zu pending=%zu active=%u active_labels=%u oldest_active_ms=%llu posted=%llu started=%llu finished=%llu rejected=%llu labels=%.900s} service{alive=%d shutdown=%d workers=%zu pending=%zu active=%u active_labels=%u oldest_active_ms=%llu posted=%llu started=%llu finished=%llu rejected=%llu labels=%.900s}",
+        "work{alive=%d shutdown=%d workers=%zu pending=%zu active=%u active_labels=%u oldest_active_ms=%llu posted=%llu started=%llu finished=%llu rejected=%llu labels=%.700s} service{alive=%d shutdown=%d workers=%zu pending=%zu active=%u active_labels=%u oldest_active_ms=%llu posted=%llu started=%llu finished=%llu rejected=%llu labels=%.700s} critical{alive=%d shutdown=%d workers=%zu pending=%zu active=%u active_labels=%u oldest_active_ms=%llu posted=%llu started=%llu finished=%llu rejected=%llu labels=%.700s}",
         work.alive ? 1 : 0,
         work.shutting_down ? 1 : 0,
         work.workers,
@@ -2960,7 +2971,91 @@ static void format_work_queue_crash_snapshot(char* out, size_t cap)
         static_cast<unsigned long long>(service.started),
         static_cast<unsigned long long>(service.finished),
         static_cast<unsigned long long>(service.rejected),
-        service.active_labels.empty() ? "<none>" : service.active_labels.c_str());
+        service.active_labels.empty() ? "<none>" : service.active_labels.c_str(),
+        critical.alive ? 1 : 0,
+        critical.shutting_down ? 1 : 0,
+        critical.workers,
+        critical.pending,
+        critical.active,
+        critical.active_label_count,
+        static_cast<unsigned long long>(critical.oldest_active_ms),
+        static_cast<unsigned long long>(critical.posted),
+        static_cast<unsigned long long>(critical.started),
+        static_cast<unsigned long long>(critical.finished),
+        static_cast<unsigned long long>(critical.rejected),
+        critical.active_labels.empty() ? "<none>" : critical.active_labels.c_str());
+}
+
+static DWORD count_current_process_threads(DWORD* err_out)
+{
+    if (err_out)
+        *err_out = 0;
+    const DWORD pid = GetCurrentProcessId();
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) {
+        if (err_out)
+            *err_out = GetLastError();
+        return 0;
+    }
+    THREADENTRY32 te = {};
+    te.dwSize = sizeof(te);
+    DWORD count = 0;
+    if (Thread32First(snap, &te)) {
+        do {
+            if (te.th32OwnerProcessID == pid)
+                ++count;
+            te.dwSize = sizeof(te);
+        } while (Thread32Next(snap, &te));
+    } else if (err_out) {
+        *err_out = GetLastError();
+    }
+    CloseHandle(snap);
+    return count;
+}
+
+static void format_message_pump_stall_context(char* out, size_t cap)
+{
+    if (!out || cap == 0)
+        return;
+    out[0] = 0;
+    char full_snapshot[1700] = {};
+    char ui_phase[900] = {};
+    char queue_snapshot[2600] = {};
+    test_all_features::format_debug_snapshot(full_snapshot, sizeof(full_snapshot));
+    test_all_features::format_ui_phase_snapshot(ui_phase, sizeof(ui_phase));
+    format_work_queue_crash_snapshot(queue_snapshot, sizeof(queue_snapshot));
+    DWORD thread_err = 0;
+    const DWORD threads = count_current_process_threads(&thread_err);
+    DWORD handles = 0;
+    const BOOL handle_ok = GetProcessHandleCount(GetCurrentProcess(), &handles);
+    const DWORD handle_err = handle_ok ? 0UL : GetLastError();
+    const char* render_phase = aida_tracer::g_render_phase_name.load(std::memory_order_acquire);
+    const char* render_section = g_render_section.c_str();
+    const char* dispatch_stage = aida_tracer::g_dispatch_stage.load(std::memory_order_acquire);
+    const char* wndproc_stage = aida_tracer::g_wndproc_stage.load(std::memory_order_acquire);
+    _snprintf_s(out, cap, _TRUNCATE,
+        "pid=%lu tid=%lu threads=%lu thread_err=%lu handles=%lu handle_ok=%d handle_err=%lu "
+        "render_phase=%s render_section=%s dispatch_stage=%s dispatch_msg=%s(0x%04X) wndproc_stage=%s wndproc_msg=%s(0x%04X) "
+        "full_test_running=%d ui={%.760s} full={%.1200s} queues={%.1800s}",
+        static_cast<unsigned long>(GetCurrentProcessId()),
+        static_cast<unsigned long>(GetCurrentThreadId()),
+        static_cast<unsigned long>(threads),
+        static_cast<unsigned long>(thread_err),
+        static_cast<unsigned long>(handles),
+        handle_ok ? 1 : 0,
+        static_cast<unsigned long>(handle_err),
+        render_phase ? render_phase : "<null>",
+        render_section ? render_section : "<null>",
+        dispatch_stage ? dispatch_stage : "<null>",
+        aida_tracer::message_name(aida_tracer::g_dispatch_msg.load(std::memory_order_acquire)),
+        aida_tracer::g_dispatch_msg.load(std::memory_order_acquire),
+        wndproc_stage ? wndproc_stage : "<null>",
+        aida_tracer::message_name(aida_tracer::g_wndproc_msg.load(std::memory_order_acquire)),
+        aida_tracer::g_wndproc_msg.load(std::memory_order_acquire),
+        test_all_features::is_running() ? 1 : 0,
+        ui_phase[0] ? ui_phase : "<empty>",
+        full_snapshot[0] ? full_snapshot : "<empty>",
+        queue_snapshot[0] ? queue_snapshot : "<empty>");
 }
 
 static void format_shutdown_crash_snapshot(char* out, size_t cap)
@@ -4298,7 +4393,7 @@ int main(int, char**)
         GetCurrentProcessId(),
         GetCurrentThreadId(),
         static_cast<unsigned long long>(GetTickCount64()));
-    bool bg_posted = critical_work_queue::post([]() {
+    bool bg_posted = critical_work_queue::post_labeled("startup.bg_init", []() {
         const uint64_t thread_tick = static_cast<uint64_t>(GetTickCount64());
         startup_log_critical_fmt("bg_init_thread_entry pid=%lu tid=%lu tick=%llu",
             GetCurrentProcessId(),
@@ -4513,7 +4608,7 @@ int main(int, char**)
         GetCurrentProcessId(),
         GetCurrentThreadId(),
         static_cast<unsigned long long>(GetTickCount64()));
-    bool driver_posted = critical_work_queue::post([] {
+    bool driver_posted = critical_work_queue::post_labeled("startup.driver_bridge_init", [] {
         const uint64_t driver_tick = static_cast<uint64_t>(GetTickCount64());
         startup_log_critical_fmt("driver_bridge_init_thread_entry pid=%lu tid=%lu tick=%llu",
             GetCurrentProcessId(),
@@ -4723,8 +4818,13 @@ int main(int, char**)
                     has_message ? (unsigned long long)static_cast<LONG_PTR>(msg.lParam) : 0ull);
             }
             if (peek_elapsed >= 50) {
+                char stall_context[4600] = {};
+                format_message_pump_stall_context(stall_context, sizeof(stall_context));
+                const char* render_phase = aida_tracer::g_render_phase_name.load(std::memory_order_acquire);
+                const char* render_section = g_render_section.c_str();
+                const char* wndproc_stage = aida_tracer::g_wndproc_stage.load(std::memory_order_acquire);
                 diag::log_tagged_critical_fmt("msgpump",
-                    "peek_slow frame=%llu elapsed_ms=%llu has_message=%d qs=0x%08lX gle=%lu flags=0x%08X filter=0x%llX msg=%s(0x%04X) hwnd=0x%llX wp=0x%llX lp=0x%llX",
+                    "peek_slow frame=%llu elapsed_ms=%llu has_message=%d qs=0x%08lX gle=%lu flags=0x%08X filter=0x%llX msg=%s(0x%04X) hwnd=0x%llX wp=0x%llX lp=0x%llX render_phase=%s render_section=%s wndproc_stage=%s ctx={%.3600s}",
                     (unsigned long long)frame_number,
                     (unsigned long long)peek_elapsed,
                     has_message ? 1 : 0,
@@ -4736,7 +4836,11 @@ int main(int, char**)
                     has_message ? msg.message : 0,
                     has_message ? (unsigned long long)reinterpret_cast<UINT_PTR>(msg.hwnd) : 0ull,
                     has_message ? (unsigned long long)static_cast<UINT_PTR>(msg.wParam) : 0ull,
-                    has_message ? (unsigned long long)static_cast<LONG_PTR>(msg.lParam) : 0ull);
+                    has_message ? (unsigned long long)static_cast<LONG_PTR>(msg.lParam) : 0ull,
+                    render_phase ? render_phase : "<null>",
+                    render_section ? render_section : "<null>",
+                    wndproc_stage ? wndproc_stage : "<null>",
+                    stall_context[0] ? stall_context : "<empty>");
             }
             if (!has_message)
                 break;
@@ -4774,8 +4878,14 @@ int main(int, char**)
             aida_tracer::g_dispatch_exit_count.fetch_add(1, std::memory_order_acq_rel);
             uint64_t dispatch_elapsed = static_cast<uint64_t>(GetTickCount64()) - dispatch_start;
             if (dispatch_elapsed >= 50 || close_related_msg) {
+                char stall_context[4600] = {};
+                if (dispatch_elapsed >= 50)
+                    format_message_pump_stall_context(stall_context, sizeof(stall_context));
+                const char* render_phase = aida_tracer::g_render_phase_name.load(std::memory_order_acquire);
+                const char* render_section = g_render_section.c_str();
+                const char* wndproc_stage = aida_tracer::g_wndproc_stage.load(std::memory_order_acquire);
                 diag::log_tagged_critical_fmt("msgpump",
-                    "dispatch_slow frame=%llu elapsed_ms=%llu result=0x%llX msg=%s(0x%04X) hwnd=0x%llX wp=0x%llX lp=0x%llX",
+                    "dispatch_slow frame=%llu elapsed_ms=%llu result=0x%llX msg=%s(0x%04X) hwnd=0x%llX wp=0x%llX lp=0x%llX render_phase=%s render_section=%s wndproc_stage=%s ctx={%.3600s}",
                     (unsigned long long)frame_number,
                     (unsigned long long)dispatch_elapsed,
                     (unsigned long long)dispatch_result,
@@ -4783,7 +4893,11 @@ int main(int, char**)
                     msg.message,
                     (unsigned long long)reinterpret_cast<UINT_PTR>(msg.hwnd),
                     (unsigned long long)static_cast<UINT_PTR>(msg.wParam),
-                    (unsigned long long)static_cast<LONG_PTR>(msg.lParam));
+                    (unsigned long long)static_cast<LONG_PTR>(msg.lParam),
+                    render_phase ? render_phase : "<null>",
+                    render_section ? render_section : "<null>",
+                    wndproc_stage ? wndproc_stage : "<null>",
+                    stall_context[0] ? stall_context : "<empty>");
             }
             aida_tracer::clear_dispatch_state();
             if (msg.message == WM_QUIT)
@@ -4942,7 +5056,7 @@ int main(int, char**)
                     GetCurrentProcessId(),
                     GetCurrentThreadId(),
                     static_cast<unsigned long long>(GetTickCount64()));
-                bool posted = critical_work_queue::post([] {
+                bool posted = critical_work_queue::post_labeled("render.authorized_feature_init", [] {
                     startup_log_critical_fmt("render_authorized_feature_worker_enter pid=%lu tid=%lu tick=%llu",
                         GetCurrentProcessId(),
                         GetCurrentThreadId(),
