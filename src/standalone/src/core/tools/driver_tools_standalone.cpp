@@ -6546,10 +6546,14 @@ tool_result_t driver_enum_kernel_callbacks(const json& params)
     };
 
     json all_callbacks = json::array();
+    std::size_t callback_type_exports_resolved = 0;
+    std::size_t callback_array_refs_found = 0;
+    std::size_t callbacks_observed = 0;
     for (const auto& t : types)
     {
         std::uint64_t fn_addr = device->resolve_export(ntos_base, t.export_name);
         if (fn_addr == 0) continue;
+        ++callback_type_exports_resolved;
 
         json cb;
         cb["type"] = t.name;
@@ -6617,8 +6621,11 @@ tool_result_t driver_enum_kernel_callbacks(const json& params)
                         }
                         entries.push_back(std::move(e));
                     }
+                    const std::size_t entry_count = entries.size();
+                    ++callback_array_refs_found;
+                    callbacks_observed += entry_count;
                     ref["callbacks"] = std::move(entries);
-                    ref["count"]     = ref["callbacks"].size();
+                    ref["count"]     = entry_count;
                     array_refs.push_back(std::move(ref));
                 }
             }
@@ -6628,6 +6635,15 @@ tool_result_t driver_enum_kernel_callbacks(const json& params)
     }
 
     result["callback_types"] = std::move(all_callbacks);
+    const bool callback_enumeration_ran = callback_type_exports_resolved > 0;
+    const bool zero_callbacks_clean = callback_enumeration_ran && callback_array_refs_found > 0 && callbacks_observed == 0;
+    result["enumeration_ran"] = callback_enumeration_ran;
+    result["clean_state"] = zero_callbacks_clean;
+    result["zero_is_clean_state"] = zero_callbacks_clean;
+    result["proof_count"] = callback_array_refs_found;
+    result["callback_type_exports_resolved"] = callback_type_exports_resolved;
+    result["callback_array_refs_found"] = callback_array_refs_found;
+    result["callbacks_observed"] = callbacks_observed;
     result["note"] = OBFSTR("Kernel callbacks are used by anti-cheats (EAC/BattlEye/Vanguard) to monitor "
                             "process creation, thread creation, image loading, and registry access.");
     return tool_result_t::ok(OBFSTR("Kernel callback enumeration complete"), result);
@@ -6757,15 +6773,24 @@ tool_result_t driver_detect_integrity_checks(const json& params)
         }
     }
 
+    const std::size_t hook_count = hooks.size();
+    const std::size_t clean_count = clean.size();
+    const bool integrity_scan_ran = checked > 0;
+    const bool zero_hooks_clean = integrity_scan_ran && hook_count == 0 && clean_count == static_cast<std::size_t>(checked);
     json result;
     result["ntoskrnl_base"]     = sa_format_address(static_cast<uint64_t>(ntos_base));
     result["functions_checked"] = checked;
-    result["hooks_found"]       = hooks.size();
+    result["hooks_found"]       = hook_count;
+    result["scan_ran"]          = integrity_scan_ran;
+    result["clean_state"]       = zero_hooks_clean;
+    result["zero_is_clean_state"] = zero_hooks_clean;
+    result["proof_count"]       = clean_count;
+    result["clean_function_count"] = clean_count;
     result["hooked_functions"]  = std::move(hooks);
     result["clean_functions"]   = std::move(clean);
     result["note"] = OBFSTR("Kernel function hooks indicate anti-cheat monitoring. Hooked functions route through "
                             "the anti-cheat driver, which can block, log, or alter calls from target processes.");
-    return tool_result_t::ok(OBFSTR("Kernel integrity: ") + std::to_string(result["hooks_found"].get<std::size_t>()) +
+    return tool_result_t::ok(OBFSTR("Kernel integrity: ") + std::to_string(hook_count) +
                              OBFSTR(" hooks in ") + std::to_string(checked) + OBFSTR(" functions"), result);
 }
 
@@ -6949,6 +6974,8 @@ tool_result_t driver_detect_ssdt_hooks(const json&)
         }
     }
 
+    const bool ssdt_scan_ran = entries_read >= read_sz && ssdt.num_services > 0;
+    const bool zero_ssdt_hooks_clean = ssdt_scan_ran && hooks_found == 0 && clean_count == static_cast<int>(ssdt.num_services);
     json result;
     result["ssdt_address"]      = sa_format_address(static_cast<uint64_t>(ssdt_addr));
     result["ssdt_descriptor_address"] = sa_format_address(static_cast<uint64_t>(ssdt_addr));
@@ -6960,6 +6987,11 @@ tool_result_t driver_detect_ssdt_hooks(const json&)
     result["total_services"]    = ssdt.num_services;
     result["hooks_found"]       = hooks_found;
     result["clean_services"]    = clean_count;
+    result["scan_ran"]          = ssdt_scan_ran;
+    result["clean_state"]       = zero_ssdt_hooks_clean;
+    result["zero_is_clean_state"] = zero_ssdt_hooks_clean;
+    result["proof_count"]       = clean_count;
+    result["entries_read_bytes"] = entries_read;
     result["ntoskrnl_range"]    = sa_format_address(static_cast<uint64_t>(ntos_base)) + " - " +
                                   sa_format_address(static_cast<uint64_t>(ntos_end));
     result["hooked_entries"]    = std::move(hooked);
@@ -7209,6 +7241,10 @@ tool_result_t driver_detect_etw_monitors(const json& params)
     std::uint64_t etw_register     = device->resolve_export(ntos_base, "EtwRegister");
 
     json providers = json::array();
+    std::size_t active_provider_count = 0;
+    std::size_t known_guid_matches = 0;
+    std::size_t etw_sections_scanned = 0;
+    std::size_t etw_modules_scanned = 0;
 
 
     if (etw_threat_intel != 0)
@@ -7223,8 +7259,10 @@ tool_result_t driver_detect_etw_monitors(const json& params)
         ti["status"]  = (reg_handle != 0) ? "active" : "inactive";
         ti["note"]    = OBFSTR("ETW-TI monitors process injection, executable memory allocation, and other "
                                "security-sensitive operations. Used by EDR and anti-cheat for real-time telemetry.");
-        if (reg_handle != 0)
+        if (reg_handle != 0) {
             ti["reg_handle"] = sa_format_address(static_cast<uint64_t>(reg_handle));
+            ++active_provider_count;
+        }
         providers.push_back(std::move(ti));
     }
 
@@ -7260,11 +7298,14 @@ tool_result_t driver_detect_etw_monitors(const json& params)
         size_t sec_sz  = std::min(vs, (std::uint32_t)0x100000);
 
         std::vector<uint8_t> sec_data(sec_sz);
-        device->read_kernel_raw(sec_addr, sec_data.data(), sec_sz);
+        size_t sec_read = device->read_kernel_raw(sec_addr, sec_data.data(), sec_sz);
+        if (sec_read < 16) continue;
+        ++etw_sections_scanned;
+        const size_t sec_limit = std::min(sec_sz, sec_read);
 
         for (const auto& g : known_guids)
         {
-            for (size_t off = 0; off + 16 <= sec_sz; ++off)
+            for (size_t off = 0; off + 16 <= sec_limit; ++off)
             {
                 if (std::memcmp(&sec_data[off], g.bytes, 16) == 0)
                 {
@@ -7273,6 +7314,7 @@ tool_result_t driver_detect_etw_monitors(const json& params)
                     prov["address"] = sa_format_address(static_cast<uint64_t>(sec_addr + off));
                     prov["status"]  = "guid_found";
                     providers.push_back(std::move(prov));
+                    ++known_guid_matches;
                     break;
                 }
             }
@@ -7305,10 +7347,13 @@ tool_result_t driver_detect_etw_monitors(const json& params)
 
 
         uint8_t scan_buf[0x1000];
-        device->read_kernel_raw(mod_base, scan_buf, sizeof(scan_buf));
+        size_t scan_read = device->read_kernel_raw(mod_base, scan_buf, sizeof(scan_buf));
+        if (scan_read < 16) continue;
+        ++etw_modules_scanned;
+        const size_t scan_limit = std::min(sizeof(scan_buf), scan_read);
 
 
-        for (size_t off = 0; off + 11 < sizeof(scan_buf); ++off)
+        for (size_t off = 0; off + 11 < scan_limit; ++off)
         {
             if (std::memcmp(&scan_buf[off], "EtwRegis", 8) == 0 ||
                 std::memcmp(&scan_buf[off], "EtwWrite", 8) == 0 ||
@@ -7318,7 +7363,7 @@ tool_result_t driver_detect_etw_monitors(const json& params)
                 em["module"]  = mod_name;
                 em["address"] = sa_format_address(static_cast<uint64_t>(mod_base));
                 em["etw_api_found"] = std::string(reinterpret_cast<const char*>(&scan_buf[off]),
-                                                   std::min((size_t)32, sizeof(scan_buf) - off));
+                                                   std::min((size_t)32, scan_limit - off));
 
                 auto& s = em["etw_api_found"].get_ref<std::string&>();
                 auto nul = s.find('\0');
@@ -7333,14 +7378,29 @@ tool_result_t driver_detect_etw_monitors(const json& params)
     result["ntoskrnl_base"]     = sa_format_address(static_cast<uint64_t>(ntos_base));
     result["etw_register"]      = (etw_register != 0) ? sa_format_address(static_cast<uint64_t>(etw_register)) : "not_found";
     result["threat_intel"]      = (etw_threat_intel != 0) ? sa_format_address(static_cast<uint64_t>(etw_threat_intel)) : "not_exported";
+    const std::size_t provider_artifact_count = providers.size();
+    const std::size_t consumer_module_count = etw_modules.size();
+    const std::size_t monitor_count = active_provider_count + consumer_module_count;
+    const bool etw_scan_ran = etw_sections_scanned > 0 || etw_modules_scanned > 0 || etw_threat_intel != 0 || etw_register != 0;
+    const bool zero_monitors_clean = etw_scan_ran && monitor_count == 0;
+    result["scan_ran"]          = etw_scan_ran;
+    result["clean_state"]       = zero_monitors_clean;
+    result["zero_is_clean_state"] = zero_monitors_clean;
+    result["proof_count"]       = etw_sections_scanned + etw_modules_scanned + (etw_threat_intel != 0 ? 1u : 0u) + (etw_register != 0 ? 1u : 0u);
+    result["active_provider_count"] = active_provider_count;
+    result["known_guid_matches"] = known_guid_matches;
+    result["provider_artifact_count"] = provider_artifact_count;
+    result["monitor_count"] = monitor_count;
+    result["sections_scanned"] = etw_sections_scanned;
+    result["modules_scanned_for_etw"] = etw_modules_scanned;
     result["providers"]         = std::move(providers);
     result["etw_consumer_modules"] = std::move(etw_modules);
     result["note"] = OBFSTR("ETW (Event Tracing for Windows) provides kernel-level telemetry. The Threat Intelligence "
                             "provider detects process injection, executable memory allocation, and suspicious API sequences. "
                             "Anti-cheats and EDRs subscribe to these events for real-time detection.");
 
-    return tool_result_t::ok(OBFSTR("ETW monitors: ") + std::to_string(result["providers"].size()) +
-                             OBFSTR(" providers, ") + std::to_string(result["etw_consumer_modules"].size()) +
+    return tool_result_t::ok(OBFSTR("ETW monitors: ") + std::to_string(provider_artifact_count) +
+                             OBFSTR(" providers, ") + std::to_string(consumer_module_count) +
                              OBFSTR(" consumer modules"), result);
 }
 

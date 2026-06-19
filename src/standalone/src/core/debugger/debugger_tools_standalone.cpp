@@ -317,6 +317,197 @@ static bool deadline_expired(const std::chrono::steady_clock::time_point& deadli
     return std::chrono::steady_clock::now() >= deadline || mcp_standalone::current_call_cancelled();
 }
 
+static bool modules_detail_deadline_expired(const std::chrono::steady_clock::time_point* deadline)
+{
+    return deadline && deadline_expired(*deadline);
+}
+
+static bool read_target_memory_exact(std::uint64_t addr, void* buf, std::size_t size)
+{
+    std::vector<std::uint8_t> tmp;
+    if (!driver_bridge::read_memory(addr, size, tmp))
+        return false;
+    if (tmp.size() < size)
+        return false;
+    std::memcpy(buf, tmp.data(), size);
+    return true;
+}
+
+static bool read_target_c_string(std::uint64_t addr, std::size_t max_len, std::string& out)
+{
+    out.clear();
+    constexpr std::size_t chunk = 256;
+    std::size_t total = 0;
+    while (total < max_len) {
+        std::size_t to_read = chunk;
+        if (total + to_read > max_len)
+            to_read = max_len - total;
+        std::vector<std::uint8_t> tmp;
+        if (!driver_bridge::read_memory(addr + total, to_read, tmp) || tmp.empty())
+            break;
+        for (std::uint8_t b : tmp) {
+            if (b == 0)
+                return true;
+            out.push_back(static_cast<char>(b));
+            if (out.size() >= max_len)
+                return true;
+        }
+        if (tmp.size() < to_read)
+            break;
+        total += tmp.size();
+    }
+    return !out.empty();
+}
+
+static bool parse_exports_for_modules_detail(std::uint64_t module_base,
+                                             const pe_parser::pe_info_t& pe,
+                                             std::vector<pe_parser::export_entry_t>& out,
+                                             std::size_t max_entries,
+                                             const std::chrono::steady_clock::time_point* deadline,
+                                             bool* truncated,
+                                             bool* deadline_hit)
+{
+    out.clear();
+    if (truncated)
+        *truncated = false;
+    if (deadline_hit)
+        *deadline_hit = false;
+    auto hit_deadline = [&]() {
+        if (truncated)
+            *truncated = true;
+        if (deadline_hit)
+            *deadline_hit = true;
+    };
+
+    if (pe.export_dir_rva == 0 || pe.export_dir_size == 0)
+        return true;
+    if (max_entries == 0) {
+        if (truncated)
+            *truncated = true;
+        return true;
+    }
+    if (modules_detail_deadline_expired(deadline)) {
+        hit_deadline();
+        return false;
+    }
+
+    std::uint8_t dir_buf[40] = {};
+    if (!read_target_memory_exact(module_base + pe.export_dir_rva, dir_buf, sizeof(dir_buf)))
+        return false;
+
+    std::uint32_t ordinal_base = 0;
+    std::uint32_t num_functions = 0;
+    std::uint32_t num_names = 0;
+    std::uint32_t addr_table_rva = 0;
+    std::uint32_t name_table_rva = 0;
+    std::uint32_t ordinal_table_rva = 0;
+    std::memcpy(&ordinal_base, dir_buf + 16, sizeof(ordinal_base));
+    std::memcpy(&num_functions, dir_buf + 20, sizeof(num_functions));
+    std::memcpy(&num_names, dir_buf + 24, sizeof(num_names));
+    std::memcpy(&addr_table_rva, dir_buf + 28, sizeof(addr_table_rva));
+    std::memcpy(&name_table_rva, dir_buf + 32, sizeof(name_table_rva));
+    std::memcpy(&ordinal_table_rva, dir_buf + 36, sizeof(ordinal_table_rva));
+
+    if (num_functions == 0 || num_functions > 0x10000)
+        return true;
+    if (num_names > num_functions)
+        num_names = num_functions;
+    if (addr_table_rva == 0)
+        return false;
+
+    std::vector<std::uint32_t> addr_table(num_functions);
+    if (!read_target_memory_exact(module_base + addr_table_rva, addr_table.data(), addr_table.size() * sizeof(std::uint32_t)))
+        return false;
+
+    std::uint32_t exp_start = pe.export_dir_rva;
+    std::uint32_t exp_end = pe.export_dir_rva + pe.export_dir_size;
+    if (exp_end < exp_start)
+        exp_end = (std::numeric_limits<std::uint32_t>::max)();
+
+    out.reserve(std::min<std::size_t>(static_cast<std::size_t>(num_functions), max_entries));
+    std::vector<std::int32_t> ordinal_to_output(num_functions, -1);
+    for (std::uint32_t i = 0; i < num_functions; ++i) {
+        if (out.size() >= max_entries) {
+            if (truncated)
+                *truncated = true;
+            break;
+        }
+        if (modules_detail_deadline_expired(deadline)) {
+            hit_deadline();
+            return true;
+        }
+        if (addr_table[i] == 0)
+            continue;
+
+        pe_parser::export_entry_t entry;
+        entry.ordinal = static_cast<std::uint16_t>(ordinal_base + i);
+        entry.rva = addr_table[i];
+        entry.address = module_base + addr_table[i];
+        entry.is_forwarded = addr_table[i] >= exp_start && addr_table[i] < exp_end;
+        ordinal_to_output[i] = static_cast<std::int32_t>(out.size());
+        out.push_back(std::move(entry));
+    }
+
+    if (num_names == 0 || out.empty() || name_table_rva == 0 || ordinal_table_rva == 0)
+        return true;
+    if (modules_detail_deadline_expired(deadline)) {
+        hit_deadline();
+        return true;
+    }
+
+    std::vector<std::uint32_t> name_ptrs(num_names);
+    std::vector<std::uint16_t> ordinals(num_names);
+    if (!read_target_memory_exact(module_base + name_table_rva, name_ptrs.data(), name_ptrs.size() * sizeof(std::uint32_t))) {
+        if (truncated)
+            *truncated = true;
+        return true;
+    }
+    if (!read_target_memory_exact(module_base + ordinal_table_rva, ordinals.data(), ordinals.size() * sizeof(std::uint16_t))) {
+        if (truncated)
+            *truncated = true;
+        return true;
+    }
+
+    std::size_t unnamed = 0;
+    for (const auto& entry : out) {
+        if (entry.name.empty())
+            ++unnamed;
+    }
+
+    for (std::uint32_t i = 0; i < num_names && unnamed > 0; ++i) {
+        if (modules_detail_deadline_expired(deadline)) {
+            hit_deadline();
+            return true;
+        }
+        const std::uint16_t ord = ordinals[i];
+        if (ord >= num_functions)
+            continue;
+        const std::int32_t out_index = ordinal_to_output[ord];
+        if (out_index < 0)
+            continue;
+        auto& entry = out[static_cast<std::size_t>(out_index)];
+        if (!entry.name.empty())
+            continue;
+        std::string name;
+        if (read_target_c_string(module_base + name_ptrs[i], 512, name) && !name.empty()) {
+            entry.name = std::move(name);
+            --unnamed;
+        }
+    }
+
+    for (auto& entry : out) {
+        if (!entry.is_forwarded)
+            continue;
+        if (modules_detail_deadline_expired(deadline)) {
+            hit_deadline();
+            return true;
+        }
+        read_target_c_string(module_base + entry.rva, 512, entry.forward_name);
+    }
+
+    return true;
+}
+
 static std::string lower_ascii(std::string s)
 {
     for (char& c : s)
@@ -3101,14 +3292,20 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
          {OBFSTR("timeout_ms"), OBFSTR("number"), OBFSTR("Maximum elapsed time before returning partial results"), false},
          {OBFSTR("allow_partial"), OBFSTR("boolean"), OBFSTR("Return partial results without marking the payload as timed out"), false}},
         [](const json& params) -> tool_result_t {
+            const auto handler_start = std::chrono::steady_clock::now();
+            auto elapsed_ms = [&]() -> long long {
+                return std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - handler_start).count();
+            };
+            auto deadline_remaining_ms = [](const std::chrono::steady_clock::time_point& point) -> long long {
+                const auto now = std::chrono::steady_clock::now();
+                if (now >= point)
+                    return 0;
+                return std::chrono::duration_cast<std::chrono::milliseconds>(point - now).count();
+            };
             diag::log_tagged_fmt("dbg_tools", "dbg_get_modules_detail: entry");
             if (auto err = ensure_attached(params)) return *err;
-            diag::log_tagged_fmt("dbg_tools", "dbg_get_modules_detail: calling module_view::refresh");
-            module_view::refresh();
             const int timeout_ms = int_param_clamped(params, "timeout_ms", 5000, 500, 60000);
-            auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-            while (module_view::g_ui.loading.load(std::memory_order_acquire) && !deadline_expired(deadline))
-                Sleep(25);
             std::string filter;
             if (params.contains("module_name") && params["module_name"].is_string())
                 filter = params["module_name"].get<std::string>();
@@ -3117,46 +3314,141 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             const int max_exports = int_param_clamped(params, "max_exports", 50, 0, 1000);
             const int max_imports = int_param_clamped(params, "max_imports", 50, 0, 1000);
             const bool allow_partial = params.value("allow_partial", false);
+            const bool focused_single = !filter.empty() && max_modules == 1;
+            auto deadline = handler_start + std::chrono::milliseconds(timeout_ms);
+
             std::vector<driver_bridge::module_info_t> mods;
-            {
-                std::lock_guard<std::mutex> lk(module_view::g_ui.modules_mutex);
-                mods = module_view::g_ui.modules;
-            }
-            if (mods.empty() || module_view::g_ui.loading.load(std::memory_order_acquire)) {
+            size_t cached_count = 0;
+            size_t direct_count = 0;
+            bool direct_used = false;
+            long long enumeration_ms = 0;
+            long long refresh_ms = 0;
+            bool loading_after_refresh = module_view::g_ui.loading.load(std::memory_order_acquire);
+            bool refresh_skipped = false;
+
+            if (focused_single) {
+                const auto enum_start = std::chrono::steady_clock::now();
                 auto direct = driver_bridge::enumerate_modules();
+                enumeration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - enum_start).count();
+                direct_count = direct.size();
                 if (!direct.empty()) {
-                    diag::log_tagged_fmt("dbg_tools",
-                        "dbg_get_modules_detail: using direct module enumeration cached=%zu direct=%zu loading=%d",
-                        mods.size(),
-                        direct.size(),
-                        module_view::g_ui.loading.load(std::memory_order_acquire) ? 1 : 0);
                     mods = std::move(direct);
+                    direct_used = true;
+                    refresh_skipped = true;
                     deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
                 }
             }
-            if (!mods.empty() && deadline_expired(deadline))
-                deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::min(timeout_ms, 3000));
+
+            if (!refresh_skipped) {
+                const auto refresh_start = std::chrono::steady_clock::now();
+                diag::log_tagged_fmt("dbg_tools",
+                    "dbg_get_modules_detail: refresh_begin filter=%s max_modules=%d max_exports=%d max_imports=%d timeout_ms=%d",
+                    filter.empty() ? "<none>" : filter.c_str(),
+                    max_modules,
+                    max_exports,
+                    max_imports,
+                    timeout_ms);
+                module_view::refresh();
+                while (module_view::g_ui.loading.load(std::memory_order_acquire) && !deadline_expired(deadline))
+                    Sleep(25);
+                refresh_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - refresh_start).count();
+                loading_after_refresh = module_view::g_ui.loading.load(std::memory_order_acquire);
+                diag::log_tagged_fmt("dbg_tools",
+                    "dbg_get_modules_detail: refresh_done elapsed_ms=%lld loading=%d deadline_hit=%d total_ms=%lld",
+                    refresh_ms,
+                    loading_after_refresh ? 1 : 0,
+                    deadline_expired(deadline) ? 1 : 0,
+                    elapsed_ms());
+                {
+                    std::lock_guard<std::mutex> lk(module_view::g_ui.modules_mutex);
+                    mods = module_view::g_ui.modules;
+                }
+                cached_count = mods.size();
+            } else {
+                {
+                    std::lock_guard<std::mutex> lk(module_view::g_ui.modules_mutex);
+                    cached_count = module_view::g_ui.modules.size();
+                }
+                diag::log_tagged_fmt("dbg_tools",
+                    "dbg_get_modules_detail: refresh_skipped reason=focused_direct filter=%s direct=%zu loading=%d enum_ms=%lld total_ms=%lld",
+                    filter.c_str(),
+                    direct_count,
+                    loading_after_refresh ? 1 : 0,
+                    enumeration_ms,
+                    elapsed_ms());
+            }
+
+            if (!direct_used && (mods.empty() || loading_after_refresh)) {
+                const auto enum_start = std::chrono::steady_clock::now();
+                auto direct = driver_bridge::enumerate_modules();
+                enumeration_ms += std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - enum_start).count();
+                direct_count = direct.size();
+                if (!direct.empty()) {
+                    mods = std::move(direct);
+                    direct_used = true;
+                    deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+                }
+            }
+            if (direct_used) {
+                diag::log_tagged_fmt("dbg_tools",
+                    "dbg_get_modules_detail: using direct module enumeration cached=%zu direct=%zu loading=%d focused=%d",
+                    cached_count,
+                    direct_count,
+                    loading_after_refresh ? 1 : 0,
+                    focused_single ? 1 : 0);
+            }
+            const size_t prefilter_count = mods.size();
+            if (!filter.empty()) {
+                std::vector<driver_bridge::module_info_t> filtered;
+                filtered.reserve(std::min<size_t>(mods.size(), static_cast<size_t>(max_modules)));
+                const std::string lower_filter = lower_ascii(filter);
+                for (const auto& m : mods) {
+                    const std::string lower_name = lower_ascii(m.name);
+                    const std::string lower_path = lower_ascii(m.path);
+                    if (lower_name.find(lower_filter) == std::string::npos &&
+                        lower_path.find(lower_filter) == std::string::npos)
+                        continue;
+                    filtered.push_back(m);
+                    if (focused_single)
+                        break;
+                }
+                mods = std::move(filtered);
+            }
+            diag::log_tagged_fmt("dbg_tools",
+                "dbg_get_modules_detail: enumeration_done cached=%zu direct=%zu direct_used=%d prefilter=%zu filtered=%zu enum_ms=%lld deadline_hit=%d total_ms=%lld",
+                cached_count,
+                direct_count,
+                direct_used ? 1 : 0,
+                prefilter_count,
+                mods.size(),
+                enumeration_ms,
+                deadline_expired(deadline) ? 1 : 0,
+                elapsed_ms());
+
             json arr = json::array();
-            bool truncated = false;
-            bool timed_out = false;
+            bool request_truncated = false;
+            bool module_limit_truncated = false;
+            bool deadline_hit = false;
+            bool deadline_prevented_result = false;
+            bool detail_deadline_hit = false;
+            bool detail_omitted_by_deadline = false;
+            bool detail_parse_incomplete = false;
+            json phase_timings = json::array();
             for (const auto& m : mods) {
                 if (arr.size() >= static_cast<size_t>(max_modules)) {
-                    truncated = true;
+                    module_limit_truncated = true;
                     break;
                 }
                 if (deadline_expired(deadline)) {
-                    timed_out = true;
-                    truncated = true;
+                    deadline_hit = true;
+                    if (arr.empty() || !focused_single)
+                        deadline_prevented_result = true;
                     break;
                 }
-                if (!filter.empty()) {
-                    std::string lower_name = m.name;
-                    std::string lower_filter = filter;
-                    for (auto& c : lower_name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                    for (auto& c : lower_filter) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                    if (lower_name.find(lower_filter) == std::string::npos)
-                        continue;
-                }
+                const auto module_start = std::chrono::steady_clock::now();
                 json mj;
                 mj["name"] = m.name;
                 mj["base"] = sa_format_address(m.base);
@@ -3167,8 +3459,50 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 mj["imports_requested"] = max_imports > 0;
                 mj["exports_omitted_by_request"] = false;
                 mj["imports_omitted_by_request"] = false;
+                diag::log_tagged_fmt("dbg_tools",
+                    "dbg_get_modules_detail: module_begin name=%s base=0x%llX size=%llu focused=%d detail_order=%s remaining_ms=%lld total_ms=%lld",
+                    m.name.c_str(),
+                    static_cast<unsigned long long>(m.base),
+                    static_cast<unsigned long long>(m.size),
+                    focused_single ? 1 : 0,
+                    focused_single ? "imports_first" : "exports_first",
+                    deadline_remaining_ms(deadline),
+                    elapsed_ms());
                 pe_parser::pe_info_t pe;
-                if (pe_parser::parse(m.base, pe, false)) {
+                const auto pe_start = std::chrono::steady_clock::now();
+                diag::log_tagged_fmt("dbg_tools",
+                    "dbg_get_modules_detail: pe_parse_begin name=%s base=0x%llX remaining_ms=%lld",
+                    m.name.c_str(),
+                    static_cast<unsigned long long>(m.base),
+                    deadline_remaining_ms(deadline));
+                const bool pe_ok = pe_parser::parse(m.base, pe, false);
+                const long long pe_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - pe_start).count();
+                long long export_ms = 0;
+                long long import_ms = 0;
+                bool exports_truncated = false;
+                bool imports_truncated = false;
+                bool exports_deadline = false;
+                bool imports_deadline = false;
+                bool exports_parse_ok = false;
+                bool imports_parse_ok = false;
+                bool exports_omitted_by_deadline = false;
+                bool imports_omitted_by_deadline = false;
+                bool exports_detail_complete = max_exports == 0;
+                bool imports_detail_complete = max_imports == 0;
+                std::size_t export_count_value = 0;
+                std::size_t import_count_value = 0;
+                diag::log_tagged_fmt("dbg_tools",
+                    "dbg_get_modules_detail: pe_parse_done name=%s base=0x%llX ok=%d pe_ms=%lld remaining_ms=%lld sections=%zu export_rva=0x%X import_rva=0x%X",
+                    m.name.c_str(),
+                    static_cast<unsigned long long>(m.base),
+                    pe_ok ? 1 : 0,
+                    pe_ms,
+                    deadline_remaining_ms(deadline),
+                    pe.sections.size(),
+                    pe.export_dir_rva,
+                    pe.import_dir_rva);
+                if (pe_ok) {
                     mj["pe_parsed"] = true;
                     mj["entry_point"] = sa_format_address(pe.entry_point);
                     mj["is_64bit"] = pe.is_64bit;
@@ -3183,13 +3517,94 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                     }
                     mj["sections"] = std::move(sections);
                     json exp_arr = json::array();
-                    if (max_exports > 0) {
+                    json imp_arr = json::array();
+                    auto run_export_phase = [&]() {
+                        if (max_exports <= 0) {
+                            mj["export_count"] = 0;
+                            mj["exports_truncated"] = false;
+                            mj["exports_parse_ok"] = true;
+                            mj["exports_detail_complete"] = true;
+                            mj["exports_omitted_by_request"] = true;
+                            mj["exports_omitted_by_deadline"] = false;
+                            mj["exports_omitted_reason"] = "max_exports_zero";
+                            diag::log_tagged_fmt("dbg_tools",
+                                "dbg_get_modules_detail: export_omitted name=%s reason=max_exports_zero total_ms=%lld",
+                                m.name.c_str(),
+                                elapsed_ms());
+                            return;
+                        }
+                        if (deadline_expired(deadline)) {
+                            exports_deadline = true;
+                            exports_truncated = true;
+                            exports_omitted_by_deadline = true;
+                            detail_deadline_hit = true;
+                            detail_omitted_by_deadline = true;
+                            detail_parse_incomplete = true;
+                            mj["export_count"] = 0;
+                            mj["exports_truncated"] = true;
+                            mj["exports_parse_ok"] = false;
+                            mj["exports_detail_complete"] = false;
+                            mj["exports_omitted_by_deadline"] = true;
+                            mj["exports_omitted_reason"] = "deadline_before_exports";
+                            diag::log_tagged_fmt("dbg_tools",
+                                "dbg_get_modules_detail: export_omitted name=%s reason=deadline_before_exports remaining_ms=0 total_ms=%lld",
+                                m.name.c_str(),
+                                elapsed_ms());
+                            return;
+                        }
+
                         std::vector<pe_parser::export_entry_t> exports;
-                        bool exports_truncated = false;
-                        pe_parser::parse_exports(m.base, pe, exports, static_cast<size_t>(max_exports), &deadline, &exports_truncated);
-                        if (exports_truncated) truncated = true;
+                        const auto export_start = std::chrono::steady_clock::now();
+                        bool export_phase_deadline = false;
+                        diag::log_tagged_fmt("dbg_tools",
+                            "dbg_get_modules_detail: export_phase_begin name=%s parser=%s max_exports=%d remaining_ms=%lld",
+                            m.name.c_str(),
+                            focused_single ? "bounded" : "pe_parser",
+                            max_exports,
+                            deadline_remaining_ms(deadline));
+                        if (focused_single) {
+                            exports_parse_ok = parse_exports_for_modules_detail(
+                                m.base,
+                                pe,
+                                exports,
+                                static_cast<std::size_t>(max_exports),
+                                &deadline,
+                                &exports_truncated,
+                                &export_phase_deadline);
+                        } else {
+                            exports_parse_ok = pe_parser::parse_exports(
+                                m.base,
+                                pe,
+                                exports,
+                                static_cast<std::size_t>(max_exports),
+                                &deadline,
+                                &exports_truncated);
+                            export_phase_deadline = deadline_expired(deadline);
+                        }
+                        export_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - export_start).count();
+                        exports_deadline = export_phase_deadline || deadline_expired(deadline);
+                        export_count_value = exports.size();
+                        if (exports_truncated)
+                            request_truncated = true;
+                        if (exports_deadline) {
+                            detail_deadline_hit = true;
+                            detail_omitted_by_deadline = true;
+                            detail_parse_incomplete = true;
+                            exports_omitted_by_deadline = true;
+                        } else if (!exports_parse_ok) {
+                            detail_parse_incomplete = true;
+                        }
+                        exports_detail_complete = exports_parse_ok && !exports_deadline;
                         mj["export_count"] = exports.size();
                         mj["exports_truncated"] = exports_truncated;
+                        mj["exports_parse_ok"] = exports_parse_ok;
+                        mj["exports_detail_complete"] = exports_detail_complete;
+                        mj["exports_omitted_by_deadline"] = exports_omitted_by_deadline;
+                        if (exports_omitted_by_deadline)
+                            mj["exports_omitted_reason"] = exports.empty() ? "deadline_before_export_rows" : "deadline_during_exports";
+                        else if (!exports_parse_ok)
+                            mj["exports_omitted_reason"] = "export_parse_failed";
                         size_t exp_limit = std::min<size_t>(exports.size(), static_cast<size_t>(max_exports));
                         for (size_t ei = 0; ei < exp_limit; ++ei) {
                             json ej;
@@ -3199,22 +3614,93 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                             if (exports[ei].is_forwarded) ej["forward"] = exports[ei].forward_name;
                             exp_arr.push_back(std::move(ej));
                         }
-                    } else {
-                        mj["export_count"] = 0;
-                        mj["exports_truncated"] = false;
-                        mj["exports_omitted_by_request"] = true;
-                        mj["exports_omitted_reason"] = "max_exports_zero";
-                    }
-                    mj["exports"] = std::move(exp_arr);
-                    json imp_arr = json::array();
-                    if (max_imports > 0) {
+                        diag::log_tagged_fmt("dbg_tools",
+                            "dbg_get_modules_detail: export_phase_done name=%s ok=%d count=%zu json_count=%zu truncated=%d deadline=%d omitted_deadline=%d complete=%d export_ms=%lld remaining_ms=%lld total_ms=%lld",
+                            m.name.c_str(),
+                            exports_parse_ok ? 1 : 0,
+                            exports.size(),
+                            exp_arr.size(),
+                            exports_truncated ? 1 : 0,
+                            exports_deadline ? 1 : 0,
+                            exports_omitted_by_deadline ? 1 : 0,
+                            exports_detail_complete ? 1 : 0,
+                            export_ms,
+                            deadline_remaining_ms(deadline),
+                            elapsed_ms());
+                    };
+                    auto run_import_phase = [&]() {
+                        if (max_imports <= 0) {
+                            mj["import_count"] = 0;
+                            mj["imports_truncated"] = false;
+                            mj["imports_parse_ok"] = true;
+                            mj["imports_detail_complete"] = true;
+                            mj["imports_omitted_by_request"] = true;
+                            mj["imports_omitted_by_deadline"] = false;
+                            mj["imports_omitted_reason"] = "max_imports_zero";
+                            diag::log_tagged_fmt("dbg_tools",
+                                "dbg_get_modules_detail: import_omitted name=%s reason=max_imports_zero total_ms=%lld",
+                                m.name.c_str(),
+                                elapsed_ms());
+                            return;
+                        }
+                        if (deadline_expired(deadline)) {
+                            imports_deadline = true;
+                            imports_truncated = true;
+                            imports_omitted_by_deadline = true;
+                            detail_deadline_hit = true;
+                            detail_omitted_by_deadline = true;
+                            detail_parse_incomplete = true;
+                            mj["import_count"] = 0;
+                            mj["imports_truncated"] = true;
+                            mj["imports_parse_ok"] = false;
+                            mj["imports_detail_complete"] = false;
+                            mj["imports_omitted_by_deadline"] = true;
+                            mj["imports_omitted_reason"] = "deadline_before_imports";
+                            diag::log_tagged_fmt("dbg_tools",
+                                "dbg_get_modules_detail: import_omitted name=%s reason=deadline_before_imports remaining_ms=0 total_ms=%lld",
+                                m.name.c_str(),
+                                elapsed_ms());
+                            return;
+                        }
+
                         std::vector<pe_parser::import_entry_t> imports;
-                        bool imports_truncated = false;
-                        pe_parser::parse_imports(m.base, pe, imports, static_cast<size_t>(max_imports), &deadline, &imports_truncated);
-                        if (imports_truncated) truncated = true;
-                        if (deadline_expired(deadline)) timed_out = true;
+                        const auto import_start = std::chrono::steady_clock::now();
+                        diag::log_tagged_fmt("dbg_tools",
+                            "dbg_get_modules_detail: import_phase_begin name=%s max_imports=%d remaining_ms=%lld",
+                            m.name.c_str(),
+                            max_imports,
+                            deadline_remaining_ms(deadline));
+                        imports_parse_ok = pe_parser::parse_imports(
+                            m.base,
+                            pe,
+                            imports,
+                            static_cast<std::size_t>(max_imports),
+                            &deadline,
+                            &imports_truncated);
+                        import_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - import_start).count();
+                        imports_deadline = deadline_expired(deadline);
+                        import_count_value = imports.size();
+                        if (imports_truncated)
+                            request_truncated = true;
+                        if (imports_deadline) {
+                            detail_deadline_hit = true;
+                            detail_omitted_by_deadline = true;
+                            detail_parse_incomplete = true;
+                            imports_omitted_by_deadline = true;
+                        } else if (!imports_parse_ok) {
+                            detail_parse_incomplete = true;
+                        }
+                        imports_detail_complete = imports_parse_ok && !imports_deadline;
                         mj["import_count"] = imports.size();
                         mj["imports_truncated"] = imports_truncated;
+                        mj["imports_parse_ok"] = imports_parse_ok;
+                        mj["imports_detail_complete"] = imports_detail_complete;
+                        mj["imports_omitted_by_deadline"] = imports_omitted_by_deadline;
+                        if (imports_omitted_by_deadline)
+                            mj["imports_omitted_reason"] = imports.empty() ? "deadline_before_import_rows" : "deadline_during_imports";
+                        else if (!imports_parse_ok)
+                            mj["imports_omitted_reason"] = "import_parse_failed";
                         size_t imp_limit = std::min<size_t>(imports.size(), static_cast<size_t>(max_imports));
                         for (size_t ii = 0; ii < imp_limit; ++ii) {
                             json ij;
@@ -3223,12 +3709,28 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                             ij["iat_address"] = sa_format_address(imports[ii].iat_address);
                             imp_arr.push_back(std::move(ij));
                         }
+                        diag::log_tagged_fmt("dbg_tools",
+                            "dbg_get_modules_detail: import_phase_done name=%s ok=%d count=%zu json_count=%zu truncated=%d deadline=%d omitted_deadline=%d complete=%d import_ms=%lld remaining_ms=%lld total_ms=%lld",
+                            m.name.c_str(),
+                            imports_parse_ok ? 1 : 0,
+                            imports.size(),
+                            imp_arr.size(),
+                            imports_truncated ? 1 : 0,
+                            imports_deadline ? 1 : 0,
+                            imports_omitted_by_deadline ? 1 : 0,
+                            imports_detail_complete ? 1 : 0,
+                            import_ms,
+                            deadline_remaining_ms(deadline),
+                            elapsed_ms());
+                    };
+                    if (focused_single) {
+                        run_import_phase();
+                        run_export_phase();
                     } else {
-                        mj["import_count"] = 0;
-                        mj["imports_truncated"] = false;
-                        mj["imports_omitted_by_request"] = true;
-                        mj["imports_omitted_reason"] = "max_imports_zero";
+                        run_export_phase();
+                        run_import_phase();
                     }
+                    mj["exports"] = std::move(exp_arr);
                     mj["imports"] = std::move(imp_arr);
                 } else {
                     mj["pe_parsed"] = false;
@@ -3238,23 +3740,109 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                     mj["imports_truncated"] = false;
                     mj["exports_omitted_by_request"] = max_exports == 0;
                     mj["imports_omitted_by_request"] = max_imports == 0;
+                    mj["exports_omitted_by_deadline"] = false;
+                    mj["imports_omitted_by_deadline"] = false;
+                    mj["exports_parse_ok"] = false;
+                    mj["imports_parse_ok"] = false;
+                    mj["exports_detail_complete"] = max_exports == 0;
+                    mj["imports_detail_complete"] = max_imports == 0;
                     mj["exports_omitted_reason"] = max_exports == 0 ? "max_exports_zero" : "pe_parse_failed";
                     mj["imports_omitted_reason"] = max_imports == 0 ? "max_imports_zero" : "pe_parse_failed";
                     mj["exports"] = json::array();
                     mj["imports"] = json::array();
+                    if (max_exports > 0 || max_imports > 0)
+                        detail_parse_incomplete = true;
+                    diag::log_tagged_fmt("dbg_tools",
+                        "dbg_get_modules_detail: detail_omitted name=%s reason=pe_parse_failed exports_requested=%d imports_requested=%d pe_ms=%lld total_ms=%lld",
+                        m.name.c_str(),
+                        max_exports > 0 ? 1 : 0,
+                        max_imports > 0 ? 1 : 0,
+                        pe_ms,
+                        elapsed_ms());
                 }
+                const long long module_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - module_start).count();
+                const bool module_deadline = deadline_expired(deadline);
+                if (module_deadline || exports_deadline || imports_deadline)
+                    deadline_hit = true;
+                json phase;
+                phase["module"] = m.name;
+                phase["base"] = sa_format_address(m.base);
+                phase["pe_ms"] = pe_ms;
+                phase["export_ms"] = export_ms;
+                phase["import_ms"] = import_ms;
+                phase["module_ms"] = module_ms;
+                phase["export_count"] = export_count_value;
+                phase["import_count"] = import_count_value;
+                phase["exports_parse_ok"] = exports_parse_ok;
+                phase["imports_parse_ok"] = imports_parse_ok;
+                phase["exports_detail_complete"] = exports_detail_complete;
+                phase["imports_detail_complete"] = imports_detail_complete;
+                phase["exports_truncated"] = exports_truncated;
+                phase["imports_truncated"] = imports_truncated;
+                phase["exports_deadline"] = exports_deadline;
+                phase["imports_deadline"] = imports_deadline;
+                phase["exports_omitted_by_deadline"] = exports_omitted_by_deadline;
+                phase["imports_omitted_by_deadline"] = imports_omitted_by_deadline;
+                phase["deadline_after_module"] = module_deadline;
+                phase_timings.push_back(phase);
+                diag::log_tagged_fmt("dbg_tools",
+                    "dbg_get_modules_detail: module_done name=%s base=0x%llX pe_ok=%d pe_ms=%lld export_ms=%lld import_ms=%lld module_ms=%lld export_count=%zu import_count=%zu exports_ok=%d imports_ok=%d exports_complete=%d imports_complete=%d exports_truncated=%d imports_truncated=%d exports_deadline=%d imports_deadline=%d exports_omitted_deadline=%d imports_omitted_deadline=%d deadline_after=%d total_ms=%lld",
+                    m.name.c_str(),
+                    static_cast<unsigned long long>(m.base),
+                    pe_ok ? 1 : 0,
+                    pe_ms,
+                    export_ms,
+                    import_ms,
+                    module_ms,
+                    export_count_value,
+                    import_count_value,
+                    exports_parse_ok ? 1 : 0,
+                    imports_parse_ok ? 1 : 0,
+                    exports_detail_complete ? 1 : 0,
+                    imports_detail_complete ? 1 : 0,
+                    exports_truncated ? 1 : 0,
+                    imports_truncated ? 1 : 0,
+                    exports_deadline ? 1 : 0,
+                    imports_deadline ? 1 : 0,
+                    exports_omitted_by_deadline ? 1 : 0,
+                    imports_omitted_by_deadline ? 1 : 0,
+                    module_deadline ? 1 : 0,
+                    elapsed_ms());
                 arr.push_back(std::move(mj));
+                if (focused_single)
+                    break;
             }
             json result;
             const std::size_t count = arr.size();
+            const bool focused_complete = focused_single && count == 1;
+            const bool deadline_incomplete = deadline_prevented_result || detail_omitted_by_deadline || (detail_deadline_hit && detail_parse_incomplete);
+            const bool effective_timed_out = deadline_incomplete || (deadline_hit && !focused_complete);
+            const bool truncated = request_truncated || module_limit_truncated || effective_timed_out;
             result["count"] = count;
             result["truncated"] = truncated;
-            result["timed_out"] = timed_out && !allow_partial;
-            result["partial"] = timed_out;
+            result["timed_out"] = effective_timed_out && !allow_partial;
+            result["partial"] = effective_timed_out;
+            result["deadline_hit"] = deadline_hit;
+            result["deadline_prevented_result"] = deadline_prevented_result;
+            result["deadline_incomplete"] = deadline_incomplete;
+            result["detail_deadline_hit"] = detail_deadline_hit;
+            result["detail_omitted_by_deadline"] = detail_omitted_by_deadline;
+            result["detail_parse_incomplete"] = detail_parse_incomplete;
+            result["focused_complete"] = focused_complete;
+            result["request_truncated"] = request_truncated;
+            result["module_limit_truncated"] = module_limit_truncated;
             result["max_modules"] = max_modules;
             result["max_exports"] = max_exports;
             result["max_imports"] = max_imports;
             result["timeout_ms"] = timeout_ms;
+            result["elapsed_ms"] = elapsed_ms();
+            result["timings"] = {
+                {"refresh_ms", refresh_ms},
+                {"enumeration_ms", enumeration_ms},
+                {"handler_ms", elapsed_ms()},
+                {"modules", phase_timings}
+            };
             result["request"] = {
                 {"module_name", filter},
                 {"max_modules", max_modules},
@@ -3264,8 +3852,24 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 {"allow_partial", allow_partial}
             };
             result["modules"] = std::move(arr);
-            diag::log_tagged_fmt("dbg_tools", "dbg_get_modules_detail: returning %zu modules truncated=%d timed_out=%d",
-                count, truncated ? 1 : 0, timed_out ? 1 : 0);
+            diag::log_tagged_fmt("dbg_tools",
+                "dbg_get_modules_detail: deadline_summary count=%zu focused=%d focused_complete=%d request_truncated=%d module_limit_truncated=%d deadline_hit=%d deadline_prevented=%d deadline_incomplete=%d detail_deadline_hit=%d detail_omitted_by_deadline=%d detail_parse_incomplete=%d effective_timed_out=%d allow_partial=%d elapsed_ms=%lld",
+                count,
+                focused_single ? 1 : 0,
+                focused_complete ? 1 : 0,
+                request_truncated ? 1 : 0,
+                module_limit_truncated ? 1 : 0,
+                deadline_hit ? 1 : 0,
+                deadline_prevented_result ? 1 : 0,
+                deadline_incomplete ? 1 : 0,
+                detail_deadline_hit ? 1 : 0,
+                detail_omitted_by_deadline ? 1 : 0,
+                detail_parse_incomplete ? 1 : 0,
+                effective_timed_out ? 1 : 0,
+                allow_partial ? 1 : 0,
+                elapsed_ms());
+            if (effective_timed_out && !allow_partial)
+                return tool_result_t{false, OBFSTR("Module detail collection did not complete within the timeout."), result};
             return tool_result_t::ok(
                 std::to_string(result["count"].get<size_t>()) + OBFSTR(" module(s)."), result);
         }, true});

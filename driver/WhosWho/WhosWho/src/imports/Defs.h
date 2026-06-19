@@ -313,6 +313,177 @@ namespace ssdt_resolver {
     inline volatile LONG g_ctx_funcs_resolved = 0;
     inline volatile UINT64 g_lstar = 0;
 
+    struct ntdll_lookup_result_t {
+        PVOID peb;
+        PVOID ldr;
+        PVOID list_head;
+        PVOID list_entry;
+        PVOID ntdll_base;
+        ULONG module_count;
+        ULONG named_count;
+        ULONG match_index;
+        char selected_name[32];
+        char first_name[32];
+        char second_name[32];
+        const char* reason;
+    };
+
+    __forceinline WCHAR lower_wchar(WCHAR c)
+    {
+        if (c >= L'A' && c <= L'Z')
+            return static_cast<WCHAR>(c + (L'a' - L'A'));
+        return c;
+    }
+
+    __forceinline void copy_unicode_ascii(PCUNICODE_STRING text, char* out, SIZE_T out_size)
+    {
+        if (!out || out_size == 0)
+            return;
+        out[0] = 0;
+        if (!text || !text->Buffer || text->Length == 0) {
+            const char none[] = "<none>";
+            SIZE_T n = sizeof(none) - 1;
+            if (n >= out_size) n = out_size - 1;
+            for (SIZE_T i = 0; i < n; ++i) out[i] = none[i];
+            out[n] = 0;
+            return;
+        }
+        __try {
+            USHORT chars = text->Length / sizeof(WCHAR);
+            SIZE_T limit = out_size - 1;
+            SIZE_T count = chars < limit ? chars : limit;
+            for (SIZE_T i = 0; i < count; ++i) {
+                WCHAR c = text->Buffer[i];
+                out[i] = c < 0x80 ? static_cast<char>(c) : '?';
+            }
+            out[count] = 0;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            const char ex[] = "<except>";
+            SIZE_T n = sizeof(ex) - 1;
+            if (n >= out_size) n = out_size - 1;
+            for (SIZE_T i = 0; i < n; ++i) out[i] = ex[i];
+            out[n] = 0;
+        }
+    }
+
+    __forceinline BOOLEAN unicode_equals_ascii_ci(PCUNICODE_STRING text, const char* ascii)
+    {
+        if (!text || !text->Buffer || !ascii)
+            return FALSE;
+        USHORT chars = text->Length / sizeof(WCHAR);
+        ULONG ascii_len = 0;
+        while (ascii[ascii_len])
+            ++ascii_len;
+        if (chars != ascii_len)
+            return FALSE;
+        __try {
+            for (USHORT i = 0; i < chars; ++i) {
+                WCHAR lhs = lower_wchar(text->Buffer[i]);
+                char rhs_c = ascii[i];
+                if (rhs_c >= 'A' && rhs_c <= 'Z')
+                    rhs_c = static_cast<char>(rhs_c + ('a' - 'A'));
+                if (lhs != static_cast<WCHAR>(rhs_c))
+                    return FALSE;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return FALSE;
+        }
+        return TRUE;
+    }
+
+    __forceinline BOOLEAN locate_current_ntdll(ntdll_lookup_result_t* out)
+    {
+        if (!out)
+            return FALSE;
+        RtlZeroMemory(out, sizeof(*out));
+        out->match_index = 0xFFFFFFFFu;
+        out->reason = "unresolved";
+
+        if (!_PsGetProcessPeb) {
+            out->reason = "missing_ps_get_process_peb";
+            return FALSE;
+        }
+
+        __try {
+            out->peb = _PsGetProcessPeb(PsGetCurrentProcess());
+            if (!out->peb) {
+                out->reason = "missing_current_peb";
+                return FALSE;
+            }
+
+            out->ldr = *(PVOID*)((UCHAR*)out->peb + 0x18);
+            if (!out->ldr) {
+                out->reason = "missing_peb_ldr";
+                return FALSE;
+            }
+
+            out->list_head = (PLIST_ENTRY)((UCHAR*)out->ldr + 0x10);
+            if (_MmIsAddressValid && !_MmIsAddressValid(out->list_head)) {
+                out->reason = "invalid_ldr_head";
+                return FALSE;
+            }
+
+            PLIST_ENTRY head = static_cast<PLIST_ENTRY>(out->list_head);
+            PLIST_ENTRY entry = head->Flink;
+            if (!entry || entry == head) {
+                out->reason = "empty_ldr_list";
+                return FALSE;
+            }
+
+            for (ULONG index = 0; index < 128 && entry && entry != head; ++index) {
+                if (_MmIsAddressValid && !_MmIsAddressValid(entry)) {
+                    out->reason = "invalid_ldr_entry";
+                    return FALSE;
+                }
+
+                out->module_count = index + 1;
+                PLDR_DATA_TABLE_ENTRY module = CONTAINING_RECORD(entry, LDR_DATA_TABLE_ENTRY, InLoadOrderModuleList);
+                UNICODE_STRING base_name = module->BaseDllName;
+                PVOID dll_base = module->DllBase;
+                char name_buf[32] = {};
+                copy_unicode_ascii(&base_name, name_buf, sizeof(name_buf));
+                if (index == 0)
+                    RtlCopyMemory(out->first_name, name_buf, sizeof(out->first_name));
+                else if (index == 1)
+                    RtlCopyMemory(out->second_name, name_buf, sizeof(out->second_name));
+                if (base_name.Buffer && base_name.Length != 0)
+                    ++out->named_count;
+                if (unicode_equals_ascii_ci(&base_name, "ntdll.dll")) {
+                    out->list_entry = entry;
+                    out->ntdll_base = dll_base;
+                    out->match_index = index;
+                    RtlCopyMemory(out->selected_name, name_buf, sizeof(out->selected_name));
+                    if (!dll_base) {
+                        out->reason = "missing_ntdll_base";
+                        return FALSE;
+                    }
+                    out->reason = "found";
+                    return TRUE;
+                }
+
+                entry = entry->Flink;
+            }
+            out->reason = "ntdll_not_found";
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            out->reason = "exception";
+        }
+
+        return FALSE;
+    }
+
+    __forceinline UINT64 read_stub_qword(PUCHAR stub)
+    {
+        UINT64 value = 0;
+        if (!stub)
+            return 0;
+        __try {
+            RtlCopyMemory(&value, stub, sizeof(value));
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            value = 0;
+        }
+        return value;
+    }
+
     __forceinline BOOLEAN find_ssdt() {
         LONG prev = _InterlockedCompareExchange(&g_ssdt_found, 1, 0);
         if (prev == 2) return g_ssdt != nullptr;
@@ -427,110 +598,204 @@ namespace ssdt_resolver {
             return g_NtSuspendThread != nullptr && g_NtResumeThread != nullptr;
         }
 
-        if (!g_ssdt || !_PsGetProcessPeb) {
-            _InterlockedExchange(&g_funcs_resolved, 2);
-            return FALSE;
+        if (!g_ssdt) {
+            find_ssdt();
         }
 
-        __try {
+        const char* reason = "unresolved";
+        PVOID ntdll_base = nullptr;
+        PVOID suspend_stub = nullptr;
+        PVOID resume_stub = nullptr;
+        ULONG suspend_idx = 0xFFFFFFFFu;
+        ULONG resume_idx = 0xFFFFFFFFu;
+        BOOLEAN resolved = FALSE;
+        ntdll_lookup_result_t ntdll = {};
+        UINT64 suspend_stub8 = 0;
+        UINT64 resume_stub8 = 0;
 
-            PVOID peb = _PsGetProcessPeb(PsGetCurrentProcess());
-            if (!peb) {
-                _InterlockedExchange(&g_funcs_resolved, 2);
-                return FALSE;
+        do {
+            if (!g_ssdt || !g_ssdt->ServiceTable) {
+                reason = "missing_ssdt";
+                break;
             }
 
-
-            PVOID ldr = *(PVOID*)((UCHAR*)peb + 0x18);
-            if (!ldr) {
-                _InterlockedExchange(&g_funcs_resolved, 2);
-                return FALSE;
+            if (!locate_current_ntdll(&ntdll)) {
+                reason = ntdll.reason;
+                break;
             }
 
-
-            PLIST_ENTRY head = (PLIST_ENTRY)((UCHAR*)ldr + 0x10);
-            PLIST_ENTRY entry = head->Flink;
-
-
-            if (entry == head) { _InterlockedExchange(&g_funcs_resolved, 2); return FALSE; }
-            entry = entry->Flink;
-            if (entry == head) { _InterlockedExchange(&g_funcs_resolved, 2); return FALSE; }
-
-
-            PVOID ntdll_base = *(PVOID*)((UCHAR*)entry + 0x30);
-            if (!ntdll_base) {
-                _InterlockedExchange(&g_funcs_resolved, 2);
-                return FALSE;
+            ntdll_base = ntdll.ntdll_base;
+            __try {
+                CHAR suspend_name[] = { 'N','t','S','u','s','p','e','n','d','T','h','r','e','a','d',0 };
+                CHAR resume_name[]  = { 'N','t','R','e','s','u','m','e','T','h','r','e','a','d',0 };
+                suspend_stub = GetProcAddress(ntdll_base, suspend_name);
+                resume_stub  = GetProcAddress(ntdll_base, resume_name);
+                suspend_stub8 = read_stub_qword((PUCHAR)suspend_stub);
+                resume_stub8 = read_stub_qword((PUCHAR)resume_stub);
+                if (!suspend_stub || !resume_stub) {
+                    reason = "missing_ntdll_export";
+                } else {
+                    PUCHAR s_bytes = (PUCHAR)suspend_stub;
+                    PUCHAR r_bytes = (PUCHAR)resume_stub;
+                    if (s_bytes[0] != 0x4C || s_bytes[1] != 0x8B || s_bytes[2] != 0xD1 || s_bytes[3] != 0xB8) {
+                        reason = "unexpected_suspend_stub";
+                    } else if (r_bytes[0] != 0x4C || r_bytes[1] != 0x8B || r_bytes[2] != 0xD1 || r_bytes[3] != 0xB8) {
+                        reason = "unexpected_resume_stub";
+                    } else {
+                        suspend_idx = *(PULONG)&s_bytes[4];
+                        resume_idx  = *(PULONG)&r_bytes[4];
+                        if (suspend_idx >= (ULONG)g_ssdt->ServiceLimit ||
+                            resume_idx  >= (ULONG)g_ssdt->ServiceLimit) {
+                            reason = "syscall_index_out_of_range";
+                        } else {
+                            g_NtSuspendThread = (fn_NtSuspendThread)get_ssdt_entry(suspend_idx);
+                            g_NtResumeThread  = (fn_NtResumeThread)get_ssdt_entry(resume_idx);
+                            resolved = (g_NtSuspendThread != nullptr && g_NtResumeThread != nullptr);
+                            reason = resolved ? "resolved" : "null_ssdt_entry";
+                        }
+                    }
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                reason = "export_exception";
             }
-
-
-            CHAR suspend_name[] = { 'N','t','S','u','s','p','e','n','d','T','h','r','e','a','d',0 };
-            CHAR resume_name[]  = { 'N','t','R','e','s','u','m','e','T','h','r','e','a','d',0 };
-
-            PVOID suspend_stub = GetProcAddress(ntdll_base, suspend_name);
-            PVOID resume_stub  = GetProcAddress(ntdll_base, resume_name);
-
-            if (!suspend_stub || !resume_stub) {
-                _InterlockedExchange(&g_funcs_resolved, 2);
-                return FALSE;
-            }
-
-
-            PUCHAR s_bytes = (PUCHAR)suspend_stub;
-            PUCHAR r_bytes = (PUCHAR)resume_stub;
-
-            if (s_bytes[0] != 0x4C || s_bytes[1] != 0x8B || s_bytes[2] != 0xD1 || s_bytes[3] != 0xB8) {
-                _InterlockedExchange(&g_funcs_resolved, 2);
-                return FALSE;
-            }
-            if (r_bytes[0] != 0x4C || r_bytes[1] != 0x8B || r_bytes[2] != 0xD1 || r_bytes[3] != 0xB8) {
-                _InterlockedExchange(&g_funcs_resolved, 2);
-                return FALSE;
-            }
-
-            ULONG suspend_idx = *(PULONG)&s_bytes[4];
-            ULONG resume_idx  = *(PULONG)&r_bytes[4];
-
-            if (suspend_idx >= (ULONG)g_ssdt->ServiceLimit ||
-                resume_idx  >= (ULONG)g_ssdt->ServiceLimit) {
-                _InterlockedExchange(&g_funcs_resolved, 2);
-                return FALSE;
-            }
-
-            g_NtSuspendThread = (fn_NtSuspendThread)get_ssdt_entry(suspend_idx);
-            g_NtResumeThread  = (fn_NtResumeThread)get_ssdt_entry(resume_idx);
-
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-        }
+        } while (FALSE);
 
         KeMemoryBarrier();
-        _InterlockedExchange(&g_funcs_resolved, 2);
-        return g_NtSuspendThread != nullptr && g_NtResumeThread != nullptr;
+        _InterlockedExchange(&g_funcs_resolved, resolved ? 2 : 0);
+        WW_LOG("SSDT resolve_suspend_resume result=%u reason=%s state=%ld ssdt=%p service_table=%p limit=%lu ntdll=%p suspend_stub=%p resume_stub=%p suspend_idx=%lu resume_idx=%lu nt_suspend=%p nt_resume=%p zw_suspend=%p zw_resume=%p ps_suspend=%p ps_resume=%p ps_get_peb=%p current_pid=%p current_tid=%p",
+            resolved ? 1u : 0u,
+            reason,
+            _InterlockedCompareExchange(&g_funcs_resolved, 0, 0),
+            g_ssdt,
+            g_ssdt ? g_ssdt->ServiceTable : nullptr,
+            g_ssdt ? g_ssdt->ServiceLimit : 0,
+            ntdll_base,
+            suspend_stub,
+            resume_stub,
+            suspend_idx,
+            resume_idx,
+            g_NtSuspendThread,
+            g_NtResumeThread,
+            _ZwSuspendThread,
+            _ZwResumeThread,
+            _PsSuspendThread,
+            _PsResumeThread,
+            _PsGetProcessPeb,
+            PsGetCurrentProcessId(),
+            PsGetCurrentThreadId());
+        WW_LOG("SSDT resolve_suspend_resume ldr_diag reason=%s ntdll_reason=%s peb=%p ldr=%p head=%p entry=%p modules=%lu names=%lu match=%lu selected='%s' first='%s' second='%s' suspend_stub8=0x%llx resume_stub8=0x%llx",
+            reason,
+            ntdll.reason ? ntdll.reason : "<none>",
+            ntdll.peb,
+            ntdll.ldr,
+            ntdll.list_head,
+            ntdll.list_entry,
+            ntdll.module_count,
+            ntdll.named_count,
+            ntdll.match_index,
+            ntdll.selected_name,
+            ntdll.first_name,
+            ntdll.second_name,
+            static_cast<unsigned long long>(suspend_stub8),
+            static_cast<unsigned long long>(resume_stub8));
+        return resolved;
     }
 
 
     __forceinline NTSTATUS call_NtSuspendThread(HANDLE thread_handle, PULONG prev_count) {
         if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_STATE;
         if (!thread_handle) return STATUS_INVALID_PARAMETER;
-        if (_ZwSuspendThread) return _ZwSuspendThread(thread_handle, prev_count);
+        if (_ZwSuspendThread) {
+            NTSTATUS status = _ZwSuspendThread(thread_handle, prev_count);
+            WW_LOG("SSDT call_NtSuspendThread path=zw_export status=0x%08X handle=%p prev=%lu zw_suspend=%p nt_suspend=%p ssdt=%p state=%ld",
+                (ULONG)status,
+                thread_handle,
+                prev_count ? *prev_count : 0,
+                _ZwSuspendThread,
+                g_NtSuspendThread,
+                g_ssdt,
+                _InterlockedCompareExchange(&g_funcs_resolved, 0, 0));
+            return status;
+        }
         if (!g_NtSuspendThread) {
             find_ssdt();
-            resolve_suspend_resume();
+            BOOLEAN resolved = resolve_suspend_resume();
+            WW_LOG("SSDT call_NtSuspendThread resolve resolved=%u handle=%p ssdt=%p nt_suspend=%p nt_resume=%p state=%ld",
+                resolved ? 1u : 0u,
+                thread_handle,
+                g_ssdt,
+                g_NtSuspendThread,
+                g_NtResumeThread,
+                _InterlockedCompareExchange(&g_funcs_resolved, 0, 0));
         }
-        if (!g_NtSuspendThread) return STATUS_PROCEDURE_NOT_FOUND;
-        return g_NtSuspendThread(thread_handle, prev_count);
+        if (!g_NtSuspendThread) {
+            WW_LOG("SSDT call_NtSuspendThread path=missing status=0x%08X handle=%p zw_suspend=%p nt_suspend=%p ssdt=%p state=%ld",
+                (ULONG)STATUS_PROCEDURE_NOT_FOUND,
+                thread_handle,
+                _ZwSuspendThread,
+                g_NtSuspendThread,
+                g_ssdt,
+                _InterlockedCompareExchange(&g_funcs_resolved, 0, 0));
+            return STATUS_PROCEDURE_NOT_FOUND;
+        }
+        NTSTATUS status = g_NtSuspendThread(thread_handle, prev_count);
+        WW_LOG("SSDT call_NtSuspendThread path=ssdt status=0x%08X handle=%p prev=%lu zw_suspend=%p nt_suspend=%p ssdt=%p state=%ld",
+            (ULONG)status,
+            thread_handle,
+            prev_count ? *prev_count : 0,
+            _ZwSuspendThread,
+            g_NtSuspendThread,
+            g_ssdt,
+            _InterlockedCompareExchange(&g_funcs_resolved, 0, 0));
+        return status;
     }
 
     __forceinline NTSTATUS call_NtResumeThread(HANDLE thread_handle, PULONG prev_count) {
         if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_STATE;
         if (!thread_handle) return STATUS_INVALID_PARAMETER;
-        if (_ZwResumeThread) return _ZwResumeThread(thread_handle, prev_count);
+        if (_ZwResumeThread) {
+            NTSTATUS status = _ZwResumeThread(thread_handle, prev_count);
+            WW_LOG("SSDT call_NtResumeThread path=zw_export status=0x%08X handle=%p prev=%lu zw_resume=%p nt_resume=%p ssdt=%p state=%ld",
+                (ULONG)status,
+                thread_handle,
+                prev_count ? *prev_count : 0,
+                _ZwResumeThread,
+                g_NtResumeThread,
+                g_ssdt,
+                _InterlockedCompareExchange(&g_funcs_resolved, 0, 0));
+            return status;
+        }
         if (!g_NtResumeThread) {
             find_ssdt();
-            resolve_suspend_resume();
+            BOOLEAN resolved = resolve_suspend_resume();
+            WW_LOG("SSDT call_NtResumeThread resolve resolved=%u handle=%p ssdt=%p nt_suspend=%p nt_resume=%p state=%ld",
+                resolved ? 1u : 0u,
+                thread_handle,
+                g_ssdt,
+                g_NtSuspendThread,
+                g_NtResumeThread,
+                _InterlockedCompareExchange(&g_funcs_resolved, 0, 0));
         }
-        if (!g_NtResumeThread) return STATUS_PROCEDURE_NOT_FOUND;
-        return g_NtResumeThread(thread_handle, prev_count);
+        if (!g_NtResumeThread) {
+            WW_LOG("SSDT call_NtResumeThread path=missing status=0x%08X handle=%p zw_resume=%p nt_resume=%p ssdt=%p state=%ld",
+                (ULONG)STATUS_PROCEDURE_NOT_FOUND,
+                thread_handle,
+                _ZwResumeThread,
+                g_NtResumeThread,
+                g_ssdt,
+                _InterlockedCompareExchange(&g_funcs_resolved, 0, 0));
+            return STATUS_PROCEDURE_NOT_FOUND;
+        }
+        NTSTATUS status = g_NtResumeThread(thread_handle, prev_count);
+        WW_LOG("SSDT call_NtResumeThread path=ssdt status=0x%08X handle=%p prev=%lu zw_resume=%p nt_resume=%p ssdt=%p state=%ld",
+            (ULONG)status,
+            thread_handle,
+            prev_count ? *prev_count : 0,
+            _ZwResumeThread,
+            g_NtResumeThread,
+            g_ssdt,
+            _InterlockedCompareExchange(&g_funcs_resolved, 0, 0));
+        return status;
     }
 
     __forceinline BOOLEAN resolve_thread_context() {
@@ -545,98 +810,210 @@ namespace ssdt_resolver {
             return g_NtGetContextThread != nullptr && g_NtSetContextThread != nullptr;
         }
 
-        if (!g_ssdt || !_PsGetProcessPeb) {
-            _InterlockedExchange(&g_ctx_funcs_resolved, 2);
-            return FALSE;
+        if (!g_ssdt) {
+            find_ssdt();
         }
 
-        __try {
-            PVOID peb = _PsGetProcessPeb(PsGetCurrentProcess());
-            if (!peb) {
-                _InterlockedExchange(&g_ctx_funcs_resolved, 2);
-                return FALSE;
+        const char* reason = "unresolved";
+        PVOID ntdll_base = nullptr;
+        PUCHAR get_bytes = nullptr;
+        PUCHAR set_bytes = nullptr;
+        ULONG get_idx = 0xFFFFFFFFu;
+        ULONG set_idx = 0xFFFFFFFFu;
+        BOOLEAN resolved = FALSE;
+        ntdll_lookup_result_t ntdll = {};
+        UINT64 get_stub8 = 0;
+        UINT64 set_stub8 = 0;
+
+        do {
+            if (!g_ssdt || !g_ssdt->ServiceTable) {
+                reason = "missing_ssdt";
+                break;
             }
 
-            PVOID ldr = *(PVOID*)((UCHAR*)peb + 0x18);
-            if (!ldr) {
-                _InterlockedExchange(&g_ctx_funcs_resolved, 2);
-                return FALSE;
+            if (!locate_current_ntdll(&ntdll)) {
+                reason = ntdll.reason;
+                break;
             }
 
-            PLIST_ENTRY head = (PLIST_ENTRY)((UCHAR*)ldr + 0x10);
-            PLIST_ENTRY entry = head->Flink;
-            if (entry == head) { _InterlockedExchange(&g_ctx_funcs_resolved, 2); return FALSE; }
-            entry = entry->Flink;
-            if (entry == head) { _InterlockedExchange(&g_ctx_funcs_resolved, 2); return FALSE; }
-
-            PVOID ntdll_base = *(PVOID*)((UCHAR*)entry + 0x30);
-            if (!ntdll_base) {
-                _InterlockedExchange(&g_ctx_funcs_resolved, 2);
-                return FALSE;
+            ntdll_base = ntdll.ntdll_base;
+            __try {
+                CHAR get_name[] = { 'N','t','G','e','t','C','o','n','t','e','x','t','T','h','r','e','a','d',0 };
+                CHAR set_name[] = { 'N','t','S','e','t','C','o','n','t','e','x','t','T','h','r','e','a','d',0 };
+                get_bytes = (PUCHAR)GetProcAddress(ntdll_base, get_name);
+                set_bytes = (PUCHAR)GetProcAddress(ntdll_base, set_name);
+                get_stub8 = read_stub_qword(get_bytes);
+                set_stub8 = read_stub_qword(set_bytes);
+                if (!get_bytes || !set_bytes) {
+                    reason = "missing_ntdll_export";
+                } else if (get_bytes[0] != 0x4C || get_bytes[1] != 0x8B || get_bytes[2] != 0xD1 || get_bytes[3] != 0xB8) {
+                    reason = "unexpected_get_stub";
+                } else if (set_bytes[0] != 0x4C || set_bytes[1] != 0x8B || set_bytes[2] != 0xD1 || set_bytes[3] != 0xB8) {
+                    reason = "unexpected_set_stub";
+                } else {
+                    get_idx = *(PULONG)&get_bytes[4];
+                    set_idx = *(PULONG)&set_bytes[4];
+                    if (get_idx >= (ULONG)g_ssdt->ServiceLimit || set_idx >= (ULONG)g_ssdt->ServiceLimit) {
+                        reason = "syscall_index_out_of_range";
+                    } else {
+                        g_NtGetContextThread = (fn_NtGetContextThread)get_ssdt_entry(get_idx);
+                        g_NtSetContextThread = (fn_NtSetContextThread)get_ssdt_entry(set_idx);
+                        resolved = (g_NtGetContextThread != nullptr && g_NtSetContextThread != nullptr);
+                        reason = resolved ? "resolved" : "null_ssdt_entry";
+                    }
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                reason = "export_exception";
             }
-
-            CHAR get_name[] = { 'N','t','G','e','t','C','o','n','t','e','x','t','T','h','r','e','a','d',0 };
-            CHAR set_name[] = { 'N','t','S','e','t','C','o','n','t','e','x','t','T','h','r','e','a','d',0 };
-
-            PUCHAR get_bytes = (PUCHAR)GetProcAddress(ntdll_base, get_name);
-            PUCHAR set_bytes = (PUCHAR)GetProcAddress(ntdll_base, set_name);
-
-            if (!get_bytes || !set_bytes) {
-                _InterlockedExchange(&g_ctx_funcs_resolved, 2);
-                return FALSE;
-            }
-
-            if (get_bytes[0] != 0x4C || get_bytes[1] != 0x8B || get_bytes[2] != 0xD1 || get_bytes[3] != 0xB8) {
-                _InterlockedExchange(&g_ctx_funcs_resolved, 2);
-                return FALSE;
-            }
-
-            if (set_bytes[0] != 0x4C || set_bytes[1] != 0x8B || set_bytes[2] != 0xD1 || set_bytes[3] != 0xB8) {
-                _InterlockedExchange(&g_ctx_funcs_resolved, 2);
-                return FALSE;
-            }
-
-            ULONG get_idx = *(PULONG)&get_bytes[4];
-            ULONG set_idx = *(PULONG)&set_bytes[4];
-
-            if (get_idx >= (ULONG)g_ssdt->ServiceLimit || set_idx >= (ULONG)g_ssdt->ServiceLimit) {
-                _InterlockedExchange(&g_ctx_funcs_resolved, 2);
-                return FALSE;
-            }
-
-            g_NtGetContextThread = (fn_NtGetContextThread)get_ssdt_entry(get_idx);
-            g_NtSetContextThread = (fn_NtSetContextThread)get_ssdt_entry(set_idx);
-
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-        }
+        } while (FALSE);
 
         KeMemoryBarrier();
-        _InterlockedExchange(&g_ctx_funcs_resolved, 2);
-        return g_NtGetContextThread != nullptr && g_NtSetContextThread != nullptr;
+        _InterlockedExchange(&g_ctx_funcs_resolved, resolved ? 2 : 0);
+        WW_LOG("SSDT resolve_thread_context result=%u reason=%s state=%ld ssdt=%p service_table=%p limit=%lu ntdll=%p get_stub=%p set_stub=%p get_idx=%lu set_idx=%lu nt_get=%p nt_set=%p zw_get=%p zw_set=%p ps_get=%p ps_set=%p ps_get_peb=%p current_pid=%p current_tid=%p",
+            resolved ? 1u : 0u,
+            reason,
+            _InterlockedCompareExchange(&g_ctx_funcs_resolved, 0, 0),
+            g_ssdt,
+            g_ssdt ? g_ssdt->ServiceTable : nullptr,
+            g_ssdt ? g_ssdt->ServiceLimit : 0,
+            ntdll_base,
+            get_bytes,
+            set_bytes,
+            get_idx,
+            set_idx,
+            g_NtGetContextThread,
+            g_NtSetContextThread,
+            _ZwGetContextThread,
+            _ZwSetContextThread,
+            _PsGetContextThread,
+            _PsSetContextThread,
+            _PsGetProcessPeb,
+            PsGetCurrentProcessId(),
+            PsGetCurrentThreadId());
+        WW_LOG("SSDT resolve_thread_context ldr_diag reason=%s ntdll_reason=%s peb=%p ldr=%p head=%p entry=%p modules=%lu names=%lu match=%lu selected='%s' first='%s' second='%s' get_stub8=0x%llx set_stub8=0x%llx",
+            reason,
+            ntdll.reason ? ntdll.reason : "<none>",
+            ntdll.peb,
+            ntdll.ldr,
+            ntdll.list_head,
+            ntdll.list_entry,
+            ntdll.module_count,
+            ntdll.named_count,
+            ntdll.match_index,
+            ntdll.selected_name,
+            ntdll.first_name,
+            ntdll.second_name,
+            static_cast<unsigned long long>(get_stub8),
+            static_cast<unsigned long long>(set_stub8));
+        return resolved;
     }
 
     __forceinline NTSTATUS call_NtGetContextThread(HANDLE thread_handle, PCONTEXT context) {
         if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_STATE;
         if (!thread_handle || !context) return STATUS_INVALID_PARAMETER;
-        if (_ZwGetContextThread) return _ZwGetContextThread(thread_handle, context);
+        if (_ZwGetContextThread) {
+            NTSTATUS status = _ZwGetContextThread(thread_handle, context);
+            WW_LOG("SSDT call_NtGetContextThread path=zw_export status=0x%08X handle=%p flags=0x%08X rip=0x%llX rsp=0x%llX zw_get=%p nt_get=%p ssdt=%p state=%ld",
+                (ULONG)status,
+                thread_handle,
+                context->ContextFlags,
+                (unsigned long long)context->Rip,
+                (unsigned long long)context->Rsp,
+                _ZwGetContextThread,
+                g_NtGetContextThread,
+                g_ssdt,
+                _InterlockedCompareExchange(&g_ctx_funcs_resolved, 0, 0));
+            return status;
+        }
         if (!g_NtGetContextThread) {
             find_ssdt();
-            resolve_thread_context();
+            BOOLEAN resolved = resolve_thread_context();
+            WW_LOG("SSDT call_NtGetContextThread resolve resolved=%u handle=%p flags=0x%08X ssdt=%p nt_get=%p nt_set=%p state=%ld",
+                resolved ? 1u : 0u,
+                thread_handle,
+                context->ContextFlags,
+                g_ssdt,
+                g_NtGetContextThread,
+                g_NtSetContextThread,
+                _InterlockedCompareExchange(&g_ctx_funcs_resolved, 0, 0));
         }
-        if (!g_NtGetContextThread) return STATUS_PROCEDURE_NOT_FOUND;
-        return g_NtGetContextThread(thread_handle, context);
+        if (!g_NtGetContextThread) {
+            WW_LOG("SSDT call_NtGetContextThread path=missing status=0x%08X handle=%p flags=0x%08X zw_get=%p nt_get=%p ssdt=%p state=%ld",
+                (ULONG)STATUS_PROCEDURE_NOT_FOUND,
+                thread_handle,
+                context->ContextFlags,
+                _ZwGetContextThread,
+                g_NtGetContextThread,
+                g_ssdt,
+                _InterlockedCompareExchange(&g_ctx_funcs_resolved, 0, 0));
+            return STATUS_PROCEDURE_NOT_FOUND;
+        }
+        NTSTATUS status = g_NtGetContextThread(thread_handle, context);
+        WW_LOG("SSDT call_NtGetContextThread path=ssdt status=0x%08X handle=%p flags=0x%08X rip=0x%llX rsp=0x%llX zw_get=%p nt_get=%p ssdt=%p state=%ld",
+            (ULONG)status,
+            thread_handle,
+            context->ContextFlags,
+            (unsigned long long)context->Rip,
+            (unsigned long long)context->Rsp,
+            _ZwGetContextThread,
+            g_NtGetContextThread,
+            g_ssdt,
+            _InterlockedCompareExchange(&g_ctx_funcs_resolved, 0, 0));
+        return status;
     }
 
     __forceinline NTSTATUS call_NtSetContextThread(HANDLE thread_handle, PCONTEXT context) {
         if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_STATE;
         if (!thread_handle || !context) return STATUS_INVALID_PARAMETER;
-        if (_ZwSetContextThread) return _ZwSetContextThread(thread_handle, context);
+        if (_ZwSetContextThread) {
+            NTSTATUS status = _ZwSetContextThread(thread_handle, context);
+            WW_LOG("SSDT call_NtSetContextThread path=zw_export status=0x%08X handle=%p flags=0x%08X rip=0x%llX rsp=0x%llX zw_set=%p nt_set=%p ssdt=%p state=%ld",
+                (ULONG)status,
+                thread_handle,
+                context->ContextFlags,
+                (unsigned long long)context->Rip,
+                (unsigned long long)context->Rsp,
+                _ZwSetContextThread,
+                g_NtSetContextThread,
+                g_ssdt,
+                _InterlockedCompareExchange(&g_ctx_funcs_resolved, 0, 0));
+            return status;
+        }
         if (!g_NtSetContextThread) {
             find_ssdt();
-            resolve_thread_context();
+            BOOLEAN resolved = resolve_thread_context();
+            WW_LOG("SSDT call_NtSetContextThread resolve resolved=%u handle=%p flags=0x%08X ssdt=%p nt_get=%p nt_set=%p state=%ld",
+                resolved ? 1u : 0u,
+                thread_handle,
+                context->ContextFlags,
+                g_ssdt,
+                g_NtGetContextThread,
+                g_NtSetContextThread,
+                _InterlockedCompareExchange(&g_ctx_funcs_resolved, 0, 0));
         }
-        if (!g_NtSetContextThread) return STATUS_PROCEDURE_NOT_FOUND;
-        return g_NtSetContextThread(thread_handle, context);
+        if (!g_NtSetContextThread) {
+            WW_LOG("SSDT call_NtSetContextThread path=missing status=0x%08X handle=%p flags=0x%08X zw_set=%p nt_set=%p ssdt=%p state=%ld",
+                (ULONG)STATUS_PROCEDURE_NOT_FOUND,
+                thread_handle,
+                context->ContextFlags,
+                _ZwSetContextThread,
+                g_NtSetContextThread,
+                g_ssdt,
+                _InterlockedCompareExchange(&g_ctx_funcs_resolved, 0, 0));
+            return STATUS_PROCEDURE_NOT_FOUND;
+        }
+        NTSTATUS status = g_NtSetContextThread(thread_handle, context);
+        WW_LOG("SSDT call_NtSetContextThread path=ssdt status=0x%08X handle=%p flags=0x%08X rip=0x%llX rsp=0x%llX zw_set=%p nt_set=%p ssdt=%p state=%ld",
+            (ULONG)status,
+            thread_handle,
+            context->ContextFlags,
+            (unsigned long long)context->Rip,
+            (unsigned long long)context->Rsp,
+            _ZwSetContextThread,
+            g_NtSetContextThread,
+            g_ssdt,
+            _InterlockedCompareExchange(&g_ctx_funcs_resolved, 0, 0));
+        return status;
     }
 }
 
@@ -765,9 +1142,29 @@ inline bool SetupFunctions() {
     WW_LOG("SetupFunctions: _DbgPrintEx=%p", _DbgPrintEx);
 
     if (!_PsSuspendThread && !_ZwSuspendThread) {
-        WW_LOG("SetupFunctions: no PsSuspendThread or ZwSuspendThread, resolving SSDT");
-        ssdt_resolver::find_ssdt();
-        WW_LOG("SetupFunctions: SSDT resolve done, ssdt=%p NtSuspend=%p NtResume=%p", ssdt_resolver::g_ssdt, ssdt_resolver::g_NtSuspendThread, ssdt_resolver::g_NtResumeThread);
+        WW_LOG("SetupFunctions: no PsSuspendThread or ZwSuspendThread, priming SSDT suspend resolver");
+        BOOLEAN ssdt_found = ssdt_resolver::find_ssdt();
+        BOOLEAN sr_resolved = ssdt_resolver::resolve_suspend_resume();
+        WW_LOG("SetupFunctions: SSDT suspend resolver primed ssdt_found=%u suspend_resume_resolved=%u state=%ld ssdt=%p NtSuspend=%p NtResume=%p",
+            ssdt_found ? 1u : 0u,
+            sr_resolved ? 1u : 0u,
+            _InterlockedCompareExchange(&ssdt_resolver::g_funcs_resolved, 0, 0),
+            ssdt_resolver::g_ssdt,
+            ssdt_resolver::g_NtSuspendThread,
+            ssdt_resolver::g_NtResumeThread);
+    }
+
+    if (!_ZwGetContextThread || !_ZwSetContextThread) {
+        WW_LOG("SetupFunctions: missing Zw context export, priming SSDT context resolver");
+        BOOLEAN ssdt_found = ssdt_resolver::find_ssdt();
+        BOOLEAN ctx_resolved = ssdt_resolver::resolve_thread_context();
+        WW_LOG("SetupFunctions: SSDT context resolver primed ssdt_found=%u context_resolved=%u state=%ld ssdt=%p NtGetContext=%p NtSetContext=%p",
+            ssdt_found ? 1u : 0u,
+            ctx_resolved ? 1u : 0u,
+            _InterlockedCompareExchange(&ssdt_resolver::g_ctx_funcs_resolved, 0, 0),
+            ssdt_resolver::g_ssdt,
+            ssdt_resolver::g_NtGetContextThread,
+            ssdt_resolver::g_NtSetContextThread);
     }
 
     if (!_RtlInitUnicodeString || !_IoCreateDevice ||

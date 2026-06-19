@@ -4,6 +4,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <exception>
 #include <functional>
 #include <mutex>
@@ -42,9 +43,25 @@ inline const int SERVICE_POOL_SIZE = []() {
 
 namespace detail {
 
+struct task_t {
+    std::function<void()> fn;
+    std::string label;
+    std::uint64_t id = 0;
+    std::uint64_t queued_ms = 0;
+};
+
+struct active_task_t {
+    std::string label;
+    std::uint64_t id = 0;
+    std::uint64_t queued_ms = 0;
+    std::uint64_t started_ms = 0;
+    DWORD tid = 0;
+};
+
 struct pool_t {
     std::vector<aida::infra::win_thread::joinable_thread_t> workers;
-    std::queue<std::function<void()>> tasks;
+    std::queue<task_t> tasks;
+    std::vector<active_task_t>        active_snapshots;
     std::mutex                        mtx;
     std::condition_variable           cv;
     std::atomic<bool>                 alive{false};
@@ -56,6 +73,7 @@ struct pool_t {
     std::atomic<std::uint64_t>        rejected_tasks{0};
     std::atomic<std::uint64_t>        started_tasks{0};
     std::atomic<std::uint64_t>        finished_tasks{0};
+    std::atomic<std::uint64_t>        next_task_id{0};
 };
 
 inline pool_t g_pool;
@@ -75,6 +93,9 @@ struct stats_t {
     std::uint64_t rejected = 0;
     std::uint64_t started = 0;
     std::uint64_t finished = 0;
+    std::uint64_t oldest_active_ms = 0;
+    std::uint32_t active_label_count = 0;
+    std::string active_labels;
 };
 
 inline void shutdown();
@@ -91,9 +112,34 @@ inline stats_t stats_for(detail::pool_t& p, int pool_size) {
     s.started = p.started_tasks.load(std::memory_order_acquire);
     s.finished = p.finished_tasks.load(std::memory_order_acquire);
     {
-        std::lock_guard<std::mutex> lk(p.mtx);
+        std::unique_lock<std::mutex> lk(p.mtx, std::try_to_lock);
+        if (!lk.owns_lock()) {
+            s.active_labels = "<stats_lock_busy>";
+            return s;
+        }
         s.workers = p.workers.size();
         s.pending = p.tasks.size();
+        const std::uint64_t now = static_cast<std::uint64_t>(GetTickCount64());
+        for (const auto& active : p.active_snapshots) {
+            if (active.id == 0)
+                continue;
+            const std::uint64_t age_ms = now >= active.started_ms ? now - active.started_ms : 0;
+            if (s.oldest_active_ms < age_ms)
+                s.oldest_active_ms = age_ms;
+            ++s.active_label_count;
+            if (s.active_labels.size() < 900) {
+                char item[256];
+                _snprintf_s(item, sizeof(item), _TRUNCATE,
+                    "%s#%llu:%s:tid=%lu:age_ms=%llu:queued_ms=%llu",
+                    s.active_labels.empty() ? "" : ";",
+                    static_cast<unsigned long long>(active.id),
+                    active.label.empty() ? "<unnamed>" : active.label.c_str(),
+                    static_cast<unsigned long>(active.tid),
+                    static_cast<unsigned long long>(age_ms),
+                    static_cast<unsigned long long>(active.queued_ms));
+                s.active_labels += item;
+            }
+        }
     }
     return s;
 }
@@ -118,10 +164,12 @@ inline void initialize_pool(detail::pool_t& p, int pool_size) {
         }
         try {
             p.workers.reserve(static_cast<std::size_t>(pool_size));
+            p.active_snapshots.assign(static_cast<std::size_t>(pool_size), {});
             for (int i = 0; i < pool_size; ++i) {
                 aida::infra::win_thread::joinable_thread_t worker;
                 std::string err;
-                const bool started = worker.start([&p]() {
+                const std::size_t worker_index = static_cast<std::size_t>(i);
+                const bool started = worker.start([&p, worker_index]() {
                     bool thread_tls_ready = aida::manual_map_tls::ensure_current_thread();
                     if (!thread_tls_ready) {
                         diag::log_tagged_fmt("work_queue",
@@ -129,13 +177,21 @@ inline void initialize_pool(detail::pool_t& p, int pool_size) {
                             static_cast<unsigned long>(GetCurrentThreadId()));
                     }
                     while (true) {
-                        std::function<void()> task;
+                        detail::task_t task;
                         {
                             std::unique_lock<std::mutex> lk(p.mtx);
                             p.cv.wait(lk, [&p]() { return !p.tasks.empty() || !p.alive.load(); });
                             if (!p.alive.load() && p.tasks.empty()) return;
                             task = std::move(p.tasks.front());
                             p.tasks.pop();
+                            if (worker_index < p.active_snapshots.size()) {
+                                auto& active = p.active_snapshots[worker_index];
+                                active.label = task.label;
+                                active.id = task.id;
+                                active.queued_ms = task.queued_ms;
+                                active.started_ms = static_cast<std::uint64_t>(GetTickCount64());
+                                active.tid = GetCurrentThreadId();
+                            }
                         }
                         p.active_tasks.fetch_add(1u, std::memory_order_acq_rel);
                         p.started_tasks.fetch_add(1u, std::memory_order_acq_rel);
@@ -147,7 +203,15 @@ inline void initialize_pool(detail::pool_t& p, int pool_size) {
                                 static_cast<unsigned long long>(p.started_tasks.load(std::memory_order_acquire)),
                                 static_cast<unsigned long long>(p.finished_tasks.load(std::memory_order_acquire)));
                         }
-                        try { task(); } catch (...) {}
+                        try {
+                            if (task.fn)
+                                task.fn();
+                        } catch (...) {}
+                        {
+                            std::lock_guard<std::mutex> lk(p.mtx);
+                            if (worker_index < p.active_snapshots.size())
+                                p.active_snapshots[worker_index] = {};
+                        }
                         p.finished_tasks.fetch_add(1u, std::memory_order_acq_rel);
                         p.active_tasks.fetch_sub(1u, std::memory_order_acq_rel);
                     }
@@ -179,7 +243,7 @@ inline void initialize_services() {
     initialize_pool(detail::g_service_pool, SERVICE_POOL_SIZE);
 }
 
-inline bool post_to(detail::pool_t& p, int pool_size, std::function<void()> f) {
+inline bool post_to(detail::pool_t& p, int pool_size, std::function<void()> f, const char* label) {
     p.post_attempts.fetch_add(1u, std::memory_order_acq_rel);
     if (!p.alive.load(std::memory_order_acquire)) initialize_pool(p, pool_size);
     if (!p.alive.load(std::memory_order_acquire) || p.shutting_down.load(std::memory_order_acquire)) {
@@ -193,7 +257,12 @@ inline bool post_to(detail::pool_t& p, int pool_size, std::function<void()> f) {
             return false;
         }
         try {
-            p.tasks.push(std::move(f));
+            detail::task_t task;
+            task.fn = std::move(f);
+            task.label = (label && *label) ? label : "<unnamed>";
+            task.id = p.next_task_id.fetch_add(1u, std::memory_order_acq_rel) + 1u;
+            task.queued_ms = static_cast<std::uint64_t>(GetTickCount64());
+            p.tasks.push(std::move(task));
             p.posted_tasks.fetch_add(1u, std::memory_order_acq_rel);
         } catch (...) {
             p.rejected_tasks.fetch_add(1u, std::memory_order_acq_rel);
@@ -205,11 +274,19 @@ inline bool post_to(detail::pool_t& p, int pool_size, std::function<void()> f) {
 }
 
 inline bool post(std::function<void()> f) {
-    return post_to(detail::g_pool, POOL_SIZE, std::move(f));
+    return post_to(detail::g_pool, POOL_SIZE, std::move(f), "work_queue.task");
 }
 
 inline bool post_service(std::function<void()> f) {
-    return post_to(detail::g_service_pool, SERVICE_POOL_SIZE, std::move(f));
+    return post_to(detail::g_service_pool, SERVICE_POOL_SIZE, std::move(f), "work_queue.service_task");
+}
+
+inline bool post_labeled(const char* label, std::function<void()> f) {
+    return post_to(detail::g_pool, POOL_SIZE, std::move(f), label);
+}
+
+inline bool post_service_labeled(const char* label, std::function<void()> f) {
+    return post_to(detail::g_service_pool, SERVICE_POOL_SIZE, std::move(f), label);
 }
 
 inline void shutdown_pool(detail::pool_t& p) {

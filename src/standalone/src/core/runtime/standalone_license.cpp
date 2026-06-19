@@ -2277,6 +2277,8 @@ namespace
     std::atomic<bool>            s_arc_fetch_deferred{false};
     std::atomic<bool>            s_arc_download_in_progress{false};
     std::atomic<uint64_t>        s_activation_completed_at_ms{0};
+    std::mutex                   s_arc_load_failure_mtx;
+    std::string                  s_arc_load_failure_detail;
 
     std::shared_mutex            s_arc_call_mtx;
     std::atomic<bool>            s_arc_unloading{false};
@@ -2318,6 +2320,65 @@ namespace
 
         bool live() const { return acquired; }
     };
+
+    void clear_arc_load_failure_detail()
+    {
+        std::lock_guard<std::mutex> lk(s_arc_load_failure_mtx);
+        s_arc_load_failure_detail.clear();
+    }
+
+    void set_arc_load_failure_detail(const std::string& detail)
+    {
+        if (detail.empty())
+            return;
+        {
+            std::lock_guard<std::mutex> lk(s_arc_load_failure_mtx);
+            s_arc_load_failure_detail = detail;
+        }
+        lic_log_fmt("arc_load_failure_detail %.320s", detail.c_str());
+    }
+
+    std::string get_arc_load_failure_detail()
+    {
+        std::lock_guard<std::mutex> lk(s_arc_load_failure_mtx);
+        return s_arc_load_failure_detail;
+    }
+
+    std::string make_arc_driver_failure_detail(const char* phase,
+                                               const char* reason,
+                                               bool loaded,
+                                               bool kernel,
+                                               bool heartbeat,
+                                               bool sentinel,
+                                               DWORD gle,
+                                               uint64_t elapsed_ms,
+                                               uint32_t timeout_ms)
+    {
+        char buf[512];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "ARC driver/Sentinel/proof relay failed before protected runtime load: phase=%s reason=%s loaded=%d kernel=%d heartbeat=%d sentinel=%d gle=%lu elapsed_ms=%llu timeout_ms=%u",
+            phase && *phase ? phase : "unknown",
+            reason && *reason ? reason : "unknown",
+            loaded ? 1 : 0,
+            kernel ? 1 : 0,
+            heartbeat ? 1 : 0,
+            sentinel ? 1 : 0,
+            static_cast<unsigned long>(gle),
+            static_cast<unsigned long long>(elapsed_ms),
+            timeout_ms);
+        return std::string(buf);
+    }
+
+    std::string arc_load_error_or_fallback(const char* fallback)
+    {
+        std::string arc_error = arc_loader::last_error();
+        if (!arc_error.empty())
+            return arc_error;
+        arc_error = get_arc_load_failure_detail();
+        if (!arc_error.empty())
+            return arc_error;
+        return fallback && *fallback ? std::string(fallback) : std::string("ARC runtime download or verification failed.");
+    }
 
 
     std::shared_ptr<httplib::Client> s_license_client;
@@ -2568,6 +2629,16 @@ namespace
         bool heartbeat = kernel ? driver_bridge::refresh_heartbeat() : false;
         bool sentinel = heartbeat ? driver_bridge::sentinel_bridge_ready() : false;
         if (!loaded || !kernel || !heartbeat || !sentinel) {
+            set_arc_load_failure_detail(make_arc_driver_failure_detail(
+                phase,
+                !loaded ? "driver_not_loaded" : (!kernel ? "kernel_driver_not_active" : (!heartbeat ? "heartbeat_failed" : "sentinel_not_ready")),
+                loaded,
+                kernel,
+                heartbeat,
+                sentinel,
+                heartbeat ? ERROR_NOT_READY : GetLastError(),
+                0,
+                0));
             lic_log_fmt("arc_deferred_driver_not_ready phase=%s loaded=%d kernel=%d heartbeat=%d sentinel=%d",
                 phase ? phase : "unknown",
                 loaded ? 1 : 0,
@@ -2576,6 +2647,7 @@ namespace
                 sentinel ? 1 : 0);
             return false;
         }
+        clear_arc_load_failure_detail();
         lic_log_fmt("arc_driver_ready phase=%s loaded=%d kernel=%d heartbeat=%d sentinel=%d",
             phase ? phase : "unknown",
             loaded ? 1 : 0,
@@ -2598,6 +2670,7 @@ namespace
             uint64_t elapsed = GetTickCount64() - start;
             if (loaded && kernel && heartbeat && sentinel)
             {
+                clear_arc_load_failure_detail();
                 lic_log_fmt("arc_driver_ready_wait phase=%s result=ready elapsed_ms=%llu loaded=1 kernel=1 heartbeat=1 sentinel=1",
                     phase ? phase : "unknown",
                     static_cast<unsigned long long>(elapsed));
@@ -2605,6 +2678,16 @@ namespace
             }
             if (elapsed >= timeout_ms)
             {
+                set_arc_load_failure_detail(make_arc_driver_failure_detail(
+                    phase,
+                    !loaded ? "driver_not_loaded_timeout" : (!kernel ? "kernel_driver_not_active_timeout" : (!heartbeat ? "heartbeat_timeout" : "sentinel_not_ready_timeout")),
+                    loaded,
+                    kernel,
+                    heartbeat,
+                    sentinel,
+                    heartbeat ? ERROR_NOT_READY : GetLastError(),
+                    elapsed,
+                    timeout_ms));
                 lic_log_fmt("arc_driver_ready_wait phase=%s result=timeout elapsed_ms=%llu loaded=%d kernel=%d heartbeat=%d sentinel=%d",
                     phase ? phase : "unknown",
                     static_cast<unsigned long long>(elapsed),
@@ -2856,6 +2939,28 @@ namespace
 
     bool check_obfuscated_valid();
 
+    void log_runtime_arc_authorized_state(bool authorized, const std::string& reason)
+    {
+        static std::mutex s_auth_log_mtx;
+        static bool s_auth_log_seen = false;
+        static bool s_auth_log_last = false;
+        static std::string s_auth_log_reason;
+        std::lock_guard<std::mutex> lk(s_auth_log_mtx);
+        if (s_auth_log_seen && s_auth_log_last == authorized && s_auth_log_reason == reason)
+            return;
+        s_auth_log_seen = true;
+        s_auth_log_last = authorized;
+        s_auth_log_reason = reason;
+        lic_log_fmt("runtime_arc_authorized_state authorized=%d reason=%.160s obf_valid=%d activation_hardening=%d arc_loaded=%d arc_unloading=%d inflight=%lld",
+            authorized ? 1 : 0,
+            reason.c_str(),
+            check_obfuscated_valid() ? 1 : 0,
+            anti_tamper::state::get().activation_hardening_done.load(std::memory_order_acquire) ? 1 : 0,
+            s_arc_loaded.load(std::memory_order_acquire) ? 1 : 0,
+            s_arc_unloading.load(std::memory_order_acquire) ? 1 : 0,
+            static_cast<long long>(s_arc_call_inflight.load(std::memory_order_acquire)));
+    }
+
     bool runtime_arc_authorized(std::string* missing_out = nullptr)
     {
         if (missing_out)
@@ -2864,12 +2969,14 @@ namespace
         {
             if (missing_out)
                 *missing_out = "license_state_invalid";
+            log_runtime_arc_authorized_state(false, "license_state_invalid");
             return false;
         }
         if (!anti_tamper::state::get().activation_hardening_done.load(std::memory_order_acquire))
         {
             if (missing_out)
                 *missing_out = "arc_hardening_not_finalized";
+            log_runtime_arc_authorized_state(false, "arc_hardening_not_finalized");
             return false;
         }
         arc_call_guard_t guard;
@@ -2877,9 +2984,12 @@ namespace
         {
             if (missing_out)
                 *missing_out = "arc_call_gate";
+            log_runtime_arc_authorized_state(false, "arc_call_gate");
             return false;
         }
-        return arc_required_exports_ready(missing_out);
+        const bool exports_ready = arc_required_exports_ready(missing_out);
+        log_runtime_arc_authorized_state(exports_ready, exports_ready ? std::string("authorized") : (missing_out ? *missing_out : std::string("arc_exports_missing")));
+        return exports_ready;
     }
 
     void reset_arc_fetch_state()
@@ -3028,6 +3138,16 @@ namespace
                 driver_bridge::using_kernel_driver() ? 1 : 0);
             if (!recover_arc_driver_ready_for_relay(phase, 15000))
             {
+                set_arc_load_failure_detail(make_arc_driver_failure_detail(
+                    phase,
+                    "driver_or_kernel_recover_failed_for_token_relay",
+                    driver_bridge::is_loaded(),
+                    driver_bridge::is_loaded() ? driver_bridge::using_kernel_driver() : false,
+                    false,
+                    false,
+                    GetLastError(),
+                    0,
+                    15000));
                 lic_log_fmt("server_token_relay_skip phase=%s driver_loaded=%d kernel=%d",
                     phase ? phase : "unknown",
                     driver_bridge::is_loaded() ? 1 : 0,
@@ -3044,6 +3164,16 @@ namespace
                 phase ? phase : "unknown",
                 settings.license_session_token.size(),
                 settings.license_server_nonce.size());
+            set_arc_load_failure_detail(make_arc_driver_failure_detail(
+                phase,
+                "server_token_or_nonce_missing_for_driver_relay",
+                driver_bridge::is_loaded(),
+                driver_bridge::is_loaded() ? driver_bridge::using_kernel_driver() : false,
+                false,
+                false,
+                ERROR_INVALID_DATA,
+                0,
+                0));
             return false;
         }
 
@@ -3096,7 +3226,20 @@ namespace
             settings.license_session_token.size(),
             settings.license_server_nonce.size());
         if (!ok || driver_proof == 0)
+        {
+            set_arc_load_failure_detail(make_arc_driver_failure_detail(
+                phase,
+                sentinel ? "server_token_relay_missing_driver_proof" : "sentinel_not_ready_for_server_token_relay",
+                driver_bridge::is_loaded(),
+                driver_bridge::is_loaded() ? driver_bridge::using_kernel_driver() : false,
+                true,
+                sentinel,
+                relay_gle,
+                0,
+                15000));
             return false;
+        }
+        clear_arc_load_failure_detail();
         store_driver_proof_cache(driver_proof, settings.license_server_nonce);
         return true;
     }
@@ -3127,9 +3270,13 @@ namespace
     bool try_load_arc_with_retries(settings_sa_t& settings, const std::string& hwid)
     {
         static const uint32_t kRetryDelayMs[3] = { 0u, 2000u, 5000u };
+        clear_arc_load_failure_detail();
 
         if (defer_arc_fetch_if_full_test_running("arc_load"))
+        {
+            set_arc_load_failure_detail("ARC runtime load deferred because the full feature test is running.");
             return false;
+        }
 
         (void)ensure_driver_server_token_relay(settings, "arc_load_pre_wait");
 
@@ -3148,6 +3295,20 @@ namespace
 
         if (!verify_seeded_driver_bridge_for_arc("arc_load"))
         {
+            const bool loaded = driver_bridge::is_loaded();
+            const bool kernel = loaded ? driver_bridge::using_kernel_driver() : false;
+            const bool heartbeat = kernel ? driver_bridge::refresh_heartbeat() : false;
+            const bool sentinel = heartbeat ? driver_bridge::sentinel_bridge_ready() : false;
+            set_arc_load_failure_detail(make_arc_driver_failure_detail(
+                "arc_load",
+                "seeded_driver_bridge_probe_failed",
+                loaded,
+                kernel,
+                heartbeat,
+                sentinel,
+                GetLastError(),
+                0,
+                0));
             log_arc_status("arc_deferred_seeded_bridge_probe_failed");
             return false;
         }
@@ -3178,6 +3339,8 @@ namespace
             }
         }
 
+        if (arc_loader::last_error().empty() && get_arc_load_failure_detail().empty())
+            set_arc_load_failure_detail("ARC runtime download/load attempts failed before the protected runtime was mapped.");
         return false;
     }
 
@@ -6164,9 +6327,7 @@ namespace
                     static_cast<unsigned long long>(fnv1a_str(settings.license_session_token)));
                 if (!try_load_arc_with_retries(settings, hwid))
                 {
-                    std::string arc_error = arc_loader::last_error();
-                    if (arc_error.empty())
-                        arc_error = "ARC runtime session reseed failed after license session rotation.";
+                    std::string arc_error = arc_load_error_or_fallback("ARC runtime session reseed failed after license session rotation.");
                     lic_log_fmt("apply_valid_response_session_token_changed_arc_reseed_failed err=%.160s",
                         arc_error.c_str());
                     std::lock_guard<std::mutex> lk(s_state_mtx);
@@ -6564,14 +6725,36 @@ namespace
     bool download_and_load_arc(settings_sa_t& settings, const std::string& hwid, uint32_t attempt_number)
     {
         if (defer_arc_fetch_if_full_test_running("arc_download"))
+        {
+            set_arc_load_failure_detail("ARC runtime download deferred because the full feature test is running.");
             return false;
+        }
 
         if (!s_arc_loaded.load(std::memory_order_acquire) &&
             !arc_driver_ready_for_load("arc_download"))
         {
             if (!ensure_driver_server_token_relay(settings, "arc_download_ready_recover") ||
                 !arc_driver_ready_for_load("arc_download_recovered"))
+            {
+                if (get_arc_load_failure_detail().empty())
+                {
+                    const bool loaded = driver_bridge::is_loaded();
+                    const bool kernel = loaded ? driver_bridge::using_kernel_driver() : false;
+                    const bool heartbeat = kernel ? driver_bridge::refresh_heartbeat() : false;
+                    const bool sentinel = heartbeat ? driver_bridge::sentinel_bridge_ready() : false;
+                    set_arc_load_failure_detail(make_arc_driver_failure_detail(
+                        "arc_download",
+                        "driver_ready_recover_failed_before_download",
+                        loaded,
+                        kernel,
+                        heartbeat,
+                        sentinel,
+                        GetLastError(),
+                        0,
+                        15000));
+                }
                 return false;
+            }
         }
 
         auto& at_rt = anti_tamper::state::get();
@@ -7317,6 +7500,23 @@ namespace
             {
                 SecureZeroMemory(loader_buffer.data(), loader_buffer.size());
                 loader_buffer.clear();
+                if (get_arc_load_failure_detail().empty())
+                {
+                    const bool loaded = driver_bridge::is_loaded();
+                    const bool kernel = loaded ? driver_bridge::using_kernel_driver() : false;
+                    const bool heartbeat = kernel ? driver_bridge::refresh_heartbeat() : false;
+                    const bool sentinel = heartbeat ? driver_bridge::sentinel_bridge_ready() : false;
+                    set_arc_load_failure_detail(make_arc_driver_failure_detail(
+                        "arc_loader_handoff",
+                        "driver_token_relay_failed_before_loader_handoff",
+                        loaded,
+                        kernel,
+                        heartbeat,
+                        sentinel,
+                        GetLastError(),
+                        0,
+                        15000));
+                }
                 lic_log("[arc-bulk] arc_loader_handoff_driver_relay_failed");
                 log_arc_status("arc_loader_handoff_driver_relay_failed");
                 return false;
@@ -8119,7 +8319,7 @@ namespace
             !try_load_arc_with_retries(settings, reval_hwid))
         {
             lic_log("heartbeat_revalidation_before_pending_arc_reseed_failed");
-            const std::string arc_error = arc_loader::last_error();
+            const std::string arc_error = arc_load_error_or_fallback("ARC runtime session reseed failed during heartbeat revalidation.");
             if (!arc_error.empty())
                 pending_error = arc_error;
             return false;
@@ -8780,9 +8980,7 @@ namespace standalone_license
         snapshot_code_hashes();
         if (!try_load_arc_with_retries(settings, s_cached_hwid))
         {
-            std::string arc_error = arc_loader::last_error();
-            if (arc_error.empty())
-                arc_error = "ARC runtime download or verification failed.";
+            std::string arc_error = arc_load_error_or_fallback("ARC runtime download or verification failed.");
             lic_log_fmt("initialize_arc_required_failed err=%.160s", arc_error.c_str());
             std::lock_guard<std::mutex> lk(s_state_mtx);
             s_error = "Protected runtime failed to load. " + arc_error;
@@ -8921,9 +9119,7 @@ namespace standalone_license
         else
         {
             lic_log("activate_arc_failed");
-            std::string arc_error = arc_loader::last_error();
-            if (arc_error.empty())
-                arc_error = "ARC runtime download or verification failed.";
+            std::string arc_error = arc_load_error_or_fallback("ARC runtime download or verification failed.");
             error_out = "License validation succeeded, but the protected AiDA runtime failed to load. " + arc_error;
             enter_pending_activation(settings, error_out);
             return false;
@@ -9006,12 +9202,31 @@ namespace standalone_license
             static_cast<long long>(s_arc_call_inflight.load(std::memory_order_acquire)));
     }
 
-    void shutdown()
+    void stop_background_workers(const char* reason, uint32_t timeout_ms)
     {
+        const char* reason_text = (reason && *reason) ? reason : "shutdown";
+        lic_log_fmt("background_workers_stop_begin reason=%.128s timeout_ms=%u heartbeat_done=%d srv_refresh_done=%d stop=%d epoch=%llu",
+            reason_text,
+            timeout_ms,
+            s_heartbeat_done.load(std::memory_order_acquire) ? 1 : 0,
+            s_srv_refresh_done.load(std::memory_order_acquire) ? 1 : 0,
+            s_stop.load(std::memory_order_acquire) ? 1 : 0,
+            static_cast<unsigned long long>(s_worker_epoch.load(std::memory_order_acquire)));
         s_worker_epoch.fetch_add(1, std::memory_order_acq_rel);
         s_stop.store(true, std::memory_order_release);
-        wait_for_worker_done(s_heartbeat_done, "heartbeat", 5000);
-        wait_for_worker_done(s_srv_refresh_done, "srv_refresh", 5000);
+        wait_for_worker_done(s_heartbeat_done, "heartbeat_background_stop", timeout_ms);
+        wait_for_worker_done(s_srv_refresh_done, "srv_refresh_background_stop", timeout_ms);
+        lic_log_fmt("background_workers_stop_done reason=%.128s heartbeat_done=%d srv_refresh_done=%d stop=%d epoch=%llu",
+            reason_text,
+            s_heartbeat_done.load(std::memory_order_acquire) ? 1 : 0,
+            s_srv_refresh_done.load(std::memory_order_acquire) ? 1 : 0,
+            s_stop.load(std::memory_order_acquire) ? 1 : 0,
+            static_cast<unsigned long long>(s_worker_epoch.load(std::memory_order_acquire)));
+    }
+
+    void shutdown()
+    {
+        stop_background_workers("license_shutdown", 5000);
         reset_arc_fetch_state();
         reset_activation_completed_at();
         reset_license_clients();

@@ -378,6 +378,21 @@ namespace {
 		push_u64(r, "background_total_published_delta", observed_published_delta);
 		push_observed_pids(r, "fresh_observed_created_pid", observed.observed_created_pids);
 		push_observed_pids(r, "fresh_observed_exited_pid", observed.observed_exited_pids);
+		const bool foreground_drain_proven = !events.empty() && stats.returned_count != 0u;
+		const bool background_observer_proven = observed.observed_count() != 0u;
+		push_u32(r, "foreground_drain_proven", foreground_drain_proven ? 1u : 0u);
+		push_u32(r, "background_observer_proven", background_observer_proven ? 1u : 0u);
+		if (foreground_drain_proven) {
+			r.parsed.push_back({ "evidence_source", "foreground_direct_drain" });
+			r.parsed.push_back({ "sentinel_evidence_result", "foreground_direct_drain_proof" });
+		} else if (background_observer_proven) {
+			r.parsed.push_back({ "evidence_source", "background_debug_event_poller" });
+			r.parsed.push_back({ "sentinel_evidence_result", "background_observer_proof_foreground_drain_zero" });
+			r.parsed.push_back({ "foreground_drain_result", "zero_returned_count" });
+		} else {
+			r.parsed.push_back({ "evidence_source", "none" });
+			r.parsed.push_back({ "sentinel_evidence_result", "no_fresh_evidence_proof" });
+		}
 		for (std::size_t i = 0; i < events.size(); ++i) {
 			const auto& e = events[i];
 			const char* type_name = "invalid";
@@ -416,8 +431,7 @@ namespace {
 			r.parsed.push_back({ label, path_utf8 });
 		}
 		if (events.empty()) {
-			if (observed.observed_count() != 0u) {
-				r.parsed.push_back({ "evidence_source", "background_debug_event_poller" });
+			if (background_observer_proven) {
 				r.ok = true;
 				return;
 			}

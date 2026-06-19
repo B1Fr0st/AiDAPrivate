@@ -469,8 +469,14 @@ namespace {
 		push_hex_field(r, "raw_ioctl_rflags", raw_req.rflags);
 		push_hex_field(r, "raw_ioctl_dr7", raw_req.dr7);
 		push_bool_field(r, "raw_context_valid", raw_context_valid);
+		push_bool_field(r, "raw_driver_tctx_pass", ok && raw_context_valid);
+		push_u32_field(r, "raw_ioctl_failure_win32", (ok && raw_context_valid) ? ERROR_SUCCESS : raw_error);
+		push_hex_field(r, "raw_ioctl_failure_ntstatus", (ok && raw_context_valid) ? 0u : static_cast<std::uint32_t>(raw_ntstatus));
+		push_bool_field(r, "raw_ioctl_failure_preserved", !(ok && raw_context_valid));
+		push_text_field(r, "raw_ioctl_evidence_contract", "raw_driver_tctx_pass_requires_raw_ioctl_ok_and_nonzero_rip_rsp_rflags");
+		push_text_field(r, "raw_ioctl_kernel_correlation", "aida_kernel.log TCTX entry/suspend/context/exit lines carry kernel-side constraint and exception evidence");
 		::diag::log_tagged_fmt("testlab_tctx",
-			"RAW pid=%u tid=%u attached_pid=%u device_pid=%u requested_ioctl=0x%08X effective_ioctl=0x%08lX ok=%d status=0x%08X ntstatus=0x%08X gle=%lu bytes_in=%zu bytes_out_capacity=%zu bytes_returned=%u elapsed_ms=%llu request_mask=0x%llX observed_mask=0x%llX rip=0x%llX rsp=0x%llX rflags=0x%llX dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX",
+			"RAW pid=%u tid=%u attached_pid=%u device_pid=%u requested_ioctl=0x%08X effective_ioctl=0x%08lX ok=%d raw_valid=%d raw_driver_tctx_pass=%d status=0x%08X ntstatus=0x%08X gle=%lu bytes_in=%zu bytes_out_capacity=%zu bytes_returned=%u elapsed_ms=%llu request_mask=0x%llX observed_mask=0x%llX rip=0x%llX rsp=0x%llX rflags=0x%llX dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX failure_preserved=%d",
 			s.pid,
 			s.tid,
 			attached_pid,
@@ -478,6 +484,8 @@ namespace {
 			requested_ioctl,
 			static_cast<unsigned long>(effective_ioctl),
 			ok ? 1 : 0,
+			raw_context_valid ? 1 : 0,
+			(ok && raw_context_valid) ? 1 : 0,
 			raw_status,
 			static_cast<unsigned>(static_cast<std::uint32_t>(raw_ntstatus)),
 			static_cast<unsigned long>(raw_error),
@@ -495,7 +503,8 @@ namespace {
 			static_cast<unsigned long long>(req.dr2),
 			static_cast<unsigned long long>(req.dr3),
 			static_cast<unsigned long long>(req.dr6),
-			static_cast<unsigned long long>(req.dr7));
+			static_cast<unsigned long long>(req.dr7),
+			(ok && raw_context_valid) ? 0 : 1);
 		if (suspend_retry_attempted) {
 			::diag::log_tagged_fmt("testlab_tctx",
 				"RAW_SUSPEND_RETRY pid=%u tid=%u initial_ok=%d initial_valid=%d initial_gle=%lu initial_elapsed_ms=%llu suspended=%d suspend_gle=%lu prev_count=%u suspend_elapsed_ms=%llu retry_ok=%d retry_valid=%d retry_gle=%lu retry_bytes=%u retry_elapsed_ms=%llu resume_ok=%d resume_gle=%lu resume_prev=%u resume_elapsed_ms=%llu retry_rip=0x%llX retry_rsp=0x%llX",
@@ -577,9 +586,11 @@ namespace {
 					} else {
 					push_text_field(r, "tctx_pass_path", "device_get_thread_context_retry");
 					push_bool_field(r, "raw_ioctl_degraded", true);
+					push_text_field(r, "fallback_source", "device_t::get_thread_context");
 					push_text_field(r, "fallback_decision_final", "functional_context_pass_raw_ioctl_degraded_public_device_t_context_matched_user_probe");
 					push_text_field(r, "raw_ioctl_result", "raw TCTX IOCTL failed or returned invalid context; device_t public fallback returned a valid matching functional context");
 					push_text_field(r, "tctx_result_classification", "functional_context_pass");
+					push_bool_field(r, "raw_ioctl_failure_remains_actionable", true);
 					push_functional_context_fields(r, "device_t::get_thread_context", ctx.rip, ctx.rsp, ctx.rflags, ctx.dr7, functional_match, functional_match_after ? "user_probe_after_fallback" : "user_probe_before_raw");
 					push_u32_field(r, "raw_ioctl_failure_pid", s.pid);
 					push_u32_field(r, "raw_ioctl_failure_tid", s.tid);
@@ -587,7 +598,6 @@ namespace {
 					push_u32_field(r, "raw_ioctl_failure_device_pid", device_pid);
 					push_u32_field(r, "raw_ioctl_failure_status", raw_status);
 					push_u32_field(r, "raw_ioctl_failure_last_error", raw_error);
-					push_hex_field(r, "raw_ioctl_failure_ntstatus", static_cast<std::uint32_t>(raw_ntstatus));
 					push_u32_field(r, "raw_ioctl_failure_bytes_returned", bytes_returned);
 					push_bool_field(r, "raw_ioctl_failure_context_valid", raw_context_valid);
 					::diag::log_tagged_fmt("testlab_tctx",
@@ -669,9 +679,11 @@ namespace {
 					} else {
 					push_text_field(r, "tctx_pass_path", "driver_bridge_get_thread_context_retry");
 					push_bool_field(r, "raw_ioctl_degraded", true);
+					push_text_field(r, "fallback_source", "driver_bridge::get_thread_context");
 					push_text_field(r, "fallback_decision_final", "functional_context_pass_raw_ioctl_degraded_public_driver_bridge_context_matched_user_probe");
 					push_text_field(r, "raw_ioctl_result", "raw TCTX IOCTL failed or returned invalid context; driver_bridge public fallback returned a valid matching functional context");
 					push_text_field(r, "tctx_result_classification", "functional_context_pass");
+					push_bool_field(r, "raw_ioctl_failure_remains_actionable", true);
 					push_functional_context_fields(r, "driver_bridge::get_thread_context", bridge_ctx.rip, bridge_ctx.rsp, bridge_ctx.rflags, bridge_ctx.dr7, functional_match, functional_match_after ? "user_probe_after_fallback" : "user_probe_before_raw");
 					push_u32_field(r, "raw_ioctl_failure_pid", s.pid);
 					push_u32_field(r, "raw_ioctl_failure_tid", s.tid);
@@ -679,7 +691,6 @@ namespace {
 					push_u32_field(r, "raw_ioctl_failure_device_pid", device_pid);
 					push_u32_field(r, "raw_ioctl_failure_status", raw_status);
 					push_u32_field(r, "raw_ioctl_failure_last_error", raw_error);
-					push_hex_field(r, "raw_ioctl_failure_ntstatus", static_cast<std::uint32_t>(raw_ntstatus));
 					push_u32_field(r, "raw_ioctl_failure_bytes_returned", bytes_returned);
 					push_bool_field(r, "raw_ioctl_failure_context_valid", raw_context_valid);
 					::diag::log_tagged_fmt("testlab_tctx",
@@ -716,6 +727,12 @@ namespace {
 			push_thread_snapshot(r, "thread_after", after_found, after);
 			const user_context_probe_t user_probe_after = probe_user_context(s.tid, thread_access);
 			push_user_probe_fields(r, "user_probe_after_failure", user_probe_after);
+			push_bool_field(r, "functional_context_pass", false);
+			push_text_field(r, "fallback_source", "none");
+			push_u32_field(r, "raw_ioctl_failure_status", raw_status);
+			push_u32_field(r, "raw_ioctl_failure_last_error", raw_error);
+			push_u32_field(r, "raw_ioctl_failure_bytes_returned", bytes_returned);
+			push_bool_field(r, "raw_ioctl_failure_context_valid", raw_context_valid);
 			push_text_field(r, "fallback_decision_final", "failed_no_valid_raw_or_public_context");
 			::diag::log_tagged_fmt("testlab_tctx",
 				"DECISION degraded=0 fail pid=%u tid=%u raw_ok=%d raw_valid=%d raw_gle=%lu raw_ntstatus=0x%08X user_after_valid=%d user_after_rip=0x%llX user_after_rsp=0x%llX after_found=%d after_state=%u after_rip=0x%llX",
@@ -738,7 +755,10 @@ namespace {
 		}
 		push_text_field(r, "tctx_pass_path", "raw_ioctl");
 		push_bool_field(r, "raw_ioctl_degraded", false);
+		push_bool_field(r, "functional_context_pass", false);
+		push_text_field(r, "fallback_source", "none");
 		push_text_field(r, "fallback_decision_final", "raw_ioctl_valid_no_public_fallback_needed");
+		push_text_field(r, "tctx_result_classification", "raw_driver_tctx_pass");
 		push_context_fields(r, req);
 		const bool after_found = find_thread_snapshot(s.pid, s.tid, after);
 		push_thread_snapshot(r, "thread_after", after_found, after);

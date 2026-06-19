@@ -691,6 +691,8 @@ struct pg_session_t {
     std::atomic<size_t> payload_reads{0};
     std::atomic<bool> capture_payloads{true};
     std::atomic<uint32_t> max_records_per_drain{0};
+    std::atomic<bool> auto_poll{true};
+    std::atomic<bool> drain_active{false};
 
     pg_session_t() = default;
     ~pg_session_t() {
@@ -713,6 +715,36 @@ class pg_engine_t {
         uint32_t previous_pid = 0;
         uint32_t entered_pid = 0;
         bool swapped = false;
+
+        static bool pid_alive(uint32_t pid, uint32_t* exit_code_out = nullptr) {
+            if (exit_code_out)
+                *exit_code_out = 0;
+            if (pid == 0)
+                return false;
+            HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+            if (!process) {
+                const DWORD err = GetLastError();
+                if (exit_code_out)
+                    *exit_code_out = err;
+                return err == ERROR_ACCESS_DENIED;
+            }
+            DWORD exit_code = 0;
+            const BOOL ok = GetExitCodeProcess(process, &exit_code);
+            const DWORD err = ok ? 0 : GetLastError();
+            CloseHandle(process);
+            if (exit_code_out)
+                *exit_code_out = ok ? static_cast<uint32_t>(exit_code) : err;
+            return ok && exit_code == STILL_ACTIVE;
+        }
+
+        static bool attached_contains(uint32_t pid) {
+            const auto pids = driver_bridge::attached_pids();
+            for (auto attached : pids) {
+                if (attached == pid)
+                    return true;
+            }
+            return false;
+        }
 
         bool enter(uint32_t pid) {
             previous_pid = driver_bridge::attached_pid();
@@ -739,17 +771,71 @@ class pg_engine_t {
             if (!swapped)
                 return;
             uint32_t current_pid = driver_bridge::attached_pid();
-            if (current_pid != entered_pid) {
-                diag::log_tagged_fmt("pg_sniff", "active_pid_scope_skip_restore entered=%u previous=%u current=%u",
+            uint32_t current_exit = 0;
+            const bool current_alive = current_pid != 0 && pid_alive(current_pid, &current_exit);
+            if (current_pid != entered_pid && current_pid != 0 && current_alive) {
+                diag::log_tagged_fmt("pg_sniff", "active_pid_scope_skip_restore entered=%u previous=%u current=%u current_alive=%d current_exit=0x%08X",
                     entered_pid,
                     previous_pid,
-                    current_pid);
+                    current_pid,
+                    current_alive ? 1 : 0,
+                    current_exit);
                 return;
             }
-            if (previous_pid != 0)
-                driver_bridge::set_active_pid(previous_pid);
-            else
+            const DWORD restore_start = GetTickCount();
+            uint32_t selected_pid = 0;
+            uint32_t previous_exit = 0;
+            bool previous_alive = false;
+            bool previous_known = false;
+            bool restored = false;
+            const char* method = "none";
+            if (previous_pid != 0) {
+                previous_alive = pid_alive(previous_pid, &previous_exit);
+                previous_known = attached_contains(previous_pid);
+                if (!previous_known && previous_alive)
+                    previous_known = driver_bridge::attach_additional(previous_pid);
+                if (previous_known && previous_alive) {
+                    method = "previous";
+                    restored = driver_bridge::set_active_pid(previous_pid);
+                    if (restored)
+                        selected_pid = previous_pid;
+                }
+            }
+            if (!restored) {
+                const auto pids = driver_bridge::attached_pids();
+                for (auto pid : pids) {
+                    if (pid == 0 || pid == entered_pid)
+                        continue;
+                    uint32_t exit_code = 0;
+                    if (!pid_alive(pid, &exit_code))
+                        continue;
+                    method = "fallback_live_attached";
+                    restored = driver_bridge::set_active_pid(pid);
+                    if (restored) {
+                        selected_pid = pid;
+                        break;
+                    }
+                }
+            }
+            if (!restored) {
+                method = previous_pid == 0 ? "clear_no_previous" : "clear_no_live_restore";
                 driver_bridge::clear_active_pid();
+            }
+            diag::log_tagged_fmt("pg_sniff",
+                "active_pid_scope_restore entered=%u previous=%u current_before=%u previous_known=%d previous_alive=%d previous_exit=0x%08X method=%s restored=%d selected=%u active_after=%u status=%s last_error=%s elapsed_ms=%lu",
+                entered_pid,
+                previous_pid,
+                current_pid,
+                previous_known ? 1 : 0,
+                previous_alive ? 1 : 0,
+                previous_exit,
+                method,
+                restored ? 1 : 0,
+                selected_pid,
+                driver_bridge::attached_pid(),
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str(),
+                static_cast<unsigned long>(GetTickCount() - restore_start));
         }
     };
 
@@ -781,16 +867,17 @@ public:
     pg_engine_t& operator=(const pg_engine_t&) = delete;
 
 
-    uint32_t install(uint32_t pid, uint64_t target_addr, uint64_t region_size, bool capture_payloads = true, uint32_t max_records_per_drain = 0) {
+    uint32_t install(uint32_t pid, uint64_t target_addr, uint64_t region_size, bool capture_payloads = true, uint32_t max_records_per_drain = 0, bool auto_poll = true) {
         const ULONGLONG install_start = GetTickCount64();
-        diag::log_tagged_fmt("pg_sniff", "install_start pid=%u target=0x%llX size=0x%llX kernel=%d attached=%u payloads=%d max_drain=%u",
+        diag::log_tagged_fmt("pg_sniff", "install_start pid=%u target=0x%llX size=0x%llX kernel=%d attached=%u payloads=%d max_drain=%u auto_poll=%d",
             pid,
             static_cast<unsigned long long>(target_addr),
             static_cast<unsigned long long>(region_size),
             driver_bridge::using_kernel_driver() ? 1 : 0,
             driver_bridge::attached_pid(),
             capture_payloads ? 1 : 0,
-            max_records_per_drain);
+            max_records_per_drain,
+            auto_poll ? 1 : 0);
         if (!driver_bridge::using_kernel_driver()) {
             diag::log_tagged_fmt("pg_sniff", "install_failed reason=no_kernel_driver pid=%u", pid);
             return 0;
@@ -990,13 +1077,15 @@ public:
         session->ntdll_size   = ntdll_mod_install.size;
         session->rtl_remove_veh_fn = rtl_remove_fn;
         session->polling.store(true);
+        session->exited.store(!auto_poll, std::memory_order_release);
         session->capture_payloads.store(capture_payloads, std::memory_order_release);
         session->max_records_per_drain.store(max_records_per_drain, std::memory_order_release);
+        session->auto_poll.store(auto_poll, std::memory_order_release);
 
         uint32_t sid = next_id_++;
         session->session_id = sid;
 
-        if (!work_queue::post([worker_session = session]() mutable {
+        if (auto_poll && !work_queue::post([worker_session = session]() mutable {
             poll_ring(std::move(worker_session));
         })) {
             diag::log_tagged_fmt("pg_sniff", "install_failed reason=poll_worker_post pid=%u target=0x%llX",
@@ -1030,7 +1119,7 @@ public:
 
         std::lock_guard<std::mutex> lk(sessions_mutex_);
         sessions_[sid] = session;
-        diag::log_tagged_fmt("pg_sniff", "install_ok sid=%u pid=%u target=0x%llX size=0x%llX ring=0x%llX sc=0x%llX orig=0x%08X old_guard=0x%08X veh=0x%llX payloads=%d max_drain=%u",
+        diag::log_tagged_fmt("pg_sniff", "install_ok sid=%u pid=%u target=0x%llX size=0x%llX ring=0x%llX sc=0x%llX orig=0x%08X old_guard=0x%08X veh=0x%llX payloads=%d max_drain=%u auto_poll=%d",
             sid,
             pid,
             static_cast<unsigned long long>(target_addr),
@@ -1041,7 +1130,8 @@ public:
             old_prot,
             static_cast<unsigned long long>(veh_handle),
             capture_payloads ? 1 : 0,
-            max_records_per_drain);
+            max_records_per_drain,
+            auto_poll ? 1 : 0);
         return sid;
     }
 
@@ -1366,11 +1456,19 @@ private:
             });
             poller_exited = sess->exited.load(std::memory_order_acquire);
         }
-        diag::log_tagged_fmt("pg_sniff", "poller_stop reason=%s sid=%u pid=%u exited=%d elapsed_ms=%llu",
+        size_t queued = 0;
+        {
+            std::lock_guard<std::mutex> slk(sess->captures_mutex);
+            queued = sess->captures.size();
+        }
+        diag::log_tagged_fmt("pg_sniff", "poller_stop reason=%s sid=%u pid=%u exited=%d auto_poll=%d polling=%d queued=%zu elapsed_ms=%llu",
             reason ? reason : "unknown",
             sess->session_id,
             sess->pid,
             poller_exited ? 1 : 0,
+            sess->auto_poll.load(std::memory_order_acquire) ? 1 : 0,
+            sess->polling.load(std::memory_order_acquire) ? 1 : 0,
+            queued,
             static_cast<unsigned long long>(GetTickCount64() - stop_start));
         return poller_exited;
     }
@@ -1403,13 +1501,34 @@ private:
         const ULONGLONG t0 = GetTickCount64();
         std::unique_lock<std::mutex> drain_lk(sess->drain_mutex, std::try_to_lock);
         if (!drain_lk.owns_lock()) {
-            diag::log_tagged_fmt("pg_sniff", "drain_skip_busy sid=%u pid=%u ring=0x%llX elapsed_ms=%llu",
+            size_t queued = 0;
+            {
+                std::lock_guard<std::mutex> slk(sess->captures_mutex);
+                queued = sess->captures.size();
+            }
+            diag::log_tagged_fmt("pg_sniff", "drain_skip_busy sid=%u pid=%u ring=0x%llX queued=%zu drain_active=%d auto_poll=%d polling=%d total=%llu elapsed_ms=%llu",
                 sess->session_id,
                 sess->pid,
                 static_cast<unsigned long long>(sess->ring_addr),
+                queued,
+                sess->drain_active.load(std::memory_order_acquire) ? 1 : 0,
+                sess->auto_poll.load(std::memory_order_acquire) ? 1 : 0,
+                sess->polling.load(std::memory_order_acquire) ? 1 : 0,
+                static_cast<unsigned long long>(sess->total_captured),
                 static_cast<unsigned long long>(GetTickCount64() - t0));
             return;
         }
+        struct drain_activity_scope_t {
+            pg_session_t* sess;
+            explicit drain_activity_scope_t(pg_session_t* s) : sess(s) {
+                if (sess)
+                    sess->drain_active.store(true, std::memory_order_release);
+            }
+            ~drain_activity_scope_t() {
+                if (sess)
+                    sess->drain_active.store(false, std::memory_order_release);
+            }
+        } drain_scope(sess);
 
         pg_ring_header_t hdr{};
         std::vector<uint8_t> hdr_buf;
@@ -1436,19 +1555,6 @@ private:
         uint32_t w = raw_w & (RING_ENTRIES - 1);
         uint32_t r = raw_r & (RING_ENTRIES - 1);
 
-
-        if (sess->ring_initialized) {
-            uint32_t writes_advanced = raw_w - sess->prev_raw_write_idx;
-            if (writes_advanced > RING_ENTRIES) {
-                sess->estimated_drops += writes_advanced - RING_ENTRIES;
-                diag::log_tagged_fmt("pg_sniff", "drain_drop_estimate sid=%u raw_w=%u prev_raw_w=%u advanced=%u drops=%llu",
-                    sess->session_id,
-                    raw_w,
-                    sess->prev_raw_write_idx,
-                    writes_advanced,
-                    static_cast<unsigned long long>(sess->estimated_drops));
-            }
-        }
         sess->prev_raw_write_idx = raw_w;
         sess->ring_initialized = true;
         sess->prev_write_idx = w;
@@ -1458,45 +1564,78 @@ private:
         uint32_t initial_r = r;
         const bool capture_payloads = sess->capture_payloads.load(std::memory_order_acquire);
         const uint32_t max_records = sess->max_records_per_drain.load(std::memory_order_acquire);
-        while (r != w) {
-            pg_capture_t entry{};
-            uint64_t entry_addr = sess->ring_addr + sizeof(pg_ring_header_t)
-                                  + r * sizeof(pg_capture_t);
-            std::vector<uint8_t> entry_buf;
-            if (driver_bridge::read_memory_for(sess->pid, entry_addr, sizeof(entry), entry_buf) && entry_buf.size() >= sizeof(entry)) {
-                std::memcpy(&entry, entry_buf.data(), sizeof(entry));
-                pg_capture_record_t record;
-                if (capture_payloads) {
-                    const size_t budget = sess->payload_budget.load(std::memory_order_acquire);
-                    const bool unlimited = budget == static_cast<size_t>(-1);
-                    const bool include_payload = unlimited || sess->payload_reads.load(std::memory_order_acquire) < budget;
-                    record = build_capture_record(sess, entry, include_payload);
-                    if (!include_payload && sess->payload_reads.load(std::memory_order_relaxed) == budget) {
-                        diag::log_tagged_fmt("pg_sniff", "payload_budget_exhausted sid=%u budget=%zu total=%llu",
-                            sess->session_id,
-                            budget,
-                            static_cast<unsigned long long>(sess->total_captured));
-                    }
-                    if (!unlimited && record.payload_read)
-                        sess->payload_reads.fetch_add(1, std::memory_order_acq_rel);
-                } else {
-                    record.metadata = entry;
-                    record.payload_source = "metadata_only";
+        uint32_t available = (w + RING_ENTRIES - r) & (RING_ENTRIES - 1);
+        uint32_t to_drain = available;
+        if (max_records != 0 && to_drain > max_records)
+            to_drain = max_records;
+
+        auto push_entry = [&](const pg_capture_t& entry) {
+            pg_capture_record_t record;
+            if (capture_payloads) {
+                const size_t budget = sess->payload_budget.load(std::memory_order_acquire);
+                const bool unlimited = budget == static_cast<size_t>(-1);
+                const bool include_payload = unlimited || sess->payload_reads.load(std::memory_order_acquire) < budget;
+                record = build_capture_record(sess, entry, include_payload);
+                if (!include_payload && sess->payload_reads.load(std::memory_order_relaxed) == budget) {
+                    diag::log_tagged_fmt("pg_sniff", "payload_budget_exhausted sid=%u budget=%zu total=%llu",
+                        sess->session_id,
+                        budget,
+                        static_cast<unsigned long long>(sess->total_captured));
                 }
-                std::lock_guard<std::mutex> lk(sess->captures_mutex);
-                sess->captures.push(std::move(record));
+                if (!unlimited && record.payload_read)
+                    sess->payload_reads.fetch_add(1, std::memory_order_acq_rel);
             } else {
-                ++entry_failures;
-                ++sess->entry_read_failures;
+                record.metadata = entry;
+                record.payload_source = "metadata_only";
             }
-            r = (r + 1) & (RING_ENTRIES - 1);
-            drained++;
-            if (max_records != 0 && drained >= max_records)
-                break;
-        }
+            std::lock_guard<std::mutex> lk(sess->captures_mutex);
+            sess->captures.push(std::move(record));
+        };
+
+        auto drain_segment = [&](uint32_t start_index, uint32_t count) {
+            if (count == 0)
+                return;
+            const uint64_t entry_addr = sess->ring_addr + sizeof(pg_ring_header_t)
+                                      + static_cast<uint64_t>(start_index) * sizeof(pg_capture_t);
+            std::vector<uint8_t> segment_buf;
+            const size_t byte_count = static_cast<size_t>(count) * sizeof(pg_capture_t);
+            if (driver_bridge::read_memory_for(sess->pid, entry_addr, byte_count, segment_buf) &&
+                segment_buf.size() >= byte_count) {
+                for (uint32_t i = 0; i < count; ++i) {
+                    pg_capture_t entry{};
+                    std::memcpy(&entry, segment_buf.data() + static_cast<size_t>(i) * sizeof(pg_capture_t), sizeof(entry));
+                    push_entry(entry);
+                }
+                drained += count;
+                return;
+            }
+
+            for (uint32_t i = 0; i < count; ++i) {
+                pg_capture_t entry{};
+                const uint64_t single_addr = sess->ring_addr + sizeof(pg_ring_header_t)
+                                           + static_cast<uint64_t>(start_index + i) * sizeof(pg_capture_t);
+                std::vector<uint8_t> entry_buf;
+                if (driver_bridge::read_memory_for(sess->pid, single_addr, sizeof(entry), entry_buf) &&
+                    entry_buf.size() >= sizeof(entry)) {
+                    std::memcpy(&entry, entry_buf.data(), sizeof(entry));
+                    push_entry(entry);
+                } else {
+                    ++entry_failures;
+                    ++sess->entry_read_failures;
+                }
+                ++drained;
+            }
+        };
+
+        const uint32_t first_count = std::min<uint32_t>(to_drain, RING_ENTRIES - r);
+        const uint32_t second_count = to_drain - first_count;
+        drain_segment(r, first_count);
+        if (second_count != 0)
+            drain_segment(0, second_count);
+        r = (initial_r + static_cast<uint32_t>(drained)) & (RING_ENTRIES - 1);
         sess->total_captured += drained;
         if (drained > 0 || entry_failures > 0) {
-            diag::log_tagged_fmt("pg_sniff", "drain sid=%u pid=%u raw_w=%u raw_r=%u w=%u r0=%u r1=%u drained=%llu entry_failures=%llu total=%llu drops=%llu rearm=%llu/%llu payloads=%d max_drain=%u elapsed_ms=%llu",
+            diag::log_tagged_fmt("pg_sniff", "drain sid=%u pid=%u raw_w=%u raw_r=%u w=%u r0=%u r1=%u available=%u requested=%u drained=%llu entry_failures=%llu total=%llu drops=%llu rearm=%llu/%llu payloads=%d max_drain=%u elapsed_ms=%llu",
                 sess->session_id,
                 sess->pid,
                 raw_w,
@@ -1504,6 +1643,8 @@ private:
                 w,
                 initial_r,
                 r,
+                available,
+                to_drain,
                 static_cast<unsigned long long>(drained),
                 static_cast<unsigned long long>(entry_failures),
                 static_cast<unsigned long long>(sess->total_captured),

@@ -1192,7 +1192,7 @@ namespace
                 static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
             return;
         }
-        bool posted = work_queue::post_service([epoch]() {
+        bool posted = work_queue::post_service_labeled("driver_watchdog", [epoch]() {
             driver_critical_fmt("driver_watchdog_thread_entry pid=%lu tid=%lu tick=%llu",
                 GetCurrentProcessId(),
                 GetCurrentThreadId(),
@@ -1215,10 +1215,289 @@ namespace
     std::atomic<bool> g_event_poller_started{false};
     std::atomic<bool> g_event_poller_stop{false};
     std::atomic<uint64_t> g_event_poller_epoch{0};
+    std::atomic<bool> g_kernel_reconnect_queued{false};
     std::atomic<uint64_t> g_tctx_kernel_bypass_until_ms{0};
     std::atomic<uint32_t> g_tctx_kernel_failures{0};
+    constexpr DWORD kKernelReconnectInitialDelayMs = 750;
+    constexpr DWORD kKernelReconnectRetryDelayMs = 2000;
+    constexpr int kKernelReconnectMaxAttempts = 3;
+
+    struct runtime_auth_snapshot_t
+    {
+        bool valid = false;
+        bool arc_loaded = false;
+        bool arc_loading = false;
+        bool arc_transfer = false;
+        bool arc_exports = false;
+        bool pending_activation = true;
+        bool violation_latched = false;
+        bool activation_hardening = false;
+        bool driver_hardening = false;
+        std::string missing_exports;
+        std::string violation_reason;
+        std::string latch_source;
+    };
+
+    struct kernel_session_snapshot_t
+    {
+        bool initialized = false;
+        bool kernel_mode = false;
+        bool connected = false;
+        bool has_vm_read = false;
+        bool kernel_attached = false;
+        bool watchdog_started = false;
+        bool watchdog_stop = false;
+        uint32_t active_pid = 0;
+        size_t attached_count = 0;
+        uint64_t watchdog_last_ok = 0;
+        int consecutive_fail = 0;
+        DWORD hb_err = 0;
+        DWORD hb_bytes = 0;
+        uint32_t hb_ioctl = 0;
+        uint32_t hb_base = 0;
+        uint32_t hb_key_hash = 0;
+    };
+
+    runtime_auth_snapshot_t capture_runtime_auth_snapshot()
+    {
+        runtime_auth_snapshot_t snap{};
+        auto& rt = anti_tamper::state::get();
+        snap.pending_activation = rt.license_pending_activation.load(std::memory_order_acquire);
+        snap.violation_latched = rt.violation_latched.load(std::memory_order_acquire);
+        snap.activation_hardening = rt.activation_hardening_done.load(std::memory_order_acquire);
+        snap.driver_hardening = rt.driver_hardening_done.load(std::memory_order_acquire);
+        {
+            std::lock_guard<std::mutex> lk(rt.mtx);
+            snap.violation_reason = rt.violation_reason;
+        }
+        snap.latch_source = anti_tamper::runtime_integrity_latch_source_snapshot();
+        snap.arc_loaded = standalone_license::is_arc_loaded();
+        snap.arc_loading = standalone_license::is_arc_download_in_progress();
+        snap.arc_transfer = standalone_license::is_arc_transfer_in_progress();
+        snap.valid = standalone_license::is_valid();
+        if (snap.arc_loaded)
+            snap.arc_exports = standalone_license::validate_arc_required_exports(snap.missing_exports);
+        else
+            snap.missing_exports = "arc_not_loaded";
+        return snap;
+    }
+
+    bool authenticated_runtime_preserved_for_kernel_transition(const runtime_auth_snapshot_t& snap)
+    {
+        return snap.valid &&
+               snap.arc_loaded &&
+               snap.arc_exports &&
+               snap.activation_hardening &&
+               !snap.pending_activation &&
+               !snap.violation_latched;
+    }
+
+    kernel_session_snapshot_t capture_kernel_session_snapshot_locked()
+    {
+        kernel_session_snapshot_t snap{};
+        snap.initialized = g_initialized;
+        snap.kernel_mode = g_kernel_mode;
+        snap.connected = device && device->is_connected();
+        snap.has_vm_read = g_has_vm_read;
+        snap.kernel_attached = g_kernel_attached;
+        snap.watchdog_started = g_driver_watchdog_started.load(std::memory_order_acquire);
+        snap.watchdog_stop = g_driver_watchdog_stop.load(std::memory_order_acquire);
+        snap.active_pid = g_pid;
+        snap.attached_count = g_processes.size();
+        snap.watchdog_last_ok = g_driver_watchdog_last_ok_tick.load(std::memory_order_acquire);
+        snap.consecutive_fail = g_driver_consecutive_fail.load(std::memory_order_acquire);
+        snap.hb_err = device ? device->get_last_heartbeat_error() : 0u;
+        snap.hb_bytes = device ? device->get_last_heartbeat_bytes_returned() : 0u;
+        snap.hb_ioctl = device ? device->get_last_heartbeat_ioctl_code() : 0u;
+        snap.hb_base = device ? device->get_last_heartbeat_base() : 0u;
+        snap.hb_key_hash = device ? device->get_last_heartbeat_key_hash() : 0u;
+        return snap;
+    }
+
+    void log_auth_kernel_transition(const char* phase,
+                                    const char* reason,
+                                    bool preserve_activation,
+                                    const runtime_auth_snapshot_t& before_auth,
+                                    const runtime_auth_snapshot_t& after_auth,
+                                    const kernel_session_snapshot_t& before_kernel,
+                                    const kernel_session_snapshot_t& after_kernel)
+    {
+        driver_critical_fmt(
+            "auth_kernel_transition phase=%s reason=%s preserve_activation=%d "
+            "auth_valid=%d->%d arc=%d->%d loading=%d->%d transfer=%d->%d exports=%d->%d pending=%d->%d violation=%d->%d activation_hardening=%d->%d driver_hardening=%d->%d missing_before='%.160s' missing_after='%.160s' violation_reason_before='%.160s' violation_reason_after='%.160s' latch_source_before='%.512s' latch_source_after='%.512s' "
+            "kernel_initialized=%d->%d kernel_mode=%d->%d connected=%d->%d vm_read=%d->%d kernel_attached=%d->%d pid=%u->%u attached=%llu->%llu watchdog_started=%d->%d watchdog_stop=%d->%d watchdog_last_ok=%llu->%llu consecutive_fail=%d->%d hb_err=%lu->%lu hb_bytes=%lu->%lu hb_ioctl=0x%08X->0x%08X hb_base=0x%04X->0x%04X key_hash=0x%08X->0x%08X",
+            phase ? phase : "<null>",
+            reason ? reason : "<null>",
+            preserve_activation ? 1 : 0,
+            before_auth.valid ? 1 : 0,
+            after_auth.valid ? 1 : 0,
+            before_auth.arc_loaded ? 1 : 0,
+            after_auth.arc_loaded ? 1 : 0,
+            before_auth.arc_loading ? 1 : 0,
+            after_auth.arc_loading ? 1 : 0,
+            before_auth.arc_transfer ? 1 : 0,
+            after_auth.arc_transfer ? 1 : 0,
+            before_auth.arc_exports ? 1 : 0,
+            after_auth.arc_exports ? 1 : 0,
+            before_auth.pending_activation ? 1 : 0,
+            after_auth.pending_activation ? 1 : 0,
+            before_auth.violation_latched ? 1 : 0,
+            after_auth.violation_latched ? 1 : 0,
+            before_auth.activation_hardening ? 1 : 0,
+            after_auth.activation_hardening ? 1 : 0,
+            before_auth.driver_hardening ? 1 : 0,
+            after_auth.driver_hardening ? 1 : 0,
+            before_auth.missing_exports.c_str(),
+            after_auth.missing_exports.c_str(),
+            before_auth.violation_reason.c_str(),
+            after_auth.violation_reason.c_str(),
+            before_auth.latch_source.c_str(),
+            after_auth.latch_source.c_str(),
+            before_kernel.initialized ? 1 : 0,
+            after_kernel.initialized ? 1 : 0,
+            before_kernel.kernel_mode ? 1 : 0,
+            after_kernel.kernel_mode ? 1 : 0,
+            before_kernel.connected ? 1 : 0,
+            after_kernel.connected ? 1 : 0,
+            before_kernel.has_vm_read ? 1 : 0,
+            after_kernel.has_vm_read ? 1 : 0,
+            before_kernel.kernel_attached ? 1 : 0,
+            after_kernel.kernel_attached ? 1 : 0,
+            before_kernel.active_pid,
+            after_kernel.active_pid,
+            static_cast<unsigned long long>(before_kernel.attached_count),
+            static_cast<unsigned long long>(after_kernel.attached_count),
+            before_kernel.watchdog_started ? 1 : 0,
+            after_kernel.watchdog_started ? 1 : 0,
+            before_kernel.watchdog_stop ? 1 : 0,
+            after_kernel.watchdog_stop ? 1 : 0,
+            static_cast<unsigned long long>(before_kernel.watchdog_last_ok),
+            static_cast<unsigned long long>(after_kernel.watchdog_last_ok),
+            before_kernel.consecutive_fail,
+            after_kernel.consecutive_fail,
+            static_cast<unsigned long>(before_kernel.hb_err),
+            static_cast<unsigned long>(after_kernel.hb_err),
+            static_cast<unsigned long>(before_kernel.hb_bytes),
+            static_cast<unsigned long>(after_kernel.hb_bytes),
+            before_kernel.hb_ioctl,
+            after_kernel.hb_ioctl,
+            before_kernel.hb_base,
+            after_kernel.hb_base,
+            before_kernel.hb_key_hash,
+            after_kernel.hb_key_hash);
+    }
+
+    void reset_kernel_transition_hardening_locked(bool preserve_activation)
+    {
+        auto& rt = anti_tamper::state::get();
+        rt.driver_hardening_done.store(false, std::memory_order_release);
+        if (!preserve_activation)
+            rt.activation_hardening_done.store(false, std::memory_order_release);
+    }
+
+    void schedule_kernel_reconnect_after_stale(const char* reason, const runtime_auth_snapshot_t& stale_auth)
+    {
+        if (!authenticated_runtime_preserved_for_kernel_transition(stale_auth)) {
+            driver_critical_fmt("kernel_reconnect_skip reason=%s auth_valid=%d arc=%d exports=%d pending=%d violation=%d activation_hardening=%d",
+                reason ? reason : "<null>",
+                stale_auth.valid ? 1 : 0,
+                stale_auth.arc_loaded ? 1 : 0,
+                stale_auth.arc_exports ? 1 : 0,
+                stale_auth.pending_activation ? 1 : 0,
+                stale_auth.violation_latched ? 1 : 0,
+                stale_auth.activation_hardening ? 1 : 0);
+            return;
+        }
+
+        bool expected = false;
+        if (!g_kernel_reconnect_queued.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+            driver_critical_fmt("kernel_reconnect_skip reason=%s already_queued=1", reason ? reason : "<null>");
+            return;
+        }
+
+        const std::string reason_text = (reason && *reason) ? reason : "kernel_stale";
+        bool posted = work_queue::post_service_labeled("kernel_reconnect_after_stale", [reason_text]() {
+            Sleep(kKernelReconnectInitialDelayMs);
+            for (int attempt = 1; attempt <= kKernelReconnectMaxAttempts; ++attempt) {
+                runtime_auth_snapshot_t auth = capture_runtime_auth_snapshot();
+                if (!authenticated_runtime_preserved_for_kernel_transition(auth)) {
+                    driver_critical_fmt("kernel_reconnect_abort reason=%s attempt=%d auth_valid=%d arc=%d exports=%d pending=%d violation=%d activation_hardening=%d missing='%.160s'",
+                        reason_text.c_str(),
+                        attempt,
+                        auth.valid ? 1 : 0,
+                        auth.arc_loaded ? 1 : 0,
+                        auth.arc_exports ? 1 : 0,
+                        auth.pending_activation ? 1 : 0,
+                        auth.violation_latched ? 1 : 0,
+                        auth.activation_hardening ? 1 : 0,
+                        auth.missing_exports.c_str());
+                    break;
+                }
+
+                driver_critical_fmt("kernel_reconnect_attempt reason=%s attempt=%d max=%d",
+                    reason_text.c_str(),
+                    attempt,
+                    kKernelReconnectMaxAttempts);
+                const bool loaded = driver_bridge::load_kernel_driver();
+                std::string unavailable_reason;
+                const bool available = loaded && driver_bridge::kernel_session_available(&unavailable_reason);
+                driver_critical_fmt("kernel_reconnect_result reason=%s attempt=%d loaded=%d available=%d unavailable='%.160s'",
+                    reason_text.c_str(),
+                    attempt,
+                    loaded ? 1 : 0,
+                    available ? 1 : 0,
+                    unavailable_reason.c_str());
+                if (loaded) {
+                    auto& rt = anti_tamper::state::get();
+                    if (rt.initialized.load(std::memory_order_acquire) &&
+                        !rt.driver_hardening_done.load(std::memory_order_acquire) &&
+                        !rt.violation_latched.load(std::memory_order_acquire))
+                    {
+                        const bool at_ok = anti_tamper::initialize();
+                        driver_critical_fmt("kernel_reconnect_antitamper_retry reason=%s attempt=%d ok=%d driver_hardening=%d violation=%d",
+                            reason_text.c_str(),
+                            attempt,
+                            at_ok ? 1 : 0,
+                            rt.driver_hardening_done.load(std::memory_order_acquire) ? 1 : 0,
+                            rt.violation_latched.load(std::memory_order_acquire) ? 1 : 0);
+                    }
+                    break;
+                }
+                if (attempt < kKernelReconnectMaxAttempts)
+                    Sleep(kKernelReconnectRetryDelayMs);
+            }
+            g_kernel_reconnect_queued.store(false, std::memory_order_release);
+        });
+
+        driver_critical_fmt("kernel_reconnect_post reason=%s posted=%d", reason_text.c_str(), posted ? 1 : 0);
+        if (!posted)
+            g_kernel_reconnect_queued.store(false, std::memory_order_release);
+    }
+    struct tctx_kernel_failure_key_t
+    {
+        uint32_t pid = 0;
+        uint32_t tid = 0;
+        DWORD status = ERROR_SUCCESS;
+        std::string op;
+    };
+    struct tctx_kernel_failure_state_t
+    {
+        tctx_kernel_failure_key_t active_key;
+        tctx_kernel_failure_key_t last_stable_key;
+        bool have_active_key = false;
+        bool have_last_stable_key = false;
+        uint32_t active_repeats = 0;
+        uint32_t distinct_stable_failures = 0;
+        uint64_t first_seen_ms = 0;
+        uint64_t last_seen_ms = 0;
+    };
+    std::mutex g_tctx_kernel_failure_mtx;
+    tctx_kernel_failure_state_t g_tctx_kernel_failure_state;
     constexpr uint64_t kTctxKernelBypassMs = 120000;
     constexpr uint64_t kTctxSlowFailureMs = 250;
+    constexpr uint64_t kTctxFailureEvidenceWindowMs = 30000;
+    constexpr uint32_t kTctxStableFailureRepeats = 2;
+    constexpr uint32_t kTctxDistinctStableFailuresBeforeBypass = 2;
 
     bool tctx_kernel_bypass_active()
     {
@@ -1229,25 +1508,97 @@ namespace
     void note_tctx_kernel_success()
     {
         g_tctx_kernel_failures.store(0, std::memory_order_release);
+        std::lock_guard<std::mutex> lk(g_tctx_kernel_failure_mtx);
+        g_tctx_kernel_failure_state = {};
     }
 
-    void note_tctx_kernel_failure(const char* op, DWORD gle, uint64_t elapsed_ms)
+    bool same_tctx_failure_key(const tctx_kernel_failure_key_t& a, const tctx_kernel_failure_key_t& b)
+    {
+        return a.pid == b.pid && a.tid == b.tid && a.status == b.status && a.op == b.op;
+    }
+
+    void arm_tctx_kernel_bypass(const char* op, uint32_t pid, uint32_t tid, DWORD gle, uint64_t elapsed_ms, uint32_t failures, uint32_t key_repeats, uint32_t distinct_stable_failures, const char* reason)
+    {
+        const uint64_t now = static_cast<uint64_t>(GetTickCount64());
+        const uint64_t until = now + kTctxKernelBypassMs;
+        const uint64_t previous = g_tctx_kernel_bypass_until_ms.exchange(until, std::memory_order_acq_rel);
+        if (previous < now) {
+            diag::log_tagged_fmt("driver",
+                "tctx_kernel_bypass_armed op=%s pid=%u tid=%u gle=%lu elapsed_ms=%llu failures=%u key_repeats=%u distinct_stable_failures=%u bypass_ms=%llu reason=%s",
+                op ? op : "tctx",
+                pid,
+                tid,
+                static_cast<unsigned long>(gle),
+                static_cast<unsigned long long>(elapsed_ms),
+                failures,
+                key_repeats,
+                distinct_stable_failures,
+                static_cast<unsigned long long>(kTctxKernelBypassMs),
+                reason ? reason : "unspecified");
+        }
+    }
+
+    void note_tctx_kernel_failure(const char* op, uint32_t pid, uint32_t tid, DWORD gle, uint64_t elapsed_ms)
     {
         const uint32_t failures = g_tctx_kernel_failures.fetch_add(1, std::memory_order_acq_rel) + 1;
         const bool proven_unavailable = gle == ERROR_PROC_NOT_FOUND || gle == ERROR_INVALID_FUNCTION || gle == ERROR_CALL_NOT_IMPLEMENTED;
-        if (proven_unavailable || elapsed_ms >= kTctxSlowFailureMs || failures >= 2) {
-            const uint64_t now = static_cast<uint64_t>(GetTickCount64());
-            const uint64_t until = now + kTctxKernelBypassMs;
-            const uint64_t previous = g_tctx_kernel_bypass_until_ms.exchange(until, std::memory_order_acq_rel);
-            if (previous < now) {
-                diag::log_tagged_fmt("driver",
-                    "tctx_kernel_bypass_armed op=%s gle=%lu elapsed_ms=%llu failures=%u bypass_ms=%llu",
-                    op ? op : "tctx",
-                    static_cast<unsigned long>(gle),
-                    static_cast<unsigned long long>(elapsed_ms),
-                    failures,
-                    static_cast<unsigned long long>(kTctxKernelBypassMs));
+        if (proven_unavailable) {
+            arm_tctx_kernel_bypass(op, pid, tid, gle, elapsed_ms, failures, failures, failures, "driver_path_unavailable");
+            return;
+        }
+
+        bool should_arm = false;
+        uint32_t key_repeats = 0;
+        uint32_t distinct_stable_failures = 0;
+        bool stable_evidence = false;
+        const uint64_t now = static_cast<uint64_t>(GetTickCount64());
+        {
+            std::lock_guard<std::mutex> lk(g_tctx_kernel_failure_mtx);
+            tctx_kernel_failure_state_t& state = g_tctx_kernel_failure_state;
+            if (state.last_seen_ms != 0 && now >= state.last_seen_ms &&
+                (now - state.last_seen_ms) > kTctxFailureEvidenceWindowMs) {
+                state = {};
             }
+            tctx_kernel_failure_key_t key{};
+            key.pid = pid;
+            key.tid = tid;
+            key.status = gle;
+            key.op = op ? op : "tctx";
+            if (!state.have_active_key || !same_tctx_failure_key(state.active_key, key)) {
+                state.active_key = key;
+                state.have_active_key = true;
+                state.active_repeats = 1;
+                if (state.first_seen_ms == 0)
+                    state.first_seen_ms = now;
+            } else {
+                state.active_repeats++;
+            }
+            state.last_seen_ms = now;
+            key_repeats = state.active_repeats;
+            stable_evidence = key_repeats >= kTctxStableFailureRepeats || elapsed_ms >= kTctxSlowFailureMs;
+            if (stable_evidence &&
+                (!state.have_last_stable_key || !same_tctx_failure_key(state.last_stable_key, key))) {
+                state.last_stable_key = key;
+                state.have_last_stable_key = true;
+                state.distinct_stable_failures++;
+            }
+            distinct_stable_failures = state.distinct_stable_failures;
+            should_arm = distinct_stable_failures >= kTctxDistinctStableFailuresBeforeBypass;
+        }
+        diag::log_tagged_fmt("driver",
+            "tctx_kernel_failure_scoped op=%s pid=%u tid=%u gle=%lu elapsed_ms=%llu failures=%u key_repeats=%u stable_evidence=%d distinct_stable_failures=%u arm_global=%d",
+            op ? op : "tctx",
+            pid,
+            tid,
+            static_cast<unsigned long>(gle),
+            static_cast<unsigned long long>(elapsed_ms),
+            failures,
+            key_repeats,
+            stable_evidence ? 1 : 0,
+            distinct_stable_failures,
+            should_arm ? 1 : 0);
+        if (should_arm) {
+            arm_tctx_kernel_bypass(op, pid, tid, gle, elapsed_ms, failures, key_repeats, distinct_stable_failures, "distinct_stable_thread_context_failures");
         }
     }
     constexpr int kEventPollerPeriodMs = 250;
@@ -1372,7 +1723,7 @@ namespace
                 static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
             return;
         }
-        bool posted = work_queue::post_service([epoch]() {
+        bool posted = work_queue::post_service_labeled("driver_event_poller", [epoch]() {
             driver_critical_fmt("event_poller_thread_entry pid=%lu tid=%lu tick=%llu",
                 GetCurrentProcessId(),
                 GetCurrentThreadId(),
@@ -1486,51 +1837,199 @@ namespace driver_bridge
 
     void invalidate_kernel_session(const char* reason)
     {
-        std::lock_guard<std::mutex> lk(g_state_mtx);
-        diag::log_tagged_critical_fmt("driver",
-            "invalidate_kernel_session reason=%s initialized=%d kernel=%d connected=%d",
-            reason ? reason : "<null>",
-            g_initialized ? 1 : 0,
-            g_kernel_mode ? 1 : 0,
-            (device && device->is_connected()) ? 1 : 0);
-        anti_tamper::state::get().driver_hardening_done.store(false, std::memory_order_release);
-        anti_tamper::state::get().activation_hardening_done.store(false, std::memory_order_release);
-        g_kernel_mode = false;
-        g_initialized = false;
-        g_has_vm_read = false;
-        g_kernel_attached = false;
-        g_pid = 0;
-        g_process_name.clear();
-        g_driver_watchdog_stop.store(true, std::memory_order_release);
-        g_event_poller_stop.store(true, std::memory_order_release);
-        g_driver_watchdog_epoch.fetch_add(1, std::memory_order_acq_rel);
-        g_event_poller_epoch.fetch_add(1, std::memory_order_acq_rel);
-        g_driver_watchdog_started.store(false, std::memory_order_release);
-        g_event_poller_started.store(false, std::memory_order_release);
-        g_driver_consecutive_fail.store(0, std::memory_order_release);
-        g_driver_watchdog_last_ok_tick.store(0, std::memory_order_release);
-        close_process_handle_locked();
-        if (device)
-            device->disconnect();
-        const bool suppress_toast = stale_session_error_toast_suppressed();
-        diag::log_tagged_critical_fmt("driver",
-            "stale_session_toast_policy reason=%s suppress=%d violation_latched=%d pending_activation=%d arc_loaded=%d",
-            reason ? reason : "<null>",
-            suppress_toast ? 1 : 0,
-            anti_tamper::state::get().violation_latched.load(std::memory_order_acquire) ? 1 : 0,
-            anti_tamper::state::get().license_pending_activation.load(std::memory_order_acquire) ? 1 : 0,
-            standalone_license::is_arc_loaded() ? 1 : 0);
-        set_last_error_locked("Kernel driver session became stale during activation; AiDA did not treat this as tampering.", !suppress_toast);
+        const runtime_auth_snapshot_t before_auth = capture_runtime_auth_snapshot();
+        const bool preserve_activation = authenticated_runtime_preserved_for_kernel_transition(before_auth);
+        kernel_session_snapshot_t before_kernel{};
+        kernel_session_snapshot_t after_kernel{};
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            before_kernel = capture_kernel_session_snapshot_locked();
+            diag::log_tagged_critical_fmt("driver",
+                "invalidate_kernel_session reason=%s initialized=%d kernel=%d connected=%d preserve_activation=%d auth_valid=%d arc=%d exports=%d pending=%d violation=%d activation_hardening=%d driver_hardening=%d",
+                reason ? reason : "<null>",
+                g_initialized ? 1 : 0,
+                g_kernel_mode ? 1 : 0,
+                (device && device->is_connected()) ? 1 : 0,
+                preserve_activation ? 1 : 0,
+                before_auth.valid ? 1 : 0,
+                before_auth.arc_loaded ? 1 : 0,
+                before_auth.arc_exports ? 1 : 0,
+                before_auth.pending_activation ? 1 : 0,
+                before_auth.violation_latched ? 1 : 0,
+                before_auth.activation_hardening ? 1 : 0,
+                before_auth.driver_hardening ? 1 : 0);
+            reset_kernel_transition_hardening_locked(preserve_activation);
+            g_kernel_mode = false;
+            g_initialized = false;
+            g_has_vm_read = false;
+            g_kernel_attached = false;
+            g_pid = 0;
+            g_process_name.clear();
+            g_driver_watchdog_stop.store(true, std::memory_order_release);
+            g_event_poller_stop.store(true, std::memory_order_release);
+            g_driver_watchdog_epoch.fetch_add(1, std::memory_order_acq_rel);
+            g_event_poller_epoch.fetch_add(1, std::memory_order_acq_rel);
+            g_driver_watchdog_started.store(false, std::memory_order_release);
+            g_event_poller_started.store(false, std::memory_order_release);
+            g_driver_consecutive_fail.store(0, std::memory_order_release);
+            g_driver_watchdog_last_ok_tick.store(0, std::memory_order_release);
+            close_process_handle_locked();
+            for (auto& kv : g_processes)
+                release_ctx_handle(kv.second);
+            g_processes.clear();
+            if (device)
+                device->disconnect();
+            const bool suppress_toast = stale_session_error_toast_suppressed();
+            diag::log_tagged_critical_fmt("driver",
+                "stale_session_toast_policy reason=%s suppress=%d violation_latched=%d pending_activation=%d arc_loaded=%d preserve_activation=%d",
+                reason ? reason : "<null>",
+                suppress_toast ? 1 : 0,
+                anti_tamper::state::get().violation_latched.load(std::memory_order_acquire) ? 1 : 0,
+                anti_tamper::state::get().license_pending_activation.load(std::memory_order_acquire) ? 1 : 0,
+                standalone_license::is_arc_loaded() ? 1 : 0,
+                preserve_activation ? 1 : 0);
+            set_last_error_locked(
+                preserve_activation
+                    ? "Kernel driver session became stale; AiDA kept the authenticated IDE session active and degraded driver-backed capabilities while reconnecting."
+                    : "Kernel driver session became stale during activation; AiDA did not treat this as tampering.",
+                !suppress_toast);
+            after_kernel = capture_kernel_session_snapshot_locked();
+        }
+        const runtime_auth_snapshot_t after_auth = capture_runtime_auth_snapshot();
+        log_auth_kernel_transition("invalidate_kernel_session",
+            reason,
+            preserve_activation,
+            before_auth,
+            after_auth,
+            before_kernel,
+            after_kernel);
+        schedule_kernel_reconnect_after_stale(reason, after_auth);
+    }
+
+    void shutdown(const char* reason)
+    {
+        const char* reason_text = (reason && *reason) ? reason : "shutdown";
+        const uint64_t started = static_cast<uint64_t>(GetTickCount64());
+        const runtime_auth_snapshot_t before_auth = capture_runtime_auth_snapshot();
+        kernel_session_snapshot_t before_kernel{};
+        kernel_session_snapshot_t after_kernel{};
+        bool kernel_mode = false;
+        bool connected = false;
+        uint32_t active_pid = 0;
+        size_t attached_count = 0;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            before_kernel = capture_kernel_session_snapshot_locked();
+            kernel_mode = g_kernel_mode;
+            connected = device && device->is_connected();
+            active_pid = g_pid;
+            attached_count = g_processes.size();
+            driver_critical_fmt(
+                "shutdown_begin reason=%s initialized=%d kernel=%d connected=%d active_pid=%u attached=%llu watchdog_started=%d watchdog_stop=%d event_started=%d event_stop=%d tid=%lu",
+                reason_text,
+                g_initialized ? 1 : 0,
+                kernel_mode ? 1 : 0,
+                connected ? 1 : 0,
+                active_pid,
+                static_cast<unsigned long long>(attached_count),
+                g_driver_watchdog_started.load(std::memory_order_acquire) ? 1 : 0,
+                g_driver_watchdog_stop.load(std::memory_order_acquire) ? 1 : 0,
+                g_event_poller_started.load(std::memory_order_acquire) ? 1 : 0,
+                g_event_poller_stop.load(std::memory_order_acquire) ? 1 : 0,
+                GetCurrentThreadId());
+            g_driver_watchdog_stop.store(true, std::memory_order_release);
+            g_event_poller_stop.store(true, std::memory_order_release);
+            g_driver_watchdog_epoch.fetch_add(1, std::memory_order_acq_rel);
+            g_event_poller_epoch.fetch_add(1, std::memory_order_acq_rel);
+            g_driver_watchdog_started.store(false, std::memory_order_release);
+            g_event_poller_started.store(false, std::memory_order_release);
+            g_driver_consecutive_fail.store(0, std::memory_order_release);
+            g_driver_watchdog_last_ok_tick.store(0, std::memory_order_release);
+        }
+
+        bool self_unregistered = false;
+        DWORD self_unregister_error = ERROR_SUCCESS;
+        if (kernel_mode && connected)
+        {
+            SetLastError(ERROR_SUCCESS);
+            self_unregistered = unregister_self_dll_protection();
+            self_unregister_error = self_unregistered ? ERROR_SUCCESS : GetLastError();
+            driver_critical_fmt(
+                "shutdown_unregister_self_dll_protection ok=%d err=%lu elapsed_ms=%llu",
+                self_unregistered ? 1 : 0,
+                static_cast<unsigned long>(self_unregister_error),
+                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
+        }
+        else
+        {
+            driver_critical_fmt(
+                "shutdown_unregister_self_dll_protection skipped kernel=%d connected=%d elapsed_ms=%llu",
+                kernel_mode ? 1 : 0,
+                connected ? 1 : 0,
+                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            bool clear_context_ok = true;
+            if (g_kernel_mode && device && device->is_connected())
+            {
+                clear_context_ok = arc_bridge_clear_process_context();
+                if (!clear_context_ok)
+                    device->clear_process_context();
+            }
+            close_process_handle_locked();
+            for (auto& kv : g_processes)
+                release_ctx_handle(kv.second);
+            g_processes.clear();
+            g_pid = 0;
+            g_process_name.clear();
+            g_has_vm_read = false;
+            g_kernel_attached = false;
+            g_kernel_mode = false;
+            g_initialized = false;
+            anti_tamper::state::get().driver_hardening_done.store(false, std::memory_order_release);
+            anti_tamper::state::get().activation_hardening_done.store(false, std::memory_order_release);
+            bool disconnect_attempted = device != nullptr;
+            bool disconnect_connected_before = device && device->is_connected();
+            if (device)
+                device->disconnect();
+            bool disconnect_connected_after = device && device->is_connected();
+            set_last_error_locked({});
+            after_kernel = capture_kernel_session_snapshot_locked();
+            driver_critical_fmt(
+                "shutdown_done reason=%s self_unreg=%d self_unreg_err=%lu clear_context_ok=%d disconnect_attempted=%d connected_before=%d connected_after=%d elapsed_ms=%llu tid=%lu",
+                reason_text,
+                self_unregistered ? 1 : 0,
+                static_cast<unsigned long>(self_unregister_error),
+                clear_context_ok ? 1 : 0,
+                disconnect_attempted ? 1 : 0,
+                disconnect_connected_before ? 1 : 0,
+                disconnect_connected_after ? 1 : 0,
+                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started),
+                GetCurrentThreadId());
+        }
+        const runtime_auth_snapshot_t after_auth = capture_runtime_auth_snapshot();
+        log_auth_kernel_transition("shutdown",
+            reason_text,
+            false,
+            before_auth,
+            after_auth,
+            before_kernel,
+            after_kernel);
     }
 
     bool initialize()
     {
         const uint64_t started = static_cast<uint64_t>(GetTickCount64());
+        const runtime_auth_snapshot_t before_auth = capture_runtime_auth_snapshot();
+        const bool preserve_activation = authenticated_runtime_preserved_for_kernel_transition(before_auth);
         driver_critical_fmt("initialize_enter pid=%lu tid=%lu tick=%llu",
             GetCurrentProcessId(),
             GetCurrentThreadId(),
             static_cast<unsigned long long>(started));
         std::lock_guard<std::mutex> lk(g_state_mtx);
+        kernel_session_snapshot_t before_kernel = capture_kernel_session_snapshot_locked();
         driver_critical_fmt("initialize_state initialized=%d kernel=%d elapsed_ms=%llu",
             g_initialized ? 1 : 0,
             g_kernel_mode ? 1 : 0,
@@ -1544,12 +2043,20 @@ namespace driver_bridge
         }
 
         g_kernel_mode = false;
-        anti_tamper::state::get().driver_hardening_done.store(false, std::memory_order_release);
-        anti_tamper::state::get().activation_hardening_done.store(false, std::memory_order_release);
+        reset_kernel_transition_hardening_locked(preserve_activation);
         g_adbg_clear_process_dr_supported.store(true, std::memory_order_release);
         g_adbg_hide_all_threads_supported.store(true, std::memory_order_release);
         g_driver_watchdog_last_ok_tick.store(0, std::memory_order_release);
         set_last_error_locked({});
+        kernel_session_snapshot_t after_reset_kernel = capture_kernel_session_snapshot_locked();
+        runtime_auth_snapshot_t after_reset_auth = capture_runtime_auth_snapshot();
+        log_auth_kernel_transition("initialize_reset",
+            "initialize",
+            preserve_activation,
+            before_auth,
+            after_reset_auth,
+            before_kernel,
+            after_reset_kernel);
 
         driver_critical_fmt("initialize_connect_existing_pre device=%d elapsed_ms=%llu",
             device ? 1 : 0,
@@ -1566,6 +2073,15 @@ namespace driver_bridge
             logf("AiDA Standalone: Connected to already-loaded driver (reuse, no remap).\n");
             start_driver_watchdog_locked();
             start_event_poller_locked();
+            kernel_session_snapshot_t after_kernel = capture_kernel_session_snapshot_locked();
+            runtime_auth_snapshot_t after_auth = capture_runtime_auth_snapshot();
+            log_auth_kernel_transition("initialize_connect_existing",
+                "initialize",
+                preserve_activation,
+                before_auth,
+                after_auth,
+                before_kernel,
+                after_kernel);
             driver_critical_fmt("initialize_exit reason=existing_driver ok=1 kernel=1 elapsed_ms=%llu",
                 static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
             return true;
@@ -1603,6 +2119,15 @@ namespace driver_bridge
                 logf("AiDA Standalone: Mapper reported failure after load, but kernel driver backend is reachable.\n");
                 start_driver_watchdog_locked();
                 start_event_poller_locked();
+                kernel_session_snapshot_t after_kernel = capture_kernel_session_snapshot_locked();
+                runtime_auth_snapshot_t after_auth = capture_runtime_auth_snapshot();
+                log_auth_kernel_transition("initialize_loader_failed_connect_retry",
+                    "initialize_loader",
+                    preserve_activation,
+                    before_auth,
+                    after_auth,
+                    before_kernel,
+                    after_kernel);
                 driver_critical_fmt("initialize_exit reason=loader_failed_but_connect_ok ok=1 kernel=1 elapsed_ms=%llu",
                     static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
                 return true;
@@ -1627,6 +2152,15 @@ namespace driver_bridge
             logf("AiDA Standalone: Live inspection bridge initialized with kernel driver backend.\n");
             start_driver_watchdog_locked();
             start_event_poller_locked();
+            kernel_session_snapshot_t after_kernel = capture_kernel_session_snapshot_locked();
+            runtime_auth_snapshot_t after_auth = capture_runtime_auth_snapshot();
+            log_auth_kernel_transition("initialize_connect_after_loader",
+                "initialize",
+                preserve_activation,
+                before_auth,
+                after_auth,
+                before_kernel,
+                after_kernel);
             driver_critical_fmt("initialize_exit reason=loaded_connect_ok ok=1 kernel=1 elapsed_ms=%llu",
                 static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
             return true;
@@ -1648,14 +2182,16 @@ namespace driver_bridge
 
     bool load_kernel_driver()
     {
+        const runtime_auth_snapshot_t before_auth = capture_runtime_auth_snapshot();
+        const bool preserve_activation = authenticated_runtime_preserved_for_kernel_transition(before_auth);
         std::lock_guard<std::mutex> lk(g_state_mtx);
+        kernel_session_snapshot_t before_kernel = capture_kernel_session_snapshot_locked();
         if (g_kernel_mode && device && device->is_connected())
             return true;
 
         if (device && device->connect()) {
             driver_loader::mark_already_loaded();
-            anti_tamper::state::get().driver_hardening_done.store(false, std::memory_order_release);
-            anti_tamper::state::get().activation_hardening_done.store(false, std::memory_order_release);
+            reset_kernel_transition_hardening_locked(preserve_activation);
             g_kernel_mode = true;
             g_initialized = true;
             g_adbg_clear_process_dr_supported.store(true, std::memory_order_release);
@@ -1663,6 +2199,15 @@ namespace driver_bridge
             g_driver_watchdog_last_ok_tick.store(0, std::memory_order_release);
             start_driver_watchdog_locked();
             start_event_poller_locked();
+            kernel_session_snapshot_t after_kernel = capture_kernel_session_snapshot_locked();
+            runtime_auth_snapshot_t after_auth = capture_runtime_auth_snapshot();
+            log_auth_kernel_transition("load_kernel_driver_connect_existing",
+                "load_kernel_driver",
+                preserve_activation,
+                before_auth,
+                after_auth,
+                before_kernel,
+                after_kernel);
             return true;
         }
 
@@ -1703,8 +2248,7 @@ namespace driver_bridge
             return false;
         }
 
-        anti_tamper::state::get().driver_hardening_done.store(false, std::memory_order_release);
-        anti_tamper::state::get().activation_hardening_done.store(false, std::memory_order_release);
+        reset_kernel_transition_hardening_locked(preserve_activation);
         g_kernel_mode = true;
         g_initialized = true;
         g_adbg_clear_process_dr_supported.store(true, std::memory_order_release);
@@ -1714,6 +2258,15 @@ namespace driver_bridge
         logf("AiDA Standalone: Kernel driver backend is active.\n");
         start_driver_watchdog_locked();
         start_event_poller_locked();
+        kernel_session_snapshot_t after_kernel = capture_kernel_session_snapshot_locked();
+        runtime_auth_snapshot_t after_auth = capture_runtime_auth_snapshot();
+        log_auth_kernel_transition("load_kernel_driver_connect_after_loader",
+            "load_kernel_driver",
+            preserve_activation,
+            before_auth,
+            after_auth,
+            before_kernel,
+            after_kernel);
         return true;
     }
 
@@ -1727,6 +2280,81 @@ namespace driver_bridge
     {
         std::lock_guard<std::mutex> lk(g_state_mtx);
         return g_kernel_mode && device && device->is_connected();
+    }
+
+    bool kernel_session_available(std::string* reason)
+    {
+        bool initialized = false;
+        bool kernel_mode = false;
+        bool connected = false;
+        std::string last_error_copy;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            initialized = g_initialized;
+            kernel_mode = g_kernel_mode;
+            connected = device && device->is_connected();
+            last_error_copy = g_last_error;
+        }
+
+        auto set_reason = [&](const char* value) {
+            if (reason)
+                *reason = value ? value : "kernel_session_unavailable";
+        };
+
+        if (!initialized) {
+            set_reason("kernel_session_not_initialized");
+            driver_critical_fmt("kernel_session_available ok=0 reason=kernel_session_not_initialized kernel=%d connected=%d last_error='%.160s'",
+                kernel_mode ? 1 : 0,
+                connected ? 1 : 0,
+                last_error_copy.c_str());
+            return false;
+        }
+        if (!kernel_mode) {
+            set_reason("kernel_driver_degraded");
+            driver_critical_fmt("kernel_session_available ok=0 reason=kernel_driver_degraded initialized=%d connected=%d last_error='%.160s'",
+                initialized ? 1 : 0,
+                connected ? 1 : 0,
+                last_error_copy.c_str());
+            return false;
+        }
+        if (!connected) {
+            set_reason("kernel_device_disconnected");
+            driver_critical_fmt("kernel_session_available ok=0 reason=kernel_device_disconnected initialized=%d kernel=%d last_error='%.160s'",
+                initialized ? 1 : 0,
+                kernel_mode ? 1 : 0,
+                last_error_copy.c_str());
+            return false;
+        }
+
+        auto& rt = anti_tamper::state::get();
+        if (rt.violation_latched.load(std::memory_order_acquire)) {
+            set_reason("runtime_integrity_violation_latched");
+            std::string latch_source = anti_tamper::runtime_integrity_latch_source_snapshot();
+            std::string violation_reason;
+            {
+                std::lock_guard<std::mutex> lk(rt.mtx);
+                violation_reason = rt.violation_reason;
+            }
+            driver_critical_fmt("kernel_session_available ok=0 reason=runtime_integrity_violation_latched violation_reason='%.160s' latch_source='%.512s'",
+                violation_reason.c_str(),
+                latch_source.c_str());
+            return false;
+        }
+        if (rt.initialized.load(std::memory_order_acquire) &&
+            !rt.driver_hardening_done.load(std::memory_order_acquire))
+        {
+            set_reason("driver_hardening_not_finalized");
+            driver_critical_fmt("kernel_session_available ok=0 reason=driver_hardening_not_finalized initialized=%d kernel=%d connected=%d activation_hardening=%d",
+                initialized ? 1 : 0,
+                kernel_mode ? 1 : 0,
+                connected ? 1 : 0,
+                rt.activation_hardening_done.load(std::memory_order_acquire) ? 1 : 0);
+            return false;
+        }
+
+        if (reason)
+            reason->clear();
+        return true;
     }
 
     bool can_read_memory()
@@ -3173,11 +3801,83 @@ namespace driver_bridge_pid_call
         ~pid_scope_t()
         {
             if (!ok) return;
-            if (swapped && prev_pid != 0 && prev_pid != target_pid) {
-                (void)driver_bridge::set_active_pid(prev_pid);
-            } else if (swapped && prev_pid == 0) {
+            if (!swapped) return;
+            const DWORD restore_start = GetTickCount();
+            const uint32_t active_before = driver_bridge::attached_pid();
+            uint32_t active_exit = 0;
+            const bool active_alive = active_before != 0 && pid_is_alive(active_before, &active_exit);
+            if (active_before != target_pid && active_before != 0 && active_alive) {
+                diag::log_tagged_fmt("driver_bridge",
+                    "pid_scope_exit_restore_skip target=%u previous=%u active_before=%u active_alive=%d active_exit=0x%08X status=%s last_error=%s elapsed_ms=%lu",
+                    target_pid,
+                    prev_pid,
+                    active_before,
+                    active_alive ? 1 : 0,
+                    active_exit,
+                    driver_bridge::status().c_str(),
+                    driver_bridge::last_error().c_str(),
+                    static_cast<unsigned long>(GetTickCount() - restore_start));
+                return;
+            }
+            uint32_t selected_pid = 0;
+            uint32_t previous_exit = 0;
+            bool previous_alive = false;
+            bool previous_known = false;
+            bool restored = false;
+            const char* method = "none";
+            if (prev_pid != 0 && prev_pid != target_pid) {
+                previous_alive = pid_is_alive(prev_pid, &previous_exit);
+                const auto pids = driver_bridge::attached_pids();
+                for (auto pid : pids) {
+                    if (pid == prev_pid) {
+                        previous_known = true;
+                        break;
+                    }
+                }
+                if (!previous_known && previous_alive)
+                    previous_known = driver_bridge::attach_additional(prev_pid);
+                if (previous_known && previous_alive) {
+                    method = "previous";
+                    restored = driver_bridge::set_active_pid(prev_pid);
+                    if (restored)
+                        selected_pid = prev_pid;
+                }
+            }
+            if (!restored) {
+                const auto pids = driver_bridge::attached_pids();
+                for (auto pid : pids) {
+                    if (pid == 0 || pid == target_pid)
+                        continue;
+                    uint32_t exit_code = 0;
+                    if (!pid_is_alive(pid, &exit_code))
+                        continue;
+                    method = "fallback_live_attached";
+                    restored = driver_bridge::set_active_pid(pid);
+                    if (restored) {
+                        selected_pid = pid;
+                        break;
+                    }
+                }
+            }
+            if (!restored) {
+                method = prev_pid == 0 ? "clear_no_previous" : "clear_no_live_restore";
                 (void)driver_bridge::clear_active_pid();
             }
+            diag::log_tagged_fmt("driver_bridge",
+                "pid_scope_exit_restore target=%u previous=%u active_before=%u previous_known=%d previous_alive=%d previous_exit=0x%08X method=%s restored=%d selected=%u active_after=%u status=%s last_error=%s elapsed_ms=%lu",
+                target_pid,
+                prev_pid,
+                active_before,
+                previous_known ? 1 : 0,
+                previous_alive ? 1 : 0,
+                previous_exit,
+                method,
+                restored ? 1 : 0,
+                selected_pid,
+                driver_bridge::attached_pid(),
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str(),
+                static_cast<unsigned long>(GetTickCount() - restore_start));
         }
     };
 
@@ -3613,12 +4313,13 @@ namespace driver_bridge
         if (!device->get_thread_context(tid, kctx)) {
             DWORD gle = GetLastError();
             const uint64_t elapsed_ms = static_cast<uint64_t>(GetTickCount64()) - kernel_t0;
-            note_tctx_kernel_failure("get_thread_context", gle, elapsed_ms);
+            const uint32_t pid = attached_pid();
+            note_tctx_kernel_failure("get_thread_context", pid, tid, gle, elapsed_ms);
             diag::log_tagged_fmt("driver",
                 "get_thread_context_kernel_failed tid=%u gle=%lu attached_pid=%u elapsed_ms=%llu fallback=user",
                 tid,
                 gle,
-                attached_pid(),
+                pid,
                 static_cast<unsigned long long>(elapsed_ms));
             if (usermode_get_thread_context(tid, ctx, "get_thread_context.kernel_failed"))
                 return true;
@@ -3681,14 +4382,15 @@ namespace driver_bridge
         if (!ok) {
             DWORD gle = GetLastError();
             const uint64_t elapsed_ms = static_cast<uint64_t>(GetTickCount64()) - kernel_t0;
-            note_tctx_kernel_failure("set_thread_context", gle, elapsed_ms);
+            const uint32_t pid = attached_pid();
+            note_tctx_kernel_failure("set_thread_context", pid, tid, gle, elapsed_ms);
             diag::log_tagged_fmt("driver",
                 "set_thread_context_KERNEL_FAILED tid=%u mask=0x%llX rip=0x%llX rsp=0x%llX attached_pid=%u kernel_mode=%d gle=%lu elapsed_ms=%llu fallback=user",
                 tid,
                 static_cast<unsigned long long>(register_mask),
                 static_cast<unsigned long long>(ctx.rip),
                 static_cast<unsigned long long>(ctx.rsp),
-                attached_pid(),
+                pid,
                 kernel_mode ? 1 : 0,
                 gle,
                 static_cast<unsigned long long>(elapsed_ms));
@@ -4380,9 +5082,11 @@ namespace driver_bridge
         if (!ok) {
             DWORD gle = GetLastError();
             const uint64_t elapsed_ms = static_cast<uint64_t>(GetTickCount64()) - kernel_t0;
-            note_tctx_kernel_failure("set_hardware_breakpoint", gle, elapsed_ms);
+            const uint32_t pid = attached_pid();
+            note_tctx_kernel_failure("set_hardware_breakpoint", pid, tid, gle, elapsed_ms);
             diag::log_tagged_fmt("driver",
-                "set_hardware_breakpoint_kernel_failed tid=%u index=%d addr=0x%llX type=%d size=%d gle=%lu elapsed_ms=%llu fallback=user",
+                "set_hardware_breakpoint_kernel_failed pid=%u tid=%u index=%d addr=0x%llX type=%d size=%d gle=%lu elapsed_ms=%llu fallback=user",
+                pid,
                 tid,
                 index,
                 static_cast<unsigned long long>(address),
@@ -4415,9 +5119,11 @@ namespace driver_bridge
         if (!ok) {
             DWORD gle = GetLastError();
             const uint64_t elapsed_ms = static_cast<uint64_t>(GetTickCount64()) - kernel_t0;
-            note_tctx_kernel_failure("clear_hardware_breakpoint", gle, elapsed_ms);
+            const uint32_t pid = attached_pid();
+            note_tctx_kernel_failure("clear_hardware_breakpoint", pid, tid, gle, elapsed_ms);
             diag::log_tagged_fmt("driver",
-                "clear_hardware_breakpoint_kernel_failed tid=%u index=%d gle=%lu elapsed_ms=%llu fallback=user",
+                "clear_hardware_breakpoint_kernel_failed pid=%u tid=%u index=%d gle=%lu elapsed_ms=%llu fallback=user",
+                pid,
                 tid,
                 index,
                 gle,

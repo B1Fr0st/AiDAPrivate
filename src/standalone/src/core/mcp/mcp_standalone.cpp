@@ -604,33 +604,72 @@ static std::string json_dump_safe(const json& j, int indent = -1)
     catch (...) { return "{}"; }
 }
 
+struct mcp_auth_snapshot_t
+{
+    bool ide_ready = false;
+    bool posture_trusted = false;
+    bool license_valid = false;
+    bool arc_loaded = false;
+    bool arc_loading = false;
+    bool arc_transfer = false;
+    bool exports_ok = false;
+    bool driver_loaded = false;
+    bool driver_kernel = false;
+    bool driver_available = false;
+    std::string missing_exports;
+    std::string driver_reason;
+};
+
+static mcp_auth_snapshot_t capture_mcp_auth_snapshot(bool include_driver)
+{
+    mcp_auth_snapshot_t snap{};
+    snap.ide_ready = g_ide_lifecycle_ready.load(std::memory_order_acquire);
+    snap.posture_trusted = anti_tamper::mcp_posture::is_current_posture_trusted();
+    snap.license_valid = standalone_license::is_valid();
+    snap.arc_loaded = standalone_license::is_arc_loaded();
+    snap.arc_loading = standalone_license::is_arc_download_in_progress();
+    snap.arc_transfer = standalone_license::is_arc_transfer_in_progress();
+    if (snap.arc_loaded)
+        snap.exports_ok = standalone_license::validate_arc_required_exports(snap.missing_exports);
+    else
+        snap.missing_exports = "arc_not_loaded";
+    if (include_driver) {
+        snap.driver_loaded = driver_bridge::is_loaded();
+        snap.driver_kernel = driver_bridge::using_kernel_driver();
+        snap.driver_available = driver_bridge::kernel_session_available(&snap.driver_reason);
+    }
+    return snap;
+}
+
 [[noreturn]] static void mcp_auth_fastfail(const char* where)
 {
-    std::string missing_exports;
-    const bool exports_ok = standalone_license::is_arc_loaded()
-        && standalone_license::validate_arc_required_exports(missing_exports);
+    const mcp_auth_snapshot_t snap = capture_mcp_auth_snapshot(true);
     diag::log_tagged_fmt("mcp_srv",
-        "auth_fastfail where=%s ide=%d valid=%d arc=%d loading=%d exports=%d missing='%.160s'",
+        "auth_fastfail where=%s ide=%d posture=%d valid=%d arc=%d loading=%d transfer=%d exports=%d missing='%.160s' driver_loaded=%d driver_kernel=%d driver_available=%d driver_reason='%.160s'",
         where ? where : "<null>",
-        g_ide_lifecycle_ready.load(std::memory_order_acquire) ? 1 : 0,
-        standalone_license::is_valid() ? 1 : 0,
-        standalone_license::is_arc_loaded() ? 1 : 0,
-        standalone_license::is_arc_download_in_progress() ? 1 : 0,
-        exports_ok ? 1 : 0,
-        missing_exports.c_str());
+        snap.ide_ready ? 1 : 0,
+        snap.posture_trusted ? 1 : 0,
+        snap.license_valid ? 1 : 0,
+        snap.arc_loaded ? 1 : 0,
+        snap.arc_loading ? 1 : 0,
+        snap.arc_transfer ? 1 : 0,
+        snap.exports_ok ? 1 : 0,
+        snap.missing_exports.c_str(),
+        snap.driver_loaded ? 1 : 0,
+        snap.driver_kernel ? 1 : 0,
+        snap.driver_available ? 1 : 0,
+        snap.driver_reason.c_str());
     __fastfail(0xA1DA4D43u);
 }
 
 static bool mcp_runtime_authorized()
 {
-    if (!g_ide_lifecycle_ready.load(std::memory_order_acquire))
-        return false;
-    if (!anti_tamper::mcp_posture::is_current_posture_trusted())
-        return false;
-    if (!standalone_license::is_valid() || !standalone_license::is_arc_loaded())
-        return false;
-    std::string missing_exports;
-    return standalone_license::validate_arc_required_exports(missing_exports);
+    const mcp_auth_snapshot_t snap = capture_mcp_auth_snapshot(false);
+    return snap.ide_ready &&
+           snap.posture_trusted &&
+           snap.license_valid &&
+           snap.arc_loaded &&
+           snap.exports_ok;
 }
 
 static void require_mcp_runtime_authorized(const char* where)
@@ -646,22 +685,22 @@ void set_ide_lifecycle_ready(bool ready) noexcept
 
 bool lifecycle_authorized(std::string* reason)
 {
-    if (!g_ide_lifecycle_ready.load(std::memory_order_acquire)) {
+    const mcp_auth_snapshot_t snap = capture_mcp_auth_snapshot(false);
+    if (!snap.ide_ready) {
         if (reason) *reason = "ide_not_ready";
         return false;
     }
-    if (!standalone_license::is_valid()) {
+    if (!snap.license_valid) {
         if (reason) *reason = "license_invalid";
         return false;
     }
-    if (!standalone_license::is_arc_loaded()) {
+    if (!snap.arc_loaded) {
         if (reason)
-            *reason = standalone_license::is_arc_download_in_progress() ? "arc_loading" : "arc_not_loaded";
+            *reason = snap.arc_loading ? "arc_loading" : "arc_not_loaded";
         return false;
     }
-    std::string missing_exports;
-    if (!standalone_license::validate_arc_required_exports(missing_exports)) {
-        if (reason) *reason = missing_exports.empty() ? "arc_exports_missing" : ("arc_exports_missing:" + missing_exports);
+    if (!snap.exports_ok) {
+        if (reason) *reason = snap.missing_exports.empty() ? "arc_exports_missing" : ("arc_exports_missing:" + snap.missing_exports);
         return false;
     }
     if (reason) *reason = "authorized";
@@ -779,6 +818,114 @@ static bool wants_full_tool_list(const json& params)
                detail == "schemas";
     }
     return false;
+}
+
+static bool schema_enum_char(unsigned char c)
+{
+    return std::isalnum(c) || c == '_' || c == '-' || c == '|';
+}
+
+static std::string trim_schema_token(std::string token)
+{
+    while (!token.empty() && !schema_enum_char(static_cast<unsigned char>(token.front())))
+        token.erase(token.begin());
+    while (!token.empty() && !schema_enum_char(static_cast<unsigned char>(token.back())))
+        token.pop_back();
+    return token;
+}
+
+static json enum_values_from_description(const std::string& description)
+{
+    json out = json::array();
+    const size_t pipe = description.find('|');
+    if (pipe == std::string::npos)
+        return out;
+
+    size_t start = pipe;
+    while (start > 0 && schema_enum_char(static_cast<unsigned char>(description[start - 1])))
+        --start;
+    size_t end = pipe + 1;
+    while (end < description.size() && schema_enum_char(static_cast<unsigned char>(description[end])))
+        ++end;
+
+    std::string segment = description.substr(start, end - start);
+    std::vector<std::string> values;
+    size_t cursor = 0;
+    while (cursor <= segment.size()) {
+        const size_t next = segment.find('|', cursor);
+        std::string token = trim_schema_token(segment.substr(cursor, next == std::string::npos ? std::string::npos : next - cursor));
+        if (token.empty() || token.size() > 64)
+            return json::array();
+        values.push_back(std::move(token));
+        if (next == std::string::npos)
+            break;
+        cursor = next + 1;
+    }
+
+    if (values.size() < 2 || values.size() > 64)
+        return json::array();
+    for (const auto& value : values)
+        out.push_back(value);
+    return out;
+}
+
+static json build_input_schema(const tool_def_t& tool)
+{
+    json input_schema;
+    input_schema["type"] = "object";
+    json properties = json::object();
+    json required_arr = json::array();
+
+    for (const auto& p : tool.params) {
+        json desc;
+        desc["type"]        = p.type;
+        desc["description"] = p.description;
+        json enum_values = enum_values_from_description(p.description);
+        if (!enum_values.empty())
+            desc["enum"] = std::move(enum_values);
+        properties[p.name] = desc;
+        if (p.required)
+            required_arr.push_back(p.name);
+    }
+
+    input_schema["properties"] = properties;
+    if (!required_arr.empty())
+        input_schema["required"] = required_arr;
+    return input_schema;
+}
+
+static const char* visibility_name(tool_visibility_t visibility)
+{
+    switch (visibility) {
+    case tool_visibility_t::external_visible:
+        return "external_visible";
+    case tool_visibility_t::internal_only:
+        return "internal_only";
+    case tool_visibility_t::ide_chat_only:
+        return "ide_chat_only";
+    default:
+        return "unknown";
+    }
+}
+
+static std::string infer_tool_domain(const std::string& name)
+{
+    if (name.rfind("browser_", 0) == 0)
+        return "browser";
+    if (name == "burp_scanner_manage")
+        return "scanner";
+    if (name.rfind("burp_", 0) == 0)
+        return "burp";
+    if (name.rfind("network_", 0) == 0)
+        return "network";
+    if (name.rfind("net_security_", 0) == 0)
+        return "network_security";
+    if (name.rfind("net_proto_", 0) == 0)
+        return "network_protocol";
+    const size_t underscore = name.find('_');
+    if (underscore == std::string::npos || underscore == 0)
+        return {};
+    return name.substr(0, underscore);
 }
 
 static std::string format_sse_event(const std::string& event_type, const std::string& data)
@@ -1054,6 +1201,33 @@ static bool is_external_mcp_tool(const tool_def_t& tool)
     return tool.visibility == tool_visibility_t::external_visible &&
            !is_standalone_ide_chat_only_tool_name(tool.name) &&
            !is_standalone_internal_only_tool_name(tool.name);
+}
+
+static bool is_driver_bridge_dependent_tool(const tool_def_t& tool)
+{
+    const std::string name = lower_ascii(tool.name);
+    if (name.rfind("driver_", 0) != 0)
+        return false;
+    const std::string desc = lower_ascii(tool.description);
+    if (desc.find("does not require the kernel driver") != std::string::npos ||
+        desc.find("purely from usermode") != std::string::npos)
+        return false;
+    static const char* const driver_needles[] = {
+        "requires driver connected",
+        "requires kernel driver",
+        "requires driver",
+        "via kernel driver",
+        "using kernel memory",
+        "kernel memory reads",
+        "kernel-level",
+        "dtb solved",
+        "kernel driver backend"
+    };
+    for (const char* needle : driver_needles) {
+        if (desc.find(needle) != std::string::npos)
+            return true;
+    }
+    return false;
 }
 
 static std::shared_mutex& active_session_tool_mutex()
@@ -1408,30 +1582,7 @@ json server_t::make_error(const json& id, int code, const std::string& msg)
 
 json server_t::tool_schema(const tool_def_t& tool, bool compact) const
 {
-    if (compact && tool.name != "get_tool_descriptions") {
-        return json{
-            {"name", tool.name},
-            {"description", tool.description},
-            {"inputSchema", json{{"type", "object"}}}
-        };
-    }
-
-    json input_schema;
-    input_schema["type"] = "object";
-    json properties = json::object();
-    json required_arr = json::array();
-
-    for (const auto& p : tool.params) {
-        json desc;
-        desc["type"]        = p.type;
-        desc["description"] = p.description;
-        properties[p.name] = desc;
-        if (p.required) required_arr.push_back(p.name);
-    }
-
-    input_schema["properties"] = properties;
-    if (!required_arr.empty()) input_schema["required"] = required_arr;
-
+    json input_schema = build_input_schema(tool);
     json annotations;
     annotations["title"]           = snake_to_title(tool.name);
     annotations["readOnlyHint"]    = tool.read_only;
@@ -1439,12 +1590,50 @@ json server_t::tool_schema(const tool_def_t& tool, bool compact) const
     annotations["idempotentHint"]  = tool.read_only;
     annotations["openWorldHint"]   = (tool.name == "sandbox_execute");
 
+    if (compact && tool.name != "get_tool_descriptions") {
+        json t;
+        t["name"]        = tool.name;
+        t["description"] = tool.description;
+        t["inputSchema"] = input_schema;
+        t["read_only"]   = tool.read_only;
+        t["visibility"]  = visibility_name(tool.visibility);
+        const std::string domain = infer_tool_domain(tool.name);
+        if (!domain.empty())
+            t["domain"] = domain;
+        t["annotations"] = json{
+            {"readOnlyHint", tool.read_only},
+            {"destructiveHint", !tool.read_only}
+        };
+        return t;
+    }
+
     json t;
     t["name"]        = tool.name;
     t["description"] = tool.description;
     t["inputSchema"] = input_schema;
     t["annotations"] = annotations;
+    t["read_only"]   = tool.read_only;
+    t["visibility"]  = visibility_name(tool.visibility);
+    const std::string domain = infer_tool_domain(tool.name);
+    if (!domain.empty())
+        t["domain"] = domain;
     return t;
+}
+
+static bool has_structured_tool_error(const tool_result_t& tr)
+{
+    return !tr.success && (!tr.error_code.empty() || (!tr.error_details.is_null() && !tr.error_details.empty()));
+}
+
+static json structured_tool_error(const tool_result_t& tr)
+{
+    json err = json::object();
+    err["message"] = tr.text;
+    if (!tr.error_code.empty())
+        err["code"] = tr.error_code;
+    if (!tr.error_details.is_null() && !tr.error_details.empty())
+        err["details"] = tr.error_details;
+    return err;
 }
 
 tool_result_t server_t::describe_tools(const json& params)
@@ -1706,6 +1895,29 @@ json server_t::handle_tools_call(const json& id, const json& params)
         return make_error(id, JSONRPC_INVALID_PARAMS, "Unknown tool: " + tool_name);
     }
 
+    if (is_driver_bridge_dependent_tool(found)) {
+        std::string driver_reason;
+        if (!driver_bridge::kernel_session_available(&driver_reason)) {
+            std::string detail = driver_bridge::last_error();
+            if (detail.empty())
+                detail = driver_bridge::status();
+            diag::log_tagged_fmt("mcp_srv",
+                "tool_driver_unavailable tool='%s' reason='%s' detail='%.160s' license_valid=%d arc=%d",
+                tool_name.c_str(),
+                driver_reason.empty() ? "<empty>" : driver_reason.c_str(),
+                detail.c_str(),
+                standalone_license::is_valid() ? 1 : 0,
+                standalone_license::is_arc_loaded() ? 1 : 0);
+            std::string message = "Kernel driver bridge unavailable for tool '" + tool_name + "'";
+            if (!driver_reason.empty())
+                message += " (" + driver_reason + ")";
+            message += ". App license and ARC authorization remain active; driver-backed capabilities are degraded while reconnect is pending.";
+            if (!detail.empty())
+                message += " Driver status: " + detail;
+            return make_error(id, -32051, message);
+        }
+    }
+
     diag::log_tagged_fmt("mcp_srv", "handle_tools_call dispatching tool='%s'", tool_name.c_str());
     cancel_scope_t scope(id);
 
@@ -1737,7 +1949,14 @@ json server_t::handle_tools_call(const json& id, const json& params)
 
     json result;
     result["content"] = content;
-    if (!tr.success) result["isError"] = true;
+    if (!tr.success) {
+        result["isError"] = true;
+        if (has_structured_tool_error(tr)) {
+            json err = structured_tool_error(tr);
+            result["_meta"]["error"] = err;
+            result["structuredContent"]["error"] = std::move(err);
+        }
+    }
     return make_result(id, result);
 }
 
@@ -2654,6 +2873,14 @@ void server_t::server_thread_func(int port)
         resp["success"] = tr.success;
         resp["output"]  = sanitize_utf8(tr.text);
         if (!tr.data.is_null() && !tr.data.empty()) resp["data"] = tr.data;
+        if (has_structured_tool_error(tr)) {
+            json err = structured_tool_error(tr);
+            resp["error"] = err;
+            if (err.contains("code"))
+                resp["error_code"] = err["code"];
+            if (err.contains("details"))
+                resp["error_details"] = err["details"];
+        }
         res.set_content(json_dump_safe(resp, 2), "application/json");
     });
 

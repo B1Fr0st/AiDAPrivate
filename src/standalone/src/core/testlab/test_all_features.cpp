@@ -539,24 +539,53 @@ namespace test_all_features {
 				before.cleanup_pending ||
 				before.child_alive ||
 				before.browser_open ||
-				before.page_verified;
-			log_msg(hf, "camoufox-cleanup", "preflight reason=%s active=%d state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d last_error_len=%zu",
+				before.page_verified ||
+				before.privacy_verified ||
+				!before.last_error.empty();
+			const bool healthy = before.state == aida::burp::camoufox::bridge_state_t::ready &&
+				before.child_alive &&
+				before.browser_open &&
+				before.page_verified &&
+				before.privacy_verified &&
+				!before.cleanup_pending &&
+				before.last_error.empty();
+			log_msg(hf, "camoufox-cleanup", "preflight reason=%s active=%d healthy=%d state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d last_error_len=%zu",
 				reason ? reason : "unspecified",
 				active ? 1 : 0,
+				healthy ? 1 : 0,
 				camoufox_bridge_state_name(before.state),
 				before.child_pid,
 				before.child_alive ? 1 : 0,
 				before.browser_open ? 1 : 0,
 				before.page_verified ? 1 : 0,
+				before.privacy_verified ? 1 : 0,
 				before.cleanup_pending ? 1 : 0,
 				before.last_error.size());
+			if (healthy) {
+				log_msg(hf, "camoufox-cleanup", "preflight_reuse reason=%s state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d generation=%llu page_count=%u browser_instances=%u child_processes=%u browser_processes=%u last_error_len=%zu",
+					reason ? reason : "unspecified",
+					camoufox_bridge_state_name(before.state),
+					before.child_pid,
+					before.child_alive ? 1 : 0,
+					before.browser_open ? 1 : 0,
+					before.page_verified ? 1 : 0,
+					before.privacy_verified ? 1 : 0,
+					before.cleanup_pending ? 1 : 0,
+					static_cast<unsigned long long>(before.generation),
+					before.page_count,
+					before.browser_instance_count,
+					before.child_process_count,
+					before.browser_process_count,
+					before.last_error.size());
+				return;
+			}
 			if (!active)
 				return;
 			const uint64_t t0 = now_ms_tick();
 			const bool cleaned = aida::burp::camoufox::force_cleanup(reason ? reason : "testlab.start_tests_preflight");
 			const bool idle = aida::burp::camoufox::wait_until_idle(15000, reason ? reason : "testlab.start_tests_preflight");
 			auto after = aida::burp::camoufox::get_status();
-			log_msg(hf, "camoufox-cleanup", "preflight_done reason=%s cleaned=%d idle=%d state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d elapsed_ms=%llu last_error_len=%zu",
+			log_msg(hf, "camoufox-cleanup", "preflight_done reason=%s cleaned=%d idle=%d state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d elapsed_ms=%llu last_error_len=%zu",
 				reason ? reason : "unspecified",
 				cleaned ? 1 : 0,
 				idle ? 1 : 0,
@@ -565,6 +594,7 @@ namespace test_all_features {
 				after.child_alive ? 1 : 0,
 				after.browser_open ? 1 : 0,
 				after.page_verified ? 1 : 0,
+				after.privacy_verified ? 1 : 0,
 				after.cleanup_pending ? 1 : 0,
 				static_cast<unsigned long long>(now_ms_tick() - t0),
 				after.last_error.size());
@@ -958,7 +988,8 @@ namespace test_all_features {
 						parsed_nonzero(r, "functional_context_rip") &&
 						parsed_nonzero(r, "functional_context_rsp") &&
 						parsed_nonzero(r, "functional_context_rflags")) {
-						return false;
+						reason = "TCTX raw_ioctl_degraded=1_functional_context_fallback_success_mixed_evidence";
+						return true;
 					}
 					reason = "TCTX raw_ioctl_degraded=1_without_functional_context_pass";
 					return true;
@@ -1053,9 +1084,9 @@ namespace test_all_features {
 				}
 			}
 			if (std::strcmp(cat, "sentinel") == 0 && name_starts_with(feature, "Sentinel Evidence Ring")) {
-				const char* labels[] = { "returned_count", "fresh_observed_count" };
+				const char* labels[] = { "foreground_drain_proven", "background_observer_proven" };
 				if (!any_parsed_nonzero(r, labels, sizeof(labels) / sizeof(labels[0]))) {
-					reason = "sentinel_evidence_returned_count_or_fresh_observed_count=0_or_missing";
+					reason = "sentinel_evidence_no_foreground_or_background_proof";
 					return true;
 				}
 			}

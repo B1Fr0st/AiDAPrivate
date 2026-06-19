@@ -134,6 +134,59 @@ static bool ensure_network_script_engine_initialized(const char* action, json& o
     return false;
 }
 
+static tool_result_t network_param_error(const std::string& message, const std::string& parameter, const std::string& code = "invalid_param") {
+    json d;
+    d["success"] = false;
+    d["parameter"] = parameter;
+    d["code"] = code;
+    return tool_result_t::error(message, code, d);
+}
+
+static bool parse_json_u32_param(const json& params, const char* name, uint32_t& out, std::string& error) {
+    if (!params.contains(name))
+        return true;
+    const auto& v = params[name];
+    if (v.is_number_unsigned()) {
+        const uint64_t raw = v.get<uint64_t>();
+        if (raw > UINT32_MAX) {
+            error = std::string("'") + name + "' exceeds uint32 range";
+            return false;
+        }
+        out = static_cast<uint32_t>(raw);
+        return true;
+    }
+    if (v.is_number_integer()) {
+        const int64_t raw = v.get<int64_t>();
+        if (raw < 0 || raw > UINT32_MAX) {
+            error = std::string("'") + name + "' exceeds uint32 range";
+            return false;
+        }
+        out = static_cast<uint32_t>(raw);
+        return true;
+    }
+    if (v.is_string()) {
+        std::string s = v.get<std::string>();
+        auto not_space = [](unsigned char c) { return !std::isspace(c); };
+        s.erase(s.begin(), std::find_if(s.begin(), s.end(), not_space));
+        s.erase(std::find_if(s.rbegin(), s.rend(), not_space).base(), s.end());
+        if (s.empty()) {
+            error = std::string("'") + name + "' is empty";
+            return false;
+        }
+        char* end = nullptr;
+        errno = 0;
+        const unsigned long long raw = std::strtoull(s.c_str(), &end, 10);
+        if (errno != 0 || end == s.c_str() || *end != '\0' || raw > UINT32_MAX) {
+            error = std::string("'") + name + "' must be an unsigned integer";
+            return false;
+        }
+        out = static_cast<uint32_t>(raw);
+        return true;
+    }
+    error = std::string("'") + name + "' must be a number or numeric string";
+    return false;
+}
+
 static std::uint32_t pre_encrypt_armed_thread_count_locked() {
     std::uint32_t count = 0;
     for (const auto& t : pre_encrypt_hook::g_state.targets)
@@ -2510,7 +2563,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                "Input as text or hex. Pipeline steps applied in order."),
         {{OBFSTR("input"), OBFSTR("string"), OBFSTR("Input data (text)"), false},
          {OBFSTR("input_hex"), OBFSTR("string"), OBFSTR("Input data (hex encoded) - use instead of 'input' for binary"), false},
-         {OBFSTR("pipeline"), OBFSTR("array"), OBFSTR("Array of transform step objects: [{\"name\":\"base64_decode\"}, {\"name\":\"xor\",\"params\":{\"key\":\"41\"}}]"), true}},
+         {OBFSTR("pipeline"), OBFSTR("array"), OBFSTR("Array of transform step objects: [{\"name\":\"base64_decode\"}, {\"transform\":\"xor\",\"params\":{\"key\":\"41\"}}]; transform is accepted as an alias for name"), true}},
         [](const json& args) -> tool_result_t {
             diag::log_tagged("net_tools", "network_decode_data entry");
             std::vector<uint8_t> data;
@@ -2526,7 +2579,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                     int hi = nib(hex[i]);
                     int lo = nib(hex[i + 1]);
                     if (hi < 0 || lo < 0) {
-                        return tool_result_t::error("Invalid hex character in 'input_hex'");
+                        return network_param_error("Invalid hex character in 'input_hex'", "input_hex");
                     }
                     data.push_back(static_cast<uint8_t>((hi << 4) | lo));
                 }
@@ -2534,16 +2587,23 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 std::string input = args["input"].get<std::string>();
                 data.assign(input.begin(), input.end());
             } else {
-                return tool_result_t::error("Either 'input' or 'input_hex' required");
+                return network_param_error("Either 'input' or 'input_hex' required", "input", "missing_required");
             }
 
             if (!args.contains("pipeline") || !args["pipeline"].is_array())
-                return tool_result_t::error("'pipeline' array required");
+                return network_param_error("'pipeline' array required", "pipeline", "missing_required");
 
             auto& reg = decoder_pipeline::registry::instance();
             for (const auto& step : args["pipeline"]) {
+                if (!step.is_object())
+                    return network_param_error("Each pipeline step must be an object", "pipeline");
                 std::string name = step.value("name", "");
-                if (name.empty()) return tool_result_t::error("Each pipeline step needs 'name'");
+                if (name.empty() && step.contains("transform") && step["transform"].is_string()) {
+                    name = step["transform"].get<std::string>();
+                    diag::log_tagged_fmt("net_tools", "network_decode_data normalized transform_alias=%s", name.c_str());
+                }
+                if (name.empty())
+                    return network_param_error("Each pipeline step needs 'name'", "pipeline.name", "missing_required");
 
                 std::map<std::string, std::string> params;
                 if (step.contains("params") && step["params"].is_object()) {
@@ -2555,7 +2615,13 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 auto result = decoder_pipeline::apply_single(name, data, params);
                 if (!result.success) {
                     diag::log_tagged_fmt("net_tools", "network_decode_data step_failed step=%s error=%s", name.c_str(), result.error.c_str());
-                    return tool_result_t::error("Transform '" + name + "' failed: " + result.error);
+                    json d;
+                    d["success"] = false;
+                    d["parameter"] = "pipeline";
+                    d["transform"] = name;
+                    d["error"] = result.error;
+                    d["code"] = "transform_failed";
+                    return tool_result_t::error("Transform '" + name + "' failed: " + result.error, "transform_failed", d);
                 }
                 data = std::move(result.data);
             }
@@ -2622,6 +2688,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                "Provide either a file path or inline source code."),
         {{OBFSTR("path"), OBFSTR("string"), OBFSTR("Path to .lua script file"), false},
          {OBFSTR("source"), OBFSTR("string"), OBFSTR("Inline Lua source code"), false},
+         {OBFSTR("source_code"), OBFSTR("string"), OBFSTR("Alias for inline Lua source code"), false},
          {OBFSTR("name"), OBFSTR("string"), OBFSTR("Script name (default: derived from path)"), false}},
         [](const json& args) -> tool_result_t {
             std::string name = args.value("name", "");
@@ -2629,11 +2696,16 @@ void register_network_tools(mcp_standalone::server_t& srv) {
             json init_diag;
             std::string init_error;
             if (!ensure_network_script_engine_initialized("load", init_diag, init_error))
-                return tool_result_t::error(init_error, init_diag);
+                return tool_result_t::error(init_error, "script_engine_unavailable", init_diag);
             bool ok = false;
             if (args.contains("source") && args["source"].is_string()) {
                 std::string src = args["source"].get<std::string>();
                 if (name.empty()) name = "_inline_";
+                ok = script_engine::load_script_source(name, src);
+            } else if (args.contains("source_code") && args["source_code"].is_string()) {
+                std::string src = args["source_code"].get<std::string>();
+                if (name.empty()) name = "_inline_";
+                diag::log_tagged_fmt("net_tools", "network_script_load normalized source_code_alias len=%zu", src.size());
                 ok = script_engine::load_script_source(name, src);
             } else if (args.contains("path") && args["path"].is_string()) {
                 std::string path = args["path"].get<std::string>();
@@ -2643,7 +2715,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 }
                 ok = script_engine::load_script(path);
             } else {
-                return tool_result_t::error("Either 'path' or 'source' required");
+                return network_param_error("Either 'path', 'source', or 'source_code' required", "source", "missing_required");
             }
             diag::log_tagged_fmt("net_tools", "network_script_load result=%d name=%s", (int)ok, name.c_str());
             auto scripts = script_engine::get_scripts();
@@ -2656,7 +2728,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
             r["hook_count"] = script_engine::registered_hook_count();
             r["initialization"] = std::move(init_diag);
             if (!ok)
-                return tool_result_t::error("Failed to load script", r);
+                return tool_result_t::error("Failed to load script", "script_load_failed", r);
             return tool_result_t::ok("Script '" + name + "' loaded", r);
         }, false});
 
@@ -2817,7 +2889,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                "'get_stream' fetches a single stream by src_ip/src_port/dst_ip/dst_port, "
                "'clear' evicts all cached streams."),
         {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("start|stop|get_all|get_stream|clear"), true},
-         {OBFSTR("pid"),       OBFSTR("number"), OBFSTR("Process ID filter for 'start' (0 = all)"), false},
+         {OBFSTR("pid"),       OBFSTR("number"), OBFSTR("Process ID filter for 'start' (0 = all); numeric strings are accepted"), false},
          {OBFSTR("src_ip"),    OBFSTR("string"), OBFSTR("Source IPv4 (dotted-quad) for get_stream"), false},
          {OBFSTR("src_port"),  OBFSTR("number"), OBFSTR("Source port for get_stream"), false},
          {OBFSTR("dst_ip"),    OBFSTR("string"), OBFSTR("Destination IPv4 (dotted-quad) for get_stream"), false},
@@ -2827,7 +2899,10 @@ void register_network_tools(mcp_standalone::server_t& srv) {
             diag::log_tagged_fmt("net_tools", "network_stream_track op=%s", op.c_str());
 
             if (op == "start") {
-                uint32_t pid = params.value("pid", 0u);
+                uint32_t pid = 0;
+                std::string pid_error;
+                if (!parse_json_u32_param(params, "pid", pid, pid_error))
+                    return network_param_error(pid_error, "pid");
                 diag::log_tagged_fmt("net_tools", "network_stream_track start pid=%u", pid);
                 network_view::g_stream_tracker.start(pid);
                 json r;

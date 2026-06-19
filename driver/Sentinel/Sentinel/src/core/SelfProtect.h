@@ -13,6 +13,37 @@ namespace self_protect {
     inline volatile ULONG  g_nt_build_number = 0;
     inline volatile LONG   g_version_resolved = 0;
 
+    __forceinline void resolver_backoff_100ns(LONG64 relative_interval) {
+        if (_KeDelayExecutionThread && KeGetCurrentIrql() == PASSIVE_LEVEL) {
+            LARGE_INTEGER wait;
+            wait.QuadPart = relative_interval;
+            _KeDelayExecutionThread(KernelMode, FALSE, &wait);
+        } else {
+            YieldProcessor();
+        }
+    }
+
+    __forceinline BOOLEAN wait_for_resolver_state(volatile LONG* state, LONG ready_value, const char* label) {
+        for (ULONG wait = 0; wait < 400; ++wait) {
+            LONG current = _InterlockedCompareExchange(state, ready_value, ready_value);
+            if (current == ready_value)
+                return TRUE;
+            if (wait < 4 || wait == 8 || wait == 16 || wait == 32 || (wait % 64) == 0) {
+                SN_LOG("self_protect::state_wait label=%s wait=%lu current=%ld ready=%ld",
+                    label ? label : "unknown",
+                    wait,
+                    current,
+                    ready_value);
+            }
+            resolver_backoff_100ns(-10000LL);
+        }
+        SN_LOG("self_protect::state_wait_timeout label=%s current=%ld ready=%ld",
+            label ? label : "unknown",
+            _InterlockedCompareExchange(state, ready_value, ready_value),
+            ready_value);
+        return FALSE;
+    }
+
 
     __forceinline ULONG get_nt_build_number() {
         LONG state = _InterlockedCompareExchange(&g_version_resolved, 0, 0);
@@ -22,8 +53,7 @@ namespace self_protect {
         LONG prev = _InterlockedCompareExchange(&g_version_resolved, 1, 0);
         if (prev == 2) return g_nt_build_number;
         if (prev == 1) {
-            while (_InterlockedCompareExchange(&g_version_resolved, 2, 2) != 2)
-                YieldProcessor();
+            wait_for_resolver_state(&g_version_resolved, 2, "nt_build");
             return g_nt_build_number;
         }
 
@@ -683,8 +713,7 @@ namespace self_protect {
         LONG prev = _InterlockedCompareExchange(&g_big_pool_resolved, 1, 0);
         if (prev == 2) return (g_pool_big_page_table != nullptr);
         if (prev == 1) {
-            while (_InterlockedCompareExchange(&g_big_pool_resolved, 2, 2) != 2)
-                YieldProcessor();
+            wait_for_resolver_state(&g_big_pool_resolved, 2, "big_pool");
             return (g_pool_big_page_table != nullptr);
         }
 

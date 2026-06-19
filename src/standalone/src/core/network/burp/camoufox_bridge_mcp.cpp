@@ -48,9 +48,44 @@ bool bridge_process_tree_ready(const camoufox::bridge_status_t& s)
     return s.browser_process_count >= kMinReadyBrowserProcessCount;
 }
 
+json visible_window_proof_from_status(const camoufox::bridge_status_t& s)
+{
+    if (!s.last_launch_diagnostics.is_object())
+        return json::object();
+    const auto it = s.last_launch_diagnostics.find("visible_window_proof");
+    if (it == s.last_launch_diagnostics.end() || !it->is_object())
+        return json::object();
+    return *it;
+}
+
+int visible_window_count_from_proof(const json& proof)
+{
+    if (!proof.is_object())
+        return -1;
+    const char* keys[] = {"visible_window_count", "visible_windows"};
+    for (const char* key : keys)
+    {
+        const auto it = proof.find(key);
+        if (it == proof.end())
+            continue;
+        if (it->is_number_integer() || it->is_number_unsigned())
+            return it->get<int>();
+        if (it->is_boolean())
+            return it->get<bool>() ? 1 : 0;
+    }
+    return -1;
+}
+
+bool bridge_visible_window_ready(const camoufox::bridge_status_t& s)
+{
+    return visible_window_count_from_proof(visible_window_proof_from_status(s)) > 0;
+}
+
 json status_to_json(const camoufox::bridge_status_t& s)
 {
     json j;
+    const json visible_window_proof = visible_window_proof_from_status(s);
+    const int visible_window_count = visible_window_count_from_proof(visible_window_proof);
     j["session_id"]       = s.session_id;
     j["active_session_id"] = s.active_session_id;
     j["state"]            = state_label(s.state);
@@ -94,6 +129,9 @@ json status_to_json(const camoufox::bridge_status_t& s)
     j["privacy_verified"] = s.privacy_verified;
     j["privacy_diagnostics"] = s.privacy_diagnostics.is_object() ? s.privacy_diagnostics : json::object();
     j["last_launch_diagnostics"] = s.last_launch_diagnostics.is_object() ? s.last_launch_diagnostics : json::object();
+    j["visible_window_proof"] = visible_window_proof;
+    j["visible_window_count"] = visible_window_count;
+    j["visible_window_verified"] = visible_window_count > 0;
     j["page_verified"]    = s.page_verified;
     j["child_alive"]      = s.child_alive;
     j["cleanup_pending"]  = s.cleanup_pending;
@@ -102,13 +140,13 @@ json status_to_json(const camoufox::bridge_status_t& s)
     j["last_nav_ms"]      = s.last_nav_ms;
     j["last_cleanup_ms"]  = s.last_cleanup_ms;
     j["last_verified_ms"] = s.last_verified_ms;
-    j["ready"]            = s.state == camoufox::bridge_state_t::ready && s.browser_open && s.page_verified && s.privacy_verified && s.child_alive && bridge_process_tree_ready(s) && !s.cleanup_pending;
+    j["ready"]            = s.state == camoufox::bridge_state_t::ready && s.browser_open && s.page_verified && s.privacy_verified && s.child_alive && bridge_process_tree_ready(s) && bridge_visible_window_ready(s) && !s.cleanup_pending;
     return j;
 }
 
 bool bridge_ready(const camoufox::bridge_status_t& s)
 {
-    return s.state == camoufox::bridge_state_t::ready && s.browser_open && s.page_verified && s.privacy_verified && s.child_alive && bridge_process_tree_ready(s) && !s.cleanup_pending;
+    return s.state == camoufox::bridge_state_t::ready && s.browser_open && s.page_verified && s.privacy_verified && s.child_alive && bridge_process_tree_ready(s) && bridge_visible_window_ready(s) && !s.cleanup_pending;
 }
 
 void attach_privacy_status(tool_result_t& out, const camoufox::bridge_status_t& s)
@@ -126,6 +164,9 @@ void attach_privacy_status(tool_result_t& out, const camoufox::bridge_status_t& 
     privacy["browser_instance_count"] = s.browser_instance_count;
     privacy["child_process_count"] = s.child_process_count;
     privacy["browser_process_count"] = s.browser_process_count;
+    privacy["visible_window_proof"] = visible_window_proof_from_status(s);
+    privacy["visible_window_count"] = visible_window_count_from_proof(privacy["visible_window_proof"]);
+    privacy["visible_window_verified"] = privacy["visible_window_count"].get<int>() > 0;
     privacy["diagnostics"] = s.privacy_diagnostics.is_object() ? s.privacy_diagnostics : json::object();
     out.data["aida_privacy"] = std::move(privacy);
 }
@@ -1234,6 +1275,7 @@ tool_result_t tool_browser_navigation(const json& params)
     static const camoufox_action_entry_t actions[] =
     {
         {"navigate", "navigate", 60000},
+        {"diagnose", "diagnose_navigation", 60000},
         {"reload", "reload", 45000},
         {"wait", "wait_for", 45000},
     };
@@ -1353,12 +1395,14 @@ std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
              {"launch_timeout_ms", "number", "Requested launch timeout in milliseconds", false},
              {"window_width", "number", "Initial browser window width", false},
              {"window_height", "number", "Initial browser window height", false}}, false, 60000},
-        {"browser_navigation", "Consolidated Camoufox navigation operations. Set action to navigate, reload, or wait.",
-            {{"action", "string", "navigate|reload|wait", true},
+        {"browser_navigation", "Consolidated Camoufox navigation operations. Set action to navigate, diagnose, reload, or wait.",
+            {{"action", "string", "navigate|diagnose|reload|wait", true},
              {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted", false},
              {"session_id", "string", "Browser session id", false},
              {"page_id", "string", "Stable AiDA page id", false},
              {"url", "string", "Target URL", false},
+             {"diagnostic_label", "string", "Diagnostic navigation label such as bloxflip", false},
+             {"include_screenshot_metadata", "boolean", "Collect bounded screenshot metadata for diagnostic navigation", false},
              {"wait_until", "string", "load, domcontentloaded, or networkidle", false},
              {"selector", "string", "CSS selector to wait for", false},
              {"url_pattern", "string", "URL pattern to wait for", false},

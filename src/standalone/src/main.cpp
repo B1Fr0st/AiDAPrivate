@@ -2106,7 +2106,7 @@ namespace aida_tracer {
             GetCurrentProcessId(),
             GetCurrentThreadId(),
             static_cast<unsigned long long>(GetTickCount64()));
-        bool posted = work_queue::post_service([]() {
+        bool posted = work_queue::post_service_labeled("render_tracer", []() {
             startup_log_critical_fmt("tracer_thread_entry pid=%lu tid=%lu tick=%llu",
                 GetCurrentProcessId(),
                 GetCurrentThreadId(),
@@ -2148,7 +2148,7 @@ namespace aida_focus_monitor {
             static_cast<unsigned long long>(start_tick));
         g_stop.store(false, std::memory_order_release);
         g_focused.store(foreground_belongs_to_process(hwnd), std::memory_order_release);
-        bool posted = work_queue::post_service([hwnd]() {
+        bool posted = work_queue::post_service_labeled("focus_monitor", [hwnd]() {
             startup_log_critical_fmt("focus_monitor_worker_enter hwnd=0x%llX pid=%lu tid=%lu tick=%llu",
                 static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
                 GetCurrentProcessId(),
@@ -2267,6 +2267,31 @@ static void format_tracer_crash_snapshot(char* out, size_t cap)
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(GetActiveWindow())),
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(GetFocus())),
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(GetCapture())));
+}
+
+namespace aida_shutdown_diag {
+    inline std::atomic<const char*> g_phase{"running"};
+    inline std::atomic<uint64_t> g_phase_tick_ms{0};
+
+    inline void mark(const char* phase)
+    {
+        const char* value = phase ? phase : "<null>";
+        g_phase.store(value, std::memory_order_release);
+        g_phase_tick_ms.store(static_cast<uint64_t>(GetTickCount64()), std::memory_order_release);
+        diag::log_tagged_critical_fmt("shutdown",
+            "phase=%s pid=%lu tid=%lu tick=%llu",
+            value,
+            GetCurrentProcessId(),
+            GetCurrentThreadId(),
+            static_cast<unsigned long long>(GetTickCount64()));
+    }
+
+    inline uint64_t phase_age_ms()
+    {
+        const uint64_t tick = g_phase_tick_ms.load(std::memory_order_acquire);
+        const uint64_t now = static_cast<uint64_t>(GetTickCount64());
+        return tick != 0 && now >= tick ? now - tick : 0;
+    }
 }
 
 static void run_phase_1_2_self_tests()
@@ -2805,6 +2830,170 @@ __declspec(noinline) static bool safe_read_qword(const void* p, uintptr_t& out)
     }
 }
 
+static const char* crash_basename_ptr(const char* path)
+{
+    if (!path)
+        return "<none>";
+    const char* slash = std::strrchr(path, '\\');
+    const char* fwd = std::strrchr(path, '/');
+    const char* base = slash && fwd ? (slash > fwd ? slash : fwd) : (slash ? slash : fwd);
+    return base ? base + 1 : path;
+}
+
+static void format_current_thread_description(char* out, size_t cap)
+{
+    if (!out || cap == 0)
+        return;
+    out[0] = 0;
+    using get_thread_description_t = HRESULT(WINAPI*)(HANDLE, PWSTR*);
+    HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
+    auto fn = kernel ? reinterpret_cast<get_thread_description_t>(GetProcAddress(kernel, "GetThreadDescription")) : nullptr;
+    if (!fn) {
+        HMODULE kernelbase = GetModuleHandleW(L"kernelbase.dll");
+        fn = kernelbase ? reinterpret_cast<get_thread_description_t>(GetProcAddress(kernelbase, "GetThreadDescription")) : nullptr;
+    }
+    if (!fn) {
+        _snprintf_s(out, cap, _TRUNCATE, "<unavailable>");
+        return;
+    }
+    PWSTR desc = nullptr;
+    HRESULT hr = fn(GetCurrentThread(), &desc);
+    if (SUCCEEDED(hr) && desc) {
+        int wrote = WideCharToMultiByte(CP_UTF8, 0, desc, -1, out, static_cast<int>(cap), nullptr, nullptr);
+        if (wrote <= 0)
+            _snprintf_s(out, cap, _TRUNCATE, "<convert_failed gle=%lu>", GetLastError());
+        LocalFree(desc);
+        if (out[0] == 0)
+            _snprintf_s(out, cap, _TRUNCATE, "<empty>");
+        return;
+    }
+    _snprintf_s(out, cap, _TRUNCATE, "<hr=0x%08lX>", static_cast<unsigned long>(hr));
+}
+
+static void append_stack_module_token(char* out, size_t cap, int idx, uintptr_t value)
+{
+    if (!out || cap == 0)
+        return;
+    size_t len = 0;
+    while (len < cap && out[len] != 0)
+        ++len;
+    if (len >= cap - 1)
+        return;
+    HMODULE mod = nullptr;
+    char path[MAX_PATH] = {};
+    const bool have_mod = value != 0 &&
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCSTR>(value), &mod) &&
+        mod;
+    if (have_mod)
+        GetModuleFileNameA(mod, path, static_cast<DWORD>(sizeof(path)));
+    const uintptr_t base = reinterpret_cast<uintptr_t>(mod);
+    const uintptr_t off = have_mod && value >= base ? value - base : 0;
+    _snprintf_s(out + len, cap - len, _TRUNCATE,
+        "%s[%02d]=0x%016llX:%s+0x%llX",
+        len == 0 ? "" : " ",
+        idx,
+        static_cast<unsigned long long>(value),
+        have_mod ? crash_basename_ptr(path) : "no_module",
+        static_cast<unsigned long long>(off));
+}
+
+static void format_context_stack_modules(CONTEXT* ctx, char* out, size_t cap)
+{
+    if (!out || cap == 0)
+        return;
+    out[0] = 0;
+    if (!ctx) {
+        _snprintf_s(out, cap, _TRUNCATE, "<no_context>");
+        return;
+    }
+#if defined(_M_X64)
+    const uintptr_t* rsp_ptr = reinterpret_cast<const uintptr_t*>(ctx->Rsp);
+#else
+    const uintptr_t* rsp_ptr = reinterpret_cast<const uintptr_t*>(ctx->Esp);
+#endif
+    for (int i = 0; i < 32; ++i) {
+        uintptr_t value = 0;
+        if (!safe_read_qword(rsp_ptr + i, value))
+            break;
+        if (value == 0)
+            continue;
+        HMODULE mod = nullptr;
+        if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                reinterpret_cast<LPCSTR>(value), &mod) || !mod)
+            continue;
+        append_stack_module_token(out, cap, i, value);
+    }
+    if (out[0] == 0)
+        _snprintf_s(out, cap, _TRUNCATE, "<no_module_stack_values>");
+}
+
+static void format_work_queue_crash_snapshot(char* out, size_t cap)
+{
+    if (!out || cap == 0)
+        return;
+    out[0] = 0;
+    const auto work = work_queue::stats();
+    const auto service = work_queue::service_stats();
+    _snprintf_s(out, cap, _TRUNCATE,
+        "work{alive=%d shutdown=%d workers=%zu pending=%zu active=%u active_labels=%u oldest_active_ms=%llu posted=%llu started=%llu finished=%llu rejected=%llu labels=%.900s} service{alive=%d shutdown=%d workers=%zu pending=%zu active=%u active_labels=%u oldest_active_ms=%llu posted=%llu started=%llu finished=%llu rejected=%llu labels=%.900s}",
+        work.alive ? 1 : 0,
+        work.shutting_down ? 1 : 0,
+        work.workers,
+        work.pending,
+        work.active,
+        work.active_label_count,
+        static_cast<unsigned long long>(work.oldest_active_ms),
+        static_cast<unsigned long long>(work.posted),
+        static_cast<unsigned long long>(work.started),
+        static_cast<unsigned long long>(work.finished),
+        static_cast<unsigned long long>(work.rejected),
+        work.active_labels.empty() ? "<none>" : work.active_labels.c_str(),
+        service.alive ? 1 : 0,
+        service.shutting_down ? 1 : 0,
+        service.workers,
+        service.pending,
+        service.active,
+        service.active_label_count,
+        static_cast<unsigned long long>(service.oldest_active_ms),
+        static_cast<unsigned long long>(service.posted),
+        static_cast<unsigned long long>(service.started),
+        static_cast<unsigned long long>(service.finished),
+        static_cast<unsigned long long>(service.rejected),
+        service.active_labels.empty() ? "<none>" : service.active_labels.c_str());
+}
+
+static void format_shutdown_crash_snapshot(char* out, size_t cap)
+{
+    if (!out || cap == 0)
+        return;
+    out[0] = 0;
+    char thread_desc[512] = {};
+    char queue_snapshot[2400] = {};
+    format_current_thread_description(thread_desc, sizeof(thread_desc));
+    format_work_queue_crash_snapshot(queue_snapshot, sizeof(queue_snapshot));
+    const char* shutdown_phase = aida_shutdown_diag::g_phase.load(std::memory_order_acquire);
+    const char* render_phase = aida_tracer::g_render_phase_name.load(std::memory_order_acquire);
+    const char* dispatch_stage = aida_tracer::g_dispatch_stage.load(std::memory_order_acquire);
+    const char* wndproc_stage = aida_tracer::g_wndproc_stage.load(std::memory_order_acquire);
+    std::string latch_source = anti_tamper::runtime_integrity_latch_source_snapshot();
+    _snprintf_s(out, cap, _TRUNCATE,
+        "shutdown_phase=%s shutdown_phase_age_ms=%llu tid=%lu thread_desc=%s render_phase=%s dispatch_stage=%s dispatch_msg=%s(0x%04X) wndproc_stage=%s wndproc_msg=%s(0x%04X) queues={%s} latch_source={%.700s}",
+        shutdown_phase ? shutdown_phase : "<null>",
+        static_cast<unsigned long long>(aida_shutdown_diag::phase_age_ms()),
+        GetCurrentThreadId(),
+        thread_desc[0] ? thread_desc : "<none>",
+        render_phase ? render_phase : "<null>",
+        dispatch_stage ? dispatch_stage : "<null>",
+        aida_tracer::message_name(aida_tracer::g_dispatch_msg.load(std::memory_order_acquire)),
+        aida_tracer::g_dispatch_msg.load(std::memory_order_acquire),
+        wndproc_stage ? wndproc_stage : "<null>",
+        aida_tracer::message_name(aida_tracer::g_wndproc_msg.load(std::memory_order_acquire)),
+        aida_tracer::g_wndproc_msg.load(std::memory_order_acquire),
+        queue_snapshot,
+        latch_source.empty() ? "<none>" : latch_source.c_str());
+}
+
 __declspec(noinline) static DWORD seh_init_standalone_chat()
 {
     const uint64_t started = static_cast<uint64_t>(GetTickCount64());
@@ -2968,9 +3157,9 @@ static void post_script_engine_startup_initialize()
     bool posted_service = false;
     bool posted_work = false;
     try {
-        posted_service = work_queue::post_service(init_task);
+        posted_service = work_queue::post_service_labeled("script_engine_startup_init", init_task);
         if (!posted_service)
-            posted_work = work_queue::post(init_task);
+            posted_work = work_queue::post_labeled("script_engine_startup_init_fallback", init_task);
         startup_log_critical_fmt("script_engine_startup_async_posted pid=%lu tid=%lu service=%d work=%d elapsed_ms=%llu",
             GetCurrentProcessId(),
             GetCurrentThreadId(),
@@ -3268,9 +3457,13 @@ static void aida_write_first_chance_crash_log(EXCEPTION_POINTERS* ep)
 
     char tracer_snapshot[2600] = {};
     format_tracer_crash_snapshot(tracer_snapshot, sizeof(tracer_snapshot));
-    char buf[4096];
+    char shutdown_snapshot[4200] = {};
+    char stack_modules[2200] = {};
+    format_shutdown_crash_snapshot(shutdown_snapshot, sizeof(shutdown_snapshot));
+    format_context_stack_modules(ctx, stack_modules, sizeof(stack_modules));
+    char buf[8192];
     snprintf(buf, sizeof(buf),
-        "FIRST_CHANCE_FATAL_EXCEPTION: code=0x%08X addr=0x%016llX addr_off_exe=0x%llX rip=0x%016llX rip_off_exe=0x%llX rsp=0x%016llX rbp=0x%016llX tid=%lu flags=0x%08X params=%lu p0=0x%016llX p1=0x%016llX last_error=%lu tracer={%s}",
+        "FIRST_CHANCE_FATAL_EXCEPTION: code=0x%08X addr=0x%016llX addr_off_exe=0x%llX rip=0x%016llX rip_off_exe=0x%llX rsp=0x%016llX rbp=0x%016llX tid=%lu flags=0x%08X params=%lu p0=0x%016llX p1=0x%016llX last_error=%lu stack_modules={%s} shutdown={%s} tracer={%s}",
         ep->ExceptionRecord->ExceptionCode,
         static_cast<unsigned long long>(crash_addr),
         static_cast<unsigned long long>(addr_offset),
@@ -3284,6 +3477,8 @@ static void aida_write_first_chance_crash_log(EXCEPTION_POINTERS* ep)
         p0,
         p1,
         GetLastError(),
+        stack_modules,
+        shutdown_snapshot,
         tracer_snapshot);
     diag::write_crash_log(buf, false);
     diag::log_tagged_critical("veh_crash", buf);
@@ -3643,7 +3838,7 @@ int main(int, char**)
 
         standalone_anti_dump::handle_strip::clear_critical_flags();
 
-        char buf[8192];
+        char buf[16384];
         HMODULE crash_mod = nullptr;
         char crash_mod_name[MAX_PATH] = "<unknown>";
         GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -3658,6 +3853,10 @@ int main(int, char**)
         test_all_features::format_debug_snapshot(test_all_snapshot, sizeof(test_all_snapshot));
         char tracer_snapshot[2600] = {};
         format_tracer_crash_snapshot(tracer_snapshot, sizeof(tracer_snapshot));
+        char shutdown_snapshot[4200] = {};
+        char stack_module_buf[2200] = {};
+        format_shutdown_crash_snapshot(shutdown_snapshot, sizeof(shutdown_snapshot));
+        format_context_stack_modules(ep->ContextRecord, stack_module_buf, sizeof(stack_module_buf));
 
         char stack_buf[512] = {};
         {
@@ -3685,6 +3884,8 @@ int main(int, char**)
             "Rip=%016llX\n"
             "EFlags=%08lX Dr6=%016llX Dr7=%016llX\n"
             "Stack: %s\n"
+            "StackModules=%s\n"
+            "ShutdownSnapshot=%s\n"
             "TestAllSnapshot=%s\n"
             "TracerSnapshot=%s\n"
             "LastError=%lu\n",
@@ -3712,6 +3913,8 @@ int main(int, char**)
             static_cast<unsigned long long>(ep->ContextRecord->Dr6),
             static_cast<unsigned long long>(ep->ContextRecord->Dr7),
             stack_buf,
+            stack_module_buf,
+            shutdown_snapshot,
             test_all_snapshot,
             tracer_snapshot,
             GetLastError());
@@ -5118,7 +5321,7 @@ int main(int, char**)
         }
     }
 
-
+    aida_shutdown_diag::mark("shutdown_sequence_begin");
     diag::log_tagged_critical_fmt("main",
         "shutdown_sequence_begin frame=%llu done=%d hwnd=0x%llX tid=%lu",
         (unsigned long long)frame_number,
@@ -5126,53 +5329,103 @@ int main(int, char**)
         (unsigned long long)reinterpret_cast<UINT_PTR>(hwnd),
         GetCurrentThreadId());
     aida_tracer::mark_render_phase("shutdown_sequence_begin");
+    {
+        char queue_snapshot[2400] = {};
+        format_work_queue_crash_snapshot(queue_snapshot, sizeof(queue_snapshot));
+        diag::log_tagged_critical_fmt("main", "shutdown_queue_snapshot_pre %s", queue_snapshot);
+    }
+    aida_shutdown_diag::mark("shutdown_testlab_cancel");
     test_all_features::cancel_tests();
     diag::log_tagged_critical("main", "shutdown_testlab_cancel_done");
+    aida_shutdown_diag::mark("shutdown_camoufox_force_cleanup");
     try {
         aida::burp::camoufox::force_cleanup("main.shutdown_sequence");
         diag::log_tagged_critical("main", "shutdown_camoufox_force_cleanup_done");
     } catch (...) {
         diag::log_tagged_critical("main", "shutdown_camoufox_force_cleanup_exception");
     }
+    aida_shutdown_diag::mark("shutdown_focus_monitor");
     aida_focus_monitor::stop();
     diag::log_tagged_critical("main", "shutdown_focus_monitor_done");
+    aida_shutdown_diag::mark("shutdown_prelude_begin");
+    diag::log_tagged_critical("main", "shutdown_prelude_begin");
+    try {
+        aida_shutdown_diag::mark("shutdown_session_health");
+        bool session_health_stopped = session_health::shutdown_and_wait(2500);
+        diag::log_tagged_critical_fmt("main", "shutdown_session_health_done stopped=%d",
+            session_health_stopped ? 1 : 0);
+    } catch (...) {
+        diag::log_tagged_critical("main", "shutdown_session_health_exception");
+    }
+    try {
+        aida_shutdown_diag::mark("shutdown_license_workers");
+        standalone_license::stop_background_workers("main.shutdown_prelude", 2500);
+        diag::log_tagged_critical("main", "shutdown_license_workers_done");
+    } catch (...) {
+        diag::log_tagged_critical("main", "shutdown_license_workers_exception");
+    }
+    try {
+        aida_shutdown_diag::mark("shutdown_driver_bridge");
+        driver_bridge::shutdown("main.shutdown_prelude");
+        diag::log_tagged_critical("main", "shutdown_driver_bridge_done");
+    } catch (...) {
+        diag::log_tagged_critical("main", "shutdown_driver_bridge_exception");
+    }
+    aida_shutdown_diag::mark("shutdown_prelude_done");
+    diag::log_tagged_critical("main", "shutdown_prelude_done");
+    aida_shutdown_diag::mark("shutdown_anti_tamper");
     anti_tamper::shutdown();
     diag::log_tagged_critical("main", "shutdown_anti_tamper_done");
+    aida_shutdown_diag::mark("shutdown_terminal");
     globals::terminal_mgr.shutdown();
     diag::log_tagged_critical("main", "shutdown_terminal_done");
 
+    aida_shutdown_diag::mark("shutdown_network");
     network_view::shutdown();
     diag::log_tagged_critical("main", "shutdown_network_done");
+    aida_shutdown_diag::mark("shutdown_script_engine");
     script_engine::shutdown();
     diag::log_tagged_critical("main", "shutdown_script_engine_done");
+    aida_shutdown_diag::mark("shutdown_workflow_tools");
     workflow_tools::shutdown_services();
     diag::log_tagged_critical("main", "shutdown_workflow_tools_done");
+    aida_shutdown_diag::mark("shutdown_chat");
     shutdown_standalone_chat();
     diag::log_tagged_critical("main", "shutdown_chat_done");
+    aida_shutdown_diag::mark("shutdown_auth_http");
     aida::auth::http::cleanup();
     diag::log_tagged_critical("main", "shutdown_auth_http_done");
+    aida_shutdown_diag::mark("shutdown_blur");
     Blur::Shutdown();
     diag::log_tagged_critical("main", "shutdown_blur_done");
+    aida_shutdown_diag::mark("shutdown_imgui_dx11");
     ImGui_ImplDX11_Shutdown();
     diag::log_tagged_critical("main", "shutdown_imgui_dx11_done");
 
+    aida_shutdown_diag::mark("shutdown_imgui_win32");
     ImGui_ImplWin32_Shutdown();
     diag::log_tagged_critical("main", "shutdown_imgui_win32_done");
+    aida_shutdown_diag::mark("shutdown_imgui_context");
     ImGui::DestroyContext();
     diag::log_tagged_critical("main", "shutdown_imgui_context_done");
 
+    aida_shutdown_diag::mark("shutdown_d3d");
     CleanupDeviceD3D();
     diag::log_tagged_critical("main", "shutdown_d3d_done");
+    aida_shutdown_diag::mark("shutdown_hotkey_unregister");
     ::SetLastError(0);
     BOOL hotkey_unregistered = ::UnregisterHotKey(hwnd, kAidaFullTestHotkeyId);
     diag::log_tagged_critical_fmt("main", "shutdown_hotkey_unregister ok=%d gle=%lu",
         hotkey_unregistered ? 1 : 0,
         static_cast<unsigned long>(GetLastError()));
+    aida_shutdown_diag::mark("shutdown_destroy_window");
     ::DestroyWindow(hwnd);
     diag::log_tagged_critical("main", "shutdown_destroy_window_done");
+    aida_shutdown_diag::mark("shutdown_unregister_class");
     ::UnregisterClassW(wc.lpszClassName, wc.hInstance);
     diag::log_tagged_critical("main", "shutdown_unregister_done");
 
+    aida_shutdown_diag::mark("shutdown_exit_process");
     diag::log_tagged_critical("main", "shutdown_exit_process_pre");
     release_single_instance_gate();
     ExitProcess(0);

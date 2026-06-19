@@ -300,8 +300,10 @@ namespace driver_bridge
     bool initialize();
     bool load_kernel_driver();
     void invalidate_kernel_session(const char* reason);
+    void shutdown(const char* reason = nullptr);
     bool is_loaded();
     bool using_kernel_driver();
+    bool kernel_session_available(std::string* reason = nullptr);
     bool can_read_memory();
     bool attach(uint32_t pid);
     bool attach_by_name(const std::string& process_name);

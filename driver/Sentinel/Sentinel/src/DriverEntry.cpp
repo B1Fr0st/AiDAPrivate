@@ -47,6 +47,90 @@ static HANDLE         g_init_thread_handle = nullptr;
 static WCHAR          g_registry_path_buffer[512] = {};
 static UNICODE_STRING g_registry_path = {};
 
+static UINT64 init_handle_to_u64(HANDLE value)
+{
+    return static_cast<UINT64>(reinterpret_cast<ULONG_PTR>(value));
+}
+
+static ULONG init_elapsed_us(const LARGE_INTEGER& start, const LARGE_INTEGER& freq)
+{
+    LARGE_INTEGER now = KeQueryPerformanceCounter(nullptr);
+    if (freq.QuadPart <= 0 || now.QuadPart < start.QuadPart)
+        return 0;
+    return static_cast<ULONG>(((now.QuadPart - start.QuadPart) * 1000000ULL) / static_cast<ULONGLONG>(freq.QuadPart));
+}
+
+static HANDLE init_object_protected_pid()
+{
+    return reinterpret_cast<HANDLE>(
+        _InterlockedCompareExchange64(
+            reinterpret_cast<volatile LONG64*>(&object_guard::g_protected_pid),
+            0,
+            0));
+}
+
+static HANDLE init_notify_protected_pid()
+{
+    return reinterpret_cast<HANDLE>(
+        _InterlockedCompareExchange64(
+            reinterpret_cast<volatile LONG64*>(&process_notify::g_protected_pid),
+            0,
+            0));
+}
+
+static void init_log_session_state(const char* phase)
+{
+    HANDLE object_pid = init_object_protected_pid();
+    HANDLE notify_pid = init_notify_protected_pid();
+    LONG heartbeat_initialized = _InterlockedCompareExchange(&heartbeat::g_initialized, 0, 0);
+    LONG first_seen = _InterlockedCompareExchange(&heartbeat::g_first_heartbeat_seen, 0, 0);
+
+    SN_LOG("init_thread::session phase=%s active=%u object_protected_pid=%llu notify_protected_pid=%llu heartbeat_initialized=%ld first_seen=%ld target_base=%p target_size=0x%lx bridge=%p shutdown=%ld",
+        phase ? phase : "unknown",
+        (object_pid || notify_pid) ? 1u : 0u,
+        init_handle_to_u64(object_pid),
+        init_handle_to_u64(notify_pid),
+        heartbeat_initialized,
+        first_seen,
+        (PVOID)g_target_driver_base,
+        g_target_driver_size,
+        heartbeat::g_bridge,
+        _InterlockedCompareExchange(&g_shutdown_flag, 0, 0));
+}
+
+static BOOLEAN init_scan_backoff(const char* phase, UINT64 probes, ULONG module_count, USHORT section_index, ULONG offset)
+{
+    if (_InterlockedCompareExchange(&g_shutdown_flag, 0, 0)) {
+        SN_LOG("init_thread::backoff_cancel phase=%s probes=%llu modules=%lu section=%u offset=0x%lx shutdown=1",
+            phase ? phase : "unknown",
+            static_cast<unsigned long long>(probes),
+            module_count,
+            section_index,
+            offset);
+        return FALSE;
+    }
+
+    if (probes <= 16384 || (probes % 65536) == 0) {
+        SN_LOG("init_thread::backoff phase=%s probes=%llu modules=%lu section=%u offset=0x%lx object_protected_pid=%llu notify_protected_pid=%llu",
+            phase ? phase : "unknown",
+            static_cast<unsigned long long>(probes),
+            module_count,
+            section_index,
+            offset,
+            init_handle_to_u64(init_object_protected_pid()),
+            init_handle_to_u64(init_notify_protected_pid()));
+    }
+
+    if (_KeDelayExecutionThread && KeGetCurrentIrql() == PASSIVE_LEVEL) {
+        LARGE_INTEGER wait;
+        wait.QuadPart = -10000LL;
+        _KeDelayExecutionThread(KernelMode, FALSE, &wait);
+    } else {
+        YieldProcessor();
+    }
+
+    return TRUE;
+}
 
 static bool find_text_section(PVOID image_base, PVOID* out_base, ULONG* out_size) {
     if (!image_base || !_MmIsAddressValid(image_base))
@@ -167,6 +251,59 @@ static BOOLEAN build_target_device_name(WCHAR* buffer, SIZE_T buffer_count) {
     return TRUE;
 }
 
+static BOOLEAN extract_target_driver_image_candidate(PDRIVER_OBJECT driver_object, PDEVICE_OBJECT device_object, PVOID* out_base, ULONG* out_size) {
+    if (!driver_object || !device_object || !out_base || !out_size)
+        return FALSE;
+
+    __try {
+        if (!_MmIsAddressValid(driver_object) || !_MmIsAddressValid(device_object))
+            return FALSE;
+
+        if (device_object->DriverObject != driver_object)
+            return FALSE;
+
+        if (!driver_object->DriverSection || !_MmIsAddressValid(driver_object->DriverSection))
+            return FALSE;
+
+        PLDR_DATA_TABLE_ENTRY ldr = static_cast<PLDR_DATA_TABLE_ENTRY>(driver_object->DriverSection);
+        if (!_MmIsAddressValid(ldr) || !ldr->DllBase || ldr->SizeOfImage == 0)
+            return FALSE;
+
+        PVOID base = ldr->DllBase;
+        ULONG size = ldr->SizeOfImage;
+        if (reinterpret_cast<ULONG_PTR>(base) < 0xFFFF800000000000ULL ||
+            size > 50 * 1024 * 1024)
+            return FALSE;
+
+        if (!_MmIsAddressValid(base))
+            return FALSE;
+
+        PIMAGE_DOS_HEADER dos = static_cast<PIMAGE_DOS_HEADER>(base);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+            return FALSE;
+
+        PIMAGE_NT_HEADERS64 nt = reinterpret_cast<PIMAGE_NT_HEADERS64>(
+            static_cast<UCHAR*>(base) + dos->e_lfanew);
+        if (!_MmIsAddressValid(nt) || nt->Signature != IMAGE_NT_SIGNATURE)
+            return FALSE;
+
+        PDRIVER_DISPATCH create_handler = driver_object->MajorFunction[IRP_MJ_CREATE];
+        PDRIVER_DISPATCH ioctl_handler = driver_object->MajorFunction[IRP_MJ_DEVICE_CONTROL];
+        if (!create_handler || !ioctl_handler)
+            return FALSE;
+
+        if (reinterpret_cast<ULONG_PTR>(create_handler) < 0xFFFF800000000000ULL ||
+            reinterpret_cast<ULONG_PTR>(ioctl_handler) < 0xFFFF800000000000ULL)
+            return FALSE;
+
+        *out_base = base;
+        *out_size = size;
+        return TRUE;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return FALSE;
+    }
+}
+
 static BOOLEAN validate_target_driver_object(PDRIVER_OBJECT driver_object, PVOID target_base) {
     if (!driver_object || !target_base || !_MmIsAddressValid(driver_object))
         return FALSE;
@@ -232,6 +369,79 @@ static PDRIVER_OBJECT resolve_target_driver_object_from_device(PVOID target_base
     ObDereferenceObject(file_object);
 
     return valid ? driver_object : nullptr;
+}
+
+static BOOLEAN discover_target_driver_from_device() {
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        SN_LOG("init_thread: device_discovery_skipped irql=%lu", static_cast<unsigned long>(KeGetCurrentIrql()));
+        return FALSE;
+    }
+
+    WCHAR device_name_buffer[80] = {};
+    if (!build_target_device_name(device_name_buffer, sizeof(device_name_buffer) / sizeof(device_name_buffer[0]))) {
+        SN_LOG("init_thread: device_discovery_name_build_failed");
+        return FALSE;
+    }
+
+    UNICODE_STRING device_name;
+    RtlInitUnicodeString(&device_name, device_name_buffer);
+
+    PFILE_OBJECT file_object = nullptr;
+    PDEVICE_OBJECT device_object = nullptr;
+    NTSTATUS status = IoGetDeviceObjectPointer(&device_name, FILE_READ_DATA, &file_object, &device_object);
+    if (!NT_SUCCESS(status) || !file_object || !device_object) {
+        SN_LOG("init_thread: device_discovery_resolve_failed status=0x%08lx file=%p device=%p",
+            status, file_object, device_object);
+        if (file_object)
+            ObDereferenceObject(file_object);
+        return FALSE;
+    }
+
+    PDRIVER_OBJECT driver_object = nullptr;
+    PVOID candidate_base = nullptr;
+    ULONG candidate_size = 0;
+    BOOLEAN shape_ok = FALSE;
+
+    __try {
+        if (_MmIsAddressValid(device_object))
+            driver_object = device_object->DriverObject;
+        shape_ok = extract_target_driver_image_candidate(driver_object, device_object, &candidate_base, &candidate_size);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        shape_ok = FALSE;
+    }
+
+    BOOLEAN bridge_ok = FALSE;
+    BOOLEAN object_ok = FALSE;
+    if (shape_ok) {
+        bridge_ok = heartbeat::locate_bridge(candidate_base, candidate_size) ? TRUE : FALSE;
+        object_ok = validate_target_driver_object(driver_object, candidate_base);
+    }
+
+    SN_LOG("init_thread: device_discovery_candidate status=0x%08lx shape=%u bridge=%u object=%u base=%p size=0x%lx driver=%p device=%p",
+        status,
+        shape_ok ? 1u : 0u,
+        bridge_ok ? 1u : 0u,
+        object_ok ? 1u : 0u,
+        candidate_base,
+        candidate_size,
+        driver_object,
+        device_object);
+
+    if (shape_ok && bridge_ok && object_ok) {
+        g_target_driver_base = candidate_base;
+        g_target_driver_size = candidate_size;
+        g_target_driver_object = driver_object;
+        SN_LOG("init_thread: device_discovery_success base=%p size=0x%lx driver=%p bridge=%p",
+            candidate_base, candidate_size, driver_object, heartbeat::g_bridge);
+        ObDereferenceObject(file_object);
+        return TRUE;
+    }
+
+    heartbeat::g_bridge = nullptr;
+    heartbeat::g_last_whoswho_tsc = 0;
+    heartbeat::g_last_check_tsc = 0;
+    ObDereferenceObject(file_object);
+    return FALSE;
 }
 
 static PDRIVER_OBJECT find_target_driver_object(PVOID target_base) {
@@ -467,7 +677,13 @@ namespace sentinel_build_identity {
 
 static void NTAPI init_thread_routine(PVOID ) {
 
-    SN_LOG("init_thread: started");
+    LARGE_INTEGER init_freq;
+    LARGE_INTEGER init_start = KeQueryPerformanceCounter(&init_freq);
+    SN_LOG("init_thread: started routine=%p pid=%llu tid=%llu",
+        reinterpret_cast<PVOID>(&init_thread_routine),
+        init_handle_to_u64(PsGetCurrentProcessId()),
+        init_handle_to_u64(PsGetCurrentThreadId()));
+    init_log_session_state("entry");
 
     constexpr ULONG SETTLE_POLLS = 5;
     constexpr LONG64 POLL_INTERVAL = -1'000'000LL;
@@ -491,7 +707,15 @@ static void NTAPI init_thread_routine(PVOID ) {
 
 
     if (g_target_driver_base == nullptr) {
-        SN_LOG("init_thread: settle done, scanning module list immediately for bridge magic...");
+        SN_LOG("init_thread: settle done, attempting device discovery before bridge magic scan...");
+        init_log_session_state("before_bridge_scan");
+
+        if (discover_target_driver_from_device()) {
+            SN_LOG("init_thread: device discovery completed before module list scan");
+            goto discovery_done;
+        }
+
+        SN_LOG("init_thread: device discovery unavailable, scanning module list for bridge magic...");
 
         if (g_sentinel_driver_object &&
             _MmIsAddressValid(g_sentinel_driver_object) &&
@@ -504,6 +728,8 @@ static void NTAPI init_thread_routine(PVOID ) {
             PLIST_ENTRY entry = list_head->Flink;
             ULONG safety = 512;
             ULONG modules_checked = 0;
+            UINT64 magic_probes = 0;
+            BOOLEAN scan_cancelled = FALSE;
 
             SN_LOG("init_thread: sentinel_ldr=%p base=%p size=0x%lx",
                 sentinel_ldr, sentinel_ldr->DllBase, sentinel_ldr->SizeOfImage);
@@ -572,6 +798,14 @@ static void NTAPI init_thread_routine(PVOID ) {
 
                         ULONG magic_checks = 0;
                         for (ULONG off = 0; off <= sec_size - sizeof(heartbeat::sentinel_bridge_t); off += 4) {
+                            magic_probes++;
+                            if ((magic_probes & 0x0FFFULL) == 0) {
+                                if (!init_scan_backoff("bridge_magic_scan", magic_probes, modules_checked, si, off)) {
+                                    scan_cancelled = TRUE;
+                                    break;
+                                }
+                            }
+
                             if (!_MmIsAddressValid(sec_base + off))
                                 continue;
 
@@ -601,16 +835,27 @@ static void NTAPI init_thread_routine(PVOID ) {
                             g_target_driver_size = mod_size;
                             goto discovery_done;
                         }
+                        if (scan_cancelled)
+                            break;
                     }
                 } __except (EXCEPTION_EXECUTE_HANDLER) {
                     SN_LOG("init_thread: EXCEPTION scanning module %p", mod_base);
                 }
 
+                if (scan_cancelled)
+                    break;
+
             next_module:
                 entry = entry->Flink;
             }
 
-            SN_LOG("init_thread: module list scan complete, checked %lu modules", modules_checked);
+            SN_LOG("init_thread: module list scan complete, checked %lu modules probes=%llu cancelled=%u elapsed_us=%lu",
+                modules_checked,
+                static_cast<unsigned long long>(magic_probes),
+                scan_cancelled ? 1u : 0u,
+                init_elapsed_us(init_start, init_freq));
+            if (scan_cancelled)
+                goto exit_thread;
         } else {
             SN_LOG("init_thread: cannot scan module list: driver_obj=%p valid=%d section=%p",
                 g_sentinel_driver_object,
@@ -619,6 +864,7 @@ static void NTAPI init_thread_routine(PVOID ) {
         }
     }
 discovery_done:
+    init_log_session_state("after_discovery");
 
     if (g_target_driver_base == nullptr) {
         SN_LOG("init_thread: FATAL - target driver NOT FOUND, exiting");
@@ -627,6 +873,7 @@ discovery_done:
 
     SN_LOG("init_thread: target found at %p size=0x%lx, beginning subsystem init",
         (PVOID)g_target_driver_base, g_target_driver_size);
+    init_log_session_state("before_subsystem_init");
 
     {
         PVOID target_base = (PVOID)g_target_driver_base;
@@ -756,6 +1003,7 @@ discovery_done:
         SN_LOG("init_thread: starting guardian...");
         bool guard_ok = guardian::start();
         SN_LOG("init_thread: guardian::start = %d", (int)guard_ok);
+        init_log_session_state("after_guardian_start");
 
 
         {
@@ -817,10 +1065,16 @@ discovery_done:
         }
 
         SN_LOG("init_thread: ALL SUBSYSTEMS INITIALIZED");
+        init_log_session_state("subsystems_initialized");
     }
 
 exit_thread:
-    SN_LOG("init_thread: exiting");
+    SN_LOG("init_thread: exiting elapsed_us=%lu target_base=%p target_size=0x%lx shutdown=%ld",
+        init_elapsed_us(init_start, init_freq),
+        (PVOID)g_target_driver_base,
+        g_target_driver_size,
+        _InterlockedCompareExchange(&g_shutdown_flag, 0, 0));
+    init_log_session_state("exit");
     _PsTerminateSystemThread(STATUS_SUCCESS);
 }
 

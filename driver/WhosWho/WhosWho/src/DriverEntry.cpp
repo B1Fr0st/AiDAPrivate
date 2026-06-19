@@ -547,8 +547,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     sentinel_bridge::allocate_evidence_blob();
     anti_debug::initialize_kd_baseline();
     debug_attach_monitor::start();
-    anti_dma_canary::init_timer();
-    file_handle_scanner::start(30);
+    WW_LOG("DriverEntry: session-bound scanners deferred until registered client heartbeat");
 
     NTSTATUS dbe_status = debug_events::initialize();
     WW_LOG("DriverEntry: debug_events::initialize returned 0x%08lx", dbe_status);

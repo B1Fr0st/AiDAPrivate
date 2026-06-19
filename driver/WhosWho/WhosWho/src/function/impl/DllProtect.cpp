@@ -22,6 +22,8 @@ namespace dll_protection {
     static constexpr UINT64 DTB_MAX_PFN = 0x1000000ULL;
     static constexpr UINT32 EPROCESS_DIRECTORY_TABLE_BASE_OFFSET = 0x28;
     static constexpr ULONG DPRT_REASON_FOREIGN_INSTRUMENTATION = 0xAE46u;
+    static constexpr LONGLONG DPRT_REPETITIVE_LOG_INTERVAL_100NS = 30LL * 1000LL * 10000LL;
+    static constexpr UINT64 DPRT_TIMER_WORK_SLOW_100NS = 50ULL * 1000ULL;
 
     struct protection_entry_t {
         volatile LONG active;
@@ -57,10 +59,49 @@ namespace dll_protection {
     static volatile LONG g_timer_running = 0;
     static volatile LONG g_timer_work_item_queued = 0;
     static volatile LONG g_timer_work_item_running = 0;
+    static volatile LONG g_timer_work_run_count = 0;
+    static volatile LONG64 g_instr_noncanonical_log_last_time = 0;
+    static volatile LONG g_instr_noncanonical_log_emitted = 0;
+    static volatile LONG g_instr_noncanonical_log_suppressed = 0;
+    static volatile LONG64 g_instr_check_log_last_time = 0;
+    static volatile LONG g_instr_check_log_emitted = 0;
+    static volatile LONG g_instr_check_log_suppressed = 0;
 
 
     static UINT64 compute_code_hash_physical(UINT32 pid, UINT64 va, UINT32 size);
     static BOOLEAN check_peb_debugger_physical(UINT32 pid);
+
+    static BOOLEAN should_log_repetitive_diagnostic(
+        volatile LONG64* last_time,
+        volatile LONG* emitted_count,
+        volatile LONG* suppressed_count,
+        LONG64 now,
+        ULONG* suppressed_out)
+    {
+        if (suppressed_out)
+            *suppressed_out = 0;
+
+        LONG emitted = _InterlockedIncrement(emitted_count);
+        if (emitted <= 4) {
+            LONG suppressed = _InterlockedExchange(suppressed_count, 0);
+            if (suppressed_out && suppressed > 0)
+                *suppressed_out = static_cast<ULONG>(suppressed);
+            return TRUE;
+        }
+
+        LONG64 previous = _InterlockedCompareExchange64(last_time, 0, 0);
+        if (previous == 0 || now - previous >= DPRT_REPETITIVE_LOG_INTERVAL_100NS) {
+            if (_InterlockedCompareExchange64(last_time, now, previous) == previous) {
+                LONG suppressed = _InterlockedExchange(suppressed_count, 0);
+                if (suppressed_out && suppressed > 0)
+                    *suppressed_out = static_cast<ULONG>(suppressed);
+                return TRUE;
+            }
+        }
+
+        _InterlockedIncrement(suppressed_count);
+        return FALSE;
+    }
 
     struct memory_snapshot_t {
         NTSTATUS lookup_status;
@@ -733,8 +774,18 @@ namespace dll_protection {
                         detected = TRUE;
                     } else {
                         UINT32 cb_tag = static_cast<UINT32>((cb_value >> 32) ^ cb_value ^ 0x0A1DA460u);
-                        WW_LOG("[DLL-PROTECT] pid=%u instrumentation_noncanonical_ignored cb_tag=0x%08X",
-                            pid, cb_tag);
+                        LARGE_INTEGER now;
+                        KeQuerySystemTime(&now);
+                        ULONG suppressed = 0;
+                        if (should_log_repetitive_diagnostic(
+                            &g_instr_noncanonical_log_last_time,
+                            &g_instr_noncanonical_log_emitted,
+                            &g_instr_noncanonical_log_suppressed,
+                            now.QuadPart,
+                            &suppressed)) {
+                            WW_LOG("[DLL-PROTECT] pid=%u instrumentation_noncanonical_ignored cb_tag=0x%08X suppressed=%lu",
+                                pid, cb_tag, suppressed);
+                        }
                     }
                 }
             }
@@ -1011,6 +1062,19 @@ namespace dll_protection {
         return cleanup_for_pid_internal(pid, "process_exit", "process_exit_unregister_pid", "process_exit_cleanup");
     }
 
+    BOOLEAN has_tracked_pid(UINT32 pid)
+    {
+        if (pid == 0)
+            return FALSE;
+        for (int i = 0; i < (int)MAX_PROTECT_SLOTS; i++) {
+            if (_InterlockedCompareExchange(&g_slots[i].active, 1, 1) == 1 &&
+                slot_matches_cleanup_pid(g_slots[i], pid)) {
+                return TRUE;
+            }
+        }
+        return FALSE;
+    }
+
     ULONG cleanup_for_session_reset(UINT32 pid, const char* reason)
     {
         ULONG cleared = cleanup_for_pid_internal(pid, reason, "session_reset_unregister_pid", "session_reset_cleanup");
@@ -1119,8 +1183,22 @@ namespace dll_protection {
                 BOOLEAN has_instr = check_foreign_instrumentation(slot.pid, &instr_cb);
                 UINT32 instr_tag = static_cast<UINT32>((instr_cb >> 32) ^ instr_cb ^ 0x0A1DA461u);
                 BOOLEAN fileless_terminal = is_fileless_terminal_slot(slot);
-                WW_LOG("[DLL-PROTECT] pid=%u check_foreign_instrumentation=%d cb_present=%u cb_tag=0x%08X fileless_terminal=%u",
-                    slot.pid, has_instr ? 1 : 0, instr_cb != 0 ? 1u : 0u, instr_tag, fileless_terminal ? 1u : 0u);
+                ULONG suppressed = 0;
+                BOOLEAN log_instrumentation_check = has_instr ? TRUE : FALSE;
+                if (!log_instrumentation_check) {
+                    LARGE_INTEGER now;
+                    KeQuerySystemTime(&now);
+                    log_instrumentation_check = should_log_repetitive_diagnostic(
+                        &g_instr_check_log_last_time,
+                        &g_instr_check_log_emitted,
+                        &g_instr_check_log_suppressed,
+                        now.QuadPart,
+                        &suppressed);
+                }
+                if (log_instrumentation_check) {
+                    WW_LOG("[DLL-PROTECT] pid=%u check_foreign_instrumentation=%d cb_present=%u cb_tag=0x%08X fileless_terminal=%u suppressed=%lu",
+                        slot.pid, has_instr ? 1 : 0, instr_cb != 0 ? 1u : 0u, instr_tag, fileless_terminal ? 1u : 0u, suppressed);
+                }
                 if (has_instr) {
                     if (fileless_terminal) {
                         WW_LOG("[DLL-PROTECT] pid=%u foreign_instr_cb_fileless_terminal_suppressed reason=0x%08X cb_tag=0x%08X owner_pid=%u module=0x%llX text=0x%llX",
@@ -1276,10 +1354,33 @@ namespace dll_protection {
             return;
         }
 
+        UINT64 start_interrupt_time = KeQueryInterruptTime();
+        BOOLEAN exception_seen = FALSE;
         __try {
             protection_timer_body();
         } __except (EXCEPTION_EXECUTE_HANDLER) {
+            exception_seen = TRUE;
             WW_LOG("[DLL-PROTECT] protection work exception");
+        }
+        UINT64 end_interrupt_time = KeQueryInterruptTime();
+        UINT64 elapsed_100ns = end_interrupt_time >= start_interrupt_time ? end_interrupt_time - start_interrupt_time : 0;
+        LONG runs = _InterlockedIncrement(&g_timer_work_run_count);
+        BOOLEAN log_work_exit = exception_seen ? TRUE : FALSE;
+        if (!log_work_exit && elapsed_100ns >= DPRT_TIMER_WORK_SLOW_100NS)
+            log_work_exit = TRUE;
+        if (!log_work_exit && (runs <= 2 || ((static_cast<ULONG>(runs) & 0x3FUL) == 0)))
+            log_work_exit = TRUE;
+        if (log_work_exit) {
+            WW_LOG("[DLL-PROTECT] protection_timer_work_exit elapsed_us=%llu runs=%ld exception=%u active_slots=%lu running=%ld queued=%ld work_running=%ld current_pid=0x%llX irql=%lu",
+                elapsed_100ns / 10ULL,
+                runs,
+                exception_seen ? 1u : 0u,
+                active_slot_count(),
+                _InterlockedCompareExchange(&g_timer_running, 1, 1),
+                _InterlockedCompareExchange(&g_timer_work_item_queued, 1, 1),
+                _InterlockedCompareExchange(&g_timer_work_item_running, 1, 1),
+                (UINT64)(ULONG_PTR)PsGetCurrentProcessId(),
+                KeGetCurrentIrql());
         }
 
         _InterlockedExchange(&g_timer_work_item_running, 0);

@@ -979,6 +979,67 @@ namespace detail
         return probe_contains_any(probe, contains_names);
     }
 
+    inline bool command_contains_any_w(const std::wstring& command, const wchar_t* const* needles, size_t count)
+    {
+        for (size_t i = 0; i < count; ++i)
+        {
+            if (contains_w(command, needles[i]))
+                return true;
+        }
+        return false;
+    }
+
+    template <size_t N>
+    inline bool command_contains_any_w(const std::wstring& command, const wchar_t* const (&needles)[N])
+    {
+        return command_contains_any_w(command, needles, N);
+    }
+
+    inline bool is_read_only_shell_query_command(const process_probe_t& probe)
+    {
+        if (probe.command_lower.empty() || !is_shell_or_interpreter(probe))
+            return false;
+        std::wstring padded;
+        padded.reserve(probe.command_lower.size() + 2);
+        padded.push_back(L' ');
+        padded.append(probe.command_lower);
+        padded.push_back(L' ');
+        static const wchar_t* const read_tokens[] = {
+            L" rg ", L" rg.exe ", L" ripgrep ", L" select-string ", L" get-content ",
+            L" findstr ", L" type ", L" gc ", L" git diff ", L" git show ",
+            L" git status ", L" get-item ", L" get-childitem ", L" ls ", L" dir "
+        };
+        if (!command_contains_any_w(padded, read_tokens))
+            return false;
+        static const wchar_t* const mutating_tokens[] = {
+            L" start-process ", L" invoke-expression ", L" iex ", L" -encodedcommand ",
+            L" set-content ", L" add-content ", L" out-file ", L" remove-item ",
+            L" move-item ", L" copy-item ", L" new-item ", L" stop-process ",
+            L" terminateprocess ", L" openprocess ", L" writeprocessmemory ",
+            L" createremotethread ", L" debug-activeprocess ", L" attach ",
+            L" inject ", L" dump ", L" patch ", L" hook "
+        };
+        return !command_contains_any_w(padded, mutating_tokens);
+    }
+
+    inline bool command_mentions_tool_token(const process_probe_t& probe, const wchar_t* const* tokens, size_t count)
+    {
+        if (probe.command_lower.empty() || is_read_only_shell_query_command(probe))
+            return false;
+        std::wstring padded;
+        padded.reserve(probe.command_lower.size() + 2);
+        padded.push_back(L' ');
+        padded.append(probe.command_lower);
+        padded.push_back(L' ');
+        return command_contains_any_w(padded, tokens, count);
+    }
+
+    template <size_t N>
+    inline bool command_mentions_tool_token(const process_probe_t& probe, const wchar_t* const (&tokens)[N])
+    {
+        return command_mentions_tool_token(probe, tokens, N);
+    }
+
     inline bool has_mcp_command_evidence(const process_probe_t& probe)
     {
         static const wchar_t* const tokens[] = {
@@ -1251,7 +1312,15 @@ namespace detail
             L"reclass", L"xenos", L"hollows_hunter", L"hollowshunter", L"artmoney",
             L"gameconqueror", L"scanmem", L"memory viewer"
         };
-        return probe_contains_any(probe, tokens);
+        if (probe_identity_contains_any(probe, tokens))
+            return true;
+        static const wchar_t* const command_tokens[] = {
+            L"cheatengine.exe", L"processhacker.exe", L"systeminformer.exe",
+            L"procmon.exe", L"procmon64.exe", L"procexp.exe", L"procexp64.exe",
+            L"vmmap.exe", L"rammap.exe", L"apimonitor.exe", L"reclass.net.exe",
+            L"reclass.exe", L"xenos.exe", L"hollows_hunter.exe", L"hollowshunter.exe"
+        };
+        return command_mentions_tool_token(probe, command_tokens);
     }
 
     inline bool is_debugger_tool(const process_probe_t& probe)
@@ -1268,7 +1337,16 @@ namespace detail
             L"x64dbg", L"x32dbg", L"windbg", L"debugger", L"ollydbg", L"immunitydebugger",
             L"frida", L"scyllahide", L"titanhide", L"vehdebug", L"hardware breakpoint"
         };
-        return probe_contains_any(probe, tokens);
+        if (probe_identity_contains_any(probe, tokens))
+            return true;
+        static const wchar_t* const command_tokens[] = {
+            L"x64dbg.exe", L"x32dbg.exe", L"windbg.exe", L"windbgx.exe",
+            L"cdb.exe", L"kd.exe", L"ntsd.exe", L"ollydbg.exe",
+            L"immunitydebugger.exe", L"frida.exe", L"frida-server.exe",
+            L"frida-trace.exe", L"frida-inject.exe", L"scyllahide",
+            L"titanhide"
+        };
+        return command_mentions_tool_token(probe, command_tokens);
     }
 
     inline bool is_re_tool(const process_probe_t& probe)
@@ -1285,7 +1363,16 @@ namespace detail
             L"radare", L"rizin", L"cutter", L"dnspy", L"ilspy", L"hopper disassembler",
             L"retdec", L"jeb", L"reversing", L"disassembler", L"decompiler"
         };
-        return probe_contains_any(probe, tokens);
+        if (probe_identity_contains_any(probe, tokens))
+            return true;
+        static const wchar_t* const command_tokens[] = {
+            L"ida.exe", L"ida64.exe", L"idaq.exe", L"idaq64.exe",
+            L"idat.exe", L"idat64.exe", L"ghidrarun.bat", L"ghidra.exe",
+            L"binaryninja.exe", L"cutter.exe", L"r2.exe", L"radare2.exe",
+            L"rizin.exe", L"dnspy.exe", L"ilspy.exe", L"hiew32.exe",
+            L"hiew64.exe", L"retdec.exe", L"jeb.exe"
+        };
+        return command_mentions_tool_token(probe, command_tokens);
     }
 
     inline bool is_dump_tool(const process_probe_t& probe)
@@ -1310,20 +1397,7 @@ namespace detail
             L" pe-sieve ", L" pe-sieve.exe ", L" scylla.exe ", L" importrec.exe ",
             L" dumpbin.exe ", L" lordpe.exe ", L" pebear.exe "
         };
-        std::wstring padded_command;
-        if (!probe.command_lower.empty())
-        {
-            padded_command.reserve(probe.command_lower.size() + 2);
-            padded_command.push_back(L' ');
-            padded_command.append(probe.command_lower);
-            padded_command.push_back(L' ');
-            for (const wchar_t* token : command_tokens)
-            {
-                if (contains_w(padded_command, token))
-                    return true;
-            }
-        }
-        return false;
+        return command_mentions_tool_token(probe, command_tokens);
     }
 
     inline bool is_ida_host_process(const process_probe_t& probe)
@@ -3037,34 +3111,42 @@ struct runtime_scan_result_t
 inline runtime_scan_result_t full_scan_runtime_cached(uint64_t safe_cache_ms, const char* caller)
 {
     static std::mutex s_runtime_scan_mutex;
-    static combined::threat_report_t s_last_safe_report{};
-    static uint64_t s_last_safe_ms = 0;
+    static combined::threat_report_t s_last_report{};
+    static uint64_t s_last_report_ms = 0;
+    static uint64_t s_last_caller_hash = 0;
     static uint64_t s_last_cache_log_ms = 0;
 
+    const char* caller_text = caller ? caller : "<null>";
+    const uint64_t caller_hash = detail::fnv1a64_bytes(caller_text, std::strlen(caller_text));
     const uint64_t wait_start_ms = static_cast<uint64_t>(GetTickCount64());
     std::unique_lock<std::mutex> lock(s_runtime_scan_mutex);
     const uint64_t locked_ms = static_cast<uint64_t>(GetTickCount64());
     runtime_scan_result_t result{};
     result.lock_wait_ms = locked_ms >= wait_start_ms ? locked_ms - wait_start_ms : 0;
 
-    if (s_last_safe_ms != 0 && locked_ms >= s_last_safe_ms)
+    if (s_last_report_ms != 0 && locked_ms >= s_last_report_ms)
     {
-        const uint64_t age_ms = locked_ms - s_last_safe_ms;
-        if (age_ms < safe_cache_ms && !s_last_safe_report.confirmed_high_risk())
+        const uint64_t age_ms = locked_ms - s_last_report_ms;
+        const bool cached_high_risk = s_last_report.confirmed_high_risk();
+        const bool same_caller = s_last_caller_hash == caller_hash;
+        if (age_ms < safe_cache_ms && (!cached_high_risk || same_caller))
         {
-            result.report = s_last_safe_report;
+            result.report = s_last_report;
             result.cached = true;
             result.cache_age_ms = age_ms;
             if (s_last_cache_log_ms == 0 || locked_ms - s_last_cache_log_ms >= 10000ULL)
             {
                 s_last_cache_log_ms = locked_ms;
                 diag::log_tagged_critical_fmt("guard",
-                    "ai_tool_posture_runtime_cached caller=%s age_ms=%llu wait_ms=%llu summary_hash=0x%016llX category_mask=0x%08X",
-                    caller ? caller : "<null>",
+                    "ai_tool_posture_runtime_cached caller=%s age_ms=%llu wait_ms=%llu summary_hash=0x%016llX category_mask=0x%08X high_risk_mask=0x%08X cached_high_risk=%d same_caller=%d",
+                    caller_text,
                     static_cast<unsigned long long>(age_ms),
                     static_cast<unsigned long long>(result.lock_wait_ms),
                     static_cast<unsigned long long>(result.report.summary_hash),
-                    result.report.category_mask);
+                    result.report.category_mask,
+                    result.report.high_risk_mask,
+                    cached_high_risk ? 1 : 0,
+                    same_caller ? 1 : 0);
             }
             return result;
         }
@@ -3072,21 +3154,14 @@ inline runtime_scan_result_t full_scan_runtime_cached(uint64_t safe_cache_ms, co
 
     result.report = combined::full_scan();
     const uint64_t complete_ms = static_cast<uint64_t>(GetTickCount64());
-    if (!result.report.confirmed_high_risk())
-    {
-        s_last_safe_report = result.report;
-        s_last_safe_ms = complete_ms;
-    }
-    else
-    {
-        s_last_safe_report = combined::threat_report_t{};
-        s_last_safe_ms = 0;
-    }
+    s_last_report = result.report;
+    s_last_report_ms = complete_ms;
+    s_last_caller_hash = caller_hash;
     if (result.lock_wait_ms >= 250ULL)
     {
         diag::log_tagged_critical_fmt("guard",
             "ai_tool_posture_runtime_scan_wait caller=%s wait_ms=%llu summary_hash=0x%016llX category_mask=0x%08X high_risk_mask=0x%08X",
-            caller ? caller : "<null>",
+            caller_text,
             static_cast<unsigned long long>(result.lock_wait_ms),
             static_cast<unsigned long long>(result.report.summary_hash),
             result.report.category_mask,

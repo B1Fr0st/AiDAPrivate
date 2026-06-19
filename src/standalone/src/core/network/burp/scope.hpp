@@ -41,6 +41,7 @@ struct parsed_url_t
 bool initialize();
 void shutdown();
 
+parsed_url_t parse_url(const std::string& url);
 bool        in_scope(const std::string& url);
 bool        in_scope_components(const std::string& scheme, const std::string& host, uint16_t port, const std::string& path);
 uint64_t    add_include_rule(const std::string& protocol, const std::string& host_pattern, int port, const std::string& path_prefix);

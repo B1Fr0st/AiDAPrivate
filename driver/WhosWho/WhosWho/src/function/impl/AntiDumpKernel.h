@@ -644,12 +644,24 @@ namespace continuous_anti_dump {
     inline void stop_if_target(UINT32 pid)
     {
         if (pid == 0) return;
+        LONG queued = _InterlockedCompareExchange(&g_work_item_queued, 0, 0);
+        LONG active_before = _InterlockedCompareExchange(&g_active, 0, 0);
         LONG prev = _InterlockedCompareExchange(
             reinterpret_cast<volatile LONG*>(&g_target_pid),
             0,
             static_cast<LONG>(pid));
         if (prev == static_cast<LONG>(pid)) {
-            WW_LOG("continuous_admp: cleared target pid=%u (process exiting)", pid);
+            LONG stopped = _InterlockedExchange(&g_active, 0);
+            KeCancelTimer(&g_timer);
+            if (_KeFlushQueuedDpcs && KeGetCurrentIrql() < DISPATCH_LEVEL)
+                _KeFlushQueuedDpcs();
+            WW_LOG("continuous_admp: stopped target pid=%u process_exiting active_before=%ld stopped=%ld queued_before=%ld queued_after=%ld irql=%lu",
+                pid,
+                active_before,
+                stopped,
+                queued,
+                _InterlockedCompareExchange(&g_work_item_queued, 0, 0),
+                static_cast<ULONG>(KeGetCurrentIrql()));
         }
     }
 }

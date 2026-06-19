@@ -127,6 +127,9 @@ namespace binary_map_view {
 		float                                   row_anim_time = 0.f;
 		bool                                    initialized = false;
 		bool                                    auto_refreshed_once = false;
+		std::string                             last_binary_identity_path;
+		uint64_t                                last_binary_identity_base = 0;
+		uint32_t                                last_binary_identity_size = 0;
 		aida::events::subscription_handle_t     subscription_binary;
 		aida::events::subscription_handle_t     subscription_proc_created;
 		aida::events::subscription_handle_t     subscription_proc_exited;
@@ -637,20 +640,34 @@ namespace binary_map_view {
 						view_state_t& vs = state();
 						vs.refresh_requested.store(true);
 						vs.live_refresh_requested.store(true);
-						vs.auto_refreshed_once = false;
+						bool identity_changed = false;
 						{
 							std::lock_guard<std::mutex> g(vs.mutex);
-							vs.collapsed_groups.clear();
-							vs.expanded_imports.clear();
-							vs.rendered_text.clear();
-							vs.fn_pulses.clear();
+							identity_changed =
+								vs.last_binary_identity_path != payload.binary_path ||
+								vs.last_binary_identity_base != payload.image_base ||
+								vs.last_binary_identity_size != payload.image_size;
+							vs.last_binary_identity_path = payload.binary_path;
+							vs.last_binary_identity_base = payload.image_base;
+							vs.last_binary_identity_size = payload.image_size;
+							if (identity_changed) {
+								vs.collapsed_groups.clear();
+								vs.expanded_imports.clear();
+								vs.rendered_text.clear();
+								vs.fn_pulses.clear();
+							}
 						}
-						vs.selected_va.store(0);
-						vs.hover_function_va = 0;
+						if (identity_changed) {
+							vs.auto_refreshed_once = false;
+							vs.selected_va.store(0);
+							vs.hover_function_va = 0;
+						}
 						diag::log_tagged_fmt("binary_map",
-							"event_binary_loaded path='%s' image_base=0x%llX -> refresh_requested + live_refresh_requested",
+							"event_binary_loaded path='%s' image_base=0x%llX image_size=%u identity_changed=%d -> refresh_requested + live_refresh_requested",
 							payload.binary_path.c_str(),
-							static_cast<unsigned long long>(payload.image_base));
+							static_cast<unsigned long long>(payload.image_base),
+							static_cast<unsigned>(payload.image_size),
+							identity_changed ? 1 : 0);
 					});
 			}
 			if (!s.subscription_proc_created.valid()) {

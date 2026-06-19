@@ -163,6 +163,37 @@ namespace sentinel_bridge {
     inline UINT8 g_challenge_hmac_key[kernel_crypto::SHA256_DIGEST_SIZE] = {};
     inline volatile LONG g_challenge_keys_valid = 0;
     inline volatile LONG64 g_last_seen_challenge_counter = 0;
+    constexpr LONGLONG BRIDGE_TICK_LOG_INTERVAL_100NS = 10LL * 1000LL * 10000LL;
+    inline volatile LONG64 g_tick_log_last_time = 0;
+    inline volatile LONG g_tick_log_emitted = 0;
+    inline volatile LONG g_tick_log_suppressed = 0;
+
+    __forceinline BOOLEAN should_log_tick(LONG64 now, ULONG* suppressed_out)
+    {
+        if (suppressed_out)
+            *suppressed_out = 0;
+
+        LONG emitted = _InterlockedIncrement(&g_tick_log_emitted);
+        if (emitted <= 4) {
+            LONG suppressed = _InterlockedExchange(&g_tick_log_suppressed, 0);
+            if (suppressed_out && suppressed > 0)
+                *suppressed_out = static_cast<ULONG>(suppressed);
+            return TRUE;
+        }
+
+        LONG64 previous = _InterlockedCompareExchange64(&g_tick_log_last_time, 0, 0);
+        if (previous == 0 || now - previous >= BRIDGE_TICK_LOG_INTERVAL_100NS) {
+            if (_InterlockedCompareExchange64(&g_tick_log_last_time, now, previous) == previous) {
+                LONG suppressed = _InterlockedExchange(&g_tick_log_suppressed, 0);
+                if (suppressed_out && suppressed > 0)
+                    *suppressed_out = static_cast<ULONG>(suppressed);
+                return TRUE;
+            }
+        }
+
+        _InterlockedIncrement(&g_tick_log_suppressed);
+        return FALSE;
+    }
 
     __forceinline void log_watchdog_bugcheck_intent(const char* path,
                                                     ULONG code,
@@ -500,12 +531,17 @@ namespace sentinel_bridge {
         UINT64 issued_counter = static_cast<UINT64>(g_bridge.challenge_counter);
         UINT64 last_seen = static_cast<UINT64>(_InterlockedCompareExchange64(
             &g_last_seen_challenge_counter, 0, 0));
+        BOOLEAN challenge_seen = raw_challenge != 0 ? TRUE : FALSE;
+        BOOLEAN challenge_candidate = FALSE;
+        BOOLEAN challenge_response_written = FALSE;
+        BOOLEAN challenge_decrypt_failed = FALSE;
 
         if (raw_challenge != 0 &&
             issued_counter > last_seen &&
             g_bridge.whoswho_response == 0 &&
             _InterlockedCompareExchange(&g_challenge_keys_valid, 0, 0) != 0)
         {
+            challenge_candidate = TRUE;
             UINT8 tag[kernel_crypto::GCM_TAG_SIZE];
             for (ULONG i = 0; i < kernel_crypto::GCM_TAG_SIZE; ++i)
                 tag[i] = g_bridge.challenge_tag[i];
@@ -522,13 +558,29 @@ namespace sentinel_bridge {
                 _InterlockedExchange64(
                     &g_last_seen_challenge_counter,
                     static_cast<LONG64>(issued_counter));
+                challenge_response_written = TRUE;
+            } else {
+                challenge_decrypt_failed = TRUE;
             }
         }
 
 
         rotate_bridge_nonce();
 
-        WW_LOG("tick: wrote whoswho_tsc=%lld", tsc);
+        LARGE_INTEGER now;
+        KeQuerySystemTime(&now);
+        ULONG suppressed = 0;
+        if (should_log_tick(now.QuadPart, &suppressed)) {
+            WW_LOG("tick: wrote whoswho_tsc=%lld suppressed=%lu challenge=%u candidate=%u response=%u decrypt_failed=%u counter=%llu last_seen=%llu",
+                tsc,
+                suppressed,
+                challenge_seen ? 1u : 0u,
+                challenge_candidate ? 1u : 0u,
+                challenge_response_written ? 1u : 0u,
+                challenge_decrypt_failed ? 1u : 0u,
+                issued_counter,
+                last_seen);
+        }
     }
 
     inline VOID NTAPI watchdog_dpc_callback(

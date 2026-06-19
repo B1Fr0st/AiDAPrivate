@@ -20,8 +20,7 @@
 
 namespace integrity_hunter {
 
-inline constexpr uint32_t k_integrity_hunter_max_records_per_drain = 16;
-inline constexpr size_t k_integrity_hunter_stop_batch_limit = 64;
+inline constexpr uint32_t k_integrity_hunter_max_records_per_drain = 0;
 
 struct integrity_node_t {
 	uint64_t reader_rip = 0;
@@ -214,6 +213,141 @@ inline std::vector<uint64_t> walk_callstack(uint64_t rbp, int max_depth)
 	return stack;
 }
 
+struct capture_batch_stats_t {
+	size_t captures = 0;
+	size_t processed = 0;
+	size_t filtered_range = 0;
+	size_t skipped_writes = 0;
+	size_t accepted_reads = 0;
+	size_t node_count = 0;
+	size_t event_count = 0;
+};
+
+inline capture_batch_stats_t process_capture_batch(std::vector<page_guard_engine::pg_capture_t>& captures,
+	uint64_t target_address,
+	uint64_t target_size,
+	std::map<uint64_t, rip_stats_t>& rip_stats,
+	uint64_t& total,
+	const std::chrono::steady_clock::time_point& start_time,
+	uint64_t generation,
+	uint32_t pg_session,
+	const char* stage,
+	bool cancel_seen)
+{
+	capture_batch_stats_t stats;
+	stats.captures = captures.size();
+	const uint64_t target_end = target_address + target_size;
+
+	for (auto& cap : captures) {
+		++stats.processed;
+		if (cap.fault_addr < target_address || cap.fault_addr >= target_end) {
+			++stats.filtered_range;
+			continue;
+		}
+
+		if (cap.access_type == 1) {
+			++stats.skipped_writes;
+			continue;
+		}
+
+		++stats.accepted_reads;
+		++total;
+
+		{
+			std::lock_guard<std::mutex> lk(g_state.mutex);
+			if (g_state.event_log.size() < 10000) {
+				capture_event_t evt;
+				evt.rip = cap.rip;
+				evt.fault_addr = cap.fault_addr;
+				evt.timestamp = cap.timestamp;
+				evt.access_type = cap.access_type;
+				g_state.event_log.push_back(evt);
+			}
+		}
+
+		auto it = rip_stats.find(cap.rip);
+		if (it == rip_stats.end()) {
+			rip_stats_t rip_stat;
+			rip_stat.rip = cap.rip;
+			rip_stat.count = 1;
+			rip_stat.first_seen = cap.timestamp;
+			rip_stat.last_seen = cap.timestamp;
+
+			std::vector<uint8_t> code;
+			driver_bridge::read_memory(cap.rip, 16, code);
+			if (!code.empty()) {
+				AsmInstr ins = zydis_decode_one(code.data(), static_cast<int>(code.size()), cap.rip);
+				char dbuf[192];
+				std::snprintf(dbuf, sizeof(dbuf), "%s %s", ins.mnem, ins.ops);
+				rip_stat.disasm = dbuf;
+			}
+
+			rip_stat.module = find_module_for_addr(cap.rip);
+			rip_stats[cap.rip] = rip_stat;
+		} else {
+			it->second.count++;
+			it->second.last_seen = cap.timestamp;
+		}
+	}
+
+	g_state.total_reads.store(total);
+
+	const auto now = std::chrono::steady_clock::now();
+	const auto elapsed_s = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
+
+	{
+		std::lock_guard<std::mutex> lk(g_state.mutex);
+		g_state.nodes.clear();
+
+		for (auto& [rip, rip_stat] : rip_stats) {
+			if (rip_stat.count < 2) continue;
+
+			integrity_node_t node;
+			node.reader_rip = rip;
+			node.read_count = rip_stat.count;
+			node.disasm_text = rip_stat.disasm;
+			node.module_name = rip_stat.module;
+
+			if (elapsed_s > 0) {
+				node.reads_per_second = static_cast<float>(rip_stat.count) /
+				    static_cast<float>(elapsed_s);
+			}
+
+			node.hash_compare_addr = find_compare_near_rip(rip);
+			find_loop_bounds(rip, node.loop_start, node.loop_end);
+
+			g_state.nodes.push_back(node);
+		}
+
+		std::sort(g_state.nodes.begin(), g_state.nodes.end(),
+		          [](const integrity_node_t& a, const integrity_node_t& b) {
+			          return a.read_count > b.read_count;
+		          });
+
+		g_state.status_text = "Monitoring: " + std::to_string(total) + " reads, " +
+		    std::to_string(g_state.nodes.size()) + " unique readers";
+		stats.node_count = g_state.nodes.size();
+		stats.event_count = g_state.event_log.size();
+	}
+
+	diag::log_tagged_fmt("integrity_hunter",
+		"capture_batch stage=%s gen=%llu session=%u captures=%zu processed=%zu filtered_range=%zu skipped_writes=%zu accepted_reads=%zu total_reads=%llu nodes=%zu events=%zu cancel=%d",
+		stage ? stage : "",
+		static_cast<unsigned long long>(generation),
+		pg_session,
+		stats.captures,
+		stats.processed,
+		stats.filtered_range,
+		stats.skipped_writes,
+		stats.accepted_reads,
+		static_cast<unsigned long long>(total),
+		stats.node_count,
+		stats.event_count,
+		cancel_seen ? 1 : 0);
+
+	return stats;
+}
+
 }
 
 inline bool start_hunt(uint64_t target_address, uint64_t target_size)
@@ -291,8 +425,9 @@ inline bool start_hunt(uint64_t target_address, uint64_t target_size)
 			pid,
 			page_base,
 			region_size,
-			true,
-			k_integrity_hunter_max_records_per_drain);
+			false,
+			k_integrity_hunter_max_records_per_drain,
+			false);
 		if (pg_session == 0) {
 			diag::log_tagged_fmt("integrity_hunter",
 				"page_guard_install_fail gen=%llu target=0x%llX page_base=0x%llX size=0x%llX cancelled=%d",
@@ -311,9 +446,10 @@ inline bool start_hunt(uint64_t target_address, uint64_t target_size)
 		}
 
 		diag::log_tagged_fmt("integrity_hunter",
-			"page_guard_installed gen=%llu session=%u page_base=0x%llX size=0x%llX",
+			"page_guard_installed gen=%llu session=%u page_base=0x%llX size=0x%llX payloads=0 max_drain=%u auto_poll=0",
 			static_cast<unsigned long long>(generation), pg_session, static_cast<unsigned long long>(page_base),
-			static_cast<unsigned long long>(region_size));
+			static_cast<unsigned long long>(region_size),
+			k_integrity_hunter_max_records_per_drain);
 
 		{
 			std::lock_guard<std::mutex> lk(g_state.mutex);
@@ -366,107 +502,61 @@ inline bool start_hunt(uint64_t target_address, uint64_t target_size)
 					static_cast<unsigned long long>(total));
 			}
 
-			size_t processed_this_cycle = 0;
-			for (auto& cap : captures) {
-				if (cancel_seen && processed_this_cycle >= k_integrity_hunter_stop_batch_limit)
-					break;
-				++processed_this_cycle;
-				if (cap.fault_addr < target_address ||
-				    cap.fault_addr >= target_address + target_size)
-					continue;
-
-				if (cap.access_type == 1) continue;
-
-				++total;
-
-				{
-					std::lock_guard<std::mutex> lk(g_state.mutex);
-					if (g_state.event_log.size() < 10000) {
-						capture_event_t evt;
-						evt.rip = cap.rip;
-						evt.fault_addr = cap.fault_addr;
-						evt.timestamp = cap.timestamp;
-						evt.access_type = cap.access_type;
-						g_state.event_log.push_back(evt);
-					}
-				}
-
-				auto it = rip_stats.find(cap.rip);
-				if (it == rip_stats.end()) {
-					detail::rip_stats_t stats;
-					stats.rip = cap.rip;
-					stats.count = 1;
-					stats.first_seen = cap.timestamp;
-					stats.last_seen = cap.timestamp;
-
-					std::vector<uint8_t> code;
-					driver_bridge::read_memory(cap.rip, 16, code);
-					if (!code.empty()) {
-						AsmInstr ins = zydis_decode_one(code.data(),
-						    static_cast<int>(code.size()), cap.rip);
-						char dbuf[192];
-						std::snprintf(dbuf, sizeof(dbuf), "%s %s", ins.mnem, ins.ops);
-						stats.disasm = dbuf;
-					}
-
-					stats.module = detail::find_module_for_addr(cap.rip);
-					rip_stats[cap.rip] = stats;
-				} else {
-					it->second.count++;
-					it->second.last_seen = cap.timestamp;
-				}
-			}
-
-			g_state.total_reads.store(total);
-
-			auto now = std::chrono::steady_clock::now();
-			auto elapsed_s = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
-
-			size_t node_count_after = 0;
-			{
-				std::lock_guard<std::mutex> lk(g_state.mutex);
-				g_state.nodes.clear();
-
-				for (auto& [rip, stats] : rip_stats) {
-					if (stats.count < 2) continue;
-
-					integrity_node_t node;
-					node.reader_rip = rip;
-					node.read_count = stats.count;
-					node.disasm_text = stats.disasm;
-					node.module_name = stats.module;
-
-					if (elapsed_s > 0) {
-						node.reads_per_second = static_cast<float>(stats.count) /
-						    static_cast<float>(elapsed_s);
-					}
-
-					node.hash_compare_addr = detail::find_compare_near_rip(rip);
-					detail::find_loop_bounds(rip, node.loop_start, node.loop_end);
-
-					g_state.nodes.push_back(node);
-				}
-
-				std::sort(g_state.nodes.begin(), g_state.nodes.end(),
-				          [](const integrity_node_t& a, const integrity_node_t& b) {
-					          return a.read_count > b.read_count;
-				          });
-
-				g_state.status_text = "Monitoring: " + std::to_string(total) + " reads, " +
-				    std::to_string(g_state.nodes.size()) + " unique readers";
-				node_count_after = g_state.nodes.size();
-			}
+			const auto batch_stats = detail::process_capture_batch(captures,
+				target_address,
+				target_size,
+				rip_stats,
+				total,
+				start_time,
+				generation,
+				pg_session,
+				"poll",
+				cancel_seen);
 			if (cancel_seen) {
 				diag::log_tagged_fmt("integrity_hunter",
-					"worker_cancel_drain_done gen=%llu session=%u processed=%zu total_after=%llu nodes=%zu",
+					"worker_cancel_drain_done gen=%llu session=%u processed=%zu filtered_range=%zu skipped_writes=%zu accepted_reads=%zu total_after=%llu nodes=%zu events=%zu",
 					static_cast<unsigned long long>(generation),
 					pg_session,
-					processed_this_cycle,
+					batch_stats.processed,
+					batch_stats.filtered_range,
+					batch_stats.skipped_writes,
+					batch_stats.accepted_reads,
 					static_cast<unsigned long long>(total),
-					node_count_after);
+					batch_stats.node_count,
+					batch_stats.event_count);
 				break;
 			}
 		}
+
+		const auto final_drain_t0 = std::chrono::steady_clock::now();
+		auto final_captures = page_guard_engine::g_pg_engine.get_captures(pg_session);
+		const auto final_drain_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+			std::chrono::steady_clock::now() - final_drain_t0).count();
+		const bool final_cancel_seen = g_state.cancel.load(std::memory_order_acquire);
+		const auto final_stats = detail::process_capture_batch(final_captures,
+			target_address,
+			target_size,
+			rip_stats,
+			total,
+			start_time,
+			generation,
+			pg_session,
+			"final_pre_uninstall",
+			final_cancel_seen);
+		diag::log_tagged_fmt("integrity_hunter",
+			"final_drain_done gen=%llu session=%u captures=%zu processed=%zu filtered_range=%zu skipped_writes=%zu accepted_reads=%zu total_after=%llu nodes=%zu events=%zu elapsed_ms=%lld cancel=%d",
+			static_cast<unsigned long long>(generation),
+			pg_session,
+			final_stats.captures,
+			final_stats.processed,
+			final_stats.filtered_range,
+			final_stats.skipped_writes,
+			final_stats.accepted_reads,
+			static_cast<unsigned long long>(total),
+			final_stats.node_count,
+			final_stats.event_count,
+			static_cast<long long>(final_drain_elapsed),
+			final_cancel_seen ? 1 : 0);
 
 		size_t nodes_before_uninstall = 0;
 		size_t events_before_uninstall = 0;
@@ -581,7 +671,23 @@ inline bool start_hunt(uint64_t target_address, uint64_t target_size)
 
 inline void stop_hunt()
 {
-	diag::log_tagged("integrity_hunter", "stop_hunt_requested");
+	size_t nodes = 0;
+	size_t events = 0;
+	{
+		std::lock_guard<std::mutex> lk(g_state.mutex);
+		nodes = g_state.nodes.size();
+		events = g_state.event_log.size();
+	}
+	diag::log_tagged_fmt("integrity_hunter",
+		"stop_hunt_requested hunting=%d worker_active=%d install_complete=%d install_success=%d session=%u nodes=%zu events=%zu total_reads=%llu",
+		g_state.hunting.load(std::memory_order_acquire) ? 1 : 0,
+		g_state.worker_active.load(std::memory_order_acquire) ? 1 : 0,
+		g_state.install_complete.load(std::memory_order_acquire) ? 1 : 0,
+		g_state.install_success.load(std::memory_order_acquire) ? 1 : 0,
+		g_state.pg_session_id.load(std::memory_order_acquire),
+		nodes,
+		events,
+		static_cast<unsigned long long>(g_state.total_reads.load(std::memory_order_acquire)));
 	g_state.cancel.store(true);
 }
 
@@ -606,6 +712,27 @@ inline bool wait_until_idle(uint32_t timeout_ms)
 		}
 		std::this_thread::sleep_for(std::chrono::milliseconds(25));
 	}
+	size_t nodes = 0;
+	size_t events = 0;
+	{
+		std::lock_guard<std::mutex> lk(g_state.mutex);
+		nodes = g_state.nodes.size();
+		events = g_state.event_log.size();
+	}
+	const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+		std::chrono::steady_clock::now() - start).count();
+	diag::log_tagged_fmt("integrity_hunter",
+		"wait_idle_success timeout_ms=%u elapsed_ms=%lld hunting=%d worker_active=%d install_complete=%d install_success=%d session=%u nodes=%zu events=%zu total_reads=%llu",
+		timeout_ms,
+		static_cast<long long>(elapsed),
+		g_state.hunting.load(std::memory_order_acquire) ? 1 : 0,
+		g_state.worker_active.load(std::memory_order_acquire) ? 1 : 0,
+		g_state.install_complete.load(std::memory_order_acquire) ? 1 : 0,
+		g_state.install_success.load(std::memory_order_acquire) ? 1 : 0,
+		g_state.pg_session_id.load(std::memory_order_acquire),
+		nodes,
+		events,
+		static_cast<unsigned long long>(g_state.total_reads.load(std::memory_order_acquire)));
 	return true;
 }
 

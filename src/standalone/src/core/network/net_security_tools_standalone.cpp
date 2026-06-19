@@ -22,6 +22,7 @@
 #include <chrono>
 #include <cctype>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -85,34 +86,74 @@ static void ns_add_unique_path(std::vector<std::string>& paths, const std::strin
         paths.push_back(path);
 }
 
+static std::string ns_trim_path(std::string path) {
+    while (!path.empty() && (path.front() == '"' || path.front() == '\'' || path.front() == ' ' || path.front() == '\t'))
+        path.erase(path.begin());
+    while (!path.empty() && (path.back() == '"' || path.back() == '\'' || path.back() == ' ' || path.back() == '\t'))
+        path.pop_back();
+    return path;
+}
+
+static void ns_add_tshark_candidate(std::vector<std::string>& paths, const std::string& raw_path) {
+    const std::string path = ns_trim_path(raw_path);
+    if (path.empty())
+        return;
+    ns_add_unique_path(paths, path);
+    std::filesystem::path fs_path(path);
+    if (!fs_path.has_extension() || _stricmp(fs_path.extension().string().c_str(), ".exe") != 0)
+        ns_add_unique_path(paths, (fs_path / "tshark.exe").string());
+}
+
+static void ns_add_tshark_base_candidates(std::vector<std::string>& paths, const std::filesystem::path& base) {
+    if (base.empty())
+        return;
+    ns_add_tshark_candidate(paths, (base / "tshark.exe").string());
+    ns_add_tshark_candidate(paths, (base / "Wireshark" / "tshark.exe").string());
+    ns_add_tshark_candidate(paths, (base / "wireshark" / "tshark.exe").string());
+    ns_add_tshark_candidate(paths, (base / "deps" / "tshark.exe").string());
+    ns_add_tshark_candidate(paths, (base / "deps" / "Wireshark" / "tshark.exe").string());
+    ns_add_tshark_candidate(paths, (base / "deps" / "wireshark" / "tshark.exe").string());
+    ns_add_tshark_candidate(paths, (base / "tools" / "Wireshark" / "tshark.exe").string());
+    ns_add_tshark_candidate(paths, (base / "third_party" / "Wireshark" / "tshark.exe").string());
+    ns_add_tshark_candidate(paths, (base / "vendor" / "Wireshark" / "tshark.exe").string());
+}
+
 static std::vector<std::string> ns_tshark_search_paths() {
     std::vector<std::string> paths;
-    ns_add_unique_path(paths, ns_env_var("AIDA_TSHARK"));
-    ns_add_unique_path(paths, ns_env_var("TSHARK_PATH"));
+    ns_add_tshark_candidate(paths, ns_env_var("AIDA_TSHARK"));
+    ns_add_tshark_candidate(paths, ns_env_var("TSHARK_PATH"));
     const std::string program_files = ns_env_var("ProgramFiles");
     if (!program_files.empty())
-        ns_add_unique_path(paths, program_files + "\\Wireshark\\tshark.exe");
+        ns_add_tshark_candidate(paths, program_files + "\\Wireshark\\tshark.exe");
     const std::string program_files_x86 = ns_env_var("ProgramFiles(x86)");
     if (!program_files_x86.empty())
-        ns_add_unique_path(paths, program_files_x86 + "\\Wireshark\\tshark.exe");
+        ns_add_tshark_candidate(paths, program_files_x86 + "\\Wireshark\\tshark.exe");
     const std::string path_env = ns_env_var("PATH");
     size_t start = 0;
     while (start <= path_env.size()) {
         const size_t end = path_env.find(';', start);
         std::string dir = path_env.substr(start, end == std::string::npos ? std::string::npos : end - start);
-        while (!dir.empty() && (dir.front() == '"' || dir.front() == ' '))
-            dir.erase(dir.begin());
-        while (!dir.empty() && (dir.back() == '"' || dir.back() == ' '))
-            dir.pop_back();
-        if (!dir.empty()) {
-            if (dir.back() == '\\' || dir.back() == '/')
-                ns_add_unique_path(paths, dir + "tshark.exe");
-            else
-                ns_add_unique_path(paths, dir + "\\tshark.exe");
-        }
+        ns_add_tshark_candidate(paths, dir);
         if (end == std::string::npos)
             break;
         start = end + 1;
+    }
+    char module_path[MAX_PATH] = {};
+    DWORD module_len = GetModuleFileNameA(nullptr, module_path, MAX_PATH);
+    if (module_len > 0 && module_len < MAX_PATH) {
+        std::filesystem::path base = std::filesystem::path(std::string(module_path, module_len)).parent_path();
+        for (int i = 0; i < 4 && !base.empty(); ++i) {
+            ns_add_tshark_base_candidates(paths, base);
+            base = base.parent_path();
+        }
+    }
+    std::error_code ec;
+    std::filesystem::path current = std::filesystem::current_path(ec);
+    if (!ec) {
+        for (int i = 0; i < 4 && !current.empty(); ++i) {
+            ns_add_tshark_base_candidates(paths, current);
+            current = current.parent_path();
+        }
     }
     return paths;
 }

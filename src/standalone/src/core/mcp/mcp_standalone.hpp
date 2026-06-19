@@ -28,13 +28,16 @@ namespace mcp_standalone
         bool        success = true;
         std::string text;
         json        data;
+        std::string error_code;
+        json        error_details;
 
-        static tool_result_t ok(const char* t) { return {true, std::string(t), {}}; }
-        static tool_result_t ok(const std::string& t) { return {true, t, {}}; }
-        static tool_result_t ok(const json& j) { return {true, j.dump(2), j}; }
-        static tool_result_t ok(const std::string& t, const json& d) { return {true, t, d}; }
-        static tool_result_t error(const std::string& e) { return {false, e, {}}; }
-        static tool_result_t error(const std::string& e, const json& d) { return {false, e, d}; }
+        static tool_result_t ok(const char* t) { return {true, std::string(t), {}, {}, {}}; }
+        static tool_result_t ok(const std::string& t) { return {true, t, {}, {}, {}}; }
+        static tool_result_t ok(const json& j) { return {true, j.dump(2), j, {}, {}}; }
+        static tool_result_t ok(const std::string& t, const json& d) { return {true, t, d, {}, {}}; }
+        static tool_result_t error(const std::string& e) { return {false, e, {}, {}, {}}; }
+        static tool_result_t error(const std::string& e, const json& d) { return {false, e, d, {}, {}}; }
+        static tool_result_t error(const std::string& e, const std::string& code, const json& d = json::object()) { return {false, e, d, code, d}; }
     };
 
     struct tool_param_t

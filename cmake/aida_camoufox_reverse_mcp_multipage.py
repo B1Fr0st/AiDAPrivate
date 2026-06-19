@@ -182,17 +182,64 @@ def patch_navigation_launch_params(path: pathlib.Path, text: str) -> str:
             f"navigation launch persistent signature {path}",
         )
     elif "bridge_generation: int | str | None = None" not in text:
-        text = replace_once(
-            text,
-            "    user_data_dir: str | None = None,\n"
-            ") -> dict:\n",
-            "    user_data_dir: str | None = None,\n"
-            "    bridge_generation: int | str | None = None,\n"
-            "    bridge_session_id: str | None = None,\n"
-            "    bridge_attempt_id: str | None = None,\n"
-            ") -> dict:\n",
-            f"navigation launch bridge diagnostics signature {path}",
-        )
+        if "    privacy_fail_closed: bool = True,\n" in text:
+            text = replace_once(
+                text,
+                "    privacy_fail_closed: bool = True,\n",
+                "    privacy_fail_closed: bool = True,\n"
+                "    bridge_generation: int | str | None = None,\n"
+                "    bridge_session_id: str | None = None,\n"
+                "    bridge_attempt_id: str | None = None,\n",
+                f"navigation launch bridge diagnostics signature {path}",
+            )
+        else:
+            text = replace_once(
+                text,
+                "    user_data_dir: str | None = None,\n"
+                ") -> dict:\n",
+                "    user_data_dir: str | None = None,\n"
+                "    bridge_generation: int | str | None = None,\n"
+                "    bridge_session_id: str | None = None,\n"
+                "    bridge_attempt_id: str | None = None,\n"
+                ") -> dict:\n",
+                f"navigation launch bridge diagnostics signature {path}",
+            )
+    if "service_workers: str | None = None" not in text:
+        if "    privacy_fail_closed: bool = True,\n" in text:
+            text = replace_once(
+                text,
+                "    privacy_fail_closed: bool = True,\n",
+                "    privacy_fail_closed: bool = True,\n"
+                "    service_workers: str | None = None,\n"
+                "    block_service_workers: bool = False,\n"
+                "    aida_fast_visible_launch: bool | None = None,\n"
+                "    aida_launch_policy_marker: str | None = None,\n",
+                f"navigation launch policy signature {path}",
+            )
+        elif "    bridge_attempt_id: str | None = None,\n" in text:
+            text = replace_once(
+                text,
+                "    bridge_attempt_id: str | None = None,\n",
+                "    bridge_attempt_id: str | None = None,\n"
+                "    service_workers: str | None = None,\n"
+                "    block_service_workers: bool = False,\n"
+                "    aida_fast_visible_launch: bool | None = None,\n"
+                "    aida_launch_policy_marker: str | None = None,\n",
+                f"navigation launch policy signature {path}",
+            )
+        else:
+            text = replace_once(
+                text,
+                "    user_data_dir: str | None = None,\n"
+                ") -> dict:\n",
+                "    user_data_dir: str | None = None,\n"
+                "    service_workers: str | None = None,\n"
+                "    block_service_workers: bool = False,\n"
+                "    aida_fast_visible_launch: bool | None = None,\n"
+                "    aida_launch_policy_marker: str | None = None,\n"
+                ") -> dict:\n",
+                f"navigation launch policy signature {path}",
+            )
     if "config[\"persistent_context\"] = True" not in text:
         text = replace_once(
             text,
@@ -237,7 +284,30 @@ def patch_navigation_launch_params(path: pathlib.Path, text: str) -> str:
             "        if proxy:\n",
             f"navigation launch bridge diagnostics config {path}",
         )
-    if "profile_dir: str | None = None" not in text or "config[\"persistent_context\"] = True" not in text or "bridge_generation: int | str | None = None" not in text:
+    if "config[\"service_workers\"] = str(service_workers)" not in text:
+        text = replace_once(
+            text,
+            "        if user_data_dir:\n"
+            "            config[\"user_data_dir\"] = user_data_dir\n",
+            "        if user_data_dir:\n"
+            "            config[\"user_data_dir\"] = user_data_dir\n"
+            "        if service_workers is not None:\n"
+            "            config[\"service_workers\"] = str(service_workers)\n"
+            "        if block_service_workers:\n"
+            "            config[\"block_service_workers\"] = True\n"
+            "        if aida_fast_visible_launch is not None:\n"
+            "            config[\"aida_fast_visible_launch\"] = bool(aida_fast_visible_launch)\n"
+            "        if aida_launch_policy_marker:\n"
+            "            config[\"aida_launch_policy_marker\"] = str(aida_launch_policy_marker)\n",
+            f"navigation launch policy config {path}",
+        )
+    if ("profile_dir: str | None = None" not in text or
+            "config[\"persistent_context\"] = True" not in text or
+            "bridge_generation: int | str | None = None" not in text or
+            "service_workers: str | None = None" not in text or
+            "aida_fast_visible_launch: bool | None = None" not in text or
+            "config[\"service_workers\"] = str(service_workers)" not in text or
+            "config[\"aida_fast_visible_launch\"] = bool(aida_fast_visible_launch)" not in text):
         fail(f"navigation launch persistent validation failed {path}")
     return text
 
@@ -483,6 +553,430 @@ def patch_browser_launch_deadline_diagnostics(text: str) -> str:
     return text
 
 
+def patch_browser_camoufox_stability(text: str) -> str:
+    if "AIDA_CAMOUFOX_BRIDGE_PATCH_ID" not in text:
+        text = replace_once(
+            text,
+            'PRIVACY_VERIFY_URL = "data:text/html,%3C!doctype%20html%3E%3Ctitle%3EAiDA%20Camoufox%3C/title%3E"\n',
+            'PRIVACY_VERIFY_URL = "data:text/html,%3C!doctype%20html%3E%3Ctitle%3EAiDA%20Camoufox%3C/title%3E"\n'
+            'AIDA_CAMOUFOX_BRIDGE_PATCH_ID = "aida_camoufox_bridge_20260619_2"\n',
+            "browser bridge patch id",
+        )
+    if "def _flag_enabled(value: Any) -> bool:" not in text:
+        helper = '''def _flag_enabled(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "enable", "enabled"}
+
+
+def _target_closed_error(exc: Exception) -> bool:
+    name = type(exc).__name__
+    text = str(exc)
+    return "TargetClosed" in name or "target closed" in text.lower() or "has been closed" in text.lower()
+
+
+'''
+        text, count = re.subn(
+            r"(def _int_config\(value: Any, fallback: int\) -> int:\n(?:    .+\n)+?    return parsed if parsed > 0 else fallback\n\n)",
+            r"\1" + helper,
+            text,
+            count=1,
+        )
+        if count != 1:
+            fail("browser stability helper anchor missing")
+    text = text.replace(
+        '    context_options: dict[str, Any] = {"service_workers": "block"}\n',
+        '    context_options: dict[str, Any] = {}\n'
+        '    service_worker_policy = str(cfg.get("service_workers") or "").strip().lower()\n'
+        '    if _flag_enabled(cfg.get("block_service_workers")) or service_worker_policy in {"block", "blocked", "disable", "disabled"}:\n'
+        '        context_options["service_workers"] = "block"\n'
+        '    elif service_worker_policy in {"allow", "allowed", "enable", "enabled"}:\n'
+        '        context_options["service_workers"] = "allow"\n',
+    )
+    text = re.sub(
+        r"def _fast_visible_privacy_plan\(plan: dict\[str, Any\]\) -> dict\[str, Any\]:\n(?:    .+\n)+?\n\ndef _fast_visible_firefox_user_prefs",
+        "def _fast_visible_privacy_plan(plan: dict[str, Any]) -> dict[str, Any]:\n"
+        "    return dict(plan)\n\n\n"
+        "def _fast_visible_firefox_user_prefs",
+        text,
+        count=1,
+    )
+    text = text.replace('    opts["service_workers"] = "block"\n', "")
+    text = text.replace(
+        '    return bool(cfg.get("aida_fast_visible_launch", True))\n',
+        '    requested = cfg.get("aida_fast_visible_launch")\n'
+        '    if requested is None:\n'
+        '        requested = _os.environ.get("AIDA_CAMOUFOX_FAST_VISIBLE_FALLBACK")\n'
+        '    return _flag_enabled(requested)\n',
+    )
+    if "aida_bridge_patch_active" not in text:
+        text = replace_once(
+            text,
+            "        cfg = {**self.default_config, **(config or {})}\n",
+            "        cfg = {**self.default_config, **(config or {})}\n"
+            "        _camoufox_debug(\n"
+            "            \"aida_bridge_patch_active\",\n"
+            "            patch_version=AIDA_CAMOUFOX_BRIDGE_PATCH_ID,\n"
+            "            default_launch_path=\"async_camoufox\",\n"
+            "            fast_visible_default=False,\n"
+            "            service_workers_default=\"allow\",\n"
+            "            ua_policy_default=\"camoufox_native\",\n"
+            "            request_marker=_safe_text(cfg.get(\"aida_launch_policy_marker\")),\n"
+            "            config_keys=sorted(str(k) for k in cfg.keys()),\n"
+            "        )\n",
+            "browser bridge patch active log",
+        )
+    text = text.replace(
+        '            patch_version="aida_camoufox_bridge_20260619_1",\n',
+        '            patch_version=AIDA_CAMOUFOX_BRIDGE_PATCH_ID,\n',
+    )
+    if "selected_launch_path=\"fast_visible_firefox_compat\" if fast_visible_launch else \"async_camoufox\"" not in text:
+        text = text.replace(
+            "        fast_visible_launch = _use_fast_visible_launch(cfg, bundled_visible_launch, profile_requested)\n",
+            "        fast_visible_launch = _use_fast_visible_launch(cfg, bundled_visible_launch, profile_requested)\n"
+            "        fast_visible_source = \"default\"\n"
+            "        if cfg.get(\"aida_fast_visible_launch\") is not None:\n"
+            "            fast_visible_source = \"request\"\n"
+            "        elif _os.environ.get(\"AIDA_CAMOUFOX_FAST_VISIBLE_FALLBACK\") is not None:\n"
+            "            fast_visible_source = \"env\"\n"
+            "        _camoufox_debug(\n"
+            "            \"aida_launch_policy_resolved\",\n"
+            "            patch_version=AIDA_CAMOUFOX_BRIDGE_PATCH_ID,\n"
+            "            selected_launch_path=\"fast_visible_firefox_compat\" if fast_visible_launch else \"async_camoufox\",\n"
+            "            fast_visible_source=fast_visible_source,\n"
+            "            bundled_visible=bool(bundled_visible_launch),\n"
+            "            profile_requested=bool(profile_requested),\n"
+            "            fast_visible_enabled=bool(fast_visible_launch),\n"
+            "            fast_visible_requested=_safe_text(cfg.get(\"aida_fast_visible_launch\")),\n"
+            "            fast_visible_env=bool(_os.environ.get(\"AIDA_CAMOUFOX_FAST_VISIBLE_FALLBACK\")),\n"
+            "            block_service_workers=bool(_flag_enabled(cfg.get(\"block_service_workers\"))),\n"
+            "            service_workers=_safe_text(cfg.get(\"service_workers\")),\n"
+            "            service_workers_default=\"allow\",\n"
+            "            context_service_workers=context_plan.get(\"context_options\", {}).get(\"service_workers\", \"\"),\n"
+            "            ua_policy=context_plan.get(\"ua_policy\"),\n"
+            "            ua_override=bool(context_plan.get(\"user_agent\")),\n"
+            "            request_marker=_safe_text(cfg.get(\"aida_launch_policy_marker\")),\n"
+            "        )\n",
+            1,
+        )
+    text = text.replace(
+        '        if fast_visible_launch:\n'
+        '            context_plan = _fast_visible_privacy_plan(context_plan)\n'
+        '        if context_plan.get("user_agent"):\n',
+        '        if fast_visible_launch:\n'
+        '            context_plan = _fast_visible_privacy_plan(context_plan)\n'
+        '            _camoufox_debug(\n'
+        '                "launch_fast_visible_compat_selected",\n'
+        '                requested=cfg.get("aida_fast_visible_launch"),\n'
+        '                env=bool(_os.environ.get("AIDA_CAMOUFOX_FAST_VISIBLE_FALLBACK")),\n'
+        '                ua_policy=context_plan.get("ua_policy"),\n'
+        '                service_workers=context_plan.get("context_options", {}).get("service_workers", "allow"),\n'
+        '            )\n'
+        '        if context_plan.get("user_agent"):\n',
+    )
+    text = text.replace(
+        '                ctx = await self.browser.new_context(service_workers="block")\n',
+        '                ctx = await self.browser.new_context()\n',
+    )
+    if '"browser_ready_ms": elapsed_ms' not in text:
+        text = replace_once(
+            text,
+            '                "privacy": privacy_info,\n'
+            '                "context_source": context_source,\n'
+            '            }\n',
+            '                "privacy": privacy_info,\n'
+            '                "context_source": context_source,\n'
+            '                "browser_ready_ms": elapsed_ms,\n'
+            '                "camoufox_launch_ms": elapsed_ms,\n'
+            '            }\n',
+            "browser normal launch timing diagnostics",
+        )
+        text = replace_once(
+            text,
+            '                "window_height": window_size[1],\n'
+            '                "diagnostics": diagnostics,\n'
+            '            }\n',
+            '                "window_height": window_size[1],\n'
+            '                "diagnostics": diagnostics,\n'
+            '                "browser_ready_ms": elapsed_ms,\n'
+            '                "camoufox_launch_ms": elapsed_ms,\n'
+            '            }\n',
+            "browser normal launch timing response",
+        )
+    if "def _handle_context_close_event" not in text:
+        text = text.replace(
+            "        listener_registered = False\n",
+            "        page_listener_registered = False\n"
+            "        close_listener_registered = False\n",
+            1,
+        )
+        text = text.replace(
+            "            listener_registered = True\n",
+            "            page_listener_registered = True\n",
+            1,
+        )
+        text = text.replace(
+            "        except Exception as exc:\n"
+            "            _camoufox_debug(\"context_listener_failed\", session_id=self.session_id, context_id=context_id, error_type=type(exc).__name__, error=_safe_text(exc, 300))\n",
+            "        except Exception as exc:\n"
+            "            _camoufox_debug(\"context_listener_failed\", session_id=self.session_id, context_id=context_id, error_type=type(exc).__name__, error=_safe_text(exc, 300))\n"
+            "        try:\n"
+            "            ctx.on(\"close\", lambda *_, cid=context_id, c=ctx: self._handle_context_close_event(cid, c))\n"
+            "            close_listener_registered = True\n"
+            "        except Exception as exc:\n"
+            "            _camoufox_debug(\"context_close_listener_failed\", session_id=self.session_id, context_id=context_id, error_type=type(exc).__name__, error_len=len(str(exc)), error_summary=_safe_text(exc, 300))\n",
+            1,
+        )
+        text = text.replace(
+            "            listener_registered=listener_registered,\n",
+            "            listener_registered=page_listener_registered,\n"
+            "            page_listener_registered=page_listener_registered,\n"
+            "            close_listener_registered=close_listener_registered,\n",
+            1,
+        )
+        handler = '''    def _handle_context_close_event(self, context_id: str, ctx: BrowserContext | None) -> None:
+        started = time.perf_counter()
+        pages_before = _context_page_count(ctx)
+        page_ids = [
+            pid for pid, meta in list(self.page_meta.items())
+            if meta.get("context_id") == context_id and pid in self.pages
+        ]
+        for pid in page_ids:
+            self._on_page_closed(pid, self.pages.get(pid), "context_close_event")
+        if ctx is not None:
+            self.context_ids.pop(id(ctx), None)
+        if self.contexts.get(context_id) is ctx:
+            self.contexts.pop(context_id, None)
+        _camoufox_debug(
+            "context_close_event",
+            session_id=self.session_id,
+            context_id=context_id,
+            elapsed_ms=int((time.perf_counter() - started) * 1000),
+            pages_before=pages_before,
+            pages_marked_closed=len(page_ids),
+            registered_contexts=len(self.contexts),
+            registered_pages=len(self.pages),
+            active_page_id=self.active_page_id or "",
+            browser_open=self.browser is not None,
+            browser_connected=self._browser_connected(),
+            process_tree=_process_tree_snapshot(),
+        )
+
+'''
+        text = text.replace("    def _queue_pending_page_id", handler + "    def _queue_pending_page_id", 1)
+    text = text.replace(
+        '        page.on("close", lambda *_, pid=page_id: self._on_page_closed(pid))\n',
+        '        page.on("close", lambda *_, pid=page_id, p=page: self._handle_page_close_event(p, pid))\n',
+    )
+    text = text.replace(
+        '            page.on("crash", lambda *_, pid=page_id: _camoufox_debug("page_crashed", session_id=self.session_id, page_id=pid, active_page_id=self.active_page_id, page_count=len(self.pages), context_count=len(self.contexts)))\n',
+        '            page.on("crash", lambda *_, pid=page_id, p=page: self._handle_page_crash_event(p, pid))\n',
+    )
+    if "self._page_terminal_ids: set[str] = set()" not in text:
+        text = text.replace(
+            "        self._listener_page_ids: set[str] = set()\n",
+            "        self._listener_page_ids: set[str] = set()\n"
+            "        self._page_terminal_ids: set[str] = set()\n",
+        )
+        text = text.replace(
+            "        self._listener_page_ids.clear()\n",
+            "        self._listener_page_ids.clear()\n"
+            "        self._page_terminal_ids.clear()\n",
+        )
+    if "self._page_terminal_ids.discard(page_id)" not in text:
+        text = text.replace(
+            "        created = page_id not in self.pages\n"
+            "        self.pages[page_id] = page\n",
+            "        created = page_id not in self.pages\n"
+            "        self._page_terminal_ids.discard(page_id)\n"
+            "        self.pages[page_id] = page\n",
+        )
+    if "def _schedule_page_lifecycle_log" not in text:
+        schedule_block = '''    def _schedule_page_lifecycle_log(self, event: str, page: Page | None, page_id: str, started: float | None = None, exc: Exception | None = None) -> None:
+        async def emit() -> None:
+            event_started = started or time.perf_counter()
+            try:
+                state = await self._launch_debug_snapshot(event, event_started, None, page=page, page_id=page_id, exc=exc)
+                _camoufox_debug(
+                    event,
+                    session_id=self.session_id,
+                    page_id=page_id,
+                    elapsed_ms=int((time.perf_counter() - event_started) * 1000),
+                    state=state,
+                )
+            except Exception as log_exc:
+                _camoufox_debug(
+                    f"{event}_log_failed",
+                    session_id=self.session_id,
+                    page_id=page_id,
+                    error_type=type(log_exc).__name__,
+                    error_len=len(str(log_exc)),
+                    error_summary=_safe_text(log_exc),
+                )
+        try:
+            asyncio.get_running_loop().create_task(emit())
+        except RuntimeError as loop_exc:
+            _camoufox_debug(
+                f"{event}_log_unavailable",
+                session_id=self.session_id,
+                page_id=page_id,
+                error_type=type(loop_exc).__name__,
+                error_len=len(str(loop_exc)),
+                error_summary=_safe_text(loop_exc),
+                process_tree=_process_tree_snapshot(),
+            )
+
+'''
+        lifecycle_anchor = "    def _handle_page_close_event" if "    def _handle_page_close_event" in text else "    def _on_page_closed"
+        text = text.replace(lifecycle_anchor, schedule_block + lifecycle_anchor, 1)
+    if "def _mark_page_terminal" not in text:
+        terminal_block = '''    def _handle_page_close_event(self, page: Page | None, page_id: str) -> None:
+        started = time.perf_counter()
+        self._schedule_page_lifecycle_log("page_close_event", page, page_id, started)
+        self._on_page_closed(page_id, page, "close_event")
+
+    def _handle_page_crash_event(self, page: Page | None, page_id: str) -> None:
+        self._schedule_page_lifecycle_log("page_crash_event", page, page_id)
+        self._on_page_crashed(page_id, page, "crash_event")
+
+    def _next_live_page_id(self, excluded_page_id: str) -> str | None:
+        for candidate_id, candidate in list(self.pages.items()):
+            if candidate_id == excluded_page_id:
+                continue
+            if not self._page_closed(candidate):
+                return candidate_id
+        return None
+
+    def _mark_page_terminal(self, page_id: str, page: Page | None, reason: str, source: str, exc: Exception | None = None) -> bool:
+        already_terminal = page_id in self._page_terminal_ids
+        stored_page = self.pages.pop(page_id, None)
+        page = page or stored_page
+        meta = self.page_meta.setdefault(page_id, {"page_id": page_id})
+        if bool(meta.get("closed")) and stored_page is None:
+            already_terminal = True
+        now_ms = int(time.time() * 1000)
+        meta["closed"] = True
+        meta["closed_ms"] = meta.get("closed_ms") or now_ms
+        meta["terminal_reason"] = reason
+        meta["terminal_source"] = source
+        if reason == "crashed":
+            meta["crashed"] = True
+            meta["crashed_ms"] = meta.get("crashed_ms") or now_ms
+        guid = meta.get("guid") or (self._page_guid(page) if page else "")
+        if guid:
+            self._page_guid_to_id.pop(str(guid), None)
+        self._listener_page_ids.discard(page_id)
+        self._page_terminal_ids.add(page_id)
+        if self.active_page_id == page_id:
+            self.active_page_id = self._next_live_page_id(page_id)
+            self.active_page_name = self.active_page_id
+        event_name = "page_crashed" if reason == "crashed" else "page_closed"
+        _camoufox_debug(
+            event_name,
+            session_id=self.session_id,
+            page_id=page_id,
+            active=self.active_page_id or "",
+            page_count=len(self.pages),
+            context_count=len(self.contexts),
+            browser_open=self.browser is not None,
+            browser_connected=self._browser_connected(),
+            guid=str(guid or ""),
+            meta_context_id=meta.get("context_id", ""),
+            duplicate=already_terminal,
+            reason=reason,
+            source=source,
+            error_type=type(exc).__name__ if exc else "",
+            error_summary=_safe_text(exc, 300) if exc else "",
+            process_tree=_process_tree_snapshot(),
+        )
+        return not already_terminal
+
+    def _on_page_closed(self, page_id: str, page: Page | None = None, source: str = "manual", exc: Exception | None = None) -> bool:
+        return self._mark_page_terminal(page_id, page, "closed", source, exc)
+
+    def _on_page_crashed(self, page_id: str, page: Page | None = None, source: str = "manual", exc: Exception | None = None) -> bool:
+        return self._mark_page_terminal(page_id, page, "crashed", source, exc)
+
+    def page_id_for'''
+        text = re.sub(
+            r"    def _handle_page_close_event\(self, page: Page \| None, page_id: str\) -> None:\n(?:    .+\n)+?\n    def page_id_for",
+            terminal_block,
+            text,
+            count=1,
+        )
+        if "def _mark_page_terminal" not in text:
+            text = re.sub(
+                r"    def _on_page_closed\(self, page_id: str\) -> None:\n(?:    .+\n)+?\n    def page_id_for",
+                terminal_block,
+                text,
+                count=1,
+            )
+    if "close_page_target_closed" not in text:
+        text = text.replace(
+            '        except Exception as exc:\n'
+            '            _camoufox_debug(\n'
+            '                "close_page_failed",\n',
+            '        except Exception as exc:\n'
+            '            if _target_closed_error(exc):\n'
+            '                self._on_page_closed(pid, page, "close_page_target_closed", exc)\n'
+            '                _camoufox_debug(\n'
+            '                    "close_page_target_closed",\n'
+            '                    session_id=self.session_id,\n'
+            '                    page_id=pid,\n'
+            '                    elapsed_ms=int((time.perf_counter() - started) * 1000),\n'
+            '                    state=await self._launch_debug_snapshot("close_page_target_closed", started, 15000, page=page, page_id=pid, exc=exc),\n'
+            '                )\n'
+            '                return {"status": "closed", "page_id": pid, "active_page_id": self.active_page_id, "page_count": len(self.pages)}\n'
+            '            _camoufox_debug(\n'
+            '                "close_page_failed",\n',
+            1,
+        )
+        text = text.replace(
+            '        self._on_page_closed(pid)\n'
+            '        _camoufox_debug(\n'
+            '            "close_page_done",\n',
+            '        self._on_page_closed(pid, page, "close_page")\n'
+            '        _camoufox_debug(\n'
+            '            "close_page_done",\n',
+            1,
+        )
+    text = text.replace(
+        "            self._on_page_closed(pid)\n"
+        "            raise RuntimeError(f\"Page is closed: {pid}\")\n",
+        "            self._on_page_closed(pid, page, \"resolve_closed\")\n"
+        "            raise RuntimeError(f\"Page is closed: {pid}\")\n",
+    )
+    required = (
+        "def _flag_enabled",
+        "AIDA_CAMOUFOX_FAST_VISIBLE_FALLBACK",
+        "AIDA_CAMOUFOX_BRIDGE_PATCH_ID",
+        "aida_bridge_patch_active",
+        "aida_launch_policy_resolved",
+        "selected_launch_path",
+        "block_service_workers",
+        '"browser_ready_ms": elapsed_ms',
+        '"camoufox_launch_ms": elapsed_ms',
+        "def _mark_page_terminal",
+        "context_close_event",
+        "close_page_target_closed",
+        "page_crashed",
+    )
+    for marker in required:
+        if marker not in text:
+            fail(f"browser stability validation missing {marker}")
+    forbidden = (
+        'return bool(cfg.get("aida_fast_visible_launch", True))',
+        'context_options: dict[str, Any] = {"service_workers": "block"}',
+        'ctx = await self.browser.new_context(service_workers="block")',
+    )
+    for marker in forbidden:
+        if marker in text:
+            fail(f"browser stability validation forbidden marker {marker}")
+    return text
+
+
 def patch_browser(path: pathlib.Path) -> None:
     text = read_text(path)
     if "self._aida_multipage_patch = 4" in text:
@@ -531,6 +1025,7 @@ def patch_browser(path: pathlib.Path) -> None:
                 "browser v4 page privacy guard",
             )
         updated = patch_browser_launch_deadline_diagnostics(updated)
+        updated = patch_browser_camoufox_stability(updated)
         if updated != text:
             write_text(path, updated)
         return
@@ -580,6 +1075,7 @@ def patch_browser(path: pathlib.Path) -> None:
                 "browser v3 page privacy guard",
             )
         updated = patch_browser_launch_deadline_diagnostics(updated)
+        updated = patch_browser_camoufox_stability(updated)
         if updated != text:
             write_text(path, updated)
         return
@@ -649,6 +1145,7 @@ def patch_browser(path: pathlib.Path) -> None:
         if "self._pending_page_ids_by_context" not in updated or "self._pop_pending_page_id(cid)" not in updated or "page_privacy_verified" not in updated:
             fail("browser v2 upgrade missing pending page id support")
         updated = patch_browser_launch_deadline_diagnostics(updated)
+        updated = patch_browser_camoufox_stability(updated)
         write_text(path, updated)
         return
     text = replace_once(
@@ -1158,7 +1655,8 @@ def patch_browser(path: pathlib.Path) -> None:
         "        self._nav_responses_by_page.clear()\n"
         "        self._route_handlers.clear()\n",
     )
-    for marker in ("self._aida_multipage_patch = 4", "async def list_pages", "async def resolve_page", "page_id", "active_page_id", "_pending_page_ids_by_context", "page_privacy_verified"):
+    text = patch_browser_camoufox_stability(text)
+    for marker in ("self._aida_multipage_patch = 4", "async def list_pages", "async def resolve_page", "page_id", "active_page_id", "_pending_page_ids_by_context", "page_privacy_verified", "def _mark_page_terminal", "AIDA_CAMOUFOX_FAST_VISIBLE_FALLBACK", "aida_camoufox_bridge_20260619_2", "aida_bridge_patch_active", "aida_launch_policy_resolved", "context_close_event"):
         if marker not in text:
             fail(f"browser validation missing {marker}")
     write_text(path, text)
@@ -1966,6 +2464,7 @@ def main() -> None:
     bases = [
         ROOT / "deps" / "camoufox-reverse-mcp" / "src" / "camoufox_reverse_mcp",
         ROOT / "deps" / "camoufox-runtime" / "Lib" / "site-packages" / "camoufox_reverse_mcp",
+        ROOT / "deps" / "AiDA_CamoufoxReverseMcp" / "_internal" / "camoufox_reverse_mcp",
     ]
     patched = 0
     for base in bases:

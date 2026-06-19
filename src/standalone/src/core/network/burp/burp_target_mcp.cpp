@@ -33,6 +33,15 @@ namespace {
 using json = nlohmann::json;
 using tool_result_t = mcp_standalone::tool_result_t;
 
+tool_result_t target_param_error(const std::string& message, const std::string& parameter, const std::string& code = "invalid_param")
+{
+    json d;
+    d["success"] = false;
+    d["parameter"] = parameter;
+    d["code"] = code;
+    return tool_result_t::error(message, code, d);
+}
+
 std::string trim_lower(const std::string& s)
 {
     std::string r;
@@ -143,13 +152,32 @@ tool_result_t sitemap_send_to(const json& args)
 tool_result_t scope_add(const json& args)
 {
     diag::log_tagged_fmt("mcp_burp", "scope_add entry");
+    json normalized = args.is_object() ? args : json::object();
+    if ((!normalized.contains("host_pattern") || !normalized["host_pattern"].is_string() || normalized["host_pattern"].get<std::string>().empty()) &&
+        normalized.contains("url") && normalized["url"].is_string()) {
+        const std::string url = normalized["url"].get<std::string>();
+        const scope::parsed_url_t parsed = scope::parse_url(url);
+        if (!parsed.valid) {
+            diag::log_tagged_fmt("mcp_burp", "scope_add invalid_url url=%s", url.c_str());
+            return target_param_error("Invalid 'url' for scope rule", "url");
+        }
+        normalized["host_pattern"] = parsed.host;
+        if (!normalized.contains("protocol") || !normalized["protocol"].is_string())
+            normalized["protocol"] = parsed.scheme;
+        if ((!normalized.contains("port") || !normalized["port"].is_number_integer()) &&
+            !((parsed.scheme == "http" && parsed.port == 80) || (parsed.scheme == "https" && parsed.port == 443))) {
+            normalized["port"] = parsed.port;
+        }
+        diag::log_tagged_fmt("mcp_burp", "scope_add normalized url=%s host_pattern=%s protocol=%s port=%u",
+            url.c_str(), parsed.host.c_str(), parsed.scheme.c_str(), static_cast<unsigned>(parsed.port));
+    }
     scope::rule_t r;
-    if (!scope::rule_from_json(args, r)) {
+    if (!scope::rule_from_json(normalized, r)) {
         diag::log_tagged_fmt("mcp_burp", "scope_add invalid_rule");
-        return tool_result_t::error("Invalid rule payload");
+        return target_param_error("Invalid rule payload", "payload");
     }
     if (r.host_pattern.empty()) {
-        return tool_result_t::error("'host_pattern' required");
+        return target_param_error("'host_pattern' required", "host_pattern", "missing_required");
     }
     const uint64_t id = scope::add_rule(r);
     diag::log_tagged_fmt("mcp_burp", "scope_add ok rule_id=%llu pattern=%s", static_cast<unsigned long long>(id), r.host_pattern.c_str());
@@ -396,7 +424,10 @@ void register_target_tools(mcp_standalone::server_t& srv)
         "burp_scope_manage", "burp",
         "Manage Burp scope rules. Actions: add, remove, list, check.",
         {{"action", "string", "add|remove|list|check", true},
-         {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted.", false}},
+         {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted.", false},
+         {"url", "string", "For add/check; add normalizes url to host_pattern when host_pattern is omitted.", false},
+         {"host_pattern", "string", "Scope host pattern for add, for example example.com or *.example.com", false},
+         {"rule_id", "number", "Rule id for remove", false}},
         [](const json& params) -> tool_result_t {
             const std::string action = compat_action_name(params);
             const json p = compat_action_payload(params);

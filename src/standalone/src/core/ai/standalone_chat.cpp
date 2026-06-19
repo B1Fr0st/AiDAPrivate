@@ -2510,18 +2510,16 @@ void shutdown_standalone_chat()
     aida::auth_view::shutdown();
 
     (void)aida::session::shutdown();
+    standalone_license::stop_background_workers("chat.shutdown_pre_driver", 5000);
+    driver_bridge::shutdown("chat.shutdown_pre_queues");
     aida::events::shutdown();
+    standalone_license::shutdown();
     critical_work_queue::shutdown();
     work_queue::shutdown();
 
     persist_workspace_state();
     g_sa_settings.save();
-    standalone_license::shutdown();
     g_sa_ai_client.reset();
-
-
-    if (driver_bridge::using_kernel_driver())
-        driver_bridge::unregister_dll_protection();
 
     s_initialized = false;
     diag::log_tagged("chat", "shutdown_standalone_chat done");

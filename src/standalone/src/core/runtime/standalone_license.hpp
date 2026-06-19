@@ -15,6 +15,7 @@ namespace standalone_license
     bool is_valid();
     std::string plan();
     std::string last_error();
+    void stop_background_workers(const char* reason = nullptr, uint32_t timeout_ms = 5000);
     void shutdown();
     void invalidate_for_enforcement(const char* reason);
 

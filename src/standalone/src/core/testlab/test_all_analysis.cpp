@@ -192,6 +192,27 @@ static std::string format_win32_error_text(DWORD err) {
     return text;
 }
 
+static bool analysis_process_alive_by_pid(uint32_t pid, uint32_t* exit_code_out = nullptr) {
+    if (exit_code_out)
+        *exit_code_out = 0;
+    if (pid == 0)
+        return false;
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) {
+        const DWORD err = GetLastError();
+        if (exit_code_out)
+            *exit_code_out = err;
+        return err == ERROR_ACCESS_DENIED;
+    }
+    DWORD exit_code = 0;
+    const BOOL ok = GetExitCodeProcess(h, &exit_code);
+    const DWORD err = ok ? 0 : GetLastError();
+    CloseHandle(h);
+    if (exit_code_out)
+        *exit_code_out = ok ? static_cast<uint32_t>(exit_code) : err;
+    return ok && exit_code == STILL_ACTIVE;
+}
+
 static void close_handle_if_open(HANDLE& h) {
     if (h && h != INVALID_HANDLE_VALUE) {
         CloseHandle(h);
@@ -401,9 +422,20 @@ static bool wait_integrity_hunter_sidecar_ready(HANDLE hf, const char* tag, cons
     }
 }
 
-static bool restore_integrity_primary_pid(HANDLE hf, const char* tag, uint32_t primary_pid) {
-    if (primary_pid == 0)
+static bool restore_integrity_primary_pid(HANDLE hf, const char* tag, uint32_t primary_pid, uint32_t sidecar_pid = 0, const char* phase = "restore") {
+    const uint32_t active_before = driver_bridge::attached_pid();
+    const DWORD started = GetTickCount();
+    if (primary_pid == 0) {
+        log_msg(hf, tag, "SIDE-FIXTURE-RESTORE -- phase=%s primary_pid=0 sidecar_pid=%u active_before=%u method=no_primary restored=1 active_now=%u status=\"%s\" last_error=\"%s\" elapsed_ms=%lu",
+            phase ? phase : "restore",
+            (unsigned)sidecar_pid,
+            active_before,
+            driver_bridge::attached_pid(),
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str(),
+            static_cast<unsigned long>(GetTickCount() - started));
         return true;
+    }
     bool known = false;
     for (uint32_t attached_pid : driver_bridge::attached_pids()) {
         if (attached_pid == primary_pid) {
@@ -411,22 +443,50 @@ static bool restore_integrity_primary_pid(HANDLE hf, const char* tag, uint32_t p
             break;
         }
     }
-    if (!known && !driver_bridge::attach_additional(primary_pid)) {
-        log_msg(hf, tag, "WARN -- primary target restore attach_additional failed pid=%u active_now=%u status=\"%s\" last_error=\"%s\"",
-            (unsigned)primary_pid,
-            driver_bridge::attached_pid(),
-            driver_bridge::status().c_str(),
-            driver_bridge::last_error().c_str());
-        return false;
+    uint32_t primary_code = 0;
+    const bool primary_alive = analysis_process_alive_by_pid(primary_pid, &primary_code);
+    uint32_t sidecar_code = 0;
+    const bool sidecar_alive = sidecar_pid != 0 && analysis_process_alive_by_pid(sidecar_pid, &sidecar_code);
+    bool restored = active_before == primary_pid;
+    const char* method = restored ? "already_active" : "none";
+    if (!restored && known) {
+        method = "set_active";
+        restored = driver_bridge::set_active_pid(primary_pid);
     }
-    const bool restored = driver_bridge::set_active_pid(primary_pid);
-    log_msg(hf, tag, "SIDE-FIXTURE-RESTORE -- primary_pid=%u restored=%d active_now=%u status=\"%s\" last_error=\"%s\"",
+    if (!restored && primary_alive) {
+        method = "attach_additional";
+        const bool attached = driver_bridge::attach_additional(primary_pid);
+        if (attached) {
+            method = "attach_additional_set_active";
+            restored = driver_bridge::set_active_pid(primary_pid);
+        }
+    }
+    if (!restored && primary_alive) {
+        method = "attach";
+        restored = driver_bridge::attach(primary_pid);
+    }
+    const uint32_t active_now = driver_bridge::attached_pid();
+    uint32_t bridge_code = 0;
+    const bool bridge_alive = active_now == primary_pid && driver_bridge::attached_process_alive(&bridge_code);
+    log_msg(hf, tag, "SIDE-FIXTURE-RESTORE -- phase=%s sidecar_pid=%u primary_pid=%u active_before=%u known=%d method=%s restored=%d active_now=%u primary_alive=%d primary_code=0x%08X sidecar_alive=%d sidecar_code=0x%08X bridge_alive=%d bridge_code=0x%08X status=\"%s\" last_error=\"%s\" elapsed_ms=%lu",
+        phase ? phase : "restore",
+        (unsigned)sidecar_pid,
         (unsigned)primary_pid,
+        active_before,
+        known ? 1 : 0,
+        method,
         restored ? 1 : 0,
-        driver_bridge::attached_pid(),
+        active_now,
+        primary_alive ? 1 : 0,
+        primary_code,
+        sidecar_alive ? 1 : 0,
+        sidecar_code,
+        bridge_alive ? 1 : 0,
+        bridge_code,
         driver_bridge::status().c_str(),
-        driver_bridge::last_error().c_str());
-    return restored;
+        driver_bridge::last_error().c_str(),
+        static_cast<unsigned long>(GetTickCount() - started));
+    return restored && bridge_alive;
 }
 
 static void close_integrity_hunter_sidecar(HANDLE hf, const char* tag, integrity_hunter_sidecar_t& sidecar, bool force) {
@@ -480,9 +540,10 @@ struct integrity_hunter_sidecar_scope_t {
     integrity_hunter_sidecar_scope_t(HANDLE h, const char* t, uint32_t p) : hf(h), tag(t), primary_pid(p) {}
 
     ~integrity_hunter_sidecar_scope_t() {
+        const uint32_t sidecar_pid_snapshot = sidecar.pid;
         if (active)
             close_integrity_hunter_sidecar(hf, tag, sidecar, true);
-        restore_integrity_primary_pid(hf, tag, primary_pid);
+        restore_integrity_primary_pid(hf, tag, primary_pid, sidecar_pid_snapshot, "scope_exit");
     }
 
     bool start(DWORD timeout_ms) {

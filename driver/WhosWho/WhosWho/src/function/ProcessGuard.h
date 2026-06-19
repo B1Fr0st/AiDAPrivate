@@ -12,6 +12,7 @@
 
 namespace dll_protection {
     ULONG cleanup_for_pid(UINT32 pid);
+    BOOLEAN has_tracked_pid(UINT32 pid);
 }
 
 namespace process_guard {
@@ -23,6 +24,43 @@ namespace process_guard {
     inline volatile UINT64 g_bridge_region_end = 0;
     inline volatile LONG g_create_notify_registered = 0;
     inline volatile LONG g_thread_notify_registered = 0;
+
+    __forceinline bool tracked_process_exit_needs_cleanup(
+        UINT32 dying_pid,
+        HANDLE registered,
+        bool* out_registered_client,
+        bool* out_canary_possible,
+        bool* out_dprt_tracked,
+        bool* out_adbg_target,
+        bool* out_admp_target,
+        bool* out_antidump_protected,
+        bool* out_permitted_pid)
+    {
+        bool registered_client = registered &&
+            reinterpret_cast<UINT64>(registered) == static_cast<UINT64>(dying_pid);
+        bool canary_possible = anti_dma_canary::g_canary_count != 0;
+        bool dprt_tracked = dll_protection::has_tracked_pid(dying_pid) ? true : false;
+        bool adbg_target = continuous_anti_debug::g_target_pid == dying_pid;
+        bool admp_target = continuous_anti_dump::g_target_pid == dying_pid;
+        bool antidump_protected = anti_dump_kernel::g_protected_pid == dying_pid;
+        bool permitted_pid = anti_dump_kernel::is_permitted_pid(dying_pid);
+
+        if (out_registered_client) *out_registered_client = registered_client;
+        if (out_canary_possible) *out_canary_possible = canary_possible;
+        if (out_dprt_tracked) *out_dprt_tracked = dprt_tracked;
+        if (out_adbg_target) *out_adbg_target = adbg_target;
+        if (out_admp_target) *out_admp_target = admp_target;
+        if (out_antidump_protected) *out_antidump_protected = antidump_protected;
+        if (out_permitted_pid) *out_permitted_pid = permitted_pid;
+
+        return registered_client ||
+            canary_possible ||
+            dprt_tracked ||
+            adbg_target ||
+            admp_target ||
+            antidump_protected ||
+            permitted_pid;
+    }
 
     constexpr ACCESS_MASK DEBUG_GRADE_ACCESS =
         PROCESS_VM_WRITE | PROCESS_CREATE_THREAD |
@@ -509,18 +547,41 @@ namespace process_guard {
         if (!CreateInfo) {
             UINT32 dying_pid = static_cast<UINT32>(reinterpret_cast<ULONG_PTR>(ProcessId));
             if (dying_pid != 0 && dying_pid != 4) {
+                HANDLE registered = caller_validation::g_registered_client_pid;
+                bool registered_client = false;
+                bool canary_possible = false;
+                bool dprt_tracked = false;
+                bool adbg_target = false;
+                bool admp_target = false;
+                bool antidump_protected = false;
+                bool permitted_pid = false;
+                if (!tracked_process_exit_needs_cleanup(
+                        dying_pid,
+                        registered,
+                        &registered_client,
+                        &canary_possible,
+                        &dprt_tracked,
+                        &adbg_target,
+                        &admp_target,
+                        &antidump_protected,
+                        &permitted_pid)) {
+                    return;
+                }
+
                 char dying_image[32] = {};
                 copy_process_object_image_for_log(Process, dying_image, sizeof(dying_image));
-                ULONG cleared = anti_dma_canary::cleanup_for_pid(dying_pid);
-                ULONG dprt_cleared = dll_protection::cleanup_for_pid(dying_pid);
-                InvalidateDTBCache(dying_pid);
-                continuous_anti_debug::stop_if_target(dying_pid);
-                continuous_anti_dump::stop_if_target(dying_pid);
-                BOOLEAN permitted_evicted = anti_dump_kernel::remove_permitted_pid(dying_pid) ? TRUE : FALSE;
-                HANDLE registered = caller_validation::g_registered_client_pid;
-                const bool registered_client = registered &&
-                    reinterpret_cast<UINT64>(registered) == static_cast<UINT64>(dying_pid);
-                WW_LOG("create_process_notify: pid=%u exited image='%s' current_pid=%llu irql=%lu canaries_cleared=%lu dprt_slots_cleared=%lu permitted_evict=%lu registered_client=%lu",
+                ULONG cleared = canary_possible ? anti_dma_canary::cleanup_for_pid(dying_pid) : 0;
+                ULONG dprt_cleared = dprt_tracked ? dll_protection::cleanup_for_pid(dying_pid) : 0;
+                if (registered || cleared || dprt_cleared || adbg_target || admp_target || antidump_protected)
+                    InvalidateDTBCache(dying_pid);
+                if (adbg_target)
+                    continuous_anti_debug::stop_if_target(dying_pid);
+                if (admp_target)
+                    continuous_anti_dump::stop_if_target(dying_pid);
+                if (antidump_protected)
+                    anti_dump_kernel::cleanup();
+                BOOLEAN permitted_evicted = permitted_pid && anti_dump_kernel::remove_permitted_pid(dying_pid) ? TRUE : FALSE;
+                WW_LOG("create_process_notify: pid=%u exited image='%s' current_pid=%llu irql=%lu canaries_cleared=%lu dprt_slots_cleared=%lu permitted_evict=%lu registered_client=%lu canary_possible=%lu dprt_tracked=%lu adbg_target=%lu admp_target=%lu antidump_protected=%lu",
                     dying_pid,
                     dying_image,
                     reinterpret_cast<UINT64>(PsGetCurrentProcessId()),
@@ -528,9 +589,13 @@ namespace process_guard {
                     cleared,
                     dprt_cleared,
                     static_cast<ULONG>(permitted_evicted ? 1 : 0),
-                    static_cast<ULONG>(registered_client ? 1 : 0));
-                if (registered &&
-                    reinterpret_cast<UINT64>(registered) == static_cast<UINT64>(dying_pid)) {
+                    static_cast<ULONG>(registered_client ? 1 : 0),
+                    static_cast<ULONG>(canary_possible ? 1 : 0),
+                    static_cast<ULONG>(dprt_tracked ? 1 : 0),
+                    static_cast<ULONG>(adbg_target ? 1 : 0),
+                    static_cast<ULONG>(admp_target ? 1 : 0),
+                    static_cast<ULONG>(antidump_protected ? 1 : 0));
+                if (registered_client) {
                     dispatcher::reset_dynamic_session_state("registered_client_exit", registered, cleared, FALSE);
                     WW_LOG("create_process_notify: registered client pid=%u exited, session reset (canaries_cleared=%lu)",
                         dying_pid, cleared);

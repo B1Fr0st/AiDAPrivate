@@ -6,6 +6,7 @@ set(AIDA_CAMOUFOX_REPO_MCP_ROOT "${CMAKE_CURRENT_LIST_DIR}/../camoufox-reverse-m
 set(AIDA_CAMOUFOX_STAGE_MCP_ROOTS
     "${AIDA_CAMOUFOX_STAGE_ROOT}/deps/camoufox-reverse-mcp/src/camoufox_reverse_mcp"
     "${AIDA_CAMOUFOX_STAGE_ROOT}/deps/camoufox-runtime/Lib/site-packages/camoufox_reverse_mcp"
+    "${AIDA_CAMOUFOX_STAGE_ROOT}/deps/AiDA_CamoufoxReverseMcp/_internal/camoufox_reverse_mcp"
 )
 set(AIDA_CAMOUFOX_SOURCE_SYNC_FILES
     "browser.py"
@@ -60,7 +61,13 @@ if(EXISTS "${AIDA_CAMOUFOX_REPO_BROWSER_PATH}" AND EXISTS "${AIDA_CAMOUFOX_REPO_
         "async def select_page"
         "async def close_page"
         "async def resolve_page"
-        "async def page_envelope")
+        "async def page_envelope"
+        "def _mark_page_terminal"
+        "AIDA_CAMOUFOX_FAST_VISIBLE_FALLBACK"
+        "aida_camoufox_bridge_20260619_2"
+        "aida_bridge_patch_active"
+        "aida_launch_policy_resolved"
+        "context_close_event")
         string(FIND "${AIDA_CAMOUFOX_REPO_BROWSER_CONTENT}" "${AIDA_CAMOUFOX_REQUIRED_BROWSER_MARKER}" AIDA_CAMOUFOX_REQUIRED_BROWSER_MARKER_POS)
         if(AIDA_CAMOUFOX_REQUIRED_BROWSER_MARKER_POS EQUAL -1)
             message(FATAL_ERROR "Root Camoufox reverse-MCP browser source is missing required marker ${AIDA_CAMOUFOX_REQUIRED_BROWSER_MARKER}: ${AIDA_CAMOUFOX_REPO_BROWSER_PATH}")
@@ -92,9 +99,124 @@ foreach(AIDA_CAMOUFOX_SOURCE_SYNC_FILE IN LISTS AIDA_CAMOUFOX_SOURCE_SYNC_FILES)
     endforeach()
 endforeach()
 
+set(AIDA_CAMOUFOX_NAV_PATCH_FILES
+    "${AIDA_CAMOUFOX_STAGE_ROOT}/deps/camoufox-reverse-mcp/src/camoufox_reverse_mcp/tools/navigation.py"
+    "${AIDA_CAMOUFOX_STAGE_ROOT}/deps/camoufox-runtime/Lib/site-packages/camoufox_reverse_mcp/tools/navigation.py"
+    "${AIDA_CAMOUFOX_STAGE_ROOT}/deps/AiDA_CamoufoxReverseMcp/_internal/camoufox_reverse_mcp/tools/navigation.py"
+)
+
+foreach(AIDA_CAMOUFOX_NAV_PATCH_FILE IN LISTS AIDA_CAMOUFOX_NAV_PATCH_FILES)
+    if(NOT EXISTS "${AIDA_CAMOUFOX_NAV_PATCH_FILE}")
+        continue()
+    endif()
+    file(READ "${AIDA_CAMOUFOX_NAV_PATCH_FILE}" AIDA_CAMOUFOX_NAV_CONTENT)
+    set(AIDA_CAMOUFOX_NAV_ORIGINAL "${AIDA_CAMOUFOX_NAV_CONTENT}")
+    string(REPLACE "\r\n" "\n" AIDA_CAMOUFOX_NAV_CONTENT "${AIDA_CAMOUFOX_NAV_CONTENT}")
+    string(REPLACE "\r" "\n" AIDA_CAMOUFOX_NAV_CONTENT "${AIDA_CAMOUFOX_NAV_CONTENT}")
+
+    string(FIND "${AIDA_CAMOUFOX_NAV_CONTENT}" "service_workers: str | None = None" AIDA_CAMOUFOX_NAV_SERVICE_WORKERS_SIG_POS)
+    if(AIDA_CAMOUFOX_NAV_SERVICE_WORKERS_SIG_POS EQUAL -1)
+        string(REPLACE [=[    privacy_fail_closed: bool = True,
+]=]
+[=[    privacy_fail_closed: bool = True,
+    service_workers: str | None = None,
+    block_service_workers: bool = False,
+    aida_fast_visible_launch: bool | None = None,
+    aida_launch_policy_marker: str | None = None,
+]=]
+            AIDA_CAMOUFOX_NAV_CONTENT "${AIDA_CAMOUFOX_NAV_CONTENT}")
+    endif()
+
+    string(FIND "${AIDA_CAMOUFOX_NAV_CONTENT}" "bridge_generation: int | str | None = None" AIDA_CAMOUFOX_NAV_BRIDGE_SIG_POS)
+    if(AIDA_CAMOUFOX_NAV_BRIDGE_SIG_POS EQUAL -1)
+        string(REPLACE [=[    user_data_dir: str | None = None,
+    privacy_fail_closed: bool = True,
+]=]
+[=[    user_data_dir: str | None = None,
+    privacy_fail_closed: bool = True,
+    bridge_generation: int | str | None = None,
+    bridge_session_id: str | None = None,
+    bridge_attempt_id: str | None = None,
+]=]
+            AIDA_CAMOUFOX_NAV_CONTENT "${AIDA_CAMOUFOX_NAV_CONTENT}")
+    endif()
+
+    string(FIND "${AIDA_CAMOUFOX_NAV_CONTENT}" "config[\"service_workers\"] = str(service_workers)" AIDA_CAMOUFOX_NAV_SERVICE_WORKERS_CONFIG_POS)
+    if(AIDA_CAMOUFOX_NAV_SERVICE_WORKERS_CONFIG_POS EQUAL -1)
+        string(REPLACE [=[        if user_data_dir:
+            config["user_data_dir"] = user_data_dir
+]=]
+[=[        if user_data_dir:
+            config["user_data_dir"] = user_data_dir
+        if service_workers is not None:
+            config["service_workers"] = str(service_workers)
+        if block_service_workers:
+            config["block_service_workers"] = True
+        if aida_fast_visible_launch is not None:
+            config["aida_fast_visible_launch"] = bool(aida_fast_visible_launch)
+        if aida_launch_policy_marker:
+            config["aida_launch_policy_marker"] = str(aida_launch_policy_marker)
+]=]
+            AIDA_CAMOUFOX_NAV_CONTENT "${AIDA_CAMOUFOX_NAV_CONTENT}")
+    endif()
+
+    string(FIND "${AIDA_CAMOUFOX_NAV_CONTENT}" "config[\"bridge_generation\"] = bridge_generation" AIDA_CAMOUFOX_NAV_BRIDGE_CONFIG_POS)
+    if(AIDA_CAMOUFOX_NAV_BRIDGE_CONFIG_POS EQUAL -1)
+        string(REPLACE [=[        if aida_launch_policy_marker:
+            config["aida_launch_policy_marker"] = str(aida_launch_policy_marker)
+]=]
+[=[        if aida_launch_policy_marker:
+            config["aida_launch_policy_marker"] = str(aida_launch_policy_marker)
+        if bridge_generation is not None:
+            config["bridge_generation"] = bridge_generation
+        if bridge_session_id:
+            config["bridge_session_id"] = bridge_session_id
+        if bridge_attempt_id:
+            config["bridge_attempt_id"] = bridge_attempt_id
+]=]
+            AIDA_CAMOUFOX_NAV_CONTENT "${AIDA_CAMOUFOX_NAV_CONTENT}")
+        string(REPLACE [=[        if user_data_dir:
+            config["user_data_dir"] = user_data_dir
+        if proxy:
+]=]
+[=[        if user_data_dir:
+            config["user_data_dir"] = user_data_dir
+        if bridge_generation is not None:
+            config["bridge_generation"] = bridge_generation
+        if bridge_session_id:
+            config["bridge_session_id"] = bridge_session_id
+        if bridge_attempt_id:
+            config["bridge_attempt_id"] = bridge_attempt_id
+        if proxy:
+]=]
+            AIDA_CAMOUFOX_NAV_CONTENT "${AIDA_CAMOUFOX_NAV_CONTENT}")
+    endif()
+
+    foreach(AIDA_CAMOUFOX_NAV_REQUIRED_MARKER IN ITEMS
+        "service_workers: str | None = None"
+        "block_service_workers: bool = False"
+        "aida_fast_visible_launch: bool | None = None"
+        "aida_launch_policy_marker: str | None = None"
+        "bridge_generation: int | str | None = None"
+        "config[\"service_workers\"] = str(service_workers)"
+        "config[\"aida_fast_visible_launch\"] = bool(aida_fast_visible_launch)"
+        "config[\"bridge_generation\"] = bridge_generation")
+        string(FIND "${AIDA_CAMOUFOX_NAV_CONTENT}" "${AIDA_CAMOUFOX_NAV_REQUIRED_MARKER}" AIDA_CAMOUFOX_NAV_REQUIRED_MARKER_POS)
+        if(AIDA_CAMOUFOX_NAV_REQUIRED_MARKER_POS EQUAL -1)
+            message(FATAL_ERROR "Failed to patch Camoufox navigation launch contract ${AIDA_CAMOUFOX_NAV_REQUIRED_MARKER}: ${AIDA_CAMOUFOX_NAV_PATCH_FILE}")
+        endif()
+    endforeach()
+
+    if(NOT AIDA_CAMOUFOX_NAV_CONTENT STREQUAL AIDA_CAMOUFOX_NAV_ORIGINAL)
+        file(WRITE "${AIDA_CAMOUFOX_NAV_PATCH_FILE}" "${AIDA_CAMOUFOX_NAV_CONTENT}")
+        message(STATUS "Patched ${AIDA_CAMOUFOX_NAV_PATCH_FILE}")
+    endif()
+endforeach()
+
 set(AIDA_CAMOUFOX_PATCH_FILES
     "${AIDA_CAMOUFOX_STAGE_ROOT}/deps/camoufox-reverse-mcp/src/camoufox_reverse_mcp/browser.py"
     "${AIDA_CAMOUFOX_STAGE_ROOT}/deps/camoufox-runtime/Lib/site-packages/camoufox_reverse_mcp/browser.py"
+    "${AIDA_CAMOUFOX_STAGE_ROOT}/deps/AiDA_CamoufoxReverseMcp/_internal/camoufox_reverse_mcp/browser.py"
 )
 
 foreach(AIDA_CAMOUFOX_PATCH_FILE IN LISTS AIDA_CAMOUFOX_PATCH_FILES)
@@ -1689,6 +1811,19 @@ def _profile_snapshot(profile_dir: str | None) -> dict[str, Any]:
         OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "persistent_context"
         OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "_profile_dir"
         OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "_profile_generated"
+        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "def _mark_page_terminal"
+        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "close_page_target_closed"
+        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "context_close_event"
+        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "AIDA_CAMOUFOX_FAST_VISIBLE_FALLBACK"
+        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "AIDA_CAMOUFOX_BRIDGE_PATCH_ID"
+        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "aida_camoufox_bridge_20260619_2"
+        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "aida_bridge_patch_active"
+        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "aida_launch_policy_resolved"
+        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "selected_launch_path"
+        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "block_service_workers"
+        OR AIDA_CAMOUFOX_CONTENT MATCHES "aida_fast_visible_launch\", True"
+        OR AIDA_CAMOUFOX_CONTENT MATCHES "context_options: dict\\[str, Any\\] = \\{\"service_workers\": \"block\"\\}"
+        OR AIDA_CAMOUFOX_CONTENT MATCHES "new_context\\(service_workers=\"block\"\\)"
         OR AIDA_CAMOUFOX_SHADOWED_ENV_POS GREATER -1)
         message(FATAL_ERROR "Failed to patch ${AIDA_CAMOUFOX_PATCH_FILE}")
     endif()
@@ -1703,6 +1838,7 @@ endforeach()
 set(AIDA_CAMOUFOX_HOOKING_PATCH_FILES
     "${AIDA_CAMOUFOX_STAGE_ROOT}/deps/camoufox-reverse-mcp/src/camoufox_reverse_mcp/tools/hooking.py"
     "${AIDA_CAMOUFOX_STAGE_ROOT}/deps/camoufox-runtime/Lib/site-packages/camoufox_reverse_mcp/tools/hooking.py"
+    "${AIDA_CAMOUFOX_STAGE_ROOT}/deps/AiDA_CamoufoxReverseMcp/_internal/camoufox_reverse_mcp/tools/hooking.py"
 )
 
 foreach(AIDA_CAMOUFOX_HOOKING_PATCH_FILE IN LISTS AIDA_CAMOUFOX_HOOKING_PATCH_FILES)

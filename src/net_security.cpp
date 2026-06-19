@@ -5,6 +5,8 @@
 #include "standalone/src/core/infra/work_queue.hpp"
 #include "../driver/comm.h"
 #include <nlohmann/json.hpp>
+#include <algorithm>
+#include <cstring>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -1677,20 +1679,94 @@ std::vector<tls_session_key_t> TlsKeyExtractor::read_keylog_file(const std::stri
 
 
 std::string TlsKeyExtractor::find_tshark_path() {
-
-    const char* candidates[] = {
-        "C:\\Program Files\\Wireshark\\tshark.exe",
-        "C:\\Program Files (x86)\\Wireshark\\tshark.exe",
+    auto env_var = [](const char* name) -> std::string {
+        char env_buffer[32767] = {};
+        DWORD len = GetEnvironmentVariableA(name, env_buffer, static_cast<DWORD>(sizeof(env_buffer)));
+        if (len == 0 || len >= sizeof(env_buffer))
+            return {};
+        return std::string(env_buffer, len);
     };
-    for (const char* path : candidates) {
-        if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES)
+    auto trim_path = [](std::string path) -> std::string {
+        while (!path.empty() && (path.front() == '"' || path.front() == '\'' || path.front() == ' ' || path.front() == '\t'))
+            path.erase(path.begin());
+        while (!path.empty() && (path.back() == '"' || path.back() == '\'' || path.back() == ' ' || path.back() == '\t'))
+            path.pop_back();
+        return path;
+    };
+    std::vector<std::string> candidates;
+    auto add_unique = [&](const std::string& raw_path) {
+        std::string path = trim_path(raw_path);
+        if (path.empty())
+            return;
+        if (std::find(candidates.begin(), candidates.end(), path) == candidates.end())
+            candidates.push_back(path);
+    };
+    auto add_candidate = [&](const std::string& raw_path) {
+        std::string path = trim_path(raw_path);
+        if (path.empty())
+            return;
+        add_unique(path);
+        std::filesystem::path fs_path(path);
+        if (!fs_path.has_extension() || _stricmp(fs_path.extension().string().c_str(), ".exe") != 0)
+            add_unique((fs_path / "tshark.exe").string());
+    };
+    auto add_base_candidates = [&](const std::filesystem::path& base) {
+        if (base.empty())
+            return;
+        add_candidate((base / "tshark.exe").string());
+        add_candidate((base / "Wireshark" / "tshark.exe").string());
+        add_candidate((base / "wireshark" / "tshark.exe").string());
+        add_candidate((base / "deps" / "tshark.exe").string());
+        add_candidate((base / "deps" / "Wireshark" / "tshark.exe").string());
+        add_candidate((base / "deps" / "wireshark" / "tshark.exe").string());
+        add_candidate((base / "tools" / "Wireshark" / "tshark.exe").string());
+        add_candidate((base / "third_party" / "Wireshark" / "tshark.exe").string());
+        add_candidate((base / "vendor" / "Wireshark" / "tshark.exe").string());
+    };
+    add_candidate(env_var("AIDA_TSHARK"));
+    add_candidate(env_var("TSHARK_PATH"));
+    const std::string program_files = env_var("ProgramFiles");
+    if (!program_files.empty())
+        add_candidate(program_files + "\\Wireshark\\tshark.exe");
+    const std::string program_files_x86 = env_var("ProgramFiles(x86)");
+    if (!program_files_x86.empty())
+        add_candidate(program_files_x86 + "\\Wireshark\\tshark.exe");
+    const std::string path_env = env_var("PATH");
+    size_t start = 0;
+    while (start <= path_env.size()) {
+        const size_t end = path_env.find(';', start);
+        const std::string dir = path_env.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        add_candidate(dir);
+        if (end == std::string::npos)
+            break;
+        start = end + 1;
+    }
+    char module_path[MAX_PATH] = {};
+    DWORD module_len = GetModuleFileNameA(nullptr, module_path, MAX_PATH);
+    if (module_len > 0 && module_len < MAX_PATH) {
+        std::filesystem::path base = std::filesystem::path(std::string(module_path, module_len)).parent_path();
+        for (int i = 0; i < 4 && !base.empty(); ++i) {
+            add_base_candidates(base);
+            base = base.parent_path();
+        }
+    }
+    std::error_code ec;
+    std::filesystem::path current = std::filesystem::current_path(ec);
+    if (!ec) {
+        for (int i = 0; i < 4 && !current.empty(); ++i) {
+            add_base_candidates(current);
+            current = current.parent_path();
+        }
+    }
+    for (const auto& path : candidates) {
+        DWORD attrs = GetFileAttributesA(path.c_str());
+        if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0)
             return path;
     }
-
-
     char buf[MAX_PATH] = {};
     DWORD len = SearchPathA(nullptr, "tshark.exe", nullptr, MAX_PATH, buf, nullptr);
-    if (len > 0 && len < MAX_PATH) return std::string(buf, len);
+    if (len > 0 && len < MAX_PATH)
+        return std::string(buf, len);
 
     return "";
 }

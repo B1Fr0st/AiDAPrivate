@@ -190,6 +190,71 @@ function Remove-FileWithRetry {
     }
 }
 
+function Get-TreeNewestWriteTimeUtc {
+    param(
+        [string]$Root,
+        [string[]]$Include = @("*")
+    )
+    $newest = [DateTime]::MinValue
+    if (-not $Root -or -not [IO.Directory]::Exists($Root)) {
+        return $newest
+    }
+    foreach ($pattern in $Include) {
+        Get-ChildItem -LiteralPath $Root -Recurse -File -Filter $pattern -ErrorAction Stop | ForEach-Object {
+            if ($_.LastWriteTimeUtc -gt $newest) {
+                $newest = $_.LastWriteTimeUtc
+            }
+        }
+    }
+    return $newest
+}
+
+function Get-FrozenMcpInputNewestWriteTimeUtc {
+    param(
+        [string]$SourceRoot,
+        [string]$BuildScript
+    )
+    $newest = [DateTime]::MinValue
+    foreach ($path in @((Join-Path $SourceRoot "pyproject.toml"), $BuildScript)) {
+        if ($path -and [IO.File]::Exists($path)) {
+            $item = Get-Item -LiteralPath $path
+            if ($item.LastWriteTimeUtc -gt $newest) {
+                $newest = $item.LastWriteTimeUtc
+            }
+        }
+    }
+    foreach ($path in @((Join-Path $SourceRoot "src"), (Join-Path (Resolve-RepoRoot) "cmake"))) {
+        $treeNewest = Get-TreeNewestWriteTimeUtc -Root $path -Include @("*.py", "*.js", "*.json", "*.toml", "*.cmake")
+        if ($treeNewest -gt $newest) {
+            $newest = $treeNewest
+        }
+    }
+    return $newest
+}
+
+function Test-FrozenMcpTargetFresh {
+    param(
+        [string]$Target,
+        [DateTime]$InputNewestUtc
+    )
+    if (-not [IO.File]::Exists($Target)) {
+        Write-Host "frozen_mcp_fresh=0"
+        Write-Host "frozen_mcp_fresh_reason=missing"
+        return $false
+    }
+    $targetItem = Get-Item -LiteralPath $Target
+    $targetUtc = $targetItem.LastWriteTimeUtc
+    Write-Host "frozen_mcp_target_mtime_utc=$($targetUtc.ToString('o'))"
+    Write-Host "frozen_mcp_input_newest_utc=$($InputNewestUtc.ToString('o'))"
+    if ($InputNewestUtc -gt $targetUtc.AddSeconds(1)) {
+        Write-Host "frozen_mcp_fresh=0"
+        Write-Host "frozen_mcp_fresh_reason=stale"
+        return $false
+    }
+    Write-Host "frozen_mcp_fresh=1"
+    return $true
+}
+
 function Add-McpJsonMessage {
     param(
         [System.Collections.ArrayList]$Messages,
@@ -671,12 +736,17 @@ if ($Jobs -lt 1) {
 $targetDir = Join-Path $OutputDir "AiDA_CamoufoxReverseMcp"
 $target = Join-Path $targetDir "AiDA_CamoufoxReverseMcp.exe"
 if ([IO.File]::Exists($target) -and -not $Force) {
-    try {
-        Invoke-FrozenMcpSmoke -Executable $target -RepoRoot $repoRoot
-        Write-Output "frozen_mcp_exists=$target"
-        exit 0
-    } catch {
-        Write-Warning "existing_frozen_mcp_contract_failed=$($_.Exception.Message)"
+    $inputNewestUtc = Get-FrozenMcpInputNewestWriteTimeUtc -SourceRoot $SourceRoot -BuildScript $PSCommandPath
+    if (Test-FrozenMcpTargetFresh -Target $target -InputNewestUtc $inputNewestUtc) {
+        try {
+            Invoke-FrozenMcpSmoke -Executable $target -RepoRoot $repoRoot
+            Write-Output "frozen_mcp_exists=$target"
+            exit 0
+        } catch {
+            Write-Warning "existing_frozen_mcp_contract_failed=$($_.Exception.Message)"
+            Remove-FileWithRetry -Path $target
+        }
+    } else {
         Remove-FileWithRetry -Path $target
     }
 }
@@ -691,9 +761,9 @@ try {
     & $Python -m venv $venv
     if ($LASTEXITCODE -ne 0) { throw "venv creation failed" }
     $venvPython = Join-Path $venv "Scripts\python.exe"
-    & $venvPython -m pip install --upgrade pip wheel setuptools nuitka zstandard ordered-set pyinstaller rich rich-click tzdata
+    & $venvPython -m pip install --disable-pip-version-check --no-cache-dir --upgrade pip wheel setuptools nuitka zstandard ordered-set pyinstaller rich rich-click tzdata
     if ($LASTEXITCODE -ne 0) { throw "build dependency install failed" }
-    & $venvPython -m pip install $SourceRoot
+    & $venvPython -m pip install --disable-pip-version-check --no-cache-dir $SourceRoot
     if ($LASTEXITCODE -ne 0) { throw "camoufox-reverse-mcp dependency install failed" }
     Install-PatchedCamoufoxPackage -VenvPython $venvPython -RepoRoot $repoRoot
     Invoke-SourceMcpContractCheck -PythonExe $venvPython
@@ -788,11 +858,23 @@ def _run_import_smoke():
     try:
         from camoufox_reverse_mcp.browser import _camoufox_debug
         debug = _camoufox_debug
+        import camoufox_reverse_mcp.browser as browser_module
+        patch_marker = getattr(browser_module, "AIDA_CAMOUFOX_BRIDGE_PATCH_ID", "")
+        launch_code = getattr(browser_module.BrowserManager.launch, "__code__", None)
+        launch_consts = repr(getattr(launch_code, "co_consts", ()))
+        launch_names = repr(getattr(launch_code, "co_names", ()))
+        if patch_marker != "aida_camoufox_bridge_20260619_2":
+            raise RuntimeError(f"frozen browser patch marker mismatch: {patch_marker!r}")
+        if "aida_bridge_patch_active" not in launch_consts or "aida_launch_policy_resolved" not in launch_consts:
+            raise RuntimeError("frozen browser launch diagnostics missing")
+        if "AIDA_CAMOUFOX_BRIDGE_PATCH_ID" not in launch_names:
+            raise RuntimeError("frozen browser launch patch marker missing")
         debug(
             "import_smoke_begin",
             cwd=os.getcwd(),
             python=sys.executable,
             env_browser=bool(os.environ.get("AIDA_CAMOUFOX_EXECUTABLE")),
+            patch_marker=patch_marker,
         )
         import_started = time.perf_counter()
         from camoufox.utils import launch_options
@@ -883,6 +965,12 @@ async def _run_live_smoke_async():
             raise RuntimeError(f"launch_elapsed_ms={launch_elapsed_ms} exceeds {timeout_ms}")
         if not privacy.get("webrtc_blocked") or not privacy.get("ice_probe_ok") or privacy.get("ice_candidate_leak_detected"):
             raise RuntimeError(f"webrtc privacy proof failed: {privacy}")
+        if privacy.get("context_source") == "fast_visible_firefox":
+            raise RuntimeError(f"unexpected fast visible launch path: {privacy}")
+        if privacy.get("effective_ua_policy") not in (None, "", "camoufox_native"):
+            raise RuntimeError(f"unexpected native launch ua policy: {privacy}")
+        if privacy.get("ua_override"):
+            raise RuntimeError(f"unexpected native launch ua override: {privacy}")
         if privacy.get("ua_override") and not (
             privacy.get("ua_ok") and privacy.get("app_version_ok") and privacy.get("platform_ok") and privacy.get("oscpu_ok")
         ):
@@ -995,41 +1083,59 @@ def _filter(name):
 
 datas, binaries, hiddenimports = collect_all("browserforge", filter_submodules=_filter, on_error="ignore")
 '@ | Set-Content -LiteralPath (Join-Path $pyiHooks "hook-browserforge.py") -Encoding UTF8
-        & $venvPython -m PyInstaller `
-            --noconfirm `
-            --clean `
-            --console `
-            --noupx `
-            --name AiDA_CamoufoxReverseMcp `
-            --distpath $OutputDir `
-            --workpath $pyiWork `
-            --specpath $pyiSpec `
-            --additional-hooks-dir $pyiHooks `
-            --collect-all camoufox_reverse_mcp `
-            --collect-all apify_fingerprint_datapoints `
-            --collect-all language_tags `
-            --collect-all ua_parser `
-            --collect-all ua_parser_builtins `
-            --collect-submodules playwright `
-            --collect-data playwright `
-            --collect-all esprima `
-            --exclude-module camoufox.gui `
-            --exclude-module PySide6 `
-            --exclude-module browserforge.injectors.undetected_playwright `
-            --exclude-module undetected_playwright `
-            --hidden-import mcp.server.fastmcp `
-            --hidden-import mcp.server.stdio `
-            --hidden-import mcp.shared.session `
-            --hidden-import mcp.shared.message `
-            --hidden-import mcp.types `
-            --hidden-import browserforge.fingerprints `
-            --hidden-import browserforge.headers `
-            --hidden-import apify_fingerprint_datapoints `
-            --hidden-import language_tags `
-            --hidden-import ua_parser `
-            --hidden-import ua_parser_builtins `
+        $pyiBuildLog = Join-Path $workRoot "pyinstaller-build.stdout.log"
+        $pyiErrorLog = Join-Path $workRoot "pyinstaller-build.stderr.log"
+        $pyiArgs = @(
+            "-m", "PyInstaller",
+            "--noconfirm",
+            "--clean",
+            "--log-level", "ERROR",
+            "--console",
+            "--noupx",
+            "--name", "AiDA_CamoufoxReverseMcp",
+            "--distpath", $OutputDir,
+            "--workpath", $pyiWork,
+            "--specpath", $pyiSpec,
+            "--additional-hooks-dir", $pyiHooks,
+            "--collect-all", "camoufox_reverse_mcp",
+            "--collect-all", "apify_fingerprint_datapoints",
+            "--collect-all", "language_tags",
+            "--collect-all", "ua_parser",
+            "--collect-all", "ua_parser_builtins",
+            "--collect-submodules", "playwright",
+            "--collect-data", "playwright",
+            "--collect-all", "esprima",
+            "--exclude-module", "camoufox.gui",
+            "--exclude-module", "PySide6",
+            "--exclude-module", "browserforge.injectors.undetected_playwright",
+            "--exclude-module", "undetected_playwright",
+            "--hidden-import", "mcp.server.fastmcp",
+            "--hidden-import", "mcp.server.stdio",
+            "--hidden-import", "mcp.shared.session",
+            "--hidden-import", "mcp.shared.message",
+            "--hidden-import", "mcp.types",
+            "--hidden-import", "browserforge.fingerprints",
+            "--hidden-import", "browserforge.headers",
+            "--hidden-import", "apify_fingerprint_datapoints",
+            "--hidden-import", "language_tags",
+            "--hidden-import", "ua_parser",
+            "--hidden-import", "ua_parser_builtins",
             $entry
-        if ($LASTEXITCODE -ne 0) { throw "PyInstaller build failed" }
+        )
+        $pyiProcess = Start-Process -FilePath $venvPython -ArgumentList $pyiArgs -Wait -PassThru -NoNewWindow -RedirectStandardOutput $pyiBuildLog -RedirectStandardError $pyiErrorLog
+        $pyiExitCode = $pyiProcess.ExitCode
+        Write-Output "pyinstaller_exit_code=$pyiExitCode"
+        Write-Output "pyinstaller_build_log=$pyiBuildLog"
+        Write-Output "pyinstaller_stderr_log=$pyiErrorLog"
+        if ($pyiExitCode -ne 0) {
+            if (Test-Path -LiteralPath $pyiBuildLog) {
+                Get-Content -LiteralPath $pyiBuildLog
+            }
+            if (Test-Path -LiteralPath $pyiErrorLog) {
+                Get-Content -LiteralPath $pyiErrorLog
+            }
+            throw "PyInstaller build failed"
+        }
     } elseif ($selectedBackend -eq "nuitka") {
         & $venvPython -m nuitka `
             --standalone `

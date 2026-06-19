@@ -8,9 +8,11 @@
 #include <ws2tcpip.h>
 #include <winhttp.h>
 #include <windns.h>
+#include <iphlpapi.h>
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "dnsapi.lib")
+#pragma comment(lib, "iphlpapi.lib")
 
 #include <atomic>
 #include <chrono>
@@ -197,6 +199,78 @@ namespace {
 		return std::string(b);
 	}
 
+	struct tcp_resource_snapshot_t {
+		bool handle_count_ok = false;
+		DWORD handle_count = 0;
+		DWORD handle_error = ERROR_SUCCESS;
+		DWORD tcp_error = ERROR_SUCCESS;
+		DWORD tcp_table_bytes = 0;
+		DWORD tcp_total = 0;
+		DWORD tcp_self = 0;
+		DWORD tcp_self_syn_sent = 0;
+		DWORD tcp_self_established = 0;
+		DWORD tcp_self_time_wait = 0;
+	};
+
+	tcp_resource_snapshot_t capture_tcp_resource_snapshot() {
+		tcp_resource_snapshot_t snap{};
+		DWORD handles = 0;
+		if (GetProcessHandleCount(GetCurrentProcess(), &handles)) {
+			snap.handle_count_ok = true;
+			snap.handle_count = handles;
+		} else {
+			snap.handle_error = GetLastError();
+		}
+
+		DWORD size = 0;
+		DWORD err = GetExtendedTcpTable(nullptr, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
+		snap.tcp_error = err;
+		snap.tcp_table_bytes = size;
+		if (err != ERROR_INSUFFICIENT_BUFFER || size == 0u || size > 4u * 1024u * 1024u)
+			return snap;
+
+		std::vector<unsigned char> buffer(size);
+		err = GetExtendedTcpTable(buffer.data(), &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
+		snap.tcp_error = err;
+		snap.tcp_table_bytes = size;
+		if (err != NO_ERROR)
+			return snap;
+
+		const DWORD self_pid = GetCurrentProcessId();
+		const auto* table = reinterpret_cast<const MIB_TCPTABLE_OWNER_PID*>(buffer.data());
+		snap.tcp_total = table->dwNumEntries;
+		for (DWORD i = 0; i < table->dwNumEntries; ++i) {
+			const auto& row = table->table[i];
+			if (row.dwOwningPid != self_pid)
+				continue;
+			++snap.tcp_self;
+			if (row.dwState == MIB_TCP_STATE_SYN_SENT)
+				++snap.tcp_self_syn_sent;
+			else if (row.dwState == MIB_TCP_STATE_ESTAB)
+				++snap.tcp_self_established;
+			else if (row.dwState == MIB_TCP_STATE_TIME_WAIT)
+				++snap.tcp_self_time_wait;
+		}
+		return snap;
+	}
+
+	std::string fmt_tcp_resource_snapshot(const tcp_resource_snapshot_t& snap) {
+		char b[256];
+		std::snprintf(b, sizeof(b),
+			"handle_ok=%d handle_count=%lu handle_err=%lu tcp_err=%lu tcp_bytes=%lu tcp_total=%lu tcp_self=%lu tcp_self_syn_sent=%lu tcp_self_established=%lu tcp_self_time_wait=%lu",
+			snap.handle_count_ok ? 1 : 0,
+			static_cast<unsigned long>(snap.handle_count),
+			static_cast<unsigned long>(snap.handle_error),
+			static_cast<unsigned long>(snap.tcp_error),
+			static_cast<unsigned long>(snap.tcp_table_bytes),
+			static_cast<unsigned long>(snap.tcp_total),
+			static_cast<unsigned long>(snap.tcp_self),
+			static_cast<unsigned long>(snap.tcp_self_syn_sent),
+			static_cast<unsigned long>(snap.tcp_self_established),
+			static_cast<unsigned long>(snap.tcp_self_time_wait));
+		return std::string(b);
+	}
+
 	void push_prefixed_field(test_lab::result_t& r, const char* prefix, const char* suffix, const std::string& value) {
 		std::string label(prefix ? prefix : "");
 		if (!label.empty())
@@ -348,97 +422,165 @@ namespace {
 			return false;
 		}
 		if (max_attempts < 1) max_attempts = 1;
-		if (max_attempts > 16) max_attempts = 16;
+		if (max_attempts > 4) max_attempts = 4;
 		const DWORD start_tick = GetTickCount();
+		const char* target = "1.1.1.1:80";
 		std::string last_diag;
 		for (int attempt = 1; attempt <= max_attempts; ++attempt) {
+			std::string resources_before = fmt_tcp_resource_snapshot(capture_tcp_resource_snapshot());
 			SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+			int socket_err = (s == INVALID_SOCKET) ? WSAGetLastError() : 0;
 			if (s == INVALID_SOCKET) {
-				int err = WSAGetLastError();
-				char b[96];
-				std::snprintf(b, sizeof(b), "socket() failed err=%d attempt=%d", err, attempt);
+				std::string resources_after = fmt_tcp_resource_snapshot(capture_tcp_resource_snapshot());
+				char b[1536];
+				std::snprintf(b, sizeof(b),
+					"target=%s attempt=%d/%d socket=invalid socket_err=%d elapsed_ms=%lu resources_before={%s} resources_after={%s}",
+					target,
+					attempt,
+					max_attempts,
+					socket_err,
+					static_cast<unsigned long>(GetTickCount() - start_tick),
+					resources_before.c_str(),
+					resources_after.c_str());
 				last_diag = b;
 				test_lab_format::testlab_diag_log_step("verify", "Network stats sanity", "tcp_probe_attempt",
-					"attempt=%d ok=0 elapsed_ms=%lu err=\"%s\"",
-					attempt,
-					static_cast<unsigned long>(GetTickCount() - start_tick),
+					"%s",
 					last_diag.c_str());
-				if (attempt < max_attempts) Sleep(200);
+				if (attempt < max_attempts) Sleep(75);
 				continue;
 			}
+
 			u_long nb = 1;
-			ioctlsocket(s, FIONBIO, &nb);
+			int nb_rc = ioctlsocket(s, FIONBIO, &nb);
+			int nb_err = (nb_rc == SOCKET_ERROR) ? WSAGetLastError() : 0;
+			if (nb_rc == SOCKET_ERROR) {
+				closesocket(s);
+				std::string resources_after = fmt_tcp_resource_snapshot(capture_tcp_resource_snapshot());
+				char b[1536];
+				std::snprintf(b, sizeof(b),
+					"target=%s attempt=%d/%d socket=created socket_err=%d nonblock_rc=%d nonblock_err=%d initiated=0 elapsed_ms=%lu resources_before={%s} resources_after={%s}",
+					target,
+					attempt,
+					max_attempts,
+					socket_err,
+					nb_rc,
+					nb_err,
+					static_cast<unsigned long>(GetTickCount() - start_tick),
+					resources_before.c_str(),
+					resources_after.c_str());
+				last_diag = b;
+				test_lab_format::testlab_diag_log_step("verify", "Network stats sanity", "tcp_probe_attempt",
+					"%s",
+					last_diag.c_str());
+				if (attempt < max_attempts) Sleep(75);
+				continue;
+			}
+
 			sockaddr_in dst{};
 			dst.sin_family = AF_INET;
 			dst.sin_port = htons(80);
 			dst.sin_addr.s_addr = htonl(0x01010101u);
-			int rc = connect(s, reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
-			bool initiated = false;
-			if (rc == 0) {
-				initiated = true;
-			} else {
-				int err = WSAGetLastError();
-				if (err == WSAEWOULDBLOCK) {
-					initiated = true;
-				} else {
-					char b[96];
-					std::snprintf(b, sizeof(b), "connect() err=%d attempt=%d", err, attempt);
-					last_diag = b;
-				}
-			}
+			int connect_rc = connect(s, reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
+			int connect_err = (connect_rc == SOCKET_ERROR) ? WSAGetLastError() : 0;
+			bool initiated = (connect_rc == 0) ||
+				connect_err == WSAEWOULDBLOCK ||
+				connect_err == WSAEINPROGRESS ||
+				connect_err == WSAEINVAL;
+			int sel = -1;
+			int sel_err = 0;
+			int so_error = 0;
+			int so_len = sizeof(so_error);
+			int write_ready = 0;
+			int except_ready = 0;
+			int sent = 0;
+			int send_err = 0;
+			int recv_sel = -1;
+			int recv_sel_err = 0;
+			int recvd = 0;
+			int recv_err = 0;
 			if (initiated) {
 				fd_set wf;
+				fd_set ef;
 				FD_ZERO(&wf);
+				FD_ZERO(&ef);
 				FD_SET(s, &wf);
+				FD_SET(s, &ef);
 				timeval tv{};
-				tv.tv_sec = 1;
-				tv.tv_usec = 0;
-				int sel = select(0, nullptr, &wf, nullptr, &tv);
-				int sent = 0;
-				int recvd = 0;
-				int send_err = 0;
+				tv.tv_sec = 0;
+				tv.tv_usec = 500000;
+				sel = select(0, nullptr, &wf, &ef, &tv);
+				sel_err = sel == SOCKET_ERROR ? WSAGetLastError() : (sel == 0 ? WSAETIMEDOUT : 0);
 				if (sel > 0) {
-					const char* req = "HEAD / HTTP/1.0\r\n\r\n";
-					sent = send(s, req, static_cast<int>(std::strlen(req)), 0);
-					if (sent == SOCKET_ERROR) {
-						send_err = WSAGetLastError();
-						sent = 0;
-					} else {
-						char recv_buf[64];
-						recvd = recv(s, recv_buf, sizeof(recv_buf), 0);
-						if (recvd == SOCKET_ERROR) recvd = 0;
+					write_ready = FD_ISSET(s, &wf) ? 1 : 0;
+					except_ready = FD_ISSET(s, &ef) ? 1 : 0;
+					if (getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&so_error), &so_len) == SOCKET_ERROR)
+						so_error = WSAGetLastError();
+					if (write_ready && so_error == 0) {
+						const char* req = "HEAD / HTTP/1.0\r\n\r\n";
+						sent = send(s, req, static_cast<int>(std::strlen(req)), 0);
+						if (sent == SOCKET_ERROR) {
+							send_err = WSAGetLastError();
+							sent = 0;
+						} else {
+							fd_set rf;
+							FD_ZERO(&rf);
+							FD_SET(s, &rf);
+							timeval rtv{};
+							rtv.tv_sec = 0;
+							rtv.tv_usec = 150000;
+							recv_sel = select(0, &rf, nullptr, nullptr, &rtv);
+							recv_sel_err = recv_sel == SOCKET_ERROR ? WSAGetLastError() : (recv_sel == 0 ? WSAETIMEDOUT : 0);
+							if (recv_sel > 0 && FD_ISSET(s, &rf)) {
+								char recv_buf[64];
+								recvd = recv(s, recv_buf, sizeof(recv_buf), 0);
+								if (recvd == SOCKET_ERROR) {
+									recv_err = WSAGetLastError();
+									recvd = 0;
+								}
+							}
+						}
 					}
 				}
-				closesocket(s);
-				char b[160];
-				std::snprintf(b, sizeof(b),
-					"external 1.1.1.1:80 connect initiated attempt=%d elapsed_ms=%lu select=%d sent=%d recv=%d send_err=%d",
-					attempt,
-					static_cast<unsigned long>(GetTickCount() - start_tick),
-					sel,
-					sent,
-					recvd,
-					send_err);
-				diag = b;
-				test_lab_format::testlab_diag_log_step("verify", "Network stats sanity", "tcp_probe_attempt",
-					"attempt=%d ok=1 elapsed_ms=%lu select=%d sent=%d recv=%d send_err=%d",
-					attempt,
-					static_cast<unsigned long>(GetTickCount() - start_tick),
-					sel,
-					sent,
-					recvd,
-					send_err);
-				return true;
 			}
 			closesocket(s);
-			test_lab_format::testlab_diag_log_step("verify", "Network stats sanity", "tcp_probe_attempt",
-				"attempt=%d ok=0 elapsed_ms=%lu err=\"%s\"",
+			std::string resources_after = fmt_tcp_resource_snapshot(capture_tcp_resource_snapshot());
+			char b[1536];
+			std::snprintf(b, sizeof(b),
+				"target=%s attempt=%d/%d socket=created socket_err=%d nonblock_rc=%d nonblock_err=%d connect_rc=%d connect_err=%d initiated=%d select=%d select_err=%d write_ready=%d except_ready=%d so_error=%d send=%d send_err=%d recv_select=%d recv_select_err=%d recv=%d recv_err=%d elapsed_ms=%lu resources_before={%s} resources_after={%s}",
+				target,
 				attempt,
+				max_attempts,
+				socket_err,
+				nb_rc,
+				nb_err,
+				connect_rc,
+				connect_err,
+				initiated ? 1 : 0,
+				sel,
+				sel_err,
+				write_ready,
+				except_ready,
+				so_error,
+				sent,
+				send_err,
+				recv_sel,
+				recv_sel_err,
+				recvd,
+				recv_err,
 				static_cast<unsigned long>(GetTickCount() - start_tick),
+				resources_before.c_str(),
+				resources_after.c_str());
+			last_diag = b;
+			test_lab_format::testlab_diag_log_step("verify", "Network stats sanity", "tcp_probe_attempt",
+				"%s",
 				last_diag.c_str());
-			if (attempt < max_attempts) Sleep(200);
+			if (initiated) {
+				diag = last_diag;
+				return true;
+			}
+			if (attempt < max_attempts) Sleep(75);
 		}
-		diag = last_diag.empty() ? "connect() did not initiate after retry budget" : last_diag;
+		diag = last_diag.empty() ? "target=1.1.1.1:80 initiated=0 retry_budget_exhausted=1" : last_diag;
 		return false;
 	}
 
@@ -708,97 +850,239 @@ namespace {
 		return true;
 	}
 
-	bool issue_tcp_dns_probe_to_one_one(const char* host, std::string& diag) {
+	struct tcp_dns_probe_summary_t {
+		std::uint32_t attempts = 0u;
+		std::uint32_t failures = 0u;
+		std::uint32_t enobufs_failures = 0u;
+		std::uint32_t enobufs_preinit_failures = 0u;
+		std::uint32_t initiated_attempts = 0u;
+	};
+
+	bool issue_tcp_dns_probe_to_one_one(const char* host, std::string& diag, tcp_dns_probe_summary_t* summary = nullptr, int max_attempts = 2) {
+		if (summary)
+			*summary = {};
+		wsa_guard_t g;
+		if (!g.ok) {
+			diag = "DNS TCP WSAStartup failed";
+			return false;
+		}
 		std::vector<unsigned char> packet;
 		std::uint16_t qid = 0;
 		if (!build_dns_query_packet(host, packet, qid, diag))
 			return false;
-		::diag::log_tagged_fmt("verify_dns", "tcp_probe start host=%s qid=%u packet_bytes=%zu",
-			host ? host : "", qid, packet.size());
-
-		SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-		if (s == INVALID_SOCKET) {
-			int err = WSAGetLastError();
-			char b[96];
-			std::snprintf(b, sizeof(b), "DNS TCP socket failed err=%d", err);
-			diag = b;
-			::diag::log_tagged_fmt("verify_dns", "tcp_probe socket_failed host=%s err=%d", host ? host : "", err);
-			return false;
-		}
-		DWORD timeout_ms = 1000;
-		setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
-		setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
-		u_long nb = 1;
-		ioctlsocket(s, FIONBIO, &nb);
-		sockaddr_in dst{};
-		dst.sin_family = AF_INET;
-		dst.sin_port = htons(53);
-		dst.sin_addr.s_addr = htonl(0x01010101u);
-		if (connect(s, reinterpret_cast<sockaddr*>(&dst), sizeof(dst)) == SOCKET_ERROR) {
-			int err = WSAGetLastError();
-			if (err != WSAEWOULDBLOCK && err != WSAEINPROGRESS && err != WSAEINVAL) {
-				closesocket(s);
-				char b[96];
-				std::snprintf(b, sizeof(b), "DNS TCP connect err=%d", err);
-				diag = b;
-				::diag::log_tagged_fmt("verify_dns", "tcp_probe connect_immediate_failed host=%s err=%d", host ? host : "", err);
-				return false;
-			}
-			fd_set wf;
-			fd_set ef;
-			FD_ZERO(&wf);
-			FD_ZERO(&ef);
-			FD_SET(s, &wf);
-			FD_SET(s, &ef);
-			timeval tv{};
-			tv.tv_sec = 1;
-			tv.tv_usec = 0;
-			int sel = select(0, nullptr, &wf, &ef, &tv);
-			if (sel <= 0) {
-				int sel_err = sel == SOCKET_ERROR ? WSAGetLastError() : WSAETIMEDOUT;
-				closesocket(s);
-				char b[128];
-				std::snprintf(b, sizeof(b), "DNS TCP connect select err=%d sel=%d", sel_err, sel);
-				diag = b;
-				::diag::log_tagged_fmt("verify_dns", "tcp_probe connect_select_failed host=%s sel=%d err=%d", host ? host : "", sel, sel_err);
-				return false;
-			}
-			int so_error = 0;
-			int so_len = sizeof(so_error);
-			getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&so_error), &so_len);
-			if (so_error != 0) {
-				closesocket(s);
-				char b[128];
-				std::snprintf(b, sizeof(b), "DNS TCP connect so_error=%d", so_error);
-				diag = b;
-				::diag::log_tagged_fmt("verify_dns", "tcp_probe connect_so_error host=%s err=%d", host ? host : "", so_error);
-				return false;
-			}
-		}
+		if (max_attempts < 1) max_attempts = 1;
+		if (max_attempts > 3) max_attempts = 3;
 		std::vector<unsigned char> tcp_packet;
 		tcp_packet.reserve(packet.size() + 2u);
 		tcp_packet.push_back(static_cast<unsigned char>((packet.size() >> 8) & 0xffu));
 		tcp_packet.push_back(static_cast<unsigned char>(packet.size() & 0xffu));
 		tcp_packet.insert(tcp_packet.end(), packet.begin(), packet.end());
-		int sent = send(s,
-			reinterpret_cast<const char*>(tcp_packet.data()),
-			static_cast<int>(tcp_packet.size()),
-			0);
-		int err = (sent == SOCKET_ERROR) ? WSAGetLastError() : 0;
-		closesocket(s);
-		if (sent == SOCKET_ERROR) {
-			char b[96];
-			std::snprintf(b, sizeof(b), "DNS TCP send err=%d", err);
-			diag = b;
-			::diag::log_tagged_fmt("verify_dns", "tcp_probe send_failed host=%s err=%d", host ? host : "", err);
-			return false;
+
+		const DWORD start_tick = GetTickCount();
+		const char* target = "1.1.1.1:53";
+		std::string last_diag;
+		::diag::log_tagged_fmt("verify_dns", "tcp_probe start host=%s target=%s qid=%u packet_bytes=%zu tcp_packet_bytes=%zu retry_budget=%d",
+			host ? host : "", target, qid, packet.size(), tcp_packet.size(), max_attempts);
+		for (int attempt = 1; attempt <= max_attempts; ++attempt) {
+			if (summary)
+				++summary->attempts;
+			std::string resources_before = fmt_tcp_resource_snapshot(capture_tcp_resource_snapshot());
+			SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+			int socket_err = (s == INVALID_SOCKET) ? WSAGetLastError() : 0;
+			if (s == INVALID_SOCKET) {
+				if (summary) {
+					++summary->failures;
+					if (socket_err == WSAENOBUFS) {
+						++summary->enobufs_failures;
+						++summary->enobufs_preinit_failures;
+					}
+				}
+				std::string resources_after = fmt_tcp_resource_snapshot(capture_tcp_resource_snapshot());
+				char b[1536];
+				std::snprintf(b, sizeof(b),
+					"host=%s target=%s attempt=%d/%d socket=invalid socket_err=%d elapsed_ms=%lu resources_before={%s} resources_after={%s}",
+					host ? host : "",
+					target,
+					attempt,
+					max_attempts,
+					socket_err,
+					static_cast<unsigned long>(GetTickCount() - start_tick),
+					resources_before.c_str(),
+					resources_after.c_str());
+				last_diag = b;
+				::diag::log_tagged_fmt("verify_dns", "tcp_probe attempt %s", last_diag.c_str());
+				if (attempt < max_attempts) Sleep(75);
+				continue;
+			}
+
+			DWORD timeout_ms = 300;
+			int rcv_timeout_rc = setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+			int rcv_timeout_err = rcv_timeout_rc == SOCKET_ERROR ? WSAGetLastError() : 0;
+			int snd_timeout_rc = setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+			int snd_timeout_err = snd_timeout_rc == SOCKET_ERROR ? WSAGetLastError() : 0;
+			u_long nb = 1;
+			int nb_rc = ioctlsocket(s, FIONBIO, &nb);
+			int nb_err = (nb_rc == SOCKET_ERROR) ? WSAGetLastError() : 0;
+			if (nb_rc == SOCKET_ERROR) {
+				closesocket(s);
+				if (summary) {
+					++summary->failures;
+					if (nb_err == WSAENOBUFS) {
+						++summary->enobufs_failures;
+						++summary->enobufs_preinit_failures;
+					}
+				}
+				std::string resources_after = fmt_tcp_resource_snapshot(capture_tcp_resource_snapshot());
+				char b[1536];
+				std::snprintf(b, sizeof(b),
+					"host=%s target=%s attempt=%d/%d socket=created socket_err=%d rcv_timeout_rc=%d rcv_timeout_err=%d snd_timeout_rc=%d snd_timeout_err=%d nonblock_rc=%d nonblock_err=%d sent=0 elapsed_ms=%lu resources_before={%s} resources_after={%s}",
+					host ? host : "",
+					target,
+					attempt,
+					max_attempts,
+					socket_err,
+					rcv_timeout_rc,
+					rcv_timeout_err,
+					snd_timeout_rc,
+					snd_timeout_err,
+					nb_rc,
+					nb_err,
+					static_cast<unsigned long>(GetTickCount() - start_tick),
+					resources_before.c_str(),
+					resources_after.c_str());
+				last_diag = b;
+				::diag::log_tagged_fmt("verify_dns", "tcp_probe attempt %s", last_diag.c_str());
+				if (attempt < max_attempts) Sleep(75);
+				continue;
+			}
+
+			sockaddr_in dst{};
+			dst.sin_family = AF_INET;
+			dst.sin_port = htons(53);
+			dst.sin_addr.s_addr = htonl(0x01010101u);
+			int connect_rc = connect(s, reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
+			int connect_err = (connect_rc == SOCKET_ERROR) ? WSAGetLastError() : 0;
+			bool initiated = (connect_rc == 0) ||
+				connect_err == WSAEWOULDBLOCK ||
+				connect_err == WSAEINPROGRESS ||
+				connect_err == WSAEINVAL;
+			if (summary && initiated)
+				++summary->initiated_attempts;
+			int sel = -1;
+			int sel_err = 0;
+			int write_ready = 0;
+			int except_ready = 0;
+			int so_error = 0;
+			int so_len = sizeof(so_error);
+			int sent = 0;
+			int send_err = 0;
+			int recv_sel = -1;
+			int recv_sel_err = 0;
+			int recvd = 0;
+			int recv_err = 0;
+			if (initiated) {
+				fd_set wf;
+				fd_set ef;
+				FD_ZERO(&wf);
+				FD_ZERO(&ef);
+				FD_SET(s, &wf);
+				FD_SET(s, &ef);
+				timeval tv{};
+				tv.tv_sec = 0;
+				tv.tv_usec = 500000;
+				sel = select(0, nullptr, &wf, &ef, &tv);
+				sel_err = sel == SOCKET_ERROR ? WSAGetLastError() : (sel == 0 ? WSAETIMEDOUT : 0);
+				if (sel > 0) {
+					write_ready = FD_ISSET(s, &wf) ? 1 : 0;
+					except_ready = FD_ISSET(s, &ef) ? 1 : 0;
+					if (getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&so_error), &so_len) == SOCKET_ERROR)
+						so_error = WSAGetLastError();
+					if (write_ready && so_error == 0) {
+						sent = send(s,
+							reinterpret_cast<const char*>(tcp_packet.data()),
+							static_cast<int>(tcp_packet.size()),
+							0);
+						if (sent == SOCKET_ERROR) {
+							send_err = WSAGetLastError();
+							sent = 0;
+						} else {
+							fd_set rf;
+							FD_ZERO(&rf);
+							FD_SET(s, &rf);
+							timeval rtv{};
+							rtv.tv_sec = 0;
+							rtv.tv_usec = 150000;
+							recv_sel = select(0, &rf, nullptr, nullptr, &rtv);
+							recv_sel_err = recv_sel == SOCKET_ERROR ? WSAGetLastError() : (recv_sel == 0 ? WSAETIMEDOUT : 0);
+							if (recv_sel > 0 && FD_ISSET(s, &rf)) {
+								char recv_buf[256];
+								recvd = recv(s, recv_buf, sizeof(recv_buf), 0);
+								if (recvd == SOCKET_ERROR) {
+									recv_err = WSAGetLastError();
+									recvd = 0;
+								}
+							}
+						}
+					}
+				}
+			}
+			closesocket(s);
+			std::string resources_after = fmt_tcp_resource_snapshot(capture_tcp_resource_snapshot());
+			char b[1536];
+			std::snprintf(b, sizeof(b),
+				"host=%s target=%s qid=%u attempt=%d/%d socket=created socket_err=%d rcv_timeout_rc=%d rcv_timeout_err=%d snd_timeout_rc=%d snd_timeout_err=%d nonblock_rc=%d nonblock_err=%d connect_rc=%d connect_err=%d initiated=%d select=%d select_err=%d write_ready=%d except_ready=%d so_error=%d send=%d send_err=%d recv_select=%d recv_select_err=%d recv=%d recv_err=%d elapsed_ms=%lu resources_before={%s} resources_after={%s}",
+				host ? host : "",
+				target,
+				qid,
+				attempt,
+				max_attempts,
+				socket_err,
+				rcv_timeout_rc,
+				rcv_timeout_err,
+				snd_timeout_rc,
+				snd_timeout_err,
+				nb_rc,
+				nb_err,
+				connect_rc,
+				connect_err,
+				initiated ? 1 : 0,
+				sel,
+				sel_err,
+				write_ready,
+				except_ready,
+				so_error,
+				sent,
+				send_err,
+				recv_sel,
+				recv_sel_err,
+				recvd,
+				recv_err,
+				static_cast<unsigned long>(GetTickCount() - start_tick),
+				resources_before.c_str(),
+				resources_after.c_str());
+			last_diag = b;
+			::diag::log_tagged_fmt("verify_dns", "tcp_probe attempt %s", last_diag.c_str());
+			if (sent > 0) {
+				diag = last_diag;
+				return true;
+			}
+			if (summary) {
+				++summary->failures;
+				const bool enobufs_failure = connect_err == WSAENOBUFS ||
+					sel_err == WSAENOBUFS ||
+					so_error == WSAENOBUFS ||
+					send_err == WSAENOBUFS ||
+					recv_sel_err == WSAENOBUFS ||
+					recv_err == WSAENOBUFS;
+				if (enobufs_failure)
+					++summary->enobufs_failures;
+				if (!initiated && connect_err == WSAENOBUFS)
+					++summary->enobufs_preinit_failures;
+			}
+			if (attempt < max_attempts) Sleep(75);
 		}
-		char b[128];
-		std::snprintf(b, sizeof(b), "DNS TCP query host=%s bytes=%d id=%u", host, sent, qid);
-		diag = b;
-		::diag::log_tagged_fmt("verify_dns", "tcp_probe done host=%s sent=%d qid=%u",
-			host ? host : "", sent, qid);
-		return true;
+		diag = last_diag.empty() ? "DNS TCP probe failed without attempt diagnostics" : last_diag;
+		return false;
 	}
 
 	void render_inputs_empty(test_lab::state_t& s) {
@@ -1356,8 +1640,16 @@ namespace {
 
 		std::string attempted_hosts;
 		std::uint32_t any_io_count = 0u;
+		std::uint32_t udp_dns_diag_ok_count = 0u;
 		std::uint32_t tcp_dns_diag_ok_count = 0u;
+		std::uint32_t tcp_dns_diag_fail_count = 0u;
 		std::uint32_t tcp_dns_enobufs_count = 0u;
+		std::uint32_t tcp_dns_probe_attempts = 0u;
+		std::uint32_t tcp_dns_probe_failures = 0u;
+		std::uint32_t tcp_dns_probe_enobufs_failures = 0u;
+		std::uint32_t tcp_dns_probe_enobufs_preinit_failures = 0u;
+		std::uint32_t tcp_dns_probe_initiated_attempts = 0u;
+		std::uint32_t tcp_dns_probe_no_attempt_failures = 0u;
 
 		for (std::size_t i = 0; i < kCandidateHostCount; ++i) {
 			if (finish_cancelled())
@@ -1368,13 +1660,26 @@ namespace {
 			std::string udp_diag;
 			dns_mark_stage(ctx, dns_log_stage_e::udp_probe);
 			bool udp_ok = issue_udp_dns_probe_to_one_one(host, udp_diag);
+			if (udp_ok)
+				++udp_dns_diag_ok_count;
 			::diag::log_tagged_fmt("verify_dns", "candidate[%zu] udp_done ok=%d diag=%s",
 				i, udp_ok ? 1 : 0, udp_diag.c_str());
 			std::string tcp_diag;
 			dns_mark_stage(ctx, dns_log_stage_e::tcp_probe);
-			bool tcp_ok = issue_tcp_dns_probe_to_one_one(host, tcp_diag);
+			tcp_dns_probe_summary_t tcp_summary{};
+			bool tcp_ok = issue_tcp_dns_probe_to_one_one(host, tcp_diag, &tcp_summary);
+			tcp_dns_probe_attempts += tcp_summary.attempts;
+			tcp_dns_probe_failures += tcp_summary.failures;
+			tcp_dns_probe_enobufs_failures += tcp_summary.enobufs_failures;
+			tcp_dns_probe_enobufs_preinit_failures += tcp_summary.enobufs_preinit_failures;
+			tcp_dns_probe_initiated_attempts += tcp_summary.initiated_attempts;
 			if (tcp_ok)
 				++tcp_dns_diag_ok_count;
+			else {
+				++tcp_dns_diag_fail_count;
+				if (tcp_summary.attempts == 0u)
+					++tcp_dns_probe_no_attempt_failures;
+			}
 			if (tcp_diag.find("10055") != std::string::npos)
 				++tcp_dns_enobufs_count;
 			::diag::log_tagged_fmt("verify_dns", "candidate[%zu] tcp_done ok=%d diag=%s",
@@ -1396,6 +1701,21 @@ namespace {
 				tcp_diag.c_str(),
 				gai_ok ? 1 : 0);
 			r.parsed.push_back({ std::string(label), std::string(val) });
+			char diag_label[48];
+			std::snprintf(diag_label, sizeof(diag_label), "step1_udp_diag[%zu]", i);
+			r.parsed.push_back({ std::string(diag_label), udp_diag });
+			std::snprintf(diag_label, sizeof(diag_label), "step1_tcp_diag[%zu]", i);
+			r.parsed.push_back({ std::string(diag_label), tcp_diag });
+			std::snprintf(diag_label, sizeof(diag_label), "step1_tcp_diag_summary[%zu]", i);
+			char summary_val[192];
+			std::snprintf(summary_val, sizeof(summary_val),
+				"attempts=%u failures=%u enobufs_failures=%u enobufs_preinit_failures=%u initiated_attempts=%u",
+				tcp_summary.attempts,
+				tcp_summary.failures,
+				tcp_summary.enobufs_failures,
+				tcp_summary.enobufs_preinit_failures,
+				tcp_summary.initiated_attempts);
+			r.parsed.push_back({ std::string(diag_label), std::string(summary_val) });
 			if (!attempted_hosts.empty()) attempted_hosts.append(",");
 			attempted_hosts.append(host);
 			if (authoritative_lookup_ok) ++any_io_count;
@@ -1405,8 +1725,18 @@ namespace {
 
 		r.parsed.push_back({ "step1_attempted_hosts", attempted_hosts });
 		r.parsed.push_back({ "step1_authoritative_lookup_attempts", fmt_u32(any_io_count) });
+		r.parsed.push_back({ "step1_udp_dns_diagnostic_ok", fmt_u32(udp_dns_diag_ok_count) });
 		r.parsed.push_back({ "step1_tcp_dns_diagnostic_ok", fmt_u32(tcp_dns_diag_ok_count) });
+		r.parsed.push_back({ "step1_tcp_dns_diagnostic_fail", fmt_u32(tcp_dns_diag_fail_count) });
+		r.parsed.push_back({ "step1_tcp_dns_diagnostic_attempts", fmt_u32(tcp_dns_diag_ok_count + tcp_dns_diag_fail_count) });
+		r.parsed.push_back({ "step1_tcp_dns_all_failed", (tcp_dns_diag_ok_count == 0u && tcp_dns_diag_fail_count > 0u) ? "1" : "0" });
 		r.parsed.push_back({ "step1_tcp_dns_enobufs_diagnostic", fmt_u32(tcp_dns_enobufs_count) });
+		r.parsed.push_back({ "step1_tcp_dns_probe_attempts", fmt_u32(tcp_dns_probe_attempts) });
+		r.parsed.push_back({ "step1_tcp_dns_probe_failures", fmt_u32(tcp_dns_probe_failures) });
+		r.parsed.push_back({ "step1_tcp_dns_probe_enobufs_failures", fmt_u32(tcp_dns_probe_enobufs_failures) });
+		r.parsed.push_back({ "step1_tcp_dns_probe_enobufs_preinit_failures", fmt_u32(tcp_dns_probe_enobufs_preinit_failures) });
+		r.parsed.push_back({ "step1_tcp_dns_probe_initiated_attempts", fmt_u32(tcp_dns_probe_initiated_attempts) });
+		r.parsed.push_back({ "step1_tcp_dns_probe_no_attempt_failures", fmt_u32(tcp_dns_probe_no_attempt_failures) });
 
 		std::uint32_t after_total = 0u;
 		std::uint32_t matches_name_and_pid = 0u;
@@ -1662,46 +1992,77 @@ namespace {
 		const bool ndns_hostname_seen = combined_any_pid_matches > 0u;
 		const bool ndns_pid_attributed = combined_self_or_unknown_matches > 0u;
 		const bool dns_counter_verified = packet_probe_seen && dns_counter_comparable && delta_total_dns_logged > 0u;
-		r.parsed.push_back({ "dns_feature_capture_verified", (ndns_pid_attributed || (ndns_hostname_seen && packet_probe_seen) || dns_counter_verified) ? "1" : "0" });
+		const bool dns_functional_proof = ndns_pid_attributed || (ndns_hostname_seen && packet_probe_seen) || dns_counter_verified;
+		const bool tcp_dns_all_failed = tcp_dns_diag_ok_count == 0u && tcp_dns_diag_fail_count > 0u;
+		const bool udp_functional_proof_preserved = dns_functional_proof && (udp_dns_diag_ok_count > 0u || packet_probe_seen || dns_counter_verified);
+		const bool dns_tcp_diagnostic_unavailable = tcp_dns_all_failed &&
+			tcp_dns_probe_failures > 0u &&
+			tcp_dns_probe_failures == tcp_dns_probe_enobufs_preinit_failures &&
+			tcp_dns_probe_initiated_attempts == 0u &&
+			tcp_dns_probe_no_attempt_failures == 0u;
+		const bool dns_tcp_required_for_clean_pass = !dns_tcp_diagnostic_unavailable;
+		const bool dns_mixed_evidence_degraded = tcp_dns_all_failed && dns_functional_proof && !dns_tcp_diagnostic_unavailable;
+		const bool dns_clean_pass_eligible = dns_functional_proof && !dns_mixed_evidence_degraded;
+		const std::string dns_tcp_diagnostic_unavailable_reason = dns_tcp_diagnostic_unavailable
+			? "all_tcp_dns_probe_attempts_failed_wsaenobufs_10055_before_session_initiation"
+			: "none";
+		auto push_dns_pass_path = [&](std::string path) {
+			if (dns_tcp_diagnostic_unavailable)
+				path.append("_tcp_diagnostic_unavailable_wsaenobufs_preinit");
+			r.parsed.push_back({ "dns_pass_path", path });
+		};
+		r.parsed.push_back({ "dns_feature_capture_verified", dns_functional_proof ? "1" : "0" });
 		r.parsed.push_back({ "dns_ndns_pid_attribution_degraded", (!ndns_pid_attributed && ndns_hostname_seen && packet_probe_seen) ? "1" : "0" });
 		r.parsed.push_back({ "dns_ndns_retrieval_cap_degraded", (!ndns_hostname_seen && dns_counter_verified) ? "1" : "0" });
-		if (ndns_pid_attributed) {
+		r.parsed.push_back({ "dns_tcp_diagnostic_unavailable", dns_tcp_diagnostic_unavailable ? "1" : "0" });
+		r.parsed.push_back({ "dns_tcp_diagnostic_unavailable_reason", dns_tcp_diagnostic_unavailable_reason });
+		r.parsed.push_back({ "dns_tcp_required_for_clean_pass", dns_tcp_required_for_clean_pass ? "1" : "0" });
+		r.parsed.push_back({ "dns_tcp_all_failed_degraded", (tcp_dns_all_failed && !dns_tcp_diagnostic_unavailable) ? "1" : "0" });
+		r.parsed.push_back({ "dns_udp_functional_proof_preserved", udp_functional_proof_preserved ? "1" : "0" });
+		r.parsed.push_back({ "dns_mixed_udp_tcp_evidence_degraded", dns_mixed_evidence_degraded ? "1" : "0" });
+		r.parsed.push_back({ "dns_clean_pass_eligible", dns_clean_pass_eligible ? "1" : "0" });
+		if (dns_mixed_evidence_degraded) {
+			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
+			r.ok = false;
+			r.error = "DNS UDP/NDNS functional proof was preserved but every TCP DNS diagnostic probe failed";
+			push_dns_pass_path("none_tcp_dns_all_failed_mixed_evidence");
+		} else if (ndns_pid_attributed) {
 			r.ntstatus = 0;
 			r.ok = true;
-			r.parsed.push_back({ "dns_pass_path", matches_name_and_pid > 0u ? "ndns_self_pid" : (self_filter_matches_name_and_pid > 0u ? "ndns_self_pid_filter" : "ndns_unknown_pid") });
+			push_dns_pass_path(matches_name_and_pid > 0u ? "ndns_self_pid" : (self_filter_matches_name_and_pid > 0u ? "ndns_self_pid_filter" : "ndns_unknown_pid"));
 		} else if (ndns_hostname_seen && packet_probe_seen) {
 			r.ntstatus = 0;
 			r.ok = true;
-			r.parsed.push_back({ "dns_pass_path", "ndns_hostname_packet_capture_pid_degraded" });
+			push_dns_pass_path("ndns_hostname_packet_capture_pid_degraded");
 		} else if (dns_counter_verified) {
 			r.ntstatus = 0;
 			r.ok = true;
-			r.parsed.push_back({ "dns_pass_path", "ndns_total_counter_packet_capture_cap_degraded" });
+			push_dns_pass_path("ndns_total_counter_packet_capture_cap_degraded");
 		} else if (packet_probe_seen) {
 			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
 			r.ok = false;
 			r.error = "DNS packet capture saw probe traffic but NDNS did not record the probe hostname";
-			r.parsed.push_back({ "dns_pass_path", "none_packet_fallback_only" });
+			push_dns_pass_path("none_packet_fallback_only");
 		} else if (ndns_hostname_seen) {
 			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
 			r.ok = false;
 			r.error = "DNS logger contains probe hostnames without fresh packet evidence and attributed them to a different nonzero PID";
-			r.parsed.push_back({ "dns_pass_path", "none_wrong_pid" });
+			push_dns_pass_path("none_wrong_pid");
 		} else if (any_self_pid_rows > 0u || self_filter_any_self_pid_rows > 0u) {
 			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
 			r.ok = false;
 			r.error = "DNS logger captured self-PID rows but none contained the probe hostnames";
-			r.parsed.push_back({ "dns_pass_path", "none_self_pid_without_probe" });
+			push_dns_pass_path("none_self_pid_without_probe");
 		} else if (delta > 0u && after_total > 0u) {
 			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
 			r.ok = false;
 			r.error = "DNS table changed during probe but no row matched both current PID and probe hostname";
-			r.parsed.push_back({ "dns_pass_path", "none_table_changed" });
+			push_dns_pass_path("none_table_changed");
 		} else {
 			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
 			r.ok = false;
 			r.error = "DNS logging did not capture the current process DNS probes";
-			r.parsed.push_back({ "dns_pass_path", "none" });
+			push_dns_pass_path("none");
 		}
 	}
 
@@ -1822,15 +2183,21 @@ namespace {
 		bool loopback_probed = issue_loopback_tcp_stats_probe(loopback_probe_diag);
 		r.parsed.push_back({ "probe_initiated", loopback_probed ? "1" : "0" });
 		r.parsed.push_back({ "primary_probe_mode", "loopback_tcp" });
+		r.parsed.push_back({ "loopback_probe_required", "1" });
 		r.parsed.push_back({ "loopback_probe_initiated", loopback_probed ? "1" : "0" });
+		r.parsed.push_back({ "loopback_probe_functional", loopback_probed ? "1" : "0" });
+		r.parsed.push_back({ "loopback_probe_error", loopback_probed ? "none" : (loopback_probe_diag.empty() ? "no diagnostic" : loopback_probe_diag) });
 		if (!loopback_probe_diag.empty()) {
 			r.parsed.push_back({ "loopback_probe_diag", loopback_probe_diag });
 		}
 
 		std::string external_probe_diag;
+		r.parsed.push_back({ "external_required", "0" });
+		r.parsed.push_back({ "external_diagnostic_only", "1" });
 		bool external_probed = issue_raw_tcp_probe_to_one_one(external_probe_diag, 1);
 		r.parsed.push_back({ "external_probe_diagnostic_only", "1" });
 		r.parsed.push_back({ "external_probe_initiated", external_probed ? "1" : "0" });
+		r.parsed.push_back({ "external_probe_error", external_probed ? "none" : (external_probe_diag.empty() ? "no diagnostic" : external_probe_diag) });
 		if (!external_probe_diag.empty()) {
 			r.parsed.push_back({ "external_probe_diag", external_probe_diag });
 		}
@@ -1871,6 +2238,12 @@ namespace {
 		r.parsed.push_back({ "delta_packets_received", fmt_u64(d_pr) });
 
 		bool any_increase = (d_bs > 0ull) || (d_br_v > 0ull) || (d_ps > 0ull) || (d_pr > 0ull);
+		const bool loopback_stats_functional_pass = loopback_probed && any_increase;
+		r.parsed.push_back({ "loopback_stats_delta_required", "1" });
+		r.parsed.push_back({ "loopback_stats_delta_observed", any_increase ? "1" : "0" });
+		r.parsed.push_back({ "loopback_functional_proof", loopback_stats_functional_pass ? "1" : "0" });
+		r.parsed.push_back({ "network_stats_functional_pass", loopback_stats_functional_pass ? "1" : "0" });
+		r.parsed.push_back({ "network_stats_external_affects_pass", "0" });
 		if (loopback_probed && any_increase) {
 			r.ntstatus = 0;
 			r.ok = true;
@@ -2321,7 +2694,7 @@ TESTLAB_REGISTER(g_reg_verify_dns_log,
 	"verify",
 	test_lab::driver_e::whoswho,
 	"DNS query log round-trip",
-	"NCAP/NDNS around UDP and WinDNS probes -> assert NDNS attributed one probe hostname to the current or unknown PID; TCP DNS is recorded as diagnostic-only.",
+	"NCAP/NDNS around UDP, TCP DNS, and WinDNS probes -> assert NDNS attributed one probe hostname to the current or unknown PID; pre-init ENOBUFS TCP DNS failures are diagnostic-unavailable.",
 	&render_inputs_empty,
 	&run_verify_dns_log);
 
@@ -2329,7 +2702,7 @@ TESTLAB_REGISTER(g_reg_verify_net_stats,
 	"verify",
 	test_lab::driver_e::whoswho,
 	"Network stats sanity",
-	"NSTS baseline -> deterministic loopback TCP stimulus with external 1.1.1.1 diagnostic probe -> NSTS again -> assert counters increased.",
+	"NSTS baseline -> required deterministic loopback TCP stimulus plus diagnostic-only external 1.1.1.1 probe -> NSTS again -> assert loopback-driven counters increased.",
 	&render_inputs_empty,
 	&run_verify_net_stats);
 

@@ -53,12 +53,35 @@ namespace anti_dma_canary {
     inline WORK_QUEUE_ITEM g_work = {};
     inline volatile LONG  g_running = 0;
     inline volatile LONG  g_work_queued = 0;
+    inline volatile LONG  g_work_running = 0;
+    inline KEVENT         g_work_done = {};
+    inline volatile LONG  g_work_sync_initialized = 0;
+    inline volatile LONG  g_timer_initialized = 0;
     inline volatile LONG  g_scan_cursor_pid = 4;
     inline volatile LONG  g_strike_pid = 0;
     inline volatile LONG  g_strike_count = 0;
     inline volatile LONG64 g_scan_batch_id = 0;
     inline volatile LONG64 g_first_canary_time = 0;
     inline volatile LONG g_warmup_logged = 0;
+
+    __forceinline ULONG elapsed_us_from_100ns(ULONGLONG start_100ns, ULONGLONG end_100ns) {
+        return end_100ns >= start_100ns
+            ? static_cast<ULONG>((end_100ns - start_100ns) / 10ULL)
+            : 0;
+    }
+
+    __forceinline void ensure_work_sync_initialized() {
+        if (_InterlockedCompareExchange(&g_work_sync_initialized, 1, 0) == 0)
+            KeInitializeEvent(&g_work_done, NotificationEvent, TRUE);
+    }
+
+    __forceinline UINT32 current_registered_client_pid() {
+        return static_cast<UINT32>(reinterpret_cast<ULONG_PTR>(
+            caller_validation::g_registered_client_pid));
+    }
+
+    __forceinline VOID init_timer(const char* reason = "manual", UINT32 client_pid = 0);
+    __forceinline VOID stop_timer(const char* reason = "manual", UINT32 client_pid = 0, BOOLEAN wait_for_work = TRUE);
 
     __forceinline void capture_process_name(PEPROCESS proc, scan_hit_t* out_hit) {
         if (!out_hit) return;
@@ -138,6 +161,7 @@ namespace anti_dma_canary {
         KIRQL old;
         KeAcquireSpinLock(&g_canary_lock, &old);
         ULONG cleared = 0;
+        ULONG new_count = g_canary_count;
         for (ULONG i = 0; i < MAX_CANARIES; i++) {
             if (g_canaries[i].active && g_canaries[i].owner_pid == owner_pid) {
                 g_canaries[i].active    = 0;
@@ -149,7 +173,7 @@ namespace anti_dma_canary {
             }
         }
         if (cleared) {
-            ULONG new_count = 0;
+            new_count = 0;
             for (ULONG i = 0; i < MAX_CANARIES; i++) {
                 if (g_canaries[i].active) new_count = i + 1;
             }
@@ -157,8 +181,18 @@ namespace anti_dma_canary {
         }
         KeReleaseSpinLock(&g_canary_lock, old);
         if (cleared) {
-            WW_LOG("dma_canary::cleanup_for_pid pid=%lu cleared=%lu count=%lu",
-                owner_pid, cleared, g_canary_count);
+            WW_LOG("dma_canary::cleanup_for_pid pid=%lu cleared=%lu count=%lu running=%ld queued=%ld work_running=%ld",
+                owner_pid,
+                cleared,
+                new_count,
+                _InterlockedCompareExchange(&g_running, 0, 0),
+                _InterlockedCompareExchange(&g_work_queued, 0, 0),
+                _InterlockedCompareExchange(&g_work_running, 0, 0));
+            if (new_count == 0) {
+                _InterlockedExchange64(&g_first_canary_time, 0);
+                _InterlockedExchange(&g_warmup_logged, 0);
+                stop_timer("cleanup_last_canary", owner_pid, FALSE);
+            }
         }
         return cleared;
     }
@@ -266,6 +300,17 @@ namespace anti_dma_canary {
     }
 
     __forceinline BOOLEAN register_canary(UINT64 va, UINT64 size, ULONG owner_pid) {
+        UINT32 registered_pid = current_registered_client_pid();
+        if (registered_pid == 0 || owner_pid != registered_pid || !is_pid_alive(owner_pid)) {
+            WW_LOG("dma_canary::register_reject no_live_registered_client va=0x%llx size=0x%llx owner=%lu registered=%u running=%ld queued=%ld",
+                static_cast<unsigned long long>(va),
+                static_cast<unsigned long long>(size),
+                owner_pid,
+                registered_pid,
+                _InterlockedCompareExchange(&g_running, 0, 0),
+                _InterlockedCompareExchange(&g_work_queued, 0, 0));
+            return FALSE;
+        }
         if (!va || !size || !owner_pid) {
             WW_LOG("dma_canary::register_reject invalid_input va=0x%llx size=0x%llx owner=%lu",
                 static_cast<unsigned long long>(va),
@@ -332,6 +377,7 @@ namespace anti_dma_canary {
                 static_cast<unsigned long long>(pa),
                 static_cast<unsigned long long>(pa & ~0xFFFULL),
                 g_canary_count);
+            init_timer("register_canary", owner_pid);
         } else {
             WW_LOG("dma_canary::register_reject no_slots owner=%lu va=0x%llx size=0x%llx pa=0x%llx count=%lu",
                 owner_pid,
@@ -487,7 +533,16 @@ namespace anti_dma_canary {
     }
 
     __forceinline void do_scan_batch() {
-        if (!caller_validation::g_registered_client_pid) return;
+        UINT32 registered_pid = current_registered_client_pid();
+        if (!registered_pid) {
+            WW_LOG("dma_canary::batch_quiesce reason=no_registered_client count=%lu running=%ld queued=%ld work_running=%ld",
+                g_canary_count,
+                _InterlockedCompareExchange(&g_running, 0, 0),
+                _InterlockedCompareExchange(&g_work_queued, 0, 0),
+                _InterlockedCompareExchange(&g_work_running, 0, 0));
+            stop_timer("batch_no_registered_client", 0, FALSE);
+            return;
+        }
 
         LONG64 first_canary_time = _InterlockedCompareExchange64(&g_first_canary_time, 0, 0);
         if (first_canary_time != 0) {
@@ -504,17 +559,33 @@ namespace anti_dma_canary {
 
         cleanup_dead_owners();
 
-        if (g_canary_count == 0) return;
+        if (g_canary_count == 0) {
+            WW_LOG("dma_canary::batch_quiesce reason=no_canaries client=%u running=%ld queued=%ld work_running=%ld",
+                registered_pid,
+                _InterlockedCompareExchange(&g_running, 0, 0),
+                _InterlockedCompareExchange(&g_work_queued, 0, 0),
+                _InterlockedCompareExchange(&g_work_running, 0, 0));
+            stop_timer("batch_no_canaries", registered_pid, FALSE);
+            return;
+        }
 
         canary_t snapshot[MAX_CANARIES] = {};
         ULONG snapshot_count = snapshot_canaries(snapshot, MAX_CANARIES);
-        if (snapshot_count == 0) return;
+        if (snapshot_count == 0) {
+            WW_LOG("dma_canary::batch_quiesce reason=empty_snapshot client=%u count=%lu running=%ld queued=%ld work_running=%ld",
+                registered_pid,
+                g_canary_count,
+                _InterlockedCompareExchange(&g_running, 0, 0),
+                _InterlockedCompareExchange(&g_work_queued, 0, 0),
+                _InterlockedCompareExchange(&g_work_running, 0, 0));
+            stop_timer("batch_empty_snapshot", registered_pid, FALSE);
+            return;
+        }
 
         LONG64 batch_id = _InterlockedIncrement64(&g_scan_batch_id);
         ULONG batch_budget = READ_BUDGET_PER_BATCH;
 
-        ULONG own_pid = static_cast<ULONG>(reinterpret_cast<ULONG_PTR>(
-            caller_validation::g_registered_client_pid));
+        ULONG own_pid = registered_pid;
 
         ULONG  hit_pid   = 0;
         scan_hit_t hit_info = {};
@@ -736,59 +807,209 @@ namespace anti_dma_canary {
     }
 
     static VOID NTAPI work_routine(PVOID) {
+        ULONGLONG start_time = KeQueryInterruptTime();
+        _InterlockedExchange(&g_work_running, 1);
+        UINT32 client_pid = current_registered_client_pid();
+        WW_LOG("dma_canary::work_entry running=%ld queued=%ld work_running=%ld count=%lu client=%u irql=%lu",
+            _InterlockedCompareExchange(&g_running, 0, 0),
+            _InterlockedCompareExchange(&g_work_queued, 0, 0),
+            _InterlockedCompareExchange(&g_work_running, 0, 0),
+            g_canary_count,
+            client_pid,
+            static_cast<ULONG>(KeGetCurrentIrql()));
         __try {
             do_scan_batch();
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             WW_LOG("dma_canary::work_exception");
         }
+        _InterlockedExchange(&g_work_running, 0);
         _InterlockedExchange(&g_work_queued, 0);
+        KeSetEvent(&g_work_done, IO_NO_INCREMENT, FALSE);
+        ULONGLONG end_time = KeQueryInterruptTime();
+        WW_LOG("dma_canary::work_exit elapsed_us=%lu running=%ld queued=%ld work_running=%ld count=%lu client=%u",
+            elapsed_us_from_100ns(start_time, end_time),
+            _InterlockedCompareExchange(&g_running, 0, 0),
+            _InterlockedCompareExchange(&g_work_queued, 0, 0),
+            _InterlockedCompareExchange(&g_work_running, 0, 0),
+            g_canary_count,
+            current_registered_client_pid());
     }
 
     static VOID NTAPI dpc_routine(_KDPC*, PVOID, PVOID, PVOID) {
-        WW_LOG("dma_canary::dpc_routine: ENTRY running=%ld", g_running);
-        if (!_InterlockedCompareExchange(&g_running, 0, 0)) {
-            WW_LOG("dma_canary::dpc_skip not_running");
+        UINT32 client_pid = current_registered_client_pid();
+        LONG running = _InterlockedCompareExchange(&g_running, 0, 0);
+        WW_LOG("dma_canary::dpc_entry running=%ld queued=%ld work_running=%ld count=%lu client=%u irql=%lu",
+            running,
+            _InterlockedCompareExchange(&g_work_queued, 0, 0),
+            _InterlockedCompareExchange(&g_work_running, 0, 0),
+            g_canary_count,
+            client_pid,
+            static_cast<ULONG>(KeGetCurrentIrql()));
+        if (!running) {
+            WW_LOG("dma_canary::dpc_skip not_running queued=%ld work_running=%ld",
+                _InterlockedCompareExchange(&g_work_queued, 0, 0),
+                _InterlockedCompareExchange(&g_work_running, 0, 0));
+            return;
+        }
+        if (client_pid == 0) {
+            stop_timer("dpc_no_registered_client", 0, FALSE);
+            return;
+        }
+        if (g_canary_count == 0) {
+            stop_timer("dpc_no_canaries", client_pid, FALSE);
+            return;
+        }
+        if (_InterlockedCompareExchange(&g_work_running, 0, 0) != 0) {
+            WW_LOG("dma_canary::dpc_skip work_running client=%u count=%lu queued=%ld",
+                client_pid,
+                g_canary_count,
+                _InterlockedCompareExchange(&g_work_queued, 0, 0));
             return;
         }
         if (_InterlockedCompareExchange(&g_work_queued, 1, 0) != 0) {
-            WW_LOG("dma_canary::dpc_skip work_already_queued");
+            WW_LOG("dma_canary::dpc_skip work_already_queued client=%u count=%lu work_running=%ld",
+                client_pid,
+                g_canary_count,
+                _InterlockedCompareExchange(&g_work_running, 0, 0));
             return;
         }
+        ensure_work_sync_initialized();
+        KeClearEvent(&g_work_done);
         ExInitializeWorkItem(&g_work, work_routine, nullptr);
         ExQueueWorkItem(&g_work, DelayedWorkQueue);
-        WW_LOG("dma_canary::dpc_queued_work");
+        WW_LOG("dma_canary::dpc_queued_work client=%u count=%lu queued=%ld work_running=%ld",
+            client_pid,
+            g_canary_count,
+            _InterlockedCompareExchange(&g_work_queued, 0, 0),
+            _InterlockedCompareExchange(&g_work_running, 0, 0));
     }
 
-    __forceinline VOID init_timer() {
-        WW_LOG("dma_canary::init_timer: ENTRY");
-        if (_InterlockedCompareExchange(&g_running, 1, 0) != 0) return;
+    __forceinline VOID init_timer(const char* reason, UINT32 client_pid) {
+        ULONGLONG start_time = KeQueryInterruptTime();
+        UINT32 registered_pid = current_registered_client_pid();
+        if (client_pid == 0)
+            client_pid = registered_pid;
+        WW_LOG("dma_canary::timer_start_entry reason=%s client=%u registered=%u count=%lu running=%ld queued=%ld work_running=%ld timer_init=%ld irql=%lu",
+            reason ? reason : "unknown",
+            client_pid,
+            registered_pid,
+            g_canary_count,
+            _InterlockedCompareExchange(&g_running, 0, 0),
+            _InterlockedCompareExchange(&g_work_queued, 0, 0),
+            _InterlockedCompareExchange(&g_work_running, 0, 0),
+            _InterlockedCompareExchange(&g_timer_initialized, 0, 0),
+            static_cast<ULONG>(KeGetCurrentIrql()));
+        if (client_pid == 0 || registered_pid == 0 || client_pid != registered_pid || g_canary_count == 0) {
+            WW_LOG("dma_canary::timer_start_reject reason=%s client=%u registered=%u count=%lu",
+                reason ? reason : "unknown",
+                client_pid,
+                registered_pid,
+                g_canary_count);
+            return;
+        }
+        if (_InterlockedCompareExchange(&g_running, 1, 0) != 0) {
+            WW_LOG("dma_canary::timer_start_noop reason=%s client=%u count=%lu queued=%ld work_running=%ld",
+                reason ? reason : "unknown",
+                client_pid,
+                g_canary_count,
+                _InterlockedCompareExchange(&g_work_queued, 0, 0),
+                _InterlockedCompareExchange(&g_work_running, 0, 0));
+            return;
+        }
 
-        RtlZeroMemory(g_canaries, sizeof(g_canaries));
-        g_canary_count = 0;
-        g_work_queued = 0;
-        g_scan_cursor_pid = 4;
-        g_strike_pid = 0;
-        g_strike_count = 0;
-        g_scan_batch_id = 0;
-        g_first_canary_time = 0;
-        g_warmup_logged = 0;
-        RtlZeroMemory(&g_timer, sizeof(g_timer));
-        RtlZeroMemory(&g_dpc, sizeof(g_dpc));
-        RtlZeroMemory(&g_work, sizeof(g_work));
-
+        ensure_work_sync_initialized();
+        if (_InterlockedCompareExchange(&g_work_queued, 0, 0) != 0 ||
+            _InterlockedCompareExchange(&g_work_running, 0, 0) != 0) {
+            NTSTATUS wait_status = STATUS_NOT_SUPPORTED;
+            if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
+                LARGE_INTEGER timeout;
+                timeout.QuadPart = -50'000'000LL;
+                wait_status = KeWaitForSingleObject(&g_work_done, Executive, KernelMode, FALSE, &timeout);
+            }
+            if (_InterlockedCompareExchange(&g_work_queued, 0, 0) != 0 ||
+                _InterlockedCompareExchange(&g_work_running, 0, 0) != 0) {
+                WW_LOG("dma_canary::timer_start_pending_work reason=%s client=%u registered=%u count=%lu wait_status=0x%08lx queued=%ld work_running=%ld",
+                    reason ? reason : "unknown",
+                    client_pid,
+                    registered_pid,
+                    g_canary_count,
+                    wait_status,
+                    _InterlockedCompareExchange(&g_work_queued, 0, 0),
+                    _InterlockedCompareExchange(&g_work_running, 0, 0));
+                _InterlockedExchange(&g_running, 0);
+                return;
+            }
+        }
+        KeSetEvent(&g_work_done, IO_NO_INCREMENT, FALSE);
+        _InterlockedExchange(&g_scan_cursor_pid, 4);
+        _InterlockedExchange(&g_strike_pid, 0);
+        _InterlockedExchange(&g_strike_count, 0);
+        _InterlockedExchange64(&g_scan_batch_id, 0);
+        _InterlockedExchange(&g_warmup_logged, 0);
         ensure_lock();
         KeInitializeTimerEx(&g_timer, SynchronizationTimer);
         KeInitializeDpc(&g_dpc, dpc_routine, nullptr);
+        _InterlockedExchange(&g_timer_initialized, 1);
         LARGE_INTEGER due;
         due.QuadPart = -10000000LL;
         KeSetTimerEx(&g_timer, due, static_cast<LONG>(PERIOD_MS), &g_dpc);
-        WW_LOG("dma_canary::init_timer: timer armed, period=%lldms", PERIOD_MS);
+        ULONGLONG end_time = KeQueryInterruptTime();
+        WW_LOG("dma_canary::timer_start_exit reason=%s client=%u registered=%u count=%lu running=%ld queued=%ld work_running=%ld period=%lldms elapsed_us=%lu",
+            reason ? reason : "unknown",
+            client_pid,
+            registered_pid,
+            g_canary_count,
+            _InterlockedCompareExchange(&g_running, 0, 0),
+            _InterlockedCompareExchange(&g_work_queued, 0, 0),
+            _InterlockedCompareExchange(&g_work_running, 0, 0),
+            PERIOD_MS,
+            elapsed_us_from_100ns(start_time, end_time));
     }
 
-    __forceinline VOID stop_timer() {
-        if (_InterlockedCompareExchange(&g_running, 0, 1) != 1) return;
-        KeCancelTimer(&g_timer);
-        KeFlushQueuedDpcs();
+    __forceinline VOID stop_timer(const char* reason, UINT32 client_pid, BOOLEAN wait_for_work) {
+        ULONGLONG start_time = KeQueryInterruptTime();
+        UINT32 registered_pid = current_registered_client_pid();
+        LONG running_before = _InterlockedExchange(&g_running, 0);
+        LONG queued_before = _InterlockedCompareExchange(&g_work_queued, 0, 0);
+        LONG work_running_before = _InterlockedCompareExchange(&g_work_running, 0, 0);
+        LONG timer_initialized = _InterlockedCompareExchange(&g_timer_initialized, 0, 0);
+        WW_LOG("dma_canary::timer_stop_entry reason=%s client=%u registered=%u count=%lu running_before=%ld queued_before=%ld work_running_before=%ld timer_init=%ld wait=%u irql=%lu",
+            reason ? reason : "unknown",
+            client_pid,
+            registered_pid,
+            g_canary_count,
+            running_before,
+            queued_before,
+            work_running_before,
+            timer_initialized,
+            wait_for_work ? 1u : 0u,
+            static_cast<ULONG>(KeGetCurrentIrql()));
+        if (timer_initialized != 0) {
+            KeCancelTimer(&g_timer);
+            _InterlockedExchange(&g_timer_initialized, 0);
+        }
+        if (_KeFlushQueuedDpcs && KeGetCurrentIrql() < DISPATCH_LEVEL)
+            _KeFlushQueuedDpcs();
+        ensure_work_sync_initialized();
+        NTSTATUS wait_status = STATUS_NOT_SUPPORTED;
+        if (wait_for_work && KeGetCurrentIrql() == PASSIVE_LEVEL &&
+            (_InterlockedCompareExchange(&g_work_queued, 0, 0) != 0 ||
+             _InterlockedCompareExchange(&g_work_running, 0, 0) != 0)) {
+            LARGE_INTEGER timeout;
+            timeout.QuadPart = -50'000'000LL;
+            wait_status = KeWaitForSingleObject(&g_work_done, Executive, KernelMode, FALSE, &timeout);
+        }
+        ULONGLONG end_time = KeQueryInterruptTime();
+        WW_LOG("dma_canary::timer_stop_exit reason=%s client=%u registered=%u count=%lu running=%ld queued=%ld work_running=%ld wait_status=0x%08lx elapsed_us=%lu",
+            reason ? reason : "unknown",
+            client_pid,
+            current_registered_client_pid(),
+            g_canary_count,
+            _InterlockedCompareExchange(&g_running, 0, 0),
+            _InterlockedCompareExchange(&g_work_queued, 0, 0),
+            _InterlockedCompareExchange(&g_work_running, 0, 0),
+            wait_status,
+            elapsed_us_from_100ns(start_time, end_time));
     }
 
     __forceinline BOOLEAN query_tier_a_preloaded() {

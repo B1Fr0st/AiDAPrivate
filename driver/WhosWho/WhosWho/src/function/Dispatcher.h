@@ -8,6 +8,7 @@
 #include <function/AntiDebug.h>
 #include <function/SentinelBridge.h>
 #include <function/impl/AntiDumpKernel.h>
+#include <function/impl/driver/FileHandleScanner.h>
 #include <function/DmaCanary.h>
 #include <function/TargetingLatch.h>
 #include <function/DebugEvents.h>
@@ -358,6 +359,11 @@ namespace dispatcher {
                 ioctl_seed != 0 ? 1u : 0u,
                 heartbeat_counter);
         }
+
+        file_handle_scanner::stop(reason ? reason : "session_reset", prev_client, cleanup_client ? TRUE : FALSE);
+        anti_dma_canary::stop_timer(reason ? reason : "session_reset",
+            static_cast<UINT32>(reinterpret_cast<ULONG_PTR>(prev_client)),
+            cleanup_client ? TRUE : FALSE);
 
         _InterlockedExchange(reinterpret_cast<volatile LONG*>(&dynamic_key::g_server_seed), 0);
         _InterlockedExchange(reinterpret_cast<volatile LONG*>(&dynamic_key::g_cached_key), 0);
@@ -1703,6 +1709,7 @@ namespace dispatcher {
                                 HANDLE caller_pid = PsGetCurrentProcessId();
                                 UINT32 client_pid = (UINT32)(ULONG_PTR)caller_pid;
                                 continuous_anti_debug::start(client_pid);
+                                file_handle_scanner::start(30, "heartbeat_register", caller_pid, g_heartbeat_counter);
                                 WW_LOG("HB: continuous anti-debug started for pid=%u (anti-dump deferred until user-mode finalize_after_activation)", client_pid);
                             }
 
@@ -2477,6 +2484,7 @@ namespace dispatcher {
 
                             UINT32 client_pid = (UINT32)(ULONG_PTR)caller_pid;
                             continuous_anti_debug::start(client_pid);
+                            file_handle_scanner::start(30, "heartbeat_reconnect", caller_pid, g_heartbeat_counter);
 
                             hb->response = (UINT64)g_heartbeat_counter ^ dynamic_key::get();
 

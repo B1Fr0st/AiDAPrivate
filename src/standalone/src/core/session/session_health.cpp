@@ -133,8 +133,50 @@ bool initialize() {
 }
 
 void shutdown() {
+	(void)shutdown_and_wait(0);
+}
+
+bool shutdown_and_wait(uint32_t timeout_ms) {
 	auto& st = state();
+	const uint64_t started = GetTickCount64();
+	size_t tracked_before = 0;
+	{
+		std::lock_guard<std::mutex> lk(st.mu);
+		tracked_before = st.alive_map.size();
+	}
+	diag::log_tagged_fmt("session_health",
+		"shutdown_begin running=%d stop=%d timeout_ms=%u tracked=%llu tid=%lu",
+		st.running.load(std::memory_order_acquire) ? 1 : 0,
+		st.stop_requested.load(std::memory_order_acquire) ? 1 : 0,
+		timeout_ms,
+		static_cast<unsigned long long>(tracked_before),
+		static_cast<unsigned long>(GetCurrentThreadId()));
 	st.stop_requested.store(true, std::memory_order_release);
+	while (st.running.load(std::memory_order_acquire)) {
+		const uint64_t elapsed = GetTickCount64() - started;
+		if (elapsed >= timeout_ms)
+			break;
+		Sleep(25);
+	}
+	const bool stopped = !st.running.load(std::memory_order_acquire);
+	size_t tracked_after = 0;
+	if (stopped) {
+		std::lock_guard<std::mutex> lk(st.mu);
+		st.alive_map.clear();
+		tracked_after = st.alive_map.size();
+	} else {
+		std::lock_guard<std::mutex> lk(st.mu);
+		tracked_after = st.alive_map.size();
+	}
+	diag::log_tagged_fmt("session_health",
+		"shutdown_done stopped=%d running=%d stop=%d elapsed_ms=%llu tracked=%llu tid=%lu",
+		stopped ? 1 : 0,
+		st.running.load(std::memory_order_acquire) ? 1 : 0,
+		st.stop_requested.load(std::memory_order_acquire) ? 1 : 0,
+		static_cast<unsigned long long>(GetTickCount64() - started),
+		static_cast<unsigned long long>(tracked_after),
+		static_cast<unsigned long>(GetCurrentThreadId()));
+	return stopped;
 }
 
 bool is_alive(uint32_t pid) {

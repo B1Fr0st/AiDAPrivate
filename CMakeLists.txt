@@ -2092,6 +2092,10 @@ if(WIN32)
                     -File "${AIDA_CAMOUFOX_REVERSE_MCP_BUILD_SCRIPT}"
                     -SourceRoot "${AIDA_CAMOUFOX_REVERSE_MCP_SOURCE_DIR}"
                     -OutputDir "${CMAKE_CURRENT_SOURCE_DIR}/.deps"
+                COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/deps"
+                COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different
+                    "${AIDA_CAMOUFOX_REVERSE_MCP_CANONICAL_DIR}"
+                    "${CMAKE_CURRENT_BINARY_DIR}/deps/AiDA_CamoufoxReverseMcp"
                 COMMAND ${CMAKE_COMMAND} -E touch "${AIDA_CAMOUFOX_REVERSE_MCP_STAMP}"
                 BYPRODUCTS "${AIDA_CAMOUFOX_REVERSE_MCP_CANONICAL_EXE}"
                 DEPENDS ${AIDA_CAMOUFOX_REVERSE_MCP_BUILD_DEPS}
@@ -2232,7 +2236,9 @@ if(WIN32)
             if(AIDA_CAMOUFOX_REVERSE_MCP_EXE)
                 get_filename_component(AIDA_CAMOUFOX_REVERSE_MCP_EXE_DIR "${AIDA_CAMOUFOX_REVERSE_MCP_EXE}" DIRECTORY)
                 get_filename_component(AIDA_CAMOUFOX_REVERSE_MCP_EXE_PARENT_NAME "${AIDA_CAMOUFOX_REVERSE_MCP_EXE_DIR}" NAME)
+                set(AIDA_CAMOUFOX_STAGE_FROZEN_ONEDIR OFF)
                 if(AIDA_CAMOUFOX_REVERSE_MCP_EXE_PARENT_NAME STREQUAL "AiDA_CamoufoxReverseMcp")
+                    set(AIDA_CAMOUFOX_STAGE_FROZEN_ONEDIR ON)
                     add_custom_command(TARGET AiDAStandalone POST_BUILD
                         COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:AiDAStandalone>/deps"
                         COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different
@@ -2266,7 +2272,7 @@ if(WIN32)
                 message(STATUS "AiDA Camoufox app-local Python runtime: ${AIDA_BUNDLED_PYTHON_DIR}")
             endif()
 
-            if(AIDA_BUNDLED_PYTHON_DIR OR AIDA_CAMOUFOX_STAGE_REVERSE_MCP_SOURCE)
+            if(AIDA_BUNDLED_PYTHON_DIR OR AIDA_CAMOUFOX_STAGE_REVERSE_MCP_SOURCE OR AIDA_CAMOUFOX_STAGE_FROZEN_ONEDIR)
                 add_custom_command(TARGET AiDAStandalone POST_BUILD
                     COMMAND ${CMAKE_COMMAND}
                         "-DAIDA_CAMOUFOX_STAGE_ROOT=$<TARGET_FILE_DIR:AiDAStandalone>"

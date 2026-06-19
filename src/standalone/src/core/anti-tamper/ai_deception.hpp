@@ -4,8 +4,11 @@
 #include <intrin.h>
 
 #include <atomic>
+#include <cstdarg>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <exception>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -705,19 +708,331 @@ namespace noise_sections {
 
 namespace mcp_decoy {
 
+    enum class io_result
+    {
+        completed,
+        cancelled,
+        disconnected,
+        failed
+    };
+
+    struct decoy_state
+    {
+        std::atomic<bool> running{false};
+        std::atomic<bool> worker_active{false};
+        std::atomic<DWORD> worker_tid{0};
+        HANDLE pipe = INVALID_HANDLE_VALUE;
+        HANDLE cancel_event = nullptr;
+        std::mutex mtx;
+        aida::infra::win_thread::joinable_thread_t worker;
+    };
+
+    inline decoy_state& state()
+    {
+        static decoy_state* s = new decoy_state();
+        return *s;
+    }
+
+    inline constexpr DWORD kCancelDrainMs = 1000;
+    inline constexpr DWORD kShutdownJoinMs = 5000;
+    inline constexpr DWORD kShutdownSecondChanceMs = 1000;
+
     inline std::atomic<bool>& decoy_running()
     {
-        static std::atomic<bool> r{false};
-        return r;
+        return state().running;
     }
 
-    inline HANDLE& pipe_handle()
+    inline uint64_t tick_ms()
     {
-        static HANDLE h = INVALID_HANDLE_VALUE;
-        return h;
+        return GetTickCount64();
     }
 
-    inline void serve_fake_responses(HANDLE pipe)
+    inline void logf(const char* fmt, ...)
+    {
+        char buf[1024];
+        va_list args;
+        va_start(args, fmt);
+        _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, args);
+        va_end(args);
+        webhook::write_log("mcp_decoy", buf);
+    }
+
+    inline bool is_disconnect_error(DWORD gle)
+    {
+        return gle == ERROR_BROKEN_PIPE ||
+            gle == ERROR_NO_DATA ||
+            gle == ERROR_PIPE_NOT_CONNECTED;
+    }
+
+    inline io_result classify_io_error(DWORD gle)
+    {
+        if (gle == ERROR_OPERATION_ABORTED)
+            return io_result::cancelled;
+        if (is_disconnect_error(gle))
+            return io_result::disconnected;
+        return io_result::failed;
+    }
+
+    inline io_result wait_pending_io(HANDLE pipe, OVERLAPPED& ov, HANDLE cancel_event, DWORD& bytes, const char* op, uint64_t started_ms)
+    {
+        HANDLE waits[2] = { ov.hEvent, cancel_event };
+        DWORD wait_count = cancel_event ? 2u : 1u;
+        DWORD wait_rc = WaitForMultipleObjects(wait_count, waits, FALSE, INFINITE);
+        uint64_t elapsed = tick_ms() - started_ms;
+
+        if (wait_rc == WAIT_OBJECT_0)
+        {
+            if (GetOverlappedResult(pipe, &ov, &bytes, FALSE))
+            {
+                logf("%s_complete pending=1 bytes=%lu elapsed_ms=%llu tid=%lu",
+                    op,
+                    static_cast<unsigned long>(bytes),
+                    static_cast<unsigned long long>(elapsed),
+                    static_cast<unsigned long>(GetCurrentThreadId()));
+                return io_result::completed;
+            }
+
+            DWORD gle = GetLastError();
+            io_result result = classify_io_error(gle);
+            logf("%s_complete_failed gle=%lu result=%u elapsed_ms=%llu tid=%lu",
+                op,
+                static_cast<unsigned long>(gle),
+                static_cast<unsigned>(result),
+                static_cast<unsigned long long>(elapsed),
+                static_cast<unsigned long>(GetCurrentThreadId()));
+            return result;
+        }
+
+        if (cancel_event && wait_rc == WAIT_OBJECT_0 + 1)
+        {
+            logf("%s_cancel_seen elapsed_ms=%llu tid=%lu",
+                op,
+                static_cast<unsigned long long>(elapsed),
+                static_cast<unsigned long>(GetCurrentThreadId()));
+            BOOL cancel_ok = CancelIoEx(pipe, &ov);
+            DWORD cancel_gle = cancel_ok ? ERROR_SUCCESS : GetLastError();
+            logf("%s_cancel_io ok=%d gle=%lu pipe=%p tid=%lu",
+                op,
+                cancel_ok ? 1 : 0,
+                static_cast<unsigned long>(cancel_gle),
+                pipe,
+                static_cast<unsigned long>(GetCurrentThreadId()));
+            DWORD drain_wait = WaitForSingleObject(ov.hEvent, kCancelDrainMs);
+            DWORD drained = 0;
+            BOOL result_ok = FALSE;
+            DWORD result_gle = ERROR_SUCCESS;
+            if (drain_wait == WAIT_OBJECT_0)
+            {
+                result_ok = GetOverlappedResult(pipe, &ov, &drained, FALSE);
+                result_gle = result_ok ? ERROR_SUCCESS : GetLastError();
+            }
+            else
+            {
+                result_gle = GetLastError();
+            }
+            logf("%s_cancel_complete wait=0x%08lX result_ok=%d gle=%lu bytes=%lu elapsed_ms=%llu tid=%lu",
+                op,
+                static_cast<unsigned long>(drain_wait),
+                result_ok ? 1 : 0,
+                static_cast<unsigned long>(result_gle),
+                static_cast<unsigned long>(drained),
+                static_cast<unsigned long long>(tick_ms() - started_ms),
+                static_cast<unsigned long>(GetCurrentThreadId()));
+            return io_result::cancelled;
+        }
+
+        DWORD gle = GetLastError();
+        logf("%s_wait_failed wait=0x%08lX gle=%lu elapsed_ms=%llu tid=%lu",
+            op,
+            static_cast<unsigned long>(wait_rc),
+            static_cast<unsigned long>(gle),
+            static_cast<unsigned long long>(elapsed),
+            static_cast<unsigned long>(GetCurrentThreadId()));
+        return io_result::failed;
+    }
+
+    inline io_result connect_client(HANDLE pipe, HANDLE cancel_event)
+    {
+        OVERLAPPED ov{};
+        ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!ov.hEvent)
+        {
+            logf("connect_event_create_failed gle=%lu pipe=%p tid=%lu",
+                static_cast<unsigned long>(GetLastError()),
+                pipe,
+                static_cast<unsigned long>(GetCurrentThreadId()));
+            return io_result::failed;
+        }
+
+        DWORD ignored = 0;
+        uint64_t started = tick_ms();
+        logf("connect_begin pipe=%p tid=%lu",
+            pipe,
+            static_cast<unsigned long>(GetCurrentThreadId()));
+        BOOL ok = ConnectNamedPipe(pipe, &ov);
+        if (ok)
+        {
+            logf("connect_complete pending=0 elapsed_ms=%llu pipe=%p tid=%lu",
+                static_cast<unsigned long long>(tick_ms() - started),
+                pipe,
+                static_cast<unsigned long>(GetCurrentThreadId()));
+            CloseHandle(ov.hEvent);
+            return io_result::completed;
+        }
+
+        DWORD gle = GetLastError();
+        if (gle == ERROR_IO_PENDING)
+        {
+            logf("connect_pending pipe=%p tid=%lu",
+                pipe,
+                static_cast<unsigned long>(GetCurrentThreadId()));
+            io_result result = wait_pending_io(pipe, ov, cancel_event, ignored, "connect", started);
+            CloseHandle(ov.hEvent);
+            return result;
+        }
+
+        if (gle == ERROR_PIPE_CONNECTED)
+        {
+            logf("connect_already_connected elapsed_ms=%llu pipe=%p tid=%lu",
+                static_cast<unsigned long long>(tick_ms() - started),
+                pipe,
+                static_cast<unsigned long>(GetCurrentThreadId()));
+            CloseHandle(ov.hEvent);
+            return io_result::completed;
+        }
+
+        io_result result = classify_io_error(gle);
+        logf("connect_failed gle=%lu result=%u elapsed_ms=%llu pipe=%p tid=%lu",
+            static_cast<unsigned long>(gle),
+            static_cast<unsigned>(result),
+            static_cast<unsigned long long>(tick_ms() - started),
+            pipe,
+            static_cast<unsigned long>(GetCurrentThreadId()));
+        CloseHandle(ov.hEvent);
+        return result;
+    }
+
+    inline io_result read_pipe(HANDLE pipe, HANDLE cancel_event, char* buf, DWORD len, DWORD& bytes)
+    {
+        bytes = 0;
+        OVERLAPPED ov{};
+        ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!ov.hEvent)
+        {
+            logf("read_event_create_failed gle=%lu pipe=%p tid=%lu",
+                static_cast<unsigned long>(GetLastError()),
+                pipe,
+                static_cast<unsigned long>(GetCurrentThreadId()));
+            return io_result::failed;
+        }
+
+        uint64_t started = tick_ms();
+        logf("read_begin max=%lu pipe=%p tid=%lu",
+            static_cast<unsigned long>(len),
+            pipe,
+            static_cast<unsigned long>(GetCurrentThreadId()));
+        BOOL ok = ReadFile(pipe, buf, len, &bytes, &ov);
+        if (ok)
+        {
+            logf("read_complete pending=0 bytes=%lu elapsed_ms=%llu pipe=%p tid=%lu",
+                static_cast<unsigned long>(bytes),
+                static_cast<unsigned long long>(tick_ms() - started),
+                pipe,
+                static_cast<unsigned long>(GetCurrentThreadId()));
+            CloseHandle(ov.hEvent);
+            return io_result::completed;
+        }
+
+        DWORD gle = GetLastError();
+        if (gle == ERROR_IO_PENDING)
+        {
+            logf("read_pending pipe=%p tid=%lu",
+                pipe,
+                static_cast<unsigned long>(GetCurrentThreadId()));
+            io_result result = wait_pending_io(pipe, ov, cancel_event, bytes, "read", started);
+            CloseHandle(ov.hEvent);
+            return result;
+        }
+
+        io_result result = classify_io_error(gle);
+        logf("read_failed gle=%lu result=%u elapsed_ms=%llu pipe=%p tid=%lu",
+            static_cast<unsigned long>(gle),
+            static_cast<unsigned>(result),
+            static_cast<unsigned long long>(tick_ms() - started),
+            pipe,
+            static_cast<unsigned long>(GetCurrentThreadId()));
+        CloseHandle(ov.hEvent);
+        return result;
+    }
+
+    inline io_result write_pipe(HANDLE pipe, HANDLE cancel_event, const char* response, DWORD len, DWORD& written)
+    {
+        written = 0;
+        OVERLAPPED ov{};
+        ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!ov.hEvent)
+        {
+            logf("write_event_create_failed gle=%lu pipe=%p tid=%lu",
+                static_cast<unsigned long>(GetLastError()),
+                pipe,
+                static_cast<unsigned long>(GetCurrentThreadId()));
+            return io_result::failed;
+        }
+
+        uint64_t started = tick_ms();
+        logf("write_begin bytes=%lu pipe=%p tid=%lu",
+            static_cast<unsigned long>(len),
+            pipe,
+            static_cast<unsigned long>(GetCurrentThreadId()));
+        BOOL ok = WriteFile(pipe, response, len, &written, &ov);
+        if (ok)
+        {
+            logf("write_complete pending=0 bytes=%lu requested=%lu elapsed_ms=%llu pipe=%p tid=%lu",
+                static_cast<unsigned long>(written),
+                static_cast<unsigned long>(len),
+                static_cast<unsigned long long>(tick_ms() - started),
+                pipe,
+                static_cast<unsigned long>(GetCurrentThreadId()));
+            CloseHandle(ov.hEvent);
+            return io_result::completed;
+        }
+
+        DWORD gle = GetLastError();
+        if (gle == ERROR_IO_PENDING)
+        {
+            logf("write_pending bytes=%lu pipe=%p tid=%lu",
+                static_cast<unsigned long>(len),
+                pipe,
+                static_cast<unsigned long>(GetCurrentThreadId()));
+            io_result result = wait_pending_io(pipe, ov, cancel_event, written, "write", started);
+            CloseHandle(ov.hEvent);
+            return result;
+        }
+
+        io_result result = classify_io_error(gle);
+        logf("write_failed gle=%lu result=%u elapsed_ms=%llu pipe=%p tid=%lu",
+            static_cast<unsigned long>(gle),
+            static_cast<unsigned>(result),
+            static_cast<unsigned long long>(tick_ms() - started),
+            pipe,
+            static_cast<unsigned long>(GetCurrentThreadId()));
+        CloseHandle(ov.hEvent);
+        return result;
+    }
+
+    inline void disconnect_pipe(HANDLE pipe, const char* reason)
+    {
+        BOOL ok = DisconnectNamedPipe(pipe);
+        DWORD gle = ok ? ERROR_SUCCESS : GetLastError();
+        logf("disconnect reason=%s ok=%d gle=%lu pipe=%p tid=%lu",
+            reason ? reason : "<none>",
+            ok ? 1 : 0,
+            static_cast<unsigned long>(gle),
+            pipe,
+            static_cast<unsigned long>(GetCurrentThreadId()));
+    }
+
+    inline bool serve_fake_responses(HANDLE pipe, HANDLE cancel_event)
     {
         const char* fake_responses[] = {
             "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"read_memory\",\"description\":\"Read process memory\"}]}}",
@@ -728,39 +1043,90 @@ namespace mcp_decoy {
         };
 
         char read_buf[4096];
-        DWORD bytes_read = 0;
         int response_idx = 0;
 
-        while (decoy_running().load())
+        while (decoy_running().load(std::memory_order_acquire))
         {
-            if (ReadFile(pipe, read_buf, sizeof(read_buf) - 1, &bytes_read, nullptr))
+            DWORD bytes_read = 0;
+            io_result read_result = read_pipe(pipe, cancel_event, read_buf, static_cast<DWORD>(sizeof(read_buf) - 1), bytes_read);
+            if (read_result == io_result::cancelled)
+                return false;
+            if (read_result != io_result::completed)
             {
-                webhook::send_debug_log("mcp_decoy", "mcp_connection_attempt", true);
+                logf("client_read_end result=%u pipe=%p tid=%lu",
+                    static_cast<unsigned>(read_result),
+                    pipe,
+                    static_cast<unsigned long>(GetCurrentThreadId()));
+                return decoy_running().load(std::memory_order_acquire);
+            }
 
-                const char* response = fake_responses[response_idx % 5];
-                DWORD written = 0;
-                WriteFile(pipe, response, static_cast<DWORD>(strlen(response)),
-                    &written, nullptr);
-                ++response_idx;
+            if (bytes_read == 0)
+            {
+                logf("client_read_zero pipe=%p tid=%lu",
+                    pipe,
+                    static_cast<unsigned long>(GetCurrentThreadId()));
+                return decoy_running().load(std::memory_order_acquire);
+            }
+
+            read_buf[(bytes_read < sizeof(read_buf)) ? bytes_read : (sizeof(read_buf) - 1)] = '\0';
+            webhook::send_debug_log("mcp_decoy", "mcp_connection_attempt", true);
+            logf("request_received bytes=%lu response_index=%d pipe=%p tid=%lu",
+                static_cast<unsigned long>(bytes_read),
+                response_idx,
+                pipe,
+                static_cast<unsigned long>(GetCurrentThreadId()));
+
+            const char* response = fake_responses[response_idx % 5];
+            DWORD written = 0;
+            DWORD response_len = static_cast<DWORD>(strlen(response));
+            io_result write_result = write_pipe(pipe, cancel_event, response, response_len, written);
+            logf("response_write_result result=%u requested=%lu written=%lu response_index=%d pipe=%p tid=%lu",
+                static_cast<unsigned>(write_result),
+                static_cast<unsigned long>(response_len),
+                static_cast<unsigned long>(written),
+                response_idx,
+                pipe,
+                static_cast<unsigned long>(GetCurrentThreadId()));
+            if (write_result == io_result::cancelled)
+                return false;
+            if (write_result != io_result::completed)
+                return decoy_running().load(std::memory_order_acquire);
+
+            ++response_idx;
+        }
+
+        return false;
+    }
+
+    inline void worker_proc()
+    {
+        auto& s = state();
+        DWORD tid = GetCurrentThreadId();
+        s.worker_tid.store(tid, std::memory_order_release);
+        logf("worker_enter pid=%lu tid=%lu",
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long>(tid));
+
+        HANDLE cancel_event = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(s.mtx);
+            cancel_event = s.cancel_event;
+        }
+
+        HANDLE pipe = INVALID_HANDLE_VALUE;
+
+        try
+        {
+            if (!cancel_event)
+            {
+                logf("worker_no_cancel_event tid=%lu", static_cast<unsigned long>(tid));
             }
             else
             {
-                DisconnectNamedPipe(pipe);
-                ConnectNamedPipe(pipe, nullptr);
-            }
-        }
-    }
-
-    inline void start_decoy_pipe()
-    {
-        if (decoy_running().exchange(true))
-            return;
-
-        std::string err;
-        if (!aida::infra::win_thread::start_detached([]() {
-                HANDLE h = CreateNamedPipeW(
+                logf("pipe_create_begin name=AiDA_MCP_Bridge tid=%lu", static_cast<unsigned long>(tid));
+                pipe = CreateNamedPipeW(
                     L"\\\\.\\pipe\\AiDA_MCP_Bridge",
-                    PIPE_ACCESS_DUPLEX,
+                    PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
                     PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
                     1,
                     4096,
@@ -768,33 +1134,274 @@ namespace mcp_decoy {
                     0,
                     nullptr);
 
-                if (h == INVALID_HANDLE_VALUE)
+                if (pipe == INVALID_HANDLE_VALUE)
                 {
-                    decoy_running().store(false);
-                    return;
+                    DWORD gle = GetLastError();
+                    logf("pipe_create_failed gle=%lu tid=%lu",
+                        static_cast<unsigned long>(gle),
+                        static_cast<unsigned long>(tid));
                 }
+                else
+                {
+                    {
+                        std::lock_guard<std::mutex> lk(s.mtx);
+                        s.pipe = pipe;
+                    }
+                    logf("pipe_create_ok pipe=%p tid=%lu", pipe, static_cast<unsigned long>(tid));
 
-                pipe_handle() = h;
-                ConnectNamedPipe(h, nullptr);
-                serve_fake_responses(h);
-            },
-            &err,
-            aida::infra::win_thread::default_stack_reserve,
-            "ai_deception_decoy_pipe"))
-        {
-            decoy_running().store(false);
+                    while (decoy_running().load(std::memory_order_acquire))
+                    {
+                        io_result connect_result = connect_client(pipe, cancel_event);
+                        if (connect_result == io_result::cancelled)
+                            break;
+
+                        if (connect_result == io_result::completed)
+                        {
+                            logf("client_connected pipe=%p tid=%lu",
+                                pipe,
+                                static_cast<unsigned long>(tid));
+                            bool keep_accepting = serve_fake_responses(pipe, cancel_event);
+                            disconnect_pipe(pipe, decoy_running().load(std::memory_order_acquire) ? "client_session_end" : "shutdown");
+                            if (!keep_accepting)
+                                break;
+                        }
+                        else
+                        {
+                            logf("connect_cycle_failed result=%u pipe=%p running=%d tid=%lu",
+                                static_cast<unsigned>(connect_result),
+                                pipe,
+                                decoy_running().load(std::memory_order_acquire) ? 1 : 0,
+                                static_cast<unsigned long>(tid));
+                            if (WaitForSingleObject(cancel_event, 250) == WAIT_OBJECT_0)
+                                break;
+                        }
+                    }
+                }
+            }
         }
+        catch (const std::exception& ex)
+        {
+            logf("worker_exception tid=%lu what=%s",
+                static_cast<unsigned long>(tid),
+                ex.what());
+        }
+        catch (...)
+        {
+            logf("worker_exception tid=%lu what=unknown",
+                static_cast<unsigned long>(tid));
+        }
+
+        if (pipe != INVALID_HANDLE_VALUE)
+        {
+            disconnect_pipe(pipe, "worker_exit");
+            std::lock_guard<std::mutex> lk(s.mtx);
+            if (s.pipe == pipe)
+                s.pipe = INVALID_HANDLE_VALUE;
+            CloseHandle(pipe);
+            logf("pipe_closed pipe=%p tid=%lu", pipe, static_cast<unsigned long>(tid));
+        }
+
+        s.running.store(false, std::memory_order_release);
+        s.worker_tid.store(0, std::memory_order_release);
+        s.worker_active.store(false, std::memory_order_release);
+        logf("worker_exit pid=%lu tid=%lu",
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long>(tid));
+    }
+
+    inline void close_cancel_event_if_idle()
+    {
+        auto& s = state();
+        std::lock_guard<std::mutex> lk(s.mtx);
+        if (!s.worker_active.load(std::memory_order_acquire) && s.cancel_event)
+        {
+            CloseHandle(s.cancel_event);
+            logf("cancel_event_closed handle=%p tid=%lu",
+                s.cancel_event,
+                static_cast<unsigned long>(GetCurrentThreadId()));
+            s.cancel_event = nullptr;
+        }
+    }
+
+    inline void start_decoy_pipe()
+    {
+        auto& s = state();
+        std::lock_guard<std::mutex> lk(s.mtx);
+        logf("start_begin pid=%lu tid=%lu running=%d worker_active=%d joinable=%d",
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            s.running.load(std::memory_order_acquire) ? 1 : 0,
+            s.worker_active.load(std::memory_order_acquire) ? 1 : 0,
+            s.worker.joinable() ? 1 : 0);
+
+        if (s.running.load(std::memory_order_acquire) || s.worker_active.load(std::memory_order_acquire))
+        {
+            logf("start_already_running tid=%lu worker_tid=%lu",
+                static_cast<unsigned long>(GetCurrentThreadId()),
+                static_cast<unsigned long>(s.worker_tid.load(std::memory_order_acquire)));
+            return;
+        }
+
+        if (s.worker.joinable() && !s.worker.join_for(0))
+        {
+            logf("start_previous_worker_busy tid=%lu worker_tid=%lu",
+                static_cast<unsigned long>(GetCurrentThreadId()),
+                static_cast<unsigned long>(s.worker.id()));
+            return;
+        }
+
+        if (!s.cancel_event)
+        {
+            s.cancel_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            if (!s.cancel_event)
+            {
+                logf("start_cancel_event_failed gle=%lu tid=%lu",
+                    static_cast<unsigned long>(GetLastError()),
+                    static_cast<unsigned long>(GetCurrentThreadId()));
+                return;
+            }
+            logf("start_cancel_event_created handle=%p tid=%lu",
+                s.cancel_event,
+                static_cast<unsigned long>(GetCurrentThreadId()));
+        }
+
+        ResetEvent(s.cancel_event);
+        s.running.store(true, std::memory_order_release);
+        s.worker_active.store(true, std::memory_order_release);
+        s.worker_tid.store(0, std::memory_order_release);
+
+        std::string err;
+        if (!s.worker.start(worker_proc,
+                &err,
+                aida::infra::win_thread::default_stack_reserve,
+                "ai_deception_decoy_pipe"))
+        {
+            s.running.store(false, std::memory_order_release);
+            s.worker_active.store(false, std::memory_order_release);
+            logf("start_thread_failed err=%s gle=%lu tid=%lu",
+                err.empty() ? "<none>" : err.c_str(),
+                static_cast<unsigned long>(GetLastError()),
+                static_cast<unsigned long>(GetCurrentThreadId()));
+            return;
+        }
+
+        logf("start_thread_started thread_id=%u tid=%lu",
+            s.worker.id(),
+            static_cast<unsigned long>(GetCurrentThreadId()));
     }
 
     inline void stop_decoy_pipe()
     {
-        decoy_running().store(false);
-        if (pipe_handle() != INVALID_HANDLE_VALUE)
+        auto& s = state();
+        unsigned worker_id = 0;
+        bool joinable = false;
+
         {
-            DisconnectNamedPipe(pipe_handle());
-            CloseHandle(pipe_handle());
-            pipe_handle() = INVALID_HANDLE_VALUE;
+            std::lock_guard<std::mutex> lk(s.mtx);
+            worker_id = s.worker.id();
+            joinable = s.worker.joinable();
+            logf("shutdown_begin pid=%lu tid=%lu running=%d worker_active=%d worker_tid=%lu joinable=%d pipe=%p cancel_event=%p",
+                static_cast<unsigned long>(GetCurrentProcessId()),
+                static_cast<unsigned long>(GetCurrentThreadId()),
+                s.running.load(std::memory_order_acquire) ? 1 : 0,
+                s.worker_active.load(std::memory_order_acquire) ? 1 : 0,
+                static_cast<unsigned long>(s.worker_tid.load(std::memory_order_acquire)),
+                joinable ? 1 : 0,
+                s.pipe,
+                s.cancel_event);
+
+            s.running.store(false, std::memory_order_release);
+            if (s.cancel_event)
+            {
+                BOOL set_ok = SetEvent(s.cancel_event);
+                logf("shutdown_cancel_event_set ok=%d gle=%lu handle=%p tid=%lu",
+                    set_ok ? 1 : 0,
+                    static_cast<unsigned long>(set_ok ? ERROR_SUCCESS : GetLastError()),
+                    s.cancel_event,
+                    static_cast<unsigned long>(GetCurrentThreadId()));
+            }
+
+            if (s.pipe != INVALID_HANDLE_VALUE)
+            {
+                BOOL cancel_ok = CancelIoEx(s.pipe, nullptr);
+                DWORD cancel_gle = cancel_ok ? ERROR_SUCCESS : GetLastError();
+                logf("shutdown_cancel_io ok=%d gle=%lu pipe=%p tid=%lu",
+                    cancel_ok ? 1 : 0,
+                    static_cast<unsigned long>(cancel_gle),
+                    s.pipe,
+                    static_cast<unsigned long>(GetCurrentThreadId()));
+            }
+            else
+            {
+                logf("shutdown_cancel_io skipped=no_pipe tid=%lu",
+                    static_cast<unsigned long>(GetCurrentThreadId()));
+            }
         }
+
+        if (joinable)
+        {
+            logf("shutdown_join_begin worker_tid=%u timeout_ms=%lu tid=%lu",
+                worker_id,
+                static_cast<unsigned long>(kShutdownJoinMs),
+                static_cast<unsigned long>(GetCurrentThreadId()));
+            if (!s.worker.join_for(kShutdownJoinMs))
+            {
+                logf("shutdown_join_timeout worker_tid=%u timeout_ms=%lu running=%d worker_active=%d tid=%lu",
+                    worker_id,
+                    static_cast<unsigned long>(kShutdownJoinMs),
+                    s.running.load(std::memory_order_acquire) ? 1 : 0,
+                    s.worker_active.load(std::memory_order_acquire) ? 1 : 0,
+                    static_cast<unsigned long>(GetCurrentThreadId()));
+                {
+                    std::lock_guard<std::mutex> lk(s.mtx);
+                    if (s.pipe != INVALID_HANDLE_VALUE)
+                    {
+                        BOOL cancel_ok = CancelIoEx(s.pipe, nullptr);
+                        DWORD cancel_gle = cancel_ok ? ERROR_SUCCESS : GetLastError();
+                        logf("shutdown_second_cancel_io ok=%d gle=%lu pipe=%p tid=%lu",
+                            cancel_ok ? 1 : 0,
+                            static_cast<unsigned long>(cancel_gle),
+                            s.pipe,
+                            static_cast<unsigned long>(GetCurrentThreadId()));
+                    }
+                }
+                if (!s.worker.join_for(kShutdownSecondChanceMs))
+                {
+                    logf("shutdown_join_second_timeout worker_tid=%u timeout_ms=%lu running=%d worker_active=%d tid=%lu",
+                        worker_id,
+                        static_cast<unsigned long>(kShutdownSecondChanceMs),
+                        s.running.load(std::memory_order_acquire) ? 1 : 0,
+                        s.worker_active.load(std::memory_order_acquire) ? 1 : 0,
+                        static_cast<unsigned long>(GetCurrentThreadId()));
+                }
+                else
+                {
+                    logf("shutdown_join_second_done worker_tid=%u tid=%lu",
+                        worker_id,
+                        static_cast<unsigned long>(GetCurrentThreadId()));
+                    close_cancel_event_if_idle();
+                }
+            }
+            else
+            {
+                logf("shutdown_join_done worker_tid=%u tid=%lu",
+                    worker_id,
+                    static_cast<unsigned long>(GetCurrentThreadId()));
+                close_cancel_event_if_idle();
+            }
+        }
+        else
+        {
+            close_cancel_event_if_idle();
+        }
+
+        logf("shutdown_done pid=%lu tid=%lu running=%d worker_active=%d joinable=%d pipe=%p",
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            s.running.load(std::memory_order_acquire) ? 1 : 0,
+            s.worker_active.load(std::memory_order_acquire) ? 1 : 0,
+            s.worker.joinable() ? 1 : 0,
+            s.pipe);
     }
 
 }
@@ -1149,8 +1756,14 @@ inline void initialize()
 
 inline void shutdown()
 {
+    webhook::write_log("ai_deception", "shutdown_begin");
+    webhook::write_log("ai_deception", "shutdown_mcp_decoy_begin");
     mcp_decoy::stop_decoy_pipe();
+    webhook::write_log("ai_deception", "shutdown_mcp_decoy_done");
+    webhook::write_log("ai_deception", "shutdown_polymorphic_decoys_begin");
     polymorphic_decoys::cleanup();
+    webhook::write_log("ai_deception", "shutdown_polymorphic_decoys_done");
+    webhook::write_log("ai_deception", "shutdown_done");
 }
 
 }

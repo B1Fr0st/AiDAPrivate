@@ -18,8 +18,10 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace aida {
@@ -29,6 +31,8 @@ namespace {
 
 using json = nlohmann::json;
 using tool_result_t = mcp_standalone::tool_result_t;
+
+std::vector<uint8_t> b64_decode(const std::string& s);
 
 const char* json_type_name(const json& j)
 {
@@ -62,6 +66,384 @@ std::string json_shape(const json& j, size_t max_keys = 12)
         oss << "[" << j.size() << "]";
     }
     return oss.str();
+}
+
+const char* json_observed_type(const json& j)
+{
+    if (j.is_object()) return "object";
+    if (j.is_array()) return "array";
+    if (j.is_string()) return "string";
+    if (j.is_boolean()) return "boolean";
+    if (j.is_number_unsigned()) return "number_unsigned";
+    if (j.is_number_integer()) return "number_integer";
+    if (j.is_number_float()) return "number_float";
+    if (j.is_null()) return "null";
+    return "other";
+}
+
+const json* json_member(const json& obj, const char* key)
+{
+    if (!obj.is_object()) return nullptr;
+    auto it = obj.find(key);
+    if (it == obj.end()) return nullptr;
+    return &(*it);
+}
+
+std::string range_text(uint64_t min_value, uint64_t max_value)
+{
+    return std::to_string(min_value) + ".." + std::to_string(max_value);
+}
+
+tool_result_t h2_field_error(const std::string& field, const json* value, const std::string& expected, const std::string& reason)
+{
+    const char* observed = value ? json_observed_type(*value) : "missing";
+    json data;
+    data["code"] = "invalid_field";
+    data["field"] = field;
+    data["expected"] = expected;
+    data["observed_type"] = observed;
+    data["reason"] = reason;
+    diag::log_tagged_fmt("mcp_burp", "h2_send parse_error field=%s observed=%s expected=%s reason=%s",
+        field.c_str(), observed, expected.c_str(), reason.c_str());
+    return tool_result_t::error("invalid field '" + field + "': " + reason, data);
+}
+
+bool h2_parse_required_string(const json& params, const char* field, std::string& out, tool_result_t& err)
+{
+    const json* value = json_member(params, field);
+    if (!value) {
+        err = h2_field_error(field, nullptr, "string", "required string field is missing");
+        return false;
+    }
+    if (!value->is_string()) {
+        err = h2_field_error(field, value, "string", "must be a string");
+        return false;
+    }
+    const auto* text = value->get_ptr<const json::string_t*>();
+    if (!text) {
+        err = h2_field_error(field, value, "string", "string storage is unavailable");
+        return false;
+    }
+    out = *text;
+    diag::log_tagged_fmt("mcp_burp", "h2_send parse_field field=%s outcome=ok type=%s len=%zu",
+        field, json_observed_type(*value), out.size());
+    return true;
+}
+
+bool h2_parse_optional_bool(const json& params, const char* field, bool default_value, bool& out, tool_result_t& err)
+{
+    const json* value = json_member(params, field);
+    if (!value) {
+        out = default_value;
+        diag::log_tagged_fmt("mcp_burp", "h2_send parse_field field=%s outcome=default value=%d",
+            field, static_cast<int>(out));
+        return true;
+    }
+    if (!value->is_boolean()) {
+        err = h2_field_error(field, value, "boolean", "must be a boolean");
+        return false;
+    }
+    const auto* parsed = value->get_ptr<const json::boolean_t*>();
+    if (!parsed) {
+        err = h2_field_error(field, value, "boolean", "boolean storage is unavailable");
+        return false;
+    }
+    out = *parsed;
+    diag::log_tagged_fmt("mcp_burp", "h2_send parse_field field=%s outcome=ok type=%s value=%d",
+        field, json_observed_type(*value), static_cast<int>(out));
+    return true;
+}
+
+bool h2_json_to_u64(const json& value, uint64_t& out, std::string& reason)
+{
+    if (value.is_number_unsigned()) {
+        const auto* parsed = value.get_ptr<const json::number_unsigned_t*>();
+        if (!parsed) {
+            reason = "unsigned integer storage is unavailable";
+            return false;
+        }
+        out = static_cast<uint64_t>(*parsed);
+        return true;
+    }
+    if (value.is_number_integer()) {
+        const auto* parsed = value.get_ptr<const json::number_integer_t*>();
+        if (!parsed) {
+            reason = "integer storage is unavailable";
+            return false;
+        }
+        if (*parsed < 0) {
+            reason = "must not be negative";
+            return false;
+        }
+        out = static_cast<uint64_t>(*parsed);
+        return true;
+    }
+    if (value.is_number_float()) {
+        reason = "must be an integer, not a floating-point number";
+        return false;
+    }
+    reason = "must be an integer";
+    return false;
+}
+
+bool h2_parse_bounded_u64(const json& params, const char* field, uint64_t default_value, uint64_t min_value, uint64_t max_value, uint64_t& out, tool_result_t& err)
+{
+    const json* value = json_member(params, field);
+    const std::string expected = "integer " + range_text(min_value, max_value);
+    if (!value) {
+        out = default_value;
+        diag::log_tagged_fmt("mcp_burp", "h2_send parse_field field=%s outcome=default value=%llu bounds=%s",
+            field, static_cast<unsigned long long>(out), range_text(min_value, max_value).c_str());
+        return true;
+    }
+    uint64_t parsed = 0;
+    std::string reason;
+    if (!h2_json_to_u64(*value, parsed, reason)) {
+        err = h2_field_error(field, value, expected, reason);
+        return false;
+    }
+    if (parsed < min_value || parsed > max_value) {
+        err = h2_field_error(field, value, expected, "must be between " + range_text(min_value, max_value));
+        return false;
+    }
+    out = parsed;
+    diag::log_tagged_fmt("mcp_burp", "h2_send parse_field field=%s outcome=ok type=%s value=%llu bounds=%s",
+        field, json_observed_type(*value), static_cast<unsigned long long>(out), range_text(min_value, max_value).c_str());
+    return true;
+}
+
+bool h2_is_base64_text(const std::string& text)
+{
+    size_t symbols = 0;
+    size_t padding = 0;
+    bool seen_padding = false;
+    for (unsigned char c : text) {
+        if (c == '\r' || c == '\n' || c == ' ' || c == '\t') continue;
+        ++symbols;
+        if (c == '=') {
+            seen_padding = true;
+            ++padding;
+            if (padding > 2) return false;
+            continue;
+        }
+        if (seen_padding) return false;
+        if (c >= 'A' && c <= 'Z') continue;
+        if (c >= 'a' && c <= 'z') continue;
+        if (c >= '0' && c <= '9') continue;
+        if (c == '+' || c == '/') continue;
+        return false;
+    }
+    if (symbols == 0) return true;
+    if (padding > 0 && (symbols % 4) != 0) return false;
+    if ((symbols % 4) == 1) return false;
+    return true;
+}
+
+bool h2_parse_pseudo_headers(const json& params, h2_editor::pseudo_headers_t& out, tool_result_t& err)
+{
+    const json* value = json_member(params, "pseudo_headers");
+    if (!value) {
+        diag::log_tagged_fmt("mcp_burp", "h2_send pseudo_headers_parse outcome=default method=%s path_len=%zu scheme=%s authority_len=%zu",
+            out.method.c_str(), out.path.size(), out.scheme.c_str(), out.authority.size());
+        return true;
+    }
+    if (!value->is_object()) {
+        err = h2_field_error("pseudo_headers", value, "object", "must be an object");
+        return false;
+    }
+    const char* keys[] = { "method", "path", "scheme", "authority" };
+    std::string* targets[] = { &out.method, &out.path, &out.scheme, &out.authority };
+    for (size_t i = 0; i < 4; ++i) {
+        const json* member = json_member(*value, keys[i]);
+        if (!member) {
+            diag::log_tagged_fmt("mcp_burp", "h2_send pseudo_headers_field field=pseudo_headers.%s outcome=default len=%zu",
+                keys[i], targets[i]->size());
+            continue;
+        }
+        if (!member->is_string()) {
+            err = h2_field_error(std::string("pseudo_headers.") + keys[i], member, "string", "pseudo-header value must be a string");
+            return false;
+        }
+        const auto* text = member->get_ptr<const json::string_t*>();
+        if (!text) {
+            err = h2_field_error(std::string("pseudo_headers.") + keys[i], member, "string", "string storage is unavailable");
+            return false;
+        }
+        *targets[i] = *text;
+        diag::log_tagged_fmt("mcp_burp", "h2_send pseudo_headers_field field=pseudo_headers.%s outcome=ok len=%zu",
+            keys[i], targets[i]->size());
+    }
+    diag::log_tagged_fmt("mcp_burp", "h2_send pseudo_headers_parse outcome=ok method=%s path_len=%zu scheme=%s authority_len=%zu",
+        out.method.c_str(), out.path.size(), out.scheme.c_str(), out.authority.size());
+    return true;
+}
+
+bool h2_parse_headers(const json& params, std::vector<std::pair<std::string, std::string>>& out, tool_result_t& err)
+{
+    const json* value = json_member(params, "headers");
+    if (!value) {
+        diag::log_tagged_fmt("mcp_burp", "h2_send headers_parse outcome=default count=0");
+        return true;
+    }
+    if (!value->is_array()) {
+        err = h2_field_error("headers", value, "array", "must be an array of [name,value] arrays or {name,value} objects");
+        return false;
+    }
+    size_t index = 0;
+    for (const auto& entry : *value) {
+        const std::string base = "headers[" + std::to_string(index) + "]";
+        std::string name;
+        std::string header_value;
+        if (entry.is_array()) {
+            if (entry.size() != 2) {
+                err = h2_field_error(base, &entry, "array[2]", "header array entry must contain exactly two elements");
+                return false;
+            }
+            if (!entry[0].is_string()) {
+                err = h2_field_error(base + "[0]", &entry[0], "string", "header name must be a string");
+                return false;
+            }
+            if (!entry[1].is_string()) {
+                err = h2_field_error(base + "[1]", &entry[1], "string", "header value must be a string");
+                return false;
+            }
+            const auto* name_text = entry[0].get_ptr<const json::string_t*>();
+            const auto* value_text = entry[1].get_ptr<const json::string_t*>();
+            if (!name_text || !value_text) {
+                err = h2_field_error(base, &entry, "array[2]", "header string storage is unavailable");
+                return false;
+            }
+            name = *name_text;
+            header_value = *value_text;
+            diag::log_tagged_fmt("mcp_burp", "h2_send header_parse index=%zu shape=array outcome=ok name_len=%zu value_len=%zu",
+                index, name.size(), header_value.size());
+        } else if (entry.is_object()) {
+            const json* name_member = json_member(entry, "name");
+            const json* value_member = json_member(entry, "value");
+            if (!name_member) {
+                err = h2_field_error(base + ".name", nullptr, "string", "header name field is missing");
+                return false;
+            }
+            if (!value_member) {
+                err = h2_field_error(base + ".value", nullptr, "string", "header value field is missing");
+                return false;
+            }
+            if (!name_member->is_string()) {
+                err = h2_field_error(base + ".name", name_member, "string", "header name must be a string");
+                return false;
+            }
+            if (!value_member->is_string()) {
+                err = h2_field_error(base + ".value", value_member, "string", "header value must be a string");
+                return false;
+            }
+            const auto* name_text = name_member->get_ptr<const json::string_t*>();
+            const auto* value_text = value_member->get_ptr<const json::string_t*>();
+            if (!name_text || !value_text) {
+                err = h2_field_error(base, &entry, "object", "header string storage is unavailable");
+                return false;
+            }
+            name = *name_text;
+            header_value = *value_text;
+            diag::log_tagged_fmt("mcp_burp", "h2_send header_parse index=%zu shape=object outcome=ok name_len=%zu value_len=%zu",
+                index, name.size(), header_value.size());
+        } else {
+            err = h2_field_error(base, &entry, "array pair or object pair", "header entry must be [name,value] or {name,value}");
+            return false;
+        }
+        out.push_back({ std::move(name), std::move(header_value) });
+        ++index;
+    }
+    diag::log_tagged_fmt("mcp_burp", "h2_send headers_parse outcome=ok count=%zu", out.size());
+    return true;
+}
+
+bool h2_parse_body(const json& params, std::vector<uint8_t>& out, tool_result_t& err)
+{
+    const json* body_b64 = json_member(params, "body_b64");
+    if (body_b64) {
+        if (!body_b64->is_string()) {
+            err = h2_field_error("body_b64", body_b64, "string", "body_b64 must be a string");
+            return false;
+        }
+        const auto* text = body_b64->get_ptr<const json::string_t*>();
+        if (!text) {
+            err = h2_field_error("body_b64", body_b64, "string", "string storage is unavailable");
+            return false;
+        }
+        if (!h2_is_base64_text(*text)) {
+            err = h2_field_error("body_b64", body_b64, "base64 string", "must contain only base64 alphabet, padding, or whitespace");
+            return false;
+        }
+        out = b64_decode(*text);
+        diag::log_tagged_fmt("mcp_burp", "h2_send parse_field field=body_b64 outcome=ok type=%s b64_len=%zu body_len=%zu",
+            json_observed_type(*body_b64), text->size(), out.size());
+        return true;
+    }
+    const json* body = json_member(params, "body");
+    if (body) {
+        if (!body->is_string()) {
+            err = h2_field_error("body", body, "string", "body must be a string");
+            return false;
+        }
+        const auto* text = body->get_ptr<const json::string_t*>();
+        if (!text) {
+            err = h2_field_error("body", body, "string", "string storage is unavailable");
+            return false;
+        }
+        out.assign(text->begin(), text->end());
+        diag::log_tagged_fmt("mcp_burp", "h2_send parse_field field=body outcome=ok type=%s body_len=%zu",
+            json_observed_type(*body), out.size());
+        return true;
+    }
+    diag::log_tagged_fmt("mcp_burp", "h2_send parse_field field=body outcome=default body_len=0");
+    return true;
+}
+
+bool h2_parse_raw_frames(const json& params, h2_editor::request_t& req, bool& raw_requested, tool_result_t& err)
+{
+    const json* raw = json_member(params, "raw_frames_b64");
+    if (!raw) {
+        raw_requested = false;
+        diag::log_tagged_fmt("mcp_burp", "h2_send parse_field field=raw_frames_b64 outcome=default present=0");
+        return true;
+    }
+    if (!raw->is_string()) {
+        err = h2_field_error("raw_frames_b64", raw, "string", "raw_frames_b64 must be a string");
+        return false;
+    }
+    const auto* text = raw->get_ptr<const json::string_t*>();
+    if (!text) {
+        err = h2_field_error("raw_frames_b64", raw, "string", "string storage is unavailable");
+        return false;
+    }
+    if (!h2_is_base64_text(*text)) {
+        err = h2_field_error("raw_frames_b64", raw, "base64 string", "must contain only base64 alphabet, padding, or whitespace");
+        return false;
+    }
+    auto bytes = b64_decode(*text);
+    std::vector<h2_editor::frame_t> frames;
+    if (!h2_editor::decode_frames(bytes, frames)) {
+        diag::log_tagged_fmt("mcp_burp", "h2_send raw_frames_decode_failed b64_len=%zu bytes=%zu",
+            text->size(), bytes.size());
+        err = h2_field_error("raw_frames_b64", raw, "base64-encoded HTTP/2 frames", "decoded bytes are not complete HTTP/2 frames");
+        return false;
+    }
+    size_t decoded_wire_len = 0;
+    for (const auto& frame : frames) {
+        decoded_wire_len += 9 + frame.payload.size();
+    }
+    if (decoded_wire_len != bytes.size()) {
+        diag::log_tagged_fmt("mcp_burp", "h2_send raw_frames_trailing_bytes b64_len=%zu bytes=%zu decoded_wire_len=%zu frames=%zu",
+            text->size(), bytes.size(), decoded_wire_len, frames.size());
+        err = h2_field_error("raw_frames_b64", raw, "base64-encoded HTTP/2 frames", "decoded bytes contain trailing partial frame data");
+        return false;
+    }
+    req.use_raw_frames = true;
+    req.raw_frames = std::move(frames);
+    raw_requested = true;
+    diag::log_tagged_fmt("mcp_burp", "h2_send parse_field field=raw_frames_b64 outcome=ok type=%s b64_len=%zu bytes=%zu frames=%zu",
+        json_observed_type(*raw), text->size(), bytes.size(), req.raw_frames.size());
+    return true;
 }
 
 json status_to_json(const intruder::status_t& s)
@@ -429,19 +811,39 @@ static tool_result_t burp_param_miner_stop(const json& params)
 
 static tool_result_t burp_h2_send(const json& params)
 {
-    diag::log_tagged_fmt("mcp_burp", "h2_send entry params_shape=%s host=%s port=%d",
+    const json* host_for_shape = json_member(params, "host");
+    diag::log_tagged_fmt("mcp_burp", "h2_send entry params_shape=%s host_type=%s",
         json_shape(params).c_str(),
-        params.contains("host") && params["host"].is_string() ? params["host"].get<std::string>().c_str() : "<missing>",
-        params.value("port", 443));
-    h2_editor::request_t req;
-    if (!params.contains("host") || !params["host"].is_string()) {
-        diag::log_tagged_fmt("mcp_burp", "h2_send missing_host");
-        return tool_result_t::error("host required");
+        host_for_shape ? json_observed_type(*host_for_shape) : "missing");
+    if (!params.is_object()) {
+        return h2_field_error("$", &params, "object", "params must be an object");
     }
-    req.host = params["host"].get<std::string>();
-    req.port = static_cast<uint16_t>(params.value("port", 443));
-    req.timeout_ms = params.value("timeout_ms", 15000);
-    if (params.value("offline_validate", false)) {
+
+    constexpr uint64_t kDefaultPort = 443;
+    constexpr uint64_t kDefaultTimeoutMs = 15000;
+    constexpr uint64_t kMaxTimeoutMs = 120000;
+    constexpr uint64_t kMaxFlags = static_cast<uint64_t>(std::numeric_limits<uint32_t>::max());
+
+    h2_editor::request_t req;
+    tool_result_t parse_err;
+
+    if (!h2_parse_required_string(params, "host", req.host, parse_err)) return parse_err;
+
+    uint64_t parsed_port = 0;
+    if (!h2_parse_bounded_u64(params, "port", kDefaultPort, 1, 65535, parsed_port, parse_err)) return parse_err;
+    req.port = static_cast<uint16_t>(parsed_port);
+
+    uint64_t parsed_timeout = 0;
+    if (!h2_parse_bounded_u64(params, "timeout_ms", kDefaultTimeoutMs, 1, kMaxTimeoutMs, parsed_timeout, parse_err)) return parse_err;
+    req.timeout_ms = static_cast<int>(parsed_timeout);
+
+    bool offline_validate = false;
+    if (!h2_parse_optional_bool(params, "offline_validate", false, offline_validate, parse_err)) return parse_err;
+
+    diag::log_tagged_fmt("mcp_burp", "h2_send core_params_ok host_len=%zu port=%u timeout_ms=%d offline_validate=%d",
+        req.host.size(), static_cast<unsigned>(req.port), req.timeout_ms, static_cast<int>(offline_validate));
+
+    if (offline_validate) {
         diag::log_tagged_fmt("mcp_burp", "h2_send offline_validate host=%s port=%u timeout_ms=%d",
             req.host.c_str(), static_cast<unsigned>(req.port), req.timeout_ms);
         h2_editor::frame_t settings;
@@ -451,58 +853,31 @@ static tool_result_t burp_h2_send(const json& params)
         std::vector<uint8_t> wire = h2_editor::encode_frame(settings);
         std::vector<h2_editor::frame_t> frames;
         bool decoded = h2_editor::decode_frames(wire, frames);
+        const bool offline_ok = decoded && frames.size() == 1 && frames[0].type == 4 && frames[0].stream_id == 0;
         json out;
-        out["ok"] = decoded && frames.size() == 1 && frames[0].type == 4 && frames[0].stream_id == 0;
+        out["ok"] = offline_ok;
         out["offline_validate"] = true;
         out["frames"] = frames.size();
         out["raw_wire_out_b64"] = b64_encode(wire);
         out["body_size"] = 0;
         out["latency_ms"] = 0;
         diag::log_tagged_fmt("mcp_burp", "h2_send offline_validate result ok=%d frames=%zu wire_len=%zu",
-            (int)out["ok"].get<bool>(), frames.size(), wire.size());
+            static_cast<int>(offline_ok), frames.size(), wire.size());
         return tool_result_t::ok(out);
     }
 
-    if (params.contains("raw_frames_b64") && params["raw_frames_b64"].is_string()) {
-        const std::string& raw_b64 = params["raw_frames_b64"].get_ref<const std::string&>();
-        auto bytes = b64_decode(raw_b64);
-        std::vector<h2_editor::frame_t> frames;
-        if (!h2_editor::decode_frames(bytes, frames)) {
-            diag::log_tagged_fmt("mcp_burp", "h2_send raw_frames_decode_failed b64_len=%zu bytes=%zu",
-                raw_b64.size(), bytes.size());
-            return tool_result_t::error("raw_frames_b64 decode failed");
-        }
-        req.use_raw_frames = true;
-        req.raw_frames = std::move(frames);
-        diag::log_tagged_fmt("mcp_burp", "h2_send raw_frames mode frames=%zu b64_len=%zu bytes=%zu",
-            req.raw_frames.size(), raw_b64.size(), bytes.size());
+    bool raw_requested = false;
+    if (!h2_parse_raw_frames(params, req, raw_requested, parse_err)) return parse_err;
+    if (raw_requested) {
+        diag::log_tagged_fmt("mcp_burp", "h2_send raw_frames mode frames=%zu", req.raw_frames.size());
     } else {
-        if (params.contains("pseudo_headers") && params["pseudo_headers"].is_object()) {
-            const auto& ph = params["pseudo_headers"];
-            if (ph.contains("method")) req.pseudo.method = ph["method"].get<std::string>();
-            if (ph.contains("path"))   req.pseudo.path   = ph["path"].get<std::string>();
-            if (ph.contains("scheme")) req.pseudo.scheme = ph["scheme"].get<std::string>();
-            if (ph.contains("authority")) req.pseudo.authority = ph["authority"].get<std::string>();
-        }
-        if (params.contains("headers") && params["headers"].is_array()) {
-            for (auto& kv : params["headers"]) {
-                if (kv.is_array() && kv.size() == 2 && kv[0].is_string() && kv[1].is_string()) {
-                    req.headers.push_back({ kv[0].get<std::string>(), kv[1].get<std::string>() });
-                }
-            }
-        }
-        if (params.contains("body_b64") && params["body_b64"].is_string()) {
-            const std::string& body_b64 = params["body_b64"].get_ref<const std::string&>();
-            req.body = b64_decode(body_b64);
-            diag::log_tagged_fmt("mcp_burp", "h2_send body_from_b64 b64_len=%zu body_len=%zu", body_b64.size(), req.body.size());
-        } else if (params.contains("body") && params["body"].is_string()) {
-            const std::string& s = params["body"].get_ref<const std::string&>();
-            req.body.assign(s.begin(), s.end());
-            diag::log_tagged_fmt("mcp_burp", "h2_send body_from_text body_len=%zu", req.body.size());
-        }
-        if (params.contains("flags") && params["flags"].is_number_unsigned()) {
-            req.flags = params["flags"].get<uint32_t>();
-        }
+        if (!h2_parse_pseudo_headers(params, req.pseudo, parse_err)) return parse_err;
+        if (!h2_parse_headers(params, req.headers, parse_err)) return parse_err;
+        if (!h2_parse_body(params, req.body, parse_err)) return parse_err;
+
+        uint64_t parsed_flags = 0;
+        if (!h2_parse_bounded_u64(params, "flags", static_cast<uint64_t>(req.flags), 0, kMaxFlags, parsed_flags, parse_err)) return parse_err;
+        req.flags = static_cast<uint32_t>(parsed_flags);
     }
     diag::log_tagged_fmt("mcp_burp", "h2_send dispatch host=%s port=%u method=%s path_len=%zu has_query=%d headers=%zu body_len=%zu use_raw=%d raw_frames=%zu timeout_ms=%d",
         req.host.c_str(), static_cast<unsigned>(req.port), req.pseudo.method.c_str(),
@@ -580,13 +955,13 @@ void register_intruder_tools(mcp_standalone::server_t& srv)
         "explicit stream flags, and a raw frame bytes mode for spec violations.",
         {
             { "host", "string", "Target host", true },
-            { "port", "number", "Target port (default 443)", false },
-            { "timeout_ms", "number", "Timeout in ms (default 15000)", false },
+            { "port", "number", "Target port 1..65535 (default 443)", false },
+            { "timeout_ms", "number", "Timeout in ms 1..120000 (default 15000)", false },
             { "pseudo_headers", "object", "Object {method, path, scheme, authority}", false },
-            { "headers", "array", "Array of [name, value] string pairs", false },
+            { "headers", "array", "Array of [name, value] or {name, value} string pairs", false },
             { "body", "string", "Body text", false },
             { "body_b64", "string", "Body, base64 encoded (preferred for binary)", false },
-            { "flags", "number", "Bitfield: 1=END_STREAM 2=END_HEADERS 4=PADDED 8=PRIORITY", false },
+            { "flags", "number", "uint32 bitfield: 1=END_STREAM 2=END_HEADERS 4=PADDED 8=PRIORITY", false },
             { "raw_frames_b64", "string", "Pre-encoded HTTP/2 frames as base64 (raw mode bypasses HEADERS/DATA construction)", false },
             { "offline_validate", "boolean", "Validate HTTP/2 frame encode/decode without opening a socket", false }
         },
