@@ -25,6 +25,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -68,29 +69,119 @@ static SSL_CTX* ensure_ctx()
     return h.ctx;
 }
 
-static SOCKET tcp_connect(const std::string& host, uint16_t port, int timeout_ms)
+std::string openssl_error_queue()
 {
+    std::ostringstream os;
+    bool first = true;
+    unsigned long e = 0;
+    while ((e = ERR_get_error()) != 0) {
+        char buf[256] = {};
+        ERR_error_string_n(e, buf, sizeof(buf));
+        if (!first) os << "|";
+        first = false;
+        os << buf;
+    }
+    return os.str();
+}
+
+std::string bytes_hex(const unsigned char* data, unsigned int len)
+{
+    static const char* h = "0123456789abcdef";
+    std::string out;
+    out.reserve(static_cast<size_t>(len) * 2);
+    for (unsigned int i = 0; i < len; ++i) {
+        out.push_back(h[(data[i] >> 4) & 0xf]);
+        out.push_back(h[data[i] & 0xf]);
+    }
+    return out;
+}
+
+std::string alpn_string(const unsigned char* data, unsigned int len)
+{
+    std::string out;
+    out.reserve(len);
+    for (unsigned int i = 0; i < len; ++i) {
+        unsigned char c = data[i];
+        out.push_back((c >= 0x20 && c < 0x7f) ? static_cast<char>(c) : '.');
+    }
+    return out;
+}
+
+std::string sockaddr_to_text(const sockaddr* sa)
+{
+    char buf[INET6_ADDRSTRLEN] = {};
+    if (!sa) return {};
+    if (sa->sa_family == AF_INET) {
+        const auto* in = reinterpret_cast<const sockaddr_in*>(sa);
+        if (inet_ntop(AF_INET, &in->sin_addr, buf, sizeof(buf))) return buf;
+    } else if (sa->sa_family == AF_INET6) {
+        const auto* in6 = reinterpret_cast<const sockaddr_in6*>(sa);
+        if (inet_ntop(AF_INET6, &in6->sin6_addr, buf, sizeof(buf))) return buf;
+    }
+    return {};
+}
+
+struct tcp_connect_result_t
+{
+    SOCKET sock = INVALID_SOCKET;
+    int wsa_error = 0;
+    int poll_rc = 0;
+    short revents = 0;
+    int poll_wsa = 0;
+    std::string stage;
+    std::string ip;
+    std::string family;
+};
+
+static tcp_connect_result_t tcp_connect(const std::string& host, uint16_t port, int timeout_ms)
+{
+    tcp_connect_result_t out;
+    out.stage = "getaddrinfo";
     addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     char ports[16];
     snprintf(ports, sizeof(ports), "%u", static_cast<unsigned>(port));
     addrinfo* res = nullptr;
-    if (getaddrinfo(host.c_str(), ports, &hints, &res) != 0 || !res) return INVALID_SOCKET;
+    int gai = getaddrinfo(host.c_str(), ports, &hints, &res);
+    if (gai != 0 || !res) {
+        out.wsa_error = gai;
+        return out;
+    }
+    out.ip = sockaddr_to_text(res->ai_addr);
+    out.family = res->ai_family == AF_INET ? "AF_INET" : (res->ai_family == AF_INET6 ? "AF_INET6" : "AF_OTHER");
+    out.stage = "socket";
     SOCKET s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (s == INVALID_SOCKET) { freeaddrinfo(res); return INVALID_SOCKET; }
+    if (s == INVALID_SOCKET) {
+        out.wsa_error = WSAGetLastError();
+        freeaddrinfo(res);
+        return out;
+    }
     u_long nb = 1;
     ioctlsocket(s, FIONBIO, &nb);
+    out.stage = "connect";
     int cr = connect(s, res->ai_addr, static_cast<int>(res->ai_addrlen));
     if (cr == SOCKET_ERROR && WSAGetLastError() != WSAEWOULDBLOCK) {
-        closesocket(s); freeaddrinfo(res); return INVALID_SOCKET;
+        out.wsa_error = WSAGetLastError();
+        closesocket(s); freeaddrinfo(res); return out;
     }
     WSAPOLLFD pfd{}; pfd.fd = s; pfd.events = POLLOUT;
+    out.stage = "poll_connect";
     int pr = WSAPoll(&pfd, 1, timeout_ms);
-    if (pr <= 0) { closesocket(s); freeaddrinfo(res); return INVALID_SOCKET; }
+    out.poll_rc = pr;
+    out.revents = pfd.revents;
+    if (pr <= 0) {
+        out.poll_wsa = WSAGetLastError();
+        out.stage = pr == 0 ? "poll_connect_timeout" : "poll_connect_failed";
+        closesocket(s); freeaddrinfo(res); return out;
+    }
     int err = 0; int sz = sizeof(err);
     getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &sz);
-    if (err != 0) { closesocket(s); freeaddrinfo(res); return INVALID_SOCKET; }
+    if (err != 0) {
+        out.wsa_error = err;
+        out.stage = "connect_so_error";
+        closesocket(s); freeaddrinfo(res); return out;
+    }
     nb = 0; ioctlsocket(s, FIONBIO, &nb);
     DWORD tmo = static_cast<DWORD>(timeout_ms);
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tmo), sizeof(tmo));
@@ -98,7 +189,9 @@ static SOCKET tcp_connect(const std::string& host, uint16_t port, int timeout_ms
     BOOL nd = TRUE;
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nd), sizeof(nd));
     freeaddrinfo(res);
-    return s;
+    out.stage = "tcp_connected";
+    out.sock = s;
+    return out;
 }
 
 struct conn_t
@@ -113,44 +206,123 @@ static void close_conn(conn_t& c)
     if (c.sock != INVALID_SOCKET) { shutdown(c.sock, SD_BOTH); closesocket(c.sock); c.sock = INVALID_SOCKET; }
 }
 
-static bool tls_connect(conn_t& c, const std::string& host, uint16_t port, int timeout_ms)
+static bool tls_connect(conn_t& c, const std::string& host, uint16_t port, int timeout_ms, std::string& error_msg)
 {
     SSL_CTX* ctx = ensure_ctx();
-    if (!ctx) return false;
-    c.sock = tcp_connect(host, port, timeout_ms);
-    if (c.sock == INVALID_SOCKET) return false;
+    if (!ctx) {
+        error_msg = "ssl_ctx_unavailable: " + openssl_error_queue();
+        set_err(error_msg);
+        return false;
+    }
+    auto tcp = tcp_connect(host, port, timeout_ms);
+    diag::log_tagged_fmt("h2_edit", "tcp_connect_result host=%s port=%u stage=%s socket=%llu wsa_error=%d poll_rc=%d revents=0x%04X poll_wsa=%d family=%s ip=%s",
+        host.c_str(), static_cast<unsigned>(port), tcp.stage.c_str(), static_cast<unsigned long long>(tcp.sock),
+        tcp.wsa_error, tcp.poll_rc, static_cast<unsigned>(tcp.revents), tcp.poll_wsa, tcp.family.c_str(), tcp.ip.c_str());
+    c.sock = tcp.sock;
+    if (c.sock == INVALID_SOCKET) {
+        std::ostringstream os;
+        os << "tcp_connect_failed stage=" << tcp.stage
+           << " wsa_error=" << tcp.wsa_error
+           << " poll_rc=" << tcp.poll_rc
+           << " revents=0x" << std::hex << static_cast<unsigned>(tcp.revents) << std::dec
+           << " poll_wsa=" << tcp.poll_wsa
+           << " ip=" << tcp.ip;
+        error_msg = os.str();
+        set_err(error_msg);
+        return false;
+    }
     c.ssl = SSL_new(ctx);
-    if (!c.ssl) { close_conn(c); return false; }
+    if (!c.ssl) {
+        error_msg = "ssl_new_failed: " + openssl_error_queue();
+        set_err(error_msg);
+        close_conn(c);
+        return false;
+    }
     SSL_set_fd(c.ssl, static_cast<int>(c.sock));
     SSL_set_tlsext_host_name(c.ssl, host.c_str());
     static const uint8_t alpn[] = { 0x02, 'h', '2' };
-    SSL_set_alpn_protos(c.ssl, alpn, sizeof(alpn));
+    ERR_clear_error();
+    int alpn_rc = SSL_set_alpn_protos(c.ssl, alpn, sizeof(alpn));
+    diag::log_tagged_fmt("h2_edit", "tls_alpn_config rc=%d requested=%s requested_hex=%s openssl_errors=%s",
+        alpn_rc, "h2", bytes_hex(alpn, sizeof(alpn)).c_str(), openssl_error_queue().c_str());
+    if (alpn_rc != 0) {
+        error_msg = "alpn_config_failed";
+        set_err(error_msg);
+        close_conn(c);
+        return false;
+    }
 
     u_long nb = 1; ioctlsocket(c.sock, FIONBIO, &nb);
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    int last_ssl_err = 0;
+    int last_poll_rc = 0;
+    short last_revents = 0;
+    int last_poll_wsa = 0;
+    std::string last_stage = "ssl_connect";
     while (true) {
+        ERR_clear_error();
         int r = SSL_connect(c.ssl);
         if (r == 1) break;
         int err = SSL_get_error(c.ssl, r);
+        last_ssl_err = err;
         if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
             auto now = std::chrono::steady_clock::now();
-            if (now >= deadline) { close_conn(c); return false; }
+            if (now >= deadline) {
+                error_msg = std::string("tls_handshake_timeout stage=") + last_stage + " ssl_error=" + std::to_string(last_ssl_err);
+                set_err(error_msg);
+                diag::log_tagged_fmt("h2_edit", "tls_handshake_timeout ssl_error=%d", last_ssl_err);
+                close_conn(c);
+                return false;
+            }
             int rem = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
             WSAPOLLFD pfd{}; pfd.fd = c.sock;
             pfd.events = (err == SSL_ERROR_WANT_WRITE) ? POLLOUT : POLLIN;
+            last_stage = (err == SSL_ERROR_WANT_WRITE) ? "ssl_want_write_poll" : "ssl_want_read_poll";
             int pr = WSAPoll(&pfd, 1, rem);
-            if (pr <= 0) { close_conn(c); return false; }
+            last_poll_rc = pr;
+            last_revents = pfd.revents;
+            if (pr <= 0) {
+                last_poll_wsa = WSAGetLastError();
+                std::ostringstream os;
+                os << "tls_handshake_poll_failed stage=" << last_stage
+                   << " ssl_error=" << last_ssl_err
+                   << " poll_rc=" << last_poll_rc
+                   << " revents=0x" << std::hex << static_cast<unsigned>(last_revents) << std::dec
+                   << " poll_wsa=" << last_poll_wsa;
+                error_msg = os.str();
+                set_err(error_msg);
+                diag::log_tagged_fmt("h2_edit", "tls_handshake_poll_failed stage=%s ssl_error=%d poll_rc=%d revents=0x%04X poll_wsa=%d",
+                    last_stage.c_str(), last_ssl_err, last_poll_rc, static_cast<unsigned>(last_revents), last_poll_wsa);
+                close_conn(c);
+                return false;
+            }
             continue;
         }
+        std::string ossl = openssl_error_queue();
+        std::ostringstream os;
+        os << "tls_handshake_failed ssl_error=" << err << " openssl_errors=" << ossl;
+        error_msg = os.str();
+        set_err(error_msg);
+        diag::log_tagged_fmt("h2_edit", "tls_handshake_failed ssl_error=%d openssl_errors=%s", err, ossl.c_str());
         close_conn(c);
         return false;
     }
     nb = 0; ioctlsocket(c.sock, FIONBIO, &nb);
+    const SSL_CIPHER* cipher = SSL_get_current_cipher(c.ssl);
+    const char* cipher_name = cipher ? SSL_CIPHER_get_name(cipher) : "";
+    const char* tls_version = SSL_get_version(c.ssl);
 
     const unsigned char* sel = nullptr;
     unsigned int sel_len = 0;
     SSL_get0_alpn_selected(c.ssl, &sel, &sel_len);
+    std::string selected = sel ? alpn_string(sel, sel_len) : std::string();
+    std::string selected_hex = sel ? bytes_hex(sel, sel_len) : std::string();
+    diag::log_tagged_fmt("h2_edit", "tls_handshake_ok host=%s tls_version=%s cipher=%s selected_alpn=%s selected_alpn_hex=%s selected_alpn_len=%u",
+        host.c_str(), tls_version ? tls_version : "", cipher_name, selected.c_str(), selected_hex.c_str(), sel_len);
     if (!(sel && sel_len == 2 && sel[0] == 'h' && sel[1] == '2')) {
+        if (!sel || sel_len == 0) error_msg = "alpn_not_selected";
+        else error_msg = "wrong_alpn_selected selected=" + selected + " selected_hex=" + selected_hex;
+        set_err(error_msg);
         close_conn(c);
         return false;
     }
@@ -383,9 +555,11 @@ response_t send(const request_t& req)
     response_t r;
     conn_t c;
     diag::log_tagged_fmt("h2_edit", "send tls_connecting host=%s port=%u", req.host.c_str(), static_cast<unsigned>(req.port));
-    if (!tls_connect(c, req.host, req.port, req.timeout_ms)) {
-        diag::log_tagged_fmt("h2_edit", "send tls_connect_failed host=%s", req.host.c_str());
-        r.error_msg = "tls_connect_failed (ALPN must be h2)";
+    std::string connect_error;
+    if (!tls_connect(c, req.host, req.port, req.timeout_ms, connect_error)) {
+        diag::log_tagged_fmt("h2_edit", "send connect_failed host=%s port=%u error=%s",
+            req.host.c_str(), static_cast<unsigned>(req.port), connect_error.c_str());
+        r.error_msg = connect_error.empty() ? "connect_failed" : connect_error;
         return r;
     }
     diag::log_tagged_fmt("h2_edit", "send tls_ok host=%s", req.host.c_str());

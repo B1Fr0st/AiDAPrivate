@@ -929,13 +929,36 @@ inline void ensure_pdb_subscription()
 
 inline void erase_cache_entry(uint64_t addr)
 {
-	std::lock_guard<std::mutex> lk(g_state.mutex);
-	auto it = g_state.cache_lru_iters.find(addr);
-	if (it != g_state.cache_lru_iters.end()) {
-		g_state.cache_lru_order.erase(it->second);
-		g_state.cache_lru_iters.erase(it);
+	bool cache_erased = false;
+	bool stale_current_cleared = false;
+	bool current_complete = false;
+	bool current_error = false;
+	size_t current_bytes = 0;
+	{
+		std::lock_guard<std::mutex> lk(g_state.mutex);
+		auto it = g_state.cache_lru_iters.find(addr);
+		if (it != g_state.cache_lru_iters.end()) {
+			g_state.cache_lru_order.erase(it->second);
+			g_state.cache_lru_iters.erase(it);
+		}
+		cache_erased = g_state.cache.erase(addr) != 0;
+		if (g_state.current.function_addr == addr) {
+			current_complete = g_state.current.complete;
+			current_error = g_state.current.is_error;
+			current_bytes = g_state.current.pseudocode.size();
+			g_state.current = decompile_result_t{};
+			g_state.active = false;
+			stale_current_cleared = true;
+		}
 	}
-	g_state.cache.erase(addr);
+	diag::log_tagged_critical_fmt("dec",
+		"erase_cache_entry addr=0x%llX cache_erased=%d stale_current_cleared=%d current_complete=%d current_error=%d current_bytes=%llu",
+		static_cast<unsigned long long>(addr),
+		cache_erased ? 1 : 0,
+		stale_current_cleared ? 1 : 0,
+		current_complete ? 1 : 0,
+		current_error ? 1 : 0,
+		static_cast<unsigned long long>(current_bytes));
 }
 
 inline size_t cache_size()

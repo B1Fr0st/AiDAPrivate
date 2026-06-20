@@ -6454,11 +6454,17 @@ namespace driver_bridge
             c.notify_fn            = src.notify_fn;
             c.flow_delete_fn       = src.flow_delete_fn;
             c.owning_module_base   = src.owning_module_base;
+            c.filter_id            = src.filter_id;
             c.callout_id           = src.callout_id;
             c.layer_id             = src.layer_id;
             c.flags                = src.flags;
+            c.entry_type           = src.entry_type;
+            c.action_type          = src.action_type;
+            c.provider_present     = src.provider_present;
+            c.aida_match_reason    = src.aida_match_reason;
             c.callout_key_str      = src.callout_key_str;
             c.applicable_layer_str = src.applicable_layer_str;
+            c.sublayer_key_str     = src.sublayer_key_str;
             c.owning_module        = src.owning_module;
             result.push_back(std::move(c));
         }

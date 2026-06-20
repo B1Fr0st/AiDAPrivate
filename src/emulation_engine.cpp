@@ -22,6 +22,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <cstring>
+#include <chrono>
+#include <mutex>
 
 extern std::unique_ptr<voyager::device_t> device;
 
@@ -53,6 +55,168 @@ static bool emu_cancelled(const emulation_config_t* config, const char* phase)
         return true;
     }
     return false;
+}
+
+static std::uint64_t emu_deadline_remaining_ms(const emulation_config_t* config)
+{
+    if (!config || config->deadline_ms == 0)
+        return 0;
+    const std::uint64_t now = emu_now_ms();
+    return now < config->deadline_ms ? config->deadline_ms - now : 0;
+}
+
+static std::recursive_timed_mutex& unicorn_native_lane_mutex()
+{
+    static std::recursive_timed_mutex m;
+    return m;
+}
+
+static bool acquire_unicorn_native_lane(const emulation_config_t* config,
+                                        const char* op,
+                                        std::uint64_t base,
+                                        std::uint64_t size,
+                                        std::unique_lock<std::recursive_timed_mutex>& lane,
+                                        std::string& failure)
+{
+    if (emu_cancelled(config, op)) {
+        failure = "deadline or cancellation before Unicorn native call";
+        return false;
+    }
+    const std::uint64_t remaining = emu_deadline_remaining_ms(config);
+    const std::uint64_t wait_ms = remaining != 0 ? remaining : 30000;
+    const std::uint64_t wait_begin = emu_now_ms();
+    lane = std::unique_lock<std::recursive_timed_mutex>(unicorn_native_lane_mutex(), std::defer_lock);
+    if (!lane.try_lock_for(std::chrono::milliseconds(wait_ms))) {
+        failure = "timed out waiting for Unicorn native lane";
+        diag::log_tagged_fmt("emulation",
+            "unicorn_native_lane_timeout op=%s diag_id=%s tool=%s base=0x%llX size=0x%llX wait_ms=%llu deadline_remaining_ms=%llu tid=%lu",
+            op ? op : "<null>",
+            mcp_standalone::current_call_diag_id(),
+            mcp_standalone::current_call_tool_name(),
+            static_cast<unsigned long long>(base),
+            static_cast<unsigned long long>(size),
+            static_cast<unsigned long long>(emu_now_ms() - wait_begin),
+            static_cast<unsigned long long>(remaining),
+            static_cast<unsigned long>(GetCurrentThreadId()));
+        return false;
+    }
+    return true;
+}
+
+static bool unicorn_mem_map_checked(uc_engine* uc,
+                                    std::uint64_t base,
+                                    std::uint64_t size,
+                                    std::uint32_t prot,
+                                    const emulation_config_t* config,
+                                    const char* phase,
+                                    uc_err& err,
+                                    std::string& failure)
+{
+    std::unique_lock<std::recursive_timed_mutex> lane;
+    if (!acquire_unicorn_native_lane(config, phase, base, size, lane, failure))
+        return false;
+    const std::uint64_t begin = emu_now_ms();
+    diag::log_tagged_fmt("emulation",
+        "unicorn_map_begin diag_id=%s tool=%s phase=%s base=0x%llX size=0x%llX prot=0x%X deadline_remaining_ms=%llu tid=%lu begin_tick=%llu expected_end_marker=unicorn_map_end residual_native_uninterruptible=1",
+        mcp_standalone::current_call_diag_id(),
+        mcp_standalone::current_call_tool_name(),
+        phase ? phase : "<null>",
+        static_cast<unsigned long long>(base),
+        static_cast<unsigned long long>(size),
+        prot,
+        static_cast<unsigned long long>(emu_deadline_remaining_ms(config)),
+        static_cast<unsigned long>(GetCurrentThreadId()),
+        static_cast<unsigned long long>(begin));
+    err = uc_mem_map(uc, base, static_cast<size_t>(size), prot);
+    diag::log_tagged_fmt("emulation",
+        "unicorn_map_end diag_id=%s tool=%s phase=%s base=0x%llX size=0x%llX err=%u text='%s' elapsed_ms=%llu deadline_remaining_ms=%llu tid=%lu",
+        mcp_standalone::current_call_diag_id(),
+        mcp_standalone::current_call_tool_name(),
+        phase ? phase : "<null>",
+        static_cast<unsigned long long>(base),
+        static_cast<unsigned long long>(size),
+        static_cast<unsigned>(err),
+        uc_strerror(err),
+        static_cast<unsigned long long>(emu_now_ms() - begin),
+        static_cast<unsigned long long>(emu_deadline_remaining_ms(config)),
+        static_cast<unsigned long>(GetCurrentThreadId()));
+    return true;
+}
+
+static bool unicorn_mem_write_checked(uc_engine* uc,
+                                      std::uint64_t base,
+                                      const void* data,
+                                      std::size_t size,
+                                      const emulation_config_t* config,
+                                      const char* phase,
+                                      uc_err& err,
+                                      std::string& failure)
+{
+    std::unique_lock<std::recursive_timed_mutex> lane;
+    if (!acquire_unicorn_native_lane(config, phase, base, static_cast<std::uint64_t>(size), lane, failure))
+        return false;
+    const std::uint64_t begin = emu_now_ms();
+    diag::log_tagged_fmt("emulation",
+        "unicorn_write_begin diag_id=%s tool=%s phase=%s base=0x%llX size=%zu deadline_remaining_ms=%llu tid=%lu begin_tick=%llu expected_end_marker=unicorn_write_end residual_native_uninterruptible=1",
+        mcp_standalone::current_call_diag_id(),
+        mcp_standalone::current_call_tool_name(),
+        phase ? phase : "<null>",
+        static_cast<unsigned long long>(base),
+        size,
+        static_cast<unsigned long long>(emu_deadline_remaining_ms(config)),
+        static_cast<unsigned long>(GetCurrentThreadId()),
+        static_cast<unsigned long long>(begin));
+    err = uc_mem_write(uc, base, data, size);
+    diag::log_tagged_fmt("emulation",
+        "unicorn_write_end diag_id=%s tool=%s phase=%s base=0x%llX size=%zu err=%u text='%s' elapsed_ms=%llu deadline_remaining_ms=%llu tid=%lu",
+        mcp_standalone::current_call_diag_id(),
+        mcp_standalone::current_call_tool_name(),
+        phase ? phase : "<null>",
+        static_cast<unsigned long long>(base),
+        size,
+        static_cast<unsigned>(err),
+        uc_strerror(err),
+        static_cast<unsigned long long>(emu_now_ms() - begin),
+        static_cast<unsigned long long>(emu_deadline_remaining_ms(config)),
+        static_cast<unsigned long>(GetCurrentThreadId()));
+    return true;
+}
+
+static bool unicorn_emu_start_checked(uc_engine* uc,
+                                      std::uint64_t begin_addr,
+                                      std::uint64_t until_addr,
+                                      std::uint64_t timeout_us,
+                                      std::uint32_t count,
+                                      const emulation_config_t* config,
+                                      uc_err& err,
+                                      std::string& failure)
+{
+    std::unique_lock<std::recursive_timed_mutex> lane;
+    if (!acquire_unicorn_native_lane(config, "unicorn_emu_start", begin_addr, until_addr, lane, failure))
+        return false;
+    const std::uint64_t begin = emu_now_ms();
+    diag::log_tagged_fmt("emulation",
+        "unicorn_start_begin diag_id=%s tool=%s start=0x%llX stop=0x%llX timeout_us=%llu max_instructions=%u deadline_remaining_ms=%llu tid=%lu begin_tick=%llu expected_end_marker=unicorn_start_end residual_native_uninterruptible=1",
+        mcp_standalone::current_call_diag_id(),
+        mcp_standalone::current_call_tool_name(),
+        static_cast<unsigned long long>(begin_addr),
+        static_cast<unsigned long long>(until_addr),
+        static_cast<unsigned long long>(timeout_us),
+        count,
+        static_cast<unsigned long long>(emu_deadline_remaining_ms(config)),
+        static_cast<unsigned long>(GetCurrentThreadId()),
+        static_cast<unsigned long long>(begin));
+    err = uc_emu_start(uc, begin_addr, until_addr, timeout_us, count);
+    diag::log_tagged_fmt("emulation",
+        "unicorn_start_end diag_id=%s tool=%s err=%u text='%s' elapsed_ms=%llu deadline_remaining_ms=%llu tid=%lu",
+        mcp_standalone::current_call_diag_id(),
+        mcp_standalone::current_call_tool_name(),
+        static_cast<unsigned>(err),
+        uc_strerror(err),
+        static_cast<unsigned long long>(emu_now_ms() - begin),
+        static_cast<unsigned long long>(emu_deadline_remaining_ms(config)),
+        static_cast<unsigned long>(GetCurrentThreadId()));
+    return true;
 }
 
 static const char* uc_mem_type_name(uc_mem_type type)
@@ -738,10 +902,19 @@ static bool hook_mem_invalid_cb(uc_engine* uc, uc_mem_type type,
     {
         std::uint64_t aligned = address & ~0xFFFULL;
         std::vector<std::uint8_t> zeros(0x2000, 0);
-        uc_err err = uc_mem_map(uc, aligned, 0x2000, UC_PROT_ALL);
+        uc_err err = UC_ERR_OK;
+        std::string failure;
+        if (!unicorn_mem_map_checked(uc, aligned, 0x2000, UC_PROT_ALL, ctx->config, "invalid_memory_map", err, failure)) {
+            diag::log_tagged_fmt("emulation", "unicorn_invalid_memory_map_aborted failure='%s'", failure.c_str());
+            return false;
+        }
         if (err != UC_ERR_OK)
             return false;
-        if (uc_mem_write(uc, aligned, zeros.data(), zeros.size()) != UC_ERR_OK)
+        if (!unicorn_mem_write_checked(uc, aligned, zeros.data(), zeros.size(), ctx->config, "invalid_memory_zero_fill", err, failure)) {
+            diag::log_tagged_fmt("emulation", "unicorn_invalid_memory_write_aborted failure='%s'", failure.c_str());
+            return false;
+        }
+        if (err != UC_ERR_OK)
             return false;
         ++ctx->invalid_page_maps;
         return true;
@@ -750,7 +923,12 @@ static bool hook_mem_invalid_cb(uc_engine* uc, uc_mem_type type,
     if (type == UC_MEM_WRITE_UNMAPPED)
     {
         std::uint64_t aligned = address & ~0xFFFULL;
-        uc_err err = uc_mem_map(uc, aligned, 0x2000, UC_PROT_ALL);
+        uc_err err = UC_ERR_OK;
+        std::string failure;
+        if (!unicorn_mem_map_checked(uc, aligned, 0x2000, UC_PROT_ALL, ctx->config, "invalid_write_map", err, failure)) {
+            diag::log_tagged_fmt("emulation", "unicorn_invalid_write_map_aborted failure='%s'", failure.c_str());
+            return false;
+        }
         if (err != UC_ERR_OK)
             return false;
         ++ctx->invalid_page_maps;
@@ -873,17 +1051,11 @@ emulation_result_t emulate_from_snapshot(
             result.error = "Emulation cancelled before mapping memory";
             return result;
         }
-        diag::log_tagged_fmt("emulation",
-            "unicorn_map_begin base=0x%llX size=0x%llX",
-            static_cast<unsigned long long>(m.base),
-            static_cast<unsigned long long>(m.size));
-        err = uc_mem_map(uc, m.base, static_cast<size_t>(m.size), UC_PROT_ALL);
-        diag::log_tagged_fmt("emulation",
-            "unicorn_map_end base=0x%llX size=0x%llX err=%u text='%s'",
-            static_cast<unsigned long long>(m.base),
-            static_cast<unsigned long long>(m.size),
-            static_cast<unsigned>(err),
-            uc_strerror(err));
+        std::string failure;
+        if (!unicorn_mem_map_checked(uc, m.base, m.size, UC_PROT_ALL, &config, "snapshot_region_map", err, failure)) {
+            result.error = failure;
+            return result;
+        }
         if (err != UC_ERR_OK)
         {
             std::ostringstream addr;
@@ -906,17 +1078,11 @@ emulation_result_t emulate_from_snapshot(
         }
         if (!region.data.empty())
         {
-            diag::log_tagged_fmt("emulation",
-                "unicorn_write_begin base=0x%llX size=%zu",
-                static_cast<unsigned long long>(region.base),
-                region.data.size());
-            err = uc_mem_write(uc, region.base, region.data.data(), region.data.size());
-            diag::log_tagged_fmt("emulation",
-                "unicorn_write_end base=0x%llX size=%zu err=%u text='%s'",
-                static_cast<unsigned long long>(region.base),
-                region.data.size(),
-                static_cast<unsigned>(err),
-                uc_strerror(err));
+            std::string failure;
+            if (!unicorn_mem_write_checked(uc, region.base, region.data.data(), region.data.size(), &config, "snapshot_region_write", err, failure)) {
+                result.error = failure;
+                return result;
+            }
             if (err != UC_ERR_OK) {
                 result.error = std::string("uc_mem_write failed: ") + uc_strerror(err);
                 return result;
@@ -1020,16 +1186,14 @@ emulation_result_t emulate_from_snapshot(
         result.error = "Emulation cancelled before start";
         return result;
     }
+    std::string start_failure;
+    if (!unicorn_emu_start_checked(uc, start_rip, config.stop_address ? config.stop_address : 0xFFFFFFFFFFFFFFFFULL,
+                                   config.timeout_us, config.max_instructions, &config, err, start_failure)) {
+        result.error = start_failure;
+        return result;
+    }
     diag::log_tagged_fmt("emulation",
-        "unicorn_start_begin start=0x%llX stop=0x%llX timeout_us=%llu max_instructions=%u",
-        static_cast<unsigned long long>(start_rip),
-        static_cast<unsigned long long>(config.stop_address ? config.stop_address : 0xFFFFFFFFFFFFFFFFULL),
-        static_cast<unsigned long long>(config.timeout_us),
-        config.max_instructions);
-    err = uc_emu_start(uc, start_rip, config.stop_address ? config.stop_address : 0xFFFFFFFFFFFFFFFFULL,
-                       config.timeout_us, config.max_instructions);
-    diag::log_tagged_fmt("emulation",
-        "unicorn_start_end err=%u text='%s' cancelled=%d insn_count=%u invalid_maps=%u hit_ret=%d hit_bp=%d",
+        "unicorn_start_result err=%u text='%s' cancelled=%d insn_count=%u invalid_maps=%u hit_ret=%d hit_bp=%d",
         static_cast<unsigned>(err),
         uc_strerror(err),
         trace_ctx.cancelled ? 1 : 0,
@@ -1124,6 +1288,7 @@ emulation_result_t driver_snapshot_and_emulate(
     std::uint64_t snapshot_base,
     std::uint64_t snapshot_size)
 {
+    const std::uint64_t total_begin = emu_now_ms();
     diag::log_tagged_fmt("emulation",
         "driver_snapshot_and_emulate entry pid=%u tid=%u snapshot_base=0x%llX snapshot_size=0x%llX start=0x%llX deadline_ms=%llu",
         pid,
@@ -1137,7 +1302,23 @@ emulation_result_t driver_snapshot_and_emulate(
         fail.error = "Cancelled before snapshot";
         return fail;
     }
+    const std::uint64_t snapshot_begin = emu_now_ms();
+    diag::log_tagged_fmt("emulation",
+        "driver_snapshot_and_emulate snapshot_begin pid=%u tid=%u deadline_remaining_ms=%llu",
+        pid,
+        tid,
+        static_cast<unsigned long long>(emu_deadline_remaining_ms(&config)));
     auto snapshot = driver_snapshot(pid, tid, snapshot_base, snapshot_size, &config);
+    diag::log_tagged_fmt("emulation",
+        "driver_snapshot_and_emulate snapshot_end pid=%u tid=%u success=%d regions=%zu bytes=%llu elapsed_ms=%llu deadline_remaining_ms=%llu error='%s'",
+        pid,
+        tid,
+        snapshot.success ? 1 : 0,
+        snapshot.regions.size(),
+        static_cast<unsigned long long>(snapshot.total_snapshot_bytes),
+        static_cast<unsigned long long>(emu_now_ms() - snapshot_begin),
+        static_cast<unsigned long long>(emu_deadline_remaining_ms(&config)),
+        snapshot.error.c_str());
     if (!snapshot.success)
     {
         emulation_result_t fail;
@@ -1146,19 +1327,49 @@ emulation_result_t driver_snapshot_and_emulate(
         return fail;
     }
 
+    if (emu_cancelled(&config, "snapshot_and_emulate_before_prepare")) {
+        emulation_result_t fail;
+        fail.error = "Cancelled before snapshot preparation";
+        return fail;
+    }
+    const std::uint64_t prepare_begin = emu_now_ms();
+    diag::log_tagged_fmt("emulation",
+        "driver_snapshot_and_emulate prepare_begin regions=%zu deadline_remaining_ms=%llu",
+        snapshot.regions.size(),
+        static_cast<unsigned long long>(emu_deadline_remaining_ms(&config)));
     prepare_snapshot_for_config(snapshot, config);
+    diag::log_tagged_fmt("emulation",
+        "driver_snapshot_and_emulate prepare_end regions=%zu bytes=%llu elapsed_ms=%llu deadline_remaining_ms=%llu",
+        snapshot.regions.size(),
+        static_cast<unsigned long long>(snapshot.total_snapshot_bytes),
+        static_cast<unsigned long long>(emu_now_ms() - prepare_begin),
+        static_cast<unsigned long long>(emu_deadline_remaining_ms(&config)));
     if (emu_cancelled(&config, "snapshot_and_emulate_before_unicorn")) {
         emulation_result_t fail;
         fail.error = "Cancelled after snapshot";
         return fail;
     }
+    const std::uint64_t emulate_begin = emu_now_ms();
+    diag::log_tagged_fmt("emulation",
+        "driver_snapshot_and_emulate unicorn_begin start=0x%llX deadline_remaining_ms=%llu",
+        static_cast<unsigned long long>(config.start_address),
+        static_cast<unsigned long long>(emu_deadline_remaining_ms(&config)));
     auto result = emulate_from_snapshot(snapshot, config);
     diag::log_tagged_fmt("emulation",
-        "driver_snapshot_and_emulate exit success=%d error='%s' total=%u trace=%zu",
+        "driver_snapshot_and_emulate unicorn_end success=%d error='%s' total=%u trace=%zu elapsed_ms=%llu deadline_remaining_ms=%llu",
         result.success ? 1 : 0,
         result.error.c_str(),
         result.total_instructions,
-        result.trace.size());
+        result.trace.size(),
+        static_cast<unsigned long long>(emu_now_ms() - emulate_begin),
+        static_cast<unsigned long long>(emu_deadline_remaining_ms(&config)));
+    diag::log_tagged_fmt("emulation",
+        "driver_snapshot_and_emulate exit success=%d error='%s' total=%u trace=%zu elapsed_ms=%llu",
+        result.success ? 1 : 0,
+        result.error.c_str(),
+        result.total_instructions,
+        result.trace.size(),
+        static_cast<unsigned long long>(emu_now_ms() - total_begin));
     return result;
 }
 

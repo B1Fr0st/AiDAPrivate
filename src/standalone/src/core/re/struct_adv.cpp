@@ -496,6 +496,7 @@ tool_result_t array_detect(const json& params)
 
 tool_result_t compare_snapshots(const json& params)
 {
+    const auto started = std::chrono::steady_clock::now();
     const std::string a_id = string_param(params, "snapshot_a_id");
     const std::string b_id = string_param(params, "snapshot_b_id");
     if (a_id.empty() || b_id.empty())
@@ -511,6 +512,7 @@ tool_result_t compare_snapshots(const json& params)
     store::memory_snapshot_t b_mem;
     bool found = false;
     std::uint32_t type_pid = 0;
+    std::string snapshot_source;
     if (store::find_memory_snapshot(a_id, a_mem) && store::find_memory_snapshot(b_id, b_mem))
     {
         if (base >= a_mem.base_va && base + struct_size <= a_mem.base_va + a_mem.data.size() &&
@@ -522,15 +524,19 @@ tool_result_t compare_snapshots(const json& params)
             b_bytes.assign(b_mem.data.begin() + b_off, b_mem.data.begin() + b_off + static_cast<std::ptrdiff_t>(struct_size));
             found = true;
             type_pid = a_mem.pid == b_mem.pid ? a_mem.pid : 0;
+            snapshot_source = "artifact_store";
         }
     }
     if (!found)
     {
         auto a_snap = find_scanner_snapshot(a_id);
         auto b_snap = find_scanner_snapshot(b_id);
-        if (a_snap && b_snap)
+        if (a_snap && b_snap) {
             found = extract_snapshot_region(*a_snap, base, struct_size, a_bytes) &&
                     extract_snapshot_region(*b_snap, base, struct_size, b_bytes);
+            if (found)
+                snapshot_source = "scanner_snapshot_diff";
+        }
     }
     if (!found)
         return tool_result_t::error("Snapshots not found in RE artifact snapshots or scanner snapshot_diff store.");
@@ -565,8 +571,25 @@ tool_result_t compare_snapshots(const json& params)
     result["snapshot_b_id"] = b_id;
     result["base_va"] = sa_format_address(base);
     result["struct_size"] = struct_size;
+    result["bytes_compared"] = std::min(a_bytes.size(), b_bytes.size());
+    result["snapshot_source"] = snapshot_source;
     result["changes"] = std::move(changes);
     result["change_count"] = result["changes"].size();
+    result["saw_mutation"] = result["change_count"].get<std::size_t>() > 0;
+    result["snapshots_equal"] = result["change_count"].get<std::size_t>() == 0;
+    result["functional_success"] = result["change_count"].get<std::size_t>() > 0;
+    result["elapsed_ms"] = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count());
+    result["evidence"] = {
+        {"snapshot_a_id", a_id},
+        {"snapshot_b_id", b_id},
+        {"snapshot_source", snapshot_source},
+        {"bytes_compared", result["bytes_compared"]},
+        {"mutation_observed", result["functional_success"]}
+    };
+    if (result["change_count"].get<std::size_t>() == 0) {
+        result["zero_change_reason"] = "snapshots were found and compared, but no byte differences were observed in the requested struct range";
+        return tool_result_t::error("Struct snapshot comparison found zero changes; no mutation evidence was observed.", result);
+    }
     return tool_result_t::ok(result);
 }
 }

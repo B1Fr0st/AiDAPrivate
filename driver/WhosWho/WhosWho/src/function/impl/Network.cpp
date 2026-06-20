@@ -175,6 +175,21 @@ typedef NTSTATUS(NTAPI* fn_FwpmFilterAdd0)(
 typedef NTSTATUS(NTAPI* fn_FwpmFilterDeleteById0)(HANDLE engineHandle, UINT64 filterId);
 typedef NTSTATUS(NTAPI* fn_FwpmCalloutDeleteById0)(HANDLE engineHandle, UINT32 calloutId);
 typedef NTSTATUS(NTAPI* fn_FwpmSubLayerDeleteByKey0)(HANDLE engineHandle, const GUID* key);
+typedef NTSTATUS(NTAPI* fn_FwpmFilterCreateEnumHandle0_NET)(
+    HANDLE engineHandle, const VOID* enumTemplate, HANDLE* enumHandle);
+typedef NTSTATUS(NTAPI* fn_FwpmFilterDestroyEnumHandle0_NET)(
+    HANDLE engineHandle, HANDLE enumHandle);
+typedef NTSTATUS(NTAPI* fn_FwpmFilterEnum0_NET)(
+    HANDLE engineHandle, HANDLE enumHandle, UINT32 numEntriesRequested,
+    FWPM_FILTER0_COMPAT*** entries, UINT32* numEntriesReturned);
+typedef NTSTATUS(NTAPI* fn_FwpmCalloutCreateEnumHandle0_NET)(
+    HANDLE engineHandle, const VOID* enumTemplate, HANDLE* enumHandle);
+typedef NTSTATUS(NTAPI* fn_FwpmCalloutDestroyEnumHandle0_NET)(
+    HANDLE engineHandle, HANDLE enumHandle);
+typedef NTSTATUS(NTAPI* fn_FwpmCalloutEnum0_NET)(
+    HANDLE engineHandle, HANDLE enumHandle, UINT32 numEntriesRequested,
+    FWPM_CALLOUT0_COMPAT*** entries, UINT32* numEntriesReturned);
+typedef VOID(NTAPI* fn_FwpmFreeMemory0_NET)(VOID** p);
 
 
 static const GUID GUID_LAYER_INBOUND_V4 =
@@ -400,6 +415,13 @@ namespace net_capture {
     inline fn_FwpmFilterDeleteById0      _FwpmFilterDeleteById0      = nullptr;
     inline fn_FwpmCalloutDeleteById0     _FwpmCalloutDeleteById0     = nullptr;
     inline fn_FwpmSubLayerDeleteByKey0   _FwpmSubLayerDeleteByKey0   = nullptr;
+    inline fn_FwpmFilterCreateEnumHandle0_NET  _FwpmFilterCreateEnumHandle0  = nullptr;
+    inline fn_FwpmFilterDestroyEnumHandle0_NET _FwpmFilterDestroyEnumHandle0 = nullptr;
+    inline fn_FwpmFilterEnum0_NET              _FwpmFilterEnum0              = nullptr;
+    inline fn_FwpmCalloutCreateEnumHandle0_NET _FwpmCalloutCreateEnumHandle0 = nullptr;
+    inline fn_FwpmCalloutDestroyEnumHandle0_NET _FwpmCalloutDestroyEnumHandle0 = nullptr;
+    inline fn_FwpmCalloutEnum0_NET             _FwpmCalloutEnum0             = nullptr;
+    inline fn_FwpmFreeMemory0_NET              _FwpmFreeMemory0              = nullptr;
 
 
     inline volatile LONG g_wfp_initialized = 0;
@@ -413,6 +435,11 @@ namespace net_capture {
     inline UINT32 g_callout_id_datagram = 0;
     inline UINT32 g_callout_id_ale_connect = 0;
     inline UINT32 g_callout_id_ale_recv = 0;
+    inline UINT32 g_fwpm_callout_id_inbound = 0;
+    inline UINT32 g_fwpm_callout_id_outbound = 0;
+    inline UINT32 g_fwpm_callout_id_datagram = 0;
+    inline UINT32 g_fwpm_callout_id_ale_connect = 0;
+    inline UINT32 g_fwpm_callout_id_ale_recv = 0;
     inline UINT64 g_filter_id_inbound = 0;
     inline UINT64 g_filter_id_outbound = 0;
     inline UINT64 g_filter_id_datagram = 0;
@@ -1897,6 +1924,13 @@ namespace net_capture {
         CHAR n11[] = {'F','w','p','m','F','i','l','t','e','r','D','e','l','e','t','e','B','y','I','d','0',0};
         CHAR n12[] = {'F','w','p','m','C','a','l','l','o','u','t','D','e','l','e','t','e','B','y','I','d','0',0};
         CHAR n13[] = {'F','w','p','m','S','u','b','L','a','y','e','r','D','e','l','e','t','e','B','y','K','e','y','0',0};
+        CHAR n14[] = {'F','w','p','m','F','i','l','t','e','r','C','r','e','a','t','e','E','n','u','m','H','a','n','d','l','e','0',0};
+        CHAR n15[] = {'F','w','p','m','F','i','l','t','e','r','D','e','s','t','r','o','y','E','n','u','m','H','a','n','d','l','e','0',0};
+        CHAR n16[] = {'F','w','p','m','F','i','l','t','e','r','E','n','u','m','0',0};
+        CHAR n17[] = {'F','w','p','m','C','a','l','l','o','u','t','C','r','e','a','t','e','E','n','u','m','H','a','n','d','l','e','0',0};
+        CHAR n18[] = {'F','w','p','m','C','a','l','l','o','u','t','D','e','s','t','r','o','y','E','n','u','m','H','a','n','d','l','e','0',0};
+        CHAR n19[] = {'F','w','p','m','C','a','l','l','o','u','t','E','n','u','m','0',0};
+        CHAR n20[] = {'F','w','p','m','F','r','e','e','M','e','m','o','r','y','0',0};
 
         *(PVOID*)&_FwpsCalloutRegister2       = GetProcAddress(fwp_base, n1);
         *(PVOID*)&_FwpsCalloutUnregisterById0 = GetProcAddress(fwp_base, n2);
@@ -1911,23 +1945,232 @@ namespace net_capture {
         *(PVOID*)&_FwpmFilterDeleteById0      = GetProcAddress(fwp_base, n11);
         *(PVOID*)&_FwpmCalloutDeleteById0     = GetProcAddress(fwp_base, n12);
         *(PVOID*)&_FwpmSubLayerDeleteByKey0   = GetProcAddress(fwp_base, n13);
+        *(PVOID*)&_FwpmFilterCreateEnumHandle0 = GetProcAddress(fwp_base, n14);
+        *(PVOID*)&_FwpmFilterDestroyEnumHandle0 = GetProcAddress(fwp_base, n15);
+        *(PVOID*)&_FwpmFilterEnum0            = GetProcAddress(fwp_base, n16);
+        *(PVOID*)&_FwpmCalloutCreateEnumHandle0 = GetProcAddress(fwp_base, n17);
+        *(PVOID*)&_FwpmCalloutDestroyEnumHandle0 = GetProcAddress(fwp_base, n18);
+        *(PVOID*)&_FwpmCalloutEnum0           = GetProcAddress(fwp_base, n19);
+        *(PVOID*)&_FwpmFreeMemory0            = GetProcAddress(fwp_base, n20);
 
         BOOLEAN ok = (_FwpsCalloutRegister2 && _FwpsCalloutUnregisterById0 &&
                 _FwpmEngineOpen0 && _FwpmEngineClose0 &&
                 _FwpmTransactionBegin0 && _FwpmTransactionCommit0 &&
-                _FwpmCalloutAdd0 && _FwpmSubLayerAdd0 && _FwpmFilterAdd0);
+                _FwpmTransactionAbort0 && _FwpmCalloutAdd0 &&
+                _FwpmSubLayerAdd0 && _FwpmFilterAdd0 &&
+                _FwpmFilterDeleteById0 && _FwpmCalloutDeleteById0 &&
+                _FwpmSubLayerDeleteByKey0 && _FwpmFilterCreateEnumHandle0 &&
+                _FwpmFilterDestroyEnumHandle0 && _FwpmFilterEnum0 &&
+                _FwpmCalloutCreateEnumHandle0 && _FwpmCalloutDestroyEnumHandle0 &&
+                _FwpmCalloutEnum0 && _FwpmFreeMemory0);
         NET_DBG("resolve_wfp_functions: Register2=%p UnregById=%p EngOpen=%p EngClose=%p",
                 _FwpsCalloutRegister2, _FwpsCalloutUnregisterById0,
                 _FwpmEngineOpen0, _FwpmEngineClose0);
         NET_DBG("resolve_wfp_functions: TxnBegin=%p TxnCommit=%p CalloutAdd=%p SubLayerAdd=%p FilterAdd=%p",
                 _FwpmTransactionBegin0, _FwpmTransactionCommit0,
                 _FwpmCalloutAdd0, _FwpmSubLayerAdd0, _FwpmFilterAdd0);
+        NET_DBG("resolve_wfp_functions: FilterEnum=%p CalloutEnum=%p FreeMem=%p FilterDel=%p CalloutDel=%p SubLayerDel=%p",
+                _FwpmFilterEnum0, _FwpmCalloutEnum0, _FwpmFreeMemory0,
+                _FwpmFilterDeleteById0, _FwpmCalloutDeleteById0,
+                _FwpmSubLayerDeleteByKey0);
         if (!ok) {
             NET_ERR("resolve_wfp_functions: one or more critical functions not resolved");
         } else {
             NET_DBG("resolve_wfp_functions: all critical functions resolved OK");
         }
         return ok;
+    }
+
+    static BOOLEAN guid_equal(const GUID* a, const GUID* b) {
+        return a && b && RtlCompareMemory(a, b, sizeof(GUID)) == sizeof(GUID);
+    }
+
+    static BOOLEAN is_aida_callout_key(const GUID* key) {
+        return guid_equal(key, &GUID_AIDA_CALLOUT_INBOUND) ||
+               guid_equal(key, &GUID_AIDA_CALLOUT_OUTBOUND) ||
+               guid_equal(key, &GUID_AIDA_CALLOUT_DATAGRAM) ||
+               guid_equal(key, &GUID_AIDA_CALLOUT_ALE_CONNECT) ||
+               guid_equal(key, &GUID_AIDA_CALLOUT_ALE_RECV);
+    }
+
+    static UINT32 filter_match_reason(const FWPM_FILTER0_COMPAT* filter) {
+        if (!filter) return 0;
+        UINT32 reason = 0;
+        if (guid_equal(&filter->subLayerKey, &GUID_AIDA_SUBLAYER))
+            reason |= WFP_AIDA_MATCH_SUBLAYER;
+        if (is_aida_callout_key(&filter->action.calloutKey))
+            reason |= WFP_AIDA_MATCH_ACTION_CALLOUT;
+        return reason;
+    }
+
+    static ULONG status_to_win32(NTSTATUS status) {
+        return RtlNtStatusToDosError(status);
+    }
+
+    static NTSTATUS cleanup_startup_wfp_orphans(HANDLE engine) {
+        if (!engine) return STATUS_INVALID_PARAMETER;
+        if (!_FwpmFilterCreateEnumHandle0 || !_FwpmFilterDestroyEnumHandle0 ||
+            !_FwpmFilterEnum0 || !_FwpmCalloutCreateEnumHandle0 ||
+            !_FwpmCalloutDestroyEnumHandle0 || !_FwpmCalloutEnum0 ||
+            !_FwpmFreeMemory0 || !_FwpmFilterDeleteById0 ||
+            !_FwpmCalloutDeleteById0 || !_FwpmSubLayerDeleteByKey0) {
+            WW_LOG("net_capture::orphan_cleanup missing_functions filter_create=%p filter_destroy=%p filter_enum=%p callout_create=%p callout_destroy=%p callout_enum=%p free=%p filter_delete=%p callout_delete=%p sublayer_delete=%p",
+                _FwpmFilterCreateEnumHandle0,
+                _FwpmFilterDestroyEnumHandle0,
+                _FwpmFilterEnum0,
+                _FwpmCalloutCreateEnumHandle0,
+                _FwpmCalloutDestroyEnumHandle0,
+                _FwpmCalloutEnum0,
+                _FwpmFreeMemory0,
+                _FwpmFilterDeleteById0,
+                _FwpmCalloutDeleteById0,
+                _FwpmSubLayerDeleteByKey0);
+            return STATUS_PROCEDURE_NOT_FOUND;
+        }
+
+        NTSTATUS first_failure = STATUS_SUCCESS;
+        UINT32 filters_seen = 0;
+        UINT32 filters_matched = 0;
+        UINT32 filters_deleted = 0;
+        UINT32 filter_delete_failed = 0;
+        UINT32 callouts_seen = 0;
+        UINT32 callouts_matched = 0;
+        UINT32 callouts_deleted = 0;
+        UINT32 callout_delete_failed = 0;
+
+        HANDLE filter_enum = nullptr;
+        NTSTATUS status = _FwpmFilterCreateEnumHandle0(engine, nullptr, &filter_enum);
+        WW_LOG("net_capture::orphan_cleanup filter_enum_create status=0x%08X win32=%lu handle=%p",
+            status, status_to_win32(status), filter_enum);
+        if (NT_SUCCESS(status) && filter_enum) {
+            for (;;) {
+                FWPM_FILTER0_COMPAT** entries = nullptr;
+                UINT32 returned = 0;
+                status = _FwpmFilterEnum0(engine, filter_enum, 64, &entries, &returned);
+                WW_LOG("net_capture::orphan_cleanup filter_enum status=0x%08X win32=%lu returned=%u",
+                    status, status_to_win32(status), returned);
+                if (!NT_SUCCESS(status)) {
+                    if (NT_SUCCESS(first_failure)) first_failure = status;
+                    break;
+                }
+                if (returned == 0) {
+                    if (entries) _FwpmFreeMemory0((VOID**)&entries);
+                    break;
+                }
+                filters_seen += returned;
+                for (UINT32 i = 0; i < returned; ++i) {
+                    FWPM_FILTER0_COMPAT* filter = entries[i];
+                    if (!filter) continue;
+                    UINT32 reason = filter_match_reason(filter);
+                    if (reason == 0) continue;
+                    ++filters_matched;
+                    NTSTATUS del_status = _FwpmFilterDeleteById0(engine, filter->filterId);
+                    ULONG del_win32 = status_to_win32(del_status);
+                    WW_LOG("net_capture::orphan_cleanup filter_delete id=%llu action=0x%08X provider=%u reason=0x%08X status=0x%08X win32=%lu",
+                        (unsigned long long)filter->filterId,
+                        (UINT32)filter->action.type,
+                        filter->providerKey ? 1u : 0u,
+                        reason,
+                        del_status,
+                        del_win32);
+                    if (NT_SUCCESS(del_status)) {
+                        ++filters_deleted;
+                    } else {
+                        ++filter_delete_failed;
+                        if (NT_SUCCESS(first_failure)) first_failure = del_status;
+                    }
+                }
+                _FwpmFreeMemory0((VOID**)&entries);
+            }
+            NTSTATUS destroy_status = _FwpmFilterDestroyEnumHandle0(engine, filter_enum);
+            WW_LOG("net_capture::orphan_cleanup filter_enum_destroy status=0x%08X win32=%lu",
+                destroy_status, status_to_win32(destroy_status));
+            if (!NT_SUCCESS(destroy_status) && NT_SUCCESS(first_failure))
+                first_failure = destroy_status;
+        } else if (NT_SUCCESS(first_failure)) {
+            first_failure = status ? status : STATUS_UNSUCCESSFUL;
+        }
+
+        HANDLE callout_enum = nullptr;
+        status = _FwpmCalloutCreateEnumHandle0(engine, nullptr, &callout_enum);
+        WW_LOG("net_capture::orphan_cleanup callout_enum_create status=0x%08X win32=%lu handle=%p",
+            status, status_to_win32(status), callout_enum);
+        if (NT_SUCCESS(status) && callout_enum) {
+            for (;;) {
+                FWPM_CALLOUT0_COMPAT** entries = nullptr;
+                UINT32 returned = 0;
+                status = _FwpmCalloutEnum0(engine, callout_enum, 64, &entries, &returned);
+                WW_LOG("net_capture::orphan_cleanup callout_enum status=0x%08X win32=%lu returned=%u",
+                    status, status_to_win32(status), returned);
+                if (!NT_SUCCESS(status)) {
+                    if (NT_SUCCESS(first_failure)) first_failure = status;
+                    break;
+                }
+                if (returned == 0) {
+                    if (entries) _FwpmFreeMemory0((VOID**)&entries);
+                    break;
+                }
+                callouts_seen += returned;
+                for (UINT32 i = 0; i < returned; ++i) {
+                    FWPM_CALLOUT0_COMPAT* callout = entries[i];
+                    if (!callout || !is_aida_callout_key(&callout->calloutKey)) continue;
+                    ++callouts_matched;
+                    NTSTATUS del_status = _FwpmCalloutDeleteById0(engine, callout->calloutId);
+                    ULONG del_win32 = status_to_win32(del_status);
+                    WW_LOG("net_capture::orphan_cleanup callout_delete id=%u provider=%u status=0x%08X win32=%lu",
+                        callout->calloutId,
+                        callout->providerKey ? 1u : 0u,
+                        del_status,
+                        del_win32);
+                    if (NT_SUCCESS(del_status)) {
+                        ++callouts_deleted;
+                    } else {
+                        ++callout_delete_failed;
+                        if (NT_SUCCESS(first_failure)) first_failure = del_status;
+                    }
+                }
+                _FwpmFreeMemory0((VOID**)&entries);
+            }
+            NTSTATUS destroy_status = _FwpmCalloutDestroyEnumHandle0(engine, callout_enum);
+            WW_LOG("net_capture::orphan_cleanup callout_enum_destroy status=0x%08X win32=%lu",
+                destroy_status, status_to_win32(destroy_status));
+            if (!NT_SUCCESS(destroy_status) && NT_SUCCESS(first_failure))
+                first_failure = destroy_status;
+        } else if (NT_SUCCESS(first_failure)) {
+            first_failure = status ? status : STATUS_UNSUCCESSFUL;
+        }
+
+        NTSTATUS sublayer_status = _FwpmSubLayerDeleteByKey0(engine, &GUID_AIDA_SUBLAYER);
+        WW_LOG("net_capture::orphan_cleanup sublayer_delete status=0x%08X win32=%lu",
+            sublayer_status, status_to_win32(sublayer_status));
+        WW_LOG("net_capture::orphan_cleanup summary filters_seen=%u filters_matched=%u filters_deleted=%u filter_failed=%u callouts_seen=%u callouts_matched=%u callouts_deleted=%u callout_failed=%u final_status=0x%08X final_win32=%lu",
+            filters_seen,
+            filters_matched,
+            filters_deleted,
+            filter_delete_failed,
+            callouts_seen,
+            callouts_matched,
+            callouts_deleted,
+            callout_delete_failed,
+            first_failure,
+            status_to_win32(first_failure));
+        return first_failure;
+    }
+
+    void unregister_wfp();
+
+    static NTSTATUS abort_register_wfp(const char* step, NTSTATUS status) {
+        NTSTATUS abort_status = STATUS_SUCCESS;
+        if (g_engine_handle && _FwpmTransactionAbort0)
+            abort_status = _FwpmTransactionAbort0(g_engine_handle);
+        WW_LOG("net_capture::register_wfp abort step=%s status=0x%08X win32=%lu abort_status=0x%08X abort_win32=%lu",
+            step ? step : "",
+            status,
+            status_to_win32(status),
+            abort_status,
+            status_to_win32(abort_status));
+        unregister_wfp();
+        return status;
     }
 
 
@@ -1947,6 +2190,16 @@ namespace net_capture {
         NET_DBG("register_wfp: FwpmEngineOpen0 status=0x%08x handle=%p", status, g_engine_handle);
         if (!NT_SUCCESS(status)) {
             NET_ERR("register_wfp: FwpmEngineOpen0 FAILED 0x%08x", status);
+            return status;
+        }
+
+        status = cleanup_startup_wfp_orphans(g_engine_handle);
+        WW_LOG("net_capture::register_wfp orphan_cleanup status=0x%08X win32=%lu",
+            status, status_to_win32(status));
+        if (!NT_SUCCESS(status)) {
+            NET_ERR("register_wfp: orphan cleanup FAILED 0x%08x", status);
+            _FwpmEngineClose0(g_engine_handle);
+            g_engine_handle = nullptr;
             return status;
         }
 
@@ -1977,10 +2230,7 @@ namespace net_capture {
         NET_DBG("register_wfp: FwpmSubLayerAdd0 status=0x%08x", status);
         if (!NT_SUCCESS(status)) {
             NET_ERR("register_wfp: FwpmSubLayerAdd0 FAILED 0x%08x", status);
-            _FwpmTransactionAbort0(g_engine_handle);
-            _FwpmEngineClose0(g_engine_handle);
-            g_engine_handle = nullptr;
-            return status;
+            return abort_register_wfp("sublayer_add", status);
         }
 
 
@@ -1995,10 +2245,7 @@ namespace net_capture {
         NET_DBG("register_wfp: inbound callout register status=0x%08x id=%u", status, g_callout_id_inbound);
         if (!NT_SUCCESS(status)) {
             NET_ERR("register_wfp: inbound callout register FAILED 0x%08x", status);
-            _FwpmTransactionAbort0(g_engine_handle);
-            _FwpmEngineClose0(g_engine_handle);
-            g_engine_handle = nullptr;
-            return status;
+            return abort_register_wfp("fwps_inbound_register", status);
         }
 
 
@@ -2013,11 +2260,7 @@ namespace net_capture {
         NET_DBG("register_wfp: outbound callout register status=0x%08x id=%u", status, g_callout_id_outbound);
         if (!NT_SUCCESS(status)) {
             NET_ERR("register_wfp: outbound callout register FAILED 0x%08x", status);
-            _FwpsCalloutUnregisterById0(g_callout_id_inbound);
-            _FwpmTransactionAbort0(g_engine_handle);
-            _FwpmEngineClose0(g_engine_handle);
-            g_engine_handle = nullptr;
-            return status;
+            return abort_register_wfp("fwps_outbound_register", status);
         }
 
         FWPS_CALLOUT2_COMPAT callout_datagram = {};
@@ -2031,12 +2274,7 @@ namespace net_capture {
         NET_DBG("register_wfp: datagram callout register status=0x%08x id=%u", status, g_callout_id_datagram);
         if (!NT_SUCCESS(status)) {
             NET_ERR("register_wfp: datagram callout register FAILED 0x%08x", status);
-            _FwpsCalloutUnregisterById0(g_callout_id_inbound);
-            _FwpsCalloutUnregisterById0(g_callout_id_outbound);
-            _FwpmTransactionAbort0(g_engine_handle);
-            _FwpmEngineClose0(g_engine_handle);
-            g_engine_handle = nullptr;
-            return status;
+            return abort_register_wfp("fwps_datagram_register", status);
         }
 
 
@@ -2050,17 +2288,12 @@ namespace net_capture {
         fwpm_callout_in.calloutKey = GUID_AIDA_CALLOUT_INBOUND;
         fwpm_callout_in.displayData = callout_display;
         fwpm_callout_in.applicableLayer = GUID_LAYER_INBOUND_V4;
-        UINT32 unused_id;
 
-        status = _FwpmCalloutAdd0(g_engine_handle, &fwpm_callout_in, nullptr, &unused_id);
+        status = _FwpmCalloutAdd0(g_engine_handle, &fwpm_callout_in, nullptr, &g_fwpm_callout_id_inbound);
+        NET_DBG("register_wfp: inbound FWPM callout add status=0x%08x id=%u", status, g_fwpm_callout_id_inbound);
         if (!NT_SUCCESS(status)) {
-            _FwpsCalloutUnregisterById0(g_callout_id_inbound);
-            _FwpsCalloutUnregisterById0(g_callout_id_outbound);
-            _FwpsCalloutUnregisterById0(g_callout_id_datagram);
-            _FwpmTransactionAbort0(g_engine_handle);
-            _FwpmEngineClose0(g_engine_handle);
-            g_engine_handle = nullptr;
-            return status;
+            NET_ERR("register_wfp: inbound FWPM callout add FAILED 0x%08x", status);
+            return abort_register_wfp("fwpm_inbound_callout_add", status);
         }
 
         FWPM_CALLOUT0_COMPAT fwpm_callout_out = {};
@@ -2068,15 +2301,11 @@ namespace net_capture {
         fwpm_callout_out.displayData = callout_display;
         fwpm_callout_out.applicableLayer = GUID_LAYER_OUTBOUND_V4;
 
-        status = _FwpmCalloutAdd0(g_engine_handle, &fwpm_callout_out, nullptr, &unused_id);
+        status = _FwpmCalloutAdd0(g_engine_handle, &fwpm_callout_out, nullptr, &g_fwpm_callout_id_outbound);
+        NET_DBG("register_wfp: outbound FWPM callout add status=0x%08x id=%u", status, g_fwpm_callout_id_outbound);
         if (!NT_SUCCESS(status)) {
-            _FwpsCalloutUnregisterById0(g_callout_id_inbound);
-            _FwpsCalloutUnregisterById0(g_callout_id_outbound);
-            _FwpsCalloutUnregisterById0(g_callout_id_datagram);
-            _FwpmTransactionAbort0(g_engine_handle);
-            _FwpmEngineClose0(g_engine_handle);
-            g_engine_handle = nullptr;
-            return status;
+            NET_ERR("register_wfp: outbound FWPM callout add FAILED 0x%08x", status);
+            return abort_register_wfp("fwpm_outbound_callout_add", status);
         }
 
         FWPM_CALLOUT0_COMPAT fwpm_callout_datagram = {};
@@ -2084,15 +2313,11 @@ namespace net_capture {
         fwpm_callout_datagram.displayData = callout_display;
         fwpm_callout_datagram.applicableLayer = GUID_LAYER_DATAGRAM_V4;
 
-        status = _FwpmCalloutAdd0(g_engine_handle, &fwpm_callout_datagram, nullptr, &unused_id);
+        status = _FwpmCalloutAdd0(g_engine_handle, &fwpm_callout_datagram, nullptr, &g_fwpm_callout_id_datagram);
+        NET_DBG("register_wfp: datagram FWPM callout add status=0x%08x id=%u", status, g_fwpm_callout_id_datagram);
         if (!NT_SUCCESS(status)) {
-            _FwpsCalloutUnregisterById0(g_callout_id_inbound);
-            _FwpsCalloutUnregisterById0(g_callout_id_outbound);
-            _FwpsCalloutUnregisterById0(g_callout_id_datagram);
-            _FwpmTransactionAbort0(g_engine_handle);
-            _FwpmEngineClose0(g_engine_handle);
-            g_engine_handle = nullptr;
-            return status;
+            NET_ERR("register_wfp: datagram FWPM callout add FAILED 0x%08x", status);
+            return abort_register_wfp("fwpm_datagram_callout_add", status);
         }
 
 
@@ -2114,13 +2339,8 @@ namespace net_capture {
         filter_in.numFilterConditions = 0;
         status = _FwpmFilterAdd0(g_engine_handle, &filter_in, nullptr, &g_filter_id_inbound);
         if (!NT_SUCCESS(status)) {
-            _FwpsCalloutUnregisterById0(g_callout_id_inbound);
-            _FwpsCalloutUnregisterById0(g_callout_id_outbound);
-            _FwpsCalloutUnregisterById0(g_callout_id_datagram);
-            _FwpmTransactionAbort0(g_engine_handle);
-            _FwpmEngineClose0(g_engine_handle);
-            g_engine_handle = nullptr;
-            return status;
+            NET_ERR("register_wfp: inbound filter add FAILED 0x%08x", status);
+            return abort_register_wfp("inbound_filter_add", status);
         }
 
         FWPM_FILTER0_COMPAT filter_out = {};
@@ -2134,14 +2354,8 @@ namespace net_capture {
         filter_out.numFilterConditions = 0;
         status = _FwpmFilterAdd0(g_engine_handle, &filter_out, nullptr, &g_filter_id_outbound);
         if (!NT_SUCCESS(status)) {
-            _FwpmFilterDeleteById0(g_engine_handle, g_filter_id_inbound);
-            _FwpsCalloutUnregisterById0(g_callout_id_inbound);
-            _FwpsCalloutUnregisterById0(g_callout_id_outbound);
-            _FwpsCalloutUnregisterById0(g_callout_id_datagram);
-            _FwpmTransactionAbort0(g_engine_handle);
-            _FwpmEngineClose0(g_engine_handle);
-            g_engine_handle = nullptr;
-            return status;
+            NET_ERR("register_wfp: outbound filter add FAILED 0x%08x", status);
+            return abort_register_wfp("outbound_filter_add", status);
         }
 
         FWPM_FILTER0_COMPAT filter_datagram = {};
@@ -2155,15 +2369,8 @@ namespace net_capture {
         filter_datagram.numFilterConditions = 0;
         status = _FwpmFilterAdd0(g_engine_handle, &filter_datagram, nullptr, &g_filter_id_datagram);
         if (!NT_SUCCESS(status)) {
-            _FwpmFilterDeleteById0(g_engine_handle, g_filter_id_inbound);
-            _FwpmFilterDeleteById0(g_engine_handle, g_filter_id_outbound);
-            _FwpsCalloutUnregisterById0(g_callout_id_inbound);
-            _FwpsCalloutUnregisterById0(g_callout_id_outbound);
-            _FwpsCalloutUnregisterById0(g_callout_id_datagram);
-            _FwpmTransactionAbort0(g_engine_handle);
-            _FwpmEngineClose0(g_engine_handle);
-            g_engine_handle = nullptr;
-            return status;
+            NET_ERR("register_wfp: datagram filter add FAILED 0x%08x", status);
+            return abort_register_wfp("datagram_filter_add", status);
         }
 
 
@@ -2199,7 +2406,13 @@ namespace net_capture {
                 fwpm_ale_conn.calloutKey = GUID_AIDA_CALLOUT_ALE_CONNECT;
                 fwpm_ale_conn.displayData = callout_display;
                 fwpm_ale_conn.applicableLayer = GUID_LAYER_ALE_CONNECT_V4;
-                _FwpmCalloutAdd0(g_engine_handle, &fwpm_ale_conn, nullptr, &unused_id);
+                NTSTATUS ale_callout_status = _FwpmCalloutAdd0(g_engine_handle, &fwpm_ale_conn, nullptr, &g_fwpm_callout_id_ale_connect);
+                NET_DBG("register_wfp: ALE connect FWPM callout add status=0x%08x id=%u",
+                    ale_callout_status, g_fwpm_callout_id_ale_connect);
+                if (!NT_SUCCESS(ale_callout_status)) {
+                    NET_ERR("register_wfp: ALE connect FWPM callout add FAILED 0x%08x", ale_callout_status);
+                    g_fwpm_callout_id_ale_connect = 0;
+                }
 
                 FWPM_FILTER0_COMPAT filter_ale_conn = {};
                 strong::kmemset(&filter_ale_conn, 0, sizeof(filter_ale_conn));
@@ -2225,7 +2438,13 @@ namespace net_capture {
                 fwpm_ale_recv.calloutKey = GUID_AIDA_CALLOUT_ALE_RECV;
                 fwpm_ale_recv.displayData = callout_display;
                 fwpm_ale_recv.applicableLayer = GUID_LAYER_ALE_RECV_V4;
-                _FwpmCalloutAdd0(g_engine_handle, &fwpm_ale_recv, nullptr, &unused_id);
+                NTSTATUS ale_callout_status = _FwpmCalloutAdd0(g_engine_handle, &fwpm_ale_recv, nullptr, &g_fwpm_callout_id_ale_recv);
+                NET_DBG("register_wfp: ALE recv FWPM callout add status=0x%08x id=%u",
+                    ale_callout_status, g_fwpm_callout_id_ale_recv);
+                if (!NT_SUCCESS(ale_callout_status)) {
+                    NET_ERR("register_wfp: ALE recv FWPM callout add FAILED 0x%08x", ale_callout_status);
+                    g_fwpm_callout_id_ale_recv = 0;
+                }
 
                 FWPM_FILTER0_COMPAT filter_ale_recv = {};
                 strong::kmemset(&filter_ale_recv, 0, sizeof(filter_ale_recv));
@@ -2255,12 +2474,7 @@ namespace net_capture {
         NET_DBG("register_wfp: FwpmTransactionCommit0 status=0x%08x", status);
         if (!NT_SUCCESS(status)) {
             NET_ERR("register_wfp: FwpmTransactionCommit0 FAILED 0x%08x", status);
-            _FwpsCalloutUnregisterById0(g_callout_id_inbound);
-            _FwpsCalloutUnregisterById0(g_callout_id_outbound);
-            _FwpsCalloutUnregisterById0(g_callout_id_datagram);
-            _FwpmEngineClose0(g_engine_handle);
-            g_engine_handle = nullptr;
-            return status;
+            return abort_register_wfp("transaction_commit", status);
         }
 
         NET_DBG("register_wfp: SUCCESS — inbound_id=%u outbound_id=%u ale_conn_id=%u ale_recv_id=%u",
@@ -2271,64 +2485,89 @@ namespace net_capture {
 
     void unregister_wfp() {
         if (g_engine_handle) {
-            if (g_filter_id_ale_recv) {
-                _FwpmFilterDeleteById0(g_engine_handle, g_filter_id_ale_recv);
-                g_filter_id_ale_recv = 0;
+            UINT64* filter_ids[] = {
+                &g_filter_id_ale_recv,
+                &g_filter_id_ale_connect,
+                &g_filter_id_inbound,
+                &g_filter_id_outbound,
+                &g_filter_id_datagram
+            };
+            for (UINT32 i = 0; i < sizeof(filter_ids) / sizeof(filter_ids[0]); ++i) {
+                if (*filter_ids[i] && _FwpmFilterDeleteById0) {
+                    UINT64 id = *filter_ids[i];
+                    NTSTATUS del_status = _FwpmFilterDeleteById0(g_engine_handle, id);
+                    WW_LOG("net_capture::unregister_wfp filter_delete index=%u id=%llu status=0x%08X win32=%lu",
+                        i,
+                        (unsigned long long)id,
+                        del_status,
+                        status_to_win32(del_status));
+                    *filter_ids[i] = 0;
+                }
             }
-            if (g_filter_id_ale_connect) {
-                _FwpmFilterDeleteById0(g_engine_handle, g_filter_id_ale_connect);
-                g_filter_id_ale_connect = 0;
+
+            UINT32* fwpm_callout_ids[] = {
+                &g_fwpm_callout_id_ale_recv,
+                &g_fwpm_callout_id_ale_connect,
+                &g_fwpm_callout_id_inbound,
+                &g_fwpm_callout_id_outbound,
+                &g_fwpm_callout_id_datagram
+            };
+            for (UINT32 i = 0; i < sizeof(fwpm_callout_ids) / sizeof(fwpm_callout_ids[0]); ++i) {
+                if (*fwpm_callout_ids[i] && _FwpmCalloutDeleteById0) {
+                    UINT32 id = *fwpm_callout_ids[i];
+                    NTSTATUS del_status = _FwpmCalloutDeleteById0(g_engine_handle, id);
+                    WW_LOG("net_capture::unregister_wfp fwpm_callout_delete index=%u id=%u status=0x%08X win32=%lu",
+                        i,
+                        id,
+                        del_status,
+                        status_to_win32(del_status));
+                    *fwpm_callout_ids[i] = 0;
+                }
             }
-            if (g_filter_id_inbound) {
-                _FwpmFilterDeleteById0(g_engine_handle, g_filter_id_inbound);
-                g_filter_id_inbound = 0;
-            }
-            if (g_filter_id_outbound) {
-                _FwpmFilterDeleteById0(g_engine_handle, g_filter_id_outbound);
-                g_filter_id_outbound = 0;
-            }
-            if (g_filter_id_datagram) {
-                _FwpmFilterDeleteById0(g_engine_handle, g_filter_id_datagram);
-                g_filter_id_datagram = 0;
-            }
+
             if (_FwpmSubLayerDeleteByKey0) {
-                _FwpmSubLayerDeleteByKey0(g_engine_handle, &GUID_AIDA_SUBLAYER);
+                NTSTATUS sublayer_status = _FwpmSubLayerDeleteByKey0(g_engine_handle, &GUID_AIDA_SUBLAYER);
+                WW_LOG("net_capture::unregister_wfp sublayer_delete status=0x%08X win32=%lu",
+                    sublayer_status,
+                    status_to_win32(sublayer_status));
             }
-            if (_FwpmCalloutDeleteById0) {
-                if (g_callout_id_inbound)
-                    _FwpmCalloutDeleteById0(g_engine_handle, g_callout_id_inbound);
-                if (g_callout_id_outbound)
-                    _FwpmCalloutDeleteById0(g_engine_handle, g_callout_id_outbound);
-                if (g_callout_id_datagram)
-                    _FwpmCalloutDeleteById0(g_engine_handle, g_callout_id_datagram);
-                if (g_callout_id_ale_connect)
-                    _FwpmCalloutDeleteById0(g_engine_handle, g_callout_id_ale_connect);
-                if (g_callout_id_ale_recv)
-                    _FwpmCalloutDeleteById0(g_engine_handle, g_callout_id_ale_recv);
-            }
-            _FwpmEngineClose0(g_engine_handle);
+            NTSTATUS close_status = _FwpmEngineClose0(g_engine_handle);
+            WW_LOG("net_capture::unregister_wfp engine_close status=0x%08X win32=%lu",
+                close_status,
+                status_to_win32(close_status));
             g_engine_handle = nullptr;
         }
-        if (g_callout_id_ale_recv) {
-            _FwpsCalloutUnregisterById0(g_callout_id_ale_recv);
-            g_callout_id_ale_recv = 0;
+
+        UINT32* fwps_callout_ids[] = {
+            &g_callout_id_ale_recv,
+            &g_callout_id_ale_connect,
+            &g_callout_id_inbound,
+            &g_callout_id_outbound,
+            &g_callout_id_datagram
+        };
+        for (UINT32 i = 0; i < sizeof(fwps_callout_ids) / sizeof(fwps_callout_ids[0]); ++i) {
+            if (*fwps_callout_ids[i] && _FwpsCalloutUnregisterById0) {
+                UINT32 id = *fwps_callout_ids[i];
+                NTSTATUS unreg_status = _FwpsCalloutUnregisterById0(id);
+                WW_LOG("net_capture::unregister_wfp fwps_callout_unregister index=%u id=%u status=0x%08X win32=%lu",
+                    i,
+                    id,
+                    unreg_status,
+                    status_to_win32(unreg_status));
+                *fwps_callout_ids[i] = 0;
+            }
         }
-        if (g_callout_id_ale_connect) {
-            _FwpsCalloutUnregisterById0(g_callout_id_ale_connect);
-            g_callout_id_ale_connect = 0;
-        }
-        if (g_callout_id_inbound) {
-            _FwpsCalloutUnregisterById0(g_callout_id_inbound);
-            g_callout_id_inbound = 0;
-        }
-        if (g_callout_id_outbound) {
-            _FwpsCalloutUnregisterById0(g_callout_id_outbound);
-            g_callout_id_outbound = 0;
-        }
-        if (g_callout_id_datagram) {
-            _FwpsCalloutUnregisterById0(g_callout_id_datagram);
-            g_callout_id_datagram = 0;
-        }
+        g_fwpm_callout_id_ale_recv = 0;
+        g_fwpm_callout_id_ale_connect = 0;
+        g_fwpm_callout_id_inbound = 0;
+        g_fwpm_callout_id_outbound = 0;
+        g_fwpm_callout_id_datagram = 0;
+        g_filter_id_ale_recv = 0;
+        g_filter_id_ale_connect = 0;
+        g_filter_id_inbound = 0;
+        g_filter_id_outbound = 0;
+        g_filter_id_datagram = 0;
+        g_device_object = nullptr;
     }
 
 
@@ -4046,6 +4285,9 @@ namespace net_wfp_enum {
         out->notify_fn = notify_fn;
         out->flow_delete_fn = flow_delete_fn;
         out->owning_module_base = (UINT64)net_capture::find_module_base("WhosWho.sys");
+        out->entry_type = WFP_ENTRY_TYPE_CALLOUT;
+        out->provider_present = 0;
+        out->aida_match_reason = net_capture::is_aida_callout_key(callout_key) ? WFP_AIDA_MATCH_ACTION_CALLOUT : 0;
         get_module_name_for_address(classify_fn, out->owning_module, sizeof(out->owning_module));
         (*total_filled)++;
     }
@@ -4120,130 +4362,151 @@ namespace net_wfp_enum {
         ExFreePoolWithTag(mods, 'wmNW');
     }
 
+    static void copy_display_name(const FWPM_DISPLAY_DATA0* display, char* out_name, SIZE_T max_len) {
+        if (!out_name || max_len == 0) return;
+        out_name[0] = 0;
+        if (!display) return;
+        __try {
+            wchar_t* wname = display->name;
+            if (wname && _MmIsAddressValid(wname)) {
+                SIZE_T j = 0;
+                for (; j + 1 < max_len && wname[j]; ++j)
+                    out_name[j] = (char)(wname[j] & 0x7F);
+                out_name[j] = 0;
+            }
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            out_name[0] = 0;
+        }
+    }
+
+    static BOOLEAN text_contains_ci(const char* text, const char* needle) {
+        if (!needle || needle[0] == 0) return TRUE;
+        if (!text || text[0] == 0) return FALSE;
+        SIZE_T nlen = 0;
+        while (needle[nlen] && nlen < 63) ++nlen;
+        SIZE_T tlen = 0;
+        while (text[tlen] && tlen < 63) ++tlen;
+        if (tlen < nlen) return FALSE;
+        for (SIZE_T s = 0; s <= tlen - nlen; ++s) {
+            BOOLEAN ok = TRUE;
+            for (SIZE_T k = 0; k < nlen; ++k) {
+                char a = text[s + k];
+                char b = needle[k];
+                if (a >= 'A' && a <= 'Z') a += 32;
+                if (b >= 'A' && b <= 'Z') b += 32;
+                if (a != b) { ok = FALSE; break; }
+            }
+            if (ok) return TRUE;
+        }
+        return FALSE;
+    }
+
     static NTSTATUS enumerate_wfp_callouts(p_wfp_callout_enum request) {
         if (!request) return STATUS_INVALID_PARAMETER;
 
         request->callout_count = 0;
-
 
         if (!net_capture::_FwpmEngineOpen0 || !net_capture::_FwpmEngineClose0) {
             if (!net_capture::resolve_wfp_functions())
                 return STATUS_NOT_SUPPORTED;
         }
 
-
-        PVOID fwp_base = net_capture::find_module_base("FWPKCLNT.SYS");
-        if (!fwp_base) fwp_base = net_capture::find_module_base("fwpkclnt.sys");
-        if (!fwp_base) return STATUS_NOT_FOUND;
-
-        CHAR en1[] = {'F','w','p','m','C','a','l','l','o','u','t','C','r','e','a','t','e','E','n','u','m','H','a','n','d','l','e','0',0};
-        CHAR en2[] = {'F','w','p','m','C','a','l','l','o','u','t','D','e','s','t','r','o','y','E','n','u','m','H','a','n','d','l','e','0',0};
-        CHAR en3[] = {'F','w','p','m','C','a','l','l','o','u','t','E','n','u','m','0',0};
-        CHAR en4[] = {'F','w','p','m','F','r','e','e','M','e','m','o','r','y','0',0};
-
-        auto _CreateEnum = (fn_FwpmCalloutCreateEnumHandle0)GetProcAddress(fwp_base, en1);
-        auto _DestroyEnum = (fn_FwpmCalloutDestroyEnumHandle0)GetProcAddress(fwp_base, en2);
-        auto _Enum = (fn_FwpmCalloutEnum0)GetProcAddress(fwp_base, en3);
-        auto _FreeMem = (fn_FwpmFreeMemory0)GetProcAddress(fwp_base, en4);
-
-        if (!_CreateEnum || !_DestroyEnum || !_Enum || !_FreeMem)
+        if (!net_capture::_FwpmCalloutCreateEnumHandle0 ||
+            !net_capture::_FwpmCalloutDestroyEnumHandle0 ||
+            !net_capture::_FwpmCalloutEnum0 ||
+            !net_capture::_FwpmFilterCreateEnumHandle0 ||
+            !net_capture::_FwpmFilterDestroyEnumHandle0 ||
+            !net_capture::_FwpmFilterEnum0 ||
+            !net_capture::_FwpmFreeMemory0) {
             return enumerate_registered_callouts(request);
-
+        }
 
         HANDLE engine = nullptr;
         NTSTATUS status = net_capture::_FwpmEngineOpen0(nullptr, 0, nullptr, nullptr, &engine);
         if (!NT_SUCCESS(status) || !engine)
             return enumerate_registered_callouts(request);
 
-        HANDLE enumHandle = nullptr;
-        status = _CreateEnum(engine, nullptr, &enumHandle);
-        if (!NT_SUCCESS(status) || !enumHandle) {
-            net_capture::_FwpmEngineClose0(engine);
-            return status ? status : STATUS_UNSUCCESSFUL;
-        }
-
         UINT32 total_filled = 0;
         BOOLEAN has_filter = (request->filter_module[0] != 0);
-
-
-        while (total_filled < MAX_WFP_CALLOUTS) {
-            FWPM_CALLOUT0_COMPAT** entries = nullptr;
-            UINT32 returned = 0;
-
-            status = _Enum(engine, enumHandle, 64, &entries, &returned);
-            if (!NT_SUCCESS(status) || returned == 0) break;
-
-            for (UINT32 i = 0; i < returned && total_filled < MAX_WFP_CALLOUTS; i++) {
-                FWPM_CALLOUT0_COMPAT* c = (FWPM_CALLOUT0_COMPAT*)entries[i];
-                if (!c) continue;
-
-                WFP_CALLOUT_ENTRY* out = &request->entries[total_filled];
-                strong::kmemset(out, 0, sizeof(WFP_CALLOUT_ENTRY));
-
-                out->callout_id = c->calloutId;
-                out->callout_key = c->calloutKey;
-                out->applicable_layer = c->applicableLayer;
-                out->flags = c->flags;
-
-
-                out->classify_fn = 0;
-                out->notify_fn = 0;
-                out->flow_delete_fn = 0;
-
-
-                if (c->providerKey && _MmIsAddressValid(c->providerKey)) {
-
+        HANDLE callout_enum = nullptr;
+        status = net_capture::_FwpmCalloutCreateEnumHandle0(engine, nullptr, &callout_enum);
+        if (NT_SUCCESS(status) && callout_enum) {
+            for (;;) {
+                FWPM_CALLOUT0_COMPAT** entries = nullptr;
+                UINT32 returned = 0;
+                status = net_capture::_FwpmCalloutEnum0(engine, callout_enum, 64, &entries, &returned);
+                if (!NT_SUCCESS(status) || returned == 0) {
+                    if (entries) net_capture::_FwpmFreeMemory0((VOID**)&entries);
+                    break;
                 }
 
+                for (UINT32 i = 0; i < returned && total_filled < MAX_WFP_CALLOUTS; i++) {
+                    FWPM_CALLOUT0_COMPAT* c = entries[i];
+                    if (!c) continue;
 
-                __try {
-                    wchar_t* wname = c->displayData.name;
-                    if (wname && _MmIsAddressValid(wname)) {
+                    WFP_CALLOUT_ENTRY candidate = {};
+                    candidate.entry_type = WFP_ENTRY_TYPE_CALLOUT;
+                    candidate.callout_id = c->calloutId;
+                    candidate.callout_key = c->calloutKey;
+                    candidate.applicable_layer = c->applicableLayer;
+                    candidate.flags = c->flags;
+                    candidate.provider_present = c->providerKey ? 1u : 0u;
+                    candidate.aida_match_reason = net_capture::is_aida_callout_key(&c->calloutKey) ? WFP_AIDA_MATCH_ACTION_CALLOUT : 0;
+                    copy_display_name(&c->displayData, candidate.owning_module, sizeof(candidate.owning_module));
+                    if (has_filter && !text_contains_ci(candidate.owning_module, request->filter_module))
+                        continue;
 
-                        for (int j = 0; j < 63 && wname[j]; j++) {
-                            out->owning_module[j] = (char)(wname[j] & 0x7F);
-                        }
-                    }
-                } __except(EXCEPTION_EXECUTE_HANDLER) {}
-
-
-                if (has_filter) {
-                    if (out->owning_module[0] == 0) continue;
-
-                    BOOLEAN match = FALSE;
-                    SIZE_T flen = 0;
-                    while (request->filter_module[flen] && flen < 63) flen++;
-                    SIZE_T mlen = 0;
-                    while (out->owning_module[mlen] && mlen < 63) mlen++;
-                    if (mlen >= flen) {
-                        for (SIZE_T s = 0; s <= mlen - flen; s++) {
-                            BOOLEAN ok = TRUE;
-                            for (SIZE_T k = 0; k < flen; k++) {
-                                char a = out->owning_module[s + k];
-                                char b = request->filter_module[k];
-                                if (a >= 'A' && a <= 'Z') a += 32;
-                                if (b >= 'A' && b <= 'Z') b += 32;
-                                if (a != b) { ok = FALSE; break; }
-                            }
-                            if (ok) { match = TRUE; break; }
-                        }
-                    }
-                    if (!match) continue;
+                    strong::kmemcpy(&request->entries[total_filled], &candidate, sizeof(candidate));
+                    ++total_filled;
                 }
-
-                total_filled++;
+                net_capture::_FwpmFreeMemory0((VOID**)&entries);
             }
-
-            _FreeMem((VOID**)&entries);
+            net_capture::_FwpmCalloutDestroyEnumHandle0(engine, callout_enum);
         }
 
-        _DestroyEnum(engine, enumHandle);
+        HANDLE filter_enum = nullptr;
+        status = net_capture::_FwpmFilterCreateEnumHandle0(engine, nullptr, &filter_enum);
+        if (NT_SUCCESS(status) && filter_enum) {
+            for (;;) {
+                FWPM_FILTER0_COMPAT** entries = nullptr;
+                UINT32 returned = 0;
+                status = net_capture::_FwpmFilterEnum0(engine, filter_enum, 64, &entries, &returned);
+                if (!NT_SUCCESS(status) || returned == 0) {
+                    if (entries) net_capture::_FwpmFreeMemory0((VOID**)&entries);
+                    break;
+                }
+
+                for (UINT32 i = 0; i < returned && total_filled < MAX_WFP_CALLOUTS; i++) {
+                    FWPM_FILTER0_COMPAT* f = entries[i];
+                    if (!f) continue;
+
+                    WFP_CALLOUT_ENTRY candidate = {};
+                    candidate.entry_type = WFP_ENTRY_TYPE_FILTER;
+                    candidate.filter_id = f->filterId;
+                    candidate.flags = f->flags;
+                    candidate.applicable_layer = f->layerKey;
+                    candidate.sublayer_key = f->subLayerKey;
+                    candidate.action_type = (UINT32)f->action.type;
+                    candidate.callout_key = f->action.calloutKey;
+                    candidate.provider_present = f->providerKey ? 1u : 0u;
+                    candidate.aida_match_reason = net_capture::filter_match_reason(f);
+                    copy_display_name(&f->displayData, candidate.owning_module, sizeof(candidate.owning_module));
+                    if (has_filter && !text_contains_ci(candidate.owning_module, request->filter_module))
+                        continue;
+
+                    strong::kmemcpy(&request->entries[total_filled], &candidate, sizeof(candidate));
+                    ++total_filled;
+                }
+                net_capture::_FwpmFreeMemory0((VOID**)&entries);
+            }
+            net_capture::_FwpmFilterDestroyEnumHandle0(engine, filter_enum);
+        }
+
         net_capture::_FwpmEngineClose0(engine);
 
         request->callout_count = total_filled;
-        if (total_filled == 0) {
+        if (total_filled == 0)
             return enumerate_registered_callouts(request);
-        }
         return STATUS_SUCCESS;
     }
 }
@@ -7043,6 +7306,54 @@ namespace net_intercept {
         return FALSE;
     }
 
+    static BOOLEAN build_inject_from_held(const HELD_PACKET* held, packet_inject_request* inj,
+                                          const UINT8* override_payload, UINT32 override_size) {
+        if (!held || !inj) return FALSE;
+        UINT32 payload_size = override_payload ? override_size : held->payload_size;
+        if (payload_size == 0 || payload_size > INTERCEPT_MAX_PAYLOAD)
+            return FALSE;
+        strong::kmemset(inj, 0, sizeof(*inj));
+        inj->direction = held->direction;
+        inj->protocol = held->protocol;
+        inj->address_family = held->address_family;
+        inj->src_port = held->src_port;
+        inj->dst_port = held->dst_port;
+        strong::kmemcpy(inj->src_addr, held->src_addr, 16);
+        strong::kmemcpy(inj->dst_addr, held->dst_addr, 16);
+        inj->payload_size = payload_size;
+        strong::kmemcpy(inj->payload, override_payload ? override_payload : held->payload, payload_size);
+        return TRUE;
+    }
+
+    static NTSTATUS release_held_packet(const HELD_PACKET* held, const char* reason) {
+        if (!held || held->hold_id == 0)
+            return STATUS_INVALID_PARAMETER;
+
+        LARGE_INTEGER now;
+        KeQuerySystemTime(&now);
+        ULONGLONG age_ms = 0;
+        if (now.QuadPart >= (LONGLONG)held->timestamp)
+            age_ms = (ULONGLONG)((now.QuadPart - (LONGLONG)held->timestamp) / 10000);
+
+        packet_inject_request inj = {};
+        BOOLEAN inject_ready = build_inject_from_held(held, &inj, nullptr, 0);
+        NTSTATUS inject_status = inject_ready ? net_inject::inject_packet(&inj) : STATUS_INVALID_PARAMETER;
+        WW_LOG("net_intercept::release_held reason=%s hold_id=%llu pid=%u direction=%u protocol=%u src_port=%u dst_port=%u payload_size=%u age_ms=%llu inject_ready=%u inject_status=0x%08X request_status=%u",
+            reason ? reason : "",
+            (unsigned long long)held->hold_id,
+            held->pid,
+            held->direction,
+            held->protocol,
+            held->src_port,
+            held->dst_port,
+            held->payload_size,
+            age_ms,
+            inject_ready ? 1u : 0u,
+            inject_status,
+            inj.status);
+        return inject_status;
+    }
+
     NTSTATUS handle_intercept(p_intercept_request request) {
         if (!request) return STATUS_INVALID_PARAMETER;
 
@@ -7079,6 +7390,17 @@ namespace net_intercept {
         }
         case 1: {
             LONG held_before = g_held_count;
+            SIZE_T release_bytes = sizeof(HELD_PACKET) * INTERCEPT_MAX_HELD;
+            HELD_PACKET* release_list = (HELD_PACKET*)ExAllocatePool2(POOL_FLAG_NON_PAGED, release_bytes, 'lhNW');
+            if (!release_list) {
+                WW_LOG("net_intercept::handle op=1 stop allocation_failed bytes=%llu held_before=%ld status=0x%08X",
+                    (ULONGLONG)release_bytes,
+                    held_before,
+                    (UINT32)STATUS_INSUFFICIENT_RESOURCES);
+                return STATUS_INSUFFICIENT_RESOURCES;
+            }
+            strong::kmemset(release_list, 0, release_bytes);
+            UINT32 release_count = 0;
             _InterlockedExchange(&g_intercepting, 0);
             g_filter_pid = 0;
             g_filter_port = 0;
@@ -7087,14 +7409,30 @@ namespace net_intercept {
             KIRQL irql;
             KeAcquireSpinLock(&g_intercept_lock, &irql);
             for (UINT32 i = 0; i < INTERCEPT_MAX_HELD; i++) {
-                g_held[i].hold_id = 0;
+                if (g_held[i].hold_id != 0 && release_count < INTERCEPT_MAX_HELD) {
+                    strong::kmemcpy(&release_list[release_count], &g_held[i], sizeof(HELD_PACKET));
+                    ++release_count;
+                }
+                strong::kmemset(&g_held[i], 0, sizeof(HELD_PACKET));
             }
             g_held_count = 0;
             KeReleaseSpinLock(&g_intercept_lock, irql);
+
+            UINT32 release_success = 0;
+            UINT32 release_failed = 0;
+            for (UINT32 i = 0; i < release_count; ++i) {
+                NTSTATUS release_status = release_held_packet(&release_list[i], "disable");
+                if (NT_SUCCESS(release_status)) ++release_success;
+                else ++release_failed;
+            }
+            ExFreePoolWithTag(release_list, 'lhNW');
             request->intercepting = 0;
             request->held_count = 0;
-            WW_LOG("net_intercept::handle op=1 stop held_before=%ld held_after=%u intercepting=%u status=0x%08X rejects inactive=%ld pid=%ld port=%ld protocol=%ld full=%ld no_slot=%ld",
+            WW_LOG("net_intercept::handle op=1 stop held_before=%ld copied=%u released_ok=%u released_failed=%u held_after=%u intercepting=%u status=0x%08X rejects inactive=%ld pid=%ld port=%ld protocol=%ld full=%ld no_slot=%ld",
                 held_before,
+                release_count,
+                release_success,
+                release_failed,
                 request->held_count,
                 request->intercepting,
                 (UINT32)STATUS_SUCCESS,

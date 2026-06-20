@@ -3030,11 +3030,17 @@ voyager::device_t::enumerate_wfp_callouts(const std::string& filter_module) noex
             info.notify_fn = e.notify_fn;
             info.flow_delete_fn = e.flow_delete_fn;
             info.owning_module_base = e.owning_module_base;
+            info.filter_id = e.filter_id;
             info.callout_id = e.callout_id;
             info.layer_id = e.layer_id;
             info.flags = e.flags;
+            info.entry_type = e.entry_type;
+            info.action_type = e.action_type;
+            info.provider_present = e.provider_present;
+            info.aida_match_reason = e.aida_match_reason;
             info.callout_key_str = guid_to_string(e.callout_key);
             info.applicable_layer_str = guid_to_string(e.applicable_layer);
+            info.sublayer_key_str = guid_to_string(e.sublayer_key);
             info.owning_module = std::string(e.owning_module,
                 strnlen(e.owning_module, sizeof(e.owning_module)));
             result.push_back(std::move(info));
@@ -3626,7 +3632,11 @@ bool voyager::device_t::intercept_op(std::uint32_t operation, std::uint32_t filt
 
     SetLastError(ERROR_SUCCESS);
     bool ok = send_request(ioctl_code, req, static_cast<DWORD>(sizeof(*req)));
-    const DWORD gle = GetLastError();
+    DWORD gle = GetLastError();
+    if (!ok && gle == ERROR_SUCCESS) {
+        gle = ERROR_GEN_FAILURE;
+        SetLastError(gle);
+    }
     diag::log_tagged_fmt("driver_comm_net",
         "intercept_op EXIT ok=%d gle=%lu op=%u pid=%u port=%u protocol=%u hold_id=%llu held_count=%u active=%u modify_size=%u ioctl=0x%08X",
         ok ? 1 : 0, gle, operation, filter_pid, filter_port, filter_protocol,

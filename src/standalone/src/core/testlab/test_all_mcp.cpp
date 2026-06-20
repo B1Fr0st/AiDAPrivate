@@ -1933,6 +1933,116 @@ namespace {
         return compact_text(oss.str(), 520);
     }
 
+    std::size_t count_redacted_payload_values(const mcp_standalone::json& value, const std::string& key = {}, std::size_t depth = 0) {
+        if (!key.empty() && sensitive_json_key(key))
+            return 1;
+        if (depth >= 12)
+            return 0;
+        std::size_t count = 0;
+        if (value.is_object()) {
+            for (auto it = value.begin(); it != value.end(); ++it)
+                count += count_redacted_payload_values(*it, it.key(), depth + 1);
+        } else if (value.is_array()) {
+            for (const auto& item : value)
+                count += count_redacted_payload_values(item, {}, depth + 1);
+        }
+        return count;
+    }
+
+    void collect_payload_evidence_keys(const mcp_standalone::json& value,
+                                       std::vector<std::string>& out,
+                                       const std::string& path = {},
+                                       std::size_t depth = 0) {
+        if (out.size() >= 18 || depth >= 6)
+            return;
+        if (value.is_object()) {
+            for (auto it = value.begin(); it != value.end() && out.size() < 18; ++it) {
+                const std::string key_path = path.empty() ? it.key() : path + "." + it.key();
+                out.push_back(key_path);
+                if (it->is_object() || it->is_array())
+                    collect_payload_evidence_keys(*it, out, key_path, depth + 1);
+            }
+        } else if (value.is_array() && !value.empty()) {
+            collect_payload_evidence_keys(value.front(), out, path.empty() ? std::string("$[]") : path + "[]", depth + 1);
+        }
+    }
+
+    std::string payload_evidence_key_list(const mcp_standalone::json& data) {
+        std::vector<std::string> keys;
+        collect_payload_evidence_keys(data, keys);
+        if (keys.empty())
+            return "none";
+        std::ostringstream oss;
+        for (std::size_t i = 0; i < keys.size(); ++i) {
+            if (i)
+                oss << ',';
+            oss << keys[i];
+        }
+        return compact_text(oss.str(), 480);
+    }
+
+    std::string validation_code_from_reason(const std::string& reason) {
+        std::string lc = lower_copy(reason);
+        if (lc.empty())
+            return "empty_validation_reason";
+        if (lc.find("unexpected_zero_output") != std::string::npos)
+            return "unexpected_zero_output";
+        if (lc.find("dependency_available=false") != std::string::npos ||
+            lc.find("dependency_unavailable=true") != std::string::npos ||
+            lc.find("dependency_reason=") != std::string::npos)
+            return "dependency_blocked";
+        if (lc.find("timeout") != std::string::npos)
+            return "bounded_timeout";
+        if (lc.find("missing") != std::string::npos)
+            return "missing_required_evidence";
+        if (lc.find("zero") != std::string::npos || lc.find("=0") != std::string::npos)
+            return "zero_required_evidence";
+        std::string code;
+        for (char c : lc) {
+            const unsigned char uc = static_cast<unsigned char>(c);
+            if (std::isalnum(uc)) {
+                code.push_back(c);
+            } else if (!code.empty() && code.back() != '_') {
+                code.push_back('_');
+            }
+            if (code.size() >= 64)
+                break;
+        }
+        while (!code.empty() && code.back() == '_')
+            code.pop_back();
+        return code.empty() ? "validation_rejected" : code;
+    }
+
+    std::string payload_shape_for_validation(const mcp_standalone::json& data) {
+        std::ostringstream oss;
+        if (data.is_object())
+            oss << "object(keys=" << data.size() << ")";
+        else if (data.is_array())
+            oss << "array(size=" << data.size() << ")";
+        else if (data.is_string())
+            oss << "string(len=" << data.get<std::string>().size() << ")";
+        else if (data.is_number())
+            oss << "number";
+        else if (data.is_boolean())
+            oss << "bool";
+        else if (data.is_null())
+            oss << "null";
+        else
+            oss << data.type_name();
+        return oss.str();
+    }
+
+    std::string validation_reason_schema(const std::string& reason, const mcp_standalone::json& data) {
+        const std::string safe_detail = reason.empty() ? std::string("no_detail_supplied") : compact_text(redact_labeled_text(reason), 520);
+        std::ostringstream oss;
+        oss << "validation_code=" << validation_code_from_reason(reason)
+            << " payload_shape=" << payload_shape_for_validation(data)
+            << " safe_detail=" << safe_detail
+            << " redacted_value_count=" << count_redacted_payload_values(data)
+            << " evidence_keys=" << payload_evidence_key_list(data);
+        return compact_text(oss.str(), 1100);
+    }
+
     void log_mcp_result_detail(const char* phase,
                                int seq,
                                const std::string& tool_name,
@@ -1944,7 +2054,7 @@ namespace {
         const auto evidence = mcp_evidence_payload(ir);
         const std::string args_preview = compact_json(args, 1200);
         const std::string data_preview = compact_json(evidence.data, 2200);
-        const std::string reason_preview = sensitive_tool ? "<redacted reason len=" + std::to_string(reason.size()) + ">" : compact_text(reason, 900);
+        const std::string reason_preview = validation_reason_schema(reason, evidence.data);
         const std::string text_preview = sensitive_tool ? "<redacted text len=" + std::to_string(ir.text.size()) + ">" : compact_text(ir.text, 1400);
         const std::string ex_preview = compact_text(ir.exception_msg, 900);
         const std::string domain = mcp_tool_domain(tool_name);
@@ -3126,7 +3236,8 @@ namespace {
         static const std::set<std::string> exact = {
             "results", "captures", "candidates", "breakpoints", "decryptors", "exports",
             "symbols", "pages", "threads", "modules", "handles", "functions",
-            "packets", "reads"
+            "packets", "reads", "matches", "scripts", "cookies", "sessions",
+            "detected_packets", "scanned_modules"
         };
         return exact.find(key) != exact.end();
     }
@@ -3144,7 +3255,12 @@ namespace {
             "total_exports", "total_symbols", "total_pages", "total_threads",
             "total_modules", "total_handles", "total_functions", "total_packets",
             "decrypted_packets", "decoded_packets", "matched_packets", "total_cookies",
-            "ice_candidate_count", "icecandidatecount", "access_count"
+            "ice_candidate_count", "icecandidatecount", "access_count", "scripts_searched",
+            "scripts_count", "script_count", "scripts_with_matches", "total_matches",
+            "returned_matches", "match_count", "matches_count", "cookie_jar_count",
+            "network_set_cookie_count", "js_cookie_log_count", "change_count",
+            "field_count", "recorded_packet_count", "attempted_or_sent",
+            "session_count", "capture_event_count", "source_size"
         };
         return exact.find(key) != exact.end();
     }
@@ -4071,6 +4187,7 @@ namespace {
         const std::string payload_summary = sensitive_tool ?
             "<redacted payload summary type=" + std::string(evidence.data.type_name()) + ">" :
             mcp_payload_summary(evidence.data);
+        const std::string reason_preview = validation_reason_schema(reason, evidence.data);
         const std::string domain = mcp_tool_domain(tool_name);
         log_msg(hf, tag, "DIAG -- mcp_result phase=%s seq=%d domain=%s tool=%s elapsed_ms=%lld found=%d success=%d threw=%d text_len=%zu data_type=%s data_empty=%d evidence_source=%s payload_summary=%s reason=%s args=%s text=%s data=%s",
             phase ? phase : "",
@@ -4086,7 +4203,7 @@ namespace {
             payload_data_empty(evidence.data) ? 1 : 0,
             evidence.source.c_str(),
             payload_summary.c_str(),
-            compact_text(reason, 300).c_str(),
+            reason_preview.c_str(),
             args_preview.c_str(),
             text_preview.c_str(),
             data_preview.c_str());
@@ -4192,13 +4309,54 @@ namespace {
             }
         }
 
+        if (tool_lc == "scripts" && (action_lc.empty() || action_lc == "list")) {
+            size_t top_level_scripts = 0;
+            size_t nested_scripts = 0;
+            if (ir.data.is_array())
+                top_level_scripts = ir.data.size();
+            payload_array_count(ir.data, "scripts", nested_scripts);
+            if (top_level_scripts == 0 && nested_scripts == 0) {
+                reason = "scripts_list_empty";
+                return true;
+            }
+        }
+
+        if (tool_lc == "search_code") {
+            uint64_t scripts_searched = 0;
+            uint64_t total_matches = 0;
+            uint64_t returned_matches = 0;
+            size_t matches = 0;
+            const bool has_scripts = payload_u64_field(ir.data, "scripts_searched", scripts_searched);
+            const bool has_total = payload_u64_field(ir.data, "total_matches", total_matches);
+            const bool has_returned = payload_u64_field(ir.data, "returned_matches", returned_matches);
+            const bool has_matches = payload_array_count(ir.data, "matches", matches);
+            if (!has_scripts || scripts_searched == 0) {
+                reason = has_scripts ? "scripts_searched=0" : "scripts_searched_missing";
+                return true;
+            }
+            if ((!has_total || total_matches == 0) &&
+                (!has_returned || returned_matches == 0) &&
+                (!has_matches || matches == 0)) {
+                reason = "search_code_matches_missing_or_zero scripts_searched=" + std::to_string(static_cast<unsigned long long>(scripts_searched));
+                return true;
+            }
+        }
+
         if (tool_lc == "analyze_cookie_sources") {
             uint64_t total_cookies = 0;
+            uint64_t cookie_jar_count = 0;
+            uint64_t network_set_cookie_count = 0;
+            uint64_t js_cookie_log_count = 0;
             size_t cookie_count = 0;
+            std::string active_url;
             const auto* cookies = find_payload_key_recursive(ir.data, "cookies");
             const bool has_total = payload_u64_field(ir.data, "total_cookies", total_cookies);
             if (!has_total || total_cookies == 0) {
                 reason = has_total ? "total_cookies=0" : "total_cookies_missing";
+                return true;
+            }
+            if (!payload_string_field(ir.data, "active_url", active_url) || active_url.empty() || lower_copy(active_url) == "about:blank") {
+                reason = active_url.empty() ? "active_url_missing" : "active_url_about_blank";
                 return true;
             }
             if (!cookies || !((cookies->is_object() && !cookies->empty()) || (cookies->is_array() && !cookies->empty()))) {
@@ -4211,6 +4369,13 @@ namespace {
                 cookie_count = cookies->size();
             if (cookie_count == 0) {
                 reason = "cookies_evidence_empty";
+                return true;
+            }
+            payload_u64_field(ir.data, "cookie_jar_count", cookie_jar_count);
+            payload_u64_field(ir.data, "network_set_cookie_count", network_set_cookie_count);
+            payload_u64_field(ir.data, "js_cookie_log_count", js_cookie_log_count);
+            if (cookie_jar_count == 0 && network_set_cookie_count == 0 && js_cookie_log_count == 0) {
+                reason = "cookie_source_counters_zero active_url=" + compact_text(active_url, 180);
                 return true;
             }
         }
@@ -6273,7 +6438,7 @@ namespace {
             compact_text(delta_s, 350).c_str(),
             compact_text(payload_dependency_label(evidence.data), 300).c_str(),
             payload_dependency_available_value(evidence.data) ? 1 : 0,
-            reason.empty() ? "<empty>" : compact_text(reason, 700).c_str(),
+            validation_reason_schema(reason, evidence.data).c_str(),
             seq);
         std::string capture_proof;
         if (mcp_status_is_functional(classification) && payload_capture_or_result_evidence(evidence.data, capture_proof)) {
@@ -6461,29 +6626,29 @@ namespace {
         }
 
         mcp_standalone::json call_args = args.is_null() ? mcp_standalone::json::object() : args;
-        const auto& tools = srv->get_tools();
-        for (const auto& t : tools) {
-            if (t.name == tool_name) {
-                ir.found = true;
-                try {
-                    auto result = t.handler(call_args);
-                    ir.success = result.success;
-                    ir.text = result.text;
-                    ir.data = result.data;
-                    normalize_invoke_result_payload(ir);
-                } catch (const std::exception& ex) {
-                    ir.threw = true;
-                    ir.exception_msg = ex.what();
-                    normalize_invoke_result_payload(ir);
-                } catch (...) {
-                    ir.threw = true;
-                    ir.exception_msg = "unknown exception";
-                    normalize_invoke_result_payload(ir);
-                }
-                return ir;
+        ir.found = tool_registered(srv, tool_name);
+        try {
+            auto result = srv->call_registered_tool(tool_name ? std::string(tool_name) : std::string(), call_args, false);
+            ir.success = result.success;
+            ir.text = result.text;
+            ir.data = result.data;
+            if (!result.success && json_payload_empty(ir.data) && !result.error_details.is_null())
+                ir.data = result.error_details;
+            if (!result.error_code.empty()) {
+                if (!ir.data.is_object())
+                    ir.data = mcp_standalone::json::object({{"payload", ir.data}});
+                ir.data["error_code"] = result.error_code;
             }
+            normalize_invoke_result_payload(ir);
+        } catch (const std::exception& ex) {
+            ir.threw = true;
+            ir.exception_msg = ex.what();
+            normalize_invoke_result_payload(ir);
+        } catch (...) {
+            ir.threw = true;
+            ir.exception_msg = "unknown exception";
+            normalize_invoke_result_payload(ir);
         }
-        normalize_invoke_result_payload(ir);
         return ir;
     }
 
@@ -7116,11 +7281,7 @@ namespace {
             payload_failed = tool_payload_failure_reason(tool_name_s, ir, payload_failure, semantic_action, &call_args, &expected_empty_proof, &expected_empty_status, hf, tag);
             payload_validation_ms = static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - payload_validation_start).count());
-            std::string payload_failure_preview = payload_failure;
-            if (sensitive_log_tool(tool_name_s))
-                payload_failure_preview = "<redacted reason len=" + std::to_string(payload_failure.size()) + ">";
-            else
-                payload_failure_preview = compact_text(std::move(payload_failure_preview), 260);
+            std::string payload_failure_preview = validation_reason_schema(payload_failure, ir.data);
             log_msg(hf, tag, "VALIDATE-PAYLOAD -- \"%s\" complete elapsed_ms=%lld failed=%d reason=%s",
                 tool_name,
                 payload_validation_ms,
@@ -7167,7 +7328,7 @@ namespace {
             if (is_zero_output_failure_reason(payload_failure))
                 record_mcp_zero_output_suspect(tool_name_s, payload_failure);
             log_msg(hf, tag, "FAIL -- \"%s\" success=true but payload reports failure: %s (elapsed %lld ms) -> %s",
-                tool_name, payload_failure.c_str(), (long long)ms, preview.c_str());
+                tool_name, validation_reason_schema(payload_failure, ir.data).c_str(), (long long)ms, preview.c_str());
             log_mcp_validation_detail(hf, tag, "failed_payload", seq, tool_name_s, call_args, ir, ms, payload_failure);
             log_mcp_result_detail("failed_payload", seq, tool_name_s, call_args, ir, ms, payload_failure);
             restore_after_mutation();
@@ -8355,6 +8516,19 @@ namespace {
             trace_args,
             true, true,
             [](const invoke_result_t& ir, std::string& reason) {
+                bool timed_out = false;
+                if (payload_bool_field(ir.data, "timed_out", timed_out) && timed_out) {
+                    reason = "vm_trace_bytecode reported bounded timed_out=true data=" + compact_json(ir.data, 700);
+                    return false;
+                }
+                std::string status;
+                if (payload_string_field(ir.data, "status", status)) {
+                    const std::string status_lc = lower_copy(status);
+                    if (status_lc.find("timeout") != std::string::npos || status_lc.find("dependency") != std::string::npos) {
+                        reason = "vm_trace_bytecode nonfunctional status=" + compact_text(status, 240) + " data=" + compact_json(ir.data, 700);
+                        return false;
+                    }
+                }
                 uint64_t emulated = 0;
                 if (!payload_u64_field(ir.data, "emulated_instructions", emulated) || emulated == 0 || emulated > 8) {
                     reason = "bounded trace did not report 1..8 emulated instructions";
@@ -8363,6 +8537,7 @@ namespace {
                 return test_coverage_protected_re_domains_11_15_payload_contains(ir, {"entry_va", "steps"}, reason);
             },
             passed, failed);
+        wait_timed_out_invocation_drain(hf, "vm_trace_bytecode bounded cleanup", 5000);
 
         mcp_standalone::json classify_args;
         classify_args["process_id"] = pid;
@@ -10663,15 +10838,23 @@ namespace {
                 payload_string_field(out.data, "session_id", session_id);
         }
 
+        bool heap_stimulus_ok = false;
         if (!session_id.empty()) {
             const std::uint64_t first = page_guard_engine::remote_thread_call(pid, desc.heap_burst_fn_va, 12, 160, 0, 0, 5000, "aida_test_re_heap_burst");
+            const bool refreshed = test_coverage_domains_1_8_refresh_re_descriptor(hf, tag, desc);
+            heap_stimulus_ok = first != 0 && refreshed && desc.heap_burst_first_va != 0 && desc.heap_burst_count > 0;
             log_msg(hf, tag, "FIXTURE -- heap_burst result=0x%016llX fn=0x%016llX",
                 static_cast<unsigned long long>(first),
                 static_cast<unsigned long long>(desc.heap_burst_fn_va));
-            test_coverage_domains_1_8_refresh_re_descriptor(hf, tag, desc);
+            log_msg(hf, tag, "FIXTURE -- heap_burst_readback ok=%d refreshed=%d first_va=0x%016llX count=%u stride=%u",
+                heap_stimulus_ok ? 1 : 0,
+                refreshed ? 1 : 0,
+                static_cast<unsigned long long>(desc.heap_burst_first_va),
+                desc.heap_burst_count,
+                desc.heap_burst_stride);
         }
 
-        if (!session_id.empty() && (!cancelled || !cancelled())) {
+        if (!session_id.empty() && heap_stimulus_ok && (!cancelled || !cancelled())) {
             mcp_standalone::json args;
             args["action"] = "results";
             args["session_id"] = session_id;
@@ -10696,6 +10879,12 @@ namespace {
                     }
                     return true;
                 }, passed, failed);
+        } else if (!session_id.empty() && !heap_stimulus_ok) {
+            test_coverage_domains_1_8_fixture_fail(hf, tag, "heap_track_manage",
+                "heap burst stimulus/readback failed first_va=" + hex_u64(desc.heap_burst_first_va) +
+                " count=" + std::to_string(desc.heap_burst_count) +
+                " stride=" + std::to_string(desc.heap_burst_stride),
+                failed);
         } else if (session_id.empty()) {
             test_coverage_domains_1_8_fixture_fail(hf, tag, "heap_track_manage", "heap start did not produce session_id for results", failed);
         }
@@ -10742,7 +10931,7 @@ namespace {
         const char* tag = "mcp.coverage.domains_1_8.struct";
         set_progress_step("mcp coverage domains 1-8: struct tools");
         const std::uint32_t pid = g_mcp_target_pid != 0 ? g_mcp_target_pid : driver_bridge::attached_pid();
-        if (!have_desc || desc.struct_base_va == 0 || desc.struct_array_va == 0 || desc.struct_size == 0 || desc.struct_count < 3) {
+        if (!have_desc || desc.struct_base_va == 0 || desc.struct_array_va == 0 || desc.struct_size == 0 || desc.struct_count < 3 || desc.mutate_struct_fn_va == 0) {
             test_coverage_domains_1_8_fixture_fail(hf, tag, "struct_observe", "RE descriptor missing struct fixture: " + descriptor_reason, failed);
             test_coverage_domains_1_8_fixture_fail(hf, tag, "struct_correlate", "RE descriptor missing struct fixture: " + descriptor_reason, failed);
             test_coverage_domains_1_8_fixture_fail(hf, tag, "struct_array_detect", "RE descriptor missing struct fixture: " + descriptor_reason, failed);
@@ -10828,6 +11017,7 @@ namespace {
             args["duration_sec"] = 1;
             args["timeout_ms"] = 15000;
             invoke_result_t out;
+            const int pass_before = passed.load(std::memory_order_acquire);
             test_coverage_domains_1_8_case(hf, tag, "struct_observe", case_name, args, 17000,
                 [](const invoke_result_t& ir, std::string& reason) {
                     if (!ir.success) {
@@ -10846,9 +11036,14 @@ namespace {
                     }
                     return true;
                 }, passed, failed, &out);
+            const int pass_after = passed.load(std::memory_order_acquire);
             const uint64_t wait_started_ms = GetTickCount64();
             while (!stim_done->load(std::memory_order_acquire) && GetTickCount64() - wait_started_ms < 6000)
                 Sleep(10);
+            const bool stimulus_valid =
+                stim_done->load(std::memory_order_acquire) &&
+                stim_calls->load(std::memory_order_relaxed) > 0 &&
+                stim_failures->load(std::memory_order_relaxed) < stim_calls->load(std::memory_order_relaxed);
             log_msg(hf, tag, "struct_observe stimulus case=%s done=%d calls=%u failures=%u wait_ms=%llu",
                 case_name ? case_name : "",
                 stim_done->load(std::memory_order_acquire) ? 1 : 0,
@@ -10856,6 +11051,15 @@ namespace {
                 stim_failures->load(std::memory_order_relaxed),
                 static_cast<unsigned long long>(GetTickCount64() - wait_started_ms));
             wait_struct_monitor_idle((stim_case + "_post").c_str(), 12000);
+            if (!stimulus_valid && pass_after > pass_before) {
+                log_msg(hf, tag, "FAIL -- struct_observe functional pass invalidated by stimulus evidence case=%s done=%d calls=%u failures=%u",
+                    case_name ? case_name : "",
+                    stim_done->load(std::memory_order_acquire) ? 1 : 0,
+                    stim_calls->load(std::memory_order_relaxed),
+                    stim_failures->load(std::memory_order_relaxed));
+                convert_last_pass_to_fixture_failure("struct_observe", passed, failed);
+                return;
+            }
             if (out.success)
                 payload_string_field(out.data, "snapshot_id", snapshot_id);
         };
@@ -10863,7 +11067,31 @@ namespace {
         std::string snapshot_a;
         std::string snapshot_b;
         observe_case("observe_fixture_struct_before_mutation", 0, 3, snapshot_a);
-        page_guard_engine::remote_thread_call(pid, desc.mutate_struct_fn_va, 0, 9, 0, 0, 3000, "aida_test_re_mutate_struct_between_snapshots");
+        std::vector<std::uint8_t> struct_before;
+        std::vector<std::uint8_t> struct_after;
+        std::string struct_read_reason;
+        const std::size_t struct_read_size = std::min<std::size_t>(static_cast<std::size_t>(desc.struct_size), 128);
+        const bool struct_before_ok = testlab_read_remote_exact(pid, observed_struct_va, struct_read_size, struct_before, struct_read_reason);
+        const std::uint64_t mutate_between_result = page_guard_engine::remote_thread_call(pid, desc.mutate_struct_fn_va, 0, 9, 0, 0, 3000, "aida_test_re_mutate_struct_between_snapshots");
+        std::string struct_after_reason;
+        const bool struct_after_ok = testlab_read_remote_exact(pid, observed_struct_va, struct_read_size, struct_after, struct_after_reason);
+        const bool struct_mutation_readback_ok = mutate_between_result != 0 && struct_before_ok && struct_after_ok && struct_before != struct_after;
+        log_msg(hf, tag, "STRUCT-MUTATION-READBACK -- result=0x%016llX before_ok=%d after_ok=%d changed=%d read_size=%zu before_reason=%s after_reason=%s",
+            static_cast<unsigned long long>(mutate_between_result),
+            struct_before_ok ? 1 : 0,
+            struct_after_ok ? 1 : 0,
+            struct_mutation_readback_ok ? 1 : 0,
+            struct_read_size,
+            struct_read_reason.empty() ? "<empty>" : compact_text(struct_read_reason, 500).c_str(),
+            struct_after_reason.empty() ? "<empty>" : compact_text(struct_after_reason, 500).c_str());
+        if (!struct_mutation_readback_ok) {
+            test_coverage_domains_1_8_fixture_fail(hf, tag, "struct_compare_snapshots",
+                "mutate_struct readback failed result=" + hex_u64(mutate_between_result) +
+                " before_ok=" + std::to_string(struct_before_ok ? 1 : 0) +
+                " after_ok=" + std::to_string(struct_after_ok ? 1 : 0) +
+                " changed=0",
+                failed);
+        }
         observe_case("observe_fixture_struct_after_mutation", 0, 11, snapshot_b);
 
         if (!cancelled || !cancelled()) {
@@ -10914,7 +11142,7 @@ namespace {
                 }, passed, failed);
         }
 
-        if (!snapshot_a.empty() && !snapshot_b.empty() && (!cancelled || !cancelled())) {
+        if (struct_mutation_readback_ok && !snapshot_a.empty() && !snapshot_b.empty() && (!cancelled || !cancelled())) {
             mcp_standalone::json args;
             args["snapshot_a_id"] = snapshot_a;
             args["snapshot_b_id"] = snapshot_b;
@@ -10933,7 +11161,7 @@ namespace {
                     }
                     return true;
                 }, passed, failed);
-        } else {
+        } else if (struct_mutation_readback_ok) {
             test_coverage_domains_1_8_fixture_fail(hf, tag, "struct_compare_snapshots", "struct_observe did not return two snapshot IDs", failed);
         }
     }
@@ -15129,8 +15357,19 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
                     st.guard_passed > 0 ||
                     st.security_guard_passed > 0 ||
                     st.negative_passed > 0;
+                const bool action_dependency_blocked_nonfatal =
+                    t.name == "analysis_query" &&
+                    st.dependency_blocked > 0 &&
+                    st.passed > 0 &&
+                    st.failed == 0 &&
+                    st.timed_out == 0;
                 const std::string stats_summary = mcp_tool_attempt_stats_summary(st);
-                if (st.dependency_blocked > 0) {
+                if (action_dependency_blocked_nonfatal) {
+                    ++covered;
+                    ++passed_tools;
+                    log_msg(hf, tag, "ACTION-DEPENDENCY-BLOCKED-NONFATAL -- registered tool \"%s\" retained functional coverage despite action-level PDB dependency block %s",
+                        t.name.c_str(), stats_summary.c_str());
+                } else if (st.dependency_blocked > 0) {
                     ++no_pass;
                     if (st.passed > 0 || st.failed > 0 || st.timed_out > 0 || nonfunctional_evidence)
                         ++mixed_fail_tools;
@@ -15173,7 +15412,7 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
                 }
                 if (st.failed > 0)
                     ++failed_tools;
-                if (st.dependency_blocked > 0)
+                if (st.dependency_blocked > 0 && !action_dependency_blocked_nonfatal)
                     ++dependency_blocked_tools;
                 if (st.skipped > 0)
                     ++skipped_tools;
@@ -15273,7 +15512,7 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             timed_out_drain_complete ? 1 : 0,
             g_invoked_tools.size());
 
-        if (missing == 0 && stale == 0 && no_pass == 0 && failed_tools == 0 && mixed_fail_tools == 0 && skipped_tools == 0 && timed_out_tools == 0 && dependency_blocked_tools == 0 && unexpected_zero_pass_tools == 0 && outstanding_timed_out_workers == 0 && timed_out_drain_complete) {
+        if (missing == 0 && stale == 0 && no_pass == 0 && failed_tools == 0 && mixed_fail_tools == 0 && skipped_tools == 0 && timed_out_tools == 0 && dependency_blocked_tools == 0 && empty_result_suspect_tools == 0 && unexpected_zero_pass_tools == 0 && outstanding_timed_out_workers == 0 && timed_out_drain_complete) {
             log_msg(hf, tag, "PASS -- attempted=%d functional_passed_tools=%d exempt_covered=%d security_guard_covered=%d covered_total=%d no_functional_pass=%d failed_tools=%d mixed_fail_tools=%d skipped_tools=%d timed_out_tools=%d dependency_blocked_tools=%d empty_result_suspect_tools=%d unexpected_zero_pass_tools=%d expected_empty_nonfunctional_tools=%d outstanding_timed_out_workers=%zu registered_total=%d external=%d internal=%d ide_chat_only=%d ai_excluded=%d non_ai_audited=%d destructive_schema_exemptions=%d",
                 attempted, passed_tools, destructive_schema_exempt_covered, security_guard_covered, covered, no_pass, failed_tools, mixed_fail_tools, skipped_tools, timed_out_tools, dependency_blocked_tools, empty_result_suspect_tools, unexpected_zero_pass_tools, expected_empty_nonfunctional_tools, outstanding_timed_out_workers,
                 registered_total, registered_external, registered_internal, registered_ide_chat, skipped_ai, non_ai_audited, destructive_schema_exemptions);
@@ -18626,6 +18865,57 @@ void test_tool_scanner_struct_manage_define(HANDLE hf, std::atomic<int>& passed,
         return false;
     }
 
+    std::string pdb_fixture_dependency_reason_code(const std::string& status_text) {
+        const std::string status_lc = lower_copy(status_text);
+        static const char* pre_parser_markers[] = {
+            "loadlibraryw_failed",
+            "worker_start_failed",
+            "syminitializew failed",
+            "symloadmoduleexw failed",
+            "failed to queue",
+            "download failed",
+            "pdb not found"
+        };
+        for (const char* marker : pre_parser_markers) {
+            if (status_lc.find(marker) != std::string::npos)
+                return "pre_parser_resource_failed";
+        }
+        return "parser_terminal_failed";
+    }
+
+    bool pdb_fixture_retry_visible_preparser_state(HANDLE hf,
+                                                   const char* tag,
+                                                   size_t& symbols,
+                                                   size_t& types,
+                                                   std::string& status_text,
+                                                   bool& loaded,
+                                                   bool& module_present,
+                                                   bool& failed) {
+        for (int attempt = 1; attempt <= 2; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            if (pdb_fixture_state(symbols, types, status_text, loaded, module_present, failed)) {
+                log_msg(hf, tag, "PDB-FIXTURE-RETRY-READY -- attempt=%d loaded=%d module_present=%d failed=%d symbols=%zu types=%zu parser_status=\"%s\"",
+                    attempt,
+                    loaded ? 1 : 0,
+                    module_present ? 1 : 0,
+                    failed ? 1 : 0,
+                    symbols,
+                    types,
+                    status_text.c_str());
+                return true;
+            }
+            log_msg(hf, tag, "PDB-FIXTURE-RETRY -- attempt=%d loaded=%d module_present=%d failed=%d symbols=%zu types=%zu parser_status=\"%s\"",
+                attempt,
+                loaded ? 1 : 0,
+                module_present ? 1 : 0,
+                failed ? 1 : 0,
+                symbols,
+                types,
+                status_text.c_str());
+        }
+        return false;
+    }
+
     bool ensure_pdb_fixture_loaded(HANDLE hf, const char* tag) {
         size_t symbols = 0;
         size_t types = 0;
@@ -18649,9 +18939,17 @@ void test_tool_scanner_struct_manage_define(HANDLE hf, std::atomic<int>& passed,
             return true;
         }
         if (pdb_fixture_terminal_failed(module_present, failed, loaded, symbols, types, status_text)) {
+            const std::string reason_code = pdb_fixture_dependency_reason_code(status_text);
+            if (reason_code == "pre_parser_resource_failed" &&
+                pdb_fixture_retry_visible_preparser_state(hf, tag, symbols, types, status_text, loaded, module_present, failed)) {
+                g_pdb_fixture_attempted = true;
+                g_pdb_fixture_ready = true;
+                g_pdb_fixture_failure_reason.clear();
+                return true;
+            }
             g_pdb_fixture_attempted = true;
             g_pdb_fixture_ready = false;
-            g_pdb_fixture_failure_reason = "dependency_reason=parser_terminal_failed loaded=" + std::to_string(loaded ? 1 : 0) +
+            g_pdb_fixture_failure_reason = "dependency_reason=" + reason_code + " loaded=" + std::to_string(loaded ? 1 : 0) +
                 " module_present=" + std::to_string(module_present ? 1 : 0) +
                 " failed=" + std::to_string(failed ? 1 : 0) +
                 " symbols=" + std::to_string(symbols) +
@@ -18719,8 +19017,15 @@ void test_tool_scanner_struct_manage_define(HANDLE hf, std::atomic<int>& passed,
             }
             if (pdb_fixture_terminal_failed(module_present, failed, loaded, symbols, types, status_text)) {
                 const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
+                const std::string reason_code = pdb_fixture_dependency_reason_code(status_text);
+                if (reason_code == "pre_parser_resource_failed" &&
+                    pdb_fixture_retry_visible_preparser_state(hf, tag, symbols, types, status_text, loaded, module_present, failed)) {
+                    g_pdb_fixture_ready = true;
+                    g_pdb_fixture_failure_reason.clear();
+                    return true;
+                }
                 g_pdb_fixture_ready = false;
-                g_pdb_fixture_failure_reason = "dependency_reason=parser_terminal_failed elapsed_ms=" + std::to_string(static_cast<long long>(elapsed_ms)) +
+                g_pdb_fixture_failure_reason = "dependency_reason=" + reason_code + " elapsed_ms=" + std::to_string(static_cast<long long>(elapsed_ms)) +
                     " loaded=" + std::to_string(loaded ? 1 : 0) +
                     " module_present=" + std::to_string(module_present ? 1 : 0) +
                     " failed=" + std::to_string(failed ? 1 : 0) +
@@ -23247,13 +23552,122 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
             reason = "total_cookies=" + std::to_string(total_cookies);
             return false;
         }
+        std::string active_url;
+        if (!payload_string_field(value, "active_url", active_url) || active_url.empty() || lower_copy(active_url) == "about:blank") {
+            reason = active_url.empty() ? "active_url_missing" : "active_url_about_blank";
+            return false;
+        }
         const auto* cookies = find_payload_key_recursive(value, "cookies");
         if (!cookies || !camoufox_cookie_payload_contains_name(*cookies, name)) {
             reason = "unique_cookie_missing name=" + name + " total_cookies=" + std::to_string(total_cookies);
             return false;
         }
-        reason = "unique_cookie_present name=" + name + " total_cookies=" + std::to_string(total_cookies);
+        uint64_t cookie_jar_count = 0;
+        uint64_t network_set_cookie_count = 0;
+        uint64_t js_cookie_log_count = 0;
+        payload_u64_field(value, "cookie_jar_count", cookie_jar_count);
+        payload_u64_field(value, "network_set_cookie_count", network_set_cookie_count);
+        payload_u64_field(value, "js_cookie_log_count", js_cookie_log_count);
+        if (cookie_jar_count == 0 && network_set_cookie_count == 0 && js_cookie_log_count == 0) {
+            reason = "cookie_source_counters_zero active_url=" + compact_text(active_url, 180);
+            return false;
+        }
+        reason = "unique_cookie_present name=" + name +
+            " total_cookies=" + std::to_string(total_cookies) +
+            " active_url=" + compact_text(active_url, 180) +
+            " cookie_jar_count=" + std::to_string(static_cast<unsigned long long>(cookie_jar_count)) +
+            " network_set_cookie_count=" + std::to_string(static_cast<unsigned long long>(network_set_cookie_count)) +
+            " js_cookie_log_count=" + std::to_string(static_cast<unsigned long long>(js_cookie_log_count));
         return true;
+    }
+
+    bool camoufox_scripts_list_payload_valid(const mcp_standalone::json& value, const std::string& expected_src_marker, std::string& reason) {
+        size_t top_level_scripts = 0;
+        size_t nested_scripts = 0;
+        if (value.is_array())
+            top_level_scripts = value.size();
+        payload_array_count(value, "scripts", nested_scripts);
+        const size_t script_count = std::max(top_level_scripts, nested_scripts);
+        if (script_count == 0) {
+            reason = "scripts_empty";
+            return false;
+        }
+        if (!expected_src_marker.empty() && lower_copy(value.dump()).find(lower_copy(expected_src_marker)) == std::string::npos) {
+            reason = "expected_script_marker_missing scripts=" + std::to_string(script_count);
+            return false;
+        }
+        reason = "scripts=" + std::to_string(script_count) + " expected_marker_present=1";
+        return true;
+    }
+
+    bool camoufox_search_code_payload_valid(const mcp_standalone::json& value, const std::string& marker, std::string& reason) {
+        uint64_t scripts_searched = 0;
+        uint64_t total_matches = 0;
+        uint64_t returned_matches = 0;
+        size_t matches = 0;
+        const bool has_scripts = payload_u64_field(value, "scripts_searched", scripts_searched);
+        const bool has_total = payload_u64_field(value, "total_matches", total_matches);
+        const bool has_returned = payload_u64_field(value, "returned_matches", returned_matches);
+        const bool has_matches = payload_array_count(value, "matches", matches);
+        if (!has_scripts || scripts_searched == 0) {
+            reason = has_scripts ? "scripts_searched=0" : "scripts_searched_missing";
+            return false;
+        }
+        if ((!has_total || total_matches == 0) && (!has_returned || returned_matches == 0) && (!has_matches || matches == 0)) {
+            reason = "matches_missing_or_zero scripts_searched=" + std::to_string(static_cast<unsigned long long>(scripts_searched));
+            return false;
+        }
+        if (!marker.empty() && lower_copy(value.dump()).find(lower_copy(marker)) == std::string::npos) {
+            reason = "expected_marker_missing scripts_searched=" + std::to_string(static_cast<unsigned long long>(scripts_searched)) +
+                " total_matches=" + std::to_string(static_cast<unsigned long long>(total_matches)) +
+                " returned_matches=" + std::to_string(static_cast<unsigned long long>(returned_matches)) +
+                " matches=" + std::to_string(matches);
+            return false;
+        }
+        reason = "scripts_searched=" + std::to_string(static_cast<unsigned long long>(scripts_searched)) +
+            " total_matches=" + std::to_string(static_cast<unsigned long long>(total_matches)) +
+            " returned_matches=" + std::to_string(static_cast<unsigned long long>(returned_matches)) +
+            " matches=" + std::to_string(matches) +
+            " marker_present=1";
+        return true;
+    }
+
+    bool camoufox_cookie_refresh_payload_valid(const mcp_standalone::json& value, const std::string& cookie_name, std::string& reason) {
+        const mcp_standalone::json* eval = value.is_object() && value.contains("value") ? &value["value"] : &value;
+        if (!eval || !eval->is_object()) {
+            reason = "cookie_refresh_eval_value_missing";
+            return false;
+        }
+        bool cookie_present = false;
+        uint64_t total_cookie_chars = 0;
+        std::string page_url;
+        payload_bool_field(*eval, "cookie_present", cookie_present);
+        payload_u64_field(*eval, "total_cookie_chars", total_cookie_chars);
+        payload_string_field(*eval, "page_url", page_url);
+        if (!cookie_present || total_cookie_chars == 0) {
+            reason = "cookie_refresh_no_readback cookie_present=" + std::to_string(cookie_present ? 1 : 0) +
+                " total_cookie_chars=" + std::to_string(static_cast<unsigned long long>(total_cookie_chars));
+            return false;
+        }
+        if (page_url.empty() || lower_copy(page_url) == "about:blank") {
+            reason = page_url.empty() ? "cookie_refresh_page_url_missing" : "cookie_refresh_about_blank";
+            return false;
+        }
+        reason = "cookie_present=1 name=" + cookie_name +
+            " total_cookie_chars=" + std::to_string(static_cast<unsigned long long>(total_cookie_chars)) +
+            " page_url=" + compact_text(page_url, 180);
+        return true;
+    }
+
+    void mark_camoufox_fixture_page_blocked(HANDLE hf, const char* tag, const std::string& root_reason, std::atomic<int>& failed) {
+        static const char* dependent_tools[] = {
+            "browser_navigation", "browser_interaction", "browser_inspect", "browser_state",
+            "browser_network", "browser_hooks", "browser_instrumentation",
+            "get_console_logs", "scripts", "search_code", "analyze_cookie_sources"
+        };
+        const std::string reason = root_reason.empty() ? std::string("fixture_page_unavailable") : root_reason;
+        for (const char* tool : dependent_tools)
+            record_camoufox_bridge_blocked_tool(hf, tag ? tag : "mcp.camoufox_reverse_dynamic", tool, reason, failed);
     }
 
     mcp_tool_call_status_t test_camoufox_environment_tool_call(HANDLE hf,
@@ -23766,11 +24180,38 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
         mcp_standalone::json fixture_page_args;
         fixture_page_args["page_id"] = fixture_page;
         fixture_page_args["make_active"] = true;
-        test_tool_action_call(hf, "mcp.camoufox.browser_lifecycle.new.fixture_after_external", "browser_lifecycle", "new", fixture_page_args, passed, failed, skipped);
+        mcp_standalone::tool_result_t fixture_new_result;
+        auto fixture_new_status = test_tool_action_call(hf, "mcp.camoufox.browser_lifecycle.new.fixture_after_external", "browser_lifecycle", "new",
+            fixture_page_args, passed, failed, skipped, false, &fixture_new_result);
+        if (fixture_new_status != mcp_tool_call_status_t::passed) {
+            std::string root_reason = "fixture_page_new_failed page_id=" + fixture_page +
+                " new_status=" + mcp_status_classification_name(fixture_new_status) +
+                " data_shape=" + mcp_payload_summary(fixture_new_result.data);
+            log_msg(hf, tag, "FAIL -- fixture page new failed after external diagnose reason=%s data=%s",
+                compact_text(root_reason, 900).c_str(),
+                compact_json(fixture_new_result.data, 1000).c_str());
+            mark_camoufox_fixture_page_blocked(hf, tag, root_reason, failed);
+            test_tool_action_call(hf, "mcp.camoufox.browser_lifecycle.close", "browser_lifecycle", "close", {}, passed, failed, skipped);
+            return;
+        }
 
         nav_args["page_id"] = fixture_page;
         nav_args["url"] = fixture_url;
-        test_tool_action_call(hf, "mcp.camoufox.browser_navigation.navigate.fixture_after_external", "browser_navigation", "navigate", nav_args, passed, failed, skipped);
+        mcp_standalone::tool_result_t fixture_nav_result;
+        auto fixture_nav_status = test_tool_action_call(hf, "mcp.camoufox.browser_navigation.navigate.fixture_after_external", "browser_navigation", "navigate",
+            nav_args, passed, failed, skipped, false, &fixture_nav_result);
+        if (fixture_nav_status != mcp_tool_call_status_t::passed) {
+            std::string root_reason = "fixture_page_navigate_failed page_id=" + fixture_page +
+                " nav_status=" + mcp_status_classification_name(fixture_nav_status) +
+                " url=" + compact_text(fixture_url, 260) +
+                " data_shape=" + mcp_payload_summary(fixture_nav_result.data);
+            log_msg(hf, tag, "FAIL -- fixture page navigate failed after external diagnose reason=%s data=%s",
+                compact_text(root_reason, 900).c_str(),
+                compact_json(fixture_nav_result.data, 1000).c_str());
+            mark_camoufox_fixture_page_blocked(hf, tag, root_reason, failed);
+            test_tool_action_call(hf, "mcp.camoufox.browser_lifecycle.close", "browser_lifecycle", "close", {}, passed, failed, skipped);
+            return;
+        }
 
         mcp_standalone::json fixture_url_assert_args;
         fixture_url_assert_args["page_id"] = fixture_page;
@@ -23781,14 +24222,40 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
             fixture_url_assert_args, passed, failed, skipped, false, &fixture_url_assert_result);
         const mcp_standalone::json* fixture_url_value = camoufox_eval_value(fixture_url_assert_result.data);
         bool fixture_url_ok = false;
+        std::string fixture_href;
         if (fixture_url_value && fixture_url_value->is_object())
             payload_bool_field(*fixture_url_value, "fixture", fixture_url_ok);
-        if (fixture_url_assert_status != mcp_tool_call_status_t::passed || !fixture_url_ok) {
-            log_msg(hf, tag, "FAIL -- fixture page URL assertion failed after external diagnose status=%s page_id=%s data=%s",
-                mcp_status_classification_name(fixture_url_assert_status),
-                fixture_page.c_str(),
-                compact_json(fixture_url_assert_result.data, 1200).c_str());
-            record_fixture_failed_tool("browser_navigation", failed);
+        if (fixture_url_value && fixture_url_value->is_object())
+            payload_string_field(*fixture_url_value, "href", fixture_href);
+        mcp_standalone::tool_result_t fixture_list_result;
+        auto fixture_list_status = test_tool_action_call(hf, "mcp.camoufox.browser_lifecycle.list.fixture_after_external", "browser_lifecycle", "list",
+            {}, passed, failed, skipped, false, &fixture_list_result);
+        const bool fixture_list_has_page = fixture_list_status == mcp_tool_call_status_t::passed &&
+            json_array_contains_string_field(fixture_list_result.data, "pages", fixture_page, {"page_id"});
+        const bool fixture_page_ready =
+            fixture_new_status == mcp_tool_call_status_t::passed &&
+            fixture_nav_status == mcp_tool_call_status_t::passed &&
+            fixture_url_assert_status == mcp_tool_call_status_t::passed &&
+            fixture_url_ok &&
+            fixture_list_has_page;
+        if (!fixture_page_ready) {
+            std::string root_reason = "fixture_page_ready=0 page_id=" + fixture_page +
+                " new_status=" + mcp_status_classification_name(fixture_new_status) +
+                " nav_status=" + mcp_status_classification_name(fixture_nav_status) +
+                " url_assert_status=" + mcp_status_classification_name(fixture_url_assert_status) +
+                " fixture_url_ok=" + std::to_string(fixture_url_ok ? 1 : 0) +
+                " list_status=" + mcp_status_classification_name(fixture_list_status) +
+                " list_has_page=" + std::to_string(fixture_list_has_page ? 1 : 0) +
+                " href=" + compact_text(fixture_href, 220);
+            log_msg(hf, tag, "FAIL -- fixture page lifecycle proof failed after external diagnose reason=%s new_data=%s nav_data=%s assert_data=%s list_data=%s",
+                compact_text(root_reason, 900).c_str(),
+                compact_json(fixture_new_result.data, 800).c_str(),
+                compact_json(fixture_nav_result.data, 800).c_str(),
+                compact_json(fixture_url_assert_result.data, 800).c_str(),
+                compact_json(fixture_list_result.data, 800).c_str());
+            mark_camoufox_fixture_page_blocked(hf, tag, root_reason, failed);
+            test_tool_action_call(hf, "mcp.camoufox.browser_lifecycle.close", "browser_lifecycle", "close", {}, passed, failed, skipped);
+            return;
         }
 
         intercept_args["page_id"] = fixture_page;
@@ -24064,13 +24531,45 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
 
         mcp_standalone::json scripts_args;
         scripts_args["action"] = "list";
-        test_tool_call(hf, "mcp.camoufox.scripts", get_server(), "scripts", scripts_args, passed, failed, skipped);
+        mcp_standalone::tool_result_t scripts_result;
+        auto scripts_status = test_tool_call(hf, "mcp.camoufox.scripts", get_server(), "scripts", scripts_args, passed, failed, skipped, false, &scripts_result);
+        bool scripts_fixture_ok = false;
+        if (scripts_status == mcp_tool_call_status_t::passed) {
+            std::string scripts_reason;
+            scripts_fixture_ok = camoufox_scripts_list_payload_valid(scripts_result.data, "aida-fixture.js", scripts_reason);
+            if (!scripts_fixture_ok) {
+                log_msg(hf, tag, "FAIL -- scripts list did not prove script-bearing fixture page reason=%s data=%s",
+                    compact_text(scripts_reason, 900).c_str(),
+                    compact_json(scripts_result.data, 1200).c_str());
+                convert_last_pass_to_fixture_failure("scripts", passed, failed);
+            } else {
+                log_msg(hf, tag, "PASS -- scripts fixture proof=%s",
+                    compact_text(scripts_reason, 700).c_str());
+            }
+        }
 
         mcp_standalone::json search_args;
         search_args["keyword"] = "AIDA_CAMOUFOX_SCRIPT_MARKER";
         search_args["max_results"] = 8;
         search_args["context_chars"] = 80;
-        test_tool_call(hf, "mcp.camoufox.search_code", get_server(), "search_code", search_args, passed, failed, skipped);
+        if (scripts_fixture_ok) {
+            mcp_standalone::tool_result_t search_result;
+            auto search_status = test_tool_call(hf, "mcp.camoufox.search_code", get_server(), "search_code", search_args, passed, failed, skipped, false, &search_result);
+            if (search_status == mcp_tool_call_status_t::passed) {
+                std::string search_reason;
+                if (!camoufox_search_code_payload_valid(search_result.data, "AIDA_CAMOUFOX_SCRIPT_MARKER", search_reason)) {
+                    log_msg(hf, tag, "FAIL -- search_code did not prove expected fixture marker reason=%s data=%s",
+                        compact_text(search_reason, 900).c_str(),
+                        compact_json(search_result.data, 1200).c_str());
+                    convert_last_pass_to_fixture_failure("search_code", passed, failed);
+                } else {
+                    log_msg(hf, tag, "PASS -- search_code marker proof=%s",
+                        compact_text(search_reason, 700).c_str());
+                }
+            }
+        } else {
+            record_camoufox_bridge_blocked_tool(hf, tag, "search_code", "scripts fixture list missing expected aida-fixture.js marker; search_code not dispatched", failed);
+        }
 
         mcp_standalone::json cookies_args;
         cookies_args["page_id"] = fixture_page;
@@ -24078,6 +24577,7 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
         cookies_args["payload"] = mcp_standalone::json::object({{"action", "get"}});
         mcp_standalone::tool_result_t cookies_result;
         auto cookies_status = test_tool_action_call(hf, "mcp.camoufox.cookies", "browser_state", "cookies", cookies_args, passed, failed, skipped, false, &cookies_result);
+        bool cookie_readback_ok = cookies_status == mcp_tool_call_status_t::passed && camoufox_cookie_payload_contains_name(cookies_result.data, cookie_name);
         if (cookies_status == mcp_tool_call_status_t::passed && !camoufox_cookie_payload_contains_name(cookies_result.data, cookie_name)) {
             log_msg(hf, tag, "FAIL -- browser_state cookies did not report unique Test Lab cookie name=%s data=%s",
                 cookie_name.c_str(),
@@ -24087,25 +24587,48 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
 
         mcp_standalone::json cookie_refresh_eval_args;
         cookie_refresh_eval_args["page_id"] = fixture_page;
-        cookie_refresh_eval_args["expression"] = "(()=>{document.cookie='" + cookie_name + "=refresh; path=/';return {cookie_name:'" + cookie_name + "',cookie_present:document.cookie.indexOf('" + cookie_name + "=')>=0,total_cookie_chars:document.cookie.length};})()";
+        cookie_refresh_eval_args["expression"] = "(()=>{document.cookie='" + cookie_name + "=refresh; path=/';return {cookie_name:'" + cookie_name + "',cookie_present:document.cookie.indexOf('" + cookie_name + "=')>=0,total_cookie_chars:document.cookie.length,page_url:String(location.href||'')};})()";
         cookie_refresh_eval_args["await_promise"] = true;
-        test_tool_action_call(hf, "mcp.camoufox.browser_interaction.evaluate.cookie_refresh", "browser_interaction", "evaluate", cookie_refresh_eval_args, passed, failed, skipped);
+        mcp_standalone::tool_result_t cookie_refresh_result;
+        auto cookie_refresh_status = test_tool_action_call(hf, "mcp.camoufox.browser_interaction.evaluate.cookie_refresh", "browser_interaction", "evaluate",
+            cookie_refresh_eval_args, passed, failed, skipped, false, &cookie_refresh_result);
+        bool cookie_refresh_ok = false;
+        if (cookie_refresh_status == mcp_tool_call_status_t::passed) {
+            std::string cookie_refresh_reason;
+            cookie_refresh_ok = camoufox_cookie_refresh_payload_valid(cookie_refresh_result.data, cookie_name, cookie_refresh_reason);
+            if (!cookie_refresh_ok) {
+                log_msg(hf, tag, "FAIL -- cookie refresh fixture readback failed reason=%s data=%s",
+                    compact_text(cookie_refresh_reason, 900).c_str(),
+                    compact_json(cookie_refresh_result.data, 1200).c_str());
+                convert_last_pass_to_fixture_failure("browser_interaction", passed, failed);
+            } else {
+                log_msg(hf, tag, "PASS -- cookie refresh proof=%s",
+                    compact_text(cookie_refresh_reason, 700).c_str());
+            }
+        }
         mcp_standalone::json cookie_source_args;
         cookie_source_args["name_filter"] = cookie_name;
         mcp_standalone::tool_result_t cookie_source_result;
-        auto cookie_source_status = test_tool_call(hf, "mcp.camoufox.analyze_cookie_sources", get_server(), "analyze_cookie_sources", cookie_source_args, passed, failed, skipped, false, &cookie_source_result);
-        if (cookie_source_status == mcp_tool_call_status_t::passed) {
-            std::string cookie_source_reason;
-            if (!camoufox_cookie_source_payload_valid(cookie_source_result.data, cookie_name, cookie_source_reason)) {
-                log_msg(hf, tag, "FAIL -- analyze_cookie_sources did not prove unique cookie source name=%s reason=%s data=%s",
-                    cookie_name.c_str(),
-                    compact_text(cookie_source_reason, 900).c_str(),
-                    compact_json(cookie_source_result.data, 1200).c_str());
-                convert_last_pass_to_fixture_failure("analyze_cookie_sources", passed, failed);
-            } else {
-                log_msg(hf, tag, "PASS -- analyze_cookie_sources unique cookie proof=%s",
-                    compact_text(cookie_source_reason, 700).c_str());
+        if (cookie_readback_ok && cookie_refresh_ok) {
+            auto cookie_source_status = test_tool_call(hf, "mcp.camoufox.analyze_cookie_sources", get_server(), "analyze_cookie_sources", cookie_source_args, passed, failed, skipped, false, &cookie_source_result);
+            if (cookie_source_status == mcp_tool_call_status_t::passed) {
+                std::string cookie_source_reason;
+                if (!camoufox_cookie_source_payload_valid(cookie_source_result.data, cookie_name, cookie_source_reason)) {
+                    log_msg(hf, tag, "FAIL -- analyze_cookie_sources did not prove unique cookie source name=%s reason=%s data=%s",
+                        cookie_name.c_str(),
+                        compact_text(cookie_source_reason, 900).c_str(),
+                        compact_json(cookie_source_result.data, 1200).c_str());
+                    convert_last_pass_to_fixture_failure("analyze_cookie_sources", passed, failed);
+                } else {
+                    log_msg(hf, tag, "PASS -- analyze_cookie_sources unique cookie proof=%s",
+                        compact_text(cookie_source_reason, 700).c_str());
+                }
             }
+        } else {
+            std::string reason = "cookie dependency not proven before analyze_cookie_sources cookie_readback_ok=" +
+                std::to_string(cookie_readback_ok ? 1 : 0) +
+                " cookie_refresh_ok=" + std::to_string(cookie_refresh_ok ? 1 : 0);
+            record_camoufox_bridge_blocked_tool(hf, tag, "analyze_cookie_sources", reason, failed);
         }
 
         mcp_standalone::json storage_args;
@@ -25086,7 +25609,7 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
             test_coverage_protocol_re_emit_stimulus_t stimulus;
             if (protocol_desc_ready)
                 stimulus = test_coverage_protocol_re_post_emit_stimulus(replay_pid, protocol_desc, 3, 5, 150, 150);
-            test_coverage_net_thread_domains_9_10_16_case(hf, tag, replay_tool, "replay_record_deterministic_session", args, 4500,
+            const bool replay_record_case_ok = test_coverage_net_thread_domains_9_10_16_case(hf, tag, replay_tool, "replay_record_deterministic_session", args, 4500,
                 [&recorded_replay_session_id](const invoke_result_t& ir, std::string& reason) {
                     if (!ir.success)
                         return test_coverage_net_thread_domains_9_10_16_known_driver_fail_closed(ir) ||
@@ -25104,8 +25627,29 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
                     recorded_replay_session_id = session_id;
                     return true;
                 }, passed, failed);
-            if (protocol_desc_ready)
+            if (protocol_desc_ready) {
                 test_coverage_protocol_re_wait_emit_stimulus(hf, tag, "replay_record_deterministic_session", stimulus, 9000);
+                const bool stimulus_ok =
+                    stimulus.posted &&
+                    stimulus.done->load(std::memory_order_acquire) &&
+                    stimulus.attempts->load(std::memory_order_acquire) > 0 &&
+                    stimulus.ok->load(std::memory_order_acquire) > 0 &&
+                    stimulus.packets_sent->load(std::memory_order_acquire) > 0 &&
+                    stimulus.bytes_sent->load(std::memory_order_acquire) > 0;
+                if (replay_record_case_ok && !stimulus_ok) {
+                    log_msg(hf, tag, "FAIL -- replay_record_deterministic_session functional pass invalidated by protocol stimulus proof posted=%d done=%d attempts=%u ok=%u packets_sent=%llu framed=%llu enet=%llu bytes_sent=%llu",
+                        stimulus.posted ? 1 : 0,
+                        stimulus.done->load(std::memory_order_acquire) ? 1 : 0,
+                        stimulus.attempts->load(std::memory_order_acquire),
+                        stimulus.ok->load(std::memory_order_acquire),
+                        static_cast<unsigned long long>(stimulus.packets_sent->load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(stimulus.framed_packets_sent->load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(stimulus.enet_packets_sent->load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(stimulus.bytes_sent->load(std::memory_order_acquire)));
+                    recorded_replay_session_id.clear();
+                    convert_last_pass_to_fixture_failure(replay_tool.c_str(), passed, failed);
+                }
+            }
         }
         if ((!cancelled || !cancelled()) && !recorded_replay_session_id.empty()) {
             mcp_standalone::json args;
@@ -25399,7 +25943,7 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
             args["sample_ms"] = 1200;
             args["max_captures"] = 8;
             auto stimulus = test_coverage_protocol_re_post_emit_stimulus(trace_pid, protocol_desc, 2, 6, 100, 125);
-            test_coverage_net_thread_domains_9_10_16_case(hf, tag, trace_tool, "trace_session_fixture_serializer_positive", args, 4500,
+            const bool trace_case_ok = test_coverage_net_thread_domains_9_10_16_case(hf, tag, trace_tool, "trace_session_fixture_serializer_positive", args, 4500,
                 [](const invoke_result_t& ir, std::string& reason) {
                     if (!ir.success) {
                         reason = "expected fixture serializer trace success text=" + compact_text(ir.text, 300);
@@ -25428,6 +25972,25 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
                     return true;
                 }, passed, failed);
             test_coverage_protocol_re_wait_emit_stimulus(hf, tag, "trace_session_fixture_serializer_positive", stimulus, 9000);
+            const bool trace_stimulus_ok =
+                stimulus.posted &&
+                stimulus.done->load(std::memory_order_acquire) &&
+                stimulus.attempts->load(std::memory_order_acquire) > 0 &&
+                stimulus.ok->load(std::memory_order_acquire) > 0 &&
+                stimulus.packets_sent->load(std::memory_order_acquire) > 0 &&
+                stimulus.bytes_sent->load(std::memory_order_acquire) > 0;
+            if (trace_case_ok && !trace_stimulus_ok) {
+                log_msg(hf, tag, "FAIL -- trace_session_fixture_serializer_positive functional pass invalidated by protocol stimulus proof posted=%d done=%d attempts=%u ok=%u packets_sent=%llu framed=%llu enet=%llu bytes_sent=%llu",
+                    stimulus.posted ? 1 : 0,
+                    stimulus.done->load(std::memory_order_acquire) ? 1 : 0,
+                    stimulus.attempts->load(std::memory_order_acquire),
+                    stimulus.ok->load(std::memory_order_acquire),
+                    static_cast<unsigned long long>(stimulus.packets_sent->load(std::memory_order_acquire)),
+                    static_cast<unsigned long long>(stimulus.framed_packets_sent->load(std::memory_order_acquire)),
+                    static_cast<unsigned long long>(stimulus.enet_packets_sent->load(std::memory_order_acquire)),
+                    static_cast<unsigned long long>(stimulus.bytes_sent->load(std::memory_order_acquire)));
+                convert_last_pass_to_fixture_failure(trace_tool.c_str(), passed, failed);
+            }
         } else if (!protocol_desc_ready) {
             log_msg(hf, tag, "INFO -- protocol descriptor unavailable; positive serializer trace not dispatched reason=%s",
                 protocol_desc_reason.empty() ? "<empty>" : compact_text(protocol_desc_reason, 900).c_str());

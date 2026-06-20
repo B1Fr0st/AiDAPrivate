@@ -149,6 +149,8 @@ tool_result_t handle_trace_serializer(const json& raw_params)
     if (!net_proto_analysis::trace_serializer(options, result, error))
         return tool_result_t::error(error.empty() ? OBFSTR("serializer trace failed") : error, result);
     result["serializer_va_normalized"] = sa_format_address(*va);
+    if (result.value("capture_count", 0u) == 0)
+        return tool_result_t::error(OBFSTR("Serializer trace completed with zero captured serializer outputs."), result);
     return tool_result_t::ok(OBFSTR("Serializer sampling completed with bounded captures."), result);
 }
 

@@ -859,16 +859,35 @@ def _run_import_smoke():
         from camoufox_reverse_mcp.browser import _camoufox_debug
         debug = _camoufox_debug
         import camoufox_reverse_mcp.browser as browser_module
+        import camoufox_reverse_mcp.tools.navigation as navigation_module
+        import camoufox_reverse_mcp.tools.network as network_module
         patch_marker = getattr(browser_module, "AIDA_CAMOUFOX_BRIDGE_PATCH_ID", "")
         launch_code = getattr(browser_module.BrowserManager.launch, "__code__", None)
         launch_consts = repr(getattr(launch_code, "co_consts", ()))
         launch_names = repr(getattr(launch_code, "co_names", ()))
+        browser_recovery_consts = (
+            repr(getattr(getattr(browser_module.BrowserManager.new_page, "__code__", None), "co_consts", ())) +
+            repr(getattr(getattr(browser_module.BrowserManager.resolve_page, "__code__", None), "co_consts", ())) +
+            repr(getattr(getattr(browser_module.BrowserManager._requested_page_id_blocker, "__code__", None), "co_consts", ())) +
+            repr(getattr(getattr(browser_module.BrowserManager._attach_listeners, "__code__", None), "co_consts", ()))
+        )
+        navigation_consts = repr(getattr(getattr(navigation_module.navigate, "__code__", None), "co_consts", ()))
+        network_consts = repr(getattr(getattr(network_module.list_network_requests, "__code__", None), "co_consts", ()))
         if patch_marker != "aida_camoufox_bridge_20260619_2":
             raise RuntimeError(f"frozen browser patch marker mismatch: {patch_marker!r}")
         if "aida_bridge_patch_active" not in launch_consts or "aida_launch_policy_resolved" not in launch_consts:
             raise RuntimeError("frozen browser launch diagnostics missing")
         if "AIDA_CAMOUFOX_BRIDGE_PATCH_ID" not in launch_names:
             raise RuntimeError("frozen browser launch patch marker missing")
+        for marker in ("browser_page_id_unavailable", "resolve_page_default_recovery_begin", "requestfinished", "websocket"):
+            if marker not in browser_recovery_consts:
+                raise RuntimeError(f"frozen browser recovery marker missing: {marker}")
+        for marker in ("bloxflip_navigation_state", "diagnostic_navigation_goto_exception", "network_capture"):
+            if marker not in navigation_consts:
+                raise RuntimeError(f"frozen navigation diagnostic marker missing: {marker}")
+        for marker in ("request_id", "network_request_id", "redirect_chain", "response_body_length", "request_body_length", "websocket", "timing", "initiator"):
+            if marker not in network_consts:
+                raise RuntimeError(f"frozen network capture marker missing: {marker}")
         debug(
             "import_smoke_begin",
             cwd=os.getcwd(),

@@ -952,6 +952,7 @@ nlohmann::json decode_payload_heuristic(const std::vector<std::uint8_t>& payload
 nlohmann::json record_replay_session(const capture_options_t& options,
                                      std::string& error)
 {
+    const std::uint64_t started = static_cast<std::uint64_t>(GetTickCount64());
     std::vector<driver_bridge::captured_packet_t> packets;
     if (!capture_packets_bounded(options, packets, error))
         return nlohmann::json::object();
@@ -976,15 +977,25 @@ nlohmann::json record_replay_session(const capture_options_t& options,
         out["filter_pid"] = options.pid;
         out["filter_protocol"] = options.protocol;
         out["capture_ms"] = options.capture_ms;
+        out["capture_window_ms"] = options.capture_ms;
+        out["elapsed_ms"] = static_cast<std::uint64_t>(GetTickCount64()) - started;
+        out["observed_packet_count"] = session.packets.size();
+        out["saw_traffic"] = !session.packets.empty();
+        out["stimulus_observed"] = !session.packets.empty();
+        out["functional_success"] = !session.packets.empty();
+        if (session.packets.empty())
+            out["zero_capture_reason"] = "driver capture completed but returned zero packets for the selected process, protocol, and capture window";
         out["requires_recorded_session"] = true;
         map[session.id] = std::move(session);
     }
     diag::log_tagged_fmt("gameproto",
-        "record_replay_session session_id=%s packets=%u pid=%u protocol=%u",
+        "record_replay_session session_id=%s packets=%u pid=%u protocol=%u elapsed_ms=%llu functional_success=%d",
         out.value("session_id", std::string()).c_str(),
         out.value("packet_count", 0u),
         options.pid,
-        options.protocol);
+        options.protocol,
+        static_cast<unsigned long long>(out.value("elapsed_ms", 0ull)),
+        out.value("functional_success", false) ? 1 : 0);
     return out;
 }
 
@@ -992,6 +1003,7 @@ nlohmann::json stop_replay_recording(const std::string& requested_session_id,
                                      std::uint32_t max_packets,
                                      std::string& error)
 {
+    const std::uint64_t started = static_cast<std::uint64_t>(GetTickCount64());
     error.clear();
     if (!driver_bridge::using_kernel_driver()) {
         error = "driver bridge is not connected";
@@ -1021,13 +1033,23 @@ nlohmann::json stop_replay_recording(const std::string& requested_session_id,
         out["packet_count"] = session.packets.size();
         out["detection"] = session.detection;
         out["backend"] = "driver_capture_stop";
+        out["max_packets"] = max_packets;
+        out["elapsed_ms"] = static_cast<std::uint64_t>(GetTickCount64()) - started;
+        out["observed_packet_count"] = session.packets.size();
+        out["saw_traffic"] = !session.packets.empty();
+        out["stimulus_observed"] = !session.packets.empty();
+        out["functional_success"] = !session.packets.empty();
+        if (session.packets.empty())
+            out["zero_capture_reason"] = "capture stop completed but the driver returned zero buffered packets";
         out["requires_recorded_session"] = true;
         map[session.id] = std::move(session);
     }
     diag::log_tagged_fmt("gameproto",
-        "stop_replay_recording session_id=%s packets=%u",
+        "stop_replay_recording session_id=%s packets=%u elapsed_ms=%llu functional_success=%d",
         out.value("session_id", std::string()).c_str(),
-        out.value("packet_count", 0u));
+        out.value("packet_count", 0u),
+        static_cast<unsigned long long>(out.value("elapsed_ms", 0ull)),
+        out.value("functional_success", false) ? 1 : 0);
     return out;
 }
 
@@ -1057,6 +1079,7 @@ bool replay_session(const replay_options_t& input,
                     nlohmann::json& out,
                     std::string& error)
 {
+    const std::uint64_t started = static_cast<std::uint64_t>(GetTickCount64());
     out = nlohmann::json::object();
     error.clear();
     if (!input.allow_unsafe || !input.confirm_unsafe) {
@@ -1114,19 +1137,28 @@ bool replay_session(const replay_options_t& input,
     }
 
     std::uint32_t sent = 0;
+    std::uint32_t attempted = 0;
+    std::uint32_t failed_inject = 0;
+    std::uint32_t skipped_empty_payload = 0;
     std::uint32_t skipped_payload_cap = 0;
     std::uint32_t skipped_target = 0;
+    std::uint32_t nonempty_payloads = 0;
+    std::uint32_t replayable_payloads = 0;
     nlohmann::json sent_packets = nlohmann::json::array();
 
     for (const auto& pkt : session.packets) {
-        if (sent >= options.max_packets)
+        if (attempted >= options.max_packets || sent >= options.max_packets)
             break;
-        if (pkt.payload.empty())
+        if (pkt.payload.empty()) {
+            ++skipped_empty_payload;
             continue;
+        }
+        ++nonempty_payloads;
         if (pkt.payload.size() > options.payload_cap) {
             ++skipped_payload_cap;
             continue;
         }
+        ++replayable_payloads;
 
         std::uint32_t direction = 1;
         if (options.direction == "original")
@@ -1170,6 +1202,7 @@ bool replay_session(const replay_options_t& input,
             continue;
         }
 
+        ++attempted;
         const bool ok = driver_bridge::inject_packet(direction, protocol, af, src_port, dst_port,
             src_addr, dst_addr, pkt.payload.data(), static_cast<std::uint32_t>(pkt.payload.size()));
 
@@ -1185,6 +1218,8 @@ bool replay_session(const replay_options_t& input,
             sent_packets.push_back(std::move(s));
         if (ok)
             ++sent;
+        else
+            ++failed_inject;
 
         if (options.replay_delay_ms)
             std::this_thread::sleep_for(std::chrono::milliseconds(options.replay_delay_ms));
@@ -1193,11 +1228,35 @@ bool replay_session(const replay_options_t& input,
     out["session_id"] = options.session_id;
     out["recorded_packet_count"] = session.packets.size();
     out["replay_requires_existing_session"] = true;
-    out["attempted_or_sent"] = sent;
+    out["attempted_or_sent"] = attempted;
+    out["attempted_packet_count"] = attempted;
+    out["sent_packet_count"] = sent;
+    out["failed_inject_count"] = failed_inject;
     out["max_packets"] = options.max_packets;
     out["payload_cap"] = options.payload_cap;
+    out["skipped_empty_payload"] = skipped_empty_payload;
     out["skipped_payload_cap"] = skipped_payload_cap;
     out["skipped_target"] = skipped_target;
+    out["nonempty_payload_count"] = nonempty_payloads;
+    out["replayable_payload_count"] = replayable_payloads;
+    out["saw_replayable_payload"] = replayable_payloads > 0;
+    out["saw_replay_attempt"] = attempted > 0;
+    out["functional_success"] = sent > 0;
+    out["elapsed_ms"] = static_cast<std::uint64_t>(GetTickCount64()) - started;
+    if (sent == 0) {
+        if (session.packets.empty())
+            out["zero_output_reason"] = "recorded session contains zero packets";
+        else if (nonempty_payloads == 0)
+            out["zero_output_reason"] = "recorded session contained no non-empty payloads";
+        else if (replayable_payloads == 0 && skipped_payload_cap > 0)
+            out["zero_output_reason"] = "all non-empty packets exceeded the configured payload cap";
+        else if (attempted == 0 && skipped_target > 0)
+            out["zero_output_reason"] = "all replayable packets were rejected by target safety policy or missing ports";
+        else if (attempted > 0 && failed_inject == attempted)
+            out["zero_output_reason"] = "packet injection was attempted but every injection call failed";
+        else
+            out["zero_output_reason"] = "replay completed without a successfully sent packet";
+    }
     out["packets"] = std::move(sent_packets);
     out["limitations"] = nlohmann::json::array({
         "kernel transport injection is packet-level and does not recreate application socket state",

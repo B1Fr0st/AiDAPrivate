@@ -74,10 +74,18 @@ tool_result_t tool_fingerprint(const json& params)
     audit_http::send_options_t opt;
     opt.timeout_ms = 15000;
     opt.follow_redirects = true;
+    opt.return_first_redirect = false;
     opt.enforce_scope = false;
     opt.publish_exchange = true;
-    opt.exchange_source = "api";
-    auto req = build_get_request(host, path);
+    opt.exchange_source = "tech_fingerprint";
+    std::string host_header = host;
+    if ((tls && port != 443) || (!tls && port != 80)) {
+        host_header += ":";
+        host_header += std::to_string(port);
+    }
+    diag::log_tagged_fmt("mcp_burp", "tech_fingerprint send_options timeout_ms=%d follow_redirects=%d return_first_redirect=%d publish_exchange=%d",
+        opt.timeout_ms, opt.follow_redirects ? 1 : 0, opt.return_first_redirect ? 1 : 0, opt.publish_exchange ? 1 : 0);
+    auto req = build_get_request(host_header, path);
     auto resp = audit_http::send(req, host, port, tls, opt);
     if (!resp.has_value())
     {
@@ -95,12 +103,19 @@ tool_result_t tool_fingerprint(const json& params)
         return error_with_data(std::string("send_failed: ") + err, data);
     }
     auto items = fingerprint(resp->resp_headers, resp->resp_body, url);
-    diag::log_tagged_fmt("mcp_burp", "tech_fingerprint ok url=%s status=%d techs=%zu", url.c_str(), resp->status_code, items.size());
+    diag::log_tagged_fmt("mcp_burp", "tech_fingerprint ok url=%s status=%d techs=%zu latency_ms=%llu tls_version=%s alpn=%s exchange_id=%llu",
+        url.c_str(), resp->status_code, items.size(), static_cast<unsigned long long>(resp->latency_ms),
+        resp->tls_version.c_str(), resp->alpn.c_str(), static_cast<unsigned long long>(resp->id));
     json arr = json::array();
     for (const auto& t : items) arr.push_back(tech_to_json(t));
     json out;
     out["url"]          = url;
     out["status_code"]  = resp->status_code;
+    out["exchange_id"]  = resp->id;
+    out["latency_ms"]   = resp->latency_ms;
+    out["tls_version"]  = resp->tls_version;
+    out["alpn"]         = resp->alpn;
+    out["follow_redirects"] = opt.follow_redirects;
     out["technologies"] = arr;
     return tool_result_t::ok(out);
 }

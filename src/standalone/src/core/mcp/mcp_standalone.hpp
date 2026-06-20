@@ -62,6 +62,9 @@ namespace mcp_standalone
     void signal_call_cancel_token(const cancel_token_ptr_t& token) noexcept;
     std::atomic<bool>* current_cancel_token() noexcept;
     bool current_call_cancelled() noexcept;
+    const char* current_call_diag_id() noexcept;
+    const char* current_call_tool_name() noexcept;
+    std::uint64_t current_call_deadline_ms() noexcept;
 
     class scoped_call_cancel_t
     {

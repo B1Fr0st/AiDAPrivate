@@ -1399,18 +1399,63 @@ inline tool_result_t vm_trace_bytecode(const json& params)
     max_steps = std::clamp<std::uint32_t>(max_steps, 1, 100000);
     const std::uint32_t return_limit = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(parse_param_u64(params, "max_returned_steps").value_or(1024)), 1, 4096);
 #ifdef __NT__
-    if (mcp_standalone::current_call_cancelled())
-        return tool_result_t::error("VM bytecode trace cancelled before region evidence");
+    const std::uint64_t trace_started_ms = static_cast<std::uint64_t>(GetTickCount64());
+    const std::uint64_t tool_deadline_ms = mcp_standalone::current_call_deadline_ms();
+    auto deadline_remaining_ms = [&]() -> std::uint64_t {
+        if (tool_deadline_ms == 0)
+            return 0;
+        const std::uint64_t now = static_cast<std::uint64_t>(GetTickCount64());
+        return now < tool_deadline_ms ? tool_deadline_ms - now : 0;
+    };
+    auto trace_cancelled = [&](const char* phase) -> bool {
+        const bool cancelled = mcp_standalone::current_call_cancelled();
+        const std::uint64_t now = static_cast<std::uint64_t>(GetTickCount64());
+        const bool expired = tool_deadline_ms != 0 && now >= tool_deadline_ms;
+        if (cancelled || expired) {
+            diag::log_tagged_fmt("protected_re",
+                "vm_trace_bytecode deadline_cancel phase=%s diag_id=%s cancelled=%d expired=%d elapsed_ms=%llu deadline_ms=%llu remaining_ms=%llu",
+                phase ? phase : "<null>",
+                mcp_standalone::current_call_diag_id(),
+                cancelled ? 1 : 0,
+                expired ? 1 : 0,
+                static_cast<unsigned long long>(now - trace_started_ms),
+                static_cast<unsigned long long>(tool_deadline_ms),
+                static_cast<unsigned long long>(deadline_remaining_ms()));
+            return true;
+        }
+        return false;
+    };
+    auto cancelled_result = [&](const char* phase, const std::string& message) -> tool_result_t {
+        json out;
+        out["phase"] = phase ? phase : "";
+        out["diag_id"] = mcp_standalone::current_call_diag_id();
+        out["pid"] = pid;
+        out["tid"] = tid;
+        out["entry_va"] = sa_format_address(*entry);
+        out["elapsed_ms"] = static_cast<std::uint64_t>(GetTickCount64()) - trace_started_ms;
+        out["deadline_ms"] = tool_deadline_ms;
+        out["deadline_remaining_ms"] = deadline_remaining_ms();
+        out["cancelled"] = mcp_standalone::current_call_cancelled();
+        return tool_result_t::error(message, out);
+    };
+    if (trace_cancelled("before_region_evidence"))
+        return cancelled_result("before_region_evidence", "VM bytecode trace cancelled before region evidence");
     diag::log_tagged_fmt("protected_re",
-        "vm_trace_bytecode region_evidence_begin pid=%u entry=0x%llX",
-        pid,
-        static_cast<unsigned long long>(*entry));
-    const json entry_region = vm_region_evidence(pid, *entry);
-    diag::log_tagged_fmt("protected_re",
-        "vm_trace_bytecode region_evidence_end pid=%u entry=0x%llX region=%s",
+        "vm_trace_bytecode region_evidence_begin pid=%u entry=0x%llX diag_id=%s deadline_remaining_ms=%llu",
         pid,
         static_cast<unsigned long long>(*entry),
+        mcp_standalone::current_call_diag_id(),
+        static_cast<unsigned long long>(deadline_remaining_ms()));
+    const json entry_region = vm_region_evidence(pid, *entry);
+    diag::log_tagged_fmt("protected_re",
+        "vm_trace_bytecode region_evidence_end pid=%u entry=0x%llX elapsed_ms=%llu deadline_remaining_ms=%llu region=%s",
+        pid,
+        static_cast<unsigned long long>(*entry),
+        static_cast<unsigned long long>(static_cast<std::uint64_t>(GetTickCount64()) - trace_started_ms),
+        static_cast<unsigned long long>(deadline_remaining_ms()),
         entry_region.dump().c_str());
+    if (trace_cancelled("after_region_evidence"))
+        return cancelled_result("after_region_evidence", "VM bytecode trace cancelled after region evidence");
     const std::uint64_t snapshot_base = parse_param_u64(params, "snapshot_base").value_or(*entry & ~0xFFFULL);
     const std::uint64_t snapshot_size = std::clamp<std::uint64_t>(parse_param_u64(params, "snapshot_size").value_or(0x40000ULL), 0x1000ULL, 0x400000ULL);
     diag::log_tagged_fmt("protected_re",
@@ -1437,18 +1482,24 @@ inline tool_result_t vm_trace_bytecode(const json& params)
     cfg.analyze_effective_ops = true;
     cfg.timeout_us = std::min<std::uint64_t>(parse_param_u64(params, "timeout_us").value_or(15000000), 60000000);
     cfg.deadline_ms = static_cast<std::uint64_t>(GetTickCount64()) + std::max<std::uint64_t>(1000, cfg.timeout_us / 1000 + 1000);
+    if (tool_deadline_ms != 0 && (cfg.deadline_ms == 0 || tool_deadline_ms < cfg.deadline_ms))
+        cfg.deadline_ms = tool_deadline_ms;
     cfg.allow_neutral_thread_context = allow_neutral_context;
     cfg.max_invalid_page_maps = static_cast<std::uint32_t>(std::clamp<std::uint64_t>(parse_param_u64(params, "max_invalid_page_maps").value_or(32), 0, 4096));
+    if (trace_cancelled("before_snapshot_emulate"))
+        return cancelled_result("before_snapshot_emulate", "VM bytecode trace cancelled before snapshot emulation");
     diag::log_tagged_fmt("protected_re",
-        "vm_trace_bytecode snapshot_emulate_begin pid=%u tid=%u deadline_ms=%llu timeout_us=%llu invalid_cap=%u",
+        "vm_trace_bytecode snapshot_emulate_begin pid=%u tid=%u diag_id=%s deadline_ms=%llu timeout_us=%llu invalid_cap=%u deadline_remaining_ms=%llu",
         pid,
         tid,
+        mcp_standalone::current_call_diag_id(),
         static_cast<unsigned long long>(cfg.deadline_ms),
         static_cast<unsigned long long>(cfg.timeout_us),
-        cfg.max_invalid_page_maps);
+        cfg.max_invalid_page_maps,
+        static_cast<unsigned long long>(deadline_remaining_ms()));
     auto r = emulation::driver_snapshot_and_emulate(pid, tid, cfg, snapshot_base, snapshot_size);
     diag::log_tagged_fmt("protected_re",
-        "vm_trace_bytecode emulation_exit pid=%u tid=%u entry=0x%llX success=%d error='%s' total=%u trace=%zu reads=%zu writes=%zu reg_deltas=%zu hit_ret=%d hit_breakpoint=%d",
+        "vm_trace_bytecode emulation_exit pid=%u tid=%u entry=0x%llX success=%d error='%s' total=%u trace=%zu reads=%zu writes=%zu reg_deltas=%zu hit_ret=%d hit_breakpoint=%d elapsed_ms=%llu deadline_remaining_ms=%llu",
         pid,
         tid,
         static_cast<unsigned long long>(*entry),
@@ -1460,7 +1511,27 @@ inline tool_result_t vm_trace_bytecode(const json& params)
         r.mem_writes.size(),
         r.reg_deltas.size(),
         r.hit_ret ? 1 : 0,
-        r.hit_breakpoint ? 1 : 0);
+        r.hit_breakpoint ? 1 : 0,
+        static_cast<unsigned long long>(static_cast<std::uint64_t>(GetTickCount64()) - trace_started_ms),
+        static_cast<unsigned long long>(deadline_remaining_ms()));
+    if (trace_cancelled("after_snapshot_emulate")) {
+        json out;
+        out["entry_va"] = sa_format_address(*entry);
+        out["pid"] = pid;
+        out["tid"] = tid;
+        out["success"] = false;
+        out["error"] = r.error.empty() ? "deadline or cancellation after snapshot emulation" : r.error;
+        out["emulated_instructions"] = r.total_instructions;
+        out["trace_entries"] = r.trace.size();
+        out["mem_reads"] = r.mem_reads.size();
+        out["mem_writes"] = r.mem_writes.size();
+        out["diag_id"] = mcp_standalone::current_call_diag_id();
+        out["elapsed_ms"] = static_cast<std::uint64_t>(GetTickCount64()) - trace_started_ms;
+        out["deadline_ms"] = tool_deadline_ms;
+        out["deadline_remaining_ms"] = deadline_remaining_ms();
+        out["cancelled"] = mcp_standalone::current_call_cancelled();
+        return tool_result_t::error("VM bytecode trace cancelled after snapshot emulation", out);
+    }
     const auto handler_lookup = handler_opcode_lookup_from_params(pid, params);
     const json opcode_map = params.contains("opcode_map") ? params["opcode_map"] : json::object();
     json steps = json::array();

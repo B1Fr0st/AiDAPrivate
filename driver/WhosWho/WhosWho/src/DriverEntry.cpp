@@ -528,6 +528,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     WW_LOG("DriverEntry: starting watchdog...");
     if (!dispatcher::verify_dispatch_integrity(DriverObject)) {
         WW_LOG("DriverEntry: dispatch integrity check FAILED before watchdog start");
+        net_capture::cleanup();
         _IoDeleteSymbolicLink(&symLink);
         _IoDeleteDevice(deviceObject);
         return STATUS_ACCESS_DENIED;
@@ -537,6 +538,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     if (!NT_SUCCESS(ob_status)) {
         WW_LOG("DriverEntry: process_guard::init FAILED before watchdog start");
         process_guard::cleanup();
+        net_capture::cleanup();
         _IoDeleteSymbolicLink(&symLink);
         _IoDeleteDevice(deviceObject);
         return ob_status;

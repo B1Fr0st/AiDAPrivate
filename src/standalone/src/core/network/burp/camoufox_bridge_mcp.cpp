@@ -1032,30 +1032,71 @@ bool browser_record_to_exchange(const json& record, const json& params, const st
 std::string browser_dedupe_key(const json& record, const json& params, const exchange_observed_t& ex)
 {
     const std::string rid = json_first_string_field(record, {"request_id", "id", "network_request_id"});
+    const std::string session_id = json_first_string_field(params, {"session_id"});
     const std::string page_id = json_first_string_field(record, {"page_id", "page"});
     if (!rid.empty())
-        return std::string("id|") + page_id + "|" + rid;
+        return std::string("id|") + session_id + "|" + page_id + "|" + rid;
     std::string url = ex.scheme + "://" + ex.host;
     if ((ex.scheme == "https" && ex.port != 443) || (ex.scheme == "http" && ex.port != 80))
         url += ":" + std::to_string(ex.port);
     url += ex.path;
     if (!ex.query.empty())
         url += "?" + ex.query;
-    return std::string("url|") + ex.method + "|" + std::to_string(ex.status_code) + "|" + url + "|" + json_first_string_field(params, {"session_id"});
+    return std::string("url|") + session_id + "|" + ex.method + "|" + std::to_string(ex.status_code) + "|" + url;
 }
 
-bool remember_browser_exchange_key(const std::string& key)
+bool browser_record_is_navigation_document(const json& record)
+{
+    const std::string resource_type = lower_ascii_copy(json_first_string_field(record, {"resource_type", "type"}));
+    if (resource_type == "document" || resource_type == "navigation")
+        return true;
+    if (!resource_type.empty() && resource_type != "other")
+        return false;
+    if (!record.is_object())
+        return false;
+    return record.contains("final_status") ||
+        record.contains("initial_status") ||
+        record.contains("response_chain") ||
+        record.contains("redirect_chain") ||
+        record.contains("navigation_timed_out") ||
+        record.contains("title");
+}
+
+std::string browser_dedupe_document_url_key(const json& record, const json& params, const exchange_observed_t& ex)
+{
+    if (!browser_record_is_navigation_document(record))
+        return {};
+    std::string url = ex.scheme + "://" + ex.host;
+    if ((ex.scheme == "https" && ex.port != 443) || (ex.scheme == "http" && ex.port != 80))
+        url += ":" + std::to_string(ex.port);
+    url += ex.path;
+    if (!ex.query.empty())
+        url += "?" + ex.query;
+    return std::string("document_url|") + json_first_string_field(params, {"session_id"}) + "|" + ex.method + "|" + std::to_string(ex.status_code) + "|" + url;
+}
+
+bool remember_browser_exchange_keys(const std::string& primary_key, const std::string& document_url_key)
 {
     static std::mutex m;
     static std::unordered_set<std::string> seen;
     static std::deque<std::string> order;
     std::lock_guard<std::mutex> lk(m);
-    if (key.empty())
+    if (primary_key.empty() && document_url_key.empty())
         return true;
-    if (seen.find(key) != seen.end())
+    if (!primary_key.empty() && seen.find(primary_key) != seen.end())
         return false;
-    seen.insert(key);
-    order.push_back(key);
+    if (!document_url_key.empty() && document_url_key != primary_key && seen.find(document_url_key) != seen.end())
+        return false;
+    if (!primary_key.empty())
+    {
+        seen.insert(primary_key);
+        order.push_back(primary_key);
+    }
+    if (!document_url_key.empty() && document_url_key != primary_key)
+    {
+        seen.insert(document_url_key);
+        order.push_back(document_url_key);
+    }
     while (order.size() > 4096)
     {
         seen.erase(order.front());
@@ -1087,7 +1128,8 @@ burp_publish_summary_t publish_browser_exchanges(const std::string& tool_name, c
             continue;
         }
         const std::string key = browser_dedupe_key(candidate, params, ex);
-        if (!remember_browser_exchange_key(key))
+        const std::string document_url_key = browser_dedupe_document_url_key(candidate, params, ex);
+        if (!remember_browser_exchange_keys(key, document_url_key))
         {
             ++summary.duplicates;
             continue;
@@ -1699,9 +1741,12 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
     }
     if (tool_name == "navigate")
     {
-        const bool capture_from_start = json_bool_param(params, "capture_from_start", false);
+        const bool publish_to_burp = json_bool_param(params, "publish_to_burp", true);
+        const bool requested_capture_from_start = json_bool_param(params, "capture_from_start", false);
+        const bool capture_from_start = requested_capture_from_start || publish_to_burp;
         const bool capture_body = json_bool_param(params, "capture_body", false);
         const std::string capture_pattern = json_string_param(params, "capture_url_pattern", "**/*");
+        const std::string capture_page_id = json_string_param(params, "page_id", std::string());
         args.erase("capture_from_start");
         args.erase("capture_body");
         args.erase("capture_url_pattern");
@@ -1709,15 +1754,22 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
         {
             json clear_args;
             clear_args["action"] = "clear";
+            if (!capture_page_id.empty())
+                clear_args["page_id"] = capture_page_id;
             camoufox::call_result_t clear_result = camoufox::call_tool("network_capture", clear_args, 10000, session_id);
             json start_args;
             start_args["action"] = "start";
             start_args["url_pattern"] = capture_pattern.empty() ? std::string("**/*") : capture_pattern;
             start_args["capture_body"] = capture_body;
+            if (!capture_page_id.empty())
+                start_args["page_id"] = capture_page_id;
             camoufox::call_result_t start_result = camoufox::call_tool("network_capture", start_args, 10000, session_id);
             capture_info["requested"] = true;
+            capture_info["requested_explicitly"] = requested_capture_from_start;
+            capture_info["auto_for_burp_publish"] = publish_to_burp && !requested_capture_from_start;
             capture_info["pattern"] = start_args["url_pattern"];
             capture_info["capture_body"] = capture_body;
+            capture_info["page_id"] = capture_page_id;
             capture_info["clear_ok"] = clear_result.ok;
             capture_info["start_ok"] = start_result.ok;
             if (!clear_result.ok)
@@ -1802,7 +1854,7 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
         if (out.success)
         {
             const std::string page_id = json_string_param(params, "page_id", std::string());
-            camoufox::call_result_t captured = is_default_browser_session(session_id)
+            camoufox::call_result_t captured = is_default_browser_session(session_id) && page_id.empty()
                 ? camoufox::list_network_requests(200)
                 : camoufox::list_network_requests(200, session_id, page_id);
             capture_info["post_navigation_list_ok"] = captured.ok;

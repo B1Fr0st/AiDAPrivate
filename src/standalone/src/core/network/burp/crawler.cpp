@@ -382,7 +382,10 @@ bool fetch_url(const std::string& url, const std::string& user_agent, int timeou
     audit_http::send_options_t opt;
     opt.timeout_ms = timeout_ms;
     opt.follow_redirects = false;
+    opt.return_first_redirect = true;
     opt.enforce_scope = false;
+    opt.publish_exchange = true;
+    opt.exchange_source = "crawler";
     auto res = audit_http::send(raw, p.host, p.port, p.scheme == "https", opt);
     auto t1 = std::chrono::steady_clock::now();
     out_latency_ms = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
@@ -402,44 +405,10 @@ bool fetch_url(const std::string& url, const std::string& user_agent, int timeou
     {
         if (to_lower(h.first) == "content-type") out_content_type = h.second;
     }
-    diag::log_tagged_fmt("crawler", "fetch_url audit_http_ok url=%s status=%d body=%zu headers=%zu latency_ms=%llu",
-        url.c_str(), out_status, out_body.size(), out_resp_headers.size(), static_cast<unsigned long long>(out_latency_ms));
+    diag::log_tagged_fmt("crawler", "fetch_url audit_http_ok url=%s status=%d body=%zu headers=%zu latency_ms=%llu tls_version=%s alpn=%s source=%s",
+        url.c_str(), out_status, out_body.size(), out_resp_headers.size(), static_cast<unsigned long long>(out_latency_ms),
+        res->tls_version.c_str(), res->alpn.c_str(), res->source.c_str());
     return true;
-}
-
-void push_event_for_url(const std::string& url, int status, uint64_t latency, const std::string& body,
-                        const std::string& content_type,
-                        const std::vector<std::pair<std::string,std::string>>& resp_headers,
-                        const std::string& user_agent)
-{
-    parsed_url_t p = parse_url(url);
-    if (!p.valid) return;
-    exchange_observed_t ev;
-    ev.id = static_cast<uint64_t>(now_ms());
-    ev.timestamp_ms = now_ms();
-    ev.method = "GET";
-    ev.scheme = p.scheme;
-    ev.host = p.host;
-    ev.port = p.port;
-    ev.path = p.path;
-    ev.query = p.query;
-    ev.req_headers.emplace_back("User-Agent", user_agent);
-    ev.req_headers.emplace_back("Host", p.host);
-    ev.status_code = status;
-    ev.resp_headers = resp_headers;
-    ev.resp_body.assign(body.begin(), body.end());
-    ev.latency_ms = latency;
-    ev.is_h2 = false;
-    ev.is_websocket = false;
-    ev.source = "crawler";
-    if (!content_type.empty())
-    {
-        bool have_ct = false;
-        for (auto& h : ev.resp_headers) { if (to_lower(h.first) == "content-type") { have_ct = true; break; } }
-        if (!have_ct) ev.resp_headers.emplace_back("Content-Type", content_type);
-    }
-    aida::events::publish(kExchangeObservedEvent, ev);
-    sitemap::ingest_exchange(ev);
 }
 
 bool host_rate_acquire(host_rate_t& hr, int rate_per_host, std::atomic<bool>& stop_flag)
@@ -653,8 +622,6 @@ void worker_step(std::shared_ptr<crawl_t> ctx, queue_item_t item)
 
     if (ok)
     {
-        push_event_for_url(item.url, status, lat, body, content_type, resp_headers, c.config.user_agent);
-
         if (status >= 300 && status < 400)
         {
             for (auto& h : resp_headers)
@@ -762,6 +729,7 @@ bool initialize()
         diag::log_tagged_fmt("crawler", "initialize already_done");
         return true;
     }
+    sitemap::initialize();
     diag::log_tagged_fmt("crawler", "initialize success");
     return true;
 }

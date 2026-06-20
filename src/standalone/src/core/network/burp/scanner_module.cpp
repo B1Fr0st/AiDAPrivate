@@ -190,6 +190,148 @@ double body_length_ratio(const exchange_observed_t& a, const exchange_observed_t
 
 namespace {
 
+uint64_t fnv1a64(const std::vector<uint8_t>& data)
+{
+    uint64_t h = 1469598103934665603ull;
+    for (uint8_t b : data) {
+        h ^= static_cast<uint64_t>(b);
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+std::string lower_ascii(std::string s)
+{
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return s;
+}
+
+std::string header_value_ci(const std::vector<std::pair<std::string, std::string>>& headers, const std::string& name)
+{
+    const std::string target = lower_ascii(name);
+    for (const auto& h : headers) {
+        if (lower_ascii(h.first) == target)
+            return h.second;
+    }
+    return {};
+}
+
+bool body_contains_ci_bytes(const std::vector<uint8_t>& body, const std::string& needle)
+{
+    if (needle.empty() || body.empty() || needle.size() > body.size())
+        return false;
+    std::string nl = lower_ascii(needle);
+    for (size_t i = 0; i + nl.size() <= body.size(); ++i) {
+        bool match = true;
+        for (size_t j = 0; j < nl.size(); ++j) {
+            const char b = static_cast<char>(std::tolower(static_cast<unsigned char>(body[i + j])));
+            if (b != nl[j]) { match = false; break; }
+        }
+        if (match)
+            return true;
+    }
+    return false;
+}
+
+response_diff_t build_response_diff(int baseline_status,
+                                    const std::vector<std::pair<std::string, std::string>>& baseline_headers,
+                                    const std::vector<uint8_t>& baseline_body,
+                                    const exchange_observed_t& resp,
+                                    const std::vector<response_marker_t>& removed_markers,
+                                    const std::vector<response_marker_t>& added_markers)
+{
+    response_diff_t d;
+    d.baseline_known = baseline_status > 0 || !baseline_body.empty() || !baseline_headers.empty();
+    d.baseline_status = baseline_status;
+    d.response_status = resp.status_code;
+    d.same_status = baseline_status > 0 && baseline_status == resp.status_code;
+    d.status_changed = baseline_status > 0 && baseline_status != resp.status_code;
+    d.baseline_body_length = baseline_body.size();
+    d.response_body_length = resp.resp_body.size();
+    d.body_length_delta = d.baseline_body_length > d.response_body_length
+        ? d.baseline_body_length - d.response_body_length
+        : d.response_body_length - d.baseline_body_length;
+    if (d.baseline_body_length == 0 && d.response_body_length == 0) d.body_length_ratio = 1.0;
+    else if (d.baseline_body_length == 0 || d.response_body_length == 0) d.body_length_ratio = 0.0;
+    else d.body_length_ratio = static_cast<double>(std::min(d.baseline_body_length, d.response_body_length)) /
+                               static_cast<double>(std::max(d.baseline_body_length, d.response_body_length));
+    d.baseline_body_hash = fnv1a64(baseline_body);
+    d.response_body_hash = fnv1a64(resp.resp_body);
+    d.body_hash_changed = d.baseline_body_hash != d.response_body_hash;
+    d.baseline_location = header_value_ci(baseline_headers, "Location");
+    d.response_location = header_value_ci(resp.resp_headers, "Location");
+    d.location_changed = d.baseline_location != d.response_location;
+    d.baseline_content_type = header_value_ci(baseline_headers, "Content-Type");
+    d.response_content_type = header_value_ci(resp.resp_headers, "Content-Type");
+    d.content_type_changed = lower_ascii(d.baseline_content_type) != lower_ascii(d.response_content_type);
+
+    for (const auto& marker : removed_markers) {
+        if (marker.text.empty()) continue;
+        if (body_contains_ci_bytes(baseline_body, marker.text) && !body_contains_ci_bytes(resp.resp_body, marker.text))
+            d.removed_markers.push_back(marker.label.empty() ? marker.text : marker.label);
+    }
+    for (const auto& marker : added_markers) {
+        if (marker.text.empty()) continue;
+        if (!body_contains_ci_bytes(baseline_body, marker.text) && body_contains_ci_bytes(resp.resp_body, marker.text))
+            d.added_markers.push_back(marker.label.empty() ? marker.text : marker.label);
+    }
+    d.meaningful_body_delta = d.body_hash_changed &&
+        (d.body_length_delta > 64 || d.body_length_ratio < 0.98 ||
+         !d.removed_markers.empty() || !d.added_markers.empty());
+
+    std::ostringstream os;
+    os << "baseline_status=" << d.baseline_status
+       << " response_status=" << d.response_status
+       << " status_delta=" << (d.status_changed ? 1 : 0)
+       << " location_delta=" << (d.location_changed ? 1 : 0)
+       << " content_type_delta=" << (d.content_type_changed ? 1 : 0)
+       << " body_hash_delta=" << (d.body_hash_changed ? 1 : 0)
+       << " baseline_body=" << d.baseline_body_length
+       << " response_body=" << d.response_body_length
+       << " body_delta=" << d.body_length_delta
+       << " body_ratio=" << d.body_length_ratio;
+    if (!d.response_location.empty()) os << " response_location=" << d.response_location;
+    if (!d.removed_markers.empty()) {
+        os << " removed_markers=";
+        for (size_t i = 0; i < d.removed_markers.size(); ++i) {
+            if (i) os << ",";
+            os << d.removed_markers[i];
+        }
+    }
+    if (!d.added_markers.empty()) {
+        os << " added_markers=";
+        for (size_t i = 0; i < d.added_markers.size(); ++i) {
+            if (i) os << ",";
+            os << d.added_markers[i];
+        }
+    }
+    d.evidence = os.str();
+    diag::log_tagged_fmt("scanner", "response_diff %s", d.evidence.c_str());
+    return d;
+}
+
+}
+
+response_diff_t compare_response_to_baseline(const exchange_observed_t& resp,
+                                             const module_context_t& ctx,
+                                             const std::vector<response_marker_t>& removed_markers,
+                                             const std::vector<response_marker_t>& added_markers)
+{
+    return build_response_diff(ctx.baseline_status_code, ctx.baseline_response_headers,
+                               ctx.baseline_response_body, resp, removed_markers, added_markers);
+}
+
+response_diff_t compare_responses(const exchange_observed_t& baseline,
+                                  const exchange_observed_t& resp,
+                                  const std::vector<response_marker_t>& removed_markers,
+                                  const std::vector<response_marker_t>& added_markers)
+{
+    return build_response_diff(baseline.status_code, baseline.resp_headers, baseline.resp_body,
+                               resp, removed_markers, added_markers);
+}
+
+namespace {
+
 std::string snippet_around(const std::vector<uint8_t>& body, const std::string& needle, size_t pad)
 {
     if (body.empty() || needle.empty()) return std::string();

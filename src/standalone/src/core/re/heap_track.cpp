@@ -205,6 +205,7 @@ json session_json(const store::heap_session_t& session)
     out["max_captures"] = session.max_captures;
     out["active"] = session.active;
     out["started_ms"] = session.started_ms;
+    out["elapsed_ms"] = session.started_ms != 0 && unix_time_ms() >= session.started_ms ? unix_time_ms() - session.started_ms : 0;
     out["rtl_allocate_heap"] = session.rtl_allocate_heap ? json(sa_format_address(session.rtl_allocate_heap)) : json(nullptr);
     out["hw_slot"] = session.hw_slot >= 0 ? json(session.hw_slot) : json(nullptr);
     out["thread_count"] = session.tids.size();
@@ -213,6 +214,11 @@ json session_json(const store::heap_session_t& session)
     out["positive_capture_count"] = session.captures.size();
     out["snapshot_capture_count"] = session.hw_slot >= 0 && !session.tids.empty() ? 0 : session.captures.size();
     out["event_capture_count"] = session.hw_slot >= 0 && !session.tids.empty() ? session.captures.size() : 0;
+    out["saw_allocation_event"] = session.hw_slot >= 0 && !session.tids.empty() && !session.captures.empty();
+    out["mutation_observed"] = !session.captures.empty();
+    out["functional_success"] = !session.captures.empty();
+    if (session.captures.empty())
+        out["zero_capture_reason"] = session.active ? "heap tracking session is active but no allocation or snapshot-diff captures have been observed yet" : "heap tracking session stopped with zero allocation or snapshot-diff captures";
     out["backend"] = session.hw_slot >= 0 && !session.tids.empty() ? "rtlallocateheap_return_debug_event" : "snapshot_diff";
     out["event_capture_active"] = session.hw_slot >= 0 && !session.tids.empty();
     out["snapshot_diff_available"] = true;
@@ -739,6 +745,7 @@ tool_result_t start_session(const json& params)
     result["fallback_reason"] = event_started ? json(nullptr) : json(event_error.empty() ? "snapshot_diff backend selected" : event_error);
     result["stimulus_required"] = !event_started;
     result["pre_stimulus"] = session.captures.empty();
+    result["observation_state"] = session.captures.empty() ? "awaiting_stimulus_or_results_poll" : "captures_observed";
     result["functional_snapshot_evidence"] = false;
     result["functional_event_evidence"] = event_started && !session.captures.empty();
     result["evidence"] = {
@@ -746,7 +753,8 @@ tool_result_t start_session(const json& params)
         {"debug_event_consumer", event_started},
         {"return_value_capture", event_started},
         {"snapshot_baseline_count", session.baseline.size()},
-        {"snapshot_baseline_skipped", skip_initial_snapshot}
+        {"snapshot_baseline_skipped", skip_initial_snapshot},
+        {"zero_capture_expected_on_start", session.captures.empty()}
     };
     return tool_result_t::ok(event_started ? "Heap tracking session started with RtlAllocateHeap return capture." : "Heap tracking session started in snapshot-diff mode.", result);
 }
@@ -785,6 +793,8 @@ tool_result_t results_session(const json& params)
     result["returned"] = result["events"].size();
     result["functional_snapshot_evidence"] = (session.hw_slot < 0 || session.tids.empty()) && session.captures.size() > 0;
     result["functional_event_evidence"] = session.hw_slot >= 0 && !session.tids.empty() && session.captures.size() > 0;
+    result["observation_complete"] = true;
+    result["saw_allocation_or_mutation"] = session.captures.size() > 0;
     result["evidence"] = {
         {"backend", result["backend"]},
         {"snapshot_diff_baseline_count", session.baseline.size()},
@@ -794,6 +804,8 @@ tool_result_t results_session(const json& params)
         {"bounded_focus_capture", focused},
         {"bounded_focus_only", focus_only}
     };
+    if (session.captures.empty())
+        return tool_result_t::error("Heap tracking produced zero captures; no allocation or snapshot-diff mutation evidence was observed.", result);
     return tool_result_t::ok(result);
 }
 
@@ -805,9 +817,22 @@ tool_result_t stop_session(const json& params)
     if (id.empty())
         return tool_result_t::error("'session_id' is required for stop.");
     store::heap_session_t session;
-    if (!store::remove_heap_session(id, &session))
+    if (!store::find_heap_session(id, session))
         return tool_result_t::error("Unknown heap tracking session.");
     active_process_scope_t scope(session.pid);
+    const bool focus_only = bool_param(params, "focus_only", false) || bool_param(params, "bounded_only", false);
+    const bool focused = scope.ok() ? append_focus_captures(session, params) : false;
+    if (scope.ok() && (session.hw_slot < 0 || session.tids.empty()))
+    {
+        if (!focus_only)
+            append_snapshot_diff(session);
+        else
+            store::update_heap_session(session);
+    }
+    else
+        store::find_heap_session(id, session);
+    if (!store::remove_heap_session(id, &session))
+        return tool_result_t::error("Unknown heap tracking session.");
     if (scope.ok())
         clear_session_breakpoints(session);
     if (session.hw_slot >= 0)
@@ -817,10 +842,17 @@ tool_result_t stop_session(const json& params)
     result["stopped"] = true;
     result["functional_snapshot_evidence"] = (session.hw_slot < 0 || session.tids.empty()) && session.captures.size() > 0;
     result["functional_event_evidence"] = session.hw_slot >= 0 && !session.tids.empty() && session.captures.size() > 0;
+    result["observation_complete"] = true;
+    result["saw_allocation_or_mutation"] = session.captures.size() > 0;
     result["evidence"] = {
         {"breakpoints_cleared", session.hw_slot >= 0},
-        {"debug_event_consumer_stopped", session.hw_slot >= 0}
+        {"debug_event_consumer_stopped", session.hw_slot >= 0},
+        {"snapshot_diff_checked", scope.ok() && (session.hw_slot < 0 || session.tids.empty()) && !focus_only},
+        {"bounded_focus_capture", focused},
+        {"bounded_focus_only", focus_only}
     };
+    if (session.captures.empty())
+        return tool_result_t::error("Heap tracking stopped with zero captures; no allocation or snapshot-diff mutation evidence was observed.", result);
     return tool_result_t::ok("Heap tracking session stopped.", result);
 }
 }

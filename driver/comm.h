@@ -604,6 +604,10 @@ namespace voyager {
 
 
         static constexpr std::size_t MAX_WFP_CALLOUTS = 256;
+        static constexpr std::uint32_t WFP_ENTRY_TYPE_CALLOUT = 0;
+        static constexpr std::uint32_t WFP_ENTRY_TYPE_FILTER = 1;
+        static constexpr std::uint32_t WFP_AIDA_MATCH_SUBLAYER = 0x00000001u;
+        static constexpr std::uint32_t WFP_AIDA_MATCH_ACTION_CALLOUT = 0x00000002u;
         static constexpr std::size_t MAX_SOCKET_HANDLES = 512;
         static constexpr std::size_t SNIFF_MAX_CAPTURES = 16;
         static constexpr std::size_t SNIFF_MAX_BUF_SIZE = 2048;
@@ -621,15 +625,21 @@ namespace voyager {
             std::uint64_t notify_fn;
             std::uint64_t flow_delete_fn;
             std::uint64_t owning_module_base;
+            std::uint64_t filter_id;
             std::uint32_t callout_id;
             std::uint32_t layer_id;
             std::uint32_t flags;
-            std::uint32_t padding0;
+            std::uint32_t entry_type;
             GUID_COMPAT   callout_key;
             GUID_COMPAT   applicable_layer;
+            GUID_COMPAT   sublayer_key;
+            std::uint32_t action_type;
+            std::uint32_t provider_present;
+            std::uint32_t aida_match_reason;
+            std::uint32_t padding0;
             char          owning_module[64];
         };
-        static_assert(sizeof(wfp_callout_entry) == 144, "wfp_callout_entry size mismatch");
+        static_assert(sizeof(wfp_callout_entry) == 184, "wfp_callout_entry size mismatch");
 
         struct wfp_callout_enum_request {
             char          filter_module[64];
@@ -1556,11 +1566,17 @@ namespace voyager {
             std::uint64_t notify_fn;
             std::uint64_t flow_delete_fn;
             std::uint64_t owning_module_base;
+            std::uint64_t filter_id;
             std::uint32_t callout_id;
             std::uint32_t layer_id;
             std::uint32_t flags;
+            std::uint32_t entry_type;
+            std::uint32_t action_type;
+            std::uint32_t provider_present;
+            std::uint32_t aida_match_reason;
             std::string   callout_key_str;
             std::string   applicable_layer_str;
+            std::string   sublayer_key_str;
             std::string   owning_module;
         };
         std::vector<wfp_callout_info> enumerate_wfp_callouts(const std::string& filter_module = {}) noexcept;

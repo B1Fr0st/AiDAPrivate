@@ -37,6 +37,38 @@ struct module_context_t
     int                               baseline_status_code = 0;
 };
 
+struct response_marker_t
+{
+    std::string label;
+    std::string text;
+};
+
+struct response_diff_t
+{
+    bool status_changed = false;
+    bool location_changed = false;
+    bool content_type_changed = false;
+    bool body_hash_changed = false;
+    bool meaningful_body_delta = false;
+    bool baseline_known = false;
+    bool same_status = false;
+    int baseline_status = 0;
+    int response_status = 0;
+    uint64_t baseline_body_hash = 0;
+    uint64_t response_body_hash = 0;
+    size_t baseline_body_length = 0;
+    size_t response_body_length = 0;
+    size_t body_length_delta = 0;
+    double body_length_ratio = 1.0;
+    std::string baseline_location;
+    std::string response_location;
+    std::string baseline_content_type;
+    std::string response_content_type;
+    std::vector<std::string> removed_markers;
+    std::vector<std::string> added_markers;
+    std::string evidence;
+};
+
 using send_fn_t = std::function<std::optional<exchange_observed_t>(const std::vector<uint8_t>& raw_request,
                                                                    const probe_t& probe)>;
 
@@ -65,6 +97,14 @@ std::string                 random_marker(const std::string& prefix);
 bool                        body_contains(const exchange_observed_t& resp, const std::string& needle);
 bool                        body_contains_ci(const exchange_observed_t& resp, const std::string& needle);
 double                      body_length_ratio(const exchange_observed_t& a, const exchange_observed_t& b);
+response_diff_t             compare_response_to_baseline(const exchange_observed_t& resp,
+                                                         const module_context_t& ctx,
+                                                         const std::vector<response_marker_t>& removed_markers = {},
+                                                         const std::vector<response_marker_t>& added_markers = {});
+response_diff_t             compare_responses(const exchange_observed_t& baseline,
+                                              const exchange_observed_t& resp,
+                                              const std::vector<response_marker_t>& removed_markers = {},
+                                              const std::vector<response_marker_t>& added_markers = {});
 
 issue_t                     make_issue(const std::string& type_key,
                                        const std::string& name,

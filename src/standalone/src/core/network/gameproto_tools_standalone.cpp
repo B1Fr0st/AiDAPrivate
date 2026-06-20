@@ -177,6 +177,8 @@ tool_result_t handle_gameproto_replay(const json& raw_params)
         json result = game_protocol::record_replay_session(options, error);
         if (!error.empty())
             return tool_result_t::error(error);
+        if (result.value("packet_count", 0u) == 0)
+            return tool_result_t::error(OBFSTR("Game protocol replay record completed with zero captured packets."), result);
         return tool_result_t::ok(OBFSTR("Game protocol replay session recorded."), result);
     }
 
@@ -188,6 +190,8 @@ tool_result_t handle_gameproto_replay(const json& raw_params)
             error);
         if (!error.empty())
             return tool_result_t::error(error);
+        if (result.value("packet_count", 0u) == 0)
+            return tool_result_t::error(OBFSTR("Game protocol replay recording stopped with zero captured packets."), result);
         return tool_result_t::ok(OBFSTR("Game protocol replay recording stopped."), result);
     }
 
@@ -219,6 +223,8 @@ tool_result_t handle_gameproto_replay(const json& raw_params)
         std::string error;
         if (!game_protocol::replay_session(options, result, error))
             return tool_result_t::error(error.empty() ? OBFSTR("replay failed") : error);
+        if (result.value("sent_packet_count", 0u) == 0)
+            return tool_result_t::error(OBFSTR("Game protocol replay completed without sending a packet."), result);
         return tool_result_t::ok(OBFSTR("Game protocol replay attempted with bounded packet caps."), result);
     }
 

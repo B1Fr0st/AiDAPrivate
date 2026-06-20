@@ -454,24 +454,152 @@ namespace {
         loaded_out = false;
         error_out = false;
         fn_out.clear();
+        struct engine_metrics_t {
+            bool metrics_present = false;
+            bool metrics_error = false;
+            bool metrics_complete = false;
+            size_t pseudocode_bytes = 0;
+            size_t pseudocode_lines = 0;
+            const char* source = "";
+            bool cache_found = false;
+            bool cache_complete = false;
+            bool cache_error = false;
+            size_t cache_bytes = 0;
+            size_t cache_lines = 0;
+            uint64_t current_addr = 0;
+            bool current_complete = false;
+            bool current_error = false;
+            size_t current_bytes = 0;
+            size_t current_lines = 0;
+            bool engine_decompiling = false;
+            bool next_pending = false;
+            uint64_t next_addr = 0;
+            bool cancel = false;
+        };
+        auto count_lines_local = [](const std::string& text) -> size_t {
+            if (text.empty())
+                return 0;
+            size_t lines = 1;
+            for (char ch : text) {
+                if (ch == '\n')
+                    ++lines;
+            }
+            if (!text.empty() && text.back() == '\n' && lines > 0)
+                --lines;
+            return lines;
+        };
+        auto read_engine_metrics = [&]() -> engine_metrics_t {
+            engine_metrics_t out;
+            std::lock_guard<std::mutex> lk(decompiler_engine::g_state.mutex);
+            out.engine_decompiling = decompiler_engine::g_state.decompiling.load(std::memory_order_acquire);
+            out.next_pending = decompiler_engine::g_state.next_pending.load(std::memory_order_acquire);
+            out.next_addr = decompiler_engine::g_state.next_addr.load(std::memory_order_acquire);
+            out.cancel = decompiler_engine::g_state.cancel.load(std::memory_order_acquire);
+            out.current_addr = decompiler_engine::g_state.current.function_addr;
+            out.current_complete = decompiler_engine::g_state.current.complete;
+            out.current_error = decompiler_engine::g_state.current.is_error;
+            out.current_bytes = decompiler_engine::g_state.current.pseudocode.size();
+            out.current_lines = count_lines_local(decompiler_engine::g_state.current.pseudocode);
+            auto it = decompiler_engine::g_state.cache.find(addr);
+            if (it != decompiler_engine::g_state.cache.end()) {
+                out.cache_found = true;
+                out.cache_complete = it->second.complete;
+                out.cache_error = it->second.is_error;
+                out.cache_bytes = it->second.pseudocode.size();
+                out.cache_lines = count_lines_local(it->second.pseudocode);
+                if (it->second.complete) {
+                    out.metrics_present = true;
+                    out.metrics_complete = it->second.complete;
+                    out.metrics_error = it->second.is_error;
+                    out.pseudocode_bytes = out.cache_bytes;
+                    out.pseudocode_lines = out.cache_lines;
+                    out.source = "cache";
+                }
+            }
+            if (!out.metrics_present &&
+                decompiler_engine::g_state.current.function_addr == addr &&
+                decompiler_engine::g_state.current.complete) {
+                out.metrics_present = true;
+                out.metrics_complete = decompiler_engine::g_state.current.complete;
+                out.metrics_error = decompiler_engine::g_state.current.is_error;
+                out.pseudocode_bytes = out.current_bytes;
+                out.pseudocode_lines = out.current_lines;
+                out.source = "current";
+            }
+            return out;
+        };
+        auto log_wait_state = [&](const char* reason, int waited_ms, bool found, size_t total,
+                                  const pseudocode_view::tab_info_t& tab,
+                                  const engine_metrics_t& metrics) {
+            log_msg(hf, tag,
+                "STATE -- decompile_wait_%s tab addr=0x%016llX waited_ms=%d timeout_ms=%d found=%d total_tabs=%zu loaded=%d decompiling=%d is_error=%d function=\"%s\" metrics=%d source=\"%s\" complete=%d engine_error=%d bytes=%zu lines=%zu",
+                reason ? reason : "state",
+                (unsigned long long)addr,
+                waited_ms,
+                timeout_ms,
+                found ? 1 : 0,
+                total,
+                found ? (int)tab.loaded : 0,
+                found ? (int)tab.decompiling : 0,
+                found ? (int)tab.is_error : 0,
+                found ? tab.function_name.c_str() : "",
+                metrics.metrics_present ? 1 : 0,
+                metrics.source,
+                metrics.metrics_complete ? 1 : 0,
+                metrics.metrics_error ? 1 : 0,
+                metrics.pseudocode_bytes,
+                metrics.pseudocode_lines);
+            log_msg(hf, tag,
+                "STATE -- decompile_wait_%s engine current_addr=0x%016llX current_complete=%d current_error=%d current_bytes=%zu current_lines=%zu cache_found=%d cache_complete=%d cache_error=%d cache_bytes=%zu cache_lines=%zu engine_decompiling=%d next_pending=%d next_addr=0x%016llX cancel=%d",
+                reason ? reason : "state",
+                (unsigned long long)metrics.current_addr,
+                metrics.current_complete ? 1 : 0,
+                metrics.current_error ? 1 : 0,
+                metrics.current_bytes,
+                metrics.current_lines,
+                metrics.cache_found ? 1 : 0,
+                metrics.cache_complete ? 1 : 0,
+                metrics.cache_error ? 1 : 0,
+                metrics.cache_bytes,
+                metrics.cache_lines,
+                metrics.engine_decompiling ? 1 : 0,
+                metrics.next_pending ? 1 : 0,
+                (unsigned long long)metrics.next_addr,
+                metrics.cancel ? 1 : 0);
+        };
         const int step_ms = 50;
         int waited = 0;
         for (;;) {
             auto tabs = pseudocode_view::snapshot_tabs();
             bool found = false;
+            pseudocode_view::tab_info_t observed{};
             for (const auto& t : tabs) {
                 if (t.addr != addr) continue;
                 found = true;
+                observed = t;
                 fn_out = t.function_name;
-                if (!t.decompiling) {
-                    loaded_out = t.loaded;
-                    error_out = t.is_error;
-                    return true;
-                }
                 break;
             }
-            if (!found && waited >= timeout_ms) return false;
-            if (waited >= timeout_ms) return true;
+            engine_metrics_t metrics = read_engine_metrics();
+            if (found) {
+                const bool has_nonzero_metrics = metrics.metrics_present &&
+                    !metrics.metrics_error &&
+                    metrics.pseudocode_bytes > 0 &&
+                    metrics.pseudocode_lines > 0 &&
+                    (observed.loaded || std::strcmp(metrics.source, "cache") == 0);
+                const bool explicit_error = observed.is_error ||
+                    (metrics.metrics_present && metrics.metrics_error);
+                if (has_nonzero_metrics || explicit_error) {
+                    loaded_out = observed.loaded || has_nonzero_metrics;
+                    error_out = observed.is_error || metrics.metrics_error;
+                    return true;
+                }
+            }
+            if (waited >= timeout_ms) {
+                log_wait_state(found ? "timeout_terminal_state_missing" : "timeout_tab_missing",
+                    waited, found, tabs.size(), observed, metrics);
+                return false;
+            }
             Sleep(step_ms);
             waited += step_ms;
         }

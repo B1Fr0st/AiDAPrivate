@@ -11,6 +11,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -947,6 +948,9 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 		uint64_t job_start = GetTickCount64();
 		const DWORD worker_pid = GetCurrentProcessId();
 		const DWORD worker_tid = GetCurrentThreadId();
+		bool parser_called = false;
+		bool parse_monitor_unavailable = false;
+		std::string parse_monitor_error;
 		try {
 			diag::log_tagged_fmt("symbol_store", "explicit_pdb_parse_start module=%s path='%s' file_size=%llu generation=%llu worker_pid=%lu worker_tid=%lu parser_diag=\"%s\"",
 				mod_copy.c_str(),
@@ -1018,7 +1022,8 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 			std::atomic<float> parse_progress{0.f};
 			std::string search_path = std::filesystem::path(path_copy).parent_path().string();
 			std::atomic<bool> parse_monitor_done{false};
-			std::thread parse_monitor([&]() {
+			std::unique_ptr<std::thread> parse_monitor;
+			auto parse_monitor_body = [&]() {
 				uint64_t last_log_ms = 0;
 				while (!parse_monitor_done.load(std::memory_order_acquire)) {
 					Sleep(1000);
@@ -1058,14 +1063,64 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 							parser_diag.c_str());
 					}
 				}
-			});
+			};
+			try {
+				parse_monitor = std::make_unique<std::thread>(parse_monitor_body);
+			} catch (const std::system_error& ex) {
+				parse_monitor_unavailable = true;
+				parse_monitor_error = ex.what();
+				const std::string parser_diag = pdb_parser::dbghelp_load_diagnostic();
+				auto wq = work_queue::stats();
+				auto sq = work_queue::service_stats();
+				auto cq = critical_work_queue::stats();
+				{
+					std::lock_guard<std::mutex> lk(g_state.mutex);
+					auto it = g_state.modules.find(mod_copy);
+					if (it != g_state.modules.end() && it->second.load_generation == generation && it->second.loading && it->second.load_phase == "parse") {
+						auto& ms = it->second;
+						ms.parse_diagnostic = parser_diag;
+						ms.load_failure_detail = std::string("parse monitor unavailable: ") + parse_monitor_error + " | " + parser_diag;
+					}
+				}
+				diag::log_tagged_fmt("symbol_store",
+					"explicit_pdb_parse_monitor_unavailable module=%s generation=%llu path='%s' file_size=%llu err=%s code=%d category=%s parser_called=%d parser_diag=\"%s\" work_pending=%zu work_active=%u work_rejected=%llu service_pending=%zu service_active=%u service_rejected=%llu critical_pending=%zu critical_active=%u critical_rejected=%llu",
+					mod_copy.c_str(),
+					static_cast<unsigned long long>(generation),
+					path_copy.c_str(),
+					static_cast<unsigned long long>(file_size_copy),
+					ex.what(),
+					ex.code().value(),
+					ex.code().category().name(),
+					parser_called ? 1 : 0,
+					parser_diag.c_str(),
+					wq.pending,
+					wq.active,
+					static_cast<unsigned long long>(wq.rejected),
+					sq.pending,
+					sq.active,
+					static_cast<unsigned long long>(sq.rejected),
+					cq.pending,
+					cq.active,
+					static_cast<unsigned long long>(cq.rejected));
+			}
 			auto stop_parse_monitor = [&]() {
 				parse_monitor_done.store(true, std::memory_order_release);
-				if (parse_monitor.joinable())
-					parse_monitor.join();
+				if (parse_monitor && parse_monitor->joinable())
+					parse_monitor->join();
 			};
 			bool parse_ok = false;
 			try {
+				diag::log_tagged_fmt("symbol_store",
+					"explicit_pdb_parse_call_enter module=%s generation=%llu path='%s' file_size=%llu search_path='%s' monitor_available=%d monitor_error='%s' parser_diag=\"%s\"",
+					mod_copy.c_str(),
+					static_cast<unsigned long long>(generation),
+					path_copy.c_str(),
+					static_cast<unsigned long long>(file_size_copy),
+					search_path.c_str(),
+					parse_monitor ? 1 : 0,
+					parse_monitor_error.c_str(),
+					pdb_parser::dbghelp_load_diagnostic().c_str());
+				parser_called = true;
 				parse_ok = pdb_parser::parse_pdb(path_copy, search_path, info, &parse_progress);
 				stop_parse_monitor();
 			} catch (...) {
@@ -1180,14 +1235,28 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 		} catch (const std::exception& ex) {
 			char status[512];
 			const std::string parser_diag = pdb_parser::dbghelp_load_diagnostic();
-			snprintf(status, sizeof(status), "Failed to parse user-supplied PDB: %s; %s", ex.what(), parser_diag.c_str());
-			std::string detail = std::string(ex.what()) + " | " + parser_diag;
-			publish_failed_load_result(mod_copy, generation, status, "explicit_pdb_parse_exception", detail.c_str(), GetTickCount64() - job_start);
+			if (parser_called) {
+				snprintf(status, sizeof(status), "Failed to parse user-supplied PDB: %s; %s", ex.what(), parser_diag.c_str());
+			} else {
+				snprintf(status, sizeof(status), "PDB pre-parser resource failure: %s; %s", ex.what(), parser_diag.c_str());
+			}
+			std::string detail = std::string("parser_called=") + (parser_called ? "1" : "0") +
+				" monitor_unavailable=" + (parse_monitor_unavailable ? "1" : "0") +
+				" monitor_error='" + parse_monitor_error + "' exception='" + ex.what() + "' | " + parser_diag;
+			publish_failed_load_result(mod_copy, generation, status,
+				parser_called ? "explicit_pdb_parse_exception" : "explicit_pdb_preparser_exception",
+				detail.c_str(), GetTickCount64() - job_start);
 		} catch (...) {
 			const std::string parser_diag = pdb_parser::dbghelp_load_diagnostic();
-			std::string status = "Failed to parse user-supplied PDB: unknown exception; " + parser_diag;
-			std::string detail = "<unknown> | " + parser_diag;
-			publish_failed_load_result(mod_copy, generation, status, "explicit_pdb_parse_exception", detail.c_str(), GetTickCount64() - job_start);
+			std::string status = parser_called
+				? "Failed to parse user-supplied PDB: unknown exception; " + parser_diag
+				: "PDB pre-parser resource failure: unknown exception; " + parser_diag;
+			std::string detail = std::string("parser_called=") + (parser_called ? "1" : "0") +
+				" monitor_unavailable=" + (parse_monitor_unavailable ? "1" : "0") +
+				" monitor_error='" + parse_monitor_error + "' exception='<unknown>' | " + parser_diag;
+			publish_failed_load_result(mod_copy, generation, status,
+				parser_called ? "explicit_pdb_parse_exception" : "explicit_pdb_preparser_exception",
+				detail.c_str(), GetTickCount64() - job_start);
 		}
 	};
 	auto wq_before_post = work_queue::stats();

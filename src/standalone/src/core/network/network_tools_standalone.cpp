@@ -1650,6 +1650,9 @@ tool_result_t network_enumerate_wfp_callouts(const json& params)
     json arr = json::array();
     for (const auto& c : callouts) {
         json entry;
+        const bool is_filter = c.entry_type == 1;
+        entry["entry_type"] = is_filter ? "filter" : "callout";
+        entry["entry_type_id"] = c.entry_type;
         entry["callout_id"] = c.callout_id;
         entry["layer_id"] = c.layer_id;
         entry["owning_module"] = c.owning_module;
@@ -1660,9 +1663,25 @@ tool_result_t network_enumerate_wfp_callouts(const json& params)
         qsnprintf(addr_buf, sizeof(addr_buf), "0x%llX", (unsigned long long)c.owning_module_base);
         entry["module_base"] = addr_buf;
         entry["flags"] = c.flags;
+        entry["provider_present"] = c.provider_present != 0;
+        entry["aida_match_reason"] = c.aida_match_reason;
+        json reasons = json::array();
+        if ((c.aida_match_reason & 0x00000001u) != 0)
+            reasons.push_back("sublayer");
+        if ((c.aida_match_reason & 0x00000002u) != 0)
+            reasons.push_back("action_callout");
+        entry["aida_match_reasons"] = reasons;
+        if (is_filter) {
+            qsnprintf(addr_buf, sizeof(addr_buf), "0x%llX", (unsigned long long)c.filter_id);
+            entry["filter_id"] = addr_buf;
+            entry["layer"] = c.applicable_layer_str;
+            entry["sublayer_key"] = c.sublayer_key_str;
+            entry["action_type"] = c.action_type;
+            entry["action_callout_key"] = c.callout_key_str;
+        }
         arr.push_back(entry);
     }
-    return tool_result_t::ok(std::to_string(callouts.size()) + OBFSTR(" WFP callouts found"), arr);
+    return tool_result_t::ok(std::to_string(callouts.size()) + OBFSTR(" WFP entries found"), arr);
 }
 
 tool_result_t network_get_socket_handles(const json& params)
@@ -3606,10 +3625,49 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 diag::log_tagged_fmt("net_tools", "network_pg_sniff install pid=%u addr=0x%llX size=%llu max_drain=%u", pid, static_cast<unsigned long long>(addr), static_cast<unsigned long long>(size), max_records);
                 uint32_t sid = page_guard_engine::g_pg_engine.install(pid, addr, size, true, max_records);
                 diag::log_tagged_fmt("net_tools", "network_pg_sniff install sid=%u max_drain=%u elapsed_ms=%llu", sid, max_records, static_cast<unsigned long long>(GetTickCount64() - t0));
-                if (sid == 0)
-                    return tool_result_t::error("Failed to install page guard. "
-                                                "Ensure the driver is connected and the "
-                                                "target address is valid.");
+                if (sid == 0) {
+                    auto failure = page_guard_engine::g_pg_engine.last_install_failure();
+                    json d;
+                    char buf[32];
+                    d["success"] = false;
+                    d["reason"] = failure.reason.empty() ? "install_failed" : failure.reason;
+                    d["detail"] = failure.detail;
+                    d["pid"] = failure.pid != 0 ? failure.pid : pid;
+                    qsnprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(failure.requested_addr != 0 ? failure.requested_addr : addr));
+                    d["requested_address"] = buf;
+                    d["requested_size"] = failure.requested_size != 0 ? failure.requested_size : size;
+                    qsnprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(failure.guard_addr));
+                    d["guard_address"] = buf;
+                    d["guard_size"] = failure.guard_size;
+                    qsnprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(failure.region_base));
+                    d["region_base"] = buf;
+                    d["region_size"] = failure.region_size;
+                    d["region_state"] = failure.region_state;
+                    d["region_protect"] = failure.region_protect;
+                    d["region_type"] = failure.region_type;
+                    d["attempted_protect"] = failure.attempted_protect;
+                    d["win32_error"] = failure.win32_error;
+                    d["driver_status"] = failure.driver_status;
+                    d["driver_last_error"] = failure.driver_last_error;
+                    const std::string reason = d["reason"].get<std::string>();
+                    diag::log_tagged_fmt("net_tools", "network_pg_sniff install_failed reason=%s detail=%s requested=0x%llX size=%llu guard=0x%llX guard_size=%llu region_base=0x%llX region_size=%llu state=0x%08X protect=0x%08X type=0x%08X attempted=0x%08X win32=%u driver_status=%s driver_last_error=%s",
+                        reason.c_str(),
+                        failure.detail.c_str(),
+                        static_cast<unsigned long long>(failure.requested_addr),
+                        static_cast<unsigned long long>(failure.requested_size),
+                        static_cast<unsigned long long>(failure.guard_addr),
+                        static_cast<unsigned long long>(failure.guard_size),
+                        static_cast<unsigned long long>(failure.region_base),
+                        static_cast<unsigned long long>(failure.region_size),
+                        failure.region_state,
+                        failure.region_protect,
+                        failure.region_type,
+                        failure.attempted_protect,
+                        failure.win32_error,
+                        failure.driver_status.c_str(),
+                        failure.driver_last_error.c_str());
+                    return tool_result_t::error(std::string("Failed to install page guard: ") + reason, "page_guard_install_failed", d);
+                }
                 json r;
                 r["session_id"] = sid;
                 r["pid"]        = pid;

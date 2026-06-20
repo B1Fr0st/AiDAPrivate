@@ -344,12 +344,34 @@ bool apply_decompile_result(tab_t& t, const decompiler_engine::decompile_result_
 
 bool sync_tab_from_cache(tab_t& t)
 {
-	diag::log_tagged_fmt("pcode_view", "sync_tab_from_cache addr=0x%llX pending=%d",
-		static_cast<unsigned long long>(t.addr), t.pending ? 1 : 0);
+	const bool tab_pending = t.pending || t.decompiling;
+	diag::log_tagged_fmt("pcode_view", "sync_tab_from_cache addr=0x%llX pending=%d decompiling=%d",
+		static_cast<unsigned long long>(t.addr), t.pending ? 1 : 0, t.decompiling ? 1 : 0);
 	auto& st = decompiler_engine::g_state;
 	std::lock_guard<std::mutex> lk(st.mutex);
 	auto it = st.cache.find(t.addr);
 	if (it == st.cache.end()) {
+		if (tab_pending) {
+			if (!st.decompiling.load(std::memory_order_acquire) &&
+			    st.current.function_addr == t.addr &&
+			    st.current.complete &&
+			    st.current.is_error) {
+				diag::log_tagged_fmt("pcode_view", "sync_tab_current_error_terminal addr=0x%llX error=%s",
+					static_cast<unsigned long long>(t.addr),
+					st.current.error_text.c_str());
+				apply_decompile_result(t, st.current);
+				return true;
+			}
+			diag::log_tagged_fmt("pcode_view",
+				"sync_tab_cache_miss_pending_refuse_current addr=0x%llX engine_decompiling=%d current_addr=0x%llX current_complete=%d current_error=%d current_bytes=%zu",
+				static_cast<unsigned long long>(t.addr),
+				st.decompiling.load(std::memory_order_acquire) ? 1 : 0,
+				static_cast<unsigned long long>(st.current.function_addr),
+				st.current.complete ? 1 : 0,
+				st.current.is_error ? 1 : 0,
+				st.current.pseudocode.size());
+			return false;
+		}
 		if (!st.decompiling.load() && st.current.function_addr == t.addr && st.current.complete) {
 			diag::log_tagged_fmt("pcode_view", "sync_tab_current_terminal addr=0x%llX is_error=%d error=%s",
 				static_cast<unsigned long long>(t.addr),

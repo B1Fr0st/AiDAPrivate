@@ -46,8 +46,9 @@ bool sql_error_text(const exchange_observed_t& resp, std::string& matched)
     static const std::regex re(
         R"((SQL syntax|mysql_fetch|MySQLSyntaxError|PostgreSQL.*ERROR|PG::SyntaxError|SQLSTATE\[)"
         R"(|ORA-\d{5}|Oracle\.DataAccess\.|System\.Data\.SqlClient|Unclosed quotation mark|SQLite3?::SQLException|sqlite3\.OperationalError|near \"\?\": syntax error)"
-        R"(|java\.sql\.SQLException|java\.sql\.SQLSyntaxErrorException|SQLSyntaxErrorException|org\.apache\.derby|ERROR [0-9]{5}|Syntax error: Encountered)"
-        R"(|SQL grammar|BadSqlGrammarException|org\.hibernate\.exception\.SQLGrammarException|org\.h2\.jdbc|JdbcSQLSyntaxErrorException|H2 database error|JDBC exception))",
+        R"(|java\.sql\.SQLException|java\.sql\.SQLSyntaxErrorException|SQLSyntaxErrorException|SQLState|SQLSTATE|org\.apache\.derby|ERROR [0-9A-Z]{5}|Syntax error: Encountered)"
+        R"(|EmbedSQLException|StandardException|org\.apache\.derby\.iapi\.error|org\.apache\.derby\.impl\.jdbc|Derby SQL error)"
+        R"(|SQL grammar|BadSqlGrammarException|org\.hibernate\.exception\.SQLGrammarException|org\.h2\.jdbc|JdbcSQLSyntaxErrorException|JdbcSQLIntegrityConstraintViolationException|H2 database error|JDBC exception|ServletException.*SQL|javax\.servlet\.ServletException))",
         std::regex::ECMAScript | std::regex::icase);
     std::string text(reinterpret_cast<const char*>(resp.resp_body.data()),
                      std::min<size_t>(resp.resp_body.size(), static_cast<size_t>(32768)));
@@ -64,19 +65,6 @@ std::string body_prefix_lower(const std::vector<uint8_t>& body, size_t cap = 163
     for (size_t i = 0; i < n; ++i)
         out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(body[i]))));
     return out;
-}
-
-std::string header_value_ci(const exchange_observed_t& resp, const char* name)
-{
-    std::string target = name ? name : "";
-    std::transform(target.begin(), target.end(), target.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    for (const auto& h : resp.resp_headers) {
-        std::string hn = h.first;
-        std::transform(hn.begin(), hn.end(), hn.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        if (hn == target)
-            return h.second;
-    }
-    return {};
 }
 
 bool is_redirect_status(int status)
@@ -104,38 +92,110 @@ bool body_has_auth_failure_text(const std::vector<uint8_t>& body)
     return false;
 }
 
+std::vector<response_marker_t> auth_failure_markers()
+{
+    return {
+        {"login_failed", "login failed"},
+        {"invalid_password", "invalid password"},
+        {"invalid_username", "invalid username"},
+        {"invalid_credentials", "invalid credentials"},
+        {"authentication_failed", "authentication failed"},
+        {"signin_failed", "sign in failed"},
+        {"incorrect_password", "incorrect password"},
+        {"try_again", "try again"},
+        {"bad_credentials", "bad credentials"},
+        {"not_authorized", "not authorized"}
+    };
+}
+
+std::vector<response_marker_t> auth_success_markers()
+{
+    return {
+        {"logout", "logout"},
+        {"signout", "sign out"},
+        {"account_summary", "account summary"},
+        {"my_account", "my account"},
+        {"transfer_funds", "transfer funds"},
+        {"dashboard", "dashboard"},
+        {"authenticated", "authenticated"},
+        {"welcome", "welcome"}
+    };
+}
+
+bool authenticated_location(const std::string& location)
+{
+    std::string lc = location;
+    std::transform(lc.begin(), lc.end(), lc.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    static const char* needles[] = {
+        "/bank/",
+        "/account",
+        "/accounts",
+        "/dashboard",
+        "/home",
+        "/main",
+        "/profile",
+        "/admin",
+        "/secure",
+        "/authenticated"
+    };
+    for (const char* n : needles) {
+        if (lc.find(n) != std::string::npos)
+            return true;
+    }
+    return false;
+}
+
 bool auth_bypass_delta(const exchange_observed_t& resp, const module_context_t& ctx, std::string& evidence)
 {
-    const bool baseline_known = ctx.baseline_status_code > 0 || !ctx.baseline_response_body.empty();
-    if (!baseline_known)
+    auto diff = compare_response_to_baseline(resp, ctx, auth_failure_markers(), auth_success_markers());
+    if (!diff.baseline_known)
         return false;
-    const bool baseline_redirect = is_redirect_status(ctx.baseline_status_code);
+    const bool baseline_redirect = is_redirect_status(diff.baseline_status);
     const bool resp_redirect = is_redirect_status(resp.status_code);
     const bool baseline_failed = body_has_auth_failure_text(ctx.baseline_response_body);
     const bool resp_failed = body_has_auth_failure_text(resp.resp_body);
-    const std::string location = header_value_ci(resp, "Location");
-    const long long body_diff = std::llabs(static_cast<long long>(resp.resp_body.size()) - static_cast<long long>(ctx.baseline_response_body.size()));
-    if (resp_redirect && !baseline_redirect && ctx.baseline_status_code > 0) {
-        evidence = "Injected SQL boolean/auth payload changed baseline status "
-                 + std::to_string(ctx.baseline_status_code) + " to redirect "
-                 + std::to_string(resp.status_code);
-        if (!location.empty())
-            evidence += " Location=" + location;
-        evidence += " body_delta=" + std::to_string(body_diff);
+    const bool auth_location = authenticated_location(diff.response_location);
+    if (resp_redirect && !baseline_redirect && auth_location) {
+        evidence = "Injected SQL auth payload produced redirect to authenticated area; " + diff.evidence;
         return true;
     }
-    if (baseline_failed && !resp_failed && resp.status_code != ctx.baseline_status_code) {
-        evidence = "Injected SQL boolean/auth payload removed authentication failure text and changed status "
-                 + std::to_string(ctx.baseline_status_code) + " to "
-                 + std::to_string(resp.status_code) + " body_delta=" + std::to_string(body_diff);
+    if (resp_redirect && diff.location_changed && auth_location) {
+        evidence = "Injected SQL auth payload changed redirect Location to authenticated area; " + diff.evidence;
         return true;
     }
-    if (baseline_failed && !resp_failed) {
-        if (body_diff > 64) {
-            evidence = "Injected SQL boolean/auth payload removed authentication failure text and changed response size by "
-                     + std::to_string(body_diff) + " bytes";
-            return true;
-        }
+    if (baseline_failed && !resp_failed && diff.status_changed) {
+        evidence = "Injected SQL auth payload removed authentication failure text and changed status; " + diff.evidence;
+        return true;
+    }
+    if (!diff.removed_markers.empty() && (diff.status_changed || diff.location_changed || diff.meaningful_body_delta || !diff.added_markers.empty())) {
+        evidence = "Injected SQL auth payload removed login-failure markers; " + diff.evidence;
+        return true;
+    }
+    if (!diff.added_markers.empty() && (diff.status_changed || diff.location_changed || diff.meaningful_body_delta)) {
+        evidence = "Injected SQL auth payload added authenticated-area markers; " + diff.evidence;
+        return true;
+    }
+    return false;
+}
+
+bool boolean_response_delta(const exchange_observed_t& false_resp, const exchange_observed_t& true_resp, std::string& evidence)
+{
+    auto diff = compare_responses(false_resp, true_resp, auth_failure_markers(), auth_success_markers());
+    if (diff.status_changed && diff.response_status > 0 && diff.baseline_status > 0) {
+        evidence = "Boolean SQL payload status delta; " + diff.evidence;
+        return true;
+    }
+    if (diff.location_changed && authenticated_location(diff.response_location)) {
+        evidence = "Boolean SQL payload changed Location to authenticated area; " + diff.evidence;
+        return true;
+    }
+    if (diff.meaningful_body_delta && (!diff.removed_markers.empty() || !diff.added_markers.empty())) {
+        evidence = "Boolean SQL payload changed authentication markers; " + diff.evidence;
+        return true;
+    }
+    if (diff.meaningful_body_delta && diff.body_length_delta > 32) {
+        evidence = "Boolean SQL payload produced meaningful body delta; " + diff.evidence;
+        return true;
     }
     return false;
 }
@@ -219,10 +279,19 @@ void sqli_custom_run(const insertion_point_t& ip, const module_context_t& ctx, c
         return;
     }
 
+    auto build_injected = [&](const std::string& payload) {
+        if (ip.build_with_options) {
+            insertion_point_build_options_t options;
+            options.force_json_string = true;
+            return ip.build_with_options(payload, options);
+        }
+        return ip.build ? ip.build(payload) : std::vector<uint8_t>(ip.base_request.begin(), ip.base_request.end());
+    };
+
     auto fetch = [&](const std::string& payload, const std::string& variant, probe_t& used) -> std::optional<exchange_observed_t> {
         used.payload = ip.original_value + payload;
         used.variant = variant;
-        auto built = ip.build(used.payload);
+        auto built = build_injected(used.payload);
         return send(built, used);
     };
 
@@ -250,7 +319,8 @@ void sqli_custom_run(const insertion_point_t& ip, const module_context_t& ctx, c
         diag::log_tagged_fmt("mod_sqli", "sqli_custom_run pair responses variant=%s true_status=%d false_status=%d true_size=%zu false_size=%zu baseline_status=%d",
                              pair.variant, rt->status_code, rf->status_code, rt->resp_body.size(), rf->resp_body.size(), ctx.baseline_status_code);
         std::string auth_evidence;
-        if (pair.auth && auth_bypass_delta(*rt, ctx, auth_evidence) && rt->status_code != rf->status_code) {
+        const bool pair_delta = boolean_response_delta(*rf, *rt, auth_evidence);
+        if (pair.auth && auth_bypass_delta(*rt, ctx, auth_evidence) && (rt->status_code != rf->status_code || pair_delta)) {
             diag::log_tagged_fmt("mod_sqli", "sqli_custom_run FINDING auth-bypass variant=%s ip=%s:%s evidence=%s",
                                  pair.variant, ip.kind.c_str(), ip.name.c_str(), auth_evidence.c_str());
             auto iss = make_issue("sqli.auth-bypass", "SQL Injection (authentication bypass)",
@@ -261,13 +331,13 @@ void sqli_custom_run(const insertion_point_t& ip, const module_context_t& ctx, c
             issue_store::add(std::move(iss));
             return;
         }
-        if (rt->status_code != rf->status_code && rt->status_code > 0 && rf->status_code > 0) {
+        std::string bool_evidence;
+        if (boolean_response_delta(*rf, *rt, bool_evidence)) {
             diag::log_tagged_fmt("mod_sqli", "sqli_custom_run FINDING boolean status-diff variant=%s ip=%s:%s true=%d false=%d",
                                  pair.variant, ip.kind.c_str(), ip.name.c_str(), rt->status_code, rf->status_code);
             auto iss = make_issue("sqli.boolean", "SQL Injection (boolean-based)",
                                   severity_t::high, confidence_t::firm, ip, pt, *rt, ctx,
-                                  std::string("Status diff: true=") + std::to_string(rt->status_code)
-                                      + " false=" + std::to_string(rf->status_code));
+                                  bool_evidence);
             iss.description = "Two semantically opposing SQL boolean payloads produced different responses, indicating the parameter influences SQL evaluation.";
             iss.remediation = "Parameterize all queries; never interpolate inputs into SQL text.";
             iss.cwe.push_back("CWE-89");

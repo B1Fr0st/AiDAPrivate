@@ -217,6 +217,18 @@ bool request_body_from_params(const json& params, std::string& body, std::string
     return true;
 }
 
+bool body_is_json_document(const std::string& body)
+{
+    if (body.empty())
+        return false;
+    try {
+        (void)json::parse(body);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 bool build_request_from_url(const json& params, std::vector<uint8_t>& out_raw, std::string& err)
 {
     const std::string url = params["url"].get<std::string>();
@@ -253,7 +265,7 @@ bool build_request_from_url(const json& params, std::vector<uint8_t>& out_raw, s
     if (params.contains("content_type") && params["content_type"].is_string() && !has_header(headers, "Content-Type"))
         headers.emplace_back("Content-Type", params["content_type"].get<std::string>());
     if (!body.empty() && !has_header(headers, "Content-Type"))
-        headers.emplace_back("Content-Type", "application/x-www-form-urlencoded");
+        headers.emplace_back("Content-Type", body_is_json_document(body) ? "application/json" : "application/x-www-form-urlencoded");
 
     std::string req;
     req.reserve(method.size() + path.size() + host_header.size() + body.size() + 256);
@@ -279,8 +291,17 @@ bool build_request_from_url(const json& params, std::vector<uint8_t>& out_raw, s
     req += "Connection: close\r\n\r\n";
     req += body;
     out_raw.assign(req.begin(), req.end());
-    diag::log_tagged_fmt("mcp_burp", "tool_start_audit synthesized_request method=%s url=%s host=%s port=%u path=%s headers=%zu body_len=%zu req_len=%zu",
-        method.c_str(), url.c_str(), host.c_str(), static_cast<unsigned>(port), path.c_str(), headers.size(), body.size(), out_raw.size());
+    std::string content_type;
+    bool has_cookie = false;
+    bool has_auth = false;
+    for (const auto& h : headers) {
+        if (header_name_equals(h.first, "Content-Type")) content_type = h.second;
+        if (header_name_equals(h.first, "Cookie")) has_cookie = true;
+        if (header_name_equals(h.first, "Authorization")) has_auth = true;
+    }
+    diag::log_tagged_fmt("mcp_burp", "tool_start_audit synthesized_request method=%s url=%s host=%s port=%u path=%s headers=%zu body_len=%zu req_len=%zu content_type=%s has_cookie=%d has_authorization=%d",
+        method.c_str(), url.c_str(), host.c_str(), static_cast<unsigned>(port), path.c_str(), headers.size(), body.size(), out_raw.size(),
+        content_type.c_str(), has_cookie ? 1 : 0, has_auth ? 1 : 0);
     return true;
 }
 
@@ -344,6 +365,8 @@ bool build_request_from_exchange(const exchange_observed_t& ex, std::vector<uint
     req += "\r\n";
     bool has_user_agent = false;
     bool has_accept = false;
+    bool has_cookie = false;
+    bool has_auth = false;
     for (const auto& h : ex.req_headers) {
         if (h.first.empty())
             continue;
@@ -355,6 +378,10 @@ bool build_request_from_exchange(const exchange_observed_t& ex, std::vector<uint
             has_user_agent = true;
         if (header_name_equals(h.first, "Accept"))
             has_accept = true;
+        if (header_name_equals(h.first, "Cookie"))
+            has_cookie = true;
+        if (header_name_equals(h.first, "Authorization"))
+            has_auth = true;
         req += header_safe(h.first);
         req += ": ";
         req += header_safe(h.second);
@@ -373,8 +400,9 @@ bool build_request_from_exchange(const exchange_observed_t& ex, std::vector<uint
     if (!ex.req_body.empty())
         req.append(reinterpret_cast<const char*>(ex.req_body.data()), ex.req_body.size());
     out_raw.assign(req.begin(), req.end());
-    diag::log_tagged_fmt("mcp_burp", "tool_start_audit exchange_request exchange_id=%llu method=%s url=%s headers=%zu body_len=%zu req_len=%zu",
-        static_cast<unsigned long long>(ex.id), method.c_str(), out_url.c_str(), ex.req_headers.size(), ex.req_body.size(), out_raw.size());
+    diag::log_tagged_fmt("mcp_burp", "tool_start_audit exchange_request exchange_id=%llu method=%s url=%s headers=%zu body_len=%zu req_len=%zu preserved_cookie=%d preserved_authorization=%d",
+        static_cast<unsigned long long>(ex.id), method.c_str(), out_url.c_str(), ex.req_headers.size(), ex.req_body.size(), out_raw.size(),
+        has_cookie ? 1 : 0, has_auth ? 1 : 0);
     return true;
 }
 

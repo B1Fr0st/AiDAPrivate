@@ -412,21 +412,31 @@ static_assert(sizeof(net_stats) == 64, "net_stats size must be 64 bytes");
 
 
 #define MAX_WFP_CALLOUTS 256
+#define WFP_ENTRY_TYPE_CALLOUT 0
+#define WFP_ENTRY_TYPE_FILTER  1
+#define WFP_AIDA_MATCH_SUBLAYER       0x00000001u
+#define WFP_AIDA_MATCH_ACTION_CALLOUT 0x00000002u
 
 typedef struct _WFP_CALLOUT_ENTRY {
     UINT64 classify_fn;
     UINT64 notify_fn;
     UINT64 flow_delete_fn;
     UINT64 owning_module_base;
+    UINT64 filter_id;
     UINT32 callout_id;
     UINT32 layer_id;
     UINT32 flags;
-    UINT32 padding0;
+    UINT32 entry_type;
     GUID   callout_key;
     GUID   applicable_layer;
+    GUID   sublayer_key;
+    UINT32 action_type;
+    UINT32 provider_present;
+    UINT32 aida_match_reason;
+    UINT32 padding0;
     char   owning_module[64];
 } WFP_CALLOUT_ENTRY, *PWFP_CALLOUT_ENTRY;
-static_assert(sizeof(WFP_CALLOUT_ENTRY) == 144, "WFP_CALLOUT_ENTRY size check");
+static_assert(sizeof(WFP_CALLOUT_ENTRY) == 184, "WFP_CALLOUT_ENTRY size check");
 
 typedef struct _WFP_CALLOUT_ENUM {
     char   filter_module[64];

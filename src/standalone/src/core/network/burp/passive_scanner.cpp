@@ -7,6 +7,8 @@
 #include "../../infra/work_queue.hpp"
 #include "../../../helpers/diag_log.hpp"
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -15,7 +17,9 @@
 #include <mutex>
 #include <regex>
 #include <set>
+#include <sstream>
 #include <string>
+#include <vector>
 
 namespace aida {
 namespace burp {
@@ -101,6 +105,506 @@ void emit(issue_t iss)
     auto& s = state();
     issue_store::add(std::move(iss));
     s.issues.fetch_add(1);
+}
+
+std::string trim_ascii(std::string s)
+{
+    while (!s.empty() && (s.front() == ' ' || s.front() == '\t' || s.front() == '\r' || s.front() == '\n'))
+        s.erase(s.begin());
+    while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r' || s.back() == '\n'))
+        s.pop_back();
+    return s;
+}
+
+bool is_hex(char c)
+{
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+int hex_val(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return 0;
+}
+
+std::string url_decode_local(const std::string& s)
+{
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '+') out.push_back(' ');
+        else if (s[i] == '%' && i + 2 < s.size() && is_hex(s[i + 1]) && is_hex(s[i + 2])) {
+            out.push_back(static_cast<char>((hex_val(s[i + 1]) << 4) | hex_val(s[i + 2])));
+            i += 2;
+        } else {
+            out.push_back(s[i]);
+        }
+    }
+    return out;
+}
+
+std::vector<uint8_t> base64_decode_local(std::string s)
+{
+    static const int8_t tbl[256] = {
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,62,-1,63,
+        52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-2,-1,-1,
+        -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+        15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,63,
+        -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+        41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
+    };
+    for (char& c : s) {
+        if (c == '-') c = '+';
+        else if (c == '_') c = '/';
+    }
+    while (s.size() % 4 != 0)
+        s.push_back('=');
+    std::vector<uint8_t> out;
+    out.reserve(s.size() * 3 / 4);
+    uint32_t buf = 0;
+    int bits = 0;
+    for (unsigned char c : s) {
+        if (c == '\r' || c == '\n' || c == ' ' || c == '\t') continue;
+        int v = tbl[c];
+        if (v == -1) return {};
+        if (v == -2) break;
+        buf = (buf << 6) | static_cast<uint32_t>(v);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back(static_cast<uint8_t>((buf >> bits) & 0xFF));
+        }
+    }
+    return out;
+}
+
+bool printable_text(const std::vector<uint8_t>& data)
+{
+    if (data.empty())
+        return false;
+    size_t printable = 0;
+    for (uint8_t b : data) {
+        if (b == '\r' || b == '\n' || b == '\t' || (b >= 0x20 && b < 0x7f))
+            ++printable;
+    }
+    return printable * 100 / data.size() >= 85;
+}
+
+bool looks_base64_token(const std::string& s)
+{
+    if (s.size() < 12)
+        return false;
+    size_t b64 = 0;
+    for (unsigned char c : s) {
+        if (std::isalnum(c) || c == '+' || c == '/' || c == '-' || c == '_' || c == '=')
+            ++b64;
+    }
+    return b64 == s.size();
+}
+
+void collect_json_keys(const nlohmann::json& j, const std::string& prefix, std::vector<std::string>& keys)
+{
+    if (j.is_object()) {
+        for (auto it = j.begin(); it != j.end(); ++it) {
+            std::string path = prefix.empty() ? it.key() : prefix + "." + it.key();
+            keys.push_back(path);
+            collect_json_keys(it.value(), path, keys);
+        }
+    } else if (j.is_array()) {
+        for (size_t i = 0; i < j.size(); ++i)
+            collect_json_keys(j[i], prefix + "[" + std::to_string(i) + "]", keys);
+    }
+}
+
+void collect_kv_keys(const std::string& s, std::vector<std::string>& keys)
+{
+    size_t p = 0;
+    while (p < s.size()) {
+        size_t end = s.find_first_of("&;\n\r", p);
+        if (end == std::string::npos) end = s.size();
+        size_t eq = s.find_first_of("=:", p);
+        if (eq != std::string::npos && eq < end) {
+            std::string key = trim_ascii(s.substr(p, eq - p));
+            if (!key.empty() && key.size() <= 64)
+                keys.push_back(key);
+        }
+        if (end >= s.size()) break;
+        p = end + 1;
+    }
+}
+
+bool sensitive_key_name(const std::string& key)
+{
+    std::string k = lc_string(key);
+    static const char* names[] = {
+        "altoroaccounts", "account", "acct", "customer", "user", "username",
+        "email", "role", "admin", "balance", "amount", "password", "passwd",
+        "pwd", "token", "session", "auth", "jwt", "ssn"
+    };
+    for (const char* n : names) {
+        if (k.find(n) != std::string::npos)
+            return true;
+    }
+    return false;
+}
+
+std::string join_limited(const std::vector<std::string>& items, size_t max_items)
+{
+    std::ostringstream os;
+    const size_t n = std::min(items.size(), max_items);
+    for (size_t i = 0; i < n; ++i) {
+        if (i) os << ",";
+        os << items[i];
+    }
+    if (items.size() > n)
+        os << ",...";
+    return os.str();
+}
+
+struct decoded_payload_t
+{
+    std::string label;
+    std::string text;
+};
+
+std::vector<decoded_payload_t> decoded_views(const std::string& value)
+{
+    std::vector<decoded_payload_t> views;
+    views.push_back({ "raw", value });
+    std::string cur = value;
+    for (int i = 0; i < 3; ++i) {
+        std::string dec = url_decode_local(cur);
+        if (dec == cur)
+            break;
+        views.push_back({ std::string("url") + std::to_string(i + 1), dec });
+        cur = dec;
+    }
+    const size_t initial = views.size();
+    for (size_t i = 0; i < initial; ++i) {
+        if (!looks_base64_token(views[i].text))
+            continue;
+        auto bytes = base64_decode_local(views[i].text);
+        if (!printable_text(bytes))
+            continue;
+        views.push_back({ views[i].label + ".base64", std::string(reinterpret_cast<const char*>(bytes.data()), bytes.size()) });
+    }
+    return views;
+}
+
+struct payload_analysis_t
+{
+    bool structured = false;
+    bool sensitive = false;
+    std::vector<std::string> keys;
+    std::string source;
+};
+
+payload_analysis_t analyze_payload_text(const std::string& text)
+{
+    payload_analysis_t out;
+    try {
+        auto j = nlohmann::json::parse(text);
+        out.structured = j.is_object() || j.is_array();
+        if (out.structured) {
+            collect_json_keys(j, "", out.keys);
+            out.source = "json";
+        }
+    } catch (...) {}
+    if (out.keys.empty()) {
+        collect_kv_keys(text, out.keys);
+        if (!out.keys.empty()) {
+            out.structured = true;
+            out.source = "key_value";
+        }
+    }
+    for (const auto& key : out.keys) {
+        if (sensitive_key_name(key)) {
+            out.sensitive = true;
+            break;
+        }
+    }
+    return out;
+}
+
+void emit_plaintext_cookie(const exchange_observed_t& ex, const std::string& direction,
+                           const std::string& cookie_name, const payload_analysis_t& analysis,
+                           const std::string& decode_label)
+{
+    auto iss = base_issue(ex);
+    iss.type_key = "cookie.plaintext-sensitive";
+    iss.name = "Plaintext sensitive cookie payload";
+    iss.description = std::string("A ") + direction + " cookie named '" + cookie_name +
+        "' contains readable sensitive fields after " + decode_label + " decoding.";
+    iss.remediation = "Store only opaque, server-side session identifiers in cookies. Protect structured client cookies with authenticated encryption and integrity checks.";
+    iss.cwe.push_back("CWE-312");
+    iss.cwe.push_back("CWE-565");
+    iss.severity = severity_t::medium;
+    iss.confidence = sensitive_key_name(cookie_name) ? confidence_t::certain : confidence_t::firm;
+    iss.parameter = cookie_name;
+    iss.insertion_point = direction == "request" ? "request.cookie" : "response.set-cookie";
+    evidence_t ev;
+    ev.marker = "cookie=" + cookie_name + "; decoded_as=" + decode_label + "; keys=" + join_limited(analysis.keys, 8);
+    if (direction == "request") ev.request_raw = "Cookie: " + cookie_name + "=<redacted>";
+    else ev.response_raw = "Set-Cookie: " + cookie_name + "=<redacted>";
+    iss.evidence.push_back(std::move(ev));
+    emit(std::move(iss));
+}
+
+std::vector<std::pair<std::string, std::string>> parse_cookie_header_pairs(const std::string& value)
+{
+    std::vector<std::pair<std::string, std::string>> out;
+    size_t p = 0;
+    while (p < value.size()) {
+        size_t end = value.find(';', p);
+        if (end == std::string::npos) end = value.size();
+        std::string part = trim_ascii(value.substr(p, end - p));
+        size_t eq = part.find('=');
+        if (eq != std::string::npos) {
+            std::string name = trim_ascii(part.substr(0, eq));
+            std::string val = trim_ascii(part.substr(eq + 1));
+            if (!name.empty())
+                out.emplace_back(std::move(name), std::move(val));
+        }
+        if (end >= value.size()) break;
+        p = end + 1;
+    }
+    return out;
+}
+
+std::pair<std::string, std::string> parse_set_cookie_name_value(const std::string& value)
+{
+    size_t semi = value.find(';');
+    std::string first = trim_ascii(value.substr(0, semi == std::string::npos ? value.size() : semi));
+    size_t eq = first.find('=');
+    if (eq == std::string::npos)
+        return {};
+    return { trim_ascii(first.substr(0, eq)), trim_ascii(first.substr(eq + 1)) };
+}
+
+void inspect_cookie_payload(const exchange_observed_t& ex, const std::string& direction,
+                            const std::string& cookie_name, const std::string& cookie_value)
+{
+    if (cookie_name.empty() || cookie_value.empty())
+        return;
+    const bool sensitive_name = sensitive_key_name(cookie_name);
+    for (const auto& view : decoded_views(cookie_value)) {
+        auto analysis = analyze_payload_text(view.text);
+        if ((analysis.structured && analysis.sensitive) || (sensitive_name && analysis.structured)) {
+            diag::log_tagged_fmt("passive", "cookie_plaintext_sensitive direction=%s name=%s decoded_as=%s key_count=%zu",
+                direction.c_str(), cookie_name.c_str(), view.label.c_str(), analysis.keys.size());
+            emit_plaintext_cookie(ex, direction, cookie_name, analysis, view.label);
+            return;
+        }
+    }
+    if (lc_string(cookie_name).find("altoroaccounts") != std::string::npos) {
+        payload_analysis_t analysis;
+        analysis.structured = true;
+        analysis.sensitive = true;
+        analysis.source = "name";
+        analysis.keys.push_back("AltoroAccounts");
+        emit_plaintext_cookie(ex, direction, cookie_name, analysis, "name");
+    }
+}
+
+std::vector<std::string> split_dot(const std::string& s)
+{
+    std::vector<std::string> out;
+    size_t p = 0;
+    while (p <= s.size()) {
+        size_t q = s.find('.', p);
+        if (q == std::string::npos) q = s.size();
+        out.push_back(s.substr(p, q - p));
+        if (q >= s.size()) break;
+        p = q + 1;
+    }
+    return out;
+}
+
+bool decode_base64_json(const std::string& s, nlohmann::json& out)
+{
+    auto bytes = base64_decode_local(s);
+    if (!printable_text(bytes))
+        return false;
+    try {
+        out = nlohmann::json::parse(std::string(reinterpret_cast<const char*>(bytes.data()), bytes.size()));
+        return out.is_object() || out.is_array();
+    } catch (...) {
+        return false;
+    }
+}
+
+struct jwt_analysis_t
+{
+    bool is_jwt = false;
+    bool unsigned_jwt = false;
+    bool missing_exp = false;
+    bool plaintext_claims = false;
+    std::string alg;
+    std::vector<std::string> claim_keys;
+};
+
+jwt_analysis_t analyze_jwt_token(const std::string& token)
+{
+    jwt_analysis_t out;
+    auto parts = split_dot(token);
+    if (parts.size() != 2 && parts.size() != 3)
+        return out;
+    nlohmann::json header;
+    nlohmann::json payload;
+    if (!decode_base64_json(parts[0], header) || !decode_base64_json(parts[1], payload))
+        return out;
+    out.is_jwt = true;
+    if (header.is_object() && header.contains("alg") && header["alg"].is_string())
+        out.alg = header["alg"].get<std::string>();
+    out.unsigned_jwt = parts.size() == 2 || (parts.size() == 3 && parts[2].empty()) || lc_string(out.alg) == "none";
+    out.missing_exp = payload.is_object() && !payload.contains("exp");
+    collect_json_keys(payload, "", out.claim_keys);
+    for (const auto& key : out.claim_keys) {
+        if (sensitive_key_name(key)) {
+            out.plaintext_claims = true;
+            break;
+        }
+    }
+    return out;
+}
+
+bool static_looking_bearer(const std::string& token)
+{
+    if (token.empty())
+        return false;
+    std::string lc = lc_string(token);
+    static const char* words[] = { "static", "sample", "example", "debug", "test", "admin", "password", "changeme", "secret" };
+    for (const char* w : words) {
+        if (lc.find(w) != std::string::npos)
+            return true;
+    }
+    std::set<char> uniq;
+    for (char c : token) uniq.insert(c);
+    if (token.size() >= 8 && token.size() < 24)
+        return true;
+    if (token.size() >= 16 && uniq.size() <= 5)
+        return true;
+    if (token.find('.') == std::string::npos && token.find('-') == std::string::npos && token.find('_') == std::string::npos && token.size() < 32)
+        return true;
+    return false;
+}
+
+void emit_token_issue(const exchange_observed_t& ex, const std::string& type_key,
+                      const std::string& name, severity_t sev, confidence_t conf,
+                      const std::string& where, const std::string& marker)
+{
+    auto iss = base_issue(ex);
+    iss.type_key = type_key;
+    iss.name = name;
+    iss.description = marker;
+    iss.remediation = "Use short-lived, signed tokens with explicit expiry and transmit them only over HTTPS in Authorization headers or HttpOnly Secure cookies.";
+    iss.cwe.push_back("CWE-319");
+    iss.severity = sev;
+    iss.confidence = conf;
+    iss.insertion_point = where;
+    evidence_t ev;
+    ev.marker = where + "; " + marker;
+    if (where.find("response") != std::string::npos) ev.response_raw = where + ": <redacted>";
+    else ev.request_raw = where + ": <redacted>";
+    iss.evidence.push_back(std::move(ev));
+    emit(std::move(iss));
+}
+
+void inspect_token_value(const exchange_observed_t& ex, const std::string& where,
+                         const std::string& token, bool bearer_context)
+{
+    if (token.size() < 6)
+        return;
+    if (ex.scheme != "https") {
+        emit_token_issue(ex, "token.http-exposure", "Token transmitted over cleartext HTTP",
+                         severity_t::high, confidence_t::firm, where,
+                         "token observed on non-HTTPS transport");
+    }
+    auto jwt = analyze_jwt_token(token);
+    if (jwt.is_jwt) {
+        if (jwt.unsigned_jwt) {
+            emit_token_issue(ex, "jwt.unsigned", "Unsigned JWT accepted or transmitted",
+                             severity_t::high, confidence_t::firm, where,
+                             "JWT alg=" + (jwt.alg.empty() ? std::string("<missing>") : jwt.alg) + " has no effective signature");
+        }
+        if (jwt.missing_exp) {
+            emit_token_issue(ex, "jwt.missing-exp", "JWT missing expiry claim",
+                             severity_t::medium, confidence_t::firm, where,
+                             "JWT payload has no exp claim; claims=" + join_limited(jwt.claim_keys, 8));
+        }
+        if (jwt.plaintext_claims) {
+            emit_token_issue(ex, "jwt.plaintext-claims", "JWT exposes readable sensitive claims",
+                             severity_t::low, confidence_t::firm, where,
+                             "JWT payload contains readable claims: " + join_limited(jwt.claim_keys, 8));
+        }
+        return;
+    }
+    for (const auto& view : decoded_views(token)) {
+        if (view.label == "raw")
+            continue;
+        auto analysis = analyze_payload_text(view.text);
+        if (analysis.structured && analysis.sensitive) {
+            emit_token_issue(ex, bearer_context ? "bearer.base64-claims" : "token.base64-claims",
+                             bearer_context ? "Bearer token exposes base64/plaintext claims" : "Token field exposes base64/plaintext claims",
+                             severity_t::high, confidence_t::firm, where,
+                             "decoded_as=" + view.label + "; keys=" + join_limited(analysis.keys, 8));
+            return;
+        }
+    }
+    if (bearer_context && static_looking_bearer(token)) {
+        emit_token_issue(ex, "bearer.static-looking", "Static-looking Bearer token",
+                         severity_t::medium, confidence_t::tentative, where,
+                         "bearer token has low-entropy or environment-style structure");
+    }
+}
+
+bool token_field_name(const std::string& key)
+{
+    std::string k = lc_string(key);
+    static const char* exact[] = {
+        "token", "access_token", "refresh_token", "id_token", "jwt",
+        "bearer", "bearer_token", "auth_token", "session_token"
+    };
+    for (const char* e : exact) {
+        if (k == e)
+            return true;
+    }
+    return k.size() > 5 && k.find("token") != std::string::npos;
+}
+
+void collect_json_token_values(const nlohmann::json& j, const std::string& path,
+                               std::vector<std::pair<std::string, std::string>>& out)
+{
+    if (j.is_object()) {
+        for (auto it = j.begin(); it != j.end(); ++it) {
+            std::string next = path.empty() ? it.key() : path + "." + it.key();
+            if (it.value().is_string() && token_field_name(it.key()))
+                out.emplace_back(next, it.value().get<std::string>());
+            collect_json_token_values(it.value(), next, out);
+        }
+    } else if (j.is_array()) {
+        for (size_t i = 0; i < j.size(); ++i)
+            collect_json_token_values(j[i], path + "[" + std::to_string(i) + "]", out);
+    }
+}
+
+void inspect_json_token_fields(const exchange_observed_t& ex, const std::string& where,
+                               const std::vector<uint8_t>& body)
+{
+    if (body.empty() || body.size() > 1024 * 1024)
+        return;
+    try {
+        auto j = nlohmann::json::parse(std::string(reinterpret_cast<const char*>(body.data()), body.size()));
+        std::vector<std::pair<std::string, std::string>> tokens;
+        collect_json_token_values(j, "", tokens);
+        diag::log_tagged_fmt("passive", "json_token_fields where=%s count=%zu", where.c_str(), tokens.size());
+        for (const auto& tv : tokens)
+            inspect_token_value(ex, where + "." + tv.first, tv.second, false);
+    } catch (...) {}
 }
 
 void check_security_headers(const exchange_observed_t& ex)
@@ -194,10 +698,19 @@ void check_server_disclosure(const exchange_observed_t& ex)
 void check_cookies(const exchange_observed_t& ex)
 {
     diag::log_tagged_fmt("passive", "check_cookies host=%s path=%s scheme=%s", ex.host.c_str(), ex.path.c_str(), ex.scheme.c_str());
+    for (const auto& h : ex.req_headers) {
+        if (lc_string(h.first) != "cookie") continue;
+        auto pairs = parse_cookie_header_pairs(h.second);
+        diag::log_tagged_fmt("passive", "check_cookies request_cookie pairs=%zu", pairs.size());
+        for (const auto& kv : pairs)
+            inspect_cookie_payload(ex, "request", kv.first, kv.second);
+    }
     for (const auto& h : ex.resp_headers) {
         if (lc_string(h.first) != "set-cookie") continue;
         diag::log_tagged_fmt("passive", "check_cookies found Set-Cookie value_len=%zu", h.second.size());
         const std::string& v = h.second;
+        auto set_pair = parse_set_cookie_name_value(v);
+        inspect_cookie_payload(ex, "response", set_pair.first, set_pair.second);
         std::string lc = lc_string(v);
         bool secure = lc.find("; secure") != std::string::npos || lc.find(";secure") != std::string::npos;
         bool httponly = lc.find("httponly") != std::string::npos;
@@ -496,7 +1009,8 @@ void check_jwt(const exchange_observed_t& ex)
 {
     diag::log_tagged_fmt("passive", "check_jwt host=%s path=%s query_len=%zu body_len=%zu req_header_count=%zu",
         ex.host.c_str(), ex.path.c_str(), ex.query.size(), ex.req_body.size(), ex.req_headers.size());
-    static const std::regex jwt_re(R"(\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\b)", std::regex::ECMAScript);
+    static const std::regex jwt_re(R"(\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}(?:\.[A-Za-z0-9_-]*)?)", std::regex::ECMAScript);
+    static const std::regex bearer_re(R"(\bBearer\s+([A-Za-z0-9._~+/\-=]{6,4096})\b)", std::regex::ECMAScript | std::regex::icase);
     auto scan_string = [&](const std::string& where, const std::string& s) {
         std::smatch m;
         if (std::regex_search(s, m, jwt_re)) {
@@ -508,16 +1022,23 @@ void check_jwt(const exchange_observed_t& ex)
             iss.cwe.push_back("CWE-319");
             iss.severity = (where == "query" || where == "body") ? severity_t::medium : severity_t::info;
             iss.confidence = confidence_t::firm;
-            evidence_t ev; ev.marker = m[0].str();
+            evidence_t ev; ev.marker = "JWT observed in " + where;
             iss.evidence.push_back(std::move(ev));
             emit(std::move(iss));
+            inspect_token_value(ex, where, m[0].str(), false);
+        }
+        if (std::regex_search(s, m, bearer_re)) {
+            inspect_token_value(ex, where + ".bearer", m[1].str(), true);
         }
     };
     scan_string("query", ex.query);
     scan_string("body", std::string(reinterpret_cast<const char*>(ex.req_body.data()), ex.req_body.size()));
     for (const auto& h : ex.req_headers) {
-        scan_string(std::string("header.") + lc_string(h.first), h.second);
+        std::string where = std::string("header.") + lc_string(h.first);
+        scan_string(where, h.second);
     }
+    inspect_json_token_fields(ex, "request.json", ex.req_body);
+    inspect_json_token_fields(ex, "response.json", ex.resp_body);
 }
 
 void check_cors(const exchange_observed_t& ex)

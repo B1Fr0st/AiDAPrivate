@@ -31,6 +31,7 @@
 #include "function_index.hpp"
 #include "xref_index.hpp"
 #include "work_queue.hpp"
+#include "../testlab/test_all_features.hpp"
 #include "../../helpers/diag_log.hpp"
 #include "../../helpers/globals.h"
 #include "../anti-tamper/webhook.hpp"
@@ -148,6 +149,11 @@ inline void push_log_fmt(const char* fmt, ...)
 	_vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, ap);
 	va_end(ap);
 	push_log(std::string(buf));
+}
+
+inline bool full_test_active()
+{
+	return test_all_features::is_running();
 }
 
 inline void rebuild_steps()
@@ -786,12 +792,22 @@ inline void run_pipeline(const std::string& path, const std::string& filename)
 			g_state.pdb_hint = hint;
 		}
 		g_state.pdb_decision.store(pdb_decision_t::pending, std::memory_order_release);
-		g_state.needs_pdb_prompt.store(true, std::memory_order_release);
-
-		push_log("Awaiting user decision on PDB download...");
-		pdb_user_accepted = wait_for_pdb_decision();
-		g_state.needs_pdb_prompt.store(false, std::memory_order_release);
-		push_log(pdb_user_accepted ? "User chose to download PDB" : "User declined PDB download");
+		if (full_test_active()) {
+			g_state.needs_pdb_prompt.store(false, std::memory_order_release);
+			g_state.pdb_decision.store(pdb_decision_t::declined, std::memory_order_release);
+			pdb_user_accepted = false;
+			push_log_fmt("testlab_auto_decline_remote_pdb module=%s pdb=%s guid=%s age=%u",
+				filename.c_str(),
+				hint.pdb_name.c_str(),
+				hint.pdb_guid.c_str(),
+				static_cast<unsigned>(hint.pdb_age));
+		} else {
+			g_state.needs_pdb_prompt.store(true, std::memory_order_release);
+			push_log("Awaiting user decision on PDB download...");
+			pdb_user_accepted = wait_for_pdb_decision();
+			g_state.needs_pdb_prompt.store(false, std::memory_order_release);
+			push_log(pdb_user_accepted ? "User chose to download PDB" : "User declined PDB download");
+		}
 
 		char buf[256];
 		std::snprintf(buf, sizeof(buf), "PDB info: %s (%s/%u)",
@@ -801,10 +817,22 @@ inline void run_pipeline(const std::string& path, const std::string& filename)
 		pdb_module_key = filename;
 	} else {
 		push_log("No PDB CodeView debug entry present in image");
-		push_log("Asking user for an externally-supplied PDB file...");
-		request_local_pdb_prompt(filename, view.image_base, view.size_of_image,
-			"This binary does not embed any PDB debug information. Do you have a PDB file for it locally?");
-		local_pdb_user_accepted = wait_for_local_pdb_decision(local_pdb_picked_path);
+		if (full_test_active()) {
+			g_state.needs_local_pdb_prompt.store(false, std::memory_order_release);
+			g_state.local_pdb_decision.store(pdb_decision_t::declined, std::memory_order_release);
+			{
+				std::lock_guard<std::mutex> lk(g_state.local_pdb_mtx);
+				g_state.local_pdb_path.clear();
+			}
+			local_pdb_user_accepted = false;
+			push_log_fmt("testlab_auto_decline_local_pdb module=%s reason=no_codeview_debug_entry",
+				filename.c_str());
+		} else {
+			push_log("Asking user for an externally-supplied PDB file...");
+			request_local_pdb_prompt(filename, view.image_base, view.size_of_image,
+				"This binary does not embed any PDB debug information. Do you have a PDB file for it locally?");
+			local_pdb_user_accepted = wait_for_local_pdb_decision(local_pdb_picked_path);
+		}
 		if (local_pdb_user_accepted) {
 			pdb_module_key = filename;
 			push_log_fmt("User supplied PDB: %s", local_pdb_picked_path.c_str());
@@ -849,9 +877,22 @@ inline void run_pipeline(const std::string& path, const std::string& filename)
 			std::snprintf(reason_buf, sizeof(reason_buf),
 				"The PDB file '%s' was not available on the Microsoft Symbol Server (or the download failed). Do you have a local copy of it?",
 				hint.pdb_name.c_str());
-			push_log("Symbol-server PDB unavailable, asking user for a local PDB file...");
-			request_local_pdb_prompt(filename, view.image_base, view.size_of_image, reason_buf);
-			local_pdb_user_accepted = wait_for_local_pdb_decision(local_pdb_picked_path);
+			if (full_test_active()) {
+				g_state.needs_local_pdb_prompt.store(false, std::memory_order_release);
+				g_state.local_pdb_decision.store(pdb_decision_t::declined, std::memory_order_release);
+				{
+					std::lock_guard<std::mutex> lk(g_state.local_pdb_mtx);
+					g_state.local_pdb_path.clear();
+				}
+				local_pdb_user_accepted = false;
+				push_log_fmt("testlab_auto_decline_local_pdb module=%s reason=symbol_server_unavailable pdb=%s",
+					filename.c_str(),
+					hint.pdb_name.c_str());
+			} else {
+				push_log("Symbol-server PDB unavailable, asking user for a local PDB file...");
+				request_local_pdb_prompt(filename, view.image_base, view.size_of_image, reason_buf);
+				local_pdb_user_accepted = wait_for_local_pdb_decision(local_pdb_picked_path);
+			}
 		}
 
 		if (local_pdb_user_accepted && !local_pdb_picked_path.empty()) {

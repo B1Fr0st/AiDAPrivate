@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <map>
 #include <set>
 #include <sstream>
 #include <string>
@@ -36,6 +37,13 @@ bool find_substr(const std::string& haystack, const std::string& needle, size_t&
     out = p;
     return true;
 }
+
+struct json_leaf_t
+{
+    std::string path;
+    std::string value;
+    std::string type;
+};
 
 struct request_line_t
 {
@@ -195,8 +203,27 @@ std::vector<std::pair<size_t, size_t>> find_query_pairs(const std::string& q)
     return out;
 }
 
+std::string json_scalar_type(const nlohmann::json& node)
+{
+    if (node.is_string()) return "string";
+    if (node.is_number_integer()) return "number_integer";
+    if (node.is_number_unsigned()) return "number_unsigned";
+    if (node.is_number_float()) return "number_float";
+    if (node.is_boolean()) return "boolean";
+    if (node.is_null()) return "null";
+    return "unknown";
+}
+
+std::string json_scalar_value(const nlohmann::json& node)
+{
+    if (node.is_string()) return node.get<std::string>();
+    std::ostringstream os;
+    os << node;
+    return os.str();
+}
+
 void collect_json_leaves(const nlohmann::json& node, const std::string& jp,
-                         std::vector<std::pair<std::string, std::string>>& leaves)
+                         std::vector<json_leaf_t>& leaves)
 {
     if (node.is_object()) {
         for (auto it = node.begin(); it != node.end(); ++it)
@@ -204,15 +231,44 @@ void collect_json_leaves(const nlohmann::json& node, const std::string& jp,
     } else if (node.is_array()) {
         for (size_t i = 0; i < node.size(); ++i)
             collect_json_leaves(node[i], jp + "/" + std::to_string(i), leaves);
-    } else if (node.is_string()) {
-        leaves.emplace_back(jp, node.get<std::string>());
-    } else if (node.is_number() || node.is_boolean()) {
-        std::ostringstream os; os << node;
-        leaves.emplace_back(jp, os.str());
+    } else if (node.is_string() || node.is_number() || node.is_boolean() || node.is_null()) {
+        leaves.push_back(json_leaf_t{ jp, json_scalar_value(node), json_scalar_type(node) });
     }
 }
 
-bool json_set_leaf(nlohmann::json& node, const std::string& jp, const std::string& value)
+nlohmann::json json_injected_value(const std::string& value, const std::string& type,
+                                   const insertion_point_build_options_t& options)
+{
+    if (options.force_json_string || !options.preserve_json_scalar_type)
+        return value;
+    if (type == "number_integer" || type == "number_unsigned" || type == "number_float") {
+        try {
+            nlohmann::json parsed = nlohmann::json::parse(value);
+            if ((type == "number_integer" && parsed.is_number_integer()) ||
+                (type == "number_unsigned" && parsed.is_number_unsigned()) ||
+                (type == "number_float" && parsed.is_number())) {
+                return parsed;
+            }
+        } catch (...) {}
+        return value;
+    }
+    if (type == "boolean") {
+        std::string lc;
+        lc.reserve(value.size());
+        for (char c : value) lc.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+        if (lc == "true" || lc == "1") return true;
+        if (lc == "false" || lc == "0") return false;
+        return value;
+    }
+    if (type == "null") {
+        if (value == "null") return nullptr;
+        return value;
+    }
+    return value;
+}
+
+bool json_set_leaf(nlohmann::json& node, const std::string& jp, const std::string& value,
+                   const std::string& type, const insertion_point_build_options_t& options)
 {
     if (jp.empty() || jp[0] != '/') return false;
     std::vector<std::string> parts;
@@ -234,12 +290,13 @@ bool json_set_leaf(nlohmann::json& node, const std::string& jp, const std::strin
         } else return false;
     }
     const std::string& last = parts.back();
-    if (cur->is_object()) (*cur)[last] = value;
+    nlohmann::json injected = json_injected_value(value, type, options);
+    if (cur->is_object()) (*cur)[last] = std::move(injected);
     else if (cur->is_array()) {
         size_t idx = 0;
         try { idx = static_cast<size_t>(std::stoul(last)); } catch (...) { return false; }
         if (idx >= cur->size()) return false;
-        (*cur)[idx] = value;
+        (*cur)[idx] = std::move(injected);
     } else return false;
     return true;
 }
@@ -471,28 +528,35 @@ std::vector<insertion_point_t> analyze(const std::vector<uint8_t>& raw_request, 
             }
             if (parsed) {
                 diag::log_tagged("insertion_points", "analyze json_body_parsed");
-                std::vector<std::pair<std::string, std::string>> leaves;
+                std::vector<json_leaf_t> leaves;
                 collect_json_leaves(doc, "", leaves);
                 diag::log_tagged_fmt("insertion_points", "analyze json_leaves=%zu", leaves.size());
                 for (const auto& lf : leaves) {
                     insertion_point_t ip;
                     ip.kind = "body_json";
-                    ip.name = lf.first;
-                    ip.original_value = lf.second;
+                    ip.name = lf.path;
+                    ip.original_value = lf.value;
+                    ip.value_type = lf.type;
                     ip.base_request = raw;
                     ip.value_offset = 0;
                     ip.value_length = 0;
                     std::string captured_body = body;
-                    std::string captured_jp = lf.first;
-                    ip.build = [raw, rl, headers, captured_body, captured_jp](const std::string& injected) {
+                    std::string captured_jp = lf.path;
+                    std::string captured_type = lf.type;
+                    ip.build_with_options = [raw, rl, headers, captured_body, captured_jp, captured_type](const std::string& injected,
+                                                                                                            const insertion_point_build_options_t& options) {
                         nlohmann::json doc2;
                         try { doc2 = nlohmann::json::parse(captured_body); } catch (...) {
                             return rebuild_with_body(raw, rl, headers, captured_body);
                         }
-                        if (!json_set_leaf(doc2, captured_jp, injected))
+                        if (!json_set_leaf(doc2, captured_jp, injected, captured_type, options))
                             return rebuild_with_body(raw, rl, headers, captured_body);
                         std::string new_body = doc2.dump();
                         return rebuild_with_body(raw, rl, headers, new_body);
+                    };
+                    ip.build = [builder = ip.build_with_options](const std::string& injected) {
+                        insertion_point_build_options_t options;
+                        return builder(injected, options);
                     };
                     out.push_back(std::move(ip));
                 }
@@ -630,7 +694,17 @@ std::vector<insertion_point_t> analyze(const std::vector<uint8_t>& raw_request, 
         }
     }
 
-    diag::log_tagged_fmt("insertion_points", "analyze complete total_points=%zu", out.size());
+    std::map<std::string, size_t> counts;
+    for (const auto& ip : out)
+        counts[ip.kind]++;
+    std::ostringstream summary;
+    bool first = true;
+    for (const auto& kv : counts) {
+        if (!first) summary << ",";
+        first = false;
+        summary << kv.first << "=" << kv.second;
+    }
+    diag::log_tagged_fmt("insertion_points", "analyze complete total_points=%zu kinds=%s", out.size(), summary.str().c_str());
     return out;
 }
 

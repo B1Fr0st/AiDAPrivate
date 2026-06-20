@@ -137,11 +137,17 @@ namespace driver_bridge
         uint64_t    notify_fn = 0;
         uint64_t    flow_delete_fn = 0;
         uint64_t    owning_module_base = 0;
+        uint64_t    filter_id = 0;
         uint32_t    callout_id = 0;
         uint32_t    layer_id = 0;
         uint32_t    flags = 0;
+        uint32_t    entry_type = 0;
+        uint32_t    action_type = 0;
+        uint32_t    provider_present = 0;
+        uint32_t    aida_match_reason = 0;
         std::string callout_key_str;
         std::string applicable_layer_str;
+        std::string sublayer_key_str;
         std::string owning_module;
     };
 

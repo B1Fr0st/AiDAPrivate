@@ -2266,6 +2266,7 @@ bool trace_serializer(const serializer_trace_options_t& input,
                       nlohmann::json& out,
                       std::string& error)
 {
+    const std::uint64_t started = static_cast<std::uint64_t>(GetTickCount64());
     out = nlohmann::json::object();
     error.clear();
     if (input.serializer_va == 0) {
@@ -2319,6 +2320,11 @@ bool trace_serializer(const serializer_trace_options_t& input,
     std::vector<std::vector<std::uint8_t>> samples;
     nlohmann::json captures = nlohmann::json::array();
     std::string backend = "pre_encrypt_hook";
+    bool pre_encrypt_attempted = buf_arg >= 0 && size_arg >= 0;
+    bool pre_encrypt_started = false;
+    bool driver_sniff_attempted = false;
+    bool driver_sniff_started = false;
+    bool driver_sniff_active_after_get = false;
 
     diag::log_tagged_fmt("net_proto",
         "trace_serializer begin pid=%u serializer=0x%llX buffer_reg=%s size_reg=%s pre_buf=%d pre_size=%d driver_buf=%u driver_size=%u sample_ms=%u max_captures=%u",
@@ -2338,6 +2344,7 @@ bool trace_serializer(const serializer_trace_options_t& input,
                                        static_cast<std::uint32_t>(buf_arg),
                                        static_cast<std::uint32_t>(size_arg)) &&
         pre_encrypt_hook::start_polling()) {
+        pre_encrypt_started = true;
         std::this_thread::sleep_for(std::chrono::milliseconds(options.sample_ms));
         auto caps = pre_encrypt_hook::get_captures(options.max_captures);
         pre_encrypt_hook::unhook_all();
@@ -2359,6 +2366,7 @@ bool trace_serializer(const serializer_trace_options_t& input,
     } else {
         pre_encrypt_hook::unhook_all();
         backend = "driver_sniff_net_buffers";
+        driver_sniff_attempted = true;
         if (!driver_bridge::sniff_net_buffers_start(options.serializer_va,
                 driver_buf_reg,
                 driver_size_reg,
@@ -2368,10 +2376,12 @@ bool trace_serializer(const serializer_trace_options_t& input,
             error = driver_bridge::last_error().empty() ? "failed to start serializer trace" : driver_bridge::last_error();
             return false;
         }
+        driver_sniff_started = true;
         std::this_thread::sleep_for(std::chrono::milliseconds(options.sample_ms));
         bool active = false;
         auto caps = driver_bridge::sniff_net_buffers_get(active);
         driver_bridge::sniff_net_buffers_stop();
+        driver_sniff_active_after_get = active;
         diag::log_tagged_fmt("net_proto",
             "trace_serializer driver_sniff_done captures=%zu active_after_get=%d sample_ms=%u driver_error=%s",
             caps.size(),
@@ -2387,7 +2397,7 @@ bool trace_serializer(const serializer_trace_options_t& input,
             c["hex_preview"] = game_protocol::bytes_to_hex(cap.buffer, 128);
             captures.push_back(std::move(c));
         }
-        out["driver_sniff_active_after_get"] = active;
+        out["driver_sniff_active_after_get"] = driver_sniff_active_after_get;
     }
 
     out["process_id"] = pid;
@@ -2398,7 +2408,22 @@ bool trace_serializer(const serializer_trace_options_t& input,
     out["trace_method"] = "output_buffer_sampling";
     out["source_resolution"] = "source_va is null unless a capture backend reports a concrete source address; current fields are inferred from serializer output bytes";
     out["sample_ms"] = options.sample_ms;
+    out["elapsed_ms"] = static_cast<std::uint64_t>(GetTickCount64()) - started;
+    out["capture_window_ms"] = options.sample_ms;
     out["capture_count"] = captures.size();
+    out["observed_capture_count"] = captures.size();
+    out["saw_serializer_output"] = !samples.empty();
+    out["stimulus_observed"] = !samples.empty();
+    out["functional_success"] = !samples.empty();
+    out["pre_encrypt_attempted"] = pre_encrypt_attempted;
+    out["pre_encrypt_started"] = pre_encrypt_started;
+    out["driver_sniff_attempted"] = driver_sniff_attempted;
+    out["driver_sniff_started"] = driver_sniff_started;
+    out["driver_sniff_active_after_get"] = driver_sniff_active_after_get;
+    if (samples.empty())
+        out["zero_capture_reason"] = backend == "pre_encrypt_hook"
+            ? "pre-encrypt hook sampling completed without observing serializer output"
+            : "driver serializer buffer sniffing completed without observing serializer output";
     out["captures"] = std::move(captures);
     out["fields"] = captures_to_fields(samples);
     out["field_count"] = out["fields"].size();
@@ -2407,11 +2432,13 @@ bool trace_serializer(const serializer_trace_options_t& input,
         ? nlohmann::json::array({"no serializer breakpoint hits observed during bounded sample"})
         : nlohmann::json::array({"captured serializer output buffers", "field offsets are inferred from payload bytes and sample variance", "source addresses are not claimed without taint provenance"});
     diag::log_tagged_fmt("net_proto",
-        "trace_serializer done backend=%s captures=%u fields=%u confidence=%.3f",
+        "trace_serializer done backend=%s captures=%u fields=%u confidence=%.3f elapsed_ms=%llu functional_success=%d",
         backend.c_str(),
         out.value("capture_count", 0u),
         out.value("field_count", 0u),
-        out.value("confidence", 0.0));
+        out.value("confidence", 0.0),
+        static_cast<unsigned long long>(out.value("elapsed_ms", 0ull)),
+        out.value("functional_success", false) ? 1 : 0);
     return true;
 }
 

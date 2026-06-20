@@ -869,6 +869,19 @@ public:
 
     uint32_t install(uint32_t pid, uint64_t target_addr, uint64_t region_size, bool capture_payloads = true, uint32_t max_records_per_drain = 0, bool auto_poll = true) {
         const ULONGLONG install_start = GetTickCount64();
+        const uint64_t requested_addr = target_addr;
+        const uint64_t requested_size = region_size;
+        clear_install_failure(pid, requested_addr, requested_size);
+        auto fail_install = [&](const char* reason,
+                                const char* detail,
+                                const driver_bridge::memory_region_t* region,
+                                uint64_t guard_addr,
+                                uint64_t guard_size,
+                                uint32_t attempted_protect) -> uint32_t {
+            record_install_failure(reason, detail, pid, requested_addr, requested_size,
+                                   guard_addr, guard_size, region, attempted_protect, GetLastError());
+            return 0;
+        };
         diag::log_tagged_fmt("pg_sniff", "install_start pid=%u target=0x%llX size=0x%llX kernel=%d attached=%u payloads=%d max_drain=%u auto_poll=%d",
             pid,
             static_cast<unsigned long long>(target_addr),
@@ -880,26 +893,26 @@ public:
             auto_poll ? 1 : 0);
         if (!driver_bridge::using_kernel_driver()) {
             diag::log_tagged_fmt("pg_sniff", "install_failed reason=no_kernel_driver pid=%u", pid);
-            return 0;
+            return fail_install("no_kernel_driver", "kernel driver is not connected", nullptr, 0, 0, 0);
         }
         if (pid == 0 || target_addr == 0 || region_size == 0) {
             diag::log_tagged_fmt("pg_sniff", "install_failed reason=invalid_args pid=%u target=0x%llX size=0x%llX",
                 pid,
                 static_cast<unsigned long long>(target_addr),
                 static_cast<unsigned long long>(region_size));
-            return 0;
+            return fail_install("invalid_args", "pid, address, and size must be nonzero", nullptr, 0, 0, 0);
         }
 
         active_pid_scope_t active;
         if (!active.enter(pid)) {
             diag::log_tagged_fmt("pg_sniff", "install_failed reason=active_pid_enter pid=%u status=%s last_error=%s",
                 pid, driver_bridge::status().c_str(), driver_bridge::last_error().c_str());
-            return 0;
+            return fail_install("active_pid_enter", "failed to select target pid for driver-backed memory operations", nullptr, 0, 0, 0);
         }
         if (driver_bridge::attached_pid() != pid) {
             diag::log_tagged_fmt("pg_sniff", "install_failed reason=active_pid_mismatch requested=%u attached=%u",
                 pid, driver_bridge::attached_pid());
-            return 0;
+            return fail_install("active_pid_mismatch", "driver active pid differs from requested pid", nullptr, 0, 0, 0);
         }
 
 
@@ -907,9 +920,91 @@ public:
         if (!driver_bridge::query_memory_for(pid, target_addr, mri)) {
             diag::log_tagged_fmt("pg_sniff", "install_failed reason=query_memory pid=%u target=0x%llX last_error=%s",
                 pid, static_cast<unsigned long long>(target_addr), driver_bridge::last_error().c_str());
-            return 0;
+            return fail_install("query_memory", "driver could not query the requested target address", nullptr, 0, 0, 0);
         }
         uint32_t orig_protect = mri.protect;
+
+        SYSTEM_INFO sys_info{};
+        GetNativeSystemInfo(&sys_info);
+        const uint64_t page_size = sys_info.dwPageSize ? static_cast<uint64_t>(sys_info.dwPageSize) : 0x1000ull;
+        const uint64_t page_mask = page_size - 1u;
+        const uint64_t region_end = mri.base + mri.size;
+        if (region_end <= mri.base || target_addr < mri.base || target_addr >= region_end) {
+            diag::log_tagged_fmt("pg_sniff", "install_failed reason=target_outside_region pid=%u target=0x%llX region_base=0x%llX region_size=0x%llX state=0x%08X protect=0x%08X type=0x%08X",
+                pid,
+                static_cast<unsigned long long>(target_addr),
+                static_cast<unsigned long long>(mri.base),
+                static_cast<unsigned long long>(mri.size),
+                mri.state,
+                mri.protect,
+                mri.type);
+            return fail_install("target_outside_region", "queried region does not contain the target address", &mri, 0, 0, 0);
+        }
+        if (mri.state != MEM_COMMIT) {
+            diag::log_tagged_fmt("pg_sniff", "install_failed reason=region_not_committed pid=%u target=0x%llX state=0x%08X protect=0x%08X type=0x%08X",
+                pid,
+                static_cast<unsigned long long>(target_addr),
+                mri.state,
+                mri.protect,
+                mri.type);
+            return fail_install("region_not_committed", "target memory is not committed", &mri, 0, 0, 0);
+        }
+        if ((mri.protect & PAGE_NOACCESS) != 0) {
+            diag::log_tagged_fmt("pg_sniff", "install_failed reason=region_noaccess pid=%u target=0x%llX protect=0x%08X",
+                pid,
+                static_cast<unsigned long long>(target_addr),
+                mri.protect);
+            return fail_install("region_noaccess", "target memory has PAGE_NOACCESS protection", &mri, 0, 0, 0);
+        }
+        if ((mri.protect & PAGE_GUARD) != 0) {
+            diag::log_tagged_fmt("pg_sniff", "install_failed reason=region_already_guarded pid=%u target=0x%llX protect=0x%08X",
+                pid,
+                static_cast<unsigned long long>(target_addr),
+                mri.protect);
+            return fail_install("region_already_guarded", "target memory is already protected with PAGE_GUARD", &mri, 0, 0, 0);
+        }
+        if ((target_addr + region_size) < target_addr) {
+            diag::log_tagged_fmt("pg_sniff", "install_failed reason=request_range_overflow pid=%u target=0x%llX size=0x%llX",
+                pid,
+                static_cast<unsigned long long>(target_addr),
+                static_cast<unsigned long long>(region_size));
+            return fail_install("request_range_overflow", "requested guard range overflows address space", &mri, 0, 0, 0);
+        }
+        uint64_t desired_end = target_addr + region_size;
+        if (desired_end > region_end)
+            desired_end = region_end;
+        uint64_t guard_addr = target_addr & ~page_mask;
+        if (guard_addr < mri.base)
+            guard_addr = mri.base;
+        uint64_t guard_end = (desired_end + page_mask) & ~page_mask;
+        if (guard_end < desired_end || guard_end > region_end)
+            guard_end = region_end;
+        if (guard_end <= guard_addr) {
+            diag::log_tagged_fmt("pg_sniff", "install_failed reason=normalized_guard_empty pid=%u target=0x%llX size=0x%llX guard=0x%llX guard_end=0x%llX region_base=0x%llX region_end=0x%llX page=0x%llX",
+                pid,
+                static_cast<unsigned long long>(target_addr),
+                static_cast<unsigned long long>(region_size),
+                static_cast<unsigned long long>(guard_addr),
+                static_cast<unsigned long long>(guard_end),
+                static_cast<unsigned long long>(mri.base),
+                static_cast<unsigned long long>(region_end),
+                static_cast<unsigned long long>(page_size));
+            return fail_install("normalized_guard_empty", "normalized guard range is empty inside the committed region", &mri, guard_addr, 0, 0);
+        }
+        target_addr = guard_addr;
+        region_size = guard_end - guard_addr;
+        diag::log_tagged_fmt("pg_sniff", "install_region pid=%u requested=0x%llX size=0x%llX guard=0x%llX guard_size=0x%llX region_base=0x%llX region_size=0x%llX state=0x%08X protect=0x%08X type=0x%08X page=0x%llX",
+            pid,
+            static_cast<unsigned long long>(requested_addr),
+            static_cast<unsigned long long>(requested_size),
+            static_cast<unsigned long long>(target_addr),
+            static_cast<unsigned long long>(region_size),
+            static_cast<unsigned long long>(mri.base),
+            static_cast<unsigned long long>(mri.size),
+            mri.state,
+            mri.protect,
+            mri.type,
+            static_cast<unsigned long long>(page_size));
 
 
         driver_bridge::module_info_t kbase_mod = find_module_info(pid, "kernelbase.dll");
@@ -925,7 +1020,7 @@ public:
                 pid,
                 static_cast<unsigned long long>(kbase_mod.base),
                 static_cast<unsigned long long>(k32_mod.base));
-            return 0;
+            return fail_install("virtualprotect_missing", "VirtualProtect export could not be resolved in the target process", &mri, target_addr, region_size, 0);
         }
         diag::log_tagged_fmt("pg_sniff", "install_virtualprotect pid=%u module=%s addr=0x%llX kernelbase=0x%llX kernel32=0x%llX",
             pid,
@@ -939,13 +1034,13 @@ public:
         if (ring_addr == 0) {
             diag::log_tagged_fmt("pg_sniff", "install_failed reason=ring_alloc pid=%u bytes=%u last_error=%s",
                 pid, RING_TOTAL_SIZE + 16, driver_bridge::last_error().c_str());
-            return 0;
+            return fail_install("ring_alloc", "failed to allocate the remote capture ring", &mri, target_addr, region_size, 0);
         }
         if (driver_bridge::attached_pid() != pid) {
             diag::log_tagged_fmt("pg_sniff", "install_failed reason=post_ring_active_mismatch requested=%u attached=%u ring=0x%llX",
                 pid, driver_bridge::attached_pid(), static_cast<unsigned long long>(ring_addr));
             driver_bridge::free_memory_for(pid, ring_addr);
-            return 0;
+            return fail_install("post_ring_active_mismatch", "driver active pid changed after ring allocation", &mri, target_addr, region_size, 0);
         }
 
         uint64_t sc_addr = driver_bridge::allocate_memory_for(pid, SHELLCODE_SIZE + 16);
@@ -953,7 +1048,7 @@ public:
             diag::log_tagged_fmt("pg_sniff", "install_failed reason=shellcode_alloc pid=%u bytes=%zu ring=0x%llX last_error=%s",
                 pid, SHELLCODE_SIZE + 16, static_cast<unsigned long long>(ring_addr), driver_bridge::last_error().c_str());
             driver_bridge::free_memory_for(pid, ring_addr);
-            return 0;
+            return fail_install("shellcode_alloc", "failed to allocate the remote VEH shellcode region", &mri, target_addr, region_size, 0);
         }
 
 
@@ -963,7 +1058,7 @@ public:
                 pid, static_cast<unsigned long long>(ring_addr), driver_bridge::last_error().c_str());
             driver_bridge::free_memory_for(pid, sc_addr);
             driver_bridge::free_memory_for(pid, ring_addr);
-            return 0;
+            return fail_install("ring_zero_write", "failed to initialize the remote capture ring", &mri, target_addr, region_size, 0);
         }
 
 
@@ -975,7 +1070,7 @@ public:
                 pid, static_cast<unsigned long long>(sc_addr), sc.size(), driver_bridge::last_error().c_str());
             driver_bridge::free_memory_for(pid, sc_addr);
             driver_bridge::free_memory_for(pid, ring_addr);
-            return 0;
+            return fail_install("shellcode_write", "failed to write the remote VEH shellcode", &mri, target_addr, region_size, 0);
         }
         uint32_t old_sc_protect = 0;
         if (!driver_bridge::protect_memory_for(pid, sc_addr, SHELLCODE_SIZE,
@@ -984,7 +1079,7 @@ public:
                 pid, static_cast<unsigned long long>(sc_addr), driver_bridge::last_error().c_str());
             driver_bridge::free_memory_for(pid, sc_addr);
             driver_bridge::free_memory_for(pid, ring_addr);
-            return 0;
+            return fail_install("shellcode_protect", "failed to make the remote VEH shellcode executable", &mri, target_addr, region_size, PAGE_EXECUTE_READ);
         }
 
 
@@ -993,7 +1088,7 @@ public:
             diag::log_tagged_fmt("pg_sniff", "install_failed reason=ntdll_missing pid=%u", pid);
             driver_bridge::free_memory_for(pid, sc_addr);
             driver_bridge::free_memory_for(pid, ring_addr);
-            return 0;
+            return fail_install("ntdll_missing", "ntdll.dll is not present in target module enumeration", &mri, target_addr, region_size, 0);
         }
         uint64_t rtl_add_fn = resolve_system_export_for_pid(pid,
                                                             ntdll_mod_install.base,
@@ -1007,7 +1102,7 @@ public:
                 pid, static_cast<unsigned long long>(ntdll_mod_install.base));
             driver_bridge::free_memory_for(pid, sc_addr);
             driver_bridge::free_memory_for(pid, ring_addr);
-            return 0;
+            return fail_install("rtladdveh_missing", "RtlAddVectoredExceptionHandler export could not be resolved", &mri, target_addr, region_size, 0);
         }
         uint64_t rtl_remove_fn = resolve_system_export_for_pid(pid,
                                                                ntdll_mod_install.base,
@@ -1029,7 +1124,7 @@ public:
                 pid, static_cast<unsigned long long>(ntdll_mod_install.base));
             driver_bridge::free_memory_for(pid, sc_addr);
             driver_bridge::free_memory_for(pid, ring_addr);
-            return 0;
+            return fail_install("rtlremoveveh_missing", "RtlRemoveVectoredExceptionHandler export could not be resolved", &mri, target_addr, region_size, 0);
         }
 
         uint64_t veh_handle = remote_thread_call(pid, rtl_add_fn, 1, sc_addr, 0, 0, 5000, "RtlAddVectoredExceptionHandler");
@@ -1038,7 +1133,7 @@ public:
                 pid, static_cast<unsigned long long>(sc_addr));
             driver_bridge::free_memory_for(pid, sc_addr);
             driver_bridge::free_memory_for(pid, ring_addr);
-            return 0;
+            return fail_install("veh_register_failed", "remote RtlAddVectoredExceptionHandler call failed", &mri, target_addr, region_size, 0);
         }
 
         uint32_t old_prot = 0;
@@ -1061,7 +1156,7 @@ public:
                     pid, static_cast<unsigned long long>(veh_handle));
             driver_bridge::free_memory_for(pid, sc_addr);
             driver_bridge::free_memory_for(pid, ring_addr);
-            return 0;
+            return fail_install("target_guard_protect", "driver or OS refused PAGE_GUARD protection for the normalized target region", &mri, target_addr, region_size, orig_protect | PAGE_GUARD);
         }
 
 
@@ -1114,7 +1209,7 @@ public:
             }
             session->polling.store(false);
             session->exited.store(true);
-            return 0;
+            return fail_install("poll_worker_post", "failed to schedule the page-guard poll worker", &mri, target_addr, region_size, orig_protect | PAGE_GUARD);
         }
 
         std::lock_guard<std::mutex> lk(sessions_mutex_);
@@ -1404,6 +1499,25 @@ public:
         size_t   pending_captures;
     };
 
+    struct install_failure_info_t {
+        std::string reason;
+        std::string detail;
+        std::string driver_status;
+        std::string driver_last_error;
+        uint32_t pid = 0;
+        uint32_t win32_error = 0;
+        uint32_t region_state = 0;
+        uint32_t region_protect = 0;
+        uint32_t region_type = 0;
+        uint32_t attempted_protect = 0;
+        uint64_t requested_addr = 0;
+        uint64_t requested_size = 0;
+        uint64_t guard_addr = 0;
+        uint64_t guard_size = 0;
+        uint64_t region_base = 0;
+        uint64_t region_size = 0;
+    };
+
     std::vector<session_info_t> list_sessions() {
         std::lock_guard<std::mutex> lk(sessions_mutex_);
         std::vector<session_info_t> out;
@@ -1420,6 +1534,11 @@ public:
             out.push_back(si);
         }
         return out;
+    }
+
+    install_failure_info_t last_install_failure() const {
+        std::lock_guard<std::mutex> lk(failure_mutex_);
+        return last_install_failure_;
     }
 
 
@@ -1441,6 +1560,45 @@ public:
 
 private:
     std::vector<std::shared_ptr<pg_session_t>> retired_sessions_;
+
+    void clear_install_failure(uint32_t pid, uint64_t requested_addr, uint64_t requested_size) {
+        std::lock_guard<std::mutex> lk(failure_mutex_);
+        last_install_failure_ = {};
+        last_install_failure_.pid = pid;
+        last_install_failure_.requested_addr = requested_addr;
+        last_install_failure_.requested_size = requested_size;
+    }
+
+    void record_install_failure(const char* reason,
+                                const char* detail,
+                                uint32_t pid,
+                                uint64_t requested_addr,
+                                uint64_t requested_size,
+                                uint64_t guard_addr,
+                                uint64_t guard_size,
+                                const driver_bridge::memory_region_t* region,
+                                uint32_t attempted_protect,
+                                uint32_t win32_error) {
+        std::lock_guard<std::mutex> lk(failure_mutex_);
+        last_install_failure_.reason = reason ? reason : "";
+        last_install_failure_.detail = detail ? detail : "";
+        last_install_failure_.driver_status = driver_bridge::status();
+        last_install_failure_.driver_last_error = driver_bridge::last_error();
+        last_install_failure_.pid = pid;
+        last_install_failure_.requested_addr = requested_addr;
+        last_install_failure_.requested_size = requested_size;
+        last_install_failure_.guard_addr = guard_addr;
+        last_install_failure_.guard_size = guard_size;
+        last_install_failure_.attempted_protect = attempted_protect;
+        last_install_failure_.win32_error = win32_error;
+        if (region) {
+            last_install_failure_.region_base = region->base;
+            last_install_failure_.region_size = region->size;
+            last_install_failure_.region_state = region->state;
+            last_install_failure_.region_protect = region->protect;
+            last_install_failure_.region_type = region->type;
+        }
+    }
 
     static bool stop_session_poller(const std::shared_ptr<pg_session_t>& sess, DWORD timeout_ms, const char* reason) {
         if (!sess)
@@ -1829,6 +1987,8 @@ private:
 
     std::mutex sessions_mutex_;
     std::unordered_map<uint32_t, std::shared_ptr<pg_session_t>> sessions_;
+    mutable std::mutex failure_mutex_;
+    install_failure_info_t last_install_failure_;
     uint32_t next_id_ = 1;
 };
 

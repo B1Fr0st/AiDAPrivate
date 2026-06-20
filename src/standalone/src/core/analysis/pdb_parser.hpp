@@ -214,10 +214,15 @@ struct dbghelp_load_state_t {
 	uint64_t started_ms = 0;
 	uint64_t completed_ms = 0;
 	uint64_t attempt = 0;
+	uint64_t parse_entry_count = 0;
+	uint64_t last_parse_generation = 0;
+	DWORD last_parse_pid = 0;
+	DWORD last_parse_tid = 0;
 	DWORD last_gle = ERROR_SUCCESS;
 	HMODULE last_hmod = nullptr;
 	std::string phase;
 	std::string path;
+	std::string last_parse_path;
 	std::string loaded_path;
 	std::string terminal_detail;
 };
@@ -246,15 +251,19 @@ inline std::string last_error()
 inline std::string dbghelp_load_state_text_locked(uint64_t now_ms)
 {
 	const uint64_t elapsed_ms = g_dbghelp_load_state.started_ms ? now_ms - g_dbghelp_load_state.started_ms : 0;
-	char buf[1536];
+	char buf[2048];
 	std::snprintf(buf, sizeof(buf),
-		"dbghelp loaded=%d in_progress=%d stuck=%d terminal=%d success=%d attempt=%llu caller_pid=%lu caller_tid=%lu worker_pid=%lu worker_tid=%lu elapsed_ms=%llu completed_ms=%llu phase='%s' path='%s' loaded_path='%s' gle=%lu hmod=%p detail='%s'",
+		"dbghelp loaded=%d in_progress=%d stuck=%d terminal=%d success=%d attempt=%llu parse_entries=%llu last_parse_generation=%llu last_parse_pid=%lu last_parse_tid=%lu caller_pid=%lu caller_tid=%lu worker_pid=%lu worker_tid=%lu elapsed_ms=%llu completed_ms=%llu phase='%s' path='%s' last_parse_path='%s' loaded_path='%s' gle=%lu hmod=%p detail='%s'",
 		g_api.loaded ? 1 : 0,
 		g_dbghelp_load_state.in_progress ? 1 : 0,
 		g_dbghelp_load_state.stuck ? 1 : 0,
 		g_dbghelp_load_state.terminal ? 1 : 0,
 		g_dbghelp_load_state.last_success ? 1 : 0,
 		static_cast<unsigned long long>(g_dbghelp_load_state.attempt),
+		static_cast<unsigned long long>(g_dbghelp_load_state.parse_entry_count),
+		static_cast<unsigned long long>(g_dbghelp_load_state.last_parse_generation),
+		g_dbghelp_load_state.last_parse_pid,
+		g_dbghelp_load_state.last_parse_tid,
 		g_dbghelp_load_state.caller_pid,
 		g_dbghelp_load_state.caller_tid,
 		g_dbghelp_load_state.worker_pid,
@@ -263,11 +272,22 @@ inline std::string dbghelp_load_state_text_locked(uint64_t now_ms)
 		static_cast<unsigned long long>(g_dbghelp_load_state.completed_ms),
 		g_dbghelp_load_state.phase.c_str(),
 		g_dbghelp_load_state.path.c_str(),
+		g_dbghelp_load_state.last_parse_path.c_str(),
 		g_dbghelp_load_state.loaded_path.c_str(),
 		g_dbghelp_load_state.last_gle,
 		g_dbghelp_load_state.last_hmod,
 		g_dbghelp_load_state.terminal_detail.c_str());
 	return buf;
+}
+
+inline void mark_parse_entry_diagnostic(uint64_t generation, DWORD pid, DWORD tid, const std::string& path)
+{
+	std::lock_guard<std::mutex> lk(g_api_mutex);
+	++g_dbghelp_load_state.parse_entry_count;
+	g_dbghelp_load_state.last_parse_generation = generation;
+	g_dbghelp_load_state.last_parse_pid = pid;
+	g_dbghelp_load_state.last_parse_tid = tid;
+	g_dbghelp_load_state.last_parse_path = path;
 }
 
 inline std::string dbghelp_load_diagnostic()
@@ -1673,6 +1693,7 @@ inline bool parse_pdb(const std::string& pdb_path,
 		auto sz = std::filesystem::file_size(pdb_path, ec);
 		if (!ec) pdb_bytes = static_cast<uint64_t>(sz);
 	}
+	mark_parse_entry_diagnostic(parse_generation, pid, tid, pdb_path);
 	diag::log_tagged_fmt("pdb",
 		"parse_pdb_entry generation=%llu pid=%lu tid=%lu worker_tid=%lu path='%s' bytes=%llu search_len=%zu cancel_ptr=%p loader_state=\"%s\"",
 		static_cast<unsigned long long>(parse_generation),
