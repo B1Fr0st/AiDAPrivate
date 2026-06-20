@@ -843,8 +843,55 @@ namespace detail {
             ~probe_guard_t() { flag.clear(std::memory_order_release); }
         } guard{ s_probe_active };
 
-        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-        if (snap == INVALID_HANDLE_VALUE)
+        struct unicode_string_local_t {
+            USHORT Length;
+            USHORT MaximumLength;
+            PWSTR Buffer;
+        };
+        struct system_process_information_local_t {
+            ULONG NextEntryOffset;
+            ULONG NumberOfThreads;
+            UCHAR Reserved1[48];
+            unicode_string_local_t ImageName;
+            LONG BasePriority;
+            HANDLE UniqueProcessId;
+            PVOID Reserved2;
+            ULONG HandleCount;
+            ULONG SessionId;
+            PVOID Reserved3;
+            SIZE_T PeakVirtualSize;
+            SIZE_T VirtualSize;
+            ULONG Reserved4;
+            SIZE_T PeakWorkingSetSize;
+            SIZE_T WorkingSetSize;
+            PVOID Reserved5;
+            SIZE_T QuotaPagedPoolUsage;
+            PVOID Reserved6;
+            SIZE_T QuotaNonPagedPoolUsage;
+            SIZE_T PagefileUsage;
+            SIZE_T PeakPagefileUsage;
+            SIZE_T PrivatePageCount;
+            LARGE_INTEGER Reserved7[6];
+        };
+        struct client_id_local_t {
+            HANDLE UniqueProcess;
+            HANDLE UniqueThread;
+        };
+        struct system_thread_information_local_t {
+            LARGE_INTEGER Reserved1[3];
+            ULONG Reserved2;
+            PVOID StartAddress;
+            client_id_local_t ClientId;
+            LONG Priority;
+            LONG BasePriority;
+            ULONG Reserved3;
+            ULONG ThreadState;
+            ULONG WaitReason;
+        };
+        static_assert(sizeof(system_process_information_local_t) == 256, "Unexpected system process information size");
+        static_assert(sizeof(system_thread_information_local_t) == 80, "Unexpected system thread information size");
+
+        if (!syscall::is_initialized())
             return false;
 
         DWORD pid = GetCurrentProcessId();
@@ -858,59 +905,105 @@ namespace detail {
         char sample[512] = {};
         size_t sample_len = 0;
 
-        THREADENTRY32 te{};
-        te.dwSize = sizeof(te);
-        if (Thread32First(snap, &te))
+        ULONG buffer_size = 1024 * 1024;
+        ULONG return_length = 0;
+        std::vector<uint8_t> buffer(buffer_size);
+        NTSTATUS st = syscall::NtQuerySystemInformation()(
+            5, buffer.data(), buffer_size, &return_length);
+        for (int attempt = 0;
+             st == static_cast<NTSTATUS>(0xC0000004) && attempt < 3;
+             ++attempt)
         {
-            do
-            {
-                if (te.th32OwnerProcessID != pid)
-                    continue;
-                if (te.th32ThreadID == main_tid)
-                    continue;
-                ++total_threads;
+            buffer_size = return_length > buffer_size ? return_length + 65536 : buffer_size * 2;
+            buffer.assign(buffer_size, 0);
+            return_length = 0;
+            st = syscall::NtQuerySystemInformation()(
+                5, buffer.data(), buffer_size, &return_length);
+        }
+        if (st < 0) {
+            static std::atomic<uint32_t> s_query_fail_logs{0};
+            const uint32_t n = s_query_fail_logs.fetch_add(1, std::memory_order_acq_rel);
+            if (n < 8 || (n % 128) == 0) {
+                char qb[160];
+                _snprintf_s(qb, sizeof(qb), _TRUNCATE,
+                    "thread_suspended_probe_query_failed status=0x%08lX return_length=%lu buffer_size=%lu",
+                    static_cast<unsigned long>(st),
+                    static_cast<unsigned long>(return_length),
+                    static_cast<unsigned long>(buffer_size));
+                webhook::write_log("re_thread_probe", qb);
+            }
+            return false;
+        }
 
-                HANDLE th = OpenThread(THREAD_QUERY_LIMITED_INFORMATION | THREAD_SUSPEND_RESUME,
-                    FALSE, te.th32ThreadID);
-                if (!th) continue;
-
-                DWORD prev = SuspendThread(th);
-                if (prev != (DWORD)-1)
-                {
-                    ResumeThread(th);
-                    if (prev > 0) {
-                        ++suspended_count;
-                        const bool critical =
-                            (worker_tid != 0 && te.th32ThreadID == worker_tid) ||
-                            (watchdog_tid != 0 && te.th32ThreadID == watchdog_tid);
-                        if (critical)
-                            ++critical_suspended;
-                        if (sample_len < sizeof(sample) - 1) {
-                            const char* role =
-                                te.th32ThreadID == worker_tid ? "re_worker" :
-                                (te.th32ThreadID == watchdog_tid ? "re_watchdog" : "app");
-                            char one[96];
-                            _snprintf_s(one, sizeof(one), _TRUNCATE,
-                                "%s%lu:%lu:%s",
-                                sample_len == 0 ? "" : ",",
-                                static_cast<unsigned long>(te.th32ThreadID),
-                                static_cast<unsigned long>(prev),
-                                role);
-                            const size_t one_len = strlen(one);
-                            const size_t room = sizeof(sample) - sample_len - 1;
-                            const size_t copy_len = one_len < room ? one_len : room;
-                            if (copy_len != 0) {
-                                memcpy(sample + sample_len, one, copy_len);
-                                sample_len += copy_len;
-                                sample[sample_len] = '\0';
-                            }
+        uint8_t* cursor = buffer.data();
+        uint8_t* end = buffer.data() + buffer.size();
+        bool found_process = false;
+        for (uint32_t process_guard = 0;
+             static_cast<size_t>(end - cursor) >= sizeof(system_process_information_local_t) && process_guard < 131072;
+             ++process_guard)
+        {
+            auto* info = reinterpret_cast<system_process_information_local_t*>(cursor);
+            if (static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(info->UniqueProcessId)) == pid) {
+                found_process = true;
+                const size_t max_threads =
+                    (static_cast<size_t>(end - cursor) > sizeof(system_process_information_local_t))
+                        ? (static_cast<size_t>(end - cursor) - sizeof(system_process_information_local_t)) / sizeof(system_thread_information_local_t)
+                        : 0;
+                const ULONG thread_count = info->NumberOfThreads <= max_threads
+                    ? info->NumberOfThreads
+                    : static_cast<ULONG>(max_threads);
+                auto* threads = reinterpret_cast<system_thread_information_local_t*>(
+                    cursor + sizeof(system_process_information_local_t));
+                for (ULONG i = 0; i < thread_count; ++i) {
+                    const DWORD tid = static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(threads[i].ClientId.UniqueThread));
+                    if (tid == 0 || tid == main_tid)
+                        continue;
+                    ++total_threads;
+                    const bool suspended_wait =
+                        threads[i].ThreadState == 5 &&
+                        (threads[i].WaitReason == 5 || threads[i].WaitReason == 12);
+                    if (!suspended_wait)
+                        continue;
+                    ++suspended_count;
+                    const bool critical =
+                        (worker_tid != 0 && tid == worker_tid) ||
+                        (watchdog_tid != 0 && tid == watchdog_tid);
+                    if (critical)
+                        ++critical_suspended;
+                    if (sample_len < sizeof(sample) - 1) {
+                        const char* role =
+                            tid == worker_tid ? "re_worker" :
+                            (tid == watchdog_tid ? "re_watchdog" : "app");
+                        char one[96];
+                        _snprintf_s(one, sizeof(one), _TRUNCATE,
+                            "%s%lu:%lu/%lu:%s",
+                            sample_len == 0 ? "" : ",",
+                            static_cast<unsigned long>(tid),
+                            static_cast<unsigned long>(threads[i].ThreadState),
+                            static_cast<unsigned long>(threads[i].WaitReason),
+                            role);
+                        const size_t one_len = strlen(one);
+                        const size_t room = sizeof(sample) - sample_len - 1;
+                        const size_t copy_len = one_len < room ? one_len : room;
+                        if (copy_len != 0) {
+                            memcpy(sample + sample_len, one, copy_len);
+                            sample_len += copy_len;
+                            sample[sample_len] = '\0';
                         }
                     }
                 }
-                CloseHandle(th);
-            } while (Thread32Next(snap, &te));
+                break;
+            }
+            if (info->NextEntryOffset == 0)
+                break;
+            const size_t remaining = static_cast<size_t>(end - cursor);
+            if (info->NextEntryOffset < sizeof(system_process_information_local_t) ||
+                info->NextEntryOffset > remaining)
+                break;
+            cursor += info->NextEntryOffset;
         }
-        CloseHandle(snap);
+        if (!found_process)
+            return false;
 
         if (total_threads < 2)
             return false;

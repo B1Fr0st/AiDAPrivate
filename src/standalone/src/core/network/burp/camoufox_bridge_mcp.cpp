@@ -52,7 +52,19 @@ const char* state_label(camoufox::bridge_state_t s)
 
 bool bridge_process_tree_ready(const camoufox::bridge_status_t& s)
 {
-    return s.browser_process_count >= kMinReadyBrowserProcessCount;
+    return s.browser_process_count > 0;
+}
+
+bool bridge_reduced_process_tree_accepted(const camoufox::bridge_status_t& s)
+{
+    return s.state == camoufox::bridge_state_t::ready &&
+        s.browser_open &&
+        s.page_verified &&
+        s.privacy_verified &&
+        s.child_alive &&
+        s.browser_process_count > 0 &&
+        s.browser_process_count < kMinReadyBrowserProcessCount &&
+        !s.cleanup_pending;
 }
 
 json visible_window_proof_from_status(const camoufox::bridge_status_t& s)
@@ -139,6 +151,8 @@ json status_to_json(const camoufox::bridge_status_t& s)
     j["visible_window_proof"] = visible_window_proof;
     j["visible_window_count"] = visible_window_count;
     j["visible_window_verified"] = visible_window_count > 0;
+    j["reduced_process_tree_accepted"] = bridge_reduced_process_tree_accepted(s);
+    j["min_ready_browser_process_count"] = kMinReadyBrowserProcessCount;
     j["page_verified"]    = s.page_verified;
     j["child_alive"]      = s.child_alive;
     j["cleanup_pending"]  = s.cleanup_pending;
@@ -171,6 +185,8 @@ void attach_privacy_status(tool_result_t& out, const camoufox::bridge_status_t& 
     privacy["browser_instance_count"] = s.browser_instance_count;
     privacy["child_process_count"] = s.child_process_count;
     privacy["browser_process_count"] = s.browser_process_count;
+    privacy["reduced_process_tree_accepted"] = bridge_reduced_process_tree_accepted(s);
+    privacy["min_ready_browser_process_count"] = kMinReadyBrowserProcessCount;
     privacy["visible_window_proof"] = visible_window_proof_from_status(s);
     privacy["visible_window_count"] = visible_window_count_from_proof(privacy["visible_window_proof"]);
     privacy["visible_window_verified"] = privacy["visible_window_count"].get<int>() > 0;

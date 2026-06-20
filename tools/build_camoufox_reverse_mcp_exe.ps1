@@ -852,15 +852,41 @@ def _int_env(name, fallback):
         return fallback
 
 
+def _apply_playwright_pageerror_patch(required=False):
+    try:
+        from camoufox_reverse_mcp._playwright_patch import AIDA_PLAYWRIGHT_PAGEERROR_PATCH_ID, patch_playwright_pageerror
+
+        result = patch_playwright_pageerror()
+        if not isinstance(result, dict):
+            result = {"ok": False, "status": "invalid_result", "value_type": type(result).__name__}
+        if result.get("patch_id") != AIDA_PLAYWRIGHT_PAGEERROR_PATCH_ID:
+            result = {**result, "ok": False, "status": "patch_marker_mismatch"}
+        if required and not result.get("ok"):
+            raise RuntimeError(f"Playwright pageError patch verification failed: {result}")
+        return result
+    except Exception as exc:
+        if required:
+            raise
+        return {
+            "ok": False,
+            "status": "exception",
+            "error_type": type(exc).__name__,
+            "error": str(exc)[:500],
+        }
+
+
 def _run_import_smoke():
     started = time.perf_counter()
     debug = None
     try:
+        playwright_patch = _apply_playwright_pageerror_patch(required=True)
         from camoufox_reverse_mcp.browser import _camoufox_debug
         debug = _camoufox_debug
         import camoufox_reverse_mcp.browser as browser_module
+        import camoufox_reverse_mcp._playwright_patch as playwright_patch_module
         import camoufox_reverse_mcp.tools.navigation as navigation_module
         import camoufox_reverse_mcp.tools.network as network_module
+        pageerror_patch_marker = getattr(playwright_patch_module, "AIDA_PLAYWRIGHT_PAGEERROR_PATCH_ID", "")
         patch_marker = getattr(browser_module, "AIDA_CAMOUFOX_BRIDGE_PATCH_ID", "")
         launch_code = getattr(browser_module.BrowserManager.launch, "__code__", None)
         launch_consts = repr(getattr(launch_code, "co_consts", ()))
@@ -873,6 +899,8 @@ def _run_import_smoke():
         )
         navigation_consts = repr(getattr(getattr(navigation_module.navigate, "__code__", None), "co_consts", ()))
         network_consts = repr(getattr(getattr(network_module.list_network_requests, "__code__", None), "co_consts", ()))
+        if pageerror_patch_marker != "aida_playwright_pageerror_location_patch_20260620_1":
+            raise RuntimeError(f"frozen Playwright pageError patch marker mismatch: {pageerror_patch_marker!r}")
         if patch_marker != "aida_camoufox_bridge_20260620_crash_diag_1":
             raise RuntimeError(f"frozen browser patch marker mismatch: {patch_marker!r}")
         if "aida_bridge_patch_active" not in launch_consts or "aida_launch_policy_resolved" not in launch_consts:
@@ -894,6 +922,8 @@ def _run_import_smoke():
             python=sys.executable,
             env_browser=bool(os.environ.get("AIDA_CAMOUFOX_EXECUTABLE")),
             patch_marker=patch_marker,
+            pageerror_patch_marker=pageerror_patch_marker,
+            pageerror_patch=playwright_patch,
         )
         import_started = time.perf_counter()
         from camoufox.utils import launch_options
@@ -940,6 +970,7 @@ def _run_import_smoke():
 
 async def _run_live_smoke_async():
     started = time.perf_counter()
+    playwright_patch = _apply_playwright_pageerror_patch(required=True)
     from camoufox_reverse_mcp.browser import _await_no_cancel_wait, _camoufox_debug
     from camoufox_reverse_mcp.server import browser_manager
     executable = os.environ.get("AIDA_CAMOUFOX_EXECUTABLE", "")
@@ -965,6 +996,7 @@ async def _run_live_smoke_async():
         executable=executable,
         timeout_ms=timeout_ms,
         trace=bool(config.get("enable_trace")),
+        pageerror_patch=playwright_patch,
     )
     try:
         launch = await browser_manager.launch(config)
@@ -1045,6 +1077,7 @@ def _run_live_smoke():
 def _preload_camoufox():
     started = time.perf_counter()
     debug = None
+    playwright_patch = _apply_playwright_pageerror_patch(required=False)
     try:
         from camoufox_reverse_mcp.browser import _camoufox_debug
         debug = _camoufox_debug
@@ -1055,6 +1088,7 @@ def _preload_camoufox():
             elapsed_ms=int((time.perf_counter() - import_started) * 1000),
             total_ms=int((time.perf_counter() - started) * 1000),
             loaded=bool(_aida_preloaded_launch_options),
+            pageerror_patch=playwright_patch,
         )
     except Exception as exc:
         if debug is not None:

@@ -74,6 +74,7 @@ inline const char* step_glyph(const initial_analysis::step_t& s)
 inline void render_modal()
 {
 	auto& st = initial_analysis::g_state;
+	initial_analysis::detail::auto_decline_pdb_prompts_for_full_test("render_modal");
 	bool wants_prompt = st.needs_pdb_prompt.load(std::memory_order_acquire);
 
 	float& anim     = detail::modal_anim();
@@ -526,6 +527,7 @@ inline std::string browse_for_pdb_dialog(HWND owner, const std::string& initial_
 inline void render_local_pdb_modal()
 {
 	auto& st = initial_analysis::g_state;
+	initial_analysis::detail::auto_decline_pdb_prompts_for_full_test("render_local_pdb_modal");
 	bool wants_prompt = st.needs_local_pdb_prompt.load(std::memory_order_acquire);
 
 	float& anim    = detail::local_pdb_anim();

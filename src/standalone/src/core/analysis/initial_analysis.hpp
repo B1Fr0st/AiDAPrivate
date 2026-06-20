@@ -157,6 +157,36 @@ inline bool full_test_active()
 	return test_all_features::is_running();
 }
 
+inline bool auto_decline_pdb_prompts_for_full_test(const char* source)
+{
+	if (!full_test_active()) return false;
+
+	const bool remote_pending = g_state.needs_pdb_prompt.load(std::memory_order_acquire);
+	const bool local_pending = g_state.needs_local_pdb_prompt.load(std::memory_order_acquire);
+	if (!remote_pending && !local_pending) return false;
+
+	if (remote_pending) {
+		g_state.needs_pdb_prompt.store(false, std::memory_order_release);
+		g_state.opt_load_types.store(false, std::memory_order_release);
+		g_state.opt_load_names.store(false, std::memory_order_release);
+		g_state.pdb_decision.store(pdb_decision_t::declined, std::memory_order_release);
+	}
+	if (local_pending) {
+		g_state.needs_local_pdb_prompt.store(false, std::memory_order_release);
+		{
+			std::lock_guard<std::mutex> lk(g_state.local_pdb_mtx);
+			g_state.local_pdb_path.clear();
+		}
+		g_state.local_pdb_decision.store(pdb_decision_t::declined, std::memory_order_release);
+	}
+
+	push_log_fmt("fulltest_pdb_prompt_auto_decline source=%s remote_pending=%d local_pending=%d choice=do_not_load_pdb prompt_suppressed=1",
+		source && *source ? source : "<unknown>",
+		remote_pending ? 1 : 0,
+		local_pending ? 1 : 0);
+	return true;
+}
+
 struct full_test_pdb_policy_t {
 	bool        active = false;
 	bool        prompt_suppressed = false;
@@ -678,7 +708,9 @@ inline bool wait_for_pdb_decision()
 {
 	const uint64_t timeout_ns = 90ull * 1000ull * 1000ull * 1000ull;
 	uint64_t start = now_ns();
+	auto_decline_pdb_prompts_for_full_test("wait_for_pdb_decision");
 	while (!g_state.cancel.load(std::memory_order_acquire)) {
+		auto_decline_pdb_prompts_for_full_test("wait_for_pdb_decision");
 		auto d = g_state.pdb_decision.load(std::memory_order_acquire);
 		if (d != pdb_decision_t::pending) return d == pdb_decision_t::accepted;
 		if (now_ns() - start > timeout_ns) {
@@ -711,7 +743,9 @@ inline bool wait_for_local_pdb_decision(std::string& out_path)
 {
 	const uint64_t timeout_ns = 300ull * 1000ull * 1000ull * 1000ull;
 	uint64_t start = now_ns();
+	auto_decline_pdb_prompts_for_full_test("wait_for_local_pdb_decision");
 	while (!g_state.cancel.load(std::memory_order_acquire)) {
+		auto_decline_pdb_prompts_for_full_test("wait_for_local_pdb_decision");
 		auto d = g_state.local_pdb_decision.load(std::memory_order_acquire);
 		if (d != pdb_decision_t::pending) {
 			if (d == pdb_decision_t::accepted) {

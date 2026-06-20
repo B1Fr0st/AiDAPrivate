@@ -371,15 +371,36 @@ namespace net_bw {
 }
 namespace net_inject {
     inline constexpr UINT32 INJECT_FLAG_RAW_TRANSPORT = 0x80000000u;
+    struct inject_metadata {
+        UINT64 endpoint_handle;
+        UINT32 compartment_id;
+        UINT32 interface_index;
+        UINT32 sub_interface_index;
+        UINT32 remote_scope_id;
+    };
     BOOLEAN resolve_inject_functions();
     BOOLEAN prepare_injection_runtime();
     NTSTATUS inject_packet(p_packet_inject_request request);
+    NTSTATUS inject_packet(p_packet_inject_request request, const inject_metadata* metadata);
     void cleanup();
     extern HANDLE g_inject_handle_v4;
     extern HANDLE g_inject_handle_net_v4;
     typedef UINT32(NTAPI* fn_FwpsQueryPacketInjectionState0)(
         HANDLE injectionHandle, PVOID netBufferList, HANDLE* injectionContext);
     extern fn_FwpsQueryPacketInjectionState0 _FwpsQueryPacketInjectionState0;
+}
+
+static __forceinline net_inject::inject_metadata make_inject_metadata(
+    const FWPS_INCOMING_METADATA_VALUES0_COMPAT* meta) {
+    net_inject::inject_metadata result = {};
+    if (meta) {
+        result.endpoint_handle = meta->transportEndpointHandle;
+        result.compartment_id = meta->compartmentId;
+        result.interface_index = meta->sourceInterfaceIndex;
+        result.sub_interface_index = 0;
+        result.remote_scope_id = meta->remoteScopeId.Value;
+    }
+    return result;
 }
 namespace net_checksum {
     UINT16 ip_checksum(const UINT8* ip_header, UINT32 header_len);
@@ -466,6 +487,8 @@ namespace net_capture {
         { 0x7a8b3c21, 0x2e4f, 0x5a6b, { 0x8c, 0x9d, 0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xfa } };
     static const GUID GUID_AIDA_SUBLAYER =
         { 0x7a8b3c1f, 0x2e4f, 0x5a6b, { 0x8c, 0x9d, 0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf8 } };
+    static const GUID GUID_AIDA_PROVIDER =
+        { 0x7a8b3c23, 0x2e4f, 0x5a6b, { 0x8c, 0x9d, 0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xfc } };
     static const UINT32 WFP_BFE_AUTH_SERVICE = 0x0000000A;
     static const GUID GUID_CONDITION_ALE_APP_ID =
         { 0xd78e1e87, 0x8644, 0x4ea5, { 0x94, 0x37, 0xd8, 0x09, 0xec, 0xef, 0xc9, 0x71 } };
@@ -1258,7 +1281,11 @@ namespace net_capture {
                             }
                             classifyOut->actionType = FWP_ACTION_BLOCK_;
                             classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE_;
-                            NTSTATUS dns_inject_status = net_inject::inject_packet(inj_buf);
+                            net_inject::inject_metadata inject_meta = make_inject_metadata(inMetaValues);
+                            NTSTATUS dns_inject_status = net_inject::inject_packet(inj_buf, &inject_meta);
+                            if (NT_SUCCESS(dns_inject_status) && inj_buf->status == 0) {
+                                classifyOut->flags |= FWPS_CLASSIFY_OUT_FLAG_ABSORB_;
+                            }
                             WW_LOG("net_dns_spoof::inject_result layer=in_trans rule_id=%u qname='%s' status=0x%08X win32=%lu request_status=%u raw_transport=%u payload_size=%u action=blocked_original",
                                 spoof_rule_id,
                                 spoof_domain,
@@ -1358,7 +1385,11 @@ namespace net_capture {
                         strong::kmemcpy(inj_buf->payload, pkt_data, pkt_len);
                     classifyOut->actionType = FWP_ACTION_BLOCK_;
                     classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE_;
-                    NTSTATUS mod_inject_status = net_inject::inject_packet(inj_buf);
+                    net_inject::inject_metadata inject_meta = make_inject_metadata(inMetaValues);
+                    NTSTATUS mod_inject_status = net_inject::inject_packet(inj_buf, &inject_meta);
+                    if (NT_SUCCESS(mod_inject_status) && inj_buf->status == 0) {
+                        classifyOut->flags |= FWPS_CLASSIFY_OUT_FLAG_ABSORB_;
+                    }
                     WW_LOG("net_mod::classify REINJECT layer=in_trans direction=0 status=0x%08X win32=%lu request_status=%u irql=%u cpu=%lu pid=%u protocol=%u ports=%u<-%u payload_size=%u active_rules=%ld generation=%lld action=blocked_original",
                         mod_inject_status,
                         net_capture::status_to_win32(mod_inject_status),
@@ -1716,7 +1747,11 @@ namespace net_capture {
                         inj_buf->payload_size);
                     classifyOut->actionType = FWP_ACTION_BLOCK_;
                     classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE_;
-                    NTSTATUS inject_status = net_inject::inject_packet(inj_buf);
+                    net_inject::inject_metadata inject_meta = make_inject_metadata(inMetaValues);
+                    NTSTATUS inject_status = net_inject::inject_packet(inj_buf, &inject_meta);
+                    if (NT_SUCCESS(inject_status) && inj_buf->status == 0) {
+                        classifyOut->flags |= FWPS_CLASSIFY_OUT_FLAG_ABSORB_;
+                    }
                     WW_LOG("net_redirect::inject_result layer=out_trans rule_id=%u status=0x%08X win32=%lu request_status=%u action=blocked_original direction=%u protocol=%u pid=%u dst_port_before=%u dst_port_after=%u payload_size=%u hdr_skip=%u iface_src=%u iface_dst=%u compartment=%lu",
                         redir_rule_id,
                         inject_status,
@@ -1821,7 +1856,11 @@ namespace net_capture {
                         strong::kmemcpy(inj_buf->payload, pkt_data, pkt_len);
                     classifyOut->actionType = FWP_ACTION_BLOCK_;
                     classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE_;
-                    NTSTATUS mod_inject_status = net_inject::inject_packet(inj_buf);
+                    net_inject::inject_metadata inject_meta = make_inject_metadata(inMetaValues);
+                    NTSTATUS mod_inject_status = net_inject::inject_packet(inj_buf, &inject_meta);
+                    if (NT_SUCCESS(mod_inject_status) && inj_buf->status == 0) {
+                        classifyOut->flags |= FWPS_CLASSIFY_OUT_FLAG_ABSORB_;
+                    }
                     WW_LOG("net_mod::classify REINJECT layer=out_trans direction=1 status=0x%08X win32=%lu request_status=%u irql=%u cpu=%lu pid=%u protocol=%u ports=%u->%u payload_size=%u active_rules=%ld generation=%lld action=blocked_original",
                         mod_inject_status,
                         net_capture::status_to_win32(mod_inject_status),
@@ -2428,6 +2467,10 @@ namespace net_capture {
                guid_equal(key, &GUID_AIDA_CALLOUT_ALE_RECV);
     }
 
+    static BOOLEAN is_aida_provider_key(const GUID* key) {
+        return key && guid_equal(key, &GUID_AIDA_PROVIDER);
+    }
+
     static char ascii_lower(char c) {
         return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
     }
@@ -2509,6 +2552,24 @@ namespace net_capture {
                text_contains_ascii_ci(text, "WhosWho");
     }
 
+    static BOOLEAN is_aida_executable_text(const char* text) {
+        return text_contains_ascii_ci(text, "aida_testtarget.exe") ||
+               text_contains_ascii_ci(text, "aidastandalone.exe") ||
+               text_contains_ascii_ci(text, "\\aida.exe") ||
+               text_contains_ascii_ci(text, "/aida.exe");
+    }
+
+    static BOOLEAN is_aida_repo_build_path(const char* text) {
+        if (!text) return FALSE;
+        const BOOLEAN repo = text_contains_ascii_ci(text, "\\aidaprivate\\") ||
+                             text_contains_ascii_ci(text, "/aidaprivate/");
+        const BOOLEAN build = text_contains_ascii_ci(text, "\\build-ninja\\") ||
+                              text_contains_ascii_ci(text, "/build-ninja/") ||
+                              text_contains_ascii_ci(text, "\\build\\") ||
+                              text_contains_ascii_ci(text, "/build/");
+        return (repo && build && is_aida_executable_text(text)) ? TRUE : FALSE;
+    }
+
     static UINT32 display_match_reason(const FWPM_DISPLAY_DATA0* display) {
         char name[96] = {};
         char desc[128] = {};
@@ -2533,6 +2594,7 @@ namespace net_capture {
         UINT32 value_type;
         UINT32 blob_size;
         UINT32 aida_candidate;
+        UINT32 aida_repo_build_path;
         UINT32 original_app_id;
         char preview[128];
     } WFP_APP_CONDITION_INFO;
@@ -2602,6 +2664,7 @@ namespace net_capture {
                         copy_wide_ascii_bounded(cond->conditionValue.unicodeString, info->preview, sizeof(info->preview));
                     }
                     info->aida_candidate = is_aida_candidate_text(info->preview) ? 1u : 0u;
+                    info->aida_repo_build_path = is_aida_repo_build_path(info->preview) ? 1u : 0u;
                     return;
                 }
             }
@@ -2613,6 +2676,8 @@ namespace net_capture {
     static UINT32 filter_match_reason(const FWPM_FILTER0_COMPAT* filter) {
         if (!filter) return 0;
         UINT32 reason = 0;
+        if (is_aida_provider_key(filter->providerKey))
+            reason |= 0x00000008u;
         if (guid_equal(&filter->subLayerKey, &GUID_AIDA_SUBLAYER))
             reason |= WFP_AIDA_MATCH_SUBLAYER;
         if (is_aida_callout_key(&filter->action.calloutKey))
@@ -2624,10 +2689,34 @@ namespace net_capture {
     static UINT32 callout_match_reason(const FWPM_CALLOUT0_COMPAT* callout) {
         if (!callout) return 0;
         UINT32 reason = 0;
+        if (is_aida_provider_key(callout->providerKey))
+            reason |= 0x00000008u;
         if (is_aida_callout_key(&callout->calloutKey))
             reason |= WFP_AIDA_MATCH_ACTION_CALLOUT;
         reason |= display_match_reason(&callout->displayData);
         return reason;
+    }
+
+    static UINT32 legacy_repo_filter_match_reason(const FWPM_FILTER0_COMPAT* filter, const WFP_APP_CONDITION_INFO* app_info) {
+        if (!filter || !app_info) return 0;
+        char name[96] = {};
+        char desc[128] = {};
+        copy_display_name_ascii(&filter->displayData, name, sizeof(name));
+        copy_display_description_ascii(&filter->displayData, desc, sizeof(desc));
+        const BOOLEAN display_names_aida = is_aida_executable_text(name) || is_aida_executable_text(desc) ||
+                                           is_aida_owned_display_text(name) || is_aida_owned_display_text(desc);
+        if (app_info->aida_repo_build_path && (display_names_aida || app_info->aida_candidate))
+            return 0x00000010u;
+        return 0;
+    }
+
+    static BOOLEAN callout_has_aida_candidate(const FWPM_CALLOUT0_COMPAT* callout) {
+        if (!callout) return FALSE;
+        char name[96] = {};
+        char desc[128] = {};
+        copy_display_name_ascii(&callout->displayData, name, sizeof(name));
+        copy_display_description_ascii(&callout->displayData, desc, sizeof(desc));
+        return (is_aida_candidate_text(name) || is_aida_candidate_text(desc)) ? TRUE : FALSE;
     }
 
     static void log_guid3_filter(const char* tag, UINT64 id, const GUID* layer, const GUID* sublayer, const GUID* callout, const GUID* provider) {
@@ -2661,8 +2750,8 @@ namespace net_capture {
         copy_display_name_ascii(&filter->displayData, name, sizeof(name));
         copy_display_description_ascii(&filter->displayData, desc, sizeof(desc));
         UINT32 provider_present = filter->providerKey ? 1u : 0u;
-        UINT32 provider_match = 0;
-        WW_LOG("net_capture::orphan_cleanup %s filter id=%llu action=0x%08X flags=0x%08X weight_type=%u provider_present=%u provider_match=%u conditions=%u app_found=%u app_index=%u app_type=%u app_blob=%u app_original=%u app_aida=%u reason=0x%08X disposition=%s",
+        UINT32 provider_match = is_aida_provider_key(filter->providerKey) ? 1u : 0u;
+        WW_LOG("net_capture::orphan_cleanup %s filter id=%llu action=0x%08X flags=0x%08X weight_type=%u provider_present=%u provider_match=%u conditions=%u app_found=%u app_index=%u app_type=%u app_blob=%u app_original=%u app_aida=%u app_repo=%u reason=0x%08X disposition=%s",
             tag,
             (unsigned long long)filter->filterId,
             (UINT32)filter->action.type,
@@ -2677,6 +2766,7 @@ namespace net_capture {
             app->blob_size,
             app->original_app_id,
             app->aida_candidate,
+            app->aida_repo_build_path,
             reason,
             disposition ? disposition : "");
         log_guid3_filter(tag, filter->filterId, &filter->layerKey, &filter->subLayerKey, &filter->action.calloutKey, filter->providerKey);
@@ -2696,11 +2786,12 @@ namespace net_capture {
         copy_display_description_ascii(&callout->displayData, desc, sizeof(desc));
         const GUID zero = {};
         const GUID* provider = callout->providerKey ? callout->providerKey : &zero;
-        WW_LOG("net_capture::orphan_cleanup %s callout id=%u flags=0x%08X provider_present=%u provider_match=0 reason=0x%08X disposition=%s",
+        WW_LOG("net_capture::orphan_cleanup %s callout id=%u flags=0x%08X provider_present=%u provider_match=%u reason=0x%08X disposition=%s",
             tag,
             callout->calloutId,
             callout->flags,
             callout->providerKey ? 1u : 0u,
+            is_aida_provider_key(callout->providerKey) ? 1u : 0u,
             reason,
             disposition ? disposition : "");
         WW_LOG("net_capture::orphan_cleanup %s callout_key id=%u key=%08lX-%04X-%04X-%02X%02X%02X%02X%02X%02X%02X%02X layer=%08lX-%04X-%04X-%02X%02X%02X%02X%02X%02X%02X%02X",
@@ -2719,7 +2810,34 @@ namespace net_capture {
             desc);
     }
 
+    static __forceinline ULONG status_to_win32_fallback(NTSTATUS status) {
+        switch (status) {
+        case STATUS_SUCCESS: return 0;
+        case STATUS_PENDING: return 997;
+        case STATUS_UNSUCCESSFUL: return 31;
+        case STATUS_NOT_SUPPORTED: return 50;
+        case STATUS_INSUFFICIENT_RESOURCES: return 8;
+        case STATUS_INVALID_PARAMETER: return 87;
+        case STATUS_NOT_FOUND: return 1168;
+        case STATUS_OBJECT_NAME_NOT_FOUND: return 2;
+        case STATUS_OBJECT_NAME_COLLISION: return 183;
+        case STATUS_ACCESS_DENIED: return 5;
+        case STATUS_BUFFER_TOO_SMALL: return 122;
+        case STATUS_INFO_LENGTH_MISMATCH: return 24;
+        case STATUS_INVALID_HANDLE: return 6;
+        case STATUS_INVALID_ADDRESS: return 487;
+        case STATUS_PROCEDURE_NOT_FOUND: return 127;
+        case STATUS_NO_MEMORY: return 8;
+        case STATUS_TIMEOUT: return 1460;
+        case STATUS_CANCELLED: return 1223;
+        default: return (ULONG)status;
+        }
+    }
+
     static ULONG status_to_win32(NTSTATUS status) {
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+            return status_to_win32_fallback(status);
+        }
         return RtlNtStatusToDosError(status);
     }
 
@@ -2760,6 +2878,12 @@ namespace net_capture {
         UINT32 aida_filter_candidates_logged = 0;
         UINT32 aida_filter_candidates_suppressed = 0;
         UINT32 external_block_filters_seen = 0;
+        UINT32 legacy_repo_filters_matched = 0;
+        UINT32 legacy_repo_filters_deleted = 0;
+        UINT32 legacy_repo_filter_delete_failed = 0;
+        UINT32 callout_candidates_seen = 0;
+        UINT32 callout_candidates_logged = 0;
+        UINT32 callout_candidates_suppressed = 0;
         const UINT32 max_block_filter_logs = 32;
         const UINT32 max_aida_candidate_logs = 96;
 
@@ -2789,6 +2913,8 @@ namespace net_capture {
                     UINT32 reason = filter_match_reason(filter);
                     WFP_APP_CONDITION_INFO app_info = {};
                     inspect_filter_app_condition(filter, &app_info);
+                    UINT32 legacy_reason = legacy_repo_filter_match_reason(filter, &app_info);
+                    reason |= legacy_reason;
                     BOOLEAN block_filter = (filter->action.type == FWP_ACTION_BLOCK_) ? TRUE : FALSE;
                     BOOLEAN display_candidate = display_has_aida_candidate(&filter->displayData);
                     BOOLEAN aida_candidate = (reason != 0 || app_info.aida_candidate != 0 || display_candidate) ? TRUE : FALSE;
@@ -2821,9 +2947,11 @@ namespace net_capture {
                         continue;
                     }
                     ++filters_matched;
+                    if (legacy_reason != 0) ++legacy_repo_filters_matched;
                     if (aida_filter_candidates_logged < max_aida_candidate_logs) {
                         ++aida_filter_candidates_logged;
-                        log_filter_diagnostic("owned_filter", filter, reason, &app_info, "delete_aida_owned_stale");
+                        log_filter_diagnostic("owned_filter", filter, reason, &app_info,
+                            legacy_reason != 0 ? "delete_aida_legacy_repo_filter" : "delete_aida_owned_stale");
                     } else {
                         ++aida_filter_candidates_suppressed;
                     }
@@ -2838,8 +2966,10 @@ namespace net_capture {
                         del_win32);
                     if (NT_SUCCESS(del_status)) {
                         ++filters_deleted;
+                        if (legacy_reason != 0) ++legacy_repo_filters_deleted;
                     } else {
                         ++filter_delete_failed;
+                        if (legacy_reason != 0) ++legacy_repo_filter_delete_failed;
                         if (NT_SUCCESS(first_failure)) first_failure = del_status;
                     }
                 }
@@ -2878,9 +3008,26 @@ namespace net_capture {
                     FWPM_CALLOUT0_COMPAT* callout = entries[i];
                     if (!callout) continue;
                     UINT32 reason = callout_match_reason(callout);
-                    if (reason == 0) continue;
+                    BOOLEAN callout_candidate = (reason != 0 || callout_has_aida_candidate(callout)) ? TRUE : FALSE;
+                    if (callout_candidate) ++callout_candidates_seen;
+                    if (reason == 0) {
+                        if (callout_candidate) {
+                            if (callout_candidates_logged < max_aida_candidate_logs) {
+                                ++callout_candidates_logged;
+                                log_callout_diagnostic("callout_candidate", callout, reason, "not_deleted_no_aida_ownership_key");
+                            } else {
+                                ++callout_candidates_suppressed;
+                            }
+                        }
+                        continue;
+                    }
                     ++callouts_matched;
-                    log_callout_diagnostic("owned_callout", callout, reason, "delete_aida_owned_stale");
+                    if (callout_candidates_logged < max_aida_candidate_logs) {
+                        ++callout_candidates_logged;
+                        log_callout_diagnostic("owned_callout", callout, reason, "delete_aida_owned_stale");
+                    } else {
+                        ++callout_candidates_suppressed;
+                    }
                     NTSTATUS del_status = _FwpmCalloutDeleteById0(engine, callout->calloutId);
                     ULONG del_win32 = status_to_win32(del_status);
                     WW_LOG("net_capture::orphan_cleanup callout_delete id=%u provider=%u reason=0x%08X status=0x%08X win32=%lu",
@@ -2914,11 +3061,14 @@ namespace net_capture {
             WW_LOG("net_capture::orphan_cleanup external_block_notice count=%u action=not_deleted reason=external_owner_without_aida_sublayer_callout_or_display next_run=filter_id_layer_sublayer_callout_provider_name_desc_app_condition_logged",
                 external_block_filters_seen);
         }
-        WW_LOG("net_capture::orphan_cleanup summary filters_seen=%u filters_matched=%u filters_deleted=%u filter_failed=%u block_seen=%u block_logged=%u block_suppressed=%u aida_candidates_seen=%u aida_candidates_logged=%u aida_candidates_suppressed=%u external_blocks=%u callouts_seen=%u callouts_matched=%u callouts_deleted=%u callout_failed=%u final_status=0x%08X final_win32=%lu",
+        WW_LOG("net_capture::orphan_cleanup summary filters_seen=%u filters_matched=%u filters_deleted=%u filter_failed=%u legacy_repo_matched=%u legacy_repo_deleted=%u legacy_repo_failed=%u block_seen=%u block_logged=%u block_suppressed=%u aida_candidates_seen=%u aida_candidates_logged=%u aida_candidates_suppressed=%u external_blocks=%u callouts_seen=%u callouts_matched=%u callouts_deleted=%u callout_failed=%u callout_candidates_seen=%u callout_candidates_logged=%u callout_candidates_suppressed=%u final_status=0x%08X final_win32=%lu",
             filters_seen,
             filters_matched,
             filters_deleted,
             filter_delete_failed,
+            legacy_repo_filters_matched,
+            legacy_repo_filters_deleted,
+            legacy_repo_filter_delete_failed,
             block_filters_seen,
             block_filters_logged,
             block_filters_suppressed,
@@ -2930,6 +3080,9 @@ namespace net_capture {
             callouts_matched,
             callouts_deleted,
             callout_delete_failed,
+            callout_candidates_seen,
+            callout_candidates_logged,
+            callout_candidates_suppressed,
             first_failure,
             status_to_win32(first_failure));
         return first_failure;
@@ -3163,6 +3316,7 @@ namespace net_capture {
         if (!NT_SUCCESS(status)) {
             g_callout_id_ale_connect = 0;
             NET_ERR("register_wfp: ALE connect callout register FAILED 0x%08x", status);
+            return abort_register_wfp("fwps_ale_connect_register", status);
         } else {
             FWPS_CALLOUT2_COMPAT callout_ale_recv_co = {};
             callout_ale_recv_co.calloutKey = GUID_AIDA_CALLOUT_ALE_RECV;
@@ -3176,6 +3330,7 @@ namespace net_capture {
             if (!NT_SUCCESS(status)) {
                 NET_ERR("register_wfp: ALE recv callout register FAILED 0x%08x", status);
                 g_callout_id_ale_recv = 0;
+                return abort_register_wfp("fwps_ale_recv_register", status);
             }
 
 
@@ -3190,6 +3345,7 @@ namespace net_capture {
                 if (!NT_SUCCESS(ale_callout_status)) {
                     NET_ERR("register_wfp: ALE connect FWPM callout add FAILED 0x%08x", ale_callout_status);
                     g_fwpm_callout_id_ale_connect = 0;
+                    return abort_register_wfp("fwpm_ale_connect_callout_add", ale_callout_status);
                 }
 
                 FWPM_FILTER0_COMPAT filter_ale_conn = {};
@@ -3207,6 +3363,7 @@ namespace net_capture {
                 if (!NT_SUCCESS(status)) {
                     NET_ERR("register_wfp: ALE connect filter add FAILED 0x%08x", status);
                     g_filter_id_ale_connect = 0;
+                    return abort_register_wfp("ale_connect_filter_add", status);
                 }
             }
 
@@ -3222,6 +3379,7 @@ namespace net_capture {
                 if (!NT_SUCCESS(ale_callout_status)) {
                     NET_ERR("register_wfp: ALE recv FWPM callout add FAILED 0x%08x", ale_callout_status);
                     g_fwpm_callout_id_ale_recv = 0;
+                    return abort_register_wfp("fwpm_ale_recv_callout_add", ale_callout_status);
                 }
 
                 FWPM_FILTER0_COMPAT filter_ale_recv = {};
@@ -3239,6 +3397,7 @@ namespace net_capture {
                 if (!NT_SUCCESS(status)) {
                     NET_ERR("register_wfp: ALE recv filter add FAILED 0x%08x", status);
                     g_filter_id_ale_recv = 0;
+                    return abort_register_wfp("ale_recv_filter_add", status);
                 }
             }
 
@@ -3253,6 +3412,33 @@ namespace net_capture {
         if (!NT_SUCCESS(status)) {
             NET_ERR("register_wfp: FwpmTransactionCommit0 FAILED 0x%08x", status);
             return abort_register_wfp("transaction_commit", status);
+        }
+
+        if (!g_callout_id_inbound || !g_callout_id_outbound || !g_callout_id_datagram ||
+            !g_callout_id_ale_connect || !g_callout_id_ale_recv ||
+            !g_fwpm_callout_id_inbound || !g_fwpm_callout_id_outbound || !g_fwpm_callout_id_datagram ||
+            !g_fwpm_callout_id_ale_connect || !g_fwpm_callout_id_ale_recv ||
+            !g_filter_id_inbound || !g_filter_id_outbound || !g_filter_id_datagram ||
+            !g_filter_id_ale_connect || !g_filter_id_ale_recv) {
+            WW_LOG("net_capture::register_wfp false_success inbound=%u outbound=%u datagram=%u ale_conn=%u ale_recv=%u fwpm_in=%u fwpm_out=%u fwpm_datagram=%u fwpm_ale_conn=%u fwpm_ale_recv=%u filter_in=%llu filter_out=%llu filter_datagram=%llu filter_ale_conn=%llu filter_ale_recv=%llu status=0x%08X",
+                g_callout_id_inbound,
+                g_callout_id_outbound,
+                g_callout_id_datagram,
+                g_callout_id_ale_connect,
+                g_callout_id_ale_recv,
+                g_fwpm_callout_id_inbound,
+                g_fwpm_callout_id_outbound,
+                g_fwpm_callout_id_datagram,
+                g_fwpm_callout_id_ale_connect,
+                g_fwpm_callout_id_ale_recv,
+                (unsigned long long)g_filter_id_inbound,
+                (unsigned long long)g_filter_id_outbound,
+                (unsigned long long)g_filter_id_datagram,
+                (unsigned long long)g_filter_id_ale_connect,
+                (unsigned long long)g_filter_id_ale_recv,
+                (UINT32)STATUS_UNSUCCESSFUL);
+            unregister_wfp();
+            return STATUS_UNSUCCESSFUL;
         }
 
         NET_DBG("register_wfp: SUCCESS — inbound_id=%u outbound_id=%u ale_conn_id=%u ale_recv_id=%u",
@@ -3442,6 +3628,20 @@ namespace net_capture {
                 status,
                 g_ring_buffer != nullptr ? 1u : 0u,
                 g_dns_ring != nullptr ? 1u : 0u);
+            _InterlockedExchange(&g_capture_active, 0);
+            g_filter_pid = 0;
+            g_filter_port = 0;
+            g_filter_protocol = 0;
+            strong::kmemset(g_filter_ip, 0, sizeof(g_filter_ip));
+            for (UINT32 i = 0; i < MAX_FILTER_RULES; i++) {
+                _InterlockedExchange(&g_filter_rules[i].active, 0);
+            }
+            _InterlockedExchange(&g_active_rule_count, 0);
+            net_intercept::cleanup();
+            net_dns_spoof::cleanup();
+            net_bw::cleanup();
+            net_inject::cleanup();
+            net_fingerprint::cleanup();
             net_dpi::cleanup();
             if (g_ring_buffer) {
                 ExFreePoolWithTag(g_ring_buffer, 'pkNW');
@@ -6236,7 +6436,16 @@ namespace net_inject {
     typedef struct _INJECT_COMPLETION_CONTEXT {
         PVOID buffer;
         PMDL mdl;
+        FWPS_TRANSPORT_SEND_PARAMS0_COMPAT send_args;
+        UINT8 remote_addr[16];
     } INJECT_COMPLETION_CONTEXT;
+
+    typedef struct _DEFERRED_INJECT_CONTEXT {
+        KDPC dpc;
+        packet_inject_request request;
+        inject_metadata metadata;
+        BOOLEAN has_metadata;
+    } DEFERRED_INJECT_CONTEXT;
 
     static __forceinline void write_be16(UINT8* dst, UINT16 value) {
         dst[0] = (UINT8)(value >> 8);
@@ -6581,7 +6790,7 @@ namespace net_inject {
         return total_len;
     }
 
-    NTSTATUS inject_packet(p_packet_inject_request request) {
+    static NTSTATUS inject_packet_now(p_packet_inject_request request, const inject_metadata* metadata) {
         if (!request) return STATUS_INVALID_PARAMETER;
         request->status = 1;
 
@@ -6672,15 +6881,31 @@ namespace net_inject {
             is_loopback_ipv4_addr(request->src_addr) &&
             is_loopback_ipv4_addr(request->dst_addr);
         UINT32 recv_interface_index = loopback_v4 ? 1u : 0u;
+        UINT32 recv_sub_interface_index = 0;
+        UINT32 compartment_id = 0;
+        UINT32 remote_scope_id = 0;
+        if (metadata) {
+            if (metadata->interface_index != 0) {
+                recv_interface_index = metadata->interface_index;
+            }
+            recv_sub_interface_index = metadata->sub_interface_index;
+            compartment_id = metadata->compartment_id;
+            remote_scope_id = metadata->remote_scope_id;
+        }
 
-        UINT64 endpoint_handle = lookup_endpoint_handle_by_port(request->protocol, request->src_port);
+        UINT64 endpoint_handle = (metadata && metadata->endpoint_handle != 0)
+            ? metadata->endpoint_handle
+            : lookup_endpoint_handle_by_port(request->protocol, request->src_port);
         NET_DBG("inject_packet: packet_size=%u loopback=%d endpoint_handle=0x%llx",
                 packet_size, (int)loopback_v4, endpoint_handle);
-        WW_LOG("net_inject::packet prepared transport_size=%u loopback=%u recv_if=%u endpoint=0x%llX have_transport=%u have_network=%u",
+        WW_LOG("net_inject::packet prepared transport_size=%u loopback=%u recv_if=%u recv_sub_if=%u endpoint=0x%llX compartment=%u scope=%u have_transport=%u have_network=%u",
             packet_size,
             loopback_v4 ? 1u : 0u,
             recv_interface_index,
+            recv_sub_interface_index,
             (unsigned long long)endpoint_handle,
+            compartment_id,
+            remote_scope_id,
             have_transport ? 1u : 0u,
             have_network ? 1u : 0u);
 
@@ -6700,6 +6925,12 @@ namespace net_inject {
             }
             strong::kmemset(completion, 0, sizeof(*completion));
             completion->buffer = buf;
+            UINT32 remote_addr_len = request->address_family == AF_INET6 ? 16u : 4u;
+            strong::kmemcpy(completion->remote_addr, request->dst_addr, remote_addr_len);
+            completion->send_args.remoteAddress = completion->remote_addr;
+            completion->send_args.remoteScopeId = remote_scope_id;
+            completion->send_args.controlData = nullptr;
+            completion->send_args.controlDataLength = 0;
 
             PMDL mdl = IoAllocateMdl(buf, packet_size, FALSE, FALSE, nullptr);
             if (!mdl) {
@@ -6729,11 +6960,8 @@ namespace net_inject {
                 recv_interface_index);
 
             if (request->direction == 1) {
-                FWPS_TRANSPORT_SEND_PARAMS0_COMPAT sendArgs = {};
-                sendArgs.remoteAddress = request->dst_addr;
-
                 st = _FwpsInjectSend0(g_inject_handle_v4, nullptr, endpoint_handle, 0,
-                    &sendArgs, (UINT16)request->address_family, 0, nbl,
+                    &completion->send_args, (UINT16)request->address_family, compartment_id, nbl,
                     (PVOID)inject_completion, completion);
                 WW_LOG("net_inject::packet transport_send status=0x%08X win32=%lu endpoint=0x%llX packet_size=%u",
                     st,
@@ -6743,7 +6971,7 @@ namespace net_inject {
 
                 if (!NT_SUCCESS(st) && _FwpsInjectRecv0 && loopback_v4) {
                     st = _FwpsInjectRecv0(g_inject_handle_v4, nullptr, nullptr, 0,
-                        (UINT16)request->address_family, 0, recv_interface_index, 0, nbl,
+                        (UINT16)request->address_family, compartment_id, recv_interface_index, recv_sub_interface_index, nbl,
                         (PVOID)inject_completion, completion);
                     WW_LOG("net_inject::packet transport_recv_fallback status=0x%08X win32=%lu recv_if=%u packet_size=%u",
                         st,
@@ -6753,7 +6981,7 @@ namespace net_inject {
                 }
             } else {
                 st = _FwpsInjectRecv0(g_inject_handle_v4, nullptr, nullptr, 0,
-                    (UINT16)request->address_family, 0, recv_interface_index, 0, nbl,
+                    (UINT16)request->address_family, compartment_id, recv_interface_index, recv_sub_interface_index, nbl,
                     (PVOID)inject_completion, completion);
                 WW_LOG("net_inject::packet transport_recv status=0x%08X win32=%lu recv_if=%u packet_size=%u",
                     st,
@@ -6762,10 +6990,8 @@ namespace net_inject {
                     packet_size);
 
                 if (!NT_SUCCESS(st) && _FwpsInjectSend0 && loopback_v4) {
-                    FWPS_TRANSPORT_SEND_PARAMS0_COMPAT sendArgs = {};
-                    sendArgs.remoteAddress = request->dst_addr;
                     st = _FwpsInjectSend0(g_inject_handle_v4, nullptr, endpoint_handle, 0,
-                        &sendArgs, (UINT16)request->address_family, 0, nbl,
+                        &completion->send_args, (UINT16)request->address_family, compartment_id, nbl,
                         (PVOID)inject_completion, completion);
                     WW_LOG("net_inject::packet transport_send_fallback status=0x%08X win32=%lu endpoint=0x%llX packet_size=%u",
                         st,
@@ -6849,30 +7075,34 @@ namespace net_inject {
 
         if (request->direction == 1 && _FwpsInjectNetSend0) {
             NET_DBG("inject_packet: trying network send path ip_size=%u", ip_packet_size);
-            st = _FwpsInjectNetSend0(g_inject_handle_net_v4, nullptr, 0, 0,
+            st = _FwpsInjectNetSend0(g_inject_handle_net_v4, nullptr, 0, compartment_id,
                 net_nbl, (PVOID)inject_completion, net_completion);
-            WW_LOG("net_inject::packet network_send status=0x%08X win32=%lu ip_size=%u compartment=0",
-                st,
-                net_capture::status_to_win32(st),
-                ip_packet_size);
-        } else if (_FwpsInjectNetRecv0) {
-            NET_DBG("inject_packet: trying network recv path ip_size=%u if_idx=%u", ip_packet_size, recv_interface_index);
-            st = _FwpsInjectNetRecv0(g_inject_handle_net_v4, nullptr, 0, 0,
-                recv_interface_index, 0, net_nbl,
-                (PVOID)inject_completion, net_completion);
-            WW_LOG("net_inject::packet network_recv status=0x%08X win32=%lu ip_size=%u recv_if=%u compartment=0",
+            WW_LOG("net_inject::packet network_send status=0x%08X win32=%lu ip_size=%u compartment=%u",
                 st,
                 net_capture::status_to_win32(st),
                 ip_packet_size,
-                recv_interface_index);
-        } else if (_FwpsInjectNetSend0) {
-            NET_DBG("inject_packet: fallback network send path");
-            st = _FwpsInjectNetSend0(g_inject_handle_net_v4, nullptr, 0, 0,
-                net_nbl, (PVOID)inject_completion, net_completion);
-            WW_LOG("net_inject::packet network_send_fallback status=0x%08X win32=%lu ip_size=%u compartment=0",
+                compartment_id);
+        } else if (_FwpsInjectNetRecv0) {
+            NET_DBG("inject_packet: trying network recv path ip_size=%u if_idx=%u", ip_packet_size, recv_interface_index);
+            st = _FwpsInjectNetRecv0(g_inject_handle_net_v4, nullptr, 0, compartment_id,
+                recv_interface_index, recv_sub_interface_index, net_nbl,
+                (PVOID)inject_completion, net_completion);
+            WW_LOG("net_inject::packet network_recv status=0x%08X win32=%lu ip_size=%u recv_if=%u recv_sub_if=%u compartment=%u",
                 st,
                 net_capture::status_to_win32(st),
-                ip_packet_size);
+                ip_packet_size,
+                recv_interface_index,
+                recv_sub_interface_index,
+                compartment_id);
+        } else if (_FwpsInjectNetSend0) {
+            NET_DBG("inject_packet: fallback network send path");
+            st = _FwpsInjectNetSend0(g_inject_handle_net_v4, nullptr, 0, compartment_id,
+                net_nbl, (PVOID)inject_completion, net_completion);
+            WW_LOG("net_inject::packet network_send_fallback status=0x%08X win32=%lu ip_size=%u compartment=%u",
+                st,
+                net_capture::status_to_win32(st),
+                ip_packet_size,
+                compartment_id);
         } else {
             st = STATUS_NOT_SUPPORTED;
             WW_LOG("net_inject::packet network_no_callable status=0x%08X win32=%lu ip_size=%u",
@@ -6903,6 +7133,114 @@ namespace net_inject {
             transport_attempted ? 1u : 0u);
         request->status = 0;
         return STATUS_SUCCESS;
+    }
+
+    static VOID NTAPI inject_dpc(PKDPC dpc, PVOID deferred_context, PVOID system_argument1, PVOID system_argument2) {
+        UNREFERENCED_PARAMETER(dpc);
+        UNREFERENCED_PARAMETER(system_argument1);
+        UNREFERENCED_PARAMETER(system_argument2);
+        DEFERRED_INJECT_CONTEXT* ctx = (DEFERRED_INJECT_CONTEXT*)deferred_context;
+        if (!ctx) {
+            return;
+        }
+        UINT64 start_tsc = __rdtsc();
+        const inject_metadata* metadata = ctx->has_metadata ? &ctx->metadata : nullptr;
+        NTSTATUS st = inject_packet_now(&ctx->request, metadata);
+        WW_LOG("net_inject::dpc EXIT status=0x%08X win32=%lu request_status=%u direction=%u protocol=%u endpoint=0x%llX compartment=%u elapsed_tsc=%llu irql=%u cpu=%lu",
+            st,
+            net_capture::status_to_win32(st),
+            ctx->request.status,
+            ctx->request.direction,
+            ctx->request.protocol,
+            metadata ? (unsigned long long)metadata->endpoint_handle : 0ull,
+            metadata ? metadata->compartment_id : 0u,
+            (unsigned long long)(__rdtsc() - start_tsc),
+            (UINT32)KeGetCurrentIrql(),
+            KeGetCurrentProcessorNumber());
+        ExFreePoolWithTag(ctx, 'qdNW');
+    }
+
+    static NTSTATUS queue_tcp_transport_injection(p_packet_inject_request request, const inject_metadata* metadata) {
+        if (!request) {
+            return STATUS_INVALID_PARAMETER;
+        }
+        if ((!g_inject_nbl_pool || (!g_inject_handle_v4 && !g_inject_handle_net_v4)) &&
+            KeGetCurrentIrql() == PASSIVE_LEVEL) {
+            prepare_injection_runtime();
+        }
+        if (!g_inject_nbl_pool) {
+            request->status = 1;
+            WW_LOG("net_inject::queue_tcp ABORT reason=nbl_pool_missing direction=%u protocol=%u irql=%u status=0x%08X",
+                request->direction,
+                request->protocol,
+                (UINT32)KeGetCurrentIrql(),
+                STATUS_INSUFFICIENT_RESOURCES);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        if (!g_inject_handle_v4 && !g_inject_handle_net_v4) {
+            request->status = 1;
+            WW_LOG("net_inject::queue_tcp ABORT reason=no_inject_handle direction=%u protocol=%u irql=%u status=0x%08X",
+                request->direction,
+                request->protocol,
+                (UINT32)KeGetCurrentIrql(),
+                STATUS_NOT_SUPPORTED);
+            return STATUS_NOT_SUPPORTED;
+        }
+
+        DEFERRED_INJECT_CONTEXT* ctx = (DEFERRED_INJECT_CONTEXT*)
+            ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(DEFERRED_INJECT_CONTEXT), 'qdNW');
+        if (!ctx) {
+            request->status = 1;
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        strong::kmemset(ctx, 0, sizeof(*ctx));
+        strong::kmemcpy(&ctx->request, request, sizeof(ctx->request));
+        if (metadata) {
+            strong::kmemcpy(&ctx->metadata, metadata, sizeof(ctx->metadata));
+            ctx->has_metadata = TRUE;
+        }
+
+        KeInitializeDpc(&ctx->dpc, inject_dpc, ctx);
+        BOOLEAN queued = KeInsertQueueDpc(&ctx->dpc, nullptr, nullptr);
+        if (!queued) {
+            ExFreePoolWithTag(ctx, 'qdNW');
+            request->status = 1;
+            WW_LOG("net_inject::queue_tcp ABORT reason=dpc_queue_rejected direction=%u protocol=%u endpoint=0x%llX compartment=%u irql=%u status=0x%08X",
+                request->direction,
+                request->protocol,
+                metadata ? (unsigned long long)metadata->endpoint_handle : 0ull,
+                metadata ? metadata->compartment_id : 0u,
+                (UINT32)KeGetCurrentIrql(),
+                STATUS_UNSUCCESSFUL);
+            return STATUS_UNSUCCESSFUL;
+        }
+
+        request->status = 0;
+        WW_LOG("net_inject::queue_tcp QUEUED direction=%u protocol=%u payload=%u flags=0x%08X endpoint=0x%llX compartment=%u irql=%u cpu=%lu",
+            request->direction,
+            request->protocol,
+            request->payload_size,
+            request->tcp_flags,
+            metadata ? (unsigned long long)metadata->endpoint_handle : 0ull,
+            metadata ? metadata->compartment_id : 0u,
+            (UINT32)KeGetCurrentIrql(),
+            KeGetCurrentProcessorNumber());
+        return STATUS_SUCCESS;
+    }
+
+    NTSTATUS inject_packet(p_packet_inject_request request, const inject_metadata* metadata) {
+        if (!request) {
+            return STATUS_INVALID_PARAMETER;
+        }
+        if (request->protocol == IPPROTO_TCP) {
+            return queue_tcp_transport_injection(request, metadata);
+        }
+        return inject_packet_now(request, metadata);
+    }
+
+    NTSTATUS inject_packet(p_packet_inject_request request) {
+        return inject_packet(request, nullptr);
     }
 
     void cleanup() {

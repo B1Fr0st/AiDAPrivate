@@ -255,27 +255,126 @@ namespace hv_detect {
         ULONG exception_seen = 0;
         ULONG seh_code = 0;
         ULONG safety_started = 0;
+        NTSTATUS subtest_status = STATUS_SUCCESS;
 
+        trace_stamp_t safety_start_begin = trace_stamp();
+        HVD_LOG_IMMEDIATE("subtest_safety_start_pre group=%s index=%d name=%s flags=0x%llx qpc=%lld tsc=%llu cpu=%lu irql=%lu pid=%llu tid=%llu",
+            group,
+            index,
+            name,
+            flags,
+            safety_start_begin.qpc.QuadPart,
+            safety_start_begin.tsc,
+            current_cpu(),
+            (ULONG)KeGetCurrentIrql(),
+            current_pid(),
+            current_tid());
         if (safety_net::start_safety_net(storage)) {
             safety_started = 1;
             detected = false;
+            trace_stamp_t safety_start_end = trace_stamp();
+            HVD_LOG_IMMEDIATE("subtest_safety_start_post group=%s index=%d name=%s flags=0x%llx ok=1 elapsed_us=%llu qpc=%lld tsc=%llu cpu=%lu irql=%lu pid=%llu tid=%llu",
+                group,
+                index,
+                name,
+                flags,
+                elapsed_us(safety_start_begin, safety_start_end),
+                safety_start_end.qpc.QuadPart,
+                safety_start_end.tsc,
+                current_cpu(),
+                (ULONG)KeGetCurrentIrql(),
+                current_pid(),
+                current_tid());
+            trace_stamp_t probe_start = trace_stamp();
+            HVD_LOG_IMMEDIATE("subtest_probe_pre group=%s index=%d name=%s flags=0x%llx qpc=%lld tsc=%llu cpu=%lu irql=%lu pid=%llu tid=%llu",
+                group,
+                index,
+                name,
+                flags,
+                probe_start.qpc.QuadPart,
+                probe_start.tsc,
+                current_cpu(),
+                (ULONG)KeGetCurrentIrql(),
+                current_pid(),
+                current_tid());
             __try {
                 detected = fn ? fn() : true;
             }
             __except ((seh_code = GetExceptionCode()), EXCEPTION_EXECUTE_HANDLER) {
                 exception_seen = 1;
                 detected = true;
+                subtest_status = static_cast<NTSTATUS>(seh_code);
             }
+            trace_stamp_t probe_end = trace_stamp();
+            HVD_LOG_IMMEDIATE("subtest_probe_post group=%s index=%d name=%s flags=0x%llx result=%u exception=%lu status=0x%08lx exception_code=0x%08lx elapsed_us=%llu qpc=%lld tsc=%llu cpu=%lu irql=%lu pid=%llu tid=%llu",
+                group,
+                index,
+                name,
+                flags,
+                detected ? 1u : 0u,
+                exception_seen,
+                subtest_status,
+                seh_code,
+                elapsed_us(probe_start, probe_end),
+                probe_end.qpc.QuadPart,
+                probe_end.tsc,
+                current_cpu(),
+                (ULONG)KeGetCurrentIrql(),
+                current_pid(),
+                current_tid());
+            trace_stamp_t stop_start = trace_stamp();
+            HVD_LOG_IMMEDIATE("subtest_safety_stop_pre group=%s index=%d name=%s flags=0x%llx qpc=%lld tsc=%llu cpu=%lu irql=%lu pid=%llu tid=%llu",
+                group,
+                index,
+                name,
+                flags,
+                stop_start.qpc.QuadPart,
+                stop_start.tsc,
+                current_cpu(),
+                (ULONG)KeGetCurrentIrql(),
+                current_pid(),
+                current_tid());
             safety_net::stop_safety_net(storage);
+            trace_stamp_t stop_end = trace_stamp();
+            HVD_LOG_IMMEDIATE("subtest_safety_stop_post group=%s index=%d name=%s flags=0x%llx elapsed_us=%llu qpc=%lld tsc=%llu cpu=%lu irql=%lu pid=%llu tid=%llu",
+                group,
+                index,
+                name,
+                flags,
+                elapsed_us(stop_start, stop_end),
+                stop_end.qpc.QuadPart,
+                stop_end.tsc,
+                current_cpu(),
+                (ULONG)KeGetCurrentIrql(),
+                current_pid(),
+                current_tid());
         } else {
             seh_code = static_cast<ULONG>(STATUS_UNSUCCESSFUL);
+            subtest_status = STATUS_UNSUCCESSFUL;
             detected = true;
+            trace_stamp_t safety_start_end = trace_stamp();
+            HVD_LOG_IMMEDIATE("subtest_safety_start_post group=%s index=%d name=%s flags=0x%llx ok=0 status=0x%08lx elapsed_us=%llu qpc=%lld tsc=%llu cpu=%lu irql=%lu pid=%llu tid=%llu",
+                group,
+                index,
+                name,
+                flags,
+                subtest_status,
+                elapsed_us(safety_start_begin, safety_start_end),
+                safety_start_end.qpc.QuadPart,
+                safety_start_end.tsc,
+                current_cpu(),
+                (ULONG)KeGetCurrentIrql(),
+                current_pid(),
+                current_tid());
         }
 
         LONG recoveries = safety_net::idt::consume_probe_recovery_count();
         LONG unresolved = safety_net::idt::consume_unresolved_exception_count();
-        if (recoveries != 0 || unresolved != 0)
+        if (recoveries != 0 || unresolved != 0) {
             detected = true;
+            if (NT_SUCCESS(subtest_status))
+                subtest_status = STATUS_UNHANDLED_EXCEPTION;
+        }
 
         uint64_t last_vector = 0;
         uint64_t last_error = 0;
@@ -284,13 +383,14 @@ namespace hv_detect {
         safety_net::idt::get_last_exception_snapshot(&last_vector, &last_error, &last_rip, &last_rsp);
 
         trace_stamp_t end = trace_stamp();
-        HVD_LOG_IMMEDIATE("subtest_post group=%s index=%d name=%s flags=0x%llx safety_started=%lu result=%u exception=%lu exception_code=0x%08lx recoveries=%ld unresolved=%ld interrupts=%llu last_vector=0x%llx last_error=0x%llx last_rip_rva=0x%llx last_rsp=0x%llx elapsed_us=%llu qpc=%lld tsc=%llu cpu=%lu irql=%lu pid=%llu tid=%llu",
+        HVD_LOG_IMMEDIATE("subtest_post group=%s index=%d name=%s flags=0x%llx safety_started=%lu result=%u status=0x%08lx exception=%lu exception_code=0x%08lx recoveries=%ld unresolved=%ld interrupts=%llu last_vector=0x%llx last_error=0x%llx last_rip_rva=0x%llx last_rsp=0x%llx elapsed_us=%llu qpc=%lld tsc=%llu cpu=%lu irql=%lu pid=%llu tid=%llu",
             group,
             index,
             name,
             flags,
             safety_started,
             detected ? 1u : 0u,
+            subtest_status,
             exception_seen,
             seh_code,
             recoveries,

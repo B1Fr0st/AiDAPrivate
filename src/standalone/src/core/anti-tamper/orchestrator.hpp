@@ -3861,9 +3861,40 @@ inline bool guard()
                         webhook::write_log("guard", "kernel_clear_dr_runtime_deferred_activation_pending");
                         CFF_GOTO(guard_cff, 9);
                     }
-                    webhook::send_debug_log("guard", "kernel_clear_dr_runtime_failed", true);
-                    enforce_violation_id(aida::reason_ids::reason_id_kernel_debugger_runtime, "kernel_clear_dr_runtime_failed");
-                    CFF_EXIT(guard_cff);
+                    uint64_t retry_debugger_pid = 0;
+                    DWORD final_scan_err = clear_dr_err;
+                    bool retry_scan_ok = false;
+                    bool clean_query_seen = false;
+                    const bool retry_confirmed = kernel_debugger_runtime_scan_retry("guard",
+                                                                                    clear_dr_err,
+                                                                                    activation_pending,
+                                                                                    runtime_authorized,
+                                                                                    retry_debugger_pid,
+                                                                                    final_scan_err,
+                                                                                    retry_scan_ok,
+                                                                                    clean_query_seen);
+                    if (retry_confirmed)
+                    {
+                        webhook::send_debug_log("guard", "kernel_clear_dr_runtime_retry_confirmed", true);
+                        enforce_violation_id(aida::reason_ids::reason_id_kernel_debugger_runtime, "kernel_clear_dr_runtime_retry_confirmed");
+                        CFF_EXIT(guard_cff);
+                    }
+                    if (retry_debugger_pid != 0 &&
+                        kernel_debugger_scan_confirmed_for_enforcement("guard", "clear_dr_runtime_retry_scan", retry_debugger_pid))
+                    {
+                        webhook::send_debug_log("guard", "kernel_clear_dr_runtime_scan_confirmed", true);
+                        enforce_violation_id(aida::reason_ids::reason_id_kernel_debugger_runtime, "kernel_clear_dr_runtime_scan_confirmed");
+                        CFF_EXIT(guard_cff);
+                    }
+                    webhook::write_log_critical_fmt("guard",
+                        "kernel_clear_dr_runtime_unconfirmed_degraded first_err=%lu final_scan_err=%lu retry_scan_ok=%d clean_query_seen=%d activation_pending=%d runtime_authorized=%d",
+                        static_cast<unsigned long>(clear_dr_err),
+                        static_cast<unsigned long>(final_scan_err),
+                        retry_scan_ok ? 1 : 0,
+                        clean_query_seen ? 1 : 0,
+                        activation_pending ? 1 : 0,
+                        runtime_authorized ? 1 : 0);
+                    CFF_GOTO(guard_cff, 9);
                 }
 
                 uint64_t debugger_pid = 0;

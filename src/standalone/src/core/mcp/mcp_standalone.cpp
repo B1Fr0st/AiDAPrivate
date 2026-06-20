@@ -34,6 +34,7 @@
 #include <cstdlib>
 #include <exception>
 #include <future>
+#include <limits>
 #include <memory>
 #include <map>
 #include <shared_mutex>
@@ -44,17 +45,16 @@ namespace mcp_standalone
 namespace
 {
     std::atomic<bool> g_ide_lifecycle_ready{false};
-    constexpr size_t kMcpHttpWorkerThreads = 48;
-    constexpr size_t kMcpHttpMaxQueuedRequests = 1024;
-    constexpr size_t kMcpBatchWorkerThreads = 48;
-    constexpr size_t kMcpBatchMaxQueuedRequests = 2048;
-    constexpr size_t kMcpToolWorkerThreads = 32;
-    constexpr size_t kMcpToolMaxQueuedRequests = 2048;
-    constexpr int kMcpMaxConcurrentStreams = 16;
     constexpr std::uint64_t kMcpDefaultToolTimeoutMs = 45000;
     constexpr std::uint64_t kMcpMinToolTimeoutMs = 500;
     constexpr std::uint64_t kMcpMaxToolTimeoutMs = 120000;
+    constexpr std::uint64_t kMcpBrowserToolMaxTimeoutMs = 300000;
+    constexpr std::uint64_t kMcpBrowserLongActionTimeoutMs = 180000;
+    constexpr std::uint64_t kMcpBrowserCleanupGraceMs = 30000;
     constexpr std::uint64_t kMcpBatchWaitTimeoutMs = 60000;
+    constexpr std::size_t kMcpMaxBatchItems = 4096;
+    constexpr std::size_t kMcpPayloadMaxLength = 64u * 1024u * 1024u;
+    constexpr std::size_t kSseMaxQueuedEvents = 4096;
     constexpr DWORD kSseSessionMaxAgeMs = 60u * 60u * 1000u;
     std::atomic<std::uint64_t> g_http_request_seq{0};
     std::atomic<int> g_active_http_requests{0};
@@ -128,6 +128,84 @@ namespace
     static std::uint64_t mcp_now_ms()
     {
         return static_cast<std::uint64_t>(GetTickCount64());
+    }
+
+    struct mcp_concurrency_config_t
+    {
+        std::size_t http_worker_threads = 256;
+        std::size_t http_max_queued_requests = 32768;
+        std::size_t batch_worker_threads = 128;
+        std::size_t batch_max_queued_requests = 65536;
+        std::size_t tool_worker_threads = 128;
+        std::size_t tool_max_queued_requests = 65536;
+        std::size_t max_concurrent_streams = 128;
+        std::size_t hardware_threads = 16;
+    };
+
+    static std::size_t mcp_hardware_threads()
+    {
+        const unsigned n = std::thread::hardware_concurrency();
+        return n == 0 ? std::size_t{16} : static_cast<std::size_t>(n);
+    }
+
+    static std::size_t clamp_size_value(std::uint64_t value, std::size_t min_value, std::size_t max_value)
+    {
+        if (max_value < min_value)
+            max_value = min_value;
+        if (value < static_cast<std::uint64_t>(min_value))
+            return min_value;
+        if (value > static_cast<std::uint64_t>(max_value))
+            return max_value;
+        return static_cast<std::size_t>(value);
+    }
+
+    static std::size_t scaled_worker_count(std::size_t floor_value, std::size_t per_core, std::size_t cap_value)
+    {
+        const std::size_t hw = mcp_hardware_threads();
+        std::size_t scaled = cap_value;
+        if (per_core != 0 && hw <= cap_value / per_core)
+            scaled = hw * per_core;
+        return clamp_size_value((std::max)(floor_value, scaled), floor_value, cap_value);
+    }
+
+    static std::size_t read_size_env_or_default(const char* name, std::size_t fallback, std::size_t min_value, std::size_t max_value)
+    {
+        if (!name || !name[0])
+            return clamp_size_value(fallback, min_value, max_value);
+        char buf[64] = {};
+        const DWORD n = GetEnvironmentVariableA(name, buf, static_cast<DWORD>(sizeof(buf)));
+        if (n == 0 || n >= static_cast<DWORD>(sizeof(buf)))
+            return clamp_size_value(fallback, min_value, max_value);
+        try {
+            const std::uint64_t parsed = static_cast<std::uint64_t>(std::stoull(std::string(buf), nullptr, 0));
+            return clamp_size_value(parsed, min_value, max_value);
+        } catch (...) {
+            return clamp_size_value(fallback, min_value, max_value);
+        }
+    }
+
+    static mcp_concurrency_config_t build_mcp_concurrency_config()
+    {
+        mcp_concurrency_config_t cfg;
+        cfg.hardware_threads = mcp_hardware_threads();
+        cfg.http_worker_threads = read_size_env_or_default("AIDA_MCP_HTTP_WORKERS", scaled_worker_count(256, 8, 768), 64, 1024);
+        cfg.http_max_queued_requests = read_size_env_or_default("AIDA_MCP_HTTP_QUEUE", 32768, 1024, 262144);
+        cfg.batch_worker_threads = read_size_env_or_default("AIDA_MCP_BATCH_WORKERS", scaled_worker_count(128, 4, 512), 32, 768);
+        cfg.batch_max_queued_requests = read_size_env_or_default("AIDA_MCP_BATCH_QUEUE", 65536, 1024, 262144);
+        cfg.tool_worker_threads = read_size_env_or_default("AIDA_MCP_TOOL_WORKERS", scaled_worker_count(128, 4, 512), 32, 768);
+        cfg.tool_max_queued_requests = read_size_env_or_default("AIDA_MCP_TOOL_QUEUE", 65536, 1024, 262144);
+        const std::size_t stream_cap = (std::max)(std::size_t{16}, (std::min)(std::size_t{512}, cfg.http_worker_threads > 16 ? cfg.http_worker_threads - 16 : cfg.http_worker_threads));
+        const std::size_t stream_floor = (std::min)(std::size_t{128}, stream_cap);
+        const std::size_t stream_scaled = cfg.hardware_threads <= stream_cap / 4 ? cfg.hardware_threads * 4 : stream_cap;
+        const std::size_t stream_fallback = clamp_size_value((std::max)(stream_floor, stream_scaled), 16, stream_cap);
+        cfg.max_concurrent_streams = read_size_env_or_default("AIDA_MCP_MAX_STREAMS", stream_fallback, 16, stream_cap);
+        return cfg;
+    }
+
+    static const mcp_concurrency_config_t& mcp_concurrency_config()
+    {
+        static const mcp_concurrency_config_t cfg = build_mcp_concurrency_config();
+        return cfg;
     }
 
     static void log_work_queue_stats(const char* context)
@@ -637,7 +715,7 @@ namespace
     {
     public:
         mcp_request_task_queue()
-            : _executor("mcp_http_requests", kMcpHttpWorkerThreads, kMcpHttpMaxQueuedRequests)
+            : _executor("mcp_http_requests", mcp_concurrency_config().http_worker_threads, mcp_concurrency_config().http_max_queued_requests)
         {
         }
 
@@ -657,14 +735,40 @@ namespace
 
     static mcp_owned_executor_t& mcp_batch_executor()
     {
-        static mcp_owned_executor_t executor("mcp_jsonrpc_batch", kMcpBatchWorkerThreads, kMcpBatchMaxQueuedRequests);
+        static mcp_owned_executor_t executor("mcp_jsonrpc_batch", mcp_concurrency_config().batch_worker_threads, mcp_concurrency_config().batch_max_queued_requests);
         return executor;
     }
 
     static mcp_owned_executor_t& mcp_tool_executor()
     {
-        static mcp_owned_executor_t executor("mcp_tool_calls", kMcpToolWorkerThreads, kMcpToolMaxQueuedRequests);
+        static mcp_owned_executor_t executor("mcp_tool_calls", mcp_concurrency_config().tool_worker_threads, mcp_concurrency_config().tool_max_queued_requests);
         return executor;
+    }
+
+    static std::string normalized_domain_key(const std::string& domain)
+    {
+        return domain.empty() ? std::string("misc") : domain;
+    }
+
+    static bool is_exclusive_domain_lane(const std::string& lane)
+    {
+        return lane.rfind("exclusive_domain_", 0) == 0;
+    }
+
+    static mcp_owned_executor_t& mcp_domain_tool_executor(const std::string& domain)
+    {
+        static std::mutex mtx;
+        static std::map<std::string, std::shared_ptr<mcp_owned_executor_t>> executors;
+        const std::string key = normalized_domain_key(domain);
+        std::lock_guard<std::mutex> lk(mtx);
+        auto it = executors.find(key);
+        if (it != executors.end() && it->second)
+            return *it->second;
+        const std::string name = "mcp_domain_" + key;
+        auto executor = std::make_shared<mcp_owned_executor_t>(name.c_str(), 1, mcp_concurrency_config().tool_max_queued_requests);
+        auto* ptr = executor.get();
+        executors.emplace(key, std::move(executor));
+        return *ptr;
     }
 
     static std::string remote_endpoint(const httplib::Request& req)
@@ -705,8 +809,9 @@ namespace
 
     static std::shared_ptr<mcp_stream_state_t> acquire_stream_slot(const char* route, const httplib::Request& req, httplib::Response& res)
     {
+        const int max_streams = static_cast<int>(mcp_concurrency_config().max_concurrent_streams);
         int cur = g_active_streams.load(std::memory_order_acquire);
-        while (cur < kMcpMaxConcurrentStreams) {
+        while (cur < max_streams) {
             if (g_active_streams.compare_exchange_weak(cur, cur + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
                 auto state = std::make_shared<mcp_stream_state_t>();
                 state->id = g_stream_seq.fetch_add(1, std::memory_order_acq_rel) + 1;
@@ -733,7 +838,7 @@ namespace
             static_cast<unsigned long>(GetCurrentProcessId()),
             static_cast<unsigned long>(GetCurrentThreadId()),
             cur,
-            kMcpMaxConcurrentStreams,
+            max_streams,
             g_active_http_requests.load(std::memory_order_acquire));
         res.status = 503;
         res.set_header("Retry-After", "2");
@@ -1305,34 +1410,183 @@ static std::uint32_t target_pid_from_args(const json& args)
     return 0;
 }
 
-static std::uint64_t tool_timeout_ms_from_args(const json& args)
+struct tool_timeout_resolution_t
 {
-    std::uint64_t requested = kMcpDefaultToolTimeoutMs;
-    if (args.is_object()) {
-        for (const char* key : {"tool_timeout_ms", "timeout_ms", "deadline_ms"}) {
-            if (!args.contains(key))
-                continue;
-            const auto& v = args[key];
-            try {
-                if (v.is_number_unsigned())
-                    requested = v.get<std::uint64_t>();
-                else if (v.is_number_integer()) {
-                    const auto s = v.get<std::int64_t>();
-                    if (s > 0)
-                        requested = static_cast<std::uint64_t>(s);
-                } else if (v.is_string()) {
-                    const std::string s = v.get<std::string>();
-                    if (!s.empty())
-                        requested = static_cast<std::uint64_t>(std::stoull(s, nullptr, 0));
+    std::uint64_t requested_ms = kMcpDefaultToolTimeoutMs;
+    std::uint64_t effective_ms = kMcpDefaultToolTimeoutMs;
+    std::uint64_t default_ms = kMcpDefaultToolTimeoutMs;
+    std::uint64_t max_ms = kMcpMaxToolTimeoutMs;
+    bool explicit_timeout = false;
+    bool action_aware = false;
+    std::string action;
+    std::string source = "default";
+};
+
+static bool json_positive_u64(const json& v, std::uint64_t& out)
+{
+    try {
+        if (v.is_number_unsigned()) {
+            const auto n = v.get<std::uint64_t>();
+            if (n > 0) {
+                out = n;
+                return true;
+            }
+        } else if (v.is_number_integer()) {
+            const auto n = v.get<std::int64_t>();
+            if (n > 0) {
+                out = static_cast<std::uint64_t>(n);
+                return true;
+            }
+        } else if (v.is_string()) {
+            const std::string s = v.get<std::string>();
+            if (!s.empty()) {
+                const auto n = static_cast<std::uint64_t>(std::stoull(s, nullptr, 0));
+                if (n > 0) {
+                    out = n;
+                    return true;
                 }
-                break;
-            } catch (...) {
-                requested = kMcpDefaultToolTimeoutMs;
-                break;
             }
         }
+    } catch (...) {
     }
-    return std::clamp<std::uint64_t>(requested, kMcpMinToolTimeoutMs, kMcpMaxToolTimeoutMs);
+    return false;
+}
+
+static bool json_positive_u64_field(const json& obj, const char* key, std::uint64_t& out)
+{
+    if (!obj.is_object() || !obj.contains(key))
+        return false;
+    return json_positive_u64(obj[key], out);
+}
+
+static const json* payload_object(const json& args)
+{
+    if (!args.is_object() || !args.contains("payload") || !args["payload"].is_object())
+        return nullptr;
+    return &args["payload"];
+}
+
+static std::string browser_action_from_args(const json& args)
+{
+    if (args.is_object()) {
+        for (const char* key : {"action", "operation"}) {
+            if (args.contains(key) && args[key].is_string())
+                return lower_ascii(args[key].get<std::string>());
+        }
+    }
+    if (const json* payload = payload_object(args)) {
+        for (const char* key : {"action", "operation"}) {
+            if (payload->contains(key) && (*payload)[key].is_string())
+                return lower_ascii((*payload)[key].get<std::string>());
+        }
+    }
+    return {};
+}
+
+static bool browser_arg_timeout_ms(const json& args, const char* key, std::uint64_t& out)
+{
+    if (json_positive_u64_field(args, key, out))
+        return true;
+    if (const json* payload = payload_object(args))
+        return json_positive_u64_field(*payload, key, out);
+    return false;
+}
+
+static bool browser_long_action(const std::string& tool_name, const std::string& action)
+{
+    if (tool_name == "browser_lifecycle")
+        return action == "launch";
+    if (tool_name == "browser_navigation")
+        return action == "navigate" || action == "diagnose" || action == "matrix";
+    return false;
+}
+
+static std::uint64_t browser_timeout_with_grace(std::uint64_t timeout_ms)
+{
+    if (timeout_ms > kMcpBrowserToolMaxTimeoutMs - kMcpBrowserCleanupGraceMs)
+        return kMcpBrowserToolMaxTimeoutMs;
+    return timeout_ms + kMcpBrowserCleanupGraceMs;
+}
+
+static std::uint64_t browser_duration_timeout_with_grace(std::uint64_t duration_s)
+{
+    const std::uint64_t max_seconds = (kMcpBrowserToolMaxTimeoutMs - kMcpBrowserCleanupGraceMs) / 1000ULL;
+    if (duration_s > max_seconds)
+        return kMcpBrowserToolMaxTimeoutMs;
+    return duration_s * 1000ULL + kMcpBrowserCleanupGraceMs;
+}
+
+static tool_timeout_resolution_t resolve_tool_timeout(const std::string& tool_name, const json& args)
+{
+    tool_timeout_resolution_t r;
+    const bool browser_tool = is_camoufox_browser_tool_name(tool_name);
+    if (browser_tool) {
+        r.max_ms = kMcpBrowserToolMaxTimeoutMs;
+        r.action = browser_action_from_args(args);
+        if (browser_long_action(tool_name, r.action)) {
+            r.default_ms = kMcpBrowserLongActionTimeoutMs + kMcpBrowserCleanupGraceMs;
+            r.action_aware = true;
+            r.source = "browser_action_default";
+        } else if (tool_name == "compare_env") {
+            r.default_ms = 95000;
+            r.action_aware = true;
+            r.source = "browser_probe_default";
+        } else if (tool_name == "browser_instrumentation" && r.action == "trace") {
+            r.default_ms = 150000;
+            r.action_aware = true;
+            r.source = "browser_trace_default";
+        }
+    }
+    r.requested_ms = r.default_ms;
+    const char* const timeout_keys[] = {"tool_timeout_ms", "timeout_ms", "deadline_ms"};
+    for (const char* key : timeout_keys) {
+        std::uint64_t parsed = 0;
+        if (json_positive_u64_field(args, key, parsed)) {
+            r.requested_ms = parsed;
+            r.explicit_timeout = true;
+            r.source = std::string("explicit_") + key;
+            break;
+        }
+    }
+    if (browser_tool && !r.explicit_timeout) {
+        std::uint64_t parsed = 0;
+        if (browser_arg_timeout_ms(args, "call_timeout_ms", parsed)) {
+            r.requested_ms = parsed;
+            r.explicit_timeout = true;
+            r.source = "explicit_call_timeout_ms";
+        }
+    }
+    if (browser_tool) {
+        std::uint64_t operation_timeout = 0;
+        if (browser_arg_timeout_ms(args, "launch_timeout_ms", operation_timeout) ||
+            browser_arg_timeout_ms(args, "timeout", operation_timeout)) {
+            r.requested_ms = (std::max)(r.requested_ms, browser_timeout_with_grace(operation_timeout));
+            r.action_aware = true;
+            if (!r.explicit_timeout)
+                r.source = "browser_operation_timeout";
+        }
+        std::uint64_t duration_s = 0;
+        if (browser_arg_timeout_ms(args, "duration", duration_s)) {
+            r.requested_ms = (std::max)(r.requested_ms, browser_duration_timeout_with_grace(duration_s));
+            r.action_aware = true;
+            if (!r.explicit_timeout)
+                r.source = "browser_duration";
+        }
+        if (r.action_aware && r.requested_ms < r.default_ms) {
+            r.requested_ms = r.default_ms;
+            r.source += "_action_floor";
+        }
+    }
+    r.effective_ms = std::clamp<std::uint64_t>(r.requested_ms, kMcpMinToolTimeoutMs, r.max_ms);
+    return r;
+}
+
+static std::uint64_t saturated_deadline_ms(std::uint64_t start_ms, std::uint64_t timeout_ms)
+{
+    const std::uint64_t max_value = (std::numeric_limits<std::uint64_t>::max)();
+    if (timeout_ms > max_value - start_ms)
+        return max_value;
+    return start_ms + timeout_ms;
 }
 
 static std::string format_sse_event(const std::string& event_type, const std::string& data)
@@ -1361,6 +1615,14 @@ struct sse_session_t
     {
         last_activity_tick.store(mcp_now_ms(), std::memory_order_release);
         std::lock_guard<std::mutex> lk(mtx);
+        if (events.size() >= kSseMaxQueuedEvents) {
+            diag::log_tagged_fmt("mcp_srv",
+                "sse_session_queue_trim session=%s queued=%zu max=%zu",
+                id.c_str(),
+                events.size(),
+                kSseMaxQueuedEvents);
+            events.pop();
+        }
         events.push(event);
     }
 
@@ -2727,8 +2989,10 @@ json server_t::handle_tools_call(const json& id, const json& params)
                    ? params["arguments"] : json::object();
     const std::string payload_shape = payload_shape_summary(arguments);
     const std::uint32_t target_pid = target_pid_from_args(arguments);
-    const std::uint64_t timeout_ms = tool_timeout_ms_from_args(arguments);
-    const std::uint64_t deadline_ms = mcp_now_ms() + timeout_ms;
+    const tool_timeout_resolution_t timeout_resolution = resolve_tool_timeout(tool_name, arguments);
+    const std::uint64_t timeout_ms = timeout_resolution.effective_ms;
+    const std::uint64_t requested_deadline_ms = saturated_deadline_ms(call_begin, timeout_resolution.requested_ms);
+    const std::uint64_t deadline_ms = saturated_deadline_ms(call_begin, timeout_ms);
     std::string validation_status = "params_ok";
     std::string dependency_status = "not_checked";
 
@@ -2836,12 +3100,23 @@ json server_t::handle_tools_call(const json& id, const json& params)
         meta->payload_shape = payload_shape;
         meta->cancel_token = call_scope.token;
     }
+    const bool use_domain_executor = is_exclusive_domain_lane(dispatch_metrics.lane);
+    const std::string queue_owner = use_domain_executor
+        ? std::string("domain_executor_") + normalized_domain_key(domain)
+        : std::string("tool_executor");
+    const std::string queue_full_status = use_domain_executor
+        ? std::string("domain_executor_queue_full")
+        : std::string("tool_executor_queue_full");
+    mcp_owned_executor_t& selected_executor = use_domain_executor
+        ? mcp_domain_tool_executor(domain)
+        : mcp_tool_executor();
 
     struct async_tool_call_state_t
     {
         std::promise<tool_result_t> promise;
         std::atomic<bool> started{false};
         std::atomic<bool> finished{false};
+        std::atomic<bool> timed_out{false};
         std::mutex mtx;
         tool_invocation_metrics_t metrics;
     };
@@ -2849,22 +3124,29 @@ json server_t::handle_tools_call(const json& id, const json& params)
     auto state = std::make_shared<async_tool_call_state_t>();
     auto future = state->promise.get_future();
     diag::log_tagged_fmt("mcp_srv",
-        "tool_call_enqueue seq=%llu diag_id=%s request_id='%s' tool='%s' domain='%s' lane='%s' read_only=%d target_pid=%u timeout_ms=%llu deadline_ms=%llu payload_shape='%s' validation=%s dependency=%s",
+        "tool_call_enqueue seq=%llu diag_id=%s request_id='%s' tool='%s' action='%s' domain='%s' lane='%s' queue_owner=%s read_only=%d target_pid=%u requested_timeout_ms=%llu effective_timeout_ms=%llu requested_deadline_ms=%llu effective_deadline_ms=%llu timeout_source=%s timeout_max_ms=%llu action_aware=%d payload_shape='%s' validation=%s dependency=%s",
         static_cast<unsigned long long>(seq),
         diag_id.c_str(),
         request_id.c_str(),
         tool_name.c_str(),
+        timeout_resolution.action.c_str(),
         domain.c_str(),
         dispatch_metrics.lane.c_str(),
+        queue_owner.c_str(),
         found.read_only ? 1 : 0,
         target_pid,
+        static_cast<unsigned long long>(timeout_resolution.requested_ms),
         static_cast<unsigned long long>(timeout_ms),
+        static_cast<unsigned long long>(requested_deadline_ms),
         static_cast<unsigned long long>(deadline_ms),
+        timeout_resolution.source.c_str(),
+        static_cast<unsigned long long>(timeout_resolution.max_ms),
+        timeout_resolution.action_aware ? 1 : 0,
         payload_shape.c_str(),
         validation_status.c_str(),
         dependency_status.c_str());
 
-    auto task = [state, meta, call_token = call_scope.token, found, arguments, handler_copy, seq, diag_id, request_id, tool_name, domain, timeout_ms, deadline_ms, payload_shape, validation_status, dependency_status, target_pid]() mutable {
+    auto task = [state, meta, call_token = call_scope.token, found, arguments, handler_copy, seq, diag_id, request_id, tool_name, domain, queue_owner, timeout_ms, deadline_ms, requested_timeout_ms = timeout_resolution.requested_ms, requested_deadline_ms, timeout_action = timeout_resolution.action, timeout_source = timeout_resolution.source, timeout_max_ms = timeout_resolution.max_ms, timeout_action_aware = timeout_resolution.action_aware, payload_shape, validation_status, dependency_status, target_pid, call_begin]() mutable {
         state->started.store(true, std::memory_order_release);
         scoped_call_cancel_t scoped_cancel(call_token);
         scoped_call_metadata_t scoped_metadata(diag_id, tool_name, deadline_ms);
@@ -2883,23 +3165,96 @@ json server_t::handle_tools_call(const json& id, const json& params)
             metrics.lane.c_str(),
             static_cast<unsigned long long>(deadline_ms),
             call_token && call_token->load(std::memory_order_acquire) ? 1 : 0);
-        tool_result_t tr = invoke_tool_with_concurrency_policy(found, arguments, handler_copy, &metrics);
+        const bool cancelled_before_dispatch = call_token && call_token->load(std::memory_order_acquire);
+        const std::uint64_t dispatch_ms = mcp_now_ms();
+        const bool expired_before_dispatch = deadline_ms != 0 && dispatch_ms >= deadline_ms;
+        tool_result_t tr;
+        if (cancelled_before_dispatch || expired_before_dispatch) {
+            json stale;
+            stale["diagnostic_id"] = diag_id;
+            stale["request_id"] = request_id;
+            stale["tool"] = tool_name;
+            stale["action"] = timeout_action;
+            stale["domain"] = domain;
+            stale["lane"] = metrics.lane;
+            stale["queue_owner"] = queue_owner;
+            stale["requested_timeout_ms"] = requested_timeout_ms;
+            stale["effective_timeout_ms"] = timeout_ms;
+            stale["requested_deadline_ms"] = requested_deadline_ms;
+            stale["effective_deadline_ms"] = deadline_ms;
+            stale["dispatch_ms"] = dispatch_ms;
+            stale["expired_before_dispatch"] = expired_before_dispatch;
+            stale["cancelled_before_dispatch"] = cancelled_before_dispatch;
+            stale["timeout_source"] = timeout_source;
+            stale["timeout_max_ms"] = timeout_max_ms;
+            stale["action_aware_timeout"] = timeout_action_aware;
+            const char* stale_code = expired_before_dispatch ? "tool_dispatch_deadline_expired" : "tool_dispatch_cancelled";
+            tr = tool_result_t::error(expired_before_dispatch
+                ? std::string("Tool call expired before handler dispatch.")
+                : std::string("Tool call was cancelled before handler dispatch."),
+                stale_code,
+                stale);
+            state->timed_out.store(true, std::memory_order_release);
+            diag::log_tagged_fmt("mcp_srv",
+                "tool_call_handler_skip seq=%llu diag_id=%s request_id='%s' tool='%s' action='%s' domain='%s' lane='%s' queue_owner=%s expired=%d cancelled=%d dispatch_delay_ms=%llu elapsed_ms=%llu",
+                static_cast<unsigned long long>(seq),
+                diag_id.c_str(),
+                request_id.c_str(),
+                tool_name.c_str(),
+                timeout_action.c_str(),
+                domain.c_str(),
+                metrics.lane.c_str(),
+                queue_owner.c_str(),
+                expired_before_dispatch ? 1 : 0,
+                cancelled_before_dispatch ? 1 : 0,
+                static_cast<unsigned long long>(dispatch_ms >= call_begin ? dispatch_ms - call_begin : 0),
+                static_cast<unsigned long long>(mcp_now_ms() - call_begin));
+        } else {
+            tr = invoke_tool_with_concurrency_policy(found, arguments, handler_copy, &metrics);
+        }
         update_executor_task_lane(meta, metrics.lane);
         {
             std::lock_guard<std::mutex> lk(state->mtx);
             state->metrics = metrics;
         }
         state->finished.store(true, std::memory_order_release);
+        const bool timed_out = state->timed_out.load(std::memory_order_acquire);
         diag::log_tagged_fmt("mcp_srv",
-            "tool_call_handler_done seq=%llu diag_id=%s tool='%s' success=%d lane='%s' lock_wait_ms=%llu handler_elapsed_ms=%llu cancelled=%d",
+            "tool_call_handler_done seq=%llu diag_id=%s tool='%s' action='%s' success=%d lane='%s' queue_owner=%s lock_wait_ms=%llu handler_elapsed_ms=%llu cancelled=%d timed_out=%d elapsed_ms=%llu",
             static_cast<unsigned long long>(seq),
             diag_id.c_str(),
             tool_name.c_str(),
+            timeout_action.c_str(),
             tr.success ? 1 : 0,
             metrics.lane.c_str(),
+            queue_owner.c_str(),
             static_cast<unsigned long long>(metrics.lock_wait_ms),
             static_cast<unsigned long long>(metrics.handler_elapsed_ms),
-            call_token && call_token->load(std::memory_order_acquire) ? 1 : 0);
+            call_token && call_token->load(std::memory_order_acquire) ? 1 : 0,
+            timed_out ? 1 : 0,
+            static_cast<unsigned long long>(mcp_now_ms() - call_begin));
+        if (timed_out && is_camoufox_browser_tool_name(tool_name))
+        {
+            diag::log_tagged_fmt("mcp_srv",
+                "browser_tool_late_result_disposition seq=%llu diag_id=%s request_id='%s' queue_owner=%s tool='%s' action='%s' lane='%s' success=%d requested_timeout_ms=%llu effective_timeout_ms=%llu requested_deadline_ms=%llu effective_deadline_ms=%llu timeout_source=%s timeout_max_ms=%llu action_aware=%d elapsed_ms=%llu cancelled=%d disposition=discarded_after_timeout",
+                static_cast<unsigned long long>(seq),
+                diag_id.c_str(),
+                request_id.c_str(),
+                queue_owner.c_str(),
+                tool_name.c_str(),
+                timeout_action.c_str(),
+                metrics.lane.c_str(),
+                tr.success ? 1 : 0,
+                static_cast<unsigned long long>(requested_timeout_ms),
+                static_cast<unsigned long long>(timeout_ms),
+                static_cast<unsigned long long>(requested_deadline_ms),
+                static_cast<unsigned long long>(deadline_ms),
+                timeout_source.c_str(),
+                static_cast<unsigned long long>(timeout_max_ms),
+                timeout_action_aware ? 1 : 0,
+                static_cast<unsigned long long>(mcp_now_ms() - call_begin),
+                call_token && call_token->load(std::memory_order_acquire) ? 1 : 0);
+        }
         try {
             state->promise.set_value(std::move(tr));
         } catch (const std::exception& ex) {
@@ -2918,25 +3273,43 @@ json server_t::handle_tools_call(const json& id, const json& params)
         }
     };
 
-    if (!mcp_tool_executor().enqueue(std::move(task), meta)) {
+    if (!selected_executor.enqueue(std::move(task), meta)) {
         call_scope.cancel();
         dispatch_metrics.lane = predicted_tool_lane(found, arguments);
-        json err = make_error(id, -32072, "MCP tool executor queue is full; tool was not started.");
+        json err = make_error(id, -32072, "MCP executor queue is full; tool was not started.");
         err["error"]["data"] = tool_diagnostics_json(
             seq, diag_id, request_id, tool_name, domain, found.read_only, target_pid,
-            timeout_ms, deadline_ms, payload_shape, validation_status, "tool_executor_queue_full",
+            timeout_ms, deadline_ms, payload_shape, validation_status, queue_full_status,
             dispatch_metrics, meta, true);
+        err["error"]["data"]["action"] = timeout_resolution.action;
+        err["error"]["data"]["queue_owner"] = queue_owner;
+        err["error"]["data"]["requested_timeout_ms"] = timeout_resolution.requested_ms;
+        err["error"]["data"]["effective_timeout_ms"] = timeout_ms;
+        err["error"]["data"]["requested_deadline_ms"] = requested_deadline_ms;
+        err["error"]["data"]["effective_deadline_ms"] = deadline_ms;
+        err["error"]["data"]["timeout_source"] = timeout_resolution.source;
+        err["error"]["data"]["timeout_max_ms"] = timeout_resolution.max_ms;
+        err["error"]["data"]["action_aware_timeout"] = timeout_resolution.action_aware;
+        err["error"]["data"]["explicit_timeout"] = timeout_resolution.explicit_timeout;
+        err["error"]["data"]["late_result_disposition"] = "not_started";
         diag::log_tagged_fmt("mcp_srv",
-            "tool_call_enqueue_failed seq=%llu diag_id=%s tool='%s' reason=tool_executor_queue_full elapsed_ms=%llu",
+            "tool_call_enqueue_failed seq=%llu diag_id=%s request_id='%s' tool='%s' action='%s' queue_owner=%s reason=%s requested_timeout_ms=%llu effective_timeout_ms=%llu elapsed_ms=%llu late_result_disposition=not_started",
             static_cast<unsigned long long>(seq),
             diag_id.c_str(),
+            request_id.c_str(),
             tool_name.c_str(),
+            timeout_resolution.action.c_str(),
+            queue_owner.c_str(),
+            queue_full_status.c_str(),
+            static_cast<unsigned long long>(timeout_resolution.requested_ms),
+            static_cast<unsigned long long>(timeout_ms),
             static_cast<unsigned long long>(mcp_now_ms() - call_begin));
         return err;
     }
 
     const auto wait_status = future.wait_for(std::chrono::milliseconds(timeout_ms));
     if (wait_status != std::future_status::ready) {
+        state->timed_out.store(true, std::memory_order_release);
         call_scope.cancel();
         {
             std::lock_guard<std::mutex> lk(state->mtx);
@@ -2950,21 +3323,65 @@ json server_t::handle_tools_call(const json& id, const json& params)
             dispatch_metrics, meta, true);
         diag["started"] = state->started.load(std::memory_order_acquire);
         diag["finished"] = state->finished.load(std::memory_order_acquire);
+        diag["action"] = timeout_resolution.action;
+        diag["queue_owner"] = queue_owner;
+        diag["requested_timeout_ms"] = timeout_resolution.requested_ms;
+        diag["effective_timeout_ms"] = timeout_ms;
+        diag["requested_deadline_ms"] = requested_deadline_ms;
+        diag["effective_deadline_ms"] = deadline_ms;
+        diag["timeout_source"] = timeout_resolution.source;
+        diag["timeout_max_ms"] = timeout_resolution.max_ms;
+        diag["action_aware_timeout"] = timeout_resolution.action_aware;
+        diag["explicit_timeout"] = timeout_resolution.explicit_timeout;
+        diag["late_result_disposition"] = "pending_cooperative_drain";
         diag["residual"] = "cooperative cancellation requested; a stuck native call may continue until it returns";
         diag::log_tagged_fmt("mcp_srv",
-            "tool_call_timeout seq=%llu diag_id=%s tool='%s' domain='%s' lane='%s' timeout_ms=%llu queue_wait_ms=%llu lock_wait_ms=%llu handler_elapsed_ms=%llu started=%d finished=%d cancelled=1 elapsed_ms=%llu",
+            "tool_call_timeout seq=%llu diag_id=%s request_id='%s' tool='%s' action='%s' domain='%s' lane='%s' queue_owner=%s timeout_ms=%llu requested_timeout_ms=%llu requested_deadline_ms=%llu effective_deadline_ms=%llu queue_wait_ms=%llu lock_wait_ms=%llu handler_elapsed_ms=%llu started=%d finished=%d cancelled=1 elapsed_ms=%llu late_result_disposition=pending_cooperative_drain",
             static_cast<unsigned long long>(seq),
             diag_id.c_str(),
+            request_id.c_str(),
             tool_name.c_str(),
+            timeout_resolution.action.c_str(),
             domain.c_str(),
             dispatch_metrics.lane.c_str(),
+            queue_owner.c_str(),
             static_cast<unsigned long long>(timeout_ms),
+            static_cast<unsigned long long>(timeout_resolution.requested_ms),
+            static_cast<unsigned long long>(requested_deadline_ms),
+            static_cast<unsigned long long>(deadline_ms),
             static_cast<unsigned long long>(diag.value("queue_wait_ms", 0ull)),
             static_cast<unsigned long long>(dispatch_metrics.lock_wait_ms),
             static_cast<unsigned long long>(dispatch_metrics.handler_elapsed_ms),
             state->started.load(std::memory_order_acquire) ? 1 : 0,
             state->finished.load(std::memory_order_acquire) ? 1 : 0,
             static_cast<unsigned long long>(mcp_now_ms() - call_begin));
+        if (is_camoufox_browser_tool_name(tool_name))
+        {
+            diag::log_tagged_fmt("mcp_srv",
+                "browser_tool_timeout seq=%llu diag_id=%s request_id='%s' queue_owner=%s tool='%s' action='%s' domain='%s' lane='%s' requested_timeout_ms=%llu effective_timeout_ms=%llu requested_deadline_ms=%llu effective_deadline_ms=%llu timeout_source=%s timeout_max_ms=%llu action_aware=%d explicit_timeout=%d queue_wait_ms=%llu lock_wait_ms=%llu handler_elapsed_ms=%llu started=%d finished=%d cancel_state=signalled elapsed_ms=%llu late_result_disposition=pending_cooperative_drain",
+                static_cast<unsigned long long>(seq),
+                diag_id.c_str(),
+                request_id.c_str(),
+                queue_owner.c_str(),
+                tool_name.c_str(),
+                timeout_resolution.action.c_str(),
+                domain.c_str(),
+                dispatch_metrics.lane.c_str(),
+                static_cast<unsigned long long>(timeout_resolution.requested_ms),
+                static_cast<unsigned long long>(timeout_ms),
+                static_cast<unsigned long long>(requested_deadline_ms),
+                static_cast<unsigned long long>(deadline_ms),
+                timeout_resolution.source.c_str(),
+                static_cast<unsigned long long>(timeout_resolution.max_ms),
+                timeout_resolution.action_aware ? 1 : 0,
+                timeout_resolution.explicit_timeout ? 1 : 0,
+                static_cast<unsigned long long>(diag.value("queue_wait_ms", 0ull)),
+                static_cast<unsigned long long>(dispatch_metrics.lock_wait_ms),
+                static_cast<unsigned long long>(dispatch_metrics.handler_elapsed_ms),
+                state->started.load(std::memory_order_acquire) ? 1 : 0,
+                state->finished.load(std::memory_order_acquire) ? 1 : 0,
+                static_cast<unsigned long long>(mcp_now_ms() - call_begin));
+        }
         json err = make_error(id, -32070, "MCP tool call timed out; cancellation was signalled for cooperative drain. Diagnostic id: " + diag_id);
         err["error"]["data"] = std::move(diag);
         return err;
@@ -2982,22 +3399,40 @@ json server_t::handle_tools_call(const json& id, const json& params)
         seq, diag_id, request_id, tool_name, domain, found.read_only, target_pid,
         timeout_ms, deadline_ms, payload_shape, validation_status, dependency_status,
         dispatch_metrics, meta, cancelled);
+    diagnostics["action"] = timeout_resolution.action;
+    diagnostics["queue_owner"] = queue_owner;
+    diagnostics["requested_timeout_ms"] = timeout_resolution.requested_ms;
+    diagnostics["effective_timeout_ms"] = timeout_ms;
+    diagnostics["requested_deadline_ms"] = requested_deadline_ms;
+    diagnostics["effective_deadline_ms"] = deadline_ms;
+    diagnostics["timeout_source"] = timeout_resolution.source;
+    diagnostics["timeout_max_ms"] = timeout_resolution.max_ms;
+    diagnostics["action_aware_timeout"] = timeout_resolution.action_aware;
+    diagnostics["explicit_timeout"] = timeout_resolution.explicit_timeout;
+    diagnostics["late_result_disposition"] = cancelled ? "cancelled_before_delivery" : "delivered";
     diag::log_tagged_fmt("mcp_srv",
-        "handle_tools_call result seq=%llu diag_id=%s tool='%s' success=%d domain='%s' lane='%s' read_only=%d target_pid=%u queue_wait_ms=%llu lock_wait_ms=%llu handler_elapsed_ms=%llu deadline_ms=%llu cancelled=%d elapsed_ms=%llu",
+        "handle_tools_call result seq=%llu diag_id=%s request_id='%s' tool='%s' action='%s' success=%d domain='%s' lane='%s' queue_owner=%s read_only=%d target_pid=%u requested_timeout_ms=%llu effective_timeout_ms=%llu requested_deadline_ms=%llu effective_deadline_ms=%llu queue_wait_ms=%llu lock_wait_ms=%llu handler_elapsed_ms=%llu cancelled=%d elapsed_ms=%llu late_result_disposition=%s",
         static_cast<unsigned long long>(seq),
         diag_id.c_str(),
+        request_id.c_str(),
         tool_name.c_str(),
+        timeout_resolution.action.c_str(),
         tr.success ? 1 : 0,
         domain.c_str(),
         dispatch_metrics.lane.c_str(),
+        queue_owner.c_str(),
         found.read_only ? 1 : 0,
         target_pid,
+        static_cast<unsigned long long>(timeout_resolution.requested_ms),
+        static_cast<unsigned long long>(timeout_ms),
+        static_cast<unsigned long long>(requested_deadline_ms),
+        static_cast<unsigned long long>(deadline_ms),
         static_cast<unsigned long long>(diagnostics.value("queue_wait_ms", 0ull)),
         static_cast<unsigned long long>(dispatch_metrics.lock_wait_ms),
         static_cast<unsigned long long>(dispatch_metrics.handler_elapsed_ms),
-        static_cast<unsigned long long>(deadline_ms),
         cancelled ? 1 : 0,
-        static_cast<unsigned long long>(mcp_now_ms() - call_begin));
+        static_cast<unsigned long long>(mcp_now_ms() - call_begin),
+        cancelled ? "cancelled_before_delivery" : "delivered");
 
     if (cancelled) {
         json cancel_result;
@@ -3254,13 +3689,28 @@ std::string handle_body(server_t* self, const std::string& body)
 
         const std::uint64_t batch_id = g_mcp_batch_seq.fetch_add(1u, std::memory_order_acq_rel) + 1u;
         const std::size_t batch_size = parsed.size();
+        if (batch_size > kMcpMaxBatchItems) {
+            json err = self->make_error(nullptr, -32073, "JSON-RPC batch item limit exceeded.");
+            err["error"]["data"] = {
+                {"batch_id", batch_id},
+                {"items", batch_size},
+                {"max_items", kMcpMaxBatchItems}
+            };
+            diag::log_tagged_fmt("mcp_srv",
+                "jsonrpc_batch_rejected batch=%llu items=%zu max_items=%zu reason=item_limit",
+                static_cast<unsigned long long>(batch_id),
+                batch_size,
+                kMcpMaxBatchItems);
+            return json_dump_safe(err);
+        }
         const std::uint64_t batch_start = mcp_now_ms();
+        const auto& mcp_cfg = mcp_concurrency_config();
         diag::log_tagged_fmt("mcp_srv",
             "jsonrpc_batch_begin batch=%llu items=%zu workers=%zu max_queue=%zu",
             static_cast<unsigned long long>(batch_id),
             batch_size,
-            kMcpBatchWorkerThreads,
-            kMcpBatchMaxQueuedRequests);
+            mcp_cfg.batch_worker_threads,
+            mcp_cfg.batch_max_queued_requests);
 
         struct batch_state_t {
             std::vector<json> responses;
@@ -3275,7 +3725,7 @@ std::string handle_body(server_t* self, const std::string& body)
         state->responses.resize(batch_size);
         state->has_response.resize(batch_size, 0);
         state->completed_items.resize(batch_size, 0);
-        std::atomic<std::size_t> inline_count{0};
+        std::atomic<std::size_t> overload_count{0};
 
         auto complete_item = [state](std::size_t index, json response) {
             {
@@ -3333,16 +3783,29 @@ std::string handle_body(server_t* self, const std::string& body)
                 meta->lane = "jsonrpc_batch_item";
                 meta->deadline_ms = batch_start + kMcpBatchWaitTimeoutMs;
             }
+            json item_id = item.is_object() && item.contains("id") ? item["id"] : json(nullptr);
+            const std::string item_method = item.is_object() ? item.value("method", std::string()) : std::string("invalid");
+            const std::string item_tool = item.is_object() && item.value("method", std::string()) == "tools/call" && item.contains("params") && item["params"].is_object() && item["params"].contains("name") && item["params"]["name"].is_string() ? item["params"]["name"].get<std::string>() : std::string();
             if (!executor.enqueue([execute_item, i, item = std::move(item)]() mutable {
                 execute_item(i, std::move(item));
             }, meta)) {
-                inline_count.fetch_add(1u, std::memory_order_acq_rel);
+                overload_count.fetch_add(1u, std::memory_order_acq_rel);
                 diag::log_tagged_fmt("mcp_srv",
-                    "jsonrpc_batch_enqueue_fallback batch=%llu index=%zu items=%zu",
+                    "jsonrpc_batch_enqueue_rejected batch=%llu index=%zu items=%zu disposition=item_error",
                     static_cast<unsigned long long>(batch_id),
                     i,
                     batch_size);
-                execute_item(i, parsed[i]);
+                json err = self->make_error(item_id, -32074, "JSON-RPC batch executor queue is full; item was not started.");
+                err["error"]["data"] = {
+                    {"batch_id", batch_id},
+                    {"index", i},
+                    {"items", batch_size},
+                    {"method", item_method},
+                    {"tool", item_tool},
+                    {"queue_owner", "mcp_jsonrpc_batch"},
+                    {"disposition", "not_started"}
+                };
+                complete_item(i, std::move(err));
             }
         }
 
@@ -3381,11 +3844,11 @@ std::string handle_body(server_t* self, const std::string& body)
                 responses.push_back(std::move(state->responses[i]));
         }
         diag::log_tagged_fmt("mcp_srv",
-            "jsonrpc_batch_done batch=%llu items=%zu responses=%zu inline=%zu complete=%d elapsed_ms=%llu",
+            "jsonrpc_batch_done batch=%llu items=%zu responses=%zu overload=%zu complete=%d elapsed_ms=%llu",
             static_cast<unsigned long long>(batch_id),
             batch_size,
             responses.size(),
-            inline_count.load(std::memory_order_acquire),
+            overload_count.load(std::memory_order_acquire),
             batch_complete ? 1 : 0,
             static_cast<unsigned long long>(mcp_now_ms() - batch_start));
         if (responses.empty()) return "";
@@ -3598,24 +4061,45 @@ void server_t::stop()
 void server_t::server_thread_func(int port)
 {
     diag::log_tagged_fmt("mcp_srv", "server_thread_func entry port=%d", port);
+    const auto& mcp_cfg = mcp_concurrency_config();
+    diag::log_tagged_fmt("mcp_srv",
+        "server_thread_func concurrency_config hardware_threads=%zu http_workers=%zu http_queue=%zu batch_workers=%zu batch_queue=%zu tool_workers=%zu tool_queue=%zu max_streams=%zu env_names=AIDA_MCP_HTTP_WORKERS,AIDA_MCP_HTTP_QUEUE,AIDA_MCP_BATCH_WORKERS,AIDA_MCP_BATCH_QUEUE,AIDA_MCP_TOOL_WORKERS,AIDA_MCP_TOOL_QUEUE,AIDA_MCP_MAX_STREAMS",
+        mcp_cfg.hardware_threads,
+        mcp_cfg.http_worker_threads,
+        mcp_cfg.http_max_queued_requests,
+        mcp_cfg.batch_worker_threads,
+        mcp_cfg.batch_max_queued_requests,
+        mcp_cfg.tool_worker_threads,
+        mcp_cfg.tool_max_queued_requests,
+        mcp_cfg.max_concurrent_streams);
     g_cached_health_ready.store(false, std::memory_order_release);
     g_cached_external_tool_count.store(0, std::memory_order_release);
     httplib::Server svr;
     svr.new_task_queue = [] {
         return new mcp_request_task_queue();
     };
+    svr.set_payload_max_length(kMcpPayloadMaxLength);
+    (void)mcp_batch_executor();
+    (void)mcp_tool_executor();
+    diag::log_tagged_fmt("mcp_srv",
+        "server_thread_func executors_prewarmed batch_workers=%zu tool_workers=%zu",
+        mcp_cfg.batch_worker_threads,
+        mcp_cfg.tool_worker_threads);
     diag::log_tagged_fmt("mcp_srv",
         "server_thread_func mcp_owned_http_dispatch workers=%zu max_queue=%zu",
-        kMcpHttpWorkerThreads,
-        kMcpHttpMaxQueuedRequests);
-    svr.set_keep_alive_max_count(8);
+        mcp_cfg.http_worker_threads,
+        mcp_cfg.http_max_queued_requests);
+    svr.set_keep_alive_max_count(64);
     svr.set_keep_alive_timeout(2);
     svr.set_read_timeout(5, 0);
     svr.set_write_timeout(10, 0);
     svr.set_idle_interval(0, 100000);
     diag::log_tagged_fmt("mcp_srv",
-        "server_thread_func http_limits keep_alive_max=8 keep_alive_timeout_sec=2 read_timeout_sec=5 write_timeout_sec=10 idle_interval_us=100000 max_streams=%d",
-        kMcpMaxConcurrentStreams);
+        "server_thread_func http_limits keep_alive_max=64 keep_alive_timeout_sec=2 read_timeout_sec=5 write_timeout_sec=10 idle_interval_us=100000 max_streams=%zu payload_max=%zu batch_max_items=%zu sse_max_events=%zu",
+        mcp_cfg.max_concurrent_streams,
+        kMcpPayloadMaxLength,
+        kMcpMaxBatchItems,
+        kSseMaxQueuedEvents);
     {
         std::lock_guard<std::mutex> lk(_server_mtx);
         _active_server = &svr;
@@ -3905,7 +4389,19 @@ void server_t::server_thread_func(int port)
         health["cache_ready"] = g_cached_health_ready.load(std::memory_order_acquire);
         health["active_requests"] = g_active_http_requests.load(std::memory_order_acquire);
         health["active_streams"] = g_active_streams.load(std::memory_order_acquire);
-        health["stream_limit"] = kMcpMaxConcurrentStreams;
+        const auto& health_mcp_cfg = mcp_concurrency_config();
+        health["stream_limit"] = health_mcp_cfg.max_concurrent_streams;
+        health["concurrency"]["hardware_threads"] = health_mcp_cfg.hardware_threads;
+        health["concurrency"]["http_workers"] = health_mcp_cfg.http_worker_threads;
+        health["concurrency"]["http_queue"] = health_mcp_cfg.http_max_queued_requests;
+        health["concurrency"]["batch_workers"] = health_mcp_cfg.batch_worker_threads;
+        health["concurrency"]["batch_queue"] = health_mcp_cfg.batch_max_queued_requests;
+        health["concurrency"]["tool_workers"] = health_mcp_cfg.tool_worker_threads;
+        health["concurrency"]["tool_queue"] = health_mcp_cfg.tool_max_queued_requests;
+        health["concurrency"]["max_streams"] = health_mcp_cfg.max_concurrent_streams;
+        health["limits"]["payload_max_bytes"] = kMcpPayloadMaxLength;
+        health["limits"]["batch_max_items"] = kMcpMaxBatchItems;
+        health["limits"]["sse_max_queued_events"] = kSseMaxQueuedEvents;
         health["executors"] = mcp_executor_health_snapshot();
         res.status = 200;
         res.set_content(json_dump_safe(health), "application/json");

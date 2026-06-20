@@ -149,7 +149,34 @@ namespace tctx_diag {
         }
     }
 
+    __forceinline ULONG ntstatus_win32_fallback(NTSTATUS status) {
+        switch (status) {
+        case STATUS_SUCCESS: return 0;
+        case STATUS_PENDING: return 997;
+        case STATUS_UNSUCCESSFUL: return 31;
+        case STATUS_NOT_SUPPORTED: return 50;
+        case STATUS_INSUFFICIENT_RESOURCES: return 8;
+        case STATUS_INVALID_PARAMETER: return 87;
+        case STATUS_NOT_FOUND: return 1168;
+        case STATUS_OBJECT_NAME_NOT_FOUND: return 2;
+        case STATUS_OBJECT_NAME_COLLISION: return 183;
+        case STATUS_ACCESS_DENIED: return 5;
+        case STATUS_BUFFER_TOO_SMALL: return 122;
+        case STATUS_INFO_LENGTH_MISMATCH: return 24;
+        case STATUS_INVALID_HANDLE: return 6;
+        case STATUS_INVALID_ADDRESS: return 487;
+        case STATUS_PROCEDURE_NOT_FOUND: return 127;
+        case STATUS_NO_MEMORY: return 8;
+        case STATUS_TIMEOUT: return 1460;
+        case STATUS_CANCELLED: return 1223;
+        default: return (ULONG)status;
+        }
+    }
+
     __forceinline ULONG ntstatus_win32(NTSTATUS status) {
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+            return ntstatus_win32_fallback(status);
+        }
         return RtlNtStatusToDosError(status);
     }
 

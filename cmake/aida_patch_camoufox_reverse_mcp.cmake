@@ -11,6 +11,7 @@ set(AIDA_CAMOUFOX_STAGE_MCP_ROOTS
 set(AIDA_CAMOUFOX_SOURCE_SYNC_FILES
     "browser.py"
     "__main__.py"
+    "_playwright_patch.py"
     "tools/navigation.py"
     "tools/script_analysis.py"
     "tools/network.py"
@@ -37,12 +38,20 @@ set(AIDA_CAMOUFOX_REQUIRED_REVERSE_TOOLS
 )
 
 set(AIDA_CAMOUFOX_REPO_BROWSER_PATH "${AIDA_CAMOUFOX_REPO_MCP_ROOT}/browser.py")
+set(AIDA_CAMOUFOX_REPO_MAIN_PATH "${AIDA_CAMOUFOX_REPO_MCP_ROOT}/__main__.py")
+set(AIDA_CAMOUFOX_REPO_PLAYWRIGHT_PATCH_PATH "${AIDA_CAMOUFOX_REPO_MCP_ROOT}/_playwright_patch.py")
 set(AIDA_CAMOUFOX_REPO_NAV_PATH "${AIDA_CAMOUFOX_REPO_MCP_ROOT}/tools/navigation.py")
 set(AIDA_CAMOUFOX_REPO_SCRIPT_PATH "${AIDA_CAMOUFOX_REPO_MCP_ROOT}/tools/script_analysis.py")
 set(AIDA_CAMOUFOX_REPO_NETWORK_PATH "${AIDA_CAMOUFOX_REPO_MCP_ROOT}/tools/network.py")
 set(AIDA_CAMOUFOX_REPO_DEBUGGING_PATH "${AIDA_CAMOUFOX_REPO_MCP_ROOT}/tools/debugging.py")
 set(AIDA_CAMOUFOX_REPO_MULTIPAGE_SOURCE_READY FALSE)
 if(EXISTS "${AIDA_CAMOUFOX_REPO_BROWSER_PATH}" AND EXISTS "${AIDA_CAMOUFOX_REPO_NAV_PATH}")
+    if(NOT EXISTS "${AIDA_CAMOUFOX_REPO_MAIN_PATH}")
+        message(FATAL_ERROR "Root Camoufox reverse-MCP main source is missing: ${AIDA_CAMOUFOX_REPO_MAIN_PATH}")
+    endif()
+    if(NOT EXISTS "${AIDA_CAMOUFOX_REPO_PLAYWRIGHT_PATCH_PATH}")
+        message(FATAL_ERROR "Root Camoufox reverse-MCP Playwright patch source is missing: ${AIDA_CAMOUFOX_REPO_PLAYWRIGHT_PATCH_PATH}")
+    endif()
     if(NOT EXISTS "${AIDA_CAMOUFOX_REPO_NETWORK_PATH}")
         message(FATAL_ERROR "Root Camoufox reverse-MCP network source is missing: ${AIDA_CAMOUFOX_REPO_NETWORK_PATH}")
     endif()
@@ -50,6 +59,8 @@ if(EXISTS "${AIDA_CAMOUFOX_REPO_BROWSER_PATH}" AND EXISTS "${AIDA_CAMOUFOX_REPO_
         message(FATAL_ERROR "Root Camoufox reverse-MCP script source is missing: ${AIDA_CAMOUFOX_REPO_SCRIPT_PATH}")
     endif()
     file(READ "${AIDA_CAMOUFOX_REPO_BROWSER_PATH}" AIDA_CAMOUFOX_REPO_BROWSER_CONTENT)
+    file(READ "${AIDA_CAMOUFOX_REPO_MAIN_PATH}" AIDA_CAMOUFOX_REPO_MAIN_CONTENT)
+    file(READ "${AIDA_CAMOUFOX_REPO_PLAYWRIGHT_PATCH_PATH}" AIDA_CAMOUFOX_REPO_PLAYWRIGHT_PATCH_CONTENT)
     file(READ "${AIDA_CAMOUFOX_REPO_NAV_PATH}" AIDA_CAMOUFOX_REPO_NAV_CONTENT)
     file(READ "${AIDA_CAMOUFOX_REPO_SCRIPT_PATH}" AIDA_CAMOUFOX_REPO_SCRIPT_CONTENT)
     file(READ "${AIDA_CAMOUFOX_REPO_NETWORK_PATH}" AIDA_CAMOUFOX_REPO_NETWORK_CONTENT)
@@ -60,6 +71,10 @@ if(EXISTS "${AIDA_CAMOUFOX_REPO_BROWSER_PATH}" AND EXISTS "${AIDA_CAMOUFOX_REPO_
     endif()
     string(REPLACE "\r\n" "\n" AIDA_CAMOUFOX_REPO_BROWSER_CONTENT "${AIDA_CAMOUFOX_REPO_BROWSER_CONTENT}")
     string(REPLACE "\r" "\n" AIDA_CAMOUFOX_REPO_BROWSER_CONTENT "${AIDA_CAMOUFOX_REPO_BROWSER_CONTENT}")
+    string(REPLACE "\r\n" "\n" AIDA_CAMOUFOX_REPO_MAIN_CONTENT "${AIDA_CAMOUFOX_REPO_MAIN_CONTENT}")
+    string(REPLACE "\r" "\n" AIDA_CAMOUFOX_REPO_MAIN_CONTENT "${AIDA_CAMOUFOX_REPO_MAIN_CONTENT}")
+    string(REPLACE "\r\n" "\n" AIDA_CAMOUFOX_REPO_PLAYWRIGHT_PATCH_CONTENT "${AIDA_CAMOUFOX_REPO_PLAYWRIGHT_PATCH_CONTENT}")
+    string(REPLACE "\r" "\n" AIDA_CAMOUFOX_REPO_PLAYWRIGHT_PATCH_CONTENT "${AIDA_CAMOUFOX_REPO_PLAYWRIGHT_PATCH_CONTENT}")
     string(REPLACE "\r\n" "\n" AIDA_CAMOUFOX_REPO_NAV_CONTENT "${AIDA_CAMOUFOX_REPO_NAV_CONTENT}")
     string(REPLACE "\r" "\n" AIDA_CAMOUFOX_REPO_NAV_CONTENT "${AIDA_CAMOUFOX_REPO_NAV_CONTENT}")
     string(REPLACE "\r\n" "\n" AIDA_CAMOUFOX_REPO_SCRIPT_CONTENT "${AIDA_CAMOUFOX_REPO_SCRIPT_CONTENT}")
@@ -106,6 +121,31 @@ if(EXISTS "${AIDA_CAMOUFOX_REPO_BROWSER_PATH}" AND EXISTS "${AIDA_CAMOUFOX_REPO_
         string(FIND "${AIDA_CAMOUFOX_REPO_BROWSER_CONTENT}" "${AIDA_CAMOUFOX_REQUIRED_BROWSER_MARKER}" AIDA_CAMOUFOX_REQUIRED_BROWSER_MARKER_POS)
         if(AIDA_CAMOUFOX_REQUIRED_BROWSER_MARKER_POS EQUAL -1)
             message(FATAL_ERROR "Root Camoufox reverse-MCP browser source is missing required marker ${AIDA_CAMOUFOX_REQUIRED_BROWSER_MARKER}: ${AIDA_CAMOUFOX_REPO_BROWSER_PATH}")
+        endif()
+    endforeach()
+    foreach(AIDA_CAMOUFOX_REQUIRED_MAIN_MARKER IN ITEMS
+        "_aida_apply_playwright_pageerror_patch"
+        "patch_playwright_pageerror"
+        "playwright_patch=playwright_patch")
+        string(FIND "${AIDA_CAMOUFOX_REPO_MAIN_CONTENT}" "${AIDA_CAMOUFOX_REQUIRED_MAIN_MARKER}" AIDA_CAMOUFOX_REQUIRED_MAIN_MARKER_POS)
+        if(AIDA_CAMOUFOX_REQUIRED_MAIN_MARKER_POS EQUAL -1)
+            message(FATAL_ERROR "Root Camoufox reverse-MCP main source is missing required marker ${AIDA_CAMOUFOX_REQUIRED_MAIN_MARKER}: ${AIDA_CAMOUFOX_REPO_MAIN_PATH}")
+        endif()
+    endforeach()
+    foreach(AIDA_CAMOUFOX_REQUIRED_PLAYWRIGHT_PATCH_MARKER IN ITEMS
+        "AIDA_PLAYWRIGHT_PAGEERROR_PATCH_ID"
+        "aida_playwright_pageerror_location_patch_20260620_1"
+        "patch_playwright_pageerror"
+        "coreBundle.js"
+        "pageError.location.url"
+        "pageError.location?.url ?? ''"
+        "pageError.location.lineNumber"
+        "pageError.location?.lineNumber ?? 0"
+        "pageError.location.columnNumber"
+        "pageError.location?.columnNumber ?? 0")
+        string(FIND "${AIDA_CAMOUFOX_REPO_PLAYWRIGHT_PATCH_CONTENT}" "${AIDA_CAMOUFOX_REQUIRED_PLAYWRIGHT_PATCH_MARKER}" AIDA_CAMOUFOX_REQUIRED_PLAYWRIGHT_PATCH_MARKER_POS)
+        if(AIDA_CAMOUFOX_REQUIRED_PLAYWRIGHT_PATCH_MARKER_POS EQUAL -1)
+            message(FATAL_ERROR "Root Camoufox reverse-MCP Playwright patch source is missing required marker ${AIDA_CAMOUFOX_REQUIRED_PLAYWRIGHT_PATCH_MARKER}: ${AIDA_CAMOUFOX_REPO_PLAYWRIGHT_PATCH_PATH}")
         endif()
     endforeach()
     foreach(AIDA_CAMOUFOX_REQUIRED_NAV_MARKER IN ITEMS
@@ -166,6 +206,10 @@ foreach(AIDA_CAMOUFOX_SOURCE_SYNC_FILE IN LISTS AIDA_CAMOUFOX_SOURCE_SYNC_FILES)
     foreach(AIDA_CAMOUFOX_STAGE_MCP_ROOT IN LISTS AIDA_CAMOUFOX_STAGE_MCP_ROOTS)
         set(AIDA_CAMOUFOX_STAGE_PATH "${AIDA_CAMOUFOX_STAGE_MCP_ROOT}/${AIDA_CAMOUFOX_SOURCE_SYNC_FILE}")
         if(NOT EXISTS "${AIDA_CAMOUFOX_STAGE_PATH}")
+            if(AIDA_CAMOUFOX_SOURCE_SYNC_FILE STREQUAL "_playwright_patch.py" AND EXISTS "${AIDA_CAMOUFOX_STAGE_MCP_ROOT}")
+                file(WRITE "${AIDA_CAMOUFOX_STAGE_PATH}" "${AIDA_CAMOUFOX_SOURCE_SYNC_CONTENT}")
+                message(STATUS "Synchronized ${AIDA_CAMOUFOX_STAGE_PATH}")
+            endif()
             continue()
         endif()
         file(READ "${AIDA_CAMOUFOX_STAGE_PATH}" AIDA_CAMOUFOX_STAGE_SYNC_CONTENT)
@@ -2254,9 +2298,14 @@ endforeach()
 
 foreach(AIDA_CAMOUFOX_STAGE_MCP_ROOT IN LISTS AIDA_CAMOUFOX_STAGE_MCP_ROOTS)
     set(AIDA_CAMOUFOX_STAGE_BROWSER_PATH "${AIDA_CAMOUFOX_STAGE_MCP_ROOT}/browser.py")
+    set(AIDA_CAMOUFOX_STAGE_MAIN_PATH "${AIDA_CAMOUFOX_STAGE_MCP_ROOT}/__main__.py")
+    set(AIDA_CAMOUFOX_STAGE_PLAYWRIGHT_PATCH_PATH "${AIDA_CAMOUFOX_STAGE_MCP_ROOT}/_playwright_patch.py")
     set(AIDA_CAMOUFOX_STAGE_NAV_PATH "${AIDA_CAMOUFOX_STAGE_MCP_ROOT}/tools/navigation.py")
     set(AIDA_CAMOUFOX_STAGE_SCRIPT_PATH "${AIDA_CAMOUFOX_STAGE_MCP_ROOT}/tools/script_analysis.py")
     set(AIDA_CAMOUFOX_STAGE_NETWORK_PATH "${AIDA_CAMOUFOX_STAGE_MCP_ROOT}/tools/network.py")
+    if(EXISTS "${AIDA_CAMOUFOX_STAGE_MCP_ROOT}" AND NOT EXISTS "${AIDA_CAMOUFOX_STAGE_PLAYWRIGHT_PATCH_PATH}")
+        message(FATAL_ERROR "Staged Camoufox reverse-MCP Playwright patch source is missing: ${AIDA_CAMOUFOX_STAGE_PLAYWRIGHT_PATCH_PATH}")
+    endif()
     if(EXISTS "${AIDA_CAMOUFOX_STAGE_BROWSER_PATH}")
         file(READ "${AIDA_CAMOUFOX_STAGE_BROWSER_PATH}" AIDA_CAMOUFOX_STAGE_BROWSER_CONTENT)
         string(REPLACE "\r\n" "\n" AIDA_CAMOUFOX_STAGE_BROWSER_CONTENT "${AIDA_CAMOUFOX_STAGE_BROWSER_CONTENT}")
@@ -2278,6 +2327,41 @@ foreach(AIDA_CAMOUFOX_STAGE_MCP_ROOT IN LISTS AIDA_CAMOUFOX_STAGE_MCP_ROOTS)
             string(FIND "${AIDA_CAMOUFOX_STAGE_BROWSER_CONTENT}" "${AIDA_CAMOUFOX_STAGE_BROWSER_MARKER}" AIDA_CAMOUFOX_STAGE_BROWSER_MARKER_POS)
             if(AIDA_CAMOUFOX_STAGE_BROWSER_MARKER_POS EQUAL -1)
                 message(FATAL_ERROR "Staged Camoufox reverse-MCP browser source is missing required marker ${AIDA_CAMOUFOX_STAGE_BROWSER_MARKER}: ${AIDA_CAMOUFOX_STAGE_BROWSER_PATH}")
+            endif()
+        endforeach()
+    endif()
+    if(EXISTS "${AIDA_CAMOUFOX_STAGE_MAIN_PATH}")
+        file(READ "${AIDA_CAMOUFOX_STAGE_MAIN_PATH}" AIDA_CAMOUFOX_STAGE_MAIN_CONTENT)
+        string(REPLACE "\r\n" "\n" AIDA_CAMOUFOX_STAGE_MAIN_CONTENT "${AIDA_CAMOUFOX_STAGE_MAIN_CONTENT}")
+        string(REPLACE "\r" "\n" AIDA_CAMOUFOX_STAGE_MAIN_CONTENT "${AIDA_CAMOUFOX_STAGE_MAIN_CONTENT}")
+        foreach(AIDA_CAMOUFOX_STAGE_MAIN_MARKER IN ITEMS
+            "_aida_apply_playwright_pageerror_patch"
+            "patch_playwright_pageerror"
+            "playwright_patch=playwright_patch")
+            string(FIND "${AIDA_CAMOUFOX_STAGE_MAIN_CONTENT}" "${AIDA_CAMOUFOX_STAGE_MAIN_MARKER}" AIDA_CAMOUFOX_STAGE_MAIN_MARKER_POS)
+            if(AIDA_CAMOUFOX_STAGE_MAIN_MARKER_POS EQUAL -1)
+                message(FATAL_ERROR "Staged Camoufox reverse-MCP main source is missing required marker ${AIDA_CAMOUFOX_STAGE_MAIN_MARKER}: ${AIDA_CAMOUFOX_STAGE_MAIN_PATH}")
+            endif()
+        endforeach()
+    endif()
+    if(EXISTS "${AIDA_CAMOUFOX_STAGE_PLAYWRIGHT_PATCH_PATH}")
+        file(READ "${AIDA_CAMOUFOX_STAGE_PLAYWRIGHT_PATCH_PATH}" AIDA_CAMOUFOX_STAGE_PLAYWRIGHT_PATCH_CONTENT)
+        string(REPLACE "\r\n" "\n" AIDA_CAMOUFOX_STAGE_PLAYWRIGHT_PATCH_CONTENT "${AIDA_CAMOUFOX_STAGE_PLAYWRIGHT_PATCH_CONTENT}")
+        string(REPLACE "\r" "\n" AIDA_CAMOUFOX_STAGE_PLAYWRIGHT_PATCH_CONTENT "${AIDA_CAMOUFOX_STAGE_PLAYWRIGHT_PATCH_CONTENT}")
+        foreach(AIDA_CAMOUFOX_STAGE_PLAYWRIGHT_PATCH_MARKER IN ITEMS
+            "AIDA_PLAYWRIGHT_PAGEERROR_PATCH_ID"
+            "aida_playwright_pageerror_location_patch_20260620_1"
+            "patch_playwright_pageerror"
+            "coreBundle.js"
+            "pageError.location.url"
+            "pageError.location?.url ?? ''"
+            "pageError.location.lineNumber"
+            "pageError.location?.lineNumber ?? 0"
+            "pageError.location.columnNumber"
+            "pageError.location?.columnNumber ?? 0")
+            string(FIND "${AIDA_CAMOUFOX_STAGE_PLAYWRIGHT_PATCH_CONTENT}" "${AIDA_CAMOUFOX_STAGE_PLAYWRIGHT_PATCH_MARKER}" AIDA_CAMOUFOX_STAGE_PLAYWRIGHT_PATCH_MARKER_POS)
+            if(AIDA_CAMOUFOX_STAGE_PLAYWRIGHT_PATCH_MARKER_POS EQUAL -1)
+                message(FATAL_ERROR "Staged Camoufox reverse-MCP Playwright patch source is missing required marker ${AIDA_CAMOUFOX_STAGE_PLAYWRIGHT_PATCH_MARKER}: ${AIDA_CAMOUFOX_STAGE_PLAYWRIGHT_PATCH_PATH}")
             endif()
         endforeach()
     endif()

@@ -87,6 +87,28 @@ static std::string hex_u64(std::uint64_t value) {
     return os.str();
 }
 
+static std::string hex_u32_status(std::uint32_t value) {
+    std::ostringstream os;
+    os << "0x" << std::hex << std::uppercase << std::setw(8) << std::setfill('0') << value;
+    return os.str();
+}
+
+static std::uint32_t ntstatus_from_win32_hint(DWORD error) {
+    switch (error) {
+    case ERROR_SUCCESS: return 0x00000000u;
+    case ERROR_INVALID_PARAMETER: return 0xC000000Du;
+    case ERROR_INVALID_HANDLE: return 0xC0000008u;
+    case ERROR_NOT_ENOUGH_MEMORY: return 0xC000009Au;
+    case ERROR_OUTOFMEMORY: return 0xC0000017u;
+    case ERROR_NOT_ENOUGH_QUOTA: return 0xC0000044u;
+    case ERROR_ACCESS_DENIED: return 0xC0000022u;
+    case ERROR_GEN_FAILURE: return 0xC0000001u;
+    case ERROR_NOT_SUPPORTED: return 0xC00000BBu;
+    case ERROR_NOT_FOUND: return 0xC0000225u;
+    default: return 0xC0000001u;
+    }
+}
+
 static bool ensure_network_script_engine_initialized(const char* action, json& out, std::string& error) {
     const uint64_t started = GetTickCount64();
     const bool before = script_engine::is_initialized();
@@ -324,6 +346,28 @@ static void add_driver_request_fields(json& r, bool ok, DWORD gle = GetLastError
     r["driver_attached_pid"] = driver_bridge::attached_pid();
     r["win32_error"] = static_cast<unsigned long>(effective_gle);
     r["win32_message"] = win32_error_message(effective_gle);
+}
+
+static json intercept_filter_criteria_json(std::uint32_t pid, std::uint32_t port, std::uint32_t protocol) {
+    json criteria;
+    criteria["pid"] = pid;
+    criteria["port"] = port;
+    criteria["protocol"] = protocol == 0 ? "any" : protocol_name(protocol);
+    criteria["protocol_number"] = protocol;
+    return criteria;
+}
+
+static void add_intercept_ntstatus_hint(json& r, DWORD gle, const char* source) {
+    const std::uint32_t status = ntstatus_from_win32_hint(gle);
+    const bool exact = source &&
+        (std::strcmp(source, "local_validation") == 0 ||
+         std::strcmp(source, "driver_not_connected") == 0 ||
+         std::strcmp(source, "driver_request_success") == 0 ||
+         std::strcmp(source, "false_success_guard") == 0);
+    r["ntstatus"] = hex_u32_status(status);
+    r["ntstatus_value"] = status;
+    r["ntstatus_source"] = source ? source : "win32_mapping";
+    r["ntstatus_exact"] = exact;
 }
 
 static bool process_exists(std::uint32_t pid) {
@@ -1732,6 +1776,10 @@ tool_result_t network_enumerate_wfp_callouts(const json& params)
             reasons.push_back("action_callout");
         if ((c.aida_match_reason & 0x00000004u) != 0)
             reasons.push_back("display_data");
+        if ((c.aida_match_reason & 0x00000008u) != 0)
+            reasons.push_back("provider");
+        if ((c.aida_match_reason & 0x00000010u) != 0)
+            reasons.push_back("legacy_repo_app_path");
         if (runtime_fallback)
             reasons.push_back("runtime_registered_fallback");
         entry["aida_match_reasons"] = reasons;
@@ -2214,6 +2262,8 @@ tool_result_t network_intercept(const json& params)
             r["pid"] = filter_pid;
             r["port"] = filter_port;
             r["protocol"] = "any";
+            r["target_pid"] = filter_pid;
+            r["filter_criteria"] = intercept_filter_criteria_json(filter_pid, filter_port, filter_protocol);
             r["failure_phase"] = "validate_filter";
             r["diagnostic"] = "packet interception enable requires at least one explicit filter: pid, port, or protocol";
             r["driver_request_attempted"] = false;
@@ -2225,6 +2275,9 @@ tool_result_t network_intercept(const json& params)
             r["driver_attached_pid"] = driver_bridge::attached_pid();
             r["win32_error"] = static_cast<unsigned long>(ERROR_INVALID_PARAMETER);
             r["win32_message"] = win32_error_message(ERROR_INVALID_PARAMETER);
+            r["cleanup_attempted"] = false;
+            r["cleanup_result"] = "not_needed";
+            add_intercept_ntstatus_hint(r, ERROR_INVALID_PARAMETER, "local_validation");
             diag::log_tagged_fmt("net_tools",
                 "network_intercept enable rejected phase=validate_filter pid=%u port=%u proto=%u gle=%lu driver_request_attempted=0",
                 filter_pid,
@@ -2233,8 +2286,32 @@ tool_result_t network_intercept(const json& params)
                 static_cast<unsigned long>(ERROR_INVALID_PARAMETER));
             return tool_result_t::error(OBFSTR("Packet interception enable requires at least one explicit filter."), r);
         }
-        if (!driver_bridge::using_kernel_driver())
-            return tool_result_t::error(OBFSTR("Driver not connected."));
+        if (!driver_bridge::using_kernel_driver()) {
+            json r;
+            r["operation"] = "enable";
+            r["active"] = false;
+            r["held_count"] = 0;
+            r["pid"] = filter_pid;
+            r["port"] = filter_port;
+            r["protocol"] = filter_protocol == 0 ? "any" : protocol_name(filter_protocol);
+            r["target_pid"] = filter_pid;
+            r["filter_criteria"] = intercept_filter_criteria_json(filter_pid, filter_port, filter_protocol);
+            r["failure_phase"] = "driver_not_connected";
+            r["diagnostic"] = "packet interception requires the kernel driver bridge";
+            r["driver_request_attempted"] = false;
+            add_driver_request_fields(r, false, ERROR_INVALID_HANDLE);
+            r["cleanup_attempted"] = false;
+            r["cleanup_result"] = "not_needed";
+            add_intercept_ntstatus_hint(r, ERROR_INVALID_HANDLE, "driver_not_connected");
+            diag::log_tagged_fmt("net_tools",
+                "network_intercept enable rejected phase=driver_not_connected pid=%u port=%u proto=%u status=%s driver_error=%s",
+                filter_pid,
+                filter_port,
+                filter_protocol,
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+            return tool_result_t::error(OBFSTR("Driver not connected."), r);
+        }
         std::uint32_t held_count = 0; bool active = false;
         diag::log_tagged_fmt("net_tools", "network_intercept enable pid=%u port=%u proto=%u", filter_pid, filter_port, filter_protocol);
         SetLastError(ERROR_SUCCESS);
@@ -2247,6 +2324,8 @@ tool_result_t network_intercept(const json& params)
         r["pid"] = filter_pid;
         r["port"] = filter_port;
         r["protocol"] = filter_protocol == 0 ? "any" : protocol_name(filter_protocol);
+        r["target_pid"] = filter_pid;
+        r["filter_criteria"] = intercept_filter_criteria_json(filter_pid, filter_port, filter_protocol);
         add_driver_request_fields(r, ok, gle);
         r["driver_request_attempted"] = true;
         diag::log_tagged_fmt("net_tools",
@@ -2258,16 +2337,61 @@ tool_result_t network_intercept(const json& params)
             win32_error_message(gle).c_str(),
             driver_bridge::status().c_str(),
             driver_bridge::last_error().c_str());
-        if (!ok) {
-            r["failure_phase"] = "driver_intercept_enable_ioctl";
-            r["diagnostic"] = "driver rejected packet interception enable request";
+        if (!ok || !active) {
+            std::uint32_t cleanup_held_count = 0;
+            bool cleanup_active = active;
+            SetLastError(ERROR_SUCCESS);
+            const bool cleanup_ok = driver_bridge::intercept_op(1, 0, 0, 0, 0, nullptr, 0, &cleanup_held_count, &cleanup_active);
+            const DWORD cleanup_gle = GetLastError();
+            r["cleanup_attempted"] = true;
+            r["cleanup_driver_request_ok"] = cleanup_ok;
+            r["cleanup_win32_error"] = static_cast<unsigned long>(cleanup_ok ? ERROR_SUCCESS : cleanup_gle);
+            r["cleanup_win32_message"] = win32_error_message(cleanup_ok ? ERROR_SUCCESS : cleanup_gle);
+            r["cleanup_held_count"] = cleanup_held_count;
+            r["cleanup_active"] = cleanup_active;
+            r["cleanup_result"] = cleanup_ok ? "disable_request_sent" : "disable_request_failed";
+            r["cleanup_driver_status"] = driver_bridge::status();
+            r["cleanup_driver_last_error"] = driver_bridge::last_error();
+            r["failure_phase"] = ok ? "driver_intercept_enable_false_success" : "driver_intercept_enable_ioctl";
+            r["diagnostic"] = ok
+                ? "driver returned success but packet interception was not active; cleanup was issued"
+                : "driver rejected packet interception enable request; cleanup was issued";
+            add_intercept_ntstatus_hint(r, ok ? ERROR_GEN_FAILURE : gle,
+                ok ? "false_success_guard" : "win32_mapping_existing_driver_abi_no_raw_ntstatus");
+            diag::log_tagged_fmt("net_tools",
+                "network_intercept enable cleanup_after_failure phase=%s enable_ok=%d active=%d enable_gle=%lu cleanup_ok=%d cleanup_active=%d cleanup_held=%u cleanup_gle=%lu",
+                ok ? "driver_intercept_enable_false_success" : "driver_intercept_enable_ioctl",
+                (int)ok,
+                (int)active,
+                static_cast<unsigned long>(gle),
+                (int)cleanup_ok,
+                (int)cleanup_active,
+                cleanup_held_count,
+                static_cast<unsigned long>(cleanup_gle));
             return tool_result_t::error(OBFSTR("Failed to enable packet interception: Win32 error ") +
-                std::to_string(static_cast<unsigned long>(gle)) + OBFSTR(" (") + win32_error_message(gle) + OBFSTR(")."), r);
+                std::to_string(static_cast<unsigned long>(ok ? ERROR_GEN_FAILURE : gle)) + OBFSTR(" (") +
+                win32_error_message(ok ? ERROR_GEN_FAILURE : gle) + OBFSTR(")."), r);
         }
+        r["cleanup_attempted"] = false;
+        r["cleanup_result"] = "not_needed";
+        add_intercept_ntstatus_hint(r, ERROR_SUCCESS, "driver_request_success");
         return tool_result_t::ok(OBFSTR("Packet interception enabled. Matching packets will be held for inspection."), r);
     } else if (op == "disable") {
-        if (!driver_bridge::using_kernel_driver())
-            return tool_result_t::error(OBFSTR("Driver not connected."));
+        if (!driver_bridge::using_kernel_driver()) {
+            json r;
+            r["operation"] = "disable";
+            r["active"] = false;
+            r["target_pid"] = 0;
+            r["filter_criteria"] = intercept_filter_criteria_json(0, 0, 0);
+            r["failure_phase"] = "driver_not_connected";
+            r["diagnostic"] = "packet interception disable requires the kernel driver bridge";
+            r["driver_request_attempted"] = false;
+            add_driver_request_fields(r, false, ERROR_INVALID_HANDLE);
+            r["cleanup_attempted"] = false;
+            r["cleanup_result"] = "not_started_driver_not_connected";
+            add_intercept_ntstatus_hint(r, ERROR_INVALID_HANDLE, "driver_not_connected");
+            return tool_result_t::error(OBFSTR("Driver not connected."), r);
+        }
         SetLastError(ERROR_SUCCESS);
         bool ok = driver_bridge::intercept_op(1, 0, 0, 0, 0, nullptr, 0, nullptr, nullptr);
         const DWORD gle = GetLastError();
@@ -2275,17 +2399,27 @@ tool_result_t network_intercept(const json& params)
         json r;
         r["operation"] = "disable";
         r["active"] = false;
+        r["target_pid"] = 0;
+        r["filter_criteria"] = intercept_filter_criteria_json(0, 0, 0);
         r["remaining_held_count"] = remaining.size();
         add_driver_request_fields(r, ok, gle);
         r["driver_request_attempted"] = true;
+        r["cleanup_attempted"] = true;
+        r["cleanup_result"] = ok ? "disable_request_sent" : "disable_request_failed";
+        add_intercept_ntstatus_hint(r, ok ? ERROR_SUCCESS : gle,
+            ok ? "driver_request_success" : "win32_mapping_existing_driver_abi_no_raw_ntstatus");
         diag::log_tagged_fmt("net_tools",
             "network_intercept disable result=%d gle=%lu message=%s remaining=%zu",
             (int)ok,
             static_cast<unsigned long>(gle),
             win32_error_message(gle).c_str(),
             remaining.size());
-        if (!ok) return tool_result_t::error(OBFSTR("Failed to disable packet interception: Win32 error ") +
-            std::to_string(static_cast<unsigned long>(gle)) + OBFSTR(" (") + win32_error_message(gle) + OBFSTR(")."), r);
+        if (!ok) {
+            r["failure_phase"] = "driver_intercept_disable_ioctl";
+            r["diagnostic"] = "driver rejected packet interception disable request";
+            return tool_result_t::error(OBFSTR("Failed to disable packet interception: Win32 error ") +
+                std::to_string(static_cast<unsigned long>(gle)) + OBFSTR(" (") + win32_error_message(gle) + OBFSTR(")."), r);
+        }
         return tool_result_t::ok(OBFSTR("Packet interception disabled. All held packets released."), r);
     }
     return tool_result_t::error(OBFSTR("Invalid operation. Use 'enable' or 'disable'."));

@@ -10,8 +10,10 @@
 
 #include "audit_http.hpp"
 #include "scope.hpp"
+#include "active_scanner.hpp"
 
 #include "../../infra/event_bus.hpp"
+#include "../../runtime/standalone_driver.hpp"
 #include "../../../helpers/diag_log.hpp"
 
 #include <openssl/ssl.h>
@@ -39,6 +41,50 @@ namespace {
 std::mutex& err_mtx() { static std::mutex m; return m; }
 std::string& err_slot() { static std::string s; return s; }
 std::atomic<uint64_t>& exchange_ids() { static std::atomic<uint64_t> ids{1000000000ULL}; return ids; }
+std::atomic<uint64_t>& wsaenobufs_diag_ids() { static std::atomic<uint64_t> ids{0ULL}; return ids; }
+
+struct circuit_snapshot_t
+{
+    bool available = false;
+    bool open = false;
+    uint64_t audit_id = 0;
+    size_t hits = 0;
+    size_t threshold = 0;
+    size_t transport_failures = 0;
+    std::string source;
+    std::string state;
+};
+
+circuit_snapshot_t current_circuit_snapshot(const send_options_t& options,
+                                            const std::string& host,
+                                            uint16_t port,
+                                            bool tls)
+{
+    circuit_snapshot_t out;
+    out.source = options.exchange_source.empty() ? "api" : options.exchange_source;
+    if (out.source != "scanner") {
+        out.state = "not_scanner_source";
+        return out;
+    }
+
+    auto audits = active_scanner::list_audits();
+    for (const auto& audit : audits) {
+        if (!audit.running)
+            continue;
+        if (audit.host != host || audit.port != port || audit.tls != tls)
+            continue;
+        out.available = true;
+        out.open = audit.transport_circuit_breaker_open;
+        out.audit_id = audit.id;
+        out.hits = audit.transport_circuit_breaker_hits;
+        out.threshold = audit.transport_circuit_breaker_threshold;
+        out.transport_failures = audit.transport_failures;
+        out.state = out.open ? "open" : "closed";
+        return out;
+    }
+    out.state = "scanner_audit_not_matched";
+    return out;
+}
 
 void set_err(const std::string& msg)
 {
@@ -755,6 +801,68 @@ std::optional<exchange_observed_t> send(const std::vector<uint8_t>& raw_request,
         if (!last_handle_count_after_ok)
             last_handle_count_after = current_process_handle_count(last_handle_count_after_ok);
         const bool enobufs_preinit = last_connect_err == WSAENOBUFS && last_before_would_block;
+        uint64_t wsaenobufs_diag_id = 0;
+        bool driver_loaded = false;
+        bool driver_connected = false;
+        uint32_t driver_attached_pid = 0;
+        std::string driver_status;
+        std::string driver_error;
+        bool intercept_query_attempted = false;
+        bool intercept_query_ok = false;
+        size_t intercept_held_count = 0;
+        std::string intercept_state = "not_queried";
+        circuit_snapshot_t circuit_snapshot;
+        const std::string caller_source = options.exchange_source.empty() ? "api" : options.exchange_source;
+        if (enobufs_preinit) {
+            wsaenobufs_diag_id = wsaenobufs_diag_ids().fetch_add(1, std::memory_order_acq_rel) + 1ULL;
+            driver_loaded = driver_bridge::is_loaded();
+            driver_connected = driver_bridge::using_kernel_driver();
+            driver_attached_pid = driver_bridge::attached_pid();
+            driver_status = driver_bridge::status();
+            driver_error = driver_bridge::last_error();
+            if (driver_connected) {
+                intercept_query_attempted = true;
+                auto held_packets = driver_bridge::get_held_packets();
+                intercept_held_count = held_packets.size();
+                intercept_query_ok = true;
+                intercept_state = "held_query_ok";
+            } else {
+                intercept_state = "driver_not_connected";
+            }
+            circuit_snapshot = current_circuit_snapshot(options, host, port, tls);
+            diag::log_tagged_fmt("audit_http",
+                "send wsaenobufs_diagnostic id=%llu pid=%lu tid=%lu target=%s:%u tls=%d caller_source=%s connect_stage=%s socket=%llu socket_state=closed_after_failed_connect before_would_block=%d driver_loaded=%d driver_connected=%d driver_attached_pid=%u driver_status=%s driver_error=%s intercept_state=%s intercept_query_attempted=%d intercept_query_ok=%d intercept_held_count=%zu circuit_available=%d circuit_state=%s circuit_audit_id=%llu circuit_hits=%zu circuit_threshold=%zu circuit_failures=%zu handle_before_ok=%d handle_before=%lu handle_after_ok=%d handle_after=%lu elapsed_ms=%llu",
+                static_cast<unsigned long long>(wsaenobufs_diag_id),
+                static_cast<unsigned long>(GetCurrentProcessId()),
+                static_cast<unsigned long>(GetCurrentThreadId()),
+                host.c_str(),
+                static_cast<unsigned>(port),
+                tls ? 1 : 0,
+                caller_source.c_str(),
+                last_connect_stage.c_str(),
+                static_cast<unsigned long long>(last_socket),
+                last_before_would_block ? 1 : 0,
+                driver_loaded ? 1 : 0,
+                driver_connected ? 1 : 0,
+                driver_attached_pid,
+                driver_status.c_str(),
+                driver_error.c_str(),
+                intercept_state.c_str(),
+                intercept_query_attempted ? 1 : 0,
+                intercept_query_ok ? 1 : 0,
+                intercept_held_count,
+                circuit_snapshot.available ? 1 : 0,
+                circuit_snapshot.state.c_str(),
+                static_cast<unsigned long long>(circuit_snapshot.audit_id),
+                circuit_snapshot.hits,
+                circuit_snapshot.threshold,
+                circuit_snapshot.transport_failures,
+                handle_count_before_ok ? 1 : 0,
+                static_cast<unsigned long>(handle_count_before),
+                last_handle_count_after_ok ? 1 : 0,
+                static_cast<unsigned long>(last_handle_count_after),
+                static_cast<unsigned long long>(now_steady_ms() - t_steady_start));
+        }
         diag::log_tagged_fmt("audit_http", "send tcp_connect_exhausted host=%s port=%u attempts=%d loopback=%d last_connect_err=%d err_name=%s last_poll_rc=%d last_revents=0x%04X last_poll_wsa=%d poll_wsa_name=%s pid=%lu tid=%lu family=%s ip=%s socket=%llu connect_stage=%s before_would_block=%d transport_error_class=%s handle_before_ok=%d handle_before=%lu handle_after_ok=%d handle_after=%lu elapsed_ms=%llu",
             host.c_str(), static_cast<unsigned>(port), max_attempts, loopback ? 1 : 0,
             last_connect_err, wsa_error_name(last_connect_err), last_poll_rc, static_cast<unsigned>(last_revents), last_poll_wsa,
@@ -793,6 +901,25 @@ std::optional<exchange_observed_t> send(const std::vector<uint8_t>& raw_request,
             << " handle_count_after_ok=" << (last_handle_count_after_ok ? 1 : 0)
             << " handle_count_after=" << static_cast<unsigned long>(last_handle_count_after)
             << " elapsed_ms=" << static_cast<unsigned long long>(now_steady_ms() - t_steady_start);
+        if (enobufs_preinit) {
+            oss << " wsaenobufs_diag_id=" << static_cast<unsigned long long>(wsaenobufs_diag_id)
+                << " caller_source=" << caller_source
+                << " driver_loaded=" << (driver_loaded ? 1 : 0)
+                << " driver_connected=" << (driver_connected ? 1 : 0)
+                << " driver_attached_pid=" << driver_attached_pid
+                << " driver_status=" << driver_status
+                << " driver_error=" << driver_error
+                << " intercept_state=" << intercept_state
+                << " intercept_query_attempted=" << (intercept_query_attempted ? 1 : 0)
+                << " intercept_query_ok=" << (intercept_query_ok ? 1 : 0)
+                << " intercept_held_count=" << intercept_held_count
+                << " circuit_available=" << (circuit_snapshot.available ? 1 : 0)
+                << " circuit_state=" << circuit_snapshot.state
+                << " circuit_audit_id=" << static_cast<unsigned long long>(circuit_snapshot.audit_id)
+                << " circuit_hits=" << circuit_snapshot.hits
+                << " circuit_threshold=" << circuit_snapshot.threshold
+                << " circuit_failures=" << circuit_snapshot.transport_failures;
+        }
         set_err(oss.str());
         return std::nullopt;
     }

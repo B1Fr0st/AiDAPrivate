@@ -217,6 +217,10 @@ namespace dispatcher {
         return static_cast<UINT64>(reinterpret_cast<ULONG_PTR>(value));
     }
 
+    __forceinline UINT64 requestor_pid_to_u64(PIRP irp) {
+        return irp ? static_cast<UINT64>(IoGetRequestorProcessId(irp)) : 0;
+    }
+
     __forceinline LONG64 next_hvdt_trace_id() {
         return _InterlockedIncrement64(&g_hvdt_dispatch_trace_id);
     }
@@ -228,16 +232,61 @@ namespace dispatcher {
         return static_cast<UINT64>(((now.QuadPart - start.QuadPart) * 1000000ULL) / static_cast<UINT64>(freq.QuadPart));
     }
 
-    __forceinline BOOLEAN is_hvdt_trace_candidate(ULONG code, ULONG input_size, ULONG output_size) {
-        if (code == ioctl_codes::HVDT())
+    struct hvdt_ioctl_decode_snapshot_t {
+        ULONG encoded;
+        ULONG base;
+        ULONG offset;
+        ULONG expected_hvdt_code;
+        ULONG key_hash;
+        ULONG ioctl_seed_hash;
+        BOOLEAN valid;
+    };
+
+    __forceinline hvdt_ioctl_decode_snapshot_t decode_ioctl_snapshot(ULONG code) {
+        hvdt_ioctl_decode_snapshot_t out{};
+        out.offset = 0xffffffffu;
+        ULONG key = dynamic_key::get();
+        out.base = ioctl_codes::get_base();
+        out.expected_hvdt_code = ioctl_codes::HVDT();
+        out.key_hash = hash_build_key(key);
+        out.ioctl_seed_hash = ioctl_codes::g_server_ioctl_seed != 0 ? hash_build_key(ioctl_codes::g_server_ioctl_seed) : 0;
+        if ((code & 0xFFFF0000u) != 0x00220000u)
+            return out;
+        out.encoded = (code & 0x0000FFFFu) >> 2;
+        if (out.encoded >= out.base) {
+            ULONG candidate = out.encoded - out.base;
+            if (candidate <= 59u) {
+                out.offset = candidate;
+                out.valid = TRUE;
+            }
+        }
+        return out;
+    }
+
+    __forceinline BOOLEAN looks_like_hvdt_buffer_shape(ULONG input_size, ULONG output_size) {
+        if (input_size == sizeof(hv_detect_result_k) && output_size == sizeof(hv_detect_result_k))
             return TRUE;
 
-        if (input_size == sizeof(hv_detect_result_k) && output_size == sizeof(hv_detect_result_k))
+        if (input_size >= sizeof(hv_detect_request_k) &&
+            output_size >= sizeof(hv_detect_result_k) &&
+            input_size == output_size &&
+            input_size >= 0x1000u &&
+            input_size <= 0x2000u)
             return TRUE;
 
         const ULONG secure_in = static_cast<ULONG>(secure_comm::SECURE_WIRE_PREFIX + sizeof(hv_detect_request_k));
         const ULONG secure_out = static_cast<ULONG>(secure_comm::SECURE_WIRE_PREFIX + sizeof(hv_detect_result_k));
         return input_size == secure_in && output_size == secure_out;
+    }
+
+    __forceinline BOOLEAN is_hvdt_trace_candidate(ULONG code, ULONG input_size, ULONG output_size, const hvdt_ioctl_decode_snapshot_t& decoded) {
+        if (code == decoded.expected_hvdt_code)
+            return TRUE;
+
+        if (decoded.valid && decoded.offset == 52u)
+            return TRUE;
+
+        return looks_like_hvdt_buffer_shape(input_size, output_size);
     }
 
     __forceinline void complete_hvdt_trace_irp(
@@ -249,17 +298,19 @@ namespace dispatcher {
         const LARGE_INTEGER& start,
         const LARGE_INTEGER& freq)
     {
-        HVD_LOG_IMMEDIATE("dispatch_complete_early trace=%lld phase=%s status=0x%08lx bytes=%llu elapsed_us=%llu cpu=%lu irql=%lu pid=%llu tid=%llu requestor_pid=%lu",
+        HVD_LOG_IMMEDIATE("dispatch_complete_early trace=%lld phase=%s status=0x%08lx bytes=%llu io_status=0x%08lx io_info=%llu elapsed_us=%llu cpu=%lu irql=%lu pid=%llu tid=%llu requestor_pid=%llu",
             trace_id,
             phase ? phase : "unknown",
             status,
             static_cast<UINT64>(information),
+            irp ? irp->IoStatus.Status : STATUS_INVALID_PARAMETER,
+            irp ? static_cast<UINT64>(irp->IoStatus.Information) : 0,
             elapsed_us_from_qpc(start, freq),
             KeGetCurrentProcessorNumber(),
             (ULONG)KeGetCurrentIrql(),
             handle_to_u64(PsGetCurrentProcessId()),
             handle_to_u64(PsGetCurrentThreadId()),
-            irp ? IoGetRequestorProcessId(irp) : 0);
+            requestor_pid_to_u64(irp));
     }
 
     __forceinline ULONG get_heartbeat_magic() {
@@ -549,26 +600,38 @@ namespace dispatcher {
         const ULONG early_code = early_stack ? early_stack->Parameters.DeviceIoControl.IoControlCode : 0;
         const ULONG early_input_size = early_stack ? early_stack->Parameters.DeviceIoControl.InputBufferLength : 0;
         const ULONG early_output_size = early_stack ? early_stack->Parameters.DeviceIoControl.OutputBufferLength : 0;
-        const BOOLEAN hvdt_trace = is_hvdt_trace_candidate(early_code, early_input_size, early_output_size);
+        const hvdt_ioctl_decode_snapshot_t early_decode = decode_ioctl_snapshot(early_code);
+        const BOOLEAN hvdt_trace = is_hvdt_trace_candidate(early_code, early_input_size, early_output_size, early_decode);
         const LONG64 hvdt_trace_id = hvdt_trace ? next_hvdt_trace_id() : 0;
         LARGE_INTEGER hvdt_dispatch_freq{};
         LARGE_INTEGER hvdt_dispatch_start = KeQueryPerformanceCounter(&hvdt_dispatch_freq);
         if (hvdt_trace) {
-            HVD_LOG_IMMEDIATE("dispatch_enter trace=%lld step=%lu code=0x%08lx hvdt_code=0x%08lx input_size=%lu output_size=%lu requestor=%u requestor_pid=%lu current_pid=%llu current_tid=%llu cpu=%lu irql=%lu buffer_present=%u device_present=%u",
+            HVD_LOG_IMMEDIATE("dispatch_enter trace=%lld step=%lu irp=%p system_buffer=%p raw_code=0x%08lx expected_hvdt=0x%08lx decoded_valid=%u decoded_offset=%lu encoded=0x%lx dyn_base=0x%lx key_hash=0x%08lx ioctl_seed_hash=0x%08lx input_size=%lu output_size=%lu requestor=%u requestor_pid=%llu current_pid=%llu current_tid=%llu cpu=%lu irql=%lu buffer_present=%u device_present=%u shape=%u io_status=0x%08lx io_info=%llu",
                 hvdt_trace_id,
                 1u,
+                irp,
+                irp ? irp->AssociatedIrp.SystemBuffer : nullptr,
                 early_code,
-                ioctl_codes::HVDT(),
+                early_decode.expected_hvdt_code,
+                early_decode.valid ? 1u : 0u,
+                early_decode.offset,
+                early_decode.encoded,
+                early_decode.base,
+                early_decode.key_hash,
+                early_decode.ioctl_seed_hash,
                 early_input_size,
                 early_output_size,
                 irp ? static_cast<ULONG>(irp->RequestorMode) : 0xffffffffu,
-                irp ? IoGetRequestorProcessId(irp) : 0,
+                requestor_pid_to_u64(irp),
                 handle_to_u64(PsGetCurrentProcessId()),
                 handle_to_u64(PsGetCurrentThreadId()),
                 KeGetCurrentProcessorNumber(),
                 (ULONG)KeGetCurrentIrql(),
                 (irp && irp->AssociatedIrp.SystemBuffer) ? 1u : 0u,
-                device_object ? 1u : 0u);
+                device_object ? 1u : 0u,
+                looks_like_hvdt_buffer_shape(early_input_size, early_output_size) ? 1u : 0u,
+                irp ? irp->IoStatus.Status : STATUS_INVALID_PARAMETER,
+                irp ? static_cast<UINT64>(irp->IoStatus.Information) : 0);
             HVD_LOG_IMMEDIATE("dispatch_timing_noise_pre trace=%lld step=%lu elapsed_us=%llu cpu=%lu irql=%lu",
                 hvdt_trace_id, 2u, elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
                 KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql());
@@ -725,16 +788,24 @@ namespace dispatcher {
         UINT64 secure_request_entropy = 0;
         UINT64 secure_request_id = 0;
         if (hvdt_trace) {
-            HVD_LOG_IMMEDIATE("dispatch_stack_loaded trace=%lld step=%lu code=0x%08lx hvdt_match=%u input_size=%lu output_size=%lu buffer_present=%u requestor=%u requestor_pid=%lu elapsed_us=%llu cpu=%lu irql=%lu",
+            HVD_LOG_IMMEDIATE("dispatch_stack_loaded trace=%lld step=%lu code=0x%08lx expected_hvdt=0x%08lx hvdt_match=%u decoded_valid=%u decoded_offset=%lu encoded=0x%lx dyn_base=0x%lx key_hash=0x%08lx ioctl_seed_hash=0x%08lx input_size=%lu output_size=%lu buffer=%p original_buffer=%p requestor=%u requestor_pid=%llu elapsed_us=%llu cpu=%lu irql=%lu",
                 hvdt_trace_id,
                 14u,
                 code,
-                code == ioctl_codes::HVDT() ? 1u : 0u,
+                early_decode.expected_hvdt_code,
+                code == early_decode.expected_hvdt_code ? 1u : 0u,
+                early_decode.valid ? 1u : 0u,
+                early_decode.offset,
+                early_decode.encoded,
+                early_decode.base,
+                early_decode.key_hash,
+                early_decode.ioctl_seed_hash,
                 input_size,
                 output_size,
-                buffer ? 1u : 0u,
+                buffer,
+                original_buffer,
                 static_cast<ULONG>(irp->RequestorMode),
-                IoGetRequestorProcessId(irp),
+                requestor_pid_to_u64(irp),
                 elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
                 KeGetCurrentProcessorNumber(),
                 (ULONG)KeGetCurrentIrql());
@@ -2010,13 +2081,29 @@ namespace dispatcher {
             HANDLE hvdt_pid = PsGetCurrentProcessId();
             HANDLE hvdt_tid = PsGetCurrentThreadId();
             KPROCESSOR_MODE hvdt_requestor = irp->RequestorMode;
-            HVD_LOG_IMMEDIATE("branch_enter trace=%lld step=%lu input_size=%lu output_size=%lu requestor=%u requestor_pid=%lu caller_pid=%llu caller_tid=%llu qpc=%lld tsc=%llu cpu=%lu irql=%lu secure_wrapped=%u elapsed_us=%llu",
+            UINT64 hvdt_first8 = 0;
+            if (buffer && input_size >= sizeof(hvdt_first8))
+                RtlCopyMemory(&hvdt_first8, buffer, sizeof(hvdt_first8));
+            HVD_LOG_IMMEDIATE("branch_enter trace=%lld step=%lu irp=%p buffer=%p original_buffer=%p raw_code=0x%08lx expected_hvdt=0x%08lx decoded_valid=%u decoded_offset=%lu encoded=0x%lx dyn_base=0x%lx key_hash=0x%08lx ioctl_seed_hash=0x%08lx input_size=%lu output_size=%lu first8=0x%llx flags=0x%llx requestor=%u requestor_pid=%llu caller_pid=%llu caller_tid=%llu qpc=%lld tsc=%llu cpu=%lu irql=%lu secure_wrapped=%u elapsed_us=%llu",
                 hvdt_trace_id,
                 27u,
+                irp,
+                buffer,
+                original_buffer,
+                code,
+                early_decode.expected_hvdt_code,
+                early_decode.valid ? 1u : 0u,
+                early_decode.offset,
+                early_decode.encoded,
+                early_decode.base,
+                early_decode.key_hash,
+                early_decode.ioctl_seed_hash,
                 input_size,
                 output_size,
+                hvdt_first8,
+                hvdt_first8,
                 static_cast<ULONG>(hvdt_requestor),
-                IoGetRequestorProcessId(irp),
+                requestor_pid_to_u64(irp),
                 handle_to_u64(hvdt_pid),
                 handle_to_u64(hvdt_tid),
                 hvdt_start.QuadPart,
@@ -2041,13 +2128,13 @@ namespace dispatcher {
                 hv_detect_result_k result_buf{};
                 const ULONG hvdt_irql = (ULONG)KeGetCurrentIrql();
                 const UINT64 hvdt_rflags = __readeflags();
-                HVD_LOG_IMMEDIATE("branch_precondition trace=%lld step=%lu flags=0x%llx passive=%u interrupts_enabled=%u requestor_pid=%lu secure_wrapped=%u elapsed_us=%llu cpu=%lu irql=%lu",
+                HVD_LOG_IMMEDIATE("branch_precondition trace=%lld step=%lu flags=0x%llx passive=%u interrupts_enabled=%u requestor_pid=%llu secure_wrapped=%u elapsed_us=%llu cpu=%lu irql=%lu",
                     hvdt_trace_id,
                     29u,
                     req->flags,
                     hvdt_irql == PASSIVE_LEVEL ? 1u : 0u,
                     (hvdt_rflags & 0x200ULL) != 0 ? 1u : 0u,
-                    IoGetRequestorProcessId(irp),
+                    requestor_pid_to_u64(irp),
                     secure_wrapped ? 1u : 0u,
                     elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
                     KeGetCurrentProcessorNumber(),
@@ -2578,6 +2665,23 @@ namespace dispatcher {
             }
         }
 
+        if (hvdt_trace && code != early_decode.expected_hvdt_code) {
+            HVD_LOG_IMMEDIATE("dispatch_hvdt_trace_no_branch trace=%lld step=%lu raw_code=0x%08lx expected_hvdt=0x%08lx decoded_valid=%u decoded_offset=%lu input_size=%lu output_size=%lu status=0x%08lx bytes=%lu elapsed_us=%llu cpu=%lu irql=%lu",
+                hvdt_trace_id,
+                36u,
+                code,
+                early_decode.expected_hvdt_code,
+                early_decode.valid ? 1u : 0u,
+                early_decode.offset,
+                input_size,
+                output_size,
+                status,
+                bytes,
+                elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                KeGetCurrentProcessorNumber(),
+                (ULONG)KeGetCurrentIrql());
+        }
+
         if (hvdt_trace) {
             HVD_LOG_IMMEDIATE("dispatch_final_timing_pre trace=%lld step=%lu status=0x%08lx bytes=%lu secure_wrapped=%u elapsed_us=%llu cpu=%lu irql=%lu",
                 hvdt_trace_id,
@@ -2683,17 +2787,20 @@ namespace dispatcher {
         irp->IoStatus.Status = status;
         irp->IoStatus.Information = bytes;
         if (hvdt_trace) {
-            HVD_LOG_IMMEDIATE("dispatch_complete trace=%lld step=%lu code=0x%08lx final_status=0x%08lx final_bytes=%lu secure_wrapped=%u elapsed_us=%llu cpu=%lu irql=%lu requestor_pid=%lu",
+            HVD_LOG_IMMEDIATE("dispatch_complete trace=%lld step=%lu code=0x%08lx expected_hvdt=0x%08lx final_status=0x%08lx final_bytes=%lu io_status=0x%08lx io_info=%llu secure_wrapped=%u elapsed_us=%llu cpu=%lu irql=%lu requestor_pid=%llu",
                 hvdt_trace_id,
                 43u,
                 code,
+                early_decode.expected_hvdt_code,
                 status,
                 bytes,
+                irp->IoStatus.Status,
+                static_cast<UINT64>(irp->IoStatus.Information),
                 secure_wrapped ? 1u : 0u,
                 elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
                 KeGetCurrentProcessorNumber(),
                 (ULONG)KeGetCurrentIrql(),
-                IoGetRequestorProcessId(irp));
+                requestor_pid_to_u64(irp));
         }
         _IofCompleteRequest(irp, IO_NO_INCREMENT);
 

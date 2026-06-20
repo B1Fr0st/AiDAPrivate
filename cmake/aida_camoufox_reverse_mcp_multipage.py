@@ -7,6 +7,7 @@ import sys
 
 ROOT = pathlib.Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else None
 AIDA_INITIATOR_CONTRACT_V2 = "aida_initiator_contract_v2_page_marker"
+AIDA_PLAYWRIGHT_PAGEERROR_PATCH_ID = "aida_playwright_pageerror_location_patch_20260620_1"
 
 
 def fail(message: str) -> None:
@@ -357,6 +358,38 @@ if "--aida-contract-check" in _aida_contract_sys.argv:
         else:
             break
     write_text(path, text[:insert_pos] + probe + text[insert_pos:])
+
+
+def validate_playwright_pageerror_patch(base: pathlib.Path) -> None:
+    main_path = base / "__main__.py"
+    patch_path = base / "_playwright_patch.py"
+    if not main_path.exists():
+        fail(f"main source missing {main_path}")
+    if not patch_path.exists():
+        fail(f"Playwright pageError patch source missing {patch_path}")
+    main_text = read_text(main_path)
+    patch_text = read_text(patch_path)
+    for marker in (
+        "_aida_apply_playwright_pageerror_patch",
+        "patch_playwright_pageerror",
+        "playwright_patch=playwright_patch",
+    ):
+        if marker not in main_text:
+            fail(f"main source validation missing {marker} in {main_path}")
+    for marker in (
+        "AIDA_PLAYWRIGHT_PAGEERROR_PATCH_ID",
+        AIDA_PLAYWRIGHT_PAGEERROR_PATCH_ID,
+        "patch_playwright_pageerror",
+        "coreBundle.js",
+        "pageError.location.url",
+        "pageError.location?.url ?? ''",
+        "pageError.location.lineNumber",
+        "pageError.location?.lineNumber ?? 0",
+        "pageError.location.columnNumber",
+        "pageError.location?.columnNumber ?? 0",
+    ):
+        if marker not in patch_text:
+            fail(f"Playwright pageError patch validation missing {marker} in {patch_path}")
 
 
 def replace_browser_already_running_summary(text: str) -> str:
@@ -2945,6 +2978,7 @@ def main() -> None:
         if not base.exists():
             continue
         patch_main(base / "__main__.py")
+        validate_playwright_pageerror_patch(base)
         patch_browser(base / "browser.py")
         patch_navigation(base / "tools" / "navigation.py")
         patch_debugging(base / "tools" / "debugging.py")
