@@ -9,6 +9,9 @@ struct arc_heartbeat_result_t;
 
 namespace standalone_license
 {
+    void set_run_correlation_id(const std::string& id);
+    std::string run_correlation_id();
+    std::string runtime_state_snapshot();
     bool initialize(settings_sa_t& settings);
     bool startup_ban_check(settings_sa_t& settings, std::string& reason_out, std::string& message_out);
     bool activate(settings_sa_t& settings, const std::string& key, std::string& error_out);

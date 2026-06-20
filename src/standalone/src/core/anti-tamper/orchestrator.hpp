@@ -3565,6 +3565,21 @@ inline bool guard()
         }
         if (integrity::periodic_violation_latched())
         {
+            const bool activation_hardening_pending =
+                rt.license_pending_activation.load(std::memory_order_acquire) &&
+                !rt.activation_hardening_done.load(std::memory_order_acquire);
+            if (rt.driver_hardening_active.load(std::memory_order_acquire) || activation_hardening_pending)
+            {
+                const uint64_t started = rt.driver_hardening_started_ms.load(std::memory_order_acquire);
+                const uint64_t now = state::monotonic_ms();
+                const uint64_t active_ms = started != 0 && now >= started ? now - started : 0;
+                webhook::write_log_critical_fmt("guard",
+                    "periodic_violation_deferred_activation_hardening driver_hardening=%d activation_pending=%d active_ms=%llu",
+                    rt.driver_hardening_active.load(std::memory_order_acquire) ? 1 : 0,
+                    activation_hardening_pending ? 1 : 0,
+                    static_cast<unsigned long long>(active_ms));
+                CFF_GOTO(guard_cff, 6);
+            }
             static std::atomic<uint32_t> s_periodic_consecutive_fail_count{0};
             static std::atomic<uint64_t> s_periodic_first_fail_qpc{0};
             constexpr uint32_t kRequiredConsecutiveFailures = 3;
@@ -3666,13 +3681,18 @@ inline bool guard()
     }
     CFF_STATE(guard_cff, 6)
     {
-        if (rt.driver_hardening_active.load(std::memory_order_acquire))
+        const bool activation_hardening_pending =
+            rt.license_pending_activation.load(std::memory_order_acquire) &&
+            !rt.activation_hardening_done.load(std::memory_order_acquire);
+        if (rt.driver_hardening_active.load(std::memory_order_acquire) || activation_hardening_pending)
         {
             const uint64_t started = rt.driver_hardening_started_ms.load(std::memory_order_acquire);
             const uint64_t now = state::monotonic_ms();
             const uint64_t active_ms = started != 0 && now >= started ? now - started : 0;
             webhook::write_log_critical_fmt("guard",
-                "block_chain_skip_driver_hardening_active active_ms=%llu verify_counter=%u",
+                "block_chain_skip_activation_hardening driver_hardening=%d activation_pending=%d active_ms=%llu verify_counter=%u",
+                rt.driver_hardening_active.load(std::memory_order_acquire) ? 1 : 0,
+                activation_hardening_pending ? 1 : 0,
                 static_cast<unsigned long long>(active_ms),
                 rt.verify_counter);
             CFF_GOTO(guard_cff, 7);

@@ -1351,6 +1351,50 @@ tool_result_t autoresponder_list_rules(const json&) {
     return tool_result_t::ok(OBFSTR("Listed ") + std::to_string(rules.size()) + OBFSTR(" autoresponder rules"), result);
 }
 
+tool_result_t autoresponder_match_request(const json& params) {
+    const std::string method = params.value("method", "GET");
+    const std::string url = params.value("url", "");
+    const std::string body = params.value("body", "");
+    std::map<std::string, std::string> headers;
+    if (params.contains("headers") && params["headers"].is_object()) {
+        for (auto it = params["headers"].begin(); it != params["headers"].end(); ++it) {
+            if (it.value().is_string())
+                headers[it.key()] = it.value().get<std::string>();
+        }
+    }
+    diag::log_tagged_fmt("net_sec", "autoresponder_match_request entry method=%s url=%s headers=%zu body_len=%zu",
+        method.c_str(), url.c_str(), headers.size(), body.size());
+    if (url.empty())
+        return tool_result_t::error(OBFSTR("url is required"));
+
+    auto match = net_security::AutoResponder::instance().match_request(method, url, headers, body);
+    auto rules = net_security::AutoResponder::instance().list_rules();
+    std::uint64_t match_count = 0;
+    for (const auto& rule : rules) {
+        if (rule.rule_id == match.rule_id) {
+            match_count = rule.match_count;
+            break;
+        }
+    }
+
+    json r;
+    r["matched"] = match.matched;
+    r["rule_id"] = match.rule_id;
+    r["match_count"] = match_count;
+    r["response_status_line"] = match.response_status_line;
+    r["response_headers"] = match.response_headers_str;
+    r["response_body"] = match.response_body;
+    diag::log_tagged_fmt("net_sec", "autoresponder_match_request result matched=%d rule_id=%u match_count=%llu status=%s body_len=%zu",
+        match.matched ? 1 : 0,
+        match.rule_id,
+        static_cast<unsigned long long>(match_count),
+        match.response_status_line.c_str(),
+        match.response_body.size());
+    if (match.matched)
+        return tool_result_t::ok(OBFSTR("AutoResponder matched request"), r);
+    return tool_result_t::error(OBFSTR("No AutoResponder rule matched request"), r);
+}
+
 tool_result_t autoresponder_start(const json&) {
     diag::log_tagged("net_sec", "autoresponder_start entry");
     bool started = net_security::AutoResponder::instance().start();
@@ -1461,6 +1505,7 @@ tool_result_t dtls_extract_keys(const json&) { return tool_result_t::error("Not 
 tool_result_t autoresponder_add_rule(const json&) { return tool_result_t::error("Not supported on this platform"); }
 tool_result_t autoresponder_remove_rule(const json&) { return tool_result_t::error("Not supported on this platform"); }
 tool_result_t autoresponder_list_rules(const json&) { return tool_result_t::error("Not supported on this platform"); }
+tool_result_t autoresponder_match_request(const json&) { return tool_result_t::error("Not supported on this platform"); }
 tool_result_t autoresponder_start(const json&) { return tool_result_t::error("Not supported on this platform"); }
 tool_result_t autoresponder_stop(const json&) { return tool_result_t::error("Not supported on this platform"); }
 tool_result_t autoresponder_import_rules(const json&) { return tool_result_t::error("Not supported on this platform"); }
@@ -1545,8 +1590,8 @@ void register_net_security_tools(mcp_standalone::server_t& srv) {
 
     register_compat(srv, {
         OBFSTR("autoresponder_manage"), OBFSTR("network_security"),
-        OBFSTR("Manage AutoResponder rules and runtime state. Actions: add_rule, remove_rule, list_rules, start, stop, import_rules, export_rules."),
-        {{OBFSTR("action"), OBFSTR("string"), OBFSTR("add_rule|remove_rule|list_rules|start|stop|import_rules|export_rules"), true},
+        OBFSTR("Manage AutoResponder rules and runtime state. Actions: add_rule, remove_rule, list_rules, match_request, start, stop, import_rules, export_rules."),
+        {{OBFSTR("action"), OBFSTR("string"), OBFSTR("add_rule|remove_rule|list_rules|match_request|start|stop|import_rules|export_rules"), true},
          {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
         [](const json& params) -> tool_result_t {
             const std::string action = compat_action_name(params);
@@ -1554,6 +1599,7 @@ void register_net_security_tools(mcp_standalone::server_t& srv) {
             if (action == "add_rule") return autoresponder_add_rule(p);
             if (action == "remove_rule") return autoresponder_remove_rule(p);
             if (action == "list_rules") return autoresponder_list_rules(p);
+            if (action == "match_request") return autoresponder_match_request(p);
             if (action == "start") return autoresponder_start(p);
             if (action == "stop") return autoresponder_stop(p);
             if (action == "import_rules") return autoresponder_import_rules(p);

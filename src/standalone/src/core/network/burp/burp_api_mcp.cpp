@@ -836,6 +836,7 @@ tool_result_t tool_logger_query(const json& params)
         j["latency_ms"]      = r.latency_ms;
         j["mime_type"]       = r.mime_type;
         j["source"]          = logger::source_label(r.source);
+        j["source_label"]    = logger::source_label(r.source);
         j["exchange_id"]     = r.exchange_id;
         arr.push_back(std::move(j));
     }

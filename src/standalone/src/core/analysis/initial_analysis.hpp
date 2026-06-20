@@ -19,6 +19,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -154,6 +155,195 @@ inline void push_log_fmt(const char* fmt, ...)
 inline bool full_test_active()
 {
 	return test_all_features::is_running();
+}
+
+struct full_test_pdb_policy_t {
+	bool        active = false;
+	bool        prompt_suppressed = false;
+	bool        local_available = false;
+	std::string pdb_name;
+	std::string pdb_guid;
+	uint32_t    pdb_age = 0;
+	std::string local_candidate;
+	std::string cache_path;
+	std::string decision;
+	std::string reason;
+};
+
+struct pdb_load_snapshot_t {
+	bool        module_present = false;
+	bool        loaded = false;
+	bool        loading = false;
+	bool        failed = false;
+	size_t      symbols = 0;
+	size_t      structs = 0;
+	size_t      enums = 0;
+	std::string status;
+	std::string path;
+};
+
+inline const char* log_value(const std::string& s)
+{
+	return s.empty() ? "<none>" : s.c_str();
+}
+
+inline std::string fallback_pdb_name_for_module(const std::string& filename)
+{
+	std::filesystem::path p(filename);
+	std::string stem = p.stem().string();
+	if (stem.empty()) stem = filename;
+	return stem + ".pdb";
+}
+
+inline bool regular_file_candidate(const std::filesystem::path& candidate, std::string& out)
+{
+	out.clear();
+	if (candidate.empty()) return false;
+	std::error_code abs_ec;
+	std::filesystem::path check = std::filesystem::absolute(candidate, abs_ec);
+	if (abs_ec) check = candidate;
+	std::error_code type_ec;
+	if (!std::filesystem::is_regular_file(check, type_ec) || type_ec) return false;
+	std::error_code size_ec;
+	const auto size = std::filesystem::file_size(check, size_ec);
+	if (size_ec || size == 0) return false;
+	out = check.string();
+	return true;
+}
+
+inline bool resolve_direct_local_pdb(const std::string& binary_path,
+                                     const std::string& pdb_name,
+                                     std::string& out)
+{
+	if (pdb_name.empty()) return false;
+	std::vector<std::filesystem::path> candidates;
+	std::filesystem::path bp(binary_path);
+	std::error_code abs_ec;
+	std::filesystem::path abs_bp = std::filesystem::absolute(bp, abs_ec);
+	if (!abs_ec) bp = abs_bp;
+	std::filesystem::path parent = bp.parent_path();
+	if (!parent.empty()) candidates.push_back(parent / pdb_name);
+	for (const auto& sp : symbol_store::g_state.search_paths) {
+		if (!sp.empty()) candidates.emplace_back(std::filesystem::path(sp) / pdb_name);
+	}
+	for (const auto& candidate : candidates) {
+		if (regular_file_candidate(candidate, out)) return true;
+	}
+	return false;
+}
+
+inline std::string expected_symbol_cache_path(const pdb_hint_t& hint)
+{
+	if (hint.pdb_name.empty() || hint.pdb_guid.empty()) return {};
+	char age_buf[16] = {};
+	std::snprintf(age_buf, sizeof(age_buf), "%X", static_cast<unsigned>(hint.pdb_age));
+	std::filesystem::path cache = symbol_store::detail::get_cache_dir();
+	return (cache / hint.pdb_name / (hint.pdb_guid + age_buf) / hint.pdb_name).string();
+}
+
+inline full_test_pdb_policy_t resolve_full_test_pdb_policy(const std::string& binary_path,
+                                                           const std::string& filename,
+                                                           const pdb_hint_t* hint)
+{
+	full_test_pdb_policy_t policy;
+	policy.active = true;
+	policy.prompt_suppressed = true;
+	if (hint) {
+		policy.pdb_name = hint->pdb_name;
+		policy.pdb_guid = hint->pdb_guid;
+		policy.pdb_age = hint->pdb_age;
+		policy.cache_path = expected_symbol_cache_path(*hint);
+	} else {
+		policy.pdb_name = fallback_pdb_name_for_module(filename);
+	}
+
+	std::string local;
+	if (resolve_direct_local_pdb(binary_path, policy.pdb_name, local)) {
+		policy.local_available = true;
+		policy.local_candidate = local;
+		policy.decision = "load_local";
+		policy.reason = "direct_local_pdb_present";
+		return policy;
+	}
+
+	if (!policy.cache_path.empty() && regular_file_candidate(policy.cache_path, local)) {
+		policy.local_available = true;
+		policy.local_candidate = local;
+		policy.decision = "load_local";
+		policy.reason = "symbol_cache_pdb_present";
+		return policy;
+	}
+
+	policy.local_available = false;
+	policy.decision = "decline";
+	policy.reason = hint ? "no_deterministic_local_pdb_decline_remote_symbol_download"
+	                     : "no_codeview_or_deterministic_local_pdb";
+	return policy;
+}
+
+inline pdb_load_snapshot_t snapshot_pdb_load(const std::string& module_key)
+{
+	pdb_load_snapshot_t out;
+	std::lock_guard<std::mutex> lk(symbol_store::g_state.mutex);
+	auto it = symbol_store::g_state.modules.find(module_key);
+	if (it == symbol_store::g_state.modules.end()) return out;
+	out.module_present = true;
+	out.loaded = it->second.pdb.loaded;
+	out.loading = it->second.loading;
+	out.failed = it->second.failed;
+	out.symbols = it->second.pdb.symbols.size();
+	out.structs = it->second.pdb.structs.size();
+	out.enums = it->second.pdb.enums.size();
+	out.status = it->second.status_text;
+	out.path = it->second.pdb_path;
+	return out;
+}
+
+inline void log_full_test_pdb_policy(const std::string& filename,
+                                     uint64_t image_base,
+                                     uint64_t image_size,
+                                     const full_test_pdb_policy_t& policy)
+{
+	push_log_fmt("fulltest_pdb_policy module=%s base=0x%llX size=0x%llX pdb=%s guid=%s age=%u local_candidate=%s cache_path=%s decision=%s reason=%s prompt_suppressed=%d",
+		filename.c_str(),
+		static_cast<unsigned long long>(image_base),
+		static_cast<unsigned long long>(image_size),
+		log_value(policy.pdb_name),
+		log_value(policy.pdb_guid),
+		static_cast<unsigned>(policy.pdb_age),
+		log_value(policy.local_candidate),
+		log_value(policy.cache_path),
+		log_value(policy.decision),
+		log_value(policy.reason),
+		policy.prompt_suppressed ? 1 : 0);
+}
+
+inline void log_full_test_pdb_final(const std::string& filename,
+                                    uint64_t image_base,
+                                    uint64_t image_size,
+                                    const full_test_pdb_policy_t& policy)
+{
+	const pdb_load_snapshot_t snap = snapshot_pdb_load(filename);
+	push_log_fmt("fulltest_pdb_final module=%s base=0x%llX size=0x%llX pdb=%s guid=%s age=%u decision=%s reason=%s prompt_suppressed=%d module_present=%d loaded=%d loading=%d failed=%d symbols=%zu structs=%zu enums=%zu types=%zu pdb_path=%s status=%s",
+		filename.c_str(),
+		static_cast<unsigned long long>(image_base),
+		static_cast<unsigned long long>(image_size),
+		log_value(policy.pdb_name),
+		log_value(policy.pdb_guid),
+		static_cast<unsigned>(policy.pdb_age),
+		log_value(policy.decision),
+		log_value(policy.reason),
+		policy.prompt_suppressed ? 1 : 0,
+		snap.module_present ? 1 : 0,
+		snap.loaded ? 1 : 0,
+		snap.loading ? 1 : 0,
+		snap.failed ? 1 : 0,
+		snap.symbols,
+		snap.structs,
+		snap.enums,
+		snap.structs + snap.enums,
+		log_value(snap.path),
+		log_value(snap.status));
 }
 
 inline void rebuild_steps()
@@ -780,6 +970,8 @@ inline void run_pipeline(const std::string& path, const std::string& filename)
 	bool local_pdb_user_accepted = false;
 	std::string local_pdb_picked_path;
 	std::string pdb_module_key;
+	const bool full_test_policy_active = full_test_active();
+	full_test_pdb_policy_t full_test_pdb_policy;
 	if (has_debug) {
 		push_log_fmt("The input file was linked with debug information stored here: %s",
 			hint.pdb_name.c_str());
@@ -792,15 +984,46 @@ inline void run_pipeline(const std::string& path, const std::string& filename)
 			g_state.pdb_hint = hint;
 		}
 		g_state.pdb_decision.store(pdb_decision_t::pending, std::memory_order_release);
-		if (full_test_active()) {
+		if (full_test_policy_active) {
+			full_test_pdb_policy = resolve_full_test_pdb_policy(path, filename, &hint);
+			log_full_test_pdb_policy(filename, view.image_base, view.size_of_image, full_test_pdb_policy);
 			g_state.needs_pdb_prompt.store(false, std::memory_order_release);
 			g_state.pdb_decision.store(pdb_decision_t::declined, std::memory_order_release);
-			pdb_user_accepted = false;
-			push_log_fmt("testlab_auto_decline_remote_pdb module=%s pdb=%s guid=%s age=%u",
-				filename.c_str(),
-				hint.pdb_name.c_str(),
-				hint.pdb_guid.c_str(),
-				static_cast<unsigned>(hint.pdb_age));
+			g_state.needs_local_pdb_prompt.store(false, std::memory_order_release);
+			if (full_test_pdb_policy.local_available) {
+				{
+					std::lock_guard<std::mutex> lk(g_state.local_pdb_mtx);
+					g_state.local_pdb_module_name = filename;
+					g_state.local_pdb_image_base = view.image_base;
+					g_state.local_pdb_image_size = view.size_of_image;
+					g_state.local_pdb_reason = full_test_pdb_policy.reason;
+					g_state.local_pdb_path = full_test_pdb_policy.local_candidate;
+				}
+				g_state.local_pdb_decision.store(pdb_decision_t::accepted, std::memory_order_release);
+				local_pdb_user_accepted = true;
+				local_pdb_picked_path = full_test_pdb_policy.local_candidate;
+				pdb_module_key = filename;
+				push_log_fmt("testlab_auto_load_local_pdb module=%s pdb=%s guid=%s age=%u path=%s reason=%s prompt_suppressed=1",
+					filename.c_str(),
+					hint.pdb_name.c_str(),
+					hint.pdb_guid.c_str(),
+					static_cast<unsigned>(hint.pdb_age),
+					full_test_pdb_policy.local_candidate.c_str(),
+					full_test_pdb_policy.reason.c_str());
+			} else {
+				g_state.local_pdb_decision.store(pdb_decision_t::declined, std::memory_order_release);
+				{
+					std::lock_guard<std::mutex> lk(g_state.local_pdb_mtx);
+					g_state.local_pdb_path.clear();
+				}
+				pdb_user_accepted = false;
+				push_log_fmt("testlab_auto_decline_remote_pdb module=%s pdb=%s guid=%s age=%u reason=%s prompt_suppressed=1",
+					filename.c_str(),
+					hint.pdb_name.c_str(),
+					hint.pdb_guid.c_str(),
+					static_cast<unsigned>(hint.pdb_age),
+					full_test_pdb_policy.reason.c_str());
+			}
 		} else {
 			g_state.needs_pdb_prompt.store(true, std::memory_order_release);
 			push_log("Awaiting user decision on PDB download...");
@@ -817,16 +1040,42 @@ inline void run_pipeline(const std::string& path, const std::string& filename)
 		pdb_module_key = filename;
 	} else {
 		push_log("No PDB CodeView debug entry present in image");
-		if (full_test_active()) {
+		if (full_test_policy_active) {
+			full_test_pdb_policy = resolve_full_test_pdb_policy(path, filename, nullptr);
+			log_full_test_pdb_policy(filename, view.image_base, view.size_of_image, full_test_pdb_policy);
 			g_state.needs_local_pdb_prompt.store(false, std::memory_order_release);
-			g_state.local_pdb_decision.store(pdb_decision_t::declined, std::memory_order_release);
-			{
-				std::lock_guard<std::mutex> lk(g_state.local_pdb_mtx);
-				g_state.local_pdb_path.clear();
+			g_state.needs_pdb_prompt.store(false, std::memory_order_release);
+			g_state.pdb_decision.store(pdb_decision_t::declined, std::memory_order_release);
+			if (full_test_pdb_policy.local_available) {
+				{
+					std::lock_guard<std::mutex> lk(g_state.local_pdb_mtx);
+					g_state.local_pdb_module_name = filename;
+					g_state.local_pdb_image_base = view.image_base;
+					g_state.local_pdb_image_size = view.size_of_image;
+					g_state.local_pdb_reason = full_test_pdb_policy.reason;
+					g_state.local_pdb_path = full_test_pdb_policy.local_candidate;
+				}
+				g_state.local_pdb_decision.store(pdb_decision_t::accepted, std::memory_order_release);
+				local_pdb_user_accepted = true;
+				local_pdb_picked_path = full_test_pdb_policy.local_candidate;
+				pdb_module_key = filename;
+				push_log_fmt("testlab_auto_load_local_pdb module=%s pdb=%s path=%s reason=%s prompt_suppressed=1",
+					filename.c_str(),
+					full_test_pdb_policy.pdb_name.c_str(),
+					full_test_pdb_policy.local_candidate.c_str(),
+					full_test_pdb_policy.reason.c_str());
+			} else {
+				g_state.local_pdb_decision.store(pdb_decision_t::declined, std::memory_order_release);
+				{
+					std::lock_guard<std::mutex> lk(g_state.local_pdb_mtx);
+					g_state.local_pdb_path.clear();
+				}
+				local_pdb_user_accepted = false;
+				push_log_fmt("testlab_auto_decline_local_pdb module=%s pdb=%s reason=%s prompt_suppressed=1",
+					filename.c_str(),
+					full_test_pdb_policy.pdb_name.c_str(),
+					full_test_pdb_policy.reason.c_str());
 			}
-			local_pdb_user_accepted = false;
-			push_log_fmt("testlab_auto_decline_local_pdb module=%s reason=no_codeview_debug_entry",
-				filename.c_str());
 		} else {
 			push_log("Asking user for an externally-supplied PDB file...");
 			request_local_pdb_prompt(filename, view.image_base, view.size_of_image,
@@ -844,7 +1093,25 @@ inline void run_pipeline(const std::string& path, const std::string& filename)
 
 	begin_step(step_id_t::load_pdb);
 	bool pdb_loaded = false;
-	if (has_debug && pdb_user_accepted && g_state.opt_load_names.load(std::memory_order_acquire)) {
+	if (local_pdb_user_accepted && !local_pdb_picked_path.empty()
+	    && g_state.opt_load_names.load(std::memory_order_acquire)) {
+		std::filesystem::path bp(path);
+		std::filesystem::path parent = bp.parent_path();
+		if (!parent.empty()) {
+			std::string parent_str = parent.string();
+			bool already = false;
+			for (const auto& sp : symbol_store::g_state.search_paths) {
+				if (_stricmp(sp.c_str(), parent_str.c_str()) == 0) { already = true; break; }
+			}
+			if (!already) symbol_store::add_search_path(parent_str);
+		}
+		push_log_fmt("Loading local PDB: %s", local_pdb_picked_path.c_str());
+		symbol_store::load_pdb_from_explicit_path(filename, view.image_base,
+			view.size_of_image, local_pdb_picked_path);
+		pdb_loaded = poll_pdb_loaded(filename);
+		pdb_module_key = filename;
+		end_step(step_id_t::load_pdb, pdb_loaded ? "PDB loaded" : "PDB load failed", !pdb_loaded);
+	} else if (has_debug && pdb_user_accepted && g_state.opt_load_names.load(std::memory_order_acquire)) {
 		bool prev_auto = symbol_store::g_state.auto_download;
 		symbol_store::g_state.auto_download = true;
 		if (symbol_store::g_state.symbol_server_url.empty())
@@ -905,8 +1172,13 @@ inline void run_pipeline(const std::string& path, const std::string& filename)
 
 		end_step(step_id_t::load_pdb, pdb_loaded ? "PDB loaded" : "PDB unavailable", !pdb_loaded);
 	} else if (has_debug && !pdb_user_accepted) {
-		push_log("PDB load skipped by user");
-		end_step(step_id_t::load_pdb, "user declined", true);
+		if (full_test_policy_active) {
+			push_log("PDB load skipped by full-test policy");
+			end_step(step_id_t::load_pdb, "full-test policy declined", true);
+		} else {
+			push_log("PDB load skipped by user");
+			end_step(step_id_t::load_pdb, "user declined", true);
+		}
 	} else if (!has_debug && local_pdb_user_accepted && !local_pdb_picked_path.empty()
 	           && g_state.opt_load_names.load(std::memory_order_acquire)) {
 		std::filesystem::path bp(path);
@@ -926,6 +1198,10 @@ inline void run_pipeline(const std::string& path, const std::string& filename)
 		end_step(step_id_t::load_pdb, pdb_loaded ? "PDB loaded" : "PDB load failed", !pdb_loaded);
 	} else {
 		end_step(step_id_t::load_pdb, "no PDB info", true);
+	}
+
+	if (full_test_policy_active) {
+		log_full_test_pdb_final(filename, view.image_base, view.size_of_image, full_test_pdb_policy);
 	}
 
 	begin_step(step_id_t::apply_typelibs);

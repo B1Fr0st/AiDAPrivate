@@ -1117,6 +1117,8 @@ static const char* visibility_name(tool_visibility_t visibility)
     }
 }
 
+static bool is_camoufox_browser_tool_name(const std::string& name);
+
 static std::string infer_tool_domain(const std::string& name)
 {
     if (name.rfind("browser_", 0) == 0)
@@ -1135,6 +1137,86 @@ static std::string infer_tool_domain(const std::string& name)
     if (underscore == std::string::npos || underscore == 0)
         return {};
     return name.substr(0, underscore);
+}
+
+static bool tool_group_noise_token(const std::string& token)
+{
+    static const char* const noise[] = {
+        "aida", "aidastandalone", "all", "complete", "description", "descriptions",
+        "every", "full", "group", "groups", "mcp", "pack", "packs", "schema",
+        "schemas", "standalone", "tool", "tools"
+    };
+    for (const char* n : noise) {
+        if (token == n)
+            return true;
+    }
+    return false;
+}
+
+static std::string normalize_tool_group_name(const std::string& text)
+{
+    std::string lowered = lower_ascii(text);
+    std::vector<std::string> tokens;
+    std::string current;
+    for (char c : lowered) {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        if (std::isalnum(uc)) {
+            current.push_back(static_cast<char>(uc));
+        } else {
+            if (!current.empty()) {
+                if (!tool_group_noise_token(current))
+                    tokens.push_back(current);
+                current.clear();
+            }
+        }
+    }
+    if (!current.empty() && !tool_group_noise_token(current))
+        tokens.push_back(current);
+
+    if (tokens.size() == 1) {
+        const std::string& token = tokens[0];
+        if (token == "browser" || token == "browsers" || token == "camoufox")
+            return "browser";
+        if (token == "network" || token == "networks" || token == "networking")
+            return "network";
+        if (token == "burp" || token == "burpsuite")
+            return "burp";
+    }
+    if (tokens.size() == 2 && tokens[0] == "burp" && tokens[1] == "suite")
+        return "burp";
+    return {};
+}
+
+static bool tool_matches_description_group(const tool_def_t& tool, const std::string& group)
+{
+    const std::string name_l = lower_ascii(tool.name);
+    const std::string desc_l = lower_ascii(tool.description);
+    const std::string domain = infer_tool_domain(tool.name);
+
+    if (group == "browser") {
+        return domain == "browser" ||
+               is_camoufox_browser_tool_name(tool.name) ||
+               name_l.find("browser") != std::string::npos ||
+               name_l.find("camoufox") != std::string::npos ||
+               desc_l.find("browser") != std::string::npos ||
+               desc_l.find("camoufox") != std::string::npos;
+    }
+    if (group == "network") {
+        return domain == "network" ||
+               domain == "network_security" ||
+               domain == "network_protocol" ||
+               name_l.rfind("network_", 0) == 0 ||
+               name_l.rfind("net_security_", 0) == 0 ||
+               name_l.rfind("net_proto_", 0) == 0 ||
+               name_l.find("_network") != std::string::npos;
+    }
+    if (group == "burp") {
+        return domain == "burp" ||
+               tool.name == "burp_scanner_manage" ||
+               name_l.rfind("burp_", 0) == 0 ||
+               desc_l.find("burp") != std::string::npos;
+    }
+    return false;
 }
 
 static const char* json_type_label(const json& value)
@@ -1744,6 +1826,40 @@ static bool tool_args_select_session_target(const json& args)
     return false;
 }
 
+static bool tool_declares_param_named(const tool_def_t& tool, const char* name)
+{
+    for (const auto& param : tool.params) {
+        if (param.name == name)
+            return true;
+    }
+    return false;
+}
+
+static const json& target_resolution_args_for_tool(const tool_def_t& tool, const json& arguments, json& storage, bool emit_log)
+{
+    if (!arguments.is_object() ||
+        !tool_declares_param_named(tool, "session_id") ||
+        !arguments.contains("session_id") ||
+        arguments.contains("binary_id")) {
+        return arguments;
+    }
+
+    std::size_t session_id_len = 0;
+    const auto it = arguments.find("session_id");
+    if (it != arguments.end() && it->is_string())
+        session_id_len = it->get<std::string>().size();
+
+    storage = arguments;
+    storage.erase("session_id");
+    if (emit_log) {
+        diag::log_tagged_fmt("mcp_srv",
+            "tool_target_args local_session_id tool='%s' session_id_len=%zu binary_id_present=0",
+            tool.name.c_str(),
+            session_id_len);
+    }
+    return storage;
+}
+
 struct target_probe_t
 {
     bool ok = true;
@@ -1865,7 +1981,9 @@ static std::string predicted_tool_lane(const tool_def_t& tool, const json& argum
 {
     const bool session_manager = is_analysis_session_management_tool(tool.name);
     const bool session_independent = is_active_session_independent_tool(tool.name);
-    const bool explicit_target = tool_args_select_session_target(arguments);
+    json target_arguments_storage;
+    const json& target_arguments = target_resolution_args_for_tool(tool, arguments, target_arguments_storage, false);
+    const bool explicit_target = tool_args_select_session_target(target_arguments);
     if (session_independent && tool.read_only && !session_manager)
         return "independent_unlocked";
     if (session_independent && !tool.read_only && !session_manager) {
@@ -1915,7 +2033,9 @@ static tool_result_t invoke_tool_with_concurrency_policy(
 {
     const bool session_manager = is_analysis_session_management_tool(tool.name);
     const bool session_independent = is_active_session_independent_tool(tool.name);
-    const bool explicit_target = tool_args_select_session_target(arguments);
+    json target_arguments_storage;
+    const json& target_arguments = target_resolution_args_for_tool(tool, arguments, target_arguments_storage, true);
+    const bool explicit_target = tool_args_select_session_target(target_arguments);
     const std::string domain = infer_tool_domain(tool.name);
 
     if (session_independent && tool.read_only && !session_manager) {
@@ -1958,7 +2078,7 @@ static tool_result_t invoke_tool_with_concurrency_policy(
             static_cast<unsigned long long>(wait_ms));
         if (!session_manager && !session_independent) {
             std::string scope_err;
-            target_scope_t scope = resolve_target(arguments, &scope_err);
+            target_scope_t scope = resolve_target(target_arguments, &scope_err);
             if (!scope.ok)
                 return tool_result_t::error(scope_err.empty() ? std::string("Unable to resolve target session") : scope_err);
             if (metrics)
@@ -1978,7 +2098,7 @@ static tool_result_t invoke_tool_with_concurrency_policy(
             tool.name.c_str(),
             static_cast<unsigned long long>(wait_ms));
         std::string scope_err;
-        target_scope_t scope = resolve_target(arguments, &scope_err);
+        target_scope_t scope = resolve_target(target_arguments, &scope_err);
         if (!scope.ok)
             return tool_result_t::error(scope_err.empty() ? std::string("Unable to resolve target session") : scope_err);
         if (metrics)
@@ -1992,7 +2112,7 @@ static tool_result_t invoke_tool_with_concurrency_policy(
         const std::uint64_t wait_start = mcp_now_ms();
         std::shared_lock<std::shared_mutex> lk(active_session_tool_mutex());
         probe_wait_ms = mcp_now_ms() - wait_start;
-        probe = probe_target_without_switch(arguments);
+        probe = probe_target_without_switch(target_arguments);
         if (!probe.ok) {
             set_tool_metrics_lane(metrics, "shared_target_reject", probe_wait_ms);
             diag::log_tagged_fmt("mcp_srv",
@@ -2012,7 +2132,7 @@ static tool_result_t invoke_tool_with_concurrency_policy(
                 static_cast<unsigned long long>(probe.target_idx),
                 static_cast<unsigned long long>(probe_wait_ms));
             std::string scope_err;
-            target_scope_t scope = resolve_target(arguments, &scope_err);
+            target_scope_t scope = resolve_target(target_arguments, &scope_err);
             if (!scope.ok)
                 return tool_result_t::error(scope_err.empty() ? std::string("Unable to resolve target session") : scope_err);
             if (metrics)
@@ -2033,7 +2153,7 @@ static tool_result_t invoke_tool_with_concurrency_policy(
         static_cast<unsigned long long>(probe_wait_ms),
         static_cast<unsigned long long>(wait_ms));
     std::string scope_err;
-    target_scope_t scope = resolve_target(arguments, &scope_err);
+    target_scope_t scope = resolve_target(target_arguments, &scope_err);
     if (!scope.ok)
         return tool_result_t::error(scope_err.empty() ? std::string("Unable to resolve target session") : scope_err);
     if (metrics)
@@ -2246,6 +2366,7 @@ static json tool_diagnostics_json(
 
 tool_result_t server_t::describe_tools(const json& params)
 {
+    const std::uint64_t begin_ms = mcp_now_ms();
     std::vector<std::string> names;
     if (params.is_object()) {
         if (params.contains("names") && params["names"].is_array()) {
@@ -2262,18 +2383,36 @@ tool_result_t server_t::describe_tools(const json& params)
 
     std::string prefix;
     std::string query;
+    std::string group;
+    std::string group_source;
     bool include_schema = true;
     int limit = 40;
+    bool explicit_limit = false;
     if (params.is_object()) {
         if (params.contains("prefix") && params["prefix"].is_string())
             prefix = params["prefix"].get<std::string>();
         if (params.contains("query") && params["query"].is_string())
             query = params["query"].get<std::string>();
+        if (params.contains("group") && params["group"].is_string()) {
+            group_source = params["group"].get<std::string>();
+            group = normalize_tool_group_name(group_source);
+        }
         if (params.contains("include_schema") && params["include_schema"].is_boolean())
             include_schema = params["include_schema"].get<bool>();
-        if (params.contains("limit") && params["limit"].is_number_integer())
+        if (params.contains("limit") && params["limit"].is_number_integer()) {
             limit = params["limit"].get<int>();
+            explicit_limit = true;
+        }
     }
+    if (names.empty() && prefix.empty() && group.empty() && !query.empty()) {
+        const std::string query_group = normalize_tool_group_name(query);
+        if (!query_group.empty()) {
+            group = query_group;
+            group_source = query;
+        }
+    }
+    if (!group.empty() && !explicit_limit)
+        limit = 100;
     limit = (std::max)(1, (std::min)(limit, 100));
 
     std::vector<tool_def_t> matches;
@@ -2293,10 +2432,24 @@ tool_result_t server_t::describe_tools(const json& params)
                     }
                 }
             }
+        } else if (!group.empty()) {
+            for (const auto& tool : _tools) {
+                if (current_call_cancelled())
+                    return tool_result_t::error("Tool description query cancelled.");
+                if (!is_external_mcp_tool(tool))
+                    continue;
+                if (tool_matches_description_group(tool, group))
+                    matches.push_back(tool);
+            }
+            std::sort(matches.begin(), matches.end(), [](const tool_def_t& a, const tool_def_t& b) {
+                return a.name < b.name;
+            });
         } else if (!prefix.empty() || !query.empty()) {
             const std::string prefix_l = lower_ascii(prefix);
             const std::string query_l = lower_ascii(query);
             for (const auto& tool : _tools) {
+                if (current_call_cancelled())
+                    return tool_result_t::error("Tool description query cancelled.");
                 if (!is_external_mcp_tool(tool))
                     continue;
                 const std::string name_l = lower_ascii(tool.name);
@@ -2313,21 +2466,95 @@ tool_result_t server_t::describe_tools(const json& params)
         }
     }
 
-    if (names.empty() && prefix.empty() && query.empty())
-        return tool_result_t::ok("Pass `names`, `name`, `prefix`, or `query` to retrieve full tool descriptions.");
+    if (names.empty() && prefix.empty() && query.empty() && group.empty())
+        return tool_result_t::ok("Pass `names`, `name`, `prefix`, `query`, or `group` to retrieve full tool descriptions.");
 
-    if (matches.empty())
-        return tool_result_t::ok("No matching tools found.");
+    if (matches.empty()) {
+        json data;
+        data["tools"] = json::array();
+        data["matched_count"] = 0;
+        data["returned_count"] = 0;
+        data["limit"] = limit;
+        if (!group.empty()) {
+            const std::uint64_t elapsed_ms = mcp_now_ms() - begin_ms;
+            data["group"] = group;
+            data["diagnostics"] = {
+                {"group", group},
+                {"matched_before_limit", 0},
+                {"matched_after_limit", 0},
+                {"limit", limit},
+                {"elapsed_ms", elapsed_ms}
+            };
+            diag::log_tagged_fmt("mcp_srv",
+                "tool_descriptions_group group='%s' source_len=%zu matched_before_limit=0 matched_after_limit=0 limit=%d elapsed_ms=%llu",
+                group.c_str(),
+                group_source.size(),
+                limit,
+                static_cast<unsigned long long>(elapsed_ms));
+        }
+        return tool_result_t::ok("No matching tools found.", data);
+    }
 
     const size_t shown = (std::min)(matches.size(), static_cast<size_t>(limit));
+    json data;
+    data["tools"] = json::array();
+    data["matched_count"] = matches.size();
+    data["returned_count"] = shown;
+    data["limit"] = limit;
+    data["include_schema"] = include_schema;
+    if (!group.empty())
+        data["group"] = group;
+    for (size_t i = 0; i < shown; ++i) {
+        if (current_call_cancelled())
+            return tool_result_t::error("Tool description query cancelled.");
+        const auto& tool = matches[i];
+        if (include_schema) {
+            data["tools"].push_back(tool_schema(tool, false));
+        } else {
+            json t;
+            t["name"] = tool.name;
+            t["description"] = tool.description;
+            t["read_only"] = tool.read_only;
+            t["visibility"] = visibility_name(tool.visibility);
+            const std::string domain = infer_tool_domain(tool.name);
+            if (!domain.empty())
+                t["domain"] = domain;
+            data["tools"].push_back(std::move(t));
+        }
+    }
+    if (!group.empty()) {
+        const std::uint64_t elapsed_ms = mcp_now_ms() - begin_ms;
+        data["diagnostics"] = {
+            {"group", group},
+            {"matched_before_limit", matches.size()},
+            {"matched_after_limit", shown},
+            {"limit", limit},
+            {"elapsed_ms", elapsed_ms}
+        };
+        diag::log_tagged_fmt("mcp_srv",
+            "tool_descriptions_group group='%s' source_len=%zu matched_before_limit=%zu matched_after_limit=%zu limit=%d elapsed_ms=%llu",
+            group.c_str(),
+            group_source.size(),
+            matches.size(),
+            shown,
+            limit,
+            static_cast<unsigned long long>(elapsed_ms));
+    }
+
     std::string result;
     result.reserve(shown * 256);
     if (matches.size() > shown) {
         result += "Showing " + std::to_string(shown) + " of " +
                   std::to_string(matches.size()) +
-                  " matching tools. Refine with `name`, `names`, `prefix`, or `query`.\n\n";
+                  " matching tools. Refine with `name`, `names`, `prefix`, `query`, or `group`.\n\n";
+    }
+    if (!group.empty()) {
+        result += "Group: " + group + "\n";
+        result += "Matched: " + std::to_string(matches.size()) + ", returned: " + std::to_string(shown) + ", limit: " + std::to_string(limit) + "\n\n";
     }
     for (size_t i = 0; i < shown; ++i) {
+        if (current_call_cancelled())
+            return tool_result_t::error("Tool description query cancelled.");
         const auto& tool = matches[i];
         result += "### " + tool.name + "\n";
         if (!tool.description.empty())
@@ -2351,7 +2578,7 @@ tool_result_t server_t::describe_tools(const json& params)
         }
         result += "\n";
     }
-    return tool_result_t::ok(result);
+    return tool_result_t::ok(result, data);
 }
 
 json server_t::handle_initialize(const json& id, const json&)

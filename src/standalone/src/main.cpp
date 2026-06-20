@@ -1043,7 +1043,13 @@ static void crash_log_fmt(const char* fmt, ...)
 static void startup_log_critical(const char* detail)
 {
     aida::manual_map_tls::ensure_current_thread();
-    anti_tamper::webhook::write_log_critical("startup", detail ? detail : "<null>");
+    std::string run_id = standalone_license::run_correlation_id();
+    char tagged[2300] = {};
+    _snprintf_s(tagged, sizeof(tagged), _TRUNCATE,
+        "run_id=%s %s",
+        run_id.c_str(),
+        detail ? detail : "<null>");
+    anti_tamper::webhook::write_log_critical("startup", tagged);
 }
 
 static void startup_log_critical_fmt(const char* fmt, ...)
@@ -1254,6 +1260,36 @@ static uint64_t diag_fnv1a64(const void* data, size_t len)
         h *= 1099511628211ULL;
     }
     return h;
+}
+
+static std::string generate_startup_run_correlation_id()
+{
+    LARGE_INTEGER qpc{};
+    QueryPerformanceCounter(&qpc);
+    uint64_t entropy[8] = {};
+    entropy[0] = static_cast<uint64_t>(GetCurrentProcessId());
+    entropy[1] = static_cast<uint64_t>(GetCurrentThreadId());
+    entropy[2] = static_cast<uint64_t>(GetTickCount64());
+    entropy[3] = static_cast<uint64_t>(qpc.QuadPart);
+    entropy[4] = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&entropy));
+#if defined(_M_X64)
+    entropy[5] = static_cast<uint64_t>(__rdtsc());
+#else
+    entropy[5] = entropy[2] ^ entropy[3];
+#endif
+    entropy[6] = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)));
+    entropy[7] = diag_fnv1a64(entropy, sizeof(entropy) - sizeof(entropy[7]));
+    const uint64_t h1 = diag_fnv1a64(entropy, sizeof(entropy));
+    entropy[0] ^= h1;
+    entropy[4] += h1;
+    const uint64_t h2 = diag_fnv1a64(entropy, sizeof(entropy));
+    char buf[80] = {};
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+        "%08lX-%016llX-%016llX",
+        static_cast<unsigned long>(GetCurrentProcessId()),
+        static_cast<unsigned long long>(h1),
+        static_cast<unsigned long long>(h2));
+    return std::string(buf);
 }
 
 static void format_message_pump_stall_context(char* out, size_t cap);
@@ -3742,6 +3778,9 @@ int main(int, char**)
     aida_early_startup::mark("manual_map_tls_pre");
     aida::manual_map_tls::ensure_current_thread();
     aida_early_startup::mark("manual_map_tls_current_thread_ok");
+    const std::string startup_run_id = generate_startup_run_correlation_id();
+    standalone_license::set_run_correlation_id(startup_run_id);
+    aida_early_startup::mark("run_correlation_id_set");
     aida_early_startup::mark("diagnostic_exception_scope_initialize_pre");
     bool diagnostic_scope_ready = aida::diagnostic_exception_scope::initialize();
     aida_early_startup::mark(diagnostic_scope_ready ? "diagnostic_exception_scope_initialized" : "diagnostic_exception_scope_failed");
@@ -3750,6 +3789,12 @@ int main(int, char**)
     aida_early_startup::mark(diagnostic_veh ? "diagnostic_veh_installed" : "diagnostic_veh_install_failed");
     aida_early_startup::mark("normal_diag_log_pre");
     diag::log_tagged_critical("main", "diagnostic_veh_installed");
+    diag::log_tagged_critical_fmt("startup",
+        "run_correlation_generated run_id=%s pid=%lu tid=%lu tick=%llu",
+        startup_run_id.c_str(),
+        GetCurrentProcessId(),
+        GetCurrentThreadId(),
+        static_cast<unsigned long long>(GetTickCount64()));
     aida_early_startup::mark_normal_diagnostics_reached();
     aida_early_startup::mark("fileless_startup_state_pre");
     log_fileless_startup_state("post_veh");
@@ -4508,6 +4553,29 @@ int main(int, char**)
         {
             startup_store_bg_step(7, "bg_init_worker", "pre_activation_anti_tamper_initialize_entering");
             const uint64_t anti_tamper_tick = static_cast<uint64_t>(GetTickCount64());
+            {
+                auto dyn = driver_bridge::dynamic_ioctl_state();
+                auto& at_rt = anti_tamper::state::get();
+                startup_log_critical_fmt("anti_tamper_pre_activation_state initialized=%d driver_hardening=%d hardening_active=%d violation=%d runtime_authorized=%d validated=%d valid=%d arc=%d dyn_loaded=%d dyn_kernel=%d dyn_connected=%d dyn_ready=%d inst_seed=%u/%u global_seed=%u/%u ioctl_seed_hash=0x%08X hb_ioctl_seed_hash=0x%08X",
+                    at_rt.initialized.load(std::memory_order_acquire) ? 1 : 0,
+                    at_rt.driver_hardening_done.load(std::memory_order_acquire) ? 1 : 0,
+                    at_rt.driver_hardening_active.load(std::memory_order_acquire) ? 1 : 0,
+                    at_rt.violation_latched.load(std::memory_order_acquire) ? 1 : 0,
+                    runtime_authorized ? 1 : 0,
+                    license::validated ? 1 : 0,
+                    standalone_license::is_valid() ? 1 : 0,
+                    standalone_license::is_arc_loaded() ? 1 : 0,
+                    dyn.loaded ? 1 : 0,
+                    dyn.kernel ? 1 : 0,
+                    dyn.connected ? 1 : 0,
+                    dyn.ready ? 1 : 0,
+                    dyn.instance_server_seed,
+                    dyn.instance_ioctl_seed,
+                    dyn.global_server_seed,
+                    dyn.global_ioctl_seed,
+                    dyn.ioctl_seed_hash,
+                    dyn.heartbeat_ioctl_seed_hash);
+            }
             startup_log_critical_fmt("anti_tamper_initialize_call_pre pid=%lu tid=%lu tick=%llu runtime_authorized=%d validated=%d valid=%d arc=%d",
                 GetCurrentProcessId(),
                 GetCurrentThreadId(),
@@ -4608,6 +4676,20 @@ int main(int, char**)
         GetCurrentProcessId(),
         GetCurrentThreadId(),
         static_cast<unsigned long long>(GetTickCount64()));
+    {
+        auto dyn = driver_bridge::dynamic_ioctl_state();
+        startup_log_critical_fmt("driver_bridge_launch_context before_post loaded=%d kernel=%d connected=%d dyn_ready=%d inst_seed=%u/%u global_seed=%u/%u ioctl_seed_hash=0x%08X hb_ioctl_seed_hash=0x%08X",
+            dyn.loaded ? 1 : 0,
+            dyn.kernel ? 1 : 0,
+            dyn.connected ? 1 : 0,
+            dyn.ready ? 1 : 0,
+            dyn.instance_server_seed,
+            dyn.instance_ioctl_seed,
+            dyn.global_server_seed,
+            dyn.global_ioctl_seed,
+            dyn.ioctl_seed_hash,
+            dyn.heartbeat_ioctl_seed_hash);
+    }
     bool driver_posted = critical_work_queue::post_labeled("startup.driver_bridge_init", [] {
         const uint64_t driver_tick = static_cast<uint64_t>(GetTickCount64());
         startup_log_critical_fmt("driver_bridge_init_thread_entry pid=%lu tid=%lu tick=%llu",
@@ -4618,6 +4700,21 @@ int main(int, char**)
         DWORD seh_dbi = seh_driver_bridge_initialize();
         if (seh_dbi != 0)
             diag::log_tagged_fmt("drv_init", "driver_bridge_initialize_seh code=0x%08X last_err=%lu", seh_dbi, GetLastError());
+        {
+            auto dyn = driver_bridge::dynamic_ioctl_state();
+            startup_log_critical_fmt("driver_bridge_launch_context after_initialize seh=0x%08X loaded=%d kernel=%d connected=%d dyn_ready=%d inst_seed=%u/%u global_seed=%u/%u ioctl_seed_hash=0x%08X hb_ioctl_seed_hash=0x%08X",
+                seh_dbi,
+                dyn.loaded ? 1 : 0,
+                dyn.kernel ? 1 : 0,
+                dyn.connected ? 1 : 0,
+                dyn.ready ? 1 : 0,
+                dyn.instance_server_seed,
+                dyn.instance_ioctl_seed,
+                dyn.global_server_seed,
+                dyn.global_ioctl_seed,
+                dyn.ioctl_seed_hash,
+                dyn.heartbeat_ioctl_seed_hash);
+        }
         if (seh_dbi == 0 && driver_bridge::is_loaded() && driver_bridge::using_kernel_driver())
         {
             auto& at_rt = anti_tamper::state::get();

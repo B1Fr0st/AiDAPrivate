@@ -39,6 +39,12 @@ T get_or(const json& j, const std::string& key, T def)
     try { return j.at(key).get<T>(); } catch (...) { return def; }
 }
 
+uint64_t unix_ms_now()
+{
+    using namespace std::chrono;
+    return static_cast<uint64_t>(duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count());
+}
+
 std::vector<std::string> get_string_array(const json& j, const std::string& key)
 {
     std::vector<std::string> out;
@@ -79,6 +85,11 @@ json crawler_status_to_json(const crawler::crawl_status_t& s)
     j["urls_found"] = s.urls_found;
     j["started_unix_ms"] = s.started_unix_ms;
     j["finished_unix_ms"] = s.finished_unix_ms;
+    j["last_progress_unix_ms"] = s.last_progress_unix_ms;
+    const uint64_t now = unix_ms_now();
+    j["ms_since_last_progress"] = s.last_progress_unix_ms != 0 && now >= s.last_progress_unix_ms ? now - s.last_progress_unix_ms : 0;
+    j["pages_per_sec"] = s.pages_per_sec;
+    j["in_flight"] = s.in_flight;
     j["last_url"] = s.last_url;
     j["last_error"] = s.last_error;
     return j;
@@ -266,7 +277,14 @@ tool_result_t crawler_status_(const json& p)
         urls.push_back(e);
     }
     j["urls"] = urls;
-    diag::log_tagged_fmt("mcp_burp", "crawler_status ok id=%llu urls=%d", static_cast<unsigned long long>(id), n);
+    diag::log_tagged_fmt("mcp_burp", "crawler_status ok id=%llu urls=%d queue_depth=%d in_flight=%d pages_per_sec=%.3f last_progress_unix_ms=%llu last_error=%s",
+        static_cast<unsigned long long>(id),
+        n,
+        s.queue_depth,
+        s.in_flight,
+        s.pages_per_sec,
+        static_cast<unsigned long long>(s.last_progress_unix_ms),
+        s.last_error.c_str());
     return tool_result_t::ok("crawler status id=" + std::to_string(id) + " urls=" + std::to_string(urls.size()), j);
 }
 
@@ -310,7 +328,30 @@ tool_result_t crawler_list_(const json&)
     for (auto& s : v) arr.push_back(crawler_status_to_json(s));
     json out;
     out["crawls"] = arr;
-    diag::log_tagged_fmt("mcp_burp", "crawler_list ok count=%zu", v.size());
+    int total_queue_depth = 0;
+    int total_in_flight = 0;
+    double total_pages_per_sec = 0.0;
+    uint64_t newest_progress = 0;
+    std::string last_error;
+    for (const auto& s : v) {
+        total_queue_depth += s.queue_depth;
+        total_in_flight += s.in_flight;
+        total_pages_per_sec += s.pages_per_sec;
+        if (s.last_progress_unix_ms > newest_progress) newest_progress = s.last_progress_unix_ms;
+        if (!s.last_error.empty()) last_error = s.last_error;
+    }
+    out["queue_depth"] = total_queue_depth;
+    out["in_flight"] = total_in_flight;
+    out["pages_per_sec"] = total_pages_per_sec;
+    out["last_progress_unix_ms"] = newest_progress;
+    out["last_error"] = last_error;
+    diag::log_tagged_fmt("mcp_burp", "crawler_list ok count=%zu queue_depth=%d in_flight=%d pages_per_sec=%.3f last_progress_unix_ms=%llu last_error=%s",
+        v.size(),
+        total_queue_depth,
+        total_in_flight,
+        total_pages_per_sec,
+        static_cast<unsigned long long>(newest_progress),
+        last_error.c_str());
     return tool_result_t::ok("crawler list count=" + std::to_string(v.size()), out);
 }
 

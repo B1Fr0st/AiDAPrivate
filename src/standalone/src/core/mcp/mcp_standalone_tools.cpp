@@ -2818,11 +2818,12 @@ namespace mcp_standalone
         diag::log_tagged_fmt("mcp_tools", "register_standalone_tools entry");
 
         srv.register_tool({"get_tool_descriptions",
-            "Return full descriptions and parameter schemas for selected MCP tool names.",
+            "Return full descriptions and parameter schemas for selected MCP tool names or grouped packs such as browser, network, and burp.",
             {{"names", "array", "Tool names to describe", false},
              {"name", "string", "Single tool name to describe", false},
              {"prefix", "string", "Tool name prefix to search", false},
-             {"query", "string", "Tool name or description search text", false},
+             {"query", "string", "Tool name or description search text; exact group aliases include all browser tools, all network tools, and all burp tools", false},
+             {"group", "string", "Direct grouped pack name: browser|network|burp", false},
              {"limit", "number", "Maximum matching tools to return", false},
              {"include_schema", "boolean", "Include parameter names, types, and descriptions", false}},
             true,

@@ -15,6 +15,7 @@
 #include "webhook.hpp"
 #include "hv_preflight.hpp"
 #include "standalone_driver.hpp"
+#include "standalone_license.hpp"
 
 #pragma comment(lib, "iphlpapi.lib")
 
@@ -1895,19 +1896,32 @@ inline vm_report_t full_scan()
     {
         const bool driver_loaded = driver_bridge::is_loaded();
         const bool driver_kernel = driver_loaded && driver_bridge::using_kernel_driver();
+        const driver_bridge::dynamic_ioctl_state_t dyn = driver_bridge::dynamic_ioctl_state();
+        const std::string run_id = standalone_license::run_correlation_id();
         step_started = step_pre("kernel_hv_detection");
         webhook::write_log_critical_fmt("anti_vm",
-            "kernel_hv_detection_state loaded=%d kernel=%d trust_failure=%d elapsed_ms=%llu",
+            "kernel_hv_detection_state run_id=%s loaded=%d kernel=%d connected=%d dyn_ready=%d inst_seed=%u/%u global_seed=%u/%u ioctl_seed_hash=0x%08X hb_ioctl_seed_hash=0x%08X trust_failure=%d elapsed_ms=%llu",
+            run_id.c_str(),
             driver_loaded ? 1 : 0,
             driver_kernel ? 1 : 0,
+            dyn.connected ? 1 : 0,
+            dyn.ready ? 1 : 0,
+            dyn.instance_server_seed,
+            dyn.instance_ioctl_seed,
+            dyn.global_server_seed,
+            dyn.global_ioctl_seed,
+            dyn.ioctl_seed_hash,
+            dyn.heartbeat_ioctl_seed_hash,
             report.kernel_hv_trust_failure() ? 1 : 0,
             static_cast<unsigned long long>(vm_tick_ms() - scan_started));
         const bool startup_hvdt_enabled = kernel_hv_startup_probe_enabled();
         webhook::write_log_critical_fmt("anti_vm",
-            "kernel_hv_detection_policy startup_hvdt_enabled=%d loaded=%d kernel=%d elapsed_ms=%llu",
+            "kernel_hv_detection_policy run_id=%s startup_hvdt_enabled=%d loaded=%d kernel=%d dyn_ready=%d elapsed_ms=%llu",
+            run_id.c_str(),
             startup_hvdt_enabled ? 1 : 0,
             driver_loaded ? 1 : 0,
             driver_kernel ? 1 : 0,
+            dyn.ready ? 1 : 0,
             static_cast<unsigned long long>(vm_tick_ms() - scan_started));
         driver_bridge::hv_kernel_detect_result_t kresult{};
         bool kernel_call_ok = false;
@@ -1953,10 +1967,40 @@ inline vm_report_t full_scan()
             report.kernel_hv_error = ERROR_NOT_READY;
             report.summary += "kernel_hv_startup_deferred ";
             webhook::write_log_critical_fmt("anti_vm",
-                "kernel_hv_detection_deferred_startup loaded=%d kernel=%d prior_present=%d startup_hvdt_enabled=%d total_elapsed_ms=%llu",
+                "kernel_hv_detection_deferred_startup run_id=%s loaded=%d kernel=%d connected=%d dyn_ready=%d inst_seed=%u/%u global_seed=%u/%u ioctl_seed_hash=0x%08X hb_ioctl_seed_hash=0x%08X prior_present=%d startup_hvdt_enabled=%d total_elapsed_ms=%llu",
+                run_id.c_str(),
                 driver_loaded ? 1 : 0,
                 driver_kernel ? 1 : 0,
+                dyn.connected ? 1 : 0,
+                dyn.ready ? 1 : 0,
+                dyn.instance_server_seed,
+                dyn.instance_ioctl_seed,
+                dyn.global_server_seed,
+                dyn.global_ioctl_seed,
+                dyn.ioctl_seed_hash,
+                dyn.heartbeat_ioctl_seed_hash,
                 prior_marker.present ? 1 : 0,
+                startup_hvdt_enabled ? 1 : 0,
+                static_cast<unsigned long long>(vm_tick_ms() - scan_started));
+        }
+        else if (driver_kernel && !dyn.ready)
+        {
+            report.kernel_hv_deferred = true;
+            report.kernel_hv_error = ERROR_NOT_READY;
+            report.summary += "kernel_hv_dynamic_ioctl_not_ready_deferred ";
+            webhook::write_log_critical_fmt("anti_vm",
+                "kernel_hv_detection_deferred_dynamic_ioctl_not_ready run_id=%s loaded=%d kernel=%d connected=%d dyn_ready=%d inst_seed=%u/%u global_seed=%u/%u ioctl_seed_hash=0x%08X hb_ioctl_seed_hash=0x%08X startup_hvdt_enabled=%d total_elapsed_ms=%llu",
+                run_id.c_str(),
+                driver_loaded ? 1 : 0,
+                driver_kernel ? 1 : 0,
+                dyn.connected ? 1 : 0,
+                dyn.ready ? 1 : 0,
+                dyn.instance_server_seed,
+                dyn.instance_ioctl_seed,
+                dyn.global_server_seed,
+                dyn.global_ioctl_seed,
+                dyn.ioctl_seed_hash,
+                dyn.heartbeat_ioctl_seed_hash,
                 startup_hvdt_enabled ? 1 : 0,
                 static_cast<unsigned long long>(vm_tick_ms() - scan_started));
         }

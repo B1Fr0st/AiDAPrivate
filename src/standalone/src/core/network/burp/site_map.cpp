@@ -6,6 +6,7 @@
 #endif
 
 #include "site_map.hpp"
+#include "burp_logger.hpp"
 #include "scope.hpp"
 
 #include "imgui/imgui.h"
@@ -163,12 +164,24 @@ void insert_into_tree(state_t& st, const exchange_observed_t& e)
     }
 }
 
+std::string normalized_source(const exchange_observed_t& e);
+std::string source_label_for(const exchange_observed_t& e);
+
 void store_exchange(exchange_observed_t e)
 {
     auto& st = s();
     std::lock_guard<std::mutex> lk(st.mtx);
     if (e.id == 0) e.id = st.next_id.fetch_add(1);
     if (e.timestamp_ms == 0) e.timestamp_ms = now_ms();
+    const std::string source = normalized_source(e);
+    const std::string label = source_label_for(e);
+    diag::log_tagged_fmt("burp", "site_map_store_exchange id=%llu source=%s source_label=%s host=%s path=%s status=%d",
+        static_cast<unsigned long long>(e.id),
+        source.c_str(),
+        label.c_str(),
+        e.host.c_str(),
+        e.path.c_str(),
+        e.status_code);
     insert_into_tree(st, e);
 }
 
@@ -185,6 +198,19 @@ std::string path_join(const std::string& parent, const std::string& seg)
     if (parent.empty() || parent == "/") return std::string("/") + (seg == "/" ? std::string() : seg);
     if (seg == "/") return parent;
     return parent + "/" + seg;
+}
+
+std::string normalized_source(const exchange_observed_t& e)
+{
+    return e.source.empty() ? std::string("proxy") : e.source;
+}
+
+std::string source_label_for(const exchange_observed_t& e)
+{
+    const std::string source = normalized_source(e);
+    logger::source_t src = logger::source_t::proxy;
+    if (logger::parse_source(source, src)) return logger::source_label(src);
+    return source;
 }
 
 }
@@ -371,7 +397,8 @@ nlohmann::json exchange_to_json(const exchange_observed_t& e, bool include_bodie
     j["alpn"]          = e.alpn;
     j["client_addr"]   = e.client_addr;
     j["client_port"]   = e.client_port;
-    j["source"]        = e.source.empty() ? "proxy" : e.source;
+    j["source"]        = normalized_source(e);
+    j["source_label"]  = source_label_for(e);
 
     nlohmann::json rh = nlohmann::json::array();
     for (const auto& kv : e.req_headers) {

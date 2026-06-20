@@ -416,6 +416,8 @@ static_assert(sizeof(net_stats) == 64, "net_stats size must be 64 bytes");
 #define WFP_ENTRY_TYPE_FILTER  1
 #define WFP_AIDA_MATCH_SUBLAYER       0x00000001u
 #define WFP_AIDA_MATCH_ACTION_CALLOUT 0x00000002u
+#define WFP_AIDA_MATCH_DISPLAY_DATA   0x00000004u
+#define WFP_AIDA_MATCH_RUNTIME_FALLBACK 0x80000000u
 
 typedef struct _WFP_CALLOUT_ENTRY {
     UINT64 classify_fn;

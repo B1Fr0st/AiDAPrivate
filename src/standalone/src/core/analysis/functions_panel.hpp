@@ -9,6 +9,8 @@
 #include "symbol_store.hpp"
 #include "rename_store.hpp"
 #include "work_queue.hpp"
+#include "../testlab/test_all_features.hpp"
+#include "../../helpers/diag_log.hpp"
 #include "ui/theme.hpp"
 #include "ui/clock.hpp"
 #include "ui/motion.hpp"
@@ -687,6 +689,51 @@ namespace functions_panel {
 			return std::string();
 		}
 
+		inline bool regular_pdb_file_candidate(const std::filesystem::path& candidate, std::string& out)
+		{
+			out.clear();
+			if (candidate.empty()) return false;
+			std::error_code abs_ec;
+			std::filesystem::path check = std::filesystem::absolute(candidate, abs_ec);
+			if (abs_ec) check = candidate;
+			std::error_code type_ec;
+			if (!std::filesystem::is_regular_file(check, type_ec) || type_ec) return false;
+			std::error_code size_ec;
+			const auto size = std::filesystem::file_size(check, size_ec);
+			if (size_ec || size == 0) return false;
+			out = check.string();
+			return true;
+		}
+
+		inline std::string disk_pdb_name_for_module(const std::string& display_name)
+		{
+			std::filesystem::path p(display_name);
+			std::string stem = p.stem().string();
+			if (stem.empty()) stem = display_name;
+			return stem + ".pdb";
+		}
+
+		inline bool resolve_full_test_disk_pdb(const std::string& binary_path,
+			const std::string& display_name, std::string& out)
+		{
+			const std::string pdb_name = disk_pdb_name_for_module(display_name);
+			std::vector<std::filesystem::path> candidates;
+			std::filesystem::path bp(binary_path);
+			std::error_code abs_ec;
+			std::filesystem::path abs_bp = std::filesystem::absolute(bp, abs_ec);
+			if (!abs_ec) bp = abs_bp;
+			std::filesystem::path parent = bp.parent_path();
+			if (!parent.empty()) candidates.push_back(parent / pdb_name);
+			for (const auto& sp : symbol_store::g_state.search_paths) {
+				if (!sp.empty()) candidates.emplace_back(std::filesystem::path(sp) / pdb_name);
+			}
+			for (const auto& candidate : candidates) {
+				if (regular_pdb_file_candidate(candidate, out)) return true;
+			}
+			out.clear();
+			return false;
+		}
+
 		inline void trigger_disk_pdb_auto_load(const std::string& binary_path,
 			const std::string& display_name, uint64_t image_base, uint32_t size_of_image)
 		{
@@ -712,10 +759,36 @@ namespace functions_panel {
 					}
 				}
 			}
-			if (!already_loaded_or_loading) {
-				symbol_store::load_pdb_for_module(display_name, image_base,
-					static_cast<uint64_t>(size_of_image));
+			if (already_loaded_or_loading) {
+				if (test_all_features::is_running()) {
+					diag::log_tagged_fmt("functions_panel",
+						"fulltest_disk_pdb_policy module=%s base=0x%llX size=0x%X pdb=%s local_candidate=<none> decision=skip_existing reason=module_loaded_loading_or_failed prompt_suppressed=1",
+						display_name.c_str(),
+						static_cast<unsigned long long>(image_base),
+						static_cast<unsigned>(size_of_image),
+						disk_pdb_name_for_module(display_name).c_str());
+				}
+				return;
 			}
+			if (test_all_features::is_running()) {
+				std::string local_candidate;
+				const bool have_local = resolve_full_test_disk_pdb(binary_path, display_name, local_candidate);
+				diag::log_tagged_fmt("functions_panel",
+					"fulltest_disk_pdb_policy module=%s base=0x%llX size=0x%X pdb=%s local_candidate=%s decision=%s reason=%s prompt_suppressed=1",
+					display_name.c_str(),
+					static_cast<unsigned long long>(image_base),
+					static_cast<unsigned>(size_of_image),
+					disk_pdb_name_for_module(display_name).c_str(),
+					local_candidate.empty() ? "<none>" : local_candidate.c_str(),
+					have_local ? "load_local" : "decline",
+					have_local ? "direct_local_pdb_present" : "no_deterministic_local_pdb_decline_remote_symbol_download");
+				if (!have_local) return;
+				symbol_store::load_pdb_from_explicit_path(display_name, image_base,
+					static_cast<uint64_t>(size_of_image), local_candidate);
+				return;
+			}
+			symbol_store::load_pdb_for_module(display_name, image_base,
+				static_cast<uint64_t>(size_of_image));
 		}
 
 		inline void build_locked_disk(view_state_t& s, const std::string& path,

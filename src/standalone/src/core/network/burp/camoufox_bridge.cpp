@@ -4135,6 +4135,7 @@ const std::vector<std::string>& required_reverse_tool_names()
         "close_page",
         "evaluate_js",
         "navigate",
+        "diagnose_bloxflip_matrix",
         "get_page_info",
     };
     return names;
@@ -4550,7 +4551,7 @@ nlohmann::json build_launch_args(const launch_config_t& cfg)
         !trim_launch_token(cfg.user_agent).empty());
     j["ua_policy"] = ua_policy;
     j["aida_fast_visible_launch"] = fast_visible_fallback;
-    j["aida_launch_policy_marker"] = "aida_camoufox_bridge_20260619_2";
+    j["aida_launch_policy_marker"] = "aida_camoufox_bridge_20260620_crash_diag_1";
     if (!cfg.user_agent.empty())
         j["user_agent"] = cfg.user_agent;
     j["enable_trace"] = cfg.enable_trace;

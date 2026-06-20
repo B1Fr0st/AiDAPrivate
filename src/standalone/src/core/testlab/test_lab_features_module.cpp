@@ -8,6 +8,7 @@
 
 #pragma comment(lib, "ws2_32.lib")
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -557,6 +558,9 @@ namespace {
 		start_req.filter_pid = self_pid;
 		start_req.filter_protocol = 6u;
 		start_req.max_packet_bytes = 1500u;
+		r.parsed.push_back({ "effective_capture_pid_filter", format_dec_u32(start_req.filter_pid) });
+		r.parsed.push_back({ "effective_capture_protocol_filter", format_dec_u32(start_req.filter_protocol) });
+		r.parsed.push_back({ "effective_capture_port_filter", format_dec_u32(start_req.filter_port) });
 		std::uint32_t cap_start_bytes = 0;
 		bool cap_started = device->send_ioctl_raw(ioctl_codes::NCAP(), &start_req,
 			static_cast<std::uint32_t>(sizeof(start_req)), cap_start_bytes);
@@ -607,6 +611,10 @@ namespace {
 		req->filter_protocol = 6u;
 		req->filter_port = 0u;
 		req->flags = 0u;
+		r.parsed.push_back({ "effective_dpin_pid_filter", format_dec_u32(req->filter_pid) });
+		r.parsed.push_back({ "effective_dpin_protocol_filter", format_dec_u32(req->filter_protocol) });
+		r.parsed.push_back({ "effective_dpin_port_filter", format_dec_u32(req->filter_port) });
+		r.parsed.push_back({ "effective_dpin_flags", format_dec_u32(req->flags) });
 		std::uint32_t bytes_returned = 0;
 		bool ok = device->send_ioctl_raw(ioctl_codes::DPIN(), req.get(),
 			static_cast<std::uint32_t>(sizeof(*req)), bytes_returned);
@@ -661,6 +669,27 @@ namespace {
 				host, sni, h.payload_size);
 			r.parsed.push_back({ label, buf });
 		}
+		const auto capture_sample = device->get_captured_packets(16u);
+		r.parsed.push_back({ "capture_sample_count", format_dec_u32(static_cast<std::uint32_t>(capture_sample.size())) });
+		std::uint32_t capture_self_pid = 0u;
+		std::uint32_t capture_http_candidate = 0u;
+		const std::uint32_t capture_cap = static_cast<std::uint32_t>(std::min<std::size_t>(capture_sample.size(), 8u));
+		for (std::uint32_t i = 0; i < capture_cap; ++i) {
+			const auto& p = capture_sample[i];
+			if (p.pid == self_pid)
+				++capture_self_pid;
+			if (p.protocol == 6u && p.payload_size >= 4u)
+				++capture_http_candidate;
+			char label[40];
+			std::snprintf(label, sizeof(label), "capture_rec[%u]", i);
+			std::snprintf(buf, sizeof(buf),
+				"dir=%u proto=%u(%s) local=%u remote=%u pid=%u payload=%u af=%u",
+				p.direction, p.protocol, proto_label(p.protocol),
+				p.local_port, p.remote_port, p.pid, p.payload_size, p.address_family);
+			r.parsed.push_back({ label, buf });
+		}
+		r.parsed.push_back({ "capture_sample_self_pid", format_dec_u32(capture_self_pid) });
+		r.parsed.push_back({ "capture_sample_tcp_payload_records", format_dec_u32(capture_http_candidate) });
 		r.parsed.push_back({ "results_matching_self_pid", format_dec_u32(matching_self_pid) });
 		r.parsed.push_back({ "http_record_count", format_dec_u32(http_records) });
 		stop_capture();

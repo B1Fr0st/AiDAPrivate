@@ -196,8 +196,13 @@ tool_result_t handle_udp_reassemble(const json& raw_params)
 tool_result_t handle_replay_mutate(const json& raw_params)
 {
     const std::string action = compat_action_name(raw_params);
-    if (!action.empty() && action != "mutate" && action != "replay")
-        return compat_unknown_action("net_replay_mutate", action);
+    if (!action.empty() && action != "mutate" && action != "replay") {
+        return tool_result_t::error("net_replay_mutate unknown action: " + action,
+            json{{"tool", "net_replay_mutate"},
+                 {"action", action},
+                 {"validation_code", "unknown_action"},
+                 {"allowed_actions", json::array({"mutate", "replay"})}});
+    }
     const json params = compat_action_payload(raw_params);
 
     net_proto_analysis::replay_mutate_options_t options;
@@ -216,7 +221,7 @@ tool_result_t handle_replay_mutate(const json& raw_params)
     json result;
     std::string error;
     if (!net_proto_analysis::replay_mutate(options, result, error))
-        return tool_result_t::error(error.empty() ? OBFSTR("mutation replay failed") : error);
+        return tool_result_t::error(error.empty() ? OBFSTR("mutation replay failed") : error, result);
     return tool_result_t::ok(OBFSTR("Mutation replay attempted with bounded unsafe caps."), result);
 }
 

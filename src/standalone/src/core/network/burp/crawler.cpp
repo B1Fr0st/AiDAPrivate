@@ -72,6 +72,7 @@ struct crawl_t
     std::string                         last_error;
     uint64_t                            started_unix_ms = 0;
     uint64_t                            finished_unix_ms = 0;
+    uint64_t                            last_progress_unix_ms = 0;
     std::atomic<int>                    in_flight{0};
     std::atomic<uint64_t>               next_request_seq{1};
 };
@@ -511,6 +512,7 @@ void enqueue_url(crawl_t& c, const std::string& url, int depth, const std::strin
     q.depth = depth;
     q.parent = parent;
     c.queue.push_back(std::move(q));
+    c.last_progress_unix_ms = now_ms();
     diag::log_tagged_fmt("crawler", "enqueue_url id=%llu queued url=%s depth=%d queue_size=%zu",
         static_cast<unsigned long long>(c.id), canonical.c_str(), depth, c.queue.size());
 }
@@ -609,6 +611,7 @@ void worker_step(std::shared_ptr<crawl_t> ctx, queue_item_t item)
         std::lock_guard<std::mutex> lk(c.mtx);
         c.discovered.push_back(d);
         c.last_url = item.url;
+        c.last_progress_unix_ms = d.fetched_unix_ms;
         if (!ok)
         {
             c.pages_failed++;
@@ -701,6 +704,7 @@ void run_crawl(std::shared_ptr<crawl_t> ctx)
             {
                 c.phase = c.stop_flag.load() ? crawl_status_phase_t::complete : crawl_status_phase_t::complete;
                 c.finished_unix_ms = now_ms();
+                c.last_progress_unix_ms = c.finished_unix_ms;
             }
         }
         if (!already)
@@ -772,6 +776,7 @@ uint64_t start(const crawl_config_t& config)
     ctx->config = config;
     ctx->phase = crawl_status_phase_t::running;
     ctx->started_unix_ms = now_ms();
+    ctx->last_progress_unix_ms = ctx->started_unix_ms;
     for (auto& u : config.start_urls)
     {
         parsed_url_t p = parse_url(u);
@@ -839,11 +844,28 @@ crawl_status_t status(uint64_t crawl_id)
     out.urls_found = static_cast<int>(ctx->discovered.size());
     out.started_unix_ms = ctx->started_unix_ms;
     out.finished_unix_ms = ctx->finished_unix_ms;
+    out.last_progress_unix_ms = ctx->last_progress_unix_ms;
+    out.in_flight = ctx->in_flight.load();
+    const uint64_t elapsed_end = ctx->finished_unix_ms != 0 ? ctx->finished_unix_ms : now_ms();
+    const uint64_t elapsed_ms = elapsed_end > ctx->started_unix_ms ? elapsed_end - ctx->started_unix_ms : 0;
+    out.pages_per_sec = elapsed_ms > 0 ? (static_cast<double>(ctx->pages_visited) * 1000.0) / static_cast<double>(elapsed_ms) : 0.0;
     out.last_url = ctx->last_url;
     out.last_error = ctx->last_error;
     out.config = ctx->config;
     out.discovered = ctx->discovered;
     out.log = ctx->log;
+    diag::log_tagged_fmt("crawler", "status id=%llu phase=%d queue_depth=%d in_flight=%d pages_visited=%d pages_failed=%d urls_found=%d pages_per_sec=%.3f last_progress_unix_ms=%llu last_url=%s last_error=%s",
+        static_cast<unsigned long long>(out.id),
+        static_cast<int>(out.phase),
+        out.queue_depth,
+        out.in_flight,
+        out.pages_visited,
+        out.pages_failed,
+        out.urls_found,
+        out.pages_per_sec,
+        static_cast<unsigned long long>(out.last_progress_unix_ms),
+        out.last_url.c_str(),
+        out.last_error.c_str());
     return out;
 }
 

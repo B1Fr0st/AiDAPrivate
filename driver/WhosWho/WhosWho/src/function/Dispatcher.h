@@ -1262,12 +1262,41 @@ namespace dispatcher {
         else if (code == ioctl_codes::PMOD()) {
             if (input_size >= sizeof(packet_mod_rule_list) && output_size >= sizeof(packet_mod_rule_list) &&
                 ((p_packet_mod_rule_list)buffer)->operation == 2) {
+                auto* req = (p_packet_mod_rule_list)buffer;
+                WW_LOG("netaction::PMOD_DISPATCH ENTER kind=list code=0x%08X input_size=%lu output_size=%lu op=%u",
+                    code,
+                    input_size,
+                    output_size,
+                    req->operation);
                 status = functions::handle_packet_mod_rule_list((p_packet_mod_rule_list)buffer);
                 bytes = sizeof(packet_mod_rule_list);
+                WW_LOG("netaction::PMOD_DISPATCH EXIT kind=list status=0x%08X bytes=%lu rule_count=%u",
+                    status,
+                    bytes,
+                    req->rule_count);
             }
             else if (input_size >= sizeof(packet_mod_rule) && output_size >= sizeof(packet_mod_rule)) {
-                status = functions::handle_packet_mod_rule((p_packet_mod_rule)buffer);
+                auto* req = (p_packet_mod_rule)buffer;
+                WW_LOG("netaction::PMOD_DISPATCH ENTER kind=rule code=0x%08X input_size=%lu output_size=%lu op=%u rule_id=%u direction=%u protocol=%u port=%u pid=%u pattern_size=%u replace_size=%u",
+                    code,
+                    input_size,
+                    output_size,
+                    req->operation,
+                    req->rule_id,
+                    req->direction,
+                    req->protocol,
+                    req->port,
+                    req->pid,
+                    req->pattern_size,
+                    req->replace_size);
+                status = functions::handle_packet_mod_rule(req);
                 bytes = sizeof(packet_mod_rule);
+                WW_LOG("netaction::PMOD_DISPATCH EXIT kind=rule status=0x%08X bytes=%lu op=%u rule_id=%u active=%u",
+                    status,
+                    bytes,
+                    req->operation,
+                    req->rule_id,
+                    req->active);
             }
             else { status = STATUS_INFO_LENGTH_MISMATCH; }
         }

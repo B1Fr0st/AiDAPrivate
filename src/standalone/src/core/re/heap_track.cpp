@@ -225,6 +225,27 @@ json session_json(const store::heap_session_t& session)
     return out;
 }
 
+json heap_session_lookup_error(const char* action, const std::string& id)
+{
+    auto sessions = store::list_heap_sessions(0);
+    json active_ids = json::array();
+    for (const auto& session : sessions)
+        active_ids.push_back(session.id);
+    diag::log_tagged_fmt("heap_track",
+        "session_lookup action=%s requested_session_id='%s' found=0 active_count=%zu",
+        action ? action : "",
+        id.c_str(),
+        sessions.size());
+    return json{
+        {"tool", "heap_track_manage"},
+        {"action", action ? action : ""},
+        {"session_id", id},
+        {"validation_code", "heap_session_not_found"},
+        {"active_session_count", sessions.size()},
+        {"active_session_ids", active_ids}
+    };
+}
+
 std::uint64_t resolve_rtl_allocate_heap(std::uint32_t pid)
 {
     auto ntdll = find_module_by_name(pid, "ntdll.dll");
@@ -763,10 +784,11 @@ tool_result_t results_session(const json& params)
 {
     const std::string id = string_param(params, "session_id");
     if (id.empty())
-        return tool_result_t::error("'session_id' is required for results.");
+        return tool_result_t::error("'session_id' is required for results.",
+            json{{"tool", "heap_track_manage"}, {"action", "results"}, {"validation_code", "session_id_required"}});
     store::heap_session_t session;
     if (!store::find_heap_session(id, session))
-        return tool_result_t::error("Unknown heap tracking session.");
+        return tool_result_t::error("Unknown heap tracking session.", heap_session_lookup_error("results", id));
     active_process_scope_t scope(session.pid);
     if (!scope.ok())
         return tool_result_t::error(scope.error());
@@ -815,10 +837,11 @@ tool_result_t stop_session(const json& params)
         return unsafe_required("heap_track_manage stop");
     const std::string id = string_param(params, "session_id");
     if (id.empty())
-        return tool_result_t::error("'session_id' is required for stop.");
+        return tool_result_t::error("'session_id' is required for stop.",
+            json{{"tool", "heap_track_manage"}, {"action", "stop"}, {"validation_code", "session_id_required"}});
     store::heap_session_t session;
     if (!store::find_heap_session(id, session))
-        return tool_result_t::error("Unknown heap tracking session.");
+        return tool_result_t::error("Unknown heap tracking session.", heap_session_lookup_error("stop", id));
     active_process_scope_t scope(session.pid);
     const bool focus_only = bool_param(params, "focus_only", false) || bool_param(params, "bounded_only", false);
     const bool focused = scope.ok() ? append_focus_captures(session, params) : false;
@@ -832,7 +855,7 @@ tool_result_t stop_session(const json& params)
     else
         store::find_heap_session(id, session);
     if (!store::remove_heap_session(id, &session))
-        return tool_result_t::error("Unknown heap tracking session.");
+        return tool_result_t::error("Unknown heap tracking session.", heap_session_lookup_error("stop_remove", id));
     if (scope.ok())
         clear_session_breakpoints(session);
     if (session.hw_slot >= 0)

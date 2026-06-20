@@ -1421,6 +1421,138 @@ void enrich_evaluate_js_response(tool_result_t& out)
     out.data["mcp_arguments"] = json::array({"expression", "await_promise", "session_id", "page_id"});
 }
 
+void set_scripts_contract_error(
+    tool_result_t& out,
+    const json& params,
+    const std::string& session_id,
+    const camoufox::bridge_status_t& status,
+    const std::string& action,
+    const std::string& error_code,
+    const std::string& error_text)
+{
+    json data = json::object();
+    data["status"] = "error";
+    data["action"] = action;
+    data["error_code"] = error_code;
+    data["error"] = error_text;
+    data["session_id"] = session_id;
+    data["requested_page_id"] = json_string_param(params, "page_id", std::string());
+    data["bridge"] = status_to_json(status);
+    data["raw_shape"] = json_shape(out.data);
+    if (out.data.is_object() && !out.data.empty())
+        data["raw_result"] = out.data;
+    else if (out.data.is_array() && out.data.size() <= 8)
+        data["raw_result"] = out.data;
+    out.success = false;
+    out.data = std::move(data);
+    out.text = out.data.dump(2);
+    diag::log_tagged_fmt("mcp_burp", "camoufox_scripts_contract_error action=%s error_code=%s error=%s session_id=%s state=%s page_id=%s data_shape=%s",
+        action.c_str(), error_code.c_str(), error_text.c_str(), session_id.c_str(), state_label(status.state),
+        json_string_param(params, "page_id", std::string()).c_str(), out.data.value("raw_shape", std::string()).c_str());
+}
+
+void normalize_scripts_response(tool_result_t& out, const json& params, const std::string& session_id, const camoufox::bridge_status_t& status)
+{
+    std::string action = lower_ascii_copy(json_string_param(params, "action", "list"));
+    if (action.empty())
+        action = "list";
+    if (!out.success)
+    {
+        if (out.data.is_object())
+        {
+            out.data["bridge"] = status_to_json(status);
+            out.data["session_id"] = session_id;
+            if (!out.data.contains("status"))
+                out.data["status"] = "error";
+            if (!out.data.contains("action"))
+                out.data["action"] = action;
+            out.text = out.data.dump(2);
+        }
+        return;
+    }
+    if (out.data.is_array())
+    {
+        for (const auto& item : out.data)
+        {
+            if (item.is_object() && item.contains("error") && item["error"].is_string() && !item["error"].get<std::string>().empty())
+            {
+                set_scripts_contract_error(out, params, session_id, status, action, "scripts_legacy_array_error", item["error"].get<std::string>());
+                return;
+            }
+        }
+        json scripts = out.data;
+        out.data = json::object();
+        out.data["status"] = "ok";
+        out.data["action"] = action;
+        out.data["scripts"] = std::move(scripts);
+        out.data["count"] = static_cast<uint64_t>(out.data["scripts"].size());
+        out.data["session_id"] = session_id;
+        out.data["requested_page_id"] = json_string_param(params, "page_id", std::string());
+        out.data["bridge"] = status_to_json(status);
+        out.text = out.data.dump(2);
+        return;
+    }
+    if (!out.data.is_object())
+    {
+        set_scripts_contract_error(out, params, session_id, status, action, "scripts_invalid_result_shape", "scripts returned a non-object result");
+        return;
+    }
+    if (out.data.empty())
+    {
+        set_scripts_contract_error(out, params, session_id, status, action, "scripts_empty_result", "scripts returned an empty object");
+        return;
+    }
+    if (out.data.contains("error") && out.data["error"].is_string() && !out.data["error"].get<std::string>().empty())
+    {
+        const std::string error_text = out.data["error"].get<std::string>();
+        if (lower_ascii_copy(json_string_field(out.data, "status")) != "ok")
+        {
+            std::string error_code = json_string_field(out.data, "error_code");
+            if (error_code.empty())
+                error_code = "scripts_error";
+            set_scripts_contract_error(out, params, session_id, status, action, error_code, error_text);
+        }
+        return;
+    }
+    if (action == "list")
+    {
+        auto scripts_it = out.data.find("scripts");
+        if (scripts_it == out.data.end() || !scripts_it->is_array())
+        {
+            set_scripts_contract_error(out, params, session_id, status, action, "scripts_missing_scripts_array", "scripts list response omitted scripts array");
+            return;
+        }
+        out.data["count"] = static_cast<uint64_t>(scripts_it->size());
+    }
+    else if (action == "get")
+    {
+        auto source_it = out.data.find("source");
+        if (source_it == out.data.end() || !source_it->is_string())
+        {
+            set_scripts_contract_error(out, params, session_id, status, action, "scripts_missing_source", "scripts get response omitted source string");
+            return;
+        }
+        out.data["length"] = static_cast<uint64_t>(source_it->get<std::string>().size());
+    }
+    else if (action == "save")
+    {
+        const std::string status_text = lower_ascii_copy(json_string_field(out.data, "status"));
+        if (status_text != "saved" && status_text != "ok")
+        {
+            set_scripts_contract_error(out, params, session_id, status, action, "scripts_save_not_confirmed", "scripts save response did not confirm saved status");
+            return;
+        }
+    }
+    if (!out.data.contains("status"))
+        out.data["status"] = action == "save" ? "saved" : "ok";
+    if (!out.data.contains("action"))
+        out.data["action"] = action;
+    out.data["session_id"] = session_id;
+    out.data["requested_page_id"] = json_string_param(params, "page_id", std::string());
+    out.data["bridge"] = status_to_json(status);
+    out.text = out.data.dump(2);
+}
+
 bool reverse_tool_needs_action(const std::string& tool_name)
 {
     return tool_name == "network_capture" ||
@@ -1890,6 +2022,8 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
     if (instrumentation_probe)
         annotate_instrumentation_response(tool_name, out, timeout_ms, static_cast<long long>(elapsed_ms));
     auto after = camoufox::get_status(session_id);
+    if (tool_name == "scripts")
+        normalize_scripts_response(out, params, session_id, after);
     if (tool_name == "compare_env" || tool_name == "check_environment")
         attach_privacy_status(out, after);
     preserve_semantic_failure(out);
@@ -2035,6 +2169,7 @@ tool_result_t tool_browser_navigation(const json& params)
     {
         {"navigate", "navigate", 60000},
         {"diagnose", "diagnose_navigation", 60000},
+        {"matrix", "diagnose_bloxflip_matrix", 180000},
         {"reload", "reload", 45000},
         {"wait", "wait_for", 45000},
     };
@@ -2154,14 +2289,15 @@ std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
              {"launch_timeout_ms", "number", "Requested launch timeout in milliseconds", false},
              {"window_width", "number", "Initial browser window width", false},
              {"window_height", "number", "Initial browser window height", false}}, false, 60000},
-        {"browser_navigation", "Consolidated Camoufox navigation operations. Set action to navigate, diagnose, reload, or wait.",
-            {{"action", "string", "navigate|diagnose|reload|wait", true},
+        {"browser_navigation", "Consolidated Camoufox navigation operations. Set action to navigate, diagnose, matrix, reload, or wait.",
+            {{"action", "string", "navigate|diagnose|matrix|reload|wait", true},
              {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted", false},
              {"session_id", "string", "Browser session id", false},
              {"page_id", "string", "Stable AiDA page id", false},
              {"url", "string", "Target URL", false},
              {"diagnostic_label", "string", "Diagnostic navigation label such as bloxflip", false},
              {"include_screenshot_metadata", "boolean", "Collect bounded screenshot metadata for diagnostic navigation", false},
+             {"restore_browser", "boolean", "Restore the previous Camoufox session after the diagnostic matrix", false},
              {"wait_until", "string", "load, domcontentloaded, or networkidle", false},
              {"selector", "string", "CSS selector to wait for", false},
              {"url_pattern", "string", "URL pattern to wait for", false},
@@ -2294,7 +2430,8 @@ std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
         {"scripts", "List loaded scripts, get source for one script, or save a script to disk.",
             {{"action", "string", "list, get, or save", true},
              {"url", "string", "Script URL for get or save", false},
-             {"save_path", "string", "Destination path for save", false}}, false, 30000},
+             {"save_path", "string", "Destination path for save", false},
+             {"page_id", "string", "Stable AiDA page id", false}}, false, 30000},
         {"search_code", "Search loaded scripts for a keyword.",
             {{"keyword", "string", "Keyword to search for", true},
              {"script_url", "string", "Optional script URL to limit the search", false},

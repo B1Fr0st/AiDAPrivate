@@ -244,6 +244,8 @@ namespace net_mod {
                                 UINT32 direction, UINT32 protocol,
                                 UINT32 port, UINT32 pid);
     BOOLEAN has_active_rules();
+    LONG active_rule_count();
+    LONG64 current_generation();
 }
 namespace net_stream {
     void feed_packet(UINT32 src_port, UINT32 dst_port, UINT32 pid,
@@ -316,6 +318,7 @@ namespace net_capture {
         UINT64 flowContext,
         FWPS_CLASSIFY_OUT0_COMPAT* classifyOut);
     NTSTATUS NTAPI callout_notify(UINT32 notifyType, const GUID* filterKey, const void* filter);
+    static ULONG status_to_win32(NTSTATUS status);
 }
 namespace net_fingerprint {
     inline KSPIN_LOCK g_fp_lock;
@@ -350,11 +353,15 @@ namespace net_intercept {
 }
 namespace net_redirect {
     BOOLEAN check_redirect(UINT32 protocol, UINT32 dst_port, const UINT8* dst_addr,
-                           UINT32 af, UINT32 pid, UINT32* new_port, UINT8* new_addr);
+                           UINT32 af, UINT32 pid, UINT32* new_port, UINT8* new_addr,
+                           UINT32* matched_rule_id, LONG* match_before, LONG* match_after);
     BOOLEAN has_active_rules();
 }
 namespace net_dns_spoof {
     BOOLEAN check_spoof(const char* domain, UINT8* out_addr, UINT32* out_af, UINT32* out_ttl);
+    BOOLEAN inspect_spoof_rule(const char* domain, UINT8* out_addr, UINT32* out_af, UINT32* out_ttl,
+                               UINT32* out_rule_id, char* out_rule_domain, UINT32 out_rule_domain_len,
+                               LONG* match_before, LONG* match_after, BOOLEAN increment_match);
     BOOLEAN has_active_rules();
     void cleanup();
 }
@@ -459,6 +466,11 @@ namespace net_capture {
         { 0x7a8b3c21, 0x2e4f, 0x5a6b, { 0x8c, 0x9d, 0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xfa } };
     static const GUID GUID_AIDA_SUBLAYER =
         { 0x7a8b3c1f, 0x2e4f, 0x5a6b, { 0x8c, 0x9d, 0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf8 } };
+    static const UINT32 WFP_BFE_AUTH_SERVICE = 0x0000000A;
+    static const GUID GUID_CONDITION_ALE_APP_ID =
+        { 0xd78e1e87, 0x8644, 0x4ea5, { 0x94, 0x37, 0xd8, 0x09, 0xec, 0xef, 0xc9, 0x71 } };
+    static const GUID GUID_CONDITION_ALE_ORIGINAL_APP_ID =
+        { 0x0e6cd086, 0xe1fb, 0x4212, { 0x84, 0x2f, 0x8a, 0x9f, 0x99, 0x3f, 0xb3, 0xf6 } };
 
 
     inline UINT32 g_filter_pid = 0;
@@ -624,6 +636,41 @@ namespace net_capture {
         } __except(EXCEPTION_EXECUTE_HANDLER) {
             return 0;
         }
+    }
+
+    __forceinline BOOLEAN select_dns_payload(UINT8* data, UINT32 data_len,
+                                             UINT32 local_port, UINT32 remote_port,
+                                             UINT8** dns_data, UINT32* dns_len,
+                                             UINT32* header_skip) {
+        if (dns_data) *dns_data = nullptr;
+        if (dns_len) *dns_len = 0;
+        if (header_skip) *header_skip = 0;
+        if (!data || data_len < 12 || (!dns_data && !dns_len)) return FALSE;
+
+        UINT8* selected = data;
+        UINT32 selected_len = data_len;
+        UINT32 skip = 0;
+
+        if (data_len >= 20) {
+            UINT16 udp_src = ((UINT16)data[0] << 8) | data[1];
+            UINT16 udp_dst = ((UINT16)data[2] << 8) | data[3];
+            UINT16 udp_len = ((UINT16)data[4] << 8) | data[5];
+            BOOLEAN ports_match =
+                ((udp_src == (UINT16)local_port || udp_src == (UINT16)remote_port ||
+                  udp_dst == (UINT16)local_port || udp_dst == (UINT16)remote_port) &&
+                 (udp_src == 53 || udp_dst == 53));
+            if (ports_match && udp_len >= 20 && udp_len <= data_len) {
+                selected = data + 8;
+                selected_len = udp_len - 8;
+                skip = 8;
+            }
+        }
+
+        if (selected_len < 12) return FALSE;
+        if (dns_data) *dns_data = selected;
+        if (dns_len) *dns_len = selected_len;
+        if (header_skip) *header_skip = skip;
+        return TRUE;
     }
 
     __forceinline UINT32 parse_dns_name(const UINT8* dns_data, UINT32 offset,
@@ -948,6 +995,9 @@ namespace net_capture {
             UINT8 local_ip[16] = {};
             UINT8 remote_ip[16] = {};
             UINT32 pid = 0;
+            UINT32 metadata_pid = 0;
+            UINT32 metadata_pid_present = 0;
+            UINT32 pid_source = 0;
 
             if (inFixedValues->valueCount > FWPS_FIELD_IN_TRANS_V4_PROTOCOL) {
                 protocol = inFixedValues->incomingValue[FWPS_FIELD_IN_TRANS_V4_PROTOCOL].value.uint8;
@@ -969,6 +1019,9 @@ namespace net_capture {
 
             if ((inMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_PROCESS_ID_) != 0) {
                 pid = (UINT32)inMetaValues->processId;
+                metadata_pid = pid;
+                metadata_pid_present = 1;
+                if (pid != 0) pid_source = 1;
             }
             if (pid != 0 && inMetaValues->transportEndpointHandle != 0) {
                 aida_store_cached_endpoint_pid(inMetaValues->transportEndpointHandle,
@@ -977,9 +1030,11 @@ namespace net_capture {
             if (pid == 0) {
                 pid = aida_resolve_packet_pid(inMetaValues->transportEndpointHandle,
                     protocol, local_port, remote_port);
+                if (pid != 0) pid_source = 2;
             }
             if (pid == 0) {
                 pid = aida_lookup_cached_port_pid(protocol, local_port, remote_port);
+                if (pid != 0) pid_source = 3;
             }
             if (pid == 0 && protocol == 17) {
                 UINT32 lip = ((UINT32)local_ip[0] << 24) | ((UINT32)local_ip[1] << 16) |
@@ -987,6 +1042,7 @@ namespace net_capture {
                 UINT32 rip = ((UINT32)remote_ip[0] << 24) | ((UINT32)remote_ip[1] << 16) |
                              ((UINT32)remote_ip[2] << 8) | remote_ip[3];
                 pid = net_udp_cache::lookup(rip, lip, (UINT16)remote_port, (UINT16)local_port);
+                if (pid != 0) pid_source = 4;
             }
             if (pid != 0) {
                 aida_store_cached_port_pid(protocol, local_port, pid);
@@ -998,6 +1054,22 @@ namespace net_capture {
                                  ((UINT32)remote_ip[2] << 8) | remote_ip[3];
                     net_udp_cache::store(rip, lip, (UINT16)remote_port, (UINT16)local_port, pid);
                 }
+            }
+            if (g_capture_active || net_dpi::is_active() || net_redirect::has_active_rules() || net_dns_spoof::has_active_rules()) {
+                WW_LOG("net_classify::in pid_attribution protocol=%u metadata_present=%u metadata_pid=%u final_pid=%u source=%u endpoint=0x%llX tuple=%u.%u.%u.%u:%u<-%u.%u.%u.%u:%u iface_src=%u iface_dst=%u compartment=%lu capture_active=%ld dpi_active=%u",
+                    protocol,
+                    metadata_pid_present,
+                    metadata_pid,
+                    pid,
+                    pid_source,
+                    (unsigned long long)inMetaValues->transportEndpointHandle,
+                    local_ip[0], local_ip[1], local_ip[2], local_ip[3], local_port,
+                    remote_ip[0], remote_ip[1], remote_ip[2], remote_ip[3], remote_port,
+                    inMetaValues->sourceInterfaceIndex,
+                    inMetaValues->destinationInterfaceIndex,
+                    inMetaValues->compartmentId,
+                    g_capture_active,
+                    net_dpi::is_active() ? 1u : 0u);
             }
 
             _InterlockedIncrement64(&g_global_pkts_recv);
@@ -1047,81 +1119,155 @@ namespace net_capture {
 
             UINT32 pkt_len = 0;
             pkt_len = copy_transport_bytes(layerData, pkt_data, NET_PKT_MAX_PAYLOAD);
+            if (g_capture_active || net_dpi::is_active() || net_dns_spoof::has_active_rules()) {
+                UINT32 transport_len = get_transport_data_length(layerData);
+                WW_LOG("net_classify::in payload_copy protocol=%u pid=%u tuple=%u.%u.%u.%u:%u<-%u.%u.%u.%u:%u transport_len=%u copied_len=%u max=%u layerData=%p",
+                    protocol,
+                    pid,
+                    local_ip[0], local_ip[1], local_ip[2], local_ip[3], local_port,
+                    remote_ip[0], remote_ip[1], remote_ip[2], remote_ip[3], remote_port,
+                    transport_len,
+                    pkt_len,
+                    NET_PKT_MAX_PAYLOAD,
+                    layerData);
+            }
             if (pkt_len == 0 && layerData) {
             }
 
 
-            if (pkt_len >= 12 && protocol == 17 && remote_port == 53 &&
-                net_dns_spoof::has_active_rules()) {
-                UINT16 dns_flags = ((UINT16)pkt_data[2] << 8) | pkt_data[3];
-                BOOLEAN is_dns_response = (dns_flags & 0x8000) != 0;
-                UINT16 qdcount = ((UINT16)pkt_data[4] << 8) | pkt_data[5];
-                if (is_dns_response && qdcount > 0 && qdcount <= 16) {
+            if (protocol == 17 && remote_port == 53 && net_dns_spoof::has_active_rules()) {
+                UINT8* dns_data = nullptr;
+                UINT32 dns_len = 0;
+                UINT32 dns_skip = 0;
+                if (select_dns_payload(pkt_data, pkt_len, local_port, remote_port, &dns_data, &dns_len, &dns_skip)) {
+                    UINT16 dns_flags = ((UINT16)dns_data[2] << 8) | dns_data[3];
+                    BOOLEAN is_dns_response = (dns_flags & 0x8000) != 0;
+                    UINT16 qdcount = ((UINT16)dns_data[4] << 8) | dns_data[5];
+                    UINT16 ancount = ((UINT16)dns_data[6] << 8) | dns_data[7];
                     char spoof_domain[260] = {};
-                    UINT32 qpos = parse_dns_name(pkt_data, 12, pkt_len, spoof_domain, sizeof(spoof_domain));
-                    if (qpos != 0 && qpos + 4 <= pkt_len && spoof_domain[0] != '\0') {
-                        UINT8 spoof_addr[16] = {};
-                        UINT32 spoof_af = 0;
-                        UINT32 spoof_ttl = 0;
-                        if (net_dns_spoof::check_spoof(spoof_domain, spoof_addr, &spoof_af, &spoof_ttl)) {
-                            UINT32 ans_pos = qpos + 4;
-                            UINT16 ancount = ((UINT16)pkt_data[6] << 8) | pkt_data[7];
-                            BOOLEAN spoofed = FALSE;
-                            for (UINT16 ai = 0; ai < ancount && ans_pos < pkt_len; ai++) {
-                                if ((pkt_data[ans_pos] & 0xC0) == 0xC0) {
-                                    ans_pos += 2;
-                                } else {
-                                    while (ans_pos < pkt_len && pkt_data[ans_pos] != 0) {
-                                        if ((pkt_data[ans_pos] & 0xC0) == 0xC0) { ans_pos += 2; goto spoof_after_name; }
-                                        if (pkt_data[ans_pos] > 63) break;
-                                        ans_pos += pkt_data[ans_pos] + 1;
-                                    }
-                                    ans_pos++;
-                                }
-                                spoof_after_name:
-                                if (ans_pos + 10 > pkt_len) break;
-                                UINT16 atype = ((UINT16)pkt_data[ans_pos] << 8) | pkt_data[ans_pos + 1];
-                                ans_pos += 4;
-                                UINT32 ttl_pos = ans_pos;
-                                ans_pos += 4;
-                                UINT16 rdlength = ((UINT16)pkt_data[ans_pos] << 8) | pkt_data[ans_pos + 1];
+                    UINT16 qtype = 0;
+                    UINT32 qpos = 0;
+                    if (qdcount > 0 && qdcount <= 16) {
+                        qpos = parse_dns_name(dns_data, 12, dns_len, spoof_domain, sizeof(spoof_domain));
+                        if (qpos != 0 && qpos + 4 <= dns_len) {
+                            qtype = ((UINT16)dns_data[qpos] << 8) | dns_data[qpos + 1];
+                        }
+                    }
+                    UINT8 spoof_addr[16] = {};
+                    UINT32 spoof_af = 0;
+                    UINT32 spoof_ttl = 0;
+                    UINT32 spoof_rule_id = 0;
+                    char spoof_rule_domain[DNS_SPOOF_MAX_DOMAIN] = {};
+                    LONG match_before = 0;
+                    LONG match_after = 0;
+                    BOOLEAN eligible_response = is_dns_response && qpos != 0 && qpos + 4 <= dns_len && spoof_domain[0] != '\0';
+                    BOOLEAN rule_match = net_dns_spoof::inspect_spoof_rule(spoof_domain, spoof_addr, &spoof_af, &spoof_ttl,
+                        &spoof_rule_id, spoof_rule_domain, sizeof(spoof_rule_domain),
+                        &match_before, &match_after, eligible_response);
+                    WW_LOG("net_dns_spoof::classify layer=in_trans direction=0 pid=%u ports=%u<-%u qr=%u flags=0x%04X qdcount=%u ancount=%u qtype=%u qname='%s' rule_id=%u rule_domain='%s' match=%u match_before=%ld match_after=%ld spoof_af=%u ttl=%u dns_skip=%u dns_len=%u pkt_len=%u action=%s",
+                        pid,
+                        local_port,
+                        remote_port,
+                        is_dns_response ? 1u : 0u,
+                        dns_flags,
+                        qdcount,
+                        ancount,
+                        qtype,
+                        spoof_domain,
+                        spoof_rule_id,
+                        spoof_rule_domain,
+                        rule_match ? 1u : 0u,
+                        match_before,
+                        match_after,
+                        spoof_af,
+                        spoof_ttl,
+                        dns_skip,
+                        dns_len,
+                        pkt_len,
+                        eligible_response ? "response_eligible" : "not_response_or_no_question");
+                    if (eligible_response && rule_match) {
+                        UINT32 ans_pos = qpos + 4;
+                        BOOLEAN spoofed = FALSE;
+                        UINT16 spoofed_type = 0;
+                        for (UINT16 ai = 0; ai < ancount && ans_pos < dns_len; ai++) {
+                            if ((dns_data[ans_pos] & 0xC0) == 0xC0) {
                                 ans_pos += 2;
-                                if (atype == 1 && rdlength == 4 && ans_pos + 4 <= pkt_len && spoof_af == 2) {
-                                    pkt_data[ttl_pos] = (UINT8)(spoof_ttl >> 24);
-                                    pkt_data[ttl_pos + 1] = (UINT8)(spoof_ttl >> 16);
-                                    pkt_data[ttl_pos + 2] = (UINT8)(spoof_ttl >> 8);
-                                    pkt_data[ttl_pos + 3] = (UINT8)(spoof_ttl);
-                                    strong::kmemcpy(&pkt_data[ans_pos], spoof_addr, 4);
-                                    spoofed = TRUE;
-                                } else if (atype == 28 && rdlength == 16 && ans_pos + 16 <= pkt_len && spoof_af == 23) {
-                                    pkt_data[ttl_pos] = (UINT8)(spoof_ttl >> 24);
-                                    pkt_data[ttl_pos + 1] = (UINT8)(spoof_ttl >> 16);
-                                    pkt_data[ttl_pos + 2] = (UINT8)(spoof_ttl >> 8);
-                                    pkt_data[ttl_pos + 3] = (UINT8)(spoof_ttl);
-                                    strong::kmemcpy(&pkt_data[ans_pos], spoof_addr, 16);
-                                    spoofed = TRUE;
+                            } else {
+                                while (ans_pos < dns_len && dns_data[ans_pos] != 0) {
+                                    if ((dns_data[ans_pos] & 0xC0) == 0xC0) { ans_pos += 2; goto spoof_after_name; }
+                                    if (dns_data[ans_pos] > 63) break;
+                                    ans_pos += dns_data[ans_pos] + 1;
                                 }
-                                ans_pos += rdlength;
+                                ans_pos++;
                             }
-                            if (spoofed) {
-                                NET_DBG("classify_inbound: DNS SPOOFED domain=%s", spoof_domain);
-                                RtlZeroMemory(inj_buf, sizeof(*inj_buf));
-                                inj_buf->direction = 0;
-                                inj_buf->protocol = 17;
-                                inj_buf->address_family = 2;
-                                inj_buf->src_port = remote_port;
-                                inj_buf->dst_port = local_port;
-                                strong::kmemcpy(inj_buf->src_addr, remote_ip, 4);
-                                strong::kmemcpy(inj_buf->dst_addr, local_ip, 4);
+                            spoof_after_name:
+                            if (ans_pos + 10 > dns_len) break;
+                            UINT16 atype = ((UINT16)dns_data[ans_pos] << 8) | dns_data[ans_pos + 1];
+                            ans_pos += 4;
+                            UINT32 ttl_pos = ans_pos;
+                            ans_pos += 4;
+                            UINT16 rdlength = ((UINT16)dns_data[ans_pos] << 8) | dns_data[ans_pos + 1];
+                            ans_pos += 2;
+                            if (atype == 1 && rdlength == 4 && ans_pos + 4 <= dns_len && spoof_af == 2) {
+                                dns_data[ttl_pos] = (UINT8)(spoof_ttl >> 24);
+                                dns_data[ttl_pos + 1] = (UINT8)(spoof_ttl >> 16);
+                                dns_data[ttl_pos + 2] = (UINT8)(spoof_ttl >> 8);
+                                dns_data[ttl_pos + 3] = (UINT8)(spoof_ttl);
+                                strong::kmemcpy(&dns_data[ans_pos], spoof_addr, 4);
+                                spoofed = TRUE;
+                                spoofed_type = atype;
+                            } else if (atype == 28 && rdlength == 16 && ans_pos + 16 <= dns_len && spoof_af == 23) {
+                                dns_data[ttl_pos] = (UINT8)(spoof_ttl >> 24);
+                                dns_data[ttl_pos + 1] = (UINT8)(spoof_ttl >> 16);
+                                dns_data[ttl_pos + 2] = (UINT8)(spoof_ttl >> 8);
+                                dns_data[ttl_pos + 3] = (UINT8)(spoof_ttl);
+                                strong::kmemcpy(&dns_data[ans_pos], spoof_addr, 16);
+                                spoofed = TRUE;
+                                spoofed_type = atype;
+                            }
+                            ans_pos += rdlength;
+                        }
+                        WW_LOG("net_dns_spoof::modify_result layer=in_trans rule_id=%u qname='%s' spoofed=%u spoofed_type=%u ancount=%u dns_skip=%u dns_len=%u",
+                            spoof_rule_id,
+                            spoof_domain,
+                            spoofed ? 1u : 0u,
+                            spoofed_type,
+                            ancount,
+                            dns_skip,
+                            dns_len);
+                        if (spoofed) {
+                            NET_DBG("classify_inbound: DNS SPOOFED domain=%s", spoof_domain);
+                            RtlZeroMemory(inj_buf, sizeof(*inj_buf));
+                            inj_buf->direction = 0;
+                            inj_buf->protocol = 17;
+                            inj_buf->address_family = 2;
+                            inj_buf->src_port = remote_port;
+                            inj_buf->dst_port = local_port;
+                            strong::kmemcpy(inj_buf->src_addr, remote_ip, 4);
+                            strong::kmemcpy(inj_buf->dst_addr, local_ip, 4);
+                            if (dns_skip == 8) {
                                 inj_buf->tcp_flags = net_inject::INJECT_FLAG_RAW_TRANSPORT;
                                 inj_buf->payload_size = pkt_len;
                                 if (pkt_len <= INJECT_MAX_PAYLOAD)
                                     strong::kmemcpy(inj_buf->payload, pkt_data, pkt_len);
-                                classifyOut->actionType = FWP_ACTION_BLOCK_;
-                                classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE_;
-                                net_inject::inject_packet(inj_buf);
-                                __leave;
+                            } else {
+                                inj_buf->tcp_flags = 0;
+                                inj_buf->payload_size = dns_len;
+                                if (dns_len <= INJECT_MAX_PAYLOAD)
+                                    strong::kmemcpy(inj_buf->payload, dns_data, dns_len);
                             }
+                            classifyOut->actionType = FWP_ACTION_BLOCK_;
+                            classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE_;
+                            NTSTATUS dns_inject_status = net_inject::inject_packet(inj_buf);
+                            WW_LOG("net_dns_spoof::inject_result layer=in_trans rule_id=%u qname='%s' status=0x%08X win32=%lu request_status=%u raw_transport=%u payload_size=%u action=blocked_original",
+                                spoof_rule_id,
+                                spoof_domain,
+                                dns_inject_status,
+                                net_capture::status_to_win32(dns_inject_status),
+                                inj_buf->status,
+                                (inj_buf->tcp_flags & net_inject::INJECT_FLAG_RAW_TRANSPORT) ? 1u : 0u,
+                                inj_buf->payload_size);
+                            __leave;
                         }
                     }
                 }
@@ -1146,8 +1292,40 @@ namespace net_capture {
 
             if (pkt_len > 0) {
                 UINT32 orig_len = pkt_len;
+                LONG mod_active = net_mod::active_rule_count();
+                LONG64 mod_generation = net_mod::current_generation();
+                if (mod_active != 0) {
+                    WW_LOG("net_mod::classify APPLY_BEGIN layer=in_trans direction=0 irql=%u cpu=%lu pid=%u protocol=%u ports=%u<-%u pkt_len=%u active_rules=%ld generation=%lld action_before=0x%08X rights_before=0x%08X",
+                        (UINT32)KeGetCurrentIrql(),
+                        KeGetCurrentProcessorNumber(),
+                        pid,
+                        protocol,
+                        local_port,
+                        remote_port,
+                        pkt_len,
+                        mod_active,
+                        mod_generation,
+                        (UINT32)classifyOut->actionType,
+                        classifyOut->rights);
+                }
                 BOOLEAN was_modified = net_mod::apply_modifications(pkt_data, &pkt_len, NET_PKT_MAX_PAYLOAD,
                                             0, protocol, remote_port, pid);
+                if (mod_active != 0) {
+                    WW_LOG("net_mod::classify APPLY_END layer=in_trans direction=0 modified=%u irql=%u cpu=%lu pid=%u protocol=%u ports=%u<-%u len_before=%u len_after=%u active_rules=%ld generation_before=%lld generation_after=%lld needs_reinject_before=%u",
+                        was_modified ? 1u : 0u,
+                        (UINT32)KeGetCurrentIrql(),
+                        KeGetCurrentProcessorNumber(),
+                        pid,
+                        protocol,
+                        local_port,
+                        remote_port,
+                        orig_len,
+                        pkt_len,
+                        mod_active,
+                        mod_generation,
+                        net_mod::current_generation(),
+                        needs_reinject ? 1u : 0u);
+                }
                 if (was_modified) {
                     NET_DBG("classify_inbound: MODIFIED proto=%u pid=%u port=%u (len %u->%u)",
                             protocol, pid, remote_port, orig_len, pkt_len);
@@ -1180,9 +1358,32 @@ namespace net_capture {
                         strong::kmemcpy(inj_buf->payload, pkt_data, pkt_len);
                     classifyOut->actionType = FWP_ACTION_BLOCK_;
                     classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE_;
-                    net_inject::inject_packet(inj_buf);
+                    NTSTATUS mod_inject_status = net_inject::inject_packet(inj_buf);
+                    WW_LOG("net_mod::classify REINJECT layer=in_trans direction=0 status=0x%08X win32=%lu request_status=%u irql=%u cpu=%lu pid=%u protocol=%u ports=%u<-%u payload_size=%u active_rules=%ld generation=%lld action=blocked_original",
+                        mod_inject_status,
+                        net_capture::status_to_win32(mod_inject_status),
+                        inj_buf->status,
+                        (UINT32)KeGetCurrentIrql(),
+                        KeGetCurrentProcessorNumber(),
+                        pid,
+                        protocol,
+                        local_port,
+                        remote_port,
+                        inj_buf->payload_size,
+                        net_mod::active_rule_count(),
+                        net_mod::current_generation());
                 } else {
                     NET_ERR("classify_inbound: packet modified/delta-adjusted but inject handle unavailable, blocking proto=%u pid=%u", protocol, pid);
+                    WW_LOG("net_mod::classify REINJECT_SKIP layer=in_trans direction=0 reason=inject_handle_unavailable irql=%u cpu=%lu pid=%u protocol=%u ports=%u<-%u pkt_len=%u active_rules=%ld generation=%lld action=blocked_original",
+                        (UINT32)KeGetCurrentIrql(),
+                        KeGetCurrentProcessorNumber(),
+                        pid,
+                        protocol,
+                        local_port,
+                        remote_port,
+                        pkt_len,
+                        net_mod::active_rule_count(),
+                        net_mod::current_generation());
                     classifyOut->actionType = FWP_ACTION_BLOCK_;
                     classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE_;
                     __leave;
@@ -1320,6 +1521,9 @@ namespace net_capture {
             UINT8 local_ip[16] = {};
             UINT8 remote_ip[16] = {};
             UINT32 pid = 0;
+            UINT32 metadata_pid = 0;
+            UINT32 metadata_pid_present = 0;
+            UINT32 pid_source = 0;
 
             if (inFixedValues->valueCount > FWPS_FIELD_OUT_TRANS_V4_PROTOCOL) {
                 protocol = inFixedValues->incomingValue[FWPS_FIELD_OUT_TRANS_V4_PROTOCOL].value.uint8;
@@ -1341,6 +1545,9 @@ namespace net_capture {
 
             if ((inMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_PROCESS_ID_) != 0) {
                 pid = (UINT32)inMetaValues->processId;
+                metadata_pid = pid;
+                metadata_pid_present = 1;
+                if (pid != 0) pid_source = 1;
             }
             if (pid != 0 && inMetaValues->transportEndpointHandle != 0) {
                 aida_store_cached_endpoint_pid(inMetaValues->transportEndpointHandle,
@@ -1349,9 +1556,11 @@ namespace net_capture {
             if (pid == 0) {
                 pid = aida_resolve_packet_pid(inMetaValues->transportEndpointHandle,
                     protocol, local_port, remote_port);
+                if (pid != 0) pid_source = 2;
             }
             if (pid == 0) {
                 pid = aida_lookup_cached_port_pid(protocol, local_port, remote_port);
+                if (pid != 0) pid_source = 3;
             }
             if (pid == 0 && protocol == 17) {
                 UINT32 lip = ((UINT32)local_ip[0] << 24) | ((UINT32)local_ip[1] << 16) |
@@ -1359,6 +1568,7 @@ namespace net_capture {
                 UINT32 rip = ((UINT32)remote_ip[0] << 24) | ((UINT32)remote_ip[1] << 16) |
                              ((UINT32)remote_ip[2] << 8) | remote_ip[3];
                 pid = net_udp_cache::lookup(lip, rip, (UINT16)local_port, (UINT16)remote_port);
+                if (pid != 0) pid_source = 4;
             }
             if (pid != 0) {
                 aida_store_cached_port_pid(protocol, local_port, pid);
@@ -1370,6 +1580,24 @@ namespace net_capture {
                                  ((UINT32)remote_ip[2] << 8) | remote_ip[3];
                     net_udp_cache::store(lip, rip, (UINT16)local_port, (UINT16)remote_port, pid);
                 }
+            }
+            if (g_capture_active || net_dpi::is_active() || net_redirect::has_active_rules() || net_dns_spoof::has_active_rules()) {
+                WW_LOG("net_classify::out pid_attribution protocol=%u metadata_present=%u metadata_pid=%u final_pid=%u source=%u endpoint=0x%llX tuple=%u.%u.%u.%u:%u->%u.%u.%u.%u:%u iface_src=%u iface_dst=%u compartment=%lu capture_active=%ld dpi_active=%u redir_active=%u dns_active=%u",
+                    protocol,
+                    metadata_pid_present,
+                    metadata_pid,
+                    pid,
+                    pid_source,
+                    (unsigned long long)inMetaValues->transportEndpointHandle,
+                    local_ip[0], local_ip[1], local_ip[2], local_ip[3], local_port,
+                    remote_ip[0], remote_ip[1], remote_ip[2], remote_ip[3], remote_port,
+                    inMetaValues->sourceInterfaceIndex,
+                    inMetaValues->destinationInterfaceIndex,
+                    inMetaValues->compartmentId,
+                    g_capture_active,
+                    net_dpi::is_active() ? 1u : 0u,
+                    net_redirect::has_active_rules() ? 1u : 0u,
+                    net_dns_spoof::has_active_rules() ? 1u : 0u);
             }
 
             _InterlockedIncrement64(&g_global_pkts_sent);
@@ -1419,6 +1647,18 @@ namespace net_capture {
 
             UINT32 pkt_len = 0;
             pkt_len = copy_transport_bytes(layerData, pkt_data, NET_PKT_MAX_PAYLOAD);
+            if (g_capture_active || net_dpi::is_active() || net_redirect::has_active_rules() || net_dns_spoof::has_active_rules()) {
+                UINT32 transport_len = get_transport_data_length(layerData);
+                WW_LOG("net_classify::out payload_copy protocol=%u pid=%u tuple=%u.%u.%u.%u:%u->%u.%u.%u.%u:%u transport_len=%u copied_len=%u max=%u layerData=%p",
+                    protocol,
+                    pid,
+                    local_ip[0], local_ip[1], local_ip[2], local_ip[3], local_port,
+                    remote_ip[0], remote_ip[1], remote_ip[2], remote_ip[3], remote_port,
+                    transport_len,
+                    pkt_len,
+                    NET_PKT_MAX_PAYLOAD,
+                    layerData);
+            }
             if (pkt_len == 0 && layerData) {
             }
 
@@ -1426,7 +1666,11 @@ namespace net_capture {
             if (pkt_len > 0 && net_redirect::has_active_rules()) {
                 UINT32 redir_port = 0;
                 UINT8 redir_addr[16] = {};
-                if (net_redirect::check_redirect(protocol, remote_port, remote_ip, 2, pid, &redir_port, redir_addr)) {
+                UINT32 redir_rule_id = 0;
+                LONG redir_match_before = 0;
+                LONG redir_match_after = 0;
+                if (net_redirect::check_redirect(protocol, remote_port, remote_ip, 2, pid, &redir_port, redir_addr,
+                        &redir_rule_id, &redir_match_before, &redir_match_after)) {
                     NET_DBG("classify_outbound: REDIRECTING proto=%u pid=%u port=%u -> %u.%u.%u.%u:%u",
                             protocol, pid, remote_port,
                             redir_addr[0], redir_addr[1], redir_addr[2], redir_addr[3], redir_port);
@@ -1454,9 +1698,40 @@ namespace net_capture {
                     inj_buf->payload_size = pkt_len - hdr_skip;
                     if (inj_buf->payload_size > 0)
                         strong::kmemcpy(inj_buf->payload, pkt_data + hdr_skip, inj_buf->payload_size);
+                    WW_LOG("net_redirect::classify layer=out_trans direction=1 protocol=%u pid=%u rule_id=%u match_before=%ld match_after=%ld tuple_before=%u.%u.%u.%u:%u->%u.%u.%u.%u:%u tuple_after=%u.%u.%u.%u:%u->%u.%u.%u.%u:%u iface_src=%u iface_dst=%u compartment=%lu transport_len=%u hdr_skip=%u payload_size=%u decision=block_inject",
+                        protocol,
+                        pid,
+                        redir_rule_id,
+                        redir_match_before,
+                        redir_match_after,
+                        local_ip[0], local_ip[1], local_ip[2], local_ip[3], local_port,
+                        remote_ip[0], remote_ip[1], remote_ip[2], remote_ip[3], remote_port,
+                        local_ip[0], local_ip[1], local_ip[2], local_ip[3], local_port,
+                        redir_addr[0], redir_addr[1], redir_addr[2], redir_addr[3], redir_port,
+                        inMetaValues->sourceInterfaceIndex,
+                        inMetaValues->destinationInterfaceIndex,
+                        inMetaValues->compartmentId,
+                        pkt_len,
+                        hdr_skip,
+                        inj_buf->payload_size);
                     classifyOut->actionType = FWP_ACTION_BLOCK_;
                     classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE_;
-                    net_inject::inject_packet(inj_buf);
+                    NTSTATUS inject_status = net_inject::inject_packet(inj_buf);
+                    WW_LOG("net_redirect::inject_result layer=out_trans rule_id=%u status=0x%08X win32=%lu request_status=%u action=blocked_original direction=%u protocol=%u pid=%u dst_port_before=%u dst_port_after=%u payload_size=%u hdr_skip=%u iface_src=%u iface_dst=%u compartment=%lu",
+                        redir_rule_id,
+                        inject_status,
+                        net_capture::status_to_win32(inject_status),
+                        inj_buf->status,
+                        inj_buf->direction,
+                        inj_buf->protocol,
+                        pid,
+                        remote_port,
+                        redir_port,
+                        inj_buf->payload_size,
+                        hdr_skip,
+                        inMetaValues->sourceInterfaceIndex,
+                        inMetaValues->destinationInterfaceIndex,
+                        inMetaValues->compartmentId);
                     __leave;
                 }
             }
@@ -1480,8 +1755,40 @@ namespace net_capture {
 
             if (pkt_len > 0) {
                 UINT32 orig_len = pkt_len;
+                LONG mod_active = net_mod::active_rule_count();
+                LONG64 mod_generation = net_mod::current_generation();
+                if (mod_active != 0) {
+                    WW_LOG("net_mod::classify APPLY_BEGIN layer=out_trans direction=1 irql=%u cpu=%lu pid=%u protocol=%u ports=%u->%u pkt_len=%u active_rules=%ld generation=%lld action_before=0x%08X rights_before=0x%08X",
+                        (UINT32)KeGetCurrentIrql(),
+                        KeGetCurrentProcessorNumber(),
+                        pid,
+                        protocol,
+                        local_port,
+                        remote_port,
+                        pkt_len,
+                        mod_active,
+                        mod_generation,
+                        (UINT32)classifyOut->actionType,
+                        classifyOut->rights);
+                }
                 BOOLEAN was_modified = net_mod::apply_modifications(pkt_data, &pkt_len, NET_PKT_MAX_PAYLOAD,
                                             1, protocol, remote_port, pid);
+                if (mod_active != 0) {
+                    WW_LOG("net_mod::classify APPLY_END layer=out_trans direction=1 modified=%u irql=%u cpu=%lu pid=%u protocol=%u ports=%u->%u len_before=%u len_after=%u active_rules=%ld generation_before=%lld generation_after=%lld needs_reinject_before=%u",
+                        was_modified ? 1u : 0u,
+                        (UINT32)KeGetCurrentIrql(),
+                        KeGetCurrentProcessorNumber(),
+                        pid,
+                        protocol,
+                        local_port,
+                        remote_port,
+                        orig_len,
+                        pkt_len,
+                        mod_active,
+                        mod_generation,
+                        net_mod::current_generation(),
+                        needs_reinject_out ? 1u : 0u);
+                }
                 if (was_modified) {
                     NET_DBG("classify_outbound: MODIFIED proto=%u pid=%u port=%u (len %u->%u)",
                             protocol, pid, remote_port, orig_len, pkt_len);
@@ -1514,9 +1821,32 @@ namespace net_capture {
                         strong::kmemcpy(inj_buf->payload, pkt_data, pkt_len);
                     classifyOut->actionType = FWP_ACTION_BLOCK_;
                     classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE_;
-                    net_inject::inject_packet(inj_buf);
+                    NTSTATUS mod_inject_status = net_inject::inject_packet(inj_buf);
+                    WW_LOG("net_mod::classify REINJECT layer=out_trans direction=1 status=0x%08X win32=%lu request_status=%u irql=%u cpu=%lu pid=%u protocol=%u ports=%u->%u payload_size=%u active_rules=%ld generation=%lld action=blocked_original",
+                        mod_inject_status,
+                        net_capture::status_to_win32(mod_inject_status),
+                        inj_buf->status,
+                        (UINT32)KeGetCurrentIrql(),
+                        KeGetCurrentProcessorNumber(),
+                        pid,
+                        protocol,
+                        local_port,
+                        remote_port,
+                        inj_buf->payload_size,
+                        net_mod::active_rule_count(),
+                        net_mod::current_generation());
                 } else {
                     NET_ERR("classify_outbound: packet modified/delta-adjusted but inject handle unavailable, blocking proto=%u pid=%u", protocol, pid);
+                    WW_LOG("net_mod::classify REINJECT_SKIP layer=out_trans direction=1 reason=inject_handle_unavailable irql=%u cpu=%lu pid=%u protocol=%u ports=%u->%u pkt_len=%u active_rules=%ld generation=%lld action=blocked_original",
+                        (UINT32)KeGetCurrentIrql(),
+                        KeGetCurrentProcessorNumber(),
+                        pid,
+                        protocol,
+                        local_port,
+                        remote_port,
+                        pkt_len,
+                        net_mod::active_rule_count(),
+                        net_mod::current_generation());
                     classifyOut->actionType = FWP_ACTION_BLOCK_;
                     classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE_;
                     __leave;
@@ -1628,6 +1958,9 @@ namespace net_capture {
             UINT8 local_ip[16] = {};
             UINT8 remote_ip[16] = {};
             UINT32 pid = 0;
+            UINT32 metadata_pid = 0;
+            UINT32 metadata_pid_present = 0;
+            UINT32 pid_source = 0;
 
             if (inFixedValues->valueCount > FWPS_FIELD_DATAGRAM_V4_PROTOCOL) {
                 protocol = inFixedValues->incomingValue[FWPS_FIELD_DATAGRAM_V4_PROTOCOL].value.uint8;
@@ -1655,6 +1988,9 @@ namespace net_capture {
 
             if ((inMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_PROCESS_ID_) != 0) {
                 pid = (UINT32)inMetaValues->processId;
+                metadata_pid = pid;
+                metadata_pid_present = 1;
+                if (pid != 0) pid_source = 1;
             }
             if (pid != 0 && inMetaValues->transportEndpointHandle != 0) {
                 aida_store_cached_endpoint_pid(inMetaValues->transportEndpointHandle,
@@ -1663,9 +1999,11 @@ namespace net_capture {
             if (pid == 0) {
                 pid = aida_resolve_packet_pid(inMetaValues->transportEndpointHandle,
                     protocol, local_port, remote_port);
+                if (pid != 0) pid_source = 2;
             }
             if (pid == 0) {
                 pid = aida_lookup_cached_port_pid(protocol, local_port, remote_port);
+                if (pid != 0) pid_source = 3;
             }
             if (pid == 0) {
                 UINT32 lip = ((UINT32)local_ip[0] << 24) | ((UINT32)local_ip[1] << 16) |
@@ -1677,6 +2015,7 @@ namespace net_capture {
                 } else {
                     pid = net_udp_cache::lookup(lip, rip, (UINT16)local_port, (UINT16)remote_port);
                 }
+                if (pid != 0) pid_source = 4;
             }
             if (pid != 0) {
                 aida_store_cached_port_pid(protocol, local_port, pid);
@@ -1690,6 +2029,26 @@ namespace net_capture {
                 } else {
                     net_udp_cache::store(lip, rip, (UINT16)local_port, (UINT16)remote_port, pid);
                 }
+            }
+            if (g_capture_active || net_dpi::is_active() || net_redirect::has_active_rules() || net_dns_spoof::has_active_rules()) {
+                WW_LOG("net_classify::datagram pid_attribution direction=%u protocol=%u metadata_present=%u metadata_pid=%u final_pid=%u source=%u endpoint=0x%llX tuple=%u.%u.%u.%u:%u%s%u.%u.%u.%u:%u iface_src=%u iface_dst=%u compartment=%lu capture_active=%ld dpi_active=%u redir_active=%u dns_active=%u",
+                    direction,
+                    protocol,
+                    metadata_pid_present,
+                    metadata_pid,
+                    pid,
+                    pid_source,
+                    (unsigned long long)inMetaValues->transportEndpointHandle,
+                    local_ip[0], local_ip[1], local_ip[2], local_ip[3], local_port,
+                    direction == 0 ? "<-" : "->",
+                    remote_ip[0], remote_ip[1], remote_ip[2], remote_ip[3], remote_port,
+                    inMetaValues->sourceInterfaceIndex,
+                    inMetaValues->destinationInterfaceIndex,
+                    inMetaValues->compartmentId,
+                    g_capture_active,
+                    net_dpi::is_active() ? 1u : 0u,
+                    net_redirect::has_active_rules() ? 1u : 0u,
+                    net_dns_spoof::has_active_rules() ? 1u : 0u);
             }
 
             UINT32 data_length = get_transport_data_length(layerData);
@@ -1728,7 +2087,83 @@ namespace net_capture {
             if (!pkt_data) __leave;
 
             UINT32 pkt_len = copy_transport_bytes(layerData, pkt_data, NET_PKT_MAX_PAYLOAD);
+            if (g_capture_active || net_dpi::is_active() || net_redirect::has_active_rules() || net_dns_spoof::has_active_rules()) {
+                UINT32 transport_len = get_transport_data_length(layerData);
+                WW_LOG("net_classify::datagram payload_copy direction=%u protocol=%u pid=%u tuple=%u.%u.%u.%u:%u%s%u.%u.%u.%u:%u transport_len=%u copied_len=%u max=%u layerData=%p",
+                    direction,
+                    protocol,
+                    pid,
+                    local_ip[0], local_ip[1], local_ip[2], local_ip[3], local_port,
+                    direction == 0 ? "<-" : "->",
+                    remote_ip[0], remote_ip[1], remote_ip[2], remote_ip[3], remote_port,
+                    transport_len,
+                    pkt_len,
+                    NET_PKT_MAX_PAYLOAD,
+                    layerData);
+            }
             if (pkt_len == 0) __leave;
+
+            if (protocol == 17 && (local_port == 53 || remote_port == 53) && net_dns_spoof::has_active_rules()) {
+                UINT8* dns_data = nullptr;
+                UINT32 dns_len = 0;
+                UINT32 dns_skip = 0;
+                if (select_dns_payload(pkt_data, pkt_len, local_port, remote_port, &dns_data, &dns_len, &dns_skip)) {
+                    UINT16 dns_flags = ((UINT16)dns_data[2] << 8) | dns_data[3];
+                    BOOLEAN is_dns_response = (dns_flags & 0x8000) != 0;
+                    UINT16 qdcount = ((UINT16)dns_data[4] << 8) | dns_data[5];
+                    UINT16 ancount = ((UINT16)dns_data[6] << 8) | dns_data[7];
+                    char qname[260] = {};
+                    UINT16 qtype = 0;
+                    UINT32 qpos = 0;
+                    if (qdcount > 0 && qdcount <= 16) {
+                        qpos = parse_dns_name(dns_data, 12, dns_len, qname, sizeof(qname));
+                        if (qpos != 0 && qpos + 4 <= dns_len) {
+                            qtype = ((UINT16)dns_data[qpos] << 8) | dns_data[qpos + 1];
+                        }
+                    }
+                    UINT8 spoof_addr[16] = {};
+                    UINT32 spoof_af = 0;
+                    UINT32 spoof_ttl = 0;
+                    UINT32 spoof_rule_id = 0;
+                    char spoof_rule_domain[DNS_SPOOF_MAX_DOMAIN] = {};
+                    LONG match_before = 0;
+                    LONG match_after = 0;
+                    BOOLEAN rule_match = net_dns_spoof::inspect_spoof_rule(qname, spoof_addr, &spoof_af, &spoof_ttl,
+                        &spoof_rule_id, spoof_rule_domain, sizeof(spoof_rule_domain),
+                        &match_before, &match_after, FALSE);
+                    WW_LOG("net_dns_spoof::classify layer=datagram direction=%u pid=%u ports=%u%s%u qr=%u flags=0x%04X qdcount=%u ancount=%u qtype=%u qname='%s' rule_id=%u rule_domain='%s' match=%u match_before=%ld match_after=%ld spoof_af=%u ttl=%u dns_skip=%u dns_len=%u pkt_len=%u action=%s",
+                        direction,
+                        pid,
+                        local_port,
+                        direction == 0 ? "<-" : "->",
+                        remote_port,
+                        is_dns_response ? 1u : 0u,
+                        dns_flags,
+                        qdcount,
+                        ancount,
+                        qtype,
+                        qname,
+                        spoof_rule_id,
+                        spoof_rule_domain,
+                        rule_match ? 1u : 0u,
+                        match_before,
+                        match_after,
+                        spoof_af,
+                        spoof_ttl,
+                        dns_skip,
+                        dns_len,
+                        pkt_len,
+                        is_dns_response ? "response_observed_no_datagram_modify" : "query_observed_no_counter_increment");
+                } else {
+                    WW_LOG("net_dns_spoof::classify layer=datagram direction=%u pid=%u ports=%u%s%u pkt_len=%u action=dns_payload_select_failed",
+                        direction,
+                        pid,
+                        local_port,
+                        direction == 0 ? "<-" : "->",
+                        remote_port,
+                        pkt_len);
+                }
+            }
 
             {
                 LARGE_INTEGER dpi_ts;
@@ -1993,6 +2428,188 @@ namespace net_capture {
                guid_equal(key, &GUID_AIDA_CALLOUT_ALE_RECV);
     }
 
+    static char ascii_lower(char c) {
+        return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+    }
+
+    static BOOLEAN text_contains_ascii_ci(const char* text, const char* needle) {
+        if (!text || !needle || needle[0] == 0) return FALSE;
+        SIZE_T text_len = 0;
+        SIZE_T needle_len = 0;
+        while (text[text_len] && text_len < 255) ++text_len;
+        while (needle[needle_len] && needle_len < 127) ++needle_len;
+        if (needle_len == 0 || text_len < needle_len) return FALSE;
+        for (SIZE_T i = 0; i <= text_len - needle_len; ++i) {
+            BOOLEAN ok = TRUE;
+            for (SIZE_T j = 0; j < needle_len; ++j) {
+                if (ascii_lower(text[i + j]) != ascii_lower(needle[j])) {
+                    ok = FALSE;
+                    break;
+                }
+            }
+            if (ok) return TRUE;
+        }
+        return FALSE;
+    }
+
+    static void copy_wide_ascii_bounded(const wchar_t* src, char* out, SIZE_T out_len) {
+        if (!out || out_len == 0) return;
+        out[0] = 0;
+        if (!src) return;
+        __try {
+            if (!_MmIsAddressValid((PVOID)src)) return;
+            SIZE_T j = 0;
+            for (; j + 1 < out_len; ++j) {
+                wchar_t wc = src[j];
+                if (wc == 0) break;
+                if (wc >= 32 && wc <= 126) {
+                    out[j] = (char)wc;
+                } else if (wc == L'\t' || wc == L'\r' || wc == L'\n') {
+                    out[j] = ' ';
+                } else {
+                    out[j] = '?';
+                }
+            }
+            out[j] = 0;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            out[0] = 0;
+        }
+    }
+
+    static void copy_display_name_ascii(const FWPM_DISPLAY_DATA0* display, char* out, SIZE_T out_len) {
+        if (!out || out_len == 0) return;
+        out[0] = 0;
+        if (!display) return;
+        __try {
+            copy_wide_ascii_bounded(display->name, out, out_len);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            out[0] = 0;
+        }
+    }
+
+    static void copy_display_description_ascii(const FWPM_DISPLAY_DATA0* display, char* out, SIZE_T out_len) {
+        if (!out || out_len == 0) return;
+        out[0] = 0;
+        if (!display) return;
+        __try {
+            copy_wide_ascii_bounded(display->description, out, out_len);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            out[0] = 0;
+        }
+    }
+
+    static BOOLEAN is_aida_owned_display_text(const char* text) {
+        return text_contains_ascii_ci(text, "AiDANet") ||
+               text_contains_ascii_ci(text, "AiDA Network Monitor");
+    }
+
+    static BOOLEAN is_aida_candidate_text(const char* text) {
+        return text_contains_ascii_ci(text, "AiDA") ||
+               text_contains_ascii_ci(text, "AiDAStandalone") ||
+               text_contains_ascii_ci(text, "WhosWho");
+    }
+
+    static UINT32 display_match_reason(const FWPM_DISPLAY_DATA0* display) {
+        char name[96] = {};
+        char desc[128] = {};
+        copy_display_name_ascii(display, name, sizeof(name));
+        copy_display_description_ascii(display, desc, sizeof(desc));
+        if (is_aida_owned_display_text(name) || is_aida_owned_display_text(desc))
+            return WFP_AIDA_MATCH_DISPLAY_DATA;
+        return 0;
+    }
+
+    static BOOLEAN display_has_aida_candidate(const FWPM_DISPLAY_DATA0* display) {
+        char name[96] = {};
+        char desc[128] = {};
+        copy_display_name_ascii(display, name, sizeof(name));
+        copy_display_description_ascii(display, desc, sizeof(desc));
+        return (is_aida_candidate_text(name) || is_aida_candidate_text(desc)) ? TRUE : FALSE;
+    }
+
+    typedef struct _WFP_APP_CONDITION_INFO {
+        UINT32 found;
+        UINT32 index;
+        UINT32 value_type;
+        UINT32 blob_size;
+        UINT32 aida_candidate;
+        UINT32 original_app_id;
+        char preview[128];
+    } WFP_APP_CONDITION_INFO;
+
+    static void copy_blob_ascii_preview(const FWP_BYTE_BLOB_COMPAT* blob, char* out, SIZE_T out_len, UINT32* blob_size) {
+        if (blob_size) *blob_size = 0;
+        if (!out || out_len == 0) return;
+        out[0] = 0;
+        if (!blob) return;
+        __try {
+            if (!_MmIsAddressValid((PVOID)blob)) return;
+            if (blob_size) *blob_size = blob->size;
+            if (!blob->data || blob->size == 0 || !_MmIsAddressValid((PVOID)blob->data)) return;
+            const UINT8* data = blob->data;
+            const UINT32 max_scan = blob->size > 512 ? 512 : blob->size;
+            UINT32 zero_high = 0;
+            UINT32 pairs = 0;
+            for (UINT32 i = 1; i < max_scan && pairs < 16; i += 2, ++pairs) {
+                if (data[i] == 0) ++zero_high;
+            }
+            BOOLEAN utf16 = (pairs >= 2 && zero_high >= (pairs / 2));
+            SIZE_T j = 0;
+            if (utf16) {
+                for (UINT32 i = 0; i + 1 < max_scan && j + 1 < out_len; i += 2) {
+                    UINT16 wc = (UINT16)data[i] | ((UINT16)data[i + 1] << 8);
+                    if (wc == 0) break;
+                    if (wc >= 32 && wc <= 126) {
+                        out[j++] = (char)wc;
+                    } else if (wc == L'\t' || wc == L'\r' || wc == L'\n') {
+                        out[j++] = ' ';
+                    } else {
+                        out[j++] = '?';
+                    }
+                }
+            } else {
+                for (UINT32 i = 0; i < max_scan && j + 1 < out_len; ++i) {
+                    UINT8 ch = data[i];
+                    if (ch == 0) break;
+                    out[j++] = (ch >= 32 && ch <= 126) ? (char)ch : '?';
+                }
+            }
+            out[j] = 0;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            out[0] = 0;
+            if (blob_size) *blob_size = 0;
+        }
+    }
+
+    static void inspect_filter_app_condition(const FWPM_FILTER0_COMPAT* filter, WFP_APP_CONDITION_INFO* info) {
+        if (!info) return;
+        strong::kmemset(info, 0, sizeof(*info));
+        if (!filter || !filter->filterCondition || filter->numFilterConditions == 0) return;
+        UINT32 limit = filter->numFilterConditions > 64 ? 64 : filter->numFilterConditions;
+        __try {
+            if (!_MmIsAddressValid((PVOID)filter->filterCondition)) return;
+            for (UINT32 i = 0; i < limit; ++i) {
+                const FWPM_FILTER_CONDITION0_COMPAT* cond = &filter->filterCondition[i];
+                if (guid_equal(&cond->fieldKey, &GUID_CONDITION_ALE_APP_ID) ||
+                    guid_equal(&cond->fieldKey, &GUID_CONDITION_ALE_ORIGINAL_APP_ID)) {
+                    info->found = 1;
+                    info->index = i;
+                    info->value_type = (UINT32)cond->conditionValue.type;
+                    info->original_app_id = guid_equal(&cond->fieldKey, &GUID_CONDITION_ALE_ORIGINAL_APP_ID) ? 1u : 0u;
+                    if (cond->conditionValue.type == FWP_BYTE_BLOB_TYPE) {
+                        copy_blob_ascii_preview(cond->conditionValue.byteBlob, info->preview, sizeof(info->preview), &info->blob_size);
+                    } else if (cond->conditionValue.type == FWP_UNICODE_STRING_TYPE) {
+                        copy_wide_ascii_bounded(cond->conditionValue.unicodeString, info->preview, sizeof(info->preview));
+                    }
+                    info->aida_candidate = is_aida_candidate_text(info->preview) ? 1u : 0u;
+                    return;
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            strong::kmemset(info, 0, sizeof(*info));
+        }
+    }
+
     static UINT32 filter_match_reason(const FWPM_FILTER0_COMPAT* filter) {
         if (!filter) return 0;
         UINT32 reason = 0;
@@ -2000,7 +2617,106 @@ namespace net_capture {
             reason |= WFP_AIDA_MATCH_SUBLAYER;
         if (is_aida_callout_key(&filter->action.calloutKey))
             reason |= WFP_AIDA_MATCH_ACTION_CALLOUT;
+        reason |= display_match_reason(&filter->displayData);
         return reason;
+    }
+
+    static UINT32 callout_match_reason(const FWPM_CALLOUT0_COMPAT* callout) {
+        if (!callout) return 0;
+        UINT32 reason = 0;
+        if (is_aida_callout_key(&callout->calloutKey))
+            reason |= WFP_AIDA_MATCH_ACTION_CALLOUT;
+        reason |= display_match_reason(&callout->displayData);
+        return reason;
+    }
+
+    static void log_guid3_filter(const char* tag, UINT64 id, const GUID* layer, const GUID* sublayer, const GUID* callout, const GUID* provider) {
+        const GUID zero = {};
+        const GUID* l = layer ? layer : &zero;
+        const GUID* s = sublayer ? sublayer : &zero;
+        const GUID* c = callout ? callout : &zero;
+        const GUID* p = provider ? provider : &zero;
+        WW_LOG("net_capture::orphan_cleanup %s filter_layer id=%llu layer=%08lX-%04X-%04X-%02X%02X%02X%02X%02X%02X%02X%02X sublayer=%08lX-%04X-%04X-%02X%02X%02X%02X%02X%02X%02X%02X",
+            tag,
+            (unsigned long long)id,
+            l->Data1, l->Data2, l->Data3, l->Data4[0], l->Data4[1], l->Data4[2], l->Data4[3], l->Data4[4], l->Data4[5], l->Data4[6], l->Data4[7],
+            s->Data1, s->Data2, s->Data3, s->Data4[0], s->Data4[1], s->Data4[2], s->Data4[3], s->Data4[4], s->Data4[5], s->Data4[6], s->Data4[7]);
+        WW_LOG("net_capture::orphan_cleanup %s filter_action id=%llu callout=%08lX-%04X-%04X-%02X%02X%02X%02X%02X%02X%02X%02X provider=%08lX-%04X-%04X-%02X%02X%02X%02X%02X%02X%02X%02X",
+            tag,
+            (unsigned long long)id,
+            c->Data1, c->Data2, c->Data3, c->Data4[0], c->Data4[1], c->Data4[2], c->Data4[3], c->Data4[4], c->Data4[5], c->Data4[6], c->Data4[7],
+            p->Data1, p->Data2, p->Data3, p->Data4[0], p->Data4[1], p->Data4[2], p->Data4[3], p->Data4[4], p->Data4[5], p->Data4[6], p->Data4[7]);
+    }
+
+    static void log_filter_diagnostic(const char* tag, const FWPM_FILTER0_COMPAT* filter, UINT32 reason, const WFP_APP_CONDITION_INFO* app_info, const char* disposition) {
+        if (!filter) return;
+        char name[96] = {};
+        char desc[128] = {};
+        WFP_APP_CONDITION_INFO local_app = {};
+        const WFP_APP_CONDITION_INFO* app = app_info;
+        if (!app) {
+            inspect_filter_app_condition(filter, &local_app);
+            app = &local_app;
+        }
+        copy_display_name_ascii(&filter->displayData, name, sizeof(name));
+        copy_display_description_ascii(&filter->displayData, desc, sizeof(desc));
+        UINT32 provider_present = filter->providerKey ? 1u : 0u;
+        UINT32 provider_match = 0;
+        WW_LOG("net_capture::orphan_cleanup %s filter id=%llu action=0x%08X flags=0x%08X weight_type=%u provider_present=%u provider_match=%u conditions=%u app_found=%u app_index=%u app_type=%u app_blob=%u app_original=%u app_aida=%u reason=0x%08X disposition=%s",
+            tag,
+            (unsigned long long)filter->filterId,
+            (UINT32)filter->action.type,
+            filter->flags,
+            (UINT32)filter->weight.type,
+            provider_present,
+            provider_match,
+            filter->numFilterConditions,
+            app->found,
+            app->index,
+            app->value_type,
+            app->blob_size,
+            app->original_app_id,
+            app->aida_candidate,
+            reason,
+            disposition ? disposition : "");
+        log_guid3_filter(tag, filter->filterId, &filter->layerKey, &filter->subLayerKey, &filter->action.calloutKey, filter->providerKey);
+        WW_LOG("net_capture::orphan_cleanup %s filter_text id=%llu name='%s' desc='%s' app='%s'",
+            tag,
+            (unsigned long long)filter->filterId,
+            name,
+            desc,
+            app->preview);
+    }
+
+    static void log_callout_diagnostic(const char* tag, const FWPM_CALLOUT0_COMPAT* callout, UINT32 reason, const char* disposition) {
+        if (!callout) return;
+        char name[96] = {};
+        char desc[128] = {};
+        copy_display_name_ascii(&callout->displayData, name, sizeof(name));
+        copy_display_description_ascii(&callout->displayData, desc, sizeof(desc));
+        const GUID zero = {};
+        const GUID* provider = callout->providerKey ? callout->providerKey : &zero;
+        WW_LOG("net_capture::orphan_cleanup %s callout id=%u flags=0x%08X provider_present=%u provider_match=0 reason=0x%08X disposition=%s",
+            tag,
+            callout->calloutId,
+            callout->flags,
+            callout->providerKey ? 1u : 0u,
+            reason,
+            disposition ? disposition : "");
+        WW_LOG("net_capture::orphan_cleanup %s callout_key id=%u key=%08lX-%04X-%04X-%02X%02X%02X%02X%02X%02X%02X%02X layer=%08lX-%04X-%04X-%02X%02X%02X%02X%02X%02X%02X%02X",
+            tag,
+            callout->calloutId,
+            callout->calloutKey.Data1, callout->calloutKey.Data2, callout->calloutKey.Data3, callout->calloutKey.Data4[0], callout->calloutKey.Data4[1], callout->calloutKey.Data4[2], callout->calloutKey.Data4[3], callout->calloutKey.Data4[4], callout->calloutKey.Data4[5], callout->calloutKey.Data4[6], callout->calloutKey.Data4[7],
+            callout->applicableLayer.Data1, callout->applicableLayer.Data2, callout->applicableLayer.Data3, callout->applicableLayer.Data4[0], callout->applicableLayer.Data4[1], callout->applicableLayer.Data4[2], callout->applicableLayer.Data4[3], callout->applicableLayer.Data4[4], callout->applicableLayer.Data4[5], callout->applicableLayer.Data4[6], callout->applicableLayer.Data4[7]);
+        WW_LOG("net_capture::orphan_cleanup %s callout_provider id=%u provider=%08lX-%04X-%04X-%02X%02X%02X%02X%02X%02X%02X%02X",
+            tag,
+            callout->calloutId,
+            provider->Data1, provider->Data2, provider->Data3, provider->Data4[0], provider->Data4[1], provider->Data4[2], provider->Data4[3], provider->Data4[4], provider->Data4[5], provider->Data4[6], provider->Data4[7]);
+        WW_LOG("net_capture::orphan_cleanup %s callout_text id=%u name='%s' desc='%s'",
+            tag,
+            callout->calloutId,
+            name,
+            desc);
     }
 
     static ULONG status_to_win32(NTSTATUS status) {
@@ -2037,6 +2753,15 @@ namespace net_capture {
         UINT32 callouts_matched = 0;
         UINT32 callouts_deleted = 0;
         UINT32 callout_delete_failed = 0;
+        UINT32 block_filters_seen = 0;
+        UINT32 block_filters_logged = 0;
+        UINT32 block_filters_suppressed = 0;
+        UINT32 aida_filter_candidates_seen = 0;
+        UINT32 aida_filter_candidates_logged = 0;
+        UINT32 aida_filter_candidates_suppressed = 0;
+        UINT32 external_block_filters_seen = 0;
+        const UINT32 max_block_filter_logs = 32;
+        const UINT32 max_aida_candidate_logs = 96;
 
         HANDLE filter_enum = nullptr;
         NTSTATUS status = _FwpmFilterCreateEnumHandle0(engine, nullptr, &filter_enum);
@@ -2062,8 +2787,46 @@ namespace net_capture {
                     FWPM_FILTER0_COMPAT* filter = entries[i];
                     if (!filter) continue;
                     UINT32 reason = filter_match_reason(filter);
-                    if (reason == 0) continue;
+                    WFP_APP_CONDITION_INFO app_info = {};
+                    inspect_filter_app_condition(filter, &app_info);
+                    BOOLEAN block_filter = (filter->action.type == FWP_ACTION_BLOCK_) ? TRUE : FALSE;
+                    BOOLEAN display_candidate = display_has_aida_candidate(&filter->displayData);
+                    BOOLEAN aida_candidate = (reason != 0 || app_info.aida_candidate != 0 || display_candidate) ? TRUE : FALSE;
+                    if (block_filter) ++block_filters_seen;
+                    if (aida_candidate) ++aida_filter_candidates_seen;
+                    if (reason == 0) {
+                        if (block_filter && aida_candidate) {
+                            ++external_block_filters_seen;
+                            if (aida_filter_candidates_logged < max_aida_candidate_logs) {
+                                ++aida_filter_candidates_logged;
+                                log_filter_diagnostic("external_block_candidate", filter, reason, &app_info, "not_deleted_external_owner_no_aida_sublayer_callout_or_exact_display");
+                            } else {
+                                ++aida_filter_candidates_suppressed;
+                            }
+                        } else if (aida_candidate) {
+                            if (aida_filter_candidates_logged < max_aida_candidate_logs) {
+                                ++aida_filter_candidates_logged;
+                                log_filter_diagnostic("aida_candidate", filter, reason, &app_info, "not_deleted_no_aida_ownership_key");
+                            } else {
+                                ++aida_filter_candidates_suppressed;
+                            }
+                        } else if (block_filter) {
+                            if (block_filters_logged < max_block_filter_logs) {
+                                ++block_filters_logged;
+                                log_filter_diagnostic("block_summary", filter, reason, &app_info, "not_deleted_block_filter_sample");
+                            } else {
+                                ++block_filters_suppressed;
+                            }
+                        }
+                        continue;
+                    }
                     ++filters_matched;
+                    if (aida_filter_candidates_logged < max_aida_candidate_logs) {
+                        ++aida_filter_candidates_logged;
+                        log_filter_diagnostic("owned_filter", filter, reason, &app_info, "delete_aida_owned_stale");
+                    } else {
+                        ++aida_filter_candidates_suppressed;
+                    }
                     NTSTATUS del_status = _FwpmFilterDeleteById0(engine, filter->filterId);
                     ULONG del_win32 = status_to_win32(del_status);
                     WW_LOG("net_capture::orphan_cleanup filter_delete id=%llu action=0x%08X provider=%u reason=0x%08X status=0x%08X win32=%lu",
@@ -2113,13 +2876,17 @@ namespace net_capture {
                 callouts_seen += returned;
                 for (UINT32 i = 0; i < returned; ++i) {
                     FWPM_CALLOUT0_COMPAT* callout = entries[i];
-                    if (!callout || !is_aida_callout_key(&callout->calloutKey)) continue;
+                    if (!callout) continue;
+                    UINT32 reason = callout_match_reason(callout);
+                    if (reason == 0) continue;
                     ++callouts_matched;
+                    log_callout_diagnostic("owned_callout", callout, reason, "delete_aida_owned_stale");
                     NTSTATUS del_status = _FwpmCalloutDeleteById0(engine, callout->calloutId);
                     ULONG del_win32 = status_to_win32(del_status);
-                    WW_LOG("net_capture::orphan_cleanup callout_delete id=%u provider=%u status=0x%08X win32=%lu",
+                    WW_LOG("net_capture::orphan_cleanup callout_delete id=%u provider=%u reason=0x%08X status=0x%08X win32=%lu",
                         callout->calloutId,
                         callout->providerKey ? 1u : 0u,
+                        reason,
                         del_status,
                         del_win32);
                     if (NT_SUCCESS(del_status)) {
@@ -2143,11 +2910,22 @@ namespace net_capture {
         NTSTATUS sublayer_status = _FwpmSubLayerDeleteByKey0(engine, &GUID_AIDA_SUBLAYER);
         WW_LOG("net_capture::orphan_cleanup sublayer_delete status=0x%08X win32=%lu",
             sublayer_status, status_to_win32(sublayer_status));
-        WW_LOG("net_capture::orphan_cleanup summary filters_seen=%u filters_matched=%u filters_deleted=%u filter_failed=%u callouts_seen=%u callouts_matched=%u callouts_deleted=%u callout_failed=%u final_status=0x%08X final_win32=%lu",
+        if (external_block_filters_seen != 0) {
+            WW_LOG("net_capture::orphan_cleanup external_block_notice count=%u action=not_deleted reason=external_owner_without_aida_sublayer_callout_or_display next_run=filter_id_layer_sublayer_callout_provider_name_desc_app_condition_logged",
+                external_block_filters_seen);
+        }
+        WW_LOG("net_capture::orphan_cleanup summary filters_seen=%u filters_matched=%u filters_deleted=%u filter_failed=%u block_seen=%u block_logged=%u block_suppressed=%u aida_candidates_seen=%u aida_candidates_logged=%u aida_candidates_suppressed=%u external_blocks=%u callouts_seen=%u callouts_matched=%u callouts_deleted=%u callout_failed=%u final_status=0x%08X final_win32=%lu",
             filters_seen,
             filters_matched,
             filters_deleted,
             filter_delete_failed,
+            block_filters_seen,
+            block_filters_logged,
+            block_filters_suppressed,
+            aida_filter_candidates_seen,
+            aida_filter_candidates_logged,
+            aida_filter_candidates_suppressed,
+            external_block_filters_seen,
             callouts_seen,
             callouts_matched,
             callouts_deleted,
@@ -2185,7 +2963,7 @@ namespace net_capture {
         NTSTATUS status;
 
 
-        status = _FwpmEngineOpen0(nullptr, 0x0000000A ,
+        status = _FwpmEngineOpen0(nullptr, WFP_BFE_AUTH_SERVICE,
             nullptr, nullptr, &g_engine_handle);
         NET_DBG("register_wfp: FwpmEngineOpen0 status=0x%08x handle=%p", status, g_engine_handle);
         if (!NT_SUCCESS(status)) {
@@ -4264,6 +5042,51 @@ typedef NTSTATUS(NTAPI* fn_FwpsCalloutEnum0)(
 namespace net_wfp_enum {
 
     static void get_module_name_for_address(UINT64 address, char* out_name, SIZE_T max_len);
+    static const UINT32 WFP_ENUM_FALLBACK_REASON_MISSING_FUNCTIONS = 1;
+    static const UINT32 WFP_ENUM_FALLBACK_REASON_ENGINE_OPEN_FAILED = 2;
+    static const UINT32 WFP_ENUM_FALLBACK_REASON_BFE_ZERO_ENTRIES = 3;
+
+    static const char* fallback_reason_name(UINT32 reason) {
+        switch (reason) {
+        case WFP_ENUM_FALLBACK_REASON_MISSING_FUNCTIONS: return "missing_bfe_enum_functions";
+        case WFP_ENUM_FALLBACK_REASON_ENGINE_OPEN_FAILED: return "engine_open_failed";
+        case WFP_ENUM_FALLBACK_REASON_BFE_ZERO_ENTRIES: return "bfe_returned_zero_entries";
+        default: return "unknown";
+        }
+    }
+
+    static BOOLEAN is_aida_classify_address(UINT64 address) {
+        return address == (UINT64)net_capture::classify_inbound ||
+               address == (UINT64)net_capture::classify_outbound ||
+               address == (UINT64)net_capture::classify_datagram_v4 ||
+               address == (UINT64)net_capture::classify_ale_connect ||
+               address == (UINT64)net_capture::classify_ale_recv;
+    }
+
+    static void append_preview_part(char* out, SIZE_T max_len, const char* prefix, const char* value) {
+        if (!out || max_len == 0 || !prefix || !value || value[0] == 0) return;
+        SIZE_T pos = 0;
+        while (pos + 1 < max_len && out[pos]) ++pos;
+        for (SIZE_T i = 0; prefix[i] && pos + 1 < max_len; ++i) out[pos++] = prefix[i];
+        for (SIZE_T i = 0; value[i] && pos + 1 < max_len; ++i) out[pos++] = value[i];
+        out[pos] = 0;
+    }
+
+    static void copy_bfe_identity_preview(const FWPM_DISPLAY_DATA0* display,
+                                          const net_capture::WFP_APP_CONDITION_INFO* app,
+                                          char* out,
+                                          SIZE_T max_len) {
+        if (!out || max_len == 0) return;
+        out[0] = 0;
+        char name[48] = {};
+        char desc[48] = {};
+        net_capture::copy_display_name_ascii(display, name, sizeof(name));
+        net_capture::copy_display_description_ascii(display, desc, sizeof(desc));
+        append_preview_part(out, max_len, "n=", name);
+        append_preview_part(out, max_len, ";d=", desc);
+        if (app && app->found)
+            append_preview_part(out, max_len, ";a=", app->preview);
+    }
 
     static void append_registered_callout(p_wfp_callout_enum request,
                                           UINT32* total_filled,
@@ -4272,7 +5095,11 @@ namespace net_wfp_enum {
                                           const GUID* applicable_layer,
                                           UINT64 classify_fn,
                                           UINT64 notify_fn,
-                                          UINT64 flow_delete_fn) {
+                                          UINT64 flow_delete_fn,
+                                          UINT32 fallback_reason,
+                                          NTSTATUS fallback_status,
+                                          ULONG fallback_win32,
+                                          UINT32 auth_service) {
         if (!request || !total_filled || *total_filled >= MAX_WFP_CALLOUTS || callout_id == 0)
             return;
 
@@ -4287,12 +5114,20 @@ namespace net_wfp_enum {
         out->owning_module_base = (UINT64)net_capture::find_module_base("WhosWho.sys");
         out->entry_type = WFP_ENTRY_TYPE_CALLOUT;
         out->provider_present = 0;
-        out->aida_match_reason = net_capture::is_aida_callout_key(callout_key) ? WFP_AIDA_MATCH_ACTION_CALLOUT : 0;
+        out->filter_id = ((UINT64)fallback_win32 << 32) | fallback_reason;
+        out->flags = (UINT32)fallback_status;
+        out->action_type = auth_service;
+        out->aida_match_reason = (net_capture::is_aida_callout_key(callout_key) ? WFP_AIDA_MATCH_ACTION_CALLOUT : 0) |
+            WFP_AIDA_MATCH_RUNTIME_FALLBACK;
         get_module_name_for_address(classify_fn, out->owning_module, sizeof(out->owning_module));
         (*total_filled)++;
     }
 
-    static NTSTATUS enumerate_registered_callouts(p_wfp_callout_enum request) {
+    static NTSTATUS enumerate_registered_callouts(p_wfp_callout_enum request,
+                                                  UINT32 fallback_reason,
+                                                  NTSTATUS fallback_status,
+                                                  ULONG fallback_win32,
+                                                  UINT32 auth_service) {
         if (!request) return STATUS_INVALID_PARAMETER;
 
         UINT32 total_filled = 0;
@@ -4302,22 +5137,52 @@ namespace net_wfp_enum {
             &GUID_LAYER_INBOUND_V4,
             (UINT64)net_capture::classify_inbound,
             (UINT64)net_capture::callout_notify,
-            0);
+            0,
+            fallback_reason,
+            fallback_status,
+            fallback_win32,
+            auth_service);
         append_registered_callout(request, &total_filled,
             net_capture::g_callout_id_outbound,
             &net_capture::GUID_AIDA_CALLOUT_OUTBOUND,
             &GUID_LAYER_OUTBOUND_V4,
             (UINT64)net_capture::classify_outbound,
             (UINT64)net_capture::callout_notify,
-            0);
+            0,
+            fallback_reason,
+            fallback_status,
+            fallback_win32,
+            auth_service);
         append_registered_callout(request, &total_filled,
             net_capture::g_callout_id_datagram,
             &net_capture::GUID_AIDA_CALLOUT_DATAGRAM,
             &GUID_LAYER_DATAGRAM_V4,
             (UINT64)net_capture::classify_datagram_v4,
             (UINT64)net_capture::callout_notify,
-            0);
+            0,
+            fallback_reason,
+            fallback_status,
+            fallback_win32,
+            auth_service);
         request->callout_count = total_filled;
+        UINT32 classify_available = 0;
+        UINT32 aida_matches = 0;
+        for (UINT32 i = 0; i < total_filled; ++i) {
+            if (request->entries[i].classify_fn != 0) {
+                ++classify_available;
+                if (is_aida_classify_address(request->entries[i].classify_fn))
+                    ++aida_matches;
+            }
+        }
+        WW_LOG("net_wfp_enum::enumerate_registered_callouts source=runtime_registered_fallback degraded=1 reason=%s reason_code=%u status=0x%08X win32=%lu auth_service=0x%08X count=%u bfe_callouts=0 bfe_filters=0 classify_addresses_available=%u aida_callback_matches=%u filter_cleanup=0",
+            fallback_reason_name(fallback_reason),
+            fallback_reason,
+            fallback_status,
+            fallback_win32,
+            auth_service,
+            total_filled,
+            classify_available,
+            aida_matches);
         return (total_filled != 0) ? STATUS_SUCCESS : STATUS_NOT_FOUND;
     }
 
@@ -4362,23 +5227,6 @@ namespace net_wfp_enum {
         ExFreePoolWithTag(mods, 'wmNW');
     }
 
-    static void copy_display_name(const FWPM_DISPLAY_DATA0* display, char* out_name, SIZE_T max_len) {
-        if (!out_name || max_len == 0) return;
-        out_name[0] = 0;
-        if (!display) return;
-        __try {
-            wchar_t* wname = display->name;
-            if (wname && _MmIsAddressValid(wname)) {
-                SIZE_T j = 0;
-                for (; j + 1 < max_len && wname[j]; ++j)
-                    out_name[j] = (char)(wname[j] & 0x7F);
-                out_name[j] = 0;
-            }
-        } __except(EXCEPTION_EXECUTE_HANDLER) {
-            out_name[0] = 0;
-        }
-    }
-
     static BOOLEAN text_contains_ci(const char* text, const char* needle) {
         if (!needle || needle[0] == 0) return TRUE;
         if (!text || text[0] == 0) return FALSE;
@@ -4405,10 +5253,22 @@ namespace net_wfp_enum {
         if (!request) return STATUS_INVALID_PARAMETER;
 
         request->callout_count = 0;
+        const UINT32 auth_service = net_capture::WFP_BFE_AUTH_SERVICE;
 
         if (!net_capture::_FwpmEngineOpen0 || !net_capture::_FwpmEngineClose0) {
-            if (!net_capture::resolve_wfp_functions())
-                return STATUS_NOT_SUPPORTED;
+            if (!net_capture::resolve_wfp_functions()) {
+                NTSTATUS fallback_status = STATUS_NOT_SUPPORTED;
+                ULONG fallback_win32 = net_capture::status_to_win32(fallback_status);
+                WW_LOG("net_wfp_enum::enumerate_wfp_callouts source=runtime_registered_fallback degraded=1 reason=resolve_wfp_functions_failed status=0x%08X win32=%lu auth_service=0x%08X filter_cleanup=0",
+                    fallback_status,
+                    fallback_win32,
+                    auth_service);
+                return enumerate_registered_callouts(request,
+                    WFP_ENUM_FALLBACK_REASON_MISSING_FUNCTIONS,
+                    fallback_status,
+                    fallback_win32,
+                    auth_service);
+            }
         }
 
         if (!net_capture::_FwpmCalloutCreateEnumHandle0 ||
@@ -4418,23 +5278,73 @@ namespace net_wfp_enum {
             !net_capture::_FwpmFilterDestroyEnumHandle0 ||
             !net_capture::_FwpmFilterEnum0 ||
             !net_capture::_FwpmFreeMemory0) {
-            return enumerate_registered_callouts(request);
+            NTSTATUS fallback_status = STATUS_PROCEDURE_NOT_FOUND;
+            ULONG fallback_win32 = net_capture::status_to_win32(fallback_status);
+            WW_LOG("net_wfp_enum::enumerate_wfp_callouts source=runtime_registered_fallback degraded=1 reason=missing_bfe_enum_functions status=0x%08X win32=%lu auth_service=0x%08X filter_cleanup=0",
+                fallback_status,
+                fallback_win32,
+                auth_service);
+            return enumerate_registered_callouts(request,
+                WFP_ENUM_FALLBACK_REASON_MISSING_FUNCTIONS,
+                fallback_status,
+                fallback_win32,
+                auth_service);
         }
 
         HANDLE engine = nullptr;
-        NTSTATUS status = net_capture::_FwpmEngineOpen0(nullptr, 0, nullptr, nullptr, &engine);
-        if (!NT_SUCCESS(status) || !engine)
-            return enumerate_registered_callouts(request);
+        NTSTATUS status = net_capture::_FwpmEngineOpen0(nullptr, auth_service, nullptr, nullptr, &engine);
+        NTSTATUS engine_open_status = status;
+        ULONG engine_open_win32 = net_capture::status_to_win32(status);
+        WW_LOG("net_wfp_enum::enumerate_wfp_callouts engine_open auth_service=0x%08X status=0x%08X win32=%lu engine=%p",
+            auth_service,
+            engine_open_status,
+            engine_open_win32,
+            engine);
+        if (!NT_SUCCESS(status) || !engine) {
+            WW_LOG("net_wfp_enum::enumerate_wfp_callouts source=runtime_registered_fallback degraded=1 reason=engine_open_failed status=0x%08X win32=%lu auth_service=0x%08X engine=%p filter_cleanup=0",
+                engine_open_status,
+                engine_open_win32,
+                auth_service,
+                engine);
+            return enumerate_registered_callouts(request,
+                WFP_ENUM_FALLBACK_REASON_ENGINE_OPEN_FAILED,
+                engine_open_status,
+                engine_open_win32,
+                auth_service);
+        }
 
         UINT32 total_filled = 0;
+        UINT32 bfe_callouts_filled = 0;
+        UINT32 bfe_filters_filled = 0;
+        UINT32 bfe_callout_key_matches = 0;
+        UINT32 bfe_filter_key_matches = 0;
+        UINT32 bfe_filter_block_actions = 0;
+        UINT32 bfe_filters_with_app = 0;
+        UINT32 bfe_filter_details_logged = 0;
+        UINT32 bfe_filter_details_suppressed = 0;
+        UINT32 classify_addresses_available = 0;
+        UINT32 aida_callback_matches = 0;
+        NTSTATUS callout_enum_status = STATUS_SUCCESS;
+        NTSTATUS filter_enum_status = STATUS_SUCCESS;
         BOOLEAN has_filter = (request->filter_module[0] != 0);
         HANDLE callout_enum = nullptr;
         status = net_capture::_FwpmCalloutCreateEnumHandle0(engine, nullptr, &callout_enum);
+        callout_enum_status = status;
+        WW_LOG("net_wfp_enum::enumerate_wfp_callouts callout_enum_create status=0x%08X win32=%lu handle=%p",
+            status,
+            net_capture::status_to_win32(status),
+            callout_enum);
         if (NT_SUCCESS(status) && callout_enum) {
             for (;;) {
                 FWPM_CALLOUT0_COMPAT** entries = nullptr;
                 UINT32 returned = 0;
                 status = net_capture::_FwpmCalloutEnum0(engine, callout_enum, 64, &entries, &returned);
+                callout_enum_status = status;
+                WW_LOG("net_wfp_enum::enumerate_wfp_callouts callout_enum status=0x%08X win32=%lu returned=%u total_before=%u",
+                    status,
+                    net_capture::status_to_win32(status),
+                    returned,
+                    bfe_callouts_filled);
                 if (!NT_SUCCESS(status) || returned == 0) {
                     if (entries) net_capture::_FwpmFreeMemory0((VOID**)&entries);
                     break;
@@ -4451,13 +5361,15 @@ namespace net_wfp_enum {
                     candidate.applicable_layer = c->applicableLayer;
                     candidate.flags = c->flags;
                     candidate.provider_present = c->providerKey ? 1u : 0u;
-                    candidate.aida_match_reason = net_capture::is_aida_callout_key(&c->calloutKey) ? WFP_AIDA_MATCH_ACTION_CALLOUT : 0;
-                    copy_display_name(&c->displayData, candidate.owning_module, sizeof(candidate.owning_module));
+                    candidate.aida_match_reason = net_capture::callout_match_reason(c);
+                    if (candidate.aida_match_reason != 0) ++bfe_callout_key_matches;
+                    copy_bfe_identity_preview(&c->displayData, nullptr, candidate.owning_module, sizeof(candidate.owning_module));
                     if (has_filter && !text_contains_ci(candidate.owning_module, request->filter_module))
                         continue;
 
                     strong::kmemcpy(&request->entries[total_filled], &candidate, sizeof(candidate));
                     ++total_filled;
+                    ++bfe_callouts_filled;
                 }
                 net_capture::_FwpmFreeMemory0((VOID**)&entries);
             }
@@ -4466,11 +5378,22 @@ namespace net_wfp_enum {
 
         HANDLE filter_enum = nullptr;
         status = net_capture::_FwpmFilterCreateEnumHandle0(engine, nullptr, &filter_enum);
+        filter_enum_status = status;
+        WW_LOG("net_wfp_enum::enumerate_wfp_callouts filter_enum_create status=0x%08X win32=%lu handle=%p",
+            status,
+            net_capture::status_to_win32(status),
+            filter_enum);
         if (NT_SUCCESS(status) && filter_enum) {
             for (;;) {
                 FWPM_FILTER0_COMPAT** entries = nullptr;
                 UINT32 returned = 0;
                 status = net_capture::_FwpmFilterEnum0(engine, filter_enum, 64, &entries, &returned);
+                filter_enum_status = status;
+                WW_LOG("net_wfp_enum::enumerate_wfp_callouts filter_enum status=0x%08X win32=%lu returned=%u total_before=%u",
+                    status,
+                    net_capture::status_to_win32(status),
+                    returned,
+                    bfe_filters_filled);
                 if (!NT_SUCCESS(status) || returned == 0) {
                     if (entries) net_capture::_FwpmFreeMemory0((VOID**)&entries);
                     break;
@@ -4481,6 +5404,8 @@ namespace net_wfp_enum {
                     if (!f) continue;
 
                     WFP_CALLOUT_ENTRY candidate = {};
+                    net_capture::WFP_APP_CONDITION_INFO app_info = {};
+                    net_capture::inspect_filter_app_condition(f, &app_info);
                     candidate.entry_type = WFP_ENTRY_TYPE_FILTER;
                     candidate.filter_id = f->filterId;
                     candidate.flags = f->flags;
@@ -4490,23 +5415,76 @@ namespace net_wfp_enum {
                     candidate.callout_key = f->action.calloutKey;
                     candidate.provider_present = f->providerKey ? 1u : 0u;
                     candidate.aida_match_reason = net_capture::filter_match_reason(f);
-                    copy_display_name(&f->displayData, candidate.owning_module, sizeof(candidate.owning_module));
+                    if (candidate.aida_match_reason != 0) ++bfe_filter_key_matches;
+                    if (candidate.action_type == (UINT32)FWP_ACTION_BLOCK_) ++bfe_filter_block_actions;
+                    if (app_info.found != 0) ++bfe_filters_with_app;
+                    copy_bfe_identity_preview(&f->displayData, &app_info, candidate.owning_module, sizeof(candidate.owning_module));
+                    if ((candidate.aida_match_reason != 0 || candidate.action_type == (UINT32)FWP_ACTION_BLOCK_ || app_info.found != 0) &&
+                        bfe_filter_details_logged < 96) {
+                        ++bfe_filter_details_logged;
+                        WW_LOG("net_wfp_enum::filter_detail id=%llu action=0x%08X flags=0x%08X provider_present=%u conditions=%u app_found=%u app_index=%u app_type=%u app_blob=%u app_original=%u app_aida=%u reason=0x%08X preview='%s'",
+                            (unsigned long long)f->filterId,
+                            candidate.action_type,
+                            candidate.flags,
+                            candidate.provider_present,
+                            f->numFilterConditions,
+                            app_info.found,
+                            app_info.index,
+                            app_info.value_type,
+                            app_info.blob_size,
+                            app_info.original_app_id,
+                            app_info.aida_candidate,
+                            candidate.aida_match_reason,
+                            candidate.owning_module);
+                    } else if (candidate.aida_match_reason != 0 || candidate.action_type == (UINT32)FWP_ACTION_BLOCK_ || app_info.found != 0) {
+                        ++bfe_filter_details_suppressed;
+                    }
                     if (has_filter && !text_contains_ci(candidate.owning_module, request->filter_module))
                         continue;
 
                     strong::kmemcpy(&request->entries[total_filled], &candidate, sizeof(candidate));
                     ++total_filled;
+                    ++bfe_filters_filled;
                 }
                 net_capture::_FwpmFreeMemory0((VOID**)&entries);
             }
             net_capture::_FwpmFilterDestroyEnumHandle0(engine, filter_enum);
         }
 
-        net_capture::_FwpmEngineClose0(engine);
+        NTSTATUS close_status = net_capture::_FwpmEngineClose0(engine);
 
         request->callout_count = total_filled;
-        if (total_filled == 0)
-            return enumerate_registered_callouts(request);
+        WW_LOG("net_wfp_enum::enumerate_wfp_callouts source=bfe_full degraded=0 auth_service=0x%08X engine_open_status=0x%08X engine_open_win32=%lu callout_enum_status=0x%08X filter_enum_status=0x%08X engine_close_status=0x%08X total=%u callouts=%u filters=%u callout_key_matches=%u filter_key_matches=%u block_filters=%u filters_with_app=%u detail_logged=%u detail_suppressed=%u classify_addresses_available=%u aida_callback_matches=%u filter_module_present=%u filter_cleanup=0",
+            auth_service,
+            engine_open_status,
+            engine_open_win32,
+            callout_enum_status,
+            filter_enum_status,
+            close_status,
+            total_filled,
+            bfe_callouts_filled,
+            bfe_filters_filled,
+            bfe_callout_key_matches,
+            bfe_filter_key_matches,
+            bfe_filter_block_actions,
+            bfe_filters_with_app,
+            bfe_filter_details_logged,
+            bfe_filter_details_suppressed,
+            classify_addresses_available,
+            aida_callback_matches,
+            has_filter ? 1u : 0u);
+        if (total_filled == 0) {
+            ULONG fallback_win32 = net_capture::status_to_win32(STATUS_NOT_FOUND);
+            WW_LOG("net_wfp_enum::enumerate_wfp_callouts source=runtime_registered_fallback degraded=1 reason=bfe_returned_zero_entries status=0x%08X win32=%lu auth_service=0x%08X filter_cleanup=0",
+                STATUS_NOT_FOUND,
+                fallback_win32,
+                auth_service);
+            return enumerate_registered_callouts(request,
+                WFP_ENUM_FALLBACK_REASON_BFE_ZERO_ENTRIES,
+                STATUS_NOT_FOUND,
+                fallback_win32,
+                auth_service);
+        }
         return STATUS_SUCCESS;
     }
 }
@@ -5613,20 +6591,39 @@ namespace net_inject {
         NET_DBG("inject_packet: src=%u.%u.%u.%u dst=%u.%u.%u.%u",
                 request->src_addr[0], request->src_addr[1], request->src_addr[2], request->src_addr[3],
                 request->dst_addr[0], request->dst_addr[1], request->dst_addr[2], request->dst_addr[3]);
+        WW_LOG("net_inject::packet ENTER direction=%u protocol=%u af=%u src=%u.%u.%u.%u:%u dst=%u.%u.%u.%u:%u payload=%u flags=0x%08X irql=%u",
+            request->direction,
+            request->protocol,
+            request->address_family,
+            request->src_addr[0], request->src_addr[1], request->src_addr[2], request->src_addr[3], request->src_port,
+            request->dst_addr[0], request->dst_addr[1], request->dst_addr[2], request->dst_addr[3], request->dst_port,
+            request->payload_size,
+            request->tcp_flags,
+            (UINT32)KeGetCurrentIrql());
 
         if (!resolve_inject_functions()) {
             NET_ERR("inject_packet: resolve_inject_functions FAILED");
+            WW_LOG("net_inject::packet ABORT step=resolve_functions status=0x%08X win32=%lu",
+                STATUS_NOT_SUPPORTED,
+                net_capture::status_to_win32(STATUS_NOT_SUPPORTED));
             return STATUS_NOT_SUPPORTED;
         }
 
         if (!g_inject_nbl_pool && KeGetCurrentIrql() != PASSIVE_LEVEL) {
             NET_ERR("inject_packet: NBL pool unavailable at IRQL=%u; injection runtime was not prewarmed",
                     (UINT32)KeGetCurrentIrql());
+            WW_LOG("net_inject::packet ABORT step=nbl_pool_unavailable_irql irql=%u status=0x%08X win32=%lu",
+                (UINT32)KeGetCurrentIrql(),
+                STATUS_INSUFFICIENT_RESOURCES,
+                net_capture::status_to_win32(STATUS_INSUFFICIENT_RESOURCES));
             return STATUS_INSUFFICIENT_RESOURCES;
         }
 
         if (!ensure_inject_nbl_pool()) {
             NET_ERR("inject_packet: ensure_inject_nbl_pool FAILED");
+            WW_LOG("net_inject::packet ABORT step=ensure_nbl_pool status=0x%08X win32=%lu",
+                STATUS_INSUFFICIENT_RESOURCES,
+                net_capture::status_to_win32(STATUS_INSUFFICIENT_RESOURCES));
             return STATUS_INSUFFICIENT_RESOURCES;
         }
 
@@ -5634,19 +6631,39 @@ namespace net_inject {
         BOOLEAN have_network = (g_inject_handle_net_v4 != nullptr && (_FwpsInjectNetSend0 || _FwpsInjectNetRecv0));
         NET_DBG("inject_packet: have_transport=%d have_network=%d handle_v4=%p handle_net_v4=%p",
                 (int)have_transport, (int)have_network, g_inject_handle_v4, g_inject_handle_net_v4);
-        if (!have_transport && !have_network)
+        if (!have_transport && !have_network) {
+            WW_LOG("net_inject::packet ABORT step=no_inject_path have_transport=0 have_network=0 status=0x%08X win32=%lu",
+                STATUS_NOT_SUPPORTED,
+                net_capture::status_to_win32(STATUS_NOT_SUPPORTED));
             return STATUS_NOT_SUPPORTED;
+        }
 
-        if (request->payload_size > INJECT_MAX_PAYLOAD)
+        if (request->payload_size > INJECT_MAX_PAYLOAD) {
+            WW_LOG("net_inject::packet ABORT step=payload_too_large payload=%u max=%u status=0x%08X win32=%lu",
+                request->payload_size,
+                INJECT_MAX_PAYLOAD,
+                STATUS_INVALID_PARAMETER,
+                net_capture::status_to_win32(STATUS_INVALID_PARAMETER));
             return STATUS_INVALID_PARAMETER;
+        }
         if (request->payload_size == 0 &&
-            request->protocol != IPPROTO_TCP && request->protocol != IPPROTO_UDP)
+            request->protocol != IPPROTO_TCP && request->protocol != IPPROTO_UDP) {
+            WW_LOG("net_inject::packet ABORT step=empty_payload_bad_protocol protocol=%u status=0x%08X win32=%lu",
+                request->protocol,
+                STATUS_INVALID_PARAMETER,
+                net_capture::status_to_win32(STATUS_INVALID_PARAMETER));
             return STATUS_INVALID_PARAMETER;
+        }
 
         UINT8 packet_buf[INJECT_MAX_PAYLOAD + 32] = {};
         UINT32 packet_size = build_transport_packet(request, packet_buf, sizeof(packet_buf));
         if (packet_size == 0) {
             NET_ERR("inject_packet: build_transport_packet returned 0");
+            WW_LOG("net_inject::packet ABORT step=build_transport_packet payload=%u flags=0x%08X status=0x%08X win32=%lu",
+                request->payload_size,
+                request->tcp_flags,
+                STATUS_INVALID_PARAMETER,
+                net_capture::status_to_win32(STATUS_INVALID_PARAMETER));
             return STATUS_INVALID_PARAMETER;
         }
 
@@ -5659,6 +6676,13 @@ namespace net_inject {
         UINT64 endpoint_handle = lookup_endpoint_handle_by_port(request->protocol, request->src_port);
         NET_DBG("inject_packet: packet_size=%u loopback=%d endpoint_handle=0x%llx",
                 packet_size, (int)loopback_v4, endpoint_handle);
+        WW_LOG("net_inject::packet prepared transport_size=%u loopback=%u recv_if=%u endpoint=0x%llX have_transport=%u have_network=%u",
+            packet_size,
+            loopback_v4 ? 1u : 0u,
+            recv_interface_index,
+            (unsigned long long)endpoint_handle,
+            have_transport ? 1u : 0u,
+            have_network ? 1u : 0u);
 
         NTSTATUS st = STATUS_UNSUCCESSFUL;
         BOOLEAN transport_attempted = FALSE;
@@ -5697,6 +6721,12 @@ namespace net_inject {
 
             transport_attempted = TRUE;
             NET_DBG("inject_packet: trying transport path, dir=%u", request->direction);
+            WW_LOG("net_inject::packet transport_attempt direction=%u endpoint=0x%llX packet_size=%u loopback=%u recv_if=%u",
+                request->direction,
+                (unsigned long long)endpoint_handle,
+                packet_size,
+                loopback_v4 ? 1u : 0u,
+                recv_interface_index);
 
             if (request->direction == 1) {
                 FWPS_TRANSPORT_SEND_PARAMS0_COMPAT sendArgs = {};
@@ -5705,16 +6735,31 @@ namespace net_inject {
                 st = _FwpsInjectSend0(g_inject_handle_v4, nullptr, endpoint_handle, 0,
                     &sendArgs, (UINT16)request->address_family, 0, nbl,
                     (PVOID)inject_completion, completion);
+                WW_LOG("net_inject::packet transport_send status=0x%08X win32=%lu endpoint=0x%llX packet_size=%u",
+                    st,
+                    net_capture::status_to_win32(st),
+                    (unsigned long long)endpoint_handle,
+                    packet_size);
 
                 if (!NT_SUCCESS(st) && _FwpsInjectRecv0 && loopback_v4) {
                     st = _FwpsInjectRecv0(g_inject_handle_v4, nullptr, nullptr, 0,
                         (UINT16)request->address_family, 0, recv_interface_index, 0, nbl,
                         (PVOID)inject_completion, completion);
+                    WW_LOG("net_inject::packet transport_recv_fallback status=0x%08X win32=%lu recv_if=%u packet_size=%u",
+                        st,
+                        net_capture::status_to_win32(st),
+                        recv_interface_index,
+                        packet_size);
                 }
             } else {
                 st = _FwpsInjectRecv0(g_inject_handle_v4, nullptr, nullptr, 0,
                     (UINT16)request->address_family, 0, recv_interface_index, 0, nbl,
                     (PVOID)inject_completion, completion);
+                WW_LOG("net_inject::packet transport_recv status=0x%08X win32=%lu recv_if=%u packet_size=%u",
+                    st,
+                    net_capture::status_to_win32(st),
+                    recv_interface_index,
+                    packet_size);
 
                 if (!NT_SUCCESS(st) && _FwpsInjectSend0 && loopback_v4) {
                     FWPS_TRANSPORT_SEND_PARAMS0_COMPAT sendArgs = {};
@@ -5722,16 +6767,29 @@ namespace net_inject {
                     st = _FwpsInjectSend0(g_inject_handle_v4, nullptr, endpoint_handle, 0,
                         &sendArgs, (UINT16)request->address_family, 0, nbl,
                         (PVOID)inject_completion, completion);
+                    WW_LOG("net_inject::packet transport_send_fallback status=0x%08X win32=%lu endpoint=0x%llX packet_size=%u",
+                        st,
+                        net_capture::status_to_win32(st),
+                        (unsigned long long)endpoint_handle,
+                        packet_size);
                 }
             }
 
             if (NT_SUCCESS(st)) {
                 NET_DBG("inject_packet: transport inject SUCCESS st=0x%08x", st);
+                WW_LOG("net_inject::packet SUCCESS path=transport status=0x%08X win32=%lu packet_size=%u",
+                    st,
+                    net_capture::status_to_win32(st),
+                    packet_size);
                 request->status = 0;
                 return STATUS_SUCCESS;
             }
 
             NET_ERR("inject_packet: transport inject FAILED 0x%08x", st);
+            WW_LOG("net_inject::packet transport_failed status=0x%08X win32=%lu fallback_network=%u",
+                st,
+                net_capture::status_to_win32(st),
+                have_network ? 1u : 0u);
             _FwpsFreeNBL0(nbl);
             IoFreeMdl(mdl);
             ExFreePoolWithTag(completion, 'jcNW');
@@ -5740,6 +6798,10 @@ namespace net_inject {
 
         if (!have_network) {
             NET_ERR("inject_packet: no network inject path available, returning 0x%08x", st);
+            WW_LOG("net_inject::packet ABORT step=no_network_after_transport status=0x%08X win32=%lu transport_attempted=%u",
+                st,
+                net_capture::status_to_win32(st),
+                transport_attempted ? 1u : 0u);
             return st;
         }
 
@@ -5747,6 +6809,10 @@ namespace net_inject {
         UINT32 ip_packet_size = build_ip_wrapped_packet(request, packet_buf, packet_size,
             ip_packet_buf, sizeof(ip_packet_buf));
         if (ip_packet_size == 0) {
+            WW_LOG("net_inject::packet ABORT step=build_ip_wrapped_packet transport_size=%u status=0x%08X win32=%lu",
+                packet_size,
+                STATUS_INVALID_PARAMETER,
+                net_capture::status_to_win32(STATUS_INVALID_PARAMETER));
             return STATUS_INVALID_PARAMETER;
         }
 
@@ -5785,21 +6851,43 @@ namespace net_inject {
             NET_DBG("inject_packet: trying network send path ip_size=%u", ip_packet_size);
             st = _FwpsInjectNetSend0(g_inject_handle_net_v4, nullptr, 0, 0,
                 net_nbl, (PVOID)inject_completion, net_completion);
+            WW_LOG("net_inject::packet network_send status=0x%08X win32=%lu ip_size=%u compartment=0",
+                st,
+                net_capture::status_to_win32(st),
+                ip_packet_size);
         } else if (_FwpsInjectNetRecv0) {
             NET_DBG("inject_packet: trying network recv path ip_size=%u if_idx=%u", ip_packet_size, recv_interface_index);
             st = _FwpsInjectNetRecv0(g_inject_handle_net_v4, nullptr, 0, 0,
                 recv_interface_index, 0, net_nbl,
                 (PVOID)inject_completion, net_completion);
+            WW_LOG("net_inject::packet network_recv status=0x%08X win32=%lu ip_size=%u recv_if=%u compartment=0",
+                st,
+                net_capture::status_to_win32(st),
+                ip_packet_size,
+                recv_interface_index);
         } else if (_FwpsInjectNetSend0) {
             NET_DBG("inject_packet: fallback network send path");
             st = _FwpsInjectNetSend0(g_inject_handle_net_v4, nullptr, 0, 0,
                 net_nbl, (PVOID)inject_completion, net_completion);
+            WW_LOG("net_inject::packet network_send_fallback status=0x%08X win32=%lu ip_size=%u compartment=0",
+                st,
+                net_capture::status_to_win32(st),
+                ip_packet_size);
         } else {
             st = STATUS_NOT_SUPPORTED;
+            WW_LOG("net_inject::packet network_no_callable status=0x%08X win32=%lu ip_size=%u",
+                st,
+                net_capture::status_to_win32(st),
+                ip_packet_size);
         }
 
         if (!NT_SUCCESS(st)) {
             NET_ERR("inject_packet: network inject FAILED 0x%08x", st);
+            WW_LOG("net_inject::packet FAILED path=network status=0x%08X win32=%lu ip_size=%u transport_attempted=%u",
+                st,
+                net_capture::status_to_win32(st),
+                ip_packet_size,
+                transport_attempted ? 1u : 0u);
             _FwpsFreeNBL0(net_nbl);
             IoFreeMdl(net_mdl);
             ExFreePoolWithTag(net_completion, 'jcNW');
@@ -5808,6 +6896,11 @@ namespace net_inject {
         }
 
         NET_DBG("inject_packet: network inject SUCCESS");
+        WW_LOG("net_inject::packet SUCCESS path=network status=0x%08X win32=%lu ip_size=%u transport_attempted=%u",
+            st,
+            net_capture::status_to_win32(st),
+            ip_packet_size,
+            transport_attempted ? 1u : 0u);
         request->status = 0;
         return STATUS_SUCCESS;
     }
@@ -6389,27 +7482,64 @@ namespace net_mod {
     inline ACTIVE_MOD_RULE g_mod_rules[MOD_MAX_RULES] = {};
     inline volatile LONG g_next_mod_id = 1;
     inline volatile LONG g_active_mod_count = 0;
+    inline volatile LONG64 g_mod_generation = 0;
 
     BOOLEAN has_active_rules() {
         return (g_active_mod_count != 0);
     }
 
+    LONG active_rule_count() {
+        return _InterlockedCompareExchange(&g_active_mod_count, 0, 0);
+    }
+
+    LONG64 current_generation() {
+        return _InterlockedCompareExchange64(&g_mod_generation, 0, 0);
+    }
 
     BOOLEAN apply_modifications(UINT8* data, UINT32* data_len, UINT32 max_len,
                                 UINT32 direction, UINT32 protocol,
                                 UINT32 port, UINT32 pid) {
-        if (g_active_mod_count == 0) return FALSE;
+        if (!data || !data_len) {
+            WW_LOG("net_mod::apply DROP reason=invalid_buffer irql=%u cpu=%lu direction=%u protocol=%u port=%u pid=%u active_rules=%ld generation=%lld",
+                (UINT32)KeGetCurrentIrql(),
+                KeGetCurrentProcessorNumber(),
+                direction,
+                protocol,
+                port,
+                pid,
+                active_rule_count(),
+                current_generation());
+            return FALSE;
+        }
+        LONG active_start = active_rule_count();
+        if (active_start == 0) return FALSE;
+        UINT64 start_tsc = __rdtsc();
+        LONG64 generation = current_generation();
+        UINT32 len_before = *data_len;
+        UINT32 skip_inactive = 0;
+        UINT32 skip_direction = 0;
+        UINT32 skip_protocol = 0;
+        UINT32 skip_port = 0;
+        UINT32 skip_pid = 0;
+        UINT32 skip_pattern_bounds = 0;
+        UINT32 skip_too_large = 0;
+        UINT32 no_match = 0;
+        UINT32 matched_rules = 0;
+        UINT32 last_rule_id = 0;
+        LONG last_match_before = 0;
+        LONG last_match_after = 0;
         BOOLEAN modified = FALSE;
 
         for (UINT32 r = 0; r < MOD_MAX_RULES; r++) {
-            if (g_mod_rules[r].active != 1) continue;
+            if (g_mod_rules[r].active != 1) { ++skip_inactive; continue; }
             ACTIVE_MOD_RULE* rule = &g_mod_rules[r];
-            if (rule->direction != 2 && rule->direction != direction) continue;
-            if (rule->protocol != 0 && rule->protocol != protocol) continue;
-            if (rule->port != 0 && rule->port != port) continue;
-            if (rule->pid != 0 && rule->pid != pid) continue;
-            if (rule->pattern_size == 0 || rule->pattern_size > *data_len) continue;
+            if (rule->direction != 2 && rule->direction != direction) { ++skip_direction; continue; }
+            if (rule->protocol != 0 && rule->protocol != protocol) { ++skip_protocol; continue; }
+            if (rule->port != 0 && rule->port != port) { ++skip_port; continue; }
+            if (rule->pid != 0 && rule->pid != pid) { ++skip_pid; continue; }
+            if (rule->pattern_size == 0 || rule->pattern_size > *data_len) { ++skip_pattern_bounds; continue; }
 
+            BOOLEAN rule_matched = FALSE;
 
             for (UINT32 i = 0; i + rule->pattern_size <= *data_len; i++) {
                 BOOLEAN match = TRUE;
@@ -6417,10 +7547,29 @@ namespace net_mod {
                     if (data[i + j] != rule->pattern[j]) { match = FALSE; break; }
                 }
                 if (match) {
+                    rule_matched = TRUE;
 
                     INT32 diff = (INT32)rule->replace_size - (INT32)rule->pattern_size;
                     UINT32 new_len = *data_len + diff;
-                    if (new_len > max_len) continue;
+                    if (new_len > max_len) {
+                        ++skip_too_large;
+                        WW_LOG("net_mod::apply SKIP reason=max_len rule_id=%u generation=%lld offset=%u len_before=%u pattern=%u replacement=%u new_len=%u max_len=%u direction=%u protocol=%u port=%u pid=%u irql=%u cpu=%lu",
+                            rule->rule_id,
+                            generation,
+                            i,
+                            *data_len,
+                            rule->pattern_size,
+                            rule->replace_size,
+                            new_len,
+                            max_len,
+                            direction,
+                            protocol,
+                            port,
+                            pid,
+                            (UINT32)KeGetCurrentIrql(),
+                            KeGetCurrentProcessorNumber());
+                        continue;
+                    }
 
                     if (diff != 0) {
 
@@ -6437,12 +7586,64 @@ namespace net_mod {
                     }
                     strong::kmemcpy(&data[i], rule->replacement, rule->replace_size);
                     *data_len = new_len;
-                    _InterlockedIncrement(&rule->match_count);
+                    LONG before = _InterlockedCompareExchange(&rule->match_count, 0, 0);
+                    LONG after = _InterlockedIncrement(&rule->match_count);
+                    ++matched_rules;
+                    last_rule_id = rule->rule_id;
+                    last_match_before = before;
+                    last_match_after = after;
+                    WW_LOG("net_mod::apply MATCH rule_id=%u generation=%lld slot=%u offset=%u match_before=%ld match_after=%ld direction=%u protocol=%u port=%u pid=%u len_before=%u len_after=%u pattern=%u replacement=%u diff=%ld irql=%u cpu=%lu active_rules_start=%ld",
+                        rule->rule_id,
+                        generation,
+                        r,
+                        i,
+                        before,
+                        after,
+                        direction,
+                        protocol,
+                        port,
+                        pid,
+                        len_before,
+                        *data_len,
+                        rule->pattern_size,
+                        rule->replace_size,
+                        diff,
+                        (UINT32)KeGetCurrentIrql(),
+                        KeGetCurrentProcessorNumber(),
+                        active_start);
                     modified = TRUE;
                     if (rule->replace_size > 0) i += rule->replace_size - 1;
                 }
             }
+            if (!rule_matched) ++no_match;
         }
+        WW_LOG("net_mod::apply EXIT modified=%u matched_rules=%u last_rule_id=%u generation=%lld last_match_before=%ld last_match_after=%ld direction=%u protocol=%u port=%u pid=%u len_before=%u len_after=%u max_len=%u active_start=%ld active_end=%ld skip_inactive=%u skip_direction=%u skip_protocol=%u skip_port=%u skip_pid=%u skip_pattern=%u skip_too_large=%u no_match=%u elapsed_tsc=%llu irql=%u cpu=%lu",
+            modified ? 1u : 0u,
+            matched_rules,
+            last_rule_id,
+            generation,
+            last_match_before,
+            last_match_after,
+            direction,
+            protocol,
+            port,
+            pid,
+            len_before,
+            *data_len,
+            max_len,
+            active_start,
+            active_rule_count(),
+            skip_inactive,
+            skip_direction,
+            skip_protocol,
+            skip_port,
+            skip_pid,
+            skip_pattern_bounds,
+            skip_too_large,
+            no_match,
+            (unsigned long long)(__rdtsc() - start_tsc),
+            (UINT32)KeGetCurrentIrql(),
+            KeGetCurrentProcessorNumber());
         return modified;
     }
 
@@ -6453,6 +7654,22 @@ namespace net_mod {
                 request->operation, request->rule_id, request->direction,
                 request->protocol, request->port, request->pid,
                 request->pattern_size, request->replace_size);
+        LONG active_before = active_rule_count();
+        LONG64 generation_before = current_generation();
+        UINT64 start_tsc = __rdtsc();
+        WW_LOG("net_mod::rule ENTER op=%u rule_id=%u direction=%u protocol=%u port=%u pid=%u pattern_size=%u replace_size=%u active_before=%ld generation_before=%lld irql=%u cpu=%lu",
+            request->operation,
+            request->rule_id,
+            request->direction,
+            request->protocol,
+            request->port,
+            request->pid,
+            request->pattern_size,
+            request->replace_size,
+            active_before,
+            generation_before,
+            (UINT32)KeGetCurrentIrql(),
+            KeGetCurrentProcessorNumber());
 
         switch (request->operation) {
         case 0: {
@@ -6474,13 +7691,38 @@ namespace net_mod {
                     KeMemoryBarrier();
                     _InterlockedExchange(&g_mod_rules[i].active, 1);
                     _InterlockedIncrement(&g_active_mod_count);
+                    LONG64 generation_after = _InterlockedIncrement64(&g_mod_generation);
                     request->rule_id = id;
                     request->active = 1;
                     NET_DBG("handle_mod_rule: ADDED rule slot=%u id=%u dir=%u proto=%u port=%u",
                             i, id, request->direction, request->protocol, request->port);
+                    WW_LOG("net_mod::rule ADD slot=%u rule_id=%u direction=%u protocol=%u port=%u pid=%u pattern_size=%u replace_size=%u active_before=%ld active_after=%ld generation=%lld status=0x%08X elapsed_tsc=%llu irql=%u cpu=%lu",
+                        i,
+                        id,
+                        request->direction,
+                        request->protocol,
+                        request->port,
+                        request->pid,
+                        request->pattern_size,
+                        request->replace_size,
+                        active_before,
+                        active_rule_count(),
+                        generation_after,
+                        STATUS_SUCCESS,
+                        (unsigned long long)(__rdtsc() - start_tsc),
+                        (UINT32)KeGetCurrentIrql(),
+                        KeGetCurrentProcessorNumber());
                     return STATUS_SUCCESS;
                 }
             }
+            WW_LOG("net_mod::rule ADD_FAIL reason=no_slot active_before=%ld active_after=%ld generation=%lld status=0x%08X elapsed_tsc=%llu irql=%u cpu=%lu",
+                active_before,
+                active_rule_count(),
+                current_generation(),
+                STATUS_INSUFFICIENT_RESOURCES,
+                (unsigned long long)(__rdtsc() - start_tsc),
+                (UINT32)KeGetCurrentIrql(),
+                KeGetCurrentProcessorNumber());
             return STATUS_INSUFFICIENT_RESOURCES;
         }
         case 1: {
@@ -6488,28 +7730,72 @@ namespace net_mod {
                 if (g_mod_rules[i].active == 1 && g_mod_rules[i].rule_id == request->rule_id) {
                     _InterlockedExchange(&g_mod_rules[i].active, 0);
                     _InterlockedDecrement(&g_active_mod_count);
+                    LONG64 generation_after = _InterlockedIncrement64(&g_mod_generation);
                     request->active = 0;
+                    WW_LOG("net_mod::rule REMOVE slot=%u rule_id=%u active_before=%ld active_after=%ld generation=%lld status=0x%08X elapsed_tsc=%llu irql=%u cpu=%lu",
+                        i,
+                        request->rule_id,
+                        active_before,
+                        active_rule_count(),
+                        generation_after,
+                        STATUS_SUCCESS,
+                        (unsigned long long)(__rdtsc() - start_tsc),
+                        (UINT32)KeGetCurrentIrql(),
+                        KeGetCurrentProcessorNumber());
                     return STATUS_SUCCESS;
                 }
             }
+            WW_LOG("net_mod::rule REMOVE_FAIL rule_id=%u reason=not_found active_before=%ld active_after=%ld generation=%lld status=0x%08X elapsed_tsc=%llu irql=%u cpu=%lu",
+                request->rule_id,
+                active_before,
+                active_rule_count(),
+                current_generation(),
+                STATUS_NOT_FOUND,
+                (unsigned long long)(__rdtsc() - start_tsc),
+                (UINT32)KeGetCurrentIrql(),
+                KeGetCurrentProcessorNumber());
             return STATUS_NOT_FOUND;
         }
         case 3: {
+            UINT32 cleared = 0;
             for (UINT32 i = 0; i < MOD_MAX_RULES; i++) {
                 if (g_mod_rules[i].active == 1) {
                     _InterlockedExchange(&g_mod_rules[i].active, 0);
                     _InterlockedDecrement(&g_active_mod_count);
+                    ++cleared;
                 }
             }
+            LONG64 generation_after = _InterlockedIncrement64(&g_mod_generation);
+            WW_LOG("net_mod::rule CLEAR cleared=%u active_before=%ld active_after=%ld generation=%lld status=0x%08X elapsed_tsc=%llu irql=%u cpu=%lu",
+                cleared,
+                active_before,
+                active_rule_count(),
+                generation_after,
+                STATUS_SUCCESS,
+                (unsigned long long)(__rdtsc() - start_tsc),
+                (UINT32)KeGetCurrentIrql(),
+                KeGetCurrentProcessorNumber());
             return STATUS_SUCCESS;
         }
         default:
+            WW_LOG("net_mod::rule INVALID op=%u active_before=%ld active_after=%ld generation=%lld status=0x%08X elapsed_tsc=%llu irql=%u cpu=%lu",
+                request->operation,
+                active_before,
+                active_rule_count(),
+                current_generation(),
+                STATUS_INVALID_PARAMETER,
+                (unsigned long long)(__rdtsc() - start_tsc),
+                (UINT32)KeGetCurrentIrql(),
+                KeGetCurrentProcessorNumber());
             return STATUS_INVALID_PARAMETER;
         }
     }
 
     NTSTATUS handle_mod_rule_list(p_packet_mod_rule_list request) {
         if (!request) return STATUS_INVALID_PARAMETER;
+        UINT64 start_tsc = __rdtsc();
+        LONG active_before = active_rule_count();
+        LONG64 generation = current_generation();
         request->rule_count = 0;
         for (UINT32 i = 0; i < MOD_MAX_RULES && request->rule_count < MOD_MAX_RULES; i++) {
             if (g_mod_rules[i].active == 1) {
@@ -6528,6 +7814,16 @@ namespace net_mod {
                 request->rule_count++;
             }
         }
+        WW_LOG("net_mod::rule LIST requested_op=%u returned=%u active_before=%ld active_after=%ld generation=%lld status=0x%08X elapsed_tsc=%llu irql=%u cpu=%lu",
+            request->operation,
+            request->rule_count,
+            active_before,
+            active_rule_count(),
+            generation,
+            STATUS_SUCCESS,
+            (unsigned long long)(__rdtsc() - start_tsc),
+            (UINT32)KeGetCurrentIrql(),
+            KeGetCurrentProcessorNumber());
         return STATUS_SUCCESS;
     }
 }
@@ -6573,7 +7869,11 @@ namespace net_redirect {
 
 
     BOOLEAN check_redirect(UINT32 protocol, UINT32 dst_port, const UINT8* dst_addr,
-                           UINT32 af, UINT32 pid, UINT32* new_port, UINT8* new_addr) {
+                           UINT32 af, UINT32 pid, UINT32* new_port, UINT8* new_addr,
+                           UINT32* matched_rule_id, LONG* match_before, LONG* match_after) {
+        if (matched_rule_id) *matched_rule_id = 0;
+        if (match_before) *match_before = 0;
+        if (match_after) *match_after = 0;
         if (g_active_redir_count == 0) return FALSE;
         for (UINT32 i = 0; i < REDIR_MAX_RULES; i++) {
             if (g_redir_rules[i].active != 1) continue;
@@ -6588,7 +7888,11 @@ namespace net_redirect {
             }
             *new_port = r->redirect_port;
             strong::kmemcpy(new_addr, r->redirect_addr, 16);
-            _InterlockedIncrement(&r->match_count);
+            LONG before = _InterlockedCompareExchange(&r->match_count, 0, 0);
+            LONG after = _InterlockedIncrement(&r->match_count);
+            if (matched_rule_id) *matched_rule_id = r->rule_id;
+            if (match_before) *match_before = before;
+            if (match_after) *match_after = after;
             return TRUE;
         }
         return FALSE;
@@ -6939,6 +8243,10 @@ namespace net_dpi {
     inline volatile LONG g_dpi_count = 0;
     inline KSPIN_LOCK g_dpi_lock;
     inline volatile LONG g_dpi_active = 0;
+    inline volatile LONG64 g_dpi_total_enqueued = 0;
+    inline volatile LONG64 g_dpi_total_overwritten = 0;
+    inline volatile LONG64 g_dpi_drop_inactive = 0;
+    inline volatile LONG64 g_dpi_drop_no_ring = 0;
 
     BOOLEAN is_active() {
         return (g_dpi_active != 0);
@@ -6968,14 +8276,32 @@ namespace net_dpi {
         strong::kmemset(g_dpi_ring, 0, (SIZE_T)DPI_RING_SIZE * sizeof(DPI_HEADER_INFO));
         KeReleaseSpinLock(&g_dpi_lock, irql);
 
+        _InterlockedExchange64(&g_dpi_total_enqueued, 0);
+        _InterlockedExchange64(&g_dpi_total_overwritten, 0);
+        _InterlockedExchange64(&g_dpi_drop_inactive, 0);
+        _InterlockedExchange64(&g_dpi_drop_no_ring, 0);
         _InterlockedExchange(&g_dpi_active, 1);
         NET_DBG("net_dpi::start active=1");
+        WW_LOG("net_dpi::start active=1 ring=%p capacity=%u head=%ld tail=%ld count=%ld",
+            g_dpi_ring,
+            DPI_RING_SIZE,
+            g_dpi_head,
+            g_dpi_tail,
+            g_dpi_count);
         return STATUS_SUCCESS;
     }
 
     void stop() {
         _InterlockedExchange(&g_dpi_active, 0);
         NET_DBG("net_dpi::stop count=%ld", g_dpi_count);
+        WW_LOG("net_dpi::stop active=0 ring_count=%ld head=%ld tail=%ld enqueued=%lld overwritten=%lld drop_inactive=%lld drop_no_ring=%lld",
+            g_dpi_count,
+            g_dpi_head,
+            g_dpi_tail,
+            _InterlockedCompareExchange64(&g_dpi_total_enqueued, 0, 0),
+            _InterlockedCompareExchange64(&g_dpi_total_overwritten, 0, 0),
+            _InterlockedCompareExchange64(&g_dpi_drop_inactive, 0, 0),
+            _InterlockedCompareExchange64(&g_dpi_drop_no_ring, 0, 0));
     }
 
     LONG entry_count() {
@@ -7096,7 +8422,40 @@ namespace net_dpi {
                         const UINT8* src_addr, const UINT8* dst_addr,
                         UINT32 af, UINT32 pid,
                         const UINT8* payload, UINT32 payload_len) {
-        if (!g_dpi_active || !g_dpi_ring) return;
+        if (!g_dpi_active) {
+            LONG64 drops = _InterlockedIncrement64(&g_dpi_drop_inactive);
+            WW_LOG("net_dpi::analyze DROP reason=inactive direction=%u protocol=%u pid=%u ports=%u->%u payload_len=%u drop_inactive=%lld",
+                direction,
+                protocol,
+                pid,
+                src_port,
+                dst_port,
+                payload_len,
+                drops);
+            return;
+        }
+        if (!g_dpi_ring) {
+            LONG64 drops = _InterlockedIncrement64(&g_dpi_drop_no_ring);
+            WW_LOG("net_dpi::analyze DROP reason=no_ring direction=%u protocol=%u pid=%u ports=%u->%u payload_len=%u drop_no_ring=%lld",
+                direction,
+                protocol,
+                pid,
+                src_port,
+                dst_port,
+                payload_len,
+                drops);
+            return;
+        }
+        WW_LOG("net_dpi::analyze ENTER direction=%u protocol=%u pid=%u af=%u tuple=%u.%u.%u.%u:%u->%u.%u.%u.%u:%u payload_len=%u active=%ld ring_count=%ld",
+            direction,
+            protocol,
+            pid,
+            af,
+            src_addr ? src_addr[0] : 0, src_addr ? src_addr[1] : 0, src_addr ? src_addr[2] : 0, src_addr ? src_addr[3] : 0, src_port,
+            dst_addr ? dst_addr[0] : 0, dst_addr ? dst_addr[1] : 0, dst_addr ? dst_addr[2] : 0, dst_addr ? dst_addr[3] : 0, dst_port,
+            payload_len,
+            g_dpi_active,
+            g_dpi_count);
 
         DPI_HEADER_INFO info;
         strong::kmemset(&info, 0, sizeof(info));
@@ -7140,6 +8499,25 @@ namespace net_dpi {
                 if ((src_port == 53 || dst_port == 53) && app_len > 0) {
                     info.is_dns = 1;
                 }
+                WW_LOG("net_dpi::analyze CLASSIFY protocol=6 pid=%u ports=%u->%u tcp_hdr_len=%u app_len=%u http=%u method=%u tls=%u tls_version=0x%04X dns=%u flags=0x%02X",
+                    pid,
+                    src_port,
+                    dst_port,
+                    tcp_hdr_len,
+                    app_len,
+                    info.is_http,
+                    info.http_method,
+                    info.is_tls,
+                    info.tls_version,
+                    info.is_dns,
+                    info.tcp_flags);
+            } else {
+                WW_LOG("net_dpi::analyze CLASSIFY protocol=6 pid=%u ports=%u->%u tcp_hdr_len=%u payload_len=%u reason=tcp_header_bounds",
+                    pid,
+                    src_port,
+                    dst_port,
+                    tcp_hdr_len,
+                    payload_len);
             }
         }
 
@@ -7160,17 +8538,57 @@ namespace net_dpi {
                 }
             }
         }
+        if (protocol == 17) {
+            WW_LOG("net_dpi::analyze CLASSIFY protocol=17 pid=%u ports=%u->%u payload_len=%u dns=%u tls=%u tls_version=0x%04X content_type=%u",
+                pid,
+                src_port,
+                dst_port,
+                payload_len,
+                info.is_dns,
+                info.is_tls,
+                info.tls_version,
+                info.tls_content_type);
+        }
 
         KIRQL irql;
         KeAcquireSpinLock(&g_dpi_lock, &irql);
+        LONG before_count = g_dpi_count;
+        LONG before_head = g_dpi_head;
+        LONG before_tail = g_dpi_tail;
+        BOOLEAN overwritten = FALSE;
         if (g_dpi_count >= DPI_RING_SIZE) {
             g_dpi_tail = (g_dpi_tail + 1) % DPI_RING_SIZE;
             g_dpi_count--;
+            overwritten = TRUE;
         }
         strong::kmemcpy(&g_dpi_ring[g_dpi_head], &info, sizeof(info));
         g_dpi_head = (g_dpi_head + 1) % DPI_RING_SIZE;
         g_dpi_count++;
+        LONG after_count = g_dpi_count;
+        LONG after_head = g_dpi_head;
+        LONG after_tail = g_dpi_tail;
         KeReleaseSpinLock(&g_dpi_lock, irql);
+        LONG64 enqueued = _InterlockedIncrement64(&g_dpi_total_enqueued);
+        LONG64 overwritten_total = overwritten ? _InterlockedIncrement64(&g_dpi_total_overwritten) :
+            _InterlockedCompareExchange64(&g_dpi_total_overwritten, 0, 0);
+        WW_LOG("net_dpi::analyze EXIT enqueued=%lld overwritten=%u overwritten_total=%lld count_before=%ld count_after=%ld head_before=%ld head_after=%ld tail_before=%ld tail_after=%ld pid=%u protocol=%u ports=%u->%u http=%u tls=%u dns=%u payload_len=%u",
+            enqueued,
+            overwritten ? 1u : 0u,
+            overwritten_total,
+            before_count,
+            after_count,
+            before_head,
+            after_head,
+            before_tail,
+            after_tail,
+            pid,
+            protocol,
+            src_port,
+            dst_port,
+            info.is_http,
+            info.is_tls,
+            info.is_dns,
+            payload_len);
     }
 
     NTSTATUS get_results(p_dpi_request request) {
@@ -7179,6 +8597,10 @@ namespace net_dpi {
             NTSTATUS st = init();
             if (!NT_SUCCESS(st)) return st;
         }
+        UINT32 requested_pid = request->filter_pid;
+        UINT32 requested_protocol = request->filter_protocol;
+        UINT32 requested_port = request->filter_port;
+        UINT32 requested_flags = request->flags;
         request->result_count = 0;
         KIRQL irql;
         KeAcquireSpinLock(&g_dpi_lock, &irql);
@@ -7186,17 +8608,23 @@ namespace net_dpi {
         LONG entries_to_scan = g_dpi_count;
         UINT32 idx = g_dpi_tail;
         LONG scanned = 0;
+        UINT32 reject_pid = 0;
+        UINT32 reject_protocol = 0;
+        UINT32 reject_port = 0;
+        UINT32 reject_http = 0;
+        UINT32 reject_tls = 0;
+        UINT32 reject_dns = 0;
         while (scanned < entries_to_scan && request->result_count < DPI_MAX_RESULTS) {
             DPI_HEADER_INFO* src = &g_dpi_ring[idx];
 
 
-            if (request->filter_pid != 0 && src->pid != request->filter_pid) goto next;
-            if (request->filter_protocol != 0 && src->protocol != request->filter_protocol) goto next;
+            if (request->filter_pid != 0 && src->pid != request->filter_pid) { ++reject_pid; goto next; }
+            if (request->filter_protocol != 0 && src->protocol != request->filter_protocol) { ++reject_protocol; goto next; }
             if (request->filter_port != 0 && src->src_port != request->filter_port &&
-                src->dst_port != request->filter_port) goto next;
-            if (request->flags & 1) { if (!src->is_http) goto next; }
-            if (request->flags & 2) { if (!src->is_tls) goto next; }
-            if (request->flags & 4) { if (!src->is_dns) goto next; }
+                src->dst_port != request->filter_port) { ++reject_port; goto next; }
+            if (request->flags & 1) { if (!src->is_http) { ++reject_http; goto next; } }
+            if (request->flags & 2) { if (!src->is_tls) { ++reject_tls; goto next; } }
+            if (request->flags & 4) { if (!src->is_dns) { ++reject_dns; goto next; } }
 
             strong::kmemcpy(&request->results[request->result_count], src, sizeof(DPI_HEADER_INFO));
             request->result_count++;
@@ -7206,6 +8634,27 @@ namespace net_dpi {
             scanned++;
         }
         KeReleaseSpinLock(&g_dpi_lock, irql);
+        WW_LOG("net_dpi::query filter_pid=%u filter_protocol=%u filter_port=%u flags=0x%08X active=%ld ring_count_before=%ld scanned=%ld returned=%u reject_pid=%u reject_protocol=%u reject_port=%u reject_http=%u reject_tls=%u reject_dns=%u head=%ld tail=%ld enqueued=%lld overwritten=%lld drop_inactive=%lld drop_no_ring=%lld",
+            requested_pid,
+            requested_protocol,
+            requested_port,
+            requested_flags,
+            g_dpi_active,
+            entries_to_scan,
+            scanned,
+            request->result_count,
+            reject_pid,
+            reject_protocol,
+            reject_port,
+            reject_http,
+            reject_tls,
+            reject_dns,
+            g_dpi_head,
+            g_dpi_tail,
+            _InterlockedCompareExchange64(&g_dpi_total_enqueued, 0, 0),
+            _InterlockedCompareExchange64(&g_dpi_total_overwritten, 0, 0),
+            _InterlockedCompareExchange64(&g_dpi_drop_inactive, 0, 0),
+            _InterlockedCompareExchange64(&g_dpi_drop_no_ring, 0, 0));
         return STATUS_SUCCESS;
     }
 
@@ -8151,19 +9600,45 @@ namespace net_dns_spoof {
     }
 
 
-    BOOLEAN check_spoof(const char* domain, UINT8* out_addr, UINT32* out_af, UINT32* out_ttl) {
+    BOOLEAN inspect_spoof_rule(const char* domain, UINT8* out_addr, UINT32* out_af, UINT32* out_ttl,
+                               UINT32* out_rule_id, char* out_rule_domain, UINT32 out_rule_domain_len,
+                               LONG* match_before, LONG* match_after, BOOLEAN increment_match) {
+        if (out_rule_id) *out_rule_id = 0;
+        if (out_rule_domain && out_rule_domain_len != 0) out_rule_domain[0] = '\0';
+        if (match_before) *match_before = 0;
+        if (match_after) *match_after = 0;
         if (g_active_spoof_count == 0) return FALSE;
         for (UINT32 i = 0; i < DNS_SPOOF_MAX_RULES; i++) {
             if (g_spoof_rules[i].active != 1) continue;
             if (domain_matches(g_spoof_rules[i].domain, domain)) {
-                strong::kmemcpy(out_addr, g_spoof_rules[i].spoof_addr, 16);
-                *out_af = g_spoof_rules[i].address_family;
-                *out_ttl = g_spoof_rules[i].ttl;
-                _InterlockedIncrement(&g_spoof_rules[i].match_count);
+                if (out_addr) strong::kmemcpy(out_addr, g_spoof_rules[i].spoof_addr, 16);
+                if (out_af) *out_af = g_spoof_rules[i].address_family;
+                if (out_ttl) *out_ttl = g_spoof_rules[i].ttl;
+                if (out_rule_id) *out_rule_id = g_spoof_rules[i].rule_id;
+                if (out_rule_domain && out_rule_domain_len != 0) {
+                    UINT32 j = 0;
+                    while (j + 1 < out_rule_domain_len && j < DNS_SPOOF_MAX_DOMAIN && g_spoof_rules[i].domain[j]) {
+                        out_rule_domain[j] = g_spoof_rules[i].domain[j];
+                        ++j;
+                    }
+                    out_rule_domain[j] = '\0';
+                }
+                LONG before = _InterlockedCompareExchange(&g_spoof_rules[i].match_count, 0, 0);
+                LONG after = before;
+                if (increment_match) {
+                    after = _InterlockedIncrement(&g_spoof_rules[i].match_count);
+                }
+                if (match_before) *match_before = before;
+                if (match_after) *match_after = after;
                 return TRUE;
             }
         }
         return FALSE;
+    }
+
+    BOOLEAN check_spoof(const char* domain, UINT8* out_addr, UINT32* out_af, UINT32* out_ttl) {
+        return inspect_spoof_rule(domain, out_addr, out_af, out_ttl,
+            nullptr, nullptr, 0, nullptr, nullptr, TRUE);
     }
 
     NTSTATUS handle_spoof_rule(p_dns_spoof_rule request) {
@@ -8936,26 +10411,102 @@ NTSTATUS functions::handle_tcpip_conn_dump(p_tcpip_conn_dump request) {
 
 NTSTATUS functions::handle_packet_inject(p_packet_inject_request request) {
     if (!request) { NET_ERR("handle_packet_inject: NULL request"); return STATUS_INVALID_PARAMETER; }
+    UINT64 start_tsc = __rdtsc();
+    WW_LOG("netaction::PINJ ENTER direction=%u protocol=%u af=%u src_port=%u dst_port=%u payload_size=%u tcp_flags=0x%08X active_mod_rules=%ld mod_generation=%lld irql=%u cpu=%lu",
+        request->direction,
+        request->protocol,
+        request->address_family,
+        request->src_port,
+        request->dst_port,
+        request->payload_size,
+        request->tcp_flags,
+        net_mod::active_rule_count(),
+        net_mod::current_generation(),
+        (UINT32)KeGetCurrentIrql(),
+        KeGetCurrentProcessorNumber());
     NTSTATUS st = net_inject::inject_packet(request);
     if (!NT_SUCCESS(st)) {
         NET_ERR("handle_packet_inject: FAILED dir=%u proto=%u af=%u payload=%u status=0x%08x",
                 request->direction, request->protocol, request->address_family, request->payload_size, st);
     }
+    WW_LOG("netaction::PINJ EXIT status=0x%08X win32=%lu request_status=%u direction=%u protocol=%u af=%u payload_size=%u elapsed_tsc=%llu active_mod_rules=%ld mod_generation=%lld irql=%u cpu=%lu",
+        st,
+        net_capture::status_to_win32(st),
+        request->status,
+        request->direction,
+        request->protocol,
+        request->address_family,
+        request->payload_size,
+        (unsigned long long)(__rdtsc() - start_tsc),
+        net_mod::active_rule_count(),
+        net_mod::current_generation(),
+        (UINT32)KeGetCurrentIrql(),
+        KeGetCurrentProcessorNumber());
     return st;
 }
 
 NTSTATUS functions::handle_packet_mod_rule(p_packet_mod_rule request) {
     if (!request) { NET_ERR("handle_packet_mod_rule: NULL request"); return STATUS_INVALID_PARAMETER; }
     NET_DBG("handle_packet_mod_rule: op=%u rule_id=%u", request->operation, request->rule_id);
+    UINT64 start_tsc = __rdtsc();
+    LONG active_before = net_mod::active_rule_count();
+    LONG64 generation_before = net_mod::current_generation();
+    WW_LOG("netaction::PMOD ENTER op=%u rule_id=%u direction=%u protocol=%u port=%u pid=%u pattern_size=%u replace_size=%u active_before=%ld generation_before=%lld irql=%u cpu=%lu",
+        request->operation,
+        request->rule_id,
+        request->direction,
+        request->protocol,
+        request->port,
+        request->pid,
+        request->pattern_size,
+        request->replace_size,
+        active_before,
+        generation_before,
+        (UINT32)KeGetCurrentIrql(),
+        KeGetCurrentProcessorNumber());
     NTSTATUS st = net_mod::handle_mod_rule(request);
     NET_DBG("handle_packet_mod_rule: returned 0x%08x rule_id=%u active=%u",
             st, request->rule_id, request->active);
+    WW_LOG("netaction::PMOD EXIT status=0x%08X win32=%lu op=%u rule_id=%u active=%u active_before=%ld active_after=%ld generation_before=%lld generation_after=%lld elapsed_tsc=%llu irql=%u cpu=%lu",
+        st,
+        net_capture::status_to_win32(st),
+        request->operation,
+        request->rule_id,
+        request->active,
+        active_before,
+        net_mod::active_rule_count(),
+        generation_before,
+        net_mod::current_generation(),
+        (unsigned long long)(__rdtsc() - start_tsc),
+        (UINT32)KeGetCurrentIrql(),
+        KeGetCurrentProcessorNumber());
     return st;
 }
 
 NTSTATUS functions::handle_packet_mod_rule_list(p_packet_mod_rule_list request) {
     if (!request) { NET_ERR("handle_packet_mod_rule_list: NULL request"); return STATUS_INVALID_PARAMETER; }
-    return net_mod::handle_mod_rule_list(request);
+    UINT64 start_tsc = __rdtsc();
+    LONG active_before = net_mod::active_rule_count();
+    LONG64 generation_before = net_mod::current_generation();
+    WW_LOG("netaction::PMOD_LIST ENTER op=%u active_before=%ld generation_before=%lld irql=%u cpu=%lu",
+        request->operation,
+        active_before,
+        generation_before,
+        (UINT32)KeGetCurrentIrql(),
+        KeGetCurrentProcessorNumber());
+    NTSTATUS st = net_mod::handle_mod_rule_list(request);
+    WW_LOG("netaction::PMOD_LIST EXIT status=0x%08X win32=%lu returned=%u active_before=%ld active_after=%ld generation_before=%lld generation_after=%lld elapsed_tsc=%llu irql=%u cpu=%lu",
+        st,
+        net_capture::status_to_win32(st),
+        request->rule_count,
+        active_before,
+        net_mod::active_rule_count(),
+        generation_before,
+        net_mod::current_generation(),
+        (unsigned long long)(__rdtsc() - start_tsc),
+        (UINT32)KeGetCurrentIrql(),
+        KeGetCurrentProcessorNumber());
+    return st;
 }
 
 NTSTATUS functions::handle_traffic_redirect(p_traffic_redirect_rule request) {
@@ -8995,6 +10546,13 @@ NTSTATUS functions::handle_stream_reassemble(p_stream_reassemble_request request
 
 NTSTATUS functions::handle_deep_inspect(p_dpi_request request) {
     if (!request) { NET_ERR("handle_deep_inspect: NULL request"); return STATUS_INVALID_PARAMETER; }
+    WW_LOG("netaction::DPIN ENTER filter_pid=%u filter_protocol=%u filter_port=%u flags=0x%08X active=%u ring_count=%ld",
+        request->filter_pid,
+        request->filter_protocol,
+        request->filter_port,
+        request->flags,
+        net_dpi::is_active() ? 1u : 0u,
+        net_dpi::entry_count());
     if (request->filter_pid != 0) {
         aida_refresh_pid_cache_for_process(request->filter_pid, request->filter_protocol);
     }
@@ -9010,6 +10568,16 @@ NTSTATUS functions::handle_deep_inspect(p_dpi_request request) {
         request->flags,
         request->result_count,
         st);
+    WW_LOG("netaction::DPIN EXIT status=0x%08X win32=%lu active_before=%u ring_before=%ld result_count=%u filter_pid=%u filter_protocol=%u filter_port=%u flags=0x%08X",
+        st,
+        net_capture::status_to_win32(st),
+        active ? 1u : 0u,
+        before,
+        request->result_count,
+        request->filter_pid,
+        request->filter_protocol,
+        request->filter_port,
+        request->flags);
     return st;
 }
 

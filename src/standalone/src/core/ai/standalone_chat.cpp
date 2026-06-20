@@ -2085,13 +2085,28 @@ void register_standalone_protection() {
         return;
     }
 
-    if (!driver_bridge::refresh_heartbeat())
-        return;
-
-    if (!driver_bridge::dynamic_ioctls_ready()) {
+    auto dyn = driver_bridge::dynamic_ioctl_state();
+    if (!dyn.ready) {
+        const std::string run_id = standalone_license::run_correlation_id();
+        diag::log_tagged_fmt("init_chat",
+            "preauth_skipped_dynamic_ioctl_not_ready phase=register_standalone_protection op=heartbeat run_id=%s runtime_authorized=%d loaded=%d kernel=%d connected=%d inst_seed=%u/%u global_seed=%u/%u ioctl_seed_hash=0x%08X hb_ioctl_seed_hash=0x%08X",
+            run_id.c_str(),
+            standalone_license::is_valid() ? 1 : 0,
+            dyn.loaded ? 1 : 0,
+            dyn.kernel ? 1 : 0,
+            dyn.connected ? 1 : 0,
+            dyn.instance_server_seed,
+            dyn.instance_ioctl_seed,
+            dyn.global_server_seed,
+            dyn.global_ioctl_seed,
+            dyn.ioctl_seed_hash,
+            dyn.heartbeat_ioctl_seed_hash);
         diag::log_tagged_fmt("init_chat", "register_standalone_protection_deferred dynamic_ioctl_ready=0");
         return;
     }
+
+    if (!driver_bridge::refresh_heartbeat())
+        return;
 
     HMODULE exe_module = GetModuleHandleW(nullptr);
     if (!exe_module)
@@ -2175,7 +2190,12 @@ void init_standalone_chat()
 {
     if (s_initialized) return;
 
-    diag::log_tagged("init_chat", "settings_load_start");
+    const std::string run_id = standalone_license::run_correlation_id();
+    diag::log_tagged_fmt("init_chat", "startup_context run_id=%s pid=%lu tid=%lu",
+        run_id.c_str(),
+        GetCurrentProcessId(),
+        GetCurrentThreadId());
+    diag::log_tagged_fmt("init_chat", "settings_load_start run_id=%s", run_id.c_str());
     bool settings_loaded = false;
     DWORD seh_load = seh_settings_load(g_sa_settings, settings_loaded);
     if (seh_load != 0)
@@ -2231,7 +2251,11 @@ void init_standalone_chat()
     themes::changed = true;
 
 
-    diag::log_tagged("init_chat", "license_initialize_start");
+    diag::log_tagged_fmt("init_chat", "license_initialize_start run_id=%s key_len=%zu session_len=%zu arc_ok=%d",
+        run_id.c_str(),
+        g_sa_settings.license_key.size(),
+        g_sa_settings.license_session_token.size(),
+        g_sa_settings.license_arc_load_ok ? 1 : 0);
     bool license_ok = false;
     DWORD seh_lic = seh_standalone_license_initialize(g_sa_settings, license_ok);
     if (seh_lic != 0)
@@ -2243,7 +2267,15 @@ void init_standalone_chat()
     if (!license::validated && !standalone_license::last_error().empty())
         license::error_msg = standalone_license::last_error();
     license::check_failed = !license::validated && !license::error_msg.empty();
-    diag::log_tagged_fmt("init_chat", "license_initialize_done validated=%d", license::validated ? 1 : 0);
+    {
+        const std::string runtime_snapshot = standalone_license::runtime_state_snapshot();
+        diag::log_tagged_fmt("init_chat", "license_initialize_done run_id=%s validated=%d canonical_valid=%d arc=%d state={%.512s}",
+            run_id.c_str(),
+            license::validated ? 1 : 0,
+            standalone_license::is_valid() ? 1 : 0,
+            standalone_license::is_arc_loaded() ? 1 : 0,
+            runtime_snapshot.c_str());
+    }
 
     diag::log_tagged("init_chat", "ai_client_create_start");
     g_sa_ai_client = std::make_unique<standalone_ai_client_t>(g_sa_settings);
@@ -2318,9 +2350,40 @@ void init_standalone_chat()
     diag::log_tagged("init_chat", "marketplace_autoconnect_deferred_until_authorized_ide");
     diag::log_tagged("init_chat", "marketplace_load_installed_done");
 
-    diag::log_tagged("init_chat", "driver_bridge_initialize_start");
+    {
+        auto dyn = driver_bridge::dynamic_ioctl_state();
+        diag::log_tagged_fmt("init_chat",
+            "driver_bridge_initialize_start run_id=%s loaded=%d kernel=%d connected=%d dyn_ready=%d inst_seed=%u/%u global_seed=%u/%u ioctl_seed_hash=0x%08X hb_ioctl_seed_hash=0x%08X",
+            run_id.c_str(),
+            dyn.loaded ? 1 : 0,
+            dyn.kernel ? 1 : 0,
+            dyn.connected ? 1 : 0,
+            dyn.ready ? 1 : 0,
+            dyn.instance_server_seed,
+            dyn.instance_ioctl_seed,
+            dyn.global_server_seed,
+            dyn.global_ioctl_seed,
+            dyn.ioctl_seed_hash,
+            dyn.heartbeat_ioctl_seed_hash);
+    }
     driver_bridge::initialize();
-    diag::log_tagged("init_chat", "driver_bridge_initialize_done");
+    {
+        auto dyn = driver_bridge::dynamic_ioctl_state();
+        diag::log_tagged_fmt("init_chat",
+            "driver_bridge_initialize_done run_id=%s loaded=%d kernel=%d connected=%d dyn_ready=%d inst_seed=%u/%u global_seed=%u/%u ioctl_seed_hash=0x%08X hb_ioctl_seed_hash=0x%08X status=%.160s",
+            run_id.c_str(),
+            dyn.loaded ? 1 : 0,
+            dyn.kernel ? 1 : 0,
+            dyn.connected ? 1 : 0,
+            dyn.ready ? 1 : 0,
+            dyn.instance_server_seed,
+            dyn.instance_ioctl_seed,
+            dyn.global_server_seed,
+            dyn.global_ioctl_seed,
+            dyn.ioctl_seed_hash,
+            dyn.heartbeat_ioctl_seed_hash,
+            driver_bridge::status().c_str());
+    }
 
     diag::log_tagged("init_chat", "register_standalone_protection_start");
     DWORD seh_rsp = seh_register_standalone_protection_call();

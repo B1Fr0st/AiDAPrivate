@@ -79,6 +79,46 @@
 
 using json = nlohmann::json;
 
+static std::mutex& lic_run_correlation_mutex()
+{
+    static std::mutex m;
+    return m;
+}
+
+static std::string& lic_run_correlation_value()
+{
+    static std::string id = "unset";
+    return id;
+}
+
+static std::string lic_run_correlation_snapshot()
+{
+    std::lock_guard<std::mutex> lk(lic_run_correlation_mutex());
+    return lic_run_correlation_value();
+}
+
+static void lic_set_run_correlation_snapshot(const std::string& id)
+{
+    std::string normalized;
+    normalized.reserve(64);
+    for (char ch : id) {
+        const bool ok =
+            (ch >= '0' && ch <= '9') ||
+            (ch >= 'A' && ch <= 'Z') ||
+            (ch >= 'a' && ch <= 'z') ||
+            ch == '-' ||
+            ch == '_';
+        if (ok)
+            normalized.push_back(ch);
+        if (normalized.size() >= 64)
+            break;
+    }
+    if (normalized.empty())
+        normalized = "unset";
+    std::lock_guard<std::mutex> lk(lic_run_correlation_mutex());
+    lic_run_correlation_value() = normalized;
+}
+
 static void lic_log(const char* step)
 {
 
@@ -99,18 +139,19 @@ static void lic_log(const char* step)
     if (hf == INVALID_HANDLE_VALUE) return;
     SYSTEMTIME st{};
     GetLocalTime(&st);
-    char line[1024];
+    std::string run_id = lic_run_correlation_snapshot();
+    char line[1536];
     int len = _snprintf_s(line, sizeof(line), _TRUNCATE,
-        "[%02d:%02d:%02d.%03d] [license] %s\r\n",
-        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, step);
+        "[%02d:%02d:%02d.%03d] [license] run_id=%s %s\r\n",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, run_id.c_str(), step);
     if (len > 0) {
         DWORD w;
         WriteFile(hf, line, (DWORD)len, &w, nullptr);
 
-        char dbg_line[1100];
+        char dbg_line[1600];
         _snprintf_s(dbg_line, sizeof(dbg_line), _TRUNCATE,
-            "[AIDA-LIC][%02d:%02d:%02d.%03d] %s",
-            st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, step);
+            "[AIDA-LIC][%02d:%02d:%02d.%03d] run_id=%s %s",
+            st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, run_id.c_str(), step);
         OutputDebugStringA(dbg_line);
     }
     CloseHandle(hf);
@@ -2369,6 +2410,260 @@ namespace
         return std::string(buf);
     }
 
+    bool dynamic_ioctl_ready_for_protected_call(const char* phase, const char* op, uint32_t timeout_ms = 0, bool update_arc_failure = true)
+    {
+        driver_bridge::dynamic_ioctl_state_t dyn = driver_bridge::dynamic_ioctl_state();
+        if (dyn.ready)
+            return true;
+        const bool runtime_authorized =
+            s_valid.load(std::memory_order_acquire) ||
+            s_arc_loaded.load(std::memory_order_acquire);
+        SetLastError(ERROR_NOT_READY);
+        static std::atomic<uint64_t> s_last_dynamic_skip_log_ms{0};
+        const uint64_t now_ms = GetTickCount64();
+        uint64_t last_ms = s_last_dynamic_skip_log_ms.load(std::memory_order_acquire);
+        bool should_log = timeout_ms == 0 || last_ms == 0 || now_ms - last_ms >= 500;
+        if (should_log &&
+            s_last_dynamic_skip_log_ms.compare_exchange_strong(last_ms, now_ms, std::memory_order_acq_rel, std::memory_order_acquire))
+        {
+            lic_log_fmt("preauth_skipped_dynamic_ioctl_not_ready phase=%s op=%s runtime_authorized=%d loaded=%d kernel=%d connected=%d inst_seed=%u/%u global_seed=%u/%u ioctl_seed_hash=0x%08X hb_ioctl_seed_hash=0x%08X timeout_ms=%u",
+                phase && *phase ? phase : "unknown",
+                op && *op ? op : "unknown",
+                runtime_authorized ? 1 : 0,
+                dyn.loaded ? 1 : 0,
+                dyn.kernel ? 1 : 0,
+                dyn.connected ? 1 : 0,
+                dyn.instance_server_seed,
+                dyn.instance_ioctl_seed,
+                dyn.global_server_seed,
+                dyn.global_ioctl_seed,
+                dyn.ioctl_seed_hash,
+                dyn.heartbeat_ioctl_seed_hash,
+                timeout_ms);
+        }
+        if (update_arc_failure) {
+            set_arc_load_failure_detail(make_arc_driver_failure_detail(
+                phase,
+                "dynamic_ioctl_not_ready_for_protected_call",
+                dyn.loaded,
+                dyn.kernel,
+                false,
+                false,
+                ERROR_NOT_READY,
+                0,
+                timeout_ms));
+        }
+        return false;
+    }
+
+    bool server_token_relay_bridge_connected(const driver_bridge::dynamic_ioctl_state_t& dyn)
+    {
+        return dyn.loaded && dyn.kernel && dyn.connected;
+    }
+
+    bool bridge_connected_for_server_token_relay(const char* phase, const char* op, uint32_t timeout_ms, bool update_arc_failure)
+    {
+        driver_bridge::dynamic_ioctl_state_t dyn = driver_bridge::dynamic_ioctl_state();
+        if (server_token_relay_bridge_connected(dyn))
+            return true;
+
+        DWORD gle = (!dyn.loaded || !dyn.connected) ? ERROR_DEVICE_NOT_CONNECTED : ERROR_NOT_READY;
+        SetLastError(gle);
+        lic_log_fmt("server_token_relay_bridge_not_ready phase=%s op=%s loaded=%d kernel=%d connected=%d dyn_ready=%d inst_seed=%u/%u global_seed=%u/%u ioctl_seed_hash=0x%08X hb_ioctl_seed_hash=0x%08X timeout_ms=%u",
+            phase && *phase ? phase : "unknown",
+            op && *op ? op : "unknown",
+            dyn.loaded ? 1 : 0,
+            dyn.kernel ? 1 : 0,
+            dyn.connected ? 1 : 0,
+            dyn.ready ? 1 : 0,
+            dyn.instance_server_seed,
+            dyn.instance_ioctl_seed,
+            dyn.global_server_seed,
+            dyn.global_ioctl_seed,
+            dyn.ioctl_seed_hash,
+            dyn.heartbeat_ioctl_seed_hash,
+            timeout_ms);
+        if (update_arc_failure) {
+            const char* reason = !dyn.loaded
+                ? "driver_not_loaded_for_server_token_relay"
+                : (!dyn.kernel ? "kernel_driver_not_active_for_server_token_relay" : "driver_bridge_not_connected_for_server_token_relay");
+            set_arc_load_failure_detail(make_arc_driver_failure_detail(
+                phase,
+                reason,
+                dyn.loaded,
+                dyn.kernel,
+                false,
+                false,
+                gle,
+                0,
+                timeout_ms));
+        }
+        return false;
+    }
+
+    bool wait_for_arc_driver_bridge_for_seed_relay(const char* phase, uint32_t timeout_ms)
+    {
+        const uint64_t start = GetTickCount64();
+        uint64_t next_log = 0;
+        for (;;)
+        {
+            driver_bridge::dynamic_ioctl_state_t dyn = driver_bridge::dynamic_ioctl_state();
+            uint64_t elapsed = GetTickCount64() - start;
+            if (server_token_relay_bridge_connected(dyn))
+            {
+                lic_log_fmt("server_token_relay_bridge_wait phase=%s result=ready elapsed_ms=%llu loaded=1 kernel=1 connected=1 dyn_ready=%d",
+                    phase ? phase : "unknown",
+                    static_cast<unsigned long long>(elapsed),
+                    dyn.ready ? 1 : 0);
+                return true;
+            }
+            if (elapsed >= timeout_ms)
+            {
+                DWORD gle = (!dyn.loaded || !dyn.connected) ? ERROR_DEVICE_NOT_CONNECTED : ERROR_NOT_READY;
+                SetLastError(gle);
+                set_arc_load_failure_detail(make_arc_driver_failure_detail(
+                    phase,
+                    !dyn.loaded ? "driver_not_loaded_timeout_for_server_token_relay" : (!dyn.kernel ? "kernel_driver_not_active_timeout_for_server_token_relay" : "driver_bridge_not_connected_timeout_for_server_token_relay"),
+                    dyn.loaded,
+                    dyn.kernel,
+                    false,
+                    false,
+                    gle,
+                    elapsed,
+                    timeout_ms));
+                lic_log_fmt("server_token_relay_bridge_wait phase=%s result=timeout elapsed_ms=%llu loaded=%d kernel=%d connected=%d dyn_ready=%d",
+                    phase ? phase : "unknown",
+                    static_cast<unsigned long long>(elapsed),
+                    dyn.loaded ? 1 : 0,
+                    dyn.kernel ? 1 : 0,
+                    dyn.connected ? 1 : 0,
+                    dyn.ready ? 1 : 0);
+                return false;
+            }
+            if (elapsed >= next_log)
+            {
+                lic_log_fmt("server_token_relay_bridge_wait phase=%s result=waiting elapsed_ms=%llu loaded=%d kernel=%d connected=%d dyn_ready=%d",
+                    phase ? phase : "unknown",
+                    static_cast<unsigned long long>(elapsed),
+                    dyn.loaded ? 1 : 0,
+                    dyn.kernel ? 1 : 0,
+                    dyn.connected ? 1 : 0,
+                    dyn.ready ? 1 : 0);
+                next_log = elapsed + 500;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+
+    bool recover_arc_driver_bridge_for_seed_relay(const char* phase, uint32_t timeout_ms)
+    {
+        if (bridge_connected_for_server_token_relay(phase, "server_token_relay_recover_pre", timeout_ms, false))
+            return true;
+
+        driver_bridge::dynamic_ioctl_state_t dyn = driver_bridge::dynamic_ioctl_state();
+        lic_log_fmt("server_token_relay_bridge_recover_begin phase=%s loaded=%d kernel=%d connected=%d dyn_ready=%d timeout_ms=%u",
+            phase ? phase : "unknown",
+            dyn.loaded ? 1 : 0,
+            dyn.kernel ? 1 : 0,
+            dyn.connected ? 1 : 0,
+            dyn.ready ? 1 : 0,
+            timeout_ms);
+
+        bool init_ok = false;
+        try
+        {
+            init_ok = driver_bridge::initialize();
+        }
+        catch (const std::exception& ex)
+        {
+            lic_log_fmt("server_token_relay_bridge_recover_initialize_exception phase=%s what=%.160s",
+                phase ? phase : "unknown",
+                ex.what());
+            return false;
+        }
+        catch (...)
+        {
+            lic_log_fmt("server_token_relay_bridge_recover_initialize_unknown_exception phase=%s",
+                phase ? phase : "unknown");
+            return false;
+        }
+
+        dyn = driver_bridge::dynamic_ioctl_state();
+        lic_log_fmt("server_token_relay_bridge_recover_initialize_post phase=%s ok=%d loaded=%d kernel=%d connected=%d dyn_ready=%d",
+            phase ? phase : "unknown",
+            init_ok ? 1 : 0,
+            dyn.loaded ? 1 : 0,
+            dyn.kernel ? 1 : 0,
+            dyn.connected ? 1 : 0,
+            dyn.ready ? 1 : 0);
+        if (!init_ok)
+            return false;
+
+        return wait_for_arc_driver_bridge_for_seed_relay(phase, timeout_ms);
+    }
+
+    bool dynamic_ioctl_seeded_after_server_token_relay(const char* phase,
+                                                       const char* op,
+                                                       bool relay_ok,
+                                                       uint64_t driver_proof,
+                                                       DWORD relay_gle,
+                                                       uint32_t timeout_ms,
+                                                       bool update_arc_failure)
+    {
+        driver_bridge::dynamic_ioctl_state_t dyn = driver_bridge::dynamic_ioctl_state();
+        lic_log_fmt("server_token_relay_dynamic_state phase=%s op=%s relay_ok=%d proof=%d relay_gle=%lu loaded=%d kernel=%d connected=%d dyn_ready=%d inst_seed=%u/%u global_seed=%u/%u ioctl_seed_hash=0x%08X hb_ioctl_seed_hash=0x%08X",
+            phase && *phase ? phase : "unknown",
+            op && *op ? op : "unknown",
+            relay_ok ? 1 : 0,
+            driver_proof != 0 ? 1 : 0,
+            static_cast<unsigned long>(relay_gle),
+            dyn.loaded ? 1 : 0,
+            dyn.kernel ? 1 : 0,
+            dyn.connected ? 1 : 0,
+            dyn.ready ? 1 : 0,
+            dyn.instance_server_seed,
+            dyn.instance_ioctl_seed,
+            dyn.global_server_seed,
+            dyn.global_ioctl_seed,
+            dyn.ioctl_seed_hash,
+            dyn.heartbeat_ioctl_seed_hash);
+        if (relay_ok && driver_proof != 0 && dyn.ready)
+        {
+            SetLastError(ERROR_SUCCESS);
+            return true;
+        }
+
+        DWORD gle = relay_gle;
+        const char* reason = "server_token_relay_failed";
+        if (relay_ok && driver_proof == 0)
+        {
+            gle = ERROR_ACCESS_DENIED;
+            reason = "server_token_relay_missing_driver_proof";
+        }
+        else if (relay_ok)
+        {
+            gle = ERROR_NOT_READY;
+            reason = "server_token_relay_did_not_seed_dynamic_ioctl";
+        }
+        if (gle == ERROR_SUCCESS)
+            gle = ERROR_NOT_READY;
+        SetLastError(gle);
+        if (update_arc_failure)
+        {
+            set_arc_load_failure_detail(make_arc_driver_failure_detail(
+                phase,
+                reason,
+                dyn.loaded,
+                dyn.kernel,
+                false,
+                false,
+                gle,
+                0,
+                timeout_ms));
+        }
+        return false;
+    }
+
     std::string arc_load_error_or_fallback(const char* fallback)
     {
         std::string arc_error = arc_loader::last_error();
@@ -2626,7 +2921,12 @@ namespace
     {
         bool loaded = driver_bridge::is_loaded();
         bool kernel = loaded ? driver_bridge::using_kernel_driver() : false;
-        bool heartbeat = kernel ? driver_bridge::refresh_heartbeat() : false;
+        bool heartbeat = false;
+        if (kernel) {
+            if (!dynamic_ioctl_ready_for_protected_call(phase, "arc_driver_ready_heartbeat"))
+                return false;
+            heartbeat = driver_bridge::refresh_heartbeat();
+        }
         bool sentinel = heartbeat ? driver_bridge::sentinel_bridge_ready() : false;
         if (!loaded || !kernel || !heartbeat || !sentinel) {
             set_arc_load_failure_detail(make_arc_driver_failure_detail(
@@ -2665,7 +2965,9 @@ namespace
         {
             bool loaded = driver_bridge::is_loaded();
             bool kernel = loaded ? driver_bridge::using_kernel_driver() : false;
-            bool heartbeat = kernel ? driver_bridge::refresh_heartbeat() : false;
+            bool heartbeat = false;
+            if (kernel && dynamic_ioctl_ready_for_protected_call(phase, "arc_driver_ready_wait_heartbeat", timeout_ms))
+                heartbeat = driver_bridge::refresh_heartbeat();
             bool sentinel = heartbeat ? driver_bridge::sentinel_bridge_ready() : false;
             uint64_t elapsed = GetTickCount64() - start;
             if (loaded && kernel && heartbeat && sentinel)
@@ -2710,55 +3012,6 @@ namespace
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
-    }
-
-    bool recover_arc_driver_ready_for_relay(const char* phase, uint32_t timeout_ms)
-    {
-        bool loaded = driver_bridge::is_loaded();
-        bool kernel = loaded ? driver_bridge::using_kernel_driver() : false;
-        bool heartbeat = kernel ? driver_bridge::refresh_heartbeat() : false;
-        bool sentinel = heartbeat ? driver_bridge::sentinel_bridge_ready() : false;
-        if (loaded && kernel && heartbeat && sentinel)
-            return true;
-
-        lic_log_fmt("arc_driver_recover_begin phase=%s loaded=%d kernel=%d heartbeat=%d sentinel=%d timeout_ms=%u",
-            phase ? phase : "unknown",
-            loaded ? 1 : 0,
-            kernel ? 1 : 0,
-            heartbeat ? 1 : 0,
-            sentinel ? 1 : 0,
-            timeout_ms);
-
-        bool init_ok = false;
-        try
-        {
-            init_ok = driver_bridge::initialize();
-        }
-        catch (const std::exception& ex)
-        {
-            lic_log_fmt("arc_driver_recover_initialize_exception phase=%s what=%.160s",
-                phase ? phase : "unknown",
-                ex.what());
-            return false;
-        }
-        catch (...)
-        {
-            lic_log_fmt("arc_driver_recover_initialize_unknown_exception phase=%s",
-                phase ? phase : "unknown");
-            return false;
-        }
-
-        loaded = driver_bridge::is_loaded();
-        kernel = loaded ? driver_bridge::using_kernel_driver() : false;
-        lic_log_fmt("arc_driver_recover_initialize_post phase=%s ok=%d loaded=%d kernel=%d",
-            phase ? phase : "unknown",
-            init_ok ? 1 : 0,
-            loaded ? 1 : 0,
-            kernel ? 1 : 0);
-        if (!init_ok)
-            return false;
-
-        return wait_for_arc_driver_ready_for_load(phase, timeout_ms);
     }
 
     struct challenge_material_t {
@@ -3082,30 +3335,45 @@ namespace
             token_hash != 0 ? 1 : 0,
             server_nonce != 0 ? 1 : 0,
             static_cast<unsigned long>(GetCurrentThreadId()));
-        bool sentinel_ready = driver_bridge::sentinel_bridge_ready();
-        DWORD sentinel_gle = sentinel_ready ? ERROR_SUCCESS : GetLastError();
-        lic_log_fmt("server_token_relay_if_ready_sentinel ready=%d gle=%lu elapsed_ms=%llu",
-            sentinel_ready ? 1 : 0,
-            static_cast<unsigned long>(sentinel_gle),
-            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - start_ms));
-        if (!sentinel_ready) {
-            SetLastError(ERROR_NOT_READY);
-            lic_log_fmt("server_token_relay_preflight_failed reason=sentinel_not_ready token_set=%d nonce_set=%d",
-                token_hash != 0 ? 1 : 0,
-                server_nonce != 0 ? 1 : 0);
+        if (!bridge_connected_for_server_token_relay("server_token_relay_if_ready", "server_token_relay", 0, false))
             return false;
-        }
+
+        driver_bridge::dynamic_ioctl_state_t pre_dyn = driver_bridge::dynamic_ioctl_state();
+        SetLastError(ERROR_SUCCESS);
+        bool heartbeat = driver_bridge::refresh_heartbeat();
+        DWORD heartbeat_gle = heartbeat ? ERROR_SUCCESS : GetLastError();
+        lic_log_fmt("server_token_relay_if_ready_preflight heartbeat=%d gle=%lu dyn_ready=%d inst_seed=%u/%u global_seed=%u/%u elapsed_ms=%llu",
+            heartbeat ? 1 : 0,
+            static_cast<unsigned long>(heartbeat_gle),
+            pre_dyn.ready ? 1 : 0,
+            pre_dyn.instance_server_seed,
+            pre_dyn.instance_ioctl_seed,
+            pre_dyn.global_server_seed,
+            pre_dyn.global_ioctl_seed,
+            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - start_ms));
+
         const uint64_t relay_ms = static_cast<uint64_t>(GetTickCount64());
         bool ok = driver_bridge::relay_server_token_v2(token_hash, server_nonce, out_driver_proof);
         DWORD relay_gle = ok ? ERROR_SUCCESS : GetLastError();
-        lic_log_fmt("server_token_relay_if_ready_exit ok=%d gle=%lu proof=%d elapsed_ms=%llu total_ms=%llu",
+        uint64_t driver_proof = out_driver_proof ? *out_driver_proof : 0;
+        bool seeded = dynamic_ioctl_seeded_after_server_token_relay(
+            "server_token_relay_if_ready",
+            "server_token_relay",
+            ok,
+            driver_proof,
+            relay_gle,
+            0,
+            false);
+        DWORD final_gle = seeded ? ERROR_SUCCESS : GetLastError();
+        lic_log_fmt("server_token_relay_if_ready_exit ok=%d seeded=%d gle=%lu proof=%d elapsed_ms=%llu total_ms=%llu",
             ok ? 1 : 0,
-            static_cast<unsigned long>(relay_gle),
-            (out_driver_proof && *out_driver_proof != 0) ? 1 : 0,
+            seeded ? 1 : 0,
+            static_cast<unsigned long>(final_gle),
+            driver_proof != 0 ? 1 : 0,
             static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - relay_ms),
             static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - start_ms));
-        SetLastError(relay_gle);
-        return ok;
+        SetLastError(final_gle);
+        return seeded;
     }
 
     bool parse_server_nonce_u64(const std::string& nonce, uint64_t& out)
@@ -3136,7 +3404,7 @@ namespace
                 phase ? phase : "unknown",
                 driver_bridge::is_loaded() ? 1 : 0,
                 driver_bridge::using_kernel_driver() ? 1 : 0);
-            if (!recover_arc_driver_ready_for_relay(phase, 15000))
+            if (!recover_arc_driver_bridge_for_seed_relay(phase, 15000))
             {
                 set_arc_load_failure_detail(make_arc_driver_failure_detail(
                     phase,
@@ -3177,64 +3445,106 @@ namespace
             return false;
         }
 
+        if (!bridge_connected_for_server_token_relay(phase, "server_token_relay", 15000, false))
+        {
+            lic_log_fmt("server_token_relay_recover_required phase=%s reason=bridge_not_connected",
+                phase ? phase : "unknown");
+            if (!recover_arc_driver_bridge_for_seed_relay(phase, 15000) ||
+                !bridge_connected_for_server_token_relay(phase, "server_token_relay_after_recover", 15000, true))
+                return false;
+        }
+
         uint32_t token_hash = static_cast<uint32_t>(
             fnv1a_str(settings.license_session_token) & 0xFFFFFFFF);
         uint64_t driver_proof = 0;
-        bool sentinel = driver_bridge::sentinel_bridge_ready();
-        if (!sentinel)
-        {
-            lic_log_fmt("server_token_relay_recover_required phase=%s reason=sentinel_not_ready",
-                phase ? phase : "unknown");
-            if (recover_arc_driver_ready_for_relay(phase, 15000))
-                sentinel = driver_bridge::sentinel_bridge_ready();
-        }
+        driver_bridge::dynamic_ioctl_state_t pre_dyn = driver_bridge::dynamic_ioctl_state();
         SetLastError(ERROR_SUCCESS);
-        if (!sentinel)
-            SetLastError(ERROR_NOT_READY);
-        bool ok = sentinel ? driver_bridge::relay_server_token_v2(token_hash, server_nonce, &driver_proof) : false;
+        bool heartbeat = driver_bridge::refresh_heartbeat();
+        DWORD heartbeat_gle = heartbeat ? ERROR_SUCCESS : GetLastError();
+        lic_log_fmt("server_token_relay_pre phase=%s heartbeat=%d heartbeat_gle=%lu dyn_ready=%d inst_seed=%u/%u global_seed=%u/%u ioctl_seed_hash=0x%08X hb_ioctl_seed_hash=0x%08X",
+            phase ? phase : "unknown",
+            heartbeat ? 1 : 0,
+            static_cast<unsigned long>(heartbeat_gle),
+            pre_dyn.ready ? 1 : 0,
+            pre_dyn.instance_server_seed,
+            pre_dyn.instance_ioctl_seed,
+            pre_dyn.global_server_seed,
+            pre_dyn.global_ioctl_seed,
+            pre_dyn.ioctl_seed_hash,
+            pre_dyn.heartbeat_ioctl_seed_hash);
+        SetLastError(ERROR_SUCCESS);
+        bool ok = driver_bridge::relay_server_token_v2(token_hash, server_nonce, &driver_proof);
         DWORD relay_gle = ok ? ERROR_SUCCESS : GetLastError();
-        if (!ok || driver_proof == 0)
+        bool seeded = dynamic_ioctl_seeded_after_server_token_relay(
+            phase,
+            "server_token_relay",
+            ok,
+            driver_proof,
+            relay_gle,
+            15000,
+            false);
+        DWORD seeded_gle = seeded ? ERROR_SUCCESS : GetLastError();
+        if (!seeded)
         {
-            lic_log_fmt("server_token_relay_retry_pre phase=%s ok=%d proof=%d gle=%lu",
+            lic_log_fmt("server_token_relay_retry_pre phase=%s ok=%d proof=%d seeded=%d gle=%lu",
                 phase ? phase : "unknown",
                 ok ? 1 : 0,
                 driver_proof != 0 ? 1 : 0,
-                static_cast<unsigned long>(relay_gle));
-            if (recover_arc_driver_ready_for_relay(phase, 15000))
+                seeded ? 1 : 0,
+                static_cast<unsigned long>(seeded_gle));
+            if (recover_arc_driver_bridge_for_seed_relay(phase, 15000))
             {
                 driver_proof = 0;
-                sentinel = driver_bridge::sentinel_bridge_ready();
                 SetLastError(ERROR_SUCCESS);
-                if (!sentinel)
-                    SetLastError(ERROR_NOT_READY);
-                ok = sentinel ? driver_bridge::relay_server_token_v2(token_hash, server_nonce, &driver_proof) : false;
+                ok = driver_bridge::relay_server_token_v2(token_hash, server_nonce, &driver_proof);
                 relay_gle = ok ? ERROR_SUCCESS : GetLastError();
-                lic_log_fmt("server_token_relay_retry_post phase=%s ok=%d proof=%d sentinel=%d gle=%lu",
+                seeded = dynamic_ioctl_seeded_after_server_token_relay(
+                    phase,
+                    "server_token_relay_retry",
+                    ok,
+                    driver_proof,
+                    relay_gle,
+                    15000,
+                    false);
+                seeded_gle = seeded ? ERROR_SUCCESS : GetLastError();
+                lic_log_fmt("server_token_relay_retry_post phase=%s ok=%d proof=%d seeded=%d gle=%lu",
                     phase ? phase : "unknown",
                     ok ? 1 : 0,
                     driver_proof != 0 ? 1 : 0,
-                    sentinel ? 1 : 0,
-                    static_cast<unsigned long>(relay_gle));
+                    seeded ? 1 : 0,
+                    static_cast<unsigned long>(seeded_gle));
             }
         }
-        lic_log_fmt("server_token_relay_result phase=%s ok=%d proof=%d sentinel=%d gle=%lu token_len=%zu nonce_len=%zu",
+        driver_bridge::dynamic_ioctl_state_t post_dyn = driver_bridge::dynamic_ioctl_state();
+        bool sentinel = post_dyn.ready ? driver_bridge::sentinel_bridge_ready() : false;
+        DWORD sentinel_gle = sentinel ? ERROR_SUCCESS : GetLastError();
+        lic_log_fmt("server_token_relay_result phase=%s ok=%d proof=%d seeded=%d sentinel=%d gle=%lu sentinel_gle=%lu token_len=%zu nonce_len=%zu dyn_ready=%d inst_seed=%u/%u global_seed=%u/%u ioctl_seed_hash=0x%08X hb_ioctl_seed_hash=0x%08X",
             phase ? phase : "unknown",
             ok ? 1 : 0,
             driver_proof != 0 ? 1 : 0,
+            seeded ? 1 : 0,
             sentinel ? 1 : 0,
-            static_cast<unsigned long>(relay_gle),
+            static_cast<unsigned long>(seeded ? relay_gle : seeded_gle),
+            static_cast<unsigned long>(sentinel_gle),
             settings.license_session_token.size(),
-            settings.license_server_nonce.size());
-        if (!ok || driver_proof == 0)
+            settings.license_server_nonce.size(),
+            post_dyn.ready ? 1 : 0,
+            post_dyn.instance_server_seed,
+            post_dyn.instance_ioctl_seed,
+            post_dyn.global_server_seed,
+            post_dyn.global_ioctl_seed,
+            post_dyn.ioctl_seed_hash,
+            post_dyn.heartbeat_ioctl_seed_hash);
+        if (!seeded)
         {
             set_arc_load_failure_detail(make_arc_driver_failure_detail(
                 phase,
-                sentinel ? "server_token_relay_missing_driver_proof" : "sentinel_not_ready_for_server_token_relay",
-                driver_bridge::is_loaded(),
-                driver_bridge::is_loaded() ? driver_bridge::using_kernel_driver() : false,
-                true,
-                sentinel,
-                relay_gle,
+                ok ? (driver_proof != 0 ? "server_token_relay_did_not_seed_dynamic_ioctl" : "server_token_relay_missing_driver_proof") : "server_token_relay_failed",
+                post_dyn.loaded,
+                post_dyn.kernel,
+                false,
+                false,
+                seeded_gle,
                 0,
                 15000));
             return false;
@@ -3246,6 +3556,8 @@ namespace
 
     bool verify_seeded_driver_bridge_for_arc(const char* phase)
     {
+        if (!dynamic_ioctl_ready_for_protected_call(phase, "tier_a_driver_present_query"))
+            return false;
         bool present = false;
         uint32_t mask = 0;
         uint64_t first_base = 0;
@@ -3297,7 +3609,9 @@ namespace
         {
             const bool loaded = driver_bridge::is_loaded();
             const bool kernel = loaded ? driver_bridge::using_kernel_driver() : false;
-            const bool heartbeat = kernel ? driver_bridge::refresh_heartbeat() : false;
+            bool heartbeat = false;
+            if (kernel && dynamic_ioctl_ready_for_protected_call("arc_load", "seeded_bridge_failure_detail_heartbeat"))
+                heartbeat = driver_bridge::refresh_heartbeat();
             const bool sentinel = heartbeat ? driver_bridge::sentinel_bridge_ready() : false;
             set_arc_load_failure_detail(make_arc_driver_failure_detail(
                 "arc_load",
@@ -6740,7 +7054,9 @@ namespace
                 {
                     const bool loaded = driver_bridge::is_loaded();
                     const bool kernel = loaded ? driver_bridge::using_kernel_driver() : false;
-                    const bool heartbeat = kernel ? driver_bridge::refresh_heartbeat() : false;
+                    bool heartbeat = false;
+                    if (kernel && dynamic_ioctl_ready_for_protected_call("arc_download", "driver_ready_recover_failure_detail_heartbeat"))
+                        heartbeat = driver_bridge::refresh_heartbeat();
                     const bool sentinel = heartbeat ? driver_bridge::sentinel_bridge_ready() : false;
                     set_arc_load_failure_detail(make_arc_driver_failure_detail(
                         "arc_download",
@@ -7504,7 +7820,9 @@ namespace
                 {
                     const bool loaded = driver_bridge::is_loaded();
                     const bool kernel = loaded ? driver_bridge::using_kernel_driver() : false;
-                    const bool heartbeat = kernel ? driver_bridge::refresh_heartbeat() : false;
+                    bool heartbeat = false;
+                    if (kernel && dynamic_ioctl_ready_for_protected_call("arc_loader_handoff", "driver_token_relay_failure_detail_heartbeat"))
+                        heartbeat = driver_bridge::refresh_heartbeat();
                     const bool sentinel = heartbeat ? driver_bridge::sentinel_bridge_ready() : false;
                     set_arc_load_failure_detail(make_arc_driver_failure_detail(
                         "arc_loader_handoff",
@@ -7591,7 +7909,8 @@ namespace
                 return false;
             }
 
-            if (!driver_bridge::refresh_heartbeat()) {
+            if (!dynamic_ioctl_ready_for_protected_call("arc_bind_driver_device", "arc_bind_driver_device_heartbeat") ||
+                !driver_bridge::refresh_heartbeat()) {
                 if (device) {
                     lic_log_fmt("arc_bind_driver_device_heartbeat_failed_detail err=%lu bytes=%lu ioctl=0x%08X base=0x%04X offset=%u key_hash=0x%08X ioctl_seed_hash=0x%08X inst_seed=%u/%u global_seed=%u/%u",
                         static_cast<unsigned long>(device->get_last_heartbeat_error()),
@@ -8933,12 +9252,68 @@ namespace
 
 namespace standalone_license
 {
+    void set_run_correlation_id(const std::string& id)
+    {
+        lic_set_run_correlation_snapshot(id);
+        lic_log_fmt("run_correlation_set len=%zu", run_correlation_id().size());
+    }
+
+    std::string run_correlation_id()
+    {
+        return lic_run_correlation_snapshot();
+    }
+
+    std::string runtime_state_snapshot()
+    {
+        const auto now_ms = static_cast<int64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count() / 1000000);
+        const int64_t last_hb = s_last_heartbeat_time.load(std::memory_order_acquire);
+        const int64_t hb_age = (last_hb > 0 && now_ms >= last_hb) ? (now_ms - last_hb) : -1;
+        const uint64_t tick_now = license_now_ms();
+        const uint64_t rate_until = s_license_rate_limited_until_ms.load(std::memory_order_acquire);
+        const uint64_t rate_remaining = rate_until > tick_now ? rate_until - tick_now : 0;
+        const int64_t silent_kill_after = s_silent_kill_after_ms.load(std::memory_order_acquire);
+        const int64_t silent_remaining = silent_kill_after > now_ms ? silent_kill_after - now_ms : 0;
+        const auto& rt = anti_tamper::state::get();
+        char buf[1024];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "valid=%d raw_valid=%d pending_activation=%d arc_loaded=%d arc_fetch_deferred=%d arc_download=%d arc_call_inflight=%lld arc_unloading=%d activation_completed_ms=%llu heartbeat_done=%d heartbeat_running_epoch=%llu heartbeat_counter=%u last_heartbeat_age_ms=%lld srv_refresh_done=%d srv_refresh_epoch=%llu worker_epoch=%llu stop=%d rate_limit_remaining_ms=%llu rate_limit_failures=%u silent_kill_remaining_ms=%lld gate_bitmap=0x%08X",
+            check_obfuscated_valid() ? 1 : 0,
+            s_valid.load(std::memory_order_acquire) ? 1 : 0,
+            rt.license_pending_activation.load(std::memory_order_acquire) ? 1 : 0,
+            s_arc_loaded.load(std::memory_order_acquire) ? 1 : 0,
+            s_arc_fetch_deferred.load(std::memory_order_acquire) ? 1 : 0,
+            s_arc_download_in_progress.load(std::memory_order_acquire) ? 1 : 0,
+            static_cast<long long>(s_arc_call_inflight.load(std::memory_order_acquire)),
+            s_arc_unloading.load(std::memory_order_acquire) ? 1 : 0,
+            static_cast<unsigned long long>(s_activation_completed_at_ms.load(std::memory_order_acquire)),
+            s_heartbeat_done.load(std::memory_order_acquire) ? 1 : 0,
+            static_cast<unsigned long long>(s_heartbeat_running_epoch.load(std::memory_order_acquire)),
+            s_heartbeat_counter.load(std::memory_order_acquire),
+            static_cast<long long>(hb_age),
+            s_srv_refresh_done.load(std::memory_order_acquire) ? 1 : 0,
+            static_cast<unsigned long long>(s_srv_refresh_running_epoch.load(std::memory_order_acquire)),
+            static_cast<unsigned long long>(s_worker_epoch.load(std::memory_order_acquire)),
+            s_stop.load(std::memory_order_acquire) ? 1 : 0,
+            static_cast<unsigned long long>(rate_remaining),
+            s_license_rate_limit_failures.load(std::memory_order_acquire),
+            static_cast<long long>(silent_remaining),
+            s_gate_bitmap.load(std::memory_order_acquire));
+        return std::string(buf);
+    }
+
     bool startup_ban_check(settings_sa_t& settings, std::string& reason_out, std::string& message_out)
     {
         try {
-            lic_log("startup_ban_check_enter");
+            lic_log_fmt("startup_ban_check_enter key_len=%zu session_len=%zu arc_ok=%d",
+                settings.license_key.size(),
+                settings.license_session_token.size(),
+                settings.license_arc_load_ok ? 1 : 0);
             bool banned = run_startup_ban_check(settings, reason_out, message_out);
-            lic_log(banned ? "startup_ban_check_banned" : "startup_ban_check_clear_or_unavailable");
+            lic_log_fmt("startup_ban_check_exit banned=%d reason_len=%zu message_len=%zu",
+                banned ? 1 : 0,
+                reason_out.size(),
+                message_out.size());
             return banned;
         } catch (...) {
             reason_out.clear();

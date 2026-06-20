@@ -111,6 +111,7 @@ namespace {
     int g_mcp_patch_index = -1;
     int g_mcp_get_patches_fixture_index = -1;
     uint64_t g_autoresponder_rule_id = 0;
+    std::string g_autoresponder_rule_match_pattern;
     uint64_t g_burp_scanner_audit_id = 0;
     uint64_t g_burp_scanner_issue_id = 0;
     uint64_t g_burp_sitemap_exchange_id = 0;
@@ -133,6 +134,10 @@ namespace {
     uint64_t g_network_packet_mod_rule_id = 0;
     uint64_t g_network_redirect_rule_id = 0;
     uint64_t g_network_dns_spoof_rule_id = 0;
+    uint16_t g_network_packet_mod_rule_port = 0;
+    uint16_t g_network_redirect_match_port = 0;
+    uint16_t g_network_redirect_rule_port = 0;
+    std::string g_network_dns_spoof_domain;
     uint64_t g_burp_collaborator_interaction_id = 0;
     bool g_burp_dom_xss_browser_infra_failed = false;
     std::string g_burp_dom_xss_dependency_reason;
@@ -1742,6 +1747,26 @@ namespace {
         return static_cast<uint64_t>(json_array_size_field(j, array_key));
     }
 
+    bool json_find_rule_match_count_recursive(const mcp_standalone::json& value, uint64_t rule_id, uint64_t& match_count) {
+        if (value.is_object()) {
+            uint64_t found_rule_id = 0;
+            if (json_u64_any_field_allow_zero(value, found_rule_id, { "id", "rule_id" }) && found_rule_id == rule_id) {
+                if (json_u64_field_allow_zero(value, "match_count", match_count))
+                    return true;
+            }
+            for (auto it = value.begin(); it != value.end(); ++it) {
+                if ((it->is_object() || it->is_array()) && json_find_rule_match_count_recursive(*it, rule_id, match_count))
+                    return true;
+            }
+        } else if (value.is_array()) {
+            for (const auto& item : value) {
+                if ((item.is_object() || item.is_array()) && json_find_rule_match_count_recursive(item, rule_id, match_count))
+                    return true;
+            }
+        }
+        return false;
+    }
+
     void log_tool_result_payload(HANDLE hf, const char* tag, const char* phase, const mcp_standalone::tool_result_t& result) {
         log_msg(hf, tag, "%s -- success=%d text_len=%zu data_type=%s text=%s data=%s",
             phase,
@@ -2779,6 +2804,70 @@ namespace {
             return true;
         }
 
+        auto direct_u64 = [&](const char* key, uint64_t& out) -> bool {
+            auto it = obj.find(key);
+            if (it == obj.end())
+                return false;
+            if (it->is_number_unsigned()) {
+                out = it->get<uint64_t>();
+                return true;
+            }
+            if (it->is_number_integer()) {
+                const auto raw = it->get<int64_t>();
+                if (raw >= 0) {
+                    out = static_cast<uint64_t>(raw);
+                    return true;
+                }
+            }
+            if (it->is_string()) {
+                const std::string text = it->get<std::string>();
+                const char* s = text.c_str();
+                while (*s == ' ' || *s == '\t')
+                    ++s;
+                if (*s == '\0')
+                    return false;
+                char* end = nullptr;
+                const uint64_t parsed = std::strtoull(s, &end, 0);
+                if (end == s)
+                    return false;
+                while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n')
+                    ++end;
+                if (*end != '\0')
+                    return false;
+                out = parsed;
+                return true;
+            }
+            return false;
+        };
+
+        auto direct_string = [&](const char* key, std::string& out) -> bool {
+            auto it = obj.find(key);
+            if (it == obj.end() || !it->is_string())
+                return false;
+            out = it->get<std::string>();
+            return true;
+        };
+
+        uint64_t transport_failures = 0;
+        uint64_t transport_error_code = 0;
+        if (direct_u64("transport_failures", transport_failures) && transport_failures > 0) {
+            reason = "transport_failures=" + std::to_string(static_cast<unsigned long long>(transport_failures));
+            return true;
+        }
+        if (direct_u64("transport_error_code", transport_error_code) && transport_error_code > 0) {
+            reason = "transport_error_code=" + std::to_string(static_cast<unsigned long long>(transport_error_code));
+            return true;
+        }
+        std::string transport_text;
+        if (direct_string("last_transport_error", transport_text) && !transport_text.empty()) {
+            reason = "last_transport_error=" + transport_text;
+            return true;
+        }
+        if (direct_string("transport_error", transport_text) && !transport_text.empty()) {
+            reason = "transport_error=" + transport_text;
+            return true;
+        }
+
         auto degraded_string = [&](const char* key) -> bool {
             auto it = obj.find(key);
             if (it != obj.end() && it->is_string() && !it->get<std::string>().empty()) {
@@ -2934,6 +3023,145 @@ namespace {
             return false;
         out = found->get<std::string>();
         return true;
+    }
+
+    bool scan_transport_status_recursive(const mcp_standalone::json& value, bool& saw_status, bool& real_failure, std::string& reason) {
+        if (value.is_object()) {
+            bool local_status = false;
+            uint64_t transport_failures = 0;
+            uint64_t transport_error_code = 0;
+            bool transport_degraded = false;
+            std::string last_transport_error;
+            std::string transport_error;
+            if (payload_u64_field(value, "transport_failures", transport_failures)) {
+                local_status = true;
+                if (transport_failures > 0) {
+                    reason = "transport_failures=" + std::to_string(static_cast<unsigned long long>(transport_failures));
+                    saw_status = true;
+                    real_failure = true;
+                    return true;
+                }
+            }
+            if (payload_u64_field(value, "transport_error_code", transport_error_code)) {
+                local_status = true;
+                if (transport_error_code > 0) {
+                    reason = "transport_error_code=" + std::to_string(static_cast<unsigned long long>(transport_error_code));
+                    saw_status = true;
+                    real_failure = true;
+                    return true;
+                }
+            }
+            if (payload_bool_field(value, "transport_degraded", transport_degraded)) {
+                local_status = true;
+                if (transport_degraded) {
+                    reason = "transport_degraded=true";
+                    saw_status = true;
+                    real_failure = true;
+                    return true;
+                }
+            }
+            if (payload_string_field(value, "last_transport_error", last_transport_error)) {
+                local_status = true;
+                if (!last_transport_error.empty()) {
+                    reason = "last_transport_error=" + compact_text(last_transport_error, 300);
+                    saw_status = true;
+                    real_failure = true;
+                    return true;
+                }
+            }
+            if (payload_string_field(value, "transport_error", transport_error)) {
+                local_status = true;
+                if (!transport_error.empty()) {
+                    reason = "transport_error=" + compact_text(transport_error, 300);
+                    saw_status = true;
+                    real_failure = true;
+                    return true;
+                }
+            }
+            if (local_status)
+                saw_status = true;
+            for (auto it = value.begin(); it != value.end(); ++it) {
+                if ((it->is_object() || it->is_array()) && scan_transport_status_recursive(*it, saw_status, real_failure, reason))
+                    return true;
+            }
+        } else if (value.is_array()) {
+            for (const auto& item : value) {
+                if ((item.is_object() || item.is_array()) && scan_transport_status_recursive(item, saw_status, real_failure, reason))
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    bool transport_status_structured_clean(const invoke_result_t& ir, std::string& proof) {
+        bool saw_status = false;
+        bool real_failure = false;
+        std::string reason;
+        scan_transport_status_recursive(ir.data, saw_status, real_failure, reason);
+        if (real_failure) {
+            proof = reason.empty() ? "transport_failure_present" : reason;
+            return false;
+        }
+        if (!saw_status) {
+            proof = "transport_status_fields_missing";
+            return false;
+        }
+        proof = "transport_status_clean";
+        return true;
+    }
+
+    size_t script_entries_in_raw_text(const std::string& raw_text, const std::string& expected_marker, bool& marker_present) {
+        marker_present = expected_marker.empty() || lower_copy(raw_text).find(lower_copy(expected_marker)) != std::string::npos;
+        size_t count = 0;
+        int depth = 0;
+        bool in_string = false;
+        bool escaped = false;
+        size_t object_start = 0;
+        for (size_t i = 0; i < raw_text.size(); ++i) {
+            const char c = raw_text[i];
+            if (in_string) {
+                if (escaped) {
+                    escaped = false;
+                } else if (c == '\\') {
+                    escaped = true;
+                } else if (c == '"') {
+                    in_string = false;
+                }
+                continue;
+            }
+            if (c == '"') {
+                in_string = true;
+                continue;
+            }
+            if (c == '{') {
+                if (depth == 0)
+                    object_start = i;
+                ++depth;
+                continue;
+            }
+            if (c == '}' && depth > 0) {
+                --depth;
+                if (depth == 0 && object_start <= i) {
+                    const std::string object_text = raw_text.substr(object_start, i - object_start + 1);
+                    try {
+                        auto parsed = mcp_standalone::json::parse(object_text);
+                        if (parsed.is_object() &&
+                            (parsed.contains("src") || parsed.contains("inline_length") ||
+                             parsed.contains("is_module") || parsed.contains("preview"))) {
+                            ++count;
+                        }
+                    } catch (...) {
+                    }
+                }
+            }
+        }
+        if (count == 0) {
+            const std::string lc = lower_copy(raw_text);
+            if (lc.find("\"src\"") != std::string::npos &&
+                (lc.find("\"inline_length\"") != std::string::npos || lc.find("\"is_module\"") != std::string::npos))
+                count = 1;
+        }
+        return count;
     }
 
     bool parse_u64_string_value(const std::string& value, uint64_t& out) {
@@ -4315,7 +4543,11 @@ namespace {
             if (ir.data.is_array())
                 top_level_scripts = ir.data.size();
             payload_array_count(ir.data, "scripts", nested_scripts);
-            if (top_level_scripts == 0 && nested_scripts == 0) {
+            std::string raw_text;
+            bool raw_marker = false;
+            const size_t raw_scripts = payload_string_field(ir.data, "raw_text", raw_text) ?
+                script_entries_in_raw_text(raw_text, std::string(), raw_marker) : 0;
+            if (top_level_scripts == 0 && nested_scripts == 0 && raw_scripts == 0) {
                 reason = "scripts_list_empty";
                 return true;
             }
@@ -4413,7 +4645,26 @@ namespace {
         for (const char* marker : text_markers) {
             std::string marker_source_path;
             if (payload_semantic_marker_contains(ir, marker, marker_source_path)) {
-                reason = marker;
+                if (tool_lc == "burp_scanner_manage" && std::strcmp(marker, "transport_error") == 0) {
+                    std::string transport_proof;
+                    if (transport_status_structured_clean(ir, transport_proof)) {
+                        log_msg(hf, log_tag ? log_tag : "mcp.semantic",
+                            "SEMANTIC-MARKER-ALLOW -- tool=%s action=%s marker=%s source_path=%s proof=%s text_len=%zu data_type=%s evidence_source=%s",
+                            tool_lc.empty() ? "<empty>" : tool_lc.c_str(),
+                            action_lc.empty() ? "<empty>" : action_lc.c_str(),
+                            marker,
+                            marker_source_path.empty() ? "<unknown>" : marker_source_path.c_str(),
+                            compact_text(transport_proof, 300).c_str(),
+                            ir.text.size(),
+                            ir.data.type_name(),
+                            ir.evidence_source.empty() ? "<empty>" : ir.evidence_source.c_str());
+                        continue;
+                    }
+                    if (!transport_proof.empty())
+                        reason = transport_proof;
+                }
+                if (reason.empty())
+                    reason = marker;
                 log_msg(hf, log_tag ? log_tag : "mcp.semantic",
                     "SEMANTIC-MARKER-REJECT -- tool=%s action=%s marker=%s source_path=%s text_len=%zu data_type=%s evidence_source=%s",
                     tool_lc.empty() ? "<empty>" : tool_lc.c_str(),
@@ -8120,6 +8371,25 @@ namespace {
         return true;
     }
 
+    bool test_coverage_protected_re_domains_11_15_missing_session(const invoke_result_t& ir, const char* expected_id, std::string& reason) {
+        const std::string combined = lower_copy(ir.text + " " + compact_json(ir.data, 4000));
+        const std::string id_lc = lower_copy(expected_id ? expected_id : "");
+        const bool has_id = id_lc.empty() || combined.find(id_lc) != std::string::npos;
+        const bool has_session_key = combined.find("session_id") != std::string::npos || combined.find("binary_id") != std::string::npos;
+        const bool has_not_found = combined.find("not found") != std::string::npos;
+        const bool has_active_session_scope = combined.find("active session") != std::string::npos || combined.find("session_id not found") != std::string::npos;
+        if (has_id && has_session_key && has_not_found && has_active_session_scope)
+            return true;
+        if (test_coverage_protected_re_domains_11_15_payload_contains(ir, {"session_id not found"}, reason))
+            return true;
+        reason = "missing-session envelope not recognized expected_id=" + id_lc +
+            " has_id=" + std::to_string(has_id ? 1 : 0) +
+            " has_session_key=" + std::to_string(has_session_key ? 1 : 0) +
+            " has_not_found=" + std::to_string(has_not_found ? 1 : 0) +
+            " has_active_session_scope=" + std::to_string(has_active_session_scope ? 1 : 0);
+        return false;
+    }
+
     bool test_coverage_protected_re_domains_11_15_dispatch_table_structural(const invoke_result_t& ir, std::string& reason) {
         return drv_find_dispatch_table_structural_json_proof(ir, reason);
     }
@@ -8368,7 +8638,7 @@ namespace {
             mcp_standalone::json{{"action", "captures"}, {"session_id", "smc-missing-session"}},
             false, false,
             [](const invoke_result_t& ir, std::string& reason) {
-                return test_coverage_protected_re_domains_11_15_payload_contains(ir, {"session_id not found"}, reason);
+                return test_coverage_protected_re_domains_11_15_missing_session(ir, "smc-missing-session", reason);
             },
             passed, failed);
 
@@ -8376,7 +8646,7 @@ namespace {
             mcp_standalone::json{{"action", "stop"}, {"session_id", "smc-missing-session"}},
             false, false,
             [](const invoke_result_t& ir, std::string& reason) {
-                return test_coverage_protected_re_domains_11_15_payload_contains(ir, {"session_id not found"}, reason);
+                return test_coverage_protected_re_domains_11_15_missing_session(ir, "smc-missing-session", reason);
             },
             passed, failed);
 
@@ -8709,7 +8979,7 @@ namespace {
             mcp_standalone::json{{"action", "results"}, {"session_id", "iat-missing-session"}},
             false, false,
             [](const invoke_result_t& ir, std::string& reason) {
-                return test_coverage_protected_re_domains_11_15_payload_contains(ir, {"session_id not found"}, reason);
+                return test_coverage_protected_re_domains_11_15_missing_session(ir, "iat-missing-session", reason);
             },
             passed, failed);
 
@@ -8717,7 +8987,7 @@ namespace {
             mcp_standalone::json{{"action", "stop"}, {"session_id", "iat-missing-session"}},
             false, false,
             [](const invoke_result_t& ir, std::string& reason) {
-                return test_coverage_protected_re_domains_11_15_payload_contains(ir, {"session_id not found"}, reason);
+                return test_coverage_protected_re_domains_11_15_missing_session(ir, "iat-missing-session", reason);
             },
             passed, failed);
 
@@ -14525,8 +14795,10 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         return g_burp_fixture_base_url + suffix;
     }
 
-    bool send_burp_fixture_tcp_payload(HANDLE hf, const char* tag, const std::vector<uint8_t>& payload) {
-        if (!ensure_burp_http_fixture(hf, tag) || !g_burp_http_fixture || g_burp_http_fixture->port == 0)
+    bool send_loopback_tcp_payload_to_port(HANDLE hf, const char* tag, uint16_t dst_port, const std::vector<uint8_t>& payload, size_t* response_len) {
+        if (response_len)
+            *response_len = 0;
+        if (dst_port == 0)
             return false;
         if (!ensure_mcp_winsock_ready()) {
             log_msg(hf, tag, "FAIL -- WSAStartup failed for capture payload fixture");
@@ -14535,10 +14807,11 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         sockaddr_in dst = {};
         dst.sin_family = AF_INET;
         dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        dst.sin_port = htons(g_burp_http_fixture->port);
+        dst.sin_port = htons(dst_port);
         int last_err = 0;
         int sent = 0;
-        const unsigned port = static_cast<unsigned>(g_burp_http_fixture->port);
+        size_t total_recv = 0;
+        const unsigned port = static_cast<unsigned>(dst_port);
         for (int attempt = 1; attempt <= 12; ++attempt) {
             SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
             if (s == INVALID_SOCKET) {
@@ -14563,10 +14836,14 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             sent = send(s, reinterpret_cast<const char*>(payload.data()), static_cast<int>(payload.size()), 0);
             last_err = sent <= 0 ? WSAGetLastError() : 0;
             char tmp[256];
-            recv(s, tmp, sizeof(tmp), 0);
+            int got = recv(s, tmp, sizeof(tmp), 0);
+            if (got > 0)
+                total_recv += static_cast<size_t>(got);
             closesocket(s);
             if (sent > 0) {
-                log_msg(hf, tag, "PAYLOAD-SENT -- port=%u attempt=%d bytes=%d", port, attempt, sent);
+                if (response_len)
+                    *response_len = total_recv;
+                log_msg(hf, tag, "PAYLOAD-SENT -- port=%u attempt=%d bytes=%d recv_len=%zu", port, attempt, sent, total_recv);
                 break;
             }
             log_msg(hf, tag, "RETRY -- payload send failed attempt=%d port=%u err=%d", attempt, port, last_err);
@@ -14578,6 +14855,13 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         }
         Sleep(250);
         return true;
+    }
+
+    bool send_burp_fixture_tcp_payload(HANDLE hf, const char* tag, const std::vector<uint8_t>& payload) {
+        if (!ensure_burp_http_fixture(hf, tag) || !g_burp_http_fixture || g_burp_http_fixture->port == 0)
+            return false;
+        size_t response_len = 0;
+        return send_loopback_tcp_payload_to_port(hf, tag, g_burp_http_fixture->port, payload, &response_len);
     }
 
     bool seed_network_parse_capture(HANDLE hf, const char* tag, const std::vector<uint8_t>& payload) {
@@ -14674,6 +14958,326 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             static_cast<unsigned>(dst_port),
             sent);
         return true;
+    }
+
+    std::vector<uint8_t> mcp_http_fixture_request_payload(const char* path);
+    uint16_t reserve_mcp_loopback_port(HANDLE hf, const char* tag);
+
+    bool append_mcp_dns_name(std::vector<uint8_t>& payload, const std::string& domain) {
+        size_t start = 0;
+        while (start < domain.size()) {
+            size_t dot = domain.find('.', start);
+            if (dot == std::string::npos)
+                dot = domain.size();
+            const size_t len = dot - start;
+            if (len == 0 || len > 63)
+                return false;
+            payload.push_back(static_cast<uint8_t>(len));
+            payload.insert(payload.end(), domain.begin() + static_cast<std::ptrdiff_t>(start), domain.begin() + static_cast<std::ptrdiff_t>(dot));
+            start = dot + 1;
+        }
+        payload.push_back(0x00);
+        return true;
+    }
+
+    std::vector<uint8_t> mcp_dns_response_payload(const std::string& domain) {
+        std::vector<uint8_t> payload;
+        payload.reserve(12 + domain.size() + 22);
+        const uint8_t header[] = {
+            0x41, 0x44, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x00
+        };
+        payload.insert(payload.end(), std::begin(header), std::end(header));
+        if (!append_mcp_dns_name(payload, domain)) {
+            payload.clear();
+            return payload;
+        }
+        const uint8_t question_and_answer[] = {
+            0x00, 0x01, 0x00, 0x01,
+            0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x3C,
+            0x00, 0x04, 0x0A, 0x2C, 0x37, 0x42
+        };
+        payload.insert(payload.end(), std::begin(question_and_answer), std::end(question_and_answer));
+        return payload;
+    }
+
+    bool mcp_dns_first_a_answer(const std::vector<uint8_t>& payload, uint8_t (&addr)[4]) {
+        if (payload.size() < 12)
+            return false;
+        const uint16_t qdcount = (static_cast<uint16_t>(payload[4]) << 8) | payload[5];
+        const uint16_t ancount = (static_cast<uint16_t>(payload[6]) << 8) | payload[7];
+        size_t pos = 12;
+        for (uint16_t qi = 0; qi < qdcount; ++qi) {
+            while (pos < payload.size() && payload[pos] != 0) {
+                if ((payload[pos] & 0xC0) == 0xC0) {
+                    pos += 2;
+                    break;
+                }
+                if (payload[pos] > 63 || pos + payload[pos] + 1 > payload.size())
+                    return false;
+                pos += payload[pos] + 1;
+            }
+            if (pos >= payload.size())
+                return false;
+            if (payload[pos] == 0)
+                ++pos;
+            if (pos + 4 > payload.size())
+                return false;
+            pos += 4;
+        }
+        for (uint16_t ai = 0; ai < ancount && pos < payload.size(); ++ai) {
+            if ((payload[pos] & 0xC0) == 0xC0) {
+                pos += 2;
+            } else {
+                while (pos < payload.size() && payload[pos] != 0) {
+                    if ((payload[pos] & 0xC0) == 0xC0) {
+                        pos += 2;
+                        break;
+                    }
+                    if (payload[pos] > 63 || pos + payload[pos] + 1 > payload.size())
+                        return false;
+                    pos += payload[pos] + 1;
+                }
+                if (pos >= payload.size())
+                    return false;
+                if (payload[pos] == 0)
+                    ++pos;
+            }
+            if (pos + 10 > payload.size())
+                return false;
+            const uint16_t atype = (static_cast<uint16_t>(payload[pos]) << 8) | payload[pos + 1];
+            pos += 8;
+            const uint16_t rdlength = (static_cast<uint16_t>(payload[pos]) << 8) | payload[pos + 1];
+            pos += 2;
+            if (pos + rdlength > payload.size())
+                return false;
+            if (atype == 1 && rdlength == 4) {
+                addr[0] = payload[pos];
+                addr[1] = payload[pos + 1];
+                addr[2] = payload[pos + 2];
+                addr[3] = payload[pos + 3];
+                return true;
+            }
+            pos += rdlength;
+        }
+        return false;
+    }
+
+    struct mcp_rule_match_count_probe_t {
+        bool timed_out = false;
+        bool found = false;
+        bool success = false;
+        bool threw = false;
+        bool match_count_found = false;
+        uint64_t match_count = 0;
+    };
+
+    mcp_rule_match_count_probe_t network_rule_match_count_probe(HANDLE hf, const char* tag, const char* tool_name, const char* list_action, uint64_t rule_id, const char* phase) {
+        mcp_standalone::json args;
+        args["action"] = list_action ? list_action : "list";
+        auto timed = invoke_tool_action_bounded(get_server(), tool_name ? tool_name : "", list_action ? list_action : "list", args, tool_timeout_ms(tool_name ? tool_name : ""));
+        mcp_rule_match_count_probe_t probe;
+        probe.timed_out = timed.timed_out;
+        probe.found = timed.result.found;
+        probe.success = timed.result.success;
+        probe.threw = timed.result.threw;
+        probe.match_count_found = !timed.timed_out && timed.result.success &&
+            json_find_rule_match_count_recursive(timed.result.data, rule_id, probe.match_count);
+        log_msg(hf, tag, "RULE-PROBE -- phase=%s tool=%s action=%s rule_id=%llu timed_out=%d found=%d success=%d threw=%d match_count_found=%d match_count=%llu text=%s data=%s",
+            phase ? phase : "<empty>",
+            tool_name ? tool_name : "<null>",
+            list_action ? list_action : "<null>",
+            static_cast<unsigned long long>(rule_id),
+            probe.timed_out ? 1 : 0,
+            probe.found ? 1 : 0,
+            probe.success ? 1 : 0,
+            probe.threw ? 1 : 0,
+            probe.match_count_found ? 1 : 0,
+            static_cast<unsigned long long>(probe.match_count),
+            compact_text(timed.result.text, 700).c_str(),
+            compact_json(timed.result.data, 900).c_str());
+        return probe;
+    }
+
+    bool require_positive_rule_match_count_from_list(HANDLE hf,
+                                                     const char* tag,
+                                                     const char* tool_name,
+                                                     uint64_t rule_id,
+                                                     const mcp_standalone::tool_result_t& result,
+                                                     std::atomic<int>& passed,
+                                                     std::atomic<int>& failed) {
+        uint64_t match_count = 0;
+        const bool found = rule_id != 0 && json_find_rule_match_count_recursive(result.data, rule_id, match_count);
+        log_msg(hf, tag, "VERIFY-MATCH -- tool=%s rule_id=%llu found=%d match_count=%llu data=%s",
+            tool_name ? tool_name : "<null>",
+            static_cast<unsigned long long>(rule_id),
+            found ? 1 : 0,
+            static_cast<unsigned long long>(match_count),
+            compact_json(result.data, 900).c_str());
+        if (found && match_count > 0) {
+            record_mcp_functional_capture_evidence(tool_name ? tool_name : "", std::string("rule_id=") +
+                std::to_string(static_cast<unsigned long long>(rule_id)) +
+                " match_count=" + std::to_string(static_cast<unsigned long long>(match_count)));
+            return true;
+        }
+        log_msg(hf, tag, "FAIL -- rule match proof missing or zero tool=%s rule_id=%llu found=%d match_count=%llu",
+            tool_name ? tool_name : "<null>",
+            static_cast<unsigned long long>(rule_id),
+            found ? 1 : 0,
+            static_cast<unsigned long long>(match_count));
+        convert_last_pass_to_fixture_failure(tool_name ? tool_name : "", passed, failed);
+        return false;
+    }
+
+    bool stimulate_network_rule_http_fixture(HANDLE hf, const char* tag, const char* tool_name, uint64_t rule_id, uint16_t expected_port, const char* path) {
+        const uint64_t requests_before = g_burp_http_fixture ? g_burp_http_fixture->request_count.load(std::memory_order_acquire) : 0;
+        const auto payload = mcp_http_fixture_request_payload(path ? path : "/aida-network-rule-stimulus");
+        const bool sent = send_burp_fixture_tcp_payload(hf, tag, payload);
+        const uint64_t requests_after = g_burp_http_fixture ? g_burp_http_fixture->request_count.load(std::memory_order_acquire) : 0;
+        log_msg(hf, tag, "RULE-STIMULUS -- tool=%s rule_id=%llu expected_port=%u sent=%d requests_before=%llu requests_after=%llu delta=%lld path=%s",
+            tool_name ? tool_name : "<null>",
+            static_cast<unsigned long long>(rule_id),
+            static_cast<unsigned>(expected_port),
+            sent ? 1 : 0,
+            static_cast<unsigned long long>(requests_before),
+            static_cast<unsigned long long>(requests_after),
+            static_cast<long long>(requests_after) - static_cast<long long>(requests_before),
+            path ? path : "<null>");
+        return sent;
+    }
+
+    bool stimulate_network_redirect_rule(HANDLE hf, const char* tag, uint64_t rule_id, uint16_t match_port, uint16_t redirect_port, const char* path) {
+        const uint64_t requests_before = g_burp_http_fixture ? g_burp_http_fixture->request_count.load(std::memory_order_acquire) : 0;
+        const auto payload = mcp_http_fixture_request_payload(path ? path : "/aida-network-redirect-stimulus");
+        size_t response_len = 0;
+        const bool sent = send_loopback_tcp_payload_to_port(hf, tag, match_port, payload, &response_len);
+        Sleep(350);
+        const uint64_t requests_after = g_burp_http_fixture ? g_burp_http_fixture->request_count.load(std::memory_order_acquire) : 0;
+        const long long delta = static_cast<long long>(requests_after) - static_cast<long long>(requests_before);
+        const bool delivered = sent && delta > 0;
+        log_msg(hf, tag, "RULE-STIMULUS -- tool=network_redirect_manage rule_id=%llu match_port=%u redirect_port=%u sent=%d response_len=%zu requests_before=%llu requests_after=%llu delta=%lld delivered=%d path=%s",
+            static_cast<unsigned long long>(rule_id),
+            static_cast<unsigned>(match_port),
+            static_cast<unsigned>(redirect_port),
+            sent ? 1 : 0,
+            response_len,
+            static_cast<unsigned long long>(requests_before),
+            static_cast<unsigned long long>(requests_after),
+            delta,
+            delivered ? 1 : 0,
+            path ? path : "<null>");
+        return delivered;
+    }
+
+    bool stimulate_dns_spoof_rule(HANDLE hf, const char* tag, uint64_t rule_id, const std::string& domain) {
+        const auto payload = mcp_dns_response_payload(domain);
+        if (payload.empty()) {
+            log_msg(hf, tag, "RULE-STIMULUS -- tool=network_dns_manage rule_id=%llu domain=%s failed=invalid_dns_payload",
+                static_cast<unsigned long long>(rule_id),
+                domain.c_str());
+            return false;
+        }
+        if (!ensure_mcp_winsock_ready()) {
+            log_msg(hf, tag, "RULE-STIMULUS -- tool=network_dns_manage rule_id=%llu domain=%s failed=wsa_startup",
+                static_cast<unsigned long long>(rule_id),
+                domain.c_str());
+            return false;
+        }
+        SOCKET client = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        SOCKET server = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (client == INVALID_SOCKET || server == INVALID_SOCKET) {
+            const int err = WSAGetLastError();
+            if (client != INVALID_SOCKET)
+                closesocket(client);
+            if (server != INVALID_SOCKET)
+                closesocket(server);
+            log_msg(hf, tag, "RULE-STIMULUS -- tool=network_dns_manage rule_id=%llu domain=%s failed=socket err=%d",
+                static_cast<unsigned long long>(rule_id),
+                domain.c_str(),
+                err);
+            return false;
+        }
+        DWORD timeout = 1500;
+        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+        setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+        setsockopt(server, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+        BOOL reuse = TRUE;
+        setsockopt(server, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+        sockaddr_in client_addr = {};
+        client_addr.sin_family = AF_INET;
+        client_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        client_addr.sin_port = 0;
+        sockaddr_in server_addr = {};
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        server_addr.sin_port = htons(53);
+        bool ok = true;
+        int err = 0;
+        if (bind(client, reinterpret_cast<sockaddr*>(&client_addr), sizeof(client_addr)) == SOCKET_ERROR) {
+            ok = false;
+            err = WSAGetLastError();
+        }
+        int client_len = sizeof(client_addr);
+        uint16_t client_port = 0;
+        if (ok && getsockname(client, reinterpret_cast<sockaddr*>(&client_addr), &client_len) == SOCKET_ERROR) {
+            ok = false;
+            err = WSAGetLastError();
+        }
+        if (ok)
+            client_port = ntohs(client_addr.sin_port);
+        if (ok && bind(server, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) == SOCKET_ERROR) {
+            ok = false;
+            err = WSAGetLastError();
+        }
+        int sent = SOCKET_ERROR;
+        int got = SOCKET_ERROR;
+        int recv_err = 0;
+        std::vector<uint8_t> received;
+        if (ok) {
+            sockaddr_in dst = {};
+            dst.sin_family = AF_INET;
+            dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            dst.sin_port = htons(client_port);
+            sent = sendto(server,
+                reinterpret_cast<const char*>(payload.data()),
+                static_cast<int>(payload.size()),
+                0,
+                reinterpret_cast<sockaddr*>(&dst),
+                sizeof(dst));
+            if (sent == SOCKET_ERROR)
+                err = WSAGetLastError();
+            char buf[512] = {};
+            sockaddr_in from = {};
+            int from_len = sizeof(from);
+            got = recvfrom(client, buf, sizeof(buf), 0, reinterpret_cast<sockaddr*>(&from), &from_len);
+            recv_err = got == SOCKET_ERROR ? WSAGetLastError() : 0;
+            if (got > 0)
+                received.assign(reinterpret_cast<uint8_t*>(buf), reinterpret_cast<uint8_t*>(buf) + got);
+        }
+        closesocket(server);
+        closesocket(client);
+        uint8_t answer[4] = {};
+        const bool parsed_answer = !received.empty() && mcp_dns_first_a_answer(received, answer);
+        const bool spoofed_answer = parsed_answer && answer[0] == 127 && answer[1] == 0 && answer[2] == 0 && answer[3] == 1;
+        log_msg(hf, tag, "RULE-STIMULUS -- tool=network_dns_manage rule_id=%llu domain=%s response_src_port=53 client_port=%u bind_ok=%d bind_err=%d sent=%d recv=%d recv_err=%d payload_len=%zu parsed_answer=%d answer=%u.%u.%u.%u spoofed_answer=%d",
+            static_cast<unsigned long long>(rule_id),
+            domain.c_str(),
+            static_cast<unsigned>(client_port),
+            ok ? 1 : 0,
+            err,
+            sent,
+            got,
+            recv_err,
+            payload.size(),
+            parsed_answer ? 1 : 0,
+            static_cast<unsigned>(answer[0]),
+            static_cast<unsigned>(answer[1]),
+            static_cast<unsigned>(answer[2]),
+            static_cast<unsigned>(answer[3]),
+            spoofed_answer ? 1 : 0);
+        Sleep(250);
+        return ok && sent > 0 && got > 0 && spoofed_answer;
     }
 
     bool seed_udp_capture_for_detection(HANDLE hf, const char* tag, uint16_t port, const std::vector<uint8_t>& payload) {
@@ -14858,10 +15462,12 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             return;
         }
 
+        const auto mod_before = driver_bridge::list_packet_mod_rules();
         const bool stop_cap = driver_bridge::stop_capture();
         const bool clear_filters = driver_bridge::clear_filter_rules();
         const bool intercept = driver_bridge::intercept_op(1, 0, 0, 0, 0, nullptr, 0, nullptr, nullptr);
         const bool clear_mod = driver_bridge::packet_mod_rule_op(3);
+        const auto mod_after = driver_bridge::list_packet_mod_rules();
         const bool clear_redirect = driver_bridge::traffic_redirect_op(3);
         const bool clear_streams = driver_bridge::stream_reassemble_op(4);
         std::uint8_t zero[16] = {};
@@ -14869,9 +15475,10 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         const bool stop_bw = driver_bridge::bw_monitor_op(1, 0, nullptr);
         const bool reset_bw = driver_bridge::bw_monitor_op(3, 0, nullptr);
         log_msg(hf, "mcp.net_cleanup",
-            "END -- stop_capture=%d clear_filters=%d intercept_disable=%d packet_mod_clear=%d redirect_clear=%d stream_clear=%d dns_clear=%d bw_stop=%d bw_reset=%d",
+            "END -- stop_capture=%d clear_filters=%d intercept_disable=%d packet_mod_clear=%d packet_mod_before=%zu packet_mod_after=%zu redirect_clear=%d stream_clear=%d dns_clear=%d bw_stop=%d bw_reset=%d",
             stop_cap ? 1 : 0, clear_filters ? 1 : 0, intercept ? 1 : 0, clear_mod ? 1 : 0,
-            clear_redirect ? 1 : 0, clear_streams ? 1 : 0, clear_dns ? 1 : 0, stop_bw ? 1 : 0, reset_bw ? 1 : 0);
+            mod_before.size(), mod_after.size(), clear_redirect ? 1 : 0, clear_streams ? 1 : 0,
+            clear_dns ? 1 : 0, stop_bw ? 1 : 0, reset_bw ? 1 : 0);
     }
 
 
@@ -20261,7 +20868,38 @@ void test_tool_api_monitor_start(HANDLE hf, std::atomic<int>& passed, std::atomi
     }
 
     void test_tool_network_enumerate_wfp_callouts(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_call(hf, "mcp.network_enumerate_wfp_callouts", get_server(), "network_enumerate_wfp_callouts", {}, passed, failed, skipped);
+        mcp_standalone::tool_result_t result;
+        auto status = test_tool_call(hf, "mcp.network_enumerate_wfp_callouts", get_server(), "network_enumerate_wfp_callouts", {}, passed, failed, skipped, false, &result);
+        if (status == mcp_tool_call_status_t::passed && result.data.is_array()) {
+            size_t bfe = 0;
+            size_t fallback = 0;
+            size_t degraded = 0;
+            size_t filters = 0;
+            size_t block_filters = 0;
+            for (const auto& entry : result.data) {
+                std::string source;
+                std::string type;
+                std::string action;
+                bool degraded_entry = false;
+                payload_string_field(entry, "enumeration_source", source);
+                payload_string_field(entry, "entry_type", type);
+                payload_string_field(entry, "action_type_label", action);
+                payload_bool_field(entry, "degraded_inventory", degraded_entry);
+                if (source == "bfe") ++bfe;
+                if (source == "runtime_registered_fallback") ++fallback;
+                if (degraded_entry) ++degraded;
+                if (type == "filter") ++filters;
+                if (type == "filter" && action == "block") ++block_filters;
+            }
+            log_msg(hf, "mcp.network_enumerate_wfp_callouts", "WFP-INVENTORY -- entries=%zu bfe=%zu runtime_fallback=%zu degraded=%zu filters=%zu block_filters=%zu data_sample=%s",
+                result.data.size(),
+                bfe,
+                fallback,
+                degraded,
+                filters,
+                block_filters,
+                compact_json(result.data, 1600).c_str());
+        }
     }
 
     void test_tool_network_get_socket_handles(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -20364,18 +21002,46 @@ void test_tool_api_monitor_start(HANDLE hf, std::atomic<int>& passed, std::atomi
 
     void test_tool_network_packet_mod_manage_add(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         (void)skipped;
+        if (!ensure_burp_http_fixture(hf, "mcp.network_packet_mod_manage.add") || !g_burp_http_fixture || g_burp_http_fixture->port == 0) {
+            log_msg(hf, "mcp.network_packet_mod_manage.add", "FAIL -- local HTTP fixture unavailable for packet modification match-count proof");
+            record_fixture_failed_tool("network_packet_mod_manage", failed);
+            return;
+        }
         mcp_standalone::json args;
         args["direction"] = "both";
         args["protocol"] = "tcp";
-        args["port"] = 65534;
-        args["pattern_hex"] = "41";
-        args["replacement_hex"] = "42";
+        args["port"] = g_burp_http_fixture->port;
+        args["pattern_text"] = "AiDA";
+        args["replacement_text"] = "AiDB";
         g_network_packet_mod_rule_id = 0;
+        g_network_packet_mod_rule_port = g_burp_http_fixture->port;
         test_tool_network_rule_add_with_id(hf, "mcp.network_packet_mod_manage.add", "network_packet_mod_manage", "add", args, g_network_packet_mod_rule_id, passed, failed);
     }
 
     void test_tool_network_packet_mod_manage_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_action_call(hf, "mcp.network_packet_mod_manage.list", "network_packet_mod_manage", "list", {}, passed, failed, skipped);
+        if (g_network_packet_mod_rule_id != 0) {
+            network_rule_match_count_probe(hf, "mcp.network_packet_mod_manage.list", "network_packet_mod_manage", "list", g_network_packet_mod_rule_id, "before_stimulus");
+            log_msg(hf, "mcp.network_packet_mod_manage.list", "BSOD-WINDOW -- before_tcp_packet_mod_stimulus rule_id=%llu port=%u pid=%lu tid=%lu",
+                static_cast<unsigned long long>(g_network_packet_mod_rule_id),
+                static_cast<unsigned>(g_network_packet_mod_rule_port),
+                static_cast<unsigned long>(GetCurrentProcessId()),
+                static_cast<unsigned long>(GetCurrentThreadId()));
+            stimulate_network_rule_http_fixture(hf, "mcp.network_packet_mod_manage.list", "network_packet_mod_manage", g_network_packet_mod_rule_id, g_network_packet_mod_rule_port, "/aida-network-packet-mod-stimulus");
+            log_msg(hf, "mcp.network_packet_mod_manage.list", "BSOD-WINDOW -- after_tcp_packet_mod_stimulus rule_id=%llu port=%u pid=%lu tid=%lu",
+                static_cast<unsigned long long>(g_network_packet_mod_rule_id),
+                static_cast<unsigned>(g_network_packet_mod_rule_port),
+                static_cast<unsigned long>(GetCurrentProcessId()),
+                static_cast<unsigned long>(GetCurrentThreadId()));
+            network_rule_match_count_probe(hf, "mcp.network_packet_mod_manage.list", "network_packet_mod_manage", "list", g_network_packet_mod_rule_id, "after_stimulus");
+        } else {
+            log_msg(hf, "mcp.network_packet_mod_manage.list", "RULE-STIMULUS -- missing packet modification rule_id; list remains subject to zero-output validation");
+        }
+        mcp_standalone::tool_result_t result;
+        auto status = test_tool_action_call(hf, "mcp.network_packet_mod_manage.list", "network_packet_mod_manage", "list", {}, passed, failed, skipped, false, &result);
+        if (status == mcp_tool_call_status_t::passed && g_network_packet_mod_rule_id != 0) {
+            require_positive_rule_match_count_from_list(hf, "mcp.network_packet_mod_manage.list",
+                "network_packet_mod_manage", g_network_packet_mod_rule_id, result, passed, failed);
+        }
     }
 
     void test_tool_network_packet_mod_manage_remove(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -20387,8 +21053,10 @@ void test_tool_api_monitor_start(HANDLE hf, std::atomic<int>& passed, std::atomi
         mcp_standalone::json args;
         args["rule_id"] = g_network_packet_mod_rule_id;
         auto status = test_tool_action_call(hf, "mcp.network_packet_mod_manage.remove", "network_packet_mod_manage", "remove", args, passed, failed, skipped);
-        if (status == mcp_tool_call_status_t::passed)
+        if (status == mcp_tool_call_status_t::passed) {
             g_network_packet_mod_rule_id = 0;
+            g_network_packet_mod_rule_port = 0;
+        }
     }
 
     void test_tool_network_packet_mod_manage_clear(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -20397,18 +21065,58 @@ void test_tool_api_monitor_start(HANDLE hf, std::atomic<int>& passed, std::atomi
 
     void test_tool_network_redirect_manage_add(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         (void)skipped;
+        if (!ensure_burp_http_fixture(hf, "mcp.network_redirect_manage.add") || !g_burp_http_fixture || g_burp_http_fixture->port == 0) {
+            log_msg(hf, "mcp.network_redirect_manage.add", "FAIL -- local HTTP fixture unavailable for redirect match-count proof");
+            record_fixture_failed_tool("network_redirect_manage", failed);
+            return;
+        }
+        uint16_t match_port = 0;
+        for (int attempt = 0; attempt < 10 && match_port == 0; ++attempt) {
+            const uint16_t candidate = reserve_mcp_loopback_port(hf, "mcp.network_redirect_manage.add");
+            if (candidate != 0 && candidate != g_burp_http_fixture->port)
+                match_port = candidate;
+        }
+        if (match_port == 0) {
+            log_msg(hf, "mcp.network_redirect_manage.add", "FAIL -- could not reserve distinct loopback match port redirect_port=%u",
+                static_cast<unsigned>(g_burp_http_fixture->port));
+            record_fixture_failed_tool("network_redirect_manage", failed);
+            return;
+        }
         mcp_standalone::json args;
         args["protocol"] = "tcp";
-        args["match_port"] = 65534;
-        args["redirect_port"] = 65533;
+        args["match_port"] = match_port;
+        args["redirect_port"] = g_burp_http_fixture->port;
         args["match_ip"] = "127.0.0.1";
         args["redirect_ip"] = "127.0.0.1";
         g_network_redirect_rule_id = 0;
+        g_network_redirect_match_port = match_port;
+        g_network_redirect_rule_port = g_burp_http_fixture->port;
         test_tool_network_rule_add_with_id(hf, "mcp.network_redirect_manage.add", "network_redirect_manage", "add", args, g_network_redirect_rule_id, passed, failed);
     }
 
     void test_tool_network_redirect_manage_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_action_call(hf, "mcp.network_redirect_manage.list", "network_redirect_manage", "list", {}, passed, failed, skipped);
+        bool redirect_delivery_ok = false;
+        if (g_network_redirect_rule_id != 0) {
+            network_rule_match_count_probe(hf, "mcp.network_redirect_manage.list", "network_redirect_manage", "list", g_network_redirect_rule_id, "before_stimulus");
+            redirect_delivery_ok = stimulate_network_redirect_rule(hf, "mcp.network_redirect_manage.list", g_network_redirect_rule_id, g_network_redirect_match_port, g_network_redirect_rule_port, "/aida-network-redirect-stimulus");
+            network_rule_match_count_probe(hf, "mcp.network_redirect_manage.list", "network_redirect_manage", "list", g_network_redirect_rule_id, "after_stimulus");
+        } else {
+            log_msg(hf, "mcp.network_redirect_manage.list", "RULE-STIMULUS -- missing redirect rule_id; list remains subject to zero-output validation");
+        }
+        mcp_standalone::tool_result_t result;
+        auto status = test_tool_action_call(hf, "mcp.network_redirect_manage.list", "network_redirect_manage", "list", {}, passed, failed, skipped, false, &result);
+        if (status == mcp_tool_call_status_t::passed && g_network_redirect_rule_id != 0) {
+            const bool match_count_ok = require_positive_rule_match_count_from_list(hf, "mcp.network_redirect_manage.list",
+                "network_redirect_manage", g_network_redirect_rule_id, result, passed, failed);
+            if (match_count_ok && !redirect_delivery_ok) {
+                log_msg(hf, "mcp.network_redirect_manage.list", "FAIL -- redirect rule matched but delivery proof failed rule_id=%llu match_port=%u redirect_port=%u data=%s",
+                    static_cast<unsigned long long>(g_network_redirect_rule_id),
+                    static_cast<unsigned>(g_network_redirect_match_port),
+                    static_cast<unsigned>(g_network_redirect_rule_port),
+                    compact_json(result.data, 900).c_str());
+                convert_last_pass_to_fixture_failure("network_redirect_manage", passed, failed);
+            }
+        }
     }
 
     void test_tool_network_redirect_manage_remove(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -20420,8 +21128,11 @@ void test_tool_api_monitor_start(HANDLE hf, std::atomic<int>& passed, std::atomi
         mcp_standalone::json args;
         args["rule_id"] = g_network_redirect_rule_id;
         auto status = test_tool_action_call(hf, "mcp.network_redirect_manage.remove", "network_redirect_manage", "remove", args, passed, failed, skipped);
-        if (status == mcp_tool_call_status_t::passed)
+        if (status == mcp_tool_call_status_t::passed) {
             g_network_redirect_rule_id = 0;
+            g_network_redirect_match_port = 0;
+            g_network_redirect_rule_port = 0;
+        }
     }
 
     void test_tool_network_redirect_manage_clear(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -20645,11 +21356,24 @@ void test_tool_api_monitor_start(HANDLE hf, std::atomic<int>& passed, std::atomi
         args["spoof_ip"] = "127.0.0.1";
         args["ttl"] = 30;
         g_network_dns_spoof_rule_id = 0;
+        g_network_dns_spoof_domain = args["domain"].get<std::string>();
         test_tool_network_rule_add_with_id(hf, "mcp.network_dns_manage.add_spoof", "network_dns_manage", "add_spoof", args, g_network_dns_spoof_rule_id, passed, failed);
     }
 
     void test_tool_network_dns_manage_list_spoof(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_action_call(hf, "mcp.network_dns_manage.list_spoof", "network_dns_manage", "list_spoof", {}, passed, failed, skipped);
+        if (g_network_dns_spoof_rule_id != 0 && !g_network_dns_spoof_domain.empty()) {
+            network_rule_match_count_probe(hf, "mcp.network_dns_manage.list_spoof", "network_dns_manage", "list_spoof", g_network_dns_spoof_rule_id, "before_stimulus");
+            stimulate_dns_spoof_rule(hf, "mcp.network_dns_manage.list_spoof", g_network_dns_spoof_rule_id, g_network_dns_spoof_domain);
+            network_rule_match_count_probe(hf, "mcp.network_dns_manage.list_spoof", "network_dns_manage", "list_spoof", g_network_dns_spoof_rule_id, "after_stimulus");
+        } else {
+            log_msg(hf, "mcp.network_dns_manage.list_spoof", "RULE-STIMULUS -- missing DNS spoof rule_id/domain; list remains subject to zero-output validation");
+        }
+        mcp_standalone::tool_result_t result;
+        auto status = test_tool_action_call(hf, "mcp.network_dns_manage.list_spoof", "network_dns_manage", "list_spoof", {}, passed, failed, skipped, false, &result);
+        if (status == mcp_tool_call_status_t::passed && g_network_dns_spoof_rule_id != 0) {
+            require_positive_rule_match_count_from_list(hf, "mcp.network_dns_manage.list_spoof",
+                "network_dns_manage", g_network_dns_spoof_rule_id, result, passed, failed);
+        }
     }
 
     void test_tool_network_dns_manage_remove_spoof(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -20661,8 +21385,10 @@ void test_tool_api_monitor_start(HANDLE hf, std::atomic<int>& passed, std::atomi
         mcp_standalone::json args;
         args["rule_id"] = g_network_dns_spoof_rule_id;
         auto status = test_tool_action_call(hf, "mcp.network_dns_manage.remove_spoof", "network_dns_manage", "remove_spoof", args, passed, failed, skipped);
-        if (status == mcp_tool_call_status_t::passed)
+        if (status == mcp_tool_call_status_t::passed) {
             g_network_dns_spoof_rule_id = 0;
+            g_network_dns_spoof_domain.clear();
+        }
     }
 
     void test_tool_network_dns_manage_clear_spoof(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -21748,6 +22474,7 @@ void test_tool_api_monitor_start(HANDLE hf, std::atomic<int>& passed, std::atomi
         auto status = test_tool_action_call(hf, "mcp.autoresponder_manage.add_rule", "autoresponder_manage", "add_rule", args, passed, failed, skipped, true, &result);
         if (status == mcp_tool_call_status_t::passed) {
             json_u64_field(result.data, "rule_id", g_autoresponder_rule_id);
+            g_autoresponder_rule_match_pattern = match_pattern;
             log_msg(hf, "mcp.autoresponder_manage.add_rule", "VERIFY-RESULT -- captured_rule_id=%llu data=%s text=%s",
                 (unsigned long long)g_autoresponder_rule_id,
                 compact_json(result.data, 900).c_str(),
@@ -21785,11 +22512,38 @@ void test_tool_api_monitor_start(HANDLE hf, std::atomic<int>& passed, std::atomi
                 contains ? 1 : 0,
                 compact_text(listed.result.text, 700).c_str(),
                 compact_json(listed.result.data, 900).c_str());
+            g_autoresponder_rule_match_pattern.clear();
         }
     }
 
     void test_tool_autoresponder_manage_list_rules(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         log_msg(hf, "mcp.autoresponder_manage.list_rules", "VERIFY-INPUT -- captured_rule_id=%llu", (unsigned long long)g_autoresponder_rule_id);
+        if (g_autoresponder_rule_id != 0) {
+            auto before_probe = network_rule_match_count_probe(hf, "mcp.autoresponder_manage.list_rules", "autoresponder_manage", "list_rules", g_autoresponder_rule_id, "before_stimulus");
+            mcp_standalone::json match_args;
+            match_args["action"] = "match_request";
+            match_args["method"] = "GET";
+            match_args["url"] = g_autoresponder_rule_match_pattern.empty() ? "http://test.local/aida-mcp-autoresponder" : g_autoresponder_rule_match_pattern + "aida-mcp-autoresponder";
+            match_args["headers"] = mcp_standalone::json{{"Host", "test.local"}};
+            auto matched = invoke_tool_action_bounded(get_server(), "autoresponder_manage", "match_request", match_args, tool_timeout_ms("autoresponder_manage"));
+            log_msg(hf, "mcp.autoresponder_manage.list_rules", "RULE-STIMULUS -- tool=autoresponder_manage rule_id=%llu match_pattern=%s before_found=%d before_match_count=%llu match_timeout=%d match_success=%d match_text=%s match_data=%s",
+                static_cast<unsigned long long>(g_autoresponder_rule_id),
+                g_autoresponder_rule_match_pattern.empty() ? "<empty>" : g_autoresponder_rule_match_pattern.c_str(),
+                before_probe.match_count_found ? 1 : 0,
+                static_cast<unsigned long long>(before_probe.match_count),
+                matched.timed_out ? 1 : 0,
+                matched.result.success ? 1 : 0,
+                compact_text(matched.result.text, 700).c_str(),
+                compact_json(matched.result.data, 900).c_str());
+            auto after_probe = network_rule_match_count_probe(hf, "mcp.autoresponder_manage.list_rules", "autoresponder_manage", "list_rules", g_autoresponder_rule_id, "after_stimulus");
+            log_msg(hf, "mcp.autoresponder_manage.list_rules", "RULE-STIMULUS-RESULT -- tool=autoresponder_manage rule_id=%llu match_pattern=%s after_found=%d after_match_count=%llu proof_required=match_count_positive",
+                static_cast<unsigned long long>(g_autoresponder_rule_id),
+                g_autoresponder_rule_match_pattern.empty() ? "<empty>" : g_autoresponder_rule_match_pattern.c_str(),
+                after_probe.match_count_found ? 1 : 0,
+                static_cast<unsigned long long>(after_probe.match_count));
+        } else {
+            log_msg(hf, "mcp.autoresponder_manage.list_rules", "RULE-STIMULUS -- missing autoresponder rule_id; list remains subject to zero-output validation");
+        }
         mcp_standalone::tool_result_t result;
         auto status = test_tool_action_call(hf, "mcp.autoresponder_manage.list_rules", "autoresponder_manage", "list_rules", {}, passed, failed, skipped, false, &result);
         if (status == mcp_tool_call_status_t::passed) {
@@ -21800,6 +22554,9 @@ void test_tool_api_monitor_start(HANDLE hf, std::atomic<int>& passed, std::atomi
                 (g_autoresponder_rule_id != 0 &&
                     json_array_contains_u64_field(result.data, "rules", g_autoresponder_rule_id, { "id", "rule_id" })) ? 1 : 0,
                 compact_json(result.data, 900).c_str());
+            if (g_autoresponder_rule_id != 0)
+                require_positive_rule_match_count_from_list(hf, "mcp.autoresponder_manage.list_rules",
+                    "autoresponder_manage", g_autoresponder_rule_id, result, passed, failed);
         }
     }
 
@@ -23587,16 +24344,24 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
         if (value.is_array())
             top_level_scripts = value.size();
         payload_array_count(value, "scripts", nested_scripts);
-        const size_t script_count = std::max(top_level_scripts, nested_scripts);
+        std::string raw_text;
+        bool raw_marker_present = false;
+        const size_t raw_scripts = payload_string_field(value, "raw_text", raw_text) ?
+            script_entries_in_raw_text(raw_text, expected_src_marker, raw_marker_present) : 0;
+        const size_t script_count = (std::max)(raw_scripts, (std::max)(top_level_scripts, nested_scripts));
         if (script_count == 0) {
             reason = "scripts_empty";
             return false;
         }
-        if (!expected_src_marker.empty() && lower_copy(value.dump()).find(lower_copy(expected_src_marker)) == std::string::npos) {
+        if (!expected_src_marker.empty() &&
+            lower_copy(value.dump()).find(lower_copy(expected_src_marker)) == std::string::npos &&
+            !raw_marker_present) {
             reason = "expected_script_marker_missing scripts=" + std::to_string(script_count);
             return false;
         }
-        reason = "scripts=" + std::to_string(script_count) + " expected_marker_present=1";
+        reason = "scripts=" + std::to_string(script_count) +
+            " raw_scripts=" + std::to_string(raw_scripts) +
+            " expected_marker_present=1";
         return true;
     }
 
@@ -24531,6 +25296,7 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
 
         mcp_standalone::json scripts_args;
         scripts_args["action"] = "list";
+        scripts_args["page_id"] = fixture_page;
         mcp_standalone::tool_result_t scripts_result;
         auto scripts_status = test_tool_call(hf, "mcp.camoufox.scripts", get_server(), "scripts", scripts_args, passed, failed, skipped, false, &scripts_result);
         bool scripts_fixture_ok = false;
@@ -26026,6 +26792,7 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
                     return true;
                 }, passed, failed);
         }
+        std::string recorded_mutate_session_id;
         if (!cancelled || !cancelled()) {
             mcp_standalone::json args;
             args["pid"] = g_mcp_target_pid != 0 ? g_mcp_target_pid : static_cast<std::uint32_t>(GetCurrentProcessId());
@@ -26034,7 +26801,7 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
             args["max_payload"] = 64;
             args["payloads_hex"] = mcp_standalone::json::array({"414944415F5544505F3031", "414944415F5544505F3032"});
             test_coverage_net_thread_domains_9_10_16_case(hf, tag, reassemble_tool, "reassemble_stream_negative_capture_clamped", args, 2500,
-                [](const invoke_result_t& ir, std::string& reason) {
+                [&recorded_mutate_session_id](const invoke_result_t& ir, std::string& reason) {
                     if (!ir.success)
                         return test_coverage_net_thread_domains_9_10_16_known_driver_fail_closed(ir);
                     uint64_t capture_ms = 0;
@@ -26073,12 +26840,45 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
                         reason = "sessions missing_or_empty";
                         return false;
                     }
+                    const auto& first_session = ir.data["sessions"].front();
+                    if (!first_session.is_object() ||
+                        !json_string_any_field(first_session, recorded_mutate_session_id, { "session_id", "id" }) ||
+                        recorded_mutate_session_id.empty()) {
+                        reason = "recorded mutate session_id missing";
+                        return false;
+                    }
                     return true;
                 }, passed, failed);
         }
         if (!cancelled || !cancelled()) {
             mcp_standalone::json args;
             args["session_id"] = "missing";
+            args["target_ip"] = "127.0.0.1";
+            args["target_port"] = 9;
+            args["allow_unsafe"] = true;
+            args["confirm_unsafe"] = true;
+            args["max_mutations"] = 1;
+            args["payload_cap"] = 64;
+            args["response_wait_ms"] = 0;
+            test_coverage_net_thread_domains_9_10_16_case(hf, tag, mutate_tool, "mutate_packet_missing_session_negative", args, 2000,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    return test_coverage_net_thread_domains_9_10_16_expect_error_any(ir, {"session_id not found"}, reason);
+                }, passed, failed);
+        }
+        auto require_recorded_mutate_session = [&](const char* case_name) -> bool {
+            if (!recorded_mutate_session_id.empty())
+                return true;
+            log_msg(hf, tag, "FAIL -- case=%s tool=\"%s\" missing deterministic session_id from net_udp_session_reassemble; guard case not dispatched with placeholder id",
+                case_name ? case_name : "<null>",
+                mutate_tool.empty() ? "<empty>" : mutate_tool.c_str());
+            if (!mutate_tool.empty())
+                record_tool_status(mutate_tool, mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
+            return false;
+        };
+        if ((!cancelled || !cancelled()) && require_recorded_mutate_session("mutate_packet_requires_dual_unsafe_gate")) {
+            mcp_standalone::json args;
+            args["session_id"] = recorded_mutate_session_id;
             args["target_ip"] = "127.0.0.1";
             args["target_port"] = 9;
             args["allow_unsafe"] = false;
@@ -26088,9 +26888,9 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
                     return test_coverage_net_thread_domains_9_10_16_expect_error_any(ir, {"allow_unsafe=true", "confirm_unsafe=true"}, reason);
                 }, passed, failed);
         }
-        if (!cancelled || !cancelled()) {
+        if ((!cancelled || !cancelled()) && require_recorded_mutate_session("mutate_packet_invalid_target_ip_or_driver_unavailable")) {
             mcp_standalone::json args;
-            args["session_id"] = "missing";
+            args["session_id"] = recorded_mutate_session_id;
             args["target_ip"] = "999.1.1.1";
             args["target_port"] = 9;
             args["allow_unsafe"] = true;
@@ -26104,9 +26904,9 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
                         {"target_ip must be an ipv4 literal", "driver bridge is not connected"}, reason);
                 }, passed, failed);
         }
-        if (!cancelled || !cancelled()) {
+        if ((!cancelled || !cancelled()) && require_recorded_mutate_session("mutate_packet_non_loopback_guard_or_driver_unavailable")) {
             mcp_standalone::json args;
-            args["session_id"] = "missing";
+            args["session_id"] = recorded_mutate_session_id;
             args["target_ip"] = "8.8.8.8";
             args["target_port"] = 9;
             args["allow_unsafe"] = true;
@@ -26121,10 +26921,10 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
                         {"non-loopback mutation replay requires allow_non_loopback=true", "driver bridge is not connected"}, reason);
                 }, passed, failed);
         }
-        if (!cancelled || !cancelled()) {
+        if ((!cancelled || !cancelled()) && require_recorded_mutate_session("mutate_packet_unknown_action_guard")) {
             mcp_standalone::json args;
             args["action"] = "drop";
-            args["session_id"] = "missing";
+            args["session_id"] = recorded_mutate_session_id;
             test_coverage_net_thread_domains_9_10_16_case(hf, tag, mutate_tool, "mutate_packet_unknown_action_guard", args, 1500,
                 [](const invoke_result_t& ir, std::string& reason) {
                     return test_coverage_net_thread_domains_9_10_16_expect_error_any(ir, {"unknown action", "net_replay_mutate"}, reason);
@@ -26347,6 +27147,7 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     g_mcp_patch_index = -1;
     g_mcp_get_patches_fixture_index = -1;
     g_autoresponder_rule_id = 0;
+    g_autoresponder_rule_match_pattern.clear();
     g_mcp_deferred_action_resource_guarded = false;
     g_burp_scanner_audit_id = 0;
     g_burp_scanner_issue_id = 0;
@@ -26363,6 +27164,10 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     g_network_packet_mod_rule_id = 0;
     g_network_redirect_rule_id = 0;
     g_network_dns_spoof_rule_id = 0;
+    g_network_packet_mod_rule_port = 0;
+    g_network_redirect_match_port = 0;
+    g_network_redirect_rule_port = 0;
+    g_network_dns_spoof_domain.clear();
     g_burp_api_collection_id = 0;
     g_burp_ws_conn_id = 0;
     g_burp_upstream_chain_id = 0;

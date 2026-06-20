@@ -995,8 +995,8 @@ std::optional<exchange_observed_t> send(const std::vector<uint8_t>& raw_request,
     if (options.publish_exchange) {
         ex.source = options.exchange_source.empty() ? "api" : options.exchange_source;
         aida::events::publish(kExchangeObservedEvent, ex);
-        diag::log_tagged_fmt("audit_http", "send published_exchange source=%s host=%s path=%s status=%d body=%zu",
-            ex.source.c_str(), ex.host.c_str(), ex.path.c_str(), ex.status_code, ex.resp_body.size());
+        diag::log_tagged_fmt("audit_http", "send published_exchange source=%s source_label=%s host=%s path=%s status=%d body=%zu",
+            ex.source.c_str(), ex.source.c_str(), ex.host.c_str(), ex.path.c_str(), ex.status_code, ex.resp_body.size());
     }
     return ex;
 }

@@ -91,6 +91,39 @@ namespace tctx_diag {
         return ctx.Rip != 0 && ctx.Rsp != 0;
     }
 
+    __forceinline BOOLEAN is_user_canonical(UINT64 value) {
+        return value != 0 && value <= 0x00007FFFFFFFFFFFULL;
+    }
+
+    __forceinline BOOLEAN is_kernel_canonical(UINT64 value) {
+        return value >= 0xFFFF800000000000ULL;
+    }
+
+    __forceinline const char* address_class(UINT64 value) {
+        if (value == 0) {
+            return "zero";
+        }
+        if (is_user_canonical(value)) {
+            return "user";
+        }
+        if (is_kernel_canonical(value)) {
+            return "kernel";
+        }
+        return "noncanonical";
+    }
+
+    __forceinline BOOLEAN user_context_sane(UINT64 rip, UINT64 rsp, UINT64 rflags) {
+        return rflags != 0 && is_user_canonical(rip) && is_user_canonical(rsp);
+    }
+
+    __forceinline BOOLEAN user_context_sane(const CONTEXT& ctx) {
+        return user_context_sane(ctx.Rip, ctx.Rsp, ctx.EFlags);
+    }
+
+    __forceinline BOOLEAN user_context_sane(const thread_ctx& ctx) {
+        return user_context_sane(ctx.rip, ctx.rsp, ctx.rflags);
+    }
+
     __forceinline BOOLEAN debug_registers_requested(UINT64 mask) {
         return (mask & kDebugRegisterMask) != 0;
     }
@@ -108,11 +141,16 @@ namespace tctx_diag {
         case STATUS_NOT_FOUND: return "STATUS_NOT_FOUND";
         case STATUS_ACCESS_DENIED: return "STATUS_ACCESS_DENIED";
         case STATUS_ACCESS_VIOLATION: return "STATUS_ACCESS_VIOLATION";
+        case STATUS_INVALID_ADDRESS: return "STATUS_INVALID_ADDRESS";
         case STATUS_INFO_LENGTH_MISMATCH: return "STATUS_INFO_LENGTH_MISMATCH";
         case STATUS_INSUFFICIENT_RESOURCES: return "STATUS_INSUFFICIENT_RESOURCES";
         case STATUS_THREAD_IS_TERMINATING: return "STATUS_THREAD_IS_TERMINATING";
         default: return "STATUS_OTHER";
         }
+    }
+
+    __forceinline ULONG ntstatus_win32(NTSTATUS status) {
+        return RtlNtStatusToDosError(status);
     }
 
     __forceinline ULONGLONG elapsed_ms(const LARGE_INTEGER& start, const LARGE_INTEGER& freq) {
@@ -284,7 +322,7 @@ namespace tctx_diag {
     }
 
     __forceinline void log_context(const char* prefix, const char* phase, const char* source, ULONG attempt, NTSTATUS status, NTSTATUS attach_status, BOOLEAN attached, const CONTEXT& ctx, const LARGE_INTEGER& start, const LARGE_INTEGER& freq) {
-        WW_LOG("TCTX %s phase=%s source=%s attempt=%u status=0x%08X status_text=%s attach_status=0x%08X attach_status_text=%s attached=%u flags=0x%08X rip=0x%llX rsp=0x%llX rbp=0x%llX rflags=0x%llX dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX core_valid=%u elapsed_ms=%llu",
+        WW_LOG("TCTX %s phase=%s source=%s attempt=%u status=0x%08X status_text=%s attach_status=0x%08X attach_status_text=%s attached=%u flags=0x%08X rip=0x%llX rip_class=%s rsp=0x%llX rsp_class=%s rbp=0x%llX rflags=0x%llX dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX core_valid=%u user_sane=%u elapsed_ms=%llu",
             prefix,
             phase,
             source,
@@ -296,7 +334,9 @@ namespace tctx_diag {
             attached ? 1u : 0u,
             ctx.ContextFlags,
             (unsigned long long)ctx.Rip,
+            address_class(ctx.Rip),
             (unsigned long long)ctx.Rsp,
+            address_class(ctx.Rsp),
             (unsigned long long)ctx.Rbp,
             (unsigned long long)ctx.EFlags,
             (unsigned long long)ctx.Dr0,
@@ -306,6 +346,7 @@ namespace tctx_diag {
             (unsigned long long)ctx.Dr6,
             (unsigned long long)ctx.Dr7,
             core_registers_present(ctx) ? 1u : 0u,
+            user_context_sane(ctx) ? 1u : 0u,
             elapsed_ms(start, freq));
     }
 }
@@ -426,15 +467,19 @@ namespace trapframe_ctx {
         ULONG selected_flags = 0;
         BOOLEAN selected_attached = FALSE;
         BOOLEAN zero_context_seen = FALSE;
+        BOOLEAN invalid_user_context_seen = FALSE;
         tctx_diag::thread_snapshot_t read_thread_before = tctx_diag::query_thread_snapshot(request->pid, request->tid);
         ULONG import_missing_count = 0;
         ULONG handle_missing_count = 0;
         ULONG call_failure_count = 0;
         ULONG attach_failure_count = 0;
         ULONG zero_context_count = 0;
+        ULONG invalid_user_context_count = 0;
         NTSTATUS last_failure_status = STATUS_SUCCESS;
         NTSTATUS last_attach_status = STATUS_SUCCESS;
         const char* last_failure_source = "none";
+        const char* first_zero_context_source = "none";
+        const char* first_invalid_user_context_source = "none";
         native_context_attempt_t attempts[] = {
             { "ps_kernel_debug", tctx_diag::kContextDebugFlags, TRUE, FALSE },
             { "ps_attach_debug", tctx_diag::kContextDebugFlags, TRUE, TRUE },
@@ -519,26 +564,44 @@ namespace trapframe_ctx {
                     }
                 }
                 tctx_diag::log_context("read_attempt", phase, current.source, attempt_index++, status, attach_status, attached, *ctx, phase_start, phase_freq);
-                if (NT_SUCCESS(status) && tctx_diag::core_registers_present(*ctx)) {
+                if (NT_SUCCESS(status) && tctx_diag::user_context_sane(*ctx)) {
                     selected_source = current.source;
                     selected_flags = ctx->ContextFlags;
                     selected_attached = attached;
-                    WW_LOG("TCTX %s read_selected source=%s status=0x%08X flags=0x%08X attached=%u elapsed_ms=%llu",
+                    WW_LOG("TCTX %s read_selected source=%s status=0x%08X flags=0x%08X attached=%u rip=0x%llX rip_class=%s rsp=0x%llX rsp_class=%s rflags=0x%llX user_sane=1 elapsed_ms=%llu",
                         phase,
                         selected_source,
                         (ULONG)status,
                         selected_flags,
                         selected_attached ? 1u : 0u,
+                        (unsigned long long)ctx->Rip,
+                        tctx_diag::address_class(ctx->Rip),
+                        (unsigned long long)ctx->Rsp,
+                        tctx_diag::address_class(ctx->Rsp),
+                        (unsigned long long)ctx->EFlags,
                         dbg_guard::elapsed_ms(phase_start, phase_freq));
                     return status;
                 }
                 if (NT_SUCCESS(status)) {
-                    zero_context_seen = TRUE;
-                    ++zero_context_count;
-                    last_failure_status = STATUS_UNSUCCESSFUL;
+                    if (!tctx_diag::core_registers_present(*ctx)) {
+                        zero_context_seen = TRUE;
+                        ++zero_context_count;
+                        if (zero_context_count == 1) {
+                            first_zero_context_source = current.source;
+                        }
+                        last_failure_status = STATUS_UNSUCCESSFUL;
+                        status = STATUS_UNSUCCESSFUL;
+                    } else {
+                        invalid_user_context_seen = TRUE;
+                        ++invalid_user_context_count;
+                        if (invalid_user_context_count == 1) {
+                            first_invalid_user_context_source = current.source;
+                        }
+                        last_failure_status = STATUS_INVALID_ADDRESS;
+                        status = STATUS_INVALID_ADDRESS;
+                    }
                     last_attach_status = attach_status;
                     last_failure_source = current.source;
-                    status = STATUS_UNSUCCESSFUL;
                 } else {
                     ++call_failure_count;
                     if (!NT_SUCCESS(attach_status)) {
@@ -555,7 +618,9 @@ namespace trapframe_ctx {
             }
         }
 
-        if (zero_context_seen && NT_SUCCESS(status)) {
+        if (invalid_user_context_seen) {
+            status = STATUS_INVALID_ADDRESS;
+        } else if (zero_context_seen) {
             status = STATUS_UNSUCCESSFUL;
         }
         const UINT32 unsupported_state = (!NT_SUCCESS(status) &&
@@ -563,7 +628,7 @@ namespace trapframe_ctx {
         const UINT32 zero_context = (NT_SUCCESS(status) && (ctx->Rip == 0 || ctx->Rsp == 0)) ? 1u : 0u;
         tctx_diag::thread_snapshot_t read_thread_after = tctx_diag::query_thread_snapshot(request->pid, request->tid);
         if (!NT_SUCCESS(status) || zero_context) {
-            WW_LOG("TCTX %s read_failure_summary pid=%u tid=%u status=0x%08X status_text=%s attempts=%u import_missing=%lu handle_missing=%lu call_failures=%lu attach_failures=%lu zero_context_failures=%lu last_source=%s last_status=0x%08X last_status_text=%s last_attach_status=0x%08X last_attach_status_text=%s ps_get_absent=%u nt_get_resolver_absent=%u handle_absent=%u thread_before_found=%u thread_before_state=%lu thread_before_wait_reason=%lu thread_after_found=%u thread_after_status=0x%08X thread_after_status_text=%s thread_after_state=%lu thread_after_wait_reason=%lu elapsed_ms=%llu",
+            WW_LOG("TCTX %s read_failure_summary pid=%u tid=%u status=0x%08X status_text=%s attempts=%u import_missing=%lu handle_missing=%lu call_failures=%lu attach_failures=%lu zero_context_failures=%lu invalid_user_context_failures=%lu first_zero_source=%s first_invalid_user_source=%s last_source=%s last_status=0x%08X last_status_text=%s last_attach_status=0x%08X last_attach_status_text=%s ps_get_absent=%u nt_get_resolver_absent=%u handle_absent=%u thread_before_found=%u thread_before_state=%lu thread_before_wait_reason=%lu thread_after_found=%u thread_after_status=0x%08X thread_after_status_text=%s thread_after_state=%lu thread_after_wait_reason=%lu rip_class=%s rsp_class=%s elapsed_ms=%llu",
                 phase,
                 request->pid,
                 request->tid,
@@ -575,6 +640,9 @@ namespace trapframe_ctx {
                 call_failure_count,
                 attach_failure_count,
                 zero_context_count,
+                invalid_user_context_count,
+                first_zero_context_source,
+                first_invalid_user_context_source,
                 last_failure_source,
                 (ULONG)last_failure_status,
                 tctx_diag::ntstatus_text(last_failure_status),
@@ -591,8 +659,10 @@ namespace trapframe_ctx {
                 tctx_diag::ntstatus_text(read_thread_after.status),
                 read_thread_after.thread_state,
                 read_thread_after.wait_reason,
+                tctx_diag::address_class(ctx->Rip),
+                tctx_diag::address_class(ctx->Rsp),
                 dbg_guard::elapsed_ms(phase_start, phase_freq));
-            WW_LOG("TCTX %s read_fail_detail pid=%u tid=%u status=0x%08X status_text=%s ps_status=0x%08X ps_status_text=%s nt_status=0x%08X nt_status_text=%s previous_mode=%u requestor_mode=%u handle=%p unsupported_state=%u zero_context=%u zero_seen=%u elapsed_ms=%llu",
+            WW_LOG("TCTX %s read_fail_detail pid=%u tid=%u status=0x%08X status_text=%s ps_status=0x%08X ps_status_text=%s nt_status=0x%08X nt_status_text=%s previous_mode=%u requestor_mode=%u handle=%p unsupported_state=%u zero_context=%u zero_seen=%u invalid_user_context=%u rip=0x%llX rip_class=%s rsp=0x%llX rsp_class=%s rflags=0x%llX elapsed_ms=%llu",
                 phase,
                 request->pid,
                 request->tid,
@@ -608,9 +678,15 @@ namespace trapframe_ctx {
                 unsupported_state,
                 zero_context,
                 zero_context_seen ? 1u : 0u,
+                invalid_user_context_seen ? 1u : 0u,
+                (unsigned long long)ctx->Rip,
+                tctx_diag::address_class(ctx->Rip),
+                (unsigned long long)ctx->Rsp,
+                tctx_diag::address_class(ctx->Rsp),
+                (unsigned long long)ctx->EFlags,
                 dbg_guard::elapsed_ms(phase_start, phase_freq));
         }
-        WW_LOG("TCTX %s read_exit status=0x%08X status_text=%s selected_source=%s selected_flags=0x%08X selected_attached=%u flags=0x%08X thread_after_found=%u thread_after_state=%lu thread_after_wait_reason=%lu rip=0x%llX rsp=0x%llX rflags=0x%llX dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX elapsed_ms=%llu",
+        WW_LOG("TCTX %s read_exit status=0x%08X status_text=%s selected_source=%s selected_flags=0x%08X selected_attached=%u flags=0x%08X thread_after_found=%u thread_after_state=%lu thread_after_wait_reason=%lu rip=0x%llX rip_class=%s rsp=0x%llX rsp_class=%s rflags=0x%llX user_sane=%u dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX elapsed_ms=%llu",
             phase,
             (ULONG)status,
             tctx_diag::ntstatus_text(status),
@@ -622,8 +698,11 @@ namespace trapframe_ctx {
             read_thread_after.thread_state,
             read_thread_after.wait_reason,
             (unsigned long long)ctx->Rip,
+            tctx_diag::address_class(ctx->Rip),
             (unsigned long long)ctx->Rsp,
+            tctx_diag::address_class(ctx->Rsp),
             (unsigned long long)ctx->EFlags,
+            tctx_diag::user_context_sane(*ctx) ? 1u : 0u,
             (unsigned long long)ctx->Dr0,
             (unsigned long long)ctx->Dr1,
             (unsigned long long)ctx->Dr2,
@@ -815,6 +894,606 @@ namespace trapframe_ctx {
 }
 
 
+namespace tctx_system_route {
+    constexpr ULONG kWorkerTag = 'xTcT';
+    constexpr LONGLONG kWorkerWait100ns = -50000000LL;
+
+    struct worker_t {
+        KEVENT done;
+        PEPROCESS process;
+        PETHREAD thread;
+        POBJECT_TYPE thread_type;
+        thread_ctx input;
+        thread_ctx output;
+        CONTEXT ctx;
+        NTSTATUS status;
+        NTSTATUS open_status;
+        NTSTATUS suspend_status;
+        NTSTATUS context_status;
+        NTSTATUS resume_status;
+        NTSTATUS resume_fallback_status;
+        NTSTATUS close_status;
+        ULONG suspend_prev_count;
+        ULONG resume_prev_count;
+        KPROCESSOR_MODE caller_mode;
+        KPROCESSOR_MODE worker_mode;
+        BOOLEAN suspended;
+        BOOLEAN suspended_via_ps;
+        BOOLEAN result_valid;
+        BOOLEAN close_attempted;
+        UINT32 pid;
+        UINT32 tid;
+        LARGE_INTEGER start;
+        LARGE_INTEGER freq;
+        HANDLE thread_handle;
+        const char* reason;
+        volatile LONG refs;
+    };
+
+    __forceinline void release_work(worker_t* work) {
+        if (work && InterlockedDecrement(&work->refs) == 0) {
+            ExFreePoolWithTag(work, kWorkerTag);
+        }
+    }
+
+    __forceinline NTSTATUS resume_worker_thread(worker_t* work) {
+        if (!work || !work->suspended) {
+            return STATUS_SUCCESS;
+        }
+
+        ULONG prev_count = 0;
+        NTSTATUS primary = STATUS_PROCEDURE_NOT_FOUND;
+        NTSTATUS fallback = STATUS_PROCEDURE_NOT_FOUND;
+
+        if (work->suspended_via_ps && _PsResumeThread) {
+            __try {
+                primary = _PsResumeThread(work->thread, &prev_count);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                primary = (NTSTATUS)GetExceptionCode();
+            }
+        } else if (work->thread_handle) {
+            __try {
+                primary = ssdt_resolver::call_NtResumeThread(work->thread_handle, &prev_count);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                primary = (NTSTATUS)GetExceptionCode();
+            }
+        }
+
+        work->resume_prev_count = prev_count;
+        work->resume_status = primary;
+        WW_LOG("TCTX system_worker_resume_primary route=system_thread reason=%s pid=%u tid=%u status=0x%08X status_text=%s win32=%lu prev=%lu via_ps=%u handle=%p ps_resume=%p zw_resume=%p nt_resume=%p elapsed_ms=%llu",
+            work->reason,
+            work->pid,
+            work->tid,
+            (ULONG)primary,
+            tctx_diag::ntstatus_text(primary),
+            tctx_diag::ntstatus_win32(primary),
+            prev_count,
+            work->suspended_via_ps ? 1u : 0u,
+            work->thread_handle,
+            _PsResumeThread,
+            _ZwResumeThread,
+            ssdt_resolver::g_NtResumeThread,
+            tctx_diag::elapsed_ms(work->start, work->freq));
+
+        if (!NT_SUCCESS(primary)) {
+            prev_count = 0;
+            if (work->suspended_via_ps && work->thread_handle) {
+                __try {
+                    fallback = ssdt_resolver::call_NtResumeThread(work->thread_handle, &prev_count);
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    fallback = (NTSTATUS)GetExceptionCode();
+                }
+            } else if (_PsResumeThread) {
+                __try {
+                    fallback = _PsResumeThread(work->thread, &prev_count);
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    fallback = (NTSTATUS)GetExceptionCode();
+                }
+            }
+            work->resume_fallback_status = fallback;
+            if (NT_SUCCESS(fallback)) {
+                work->resume_prev_count = prev_count;
+            }
+            WW_LOG("TCTX system_worker_resume_fallback route=system_thread reason=%s pid=%u tid=%u status=0x%08X status_text=%s win32=%lu prev=%lu via_ps=%u handle=%p ps_resume=%p zw_resume=%p nt_resume=%p elapsed_ms=%llu",
+                work->reason,
+                work->pid,
+                work->tid,
+                (ULONG)fallback,
+                tctx_diag::ntstatus_text(fallback),
+                tctx_diag::ntstatus_win32(fallback),
+                prev_count,
+                work->suspended_via_ps ? 1u : 0u,
+                work->thread_handle,
+                _PsResumeThread,
+                _ZwResumeThread,
+                ssdt_resolver::g_NtResumeThread,
+                tctx_diag::elapsed_ms(work->start, work->freq));
+        }
+
+        NTSTATUS effective = NT_SUCCESS(primary) ? primary : fallback;
+        if (NT_SUCCESS(effective)) {
+            work->suspended = FALSE;
+        }
+        return effective;
+    }
+
+    VOID NTAPI worker_entry(PVOID parameter) {
+        worker_t* work = static_cast<worker_t*>(parameter);
+        if (!work) {
+            if (_PsTerminateSystemThread) {
+                _PsTerminateSystemThread(STATUS_INVALID_PARAMETER);
+            }
+            return;
+        }
+
+        work->worker_mode = ExGetPreviousMode();
+        tctx_diag::thread_snapshot_t before = tctx_diag::query_thread_snapshot(work->pid, work->tid);
+        WW_LOG("TCTX system_worker_entry route=system_thread reason=%s pid=%u tid=%u set=%u mask=0x%llX caller_previous_mode=%u worker_previous_mode=%u current_pid=%p current_tid=%p process=%p thread=%p thread_type=%p thread_found=%u thread_status=0x%08X thread_status_text=%s thread_state=%lu wait_reason=%lu elapsed_ms=%llu",
+            work->reason,
+            work->pid,
+            work->tid,
+            work->input.should_set,
+            (unsigned long long)work->input.register_mask,
+            (ULONG)work->caller_mode,
+            (ULONG)work->worker_mode,
+            PsGetCurrentProcessId(),
+            PsGetCurrentThreadId(),
+            work->process,
+            work->thread,
+            work->thread_type,
+            before.found ? 1u : 0u,
+            (ULONG)before.status,
+            tctx_diag::ntstatus_text(before.status),
+            before.thread_state,
+            before.wait_reason,
+            tctx_diag::elapsed_ms(work->start, work->freq));
+
+        ACCESS_MASK desired_access = THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | SYNCHRONIZE;
+        if (work->input.should_set != 0) {
+            desired_access |= THREAD_SET_CONTEXT;
+        }
+
+        __try {
+            work->open_status = _ObOpenObjectByPointer(
+                work->thread,
+                OBJ_KERNEL_HANDLE,
+                nullptr,
+                desired_access,
+                work->thread_type,
+                KernelMode,
+                &work->thread_handle);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            work->open_status = (NTSTATUS)GetExceptionCode();
+            work->thread_handle = nullptr;
+        }
+
+        WW_LOG("TCTX system_worker_open route=system_thread reason=%s pid=%u tid=%u desired=0x%08X status=0x%08X status_text=%s win32=%lu handle=%p thread_type=%p elapsed_ms=%llu",
+            work->reason,
+            work->pid,
+            work->tid,
+            (ULONG)desired_access,
+            (ULONG)work->open_status,
+            tctx_diag::ntstatus_text(work->open_status),
+            tctx_diag::ntstatus_win32(work->open_status),
+            work->thread_handle,
+            work->thread_type,
+            tctx_diag::elapsed_ms(work->start, work->freq));
+
+        NTSTATUS status = work->open_status;
+        if (NT_SUCCESS(status) && work->thread_handle) {
+            if (_PsSuspendThread && (_PsResumeThread || _ZwResumeThread || ssdt_resolver::g_NtResumeThread)) {
+                __try {
+                    work->suspend_status = _PsSuspendThread(work->thread, &work->suspend_prev_count);
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    work->suspend_status = (NTSTATUS)GetExceptionCode();
+                }
+                WW_LOG("TCTX system_worker_suspend_ps route=system_thread reason=%s pid=%u tid=%u status=0x%08X status_text=%s win32=%lu prev=%lu ps_suspend=%p ps_resume=%p elapsed_ms=%llu",
+                    work->reason,
+                    work->pid,
+                    work->tid,
+                    (ULONG)work->suspend_status,
+                    tctx_diag::ntstatus_text(work->suspend_status),
+                    tctx_diag::ntstatus_win32(work->suspend_status),
+                    work->suspend_prev_count,
+                    _PsSuspendThread,
+                    _PsResumeThread,
+                    tctx_diag::elapsed_ms(work->start, work->freq));
+                if (NT_SUCCESS(work->suspend_status)) {
+                    work->suspended = TRUE;
+                    work->suspended_via_ps = TRUE;
+                }
+            }
+
+            if (!work->suspended) {
+                work->suspend_prev_count = 0;
+                __try {
+                    work->suspend_status = ssdt_resolver::call_NtSuspendThread(work->thread_handle, &work->suspend_prev_count);
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    work->suspend_status = (NTSTATUS)GetExceptionCode();
+                }
+                WW_LOG("TCTX system_worker_suspend_nt route=system_thread reason=%s pid=%u tid=%u status=0x%08X status_text=%s win32=%lu prev=%lu handle=%p zw_suspend=%p nt_suspend=%p worker_previous_mode=%u elapsed_ms=%llu",
+                    work->reason,
+                    work->pid,
+                    work->tid,
+                    (ULONG)work->suspend_status,
+                    tctx_diag::ntstatus_text(work->suspend_status),
+                    tctx_diag::ntstatus_win32(work->suspend_status),
+                    work->suspend_prev_count,
+                    work->thread_handle,
+                    _ZwSuspendThread,
+                    ssdt_resolver::g_NtSuspendThread,
+                    (ULONG)work->worker_mode,
+                    tctx_diag::elapsed_ms(work->start, work->freq));
+                if (NT_SUCCESS(work->suspend_status)) {
+                    work->suspended = TRUE;
+                    work->suspended_via_ps = FALSE;
+                }
+            }
+
+            tctx_diag::thread_snapshot_t after_suspend = tctx_diag::query_thread_snapshot(work->pid, work->tid);
+            WW_LOG("TCTX system_worker_suspend_summary route=system_thread reason=%s pid=%u tid=%u suspended=%u via_ps=%u status=0x%08X status_text=%s win32=%lu prev=%lu thread_found=%u thread_status=0x%08X thread_status_text=%s thread_state=%lu wait_reason=%lu elapsed_ms=%llu",
+                work->reason,
+                work->pid,
+                work->tid,
+                work->suspended ? 1u : 0u,
+                work->suspended_via_ps ? 1u : 0u,
+                (ULONG)work->suspend_status,
+                tctx_diag::ntstatus_text(work->suspend_status),
+                tctx_diag::ntstatus_win32(work->suspend_status),
+                work->suspend_prev_count,
+                after_suspend.found ? 1u : 0u,
+                (ULONG)after_suspend.status,
+                tctx_diag::ntstatus_text(after_suspend.status),
+                after_suspend.thread_state,
+                after_suspend.wait_reason,
+                tctx_diag::elapsed_ms(work->start, work->freq));
+
+            if (work->suspended) {
+                strong::kmemcpy(&work->output, &work->input, sizeof(work->output));
+                strong::kmemset(&work->ctx, 0, sizeof(work->ctx));
+                if (work->input.should_set == 0) {
+                    work->context_status = trapframe_ctx::get_context(work->process, work->thread, work->thread_handle, &work->output, &work->ctx);
+                    work->result_valid = NT_SUCCESS(work->context_status) && tctx_diag::user_context_sane(work->output);
+                    if (NT_SUCCESS(work->context_status) && !work->result_valid) {
+                        work->context_status = tctx_diag::core_registers_present(work->ctx) ? STATUS_INVALID_ADDRESS : STATUS_UNSUCCESSFUL;
+                    }
+                } else {
+                    work->context_status = trapframe_ctx::set_context(work->process, work->thread, work->thread_handle, &work->output, &work->ctx);
+                    work->result_valid = NT_SUCCESS(work->context_status);
+                }
+
+                WW_LOG("TCTX system_worker_context route=system_thread reason=%s pid=%u tid=%u set=%u status=0x%08X status_text=%s win32=%lu valid=%u flags=0x%08X rip=0x%llX rip_class=%s rsp=0x%llX rsp_class=%s rflags=0x%llX user_sane=%u dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX elapsed_ms=%llu",
+                    work->reason,
+                    work->pid,
+                    work->tid,
+                    work->input.should_set,
+                    (ULONG)work->context_status,
+                    tctx_diag::ntstatus_text(work->context_status),
+                    tctx_diag::ntstatus_win32(work->context_status),
+                    work->result_valid ? 1u : 0u,
+                    work->ctx.ContextFlags,
+                    (unsigned long long)work->output.rip,
+                    tctx_diag::address_class(work->output.rip),
+                    (unsigned long long)work->output.rsp,
+                    tctx_diag::address_class(work->output.rsp),
+                    (unsigned long long)work->output.rflags,
+                    tctx_diag::user_context_sane(work->output) ? 1u : 0u,
+                    (unsigned long long)work->output.dr0,
+                    (unsigned long long)work->output.dr1,
+                    (unsigned long long)work->output.dr2,
+                    (unsigned long long)work->output.dr3,
+                    (unsigned long long)work->output.dr6,
+                    (unsigned long long)work->output.dr7,
+                    tctx_diag::elapsed_ms(work->start, work->freq));
+                status = work->context_status;
+            } else {
+                status = NT_SUCCESS(work->suspend_status) ? STATUS_INVALID_DEVICE_STATE : work->suspend_status;
+            }
+        }
+
+        NTSTATUS resume_effective = resume_worker_thread(work);
+        if (!NT_SUCCESS(resume_effective)) {
+            status = resume_effective;
+        }
+
+        if (work->thread_handle) {
+            work->close_attempted = TRUE;
+            __try {
+                work->close_status = _ZwClose(work->thread_handle);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                work->close_status = (NTSTATUS)GetExceptionCode();
+            }
+            WW_LOG("TCTX system_worker_close route=system_thread reason=%s pid=%u tid=%u handle=%p status=0x%08X status_text=%s win32=%lu elapsed_ms=%llu",
+                work->reason,
+                work->pid,
+                work->tid,
+                work->thread_handle,
+                (ULONG)work->close_status,
+                tctx_diag::ntstatus_text(work->close_status),
+                tctx_diag::ntstatus_win32(work->close_status),
+                tctx_diag::elapsed_ms(work->start, work->freq));
+            work->thread_handle = nullptr;
+        }
+
+        work->status = status;
+        tctx_diag::thread_snapshot_t after = tctx_diag::query_thread_snapshot(work->pid, work->tid);
+        WW_LOG("TCTX system_worker_exit route=system_thread reason=%s pid=%u tid=%u set=%u status=0x%08X status_text=%s win32=%lu open_status=0x%08X suspend_status=0x%08X context_status=0x%08X resume_status=0x%08X resume_fallback_status=0x%08X close_status=0x%08X suspended_after=%u valid=%u thread_after_found=%u thread_after_status=0x%08X thread_after_status_text=%s thread_after_state=%lu thread_after_wait_reason=%lu rip=0x%llX rip_class=%s rsp=0x%llX rsp_class=%s rflags=0x%llX user_sane=%u dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX elapsed_ms=%llu",
+            work->reason,
+            work->pid,
+            work->tid,
+            work->input.should_set,
+            (ULONG)work->status,
+            tctx_diag::ntstatus_text(work->status),
+            tctx_diag::ntstatus_win32(work->status),
+            (ULONG)work->open_status,
+            (ULONG)work->suspend_status,
+            (ULONG)work->context_status,
+            (ULONG)work->resume_status,
+            (ULONG)work->resume_fallback_status,
+            (ULONG)work->close_status,
+            work->suspended ? 1u : 0u,
+            work->result_valid ? 1u : 0u,
+            after.found ? 1u : 0u,
+            (ULONG)after.status,
+            tctx_diag::ntstatus_text(after.status),
+            after.thread_state,
+            after.wait_reason,
+            (unsigned long long)work->output.rip,
+            tctx_diag::address_class(work->output.rip),
+            (unsigned long long)work->output.rsp,
+            tctx_diag::address_class(work->output.rsp),
+            (unsigned long long)work->output.rflags,
+            tctx_diag::user_context_sane(work->output) ? 1u : 0u,
+            (unsigned long long)work->output.dr0,
+            (unsigned long long)work->output.dr1,
+            (unsigned long long)work->output.dr2,
+            (unsigned long long)work->output.dr3,
+            (unsigned long long)work->output.dr6,
+            (unsigned long long)work->output.dr7,
+            tctx_diag::elapsed_ms(work->start, work->freq));
+
+        KeSetEvent(&work->done, IO_NO_INCREMENT, FALSE);
+        release_work(work);
+        if (_PsTerminateSystemThread) {
+            _PsTerminateSystemThread(STATUS_SUCCESS);
+        }
+    }
+
+    NTSTATUS run(PEPROCESS process,
+                 PETHREAD thread,
+                 POBJECT_TYPE thread_type,
+                 p_thread_ctx request,
+                 KPROCESSOR_MODE caller_mode,
+                 const char* reason,
+                 const LARGE_INTEGER& parent_start,
+                 const LARGE_INTEGER& parent_freq) {
+        if (!process || !thread || !thread_type || !request) {
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        if (!_PsCreateSystemThread || !_PsTerminateSystemThread || !_ObOpenObjectByPointer || !_ZwClose) {
+            WW_LOG("TCTX system_route_unavailable route=system_thread reason=%s pid=%u tid=%u create=%p terminate=%p ob_open=%p zw_close=%p thread_type=%p elapsed_ms=%llu",
+                reason ? reason : "none",
+                request->pid,
+                request->tid,
+                _PsCreateSystemThread,
+                _PsTerminateSystemThread,
+                _ObOpenObjectByPointer,
+                _ZwClose,
+                thread_type,
+                tctx_diag::elapsed_ms(parent_start, parent_freq));
+            return STATUS_PROCEDURE_NOT_FOUND;
+        }
+
+        const LONG suspend_state_before = _InterlockedCompareExchange(&ssdt_resolver::g_funcs_resolved, 0, 0);
+        const LONG context_state_before = _InterlockedCompareExchange(&ssdt_resolver::g_ctx_funcs_resolved, 0, 0);
+        BOOLEAN suspend_prime_attempted = FALSE;
+        BOOLEAN context_prime_attempted = FALSE;
+        BOOLEAN suspend_prime_resolved = (ssdt_resolver::g_NtSuspendThread != nullptr && ssdt_resolver::g_NtResumeThread != nullptr) ? TRUE : FALSE;
+        BOOLEAN context_prime_resolved = (ssdt_resolver::g_NtGetContextThread != nullptr && ssdt_resolver::g_NtSetContextThread != nullptr) ? TRUE : FALSE;
+
+        if (!_ZwSuspendThread &&
+            (!ssdt_resolver::g_NtSuspendThread || !ssdt_resolver::g_NtResumeThread)) {
+            suspend_prime_attempted = TRUE;
+            ssdt_resolver::find_ssdt();
+            suspend_prime_resolved = ssdt_resolver::resolve_suspend_resume();
+        }
+
+        if ((!_ZwGetContextThread || !_ZwSetContextThread) &&
+            (!ssdt_resolver::g_NtGetContextThread || !ssdt_resolver::g_NtSetContextThread)) {
+            context_prime_attempted = TRUE;
+            ssdt_resolver::find_ssdt();
+            context_prime_resolved = ssdt_resolver::resolve_thread_context();
+        }
+
+        WW_LOG("TCTX system_route_prime route=pre_worker reason=%s pid=%u tid=%u set=%u caller_previous_mode=%u current_pid=%p current_tid=%p suspend_attempted=%u suspend_resolved=%u suspend_state_before=%ld suspend_state_after=%ld context_attempted=%u context_resolved=%u context_state_before=%ld context_state_after=%ld ssdt=%p service_table=%p limit=%lu ps_suspend=%p ps_resume=%p zw_suspend=%p zw_resume=%p nt_suspend=%p nt_resume=%p ps_get=%p ps_set=%p zw_get=%p zw_set=%p nt_get=%p nt_set=%p elapsed_ms=%llu",
+            reason ? reason : "none",
+            request->pid,
+            request->tid,
+            request->should_set,
+            (ULONG)caller_mode,
+            PsGetCurrentProcessId(),
+            PsGetCurrentThreadId(),
+            suspend_prime_attempted ? 1u : 0u,
+            suspend_prime_resolved ? 1u : 0u,
+            suspend_state_before,
+            _InterlockedCompareExchange(&ssdt_resolver::g_funcs_resolved, 0, 0),
+            context_prime_attempted ? 1u : 0u,
+            context_prime_resolved ? 1u : 0u,
+            context_state_before,
+            _InterlockedCompareExchange(&ssdt_resolver::g_ctx_funcs_resolved, 0, 0),
+            ssdt_resolver::g_ssdt,
+            ssdt_resolver::g_ssdt ? ssdt_resolver::g_ssdt->ServiceTable : nullptr,
+            ssdt_resolver::g_ssdt ? ssdt_resolver::g_ssdt->ServiceLimit : 0,
+            _PsSuspendThread,
+            _PsResumeThread,
+            _ZwSuspendThread,
+            _ZwResumeThread,
+            ssdt_resolver::g_NtSuspendThread,
+            ssdt_resolver::g_NtResumeThread,
+            _PsGetContextThread,
+            _PsSetContextThread,
+            _ZwGetContextThread,
+            _ZwSetContextThread,
+            ssdt_resolver::g_NtGetContextThread,
+            ssdt_resolver::g_NtSetContextThread,
+            tctx_diag::elapsed_ms(parent_start, parent_freq));
+
+        worker_t* work = static_cast<worker_t*>(ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(worker_t), kWorkerTag));
+        if (!work) {
+            WW_LOG("TCTX system_route_alloc_failed route=system_thread reason=%s pid=%u tid=%u bytes=%llu elapsed_ms=%llu",
+                reason ? reason : "none",
+                request->pid,
+                request->tid,
+                (unsigned long long)sizeof(worker_t),
+                tctx_diag::elapsed_ms(parent_start, parent_freq));
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        strong::kmemset(work, 0, sizeof(*work));
+        KeInitializeEvent(&work->done, NotificationEvent, FALSE);
+        work->status = STATUS_UNSUCCESSFUL;
+        work->open_status = STATUS_NOT_FOUND;
+        work->suspend_status = STATUS_NOT_FOUND;
+        work->context_status = STATUS_NOT_FOUND;
+        work->resume_status = STATUS_NOT_FOUND;
+        work->resume_fallback_status = STATUS_NOT_FOUND;
+        work->close_status = STATUS_NOT_FOUND;
+        work->process = process;
+        work->thread = thread;
+        work->thread_type = thread_type;
+        work->caller_mode = caller_mode;
+        work->pid = request->pid;
+        work->tid = request->tid;
+        work->reason = reason ? reason : "none";
+        work->start = KeQueryPerformanceCounter(&work->freq);
+        work->refs = 2;
+        strong::kmemcpy(&work->input, request, sizeof(work->input));
+        strong::kmemcpy(&work->output, request, sizeof(work->output));
+
+        HANDLE worker_handle = nullptr;
+        OBJECT_ATTRIBUTES oa;
+        InitializeObjectAttributes(&oa, nullptr, OBJ_KERNEL_HANDLE, nullptr, nullptr);
+        NTSTATUS create_status = _PsCreateSystemThread(
+            &worker_handle,
+            THREAD_ALL_ACCESS,
+            &oa,
+            nullptr,
+            nullptr,
+            worker_entry,
+            work);
+
+        WW_LOG("TCTX system_route_create route=system_thread reason=%s pid=%u tid=%u set=%u status=0x%08X status_text=%s win32=%lu worker_handle=%p process=%p thread=%p caller_previous_mode=%u elapsed_ms=%llu",
+            work->reason,
+            work->pid,
+            work->tid,
+            work->input.should_set,
+            (ULONG)create_status,
+            tctx_diag::ntstatus_text(create_status),
+            tctx_diag::ntstatus_win32(create_status),
+            worker_handle,
+            process,
+            thread,
+            (ULONG)caller_mode,
+            tctx_diag::elapsed_ms(parent_start, parent_freq));
+
+        if (!NT_SUCCESS(create_status)) {
+            ExFreePoolWithTag(work, kWorkerTag);
+            return create_status;
+        }
+
+        LARGE_INTEGER timeout;
+        timeout.QuadPart = kWorkerWait100ns;
+        NTSTATUS wait_status = KeWaitForSingleObject(&work->done, Executive, KernelMode, FALSE, &timeout);
+        NTSTATUS final_wait_status = wait_status;
+        if (wait_status != STATUS_SUCCESS) {
+            WW_LOG("TCTX system_route_wait_bounded route=system_thread reason=%s pid=%u tid=%u wait_status=0x%08X wait_status_text=%s win32=%lu timeout_100ns=%lld worker_handle=%p elapsed_ms=%llu",
+                work->reason,
+                work->pid,
+                work->tid,
+                (ULONG)wait_status,
+                tctx_diag::ntstatus_text(wait_status),
+                tctx_diag::ntstatus_win32(wait_status),
+                (long long)kWorkerWait100ns,
+                worker_handle,
+                tctx_diag::elapsed_ms(parent_start, parent_freq));
+            if (worker_handle) {
+                NTSTATUS close_worker_status = _ZwClose(worker_handle);
+                WW_LOG("TCTX system_route_worker_handle_close route=system_thread reason=%s pid=%u tid=%u handle=%p status=0x%08X status_text=%s win32=%lu after_timeout=1 elapsed_ms=%llu",
+                    work->reason,
+                    work->pid,
+                    work->tid,
+                    worker_handle,
+                    (ULONG)close_worker_status,
+                    tctx_diag::ntstatus_text(close_worker_status),
+                    tctx_diag::ntstatus_win32(close_worker_status),
+                    tctx_diag::elapsed_ms(parent_start, parent_freq));
+            }
+            release_work(work);
+            return STATUS_IO_TIMEOUT;
+        }
+
+        if (worker_handle) {
+            NTSTATUS close_worker_status = _ZwClose(worker_handle);
+            WW_LOG("TCTX system_route_worker_handle_close route=system_thread reason=%s pid=%u tid=%u handle=%p status=0x%08X status_text=%s win32=%lu elapsed_ms=%llu",
+                work->reason,
+                work->pid,
+                work->tid,
+                worker_handle,
+                (ULONG)close_worker_status,
+                tctx_diag::ntstatus_text(close_worker_status),
+                tctx_diag::ntstatus_win32(close_worker_status),
+                tctx_diag::elapsed_ms(parent_start, parent_freq));
+        }
+
+        NTSTATUS status = work->status;
+        const BOOLEAN copy_result = NT_SUCCESS(status) && request->should_set == 0 && work->result_valid;
+        if (copy_result) {
+            strong::kmemcpy(request, &work->output, sizeof(*request));
+        } else if (NT_SUCCESS(status) && request->should_set == 0) {
+            status = STATUS_UNSUCCESSFUL;
+        }
+
+        WW_LOG("TCTX system_route_exit route=system_thread reason=%s pid=%u tid=%u set=%u status=0x%08X status_text=%s win32=%lu create_status=0x%08X wait_status=0x%08X final_wait_status=0x%08X worker_status=0x%08X open_status=0x%08X suspend_status=0x%08X context_status=0x%08X resume_status=0x%08X resume_fallback_status=0x%08X valid=%u copied=%u rip=0x%llX rip_class=%s rsp=0x%llX rsp_class=%s rflags=0x%llX user_sane=%u dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX elapsed_ms=%llu",
+            work->reason,
+            work->pid,
+            work->tid,
+            work->input.should_set,
+            (ULONG)status,
+            tctx_diag::ntstatus_text(status),
+            tctx_diag::ntstatus_win32(status),
+            (ULONG)create_status,
+            (ULONG)wait_status,
+            (ULONG)final_wait_status,
+            (ULONG)work->status,
+            (ULONG)work->open_status,
+            (ULONG)work->suspend_status,
+            (ULONG)work->context_status,
+            (ULONG)work->resume_status,
+            (ULONG)work->resume_fallback_status,
+            work->result_valid ? 1u : 0u,
+            copy_result ? 1u : 0u,
+            (unsigned long long)work->output.rip,
+            tctx_diag::address_class(work->output.rip),
+            (unsigned long long)work->output.rsp,
+            tctx_diag::address_class(work->output.rsp),
+            (unsigned long long)work->output.rflags,
+            tctx_diag::user_context_sane(work->output) ? 1u : 0u,
+            (unsigned long long)work->output.dr0,
+            (unsigned long long)work->output.dr1,
+            (unsigned long long)work->output.dr2,
+            (unsigned long long)work->output.dr3,
+            (unsigned long long)work->output.dr6,
+            (unsigned long long)work->output.dr7,
+            tctx_diag::elapsed_ms(parent_start, parent_freq));
+
+        release_work(work);
+        return status;
+    }
+}
+
+
 NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
     if (!request || request->pid == 0 || request->tid == 0) {
         WW_LOG("TCTX reject invalid_request request=%p", request);
@@ -974,6 +1653,61 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
     }
 
     dbg_guard::timing_scatter();
+
+    if (previous_mode != KernelMode) {
+        NTSTATUS system_status = tctx_system_route::run(
+            process,
+            thread,
+            thread_type,
+            request,
+            previous_mode,
+            "user_previous_mode",
+            tctx_start,
+            tctx_freq);
+        if (NT_SUCCESS(system_status)) {
+            tctx_diag::thread_snapshot_t thread_after_system = tctx_diag::query_thread_snapshot(request->pid, request->tid);
+            WW_LOG("TCTX exit route=system_thread pid=%u tid=%u set=%u status=0x%08X status_text=%s win32=%lu previous_mode=%u requestor_mode=%u thread_after_found=%u thread_after_status=0x%08X thread_after_status_text=%s thread_after_state=%lu thread_after_wait_reason=%lu rip=0x%llX rip_class=%s rsp=0x%llX rsp_class=%s rflags=0x%llX user_sane=%u dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX elapsed_ms=%llu",
+                request->pid,
+                request->tid,
+                request->should_set,
+                (ULONG)system_status,
+                tctx_diag::ntstatus_text(system_status),
+                tctx_diag::ntstatus_win32(system_status),
+                (ULONG)previous_mode,
+                (ULONG)previous_mode,
+                thread_after_system.found ? 1u : 0u,
+                (ULONG)thread_after_system.status,
+                tctx_diag::ntstatus_text(thread_after_system.status),
+                thread_after_system.thread_state,
+                thread_after_system.wait_reason,
+                (unsigned long long)request->rip,
+                tctx_diag::address_class(request->rip),
+                (unsigned long long)request->rsp,
+                tctx_diag::address_class(request->rsp),
+                (unsigned long long)request->rflags,
+                tctx_diag::user_context_sane(*request) ? 1u : 0u,
+                (unsigned long long)request->dr0,
+                (unsigned long long)request->dr1,
+                (unsigned long long)request->dr2,
+                (unsigned long long)request->dr3,
+                (unsigned long long)request->dr6,
+                (unsigned long long)request->dr7,
+                dbg_guard::elapsed_ms(tctx_start, tctx_freq));
+            _ObfDereferenceObject(thread);
+            _ObfDereferenceObject(process);
+            return system_status;
+        }
+        WW_LOG("TCTX system_route_continue route=inline_direct pid=%u tid=%u set=%u system_status=0x%08X system_status_text=%s win32=%lu previous_mode=%u requestor_mode=%u elapsed_ms=%llu",
+            request->pid,
+            request->tid,
+            request->should_set,
+            (ULONG)system_status,
+            tctx_diag::ntstatus_text(system_status),
+            tctx_diag::ntstatus_win32(system_status),
+            (ULONG)previous_mode,
+            (ULONG)previous_mode,
+            dbg_guard::elapsed_ms(tctx_start, tctx_freq));
+    }
 
 
     HANDLE ctx_thread_handle = nullptr;
@@ -1275,12 +2009,17 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
         ctx.ContextFlags,
         dbg_guard::elapsed_ms(tctx_start, tctx_freq));
 
-    if (NT_SUCCESS(status) && request->should_set == 0 && (request->rip == 0 || request->rsp == 0)) {
-        WW_LOG("TCTX reject zero_context pid=%u tid=%u rip=0x%llX rsp=0x%llX rflags=0x%llX dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX flags=0x%08X previous_mode=%u requestor_mode=%u",
+    if (NT_SUCCESS(status) && request->should_set == 0 && !tctx_diag::user_context_sane(*request)) {
+        const BOOLEAN core_present = request->rip != 0 && request->rsp != 0;
+        WW_LOG("TCTX reject invalid_user_context pid=%u tid=%u status_after=0x%08X reason=%s rip=0x%llX rip_class=%s rsp=0x%llX rsp_class=%s rflags=0x%llX user_sane=0 dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX flags=0x%08X previous_mode=%u requestor_mode=%u",
             request->pid,
             request->tid,
+            core_present ? (ULONG)STATUS_INVALID_ADDRESS : (ULONG)STATUS_UNSUCCESSFUL,
+            core_present ? "kernel_or_noncanonical_context" : "zero_context",
             (unsigned long long)request->rip,
+            tctx_diag::address_class(request->rip),
             (unsigned long long)request->rsp,
+            tctx_diag::address_class(request->rsp),
             (unsigned long long)request->rflags,
             (unsigned long long)request->dr0,
             (unsigned long long)request->dr1,
@@ -1291,7 +2030,7 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
             ctx.ContextFlags,
             (ULONG)previous_mode,
             (ULONG)previous_mode);
-        status = STATUS_UNSUCCESSFUL;
+        status = core_present ? STATUS_INVALID_ADDRESS : STATUS_UNSUCCESSFUL;
     }
 
     if (ctx_thread_suspended && ctx_thread_handle) {
@@ -1361,7 +2100,7 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
     }
 
     tctx_diag::thread_snapshot_t thread_after = tctx_diag::query_thread_snapshot(request->pid, request->tid);
-    WW_LOG("TCTX exit pid=%u tid=%u set=%u status=0x%08X status_text=%s open_status=0x%08X open_status_text=%s suspend_status=0x%08X suspend_status_text=%s open_strategy=%s suspend_strategy=%s suspend_constraint=%s suspended=%u via_ps=%u open_import_absent=%u suspend_import_absent=%u suspend_call_failed=%u nt_user_previous_mode_skipped=%u ps_exception=%u ps_exception_code=0x%08X nt_exception=%u nt_exception_code=0x%08X previous_mode=%u requestor_mode=%u thread_after_found=%u thread_after_status=0x%08X thread_after_status_text=%s thread_after_state=%lu thread_after_wait_reason=%lu rip=0x%llX rsp=0x%llX rflags=0x%llX dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX elapsed_ms=%llu",
+    WW_LOG("TCTX exit pid=%u tid=%u set=%u status=0x%08X status_text=%s open_status=0x%08X open_status_text=%s suspend_status=0x%08X suspend_status_text=%s open_strategy=%s suspend_strategy=%s suspend_constraint=%s suspended=%u via_ps=%u open_import_absent=%u suspend_import_absent=%u suspend_call_failed=%u nt_user_previous_mode_skipped=%u ps_exception=%u ps_exception_code=0x%08X nt_exception=%u nt_exception_code=0x%08X previous_mode=%u requestor_mode=%u thread_after_found=%u thread_after_status=0x%08X thread_after_status_text=%s thread_after_state=%lu thread_after_wait_reason=%lu rip=0x%llX rip_class=%s rsp=0x%llX rsp_class=%s rflags=0x%llX user_sane=%u dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX elapsed_ms=%llu",
         request->pid,
         request->tid,
         request->should_set,
@@ -1392,8 +2131,11 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
         thread_after.thread_state,
         thread_after.wait_reason,
         (unsigned long long)request->rip,
+        tctx_diag::address_class(request->rip),
         (unsigned long long)request->rsp,
+        tctx_diag::address_class(request->rsp),
         (unsigned long long)request->rflags,
+        tctx_diag::user_context_sane(*request) ? 1u : 0u,
         (unsigned long long)request->dr0,
         (unsigned long long)request->dr1,
         (unsigned long long)request->dr2,

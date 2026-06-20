@@ -348,6 +348,10 @@ exit $rc
 }
 
 function Publish-StandalonePrivateBase([string]$StandalonePath, [string]$DeployId, [hashtable]$RemoteEnv) {
+    if ($SkipStandalone) {
+        Write-Warn "Skipping private standalone base publish because -SkipStandalone was specified"
+        return [pscustomobject]@{ Changed = $false; Sha = ""; Size = 0; Version = "" }
+    }
     if (-not (Test-Path -LiteralPath $StandalonePath -PathType Leaf)) {
         Stop-Deploy "AiDAStandalone.exe not found: $StandalonePath"
     }
@@ -810,6 +814,6 @@ Write-Host "  DEPLOY COMPLETE" -ForegroundColor Green
 Write-Host "============================================" -ForegroundColor Green
 Write-Host ("  ARC:         {0}" -f ($(if ($SkipArc) { "skipped" } elseif ($arcChanged) { "published" } else { "unchanged" }))) -ForegroundColor White
 Write-Host ("  Standalone:  {0}" -f ($(if ($SkipStandalone) { "skipped" } elseif ($package.Changed) { $package.Url } else { "unchanged" }))) -ForegroundColor White
-Write-Host ("  PrivateBase: {0}" -f ($(if ($privateBase.Changed) { $privateBase.Sha } else { "unchanged" }))) -ForegroundColor White
+Write-Host ("  PrivateBase: {0}" -f ($(if ($SkipStandalone) { "skipped" } elseif ($privateBase.Changed) { $privateBase.Sha } else { "unchanged" }))) -ForegroundColor White
 Write-Host ("  Camoufox:    {0}" -f ($(if ($SkipCamoufoxSidecar) { "skipped" } elseif ($sidecar.Changed) { $sidecar.Url } else { "unchanged" }))) -ForegroundColor White
 Write-Host "============================================" -ForegroundColor Green

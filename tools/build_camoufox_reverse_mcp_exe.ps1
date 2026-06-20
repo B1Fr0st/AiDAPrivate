@@ -873,7 +873,7 @@ def _run_import_smoke():
         )
         navigation_consts = repr(getattr(getattr(navigation_module.navigate, "__code__", None), "co_consts", ()))
         network_consts = repr(getattr(getattr(network_module.list_network_requests, "__code__", None), "co_consts", ()))
-        if patch_marker != "aida_camoufox_bridge_20260619_2":
+        if patch_marker != "aida_camoufox_bridge_20260620_crash_diag_1":
             raise RuntimeError(f"frozen browser patch marker mismatch: {patch_marker!r}")
         if "aida_bridge_patch_active" not in launch_consts or "aida_launch_policy_resolved" not in launch_consts:
             raise RuntimeError("frozen browser launch diagnostics missing")

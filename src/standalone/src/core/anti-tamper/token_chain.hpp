@@ -3,7 +3,10 @@
 #include <windows.h>
 #include <intrin.h>
 
+#include <atomic>
 #include <cstdint>
+#include <mutex>
+#include <vector>
 
 #include "state.hpp"
 #include "integrity.hpp"
@@ -116,6 +119,33 @@ namespace token_chain {
             return v;
         }
 
+        inline std::atomic<uint64_t>& code_integrity_defer_log_ms()
+        {
+            static std::atomic<uint64_t> v{0};
+            return v;
+        }
+
+        inline void log_code_integrity_deferred(const char* reason, state::runtime_t& rt)
+        {
+            const uint64_t now = static_cast<uint64_t>(GetTickCount64());
+            auto& last = code_integrity_defer_log_ms();
+            uint64_t prev = last.load(std::memory_order_acquire);
+            if (prev != 0 && now - prev < 1000)
+                return;
+            if (!last.compare_exchange_strong(prev, now, std::memory_order_acq_rel))
+                return;
+            const uint64_t started = rt.driver_hardening_started_ms.load(std::memory_order_acquire);
+            const uint64_t active_ms = started != 0 && now >= started ? now - started : 0;
+            webhook::write_log_critical_fmt("token_chain",
+                "code_integrity_deferred reason=%s pending=%d activation_done=%d driver_hardening=%d active_ms=%llu violation=%d",
+                reason,
+                rt.license_pending_activation.load(std::memory_order_acquire) ? 1 : 0,
+                rt.activation_hardening_done.load(std::memory_order_acquire) ? 1 : 0,
+                rt.driver_hardening_active.load(std::memory_order_acquire) ? 1 : 0,
+                static_cast<unsigned long long>(active_ms),
+                rt.violation_latched.load(std::memory_order_acquire) ? 1 : 0);
+        }
+
         inline void refresh_check_times(state::runtime_t& rt, int64_t now)
         {
             rt.chain.last_fast_check_ms.store(now, std::memory_order_release);
@@ -203,15 +233,38 @@ namespace token_chain {
 
         inline uint64_t run_code_integrity_checks(state::runtime_t& rt)
         {
-            uint64_t result = 0;
+            if (rt.driver_hardening_active.load(std::memory_order_acquire))
+            {
+                log_code_integrity_deferred("driver_hardening_active", rt);
+                return 0;
+            }
 
-            if (!integrity::verify_block_chain(rt.code_snap, rt.block_chain))
+            if (rt.license_pending_activation.load(std::memory_order_acquire) &&
+                !rt.activation_hardening_done.load(std::memory_order_acquire))
+            {
+                log_code_integrity_deferred("activation_hardening_pending", rt);
+                return 0;
+            }
+
+            uint64_t result = 0;
+            state::code_snapshot_t code_snap{};
+            std::vector<state::block_hash_t> block_chain;
+            std::vector<state::iat_entry_t> iat_snap;
+
+            {
+                std::lock_guard<std::mutex> lk(rt.mtx);
+                code_snap = rt.code_snap;
+                block_chain = rt.block_chain;
+                iat_snap = rt.iat_snap;
+            }
+
+            if (!integrity::verify_block_chain(code_snap, block_chain))
                 result |= 1ULL;
 
             if (!integrity::verify_self_hash())
                 result |= 2ULL;
 
-            if (!integrity::verify_iat(rt.iat_snap))
+            if (!integrity::verify_iat(iat_snap))
                 result |= 4ULL;
 
             return result;

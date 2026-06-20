@@ -142,6 +142,53 @@ std::string make_session_id(const char* prefix)
     return os.str();
 }
 
+nlohmann::json replay_mutate_error_data(const replay_mutate_options_t& input,
+                                        const char* validation_code,
+                                        const char* guard,
+                                        const char* detail)
+{
+    nlohmann::json active_ids = nlohmann::json::array();
+    {
+        std::lock_guard<std::mutex> lock(udp_mutex());
+        for (const auto& [id, session] : udp_sessions()) {
+            (void)session;
+            active_ids.push_back(id);
+        }
+    }
+    const auto active_count = active_ids.size();
+    const bool driver_connected = driver_bridge::using_kernel_driver();
+    nlohmann::json out{
+        {"tool", "net_replay_mutate"},
+        {"action", "mutate"},
+        {"validation_code", validation_code ? validation_code : "net_replay_mutate_failed"},
+        {"guard", guard ? guard : ""},
+        {"session_id", input.session_id},
+        {"active_session_count", active_count},
+        {"active_session_ids", active_ids},
+        {"target_ip", input.target_ip},
+        {"target_port", input.target_port},
+        {"allow_unsafe", input.allow_unsafe},
+        {"confirm_unsafe", input.confirm_unsafe},
+        {"allow_non_loopback", input.allow_non_loopback},
+        {"driver_connected", driver_connected}
+    };
+    if (detail && *detail)
+        out["detail"] = detail;
+    diag::log_tagged_fmt("net_proto",
+        "replay_mutate_guard validation_code=%s guard=%s session_id='%s' active_count=%zu target_ip='%s' target_port=%u allow_unsafe=%d confirm_unsafe=%d allow_non_loopback=%d driver_connected=%d",
+        validation_code ? validation_code : "",
+        guard ? guard : "",
+        input.session_id.c_str(),
+        static_cast<std::size_t>(active_count),
+        input.target_ip.c_str(),
+        input.target_port,
+        input.allow_unsafe ? 1 : 0,
+        input.confirm_unsafe ? 1 : 0,
+        input.allow_non_loopback ? 1 : 0,
+        driver_connected ? 1 : 0);
+    return out;
+}
+
 std::string lower_copy(std::string s)
 {
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
@@ -2612,32 +2659,34 @@ bool replay_mutate(const replay_mutate_options_t& input,
     error.clear();
     if (!input.allow_unsafe || !input.confirm_unsafe) {
         error = "mutation replay requires allow_unsafe=true and confirm_unsafe=true";
-        return false;
-    }
-    if (!driver_bridge::using_kernel_driver()) {
-        error = "driver bridge is not connected";
+        out = replay_mutate_error_data(input, "unsafe_confirmation_required", "unsafe_confirmation", error.c_str());
         return false;
     }
     if (input.session_id.empty()) {
         error = "session_id is required";
+        out = replay_mutate_error_data(input, "session_id_required", "session_lookup", error.c_str());
         return false;
     }
     if (input.target_ip.empty() || input.target_port == 0 || input.target_port > 65535) {
         error = "target_ip and valid target_port are required";
+        out = replay_mutate_error_data(input, "target_required", "target_validation", error.c_str());
         return false;
     }
 
     std::uint8_t target_addr[16] = {};
     if (!parse_ipv4(input.target_ip, target_addr)) {
         error = "target_ip must be an IPv4 literal";
+        out = replay_mutate_error_data(input, "target_ip_invalid", "target_validation", error.c_str());
         return false;
     }
     if (is_blocked_target(target_addr)) {
         error = "target_ip is multicast, broadcast, unspecified, or link-local";
+        out = replay_mutate_error_data(input, "target_ip_blocked", "target_validation", error.c_str());
         return false;
     }
     if (!is_loopback(target_addr, 2) && !input.allow_non_loopback) {
         error = "non-loopback mutation replay requires allow_non_loopback=true";
+        out = replay_mutate_error_data(input, "non_loopback_requires_allow", "non_loopback", error.c_str());
         return false;
     }
 
@@ -2654,19 +2703,31 @@ bool replay_mutate(const replay_mutate_options_t& input,
         options.response_wait_ms = 5000;
 
     udp_session_t session;
+    bool found_session = false;
     {
         std::lock_guard<std::mutex> lock(udp_mutex());
         auto it = udp_sessions().find(options.session_id);
-        if (it == udp_sessions().end()) {
-            error = "session_id not found";
-            return false;
+        if (it != udp_sessions().end()) {
+            session = it->second;
+            found_session = true;
         }
-        session = it->second;
+    }
+    if (!found_session) {
+        error = "session_id not found";
+        out = replay_mutate_error_data(input, "session_id_not_found", "session_lookup", error.c_str());
+        return false;
+    }
+
+    if (!driver_bridge::using_kernel_driver()) {
+        error = "driver bridge is not connected";
+        out = replay_mutate_error_data(input, "driver_bridge_not_connected", "driver_bridge", error.c_str());
+        return false;
     }
 
     auto mutations = make_mutations(session, lower_copy(options.mutation_strategy), options.max_mutations, options.payload_cap);
     if (mutations.empty()) {
         error = "no mutations generated within payload cap";
+        out = replay_mutate_error_data(input, "no_mutations_generated", "mutation_generation", error.c_str());
         return false;
     }
 

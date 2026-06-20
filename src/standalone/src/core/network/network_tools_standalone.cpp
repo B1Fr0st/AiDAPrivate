@@ -1634,6 +1634,51 @@ tool_result_t network_parse_tls(const json& params)
     return tool_result_t::ok(std::to_string(arr.size()) + OBFSTR(" TLS records parsed"), arr);
 }
 
+static const char* wfp_action_type_name(std::uint32_t action)
+{
+    switch (action) {
+    case 0x00001001u: return "block";
+    case 0x00001002u: return "permit";
+    case 0x00001003u: return "callout_terminating";
+    case 0x00001004u: return "callout_inspection";
+    case 0x00001005u: return "callout_unknown";
+    default: return "unknown";
+    }
+}
+
+static const char* wfp_fallback_reason_name(std::uint32_t reason)
+{
+    switch (reason) {
+    case 1u: return "missing_bfe_enum_functions";
+    case 2u: return "engine_open_failed";
+    case 3u: return "bfe_returned_zero_entries";
+    default: return "unknown";
+    }
+}
+
+static std::string hex_u32(std::uint32_t value)
+{
+    char buf[16];
+    qsnprintf(buf, sizeof(buf), "0x%08X", value);
+    return buf;
+}
+
+static const char* wfp_guid_label(const std::string& guid)
+{
+    if (guid == "5926DFC8-E3CF-4426-A283-DC393F5D0F9D") return "FWPM_LAYER_INBOUND_TRANSPORT_V4";
+    if (guid == "09E61AEA-D214-46E2-9B21-B26B0B2F28C8") return "FWPM_LAYER_OUTBOUND_TRANSPORT_V4";
+    if (guid == "3D08BF4E-45F6-4930-A922-417098E20027") return "FWPM_LAYER_DATAGRAM_DATA_V4";
+    if (guid == "C38D57D1-05A7-4C33-904F-7FBCEEE60E82") return "FWPM_LAYER_ALE_AUTH_CONNECT_V4";
+    if (guid == "E1CD9FE7-F4B5-4273-96C0-592E487B8650") return "FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4";
+    if (guid == "7A8B3C1D-2E4F-5A6B-8C9D-A1B2C3D4E5F6") return "AiDA inbound callout";
+    if (guid == "7A8B3C1E-2E4F-5A6B-8C9D-A1B2C3D4E5F7") return "AiDA outbound callout";
+    if (guid == "7A8B3C22-2E4F-5A6B-8C9D-A1B2C3D4E5FB") return "AiDA datagram callout";
+    if (guid == "7A8B3C20-2E4F-5A6B-8C9D-A1B2C3D4E5F9") return "AiDA ALE connect callout";
+    if (guid == "7A8B3C21-2E4F-5A6B-8C9D-A1B2C3D4E5FA") return "AiDA ALE recv callout";
+    if (guid == "7A8B3C1F-2E4F-5A6B-8C9D-A1B2C3D4E5F8") return "AiDA network sublayer";
+    return "";
+}
+
 tool_result_t network_enumerate_wfp_callouts(const json& params)
 {
     diag::log_tagged("net_tools", "network_enumerate_wfp_callouts entry");
@@ -1648,39 +1693,78 @@ tool_result_t network_enumerate_wfp_callouts(const json& params)
     auto callouts = driver_bridge::enumerate_wfp_callouts(filter_module);
     diag::log_tagged_fmt("net_tools", "network_enumerate_wfp_callouts count=%zu", callouts.size());
     json arr = json::array();
+    std::size_t runtime_fallback_count = 0;
+    std::size_t bfe_count = 0;
     for (const auto& c : callouts) {
         json entry;
         const bool is_filter = c.entry_type == 1;
+        const bool runtime_fallback = (c.aida_match_reason & 0x80000000u) != 0;
+        if (runtime_fallback)
+            ++runtime_fallback_count;
+        else
+            ++bfe_count;
         entry["entry_type"] = is_filter ? "filter" : "callout";
         entry["entry_type_id"] = c.entry_type;
+        entry["enumeration_source"] = runtime_fallback ? "runtime_registered_fallback" : "bfe";
+        entry["degraded_inventory"] = runtime_fallback;
         entry["callout_id"] = c.callout_id;
         entry["layer_id"] = c.layer_id;
         entry["owning_module"] = c.owning_module;
+        entry["identity_preview"] = c.owning_module;
         entry["callout_key"] = c.callout_key_str;
+        entry["callout_key_label"] = wfp_guid_label(c.callout_key_str);
         entry["applicable_layer"] = c.applicable_layer_str;
+        entry["applicable_layer_label"] = wfp_guid_label(c.applicable_layer_str);
         char addr_buf[32]; qsnprintf(addr_buf, sizeof(addr_buf), "0x%llX", (unsigned long long)c.classify_fn);
         entry["classify_fn"] = addr_buf;
         qsnprintf(addr_buf, sizeof(addr_buf), "0x%llX", (unsigned long long)c.owning_module_base);
         entry["module_base"] = addr_buf;
         entry["flags"] = c.flags;
+        entry["flags_hex"] = hex_u32(c.flags);
         entry["provider_present"] = c.provider_present != 0;
+        if (c.provider_present != 0)
+            entry["provider_guid"] = "not_returned_by_driver_abi";
         entry["aida_match_reason"] = c.aida_match_reason;
         json reasons = json::array();
         if ((c.aida_match_reason & 0x00000001u) != 0)
             reasons.push_back("sublayer");
         if ((c.aida_match_reason & 0x00000002u) != 0)
             reasons.push_back("action_callout");
+        if ((c.aida_match_reason & 0x00000004u) != 0)
+            reasons.push_back("display_data");
+        if (runtime_fallback)
+            reasons.push_back("runtime_registered_fallback");
         entry["aida_match_reasons"] = reasons;
+        if (runtime_fallback) {
+            const auto fallback_reason = static_cast<std::uint32_t>(c.filter_id & 0xFFFFFFFFull);
+            const auto fallback_win32 = static_cast<std::uint32_t>((c.filter_id >> 32) & 0xFFFFFFFFull);
+            entry["degraded_reason"] = wfp_fallback_reason_name(fallback_reason);
+            entry["degraded_reason_code"] = fallback_reason;
+            entry["bfe_auth_service"] = c.action_type;
+            entry["bfe_auth_service_hex"] = hex_u32(c.action_type);
+            entry["engine_open_status"] = hex_u32(c.flags);
+            entry["engine_open_win32"] = fallback_win32;
+            entry["registered_callback_address_returned"] = c.classify_fn != 0;
+            entry["registered_callback_match"] = c.classify_fn != 0;
+        }
         if (is_filter) {
             qsnprintf(addr_buf, sizeof(addr_buf), "0x%llX", (unsigned long long)c.filter_id);
             entry["filter_id"] = addr_buf;
             entry["layer"] = c.applicable_layer_str;
+            entry["layer_label"] = wfp_guid_label(c.applicable_layer_str);
             entry["sublayer_key"] = c.sublayer_key_str;
+            entry["sublayer_label"] = wfp_guid_label(c.sublayer_key_str);
             entry["action_type"] = c.action_type;
+            entry["action_type_hex"] = hex_u32(c.action_type);
+            entry["action_type_label"] = wfp_action_type_name(c.action_type);
             entry["action_callout_key"] = c.callout_key_str;
+            entry["action_callout_label"] = wfp_guid_label(c.callout_key_str);
+            entry["display_description_app_preview"] = c.owning_module;
         }
         arr.push_back(entry);
     }
+    diag::log_tagged_fmt("net_tools", "network_enumerate_wfp_callouts source_counts bfe=%zu runtime_registered_fallback=%zu",
+                         bfe_count, runtime_fallback_count);
     return tool_result_t::ok(std::to_string(callouts.size()) + OBFSTR(" WFP entries found"), arr);
 }
 
@@ -2985,9 +3069,9 @@ void register_network_tools(mcp_standalone::server_t& srv) {
 
     register_compat(srv, {
         OBFSTR("network_enumerate_wfp_callouts"), OBFSTR("network"),
-        OBFSTR("Enumerate all registered WFP (Windows Filtering Platform) callouts in the system. Shows callout ID, "
-               "layer, owning module, classify/notify function addresses. Use to audit what other drivers/security "
-               "products are hooking network traffic. Filter by module name."),
+        OBFSTR("Enumerate registered WFP (Windows Filtering Platform) callouts and filters. Shows BFE inventory source, "
+               "degraded runtime-fallback status, action/layer/sublayer/callout GUID labels, display/app-condition previews, "
+               "and classify/notify addresses where available. Use to audit stale block filters or security products hooking network traffic."),
         {{OBFSTR("module"), OBFSTR("string"), OBFSTR("Filter by owning module name (case-insensitive substring)"), false}},
         network_enumerate_wfp_callouts, true});
 
@@ -3067,9 +3151,16 @@ void register_network_tools(mcp_standalone::server_t& srv) {
 
     register_compat(srv, {
         OBFSTR("network_intercept_manage"), OBFSTR("network"),
-        OBFSTR("Manage packet interception and held-packet decisions. Actions: enable, disable, list, release, drop, modify."),
+        OBFSTR("Manage packet interception and held-packet decisions. Actions: enable, disable, list, release, drop, modify. "
+               "The enable action requires at least one explicit filter: pid, port, or protocol."),
         {{OBFSTR("action"), OBFSTR("string"), OBFSTR("enable|disable|list|release|drop|modify"), true},
-         {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
+         {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false},
+         {OBFSTR("pid"), OBFSTR("number"), OBFSTR("Enable filter: process ID. At least one of pid, port, or protocol is required for enable."), false},
+         {OBFSTR("port"), OBFSTR("number"), OBFSTR("Enable filter: local or remote port. At least one of pid, port, or protocol is required for enable."), false},
+         {OBFSTR("protocol"), OBFSTR("string"), OBFSTR("Enable filter: 'tcp' or 'udp'. At least one of pid, port, or protocol is required for enable."), false},
+         {OBFSTR("hold_id"), OBFSTR("number"), OBFSTR("Held packet ID for release, drop, or modify."), false},
+         {OBFSTR("payload_text"), OBFSTR("string"), OBFSTR("Replacement payload text for modify."), false},
+         {OBFSTR("payload_hex"), OBFSTR("string"), OBFSTR("Replacement payload hex for modify."), false}},
         [](const json& params) -> tool_result_t {
             const std::string action = compat_action_name(params);
             json p = compat_action_payload(params);

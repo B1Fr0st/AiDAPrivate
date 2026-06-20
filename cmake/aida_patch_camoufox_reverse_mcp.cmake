@@ -12,6 +12,7 @@ set(AIDA_CAMOUFOX_SOURCE_SYNC_FILES
     "browser.py"
     "__main__.py"
     "tools/navigation.py"
+    "tools/script_analysis.py"
     "tools/network.py"
     "tools/debugging.py"
     "tools/environment.py"
@@ -27,14 +28,17 @@ set(AIDA_CAMOUFOX_REQUIRED_REVERSE_TOOLS
     "close_page"
     "evaluate_js"
     "navigate"
+    "diagnose_bloxflip_matrix"
     "get_page_info"
     "network_capture"
     "list_network_requests"
     "get_network_request"
+    "scripts"
 )
 
 set(AIDA_CAMOUFOX_REPO_BROWSER_PATH "${AIDA_CAMOUFOX_REPO_MCP_ROOT}/browser.py")
 set(AIDA_CAMOUFOX_REPO_NAV_PATH "${AIDA_CAMOUFOX_REPO_MCP_ROOT}/tools/navigation.py")
+set(AIDA_CAMOUFOX_REPO_SCRIPT_PATH "${AIDA_CAMOUFOX_REPO_MCP_ROOT}/tools/script_analysis.py")
 set(AIDA_CAMOUFOX_REPO_NETWORK_PATH "${AIDA_CAMOUFOX_REPO_MCP_ROOT}/tools/network.py")
 set(AIDA_CAMOUFOX_REPO_DEBUGGING_PATH "${AIDA_CAMOUFOX_REPO_MCP_ROOT}/tools/debugging.py")
 set(AIDA_CAMOUFOX_REPO_MULTIPAGE_SOURCE_READY FALSE)
@@ -42,8 +46,12 @@ if(EXISTS "${AIDA_CAMOUFOX_REPO_BROWSER_PATH}" AND EXISTS "${AIDA_CAMOUFOX_REPO_
     if(NOT EXISTS "${AIDA_CAMOUFOX_REPO_NETWORK_PATH}")
         message(FATAL_ERROR "Root Camoufox reverse-MCP network source is missing: ${AIDA_CAMOUFOX_REPO_NETWORK_PATH}")
     endif()
+    if(NOT EXISTS "${AIDA_CAMOUFOX_REPO_SCRIPT_PATH}")
+        message(FATAL_ERROR "Root Camoufox reverse-MCP script source is missing: ${AIDA_CAMOUFOX_REPO_SCRIPT_PATH}")
+    endif()
     file(READ "${AIDA_CAMOUFOX_REPO_BROWSER_PATH}" AIDA_CAMOUFOX_REPO_BROWSER_CONTENT)
     file(READ "${AIDA_CAMOUFOX_REPO_NAV_PATH}" AIDA_CAMOUFOX_REPO_NAV_CONTENT)
+    file(READ "${AIDA_CAMOUFOX_REPO_SCRIPT_PATH}" AIDA_CAMOUFOX_REPO_SCRIPT_CONTENT)
     file(READ "${AIDA_CAMOUFOX_REPO_NETWORK_PATH}" AIDA_CAMOUFOX_REPO_NETWORK_CONTENT)
     if(EXISTS "${AIDA_CAMOUFOX_REPO_DEBUGGING_PATH}")
         file(READ "${AIDA_CAMOUFOX_REPO_DEBUGGING_PATH}" AIDA_CAMOUFOX_REPO_DEBUGGING_CONTENT)
@@ -54,11 +62,13 @@ if(EXISTS "${AIDA_CAMOUFOX_REPO_BROWSER_PATH}" AND EXISTS "${AIDA_CAMOUFOX_REPO_
     string(REPLACE "\r" "\n" AIDA_CAMOUFOX_REPO_BROWSER_CONTENT "${AIDA_CAMOUFOX_REPO_BROWSER_CONTENT}")
     string(REPLACE "\r\n" "\n" AIDA_CAMOUFOX_REPO_NAV_CONTENT "${AIDA_CAMOUFOX_REPO_NAV_CONTENT}")
     string(REPLACE "\r" "\n" AIDA_CAMOUFOX_REPO_NAV_CONTENT "${AIDA_CAMOUFOX_REPO_NAV_CONTENT}")
+    string(REPLACE "\r\n" "\n" AIDA_CAMOUFOX_REPO_SCRIPT_CONTENT "${AIDA_CAMOUFOX_REPO_SCRIPT_CONTENT}")
+    string(REPLACE "\r" "\n" AIDA_CAMOUFOX_REPO_SCRIPT_CONTENT "${AIDA_CAMOUFOX_REPO_SCRIPT_CONTENT}")
     string(REPLACE "\r\n" "\n" AIDA_CAMOUFOX_REPO_NETWORK_CONTENT "${AIDA_CAMOUFOX_REPO_NETWORK_CONTENT}")
     string(REPLACE "\r" "\n" AIDA_CAMOUFOX_REPO_NETWORK_CONTENT "${AIDA_CAMOUFOX_REPO_NETWORK_CONTENT}")
     string(REPLACE "\r\n" "\n" AIDA_CAMOUFOX_REPO_DEBUGGING_CONTENT "${AIDA_CAMOUFOX_REPO_DEBUGGING_CONTENT}")
     string(REPLACE "\r" "\n" AIDA_CAMOUFOX_REPO_DEBUGGING_CONTENT "${AIDA_CAMOUFOX_REPO_DEBUGGING_CONTENT}")
-    set(AIDA_CAMOUFOX_REPO_TOOL_CONTENT "${AIDA_CAMOUFOX_REPO_NAV_CONTENT}\n${AIDA_CAMOUFOX_REPO_NETWORK_CONTENT}\n${AIDA_CAMOUFOX_REPO_DEBUGGING_CONTENT}")
+    set(AIDA_CAMOUFOX_REPO_TOOL_CONTENT "${AIDA_CAMOUFOX_REPO_NAV_CONTENT}\n${AIDA_CAMOUFOX_REPO_SCRIPT_CONTENT}\n${AIDA_CAMOUFOX_REPO_NETWORK_CONTENT}\n${AIDA_CAMOUFOX_REPO_DEBUGGING_CONTENT}")
     foreach(AIDA_CAMOUFOX_REQUIRED_REVERSE_TOOL IN LISTS AIDA_CAMOUFOX_REQUIRED_REVERSE_TOOLS)
         string(FIND "${AIDA_CAMOUFOX_REPO_TOOL_CONTENT}" "async def ${AIDA_CAMOUFOX_REQUIRED_REVERSE_TOOL}(" AIDA_CAMOUFOX_REQUIRED_TOOL_POS)
         if(AIDA_CAMOUFOX_REQUIRED_TOOL_POS EQUAL -1)
@@ -75,10 +85,17 @@ if(EXISTS "${AIDA_CAMOUFOX_REPO_BROWSER_PATH}" AND EXISTS "${AIDA_CAMOUFOX_REPO_
         "async def page_envelope"
         "def _mark_page_terminal"
         "AIDA_CAMOUFOX_FAST_VISIBLE_FALLBACK"
-        "aida_camoufox_bridge_20260619_2"
+        "aida_camoufox_bridge_20260620_crash_diag_1"
         "aida_bridge_patch_active"
         "aida_launch_policy_resolved"
         "context_close_event"
+        "cmdline_sha256"
+        "subprocess_diagnostics_installed"
+        "stdout_capture"
+        "stderr_capture"
+        "exit_ts_ms"
+        "diagnostic_original_style_bundled"
+        "_registered_page_records"
         "page_recovery_created"
         "resolve_page_default_recovery_begin"
         "browser_page_id_unavailable"
@@ -95,11 +112,30 @@ if(EXISTS "${AIDA_CAMOUFOX_REPO_BROWSER_PATH}" AND EXISTS "${AIDA_CAMOUFOX_REPO_
         "diagnostic_navigation_goto_begin"
         "diagnostic_navigation_goto_exception"
         "bloxflip_navigation_state"
+        "navigation_lifecycle_degraded"
+        "first_failure_phase"
+        "diagnose_bloxflip_matrix"
+        "original_style_bundled"
+        "node_exit_code"
+        "camoufox_child_exits"
+        "cloudflare"
         "\"network_requests\""
         "\"network_capture\"")
         string(FIND "${AIDA_CAMOUFOX_REPO_NAV_CONTENT}" "${AIDA_CAMOUFOX_REQUIRED_NAV_MARKER}" AIDA_CAMOUFOX_REQUIRED_NAV_MARKER_POS)
         if(AIDA_CAMOUFOX_REQUIRED_NAV_MARKER_POS EQUAL -1)
             message(FATAL_ERROR "Root Camoufox reverse-MCP navigation source is missing required marker ${AIDA_CAMOUFOX_REQUIRED_NAV_MARKER}: ${AIDA_CAMOUFOX_REPO_NAV_PATH}")
+        endif()
+    endforeach()
+    foreach(AIDA_CAMOUFOX_REQUIRED_SCRIPT_MARKER IN ITEMS
+        "async def scripts("
+        "async def _script_error"
+        "\"scripts\""
+        "\"count\""
+        "scripts_error"
+        "requested_page_id")
+        string(FIND "${AIDA_CAMOUFOX_REPO_SCRIPT_CONTENT}" "${AIDA_CAMOUFOX_REQUIRED_SCRIPT_MARKER}" AIDA_CAMOUFOX_REQUIRED_SCRIPT_MARKER_POS)
+        if(AIDA_CAMOUFOX_REQUIRED_SCRIPT_MARKER_POS EQUAL -1)
+            message(FATAL_ERROR "Root Camoufox reverse-MCP script source is missing required marker ${AIDA_CAMOUFOX_REQUIRED_SCRIPT_MARKER}: ${AIDA_CAMOUFOX_REPO_SCRIPT_PATH}")
         endif()
     endforeach()
     foreach(AIDA_CAMOUFOX_REQUIRED_NETWORK_MARKER IN ITEMS
@@ -1862,7 +1898,7 @@ def _profile_snapshot(profile_dir: str | None) -> dict[str, Any]:
         OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "context_close_event"
         OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "AIDA_CAMOUFOX_FAST_VISIBLE_FALLBACK"
         OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "AIDA_CAMOUFOX_BRIDGE_PATCH_ID"
-        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "aida_camoufox_bridge_20260619_2"
+        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "aida_camoufox_bridge_20260620_crash_diag_1"
         OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "aida_bridge_patch_active"
         OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "aida_launch_policy_resolved"
         OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "selected_launch_path"
@@ -2219,6 +2255,7 @@ endforeach()
 foreach(AIDA_CAMOUFOX_STAGE_MCP_ROOT IN LISTS AIDA_CAMOUFOX_STAGE_MCP_ROOTS)
     set(AIDA_CAMOUFOX_STAGE_BROWSER_PATH "${AIDA_CAMOUFOX_STAGE_MCP_ROOT}/browser.py")
     set(AIDA_CAMOUFOX_STAGE_NAV_PATH "${AIDA_CAMOUFOX_STAGE_MCP_ROOT}/tools/navigation.py")
+    set(AIDA_CAMOUFOX_STAGE_SCRIPT_PATH "${AIDA_CAMOUFOX_STAGE_MCP_ROOT}/tools/script_analysis.py")
     set(AIDA_CAMOUFOX_STAGE_NETWORK_PATH "${AIDA_CAMOUFOX_STAGE_MCP_ROOT}/tools/network.py")
     if(EXISTS "${AIDA_CAMOUFOX_STAGE_BROWSER_PATH}")
         file(READ "${AIDA_CAMOUFOX_STAGE_BROWSER_PATH}" AIDA_CAMOUFOX_STAGE_BROWSER_CONTENT)
@@ -2228,6 +2265,13 @@ foreach(AIDA_CAMOUFOX_STAGE_MCP_ROOT IN LISTS AIDA_CAMOUFOX_STAGE_MCP_ROOTS)
             "page_recovery_created"
             "resolve_page_default_recovery_begin"
             "browser_page_id_unavailable"
+            "cmdline_sha256"
+            "subprocess_diagnostics_installed"
+            "stdout_capture"
+            "stderr_capture"
+            "exit_ts_ms"
+            "diagnostic_original_style_bundled"
+            "_registered_page_records"
             "requestfinished_event"
             "websocket_event"
             "response_body_length")
@@ -2245,11 +2289,35 @@ foreach(AIDA_CAMOUFOX_STAGE_MCP_ROOT IN LISTS AIDA_CAMOUFOX_STAGE_MCP_ROOTS)
             "diagnostic_navigation_goto_begin"
             "diagnostic_navigation_goto_exception"
             "bloxflip_navigation_state"
+            "navigation_lifecycle_degraded"
+            "first_failure_phase"
+            "diagnose_bloxflip_matrix"
+            "original_style_bundled"
+            "node_exit_code"
+            "camoufox_child_exits"
+            "cloudflare"
             "\"network_requests\""
             "\"network_capture\"")
             string(FIND "${AIDA_CAMOUFOX_STAGE_NAV_CONTENT}" "${AIDA_CAMOUFOX_STAGE_NAV_MARKER}" AIDA_CAMOUFOX_STAGE_NAV_MARKER_POS)
             if(AIDA_CAMOUFOX_STAGE_NAV_MARKER_POS EQUAL -1)
                 message(FATAL_ERROR "Staged Camoufox reverse-MCP navigation source is missing required marker ${AIDA_CAMOUFOX_STAGE_NAV_MARKER}: ${AIDA_CAMOUFOX_STAGE_NAV_PATH}")
+            endif()
+        endforeach()
+    endif()
+    if(EXISTS "${AIDA_CAMOUFOX_STAGE_SCRIPT_PATH}")
+        file(READ "${AIDA_CAMOUFOX_STAGE_SCRIPT_PATH}" AIDA_CAMOUFOX_STAGE_SCRIPT_CONTENT)
+        string(REPLACE "\r\n" "\n" AIDA_CAMOUFOX_STAGE_SCRIPT_CONTENT "${AIDA_CAMOUFOX_STAGE_SCRIPT_CONTENT}")
+        string(REPLACE "\r" "\n" AIDA_CAMOUFOX_STAGE_SCRIPT_CONTENT "${AIDA_CAMOUFOX_STAGE_SCRIPT_CONTENT}")
+        foreach(AIDA_CAMOUFOX_STAGE_SCRIPT_MARKER IN ITEMS
+            "async def scripts("
+            "async def _script_error"
+            "\"scripts\""
+            "\"count\""
+            "scripts_error"
+            "requested_page_id")
+            string(FIND "${AIDA_CAMOUFOX_STAGE_SCRIPT_CONTENT}" "${AIDA_CAMOUFOX_STAGE_SCRIPT_MARKER}" AIDA_CAMOUFOX_STAGE_SCRIPT_MARKER_POS)
+            if(AIDA_CAMOUFOX_STAGE_SCRIPT_MARKER_POS EQUAL -1)
+                message(FATAL_ERROR "Staged Camoufox reverse-MCP script source is missing required marker ${AIDA_CAMOUFOX_STAGE_SCRIPT_MARKER}: ${AIDA_CAMOUFOX_STAGE_SCRIPT_PATH}")
             endif()
         endforeach()
     endif()

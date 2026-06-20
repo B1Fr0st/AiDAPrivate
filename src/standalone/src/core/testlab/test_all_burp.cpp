@@ -3254,9 +3254,70 @@ namespace {
         const char* tag = "cfox_ready";
         log_msg(hf, tag, "START -- camoufox::is_ready()");
         bool ready = aida::burp::camoufox::is_ready();
-        log_msg(hf, tag, "is_ready = %s", ready ? "true" : "false");
-        log_msg(hf, tag, "PASS -- is_ready returned %s", ready ? "true" : "false");
-        passed.fetch_add(1);
+        auto before = aida::burp::camoufox::get_status();
+        log_msg(hf, tag, "initial_ready=%s state=%s generation=%llu child_pid=%u child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d child_processes=%u browser_processes=%u pages=%u last_error=%s",
+            ready ? "true" : "false",
+            camoufox_bridge_state_name(before.state),
+            static_cast<unsigned long long>(before.generation),
+            before.child_pid,
+            before.child_alive ? 1 : 0,
+            before.browser_open ? 1 : 0,
+            before.page_verified ? 1 : 0,
+            before.privacy_verified ? 1 : 0,
+            before.cleanup_pending ? 1 : 0,
+            before.child_process_count,
+            before.browser_process_count,
+            before.page_count,
+            before.last_error.empty() ? "<empty>" : compact_burp_text(before.last_error, 700).c_str());
+        if (ready) {
+            log_msg(hf, tag, "PASS -- Camoufox bridge is ready");
+            passed.fetch_add(1);
+            return;
+        }
+        const uint64_t t0 = GetTickCount64();
+        bool recovered = false;
+        try {
+            recovered = aida::burp::camoufox::ensure_ready();
+        } catch (...) {
+            recovered = false;
+        }
+        auto after = aida::burp::camoufox::get_status();
+        const bool ready_after = aida::burp::camoufox::is_ready();
+        log_msg(hf, tag, "relaunch_attempt recovered=%d ready_after=%d state=%s generation=%llu child_pid=%u child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d child_processes=%u browser_processes=%u pages=%u elapsed_ms=%llu last_error=%s",
+            recovered ? 1 : 0,
+            ready_after ? 1 : 0,
+            camoufox_bridge_state_name(after.state),
+            static_cast<unsigned long long>(after.generation),
+            after.child_pid,
+            after.child_alive ? 1 : 0,
+            after.browser_open ? 1 : 0,
+            after.page_verified ? 1 : 0,
+            after.privacy_verified ? 1 : 0,
+            after.cleanup_pending ? 1 : 0,
+            after.child_process_count,
+            after.browser_process_count,
+            after.page_count,
+            static_cast<unsigned long long>(GetTickCount64() - t0),
+            after.last_error.empty() ? "<empty>" : compact_burp_text(after.last_error, 700).c_str());
+        if (ready_after) {
+            log_msg(hf, tag, "PASS -- Camoufox bridge recovered from initial not-ready state child_pid=%u", after.child_pid);
+            passed.fetch_add(1);
+            return;
+        }
+        fail_empty_evidence(hf, tag, failed,
+            "Camoufox readiness is false after relaunch attempt state=%s generation=%llu child_pid=%u child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d child_processes=%u browser_processes=%u pages=%u last_error=%s",
+            camoufox_bridge_state_name(after.state),
+            static_cast<unsigned long long>(after.generation),
+            after.child_pid,
+            after.child_alive ? 1 : 0,
+            after.browser_open ? 1 : 0,
+            after.page_verified ? 1 : 0,
+            after.privacy_verified ? 1 : 0,
+            after.cleanup_pending ? 1 : 0,
+            after.child_process_count,
+            after.browser_process_count,
+            after.page_count,
+            after.last_error.empty() ? "<empty>" : compact_burp_text(after.last_error, 700).c_str());
     }
 
     void test_camoufox_last_error(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {

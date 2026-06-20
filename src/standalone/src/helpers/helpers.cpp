@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <iostream>
 #include <string>
+#include <cstring>
 #include <atomic>
 #include <thread>
 #include <chrono>
@@ -52,6 +53,7 @@
 #include "analysis_hub_view.hpp"
 #include "source_reconstruct_view.hpp"
 #include "work_queue.hpp"
+#include "critical_work_queue.hpp"
 #include "functions_panel.hpp"
 #include "function_index.hpp"
 #include "xref_index.hpp"
@@ -122,6 +124,103 @@ namespace {
 			}
 		}
 		g_settings_cv.notify_one();
+	}
+
+	void log_license_screen_breadcrumb(const char* event, float window_w, float window_h, bool runtime_ready, bool runtime_locked)
+	{
+		const std::string run_id = standalone_license::run_correlation_id();
+		const std::string runtime_snapshot = standalone_license::runtime_state_snapshot();
+		auto dyn = driver_bridge::dynamic_ioctl_state();
+		auto wq = work_queue::stats();
+		auto swq = work_queue::service_stats();
+		auto cwq = critical_work_queue::stats();
+		DWORD qs = ::GetQueueStatus(QS_ALLINPUT);
+		DWORD qs_changed = LOWORD(qs);
+		DWORD qs_current = HIWORD(qs);
+		RECT wr{};
+		BOOL rect_ok = g_hwnd ? ::GetWindowRect(g_hwnd, &wr) : FALSE;
+		DWORD rect_gle = rect_ok ? ERROR_SUCCESS : ::GetLastError();
+		const bool activation_worker_active = license::activation_worker_active.load(std::memory_order_acquire);
+		const bool arc_transfer_active = standalone_license::is_arc_transfer_in_progress();
+		const bool activation_progress_active = license::checking && (activation_worker_active || arc_transfer_active);
+		const bool full_test_running = test_all_features::is_running();
+		std::string driver_status = driver_bridge::status();
+		const char* breadcrumb_event = event ? event : "license_screen_frame_health";
+		diag::log_tagged_critical_fmt("license",
+			"%s run_id=%s frame=%d tick=%llu tid=%lu runtime_ready=%d runtime_locked=%d validated=%d canonical_valid=%d checking=%d check_failed=%d activation_worker=%d activation_progress=%d activation_phase=%d arc_loaded=%d arc_download=%d arc_transfer=%d full_test=%d key_len=%zu window=%.0fx%.0f hwnd=0x%llX visible=%d enabled=%d iconic=%d rect_ok=%d rect=%ld,%ld,%ld,%ld rect_gle=%lu fg=0x%llX active=0x%llX focus=0x%llX capture=0x%llX qs=0x%08lX qs_changed=0x%04lX qs_current=0x%04lX want_text=%d render_section=%s driver_loaded=%d driver_kernel=%d driver_connected=%d dyn_ready=%d inst_seed=%u/%u global_seed=%u/%u ioctl_seed_hash=0x%08X hb_ioctl_seed_hash=0x%08X attached_pid=%u driver_status=%.120s runtime={%.520s}",
+			breadcrumb_event,
+			run_id.c_str(),
+			ImGui::GetFrameCount(),
+			static_cast<unsigned long long>(GetTickCount64()),
+			::GetCurrentThreadId(),
+			runtime_ready ? 1 : 0,
+			runtime_locked ? 1 : 0,
+			license::validated ? 1 : 0,
+			standalone_license::is_valid() ? 1 : 0,
+			license::checking ? 1 : 0,
+			license::check_failed ? 1 : 0,
+			activation_worker_active ? 1 : 0,
+			activation_progress_active ? 1 : 0,
+			globals::ui::license_activation_phase.load(std::memory_order_acquire),
+			standalone_license::is_arc_loaded() ? 1 : 0,
+			standalone_license::is_arc_download_in_progress() ? 1 : 0,
+			arc_transfer_active ? 1 : 0,
+			full_test_running ? 1 : 0,
+			std::strlen(license::key_buf),
+			window_w,
+			window_h,
+			static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(g_hwnd)),
+			(g_hwnd && ::IsWindowVisible(g_hwnd)) ? 1 : 0,
+			(g_hwnd && ::IsWindowEnabled(g_hwnd)) ? 1 : 0,
+			(g_hwnd && ::IsIconic(g_hwnd)) ? 1 : 0,
+			rect_ok ? 1 : 0,
+			rect_ok ? wr.left : 0,
+			rect_ok ? wr.top : 0,
+			rect_ok ? wr.right : 0,
+			rect_ok ? wr.bottom : 0,
+			static_cast<unsigned long>(rect_gle),
+			static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(::GetForegroundWindow())),
+			static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(::GetActiveWindow())),
+			static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(::GetFocus())),
+			static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(::GetCapture())),
+			static_cast<unsigned long>(qs),
+			static_cast<unsigned long>(qs_changed),
+			static_cast<unsigned long>(qs_current),
+			ImGui::GetIO().WantTextInput ? 1 : 0,
+			g_render_section.c_str(),
+			dyn.loaded ? 1 : 0,
+			dyn.kernel ? 1 : 0,
+			dyn.connected ? 1 : 0,
+			dyn.ready ? 1 : 0,
+			dyn.instance_server_seed,
+			dyn.instance_ioctl_seed,
+			dyn.global_server_seed,
+			dyn.global_ioctl_seed,
+			dyn.ioctl_seed_hash,
+			dyn.heartbeat_ioctl_seed_hash,
+			driver_bridge::attached_pid(),
+			driver_status.c_str(),
+			runtime_snapshot.c_str());
+		diag::log_tagged_critical_fmt("license",
+			"%s_queues run_id=%s frame=%d work_alive=%d work_pending=%zu work_active=%u work_oldest_ms=%llu work_labels=%.220s svc_alive=%d svc_pending=%zu svc_active=%u svc_oldest_ms=%llu svc_labels=%.220s critical_alive=%d critical_pending=%zu critical_active=%u critical_oldest_ms=%llu critical_labels=%.220s",
+			breadcrumb_event,
+			run_id.c_str(),
+			ImGui::GetFrameCount(),
+			wq.alive ? 1 : 0,
+			wq.pending,
+			wq.active,
+			static_cast<unsigned long long>(wq.oldest_active_ms),
+			wq.active_labels.c_str(),
+			swq.alive ? 1 : 0,
+			swq.pending,
+			swq.active,
+			static_cast<unsigned long long>(swq.oldest_active_ms),
+			swq.active_labels.c_str(),
+			cwq.alive ? 1 : 0,
+			cwq.pending,
+			cwq.active,
+			static_cast<unsigned long long>(cwq.oldest_active_ms),
+			cwq.active_labels.c_str());
 	}
 
 	void request_chrome_shutdown_from_render(const char* source, const char* cleanup_reason)
@@ -1464,12 +1563,21 @@ void helpers::render_title()
 		++s_inline_log_ctr;
 
 		if ((s_inline_log_ctr % 1000) == 0) {
-			work_queue::post([] {
-				try {
-					anti_tamper::run_inline_check(anti_tamper::CHECK_CODE_INTEGRITY);
-				} catch (...) {
-				}
-			});
+			auto& rt = anti_tamper::state::get();
+			const bool heavy_integrity_ready =
+				!rt.driver_hardening_active.load(std::memory_order_acquire) &&
+				(!rt.license_pending_activation.load(std::memory_order_acquire) ||
+					rt.activation_hardening_done.load(std::memory_order_acquire)) &&
+				standalone_license::is_arc_loaded() &&
+				!standalone_license::is_arc_download_in_progress();
+			if (heavy_integrity_ready) {
+				work_queue::post([] {
+					try {
+						anti_tamper::run_inline_check(anti_tamper::CHECK_CODE_INTEGRITY);
+					} catch (...) {
+					}
+				});
+			}
 		}
 	}
 
@@ -2430,6 +2538,19 @@ void helpers::render_title()
 		(void)gs;
 
 		const bool runtime_locked = anti_tamper::state::get().violation_latched.load(std::memory_order_acquire);
+		{
+			static bool s_license_screen_enter_logged = false;
+			static uint64_t s_license_screen_last_health_ms = 0;
+			const uint64_t now_ms = static_cast<uint64_t>(GetTickCount64());
+			if (!s_license_screen_enter_logged) {
+				log_license_screen_breadcrumb("license_screen_enter", ww, wh, runtime_ready, runtime_locked);
+				s_license_screen_enter_logged = true;
+				s_license_screen_last_health_ms = now_ms;
+			} else if (s_license_screen_last_health_ms == 0 || now_ms - s_license_screen_last_health_ms >= 2000) {
+				log_license_screen_breadcrumb("license_screen_frame_health", ww, wh, runtime_ready, runtime_locked);
+				s_license_screen_last_health_ms = now_ms;
+			}
+		}
 		if (runtime_locked) {
 			dl->AddRectFilled(card_a, card_b, aida::ui::with_alpha(th.panel_bg, 0.82f * la), 16.f);
 			dl->AddRect(card_a, card_b, aida::ui::with_alpha(th.border_subtle, la), 16.f, 0, 1.2f);
@@ -2765,9 +2886,9 @@ void helpers::render_title()
 
 		if (activation_progress_active) {
 			static const char* k_act_phases[] = {
-				"Resolving license server...",
-				"Verifying signature...",
-				"Issuing session...",
+				"Activating license...",
+				"Verifying license...",
+				"Preparing protected runtime...",
 				"Downloading runtime...",
 				"Sealing..."
 			};

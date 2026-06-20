@@ -841,7 +841,7 @@ def patch_browser_camoufox_stability(text: str) -> str:
             text,
             'PRIVACY_VERIFY_URL = "data:text/html,%3C!doctype%20html%3E%3Ctitle%3EAiDA%20Camoufox%3C/title%3E"\n',
             'PRIVACY_VERIFY_URL = "data:text/html,%3C!doctype%20html%3E%3Ctitle%3EAiDA%20Camoufox%3C/title%3E"\n'
-            'AIDA_CAMOUFOX_BRIDGE_PATCH_ID = "aida_camoufox_bridge_20260619_2"\n',
+            'AIDA_CAMOUFOX_BRIDGE_PATCH_ID = "aida_camoufox_bridge_20260620_crash_diag_1"\n',
             "browser bridge patch id",
         )
     if "def _flag_enabled(value: Any) -> bool:" not in text:
@@ -1946,7 +1946,7 @@ def patch_browser(path: pathlib.Path) -> None:
     text = patch_browser_camoufox_stability(text)
     text = patch_browser_pending_activation(text)
     text = patch_browser_debug_helper(text)
-    for marker in ("self._aida_multipage_patch = 4", "async def list_pages", "async def resolve_page", "page_id", "active_page_id", "_pending_page_ids_by_context", "page_privacy_verified", "def _mark_page_terminal", "AIDA_CAMOUFOX_FAST_VISIBLE_FALLBACK", "aida_camoufox_bridge_20260619_2", "aida_bridge_patch_active", "aida_launch_policy_resolved", "context_close_event"):
+    for marker in ("self._aida_multipage_patch = 4", "async def list_pages", "async def resolve_page", "page_id", "active_page_id", "_pending_page_ids_by_context", "page_privacy_verified", "def _mark_page_terminal", "AIDA_CAMOUFOX_FAST_VISIBLE_FALLBACK", "aida_camoufox_bridge_20260620_crash_diag_1", "aida_bridge_patch_active", "aida_launch_policy_resolved", "context_close_event", "cmdline_sha256", "subprocess_diagnostics_installed", "stdout_capture", "stderr_capture", "exit_ts_ms", "diagnostic_original_style_bundled", "_registered_page_records"):
         if marker not in text:
             fail(f"browser validation missing {marker}")
     write_text(path, text)
@@ -1959,6 +1959,9 @@ def patch_navigation(path: pathlib.Path) -> None:
         text = patch_navigation_reset_cleanup(path, text)
         text = patch_navigation_capture(path, text)
         text = patch_navigation_diagnostics(path, text)
+        for marker in ("navigation_lifecycle_degraded", "first_failure_phase", "timeout_source", "_NavigationLifecycleError", "diagnose_bloxflip_matrix", "original_style_bundled", "node_exit_code", "camoufox_child_exits", "cloudflare"):
+            if marker not in text:
+                fail(f"navigation validation missing {marker}")
         write_text(path, text)
         return
     text = replace_once(
@@ -2920,6 +2923,15 @@ def patch_hooking(path: pathlib.Path) -> None:
     write_text(path, text)
 
 
+def validate_script_analysis(path: pathlib.Path) -> None:
+    if not path.exists():
+        fail(f"script analysis source missing {path}")
+    text = read_text(path)
+    for marker in ("async def scripts(", "async def _script_error", "\"scripts\"", "\"count\"", "scripts_error", "requested_page_id"):
+        if marker not in text:
+            fail(f"script analysis validation missing {marker} in {path}")
+
+
 def main() -> None:
     if ROOT is None:
         fail("stage root argument is required")
@@ -2938,6 +2950,7 @@ def main() -> None:
         patch_debugging(base / "tools" / "debugging.py")
         patch_network(base / "tools" / "network.py")
         patch_hooking(base / "tools" / "hooking.py")
+        validate_script_analysis(base / "tools" / "script_analysis.py")
         patched += 1
     if patched == 0:
         fail(f"no camoufox_reverse_mcp package found under {ROOT}")

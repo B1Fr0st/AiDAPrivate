@@ -5166,6 +5166,55 @@ namespace driver_bridge
         return device->refresh_heartbeat();
     }
 
+    static dynamic_ioctl_state_t sentinel_dynamic_ioctl_preflight_state()
+    {
+        dynamic_ioctl_state_t out{};
+        std::lock_guard<std::mutex> lk(g_state_mtx);
+        out.loaded = g_initialized;
+        out.kernel = g_kernel_mode;
+        out.connected = device && device->is_connected();
+        if (device)
+        {
+            device->sync_dynamic_security_state();
+            out.instance_server_seed = device->has_server_seed() ? 1u : 0u;
+            out.instance_ioctl_seed = device->has_server_ioctl_seed() ? 1u : 0u;
+            out.global_server_seed = dynamic_key::g_server_seed != 0 ? 1u : 0u;
+            out.global_ioctl_seed = ioctl_codes::g_server_ioctl_seed != 0 ? 1u : 0u;
+            out.ioctl_seed_hash = device->get_server_ioctl_seed_hash();
+            out.heartbeat_ioctl_seed_hash = device->get_last_heartbeat_ioctl_seed_hash();
+        }
+        out.ready = out.connected && out.kernel &&
+            out.instance_server_seed != 0 &&
+            out.instance_ioctl_seed != 0 &&
+            out.global_server_seed != 0 &&
+            out.global_ioctl_seed != 0;
+        return out;
+    }
+
+    static bool sentinel_dynamic_ioctl_ready_preflight(const char* op, ULONGLONG start, dynamic_ioctl_state_t* out_state = nullptr)
+    {
+        dynamic_ioctl_state_t dyn = sentinel_dynamic_ioctl_preflight_state();
+        if (out_state)
+            *out_state = dyn;
+        if (dyn.ready)
+            return true;
+        SetLastError(ERROR_NOT_READY);
+        diag::log_tagged_fmt("driver",
+            "preauth_skipped_dynamic_ioctl_not_ready phase=driver_bridge_sentinel op=%s loaded=%d kernel=%d connected=%d inst_seed=%u/%u global_seed=%u/%u ioctl_seed_hash=0x%08X hb_ioctl_seed_hash=0x%08X elapsed_ms=%llu",
+            op && *op ? op : "unknown",
+            dyn.loaded ? 1 : 0,
+            dyn.kernel ? 1 : 0,
+            dyn.connected ? 1 : 0,
+            dyn.instance_server_seed,
+            dyn.instance_ioctl_seed,
+            dyn.global_server_seed,
+            dyn.global_ioctl_seed,
+            dyn.ioctl_seed_hash,
+            dyn.heartbeat_ioctl_seed_hash,
+            static_cast<unsigned long long>(GetTickCount64() - start));
+        return false;
+    }
+
     bool sentinel_bridge_ready()
     {
         const ULONGLONG start = GetTickCount64();
@@ -5187,6 +5236,17 @@ namespace driver_bridge
                 kernel_flag ? 1 : 0,
                 connected ? 1 : 0,
                 static_cast<unsigned long long>(GetTickCount64() - start));
+            return false;
+        }
+
+        dynamic_ioctl_state_t dyn{};
+        if (!sentinel_dynamic_ioctl_ready_preflight("sentinel_bridge_ready", start, &dyn)) {
+            diag::log_tagged_fmt("driver",
+                "sentinel_bridge_ready_result heartbeat_ok=0 heartbeat_gle=%lu heartbeat_ms=0 ready=0 ready_gle=%lu ready_ms=0 total_ms=%llu dyn_ready=%d",
+                static_cast<unsigned long>(ERROR_NOT_READY),
+                static_cast<unsigned long>(ERROR_NOT_READY),
+                static_cast<unsigned long long>(GetTickCount64() - start),
+                dyn.ready ? 1 : 0);
             return false;
         }
 
@@ -5212,6 +5272,7 @@ namespace driver_bridge
 
     uint64_t sentinel_ready_since_tsc()
     {
+        const ULONGLONG start = GetTickCount64();
         bool kernel_mode = false;
         {
             std::lock_guard<std::mutex> lk(g_state_mtx);
@@ -5220,7 +5281,18 @@ namespace driver_bridge
         if (!kernel_mode)
             return 0;
 
-        device->refresh_heartbeat();
+        if (!sentinel_dynamic_ioctl_ready_preflight("sentinel_ready_since_tsc", start))
+            return 0;
+
+        if (!device->refresh_heartbeat()) {
+            DWORD gle = GetLastError();
+            diag::log_tagged_fmt("driver",
+                "sentinel_ready_since_tsc_heartbeat_failed gle=%lu elapsed_ms=%llu",
+                static_cast<unsigned long>(gle),
+                static_cast<unsigned long long>(GetTickCount64() - start));
+            SetLastError(gle);
+            return 0;
+        }
         return device->sentinel_ready_since_tsc();
     }
 

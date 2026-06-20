@@ -608,6 +608,8 @@ namespace voyager {
         static constexpr std::uint32_t WFP_ENTRY_TYPE_FILTER = 1;
         static constexpr std::uint32_t WFP_AIDA_MATCH_SUBLAYER = 0x00000001u;
         static constexpr std::uint32_t WFP_AIDA_MATCH_ACTION_CALLOUT = 0x00000002u;
+        static constexpr std::uint32_t WFP_AIDA_MATCH_DISPLAY_DATA = 0x00000004u;
+        static constexpr std::uint32_t WFP_AIDA_MATCH_RUNTIME_FALLBACK = 0x80000000u;
         static constexpr std::size_t MAX_SOCKET_HANDLES = 512;
         static constexpr std::size_t SNIFF_MAX_CAPTURES = 16;
         static constexpr std::size_t SNIFF_MAX_BUF_SIZE = 2048;

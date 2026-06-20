@@ -117,6 +117,33 @@ namespace syscall_indices {
 
 namespace {
     constexpr std::size_t k_staged_physical_chunk_size = 0x1000;
+    constexpr std::uint64_t k_tctx_user_address_max = 0x00007FFFFFFFFFFFull;
+    constexpr std::uint64_t k_tctx_kernel_address_min = 0xFFFF800000000000ull;
+
+    static bool tctx_user_canonical(std::uint64_t value) noexcept {
+        return value != 0 && value <= k_tctx_user_address_max;
+    }
+
+    static bool tctx_kernel_canonical(std::uint64_t value) noexcept {
+        return value >= k_tctx_kernel_address_min;
+    }
+
+    static const char* tctx_address_class(std::uint64_t value) noexcept {
+        if (value == 0) {
+            return "zero";
+        }
+        if (tctx_user_canonical(value)) {
+            return "user";
+        }
+        if (tctx_kernel_canonical(value)) {
+            return "kernel";
+        }
+        return "noncanonical";
+    }
+
+    static bool tctx_user_context_sane(std::uint64_t rip, std::uint64_t rsp, std::uint64_t rflags) noexcept {
+        return rflags != 0 && tctx_user_canonical(rip) && tctx_user_canonical(rsp);
+    }
 
     struct dpi_payload_view_t {
         const std::uint8_t* data = nullptr;
@@ -2159,16 +2186,17 @@ bool voyager::device_t::get_thread_context(std::uint32_t tid, thread_context& ct
         ioctl_codes::g_server_ioctl_seed != 0 ? 1 : 0);
 
     auto context_sane = [&req]() noexcept {
-        return req.rip != 0 && req.rsp != 0 && req.rflags != 0;
+        return tctx_user_context_sane(req.rip, req.rsp, req.rflags);
     };
 
     const ULONGLONG initial_start = GetTickCount64();
+    const char* context_provenance = "raw_tctx_ioctl";
     bool ok = send_request(tctx_ioctl, &req, sizeof(req));
     DWORD first_gle = ok ? ERROR_SUCCESS : GetLastError();
     const ULONGLONG initial_elapsed = GetTickCount64() - initial_start;
     bool sane = ok && context_sane();
     diag::log_tagged_fmt("comm",
-        "TCTX get initial pid=%u tid=%u ok=%d gle=%lu sane=%d elapsed_ms=%llu rip=0x%llX rsp=0x%llX rflags=0x%llX dr7=0x%llX",
+        "TCTX get initial pid=%u tid=%u ok=%d gle=%lu sane=%d elapsed_ms=%llu rip=0x%llX rip_class=%s rsp=0x%llX rsp_class=%s rflags=0x%llX dr7=0x%llX provenance=raw_tctx_ioctl",
         process_id_,
         tid,
         ok ? 1 : 0,
@@ -2176,7 +2204,9 @@ bool voyager::device_t::get_thread_context(std::uint32_t tid, thread_context& ct
         sane ? 1 : 0,
         static_cast<unsigned long long>(initial_elapsed),
         static_cast<unsigned long long>(req.rip),
+        tctx_address_class(req.rip),
         static_cast<unsigned long long>(req.rsp),
+        tctx_address_class(req.rsp),
         static_cast<unsigned long long>(req.rflags),
         static_cast<unsigned long long>(req.dr7));
     if (!ok || !sane) {
@@ -2193,6 +2223,7 @@ bool voyager::device_t::get_thread_context(std::uint32_t tid, thread_context& ct
             req.register_mask = 0;
             const ULONGLONG retry_start = GetTickCount64();
             ok = send_request(tctx_ioctl, &req, sizeof(req));
+            context_provenance = "raw_tctx_ioctl_suspended_retry";
             first_gle = ok ? ERROR_SUCCESS : GetLastError();
             const ULONGLONG retry_elapsed = GetTickCount64() - retry_start;
             sane = ok && context_sane();
@@ -2202,7 +2233,7 @@ bool voyager::device_t::get_thread_context(std::uint32_t tid, thread_context& ct
             const DWORD resume_gle = resumed ? ERROR_SUCCESS : GetLastError();
             const ULONGLONG resume_elapsed = GetTickCount64() - resume_start;
             diag::log_tagged_fmt("comm",
-                "TCTX get suspended_retry pid=%u tid=%u suspended=1 suspend_gle=%lu suspend_prev=%u suspend_elapsed_ms=%llu retry_ok=%d retry_gle=%lu retry_sane=%d retry_elapsed_ms=%llu resume_ok=%d resume_gle=%lu resume_prev=%u resume_elapsed_ms=%llu rip=0x%llX rsp=0x%llX rflags=0x%llX dr7=0x%llX",
+                "TCTX get suspended_retry pid=%u tid=%u suspended=1 suspend_gle=%lu suspend_prev=%u suspend_elapsed_ms=%llu retry_ok=%d retry_gle=%lu retry_sane=%d retry_elapsed_ms=%llu resume_ok=%d resume_gle=%lu resume_prev=%u resume_elapsed_ms=%llu rip=0x%llX rip_class=%s rsp=0x%llX rsp_class=%s rflags=0x%llX dr7=0x%llX provenance=raw_tctx_ioctl_suspended_retry",
                 process_id_,
                 tid,
                 static_cast<unsigned long>(suspend_gle),
@@ -2217,7 +2248,9 @@ bool voyager::device_t::get_thread_context(std::uint32_t tid, thread_context& ct
                 ignored,
                 static_cast<unsigned long long>(resume_elapsed),
                 static_cast<unsigned long long>(req.rip),
+                tctx_address_class(req.rip),
                 static_cast<unsigned long long>(req.rsp),
+                tctx_address_class(req.rsp),
                 static_cast<unsigned long long>(req.rflags),
                 static_cast<unsigned long long>(req.dr7));
         } else {
@@ -2231,7 +2264,7 @@ bool voyager::device_t::get_thread_context(std::uint32_t tid, thread_context& ct
                 req.rflags,
                 suspend_gle);
             diag::log_tagged_fmt("comm",
-                "TCTX get suspend_failed pid=%u tid=%u initial_ok=%d initial_gle=%lu initial_sane=%d suspend_gle=%lu suspend_elapsed_ms=%llu rip=0x%llX rsp=0x%llX rflags=0x%llX",
+                "TCTX get suspend_failed pid=%u tid=%u initial_ok=%d initial_gle=%lu initial_sane=%d suspend_gle=%lu suspend_elapsed_ms=%llu rip=0x%llX rip_class=%s rsp=0x%llX rsp_class=%s rflags=0x%llX provenance=raw_tctx_ioctl",
                 process_id_,
                 tid,
                 ok ? 1 : 0,
@@ -2240,41 +2273,55 @@ bool voyager::device_t::get_thread_context(std::uint32_t tid, thread_context& ct
                 static_cast<unsigned long>(suspend_gle),
                 static_cast<unsigned long long>(suspend_elapsed),
                 static_cast<unsigned long long>(req.rip),
+                tctx_address_class(req.rip),
                 static_cast<unsigned long long>(req.rsp),
+                tctx_address_class(req.rsp),
                 static_cast<unsigned long long>(req.rflags));
         }
     }
     if (!ok) {
         RC_UM_DBG("TCTX get send_failed pid=%u tid=%u gle=%lu ioctl=0x%08X", process_id_, tid, first_gle, tctx_ioctl);
         diag::log_tagged_fmt("comm",
-            "TCTX get final_failed pid=%u tid=%u reason=send_failed gle=%lu ioctl=0x%08X rip=0x%llX rsp=0x%llX rflags=0x%llX",
+            "TCTX get final_failed pid=%u tid=%u reason=raw_send_failed gle=%lu ioctl=0x%08X rip=0x%llX rip_class=%s rsp=0x%llX rsp_class=%s rflags=0x%llX provenance=%s",
             process_id_,
             tid,
             static_cast<unsigned long>(first_gle),
             tctx_ioctl,
             static_cast<unsigned long long>(req.rip),
+            tctx_address_class(req.rip),
             static_cast<unsigned long long>(req.rsp),
-            static_cast<unsigned long long>(req.rflags));
+            tctx_address_class(req.rsp),
+            static_cast<unsigned long long>(req.rflags),
+            context_provenance);
         return false;
     }
     if (!sane) {
-        RC_UM_DBG("TCTX get invalid_zero_context pid=%u tid=%u rip=0x%llX rsp=0x%llX rflags=0x%llX ioctl=0x%08X",
+        const bool core_present = req.rip != 0 && req.rsp != 0 && req.rflags != 0;
+        const DWORD reject_error = core_present ? ERROR_INVALID_ADDRESS : ERROR_INVALID_DATA;
+        RC_UM_DBG("TCTX get invalid_user_context pid=%u tid=%u rip=0x%llX rsp=0x%llX rflags=0x%llX ioctl=0x%08X gle=%lu",
             process_id_,
             tid,
             req.rip,
             req.rsp,
             req.rflags,
-            tctx_ioctl);
+            tctx_ioctl,
+            reject_error);
         diag::log_tagged_fmt("comm",
-            "TCTX get final_failed pid=%u tid=%u reason=invalid_zero_context ioctl=0x%08X rip=0x%llX rsp=0x%llX rflags=0x%llX dr7=0x%llX",
+            "TCTX get final_failed pid=%u tid=%u reason=%s gle=%lu ntstatus=0x%08X ioctl=0x%08X rip=0x%llX rip_class=%s rsp=0x%llX rsp_class=%s rflags=0x%llX dr7=0x%llX provenance=%s",
             process_id_,
             tid,
+            core_present ? "kernel_or_noncanonical_context" : "zero_context",
+            static_cast<unsigned long>(reject_error),
+            core_present ? 0xC0000141u : 0xC0000001u,
             tctx_ioctl,
             static_cast<unsigned long long>(req.rip),
+            tctx_address_class(req.rip),
             static_cast<unsigned long long>(req.rsp),
+            tctx_address_class(req.rsp),
             static_cast<unsigned long long>(req.rflags),
-            static_cast<unsigned long long>(req.dr7));
-        SetLastError(ERROR_INVALID_DATA);
+            static_cast<unsigned long long>(req.dr7),
+            context_provenance);
+        SetLastError(reject_error);
         return false;
     }
 
@@ -2288,14 +2335,17 @@ bool voyager::device_t::get_thread_context(std::uint32_t tid, thread_context& ct
     ctx.dr6 = req.dr6; ctx.dr7 = req.dr7;
     ctx.kernel_gs_base = 0;
     diag::log_tagged_fmt("comm",
-        "TCTX get final_ok pid=%u tid=%u rip=0x%llX rsp=0x%llX rflags=0x%llX dr7=0x%llX ioctl=0x%08X",
+        "TCTX get final_ok pid=%u tid=%u rip=0x%llX rip_class=%s rsp=0x%llX rsp_class=%s rflags=0x%llX dr7=0x%llX ioctl=0x%08X provenance=%s",
         process_id_,
         tid,
         static_cast<unsigned long long>(ctx.rip),
+        tctx_address_class(ctx.rip),
         static_cast<unsigned long long>(ctx.rsp),
+        tctx_address_class(ctx.rsp),
         static_cast<unsigned long long>(ctx.rflags),
         static_cast<unsigned long long>(ctx.dr7),
-        tctx_ioctl);
+        tctx_ioctl,
+        context_provenance);
 
     return true;
 }

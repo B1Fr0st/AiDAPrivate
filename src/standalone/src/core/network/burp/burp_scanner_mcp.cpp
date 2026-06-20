@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -434,6 +435,19 @@ size_t issue_count_for_audit(uint64_t audit_id)
     return issue_store::list(filter).size();
 }
 
+uint64_t unix_ms_now()
+{
+    using namespace std::chrono;
+    return static_cast<uint64_t>(duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count());
+}
+
+uint64_t audit_runtime_elapsed_ms(const active_scanner::audit_status_t& st)
+{
+    if (st.started_ms == 0) return 0;
+    const uint64_t end = st.ended_ms != 0 ? st.ended_ms : unix_ms_now();
+    return end > st.started_ms ? end - st.started_ms : 0;
+}
+
 tool_result_t tool_start_audit(const json& p)
 {
     const uint64_t started = GetTickCount64();
@@ -574,6 +588,7 @@ tool_result_t tool_audit_status(const json& p)
         data["queue_depth"] = load.queue_depth;
         data["in_flight_requests"] = load.in_flight_requests;
         data["elapsed_ms"] = static_cast<unsigned long long>(GetTickCount64() - started);
+        data["handler_elapsed_ms"] = data["elapsed_ms"];
         data["thread_id"] = static_cast<unsigned long>(tid);
         diag::log_tagged_fmt("mcp_burp", "tool_audit_status not_found id=%llu active_audits=%zu running_audits=%zu queue_depth=%zu in_flight=%zu elapsed_ms=%llu tid=%lu",
             static_cast<unsigned long long>(id), load.active_audits, load.running_audits, load.queue_depth, load.in_flight_requests,
@@ -583,6 +598,8 @@ tool_result_t tool_audit_status(const json& p)
     const size_t stored_issues = issue_count_for_audit(id);
     const size_t issues_found = std::max(st.issues_found, stored_issues);
     const auto load = active_scanner::load_snapshot();
+    const uint64_t handler_elapsed_ms = GetTickCount64() - started;
+    const uint64_t audit_elapsed_ms = audit_runtime_elapsed_ms(st);
     json data;
     data["id"] = st.id;
     data["url"] = st.url;
@@ -615,6 +632,8 @@ tool_result_t tool_audit_status(const json& p)
     data["drained"] = st.drained;
     data["started_ms"] = st.started_ms;
     data["ended_ms"] = st.ended_ms;
+    data["audit_elapsed_ms"] = audit_elapsed_ms;
+    data["handler_elapsed_ms"] = handler_elapsed_ms;
     data["request_length"] = st.request_length;
     data["queue_depth"] = load.queue_depth;
     data["active_audits"] = load.active_audits;
@@ -623,9 +642,9 @@ tool_result_t tool_audit_status(const json& p)
     data["queued_workers"] = st.queued_workers;
     data["in_flight_requests"] = load.in_flight_requests;
     data["audit_in_flight_requests"] = st.in_flight_requests;
-    data["elapsed_ms"] = static_cast<unsigned long long>(GetTickCount64() - started);
+    data["elapsed_ms"] = audit_elapsed_ms;
     data["thread_id"] = static_cast<unsigned long>(tid);
-    diag::log_tagged_fmt("mcp_burp", "tool_audit_status ok id=%llu running=%d cancelled=%d cancel_requested=%d drained=%d runtime_issues=%zu stored_issues=%zu reported_issues=%zu responses=%zu no_response=%zu transport_failures=%zu transport_error_code=%u transport_error_class=%s circuit_open=%d circuit_hits=%zu circuit_threshold=%zu last_transport_error=%s req_len=%zu active_audits=%zu running_audits=%zu queue_depth=%zu in_flight=%zu effective_concurrency=%zu effective_throttle_ms=%zu elapsed_ms=%llu tid=%lu",
+    diag::log_tagged_fmt("mcp_burp", "tool_audit_status ok id=%llu running=%d cancelled=%d cancel_requested=%d drained=%d runtime_issues=%zu stored_issues=%zu reported_issues=%zu responses=%zu no_response=%zu transport_failures=%zu transport_error_code=%u transport_error_class=%s circuit_open=%d circuit_hits=%zu circuit_threshold=%zu last_transport_error=%s req_len=%zu active_audits=%zu running_audits=%zu queue_depth=%zu in_flight=%zu effective_concurrency=%zu effective_throttle_ms=%zu audit_elapsed_ms=%llu handler_elapsed_ms=%llu tid=%lu",
         static_cast<unsigned long long>(id),
         (int)st.running,
         st.cancelled ? 1 : 0,
@@ -650,7 +669,8 @@ tool_result_t tool_audit_status(const json& p)
         load.in_flight_requests,
         st.effective_max_concurrent,
         st.effective_throttle_ms,
-        static_cast<unsigned long long>(GetTickCount64() - started),
+        static_cast<unsigned long long>(audit_elapsed_ms),
+        static_cast<unsigned long long>(handler_elapsed_ms),
         static_cast<unsigned long>(tid));
     return tool_result_t::ok(data);
 }
@@ -697,6 +717,8 @@ tool_result_t tool_list_audits(const json&)
         e["drained"] = st.drained;
         e["started_ms"] = st.started_ms;
         e["ended_ms"] = st.ended_ms;
+        e["elapsed_ms"] = audit_runtime_elapsed_ms(st);
+        e["audit_elapsed_ms"] = e["elapsed_ms"];
         e["request_length"] = st.request_length;
         e["active_workers"] = st.active_workers;
         e["queued_workers"] = st.queued_workers;
