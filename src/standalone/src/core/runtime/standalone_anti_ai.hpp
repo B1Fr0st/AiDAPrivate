@@ -918,6 +918,7 @@ namespace detail
         if ((access & disallowed) != 0)
             return false;
         constexpr DWORD allowed =
+            STANDARD_RIGHTS_REQUIRED |
             SYNCHRONIZE |
             PROCESS_TERMINATE |
             PROCESS_CREATE_THREAD |
@@ -2763,7 +2764,7 @@ namespace self_analysis
                 bool owner_targets = false;
                 bool owner_input_helper_name = false;
                 bool owner_input_helper = false;
-                bool owner_internal_camoufox_browser = false;
+                bool owner_internal_camoufox_tree = false;
                 uint64_t owner_hash = 0;
                 bool owner_query_ok = false;
                 bool owner_core_system = false;
@@ -2784,8 +2785,8 @@ namespace self_analysis
                     owner_targets = detail::has_aida_target_evidence(*probe);
                     owner_input_helper_name = detail::windows_oem_input_helper_basename(*probe);
                     owner_input_helper = detail::trusted_windows_oem_input_helper_process(*probe);
-                    owner_internal_camoufox_browser =
-                        probes && detail::is_trusted_aida_internal_camoufox_browser_process(*probe, *probes);
+                    owner_internal_camoufox_tree =
+                        probes && detail::is_trusted_aida_internal_camoufox_tree_process(*probe, *probes);
                 }
                 if (detail::is_fileless_bootstrap_parent_owner(probe, owner_pid, fileless_parent_pid))
                 {
@@ -2851,15 +2852,15 @@ namespace self_analysis
                         owner_image.empty() ? "<empty>" : owner_image.c_str(),
                         owner_path.empty() ? "<empty>" : owner_path.c_str());
                 }
-                if (owner_internal_camoufox_browser)
+                if (owner_internal_camoufox_tree)
                 {
                     std::string owner_image = detail::probe_image_for_log(probe);
                     std::string owner_path = detail::probe_path_for_log(probe);
                     std::string flags = detail::format_process_handle_access_flags(h.GrantedAccess);
                     const bool bounded_access = detail::trusted_aida_internal_camoufox_handle_access(h.GrantedAccess);
-                    const bool owner_has_tool_context = owner_memory || owner_re || owner_debugger ||
-                        owner_dump || owner_offensive || owner_mcp || owner_ai || owner_targets;
-                    if (bounded_access && !owner_has_tool_context)
+                    const bool owner_has_blocking_tool_context = owner_memory || owner_re || owner_debugger ||
+                        owner_dump || owner_offensive || owner_ai || owner_targets;
+                    if (bounded_access && !owner_has_blocking_tool_context)
                     {
                         out.internal_camoufox_ignored = true;
                         ++out.internal_camoufox_ignored_count;
@@ -2873,11 +2874,12 @@ namespace self_analysis
                         if (out.internal_camoufox_owner_path.empty())
                             out.internal_camoufox_owner_path = owner_path;
                         diag::log_tagged_critical_fmt("guard",
-                            "ai_tool_posture_internal_camoufox_handle_ignored owner_pid=%lu handle=0x%016llX access=0x%08lX access_flags=%s owner_hash=0x%016llX owner_image=%s owner_path=%s ignored_count=%u",
+                            "ai_tool_posture_internal_camoufox_handle_ignored owner_pid=%lu handle=0x%016llX access=0x%08lX access_flags=%s owner_mcp=%d owner_hash=0x%016llX owner_image=%s owner_path=%s ignored_count=%u",
                             static_cast<unsigned long>(owner_pid),
                             static_cast<unsigned long long>(h.HandleValue),
                             static_cast<unsigned long>(h.GrantedAccess),
                             flags.c_str(),
+                            owner_mcp ? 1 : 0,
                             static_cast<unsigned long long>(owner_hash),
                             owner_image.empty() ? "<empty>" : owner_image.c_str(),
                             owner_path.empty() ? "<empty>" : owner_path.c_str(),

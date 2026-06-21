@@ -300,6 +300,18 @@ namespace anti_dma_canary {
     }
 
     __forceinline BOOLEAN register_canary(UINT64 va, UINT64 size, ULONG owner_pid) {
+        ULONG build = strong::get_windows_version();
+        WW_LOG("dma_canary::register_entry build=%lu va=0x%llx size=0x%llx owner=%lu registered=%u count=%lu running=%ld queued=%ld work_running=%ld irql=%lu",
+            build,
+            static_cast<unsigned long long>(va),
+            static_cast<unsigned long long>(size),
+            owner_pid,
+            current_registered_client_pid(),
+            g_canary_count,
+            _InterlockedCompareExchange(&g_running, 0, 0),
+            _InterlockedCompareExchange(&g_work_queued, 0, 0),
+            _InterlockedCompareExchange(&g_work_running, 0, 0),
+            static_cast<ULONG>(KeGetCurrentIrql()));
         UINT32 registered_pid = current_registered_client_pid();
         if (registered_pid == 0 || owner_pid != registered_pid || !is_pid_alive(owner_pid)) {
             WW_LOG("dma_canary::register_reject no_live_registered_client va=0x%llx size=0x%llx owner=%lu registered=%u running=%ld queued=%ld",
@@ -1013,9 +1025,23 @@ namespace anti_dma_canary {
     }
 
     __forceinline BOOLEAN query_tier_a_preloaded() {
-        return sentinel_bridge::g_bridge.sentinel_cmd == sentinel_bridge::BRIDGE_CMD_TIER_A_PRE_LOADED ||
-               sentinel_bridge::g_bridge.sentinel_cmd ==
-                   (sentinel_bridge::BRIDGE_CMD_TIER_A_PRE_LOADED ^
-                    static_cast<ULONG>(sentinel_bridge::g_bridge_crypt_key & 0xFFFFFFFF));
+        ULONG raw_cmd = static_cast<ULONG>(sentinel_bridge::g_bridge.sentinel_cmd);
+        ULONG plain_cmd = sentinel_bridge::BRIDGE_CMD_TIER_A_PRE_LOADED;
+        ULONG encoded_cmd = sentinel_bridge::BRIDGE_CMD_TIER_A_PRE_LOADED ^
+            static_cast<ULONG>(sentinel_bridge::g_bridge_crypt_key & 0xFFFFFFFF);
+        BOOLEAN present = raw_cmd == plain_cmd || raw_cmd == encoded_cmd;
+        WW_LOG("dma_canary::query_tier_a_preloaded raw_cmd=0x%08lx plain_match=%u encoded_match=%u present=%u bridge=%p whoswho_tsc=%lld sentinel_tsc=%lld canary_count=%lu running=%ld queued=%ld work_running=%ld",
+            raw_cmd,
+            raw_cmd == plain_cmd ? 1u : 0u,
+            raw_cmd == encoded_cmd ? 1u : 0u,
+            present ? 1u : 0u,
+            &sentinel_bridge::g_bridge,
+            sentinel_bridge::g_bridge.whoswho_tsc,
+            sentinel_bridge::g_bridge.sentinel_tsc,
+            g_canary_count,
+            _InterlockedCompareExchange(&g_running, 0, 0),
+            _InterlockedCompareExchange(&g_work_queued, 0, 0),
+            _InterlockedCompareExchange(&g_work_running, 0, 0));
+        return present;
     }
 }

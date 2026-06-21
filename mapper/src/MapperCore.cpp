@@ -69,29 +69,6 @@ static void OpenMapperLog()
     }
 
     if (!g_LogFile) {
-        char exePath[MAX_PATH] = {};
-        DWORD got = GetModuleFileNameA(nullptr, exePath, MAX_PATH);
-        if (got > 0 && got < MAX_PATH) {
-            char* lastSlash = std::strrchr(exePath, '\\');
-            if (lastSlash) {
-                *(lastSlash + 1) = '\0';
-                strncat_s(exePath, sizeof(exePath), "WindMapper_debug.log", _TRUNCATE);
-                fopen_s(&g_LogFile, exePath, "w");
-                if (g_LogFile) {
-                    setvbuf(g_LogFile, nullptr, _IONBF, 0);
-                }
-            }
-        }
-    }
-
-    if (!g_LogFile) {
-        fopen_s(&g_LogFile, "C:\\WindMapper_debug.log", "w");
-        if (g_LogFile) {
-            setvbuf(g_LogFile, nullptr, _IONBF, 0);
-        }
-    }
-
-    if (!g_LogFile) {
         OutputDebugStringA("[WindMapper][OpenMapperLog] failed to open file log\n");
     }
 }

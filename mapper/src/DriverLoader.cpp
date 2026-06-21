@@ -20,6 +20,25 @@ static void DLDbgLog(const char* func, const char* fmt, ...) {
 #define DLLOG(fmt, ...) DLDbgLog(__FUNCTION__, fmt, ##__VA_ARGS__)
 #define DLLOG_STATUS(msg, st) DLDbgLog(__FUNCTION__, "%s: 0x%08X (%s)", msg, (DWORD)(st), NT_SUCCESS(st) ? "SUCCESS" : "FAILED")
 
+static NTSTATUS WriteKernelLogPathValue(PCWSTR servicePath) {
+    WCHAR kernelLogPath[512] = {};
+    DWORD len = GetEnvironmentVariableW(L"AIDA_KERNEL_LOG_PATH", kernelLogPath, _countof(kernelLogPath));
+    if (len == 0) {
+        wcscpy_s(kernelLogPath, L"\\??\\C:\\Users\\Public\\Desktop\\aida_kernel.log");
+        len = static_cast<DWORD>(wcslen(kernelLogPath));
+        DLLOG("AIDA_KERNEL_LOG_PATH not set, using default");
+    }
+    if (len >= _countof(kernelLogPath)) {
+        DLLOG("AIDA_KERNEL_LOG_PATH too long len=%lu", static_cast<unsigned long>(len));
+        return static_cast<NTSTATUS>(0xC0000023L);
+    }
+    NTSTATUS status = RtlWriteRegistryValuePtr(0, servicePath, L"AidaKernelLogPath", REG_SZ, kernelLogPath,
+        static_cast<ULONG>((wcslen(kernelLogPath) + 1) * sizeof(WCHAR)));
+    DLLOG("AidaKernelLogPath: %ls", kernelLogPath);
+    DLLOG_STATUS("RtlWriteRegistryValue (AidaKernelLogPath)", status);
+    return status;
+}
+
 namespace DriverLoader {
 
     NTSTATUS CreateDriverService(PWSTR servicePath, PCWSTR filePath) {
@@ -67,6 +86,11 @@ namespace DriverLoader {
         DLLOG("ImagePath: %ls", ntPath);
         DLLOG_STATUS("RtlWriteRegistryValue (ImagePath)", status);
 
+        if (!NT_SUCCESS(status)) {
+            return status;
+        }
+
+        status = WriteKernelLogPathValue(servicePath);
         if (!NT_SUCCESS(status)) {
             return status;
         }
@@ -136,6 +160,9 @@ namespace DriverLoader {
         status = RtlWriteRegistryValuePtr(0, servicePath, L"ImagePath", REG_SZ, ntPath,
             static_cast<ULONG>((ntPathLen + 1) * sizeof(WCHAR)));
         DLLOG_STATUS("RtlWriteRegistryValue (ImagePath)", status);
+        if (!NT_SUCCESS(status)) return status;
+
+        status = WriteKernelLogPathValue(servicePath);
         if (!NT_SUCCESS(status)) return status;
 
         DWORD typeValue = 2;

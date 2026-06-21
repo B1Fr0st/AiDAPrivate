@@ -1004,6 +1004,8 @@ tool_result_t tool_logger_query(const json& params)
         f.mime_type  = fp.value("mime_type", std::string());
         f.time_from_ms = fp.value("time_from_ms", 0ull);
         f.time_to_ms   = fp.value("time_to_ms", 0ull);
+    } else if (params.contains("filter")) {
+        return tool_result_t::error("burp_logger.query filter must be an object");
     } else {
         f.method     = params.value("method", std::string());
         f.host_regex = params.value("host_regex", std::string());
@@ -1013,7 +1015,7 @@ tool_result_t tool_logger_query(const json& params)
         f.source     = params.value("source", std::string());
         f.mime_type  = params.value("mime_type", std::string());
     }
-    size_t limit = params.value("limit", 100u);
+    size_t limit = params.value("limit", params.contains("filter") && params["filter"].is_object() ? params["filter"].value("limit", 100u) : 100u);
     diag::log_tagged_fmt("mcp_burp", "logger_query host_regex=%s url_regex=%s limit=%zu", f.host_regex.c_str(), f.url_regex.c_str(), limit);
     auto rows = logger::query(f, limit);
     json arr = json::array();
@@ -1192,7 +1194,18 @@ void register_api_tools(mcp_standalone::server_t& srv)
         "burp_logger_manage",
         "Manage the unified Burp logger ring buffer. Actions: query, total, clear, export_csv.",
         {{"action", "string", "query|total|clear|export_csv", true},
-         {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted.", false}},
+         {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted.", false},
+         {"filter", "object", "Optional query filter with method, host_regex, url_regex, status_min, status_max, source, mime_type, time_from_ms, time_to_ms, and limit.", false},
+         {"method", "string", "HTTP method filter for query/export_csv.", false},
+         {"host_regex", "string", "Case-insensitive host regex or substring fallback.", false},
+         {"url_regex", "string", "Case-insensitive URL regex or substring fallback.", false},
+         {"status_min", "number", "Minimum response status.", false},
+         {"status_max", "number", "Maximum response status.", false},
+         {"source", "string", "Source label such as browser, proxy, repeater, scanner, intruder, crawler, api, or fuzzer.", false},
+         {"mime_type", "string", "MIME type filter.", false},
+         {"time_from_ms", "number", "Earliest timestamp in epoch milliseconds.", false},
+         {"time_to_ms", "number", "Latest timestamp in epoch milliseconds.", false},
+         {"limit", "number", "Maximum rows to return.", false}},
         false,
         [](const json& params) -> tool_result_t {
             const std::string action = compat_action_name(params);

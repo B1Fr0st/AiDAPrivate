@@ -2024,6 +2024,13 @@ def patch_browser(path: pathlib.Path) -> None:
         "            if entry[\"url\"] == resp.url and entry[\"status\"] is None and (page_id is None or entry.get(\"page_id\") == page_id):\n",
         "browser response page match",
     )
+    if "response_body_task" not in text:
+        text = replace_once(
+            text,
+            "                    asyncio.ensure_future(self._fetch_response_body(resp, entry))\n",
+            "                    entry[\"response_body_task\"] = asyncio.ensure_future(self._fetch_response_body(resp, entry))\n",
+            "browser response body task",
+        )
     text = replace_once(
         text,
         "    def _on_response_for_nav(self, resp) -> None:\n"
@@ -2427,8 +2434,16 @@ def patch_network(path: pathlib.Path) -> None:
         and "url_prefix: str | None = None" in text
         and '"filtered_count"' in text
         and '"has_more"' in text
+        and "include_body: bool = False" in text
+        and "body_tasks = []" in text
+        and "response_body_available" in text
     ):
         return
+    if "import asyncio\n" not in text:
+        if "from __future__ import annotations\n\n" in text:
+            text = text.replace("from __future__ import annotations\n\n", "from __future__ import annotations\n\nimport asyncio\n", 1)
+        else:
+            text = "import asyncio\n" + text
     if "AIDA_INITIATOR_CONTRACT_V2" not in text:
         insert_pos = 0
         for match in re.finditer(r"(?:from __future__ import [^\n]+\n|import [^\n]+\n|from [^\n]+ import [^\n]+\n)", text):
@@ -2591,6 +2606,84 @@ def patch_network(path: pathlib.Path) -> None:
             "            \"filter\": str(filter or \"\"),\n"
             "            \"url_prefix\": str(url_prefix or \"\"),\n",
             "network url prefix envelope",
+        )
+    if "include_body: bool = False" not in text:
+        text = replace_in_function(
+            text,
+            "list_network_requests",
+            "    include_initiator_snapshots: bool = True,\n) -> dict:\n",
+            "    include_initiator_snapshots: bool = True,\n    include_body: bool = False,\n    max_body_size: int = 5000,\n) -> dict:\n",
+            "network list body signature",
+        )
+    if "body_tasks = []" not in text:
+        text = replace_in_function(
+            text,
+            "list_network_requests",
+            "        paged_reqs = reqs[safe_offset:safe_offset + safe_limit] if safe_limit > 0 else []\n\n"
+            "        effective_marker = str(marker or filter or url_filter or url_prefix or \"\")\n",
+            "        paged_reqs = reqs[safe_offset:safe_offset + safe_limit] if safe_limit > 0 else []\n"
+            "        if include_body:\n"
+            "            body_tasks = []\n"
+            "            for r in paged_reqs:\n"
+            "                task = r.get(\"response_body_task\")\n"
+            "                if isinstance(task, asyncio.Future) and not task.done():\n"
+            "                    body_tasks.append(task)\n"
+            "            if body_tasks:\n"
+            "                await asyncio.wait(body_tasks, timeout=2.0)\n\n"
+            "        effective_marker = str(marker or filter or url_filter or url_prefix or \"\")\n",
+            "network list body wait",
+        )
+    if "request_body = r.get(\"request_body\") or r.get(\"request_post_data\") or r.get(\"post_data\") or \"\"" not in text:
+        text = replace_in_function(
+            text,
+            "list_network_requests",
+            "            request_body_length = int(r.get(\"request_body_length\") or len(r.get(\"request_post_data\") or r.get(\"post_data\") or \"\"))\n"
+            "            summaries.append({\n",
+            "            request_body = r.get(\"request_body\") or r.get(\"request_post_data\") or r.get(\"post_data\") or \"\"\n"
+            "            request_body_length = int(r.get(\"request_body_length\") or len(request_body or \"\"))\n"
+            "            summary = {\n",
+            "network list body summary begin",
+        )
+        text = replace_in_function(
+            text,
+            "list_network_requests",
+            "                \"initiator_source\": _initiator_snapshot_source(snapshot),\n"
+            "                \"initiator_stack_len\": len(str(snapshot.get(\"stack\") or \"\")),\n"
+            "            })\n",
+            "                \"initiator_source\": _initiator_snapshot_source(snapshot),\n"
+            "                \"initiator_stack_len\": len(str(snapshot.get(\"stack\") or \"\")),\n"
+            "                \"response_body_available\": r.get(\"response_body\") is not None,\n"
+            "            }\n"
+            "            if include_body:\n"
+            "                response_body = r.get(\"response_body\")\n"
+            "                bounded_body_size = _bounded_int(max_body_size, 5000, -1, 10_000_000)\n"
+            "                if request_body:\n"
+            "                    summary[\"request_body\"] = request_body\n"
+            "                    summary[\"post_data\"] = request_body\n"
+            "                if response_body is not None:\n"
+            "                    if bounded_body_size >= 0 and len(response_body) > bounded_body_size:\n"
+            "                        summary[\"response_body\"] = response_body[:bounded_body_size]\n"
+            "                        summary[\"response_body_truncated\"] = True\n"
+            "                        summary[\"response_body_original_size\"] = len(response_body)\n"
+            "                        summary[\"response_body_size_returned\"] = bounded_body_size\n"
+            "                    else:\n"
+            "                        summary[\"response_body\"] = response_body\n"
+            "                        summary[\"response_body_truncated\"] = False\n"
+            "                        summary[\"response_body_original_size\"] = len(response_body)\n"
+            "                        summary[\"response_body_size_returned\"] = len(response_body)\n"
+            "            summaries.append(summary)\n",
+            "network list body summary finish",
+        )
+    if "result.pop(\"response_body_task\", None)" not in text:
+        text = replace_in_function(
+            text,
+            "get_network_request",
+            "                result = dict(r)\n"
+            "                if not include_body:\n",
+            "                result = dict(r)\n"
+            "                result.pop(\"response_body_task\", None)\n"
+            "                if not include_body:\n",
+            "network get strip body task",
         )
     if "\"page_id\": r.get(\"page_id\")" not in text:
         text = replace_once(
@@ -3005,6 +3098,74 @@ async def get_request_initiator(request_id: int, page_id: str | None = None, mar
     write_text(path, text)
 
 
+def patch_instrumentation(path: pathlib.Path) -> None:
+    if not path.exists():
+        return
+    original_text = read_text(path)
+    text = original_text
+    if "timeout_ms: int = 60000" not in text:
+        text = replace_in_function(
+            text,
+            "instrumentation",
+            "    max_file_size: int = 200_000,\n"
+            "    on_oversized: str = \"selective\",\n"
+            ") -> dict:\n",
+            "    max_file_size: int = 200_000,\n"
+            "    on_oversized: str = \"selective\",\n"
+            "    timeout_ms: int = 60000,\n"
+            ") -> dict:\n",
+            "instrumentation timeout signature",
+        )
+    if "return await _reload_with_hooks(clear_log, wait_until, timeout_ms)" not in text:
+        text = replace_in_function(
+            text,
+            "instrumentation",
+            "        return await _reload_with_hooks(clear_log, wait_until)\n",
+            "        return await _reload_with_hooks(clear_log, wait_until, timeout_ms)\n",
+            "instrumentation timeout forwarding",
+        )
+    if "async def _reload_with_hooks(clear_log: bool = True, wait_until: str = \"load\", timeout_ms: int = 60000)" not in text:
+        text = text.replace(
+            "async def _reload_with_hooks(clear_log: bool = True, wait_until: str = \"load\") -> dict:\n",
+            "async def _reload_with_hooks(clear_log: bool = True, wait_until: str = \"load\", timeout_ms: int = 60000) -> dict:\n",
+            1,
+        )
+    if "nav_timeout_ms = max(1000, min(int(timeout_ms), 120000))" not in text:
+        text = text.replace(
+            "async def _reload_with_hooks(clear_log: bool = True, wait_until: str = \"load\", timeout_ms: int = 60000) -> dict:\n"
+            "    try:\n"
+            "        page = await browser_manager.get_active_page()\n",
+            "async def _reload_with_hooks(clear_log: bool = True, wait_until: str = \"load\", timeout_ms: int = 60000) -> dict:\n"
+            "    try:\n"
+            "        try:\n"
+            "            nav_timeout_ms = max(1000, min(int(timeout_ms), 120000))\n"
+            "        except Exception:\n"
+            "            nav_timeout_ms = 60000\n"
+            "        page = await browser_manager.get_active_page()\n",
+            1,
+        )
+    if "page.reload(wait_until=wait_until, timeout=nav_timeout_ms)" not in text:
+        text = text.replace(
+            "resp = await page.reload(wait_until=wait_until)\n",
+            "resp = await page.reload(wait_until=wait_until, timeout=nav_timeout_ms)\n",
+            1,
+        )
+    if "\"timeout_ms\": nav_timeout_ms" not in text:
+        text = text.replace(
+            "            \"redirect_chain\": chain,\n"
+            "        }\n",
+            "            \"redirect_chain\": chain,\n"
+            "            \"timeout_ms\": nav_timeout_ms,\n"
+            "        }\n",
+            1,
+        )
+    for marker in ("timeout_ms: int = 60000", "_reload_with_hooks(clear_log, wait_until, timeout_ms)", "page.reload(wait_until=wait_until, timeout=nav_timeout_ms)"):
+        if marker not in text:
+            fail(f"instrumentation validation missing {marker} in {path}")
+    if text != original_text:
+        write_text(path, text)
+
+
 def patch_navigation_diagnostics(path: pathlib.Path, text: str) -> str:
     if "navigate_goto_exception" in text:
         return text
@@ -3240,6 +3401,7 @@ def main() -> None:
         patch_navigation(base / "tools" / "navigation.py")
         patch_debugging(base / "tools" / "debugging.py")
         patch_network(base / "tools" / "network.py")
+        patch_instrumentation(base / "tools" / "instrumentation.py")
         patch_hooking(base / "tools" / "hooking.py")
         validate_script_analysis(base / "tools" / "script_analysis.py")
         patched += 1

@@ -58,9 +58,8 @@ static void arc_log(const char* tag, const char* msg)
     static char s_log_path[MAX_PATH] = {};
     static bool  s_path_ready = false;
     if (!s_path_ready) {
-        if (!diag::build_log_path("aida_debug.log", s_log_path, sizeof(s_log_path))) {
-            strcpy_s(s_log_path, "aida_debug.log");
-        }
+        if (!diag::build_log_path("aida_debug.log", s_log_path, sizeof(s_log_path)))
+            s_log_path[0] = '\0';
         s_path_ready = true;
     }
 
@@ -71,16 +70,18 @@ static void arc_log(const char* tag, const char* msg)
         "[%02d:%02d:%02d.%03d] [arc/%s] %s\n",
         st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, tag, msg);
     if (n <= 0) return;
-    HANDLE h = CreateFileA(s_log_path, GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-        OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h != INVALID_HANDLE_VALUE)
-    {
-        SetFilePointer(h, 0, nullptr, FILE_END);
-        DWORD written = 0;
-        WriteFile(h, line, static_cast<DWORD>(n), &written, nullptr);
-        FlushFileBuffers(h);
-        CloseHandle(h);
+    if (s_log_path[0] != '\0') {
+        HANDLE h = CreateFileA(s_log_path, GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h != INVALID_HANDLE_VALUE)
+        {
+            SetFilePointer(h, 0, nullptr, FILE_END);
+            DWORD written = 0;
+            WriteFile(h, line, static_cast<DWORD>(n), &written, nullptr);
+            FlushFileBuffers(h);
+            CloseHandle(h);
+        }
     }
     OutputDebugStringA(line);
 }
@@ -1367,21 +1368,9 @@ __declspec(noreturn) __forceinline void enforce_violation(const char* reason, co
 
     arc_log("violation", "step04_pre_exe_path");
     {
-        char exe_path[MAX_PATH] = {};
-        DWORD got = GetModuleFileNameA(nullptr, exe_path, MAX_PATH);
         char crash_path[MAX_PATH] = {};
-        if (got > 0 && got < MAX_PATH)
-        {
-            char* last_sep = strrchr(exe_path, '\\');
-            if (last_sep)
-            {
-                *(last_sep + 1) = '\0';
-                _snprintf_s(crash_path, sizeof(crash_path), _TRUNCATE,
-                    "%saida_crash.log", exe_path);
-            }
-        }
-        if (crash_path[0] == '\0')
-            strcpy_s(crash_path, sizeof(crash_path), "aida_crash.log");
+        if (!diag::build_log_path("aida_crash.log", crash_path, sizeof(crash_path)))
+            crash_path[0] = '\0';
         arc_log("violation", "step05_exe_path_resolved");
 
         SYSTEMTIME st{};
@@ -1452,11 +1441,13 @@ __declspec(noreturn) __forceinline void enforce_violation(const char* reason, co
         if (n > 0)
         {
             arc_log("violation", "step09_pre_crashlog_open");
-            HANDLE hf = CreateFileA(crash_path,
-                FILE_APPEND_DATA | SYNCHRONIZE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                OPEN_ALWAYS,
-                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr);
+            HANDLE hf = crash_path[0] != '\0'
+                ? CreateFileA(crash_path,
+                    FILE_APPEND_DATA | SYNCHRONIZE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                    OPEN_ALWAYS,
+                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr)
+                : INVALID_HANDLE_VALUE;
             arc_log("violation", "step10_post_crashlog_open");
             if (hf != INVALID_HANDLE_VALUE)
             {

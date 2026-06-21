@@ -2,6 +2,7 @@
 #include <ntifs.h>
 #include <intrin.h>
 #include <imports/Defs.h>
+#include "../KernelLayout.h"
 
 namespace anti_dump_kernel {
 
@@ -453,7 +454,15 @@ namespace anti_dump_kernel {
             PEPROCESS initial = PsInitialSystemProcess;
             if (!initial || !_MmIsAddressValid(initial)) return STATUS_UNSUCCESSFUL;
 
-            PLIST_ENTRY list_head = (PLIST_ENTRY)((UINT8*)initial + 0x448);
+            SIZE_T active_links_offset = whoswho_kernel_layout::eprocess_active_process_links_offset();
+            if (active_links_offset == 0) {
+                WW_LOG("anti_dump: scan_and_kill_readers fail_closed pid=%u build=%lu reason=unsupported_eprocess_layout",
+                    pid,
+                    whoswho_kernel_layout::build_number());
+                return STATUS_NOT_SUPPORTED;
+            }
+
+            PLIST_ENTRY list_head = (PLIST_ENTRY)((UINT8*)initial + active_links_offset);
             PLIST_ENTRY entry = list_head->Flink;
 
             const char* dump_tools[] = {
@@ -476,7 +485,7 @@ namespace anti_dump_kernel {
             constexpr int num_tools = sizeof(dump_tools) / sizeof(dump_tools[0]);
 
             for (int iter = 0; iter < 2048 && entry != list_head; ++iter, entry = entry->Flink) {
-                PEPROCESS proc = (PEPROCESS)((UINT8*)entry - 0x448);
+                PEPROCESS proc = (PEPROCESS)((UINT8*)entry - active_links_offset);
                 if (!_MmIsAddressValid(proc)) continue;
 
                 HANDLE proc_pid = PsGetProcessId(proc);

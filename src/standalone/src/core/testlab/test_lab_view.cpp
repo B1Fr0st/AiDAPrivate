@@ -183,7 +183,13 @@ namespace test_lab_view {
 		};
 
 		const char* run_all_log_path() {
-			return "C:\\Users\\Public\\Desktop\\aida_test_results.log";
+			static const std::string path = []() {
+				char buf[MAX_PATH] = {};
+				if (diag::build_log_path("aida_test_results.log", buf, sizeof(buf)))
+					return std::string(buf);
+				return std::string();
+			}();
+			return path.c_str();
 		}
 
 		void populate_safe_defaults(test_lab::state_t& s) {
@@ -1097,7 +1103,7 @@ namespace test_lab_view {
 			ImGui::Text("%s", status_copy.c_str());
 		}
 		else {
-			ImGui::TextUnformatted("Output: C:\\Users\\Public\\Desktop\\aida_test_results.log");
+			ImGui::Text("Output: %s", run_all_log_path());
 		}
 		ImGui::PopStyleColor();
 		ImGui::Unindent(10.f);

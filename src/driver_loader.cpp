@@ -245,19 +245,42 @@ namespace
 
     std::wstring resolve_mapper_log_path()
     {
-        PWSTR docs = nullptr;
-        if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, KF_FLAG_CREATE, nullptr, &docs)) && docs) {
-            std::filesystem::path path(docs);
-            CoTaskMemFree(docs);
-            return (path / L"windmapper.log").wstring();
-        }
-        if (docs)
-            CoTaskMemFree(docs);
-
         std::wstring module_dir = get_module_dir();
         if (!module_dir.empty())
             return (std::filesystem::path(module_dir) / L"WindMapper_debug.log").wstring();
         return {};
+    }
+
+    std::wstring native_dos_path(const std::wstring& path)
+    {
+        if (path.empty())
+            return {};
+        if (path.rfind(L"\\??\\", 0) == 0 || path.rfind(L"\\Device\\", 0) == 0)
+            return path;
+        if (path.rfind(L"\\\\?\\", 0) == 0)
+            return L"\\??\\" + path.substr(4);
+        return L"\\??\\" + path;
+    }
+
+    std::wstring resolve_public_desktop_kernel_log_path()
+    {
+        PWSTR public_desktop = nullptr;
+        if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_PublicDesktop, KF_FLAG_CREATE, nullptr, &public_desktop)) && public_desktop) {
+            std::filesystem::path path(public_desktop);
+            CoTaskMemFree(public_desktop);
+            return native_dos_path((path / L"aida_kernel.log").wstring());
+        }
+        if (public_desktop)
+            CoTaskMemFree(public_desktop);
+        return L"\\??\\C:\\Users\\Public\\Desktop\\aida_kernel.log";
+    }
+
+    std::wstring resolve_kernel_log_path()
+    {
+        std::wstring module_dir = get_module_dir();
+        if (module_dir.empty())
+            return resolve_public_desktop_kernel_log_path();
+        return native_dos_path((std::filesystem::path(module_dir) / L"aida_kernel.log").wstring());
     }
 
     std::wstring random_token(size_t bytes)
@@ -695,7 +718,10 @@ namespace
 
         std::wstring nt_image_path = L"\\??\\";
         nt_image_path += image_path;
+        const std::wstring kernel_log_path = resolve_kernel_log_path();
         bool ok = set_reg_string(key, L"ImagePath", nt_image_path, REG_EXPAND_SZ) &&
+            !kernel_log_path.empty() &&
+            set_reg_string(key, L"AidaKernelLogPath", kernel_log_path, REG_SZ) &&
             set_reg_dword(key, L"Type", 1) &&
             set_reg_dword(key, L"Start", 3) &&
             set_reg_dword(key, L"ErrorControl", 1);
@@ -703,13 +729,14 @@ namespace
         RegFlushKey(key);
         RegCloseKey(key);
 
-        loader_diag_fmt("native_service_create label=%s service=\"%s\" disposition=%lu ok=%d gle=%lu image=\"%s\" elapsed_ms=%llu",
+        loader_diag_fmt("native_service_create label=%s service=\"%s\" disposition=%lu ok=%d gle=%lu image=\"%s\" kernel_log=\"%s\" elapsed_ms=%llu",
             label ? label : "?",
             utf8_from_wide(service_name).c_str(),
             static_cast<unsigned long>(disposition),
             ok ? 1 : 0,
             static_cast<unsigned long>(gle),
             utf8_from_wide(image_path).c_str(),
+            kernel_log_path.empty() ? "<unresolved>" : utf8_from_wide(kernel_log_path).c_str(),
             static_cast<unsigned long long>(GetTickCount64() - started));
         if (!ok)
             delete_service_registry_tree(service_name, label);
@@ -1043,6 +1070,15 @@ namespace driver_loader
         } else {
             SetEnvironmentVariableW(L"AIDA_MAPPER_LOG", nullptr);
             loader_diag("mapper_log_path=<unresolved>");
+        }
+
+        std::wstring kernel_log_path = resolve_kernel_log_path();
+        if (!kernel_log_path.empty()) {
+            SetEnvironmentVariableW(L"AIDA_KERNEL_LOG_PATH", kernel_log_path.c_str());
+            loader_diag_fmt("kernel_log_path=\"%s\"", utf8_from_wide(kernel_log_path).c_str());
+        } else {
+            SetEnvironmentVariableW(L"AIDA_KERNEL_LOG_PATH", nullptr);
+            loader_diag("kernel_log_path=<unresolved>");
         }
 
         STARTUPINFOW si = {};

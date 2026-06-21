@@ -15,6 +15,7 @@
 #include <intrin.h>
 #include <cstdio>
 #include <cstring>
+#include <atomic>
 
 #ifdef _DEBUG
 #define RC_UM_DBG(fmt, ...) do { char _rc_buf[512]; _snprintf_s(_rc_buf, sizeof(_rc_buf), _TRUNCATE, "[AIDA-RC-UM] " fmt "\n", ##__VA_ARGS__); OutputDebugStringA(_rc_buf); } while(0)
@@ -40,6 +41,25 @@ typedef CLIENT_ID* PCLIENT_ID;
 #ifndef NT_SUCCESS
 #define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
 #endif
+
+namespace {
+    std::atomic<std::uint32_t> g_server_token_relay_inflight{0};
+
+    struct server_token_relay_scope_t {
+        server_token_relay_scope_t() noexcept
+        {
+            g_server_token_relay_inflight.fetch_add(1, std::memory_order_acq_rel);
+        }
+
+        ~server_token_relay_scope_t()
+        {
+            g_server_token_relay_inflight.fetch_sub(1, std::memory_order_acq_rel);
+        }
+
+        server_token_relay_scope_t(const server_token_relay_scope_t&) = delete;
+        server_token_relay_scope_t& operator=(const server_token_relay_scope_t&) = delete;
+    };
+}
 
 namespace syscall_indices {
     inline std::uint32_t NtOpenThread_idx = 0;
@@ -730,6 +750,11 @@ bool voyager::device_t::send_heartbeat() noexcept {
         return true;
 
     if (effective_error == ERROR_INVALID_FUNCTION && had_dynamic_seed) {
+        if (g_server_token_relay_inflight.load(std::memory_order_acquire) != 0) {
+            log_security_snapshot("send_heartbeat_seed_desync_deferred_relay_inflight", ioctl_code, ioctl_code, effective_error);
+            SetLastError(effective_error);
+            return false;
+        }
         log_security_snapshot("send_heartbeat_seed_desync_reset", ioctl_code, ioctl_code, effective_error);
         server_seed_ = 0;
         server_ioctl_seed_ = 0;
@@ -4965,6 +4990,7 @@ bool voyager::device_t::kernel_anti_dump_start_continuous(std::uint32_t pid) noe
 
 bool voyager::device_t::relay_server_token(std::uint32_t token_hash, std::uint64_t server_nonce) noexcept
 {
+    server_token_relay_scope_t relay_scope;
     sync_dynamic_security_state();
     log_security_snapshot("relay_server_token_entry", 0, 0, 0);
 
@@ -4995,6 +5021,7 @@ bool voyager::device_t::relay_server_token(std::uint32_t token_hash, std::uint64
 
 bool voyager::device_t::relay_server_token_v2(std::uint32_t token_hash, std::uint64_t server_nonce, std::uint64_t* out_driver_proof) noexcept
 {
+    server_token_relay_scope_t relay_scope;
     sync_dynamic_security_state();
     log_security_snapshot("relay_server_token_v2_entry", 0, 0, 0);
 

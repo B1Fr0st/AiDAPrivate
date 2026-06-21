@@ -21,8 +21,100 @@ namespace dbg_capture {
     static KEVENT g_wake_event;
     static PETHREAD g_drain_thread = nullptr;
     static volatile UINT64 g_drain_thread_tid = 0;
+    static volatile LONG g_ring_drop_events = 0;
+    static volatile LONG g_ring_drop_bytes = 0;
+    static volatile LONG g_flush_lost_events = 0;
+    static volatile LONG g_flush_lost_bytes = 0;
+    static volatile LONG g_immediate_failures = 0;
+    static volatile LONG g_immediate_last_status = STATUS_SUCCESS;
 
-    static const wchar_t* const kLogPath = L"\\??\\C:\\Users\\Public\\Desktop\\aida_kernel.log";
+    static const wchar_t* const kDefaultLogPath = L"\\??\\C:\\Users\\Public\\Desktop\\aida_kernel.log";
+    static WCHAR g_log_path_buffer[512] = {};
+    static UNICODE_STRING g_log_path = {};
+    static volatile LONG g_log_path_configured = 0;
+
+    static BOOLEAN starts_with_path_prefix(const WCHAR* text, ULONG chars, const WCHAR* prefix)
+    {
+        if (!text || !prefix) return FALSE;
+        ULONG i = 0;
+        while (prefix[i] != L'\0') {
+            if (i >= chars || text[i] != prefix[i]) return FALSE;
+            ++i;
+        }
+        return TRUE;
+    }
+
+    static BOOLEAN has_supported_log_path_prefix(const WCHAR* text, ULONG chars)
+    {
+        return starts_with_path_prefix(text, chars, L"\\??\\") ||
+               starts_with_path_prefix(text, chars, L"\\Device\\");
+    }
+
+    static UNICODE_STRING current_log_path()
+    {
+        if (g_log_path.Buffer && g_log_path.Length > 0)
+            return g_log_path;
+        UNICODE_STRING path;
+        RtlInitUnicodeString(&path, kDefaultLogPath);
+        return path;
+    }
+
+    void configure_log_path(PUNICODE_STRING registry_path)
+    {
+        if (_InterlockedCompareExchange(&g_log_path_configured, 1, 0) != 0)
+            return;
+
+        RtlInitUnicodeString(&g_log_path, kDefaultLogPath);
+        if (!registry_path || !registry_path->Buffer || registry_path->Length == 0)
+            return;
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+            return;
+
+        UNICODE_STRING value_name;
+        RtlInitUnicodeString(&value_name, L"AidaKernelLogPath");
+
+        OBJECT_ATTRIBUTES oa;
+        InitializeObjectAttributes(&oa, registry_path,
+            OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+        HANDLE key = nullptr;
+        NTSTATUS st = ZwOpenKey(&key, KEY_QUERY_VALUE, &oa);
+        if (!NT_SUCCESS(st) || !key)
+            return;
+
+        union query_storage_t
+        {
+            KEY_VALUE_PARTIAL_INFORMATION info;
+            UCHAR bytes[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(g_log_path_buffer)];
+        } storage = {};
+
+        ULONG bytes_returned = 0;
+        st = ZwQueryValueKey(key, &value_name, KeyValuePartialInformation,
+            storage.bytes, sizeof(storage.bytes), &bytes_returned);
+        ZwClose(key);
+        if (!NT_SUCCESS(st))
+            return;
+
+        PKEY_VALUE_PARTIAL_INFORMATION info =
+            reinterpret_cast<PKEY_VALUE_PARTIAL_INFORMATION>(storage.bytes);
+        if (info->Type != REG_SZ && info->Type != REG_EXPAND_SZ)
+            return;
+        if (info->DataLength < sizeof(WCHAR) || info->DataLength >= sizeof(g_log_path_buffer))
+            return;
+
+        const WCHAR* src = reinterpret_cast<const WCHAR*>(info->Data);
+        ULONG chars = info->DataLength / sizeof(WCHAR);
+        while (chars > 0 && src[chars - 1] == L'\0')
+            --chars;
+        if (chars == 0 || chars >= RTL_NUMBER_OF(g_log_path_buffer))
+            return;
+        if (!has_supported_log_path_prefix(src, chars))
+            return;
+
+        RtlCopyMemory(g_log_path_buffer, src, chars * sizeof(WCHAR));
+        g_log_path_buffer[chars] = L'\0';
+        RtlInitUnicodeString(&g_log_path, g_log_path_buffer);
+    }
 
     static BOOLEAN is_hex_digit_char(char c)
     {
@@ -110,6 +202,8 @@ namespace dbg_capture {
         if (free_bytes < len) {
             ULONG to_drop = len - free_bytes;
             g_read_pos = rpos + to_drop;
+            _InterlockedIncrement(&g_ring_drop_events);
+            _InterlockedExchangeAdd(&g_ring_drop_bytes, static_cast<LONG>(to_drop));
         }
 
         ULONG offset = wpos % kRingSize;
@@ -176,6 +270,12 @@ namespace dbg_capture {
         NTSTATUS create_status;
         NTSTATUS write_status;
         ULONG elapsed_us;
+        ULONG ring_drop_events;
+        ULONG ring_drop_bytes;
+        ULONG flush_lost_events;
+        ULONG flush_lost_bytes;
+        ULONG immediate_failures;
+        NTSTATUS immediate_last_status;
     };
 
     static ULONG elapsed_us(LARGE_INTEGER start, LARGE_INTEGER end, LARGE_INTEGER freq)
@@ -247,8 +347,7 @@ namespace dbg_capture {
         KeReleaseSpinLock(&g_lock, old_irql);
         result.bytes = snapshot_len;
 
-        UNICODE_STRING path;
-        RtlInitUnicodeString(&path, kLogPath);
+        UNICODE_STRING path = current_log_path();
 
         OBJECT_ATTRIBUTES oa;
         InitializeObjectAttributes(&oa, &path,
@@ -276,9 +375,21 @@ namespace dbg_capture {
             result.write_status = ZwWriteFile(hFile, NULL, NULL, NULL, &iosb,
                 g_flush_buffer, snapshot_len, &offset_li, NULL);
             ZwClose(hFile);
+        } else if (NT_SUCCESS(st)) {
+            result.write_status = STATUS_INVALID_HANDLE;
+        }
+        if (snapshot_len != 0 && (!NT_SUCCESS(result.create_status) || !NT_SUCCESS(result.write_status))) {
+            _InterlockedIncrement(&g_flush_lost_events);
+            _InterlockedExchangeAdd(&g_flush_lost_bytes, static_cast<LONG>(snapshot_len));
         }
         LARGE_INTEGER end = KeQueryPerformanceCounter(nullptr);
         result.elapsed_us = elapsed_us(start, end, freq);
+        result.ring_drop_events = static_cast<ULONG>(_InterlockedCompareExchange(&g_ring_drop_events, 0, 0));
+        result.ring_drop_bytes = static_cast<ULONG>(_InterlockedCompareExchange(&g_ring_drop_bytes, 0, 0));
+        result.flush_lost_events = static_cast<ULONG>(_InterlockedCompareExchange(&g_flush_lost_events, 0, 0));
+        result.flush_lost_bytes = static_cast<ULONG>(_InterlockedCompareExchange(&g_flush_lost_bytes, 0, 0));
+        result.immediate_failures = static_cast<ULONG>(_InterlockedCompareExchange(&g_immediate_failures, 0, 0));
+        result.immediate_last_status = static_cast<NTSTATUS>(_InterlockedCompareExchange(&g_immediate_last_status, 0, 0));
         return result;
     }
 
@@ -286,8 +397,7 @@ namespace dbg_capture {
     {
         if (!data || len == 0 || KeGetCurrentIrql() != PASSIVE_LEVEL) return;
 
-        UNICODE_STRING path;
-        RtlInitUnicodeString(&path, kLogPath);
+        UNICODE_STRING path = current_log_path();
 
         OBJECT_ATTRIBUTES oa;
         InitializeObjectAttributes(&oa, &path,
@@ -307,13 +417,22 @@ namespace dbg_capture {
             FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
             NULL, 0);
 
+        NTSTATUS write_status = STATUS_SUCCESS;
         if (NT_SUCCESS(st) && hFile) {
             LARGE_INTEGER offset_li;
             offset_li.HighPart = -1;
             offset_li.LowPart = FILE_WRITE_TO_END_OF_FILE;
-            ZwWriteFile(hFile, NULL, NULL, NULL, &iosb,
+            write_status = ZwWriteFile(hFile, NULL, NULL, NULL, &iosb,
                 const_cast<char*>(data), len, &offset_li, NULL);
             ZwClose(hFile);
+        } else if (NT_SUCCESS(st)) {
+            write_status = STATUS_INVALID_HANDLE;
+        } else {
+            write_status = st;
+        }
+        if (!NT_SUCCESS(st) || !NT_SUCCESS(write_status)) {
+            _InterlockedIncrement(&g_immediate_failures);
+            _InterlockedExchange(&g_immediate_last_status, static_cast<LONG>(!NT_SUCCESS(st) ? st : write_status));
         }
     }
 
@@ -370,7 +489,7 @@ namespace dbg_capture {
                 empty_count = 0;
                 wait_ms = kFlushIntervalMs;
                 if (should_log_flush(flush, flush_count)) {
-                    write_immediate_formatted("[WW] dbg_capture::drain_thread_flush tid=%llu wait_status=0x%08lx wake=%s bytes=%lu total_bytes=%llu flush_us=%lu total_flush_us=%llu flush_count=%llu suppressed_flushes=%llu suppressed_bytes=%llu suppressed_flush_us=%llu create=0x%08lx write=0x%08lx next_wait_ms=%lu\n",
+                    write_immediate_formatted("[WW] dbg_capture::drain_thread_flush tid=%llu wait_status=0x%08lx wake=%s bytes=%lu total_bytes=%llu flush_us=%lu total_flush_us=%llu flush_count=%llu suppressed_flushes=%llu suppressed_bytes=%llu suppressed_flush_us=%llu create=0x%08lx write=0x%08lx ring_drop_events=%lu ring_drop_bytes=%lu flush_lost_events=%lu flush_lost_bytes=%lu immediate_failures=%lu immediate_last=0x%08lx next_wait_ms=%lu\n",
                         static_cast<unsigned long long>(tid),
                         static_cast<ULONG>(wait_status),
                         wait_reason(wait_status, FALSE),
@@ -384,6 +503,12 @@ namespace dbg_capture {
                         static_cast<unsigned long long>(suppressed_flush_us),
                         static_cast<ULONG>(flush.create_status),
                         static_cast<ULONG>(flush.write_status),
+                        flush.ring_drop_events,
+                        flush.ring_drop_bytes,
+                        flush.flush_lost_events,
+                        flush.flush_lost_bytes,
+                        flush.immediate_failures,
+                        static_cast<ULONG>(flush.immediate_last_status),
                         wait_ms);
                     suppressed_flush_count = 0;
                     suppressed_flush_bytes = 0;
@@ -421,7 +546,7 @@ namespace dbg_capture {
         total_flush_us += final_flush.elapsed_us;
         if (final_flush.bytes != 0)
             ++flush_count;
-        write_immediate_formatted("[WW] dbg_capture::drain_thread_exit tid=%llu final_bytes=%lu total_bytes=%llu empty_count=%llu total_flush_us=%llu flush_count=%llu suppressed_flushes=%llu suppressed_bytes=%llu suppressed_flush_us=%llu create=0x%08lx write=0x%08lx\n",
+        write_immediate_formatted("[WW] dbg_capture::drain_thread_exit tid=%llu final_bytes=%lu total_bytes=%llu empty_count=%llu total_flush_us=%llu flush_count=%llu suppressed_flushes=%llu suppressed_bytes=%llu suppressed_flush_us=%llu create=0x%08lx write=0x%08lx ring_drop_events=%lu ring_drop_bytes=%lu flush_lost_events=%lu flush_lost_bytes=%lu immediate_failures=%lu immediate_last=0x%08lx\n",
             static_cast<unsigned long long>(tid),
             final_flush.bytes,
             static_cast<unsigned long long>(total_bytes),
@@ -432,7 +557,13 @@ namespace dbg_capture {
             static_cast<unsigned long long>(suppressed_flush_bytes),
             static_cast<unsigned long long>(suppressed_flush_us),
             static_cast<ULONG>(final_flush.create_status),
-            static_cast<ULONG>(final_flush.write_status));
+            static_cast<ULONG>(final_flush.write_status),
+            final_flush.ring_drop_events,
+            final_flush.ring_drop_bytes,
+            final_flush.flush_lost_events,
+            final_flush.flush_lost_bytes,
+            final_flush.immediate_failures,
+            static_cast<ULONG>(final_flush.immediate_last_status));
         PsTerminateSystemThread(STATUS_SUCCESS);
     }
 
@@ -440,15 +571,30 @@ namespace dbg_capture {
     {
         if (_InterlockedCompareExchange(&g_initialized, 0, 0)) return STATUS_SUCCESS;
 
+        write_immediate_formatted("[WW] dbg_capture::initialize_enter irql=%lu pid=%llu tid=%llu ring=%p flush=%p\n",
+            static_cast<ULONG>(KeGetCurrentIrql()),
+            static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(PsGetCurrentProcessId())),
+            static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(PsGetCurrentThreadId())),
+            g_ring,
+            g_flush_buffer);
+
         g_ring = static_cast<UCHAR*>(
             ExAllocatePool2(POOL_FLAG_NON_PAGED, kRingSize, kPoolTag));
-        if (!g_ring) return STATUS_INSUFFICIENT_RESOURCES;
+        if (!g_ring) {
+            write_immediate_formatted("[WW] dbg_capture::initialize_alloc_failed target=ring bytes=%lu status=0x%08lx\n",
+                kRingSize,
+                static_cast<ULONG>(STATUS_INSUFFICIENT_RESOURCES));
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
 
         g_flush_buffer = static_cast<UCHAR*>(
             ExAllocatePool2(POOL_FLAG_NON_PAGED, kRingSize, kPoolTag));
         if (!g_flush_buffer) {
             ExFreePoolWithTag(g_ring, kPoolTag);
             g_ring = nullptr;
+            write_immediate_formatted("[WW] dbg_capture::initialize_alloc_failed target=flush bytes=%lu status=0x%08lx\n",
+                kRingSize,
+                static_cast<ULONG>(STATUS_INSUFFICIENT_RESOURCES));
             return STATUS_INSUFFICIENT_RESOURCES;
         }
 
@@ -477,10 +623,14 @@ namespace dbg_capture {
             ExFreePoolWithTag(g_flush_buffer, kPoolTag);
             g_flush_buffer = nullptr;
             _InterlockedExchange(&g_initialized, 0);
+            write_immediate_formatted("[WW] dbg_capture::initialize_thread_failed status=0x%08lx ring=%p flush=%p\n",
+                static_cast<ULONG>(st),
+                g_ring,
+                g_flush_buffer);
             return st;
         }
 
-        ObReferenceObjectByHandle(
+        NTSTATUS ref_status = ObReferenceObjectByHandle(
             thread_handle,
             THREAD_ALL_ACCESS,
             NULL,
@@ -488,6 +638,14 @@ namespace dbg_capture {
             reinterpret_cast<PVOID*>(&g_drain_thread),
             NULL);
         ZwClose(thread_handle);
+
+        write_immediate_formatted("[WW] dbg_capture::initialize_exit status=0x%08lx ref_status=0x%08lx ring=%p flush=%p thread=%p initialized=%ld\n",
+            static_cast<ULONG>(st),
+            static_cast<ULONG>(ref_status),
+            g_ring,
+            g_flush_buffer,
+            g_drain_thread,
+            _InterlockedCompareExchange(&g_initialized, 0, 0));
 
         return STATUS_SUCCESS;
     }

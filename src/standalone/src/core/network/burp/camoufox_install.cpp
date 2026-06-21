@@ -313,19 +313,34 @@ bool developer_repo_root_w(const std::wstring& dir)
         directory_exists_w(join_path_w(join_path_w(dir, L"src"), L"standalone"));
 }
 
+void append_developer_repo_candidate(std::vector<std::wstring>& bases, const std::wstring& candidate)
+{
+    if (developer_repo_root_w(candidate))
+        append_unique_path(bases, candidate);
+}
+
 void append_developer_repo_roots(std::vector<std::wstring>& bases, const std::wstring& exe_dir)
 {
     const std::wstring cwd = current_dir_w();
-    if (developer_repo_root_w(cwd))
-        append_unique_path(bases, cwd);
+    append_developer_repo_candidate(bases, cwd);
     const std::wstring parent = parent_dir_w(exe_dir);
-    if (developer_repo_root_w(parent))
-        append_unique_path(bases, parent);
+    append_developer_repo_candidate(bases, parent);
     const std::wstring grandparent = parent_dir_w(parent);
-    if (developer_repo_root_w(grandparent))
-        append_unique_path(bases, grandparent);
-    if (developer_repo_root_w(exe_dir))
-        append_unique_path(bases, exe_dir);
+    append_developer_repo_candidate(bases, grandparent);
+    append_developer_repo_candidate(bases, exe_dir);
+    append_env_path_roots(bases, L"AIDA_DEVELOPER_REPO_ROOT", 1);
+    append_env_path_roots(bases, L"AIDA_REPO_ROOT", 1);
+    std::wstring user_profile;
+    if (read_env_path_w(L"USERPROFILE", user_profile))
+    {
+        append_developer_repo_candidate(bases, join_path_w(user_profile, L"AiDAPrivate"));
+        append_developer_repo_candidate(bases, join_path_w(join_path_w(user_profile, L"source"), L"AiDAPrivate"));
+        append_developer_repo_candidate(bases, join_path_w(join_path_w(join_path_w(user_profile, L"source"), L"repos"), L"AiDAPrivate"));
+    }
+    std::wstring home_drive;
+    std::wstring home_path;
+    if (read_env_path_w(L"HOMEDRIVE", home_drive) && read_env_path_w(L"HOMEPATH", home_path))
+        append_developer_repo_candidate(bases, join_path_w(home_drive + home_path, L"AiDAPrivate"));
 }
 
 bool fileless_camoufox_browser_path_allowed(const std::wstring& candidate)
@@ -1978,9 +1993,9 @@ std::string compact_log_tail(std::string s, size_t limit)
 
 DWORD contract_probe_timeout_ms(DWORD timeout_ms)
 {
-    if (timeout_ms == INFINITE) return 7000;
+    if (timeout_ms == INFINITE) return 30000;
     if (timeout_ms < 1000) return timeout_ms;
-    return std::min<DWORD>(timeout_ms, 7000);
+    return std::max<DWORD>(timeout_ms, 30000);
 }
 
 bool validate_contract_probe_output(const std::string& captured, std::string& detail)

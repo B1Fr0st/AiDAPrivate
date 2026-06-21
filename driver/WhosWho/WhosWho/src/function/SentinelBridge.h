@@ -570,16 +570,20 @@ namespace sentinel_bridge {
         LARGE_INTEGER now;
         KeQuerySystemTime(&now);
         ULONG suppressed = 0;
-        if (should_log_tick(now.QuadPart, &suppressed)) {
-            WW_LOG("tick: wrote whoswho_tsc=%lld suppressed=%lu challenge=%u candidate=%u response=%u decrypt_failed=%u counter=%llu last_seen=%llu",
+        if (challenge_response_written || challenge_decrypt_failed || should_log_tick(now.QuadPart, &suppressed)) {
+            WW_LOG("tick: wrote whoswho_tsc=%lld sentinel_tsc=%lld suppressed=%lu challenge=%u candidate=%u response=%u decrypt_failed=%u counter=%llu last_seen=%llu bridge=%p keys_valid=%ld hmac_valid=%u",
                 tsc,
+                g_bridge.sentinel_tsc,
                 suppressed,
                 challenge_seen ? 1u : 0u,
                 challenge_candidate ? 1u : 0u,
                 challenge_response_written ? 1u : 0u,
                 challenge_decrypt_failed ? 1u : 0u,
                 issued_counter,
-                last_seen);
+                last_seen,
+                &g_bridge,
+                _InterlockedCompareExchange(&g_challenge_keys_valid, 0, 0),
+                g_bridge_v2.hmac_valid ? 1u : 0u);
         }
     }
 
@@ -765,8 +769,20 @@ namespace sentinel_bridge {
         derive_challenge_subkeys();
         g_bridge.code_base = text_base;
         g_bridge.code_size = text_size;
-        WW_LOG("bridge::init: code_base=%p code_size=0x%lx bridge_addr=%p magic=0x%lx version=%lu",
-            text_base, text_size, &g_bridge, g_bridge.magic, g_bridge.version);
+        WW_LOG("bridge::init: code_base=%p code_end=%p code_size=0x%lx bridge_addr=%p bridge_v2=%p magic=0x%lx version=%lu expected_version=%lu key_present=%u challenge_keys_valid=%ld whoswho_tsc=%lld sentinel_tsc=%lld hmac_valid=%u",
+            text_base,
+            text_base ? static_cast<UCHAR*>(text_base) + text_size : nullptr,
+            text_size,
+            &g_bridge,
+            &g_bridge_v2,
+            g_bridge.magic,
+            g_bridge.version,
+            BRIDGE_VERSION_2,
+            g_bridge_crypt_key != 0 ? 1u : 0u,
+            _InterlockedCompareExchange(&g_challenge_keys_valid, 0, 0),
+            g_bridge.whoswho_tsc,
+            g_bridge.sentinel_tsc,
+            g_bridge_v2.hmac_valid ? 1u : 0u);
     }
 
 
@@ -775,6 +791,11 @@ namespace sentinel_bridge {
             WW_LOG("start_watchdog: already active, skipping");
             return;
         }
+
+        WW_LOG("sentinel_bridge::discovery_model whoswho_sentinel_device_probe=0 whoswho_sentinel_object_probe=0 reason=shared_bridge_waits_for_sentinel_tsc bridge=%p version=%lu magic=0x%lx",
+            &g_bridge,
+            g_bridge.version,
+            g_bridge.magic);
 
         _InterlockedExchange64(&g_watchdog_start_qpc, static_cast<LONG64>(__rdtsc()));
 
@@ -789,11 +810,16 @@ namespace sentinel_bridge {
         LARGE_INTEGER due_time;
         due_time.QuadPart = -static_cast<LONGLONG>(WATCHDOG_PERIOD_MS) * 10000LL;
 
-        _KeSetTimerEx(&g_watchdog_timer, due_time, WATCHDOG_PERIOD_MS, &g_watchdog_dpc);
+        BOOLEAN timer_was_set = _KeSetTimerEx(&g_watchdog_timer, due_time, WATCHDOG_PERIOD_MS, &g_watchdog_dpc);
 
-        WW_LOG("start_watchdog: armed, period=%ldms grace=%ldms timeout=%ldms initial_sentinel_tsc=%lld bridge=%p",
+        WW_LOG("start_watchdog: armed, period=%ldms grace=%ldms timeout=%ldms initial_sentinel_tsc=%lld bridge=%p timer_was_set=%u active=%ld whoswho_tsc=%lld hmac_valid=%u",
             WATCHDOG_PERIOD_MS, GRACE_PERIOD_MS, SENTINEL_TIMEOUT_MS,
-            initial_sentinel_tsc, &g_bridge);
+            initial_sentinel_tsc,
+            &g_bridge,
+            timer_was_set ? 1u : 0u,
+            _InterlockedCompareExchange(&g_watchdog_active, 0, 0),
+            g_bridge.whoswho_tsc,
+            g_bridge_v2.hmac_valid ? 1u : 0u);
     }
 
     constexpr ULONG EVIDENCE_BLOB_MAGIC = 0x45564944u;

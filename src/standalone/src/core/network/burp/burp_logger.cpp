@@ -58,6 +58,40 @@ struct ring_t
     aida::events::subscription_handle_t          sub;
 };
 
+struct prepared_filter_t
+{
+    const log_filter_t& filter;
+    logger::source_t source_value = logger::source_t::manual;
+    bool source_filtered = false;
+    bool host_regex_ready = false;
+    bool url_regex_ready = false;
+    std::regex host_regex;
+    std::regex url_regex;
+
+    explicit prepared_filter_t(const log_filter_t& f) : filter(f)
+    {
+        source_filtered = !f.source.empty() && parse_source(f.source, source_value);
+        if (!f.host_regex.empty() && f.host_regex.size() <= 512)
+        {
+            try
+            {
+                host_regex = std::regex(f.host_regex, std::regex::ECMAScript | std::regex::icase);
+                host_regex_ready = true;
+            }
+            catch (...) { host_regex_ready = false; }
+        }
+        if (!f.url_regex.empty() && f.url_regex.size() <= 512)
+        {
+            try
+            {
+                url_regex = std::regex(f.url_regex, std::regex::ECMAScript | std::regex::icase);
+                url_regex_ready = true;
+            }
+            catch (...) { url_regex_ready = false; }
+        }
+    }
+};
+
 ring_t& ring()
 {
     static ring_t r;
@@ -135,30 +169,26 @@ std::string csv_quote(const std::string& s)
     return out;
 }
 
-bool row_matches(const log_row_t& r, const log_filter_t& f)
+bool row_matches(const log_row_t& r, const prepared_filter_t& pf)
 {
+    const log_filter_t& f = pf.filter;
     if (!f.method.empty() && r.method != f.method) return false;
     if (r.status < f.status_min || r.status > f.status_max) return false;
-    if (!f.source.empty()) {
-        source_t src = source_t::manual;
-        if (parse_source(f.source, src)) { if (r.source != src) return false; }
-    }
+    if (pf.source_filtered && r.source != pf.source_value) return false;
     if (f.time_from_ms > 0 && r.ts_ms < f.time_from_ms) return false;
     if (f.time_to_ms   > 0 && r.ts_ms > f.time_to_ms)   return false;
     if (!f.mime_type.empty() && r.mime_type != f.mime_type) return false;
     if (!f.host_regex.empty()) {
-        try {
-            std::regex re(f.host_regex, std::regex::ECMAScript | std::regex::icase);
-            if (!std::regex_search(r.host, re)) return false;
-        } catch (...) {
+        if (pf.host_regex_ready) {
+            if (!std::regex_search(r.host, pf.host_regex)) return false;
+        } else {
             if (r.host.find(f.host_regex) == std::string::npos) return false;
         }
     }
     if (!f.url_regex.empty()) {
-        try {
-            std::regex re(f.url_regex, std::regex::ECMAScript | std::regex::icase);
-            if (!std::regex_search(r.url, re)) return false;
-        } catch (...) {
+        if (pf.url_regex_ready) {
+            if (!std::regex_search(r.url, pf.url_regex)) return false;
+        } else {
             if (r.url.find(f.url_regex) == std::string::npos) return false;
         }
     }
@@ -269,8 +299,9 @@ std::vector<log_row_t> query(const log_filter_t& f, size_t limit)
     std::vector<log_row_t> all = snapshot_chronological();
     std::vector<log_row_t> out;
     out.reserve(all.size());
+    prepared_filter_t pf(f);
     for (auto it = all.rbegin(); it != all.rend(); ++it) {
-        if (row_matches(*it, f)) {
+        if (row_matches(*it, pf)) {
             out.push_back(*it);
             if (limit > 0 && out.size() >= limit) break;
         }

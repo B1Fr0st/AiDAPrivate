@@ -531,6 +531,22 @@ static void log_sync_event_create(const char* name, HANDLE handle, DWORD gle, bo
     fflush(stdout);
 }
 
+static bool build_default_target_log_path(char* out, DWORD cap) {
+    if (!out || cap == 0)
+        return false;
+    out[0] = '\0';
+    char module[MAX_PATH] = {};
+    DWORD got = GetModuleFileNameA(nullptr, module, MAX_PATH);
+    if (got == 0 || got >= MAX_PATH)
+        return false;
+    char* last = strrchr(module, '\\');
+    if (!last)
+        return false;
+    *(last + 1) = '\0';
+    _snprintf_s(out, cap, _TRUNCATE, "%saida_test_target.log", module);
+    return out[0] != '\0';
+}
+
 int main(int argc, char* argv[]) {
     char target_log_path[MAX_PATH * 2] = {};
     DWORD target_log_len = GetEnvironmentVariableA(
@@ -539,8 +555,8 @@ int main(int argc, char* argv[]) {
         static_cast<DWORD>(sizeof(target_log_path)));
     if (target_log_len > 0 && target_log_len < sizeof(target_log_path))
         aida_target_log_set_file(target_log_path);
-    else
-        aida_target_log_set_file("C:\\Users\\Public\\Desktop\\aida_test_target.log");
+    else if (build_default_target_log_path(target_log_path, static_cast<DWORD>(sizeof(target_log_path))))
+        aida_target_log_set_file(target_log_path);
     install_target_crash_handlers();
     s_args = parse_args(argc, argv);
     const cli_args_t& args = s_args;

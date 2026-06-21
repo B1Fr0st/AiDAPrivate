@@ -167,11 +167,23 @@ namespace test_all_features {
 
 
 		const char* log_path() {
-			return "C:\\Users\\Public\\Desktop\\aida_full_test.log";
+			static const std::string path = []() {
+				char buf[MAX_PATH] = {};
+				if (diag::build_log_path("aida_full_test.log", buf, sizeof(buf)))
+					return std::string(buf);
+				return std::string();
+			}();
+			return path.c_str();
 		}
 
 		const char* target_log_path() {
-			return "C:\\Users\\Public\\Desktop\\aida_test_target.log";
+			static const std::string path = []() {
+				char buf[MAX_PATH] = {};
+				if (diag::build_log_path("aida_test_target.log", buf, sizeof(buf)))
+					return std::string(buf);
+				return std::string();
+			}();
+			return path.c_str();
 		}
 
 		constexpr const char* kFullTestEnvName = "AIDA_FULL_TEST_RUNNING";

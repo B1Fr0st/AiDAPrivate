@@ -3,6 +3,7 @@
 #include "../Struct.h"
 #include "../Functions.h"
 #include "../CoreSecurity.h"
+#include "../KernelLayout.h"
 #include "../../imports/Defs.h"
 
 extern "C" PPEB PsGetProcessPeb(PEPROCESS Process);
@@ -728,7 +729,15 @@ namespace dll_protection {
         BOOLEAN detected = FALSE;
         __try {
             UINT8* eprocess = (UINT8*)process;
-            volatile PVOID* debug_port = (volatile PVOID*)(eprocess + 0x578);
+            SIZE_T debug_port_offset = whoswho_kernel_layout::eprocess_debug_port_offset();
+            if (debug_port_offset == 0) {
+                WW_LOG("[DLL-PROTECT] debug_port_check fail_closed pid=%u build=%lu reason=unsupported_eprocess_layout",
+                    pid,
+                    whoswho_kernel_layout::build_number());
+                ObDereferenceObject(process);
+                return FALSE;
+            }
+            volatile PVOID* debug_port = (volatile PVOID*)(eprocess + debug_port_offset);
             if (_MmIsAddressValid((PVOID)debug_port)) {
                 PVOID port = *debug_port;
                 UINT64 port_value = (UINT64)(ULONG_PTR)port;
@@ -764,7 +773,15 @@ namespace dll_protection {
         BOOLEAN detected = FALSE;
         __try {
             UINT8* eprocess = (UINT8*)process;
-            volatile PVOID* instr_cb = (volatile PVOID*)(eprocess + 0x460);
+            SIZE_T instr_offset = whoswho_kernel_layout::eprocess_instrumentation_callback_offset();
+            if (instr_offset == 0) {
+                WW_LOG("[DLL-PROTECT] instrumentation_check fail_closed pid=%u build=%lu reason=unsupported_eprocess_layout",
+                    pid,
+                    whoswho_kernel_layout::build_number());
+                ObDereferenceObject(process);
+                return FALSE;
+            }
+            volatile PVOID* instr_cb = (volatile PVOID*)(eprocess + instr_offset);
             if (_MmIsAddressValid((PVOID)instr_cb)) {
                 PVOID cb = *instr_cb;
                 if (cb != nullptr) {
@@ -1452,12 +1469,24 @@ namespace anti_dump_driver {
                 return STATUS_UNSUCCESSFUL;
             }
 
-            PLIST_ENTRY list_head = (PLIST_ENTRY)((UINT8*)initial + 0x448);
+            SIZE_T active_links_offset = whoswho_kernel_layout::eprocess_active_process_links_offset();
+            SIZE_T object_table_offset = whoswho_kernel_layout::eprocess_object_table_offset();
+            if (active_links_offset == 0 || object_table_offset == 0) {
+                WW_LOG("[DLL-PROTECT] detect_external_handles fail_closed target_pid=%u build=%lu active_offset=0x%llx object_offset=0x%llx",
+                    target_pid,
+                    whoswho_kernel_layout::build_number(),
+                    static_cast<unsigned long long>(active_links_offset),
+                    static_cast<unsigned long long>(object_table_offset));
+                ObDereferenceObject(target_proc);
+                return STATUS_NOT_SUPPORTED;
+            }
+
+            PLIST_ENTRY list_head = (PLIST_ENTRY)((UINT8*)initial + active_links_offset);
             PLIST_ENTRY entry = list_head->Flink;
 
             for (int iter = 0; iter < 2048 && entry != list_head; ++iter, entry = entry->Flink)
             {
-                PEPROCESS scan_proc = (PEPROCESS)((UINT8*)entry - 0x448);
+                PEPROCESS scan_proc = (PEPROCESS)((UINT8*)entry - active_links_offset);
                 if (!_MmIsAddressValid(scan_proc)) continue;
                 if (scan_proc == target_proc) continue;
 
@@ -1465,9 +1494,9 @@ namespace anti_dump_driver {
                 if ((UINT64)(ULONG_PTR)scan_pid <= 4) continue;
 
                 UINT8* eproc = (UINT8*)scan_proc;
-                if (!_MmIsAddressValid(eproc + 0x570)) continue;
+                if (!_MmIsAddressValid(eproc + object_table_offset)) continue;
 
-                volatile UINT64* object_table = (volatile UINT64*)(eproc + 0x570);
+                volatile UINT64* object_table = (volatile UINT64*)(eproc + object_table_offset);
                 if (*object_table == 0) continue;
 
                 UCHAR* image_name = PsGetProcessImageFileName(scan_proc);

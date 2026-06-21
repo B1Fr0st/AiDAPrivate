@@ -2,6 +2,7 @@
 #include "../../imports/Defs.h"
 #include "driver/Strong.h"
 #include "../CoreSecurity.h"
+#include "../KernelLayout.h"
 #include "../Struct.h"
 #include "../AntiDebug.h"
 #include "../SentinelBridge.h"
@@ -2806,11 +2807,7 @@ namespace debug_attach_monitor {
     inline volatile ULONG g_pending_pid = 0;
 
     __forceinline ULONG resolve_debug_port_offset() {
-        ULONG build = strong::get_windows_version();
-        if (build >= 22000) return 0x578;
-        if (build >= 19041) return 0x578;
-        if (build >= 17763) return 0x550;
-        return 0x420;
+        return static_cast<ULONG>(whoswho_kernel_layout::eprocess_debug_port_offset());
     }
 
     __forceinline bool attribute_debugger_to_re_tool(HANDLE target_pid) {

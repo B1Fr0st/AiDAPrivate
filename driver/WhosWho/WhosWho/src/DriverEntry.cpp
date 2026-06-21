@@ -25,6 +25,49 @@ namespace debug_attach_monitor {
 
 constexpr ULONG TAG_DEL = 'leDW';
 
+static UINT64 ww_handle_to_u64(HANDLE value)
+{
+    return static_cast<UINT64>(reinterpret_cast<ULONG_PTR>(value));
+}
+
+static ULONG ww_elapsed_us(const LARGE_INTEGER& start, const LARGE_INTEGER& freq)
+{
+    LARGE_INTEGER now = KeQueryPerformanceCounter(nullptr);
+    if (freq.QuadPart <= 0 || now.QuadPart < start.QuadPart)
+        return 0;
+    return static_cast<ULONG>(((now.QuadPart - start.QuadPart) * 1000000ULL) / static_cast<ULONGLONG>(freq.QuadPart));
+}
+
+static ULONG ww_read_kuser_u32(ULONG offset)
+{
+    ULONG value = 0;
+    __try {
+        volatile ULONG* ptr = reinterpret_cast<volatile ULONG*>(0xFFFFF78000000000ULL + offset);
+        value = *ptr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        value = 0;
+    }
+    return value;
+}
+
+static void ww_log_driverentry_phase(const char* phase, const LARGE_INTEGER& start, const LARGE_INTEGER& freq)
+{
+    ULONG build = ww_read_kuser_u32(0x260) & 0xFFFFu;
+    ULONG ci_options = ww_read_kuser_u32(0x3A8);
+    WW_LOG("DriverEntryPhase phase=%s elapsed_us=%lu pid=%llu tid=%llu irql=%lu cpu=%lu build=%lu ci_options=0x%08lx hvci=%u ci_enabled=%u initialized_log=%u",
+        phase ? phase : "unknown",
+        ww_elapsed_us(start, freq),
+        ww_handle_to_u64(PsGetCurrentProcessId()),
+        ww_handle_to_u64(PsGetCurrentThreadId()),
+        static_cast<ULONG>(KeGetCurrentIrql()),
+        KeGetCurrentProcessorNumber(),
+        build,
+        ci_options,
+        (ci_options & hvci_detect::CI_OPTION_HVCI_KMCI_ENABLED) || (ci_options & hvci_detect::CI_OPTION_HVCI_STRICT) ? 1u : 0u,
+        (ci_options & hvci_detect::CI_OPTION_ENABLED) ? 1u : 0u,
+        1u);
+}
+
 
 #ifndef FILE_DISPOSITION_FLAG_DELETE
 #define FILE_DISPOSITION_FLAG_DELETE                 0x00000001
@@ -376,9 +419,22 @@ namespace whoswho_build_identity {
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
 
-    dbg_capture::write_immediate_formatted("[WW-EARLY] DriverEntry entered driver_object_present=%u registry_path_present=%u\n",
+    LARGE_INTEGER entry_freq = {};
+    LARGE_INTEGER entry_start = KeQueryPerformanceCounter(&entry_freq);
+    dbg_capture::configure_log_path(RegistryPath);
+    ULONG early_build = ww_read_kuser_u32(0x260) & 0xFFFFu;
+    ULONG early_ci_options = ww_read_kuser_u32(0x3A8);
+    dbg_capture::write_immediate_formatted("[WW-EARLY] DriverEntry entered driver_object_present=%u registry_path_present=%u pid=%llu tid=%llu irql=%lu cpu=%lu build=%lu ci_options=0x%08lx hvci=%u ci_enabled=%u\n",
         DriverObject != nullptr ? 1u : 0u,
-        RegistryPath != nullptr ? 1u : 0u);
+        RegistryPath != nullptr ? 1u : 0u,
+        ww_handle_to_u64(PsGetCurrentProcessId()),
+        ww_handle_to_u64(PsGetCurrentThreadId()),
+        static_cast<ULONG>(KeGetCurrentIrql()),
+        KeGetCurrentProcessorNumber(),
+        early_build,
+        early_ci_options,
+        (early_ci_options & hvci_detect::CI_OPTION_HVCI_KMCI_ENABLED) || (early_ci_options & hvci_detect::CI_OPTION_HVCI_STRICT) ? 1u : 0u,
+        (early_ci_options & hvci_detect::CI_OPTION_ENABLED) ? 1u : 0u);
     dbg_capture::write_immediate_formatted("[WW-EARLY] build_identity hash=0x%llX date=%s time=%s msc=%u cpp=%lu entry=%p\n",
         whoswho_build_identity::kHash,
         __DATE__,
@@ -390,13 +446,18 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     dbg_capture::write_immediate_formatted("[WW-EARLY] SetupFunctions begin\n");
 
     if (!SetupFunctions()) {
-        dbg_capture::write_immediate_formatted("[WW-EARLY] SetupFunctions FAILED\n");
+        dbg_capture::write_immediate_formatted("[WW-EARLY] SetupFunctions FAILED elapsed_us=%lu\n",
+            ww_elapsed_us(entry_start, entry_freq));
         return STATUS_UNSUCCESSFUL;
     }
 
-    dbg_capture::write_immediate_formatted("[WW-EARLY] SetupFunctions OK\n");
+    dbg_capture::write_immediate_formatted("[WW-EARLY] SetupFunctions OK elapsed_us=%lu\n",
+        ww_elapsed_us(entry_start, entry_freq));
 
-    dbg_capture::initialize();
+    NTSTATUS dbg_status = dbg_capture::initialize();
+    dbg_capture::write_immediate_formatted("[WW-EARLY] dbg_capture::initialize status=0x%08lx elapsed_us=%lu\n",
+        static_cast<ULONG>(dbg_status),
+        ww_elapsed_us(entry_start, entry_freq));
 
     WW_LOG("DriverEntry: SetupFunctions OK");
     WW_LOG("DriverEntry: build_identity hash=0x%llX date=%s time=%s msc=%u cpp=%lu entry=%p driver_object=%p registry_path_present=%u",
@@ -408,13 +469,17 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
         reinterpret_cast<PVOID>(&DriverEntry),
         DriverObject,
         RegistryPath != nullptr ? 1u : 0u);
+    ww_log_driverentry_phase("post_setup", entry_start, entry_freq);
 
     if (!device_names::initialize_names()) {
-        WW_LOG("DriverEntry: initialize_names FAILED");
+        WW_LOG("DriverEntry: initialize_names FAILED elapsed_us=%lu", ww_elapsed_us(entry_start, entry_freq));
         return STATUS_UNSUCCESSFUL;
     }
 
-    WW_LOG("DriverEntry: device names initialized");
+    WW_LOG("DriverEntry: device names initialized device=%ws symlink=%ws elapsed_us=%lu",
+        device_names::get_device_name(),
+        device_names::get_symlink_name(),
+        ww_elapsed_us(entry_start, entry_freq));
 
     UNICODE_STRING deviceName = {};
     _RtlInitUnicodeString(&deviceName, device_names::get_device_name());
@@ -432,11 +497,20 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     );
 
     if (!NT_SUCCESS(status)) {
-        WW_LOG("DriverEntry: IoCreateDevice FAILED status=0x%08lx", status);
+        WW_LOG("DriverEntry: IoCreateDevice FAILED status=0x%08lx device=%wZ elapsed_us=%lu irql=%lu",
+            status,
+            &deviceName,
+            ww_elapsed_us(entry_start, entry_freq),
+            static_cast<ULONG>(KeGetCurrentIrql()));
         return status;
     }
 
-    WW_LOG("DriverEntry: device created present=%u", deviceObject != nullptr ? 1u : 0u);
+    WW_LOG("DriverEntry: device created present=%u device_object=%p device=%wZ flags=0x%lx elapsed_us=%lu",
+        deviceObject != nullptr ? 1u : 0u,
+        deviceObject,
+        &deviceName,
+        deviceObject ? deviceObject->Flags : 0,
+        ww_elapsed_us(entry_start, entry_freq));
 
     UNICODE_STRING symLink = {};
     _RtlInitUnicodeString(&symLink, device_names::get_symlink_name());
@@ -445,12 +519,19 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
 
     status = _IoCreateSymbolicLink(&symLink, &deviceName);
     if (!NT_SUCCESS(status)) {
-        WW_LOG("DriverEntry: IoCreateSymbolicLink FAILED status=0x%08lx", status);
+        WW_LOG("DriverEntry: IoCreateSymbolicLink FAILED status=0x%08lx device=%wZ symlink=%wZ elapsed_us=%lu",
+            status,
+            &deviceName,
+            &symLink,
+            ww_elapsed_us(entry_start, entry_freq));
         _IoDeleteDevice(deviceObject);
         return status;
     }
 
-    WW_LOG("DriverEntry: symlink created");
+    WW_LOG("DriverEntry: symlink created device=%wZ symlink=%wZ elapsed_us=%lu",
+        &deviceName,
+        &symLink,
+        ww_elapsed_us(entry_start, entry_freq));
 
     SetFlag(deviceObject->Flags, DO_BUFFERED_IO);
 
@@ -459,23 +540,43 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = dispatcher::Controller;
 
     DriverObject->DriverUnload = nullptr;
+    WW_LOG("DriverEntry: dispatch table assigned create=%p close=%p ioctl=%p unload=%p device_flags=0x%lx driver_object=%p elapsed_us=%lu",
+        DriverObject->MajorFunction[IRP_MJ_CREATE],
+        DriverObject->MajorFunction[IRP_MJ_CLOSE],
+        DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL],
+        DriverObject->DriverUnload,
+        deviceObject->Flags,
+        DriverObject,
+        ww_elapsed_us(entry_start, entry_freq));
 
     if (DriverObject->DriverSection) {
         auto ldrEntry = static_cast<PLDR_DATA_TABLE_ENTRY>(DriverObject->DriverSection);
         ldrEntry->Flags |= 0x20u;
+        WW_LOG("DriverEntry: DriverSection flag set ldr=%p flags=0x%lx base=%p size=0x%lx elapsed_us=%lu",
+            ldrEntry,
+            ldrEntry->Flags,
+            ldrEntry->DllBase,
+            ldrEntry->SizeOfImage,
+            ww_elapsed_us(entry_start, entry_freq));
     }
 
     ClearFlag(deviceObject->Flags, DO_DEVICE_INITIALIZING);
+    WW_LOG("DriverEntry: device initialization cleared flags=0x%lx elapsed_us=%lu",
+        deviceObject->Flags,
+        ww_elapsed_us(entry_start, entry_freq));
 
     status = net_capture::initialize(deviceObject);
     if (!NT_SUCCESS(status)) {
-        WW_LOG("DriverEntry: net_capture::initialize FAILED status=0x%08lx", status);
+        WW_LOG("DriverEntry: net_capture::initialize FAILED status=0x%08lx device_object=%p elapsed_us=%lu",
+            status,
+            deviceObject,
+            ww_elapsed_us(entry_start, entry_freq));
         _IoDeleteSymbolicLink(&symLink);
         _IoDeleteDevice(deviceObject);
         return status;
     }
 
-    WW_LOG("DriverEntry: net_capture initialized");
+    WW_LOG("DriverEntry: net_capture initialized elapsed_us=%lu", ww_elapsed_us(entry_start, entry_freq));
 
 
     if (DriverObject->DriverSection) {
@@ -503,7 +604,13 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
                             sec[i].Name[4] == 't') {
                             PVOID text_base = static_cast<UCHAR*>(base) + sec[i].VirtualAddress;
                             ULONG text_size = sec[i].Misc.VirtualSize;
-                            WW_LOG("DriverEntry: .text found present=%u size=0x%lx", text_base != nullptr ? 1u : 0u, text_size);
+                            WW_LOG("DriverEntry: .text found present=%u base=%p end=%p rva=0x%lx size=0x%lx elapsed_us=%lu",
+                                text_base != nullptr ? 1u : 0u,
+                                text_base,
+                                static_cast<UCHAR*>(text_base) + text_size,
+                                sec[i].VirtualAddress,
+                                text_size,
+                                ww_elapsed_us(entry_start, entry_freq));
                             sentinel_bridge::init(text_base, text_size);
                             found_text = true;
                             break;
@@ -527,16 +634,18 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
 
     WW_LOG("DriverEntry: starting watchdog...");
     if (!dispatcher::verify_dispatch_integrity(DriverObject)) {
-        WW_LOG("DriverEntry: dispatch integrity check FAILED before watchdog start");
+        WW_LOG("DriverEntry: dispatch integrity check FAILED before watchdog start elapsed_us=%lu",
+            ww_elapsed_us(entry_start, entry_freq));
         net_capture::cleanup();
         _IoDeleteSymbolicLink(&symLink);
         _IoDeleteDevice(deviceObject);
         return STATUS_ACCESS_DENIED;
     }
+    WW_LOG("DriverEntry: dispatch integrity check OK elapsed_us=%lu", ww_elapsed_us(entry_start, entry_freq));
     NTSTATUS ob_status = process_guard::init();
-    WW_LOG("DriverEntry: process_guard::init returned 0x%08lx", ob_status);
+    WW_LOG("DriverEntry: process_guard::init returned 0x%08lx elapsed_us=%lu", ob_status, ww_elapsed_us(entry_start, entry_freq));
     if (!NT_SUCCESS(ob_status)) {
-        WW_LOG("DriverEntry: process_guard::init FAILED before watchdog start");
+        WW_LOG("DriverEntry: process_guard::init FAILED before watchdog start elapsed_us=%lu", ww_elapsed_us(entry_start, entry_freq));
         process_guard::cleanup();
         net_capture::cleanup();
         _IoDeleteSymbolicLink(&symLink);
@@ -545,14 +654,22 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     }
 
     sentinel_bridge::start_watchdog();
+    ww_log_driverentry_phase("watchdog_started", entry_start, entry_freq);
 
-    sentinel_bridge::allocate_evidence_blob();
+    NTSTATUS evidence_status = sentinel_bridge::allocate_evidence_blob();
+    WW_LOG("DriverEntry: allocate_evidence_blob returned 0x%08lx blob=%p offset=0x%llx elapsed_us=%lu",
+        evidence_status,
+        sentinel_bridge::g_evidence_blob,
+        static_cast<unsigned long long>(sentinel_bridge::g_evidence_blob_offset),
+        ww_elapsed_us(entry_start, entry_freq));
     anti_debug::initialize_kd_baseline();
+    WW_LOG("DriverEntry: anti_debug::initialize_kd_baseline complete elapsed_us=%lu", ww_elapsed_us(entry_start, entry_freq));
     debug_attach_monitor::start();
+    WW_LOG("DriverEntry: debug_attach_monitor::start complete elapsed_us=%lu", ww_elapsed_us(entry_start, entry_freq));
     WW_LOG("DriverEntry: session-bound scanners deferred until registered client heartbeat");
 
     NTSTATUS dbe_status = debug_events::initialize();
-    WW_LOG("DriverEntry: debug_events::initialize returned 0x%08lx", dbe_status);
+    WW_LOG("DriverEntry: debug_events::initialize returned 0x%08lx elapsed_us=%lu", dbe_status, ww_elapsed_us(entry_start, entry_freq));
 
     WW_LOG("DriverEntry: invoking malware_safe::init (after process_guard)...");
     NTSTATUS ms_status = malware_safe::init(DriverObject);
@@ -568,10 +685,22 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
 
     WW_LOG("DriverEntry: scheduling stealth hide...");
     stealth::ScheduleDelayedHide(DriverObject);
+    WW_LOG("DriverEntry: stealth hide scheduled elapsed_us=%lu", ww_elapsed_us(entry_start, entry_freq));
 
-    if (!hvci_detect::is_hvci_enabled()) {
+    BOOLEAN hvci_enabled = hvci_detect::is_hvci_enabled();
+    WW_LOG("DriverEntry: code_integrity_state hvci=%u secure_boot_ci=%u ci_options=0x%08lx build=%lu elapsed_us=%lu",
+        hvci_enabled ? 1u : 0u,
+        hvci_detect::is_secure_boot_ci_enabled() ? 1u : 0u,
+        ww_read_kuser_u32(0x3A8),
+        ww_read_kuser_u32(0x260) & 0xFFFFu,
+        ww_elapsed_us(entry_start, entry_freq));
+    if (!hvci_enabled) {
         WW_LOG("DriverEntry: HVCI not enabled, relocating dispatch to signed memory");
         signed_memory::RelocateDispatchToSignedMemory(DriverObject, 0x800);
+        WW_LOG("DriverEntry: dispatch relocation call returned create=%p ioctl=%p elapsed_us=%lu",
+            DriverObject->MajorFunction[IRP_MJ_CREATE],
+            DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL],
+            ww_elapsed_us(entry_start, entry_freq));
     } else {
         WW_LOG("DriverEntry: HVCI enabled, skipping signed memory relocation");
     }
@@ -579,9 +708,13 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     WW_LOG("DriverEntry: deleting driver on disk...");
     DeleteDriverOnDisk(RegistryPath);
 
-    WW_LOG("DriverEntry: COMPLETE, bridge_present=1 magic_set=%u whoswho_tsc=%lld sentinel_tsc=%lld",
+    WW_LOG("DriverEntry: COMPLETE, bridge_present=1 magic_set=%u whoswho_tsc=%lld sentinel_tsc=%lld elapsed_us=%lu device=%p driver=%p",
         sentinel_bridge::g_bridge.magic != 0 ? 1u : 0u,
-        sentinel_bridge::g_bridge.whoswho_tsc, sentinel_bridge::g_bridge.sentinel_tsc);
+        sentinel_bridge::g_bridge.whoswho_tsc,
+        sentinel_bridge::g_bridge.sentinel_tsc,
+        ww_elapsed_us(entry_start, entry_freq),
+        deviceObject,
+        DriverObject);
 
     return STATUS_SUCCESS;
 }

@@ -280,6 +280,13 @@ namespace heartbeat {
         return c;
     }
 
+    __forceinline ULONG elapsed_us_from_qpc(const LARGE_INTEGER& start, const LARGE_INTEGER& freq) {
+        LARGE_INTEGER now = KeQueryPerformanceCounter(nullptr);
+        if (freq.QuadPart <= 0 || now.QuadPart < start.QuadPart)
+            return 0;
+        return static_cast<ULONG>(((now.QuadPart - start.QuadPart) * 1000000ULL) / static_cast<ULONGLONG>(freq.QuadPart));
+    }
+
     __forceinline bool register_quorum_failure(ULONG bit, ULONG_PTR a, ULONG_PTR b, ULONG_PTR c) {
         UINT64 now = __rdtsc();
         UINT64 last = g_quorum_fail_tsc;
@@ -308,40 +315,62 @@ namespace heartbeat {
 
     __forceinline bool locate_bridge(PVOID whoswho_base, ULONG whoswho_size) {
 
-        SN_LOG("locate_bridge: whoswho_base=%p whoswho_size=0x%lx", whoswho_base, whoswho_size);
+        LARGE_INTEGER freq = {};
+        LARGE_INTEGER start = KeQueryPerformanceCounter(&freq);
+
+        SN_LOG("locate_bridge: whoswho_base=%p whoswho_end=%p whoswho_size=0x%lx irql=%lu pid=%llu tid=%llu",
+            whoswho_base,
+            whoswho_base ? static_cast<UCHAR*>(whoswho_base) + whoswho_size : nullptr,
+            whoswho_size,
+            static_cast<ULONG>(KeGetCurrentIrql()),
+            static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(PsGetCurrentProcessId())),
+            static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(PsGetCurrentThreadId())));
 
         if (!whoswho_base || whoswho_size == 0) {
-            SN_LOG("locate_bridge: FAIL - null base or zero size");
+            SN_LOG("locate_bridge: FAIL - null base or zero size elapsed_us=%lu", elapsed_us_from_qpc(start, freq));
             return false;
         }
 
         if (!_MmIsAddressValid(whoswho_base)) {
-            SN_LOG("locate_bridge: FAIL - whoswho_base %p not valid", whoswho_base);
+            SN_LOG("locate_bridge: FAIL - whoswho_base %p not valid elapsed_us=%lu", whoswho_base, elapsed_us_from_qpc(start, freq));
             return false;
         }
 
         PIMAGE_DOS_HEADER dos = static_cast<PIMAGE_DOS_HEADER>(whoswho_base);
         if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
-            SN_LOG("locate_bridge: FAIL - bad DOS sig at %p (got 0x%x)", whoswho_base, dos->e_magic);
+            SN_LOG("locate_bridge: FAIL - bad DOS sig at %p (got 0x%x) elapsed_us=%lu", whoswho_base, dos->e_magic, elapsed_us_from_qpc(start, freq));
             return false;
         }
 
         PIMAGE_NT_HEADERS64 nt = reinterpret_cast<PIMAGE_NT_HEADERS64>(
             static_cast<UCHAR*>(whoswho_base) + dos->e_lfanew);
         if (!_MmIsAddressValid(nt) || nt->Signature != IMAGE_NT_SIGNATURE) {
-            SN_LOG("locate_bridge: FAIL - bad NT headers at %p", nt);
+            SN_LOG("locate_bridge: FAIL - bad NT headers at %p valid=%u elapsed_us=%lu",
+                nt,
+                _MmIsAddressValid(nt) ? 1u : 0u,
+                elapsed_us_from_qpc(start, freq));
             return false;
         }
 
         PIMAGE_SECTION_HEADER sections = IMAGE_FIRST_SECTION(nt);
         SN_LOG("locate_bridge: PE valid, %u sections", nt->FileHeader.NumberOfSections);
+        ULONG total_magic_hits = 0;
+        ULONG scanned_sections = 0;
+        ULONG scanned_bytes = 0;
 
         for (USHORT i = 0; i < nt->FileHeader.NumberOfSections; i++) {
             UCHAR* section_base = static_cast<UCHAR*>(whoswho_base) + sections[i].VirtualAddress;
             ULONG section_size = sections[i].Misc.VirtualSize;
+            ++scanned_sections;
+            scanned_bytes += section_size;
 
-            SN_LOG("locate_bridge: section[%u] name=%.8s base=%p size=0x%lx",
-                i, sections[i].Name, section_base, section_size);
+            SN_LOG("locate_bridge: section[%u] name=%.8s base=%p end=%p rva=0x%lx size=0x%lx",
+                i,
+                sections[i].Name,
+                section_base,
+                section_base + section_size,
+                sections[i].VirtualAddress,
+                section_size);
 
             if (section_size < sizeof(sentinel_bridge_t)) {
                 SN_LOG("locate_bridge: section[%u] too small for bridge (%lu < %llu)",
@@ -363,6 +392,7 @@ namespace heartbeat {
                         continue;
 
                     magic_hits++;
+                    total_magic_hits++;
                     SN_LOG("locate_bridge: MAGIC hit at section[%u]+0x%lx (addr=%p)", i, offset, magic_ptr);
 
                     volatile UINT32* version_ptr = magic_ptr + 1;
@@ -395,7 +425,16 @@ namespace heartbeat {
                         g_bridge = bridge;
                         g_last_whoswho_tsc = static_cast<UINT64>(bridge->whoswho_tsc);
                         g_last_check_tsc = __rdtsc();
-                        SN_LOG("locate_bridge: SUCCESS - bridge=%p tsc_now=%llu", bridge, g_last_check_tsc);
+                        SN_LOG("locate_bridge: SUCCESS bridge=%p tsc_now=%llu whoswho_tsc=%llu sentinel_tsc=%llu challenge_counter=%llu sections=%lu magic_hits=%lu scanned_bytes=0x%lx elapsed_us=%lu",
+                            bridge,
+                            g_last_check_tsc,
+                            static_cast<unsigned long long>(bridge->whoswho_tsc),
+                            static_cast<unsigned long long>(bridge->sentinel_tsc),
+                            static_cast<unsigned long long>(bridge->challenge_counter),
+                            scanned_sections,
+                            total_magic_hits,
+                            scanned_bytes,
+                            elapsed_us_from_qpc(start, freq));
                         return true;
                     } else {
                         SN_LOG("locate_bridge: REJECTED bridge - code_base=%p code_size=0x%lx out of range", cb, cs);
@@ -405,12 +444,19 @@ namespace heartbeat {
                     SN_LOG("locate_bridge: section[%u] no magic hits", i);
                 }
             } __except (EXCEPTION_EXECUTE_HANDLER) {
-                SN_LOG("locate_bridge: EXCEPTION in section[%u]", i);
+                SN_LOG("locate_bridge: EXCEPTION in section[%u] code=0x%08lx elapsed_us=%lu",
+                    i,
+                    GetExceptionCode(),
+                    elapsed_us_from_qpc(start, freq));
                 continue;
             }
         }
 
-        SN_LOG("locate_bridge: FAIL - bridge not found in any section");
+        SN_LOG("locate_bridge: FAIL - bridge not found sections=%lu magic_hits=%lu scanned_bytes=0x%lx elapsed_us=%lu",
+            scanned_sections,
+            total_magic_hits,
+            scanned_bytes,
+            elapsed_us_from_qpc(start, freq));
         return false;
     }
 
@@ -665,13 +711,21 @@ namespace heartbeat {
     }
 
     __forceinline bool verify_module_presence() {
-        if (!g_target_driver_base || !g_sentinel_driver_object)
+        if (!g_target_driver_base || !g_sentinel_driver_object) {
+            SN_LOG("heartbeat::verify_module_presence: skip target_base=%p sentinel_driver=%p",
+                (PVOID)g_target_driver_base,
+                g_sentinel_driver_object);
             return true;
+        }
 
         if (!_MmIsAddressValid(g_sentinel_driver_object) ||
             !g_sentinel_driver_object->DriverSection ||
-            !_MmIsAddressValid(g_sentinel_driver_object->DriverSection))
+            !_MmIsAddressValid(g_sentinel_driver_object->DriverSection)) {
+            SN_LOG("heartbeat::verify_module_presence: skip invalid_sentinel_object driver=%p section=%p",
+                g_sentinel_driver_object,
+                g_sentinel_driver_object ? g_sentinel_driver_object->DriverSection : nullptr);
             return true;
+        }
 
         PLDR_DATA_TABLE_ENTRY sentinel_ldr = static_cast<PLDR_DATA_TABLE_ENTRY>(
             g_sentinel_driver_object->DriverSection);
@@ -688,12 +742,20 @@ namespace heartbeat {
                 PLDR_DATA_TABLE_ENTRY mod = CONTAINING_RECORD(
                     entry, LDR_DATA_TABLE_ENTRY, InLoadOrderModuleList);
 
-                if (_MmIsAddressValid(mod) && mod->DllBase == (PVOID)g_target_driver_base)
+                if (_MmIsAddressValid(mod) && mod->DllBase == (PVOID)g_target_driver_base) {
+                    SN_LOG("heartbeat::verify_module_presence: target present entry=%p base=%p size=0x%lx",
+                        mod,
+                        mod->DllBase,
+                        mod->SizeOfImage);
                     return true;
+                }
 
                 entry = entry->Flink;
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
+            SN_LOG("heartbeat::verify_module_presence: exception code=0x%08lx target=%p",
+                GetExceptionCode(),
+                (PVOID)g_target_driver_base);
             return true;
         }
 

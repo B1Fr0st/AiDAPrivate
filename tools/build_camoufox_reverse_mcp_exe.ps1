@@ -18,9 +18,6 @@ $AidaFrozenMcpBuildRequirements = @(
     "pip",
     "wheel",
     "setuptools",
-    "nuitka",
-    "zstandard",
-    "ordered-set",
     "pyinstaller",
     "rich",
     "rich-click",
@@ -549,7 +546,7 @@ function Invoke-FrozenMcpContractCheck {
     $psi.Environment["PYTHONIOENCODING"] = "utf-8"
     $proc = [System.Diagnostics.Process]::new()
     $proc.StartInfo = $psi
-    $timeoutMs = 7000
+    $timeoutMs = 30000
     Write-Output "frozen_mcp_contract_check_command=$Executable --aida-contract-check"
     Write-Output "frozen_mcp_contract_check_timeout_ms=$timeoutMs"
     if (-not $proc.Start()) {
@@ -580,6 +577,22 @@ function Invoke-FrozenMcpContractCheck {
         throw "Frozen MCP contract check failed exit=$($proc.ExitCode) contract=$([int]$hasContract) request_id=$([int]$hasRequestId) page_id=$([int]$hasPageId) marker=$([int]$hasMarker) stdout=[$(ConvertTo-CompactLogText $stdout)] stderr=[$(ConvertTo-CompactLogText $stderr)]"
     }
     Write-Output "frozen_mcp_contract_check=ok"
+}
+
+function Test-FrozenMcpOneDirRuntime {
+    param([string]$Executable)
+    if (-not $Executable) { return $false }
+    $dir = Split-Path -Parent $Executable
+    if (-not $dir) { return $false }
+    $internal = Join-Path $dir "_internal"
+    return [IO.Directory]::Exists($internal)
+}
+
+function Assert-FrozenMcpCustomerSafeExecutable {
+    param([string]$Executable)
+    if (Test-FrozenMcpOneDirRuntime $Executable) {
+        throw "Frozen MCP executable is a PyInstaller onedir bootloader with sibling _internal runtime. Build a self-contained onefile executable before customer deployment."
+    }
 }
 
 function Invoke-SourceMcpContractCheck {
@@ -960,19 +973,42 @@ if ($Jobs -lt 1) {
 }
 $targetDir = Join-Path $OutputDir "AiDA_CamoufoxReverseMcp"
 $target = Join-Path $targetDir "AiDA_CamoufoxReverseMcp.exe"
+$flatTarget = Join-Path $OutputDir "AiDA_CamoufoxReverseMcp.exe"
+if ($Force -or (Test-FrozenMcpOneDirRuntime $target)) {
+    if ([IO.Directory]::Exists($targetDir)) {
+        Remove-DirectoryInsideWithRetry -Path $targetDir -AllowedRoot $OutputDir
+    }
+    if ([IO.File]::Exists($flatTarget)) {
+        Remove-FileWithRetry -Path $flatTarget
+    }
+}
 if ([IO.File]::Exists($target) -and -not $Force) {
     $inputNewestUtc = Get-FrozenMcpInputNewestWriteTimeUtc -SourceRoot $SourceRoot -BuildScript $PSCommandPath
     if (Test-FrozenMcpTargetFresh -Target $target -InputNewestUtc $inputNewestUtc) {
         try {
+            Assert-FrozenMcpCustomerSafeExecutable $target
             Invoke-FrozenMcpSmoke -Executable $target -RepoRoot $repoRoot
+            $targetHash = Get-FileSha256OrEmpty $target
+            $flatHash = Get-FileSha256OrEmpty $flatTarget
+            if (-not [IO.File]::Exists($flatTarget) -or $targetHash -ne $flatHash) {
+                Copy-Item -LiteralPath $target -Destination $flatTarget -Force
+            }
             Write-Output "frozen_mcp_exists=$target"
             exit 0
         } catch {
             Write-Warning "existing_frozen_mcp_contract_failed=$($_.Exception.Message)"
-            Remove-FileWithRetry -Path $target
+            if ([IO.Directory]::Exists($targetDir)) {
+                Remove-DirectoryInsideWithRetry -Path $targetDir -AllowedRoot $OutputDir
+            } else {
+                Remove-FileWithRetry -Path $target
+            }
         }
     } else {
-        Remove-FileWithRetry -Path $target
+        if ([IO.Directory]::Exists($targetDir)) {
+            Remove-DirectoryInsideWithRetry -Path $targetDir -AllowedRoot $OutputDir
+        } else {
+            Remove-FileWithRetry -Path $target
+        }
     }
 }
 
@@ -983,6 +1019,11 @@ New-Item -ItemType Directory -Force -Path $workRoot | Out-Null
 
 try {
     $script:AidaFrozenMcpVenvPython = ""
+    $selectedBackend = $Backend.ToLowerInvariant()
+    if ($selectedBackend -eq "auto") { $selectedBackend = "pyinstaller" }
+    if ($selectedBackend -eq "nuitka") {
+        $script:AidaFrozenMcpBuildRequirements = $script:AidaFrozenMcpBuildRequirements + @("nuitka", "zstandard", "ordered-set")
+    }
     Ensure-FrozenMcpBuildVenv -PythonExe $Python -SourceRoot $SourceRoot -OutputDir $OutputDir -RepoRoot $repoRoot -Force:$Force
     $venvPython = $script:AidaFrozenMcpVenvPython
     if (-not [IO.File]::Exists($venvPython)) { throw "Reusable Camoufox reverse MCP build venv did not produce python.exe" }
@@ -1332,8 +1373,6 @@ if __name__ == "__main__":
     from camoufox_reverse_mcp.__main__ import main
     raise SystemExit(main())
 '@ | Set-Content -LiteralPath $entry -Encoding UTF8
-    $selectedBackend = $Backend.ToLowerInvariant()
-    if ($selectedBackend -eq "auto") { $selectedBackend = "pyinstaller" }
     if ($selectedBackend -eq "pyinstaller") {
         $pyiWork = Join-Path $workRoot "pyinstaller-work"
         $pyiSpec = Join-Path $workRoot "pyinstaller-spec"
@@ -1365,6 +1404,7 @@ datas, binaries, hiddenimports = collect_all("browserforge", filter_submodules=_
             "--log-level", "ERROR",
             "--console",
             "--noupx",
+            "--onefile",
             "--name", "AiDA_CamoufoxReverseMcp",
             "--distpath", $OutputDir,
             "--workpath", $pyiWork,
@@ -1409,6 +1449,10 @@ datas, binaries, hiddenimports = collect_all("browserforge", filter_submodules=_
             }
             throw "PyInstaller build failed"
         }
+        $built = Join-Path $OutputDir "AiDA_CamoufoxReverseMcp.exe"
+        if (-not [IO.File]::Exists($built)) { throw "PyInstaller onefile output executable was not produced" }
+        New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
+        Copy-Item -LiteralPath $built -Destination $target -Force
     } elseif ($selectedBackend -eq "nuitka") {
         & $venvPython -m nuitka `
             --standalone `
@@ -1444,13 +1488,21 @@ datas, binaries, hiddenimports = collect_all("browserforge", filter_submodules=_
         throw "Unsupported backend: $Backend"
     }
     if (-not [IO.File]::Exists($target)) { throw "Frozen executable was not produced at $target" }
+    Assert-FrozenMcpCustomerSafeExecutable $target
+    Copy-Item -LiteralPath $target -Destination $flatTarget -Force
     Invoke-FrozenMcpSmoke -Executable $target -RepoRoot $repoRoot
+    Copy-Item -LiteralPath $target -Destination $flatTarget -Force
     $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $target).Hash.ToLowerInvariant()
     $size = (Get-Item -LiteralPath $target).Length
+    $flatHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $flatTarget).Hash.ToLowerInvariant()
+    $flatSize = (Get-Item -LiteralPath $flatTarget).Length
     Write-Output "frozen_mcp_backend=$selectedBackend"
     Write-Output "frozen_mcp_built=$target"
     Write-Output "frozen_mcp_size=$size"
     Write-Output "frozen_mcp_sha256=$hash"
+    Write-Output "frozen_mcp_flat=$flatTarget"
+    Write-Output "frozen_mcp_flat_size=$flatSize"
+    Write-Output "frozen_mcp_flat_sha256=$flatHash"
 } finally {
     if ([IO.Directory]::Exists($workRoot)) {
         Remove-Item -LiteralPath $workRoot -Recurse -Force -ErrorAction SilentlyContinue

@@ -473,6 +473,8 @@ test('bootstrap script installs only the verified Camoufox package and parses as
     assert.match(script, /camoufox_mcp_patch_current_ok/);
     assert.match(script, /camoufox_mcp_patch_redownload reason=manifest_mismatch/);
     assert.match(script, /camoufox_mcp_patch_installed/);
+    assert.match(script, /camoufox_mcp_static_onedir_runtime_disallowed/);
+    assert.match(script, /camoufox_mcp_static_self_contained_too_small/);
     assert.match(script, /expected_size=.*actual_size=.*expected_sha256=.*actual_sha256/);
     assert.match(script, /camoufox_sidecar_cache_probe/);
     assert.match(script, /mcp_sha256/);

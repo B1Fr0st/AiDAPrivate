@@ -181,11 +181,12 @@ namespace
         static char s_path[MAX_PATH] = {};
         static bool s_path_init = false;
         if (!s_path_init) {
-            if (!diag::build_log_path("aida_debug.log", s_path, sizeof(s_path))) {
-                strcpy_s(s_path, "aida_debug.log");
-            }
+            if (!diag::build_log_path("aida_debug.log", s_path, sizeof(s_path)))
+                s_path[0] = '\0';
             s_path_init = true;
         }
+        if (s_path[0] == '\0')
+            return;
 
         HANDLE hf = CreateFileA(s_path, FILE_APPEND_DATA | SYNCHRONIZE,
             FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,

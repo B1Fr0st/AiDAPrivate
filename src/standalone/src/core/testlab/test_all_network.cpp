@@ -2041,9 +2041,10 @@ namespace {
     void test_ssl_keylog_watching(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "ssl_kl_watch";
         log_msg(hf, tag, "START -- ssl_keylog start/stop watching lifecycle");
-        char temp_path[MAX_PATH] = {};
-        GetTempPathA(MAX_PATH, temp_path);
-        std::string kl_path = std::string(temp_path) + "aida_test_sslkeylog.log";
+        char keylog_path[MAX_PATH] = {};
+        std::string kl_path;
+        if (diag::build_log_path("aida_test_sslkeylog.log", keylog_path, sizeof(keylog_path)))
+            kl_path = keylog_path;
 
         ssl_keylog::start_watching(kl_path);
         bool watching = ssl_keylog::is_watching();

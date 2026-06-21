@@ -143,19 +143,6 @@ void aida_target_log_set_file(const char* path)
 
     DWORD primary_err = GetLastError();
     write_target_log_open_line_locked(path, false, primary_err);
-
-    char temp_dir[MAX_PATH] = {};
-    DWORD temp_len = GetTempPathA(static_cast<DWORD>(sizeof(temp_dir)), temp_dir);
-    if (temp_len == 0 || temp_len >= sizeof(temp_dir))
-        return;
-
-    char fallback[MAX_PATH] = {};
-    _snprintf_s(fallback, sizeof(fallback), _TRUNCATE, "%saida_testtarget_%lu.log",
-        temp_dir, static_cast<unsigned long>(GetCurrentProcessId()));
-    g_log_file = CreateFileA(fallback, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
-        nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    write_target_log_open_line_locked(fallback, g_log_file != INVALID_HANDLE_VALUE,
-        g_log_file != INVALID_HANDLE_VALUE ? 0 : GetLastError());
 }
 
 void aida_target_log_close()

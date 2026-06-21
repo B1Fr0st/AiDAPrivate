@@ -213,10 +213,10 @@ public:
 private:
 
     json rpc_request(const std::string& method, const json& params = json::object());
-    bool send_rpc(json& out, const json& request);
+    bool send_rpc(json& out, const json& request, int http_read_timeout_sec = 30);
 
 
-    bool send_http(json& out, const json& request);
+    bool send_http(json& out, const json& request, int read_timeout_sec = 30);
     bool send_stdio(json& out, const json& request);
 
     bool perform_remote_handshake();

@@ -864,19 +864,34 @@ bool developer_repo_root_w(const std::wstring& dir)
         directory_exists_w(join_path_w(join_path_w(dir, L"src"), L"standalone"));
 }
 
+void append_developer_repo_candidate(std::vector<std::wstring>& bases, const std::wstring& candidate)
+{
+    if (developer_repo_root_w(candidate))
+        append_unique_path(bases, candidate);
+}
+
 void append_developer_repo_roots(std::vector<std::wstring>& bases, const std::wstring& exe_dir)
 {
     const std::wstring cwd = current_dir_w();
-    if (developer_repo_root_w(cwd))
-        append_unique_path(bases, cwd);
+    append_developer_repo_candidate(bases, cwd);
     const std::wstring parent = parent_dir_w(exe_dir);
-    if (developer_repo_root_w(parent))
-        append_unique_path(bases, parent);
+    append_developer_repo_candidate(bases, parent);
     const std::wstring grandparent = parent_dir_w(parent);
-    if (developer_repo_root_w(grandparent))
-        append_unique_path(bases, grandparent);
-    if (developer_repo_root_w(exe_dir))
-        append_unique_path(bases, exe_dir);
+    append_developer_repo_candidate(bases, grandparent);
+    append_developer_repo_candidate(bases, exe_dir);
+    append_env_path_roots(bases, L"AIDA_DEVELOPER_REPO_ROOT", 1);
+    append_env_path_roots(bases, L"AIDA_REPO_ROOT", 1);
+    std::wstring user_profile;
+    if (read_env_path_w(L"USERPROFILE", user_profile))
+    {
+        append_developer_repo_candidate(bases, join_path_w(user_profile, L"AiDAPrivate"));
+        append_developer_repo_candidate(bases, join_path_w(join_path_w(user_profile, L"source"), L"AiDAPrivate"));
+        append_developer_repo_candidate(bases, join_path_w(join_path_w(join_path_w(user_profile, L"source"), L"repos"), L"AiDAPrivate"));
+    }
+    std::wstring home_drive;
+    std::wstring home_path;
+    if (read_env_path_w(L"HOMEDRIVE", home_drive) && read_env_path_w(L"HOMEPATH", home_path))
+        append_developer_repo_candidate(bases, join_path_w(home_drive + home_path, L"AiDAPrivate"));
 }
 
 std::vector<std::wstring> runtime_base_dirs()
@@ -4628,28 +4643,13 @@ nlohmann::json build_launch_args(const launch_config_t& cfg)
 
 std::string camoufox_debug_log_path()
 {
-    std::string configured;
-    if (read_env_path_a("AIDA_CAMOUFOX_DEBUG_LOG", configured))
-        return configured;
-    if (env_flag_enabled_a("AIDA_FILELESS_LAUNCH"))
-    {
-        wchar_t temp[MAX_PATH + 1] = {};
-        DWORD got = GetTempPathW(MAX_PATH, temp);
-        if (got != 0 && got < MAX_PATH)
-        {
-            std::wstring root = join_path_w(std::wstring(temp), L"AiDA");
-            CreateDirectoryW(root.c_str(), nullptr);
-            std::wstring camoufox_root = join_path_w(root, L"camoufox");
-            CreateDirectoryW(camoufox_root.c_str(), nullptr);
-            std::string out = wide_to_utf8(join_path_w(camoufox_root, L"aida_camoufox_debug.log"));
-            if (!out.empty()) return out;
-        }
-    }
+    char path[MAX_PATH] = {};
+    if (diag::build_log_path("aida_camoufox_debug.log", path, sizeof(path)))
+        return path;
     std::wstring dir = executable_dir_w();
-    if (dir.empty()) dir = current_dir_w();
-    if (dir.empty()) return "aida_camoufox_debug.log";
+    if (dir.empty()) return {};
     std::string out = wide_to_utf8(join_path_w(dir, L"aida_camoufox_debug.log"));
-    return out.empty() ? std::string("aida_camoufox_debug.log") : out;
+    return out;
 }
 
 std::string camoufox_working_dir_path()

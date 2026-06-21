@@ -201,6 +201,7 @@ namespace dispatcher {
     inline volatile ULONG g_heartbeat_fast_intervals = 0;
     inline volatile ULONG g_heartbeat_reentrant = 0;
     inline volatile LONG64 g_hvdt_dispatch_trace_id = 0;
+    inline volatile LONG64 g_tier_a_dispatch_trace_id = 0;
 
     inline volatile LONG64 g_server_token_time = 0;
     inline volatile ULONG g_server_token_hash = 0;
@@ -223,6 +224,10 @@ namespace dispatcher {
 
     __forceinline LONG64 next_hvdt_trace_id() {
         return _InterlockedIncrement64(&g_hvdt_dispatch_trace_id);
+    }
+
+    __forceinline LONG64 next_tier_a_trace_id() {
+        return _InterlockedIncrement64(&g_tier_a_dispatch_trace_id);
     }
 
     __forceinline UINT64 elapsed_us_from_qpc(const LARGE_INTEGER& start, const LARGE_INTEGER& freq) {
@@ -287,6 +292,25 @@ namespace dispatcher {
             return TRUE;
 
         return looks_like_hvdt_buffer_shape(input_size, output_size);
+    }
+
+    __forceinline BOOLEAN looks_like_tier_a_buffer_shape(ULONG input_size, ULONG output_size) {
+        return input_size >= sizeof(phase3_msg::tier_a_query_request_k) &&
+               output_size >= sizeof(phase3_msg::tier_a_query_request_k);
+    }
+
+    __forceinline BOOLEAN is_tier_a_trace_candidate(
+        ULONG code,
+        ULONG input_size,
+        ULONG output_size,
+        const hvdt_ioctl_decode_snapshot_t& decoded,
+        ULONG expected_tira_code)
+    {
+        if (code == expected_tira_code)
+            return TRUE;
+        if (decoded.valid && decoded.offset == 48u)
+            return TRUE;
+        return looks_like_tier_a_buffer_shape(input_size, output_size);
     }
 
     __forceinline void complete_hvdt_trace_irp(
@@ -603,8 +627,38 @@ namespace dispatcher {
         const hvdt_ioctl_decode_snapshot_t early_decode = decode_ioctl_snapshot(early_code);
         const BOOLEAN hvdt_trace = is_hvdt_trace_candidate(early_code, early_input_size, early_output_size, early_decode);
         const LONG64 hvdt_trace_id = hvdt_trace ? next_hvdt_trace_id() : 0;
+        const ULONG early_expected_tira = ioctl_codes::TIRA();
+        const BOOLEAN tier_a_trace = is_tier_a_trace_candidate(early_code, early_input_size, early_output_size, early_decode, early_expected_tira);
+        const LONG64 tier_a_trace_id = tier_a_trace ? next_tier_a_trace_id() : 0;
         LARGE_INTEGER hvdt_dispatch_freq{};
         LARGE_INTEGER hvdt_dispatch_start = KeQueryPerformanceCounter(&hvdt_dispatch_freq);
+        if (tier_a_trace) {
+            WW_LOG("TIRA_DISPATCH_ENTER trace=%lld raw_code=0x%08lx expected_tira=0x%08lx decoded_valid=%u decoded_offset=%lu encoded=0x%lx dyn_base=0x%lx key_hash=0x%08lx ioctl_seed_hash=0x%08lx input_size=%lu output_size=%lu requestor=%u requestor_pid=%llu current_pid=%llu current_tid=%llu cpu=%lu irql=%lu buffer_present=%u device_present=%u shape=%u activated=%ld registered_pid=%llu server_seed_set=%u ioctl_seed_set=%u",
+                tier_a_trace_id,
+                early_code,
+                early_expected_tira,
+                early_decode.valid ? 1u : 0u,
+                early_decode.offset,
+                early_decode.encoded,
+                early_decode.base,
+                early_decode.key_hash,
+                early_decode.ioctl_seed_hash,
+                early_input_size,
+                early_output_size,
+                irp ? static_cast<ULONG>(irp->RequestorMode) : 0xffffffffu,
+                requestor_pid_to_u64(irp),
+                handle_to_u64(PsGetCurrentProcessId()),
+                handle_to_u64(PsGetCurrentThreadId()),
+                KeGetCurrentProcessorNumber(),
+                static_cast<ULONG>(KeGetCurrentIrql()),
+                (irp && irp->AssociatedIrp.SystemBuffer) ? 1u : 0u,
+                device_object ? 1u : 0u,
+                looks_like_tier_a_buffer_shape(early_input_size, early_output_size) ? 1u : 0u,
+                _InterlockedCompareExchange(&g_driver_activated, 0, 0),
+                handle_to_u64(caller_validation::g_registered_client_pid),
+                dynamic_key::g_server_seed != 0 ? 1u : 0u,
+                ioctl_codes::g_server_ioctl_seed != 0 ? 1u : 0u);
+        }
         if (hvdt_trace) {
             HVD_LOG_IMMEDIATE("dispatch_enter trace=%lld step=%lu irp=%p system_buffer=%p raw_code=0x%08lx expected_hvdt=0x%08lx decoded_valid=%u decoded_offset=%lu encoded=0x%lx dyn_base=0x%lx key_hash=0x%08lx ioctl_seed_hash=0x%08lx input_size=%lu output_size=%lu requestor=%u requestor_pid=%llu current_pid=%llu current_tid=%llu cpu=%lu irql=%lu buffer_present=%u device_present=%u shape=%u io_status=0x%08lx io_info=%llu",
                 hvdt_trace_id,
@@ -664,6 +718,15 @@ namespace dispatcher {
                     elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
                     KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql());
             }
+            if (tier_a_trace) {
+                WW_LOG("TIRA_DISPATCH_REJECT trace=%lld phase=dispatch_integrity status=0x%08lx raw_code=0x%08lx expected_tira=0x%08lx elapsed_us=%llu driver_object=%p",
+                    tier_a_trace_id,
+                    STATUS_ACCESS_DENIED,
+                    early_code,
+                    early_expected_tira,
+                    elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                    device_object ? device_object->DriverObject : nullptr);
+            }
             _InterlockedExchange(&g_driver_activated, 0);
             caller_validation::unregister_client();
             irp->IoStatus.Status = STATUS_ACCESS_DENIED;
@@ -688,6 +751,14 @@ namespace dispatcher {
                     hvdt_trace_id, 9u, STATUS_DEVICE_BUSY,
                     elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
                     KeGetCurrentProcessorNumber(), (ULONG)KeGetCurrentIrql());
+            }
+            if (tier_a_trace) {
+                WW_LOG("TIRA_DISPATCH_REJECT trace=%lld phase=rate_limit status=0x%08lx raw_code=0x%08lx requestor_pid=%llu elapsed_us=%llu",
+                    tier_a_trace_id,
+                    STATUS_DEVICE_BUSY,
+                    early_code,
+                    requestor_pid_to_u64(irp),
+                    elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq));
             }
             irp->IoStatus.Status = STATUS_DEVICE_BUSY;
             irp->IoStatus.Information = 0;
@@ -719,6 +790,15 @@ namespace dispatcher {
                     malware_safe::record_denial(caller_pid);
                     WW_MALSAFE_LOG_INFO("DENY ioctl_from_sandbox pid=%lu flags=0x%08X status=0x%08X",
                         (ULONG)(ULONG_PTR)caller_pid, sbx_flags, STATUS_ACCESS_DENIED);
+                    if (tier_a_trace) {
+                        WW_LOG("TIRA_DISPATCH_REJECT trace=%lld phase=sandbox status=0x%08lx caller_pid=%llu client_pid=%llu flags=0x%08lx elapsed_us=%llu",
+                            tier_a_trace_id,
+                            STATUS_ACCESS_DENIED,
+                            handle_to_u64(caller_pid),
+                            handle_to_u64(client_pid),
+                            sbx_flags,
+                            elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq));
+                    }
                     irp->IoStatus.Status = STATUS_ACCESS_DENIED;
                     irp->IoStatus.Information = 0;
                     if (hvdt_trace)
@@ -775,6 +855,7 @@ namespace dispatcher {
 
         NTSTATUS status = STATUS_INVALID_DEVICE_REQUEST;
         ULONG bytes = 0;
+        BOOLEAN tier_a_handler_reached = FALSE;
 
         PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(irp);
 
@@ -815,6 +896,16 @@ namespace dispatcher {
             if (code == ioctl_codes::STRM() || code == ioctl_codes::CKIL()) {
                 WW_LOG("netaction::DISPATCH null_buffer code=0x%08X input_size=%lu output_size=%lu",
                     code, input_size, output_size);
+            }
+            if (tier_a_trace) {
+                WW_LOG("TIRA_DISPATCH_REJECT trace=%lld phase=null_buffer status=0x%08lx raw_code=0x%08lx expected_tira=0x%08lx input_size=%lu output_size=%lu elapsed_us=%llu",
+                    tier_a_trace_id,
+                    STATUS_INVALID_PARAMETER,
+                    code,
+                    early_expected_tira,
+                    input_size,
+                    output_size,
+                    elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq));
             }
             irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
             irp->IoStatus.Information = 0;
@@ -865,6 +956,16 @@ namespace dispatcher {
                     WW_LOG("netaction::DISPATCH secure_header_too_small code=0x%08X input_size=%lu required=%lu",
                         code, input_size, (ULONG)sizeof(secure_comm::SECURE_HEADER));
                 }
+                if (tier_a_trace) {
+                    WW_LOG("TIRA_DISPATCH_REJECT trace=%lld phase=secure_header_too_small status=0x%08lx raw_code=0x%08lx input_size=%lu required=%lu comm_initialized=%ld elapsed_us=%llu",
+                        tier_a_trace_id,
+                        STATUS_ACCESS_DENIED,
+                        code,
+                        input_size,
+                        static_cast<ULONG>(sizeof(secure_comm::SECURE_HEADER)),
+                        _InterlockedCompareExchange(&secure_comm::g_comm_initialized, 0, 0),
+                        elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq));
+                }
                 irp->IoStatus.Status = STATUS_ACCESS_DENIED;
                 irp->IoStatus.Information = 0;
                 if (hvdt_trace)
@@ -908,6 +1009,14 @@ namespace dispatcher {
                     WW_LOG("netaction::DISPATCH secure_work_buffer_alloc_failed code=0x%08X work_size=%llu",
                         code, (ULONG64)work_size);
                 }
+                if (tier_a_trace) {
+                    WW_LOG("TIRA_DISPATCH_REJECT trace=%lld phase=secure_alloc_failed status=0x%08lx raw_code=0x%08lx work_size=%llu elapsed_us=%llu",
+                        tier_a_trace_id,
+                        STATUS_INSUFFICIENT_RESOURCES,
+                        code,
+                        static_cast<UINT64>(work_size),
+                        elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq));
+                }
                 irp->IoStatus.Status = STATUS_INSUFFICIENT_RESOURCES;
                 irp->IoStatus.Information = 0;
                 if (hvdt_trace)
@@ -941,6 +1050,17 @@ namespace dispatcher {
                 if (code == ioctl_codes::STRM() || code == ioctl_codes::CKIL()) {
                     WW_LOG("netaction::DISPATCH secure_decrypt_failed code=0x%08X input_size=%lu work_size=%llu",
                         code, input_size, (ULONG64)work_size);
+                }
+                if (tier_a_trace) {
+                    WW_LOG("TIRA_DISPATCH_REJECT trace=%lld phase=secure_decrypt_failed status=0x%08lx raw_code=0x%08lx input_size=%lu work_size=%llu payload_size=%lu request_id_present=%u elapsed_us=%llu",
+                        tier_a_trace_id,
+                        STATUS_ACCESS_DENIED,
+                        code,
+                        input_size,
+                        static_cast<UINT64>(work_size),
+                        sec_hdr.payload_size,
+                        secure_request_id != 0 ? 1u : 0u,
+                        elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq));
                 }
                 if (hvdt_trace) {
                     HVD_LOG_IMMEDIATE("dispatch_secure_decrypt_post trace=%lld step=%lu ok=0 status=0x%08lx plain_size=%llu elapsed_us=%llu cpu=%lu irql=%lu",
@@ -1002,6 +1122,20 @@ namespace dispatcher {
             if (code == ioctl_codes::STRM() || code == ioctl_codes::CKIL()) {
                 WW_LOG("netaction::DISPATCH session_invalid code=0x%08X g_driver_activated=%ld",
                     code, _InterlockedCompareExchange(&g_driver_activated, 0, 0));
+            }
+            if (tier_a_trace) {
+                WW_LOG("TIRA_DISPATCH_REJECT trace=%lld phase=session_invalid status=0x%08lx raw_code=0x%08lx expected_tira=0x%08lx activated=%ld registered_pid=%llu last_hb_set=%u server_seed_set=%u ioctl_seed_set=%u secure_wrapped=%u elapsed_us=%llu",
+                    tier_a_trace_id,
+                    STATUS_INVALID_DEVICE_REQUEST,
+                    code,
+                    early_expected_tira,
+                    _InterlockedCompareExchange(&g_driver_activated, 0, 0),
+                    handle_to_u64(caller_validation::g_registered_client_pid),
+                    _InterlockedCompareExchange64(&g_last_heartbeat_time, 0, 0) != 0 ? 1u : 0u,
+                    dynamic_key::g_server_seed != 0 ? 1u : 0u,
+                    ioctl_codes::g_server_ioctl_seed != 0 ? 1u : 0u,
+                    secure_wrapped ? 1u : 0u,
+                    elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq));
             }
             if (secure_work_buffer)
                 ExFreePoolWithTag(secure_work_buffer, 'mocS');
@@ -2001,11 +2135,28 @@ namespace dispatcher {
             } else { status = STATUS_INFO_LENGTH_MISMATCH; }
         }
         else if (code == ioctl_codes::TIRA()) {
+            tier_a_handler_reached = TRUE;
             if (input_size >= sizeof(phase3_msg::tier_a_query_request_k) &&
                 output_size >= sizeof(phase3_msg::tier_a_query_request_k)) {
                 auto* req = reinterpret_cast<phase3_msg::tier_a_query_request_k*>(buffer);
                 UINT64 caller_pid = handle_to_u64(PsGetCurrentProcessId());
                 UINT64 registered_pid = handle_to_u64(caller_validation::g_registered_client_pid);
+                WW_LOG("TIRA: handler_entry trace=%lld raw_code=0x%08lx expected_tira=0x%08lx input_size=%lu output_size=%lu session_present=%u session_match=%u caller_pid=%llu registered_pid=%llu activated=%ld secure_wrapped=%u bridge_cmd=0x%08lx bridge_whoswho_seen=%u bridge_sentinel_seen=%u elapsed_us=%llu",
+                    tier_a_trace_id,
+                    code,
+                    early_expected_tira,
+                    input_size,
+                    output_size,
+                    req->session_key != 0 ? 1u : 0u,
+                    req->session_key == g_session_key ? 1u : 0u,
+                    caller_pid,
+                    registered_pid,
+                    _InterlockedCompareExchange(&g_driver_activated, 0, 0),
+                    secure_wrapped ? 1u : 0u,
+                    static_cast<ULONG>(sentinel_bridge::g_bridge.sentinel_cmd),
+                    sentinel_bridge::g_bridge.whoswho_tsc != 0 ? 1u : 0u,
+                    sentinel_bridge::g_bridge.sentinel_tsc != 0 ? 1u : 0u,
+                    elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq));
                 if (req->session_key != g_session_key) {
                     status = STATUS_ACCESS_DENIED;
                     WW_LOG("TIRA: rejected expected_bytes=%llu returned_bytes=%llu session_present=%u session_match=0 caller_pid=%llu registered_pid=%llu elapsed_us=%llu",
@@ -2016,7 +2167,8 @@ namespace dispatcher {
                         registered_pid,
                         elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq));
                 } else {
-                    req->present_flag      = anti_dma_canary::query_tier_a_preloaded() ? 1u : 0u;
+                    BOOLEAN tier_present = anti_dma_canary::query_tier_a_preloaded();
+                    req->present_flag      = tier_present ? 1u : 0u;
                     req->tier_mask         = req->present_flag;
                     req->first_driver_base = 0;
                     status = STATUS_SUCCESS;
@@ -2033,7 +2185,17 @@ namespace dispatcher {
                         elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq));
                 }
                 bytes = sizeof(phase3_msg::tier_a_query_request_k);
-            } else { status = STATUS_INFO_LENGTH_MISMATCH; }
+            } else {
+                WW_LOG("TIRA: size_mismatch trace=%lld raw_code=0x%08lx expected_tira=0x%08lx input_size=%lu output_size=%lu required=%llu elapsed_us=%llu",
+                    tier_a_trace_id,
+                    code,
+                    early_expected_tira,
+                    input_size,
+                    output_size,
+                    static_cast<UINT64>(sizeof(phase3_msg::tier_a_query_request_k)),
+                    elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq));
+                status = STATUS_INFO_LENGTH_MISMATCH;
+            }
         }
         else if (code == ioctl_codes::RECU()) {
             if (input_size >= sizeof(phase3_msg::re_confirmed_usermode_request_k) &&
@@ -2616,14 +2778,29 @@ namespace dispatcher {
                     }
                 } else if (code == base_tira_code && input_size >= sizeof(phase3_msg::tier_a_query_request_k) &&
                     output_size >= sizeof(phase3_msg::tier_a_query_request_k)) {
+                    tier_a_handler_reached = TRUE;
                     HANDLE prev_client = caller_validation::g_registered_client_pid;
                     HANDLE caller_pid = PsGetCurrentProcessId();
                     auto* req = reinterpret_cast<phase3_msg::tier_a_query_request_k*>(buffer);
+                    WW_LOG("TIRA: stale_base_handler_entry trace=%lld raw_code=0x%08lx base_tira=0x%08lx seeded_tira=0x%08lx input_size=%lu output_size=%lu session_present=%u active_match=%u session_match=%u caller_pid=%llu registered_pid=%llu elapsed_us=%llu",
+                        tier_a_trace_id,
+                        code,
+                        base_tira_code,
+                        early_expected_tira,
+                        input_size,
+                        output_size,
+                        req->session_key != 0 ? 1u : 0u,
+                        (prev_client != NULL && prev_client == caller_pid) ? 1u : 0u,
+                        req->session_key == g_session_key ? 1u : 0u,
+                        (unsigned long long)(ULONG_PTR)caller_pid,
+                        (unsigned long long)(ULONG_PTR)prev_client,
+                        elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq));
                     _InterlockedExchange(reinterpret_cast<volatile LONG*>(&dynamic_key::g_server_seed),
                         static_cast<LONG>(orig_server_seed));
                     _InterlockedExchange(reinterpret_cast<volatile LONG*>(&dynamic_key::g_cached_key), 0);
                     if (prev_client != NULL && prev_client == caller_pid && req->session_key == g_session_key) {
-                        req->present_flag      = anti_dma_canary::query_tier_a_preloaded() ? 1u : 0u;
+                        BOOLEAN tier_present = anti_dma_canary::query_tier_a_preloaded();
+                        req->present_flag      = tier_present ? 1u : 0u;
                         req->tier_mask         = req->present_flag;
                         req->first_driver_base = 0;
                         WW_LOG("TIRA: accepted stale base query result=%u expected_bytes=%llu returned_bytes=%llu tier_mask=0x%08X first_base=0x%llX session_present=%u caller_pid=%llu registered_pid=%llu reason=%s elapsed_us=%llu",
@@ -2656,13 +2833,54 @@ namespace dispatcher {
                     _InterlockedExchange(reinterpret_cast<volatile LONG*>(&dynamic_key::g_server_seed),
                         static_cast<LONG>(orig_server_seed));
                     _InterlockedExchange(reinterpret_cast<volatile LONG*>(&dynamic_key::g_cached_key), 0);
+                    if (tier_a_trace) {
+                        WW_LOG("TIRA_DISPATCH_REJECT trace=%lld phase=no_seeded_or_base_match status=0x%08lx raw_code=0x%08lx expected_tira=0x%08lx base_tira=0x%08lx decoded_valid=%u decoded_offset=%lu input_size=%lu output_size=%lu elapsed_us=%llu",
+                            tier_a_trace_id,
+                            STATUS_INVALID_DEVICE_REQUEST,
+                            code,
+                            early_expected_tira,
+                            base_tira_code,
+                            early_decode.valid ? 1u : 0u,
+                            early_decode.offset,
+                            input_size,
+                            output_size,
+                            elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq));
+                    }
                     status = STATUS_INVALID_DEVICE_REQUEST;
                     bytes = 0;
                 }
             } else {
+                if (tier_a_trace) {
+                    WW_LOG("TIRA_DISPATCH_REJECT trace=%lld phase=no_dynamic_seed status=0x%08lx raw_code=0x%08lx expected_tira=0x%08lx decoded_valid=%u decoded_offset=%lu input_size=%lu output_size=%lu elapsed_us=%llu",
+                        tier_a_trace_id,
+                        STATUS_INVALID_DEVICE_REQUEST,
+                        code,
+                        early_expected_tira,
+                        early_decode.valid ? 1u : 0u,
+                        early_decode.offset,
+                        input_size,
+                        output_size,
+                        elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq));
+                }
                 status = STATUS_INVALID_DEVICE_REQUEST;
                 bytes = 0;
             }
+        }
+
+        if (tier_a_trace) {
+            WW_LOG("TIRA_DISPATCH_PRE_COMPLETE trace=%lld raw_code=0x%08lx expected_tira=0x%08lx status=0x%08lx bytes=%lu handler_reached=%u secure_wrapped=%u activated=%ld registered_pid=%llu bridge_whoswho_seen=%u bridge_sentinel_seen=%u elapsed_us=%llu",
+                tier_a_trace_id,
+                code,
+                early_expected_tira,
+                status,
+                bytes,
+                tier_a_handler_reached ? 1u : 0u,
+                secure_wrapped ? 1u : 0u,
+                _InterlockedCompareExchange(&g_driver_activated, 0, 0),
+                handle_to_u64(caller_validation::g_registered_client_pid),
+                sentinel_bridge::g_bridge.whoswho_tsc != 0 ? 1u : 0u,
+                sentinel_bridge::g_bridge.sentinel_tsc != 0 ? 1u : 0u,
+                elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq));
         }
 
         if (hvdt_trace && code != early_decode.expected_hvdt_code) {

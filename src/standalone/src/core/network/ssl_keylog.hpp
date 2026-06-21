@@ -67,9 +67,10 @@ inline launch_result launch_with_keylog(const std::string& exe_path,
 
     std::string kpath = keylog_path;
     if (kpath.empty()) {
-        char temp[MAX_PATH] = {};
-        GetTempPathA(MAX_PATH, temp);
-        kpath = std::string(temp) + "aida_sslkeylog_" + std::to_string(GetCurrentProcessId()) + ".log";
+        const std::string name = "aida_sslkeylog_" + std::to_string(GetCurrentProcessId()) + ".log";
+        char path[MAX_PATH] = {};
+        if (diag::build_log_path(name.c_str(), path, sizeof(path)))
+            kpath = path;
     }
     result.keylog_path = kpath;
 

@@ -300,7 +300,7 @@ namespace self_protect {
             return false;
 
         if (nt_version::is_windows_11_or_newer()) {
-            SN_LOG("self_protect::clean_piddb_cache skip_windows11 build=%lu",
+            SN_LOG("self_protect::clean_piddb_cache fail_closed_windows11 build=%lu reason=unverified_piddb_table_lock_pair",
                 nt_version::build_number());
             return false;
         }
@@ -520,7 +520,7 @@ namespace self_protect {
             return false;
 
         if (nt_version::is_windows_11_or_newer()) {
-            SN_LOG("self_protect::clean_mm_unloaded_drivers skip_windows11 build=%lu",
+            SN_LOG("self_protect::clean_mm_unloaded_drivers fail_closed_windows11 build=%lu reason=unverified_mm_unloaded_lock_and_pattern_ambiguity",
                 nt_version::build_number());
             return false;
         }
@@ -623,7 +623,7 @@ namespace self_protect {
 
     __forceinline bool clean_kernel_hash_buckets(PVOID nt_base, PUNICODE_STRING driver_name) {
         if (nt_version::is_windows_11_or_newer()) {
-            SN_LOG("self_protect::clean_kernel_hash_buckets skip_windows11 build=%lu",
+            SN_LOG("self_protect::clean_kernel_hash_buckets fail_closed_windows11 build=%lu reason=kernel_hash_target_unproven_primary_pattern_resolves_loaded_module_list",
                 nt_version::build_number());
             return false;
         }
@@ -748,6 +748,16 @@ namespace self_protect {
             return (g_pool_big_page_table != nullptr);
         }
 
+        if (nt_version::is_windows_11_or_newer()) {
+            g_pool_big_page_table = nullptr;
+            g_pool_big_page_table_size = nullptr;
+            KeMemoryBarrier();
+            _InterlockedExchange(&g_big_pool_resolved, 2);
+            SN_LOG("self_protect::resolve_big_pool_table fail_closed_windows11 build=%lu reason=self_hide_big_pool_write_path_unverified",
+                nt_version::build_number());
+            return false;
+        }
+
         static const UCHAR pat[] = {
             0x48, 0x8B, 0x05, 0x00, 0x00, 0x00, 0x00,
             0x48, 0x85, 0xC0
@@ -796,7 +806,7 @@ namespace self_protect {
             return false;
 
         if (nt_version::is_windows_11_or_newer()) {
-            SN_LOG("self_protect::clean_big_pool_table skip_windows11 build=%lu",
+            SN_LOG("self_protect::clean_big_pool_table fail_closed_windows11 build=%lu reason=self_driver_big_pool_hide_unverified",
                 nt_version::build_number());
             return false;
         }

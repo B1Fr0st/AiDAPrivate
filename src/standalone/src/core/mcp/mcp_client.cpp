@@ -785,11 +785,14 @@ static httplib::Result do_https_get(const parsed_url_t& url, const httplib::Head
 
 static httplib::Result do_https_post(const std::string& origin, const std::string& path,
                                      const httplib::Headers& hdrs,
-                                     const std::string& body, const std::string& content_type)
+                                     const std::string& body, const std::string& content_type,
+                                     int read_timeout_sec = 30)
 {
     httplib::Client cli(origin);
     cli.set_connection_timeout(15);
-    cli.set_read_timeout(30);
+    if (read_timeout_sec < 30) read_timeout_sec = 30;
+    if (read_timeout_sec > 180) read_timeout_sec = 180;
+    cli.set_read_timeout(read_timeout_sec);
     cli.set_write_timeout(15);
     const bool is_https_origin = origin.rfind("https://", 0) == 0;
     cli.enable_server_certificate_verification(is_https_origin);
@@ -1417,6 +1420,38 @@ std::vector<remote_tool_t> client_t::list_tools()
     return _cached_tools;
 }
 
+namespace {
+
+int tool_call_read_timeout_sec(const json& arguments)
+{
+    int timeout_ms = 0;
+    if (arguments.is_object())
+    {
+        for (const char* key : {"call_timeout_ms", "timeout_ms", "evaluate_timeout_ms", "timeout"})
+        {
+            auto it = arguments.find(key);
+            if (it == arguments.end())
+                continue;
+            try
+            {
+                if (it->is_number_integer())
+                    timeout_ms = (std::max)(timeout_ms, it->get<int>());
+                else if (it->is_number())
+                    timeout_ms = (std::max)(timeout_ms, static_cast<int>(it->get<double>()));
+            }
+            catch (...) {}
+        }
+    }
+    if (timeout_ms <= 0)
+        return 30;
+    int seconds = (timeout_ms + 999) / 1000 + 10;
+    if (seconds < 30) seconds = 30;
+    if (seconds > 180) seconds = 180;
+    return seconds;
+}
+
+}
+
 call_result_t client_t::call_tool(const std::string& tool_name, const json& arguments)
 {
     diag::log_tagged_fmt("mcp", "call_tool enter server='%s' tool='%s'",
@@ -1434,7 +1469,8 @@ call_result_t client_t::call_tool(const std::string& tool_name, const json& argu
     });
 
     json response;
-    if (!send_rpc(response, req)) {
+    const int http_read_timeout_sec = tool_call_read_timeout_sec(arguments);
+    if (!send_rpc(response, req, http_read_timeout_sec)) {
         diag::log_tagged_fmt("mcp", "call_tool RPC_FAILED server='%s' tool='%s' error='%s'",
             _cfg.name.c_str(), tool_name.c_str(), _last_error.c_str());
         return call_result_t::error("tools/call failed: " + _last_error);
@@ -1719,11 +1755,11 @@ json client_t::rpc_request(const std::string& method, const json& params)
     return req;
 }
 
-bool client_t::send_rpc(json& out, const json& request)
+bool client_t::send_rpc(json& out, const json& request, int http_read_timeout_sec)
 {
     switch (_cfg.transport) {
     case transport_type_t::http_sse:
-        return send_http(out, request);
+        return send_http(out, request, http_read_timeout_sec);
     case transport_type_t::stdio:
         return send_stdio(out, request);
     default:
@@ -1789,7 +1825,7 @@ bool client_t::refresh_access_token_locked()
 }
 
 
-bool client_t::send_http(json& out, const json& request)
+bool client_t::send_http(json& out, const json& request, int read_timeout_sec)
 {
     ensure_access_token_fresh_locked();
 
@@ -1825,7 +1861,7 @@ bool client_t::send_http(json& out, const json& request)
         return headers;
     };
 
-    auto res = do_https_post(purl.origin, post_path, build_headers(), body, "application/json");
+    auto res = do_https_post(purl.origin, post_path, build_headers(), body, "application/json", read_timeout_sec);
 
     if (res && (res->status == 401 || res->status == 403)) {
         bool refreshed = false;
@@ -1838,7 +1874,7 @@ bool client_t::send_http(json& out, const json& request)
             }
         }
         if (refreshed) {
-            res = do_https_post(purl.origin, post_path, build_headers(), body, "application/json");
+            res = do_https_post(purl.origin, post_path, build_headers(), body, "application/json", read_timeout_sec);
         }
     }
 

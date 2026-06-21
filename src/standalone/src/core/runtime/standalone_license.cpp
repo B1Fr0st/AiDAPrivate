@@ -126,12 +126,12 @@ static void lic_log(const char* step)
     static INIT_ONCE s_once = INIT_ONCE_STATIC_INIT;
     BOOL pending;
     InitOnceBeginInitialize(&s_once, INIT_ONCE_ASYNC, &pending, nullptr);
-    if (pending || s_log_path[0] == '\0') {
-        if (!diag::build_log_path("aida_debug.log", s_log_path, sizeof(s_log_path))) {
-            strcpy_s(s_log_path, "aida_debug.log");
-        }
+    if (pending) {
+        if (!diag::build_log_path("aida_debug.log", s_log_path, sizeof(s_log_path)))
+            s_log_path[0] = '\0';
         InitOnceComplete(&s_once, INIT_ONCE_ASYNC, nullptr);
     }
+    if (s_log_path[0] == '\0') return;
 
     HANDLE hf = CreateFileA(s_log_path, FILE_APPEND_DATA | SYNCHRONIZE,
         FILE_SHARE_READ | FILE_SHARE_WRITE,

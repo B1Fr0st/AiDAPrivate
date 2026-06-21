@@ -165,18 +165,6 @@ static void wide_to_utf8(const wchar_t* in, char* out, size_t cap)
         _snprintf_s(out, cap, _TRUNCATE, "<wide_conversion_failed_gle_%lu>", GetLastError());
 }
 
-static bool ensure_dir(const wchar_t* path)
-{
-    if (!path || path[0] == L'\0')
-        return false;
-    DWORD attr = GetFileAttributesW(path);
-    if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY))
-        return true;
-    if (CreateDirectoryW(path, nullptr))
-        return true;
-    return GetLastError() == ERROR_ALREADY_EXISTS;
-}
-
 static bool build_exe_log_path(wchar_t* out, size_t cap)
 {
     if (!out || cap == 0)
@@ -191,44 +179,6 @@ static bool build_exe_log_path(wchar_t* out, size_t cap)
         return false;
     *(last + 1) = L'\0';
     _snwprintf_s(out, cap, _TRUNCATE, L"%saida_early_startup.log", exe);
-    return out[0] != L'\0';
-}
-
-static bool build_local_log_path(wchar_t* out, size_t cap)
-{
-    if (!out || cap == 0)
-        return false;
-    out[0] = L'\0';
-    wchar_t base[MAX_PATH] = {};
-    DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH)
-        return false;
-    wchar_t root[MAX_PATH] = {};
-    wchar_t logs[MAX_PATH] = {};
-    _snwprintf_s(root, _countof(root), _TRUNCATE, L"%s\\AiDA", base);
-    if (!ensure_dir(root))
-        return false;
-    _snwprintf_s(logs, _countof(logs), _TRUNCATE, L"%s\\logs", root);
-    if (!ensure_dir(logs))
-        return false;
-    _snwprintf_s(out, cap, _TRUNCATE, L"%s\\aida_early_startup.log", logs);
-    return out[0] != L'\0';
-}
-
-static bool build_temp_log_path(wchar_t* out, size_t cap)
-{
-    if (!out || cap == 0)
-        return false;
-    out[0] = L'\0';
-    wchar_t base[MAX_PATH] = {};
-    DWORD n = GetTempPathW(MAX_PATH, base);
-    if (n == 0 || n >= MAX_PATH)
-        return false;
-    wchar_t root[MAX_PATH] = {};
-    _snwprintf_s(root, _countof(root), _TRUNCATE, L"%sAiDA", base);
-    if (!ensure_dir(root))
-        return false;
-    _snwprintf_s(out, cap, _TRUNCATE, L"%s\\aida_early_startup.log", root);
     return out[0] != L'\0';
 }
 
@@ -390,10 +340,6 @@ static void write_line(const char* event_name, const char* detail)
 
     wchar_t path[MAX_PATH] = {};
     if (build_exe_log_path(path, _countof(path)))
-        append_file(path, line);
-    if (build_local_log_path(path, _countof(path)))
-        append_file(path, line);
-    if (build_temp_log_path(path, _countof(path)))
         append_file(path, line);
 
     g_write_active.store(0, std::memory_order_release);

@@ -24,8 +24,6 @@
 
 namespace diag {
 
-inline bool ensure_dir_exists(const char* dir);
-
 inline bool append_trailing_slash(char* path, size_t path_size)
 {
     if (!path || path_size == 0) return false;
@@ -101,68 +99,7 @@ inline bool is_debug_log_name(const char* file_name)
 
 inline const char* effective_log_file_name(const char* file_name)
 {
-    char fileless_path[MAX_PATH] = {};
-    if (is_debug_log_name(file_name) &&
-        (env_flag_enabled("AIDA_FILELESS_LAUNCH") ||
-         env_value_present("AIDA_FILELESS_DEBUG_LOG_PATH", fileless_path, static_cast<DWORD>(sizeof(fileless_path))))) {
-        return "aida_debug_fileless.log";
-    }
     return file_name;
-}
-
-inline bool resolve_env_log_path(const char* env_name, char* out, size_t out_size)
-{
-    if (!out || out_size == 0) return false;
-    out[0] = '\0';
-    char path[MAX_PATH] = {};
-    DWORD n = GetEnvironmentVariableA(env_name, path, static_cast<DWORD>(sizeof(path)));
-    if (n == 0 || n >= sizeof(path)) return false;
-    const char* slash = std::strrchr(path, '\\');
-    const char* fslash = std::strrchr(path, '/');
-    const char* last = slash && fslash ? (slash > fslash ? slash : fslash) : (slash ? slash : fslash);
-    if (!last || last == path) return false;
-    char dir[MAX_PATH] = {};
-    size_t dir_len = static_cast<size_t>(last - path);
-    if (dir_len == 0 || dir_len >= sizeof(dir)) return false;
-    std::memcpy(dir, path, dir_len);
-    dir[dir_len] = '\0';
-    if (!ensure_dir_exists(dir)) return false;
-    _snprintf_s(out, out_size, _TRUNCATE, "%s", path);
-    return out[0] != '\0';
-}
-
-inline bool resolve_env_log_dir(const char* env_name, char* out, size_t out_size)
-{
-    if (!out || out_size == 0) return false;
-    char dir[MAX_PATH] = {};
-    DWORD n = GetEnvironmentVariableA(env_name, dir, static_cast<DWORD>(sizeof(dir)));
-    if (n == 0 || n >= sizeof(dir)) return false;
-    if (!ensure_dir_exists(dir)) return false;
-    return copy_log_dir(out, out_size, dir);
-}
-
-inline bool resolve_desktop_log_dir(char* out, size_t out_size)
-{
-    if (!out || out_size == 0) return false;
-    char desktop[MAX_PATH] = {};
-    DWORD n = GetEnvironmentVariableA("AIDA_FILELESS_DEBUG_LOG_PATH", desktop, static_cast<DWORD>(sizeof(desktop)));
-    if (n > 0 && n < sizeof(desktop)) {
-        char* last = std::strrchr(desktop, '\\');
-        if (last) {
-            *last = '\0';
-            if (ensure_dir_exists(desktop))
-                return copy_log_dir(out, out_size, desktop);
-        }
-    }
-    n = GetEnvironmentVariableA("AIDA_FILELESS_LOG_DIR", desktop, static_cast<DWORD>(sizeof(desktop)));
-    if (n > 0 && n < sizeof(desktop) && ensure_dir_exists(desktop))
-        return copy_log_dir(out, out_size, desktop);
-    char user[MAX_PATH] = {};
-    n = GetEnvironmentVariableA("USERPROFILE", user, static_cast<DWORD>(sizeof(user)));
-    if (n == 0 || n >= sizeof(user)) return false;
-    _snprintf_s(desktop, sizeof(desktop), _TRUNCATE, "%s\\Desktop", user);
-    if (!ensure_dir_exists(desktop)) return false;
-    return copy_log_dir(out, out_size, desktop);
 }
 
 inline bool resolve_module_log_dir(char* out, size_t out_size)
@@ -184,27 +121,13 @@ inline const char* resolve_log_dir()
     static char s_cached[MAX_PATH] = {};
     static bool s_ready = false;
     if (s_ready) return s_cached;
-    char debug_env[MAX_PATH] = {};
-    bool fileless = env_flag_enabled("AIDA_FILELESS_LAUNCH");
-    bool has_debug_env = env_value_present("AIDA_FILELESS_DEBUG_LOG_PATH", debug_env, static_cast<DWORD>(sizeof(debug_env)));
-    if (has_debug_env) fileless = true;
-    if (fileless && resolve_desktop_log_dir(s_cached, sizeof(s_cached))) {
-        remember_log_source(has_debug_env ? "fileless_debug_env" : "fileless_desktop", true);
-        s_ready = true;
-        return s_cached;
-    }
-    if (!fileless && resolve_module_log_dir(s_cached, sizeof(s_cached))) {
+    if (resolve_module_log_dir(s_cached, sizeof(s_cached))) {
         remember_log_source("exe_dir", false);
         s_ready = true;
         return s_cached;
     }
-    if (fileless && resolve_env_log_dir("AIDA_FILELESS_LOG_DIR", s_cached, sizeof(s_cached))) {
-        remember_log_source("fileless_env_dir", true);
-        s_ready = true;
-        return s_cached;
-    }
     s_cached[0] = '\0';
-    remember_log_source(fileless ? "fileless_unresolved" : "unresolved", fileless);
+    remember_log_source("unresolved", false);
     s_ready = true;
     return s_cached;
 }
@@ -213,53 +136,11 @@ inline bool build_log_path(const char* file_name, char* out, size_t out_size)
 {
     if (!file_name || !out || out_size == 0) return false;
     out[0] = '\0';
-    char fileless_path_env[MAX_PATH] = {};
-    const bool fileless = env_flag_enabled("AIDA_FILELESS_LAUNCH") ||
-        env_value_present("AIDA_FILELESS_DEBUG_LOG_PATH", fileless_path_env, static_cast<DWORD>(sizeof(fileless_path_env)));
-    if (fileless &&
-        is_debug_log_name(file_name) &&
-        resolve_env_log_path("AIDA_FILELESS_DEBUG_LOG_PATH", out, out_size)) {
-        return true;
-    }
     file_name = effective_log_file_name(file_name);
     const char* dir = resolve_log_dir();
     if (!dir || dir[0] == '\0') return false;
     _snprintf_s(out, out_size, _TRUNCATE, "%s%s", dir, file_name);
     return out[0] != '\0';
-}
-
-inline bool ensure_dir_exists(const char* dir)
-{
-    if (!dir || dir[0] == '\0') return false;
-    DWORD attr = GetFileAttributesA(dir);
-    if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) return true;
-    if (CreateDirectoryA(dir, nullptr)) return true;
-    return GetLastError() == ERROR_ALREADY_EXISTS;
-}
-
-inline bool resolve_local_log_dir(char* out, size_t out_size)
-{
-    if (!out || out_size == 0) return false;
-    out[0] = '\0';
-    char base[MAX_PATH] = {};
-    DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", base, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH) return false;
-    char root[MAX_PATH] = {};
-    _snprintf_s(root, sizeof(root), _TRUNCATE, "%s\\AiDA", base);
-    if (!ensure_dir_exists(root)) return false;
-    _snprintf_s(out, out_size, _TRUNCATE, "%s\\logs", root);
-    return ensure_dir_exists(out);
-}
-
-inline bool resolve_temp_log_dir(char* out, size_t out_size)
-{
-    if (!out || out_size == 0) return false;
-    out[0] = '\0';
-    char base[MAX_PATH] = {};
-    DWORD n = GetTempPathA(MAX_PATH, base);
-    if (n == 0 || n >= MAX_PATH) return false;
-    _snprintf_s(out, out_size, _TRUNCATE, "%sAiDA", base);
-    return ensure_dir_exists(out);
 }
 
 inline void archive_existing_debug_log_once(const char* file_name, const char* path)
@@ -302,21 +183,7 @@ inline HANDLE open_log_handle(const char* file_name, DWORD desired_access, DWORD
 {
     constexpr DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
     char path[MAX_PATH] = {};
-    char fileless_path_env[MAX_PATH] = {};
-    const bool fileless = env_flag_enabled("AIDA_FILELESS_LAUNCH") ||
-        env_value_present("AIDA_FILELESS_DEBUG_LOG_PATH", fileless_path_env, static_cast<DWORD>(sizeof(fileless_path_env)));
     file_name = effective_log_file_name(file_name);
-    if (fileless &&
-        is_debug_log_name(file_name) &&
-        resolve_env_log_path("AIDA_FILELESS_DEBUG_LOG_PATH", path, sizeof(path))) {
-        archive_existing_debug_log_once(file_name, path);
-        HANDLE hf = CreateFileA(path, desired_access, share, nullptr, creation, flags, nullptr);
-        if (hf != INVALID_HANDLE_VALUE) {
-            remember_log_source("fileless_debug_env", true);
-            remember_log_path(path);
-            return hf;
-        }
-    }
     const char* exe_dir = resolve_log_dir();
     if (exe_dir && exe_dir[0] != '\0') {
         _snprintf_s(path, sizeof(path), _TRUNCATE, "%s%s", exe_dir, file_name);
@@ -327,37 +194,7 @@ inline HANDLE open_log_handle(const char* file_name, DWORD desired_access, DWORD
             return hf;
         }
     }
-
-    char dir[MAX_PATH] = {};
-    if (resolve_local_log_dir(dir, sizeof(dir))) {
-        _snprintf_s(path, sizeof(path), _TRUNCATE, "%s\\%s", dir, file_name);
-        archive_existing_debug_log_once(file_name, path);
-        HANDLE hf = CreateFileA(path, desired_access, share, nullptr, creation, flags, nullptr);
-        if (hf != INVALID_HANDLE_VALUE) {
-            remember_log_source(fileless ? "fileless_localappdata" : "localappdata", fileless);
-            remember_log_path(path);
-            return hf;
-        }
-    }
-
-    if (resolve_temp_log_dir(dir, sizeof(dir))) {
-        _snprintf_s(path, sizeof(path), _TRUNCATE, "%s\\%s", dir, file_name);
-        archive_existing_debug_log_once(file_name, path);
-        HANDLE hf = CreateFileA(path, desired_access, share, nullptr, creation, flags, nullptr);
-        if (hf != INVALID_HANDLE_VALUE) {
-            remember_log_source(fileless ? "fileless_temp" : "temp", fileless);
-            remember_log_path(path);
-            return hf;
-        }
-    }
-
-    archive_existing_debug_log_once(file_name, file_name);
-    HANDLE hf = CreateFileA(file_name, desired_access, share, nullptr, creation, flags, nullptr);
-    if (hf != INVALID_HANDLE_VALUE) {
-        remember_log_source(fileless ? "fileless_cwd" : "cwd", fileless);
-        remember_log_path(file_name);
-    }
-    return hf;
+    return INVALID_HANDLE_VALUE;
 }
 
 inline std::mutex& log_file_mutex()

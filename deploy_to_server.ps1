@@ -497,14 +497,15 @@ function Get-CamoufoxSidecarInputs([string]$ReleaseDir) {
         (Join-Path $RepoRoot ".deps\$browserName")
     ) -Directory
     $mcp = Find-FirstExistingPath @(
+        (Join-Path $ReleaseDir "deps\AiDA_CamoufoxReverseMcp.exe"),
+        (Join-Path $RepoRoot ".deps\AiDA_CamoufoxReverseMcp.exe"),
+        (Join-Path $RepoRoot "build-ninja\deps\AiDA_CamoufoxReverseMcp.exe"),
         (Join-Path $ReleaseDir "deps\AiDA_CamoufoxReverseMcp\AiDA_CamoufoxReverseMcp.exe"),
         (Join-Path $RepoRoot ".deps\AiDA_CamoufoxReverseMcp\AiDA_CamoufoxReverseMcp.exe"),
         (Join-Path $RepoRoot "build-ninja\deps\AiDA_CamoufoxReverseMcp\AiDA_CamoufoxReverseMcp.exe"),
-        (Join-Path $ReleaseDir "deps\AiDA_CamoufoxReverseMcp.exe"),
         (Join-Path $ReleaseDir "deps\camoufox-reverse-mcp.exe"),
         (Join-Path $RepoRoot "camoufox-reverse-mcp\dist\AiDA_CamoufoxReverseMcp.exe"),
         (Join-Path $RepoRoot "camoufox-reverse-mcp\dist\camoufox-reverse-mcp.exe"),
-        (Join-Path $RepoRoot ".deps\AiDA_CamoufoxReverseMcp.exe"),
         (Join-Path $RepoRoot ".deps\camoufox-reverse-mcp.exe"),
         (Join-Path $RepoRoot "AiDA_CamoufoxReverseMcp.exe"),
         (Join-Path $RepoRoot "camoufox-reverse-mcp.exe")
@@ -535,7 +536,14 @@ function Assert-CamoufoxSidecarInputs([pscustomobject]$Inputs) {
     if (-not $Inputs.McpExe -or -not (Test-Path -LiteralPath $Inputs.McpExe -PathType Leaf)) {
         Stop-Deploy "Frozen Camoufox reverse MCP executable is missing. Build .deps\AiDA_CamoufoxReverseMcp\AiDA_CamoufoxReverseMcp.exe first."
     }
+    $mcpDir = Split-Path -Parent $Inputs.McpExe
+    if ($mcpDir -and (Test-Path -LiteralPath (Join-Path $mcpDir "_internal") -PathType Container)) {
+        Stop-Deploy "Frozen Camoufox reverse MCP executable is a PyInstaller onedir bootloader with sibling _internal runtime. Build the self-contained onefile executable before customer deployment."
+    }
     $size = (Get-Item -LiteralPath $Inputs.McpExe).Length
+    if ($size -lt 33554432) {
+        Stop-Deploy "Frozen Camoufox reverse MCP executable is too small to be the customer self-contained bridge: $size bytes"
+    }
     if ($size -le 0 -or $size -gt 268435456) {
         Stop-Deploy "Frozen Camoufox reverse MCP executable size is invalid: $size bytes"
     }

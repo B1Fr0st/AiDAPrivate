@@ -106,6 +106,78 @@ namespace pool_scrub {
         return reinterpret_cast<PVOID>(ip + total_size + disp);
     }
 
+    __forceinline bool nt_section_contains(PVOID nt_base, PVOID address, SIZE_T bytes, ULONG required_characteristics) {
+        if (!nt_base || !address || bytes == 0 || !_MmIsAddressValid(nt_base) || !_MmIsAddressValid(address))
+            return false;
+
+        __try {
+            PIMAGE_DOS_HEADER dos = static_cast<PIMAGE_DOS_HEADER>(nt_base);
+            if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+                return false;
+
+            PIMAGE_NT_HEADERS64 nt = reinterpret_cast<PIMAGE_NT_HEADERS64>(
+                static_cast<UCHAR*>(nt_base) + dos->e_lfanew);
+            if (!_MmIsAddressValid(nt) || nt->Signature != IMAGE_NT_SIGNATURE)
+                return false;
+
+            ULONG_PTR target = reinterpret_cast<ULONG_PTR>(address);
+            if (target + bytes < target)
+                return false;
+
+            PIMAGE_SECTION_HEADER sections = IMAGE_FIRST_SECTION(nt);
+            for (USHORT i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+                if ((sections[i].Characteristics & required_characteristics) != required_characteristics)
+                    continue;
+
+                SIZE_T section_size = sections[i].Misc.VirtualSize;
+                if (section_size == 0)
+                    section_size = sections[i].SizeOfRawData;
+                if (section_size == 0)
+                    continue;
+
+                ULONG_PTR start = reinterpret_cast<ULONG_PTR>(nt_base) + sections[i].VirtualAddress;
+                ULONG_PTR end = start + section_size;
+                if (end < start)
+                    continue;
+
+                if (target >= start && target + bytes <= end)
+                    return true;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+
+        return false;
+    }
+
+    __forceinline bool validate_big_pool_table_sample(PVOID table, ULONGLONG size64) {
+        if (!table || size64 == 0 || size64 > 0x100000ULL || !_MmIsAddressValid(table))
+            return false;
+
+        ULONG probes = size64 < 64 ? static_cast<ULONG>(size64) : 64;
+        if (probes == 0)
+            return false;
+
+        __try {
+            for (ULONG i = 0; i < probes; ++i) {
+                volatile UCHAR* entry = static_cast<volatile UCHAR*>(table) + (static_cast<SIZE_T>(i) * 0x20);
+                if (!_MmIsAddressValid((PVOID)entry) || !_MmIsAddressValid((PVOID)(entry + 0x1F)))
+                    return false;
+
+                ULONGLONG va = *reinterpret_cast<volatile ULONGLONG*>(entry);
+                ULONGLONG number_of_bytes = *reinterpret_cast<volatile ULONGLONG*>(entry + 0x10);
+                ULONG_PTR normalized_va = static_cast<ULONG_PTR>(va & ~1ULL);
+                if (normalized_va != 0 && normalized_va < 0xFFFF800000000000ULL)
+                    return false;
+                if (number_of_bytes > 0x100000000ULL)
+                    return false;
+            }
+            return true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+    }
+
     __forceinline bool resolve_big_pool_table_win11(PVOID nt_base) {
         if (!nt_base || !_MmIsAddressValid(nt_base))
             return false;
@@ -126,40 +198,99 @@ namespace pool_scrub {
         };
 
         PIMAGE_SECTION_HEADER sections = IMAGE_FIRST_SECTION(nt);
+        PVOID selected_table = nullptr;
+        ULONG selected_size = 0;
+        PVOID selected_found = nullptr;
+        ULONG raw_candidates = 0;
+        ULONG valid_candidates = 0;
+
         for (USHORT s = 0; s < nt->FileHeader.NumberOfSections; s++) {
             if (!(sections[s].Characteristics & IMAGE_SCN_MEM_EXECUTE))
                 continue;
 
             PVOID section_base = static_cast<UCHAR*>(nt_base) + sections[s].VirtualAddress;
             ULONG section_size = sections[s].Misc.VirtualSize;
-            PVOID found = find_pattern_safe(section_base, section_size, pat, "xxx????xxx????xxx");
-            if (!found)
-                continue;
+            ULONG search_offset = 0;
 
-            PVOID table_ptr = resolve_relative(found, 3, 7);
-            PVOID size_ptr = resolve_relative(static_cast<UCHAR*>(found) + 7, 3, 7);
-            if (!table_ptr || !size_ptr || !_MmIsAddressValid(table_ptr) || !_MmIsAddressValid(size_ptr))
-                continue;
+            for (;;) {
+                if (search_offset >= section_size)
+                    break;
 
-            PVOID table = *static_cast<PVOID*>(table_ptr);
-            if (!table || !_MmIsAddressValid(table))
-                continue;
+                PVOID search_base = static_cast<UCHAR*>(section_base) + search_offset;
+                ULONG remaining = section_size - search_offset;
+                PVOID found = find_pattern_safe(search_base, remaining, pat, "xxx????xxx????xxx");
+                if (!found)
+                    break;
 
-            ULONGLONG size64 = *static_cast<ULONGLONG*>(size_ptr);
-            if (size64 == 0 || size64 > 0x1000000ULL)
-                continue;
+                raw_candidates++;
+                PVOID table_ptr = resolve_relative(found, 3, 7);
+                PVOID size_ptr = resolve_relative(static_cast<UCHAR*>(found) + 7, 3, 7);
+                bool globals_valid =
+                    table_ptr && size_ptr &&
+                    nt_section_contains(nt_base, table_ptr, sizeof(PVOID), IMAGE_SCN_MEM_WRITE) &&
+                    nt_section_contains(nt_base, size_ptr, sizeof(ULONGLONG), IMAGE_SCN_MEM_WRITE) &&
+                    reinterpret_cast<ULONG_PTR>(size_ptr) == reinterpret_cast<ULONG_PTR>(table_ptr) + sizeof(PVOID);
 
-            g_big_pool_table = static_cast<volatile UCHAR*>(table);
-            g_big_pool_table_size = static_cast<ULONG>(size64);
+                PVOID table = nullptr;
+                ULONGLONG size64 = 0;
+                if (globals_valid) {
+                    __try {
+                        table = *static_cast<PVOID*>(table_ptr);
+                        size64 = *static_cast<ULONGLONG*>(size_ptr);
+                    } __except (EXCEPTION_EXECUTE_HANDLER) {
+                        table = nullptr;
+                        size64 = 0;
+                    }
+                }
+
+                bool sample_valid = globals_valid && validate_big_pool_table_sample(table, size64);
+                SN_LOG("pool_scrub::resolve_big_pool_table_win11 candidate section=%u found=%p table_ptr=%p size_ptr=%p table=%p size=%llu globals=%u sample=%u raw=%lu valid_count=%lu",
+                    s,
+                    found,
+                    table_ptr,
+                    size_ptr,
+                    table,
+                    static_cast<unsigned long long>(size64),
+                    globals_valid ? 1u : 0u,
+                    sample_valid ? 1u : 0u,
+                    raw_candidates,
+                    valid_candidates + (sample_valid ? 1u : 0u));
+
+                if (sample_valid) {
+                    valid_candidates++;
+                    if (valid_candidates == 1) {
+                        selected_table = table;
+                        selected_size = static_cast<ULONG>(size64);
+                        selected_found = found;
+                    }
+                }
+
+                ULONG consumed = static_cast<ULONG>(
+                    static_cast<UCHAR*>(found) - static_cast<UCHAR*>(section_base)) + 1;
+                if (consumed <= search_offset || consumed >= section_size)
+                    break;
+                search_offset = consumed;
+            }
+        }
+
+        if (valid_candidates == 1 && selected_table && selected_size != 0) {
+            g_big_pool_table = static_cast<volatile UCHAR*>(selected_table);
+            g_big_pool_table_size = selected_size;
             g_big_pool_entry_stride = 0x20;
-            SN_LOG("pool_scrub::resolve_big_pool_table_win11 table=%p size=%lu stride=%lu",
+            SN_LOG("pool_scrub::resolve_big_pool_table_win11 selected found=%p table=%p size=%lu stride=%lu raw=%lu",
+                selected_found,
                 (PVOID)g_big_pool_table,
                 g_big_pool_table_size,
-                g_big_pool_entry_stride);
+                g_big_pool_entry_stride,
+                raw_candidates);
             return true;
         }
 
-        SN_LOG("pool_scrub::resolve_big_pool_table_win11 miss");
+        SN_LOG("pool_scrub::resolve_big_pool_table_win11 fail_closed raw=%lu valid=%lu selected=%p size=%lu",
+            raw_candidates,
+            valid_candidates,
+            selected_table,
+            selected_size);
         return false;
     }
 
@@ -269,15 +400,30 @@ namespace pool_scrub {
                 if (!va || va == (PVOID)1)
                     continue;
 
+                ULONG_PTR normalized_va = reinterpret_cast<ULONG_PTR>(va) & ~1ULL;
+                if (normalized_va < 0xFFFF800000000000ULL)
+                    continue;
+
                 ULONG key = *reinterpret_cast<volatile ULONG*>(entry + 8);
                 if (key == 0)
                     continue;
 
+                if (g_big_pool_entry_stride == 0x20) {
+                    ULONGLONG number_of_bytes = *reinterpret_cast<volatile ULONGLONG*>(entry + 0x10);
+                    if (number_of_bytes == 0 || number_of_bytes > 0x100000000ULL)
+                        continue;
+                }
 
                 for (ULONG t = 0; t < TAG_MAP_COUNT; t++) {
                     if (key == g_tag_map[t].original_tag) {
 
-
+                        SN_LOG("pool_scrub::scrub_tags replace index=%lu entry=%p va=%p old=0x%08lx new=0x%08lx stride=%lu",
+                            i,
+                            (PVOID)entry,
+                            va,
+                            key,
+                            g_tag_map[t].replacement_tag,
+                            g_big_pool_entry_stride);
                         *reinterpret_cast<volatile ULONG*>(entry + 8) =
                             g_tag_map[t].replacement_tag;
                         break;
@@ -295,15 +441,20 @@ namespace pool_scrub {
         if (!nt_base)
             return false;
 
-        resolve_big_pool_table(nt_base);
+        bool resolved = resolve_big_pool_table(nt_base);
         SN_LOG("pool_scrub::init: big_pool_table=%p size=%lu",
             (PVOID)g_big_pool_table, g_big_pool_table_size);
 
-        scrub_tags();
+        if (resolved)
+            scrub_tags();
+        else
+            SN_LOG("pool_scrub::init: fail_closed reason=big_pool_table_unresolved build=%lu",
+                nt_version::build_number());
 
         _InterlockedExchange(&g_initialized, 1);
-        SN_LOG("pool_scrub::init: SUCCESS");
-        return true;
+        SN_LOG("pool_scrub::init: done resolved=%u",
+            resolved ? 1u : 0u);
+        return resolved;
     }
 
     __forceinline void periodic_scrub() {

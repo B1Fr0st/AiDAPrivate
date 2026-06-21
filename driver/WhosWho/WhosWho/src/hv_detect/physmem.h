@@ -2,6 +2,7 @@
 #include "physmem_decl.h"
 #include "page_table_helpers.h"
 #include "win_helpers.h"
+#include "../function/KernelLayout.h"
 
 namespace physmem {
 
@@ -218,18 +219,33 @@ namespace physmem {
 				__rdtsc());
 			PEPROCESS sys_process = PsInitialSystemProcess;
 			PEPROCESS curr_entry = sys_process;
+			SIZE_T unique_pid_offset = whoswho_kernel_layout::eprocess_unique_process_id_offset();
+			SIZE_T active_links_offset = whoswho_kernel_layout::eprocess_active_process_links_offset();
+			SIZE_T active_threads_offset = whoswho_kernel_layout::eprocess_active_threads_offset();
+			if (unique_pid_offset == 0 || active_links_offset == 0 || active_threads_offset == 0) {
+				HVD_LOG_IMMEDIATE("physmem_get_cr3_exit ok=0 target_pid=%llu reason=unsupported_eprocess_layout build=%lu unique=0x%llx active=0x%llx threads=0x%llx elapsed_us=%llu cpu=%lu irql=%lu",
+					target_pid,
+					whoswho_kernel_layout::build_number(),
+					static_cast<unsigned long long>(unique_pid_offset),
+					static_cast<unsigned long long>(active_links_offset),
+					static_cast<unsigned long long>(active_threads_offset),
+					trace_elapsed_us(start, freq),
+					KeGetCurrentProcessorNumber(),
+					(ULONG)KeGetCurrentIrql());
+				return 0;
+			}
 
 			do {
 				uint64_t curr_pid;
 
-				memcpy(&curr_pid, (void*)((uintptr_t)curr_entry + 0x440), sizeof(curr_pid));
+				memcpy(&curr_pid, (void*)((uintptr_t)curr_entry + unique_pid_offset), sizeof(curr_pid));
 
 
 				if (target_pid == curr_pid) {
 
 					uint32_t active_threads;
 
-					memcpy((void*)&active_threads, (void*)((uintptr_t)curr_entry + 0x5f0), sizeof(active_threads));
+					memcpy((void*)&active_threads, (void*)((uintptr_t)curr_entry + active_threads_offset), sizeof(active_threads));
 
 					if (active_threads || target_pid == 4) {
 						uint64_t cr3;
@@ -248,8 +264,8 @@ namespace physmem {
 					}
 				}
 
-				PLIST_ENTRY list = (PLIST_ENTRY)((uintptr_t)(curr_entry)+0x448);
-				curr_entry = (PEPROCESS)((uintptr_t)list->Flink - 0x448);
+				PLIST_ENTRY list = (PLIST_ENTRY)((uintptr_t)(curr_entry)+active_links_offset);
+				curr_entry = (PEPROCESS)((uintptr_t)list->Flink - active_links_offset);
 			} while (curr_entry != sys_process);
 
 			HVD_LOG_IMMEDIATE("physmem_get_cr3_exit ok=0 target_pid=%llu elapsed_us=%llu cpu=%lu irql=%lu",

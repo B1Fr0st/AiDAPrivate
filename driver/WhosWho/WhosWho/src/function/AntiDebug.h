@@ -3,6 +3,7 @@
 #include <intrin.h>
 #include "../imports/Defs.h"
 #include <function/CoreSecurity.h>
+#include "KernelLayout.h"
 #include "SentinelBridge.h"
 #include "impl/AntiDumpKernel.h"
 
@@ -846,11 +847,22 @@ namespace anti_debug {
 
         __try {
             UINT8* eprocess = (UINT8*)process;
-            volatile PVOID* debug_port = (volatile PVOID*)(eprocess + 0x578);
+            SIZE_T debug_port_offset = whoswho_kernel_layout::eprocess_debug_port_offset();
+            if (debug_port_offset == 0) {
+                WW_LOG("anti_debug: debug port inspect fail_closed pid=%u build=%lu reason=unsupported_eprocess_layout",
+                    pid,
+                    whoswho_kernel_layout::build_number());
+                ObDereferenceObject(process);
+                return STATUS_NOT_SUPPORTED;
+            }
+            volatile PVOID* debug_port = (volatile PVOID*)(eprocess + debug_port_offset);
             if (_MmIsAddressValid((PVOID)debug_port) && *debug_port != nullptr) {
                 UINT64 port_value = reinterpret_cast<UINT64>(*debug_port);
                 UINT32 port_tag = static_cast<UINT32>((port_value >> 32) ^ port_value ^ 0x0A1DAD57u);
-                WW_LOG("anti_debug: debug port present for pid=%u tag=0x%08X", pid, port_tag);
+                WW_LOG("anti_debug: debug port present for pid=%u offset=0x%llx tag=0x%08X",
+                    pid,
+                    static_cast<unsigned long long>(debug_port_offset),
+                    port_tag);
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             status = STATUS_UNSUCCESSFUL;
@@ -881,7 +893,16 @@ namespace anti_debug {
                 osver.dwMajorVersion * 1000 + osver.dwMinorVersion,
                 osver.dwBuildNumber);
 
-            volatile PVOID* instr_cb = (volatile PVOID*)(eprocess + 0x460);
+            SIZE_T instr_offset = whoswho_kernel_layout::eprocess_instrumentation_callback_offset();
+            if (instr_offset == 0) {
+                WW_LOG("[INSTR-DUMP] fail_closed pid=%u build=%lu reason=unsupported_eprocess_layout",
+                    pid,
+                    whoswho_kernel_layout::build_number());
+                ObDereferenceObject(process);
+                return STATUS_NOT_SUPPORTED;
+            }
+
+            volatile PVOID* instr_cb = (volatile PVOID*)(eprocess + instr_offset);
             PVOID cur = *instr_cb;
             BOOLEAN is_canonical = (cur == nullptr) ||
                 ((UINT64)cur < 0x00007FFFFFFFFFFull) ||
@@ -892,7 +913,8 @@ namespace anti_debug {
             UINT64 own_value = reinterpret_cast<UINT64>(g_instrumentation_callback);
             UINT32 own_tag = static_cast<UINT32>((own_value >> 32) ^ own_value ^ 0x0A1DA461u);
 
-            WW_LOG("[INSTR-DUMP] offset=0x460 present=%d is_canonical=%d matches_own=%d cur_tag=0x%08X own_tag=0x%08X",
+            WW_LOG("[INSTR-DUMP] offset=0x%llx present=%d is_canonical=%d matches_own=%d cur_tag=0x%08X own_tag=0x%08X",
+                static_cast<unsigned long long>(instr_offset),
                 cur != nullptr ? 1 : 0,
                 is_canonical ? 1 : 0,
                 (cur == g_instrumentation_callback) ? 1 : 0,
@@ -906,7 +928,10 @@ namespace anti_debug {
                 WW_LOG("[INSTR-DUMP] foreign cb observed inspect_only pid=%u cur_tag=0x%08X own_tag=0x%08X",
                     pid, cur_tag, own_tag);
             } else {
-                WW_LOG("[INSTR-DUMP] no foreign cb at 0x460 for pid=%u present=%d", pid, cur != nullptr ? 1 : 0);
+                WW_LOG("[INSTR-DUMP] no foreign cb at offset=0x%llx for pid=%u present=%d",
+                    static_cast<unsigned long long>(instr_offset),
+                    pid,
+                    cur != nullptr ? 1 : 0);
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             WW_LOG("[INSTR-DUMP] EXCEPTION during dump for pid=%u", pid);
@@ -976,9 +1001,16 @@ namespace continuous_anti_debug {
                     __try {
 
 
-                        ULONG_PTR* debug_port_ptr = (ULONG_PTR*)((UINT8*)target_proc + 0x578);
-                        if (_MmIsAddressValid(debug_port_ptr) && *debug_port_ptr != 0)
-                            target_being_debugged = TRUE;
+                        SIZE_T debug_port_offset = whoswho_kernel_layout::eprocess_debug_port_offset();
+                        if (debug_port_offset == 0) {
+                            WW_LOG("[CONT-ADBG] debug_port fail_closed pid=%u build=%lu reason=unsupported_eprocess_layout",
+                                pid,
+                                whoswho_kernel_layout::build_number());
+                        } else {
+                            ULONG_PTR* debug_port_ptr = (ULONG_PTR*)((UINT8*)target_proc + debug_port_offset);
+                            if (_MmIsAddressValid(debug_port_ptr) && *debug_port_ptr != 0)
+                                target_being_debugged = TRUE;
+                        }
                     } __except (EXCEPTION_EXECUTE_HANDLER) {}
                     ObDereferenceObject(target_proc);
                 }

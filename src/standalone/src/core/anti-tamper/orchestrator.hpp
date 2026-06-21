@@ -284,6 +284,18 @@ struct seh_capture_t
     ULONG_PTR info[EXCEPTION_MAXIMUM_PARAMETERS] = {};
 };
 
+inline bool is_windows_11_or_newer()
+{
+    using rtl_get_version_t = LONG(WINAPI*)(PRTL_OSVERSIONINFOW);
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    auto fn = ntdll ? reinterpret_cast<rtl_get_version_t>(GetProcAddress(ntdll, "RtlGetVersion")) : nullptr;
+    if (!fn)
+        return false;
+    RTL_OSVERSIONINFOW ver{};
+    ver.dwOSVersionInfoSize = sizeof(ver);
+    return fn(&ver) == 0 && ver.dwBuildNumber >= 22000;
+}
+
 static int capture_seh_exception(EXCEPTION_POINTERS* ep, seh_capture_t* out)
 {
     if (out && ep && ep->ExceptionRecord)
@@ -1908,20 +1920,30 @@ inline bool initialize()
             if (lock_ok)
             {
                 uint64_t canary_register_tick = GetTickCount64();
+                const bool win11_or_newer = is_windows_11_or_newer();
                 webhook::write_log_critical_fmt("init",
-                    "canary_register_pre pid=%lu tid=%lu tick=%llu va=%p size=0x%X",
+                    "canary_register_pre pid=%lu tid=%lu tick=%llu va=%p size=0x%X win11_or_newer=%d",
                     GetCurrentProcessId(),
                     GetCurrentThreadId(),
                     static_cast<unsigned long long>(canary_register_tick),
                     canary,
-                    4096u);
+                    4096u,
+                    win11_or_newer ? 1 : 0);
                 BOOL register_bool = FALSE;
-                register_seh = seh_canary_register(canary,
-                    4096,
-                    &register_bool,
-                    &register_error,
-                    &register_exception);
-                register_ok = register_seh == 0 && register_bool != FALSE;
+                if (win11_or_newer)
+                {
+                    register_error = ERROR_NOT_SUPPORTED;
+                    webhook::write_log("init", "canary_register_skipped_windows11");
+                }
+                else
+                {
+                    register_seh = seh_canary_register(canary,
+                        4096,
+                        &register_bool,
+                        &register_error,
+                        &register_exception);
+                    register_ok = register_seh == 0 && register_bool != FALSE;
+                }
                 webhook::write_log_critical_fmt("init",
                     "canary_register_post ok=%d err=%lu seh=0x%08lX elapsed_ms=%llu va=%p size=0x%X",
                     register_ok ? 1 : 0,

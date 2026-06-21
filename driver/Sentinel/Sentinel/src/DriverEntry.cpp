@@ -60,6 +60,39 @@ static ULONG init_elapsed_us(const LARGE_INTEGER& start, const LARGE_INTEGER& fr
     return static_cast<ULONG>(((now.QuadPart - start.QuadPart) * 1000000ULL) / static_cast<ULONGLONG>(freq.QuadPart));
 }
 
+static ULONG init_read_kuser_u32(ULONG offset)
+{
+    ULONG value = 0;
+    __try {
+        volatile ULONG* ptr = reinterpret_cast<volatile ULONG*>(0xFFFFF78000000000ULL + offset);
+        value = *ptr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        value = 0;
+    }
+    return value;
+}
+
+static void init_log_driverentry_phase(const char* phase, const LARGE_INTEGER& start, const LARGE_INTEGER& freq)
+{
+    ULONG build = init_read_kuser_u32(0x260) & 0xFFFFu;
+    ULONG ci_options = init_read_kuser_u32(0x3A8);
+    SN_LOG("DriverEntryPhase phase=%s elapsed_us=%lu pid=%llu tid=%llu irql=%lu cpu=%lu build=%lu ci_options=0x%08lx hvci=%u ci_enabled=%u target_base=%p target_size=0x%lx target_object=%p bridge=%p",
+        phase ? phase : "unknown",
+        init_elapsed_us(start, freq),
+        init_handle_to_u64(PsGetCurrentProcessId()),
+        init_handle_to_u64(PsGetCurrentThreadId()),
+        static_cast<ULONG>(KeGetCurrentIrql()),
+        KeGetCurrentProcessorNumber(),
+        build,
+        ci_options,
+        (ci_options & hvci_detect::CI_OPTION_HVCI_KMCI_ENABLED) || (ci_options & hvci_detect::CI_OPTION_HVCI_STRICT) ? 1u : 0u,
+        (ci_options & 0x1u) ? 1u : 0u,
+        (PVOID)g_target_driver_base,
+        g_target_driver_size,
+        (PVOID)g_target_driver_object,
+        heartbeat::g_bridge);
+}
+
 static HANDLE init_object_protected_pid()
 {
     return reinterpret_cast<HANDLE>(
@@ -248,87 +281,223 @@ static BOOLEAN build_target_device_name(WCHAR* buffer, SIZE_T buffer_count) {
     const WCHAR* base_name = bases[seed % (sizeof(bases) / sizeof(bases[0]))];
     pos += copy_wstr(buffer + pos, buffer_count - pos, base_name);
     append_decimal_suffix(buffer, buffer_count, pos, seed >> 4);
+    SN_LOG("init_thread: target_device_name_built name=%ws base=%ws seed=0x%08lx build=%lu ci_options=0x%08lx",
+        buffer,
+        base_name,
+        seed,
+        init_read_kuser_u32(0x260) & 0xFFFFu,
+        init_read_kuser_u32(0x3A8));
     return TRUE;
 }
 
 static BOOLEAN extract_target_driver_image_candidate(PDRIVER_OBJECT driver_object, PDEVICE_OBJECT device_object, PVOID* out_base, ULONG* out_size) {
-    if (!driver_object || !device_object || !out_base || !out_size)
+    LARGE_INTEGER freq = {};
+    LARGE_INTEGER start = KeQueryPerformanceCounter(&freq);
+    SN_LOG("extract_target_driver_image_candidate: entry driver=%p device=%p out_base=%p out_size=%p irql=%lu pid=%llu tid=%llu",
+        driver_object,
+        device_object,
+        out_base,
+        out_size,
+        static_cast<ULONG>(KeGetCurrentIrql()),
+        init_handle_to_u64(PsGetCurrentProcessId()),
+        init_handle_to_u64(PsGetCurrentThreadId()));
+    if (!driver_object || !device_object || !out_base || !out_size) {
+        SN_LOG("extract_target_driver_image_candidate: reject reason=null_arg driver=%p device=%p elapsed_us=%lu",
+            driver_object,
+            device_object,
+            init_elapsed_us(start, freq));
         return FALSE;
+    }
 
     __try {
-        if (!_MmIsAddressValid(driver_object) || !_MmIsAddressValid(device_object))
+        BOOLEAN driver_valid = _MmIsAddressValid(driver_object) ? TRUE : FALSE;
+        BOOLEAN device_valid = _MmIsAddressValid(device_object) ? TRUE : FALSE;
+        if (!driver_valid || !device_valid) {
+            SN_LOG("extract_target_driver_image_candidate: reject reason=invalid_object driver_valid=%u device_valid=%u elapsed_us=%lu",
+                driver_valid ? 1u : 0u,
+                device_valid ? 1u : 0u,
+                init_elapsed_us(start, freq));
             return FALSE;
+        }
 
-        if (device_object->DriverObject != driver_object)
+        if (device_object->DriverObject != driver_object) {
+            SN_LOG("extract_target_driver_image_candidate: reject reason=device_driver_mismatch device_driver=%p expected=%p elapsed_us=%lu",
+                device_object->DriverObject,
+                driver_object,
+                init_elapsed_us(start, freq));
             return FALSE;
+        }
 
-        if (!driver_object->DriverSection || !_MmIsAddressValid(driver_object->DriverSection))
+        if (!driver_object->DriverSection || !_MmIsAddressValid(driver_object->DriverSection)) {
+            SN_LOG("extract_target_driver_image_candidate: reject reason=invalid_driver_section section=%p elapsed_us=%lu",
+                driver_object->DriverSection,
+                init_elapsed_us(start, freq));
             return FALSE;
+        }
 
         PLDR_DATA_TABLE_ENTRY ldr = static_cast<PLDR_DATA_TABLE_ENTRY>(driver_object->DriverSection);
-        if (!_MmIsAddressValid(ldr) || !ldr->DllBase || ldr->SizeOfImage == 0)
+        if (!_MmIsAddressValid(ldr) || !ldr->DllBase || ldr->SizeOfImage == 0) {
+            SN_LOG("extract_target_driver_image_candidate: reject reason=invalid_ldr ldr=%p base=%p size=0x%lx elapsed_us=%lu",
+                ldr,
+                ldr && _MmIsAddressValid(ldr) ? ldr->DllBase : nullptr,
+                ldr && _MmIsAddressValid(ldr) ? ldr->SizeOfImage : 0,
+                init_elapsed_us(start, freq));
             return FALSE;
+        }
 
         PVOID base = ldr->DllBase;
         ULONG size = ldr->SizeOfImage;
         if (reinterpret_cast<ULONG_PTR>(base) < 0xFFFF800000000000ULL ||
-            size > 50 * 1024 * 1024)
+            size > 50 * 1024 * 1024) {
+            SN_LOG("extract_target_driver_image_candidate: reject reason=range base=%p size=0x%lx elapsed_us=%lu",
+                base,
+                size,
+                init_elapsed_us(start, freq));
             return FALSE;
+        }
 
-        if (!_MmIsAddressValid(base))
+        if (!_MmIsAddressValid(base)) {
+            SN_LOG("extract_target_driver_image_candidate: reject reason=base_invalid base=%p size=0x%lx elapsed_us=%lu",
+                base,
+                size,
+                init_elapsed_us(start, freq));
             return FALSE;
+        }
 
         PIMAGE_DOS_HEADER dos = static_cast<PIMAGE_DOS_HEADER>(base);
-        if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+            SN_LOG("extract_target_driver_image_candidate: reject reason=bad_dos base=%p magic=0x%04x elapsed_us=%lu",
+                base,
+                dos->e_magic,
+                init_elapsed_us(start, freq));
             return FALSE;
+        }
 
         PIMAGE_NT_HEADERS64 nt = reinterpret_cast<PIMAGE_NT_HEADERS64>(
             static_cast<UCHAR*>(base) + dos->e_lfanew);
-        if (!_MmIsAddressValid(nt) || nt->Signature != IMAGE_NT_SIGNATURE)
+        if (!_MmIsAddressValid(nt) || nt->Signature != IMAGE_NT_SIGNATURE) {
+            SN_LOG("extract_target_driver_image_candidate: reject reason=bad_nt nt=%p valid=%u elapsed_us=%lu",
+                nt,
+                _MmIsAddressValid(nt) ? 1u : 0u,
+                init_elapsed_us(start, freq));
             return FALSE;
+        }
 
         PDRIVER_DISPATCH create_handler = driver_object->MajorFunction[IRP_MJ_CREATE];
         PDRIVER_DISPATCH ioctl_handler = driver_object->MajorFunction[IRP_MJ_DEVICE_CONTROL];
-        if (!create_handler || !ioctl_handler)
+        if (!create_handler || !ioctl_handler) {
+            SN_LOG("extract_target_driver_image_candidate: reject reason=missing_dispatch create=%p ioctl=%p elapsed_us=%lu",
+                create_handler,
+                ioctl_handler,
+                init_elapsed_us(start, freq));
             return FALSE;
+        }
 
         if (reinterpret_cast<ULONG_PTR>(create_handler) < 0xFFFF800000000000ULL ||
-            reinterpret_cast<ULONG_PTR>(ioctl_handler) < 0xFFFF800000000000ULL)
+            reinterpret_cast<ULONG_PTR>(ioctl_handler) < 0xFFFF800000000000ULL) {
+            SN_LOG("extract_target_driver_image_candidate: reject reason=dispatch_user_range create=%p ioctl=%p elapsed_us=%lu",
+                create_handler,
+                ioctl_handler,
+                init_elapsed_us(start, freq));
             return FALSE;
+        }
 
         *out_base = base;
         *out_size = size;
+        SN_LOG("extract_target_driver_image_candidate: accept driver=%p device=%p base=%p end=%p size=0x%lx create=%p ioctl=%p sections=%u elapsed_us=%lu",
+            driver_object,
+            device_object,
+            base,
+            static_cast<UCHAR*>(base) + size,
+            size,
+            create_handler,
+            ioctl_handler,
+            nt->FileHeader.NumberOfSections,
+            init_elapsed_us(start, freq));
         return TRUE;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
+        SN_LOG("extract_target_driver_image_candidate: exception code=0x%08lx driver=%p device=%p elapsed_us=%lu",
+            GetExceptionCode(),
+            driver_object,
+            device_object,
+            init_elapsed_us(start, freq));
         return FALSE;
     }
 }
 
 static BOOLEAN validate_target_driver_object(PDRIVER_OBJECT driver_object, PVOID target_base) {
-    if (!driver_object || !target_base || !_MmIsAddressValid(driver_object))
+    LARGE_INTEGER freq = {};
+    LARGE_INTEGER start = KeQueryPerformanceCounter(&freq);
+    if (!driver_object || !target_base || !_MmIsAddressValid(driver_object)) {
+        SN_LOG("validate_target_driver_object: reject reason=invalid_arg driver=%p target_base=%p elapsed_us=%lu",
+            driver_object,
+            target_base,
+            init_elapsed_us(start, freq));
         return FALSE;
+    }
 
     __try {
-        if (!driver_object->DriverSection || !_MmIsAddressValid(driver_object->DriverSection))
+        if (!driver_object->DriverSection || !_MmIsAddressValid(driver_object->DriverSection)) {
+            SN_LOG("validate_target_driver_object: reject reason=invalid_section driver=%p section=%p elapsed_us=%lu",
+                driver_object,
+                driver_object->DriverSection,
+                init_elapsed_us(start, freq));
             return FALSE;
+        }
 
         PLDR_DATA_TABLE_ENTRY ldr = static_cast<PLDR_DATA_TABLE_ENTRY>(driver_object->DriverSection);
-        if (!_MmIsAddressValid(ldr) || ldr->DllBase != target_base)
+        if (!_MmIsAddressValid(ldr) || ldr->DllBase != target_base) {
+            SN_LOG("validate_target_driver_object: reject reason=base_mismatch ldr=%p ldr_base=%p target_base=%p elapsed_us=%lu",
+                ldr,
+                _MmIsAddressValid(ldr) ? ldr->DllBase : nullptr,
+                target_base,
+                init_elapsed_us(start, freq));
             return FALSE;
+        }
 
         PDEVICE_OBJECT device = driver_object->DeviceObject;
-        if (!device || !_MmIsAddressValid(device) || device->DriverObject != driver_object)
+        if (!device || !_MmIsAddressValid(device) || device->DriverObject != driver_object) {
+            SN_LOG("validate_target_driver_object: reject reason=device_invalid device=%p device_valid=%u device_driver=%p expected=%p elapsed_us=%lu",
+                device,
+                device && _MmIsAddressValid(device) ? 1u : 0u,
+                device && _MmIsAddressValid(device) ? device->DriverObject : nullptr,
+                driver_object,
+                init_elapsed_us(start, freq));
             return FALSE;
+        }
 
         PDRIVER_DISPATCH create_handler = driver_object->MajorFunction[IRP_MJ_CREATE];
         PDRIVER_DISPATCH ioctl_handler = driver_object->MajorFunction[IRP_MJ_DEVICE_CONTROL];
-        if (!create_handler || !ioctl_handler)
+        if (!create_handler || !ioctl_handler) {
+            SN_LOG("validate_target_driver_object: reject reason=missing_dispatch create=%p ioctl=%p elapsed_us=%lu",
+                create_handler,
+                ioctl_handler,
+                init_elapsed_us(start, freq));
             return FALSE;
+        }
 
         if (reinterpret_cast<ULONG_PTR>(create_handler) < 0xFFFF800000000000ULL ||
-            reinterpret_cast<ULONG_PTR>(ioctl_handler) < 0xFFFF800000000000ULL)
+            reinterpret_cast<ULONG_PTR>(ioctl_handler) < 0xFFFF800000000000ULL) {
+            SN_LOG("validate_target_driver_object: reject reason=dispatch_user_range create=%p ioctl=%p elapsed_us=%lu",
+                create_handler,
+                ioctl_handler,
+                init_elapsed_us(start, freq));
             return FALSE;
+        }
+        SN_LOG("validate_target_driver_object: accept driver=%p device=%p base=%p size=0x%lx create=%p ioctl=%p elapsed_us=%lu",
+            driver_object,
+            device,
+            target_base,
+            ldr->SizeOfImage,
+            create_handler,
+            ioctl_handler,
+            init_elapsed_us(start, freq));
     } __except (EXCEPTION_EXECUTE_HANDLER) {
+        SN_LOG("validate_target_driver_object: exception code=0x%08lx driver=%p target_base=%p elapsed_us=%lu",
+            GetExceptionCode(),
+            driver_object,
+            target_base,
+            init_elapsed_us(start, freq));
         return FALSE;
     }
 
@@ -336,21 +505,41 @@ static BOOLEAN validate_target_driver_object(PDRIVER_OBJECT driver_object, PVOID
 }
 
 static PDRIVER_OBJECT resolve_target_driver_object_from_device(PVOID target_base) {
-    if (!target_base || KeGetCurrentIrql() != PASSIVE_LEVEL)
+    LARGE_INTEGER freq = {};
+    LARGE_INTEGER start = KeQueryPerformanceCounter(&freq);
+    if (!target_base || KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        SN_LOG("find_target_driver_object: device_resolve_skipped target_base=%p irql=%lu elapsed_us=%lu",
+            target_base,
+            static_cast<ULONG>(KeGetCurrentIrql()),
+            init_elapsed_us(start, freq));
         return nullptr;
+    }
 
     WCHAR device_name_buffer[80] = {};
-    if (!build_target_device_name(device_name_buffer, sizeof(device_name_buffer) / sizeof(device_name_buffer[0])))
+    if (!build_target_device_name(device_name_buffer, sizeof(device_name_buffer) / sizeof(device_name_buffer[0]))) {
+        SN_LOG("find_target_driver_object: device_name_build_failed target_base=%p elapsed_us=%lu",
+            target_base,
+            init_elapsed_us(start, freq));
         return nullptr;
+    }
 
     UNICODE_STRING device_name;
     RtlInitUnicodeString(&device_name, device_name_buffer);
+    SN_LOG("find_target_driver_object: device_resolve_begin target_base=%p device=%wZ elapsed_us=%lu",
+        target_base,
+        &device_name,
+        init_elapsed_us(start, freq));
 
     PFILE_OBJECT file_object = nullptr;
     PDEVICE_OBJECT device_object = nullptr;
     NTSTATUS status = IoGetDeviceObjectPointer(&device_name, FILE_READ_DATA, &file_object, &device_object);
     if (!NT_SUCCESS(status) || !file_object || !device_object) {
-        SN_LOG("find_target_driver_object: device_resolve_failed status=0x%08lx", status);
+        SN_LOG("find_target_driver_object: device_resolve_failed status=0x%08lx device=%wZ file=%p device_object=%p elapsed_us=%lu",
+            status,
+            &device_name,
+            file_object,
+            device_object,
+            init_elapsed_us(start, freq));
         if (file_object)
             ObDereferenceObject(file_object);
         return nullptr;
@@ -365,33 +554,54 @@ static PDRIVER_OBJECT resolve_target_driver_object_from_device(PVOID target_base
     }
 
     BOOLEAN valid = validate_target_driver_object(driver_object, target_base);
-    SN_LOG("find_target_driver_object: device_resolve status=0x%08lx valid=%u", status, valid ? 1u : 0u);
+    SN_LOG("find_target_driver_object: device_resolve status=0x%08lx valid=%u device=%wZ file=%p device_object=%p driver=%p elapsed_us=%lu",
+        status,
+        valid ? 1u : 0u,
+        &device_name,
+        file_object,
+        device_object,
+        driver_object,
+        init_elapsed_us(start, freq));
     ObDereferenceObject(file_object);
 
     return valid ? driver_object : nullptr;
 }
 
 static BOOLEAN discover_target_driver_from_device() {
+    LARGE_INTEGER freq = {};
+    LARGE_INTEGER start = KeQueryPerformanceCounter(&freq);
     if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
-        SN_LOG("init_thread: device_discovery_skipped irql=%lu", static_cast<unsigned long>(KeGetCurrentIrql()));
+        SN_LOG("init_thread: device_discovery_skipped irql=%lu elapsed_us=%lu",
+            static_cast<unsigned long>(KeGetCurrentIrql()),
+            init_elapsed_us(start, freq));
         return FALSE;
     }
 
     WCHAR device_name_buffer[80] = {};
     if (!build_target_device_name(device_name_buffer, sizeof(device_name_buffer) / sizeof(device_name_buffer[0]))) {
-        SN_LOG("init_thread: device_discovery_name_build_failed");
+        SN_LOG("init_thread: device_discovery_name_build_failed elapsed_us=%lu", init_elapsed_us(start, freq));
         return FALSE;
     }
 
     UNICODE_STRING device_name;
     RtlInitUnicodeString(&device_name, device_name_buffer);
+    SN_LOG("init_thread: device_discovery_begin device=%wZ pid=%llu tid=%llu irql=%lu elapsed_us=%lu",
+        &device_name,
+        init_handle_to_u64(PsGetCurrentProcessId()),
+        init_handle_to_u64(PsGetCurrentThreadId()),
+        static_cast<ULONG>(KeGetCurrentIrql()),
+        init_elapsed_us(start, freq));
 
     PFILE_OBJECT file_object = nullptr;
     PDEVICE_OBJECT device_object = nullptr;
     NTSTATUS status = IoGetDeviceObjectPointer(&device_name, FILE_READ_DATA, &file_object, &device_object);
     if (!NT_SUCCESS(status) || !file_object || !device_object) {
-        SN_LOG("init_thread: device_discovery_resolve_failed status=0x%08lx file=%p device=%p",
-            status, file_object, device_object);
+        SN_LOG("init_thread: device_discovery_resolve_failed status=0x%08lx device=%wZ file=%p device=%p elapsed_us=%lu",
+            status,
+            &device_name,
+            file_object,
+            device_object,
+            init_elapsed_us(start, freq));
         if (file_object)
             ObDereferenceObject(file_object);
         return FALSE;
@@ -407,6 +617,12 @@ static BOOLEAN discover_target_driver_from_device() {
             driver_object = device_object->DriverObject;
         shape_ok = extract_target_driver_image_candidate(driver_object, device_object, &candidate_base, &candidate_size);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
+        SN_LOG("init_thread: device_discovery_candidate_exception code=0x%08lx device=%wZ file=%p device=%p elapsed_us=%lu",
+            GetExceptionCode(),
+            &device_name,
+            file_object,
+            device_object,
+            init_elapsed_us(start, freq));
         shape_ok = FALSE;
     }
 
@@ -417,22 +633,33 @@ static BOOLEAN discover_target_driver_from_device() {
         object_ok = validate_target_driver_object(driver_object, candidate_base);
     }
 
-    SN_LOG("init_thread: device_discovery_candidate status=0x%08lx shape=%u bridge=%u object=%u base=%p size=0x%lx driver=%p device=%p",
+    SN_LOG("init_thread: device_discovery_candidate status=0x%08lx device_name=%wZ shape=%u bridge=%u object=%u base=%p end=%p size=0x%lx driver=%p device=%p file=%p elapsed_us=%lu",
         status,
+        &device_name,
         shape_ok ? 1u : 0u,
         bridge_ok ? 1u : 0u,
         object_ok ? 1u : 0u,
         candidate_base,
+        candidate_base ? static_cast<UCHAR*>(candidate_base) + candidate_size : nullptr,
         candidate_size,
         driver_object,
-        device_object);
+        device_object,
+        file_object,
+        init_elapsed_us(start, freq));
 
     if (shape_ok && bridge_ok && object_ok) {
         g_target_driver_base = candidate_base;
         g_target_driver_size = candidate_size;
         g_target_driver_object = driver_object;
-        SN_LOG("init_thread: device_discovery_success base=%p size=0x%lx driver=%p bridge=%p",
-            candidate_base, candidate_size, driver_object, heartbeat::g_bridge);
+        SN_LOG("init_thread: device_discovery_success device=%wZ base=%p size=0x%lx driver=%p bridge=%p whoswho_tsc=%llu sentinel_tsc=%llu elapsed_us=%lu",
+            &device_name,
+            candidate_base,
+            candidate_size,
+            driver_object,
+            heartbeat::g_bridge,
+            heartbeat::g_bridge ? static_cast<unsigned long long>(heartbeat::g_bridge->whoswho_tsc) : 0ULL,
+            heartbeat::g_bridge ? static_cast<unsigned long long>(heartbeat::g_bridge->sentinel_tsc) : 0ULL,
+            init_elapsed_us(start, freq));
         ObDereferenceObject(file_object);
         return TRUE;
     }
@@ -441,6 +668,12 @@ static BOOLEAN discover_target_driver_from_device() {
     heartbeat::g_last_whoswho_tsc = 0;
     heartbeat::g_last_check_tsc = 0;
     ObDereferenceObject(file_object);
+    SN_LOG("init_thread: device_discovery_reject device=%wZ reset_bridge=1 shape=%u bridge=%u object=%u elapsed_us=%lu",
+        &device_name,
+        shape_ok ? 1u : 0u,
+        bridge_ok ? 1u : 0u,
+        object_ok ? 1u : 0u,
+        init_elapsed_us(start, freq));
     return FALSE;
 }
 
@@ -683,6 +916,14 @@ static void NTAPI init_thread_routine(PVOID ) {
         reinterpret_cast<PVOID>(&init_thread_routine),
         init_handle_to_u64(PsGetCurrentProcessId()),
         init_handle_to_u64(PsGetCurrentThreadId()));
+    SN_LOG("init_thread: system_state build=%lu ci_options=0x%08lx hvci=%u ci_enabled=%u secure_kernel_hint=%u irql=%lu cpu=%lu",
+        init_read_kuser_u32(0x260) & 0xFFFFu,
+        init_read_kuser_u32(0x3A8),
+        hvci_detect::is_hvci_enabled() ? 1u : 0u,
+        (init_read_kuser_u32(0x3A8) & 0x1u) ? 1u : 0u,
+        (init_read_kuser_u32(0x3A8) & (hvci_detect::CI_OPTION_HVCI_KMCI_ENABLED | hvci_detect::CI_OPTION_HVCI_STRICT)) ? 1u : 0u,
+        static_cast<ULONG>(KeGetCurrentIrql()),
+        KeGetCurrentProcessorNumber());
     init_log_session_state("entry");
 
     constexpr ULONG SETTLE_POLLS = 5;
@@ -935,7 +1176,14 @@ discovery_done:
 
 
                 heartbeat::update_and_check();
-                SN_LOG("init_thread: heartbeat initial tick done");
+                SN_LOG("init_thread: heartbeat initial tick done bridge=%p whoswho_seen=%u sentinel_seen=%u whoswho_tsc=%llu sentinel_tsc=%llu initialized=%ld first_seen=%ld",
+                    heartbeat::g_bridge,
+                    heartbeat::g_bridge && heartbeat::g_bridge->whoswho_tsc != 0 ? 1u : 0u,
+                    heartbeat::g_bridge && heartbeat::g_bridge->sentinel_tsc != 0 ? 1u : 0u,
+                    heartbeat::g_bridge ? static_cast<unsigned long long>(heartbeat::g_bridge->whoswho_tsc) : 0ULL,
+                    heartbeat::g_bridge ? static_cast<unsigned long long>(heartbeat::g_bridge->sentinel_tsc) : 0ULL,
+                    _InterlockedCompareExchange(&heartbeat::g_initialized, 0, 0),
+                    _InterlockedCompareExchange(&heartbeat::g_first_heartbeat_seen, 0, 0));
             }
         }
 
@@ -1081,11 +1329,44 @@ exit_thread:
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
 
+    LARGE_INTEGER entry_freq = {};
+    LARGE_INTEGER entry_start = KeQueryPerformanceCounter(&entry_freq);
+    dbg_capture::configure_log_path(RegistryPath);
+    ULONG early_build = init_read_kuser_u32(0x260) & 0xFFFFu;
+    ULONG early_ci_options = init_read_kuser_u32(0x3A8);
+    dbg_capture::write_immediate_formatted("[SN-EARLY] DriverEntry entered driver_object_present=%u registry_path_present=%u pid=%llu tid=%llu irql=%lu cpu=%lu build=%lu ci_options=0x%08lx hvci=%u ci_enabled=%u\n",
+        DriverObject != nullptr ? 1u : 0u,
+        RegistryPath != nullptr ? 1u : 0u,
+        init_handle_to_u64(PsGetCurrentProcessId()),
+        init_handle_to_u64(PsGetCurrentThreadId()),
+        static_cast<ULONG>(KeGetCurrentIrql()),
+        KeGetCurrentProcessorNumber(),
+        early_build,
+        early_ci_options,
+        (early_ci_options & hvci_detect::CI_OPTION_HVCI_KMCI_ENABLED) || (early_ci_options & hvci_detect::CI_OPTION_HVCI_STRICT) ? 1u : 0u,
+        (early_ci_options & 0x1u) ? 1u : 0u);
+    dbg_capture::write_immediate_formatted("[SN-EARLY] build_identity hash=0x%llX date=%s time=%s msc=%u cpp=%lu entry=%p\n",
+        sentinel_build_identity::kHash,
+        __DATE__,
+        __TIME__,
+        (unsigned)_MSC_VER,
+        (unsigned long)__cplusplus,
+        reinterpret_cast<PVOID>(&DriverEntry));
+    dbg_capture::write_immediate_formatted("[SN-EARLY] SetupFunctions begin\n");
 
-    if (!SetupFunctions())
+    if (!SetupFunctions()) {
+        dbg_capture::write_immediate_formatted("[SN-EARLY] SetupFunctions FAILED elapsed_us=%lu\n",
+            init_elapsed_us(entry_start, entry_freq));
         return STATUS_UNSUCCESSFUL;
+    }
 
-    dbg_capture::initialize();
+    dbg_capture::write_immediate_formatted("[SN-EARLY] SetupFunctions OK elapsed_us=%lu\n",
+        init_elapsed_us(entry_start, entry_freq));
+
+    NTSTATUS dbg_status = dbg_capture::initialize();
+    dbg_capture::write_immediate_formatted("[SN-EARLY] dbg_capture::initialize status=0x%08lx elapsed_us=%lu\n",
+        static_cast<ULONG>(dbg_status),
+        init_elapsed_us(entry_start, entry_freq));
 
     SN_LOG("DriverEntry: SetupFunctions OK");
     SN_LOG("DriverEntry: build_identity hash=0x%llX date=%s time=%s msc=%u cpp=%lu entry=%p driver_object=%p registry_path_present=%u",
@@ -1097,8 +1378,13 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
         reinterpret_cast<PVOID>(&DriverEntry),
         DriverObject,
         RegistryPath != nullptr ? 1u : 0u);
+    init_log_driverentry_phase("post_setup", entry_start, entry_freq);
 
     g_sentinel_driver_object = DriverObject;
+    SN_LOG("DriverEntry: sentinel driver object registered object=%p device_object=%p public_device_create=0 symlink_create=0 reason=sentinel_internal_bridge_only elapsed_us=%lu",
+        DriverObject,
+        DriverObject ? DriverObject->DeviceObject : nullptr,
+        init_elapsed_us(entry_start, entry_freq));
 
 
     if (RegistryPath && RegistryPath->Buffer && RegistryPath->Length > 0) {
@@ -1112,15 +1398,33 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
         g_registry_path.Buffer = g_registry_path_buffer;
         g_registry_path.Length = copy_len;
         g_registry_path.MaximumLength = sizeof(g_registry_path_buffer);
+        SN_LOG("DriverEntry: registry path captured bytes=%u chars=%u path=%wZ elapsed_us=%lu",
+            copy_len,
+            copy_len / sizeof(WCHAR),
+            &g_registry_path,
+            init_elapsed_us(entry_start, entry_freq));
+    } else {
+        SN_LOG("DriverEntry: registry path absent elapsed_us=%lu", init_elapsed_us(entry_start, entry_freq));
     }
 
 
     DriverObject->DriverUnload = nullptr;
+    SN_LOG("DriverEntry: unload disabled unload=%p major_create=%p major_ioctl=%p elapsed_us=%lu",
+        DriverObject->DriverUnload,
+        DriverObject->MajorFunction[IRP_MJ_CREATE],
+        DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL],
+        init_elapsed_us(entry_start, entry_freq));
 
 
     if (DriverObject->DriverSection) {
         auto ldr = static_cast<PLDR_DATA_TABLE_ENTRY>(DriverObject->DriverSection);
         ldr->Flags |= 0x20u;
+        SN_LOG("DriverEntry: DriverSection flag set ldr=%p flags=0x%lx base=%p size=0x%lx elapsed_us=%lu",
+            ldr,
+            ldr->Flags,
+            ldr->DllBase,
+            ldr->SizeOfImage,
+            init_elapsed_us(entry_start, entry_freq));
     }
 
 
@@ -1143,7 +1447,9 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
 
     if (own_text && own_text_size > 0) {
         bool bl_ok = self_protect::init_baseline(own_text, own_text_size);
-        SN_LOG("DriverEntry: self_protect::init_baseline = %d", (int)bl_ok);
+        SN_LOG("DriverEntry: self_protect::init_baseline = %d elapsed_us=%lu", (int)bl_ok, init_elapsed_us(entry_start, entry_freq));
+    } else {
+        SN_LOG("DriverEntry: self_protect::init_baseline skipped reason=no_text elapsed_us=%lu", init_elapsed_us(entry_start, entry_freq));
     }
 
 
@@ -1157,7 +1463,11 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
         init_thread_routine,
         nullptr);
 
-    SN_LOG("DriverEntry: PsCreateSystemThread status=0x%08lx handle=%p", status, thread_handle);
+    SN_LOG("DriverEntry: PsCreateSystemThread status=0x%08lx handle=%p routine=%p elapsed_us=%lu",
+        status,
+        thread_handle,
+        reinterpret_cast<PVOID>(&init_thread_routine),
+        init_elapsed_us(entry_start, entry_freq));
 
     if (NT_SUCCESS(status) && thread_handle) {
         g_init_thread_handle = thread_handle;
@@ -1165,8 +1475,18 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
 
         _ZwClose(thread_handle);
         g_init_thread_handle = nullptr;
+        SN_LOG("DriverEntry: init thread handle closed status=0x%08lx elapsed_us=%lu",
+            status,
+            init_elapsed_us(entry_start, entry_freq));
+    } else if (!NT_SUCCESS(status)) {
+        SN_LOG("DriverEntry: init thread creation failed status=0x%08lx elapsed_us=%lu",
+            status,
+            init_elapsed_us(entry_start, entry_freq));
     }
 
-    SN_LOG("DriverEntry: returning STATUS_SUCCESS, g_target_driver_base=%p", (PVOID)g_target_driver_base);
+    init_log_driverentry_phase("return_success", entry_start, entry_freq);
+    SN_LOG("DriverEntry: returning STATUS_SUCCESS, g_target_driver_base=%p elapsed_us=%lu",
+        (PVOID)g_target_driver_base,
+        init_elapsed_us(entry_start, entry_freq));
     return STATUS_SUCCESS;
 }

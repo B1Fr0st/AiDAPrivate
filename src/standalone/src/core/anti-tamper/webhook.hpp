@@ -32,22 +32,7 @@ namespace detail {
         if (!s_init)
         {
             if (!diag::build_log_path("aida_debug.log", s_path, sizeof(s_path)))
-            {
-                DWORD ret = GetModuleFileNameA(nullptr, s_path, MAX_PATH);
-                if (ret == 0 || ret >= MAX_PATH)
-                {
-                    strcpy_s(s_path, "aida_debug.log");
-                }
-                else
-                {
-                    char* last = strrchr(s_path, '\\');
-                    if (last)
-                        *(last + 1) = '\0';
-                    else
-                        s_path[0] = '\0';
-                    strcat_s(s_path, "aida_debug.log");
-                }
-            }
+                s_path[0] = '\0';
             s_init = true;
         }
         return s_path;
@@ -148,6 +133,7 @@ inline void write_log(const char* tag, const char* detail)
         if (hf == INVALID_HANDLE_VALUE)
         {
             const char* path = detail::log_path();
+            if (!path || !*path) return;
             hf = CreateFileA(path, FILE_APPEND_DATA | SYNCHRONIZE,
                 FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                 OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -186,6 +172,7 @@ inline void write_log_critical(const char* tag, const char* detail)
     {
         std::lock_guard<std::recursive_mutex> lk(detail::log_mtx());
         const char* path = detail::log_path();
+        if (!path || !*path) return;
         HANDLE hf = CreateFileA(path,
             FILE_APPEND_DATA | SYNCHRONIZE,
             FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,

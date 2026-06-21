@@ -4,6 +4,8 @@
 
 namespace dbg_capture {
 
+    void configure_log_path(PUNICODE_STRING registry_path);
+
     NTSTATUS initialize();
 
     void write_formatted(const char* fmt, ...);

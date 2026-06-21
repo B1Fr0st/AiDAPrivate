@@ -523,6 +523,11 @@ bool json_bool_param(const json& params, const char* name, bool fallback)
     return params[name].get<bool>();
 }
 
+bool json_bool_param_present(const json& params, const char* name)
+{
+    return params.is_object() && params.contains(name) && params[name].is_boolean();
+}
+
 std::string json_string_param(const json& params, const char* name, const std::string& fallback = std::string())
 {
     if (!params.is_object() || !params.contains(name) || !params[name].is_string())
@@ -1166,6 +1171,69 @@ bool browser_record_to_exchange(const json& record, const json& params, const st
     return !ex.host.empty();
 }
 
+bool browser_record_has_body_payload(const json& record)
+{
+    if (!record.is_object())
+        return false;
+    for (const char* key : {"request_body", "requestBody", "post_data", "postData", "response_body", "responseBody", "body_text", "bodyText", "response_text"})
+    {
+        auto it = record.find(key);
+        if (it != record.end() && it->is_string() && !it->get<std::string>().empty())
+            return true;
+    }
+    return false;
+}
+
+bool browser_record_body_hydration_wanted(const json& record, const json& params)
+{
+    if (browser_record_has_body_payload(record))
+        return false;
+    if (json_bool_param_present(params, "include_body"))
+        return json_bool_param(params, "include_body", false);
+    if (json_bool_param_present(params, "capture_body"))
+        return json_bool_param(params, "capture_body", false);
+    if (json_bool_param(params, "publish_to_burp", true))
+        return true;
+    if (json_bool_param(record, "response_body_available", false))
+        return true;
+    return json_first_u64_field(record, {"response_body_length", "body_length", "size", "request_body_length"}, 0) > 0;
+}
+
+json hydrate_browser_exchange_candidate(const json& record, const json& params, const std::string& session_id)
+{
+    if (!record.is_object() || !browser_record_body_hydration_wanted(record, params))
+        return record;
+    const uint64_t request_id = json_first_u64_field(record, {"request_id", "id", "network_request_id"}, 0);
+    if (request_id == 0)
+        return record;
+    json args = json::object();
+    args["request_id"] = request_id;
+    args["include_body"] = true;
+    args["include_headers"] = true;
+    args["max_body_size"] = json_int_param(params, "max_body_size", -1);
+    const std::string page_id = json_first_string_field(record, {"page_id", "request_page_id"});
+    const std::string marker = json_string_param(params, "marker", std::string());
+    if (!page_id.empty())
+        args["page_id"] = page_id;
+    if (!marker.empty())
+        args["marker"] = marker;
+    camoufox::call_result_t detail = camoufox::call_tool("get_network_request", args, 15000, session_id);
+    if (!detail.ok || !detail.data.is_object())
+    {
+        diag::log_tagged_fmt("mcp_burp", "browser_burp_body_hydrate_failed request_id=%llu ok=%d err=%s shape=%s",
+            static_cast<unsigned long long>(request_id), detail.ok ? 1 : 0, detail.error.c_str(), json_shape(detail.data).c_str());
+        return record;
+    }
+    json merged = record;
+    for (auto it = detail.data.begin(); it != detail.data.end(); ++it)
+        merged[it.key()] = it.value();
+    diag::log_tagged_fmt("mcp_burp", "browser_burp_body_hydrate_ok request_id=%llu response_body_len=%zu request_body_len=%zu",
+        static_cast<unsigned long long>(request_id),
+        json_first_string_field(merged, {"response_body", "responseBody", "body_text", "bodyText", "response_text"}).size(),
+        json_first_string_field(merged, {"request_body", "requestBody", "post_data", "postData"}).size());
+    return merged;
+}
+
 std::string browser_dedupe_key(const json& record, const json& params, const exchange_observed_t& ex)
 {
     const std::string rid = json_first_string_field(record, {"request_id", "id", "network_request_id"});
@@ -1258,14 +1326,15 @@ burp_publish_summary_t publish_browser_exchanges(const std::string& tool_name, c
     }
     for (const json& candidate : candidates)
     {
+        json hydrated_candidate = hydrate_browser_exchange_candidate(candidate, params, json_string_param(params, "session_id", "default"));
         exchange_observed_t ex;
-        if (!browser_record_to_exchange(candidate, params, summary.source, ex))
+        if (!browser_record_to_exchange(hydrated_candidate, params, summary.source, ex))
         {
             ++summary.skipped;
             continue;
         }
-        const std::string key = browser_dedupe_key(candidate, params, ex);
-        const std::string document_url_key = browser_dedupe_document_url_key(candidate, params, ex);
+        const std::string key = browser_dedupe_key(hydrated_candidate, params, ex);
+        const std::string document_url_key = browser_dedupe_document_url_key(hydrated_candidate, params, ex);
         if (!remember_browser_exchange_keys(key, document_url_key))
         {
             ++summary.duplicates;
@@ -2030,7 +2099,10 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
             return validation;
         args["timeout_ms"] = camoufox_evaluate_timeout_ms(params, timeout_ms);
     }
+    if (tool_name == "instrumentation" && lower_ascii_copy(json_string_param(args, "action", std::string())) == "reload")
+        args["timeout_ms"] = timeout_ms;
     json capture_info = json::object();
+    bool navigation_capture_body = false;
     if (tool_name == "take_screenshot")
     {
         args.erase("include_base64");
@@ -2042,7 +2114,8 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
         const bool publish_to_burp = json_bool_param(params, "publish_to_burp", true);
         const bool requested_capture_from_start = json_bool_param(params, "capture_from_start", false);
         const bool capture_from_start = requested_capture_from_start || publish_to_burp;
-        const bool capture_body = json_bool_param(params, "capture_body", false);
+        const bool capture_body = json_bool_param(params, "capture_body", publish_to_burp);
+        navigation_capture_body = capture_body;
         const std::string capture_pattern = json_string_param(params, "capture_url_pattern", "**/*");
         const std::string capture_page_id = json_string_param(params, "page_id", std::string());
         if (capture_from_start)
@@ -2131,9 +2204,14 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
         if (out.success)
         {
             const std::string page_id = json_string_param(params, "page_id", std::string());
-            camoufox::call_result_t captured = is_default_browser_session(session_id) && page_id.empty()
-                ? camoufox::list_network_requests(200)
-                : camoufox::list_network_requests(200, session_id, page_id);
+            json list_args = json::object();
+            list_args["limit"] = 200;
+            list_args["include_headers"] = true;
+            list_args["include_body"] = navigation_capture_body;
+            list_args["max_body_size"] = json_int_param(params, "max_body_size", -1);
+            if (!page_id.empty())
+                list_args["page_id"] = page_id;
+            camoufox::call_result_t captured = camoufox::call_tool("list_network_requests", list_args, 30000, session_id);
             capture_info["post_navigation_list_ok"] = captured.ok;
             capture_info["post_navigation_data_shape"] = json_shape(captured.data);
             if (!captured.ok)
