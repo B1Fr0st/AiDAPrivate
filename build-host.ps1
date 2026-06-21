@@ -220,9 +220,11 @@ if ($Drivers) {
         "driver\Sentinel\nuget.exe restore driver\WhosWho\WhosWho.sln"
     )
     if ($CleanDrivers) {
+        $driverParts += "msbuild mapper\WindMapper.sln /t:Clean /p:Configuration=Release /p:Platform=x64 /m:1 /p:BuildInParallel=false /v:minimal"
         $driverParts += "msbuild driver\Sentinel\Sentinel.sln /t:Clean /p:Configuration=Release /p:Platform=x64 /m:1 /p:BuildInParallel=false /v:minimal"
         $driverParts += "msbuild driver\WhosWho\WhosWho.sln /t:Clean /p:Configuration=Release /p:Platform=x64 /m:1 /p:BuildInParallel=false /v:minimal"
     }
+    $driverParts += "msbuild mapper\WindMapper.sln /t:Build /p:Configuration=Release /p:Platform=x64 /m:1 /p:BuildInParallel=false /v:minimal"
     $driverParts += "msbuild driver\Sentinel\Sentinel.sln /t:Build /p:Configuration=Release /p:Platform=x64 /m:1 /p:BuildInParallel=false /v:minimal"
     $driverParts += "msbuild driver\WhosWho\WhosWho.sln /t:Build /p:Configuration=Release /p:Platform=x64 /m:1 /p:BuildInParallel=false /v:minimal"
     $steps.Add((New-Step "drivers" ($driverParts -join " && ") "driver.log" (Join-Path $env:TEMP "aida_driver_build_out.txt")))

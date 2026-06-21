@@ -453,6 +453,7 @@ namespace net_capture {
 
 
     inline volatile LONG g_wfp_initialized = 0;
+    inline volatile LONG g_wfp_degraded = 0;
     inline volatile LONG g_capture_active = 0;
     inline HANDLE g_engine_handle = nullptr;
     inline PDEVICE_OBJECT g_device_object = nullptr;
@@ -517,6 +518,22 @@ namespace net_capture {
     inline volatile LONG64 g_global_bytes_recv = 0;
     inline volatile LONG64 g_global_pkts_sent = 0;
     inline volatile LONG64 g_global_pkts_recv = 0;
+
+    static ULONG runtime_build_number() {
+        if (!_RtlGetVersion) {
+            return 0;
+        }
+        RTL_OSVERSIONINFOW version = {};
+        version.dwOSVersionInfoSize = sizeof(version);
+        if (!NT_SUCCESS(_RtlGetVersion(&version))) {
+            return 0;
+        }
+        return version.dwBuildNumber;
+    }
+
+    static BOOLEAN startup_wfp_degraded_for_build(ULONG build) {
+        return build >= 26200;
+    }
 
 
     #define DNS_RING_SIZE 256
@@ -3537,10 +3554,29 @@ namespace net_capture {
 
     NTSTATUS initialize(PDEVICE_OBJECT devObj) {
         NET_DBG("initialize: starting WFP init, devObj=%p", devObj);
+        ULONG build = runtime_build_number();
+        if (startup_wfp_degraded_for_build(build)) {
+            g_device_object = devObj;
+            KeInitializeSpinLock(&g_ring_lock);
+            KeInitializeSpinLock(&g_dns_lock);
+            KeInitializeSpinLock(&g_seq_delta_lock);
+            KeInitializeSpinLock(&g_udp_flow_lock);
+            KeInitializeSpinLock(&g_pid_path_lock);
+            KeInitializeSpinLock(&net_fingerprint::g_fp_lock);
+            _InterlockedExchange(&g_capture_active, 0);
+            _InterlockedExchange(&g_wfp_degraded, 1);
+            _InterlockedExchange(&g_wfp_initialized, 3);
+            WW_LOG("net_capture::initialize DEGRADED build=%lu state=3 device=%p", build, devObj);
+            return STATUS_SUCCESS;
+        }
         LONG prev = _InterlockedCompareExchange(&g_wfp_initialized, 1, 0);
         if (prev == 2) {
             NET_DBG("initialize: already initialized (state=2)");
             return STATUS_SUCCESS;
+        }
+        if (prev == 3) {
+            NET_DBG("initialize: degraded unsupported build state=3");
+            return STATUS_NOT_SUPPORTED;
         }
         if (prev == 1) {
             NET_DBG("initialize: concurrent init detected, waiting...");
@@ -3568,6 +3604,7 @@ namespace net_capture {
             POOL_FLAG_NON_PAGED, ring_size, 'pkNW');
         if (!g_ring_buffer) {
             NET_ERR("initialize: packet ring alloc FAILED (size=%llu)", (ULONGLONG)ring_size);
+            _InterlockedExchange(&g_wfp_degraded, 0);
             _InterlockedExchange(&g_wfp_initialized, 0);
             return STATUS_INSUFFICIENT_RESOURCES;
         }
@@ -3582,6 +3619,7 @@ namespace net_capture {
             NET_ERR("initialize: DNS ring alloc FAILED (size=%llu)", (ULONGLONG)dns_size);
             ExFreePoolWithTag(g_ring_buffer, 'pkNW');
             g_ring_buffer = nullptr;
+            _InterlockedExchange(&g_wfp_degraded, 0);
             _InterlockedExchange(&g_wfp_initialized, 0);
             return STATUS_INSUFFICIENT_RESOURCES;
         }
@@ -3599,6 +3637,7 @@ namespace net_capture {
             g_ring_buffer = nullptr;
             ExFreePoolWithTag(g_dns_ring, 'dnNW');
             g_dns_ring = nullptr;
+            _InterlockedExchange(&g_wfp_degraded, 0);
             _InterlockedExchange(&g_wfp_initialized, 0);
             return status;
         }
@@ -3611,6 +3650,7 @@ namespace net_capture {
             g_ring_buffer = nullptr;
             ExFreePoolWithTag(g_dns_ring, 'dnNW');
             g_dns_ring = nullptr;
+            _InterlockedExchange(&g_wfp_degraded, 0);
             _InterlockedExchange(&g_wfp_initialized, 0);
             return STATUS_NOT_SUPPORTED;
         }
@@ -3651,11 +3691,13 @@ namespace net_capture {
                 ExFreePoolWithTag(g_dns_ring, 'dnNW');
                 g_dns_ring = nullptr;
             }
+            _InterlockedExchange(&g_wfp_degraded, 0);
             _InterlockedExchange(&g_wfp_initialized, 0);
             return status;
         }
 
         KeMemoryBarrier();
+        _InterlockedExchange(&g_wfp_degraded, 0);
         _InterlockedExchange(&g_wfp_initialized, 2);
         NET_DBG("initialize: WFP fully initialized (state=2)");
         WW_LOG("net_capture::initialize OK state=2 ring_ready=%u dns_ready=%u max_payload=%u",
@@ -3673,6 +3715,7 @@ namespace net_capture {
 
     void cleanup() {
         _InterlockedExchange(&g_capture_active, 0);
+        _InterlockedExchange(&g_wfp_degraded, 0);
         g_filter_pid = 0;
         g_filter_port = 0;
         g_filter_protocol = 0;
@@ -4884,6 +4927,15 @@ NTSTATUS functions::handle_net_cap_ctrl(p_net_cap_ctrl request) {
         request->filter_port,
         request->filter_protocol,
         request->max_packet_bytes);
+
+    if (net_capture::g_wfp_initialized == 3 || net_capture::g_wfp_degraded != 0) {
+        WW_LOG("net_capture::ctrl FAIL step=wfp_degraded status=0x%08X state=%ld degraded=%ld build=%lu",
+            STATUS_NOT_SUPPORTED,
+            net_capture::g_wfp_initialized,
+            net_capture::g_wfp_degraded,
+            net_capture::runtime_build_number());
+        return STATUS_NOT_SUPPORTED;
+    }
 
     if (net_capture::g_wfp_initialized != 2) {
 

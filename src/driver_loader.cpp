@@ -833,7 +833,7 @@ namespace
         return loaded && deleted;
     }
 
-    bool initialize_with_native_services()
+    [[maybe_unused]] bool initialize_with_native_services()
     {
         const ULONGLONG started = GetTickCount64();
         loader_diag_fmt("native_load_begin pid=%lu tid=%lu",
@@ -982,26 +982,16 @@ namespace driver_loader
         s_last_error.clear();
         loader_diag("initialize_and_load_begin");
 
-        if (initialize_with_native_services()) {
-            g_loaded = true;
-            loader_diag("initialize_and_load_success mode=native_services");
-            return true;
-        }
-
-        std::string native_error = s_last_error;
+        loader_diag("native_services_skipped_unsigned_driver_policy");
 
         if (!legacy_mapper_enabled()) {
             loader_diag("legacy_mapper_disabled");
-            if (!native_error.empty()) {
-                set_last_error(native_error + "; legacy mapper disabled for normal startup");
-            } else {
-                set_last_error("Native driver load failed; legacy mapper disabled for normal startup");
-            }
+            set_last_error("Legacy WindMapper loader is required for unsigned drivers; native NtLoadDriver startup is disabled");
             return false;
         }
 
 #ifndef AIDA_LEGACY_DRIVER_MAPPER_AVAILABLE
-        (void)native_error;
+        set_last_error("Legacy WindMapper loader is required but not embedded in this build");
         return false;
 #else
         loader_diag("legacy_mapper_enabled");

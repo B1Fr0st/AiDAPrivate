@@ -912,6 +912,15 @@ static void NTAPI init_thread_routine(PVOID ) {
 
     LARGE_INTEGER init_freq;
     LARGE_INTEGER init_start = KeQueryPerformanceCounter(&init_freq);
+    dbg_capture::write_immediate_formatted("[SN-EARLY] init_thread entered routine=%p pid=%llu tid=%llu irql=%lu cpu=%lu target_base=%p target_size=0x%lx bridge=%p elapsed_us=0\n",
+        reinterpret_cast<PVOID>(&init_thread_routine),
+        init_handle_to_u64(PsGetCurrentProcessId()),
+        init_handle_to_u64(PsGetCurrentThreadId()),
+        static_cast<ULONG>(KeGetCurrentIrql()),
+        KeGetCurrentProcessorNumber(),
+        (PVOID)g_target_driver_base,
+        g_target_driver_size,
+        heartbeat::g_bridge);
     SN_LOG("init_thread: started routine=%p pid=%llu tid=%llu",
         reinterpret_cast<PVOID>(&init_thread_routine),
         init_handle_to_u64(PsGetCurrentProcessId()),
@@ -1106,6 +1115,14 @@ static void NTAPI init_thread_routine(PVOID ) {
     }
 discovery_done:
     init_log_session_state("after_discovery");
+    dbg_capture::write_immediate_formatted("[SN-EARLY] init_thread discovery_done target_base=%p target_size=0x%lx target_object=%p heartbeat_bridge=%p whoswho_tsc=%llu sentinel_tsc=%llu elapsed_us=%lu\n",
+        (PVOID)g_target_driver_base,
+        g_target_driver_size,
+        (PVOID)g_target_driver_object,
+        heartbeat::g_bridge,
+        heartbeat::g_bridge ? static_cast<unsigned long long>(heartbeat::g_bridge->whoswho_tsc) : 0ULL,
+        heartbeat::g_bridge ? static_cast<unsigned long long>(heartbeat::g_bridge->sentinel_tsc) : 0ULL,
+        init_elapsed_us(init_start, init_freq));
 
     if (g_target_driver_base == nullptr) {
         SN_LOG("init_thread: FATAL - target driver NOT FOUND, exiting");
@@ -1208,13 +1225,26 @@ discovery_done:
 
                 UINT8 bridge_key[32] = {};
                 bool derive_ok = witness_key::derive_subkey("bridge-v2", bridge_key);
-                SN_LOG("init_thread: witness_key::derive_subkey = %d", (int)derive_ok);
+                UINT64 bridge_key_hash = bridge_v2::bridge_diag_hash(bridge_key, derive_ok ? sizeof(bridge_key) : 0);
+                SN_LOG("init_thread: witness_key::derive_subkey = %d key_hash=0x%llx bridge_before=%p bridge_last_counter=%llu elapsed_us=%lu",
+                    (int)derive_ok,
+                    static_cast<unsigned long long>(bridge_key_hash),
+                    bridge_v2::g_bridge_v2,
+                    static_cast<unsigned long long>(bridge_v2::g_last_counter),
+                    init_elapsed_us(init_start, init_freq));
 
                 bool bridge_ok = FALSE;
                 if (derive_ok) {
                     bridge_ok = bridge_v2::init_bridge(bridge_key);
                 }
-                SN_LOG("init_thread: bridge_v2::init_bridge = %d", (int)bridge_ok);
+                SN_LOG("init_thread: bridge_v2::init_bridge = %d bridge=%p version=%u counter=%llu last_counter=%llu key_hash=0x%llx elapsed_us=%lu",
+                    (int)bridge_ok,
+                    bridge_v2::g_bridge_v2,
+                    bridge_v2::g_bridge_v2 ? bridge_v2::g_bridge_v2->version : 0,
+                    bridge_v2::g_bridge_v2 ? static_cast<unsigned long long>(bridge_v2::g_bridge_v2->counter) : 0ULL,
+                    static_cast<unsigned long long>(bridge_v2::g_last_counter),
+                    static_cast<unsigned long long>(bridge_key_hash),
+                    init_elapsed_us(init_start, init_freq));
                 RtlSecureZeroMemory(bridge_key, sizeof(bridge_key));
             }
 
@@ -1249,8 +1279,21 @@ discovery_done:
 
 
         SN_LOG("init_thread: starting guardian...");
+        dbg_capture::write_immediate_formatted("[SN-EARLY] init_thread guardian_start_enter target_base=%p target_size=0x%lx heartbeat_bridge=%p bridge_v2=%p elapsed_us=%lu\n",
+            (PVOID)g_target_driver_base,
+            g_target_driver_size,
+            heartbeat::g_bridge,
+            bridge_v2::g_bridge_v2,
+            init_elapsed_us(init_start, init_freq));
         bool guard_ok = guardian::start();
         SN_LOG("init_thread: guardian::start = %d", (int)guard_ok);
+        dbg_capture::write_immediate_formatted("[SN-EARLY] init_thread guardian_start_exit ok=%u target_base=%p target_size=0x%lx heartbeat_bridge=%p bridge_v2=%p elapsed_us=%lu\n",
+            guard_ok ? 1u : 0u,
+            (PVOID)g_target_driver_base,
+            g_target_driver_size,
+            heartbeat::g_bridge,
+            bridge_v2::g_bridge_v2,
+            init_elapsed_us(init_start, init_freq));
         init_log_session_state("after_guardian_start");
 
 
@@ -1317,6 +1360,14 @@ discovery_done:
     }
 
 exit_thread:
+    dbg_capture::write_immediate_formatted("[SN-EARLY] init_thread exiting target_base=%p target_size=0x%lx target_object=%p heartbeat_bridge=%p bridge_v2=%p shutdown=%ld elapsed_us=%lu\n",
+        (PVOID)g_target_driver_base,
+        g_target_driver_size,
+        (PVOID)g_target_driver_object,
+        heartbeat::g_bridge,
+        bridge_v2::g_bridge_v2,
+        _InterlockedCompareExchange(&g_shutdown_flag, 0, 0),
+        init_elapsed_us(init_start, init_freq));
     SN_LOG("init_thread: exiting elapsed_us=%lu target_base=%p target_size=0x%lx shutdown=%ld",
         init_elapsed_us(init_start, init_freq),
         (PVOID)g_target_driver_base,
@@ -1419,6 +1470,12 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     if (DriverObject->DriverSection) {
         auto ldr = static_cast<PLDR_DATA_TABLE_ENTRY>(DriverObject->DriverSection);
         ldr->Flags |= 0x20u;
+        dbg_capture::write_immediate_formatted("[SN-EARLY] DriverSection inspect ldr=%p flags=0x%lx base=%p size=0x%lx elapsed_us=%lu\n",
+            ldr,
+            ldr->Flags,
+            ldr->DllBase,
+            ldr->SizeOfImage,
+            init_elapsed_us(entry_start, entry_freq));
         SN_LOG("DriverEntry: DriverSection flag set ldr=%p flags=0x%lx base=%p size=0x%lx elapsed_us=%lu",
             ldr,
             ldr->Flags,
@@ -1440,9 +1497,17 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     SN_LOG("DriverEntry: own_base=%p build_hash=0x%llX", own_base, sentinel_build_identity::kHash);
 
     if (own_base) {
+        dbg_capture::write_immediate_formatted("[SN-EARLY] find_text_section enter own_base=%p elapsed_us=%lu\n",
+            own_base,
+            init_elapsed_us(entry_start, entry_freq));
         find_text_section(own_base, &own_text, &own_text_size);
     }
 
+    dbg_capture::write_immediate_formatted("[SN-EARLY] find_text_section exit own_base=%p own_text=%p own_text_size=0x%lx elapsed_us=%lu\n",
+        own_base,
+        own_text,
+        own_text_size,
+        init_elapsed_us(entry_start, entry_freq));
     SN_LOG("DriverEntry: own_text=%p own_text_size=0x%lx", own_text, own_text_size);
 
     if (own_text && own_text_size > 0) {
@@ -1454,6 +1519,12 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
 
 
     HANDLE thread_handle = nullptr;
+    dbg_capture::write_immediate_formatted("[SN-EARLY] PsCreateSystemThread enter routine=%p target_base=%p target_size=0x%lx bridge=%p elapsed_us=%lu\n",
+        reinterpret_cast<PVOID>(&init_thread_routine),
+        (PVOID)g_target_driver_base,
+        g_target_driver_size,
+        heartbeat::g_bridge,
+        init_elapsed_us(entry_start, entry_freq));
     NTSTATUS status = _PsCreateSystemThread(
         &thread_handle,
         THREAD_ALL_ACCESS,
@@ -1463,6 +1534,11 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
         init_thread_routine,
         nullptr);
 
+    dbg_capture::write_immediate_formatted("[SN-EARLY] PsCreateSystemThread exit status=0x%08lx handle=%p routine=%p elapsed_us=%lu\n",
+        status,
+        thread_handle,
+        reinterpret_cast<PVOID>(&init_thread_routine),
+        init_elapsed_us(entry_start, entry_freq));
     SN_LOG("DriverEntry: PsCreateSystemThread status=0x%08lx handle=%p routine=%p elapsed_us=%lu",
         status,
         thread_handle,

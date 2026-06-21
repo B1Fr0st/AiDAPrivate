@@ -1497,6 +1497,15 @@ inline bool verify_self_hash()
 
 inline bool snapshot_code(state::code_snapshot_t& snap)
 {
+    const uint64_t enter_tick = GetTickCount64();
+    webhook::write_log_critical_fmt("integrity",
+        "snapshot_code_enter pid=%lu tid=%lu tick=%llu prior_base=0x%llX prior_size=0x%X prior_hash=0x%016llX",
+        GetCurrentProcessId(),
+        GetCurrentThreadId(),
+        static_cast<unsigned long long>(enter_tick),
+        static_cast<unsigned long long>(snap.text_base),
+        snap.text_size,
+        static_cast<unsigned long long>(snap.text_hash));
     HMODULE mod = GetModuleHandleW(nullptr);
     if (!mod)
     {
@@ -1508,14 +1517,47 @@ inline bool snapshot_code(state::code_snapshot_t& snap)
     uint64_t module_end = 0;
     uint32_t module_size = 0;
     MODULEINFO mi{};
-    if (GetModuleInformation(GetCurrentProcess(), mod, &mi, sizeof(mi)))
+    SetLastError(ERROR_SUCCESS);
+    webhook::write_log_critical_fmt("integrity",
+        "snapshot_code_module_info_pre module_base=0x%llX elapsed_ms=%llu",
+        static_cast<unsigned long long>(module_base),
+        static_cast<unsigned long long>(GetTickCount64() - enter_tick));
+    BOOL module_info_ok = GetModuleInformation(GetCurrentProcess(), mod, &mi, sizeof(mi));
+    DWORD module_info_err = module_info_ok ? ERROR_SUCCESS : GetLastError();
+    webhook::write_log_critical_fmt("integrity",
+        "snapshot_code_module_info_post ok=%d err=%lu size=0x%lX base=0x%llX elapsed_ms=%llu",
+        module_info_ok ? 1 : 0,
+        static_cast<unsigned long>(module_info_err),
+        module_info_ok ? static_cast<unsigned long>(mi.SizeOfImage) : 0ul,
+        static_cast<unsigned long long>(reinterpret_cast<uint64_t>(module_info_ok ? mi.lpBaseOfDll : nullptr)),
+        static_cast<unsigned long long>(GetTickCount64() - enter_tick));
+    if (module_info_ok)
     {
         module_size = mi.SizeOfImage;
         module_end = module_base + mi.SizeOfImage;
     }
 
     detail::live_pe_layout_t live{};
+    webhook::write_log_critical_fmt("integrity",
+        "snapshot_code_live_pe_pre module_base=0x%llX module_end=0x%llX elapsed_ms=%llu",
+        static_cast<unsigned long long>(module_base),
+        static_cast<unsigned long long>(module_end),
+        static_cast<unsigned long long>(GetTickCount64() - enter_tick));
     detail::read_live_pe_layout_seh(mod, module_base, live);
+    webhook::write_log_critical_fmt("integrity",
+        "snapshot_code_live_pe_post parsed=%d reason=%s dos=0x%04X e_lfanew=0x%lX nt=0x%08lX opt=0x%04X sections=%u image=0x%lX text=0x%llX size=0x%X seh=0x%08lX elapsed_ms=%llu",
+        live.parsed ? 1 : 0,
+        live.fail_reason,
+        live.dos_magic,
+        static_cast<unsigned long>(live.e_lfanew),
+        static_cast<unsigned long>(live.nt_signature),
+        live.opt_magic,
+        live.section_count,
+        static_cast<unsigned long>(live.size_of_image),
+        static_cast<unsigned long long>(live.text_base),
+        live.text_size,
+        static_cast<unsigned long>(live.seh_code),
+        static_cast<unsigned long long>(GetTickCount64() - enter_tick));
 
     if (module_end == 0 && live.size_of_image != 0)
         module_end = module_base + live.size_of_image;

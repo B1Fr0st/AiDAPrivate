@@ -343,6 +343,37 @@ __declspec(noinline) static DWORD seh_canary_register(void* canary,
     return 0;
 }
 
+__declspec(noinline) static DWORD seh_snapshot_code(state::code_snapshot_t* snap,
+                                                    BOOL* out_snapshot_ok,
+                                                    DWORD* out_error,
+                                                    seh_capture_t* out_exception)
+{
+    if (out_snapshot_ok)
+        *out_snapshot_ok = FALSE;
+    if (out_error)
+        *out_error = ERROR_SUCCESS;
+    if (out_exception)
+        *out_exception = {};
+    __try
+    {
+        SetLastError(ERROR_SUCCESS);
+        const bool ok = snap ? integrity::snapshot_code(*snap) : false;
+        const DWORD err = ok ? ERROR_SUCCESS : GetLastError();
+        if (out_snapshot_ok)
+            *out_snapshot_ok = ok ? TRUE : FALSE;
+        if (out_error)
+            *out_error = err;
+    }
+    __except (capture_seh_exception(GetExceptionInformation(), out_exception))
+    {
+        const DWORD code = out_exception ? out_exception->code : GetExceptionCode();
+        if (out_error)
+            *out_error = GetLastError() != ERROR_SUCCESS ? GetLastError() : ERROR_UNHANDLED_EXCEPTION;
+        return code;
+    }
+    return 0;
+}
+
 inline bool kernel_adbg_hard_flags_present(uint32_t flags)
 {
     constexpr uint32_t kHardFlags = 0x00000001u | 0x00000008u;
@@ -1930,20 +1961,12 @@ inline bool initialize()
                     4096u,
                     win11_or_newer ? 1 : 0);
                 BOOL register_bool = FALSE;
-                if (win11_or_newer)
-                {
-                    register_error = ERROR_NOT_SUPPORTED;
-                    webhook::write_log("init", "canary_register_skipped_windows11");
-                }
-                else
-                {
-                    register_seh = seh_canary_register(canary,
-                        4096,
-                        &register_bool,
-                        &register_error,
-                        &register_exception);
-                    register_ok = register_seh == 0 && register_bool != FALSE;
-                }
+                register_seh = seh_canary_register(canary,
+                    4096,
+                    &register_bool,
+                    &register_error,
+                    &register_exception);
+                register_ok = register_seh == 0 && register_bool != FALSE;
                 webhook::write_log_critical_fmt("init",
                     "canary_register_post ok=%d err=%lu seh=0x%08lX elapsed_ms=%llu va=%p size=0x%X",
                     register_ok ? 1 : 0,
@@ -2099,16 +2122,41 @@ inline bool initialize()
         static_cast<unsigned long long>(rt.code_snap.text_hash),
         static_cast<unsigned long long>(rt.code_snap.module_base),
         static_cast<unsigned long long>(rt.code_snap.module_end));
-    bool snapshot_code_ok = integrity::snapshot_code(rt.code_snap);
+    BOOL snapshot_code_bool = FALSE;
+    DWORD snapshot_code_error = ERROR_SUCCESS;
+    seh_capture_t snapshot_code_exception{};
+    DWORD snapshot_code_seh = seh_snapshot_code(&rt.code_snap,
+        &snapshot_code_bool,
+        &snapshot_code_error,
+        &snapshot_code_exception);
+    bool snapshot_code_ok = snapshot_code_seh == 0 && snapshot_code_bool != FALSE;
     webhook::write_log_critical_fmt("init",
-        "snapshot_code_call_post ok=%d elapsed_ms=%llu base=0x%llX size=0x%X hash=0x%016llX module_base=0x%llX module_end=0x%llX",
+        "snapshot_code_call_post ok=%d err=%lu seh=0x%08lX elapsed_ms=%llu base=0x%llX size=0x%X hash=0x%016llX module_base=0x%llX module_end=0x%llX",
         snapshot_code_ok ? 1 : 0,
+        static_cast<unsigned long>(snapshot_code_error),
+        static_cast<unsigned long>(snapshot_code_seh),
         static_cast<unsigned long long>(GetTickCount64() - snapshot_code_tick),
         static_cast<unsigned long long>(rt.code_snap.text_base),
         rt.code_snap.text_size,
         static_cast<unsigned long long>(rt.code_snap.text_hash),
         static_cast<unsigned long long>(rt.code_snap.module_base),
         static_cast<unsigned long long>(rt.code_snap.module_end));
+    if (snapshot_code_seh != 0)
+    {
+        webhook::write_log_critical_fmt("init",
+            "snapshot_code_call_seh code=0x%08lX addr=%p flags=0x%08lX params=%lu p0=0x%llX p1=0x%llX p2=0x%llX p3=0x%llX err=%lu pid=%lu tid=%lu",
+            static_cast<unsigned long>(snapshot_code_seh),
+            snapshot_code_exception.address,
+            static_cast<unsigned long>(snapshot_code_exception.flags),
+            static_cast<unsigned long>(snapshot_code_exception.parameters),
+            static_cast<unsigned long long>(snapshot_code_exception.info[0]),
+            static_cast<unsigned long long>(snapshot_code_exception.info[1]),
+            static_cast<unsigned long long>(snapshot_code_exception.info[2]),
+            static_cast<unsigned long long>(snapshot_code_exception.info[3]),
+            static_cast<unsigned long>(snapshot_code_error),
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long>(GetCurrentThreadId()));
+    }
     if (!snapshot_code_ok)
     {
         webhook::write_log_critical("init", "snapshot_code_failed");
@@ -3652,7 +3700,7 @@ inline bool guard()
             rt.verify_counter,
             rt.iat_snap.size(),
             rt.full_test_running.load(std::memory_order_acquire) ? 1u : 0u);
-        auto hook = anti_hook::full_scan(rt.iat_snap);
+        auto hook = anti_hook::runtime_scan(rt.iat_snap);
         webhook::write_log_critical_fmt("guard",
             "anti_hook_runtime_post detected=%d elapsed_ms=%llu iat=%d ntdll=%d k32=%d syscall=%d eat=%d prologue=%d disk=%d veh=%d dr=%d redir=%d summary=%s",
             hook.any_detected() ? 1 : 0,

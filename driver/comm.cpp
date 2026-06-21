@@ -141,6 +141,35 @@ namespace {
     constexpr std::uint64_t k_tctx_kernel_address_min = 0xFFFF800000000000ull;
     constexpr DWORD k_hvdt_offset = 52u;
 
+    static bool startup_ioctl_offset(DWORD offset) noexcept {
+        return offset == 8u || offset == 44u || offset == 46u || offset == 48u ||
+               offset == 49u || offset == 50u || offset == 52u || offset == 53u;
+    }
+
+    static const char* startup_ioctl_name(DWORD offset) noexcept {
+        switch (offset) {
+        case 8u: return "HB";
+        case 44u: return "SRVT";
+        case 46u: return "SRV2";
+        case 48u: return "TIRA";
+        case 49u: return "CANR";
+        case 50u: return "CANQ";
+        case 52u: return "HVDT";
+        case 53u: return "RELA";
+        default: return "OTHER";
+        }
+    }
+
+    static std::uint64_t fold64_no_secret(std::uint64_t value) noexcept {
+        std::uint64_t h = value ^ 0x9E3779B97F4A7C15ull;
+        h ^= h >> 33;
+        h *= 0xFF51AFD7ED558CCDull;
+        h ^= h >> 33;
+        h *= 0xC4CEB9FE1A85EC53ull;
+        h ^= h >> 33;
+        return h;
+    }
+
     static std::uint64_t read_first_u64_noexcept(const void* data, DWORD size) noexcept {
         std::uint64_t value = 0;
         if (data != nullptr && size >= sizeof(value)) {
@@ -499,10 +528,24 @@ bool voyager::device_t::connect() noexcept {
     SPOOF_FUNC;
 
     if (is_connected()) {
+        diag::log_tagged_critical_fmt("comm-startup",
+            "connect_skip already_connected=1 handle=0x%llX pid=%u session=%d hb_tsc=%llu bridge_sentinel=%llu",
+            reinterpret_cast<unsigned long long>(driver_handle_),
+            process_id_,
+            session_key_ != 0 ? 1 : 0,
+            static_cast<unsigned long long>(last_heartbeat_tsc_),
+            static_cast<unsigned long long>(last_bridge_sentinel_tsc_));
         return true;
     }
 
     std::wstring device_path = device_names_um::get_device_path();
+    diag::log_tagged_critical_fmt("comm-startup",
+        "connect_enter local_pid=%lu local_tid=%lu path_chars=%zu base=0x%04X key_hash=0x%08X",
+        static_cast<unsigned long>(GetCurrentProcessId()),
+        static_cast<unsigned long>(GetCurrentThreadId()),
+        static_cast<std::size_t>(device_path.size()),
+        compute_ioctl_base_snapshot(),
+        hash_build_key(compute_dynamic_key_snapshot()));
     driver_handle_ = CreateFileW(
         device_path.c_str(),
         GENERIC_READ | GENERIC_WRITE,
@@ -532,8 +575,16 @@ bool voyager::device_t::connect() noexcept {
 
     if (!is_connected()) {
         last_connect_error_ = GetLastError();
+        diag::log_tagged_critical_fmt("comm-startup",
+            "connect_failed gle=%lu handle=0x%llX",
+            static_cast<unsigned long>(last_connect_error_),
+            reinterpret_cast<unsigned long long>(driver_handle_));
         return false;
     }
+    diag::log_tagged_critical_fmt("comm-startup",
+        "connect_handle_opened handle=0x%llX session_before=%d",
+        reinterpret_cast<unsigned long long>(driver_handle_),
+        session_key_ != 0 ? 1 : 0);
     last_connect_error_ = 0;
     server_seed_ = 0;
     server_ioctl_seed_ = 0;
@@ -541,6 +592,14 @@ bool voyager::device_t::connect() noexcept {
     ioctl_codes::reset_server_ioctl_seed();
     session_key_ = static_cast<std::uint32_t>(__rdtsc() ^ 0xDEADC0DEu);
     if (session_key_ == 0) session_key_ = 0x12345678u;
+    diag::log_tagged_critical_fmt("comm-startup",
+        "connect_heartbeat_begin handle=0x%llX session=%d inst_seed=%u/%u glob_seed=%u/%u",
+        reinterpret_cast<unsigned long long>(driver_handle_),
+        session_key_ != 0 ? 1 : 0,
+        server_seed_ != 0 ? 1u : 0u,
+        server_ioctl_seed_ != 0 ? 1u : 0u,
+        dynamic_key::g_server_seed != 0 ? 1u : 0u,
+        ioctl_codes::g_server_ioctl_seed != 0 ? 1u : 0u);
     if (!send_heartbeat()) {
         DWORD hb_err = last_heartbeat_error_;
         if (hb_err == 0 && last_heartbeat_dioctl_result_) {
@@ -554,6 +613,15 @@ bool voyager::device_t::connect() noexcept {
             hb_err = ERROR_GEN_FAILURE;
         }
         last_connect_error_ = 0xBEA70000u | (hb_err & 0xFFFFu);
+        diag::log_tagged_critical_fmt("comm-startup",
+            "connect_heartbeat_failed hb_err=%lu last_connect_error=0x%08lX dioctl=%d bytes=%lu response=0x%llX bridge_whoswho=%llu bridge_sentinel=%llu",
+            static_cast<unsigned long>(hb_err),
+            static_cast<unsigned long>(last_connect_error_),
+            last_heartbeat_dioctl_result_ ? 1 : 0,
+            static_cast<unsigned long>(last_heartbeat_bytes_),
+            static_cast<unsigned long long>(last_heartbeat_response_),
+            static_cast<unsigned long long>(last_bridge_whoswho_tsc_),
+            static_cast<unsigned long long>(last_bridge_sentinel_tsc_));
         CloseHandle(driver_handle_);
         driver_handle_ = INVALID_HANDLE_VALUE;
         session_key_ = 0;
@@ -564,6 +632,13 @@ bool voyager::device_t::connect() noexcept {
         return false;
     }
 
+    diag::log_tagged_critical_fmt("comm-startup",
+        "connect_success handle=0x%llX hb_tsc=%llu bridge_whoswho=%llu bridge_sentinel=%llu first_sentinel=%llu",
+        reinterpret_cast<unsigned long long>(driver_handle_),
+        static_cast<unsigned long long>(last_heartbeat_tsc_),
+        static_cast<unsigned long long>(last_bridge_whoswho_tsc_),
+        static_cast<unsigned long long>(last_bridge_sentinel_tsc_),
+        static_cast<unsigned long long>(first_sentinel_ready_tsc_));
     return true;
 }
 
@@ -2029,10 +2104,42 @@ bool voyager::device_t::send_request(DWORD control_code, void* input, DWORD inpu
     }
     const bool hvdt_shape = hvdt_user_buffer_shape(input_size);
     const bool hvdt_request = (dynamic_offset_valid && dynamic_offset == k_hvdt_offset) || hvdt_shape;
+    const bool startup_request = dynamic_offset_valid && startup_ioctl_offset(dynamic_offset);
+    const char* startup_name = dynamic_offset_valid ? startup_ioctl_name(dynamic_offset) : "UNKNOWN";
     const DWORD hvdt_expected_code = make_ioctl_snapshot(k_hvdt_offset);
     const std::uint64_t hvdt_first8_pre = read_first_u64_noexcept(input, input_size);
     const std::uint64_t hvdt_flags_pre = hvdt_shape ? hvdt_first8_pre : 0;
     log_security_snapshot("send_request_pre", control_code, effective_control_code, 0);
+    if (startup_request) {
+        diag::log_tagged_critical_fmt("comm-startup",
+            "send_request_startup_pre name=%s raw=0x%08X effective=0x%08X dyn_offset=%u input=%p input_size=%u connected=%d handle=0x%llX local_pid=%lu local_tid=%lu target_pid=%u session=%d inst_seed=%u/%u glob_seed=%u/%u base_before=0x%04X base_after=0x%04X key_hash_before=0x%08X key_hash_after=0x%08X ioctl_seed_hash_before=0x%08X ioctl_seed_hash_after=0x%08X hb_tsc=%llu bridge_whoswho=%llu bridge_sentinel=%llu first_sentinel=%llu",
+            startup_name,
+            control_code,
+            effective_control_code,
+            dynamic_offset,
+            input,
+            input_size,
+            is_connected() ? 1 : 0,
+            reinterpret_cast<unsigned long long>(driver_handle_),
+            static_cast<unsigned long>(local_pid),
+            static_cast<unsigned long>(local_tid),
+            process_id_,
+            session_key_ != 0 ? 1 : 0,
+            server_seed_ != 0 ? 1u : 0u,
+            server_ioctl_seed_ != 0 ? 1u : 0u,
+            global_server_seed_after_sync,
+            global_ioctl_seed_after_sync,
+            base_before_sync,
+            base_after_sync,
+            key_hash_before_sync,
+            key_hash_after_sync,
+            ioctl_seed_hash_before_sync,
+            ioctl_seed_hash_after_sync,
+            static_cast<unsigned long long>(last_heartbeat_tsc_),
+            static_cast<unsigned long long>(last_bridge_whoswho_tsc_),
+            static_cast<unsigned long long>(last_bridge_sentinel_tsc_),
+            static_cast<unsigned long long>(first_sentinel_ready_tsc_));
+    }
     if (hvdt_request || control_code == hvdt_expected_code || effective_control_code == hvdt_expected_code) {
         diag::log_tagged_critical_fmt("comm",
             "send_request_hvdt_pre raw=0x%08X effective=0x%08X expected=0x%08X dyn_valid=%d dyn_offset=%u shape=%u input=%p output=%p input_size=%u output_size=%u first8=0x%016llX flags=0x%016llX connected=%d handle=0x%llX local_pid=%lu local_tid=%lu target_pid=%u session=%d inst_seed=%u/%u glob_seed_before=%u/%u glob_seed_after=%u/%u base_before=0x%04X base_after=0x%04X key_hash_before=0x%08X key_hash_after=0x%08X ioctl_seed_hash_before=0x%08X ioctl_seed_hash_after=0x%08X",
@@ -2097,6 +2204,17 @@ bool voyager::device_t::send_request(DWORD control_code, void* input, DWORD inpu
                 static_cast<unsigned long>(ERROR_INVALID_HANDLE));
         }
         log_security_snapshot("send_request_reject", control_code, effective_control_code, ERROR_INVALID_HANDLE);
+        if (startup_request) {
+            diag::log_tagged_critical_fmt("comm-startup",
+                "send_request_startup_reject name=%s raw=0x%08X effective=0x%08X dyn_offset=%u input_size=%u connected=%d gle=%lu",
+                startup_name,
+                control_code,
+                effective_control_code,
+                dynamic_offset,
+                input_size,
+                is_connected() ? 1 : 0,
+                static_cast<unsigned long>(ERROR_INVALID_HANDLE));
+        }
         return false;
     }
 
@@ -2294,6 +2412,27 @@ bool voyager::device_t::send_request(DWORD control_code, void* input, DWORD inpu
         RC_UM_DBG("send_request FAILED ioctl=0x%08X input_size=%u err=%lu handle=0x%llX",
             effective_control_code, input_size, err, reinterpret_cast<unsigned long long>(driver_handle_));
         log_security_snapshot("send_request_failed", control_code, effective_control_code, err);
+        if (startup_request) {
+            diag::log_tagged_critical_fmt("comm-startup",
+                "send_request_startup_post name=%s ok=0 raw=0x%08X effective=0x%08X dyn_offset=%u input_size=%u bytes=%lu gle=%lu elapsed_ms=%llu session=%d inst_seed=%u/%u glob_seed=%u/%u hb_tsc=%llu bridge_whoswho=%llu bridge_sentinel=%llu first_sentinel=%llu",
+                startup_name,
+                control_code,
+                effective_control_code,
+                dynamic_offset,
+                input_size,
+                static_cast<unsigned long>(bytes_returned),
+                err,
+                static_cast<unsigned long long>(GetTickCount64() - ioctl_start),
+                session_key_ != 0 ? 1 : 0,
+                server_seed_ != 0 ? 1u : 0u,
+                server_ioctl_seed_ != 0 ? 1u : 0u,
+                dynamic_key::g_server_seed != 0 ? 1u : 0u,
+                ioctl_codes::g_server_ioctl_seed != 0 ? 1u : 0u,
+                static_cast<unsigned long long>(last_heartbeat_tsc_),
+                static_cast<unsigned long long>(last_bridge_whoswho_tsc_),
+                static_cast<unsigned long long>(last_bridge_sentinel_tsc_),
+                static_cast<unsigned long long>(first_sentinel_ready_tsc_));
+        }
         if (effective_control_code == ioctl_codes::ADBG() && input_size >= sizeof(detail::anti_debug_request)) {
             const auto* adbg = static_cast<const detail::anti_debug_request*>(input);
             diag::log_tagged_fmt("comm",
@@ -2328,6 +2467,27 @@ bool voyager::device_t::send_request(DWORD control_code, void* input, DWORD inpu
         log_security_snapshot("send_request_ok_suspicious", control_code, effective_control_code, 0);
     } else {
         log_security_snapshot("send_request_ok", control_code, effective_control_code, 0);
+    }
+    if (result && startup_request) {
+        diag::log_tagged_critical_fmt("comm-startup",
+            "send_request_startup_post name=%s ok=1 raw=0x%08X effective=0x%08X dyn_offset=%u input_size=%u bytes=%lu gle=%lu elapsed_ms=%llu session=%d inst_seed=%u/%u glob_seed=%u/%u hb_tsc=%llu bridge_whoswho=%llu bridge_sentinel=%llu first_sentinel=%llu",
+            startup_name,
+            control_code,
+            effective_control_code,
+            dynamic_offset,
+            input_size,
+            static_cast<unsigned long>(bytes_returned),
+            static_cast<unsigned long>(ERROR_SUCCESS),
+            static_cast<unsigned long long>(GetTickCount64() - ioctl_start),
+            session_key_ != 0 ? 1 : 0,
+            server_seed_ != 0 ? 1u : 0u,
+            server_ioctl_seed_ != 0 ? 1u : 0u,
+            dynamic_key::g_server_seed != 0 ? 1u : 0u,
+            ioctl_codes::g_server_ioctl_seed != 0 ? 1u : 0u,
+            static_cast<unsigned long long>(last_heartbeat_tsc_),
+            static_cast<unsigned long long>(last_bridge_whoswho_tsc_),
+            static_cast<unsigned long long>(last_bridge_sentinel_tsc_),
+            static_cast<unsigned long long>(first_sentinel_ready_tsc_));
     }
 
     spoofer::scatter_execution();
@@ -5024,6 +5184,19 @@ bool voyager::device_t::relay_server_token_v2(std::uint32_t token_hash, std::uin
     server_token_relay_scope_t relay_scope;
     sync_dynamic_security_state();
     log_security_snapshot("relay_server_token_v2_entry", 0, 0, 0);
+    diag::log_tagged_critical_fmt("comm-startup",
+        "relay_server_token_v2_enter connected=%d token_hash=0x%08X nonce_fold=0x%llX out_proof=%d session=%d inst_seed=%u/%u glob_seed=%u/%u hb_tsc=%llu bridge_sentinel=%llu",
+        is_connected() ? 1 : 0,
+        token_hash,
+        static_cast<unsigned long long>(fold64_no_secret(server_nonce)),
+        out_driver_proof ? 1 : 0,
+        session_key_ != 0 ? 1 : 0,
+        server_seed_ != 0 ? 1u : 0u,
+        server_ioctl_seed_ != 0 ? 1u : 0u,
+        dynamic_key::g_server_seed != 0 ? 1u : 0u,
+        ioctl_codes::g_server_ioctl_seed != 0 ? 1u : 0u,
+        static_cast<unsigned long long>(last_heartbeat_tsc_),
+        static_cast<unsigned long long>(last_bridge_sentinel_tsc_));
 
     if (!is_connected()) return false;
 
@@ -5035,9 +5208,22 @@ bool voyager::device_t::relay_server_token_v2(std::uint32_t token_hash, std::uin
 
     const DWORD ioctl_code = make_ioctl_snapshot(46);
     log_security_snapshot("relay_server_token_v2_pre", ioctl_code, ioctl_code, 0);
+    diag::log_tagged_critical_fmt("comm-startup",
+        "relay_server_token_v2_send_pre ioctl=0x%08X token_hash=0x%08X nonce_fold=0x%llX session=%d",
+        ioctl_code,
+        token_hash,
+        static_cast<unsigned long long>(fold64_no_secret(server_nonce)),
+        session_key_ != 0 ? 1 : 0);
     if (!send_request(ioctl_code, &req, static_cast<DWORD>(sizeof(req)))) {
         DWORD first_err = GetLastError();
         log_security_snapshot("relay_server_token_v2_first_failed", ioctl_code, ioctl_code, first_err);
+        diag::log_tagged_critical_fmt("comm-startup",
+            "relay_server_token_v2_first_failed ioctl=0x%08X err=%lu token_hash=0x%08X nonce_fold=0x%llX will_recover=%d",
+            ioctl_code,
+            static_cast<unsigned long>(first_err),
+            token_hash,
+            static_cast<unsigned long long>(fold64_no_secret(server_nonce)),
+            first_err == ERROR_INVALID_FUNCTION ? 1 : 0);
         if (first_err != ERROR_INVALID_FUNCTION)
             return false;
 
@@ -5059,10 +5245,24 @@ bool voyager::device_t::relay_server_token_v2(std::uint32_t token_hash, std::uin
             if (hb_err == 0)
                 hb_err = ERROR_GEN_FAILURE;
             log_security_snapshot("relay_server_token_v2_recover_heartbeat_failed", retry_ioctl_code, retry_ioctl_code, hb_err);
+            diag::log_tagged_critical_fmt("comm-startup",
+                "relay_server_token_v2_recover_heartbeat_failed retry_ioctl=0x%08X hb_err=%lu dioctl=%d bytes=%lu response=0x%llX bridge_sentinel=%llu",
+                retry_ioctl_code,
+                static_cast<unsigned long>(hb_err),
+                last_heartbeat_dioctl_result_ ? 1 : 0,
+                static_cast<unsigned long>(last_heartbeat_bytes_),
+                static_cast<unsigned long long>(last_heartbeat_response_),
+                static_cast<unsigned long long>(last_bridge_sentinel_tsc_));
             SetLastError(hb_err);
             return false;
         }
         log_security_snapshot("relay_server_token_v2_recover_heartbeat_ok", retry_ioctl_code, retry_ioctl_code, 0);
+        diag::log_tagged_critical_fmt("comm-startup",
+            "relay_server_token_v2_recover_heartbeat_ok retry_ioctl=0x%08X hb_tsc=%llu bridge_whoswho=%llu bridge_sentinel=%llu",
+            retry_ioctl_code,
+            static_cast<unsigned long long>(last_heartbeat_tsc_),
+            static_cast<unsigned long long>(last_bridge_whoswho_tsc_),
+            static_cast<unsigned long long>(last_bridge_sentinel_tsc_));
 
         detail::server_token_relay_v2 retry{};
         retry.token_hash = token_hash;
@@ -5071,7 +5271,14 @@ bool voyager::device_t::relay_server_token_v2(std::uint32_t token_hash, std::uin
         retry.server_nonce = server_nonce;
         log_security_snapshot("relay_server_token_v2_retry_pre", retry_ioctl_code, retry_ioctl_code, 0);
         if (!send_request(retry_ioctl_code, &retry, static_cast<DWORD>(sizeof(retry)))) {
-            log_security_snapshot("relay_server_token_v2_retry_failed", retry_ioctl_code, retry_ioctl_code, GetLastError());
+            DWORD retry_err = GetLastError();
+            log_security_snapshot("relay_server_token_v2_retry_failed", retry_ioctl_code, retry_ioctl_code, retry_err);
+            diag::log_tagged_critical_fmt("comm-startup",
+                "relay_server_token_v2_retry_failed retry_ioctl=0x%08X err=%lu token_hash=0x%08X nonce_fold=0x%llX",
+                retry_ioctl_code,
+                static_cast<unsigned long>(retry_err),
+                token_hash,
+                static_cast<unsigned long long>(fold64_no_secret(server_nonce)));
             SetLastError(first_err);
             return false;
         }
@@ -5085,9 +5292,26 @@ bool voyager::device_t::relay_server_token_v2(std::uint32_t token_hash, std::uin
         dynamic_key::set_server_seed(server_nonce, token_hash, session_key_);
         ioctl_codes::set_server_ioctl_seed(server_nonce, token_hash, session_key_);
         log_security_snapshot("relay_server_token_v2_seeded", ioctl_code, make_ioctl_snapshot(46), 0);
+        diag::log_tagged_critical_fmt("comm-startup",
+            "relay_server_token_v2_seeded result=%u proof_fold=0x%llX token_hash=0x%08X nonce_fold=0x%llX inst_seed=%u/%u glob_seed=%u/%u seeded_ioctl=0x%08X",
+            req.result,
+            static_cast<unsigned long long>(fold64_no_secret(req.driver_proof)),
+            token_hash,
+            static_cast<unsigned long long>(fold64_no_secret(server_nonce)),
+            server_seed_ != 0 ? 1u : 0u,
+            server_ioctl_seed_ != 0 ? 1u : 0u,
+            dynamic_key::g_server_seed != 0 ? 1u : 0u,
+            ioctl_codes::g_server_ioctl_seed != 0 ? 1u : 0u,
+            make_ioctl_snapshot(46));
         return true;
     }
     log_security_snapshot("relay_server_token_v2_rejected", ioctl_code, ioctl_code, ERROR_ACCESS_DENIED);
+    diag::log_tagged_critical_fmt("comm-startup",
+        "relay_server_token_v2_rejected result=%u proof_fold=0x%llX token_hash=0x%08X nonce_fold=0x%llX",
+        req.result,
+        static_cast<unsigned long long>(fold64_no_secret(req.driver_proof)),
+        token_hash,
+        static_cast<unsigned long long>(fold64_no_secret(server_nonce)));
     return false;
 }
 

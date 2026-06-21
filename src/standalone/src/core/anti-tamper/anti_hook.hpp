@@ -688,6 +688,52 @@ namespace veh_chain {
 
 namespace dr_scan {
 
+    inline bool context_has_enabled_dr_in_text(const CONTEXT& ctx, uint64_t text_base, uint64_t text_end)
+    {
+        const uint64_t drs[4] = { ctx.Dr0, ctx.Dr1, ctx.Dr2, ctx.Dr3 };
+        const uint64_t dr7 = ctx.Dr7;
+        for (int i = 0; i < 4; ++i)
+        {
+            if (drs[i] == 0) continue;
+            const bool en_local  = (dr7 >> (i * 2))     & 1;
+            const bool en_global = (dr7 >> (i * 2 + 1)) & 1;
+            if (!en_local && !en_global) continue;
+            if (drs[i] >= text_base && drs[i] < text_end)
+                return true;
+        }
+        return false;
+    }
+
+    inline bool current_thread_has_dr_in_text(uint64_t text_base, uint64_t text_end)
+    {
+        CONTEXT ctx{};
+        ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        if (!GetThreadContext(GetCurrentThread(), &ctx))
+            return false;
+        return context_has_enabled_dr_in_text(ctx, text_base, text_end);
+    }
+
+    inline bool thread_has_dr_in_text(DWORD tid, uint64_t text_base, uint64_t text_end)
+    {
+        HANDLE ht = OpenThread(THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME,
+            FALSE, tid);
+        if (!ht) return false;
+
+        bool ok = false;
+        CONTEXT ctx{};
+        ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+
+        DWORD prev_susp = SuspendThread(ht);
+        if (prev_susp != static_cast<DWORD>(-1))
+        {
+            if (GetThreadContext(ht, &ctx))
+                ok = context_has_enabled_dr_in_text(ctx, text_base, text_end);
+            ResumeThread(ht);
+        }
+        CloseHandle(ht);
+        return ok;
+    }
+
     inline bool any_dr_in_text_range(uint64_t text_base, uint64_t text_end)
     {
         if (text_base == 0 || text_end <= text_base) return false;
@@ -709,64 +755,69 @@ namespace dr_scan {
                 if (te.th32OwnerProcessID != self_pid) continue;
                 if (te.th32ThreadID == self_tid) continue;
 
-                HANDLE ht = OpenThread(THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME,
-                    FALSE, te.th32ThreadID);
-                if (!ht) continue;
-
-                CONTEXT ctx{};
-                ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-
-                DWORD prev_susp = SuspendThread(ht);
-                if (prev_susp != static_cast<DWORD>(-1))
-                {
-                    if (GetThreadContext(ht, &ctx))
-                    {
-                        const uint64_t drs[4] = { ctx.Dr0, ctx.Dr1, ctx.Dr2, ctx.Dr3 };
-                        const uint64_t dr7 = ctx.Dr7;
-                        for (int i = 0; i < 4; ++i)
-                        {
-                            if (drs[i] == 0) continue;
-                            const bool en_local  = (dr7 >> (i * 2))     & 1;
-                            const bool en_global = (dr7 >> (i * 2 + 1)) & 1;
-                            if (!en_local && !en_global) continue;
-                            if (drs[i] >= text_base && drs[i] < text_end)
-                            {
-                                ok = true;
-                                break;
-                            }
-                        }
-                    }
-                    ResumeThread(ht);
-                }
-                CloseHandle(ht);
+                ok = thread_has_dr_in_text(te.th32ThreadID, text_base, text_end);
                 if (ok) break;
             } while (Thread32Next(snap, &te));
         }
         CloseHandle(snap);
 
         if (!ok)
-        {
-            CONTEXT ctx{};
-            ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-            if (GetThreadContext(GetCurrentThread(), &ctx))
-            {
-                const uint64_t drs[4] = { ctx.Dr0, ctx.Dr1, ctx.Dr2, ctx.Dr3 };
-                const uint64_t dr7 = ctx.Dr7;
-                for (int i = 0; i < 4; ++i)
-                {
-                    if (drs[i] == 0) continue;
-                    const bool en_local  = (dr7 >> (i * 2))     & 1;
-                    const bool en_global = (dr7 >> (i * 2 + 1)) & 1;
-                    if (!en_local && !en_global) continue;
-                    if (drs[i] >= text_base && drs[i] < text_end)
-                    {
-                        ok = true;
-                        break;
-                    }
-                }
-            }
-        }
+            ok = current_thread_has_dr_in_text(text_base, text_end);
 
+        return ok;
+    }
+
+    inline std::atomic<DWORD>& runtime_cursor_tid()
+    {
+        static std::atomic<DWORD> v{0};
+        return v;
+    }
+
+    inline bool any_dr_in_text_range_incremental(uint64_t text_base, uint64_t text_end, uint32_t budget)
+    {
+        if (text_base == 0 || text_end <= text_base) return false;
+        if (budget == 0) budget = 1;
+
+        if (current_thread_has_dr_in_text(text_base, text_end))
+            return true;
+
+        const DWORD self_pid = GetCurrentProcessId();
+        const DWORD self_tid = GetCurrentThreadId();
+        const DWORD cursor = runtime_cursor_tid().load(std::memory_order_acquire);
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snap == INVALID_HANDLE_VALUE) return false;
+
+        THREADENTRY32 te{};
+        te.dwSize = sizeof(te);
+        bool ok = false;
+        DWORD last_seen = cursor;
+        uint32_t scanned = 0;
+
+        auto scan_pass = [&](bool wrap) {
+            te.dwSize = sizeof(te);
+            if (!Thread32First(snap, &te)) return;
+            do
+            {
+                if (te.th32OwnerProcessID != self_pid) continue;
+                if (te.th32ThreadID == self_tid) continue;
+                if (!wrap && te.th32ThreadID <= cursor) continue;
+                if (wrap && cursor != 0 && te.th32ThreadID > cursor) continue;
+                last_seen = te.th32ThreadID;
+                ++scanned;
+                if (thread_has_dr_in_text(te.th32ThreadID, text_base, text_end))
+                {
+                    ok = true;
+                    break;
+                }
+            } while (scanned < budget && Thread32Next(snap, &te));
+        };
+
+        scan_pass(false);
+        if (!ok && scanned < budget && cursor != 0)
+            scan_pass(true);
+
+        CloseHandle(snap);
+        runtime_cursor_tid().store(last_seen, std::memory_order_release);
         return ok;
     }
 
@@ -1185,7 +1236,7 @@ inline bool verify_export_addresses(HMODULE mod)
     return true;
 }
 
-inline hook_report_t full_scan(const std::vector<state::iat_entry_t>& iat_snap)
+inline hook_report_t scan_impl(const std::vector<state::iat_entry_t>& iat_snap, bool incremental_dr)
 {
     hook_report_t report{};
 
@@ -1263,8 +1314,9 @@ inline hook_report_t full_scan(const std::vector<state::iat_entry_t>& iat_snap)
     if (rt.code_snap.text_base != 0 && rt.code_snap.text_size != 0)
     {
         uint64_t text_end = rt.code_snap.text_base + rt.code_snap.text_size;
-        report.dr_in_text_range = dr_scan::any_dr_in_text_range(
-            rt.code_snap.text_base, text_end);
+        report.dr_in_text_range = incremental_dr
+            ? dr_scan::any_dr_in_text_range_incremental(rt.code_snap.text_base, text_end, 16)
+            : dr_scan::any_dr_in_text_range(rt.code_snap.text_base, text_end);
         if (report.dr_in_text_range)
             webhook::send_debug_log("dr_scan", "dr_in_text_range", true);
     }
@@ -1304,6 +1356,16 @@ inline hook_report_t full_scan(const std::vector<state::iat_entry_t>& iat_snap)
     if (report.dispatch_table_redirected) report.summary += "redir:" + redir_name + " ";
 
     return report;
+}
+
+inline hook_report_t full_scan(const std::vector<state::iat_entry_t>& iat_snap)
+{
+    return scan_impl(iat_snap, false);
+}
+
+inline hook_report_t runtime_scan(const std::vector<state::iat_entry_t>& iat_snap)
+{
+    return scan_impl(iat_snap, true);
 }
 
 }

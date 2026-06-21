@@ -23,6 +23,7 @@ namespace anti_dma_canary {
         UINT64 va;
         UINT64 pa;
         UINT64 size;
+        PMDL mdl;
         UINT32 owner_pid;
         UINT32 active;
     };
@@ -155,9 +156,117 @@ namespace anti_dma_canary {
         return TRUE;
     }
 
+    __forceinline void release_locked_mdl(PMDL mdl) {
+        if (!mdl) return;
+        ULONG exception_code = 0;
+        __try {
+            if (_MmUnlockPages)
+                _MmUnlockPages(mdl);
+        } __except ((exception_code = GetExceptionInformation()->ExceptionRecord->ExceptionCode), EXCEPTION_EXECUTE_HANDLER) {
+            WW_LOG("dma_canary::mdl_unlock_exception mdl=%p code=0x%08lx",
+                mdl,
+                exception_code);
+        }
+        if (_IoFreeMdl)
+            _IoFreeMdl(mdl);
+    }
+
+    __forceinline BOOLEAN lock_user_page_pa_for_pid(ULONG pid, UINT64 va, PMDL* out_mdl, UINT64* out_pa) {
+        if (out_mdl) *out_mdl = nullptr;
+        if (out_pa) *out_pa = 0;
+        if (!pid || !va || !out_pa ||
+            !_PsLookupProcessByProcessId || !_ObfDereferenceObject ||
+            !_IoAllocateMdl || !_IoFreeMdl || !_MmProbeAndLockPages ||
+            !_MmUnlockPages || !_KeStackAttachProcess || !_KeUnstackDetachProcess) {
+            WW_LOG("dma_canary::lock_user_page_reject missing_prereq pid=%lu va=0x%llx",
+                pid,
+                static_cast<unsigned long long>(va));
+            return FALSE;
+        }
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+            WW_LOG("dma_canary::lock_user_page_reject irql=%lu pid=%lu va=0x%llx",
+                static_cast<ULONG>(KeGetCurrentIrql()),
+                pid,
+                static_cast<unsigned long long>(va));
+            return FALSE;
+        }
+
+        PEPROCESS proc = nullptr;
+        NTSTATUS lookup = _PsLookupProcessByProcessId(
+            reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(pid)), &proc);
+        if (!NT_SUCCESS(lookup) || !proc) {
+            WW_LOG("dma_canary::lock_user_page_reject lookup=0x%08lx pid=%lu va=0x%llx",
+                lookup,
+                pid,
+                static_cast<unsigned long long>(va));
+            return FALSE;
+        }
+
+        PVOID page_va = reinterpret_cast<PVOID>(static_cast<ULONG_PTR>(va & ~0xFFFULL));
+        PMDL mdl = _IoAllocateMdl(page_va, 0x1000, FALSE, FALSE, nullptr);
+        if (!mdl) {
+            _ObfDereferenceObject(proc);
+            WW_LOG("dma_canary::lock_user_page_reject mdl_alloc pid=%lu va=0x%llx page_va=%p",
+                pid,
+                static_cast<unsigned long long>(va),
+                page_va);
+            return FALSE;
+        }
+
+        KAPC_STATE apc{};
+        BOOLEAN attached = FALSE;
+        BOOLEAN locked = FALSE;
+        ULONG exception_code = 0;
+        UINT64 pa = 0;
+        __try {
+            _KeStackAttachProcess(proc, &apc);
+            attached = TRUE;
+            _MmProbeAndLockPages(mdl, UserMode, IoReadAccess);
+            locked = TRUE;
+            PPFN_NUMBER pfns = MmGetMdlPfnArray(mdl);
+            if (pfns && pfns[0] != 0)
+                pa = (static_cast<UINT64>(pfns[0]) << 12) | (va & 0xFFFULL);
+        } __except ((exception_code = GetExceptionInformation()->ExceptionRecord->ExceptionCode), EXCEPTION_EXECUTE_HANDLER) {
+        }
+
+        if (attached)
+            _KeUnstackDetachProcess(&apc);
+        _ObfDereferenceObject(proc);
+
+        if (!locked || pa == 0) {
+            if (locked)
+                release_locked_mdl(mdl);
+            else
+                _IoFreeMdl(mdl);
+            WW_LOG("dma_canary::lock_user_page_reject lock_failed pid=%lu va=0x%llx page_va=%p locked=%u pa=0x%llx seh=0x%08lx",
+                pid,
+                static_cast<unsigned long long>(va),
+                page_va,
+                locked ? 1u : 0u,
+                static_cast<unsigned long long>(pa),
+                exception_code);
+            return FALSE;
+        }
+
+        *out_pa = pa;
+        if (out_mdl)
+            *out_mdl = mdl;
+        else
+            release_locked_mdl(mdl);
+        WW_LOG("dma_canary::lock_user_page_ok pid=%lu va=0x%llx page_va=%p pa=0x%llx keep_mdl=%u",
+            pid,
+            static_cast<unsigned long long>(va),
+            page_va,
+            static_cast<unsigned long long>(pa),
+            out_mdl ? 1u : 0u);
+        return TRUE;
+    }
+
     __forceinline ULONG cleanup_for_pid(UINT32 owner_pid) {
         if (owner_pid == 0) return 0;
         ensure_lock();
+        PMDL release_mdls[MAX_CANARIES] = {};
+        ULONG release_count = 0;
         KIRQL old;
         KeAcquireSpinLock(&g_canary_lock, &old);
         ULONG cleared = 0;
@@ -168,6 +277,9 @@ namespace anti_dma_canary {
                 g_canaries[i].pa        = 0;
                 g_canaries[i].va        = 0;
                 g_canaries[i].size      = 0;
+                if (g_canaries[i].mdl && release_count < MAX_CANARIES)
+                    release_mdls[release_count++] = g_canaries[i].mdl;
+                g_canaries[i].mdl       = nullptr;
                 g_canaries[i].owner_pid = 0;
                 cleared++;
             }
@@ -180,6 +292,8 @@ namespace anti_dma_canary {
             g_canary_count = new_count;
         }
         KeReleaseSpinLock(&g_canary_lock, old);
+        for (ULONG i = 0; i < release_count; ++i)
+            release_locked_mdl(release_mdls[i]);
         if (cleared) {
             WW_LOG("dma_canary::cleanup_for_pid pid=%lu cleared=%lu count=%lu running=%ld queued=%ld work_running=%ld",
                 owner_pid,
@@ -233,22 +347,10 @@ namespace anti_dma_canary {
     }
 
     __forceinline UINT64 va_to_pa_for_pid(ULONG pid, UINT64 va) {
-        PEPROCESS proc = nullptr;
-        if (!NT_SUCCESS(PsLookupProcessByProcessId(
-                reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(pid)), &proc)) || !proc) {
-            return 0;
-        }
-
-        UINT64 dtb = 0;
-        __try {
-            dtb = *reinterpret_cast<UINT64*>(reinterpret_cast<UCHAR*>(proc) + 0x28);
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            dtb = 0;
-        }
-        ObDereferenceObject(proc);
-        if (!dtb) return 0;
-
-        return strong::translate_virtual_address(dtb, va);
+        UINT64 pa = 0;
+        if (lock_user_page_pa_for_pid(pid, va, nullptr, &pa))
+            return pa;
+        return 0;
     }
 
     __forceinline BOOLEAN canary_still_valid_for(UINT32 owner_pid, UINT64 owner_va, UINT64 canary_pa) {
@@ -348,8 +450,17 @@ namespace anti_dma_canary {
         }
         ensure_lock();
 
-        UINT64 pa = va_to_pa_for_pid(owner_pid, va);
+        PMDL locked_mdl = nullptr;
+        UINT64 pa = 0;
+        if (!lock_user_page_pa_for_pid(owner_pid, va, &locked_mdl, &pa)) {
+            WW_LOG("dma_canary::register_reject translate_failed va=0x%llx size=0x%llx owner=%lu",
+                static_cast<unsigned long long>(va),
+                static_cast<unsigned long long>(size),
+                owner_pid);
+            return FALSE;
+        }
         if (!pa) {
+            release_locked_mdl(locked_mdl);
             WW_LOG("dma_canary::register_reject translate_failed va=0x%llx size=0x%llx owner=%lu",
                 static_cast<unsigned long long>(va),
                 static_cast<unsigned long long>(size),
@@ -367,16 +478,20 @@ namespace anti_dma_canary {
                 g_canaries[i].va        = va;
                 g_canaries[i].pa        = pa & ~0xFFFULL;
                 g_canaries[i].size      = 0x1000ULL;
+                g_canaries[i].mdl       = locked_mdl;
                 g_canaries[i].owner_pid = owner_pid;
                 g_canaries[i].active    = 1;
                 if (i + 1 > g_canary_count) g_canary_count = i + 1;
                 slot = i;
                 ok = TRUE;
+                locked_mdl = nullptr;
                 break;
             }
         }
 
         KeReleaseSpinLock(&g_canary_lock, old);
+        if (locked_mdl)
+            release_locked_mdl(locked_mdl);
 
         if (ok) {
             LONG64 now = static_cast<LONG64>(KeQueryInterruptTime());

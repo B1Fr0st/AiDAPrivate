@@ -4499,8 +4499,9 @@ int main(int, char**)
         {
             startup_store_bg_step(7, "bg_init_worker", "pre_activation_anti_tamper_initialize_entering");
             const uint64_t anti_tamper_tick = static_cast<uint64_t>(GetTickCount64());
+            driver_bridge::dynamic_ioctl_state_t pre_at_dyn{};
             {
-                auto dyn = driver_bridge::dynamic_ioctl_state();
+                pre_at_dyn = driver_bridge::dynamic_ioctl_state();
                 auto& at_rt = anti_tamper::state::get();
                 startup_log_critical_fmt("anti_tamper_pre_activation_state initialized=%d driver_hardening=%d hardening_active=%d violation=%d runtime_authorized=%d validated=%d valid=%d arc=%d dyn_loaded=%d dyn_kernel=%d dyn_connected=%d dyn_ready=%d inst_seed=%u/%u global_seed=%u/%u ioctl_seed_hash=0x%08X hb_ioctl_seed_hash=0x%08X",
                     at_rt.initialized.load(std::memory_order_acquire) ? 1 : 0,
@@ -4511,18 +4512,38 @@ int main(int, char**)
                     license::validated ? 1 : 0,
                     standalone_license::is_valid() ? 1 : 0,
                     standalone_license::is_arc_loaded() ? 1 : 0,
-                    dyn.loaded ? 1 : 0,
-                    dyn.kernel ? 1 : 0,
-                    dyn.connected ? 1 : 0,
-                    dyn.ready ? 1 : 0,
-                    dyn.instance_server_seed,
-                    dyn.instance_ioctl_seed,
-                    dyn.global_server_seed,
-                    dyn.global_ioctl_seed,
-                    dyn.ioctl_seed_hash,
-                    dyn.heartbeat_ioctl_seed_hash);
+                    pre_at_dyn.loaded ? 1 : 0,
+                    pre_at_dyn.kernel ? 1 : 0,
+                    pre_at_dyn.connected ? 1 : 0,
+                    pre_at_dyn.ready ? 1 : 0,
+                    pre_at_dyn.instance_server_seed,
+                    pre_at_dyn.instance_ioctl_seed,
+                    pre_at_dyn.global_server_seed,
+                    pre_at_dyn.global_ioctl_seed,
+                    pre_at_dyn.ioctl_seed_hash,
+                    pre_at_dyn.heartbeat_ioctl_seed_hash);
             }
-            startup_log_critical_fmt("anti_tamper_initialize_call_pre pid=%lu tid=%lu tick=%llu runtime_authorized=%d validated=%d valid=%d arc=%d",
+            const bool pre_activation_driver_unseeded = pre_at_dyn.loaded && pre_at_dyn.kernel && pre_at_dyn.connected && !pre_at_dyn.ready;
+            if (!runtime_authorized && pre_activation_driver_unseeded)
+            {
+                startup_log_critical_fmt("anti_tamper_initialize_deferred_dynamic_ioctl_not_ready runtime_authorized=0 validated=%d valid=%d arc=%d dyn_loaded=%d dyn_kernel=%d dyn_connected=%d inst_seed=%u/%u global_seed=%u/%u ioctl_seed_hash=0x%08X hb_ioctl_seed_hash=0x%08X",
+                    license::validated ? 1 : 0,
+                    standalone_license::is_valid() ? 1 : 0,
+                    standalone_license::is_arc_loaded() ? 1 : 0,
+                    pre_at_dyn.loaded ? 1 : 0,
+                    pre_at_dyn.kernel ? 1 : 0,
+                    pre_at_dyn.connected ? 1 : 0,
+                    pre_at_dyn.instance_server_seed,
+                    pre_at_dyn.instance_ioctl_seed,
+                    pre_at_dyn.global_server_seed,
+                    pre_at_dyn.global_ioctl_seed,
+                    pre_at_dyn.ioctl_seed_hash,
+                    pre_at_dyn.heartbeat_ioctl_seed_hash);
+                diag::log_tagged("bg_init", "pre_activation_anti_tamper_initialize_deferred_dynamic_ioctl_not_ready");
+            }
+            else
+            {
+                startup_log_critical_fmt("anti_tamper_initialize_call_pre pid=%lu tid=%lu tick=%llu runtime_authorized=%d validated=%d valid=%d arc=%d",
                 GetCurrentProcessId(),
                 GetCurrentThreadId(),
                 static_cast<unsigned long long>(anti_tamper_tick),
@@ -4566,6 +4587,7 @@ int main(int, char**)
                 anti_tamper::enforce_violation_id(
                     aida::reason_ids::reason_id_from_string("anti_tamper_initialize_failed"),
                     "anti_tamper_initialize_failed_pre_activation");
+            }
             }
         }
         startup_store_bg_step(7, "bg_init_worker", "bg_init_all_steps_done");

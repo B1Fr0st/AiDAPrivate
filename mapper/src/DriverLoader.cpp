@@ -20,6 +20,15 @@ static void DLDbgLog(const char* func, const char* fmt, ...) {
 #define DLLOG(fmt, ...) DLDbgLog(__FUNCTION__, fmt, ##__VA_ARGS__)
 #define DLLOG_STATUS(msg, st) DLDbgLog(__FUNCTION__, "%s: 0x%08X (%s)", msg, (DWORD)(st), NT_SUCCESS(st) ? "SUCCESS" : "FAILED")
 
+static ULONGLONG DLElapsedMs(ULONGLONG start) {
+    ULONGLONG now = GetTickCount64();
+    return now >= start ? now - start : 0;
+}
+
+static ULONG DLBuildNumber() {
+    return *reinterpret_cast<volatile ULONG*>(static_cast<ULONG_PTR>(0x7FFE0260)) & 0xFFFFu;
+}
+
 static NTSTATUS WriteKernelLogPathValue(PCWSTR servicePath) {
     WCHAR kernelLogPath[512] = {};
     DWORD len = GetEnvironmentVariableW(L"AIDA_KERNEL_LOG_PATH", kernelLogPath, _countof(kernelLogPath));
@@ -223,12 +232,31 @@ namespace DriverLoader {
     }
 
     NTSTATUS LoadDriver(PCWSTR servicePath) {
+        const ULONGLONG start = GetTickCount64();
         DLLOG("Loading driver: %ls", servicePath);
+        DLLOG("LoadDriver enter service=%ls service_len=%llu pid=%lu tid=%lu build=%lu ntload=%p",
+            servicePath ? servicePath : L"(null)",
+            servicePath ? static_cast<unsigned long long>(wcslen(servicePath)) : 0ULL,
+            GetCurrentProcessId(),
+            GetCurrentThreadId(),
+            DLBuildNumber(),
+            NtLoadDriverPtr);
         UNICODE_STRING usServicePath;
         RtlInitUnicodeString(&usServicePath, servicePath);
+        DLLOG("LoadDriver unicode length=%u max=%u buffer=%p elapsed_ms=%llu",
+            usServicePath.Length,
+            usServicePath.MaximumLength,
+            usServicePath.Buffer,
+            DLElapsedMs(start));
 
         NTSTATUS status = NtLoadDriverPtr(&usServicePath);
         DLLOG_STATUS("NtLoadDriver", status);
+        DLLOG("LoadDriver exit service=%ls status=0x%08X elapsed_ms=%llu pid=%lu tid=%lu",
+            servicePath ? servicePath : L"(null)",
+            (DWORD)status,
+            DLElapsedMs(start),
+            GetCurrentProcessId(),
+            GetCurrentThreadId());
         if (!NT_SUCCESS(status)) {
             DLLOG("NtLoadDriver FAILED for '%ls', NTSTATUS=0x%08X", servicePath, (DWORD)status);
         }
@@ -237,12 +265,31 @@ namespace DriverLoader {
     }
 
     NTSTATUS UnloadDriver(PCWSTR servicePath) {
+        const ULONGLONG start = GetTickCount64();
         DLLOG("Unloading driver: %ls", servicePath);
+        DLLOG("UnloadDriver enter service=%ls service_len=%llu pid=%lu tid=%lu build=%lu ntunload=%p",
+            servicePath ? servicePath : L"(null)",
+            servicePath ? static_cast<unsigned long long>(wcslen(servicePath)) : 0ULL,
+            GetCurrentProcessId(),
+            GetCurrentThreadId(),
+            DLBuildNumber(),
+            NtUnloadDriverPtr);
         UNICODE_STRING usServicePath;
         RtlInitUnicodeString(&usServicePath, servicePath);
+        DLLOG("UnloadDriver unicode length=%u max=%u buffer=%p elapsed_ms=%llu",
+            usServicePath.Length,
+            usServicePath.MaximumLength,
+            usServicePath.Buffer,
+            DLElapsedMs(start));
 
         NTSTATUS status = NtUnloadDriverPtr(&usServicePath);
         DLLOG_STATUS("NtUnloadDriver", status);
+        DLLOG("UnloadDriver exit service=%ls status=0x%08X elapsed_ms=%llu pid=%lu tid=%lu",
+            servicePath ? servicePath : L"(null)",
+            (DWORD)status,
+            DLElapsedMs(start),
+            GetCurrentProcessId(),
+            GetCurrentThreadId());
 
         return status;
     }

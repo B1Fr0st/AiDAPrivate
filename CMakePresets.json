@@ -15,6 +15,7 @@
         "CMAKE_MAKE_PROGRAM": "C:/Users/ruar1337/Downloads/ninja-win/ninja.exe",
         "AIDA_ENABLE_LTCG": "OFF",
         "AIDA_FAST_LINK":   "ON",
+        "AIDA_REGENERATE_LEGACY_DRIVER_MAPPER_FROM_BINARY": "ON",
         "AIDA_CAMOUFOX_BUILD_REVERSE_MCP_EXE": "ON",
         "AIDA_CAMOUFOX_STAGE_SIDECAR_DEPS": "ON"
       },

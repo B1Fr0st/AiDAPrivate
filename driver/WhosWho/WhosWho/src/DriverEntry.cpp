@@ -564,8 +564,17 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     WW_LOG("DriverEntry: device initialization cleared flags=0x%lx elapsed_us=%lu",
         deviceObject->Flags,
         ww_elapsed_us(entry_start, entry_freq));
+    dbg_capture::write_immediate_formatted("[WW-EARLY] device initialization cleared flags=0x%lx elapsed_us=%lu\n",
+        deviceObject->Flags,
+        ww_elapsed_us(entry_start, entry_freq));
 
+    dbg_capture::write_immediate_formatted("[WW-EARLY] net_capture::initialize enter device=%p elapsed_us=%lu\n",
+        deviceObject,
+        ww_elapsed_us(entry_start, entry_freq));
     status = net_capture::initialize(deviceObject);
+    dbg_capture::write_immediate_formatted("[WW-EARLY] net_capture::initialize exit status=0x%08lx elapsed_us=%lu\n",
+        static_cast<ULONG>(status),
+        ww_elapsed_us(entry_start, entry_freq));
     if (!NT_SUCCESS(status)) {
         WW_LOG("DriverEntry: net_capture::initialize FAILED status=0x%08lx device_object=%p elapsed_us=%lu",
             status,
@@ -577,11 +586,17 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     }
 
     WW_LOG("DriverEntry: net_capture initialized elapsed_us=%lu", ww_elapsed_us(entry_start, entry_freq));
+    dbg_capture::write_immediate_formatted("[WW-EARLY] net_capture initialized elapsed_us=%lu\n",
+        ww_elapsed_us(entry_start, entry_freq));
 
 
     if (DriverObject->DriverSection) {
         auto ldr = static_cast<PLDR_DATA_TABLE_ENTRY>(DriverObject->DriverSection);
         PVOID base = ldr->DllBase;
+        dbg_capture::write_immediate_formatted("[WW-EARLY] DriverSection inspect enter base=%p size=0x%lx elapsed_us=%lu\n",
+            base,
+            ldr->SizeOfImage,
+            ww_elapsed_us(entry_start, entry_freq));
         WW_LOG("DriverEntry: DriverSection base_present=%u SizeOfImage=0x%lx build_hash=0x%llX image_base=%p",
             base != nullptr ? 1u : 0u,
             ldr->SizeOfImage,
@@ -611,7 +626,13 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
                                 sec[i].VirtualAddress,
                                 text_size,
                                 ww_elapsed_us(entry_start, entry_freq));
+                            dbg_capture::write_immediate_formatted("[WW-EARLY] sentinel_bridge::init enter text=%p size=0x%lx elapsed_us=%lu\n",
+                                text_base,
+                                text_size,
+                                ww_elapsed_us(entry_start, entry_freq));
                             sentinel_bridge::init(text_base, text_size);
+                            dbg_capture::write_immediate_formatted("[WW-EARLY] sentinel_bridge::init exit elapsed_us=%lu\n",
+                                ww_elapsed_us(entry_start, entry_freq));
                             found_text = true;
                             break;
                         }
@@ -633,6 +654,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     }
 
     WW_LOG("DriverEntry: starting watchdog...");
+    dbg_capture::write_immediate_formatted("[WW-EARLY] dispatch integrity enter elapsed_us=%lu\n",
+        ww_elapsed_us(entry_start, entry_freq));
     if (!dispatcher::verify_dispatch_integrity(DriverObject)) {
         WW_LOG("DriverEntry: dispatch integrity check FAILED before watchdog start elapsed_us=%lu",
             ww_elapsed_us(entry_start, entry_freq));
@@ -642,7 +665,12 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
         return STATUS_ACCESS_DENIED;
     }
     WW_LOG("DriverEntry: dispatch integrity check OK elapsed_us=%lu", ww_elapsed_us(entry_start, entry_freq));
+    dbg_capture::write_immediate_formatted("[WW-EARLY] process_guard::init enter elapsed_us=%lu\n",
+        ww_elapsed_us(entry_start, entry_freq));
     NTSTATUS ob_status = process_guard::init();
+    dbg_capture::write_immediate_formatted("[WW-EARLY] process_guard::init exit status=0x%08lx elapsed_us=%lu\n",
+        static_cast<ULONG>(ob_status),
+        ww_elapsed_us(entry_start, entry_freq));
     WW_LOG("DriverEntry: process_guard::init returned 0x%08lx elapsed_us=%lu", ob_status, ww_elapsed_us(entry_start, entry_freq));
     if (!NT_SUCCESS(ob_status)) {
         WW_LOG("DriverEntry: process_guard::init FAILED before watchdog start elapsed_us=%lu", ww_elapsed_us(entry_start, entry_freq));
@@ -653,10 +681,20 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
         return ob_status;
     }
 
+    dbg_capture::write_immediate_formatted("[WW-EARLY] sentinel_bridge::start_watchdog enter elapsed_us=%lu\n",
+        ww_elapsed_us(entry_start, entry_freq));
     sentinel_bridge::start_watchdog();
+    dbg_capture::write_immediate_formatted("[WW-EARLY] sentinel_bridge::start_watchdog exit elapsed_us=%lu\n",
+        ww_elapsed_us(entry_start, entry_freq));
     ww_log_driverentry_phase("watchdog_started", entry_start, entry_freq);
 
+    dbg_capture::write_immediate_formatted("[WW-EARLY] allocate_evidence_blob enter elapsed_us=%lu\n",
+        ww_elapsed_us(entry_start, entry_freq));
     NTSTATUS evidence_status = sentinel_bridge::allocate_evidence_blob();
+    dbg_capture::write_immediate_formatted("[WW-EARLY] allocate_evidence_blob exit status=0x%08lx blob=%p elapsed_us=%lu\n",
+        static_cast<ULONG>(evidence_status),
+        sentinel_bridge::g_evidence_blob,
+        ww_elapsed_us(entry_start, entry_freq));
     WW_LOG("DriverEntry: allocate_evidence_blob returned 0x%08lx blob=%p offset=0x%llx elapsed_us=%lu",
         evidence_status,
         sentinel_bridge::g_evidence_blob,
