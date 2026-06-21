@@ -103,6 +103,9 @@ struct state_t {
 	std::mutex init_mtx;
 	std::atomic<bool> initialized{false};
 	std::string specs_dir;
+	std::string init_detail;
+	std::string last_specs_probe;
+	std::string last_init_reason;
 	std::ostringstream err_stream;
 	std::atomic<int> active_decompiles{0};
 	std::atomic<bool> shutting_down{false};
@@ -110,6 +113,8 @@ struct state_t {
 };
 
 inline state_t g_state;
+
+inline std::string init_diagnostics();
 
 inline bool buffer_is_zero_padding(const std::vector<uint8_t>& bytes)
 {
@@ -267,6 +272,44 @@ inline std::string get_exe_directory() {
 	if (pos != std::string::npos)
 		return full.substr(0, pos);
 	return ".";
+}
+
+inline void append_specs_probe_candidate(std::ostringstream& out,
+                                         const char* label,
+                                         const std::string& path)
+{
+	DWORD attr = GetFileAttributesA(path.c_str());
+	out << label << "=\"" << path << "\"";
+	if (attr == INVALID_FILE_ATTRIBUTES) {
+		out << ":missing_gle=" << static_cast<unsigned long>(GetLastError());
+	} else {
+		out << ":attr=0x" << std::hex << std::uppercase << attr << std::dec
+		    << ":dir=" << ((attr & FILE_ATTRIBUTE_DIRECTORY) ? 1 : 0);
+	}
+	out << " ";
+}
+
+inline std::string describe_specs_probe(const std::string& explicit_dir)
+{
+	std::ostringstream out;
+	std::string exe_dir = get_exe_directory();
+	out << "explicit=\"" << (explicit_dir.empty() ? std::string("<empty>") : explicit_dir) << "\" ";
+	out << "exe_dir=\"" << exe_dir << "\" ";
+	if (!explicit_dir.empty())
+		append_specs_probe_candidate(out, "explicit_attr", explicit_dir);
+	append_specs_probe_candidate(out, "exe_ghidra_specs", exe_dir + "\\ghidra_specs");
+	append_specs_probe_candidate(out, "parent_ghidra_specs", exe_dir + "\\..\\ghidra_specs");
+#ifdef GHIDRA_SPECS_DIR
+#define AIDA_GHIDRA_SPECS_STR_IMPL(x) #x
+#define AIDA_GHIDRA_SPECS_STR(x) AIDA_GHIDRA_SPECS_STR_IMPL(x)
+	std::string cmake_dir = AIDA_GHIDRA_SPECS_STR(GHIDRA_SPECS_DIR);
+	#undef AIDA_GHIDRA_SPECS_STR
+	#undef AIDA_GHIDRA_SPECS_STR_IMPL
+	append_specs_probe_candidate(out, "cmake_ghidra_specs", cmake_dir);
+#else
+	out << "cmake_ghidra_specs=<not_defined> ";
+#endif
+	return out.str();
 }
 
 inline std::string find_specs_dir() {
@@ -760,9 +803,16 @@ inline bool init(const std::string& specs_dir = "") {
 		specs_dir.empty() ? "<empty>" : specs_dir.c_str());
 	std::lock_guard<std::mutex> lk(g_state.init_mtx);
 	if (g_state.initialized.load()) {
-		diag::log_tagged_critical("dec", "ghidra_init_exit reason=already_initialized");
+		diag::log_tagged_critical_fmt("dec", "ghidra_init_exit reason=already_initialized detail=%s",
+			g_state.init_detail.empty() ? "<empty>" : g_state.init_detail.c_str());
 		return true;
 	}
+	g_state.err_stream.str("");
+	g_state.err_stream.clear();
+	g_state.last_init_reason = "starting";
+	g_state.last_specs_probe = detail::describe_specs_probe(specs_dir);
+	g_state.init_detail = "ghidra init starting; " + g_state.last_specs_probe;
+	diag::log_tagged_critical_fmt("dec", "ghidra_init_specs_probe %s", g_state.last_specs_probe.c_str());
 
 	std::string dir = specs_dir;
 	if (dir.empty())
@@ -785,7 +835,11 @@ inline bool init(const std::string& specs_dir = "") {
 	}
 
 	if (dir.empty()) {
-		diag::log_tagged_critical("dec", "ghidra_init_exit reason=no_specs_dir");
+		g_state.last_init_reason = "dependency_blocked_no_specs_dir";
+		g_state.init_detail = "dependency_blocked=1 reason=no_ghidra_specs_dir " + g_state.last_specs_probe;
+		g_state.err_stream << g_state.init_detail << "\n";
+		diag::log_tagged_critical_fmt("dec", "ghidra_init_exit reason=no_specs_dir detail=%s",
+			g_state.init_detail.c_str());
 		return false;
 	}
 
@@ -793,26 +847,43 @@ inline bool init(const std::string& specs_dir = "") {
 		g_state.specs_dir = dir;
 		std::vector<std::string> paths;
 		paths.push_back(dir);
+		g_state.last_init_reason = "start_library";
+		g_state.init_detail = "starting_decompiler_library specs_dir=\"" + dir + "\" " + g_state.last_specs_probe;
 		diag::log_tagged_critical_fmt("dec", "ghidra_init_pre_startDecompilerLibrary dir=%s", dir.c_str());
 		ghidra::startDecompilerLibrary(paths);
 		diag::log_tagged_critical("dec", "ghidra_init_post_startDecompilerLibrary");
 		g_state.initialized.store(true);
-		diag::log_tagged_critical("dec", "ghidra_init_exit reason=ok");
+		g_state.last_init_reason = "ok";
+		g_state.init_detail = "initialized specs_dir=\"" + dir + "\" " + g_state.last_specs_probe;
+		diag::log_tagged_critical_fmt("dec", "ghidra_init_exit reason=ok detail=%s",
+			g_state.init_detail.c_str());
 		return true;
 	}
 	catch (ghidra::LowlevelError& err) {
 		g_state.err_stream << "ghidra init error: " << err.explain << "\n";
-		diag::log_tagged_critical_fmt("dec", "ghidra_init_exit reason=lowlevel_error err=%s", err.explain.c_str());
+		g_state.last_init_reason = "lowlevel_error";
+		g_state.init_detail = "dependency_blocked=1 reason=lowlevel_error specs_dir=\"" + dir + "\" err=\"" + err.explain + "\" " + g_state.last_specs_probe;
+		g_state.err_stream << g_state.init_detail << "\n";
+		diag::log_tagged_critical_fmt("dec", "ghidra_init_exit reason=lowlevel_error err=%s detail=%s",
+			err.explain.c_str(), g_state.init_detail.c_str());
 		return false;
 	}
 	catch (ghidra::DecoderError& err) {
 		g_state.err_stream << "ghidra decoder error: " << err.explain << "\n";
-		diag::log_tagged_critical_fmt("dec", "ghidra_init_exit reason=decoder_error err=%s", err.explain.c_str());
+		g_state.last_init_reason = "decoder_error";
+		g_state.init_detail = "dependency_blocked=1 reason=decoder_error specs_dir=\"" + dir + "\" err=\"" + err.explain + "\" " + g_state.last_specs_probe;
+		g_state.err_stream << g_state.init_detail << "\n";
+		diag::log_tagged_critical_fmt("dec", "ghidra_init_exit reason=decoder_error err=%s detail=%s",
+			err.explain.c_str(), g_state.init_detail.c_str());
 		return false;
 	}
 	catch (...) {
 		g_state.err_stream << "ghidra init: unknown error\n";
-		diag::log_tagged_critical("dec", "ghidra_init_exit reason=unknown_exception");
+		g_state.last_init_reason = "unknown_exception";
+		g_state.init_detail = "dependency_blocked=1 reason=unknown_exception specs_dir=\"" + dir + "\" " + g_state.last_specs_probe;
+		g_state.err_stream << g_state.init_detail << "\n";
+		diag::log_tagged_critical_fmt("dec", "ghidra_init_exit reason=unknown_exception detail=%s",
+			g_state.init_detail.c_str());
 		return false;
 	}
 }
@@ -833,7 +904,7 @@ inline ghidra_result_t decompile_function(uint64_t entry_addr,
 	if (!g_state.initialized.load()) {
 		if (!init()) {
 			result.is_error = true;
-			result.error_text = "ghidra decompiler not initialized: " + g_state.err_stream.str();
+			result.error_text = "dependency_blocked: ghidra decompiler not initialized; " + init_diagnostics();
 			return result;
 		}
 	}
@@ -1072,7 +1143,7 @@ inline ghidra_result_t decompile_buffer(const uint8_t* data, size_t size,
 	if (!g_state.initialized.load()) {
 		if (!init()) {
 			result.is_error = true;
-			result.error_text = "ghidra decompiler not initialized";
+			result.error_text = "dependency_blocked: ghidra decompiler not initialized; " + init_diagnostics();
 			return result;
 		}
 	}
@@ -1255,13 +1326,15 @@ inline void batch_decompile(const uint8_t* buffer, size_t buf_size, uint64_t bas
 
 	if (!g_state.initialized.load()) {
 		if (!init()) {
+			const std::string init_diag = init_diagnostics();
 			for (auto& r : results) {
 				r.is_error = true;
-				r.error_text = "ghidra decompiler not initialized";
+				r.error_text = "dependency_blocked: ghidra decompiler not initialized; " + init_diag;
 			}
 			diag::log_tagged_fmt("ghidra",
-				"batch_decompile_exit reason=init_failed entries=%zu elapsed_ms=%llu",
+				"batch_decompile_exit reason=init_failed entries=%zu diagnostics=%s elapsed_ms=%llu",
 				entries.size(),
+				init_diag.c_str(),
 				static_cast<unsigned long long>(GetTickCount64() - batch_start_ms));
 			return;
 		}
@@ -1436,6 +1509,20 @@ inline void batch_decompile(const uint8_t* buffer, size_t buf_size, uint64_t bas
 inline std::string last_error() {
 	std::lock_guard<std::mutex> lk(g_state.init_mtx);
 	return g_state.err_stream.str();
+}
+
+inline std::string init_diagnostics() {
+	std::lock_guard<std::mutex> lk(g_state.init_mtx);
+	std::ostringstream out;
+	out << "initialized=" << (g_state.initialized.load(std::memory_order_acquire) ? 1 : 0);
+	out << " last_init_reason=" << (g_state.last_init_reason.empty() ? "<empty>" : g_state.last_init_reason);
+	out << " specs_dir=\"" << (g_state.specs_dir.empty() ? std::string("<empty>") : g_state.specs_dir) << "\"";
+	if (!g_state.init_detail.empty())
+		out << " detail=\"" << g_state.init_detail << "\"";
+	std::string err = g_state.err_stream.str();
+	if (!err.empty())
+		out << " error=\"" << err << "\"";
+	return out.str();
 }
 
 inline bool is_initialized() {

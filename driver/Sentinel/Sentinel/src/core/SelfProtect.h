@@ -1,6 +1,7 @@
 #pragma once
 #include <imports/Defs.h>
 #include <core/Integrity.h>
+#include <core/NtVersion.h>
 
 
 namespace self_protect {
@@ -157,17 +158,29 @@ namespace self_protect {
             SIZE_T max_this_page = page_end - reinterpret_cast<ULONG_PTR>(base);
             if (max_this_page > size) max_this_page = size;
 
-            for (; i <= max_this_page - mask_len && i <= size - mask_len; ++i) {
-                bool found = true;
-                for (SIZE_T j = 0; j < mask_len; ++j) {
-                    if (mask[j] == 'x' && base[i + j] != pattern[j]) {
-                        found = false;
-                        break;
+            if (max_this_page >= mask_len) {
+                SIZE_T scan_limit = max_this_page - mask_len;
+                SIZE_T max_start = size - mask_len;
+                if (scan_limit > max_start) scan_limit = max_start;
+
+                for (; i <= scan_limit; ++i) {
+                    bool found = true;
+                    for (SIZE_T j = 0; j < mask_len; ++j) {
+                        if (mask[j] == 'x' && base[i + j] != pattern[j]) {
+                            found = false;
+                            break;
+                        }
                     }
+                    if (found)
+                        return const_cast<UCHAR*>(&base[i]);
                 }
-                if (found)
-                    return const_cast<UCHAR*>(&base[i]);
             }
+
+            SIZE_T next_i = page_end - reinterpret_cast<ULONG_PTR>(base);
+            if (next_i <= i)
+                ++i;
+            else
+                i = next_i;
         }
 
         return nullptr;
@@ -285,6 +298,12 @@ namespace self_protect {
     __forceinline bool clean_piddb_cache(PVOID nt_base, PLDR_DATA_TABLE_ENTRY ldr_entry) {
         if (!nt_base || !ldr_entry || !ldr_entry->DllBase)
             return false;
+
+        if (nt_version::is_windows_11_or_newer()) {
+            SN_LOG("self_protect::clean_piddb_cache skip_windows11 build=%lu",
+                nt_version::build_number());
+            return false;
+        }
 
         if (!_ExAcquireResourceExclusiveLite || !_ExReleaseResourceLite ||
             !_KeEnterCriticalRegion || !_KeLeaveCriticalRegion ||
@@ -500,6 +519,12 @@ namespace self_protect {
         if (!nt_base || !_MmIsAddressValid(nt_base))
             return false;
 
+        if (nt_version::is_windows_11_or_newer()) {
+            SN_LOG("self_protect::clean_mm_unloaded_drivers skip_windows11 build=%lu",
+                nt_version::build_number());
+            return false;
+        }
+
         static const UCHAR pat1[] = {
             0x4C, 0x8B, 0x15, 0x00, 0x00, 0x00, 0x00,
             0x4C, 0x8B, 0xC9
@@ -597,6 +622,12 @@ namespace self_protect {
     }
 
     __forceinline bool clean_kernel_hash_buckets(PVOID nt_base, PUNICODE_STRING driver_name) {
+        if (nt_version::is_windows_11_or_newer()) {
+            SN_LOG("self_protect::clean_kernel_hash_buckets skip_windows11 build=%lu",
+                nt_version::build_number());
+            return false;
+        }
+
         if (!driver_name || !driver_name->Buffer || driver_name->Length == 0)
             return false;
 
@@ -763,6 +794,12 @@ namespace self_protect {
     __forceinline bool clean_big_pool_table(PVOID nt_base, PVOID driver_base, SIZE_T driver_size) {
         if (!nt_base || !driver_base || driver_size == 0)
             return false;
+
+        if (nt_version::is_windows_11_or_newer()) {
+            SN_LOG("self_protect::clean_big_pool_table skip_windows11 build=%lu",
+                nt_version::build_number());
+            return false;
+        }
 
         if (!resolve_big_pool_table(nt_base))
             return false;

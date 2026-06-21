@@ -179,6 +179,36 @@ namespace detail
         return false;
     }
 
+    inline bool contains_offensive_mcp_process_text(const std::wstring& text)
+    {
+        if (text.empty())
+            return false;
+        static const wchar_t* const tokens[] = {
+            L"frida", L"x64dbg", L"x32dbg", L"windbg", L"cdb", L"kd debugger",
+            L"ida pro", L"hex rays", L"ghidra", L"binary ninja", L"radare",
+            L"rizin", L"dnspy", L"ilspy", L"cheat engine", L"process hacker",
+            L"system informer", L"scylla", L"pe sieve", L"hollows hunter",
+            L"openprocess", L"readprocessmemory", L"writeprocessmemory",
+            L"virtualprotectex", L"createremotethread", L"debugactiveprocess",
+            L"sedebugprivilege", L"process memory", L"read process memory",
+            L"write process memory", L"virtual memory", L"dump process",
+            L"process dump", L"minidump", L"dump memory", L"memory dump",
+            L"memory scanner", L"memory scan", L"scan memory", L"attach debugger",
+            L"debug process", L"inject dll", L"dll injection", L"remote thread",
+            L"hook function", L"patch bytes", L"patch memory", L"disassemble process",
+            L"decompile process", L"keylogger", L"credential dump", L"lsass dump",
+            L"mimikatz", L"packet capture", L"mitm", L"proxy intercept"
+        };
+        const std::wstring folded = fold_metadata_w(text, false);
+        const std::wstring compacted = fold_metadata_w(text, true);
+        for (const wchar_t* token : tokens)
+        {
+            if (folded_contains_token_w(folded, token) || compact_contains_token_w(compacted, token))
+                return true;
+        }
+        return false;
+    }
+
     inline bool equals_w(const wchar_t* lhs, const wchar_t* rhs)
     {
         return lhs && rhs && wcscmp(lhs, rhs) == 0;
@@ -830,6 +860,38 @@ namespace detail
         return path_has_dir_prefix_w(probe.image_lower, lower_copy(system_dir));
     }
 
+    inline bool windows_oem_input_helper_basename(const process_probe_t& probe)
+    {
+        static const wchar_t* const exact_names[] = {
+            L"syntpenh.exe"
+        };
+        const wchar_t* exe_base = basename_ptr(probe.exe_lower.c_str());
+        const wchar_t* image_base = basename_ptr(probe.image_lower.empty() ? probe.exe_lower.c_str() : probe.image_lower.c_str());
+        return equals_any_w(exe_base, exact_names) || equals_any_w(image_base, exact_names);
+    }
+
+    inline bool trusted_windows_oem_input_helper_process(const process_probe_t& probe)
+    {
+        if (!probe.query_ok || probe.image_lower.empty() || !windows_oem_input_helper_basename(probe))
+            return false;
+        wchar_t system_dir[MAX_PATH] = {};
+        UINT system_len = GetSystemDirectoryW(system_dir, MAX_PATH);
+        if (system_len == 0 || system_len >= MAX_PATH)
+            return false;
+        const std::wstring system_root = canonical_path_lower_w(std::wstring(system_dir, system_len));
+        if (system_root.empty())
+            return false;
+        const std::wstring image_path = canonical_path_lower_w(probe.image_lower);
+        if (image_path.empty())
+            return false;
+        const std::wstring base = lower_copy(basename_ptr(image_path.c_str()));
+        std::wstring expected = system_root;
+        if (!expected.empty() && expected.back() != L'\\')
+            expected.push_back(L'\\');
+        expected.append(base);
+        return image_path == expected;
+    }
+
     inline bool trusted_kernel_system_owner(DWORD owner_pid)
     {
         return owner_pid == 4;
@@ -843,6 +905,25 @@ namespace detail
             PROCESS_SET_INFORMATION |
             PROCESS_SUSPEND_RESUME;
         return (access & active_mutation) == 0;
+    }
+
+    inline bool trusted_aida_internal_camoufox_handle_access(DWORD access)
+    {
+        constexpr DWORD disallowed =
+            PROCESS_VM_WRITE |
+            PROCESS_VM_OPERATION |
+            PROCESS_DUP_HANDLE |
+            PROCESS_SET_INFORMATION |
+            PROCESS_SUSPEND_RESUME;
+        if ((access & disallowed) != 0)
+            return false;
+        constexpr DWORD allowed =
+            SYNCHRONIZE |
+            PROCESS_TERMINATE |
+            PROCESS_CREATE_THREAD |
+            PROCESS_QUERY_INFORMATION |
+            PROCESS_QUERY_LIMITED_INFORMATION;
+        return (access & ~allowed) == 0;
     }
 
     inline std::string format_process_handle_access_flags(DWORD access)
@@ -1057,9 +1138,9 @@ namespace detail
 
     inline bool has_offensive_mcp_tool_metadata_evidence(const process_probe_t& probe)
     {
-        return contains_offensive_mcp_tool_text(probe.exe_lower) ||
-            contains_offensive_mcp_tool_text(probe.image_lower) ||
-            contains_offensive_mcp_tool_text(probe.command_lower);
+        return contains_offensive_mcp_process_text(probe.exe_lower) ||
+            contains_offensive_mcp_process_text(probe.image_lower) ||
+            contains_offensive_mcp_process_text(probe.command_lower);
     }
 
     inline bool has_aida_target_evidence(const process_probe_t& probe)
@@ -1194,6 +1275,16 @@ namespace detail
                                                                const std::vector<process_probe_t>& probes)
     {
         return is_trusted_aida_internal_camoufox_mcp_process(probe) ||
+            is_trusted_aida_internal_camoufox_descendant_process(probe, probes);
+    }
+
+    inline bool is_trusted_aida_internal_camoufox_browser_process(const process_probe_t& probe,
+                                                                  const std::vector<process_probe_t>& probes)
+    {
+        static const wchar_t* const browser_names[] = {
+            L"camoufox.exe"
+        };
+        return basename_equals_any(probe, browser_names) &&
             is_trusted_aida_internal_camoufox_descendant_process(probe, probes);
     }
 
@@ -1641,7 +1732,9 @@ namespace detail
             const bool re_tool = is_re_tool(probe);
             const bool debugger_tool = is_debugger_tool(probe);
             const bool dump_tool = is_dump_tool(probe);
-            const bool high_value_tool = mcp_evidence || ai_tool || memory_tool || re_tool || debugger_tool || dump_tool;
+            const bool offensive_mcp_tool = mcp_evidence && has_offensive_mcp_tool_metadata_evidence(probe);
+            const bool high_value_tool = mcp_evidence || ai_tool || memory_tool || re_tool || debugger_tool ||
+                dump_tool || offensive_mcp_tool;
             const bool trusted_internal_camoufox =
                 !memory_tool &&
                 !re_tool &&
@@ -1724,6 +1817,11 @@ namespace detail
                 out.dump_tool_hash = out.dump_tool_hash ? mix_hash(out.dump_tool_hash, h) : h;
                 counted = true;
             }
+            if (offensive_mcp_tool)
+            {
+                out.offensive_mcp_tool = true;
+                counted = true;
+            }
             if (high_value_tool && has_aida_target_evidence(probe))
             {
                 out.targets_aida = true;
@@ -1732,7 +1830,7 @@ namespace detail
             if (counted)
             {
                 diag::log_tagged_fmt("guard",
-                    "ai_tool_posture_process_evidence pid=%lu parent_pid=%lu exe_hash=0x%016llX image_hash=0x%016llX command_hash=0x%016llX mcp=%d mcp_cmd=%d ai=%d llm=%d mem=%d re=%d dbg=%d dump=%d target=%d",
+                    "ai_tool_posture_process_evidence pid=%lu parent_pid=%lu exe_hash=0x%016llX image_hash=0x%016llX command_hash=0x%016llX mcp=%d mcp_cmd=%d ai=%d llm=%d mem=%d re=%d dbg=%d dump=%d offensive=%d target=%d",
                     static_cast<unsigned long>(probe.pid),
                     static_cast<unsigned long>(probe.parent_pid),
                     static_cast<unsigned long long>(probe.basename_hash),
@@ -1746,6 +1844,7 @@ namespace detail
                     re_tool ? 1 : 0,
                     debugger_tool ? 1 : 0,
                     dump_tool ? 1 : 0,
+                    offensive_mcp_tool ? 1 : 0,
                     has_aida_target_evidence(probe) ? 1 : 0);
                 add_process_evidence(out, probe);
             }
@@ -2438,6 +2537,7 @@ namespace self_analysis
         bool owner_targets_aida = false;
         bool trusted_system_ignored = false;
         bool fileless_bootstrap_parent_ignored = false;
+        bool internal_camoufox_ignored = false;
         DWORD access_mask = 0;
         DWORD first_owner_pid = 0;
         DWORD first_access_mask = 0;
@@ -2456,16 +2556,24 @@ namespace self_analysis
         bool first_owner_re = false;
         bool first_owner_debugger = false;
         bool first_owner_dump = false;
+        bool first_owner_offensive = false;
+        bool first_owner_input_helper = false;
         uint64_t owner_hash = 0;
         uint64_t trusted_system_owner_hash = 0;
         uint64_t fileless_bootstrap_parent_owner_hash = 0;
+        uint64_t internal_camoufox_owner_hash = 0;
         DWORD trusted_system_access_mask = 0;
         DWORD fileless_bootstrap_parent_access_mask = 0;
+        DWORD internal_camoufox_access_mask = 0;
         DWORD fileless_bootstrap_parent_owner_pid = 0;
+        DWORD internal_camoufox_owner_pid = 0;
         std::string fileless_bootstrap_parent_owner_image;
         std::string fileless_bootstrap_parent_owner_path;
+        std::string internal_camoufox_owner_image;
+        std::string internal_camoufox_owner_path;
         uint32_t trusted_system_ignored_count = 0;
         uint32_t fileless_bootstrap_parent_ignored_count = 0;
+        uint32_t internal_camoufox_ignored_count = 0;
         uint32_t observed_handle_count = 0;
     };
 
@@ -2645,6 +2753,40 @@ namespace self_analysis
                         probe = &fallback;
                     }
                 }
+                bool owner_memory = false;
+                bool owner_re = false;
+                bool owner_debugger = false;
+                bool owner_dump = false;
+                bool owner_offensive = false;
+                bool owner_mcp = false;
+                bool owner_ai = false;
+                bool owner_targets = false;
+                bool owner_input_helper_name = false;
+                bool owner_input_helper = false;
+                bool owner_internal_camoufox_browser = false;
+                uint64_t owner_hash = 0;
+                bool owner_query_ok = false;
+                bool owner_core_system = false;
+                bool owner_trusted_system_process = false;
+                if (probe)
+                {
+                    owner_hash = probe->basename_hash;
+                    owner_query_ok = probe->query_ok;
+                    owner_core_system = detail::trusted_windows_core_basename_w(probe->exe_lower);
+                    owner_trusted_system_process = detail::trusted_windows_system_process(*probe);
+                    owner_memory = detail::is_memory_scanner_tool(*probe);
+                    owner_re = detail::is_re_tool(*probe);
+                    owner_debugger = detail::is_debugger_tool(*probe);
+                    owner_dump = detail::is_dump_tool(*probe);
+                    owner_offensive = detail::has_offensive_mcp_tool_metadata_evidence(*probe);
+                    owner_mcp = detail::has_mcp_command_evidence(*probe);
+                    owner_ai = detail::is_ai_coding_tool(*probe);
+                    owner_targets = detail::has_aida_target_evidence(*probe);
+                    owner_input_helper_name = detail::windows_oem_input_helper_basename(*probe);
+                    owner_input_helper = detail::trusted_windows_oem_input_helper_process(*probe);
+                    owner_internal_camoufox_browser =
+                        probes && detail::is_trusted_aida_internal_camoufox_browser_process(*probe, *probes);
+                }
                 if (detail::is_fileless_bootstrap_parent_owner(probe, owner_pid, fileless_parent_pid))
                 {
                     std::string owner_image = detail::probe_image_for_log(probe);
@@ -2709,6 +2851,83 @@ namespace self_analysis
                         owner_image.empty() ? "<empty>" : owner_image.c_str(),
                         owner_path.empty() ? "<empty>" : owner_path.c_str());
                 }
+                if (owner_internal_camoufox_browser)
+                {
+                    std::string owner_image = detail::probe_image_for_log(probe);
+                    std::string owner_path = detail::probe_path_for_log(probe);
+                    std::string flags = detail::format_process_handle_access_flags(h.GrantedAccess);
+                    const bool bounded_access = detail::trusted_aida_internal_camoufox_handle_access(h.GrantedAccess);
+                    const bool owner_has_tool_context = owner_memory || owner_re || owner_debugger ||
+                        owner_dump || owner_offensive || owner_mcp || owner_ai || owner_targets;
+                    if (bounded_access && !owner_has_tool_context)
+                    {
+                        out.internal_camoufox_ignored = true;
+                        ++out.internal_camoufox_ignored_count;
+                        out.internal_camoufox_access_mask |= h.GrantedAccess;
+                        out.internal_camoufox_owner_pid = owner_pid;
+                        out.internal_camoufox_owner_hash = detail::mix_hash(
+                            out.internal_camoufox_owner_hash,
+                            owner_hash);
+                        if (out.internal_camoufox_owner_image.empty())
+                            out.internal_camoufox_owner_image = owner_image;
+                        if (out.internal_camoufox_owner_path.empty())
+                            out.internal_camoufox_owner_path = owner_path;
+                        diag::log_tagged_critical_fmt("guard",
+                            "ai_tool_posture_internal_camoufox_handle_ignored owner_pid=%lu handle=0x%016llX access=0x%08lX access_flags=%s owner_hash=0x%016llX owner_image=%s owner_path=%s ignored_count=%u",
+                            static_cast<unsigned long>(owner_pid),
+                            static_cast<unsigned long long>(h.HandleValue),
+                            static_cast<unsigned long>(h.GrantedAccess),
+                            flags.c_str(),
+                            static_cast<unsigned long long>(owner_hash),
+                            owner_image.empty() ? "<empty>" : owner_image.c_str(),
+                            owner_path.empty() ? "<empty>" : owner_path.c_str(),
+                            out.internal_camoufox_ignored_count);
+                        continue;
+                    }
+                    diag::log_tagged_critical_fmt("guard",
+                        "ai_tool_posture_internal_camoufox_handle_not_ignored owner_pid=%lu handle=0x%016llX access=0x%08lX access_flags=%s bounded_access=%d owner_memory=%d owner_re=%d owner_debugger=%d owner_dump=%d owner_offensive=%d owner_mcp=%d owner_ai=%d owner_target=%d owner_hash=0x%016llX owner_image=%s owner_path=%s",
+                        static_cast<unsigned long>(owner_pid),
+                        static_cast<unsigned long long>(h.HandleValue),
+                        static_cast<unsigned long>(h.GrantedAccess),
+                        flags.c_str(),
+                        bounded_access ? 1 : 0,
+                        owner_memory ? 1 : 0,
+                        owner_re ? 1 : 0,
+                        owner_debugger ? 1 : 0,
+                        owner_dump ? 1 : 0,
+                        owner_offensive ? 1 : 0,
+                        owner_mcp ? 1 : 0,
+                        owner_ai ? 1 : 0,
+                        owner_targets ? 1 : 0,
+                        static_cast<unsigned long long>(owner_hash),
+                        owner_image.empty() ? "<empty>" : owner_image.c_str(),
+                        owner_path.empty() ? "<empty>" : owner_path.c_str());
+                }
+                if (owner_input_helper_name)
+                {
+                    std::string owner_image = detail::probe_image_for_log(probe);
+                    std::string owner_path = detail::probe_path_for_log(probe);
+                    std::string flags = detail::format_process_handle_access_flags(h.GrantedAccess);
+                    diag::log_tagged_critical_fmt("guard",
+                        "ai_tool_posture_input_helper_handle_observed owner_pid=%lu handle=0x%016llX access=0x%08lX access_flags=%s trusted_input_helper=%d query_ok=%d owner_memory=%d owner_re=%d owner_debugger=%d owner_dump=%d owner_offensive=%d owner_mcp=%d owner_ai=%d owner_target=%d owner_hash=0x%016llX owner_image=%s owner_path=%s",
+                        static_cast<unsigned long>(owner_pid),
+                        static_cast<unsigned long long>(h.HandleValue),
+                        static_cast<unsigned long>(h.GrantedAccess),
+                        flags.c_str(),
+                        owner_input_helper ? 1 : 0,
+                        owner_query_ok ? 1 : 0,
+                        owner_memory ? 1 : 0,
+                        owner_re ? 1 : 0,
+                        owner_debugger ? 1 : 0,
+                        owner_dump ? 1 : 0,
+                        owner_offensive ? 1 : 0,
+                        owner_mcp ? 1 : 0,
+                        owner_ai ? 1 : 0,
+                        owner_targets ? 1 : 0,
+                        static_cast<unsigned long long>(owner_hash),
+                        owner_image.empty() ? "<empty>" : owner_image.c_str(),
+                        owner_path.empty() ? "<empty>" : owner_path.c_str());
+                }
                 if (detail::trusted_kernel_system_owner(owner_pid))
                 {
                     out.trusted_system_ignored = true;
@@ -2734,31 +2953,6 @@ namespace self_analysis
                         probe->basename_hash);
                     continue;
                 }
-                bool owner_memory = false;
-                bool owner_re = false;
-                bool owner_debugger = false;
-                bool owner_dump = false;
-                bool owner_mcp = false;
-                bool owner_ai = false;
-                bool owner_targets = false;
-                uint64_t owner_hash = 0;
-                bool owner_query_ok = false;
-                bool owner_core_system = false;
-                bool owner_trusted_system_process = false;
-                if (probe)
-                {
-                    owner_hash = probe->basename_hash;
-                    owner_query_ok = probe->query_ok;
-                    owner_core_system = detail::trusted_windows_core_basename_w(probe->exe_lower);
-                    owner_trusted_system_process = detail::trusted_windows_system_process(*probe);
-                    owner_memory = detail::is_memory_scanner_tool(*probe);
-                    owner_re = detail::is_re_tool(*probe);
-                    owner_debugger = detail::is_debugger_tool(*probe);
-                    owner_dump = detail::is_dump_tool(*probe);
-                    owner_mcp = detail::has_mcp_command_evidence(*probe);
-                    owner_ai = detail::is_ai_coding_tool(*probe);
-                    owner_targets = detail::has_aida_target_evidence(*probe);
-                }
                 out.any = true;
                 ++out.observed_handle_count;
                 out.access_mask |= h.GrantedAccess;
@@ -2783,21 +2977,24 @@ namespace self_analysis
                     out.first_owner_re = owner_re;
                     out.first_owner_debugger = owner_debugger;
                     out.first_owner_dump = owner_dump;
+                    out.first_owner_offensive = owner_offensive;
+                    out.first_owner_input_helper = owner_input_helper;
                     out.first_owner_targets_aida = owner_targets;
-                    out.first_owner_tool = owner_memory || owner_re || owner_debugger || owner_dump || owner_mcp || owner_ai;
+                    out.first_owner_tool = owner_memory || owner_re || owner_debugger || owner_dump ||
+                        owner_offensive || owner_mcp || owner_ai;
                 }
                 if (probe)
                 {
                     out.owner_hash = owner_hash;
                     out.owner_tool = out.owner_tool || owner_memory || owner_re ||
-                        owner_debugger || owner_dump || owner_mcp || owner_ai;
+                        owner_debugger || owner_dump || owner_offensive || owner_mcp || owner_ai;
                     out.owner_targets_aida = out.owner_targets_aida || owner_targets;
                 }
                 if (out.vm_write || out.vm_operation || out.create_thread)
                     break;
             }
             diag::log_tagged_critical_fmt("guard",
-                "ai_tool_posture_handle_scan_done handles=%llu interesting=%llu self_object=%d self_matches=%llu duplicate_probes=%llu observed=%u trusted_ignored=%u fileless_parent_ignored=%u elapsed_ms=%llu",
+                "ai_tool_posture_handle_scan_done handles=%llu interesting=%llu self_object=%d self_matches=%llu duplicate_probes=%llu observed=%u trusted_ignored=%u fileless_parent_ignored=%u internal_camoufox_ignored=%u elapsed_ms=%llu",
                 static_cast<unsigned long long>(info->NumberOfHandles),
                 static_cast<unsigned long long>(interesting_count),
                 self_process_object ? 1 : 0,
@@ -2806,6 +3003,7 @@ namespace self_analysis
                 out.observed_handle_count,
                 out.trusted_system_ignored_count,
                 out.fileless_bootstrap_parent_ignored_count,
+                out.internal_camoufox_ignored_count,
                 static_cast<unsigned long long>(GetTickCount64() - scan_start_ms));
         }
         else
@@ -2859,8 +3057,10 @@ namespace combined
         bool tool_targets_aida = false;
         bool trusted_system_handle_ignored = false;
         bool fileless_bootstrap_parent_handle_ignored = false;
+        bool internal_camoufox_handle_ignored = false;
         uint32_t trusted_system_handle_ignored_count = 0;
         uint32_t fileless_bootstrap_parent_handle_ignored_count = 0;
+        uint32_t internal_camoufox_handle_ignored_count = 0;
         uint32_t observed_handle_count = 0;
         DWORD handle_access_mask = 0;
         DWORD first_handle_owner_pid = 0;
@@ -2880,13 +3080,20 @@ namespace combined
         bool first_handle_owner_re = false;
         bool first_handle_owner_debugger = false;
         bool first_handle_owner_dump = false;
+        bool first_handle_owner_offensive = false;
+        bool first_handle_owner_input_helper = false;
         DWORD trusted_system_handle_access_mask = 0;
         DWORD fileless_bootstrap_parent_handle_access_mask = 0;
+        DWORD internal_camoufox_handle_access_mask = 0;
         DWORD fileless_bootstrap_parent_handle_owner_pid = 0;
+        DWORD internal_camoufox_handle_owner_pid = 0;
         uint64_t trusted_system_handle_owner_hash = 0;
         uint64_t fileless_bootstrap_parent_handle_owner_hash = 0;
+        uint64_t internal_camoufox_handle_owner_hash = 0;
         std::string fileless_bootstrap_parent_handle_owner_image;
         std::string fileless_bootstrap_parent_handle_owner_path;
+        std::string internal_camoufox_handle_owner_image;
+        std::string internal_camoufox_handle_owner_path;
         uint32_t category_mask = 0;
         uint32_t high_risk_mask = 0;
         uint32_t high_risk_count = 0;
@@ -2937,6 +3144,53 @@ namespace combined
             report.tool_targets_aida;
     }
 
+    inline bool input_helper_foreign_handle_candidate(const threat_report_t& report)
+    {
+        constexpr uint32_t foreign_mutating_mask =
+            category_foreign_write_handle |
+            category_foreign_vm_operation |
+            category_foreign_create_thread;
+        constexpr uint32_t allowed_correlated_mask =
+            category_mcp_pipe |
+            category_mcp_process |
+            category_mcp_port |
+            category_mcp_command_server |
+            category_local_llm |
+            category_ai_coding_tool |
+            category_clipboard_monitor |
+            foreign_mutating_mask;
+        constexpr uint32_t concrete_tool_mask =
+            category_memory_scanner |
+            category_re_tool |
+            category_debugger_tool |
+            category_dump_tool |
+            category_offensive_mcp_tool |
+            category_targets_aida;
+        if ((report.high_risk_mask & foreign_mutating_mask) == 0)
+            return false;
+        if ((report.high_risk_mask & ~allowed_correlated_mask) != 0)
+            return false;
+        if ((report.high_risk_mask & concrete_tool_mask) != 0)
+            return false;
+        if (!report.handle_to_us_detected || report.observed_handle_count != 1)
+            return false;
+        if (!report.first_handle_owner_query_ok || !report.first_handle_owner_input_helper)
+            return false;
+        if (report.first_handle_owner_tool || report.first_handle_owner_targets_aida ||
+            report.handle_owner_tool)
+            return false;
+        if (report.first_handle_owner_memory || report.first_handle_owner_re ||
+            report.first_handle_owner_debugger || report.first_handle_owner_dump ||
+            report.first_handle_owner_offensive || report.first_handle_owner_mcp ||
+            report.first_handle_owner_ai)
+            return false;
+        if (report.memory_scanner_detected || report.re_tool_detected ||
+            report.debugger_tool_detected || report.dump_tool_detected ||
+            report.offensive_mcp_tool_detected)
+            return false;
+        return true;
+    }
+
     inline threat_report_t full_scan()
     {
         detail::ensure_runtime_lure_arenas();
@@ -2971,6 +3225,8 @@ namespace combined
         report.trusted_system_handle_ignored_count = handle_report.trusted_system_ignored_count;
         report.fileless_bootstrap_parent_handle_ignored = handle_report.fileless_bootstrap_parent_ignored;
         report.fileless_bootstrap_parent_handle_ignored_count = handle_report.fileless_bootstrap_parent_ignored_count;
+        report.internal_camoufox_handle_ignored = handle_report.internal_camoufox_ignored;
+        report.internal_camoufox_handle_ignored_count = handle_report.internal_camoufox_ignored_count;
         report.observed_handle_count = handle_report.observed_handle_count;
         report.handle_access_mask = handle_report.access_mask;
         report.first_handle_owner_pid = handle_report.first_owner_pid;
@@ -2990,6 +3246,8 @@ namespace combined
         report.first_handle_owner_re = handle_report.first_owner_re;
         report.first_handle_owner_debugger = handle_report.first_owner_debugger;
         report.first_handle_owner_dump = handle_report.first_owner_dump;
+        report.first_handle_owner_offensive = handle_report.first_owner_offensive;
+        report.first_handle_owner_input_helper = handle_report.first_owner_input_helper;
         report.trusted_system_handle_access_mask = handle_report.trusted_system_access_mask;
         report.trusted_system_handle_owner_hash = handle_report.trusted_system_owner_hash;
         report.fileless_bootstrap_parent_handle_access_mask = handle_report.fileless_bootstrap_parent_access_mask;
@@ -2997,6 +3255,11 @@ namespace combined
         report.fileless_bootstrap_parent_handle_owner_hash = handle_report.fileless_bootstrap_parent_owner_hash;
         report.fileless_bootstrap_parent_handle_owner_image = handle_report.fileless_bootstrap_parent_owner_image;
         report.fileless_bootstrap_parent_handle_owner_path = handle_report.fileless_bootstrap_parent_owner_path;
+        report.internal_camoufox_handle_access_mask = handle_report.internal_camoufox_access_mask;
+        report.internal_camoufox_handle_owner_pid = handle_report.internal_camoufox_owner_pid;
+        report.internal_camoufox_handle_owner_hash = handle_report.internal_camoufox_owner_hash;
+        report.internal_camoufox_handle_owner_image = handle_report.internal_camoufox_owner_image;
+        report.internal_camoufox_handle_owner_path = handle_report.internal_camoufox_owner_path;
 
         auto window_target = detail::scan_windows_for_aida_targeting(processes);
         report.tool_targets_aida = report.tool_targets_aida || handle_report.owner_targets_aida || window_target.targeted;
@@ -3008,6 +3271,8 @@ namespace combined
             report.evidence_hash = detail::mix_hash(report.evidence_hash, handle_report.trusted_system_owner_hash);
         if (handle_report.fileless_bootstrap_parent_owner_hash)
             report.evidence_hash = detail::mix_hash(report.evidence_hash, handle_report.fileless_bootstrap_parent_owner_hash);
+        if (handle_report.internal_camoufox_owner_hash)
+            report.evidence_hash = detail::mix_hash(report.evidence_hash, handle_report.internal_camoufox_owner_hash);
         if (window_target.owner_hash)
             report.evidence_hash = detail::mix_hash(report.evidence_hash, window_target.owner_hash);
         report.evidence_count = process_evidence.evidence_count;
@@ -3043,6 +3308,7 @@ namespace combined
              report.first_handle_owner_re ||
              report.first_handle_owner_debugger ||
              report.first_handle_owner_dump ||
+             report.first_handle_owner_offensive ||
              report.first_handle_owner_targets_aida);
         const bool concrete_targeting = report.tool_targets_aida && concrete_re_tool;
 

@@ -226,10 +226,17 @@ namespace anti_tamper::mcp_posture
                    n == "aida-pro-mcp";
         }
 
+        inline bool is_aida_ida_managed_name(const std::string& name)
+        {
+            const std::string n = normalized_name_key(name);
+            return n == "aida-ida-mcp";
+        }
+
         inline bool is_managed_name(const std::string& name)
         {
             const std::string n = normalized_name_key(name);
             return is_aida_managed_name(n) ||
+                   is_aida_ida_managed_name(n) ||
                    n == "camoufox-reverse-mcp" ||
                    n == "camoufox-reverse" ||
                    is_dynamic_camoufox_reverse_name_key(n);
@@ -506,6 +513,7 @@ namespace anti_tamper::mcp_posture
             std::string lower = lower_ascii(text);
             return lower.find("mcp") != std::string::npos ||
                    lower.find("aida-standalone-mcp") != std::string::npos ||
+                   lower.find("aida-ida-mcp") != std::string::npos ||
                    lower.find("aida-pro-mcp") != std::string::npos ||
                    lower.find("camoufox-reverse") != std::string::npos;
         }
@@ -1701,6 +1709,13 @@ namespace anti_tamper::mcp_posture
             return trim(url) == exact_mcp || trim(url) == exact_sse;
         }
 
+        inline bool is_exact_ida_managed_url(const std::string& url)
+        {
+            const std::string exact_mcp = "http://127.0.0.1:13120/mcp";
+            const std::string exact_sse = "http://127.0.0.1:13120/sse";
+            return trim(url) == exact_mcp || trim(url) == exact_sse;
+        }
+
         inline bool is_aida_managed_endpoint_path(const std::string& path)
         {
             return path == "/mcp" || path == "/sse";
@@ -1740,6 +1755,29 @@ namespace anti_tamper::mcp_posture
                    parsed_port >= 1024 &&
                    u.port != configured_port &&
                    is_aida_managed_endpoint_path(path);
+        }
+
+        inline bool report_has_verified_aida_managed_endpoint(const report_t& report, const std::string& server_name)
+        {
+            const std::string n = normalized_name_key(server_name);
+            const bool standalone = is_aida_managed_name(n);
+            const bool ida = is_aida_ida_managed_name(n);
+            if (!standalone && !ida)
+                return false;
+            const std::uint64_t expected_hash = fnv1a_string(n);
+            for (const auto& f : report.findings) {
+                if (f.deny || !f.managed_name || f.server_hash != expected_hash)
+                    continue;
+                if (!f.localhost || f.transport != transport_t::http_sse || f.command_hash != 0)
+                    continue;
+                if (f.high_risk_command || f.high_risk_url || f.offensive_tool_metadata || f.metadata_count != 0)
+                    continue;
+                if (standalone && f.reason == "managed_aida_local")
+                    return true;
+                if (ida && f.reason == "managed_aida_ida_local" && f.port == 13120)
+                    return true;
+            }
+            return false;
         }
 
         inline bool url_is_high_risk(const std::string& url)
@@ -1818,9 +1856,11 @@ namespace anti_tamper::mcp_posture
             f.url_host_hash = u.host.empty() ? 0 : fnv1a_string(u.host);
 
             if (f.managed_name) {
+                const bool standalone_managed = is_aida_managed_name(e.name);
+                const bool ida_managed = is_aida_ida_managed_name(e.name);
                 if (is_internal_camoufox_stdio(e)) {
                     f.reason = "managed_internal_camoufox_stdio";
-                } else if (!is_aida_managed_name(e.name)) {
+                } else if (!standalone_managed && !ida_managed) {
                     f.deny = true;
                     f.reason = "managed_name_spoof";
                 } else if (f.offensive_tool_metadata || f.metadata_count != 0) {
@@ -1829,10 +1869,12 @@ namespace anti_tamper::mcp_posture
                 } else if (e.transport != transport_t::http_sse || !e.command.empty() || !e.args.empty()) {
                     f.deny = true;
                     f.reason = "managed_name_spoof";
-                } else if (is_exact_managed_url(e.url, configured_port)) {
+                } else if (standalone_managed && is_exact_managed_url(e.url, configured_port)) {
                     f.reason = "managed_aida_local";
-                } else if (allow_stale_aida_local && is_stale_aida_managed_local_url(e, u, configured_port)) {
+                } else if (standalone_managed && allow_stale_aida_local && is_stale_aida_managed_local_url(e, u, configured_port)) {
                     f.reason = "managed_aida_local_stale_port";
+                } else if (ida_managed && is_exact_ida_managed_url(e.url)) {
+                    f.reason = "managed_aida_ida_local";
                 } else {
                     f.deny = true;
                     f.reason = "managed_name_spoof";
@@ -2182,7 +2224,29 @@ namespace anti_tamper::mcp_posture
                 static_cast<unsigned long long>(detail::fnv1a_string(tool_name)));
             return false;
         }
-        if (detail::is_managed_name(server_name) || detail::is_camoufox_managed_name(server_name)) {
+        const bool aida_managed = detail::is_aida_managed_name(server_name) || detail::is_aida_ida_managed_name(server_name);
+        if (aida_managed) {
+            report_t cached = cached_report();
+            if (detail::report_has_verified_aida_managed_endpoint(cached, server_name)) {
+                diag::log_tagged_fmt("mcp_posture",
+                    "runtime_tool_metadata_allow_verified_aida_managed server_hash=0x%016llX name_len=%zu tool_hash=0x%016llX desc_len=%zu summary_hash=0x%016llX",
+                    static_cast<unsigned long long>(detail::fnv1a_string(detail::normalized_name_key(server_name))),
+                    server_name.size(),
+                    static_cast<unsigned long long>(detail::fnv1a_string(tool_name)),
+                    description.size(),
+                    static_cast<unsigned long long>(cached.summary_hash));
+                return true;
+            }
+            diag::log_tagged_fmt("mcp_posture",
+                "runtime_tool_metadata_block_unverified_aida_managed server_hash=0x%016llX name_len=%zu tool_hash=0x%016llX desc_len=%zu summary_hash=0x%016llX",
+                static_cast<unsigned long long>(detail::fnv1a_string(detail::normalized_name_key(server_name))),
+                server_name.size(),
+                static_cast<unsigned long long>(detail::fnv1a_string(tool_name)),
+                description.size(),
+                static_cast<unsigned long long>(cached.summary_hash));
+            return false;
+        }
+        if (detail::is_camoufox_managed_name(server_name)) {
             diag::log_tagged_fmt("mcp_posture",
                 "runtime_tool_metadata_allow_managed server_hash=0x%016llX name_len=%zu tool_hash=0x%016llX desc_len=%zu summary_hash=0x%016llX",
                 static_cast<unsigned long long>(detail::fnv1a_string(detail::normalized_name_key(server_name))),

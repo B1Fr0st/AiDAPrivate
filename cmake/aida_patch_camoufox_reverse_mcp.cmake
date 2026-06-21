@@ -16,6 +16,7 @@ set(AIDA_CAMOUFOX_SOURCE_SYNC_FILES
     "tools/script_analysis.py"
     "tools/network.py"
     "tools/debugging.py"
+    "tools/hooking.py"
     "tools/environment.py"
     "tools/storage.py"
 )
@@ -44,6 +45,7 @@ set(AIDA_CAMOUFOX_REPO_NAV_PATH "${AIDA_CAMOUFOX_REPO_MCP_ROOT}/tools/navigation
 set(AIDA_CAMOUFOX_REPO_SCRIPT_PATH "${AIDA_CAMOUFOX_REPO_MCP_ROOT}/tools/script_analysis.py")
 set(AIDA_CAMOUFOX_REPO_NETWORK_PATH "${AIDA_CAMOUFOX_REPO_MCP_ROOT}/tools/network.py")
 set(AIDA_CAMOUFOX_REPO_DEBUGGING_PATH "${AIDA_CAMOUFOX_REPO_MCP_ROOT}/tools/debugging.py")
+set(AIDA_CAMOUFOX_REPO_STORAGE_PATH "${AIDA_CAMOUFOX_REPO_MCP_ROOT}/tools/storage.py")
 set(AIDA_CAMOUFOX_REPO_MULTIPAGE_SOURCE_READY FALSE)
 if(EXISTS "${AIDA_CAMOUFOX_REPO_BROWSER_PATH}" AND EXISTS "${AIDA_CAMOUFOX_REPO_NAV_PATH}")
     if(NOT EXISTS "${AIDA_CAMOUFOX_REPO_MAIN_PATH}")
@@ -69,6 +71,11 @@ if(EXISTS "${AIDA_CAMOUFOX_REPO_BROWSER_PATH}" AND EXISTS "${AIDA_CAMOUFOX_REPO_
     else()
         set(AIDA_CAMOUFOX_REPO_DEBUGGING_CONTENT "")
     endif()
+    if(EXISTS "${AIDA_CAMOUFOX_REPO_STORAGE_PATH}")
+        file(READ "${AIDA_CAMOUFOX_REPO_STORAGE_PATH}" AIDA_CAMOUFOX_REPO_STORAGE_CONTENT)
+    else()
+        set(AIDA_CAMOUFOX_REPO_STORAGE_CONTENT "")
+    endif()
     string(REPLACE "\r\n" "\n" AIDA_CAMOUFOX_REPO_BROWSER_CONTENT "${AIDA_CAMOUFOX_REPO_BROWSER_CONTENT}")
     string(REPLACE "\r" "\n" AIDA_CAMOUFOX_REPO_BROWSER_CONTENT "${AIDA_CAMOUFOX_REPO_BROWSER_CONTENT}")
     string(REPLACE "\r\n" "\n" AIDA_CAMOUFOX_REPO_MAIN_CONTENT "${AIDA_CAMOUFOX_REPO_MAIN_CONTENT}")
@@ -83,6 +90,8 @@ if(EXISTS "${AIDA_CAMOUFOX_REPO_BROWSER_PATH}" AND EXISTS "${AIDA_CAMOUFOX_REPO_
     string(REPLACE "\r" "\n" AIDA_CAMOUFOX_REPO_NETWORK_CONTENT "${AIDA_CAMOUFOX_REPO_NETWORK_CONTENT}")
     string(REPLACE "\r\n" "\n" AIDA_CAMOUFOX_REPO_DEBUGGING_CONTENT "${AIDA_CAMOUFOX_REPO_DEBUGGING_CONTENT}")
     string(REPLACE "\r" "\n" AIDA_CAMOUFOX_REPO_DEBUGGING_CONTENT "${AIDA_CAMOUFOX_REPO_DEBUGGING_CONTENT}")
+    string(REPLACE "\r\n" "\n" AIDA_CAMOUFOX_REPO_STORAGE_CONTENT "${AIDA_CAMOUFOX_REPO_STORAGE_CONTENT}")
+    string(REPLACE "\r" "\n" AIDA_CAMOUFOX_REPO_STORAGE_CONTENT "${AIDA_CAMOUFOX_REPO_STORAGE_CONTENT}")
     set(AIDA_CAMOUFOX_REPO_TOOL_CONTENT "${AIDA_CAMOUFOX_REPO_NAV_CONTENT}\n${AIDA_CAMOUFOX_REPO_SCRIPT_CONTENT}\n${AIDA_CAMOUFOX_REPO_NETWORK_CONTENT}\n${AIDA_CAMOUFOX_REPO_DEBUGGING_CONTENT}")
     foreach(AIDA_CAMOUFOX_REQUIRED_REVERSE_TOOL IN LISTS AIDA_CAMOUFOX_REQUIRED_REVERSE_TOOLS)
         string(FIND "${AIDA_CAMOUFOX_REPO_TOOL_CONTENT}" "async def ${AIDA_CAMOUFOX_REQUIRED_REVERSE_TOOL}(" AIDA_CAMOUFOX_REQUIRED_TOOL_POS)
@@ -159,6 +168,12 @@ if(EXISTS "${AIDA_CAMOUFOX_REPO_BROWSER_PATH}" AND EXISTS "${AIDA_CAMOUFOX_REPO_
         "node_exit_code"
         "camoufox_child_exits"
         "cloudflare"
+        "nav_timeout_ms"
+        "\"timeout_ms\": nav_timeout_ms"
+        "_await_no_cancel_wait(page.evaluate(\"document.readyState\")"
+        "_navigation_capture_summary"
+        "\"capture_compacted\""
+        "\"body_access\""
         "\"network_requests\""
         "\"network_capture\"")
         string(FIND "${AIDA_CAMOUFOX_REPO_NAV_CONTENT}" "${AIDA_CAMOUFOX_REQUIRED_NAV_MARKER}" AIDA_CAMOUFOX_REQUIRED_NAV_MARKER_POS)
@@ -186,10 +201,35 @@ if(EXISTS "${AIDA_CAMOUFOX_REPO_BROWSER_PATH}" AND EXISTS "${AIDA_CAMOUFOX_REPO_
         "\"redirect_chain\""
         "\"websocket\""
         "\"timing\""
-        "\"initiator\"")
+        "\"initiator\""
+        "_NETWORK_DEFAULT_LIMIT"
+        "url_prefix: str | None = None"
+        "_request_matches_text_filter"
+        "\"filtered_count\""
+        "\"returned_count\""
+        "\"has_more\"")
         string(FIND "${AIDA_CAMOUFOX_REPO_NETWORK_CONTENT}" "${AIDA_CAMOUFOX_REQUIRED_NETWORK_MARKER}" AIDA_CAMOUFOX_REQUIRED_NETWORK_MARKER_POS)
         if(AIDA_CAMOUFOX_REQUIRED_NETWORK_MARKER_POS EQUAL -1)
             message(FATAL_ERROR "Root Camoufox reverse-MCP network source is missing required marker ${AIDA_CAMOUFOX_REQUIRED_NETWORK_MARKER}: ${AIDA_CAMOUFOX_REPO_NETWORK_PATH}")
+        endif()
+    endforeach()
+    foreach(AIDA_CAMOUFOX_REQUIRED_DEBUGGING_MARKER IN ITEMS
+        "timeout_ms: int = 30000"
+        "_eval_with_budget"
+        "evaluate_js timed out after"
+        "browser_manager.resolve_page(page_id)")
+        string(FIND "${AIDA_CAMOUFOX_REPO_DEBUGGING_CONTENT}" "${AIDA_CAMOUFOX_REQUIRED_DEBUGGING_MARKER}" AIDA_CAMOUFOX_REQUIRED_DEBUGGING_MARKER_POS)
+        if(AIDA_CAMOUFOX_REQUIRED_DEBUGGING_MARKER_POS EQUAL -1)
+            message(FATAL_ERROR "Root Camoufox reverse-MCP debugging source is missing required marker ${AIDA_CAMOUFOX_REQUIRED_DEBUGGING_MARKER}: ${AIDA_CAMOUFOX_REPO_DEBUGGING_PATH}")
+        endif()
+    endforeach()
+    foreach(AIDA_CAMOUFOX_REQUIRED_STORAGE_MARKER IN ITEMS
+        "payload: dict | None = None"
+        "cookie_action = str(params.get(\"action\") or action or \"get\")"
+        "browser_manager.resolve_page(page_id)")
+        string(FIND "${AIDA_CAMOUFOX_REPO_STORAGE_CONTENT}" "${AIDA_CAMOUFOX_REQUIRED_STORAGE_MARKER}" AIDA_CAMOUFOX_REQUIRED_STORAGE_MARKER_POS)
+        if(AIDA_CAMOUFOX_REQUIRED_STORAGE_MARKER_POS EQUAL -1)
+            message(FATAL_ERROR "Root Camoufox reverse-MCP storage source is missing required marker ${AIDA_CAMOUFOX_REQUIRED_STORAGE_MARKER}: ${AIDA_CAMOUFOX_REPO_STORAGE_PATH}")
         endif()
     endforeach()
     set(AIDA_CAMOUFOX_REPO_MULTIPAGE_SOURCE_READY TRUE)
@@ -1977,10 +2017,24 @@ foreach(AIDA_CAMOUFOX_HOOKING_PATCH_FILE IN LISTS AIDA_CAMOUFOX_HOOKING_PATCH_FI
     string(REPLACE "\r\n" "\n" AIDA_CAMOUFOX_HOOKING_CONTENT "${AIDA_CAMOUFOX_HOOKING_CONTENT}")
     string(REPLACE "\r" "\n" AIDA_CAMOUFOX_HOOKING_CONTENT "${AIDA_CAMOUFOX_HOOKING_CONTENT}")
 
-    if(NOT AIDA_CAMOUFOX_HOOKING_CONTENT MATCHES "context_init")
-        string(REPLACE [=[        page = await browser_manager.get_active_page()
-        await page.add_init_script(script=script)
-        browser_manager._init_scripts.append(script_name)
+    set(AIDA_CAMOUFOX_HOOKING_ADD_INIT_SCRIPT [=[@mcp.tool()
+async def add_init_script(
+    script: str,
+    name: str = "",
+    persistent: bool = True,
+    page_id: str | None = None,
+) -> dict:
+    try:
+        if not isinstance(script, str) or not script.strip():
+            return {"error": "script is required"}
+        script_name = name.strip() if isinstance(name, str) and name.strip() else f"inline:{hashlib.sha256(script.encode('utf-8')).hexdigest()[:16]}"
+        page = await browser_manager.resolve_page(page_id)
+        if persistent:
+            await browser_manager.add_persistent_script(script_name, script)
+        else:
+            await page.add_init_script(script=script)
+        if script_name not in browser_manager._init_scripts:
+            browser_manager._init_scripts.append(script_name)
         warning = None
         try:
             await page.evaluate(script)
@@ -1989,25 +2043,30 @@ foreach(AIDA_CAMOUFOX_HOOKING_PATCH_FILE IN LISTS AIDA_CAMOUFOX_HOOKING_PATCH_FI
         out = {
             "status": "injected",
             "name": script_name,
-            "persistent": False,
-            "page_init": True,
+            "persistent": bool(persistent),
+            "context_init": bool(persistent),
+            "page_init": not bool(persistent),
+            "page_id": browser_manager.page_id_for(page) if hasattr(browser_manager, "page_id_for") else page_id,
             "applied_to_current_page": warning is None,
+            "contexts": len(browser_manager.contexts),
+            "pages": len(browser_manager.pages),
         }
         if warning:
             out["warning"] = f"current page evaluate failed: {warning}"
-        return out]=]
-[=[        page = await browser_manager.get_active_page()
-        ctx = page.context
-        await ctx.add_init_script(script=script)
-        replaced = False
-        for script_info in browser_manager._persistent_scripts:
-            if script_info.get("name") == script_name:
-                script_info["content"] = script
-                replaced = True
-                break
-        if not replaced:
-            browser_manager._persistent_scripts.append({"name": script_name, "content": script})
-        browser_manager._init_scripts.append(script_name)
+        return out
+    except Exception as e:
+        return {"error": str(e)}
+]=])
+    string(REPLACE [=[@mcp.tool()
+async def add_init_script(script: str, name: str = "") -> dict:
+    try:
+        if not isinstance(script, str) or not script.strip():
+            return {"error": "script is required"}
+        script_name = name.strip() if isinstance(name, str) and name.strip() else f"inline:{hashlib.sha256(script.encode('utf-8')).hexdigest()[:16]}"
+        page = await browser_manager.get_active_page()
+        await browser_manager.add_persistent_script(script_name, script)
+        if script_name not in browser_manager._init_scripts:
+            browser_manager._init_scripts.append(script_name)
         warning = None
         try:
             await page.evaluate(script)
@@ -2025,12 +2084,42 @@ foreach(AIDA_CAMOUFOX_HOOKING_PATCH_FILE IN LISTS AIDA_CAMOUFOX_HOOKING_PATCH_FI
         }
         if warning:
             out["warning"] = f"current page evaluate failed: {warning}"
-        return out]=]
-            AIDA_CAMOUFOX_HOOKING_CONTENT "${AIDA_CAMOUFOX_HOOKING_CONTENT}")
-    endif()
+        return out
+    except Exception as e:
+        return {"error": str(e)}
+]=] "${AIDA_CAMOUFOX_HOOKING_ADD_INIT_SCRIPT}" AIDA_CAMOUFOX_HOOKING_CONTENT "${AIDA_CAMOUFOX_HOOKING_CONTENT}")
+    string(REPLACE [=[@mcp.tool()
+async def add_init_script(script: str, name: str = "") -> dict:
+    try:
+        if not isinstance(script, str) or not script.strip():
+            return {"error": "script is required"}
+        script_name = name.strip() if isinstance(name, str) and name.strip() else f"inline:{hashlib.sha256(script.encode('utf-8')).hexdigest()[:16]}"
+        page = await browser_manager.get_active_page()
+        await page.add_init_script(script=script)
+        browser_manager._init_scripts.append(script_name)
+        warning = None
+        try:
+            await page.evaluate(script)
+        except Exception as e:
+            warning = str(e)
+        out = {
+            "status": "injected",
+            "name": script_name,
+            "persistent": False,
+            "page_init": True,
+            "applied_to_current_page": warning is None,
+        }
+        if warning:
+            out["warning"] = f"current page evaluate failed: {warning}"
+        return out
+    except Exception as e:
+        return {"error": str(e)}
+]=] "${AIDA_CAMOUFOX_HOOKING_ADD_INIT_SCRIPT}" AIDA_CAMOUFOX_HOOKING_CONTENT "${AIDA_CAMOUFOX_HOOKING_CONTENT}")
 
     if(NOT AIDA_CAMOUFOX_HOOKING_CONTENT MATCHES "context_init"
-        OR NOT AIDA_CAMOUFOX_HOOKING_CONTENT MATCHES "ctx.add_init_script"
+        OR NOT AIDA_CAMOUFOX_HOOKING_CONTENT MATCHES "browser_manager.add_persistent_script"
+        OR NOT AIDA_CAMOUFOX_HOOKING_CONTENT MATCHES "persistent: bool = True"
+        OR NOT AIDA_CAMOUFOX_HOOKING_CONTENT MATCHES "browser_manager.resolve_page\\(page_id\\)"
         OR NOT AIDA_CAMOUFOX_HOOKING_CONTENT MATCHES "_persistent_scripts")
         message(FATAL_ERROR "Failed to patch ${AIDA_CAMOUFOX_HOOKING_PATCH_FILE}")
     endif()
@@ -2380,6 +2469,12 @@ foreach(AIDA_CAMOUFOX_STAGE_MCP_ROOT IN LISTS AIDA_CAMOUFOX_STAGE_MCP_ROOTS)
             "node_exit_code"
             "camoufox_child_exits"
             "cloudflare"
+            "nav_timeout_ms"
+            "\"timeout_ms\": nav_timeout_ms"
+            "_await_no_cancel_wait(page.evaluate(\"document.readyState\")"
+            "_navigation_capture_summary"
+            "\"capture_compacted\""
+            "\"body_access\""
             "\"network_requests\""
             "\"network_capture\"")
             string(FIND "${AIDA_CAMOUFOX_STAGE_NAV_CONTENT}" "${AIDA_CAMOUFOX_STAGE_NAV_MARKER}" AIDA_CAMOUFOX_STAGE_NAV_MARKER_POS)
@@ -2417,7 +2512,13 @@ foreach(AIDA_CAMOUFOX_STAGE_MCP_ROOT IN LISTS AIDA_CAMOUFOX_STAGE_MCP_ROOTS)
             "\"redirect_chain\""
             "\"websocket\""
             "\"timing\""
-            "\"initiator\"")
+            "\"initiator\""
+            "_NETWORK_DEFAULT_LIMIT"
+            "url_prefix: str | None = None"
+            "_request_matches_text_filter"
+            "\"filtered_count\""
+            "\"returned_count\""
+            "\"has_more\"")
             string(FIND "${AIDA_CAMOUFOX_STAGE_NETWORK_CONTENT}" "${AIDA_CAMOUFOX_STAGE_NETWORK_MARKER}" AIDA_CAMOUFOX_STAGE_NETWORK_MARKER_POS)
             if(AIDA_CAMOUFOX_STAGE_NETWORK_MARKER_POS EQUAL -1)
                 message(FATAL_ERROR "Staged Camoufox reverse-MCP network source is missing required marker ${AIDA_CAMOUFOX_STAGE_NETWORK_MARKER}: ${AIDA_CAMOUFOX_STAGE_NETWORK_PATH}")

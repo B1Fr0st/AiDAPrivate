@@ -8966,31 +8966,6 @@ namespace
                 continue;
             }
 
-            const bool full_test_running = test_all_features::is_running();
-            if (full_test_running) {
-                uint64_t cached_proof = 0;
-                uint64_t cached_age_ms = 0;
-                std::string cached_nonce;
-                if (load_driver_proof_cache(&cached_proof, &cached_nonce, &cached_age_ms) &&
-                    cached_proof != 0 &&
-                    cached_nonce == settings->license_server_nonce) {
-                    lic_log_fmt("srv_refresh_full_test_cached_proof age_ms=%llu",
-                        static_cast<unsigned long long>(cached_age_ms));
-                }
-                else {
-                    lic_log("srv_refresh_full_test_running_cache_miss");
-                }
-            }
-
-            const bool driver_loaded = driver_bridge::is_loaded();
-            const bool driver_kernel = driver_loaded ? driver_bridge::using_kernel_driver() : false;
-            if (!driver_loaded || !driver_kernel) {
-                lic_log_fmt("srv_refresh_skip reason=driver_not_ready loaded=%d kernel=%d",
-                    driver_loaded ? 1 : 0,
-                    driver_kernel ? 1 : 0);
-                continue;
-            }
-
             std::string srv_nonce_str = settings->license_server_nonce;
             if (srv_nonce_str.empty()) {
                 lic_log("srv_refresh_skip reason=empty_server_nonce");

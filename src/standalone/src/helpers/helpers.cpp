@@ -382,6 +382,125 @@ namespace {
 		return token && text.find(token) != std::string::npos;
 	}
 
+	bool text_has_positive_field(const std::string& text, const char* field)
+	{
+		if (!field || !*field)
+			return false;
+		std::string needle = field;
+		needle += "=1";
+		return text.find(needle) != std::string::npos;
+	}
+
+	std::string runtime_lock_field_value(const std::string& text, const char* field)
+	{
+		if (!field || !*field)
+			return {};
+		std::string needle = field;
+		needle += "=";
+		size_t pos = text.find(needle);
+		if (pos == std::string::npos)
+			return {};
+		pos += needle.size();
+		size_t end = text.find_first_of(" \t\r\n", pos);
+		if (end == std::string::npos)
+			end = text.size();
+		return text.substr(pos, end - pos);
+	}
+
+	std::string runtime_lock_summary_value(const std::string& detail)
+	{
+		const std::string needle = "summary=";
+		size_t pos = detail.find(needle);
+		if (pos == std::string::npos)
+			return {};
+		pos += needle.size();
+		size_t end = detail.find(" evidence_hash=", pos);
+		if (end == std::string::npos)
+			end = detail.find(" cat=", pos);
+		if (end == std::string::npos)
+			end = detail.size();
+		std::string out = detail.substr(pos, end - pos);
+		if (out.size() > 180)
+			out = out.substr(0, 180);
+		return out;
+	}
+
+	void runtime_lock_append_part(std::string& out, const std::string& part)
+	{
+		if (part.empty())
+			return;
+		if (!out.empty())
+			out += "; ";
+		out += part;
+	}
+
+	std::string runtime_lock_evidence_message(const std::string& reason, const std::string& detail)
+	{
+		const std::string joined = reason + " " + detail;
+		std::string out;
+		const std::string reason_value = runtime_lock_field_value(joined, "reason");
+		if (!reason_value.empty())
+			runtime_lock_append_part(out, "detector=" + reason_value);
+		const std::string summary = runtime_lock_summary_value(detail);
+		if (!summary.empty())
+			runtime_lock_append_part(out, "evidence=" + summary);
+		const std::string owner_pid = runtime_lock_field_value(joined, "first_owner_pid");
+		if (!owner_pid.empty() && owner_pid != "0")
+			runtime_lock_append_part(out, "owner_pid=" + owner_pid);
+		const std::string owner_image = runtime_lock_field_value(joined, "first_owner_image");
+		if (!owner_image.empty() && owner_image != "<empty>")
+			runtime_lock_append_part(out, "owner=" + owner_image);
+		const std::string kernel_status = runtime_lock_field_value(joined, "kernel_status");
+		if (!kernel_status.empty())
+			runtime_lock_append_part(out, "kernel=" + kernel_status);
+		const std::string kernel_confirmed = runtime_lock_field_value(joined, "kernel_confirmed");
+		if (!kernel_confirmed.empty())
+			runtime_lock_append_part(out, "kernel_confirmed=" + kernel_confirmed);
+		return out;
+	}
+
+	bool custom_icon_path_render_safe(const std::string& path, uint64_t& size_out, DWORD& attr_out, DWORD& err_out)
+	{
+		size_out = 0;
+		attr_out = 0;
+		err_out = ERROR_SUCCESS;
+		if (path.empty()) {
+			err_out = ERROR_INVALID_PARAMETER;
+			return false;
+		}
+		if (path.rfind("\\\\", 0) == 0 || path.rfind("//", 0) == 0) {
+			err_out = ERROR_BAD_NET_NAME;
+			return false;
+		}
+		if (path.size() > MAX_PATH * 4) {
+			err_out = ERROR_BAD_LENGTH;
+			return false;
+		}
+		if (path.size() >= 2 && path[1] == ':') {
+			char root[4] = { path[0], ':', '\\', '\0' };
+			if (GetDriveTypeA(root) == DRIVE_REMOTE) {
+				err_out = ERROR_BAD_NET_NAME;
+				return false;
+			}
+		}
+		WIN32_FILE_ATTRIBUTE_DATA data{};
+		if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &data)) {
+			err_out = GetLastError();
+			return false;
+		}
+		attr_out = data.dwFileAttributes;
+		if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+			err_out = ERROR_DIRECTORY;
+			return false;
+		}
+		size_out = (static_cast<uint64_t>(data.nFileSizeHigh) << 32) | static_cast<uint64_t>(data.nFileSizeLow);
+		if (size_out == 0 || size_out > 32ull * 1024ull * 1024ull) {
+			err_out = ERROR_BAD_LENGTH;
+			return false;
+		}
+		return true;
+	}
+
 	std::string runtime_lock_user_message(const std::string& reason, const std::string& detail)
 	{
 		const std::string joined = reason + " " + detail;
@@ -391,17 +510,22 @@ namespace {
 			return "Suspicious process handle to AiDA detected. Close that process, then restart AiDAStandalone.exe.";
 		if (text_has_token(joined, "TARGET_AIDA") || text_has_token(joined, "targeting_aida"))
 			return "External tooling is targeting AiDA. Close the tool targeting AiDA, then restart AiDAStandalone.exe.";
-		if (text_has_token(joined, "DBG_TOOL") || text_has_token(joined, "debugger"))
+		if (text_has_token(joined, "MCP_OFFENSIVE_TOOL") || text_has_token(joined, "offensive_mcp_tool_detected") ||
+			text_has_token(joined, "ai_tool_posture_mcp_offensive_tools") || text_has_token(joined, "anti_mcp_offensive"))
+			return "Offensive MCP tooling detected. Close that MCP tool, then restart AiDAStandalone.exe.";
+		if (text_has_token(joined, "DBG_TOOL") || text_has_token(joined, "debugger_tool_detected") ||
+			text_has_token(joined, "debugger_tool_scan") || text_has_token(joined, "kernel_debugger") ||
+			text_has_positive_field(joined, "first_owner_debugger"))
 			return "Debugger activity detected. Close the debugger, then restart AiDAStandalone.exe.";
 		if (text_has_token(joined, "RE_TOOL") || text_has_token(joined, "reverse_engineering") ||
-			text_has_token(joined, "ai_tool_posture_re_tool"))
+			text_has_token(joined, "ai_tool_posture_re_tool") || text_has_positive_field(joined, "first_owner_re"))
 			return "Reverse-engineering tool activity detected. Close that tool, then restart AiDAStandalone.exe.";
-		if (text_has_token(joined, "DUMP_TOOL") || text_has_token(joined, "dump_tool"))
+		if (text_has_token(joined, "DUMP_TOOL") || text_has_token(joined, "dump_tool_detected") ||
+			text_has_token(joined, "dump_tool_scan") || text_has_positive_field(joined, "first_owner_dump"))
 			return "Dumping tool activity detected. Close that tool, then restart AiDAStandalone.exe.";
-		if (text_has_token(joined, "MEM_SCANNER") || text_has_token(joined, "memory_scanner"))
+		if (text_has_token(joined, "MEM_SCANNER") || text_has_token(joined, "memory_scanner") ||
+			text_has_positive_field(joined, "first_owner_memory"))
 			return "Memory scanner activity detected. Close the scanner, then restart AiDAStandalone.exe.";
-		if (text_has_token(joined, "MCP_OFFENSIVE_TOOL") || text_has_token(joined, "offensive_mcp"))
-			return "Offensive MCP tooling detected. Close that MCP tool, then restart AiDAStandalone.exe.";
 		if (text_has_token(joined, "MCP_PIPE") || text_has_token(joined, "MCP_PROCESS") ||
 			text_has_token(joined, "MCP_PORT") || text_has_token(joined, "MCP_CMD") ||
 			text_has_token(joined, "mcp_bridge"))
@@ -1597,19 +1721,21 @@ void helpers::render_title()
 		static bool s_runtime_lock_logged = false;
 		static bool s_full_test_validity_bridge_logged = false;
 		if (runtime_locked) {
+			std::string reason;
+			std::string detail;
+			{
+				auto& rt = anti_tamper::state::get();
+				std::lock_guard<std::mutex> lk(rt.mtx);
+				reason = rt.violation_reason;
+				detail = rt.violation_detail;
+			}
 			license::validated = false;
 			license::checking = false;
 			license::activation_worker_active.store(false, std::memory_order_release);
 			license::check_failed = false;
-			license::error_msg = "Runtime integrity check failed. Restart AiDAStandalone.exe.";
+			license::error_msg = runtime_lock_user_message(reason, detail);
 			s_full_test_validity_bridge_logged = false;
 			if (!s_runtime_lock_logged) {
-				std::string reason;
-				{
-					auto& rt = anti_tamper::state::get();
-					std::lock_guard<std::mutex> lk(rt.mtx);
-					reason = rt.violation_reason;
-				}
 				diag::log_tagged_fmt("license",
 					"DIAG_DIALOG_SUPPRESSED_LICENSE_INPUT source=render_title reason=%.160s",
 					reason.c_str());
@@ -1938,6 +2064,42 @@ void helpers::render_title()
 		active_custom_icon_path = g_sa_settings.custom_icon_path;
 	}
 
+	static std::string s_last_rejected_custom_icon_path;
+	static std::string s_last_checked_custom_icon_path;
+	static bool s_last_checked_custom_icon_ok = false;
+	static uint64_t s_last_checked_custom_icon_ms = 0;
+	if (!active_custom_icon_path.empty()) {
+		const uint64_t now_ms = static_cast<uint64_t>(GetTickCount64());
+		if (active_custom_icon_path != s_last_checked_custom_icon_path ||
+			now_ms - s_last_checked_custom_icon_ms >= 5000) {
+			uint64_t icon_file_size = 0;
+			DWORD icon_file_attrs = 0;
+			DWORD icon_file_error = ERROR_SUCCESS;
+			s_last_checked_custom_icon_path = active_custom_icon_path;
+			s_last_checked_custom_icon_ms = now_ms;
+			s_last_checked_custom_icon_ok = custom_icon_path_render_safe(active_custom_icon_path, icon_file_size, icon_file_attrs, icon_file_error);
+			if (!s_last_checked_custom_icon_ok &&
+				s_last_rejected_custom_icon_path != active_custom_icon_path) {
+				diag::log_tagged_critical_fmt("render",
+					"custom_theme_icon_rejected path_len=%zu gle=%lu attrs=0x%08lX size=%llu",
+					active_custom_icon_path.size(),
+					static_cast<unsigned long>(icon_file_error),
+					static_cast<unsigned long>(icon_file_attrs),
+					static_cast<unsigned long long>(icon_file_size));
+				s_last_rejected_custom_icon_path = active_custom_icon_path;
+			}
+		}
+		if (!s_last_checked_custom_icon_ok)
+			active_custom_icon_path.clear();
+	}
+
+	if (active_custom_icon_path.empty() && g_custom_theme_icon_srv) {
+		g_custom_theme_icon_srv->Release();
+		g_custom_theme_icon_srv = nullptr;
+		g_custom_theme_icon_w = g_custom_theme_icon_h = 0;
+		g_custom_theme_icon_path.clear();
+	}
+
 	if (!active_custom_icon_path.empty() &&
 	    active_custom_icon_path != g_custom_theme_icon_path &&
 	    g_pd3dDevice) {
@@ -1951,12 +2113,6 @@ void helpers::render_title()
 			g_custom_theme_icon_path = active_custom_icon_path;
 		else
 			g_custom_theme_icon_path.clear();
-	}
-	if (active_custom_icon_path.empty() && g_custom_theme_icon_srv) {
-		g_custom_theme_icon_srv->Release();
-		g_custom_theme_icon_srv = nullptr;
-		g_custom_theme_icon_w = g_custom_theme_icon_h = 0;
-		g_custom_theme_icon_path.clear();
 	}
 
 
@@ -2573,10 +2729,12 @@ void helpers::render_title()
 			std::string sub = runtime_lock_user_message(reason, detail);
 			float sub_size = body->FontSize;
 			ImVec2 sub_ts = body->CalcTextSizeA(sub_size, inner_w, 0.f, sub.c_str());
+			const float sub_y = content_y + 76.f + title_size + 16.f;
 			dl->AddText(body, sub_size,
-				ImVec2(cx - sub_ts.x * 0.5f + shake_x, content_y + 76.f + title_size + 16.f),
+				ImVec2(cx - sub_ts.x * 0.5f + shake_x, sub_y),
 				aida::ui::with_alpha(th.text_secondary, la), sub.c_str(), nullptr, inner_w);
 
+			float next_y = sub_y + sub_ts.y + 12.f;
 			if (!reason.empty()) {
 				std::string msg = "Reason: " + reason;
 				ImFont* code = aida::ui::fonts::code();
@@ -2584,7 +2742,20 @@ void helpers::render_title()
 				float msg_size = 13.f;
 				ImVec2 reason_ts = code->CalcTextSizeA(msg_size, inner_w, 0.f, msg.c_str());
 				dl->AddText(code, msg_size,
-					ImVec2(cx - reason_ts.x * 0.5f + shake_x, content_y + 76.f + title_size + 48.f),
+					ImVec2(cx - reason_ts.x * 0.5f + shake_x, next_y),
+					aida::ui::with_alpha(th.text_dim, la), msg.c_str(), nullptr, inner_w);
+				next_y += reason_ts.y + 8.f;
+			}
+
+			std::string evidence = runtime_lock_evidence_message(reason, detail);
+			if (!evidence.empty()) {
+				std::string msg = "Evidence: " + evidence;
+				ImFont* code = aida::ui::fonts::code();
+				if (!code) code = ImGui::GetFont();
+				float msg_size = 12.f;
+				ImVec2 evidence_ts = code->CalcTextSizeA(msg_size, inner_w, 0.f, msg.c_str());
+				dl->AddText(code, msg_size,
+					ImVec2(cx - evidence_ts.x * 0.5f + shake_x, next_y),
 					aida::ui::with_alpha(th.text_dim, la), msg.c_str(), nullptr, inner_w);
 			}
 
@@ -4970,9 +5141,12 @@ void helpers::render_title()
 		{
 			ImDrawList* scl = ImGui::GetWindowDrawList();
 			if (file_browser::needs_refresh || file_browser::entries.empty()) {
+				g_render_section = "left_panel_explorer_refresh";
 				file_browser::refresh();
 			}
+			g_render_section = "left_panel_explorer_watcher";
 			file_browser::tick_watcher();
+			g_render_section = "left_panel_explorer_rows";
 
 			for (int fi = 0; fi < (int)file_browser::entries.size(); fi++) {
 				auto& ent = file_browser::entries[fi];
@@ -5027,37 +5201,12 @@ void helpers::render_title()
 		{
 			g_render_section = "left_panel_theme_icon";
 			ID3D11ShaderResourceView* icon_srv = get_active_theme_icon();
-			if (icon_srv) {
-				int icon_idx = g_sa_settings.theme_icon_index;
-				if (custom_themes::active_custom >= 0 &&
-				    custom_themes::active_custom < (int)custom_themes::list.size())
-					icon_idx = custom_themes::list[custom_themes::active_custom].icon_index;
-				float src_w = 0.f, src_h = 0.f;
-				if (icon_idx < 0 && g_custom_theme_icon_w > 0 && g_custom_theme_icon_h > 0) {
-					src_w = static_cast<float>(g_custom_theme_icon_w);
-					src_h = static_cast<float>(g_custom_theme_icon_h);
-				} else {
-					if (icon_idx < 0) icon_idx = 3;
-					src_w = static_cast<float>(g_theme_icon_w[icon_idx]);
-					src_h = static_cast<float>(g_theme_icon_h[icon_idx]);
-				}
-				if (src_w > 0 && src_h > 0) {
-					float max_icon_w = fw * 0.8f;
-					float max_icon_h = fh * 0.35f;
-					float scale = std::min(max_icon_w / src_w, max_icon_h / src_h);
-					float dw = src_w * scale;
-					float dh = src_h * scale;
-					float ix = fwp.x + fw * 0.5f - dw * 0.5f;
-					float iy = fwp.y + fh - dh - 8.f;
-					fdl->AddImage(reinterpret_cast<ImTextureID>(icon_srv),
-						ImVec2(ix, iy), ImVec2(ix + dw, iy + dh),
-						ImVec2(0, 0), ImVec2(1, 1),
-						IM_COL32(255, 255, 255, static_cast<int>(100 * a)));
-				}
-			}
+			(void)icon_srv;
 		}
 	}
+	g_render_section = "left_panel_end_child";
 	end_child();
+	g_render_section = "left_panel_done";
 	}
 
 	float ab_extra = g_sa_settings.activity_bar_visible ? globals::ui::activity_bar_w : 0.f;
@@ -8624,8 +8773,16 @@ void helpers::render_title()
 				} else {
 					g_render_section = "post_bottom_license_fail_closed";
 					license::validated = false;
+					std::string runtime_reason;
+					std::string runtime_detail;
+					if (runtime_locked) {
+						auto& rt = anti_tamper::state::get();
+						std::lock_guard<std::mutex> lk(rt.mtx);
+						runtime_reason = rt.violation_reason;
+						runtime_detail = rt.violation_detail;
+					}
 					license::error_msg = runtime_locked
-						? std::string("Runtime integrity check failed. Restart AiDAStandalone.exe.")
+						? runtime_lock_user_message(runtime_reason, runtime_detail)
 						: standalone_license::last_error();
 					output_log::push(bottom_tab_t::output, runtime_locked
 						? std::string("[license] Runtime integrity lock, activation screen suppressed")

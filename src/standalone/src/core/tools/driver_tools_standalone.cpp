@@ -4718,6 +4718,132 @@ static std::string bounded_kernel_module_name(const sys_module_entry_t& m)
     return (slash == std::string::npos) ? path : path.substr(slash + 1);
 }
 
+struct kernel_module_query_diagnostics_t
+{
+    ULONG count = 0;
+    std::size_t buffer_size = 0;
+    std::size_t zero_base_count = 0;
+    std::size_t nonzero_base_count = 0;
+    bool all_image_bases_zero = false;
+    bool dependency_blocked = false;
+    std::vector<std::string> samples;
+    json token;
+    json driver;
+    std::string strict_fallback;
+};
+
+static const char* integrity_name_from_rid(DWORD rid)
+{
+    if (rid >= SECURITY_MANDATORY_SYSTEM_RID)
+        return "system";
+    if (rid >= SECURITY_MANDATORY_HIGH_RID)
+        return "high";
+    if (rid >= SECURITY_MANDATORY_MEDIUM_RID)
+        return "medium";
+    if (rid >= SECURITY_MANDATORY_LOW_RID)
+        return "low";
+    return "untrusted";
+}
+
+static json current_process_token_diagnostics()
+{
+    json out = json::object();
+    DWORD session = 0xFFFFFFFFu;
+    out["pid"] = GetCurrentProcessId();
+    out["tid"] = GetCurrentThreadId();
+    out["session_ok"] = ProcessIdToSessionId(GetCurrentProcessId(), &session) ? true : false;
+    out["session"] = session;
+
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+    {
+        out["open_ok"] = false;
+        out["open_error"] = static_cast<unsigned long>(GetLastError());
+        return out;
+    }
+
+    out["open_ok"] = true;
+    TOKEN_ELEVATION elevation{};
+    DWORD ret = 0;
+    if (GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &ret))
+        out["elevated"] = elevation.TokenIsElevated ? true : false;
+    else
+        out["elevation_error"] = static_cast<unsigned long>(GetLastError());
+
+    TOKEN_ELEVATION_TYPE elevation_type = TokenElevationTypeDefault;
+    ret = 0;
+    if (GetTokenInformation(token, TokenElevationType, &elevation_type, sizeof(elevation_type), &ret))
+        out["elevation_type"] = static_cast<unsigned long>(elevation_type);
+    else
+        out["elevation_type_error"] = static_cast<unsigned long>(GetLastError());
+
+    ret = 0;
+    GetTokenInformation(token, TokenIntegrityLevel, nullptr, 0, &ret);
+    if (ret != 0)
+    {
+        std::vector<unsigned char> buf(ret);
+        if (GetTokenInformation(token, TokenIntegrityLevel, buf.data(), ret, &ret))
+        {
+            auto* til = reinterpret_cast<TOKEN_MANDATORY_LABEL*>(buf.data());
+            DWORD rid = 0;
+            if (til->Label.Sid && IsValidSid(til->Label.Sid))
+            {
+                const DWORD count = *GetSidSubAuthorityCount(til->Label.Sid);
+                if (count != 0)
+                    rid = *GetSidSubAuthority(til->Label.Sid, count - 1);
+            }
+            out["integrity_rid"] = static_cast<unsigned long>(rid);
+            out["integrity"] = integrity_name_from_rid(rid);
+        }
+        else
+        {
+            out["integrity_error"] = static_cast<unsigned long>(GetLastError());
+        }
+    }
+
+    CloseHandle(token);
+    return out;
+}
+
+static std::string module_sample_text(const std::vector<std::string>& samples)
+{
+    std::ostringstream ss;
+    for (std::size_t i = 0; i < samples.size(); ++i)
+    {
+        if (i != 0)
+            ss << ";";
+        ss << samples[i];
+    }
+    return ss.str();
+}
+
+static json kernel_module_query_diagnostics_json(const kernel_module_query_diagnostics_t& diag)
+{
+    json out = json::object();
+    out["dependency_blocked"] = diag.dependency_blocked;
+    out["module_count"] = diag.count;
+    out["buffer_size"] = diag.buffer_size;
+    out["zero_base_count"] = diag.zero_base_count;
+    out["nonzero_base_count"] = diag.nonzero_base_count;
+    out["all_image_bases_zero"] = diag.all_image_bases_zero;
+    out["sample_modules"] = diag.samples;
+    out["token"] = diag.token;
+    out["driver"] = diag.driver;
+    out["strict_fallback"] = diag.strict_fallback;
+    return out;
+}
+
+static tool_result_t kernel_module_query_error_result(
+    const std::string& error,
+    const kernel_module_query_diagnostics_t& diag,
+    std::string prefix = {})
+{
+    const std::string message = prefix.empty() ? error : prefix + error;
+    if (diag.dependency_blocked)
+        return tool_result_t::error(message, OBFSTR("dependency_blocked"), kernel_module_query_diagnostics_json(diag));
+    return tool_result_t::error(message);
+}
+
 typedef LONG(NTAPI* NtQuerySystemInformation_fn)(
     ULONG SystemInformationClass,
     PVOID SystemInformation,
@@ -4727,8 +4853,11 @@ typedef LONG(NTAPI* NtQuerySystemInformation_fn)(
 static bool query_kernel_modules(
     std::vector<std::uint8_t>& out_buffer,
     sys_module_info_t*& out_info,
-    std::string& error_msg)
+    std::string& error_msg,
+    kernel_module_query_diagnostics_t* diagnostics = nullptr)
 {
+    if (diagnostics)
+        *diagnostics = {};
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
     if (!ntdll)
     {
@@ -4779,8 +4908,72 @@ static bool query_kernel_modules(
             std::to_string(count) + OBFSTR(" buffer=") + std::to_string(out_buffer.size());
         return false;
     }
-    diag::log_tagged_fmt("drv_tools", "query_kernel_modules ok count=%lu bytes=%zu",
-        static_cast<unsigned long>(count), out_buffer.size());
+    kernel_module_query_diagnostics_t local_diag{};
+    auto& diag_ref = diagnostics ? *diagnostics : local_diag;
+    diag_ref.count = count;
+    diag_ref.buffer_size = out_buffer.size();
+    diag_ref.samples.reserve((std::min)(static_cast<ULONG>(8), count));
+    for (ULONG i = 0; i < count; ++i)
+    {
+        const auto& m = out_info->Modules[i];
+        const std::uint64_t base = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(m.ImageBase));
+        if (base == 0)
+            ++diag_ref.zero_base_count;
+        else
+            ++diag_ref.nonzero_base_count;
+        if (diag_ref.samples.size() < 8)
+        {
+            std::ostringstream sample;
+            sample << bounded_kernel_module_name(m)
+                   << "@base=" << sa_format_address(base)
+                   << ",size=" << sa_format_address(static_cast<std::uint64_t>(m.ImageSize));
+            diag_ref.samples.push_back(sample.str());
+        }
+    }
+    diag_ref.all_image_bases_zero = count != 0 && diag_ref.nonzero_base_count == 0;
+    std::string kernel_session_reason;
+    const bool kernel_session_ok = driver_bridge::kernel_session_available(&kernel_session_reason);
+    diag_ref.driver = json::object({
+        {"using_kernel_driver", driver_bridge::using_kernel_driver()},
+        {"kernel_session_available", kernel_session_ok},
+        {"kernel_session_reason", kernel_session_reason},
+        {"status", driver_bridge::status()},
+        {"attached_pid", driver_bridge::attached_pid()}
+    });
+    diag_ref.strict_fallback = "unavailable_no_exported_readonly_kernel_module_base_api";
+    const std::string samples = module_sample_text(diag_ref.samples);
+    diag::log_tagged_fmt("drv_tools",
+        "query_kernel_modules ok count=%lu bytes=%zu zero_bases=%zu nonzero_bases=%zu all_zero=%d samples=%s driver_kernel=%d kernel_session=%d kernel_session_reason=%s",
+        static_cast<unsigned long>(count),
+        out_buffer.size(),
+        diag_ref.zero_base_count,
+        diag_ref.nonzero_base_count,
+        diag_ref.all_image_bases_zero ? 1 : 0,
+        samples.empty() ? "<none>" : samples.c_str(),
+        driver_bridge::using_kernel_driver() ? 1 : 0,
+        kernel_session_ok ? 1 : 0,
+        kernel_session_reason.empty() ? "<empty>" : kernel_session_reason.c_str());
+
+    if (diag_ref.all_image_bases_zero)
+    {
+        diag_ref.dependency_blocked = true;
+        diag_ref.token = current_process_token_diagnostics();
+        const std::string sample_value = samples.empty() ? std::string("<none>") : samples;
+        error_msg = OBFSTR("dependency_blocked: NtQuerySystemInformation(SystemModuleInformation) returned ") +
+            std::to_string(count) +
+            OBFSTR(" modules but every ImageBase is zero; kernel module base resolution is unavailable for this process. sample_modules=") +
+            sample_value +
+            OBFSTR(" strict_fallback=unavailable_no_exported_readonly_kernel_module_base_api");
+        const std::string token_json = diag_ref.token.dump();
+        const std::string driver_json = diag_ref.driver.dump();
+        diag::log_tagged_fmt("drv_tools",
+            "query_kernel_modules dependency_blocked reason=all_image_bases_zero count=%lu token=%s driver=%s strict_fallback=%s",
+            static_cast<unsigned long>(count),
+            token_json.c_str(),
+            driver_json.c_str(),
+            diag_ref.strict_fallback.c_str());
+        return false;
+    }
     return true;
 }
 
@@ -4790,8 +4983,13 @@ tool_result_t driver_enumerate_kernel_modules(const json& params)
     std::vector<std::uint8_t> buf;
     sys_module_info_t* info = nullptr;
     std::string err;
-    if (!query_kernel_modules(buf, info, err))
+    kernel_module_query_diagnostics_t query_diag{};
+    if (!query_kernel_modules(buf, info, err, &query_diag))
+    {
+        if (query_diag.dependency_blocked)
+            return tool_result_t::error(err, OBFSTR("dependency_blocked"), kernel_module_query_diagnostics_json(query_diag));
         return tool_result_t::error(err);
+    }
 
     std::string filter;
     if (params.contains("filter") && params["filter"].is_string())
@@ -4842,6 +5040,7 @@ tool_result_t driver_enumerate_kernel_modules(const json& params)
     result["modules"]        = modules_arr;
     result["total_loaded"]   = info->NumberOfModules;
     result["returned"]       = modules_arr.size();
+    result["module_base_diagnostics"] = kernel_module_query_diagnostics_json(query_diag);
 
     return tool_result_t::ok(
         OBFSTR("Enumerated ") + std::to_string(modules_arr.size()) + OBFSTR(" kernel modules") +
@@ -5341,7 +5540,10 @@ public:
                                  std::uint64_t& out_base,
                                  std::uint32_t& out_size,
                                  std::string& out_name,
-                                 std::string& out_path);
+                                 std::string& out_path,
+                                 std::string* out_error = nullptr,
+                                 json* out_diagnostics = nullptr,
+                                 bool* out_dependency_blocked = nullptr);
     bool poll_process_start(const std::string& target, std::uint32_t& out_pid);
 
 private:
@@ -5576,28 +5778,39 @@ bool DeferredActionManager::poll_kernel_module_load(
     std::uint64_t& out_base,
     std::uint32_t& out_size,
     std::string& out_name,
-    std::string& out_path)
+    std::string& out_path,
+    std::string* out_error,
+    json* out_diagnostics,
+    bool* out_dependency_blocked)
 {
-    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-    if (!ntdll) return false;
+    if (out_error)
+        out_error->clear();
+    if (out_diagnostics)
+        *out_diagnostics = json::object();
+    if (out_dependency_blocked)
+        *out_dependency_blocked = false;
 
-    auto pNtQuerySystemInformation = reinterpret_cast<NtQuerySystemInformation_fn>(
-        GetProcAddress(ntdll, "NtQuerySystemInformation"));
-    if (!pNtQuerySystemInformation) return false;
-
-    constexpr ULONG SystemModuleInformation = 11;
-    ULONG needed = 0;
-    pNtQuerySystemInformation(SystemModuleInformation, nullptr, 0, &needed);
-    if (needed == 0) needed = 256 * 1024;
-    needed += 16384;
-
-    std::vector<std::uint8_t> buf(needed, 0);
-    LONG status = pNtQuerySystemInformation(
-        SystemModuleInformation, buf.data(),
-        static_cast<ULONG>(buf.size()), &needed);
-    if (status < 0) return false;
-
-    auto* info = reinterpret_cast<sys_module_info_t*>(buf.data());
+    std::vector<std::uint8_t> buf;
+    sys_module_info_t* info = nullptr;
+    std::string err;
+    kernel_module_query_diagnostics_t query_diag{};
+    if (!query_kernel_modules(buf, info, err, &query_diag))
+    {
+        const std::string diag_json = kernel_module_query_diagnostics_json(query_diag).dump();
+        if (out_error)
+            *out_error = err;
+        if (out_diagnostics)
+            *out_diagnostics = kernel_module_query_diagnostics_json(query_diag);
+        if (out_dependency_blocked)
+            *out_dependency_blocked = query_diag.dependency_blocked;
+        diag::log_tagged_fmt("drv_tools",
+            "poll_kernel_module_load query_failed target=%s err=%s dependency_blocked=%d diag=%s",
+            target.c_str(),
+            err.c_str(),
+            query_diag.dependency_blocked ? 1 : 0,
+            diag_json.c_str());
+        return false;
+    }
 
     std::string lower_target = target;
     std::transform(lower_target.begin(), lower_target.end(), lower_target.begin(),
@@ -5619,9 +5832,25 @@ bool DeferredActionManager::poll_kernel_module_load(
             out_size = m.ImageSize;
             out_name = name;
             out_path = full_path;
+            diag::log_tagged_fmt("drv_tools",
+                "poll_kernel_module_load match target=%s name=%s base=0x%llX size=0x%X count=%lu zero_bases=%zu",
+                target.c_str(),
+                name.c_str(),
+                static_cast<unsigned long long>(out_base),
+                static_cast<unsigned>(out_size),
+                static_cast<unsigned long>(info->NumberOfModules),
+                query_diag.zero_base_count);
             return true;
         }
     }
+    const std::string samples = module_sample_text(query_diag.samples);
+    diag::log_tagged_fmt("drv_tools",
+        "poll_kernel_module_load not_found target=%s count=%lu samples=%s zero_bases=%zu nonzero_bases=%zu",
+        target.c_str(),
+        static_cast<unsigned long>(info->NumberOfModules),
+        samples.empty() ? "<none>" : samples.c_str(),
+        query_diag.zero_base_count,
+        query_diag.nonzero_base_count);
     return false;
 }
 
@@ -5840,7 +6069,11 @@ void DeferredActionManager::watcher_thread_func(int action_id)
             std::uint64_t base = 0;
             std::uint32_t size = 0;
             std::string name, path;
-            if (poll_kernel_module_load(action->target_name, base, size, name, path))
+            std::string poll_error;
+            json poll_diagnostics;
+            bool dependency_blocked = false;
+            if (poll_kernel_module_load(action->target_name, base, size, name, path,
+                    &poll_error, &poll_diagnostics, &dependency_blocked))
             {
                 condition_met = true;
                 std::ostringstream base_ss, size_ss;
@@ -5856,6 +6089,25 @@ void DeferredActionManager::watcher_thread_func(int action_id)
                     std::lock_guard<std::mutex> lock(_mutex);
                     action->trigger_info = trigger_context.dump();
                 }
+            }
+            else if (dependency_blocked)
+            {
+                {
+                    std::lock_guard<std::mutex> lock(_mutex);
+                    action->status.store(deferred_status::failed);
+                    action->error = poll_error.empty()
+                        ? std::string(OBFSTR("dependency_blocked: kernel module base resolution unavailable"))
+                        : poll_error;
+                    action->trigger_info = poll_diagnostics.dump();
+                }
+                const std::string poll_diag_text = poll_diagnostics.dump();
+                diag::log_tagged_fmt("drv_tools",
+                    "deferred_kernel_module_load dependency_blocked action_id=%d target=%s err=%s diag=%s",
+                    action->id,
+                    action->target_name.c_str(),
+                    poll_error.c_str(),
+                    poll_diag_text.c_str());
+                return;
             }
         }
         else if (action->condition_type == "process_start")
@@ -6033,9 +6285,20 @@ tool_result_t driver_defer_action(const json& params)
         std::uint64_t base = 0;
         std::uint32_t size = 0;
         std::string name, path;
+        std::string poll_error;
+        json poll_diagnostics;
+        bool dependency_blocked = false;
         auto& mgr = DeferredActionManager::instance();
-        if (mgr.poll_kernel_module_load(target, base, size, name, path))
+        if (mgr.poll_kernel_module_load(target, base, size, name, path,
+                &poll_error, &poll_diagnostics, &dependency_blocked))
             already_met = true;
+        else if (dependency_blocked)
+        {
+            const std::string error_text = poll_error.empty()
+                ? std::string(OBFSTR("dependency_blocked: kernel module base resolution unavailable"))
+                : poll_error;
+            return tool_result_t::error(error_text, OBFSTR("dependency_blocked"), poll_diagnostics);
+        }
     }
     else if (wait_for == "process_start")
     {
@@ -6504,8 +6767,9 @@ tool_result_t driver_enum_kernel_callbacks(const json& params)
     std::vector<std::uint8_t> mod_buf;
     sys_module_info_t* info = nullptr;
     std::string err;
-    if (!query_kernel_modules(mod_buf, info, err))
-        return tool_result_t::error(err);
+    kernel_module_query_diagnostics_t query_diag{};
+    if (!query_kernel_modules(mod_buf, info, err, &query_diag))
+        return kernel_module_query_error_result(err, query_diag);
 
 
     std::uint64_t ntos_base = 0;
@@ -6661,8 +6925,9 @@ tool_result_t driver_detect_integrity_checks(const json& params)
     std::vector<std::uint8_t> mod_buf;
     sys_module_info_t* info = nullptr;
     std::string err;
-    if (!query_kernel_modules(mod_buf, info, err))
-        return tool_result_t::error(err);
+    kernel_module_query_diagnostics_t query_diag{};
+    if (!query_kernel_modules(mod_buf, info, err, &query_diag))
+        return kernel_module_query_error_result(err, query_diag);
 
 
     std::uint64_t ntos_base = 0;
@@ -6806,9 +7071,10 @@ tool_result_t driver_detect_ssdt_hooks(const json&)
     std::vector<uint8_t> buf;
     sys_module_info_t* info = nullptr;
     std::string err;
-    if (!query_kernel_modules(buf, info, err)) {
+    kernel_module_query_diagnostics_t query_diag{};
+    if (!query_kernel_modules(buf, info, err, &query_diag)) {
         diag::log_tagged_fmt("drv_tools", "driver_detect_ssdt_hooks query_kernel_modules_failed err=%s", err.c_str());
-        return tool_result_t::error(OBFSTR("Failed to enumerate kernel modules: ") + err);
+        return kernel_module_query_error_result(err, query_diag, OBFSTR("Failed to enumerate kernel modules: "));
     }
     diag::log_tagged_fmt("drv_tools", "driver_detect_ssdt_hooks modules=%lu kernel_dtb=0x%llX",
         static_cast<unsigned long>(info ? info->NumberOfModules : 0),
@@ -7014,8 +7280,9 @@ tool_result_t driver_enum_minifilters(const json& params)
     std::vector<uint8_t> buf;
     sys_module_info_t* info = nullptr;
     std::string err;
-    if (!query_kernel_modules(buf, info, err))
-        return tool_result_t::error(OBFSTR("Failed to enumerate kernel modules: ") + err);
+    kernel_module_query_diagnostics_t query_diag{};
+    if (!query_kernel_modules(buf, info, err, &query_diag))
+        return kernel_module_query_error_result(err, query_diag, OBFSTR("Failed to enumerate kernel modules: "));
 
 
     std::uint64_t fltmgr_base = 0, fltmgr_size = 0;
@@ -7217,8 +7484,9 @@ tool_result_t driver_detect_etw_monitors(const json& params)
     std::vector<uint8_t> buf;
     sys_module_info_t* info = nullptr;
     std::string err;
-    if (!query_kernel_modules(buf, info, err))
-        return tool_result_t::error(OBFSTR("Failed to enumerate kernel modules: ") + err);
+    kernel_module_query_diagnostics_t query_diag{};
+    if (!query_kernel_modules(buf, info, err, &query_diag))
+        return kernel_module_query_error_result(err, query_diag, OBFSTR("Failed to enumerate kernel modules: "));
 
     std::uint64_t ntos_base = 0, ntos_size = 0;
     for (ULONG i = 0; i < info->NumberOfModules; ++i)
@@ -7568,8 +7836,9 @@ tool_result_t driver_detect_hidden_modules(const json& params)
         std::vector<uint8_t> mod_buf;
         sys_module_info_t* kinfo = nullptr;
         std::string kerr;
-        if (!query_kernel_modules(mod_buf, kinfo, kerr))
-            return tool_result_t::error(OBFSTR("Failed to enumerate kernel modules: ") + kerr);
+        kernel_module_query_diagnostics_t query_diag{};
+        if (!query_kernel_modules(mod_buf, kinfo, kerr, &query_diag))
+            return kernel_module_query_error_result(kerr, query_diag, OBFSTR("Failed to enumerate kernel modules: "));
 
         std::set<std::uint64_t> known_bases;
         for (ULONG i = 0; i < kinfo->NumberOfModules; ++i)

@@ -1159,40 +1159,43 @@ inline bool snapshot_code_from_layout(state::code_snapshot_t& snap,
     next.text_size = text_size;
     memcpy(next.text_sha256, stable_sha256, 32);
 
-    derive_session_keys(reinterpret_cast<const uint8_t*>(next.text_base), next.text_size);
-    next.text_hash = hash_memory(reinterpret_cast<const void*>(next.text_base), next.text_size);
-
-    uint64_t seed_value = fresh_entropy();
-    if (seed_value == 0) seed_value = 0xA1DAA0E2DEADBEEFULL;
-    s_self_chain_seed.store(seed_value, std::memory_order_release);
-    uint64_t per_call = siphash::siphash_3u64(seed_value, load_k0(), load_k1());
-    uint64_t chain = self_hash_chain_compute(per_call);
-    if (chain != 0)
     {
-        uint8_t mat[16];
-        memcpy(mat + 0, &chain, 8);
-        memcpy(mat + 8, &per_call, 8);
-        uint8_t mac[32] = {};
-        uint8_t base_secret[32] = {};
-        bool secret_ok = compute_session_secret(base_secret);
-        bool hmac_ok = secret_ok && sha256::hmac(base_secret, 32, mat, sizeof(mat), mac);
-        SecureZeroMemory(base_secret, sizeof(base_secret));
-        if (hmac_ok)
+        std::lock_guard<std::mutex> chain_lk(self_chain_mtx());
+        derive_session_keys(reinterpret_cast<const uint8_t*>(next.text_base), next.text_size);
+        next.text_hash = hash_memory(reinterpret_cast<const void*>(next.text_base), next.text_size);
+
+        uint64_t seed_value = fresh_entropy();
+        if (seed_value == 0) seed_value = 0xA1DAA0E2DEADBEEFULL;
+        s_self_chain_seed.store(seed_value, std::memory_order_release);
+        uint64_t per_call = siphash::siphash_3u64(seed_value, load_k0(), load_k1());
+        uint64_t chain = self_hash_chain_compute(per_call);
+        if (chain != 0)
         {
-            uint64_t anchor = 0;
-            memcpy(&anchor, mac, 8);
-            s_self_chain_anchor.store(anchor ^ seed_value, std::memory_order_release);
+            uint8_t mat[16];
+            memcpy(mat + 0, &chain, 8);
+            memcpy(mat + 8, &per_call, 8);
+            uint8_t mac[32] = {};
+            uint8_t base_secret[32] = {};
+            bool secret_ok = compute_session_secret(base_secret);
+            bool hmac_ok = secret_ok && sha256::hmac(base_secret, 32, mat, sizeof(mat), mac);
+            SecureZeroMemory(base_secret, sizeof(base_secret));
+            if (hmac_ok)
+            {
+                uint64_t anchor = 0;
+                memcpy(&anchor, mac, 8);
+                s_self_chain_anchor.store(anchor ^ seed_value, std::memory_order_release);
+            }
+            else
+            {
+                s_self_chain_anchor.store(0, std::memory_order_release);
+            }
+            SecureZeroMemory(mac, sizeof(mac));
+            SecureZeroMemory(mat, sizeof(mat));
         }
         else
         {
             s_self_chain_anchor.store(0, std::memory_order_release);
         }
-        SecureZeroMemory(mac, sizeof(mac));
-        SecureZeroMemory(mat, sizeof(mat));
-    }
-    else
-    {
-        s_self_chain_anchor.store(0, std::memory_order_release);
     }
 
     {

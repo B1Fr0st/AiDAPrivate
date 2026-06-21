@@ -11106,6 +11106,11 @@ namespace {
                 }, passed, failed, &out);
             if (out.success)
                 payload_string_field(out.data, "session_id", session_id);
+            log_msg(hf, tag, "HEAP-SESSION -- phase=start status_success=%d session_id=%s args=%s data=%s",
+                out.success ? 1 : 0,
+                session_id.empty() ? "<empty>" : session_id.c_str(),
+                compact_json(args, 900).c_str(),
+                compact_json(out.data, 900).c_str());
         }
 
         bool heap_stimulus_ok = false;
@@ -11136,6 +11141,13 @@ namespace {
                 args["focus_stride"] = desc.heap_burst_stride != 0 ? desc.heap_burst_stride : 160;
                 args["focus_size"] = desc.heap_burst_stride != 0 ? desc.heap_burst_stride : 160;
             }
+            log_msg(hf, tag, "HEAP-SESSION -- phase=results session_id=%s active_pid=%u heap_first_va=0x%016llX heap_count=%u heap_stride=%u args=%s",
+                session_id.c_str(),
+                pid,
+                static_cast<unsigned long long>(desc.heap_burst_first_va),
+                desc.heap_burst_count,
+                desc.heap_burst_stride,
+                compact_json(args, 900).c_str());
             test_coverage_domains_1_8_case(hf, tag, "heap_track_manage", "results_after_fixture_heap_burst", args, 4000,
                 [](const invoke_result_t& ir, std::string& reason) {
                     if (!ir.success) {
@@ -11163,6 +11175,9 @@ namespace {
             mcp_standalone::json args = test_coverage_domains_1_8_safe_args();
             args["action"] = "stop";
             args["session_id"] = session_id;
+            log_msg(hf, tag, "HEAP-SESSION -- phase=stop session_id=%s args=%s",
+                session_id.c_str(),
+                compact_json(args, 900).c_str());
             test_coverage_domains_1_8_case(hf, tag, "heap_track_manage", "stop_heap_session_safe_fixture", args, 3000,
                 [](const invoke_result_t& ir, std::string& reason) {
                     if (!ir.success) {
@@ -11459,7 +11474,7 @@ namespace {
         test_coverage_domains_1_8_schema(hf, tag, "encptr_emit_resolver", true, {{"chain", true}}, passed, failed);
         test_coverage_domains_1_8_schema(hf, tag, "encptr_verify_stable", true, {{"chain", true}}, passed, failed);
         test_coverage_domains_1_8_schema(hf, tag, "offsets_manage", false, {{"action", true}, {"confirm_unsafe", false}}, passed, failed);
-        test_coverage_domains_1_8_schema(hf, tag, "heap_track_manage", false, {{"action", true}, {"confirm_unsafe", false}}, passed, failed);
+        test_coverage_domains_1_8_schema(hf, tag, "heap_track_manage", false, {{"action", true}, {"session_id", false}, {"confirm_unsafe", false}}, passed, failed);
         test_coverage_domains_1_8_schema(hf, tag, "sigs_manage", false, {{"action", true}, {"confirm_unsafe", false}}, passed, failed);
         test_coverage_domains_1_8_schema(hf, tag, "struct_observe", false, {{"base_va", true}, {"confirm_unsafe", false}}, passed, failed);
         test_coverage_domains_1_8_schema(hf, tag, "struct_correlate", true, {{"field_addresses", true}}, passed, failed);
@@ -13217,6 +13232,39 @@ namespace {
         return out;
     }
 
+    std::string fixture_js_string_escape(const std::string& s) {
+        std::string out;
+        out.reserve(s.size() + 8);
+        for (char c : s) {
+            switch (c) {
+            case '\\': out += "\\\\"; break;
+            case '\'': out += "\\'"; break;
+            case '\r': out += "\\r"; break;
+            case '\n': out += "\\n"; break;
+            case '<': out += "\\x3C"; break;
+            default: out.push_back(c); break;
+            }
+        }
+        return out;
+    }
+
+    std::string fixture_cookie_token(const std::string& s) {
+        std::string out;
+        out.reserve(std::min<size_t>(s.size(), 128));
+        for (char c : s) {
+            const unsigned char uc = static_cast<unsigned char>(c);
+            if ((uc >= 'a' && uc <= 'z') ||
+                (uc >= 'A' && uc <= 'Z') ||
+                (uc >= '0' && uc <= '9') ||
+                c == '_' || c == '-') {
+                out.push_back(c);
+                if (out.size() >= 128)
+                    break;
+            }
+        }
+        return out;
+    }
+
     std::string fixture_query_value(const std::string& req, const char* key) {
         if (!key)
             return {};
@@ -14539,6 +14587,7 @@ namespace {
             }
             std::string body;
             std::string content_type = "text/html; charset=utf-8";
+            std::string set_cookie_header;
             const char* route = "html";
             if (req.rfind("POST /token ", 0) == 0) {
                 content_type = "application/json";
@@ -14548,9 +14597,18 @@ namespace {
                 content_type = "application/json";
                 body = "{\"data\":{\"__typename\":\"Query\",\"aidaStatus\":\"ready\",\"viewer\":{\"id\":\"fixture\",\"name\":\"AiDA Fixture\"},\"__schema\":{\"queryType\":{\"name\":\"Query\"},\"types\":[{\"kind\":\"OBJECT\",\"name\":\"Query\",\"fields\":[{\"name\":\"__typename\",\"type\":{\"kind\":\"SCALAR\",\"name\":\"String\"},\"args\":[]},{\"name\":\"aidaStatus\",\"type\":{\"kind\":\"SCALAR\",\"name\":\"String\"},\"args\":[]},{\"name\":\"viewer\",\"type\":{\"kind\":\"OBJECT\",\"name\":\"AidaViewer\"},\"args\":[]}],\"interfaces\":[]},{\"kind\":\"OBJECT\",\"name\":\"AidaViewer\",\"fields\":[{\"name\":\"id\",\"type\":{\"kind\":\"SCALAR\",\"name\":\"ID\"},\"args\":[]},{\"name\":\"name\",\"type\":{\"kind\":\"SCALAR\",\"name\":\"String\"},\"args\":[]}],\"interfaces\":[]},{\"kind\":\"SCALAR\",\"name\":\"String\",\"fields\":[],\"interfaces\":[]},{\"kind\":\"SCALAR\",\"name\":\"ID\",\"fields\":[],\"interfaces\":[]}]}}}";
                 route = "graphql";
-            } else if (req.rfind("GET /aida-fixture.js ", 0) == 0) {
+            } else if (req.rfind("GET /aida-fixture.js", 0) == 0) {
                 content_type = "application/javascript";
-                body = "window.aidaExternalFixture='AIDA_CAMOUFOX_SCRIPT_MARKER';function aidaFixtureSigner(p){return p.aida_value||'';}console.log('AIDA_CAMOUFOX_SCRIPT_READY');";
+                const std::string capture = fixture_query_value(req, "capture");
+                const std::string cookie_name = fixture_cookie_token(fixture_query_value(req, "set_cookie"));
+                const std::string capture_js = fixture_js_string_escape(capture);
+                body = "window.aidaExternalFixture='AIDA_CAMOUFOX_SCRIPT_MARKER';"
+                       "window.aidaExternalFixtureCapture='" + capture_js + "';"
+                       "window.aidaExternalFixtureLoadedAt=Date.now();"
+                       "function aidaFixtureSigner(p){return p.aida_value||'';}"
+                       "console.log('AIDA_CAMOUFOX_SCRIPT_READY:" + capture_js + "');";
+                if (!cookie_name.empty())
+                    set_cookie_header = cookie_name + "=http; Path=/; SameSite=Lax";
                 route = "script";
             } else if (req.find(" /aida-mcp-test") != std::string::npos || req.find(" /FUZZ") != std::string::npos) {
                 body = "aida-mcp-test";
@@ -14599,6 +14657,8 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             resp += "X-Powered-By: PHP/8.2\r\n";
             resp += "X-AiDA-Fixture: mcp-local\r\n";
             resp += "X-Query-Echo: " + fixture_header_safe(fixture_request_query(req)) + "\r\n";
+            if (!set_cookie_header.empty())
+                resp += "Set-Cookie: " + set_cookie_header + "\r\n";
             resp += "Connection: close\r\n";
             resp += "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n";
             resp += body;
@@ -15147,27 +15207,163 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         return sent;
     }
 
-    bool stimulate_network_redirect_rule(HANDLE hf, const char* tag, uint64_t rule_id, uint16_t match_port, uint16_t redirect_port, const char* path) {
-        const uint64_t requests_before = g_burp_http_fixture ? g_burp_http_fixture->request_count.load(std::memory_order_acquire) : 0;
-        const auto payload = mcp_http_fixture_request_payload(path ? path : "/aida-network-redirect-stimulus");
+    int mcp_socket_so_error(SOCKET s) {
+        int value = 0;
+        int len = sizeof(value);
+        if (getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&value), &len) == SOCKET_ERROR)
+            return WSAGetLastError();
+        return value;
+    }
+
+    struct network_redirect_stimulus_result_t {
+        bool wsa_ready = false;
+        bool sent = false;
+        bool delivered = false;
+        int attempts = 0;
+        int socket_error = 0;
+        int connect_rc = SOCKET_ERROR;
+        int connect_error = 0;
+        int send_rc = SOCKET_ERROR;
+        int send_error = 0;
+        int recv_rc = SOCKET_ERROR;
+        int recv_error = 0;
+        int so_error_after_connect = 0;
+        int so_error_after_send = 0;
+        int so_error_after_recv = 0;
         size_t response_len = 0;
-        const bool sent = send_loopback_tcp_payload_to_port(hf, tag, match_port, payload, &response_len);
-        Sleep(350);
-        const uint64_t requests_after = g_burp_http_fixture ? g_burp_http_fixture->request_count.load(std::memory_order_acquire) : 0;
-        const long long delta = static_cast<long long>(requests_after) - static_cast<long long>(requests_before);
-        const bool delivered = sent && delta > 0;
-        log_msg(hf, tag, "RULE-STIMULUS -- tool=network_redirect_manage rule_id=%llu match_port=%u redirect_port=%u sent=%d response_len=%zu requests_before=%llu requests_after=%llu delta=%lld delivered=%d path=%s",
+        uint64_t requests_before = 0;
+        uint64_t requests_after = 0;
+        uint64_t accepts_before = 0;
+        uint64_t accepts_after = 0;
+        long long request_delta = 0;
+        long long accept_delta = 0;
+    };
+
+    network_redirect_stimulus_result_t stimulate_network_redirect_rule(HANDLE hf, const char* tag, uint64_t rule_id, uint16_t match_port, uint16_t redirect_port, const char* path) {
+        network_redirect_stimulus_result_t diag;
+        diag.requests_before = g_burp_http_fixture ? g_burp_http_fixture->request_count.load(std::memory_order_acquire) : 0;
+        diag.accepts_before = g_burp_http_fixture ? g_burp_http_fixture->accept_count.load(std::memory_order_acquire) : 0;
+        const auto payload = mcp_http_fixture_request_payload(path ? path : "/aida-network-redirect-stimulus");
+        if (match_port == 0) {
+            log_msg(hf, tag, "RULE-STIMULUS -- tool=network_redirect_manage rule_id=%llu match_port=%u redirect_port=%u wsa_ready=%d attempts=%d sent=0 delivered=0 reason=%s path=%s",
+                static_cast<unsigned long long>(rule_id),
+                static_cast<unsigned>(match_port),
+                static_cast<unsigned>(redirect_port),
+                diag.wsa_ready ? 1 : 0,
+                diag.attempts,
+                "match_port_zero",
+                path ? path : "<null>");
+            return diag;
+        }
+        diag.wsa_ready = ensure_mcp_winsock_ready();
+        if (!diag.wsa_ready) {
+            log_msg(hf, tag, "RULE-STIMULUS -- tool=network_redirect_manage rule_id=%llu match_port=%u redirect_port=%u wsa_ready=0 attempts=%d sent=0 delivered=0 reason=%s path=%s",
+                static_cast<unsigned long long>(rule_id),
+                static_cast<unsigned>(match_port),
+                static_cast<unsigned>(redirect_port),
+                diag.attempts,
+                "wsa_startup_failed",
+                path ? path : "<null>");
+            return diag;
+        }
+        sockaddr_in dst = {};
+        dst.sin_family = AF_INET;
+        dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        dst.sin_port = htons(match_port);
+        for (int attempt = 1; attempt <= 12; ++attempt) {
+            diag.attempts = attempt;
+            SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            if (s == INVALID_SOCKET) {
+                diag.socket_error = WSAGetLastError();
+                log_msg(hf, tag, "REDIRECT-STIMULUS-ATTEMPT -- attempt=%d rule_id=%llu socket_failed err=%d",
+                    attempt,
+                    static_cast<unsigned long long>(rule_id),
+                    diag.socket_error);
+                break;
+            }
+            DWORD timeout = 1500;
+            setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+            setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+            diag.connect_rc = connect(s, reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
+            diag.connect_error = diag.connect_rc == SOCKET_ERROR ? WSAGetLastError() : 0;
+            diag.so_error_after_connect = mcp_socket_so_error(s);
+            log_msg(hf, tag, "REDIRECT-STIMULUS-CONNECT -- attempt=%d rule_id=%llu match_port=%u rc=%d err=%d so_error=%d fixture_accepts_before=%llu fixture_requests_before=%llu",
+                attempt,
+                static_cast<unsigned long long>(rule_id),
+                static_cast<unsigned>(match_port),
+                diag.connect_rc,
+                diag.connect_error,
+                diag.so_error_after_connect,
+                static_cast<unsigned long long>(diag.accepts_before),
+                static_cast<unsigned long long>(diag.requests_before));
+            if (diag.connect_rc == SOCKET_ERROR) {
+                closesocket(s);
+                if (diag.connect_error == WSAECONNREFUSED || diag.connect_error == WSAETIMEDOUT ||
+                    diag.connect_error == WSAEADDRNOTAVAIL || diag.connect_error == WSAENOBUFS) {
+                    Sleep(static_cast<DWORD>(25 * attempt));
+                    continue;
+                }
+                break;
+            }
+            diag.send_rc = send(s, reinterpret_cast<const char*>(payload.data()), static_cast<int>(payload.size()), 0);
+            diag.send_error = diag.send_rc <= 0 ? WSAGetLastError() : 0;
+            diag.so_error_after_send = mcp_socket_so_error(s);
+            if (diag.send_rc > 0)
+                diag.sent = true;
+            char tmp[512];
+            diag.recv_rc = recv(s, tmp, sizeof(tmp), 0);
+            diag.recv_error = diag.recv_rc <= 0 ? WSAGetLastError() : 0;
+            diag.so_error_after_recv = mcp_socket_so_error(s);
+            if (diag.recv_rc > 0)
+                diag.response_len += static_cast<size_t>(diag.recv_rc);
+            log_msg(hf, tag, "REDIRECT-STIMULUS-IO -- attempt=%d rule_id=%llu match_port=%u redirect_port=%u send_rc=%d send_err=%d so_after_send=%d recv_rc=%d recv_err=%d so_after_recv=%d response_len=%zu",
+                attempt,
+                static_cast<unsigned long long>(rule_id),
+                static_cast<unsigned>(match_port),
+                static_cast<unsigned>(redirect_port),
+                diag.send_rc,
+                diag.send_error,
+                diag.so_error_after_send,
+                diag.recv_rc,
+                diag.recv_error,
+                diag.so_error_after_recv,
+                diag.response_len);
+            closesocket(s);
+            if (diag.sent)
+                break;
+            Sleep(static_cast<DWORD>(25 * attempt));
+        }
+        Sleep(500);
+        diag.requests_after = g_burp_http_fixture ? g_burp_http_fixture->request_count.load(std::memory_order_acquire) : 0;
+        diag.accepts_after = g_burp_http_fixture ? g_burp_http_fixture->accept_count.load(std::memory_order_acquire) : 0;
+        diag.request_delta = static_cast<long long>(diag.requests_after) - static_cast<long long>(diag.requests_before);
+        diag.accept_delta = static_cast<long long>(diag.accepts_after) - static_cast<long long>(diag.accepts_before);
+        diag.delivered = diag.sent && diag.request_delta > 0;
+        log_msg(hf, tag, "RULE-STIMULUS -- tool=network_redirect_manage rule_id=%llu match_port=%u redirect_port=%u attempts=%d sent=%d response_len=%zu requests_before=%llu requests_after=%llu request_delta=%lld accepts_before=%llu accepts_after=%llu accept_delta=%lld delivered=%d connect_rc=%d connect_err=%d so_connect=%d send_rc=%d send_err=%d so_send=%d recv_rc=%d recv_err=%d so_recv=%d path=%s",
             static_cast<unsigned long long>(rule_id),
             static_cast<unsigned>(match_port),
             static_cast<unsigned>(redirect_port),
-            sent ? 1 : 0,
-            response_len,
-            static_cast<unsigned long long>(requests_before),
-            static_cast<unsigned long long>(requests_after),
-            delta,
-            delivered ? 1 : 0,
+            diag.attempts,
+            diag.sent ? 1 : 0,
+            diag.response_len,
+            static_cast<unsigned long long>(diag.requests_before),
+            static_cast<unsigned long long>(diag.requests_after),
+            diag.request_delta,
+            static_cast<unsigned long long>(diag.accepts_before),
+            static_cast<unsigned long long>(diag.accepts_after),
+            diag.accept_delta,
+            diag.delivered ? 1 : 0,
+            diag.connect_rc,
+            diag.connect_error,
+            diag.so_error_after_connect,
+            diag.send_rc,
+            diag.send_error,
+            diag.so_error_after_send,
+            diag.recv_rc,
+            diag.recv_error,
+            diag.so_error_after_recv,
             path ? path : "<null>");
-        return delivered;
+        return diag;
     }
 
     bool stimulate_dns_spoof_rule(HANDLE hf, const char* tag, uint64_t rule_id, const std::string& domain) {
@@ -21095,11 +21291,13 @@ void test_tool_api_monitor_start(HANDLE hf, std::atomic<int>& passed, std::atomi
     }
 
     void test_tool_network_redirect_manage_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        bool redirect_delivery_ok = false;
+        network_redirect_stimulus_result_t redirect_diag;
+        mcp_rule_match_count_probe_t before_probe;
+        mcp_rule_match_count_probe_t after_probe;
         if (g_network_redirect_rule_id != 0) {
-            network_rule_match_count_probe(hf, "mcp.network_redirect_manage.list", "network_redirect_manage", "list", g_network_redirect_rule_id, "before_stimulus");
-            redirect_delivery_ok = stimulate_network_redirect_rule(hf, "mcp.network_redirect_manage.list", g_network_redirect_rule_id, g_network_redirect_match_port, g_network_redirect_rule_port, "/aida-network-redirect-stimulus");
-            network_rule_match_count_probe(hf, "mcp.network_redirect_manage.list", "network_redirect_manage", "list", g_network_redirect_rule_id, "after_stimulus");
+            before_probe = network_rule_match_count_probe(hf, "mcp.network_redirect_manage.list", "network_redirect_manage", "list", g_network_redirect_rule_id, "before_stimulus");
+            redirect_diag = stimulate_network_redirect_rule(hf, "mcp.network_redirect_manage.list", g_network_redirect_rule_id, g_network_redirect_match_port, g_network_redirect_rule_port, "/aida-network-redirect-stimulus");
+            after_probe = network_rule_match_count_probe(hf, "mcp.network_redirect_manage.list", "network_redirect_manage", "list", g_network_redirect_rule_id, "after_stimulus");
         } else {
             log_msg(hf, "mcp.network_redirect_manage.list", "RULE-STIMULUS -- missing redirect rule_id; list remains subject to zero-output validation");
         }
@@ -21108,11 +21306,33 @@ void test_tool_api_monitor_start(HANDLE hf, std::atomic<int>& passed, std::atomi
         if (status == mcp_tool_call_status_t::passed && g_network_redirect_rule_id != 0) {
             const bool match_count_ok = require_positive_rule_match_count_from_list(hf, "mcp.network_redirect_manage.list",
                 "network_redirect_manage", g_network_redirect_rule_id, result, passed, failed);
-            if (match_count_ok && !redirect_delivery_ok) {
-                log_msg(hf, "mcp.network_redirect_manage.list", "FAIL -- redirect rule matched but delivery proof failed rule_id=%llu match_port=%u redirect_port=%u data=%s",
+            if (match_count_ok && !redirect_diag.delivered) {
+                log_msg(hf, "mcp.network_redirect_manage.list", "FIXTURE-REDIRECT-PATH-FAILURE -- kernel_match_count_positive=1 delivery_proven=0 rule_id=%llu match_port=%u redirect_port=%u before_found=%d before_match=%llu after_found=%d after_match=%llu attempts=%d sent=%d response_len=%zu requests_before=%llu requests_after=%llu request_delta=%lld accepts_before=%llu accepts_after=%llu accept_delta=%lld connect_rc=%d connect_err=%d so_connect=%d send_rc=%d send_err=%d so_send=%d recv_rc=%d recv_err=%d so_recv=%d data=%s",
                     static_cast<unsigned long long>(g_network_redirect_rule_id),
                     static_cast<unsigned>(g_network_redirect_match_port),
                     static_cast<unsigned>(g_network_redirect_rule_port),
+                    before_probe.match_count_found ? 1 : 0,
+                    static_cast<unsigned long long>(before_probe.match_count),
+                    after_probe.match_count_found ? 1 : 0,
+                    static_cast<unsigned long long>(after_probe.match_count),
+                    redirect_diag.attempts,
+                    redirect_diag.sent ? 1 : 0,
+                    redirect_diag.response_len,
+                    static_cast<unsigned long long>(redirect_diag.requests_before),
+                    static_cast<unsigned long long>(redirect_diag.requests_after),
+                    redirect_diag.request_delta,
+                    static_cast<unsigned long long>(redirect_diag.accepts_before),
+                    static_cast<unsigned long long>(redirect_diag.accepts_after),
+                    redirect_diag.accept_delta,
+                    redirect_diag.connect_rc,
+                    redirect_diag.connect_error,
+                    redirect_diag.so_error_after_connect,
+                    redirect_diag.send_rc,
+                    redirect_diag.send_error,
+                    redirect_diag.so_error_after_send,
+                    redirect_diag.recv_rc,
+                    redirect_diag.recv_error,
+                    redirect_diag.so_error_after_recv,
                     compact_json(result.data, 900).c_str());
                 convert_last_pass_to_fixture_failure("network_redirect_manage", passed, failed);
             }
@@ -21993,6 +22213,115 @@ void test_tool_api_monitor_start(HANDLE hf, std::atomic<int>& passed, std::atomi
                 driver_bridge::free_memory(pg_addr);
             return;
         }
+        uint64_t trigger_fn = resolve_remote_export("ntdll.dll", "RtlComputeCrc32");
+        const char* trigger_kind = "RtlComputeCrc32";
+        if (trigger_fn == 0) {
+            trigger_fn = resolve_remote_export("ntdll.dll", "RtlCompareMemory");
+            trigger_kind = "RtlCompareMemory";
+        }
+        uint64_t trigger_result = 0;
+        if (trigger_fn != 0) {
+            trigger_result = std::strcmp(trigger_kind, "RtlCompareMemory") == 0
+                ? page_guard_engine::remote_thread_call(pid, trigger_fn, pg_addr, pg_addr, marker_text.size(), 0, 3000, "network_pg_sniff_RtlCompareMemory_fixture")
+                : page_guard_engine::remote_thread_call(pid, trigger_fn, 0, pg_addr, marker_text.size(), 0, 3000, "network_pg_sniff_RtlComputeCrc32_fixture");
+        }
+        log_msg(hf, "mcp.network_pg_sniff", "TRIGGER -- session_id=%llu pid=%u addr=0x%016llX size=%zu trigger_kind=%s trigger_fn=0x%016llX trigger_result=0x%016llX status=\"%s\" last_error=\"%s\"",
+            static_cast<unsigned long long>(session_id),
+            pid,
+            static_cast<unsigned long long>(pg_addr),
+            marker_text.size(),
+            trigger_kind,
+            static_cast<unsigned long long>(trigger_fn),
+            static_cast<unsigned long long>(trigger_result),
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str());
+        sidecar_capture_coverage_t direct_capture_coverage;
+        std::string direct_capture_aggregate;
+        auto pg_capture_poll = [&](DWORD timeout_ms) -> bool {
+            const char* tool_name = "network_pg_sniff";
+            const DWORD start = GetTickCount();
+            int attempts = 0;
+            mcp_standalone::json capture_args;
+            capture_args["operation"] = "get_captures";
+            capture_args["session_id"] = session_id;
+            for (;;) {
+                ++attempts;
+                g_invoked_tools.insert(tool_name);
+                const int seq = g_mcp_tool_sequence.fetch_add(1, std::memory_order_acq_rel) + 1;
+                set_progress_step("mcp network_pg_sniff get_captures");
+                log_msg(hf, "mcp.network_pg_sniff", "DISPATCH -- phase=get_captures seq=%d attempt=%d session_id=%llu pid=%u addr=0x%016llX args=%s",
+                    seq,
+                    attempts,
+                    static_cast<unsigned long long>(session_id),
+                    pid,
+                    static_cast<unsigned long long>(pg_addr),
+                    compact_json(capture_args, 900).c_str());
+                auto timed = invoke_tool_bounded(get_server(), tool_name, capture_args, 10000, hf, "mcp.network_pg_sniff", seq);
+                const invoke_result_t& ir = timed.result;
+                log_mcp_result_detail(timed.timed_out ? "timeout" : "get_captures", seq, tool_name, capture_args, ir, timed.elapsed_ms, "");
+                if (!timed.timed_out && ir.found && !ir.threw && ir.success) {
+                    direct_capture_aggregate += ir.text;
+                    direct_capture_aggregate += compact_json(ir.data, 3000);
+                    sidecar_capture_coverage_t delta = marker_coverage_from_result(ir, marker_text);
+                    direct_capture_coverage.captures += delta.captures;
+                    direct_capture_coverage.iterations.insert(delta.iterations.begin(), delta.iterations.end());
+                    log_msg(hf, "mcp.network_pg_sniff", "CAPTURE-POLL -- attempt=%d captures=%zu total_captures=%zu iterations=%s data=%s",
+                        attempts,
+                        delta.captures,
+                        direct_capture_coverage.captures,
+                        iteration_coverage_summary(direct_capture_coverage.iterations).c_str(),
+                        compact_json(ir.data, 1200).c_str());
+                    if (direct_capture_coverage.captures > 0) {
+                        log_msg(hf, "mcp.network_pg_sniff", "FUNCTIONAL-PASS -- phase=get_captures session_id=%llu marker=%s captures=%zu iterations=%s trigger_kind=%s trigger_result=0x%016llX",
+                            static_cast<unsigned long long>(session_id),
+                            marker_text.c_str(),
+                            direct_capture_coverage.captures,
+                            iteration_coverage_summary(direct_capture_coverage.iterations).c_str(),
+                            trigger_kind,
+                            static_cast<unsigned long long>(trigger_result));
+                        record_tool_status(tool_name, mcp_tool_call_status_t::functional_pass);
+                        return true;
+                    }
+                } else {
+                    direct_capture_aggregate += compact_text(ir.text, 900);
+                    direct_capture_aggregate += compact_json(ir.data, 1200);
+                    log_msg(hf, "mcp.network_pg_sniff", "CAPTURE-POLL-MISS -- attempt=%d timed_out=%d found=%d threw=%d success=%d elapsed_ms=%lld text=%s data=%s",
+                        attempts,
+                        timed.timed_out ? 1 : 0,
+                        ir.found ? 1 : 0,
+                        ir.threw ? 1 : 0,
+                        ir.success ? 1 : 0,
+                        timed.elapsed_ms,
+                        compact_text(ir.text, 700).c_str(),
+                        compact_json(ir.data, 900).c_str());
+                }
+                if (GetTickCount() - start >= timeout_ms)
+                    break;
+                Sleep(125);
+            }
+            log_msg(hf, "mcp.network_pg_sniff", "FAIL -- get_captures did not return guarded-page marker session_id=%llu marker=%s captures=%zu trigger_kind=%s trigger_fn=0x%016llX trigger_result=0x%016llX aggregate=%s",
+                static_cast<unsigned long long>(session_id),
+                marker_text.c_str(),
+                direct_capture_coverage.captures,
+                trigger_kind,
+                static_cast<unsigned long long>(trigger_fn),
+                static_cast<unsigned long long>(trigger_result),
+                compact_text(direct_capture_aggregate, 1400).c_str());
+            record_tool_status(tool_name, mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
+            return false;
+        };
+        bool capture_ok = false;
+        if (trigger_fn == 0) {
+            log_msg(hf, "mcp.network_pg_sniff", "FAIL -- no safe ntdll guarded-page trigger export resolved session_id=%llu pid=%u",
+                static_cast<unsigned long long>(session_id),
+                pid);
+            record_tool_status("network_pg_sniff", mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
+        } else {
+            Sleep(250);
+            capture_ok = pg_capture_poll(5000);
+        }
         mcp_standalone::json list_args;
         list_args["operation"] = "list_sessions";
         const bool list_ok = pg_contract_call("list_sessions", list_args,
@@ -22033,12 +22362,14 @@ void test_tool_api_monitor_start(HANDLE hf, std::atomic<int>& passed, std::atomi
         bool freed = false;
         if (pg_addr != 0)
             freed = driver_bridge::free_memory(pg_addr);
-        log_msg(hf, "mcp.network_pg_sniff", "CLEANUP -- session_id=%llu list_ok=%d uninstall_ok=%d freed=%d addr=0x%016llX functional_capture_coverage=0",
+        log_msg(hf, "mcp.network_pg_sniff", "CLEANUP -- session_id=%llu list_ok=%d capture_ok=%d uninstall_ok=%d freed=%d addr=0x%016llX functional_capture_coverage=%zu",
             static_cast<unsigned long long>(session_id),
             list_ok ? 1 : 0,
+            capture_ok ? 1 : 0,
             uninstall_ok ? 1 : 0,
             freed ? 1 : 0,
-            static_cast<unsigned long long>(pg_addr));
+            static_cast<unsigned long long>(pg_addr),
+            direct_capture_coverage.captures);
     }
 
     void test_network_pg_sniff_payload_serialization(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -24303,6 +24634,63 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
         return false;
     }
 
+    const mcp_standalone::json* camoufox_find_cookie_payload_by_name(const mcp_standalone::json& value, const std::string& name) {
+        if (name.empty())
+            return nullptr;
+        if (value.is_object()) {
+            auto keyed = value.find(name);
+            if (keyed != value.end())
+                return &(*keyed);
+            std::string field_name;
+            if (json_string_any_field(value, field_name, {"name", "cookie_name"}) && field_name == name)
+                return &value;
+            for (auto it = value.begin(); it != value.end(); ++it) {
+                if (it->is_array() || it->is_object()) {
+                    if (const auto* found = camoufox_find_cookie_payload_by_name(*it, name))
+                        return found;
+                }
+            }
+        } else if (value.is_array()) {
+            for (const auto& item : value) {
+                if (const auto* found = camoufox_find_cookie_payload_by_name(item, name))
+                    return found;
+            }
+        }
+        return nullptr;
+    }
+
+    bool camoufox_cookie_payload_has_nonempty_value(const mcp_standalone::json& entry, std::string& value) {
+        if (entry.is_string()) {
+            value = entry.get<std::string>();
+            return !value.empty();
+        }
+        if (!entry.is_object())
+            return false;
+        for (const char* key : {"current_value", "value", "cookie_value"}) {
+            auto it = entry.find(key);
+            if (it != entry.end() && it->is_string()) {
+                value = it->get<std::string>();
+                if (!value.empty())
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    bool camoufox_cookie_entry_has_specific_source(const mcp_standalone::json& entry) {
+        const std::string lc = lower_copy(entry.dump());
+        if (lc.find("http_set_cookie") != std::string::npos ||
+            lc.find("set-cookie") != std::string::npos ||
+            lc.find("js_document_cookie") != std::string::npos ||
+            lc.find("document.cookie") != std::string::npos)
+            return true;
+        size_t sources = 0;
+        if (!payload_array_count(entry, "sources", sources) || sources == 0)
+            return false;
+        return lc.find("unknown_or_preexisting") == std::string::npos &&
+            lc.find("unknown") == std::string::npos;
+    }
+
     bool camoufox_cookie_source_payload_valid(const mcp_standalone::json& value, const std::string& name, std::string& reason) {
         uint64_t total_cookies = 0;
         if (!payload_u64_field(value, "total_cookies", total_cookies) || total_cookies == 0) {
@@ -24319,6 +24707,16 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
             reason = "unique_cookie_missing name=" + name + " total_cookies=" + std::to_string(total_cookies);
             return false;
         }
+        const mcp_standalone::json* cookie_entry = camoufox_find_cookie_payload_by_name(*cookies, name);
+        if (!cookie_entry) {
+            reason = "unique_cookie_entry_missing name=" + name + " total_cookies=" + std::to_string(total_cookies);
+            return false;
+        }
+        std::string cookie_value;
+        if (!camoufox_cookie_payload_has_nonempty_value(*cookie_entry, cookie_value)) {
+            reason = "unique_cookie_empty_value name=" + name + " entry=" + compact_json(*cookie_entry, 900);
+            return false;
+        }
         uint64_t cookie_jar_count = 0;
         uint64_t network_set_cookie_count = 0;
         uint64_t js_cookie_log_count = 0;
@@ -24329,9 +24727,20 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
             reason = "cookie_source_counters_zero active_url=" + compact_text(active_url, 180);
             return false;
         }
+        const bool named_source_specific = camoufox_cookie_entry_has_specific_source(*cookie_entry);
+        if (!named_source_specific && network_set_cookie_count == 0 && js_cookie_log_count == 0) {
+            reason = "unique_cookie_source_attribution_missing name=" + name +
+                " cookie_jar_count=" + std::to_string(static_cast<unsigned long long>(cookie_jar_count)) +
+                " network_set_cookie_count=" + std::to_string(static_cast<unsigned long long>(network_set_cookie_count)) +
+                " js_cookie_log_count=" + std::to_string(static_cast<unsigned long long>(js_cookie_log_count)) +
+                " entry=" + compact_json(*cookie_entry, 900);
+            return false;
+        }
         reason = "unique_cookie_present name=" + name +
             " total_cookies=" + std::to_string(total_cookies) +
             " active_url=" + compact_text(active_url, 180) +
+            " value_len=" + std::to_string(cookie_value.size()) +
+            " named_source_specific=" + std::to_string(named_source_specific ? 1 : 0) +
             " cookie_jar_count=" + std::to_string(static_cast<unsigned long long>(cookie_jar_count)) +
             " network_set_cookie_count=" + std::to_string(static_cast<unsigned long long>(network_set_cookie_count)) +
             " js_cookie_log_count=" + std::to_string(static_cast<unsigned long long>(js_cookie_log_count));
@@ -24404,10 +24813,16 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
             return false;
         }
         bool cookie_present = false;
+        bool cookie_hook_installed = false;
+        bool cookie_log_contains_name = false;
         uint64_t total_cookie_chars = 0;
+        uint64_t js_cookie_log_count = 0;
         std::string page_url;
         payload_bool_field(*eval, "cookie_present", cookie_present);
+        payload_bool_field(*eval, "cookie_hook_installed", cookie_hook_installed);
+        payload_bool_field(*eval, "cookie_log_contains_name", cookie_log_contains_name);
         payload_u64_field(*eval, "total_cookie_chars", total_cookie_chars);
+        payload_u64_field(*eval, "js_cookie_log_count", js_cookie_log_count);
         payload_string_field(*eval, "page_url", page_url);
         if (!cookie_present || total_cookie_chars == 0) {
             reason = "cookie_refresh_no_readback cookie_present=" + std::to_string(cookie_present ? 1 : 0) +
@@ -24418,8 +24833,16 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
             reason = page_url.empty() ? "cookie_refresh_page_url_missing" : "cookie_refresh_about_blank";
             return false;
         }
+        if (!cookie_hook_installed || js_cookie_log_count == 0 || !cookie_log_contains_name) {
+            reason = "cookie_refresh_hook_source_missing cookie_hook_installed=" + std::to_string(cookie_hook_installed ? 1 : 0) +
+                " js_cookie_log_count=" + std::to_string(static_cast<unsigned long long>(js_cookie_log_count)) +
+                " cookie_log_contains_name=" + std::to_string(cookie_log_contains_name ? 1 : 0);
+            return false;
+        }
         reason = "cookie_present=1 name=" + cookie_name +
             " total_cookie_chars=" + std::to_string(static_cast<unsigned long long>(total_cookie_chars)) +
+            " cookie_hook_installed=1 js_cookie_log_count=" + std::to_string(static_cast<unsigned long long>(js_cookie_log_count)) +
+            " cookie_log_contains_name=1" +
             " page_url=" + compact_text(page_url, 180);
         return true;
     }
@@ -24763,6 +25186,7 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
         const std::string fixture_page = "aida_testlab_fixture_" + page_suffix;
         const std::string network_marker = "AIDA_CAMOUFOX_NET_" + page_suffix;
         const std::string network_retry_marker = "AIDA_CAMOUFOX_NET_RETRY_" + page_suffix;
+        const std::string script_marker = "AIDA_CAMOUFOX_SCRIPT_SRC_" + page_suffix;
         const std::string cookie_name = "aida_cookie_" + page_suffix;
 
         mcp_standalone::json page_a_args;
@@ -24930,7 +25354,7 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
         mcp_standalone::json bloxflip_diag_args;
         bloxflip_diag_args["url"] = "https://bloxflip.com";
         bloxflip_diag_args["wait_until"] = "domcontentloaded";
-        bloxflip_diag_args["timeout"] = 30000;
+        bloxflip_diag_args["timeout"] = 24000;
         bloxflip_diag_args["include_screenshot_metadata"] = true;
         bloxflip_diag_args["diagnostic_label"] = "bloxflip";
         mcp_standalone::tool_result_t bloxflip_diag_result;
@@ -25074,7 +25498,7 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
         eval_args["page_id"] = fixture_page;
         const std::string network_fetch_path = "/aida-fixture.js?capture=" + network_marker;
         const std::string network_fetch_url = burp_fixture_url(hf, tag, network_fetch_path.c_str());
-        eval_args["expression"] = "(async()=>{console.log('AIDA_CAMOUFOX_CONSOLE');localStorage.setItem('aida_storage','ok');document.cookie='" + cookie_name + "=ok; path=/';let fetch_status=0;let fetch_url='';try{const r=await fetch('" + network_fetch_url + "',{cache:'no-store'});fetch_status=r.status;fetch_url=r.url;await r.text();}catch(e){fetch_status=-1;}const hook_value=window.aidaHookTarget?window.aidaHookTarget('x'):'missing';return {hook_value,fetch_status,fetch_url,network_marker:'" + network_marker + "',cookie_name:'" + cookie_name + "',cookie_present:document.cookie.indexOf('" + cookie_name + "=')>=0,storage:localStorage.getItem('aida_storage'),page_url:String(location.href||'')};})()";
+        eval_args["expression"] = "(async()=>{console.log('AIDA_CAMOUFOX_CONSOLE');localStorage.setItem('aida_storage','ok');let fetch_status=0;let fetch_url='';try{const r=await fetch('" + network_fetch_url + "',{cache:'no-store'});fetch_status=r.status;fetch_url=r.url;await r.text();}catch(e){fetch_status=-1;}const hook_value=window.aidaHookTarget?window.aidaHookTarget('x'):'missing';return {hook_value,fetch_status,fetch_url,network_marker:'" + network_marker + "',cookie_name:'" + cookie_name + "',cookie_present:document.cookie.indexOf('" + cookie_name + "=')>=0,storage:localStorage.getItem('aida_storage'),page_url:String(location.href||'')};})()";
         eval_args["await_promise"] = true;
         mcp_standalone::tool_result_t eval_result;
         auto eval_status = test_tool_action_call(hf, "mcp.camoufox.browser_interaction.evaluate", "browser_interaction", "evaluate",
@@ -25294,6 +25718,89 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
         console_args["clear"] = false;
         test_tool_call(hf, "mcp.camoufox.get_console_logs", get_server(), "get_console_logs", console_args, passed, failed, skipped);
 
+        mcp_standalone::json cookie_hook_args;
+        cookie_hook_args["page_id"] = fixture_page;
+        cookie_hook_args["preset"] = "cookie";
+        cookie_hook_args["persistent"] = false;
+        mcp_standalone::tool_result_t cookie_hook_result;
+        auto cookie_hook_status = test_tool_action_call(hf, "mcp.camoufox.browser_hooks.preset.cookie", "browser_hooks", "preset",
+            cookie_hook_args, passed, failed, skipped, false, &cookie_hook_result);
+        mcp_standalone::json cookie_hook_probe_args;
+        cookie_hook_probe_args["page_id"] = fixture_page;
+        cookie_hook_probe_args["expression"] = "(()=>({cookie_hook_installed:!!window.__mcp_cookie_hook_installed,js_cookie_log_count:Array.isArray(window.__mcp_cookie_log)?window.__mcp_cookie_log.length:0,page_url:String(location.href||'')}))()";
+        cookie_hook_probe_args["await_promise"] = true;
+        mcp_standalone::tool_result_t cookie_hook_probe_result;
+        auto cookie_hook_probe_status = test_tool_action_call(hf, "mcp.camoufox.browser_interaction.evaluate.cookie_hook_probe", "browser_interaction", "evaluate",
+            cookie_hook_probe_args, passed, failed, skipped, false, &cookie_hook_probe_result);
+        bool cookie_hook_ready = false;
+        if (cookie_hook_probe_status == mcp_tool_call_status_t::passed) {
+            const mcp_standalone::json* cookie_hook_value = camoufox_eval_value(cookie_hook_probe_result.data);
+            bool hook_installed = false;
+            payload_bool_field(cookie_hook_value ? *cookie_hook_value : cookie_hook_probe_result.data, "cookie_hook_installed", hook_installed);
+            cookie_hook_ready = hook_installed;
+            if (!cookie_hook_ready) {
+                log_msg(hf, tag, "FAIL -- cookie source hook was not installed before deterministic JS cookie write hook_status=%s probe_data=%s hook_data=%s",
+                    mcp_status_classification_name(cookie_hook_status),
+                    compact_json(cookie_hook_probe_result.data, 900).c_str(),
+                    compact_json(cookie_hook_result.data, 900).c_str());
+                convert_last_pass_to_fixture_failure("browser_interaction", passed, failed);
+            }
+        } else {
+            log_msg(hf, tag, "FAIL -- cookie source hook probe failed before deterministic cookie fixture hook_status=%s probe_status=%s hook_data=%s probe_data=%s",
+                mcp_status_classification_name(cookie_hook_status),
+                mcp_status_classification_name(cookie_hook_probe_status),
+                compact_json(cookie_hook_result.data, 900).c_str(),
+                compact_json(cookie_hook_probe_result.data, 900).c_str());
+        }
+
+        const std::string dynamic_script_path = "/aida-fixture.js?capture=" + script_marker + "&set_cookie=" + cookie_name;
+        const std::string dynamic_script_url = burp_fixture_url(hf, tag, dynamic_script_path.c_str());
+        mcp_standalone::json dynamic_script_args;
+        dynamic_script_args["page_id"] = fixture_page;
+        dynamic_script_args["expression"] = "(async()=>{const src='" + dynamic_script_url + "';const marker='" + script_marker + "';const cookie='" + cookie_name + "';const out={loaded:false,error:'',src:src,capture_marker:marker,script_count:0,script_urls:[],src_found:false,marker_present:false,cookie_present:false,cookie_hook_installed:!!window.__mcp_cookie_hook_installed,js_cookie_log_count:Array.isArray(window.__mcp_cookie_log)?window.__mcp_cookie_log.length:0,page_url:String(location.href||'')};try{await new Promise((resolve,reject)=>{const s=document.createElement('script');s.src=src;s.async=false;s.onload=()=>{out.loaded=true;resolve();};s.onerror=()=>reject(new Error('script_onerror'));(document.head||document.documentElement).appendChild(s);setTimeout(()=>reject(new Error('script_timeout')),5000);});}catch(e){out.error=String(e&&e.message?e.message:e);}try{out.script_urls=Array.from(document.querySelectorAll('script')).map(s=>String(s.src||''));out.script_count=out.script_urls.length;out.src_found=out.script_urls.some(u=>u.indexOf('/aida-fixture.js')>=0&&u.indexOf(marker)>=0);out.marker_present=window.aidaExternalFixture==='AIDA_CAMOUFOX_SCRIPT_MARKER'&&window.aidaExternalFixtureCapture===marker;out.cookie_present=document.cookie.indexOf(cookie+'=')>=0;out.cookie_hook_installed=!!window.__mcp_cookie_hook_installed;out.js_cookie_log_count=Array.isArray(window.__mcp_cookie_log)?window.__mcp_cookie_log.length:0;}catch(e){out.inspect_error=String(e&&e.message?e.message:e);}return out;})()";
+        dynamic_script_args["await_promise"] = true;
+        mcp_standalone::tool_result_t dynamic_script_result;
+        auto dynamic_script_status = test_tool_action_call(hf, "mcp.camoufox.browser_interaction.evaluate.dynamic_script_fixture", "browser_interaction", "evaluate",
+            dynamic_script_args, passed, failed, skipped, false, &dynamic_script_result);
+        bool dynamic_script_fixture_ok = false;
+        if (dynamic_script_status == mcp_tool_call_status_t::passed) {
+            const mcp_standalone::json* script_value = camoufox_eval_value(dynamic_script_result.data);
+            bool loaded = false;
+            bool src_found = false;
+            bool marker_present = false;
+            bool http_cookie_present = false;
+            uint64_t script_count = 0;
+            payload_bool_field(script_value ? *script_value : dynamic_script_result.data, "loaded", loaded);
+            payload_bool_field(script_value ? *script_value : dynamic_script_result.data, "src_found", src_found);
+            payload_bool_field(script_value ? *script_value : dynamic_script_result.data, "marker_present", marker_present);
+            payload_bool_field(script_value ? *script_value : dynamic_script_result.data, "cookie_present", http_cookie_present);
+            payload_u64_field(script_value ? *script_value : dynamic_script_result.data, "script_count", script_count);
+            dynamic_script_fixture_ok = loaded && src_found && marker_present && http_cookie_present && script_count > 0;
+            log_msg(hf, tag, "SCRIPT-FIXTURE -- status=%s loaded=%d src_found=%d marker_present=%d http_cookie_present=%d script_count=%llu marker=%s data=%s",
+                mcp_status_classification_name(dynamic_script_status),
+                loaded ? 1 : 0,
+                src_found ? 1 : 0,
+                marker_present ? 1 : 0,
+                http_cookie_present ? 1 : 0,
+                static_cast<unsigned long long>(script_count),
+                script_marker.c_str(),
+                compact_json(dynamic_script_result.data, 1400).c_str());
+            if (!dynamic_script_fixture_ok) {
+                log_msg(hf, tag, "FAIL -- dynamic script fixture load failed before scripts/search_code marker=%s url=%s data=%s",
+                    script_marker.c_str(),
+                    compact_text(dynamic_script_url, 360).c_str(),
+                    compact_json(dynamic_script_result.data, 1400).c_str());
+                convert_last_pass_to_fixture_failure("browser_interaction", passed, failed);
+            }
+        } else {
+            log_msg(hf, tag, "FAIL -- dynamic script fixture evaluate failed before scripts/search_code status=%s marker=%s url=%s data=%s text=%s",
+                mcp_status_classification_name(dynamic_script_status),
+                script_marker.c_str(),
+                compact_text(dynamic_script_url, 360).c_str(),
+                compact_json(dynamic_script_result.data, 1400).c_str(),
+                compact_text(dynamic_script_result.text, 900).c_str());
+        }
+
         mcp_standalone::json scripts_args;
         scripts_args["action"] = "list";
         scripts_args["page_id"] = fixture_page;
@@ -25302,9 +25809,10 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
         bool scripts_fixture_ok = false;
         if (scripts_status == mcp_tool_call_status_t::passed) {
             std::string scripts_reason;
-            scripts_fixture_ok = camoufox_scripts_list_payload_valid(scripts_result.data, "aida-fixture.js", scripts_reason);
+            scripts_fixture_ok = dynamic_script_fixture_ok && camoufox_scripts_list_payload_valid(scripts_result.data, script_marker, scripts_reason);
             if (!scripts_fixture_ok) {
-                log_msg(hf, tag, "FAIL -- scripts list did not prove script-bearing fixture page reason=%s data=%s",
+                log_msg(hf, tag, "FAIL -- scripts list did not prove dynamically inserted script-bearing fixture page dynamic_script_ok=%d reason=%s data=%s",
+                    dynamic_script_fixture_ok ? 1 : 0,
                     compact_text(scripts_reason, 900).c_str(),
                     compact_json(scripts_result.data, 1200).c_str());
                 convert_last_pass_to_fixture_failure("scripts", passed, failed);
@@ -25334,7 +25842,7 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
                 }
             }
         } else {
-            record_camoufox_bridge_blocked_tool(hf, tag, "search_code", "scripts fixture list missing expected aida-fixture.js marker; search_code not dispatched", failed);
+            record_camoufox_bridge_blocked_tool(hf, tag, "search_code", "scripts fixture list missing expected dynamic aida-fixture.js marker; search_code not dispatched", failed);
         }
 
         mcp_standalone::json cookies_args;
@@ -25353,7 +25861,7 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
 
         mcp_standalone::json cookie_refresh_eval_args;
         cookie_refresh_eval_args["page_id"] = fixture_page;
-        cookie_refresh_eval_args["expression"] = "(()=>{document.cookie='" + cookie_name + "=refresh; path=/';return {cookie_name:'" + cookie_name + "',cookie_present:document.cookie.indexOf('" + cookie_name + "=')>=0,total_cookie_chars:document.cookie.length,page_url:String(location.href||'')};})()";
+        cookie_refresh_eval_args["expression"] = "(()=>{const name='" + cookie_name + "';const before=Array.isArray(window.__mcp_cookie_log)?window.__mcp_cookie_log.length:0;document.cookie=name+'=js; path=/; SameSite=Lax';const log=Array.isArray(window.__mcp_cookie_log)?window.__mcp_cookie_log:[];return {cookie_name:name,cookie_present:document.cookie.indexOf(name+'=')>=0,total_cookie_chars:document.cookie.length,cookie_hook_installed:!!window.__mcp_cookie_hook_installed,js_cookie_log_count:log.length,js_cookie_log_before:before,cookie_log_contains_name:log.some(e=>JSON.stringify(e).indexOf(name)>=0),page_url:String(location.href||'')};})()";
         cookie_refresh_eval_args["await_promise"] = true;
         mcp_standalone::tool_result_t cookie_refresh_result;
         auto cookie_refresh_status = test_tool_action_call(hf, "mcp.camoufox.browser_interaction.evaluate.cookie_refresh", "browser_interaction", "evaluate",
@@ -25375,7 +25883,7 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
         mcp_standalone::json cookie_source_args;
         cookie_source_args["name_filter"] = cookie_name;
         mcp_standalone::tool_result_t cookie_source_result;
-        if (cookie_readback_ok && cookie_refresh_ok) {
+        if (cookie_readback_ok && cookie_refresh_ok && cookie_hook_ready && dynamic_script_fixture_ok) {
             auto cookie_source_status = test_tool_call(hf, "mcp.camoufox.analyze_cookie_sources", get_server(), "analyze_cookie_sources", cookie_source_args, passed, failed, skipped, false, &cookie_source_result);
             if (cookie_source_status == mcp_tool_call_status_t::passed) {
                 std::string cookie_source_reason;
@@ -25393,7 +25901,9 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
         } else {
             std::string reason = "cookie dependency not proven before analyze_cookie_sources cookie_readback_ok=" +
                 std::to_string(cookie_readback_ok ? 1 : 0) +
-                " cookie_refresh_ok=" + std::to_string(cookie_refresh_ok ? 1 : 0);
+                " cookie_refresh_ok=" + std::to_string(cookie_refresh_ok ? 1 : 0) +
+                " cookie_hook_ready=" + std::to_string(cookie_hook_ready ? 1 : 0) +
+                " dynamic_script_fixture_ok=" + std::to_string(dynamic_script_fixture_ok ? 1 : 0);
             record_camoufox_bridge_blocked_tool(hf, tag, "analyze_cookie_sources", reason, failed);
         }
 

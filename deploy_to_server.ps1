@@ -153,6 +153,70 @@ function Get-FileSha256Lower([string]$Path) {
     return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant()
 }
 
+function Resolve-LocalPowerShellExe {
+    $candidates = @(
+        (Join-Path $PSHOME "pwsh.exe"),
+        (Join-Path $PSHOME "powershell.exe")
+    )
+    foreach ($name in @("pwsh.exe", "powershell.exe")) {
+        $command = Get-Command $name -ErrorAction SilentlyContinue
+        if ($command -and $command.Source) {
+            $candidates += $command.Source
+        }
+    }
+    foreach ($candidate in $candidates) {
+        if ($candidate -and (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+            return (Resolve-Path -LiteralPath $candidate).Path
+        }
+    }
+    Stop-Deploy "Unable to locate a local PowerShell executable for Camoufox MCP contract validation."
+}
+
+function Invoke-CamoufoxFrozenMcpContractValidation([string]$McpExe, [string]$BrowserExe) {
+    $contractScript = Join-Path $RepoRoot "tools\build_camoufox_reverse_mcp_exe.ps1"
+    if (-not (Test-Path -LiteralPath $contractScript -PathType Leaf)) {
+        Stop-Deploy "Frozen Camoufox reverse MCP contract script is missing: $contractScript"
+    }
+    $resolvedMcp = (Resolve-Path -LiteralPath $McpExe -ErrorAction Stop).Path
+    $resolvedBrowser = (Resolve-Path -LiteralPath $BrowserExe -ErrorAction Stop).Path
+    $mcpSize = (Get-Item -LiteralPath $resolvedMcp).Length
+    $mcpSha = Get-FileSha256Lower $resolvedMcp
+    Write-Step "Validating frozen Camoufox reverse MCP"
+    Write-Host "  selected_mcp_path=$resolvedMcp"
+    Write-Host "  selected_mcp_size=$mcpSize"
+    Write-Host "  selected_mcp_sha256=$mcpSha"
+    Write-Host "  selected_browser_path=$resolvedBrowser"
+    $psExe = Resolve-LocalPowerShellExe
+    $psArgs = @("-NoProfile")
+    if ([string]::Equals([IO.Path]::GetFileName($psExe), "powershell.exe", [StringComparison]::OrdinalIgnoreCase)) {
+        $psArgs += @("-ExecutionPolicy", "Bypass")
+    }
+    $psArgs += @("-File", $contractScript, "-ContractCheckOnly", "-ExistingExecutable", $resolvedMcp, "-BrowserExecutable", $resolvedBrowser)
+    $output = & $psExe @psArgs 2>&1
+    $exitCode = $LASTEXITCODE
+    $outputLines = @()
+    foreach ($line in @($output)) {
+        $text = [string]$line
+        $outputLines += $text
+        if ([string]::IsNullOrWhiteSpace($text)) {
+            continue
+        }
+        if ($text.Length -gt 4096) {
+            $text = $text.Substring(0, 4096) + "..."
+        }
+        Write-Host "  contract_check: $text"
+    }
+    $outputText = $outputLines -join "`n"
+    if ($exitCode -ne 0) {
+        Stop-Deploy "Frozen Camoufox reverse MCP contract validation failed exit=$exitCode path=$resolvedMcp"
+    }
+    if ($outputText -notmatch "(?m)^frozen_mcp_contract_check=ok$" -or $outputText -notmatch "(?m)^frozen_mcp_stdio_smoke=ok$") {
+        Stop-Deploy "Frozen Camoufox reverse MCP contract validation did not confirm both page-marker and tools/list contracts."
+    }
+    Write-Ok "Frozen Camoufox reverse MCP contract validation passed: sha256=$mcpSha size=$mcpSize"
+    return [pscustomobject]@{ Path = $resolvedMcp; Sha = $mcpSha; Size = [int64]$mcpSize }
+}
+
 function Get-RemoteEnvMap {
     $script = @'
 set -e
@@ -433,12 +497,15 @@ function Get-CamoufoxSidecarInputs([string]$ReleaseDir) {
         (Join-Path $RepoRoot ".deps\$browserName")
     ) -Directory
     $mcp = Find-FirstExistingPath @(
+        (Join-Path $ReleaseDir "deps\AiDA_CamoufoxReverseMcp\AiDA_CamoufoxReverseMcp.exe"),
+        (Join-Path $RepoRoot ".deps\AiDA_CamoufoxReverseMcp\AiDA_CamoufoxReverseMcp.exe"),
+        (Join-Path $RepoRoot "build-ninja\deps\AiDA_CamoufoxReverseMcp\AiDA_CamoufoxReverseMcp.exe"),
         (Join-Path $ReleaseDir "deps\AiDA_CamoufoxReverseMcp.exe"),
         (Join-Path $ReleaseDir "deps\camoufox-reverse-mcp.exe"),
-        (Join-Path $RepoRoot ".deps\AiDA_CamoufoxReverseMcp.exe"),
-        (Join-Path $RepoRoot ".deps\camoufox-reverse-mcp.exe"),
         (Join-Path $RepoRoot "camoufox-reverse-mcp\dist\AiDA_CamoufoxReverseMcp.exe"),
         (Join-Path $RepoRoot "camoufox-reverse-mcp\dist\camoufox-reverse-mcp.exe"),
+        (Join-Path $RepoRoot ".deps\AiDA_CamoufoxReverseMcp.exe"),
+        (Join-Path $RepoRoot ".deps\camoufox-reverse-mcp.exe"),
         (Join-Path $RepoRoot "AiDA_CamoufoxReverseMcp.exe"),
         (Join-Path $RepoRoot "camoufox-reverse-mcp.exe")
     )
@@ -466,7 +533,7 @@ function Assert-CamoufoxSidecarInputs([pscustomobject]$Inputs) {
         Stop-Deploy "Camoufox browser bundle is incomplete: browser directory is missing."
     }
     if (-not $Inputs.McpExe -or -not (Test-Path -LiteralPath $Inputs.McpExe -PathType Leaf)) {
-        Stop-Deploy "Frozen Camoufox reverse MCP executable is missing. Build .deps\AiDA_CamoufoxReverseMcp.exe first."
+        Stop-Deploy "Frozen Camoufox reverse MCP executable is missing. Build .deps\AiDA_CamoufoxReverseMcp\AiDA_CamoufoxReverseMcp.exe first."
     }
     $size = (Get-Item -LiteralPath $Inputs.McpExe).Length
     if ($size -le 0 -or $size -gt 268435456) {
@@ -529,9 +596,10 @@ function Publish-CamoufoxSidecar([string]$ReleaseDir, [string]$DeployId, [hashta
 
     $inputs = Get-CamoufoxSidecarInputs $ReleaseDir
     Assert-CamoufoxSidecarInputs $inputs
+    $mcpContract = Invoke-CamoufoxFrozenMcpContractValidation $inputs.McpExe $inputs.BrowserExe
     $sidecarPackage = New-CamoufoxSidecarPackage $inputs $DeployId
-    $mcpSha = Get-FileSha256Lower $inputs.McpExe
-    $mcpSize = (Get-Item -LiteralPath $inputs.McpExe).Length
+    $mcpSha = $mcpContract.Sha
+    $mcpSize = $mcpContract.Size
     $sidecarSha = $sidecarPackage.Sha
     $sidecarSize = $sidecarPackage.Size
     $version = (Get-Date -Format "yyyyMMddHHmmss")

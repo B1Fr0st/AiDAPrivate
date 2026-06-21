@@ -4244,7 +4244,14 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                         cj["module"] = c.module_name + "+0x" + (std::ostringstream() << std::hex << c.module_offset).str();
                     arr.push_back(cj);
                 }
-                return tool_result_t::ok(std::to_string(caps.size()) + " plaintext captures", arr);
+                json r = pre_encrypt_status_payload();
+                r["operation"] = "get_captures";
+                r["status"] = "ok";
+                r["count"] = static_cast<uint64_t>(arr.size());
+                r["max_count"] = static_cast<uint64_t>(max_count);
+                r["captures"] = std::move(arr);
+                r["drained"] = false;
+                return tool_result_t::ok(r);
             }
             if (op == "clear") {
                 const size_t cleared = pre_encrypt_hook::clear_captures();

@@ -19,6 +19,7 @@
 #include <intrin.h>
 
 #include <cstdint>
+#include <algorithm>
 #include <exception>
 #include <mutex>
 #include <vector>
@@ -31,6 +32,10 @@
 #include "driver_loader.hpp"
 #include "../driver/comm.h"
 #include "license.hpp"
+
+namespace aida_ipc {
+void trace_breadcrumb(const char* fmt, ...);
+}
 
 namespace discord_webhook {
 
@@ -124,6 +129,10 @@ struct runtime_state_t
 	std::uint64_t text_hash = 0;
 	std::uint64_t text_base = 0;
 	std::uint32_t text_size = 0;
+	std::uint32_t text_rva = 0;
+	std::uint32_t text_raw_size = 0;
+	std::uint32_t text_characteristics = 0;
+	std::atomic<DWORD> last_verify_exception{0};
 
 	std::vector<iat_entry_t> iat_entries;
 
@@ -151,6 +160,10 @@ inline void reset_state_locked(runtime_state_t& runtime)
 	runtime.text_hash = 0;
 	runtime.text_base = 0;
 	runtime.text_size = 0;
+	runtime.text_rva = 0;
+	runtime.text_raw_size = 0;
+	runtime.text_characteristics = 0;
+	runtime.last_verify_exception.store(0, std::memory_order_release);
 	runtime.iat_entries.clear();
 	runtime.protections_enforced = false;
 	runtime.verify_counter = 0;
@@ -267,6 +280,151 @@ __forceinline std::uint64_t hash_memory(const void* data, std::size_t size)
 	return (h1 & 0xFFFFFFFF) | ((h2 & 0xFFFFFFFF) << 32);
 }
 
+inline bool hash_bytes_seh(const std::uint8_t* ptr, std::size_t size, std::uint64_t& h1, std::uint64_t& h2, DWORD& seh_code)
+{
+	seh_code = 0;
+	__try
+	{
+		const std::size_t chunks = size / 8;
+		const auto* ptr64 = reinterpret_cast<const std::uint64_t*>(ptr);
+		for (std::size_t i = 0; i < chunks; ++i)
+		{
+			h1 = _mm_crc32_u64(h1, ptr64[i]);
+			h2 = _mm_crc32_u64(h2, ptr64[i] ^ 0xA5A5A5A5A5A5A5A5ULL);
+		}
+
+		const std::size_t remaining = size % 8;
+		const auto* tail = ptr + chunks * 8;
+		for (std::size_t i = 0; i < remaining; ++i)
+		{
+			h1 = _mm_crc32_u8(static_cast<std::uint32_t>(h1), tail[i]);
+			h2 = _mm_crc32_u8(static_cast<std::uint32_t>(h2), tail[i] ^ 0xA5u);
+		}
+		return true;
+	}
+	__except (seh_code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER)
+	{
+		return false;
+	}
+}
+
+inline void mix_region_metadata(std::uint64_t& h1, std::uint64_t& h2, const MEMORY_BASIC_INFORMATION& mbi, std::uint64_t start, std::uint64_t end)
+{
+	const std::uint64_t values[] = {
+		start,
+		end,
+		reinterpret_cast<std::uint64_t>(mbi.BaseAddress),
+		static_cast<std::uint64_t>(mbi.RegionSize),
+		static_cast<std::uint64_t>(mbi.State),
+		static_cast<std::uint64_t>(mbi.Protect),
+		static_cast<std::uint64_t>(mbi.Type)
+	};
+	for (std::uint64_t value : values)
+	{
+		h1 = _mm_crc32_u64(h1, value);
+		h2 = _mm_crc32_u64(h2, value ^ 0xA5A5A5A5A5A5A5A5ULL);
+	}
+}
+
+inline bool hash_memory_checked(const void* data, std::size_t size, bool metadata_for_unreadable, const char* phase, std::uint64_t& out_hash)
+{
+	out_hash = 0;
+	if (!data || size == 0)
+		return false;
+
+	const auto* begin = static_cast<const std::uint8_t*>(data);
+	const std::uint64_t range_start = reinterpret_cast<std::uint64_t>(begin);
+	const std::uint64_t range_end = range_start + static_cast<std::uint64_t>(size);
+	std::uint64_t cursor = range_start;
+	std::uint64_t h1 = 0xFFFFFFFFULL;
+	std::uint64_t h2 = 0x85EBCA6BULL;
+	std::uint32_t readable_regions = 0;
+	std::uint32_t metadata_regions = 0;
+
+	while (cursor < range_end)
+	{
+		MEMORY_BASIC_INFORMATION mbi{};
+		if (VirtualQuery(reinterpret_cast<LPCVOID>(cursor), &mbi, sizeof(mbi)) == 0)
+		{
+			aida_ipc::trace_breadcrumb("anti_re_hash_vq_fail phase=%s cursor=0x%llX gle=%lu metadata=%d",
+				phase ? phase : "<none>",
+				static_cast<unsigned long long>(cursor),
+				GetLastError(),
+				metadata_for_unreadable ? 1 : 0);
+			return false;
+		}
+
+		const std::uint64_t mbi_start = reinterpret_cast<std::uint64_t>(mbi.BaseAddress);
+		const std::uint64_t mbi_end = mbi_start + static_cast<std::uint64_t>(mbi.RegionSize);
+		const std::uint64_t chunk_end = (std::min)(mbi_end, range_end);
+		if (chunk_end <= cursor)
+			return false;
+
+		const DWORD protect = mbi.Protect & 0xFFu;
+		const bool committed = mbi.State == MEM_COMMIT;
+		const bool readable =
+			protect == PAGE_READONLY ||
+			protect == PAGE_READWRITE ||
+			protect == PAGE_WRITECOPY ||
+			protect == PAGE_EXECUTE_READ ||
+			protect == PAGE_EXECUTE_READWRITE ||
+			protect == PAGE_EXECUTE_WRITECOPY;
+		const bool unreadable = !committed || !readable || (mbi.Protect & PAGE_GUARD) != 0;
+		if (unreadable)
+		{
+			if (!metadata_for_unreadable)
+			{
+				aida_ipc::trace_breadcrumb("anti_re_hash_unreadable phase=%s cursor=0x%llX end=0x%llX state=0x%lX protect=0x%lX type=0x%lX",
+					phase ? phase : "<none>",
+					static_cast<unsigned long long>(cursor),
+					static_cast<unsigned long long>(chunk_end),
+					mbi.State,
+					mbi.Protect,
+					mbi.Type);
+				return false;
+			}
+			mix_region_metadata(h1, h2, mbi, cursor, chunk_end);
+			++metadata_regions;
+			cursor = chunk_end;
+			continue;
+		}
+
+		DWORD seh_code = 0;
+		const auto* ptr = reinterpret_cast<const std::uint8_t*>(cursor);
+		const std::size_t chunk_size = static_cast<std::size_t>(chunk_end - cursor);
+		if (!hash_bytes_seh(ptr, chunk_size, h1, h2, seh_code))
+		{
+			aida_ipc::trace_breadcrumb("anti_re_hash_seh phase=%s cursor=0x%llX end=0x%llX protect=0x%lX seh=0x%08lX metadata=%d",
+				phase ? phase : "<none>",
+				static_cast<unsigned long long>(cursor),
+				static_cast<unsigned long long>(chunk_end),
+				mbi.Protect,
+				seh_code,
+				metadata_for_unreadable ? 1 : 0);
+			if (!metadata_for_unreadable)
+				return false;
+			mix_region_metadata(h1, h2, mbi, cursor, chunk_end);
+			++metadata_regions;
+		}
+		else
+		{
+			++readable_regions;
+		}
+		cursor = chunk_end;
+	}
+
+	out_hash = (h1 & 0xFFFFFFFFULL) | ((h2 & 0xFFFFFFFFULL) << 32);
+	aida_ipc::trace_breadcrumb("anti_re_hash_done phase=%s base=0x%llX size=0x%llX hash=0x%016llX readable_regions=%u metadata_regions=%u metadata=%d",
+		phase ? phase : "<none>",
+		static_cast<unsigned long long>(range_start),
+		static_cast<unsigned long long>(size),
+		static_cast<unsigned long long>(out_hash),
+		readable_regions,
+		metadata_regions,
+		metadata_for_unreadable ? 1 : 0);
+	return out_hash != 0;
+}
+
 enum class kernel_integrity_probe_t : std::uint8_t
 {
 	match,
@@ -331,7 +489,7 @@ inline kernel_integrity_probe_t probe_code_integrity_kernel(runtime_state_t& run
 		: kernel_integrity_probe_t::mismatch;
 }
 
-inline bool find_code_section(HMODULE mod, std::uint64_t& base, std::uint32_t& size)
+inline bool find_code_section(HMODULE mod, std::uint64_t& base, std::uint32_t& size, std::uint32_t& rva, std::uint32_t& raw_size, std::uint32_t& characteristics)
 {
 	const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(mod);
 	if (dos->e_magic != IMAGE_DOS_SIGNATURE)
@@ -350,6 +508,16 @@ inline bool find_code_section(HMODULE mod, std::uint64_t& base, std::uint32_t& s
 		{
 			base = reinterpret_cast<std::uint64_t>(mod) + section[i].VirtualAddress;
 			size = section[i].Misc.VirtualSize;
+			rva = section[i].VirtualAddress;
+			raw_size = section[i].SizeOfRawData;
+			characteristics = section[i].Characteristics;
+			aida_ipc::trace_breadcrumb("anti_re_code_section_selected index=%u base=0x%llX rva=0x%X size=0x%X raw=0x%X ch=0x%08X",
+				static_cast<unsigned>(i),
+				static_cast<unsigned long long>(base),
+				rva,
+				size,
+				raw_size,
+				characteristics);
 			return true;
 		}
 	}
@@ -360,12 +528,20 @@ inline bool snapshot_code_section(runtime_state_t& runtime)
 {
 	std::uint64_t base = 0;
 	std::uint32_t size = 0;
-	if (!find_code_section(runtime.module, base, size) || size == 0)
+	std::uint32_t rva = 0;
+	std::uint32_t raw_size = 0;
+	std::uint32_t characteristics = 0;
+	if (!find_code_section(runtime.module, base, size, rva, raw_size, characteristics) || size == 0)
 		return false;
 
 	runtime.text_base = base;
 	runtime.text_size = size;
-	runtime.text_hash = hash_memory(reinterpret_cast<const void*>(base), size);
+	runtime.text_rva = rva;
+	runtime.text_raw_size = raw_size;
+	runtime.text_characteristics = characteristics;
+	const bool metadata_for_unreadable = raw_size == 0;
+	if (!hash_memory_checked(reinterpret_cast<const void*>(base), size, metadata_for_unreadable, "snapshot", runtime.text_hash))
+		return false;
 	return runtime.text_hash != 0;
 }
 
@@ -417,8 +593,14 @@ inline bool verify_code_integrity_usermode(const runtime_state_t& runtime)
 	if (runtime.text_base == 0 || runtime.text_size == 0 || runtime.text_hash == 0)
 		return true;
 
-	const std::uint64_t current = hash_memory(
-		reinterpret_cast<const void*>(runtime.text_base), runtime.text_size);
+	std::uint64_t current = 0;
+	const bool metadata_for_unreadable = runtime.text_raw_size == 0;
+	if (!hash_memory_checked(reinterpret_cast<const void*>(runtime.text_base),
+		runtime.text_size,
+		metadata_for_unreadable,
+		"verify_usermode",
+		current))
+		return false;
 	return current == runtime.text_hash;
 }
 
@@ -598,96 +780,176 @@ inline bool initialize_locked(runtime_state_t& runtime)
 
 inline bool verify_locked(runtime_state_t& runtime);
 
+inline bool verify_locked_seh(runtime_state_t& runtime, DWORD& seh_code)
+{
+	seh_code = 0;
+	__try
+	{
+		return verify_locked(runtime);
+	}
+	__except (seh_code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER)
+	{
+		runtime.trusted.store(false, std::memory_order_release);
+		runtime.last_verified_ms = 0;
+		runtime.last_verify_exception.store(seh_code, std::memory_order_release);
+		aida_ipc::trace_breadcrumb("anti_re_verify_locked_seh code=0x%08lX initialized=%d trusted=%d inflight=%d text_base=0x%llX text_size=0x%X text_rva=0x%X text_raw=0x%X text_ch=0x%08X verify_counter=%u",
+			seh_code,
+			runtime.initialized.load(std::memory_order_acquire) ? 1 : 0,
+			runtime.trusted.load(std::memory_order_acquire) ? 1 : 0,
+			runtime.verify_inflight.load(std::memory_order_acquire) ? 1 : 0,
+			static_cast<unsigned long long>(runtime.text_base),
+			runtime.text_size,
+			runtime.text_rva,
+			runtime.text_raw_size,
+			runtime.text_characteristics,
+			runtime.verify_counter);
+		return false;
+	}
+}
+
 inline void schedule_verify_async(runtime_state_t& runtime)
 {
 	if (runtime.verify_inflight.load(std::memory_order_acquire))
 		return;
 
 	runtime.verify_inflight.store(true, std::memory_order_release);
+	aida_ipc::trace_breadcrumb("anti_re_schedule_verify_guarded initialized=%d trusted=%d text_base=0x%llX text_size=0x%X text_rva=0x%X text_raw=0x%X counter=%u",
+		runtime.initialized.load(std::memory_order_acquire) ? 1 : 0,
+		runtime.trusted.load(std::memory_order_acquire) ? 1 : 0,
+		static_cast<unsigned long long>(runtime.text_base),
+		runtime.text_size,
+		runtime.text_rva,
+		runtime.text_raw_size,
+		runtime.verify_counter);
 	try
 	{
-		std::thread([]()
-		{
-			ULONGLONG t0 = GetTickCount64();
-			auto& async_runtime = state();
-			std::lock_guard<std::mutex> async_lock(async_runtime.mutex);
-			bool ok = verify_locked(async_runtime);
-			async_runtime.verify_inflight.store(false, std::memory_order_release);
-			ULONGLONG dt = GetTickCount64() - t0;
-			msg(OBFSTR_C("AiDA PERF: anti_re async verify dt=%llums ok=%d trusted=%d\n"),
-				static_cast<unsigned long long>(dt),
-				ok ? 1 : 0,
-				async_runtime.trusted.load(std::memory_order_acquire) ? 1 : 0);
-		}).detach();
+		ULONGLONG t0 = GetTickCount64();
+		DWORD seh_code = 0;
+		aida_ipc::trace_breadcrumb("anti_re_guarded_verify_enter initialized=%d trusted=%d text_base=0x%llX text_size=0x%X text_rva=0x%X text_raw=0x%X counter=%u",
+			runtime.initialized.load(std::memory_order_acquire) ? 1 : 0,
+			runtime.trusted.load(std::memory_order_acquire) ? 1 : 0,
+			static_cast<unsigned long long>(runtime.text_base),
+			runtime.text_size,
+			runtime.text_rva,
+			runtime.text_raw_size,
+			runtime.verify_counter);
+		bool ok = verify_locked_seh(runtime, seh_code);
+		if (ok)
+			runtime.last_verify_exception.store(0, std::memory_order_release);
+		runtime.verify_inflight.store(false, std::memory_order_release);
+		ULONGLONG dt = GetTickCount64() - t0;
+		aida_ipc::trace_breadcrumb("anti_re_guarded_verify_exit ok=%d seh=0x%08lX trusted=%d elapsed_ms=%llu counter=%u",
+			ok ? 1 : 0,
+			seh_code,
+			runtime.trusted.load(std::memory_order_acquire) ? 1 : 0,
+			static_cast<unsigned long long>(dt),
+			runtime.verify_counter);
+		msg(OBFSTR_C("AiDA PERF: anti_re guarded verify dt=%llums ok=%d trusted=%d\n"),
+			static_cast<unsigned long long>(dt),
+			ok ? 1 : 0,
+			runtime.trusted.load(std::memory_order_acquire) ? 1 : 0);
 	}
 	catch (const std::exception& ex)
 	{
+		runtime.trusted.store(false, std::memory_order_release);
+		runtime.last_verified_ms = 0;
 		runtime.verify_inflight.store(false, std::memory_order_release);
-		msg(OBFSTR_C("AiDA anti_re async verify worker unavailable: %s\n"), ex.what());
+		aida_ipc::trace_breadcrumb("anti_re_guarded_verify_exception what=%s", ex.what());
+		msg(OBFSTR_C("AiDA anti_re guarded verify failed: %s\n"), ex.what());
 	}
 	catch (...)
 	{
+		runtime.trusted.store(false, std::memory_order_release);
+		runtime.last_verified_ms = 0;
 		runtime.verify_inflight.store(false, std::memory_order_release);
-		msg(OBFSTR_C("AiDA anti_re async verify worker unavailable.\n"));
+		aida_ipc::trace_breadcrumb("anti_re_guarded_verify_unknown_exception");
+		msg(OBFSTR_C("AiDA anti_re guarded verify failed.\n"));
 	}
 }
 
 inline bool verify_locked(runtime_state_t& runtime)
 {
 	if (!runtime.initialized.load(std::memory_order_acquire) && !initialize_locked(runtime))
+	{
+		aida_ipc::trace_breadcrumb("anti_re_verify_fail phase=initialize");
 		return false;
+	}
 
+	aida_ipc::trace_breadcrumb("anti_re_verify_phase phase=prepare_driver pid=%lu text_base=0x%llX text_size=0x%X text_rva=0x%X text_raw=0x%X text_ch=0x%08X",
+		GetCurrentProcessId(),
+		static_cast<unsigned long long>(runtime.text_base),
+		runtime.text_size,
+		runtime.text_rva,
+		runtime.text_raw_size,
+		runtime.text_characteristics);
 	prepare_driver(runtime);
+	aida_ipc::trace_breadcrumb("anti_re_verify_phase phase=peb");
 	if (!verify_peb_state_locked(runtime))
 	{
 		runtime.trusted.store(false, std::memory_order_release);
 		runtime.last_verified_ms = 0;
+		aida_ipc::trace_breadcrumb("anti_re_verify_fail phase=peb");
 		return false;
 	}
 
+	aida_ipc::trace_breadcrumb("anti_re_verify_phase phase=code_usermode");
 	if (!verify_code_integrity_usermode(runtime))
 	{
 		runtime.trusted.store(false, std::memory_order_release);
 		runtime.last_verified_ms = 0;
+		aida_ipc::trace_breadcrumb("anti_re_verify_fail phase=code_usermode");
 		return false;
 	}
 
+	aida_ipc::trace_breadcrumb("anti_re_verify_phase phase=iat entries=%zu", runtime.iat_entries.size());
 	if (!verify_iat_locked(runtime))
 	{
 		runtime.trusted.store(false, std::memory_order_release);
 		runtime.last_verified_ms = 0;
+		aida_ipc::trace_breadcrumb("anti_re_verify_fail phase=iat");
 		return false;
 	}
 
 	++runtime.verify_counter;
 	const bool deep = (runtime.verify_counter & 3u) == 0;
+	aida_ipc::trace_breadcrumb("anti_re_verify_phase phase=deep_selector counter=%u deep=%d", runtime.verify_counter, deep ? 1 : 0);
 
 	if (deep)
 	{
+		aida_ipc::trace_breadcrumb("anti_re_verify_phase phase=kernel_code");
 		if (!verify_code_integrity_kernel(runtime))
 		{
 			runtime.trusted.store(false, std::memory_order_release);
 			runtime.last_verified_ms = 0;
+			aida_ipc::trace_breadcrumb("anti_re_verify_fail phase=kernel_code read_streak=%u mismatch_streak=%u",
+				runtime.kernel_read_failure_streak,
+				runtime.kernel_hash_mismatch_streak);
 			return false;
 		}
 
+		aida_ipc::trace_breadcrumb("anti_re_verify_phase phase=hw_breakpoints");
 		if (!verify_hw_breakpoints_kernel(runtime))
 		{
 			runtime.trusted.store(false, std::memory_order_release);
 			runtime.last_verified_ms = 0;
+			aida_ipc::trace_breadcrumb("anti_re_verify_fail phase=hw_breakpoints");
 			return false;
 		}
 
 
 	}
 
+	aida_ipc::trace_breadcrumb("anti_re_verify_phase phase=page_protections");
 	if (!verify_page_protections(runtime))
 	{
+		aida_ipc::trace_breadcrumb("anti_re_verify_page_protections_repair_begin");
 		enforce_code_protections(runtime);
 		if (!verify_page_protections(runtime))
 		{
 			runtime.trusted.store(false, std::memory_order_release);
 			runtime.last_verified_ms = 0;
+			aida_ipc::trace_breadcrumb("anti_re_verify_fail phase=page_protections enforced=%d",
+				runtime.protections_enforced ? 1 : 0);
 			return false;
 		}
 	}
@@ -696,17 +958,21 @@ inline bool verify_locked(runtime_state_t& runtime)
 	if (deep && device && device->is_connected())
 	{
 		voyager::device_t::dll_protect_status dp_status{};
+		aida_ipc::trace_breadcrumb("anti_re_verify_phase phase=dll_protection_status");
 		if (device->query_dll_protection(dp_status)
 			&& dp_status.status == voyager::detail::DPRT_STATUS_TAMPERED)
 		{
 			runtime.trusted.store(false, std::memory_order_release);
 			runtime.last_verified_ms = 0;
+			aida_ipc::trace_breadcrumb("anti_re_verify_fail phase=dll_protection_status status=%u", dp_status.status);
 			return false;
 		}
 	}
 
 	runtime.trusted.store(true, std::memory_order_release);
 	runtime.last_verified_ms = GetTickCount64();
+	runtime.last_verify_exception.store(0, std::memory_order_release);
+	aida_ipc::trace_breadcrumb("anti_re_verify_success counter=%u deep=%d", runtime.verify_counter, deep ? 1 : 0);
 	return true;
 }
 
@@ -717,6 +983,11 @@ inline bool initialize()
 	auto& runtime = detail::state();
 	std::lock_guard<std::mutex> lock(runtime.mutex);
 	return detail::initialize_locked(runtime);
+}
+
+inline DWORD last_internal_verify_exception()
+{
+	return detail::state().last_verify_exception.load(std::memory_order_acquire);
 }
 
 inline bool violation_latched();

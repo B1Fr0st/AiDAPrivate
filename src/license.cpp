@@ -104,14 +104,14 @@ static std::string get_server_signing_public_key_der_hex_kid1()
     k += OBFSTR("302a3005");
     k += OBFSTR("06032b65");
     k += OBFSTR("70032100");
-    k += OBFSTR("049ed74a");
-    k += OBFSTR("6f0e1969");
-    k += OBFSTR("8f759cc0");
-    k += OBFSTR("63bbe0bc");
-    k += OBFSTR("a0a9f7f7");
-    k += OBFSTR("3c818adb");
-    k += OBFSTR("814e9be8");
-    k += OBFSTR("be03a648");
+    k += OBFSTR("ae7ba74a");
+    k += OBFSTR("a9b8a230");
+    k += OBFSTR("d6614d8d");
+    k += OBFSTR("0c78e0e5");
+    k += OBFSTR("33adfa2a");
+    k += OBFSTR("bdc3d632");
+    k += OBFSTR("8438c378");
+    k += OBFSTR("077adc90");
     return k;
 }
 

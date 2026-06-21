@@ -11,4 +11,10 @@ namespace aida_ipc
     void shutdown();
 
     bool is_standalone_alive();
+
+    void install_crash_breadcrumbs();
+
+    void uninstall_crash_breadcrumbs();
+
+    void trace_breadcrumb(const char* fmt, ...);
 }

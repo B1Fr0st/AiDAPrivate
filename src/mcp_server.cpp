@@ -3506,8 +3506,6 @@ static bool mcp_is_aida_managed_key(const std::string& key)
         return true;
     if (key == MCP_OLD_PRO_PREFIX)
         return true;
-    if (key == OBFSTR("aida-standalone-mcp"))
-        return true;
     if (key == OBFSTR("aida-ida-all"))
         return true;
     if (key == OBFSTR("camoufox-reverse-mcp"))
@@ -4024,7 +4022,6 @@ static bool mcp_write_codex_toml(const std::string& path,
     {
         const std::vector<std::string> names = {
             OBFSTR("AiDA-Pro-MCP"),
-            OBFSTR("aida-standalone-mcp"),
             OBFSTR("aida-ida-all"),
             OBFSTR("camoufox-reverse-mcp"),
             OBFSTR("camoufox_reverse_mcp"),
@@ -4153,7 +4150,7 @@ static void mcp_write_reference_config(
     const ida_instance_record_t& self_rec)
 {
     json config;
-    config["_comment"] = OBFSTR("MCP Server - Auto-configured endpoint. aida-ida-mcp is the only IDA client entry and routes to live instances internally.");
+    config["_comment"] = OBFSTR("MCP Server - Auto-configured endpoint. aida-ida-mcp is the IDA plugin entry and coexists with aida-standalone-mcp.");
     config["_version"] = AIDA_VERSION;
     config["self"] = {
         {"instance_id",       self_rec.instance_id},

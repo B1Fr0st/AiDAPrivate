@@ -644,26 +644,44 @@ static int idaapi self_analysis_watchdog(void *)
     static bool s_self_target_checked = false;
     static bool s_is_self_target      = false;
 
+    aida_ipc::trace_breadcrumb("self_analysis_watchdog_enter checked=%d self_target=%d", s_self_target_checked ? 1 : 0, s_is_self_target ? 1 : 0);
     if (!s_self_target_checked)
     {
         s_is_self_target      = ida_utils::is_self_target_database();
         s_self_target_checked = true;
+        aida_ipc::trace_breadcrumb("self_analysis_watchdog_self_target_checked self_target=%d", s_is_self_target ? 1 : 0);
     }
 
     if (s_is_self_target)
+    {
+        aida_ipc::trace_breadcrumb("self_analysis_watchdog_stop_self_target");
         return -1;
+    }
 
 #ifdef __NT__
-    if (!anti_re::guard())
+    aida_ipc::trace_breadcrumb("self_analysis_watchdog_guard_begin");
+    const bool guard_ok = anti_re::guard();
+    const DWORD internal_exception = anti_re::last_internal_verify_exception();
+    aida_ipc::trace_breadcrumb("self_analysis_watchdog_guard_result ok=%d internal_exception=0x%08lX", guard_ok ? 1 : 0, internal_exception);
+    if (!guard_ok)
     {
+        if (internal_exception != 0)
+        {
+            anti_re::latch_self_analysis_violation("self_analysis_watchdog_internal_verify_exception", false);
+            anti_re::sync_latched_violation_with_server();
+            aida_ipc::trace_breadcrumb("self_analysis_watchdog_stop_internal_exception code=0x%08lX", internal_exception);
+            return -1;
+        }
         anti_re::latch_self_analysis_violation("self_analysis_watchdog");
         anti_re::sync_latched_violation_with_server();
         anti_re::arm_destructive_enforcement();
         anti_re::enforce_self_analysis_violation();
+        aida_ipc::trace_breadcrumb("self_analysis_watchdog_enforced_violation");
         return -1;
     }
 #endif
 
+    aida_ipc::trace_breadcrumb("self_analysis_watchdog_reschedule");
     return 30000;
 }
 
@@ -847,6 +865,9 @@ aida_plugin_t::~aida_plugin_t()
         analysis_fixer::uninstall_hexrays_fixups();
     }
     unregister_actions();
+#ifdef __NT__
+    aida_ipc::uninstall_crash_breadcrumbs();
+#endif
     msg(OBFSTR_C("--- Plugin has been unloaded ---\n"));
 }
 
@@ -964,6 +985,7 @@ static plugmod_t* idaapi init()
 
     plugin_vm_guard();
     plugin_kd_test_signing_guard();
+    aida_ipc::install_crash_breadcrumbs();
 
     standalone_verified = aida_ipc::verify_standalone_runtime(&standalone_failure);
     if (!standalone_verified)

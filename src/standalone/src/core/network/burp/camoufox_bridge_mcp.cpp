@@ -1000,6 +1000,127 @@ size_t browser_exchange_candidate_count(const std::string& tool_name, const json
     return collect_browser_exchange_candidates(tool_name, data).size();
 }
 
+std::string browser_record_url(const json& record, const json& params);
+
+int bounded_browser_list_limit(const json& params)
+{
+    int limit = json_int_param(params, "limit", json_int_param(params, "max_records", 200));
+    if (limit <= 0)
+        limit = 200;
+    if (limit > 500)
+        limit = 500;
+    return limit;
+}
+
+int bounded_browser_list_offset(const json& params)
+{
+    int offset = json_int_param(params, "offset", 0);
+    return offset < 0 ? 0 : offset;
+}
+
+bool string_starts_with_ascii(const std::string& value, const std::string& prefix)
+{
+    return value.size() >= prefix.size() && value.compare(0, prefix.size(), prefix) == 0;
+}
+
+bool browser_network_record_matches_params(const json& record, const json& params)
+{
+    const std::string url = browser_record_url(record, params);
+    const std::string url_filter = json_string_param(params, "url_filter", std::string());
+    const std::string url_prefix = json_string_param(params, "url_prefix", std::string());
+    const std::string url_contains_domain = json_string_param(params, "url_contains_domain", std::string());
+    if (!url_filter.empty() && url.find(url_filter) == std::string::npos)
+        return false;
+    if (!url_prefix.empty() && !string_starts_with_ascii(url, url_prefix))
+        return false;
+    if (!url_contains_domain.empty() && url.find(url_contains_domain) == std::string::npos)
+        return false;
+    const std::string method = uppercase_ascii_copy(json_string_param(params, "method", std::string()));
+    if (!method.empty() && uppercase_ascii_copy(json_first_string_field(record, {"method", "request_method"})) != method)
+        return false;
+    const std::string resource_type = json_string_param(params, "resource_type", std::string());
+    if (!resource_type.empty() && json_first_string_field(record, {"resource_type", "type"}) != resource_type)
+        return false;
+    const int status_code = json_int_param(params, "status_code", -1);
+    if (status_code >= 0 && json_first_int_field(record, {"status", "status_code", "response_status"}, -1) != status_code)
+        return false;
+    return true;
+}
+
+json compact_browser_network_record(json record, bool include_headers, bool include_body)
+{
+    if (!record.is_object())
+        return record;
+    if (!include_headers)
+    {
+        record.erase("request_headers");
+        record.erase("response_headers");
+        record.erase("headers");
+        record.erase("requestHeaders");
+        record.erase("responseHeaders");
+    }
+    if (!include_body)
+    {
+        record.erase("request_body");
+        record.erase("requestBody");
+        record.erase("post_data");
+        record.erase("postData");
+        record.erase("response_body");
+        record.erase("responseBody");
+        record.erase("body_text");
+        record.erase("bodyText");
+        record.erase("response_text");
+    }
+    return record;
+}
+
+void normalize_browser_network_list_response(tool_result_t& out, const json& params)
+{
+    if (!out.success || out.data.is_null())
+        return;
+    const int limit = bounded_browser_list_limit(params);
+    const int requested_offset = bounded_browser_list_offset(params);
+    const bool upstream_paged = out.data.is_object() &&
+        (out.data.contains("returned_count") || out.data.contains("filtered_count") || out.data.contains("has_more"));
+    const int effective_offset = upstream_paged ? 0 : requested_offset;
+    const bool include_headers = json_bool_param(params, "include_headers", false);
+    const bool include_body = json_bool_param(params, "include_body", false);
+    std::vector<json> candidates = collect_browser_exchange_candidates("list_network_requests", out.data);
+    std::vector<json> filtered;
+    filtered.reserve(candidates.size());
+    for (const json& candidate : candidates)
+    {
+        if (browser_network_record_matches_params(candidate, params))
+            filtered.push_back(compact_browser_network_record(candidate, include_headers, include_body));
+    }
+    const size_t total = filtered.size();
+    const size_t start = (std::min)(static_cast<size_t>(effective_offset), total);
+    const size_t end = (std::min)(start + static_cast<size_t>(limit), total);
+    json requests = json::array();
+    for (size_t i = start; i < end; ++i)
+        requests.push_back(std::move(filtered[i]));
+    if (!out.data.is_object())
+        out.data = json::object();
+    const uint64_t source_total_count = upstream_paged ? json_first_u64_field(out.data, {"total_count"}, static_cast<uint64_t>(total)) : static_cast<uint64_t>(total);
+    const uint64_t filtered_count = upstream_paged ? json_first_u64_field(out.data, {"filtered_count"}, source_total_count) : static_cast<uint64_t>(total);
+    const int reported_offset = upstream_paged ? json_int_param(out.data, "offset", requested_offset) : requested_offset;
+    const int reported_limit = upstream_paged ? json_int_param(out.data, "limit", limit) : limit;
+    const bool upstream_has_more = upstream_paged && json_bool_param(out.data, "has_more", false);
+    out.data["status"] = json_string_field(out.data, "status").empty() ? "ok" : json_string_field(out.data, "status");
+    out.data["requests"] = std::move(requests);
+    out.data["count"] = static_cast<uint64_t>(out.data["requests"].size());
+    out.data["returned_count"] = static_cast<uint64_t>(out.data["requests"].size());
+    out.data["filtered_count"] = filtered_count;
+    out.data["total_count"] = source_total_count;
+    out.data["offset"] = reported_offset;
+    out.data["limit"] = reported_limit;
+    out.data["has_more"] = upstream_has_more || end < total;
+    out.data["truncated"] = upstream_has_more || end < total;
+    out.data["include_headers"] = include_headers;
+    out.data["include_body"] = include_body;
+    out.text = out.data.dump(2);
+}
+
 std::string browser_record_url(const json& record, const json& params)
 {
     std::string url = json_first_string_field(record, {"url", "request_url", "final_url", "target_url", "name"});
@@ -1584,6 +1705,10 @@ json camoufox_args(const json& params, bool preserve_action)
     args.erase("binary_id");
     args.erase("session_id");
     args.erase("call_timeout_ms");
+    args.erase("timeout_ms");
+    args.erase("evaluate_timeout_ms");
+    args.erase("tool_timeout_ms");
+    args.erase("deadline_ms");
     args.erase("launch_timeout_ms");
     args.erase("python_executable");
     args.erase("browser_executable");
@@ -1603,6 +1728,9 @@ int camoufox_timeout_ms(const json& params, int fallback)
     int timeout_ms = fallback > 0 ? fallback : 30000;
     timeout_ms = json_int_param(params, "call_timeout_ms", timeout_ms);
     timeout_ms = json_int_param(params, "timeout_ms", timeout_ms);
+    const int evaluate_timeout = json_int_param(params, "evaluate_timeout_ms", 0);
+    if (evaluate_timeout > 0)
+        timeout_ms = (std::max)(timeout_ms, evaluate_timeout + 5000);
     const int timeout = json_int_param(params, "timeout", 0);
     if (timeout > 0)
         timeout_ms = (std::max)(timeout_ms, timeout + 5000);
@@ -1611,6 +1739,23 @@ int camoufox_timeout_ms(const json& params, int fallback)
         timeout_ms = (std::max)(timeout_ms, duration * 1000 + 15000);
     if (timeout_ms < 5000) timeout_ms = 5000;
     if (timeout_ms > 300000) timeout_ms = 300000;
+    return timeout_ms;
+}
+
+int camoufox_evaluate_timeout_ms(const json& params, int outer_timeout_ms)
+{
+    int timeout_ms = 30000;
+    timeout_ms = json_int_param(params, "call_timeout_ms", timeout_ms);
+    timeout_ms = json_int_param(params, "timeout_ms", timeout_ms);
+    timeout_ms = json_int_param(params, "evaluate_timeout_ms", timeout_ms);
+    if (timeout_ms < 1000)
+        timeout_ms = 1000;
+    if (timeout_ms > 120000)
+        timeout_ms = 120000;
+    if (outer_timeout_ms > 2000 && timeout_ms >= outer_timeout_ms)
+        timeout_ms = outer_timeout_ms - 1000;
+    if (timeout_ms < 1000)
+        timeout_ms = 1000;
     return timeout_ms;
 }
 
@@ -1874,11 +2019,16 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
         return tool_camoufox_type_text(params);
     if (tool_name == "wait_for" && params.is_object() && params.contains("selector") && params["selector"].is_string())
         return tool_camoufox_wait_for_selector(params);
+    if (tool_name == "add_init_script")
+        args.erase("keep_persistent");
+    if (tool_name == "remove_hooks")
+        args.erase("persistent");
     if (tool_name == "evaluate_js")
     {
         tool_result_t validation = validate_evaluate_js_params(params);
         if (!validation.success)
             return validation;
+        args["timeout_ms"] = camoufox_evaluate_timeout_ms(params, timeout_ms);
     }
     json capture_info = json::object();
     if (tool_name == "take_screenshot")
@@ -1895,42 +2045,19 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
         const bool capture_body = json_bool_param(params, "capture_body", false);
         const std::string capture_pattern = json_string_param(params, "capture_url_pattern", "**/*");
         const std::string capture_page_id = json_string_param(params, "page_id", std::string());
-        args.erase("capture_from_start");
-        args.erase("capture_body");
-        args.erase("capture_url_pattern");
         if (capture_from_start)
         {
-            json clear_args;
-            clear_args["action"] = "clear";
-            if (!capture_page_id.empty())
-                clear_args["page_id"] = capture_page_id;
-            camoufox::call_result_t clear_result = camoufox::call_tool("network_capture", clear_args, 10000, session_id);
-            json start_args;
-            start_args["action"] = "start";
-            start_args["url_pattern"] = capture_pattern.empty() ? std::string("**/*") : capture_pattern;
-            start_args["capture_body"] = capture_body;
-            if (!capture_page_id.empty())
-                start_args["page_id"] = capture_page_id;
-            camoufox::call_result_t start_result = camoufox::call_tool("network_capture", start_args, 10000, session_id);
+            args["capture_from_start"] = true;
+            args["capture_body"] = capture_body;
+            args["capture_url_pattern"] = capture_pattern.empty() ? std::string("**/*") : capture_pattern;
             capture_info["requested"] = true;
             capture_info["requested_explicitly"] = requested_capture_from_start;
             capture_info["auto_for_burp_publish"] = publish_to_burp && !requested_capture_from_start;
-            capture_info["pattern"] = start_args["url_pattern"];
+            capture_info["pattern"] = args["capture_url_pattern"];
             capture_info["capture_body"] = capture_body;
             capture_info["page_id"] = capture_page_id;
-            capture_info["clear_ok"] = clear_result.ok;
-            capture_info["start_ok"] = start_result.ok;
-            if (!clear_result.ok)
-                capture_info["clear_error"] = clear_result.error;
-            if (!start_result.ok)
-            {
-                capture_info["start_error"] = start_result.error;
-                tool_result_t fail;
-                fail.success = false;
-                fail.text = start_result.error.empty() ? std::string("network capture start failed before navigate") : start_result.error;
-                fail.data = json{{"error", fail.text}, {"network_capture", capture_info}};
-                return fail;
-            }
+            capture_info["delegated_to_navigate"] = true;
+            capture_info["cpp_pre_capture_rpc"] = false;
         }
     }
     camoufox::call_result_t bridge_result = camoufox::call_tool(tool_name, args, timeout_ms, session_id);
@@ -1991,6 +2118,8 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
                 session_id.c_str(), static_cast<int>(fallback_result.ok), fallback_result.error.c_str(), performance_fallback_error.c_str(), json_shape(fallback_result.data).c_str());
         }
     }
+    if (tool_name == "list_network_requests")
+        normalize_browser_network_list_response(out, params);
     if (tool_name == "take_screenshot")
         compact_screenshot_response(out, params);
     if (tool_name == "evaluate_js")
@@ -2031,7 +2160,16 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
             diag::log_tagged_fmt("mcp_burp", "browser_navigation post_capture_list session_id=%s page_id=%s ok=%d candidates=%zu err=%s",
                 session_id.c_str(), page_id.c_str(), static_cast<int>(captured.ok), captured_candidates, captured.error.c_str());
         }
-        out.data["network_capture"] = capture_info;
+        auto existing_capture = out.data.find("network_capture");
+        if (existing_capture != out.data.end() && existing_capture->is_object())
+        {
+            (*existing_capture)["wrapper"] = capture_info;
+        }
+        else
+        {
+            out.data["network_capture"] = capture_info;
+        }
+        out.text = out.data.dump(2);
     }
     const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start).count();
@@ -2133,6 +2271,36 @@ json camoufox_group_payload(const json& params)
     return out;
 }
 
+void normalize_camoufox_group_payload(
+    const char* group_name,
+    const std::string& group_action,
+    const char* internal_tool,
+    const json& params,
+    json& forwarded)
+{
+    const std::string internal = internal_tool ? internal_tool : "";
+    if (internal == "cookies")
+    {
+        const std::string cookie_action = json_string_param(forwarded, "cookie_action",
+            json_string_param(params, "cookie_action", std::string()));
+        if (!cookie_action.empty())
+            forwarded["action"] = cookie_action;
+        else if (!forwarded.contains("action") || !forwarded["action"].is_string())
+            forwarded["action"] = group_action == "cookies" ? "get" : group_action;
+        forwarded.erase("cookie_action");
+        return;
+    }
+    if (internal == "network_capture" && (!forwarded.contains("action") || !forwarded["action"].is_string()))
+        forwarded["action"] = "status";
+    if (std::string(group_name) == "browser_network" && group_action == "list")
+    {
+        if (!forwarded.contains("limit") && !forwarded.contains("max_records"))
+            forwarded["limit"] = bounded_browser_list_limit(params);
+        if (!forwarded.contains("offset"))
+            forwarded["offset"] = bounded_browser_list_offset(params);
+    }
+}
+
 tool_result_t dispatch_camoufox_browser_group(
     const json& params,
     const char* group_name,
@@ -2149,7 +2317,8 @@ tool_result_t dispatch_camoufox_browser_group(
     if (!action_spec)
         return tool_result_t::error("Unsupported " + std::string(group_name) + " action: " + action);
 
-    const json forwarded = camoufox_group_payload(params);
+    json forwarded = camoufox_group_payload(params);
+    normalize_camoufox_group_payload(group_name, action, action_spec->internal_tool, params, forwarded);
     if (std::string(action_spec->internal_tool) == "launch_browser")
         return tool_launch_browser(forwarded);
     if (std::string(action_spec->internal_tool) == "close_browser")
@@ -2336,7 +2505,10 @@ std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
              {"text", "string", "Text to type", false},
              {"delay", "number", "Delay between key presses in milliseconds", false},
              {"expression", "string", "JavaScript expression", false},
-             {"await_promise", "boolean", "Await promise return values", false}}, false, 45000},
+             {"await_promise", "boolean", "Await promise return values", false},
+             {"evaluate_timeout_ms", "number", "Python-side JavaScript evaluation timeout in milliseconds", false},
+             {"call_timeout_ms", "number", "End-to-end browser tool timeout in milliseconds, capped by AiDA's browser tool limit", false},
+             {"timeout_ms", "number", "Alias for the end-to-end browser tool timeout", false}}, false, 45000},
         {"browser_inspect", "Consolidated Camoufox inspection operations. Set action to screenshot, snapshot, or info.",
             {{"action", "string", "screenshot|snapshot|info", true},
              {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted", false},
@@ -2352,6 +2524,7 @@ std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
              {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted", false},
              {"session_id", "string", "Browser session id", false},
              {"domain", "string", "Cookie domain filter", false},
+             {"cookie_action", "string", "Cookie operation for action=cookies: get, set, or delete; defaults to get", false},
              {"cookies_list", "array", "Cookie objects to set", false},
              {"name", "string", "Cookie name", false},
              {"storage_type", "string", "local or session", false},
@@ -2371,10 +2544,14 @@ std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
              {"request_id", "number", "Captured request id", false},
              {"url_pattern", "string", "URL glob pattern", false},
              {"url_filter", "string", "Substring filter for URLs", false},
+             {"url_prefix", "string", "Prefix filter for request URLs", false},
              {"url_contains_domain", "string", "Domain substring filter", false},
              {"method", "string", "HTTP method filter", false},
              {"resource_type", "string", "Resource type filter", false},
              {"status_code", "number", "HTTP status code filter", false},
+             {"limit", "number", "Maximum list results to return, default 200 and capped at 500", false},
+             {"offset", "number", "Zero-based list result offset", false},
+             {"max_records", "number", "Alias for limit", false},
              {"capture_body", "boolean", "Capture response bodies", false},
              {"include_body", "boolean", "Include response body", false},
              {"include_headers", "boolean", "Include request and response headers", false},

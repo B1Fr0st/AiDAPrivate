@@ -808,7 +808,11 @@ inline void reconstruct(const reconstruction_config_t& config) {
 		}
 
 		if (!ghidra_ok) {
-			finish(false, "Ghidra decompiler not initialized.");
+			std::string init_diag = ghidra_decompiler::init_diagnostics();
+			diag::log_tagged_fmt("source_recon",
+				"ghidra_dependency_blocked initialized=0 detail=%s",
+				init_diag.c_str());
+			finish(false, "dependency_blocked: Ghidra decompiler not initialized; " + init_diag);
 			return;
 		}
 

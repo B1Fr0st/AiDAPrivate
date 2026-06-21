@@ -655,61 +655,99 @@ bool voyager::device_t::send_heartbeat() noexcept {
         return false;
     }
 
-    sync_dynamic_security_state();
+    const bool had_dynamic_seed =
+        server_seed_ != 0 ||
+        server_ioctl_seed_ != 0 ||
+        dynamic_key::g_server_seed != 0 ||
+        ioctl_codes::g_server_ioctl_seed != 0;
 
-    detail::heartbeat_request hb{};
-    hb.magic = heartbeat_magic_snapshot();
-    hb.session_key = session_key_;
-    hb.timestamp = __rdtsc();
-    hb.response = 0;
+    auto send_once = [&](const char* pre_label, const char* ok_label, const char* fail_label,
+                         DWORD& out_error, DWORD& out_ioctl) noexcept -> bool {
+        sync_dynamic_security_state();
 
-    DWORD ioctlCode = make_ioctl_snapshot(8);
-    capture_heartbeat_security_snapshot(8, ioctlCode, hb.magic);
-    log_security_snapshot("send_heartbeat_pre", ioctlCode, ioctlCode, 0);
+        detail::heartbeat_request hb{};
+        hb.magic = heartbeat_magic_snapshot();
+        hb.session_key = session_key_;
+        hb.timestamp = __rdtsc();
+        hb.response = 0;
 
-    DWORD bytes_returned = 0;
-    SetLastError(0);
-    BOOL result = DeviceIoControl(
-        driver_handle_,
-        ioctlCode,
-        &hb,
-        sizeof(hb),
-        &hb,
-        sizeof(hb),
-        &bytes_returned,
-        nullptr
-    );
-    DWORD captured_error = GetLastError();
-    bool hb_ok = result && bytes_returned >= sizeof(hb) && hb.response != 0;
-    DWORD effective_error = result ? ERROR_SUCCESS : captured_error;
-    if (!hb_ok) {
-        if (effective_error == ERROR_SUCCESS) {
-            if (result && bytes_returned < sizeof(hb))
-                effective_error = ERROR_MORE_DATA;
-            else if (result && hb.response == 0)
-                effective_error = ERROR_ACCESS_DENIED;
-            else
-                effective_error = ERROR_GEN_FAILURE;
+        DWORD ioctlCode = make_ioctl_snapshot(8);
+        out_ioctl = ioctlCode;
+        capture_heartbeat_security_snapshot(8, ioctlCode, hb.magic);
+        log_security_snapshot(pre_label, ioctlCode, ioctlCode, 0);
+
+        DWORD bytes_returned = 0;
+        SetLastError(0);
+        BOOL result = DeviceIoControl(
+            driver_handle_,
+            ioctlCode,
+            &hb,
+            sizeof(hb),
+            &hb,
+            sizeof(hb),
+            &bytes_returned,
+            nullptr
+        );
+        DWORD captured_error = GetLastError();
+        bool hb_ok = result && bytes_returned >= sizeof(hb) && hb.response != 0;
+        DWORD effective_error = result ? ERROR_SUCCESS : captured_error;
+        if (!hb_ok) {
+            if (effective_error == ERROR_SUCCESS) {
+                if (result && bytes_returned < sizeof(hb))
+                    effective_error = ERROR_MORE_DATA;
+                else if (result && hb.response == 0)
+                    effective_error = ERROR_ACCESS_DENIED;
+                else
+                    effective_error = ERROR_GEN_FAILURE;
+            }
         }
-    }
 
-    last_heartbeat_dioctl_result_ = result;
-    last_heartbeat_bytes_ = bytes_returned;
-    last_heartbeat_response_ = hb.response;
-    last_heartbeat_error_ = hb_ok ? 0 : effective_error;
-    capture_heartbeat_security_snapshot(8, ioctlCode, hb.magic);
+        last_heartbeat_dioctl_result_ = result;
+        last_heartbeat_bytes_ = bytes_returned;
+        last_heartbeat_response_ = hb.response;
+        last_heartbeat_error_ = hb_ok ? 0 : effective_error;
+        capture_heartbeat_security_snapshot(8, ioctlCode, hb.magic);
 
-    if (hb_ok) {
-        last_heartbeat_tsc_ = __rdtsc();
-        last_bridge_whoswho_tsc_ = hb.whoswho_tsc;
-        last_bridge_sentinel_tsc_ = hb.sentinel_tsc;
-        if (hb.sentinel_tsc != 0 && first_sentinel_ready_tsc_ == 0)
-            first_sentinel_ready_tsc_ = hb.sentinel_tsc;
-        log_security_snapshot("send_heartbeat_ok", ioctlCode, ioctlCode, 0);
+        if (hb_ok) {
+            last_heartbeat_tsc_ = __rdtsc();
+            last_bridge_whoswho_tsc_ = hb.whoswho_tsc;
+            last_bridge_sentinel_tsc_ = hb.sentinel_tsc;
+            if (hb.sentinel_tsc != 0 && first_sentinel_ready_tsc_ == 0)
+                first_sentinel_ready_tsc_ = hb.sentinel_tsc;
+            out_error = ERROR_SUCCESS;
+            log_security_snapshot(ok_label, ioctlCode, ioctlCode, 0);
+            return true;
+        }
+
+        out_error = effective_error;
+        log_security_snapshot(fail_label, ioctlCode, ioctlCode, effective_error);
+        return false;
+    };
+
+    DWORD effective_error = ERROR_SUCCESS;
+    DWORD ioctl_code = 0;
+    if (send_once("send_heartbeat_pre", "send_heartbeat_ok", "send_heartbeat_failed", effective_error, ioctl_code))
         return true;
+
+    if (effective_error == ERROR_INVALID_FUNCTION && had_dynamic_seed) {
+        log_security_snapshot("send_heartbeat_seed_desync_reset", ioctl_code, ioctl_code, effective_error);
+        server_seed_ = 0;
+        server_ioctl_seed_ = 0;
+        dynamic_key::reset_server_seed();
+        ioctl_codes::reset_server_ioctl_seed();
+
+        DWORD retry_error = ERROR_SUCCESS;
+        DWORD retry_ioctl_code = 0;
+        if (send_once("send_heartbeat_unseeded_retry_pre",
+                      "send_heartbeat_unseeded_retry_ok",
+                      "send_heartbeat_unseeded_retry_failed",
+                      retry_error,
+                      retry_ioctl_code)) {
+            return true;
+        }
+        effective_error = retry_error;
     }
 
-    log_security_snapshot("send_heartbeat_failed", ioctlCode, ioctlCode, effective_error);
     SetLastError(effective_error);
     return false;
 }

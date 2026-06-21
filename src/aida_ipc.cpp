@@ -16,9 +16,12 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdarg>
 #include <cctype>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <fstream>
 #include <iomanip>
@@ -37,13 +40,178 @@ namespace
     constexpr DWORD kWatchdogIntervalMs            = 5000;
     constexpr int   kWatchdogFailThreshold         = 3;
     constexpr DWORD kStandaloneAuthFastFailCode    = 0xA1DA1DA1u;
+    constexpr DWORD kFastFailExceptionCode         = 0xC0000409u;
 
     std::atomic<bool> g_watchdog_running{false};
     std::atomic<bool> g_watchdog_started{false};
     std::atomic<bool> g_standalone_authenticated{false};
     std::atomic<int>  g_verified_port{0};
+    std::mutex        g_watchdog_mutex;
     std::mutex        g_state_mutex;
+    std::mutex        g_exception_mutex;
+    std::thread       g_watchdog_thread;
+    HANDLE            g_watchdog_stop_event = nullptr;
+    PVOID             g_exception_handler = nullptr;
     std::string       g_last_failure;
+
+    bool diag_log_path(char* out, size_t cap)
+    {
+        if (!out || cap == 0)
+            return false;
+        char temp[MAX_PATH] = {};
+        DWORD len = GetTempPathA(static_cast<DWORD>(sizeof(temp)), temp);
+        if (len == 0 || len >= sizeof(temp))
+            return false;
+        char dir[MAX_PATH] = {};
+        if (_snprintf_s(dir, sizeof(dir), _TRUNCATE, "%sAiDA", temp) < 0)
+            return false;
+        if (!CreateDirectoryA(dir, nullptr))
+        {
+            DWORD gle = GetLastError();
+            if (gle != ERROR_ALREADY_EXISTS)
+                return false;
+        }
+        return _snprintf_s(out, cap, _TRUNCATE, "%s\\aida_ida_plugin.log", dir) >= 0;
+    }
+
+    void diag_write_raw(const char* line)
+    {
+        if (!line || !*line)
+            return;
+        char path[MAX_PATH] = {};
+        if (!diag_log_path(path, sizeof(path)))
+            return;
+        HANDLE file = CreateFileA(path,
+                                  FILE_APPEND_DATA,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                  nullptr,
+                                  OPEN_ALWAYS,
+                                  FILE_ATTRIBUTE_NORMAL,
+                                  nullptr);
+        if (file == INVALID_HANDLE_VALUE)
+            return;
+        DWORD written = 0;
+        DWORD len = static_cast<DWORD>(std::strlen(line));
+        WriteFile(file, line, len, &written, nullptr);
+        FlushFileBuffers(file);
+        CloseHandle(file);
+        OutputDebugStringA(line);
+    }
+
+    void diag_log_vfmt(const char* fmt, va_list args)
+    {
+        char body[3072] = {};
+        _vsnprintf_s(body, sizeof(body), _TRUNCATE, fmt, args);
+
+        SYSTEMTIME st = {};
+        GetLocalTime(&st);
+        char line[4096] = {};
+        _snprintf_s(line,
+                    sizeof(line),
+                    _TRUNCATE,
+                    "[%04u-%02u-%02u %02u:%02u:%02u.%03u] [ida_ipc] pid=%lu tid=%lu tick=%llu %s\r\n",
+                    static_cast<unsigned>(st.wYear),
+                    static_cast<unsigned>(st.wMonth),
+                    static_cast<unsigned>(st.wDay),
+                    static_cast<unsigned>(st.wHour),
+                    static_cast<unsigned>(st.wMinute),
+                    static_cast<unsigned>(st.wSecond),
+                    static_cast<unsigned>(st.wMilliseconds),
+                    GetCurrentProcessId(),
+                    GetCurrentThreadId(),
+                    static_cast<unsigned long long>(GetTickCount64()),
+                    body);
+        diag_write_raw(line);
+    }
+
+    void diag_log_fmt(const char* fmt, ...)
+    {
+        va_list args;
+        va_start(args, fmt);
+        diag_log_vfmt(fmt, args);
+        va_end(args);
+    }
+
+    bool is_aida_module_path(const char* path)
+    {
+        if (!path || !*path)
+            return false;
+        const char* base = std::strrchr(path, '\\');
+        base = base ? base + 1 : path;
+        return _stricmp(base, "AiDA.dll") == 0;
+    }
+
+    LONG CALLBACK plugin_exception_veh(PEXCEPTION_POINTERS ep)
+    {
+        static thread_local bool in_handler = false;
+        if (in_handler || !ep || !ep->ExceptionRecord)
+            return EXCEPTION_CONTINUE_SEARCH;
+
+        const DWORD code = ep->ExceptionRecord->ExceptionCode;
+        if (code != EXCEPTION_ACCESS_VIOLATION && code != kFastFailExceptionCode)
+            return EXCEPTION_CONTINUE_SEARCH;
+
+        in_handler = true;
+        PVOID addr = ep->ExceptionRecord->ExceptionAddress;
+        HMODULE mod = nullptr;
+        char mod_path[MAX_PATH] = "<unknown>";
+        uintptr_t mod_base = 0;
+        uintptr_t mod_off = 0;
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCSTR>(addr),
+                               &mod) && mod)
+        {
+            GetModuleFileNameA(mod, mod_path, MAX_PATH);
+            mod_base = reinterpret_cast<uintptr_t>(mod);
+            const uintptr_t a = reinterpret_cast<uintptr_t>(addr);
+            if (a >= mod_base)
+                mod_off = a - mod_base;
+        }
+
+        const bool in_aida = is_aida_module_path(mod_path);
+        const ULONG_PTR info0 = ep->ExceptionRecord->NumberParameters > 0 ? ep->ExceptionRecord->ExceptionInformation[0] : 0;
+        const ULONG_PTR info1 = ep->ExceptionRecord->NumberParameters > 1 ? ep->ExceptionRecord->ExceptionInformation[1] : 0;
+        const ULONG_PTR info2 = ep->ExceptionRecord->NumberParameters > 2 ? ep->ExceptionRecord->ExceptionInformation[2] : 0;
+#ifdef _M_X64
+        const unsigned long long rip = ep->ContextRecord ? static_cast<unsigned long long>(ep->ContextRecord->Rip) : 0;
+        const unsigned long long rsp = ep->ContextRecord ? static_cast<unsigned long long>(ep->ContextRecord->Rsp) : 0;
+        const unsigned long long rbp = ep->ContextRecord ? static_cast<unsigned long long>(ep->ContextRecord->Rbp) : 0;
+        const unsigned long long rax = ep->ContextRecord ? static_cast<unsigned long long>(ep->ContextRecord->Rax) : 0;
+        const unsigned long long rcx = ep->ContextRecord ? static_cast<unsigned long long>(ep->ContextRecord->Rcx) : 0;
+        const unsigned long long rdx = ep->ContextRecord ? static_cast<unsigned long long>(ep->ContextRecord->Rdx) : 0;
+#else
+        const unsigned long long rip = 0;
+        const unsigned long long rsp = 0;
+        const unsigned long long rbp = 0;
+        const unsigned long long rax = 0;
+        const unsigned long long rcx = 0;
+        const unsigned long long rdx = 0;
+#endif
+        diag_log_fmt("veh_exception code=0x%08lX flags=0x%08lX addr=%p module=%s module_base=0x%llX module_off=0x%llX in_aida=%d params=%lu info0=0x%llX info1=0x%llX info2=0x%llX rip=0x%llX rsp=0x%llX rbp=0x%llX rax=0x%llX rcx=0x%llX rdx=0x%llX watchdog_running=%d watchdog_started=%d standalone_auth=%d verified_port=%d",
+                     code,
+                     ep->ExceptionRecord->ExceptionFlags,
+                     addr,
+                     mod_path,
+                     static_cast<unsigned long long>(mod_base),
+                     static_cast<unsigned long long>(mod_off),
+                     in_aida ? 1 : 0,
+                     ep->ExceptionRecord->NumberParameters,
+                     static_cast<unsigned long long>(info0),
+                     static_cast<unsigned long long>(info1),
+                     static_cast<unsigned long long>(info2),
+                     rip,
+                     rsp,
+                     rbp,
+                     rax,
+                     rcx,
+                     rdx,
+                     g_watchdog_running.load(std::memory_order_acquire) ? 1 : 0,
+                     g_watchdog_started.load(std::memory_order_acquire) ? 1 : 0,
+                     g_standalone_authenticated.load(std::memory_order_acquire) ? 1 : 0,
+                     g_verified_port.load(std::memory_order_acquire));
+        in_handler = false;
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
 
     std::string bytes_to_hex(const unsigned char* data, size_t size)
     {
@@ -617,6 +785,20 @@ namespace
 
     bool verify_port(int port, std::string& failure)
     {
+        const ULONGLONG started = GetTickCount64();
+        diag_log_fmt("verify_port_enter port=%d", port);
+        auto elapsed_ms = [&]() -> unsigned long long {
+            return static_cast<unsigned long long>(GetTickCount64() - started);
+        };
+        auto fail = [&](const char* phase, const std::string& reason) -> bool {
+            failure = reason;
+            diag_log_fmt("verify_port_fail port=%d phase=%s reason=%s elapsed_ms=%llu",
+                         port,
+                         phase ? phase : "<unknown>",
+                         failure.c_str(),
+                         elapsed_ms());
+            return false;
+        };
         try
         {
             httplib::Client client("127.0.0.1", port);
@@ -625,27 +807,31 @@ namespace
             client.set_write_timeout(kVerifyReadTimeoutSec);
             client.set_keep_alive(false);
 
+            diag_log_fmt("verify_port_health_begin port=%d elapsed_ms=%llu", port, elapsed_ms());
             auto health_res = client.Get("/health");
             if (!health_res)
-            {
-                failure = "no health response on port " + std::to_string(port);
-                return false;
-            }
+                return fail("health", "no health response on port " + std::to_string(port));
+            diag_log_fmt("verify_port_health_response port=%d status=%d body_len=%zu elapsed_ms=%llu",
+                         port,
+                         health_res->status,
+                         health_res->body.size(),
+                         elapsed_ms());
             if (health_res->status != 200)
-            {
-                failure = "health returned HTTP " + std::to_string(health_res->status);
-                return false;
-            }
+                return fail("health_status", "health returned HTTP " + std::to_string(health_res->status));
             nlohmann::json health = nlohmann::json::parse(health_res->body, nullptr, false);
             if (!verify_health_payload(health, failure))
-                return false;
+                return fail("health_payload", failure);
 
             std::string challenge = generate_challenge_hex();
             if (challenge.empty())
-            {
-                failure = "auth challenge generation failed";
-                return false;
-            }
+                return fail("challenge", "auth challenge generation failed");
+            const std::string challenge_hash = sha256_hex(challenge);
+            diag_log_fmt("verify_port_challenge_ready port=%d challenge_len=%zu challenge_hash16=%.*s elapsed_ms=%llu",
+                         port,
+                         challenge.size(),
+                         16,
+                         challenge_hash.c_str(),
+                         elapsed_ms());
 
             nlohmann::json auth_req;
             auth_req["challenge"] = challenge;
@@ -656,20 +842,24 @@ namespace
                 {"Content-Type", "application/json"},
                 {"Accept", "application/json"}
             };
+            diag_log_fmt("verify_port_auth_begin port=%d body_len=%zu elapsed_ms=%llu",
+                         port,
+                         json_dump_safe(auth_req).size(),
+                         elapsed_ms());
             auto auth_res = client.Post("/ida-plugin-auth", auth_headers, json_dump_safe(auth_req), "application/json");
             if (!auth_res)
-            {
-                failure = "no standalone auth proof response on port " + std::to_string(port);
-                return false;
-            }
+                return fail("auth_http", "no standalone auth proof response on port " + std::to_string(port));
+            diag_log_fmt("verify_port_auth_response port=%d status=%d body_len=%zu elapsed_ms=%llu",
+                         port,
+                         auth_res->status,
+                         auth_res->body.size(),
+                         elapsed_ms());
             if (auth_res->status != 200)
-            {
-                failure = "standalone auth proof returned HTTP " + std::to_string(auth_res->status);
-                return false;
-            }
+                return fail("auth_status", "standalone auth proof returned HTTP " + std::to_string(auth_res->status));
             nlohmann::json auth_json = nlohmann::json::parse(auth_res->body, nullptr, false);
             if (!verify_ida_plugin_auth_proof(auth_json, challenge, port, failure))
-                return false;
+                return fail("auth_payload", failure);
+            diag_log_fmt("verify_port_auth_verified port=%d elapsed_ms=%llu", port, elapsed_ms());
 
             nlohmann::json init_req;
             init_req["jsonrpc"] = "2.0";
@@ -686,48 +876,61 @@ namespace
                 {"Accept", "application/json"},
                 {"MCP-Protocol-Version", "2025-06-18"}
             };
-            auto init_res = client.Post("/mcp", headers, json_dump_safe(init_req), "application/json");
+            const std::string init_body = json_dump_safe(init_req);
+            diag_log_fmt("verify_port_initialize_begin port=%d body_len=%zu elapsed_ms=%llu",
+                         port,
+                         init_body.size(),
+                         elapsed_ms());
+            auto init_res = client.Post("/mcp", headers, init_body, "application/json");
             if (!init_res)
-            {
-                failure = "no initialize response on port " + std::to_string(port);
-                return false;
-            }
+                return fail("initialize_http", "no initialize response on port " + std::to_string(port));
+            diag_log_fmt("verify_port_initialize_response port=%d status=%d body_len=%zu elapsed_ms=%llu",
+                         port,
+                         init_res->status,
+                         init_res->body.size(),
+                         elapsed_ms());
             if (init_res->status < 200 || init_res->status >= 300)
-            {
-                failure = "initialize returned HTTP " + std::to_string(init_res->status);
-                return false;
-            }
+                return fail("initialize_status", "initialize returned HTTP " + std::to_string(init_res->status));
             nlohmann::json init_json = nlohmann::json::parse(init_res->body, nullptr, false);
             if (!verify_initialize_payload(init_json, failure))
-                return false;
+                return fail("initialize_payload", failure);
+            diag_log_fmt("verify_port_success port=%d elapsed_ms=%llu", port, elapsed_ms());
             return true;
         }
         catch (const std::exception& ex)
         {
-            failure = ex.what();
-            return false;
+            return fail("exception", ex.what());
         }
         catch (...)
         {
-            failure = "unknown verification exception";
-            return false;
+            return fail("exception", "unknown verification exception");
         }
     }
 
     bool verify_any_candidate(std::string* failure)
     {
+        const ULONGLONG started = GetTickCount64();
+        diag_log_fmt("verify_any_candidate_enter");
         std::string last;
         for (int port : candidate_ports())
         {
             std::string port_failure;
+            diag_log_fmt("verify_any_candidate_try port=%d", port);
             if (verify_port(port, port_failure))
             {
                 g_verified_port.store(port, std::memory_order_release);
                 g_standalone_authenticated.store(true, std::memory_order_release);
                 set_failure({});
+                diag_log_fmt("verify_any_candidate_success port=%d elapsed_ms=%llu",
+                             port,
+                             static_cast<unsigned long long>(GetTickCount64() - started));
                 return true;
             }
             last = port_failure;
+            diag_log_fmt("verify_any_candidate_port_fail port=%d reason=%s elapsed_ms=%llu",
+                         port,
+                         last.c_str(),
+                         static_cast<unsigned long long>(GetTickCount64() - started));
         }
         if (last.empty())
             last = "no standalone MCP candidate port responded";
@@ -735,38 +938,70 @@ namespace
         set_failure(last);
         if (failure)
             *failure = last;
+        diag_log_fmt("verify_any_candidate_fail reason=%s elapsed_ms=%llu",
+                     last.c_str(),
+                     static_cast<unsigned long long>(GetTickCount64() - started));
         return false;
     }
 
-    void watchdog_thread()
+    void watchdog_thread(HANDLE stop_event)
     {
+        diag_log_fmt("watchdog_thread_enter stop_event=%p", stop_event);
         int consecutive_failures = 0;
+        unsigned long long iter = 0;
         while (g_watchdog_running.load(std::memory_order_acquire))
         {
-            Sleep(kWatchdogIntervalMs);
+            DWORD wait_rc = stop_event ? WaitForSingleObject(stop_event, kWatchdogIntervalMs) : WAIT_TIMEOUT;
+            if (wait_rc == WAIT_OBJECT_0)
+            {
+                diag_log_fmt("watchdog_thread_stop_signaled iter=%llu", iter);
+                break;
+            }
+            if (wait_rc != WAIT_TIMEOUT)
+            {
+                diag_log_fmt("watchdog_thread_wait_failed iter=%llu wait_rc=0x%08lX gle=%lu", iter, wait_rc, GetLastError());
+                break;
+            }
             if (!g_watchdog_running.load(std::memory_order_acquire))
                 break;
 
+            ++iter;
             std::string failure;
             bool ok = false;
             int port = g_verified_port.load(std::memory_order_acquire);
+            diag_log_fmt("watchdog_iter_begin iter=%llu port=%d consecutive_failures=%d", iter, port, consecutive_failures);
             if (valid_port(port))
                 ok = verify_port(port, failure);
             if (!ok)
+            {
+                diag_log_fmt("watchdog_iter_fallback iter=%llu prior_port=%d prior_failure=%s", iter, port, failure.c_str());
                 ok = verify_any_candidate(&failure);
+            }
 
             if (ok)
             {
                 consecutive_failures = 0;
+                diag_log_fmt("watchdog_iter_success iter=%llu verified_port=%d", iter, g_verified_port.load(std::memory_order_acquire));
                 continue;
             }
 
             ++consecutive_failures;
+            diag_log_fmt("watchdog_iter_fail iter=%llu consecutive_failures=%d reason=%s",
+                         iter,
+                         consecutive_failures,
+                         failure.c_str());
             if (consecutive_failures >= kWatchdogFailThreshold)
+            {
+                diag_log_fmt("watchdog_fastfail iter=%llu code=0x%08lX reason=%s",
+                             iter,
+                             kStandaloneAuthFastFailCode,
+                             failure.c_str());
                 __fastfail(kStandaloneAuthFastFailCode);
+            }
         }
         g_standalone_authenticated.store(false, std::memory_order_release);
         g_watchdog_started.store(false, std::memory_order_release);
+        diag_log_fmt("watchdog_thread_exit");
     }
 }
 
@@ -774,37 +1009,128 @@ namespace aida_ipc
 {
     bool verify_standalone_runtime(std::string* failure)
     {
+        diag_log_fmt("verify_standalone_runtime_enter");
         return verify_any_candidate(failure);
     }
 
     bool start_standalone_watchdog()
     {
+        diag_log_fmt("start_watchdog_enter");
+        std::lock_guard<std::mutex> lock(g_watchdog_mutex);
         bool expected = false;
         if (!g_watchdog_started.compare_exchange_strong(expected, true))
+        {
+            diag_log_fmt("start_watchdog_already_started running=%d joinable=%d",
+                         g_watchdog_running.load(std::memory_order_acquire) ? 1 : 0,
+                         g_watchdog_thread.joinable() ? 1 : 0);
             return g_watchdog_running.load(std::memory_order_acquire);
+        }
+        if (g_watchdog_thread.joinable())
+        {
+            g_watchdog_started.store(false, std::memory_order_release);
+            diag_log_fmt("start_watchdog_stale_joinable");
+            return false;
+        }
+        HANDLE stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!stop_event)
+        {
+            const DWORD gle = GetLastError();
+            g_watchdog_started.store(false, std::memory_order_release);
+            g_standalone_authenticated.store(false, std::memory_order_release);
+            diag_log_fmt("start_watchdog_event_failed gle=%lu", gle);
+            return false;
+        }
+        g_watchdog_stop_event = stop_event;
         g_watchdog_running.store(true, std::memory_order_release);
         try
         {
-            std::thread(watchdog_thread).detach();
+            g_watchdog_thread = std::thread(watchdog_thread, stop_event);
+            diag_log_fmt("start_watchdog_success stop_event=%p", stop_event);
             return true;
         }
         catch (...)
         {
+            const DWORD gle = GetLastError();
             g_watchdog_running.store(false, std::memory_order_release);
             g_watchdog_started.store(false, std::memory_order_release);
             g_standalone_authenticated.store(false, std::memory_order_release);
+            CloseHandle(stop_event);
+            g_watchdog_stop_event = nullptr;
+            diag_log_fmt("start_watchdog_thread_failed gle=%lu", gle);
             return false;
         }
     }
 
     void shutdown()
     {
+        const ULONGLONG started = GetTickCount64();
+        diag_log_fmt("shutdown_enter");
+        std::thread worker;
+        HANDLE stop_event = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(g_watchdog_mutex);
+            stop_event = g_watchdog_stop_event;
+            if (stop_event)
+                SetEvent(stop_event);
+            if (g_watchdog_thread.joinable())
+                worker = std::move(g_watchdog_thread);
+        }
         g_watchdog_running.store(false, std::memory_order_release);
         g_standalone_authenticated.store(false, std::memory_order_release);
+        if (worker.joinable())
+        {
+            diag_log_fmt("shutdown_join_begin stop_event=%p", stop_event);
+            worker.join();
+            diag_log_fmt("shutdown_join_done elapsed_ms=%llu",
+                         static_cast<unsigned long long>(GetTickCount64() - started));
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_watchdog_mutex);
+            if (g_watchdog_stop_event)
+            {
+                CloseHandle(g_watchdog_stop_event);
+                g_watchdog_stop_event = nullptr;
+            }
+            g_watchdog_started.store(false, std::memory_order_release);
+        }
+        diag_log_fmt("shutdown_exit elapsed_ms=%llu",
+                     static_cast<unsigned long long>(GetTickCount64() - started));
     }
 
     bool is_standalone_alive()
     {
         return g_standalone_authenticated.load(std::memory_order_acquire);
+    }
+
+    void install_crash_breadcrumbs()
+    {
+        std::lock_guard<std::mutex> lock(g_exception_mutex);
+        if (g_exception_handler)
+            return;
+        g_exception_handler = AddVectoredExceptionHandler(1, plugin_exception_veh);
+        diag_log_fmt("crash_breadcrumbs_install handler=%p gle=%lu", g_exception_handler, GetLastError());
+    }
+
+    void uninstall_crash_breadcrumbs()
+    {
+        PVOID handler = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(g_exception_mutex);
+            handler = g_exception_handler;
+            g_exception_handler = nullptr;
+        }
+        if (handler)
+        {
+            ULONG removed = RemoveVectoredExceptionHandler(handler);
+            diag_log_fmt("crash_breadcrumbs_uninstall handler=%p removed=%lu gle=%lu", handler, removed, GetLastError());
+        }
+    }
+
+    void trace_breadcrumb(const char* fmt, ...)
+    {
+        va_list args;
+        va_start(args, fmt);
+        diag_log_vfmt(fmt, args);
+        va_end(args);
     }
 }

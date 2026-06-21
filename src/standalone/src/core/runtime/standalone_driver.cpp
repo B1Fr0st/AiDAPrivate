@@ -457,6 +457,7 @@ namespace
     uint32_t        g_pid = 0;
     std::string     g_process_name;
     std::string     g_last_error;
+    std::atomic<bool> g_last_error_present{false};
     bool            g_initialized = false;
     bool            g_kernel_mode = false;
     bool            g_has_vm_read = false;
@@ -905,6 +906,7 @@ namespace
     void set_last_error_locked(const std::string& text, bool allow_toast = true)
     {
         g_last_error = text;
+        g_last_error_present.store(!text.empty(), std::memory_order_release);
         if (!text.empty()) {
             logf("AiDA Standalone: %s\n", text.c_str());
             if (!allow_toast || driver_error_toast_suppressed()) {
@@ -917,6 +919,25 @@ namespace
                 toast_notification::push(text, toast_notification::toast_type_t::error);
             }
         }
+    }
+
+    void clear_last_error_locked_after_success(const char* source)
+    {
+        if (!g_last_error.empty()) {
+            diag::log_tagged_fmt("driver",
+                "last_error_clear_after_success source=%s stale=\"%s\"",
+                source ? source : "<null>",
+                g_last_error.c_str());
+        }
+        set_last_error_locked({});
+    }
+
+    void clear_last_error_after_success(const char* source)
+    {
+        if (!g_last_error_present.load(std::memory_order_acquire))
+            return;
+        std::lock_guard<std::mutex> lk(g_state_mtx);
+        clear_last_error_locked_after_success(source);
     }
 
     void require_kernel_fail(const char* func_name)
@@ -940,7 +961,10 @@ namespace
     std::atomic<uint64_t> g_driver_watchdog_last_ok_tick{0};
 
     constexpr int    kDriverWatchdogPeriodMs       = 4000;
-    constexpr int    kDriverWatchdogFailThreshold  = 3;
+    constexpr int    kDriverWatchdogFailThreshold  = 8;
+    constexpr uint64_t kDriverWatchdogStaleSessionMinAgeMs = 45000;
+    constexpr int    kDriverWatchdogRecoveryProbeCount = 2;
+    constexpr DWORD  kDriverWatchdogRecoveryProbeDelayMs = 250;
     constexpr DWORD  kDriverFastFailCode           = 0xBEA7DEADu;
 
     [[noreturn]] void driver_fast_fail(const char* phase, DWORD err)
@@ -1153,6 +1177,58 @@ namespace
             if (n >= kDriverWatchdogFailThreshold) {
                 const uint64_t last_ok = g_driver_watchdog_last_ok_tick.load(std::memory_order_acquire);
                 if (connected && last_ok != 0) {
+                    const uint64_t now_tick = static_cast<uint64_t>(GetTickCount64());
+                    const uint64_t last_ok_age = now_tick >= last_ok ? now_tick - last_ok : 0;
+                    if (last_ok_age < kDriverWatchdogStaleSessionMinAgeMs) {
+                        diag::log_tagged_critical_fmt("driver",
+                            "watchdog_stale_session_defer consecutive=%d last_ok_age_ms=%llu min_age_ms=%llu hb_err=%lu hb_ioctl=0x%08X hb_base=0x%04X key_hash=0x%08X inst_seed=%u/%u global_seed=%u/%u",
+                            n,
+                            static_cast<unsigned long long>(last_ok_age),
+                            static_cast<unsigned long long>(kDriverWatchdogStaleSessionMinAgeMs),
+                            device ? (unsigned long)device->get_last_heartbeat_error() : 0ul,
+                            device ? (unsigned int)device->get_last_heartbeat_ioctl_code() : 0u,
+                            device ? (unsigned int)device->get_last_heartbeat_base() : 0u,
+                            device ? (unsigned int)device->get_last_heartbeat_key_hash() : 0u,
+                            device ? (unsigned int)device->get_last_heartbeat_server_seed_present() : 0u,
+                            device ? (unsigned int)device->get_last_heartbeat_ioctl_seed_present() : 0u,
+                            device ? (unsigned int)device->get_last_heartbeat_global_server_seed_present() : 0u,
+                            device ? (unsigned int)device->get_last_heartbeat_global_ioctl_seed_present() : 0u);
+                        g_driver_consecutive_fail.store(kDriverWatchdogFailThreshold - 1, std::memory_order_release);
+                        continue;
+                    }
+                    bool recovered = false;
+                    for (int probe = 1; probe <= kDriverWatchdogRecoveryProbeCount; ++probe) {
+                        if (g_driver_watchdog_stop.load(std::memory_order_acquire) ||
+                            g_driver_watchdog_epoch.load(std::memory_order_acquire) != epoch)
+                            break;
+                        Sleep(kDriverWatchdogRecoveryProbeDelayMs);
+                        const bool probe_connected = (device && device->is_connected());
+                        const bool probe_ok = probe_connected && device->send_heartbeat();
+                        diag::log_tagged_critical_fmt("driver",
+                            "watchdog_recovery_probe probe=%d max=%d connected=%d ok=%d last_ok_age_ms=%llu hb_err=%lu hb_bytes=%lu hb_ioctl=0x%08X hb_base=0x%04X key_hash=0x%08X inst_seed=%u/%u global_seed=%u/%u",
+                            probe,
+                            kDriverWatchdogRecoveryProbeCount,
+                            probe_connected ? 1 : 0,
+                            probe_ok ? 1 : 0,
+                            static_cast<unsigned long long>(last_ok_age),
+                            device ? (unsigned long)device->get_last_heartbeat_error() : 0ul,
+                            device ? (unsigned long)device->get_last_heartbeat_bytes_returned() : 0ul,
+                            device ? (unsigned int)device->get_last_heartbeat_ioctl_code() : 0u,
+                            device ? (unsigned int)device->get_last_heartbeat_base() : 0u,
+                            device ? (unsigned int)device->get_last_heartbeat_key_hash() : 0u,
+                            device ? (unsigned int)device->get_last_heartbeat_server_seed_present() : 0u,
+                            device ? (unsigned int)device->get_last_heartbeat_ioctl_seed_present() : 0u,
+                            device ? (unsigned int)device->get_last_heartbeat_global_server_seed_present() : 0u,
+                            device ? (unsigned int)device->get_last_heartbeat_global_ioctl_seed_present() : 0u);
+                        if (probe_ok) {
+                            g_driver_watchdog_last_ok_tick.store(GetTickCount64(), std::memory_order_release);
+                            g_driver_consecutive_fail.store(0, std::memory_order_release);
+                            recovered = true;
+                            break;
+                        }
+                    }
+                    if (recovered)
+                        continue;
                     diag::log_tagged_critical_fmt("driver",
                         "watchdog_stale_session_invalidate consecutive=%d last_ok_age_ms=%llu hb_err=%lu hb_ioctl=0x%08X hb_base=0x%04X key_hash=0x%08X inst_seed=%u/%u global_seed=%u/%u",
                         n,
@@ -1880,10 +1956,12 @@ namespace driver_bridge
             if (device)
                 device->disconnect();
             const bool suppress_toast = stale_session_error_toast_suppressed();
+            const bool allow_toast = !suppress_toast && !preserve_activation;
             diag::log_tagged_critical_fmt("driver",
-                "stale_session_toast_policy reason=%s suppress=%d violation_latched=%d pending_activation=%d arc_loaded=%d preserve_activation=%d",
+                "stale_session_toast_policy reason=%s suppress=%d allow_toast=%d violation_latched=%d pending_activation=%d arc_loaded=%d preserve_activation=%d",
                 reason ? reason : "<null>",
                 suppress_toast ? 1 : 0,
+                allow_toast ? 1 : 0,
                 anti_tamper::state::get().violation_latched.load(std::memory_order_acquire) ? 1 : 0,
                 anti_tamper::state::get().license_pending_activation.load(std::memory_order_acquire) ? 1 : 0,
                 standalone_license::is_arc_loaded() ? 1 : 0,
@@ -1892,7 +1970,7 @@ namespace driver_bridge
                 preserve_activation
                     ? "Kernel driver session became stale; AiDA kept the authenticated IDE session active and degraded driver-backed capabilities while reconnecting."
                     : "Kernel driver session became stale during activation; AiDA did not treat this as tampering.",
-                !suppress_toast);
+                allow_toast);
             after_kernel = capture_kernel_session_snapshot_locked();
         }
         const runtime_auth_snapshot_t after_auth = capture_runtime_auth_snapshot();
@@ -2047,7 +2125,7 @@ namespace driver_bridge
         g_adbg_clear_process_dr_supported.store(true, std::memory_order_release);
         g_adbg_hide_all_threads_supported.store(true, std::memory_order_release);
         g_driver_watchdog_last_ok_tick.store(0, std::memory_order_release);
-        set_last_error_locked({});
+        clear_last_error_locked_after_success("initialize_reset");
         kernel_session_snapshot_t after_reset_kernel = capture_kernel_session_snapshot_locked();
         runtime_auth_snapshot_t after_reset_auth = capture_runtime_auth_snapshot();
         log_auth_kernel_transition("initialize_reset",
@@ -2254,7 +2332,7 @@ namespace driver_bridge
         g_adbg_clear_process_dr_supported.store(true, std::memory_order_release);
         g_adbg_hide_all_threads_supported.store(true, std::memory_order_release);
         g_driver_watchdog_last_ok_tick.store(0, std::memory_order_release);
-        set_last_error_locked({});
+        clear_last_error_locked_after_success("load_kernel_driver");
         logf("AiDA Standalone: Kernel driver backend is active.\n");
         start_driver_watchdog_locked();
         start_event_poller_locked();
@@ -2503,7 +2581,7 @@ namespace driver_bridge
             }
         }
 
-        set_last_error_locked({});
+        clear_last_error_locked_after_success("attach");
         if (kernel_ok) {
             logf("AiDA Standalone: Attached to PID %u (%s) via kernel driver. DTB=0x%llX\n",
                  g_pid, g_process_name.empty() ? "unknown" : g_process_name.c_str(),
@@ -2600,7 +2678,7 @@ namespace driver_bridge
                 g_processes.erase(it);
             }
         }
-        set_last_error_locked({});
+        clear_last_error_locked_after_success("detach");
     }
 
     bool attach_additional(uint32_t pid)
@@ -2612,6 +2690,7 @@ namespace driver_bridge
 
         std::lock_guard<std::mutex> lk(g_state_mtx);
         if (g_processes.find(pid) != g_processes.end()) {
+            clear_last_error_locked_after_success("attach_additional_existing");
             return true;
         }
 
@@ -2645,6 +2724,7 @@ namespace driver_bridge
         g_processes[pid] = std::move(ctx);
 
         diag::log_tagged_fmt("driver", "attach_additional_ok pid=%u has_vm_read=%d", pid, has_vm_read ? 1 : 0);
+        clear_last_error_locked_after_success("attach_additional");
         return true;
     }
 
@@ -2711,6 +2791,7 @@ namespace driver_bridge
                 g_kernel_attached ? 1 : 0,
                 static_cast<unsigned long long>((device && device->is_connected()) ? device->get_dtb() : 0),
                 static_cast<unsigned long long>(ctx.cached_dtb));
+            clear_last_error_locked_after_success("set_active_pid_same");
             return true;
         }
 
@@ -2756,6 +2837,7 @@ namespace driver_bridge
             g_kernel_attached ? 1 : 0,
             static_cast<unsigned long long>((device && device->is_connected()) ? device->get_dtb() : 0),
             static_cast<unsigned long long>(target.cached_dtb));
+        clear_last_error_locked_after_success("set_active_pid");
         return true;
     }
 
@@ -2790,8 +2872,10 @@ namespace driver_bridge
     bool clear_active_pid()
     {
         std::lock_guard<std::mutex> lk(g_state_mtx);
-        if (g_pid == 0)
+        if (g_pid == 0) {
+            clear_last_error_locked_after_success("clear_active_pid_noop");
             return true;
+        }
         auto it = g_processes.find(g_pid);
         if (it != g_processes.end()) {
             if (it->second.h_process == nullptr && g_process != nullptr) {
@@ -2816,6 +2900,7 @@ namespace driver_bridge
             if (!arc_bridge_clear_process_context())
                 device->clear_process_context();
         }
+        clear_last_error_locked_after_success("clear_active_pid");
         return true;
     }
 
@@ -3540,6 +3625,7 @@ namespace driver_bridge
 
                 if (bytes_read > 0) {
                     out.resize(bytes_read);
+                    clear_last_error_after_success("read_memory_kernel");
                     return true;
                 }
                 out.clear();
@@ -3562,6 +3648,7 @@ namespace driver_bridge
             }
             if (rpm_ok && bytes_rpm > 0) {
                 out.resize(static_cast<size_t>(bytes_rpm));
+                clear_last_error_after_success("read_memory_rpm");
                 return true;
             }
             out.clear();
@@ -4168,6 +4255,7 @@ namespace driver_bridge
             return false;
         }
         out.resize(bytes_read);
+        clear_last_error_after_success("read_kernel_memory");
         return true;
     }
 
@@ -4274,8 +4362,10 @@ namespace driver_bridge
                 static_cast<unsigned long long>(address),
                 static_cast<unsigned long long>(size),
                 new_protect, ok ? 1 : 0);
-            if (ok)
+            if (ok) {
+                clear_last_error_after_success("protect_memory_kernel");
                 return true;
+            }
         }
 
         if (!process || size == 0)
@@ -4294,6 +4384,8 @@ namespace driver_bridge
             static_cast<unsigned long long>(address),
             static_cast<unsigned long long>(size),
             new_protect, ok ? 1 : 0, old, ok ? 0UL : GetLastError());
+        if (ok)
+            clear_last_error_after_success("protect_memory_vpe");
         return ok != FALSE;
     }
 

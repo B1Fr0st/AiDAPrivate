@@ -92,6 +92,153 @@ url_log_t summarize_url_for_log(const std::string& url)
     return out;
 }
 
+std::string lower_ascii_copy(std::string s)
+{
+    std::transform(s.begin(), s.end(), s.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return s;
+}
+
+bool url_has_explicit_port(const std::string& url)
+{
+    const size_t scheme = url.find("://");
+    const size_t host_start = scheme == std::string::npos ? 0 : scheme + 3;
+    if (host_start >= url.size())
+        return false;
+    const size_t host_end = url.find_first_of("/?#", host_start);
+    const size_t end = host_end == std::string::npos ? url.size() : host_end;
+    if (url[host_start] == '[')
+    {
+        const size_t close = url.find(']', host_start + 1);
+        return close != std::string::npos && close + 1 < end && url[close + 1] == ':';
+    }
+    return url.find(':', host_start) != std::string::npos && url.find(':', host_start) < end;
+}
+
+bool parse_port_u16(const std::string& text, uint16_t& port)
+{
+    try
+    {
+        size_t parsed_len = 0;
+        const unsigned long parsed = std::stoul(text, &parsed_len);
+        if (parsed_len != text.size() || parsed == 0 || parsed > 65535)
+            return false;
+        port = static_cast<uint16_t>(parsed);
+        return true;
+    }
+    catch (...) { return false; }
+}
+
+bool json_port_u16(const json& value, uint16_t& port)
+{
+    if (value.is_number_unsigned())
+    {
+        const unsigned long long parsed = value.get<unsigned long long>();
+        if (parsed == 0 || parsed > 65535)
+            return false;
+        port = static_cast<uint16_t>(parsed);
+        return true;
+    }
+    if (value.is_number_integer())
+    {
+        const long long parsed = value.get<long long>();
+        if (parsed <= 0 || parsed > 65535)
+            return false;
+        port = static_cast<uint16_t>(parsed);
+        return true;
+    }
+    if (value.is_string())
+        return parse_port_u16(value.get<std::string>(), port);
+    return false;
+}
+
+bool apply_ws_url(ws_editor::ws_connection_config_t& cfg, const std::string& url, std::string& error)
+{
+    const size_t scheme_sep = url.find("://");
+    if (scheme_sep == std::string::npos)
+    {
+        error = "WebSocket URL requires ws:// or wss:// scheme";
+        return false;
+    }
+    std::string scheme = url.substr(0, scheme_sep);
+    scheme = lower_ascii_copy(scheme);
+    if (scheme != "ws" && scheme != "wss")
+    {
+        error = "WebSocket URL scheme must be ws or wss";
+        return false;
+    }
+    const size_t authority_start = scheme_sep + 3;
+    const size_t authority_end = url.find_first_of("/?#", authority_start);
+    const std::string authority = authority_end == std::string::npos
+        ? url.substr(authority_start)
+        : url.substr(authority_start, authority_end - authority_start);
+    if (authority.empty())
+    {
+        error = "WebSocket URL host is empty";
+        return false;
+    }
+    std::string host;
+    uint16_t port = scheme == "wss" ? 443 : 80;
+    if (authority.front() == '[')
+    {
+        const size_t close = authority.find(']');
+        if (close == std::string::npos || close == 1)
+        {
+            error = "invalid bracketed WebSocket host";
+            return false;
+        }
+        host = authority.substr(1, close - 1);
+        if (close + 1 < authority.size())
+        {
+            if (authority[close + 1] != ':')
+            {
+                error = "invalid WebSocket authority";
+                return false;
+            }
+            if (!parse_port_u16(authority.substr(close + 2), port))
+            {
+                error = "invalid WebSocket URL port";
+                return false;
+            }
+        }
+    }
+    else
+    {
+        const size_t colon = authority.rfind(':');
+        if (colon != std::string::npos && authority.find(':') == colon)
+        {
+            host = authority.substr(0, colon);
+            if (!parse_port_u16(authority.substr(colon + 1), port))
+            {
+                error = "invalid WebSocket URL port";
+                return false;
+            }
+        }
+        else
+        {
+            host = authority;
+        }
+    }
+    if (host.empty() || port == 0)
+    {
+        error = "WebSocket URL host or port is empty";
+        return false;
+    }
+    const bool explicit_port = url_has_explicit_port(url);
+    if (!explicit_port)
+        port = scheme == "wss" ? 443 : 80;
+    std::string path = authority_end == std::string::npos ? std::string("/") : url.substr(authority_end);
+    if (path.empty())
+        path = "/";
+    else if (path[0] != '/')
+        path.insert(path.begin(), '/');
+    cfg.scheme = scheme;
+    cfg.host = host;
+    cfg.port = port;
+    cfg.path = path.empty() ? std::string("/") : path;
+    return true;
+}
+
 std::map<std::string, std::string> json_obj_to_map(const json& j)
 {
     std::map<std::string, std::string> out;
@@ -570,14 +717,60 @@ tool_result_t tool_gql_send(const json& params)
 tool_result_t tool_ws_connect(const json& params)
 {
     ws_editor::ws_connection_config_t cfg;
-    cfg.scheme = params.value("scheme", std::string("wss"));
-    cfg.host   = params.value("host", std::string());
-    cfg.port   = static_cast<uint16_t>(params.value("port", 443));
-    cfg.path   = params.value("path", std::string("/"));
+    cfg.scheme = "wss";
+    cfg.port = 443;
+    cfg.path = "/";
+    const std::string url = params.value("url", std::string());
+    bool parsed_url = false;
+    if (!url.empty())
+    {
+        std::string parse_error;
+        parsed_url = apply_ws_url(cfg, url, parse_error);
+        if (!parsed_url)
+        {
+            diag::log_tagged_fmt("mcp_burp", "ws_connect url_parse_failed url_len=%zu err=%s", url.size(), parse_error.c_str());
+            json data;
+            data["error"] = parse_error;
+            data["url_length"] = url.size();
+            data["status"] = "url_parse_failed";
+            return error_with_data(parse_error, data);
+        }
+    }
+    cfg.scheme = params.value("scheme", cfg.scheme);
+    cfg.scheme = lower_ascii_copy(cfg.scheme);
+    cfg.host   = params.value("host", cfg.host);
+    if (cfg.scheme != "ws" && cfg.scheme != "wss")
+    {
+        json data;
+        data["error"] = "WebSocket scheme must be ws or wss";
+        data["scheme"] = cfg.scheme;
+        data["status"] = "invalid_scheme";
+        return error_with_data("WebSocket scheme must be ws or wss", data);
+    }
+    if (params.contains("port"))
+    {
+        uint16_t explicit_port = 0;
+        if (!json_port_u16(params["port"], explicit_port))
+        {
+            json data;
+            data["error"] = "WebSocket port must be in range 1..65535";
+            data["status"] = "invalid_port";
+            return error_with_data("WebSocket port must be in range 1..65535", data);
+        }
+        cfg.port = explicit_port;
+    }
+    cfg.path   = params.value("path", cfg.path.empty() ? std::string("/") : cfg.path);
+    if (cfg.path.empty())
+        cfg.path = "/";
+    else if (cfg.path[0] != '/')
+        cfg.path.insert(cfg.path.begin(), '/');
     cfg.origin = params.value("origin", std::string());
     cfg.subprotocol = params.value("subprotocol", std::string());
     cfg.verify_tls = params.value("verify_tls", true);
-    diag::log_tagged_fmt("mcp_burp", "ws_connect scheme=%s host=%s port=%d path=%s", cfg.scheme.c_str(), cfg.host.c_str(), (int)cfg.port, cfg.path.c_str());
+    cfg.connect_timeout_ms = params.value("connect_timeout_ms", cfg.connect_timeout_ms);
+    cfg.read_timeout_ms = params.value("read_timeout_ms", cfg.read_timeout_ms);
+    diag::log_tagged_fmt("mcp_burp", "ws_connect scheme=%s host=%s port=%d path=%s parsed_url=%d timeout_ms=%d",
+        cfg.scheme.c_str(), cfg.host.c_str(), (int)cfg.port, cfg.path.c_str(), parsed_url ? 1 : 0, cfg.connect_timeout_ms);
     if (params.contains("headers") && params["headers"].is_object()) {
         for (auto it = params["headers"].begin(); it != params["headers"].end(); ++it) {
             cfg.headers.emplace_back(it.key(),
@@ -595,6 +788,8 @@ tool_result_t tool_ws_connect(const json& params)
         data["host"] = cfg.host;
         data["port"] = cfg.port;
         data["path"] = cfg.path;
+        data["parsed_url"] = parsed_url;
+        data["connect_timeout_ms"] = cfg.connect_timeout_ms;
         data["status"] = "connect_failed";
         return error_with_data(err, data);
     }

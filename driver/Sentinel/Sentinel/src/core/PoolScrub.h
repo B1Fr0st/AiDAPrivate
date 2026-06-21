@@ -1,5 +1,6 @@
 #pragma once
 #include <imports/Defs.h>
+#include <core/NtVersion.h>
 
 
 namespace pool_scrub {
@@ -13,8 +14,9 @@ namespace pool_scrub {
         ULONG           SlushSize;
     };
 
-    inline volatile POOL_TRACKER_BIG_PAGES* g_big_pool_table = nullptr;
+    inline volatile UCHAR*                  g_big_pool_table = nullptr;
     inline volatile ULONG                   g_big_pool_table_size = 0;
+    inline volatile ULONG                   g_big_pool_entry_stride = sizeof(POOL_TRACKER_BIG_PAGES);
     inline volatile LONG                    g_initialized = 0;
 
 
@@ -66,15 +68,27 @@ namespace pool_scrub {
                 ULONG max_this_page = static_cast<ULONG>(page_end - reinterpret_cast<ULONG_PTR>(base));
                 if (max_this_page > size) max_this_page = size;
 
-                for (; i <= max_this_page - mask_len && i <= size - mask_len; ++i) {
-                    bool found = true;
-                    for (ULONG j = 0; j < mask_len && found; j++) {
-                        if (mask[j] == 'x' && base[i + j] != pattern[j])
-                            found = false;
+                if (max_this_page >= mask_len) {
+                    ULONG scan_limit = max_this_page - mask_len;
+                    ULONG max_start = size - mask_len;
+                    if (scan_limit > max_start) scan_limit = max_start;
+
+                    for (; i <= scan_limit; ++i) {
+                        bool found = true;
+                        for (ULONG j = 0; j < mask_len && found; j++) {
+                            if (mask[j] == 'x' && base[i + j] != pattern[j])
+                                found = false;
+                        }
+                        if (found)
+                            return (PVOID)(base + i);
                     }
-                    if (found)
-                        return (PVOID)(base + i);
                 }
+
+                ULONG next_i = static_cast<ULONG>(page_end - reinterpret_cast<ULONG_PTR>(base));
+                if (next_i <= i)
+                    ++i;
+                else
+                    i = next_i;
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             return nullptr;
@@ -92,10 +106,73 @@ namespace pool_scrub {
         return reinterpret_cast<PVOID>(ip + total_size + disp);
     }
 
+    __forceinline bool resolve_big_pool_table_win11(PVOID nt_base) {
+        if (!nt_base || !_MmIsAddressValid(nt_base))
+            return false;
+
+        PIMAGE_DOS_HEADER dos = static_cast<PIMAGE_DOS_HEADER>(nt_base);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+            return false;
+
+        PIMAGE_NT_HEADERS64 nt = reinterpret_cast<PIMAGE_NT_HEADERS64>(
+            static_cast<UCHAR*>(nt_base) + dos->e_lfanew);
+        if (!_MmIsAddressValid(nt) || nt->Signature != IMAGE_NT_SIGNATURE)
+            return false;
+
+        static const UCHAR pat[] = {
+            0x48, 0x8B, 0x15, 0x00, 0x00, 0x00, 0x00,
+            0x4C, 0x8B, 0x05, 0x00, 0x00, 0x00, 0x00,
+            0x48, 0x85, 0xD2
+        };
+
+        PIMAGE_SECTION_HEADER sections = IMAGE_FIRST_SECTION(nt);
+        for (USHORT s = 0; s < nt->FileHeader.NumberOfSections; s++) {
+            if (!(sections[s].Characteristics & IMAGE_SCN_MEM_EXECUTE))
+                continue;
+
+            PVOID section_base = static_cast<UCHAR*>(nt_base) + sections[s].VirtualAddress;
+            ULONG section_size = sections[s].Misc.VirtualSize;
+            PVOID found = find_pattern_safe(section_base, section_size, pat, "xxx????xxx????xxx");
+            if (!found)
+                continue;
+
+            PVOID table_ptr = resolve_relative(found, 3, 7);
+            PVOID size_ptr = resolve_relative(static_cast<UCHAR*>(found) + 7, 3, 7);
+            if (!table_ptr || !size_ptr || !_MmIsAddressValid(table_ptr) || !_MmIsAddressValid(size_ptr))
+                continue;
+
+            PVOID table = *static_cast<PVOID*>(table_ptr);
+            if (!table || !_MmIsAddressValid(table))
+                continue;
+
+            ULONGLONG size64 = *static_cast<ULONGLONG*>(size_ptr);
+            if (size64 == 0 || size64 > 0x1000000ULL)
+                continue;
+
+            g_big_pool_table = static_cast<volatile UCHAR*>(table);
+            g_big_pool_table_size = static_cast<ULONG>(size64);
+            g_big_pool_entry_stride = 0x20;
+            SN_LOG("pool_scrub::resolve_big_pool_table_win11 table=%p size=%lu stride=%lu",
+                (PVOID)g_big_pool_table,
+                g_big_pool_table_size,
+                g_big_pool_entry_stride);
+            return true;
+        }
+
+        SN_LOG("pool_scrub::resolve_big_pool_table_win11 miss");
+        return false;
+    }
+
 
     __forceinline bool resolve_big_pool_table(PVOID nt_base) {
         if (!nt_base || !_MmIsAddressValid(nt_base))
             return false;
+
+        if (nt_version::is_windows_11_or_newer()) {
+            SN_LOG("pool_scrub::resolve_big_pool_table windows11_path build=%lu",
+                nt_version::build_number());
+            return resolve_big_pool_table_win11(nt_base);
+        }
 
         PIMAGE_DOS_HEADER dos = static_cast<PIMAGE_DOS_HEADER>(nt_base);
         if (dos->e_magic != IMAGE_DOS_SIGNATURE)
@@ -157,8 +234,9 @@ namespace pool_scrub {
             if (!size_ptr || !_MmIsAddressValid(size_ptr))
                 continue;
 
-            g_big_pool_table = static_cast<volatile POOL_TRACKER_BIG_PAGES*>(*actual_table_ptr);
+            g_big_pool_table = static_cast<volatile UCHAR*>(*actual_table_ptr);
             g_big_pool_table_size = *static_cast<ULONG*>(size_ptr);
+            g_big_pool_entry_stride = sizeof(POOL_TRACKER_BIG_PAGES);
 
             if (g_big_pool_table && g_big_pool_table_size > 0 &&
                 g_big_pool_table_size < 0x1000000)
@@ -178,18 +256,20 @@ namespace pool_scrub {
 
         __try {
             for (ULONG i = 0; i < g_big_pool_table_size; i++) {
-                volatile POOL_TRACKER_BIG_PAGES* entry =
-                    &g_big_pool_table[i];
+                volatile UCHAR* entry =
+                    g_big_pool_table + (static_cast<SIZE_T>(i) * g_big_pool_entry_stride);
 
-                if (!_MmIsAddressValid((PVOID)entry))
+                if (!_MmIsAddressValid((PVOID)entry) ||
+                    !_MmIsAddressValid((PVOID)(entry + sizeof(PVOID) - 1)) ||
+                    !_MmIsAddressValid((PVOID)(entry + 8 + sizeof(ULONG) - 1)))
                     break;
 
 
-                PVOID va = (PVOID)entry->Va;
+                PVOID va = *reinterpret_cast<volatile PVOID*>(entry);
                 if (!va || va == (PVOID)1)
                     continue;
 
-                ULONG key = entry->Key;
+                ULONG key = *reinterpret_cast<volatile ULONG*>(entry + 8);
                 if (key == 0)
                     continue;
 
@@ -198,8 +278,7 @@ namespace pool_scrub {
                     if (key == g_tag_map[t].original_tag) {
 
 
-                        const_cast<POOL_TRACKER_BIG_PAGES*>(
-                            const_cast<volatile POOL_TRACKER_BIG_PAGES*>(entry))->Key =
+                        *reinterpret_cast<volatile ULONG*>(entry + 8) =
                             g_tag_map[t].replacement_tag;
                         break;
                     }

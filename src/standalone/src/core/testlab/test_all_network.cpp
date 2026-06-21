@@ -345,35 +345,230 @@ namespace {
         return sent == payload_len && recvd == payload_len;
     }
 
-    bool drive_udp_burst_fixture(HANDLE hf, const char* tag, uint16_t dst_port, int packet_count, uint32_t& sent_packets) {
-        sent_packets = 0;
-        SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        if (s == INVALID_SOCKET) {
-            log_msg(hf, tag, "fixture udp socket failed err=%d", WSAGetLastError());
+    struct udp_pair_fixture_t {
+        SOCKET server = INVALID_SOCKET;
+        SOCKET client = INVALID_SOCKET;
+        uint16_t server_port = 0;
+        uint16_t client_port = 0;
+        uint32_t sent_packets = 0;
+        uint32_t sent_bytes = 0;
+        uint32_t received_packets = 0;
+        uint32_t received_bytes = 0;
+        int last_send_error = 0;
+        int last_recv_error = 0;
+
+        ~udp_pair_fixture_t() {
+            close_all();
+        }
+
+        void close_all() {
+            if (client != INVALID_SOCKET) {
+                closesocket(client);
+                client = INVALID_SOCKET;
+            }
+            if (server != INVALID_SOCKET) {
+                closesocket(server);
+                server = INVALID_SOCKET;
+            }
+        }
+
+        void reset_fields() {
+            server_port = 0;
+            client_port = 0;
+            sent_packets = 0;
+            sent_bytes = 0;
+            received_packets = 0;
+            received_bytes = 0;
+            last_send_error = 0;
+            last_recv_error = 0;
+        }
+    };
+
+    unsigned long long socket_id(SOCKET s) {
+        return static_cast<unsigned long long>(static_cast<UINT_PTR>(s));
+    }
+
+    bool open_udp_pair_fixture(HANDLE hf, const char* tag, udp_pair_fixture_t& fx, uint16_t preferred_server_port) {
+        const ULONGLONG t0 = GetTickCount64();
+        fx.close_all();
+        fx.reset_fields();
+        fx.server = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (fx.server == INVALID_SOCKET) {
+            log_msg(hf, tag, "fixture udp server socket failed pid=%lu tid=%lu err=%d",
+                GetCurrentProcessId(), GetCurrentThreadId(), WSAGetLastError());
             return false;
         }
-        DWORD timeout_ms = 250;
-        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+        fx.client = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (fx.client == INVALID_SOCKET) {
+            log_msg(hf, tag, "fixture udp client socket failed pid=%lu tid=%lu server_socket=%llu err=%d",
+                GetCurrentProcessId(), GetCurrentThreadId(), socket_id(fx.server), WSAGetLastError());
+            fx.close_all();
+            return false;
+        }
+        configure_fixture_socket(fx.server);
+        configure_fixture_socket(fx.client);
+        BOOL reuse = TRUE;
+        setsockopt(fx.server, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+        setsockopt(fx.client, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+
+        sockaddr_in server_addr{};
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        server_addr.sin_port = htons(preferred_server_port);
+        int server_bind_err = 0;
+        bool used_preferred = true;
+        if (bind(fx.server, reinterpret_cast<const sockaddr*>(&server_addr), sizeof(server_addr)) != 0) {
+            server_bind_err = WSAGetLastError();
+            used_preferred = false;
+            server_addr.sin_port = 0;
+            if (bind(fx.server, reinterpret_cast<const sockaddr*>(&server_addr), sizeof(server_addr)) != 0) {
+                log_msg(hf, tag, "fixture udp server bind failed pid=%lu tid=%lu preferred_port=%u first_err=%d fallback_err=%d",
+                    GetCurrentProcessId(), GetCurrentThreadId(), static_cast<unsigned>(preferred_server_port),
+                    server_bind_err, WSAGetLastError());
+                fx.close_all();
+                return false;
+            }
+        }
+
+        sockaddr_in actual_server{};
+        int actual_server_len = sizeof(actual_server);
+        if (getsockname(fx.server, reinterpret_cast<sockaddr*>(&actual_server), &actual_server_len) != 0) {
+            log_msg(hf, tag, "fixture udp server getsockname failed pid=%lu tid=%lu err=%d",
+                GetCurrentProcessId(), GetCurrentThreadId(), WSAGetLastError());
+            fx.close_all();
+            return false;
+        }
+        fx.server_port = ntohs(actual_server.sin_port);
+
+        sockaddr_in client_addr{};
+        client_addr.sin_family = AF_INET;
+        client_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        client_addr.sin_port = 0;
+        if (bind(fx.client, reinterpret_cast<const sockaddr*>(&client_addr), sizeof(client_addr)) != 0) {
+            log_msg(hf, tag, "fixture udp client bind failed pid=%lu tid=%lu server_port=%u err=%d",
+                GetCurrentProcessId(), GetCurrentThreadId(), static_cast<unsigned>(fx.server_port), WSAGetLastError());
+            fx.close_all();
+            return false;
+        }
+
+        sockaddr_in actual_client{};
+        int actual_client_len = sizeof(actual_client);
+        if (getsockname(fx.client, reinterpret_cast<sockaddr*>(&actual_client), &actual_client_len) != 0) {
+            log_msg(hf, tag, "fixture udp client getsockname failed pid=%lu tid=%lu err=%d",
+                GetCurrentProcessId(), GetCurrentThreadId(), WSAGetLastError());
+            fx.close_all();
+            return false;
+        }
+        fx.client_port = ntohs(actual_client.sin_port);
+
         sockaddr_in dst{};
         dst.sin_family = AF_INET;
         dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        dst.sin_port = htons(dst_port);
-        char payload[160];
-        std::memset(payload, 'N', sizeof(payload));
+        dst.sin_port = htons(fx.server_port);
+        if (connect(fx.client, reinterpret_cast<const sockaddr*>(&dst), sizeof(dst)) != 0) {
+            log_msg(hf, tag, "fixture udp client connect failed pid=%lu tid=%lu client_port=%u dst_port=%u err=%d",
+                GetCurrentProcessId(), GetCurrentThreadId(), static_cast<unsigned>(fx.client_port),
+                static_cast<unsigned>(fx.server_port), WSAGetLastError());
+            fx.close_all();
+            return false;
+        }
+
+        u_long nonblocking = 1;
+        const int nb_rc = ioctlsocket(fx.server, FIONBIO, &nonblocking);
+        log_msg(hf, tag, "fixture udp pair ready pid=%lu tid=%lu client_socket=%llu server_socket=%llu client_port=%u server_port=%u preferred_port=%u used_preferred=%d first_bind_err=%d server_nonblock_rc=%d server_nonblock_err=%d elapsed_ms=%llu",
+            GetCurrentProcessId(), GetCurrentThreadId(), socket_id(fx.client), socket_id(fx.server),
+            static_cast<unsigned>(fx.client_port), static_cast<unsigned>(fx.server_port),
+            static_cast<unsigned>(preferred_server_port), used_preferred ? 1 : 0, server_bind_err,
+            nb_rc, nb_rc == 0 ? 0 : WSAGetLastError(),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+        return true;
+    }
+
+    uint32_t drain_udp_fixture(HANDLE hf, const char* tag, udp_pair_fixture_t& fx, const char* phase) {
+        uint32_t drained = 0;
+        char buf[512]{};
+        for (;;) {
+            sockaddr_in from{};
+            int from_len = sizeof(from);
+            int rc = recvfrom(fx.server, buf, sizeof(buf), 0, reinterpret_cast<sockaddr*>(&from), &from_len);
+            if (rc == SOCKET_ERROR) {
+                int err = WSAGetLastError();
+                fx.last_recv_error = err;
+                if (err == WSAEWOULDBLOCK)
+                    break;
+                log_msg(hf, tag, "fixture udp drain error phase=%s pid=%lu tid=%lu client_port=%u server_port=%u received=%u err=%d",
+                    phase ? phase : "<null>", GetCurrentProcessId(), GetCurrentThreadId(),
+                    static_cast<unsigned>(fx.client_port), static_cast<unsigned>(fx.server_port),
+                    static_cast<unsigned>(drained), err);
+                break;
+            }
+            if (rc == 0)
+                break;
+            ++drained;
+            ++fx.received_packets;
+            fx.received_bytes += static_cast<uint32_t>(rc);
+            if (drained >= 128)
+                break;
+        }
+        log_msg(hf, tag, "fixture udp drain phase=%s pid=%lu tid=%lu client_port=%u server_port=%u drained=%u total_received=%u total_received_bytes=%u last_recv_err=%d",
+            phase ? phase : "<null>", GetCurrentProcessId(), GetCurrentThreadId(),
+            static_cast<unsigned>(fx.client_port), static_cast<unsigned>(fx.server_port),
+            static_cast<unsigned>(drained), static_cast<unsigned>(fx.received_packets),
+            static_cast<unsigned>(fx.received_bytes), fx.last_recv_error);
+        return drained;
+    }
+
+    bool drive_udp_burst_fixture(HANDLE hf, const char* tag, udp_pair_fixture_t& fx, int packet_count) {
+        const ULONGLONG t0 = GetTickCount64();
+        char payload[160]{};
         int last_err = 0;
+        uint32_t sent = 0;
+        uint32_t bytes = 0;
         for (int i = 0; i < packet_count; ++i) {
-            int rc = sendto(s, payload, static_cast<int>(sizeof(payload)), 0,
-                reinterpret_cast<const sockaddr*>(&dst), sizeof(dst));
+            _snprintf_s(payload, sizeof(payload), _TRUNCATE,
+                "AIDA-UDP-FIXTURE pid=%lu tid=%lu seq=%d src=%u dst=%u",
+                GetCurrentProcessId(), GetCurrentThreadId(), i,
+                static_cast<unsigned>(fx.client_port), static_cast<unsigned>(fx.server_port));
+            int rc = send(fx.client, payload, static_cast<int>(sizeof(payload)), 0);
             if (rc == SOCKET_ERROR) {
                 last_err = WSAGetLastError();
             } else {
-                ++sent_packets;
+                ++sent;
+                bytes += static_cast<uint32_t>(rc);
             }
         }
-        closesocket(s);
-        log_msg(hf, tag, "fixture udp burst dst_port=%u requested=%d sent=%u last_err=%d",
-            static_cast<unsigned>(dst_port), packet_count, static_cast<unsigned>(sent_packets), last_err);
-        return sent_packets > 0;
+        fx.sent_packets += sent;
+        fx.sent_bytes += bytes;
+        fx.last_send_error = last_err;
+        log_msg(hf, tag, "fixture udp burst pid=%lu tid=%lu client_socket=%llu server_socket=%llu client_port=%u dst_port=%u requested=%d sent=%u sent_bytes=%u last_send_err=%d elapsed_ms=%llu",
+            GetCurrentProcessId(), GetCurrentThreadId(), socket_id(fx.client), socket_id(fx.server),
+            static_cast<unsigned>(fx.client_port), static_cast<unsigned>(fx.server_port),
+            packet_count, static_cast<unsigned>(sent), static_cast<unsigned>(bytes), last_err,
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+        return sent > 0;
+    }
+
+    bool drive_udp_burst_fixture(HANDLE hf, const char* tag, uint16_t dst_port, int packet_count, uint32_t& sent_packets) {
+        sent_packets = 0;
+        udp_pair_fixture_t fx;
+        if (!open_udp_pair_fixture(hf, tag, fx, dst_port)) {
+            log_msg(hf, tag, "fixture udp compat open failed dst_port=%u requested=%d",
+                static_cast<unsigned>(dst_port), packet_count);
+            return false;
+        }
+        const bool ok = drive_udp_burst_fixture(hf, tag, fx, packet_count);
+        sent_packets = fx.sent_packets;
+        const uint32_t drained = drain_udp_fixture(hf, tag, fx, "compat_after_burst");
+        log_msg(hf, tag, "fixture udp compat burst dst_port=%u requested=%d sent=%u received=%u drained=%u client_port=%u server_port=%u ok=%d",
+            static_cast<unsigned>(dst_port),
+            packet_count,
+            static_cast<unsigned>(sent_packets),
+            static_cast<unsigned>(fx.received_packets),
+            static_cast<unsigned>(drained),
+            static_cast<unsigned>(fx.client_port),
+            static_cast<unsigned>(fx.server_port),
+            ok ? 1 : 0);
+        return ok;
     }
 
     bool driver_capture_fixture(HANDLE hf, const char* tag, uint32_t protocol_filter, std::vector<driver_bridge::captured_packet_t>& packets) {
@@ -2455,30 +2650,76 @@ namespace {
             failed.fetch_add(1);
             return;
         }
+        udp_pair_fixture_t udp_fx;
+        const uint32_t self_pid = GetCurrentProcessId();
+        if (!open_udp_pair_fixture(hf, tag, udp_fx, 53537)) {
+            fail_empty_evidence(hf, tag, failed, "UDP fixture could not bind explicit client/server sockets pid=%u tid=%lu",
+                self_pid, GetCurrentThreadId());
+            return;
+        }
         uint32_t held_count = 0;
         bool active = false;
-        const uint32_t self_pid = GetCurrentProcessId();
-        bool started = driver_bridge::intercept_op(0, self_pid, 0, 17, 0, nullptr, 0, &held_count, &active);
-        log_msg(hf, tag, "intercept start ok=%d self_pid=%u held=%u active=%d",
-            started ? 1 : 0, self_pid, held_count, active ? 1 : 0);
-        uint32_t udp_sent = 0;
+        bool started = driver_bridge::intercept_op(0, self_pid, udp_fx.server_port, 17, 0, nullptr, 0, &held_count, &active);
+        log_msg(hf, tag, "intercept start ok=%d self_pid=%u tid=%lu filter_port=%u client_port=%u held=%u active=%d driver_status=\"%s\" driver_error=\"%s\"",
+            started ? 1 : 0, self_pid, GetCurrentThreadId(),
+            static_cast<unsigned>(udp_fx.server_port), static_cast<unsigned>(udp_fx.client_port),
+            held_count, active ? 1 : 0, driver_bridge::status().c_str(), driver_bridge::last_error().c_str());
         bool udp_ok = false;
         if (started)
-            udp_ok = drive_udp_burst_fixture(hf, tag, 53537, 16, udp_sent);
+            udp_ok = drive_udp_burst_fixture(hf, tag, udp_fx, 16);
         std::vector<driver_bridge::held_packet_info_t> held;
-        for (int i = 0; i < 8; ++i) {
+        for (int i = 0; i < 12; ++i) {
             Sleep(125);
+            uint32_t poll_held_count = 0;
+            bool poll_active = false;
+            bool query_ok = driver_bridge::intercept_op(2, 0, 0, 0, 0, nullptr, 0, &poll_held_count, &poll_active);
+            uint32_t drained_before = drain_udp_fixture(hf, tag, udp_fx, "poll_before_get_held");
             held = driver_bridge::get_held_packets();
-            log_msg(hf, tag, "held poll iter=%d entries=%zu", i, held.size());
+            uint32_t drained_after = drain_udp_fixture(hf, tag, udp_fx, "poll_after_get_held");
+            log_msg(hf, tag, "held poll iter=%d query_ok=%d query_held=%u query_active=%d entries=%zu drained_before=%u drained_after=%u sent=%u received=%u client_port=%u dst_port=%u",
+                i, query_ok ? 1 : 0, poll_held_count, poll_active ? 1 : 0, held.size(),
+                static_cast<unsigned>(drained_before), static_cast<unsigned>(drained_after),
+                static_cast<unsigned>(udp_fx.sent_packets), static_cast<unsigned>(udp_fx.received_packets),
+                static_cast<unsigned>(udp_fx.client_port), static_cast<unsigned>(udp_fx.server_port));
+            for (size_t hi = 0; hi < held.size() && hi < 4; ++hi) {
+                const auto& hp = held[hi];
+                const bool tuple_match =
+                    hp.pid == self_pid ||
+                    hp.src_port == udp_fx.client_port ||
+                    hp.dst_port == udp_fx.server_port;
+                log_msg(hf, tag, "held[%zu] id=%llu pid=%u proto=%u dir=%u af=%u src_port=%u dst_port=%u payload_size=%u tuple_match=%d timestamp=%llu",
+                    hi,
+                    static_cast<unsigned long long>(hp.hold_id),
+                    hp.pid,
+                    hp.protocol,
+                    hp.direction,
+                    hp.af,
+                    hp.src_port,
+                    hp.dst_port,
+                    hp.payload_size,
+                    tuple_match ? 1 : 0,
+                    static_cast<unsigned long long>(hp.timestamp));
+            }
             if (!held.empty())
                 break;
         }
+        uint32_t drained_before_stop = drain_udp_fixture(hf, tag, udp_fx, "before_stop");
         bool stopped = driver_bridge::intercept_op(1, 0, 0, 0, 0, nullptr, 0, &held_count, &active);
-        log_msg(hf, tag, "intercept stop/drop ok=%d held_after=%u active_after=%d udp_ok=%d udp_sent=%u",
-            stopped ? 1 : 0, held_count, active ? 1 : 0, udp_ok ? 1 : 0, udp_sent);
+        uint32_t drained_after_stop = drain_udp_fixture(hf, tag, udp_fx, "after_stop");
+        log_msg(hf, tag, "intercept stop/drop ok=%d held_after=%u active_after=%d udp_ok=%d sent=%u sent_bytes=%u received=%u received_bytes=%u client_port=%u dst_port=%u send_err=%d recv_err=%d drained_before_stop=%u drained_after_stop=%u",
+            stopped ? 1 : 0, held_count, active ? 1 : 0, udp_ok ? 1 : 0,
+            static_cast<unsigned>(udp_fx.sent_packets), static_cast<unsigned>(udp_fx.sent_bytes),
+            static_cast<unsigned>(udp_fx.received_packets), static_cast<unsigned>(udp_fx.received_bytes),
+            static_cast<unsigned>(udp_fx.client_port), static_cast<unsigned>(udp_fx.server_port),
+            udp_fx.last_send_error, udp_fx.last_recv_error,
+            static_cast<unsigned>(drained_before_stop), static_cast<unsigned>(drained_after_stop));
         if (held.empty()) {
-            fail_empty_evidence(hf, tag, failed, "held packet list is empty after live intercept UDP fixture start=%d udp_ok=%d udp_sent=%u stop=%d",
-                started ? 1 : 0, udp_ok ? 1 : 0, udp_sent, stopped ? 1 : 0);
+            fail_empty_evidence(hf, tag, failed, "held packet list is empty after live intercept UDP fixture start=%d udp_ok=%d sent=%u received=%u client_port=%u dst_port=%u stop=%d active_after=%d held_after=%u send_err=%d recv_err=%d",
+                started ? 1 : 0, udp_ok ? 1 : 0,
+                static_cast<unsigned>(udp_fx.sent_packets), static_cast<unsigned>(udp_fx.received_packets),
+                static_cast<unsigned>(udp_fx.client_port), static_cast<unsigned>(udp_fx.server_port),
+                stopped ? 1 : 0, active ? 1 : 0, held_count,
+                udp_fx.last_send_error, udp_fx.last_recv_error);
             return;
         }
         log_msg(hf, tag, "PASS -- get_held_packets returned %zu entries", held.size());

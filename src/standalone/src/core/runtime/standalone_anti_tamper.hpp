@@ -86,6 +86,88 @@ namespace runtime_enforcement_detail
 #endif
     }
 
+    inline bool kernel_adbg_hard_flags_present(uint32_t flags)
+    {
+        constexpr uint32_t kHardFlags = 0x00000001u | 0x00000008u;
+        return (flags & kHardFlags) != 0;
+    }
+
+    inline bool input_helper_handle_kernel_clean(const standalone_anti_ai::combined::threat_report_t& report,
+                                                 const char* phase)
+    {
+        driver_bridge::dynamic_ioctl_state_t dyn = driver_bridge::dynamic_ioctl_state();
+        const bool kernel_ready = dyn.loaded && dyn.kernel && dyn.connected;
+        const bool dynamic_ready = dyn.ready;
+        bool query_ok = false;
+        DWORD query_err = ERROR_SUCCESS;
+        uint32_t query_flags = 0;
+        uint64_t query_pid = 0;
+        bool scan_ok = false;
+        DWORD scan_err = ERROR_SUCCESS;
+        uint64_t scan_pid = 0;
+        bool kernel_confirmed = false;
+        bool kernel_clean = false;
+        const char* status = "kernel_unavailable";
+        if (kernel_ready && !dynamic_ready)
+        {
+            status = "dynamic_ioctl_not_ready";
+        }
+        else if (kernel_ready && dynamic_ready)
+        {
+            driver_bridge::anti_debug_result_t query{};
+            SetLastError(ERROR_SUCCESS);
+            query_ok = driver_bridge::kernel_anti_debug_query(query);
+            query_err = query_ok ? ERROR_SUCCESS : GetLastError();
+            query_flags = query.result_flags;
+            query_pid = query.detected_debugger_pid;
+            SetLastError(ERROR_SUCCESS);
+            scan_ok = driver_bridge::kernel_anti_debug_scan_debuggers(&scan_pid);
+            scan_err = scan_ok ? ERROR_SUCCESS : GetLastError();
+            kernel_confirmed = query_ok &&
+                (kernel_adbg_hard_flags_present(query.result_flags) || query.detected_debugger_pid != 0);
+            kernel_clean = query_ok && scan_ok && !kernel_confirmed && scan_pid == 0;
+            if (kernel_clean)
+                status = "clean";
+            else if (!query_ok)
+                status = "query_failed";
+            else if (!scan_ok)
+                status = "scan_failed";
+            else if (kernel_confirmed || scan_pid != 0)
+                status = "confirmed";
+            else
+                status = "unclean";
+        }
+        diag::log_tagged_critical_fmt("guard",
+            "runtime_verify_input_helper_kernel_corroboration phase=%s status=%s clean=%d kernel_ready=%d dynamic_ready=%d query_ok=%d query_err=%lu query_flags=0x%08X query_pid=%llu scan_ok=%d scan_err=%lu scan_pid=%llu confirmed=%d handle_any=%d observed_handles=%u first_owner_pid=%lu first_owner_image=%s first_owner_path=%s first_access=0x%08lX first_owner_hash=0x%016llX first_query_ok=%d first_input_helper=%d first_owner_tool=%d first_owner_offensive=%d high_risk_mask=0x%08X summary_hash=0x%016llX",
+            phase ? phase : "runtime_verify",
+            status,
+            kernel_clean ? 1 : 0,
+            kernel_ready ? 1 : 0,
+            dynamic_ready ? 1 : 0,
+            query_ok ? 1 : 0,
+            static_cast<unsigned long>(query_err),
+            query_flags,
+            static_cast<unsigned long long>(query_pid),
+            scan_ok ? 1 : 0,
+            static_cast<unsigned long>(scan_err),
+            static_cast<unsigned long long>(scan_pid),
+            kernel_confirmed ? 1 : 0,
+            report.handle_to_us_detected ? 1 : 0,
+            report.observed_handle_count,
+            static_cast<unsigned long>(report.first_handle_owner_pid),
+            report.first_handle_owner_image.empty() ? "<empty>" : report.first_handle_owner_image.c_str(),
+            report.first_handle_owner_path.empty() ? "<empty>" : report.first_handle_owner_path.c_str(),
+            static_cast<unsigned long>(report.first_handle_access_mask),
+            static_cast<unsigned long long>(report.first_handle_owner_hash),
+            report.first_handle_owner_query_ok ? 1 : 0,
+            report.first_handle_owner_input_helper ? 1 : 0,
+            report.first_handle_owner_tool ? 1 : 0,
+            report.first_handle_owner_offensive ? 1 : 0,
+            report.high_risk_mask,
+            static_cast<unsigned long long>(report.summary_hash));
+        return kernel_clean;
+    }
+
     inline void log_suppressed(const char* reason)
     {
         uint64_t full_test_suppression_remaining = 0;
@@ -707,76 +789,103 @@ inline bool run_verification_cycle()
 
         auto ai_scan = standalone_anti_ai::full_scan_runtime_cached(15000ULL, "runtime_verify");
         auto ai_report = ai_scan.report;
+        const bool input_helper_candidate =
+            standalone_anti_ai::combined::input_helper_foreign_handle_candidate(ai_report);
+        bool input_helper_kernel_clean = false;
 
         if (ai_report.confirmed_high_risk())
         {
-            std::string detail = ai_report.summary;
-            const char* viol_reason = "ai_analysis_high_risk";
-            const char* webhook_tag = "anti_ai_high_risk";
-            if (ai_report.offensive_mcp_tool_detected)
+            input_helper_kernel_clean =
+                input_helper_candidate &&
+                runtime_enforcement_detail::input_helper_handle_kernel_clean(ai_report, "runtime_verify");
+            if (input_helper_kernel_clean)
             {
-                viol_reason = "offensive_mcp_tool_detected";
-                webhook_tag = "anti_mcp_offensive";
+                diag::log_tagged_critical_fmt("guard",
+                    "runtime_verify_input_helper_handle_kernel_clean_suppressed category_mask=0x%08X high_risk_mask=0x%08X high_risk_count=%u summary_hash=0x%016llX observed_handles=%u first_owner_pid=%lu first_owner_image=%s first_owner_path=%s first_access=0x%08lX first_owner_hash=0x%016llX tool_targets_aida=%d summary=%s",
+                    ai_report.category_mask,
+                    ai_report.high_risk_mask,
+                    ai_report.high_risk_count,
+                    static_cast<unsigned long long>(ai_report.summary_hash),
+                    ai_report.observed_handle_count,
+                    static_cast<unsigned long>(ai_report.first_handle_owner_pid),
+                    ai_report.first_handle_owner_image.empty() ? "<empty>" : ai_report.first_handle_owner_image.c_str(),
+                    ai_report.first_handle_owner_path.empty() ? "<empty>" : ai_report.first_handle_owner_path.c_str(),
+                    static_cast<unsigned long>(ai_report.first_handle_access_mask),
+                    static_cast<unsigned long long>(ai_report.first_handle_owner_hash),
+                    ai_report.tool_targets_aida ? 1 : 0,
+                    ai_report.summary.c_str());
             }
-            else if (ai_report.llm_detected)
+            else
             {
-                viol_reason = "local_llm_analysis";
-                webhook_tag = "anti_llm";
+                std::string detail = ai_report.summary;
+                const char* viol_reason = "ai_analysis_high_risk";
+                const char* webhook_tag = "anti_ai_high_risk";
+                if (ai_report.offensive_mcp_tool_detected)
+                {
+                    viol_reason = "offensive_mcp_tool_detected";
+                    webhook_tag = "anti_mcp_offensive";
+                }
+                else if (ai_report.llm_detected)
+                {
+                    viol_reason = "local_llm_analysis";
+                    webhook_tag = "anti_llm";
+                }
+                else if (ai_report.mcp_detected)
+                {
+                    viol_reason = "mcp_bridge_detected";
+                    webhook_tag = "anti_mcp";
+                }
+                else if (ai_report.ai_tool_detected && ai_report.tool_targets_aida)
+                {
+                    viol_reason = "ai_agent_targeting_aida";
+                    webhook_tag = "anti_ai_agent";
+                }
+                else if (ai_report.memory_scanner_detected)
+                {
+                    viol_reason = "memory_scanner_attached";
+                    webhook_tag = "mem_scanner";
+                }
+                else if (ai_report.re_tool_detected)
+                {
+                    viol_reason = "reverse_engineering_tool_detected";
+                    webhook_tag = "re_tool_scan";
+                }
+                else if (ai_report.debugger_tool_detected)
+                {
+                    viol_reason = "debugger_tool_detected";
+                    webhook_tag = "debugger_tool_scan";
+                }
+                else if (ai_report.dump_tool_detected)
+                {
+                    viol_reason = "dump_tool_detected";
+                    webhook_tag = "dump_tool_scan";
+                }
+                else if (ai_report.foreign_vm_write_handle || ai_report.foreign_vm_operation_handle || ai_report.foreign_create_thread_handle)
+                {
+                    viol_reason = "foreign_mutating_handle_detected";
+                    webhook_tag = "handle_leak";
+                }
+                else if (ai_report.handle_to_us_detected)
+                {
+                    viol_reason = "foreign_handle_detected";
+                    webhook_tag = "handle_leak";
+                }
+                else if (ai_report.tool_targets_aida)
+                {
+                    viol_reason = "tool_targeting_aida";
+                    webhook_tag = "anti_ai_target";
+                }
+                webhook::send_debug_log(webhook_tag, detail, true);
+                enforce_violation(viol_reason, detail);
+                return false;
             }
-            else if (ai_report.mcp_detected)
-            {
-                viol_reason = "mcp_bridge_detected";
-                webhook_tag = "anti_mcp";
-            }
-            else if (ai_report.ai_tool_detected && ai_report.tool_targets_aida)
-            {
-                viol_reason = "ai_agent_targeting_aida";
-                webhook_tag = "anti_ai_agent";
-            }
-            else if (ai_report.memory_scanner_detected)
-            {
-                viol_reason = "memory_scanner_attached";
-                webhook_tag = "mem_scanner";
-            }
-            else if (ai_report.re_tool_detected)
-            {
-                viol_reason = "reverse_engineering_tool_detected";
-                webhook_tag = "re_tool_scan";
-            }
-            else if (ai_report.debugger_tool_detected)
-            {
-                viol_reason = "debugger_tool_detected";
-                webhook_tag = "debugger_tool_scan";
-            }
-            else if (ai_report.dump_tool_detected)
-            {
-                viol_reason = "dump_tool_detected";
-                webhook_tag = "dump_tool_scan";
-            }
-            else if (ai_report.foreign_vm_write_handle || ai_report.foreign_vm_operation_handle || ai_report.foreign_create_thread_handle)
-            {
-                viol_reason = "foreign_mutating_handle_detected";
-                webhook_tag = "handle_leak";
-            }
-            else if (ai_report.handle_to_us_detected)
-            {
-                viol_reason = "foreign_handle_detected";
-                webhook_tag = "handle_leak";
-            }
-            else if (ai_report.tool_targets_aida)
-            {
-                viol_reason = "tool_targeting_aida";
-                webhook_tag = "anti_ai_target";
-            }
-            webhook::send_debug_log(webhook_tag, detail, true);
-            enforce_violation(viol_reason, detail);
-            return false;
         }
 
-        if (ai_report.memory_scanner_detected || ai_report.handle_to_us_detected ||
-            ai_report.re_tool_detected || ai_report.debugger_tool_detected ||
-            ai_report.dump_tool_detected || ai_report.offensive_mcp_tool_detected ||
-            ai_report.tool_targets_aida)
+        if (!input_helper_kernel_clean &&
+            (ai_report.memory_scanner_detected || ai_report.handle_to_us_detected ||
+                ai_report.re_tool_detected || ai_report.debugger_tool_detected ||
+                ai_report.dump_tool_detected || ai_report.offensive_mcp_tool_detected ||
+                ai_report.tool_targets_aida))
         {
             uint64_t now_tick = GetTickCount64();
             uint64_t first_tick = rt.soft_violation_window_tick.load(std::memory_order_relaxed);

@@ -476,6 +476,165 @@ def patch_navigation_capture(path: pathlib.Path, text: str) -> str:
         )
     if "capture_from_start: bool = False" not in text or "capture_from_start_enabled" not in text:
         fail(f"navigation capture validation failed {path}")
+    if "_await_no_cancel_wait(page.evaluate(\"document.readyState\")" not in text:
+        if "from ..browser import _await_no_cancel_wait" not in text:
+            if "from ..browser import _camoufox_debug, _safe_text, _target_domain" in text:
+                text = text.replace(
+                    "from ..browser import _camoufox_debug, _safe_text, _target_domain",
+                    "from ..browser import _await_no_cancel_wait, _camoufox_debug, _safe_text, _target_domain",
+                    1,
+                )
+            elif "from ..browser import _camoufox_debug, _safe_text" in text:
+                text = text.replace(
+                    "from ..browser import _camoufox_debug, _safe_text",
+                    "from ..browser import _await_no_cancel_wait, _camoufox_debug, _safe_text",
+                    1,
+                )
+        text = text.replace(
+            "dom_ready = await page.evaluate(\"document.readyState\")",
+            "dom_ready = await _await_no_cancel_wait(page.evaluate(\"document.readyState\"), timeout=3.0)",
+            1,
+        )
+    if "nav_timeout_ms" not in text:
+        if "    wait_until: str = \"load\",\n    pre_inject_hooks:" in text:
+            text = text.replace(
+                "    wait_until: str = \"load\",\n    pre_inject_hooks:",
+                "    wait_until: str = \"load\",\n    timeout: int = 30000,\n    pre_inject_hooks:",
+                1,
+            )
+        elif "    wait_until: str = \"load\",\n    collect_response_chain:" in text:
+            text = text.replace(
+                "    wait_until: str = \"load\",\n    collect_response_chain:",
+                "    wait_until: str = \"load\",\n    timeout: int = 30000,\n    collect_response_chain:",
+                1,
+            )
+        text = replace_once(
+            text,
+            "        warnings: list[str] = []\n        hooks_injected: list[str] = []\n",
+            "        warnings: list[str] = []\n        hooks_injected: list[str] = []\n"
+            "        try:\n"
+            "            nav_timeout_ms = max(1000, min(int(timeout), 120000))\n"
+            "        except Exception:\n"
+            "            nav_timeout_ms = 30000\n",
+            "navigation timeout budget",
+        )
+        text = text.replace("timeout=30000)", "timeout=nav_timeout_ms)", 1)
+        text = text.replace("await page.wait_for_load_state(state_name, timeout=5000)", "await page.wait_for_load_state(state_name, timeout=max(250, min(5000, nav_timeout_ms)))")
+        text = text.replace("resp2 = await page.reload(wait_until=wait_until)", "resp2 = await page.reload(wait_until=wait_until, timeout=nav_timeout_ms)")
+    if "nav_timeout_ms" not in text:
+        fail(f"navigation timeout validation failed {path}")
+    if "_await_no_cancel_wait(page.evaluate(\"document.readyState\")" not in text:
+        fail(f"navigation ready-state timeout validation failed {path}")
+    if "_navigation_capture_summary" not in text:
+        helper = '''_NAVIGATION_CAPTURE_INLINE_LIMIT = 80
+
+
+def _navigation_request_summary(entry: dict) -> dict:
+    response_body = entry.get("response_body")
+    response_body_length = int(entry.get("response_body_length") or entry.get("body_length") or (len(response_body) if response_body else 0) or 0)
+    request_body = entry.get("request_body") or entry.get("request_post_data") or entry.get("post_data") or ""
+    request_body_length = int(entry.get("request_body_length") or len(request_body or "") or 0)
+    request_id = entry.get("request_id", entry.get("id"))
+    url = str(entry.get("url") or "")
+    return {
+        "id": entry.get("id"),
+        "request_id": request_id,
+        "network_request_id": entry.get("network_request_id", request_id),
+        "page_id": entry.get("page_id"),
+        "context_id": entry.get("context_id"),
+        "url": url[:240],
+        "url_len": len(url),
+        "method": entry.get("method"),
+        "status": entry.get("status"),
+        "status_code": entry.get("status_code", entry.get("status")),
+        "type": entry.get("resource_type"),
+        "resource_type": entry.get("resource_type"),
+        "ms": entry.get("duration"),
+        "duration_ms": entry.get("duration_ms", entry.get("duration")),
+        "size": response_body_length,
+        "body_length": response_body_length,
+        "request_body_length": request_body_length,
+        "response_body_length": response_body_length,
+        "response_body_available": response_body is not None,
+        "failed": bool(entry.get("failed")),
+        "failure": entry.get("failure", ""),
+        "websocket": bool(entry.get("websocket") or entry.get("resource_type") == "websocket"),
+        "redirected_from": entry.get("redirected_from", ""),
+        "redirect_chain_count": len(entry.get("redirect_chain") or []) if isinstance(entry.get("redirect_chain"), list) else 0,
+    }
+
+
+def _navigation_capture_summary(page_id: str | None, limit: int = _NAVIGATION_CAPTURE_INLINE_LIMIT) -> dict:
+    all_requests = []
+    try:
+        for entry in list(browser_manager._network_requests):
+            if page_id and entry.get("page_id") not in {page_id, None}:
+                continue
+            all_requests.append(entry)
+    except Exception as exc:
+        return {
+            "status": "capture_summary_failed",
+            "error": _safe_text(exc, 500),
+            "requests": [],
+            "count": 0,
+            "returned_count": 0,
+            "total_count": 0,
+            "truncated": False,
+            "capture_compacted": True,
+        }
+    safe_limit = max(0, int(limit or 0))
+    summaries = [_navigation_request_summary(entry) for entry in all_requests[:safe_limit]]
+    return {
+        "status": "captured" if summaries else "empty",
+        "requests": summaries,
+        "count": len(summaries),
+        "returned_count": len(summaries),
+        "total_count": len(all_requests),
+        "truncated": len(all_requests) > len(summaries),
+        "limit": safe_limit,
+        "page_id": page_id,
+        "active": browser_manager._capturing,
+        "capture_compacted": True,
+        "body_access": "browser_network.get_request",
+    }
+
+
+'''
+        text = replace_once(
+            text,
+            "\n\n@mcp.tool()\nasync def navigate(",
+            "\n\n" + helper + "@mcp.tool()\nasync def navigate(",
+            "navigation capture summary helpers",
+        )
+    if "captured_requests.append(dict(entry))" in text:
+        old_block = '''        captured_requests = []
+        try:
+            for entry in list(browser_manager._network_requests):
+                if resolved_page_id and entry.get("page_id") not in {resolved_page_id, None}:
+                    continue
+                captured_requests.append(dict(entry))
+                if len(captured_requests) >= 300:
+                    break
+        except Exception:
+            captured_requests = []
+        if captured_requests:
+            out["network_requests"] = captured_requests
+            out["network_capture"] = {
+                "status": "captured",
+                "requests": captured_requests,
+                "count": len(captured_requests),
+                "page_id": resolved_page_id,
+                "active": browser_manager._capturing,
+            }
+'''
+        new_block = '''        capture_summary = _navigation_capture_summary(resolved_page_id)
+        if capture_summary.get("returned_count", 0) > 0:
+            out["network_requests"] = capture_summary["requests"]
+            out["network_capture"] = capture_summary
+'''
+        text = replace_once(text, old_block, new_block, "navigation compact capture response")
+    if "_navigation_capture_summary" not in text or "capture_compacted" not in text or "body_access" not in text:
+        fail(f"navigation compact capture validation failed {path}")
     return text
 
 
@@ -2099,6 +2258,9 @@ def patch_navigation(path: pathlib.Path) -> None:
 
 def patch_debugging(path: pathlib.Path) -> None:
     text = read_text(path)
+    if "timeout_ms: int = 30000" in text and "_eval_with_budget" in text and "browser_manager.resolve_page(page_id)" in text:
+        write_text(path, text)
+        return
     if "playwright_evaluate_signature" not in text:
         text = replace_once(
             text,
@@ -2257,7 +2419,15 @@ def patch_jsvmp_hooking_diagnostics(path: pathlib.Path, text: str) -> str:
 
 def patch_network(path: pathlib.Path) -> None:
     text = read_text(path)
-    if "_aida_network_hook_counts" in text and "browser_network_initiator_unknown_source" in text and AIDA_INITIATOR_CONTRACT_V2 in text:
+    if (
+        "_aida_network_hook_counts" in text
+        and "browser_network_initiator_unknown_source" in text
+        and AIDA_INITIATOR_CONTRACT_V2 in text
+        and "_NETWORK_DEFAULT_LIMIT" in text
+        and "url_prefix: str | None = None" in text
+        and '"filtered_count"' in text
+        and '"has_more"' in text
+    ):
         return
     if "AIDA_INITIATOR_CONTRACT_V2" not in text:
         insert_pos = 0
@@ -2391,12 +2561,36 @@ def patch_network(path: pathlib.Path) -> None:
             "    url_filter: str | None = None,\n",
             "network list signature",
         )
+    if "url_prefix: str | None = None" not in text:
+        text = replace_once(
+            text,
+            "    url_filter: str | None = None,\n",
+            "    url_filter: str | None = None,\n"
+            "    url_prefix: str | None = None,\n",
+            "network url prefix signature",
+        )
     if "if page_id:\n            reqs = [r for r in reqs if r.get(\"page_id\") == page_id]" not in text:
         text = replace_once(
             text,
             "        if url_filter:\n",
             "        if page_id:\n            reqs = [r for r in reqs if r.get(\"page_id\") == page_id]\n        if url_filter:\n",
             "network page filter",
+        )
+    if "if url_prefix:\n            reqs = [r for r in reqs if str(r.get(\"url\") or \"\").startswith(url_prefix)]" not in text:
+        text = replace_once(
+            text,
+            "        if url_filter:\n            reqs = [r for r in reqs if url_filter in r.get(\"url\", \"\")]\n",
+            "        if url_filter:\n            reqs = [r for r in reqs if url_filter in r.get(\"url\", \"\")]\n"
+            "        if url_prefix:\n            reqs = [r for r in reqs if str(r.get(\"url\") or \"\").startswith(url_prefix)]\n",
+            "network url prefix filter",
+        )
+    if "\"url_prefix\": str(url_prefix or \"\")" not in text:
+        text = replace_once(
+            text,
+            "            \"filter\": str(filter or \"\"),\n",
+            "            \"filter\": str(filter or \"\"),\n"
+            "            \"url_prefix\": str(url_prefix or \"\"),\n",
+            "network url prefix envelope",
         )
     if "\"page_id\": r.get(\"page_id\")" not in text:
         text = replace_once(
@@ -2805,7 +2999,7 @@ async def get_request_initiator(request_id: int, page_id: str | None = None, mar
     )
     if "\"page_id\": r.get(\"page_id\")" not in text or "browser_manager.resolve_page(page_id" not in text:
         fail(f"network validation failed {path}")
-    for marker in ("_aida_network_hook_counts", "request_marker", "fetch_initiator_log_count", "browser_network_initiator_unknown_source", "initiator_contract", AIDA_INITIATOR_CONTRACT_V2):
+    for marker in ("_aida_network_hook_counts", "request_marker", "fetch_initiator_log_count", "browser_network_initiator_unknown_source", "initiator_contract", AIDA_INITIATOR_CONTRACT_V2, "_NETWORK_DEFAULT_LIMIT", "url_prefix: str | None = None", "_request_matches_text_filter", '"filtered_count"', '"returned_count"', '"has_more"'):
         if marker not in text:
             fail(f"network initiator validation missing {marker} in {path}")
     write_text(path, text)
@@ -2918,17 +3112,80 @@ async def _navigation_state(page=None, requested_page_id: str | None = None) -> 
     return text
 
 
+HOOKING_ADD_INIT_SCRIPT = '''@mcp.tool()
+async def add_init_script(
+    script: str,
+    name: str = "",
+    persistent: bool = True,
+    page_id: str | None = None,
+) -> dict:
+    try:
+        if not isinstance(script, str) or not script.strip():
+            return {"error": "script is required"}
+        script_name = name.strip() if isinstance(name, str) and name.strip() else f"inline:{hashlib.sha256(script.encode('utf-8')).hexdigest()[:16]}"
+        page = await browser_manager.resolve_page(page_id)
+        if persistent:
+            await browser_manager.add_persistent_script(script_name, script)
+        else:
+            await page.add_init_script(script=script)
+        if script_name not in browser_manager._init_scripts:
+            browser_manager._init_scripts.append(script_name)
+        warning = None
+        try:
+            await page.evaluate(script)
+        except Exception as e:
+            warning = str(e)
+        out = {
+            "status": "injected",
+            "name": script_name,
+            "persistent": bool(persistent),
+            "context_init": bool(persistent),
+            "page_init": not bool(persistent),
+            "page_id": browser_manager.page_id_for(page) if hasattr(browser_manager, "page_id_for") else page_id,
+            "applied_to_current_page": warning is None,
+            "contexts": len(browser_manager.contexts),
+            "pages": len(browser_manager.pages),
+        }
+        if warning:
+            out["warning"] = f"current page evaluate failed: {warning}"
+        return out
+    except Exception as e:
+        return {"error": str(e)}
+'''
+
+
+def patch_hooking_init_script(path: pathlib.Path, text: str) -> str:
+    markers = (
+        "persistent: bool = True",
+        "page_id: str | None = None",
+        "browser_manager.resolve_page(page_id)",
+        "\"context_init\": bool(persistent)",
+        "\"page_init\": not bool(persistent)",
+    )
+    if all(marker in text for marker in markers):
+        return text
+    pattern = re.compile(
+        r"@mcp\.tool\(\)\nasync def add_init_script\([\s\S]*?\n(?=\n\n@mcp\.tool\(\)\nasync def inject_hook_preset\()"
+    )
+    match = pattern.search(text)
+    if not match:
+        fail(f"hooking add_init_script validation failed {path}")
+    return text[:match.start()] + HOOKING_ADD_INIT_SCRIPT + text[match.end():]
+
+
 def patch_hooking(path: pathlib.Path) -> None:
     text = read_text(path)
+    original_text = text
     updated = patch_jsvmp_hooking_diagnostics(path, text)
     if updated != text:
         text = updated
+    text = patch_hooking_init_script(path, text)
     if "async def get_console_logs(" not in text:
-        if updated != read_text(path):
+        if text != original_text:
             write_text(path, text)
         return
     if "page_id: str | None = None" in text and "log.get(\"page_id\") == page_id" in text:
-        if updated != read_text(path):
+        if text != original_text:
             write_text(path, text)
         return
     text = replace_once(

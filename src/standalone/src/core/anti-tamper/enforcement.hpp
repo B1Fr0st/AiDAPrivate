@@ -748,6 +748,17 @@ inline void enforce_violation_id(uint64_t reason_id, const std::string& extra = 
 inline void enforce_violation(const char* reason, const std::string& extra = "")
 {
     uint64_t rid = aida::reason_ids::reason_id_from_string(reason);
+    if (reason && *reason)
+    {
+        std::string detail = std::string("reason=") + reason;
+        if (!extra.empty())
+        {
+            detail.push_back(' ');
+            detail += extra;
+        }
+        enforce_violation_id(rid, detail);
+        return;
+    }
     enforce_violation_id(rid, extra);
 }
 
