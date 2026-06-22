@@ -103,6 +103,40 @@ std::uint64_t module_base_local(const char* name, bool allow_load = true)
     return reinterpret_cast<std::uint64_t>(mod);
 }
 
+bool dx_call_cancelled(const char* phase, std::uint32_t pid, std::uint64_t started_ms)
+{
+    if (mcp_standalone::current_call_cancelled())
+    {
+        diag::log_tagged_fmt("dx_hook", "cancelled pid=%u phase=%s elapsed_ms=%llu diag_id=%s",
+                             pid,
+                             phase ? phase : "",
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms),
+                             mcp_standalone::current_call_diag_id());
+        return true;
+    }
+    const std::uint64_t deadline = mcp_standalone::current_call_deadline_ms();
+    if (deadline != 0 && GetTickCount64() >= deadline)
+    {
+        diag::log_tagged_fmt("dx_hook", "deadline_reached pid=%u phase=%s elapsed_ms=%llu diag_id=%s",
+                             pid,
+                             phase ? phase : "",
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms),
+                             mcp_standalone::current_call_diag_id());
+        return true;
+    }
+    return false;
+}
+
+bool target_module_loaded(std::uint32_t pid, const char* module_name)
+{
+    const bool loaded = module_name && find_module_by_name(pid, module_name).has_value();
+    diag::log_tagged_fmt("dx_hook", "target_module_loaded pid=%u module=%s loaded=%d",
+                         pid,
+                         module_name ? module_name : "",
+                         loaded ? 1 : 0);
+    return loaded;
+}
+
 std::uint64_t map_local_to_target(std::uint32_t pid, const char* module_name, std::uint64_t local_va, bool allow_local_load = true)
 {
     const std::uint64_t started_ms = GetTickCount64();
@@ -147,6 +181,114 @@ std::uint64_t map_local_to_target(std::uint32_t pid, const char* module_name, st
                          sa_format_address(target).c_str(),
                          static_cast<unsigned long long>(GetTickCount64() - started_ms));
     return target;
+}
+
+struct local_owner_t
+{
+    bool ok = false;
+    std::string module_name;
+    std::string module_path;
+    std::uint64_t base = 0;
+    std::uint64_t rva = 0;
+};
+
+std::string filename_leaf(const char* path)
+{
+    if (!path || !*path)
+        return {};
+    const char* slash = std::strrchr(path, '\\');
+    const char* fslash = std::strrchr(path, '/');
+    const char* leaf = slash && fslash ? std::max(slash, fslash) + 1 : (slash ? slash + 1 : (fslash ? fslash + 1 : path));
+    return leaf && *leaf ? std::string(leaf) : std::string(path);
+}
+
+local_owner_t local_owner_for_address(std::uint64_t local_va)
+{
+    local_owner_t owner;
+    if (local_va == 0)
+        return owner;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(reinterpret_cast<const void*>(local_va), &mbi, sizeof(mbi)) != sizeof(mbi) || !mbi.AllocationBase)
+    {
+        diag::log_tagged_fmt("dx_hook", "local_owner query_failed local_va=%s gle=%lu",
+                             sa_format_address(local_va).c_str(),
+                             static_cast<unsigned long>(GetLastError()));
+        return owner;
+    }
+    char path[MAX_PATH] = {};
+    const DWORD len = GetModuleFileNameA(reinterpret_cast<HMODULE>(mbi.AllocationBase), path, static_cast<DWORD>(sizeof(path)));
+    if (len == 0)
+    {
+        diag::log_tagged_fmt("dx_hook", "local_owner module_name_failed local_va=%s allocation_base=%s gle=%lu",
+                             sa_format_address(local_va).c_str(),
+                             sa_format_address(reinterpret_cast<std::uint64_t>(mbi.AllocationBase)).c_str(),
+                             static_cast<unsigned long>(GetLastError()));
+        return owner;
+    }
+    owner.ok = true;
+    owner.module_path.assign(path, path + std::min<DWORD>(len, static_cast<DWORD>(sizeof(path) - 1)));
+    owner.module_name = filename_leaf(owner.module_path.c_str());
+    owner.base = reinterpret_cast<std::uint64_t>(mbi.AllocationBase);
+    owner.rva = local_va >= owner.base ? local_va - owner.base : 0;
+    diag::log_tagged_fmt("dx_hook", "local_owner resolved local_va=%s owner_module=%s owner_base=%s owner_rva=%s path='%s'",
+                         sa_format_address(local_va).c_str(),
+                         owner.module_name.c_str(),
+                         sa_format_address(owner.base).c_str(),
+                         sa_format_address(owner.rva).c_str(),
+                         owner.module_path.c_str());
+    return owner;
+}
+
+std::uint64_t map_local_slot_to_target(std::uint32_t pid,
+                                       const char* slot_name,
+                                       std::uint32_t slot,
+                                       std::uint64_t local_va,
+                                       const char* fallback_module,
+                                       bool allow_fallback_load,
+                                       std::string& module_name)
+{
+    const std::uint64_t started_ms = GetTickCount64();
+    const local_owner_t owner = local_owner_for_address(local_va);
+    if (owner.ok && !owner.module_name.empty())
+    {
+        module_name = owner.module_name;
+        auto target_module = find_module_by_name(pid, owner.module_name);
+        const bool rva_in_range = target_module && owner.rva < static_cast<std::uint64_t>(target_module->size);
+        const std::uint64_t target_va = rva_in_range ? target_module->base + owner.rva : 0;
+        diag::log_tagged_fmt("dx_hook",
+                             "map_local_slot owner_map pid=%u name=%s slot=%u local_va=%s owner_module=%s owner_rva=%s target_module_match=%d target_base=%s target_size=%llu target_va=%s elapsed_ms=%llu",
+                             pid,
+                             slot_name ? slot_name : "",
+                             slot,
+                             sa_format_address(local_va).c_str(),
+                             owner.module_name.c_str(),
+                             sa_format_address(owner.rva).c_str(),
+                             target_module ? 1 : 0,
+                             target_module ? sa_format_address(target_module->base).c_str() : "0x0",
+                             target_module ? static_cast<unsigned long long>(target_module->size) : 0ull,
+                             sa_format_address(target_va).c_str(),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        if (target_va != 0)
+            return target_va;
+    }
+
+    if (!fallback_module || !*fallback_module)
+        return 0;
+    if (owner.ok && _stricmp(owner.module_name.c_str(), fallback_module) == 0)
+        return 0;
+    module_name = fallback_module;
+    const std::uint64_t fallback = map_local_to_target(pid, fallback_module, local_va, allow_fallback_load);
+    diag::log_tagged_fmt("dx_hook",
+                         "map_local_slot fallback_map pid=%u name=%s slot=%u local_va=%s fallback_module=%s target_va=%s allow_load=%d elapsed_ms=%llu",
+                         pid,
+                         slot_name ? slot_name : "",
+                         slot,
+                         sa_format_address(local_va).c_str(),
+                         fallback_module,
+                         sa_format_address(fallback).c_str(),
+                         allow_fallback_load ? 1 : 0,
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
+    return fallback;
 }
 
 std::string local_prologue_hint(std::uint64_t local_va)
@@ -734,17 +876,18 @@ std::vector<slot_entry_t> discover_d3d11_from_live_context(std::uint32_t pid)
     {
         for (const auto& [name, index] : d3d11_context_slots())
         {
+            if (dx_call_cancelled("discover_d3d11_live_slots", pid, started_ms))
+                break;
             slot_entry_t entry;
             entry.name = name;
             entry.slot = index;
             entry.local_va = vtable[index];
-            entry.module_name = "d3d11.dll";
             diag::log_tagged_fmt("dx_hook", "discover_d3d11_live slot_begin pid=%u name=%s index=%u local_va=%s",
                                  pid,
                                  entry.name.c_str(),
                                  entry.slot,
                                  sa_format_address(entry.local_va).c_str());
-            entry.target_va = map_local_to_target(pid, "d3d11.dll", entry.local_va, false);
+            entry.target_va = map_local_slot_to_target(pid, entry.name.c_str(), entry.slot, entry.local_va, "d3d11.dll", false, entry.module_name);
             finalize_slot(pid, entry);
             diag::log_tagged_fmt("dx_hook", "discover_d3d11_live slot_end pid=%u name=%s index=%u target_va=%s validated=%d hint=%s",
                                  pid,
@@ -777,6 +920,8 @@ std::vector<slot_entry_t> discover_d3d11(std::uint32_t pid, bool allow_dummy_dev
                          allow_dummy_device ? 1 : 0);
     std::vector<slot_entry_t> slots;
     auto live_slots = discover_d3d11_from_live_context(pid);
+    if (dx_call_cancelled("discover_d3d11_after_live", pid, started_ms))
+        return live_slots;
     if (!live_slots.empty() && resolved_slot_count(live_slots) != 0)
     {
         diag::log_tagged_fmt("dx_hook", "discover_d3d11 live_exit pid=%u slots=%zu resolved=%zu elapsed_ms=%llu",
@@ -797,6 +942,8 @@ std::vector<slot_entry_t> discover_d3d11(std::uint32_t pid, bool allow_dummy_dev
                              static_cast<unsigned long long>(GetTickCount64() - started_ms));
         return slots;
     }
+    if (dx_call_cancelled("discover_d3d11_before_load", pid, started_ms))
+        return slots;
     SetLastError(ERROR_SUCCESS);
     diag::log_tagged_fmt("dx_hook", "discover_d3d11 load_begin pid=%u module=d3d11.dll elapsed_ms=%llu",
                          pid,
@@ -891,6 +1038,8 @@ std::vector<slot_entry_t> discover_d3d11(std::uint32_t pid, bool allow_dummy_dev
     slots.clear();
     for (const auto& [name, index] : d3d11_context_slots())
     {
+        if (dx_call_cancelled("discover_d3d11_dummy_slots", pid, started_ms))
+            break;
         slot_entry_t entry;
         entry.name = name;
         entry.slot = index;
@@ -900,8 +1049,7 @@ std::vector<slot_entry_t> discover_d3d11(std::uint32_t pid, bool allow_dummy_dev
                              entry.name.c_str(),
                              entry.slot,
                              sa_format_address(entry.local_va).c_str());
-        entry.target_va = map_local_to_target(pid, "d3d11.dll", entry.local_va);
-        entry.module_name = "d3d11.dll";
+        entry.target_va = map_local_slot_to_target(pid, entry.name.c_str(), entry.slot, entry.local_va, "d3d11.dll", true, entry.module_name);
         finalize_slot(pid, entry);
         diag::log_tagged_fmt("dx_hook", "discover_d3d11 dummy_slot_end pid=%u name=%s index=%u target_va=%s validated=%d hint=%s",
                              pid,
@@ -929,27 +1077,145 @@ std::vector<slot_entry_t> discover_d3d11(std::uint32_t pid, bool allow_dummy_dev
     return slots;
 }
 
-std::vector<slot_entry_t> discover_d3d12(std::uint32_t pid)
+std::vector<slot_entry_t> discover_d3d12(std::uint32_t pid, bool allow_dummy_device = true)
 {
+    const std::uint64_t started_ms = GetTickCount64();
     std::vector<slot_entry_t> slots;
+    diag::log_tagged_fmt("dx_hook", "discover_d3d12 enter pid=%u tid=%lu allow_dummy_device=%d",
+                         pid,
+                         static_cast<unsigned long>(GetCurrentThreadId()),
+                         allow_dummy_device ? 1 : 0);
+    if (!allow_dummy_device)
+    {
+        diag::log_tagged_fmt("dx_hook", "discover_d3d12 dummy_skipped pid=%u elapsed_ms=%llu",
+                             pid,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        diag::log_tagged_fmt("dx_hook", "discover_d3d12 exit pid=%u slots=0 resolved=0 elapsed_ms=%llu",
+                             pid,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        return slots;
+    }
+    if (dx_call_cancelled("discover_d3d12_before_load", pid, started_ms))
+    {
+        diag::log_tagged_fmt("dx_hook", "discover_d3d12 exit pid=%u slots=0 resolved=0 cancelled=1 elapsed_ms=%llu",
+                             pid,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        return slots;
+    }
+    SetLastError(ERROR_SUCCESS);
+    diag::log_tagged_fmt("dx_hook", "discover_d3d12 load_begin pid=%u module=d3d12.dll elapsed_ms=%llu",
+                         pid,
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     HMODULE d3d12 = LoadLibraryA("d3d12.dll");
+    diag::log_tagged_fmt("dx_hook", "discover_d3d12 load_end pid=%u module=d3d12.dll base=%s gle=%lu elapsed_ms=%llu",
+                         pid,
+                         sa_format_address(reinterpret_cast<std::uint64_t>(d3d12)).c_str(),
+                         static_cast<unsigned long>(GetLastError()),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     if (!d3d12)
+    {
+        diag::log_tagged_fmt("dx_hook", "discover_d3d12 load_failed pid=%u gle=%lu elapsed_ms=%llu",
+                             pid,
+                             static_cast<unsigned long>(GetLastError()),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        diag::log_tagged_fmt("dx_hook", "discover_d3d12 exit pid=%u slots=0 resolved=0 elapsed_ms=%llu",
+                             pid,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
         return slots;
+    }
+    if (dx_call_cancelled("discover_d3d12_before_proc", pid, started_ms))
+    {
+        diag::log_tagged_fmt("dx_hook", "discover_d3d12 exit pid=%u slots=0 resolved=0 cancelled=1 elapsed_ms=%llu",
+                             pid,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        return slots;
+    }
+    SetLastError(ERROR_SUCCESS);
+    diag::log_tagged_fmt("dx_hook", "discover_d3d12 proc_begin pid=%u proc=D3D12CreateDevice elapsed_ms=%llu",
+                         pid,
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     auto create_device = reinterpret_cast<pfn_d3d12_create_device_t>(GetProcAddress(d3d12, "D3D12CreateDevice"));
+    diag::log_tagged_fmt("dx_hook", "discover_d3d12 proc_end pid=%u proc=D3D12CreateDevice addr=%p gle=%lu elapsed_ms=%llu",
+                         pid,
+                         reinterpret_cast<void*>(create_device),
+                         static_cast<unsigned long>(GetLastError()),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     if (!create_device)
+    {
+        diag::log_tagged_fmt("dx_hook", "discover_d3d12 proc_missing pid=%u gle=%lu elapsed_ms=%llu",
+                             pid,
+                             static_cast<unsigned long>(GetLastError()),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        diag::log_tagged_fmt("dx_hook", "discover_d3d12 exit pid=%u slots=0 resolved=0 elapsed_ms=%llu",
+                             pid,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
         return slots;
+    }
     ID3D12Device* device = nullptr;
+    const std::uint64_t create_start_ms = GetTickCount64();
+    diag::log_tagged_fmt("dx_hook", "discover_d3d12 device_create_begin pid=%u feature=0x%08X elapsed_ms=%llu",
+                         pid,
+                         static_cast<unsigned>(D3D_FEATURE_LEVEL_11_0),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     HRESULT hr = create_device(nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), reinterpret_cast<void**>(&device));
+    const std::uint64_t create_elapsed_ms = GetTickCount64() - create_start_ms;
+    diag::log_tagged_fmt("dx_hook", "discover_d3d12 device_create_end pid=%u hr=0x%08lX device=%p create_ms=%llu elapsed_ms=%llu",
+                         pid,
+                         static_cast<unsigned long>(hr),
+                         device,
+                         static_cast<unsigned long long>(create_elapsed_ms),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     if (FAILED(hr) || !device)
+    {
+        diag::log_tagged_fmt("dx_hook", "discover_d3d12 create_failed pid=%u hr=0x%08lX device=%d elapsed_ms=%llu",
+                             pid,
+                             static_cast<unsigned long>(hr),
+                             device ? 1 : 0,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        diag::log_tagged_fmt("dx_hook", "discover_d3d12 exit pid=%u slots=0 resolved=0 elapsed_ms=%llu",
+                             pid,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
         return slots;
+    }
+    if (dx_call_cancelled("discover_d3d12_after_device", pid, started_ms))
+    {
+        device->Release();
+        diag::log_tagged_fmt("dx_hook", "discover_d3d12 exit pid=%u slots=0 resolved=0 cancelled=1 elapsed_ms=%llu",
+                             pid,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        return slots;
+    }
     ID3D12CommandAllocator* alloc = nullptr;
     ID3D12GraphicsCommandList* list = nullptr;
+    diag::log_tagged_fmt("dx_hook", "discover_d3d12 allocator_create_begin pid=%u elapsed_ms=%llu",
+                         pid,
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator), reinterpret_cast<void**>(&alloc));
+    diag::log_tagged_fmt("dx_hook", "discover_d3d12 allocator_create_end pid=%u hr=0x%08lX alloc=%p elapsed_ms=%llu",
+                         pid,
+                         static_cast<unsigned long>(hr),
+                         alloc,
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     if (SUCCEEDED(hr) && alloc)
+    {
+        diag::log_tagged_fmt("dx_hook", "discover_d3d12 command_list_create_begin pid=%u elapsed_ms=%llu",
+                             pid,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
         hr = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, nullptr, __uuidof(ID3D12GraphicsCommandList), reinterpret_cast<void**>(&list));
+        diag::log_tagged_fmt("dx_hook", "discover_d3d12 command_list_create_end pid=%u hr=0x%08lX list=%p elapsed_ms=%llu",
+                             pid,
+                             static_cast<unsigned long>(hr),
+                             list,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
+    }
     if (SUCCEEDED(hr) && list)
     {
         auto vtable = *reinterpret_cast<std::uint64_t**>(list);
+        diag::log_tagged_fmt("dx_hook", "discover_d3d12 vtable pid=%u list=%p vtable=%p elapsed_ms=%llu",
+                             pid,
+                             list,
+                             vtable,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
         std::map<std::string, std::uint32_t> wanted = {
             {"DrawInstanced", 12},
             {"DrawIndexedInstanced", 13},
@@ -959,29 +1225,79 @@ std::vector<slot_entry_t> discover_d3d12(std::uint32_t pid)
         };
         for (const auto& [name, index] : wanted)
         {
+            if (dx_call_cancelled("discover_d3d12_slots", pid, started_ms))
+                break;
             slot_entry_t entry;
             entry.name = name;
             entry.slot = index;
             entry.local_va = vtable[index];
-            entry.target_va = map_local_to_target(pid, "d3d12.dll", entry.local_va);
-            entry.module_name = "d3d12.dll";
+            diag::log_tagged_fmt("dx_hook", "discover_d3d12 slot_begin pid=%u name=%s index=%u local_va=%s",
+                                 pid,
+                                 entry.name.c_str(),
+                                 entry.slot,
+                                 sa_format_address(entry.local_va).c_str());
+            entry.target_va = map_local_slot_to_target(pid, entry.name.c_str(), entry.slot, entry.local_va, "d3d12.dll", true, entry.module_name);
             finalize_slot(pid, entry);
+            diag::log_tagged_fmt("dx_hook", "discover_d3d12 slot_end pid=%u name=%s index=%u target_va=%s validated=%d hint=%s",
+                                 pid,
+                                 entry.name.c_str(),
+                                 entry.slot,
+                                 sa_format_address(entry.target_va).c_str(),
+                                 entry.validated ? 1 : 0,
+                                 entry.hint.c_str());
             slots.push_back(std::move(entry));
         }
     }
+    else
+    {
+        diag::log_tagged_fmt("dx_hook", "discover_d3d12 command_list_unavailable pid=%u hr=0x%08lX alloc=%p list=%p elapsed_ms=%llu",
+                             pid,
+                             static_cast<unsigned long>(hr),
+                             alloc,
+                             list,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
+    }
+    diag::log_tagged_fmt("dx_hook", "discover_d3d12 cleanup_begin pid=%u list=%p alloc=%p device=%p",
+                         pid,
+                         list,
+                         alloc,
+                         device);
     if (list) list->Release();
     if (alloc) alloc->Release();
     device->Release();
+    diag::log_tagged_fmt("dx_hook", "discover_d3d12 exit pid=%u slots=%zu resolved=%zu elapsed_ms=%llu",
+                         pid,
+                         slots.size(),
+                         resolved_slot_count(slots),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     return slots;
 }
 
-std::vector<slot_entry_t> discover_dxgi_present(std::uint32_t pid)
+std::vector<slot_entry_t> discover_dxgi_present(std::uint32_t pid, bool allow_dummy_swapchain = true)
 {
     const std::uint64_t started_ms = GetTickCount64();
-    diag::log_tagged_fmt("dx_hook", "discover_dxgi_present enter pid=%u tid=%lu",
+    diag::log_tagged_fmt("dx_hook", "discover_dxgi_present enter pid=%u tid=%lu allow_dummy_swapchain=%d",
                          pid,
-                         static_cast<unsigned long>(GetCurrentThreadId()));
+                         static_cast<unsigned long>(GetCurrentThreadId()),
+                         allow_dummy_swapchain ? 1 : 0);
     std::vector<slot_entry_t> slots;
+    if (!allow_dummy_swapchain)
+    {
+        diag::log_tagged_fmt("dx_hook", "discover_dxgi_present dummy_skipped pid=%u elapsed_ms=%llu",
+                             pid,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        diag::log_tagged_fmt("dx_hook", "discover_dxgi_present exit pid=%u local_va=0x0 target_va=0x0 hint=dummy_skipped elapsed_ms=%llu",
+                             pid,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        return slots;
+    }
+    if (dx_call_cancelled("discover_dxgi_present_before_load", pid, started_ms))
+    {
+        diag::log_tagged_fmt("dx_hook", "discover_dxgi_present exit pid=%u local_va=0x0 target_va=0x0 hint=cancelled elapsed_ms=%llu",
+                             pid,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        return slots;
+    }
     SetLastError(ERROR_SUCCESS);
     diag::log_tagged_fmt("dx_hook", "discover_dxgi_present load_begin pid=%u module=d3d11.dll elapsed_ms=%llu",
                          pid,
@@ -1008,6 +1324,13 @@ std::vector<slot_entry_t> discover_dxgi_present(std::uint32_t pid)
     entry.module_name = "dxgi.dll";
     if (create_swap_chain)
     {
+        if (dx_call_cancelled("discover_dxgi_present_before_window", pid, started_ms))
+        {
+            diag::log_tagged_fmt("dx_hook", "discover_dxgi_present exit pid=%u local_va=0x0 target_va=0x0 hint=cancelled elapsed_ms=%llu",
+                                 pid,
+                                 static_cast<unsigned long long>(GetTickCount64() - started_ms));
+            return slots;
+        }
         const char* cls = "AiDA_RE_DummySwapChainWindow";
         WNDCLASSA wc{};
         wc.lpfnWndProc = DefWindowProcA;
@@ -1055,6 +1378,8 @@ std::vector<slot_entry_t> discover_dxgi_present(std::uint32_t pid)
             const D3D_DRIVER_TYPE drivers[] = {D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP, D3D_DRIVER_TYPE_REFERENCE};
             for (D3D_DRIVER_TYPE driver_type : drivers)
             {
+                if (dx_call_cancelled("discover_dxgi_present_create_loop", pid, started_ms))
+                    break;
                 const std::uint64_t create_start_ms = GetTickCount64();
                 diag::log_tagged_fmt("dx_hook", "discover_dxgi_present create_begin pid=%u driver_type=%u hwnd=%p elapsed_ms=%llu",
                                      pid,
@@ -1088,7 +1413,7 @@ std::vector<slot_entry_t> discover_dxgi_present(std::uint32_t pid)
                     diag::log_tagged_fmt("dx_hook", "discover_dxgi_present slot_map_begin pid=%u local_va=%s module=dxgi.dll",
                                          pid,
                                          sa_format_address(entry.local_va).c_str());
-                    entry.target_va = map_local_to_target(pid, "dxgi.dll", entry.local_va);
+                    entry.target_va = map_local_slot_to_target(pid, entry.name.c_str(), entry.slot, entry.local_va, "dxgi.dll", true, entry.module_name);
                     finalize_slot(pid, entry);
                     diag::log_tagged_fmt("dx_hook", "discover_dxgi_present slot_map_end pid=%u local_va=%s target_va=%s validated=%d hint=%s",
                                          pid,
@@ -1146,25 +1471,63 @@ std::vector<slot_entry_t> discover_dxgi_present(std::uint32_t pid)
     return slots;
 }
 
-std::vector<slot_entry_t> discover_vulkan(std::uint32_t pid)
+std::vector<slot_entry_t> discover_vulkan(std::uint32_t pid, bool allow_local_load = true)
 {
+    const std::uint64_t started_ms = GetTickCount64();
+    diag::log_tagged_fmt("dx_hook", "discover_vulkan enter pid=%u tid=%lu allow_local_load=%d",
+                         pid,
+                         static_cast<unsigned long>(GetCurrentThreadId()),
+                         allow_local_load ? 1 : 0);
     std::vector<slot_entry_t> slots;
-    HMODULE vulkan = LoadLibraryA("vulkan-1.dll");
     auto target = find_module_by_name(pid, "vulkan-1.dll");
+    diag::log_tagged_fmt("dx_hook", "discover_vulkan target_module pid=%u loaded=%d base=%s size=%llu elapsed_ms=%llu",
+                         pid,
+                         target ? 1 : 0,
+                         target ? sa_format_address(target->base).c_str() : "0x0",
+                         target ? static_cast<unsigned long long>(target->size) : 0ull,
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
+    HMODULE vulkan = reinterpret_cast<HMODULE>(module_base_local("vulkan-1.dll", allow_local_load));
+    if (!vulkan && dx_call_cancelled("discover_vulkan_load", pid, started_ms))
+        return slots;
     const char* names[] = {"vkQueuePresentKHR", "vkCmdDraw", "vkCmdDrawIndexed"};
     for (const char* name : names)
     {
+        if (dx_call_cancelled("discover_vulkan_exports", pid, started_ms))
+            break;
         slot_entry_t entry;
         entry.name = name;
         entry.module_name = "vulkan-1.dll";
+        SetLastError(ERROR_SUCCESS);
+        diag::log_tagged_fmt("dx_hook", "discover_vulkan proc_begin pid=%u export=%s elapsed_ms=%llu",
+                             pid,
+                             name,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
         entry.local_va = vulkan ? reinterpret_cast<std::uint64_t>(GetProcAddress(vulkan, name)) : 0;
-        entry.target_va = entry.local_va != 0 ? map_local_to_target(pid, "vulkan-1.dll", entry.local_va) : 0;
+        diag::log_tagged_fmt("dx_hook", "discover_vulkan proc_end pid=%u export=%s local_va=%s gle=%lu elapsed_ms=%llu",
+                             pid,
+                             name,
+                             sa_format_address(entry.local_va).c_str(),
+                             static_cast<unsigned long>(GetLastError()),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        entry.target_va = entry.local_va != 0 ? map_local_slot_to_target(pid, entry.name.c_str(), entry.slot, entry.local_va, "vulkan-1.dll", allow_local_load, entry.module_name) : 0;
         if (target)
             finalize_slot(pid, entry);
         else
             entry.hint = "vulkan_not_loaded_in_target";
+        diag::log_tagged_fmt("dx_hook", "discover_vulkan slot_end pid=%u export=%s local_va=%s target_va=%s validated=%d hint=%s",
+                             pid,
+                             entry.name.c_str(),
+                             sa_format_address(entry.local_va).c_str(),
+                             sa_format_address(entry.target_va).c_str(),
+                             entry.validated ? 1 : 0,
+                             entry.hint.c_str());
         slots.push_back(std::move(entry));
     }
+    diag::log_tagged_fmt("dx_hook", "discover_vulkan exit pid=%u slots=%zu resolved=%zu elapsed_ms=%llu",
+                         pid,
+                         slots.size(),
+                         resolved_slot_count(slots),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     return slots;
 }
 
@@ -1184,15 +1547,30 @@ json slots_to_result(std::uint32_t pid, const std::string& api, const std::vecto
 std::vector<slot_entry_t> discover_api(std::uint32_t pid, const std::string& api, bool allow_dummy_device = true)
 {
     if (api == "d3d11") return discover_d3d11(pid, allow_dummy_device);
-    if (api == "d3d12") return discover_d3d12(pid);
-    if (api == "vulkan") return discover_vulkan(pid);
+    if (api == "d3d12") return discover_d3d12(pid, allow_dummy_device);
+    if (api == "dxgi") return discover_dxgi_present(pid, allow_dummy_device);
+    if (api == "vulkan") return discover_vulkan(pid, allow_dummy_device);
     std::vector<slot_entry_t> out;
-    auto d3d11 = discover_d3d11(pid, allow_dummy_device);
-    auto d3d12 = discover_d3d12(pid);
-    auto vk = discover_vulkan(pid);
-    out.insert(out.end(), d3d11.begin(), d3d11.end());
-    out.insert(out.end(), d3d12.begin(), d3d12.end());
-    out.insert(out.end(), vk.begin(), vk.end());
+    if (target_module_loaded(pid, "d3d11.dll"))
+    {
+        auto d3d11 = discover_d3d11(pid, allow_dummy_device);
+        out.insert(out.end(), d3d11.begin(), d3d11.end());
+    }
+    if (target_module_loaded(pid, "d3d12.dll"))
+    {
+        auto d3d12 = discover_d3d12(pid, allow_dummy_device);
+        out.insert(out.end(), d3d12.begin(), d3d12.end());
+    }
+    if (target_module_loaded(pid, "dxgi.dll"))
+    {
+        auto dxgi = discover_dxgi_present(pid, allow_dummy_device);
+        out.insert(out.end(), dxgi.begin(), dxgi.end());
+    }
+    if (target_module_loaded(pid, "vulkan-1.dll"))
+    {
+        auto vk = discover_vulkan(pid, allow_dummy_device);
+        out.insert(out.end(), vk.begin(), vk.end());
+    }
     return out;
 }
 
@@ -1321,7 +1699,7 @@ std::optional<slot_entry_t> choose_hook_target(std::uint32_t pid, const std::str
     }
     if (action == "present")
     {
-        auto present = discover_dxgi_present(pid);
+        auto present = discover_dxgi_present(pid, api != "auto");
         if (!present.empty() && present.front().target_va != 0)
         {
             diag::log_tagged_fmt("dx_hook", "choose_hook_target present_exact pid=%u api=%s target=%s elapsed_ms=%llu",
@@ -1332,7 +1710,7 @@ std::optional<slot_entry_t> choose_hook_target(std::uint32_t pid, const std::str
             return present.front();
         }
     }
-    auto slots = discover_api(pid, api);
+    auto slots = discover_api(pid, api, api != "auto");
     diag::log_tagged_fmt("dx_hook", "choose_hook_target slots pid=%u api=%s action=%s slots=%zu resolved=%zu elapsed_ms=%llu",
                          pid,
                          api.c_str(),
@@ -1389,16 +1767,148 @@ json dx_record_json(const store::dx_hook_record_t& record)
     return out;
 }
 
+struct matrix_eval_t
+{
+    bool plausible = false;
+    bool view_like = false;
+    bool projection_like = false;
+    bool viewproj_like = false;
+    double score = 0.0;
+    double determinant = 0.0;
+    double orthogonality_error = 1.0;
+    std::string reason;
+    std::string type;
+};
+
+double vec3_norm(float a, float b, float c)
+{
+    return std::sqrt(static_cast<double>(a) * a + static_cast<double>(b) * b + static_cast<double>(c) * c);
+}
+
+double vec3_dot(float ax, float ay, float az, float bx, float by, float bz)
+{
+    return static_cast<double>(ax) * bx + static_cast<double>(ay) * by + static_cast<double>(az) * bz;
+}
+
+double det3x3_rows(const float* f)
+{
+    return static_cast<double>(f[0]) * (static_cast<double>(f[5]) * f[10] - static_cast<double>(f[6]) * f[9]) -
+           static_cast<double>(f[1]) * (static_cast<double>(f[4]) * f[10] - static_cast<double>(f[6]) * f[8]) +
+           static_cast<double>(f[2]) * (static_cast<double>(f[4]) * f[9] - static_cast<double>(f[5]) * f[8]);
+}
+
+matrix_eval_t evaluate_matrix4x4(const float* f, double world_max)
+{
+    matrix_eval_t eval;
+    double max_abs = 0.0;
+    int near_zero = 0;
+    for (int i = 0; i < 16; ++i)
+    {
+        if (!std::isfinite(f[i]))
+        {
+            eval.reason = "nonfinite";
+            return eval;
+        }
+        const double av = std::fabs(static_cast<double>(f[i]));
+        max_abs = std::max(max_abs, av);
+        if (av < 0.000001)
+            ++near_zero;
+    }
+    const double max_component = std::max<double>(world_max * 4.0, 1000000.0);
+    if (max_abs <= 0.000001)
+    {
+        eval.reason = "all_zero";
+        return eval;
+    }
+    if (max_abs > max_component)
+    {
+        eval.reason = "component_out_of_range";
+        return eval;
+    }
+    if (near_zero >= 15)
+    {
+        eval.reason = "too_sparse";
+        return eval;
+    }
+
+    const double r0 = vec3_norm(f[0], f[1], f[2]);
+    const double r1 = vec3_norm(f[4], f[5], f[6]);
+    const double r2 = vec3_norm(f[8], f[9], f[10]);
+    const double c0 = vec3_norm(f[0], f[4], f[8]);
+    const double c1 = vec3_norm(f[1], f[5], f[9]);
+    const double c2 = vec3_norm(f[2], f[6], f[10]);
+    const double min_axis = std::min({r0, r1, r2, c0, c1, c2});
+    const double max_axis = std::max({r0, r1, r2, c0, c1, c2});
+    if (min_axis < 0.0001 || max_axis > 10000.0)
+    {
+        eval.reason = "axis_norm_out_of_range";
+        return eval;
+    }
+
+    const double d01 = std::fabs(vec3_dot(f[0], f[1], f[2], f[4], f[5], f[6]) / std::max(0.000001, r0 * r1));
+    const double d02 = std::fabs(vec3_dot(f[0], f[1], f[2], f[8], f[9], f[10]) / std::max(0.000001, r0 * r2));
+    const double d12 = std::fabs(vec3_dot(f[4], f[5], f[6], f[8], f[9], f[10]) / std::max(0.000001, r1 * r2));
+    eval.orthogonality_error = std::max({d01, d02, d12});
+    eval.determinant = det3x3_rows(f);
+    const double abs_det = std::fabs(eval.determinant);
+
+    const bool translation_ok = std::fabs(static_cast<double>(f[12])) <= world_max &&
+                                std::fabs(static_cast<double>(f[13])) <= world_max &&
+                                std::fabs(static_cast<double>(f[14])) <= world_max;
+    if (!translation_ok)
+    {
+        eval.reason = "translation_out_of_range";
+        return eval;
+    }
+
+    const bool row_view_norms = r0 >= 0.35 && r0 <= 3.25 && r1 >= 0.35 && r1 <= 3.25 && r2 >= 0.35 && r2 <= 3.25;
+    const bool col_view_norms = c0 >= 0.35 && c0 <= 3.25 && c1 >= 0.35 && c1 <= 3.25 && c2 >= 0.35 && c2 <= 3.25;
+    eval.view_like = row_view_norms && col_view_norms && eval.orthogonality_error <= 0.35 && abs_det >= 0.05 && abs_det <= 8.0 && std::fabs(static_cast<double>(f[15]) - 1.0) <= 0.10;
+
+    const double perspective_terms = std::fabs(static_cast<double>(f[3])) + std::fabs(static_cast<double>(f[7])) + std::fabs(static_cast<double>(f[11]));
+    const bool projection_diag = std::fabs(static_cast<double>(f[0])) >= 0.0001 && std::fabs(static_cast<double>(f[5])) >= 0.0001;
+    const bool projection_tail = std::fabs(static_cast<double>(f[15])) <= 0.10 &&
+                                 (std::fabs(static_cast<double>(f[11])) >= 0.10 || std::fabs(static_cast<double>(f[14])) >= 0.0001);
+    const bool projection_zero_shape = std::fabs(static_cast<double>(f[1])) + std::fabs(static_cast<double>(f[2])) +
+                                       std::fabs(static_cast<double>(f[4])) + std::fabs(static_cast<double>(f[6])) <=
+                                       std::max(0.75, (std::fabs(static_cast<double>(f[0])) + std::fabs(static_cast<double>(f[5]))) * 0.35);
+    eval.projection_like = projection_diag && projection_tail && projection_zero_shape;
+    eval.viewproj_like = !eval.view_like && !eval.projection_like && perspective_terms >= 0.10 && abs_det >= 0.00000001 && max_axis <= 10000.0;
+
+    if (!eval.view_like && !eval.projection_like && !eval.viewproj_like)
+    {
+        eval.reason = "shape_rejected";
+        return eval;
+    }
+
+    eval.plausible = true;
+    eval.reason = "accepted";
+    eval.score = 0.45;
+    if (eval.view_like)
+    {
+        eval.type = "view";
+        eval.score += 0.25;
+    }
+    else if (eval.projection_like)
+    {
+        eval.type = "projection";
+        eval.score += 0.20;
+    }
+    else
+    {
+        eval.type = "viewproj";
+        eval.score += 0.15;
+    }
+    eval.score += std::max(0.0, 0.20 - eval.orthogonality_error * 0.20);
+    if (abs_det >= 0.10 && abs_det <= 4.0)
+        eval.score += 0.08;
+    eval.score = std::min(0.98, eval.score);
+    return eval;
+}
+
 bool plausible_matrix4x4(const float* f, double world_max)
 {
-    if (!std::isfinite(f[0]) || !std::isfinite(f[5]) || !std::isfinite(f[10]) || !std::isfinite(f[15]))
-        return false;
-    const float r0 = std::sqrt(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);
-    const float r1 = std::sqrt(f[4] * f[4] + f[5] * f[5] + f[6] * f[6]);
-    const float r2 = std::sqrt(f[8] * f[8] + f[9] * f[9] + f[10] * f[10]);
-    const bool rows = r0 > 0.5f && r0 < 2.0f && r1 > 0.5f && r1 < 2.0f && r2 > 0.5f && r2 < 2.0f;
-    const bool translation = std::fabs(f[12]) <= world_max && std::fabs(f[13]) <= world_max && std::fabs(f[14]) <= world_max;
-    return rows && translation;
+    return evaluate_matrix4x4(f, world_max).plausible;
 }
 
 json preview_floats(const std::vector<std::uint8_t>& bytes)
@@ -1644,11 +2154,14 @@ void collect_resource_array_candidates(std::uint32_t pid,
 
 json scan_memory_cbuffer_candidates(std::uint32_t pid, std::size_t limit, double world_max, std::size_t max_regions)
 {
+    const std::uint64_t started_ms = GetTickCount64();
     json out = json::array();
     std::set<std::uint64_t> seen;
     std::size_t scanned_regions = 0;
     for (const auto& region : regions_for(pid, 4096))
     {
+        if (dx_call_cancelled("scan_memory_cbuffer_candidates_regions", pid, started_ms))
+            break;
         if (out.size() >= limit || scanned_regions >= max_regions)
             break;
         if (!is_readable(region) || is_executable(region) || region.size < 64 || region.size > 32ull * 1024ull * 1024ull)
@@ -1662,6 +2175,8 @@ json scan_memory_cbuffer_candidates(std::uint32_t pid, std::size_t limit, double
             continue;
         for (std::size_t off = 0; off + 64 <= bytes.size() && out.size() < limit; off += 16)
         {
+            if ((off & 0xFFFu) == 0 && dx_call_cancelled("scan_memory_cbuffer_candidates_bytes", pid, started_ms))
+                break;
             const std::uint32_t run64 = matrix_run_count(bytes, off, 64, world_max, 256);
             const std::uint32_t run48 = matrix_run_count(bytes, off, 48, world_max, 256);
             const std::uint32_t best = std::max(run64, run48);
@@ -1677,6 +2192,12 @@ json scan_memory_cbuffer_candidates(std::uint32_t pid, std::size_t limit, double
             off += (run64 >= run48 ? 64ull : 48ull) * std::max<std::uint32_t>(best, 1);
         }
     }
+    diag::log_tagged_fmt("dx_hook", "scan_memory_cbuffer_candidates exit pid=%u regions=%zu max_regions=%zu results=%zu elapsed_ms=%llu",
+                         pid,
+                         scanned_regions,
+                         max_regions,
+                         out.size(),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     return out;
 }
 
@@ -2072,7 +2593,7 @@ void stop_dx_debug_loop(std::uint32_t pid)
 
 std::optional<slot_entry_t> choose_cbuffer_target(std::uint32_t pid, const std::string& api)
 {
-    auto slots = discover_api(pid, api);
+    auto slots = discover_api(pid, api, api != "auto");
     for (const auto& slot : slots)
     {
         if (slot.target_va != 0 && slot.name == "VSSetConstantBuffers")
@@ -2340,10 +2861,22 @@ tool_result_t find_device_vtable(const json& params)
     if (api == "auto")
     {
         json apis = json::array();
-        apis.push_back(slots_to_result(scope.pid(), "d3d11", discover_d3d11(scope.pid(), false)));
-        apis.push_back(slots_to_result(scope.pid(), "d3d12", discover_d3d12(scope.pid())));
-        apis.push_back(slots_to_result(scope.pid(), "dxgi", discover_dxgi_present(scope.pid())));
-        apis.push_back(slots_to_result(scope.pid(), "vulkan", discover_vulkan(scope.pid())));
+        if (target_module_loaded(scope.pid(), "d3d11.dll") && !dx_call_cancelled("find_device_vtable_auto_d3d11", scope.pid(), started_ms))
+            apis.push_back(slots_to_result(scope.pid(), "d3d11", discover_d3d11(scope.pid(), false)));
+        else
+            apis.push_back(slots_to_result(scope.pid(), "d3d11", {}));
+        if (target_module_loaded(scope.pid(), "d3d12.dll") && !dx_call_cancelled("find_device_vtable_auto_d3d12", scope.pid(), started_ms))
+            apis.push_back(slots_to_result(scope.pid(), "d3d12", discover_d3d12(scope.pid(), false)));
+        else
+            apis.push_back(slots_to_result(scope.pid(), "d3d12", {}));
+        if (target_module_loaded(scope.pid(), "dxgi.dll") && !dx_call_cancelled("find_device_vtable_auto_dxgi", scope.pid(), started_ms))
+            apis.push_back(slots_to_result(scope.pid(), "dxgi", discover_dxgi_present(scope.pid(), false)));
+        else
+            apis.push_back(slots_to_result(scope.pid(), "dxgi", {}));
+        if (target_module_loaded(scope.pid(), "vulkan-1.dll") && !dx_call_cancelled("find_device_vtable_auto_vulkan", scope.pid(), started_ms))
+            apis.push_back(slots_to_result(scope.pid(), "vulkan", discover_vulkan(scope.pid(), false)));
+        else
+            apis.push_back(slots_to_result(scope.pid(), "vulkan", {}));
         json result;
         result["process_id"] = scope.pid();
         result["api"] = "auto";
@@ -2353,7 +2886,9 @@ tool_result_t find_device_vtable(const json& params)
                              static_cast<unsigned long long>(GetTickCount64() - started_ms));
         return tool_result_t::ok(result);
     }
-    auto slots = api == "dxgi" ? discover_dxgi_present(scope.pid()) : discover_api(scope.pid(), api, false);
+    if (dx_call_cancelled("find_device_vtable_before_explicit", scope.pid(), started_ms))
+        return tool_result_t::error("DX vtable discovery cancelled.");
+    auto slots = api == "dxgi" ? discover_dxgi_present(scope.pid(), true) : discover_api(scope.pid(), api, true);
     std::size_t resolved = 0;
     for (const auto& slot : slots)
     {
@@ -2816,74 +3351,189 @@ tool_result_t dump_render_targets(const json& params)
 
 tool_result_t find_view_matrix(const json& params)
 {
+    const std::uint64_t started_ms = GetTickCount64();
     active_process_scope_t scope(params);
     if (!scope.ok())
         return tool_result_t::error(scope.error());
     const bool cbuffers_only = bool_param(params, "scan_cbuffers_only", true);
+    const bool allow_memory_fallback = bool_param(params, "allow_memory_fallback", false);
     const double world_max = number_param(params, "world_unit_max", 1000000.0, 1.0, 1000000000.0);
     json out = json::array();
-    bool used_cbuffer_capture = false;
+    std::map<std::string, std::uint64_t> rejection_counts;
+    std::map<std::string, std::uint64_t> provenance_counts;
+    std::map<std::uint64_t, std::uint32_t> temporal_hits;
+    std::set<std::string> seen_keys;
+    std::uint64_t inspected_candidates = 0;
+    std::uint64_t high_confidence = 0;
+    std::uint64_t fallback_accepted = 0;
+    constexpr std::size_t kMaxResults = 128;
+    constexpr std::size_t kMaxFallbackResults = 16;
     bool used_memory_fallback = false;
     refresh_snapshot_records(scope.pid(), "find_view_matrix requested current bounded evidence", &params);
+    json stored_rows = stored_cbuffer_rows(scope.pid());
+    for (const auto& cb : stored_rows)
+    {
+        std::uint64_t va = 0;
+        if (cb.contains("va") && parse_u64_value(cb["va"], va) && va != 0)
+            ++temporal_hits[va];
+    }
     auto inspect_candidate = [&](const json& candidate, const std::string& source) {
-        if (!candidate.contains("va") || out.size() >= 128)
+        if (!candidate.contains("va") || out.size() >= kMaxResults)
             return;
+        ++inspected_candidates;
+        ++provenance_counts[source];
         std::uint64_t va = 0;
         if (!parse_u64_value(candidate["va"], va) || va == 0)
+        {
+            ++rejection_counts["bad_va"];
             return;
+        }
+        driver_bridge::memory_region_t region{};
+        if (!query_region(scope.pid(), va, region) || !is_readable(region) || is_executable(region) || is_guarded(region))
+        {
+            ++rejection_counts["region_not_readable"];
+            return;
+        }
+        int slot = -1;
+        if (candidate.contains("slot") && candidate["slot"].is_number_integer())
+            slot = candidate["slot"].get<int>();
+        std::ostringstream key;
+        if (slot >= 0)
+            key << std::hex << region.base << ":" << slot;
+        else
+            key << std::hex << va;
+        if (!seen_keys.insert(key.str()).second)
+        {
+            ++rejection_counts["duplicate_region_slot"];
+            return;
+        }
         std::vector<std::uint8_t> bytes;
         if (!read_bytes(scope.pid(), va, 64, bytes) || bytes.size() < 64)
+        {
+            ++rejection_counts["read_failed"];
             return;
+        }
         float f[16] = {};
         std::memcpy(f, bytes.data(), 64);
-        if (!plausible_matrix4x4(f, world_max))
+        matrix_eval_t eval = evaluate_matrix4x4(f, world_max);
+        if (!eval.plausible)
+        {
+            ++rejection_counts[eval.reason.empty() ? "matrix_rejected" : eval.reason];
             return;
+        }
         json row;
         row["va"] = sa_format_address(va);
         double source_confidence = 0.50;
         if (candidate.contains("confidence") && candidate["confidence"].is_number())
             source_confidence = candidate["confidence"].get<double>();
-        row["confidence"] = std::min(0.96, source_confidence + (source == "dx_hook_cbuffer_capture" ? 0.20 : 0.05));
-        row["matrix_type"] = std::fabs(f[15] - 1.0f) < 0.01f ? "view" : "viewproj";
+        const bool fallback_source = source == "bounded_private_memory_matrix_scan";
+        const std::uint32_t hits = temporal_hits.count(va) ? temporal_hits[va] : 0;
+        double confidence = source_confidence + eval.score * 0.35;
+        if (source == "dx_hook_cbuffer_capture")
+            confidence += 0.18;
+        else if (source == "explicit_cbuffer_candidate")
+            confidence += 0.12;
+        else if (fallback_source)
+            confidence -= 0.08;
+        if (hits > 1)
+            confidence += std::min(0.18, static_cast<double>(hits) * 0.06);
+        confidence = std::min(0.98, std::max(0.0, confidence));
+        if (fallback_source)
+        {
+            if (fallback_accepted >= kMaxFallbackResults)
+            {
+                ++rejection_counts["fallback_cap"];
+                return;
+            }
+            if (confidence < 0.70)
+            {
+                ++rejection_counts["fallback_low_confidence"];
+                return;
+            }
+            ++fallback_accepted;
+        }
+        if (confidence >= 0.75)
+            ++high_confidence;
+        row["confidence"] = confidence;
+        row["matrix_type"] = eval.type;
+        row["determinant3x3"] = eval.determinant;
+        row["orthogonality_error"] = eval.orthogonality_error;
+        row["temporal_hits"] = hits;
         row["preview_floats"] = preview_floats(bytes);
         row["source"] = source;
+        row["region"] = region_json(region);
         row["evidence"] = candidate;
         out.push_back(std::move(row));
     };
 
     for (const auto& cb : explicit_cbuffer_candidates(scope.pid(), params, 128, "explicit_cbuffer_candidate"))
     {
+        if (dx_call_cancelled("find_view_matrix_explicit_candidates", scope.pid(), started_ms))
+            break;
         inspect_candidate(cb, "explicit_cbuffer_candidate");
-        if (out.size() >= 128)
+        if (out.size() >= kMaxResults)
             break;
     }
 
-    for (const auto& cb : stored_cbuffer_rows(scope.pid()))
+    for (const auto& cb : stored_rows)
     {
+        if (dx_call_cancelled("find_view_matrix_stored_cbuffer_candidates", scope.pid(), started_ms))
+            break;
         inspect_candidate(cb, "dx_hook_cbuffer_capture");
-        if (out.size() >= 128)
+        if (out.size() >= kMaxResults)
             break;
     }
-    used_cbuffer_capture = !out.empty();
 
-    if (!used_cbuffer_capture || !cbuffers_only)
+    if (allow_memory_fallback && out.size() < kMaxResults && !dx_call_cancelled("find_view_matrix_memory_fallback", scope.pid(), started_ms))
     {
-        json scanned = scan_memory_cbuffer_candidates(scope.pid(), 128 - static_cast<std::size_t>(out.size()), world_max, cbuffers_only ? 512 : 4096);
+        const std::size_t fallback_limit = std::min<std::size_t>(kMaxFallbackResults, kMaxResults - static_cast<std::size_t>(out.size()));
+        json scanned = scan_memory_cbuffer_candidates(scope.pid(), fallback_limit, world_max, cbuffers_only ? 512 : 4096);
         for (const auto& row : scanned)
         {
             inspect_candidate(row, "bounded_private_memory_matrix_scan");
-            if (out.size() >= 128)
+            if (out.size() >= kMaxResults)
                 break;
         }
         used_memory_fallback = !scanned.empty();
     }
+    else if (!allow_memory_fallback)
+    {
+        diag::log_tagged_fmt("dx_hook",
+                             "find_view_matrix memory_fallback_skipped pid=%u scan_cbuffers_only=%d allow_memory_fallback=0 accepted=%zu stored_rows=%zu elapsed_ms=%llu",
+                             scope.pid(),
+                             cbuffers_only ? 1 : 0,
+                             out.size(),
+                             stored_rows.size(),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
+    }
     json result;
     result["process_id"] = scope.pid();
     result["scan_cbuffers_only"] = cbuffers_only;
-    result["used_cbuffer_capture"] = used_cbuffer_capture;
+    result["allow_memory_fallback"] = allow_memory_fallback;
+    result["used_cbuffer_capture"] = provenance_counts["dx_hook_cbuffer_capture"] != 0;
     result["used_memory_fallback"] = used_memory_fallback;
+    result["inspected_candidates"] = inspected_candidates;
+    result["stored_cbuffer_candidates"] = stored_rows.size();
+    result["high_confidence_count"] = high_confidence;
+    result["rejection_counts"] = rejection_counts;
+    result["provenance_counts"] = provenance_counts;
     result["results"] = std::move(out);
     result["count"] = result["results"].size();
+    diag::log_tagged_fmt("dx_hook",
+                         "find_view_matrix exit pid=%u count=%zu inspected=%llu high_confidence=%llu explicit=%llu cbuffer=%llu fallback=%llu rejected_bad_va=%llu rejected_read=%llu rejected_shape=%llu rejected_duplicate=%llu used_memory_fallback=%d elapsed_ms=%llu",
+                         scope.pid(),
+                         result["results"].size(),
+                         static_cast<unsigned long long>(inspected_candidates),
+                         static_cast<unsigned long long>(high_confidence),
+                         static_cast<unsigned long long>(provenance_counts["explicit_cbuffer_candidate"]),
+                         static_cast<unsigned long long>(provenance_counts["dx_hook_cbuffer_capture"]),
+                         static_cast<unsigned long long>(provenance_counts["bounded_private_memory_matrix_scan"]),
+                         static_cast<unsigned long long>(rejection_counts["bad_va"]),
+                         static_cast<unsigned long long>(rejection_counts["read_failed"]),
+                         static_cast<unsigned long long>(rejection_counts["shape_rejected"]),
+                         static_cast<unsigned long long>(rejection_counts["duplicate_region_slot"]),
+                         used_memory_fallback ? 1 : 0,
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     return tool_result_t::ok(result);
 }
 }

@@ -52,6 +52,9 @@ namespace
     constexpr std::uint64_t kMcpBrowserLongActionTimeoutMs = 180000;
     constexpr std::uint64_t kMcpBrowserCleanupGraceMs = 30000;
     constexpr std::uint64_t kMcpBatchWaitTimeoutMs = 60000;
+    constexpr std::uint64_t kMcpPolicyLockMaxWaitMs = 5000;
+    constexpr std::uint64_t kMcpPolicyLockPollMs = 25;
+    constexpr std::uint64_t kMcpPolicyLockLogEveryMs = 500;
     constexpr std::size_t kMcpMaxBatchItems = 4096;
     constexpr std::size_t kMcpPayloadMaxLength = 64u * 1024u * 1024u;
     constexpr std::size_t kSseMaxQueuedEvents = 4096;
@@ -2074,6 +2077,157 @@ static void set_tool_metrics_lane(tool_invocation_metrics_t* metrics, const std:
     metrics->lock_wait_ms += lock_wait_ms;
 }
 
+enum class policy_lock_status_t
+{
+    acquired,
+    cancelled,
+    busy
+};
+
+struct policy_lock_wait_t
+{
+    policy_lock_status_t status = policy_lock_status_t::busy;
+    std::uint64_t wait_ms = 0;
+};
+
+static std::uint64_t policy_lock_wait_budget_ms()
+{
+    const std::uint64_t now = mcp_now_ms();
+    const std::uint64_t deadline = current_call_deadline_ms();
+    if (deadline != 0 && deadline > now)
+        return std::min<std::uint64_t>(kMcpPolicyLockMaxWaitMs, deadline - now);
+    if (deadline != 0 && deadline <= now)
+        return 0;
+    return kMcpPolicyLockMaxWaitMs;
+}
+
+template <typename Lock, typename TryLockFn>
+static policy_lock_wait_t wait_policy_lock(Lock& lock,
+                                           TryLockFn&& try_lock,
+                                           const std::string& tool_name,
+                                           const char* lane,
+                                           const char* mode,
+                                           bool read_only,
+                                           bool explicit_target)
+{
+    const std::uint64_t started = mcp_now_ms();
+    const std::uint64_t budget = policy_lock_wait_budget_ms();
+    std::uint64_t last_log = started;
+    diag::log_tagged_fmt("mcp_srv",
+        "tool_policy_lock_wait_begin tool='%s' lane=%s mode=%s read_only=%d explicit_target=%d budget_ms=%llu diag_id=%s",
+        tool_name.c_str(),
+        lane ? lane : "",
+        mode ? mode : "",
+        read_only ? 1 : 0,
+        explicit_target ? 1 : 0,
+        static_cast<unsigned long long>(budget),
+        current_call_diag_id());
+
+    for (;;)
+    {
+        if (try_lock(lock))
+        {
+            const std::uint64_t waited = mcp_now_ms() - started;
+            diag::log_tagged_fmt("mcp_srv",
+                "tool_policy_lock_wait_acquired tool='%s' lane=%s mode=%s wait_ms=%llu diag_id=%s",
+                tool_name.c_str(),
+                lane ? lane : "",
+                mode ? mode : "",
+                static_cast<unsigned long long>(waited),
+                current_call_diag_id());
+            return {policy_lock_status_t::acquired, waited};
+        }
+
+        const std::uint64_t now = mcp_now_ms();
+        const std::uint64_t waited = now >= started ? now - started : 0;
+        if (current_call_cancelled())
+        {
+            diag::log_tagged_fmt("mcp_srv",
+                "tool_policy_lock_wait_cancelled tool='%s' lane=%s mode=%s wait_ms=%llu diag_id=%s",
+                tool_name.c_str(),
+                lane ? lane : "",
+                mode ? mode : "",
+                static_cast<unsigned long long>(waited),
+                current_call_diag_id());
+            return {policy_lock_status_t::cancelled, waited};
+        }
+
+        const std::uint64_t deadline = current_call_deadline_ms();
+        if ((budget == 0 || waited >= budget) || (deadline != 0 && now >= deadline))
+        {
+            diag::log_tagged_fmt("mcp_srv",
+                "tool_policy_lock_wait_busy tool='%s' lane=%s mode=%s wait_ms=%llu budget_ms=%llu diag_id=%s",
+                tool_name.c_str(),
+                lane ? lane : "",
+                mode ? mode : "",
+                static_cast<unsigned long long>(waited),
+                static_cast<unsigned long long>(budget),
+                current_call_diag_id());
+            return {policy_lock_status_t::busy, waited};
+        }
+
+        if (now - last_log >= kMcpPolicyLockLogEveryMs)
+        {
+            last_log = now;
+            diag::log_tagged_fmt("mcp_srv",
+                "tool_policy_lock_wait_state tool='%s' lane=%s mode=%s wait_ms=%llu cancelled=%d diag_id=%s",
+                tool_name.c_str(),
+                lane ? lane : "",
+                mode ? mode : "",
+                static_cast<unsigned long long>(waited),
+                current_call_cancelled() ? 1 : 0,
+                current_call_diag_id());
+        }
+        Sleep(static_cast<DWORD>(kMcpPolicyLockPollMs));
+    }
+}
+
+static policy_lock_wait_t acquire_policy_unique_lock(std::unique_lock<std::shared_mutex>& lock,
+                                                     const std::string& tool_name,
+                                                     const char* lane,
+                                                     bool read_only,
+                                                     bool explicit_target)
+{
+    return wait_policy_lock(lock,
+        [](std::unique_lock<std::shared_mutex>& l) { return l.try_lock(); },
+        tool_name,
+        lane,
+        "exclusive",
+        read_only,
+        explicit_target);
+}
+
+static policy_lock_wait_t acquire_policy_shared_lock(std::shared_lock<std::shared_mutex>& lock,
+                                                     const std::string& tool_name,
+                                                     const char* lane,
+                                                     bool explicit_target)
+{
+    return wait_policy_lock(lock,
+        [](std::shared_lock<std::shared_mutex>& l) { return l.try_lock(); },
+        tool_name,
+        lane,
+        "shared",
+        true,
+        explicit_target);
+}
+
+static tool_result_t policy_lock_error_result(const std::string& tool_name,
+                                              const char* lane,
+                                              const policy_lock_wait_t& wait)
+{
+    json details = {
+        {"tool", tool_name},
+        {"lane", lane ? lane : ""},
+        {"lock_wait_ms", wait.wait_ms},
+        {"diagnostic_id", current_call_diag_id()},
+        {"cancelled", wait.status == policy_lock_status_t::cancelled},
+        {"busy", wait.status == policy_lock_status_t::busy}
+    };
+    if (wait.status == policy_lock_status_t::cancelled)
+        return tool_result_t::error("MCP tool call cancelled while waiting for active-session policy lock.", "cancelled", details);
+    return tool_result_t::error("MCP active-session policy lock is busy; a prior tool is still draining.", "busy", details);
+}
+
 static bool tool_args_select_session_target(const json& args)
 {
     if (!args.is_object())
@@ -2129,6 +2283,7 @@ struct target_probe_t
     size_t active_idx = static_cast<size_t>(-1);
     size_t target_idx = static_cast<size_t>(-1);
     std::string resolved_id;
+    std::uint32_t pid = 0;
     std::string err;
 };
 
@@ -2210,7 +2365,43 @@ static target_probe_t probe_target_without_switch(const json& args)
     probe.target_idx = resolved_idx;
     auto sum = analysis_session::summarize_session_at(resolved_idx);
     probe.resolved_id = sum.id;
+    probe.pid = sum.pid;
     return probe;
+}
+
+static bool tool_args_have_explicit_pid(const json& args)
+{
+    if (!args.is_object())
+        return false;
+    for (const char* key : {"target_pid", "process_id", "pid"}) {
+        if (args.contains(key) && !args[key].is_null())
+            return true;
+    }
+    return false;
+}
+
+static json add_process_id_for_handler_if_supported(const tool_def_t& tool, const json& arguments, std::uint32_t pid, bool* added)
+{
+    if (added)
+        *added = false;
+    if (pid == 0 || !arguments.is_object())
+        return arguments;
+    if (tool_args_have_explicit_pid(arguments))
+        return arguments;
+    const char* key = nullptr;
+    if (tool_declares_param_named(tool, "process_id"))
+        key = "process_id";
+    else if (tool_declares_param_named(tool, "target_pid"))
+        key = "target_pid";
+    else if (tool_declares_param_named(tool, "pid"))
+        key = "pid";
+    if (!key)
+        return arguments;
+    json copy = arguments;
+    copy[key] = pid;
+    if (added)
+        *added = true;
+    return copy;
 }
 
 static bool is_analysis_session_management_tool(const std::string& name)
@@ -2325,11 +2516,15 @@ static tool_result_t invoke_tool_with_concurrency_policy(
     }
 
     if (session_manager || !tool.read_only) {
-        const std::uint64_t wait_start = mcp_now_ms();
-        std::unique_lock<std::shared_mutex> lk(active_session_tool_mutex());
-        const std::uint64_t wait_ms = mcp_now_ms() - wait_start;
         const char* lane = session_manager ? "exclusive_session_manager" :
             (session_independent ? "exclusive_independent_mutating" : "exclusive_mutating");
+        std::unique_lock<std::shared_mutex> lk(active_session_tool_mutex(), std::defer_lock);
+        const policy_lock_wait_t wait = acquire_policy_unique_lock(lk, tool.name, lane, tool.read_only, explicit_target);
+        if (wait.status != policy_lock_status_t::acquired) {
+            set_tool_metrics_lane(metrics, lane, wait.wait_ms);
+            return policy_lock_error_result(tool.name, lane, wait);
+        }
+        const std::uint64_t wait_ms = wait.wait_ms;
         set_tool_metrics_lane(metrics, lane, wait_ms);
         diag::log_tagged_fmt("mcp_srv",
             "tool_policy_lane tool='%s' lane=%s read_only=%d explicit_target=%d lock_wait_ms=%llu",
@@ -2351,9 +2546,13 @@ static tool_result_t invoke_tool_with_concurrency_policy(
     }
 
     if (!explicit_target) {
-        const std::uint64_t wait_start = mcp_now_ms();
-        std::shared_lock<std::shared_mutex> lk(active_session_tool_mutex());
-        const std::uint64_t wait_ms = mcp_now_ms() - wait_start;
+        std::shared_lock<std::shared_mutex> lk(active_session_tool_mutex(), std::defer_lock);
+        const policy_lock_wait_t wait = acquire_policy_shared_lock(lk, tool.name, "shared_active", false);
+        if (wait.status != policy_lock_status_t::acquired) {
+            set_tool_metrics_lane(metrics, "shared_active", wait.wait_ms);
+            return policy_lock_error_result(tool.name, "shared_active", wait);
+        }
+        const std::uint64_t wait_ms = wait.wait_ms;
         set_tool_metrics_lane(metrics, "shared_active", wait_ms);
         diag::log_tagged_fmt("mcp_srv",
             "tool_policy_lane tool='%s' lane=shared_active read_only=1 explicit_target=0 lock_wait_ms=%llu",
@@ -2371,9 +2570,13 @@ static tool_result_t invoke_tool_with_concurrency_policy(
     target_probe_t probe;
     std::uint64_t probe_wait_ms = 0;
     {
-        const std::uint64_t wait_start = mcp_now_ms();
-        std::shared_lock<std::shared_mutex> lk(active_session_tool_mutex());
-        probe_wait_ms = mcp_now_ms() - wait_start;
+        std::shared_lock<std::shared_mutex> lk(active_session_tool_mutex(), std::defer_lock);
+        const policy_lock_wait_t wait = acquire_policy_shared_lock(lk, tool.name, "shared_target_probe", true);
+        if (wait.status != policy_lock_status_t::acquired) {
+            set_tool_metrics_lane(metrics, "shared_target_probe", wait.wait_ms);
+            return policy_lock_error_result(tool.name, "shared_target_probe", wait);
+        }
+        probe_wait_ms = wait.wait_ms;
         probe = probe_target_without_switch(target_arguments);
         if (!probe.ok) {
             set_tool_metrics_lane(metrics, "shared_target_reject", probe_wait_ms);
@@ -2399,13 +2602,33 @@ static tool_result_t invoke_tool_with_concurrency_policy(
                 return tool_result_t::error(scope_err.empty() ? std::string("Unable to resolve target session") : scope_err);
             if (metrics)
                 metrics->resolved_target = true;
-            return invoke_tool_handler_unlocked(tool.name, arguments, handler, metrics);
+            bool added_pid = false;
+            json handler_arguments = add_process_id_for_handler_if_supported(tool, arguments, probe.pid, &added_pid);
+            const bool release_before_handler = probe.resolved &&
+                probe.pid != 0 &&
+                probe.target_idx == probe.active_idx &&
+                !scope.swapped &&
+                (tool_args_have_explicit_pid(arguments) || added_pid);
+            if (release_before_handler) {
+                lk.unlock();
+                diag::log_tagged_fmt("mcp_srv",
+                    "tool_policy_lock_release_before_handler tool='%s' lane=shared_explicit_no_switch pid=%u added_pid=%d lock_wait_ms=%llu",
+                    tool.name.c_str(),
+                    probe.pid,
+                    added_pid ? 1 : 0,
+                    static_cast<unsigned long long>(probe_wait_ms));
+            }
+            return invoke_tool_handler_unlocked(tool.name, release_before_handler ? handler_arguments : arguments, handler, metrics);
         }
     }
 
-    const std::uint64_t wait_start = mcp_now_ms();
-    std::unique_lock<std::shared_mutex> lk(active_session_tool_mutex());
-    const std::uint64_t wait_ms = mcp_now_ms() - wait_start;
+    std::unique_lock<std::shared_mutex> lk(active_session_tool_mutex(), std::defer_lock);
+    const policy_lock_wait_t wait = acquire_policy_unique_lock(lk, tool.name, "exclusive_target_switch", true, true);
+    if (wait.status != policy_lock_status_t::acquired) {
+        set_tool_metrics_lane(metrics, "exclusive_target_switch", probe_wait_ms + wait.wait_ms);
+        return policy_lock_error_result(tool.name, "exclusive_target_switch", wait);
+    }
+    const std::uint64_t wait_ms = wait.wait_ms;
     set_tool_metrics_lane(metrics, "exclusive_target_switch", probe_wait_ms + wait_ms);
     diag::log_tagged_fmt("mcp_srv",
         "tool_policy_lane tool='%s' lane=exclusive_target_switch read_only=1 active_idx=%llu target_idx=%llu probe_wait_ms=%llu lock_wait_ms=%llu",

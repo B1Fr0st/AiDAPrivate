@@ -892,6 +892,51 @@ namespace detail
         return image_path == expected;
     }
 
+    inline bool trusted_windows_console_host_process(const process_probe_t& probe)
+    {
+        if (!probe.query_ok || probe.image_lower.empty())
+            return false;
+        const std::wstring image_path = canonical_path_lower_w(probe.image_lower);
+        if (image_path.empty())
+            return false;
+        const std::wstring base = lower_copy(basename_ptr(image_path.c_str()));
+        if (!equals_w(base.c_str(), L"conhost.exe") && !equals_w(base.c_str(), L"openconsole.exe"))
+            return false;
+        wchar_t windows_dir[MAX_PATH] = {};
+        UINT windows_len = GetWindowsDirectoryW(windows_dir, MAX_PATH);
+        if (windows_len == 0 || windows_len >= MAX_PATH)
+            return false;
+        std::wstring root = canonical_path_lower_w(std::wstring(windows_dir, windows_len));
+        if (root.empty())
+            return false;
+        if (!root.empty() && root.back() != L'\\')
+            root.push_back(L'\\');
+        return image_path == root + L"system32\\" + base ||
+            image_path == root + L"syswow64\\" + base;
+    }
+
+    inline bool trusted_windows_console_host_handle_access(DWORD access)
+    {
+        constexpr DWORD disallowed =
+            PROCESS_VM_WRITE |
+            PROCESS_CREATE_THREAD |
+            PROCESS_DUP_HANDLE |
+            PROCESS_SET_INFORMATION |
+            PROCESS_SET_QUOTA |
+            PROCESS_SUSPEND_RESUME;
+        if ((access & disallowed) != 0)
+            return false;
+        constexpr DWORD allowed =
+            READ_CONTROL |
+            SYNCHRONIZE |
+            PROCESS_TERMINATE |
+            PROCESS_QUERY_INFORMATION |
+            PROCESS_QUERY_LIMITED_INFORMATION |
+            PROCESS_VM_READ |
+            PROCESS_VM_OPERATION;
+        return (access & ~allowed) == 0;
+    }
+
     inline bool trusted_kernel_system_owner(DWORD owner_pid)
     {
         return owner_pid == 4;
@@ -2765,6 +2810,7 @@ namespace self_analysis
                 bool owner_input_helper_name = false;
                 bool owner_input_helper = false;
                 bool owner_internal_camoufox_tree = false;
+                bool owner_console_host = false;
                 uint64_t owner_hash = 0;
                 bool owner_query_ok = false;
                 bool owner_core_system = false;
@@ -2787,6 +2833,7 @@ namespace self_analysis
                     owner_input_helper = detail::trusted_windows_oem_input_helper_process(*probe);
                     owner_internal_camoufox_tree =
                         probes && detail::is_trusted_aida_internal_camoufox_tree_process(*probe, *probes);
+                    owner_console_host = detail::trusted_windows_console_host_process(*probe);
                 }
                 if (detail::is_fileless_bootstrap_parent_owner(probe, owner_pid, fileless_parent_pid))
                 {
@@ -2893,6 +2940,56 @@ namespace self_analysis
                         static_cast<unsigned long>(h.GrantedAccess),
                         flags.c_str(),
                         bounded_access ? 1 : 0,
+                        owner_memory ? 1 : 0,
+                        owner_re ? 1 : 0,
+                        owner_debugger ? 1 : 0,
+                        owner_dump ? 1 : 0,
+                        owner_offensive ? 1 : 0,
+                        owner_mcp ? 1 : 0,
+                        owner_ai ? 1 : 0,
+                        owner_targets ? 1 : 0,
+                        static_cast<unsigned long long>(owner_hash),
+                        owner_image.empty() ? "<empty>" : owner_image.c_str(),
+                        owner_path.empty() ? "<empty>" : owner_path.c_str());
+                }
+                if (owner_console_host)
+                {
+                    std::string owner_image = detail::probe_image_for_log(probe);
+                    std::string owner_path = detail::probe_path_for_log(probe);
+                    std::string flags = detail::format_process_handle_access_flags(h.GrantedAccess);
+                    const bool bounded_access = detail::trusted_windows_console_host_handle_access(h.GrantedAccess);
+                    const bool same_session = detail::processes_share_session(owner_pid, GetCurrentProcessId());
+                    const bool owner_has_blocking_tool_context = owner_memory || owner_re || owner_debugger ||
+                        owner_dump || owner_offensive || owner_mcp || owner_ai || owner_targets;
+                    if (bounded_access && same_session && !owner_has_blocking_tool_context)
+                    {
+                        out.trusted_system_ignored = true;
+                        ++out.trusted_system_ignored_count;
+                        out.trusted_system_access_mask |= h.GrantedAccess;
+                        out.trusted_system_owner_hash = detail::mix_hash(
+                            out.trusted_system_owner_hash,
+                            owner_hash);
+                        diag::log_tagged_critical_fmt("guard",
+                            "ai_tool_posture_console_host_handle_ignored owner_pid=%lu handle=0x%016llX access=0x%08lX access_flags=%s same_session=%d owner_hash=0x%016llX owner_image=%s owner_path=%s ignored_count=%u",
+                            static_cast<unsigned long>(owner_pid),
+                            static_cast<unsigned long long>(h.HandleValue),
+                            static_cast<unsigned long>(h.GrantedAccess),
+                            flags.c_str(),
+                            same_session ? 1 : 0,
+                            static_cast<unsigned long long>(owner_hash),
+                            owner_image.empty() ? "<empty>" : owner_image.c_str(),
+                            owner_path.empty() ? "<empty>" : owner_path.c_str(),
+                            out.trusted_system_ignored_count);
+                        continue;
+                    }
+                    diag::log_tagged_critical_fmt("guard",
+                        "ai_tool_posture_console_host_handle_not_ignored owner_pid=%lu handle=0x%016llX access=0x%08lX access_flags=%s bounded_access=%d same_session=%d owner_memory=%d owner_re=%d owner_debugger=%d owner_dump=%d owner_offensive=%d owner_mcp=%d owner_ai=%d owner_target=%d owner_hash=0x%016llX owner_image=%s owner_path=%s",
+                        static_cast<unsigned long>(owner_pid),
+                        static_cast<unsigned long long>(h.HandleValue),
+                        static_cast<unsigned long>(h.GrantedAccess),
+                        flags.c_str(),
+                        bounded_access ? 1 : 0,
+                        same_session ? 1 : 0,
                         owner_memory ? 1 : 0,
                         owner_re ? 1 : 0,
                         owner_debugger ? 1 : 0,

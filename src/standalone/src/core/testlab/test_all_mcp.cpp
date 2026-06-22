@@ -6797,6 +6797,21 @@ namespace {
                 return mcp_tool_call_status_t::functional_pass;
             return mcp_tool_call_status_t::contract_pass;
         }
+        if (tool_lc == "network_pre_encrypt_hook") {
+            std::string capture_reason;
+            if (payload_capture_or_result_evidence(ir.data, capture_reason)) {
+                evidence = "network_pre_encrypt_hook_capture_evidence " + capture_reason;
+                return mcp_tool_call_status_t::functional_pass;
+            }
+            if (effective_action_lc == "status") {
+                evidence = "network_pre_encrypt_hook_status_contract_no_capture";
+                return mcp_tool_call_status_t::state_contract_pass;
+            }
+            if (effective_action_lc == "auto_hook" || effective_action_lc == "hook_address") {
+                evidence = "network_pre_encrypt_hook_install_contract_waiting_for_capture";
+                return mcp_tool_call_status_t::contract_pass;
+            }
+        }
         if (action_is_cleanup_semantic(effective_action_lc)) {
             std::string delta_reason;
             if (payload_seeded_cleanup_delta(ir.data, delta_reason)) {
@@ -8148,9 +8163,15 @@ namespace {
 
     struct test_coverage_protocol_re_emit_stimulus_t {
         bool posted = false;
+        std::shared_ptr<std::atomic<bool>> started = std::make_shared<std::atomic<bool>>(false);
         std::shared_ptr<std::atomic<bool>> done = std::make_shared<std::atomic<bool>>(false);
+        std::shared_ptr<std::atomic<DWORD>> owner_tid = std::make_shared<std::atomic<DWORD>>(0);
+        std::shared_ptr<std::atomic<DWORD>> completion_owner_tid = std::make_shared<std::atomic<DWORD>>(0);
+        std::shared_ptr<std::atomic<std::uint64_t>> owner_start_tick = std::make_shared<std::atomic<std::uint64_t>>(0);
+        std::shared_ptr<std::atomic<std::uint64_t>> owner_done_tick = std::make_shared<std::atomic<std::uint64_t>>(0);
         std::shared_ptr<std::atomic<std::uint32_t>> attempts = std::make_shared<std::atomic<std::uint32_t>>(0);
         std::shared_ptr<std::atomic<std::uint32_t>> ok = std::make_shared<std::atomic<std::uint32_t>>(0);
+        std::shared_ptr<std::atomic<std::uint32_t>> descriptor_read_failures = std::make_shared<std::atomic<std::uint32_t>>(0);
         std::shared_ptr<std::atomic<std::uint64_t>> remote_result = std::make_shared<std::atomic<std::uint64_t>>(0);
         std::shared_ptr<std::atomic<std::uint64_t>> packets_sent = std::make_shared<std::atomic<std::uint64_t>>(0);
         std::shared_ptr<std::atomic<std::uint64_t>> framed_packets_sent = std::make_shared<std::atomic<std::uint64_t>>(0);
@@ -8163,17 +8184,50 @@ namespace {
                                                                                            std::uint32_t burst_count,
                                                                                            std::uint32_t repeats,
                                                                                            std::uint32_t initial_delay_ms,
-                                                                                           std::uint32_t interval_ms) {
+                                                                                           std::uint32_t interval_ms,
+                                                                                           HANDLE hf = nullptr,
+                                                                                           const char* tag = nullptr,
+                                                                                           const char* phase = nullptr) {
         test_coverage_protocol_re_emit_stimulus_t state;
         if (pid == 0 || desc.deterministic_emit_fn_va == 0 || repeats == 0) {
+            state.completion_owner_tid->store(GetCurrentThreadId(), std::memory_order_release);
             state.done->store(true, std::memory_order_release);
             return state;
         }
-        state.posted = work_queue::post([pid, desc, burst_count, repeats, initial_delay_ms, interval_ms, state]() mutable {
+        try {
+            std::thread([pid, desc, burst_count, repeats, initial_delay_ms, interval_ms, state, hf, tag_s = std::string(tag ? tag : "mcp.coverage.protocol_re"), phase_s = std::string(phase ? phase : "<empty>")]() mutable {
+            try {
+            const DWORD owner_tid = GetCurrentThreadId();
+            const std::uint64_t owner_start = GetTickCount64();
+            state.owner_tid->store(owner_tid, std::memory_order_release);
+            state.owner_start_tick->store(owner_start, std::memory_order_release);
+            state.started->store(true, std::memory_order_release);
+            log_msg(hf, tag_s.c_str(), "PROTOCOL-STIMULUS-EMITTER -- start phase=%s pid=%u owner_tid=%lu fn=0x%016llX descriptor=0x%016llX burst=%u repeats=%u initial_delay_ms=%u interval_ms=%u event=aida_test_proto_emit_deterministic",
+                phase_s.c_str(),
+                pid,
+                static_cast<unsigned long>(owner_tid),
+                static_cast<unsigned long long>(desc.deterministic_emit_fn_va),
+                static_cast<unsigned long long>(desc.descriptor_va),
+                burst_count,
+                repeats,
+                initial_delay_ms,
+                interval_ms);
             Sleep(initial_delay_ms);
             test_coverage_protocol_re_descriptor_t before{};
             std::string reason;
-            (void)test_coverage_protocol_re_read_descriptor_at(pid, desc.descriptor_va, before, reason);
+            const bool before_ok = test_coverage_protocol_re_read_descriptor_at(pid, desc.descriptor_va, before, reason);
+            if (!before_ok)
+                state.descriptor_read_failures->fetch_add(1, std::memory_order_acq_rel);
+            log_msg(hf, tag_s.c_str(), "PROTOCOL-STIMULUS-EMITTER -- before phase=%s owner_tid=%lu read_ok=%d reason=%s packets=%llu framed=%llu enet=%llu bytes=%llu recv=%llu",
+                phase_s.c_str(),
+                static_cast<unsigned long>(owner_tid),
+                before_ok ? 1 : 0,
+                reason.empty() ? "<none>" : compact_text(reason, 700).c_str(),
+                static_cast<unsigned long long>(before.packets_sent),
+                static_cast<unsigned long long>(before.framed_packets_sent),
+                static_cast<unsigned long long>(before.enet_packets_sent),
+                static_cast<unsigned long long>(before.bytes_sent),
+                static_cast<unsigned long long>(before.packets_received));
             for (std::uint32_t i = 0; i < repeats; ++i) {
                 state.attempts->fetch_add(1, std::memory_order_acq_rel);
                 const std::uint64_t emitted = page_guard_engine::remote_thread_call(pid, desc.deterministic_emit_fn_va, burst_count, 0, 0, 0, 5000, "aida_test_proto_emit_deterministic");
@@ -8191,15 +8245,76 @@ namespace {
                         state.ok->fetch_add(1, std::memory_order_acq_rel);
                     before = after;
                 } else if (emitted != 0) {
+                    state.descriptor_read_failures->fetch_add(1, std::memory_order_acq_rel);
                     state.ok->fetch_add(1, std::memory_order_acq_rel);
+                } else {
+                    state.descriptor_read_failures->fetch_add(1, std::memory_order_acq_rel);
                 }
+                log_msg(hf, tag_s.c_str(), "PROTOCOL-STIMULUS-EMITTER -- attempt phase=%s owner_tid=%lu index=%u emitted=%llu read_ok=%d reason=%s packets=%llu framed=%llu enet=%llu bytes=%llu ok=%u event=aida_test_proto_emit_deterministic",
+                    phase_s.c_str(),
+                    static_cast<unsigned long>(owner_tid),
+                    i + 1,
+                    static_cast<unsigned long long>(emitted),
+                    read_ok ? 1 : 0,
+                    read_reason.empty() ? "<none>" : compact_text(read_reason, 700).c_str(),
+                    static_cast<unsigned long long>(after.packets_sent),
+                    static_cast<unsigned long long>(after.framed_packets_sent),
+                    static_cast<unsigned long long>(after.enet_packets_sent),
+                    static_cast<unsigned long long>(after.bytes_sent),
+                    state.ok->load(std::memory_order_acquire));
                 if (i + 1 < repeats)
                     Sleep(interval_ms);
             }
+            state.completion_owner_tid->store(owner_tid, std::memory_order_release);
+            state.owner_done_tick->store(GetTickCount64(), std::memory_order_release);
             state.done->store(true, std::memory_order_release);
-        });
-        if (!state.posted)
+            log_msg(hf, tag_s.c_str(), "PROTOCOL-STIMULUS-EMITTER -- done phase=%s owner_tid=%lu completion_owner_tid=%lu attempts=%u ok=%u remote_result=%llu packets=%llu framed=%llu enet=%llu bytes=%llu read_failures=%u elapsed_ms=%llu",
+                phase_s.c_str(),
+                static_cast<unsigned long>(owner_tid),
+                static_cast<unsigned long>(state.completion_owner_tid->load(std::memory_order_acquire)),
+                state.attempts->load(std::memory_order_acquire),
+                state.ok->load(std::memory_order_acquire),
+                static_cast<unsigned long long>(state.remote_result->load(std::memory_order_acquire)),
+                static_cast<unsigned long long>(state.packets_sent->load(std::memory_order_acquire)),
+                static_cast<unsigned long long>(state.framed_packets_sent->load(std::memory_order_acquire)),
+                static_cast<unsigned long long>(state.enet_packets_sent->load(std::memory_order_acquire)),
+                static_cast<unsigned long long>(state.bytes_sent->load(std::memory_order_acquire)),
+                state.descriptor_read_failures->load(std::memory_order_acquire),
+                static_cast<unsigned long long>(GetTickCount64() - owner_start));
+            } catch (const std::exception& e) {
+                const DWORD owner_tid = GetCurrentThreadId();
+                state.owner_tid->store(owner_tid, std::memory_order_release);
+                state.completion_owner_tid->store(owner_tid, std::memory_order_release);
+                state.owner_done_tick->store(GetTickCount64(), std::memory_order_release);
+                state.done->store(true, std::memory_order_release);
+                log_msg(hf, tag_s.c_str(), "PROTOCOL-STIMULUS-EMITTER -- failed phase=%s owner_tid=%lu exception=%s",
+                    phase_s.c_str(),
+                    static_cast<unsigned long>(owner_tid),
+                    e.what());
+            } catch (...) {
+                const DWORD owner_tid = GetCurrentThreadId();
+                state.owner_tid->store(owner_tid, std::memory_order_release);
+                state.completion_owner_tid->store(owner_tid, std::memory_order_release);
+                state.owner_done_tick->store(GetTickCount64(), std::memory_order_release);
+                state.done->store(true, std::memory_order_release);
+                log_msg(hf, tag_s.c_str(), "PROTOCOL-STIMULUS-EMITTER -- failed phase=%s owner_tid=%lu exception=unknown",
+                    phase_s.c_str(),
+                    static_cast<unsigned long>(owner_tid));
+            }
+            }).detach();
+            state.posted = true;
+        } catch (const std::exception& e) {
+            state.completion_owner_tid->store(GetCurrentThreadId(), std::memory_order_release);
+            log_msg(hf, tag ? tag : "mcp.coverage.protocol_re", "PROTOCOL-STIMULUS-EMITTER -- start_failed phase=%s exception=%s",
+                phase ? phase : "<empty>",
+                e.what());
             state.done->store(true, std::memory_order_release);
+        } catch (...) {
+            state.completion_owner_tid->store(GetCurrentThreadId(), std::memory_order_release);
+            log_msg(hf, tag ? tag : "mcp.coverage.protocol_re", "PROTOCOL-STIMULUS-EMITTER -- start_failed phase=%s exception=unknown",
+                phase ? phase : "<empty>");
+            state.done->store(true, std::memory_order_release);
+        }
         return state;
     }
 
@@ -8211,18 +8326,24 @@ namespace {
         const std::uint64_t started = GetTickCount64();
         while (!state.done->load(std::memory_order_acquire) && GetTickCount64() - started < timeout_ms)
             Sleep(25);
-        log_msg(hf, tag, "PROTOCOL-STIMULUS -- phase=%s posted=%d done=%d elapsed_ms=%llu attempts=%u ok=%u remote_result=%llu packets_sent=%llu framed=%llu enet=%llu bytes_sent=%llu",
+        log_msg(hf, tag, "PROTOCOL-STIMULUS -- phase=%s posted=%d started=%d done=%d owner_tid=%lu completion_owner_tid=%lu elapsed_ms=%llu owner_elapsed_ms=%llu attempts=%u ok=%u remote_result=%llu packets_sent=%llu framed=%llu enet=%llu bytes_sent=%llu descriptor_read_failures=%u",
             phase ? phase : "<empty>",
             state.posted ? 1 : 0,
+            state.started->load(std::memory_order_acquire) ? 1 : 0,
             state.done->load(std::memory_order_acquire) ? 1 : 0,
+            static_cast<unsigned long>(state.owner_tid->load(std::memory_order_acquire)),
+            static_cast<unsigned long>(state.completion_owner_tid->load(std::memory_order_acquire)),
             static_cast<unsigned long long>(GetTickCount64() - started),
+            state.owner_start_tick->load(std::memory_order_acquire) == 0 ? 0ull :
+                static_cast<unsigned long long>((state.owner_done_tick->load(std::memory_order_acquire) != 0 ? state.owner_done_tick->load(std::memory_order_acquire) : GetTickCount64()) - state.owner_start_tick->load(std::memory_order_acquire)),
             state.attempts->load(std::memory_order_acquire),
             state.ok->load(std::memory_order_acquire),
             static_cast<unsigned long long>(state.remote_result->load(std::memory_order_acquire)),
             static_cast<unsigned long long>(state.packets_sent->load(std::memory_order_acquire)),
             static_cast<unsigned long long>(state.framed_packets_sent->load(std::memory_order_acquire)),
             static_cast<unsigned long long>(state.enet_packets_sent->load(std::memory_order_acquire)),
-            static_cast<unsigned long long>(state.bytes_sent->load(std::memory_order_acquire)));
+            static_cast<unsigned long long>(state.bytes_sent->load(std::memory_order_acquire)),
+            state.descriptor_read_failures->load(std::memory_order_acquire));
     }
 
     bool test_coverage_protected_re_domains_11_15_expect(HANDLE hf,
@@ -14988,6 +15109,14 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             log_msg(hf, tag, "FAIL -- WSAStartup failed for UDP fixture");
             return false;
         }
+        const DWORD emitter_tid = GetCurrentThreadId();
+        const DWORD emitter_start = GetTickCount();
+        log_msg(hf, tag, "NETWORK-FIXTURE -- udp emitter start pid=%lu tid=%lu dst=127.0.0.1:%u bytes=%zu header=%s",
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long>(emitter_tid),
+            static_cast<unsigned>(dst_port),
+            payload.size(),
+            hex_preview(payload, 32).c_str());
         SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (s == INVALID_SOCKET) {
             log_msg(hf, tag, "FAIL -- UDP socket failed err=%d", WSAGetLastError());
@@ -15006,17 +15135,22 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         const int err = sent == SOCKET_ERROR ? WSAGetLastError() : 0;
         closesocket(s);
         if (sent <= 0) {
-            log_msg(hf, tag, "FAIL -- UDP fixture send failed port=%u bytes=%zu err=%d",
+            log_msg(hf, tag, "FAIL -- UDP fixture send failed tid=%lu port=%u bytes=%zu err=%d elapsed_ms=%lu",
+                static_cast<unsigned long>(emitter_tid),
                 static_cast<unsigned>(dst_port),
                 payload.size(),
-                err);
+                err,
+                static_cast<unsigned long>(GetTickCount() - emitter_start));
             return false;
         }
         Sleep(250);
-        log_msg(hf, tag, "NETWORK-FIXTURE -- udp payload sent pid=%lu dst=127.0.0.1:%u bytes=%d",
+        log_msg(hf, tag, "NETWORK-FIXTURE -- udp emitter done pid=%lu tid=%lu dst=127.0.0.1:%u bytes=%d elapsed_ms=%lu header=%s",
             static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long>(emitter_tid),
             static_cast<unsigned>(dst_port),
-            sent);
+            sent,
+            static_cast<unsigned long>(GetTickCount() - emitter_start),
+            hex_preview(payload, 32).c_str());
         return true;
     }
 
@@ -15476,13 +15610,25 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         return ok && sent > 0 && got > 0 && spoofed_answer;
     }
 
-    bool seed_udp_capture_for_detection(HANDLE hf, const char* tag, uint16_t port, const std::vector<uint8_t>& payload) {
+    bool seed_udp_capture_for_detection(HANDLE hf, const char* tag, uint16_t port, const std::vector<uint8_t>& payload, bool* active_out = nullptr, uint32_t* captured_out = nullptr, uint32_t* dropped_out = nullptr) {
         if (!driver_bridge::using_kernel_driver()) {
             log_msg(hf, tag, "FAIL -- kernel driver not loaded for UDP detection fixture");
             return false;
         }
+        bool active_before_stop = false;
+        uint32_t captured_before_stop = 0;
+        uint32_t dropped_before_stop = 0;
+        driver_bridge::get_capture_status(active_before_stop, captured_before_stop, dropped_before_stop);
         driver_bridge::stop_capture();
         const DWORD start_tick = GetTickCount();
+        log_msg(hf, tag, "NETWORK-FIXTURE -- udp capture start pid=%lu port=%u protocol=17 payload_bytes=%zu previous_active=%d previous_captured=%u previous_dropped=%u header=%s",
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned>(port),
+            payload.size(),
+            active_before_stop ? 1 : 0,
+            captured_before_stop,
+            dropped_before_stop,
+            hex_preview(payload, 32).c_str());
         if (!driver_bridge::start_capture(GetCurrentProcessId(), port, 17, nullptr, 1500)) {
             log_msg(hf, tag, "FAIL -- start_capture failed for UDP fixture pid=%lu port=%u",
                 static_cast<unsigned long>(GetCurrentProcessId()),
@@ -15496,15 +15642,51 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         bool active = false;
         uint32_t captured = 0;
         uint32_t dropped = 0;
-        driver_bridge::get_capture_status(active, captured, dropped);
-        log_msg(hf, tag, "NETWORK-FIXTURE -- udp capture seeded pid=%lu port=%u active=%d captured=%u dropped=%u elapsed_ms=%lu",
+        uint32_t polls = 0;
+        do {
+            driver_bridge::get_capture_status(active, captured, dropped);
+            if (captured != 0 || dropped != 0 || GetTickCount() - start_tick >= 1500)
+                break;
+            ++polls;
+            Sleep(50);
+        } while (true);
+        if (active_out)
+            *active_out = active;
+        if (captured_out)
+            *captured_out = captured;
+        if (dropped_out)
+            *dropped_out = dropped;
+        log_msg(hf, tag, "NETWORK-FIXTURE -- udp capture seeded pid=%lu port=%u active=%d captured=%u dropped=%u polls=%u elapsed_ms=%lu header=%s",
             static_cast<unsigned long>(GetCurrentProcessId()),
             static_cast<unsigned>(port),
             active ? 1 : 0,
             captured,
             dropped,
-            static_cast<unsigned long>(GetTickCount() - start_tick));
+            polls,
+            static_cast<unsigned long>(GetTickCount() - start_tick),
+            hex_preview(payload, 32).c_str());
         return true;
+    }
+
+    void stop_udp_capture_after_detection(HANDLE hf, const char* tag, uint16_t port) {
+        bool active_before = false;
+        uint32_t captured_before = 0;
+        uint32_t dropped_before = 0;
+        driver_bridge::get_capture_status(active_before, captured_before, dropped_before);
+        const bool stopped = driver_bridge::stop_capture();
+        bool active_after = false;
+        uint32_t captured_after = 0;
+        uint32_t dropped_after = 0;
+        driver_bridge::get_capture_status(active_after, captured_after, dropped_after);
+        log_msg(hf, tag, "NETWORK-FIXTURE -- udp capture stop port=%u before_active=%d before_captured=%u before_dropped=%u stopped=%d after_active=%d after_captured=%u after_dropped=%u",
+            static_cast<unsigned>(port),
+            active_before ? 1 : 0,
+            captured_before,
+            dropped_before,
+            stopped ? 1 : 0,
+            active_after ? 1 : 0,
+            captured_after,
+            dropped_after);
     }
 
     std::vector<uint8_t> mcp_http_fixture_request_payload(const char* path) {
@@ -22727,14 +22909,30 @@ void test_tool_api_monitor_start(HANDLE hf, std::atomic<int>& passed, std::atomi
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
             0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10
         };
-        if (!seed_udp_capture_for_detection(hf, "mcp.quic_manage.detect_connections", 443, packet)) {
+        bool capture_active = false;
+        uint32_t capture_count = 0;
+        uint32_t capture_dropped = 0;
+        if (!seed_udp_capture_for_detection(hf, "mcp.quic_manage.detect_connections", 443, packet, &capture_active, &capture_count, &capture_dropped)) {
             record_fixture_failed_tool("quic_manage", failed);
             return;
         }
         mcp_standalone::json args;
         args["pid"] = GetCurrentProcessId();
-        test_tool_action_call(hf, "mcp.quic_manage.detect_connections", "quic_manage", "detect_connections", args, passed, failed, skipped);
-        driver_bridge::stop_capture();
+        args["payload_hex"] = test_coverage_bytes_hex(packet);
+        args["remote_port"] = 443;
+        args["local_port"] = 40000;
+        log_msg(hf, "mcp.quic_manage.detect_connections", "NETWORK-FIXTURE -- quic detector dispatch deterministic_payload=1 capture_active=%d capture_count=%u capture_dropped=%u bytes=%zu header_class=quic_initial_long",
+            capture_active ? 1 : 0,
+            capture_count,
+            capture_dropped,
+            packet.size());
+        mcp_standalone::tool_result_t result;
+        auto status = test_tool_action_call(hf, "mcp.quic_manage.detect_connections", "quic_manage", "detect_connections", args, passed, failed, skipped, false, &result);
+        log_msg(hf, "mcp.quic_manage.detect_connections", "NETWORK-FIXTURE -- quic detector result status=%s text=%s data=%s",
+            mcp_status_classification_name(status),
+            compact_text(result.text, 700).c_str(),
+            compact_json(result.data, 900).c_str());
+        stop_udp_capture_after_detection(hf, "mcp.quic_manage.detect_connections", 443);
     }
 
     void test_tool_quic_manage_decrypt_initial(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -22774,14 +22972,30 @@ void test_tool_api_monitor_start(HANDLE hf, std::atomic<int>& passed, std::atomi
             0x00, 0x01,
             0x01
         };
-        if (!seed_udp_capture_for_detection(hf, "mcp.dtls_manage.detect_sessions", 4443, packet)) {
+        bool capture_active = false;
+        uint32_t capture_count = 0;
+        uint32_t capture_dropped = 0;
+        if (!seed_udp_capture_for_detection(hf, "mcp.dtls_manage.detect_sessions", 4443, packet, &capture_active, &capture_count, &capture_dropped)) {
             record_fixture_failed_tool("dtls_manage", failed);
             return;
         }
         mcp_standalone::json args;
         args["pid"] = GetCurrentProcessId();
-        test_tool_action_call(hf, "mcp.dtls_manage.detect_sessions", "dtls_manage", "detect_sessions", args, passed, failed, skipped);
-        driver_bridge::stop_capture();
+        args["payload_hex"] = test_coverage_bytes_hex(packet);
+        args["remote_port"] = 4443;
+        args["local_port"] = 40000;
+        log_msg(hf, "mcp.dtls_manage.detect_sessions", "NETWORK-FIXTURE -- dtls detector dispatch deterministic_payload=1 capture_active=%d capture_count=%u capture_dropped=%u bytes=%zu header_class=dtls_handshake_record",
+            capture_active ? 1 : 0,
+            capture_count,
+            capture_dropped,
+            packet.size());
+        mcp_standalone::tool_result_t result;
+        auto status = test_tool_action_call(hf, "mcp.dtls_manage.detect_sessions", "dtls_manage", "detect_sessions", args, passed, failed, skipped, false, &result);
+        log_msg(hf, "mcp.dtls_manage.detect_sessions", "NETWORK-FIXTURE -- dtls detector result status=%s text=%s data=%s",
+            mcp_status_classification_name(status),
+            compact_text(result.text, 700).c_str(),
+            compact_json(result.data, 900).c_str());
+        stop_udp_capture_after_detection(hf, "mcp.dtls_manage.detect_sessions", 4443);
     }
 
     void test_tool_dtls_manage_extract_keys(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -25757,7 +25971,7 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
         const std::string dynamic_script_url = burp_fixture_url(hf, tag, dynamic_script_path.c_str());
         mcp_standalone::json dynamic_script_args;
         dynamic_script_args["page_id"] = fixture_page;
-        dynamic_script_args["expression"] = "(async()=>{const src='" + dynamic_script_url + "';const marker='" + script_marker + "';const cookie='" + cookie_name + "';const out={loaded:false,error:'',src:src,capture_marker:marker,script_count:0,script_urls:[],src_found:false,marker_present:false,cookie_present:false,cookie_hook_installed:!!window.__mcp_cookie_hook_installed,js_cookie_log_count:Array.isArray(window.__mcp_cookie_log)?window.__mcp_cookie_log.length:0,page_url:String(location.href||'')};try{await new Promise((resolve,reject)=>{const s=document.createElement('script');s.src=src;s.async=false;s.onload=()=>{out.loaded=true;resolve();};s.onerror=()=>reject(new Error('script_onerror'));(document.head||document.documentElement).appendChild(s);setTimeout(()=>reject(new Error('script_timeout')),5000);});}catch(e){out.error=String(e&&e.message?e.message:e);}try{out.script_urls=Array.from(document.querySelectorAll('script')).map(s=>String(s.src||''));out.script_count=out.script_urls.length;out.src_found=out.script_urls.some(u=>u.indexOf('/aida-fixture.js')>=0&&u.indexOf(marker)>=0);out.marker_present=window.aidaExternalFixture==='AIDA_CAMOUFOX_SCRIPT_MARKER'&&window.aidaExternalFixtureCapture===marker;out.cookie_present=document.cookie.indexOf(cookie+'=')>=0;out.cookie_hook_installed=!!window.__mcp_cookie_hook_installed;out.js_cookie_log_count=Array.isArray(window.__mcp_cookie_log)?window.__mcp_cookie_log.length:0;}catch(e){out.inspect_error=String(e&&e.message?e.message:e);}return out;})()";
+        dynamic_script_args["expression"] = "(async()=>{const src='" + dynamic_script_url + "';const marker='" + script_marker + "';const cookie='" + cookie_name + "';const out={loaded:false,error:'',src:src,capture_marker:marker,script_count:0,script_urls:[],normalized_script_urls:[],normalized_src:'',src_found:false,marker_present:false,global_marker_present:false,source_marker_present:false,source_capture_present:false,script_response_status:0,script_response_ok:false,source_len:0,source_sha256:'',cookie_present:false,cookie_hook_installed:!!window.__mcp_cookie_hook_installed,js_cookie_log_count:Array.isArray(window.__mcp_cookie_log)?window.__mcp_cookie_log.length:0,page_url:String(location.href||'')};const norm=(v)=>{try{const u=new URL(String(v||''),location.href);u.hash='';return u.href;}catch(e){return String(v||'');}};const sha256=async(t)=>{try{const b=new TextEncoder().encode(String(t||''));const d=await crypto.subtle.digest('SHA-256',b);return Array.from(new Uint8Array(d)).map(x=>x.toString(16).padStart(2,'0')).join('');}catch(e){let h=2166136261;const s=String(t||'');for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619)>>>0;}return 'fnv32:'+h.toString(16).padStart(8,'0');}};out.normalized_src=norm(src);try{await new Promise((resolve,reject)=>{const s=document.createElement('script');s.src=src;s.async=false;s.onload=()=>{out.loaded=true;resolve();};s.onerror=()=>reject(new Error('script_onerror'));(document.head||document.documentElement).appendChild(s);setTimeout(()=>reject(new Error('script_timeout')),5000);});}catch(e){out.error=String(e&&e.message?e.message:e);}try{out.script_urls=Array.from(document.querySelectorAll('script')).map(s=>String(s.src||''));out.normalized_script_urls=out.script_urls.map(norm);out.script_count=out.script_urls.length;out.src_found=out.normalized_script_urls.some(u=>u.indexOf('/aida-fixture.js')>=0&&u.indexOf(marker)>=0);try{const r=await fetch(src,{cache:'force-cache'});out.script_response_status=r.status||0;out.script_response_ok=!!r.ok;const body=await r.text();out.source_len=body.length;out.source_sha256=await sha256(body);out.source_marker_present=body.indexOf('AIDA_CAMOUFOX_SCRIPT_MARKER')>=0;out.source_capture_present=body.indexOf(marker)>=0;}catch(e){out.source_error=String(e&&e.message?e.message:e);}out.global_marker_present=window.aidaExternalFixture==='AIDA_CAMOUFOX_SCRIPT_MARKER'&&window.aidaExternalFixtureCapture===marker;out.marker_present=out.global_marker_present||(out.source_marker_present&&out.source_capture_present);out.cookie_present=document.cookie.indexOf(cookie+'=')>=0;out.cookie_hook_installed=!!window.__mcp_cookie_hook_installed;out.js_cookie_log_count=Array.isArray(window.__mcp_cookie_log)?window.__mcp_cookie_log.length:0;out.cookie_hook_state=window.__mcp_cookie_hook_state||{};}catch(e){out.inspect_error=String(e&&e.message?e.message:e);}return out;})()";
         dynamic_script_args["await_promise"] = true;
         mcp_standalone::tool_result_t dynamic_script_result;
         auto dynamic_script_status = test_tool_action_call(hf, "mcp.camoufox.browser_interaction.evaluate.dynamic_script_fixture", "browser_interaction", "evaluate",
@@ -25768,21 +25982,39 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
             bool loaded = false;
             bool src_found = false;
             bool marker_present = false;
+            bool global_marker_present = false;
+            bool source_marker_present = false;
+            bool source_capture_present = false;
             bool http_cookie_present = false;
             uint64_t script_count = 0;
+            uint64_t source_len = 0;
+            uint64_t script_response_status = 0;
+            std::string source_sha256;
             payload_bool_field(script_value ? *script_value : dynamic_script_result.data, "loaded", loaded);
             payload_bool_field(script_value ? *script_value : dynamic_script_result.data, "src_found", src_found);
             payload_bool_field(script_value ? *script_value : dynamic_script_result.data, "marker_present", marker_present);
+            payload_bool_field(script_value ? *script_value : dynamic_script_result.data, "global_marker_present", global_marker_present);
+            payload_bool_field(script_value ? *script_value : dynamic_script_result.data, "source_marker_present", source_marker_present);
+            payload_bool_field(script_value ? *script_value : dynamic_script_result.data, "source_capture_present", source_capture_present);
             payload_bool_field(script_value ? *script_value : dynamic_script_result.data, "cookie_present", http_cookie_present);
             payload_u64_field(script_value ? *script_value : dynamic_script_result.data, "script_count", script_count);
+            payload_u64_field(script_value ? *script_value : dynamic_script_result.data, "source_len", source_len);
+            payload_u64_field(script_value ? *script_value : dynamic_script_result.data, "script_response_status", script_response_status);
+            payload_string_field(script_value ? *script_value : dynamic_script_result.data, "source_sha256", source_sha256);
             dynamic_script_fixture_ok = loaded && src_found && marker_present && http_cookie_present && script_count > 0;
-            log_msg(hf, tag, "SCRIPT-FIXTURE -- status=%s loaded=%d src_found=%d marker_present=%d http_cookie_present=%d script_count=%llu marker=%s data=%s",
+            log_msg(hf, tag, "SCRIPT-FIXTURE -- status=%s loaded=%d src_found=%d marker_present=%d global_marker_present=%d source_marker_present=%d source_capture_present=%d http_cookie_present=%d script_count=%llu source_len=%llu response_status=%llu source_sha256=%s marker=%s data=%s",
                 mcp_status_classification_name(dynamic_script_status),
                 loaded ? 1 : 0,
                 src_found ? 1 : 0,
                 marker_present ? 1 : 0,
+                global_marker_present ? 1 : 0,
+                source_marker_present ? 1 : 0,
+                source_capture_present ? 1 : 0,
                 http_cookie_present ? 1 : 0,
                 static_cast<unsigned long long>(script_count),
+                static_cast<unsigned long long>(source_len),
+                static_cast<unsigned long long>(script_response_status),
+                source_sha256.empty() ? "<empty>" : source_sha256.c_str(),
                 script_marker.c_str(),
                 compact_json(dynamic_script_result.data, 1400).c_str());
             if (!dynamic_script_fixture_ok) {
@@ -25826,6 +26058,7 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
         search_args["keyword"] = "AIDA_CAMOUFOX_SCRIPT_MARKER";
         search_args["max_results"] = 8;
         search_args["context_chars"] = 80;
+        search_args["page_id"] = fixture_page;
         if (scripts_fixture_ok) {
             mcp_standalone::tool_result_t search_result;
             auto search_status = test_tool_call(hf, "mcp.camoufox.search_code", get_server(), "search_code", search_args, passed, failed, skipped, false, &search_result);
@@ -25882,6 +26115,7 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
         }
         mcp_standalone::json cookie_source_args;
         cookie_source_args["name_filter"] = cookie_name;
+        cookie_source_args["page_id"] = fixture_page;
         mcp_standalone::tool_result_t cookie_source_result;
         if (cookie_readback_ok && cookie_refresh_ok && cookie_hook_ready && dynamic_script_fixture_ok) {
             auto cookie_source_status = test_tool_call(hf, "mcp.camoufox.analyze_cookie_sources", get_server(), "analyze_cookie_sources", cookie_source_args, passed, failed, skipped, false, &cookie_source_result);
@@ -26884,7 +27118,7 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
             args["protocol"] = "udp";
             test_coverage_protocol_re_emit_stimulus_t stimulus;
             if (protocol_desc_ready)
-                stimulus = test_coverage_protocol_re_post_emit_stimulus(replay_pid, protocol_desc, 3, 5, 150, 150);
+                stimulus = test_coverage_protocol_re_post_emit_stimulus(replay_pid, protocol_desc, 3, 5, 150, 150, hf, tag, "replay_recorded_loopback_session");
             const bool replay_record_case_ok = test_coverage_net_thread_domains_9_10_16_case(hf, tag, replay_tool, "replay_record_deterministic_session", args, 4500,
                 [&recorded_replay_session_id](const invoke_result_t& ir, std::string& reason) {
                     if (!ir.success)
@@ -27218,7 +27452,7 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
             args["size_reg"] = "r8";
             args["sample_ms"] = 1200;
             args["max_captures"] = 8;
-            auto stimulus = test_coverage_protocol_re_post_emit_stimulus(trace_pid, protocol_desc, 2, 6, 100, 125);
+            auto stimulus = test_coverage_protocol_re_post_emit_stimulus(trace_pid, protocol_desc, 2, 6, 100, 125, hf, tag, "trace_session_fixture_serializer_positive");
             const bool trace_case_ok = test_coverage_net_thread_domains_9_10_16_case(hf, tag, trace_tool, "trace_session_fixture_serializer_positive", args, 4500,
                 [](const invoke_result_t& ir, std::string& reason) {
                     if (!ir.success) {

@@ -5,6 +5,7 @@
 #include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <psapi.h>
 
 #include "standalone_compat.hpp"
 #include "comm.h"
@@ -4718,18 +4719,49 @@ static std::string bounded_kernel_module_name(const sys_module_entry_t& m)
     return (slash == std::string::npos) ? path : path.substr(slash + 1);
 }
 
+enum class kernel_module_query_fallback_policy
+{
+    primary_only,
+    allow_readonly_kernel_base_evidence
+};
+
 struct kernel_module_query_diagnostics_t
 {
     ULONG count = 0;
     std::size_t buffer_size = 0;
+    std::size_t returned_length = 0;
+    std::size_t abi_header_size = 0;
+    std::size_t abi_entry_size = 0;
+    std::size_t abi_min_size = 0;
     std::size_t zero_base_count = 0;
     std::size_t nonzero_base_count = 0;
+    std::size_t resolved_zero_base_count = 0;
+    std::size_t resolved_nonzero_base_count = 0;
+    std::uint32_t initial_ntstatus = 0;
+    std::uint32_t final_ntstatus = 0;
+    DWORD win32_error = 0;
+    bool primary_all_image_bases_zero = false;
     bool all_image_bases_zero = false;
     bool dependency_blocked = false;
+    bool fallback_attempted = false;
+    bool fallback_used = false;
+    DWORD fallback_win32_error = 0;
+    std::size_t fallback_bytes_returned = 0;
+    std::size_t fallback_raw_count = 0;
+    std::size_t fallback_accepted_count = 0;
+    std::size_t fallback_rejected_count = 0;
+    std::size_t fallback_name_query_failed_count = 0;
+    std::size_t fallback_duplicate_name_count = 0;
+    std::size_t fallback_match_count = 0;
+    std::size_t fallback_missing_count = 0;
     std::vector<std::string> samples;
+    std::vector<std::string> fallback_samples;
     json token;
     json driver;
     std::string strict_fallback;
+    std::string fallback_status;
+    std::string fallback_reason;
+    std::string base_source;
 };
 
 static const char* integrity_name_from_rid(DWORD rid)
@@ -4817,16 +4849,301 @@ static std::string module_sample_text(const std::vector<std::string>& samples)
     return ss.str();
 }
 
+struct readonly_kernel_module_base_snapshot_t
+{
+    DWORD win32_error = 0;
+    DWORD bytes_returned = 0;
+    DWORD raw_count = 0;
+    std::size_t accepted_count = 0;
+    std::size_t rejected_count = 0;
+    std::size_t name_query_failed_count = 0;
+    std::size_t duplicate_name_count = 0;
+    bool ok = false;
+    std::string reason;
+    std::unordered_map<std::string, std::uint64_t> bases_by_name;
+    std::vector<std::string> samples;
+};
+
+static bool is_page_aligned_kernel_base(std::uint64_t base)
+{
+    return is_probably_kernel_address(base) && (base & 0xFFFULL) == 0;
+}
+
+static readonly_kernel_module_base_snapshot_t enumerate_readonly_kernel_module_bases_psapi(const char* reason)
+{
+    readonly_kernel_module_base_snapshot_t out;
+    LPVOID drivers[4096] = {};
+    DWORD cb_needed = 0;
+    constexpr DWORD driver_buffer_bytes = static_cast<DWORD>(sizeof(drivers));
+    if (!EnumDeviceDrivers(drivers, driver_buffer_bytes, &cb_needed))
+    {
+        out.win32_error = GetLastError();
+        out.reason = "EnumDeviceDrivers_failed";
+        diag::log_tagged_fmt("drv_tools",
+            "kernel_module_base_fallback rejected reason=%s caller_reason=%s gle=%lu bytes_returned=%lu raw_count=0 accepted=0 rejected=0",
+            out.reason.c_str(),
+            reason ? reason : "<null>",
+            static_cast<unsigned long>(out.win32_error),
+            static_cast<unsigned long>(cb_needed));
+        return out;
+    }
+
+    out.bytes_returned = cb_needed;
+    out.raw_count = cb_needed / static_cast<DWORD>(sizeof(LPVOID));
+    if (cb_needed > driver_buffer_bytes)
+        out.raw_count = static_cast<DWORD>(_countof(drivers));
+    out.samples.reserve((std::min)(static_cast<DWORD>(8), out.raw_count));
+
+    for (DWORD i = 0; i < out.raw_count; ++i)
+    {
+        const std::uint64_t base = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(drivers[i]));
+        char name[MAX_PATH] = {};
+        DWORD name_gle = 0;
+        bool name_ok = false;
+        if (drivers[i] != nullptr)
+        {
+            name_ok = GetDeviceDriverBaseNameA(drivers[i], name, static_cast<DWORD>(sizeof(name))) != 0;
+            if (!name_ok)
+                name_gle = GetLastError();
+        }
+        else
+        {
+            name_gle = 0;
+        }
+
+        if (out.samples.size() < 8)
+        {
+            std::ostringstream sample;
+            sample << "index=" << i
+                   << ",name=" << (name_ok ? name : "<name_query_failed>")
+                   << ",base=" << sa_format_address(base);
+            if (!name_ok)
+                sample << ",gle=" << name_gle;
+            out.samples.push_back(sample.str());
+        }
+
+        if (drivers[i] == nullptr)
+        {
+            ++out.rejected_count;
+            continue;
+        }
+        if (!name_ok)
+        {
+            if (out.win32_error == 0)
+                out.win32_error = name_gle;
+            ++out.name_query_failed_count;
+            ++out.rejected_count;
+            continue;
+        }
+        if (!is_page_aligned_kernel_base(base))
+        {
+            ++out.rejected_count;
+            continue;
+        }
+
+        const std::string key = to_lower_ascii_copy(name);
+        auto inserted = out.bases_by_name.emplace(key, base);
+        if (!inserted.second)
+            ++out.duplicate_name_count;
+        ++out.accepted_count;
+    }
+
+    if (cb_needed > driver_buffer_bytes)
+        out.reason = "EnumDeviceDrivers_truncated";
+    else if (out.raw_count == 0)
+        out.reason = "EnumDeviceDrivers_empty";
+    else if (out.name_query_failed_count != 0)
+        out.reason = "EnumDeviceDrivers_name_query_failed";
+    else if (out.rejected_count != 0)
+        out.reason = "EnumDeviceDrivers_rejected_noncanonical_base";
+    else if (out.duplicate_name_count != 0)
+        out.reason = "EnumDeviceDrivers_duplicate_module_name";
+    else if (out.bases_by_name.empty())
+        out.reason = "EnumDeviceDrivers_no_usable_bases";
+    else
+    {
+        out.ok = true;
+        out.reason = "EnumDeviceDrivers_unique_kernel_bases";
+    }
+
+    const std::string samples = module_sample_text(out.samples);
+    diag::log_tagged_fmt("drv_tools",
+        "kernel_module_base_fallback %s caller_reason=%s bytes_returned=%lu raw_count=%lu accepted=%zu rejected=%zu name_query_failed=%zu duplicate_names=%zu samples=%s",
+        out.ok ? "accepted" : "rejected",
+        reason ? reason : "<null>",
+        static_cast<unsigned long>(out.bytes_returned),
+        static_cast<unsigned long>(out.raw_count),
+        out.accepted_count,
+        out.rejected_count,
+        out.name_query_failed_count,
+        out.duplicate_name_count,
+        samples.empty() ? "<none>" : samples.c_str());
+
+    return out;
+}
+
+static void copy_readonly_fallback_diagnostics(
+    const readonly_kernel_module_base_snapshot_t& fallback,
+    kernel_module_query_diagnostics_t& diag_ref)
+{
+    diag_ref.fallback_win32_error = fallback.win32_error;
+    diag_ref.fallback_bytes_returned = fallback.bytes_returned;
+    diag_ref.fallback_raw_count = fallback.raw_count;
+    diag_ref.fallback_accepted_count = fallback.accepted_count;
+    diag_ref.fallback_rejected_count = fallback.rejected_count;
+    diag_ref.fallback_name_query_failed_count = fallback.name_query_failed_count;
+    diag_ref.fallback_duplicate_name_count = fallback.duplicate_name_count;
+    diag_ref.fallback_samples = fallback.samples;
+}
+
+static bool apply_readonly_kernel_module_base_fallback(
+    sys_module_info_t* info,
+    kernel_module_query_diagnostics_t& diag_ref,
+    std::string& error_msg)
+{
+    diag_ref.fallback_attempted = true;
+    diag_ref.strict_fallback = "EnumDeviceDrivers_readonly_kernel_module_base";
+    diag_ref.fallback_status = "attempted";
+
+    const readonly_kernel_module_base_snapshot_t fallback =
+        enumerate_readonly_kernel_module_bases_psapi("SystemModuleInformation_all_image_bases_zero");
+    copy_readonly_fallback_diagnostics(fallback, diag_ref);
+
+    const std::string primary_samples = module_sample_text(diag_ref.samples);
+    if (!fallback.ok)
+    {
+        diag_ref.dependency_blocked = true;
+        diag_ref.token = current_process_token_diagnostics();
+        diag_ref.fallback_status = "rejected";
+        diag_ref.fallback_reason = fallback.reason;
+        const std::string token_json = diag_ref.token.dump();
+        const std::string driver_json = diag_ref.driver.dump();
+        error_msg = OBFSTR("dependency_blocked: NtQuerySystemInformation(SystemModuleInformation) returned ") +
+            std::to_string(diag_ref.count) +
+            OBFSTR(" modules but every ImageBase is zero; read-only EnumDeviceDrivers fallback was rejected. sample_modules=") +
+            (primary_samples.empty() ? std::string("<none>") : primary_samples) +
+            OBFSTR(" strict_fallback=") + diag_ref.strict_fallback +
+            OBFSTR(" fallback_reason=") + diag_ref.fallback_reason;
+        diag::log_tagged_fmt("drv_tools",
+            "query_kernel_modules dependency_blocked reason=all_image_bases_zero fallback_status=rejected fallback_reason=%s count=%lu token=%s driver=%s strict_fallback=%s",
+            diag_ref.fallback_reason.c_str(),
+            static_cast<unsigned long>(diag_ref.count),
+            token_json.c_str(),
+            driver_json.c_str(),
+            diag_ref.strict_fallback.c_str());
+        return false;
+    }
+
+    std::vector<std::uint64_t> resolved_bases(diag_ref.count, 0);
+    std::vector<std::string> missing_samples;
+    missing_samples.reserve(8);
+    for (ULONG i = 0; i < diag_ref.count; ++i)
+    {
+        const std::string name = bounded_kernel_module_name(info->Modules[i]);
+        const std::string key = to_lower_ascii_copy(name);
+        const auto it = fallback.bases_by_name.find(key);
+        if (it == fallback.bases_by_name.end() || !is_page_aligned_kernel_base(it->second))
+        {
+            ++diag_ref.fallback_missing_count;
+            if (missing_samples.size() < 8)
+                missing_samples.push_back(name.empty() ? std::string("<empty>") : name);
+            continue;
+        }
+        resolved_bases[i] = it->second;
+        ++diag_ref.fallback_match_count;
+    }
+
+    if (diag_ref.fallback_match_count != diag_ref.count || diag_ref.fallback_missing_count != 0)
+    {
+        diag_ref.dependency_blocked = true;
+        diag_ref.token = current_process_token_diagnostics();
+        diag_ref.fallback_status = "rejected";
+        diag_ref.fallback_reason = "EnumDeviceDrivers_did_not_match_every_SystemModuleInformation_entry";
+        const std::string missing = module_sample_text(missing_samples);
+        const std::string token_json = diag_ref.token.dump();
+        const std::string driver_json = diag_ref.driver.dump();
+        error_msg = OBFSTR("dependency_blocked: NtQuerySystemInformation(SystemModuleInformation) returned ") +
+            std::to_string(diag_ref.count) +
+            OBFSTR(" modules but every ImageBase is zero; read-only EnumDeviceDrivers fallback did not match every primary module. missing_modules=") +
+            (missing.empty() ? std::string("<none>") : missing) +
+            OBFSTR(" strict_fallback=") + diag_ref.strict_fallback;
+        diag::log_tagged_fmt("drv_tools",
+            "query_kernel_modules dependency_blocked reason=all_image_bases_zero fallback_status=rejected fallback_reason=%s count=%lu match_count=%zu missing_count=%zu missing=%s token=%s driver=%s strict_fallback=%s",
+            diag_ref.fallback_reason.c_str(),
+            static_cast<unsigned long>(diag_ref.count),
+            diag_ref.fallback_match_count,
+            diag_ref.fallback_missing_count,
+            missing.empty() ? "<none>" : missing.c_str(),
+            token_json.c_str(),
+            driver_json.c_str(),
+            diag_ref.strict_fallback.c_str());
+        return false;
+    }
+
+    diag_ref.resolved_zero_base_count = 0;
+    diag_ref.resolved_nonzero_base_count = 0;
+    for (ULONG i = 0; i < diag_ref.count; ++i)
+    {
+        info->Modules[i].ImageBase = reinterpret_cast<PVOID>(static_cast<std::uintptr_t>(resolved_bases[i]));
+        if (resolved_bases[i] == 0)
+            ++diag_ref.resolved_zero_base_count;
+        else
+            ++diag_ref.resolved_nonzero_base_count;
+    }
+
+    diag_ref.all_image_bases_zero = diag_ref.count != 0 && diag_ref.resolved_nonzero_base_count == 0;
+    diag_ref.dependency_blocked = false;
+    diag_ref.fallback_used = true;
+    diag_ref.fallback_status = "used";
+    diag_ref.fallback_reason = "EnumDeviceDrivers_matched_all_SystemModuleInformation_entries";
+    diag_ref.base_source = "EnumDeviceDrivers";
+    const std::string fallback_samples = module_sample_text(diag_ref.fallback_samples);
+    diag::log_tagged_fmt("drv_tools",
+        "query_kernel_modules fallback_selected source=EnumDeviceDrivers count=%lu match_count=%zu resolved_zero=%zu resolved_nonzero=%zu primary_samples=%s fallback_samples=%s",
+        static_cast<unsigned long>(diag_ref.count),
+        diag_ref.fallback_match_count,
+        diag_ref.resolved_zero_base_count,
+        diag_ref.resolved_nonzero_base_count,
+        primary_samples.empty() ? "<none>" : primary_samples.c_str(),
+        fallback_samples.empty() ? "<none>" : fallback_samples.c_str());
+    return true;
+}
+
 static json kernel_module_query_diagnostics_json(const kernel_module_query_diagnostics_t& diag)
 {
     json out = json::object();
     out["dependency_blocked"] = diag.dependency_blocked;
     out["module_count"] = diag.count;
     out["buffer_size"] = diag.buffer_size;
+    out["returned_length"] = diag.returned_length;
+    out["abi_header_size"] = diag.abi_header_size;
+    out["abi_entry_size"] = diag.abi_entry_size;
+    out["abi_min_size"] = diag.abi_min_size;
     out["zero_base_count"] = diag.zero_base_count;
     out["nonzero_base_count"] = diag.nonzero_base_count;
+    out["resolved_zero_base_count"] = diag.resolved_zero_base_count;
+    out["resolved_nonzero_base_count"] = diag.resolved_nonzero_base_count;
     out["all_image_bases_zero"] = diag.all_image_bases_zero;
+    out["initial_ntstatus"] = sa_format_address(static_cast<std::uint64_t>(diag.initial_ntstatus));
+    out["final_ntstatus"] = sa_format_address(static_cast<std::uint64_t>(diag.final_ntstatus));
+    out["win32_error"] = static_cast<unsigned long>(diag.win32_error);
+    out["primary_all_image_bases_zero"] = diag.primary_all_image_bases_zero;
     out["sample_modules"] = diag.samples;
+    out["base_source"] = diag.base_source;
+    out["fallback_attempted"] = diag.fallback_attempted;
+    out["fallback_used"] = diag.fallback_used;
+    out["fallback_status"] = diag.fallback_status;
+    out["fallback_reason"] = diag.fallback_reason;
+    out["fallback_win32_error"] = static_cast<unsigned long>(diag.fallback_win32_error);
+    out["fallback_bytes_returned"] = diag.fallback_bytes_returned;
+    out["fallback_raw_count"] = diag.fallback_raw_count;
+    out["fallback_accepted_count"] = diag.fallback_accepted_count;
+    out["fallback_rejected_count"] = diag.fallback_rejected_count;
+    out["fallback_name_query_failed_count"] = diag.fallback_name_query_failed_count;
+    out["fallback_duplicate_name_count"] = diag.fallback_duplicate_name_count;
+    out["fallback_match_count"] = diag.fallback_match_count;
+    out["fallback_missing_count"] = diag.fallback_missing_count;
+    out["fallback_sample_modules"] = diag.fallback_samples;
     out["token"] = diag.token;
     out["driver"] = diag.driver;
     out["strict_fallback"] = diag.strict_fallback;
@@ -4854,14 +5171,34 @@ static bool query_kernel_modules(
     std::vector<std::uint8_t>& out_buffer,
     sys_module_info_t*& out_info,
     std::string& error_msg,
-    kernel_module_query_diagnostics_t* diagnostics = nullptr)
+    kernel_module_query_diagnostics_t* diagnostics = nullptr,
+    kernel_module_query_fallback_policy fallback_policy = kernel_module_query_fallback_policy::primary_only)
 {
+    out_info = nullptr;
+    error_msg.clear();
     if (diagnostics)
         *diagnostics = {};
+    kernel_module_query_diagnostics_t local_diag{};
+    auto& diag_ref = diagnostics ? *diagnostics : local_diag;
+    diag_ref.abi_header_size = sizeof(ULONG);
+    diag_ref.abi_entry_size = sizeof(sys_module_entry_t);
+    diag_ref.base_source = "SystemModuleInformation";
+    diag_ref.strict_fallback = fallback_policy == kernel_module_query_fallback_policy::allow_readonly_kernel_base_evidence
+        ? "not_needed_primary_image_bases_nonzero"
+        : "disabled_primary_only";
+    diag_ref.fallback_status = "not_attempted";
+    diag_ref.fallback_reason = "primary_source_not_yet_evaluated";
+
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
     if (!ntdll)
     {
+        diag_ref.win32_error = GetLastError();
         error_msg = OBFSTR("Cannot resolve ntdll.dll");
+        diag::log_tagged_fmt("drv_tools",
+            "query_kernel_modules failed stage=resolve_ntdll gle=%lu abi_header=%zu abi_entry=%zu",
+            static_cast<unsigned long>(diag_ref.win32_error),
+            diag_ref.abi_header_size,
+            diag_ref.abi_entry_size);
         return false;
     }
 
@@ -4869,14 +5206,28 @@ static bool query_kernel_modules(
         GetProcAddress(ntdll, "NtQuerySystemInformation"));
     if (!pNtQuerySystemInformation)
     {
+        diag_ref.win32_error = GetLastError();
         error_msg = OBFSTR("Cannot resolve NtQuerySystemInformation");
+        diag::log_tagged_fmt("drv_tools",
+            "query_kernel_modules failed stage=resolve_NtQuerySystemInformation gle=%lu abi_header=%zu abi_entry=%zu",
+            static_cast<unsigned long>(diag_ref.win32_error),
+            diag_ref.abi_header_size,
+            diag_ref.abi_entry_size);
         return false;
     }
 
     constexpr ULONG SystemModuleInformation = 11;
     ULONG needed = 0;
-    diag::log_tagged_fmt("drv_tools", "query_kernel_modules entry");
-    pNtQuerySystemInformation(SystemModuleInformation, nullptr, 0, &needed);
+    diag::log_tagged_fmt("drv_tools",
+        "query_kernel_modules entry fallback_policy=%s abi_header=%zu abi_entry=%zu pid=%lu tid=%lu",
+        fallback_policy == kernel_module_query_fallback_policy::allow_readonly_kernel_base_evidence ? "allow_readonly_kernel_base_evidence" : "primary_only",
+        diag_ref.abi_header_size,
+        diag_ref.abi_entry_size,
+        static_cast<unsigned long>(GetCurrentProcessId()),
+        static_cast<unsigned long>(GetCurrentThreadId()));
+    const LONG probe_status = pNtQuerySystemInformation(SystemModuleInformation, nullptr, 0, &needed);
+    diag_ref.initial_ntstatus = static_cast<std::uint32_t>(probe_status);
+    diag_ref.returned_length = needed;
     if (needed == 0)
         needed = 256 * 1024;
     needed += 16384;
@@ -4885,11 +5236,27 @@ static bool query_kernel_modules(
     LONG status = pNtQuerySystemInformation(
         SystemModuleInformation, out_buffer.data(),
         static_cast<ULONG>(out_buffer.size()), &needed);
+    diag_ref.final_ntstatus = static_cast<std::uint32_t>(status);
+    diag_ref.returned_length = needed;
+    diag_ref.buffer_size = out_buffer.size();
+    diag::log_tagged_fmt("drv_tools",
+        "query_kernel_modules qsi probe_status=0x%08X final_status=0x%08X bytes_returned=%lu buffer_size=%zu abi_header=%zu abi_entry=%zu",
+        static_cast<unsigned int>(diag_ref.initial_ntstatus),
+        static_cast<unsigned int>(diag_ref.final_ntstatus),
+        static_cast<unsigned long>(needed),
+        out_buffer.size(),
+        diag_ref.abi_header_size,
+        diag_ref.abi_entry_size);
 
     if (status < 0)
     {
-        error_msg = OBFSTR("NtQuerySystemInformation(SystemModuleInformation) failed: NTSTATUS 0x")
-            + sa_format_address(static_cast<uint64_t>(static_cast<unsigned long>(status)));
+        error_msg = OBFSTR("NtQuerySystemInformation(SystemModuleInformation) failed: NTSTATUS ")
+            + sa_format_address(static_cast<uint64_t>(diag_ref.final_ntstatus));
+        diag::log_tagged_fmt("drv_tools",
+            "query_kernel_modules failed stage=SystemModuleInformation status=0x%08X bytes_returned=%lu buffer_size=%zu",
+            static_cast<unsigned int>(diag_ref.final_ntstatus),
+            static_cast<unsigned long>(needed),
+            out_buffer.size());
         return false;
     }
 
@@ -4897,21 +5264,30 @@ static bool query_kernel_modules(
     if (out_buffer.size() < sizeof(ULONG))
     {
         error_msg = OBFSTR("System module buffer is too small");
+        diag::log_tagged_fmt("drv_tools",
+            "query_kernel_modules failed stage=buffer_too_small buffer_size=%zu abi_header=%zu",
+            out_buffer.size(),
+            diag_ref.abi_header_size);
         return false;
     }
     const ULONG count = out_info->NumberOfModules;
     const std::size_t min_size =
         sizeof(ULONG) + static_cast<std::size_t>(count) * sizeof(sys_module_entry_t);
+    diag_ref.count = count;
+    diag_ref.abi_min_size = min_size;
     if (count > 4096 || min_size > out_buffer.size())
     {
         error_msg = OBFSTR("System module buffer failed bounds validation: count=") +
             std::to_string(count) + OBFSTR(" buffer=") + std::to_string(out_buffer.size());
+        diag::log_tagged_fmt("drv_tools",
+            "query_kernel_modules failed stage=bounds count=%lu min_size=%zu buffer_size=%zu bytes_returned=%zu abi_entry=%zu",
+            static_cast<unsigned long>(count),
+            min_size,
+            out_buffer.size(),
+            diag_ref.returned_length,
+            diag_ref.abi_entry_size);
         return false;
     }
-    kernel_module_query_diagnostics_t local_diag{};
-    auto& diag_ref = diagnostics ? *diagnostics : local_diag;
-    diag_ref.count = count;
-    diag_ref.buffer_size = out_buffer.size();
     diag_ref.samples.reserve((std::min)(static_cast<ULONG>(8), count));
     for (ULONG i = 0; i < count; ++i)
     {
@@ -4925,12 +5301,17 @@ static bool query_kernel_modules(
         {
             std::ostringstream sample;
             sample << bounded_kernel_module_name(m)
-                   << "@base=" << sa_format_address(base)
-                   << ",size=" << sa_format_address(static_cast<std::uint64_t>(m.ImageSize));
+                   << "@raw_base=" << sa_format_address(base)
+                   << ",size=" << sa_format_address(static_cast<std::uint64_t>(m.ImageSize))
+                   << ",offset=" << static_cast<unsigned long>(m.OffsetToFileName);
             diag_ref.samples.push_back(sample.str());
         }
     }
-    diag_ref.all_image_bases_zero = count != 0 && diag_ref.nonzero_base_count == 0;
+    diag_ref.primary_all_image_bases_zero = count != 0 && diag_ref.nonzero_base_count == 0;
+    diag_ref.all_image_bases_zero = diag_ref.primary_all_image_bases_zero;
+    diag_ref.resolved_zero_base_count = diag_ref.zero_base_count;
+    diag_ref.resolved_nonzero_base_count = diag_ref.nonzero_base_count;
+    diag_ref.fallback_reason = diag_ref.primary_all_image_bases_zero ? "primary_source_all_image_bases_zero" : "primary_source_has_nonzero_bases";
     std::string kernel_session_reason;
     const bool kernel_session_ok = driver_bridge::kernel_session_available(&kernel_session_reason);
     diag_ref.driver = json::object({
@@ -4940,38 +5321,50 @@ static bool query_kernel_modules(
         {"status", driver_bridge::status()},
         {"attached_pid", driver_bridge::attached_pid()}
     });
-    diag_ref.strict_fallback = "unavailable_no_exported_readonly_kernel_module_base_api";
     const std::string samples = module_sample_text(diag_ref.samples);
     diag::log_tagged_fmt("drv_tools",
-        "query_kernel_modules ok count=%lu bytes=%zu zero_bases=%zu nonzero_bases=%zu all_zero=%d samples=%s driver_kernel=%d kernel_session=%d kernel_session_reason=%s",
+        "query_kernel_modules primary_ok count=%lu bytes=%zu returned=%zu zero_bases=%zu nonzero_bases=%zu all_zero=%d samples=%s driver_kernel=%d kernel_session=%d kernel_session_reason=%s",
         static_cast<unsigned long>(count),
         out_buffer.size(),
+        diag_ref.returned_length,
         diag_ref.zero_base_count,
         diag_ref.nonzero_base_count,
-        diag_ref.all_image_bases_zero ? 1 : 0,
+        diag_ref.primary_all_image_bases_zero ? 1 : 0,
         samples.empty() ? "<none>" : samples.c_str(),
         driver_bridge::using_kernel_driver() ? 1 : 0,
         kernel_session_ok ? 1 : 0,
         kernel_session_reason.empty() ? "<empty>" : kernel_session_reason.c_str());
 
-    if (diag_ref.all_image_bases_zero)
+    if (diag_ref.primary_all_image_bases_zero)
     {
+        if (fallback_policy == kernel_module_query_fallback_policy::allow_readonly_kernel_base_evidence)
+            return apply_readonly_kernel_module_base_fallback(out_info, diag_ref, error_msg);
+
         diag_ref.dependency_blocked = true;
         diag_ref.token = current_process_token_diagnostics();
+        if (diag_ref.fallback_status == "not_attempted")
+        {
+            diag_ref.strict_fallback = "disabled_for_primary_only_context";
+            diag_ref.fallback_reason = "readonly_kernel_base_fallback_not_permitted_by_caller";
+        }
         const std::string sample_value = samples.empty() ? std::string("<none>") : samples;
         error_msg = OBFSTR("dependency_blocked: NtQuerySystemInformation(SystemModuleInformation) returned ") +
             std::to_string(count) +
-            OBFSTR(" modules but every ImageBase is zero; kernel module base resolution is unavailable for this process. sample_modules=") +
+            OBFSTR(" modules but every ImageBase is zero; kernel module base resolution is unavailable for this context. sample_modules=") +
             sample_value +
-            OBFSTR(" strict_fallback=unavailable_no_exported_readonly_kernel_module_base_api");
+            OBFSTR(" strict_fallback=") + diag_ref.strict_fallback +
+            OBFSTR(" fallback_status=") + diag_ref.fallback_status +
+            OBFSTR(" fallback_reason=") + diag_ref.fallback_reason;
         const std::string token_json = diag_ref.token.dump();
         const std::string driver_json = diag_ref.driver.dump();
         diag::log_tagged_fmt("drv_tools",
-            "query_kernel_modules dependency_blocked reason=all_image_bases_zero count=%lu token=%s driver=%s strict_fallback=%s",
+            "query_kernel_modules dependency_blocked reason=all_image_bases_zero count=%lu token=%s driver=%s strict_fallback=%s fallback_status=%s fallback_reason=%s",
             static_cast<unsigned long>(count),
             token_json.c_str(),
             driver_json.c_str(),
-            diag_ref.strict_fallback.c_str());
+            diag_ref.strict_fallback.c_str(),
+            diag_ref.fallback_status.c_str(),
+            diag_ref.fallback_reason.c_str());
         return false;
     }
     return true;
@@ -4984,7 +5377,8 @@ tool_result_t driver_enumerate_kernel_modules(const json& params)
     sys_module_info_t* info = nullptr;
     std::string err;
     kernel_module_query_diagnostics_t query_diag{};
-    if (!query_kernel_modules(buf, info, err, &query_diag))
+    if (!query_kernel_modules(buf, info, err, &query_diag,
+            kernel_module_query_fallback_policy::allow_readonly_kernel_base_evidence))
     {
         if (query_diag.dependency_blocked)
             return tool_result_t::error(err, OBFSTR("dependency_blocked"), kernel_module_query_diagnostics_json(query_diag));
@@ -6768,7 +7162,8 @@ tool_result_t driver_enum_kernel_callbacks(const json& params)
     sys_module_info_t* info = nullptr;
     std::string err;
     kernel_module_query_diagnostics_t query_diag{};
-    if (!query_kernel_modules(mod_buf, info, err, &query_diag))
+    if (!query_kernel_modules(mod_buf, info, err, &query_diag,
+            kernel_module_query_fallback_policy::allow_readonly_kernel_base_evidence))
         return kernel_module_query_error_result(err, query_diag);
 
 
@@ -6908,6 +7303,7 @@ tool_result_t driver_enum_kernel_callbacks(const json& params)
     result["callback_type_exports_resolved"] = callback_type_exports_resolved;
     result["callback_array_refs_found"] = callback_array_refs_found;
     result["callbacks_observed"] = callbacks_observed;
+    result["module_base_diagnostics"] = kernel_module_query_diagnostics_json(query_diag);
     result["note"] = OBFSTR("Kernel callbacks are used by anti-cheats (EAC/BattlEye/Vanguard) to monitor "
                             "process creation, thread creation, image loading, and registry access.");
     return tool_result_t::ok(OBFSTR("Kernel callback enumeration complete"), result);
@@ -6926,7 +7322,8 @@ tool_result_t driver_detect_integrity_checks(const json& params)
     sys_module_info_t* info = nullptr;
     std::string err;
     kernel_module_query_diagnostics_t query_diag{};
-    if (!query_kernel_modules(mod_buf, info, err, &query_diag))
+    if (!query_kernel_modules(mod_buf, info, err, &query_diag,
+            kernel_module_query_fallback_policy::allow_readonly_kernel_base_evidence))
         return kernel_module_query_error_result(err, query_diag);
 
 
@@ -7053,6 +7450,7 @@ tool_result_t driver_detect_integrity_checks(const json& params)
     result["clean_function_count"] = clean_count;
     result["hooked_functions"]  = std::move(hooks);
     result["clean_functions"]   = std::move(clean);
+    result["module_base_diagnostics"] = kernel_module_query_diagnostics_json(query_diag);
     result["note"] = OBFSTR("Kernel function hooks indicate anti-cheat monitoring. Hooked functions route through "
                             "the anti-cheat driver, which can block, log, or alter calls from target processes.");
     return tool_result_t::ok(OBFSTR("Kernel integrity: ") + std::to_string(hook_count) +
@@ -7072,7 +7470,8 @@ tool_result_t driver_detect_ssdt_hooks(const json&)
     sys_module_info_t* info = nullptr;
     std::string err;
     kernel_module_query_diagnostics_t query_diag{};
-    if (!query_kernel_modules(buf, info, err, &query_diag)) {
+    if (!query_kernel_modules(buf, info, err, &query_diag,
+            kernel_module_query_fallback_policy::allow_readonly_kernel_base_evidence)) {
         diag::log_tagged_fmt("drv_tools", "driver_detect_ssdt_hooks query_kernel_modules_failed err=%s", err.c_str());
         return kernel_module_query_error_result(err, query_diag, OBFSTR("Failed to enumerate kernel modules: "));
     }
@@ -7261,6 +7660,7 @@ tool_result_t driver_detect_ssdt_hooks(const json&)
     result["ntoskrnl_range"]    = sa_format_address(static_cast<uint64_t>(ntos_base)) + " - " +
                                   sa_format_address(static_cast<uint64_t>(ntos_end));
     result["hooked_entries"]    = std::move(hooked);
+    result["module_base_diagnostics"] = kernel_module_query_diagnostics_json(query_diag);
     result["note"] = OBFSTR("SSDT hooks redirect syscalls to third-party kernel code. Anti-cheats commonly hook "
                             "NtReadVirtualMemory, NtWriteVirtualMemory, NtOpenProcess to intercept memory access.");
 
@@ -7281,7 +7681,8 @@ tool_result_t driver_enum_minifilters(const json& params)
     sys_module_info_t* info = nullptr;
     std::string err;
     kernel_module_query_diagnostics_t query_diag{};
-    if (!query_kernel_modules(buf, info, err, &query_diag))
+    if (!query_kernel_modules(buf, info, err, &query_diag,
+            kernel_module_query_fallback_policy::allow_readonly_kernel_base_evidence))
         return kernel_module_query_error_result(err, query_diag, OBFSTR("Failed to enumerate kernel modules: "));
 
 
@@ -7465,6 +7866,7 @@ tool_result_t driver_enum_minifilters(const json& params)
     result["fltmgr_base"]     = sa_format_address(static_cast<uint64_t>(fltmgr_base));
     result["filter_count"]    = filters.size();
     result["filters"]         = std::move(filters);
+    result["module_base_diagnostics"] = kernel_module_query_diagnostics_json(query_diag);
     result["note"] = OBFSTR("Minifilter drivers intercept filesystem I/O. Anti-cheats use minifilters to monitor file access, "
                             "prevent dumps, and detect injection DLLs. Altitude determines callback priority order.");
 
@@ -7485,7 +7887,8 @@ tool_result_t driver_detect_etw_monitors(const json& params)
     sys_module_info_t* info = nullptr;
     std::string err;
     kernel_module_query_diagnostics_t query_diag{};
-    if (!query_kernel_modules(buf, info, err, &query_diag))
+    if (!query_kernel_modules(buf, info, err, &query_diag,
+            kernel_module_query_fallback_policy::allow_readonly_kernel_base_evidence))
         return kernel_module_query_error_result(err, query_diag, OBFSTR("Failed to enumerate kernel modules: "));
 
     std::uint64_t ntos_base = 0, ntos_size = 0;
@@ -7663,6 +8066,7 @@ tool_result_t driver_detect_etw_monitors(const json& params)
     result["modules_scanned_for_etw"] = etw_modules_scanned;
     result["providers"]         = std::move(providers);
     result["etw_consumer_modules"] = std::move(etw_modules);
+    result["module_base_diagnostics"] = kernel_module_query_diagnostics_json(query_diag);
     result["note"] = OBFSTR("ETW (Event Tracing for Windows) provides kernel-level telemetry. The Threat Intelligence "
                             "provider detects process injection, executable memory allocation, and suspicious API sequences. "
                             "Anti-cheats and EDRs subscribe to these events for real-time detection.");
@@ -7685,6 +8089,7 @@ tool_result_t driver_detect_hidden_modules(const json& params)
 
     json hidden = json::array();
     json legitimate = json::array();
+    json module_base_diagnostics = json::object();
 
     if (!scan_kernel)
     {
@@ -7837,8 +8242,10 @@ tool_result_t driver_detect_hidden_modules(const json& params)
         sys_module_info_t* kinfo = nullptr;
         std::string kerr;
         kernel_module_query_diagnostics_t query_diag{};
-        if (!query_kernel_modules(mod_buf, kinfo, kerr, &query_diag))
+        if (!query_kernel_modules(mod_buf, kinfo, kerr, &query_diag,
+                kernel_module_query_fallback_policy::allow_readonly_kernel_base_evidence))
             return kernel_module_query_error_result(kerr, query_diag, OBFSTR("Failed to enumerate kernel modules: "));
+        module_base_diagnostics = kernel_module_query_diagnostics_json(query_diag);
 
         std::set<std::uint64_t> known_bases;
         for (ULONG i = 0; i < kinfo->NumberOfModules; ++i)
@@ -7915,6 +8322,10 @@ tool_result_t driver_detect_hidden_modules(const json& params)
     {
         result["legitimate_count"]  = legitimate.size();
         result["legitimate_modules"] = std::move(legitimate);
+    }
+    else
+    {
+        result["module_base_diagnostics"] = std::move(module_base_diagnostics);
     }
     result["note"] = OBFSTR("Hidden modules are PE images present in memory but not in the PEB module list (usermode) "
                             "or NtQuerySystemInformation module list (kernel). Common for manual-mapped DLLs, "

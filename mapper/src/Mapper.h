@@ -318,7 +318,7 @@ namespace DriverLoader {
     NTSTATUS CreateDriverService(PWSTR servicePath, PCWSTR filePath);
     NTSTATUS CreateMinifilterService(PWSTR servicePath, PCWSTR filePath,
                                      PCWSTR instanceName, PCWSTR altitude);
-    NTSTATUS LoadDriver(PCWSTR servicePath);
+    NTSTATUS LoadDriver(PCWSTR servicePath, PCWSTR imagePath = nullptr);
     NTSTATUS UnloadDriver(PCWSTR servicePath);
 }
 
@@ -327,6 +327,7 @@ namespace KernelUtils {
     PVOID GetKernelProcAddress(PVOID moduleBase, const char* procName);
     BOOL GetCiValidateImageHeaderEntry(PVOID* outCiEntry, PVOID* outZwFlush);
     BOOL PatchDriverSigningFlags(HANDLE device, PCWSTR driverFileName);
+    BOOL PatchDriverSigningFlagsByBase(HANDLE device, PVOID driverBase, ULONG driverImageSize, PCSTR label, BOOL updateDriverLoadAddress);
     PVOID GetDriverBaseByName(PCWSTR driverFileName, PULONG outImageSize);
 }
 
@@ -336,6 +337,7 @@ namespace VulnDriver {
     NTSTATUS UnmapPhysicalMemory(HANDLE device, PVOID mappedAddr);
     NTSTATUS ReadPhysicalMemory(HANDLE device, ULONGLONG physAddr, PVOID buffer, SIZE_T size);
     NTSTATUS WritePhysicalMemory(HANDLE device, ULONGLONG physAddr, PVOID data, SIZE_T size);
+    NTSTATUS ExchangePhysicalPointer(HANDLE device, ULONGLONG physAddr, PVOID newValue, PVOID* oldValue);
     NTSTATUS ReadKernelMemory(HANDLE device, PVOID address, PVOID buffer, SIZE_T size);
     NTSTATUS WriteKernelMemory(HANDLE device, PVOID address, PVOID data, SIZE_T size);
     NTSTATUS ReadMsr(HANDLE device, ULONG msrIndex, PULONGLONG value);

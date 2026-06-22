@@ -4722,8 +4722,12 @@ inline void watchdog_loop()
 inline void monitor_loop()
 {
     auto& rt = state::get();
+    const int prior_priority = GetThreadPriority(GetCurrentThread());
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     Sleep(5000);
-    diag::log_tagged_critical("monitor", "thread_started");
+    diag::log_tagged_critical_fmt("monitor", "thread_started tid=%lu priority=%d",
+        GetCurrentThreadId(),
+        GetThreadPriority(GetCurrentThread()));
     uint64_t iter = 0;
     while (rt.monitors_running.load() && !rt.violation_latched.load())
     {
@@ -4732,6 +4736,7 @@ inline void monitor_loop()
             diag::log_tagged_critical_fmt("monitor", "iter=%llu pre_guard latched=%d",
                 (unsigned long long)iter, rt.violation_latched.load() ? 1 : 0);
         }
+        const uint64_t guard_start_ms = GetTickCount64();
         try
         {
             guard();
@@ -4751,17 +4756,29 @@ inline void monitor_loop()
                 "monitor_loop_UNKNOWN_EXCEPTION iter=%llu", iter);
             diag::log_tagged_critical("monitor", ebuf);
         }
+        const uint64_t guard_elapsed_ms = GetTickCount64() - guard_start_ms;
+        if (guard_elapsed_ms >= 125ULL || (iter % 16ULL) == 0ULL)
+        {
+            diag::log_tagged_critical_fmt("monitor",
+                "iter=%llu guard_elapsed_ms=%llu latched=%d full_test=%d",
+                static_cast<unsigned long long>(iter),
+                static_cast<unsigned long long>(guard_elapsed_ms),
+                rt.violation_latched.load(std::memory_order_acquire) ? 1 : 0,
+                rt.full_test_running.load(std::memory_order_acquire) ? 1 : 0);
+        }
         if ((iter % 4ULL) == 0ULL) {
             diag::log_tagged_critical_fmt("monitor", "iter=%llu post_guard latched=%d",
                 (unsigned long long)iter, rt.violation_latched.load() ? 1 : 0);
         }
-        Sleep(500);
+        Sleep(rt.full_test_running.load(std::memory_order_acquire) ? 500 : 750);
     }
     char dbg[128];
     _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
         "thread_exiting monitors_running=%d violation_latched=%d iter=%llu",
         rt.monitors_running.load() ? 1 : 0, rt.violation_latched.load() ? 1 : 0, iter);
     webhook::write_log("monitor", dbg);
+    if (prior_priority != THREAD_PRIORITY_ERROR_RETURN)
+        SetThreadPriority(GetCurrentThread(), prior_priority);
 }
 
 }

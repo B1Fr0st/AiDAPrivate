@@ -2,7 +2,9 @@
 
 #include <atomic>
 #include "work_queue.hpp"
+#include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -63,6 +65,9 @@ inline std::vector<uint64_t> find_rdtsc_sites(uint64_t base, uint64_t size, int 
 
 	std::vector<uint8_t> code;
 	const uint64_t chunk_size = 0x10000;
+	uint64_t decoded = 0;
+	uint64_t raw_pairs = 0;
+	uint64_t embedded_pairs = 0;
 
 	for (uint64_t offset = 0; offset < size && static_cast<int>(sites.size()) < max_sites; offset += chunk_size) {
 		uint64_t read_size = (std::min)(chunk_size, size - offset);
@@ -70,14 +75,39 @@ inline std::vector<uint64_t> find_rdtsc_sites(uint64_t base, uint64_t size, int 
 		driver_bridge::read_memory(base + offset, static_cast<size_t>(read_size), code);
 		if (code.empty()) continue;
 
-		for (size_t i = 0; i + 1 < code.size(); ++i) {
-			if (code[i] == 0x0F && code[i + 1] == 0x31) {
-				sites.push_back(base + offset + i);
-				if (static_cast<int>(sites.size()) >= max_sites) break;
+		for (size_t i = 0; i < code.size() && static_cast<int>(sites.size()) < max_sites;) {
+			if (i + 1 < code.size() && code[i] == 0x0F && code[i + 1] == 0x31)
+				++raw_pairs;
+			const int avail = static_cast<int>((std::min)(static_cast<size_t>(16), code.size() - i));
+			AsmInstr ins = zydis_decode_one(code.data() + i, avail, base + offset + i);
+			const int len = (std::max)(1, ins.len);
+			++decoded;
+			bool raw_inside = false;
+			for (int j = 1; j + 1 < len && i + static_cast<size_t>(j + 1) < code.size(); ++j) {
+				if (code[i + static_cast<size_t>(j)] == 0x0F && code[i + static_cast<size_t>(j + 1)] == 0x31) {
+					raw_inside = true;
+					break;
+				}
 			}
+			if (raw_inside)
+				++embedded_pairs;
+			std::string mnem = ins.mnem;
+			for (auto& c : mnem) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+			if (mnem == "rdtsc")
+				sites.push_back(ins.addr);
+			i += static_cast<size_t>(len);
 		}
 	}
 
+	diag::log_tagged_fmt("stealth",
+		"rdtsc_scan_decoded base=0x%llX size=0x%llX decoded=%llu raw_pairs=%llu embedded_pairs=%llu sites=%zu max_sites=%d",
+		static_cast<unsigned long long>(base),
+		static_cast<unsigned long long>(size),
+		static_cast<unsigned long long>(decoded),
+		static_cast<unsigned long long>(raw_pairs),
+		static_cast<unsigned long long>(embedded_pairs),
+		sites.size(),
+		max_sites);
 	return sites;
 }
 
@@ -86,6 +116,36 @@ inline bool install_rdtsc_hook(uint64_t rdtsc_addr, uint32_t pid, stealth_sessio
 	std::vector<uint8_t> original;
 	driver_bridge::read_memory(rdtsc_addr, 16, original);
 	if (original.size() < 16) return false;
+	AsmInstr first = zydis_decode_one(original.data(), static_cast<int>(original.size()), rdtsc_addr);
+	std::string first_mnem = first.mnem;
+	for (auto& c : first_mnem) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+	if (first_mnem != "rdtsc" || first.len != 2) {
+		diag::log_tagged_fmt("stealth",
+			"rdtsc_hook_skip reason=not_decoded_rdtsc addr=0x%llX mnem=%s len=%d",
+			static_cast<unsigned long long>(rdtsc_addr),
+			first.mnem,
+			first.len);
+		return false;
+	}
+	bool safe_padding = true;
+	for (size_t i = 2; i < 5; ++i) {
+		const uint8_t b = original[i];
+		if (b != 0x90 && b != 0xCC) {
+			safe_padding = false;
+			break;
+		}
+	}
+	if (!safe_padding) {
+		diag::log_tagged_fmt("stealth",
+			"rdtsc_hook_skip reason=unsafe_inline_patch_window addr=0x%llX bytes=%02X%02X%02X%02X%02X",
+			static_cast<unsigned long long>(rdtsc_addr),
+			original[0],
+			original[1],
+			original[2],
+			original[3],
+			original[4]);
+		return false;
+	}
 
 	uint64_t cave = driver_bridge::allocate_memory(64);
 	if (cave == 0) return false;

@@ -18,6 +18,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "standalone_driver.hpp"
@@ -274,6 +275,80 @@ inline std::string get_exe_directory() {
 	return ".";
 }
 
+inline std::string read_env_var(const char* name)
+{
+	char buf[32768] = {};
+	DWORD n = GetEnvironmentVariableA(name, buf, static_cast<DWORD>(sizeof(buf)));
+	if (n == 0 || n >= static_cast<DWORD>(sizeof(buf)))
+		return {};
+	return std::string(buf, n);
+}
+
+inline bool specs_dir_has_required_files(const std::string& dir)
+{
+	if (dir.empty())
+		return false;
+	DWORD attr = GetFileAttributesA(dir.c_str());
+	if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY))
+		return false;
+	std::string prefix = dir;
+	if (!prefix.empty() && prefix.back() != '\\' && prefix.back() != '/')
+		prefix += "\\";
+	const char* names[] = {
+		"x86-64.sla",
+		"x86-64.pspec",
+		"x86-64-win.cspec",
+		"x86.ldefs"
+	};
+	for (const char* name : names) {
+		const std::string file = prefix + name;
+		attr = GetFileAttributesA(file.c_str());
+		if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY))
+			return false;
+	}
+	return true;
+}
+
+inline void append_specs_root_candidates(std::vector<std::pair<std::string, std::string>>& out,
+                                         const std::string& label,
+                                         const std::string& root)
+{
+	if (root.empty())
+		return;
+	out.emplace_back(label + "_ghidra_specs", root + "\\ghidra_specs");
+	out.emplace_back(label + "_deps_ghidra_specs", root + "\\deps\\ghidra_specs");
+}
+
+inline std::vector<std::pair<std::string, std::string>> specs_probe_candidates(const std::string& explicit_dir)
+{
+	std::vector<std::pair<std::string, std::string>> out;
+	if (!explicit_dir.empty())
+		out.emplace_back("explicit_attr", explicit_dir);
+	const std::string env_specs = read_env_var("AIDA_GHIDRA_SPECS_DIR");
+	if (!env_specs.empty())
+		out.emplace_back("env_AIDA_GHIDRA_SPECS_DIR", env_specs);
+	const std::string env_ghidra_specs = read_env_var("GHIDRA_SPECS_DIR");
+	if (!env_ghidra_specs.empty())
+		out.emplace_back("env_GHIDRA_SPECS_DIR", env_ghidra_specs);
+	append_specs_root_candidates(out, "env_AIDA_PACKAGE_DIR", read_env_var("AIDA_PACKAGE_DIR"));
+	const std::string env_deps = read_env_var("AIDA_DEPS_DIR");
+	if (!env_deps.empty()) {
+		out.emplace_back("env_AIDA_DEPS_DIR_direct", env_deps);
+		out.emplace_back("env_AIDA_DEPS_DIR_ghidra_specs", env_deps + "\\ghidra_specs");
+	}
+	const std::string exe_dir = get_exe_directory();
+	append_specs_root_candidates(out, "exe", exe_dir);
+	append_specs_root_candidates(out, "parent", exe_dir + "\\..");
+#ifdef GHIDRA_SPECS_DIR
+#define AIDA_GHIDRA_SPECS_STR_IMPL(x) #x
+#define AIDA_GHIDRA_SPECS_STR(x) AIDA_GHIDRA_SPECS_STR_IMPL(x)
+	out.emplace_back("cmake_ghidra_specs", AIDA_GHIDRA_SPECS_STR(GHIDRA_SPECS_DIR));
+#undef AIDA_GHIDRA_SPECS_STR
+#undef AIDA_GHIDRA_SPECS_STR_IMPL
+#endif
+	return out;
+}
+
 inline void append_specs_probe_candidate(std::ostringstream& out,
                                          const char* label,
                                          const std::string& path)
@@ -284,7 +359,8 @@ inline void append_specs_probe_candidate(std::ostringstream& out,
 		out << ":missing_gle=" << static_cast<unsigned long>(GetLastError());
 	} else {
 		out << ":attr=0x" << std::hex << std::uppercase << attr << std::dec
-		    << ":dir=" << ((attr & FILE_ATTRIBUTE_DIRECTORY) ? 1 : 0);
+		    << ":dir=" << ((attr & FILE_ATTRIBUTE_DIRECTORY) ? 1 : 0)
+		    << ":ready=" << (specs_dir_has_required_files(path) ? 1 : 0);
 	}
 	out << " ";
 }
@@ -295,46 +371,18 @@ inline std::string describe_specs_probe(const std::string& explicit_dir)
 	std::string exe_dir = get_exe_directory();
 	out << "explicit=\"" << (explicit_dir.empty() ? std::string("<empty>") : explicit_dir) << "\" ";
 	out << "exe_dir=\"" << exe_dir << "\" ";
-	if (!explicit_dir.empty())
-		append_specs_probe_candidate(out, "explicit_attr", explicit_dir);
-	append_specs_probe_candidate(out, "exe_ghidra_specs", exe_dir + "\\ghidra_specs");
-	append_specs_probe_candidate(out, "parent_ghidra_specs", exe_dir + "\\..\\ghidra_specs");
-#ifdef GHIDRA_SPECS_DIR
-#define AIDA_GHIDRA_SPECS_STR_IMPL(x) #x
-#define AIDA_GHIDRA_SPECS_STR(x) AIDA_GHIDRA_SPECS_STR_IMPL(x)
-	std::string cmake_dir = AIDA_GHIDRA_SPECS_STR(GHIDRA_SPECS_DIR);
-	#undef AIDA_GHIDRA_SPECS_STR
-	#undef AIDA_GHIDRA_SPECS_STR_IMPL
-	append_specs_probe_candidate(out, "cmake_ghidra_specs", cmake_dir);
-#else
+	for (const auto& candidate : specs_probe_candidates(explicit_dir))
+		append_specs_probe_candidate(out, candidate.first.c_str(), candidate.second);
+#ifndef GHIDRA_SPECS_DIR
 	out << "cmake_ghidra_specs=<not_defined> ";
 #endif
 	return out.str();
 }
 
 inline std::string find_specs_dir() {
-	std::string exe_dir = get_exe_directory();
-	std::string candidate = exe_dir + "\\ghidra_specs";
-	DWORD attr = GetFileAttributesA(candidate.c_str());
-	if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY))
-		return candidate;
-
-	candidate = exe_dir + "\\..\\ghidra_specs";
-	attr = GetFileAttributesA(candidate.c_str());
-	if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY))
-		return candidate;
-
-#ifdef GHIDRA_SPECS_DIR
-#define AIDA_GHIDRA_SPECS_STR_IMPL(x) #x
-#define AIDA_GHIDRA_SPECS_STR(x) AIDA_GHIDRA_SPECS_STR_IMPL(x)
-	std::string cmake_dir = AIDA_GHIDRA_SPECS_STR(GHIDRA_SPECS_DIR);
-	#undef AIDA_GHIDRA_SPECS_STR
-	#undef AIDA_GHIDRA_SPECS_STR_IMPL
-	attr = GetFileAttributesA(cmake_dir.c_str());
-	if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY))
-		return cmake_dir;
-#endif
-
+	for (const auto& candidate : specs_probe_candidates(""))
+		if (specs_dir_has_required_files(candidate.second))
+			return candidate.second;
 	return "";
 }
 

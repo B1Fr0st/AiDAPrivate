@@ -29,21 +29,111 @@ static ULONG DLBuildNumber() {
     return *reinterpret_cast<volatile ULONG*>(static_cast<ULONG_PTR>(0x7FFE0260)) & 0xFFFFu;
 }
 
+static const char* DLFileTypeName(DWORD type) {
+    switch (type) {
+    case FILE_TYPE_DISK:
+        return "disk";
+    case FILE_TYPE_CHAR:
+        return "char";
+    case FILE_TYPE_PIPE:
+        return "pipe";
+    case FILE_TYPE_REMOTE:
+        return "remote";
+    default:
+        return "unknown";
+    }
+}
+
+static void DLProbeImagePath(PCWSTR phase, PCWSTR filePath) {
+    const ULONGLONG start = GetTickCount64();
+    if (!filePath || !filePath[0]) {
+        DLLOG("image_probe phase=%ls path=(null) elapsed_ms=%llu", phase ? phase : L"(null)", DLElapsedMs(start));
+        return;
+    }
+
+    DWORD attr = GetFileAttributesW(filePath);
+    DWORD attrGle = GetLastError();
+    WIN32_FILE_ATTRIBUTE_DATA fad = {};
+    BOOL attrExOk = GetFileAttributesExW(filePath, GetFileExInfoStandard, &fad);
+    DWORD attrExGle = GetLastError();
+    HANDLE h = CreateFileW(filePath, GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    DWORD openGle = h == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+    LARGE_INTEGER size = {};
+    DWORD type = FILE_TYPE_UNKNOWN;
+    if (h != INVALID_HANDLE_VALUE) {
+        GetFileSizeEx(h, &size);
+        type = GetFileType(h);
+        CloseHandle(h);
+    }
+
+    DLLOG("image_probe phase=%ls path=%ls attr=0x%08X attr_gle=%lu attr_ex=%u attr_ex_gle=%lu open=%u open_gle=%lu size=%lld type=%s elapsed_ms=%llu",
+        phase ? phase : L"(null)",
+        filePath,
+        attr,
+        attrGle,
+        attrExOk ? 1u : 0u,
+        attrExGle,
+        h != INVALID_HANDLE_VALUE ? 1u : 0u,
+        openGle,
+        static_cast<long long>(size.QuadPart),
+        DLFileTypeName(type),
+        DLElapsedMs(start));
+}
+
+static NTSTATUS DLFlushServiceKey(PCWSTR servicePath, PCWSTR phase) {
+    if (!servicePath || !servicePath[0] || !NtOpenKeyPtr) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    UNICODE_STRING keyName;
+    RtlInitUnicodeString(&keyName, servicePath);
+    OBJECT_ATTRIBUTES objAttr;
+    InitializeObjectAttributes(&objAttr, &keyName, OBJ_CASE_INSENSITIVE, nullptr, nullptr);
+
+    HANDLE hKey = nullptr;
+    ACCESS_MASK access = KEY_READ;
+    if (NtFlushKeyPtr) {
+        access |= KEY_WRITE;
+    }
+    NTSTATUS status = NtOpenKeyPtr(&hKey, access, &objAttr);
+    DLLOG("service_key_probe phase=%ls service=%ls open_status=0x%08X flush_available=%u",
+        phase ? phase : L"(null)",
+        servicePath,
+        static_cast<DWORD>(status),
+        NtFlushKeyPtr ? 1u : 0u);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    if (NtFlushKeyPtr) {
+        NTSTATUS flushStatus = NtFlushKeyPtr(hKey);
+        DLLOG("service_key_flush phase=%ls service=%ls status=0x%08X",
+            phase ? phase : L"(null)",
+            servicePath,
+            static_cast<DWORD>(flushStatus));
+        if (!NT_SUCCESS(flushStatus)) {
+            status = flushStatus;
+        }
+    }
+
+    NtClose(hKey);
+    return status;
+}
+
 static NTSTATUS WriteKernelLogPathValue(PCWSTR servicePath) {
-    WCHAR kernelLogPath[512] = {};
-    DWORD len = GetEnvironmentVariableW(L"AIDA_KERNEL_LOG_PATH", kernelLogPath, _countof(kernelLogPath));
-    if (len == 0) {
-        wcscpy_s(kernelLogPath, L"\\??\\C:\\Users\\Public\\Desktop\\aida_kernel.log");
-        len = static_cast<DWORD>(wcslen(kernelLogPath));
-        DLLOG("AIDA_KERNEL_LOG_PATH not set, using default");
+    constexpr PCWSTR kUnifiedKernelLogPath = L"\\??\\C:\\Users\\Public\\Desktop\\aida_kernel.log";
+    WCHAR inheritedKernelLogPath[512] = {};
+    DWORD inheritedLen = GetEnvironmentVariableW(L"AIDA_KERNEL_LOG_PATH", inheritedKernelLogPath, _countof(inheritedKernelLogPath));
+    if (inheritedLen > 0 && inheritedLen < _countof(inheritedKernelLogPath) && wcscmp(inheritedKernelLogPath, kUnifiedKernelLogPath) != 0) {
+        DLLOG("AIDA_KERNEL_LOG_PATH ignored inherited=%ls unified=%ls", inheritedKernelLogPath, kUnifiedKernelLogPath);
+    } else if (inheritedLen >= _countof(inheritedKernelLogPath)) {
+        DLLOG("AIDA_KERNEL_LOG_PATH ignored too long len=%lu unified=%ls", static_cast<unsigned long>(inheritedLen), kUnifiedKernelLogPath);
     }
-    if (len >= _countof(kernelLogPath)) {
-        DLLOG("AIDA_KERNEL_LOG_PATH too long len=%lu", static_cast<unsigned long>(len));
-        return static_cast<NTSTATUS>(0xC0000023L);
-    }
-    NTSTATUS status = RtlWriteRegistryValuePtr(0, servicePath, L"AidaKernelLogPath", REG_SZ, kernelLogPath,
-        static_cast<ULONG>((wcslen(kernelLogPath) + 1) * sizeof(WCHAR)));
-    DLLOG("AidaKernelLogPath: %ls", kernelLogPath);
+    NTSTATUS status = RtlWriteRegistryValuePtr(0, servicePath, L"AidaKernelLogPath", REG_SZ, const_cast<PWSTR>(kUnifiedKernelLogPath),
+        static_cast<ULONG>((wcslen(kUnifiedKernelLogPath) + 1) * sizeof(WCHAR)));
+    DLLOG("AidaKernelLogPath: %ls", kUnifiedKernelLogPath);
     DLLOG_STATUS("RtlWriteRegistryValue (AidaKernelLogPath)", status);
     return status;
 }
@@ -129,6 +219,7 @@ namespace DriverLoader {
         }
 
         DLLOG("Service created successfully");
+        DLFlushServiceKey(servicePath, L"create_driver_service");
         return STATUS_SUCCESS;
     }
 
@@ -228,10 +319,11 @@ namespace DriverLoader {
             &instanceFlags, sizeof(DWORD));
 
         DLLOG("Minifilter service created successfully");
+        DLFlushServiceKey(servicePath, L"create_minifilter_service");
         return STATUS_SUCCESS;
     }
 
-    NTSTATUS LoadDriver(PCWSTR servicePath) {
+    NTSTATUS LoadDriver(PCWSTR servicePath, PCWSTR imagePath) {
         const ULONGLONG start = GetTickCount64();
         DLLOG("Loading driver: %ls", servicePath);
         DLLOG("LoadDriver enter service=%ls service_len=%llu pid=%lu tid=%lu build=%lu ntload=%p",
@@ -241,6 +333,8 @@ namespace DriverLoader {
             GetCurrentThreadId(),
             DLBuildNumber(),
             NtLoadDriverPtr);
+        DLFlushServiceKey(servicePath, L"pre_load");
+        DLProbeImagePath(L"pre_load", imagePath);
         UNICODE_STRING usServicePath;
         RtlInitUnicodeString(&usServicePath, servicePath);
         DLLOG("LoadDriver unicode length=%u max=%u buffer=%p elapsed_ms=%llu",
@@ -251,6 +345,17 @@ namespace DriverLoader {
 
         NTSTATUS status = NtLoadDriverPtr(&usServicePath);
         DLLOG_STATUS("NtLoadDriver", status);
+        if (status == static_cast<NTSTATUS>(0xC0000034L)) {
+            DLLOG("NtLoadDriver object_name_not_found retry_prepare service=%ls image=%ls elapsed_ms=%llu",
+                servicePath ? servicePath : L"(null)",
+                imagePath ? imagePath : L"(null)",
+                DLElapsedMs(start));
+            DLFlushServiceKey(servicePath, L"retry_object_name_not_found");
+            DLProbeImagePath(L"retry_object_name_not_found", imagePath);
+            Sleep(50);
+            status = NtLoadDriverPtr(&usServicePath);
+            DLLOG_STATUS("NtLoadDriver retry", status);
+        }
         DLLOG("LoadDriver exit service=%ls status=0x%08X elapsed_ms=%llu pid=%lu tid=%lu",
             servicePath ? servicePath : L"(null)",
             (DWORD)status,

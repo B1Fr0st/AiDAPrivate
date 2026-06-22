@@ -491,6 +491,7 @@ stat -c 'private_standalone_size=%s' '__REMOTE_BASE__'
 
 function Get-CamoufoxSidecarInputs([string]$ReleaseDir) {
     $browserName = "camoufox-135.0.1-beta.24-win.x86_64"
+    $releaseOutput = Join-Path $ReleaseDir "Release"
     $browser = Find-FirstExistingPath @(
         (Join-Path $ReleaseDir "deps\$browserName"),
         (Join-Path $RepoRoot $browserName),
@@ -510,13 +511,57 @@ function Get-CamoufoxSidecarInputs([string]$ReleaseDir) {
         (Join-Path $RepoRoot "AiDA_CamoufoxReverseMcp.exe"),
         (Join-Path $RepoRoot "camoufox-reverse-mcp.exe")
     )
+    $ghidraSpecs = Find-FirstExistingPath @(
+        (Join-Path $ReleaseDir "ghidra_specs"),
+        (Join-Path $ReleaseDir "deps\ghidra_specs"),
+        (Join-Path $releaseOutput "ghidra_specs"),
+        (Join-Path $releaseOutput "deps\ghidra_specs"),
+        (Join-Path $RepoRoot "build-ninja\ghidra_specs"),
+        (Join-Path $RepoRoot "build-ninja\Release\ghidra_specs")
+    ) -Directory
+    $targetProtocol = Find-FirstExistingPath @(
+        (Join-Path $ReleaseDir "test_binaries\target_protocol"),
+        (Join-Path $ReleaseDir "deps\test_binaries\target_protocol"),
+        (Join-Path $releaseOutput "test_binaries\target_protocol"),
+        (Join-Path $releaseOutput "deps\test_binaries\target_protocol"),
+        (Join-Path $RepoRoot "build-ninja\test_binaries\target_protocol"),
+        (Join-Path $RepoRoot "build-ninja\Release\test_binaries\target_protocol"),
+        (Join-Path $RepoRoot "build-ninja\Release\deps\test_binaries\target_protocol"),
+        (Join-Path $RepoRoot "test_binaries\target_protocol")
+    ) -Directory
     return [pscustomobject]@{
         BrowserName = $browserName
         BrowserDir = $browser
         BrowserExe = if ($browser) { Join-Path $browser "camoufox.exe" } else { "" }
         McpExe = $mcp
+        GhidraSpecsDir = $ghidraSpecs
+        TargetProtocolDir = $targetProtocol
         ExeRel = "deps/$browserName/camoufox.exe"
         PythonRel = ""
+    }
+}
+
+function Assert-GhidraSpecsInput([string]$Dir) {
+    if (-not $Dir -or -not (Test-Path -LiteralPath $Dir -PathType Container)) {
+        Stop-Deploy "Ghidra specs directory is missing. Build AiDAStandalone so ghidra_specs is staged."
+    }
+    foreach ($name in @("x86-64.sla", "x86-64.pspec", "x86-64-win.cspec", "x86.ldefs")) {
+        $path = Join-Path $Dir $name
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            Stop-Deploy "Ghidra specs directory is incomplete: $path is missing."
+        }
+    }
+}
+
+function Assert-TargetProtocolInput([string]$Dir) {
+    if (-not $Dir -or -not (Test-Path -LiteralPath $Dir -PathType Container)) {
+        Stop-Deploy "target_protocol fixture directory is missing. Build AiDAStandalone so test_binaries\target_protocol is staged."
+    }
+    foreach ($name in @("target_protocol.exe", "target_protocol.pdb")) {
+        $path = Join-Path $Dir $name
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            Stop-Deploy "target_protocol fixture directory is incomplete: $path is missing."
+        }
     }
 }
 
@@ -547,6 +592,8 @@ function Assert-CamoufoxSidecarInputs([pscustomobject]$Inputs) {
     if ($size -le 0 -or $size -gt 268435456) {
         Stop-Deploy "Frozen Camoufox reverse MCP executable size is invalid: $size bytes"
     }
+    Assert-GhidraSpecsInput $Inputs.GhidraSpecsDir
+    Assert-TargetProtocolInput $Inputs.TargetProtocolDir
 }
 
 function Assert-NoReverseMcpSourceLeak([string]$StageRoot) {
@@ -570,6 +617,11 @@ function New-CamoufoxSidecarPackage([pscustomobject]$Inputs, [string]$DeployId) 
         New-Item -ItemType Directory -Force -Path $depsRoot | Out-Null
         Copy-Item -LiteralPath $Inputs.BrowserDir -Destination (Join-Path $depsRoot $Inputs.BrowserName) -Recurse -Force
         Copy-Item -LiteralPath $Inputs.McpExe -Destination (Join-Path $depsRoot "AiDA_CamoufoxReverseMcp.exe") -Force
+        Copy-Item -LiteralPath $Inputs.GhidraSpecsDir -Destination (Join-Path $depsRoot "ghidra_specs") -Recurse -Force
+        $targetProtocolDest = Join-Path $depsRoot "test_binaries\target_protocol"
+        New-Item -ItemType Directory -Force -Path $targetProtocolDest | Out-Null
+        Copy-Item -LiteralPath (Join-Path $Inputs.TargetProtocolDir "target_protocol.exe") -Destination (Join-Path $targetProtocolDest "target_protocol.exe") -Force
+        Copy-Item -LiteralPath (Join-Path $Inputs.TargetProtocolDir "target_protocol.pdb") -Destination (Join-Path $targetProtocolDest "target_protocol.pdb") -Force
         Assert-NoReverseMcpSourceLeak $stageRoot
         Add-Type -AssemblyName System.IO.Compression.FileSystem
         if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force }

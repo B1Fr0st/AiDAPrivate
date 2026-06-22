@@ -131,6 +131,27 @@ static void init_log_session_state(const char* phase)
         _InterlockedCompareExchange(&g_shutdown_flag, 0, 0));
 }
 
+static void init_read_target_handoff(PVOID* out_base, ULONG* out_size, PVOID* out_object)
+{
+    if (out_base)
+        *out_base = (PVOID)g_target_driver_base;
+    if (out_size)
+        *out_size = g_target_driver_size;
+    if (out_object)
+        *out_object = (PVOID)g_target_driver_object;
+}
+
+static BOOLEAN init_target_handoff_ready(PVOID base, ULONG size)
+{
+    if (!base || size == 0)
+        return FALSE;
+    if (reinterpret_cast<ULONG_PTR>(base) < 0xFFFF800000000000ULL)
+        return FALSE;
+    if (size > 50 * 1024 * 1024)
+        return FALSE;
+    return TRUE;
+}
+
 static BOOLEAN init_scan_backoff(const char* phase, UINT64 probes, ULONG module_count, USHORT section_index, ULONG offset)
 {
     if (_InterlockedCompareExchange(&g_shutdown_flag, 0, 0)) {
@@ -935,11 +956,19 @@ static void NTAPI init_thread_routine(PVOID ) {
         KeGetCurrentProcessorNumber());
     init_log_session_state("entry");
 
-    constexpr ULONG SETTLE_POLLS = 5;
+    constexpr ULONG SETTLE_POLLS = 20;
     constexpr LONG64 POLL_INTERVAL = -1'000'000LL;
 
     LARGE_INTEGER interval;
     interval.QuadPart = POLL_INTERVAL;
+
+    dbg_capture::write_immediate_formatted("[SN-EARLY] init_thread settle_begin polls=%lu interval_100ns=%lld target_base=%p target_size=0x%lx target_object=%p elapsed_us=%lu\n",
+        SETTLE_POLLS,
+        static_cast<long long>(POLL_INTERVAL),
+        (PVOID)g_target_driver_base,
+        g_target_driver_size,
+        (PVOID)g_target_driver_object,
+        init_elapsed_us(init_start, init_freq));
 
     for (ULONG i = 0; i < SETTLE_POLLS; i++) {
         if (_InterlockedCompareExchange(&g_shutdown_flag, 0, 0)) {
@@ -947,17 +976,51 @@ static void NTAPI init_thread_routine(PVOID ) {
             goto exit_thread;
         }
 
-        if (g_target_driver_base != nullptr) {
-            SN_LOG("init_thread: g_target_driver_base pre-set at %p after %lu settles", (PVOID)g_target_driver_base, i);
+        PVOID handoff_base = nullptr;
+        PVOID handoff_object = nullptr;
+        ULONG handoff_size = 0;
+        init_read_target_handoff(&handoff_base, &handoff_size, &handoff_object);
+        BOOLEAN handoff_ready = init_target_handoff_ready(handoff_base, handoff_size);
+
+        dbg_capture::write_immediate_formatted("[SN-EARLY] init_thread settle_probe poll=%lu ready=%u target_base=%p target_size=0x%lx target_object=%p shutdown=%ld elapsed_us=%lu\n",
+            i,
+            handoff_ready ? 1u : 0u,
+            handoff_base,
+            handoff_size,
+            handoff_object,
+            _InterlockedCompareExchange(&g_shutdown_flag, 0, 0),
+            init_elapsed_us(init_start, init_freq));
+
+        if (handoff_ready) {
+            SN_LOG("init_thread: target handoff ready base=%p size=0x%lx object=%p after %lu settles",
+                handoff_base, handoff_size, handoff_object, i);
             break;
+        }
+
+        if (handoff_base || handoff_size != 0 || handoff_object) {
+            SN_LOG("init_thread: target handoff incomplete poll=%lu base=%p size=0x%lx object=%p",
+                i, handoff_base, handoff_size, handoff_object);
         }
 
         _KeDelayExecutionThread(KernelMode, FALSE, &interval);
     }
 
 
-    if (g_target_driver_base == nullptr) {
-        SN_LOG("init_thread: settle done, attempting device discovery before bridge magic scan...");
+    {
+        PVOID handoff_base = nullptr;
+        PVOID handoff_object = nullptr;
+        ULONG handoff_size = 0;
+        init_read_target_handoff(&handoff_base, &handoff_size, &handoff_object);
+        dbg_capture::write_immediate_formatted("[SN-EARLY] init_thread settle_done ready=%u target_base=%p target_size=0x%lx target_object=%p elapsed_us=%lu\n",
+            init_target_handoff_ready(handoff_base, handoff_size) ? 1u : 0u,
+            handoff_base,
+            handoff_size,
+            handoff_object,
+            init_elapsed_us(init_start, init_freq));
+    }
+
+    if (!init_target_handoff_ready((PVOID)g_target_driver_base, g_target_driver_size)) {
+        SN_LOG("init_thread: settle done without complete target handoff, attempting device discovery before bridge magic scan...");
         init_log_session_state("before_bridge_scan");
 
         if (discover_target_driver_from_device()) {
@@ -1126,6 +1189,13 @@ discovery_done:
 
     if (g_target_driver_base == nullptr) {
         SN_LOG("init_thread: FATAL - target driver NOT FOUND, exiting");
+        goto exit_thread;
+    }
+
+    if (g_target_driver_size == 0) {
+        SN_LOG("init_thread: FATAL - target driver size NOT FOUND, exiting base=%p object=%p",
+            (PVOID)g_target_driver_base,
+            (PVOID)g_target_driver_object);
         goto exit_thread;
     }
 

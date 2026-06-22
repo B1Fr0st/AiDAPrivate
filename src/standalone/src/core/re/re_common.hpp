@@ -42,6 +42,10 @@ struct module_section_t
 struct module_layout_t
 {
     driver_bridge::module_info_t module;
+    std::uint16_t machine = 0;
+    std::uint16_t optional_magic = 0;
+    bool is_pe32_plus = false;
+    std::uint32_t pointer_size = 0;
     std::vector<module_section_t> sections;
 };
 

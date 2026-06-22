@@ -217,7 +217,7 @@ if(EXISTS "${AIDA_CAMOUFOX_REPO_BROWSER_PATH}" AND EXISTS "${AIDA_CAMOUFOX_REPO_
         "timeout_ms: int = 30000"
         "_eval_with_budget"
         "evaluate_js timed out after"
-        "browser_manager.resolve_page(page_id)")
+        "browser_manager.resolve_page_for_operation(page_id")
         string(FIND "${AIDA_CAMOUFOX_REPO_DEBUGGING_CONTENT}" "${AIDA_CAMOUFOX_REQUIRED_DEBUGGING_MARKER}" AIDA_CAMOUFOX_REQUIRED_DEBUGGING_MARKER_POS)
         if(AIDA_CAMOUFOX_REQUIRED_DEBUGGING_MARKER_POS EQUAL -1)
             message(FATAL_ERROR "Root Camoufox reverse-MCP debugging source is missing required marker ${AIDA_CAMOUFOX_REQUIRED_DEBUGGING_MARKER}: ${AIDA_CAMOUFOX_REPO_DEBUGGING_PATH}")
@@ -226,7 +226,7 @@ if(EXISTS "${AIDA_CAMOUFOX_REPO_BROWSER_PATH}" AND EXISTS "${AIDA_CAMOUFOX_REPO_
     foreach(AIDA_CAMOUFOX_REQUIRED_STORAGE_MARKER IN ITEMS
         "payload: dict | None = None"
         "cookie_action = str(params.get(\"action\") or action or \"get\")"
-        "browser_manager.resolve_page(page_id)")
+        "browser_manager.resolve_page_for_operation(page_id")
         string(FIND "${AIDA_CAMOUFOX_REPO_STORAGE_CONTENT}" "${AIDA_CAMOUFOX_REQUIRED_STORAGE_MARKER}" AIDA_CAMOUFOX_REQUIRED_STORAGE_MARKER_POS)
         if(AIDA_CAMOUFOX_REQUIRED_STORAGE_MARKER_POS EQUAL -1)
             message(FATAL_ERROR "Root Camoufox reverse-MCP storage source is missing required marker ${AIDA_CAMOUFOX_REQUIRED_STORAGE_MARKER}: ${AIDA_CAMOUFOX_REPO_STORAGE_PATH}")
@@ -2023,12 +2023,13 @@ async def add_init_script(
     name: str = "",
     persistent: bool = True,
     page_id: str | None = None,
+    aida_operation_id=None,
 ) -> dict:
     try:
         if not isinstance(script, str) or not script.strip():
             return {"error": "script is required"}
         script_name = name.strip() if isinstance(name, str) and name.strip() else f"inline:{hashlib.sha256(script.encode('utf-8')).hexdigest()[:16]}"
-        page = await browser_manager.resolve_page(page_id)
+        page = await browser_manager.resolve_page_for_operation(page_id, "add_init_script", True, aida_operation_id)
         if persistent:
             await browser_manager.add_persistent_script(script_name, script)
         else:
@@ -2119,7 +2120,7 @@ async def add_init_script(script: str, name: str = "") -> dict:
     if(NOT AIDA_CAMOUFOX_HOOKING_CONTENT MATCHES "context_init"
         OR NOT AIDA_CAMOUFOX_HOOKING_CONTENT MATCHES "browser_manager.add_persistent_script"
         OR NOT AIDA_CAMOUFOX_HOOKING_CONTENT MATCHES "persistent: bool = True"
-        OR NOT AIDA_CAMOUFOX_HOOKING_CONTENT MATCHES "browser_manager.resolve_page\\(page_id\\)"
+        OR NOT AIDA_CAMOUFOX_HOOKING_CONTENT MATCHES "browser_manager.resolve_page_for_operation\\(page_id"
         OR NOT AIDA_CAMOUFOX_HOOKING_CONTENT MATCHES "_persistent_scripts")
         message(FATAL_ERROR "Failed to patch ${AIDA_CAMOUFOX_HOOKING_PATCH_FILE}")
     endif()

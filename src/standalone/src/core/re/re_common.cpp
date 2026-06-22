@@ -669,11 +669,19 @@ bool load_module_layout(std::uint32_t pid, const driver_bridge::module_info_t& m
     if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0)
         return false;
     const std::size_t nt_off = static_cast<std::size_t>(dos->e_lfanew);
-    if (nt_off + sizeof(IMAGE_NT_HEADERS64) > headers.size())
+    const std::size_t nt_common_size = sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER) + sizeof(WORD);
+    if (nt_off + nt_common_size > headers.size())
         return false;
-    auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(headers.data() + nt_off);
-    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->FileHeader.SizeOfOptionalHeader == 0)
+    auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS32*>(headers.data() + nt_off);
+    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->FileHeader.SizeOfOptionalHeader < sizeof(WORD))
         return false;
+    const std::uint16_t optional_magic = nt->OptionalHeader.Magic;
+    if (optional_magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC && optional_magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC)
+        return false;
+    out.machine = nt->FileHeader.Machine;
+    out.optional_magic = optional_magic;
+    out.is_pe32_plus = optional_magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+    out.pointer_size = out.is_pe32_plus ? 8u : 4u;
     const std::size_t section_off = nt_off + sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER) + nt->FileHeader.SizeOfOptionalHeader;
     const std::size_t section_bytes = static_cast<std::size_t>(nt->FileHeader.NumberOfSections) * sizeof(IMAGE_SECTION_HEADER);
     if (section_off + section_bytes > headers.size())

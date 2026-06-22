@@ -956,7 +956,6 @@ if(Python3_FOUND)
         set(rule_command_args "")
         set(rule_input_label "")
         if(EXISTS "${binary_path}")
-            list(APPEND rule_deps "${binary_path}")
             set(rule_command_args --from-binary "${binary_path}")
             set(rule_input_label "${binary_path}")
         elseif(EXISTS "${hex_path}")
@@ -1940,6 +1939,37 @@ if(WIN32)
         )
 
         add_dependencies(AiDAStandalone ghidra_specs)
+        add_custom_command(TARGET AiDAStandalone POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                "$<TARGET_FILE_DIR:AiDAStandalone>/ghidra_specs"
+                "$<TARGET_FILE_DIR:AiDAStandalone>/deps/ghidra_specs"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64.sla"
+                "$<TARGET_FILE_DIR:AiDAStandalone>/ghidra_specs/x86-64.sla"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64.pspec"
+                "$<TARGET_FILE_DIR:AiDAStandalone>/ghidra_specs/x86-64.pspec"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64-win.cspec"
+                "$<TARGET_FILE_DIR:AiDAStandalone>/ghidra_specs/x86-64-win.cspec"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${GHIDRA_SPECS_OUTPUT_DIR}/x86.ldefs"
+                "$<TARGET_FILE_DIR:AiDAStandalone>/ghidra_specs/x86.ldefs"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64.sla"
+                "$<TARGET_FILE_DIR:AiDAStandalone>/deps/ghidra_specs/x86-64.sla"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64.pspec"
+                "$<TARGET_FILE_DIR:AiDAStandalone>/deps/ghidra_specs/x86-64.pspec"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64-win.cspec"
+                "$<TARGET_FILE_DIR:AiDAStandalone>/deps/ghidra_specs/x86-64-win.cspec"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${GHIDRA_SPECS_OUTPUT_DIR}/x86.ldefs"
+                "$<TARGET_FILE_DIR:AiDAStandalone>/deps/ghidra_specs/x86.ldefs"
+            COMMENT "Staging Ghidra specs beside AiDAStandalone.exe..."
+            VERBATIM
+        )
         if(TARGET encrypt_drivers)
             add_dependencies(AiDAStandalone encrypt_drivers)
         endif()
@@ -2344,10 +2374,6 @@ if(WIN32)
                 message(STATUS "AiDA Camoufox app-local wheelhouse: ${AIDA_CAMOUFOX_WHEELHOUSE_DIR}")
             endif()
         endif()
-
-        # Post-build copies removed — libz3.dll and ghidra_specs are now
-        # embedded as Win32 resources inside the .exe via aida_embedded.rc.
-
     endif()
 
     # ── ARC (AiDA Runtime Core) DLL ──────────────────────────────────────
@@ -3229,12 +3255,19 @@ if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/standalone/test_target/CMak
         add_custom_command(TARGET AiDAStandalone POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E make_directory
                 "$<TARGET_FILE_DIR:AiDAStandalone>/test_binaries/target_protocol"
+                "$<TARGET_FILE_DIR:AiDAStandalone>/deps/test_binaries/target_protocol"
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "$<TARGET_FILE:AiDA_TargetProtocolFixture>"
                 "$<TARGET_FILE_DIR:AiDAStandalone>/test_binaries/target_protocol/target_protocol.exe"
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "$<TARGET_PDB_FILE:AiDA_TargetProtocolFixture>"
                 "$<TARGET_FILE_DIR:AiDAStandalone>/test_binaries/target_protocol/target_protocol.pdb"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:AiDA_TargetProtocolFixture>"
+                "$<TARGET_FILE_DIR:AiDAStandalone>/deps/test_binaries/target_protocol/target_protocol.exe"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_PDB_FILE:AiDA_TargetProtocolFixture>"
+                "$<TARGET_FILE_DIR:AiDAStandalone>/deps/test_binaries/target_protocol/target_protocol.pdb"
             COMMENT "Staging target_protocol fixture and PDB beside AiDAStandalone.exe..."
             VERBATIM
         )

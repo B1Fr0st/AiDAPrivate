@@ -304,12 +304,17 @@ std::wstring resolve_windows_sandbox_exe() {
 	return p;
 }
 
-std::wstring resolve_guest_agent_exe() {
+std::filesystem::path current_module_dir() {
 	wchar_t module_path[MAX_PATH] = {};
 	DWORD n = GetModuleFileNameW(nullptr, module_path, MAX_PATH);
 	if (n == 0 || n >= MAX_PATH) return {};
-	std::filesystem::path p(module_path);
-	std::filesystem::path agent = p.parent_path() / L"AiDAGuestAgent.exe";
+	return std::filesystem::path(module_path).parent_path();
+}
+
+std::wstring resolve_guest_agent_exe() {
+	std::filesystem::path module_dir = current_module_dir();
+	if (module_dir.empty()) return {};
+	std::filesystem::path agent = module_dir / L"AiDAGuestAgent.exe";
 	if (!file_exists_w(agent.wstring())) return {};
 	return agent.wstring();
 }
@@ -325,6 +330,41 @@ void stage_file_if_present(const std::filesystem::path& src, const std::filesyst
 		"stage_dependency name='%s' copied=%d ec=%d msg='%s'",
 		narrow_utf8(src.filename().wstring()).c_str(),
 		ec ? 0 : 1,
+		ec.value(),
+		ec.message().c_str());
+}
+
+void stage_directory_if_present(const std::filesystem::path& src,
+                                const std::filesystem::path& dst,
+                                const char* label) {
+	std::error_code ec;
+	if (src.empty() || !std::filesystem::exists(src, ec) || ec)
+		return;
+	ec.clear();
+	if (!std::filesystem::is_directory(src, ec) || ec)
+		return;
+	ec.clear();
+	std::filesystem::create_directories(dst.parent_path(), ec);
+	if (ec) {
+		diag::log_tagged_critical_fmt("run_target",
+			"stage_dependency_dir name='%s' copied=0 src='%s' dst='%s' ec=%d msg='%s'",
+			label,
+			narrow_utf8(src.wstring()).c_str(),
+			narrow_utf8(dst.wstring()).c_str(),
+			ec.value(),
+			ec.message().c_str());
+		return;
+	}
+	ec.clear();
+	std::filesystem::copy(src, dst,
+		std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing,
+		ec);
+	diag::log_tagged_critical_fmt("run_target",
+		"stage_dependency_dir name='%s' copied=%d src='%s' dst='%s' ec=%d msg='%s'",
+		label,
+		ec ? 0 : 1,
+		narrow_utf8(src.wstring()).c_str(),
+		narrow_utf8(dst.wstring()).c_str(),
 		ec.value(),
 		ec.message().c_str());
 }
@@ -451,6 +491,24 @@ void stage_common_runtime_dependencies(const std::filesystem::path& host_input) 
 	}
 	if (!module_dir.empty())
 		stage_runtime_dependency_directory(module_dir, host_input);
+}
+
+void stage_packaged_analysis_dependencies(const std::filesystem::path& host_input) {
+	std::filesystem::path module_dir = current_module_dir();
+	if (module_dir.empty())
+		return;
+	stage_directory_if_present(module_dir / L"ghidra_specs",
+		host_input / L"ghidra_specs",
+		"ghidra_specs");
+	stage_directory_if_present(module_dir / L"deps" / L"ghidra_specs",
+		host_input / L"deps" / L"ghidra_specs",
+		"deps_ghidra_specs");
+	stage_directory_if_present(module_dir / L"test_binaries" / L"target_protocol",
+		host_input / L"test_binaries" / L"target_protocol",
+		"target_protocol");
+	stage_directory_if_present(module_dir / L"deps" / L"test_binaries" / L"target_protocol",
+		host_input / L"deps" / L"test_binaries" / L"target_protocol",
+		"deps_target_protocol");
 }
 
 std::string make_unique_rule_name() {
@@ -1899,6 +1957,7 @@ bool launch_windows_sandbox(const launch_options_t& opts, launch_result_t& out) 
 	ec.clear();
 
 	stage_common_runtime_dependencies(host_input);
+	stage_packaged_analysis_dependencies(host_input);
 
 	std::wstring guest_root = L"C:\\Users\\WDAGUtilityAccount\\Desktop\\AiDAWorkspace";
 	std::wstring guest_input = guest_root + L"\\input";
@@ -1924,6 +1983,13 @@ bool launch_windows_sandbox(const launch_options_t& opts, launch_result_t& out) 
 		ofs << L"New-Item -ItemType Directory -Force -Path (Join-Path $outDir 'artifacts') | Out-Null\n";
 		ofs << L"Set-Content -Path (Join-Path $outDir 'launch.txt') -Value ('AiDA sandbox launch ' + (Get-Date).ToString('o'))\n";
 		ofs << L"$workDir = Split-Path -Path $exePath -Parent\n";
+		ofs << L"[Environment]::SetEnvironmentVariable(\"AIDA_PACKAGE_DIR\", $workDir, \"Process\"); $env:AIDA_PACKAGE_DIR = $workDir\n";
+		ofs << L"$depsDir = Join-Path $workDir 'deps'\n";
+		ofs << L"if (Test-Path -LiteralPath $depsDir) { [Environment]::SetEnvironmentVariable(\"AIDA_DEPS_DIR\", $depsDir, \"Process\"); $env:AIDA_DEPS_DIR = $depsDir }\n";
+		ofs << L"$fixtureDir = Join-Path $workDir 'test_binaries\\target_protocol'\n";
+		ofs << L"if (Test-Path -LiteralPath $fixtureDir) { [Environment]::SetEnvironmentVariable(\"AIDA_TARGET_PROTOCOL_FIXTURE_DIR\", $fixtureDir, \"Process\"); $env:AIDA_TARGET_PROTOCOL_FIXTURE_DIR = $fixtureDir }\n";
+		ofs << L"$specsDir = Join-Path $workDir 'ghidra_specs'\n";
+		ofs << L"if (Test-Path -LiteralPath $specsDir) { [Environment]::SetEnvironmentVariable(\"AIDA_GHIDRA_SPECS_DIR\", $specsDir, \"Process\"); $env:AIDA_GHIDRA_SPECS_DIR = $specsDir }\n";
 		ofs << L"$cfg = @{ sample = $exePath; args = $argLine; created = (Get-Date).ToString('o') } | ConvertTo-Json -Compress\n";
 		ofs << L"$utf8NoBom = New-Object System.Text.UTF8Encoding($false)\n";
 		ofs << L"[System.IO.File]::WriteAllText((Join-Path $outDir 'launch_config.json'), $cfg, $utf8NoBom)\n";

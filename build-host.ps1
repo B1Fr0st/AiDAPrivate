@@ -234,6 +234,10 @@ if ($Configure) {
     $steps.Add((New-Step "configure" "cmake --preset $Preset" "configure.log" (Join-Path $env:TEMP "aida_configure_out.txt")))
 }
 
+if ($Drivers) {
+    $steps.Add((New-Step "driver-stamps" "cmake -E remove build-ninja\whoswho_encrypted.stamp build-ninja\sentinel_encrypted.stamp build-ninja\windmapper_encrypted.stamp" "driver-stamps.log" (Join-Path $env:TEMP "aida_driver_stamps_out.txt")))
+}
+
 $steps.Add((New-Step "build" "cmake --build --preset $Preset" "build.log" (Join-Path $env:TEMP "aida_build_out.txt")))
 
 if (-not $SkipVerify) {

@@ -2164,9 +2164,76 @@ namespace driver_bridge
                 static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
             return true;
         }
-        driver_critical_fmt("initialize_connect_existing_post ok=0 err=%lu elapsed_ms=%llu",
-            static_cast<unsigned long>(device ? device->get_last_connect_error() : GetLastError()),
+        DWORD existing_connect_err = device ? device->get_last_connect_error() : GetLastError();
+        BOOL existing_hb_ioctl = device ? device->get_last_heartbeat_dioctl_result() : FALSE;
+        DWORD existing_hb_bytes = device ? device->get_last_heartbeat_bytes_returned() : 0u;
+        DWORD existing_hb_err = device ? device->get_last_heartbeat_error() : 0u;
+        driver_critical_fmt("initialize_connect_existing_post ok=0 err=%lu hb_ioctl=%d hb_err=%lu hb_bytes=%lu elapsed_ms=%llu",
+            static_cast<unsigned long>(existing_connect_err),
+            existing_hb_ioctl ? 1 : 0,
+            static_cast<unsigned long>(existing_hb_err),
+            static_cast<unsigned long>(existing_hb_bytes),
             static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
+
+        const bool existing_driver_unreachable =
+            ((existing_connect_err & 0xFFFF0000u) == 0xBEA70000u) ||
+            existing_hb_ioctl ||
+            existing_hb_bytes != 0 ||
+            existing_connect_err == 433u ||
+            existing_connect_err == ERROR_ACCESS_DENIED;
+        if (device && existing_driver_unreachable) {
+            for (int attempt = 1; attempt <= 3; ++attempt) {
+                Sleep(300);
+                driver_critical_fmt("initialize_existing_driver_retry_pre attempt=%d err=%lu hb_ioctl=%d hb_err=%lu hb_bytes=%lu elapsed_ms=%llu",
+                    attempt,
+                    static_cast<unsigned long>(device->get_last_connect_error()),
+                    device->get_last_heartbeat_dioctl_result() ? 1 : 0,
+                    static_cast<unsigned long>(device->get_last_heartbeat_error()),
+                    static_cast<unsigned long>(device->get_last_heartbeat_bytes_returned()),
+                    static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
+                if (device->connect()) {
+                    driver_critical_fmt("initialize_existing_driver_retry_post attempt=%d ok=1 elapsed_ms=%llu hb_err=%lu hb_bytes=%lu",
+                        attempt,
+                        static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started),
+                        static_cast<unsigned long>(device->get_last_heartbeat_error()),
+                        static_cast<unsigned long>(device->get_last_heartbeat_bytes_returned()));
+                    diag::log_tagged_fmt("driver", "connected to existing driver instance after guarded retry, skipping mapper");
+                    driver_loader::mark_already_loaded();
+                    g_kernel_mode = true;
+                    g_initialized = true;
+                    logf("AiDA Standalone: Connected to already-loaded driver after guarded retry.\n");
+                    start_driver_watchdog_locked();
+                    start_event_poller_locked();
+                    kernel_session_snapshot_t after_kernel = capture_kernel_session_snapshot_locked();
+                    runtime_auth_snapshot_t after_auth = capture_runtime_auth_snapshot();
+                    log_auth_kernel_transition("initialize_existing_driver_retry",
+                        "initialize",
+                        preserve_activation,
+                        before_auth,
+                        after_auth,
+                        before_kernel,
+                        after_kernel);
+                    driver_critical_fmt("initialize_exit reason=existing_driver_retry ok=1 kernel=1 elapsed_ms=%llu",
+                        static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
+                    return true;
+                }
+                driver_critical_fmt("initialize_existing_driver_retry_post attempt=%d ok=0 err=%lu hb_ioctl=%d hb_err=%lu hb_bytes=%lu elapsed_ms=%llu",
+                    attempt,
+                    static_cast<unsigned long>(device->get_last_connect_error()),
+                    device->get_last_heartbeat_dioctl_result() ? 1 : 0,
+                    static_cast<unsigned long>(device->get_last_heartbeat_error()),
+                    static_cast<unsigned long>(device->get_last_heartbeat_bytes_returned()),
+                    static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
+            }
+            DWORD guarded_err = device->get_last_connect_error();
+            driver_critical_fmt("initialize_exit reason=existing_driver_unreachable_no_remap err=%lu hb_ioctl=%d hb_err=%lu hb_bytes=%lu elapsed_ms=%llu",
+                static_cast<unsigned long>(guarded_err),
+                device->get_last_heartbeat_dioctl_result() ? 1 : 0,
+                static_cast<unsigned long>(device->get_last_heartbeat_error()),
+                static_cast<unsigned long>(device->get_last_heartbeat_bytes_returned()),
+                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
+            return driver_startup_fail_closed("initialize_existing_driver_unreachable_no_remap", guarded_err);
+        }
 
         driver_critical_fmt("initialize_loader_pre elapsed_ms=%llu",
             static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
@@ -2287,6 +2354,65 @@ namespace driver_bridge
                 before_kernel,
                 after_kernel);
             return true;
+        }
+
+        if (device) {
+            DWORD existing_connect_err = device->get_last_connect_error();
+            const bool existing_driver_unreachable =
+                ((existing_connect_err & 0xFFFF0000u) == 0xBEA70000u) ||
+                device->get_last_heartbeat_dioctl_result() ||
+                device->get_last_heartbeat_bytes_returned() != 0 ||
+                existing_connect_err == 433u ||
+                existing_connect_err == ERROR_ACCESS_DENIED;
+            if (existing_driver_unreachable) {
+                for (int attempt = 1; attempt <= 3; ++attempt) {
+                    Sleep(300);
+                    driver_critical_fmt("load_kernel_driver_existing_retry_pre attempt=%d err=%lu hb_ioctl=%d hb_err=%lu hb_bytes=%lu",
+                        attempt,
+                        static_cast<unsigned long>(device->get_last_connect_error()),
+                        device->get_last_heartbeat_dioctl_result() ? 1 : 0,
+                        static_cast<unsigned long>(device->get_last_heartbeat_error()),
+                        static_cast<unsigned long>(device->get_last_heartbeat_bytes_returned()));
+                    if (device->connect()) {
+                        driver_loader::mark_already_loaded();
+                        reset_kernel_transition_hardening_locked(preserve_activation);
+                        g_kernel_mode = true;
+                        g_initialized = true;
+                        g_adbg_clear_process_dr_supported.store(true, std::memory_order_release);
+                        g_adbg_hide_all_threads_supported.store(true, std::memory_order_release);
+                        g_driver_watchdog_last_ok_tick.store(0, std::memory_order_release);
+                        start_driver_watchdog_locked();
+                        start_event_poller_locked();
+                        kernel_session_snapshot_t after_kernel = capture_kernel_session_snapshot_locked();
+                        runtime_auth_snapshot_t after_auth = capture_runtime_auth_snapshot();
+                        log_auth_kernel_transition("load_kernel_driver_existing_retry",
+                            "load_kernel_driver",
+                            preserve_activation,
+                            before_auth,
+                            after_auth,
+                            before_kernel,
+                            after_kernel);
+                        driver_critical_fmt("load_kernel_driver_existing_retry_post attempt=%d ok=1 hb_err=%lu hb_bytes=%lu",
+                            attempt,
+                            static_cast<unsigned long>(device->get_last_heartbeat_error()),
+                            static_cast<unsigned long>(device->get_last_heartbeat_bytes_returned()));
+                        return true;
+                    }
+                    driver_critical_fmt("load_kernel_driver_existing_retry_post attempt=%d ok=0 err=%lu hb_ioctl=%d hb_err=%lu hb_bytes=%lu",
+                        attempt,
+                        static_cast<unsigned long>(device->get_last_connect_error()),
+                        device->get_last_heartbeat_dioctl_result() ? 1 : 0,
+                        static_cast<unsigned long>(device->get_last_heartbeat_error()),
+                        static_cast<unsigned long>(device->get_last_heartbeat_bytes_returned()));
+                }
+                DWORD guarded_err = device->get_last_connect_error();
+                driver_critical_fmt("load_kernel_driver_no_remap_existing_unreachable err=%lu hb_ioctl=%d hb_err=%lu hb_bytes=%lu",
+                    static_cast<unsigned long>(guarded_err),
+                    device->get_last_heartbeat_dioctl_result() ? 1 : 0,
+                    static_cast<unsigned long>(device->get_last_heartbeat_error()),
+                    static_cast<unsigned long>(device->get_last_heartbeat_bytes_returned()));
+                return driver_startup_fail_closed("load_kernel_driver_existing_unreachable_no_remap", guarded_err);
+            }
         }
 
         bool loader_ok = driver_loader::initialize_and_load();

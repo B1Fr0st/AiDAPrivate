@@ -1906,6 +1906,7 @@ static SimpleHttpResponse raw_https_request(
     int timeout_sec = 15)
 {
     SimpleHttpResponse out;
+    const ULONGLONG request_start_ms = GetTickCount64();
     {
         char buf[256];
         _snprintf_s(buf, sizeof(buf), _TRUNCATE,
@@ -1930,6 +1931,9 @@ static SimpleHttpResponse raw_https_request(
         out.ok = false;
         out.status = 0;
         out.error = "url_parse_failed";
+        lic_log_fmt("https_request_end ok=0 status=0 elapsed_ms=%llu err=%.120s body_len=0",
+            static_cast<unsigned long long>(GetTickCount64() - request_start_ms),
+            out.error.c_str());
         return out;
     }
 
@@ -1992,6 +1996,11 @@ static SimpleHttpResponse raw_https_request(
             "https_request_transport_ok status=%d body_len=%zu debug_reason=%.180s",
             out.status, out.body.size(), resp.debug_reason.c_str());
         lic_log(buf);
+        lic_log_fmt("https_request_end ok=1 status=%d elapsed_ms=%llu transport_ms=%llu err= body_len=%zu",
+            out.status,
+            static_cast<unsigned long long>(GetTickCount64() - request_start_ms),
+            static_cast<unsigned long long>(GetTickCount64() - transport_start_ms),
+            out.body.size());
         return out;
     }
 
@@ -2002,6 +2011,12 @@ static SimpleHttpResponse raw_https_request(
         "https_request_transport_failed err=%.220s status=%d",
         transport_err.c_str(), out.status);
     lic_log(buf);
+    lic_log_fmt("https_request_end ok=0 status=%d elapsed_ms=%llu transport_ms=%llu err=%.120s body_len=%zu",
+        out.status,
+        static_cast<unsigned long long>(GetTickCount64() - request_start_ms),
+        static_cast<unsigned long long>(GetTickCount64() - transport_start_ms),
+        out.error.c_str(),
+        out.body.size());
     return out;
 }
 
@@ -8756,6 +8771,12 @@ namespace
 
     void heartbeat_worker(settings_sa_t* settings, uint64_t worker_epoch)
     {
+        const int prior_priority = GetThreadPriority(GetCurrentThread());
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        lic_log_fmt("heartbeat_worker_enter epoch=%llu tid=%lu priority=%d",
+            static_cast<unsigned long long>(worker_epoch),
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            GetThreadPriority(GetCurrentThread()));
         std::mt19937 rng(static_cast<unsigned>(
             std::chrono::steady_clock::now().time_since_epoch().count() ^
             GetCurrentProcessId()));
@@ -8937,10 +8958,21 @@ namespace
             }
             lic_log("heartbeat_apply_done");
         }
+        lic_log_fmt("heartbeat_worker_exit epoch=%llu tid=%lu",
+            static_cast<unsigned long long>(worker_epoch),
+            static_cast<unsigned long>(GetCurrentThreadId()));
+        if (prior_priority != THREAD_PRIORITY_ERROR_RETURN)
+            SetThreadPriority(GetCurrentThread(), prior_priority);
     }
 
     void srv_refresh_worker(settings_sa_t* settings, uint64_t worker_epoch)
     {
+        const int prior_priority = GetThreadPriority(GetCurrentThread());
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        lic_log_fmt("srv_refresh_worker_enter epoch=%llu tid=%lu priority=%d",
+            static_cast<unsigned long long>(worker_epoch),
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            GetThreadPriority(GetCurrentThread()));
         while (worker_active(worker_epoch))
         {
             for (int w = 0; w < 10 && worker_active(worker_epoch); ++w)
@@ -8999,6 +9031,11 @@ namespace
             if (relay_ok && driver_proof != 0)
                 store_driver_proof_cache(driver_proof, srv_nonce_str);
         }
+        lic_log_fmt("srv_refresh_worker_exit epoch=%llu tid=%lu",
+            static_cast<unsigned long long>(worker_epoch),
+            static_cast<unsigned long>(GetCurrentThreadId()));
+        if (prior_priority != THREAD_PRIORITY_ERROR_RETURN)
+            SetThreadPriority(GetCurrentThread(), prior_priority);
     }
 
     bool run_heartbeat_once_after_worker_degrade(settings_sa_t& settings, const char* phase)

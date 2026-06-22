@@ -35,6 +35,41 @@ struct thread_state_t {
     std::function<void()> fn;
 };
 
+inline void run_state_fn(thread_state_t* state, void* raw_state)
+{
+    try {
+        if (state && state->fn)
+            state->fn();
+        diag::log_tagged_fmt("win_thread", "thread_fn_return tid=%lu state=%p", static_cast<unsigned long>(GetCurrentThreadId()), raw_state);
+    } catch (const std::exception& ex) {
+        diag::log_tagged_fmt("win_thread", "thread_fn_exception tid=%lu state=%p err=%s", static_cast<unsigned long>(GetCurrentThreadId()), raw_state, ex.what());
+    } catch (...) {
+        diag::log_tagged_fmt("win_thread", "thread_fn_exception tid=%lu state=%p err=unknown", static_cast<unsigned long>(GetCurrentThreadId()), raw_state);
+    }
+}
+
+inline DWORD run_state_fn_guarded(thread_state_t* state, void* raw_state)
+{
+    DWORD seh_code = 0;
+    __try {
+        run_state_fn(state, raw_state);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        seh_code = GetExceptionCode();
+    }
+    return seh_code;
+}
+
+inline DWORD destroy_state_guarded(thread_state_t* state)
+{
+    DWORD seh_code = 0;
+    __try {
+        delete state;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        seh_code = GetExceptionCode();
+    }
+    return seh_code;
+}
+
 inline DWORD WINAPI entry(void* arg)
 {
     const bool tls_ready = aida::manual_map_tls::ensure_current_thread();
@@ -46,16 +81,29 @@ inline DWORD WINAPI entry(void* arg)
         diag::log_tagged_fmt("win_thread", "thread_entry_null_state tid=%lu", static_cast<unsigned long>(GetCurrentThreadId()));
         return 0;
     }
-    std::unique_ptr<thread_state_t> state(static_cast<thread_state_t*>(arg));
-    try {
-        state->fn();
-        diag::log_tagged_fmt("win_thread", "thread_fn_return tid=%lu state=%p", static_cast<unsigned long>(GetCurrentThreadId()), arg);
-    } catch (const std::exception& ex) {
-        diag::log_tagged_fmt("win_thread", "thread_fn_exception tid=%lu state=%p err=%s", static_cast<unsigned long>(GetCurrentThreadId()), arg, ex.what());
-    } catch (...) {
-        diag::log_tagged_fmt("win_thread", "thread_fn_exception tid=%lu state=%p err=unknown", static_cast<unsigned long>(GetCurrentThreadId()), arg);
+    thread_state_t* state = static_cast<thread_state_t*>(arg);
+    const DWORD run_seh = run_state_fn_guarded(state, arg);
+    if (run_seh != 0) {
+        diag::log_tagged_fmt("win_thread",
+            "thread_fn_seh tid=%lu state=%p code=0x%08lX",
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            arg,
+            static_cast<unsigned long>(run_seh));
     }
     diag::log_tagged_fmt("win_thread", "thread_exit_pre tid=%lu state=%p", static_cast<unsigned long>(GetCurrentThreadId()), arg);
+    const DWORD destroy_seh = destroy_state_guarded(state);
+    if (destroy_seh != 0) {
+        diag::log_tagged_fmt("win_thread",
+            "thread_state_destroy_seh tid=%lu state=%p code=0x%08lX",
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            arg,
+            static_cast<unsigned long>(destroy_seh));
+    }
+    diag::log_tagged_fmt("win_thread", "thread_exit_post tid=%lu state=%p run_seh=0x%08lX destroy_seh=0x%08lX",
+        static_cast<unsigned long>(GetCurrentThreadId()),
+        arg,
+        static_cast<unsigned long>(run_seh),
+        static_cast<unsigned long>(destroy_seh));
     return 0;
 }
 

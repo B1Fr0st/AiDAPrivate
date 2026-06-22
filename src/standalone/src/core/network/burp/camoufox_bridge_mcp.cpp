@@ -2708,7 +2708,8 @@ std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
              {"script_url", "string", "Optional script URL to limit the search", false},
              {"context_chars", "number", "Characters of context around matches", false},
              {"context_lines", "number", "Lines of context around matches", false},
-             {"max_results", "number", "Maximum matches", false}}, true, 30000},
+             {"max_results", "number", "Maximum matches", false},
+             {"page_id", "string", "Stable AiDA page id", false}}, true, 30000},
         {"compare_env", "Collect browser environment fingerprint data for comparison.",
             {{"properties", "array", "Specific properties to check", false}}, true, 65000},
         {"check_environment", "Run reverse-MCP dependency, browser, privacy, and runtime state checks.",
@@ -2718,7 +2719,8 @@ std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
              {"samples", "array", "Request/signature samples", true},
              {"compare_params", "array", "Parameter names to compare", false}}, true, 30000},
         {"analyze_cookie_sources", "Attribute observed cookies to HTTP headers or JavaScript writes.",
-            {{"name_filter", "string", "Optional cookie-name filter", false}}, true, 30000}
+            {{"name_filter", "string", "Optional cookie-name filter", false},
+             {"page_id", "string", "Stable AiDA page id", false}}, true, 30000}
     };
 }
 

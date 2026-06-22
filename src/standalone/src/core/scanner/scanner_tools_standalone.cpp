@@ -762,6 +762,18 @@ static tool_result_t handle_first_scan(const json& params) {
 
 	for (int i = 0; i < 300; ++i) {
 		if (!memory_scanner::g_state.scanning.load()) break;
+		if (mcp_standalone::current_call_cancelled()) {
+			json result = scan_summary_json(100);
+			result["completed"] = false;
+			result["cancelled"] = true;
+			result["poll_iteration"] = i;
+			diag::log_tagged_fmt("scanner", "mcp first_scan cancelled total=%zu scan_count=%d poll_iteration=%d",
+				memory_scanner::g_state.total_found,
+				memory_scanner::g_state.scan_count,
+				i);
+			memory_scanner::reset_scan();
+			return tool_result_t::error(OBFSTR("Memory scan cancelled."), "cancelled", result);
+		}
 		Sleep(100);
 	}
 
@@ -804,6 +816,18 @@ static tool_result_t handle_next_scan(const json& params) {
 
 	for (int i = 0; i < 300; ++i) {
 		if (!memory_scanner::g_state.scanning.load()) break;
+		if (mcp_standalone::current_call_cancelled()) {
+			json result = scan_summary_json(100);
+			result["completed"] = false;
+			result["cancelled"] = true;
+			result["poll_iteration"] = i;
+			diag::log_tagged_fmt("scanner", "mcp next_scan cancelled total=%zu scan_count=%d poll_iteration=%d",
+				memory_scanner::g_state.total_found,
+				memory_scanner::g_state.scan_count,
+				i);
+			memory_scanner::reset_scan();
+			return tool_result_t::error(OBFSTR("Next memory scan cancelled."), "cancelled", result);
+		}
 		Sleep(100);
 	}
 

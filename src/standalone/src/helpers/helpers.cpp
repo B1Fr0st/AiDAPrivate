@@ -6656,22 +6656,24 @@ void helpers::render_title()
 	float disasm_child_h = total_h - hdr_h - 1.f;
 	const float di_pad   = 6.f;
 	const float session_tabs_h = 32.f;
+	float center_content_w = (std::max)(center_w - di_pad * 2.f, 1.f);
+	float center_content_h = (std::max)(disasm_child_h - di_pad * 2.f - session_tabs_h, 1.f);
 	{
 		ImVec2 wpos = ImGui::GetWindowPos();
 		float tabs_screen_x = wpos.x + pad + left_gap + di_pad;
 		float tabs_screen_y = wpos.y + disasm_child_y + di_pad;
-		float tabs_w = center_w - di_pad * 2.f;
+		float tabs_w = center_content_w;
 		render_session_tabs(tabs_screen_x, tabs_screen_y, tabs_w, session_tabs_h, a);
 	}
 	ImGui::SetCursorPos(ImVec2(pad + left_gap + di_pad, disasm_child_y + di_pad + session_tabs_h));
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f,0.f));
 	ImGui::BeginChild("##center_content_scroll",
-		ImVec2(center_w - di_pad*2.f, disasm_child_h - di_pad*2.f - session_tabs_h),
+		ImVec2(center_content_w, center_content_h),
 		false, ImGuiWindowFlags_NoBackground);
 	{
 
 
-	mark_center_render_section("center_pump_ui_thread_jobs", globals::ui::active_center_view, false, 0.f, 0.f);
+	mark_center_render_section("center_pump_ui_thread_jobs", globals::ui::active_center_view, false, center_content_w, center_content_h);
 	static std::atomic<unsigned long long> s_last_pump_jobs_log_ms{0};
 	const unsigned long long ui_jobs_start_ms = GetTickCount64();
 	unsigned long long last_pump_jobs_log_ms = s_last_pump_jobs_log_ms.load(std::memory_order_acquire);
@@ -6723,8 +6725,8 @@ void helpers::render_title()
 			cv = center_view_t::hex_view;
 	}
 
-	float vw = center_w - di_pad * 2.f;
-	float vh = disasm_child_h - di_pad * 2.f - session_tabs_h;
+	float vw = center_content_w;
+	float vh = center_content_h;
 	const unsigned long long center_dispatch_start_ms = GetTickCount64();
 	auto log_center_dispatch_exit = [&](const char* section) {
 		const unsigned long long now_ms = GetTickCount64();

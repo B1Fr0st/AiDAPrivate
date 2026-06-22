@@ -2368,7 +2368,12 @@ bool trace_serializer(const serializer_trace_options_t& input,
     nlohmann::json captures = nlohmann::json::array();
     std::string backend = "pre_encrypt_hook";
     bool pre_encrypt_attempted = buf_arg >= 0 && size_arg >= 0;
+    bool pre_encrypt_hook_installed = false;
+    bool pre_encrypt_polling_started = false;
     bool pre_encrypt_started = false;
+    std::uint32_t pre_encrypt_unhook_removed = 0;
+    DWORD pre_encrypt_debugger_error = ERROR_SUCCESS;
+    std::string pre_encrypt_fallback_reason;
     bool driver_sniff_attempted = false;
     bool driver_sniff_started = false;
     bool driver_sniff_active_after_get = false;
@@ -2386,19 +2391,38 @@ bool trace_serializer(const serializer_trace_options_t& input,
         options.sample_ms,
         options.max_captures);
 
-    if (buf_arg >= 0 && size_arg >= 0 &&
-        pre_encrypt_hook::hook_address(options.serializer_va, "net_proto_serializer",
-                                       static_cast<std::uint32_t>(buf_arg),
-                                       static_cast<std::uint32_t>(size_arg)) &&
-        pre_encrypt_hook::start_polling()) {
+    if (buf_arg >= 0 && size_arg >= 0) {
+        pre_encrypt_hook_installed = pre_encrypt_hook::hook_address(options.serializer_va, "net_proto_serializer",
+            static_cast<std::uint32_t>(buf_arg),
+            static_cast<std::uint32_t>(size_arg));
+        if (pre_encrypt_hook_installed)
+            pre_encrypt_polling_started = pre_encrypt_hook::start_polling();
+        pre_encrypt_debugger_error = pre_encrypt_hook::g_state.debugger_error.load();
+        if (!pre_encrypt_hook_installed)
+            pre_encrypt_fallback_reason = "pre_encrypt_hook_install_failed";
+        else if (!pre_encrypt_polling_started)
+            pre_encrypt_fallback_reason = "pre_encrypt_polling_start_failed";
+        diag::log_tagged_fmt("net_proto",
+            "trace_serializer pre_encrypt_setup attempted=1 installed=%d polling_started=%d debugger_error=%lu fallback_reason=%s",
+            pre_encrypt_hook_installed ? 1 : 0,
+            pre_encrypt_polling_started ? 1 : 0,
+            static_cast<unsigned long>(pre_encrypt_debugger_error),
+            pre_encrypt_fallback_reason.empty() ? "<none>" : pre_encrypt_fallback_reason.c_str());
+    }
+
+    if (pre_encrypt_hook_installed && pre_encrypt_polling_started) {
         pre_encrypt_started = true;
         std::this_thread::sleep_for(std::chrono::milliseconds(options.sample_ms));
         auto caps = pre_encrypt_hook::get_captures(options.max_captures);
-        pre_encrypt_hook::unhook_all();
+        pre_encrypt_unhook_removed = pre_encrypt_hook::unhook_all();
         diag::log_tagged_fmt("net_proto",
-            "trace_serializer pre_encrypt_done captures=%zu sample_ms=%u",
+            "trace_serializer pre_encrypt_done installed=%d polling_started=%d captures=%zu sample_ms=%u unhook_removed=%u debugger_error=%lu",
+            pre_encrypt_hook_installed ? 1 : 0,
+            pre_encrypt_polling_started ? 1 : 0,
             caps.size(),
-            options.sample_ms);
+            options.sample_ms,
+            pre_encrypt_unhook_removed,
+            static_cast<unsigned long>(pre_encrypt_debugger_error));
         for (const auto& cap : caps) {
             samples.push_back(cap.buffer);
             nlohmann::json c;
@@ -2411,9 +2435,17 @@ bool trace_serializer(const serializer_trace_options_t& input,
             captures.push_back(std::move(c));
         }
     } else {
-        pre_encrypt_hook::unhook_all();
+        pre_encrypt_unhook_removed = pre_encrypt_hook::unhook_all();
         backend = "driver_sniff_net_buffers";
         driver_sniff_attempted = true;
+        diag::log_tagged_fmt("net_proto",
+            "trace_serializer driver_fallback pre_attempted=%d installed=%d polling_started=%d unhook_removed=%u debugger_error=%lu reason=%s",
+            pre_encrypt_attempted ? 1 : 0,
+            pre_encrypt_hook_installed ? 1 : 0,
+            pre_encrypt_polling_started ? 1 : 0,
+            pre_encrypt_unhook_removed,
+            static_cast<unsigned long>(pre_encrypt_debugger_error),
+            pre_encrypt_fallback_reason.empty() ? "<none>" : pre_encrypt_fallback_reason.c_str());
         if (!driver_bridge::sniff_net_buffers_start(options.serializer_va,
                 driver_buf_reg,
                 driver_size_reg,
@@ -2421,6 +2453,23 @@ bool trace_serializer(const serializer_trace_options_t& input,
                 options.tid,
                 0)) {
             error = driver_bridge::last_error().empty() ? "failed to start serializer trace" : driver_bridge::last_error();
+            out["process_id"] = pid;
+            out["serializer_va"] = fmt_addr(options.serializer_va);
+            out["buffer_reg"] = options.buffer_reg;
+            out["size_reg"] = options.size_reg;
+            out["backend"] = backend;
+            out["pre_encrypt_attempted"] = pre_encrypt_attempted;
+            out["pre_encrypt_hook_installed"] = pre_encrypt_hook_installed;
+            out["pre_encrypt_polling_started"] = pre_encrypt_polling_started;
+            out["pre_encrypt_started"] = pre_encrypt_started;
+            out["pre_encrypt_unhook_removed"] = pre_encrypt_unhook_removed;
+            out["pre_encrypt_debugger_error"] = static_cast<unsigned long>(pre_encrypt_debugger_error);
+            out["pre_encrypt_fallback_reason"] = pre_encrypt_fallback_reason;
+            out["driver_sniff_attempted"] = driver_sniff_attempted;
+            out["driver_sniff_started"] = driver_sniff_started;
+            out["driver_error"] = error;
+            out["functional_success"] = false;
+            out["zero_capture_reason"] = "driver serializer buffer sniffing did not start after pre-encrypt hook fallback";
             return false;
         }
         driver_sniff_started = true;
@@ -2463,7 +2512,12 @@ bool trace_serializer(const serializer_trace_options_t& input,
     out["stimulus_observed"] = !samples.empty();
     out["functional_success"] = !samples.empty();
     out["pre_encrypt_attempted"] = pre_encrypt_attempted;
+    out["pre_encrypt_hook_installed"] = pre_encrypt_hook_installed;
+    out["pre_encrypt_polling_started"] = pre_encrypt_polling_started;
     out["pre_encrypt_started"] = pre_encrypt_started;
+    out["pre_encrypt_unhook_removed"] = pre_encrypt_unhook_removed;
+    out["pre_encrypt_debugger_error"] = static_cast<unsigned long>(pre_encrypt_debugger_error);
+    out["pre_encrypt_fallback_reason"] = pre_encrypt_fallback_reason;
     out["driver_sniff_attempted"] = driver_sniff_attempted;
     out["driver_sniff_started"] = driver_sniff_started;
     out["driver_sniff_active_after_get"] = driver_sniff_active_after_get;

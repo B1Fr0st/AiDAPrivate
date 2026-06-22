@@ -539,52 +539,113 @@ bool voyager::device_t::connect() noexcept {
     }
 
     std::wstring device_path = device_names_um::get_device_path();
+    std::wstring leaf = device_path;
+    constexpr const wchar_t* dos_prefix = L"\\\\.\\";
+    constexpr std::size_t dos_prefix_len = 4;
+    if (leaf.size() > dos_prefix_len && leaf.compare(0, dos_prefix_len, dos_prefix) == 0) {
+        leaf.erase(0, dos_prefix_len);
+    }
+    std::wstring global_dos_path = L"\\\\.\\Global\\";
+    global_dos_path += leaf;
+    std::wstring globalroot_device_path = L"\\\\?\\GLOBALROOT\\Device\\";
+    globalroot_device_path += leaf;
+    std::wstring globalroot_dos_path = L"\\\\?\\GLOBALROOT\\GLOBAL??\\";
+    globalroot_dos_path += leaf;
+    const std::wstring* candidates[] = {
+        &device_path,
+        &global_dos_path,
+        &globalroot_device_path,
+        &globalroot_dos_path,
+    };
     diag::log_tagged_critical_fmt("comm-startup",
-        "connect_enter local_pid=%lu local_tid=%lu path_chars=%zu base=0x%04X key_hash=0x%08X",
+        "connect_enter local_pid=%lu local_tid=%lu path_chars=%zu candidates=%zu base=0x%04X key_hash=0x%08X",
         static_cast<unsigned long>(GetCurrentProcessId()),
         static_cast<unsigned long>(GetCurrentThreadId()),
         static_cast<std::size_t>(device_path.size()),
+        static_cast<std::size_t>(_countof(candidates)),
         compute_ioctl_base_snapshot(),
         hash_build_key(compute_dynamic_key_snapshot()));
-    driver_handle_ = CreateFileW(
-        device_path.c_str(),
-        GENERIC_READ | GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
-        nullptr,
-        OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL,
-        nullptr
-    );
 
-    if (!is_connected()) {
-        DWORD rw_error = GetLastError();
+    DWORD first_error = ERROR_SUCCESS;
+    DWORD last_error = ERROR_SUCCESS;
+    std::size_t opened_index = static_cast<std::size_t>(-1);
+    for (std::size_t i = 0; i < _countof(candidates); ++i) {
+        const std::wstring& candidate = *candidates[i];
         driver_handle_ = CreateFileW(
-            device_path.c_str(),
-            GENERIC_READ,
+            candidate.c_str(),
+            GENERIC_READ | GENERIC_WRITE,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             nullptr,
             OPEN_EXISTING,
             FILE_ATTRIBUTE_NORMAL,
             nullptr
         );
+
+        DWORD rw_error = is_connected() ? ERROR_SUCCESS : GetLastError();
+        if (!is_connected()) {
+            if (first_error == ERROR_SUCCESS) {
+                first_error = rw_error;
+            }
+            last_error = rw_error;
+            driver_handle_ = CreateFileW(
+                candidate.c_str(),
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                nullptr,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                nullptr
+            );
+            DWORD ro_error = is_connected() ? ERROR_SUCCESS : GetLastError();
+            if (!is_connected()) {
+                if (first_error == ERROR_SUCCESS) {
+                    first_error = ro_error;
+                }
+                last_error = ro_error;
+            }
+            diag::log_tagged_critical_fmt("comm-startup",
+                "connect_candidate index=%zu chars=%zu rw_gle=%lu ro_gle=%lu opened=%u",
+                i,
+                static_cast<std::size_t>(candidate.size()),
+                static_cast<unsigned long>(rw_error),
+                static_cast<unsigned long>(ro_error),
+                is_connected() ? 1u : 0u);
+        } else {
+            diag::log_tagged_critical_fmt("comm-startup",
+                "connect_candidate index=%zu chars=%zu rw_gle=0 ro_gle=0 opened=1",
+                i,
+                static_cast<std::size_t>(candidate.size()));
+        }
+
         if (is_connected()) {
-            diag::log_tagged_fmt("comm", "connect_rw_denied_fallback_read path_opened=1 rw_gle=%lu",
-                static_cast<unsigned long>(rw_error));
+            opened_index = i;
+            if (rw_error != ERROR_SUCCESS) {
+                diag::log_tagged_fmt("comm", "connect_rw_denied_fallback_read path_opened=1 rw_gle=%lu candidate=%zu",
+                    static_cast<unsigned long>(rw_error),
+                    i);
+            }
+            break;
         }
     }
 
     if (!is_connected()) {
-        last_connect_error_ = GetLastError();
+        last_connect_error_ = last_error != ERROR_SUCCESS ? last_error : first_error;
+        if (last_connect_error_ == ERROR_SUCCESS) {
+            last_connect_error_ = ERROR_NO_SUCH_DEVICE;
+        }
         diag::log_tagged_critical_fmt("comm-startup",
-            "connect_failed gle=%lu handle=0x%llX",
+            "connect_failed gle=%lu first_gle=%lu handle=0x%llX candidates=%zu",
             static_cast<unsigned long>(last_connect_error_),
-            reinterpret_cast<unsigned long long>(driver_handle_));
+            static_cast<unsigned long>(first_error),
+            reinterpret_cast<unsigned long long>(driver_handle_),
+            static_cast<std::size_t>(_countof(candidates)));
         return false;
     }
     diag::log_tagged_critical_fmt("comm-startup",
-        "connect_handle_opened handle=0x%llX session_before=%d",
+        "connect_handle_opened handle=0x%llX session_before=%d candidate=%zu",
         reinterpret_cast<unsigned long long>(driver_handle_),
-        session_key_ != 0 ? 1 : 0);
+        session_key_ != 0 ? 1 : 0,
+        opened_index);
     last_connect_error_ = 0;
     server_seed_ = 0;
     server_ioctl_seed_ = 0;

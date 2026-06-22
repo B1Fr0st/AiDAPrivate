@@ -3425,6 +3425,7 @@ call_result_t to_bridge_result(const mcp_client::call_result_t& r)
 }
 
 call_result_t call_with_deadline(const std::string& tool_name, const nlohmann::json& args, int timeout_ms, uint64_t request_id = 0);
+void stamp_aida_operation_id(nlohmann::json& args, const std::string& tool_name, uint64_t request_id);
 void update_page_cache_from_json_locked(const nlohmann::json& data, const char* source);
 
 std::string evaluate_result_error(const call_result_t& r)
@@ -3711,6 +3712,8 @@ call_result_t call_with_deadline(const std::string& tool_name, const nlohmann::j
     fail.ok = false;
     if (request_id == 0)
         request_id = next_request_id();
+    nlohmann::json call_args = args.is_null() ? nlohmann::json::object() : args;
+    stamp_aida_operation_id(call_args, tool_name, request_id);
 
     std::shared_ptr<mcp_client::client_t> cli;
     {
@@ -3744,7 +3747,7 @@ call_result_t call_with_deadline(const std::string& tool_name, const nlohmann::j
                     : "camoufox bridge not ready";
             diag::log_tagged_fmt("camoufox", "call_with_deadline phase=recovery_failed request_id=%llu tool=%s state=%d client=%d err_len=%zu args_shape=%s",
                 static_cast<unsigned long long>(request_id), tool_name.c_str(), static_cast<int>(sg().state), static_cast<int>(sg().client != nullptr),
-                fail.error.size(), json_shape(args).c_str());
+                fail.error.size(), json_shape(call_args).c_str());
             return fail;
         }
         {
@@ -3785,15 +3788,15 @@ call_result_t call_with_deadline(const std::string& tool_name, const nlohmann::j
     sg().total_calls.fetch_add(1, std::memory_order_relaxed);
     diag::log_tagged_fmt("camoufox", "call_with_deadline phase=dispatch request_id=%llu tool=%s timeout_ms=%d generation=%llu child_pid=%lu args_shape=%s",
         static_cast<unsigned long long>(request_id), tool_name.c_str(), timeout_ms, static_cast<unsigned long long>(state->generation),
-        static_cast<unsigned long>(state->child_pid), json_shape(args).c_str());
+        static_cast<unsigned long>(state->child_pid), json_shape(call_args).c_str());
 
-    bool posted = post_bridge_task("camoufox.call", [state, cli, tool_name, args, request_id]() {
+    bool posted = post_bridge_task("camoufox.call", [state, cli, tool_name, call_args, request_id]() {
         const uint64_t worker_start = now_ms();
         mcp_client::call_result_t r;
         guarded_mcp_call_context_t call_ctx;
         call_ctx.client = cli.get();
         call_ctx.tool_name = &tool_name;
-        call_ctx.args = &args;
+        call_ctx.args = &call_args;
         call_ctx.result = &r;
         diag::log_tagged_fmt("camoufox", "call_worker phase=enter request_id=%llu tool=%s generation=%llu child_pid=%lu",
             static_cast<unsigned long long>(request_id), tool_name.c_str(), static_cast<unsigned long long>(state->generation),
@@ -5383,15 +5386,62 @@ bool tool_accepts_page_id_directly(const std::string& tool_name)
            tool_name == "close_page" ||
            tool_name == "navigate" ||
            tool_name == "reload" ||
+           tool_name == "evaluate_js" ||
            tool_name == "take_screenshot" ||
            tool_name == "take_snapshot" ||
            tool_name == "network_capture" ||
            tool_name == "list_network_requests" ||
+           tool_name == "get_network_request" ||
            tool_name == "get_request_initiator" ||
+           tool_name == "intercept_request" ||
+           tool_name == "scripts" ||
+           tool_name == "search_code" ||
+           tool_name == "cookies" ||
+           tool_name == "get_storage" ||
+           tool_name == "hook_function" ||
+           tool_name == "add_init_script" ||
+           tool_name == "inject_hook_preset" ||
+           tool_name == "remove_hooks" ||
+           tool_name == "analyze_cookie_sources" ||
            tool_name == "click" ||
            tool_name == "type_text" ||
            tool_name == "wait_for" ||
            tool_name == "get_page_info";
+}
+
+bool tool_accepts_aida_operation_id(const std::string& tool_name)
+{
+    return tool_name == "navigate" ||
+           tool_name == "reload" ||
+           tool_name == "evaluate_js" ||
+           tool_name == "take_screenshot" ||
+           tool_name == "take_snapshot" ||
+           tool_name == "network_capture" ||
+           tool_name == "list_network_requests" ||
+           tool_name == "get_network_request" ||
+           tool_name == "get_request_initiator" ||
+           tool_name == "intercept_request" ||
+           tool_name == "scripts" ||
+           tool_name == "search_code" ||
+           tool_name == "cookies" ||
+           tool_name == "get_storage" ||
+           tool_name == "hook_function" ||
+           tool_name == "add_init_script" ||
+           tool_name == "inject_hook_preset" ||
+           tool_name == "remove_hooks" ||
+           tool_name == "analyze_cookie_sources" ||
+           tool_name == "click" ||
+           tool_name == "type_text" ||
+           tool_name == "wait_for" ||
+           tool_name == "get_page_info";
+}
+
+void stamp_aida_operation_id(nlohmann::json& args, const std::string& tool_name, uint64_t request_id)
+{
+    if (!args.is_object() || request_id == 0 || !tool_accepts_aida_operation_id(tool_name))
+        return;
+    if (!args.contains("aida_operation_id"))
+        args["aida_operation_id"] = request_id;
 }
 
 call_result_t page_target_select_failure(const std::string& tool_name, const std::string& session_id, const std::string& page_id, const call_result_t& select_result)
@@ -7538,6 +7588,8 @@ call_result_t managed_call_with_deadline(const std::shared_ptr<managed_session_t
     }
     if (timeout_ms <= 0) timeout_ms = 30000;
     const uint64_t request_id = session->next_request_id.fetch_add(1, std::memory_order_relaxed);
+    nlohmann::json call_args = args.is_null() ? nlohmann::json::object() : args;
+    stamp_aida_operation_id(call_args, tool_name, request_id);
     std::shared_ptr<mcp_client::client_t> cli;
     uint64_t generation = 0;
     uint32_t child_pid = 0;
@@ -7590,15 +7642,15 @@ call_result_t managed_call_with_deadline(const std::shared_ptr<managed_session_t
         static_cast<unsigned>(managed_entry_health.browser_process_count),
         static_cast<unsigned long>(GetCurrentProcessId()),
         static_cast<unsigned long>(GetCurrentThreadId()),
-        json_shape(args).c_str(),
+        json_shape(call_args).c_str(),
         managed_entry_health.process_tree.empty() ? "<empty>" : managed_entry_health.process_tree.c_str());
-    bool posted = post_bridge_task("camoufox.session.call", [state, cli, tool_name, args, request_id, generation, child_pid, sid = session->session_id]() {
+    bool posted = post_bridge_task("camoufox.session.call", [state, cli, tool_name, call_args, request_id, generation, child_pid, sid = session->session_id]() {
         const uint64_t worker_start = now_ms();
         mcp_client::call_result_t r;
         guarded_mcp_call_context_t call_ctx;
         call_ctx.client = cli.get();
         call_ctx.tool_name = &tool_name;
-        call_ctx.args = &args;
+        call_ctx.args = &call_args;
         call_ctx.result = &r;
         DWORD guard_status = guarded_mcp_call(&call_ctx);
         if (guard_status != ERROR_SUCCESS)
@@ -8854,6 +8906,7 @@ call_result_t call_tool(const std::string& tool_name, const nlohmann::json& args
     const uint64_t call_start_ms = now_ms();
     const uint64_t request_id = next_request_id();
     nlohmann::json safe_args = args.is_null() ? nlohmann::json::object() : args;
+    stamp_aida_operation_id(safe_args, tool_name, request_id);
     const action_snapshot_t entry = action_snapshot();
     diag::log_tagged_fmt("camoufox", "call_tool entry request_id=%llu tool=%s timeout_ms=%d args_shape=%s generation=%llu child_pid=%lu state=%s browser_open=%d page_verified=%d child_alive=%d cleanup_pending=%d",
         static_cast<unsigned long long>(request_id), tool_name.c_str(), timeout_ms, json_shape(safe_args).c_str(),

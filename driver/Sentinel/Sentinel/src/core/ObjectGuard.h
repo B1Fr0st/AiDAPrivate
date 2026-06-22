@@ -11,6 +11,9 @@ namespace object_guard {
     inline volatile UINT64 g_last_suspicious_pid = 0;
     inline volatile UINT32 g_suspicious_handle_count = 0;
     inline volatile HANDLE g_protected_pid = nullptr;
+    inline volatile LONG g_hide_thread_active = 0;
+    inline volatile LONG g_device_hidden = 0;
+    inline PDRIVER_OBJECT g_target_driver_object = nullptr;
 
     __forceinline void set_protected_pid(HANDLE pid) {
         _InterlockedExchange64(
@@ -142,7 +145,7 @@ namespace object_guard {
     }
 
 
-    __forceinline bool hide_device_and_symlink(PDRIVER_OBJECT target_driver_object) {
+    __forceinline bool set_device_open_state(PDRIVER_OBJECT target_driver_object, BOOLEAN hidden, const char* phase) {
         if (!target_driver_object || !_MmIsAddressValid(target_driver_object))
             return false;
 
@@ -151,33 +154,161 @@ namespace object_guard {
             if (!device || !_MmIsAddressValid(device))
                 return false;
 
-
             UCHAR* obj_header_addr = reinterpret_cast<UCHAR*>(device) - 0x30;
+            ULONG flags_before = device->Flags;
+            CSHORT refs = device->ReferenceCount;
+            UCHAR info_mask = 0;
 
             if (_MmIsAddressValid(obj_header_addr)) {
-
-
-                UCHAR info_mask = obj_header_addr[0x1A];
-                if (info_mask & 0x02) {
-
-
-                    device->Flags |= DO_DEVICE_INITIALIZING;
-                }
+                info_mask = obj_header_addr[0x1A];
+                device->Flags &= ~DO_DEVICE_INITIALIZING;
+            } else {
+                device->Flags &= ~DO_DEVICE_INITIALIZING;
             }
 
-            _InterlockedExchange(&g_initialized, 1);
+            ULONG flags_after = device->Flags;
+            _InterlockedExchange(&g_device_hidden, 0);
+            SN_LOG("object_guard::device_open_state phase=%s requested_hidden=%u openable=1 device=%p info_mask=0x%02x refs=%d flags_before=0x%lx flags_after=0x%lx first_hb=%ld bridge=%p whoswho_tsc=%llu",
+                phase ? phase : "unknown",
+                hidden ? 1u : 0u,
+                device,
+                info_mask,
+                static_cast<int>(refs),
+                flags_before,
+                flags_after,
+                _InterlockedCompareExchange(&heartbeat::g_first_heartbeat_seen, 0, 0),
+                heartbeat::g_bridge,
+                heartbeat::g_bridge ? static_cast<unsigned long long>(heartbeat::g_bridge->whoswho_tsc) : 0ull);
             return true;
 
         } __except (EXCEPTION_EXECUTE_HANDLER) {
+            SN_LOG("object_guard::device_open_state exception phase=%s hidden=%u",
+                phase ? phase : "unknown",
+                hidden ? 1u : 0u);
             return false;
         }
     }
 
+    __forceinline bool hide_device_and_symlink(PDRIVER_OBJECT target_driver_object) {
+        bool ok = set_device_open_state(target_driver_object, TRUE, "hide");
+        if (ok)
+            _InterlockedExchange(&g_initialized, 1);
+        return ok;
+    }
+
+    __forceinline bool restore_device_openable(PDRIVER_OBJECT target_driver_object, const char* phase) {
+        bool ok = set_device_open_state(target_driver_object, FALSE, phase);
+        if (ok)
+            _InterlockedExchange(&g_initialized, 1);
+        return ok;
+    }
+
+    __forceinline BOOLEAN first_client_heartbeat_seen() {
+        if (_InterlockedCompareExchange(&heartbeat::g_first_heartbeat_seen, 0, 0) == 0)
+            return FALSE;
+        if (!heartbeat::g_bridge || !_MmIsAddressValid(reinterpret_cast<PVOID>(
+                const_cast<heartbeat::sentinel_bridge_t*>(heartbeat::g_bridge))))
+            return FALSE;
+        return heartbeat::g_bridge->whoswho_tsc != 0 ? TRUE : FALSE;
+    }
+
+    __forceinline CSHORT device_open_reference_count(PDRIVER_OBJECT target_driver_object) {
+        if (!target_driver_object || !_MmIsAddressValid(target_driver_object))
+            return 0;
+
+        __try {
+            PDEVICE_OBJECT device = target_driver_object->DeviceObject;
+            if (!device || !_MmIsAddressValid(device))
+                return 0;
+            return device->ReferenceCount;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return 0;
+        }
+    }
+
+    inline VOID NTAPI deferred_hide_thread(PVOID) {
+        _InterlockedExchange(&g_hide_thread_active, 1);
+
+        PDRIVER_OBJECT target = g_target_driver_object;
+        SN_LOG("object_guard::deferred_hide_thread entry target=%p bridge=%p first_hb=%ld",
+            target,
+            heartbeat::g_bridge,
+            _InterlockedCompareExchange(&heartbeat::g_first_heartbeat_seen, 0, 0));
+
+        bool hidden = false;
+        for (ULONG i = 0; i < 240; ++i) {
+            BOOLEAN first_hb = first_client_heartbeat_seen();
+            CSHORT refs = device_open_reference_count(target);
+            if (first_hb && refs > 0) {
+                hidden = hide_device_and_symlink(target);
+                SN_LOG("object_guard::deferred_hide_thread hide_attempt poll=%lu hidden=%u refs=%d first_hb=%u",
+                    i,
+                    hidden ? 1u : 0u,
+                    static_cast<int>(refs),
+                    first_hb ? 1u : 0u);
+                break;
+            }
+            if ((i < 8) || ((i % 20) == 0)) {
+                SN_LOG("object_guard::deferred_hide_thread wait poll=%lu refs=%d first_hb=%u bridge=%p whoswho_tsc=%llu",
+                    i,
+                    static_cast<int>(refs),
+                    first_hb ? 1u : 0u,
+                    heartbeat::g_bridge,
+                    heartbeat::g_bridge ? static_cast<unsigned long long>(heartbeat::g_bridge->whoswho_tsc) : 0ull);
+            }
+            if (_KeDelayExecutionThread) {
+                LARGE_INTEGER wait;
+                wait.QuadPart = -2500000LL;
+                _KeDelayExecutionThread(KernelMode, FALSE, &wait);
+            }
+        }
+
+        if (!hidden) {
+            restore_device_openable(target, "deferred_no_client");
+            SN_LOG("object_guard::deferred_hide_thread no_client_seen target=%p bridge=%p first_hb=%ld",
+                target,
+                heartbeat::g_bridge,
+                _InterlockedCompareExchange(&heartbeat::g_first_heartbeat_seen, 0, 0));
+        }
+
+        _InterlockedExchange(&g_hide_thread_active, 0);
+        if (_PsTerminateSystemThread)
+            _PsTerminateSystemThread(STATUS_SUCCESS);
+    }
+
+    __forceinline bool start_deferred_hide(PDRIVER_OBJECT target_driver_object) {
+        if (!target_driver_object || !_PsCreateSystemThread || !_ZwClose)
+            return false;
+        if (_InterlockedCompareExchange(&g_hide_thread_active, 1, 0) != 0)
+            return true;
+
+        g_target_driver_object = target_driver_object;
+        HANDLE thread_handle = nullptr;
+        NTSTATUS st = _PsCreateSystemThread(
+            &thread_handle,
+            THREAD_ALL_ACCESS,
+            nullptr,
+            nullptr,
+            nullptr,
+            reinterpret_cast<PKSTART_ROUTINE>(deferred_hide_thread),
+            nullptr);
+        SN_LOG("object_guard::start_deferred_hide status=0x%08lx handle=%p target=%p", st, thread_handle, target_driver_object);
+        if (NT_SUCCESS(st)) {
+            _ZwClose(thread_handle);
+            return true;
+        }
+        _InterlockedExchange(&g_hide_thread_active, 0);
+        g_target_driver_object = nullptr;
+        return false;
+    }
+
     __forceinline bool init(PDRIVER_OBJECT target_driver_object) {
         SN_LOG("object_guard::init: target_driver_object=%p", target_driver_object);
-        bool result = hide_device_and_symlink(target_driver_object);
         bool cb_ok = install_ob_callbacks();
-        SN_LOG("object_guard::init: hide=%d ob_callbacks=%d", (int)result, (int)cb_ok);
-        return result && cb_ok;
+        bool open_ok = restore_device_openable(target_driver_object, "init_pre_client");
+        _InterlockedExchange(&g_hide_thread_active, 0);
+        g_target_driver_object = target_driver_object;
+        SN_LOG("object_guard::init: openable=%d hide_deferred=0 ob_callbacks=%d", (int)open_ok, (int)cb_ok);
+        return open_ok && cb_ok;
     }
 }

