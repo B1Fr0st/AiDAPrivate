@@ -73,10 +73,13 @@ namespace aida::ui::blur {
 	inline void render_drop_shadow(ImDrawList* dl, ImVec2 a, ImVec2 b,
 	                                float radius, int passes = 4,
 	                                float strength = 0.35f, ImVec2 offset = ImVec2(0.f, 4.f)) {
+		const auto& t = aida::ui::resolved();
+		ImU32 shadow_base = t.is_dark ? aida::ui::darken(t.bg_base, 18) : aida::ui::darken(t.text_dim, 18);
+		float scheme_alpha = t.is_dark ? 0.46f : 0.32f;
 		for (int i = 0; i < passes; ++i) {
 			float spread = (float)(i + 1) * 1.6f;
 			float fa = strength * (1.f - (float)i / (float)passes);
-			ImU32 sh = IM_COL32(0, 0, 0, (int)(fa * 80.f));
+			ImU32 sh = aida::ui::with_alpha(shadow_base, fa * scheme_alpha);
 			dl->AddRectFilled(
 				ImVec2(a.x - spread + offset.x, a.y - spread + offset.y),
 				ImVec2(b.x + spread + offset.x, b.y + spread + offset.y),

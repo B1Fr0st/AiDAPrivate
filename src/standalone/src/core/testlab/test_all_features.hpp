@@ -12,6 +12,7 @@ namespace test_all_features {
 	void end_test_guard(const char* source, bool arm_post_suppression = true);
 	void render_overlay(float vw, float vh);
 	bool is_running();
+	bool is_unattended_full_test_active();
 	void set_progress_step(const char* label);
 	void format_debug_snapshot(char* out, std::size_t cap);
 	void log_external_session_event(const char* source, unsigned msg, std::uintptr_t wparam, std::intptr_t lparam);

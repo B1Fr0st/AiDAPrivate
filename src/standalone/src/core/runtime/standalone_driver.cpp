@@ -322,8 +322,29 @@ namespace
             *invoked = false;
         if (!buffer || size == 0)
             return 0;
+        static std::atomic<uint64_t> s_arc_read_seq{0};
+        const uint64_t seq = s_arc_read_seq.fetch_add(1, std::memory_order_acq_rel) + 1;
+        const bool log_this = seq <= 256 || size <= 4096 || (seq % 128) == 0;
+        const uint32_t active_pid = driver_bridge::attached_pid();
+        const bool arc_loaded = standalone_license::is_arc_loaded();
+        const bool bridge_available = arc_loaded && driver_bridge::can_read_memory();
+        const DWORD tid = GetCurrentThreadId();
+        const ULONGLONG started = GetTickCount64();
+        if (log_this) {
+            diag::log_tagged_critical_fmt("driver",
+                "arc_read_raw_pre seq=%llu target_pid=%u active_pid=%u addr=0x%llX size=%llu tid=%lu arc_loaded=%d bridge_available=%d",
+                static_cast<unsigned long long>(seq),
+                active_pid,
+                active_pid,
+                static_cast<unsigned long long>(address),
+                static_cast<unsigned long long>(size),
+                static_cast<unsigned long>(tid),
+                arc_loaded ? 1 : 0,
+                bridge_available ? 1 : 0);
+        }
         struct ctx_t { uint64_t address; void* buffer; size_t size; size_t bytes; bool invoked; } ctx{address, buffer, size, 0, false};
-        standalone_license::with_arc_comm_bridge(
+        SetLastError(ERROR_SUCCESS);
+        const bool bridge_ok = standalone_license::with_arc_comm_bridge(
             [](const arc_comm_vtable_t* table, void* user) -> bool {
                 auto* c = static_cast<ctx_t*>(user);
                 if (!table->read_raw)
@@ -333,6 +354,25 @@ namespace
                 return true;
             },
             &ctx);
+        const DWORD gle = GetLastError();
+        const ULONGLONG elapsed = GetTickCount64() - started;
+        if (log_this || !bridge_ok || !ctx.invoked || ctx.bytes == 0 || ctx.bytes != size || elapsed > 250) {
+            diag::log_tagged_critical_fmt("driver",
+                "arc_read_raw_post seq=%llu target_pid=%u active_pid=%u addr=0x%llX size=%llu tid=%lu arc_loaded=%d bridge_available=%d bridge_ok=%d invoked=%d bytes=%llu gle=%lu elapsed_ms=%llu",
+                static_cast<unsigned long long>(seq),
+                active_pid,
+                driver_bridge::attached_pid(),
+                static_cast<unsigned long long>(address),
+                static_cast<unsigned long long>(size),
+                static_cast<unsigned long>(tid),
+                arc_loaded ? 1 : 0,
+                bridge_available ? 1 : 0,
+                bridge_ok ? 1 : 0,
+                ctx.invoked ? 1 : 0,
+                static_cast<unsigned long long>(ctx.bytes),
+                static_cast<unsigned long>(gle),
+                static_cast<unsigned long long>(elapsed));
+        }
         if (invoked)
             *invoked = ctx.invoked;
         return ctx.bytes;

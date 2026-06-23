@@ -156,6 +156,27 @@ namespace test_all_features {
 		std::deque<std::string> g_log_lines;
 		constexpr std::size_t kMaxLogLines = 4096;
 
+		struct destructive_skip_key_t {
+			const char* category;
+			const char* name;
+		};
+
+		constexpr destructive_skip_key_t kExpectedDestructiveSkipKeys[] = {
+			{ "thread", "TSR" },
+			{ "remote-call", "RC" },
+			{ "anti-debug", "DBGA" },
+			{ "module", "PINJ" },
+			{ "tamper", "ABRT" },
+			{ "evidence", "RECU" }
+		};
+		constexpr int kExpectedDestructiveSkipCount =
+			static_cast<int>(sizeof(kExpectedDestructiveSkipKeys) / sizeof(kExpectedDestructiveSkipKeys[0]));
+		bool g_expected_destructive_skip_seen[kExpectedDestructiveSkipCount] = {};
+		int g_expected_destructive_skip_seen_count = 0;
+		int g_unexpected_destructive_skip_count = 0;
+		int g_duplicate_destructive_skip_count = 0;
+		std::vector<std::string> g_unexpected_skip_records;
+
 		std::shared_ptr<const std::string> g_phase_label = std::make_shared<const std::string>();
 		std::shared_ptr<const std::string> g_step_label = std::make_shared<const std::string>();
 		std::atomic<std::uint64_t> g_run_id{ 0 };
@@ -552,6 +573,16 @@ namespace test_all_features {
 				static_cast<unsigned long>(err));
 		}
 
+		bool full_test_env_active() {
+			char value[16] = {};
+			DWORD n = GetEnvironmentVariableA(kFullTestEnvName, value, static_cast<DWORD>(sizeof(value)));
+			if (n == 0)
+				return false;
+			if (n >= sizeof(value))
+				return true;
+			return value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
+		}
+
 		const char* camoufox_bridge_state_name(aida::burp::camoufox::bridge_state_t state) {
 			using state_t = aida::burp::camoufox::bridge_state_t;
 			switch (state) {
@@ -898,6 +929,93 @@ namespace test_all_features {
 		const char* destructive_reason(const char* category, const char* name) {
 			const char* reason = test_lab::destructive_guard_reason(category, name);
 			return reason ? reason : "unknown destructive guard";
+		}
+
+		std::string skip_key_string(const char* category, const char* name) {
+			std::string out = category ? category : "?";
+			out += "/";
+			out += name ? name : "?";
+			return out;
+		}
+
+		int expected_destructive_skip_index(const char* category, const char* name) {
+			if (category == nullptr || name == nullptr)
+				return -1;
+			for (int i = 0; i < kExpectedDestructiveSkipCount; ++i) {
+				if (std::strcmp(category, kExpectedDestructiveSkipKeys[i].category) == 0 &&
+					std::strcmp(name, kExpectedDestructiveSkipKeys[i].name) == 0)
+					return i;
+			}
+			return -1;
+		}
+
+		void reset_destructive_skip_accounting() {
+			for (int i = 0; i < kExpectedDestructiveSkipCount; ++i)
+				g_expected_destructive_skip_seen[i] = false;
+			g_expected_destructive_skip_seen_count = 0;
+			g_unexpected_destructive_skip_count = 0;
+			g_duplicate_destructive_skip_count = 0;
+			g_unexpected_skip_records.clear();
+		}
+
+		bool record_destructive_skip_key(HANDLE hf, int ordinal, int total, const char* category, const char* name) {
+			const char* reason = test_lab::destructive_guard_reason(category, name);
+			const int expected_index = expected_destructive_skip_index(category, name);
+			const std::string key = skip_key_string(category, name);
+			if (expected_index < 0 || reason == nullptr) {
+				++g_unexpected_destructive_skip_count;
+				g_unexpected_skip_records.push_back(key + " reason=\"" + destructive_reason(category, name) + "\"");
+				log_msg(hf, "testlab", "[%d/%d] FAIL %s unexpected destructive skip key reason=\"%s\"",
+					ordinal, total, key.c_str(), destructive_reason(category, name));
+				return false;
+			}
+			if (g_expected_destructive_skip_seen[expected_index]) {
+				++g_duplicate_destructive_skip_count;
+				g_unexpected_skip_records.push_back(key + " reason=\"duplicate expected destructive skip\"");
+				log_msg(hf, "testlab", "[%d/%d] FAIL %s duplicate destructive skip key reason=\"%s\" expected_index=%d",
+					ordinal, total, key.c_str(), reason, expected_index);
+				return false;
+			}
+			const int before = g_skipped.load(std::memory_order_acquire);
+			const int after = g_skipped.fetch_add(1, std::memory_order_acq_rel) + 1;
+			g_expected_destructive_skip_seen[expected_index] = true;
+			++g_expected_destructive_skip_seen_count;
+			log_msg(hf, "testlab", "[%d/%d] SKIP %s expected_destructive_key=1 expected_index=%d reason=\"%s\" skip_before=%d skip_after=%d",
+				ordinal, total, key.c_str(), expected_index, reason, before, after);
+			return true;
+		}
+
+		int log_destructive_skip_accounting(HANDLE hf, const char* tag, const char* scope, bool final_accounting) {
+			const char* safe_tag = tag ? tag : "summary";
+			const char* safe_scope = scope ? scope : "full-test";
+			int missing = 0;
+			for (int i = 0; i < kExpectedDestructiveSkipCount; ++i) {
+				const bool seen = g_expected_destructive_skip_seen[i];
+				if (!seen)
+					++missing;
+				log_msg(hf, safe_tag, "DESTRUCTIVE-SKIP-KEY -- scope=%s key=%s/%s expected=1 observed=%d reason=\"%s\"",
+					safe_scope,
+					kExpectedDestructiveSkipKeys[i].category,
+					kExpectedDestructiveSkipKeys[i].name,
+					seen ? 1 : 0,
+					destructive_reason(kExpectedDestructiveSkipKeys[i].category, kExpectedDestructiveSkipKeys[i].name));
+			}
+			for (const auto& record : g_unexpected_skip_records) {
+				log_msg(hf, safe_tag, "UNEXPECTED-SKIP-KEY -- scope=%s key=%s",
+					safe_scope,
+					record.c_str());
+			}
+			const int raw_skips = g_skipped.load(std::memory_order_acquire);
+			log_msg(hf, safe_tag, "DESTRUCTIVE-SKIP-ACCOUNTING -- scope=%s expected=%d observed_expected=%d missing=%d unexpected=%d duplicate=%d global_skipped=%d final=%d",
+				safe_scope,
+				kExpectedDestructiveSkipCount,
+				g_expected_destructive_skip_seen_count,
+				missing,
+				g_unexpected_destructive_skip_count,
+				g_duplicate_destructive_skip_count,
+				raw_skips,
+				final_accounting ? 1 : 0);
+			return missing + g_unexpected_destructive_skip_count + g_duplicate_destructive_skip_count;
 		}
 
 		bool name_starts_with(const char* name, const char* prefix) {
@@ -2037,10 +2155,8 @@ namespace test_all_features {
 				const char* cat  = (f.category != nullptr) ? f.category : "?";
 
 				if (is_destructive(f.category, f.name)) {
-					const int before = g_skipped.load(std::memory_order_acquire);
-					const int after = g_skipped.fetch_add(1, std::memory_order_acq_rel) + 1;
-					log_msg(hf, "testlab", "[%d/%d] SKIP %s/%s (destructive guard reason=\"%s\" skip_before=%d skip_after=%d)",
-						i + 1, total, cat, name, destructive_reason(f.category, f.name), before, after);
+					if (!record_destructive_skip_key(hf, i + 1, total, f.category, f.name))
+						g_failed.fetch_add(1, std::memory_order_acq_rel);
 					continue;
 				}
 				if (f.run == nullptr) {
@@ -2296,6 +2412,11 @@ namespace test_all_features {
 					log_msg(hf, "testlab", "[%d/%d] memory-fixture cleanup addr=0x%016llX freed=%d",
 						i + 1, total, static_cast<unsigned long long>(cleanup_alloc), freed ? 1 : 0);
 				}
+			}
+			const int skip_accounting_errors = log_destructive_skip_accounting(hf, "testlab", "testlab features phase", false);
+			if (skip_accounting_errors != 0) {
+				g_failed.fetch_add(1, std::memory_order_acq_rel);
+				log_msg(hf, "testlab", "FAIL -- destructive skip-key phase accounting errors=%d", skip_accounting_errors);
 			}
 			log_phase_end(hf, "testlab features");
 		}
@@ -3239,17 +3360,21 @@ namespace test_all_features {
 			phase_stop_target(hf, target_pid);
 
 			set_phase("Complete");
-			constexpr int kExpectedDestructiveSkips = 6;
+			const int skip_accounting_errors = log_destructive_skip_accounting(hf, "summary", "final", true);
 			const int raw_skips = g_skipped.load(std::memory_order_acquire);
-			if (raw_skips > kExpectedDestructiveSkips) {
-				const int converted = raw_skips - kExpectedDestructiveSkips;
+			if (raw_skips > kExpectedDestructiveSkipCount) {
+				const int converted = raw_skips - kExpectedDestructiveSkipCount;
 				g_skipped.fetch_sub(converted, std::memory_order_acq_rel);
 				g_failed.fetch_add(converted, std::memory_order_acq_rel);
-				log_msg(hf, "summary", "FAIL -- converted %d non-destructive skip(s) into failures; exactly six destructive guards may remain skipped", converted);
-			} else if (raw_skips < kExpectedDestructiveSkips) {
-				const int missing = kExpectedDestructiveSkips - raw_skips;
+				log_msg(hf, "summary", "FAIL -- converted %d non-destructive skip(s) into failures; only the six expected destructive keys may remain skipped", converted);
+			}
+			if (skip_accounting_errors != 0 || raw_skips != kExpectedDestructiveSkipCount) {
 				g_failed.fetch_add(1, std::memory_order_acq_rel);
-				log_msg(hf, "summary", "FAIL -- destructive skip accounting expected exactly six destructive guards but observed %d; missing=%d", raw_skips, missing);
+				log_msg(hf, "summary", "FAIL -- destructive skip accounting expected exact key set observed_expected=%d expected=%d raw_skipped=%d errors=%d",
+					g_expected_destructive_skip_seen_count,
+					kExpectedDestructiveSkipCount,
+					raw_skips,
+					skip_accounting_errors);
 			}
 			int p = g_passed.load();
 			int f = g_failed.load();
@@ -3438,6 +3563,7 @@ namespace test_all_features {
 			g_target_image_base.store(0);
 			g_driver_attached.store(false);
 			g_saved_dtb.store(0, std::memory_order_release);
+			reset_destructive_skip_accounting();
 
 			{
 				std::lock_guard<std::mutex> lk(g_log_mtx);
@@ -3677,6 +3803,12 @@ namespace test_all_features {
 
 	bool is_running() {
 		return g_running.load(std::memory_order_acquire) || g_start_queued.load(std::memory_order_acquire);
+	}
+
+	bool is_unattended_full_test_active() {
+		return is_running() ||
+			anti_tamper::state::get().full_test_running.load(std::memory_order_acquire) ||
+			full_test_env_active();
 	}
 
 	void set_progress_step(const char* label) {

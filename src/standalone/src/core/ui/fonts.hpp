@@ -16,12 +16,12 @@ extern ImFont* g_font_code_400_lg;
 namespace aida::ui::fonts {
 	struct font_policy_t {
 		float scale = 1.f;
-		float body_px = 15.f;
-		float large_px = 17.f;
-		float caption_px = 12.5f;
-		float display_px = 26.f;
-		float code_px = 13.5f;
-		float code_large_px = 20.f;
+		float body_px = 16.5f;
+		float large_px = 18.5f;
+		float caption_px = 13.5f;
+		float display_px = 28.f;
+		float code_px = 14.5f;
+		float code_large_px = 21.f;
 		bool enable_lcd = false;
 	};
 
@@ -42,12 +42,12 @@ namespace aida::ui::fonts {
 	inline font_policy_t policy_for_dpi(float dpi_scale) {
 		font_policy_t p;
 		p.scale = scale_for_dpi(dpi_scale);
-		p.body_px = px(15.f, p.scale);
-		p.large_px = px(17.f, p.scale);
-		p.caption_px = px(12.5f, p.scale);
-		p.display_px = px(26.f, p.scale);
-		p.code_px = px(13.5f, p.scale);
-		p.code_large_px = px(20.f, p.scale);
+		p.body_px = px(16.5f, p.scale);
+		p.large_px = px(18.5f, p.scale);
+		p.caption_px = px(13.5f, p.scale);
+		p.display_px = px(28.f, p.scale);
+		p.code_px = px(14.5f, p.scale);
+		p.code_large_px = px(21.f, p.scale);
 		p.enable_lcd = p.scale >= 1.50f;
 		return p;
 	}

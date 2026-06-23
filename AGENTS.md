@@ -28,6 +28,7 @@ For serious crash, hang, Test Lab, MCP startup, Runtime Integrity Lock, anti-tam
 - The **host AI is the sole builder.** After every subagent finishes implementing, the host AI runs the canonical build command itself and validates exit code plus zero new warnings before reporting the task complete.
 - This rule has no exceptions: not "just to check it compiles", not "just a quick sanity build", not "the subagent has a worktree". The build belongs to the host.
 - Subagents are not alone in the codebase. Tell them not to revert other changes and to work with existing edits.
+- The host AI is also never alone in this project. Unrelated modified files are user-owned workspace state. Do not tell subagents that unrelated dirty files are suspicious or outside their work because the host noticed them; just scope the task clearly and require subagents to list the files they changed.
 
 ## Working Contract
 

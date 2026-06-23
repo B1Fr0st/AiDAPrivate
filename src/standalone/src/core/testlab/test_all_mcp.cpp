@@ -16382,6 +16382,19 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
                     st.guard_passed > 0 ||
                     st.security_guard_passed > 0 ||
                     st.negative_passed > 0;
+                const bool clean_nonfunctional_contract =
+                    st.failed == 0 &&
+                    st.timed_out == 0 &&
+                    st.skipped == 0 &&
+                    st.dependency_blocked == 0;
+                const bool destructive_safe_contract_proof =
+                    destructive_exempt &&
+                    clean_nonfunctional_contract &&
+                    (st.schema_passed > 0 || st.contract_passed > 0 || st.guard_passed > 0);
+                const bool guard_only_safe_contract_proof =
+                    safe_external_guard_exempt &&
+                    clean_nonfunctional_contract &&
+                    st.security_guard_passed > 0;
                 const bool action_dependency_blocked_nonfatal =
                     t.name == "analysis_query" &&
                     st.dependency_blocked > 0 &&
@@ -16408,15 +16421,23 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
                         log_msg(hf, tag, "MIXED-FAIL -- registered tool \"%s\" had functional pass evidence but also failed or timed out %s",
                             t.name.c_str(), stats_summary.c_str());
                     }
-                } else if (destructive_exempt && nonfunctional_evidence) {
+                } else if (destructive_safe_contract_proof) {
                     ++covered;
                     ++destructive_schema_exempt_covered;
-                    log_msg(hf, tag, "EXEMPT-PASS -- registered tool \"%s\" destructive_schema_only=1 functional_pass=0 %s",
+                    log_msg(hf, tag, "DESTRUCTIVE-SAFE-CONTRACT-COVERED -- registered tool \"%s\" destructive_schema_only=1 functional_pass=0 functional_counted=0 structured_safe_contract=1 %s",
                         t.name.c_str(), stats_summary.c_str());
-                } else if (safe_external_guard_exempt && st.security_guard_passed > 0 && st.failed == 0 && st.timed_out == 0) {
+                } else if (guard_only_safe_contract_proof) {
                     ++covered;
                     ++security_guard_covered;
-                    log_msg(hf, tag, "SECURITY-GUARD-PASS -- registered tool \"%s\" safe_external_guard=1 functional_pass=0 %s",
+                    log_msg(hf, tag, "SECURITY-GUARD-COVERED -- registered tool \"%s\" guard_only=1 functional_pass=0 functional_counted=0 structured_safe_contract=1 %s",
+                        t.name.c_str(), stats_summary.c_str());
+                } else if (destructive_exempt && nonfunctional_evidence) {
+                    ++no_pass;
+                    log_msg(hf, tag, "DESTRUCTIVE-SAFE-CONTRACT-INVALID -- registered tool \"%s\" destructive_schema_only=1 functional_pass=0 structured_safe_contract=0 %s",
+                        t.name.c_str(), stats_summary.c_str());
+                } else if (safe_external_guard_exempt && (st.security_guard_passed > 0 || st.guard_passed > 0)) {
+                    ++no_pass;
+                    log_msg(hf, tag, "GUARD-SAFE-CONTRACT-INVALID -- registered tool \"%s\" guard_only=1 functional_pass=0 structured_safe_contract=0 %s",
                         t.name.c_str(), stats_summary.c_str());
                 } else if (st.cleanup_contract_passed > 0 && st.failed == 0 && st.timed_out == 0) {
                     ++no_pass;
@@ -16511,7 +16532,7 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             }
         }
 
-        log_msg(hf, tag, "DIAG -- registry total=%d external=%d internal=%d ide_chat_only=%d ai_excluded=%d non_ai_audited=%d destructive_tools=%d destructive_schema_exemptions=%d destructive_schema_exempt_covered=%d security_guard_covered=%d schema_pass_tools=%d contract_pass_tools=%d cleanup_contract_pass_tools=%d state_contract_pass_tools=%d guard_pass_tools=%d security_guard_pass_tools=%d negative_pass_tools=%d dependency_blocked_tools=%d expected_empty_nonfunctional_tools=%d empty_result_suspect_tools=%d unexpected_zero_pass_tools=%d outstanding_timed_out_workers=%zu timed_out_drain_complete=%d explicit_invocations=%zu",
+        log_msg(hf, tag, "DIAG -- registry total=%d external=%d internal=%d ide_chat_only=%d ai_excluded=%d non_ai_audited=%d destructive_tools=%d destructive_schema_exemptions=%d destructive_safe_contract_covered=%d security_guard_covered=%d schema_pass_tools=%d contract_pass_tools=%d cleanup_contract_pass_tools=%d state_contract_pass_tools=%d guard_pass_tools=%d security_guard_pass_tools=%d negative_pass_tools=%d dependency_blocked_tools=%d expected_empty_nonfunctional_tools=%d empty_result_suspect_tools=%d unexpected_zero_pass_tools=%d outstanding_timed_out_workers=%zu timed_out_drain_complete=%d explicit_invocations=%zu strict_safe_contract_proof=1",
             registered_total,
             registered_external,
             registered_internal,
@@ -16538,18 +16559,18 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             g_invoked_tools.size());
 
         if (missing == 0 && stale == 0 && no_pass == 0 && failed_tools == 0 && mixed_fail_tools == 0 && skipped_tools == 0 && timed_out_tools == 0 && dependency_blocked_tools == 0 && empty_result_suspect_tools == 0 && unexpected_zero_pass_tools == 0 && outstanding_timed_out_workers == 0 && timed_out_drain_complete) {
-            log_msg(hf, tag, "PASS -- attempted=%d functional_passed_tools=%d exempt_covered=%d security_guard_covered=%d covered_total=%d no_functional_pass=%d failed_tools=%d mixed_fail_tools=%d skipped_tools=%d timed_out_tools=%d dependency_blocked_tools=%d empty_result_suspect_tools=%d unexpected_zero_pass_tools=%d expected_empty_nonfunctional_tools=%d outstanding_timed_out_workers=%zu registered_total=%d external=%d internal=%d ide_chat_only=%d ai_excluded=%d non_ai_audited=%d destructive_schema_exemptions=%d",
+            log_msg(hf, tag, "PASS -- attempted=%d functional_passed_tools=%d destructive_safe_contract_covered=%d security_guard_covered=%d covered_total=%d no_functional_pass=%d failed_tools=%d mixed_fail_tools=%d skipped_tools=%d timed_out_tools=%d dependency_blocked_tools=%d empty_result_suspect_tools=%d unexpected_zero_pass_tools=%d expected_empty_nonfunctional_tools=%d outstanding_timed_out_workers=%zu registered_total=%d external=%d internal=%d ide_chat_only=%d ai_excluded=%d non_ai_audited=%d destructive_schema_exemptions=%d strict_safe_contract_proof=1",
                 attempted, passed_tools, destructive_schema_exempt_covered, security_guard_covered, covered, no_pass, failed_tools, mixed_fail_tools, skipped_tools, timed_out_tools, dependency_blocked_tools, empty_result_suspect_tools, unexpected_zero_pass_tools, expected_empty_nonfunctional_tools, outstanding_timed_out_workers,
                 registered_total, registered_external, registered_internal, registered_ide_chat, skipped_ai, non_ai_audited, destructive_schema_exemptions);
             passed.fetch_add(1);
         } else {
-            log_msg(hf, tag, "FAIL -- missing=%d stale=%d attempted=%d functional_passed_tools=%d exempt_covered=%d security_guard_covered=%d covered_total=%d no_functional_pass=%d failed_tools=%d mixed_fail_tools=%d skipped_tools=%d timed_out_tools=%d dependency_blocked_tools=%d empty_result_suspect_tools=%d unexpected_zero_pass_tools=%d expected_empty_nonfunctional_tools=%d outstanding_timed_out_workers=%zu timed_out_drain_complete=%d registered_total=%d external=%d internal=%d ide_chat_only=%d ai_excluded=%d non_ai_audited=%d destructive_schema_exemptions=%d strict_functional_coverage=1",
+            log_msg(hf, tag, "FAIL -- missing=%d stale=%d attempted=%d functional_passed_tools=%d destructive_safe_contract_covered=%d security_guard_covered=%d covered_total=%d no_functional_pass=%d failed_tools=%d mixed_fail_tools=%d skipped_tools=%d timed_out_tools=%d dependency_blocked_tools=%d empty_result_suspect_tools=%d unexpected_zero_pass_tools=%d expected_empty_nonfunctional_tools=%d outstanding_timed_out_workers=%zu timed_out_drain_complete=%d registered_total=%d external=%d internal=%d ide_chat_only=%d ai_excluded=%d non_ai_audited=%d destructive_schema_exemptions=%d strict_functional_coverage=1 strict_safe_contract_proof=1",
                 missing, stale, attempted, passed_tools, destructive_schema_exempt_covered, security_guard_covered, covered, no_pass, failed_tools, mixed_fail_tools, skipped_tools, timed_out_tools, dependency_blocked_tools, empty_result_suspect_tools, unexpected_zero_pass_tools, expected_empty_nonfunctional_tools, outstanding_timed_out_workers, timed_out_drain_complete ? 1 : 0,
                 registered_total, registered_external, registered_internal, registered_ide_chat, skipped_ai, non_ai_audited, destructive_schema_exemptions);
             failed.fetch_add(1);
         }
         const auto cq_end = critical_work_queue::stats();
-        log_msg(hf, tag, "END -- missing=%d stale=%d no_functional_pass=%d functional_passed_tools=%d exempt_covered=%d security_guard_covered=%d failed_tools=%d mixed_fail_tools=%d dependency_blocked_tools=%d empty_result_suspect_tools=%d unexpected_zero_pass_tools=%d expected_empty_nonfunctional_tools=%d timed_out_tools=%d outstanding_timed_out_workers=%zu schema_pass_tools=%d contract_pass_tools=%d cleanup_contract_pass_tools=%d state_contract_pass_tools=%d guard_pass_tools=%d security_guard_pass_tools=%d negative_pass_tools=%d pass=%d fail=%d skip=%d cq_pending=%zu cq_active=%u cq_started=%llu cq_finished=%llu",
+        log_msg(hf, tag, "END -- missing=%d stale=%d no_functional_pass=%d functional_passed_tools=%d destructive_safe_contract_covered=%d security_guard_covered=%d failed_tools=%d mixed_fail_tools=%d dependency_blocked_tools=%d empty_result_suspect_tools=%d unexpected_zero_pass_tools=%d expected_empty_nonfunctional_tools=%d timed_out_tools=%d outstanding_timed_out_workers=%zu schema_pass_tools=%d contract_pass_tools=%d cleanup_contract_pass_tools=%d state_contract_pass_tools=%d guard_pass_tools=%d security_guard_pass_tools=%d negative_pass_tools=%d strict_safe_contract_proof=1 pass=%d fail=%d skip=%d cq_pending=%zu cq_active=%u cq_started=%llu cq_finished=%llu",
             missing,
             stale,
             no_pass,
@@ -17363,16 +17384,36 @@ void test_tool_driver_set_hw_breakpoint(HANDLE hf, std::atomic<int>& passed, std
             return mcp_tool_call_status_t::failed;
         }
 
-        const auto t0 = std::chrono::steady_clock::now();
-        invoke_result_t ir = invoke_tool(get_server(), tool_name, call_args);
-        const auto ms = static_cast<long long>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count());
+        const long long timeout_ms = tool_timeout_ms(tool_name_s);
+        auto timed = invoke_tool_bounded(get_server(), tool_name_s, call_args, timeout_ms, hf, tag, seq);
+        invoke_result_t& ir = timed.result;
+        const long long ms = timed.elapsed_ms;
         if (out_result)
             *out_result = { ir.success, ir.text, ir.data };
-        log_mcp_result_detail("direct_completed", seq, tool_name_s, call_args, ir, ms, "");
+        log_mcp_result_detail("direct_bounded_completed", seq, tool_name_s, call_args, ir, ms, "");
+
+        if (timed.timed_out) {
+            log_msg(hf, tag, "TIMEOUT -- \"%s\" direct deferred dispatch exceeded %lld ms worker_started=%d handler_entered=%d handler_exited=%d worker_pid=%lu worker_tid=%lu queue_delay_ms=%lld phase=%s",
+                tool_name ? tool_name : "<null>",
+                timeout_ms,
+                timed.worker_started ? 1 : 0,
+                timed.handler_entered ? 1 : 0,
+                timed.handler_exited ? 1 : 0,
+                static_cast<unsigned long>(timed.worker_pid),
+                static_cast<unsigned long>(timed.worker_tid),
+                timed.queue_delay_ms,
+                timed.worker_phase.empty() ? "<empty>" : timed.worker_phase.c_str());
+            log_mcp_call_classification(hf, tag, seq, tool_name_s, call_args, mcp_tool_call_status_t::timed_out, ir,
+                "", "bounded_deferred_dispatch_timeout");
+            record_tool_status(tool_name_s, mcp_tool_call_status_t::timed_out);
+            failed.fetch_add(1);
+            return mcp_tool_call_status_t::timed_out;
+        }
 
         if (!ir.found) {
             log_msg(hf, tag, "FAIL -- tool \"%s\" disappeared during direct deferred dispatch", tool_name ? tool_name : "<null>");
+            log_mcp_call_classification(hf, tag, seq, tool_name_s, call_args, mcp_tool_call_status_t::failed, ir,
+                "", "bounded_deferred_dispatch_not_found");
             record_tool_status(tool_name_s, mcp_tool_call_status_t::failed);
             failed.fetch_add(1);
             return mcp_tool_call_status_t::failed;
@@ -17380,6 +17421,8 @@ void test_tool_driver_set_hw_breakpoint(HANDLE hf, std::atomic<int>& passed, std
         if (ir.threw) {
             log_msg(hf, tag, "FAIL -- \"%s\" threw during direct deferred dispatch: %s (elapsed %lld ms)",
                 tool_name ? tool_name : "<null>", ir.exception_msg.c_str(), ms);
+            log_mcp_call_classification(hf, tag, seq, tool_name_s, call_args, mcp_tool_call_status_t::failed, ir,
+                "", "bounded_deferred_dispatch_exception");
             record_tool_status(tool_name_s, mcp_tool_call_status_t::failed);
             failed.fetch_add(1);
             return mcp_tool_call_status_t::failed;
@@ -17387,6 +17430,8 @@ void test_tool_driver_set_hw_breakpoint(HANDLE hf, std::atomic<int>& passed, std
         if (!ir.success) {
             log_msg(hf, tag, "FAIL -- \"%s\" success=false: %s (elapsed %lld ms)",
                 tool_name ? tool_name : "<null>", ir.text.c_str(), ms);
+            log_mcp_call_classification(hf, tag, seq, tool_name_s, call_args, mcp_tool_call_status_t::failed, ir,
+                "", "bounded_deferred_dispatch_success_false");
             record_tool_status(tool_name_s, mcp_tool_call_status_t::failed);
             failed.fetch_add(1);
             return mcp_tool_call_status_t::failed;
@@ -17397,6 +17442,8 @@ void test_tool_driver_set_hw_breakpoint(HANDLE hf, std::atomic<int>& passed, std
         for (auto& c : preview) { if (c == '\n' || c == '\r') c = ' '; }
         log_msg(hf, tag, "PASS -- \"%s\" success=true direct=1 (elapsed %lld ms) -> %s",
             tool_name ? tool_name : "<null>", ms, preview.c_str());
+        log_mcp_call_classification(hf, tag, seq, tool_name_s, call_args, mcp_tool_call_status_t::functional_pass, ir,
+            "bounded_deferred_dispatch_success", "");
         record_tool_status(tool_name_s, mcp_tool_call_status_t::passed);
         passed.fetch_add(1);
         return mcp_tool_call_status_t::passed;

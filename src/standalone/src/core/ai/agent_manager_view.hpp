@@ -417,7 +417,7 @@ namespace agent_manager {
 			char filter_local[96];
 			std::memcpy(filter_local, st.left_filter, sizeof(filter_local));
 			if (aida::ui::input_text("##agent_filter", filter_local, sizeof(filter_local),
-					"Filter agents...", false, ImVec2(left_w - 14.f, 32.f))) {
+					"Filter agents...", false, ImVec2((std::max)(120.f, left_w - 14.f), 32.f))) {
 				std::lock_guard<std::mutex> lk(st.mtx);
 				std::memcpy(st.left_filter, filter_local, sizeof(st.left_filter));
 			}
@@ -681,8 +681,13 @@ namespace agent_manager {
 			if (detail::render_section_header("Model override", &st.section_model_open,
 					st.section_model_anim, th.accent_u32)) {
 				const auto& providers = aida::provider::catalog::list_providers();
+				const float model_avail = (std::max)(160.f, ImGui::GetContentRegionAvail().x);
+				const bool model_narrow = model_avail < 360.f;
+				const bool model_medium = model_avail < 560.f;
+				const float provider_w = model_narrow ? model_avail : (model_medium ? (model_avail - 8.f) * 0.5f : 180.f);
+				const float model_w = model_narrow ? model_avail : (model_medium ? (model_avail - 8.f) * 0.5f : 220.f);
 
-				ImGui::SetNextItemWidth(180.f);
+				ImGui::SetNextItemWidth(provider_w);
 				std::string prov_label = std::strlen(st.provider_buf) > 0 ? std::string(st.provider_buf) : std::string("(default)");
 				if (ImGui::BeginCombo("##agent_provider", prov_label.c_str())) {
 					bool default_selected = std::strlen(st.provider_buf) == 0;
@@ -702,8 +707,9 @@ namespace agent_manager {
 					ImGui::EndCombo();
 				}
 
-				ImGui::SameLine(0.f, 8.f);
-				ImGui::SetNextItemWidth(220.f);
+				if (!model_narrow)
+					ImGui::SameLine(0.f, 8.f);
+				ImGui::SetNextItemWidth(model_w);
 				std::string model_label = std::strlen(st.model_buf) > 0 ? std::string(st.model_buf) : std::string("(default)");
 				if (ImGui::BeginCombo("##agent_model", model_label.c_str())) {
 					bool default_selected = std::strlen(st.model_buf) == 0;
@@ -730,21 +736,26 @@ namespace agent_manager {
 
 				ImGui::Spacing();
 				ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "Temperature");
-				ImGui::SetNextItemWidth(220.f);
+				const float slider_w = model_narrow ? model_avail : (model_medium ? (model_avail - 8.f) * 0.5f : 220.f);
+				ImGui::SetNextItemWidth(slider_w);
 				if (ImGui::SliderFloat("##agent_temp", &st.temperature, 0.f, 2.f, "%.2f")) {
 					detail::mark_dirty_locked();
 				}
-				ImGui::SameLine(0.f, 12.f);
+				if (!model_narrow)
+					ImGui::SameLine(0.f, 12.f);
 				ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "Top-p");
-				ImGui::SameLine();
-				ImGui::SetNextItemWidth(180.f);
+				if (!model_narrow && !model_medium)
+					ImGui::SameLine();
+				ImGui::SetNextItemWidth(model_narrow ? model_avail : (model_medium ? slider_w : 180.f));
 				if (ImGui::SliderFloat("##agent_topp", &st.top_p, 0.f, 1.f, "%.2f")) {
 					detail::mark_dirty_locked();
 				}
-				ImGui::SameLine(0.f, 12.f);
+				if (!model_medium)
+					ImGui::SameLine(0.f, 12.f);
 				ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "Max steps");
-				ImGui::SameLine();
-				ImGui::SetNextItemWidth(120.f);
+				if (!model_medium)
+					ImGui::SameLine();
+				ImGui::SetNextItemWidth(model_narrow ? model_avail : 120.f);
 				if (ImGui::InputInt("##agent_max_steps", &st.max_steps, 1, 8,
 					is_native ? ImGuiInputTextFlags_ReadOnly : ImGuiInputTextFlags_None)) {
 					if (st.max_steps < 0) st.max_steps = 0;
@@ -756,73 +767,120 @@ namespace agent_manager {
 
 			if (detail::render_section_header("Permission rules", &st.section_perm_open,
 					st.section_perm_anim, th.accent_u32)) {
-				if (ImGui::BeginTable("##agent_rules", 4,
-					ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
-					ImGui::TableSetupColumn("Permission Key", ImGuiTableColumnFlags_WidthStretch, 0.30f);
-					ImGui::TableSetupColumn("Pattern", ImGuiTableColumnFlags_WidthStretch, 0.40f);
-					ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed, 100.f);
-					ImGui::TableSetupColumn("##rm", ImGuiTableColumnFlags_WidthFixed, 32.f);
-					ImGui::TableHeadersRow();
+				const float rules_avail = (std::max)(160.f, ImGui::GetContentRegionAvail().x);
+				int remove_idx = -1;
+				const char* actions[] = { "allow", "deny", "ask" };
+				if (rules_avail >= 520.f) {
+					if (ImGui::BeginTable("##agent_rules", 4,
+						ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+						ImGui::TableSetupColumn("Permission Key", ImGuiTableColumnFlags_WidthStretch, 0.30f);
+						ImGui::TableSetupColumn("Pattern", ImGuiTableColumnFlags_WidthStretch, 0.40f);
+						ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed, 100.f);
+						ImGui::TableSetupColumn("##rm", ImGuiTableColumnFlags_WidthFixed, 32.f);
+						ImGui::TableHeadersRow();
 
-					int remove_idx = -1;
+						for (size_t i = 0; i < st.rules.size(); ++i) {
+							ImGui::TableNextRow();
+							ImGui::PushID(static_cast<int>(i));
+							ImGui::TableSetColumnIndex(0);
+							ImGui::SetNextItemWidth(-FLT_MIN);
+							if (ImGui::InputText("##rk", st.rules[i].permission_key, sizeof(st.rules[i].permission_key),
+								is_native ? ImGuiInputTextFlags_ReadOnly : ImGuiInputTextFlags_None)) {
+								detail::mark_dirty_locked();
+							}
+							ImGui::TableSetColumnIndex(1);
+							ImGui::SetNextItemWidth(-FLT_MIN);
+							if (ImGui::InputText("##rp", st.rules[i].pattern, sizeof(st.rules[i].pattern),
+								is_native ? ImGuiInputTextFlags_ReadOnly : ImGuiInputTextFlags_None)) {
+								detail::mark_dirty_locked();
+							}
+							ImGui::TableSetColumnIndex(2);
+							ImGui::SetNextItemWidth(-FLT_MIN);
+							if (is_native) {
+								ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "%s",
+									actions[std::clamp(st.rules[i].action, 0, 2)]);
+							} else {
+								if (ImGui::Combo("##ra", &st.rules[i].action, actions, IM_ARRAYSIZE(actions))) {
+									detail::mark_dirty_locked();
+								}
+							}
+							ImGui::TableSetColumnIndex(3);
+							if (!is_native) {
+								if (aida::ui::button("X", aida::ui::button_kind_t::ghost,
+										aida::ui::size_t_::sm, ImVec2(28.f, 28.f))) {
+									remove_idx = static_cast<int>(i);
+								}
+							}
+							ImGui::PopID();
+						}
+						ImGui::EndTable();
+					}
+				} else {
 					for (size_t i = 0; i < st.rules.size(); ++i) {
-						ImGui::TableNextRow();
 						ImGui::PushID(static_cast<int>(i));
-						ImGui::TableSetColumnIndex(0);
+						ImGui::PushStyleColor(ImGuiCol_ChildBg,
+							ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.panel_header, 0.45f)));
+						ImGui::BeginChild("##rule_card", ImVec2(0.f, is_native ? 108.f : 138.f), true,
+							ImGuiWindowFlags_NoSavedSettings);
+						ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "Permission Key");
 						ImGui::SetNextItemWidth(-FLT_MIN);
-						if (ImGui::InputText("##rk", st.rules[i].permission_key, sizeof(st.rules[i].permission_key),
+						if (ImGui::InputText("##rk_card", st.rules[i].permission_key, sizeof(st.rules[i].permission_key),
 							is_native ? ImGuiInputTextFlags_ReadOnly : ImGuiInputTextFlags_None)) {
 							detail::mark_dirty_locked();
 						}
-						ImGui::TableSetColumnIndex(1);
+						ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "Pattern");
 						ImGui::SetNextItemWidth(-FLT_MIN);
-						if (ImGui::InputText("##rp", st.rules[i].pattern, sizeof(st.rules[i].pattern),
+						if (ImGui::InputText("##rp_card", st.rules[i].pattern, sizeof(st.rules[i].pattern),
 							is_native ? ImGuiInputTextFlags_ReadOnly : ImGuiInputTextFlags_None)) {
 							detail::mark_dirty_locked();
 						}
-						ImGui::TableSetColumnIndex(2);
-						const char* actions[] = { "allow", "deny", "ask" };
-						ImGui::SetNextItemWidth(-FLT_MIN);
 						if (is_native) {
 							ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "%s",
 								actions[std::clamp(st.rules[i].action, 0, 2)]);
 						} else {
-							if (ImGui::Combo("##ra", &st.rules[i].action, actions, IM_ARRAYSIZE(actions))) {
+							ImGui::SetNextItemWidth((std::min)(140.f, rules_avail));
+							if (ImGui::Combo("##ra_card", &st.rules[i].action, actions, IM_ARRAYSIZE(actions)))
 								detail::mark_dirty_locked();
-							}
-						}
-						ImGui::TableSetColumnIndex(3);
-						if (!is_native) {
-							if (aida::ui::button("X", aida::ui::button_kind_t::ghost,
-									aida::ui::size_t_::sm, ImVec2(28.f, 28.f))) {
+							if (rules_avail >= 250.f)
+								ImGui::SameLine(0.f, 8.f);
+							if (aida::ui::button("Remove",
+									aida::ui::button_kind_t::ghost,
+									aida::ui::size_t_::sm,
+									ImVec2((std::min)(96.f, rules_avail), 24.f))) {
 								remove_idx = static_cast<int>(i);
 							}
 						}
+						ImGui::EndChild();
+						ImGui::PopStyleColor();
+						ImGui::Dummy(ImVec2(0.f, 6.f));
 						ImGui::PopID();
 					}
-					if (remove_idx >= 0) {
-						st.rules.erase(st.rules.begin() + remove_idx);
-						detail::mark_dirty_locked();
-					}
-					ImGui::EndTable();
+				}
+				if (remove_idx >= 0) {
+					st.rules.erase(st.rules.begin() + remove_idx);
+					detail::mark_dirty_locked();
 				}
 				if (!is_native) {
-					ImGui::SetNextItemWidth(180.f);
+					const float add_avail = (std::max)(160.f, ImGui::GetContentRegionAvail().x);
+					const bool add_stack = add_avail < 600.f;
+					ImGui::SetNextItemWidth(add_stack ? add_avail : 180.f);
 					ImGui::InputTextWithHint("##new_rk", "permission key",
 						st.new_rule.permission_key, sizeof(st.new_rule.permission_key));
-					ImGui::SameLine();
-					ImGui::SetNextItemWidth(220.f);
+					if (!add_stack)
+						ImGui::SameLine();
+					ImGui::SetNextItemWidth(add_stack ? add_avail : 220.f);
 					ImGui::InputTextWithHint("##new_rp", "pattern (eg. **/*.cpp)",
 						st.new_rule.pattern, sizeof(st.new_rule.pattern));
-					ImGui::SameLine();
-					const char* actions[] = { "allow", "deny", "ask" };
-					ImGui::SetNextItemWidth(80.f);
+					if (!add_stack)
+						ImGui::SameLine();
+					ImGui::SetNextItemWidth(add_stack ? (std::min)(140.f, add_avail) : 80.f);
 					ImGui::Combo("##new_ra", &st.new_rule.action, actions, IM_ARRAYSIZE(actions));
-					ImGui::SameLine();
+					if (!add_stack)
+						ImGui::SameLine();
 					if (aida::ui::button("Add rule",
 							aida::ui::button_kind_t::secondary,
 							aida::ui::size_t_::sm,
-							ImVec2(96.f, 24.f))) {
+							ImVec2(add_stack ? (std::min)(add_avail, 140.f) : 96.f, 24.f))) {
 						if (std::strlen(st.new_rule.permission_key) > 0) {
 							st.rules.push_back(st.new_rule);
 							st.new_rule = detail::rule_buf_t{};
@@ -870,14 +928,17 @@ namespace agent_manager {
 					}
 					ImGui::SetCursorScreenPos(ImVec2(chip_x_start, chip_y + 28.f));
 					if (!is_native) {
-						ImGui::SetNextItemWidth(220.f);
+						const float input_avail = (std::max)(120.f, ImGui::GetContentRegionAvail().x);
+						const bool chip_stack = input_avail < 320.f;
+						ImGui::SetNextItemWidth(chip_stack ? input_avail : (std::min)(220.f, input_avail - 84.f));
 						ImGui::InputTextWithHint(("##chip_in_" + std::string(label)).c_str(), hint,
 							input.buf, sizeof(input.buf));
-						ImGui::SameLine();
+						if (!chip_stack)
+							ImGui::SameLine();
 						if (aida::ui::button(("Add##" + std::string(label)).c_str(),
 								aida::ui::button_kind_t::secondary,
 								aida::ui::size_t_::sm,
-								ImVec2(72.f, 24.f))) {
+								ImVec2(chip_stack ? (std::min)(input_avail, 96.f) : 72.f, 24.f))) {
 							if (std::strlen(input.buf) > 0) {
 								chips.emplace_back(input.buf);
 								input.buf[0] = '\0';
@@ -899,10 +960,11 @@ namespace agent_manager {
 			ImGui::Spacing();
 
 			if (is_native) {
+				const float footer_avail = (std::max)(160.f, ImGui::GetContentRegionAvail().x);
 				if (aida::ui::button("Duplicate as custom",
 						aida::ui::button_kind_t::primary,
 						aida::ui::size_t_::md,
-						ImVec2(180.f, 32.f))) {
+						ImVec2((std::min)(180.f, footer_avail), 32.f))) {
 					aida::agent::agent_info_t copy = detail::build_info_from_buffers_locked(false);
 					copy.name = st.selected_name + "-custom";
 					copy.native = false;
@@ -918,10 +980,13 @@ namespace agent_manager {
 					}
 				}
 			} else {
+				const float footer_avail = (std::max)(160.f, ImGui::GetContentRegionAvail().x);
+				const bool footer_stack = footer_avail < 290.f;
+				const float footer_btn_w = footer_stack ? (std::min)(footer_avail, 140.f) : 86.f;
 				if (aida::ui::button("Save",
 						aida::ui::button_kind_t::primary,
 						aida::ui::size_t_::md,
-						ImVec2(86.f, 32.f))) {
+						ImVec2(footer_btn_w, 32.f))) {
 					std::string trimmed_name(st.edit_name);
 					if (trimmed_name.empty()) {
 						toast_notification::push("Agent name cannot be empty",
@@ -944,20 +1009,22 @@ namespace agent_manager {
 						}
 					}
 				}
-				ImGui::SameLine(0.f, 8.f);
+				if (!footer_stack)
+					ImGui::SameLine(0.f, 8.f);
 				if (aida::ui::button("Reset",
 						aida::ui::button_kind_t::secondary,
 						aida::ui::size_t_::md,
-						ImVec2(86.f, 32.f))) {
+						ImVec2(footer_btn_w, 32.f))) {
 					detail::load_buffers_for_selected_locked();
 					toast_notification::push("Reverted unsaved changes",
 						toast_notification::toast_type_t::info, 2.5f);
 				}
-				ImGui::SameLine(0.f, 8.f);
+				if (!footer_stack)
+					ImGui::SameLine(0.f, 8.f);
 				if (aida::ui::button("Delete",
 						aida::ui::button_kind_t::destructive,
 						aida::ui::size_t_::md,
-						ImVec2(86.f, 32.f))) {
+						ImVec2(footer_btn_w, 32.f))) {
 					if (aida::agent::unregister_custom(st.selected_name)) {
 						aida::agent::save_custom_to_disk();
 						toast_notification::push("Deleted: " + st.selected_name,

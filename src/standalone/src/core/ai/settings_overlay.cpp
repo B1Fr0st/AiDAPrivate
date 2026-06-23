@@ -352,6 +352,53 @@ namespace settings_overlay {
 			(void)side_w;
 		}
 
+		inline void render_compact_tab_row(float row_w, float row_h, float dt)
+		{
+			auto& s = state();
+			const auto& th = aida::ui::resolved();
+			static const char* tab_labels[tab_count] = {
+				"Accounts",
+				"Agents",
+				"Skills",
+				"MCP Servers",
+				"Editor"
+			};
+			const float gap = 4.f;
+			const float btn_w = (std::max)(32.f, (row_w - gap * (tab_count - 1)) / static_cast<float>(tab_count));
+			const float base_fs = aida::ui::components::detail::ui_fs();
+			ImDrawList* dl = ImGui::GetWindowDrawList();
+			ImVec2 p = ImGui::GetCursorScreenPos();
+			const int active = s.active_tab.load();
+			for (int i = 0; i < tab_count; ++i) {
+				ImGui::PushID(1000 + i);
+				ImGui::SetCursorScreenPos(ImVec2(p.x + (btn_w + gap) * i, p.y));
+				ImGui::InvisibleButton("##compact_settings_tab", ImVec2(btn_w, row_h));
+				const bool hov = ImGui::IsItemHovered();
+				if (hov)
+					aida::ui::components::tooltip_blur(tab_labels[i], 0.35f);
+				if (ImGui::IsItemClicked()) {
+					int prev = s.active_tab.exchange(i);
+					if (prev != i) {
+						s.previous_tab.store(prev);
+						s.tab_crossfade_progress = 0.f;
+						s.tab_crossfade_from = prev;
+					}
+				}
+				ImGui::PopID();
+				ImVec2 a(p.x + (btn_w + gap) * i, p.y);
+				ImVec2 b(a.x + btn_w, a.y + row_h - 4.f);
+				ImU32 bg = (active == i)
+					? aida::ui::with_alpha(th.selection, 0.88f)
+					: (hov ? th.hover_wash : aida::ui::with_alpha(th.panel_header, 0.55f));
+				dl->AddRectFilled(a, b, bg, 7.f);
+				dl->AddRect(a, b, aida::ui::with_alpha(th.border_subtle, active == i ? 0.9f : 0.45f), 7.f);
+				draw_tab_glyph(dl, ImVec2((a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f),
+					base_fs * 0.70f, i, active == i ? th.text_primary : th.text_secondary);
+			}
+			ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + row_h));
+			(void)dt;
+		}
+
 
 		inline void render_tab_accounts(float content_w, float content_h)
 		{
@@ -800,6 +847,15 @@ namespace settings_overlay {
 				load_draft();
 
 			float avail_w = ImGui::GetContentRegionAvail().x;
+			if (avail_w < 320.f) {
+				aida::ui::responsive::draw_clamp_overlay(mcp_tab_origin,
+					ImVec2(content_w, content_h), "Widen Settings to edit MCP servers");
+				ImGui::PopStyleVar(2);
+				ImGui::PopFont();
+				ImGui::PopID();
+				aida::mcp_marketplace_view::render_modal_if_open();
+				return;
+			}
 			float left_w = 280.f;
 			float min_detail_w = 260.f;
 			bool stack_vertical = (avail_w - left_w - 8.f) < min_detail_w;
@@ -987,9 +1043,12 @@ namespace settings_overlay {
 			if (s_dirty) {
 				aida::ui::pill_kind("Unsaved changes", aida::ui::pill_kind_t::warning,
 					aida::ui::size_t_::sm, false);
-				ImGui::SameLine(0.f, 8.f);
+				if (ImGui::GetContentRegionAvail().x >= 300.f)
+					ImGui::SameLine(0.f, 8.f);
+				ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + (std::max)(80.f, ImGui::GetContentRegionAvail().x - 8.f));
 				ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_dim),
 					"Apply reconnects configured MCP clients.");
+				ImGui::PopTextWrapPos();
 			} else {
 				ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_dim),
 					"Edits are staged until Apply.");
@@ -1045,7 +1104,8 @@ namespace settings_overlay {
 
 				ImGui::Dummy(ImVec2(0.f, 6.f));
 				field_changed |= aida::ui::toggle_switch("Enabled##mcp", &s_enabled, aida::ui::size_t_::md);
-				ImGui::SameLine(140.f);
+				if (ImGui::GetContentRegionAvail().x >= 230.f)
+					ImGui::SameLine(140.f);
 				field_changed |= aida::ui::toggle_switch("Auto-connect", &s_auto, aida::ui::size_t_::md);
 				if (!s_enabled && s_auto) {
 					s_auto = false;
@@ -1056,6 +1116,7 @@ namespace settings_overlay {
 
 				ImGui::Dummy(ImVec2(0.f, 8.f));
 				const bool actions_disabled = s_dirty || !s_enabled;
+				const bool stack_conn_actions = ImGui::GetContentRegionAvail().x < 230.f;
 				if (aida::ui::button("Reconnect",
 						aida::ui::button_kind_t::secondary,
 						aida::ui::size_t_::sm,
@@ -1072,7 +1133,8 @@ namespace settings_overlay {
 						toast_notification::push(err, toast_notification::toast_type_t::error);
 					}
 				}
-				ImGui::SameLine(0.f, 8.f);
+				if (!stack_conn_actions)
+					ImGui::SameLine(0.f, 8.f);
 				if (aida::ui::button("Disconnect",
 						aida::ui::button_kind_t::secondary,
 						aida::ui::size_t_::sm,
@@ -1216,7 +1278,8 @@ namespace settings_overlay {
 				std::string remove_name = "selected server";
 				if (s_remove_index >= 0 && s_remove_index < static_cast<int>(servers.size()))
 					remove_name = servers[s_remove_index].name;
-				ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 420.f);
+				const float modal_wrap_w = (std::min)(420.f, (std::max)(180.f, ImGui::GetContentRegionAvail().x));
+				ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + modal_wrap_w);
 				ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_primary),
 					"Remove %s?", remove_name.c_str());
 				ImGui::TextWrapped("%s",
@@ -1248,7 +1311,7 @@ namespace settings_overlay {
 				ImGui::EndPopup();
 			}
 
-			if (footer_avail < 200.f) {
+			if (footer_avail < 320.f) {
 				aida::ui::responsive::draw_clamp_overlay(mcp_tab_origin,
 					ImVec2(content_w, content_h), "Settings pane too narrow");
 			}
@@ -1263,7 +1326,7 @@ namespace settings_overlay {
 
 		inline void render_tab_editor_theme(float content_w, float content_h)
 		{
-			(void)content_w; (void)content_h;
+			(void)content_h;
 			auto& s = state();
 			const auto& th = aida::ui::resolved();
 			std::lock_guard<std::mutex> lk(s.mtx);
@@ -1280,24 +1343,29 @@ namespace settings_overlay {
 			ImGui::Dummy(ImVec2(0.f, 32.f));
 
 			bool changed = false;
+			const float field_w = std::clamp(content_w - 20.f, 160.f, 240.f);
 			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "Tab size");
-			ImGui::SetNextItemWidth(240.f);
+			ImGui::SetNextItemWidth(field_w);
 			changed |= ImGui::InputInt("##ed_tab", &s.ed_tab_size, 0, 0);
 			s.ed_tab_size = (std::max)(s.ed_tab_size, 1);
 
 			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "Font size");
-			ImGui::SetNextItemWidth(240.f);
+			ImGui::SetNextItemWidth(field_w);
 			changed |= ImGui::SliderFloat("##ed_font", &s.ed_font_size, 9.f, 32.f, "%.0f");
 
 			ImGui::Dummy(ImVec2(0.f, 4.f));
 			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary),
 				"Disassembly selection");
 			bool full_line_sel = editor_config::disasm_full_line_select;
+			if (content_w < 360.f)
+				ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + (std::max)(120.f, content_w - 24.f));
 			if (ImGui::Checkbox("Full-line selection (highlight entire row)##disasm_full_line_sel",
 				&full_line_sel))
 			{
 				editor_config::disasm_full_line_select = full_line_sel;
 			}
+			if (content_w < 360.f)
+				ImGui::PopTextWrapPos();
 
 			ImGui::Dummy(ImVec2(0.f, 6.f));
 			ImGui::Separator();
@@ -1309,7 +1377,7 @@ namespace settings_overlay {
 
 			static const char* theme_names[] = { "AiDA Dark", "AiDA Light", "Claude Dark", "Claude Light" };
 			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "Active theme");
-			ImGui::SetNextItemWidth(240.f);
+			ImGui::SetNextItemWidth(field_w);
 			int prev_idx = g_sa_settings.active_theme_idx;
 			if (ImGui::Combo("##theme_idx", &g_sa_settings.active_theme_idx, theme_names,
 				IM_ARRAYSIZE(theme_names)))
@@ -1470,9 +1538,16 @@ namespace settings_overlay {
 
 		aida::ui::responsive::sidebar_metrics_t side_metrics =
 			aida::ui::responsive::resolve_sidebar(panel_w - 8.f, side_pol);
-		const float side_w = side_metrics.width;
+		float side_w = side_metrics.width;
 		const bool side_icon_only = side_metrics.icon_only;
-		const bool side_hidden = side_metrics.hidden;
+		bool side_hidden = side_metrics.hidden;
+
+		if (panel_w < 320.f || panel_h < 220.f) {
+			ImVec2 overlay_pos(wp.x, wp.y + header_h);
+			aida::ui::responsive::draw_clamp_overlay(overlay_pos,
+				ImVec2(ws.x, (std::max)(1.f, ws.y - header_h)), "Widen Settings");
+			return;
+		}
 
 		static bool s_logged_icon_only = false;
 		if (side_icon_only && !s_logged_icon_only) {
@@ -1487,7 +1562,14 @@ namespace settings_overlay {
 		const float content_y = header_h + 4.f;
 		const float content_h = panel_h - content_y - 8.f;
 		float content_avail_w = panel_w - side_w - (side_hidden ? 0.f : 8.f);
-		if (content_avail_w < 80.f) content_avail_w = 80.f;
+		bool compact_top_tabs = side_hidden;
+		if (!side_hidden && content_avail_w < 320.f) {
+			side_hidden = true;
+			side_w = 0.f;
+			content_avail_w = panel_w;
+			compact_top_tabs = true;
+		}
+		if (content_avail_w < 180.f) content_avail_w = 180.f;
 		float content_w = content_avail_w;
 
 		if (!side_hidden) {
@@ -1515,8 +1597,18 @@ namespace settings_overlay {
 		}
 
 		float content_x = side_hidden ? 0.f : (side_w + 6.f);
-		ImGui::SetCursorPos(ImVec2(content_x, content_y));
-		ImGui::BeginChild("##settings_content", ImVec2(content_w, content_h), false,
+		float content_body_y = content_y;
+		float content_body_h = content_h;
+		if (compact_top_tabs) {
+			ImGui::SetCursorPos(ImVec2(6.f, content_y));
+			detail::render_compact_tab_row((std::max)(1.f, panel_w - 12.f), 34.f, dt);
+			content_body_y += 38.f;
+			content_body_h = (std::max)(1.f, content_body_h - 38.f);
+			content_x = 0.f;
+			content_w = (std::max)(180.f, panel_w);
+		}
+		ImGui::SetCursorPos(ImVec2(content_x, content_body_y));
+		ImGui::BeginChild("##settings_content", ImVec2(content_w, content_body_h), false,
 			ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_HorizontalScrollbar);
 		{
 			s.tab_crossfade_progress = aida::motion::smooth_lerp(
@@ -1525,7 +1617,7 @@ namespace settings_overlay {
 			const int active = s.active_tab.load();
 			ImGui::PushClipRect(ImGui::GetWindowPos(),
 				ImVec2(ImGui::GetWindowPos().x + content_w,
-					ImGui::GetWindowPos().y + content_h),
+					ImGui::GetWindowPos().y + content_body_h),
 				true);
 
 			float p = s.tab_crossfade_progress;
@@ -1533,12 +1625,12 @@ namespace settings_overlay {
 
 			auto draw_tab = [&](int idx) {
 				switch (idx) {
-				case tab_accounts:        detail::render_tab_accounts(content_w, content_h); break;
-				case tab_agents:          detail::render_tab_agents(content_w, content_h); break;
-				case tab_skills:          detail::render_tab_skills(content_w, content_h); break;
-				case tab_mcp_servers:     detail::render_tab_mcp_servers(content_w, content_h); break;
-				case tab_editor_theme:    detail::render_tab_editor_theme(content_w, content_h); break;
-				default:                  detail::render_tab_accounts(content_w, content_h); break;
+				case tab_accounts:        detail::render_tab_accounts(content_w, content_body_h); break;
+				case tab_agents:          detail::render_tab_agents(content_w, content_body_h); break;
+				case tab_skills:          detail::render_tab_skills(content_w, content_body_h); break;
+				case tab_mcp_servers:     detail::render_tab_mcp_servers(content_w, content_body_h); break;
+				case tab_editor_theme:    detail::render_tab_editor_theme(content_w, content_body_h); break;
+				default:                  detail::render_tab_accounts(content_w, content_body_h); break;
 				}
 			};
 

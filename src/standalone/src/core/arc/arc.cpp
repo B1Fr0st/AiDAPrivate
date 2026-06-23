@@ -1532,7 +1532,57 @@ __declspec(noreturn) __forceinline void enforce_violation(const char* reason, co
     __fastfail(0xA1DA);
 }
 
-bool check_debugger()
+static std::atomic<uint32_t> g_rdtsc_debugger_count{0};
+static std::atomic<uint64_t> g_rdtsc_debugger_window_start_ms{0};
+
+static void reset_rdtsc_debugger_quorum()
+{
+    g_rdtsc_debugger_count.store(0, std::memory_order_release);
+    g_rdtsc_debugger_window_start_ms.store(0, std::memory_order_release);
+}
+
+static bool rdtsc_debugger_quorum_reached(uint64_t delta, const char* caller_context)
+{
+    constexpr uint64_t kWindowMs = 15000;
+    constexpr uint64_t kMinEscalateAgeMs = 1200;
+    constexpr uint32_t kRequiredSignals = 3;
+
+    const uint64_t now = static_cast<uint64_t>(GetTickCount64());
+    uint64_t window_start = g_rdtsc_debugger_window_start_ms.load(std::memory_order_acquire);
+    for (;;)
+    {
+        const bool reset_window = window_start == 0 || now < window_start || now - window_start > kWindowMs;
+        if (!reset_window)
+            break;
+        if (g_rdtsc_debugger_window_start_ms.compare_exchange_weak(
+                window_start, now, std::memory_order_acq_rel, std::memory_order_acquire))
+        {
+            g_rdtsc_debugger_count.store(0, std::memory_order_release);
+            window_start = now;
+            break;
+        }
+    }
+
+    const uint32_t count = g_rdtsc_debugger_count.fetch_add(1, std::memory_order_acq_rel) + 1;
+    const uint64_t age_ms = now >= window_start ? now - window_start : 0;
+    const bool escalated = count >= kRequiredSignals && age_ms >= kMinEscalateAgeMs;
+    char dbg[224];
+    _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+        "check_debugger: rdtsc_delta=%llu count=%u window_age_ms=%llu escalated=%d caller=%s state=%s tid=%lu",
+        static_cast<unsigned long long>(delta),
+        count,
+        static_cast<unsigned long long>(age_ms),
+        escalated ? 1 : 0,
+        (caller_context && caller_context[0]) ? caller_context : "unknown",
+        arc_runtime_state_name(g_arc_runtime_state.load(std::memory_order_acquire)),
+        static_cast<unsigned long>(GetCurrentThreadId()));
+    arc_log("debugger", dbg);
+    if (escalated)
+        reset_rdtsc_debugger_quorum();
+    return escalated;
+}
+
+bool check_debugger(const char* caller_context)
 {
     auto* peb = reinterpret_cast<const uint8_t*>(__readgsqword(0x60));
     if (!peb) return false;
@@ -1557,12 +1607,11 @@ bool check_debugger()
     volatile int dummy = 0;
     for (int i = 0; i < 100; ++i) dummy += i;
     uint64_t t1 = __rdtscp(&aux);
-    if ((t1 - t0) > 10000000ULL)
+    const uint64_t rdtsc_delta = t1 - t0;
+    if (rdtsc_delta > 10000000ULL)
     {
-        char dbg[64];
-        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE, "check_debugger: rdtsc_delta=%llu", (unsigned long long)(t1 - t0));
-        arc_log("debugger", dbg);
-        return true;
+        if (rdtsc_debugger_quorum_reached(rdtsc_delta, caller_context))
+            return true;
     }
 
     auto* kuser = reinterpret_cast<const volatile uint8_t*>(
@@ -2114,7 +2163,7 @@ bool is_session_valid()
 bool vtable_connect(uint64_t)
 {
     if (!is_session_valid()) return false;
-    if (check_debugger()) { enforce_violation_id(aida::reason_ids::reason_id_arc_debugger, "vtable_connect"); }
+    if (check_debugger("vtable_connect")) { enforce_violation_id(aida::reason_ids::reason_id_arc_debugger, "vtable_connect"); }
     auto* dev = get_device_enc(g_vtable_crypt_key);
     if (!dev) return false;
     return dev->connect();
@@ -2188,7 +2237,7 @@ void vtable_clear_process_context()
 size_t vtable_read_raw(uint64_t address, void* buffer, size_t size)
 {
     if (!is_session_valid()) return 0;
-    if (check_debugger()) { enforce_violation_id(aida::reason_ids::reason_id_arc_debugger, "vtable_read"); }
+    if (check_debugger("vtable_read")) { enforce_violation_id(aida::reason_ids::reason_id_arc_debugger, "vtable_read"); }
     if (!verify_vtable()) { enforce_violation_id(aida::reason_ids::reason_id_arc_vtable_tampered, "read"); }
     if (!buffer || size == 0) return 0;
     auto* dev = get_device_enc(g_vtable_crypt_key);
@@ -2199,7 +2248,7 @@ size_t vtable_read_raw(uint64_t address, void* buffer, size_t size)
 size_t vtable_write_raw(uint64_t address, const void* buffer, size_t size)
 {
     if (!is_session_valid()) return 0;
-    if (check_debugger()) { enforce_violation_id(aida::reason_ids::reason_id_arc_debugger, "vtable_write"); }
+    if (check_debugger("vtable_write")) { enforce_violation_id(aida::reason_ids::reason_id_arc_debugger, "vtable_write"); }
     if (!verify_vtable()) { enforce_violation_id(aida::reason_ids::reason_id_arc_vtable_tampered, "write"); }
     if (!buffer || size == 0) return 0;
     auto* dev = get_device_enc(g_vtable_crypt_key);
@@ -2270,7 +2319,7 @@ uint64_t vtable_remote_call(
     uint64_t arg3, uint64_t arg4)
 {
     if (!is_session_valid()) return 0;
-    if (check_debugger()) { enforce_violation_id(aida::reason_ids::reason_id_arc_debugger, "vtable_remote_call"); }
+    if (check_debugger("vtable_remote_call")) { enforce_violation_id(aida::reason_ids::reason_id_arc_debugger, "vtable_remote_call"); }
     if (!verify_vtable()) { enforce_violation_id(aida::reason_ids::reason_id_arc_vtable_tampered, "remote_call"); }
     auto* dev = get_device_enc(g_vtable_crypt_key);
     if (!dev) return 0;
@@ -2513,7 +2562,7 @@ ARC_API bool arc_init(
     }
 
     arc_log("init", "arc_init_step2_check_debugger");
-    if (check_debugger())
+    if (check_debugger("arc_init"))
     {
         enforce_violation_id(aida::reason_ids::reason_id_arc_debugger, "arc_init");
     }
@@ -2812,7 +2861,7 @@ ARC_API bool arc_init(
                     arc_log("driver", to_buf);
                     enforce_violation_id(aida::reason_ids::reason_id_arc_no_driver, "sentinel_bridge_down");
                 }
-                if (check_debugger())
+                if (check_debugger("sentinel_bridge_wait"))
                 {
                     enforce_violation_id(aida::reason_ids::reason_id_arc_debugger, "sentinel_bridge_wait");
                 }
@@ -3119,7 +3168,7 @@ ARC_API uint64_t arc_validate_tool_exec_v2(
     }
     CFF_STATE(validate_v2_cff, 2)
     {
-        if (check_debugger())
+        if (check_debugger("validate_tool_v2"))
         {
             enforce_violation_id(aida::reason_ids::reason_id_arc_debugger, "validate_tool_v2");
         }
@@ -3271,7 +3320,7 @@ ARC_API arc_heartbeat_result_t arc_heartbeat()
     }
     CFF_STATE(hb_cff, 2)
     {
-        if (check_debugger())
+        if (check_debugger("heartbeat"))
         {
             enforce_violation_id(aida::reason_ids::reason_id_arc_debugger, "heartbeat");
         }
@@ -3471,7 +3520,7 @@ ARC_API arc_heartbeat_result_t arc_heartbeat_ex(uint64_t hb_count, const char* c
     }
     CFF_STATE(hbex_cff, 2)
     {
-        if (check_debugger())
+        if (check_debugger("heartbeat_ex"))
         {
             enforce_violation_id(aida::reason_ids::reason_id_arc_debugger, "heartbeat_ex");
         }
@@ -3805,7 +3854,7 @@ ARC_API bool arc_unseal_feature(
     if (!out || !out_size || out_cap == 0) { arc_log("unseal", "bad_args"); return false; }
     if (!nonce || nonce_len == 0 || nonce_len > 256) { arc_log("unseal", "bad_nonce"); return false; }
     if (!is_session_valid()) { arc_log("unseal", "session_invalid"); return false; }
-    if (check_debugger()) { enforce_violation_id(aida::reason_ids::reason_id_arc_debugger, "unseal_feature"); }
+    if (check_debugger("unseal_feature")) { enforce_violation_id(aida::reason_ids::reason_id_arc_debugger, "unseal_feature"); }
     if (!load_bind_secret()) { arc_log("unseal", "bind_secret_load_failed"); return false; }
 
     uint8_t feature_blob[sizeof(g_feature_blob)] = {};

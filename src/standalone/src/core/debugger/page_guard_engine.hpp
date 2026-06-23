@@ -69,6 +69,50 @@ static constexpr size_t PATCH_PAGE_SIZE         = 196;
 static constexpr size_t PATCH_ORIG_PROTECT      = 208;
 static constexpr size_t PATCH_VIRT_PROTECT      = 227;
 
+struct process_mitigation_diag_t {
+    bool open_ok = false;
+    DWORD open_error = 0;
+    bool dynamic_ok = false;
+    DWORD dynamic_error = 0;
+    DWORD dynamic_flags = 0;
+    bool cfg_ok = false;
+    DWORD cfg_error = 0;
+    DWORD cfg_flags = 0;
+};
+
+static inline process_mitigation_diag_t query_process_mitigation_diag(uint32_t pid) noexcept
+{
+    process_mitigation_diag_t out{};
+    if (pid == 0) {
+        out.open_error = ERROR_INVALID_PARAMETER;
+        return out;
+    }
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process) {
+        out.open_error = GetLastError();
+        return out;
+    }
+    out.open_ok = true;
+    PROCESS_MITIGATION_DYNAMIC_CODE_POLICY dynamic_policy{};
+    SetLastError(ERROR_SUCCESS);
+    if (GetProcessMitigationPolicy(process, ProcessDynamicCodePolicy, &dynamic_policy, sizeof(dynamic_policy))) {
+        out.dynamic_ok = true;
+        out.dynamic_flags = dynamic_policy.Flags;
+    } else {
+        out.dynamic_error = GetLastError();
+    }
+    PROCESS_MITIGATION_CONTROL_FLOW_GUARD_POLICY cfg_policy{};
+    SetLastError(ERROR_SUCCESS);
+    if (GetProcessMitigationPolicy(process, ProcessControlFlowGuardPolicy, &cfg_policy, sizeof(cfg_policy))) {
+        out.cfg_ok = true;
+        out.cfg_flags = cfg_policy.Flags;
+    } else {
+        out.cfg_error = GetLastError();
+    }
+    CloseHandle(process);
+    return out;
+}
+
 static inline bool kernel_operation_ready(uint32_t pid,
                                           const char* label,
                                           const char* operation,
@@ -709,30 +753,43 @@ static inline uint64_t remove_vectored_exception_handler_remote(uint32_t pid,
                                                                 const char* phase,
                                                                 ULONGLONG phase_start) {
     const ULONGLONG t0 = GetTickCount64();
+    const process_mitigation_diag_t mitigation = query_process_mitigation_diag(pid);
     diag::log_tagged_fmt("pg_sniff",
-        "remove_veh_remote_begin phase=%s pid=%u active_pid=%u module=ntdll.dll base=0x%llX function=RtlRemoveVectoredExceptionHandler va=0x%llX handle=0x%llX elapsed_ms=%llu",
+        "remove_veh_remote_begin phase=%s pid=%u active_pid=%u module=ntdll.dll base=0x%llX function=RtlRemoveVectoredExceptionHandler va=0x%llX handle=0x%llX mitigation_open=%d mitigation_open_error=%lu dyn_ok=%d dyn_error=%lu dyn_flags=0x%08lX cfg_ok=%d cfg_error=%lu cfg_flags=0x%08lX elapsed_ms=%llu",
         phase ? phase : "",
         pid,
         driver_bridge::attached_pid(),
         static_cast<unsigned long long>(module_base),
         static_cast<unsigned long long>(remove_fn),
         static_cast<unsigned long long>(veh_handle),
+        mitigation.open_ok ? 1 : 0,
+        static_cast<unsigned long>(mitigation.open_error),
+        mitigation.dynamic_ok ? 1 : 0,
+        static_cast<unsigned long>(mitigation.dynamic_error),
+        static_cast<unsigned long>(mitigation.dynamic_flags),
+        mitigation.cfg_ok ? 1 : 0,
+        static_cast<unsigned long>(mitigation.cfg_error),
+        static_cast<unsigned long>(mitigation.cfg_flags),
         static_cast<unsigned long long>(GetTickCount64() - phase_start));
     if (pid == 0 || remove_fn == 0 || veh_handle == 0) {
         diag::log_tagged_fmt("pg_sniff",
-            "remove_veh_remote_skip phase=%s pid=%u active_pid=%u module=ntdll.dll base=0x%llX function=RtlRemoveVectoredExceptionHandler va=0x%llX handle=0x%llX elapsed_ms=%llu outcome=invalid_args",
+            "remove_veh_remote_skip phase=%s pid=%u active_pid=%u module=ntdll.dll base=0x%llX function=RtlRemoveVectoredExceptionHandler va=0x%llX handle=0x%llX elapsed_ms=%llu outcome=invalid_args gle=%lu",
             phase ? phase : "",
             pid,
             driver_bridge::attached_pid(),
             static_cast<unsigned long long>(module_base),
             static_cast<unsigned long long>(remove_fn),
             static_cast<unsigned long long>(veh_handle),
-            static_cast<unsigned long long>(GetTickCount64() - phase_start));
+            static_cast<unsigned long long>(GetTickCount64() - phase_start),
+            static_cast<unsigned long>(ERROR_INVALID_PARAMETER));
+        SetLastError(ERROR_INVALID_PARAMETER);
         return 0;
     }
+    SetLastError(ERROR_SUCCESS);
     const uint64_t removed = driver_remote_call(pid, remove_fn, veh_handle, 0, 0, 0, "RtlRemoveVectoredExceptionHandler");
+    const DWORD gle = removed != 0 ? ERROR_SUCCESS : GetLastError();
     diag::log_tagged_fmt("pg_sniff",
-        "remove_veh_remote_done phase=%s pid=%u active_pid=%u module=ntdll.dll base=0x%llX function=RtlRemoveVectoredExceptionHandler va=0x%llX handle=0x%llX result=0x%llX ok=%d elapsed_ms=%llu phase_elapsed_ms=%llu",
+        "remove_veh_remote_done phase=%s pid=%u active_pid=%u module=ntdll.dll base=0x%llX function=RtlRemoveVectoredExceptionHandler va=0x%llX handle=0x%llX result=0x%llX ok=%d gle=%lu status=%s last_error=%s elapsed_ms=%llu phase_elapsed_ms=%llu",
         phase ? phase : "",
         pid,
         driver_bridge::attached_pid(),
@@ -741,8 +798,13 @@ static inline uint64_t remove_vectored_exception_handler_remote(uint32_t pid,
         static_cast<unsigned long long>(veh_handle),
         static_cast<unsigned long long>(removed),
         removed != 0 ? 1 : 0,
+        static_cast<unsigned long>(gle),
+        driver_bridge::status().c_str(),
+        driver_bridge::last_error().c_str(),
         static_cast<unsigned long long>(GetTickCount64() - t0),
         static_cast<unsigned long long>(GetTickCount64() - phase_start));
+    if (removed == 0)
+        SetLastError(gle);
     return removed;
 }
 
@@ -1472,21 +1534,28 @@ public:
         const std::string veh_handler_before_error = veh_handler_before_ok ? std::string() : driver_bridge::last_error();
         const bool veh_ring_before_ok = driver_bridge::query_memory_for(pid, ring_addr, veh_ring_before);
         const std::string veh_ring_before_error = veh_ring_before_ok ? std::string() : driver_bridge::last_error();
+        const uint32_t proposed_guard_protect = orig_protect | PAGE_GUARD;
+        const uint64_t veh_context_addr = ring_addr;
+        const process_mitigation_diag_t veh_mitigation = query_process_mitigation_diag(pid);
         diag::log_tagged_fmt("pg_sniff",
-            "veh_register_begin pid=%u active_pid=%u caller_tid=%lu module=ntdll.dll ntdll_base=0x%llX ntdll_size=0x%llX function=RtlAddVectoredExceptionHandler va=0x%llX remove_va=0x%llX handler=0x%llX ring=0x%llX method=driver_bridge::call_function target_base=0x%llX target_size=0x%llX target_state=0x%08X target_protect=0x%08X target_type=0x%08X handler_query=%d handler_base=0x%llX handler_size=0x%llX handler_state=0x%08X handler_protect=0x%08X handler_type=0x%08X handler_error=%s ring_query=%d ring_base=0x%llX ring_size=0x%llX ring_state=0x%08X ring_protect=0x%08X ring_type=0x%08X ring_error=%s elapsed_ms=%llu",
+            "veh_register_begin pid=%u active_pid=%u caller_tid=%lu generation=%llu current_generation=%llu module=ntdll.dll ntdll_base=0x%llX ntdll_size=0x%llX function=RtlAddVectoredExceptionHandler va=0x%llX remove_va=0x%llX handler=0x%llX ring=0x%llX context=0x%llX method=driver_bridge::call_function target_base=0x%llX target_size=0x%llX target_state=0x%08X target_protect=0x%08X proposed_protect=0x%08X target_type=0x%08X handler_query=%d handler_base=0x%llX handler_size=0x%llX handler_state=0x%08X handler_protect=0x%08X handler_type=0x%08X handler_error=%s ring_query=%d ring_base=0x%llX ring_size=0x%llX ring_state=0x%08X ring_protect=0x%08X ring_type=0x%08X ring_error=%s mitigation_open=%d mitigation_open_error=%lu dyn_ok=%d dyn_error=%lu dyn_flags=0x%08lX cfg_ok=%d cfg_error=%lu cfg_flags=0x%08lX elapsed_ms=%llu",
             pid,
             driver_bridge::attached_pid(),
             static_cast<unsigned long>(GetCurrentThreadId()),
+            static_cast<unsigned long long>(install_generation),
+            static_cast<unsigned long long>(install_stop_generation_.load(std::memory_order_acquire)),
             static_cast<unsigned long long>(ntdll_mod_install.base),
             static_cast<unsigned long long>(ntdll_mod_install.size),
             static_cast<unsigned long long>(rtl_add_fn),
             static_cast<unsigned long long>(rtl_remove_fn),
             static_cast<unsigned long long>(sc_addr),
             static_cast<unsigned long long>(ring_addr),
+            static_cast<unsigned long long>(veh_context_addr),
             static_cast<unsigned long long>(veh_target_before.base),
             static_cast<unsigned long long>(veh_target_before.size),
             veh_target_before.state,
             veh_target_before.protect,
+            proposed_guard_protect,
             veh_target_before.type,
             veh_handler_before_ok ? 1 : 0,
             static_cast<unsigned long long>(veh_handler_before.base),
@@ -1502,6 +1571,14 @@ public:
             veh_ring_before.protect,
             veh_ring_before.type,
             veh_ring_before_error.c_str(),
+            veh_mitigation.open_ok ? 1 : 0,
+            static_cast<unsigned long>(veh_mitigation.open_error),
+            veh_mitigation.dynamic_ok ? 1 : 0,
+            static_cast<unsigned long>(veh_mitigation.dynamic_error),
+            static_cast<unsigned long>(veh_mitigation.dynamic_flags),
+            veh_mitigation.cfg_ok ? 1 : 0,
+            static_cast<unsigned long>(veh_mitigation.cfg_error),
+            static_cast<unsigned long>(veh_mitigation.cfg_flags),
             static_cast<unsigned long long>(GetTickCount64() - install_start));
 
         if (const char* reason = check_install_cancelled("before_veh_register")) {
@@ -1521,7 +1598,13 @@ public:
                 static_cast<unsigned long long>(GetTickCount64() - install_start));
             return fail_install(reason, "page-guard install cancelled before VEH registration", &mri, target_addr, region_size, 0);
         }
+        SetLastError(ERROR_SUCCESS);
+        const ULONGLONG veh_call_start = GetTickCount64();
         uint64_t veh_handle = driver_remote_call(pid, rtl_add_fn, 1, sc_addr, 0, 0, "RtlAddVectoredExceptionHandler");
+        const uint64_t veh_call_elapsed = GetTickCount64() - veh_call_start;
+        const DWORD veh_call_gle = veh_handle != 0 ? ERROR_SUCCESS : GetLastError();
+        const std::string veh_call_status = driver_bridge::status();
+        const std::string veh_call_last_error = driver_bridge::last_error();
         driver_bridge::memory_region_t veh_target_after{};
         driver_bridge::memory_region_t veh_handler_after{};
         driver_bridge::memory_region_t veh_ring_after{};
@@ -1537,17 +1620,26 @@ public:
             const bool cleanup_ring_ok = driver_bridge::free_memory_for(pid, ring_addr);
             const std::string cleanup_ring_error = cleanup_ring_ok ? std::string() : driver_bridge::last_error();
             diag::log_tagged_fmt("pg_sniff",
-                "veh_register_failed pid=%u active_pid=%u caller_tid=%lu module=ntdll.dll ntdll_base=0x%llX ntdll_size=0x%llX function=RtlAddVectoredExceptionHandler va=0x%llX remove_va=0x%llX handler=0x%llX ring=0x%llX method=driver_bridge::call_function result=0x%llX target_before_base=0x%llX target_before_size=0x%llX target_before_state=0x%08X target_before_protect=0x%08X target_before_type=0x%08X target_after_query=%d target_after_base=0x%llX target_after_size=0x%llX target_after_state=0x%08X target_after_protect=0x%08X target_after_type=0x%08X target_after_error=%s handler_before_query=%d handler_before_base=0x%llX handler_before_size=0x%llX handler_before_state=0x%08X handler_before_protect=0x%08X handler_before_type=0x%08X handler_after_query=%d handler_after_base=0x%llX handler_after_size=0x%llX handler_after_state=0x%08X handler_after_protect=0x%08X handler_after_type=0x%08X handler_after_error=%s ring_before_query=%d ring_before_base=0x%llX ring_before_size=0x%llX ring_before_state=0x%08X ring_before_protect=0x%08X ring_before_type=0x%08X ring_after_query=%d ring_after_base=0x%llX ring_after_size=0x%llX ring_after_state=0x%08X ring_after_protect=0x%08X ring_after_type=0x%08X ring_after_error=%s cleanup_sc_ok=%d cleanup_sc_error=%s cleanup_ring_ok=%d cleanup_ring_error=%s elapsed_ms=%llu",
+                "veh_register_failed pid=%u active_pid=%u caller_tid=%lu generation=%llu current_generation=%llu module=ntdll.dll ntdll_base=0x%llX ntdll_size=0x%llX function=RtlAddVectoredExceptionHandler va=0x%llX remove_va=0x%llX handler=0x%llX ring=0x%llX context=0x%llX method=driver_bridge::call_function result=0x%llX gle=%lu remote_elapsed_ms=%llu remote_status=%s remote_last_error=%s original_protect=0x%08X proposed_protect=0x%08X target_before_base=0x%llX target_before_size=0x%llX target_before_state=0x%08X target_before_protect=0x%08X target_before_type=0x%08X target_after_query=%d target_after_base=0x%llX target_after_size=0x%llX target_after_state=0x%08X target_after_protect=0x%08X target_after_type=0x%08X target_after_error=%s handler_before_query=%d handler_before_base=0x%llX handler_before_size=0x%llX handler_before_state=0x%08X handler_before_protect=0x%08X handler_before_type=0x%08X handler_after_query=%d handler_after_base=0x%llX handler_after_size=0x%llX handler_after_state=0x%08X handler_after_protect=0x%08X handler_after_type=0x%08X handler_after_error=%s ring_before_query=%d ring_before_base=0x%llX ring_before_size=0x%llX ring_before_state=0x%08X ring_before_protect=0x%08X ring_before_type=0x%08X ring_after_query=%d ring_after_base=0x%llX ring_after_size=0x%llX ring_after_state=0x%08X ring_after_protect=0x%08X ring_after_type=0x%08X ring_after_error=%s mitigation_open=%d mitigation_open_error=%lu dyn_ok=%d dyn_error=%lu dyn_flags=0x%08lX cfg_ok=%d cfg_error=%lu cfg_flags=0x%08lX cleanup_sc_ok=%d cleanup_sc_error=%s cleanup_ring_ok=%d cleanup_ring_error=%s elapsed_ms=%llu",
                 pid,
                 driver_bridge::attached_pid(),
                 static_cast<unsigned long>(GetCurrentThreadId()),
+                static_cast<unsigned long long>(install_generation),
+                static_cast<unsigned long long>(install_stop_generation_.load(std::memory_order_acquire)),
                 static_cast<unsigned long long>(ntdll_mod_install.base),
                 static_cast<unsigned long long>(ntdll_mod_install.size),
                 static_cast<unsigned long long>(rtl_add_fn),
                 static_cast<unsigned long long>(rtl_remove_fn),
                 static_cast<unsigned long long>(sc_addr),
                 static_cast<unsigned long long>(ring_addr),
+                static_cast<unsigned long long>(veh_context_addr),
                 static_cast<unsigned long long>(veh_handle),
+                static_cast<unsigned long>(veh_call_gle),
+                static_cast<unsigned long long>(veh_call_elapsed),
+                veh_call_status.c_str(),
+                veh_call_last_error.c_str(),
+                orig_protect,
+                proposed_guard_protect,
                 static_cast<unsigned long long>(veh_target_before.base),
                 static_cast<unsigned long long>(veh_target_before.size),
                 veh_target_before.state,
@@ -1586,12 +1678,52 @@ public:
                 veh_ring_after.protect,
                 veh_ring_after.type,
                 veh_ring_after_error.c_str(),
+                veh_mitigation.open_ok ? 1 : 0,
+                static_cast<unsigned long>(veh_mitigation.open_error),
+                veh_mitigation.dynamic_ok ? 1 : 0,
+                static_cast<unsigned long>(veh_mitigation.dynamic_error),
+                static_cast<unsigned long>(veh_mitigation.dynamic_flags),
+                veh_mitigation.cfg_ok ? 1 : 0,
+                static_cast<unsigned long>(veh_mitigation.cfg_error),
+                static_cast<unsigned long>(veh_mitigation.cfg_flags),
                 cleanup_sc_ok ? 1 : 0,
                 cleanup_sc_error.c_str(),
                 cleanup_ring_ok ? 1 : 0,
                 cleanup_ring_error.c_str(),
                 static_cast<unsigned long long>(GetTickCount64() - install_start));
-            return fail_install("veh_register_failed", "remote RtlAddVectoredExceptionHandler call failed", &mri, target_addr, region_size, 0);
+            record_install_failure("veh_register_failed",
+                                   "remote RtlAddVectoredExceptionHandler call returned NULL",
+                                   pid,
+                                   requested_addr,
+                                   requested_size,
+                                   target_addr,
+                                   region_size,
+                                   &mri,
+                                   proposed_guard_protect,
+                                   veh_call_gle);
+            record_install_veh_failure_detail(driver_bridge::attached_pid(),
+                                              ring_addr,
+                                              sc_addr,
+                                              veh_context_addr,
+                                              ntdll_mod_install.base,
+                                              ntdll_mod_install.size,
+                                              rtl_add_fn,
+                                              rtl_remove_fn,
+                                              veh_handle,
+                                              veh_call_gle,
+                                              veh_call_elapsed,
+                                              orig_protect,
+                                              proposed_guard_protect,
+                                              cleanup_sc_ok ? 1u : 0u,
+                                              cleanup_ring_ok ? 1u : 0u,
+                                              GetTickCount64() - install_start,
+                                              install_generation,
+                                              install_stop_generation_.load(std::memory_order_acquire),
+                                              veh_mitigation,
+                                              veh_call_status,
+                                              veh_call_last_error);
+            SetLastError(veh_call_gle);
+            return 0;
         }
         if (const char* reason = check_install_cancelled("after_veh_register")) {
             uint64_t removed = remove_vectored_exception_handler_remote(pid,
@@ -1619,16 +1751,31 @@ public:
             return fail_install(reason, "page-guard install cancelled after VEH registration", &mri, target_addr, region_size, 0);
         }
         diag::log_tagged_fmt("pg_sniff",
-            "veh_register_done pid=%u active_pid=%u caller_tid=%lu module=ntdll.dll ntdll_base=0x%llX ntdll_size=0x%llX function=RtlAddVectoredExceptionHandler va=0x%llX handler=0x%llX ring=0x%llX handle=0x%llX method=driver_bridge::call_function target_after_query=%d target_after_base=0x%llX target_after_size=0x%llX target_after_state=0x%08X target_after_protect=0x%08X target_after_type=0x%08X handler_after_query=%d handler_after_base=0x%llX handler_after_size=0x%llX handler_after_state=0x%08X handler_after_protect=0x%08X handler_after_type=0x%08X ring_after_query=%d ring_after_base=0x%llX ring_after_size=0x%llX ring_after_state=0x%08X ring_after_protect=0x%08X ring_after_type=0x%08X elapsed_ms=%llu",
+            "veh_register_done pid=%u active_pid=%u caller_tid=%lu generation=%llu current_generation=%llu module=ntdll.dll ntdll_base=0x%llX ntdll_size=0x%llX function=RtlAddVectoredExceptionHandler va=0x%llX handler=0x%llX ring=0x%llX context=0x%llX handle=0x%llX method=driver_bridge::call_function gle=%lu remote_elapsed_ms=%llu original_protect=0x%08X proposed_protect=0x%08X mitigation_open=%d mitigation_open_error=%lu dyn_ok=%d dyn_error=%lu dyn_flags=0x%08lX cfg_ok=%d cfg_error=%lu cfg_flags=0x%08lX target_after_query=%d target_after_base=0x%llX target_after_size=0x%llX target_after_state=0x%08X target_after_protect=0x%08X target_after_type=0x%08X handler_after_query=%d handler_after_base=0x%llX handler_after_size=0x%llX handler_after_state=0x%08X handler_after_protect=0x%08X handler_after_type=0x%08X ring_after_query=%d ring_after_base=0x%llX ring_after_size=0x%llX ring_after_state=0x%08X ring_after_protect=0x%08X ring_after_type=0x%08X elapsed_ms=%llu",
             pid,
             driver_bridge::attached_pid(),
             static_cast<unsigned long>(GetCurrentThreadId()),
+            static_cast<unsigned long long>(install_generation),
+            static_cast<unsigned long long>(install_stop_generation_.load(std::memory_order_acquire)),
             static_cast<unsigned long long>(ntdll_mod_install.base),
             static_cast<unsigned long long>(ntdll_mod_install.size),
             static_cast<unsigned long long>(rtl_add_fn),
             static_cast<unsigned long long>(sc_addr),
             static_cast<unsigned long long>(ring_addr),
+            static_cast<unsigned long long>(veh_context_addr),
             static_cast<unsigned long long>(veh_handle),
+            static_cast<unsigned long>(veh_call_gle),
+            static_cast<unsigned long long>(veh_call_elapsed),
+            orig_protect,
+            proposed_guard_protect,
+            veh_mitigation.open_ok ? 1 : 0,
+            static_cast<unsigned long>(veh_mitigation.open_error),
+            veh_mitigation.dynamic_ok ? 1 : 0,
+            static_cast<unsigned long>(veh_mitigation.dynamic_error),
+            static_cast<unsigned long>(veh_mitigation.dynamic_flags),
+            veh_mitigation.cfg_ok ? 1 : 0,
+            static_cast<unsigned long>(veh_mitigation.cfg_error),
+            static_cast<unsigned long>(veh_mitigation.cfg_flags),
             veh_target_after_ok ? 1 : 0,
             static_cast<unsigned long long>(veh_target_after.base),
             static_cast<unsigned long long>(veh_target_after.size),
@@ -2196,18 +2343,46 @@ public:
         std::string detail;
         std::string driver_status;
         std::string driver_last_error;
+        std::string remote_call_driver_status;
+        std::string remote_call_driver_last_error;
         uint32_t pid = 0;
+        uint32_t active_pid = 0;
         uint32_t win32_error = 0;
+        uint32_t remote_call_gle = 0;
         uint32_t region_state = 0;
         uint32_t region_protect = 0;
         uint32_t region_type = 0;
         uint32_t attempted_protect = 0;
+        uint32_t original_protect = 0;
+        uint32_t proposed_protect = 0;
+        uint32_t cleanup_shellcode_ok = 0;
+        uint32_t cleanup_ring_ok = 0;
+        uint32_t mitigation_open_ok = 0;
+        uint32_t mitigation_open_error = 0;
+        uint32_t mitigation_dynamic_ok = 0;
+        uint32_t mitigation_dynamic_error = 0;
+        uint32_t mitigation_dynamic_flags = 0;
+        uint32_t mitigation_cfg_ok = 0;
+        uint32_t mitigation_cfg_error = 0;
+        uint32_t mitigation_cfg_flags = 0;
         uint64_t requested_addr = 0;
         uint64_t requested_size = 0;
         uint64_t guard_addr = 0;
         uint64_t guard_size = 0;
         uint64_t region_base = 0;
         uint64_t region_size = 0;
+        uint64_t ring_addr = 0;
+        uint64_t shellcode_addr = 0;
+        uint64_t context_addr = 0;
+        uint64_t ntdll_base = 0;
+        uint64_t ntdll_size = 0;
+        uint64_t rtl_add_veh = 0;
+        uint64_t rtl_remove_veh = 0;
+        uint64_t veh_result = 0;
+        uint64_t remote_call_elapsed_ms = 0;
+        uint64_t install_elapsed_ms = 0;
+        uint64_t install_generation = 0;
+        uint64_t current_generation = 0;
     };
 
     std::vector<session_info_t> list_sessions() {
@@ -2291,6 +2466,58 @@ private:
             last_install_failure_.region_protect = region->protect;
             last_install_failure_.region_type = region->type;
         }
+    }
+
+    void record_install_veh_failure_detail(uint32_t active_pid,
+                                           uint64_t ring_addr,
+                                           uint64_t shellcode_addr,
+                                           uint64_t context_addr,
+                                           uint64_t ntdll_base,
+                                           uint64_t ntdll_size,
+                                           uint64_t rtl_add_fn,
+                                           uint64_t rtl_remove_fn,
+                                           uint64_t veh_result,
+                                           uint32_t remote_call_gle,
+                                           uint64_t remote_call_elapsed_ms,
+                                           uint32_t original_protect,
+                                           uint32_t proposed_protect,
+                                           uint32_t cleanup_shellcode_ok,
+                                           uint32_t cleanup_ring_ok,
+                                           uint64_t install_elapsed_ms,
+                                           uint64_t install_generation,
+                                           uint64_t current_generation,
+                                           const process_mitigation_diag_t& mitigation,
+                                           const std::string& remote_call_status,
+                                           const std::string& remote_call_last_error) {
+        std::lock_guard<std::mutex> lk(failure_mutex_);
+        last_install_failure_.active_pid = active_pid;
+        last_install_failure_.ring_addr = ring_addr;
+        last_install_failure_.shellcode_addr = shellcode_addr;
+        last_install_failure_.context_addr = context_addr;
+        last_install_failure_.ntdll_base = ntdll_base;
+        last_install_failure_.ntdll_size = ntdll_size;
+        last_install_failure_.rtl_add_veh = rtl_add_fn;
+        last_install_failure_.rtl_remove_veh = rtl_remove_fn;
+        last_install_failure_.veh_result = veh_result;
+        last_install_failure_.remote_call_gle = remote_call_gle;
+        last_install_failure_.remote_call_elapsed_ms = remote_call_elapsed_ms;
+        last_install_failure_.original_protect = original_protect;
+        last_install_failure_.proposed_protect = proposed_protect;
+        last_install_failure_.cleanup_shellcode_ok = cleanup_shellcode_ok;
+        last_install_failure_.cleanup_ring_ok = cleanup_ring_ok;
+        last_install_failure_.install_elapsed_ms = install_elapsed_ms;
+        last_install_failure_.install_generation = install_generation;
+        last_install_failure_.current_generation = current_generation;
+        last_install_failure_.mitigation_open_ok = mitigation.open_ok ? 1u : 0u;
+        last_install_failure_.mitigation_open_error = mitigation.open_error;
+        last_install_failure_.mitigation_dynamic_ok = mitigation.dynamic_ok ? 1u : 0u;
+        last_install_failure_.mitigation_dynamic_error = mitigation.dynamic_error;
+        last_install_failure_.mitigation_dynamic_flags = mitigation.dynamic_flags;
+        last_install_failure_.mitigation_cfg_ok = mitigation.cfg_ok ? 1u : 0u;
+        last_install_failure_.mitigation_cfg_error = mitigation.cfg_error;
+        last_install_failure_.mitigation_cfg_flags = mitigation.cfg_flags;
+        last_install_failure_.remote_call_driver_status = remote_call_status;
+        last_install_failure_.remote_call_driver_last_error = remote_call_last_error;
     }
 
     static bool stop_session_poller(const std::shared_ptr<pg_session_t>& sess, DWORD timeout_ms, const char* reason) {

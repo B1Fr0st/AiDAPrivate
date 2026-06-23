@@ -154,7 +154,7 @@ inline void push_log_fmt(const char* fmt, ...)
 
 inline bool full_test_active()
 {
-	return test_all_features::is_running();
+	return test_all_features::is_unattended_full_test_active();
 }
 
 inline const char* log_value(const std::string& s);

@@ -21,6 +21,7 @@
 #include "standalone_driver.hpp"
 #include "work_queue.hpp"
 #include "zydis_disasm.hpp"
+#include "../../helpers/diag_log.hpp"
 
 namespace xref_index {
 
@@ -64,6 +65,17 @@ namespace xref_index {
 	};
 
 	namespace detail {
+
+		inline unsigned long current_worker_tid()
+		{
+			return static_cast<unsigned long>(GetCurrentThreadId());
+		}
+
+		inline uint64_t elapsed_us_since(const std::chrono::steady_clock::time_point& started)
+		{
+			return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+				std::chrono::steady_clock::now() - started).count());
+		}
 
 		enum class build_state_t : uint32_t {
 			idle = 0,
@@ -448,7 +460,10 @@ namespace xref_index {
 			}
 		}
 
-		inline void build_module_to_index_live(std::shared_ptr<module_index_t> mod) {
+		inline void build_module_to_index_live(std::shared_ptr<module_index_t> mod, uint64_t warm_lo = 0, uint64_t warm_hi = 0) {
+			const auto started = std::chrono::steady_clock::now();
+			const unsigned long worker_tid = current_worker_tid();
+			const uint32_t start_pid = driver_bridge::attached_pid();
 			pe_parser::pe_info_t pe;
 			std::vector<pe_parser::section_info_t> sections;
 			if (pe_parser::parse(mod->base, pe))
@@ -461,10 +476,35 @@ namespace xref_index {
 
 			const size_t page_size = 4096;
 			const uint64_t module_size = mod->size;
+			size_t pages_read = 0;
+			size_t pages_failed = 0;
+			size_t bytes_read = 0;
+			diag::log_tagged_critical_fmt("xref",
+				"warm_range_worker_enter module=%s base=0x%llX size=0x%llX warm_lo=0x%llX warm_hi=0x%llX pid=%u tid=%lu sections=%zu elapsed_us=%llu",
+				mod->name.c_str(),
+				static_cast<unsigned long long>(mod->base),
+				static_cast<unsigned long long>(module_size),
+				static_cast<unsigned long long>(warm_lo),
+				static_cast<unsigned long long>(warm_hi),
+				start_pid,
+				worker_tid,
+				sections.size(),
+				static_cast<unsigned long long>(elapsed_us_since(started)));
 
 			for (uint64_t offset = 0; offset < module_size; offset += page_size) {
 				if (driver_bridge::attached_pid() == 0) {
 					mod->state.store(static_cast<uint32_t>(build_state_t::failed), std::memory_order_release);
+					diag::log_tagged_critical_fmt("xref",
+						"warm_range_worker_exit module=%s reason=no_attached_pid warm_lo=0x%llX warm_hi=0x%llX page_cursor=0x%llX pages_read=%zu pages_failed=%zu bytes_read=%zu tid=%lu elapsed_us=%llu",
+						mod->name.c_str(),
+						static_cast<unsigned long long>(warm_lo),
+						static_cast<unsigned long long>(warm_hi),
+						static_cast<unsigned long long>(mod->base + offset),
+						pages_read,
+						pages_failed,
+						bytes_read,
+						worker_tid,
+						static_cast<unsigned long long>(elapsed_us_since(started)));
 					return;
 				}
 
@@ -473,11 +513,54 @@ namespace xref_index {
 					chunk = static_cast<size_t>(module_size - offset);
 
 				std::vector<uint8_t> page_data;
-				if (!driver_bridge::read_memory(mod->base + offset, chunk, page_data) || page_data.empty())
+				const uint64_t cursor = mod->base + offset;
+				const auto page_started = std::chrono::steady_clock::now();
+				diag::log_tagged_critical_fmt("xref",
+					"warm_range_worker_page_pre module=%s base=0x%llX warm_lo=0x%llX warm_hi=0x%llX cursor=0x%llX chunk=%zu pid=%u tid=%lu elapsed_us=%llu",
+					mod->name.c_str(),
+					static_cast<unsigned long long>(mod->base),
+					static_cast<unsigned long long>(warm_lo),
+					static_cast<unsigned long long>(warm_hi),
+					static_cast<unsigned long long>(cursor),
+					chunk,
+					driver_bridge::attached_pid(),
+					worker_tid,
+					static_cast<unsigned long long>(elapsed_us_since(started)));
+				const bool read_ok = driver_bridge::read_memory(cursor, chunk, page_data);
+				if (!read_ok || page_data.empty()) {
+					++pages_failed;
+					diag::log_tagged_critical_fmt("xref",
+						"warm_range_worker_page_post module=%s cursor=0x%llX chunk=%zu ok=%d bytes=%zu pages_read=%zu pages_failed=%zu pid=%u tid=%lu page_elapsed_us=%llu elapsed_us=%llu",
+						mod->name.c_str(),
+						static_cast<unsigned long long>(cursor),
+						chunk,
+						read_ok ? 1 : 0,
+						page_data.size(),
+						pages_read,
+						pages_failed,
+						driver_bridge::attached_pid(),
+						worker_tid,
+						static_cast<unsigned long long>(elapsed_us_since(page_started)),
+						static_cast<unsigned long long>(elapsed_us_since(started)));
 					continue;
+				}
+				++pages_read;
+				bytes_read += page_data.size();
 
 				scan_block_for_xrefs(page_data.data(), page_data.size(),
-					mod->base + offset, fns, sections, mod->base, mod->name, map);
+					cursor, fns, sections, mod->base, mod->name, map);
+				diag::log_tagged_critical_fmt("xref",
+					"warm_range_worker_page_post module=%s cursor=0x%llX chunk=%zu ok=1 bytes=%zu pages_read=%zu pages_failed=%zu pid=%u tid=%lu page_elapsed_us=%llu elapsed_us=%llu",
+					mod->name.c_str(),
+					static_cast<unsigned long long>(cursor),
+					chunk,
+					page_data.size(),
+					pages_read,
+					pages_failed,
+					driver_bridge::attached_pid(),
+					worker_tid,
+					static_cast<unsigned long long>(elapsed_us_since(page_started)),
+					static_cast<unsigned long long>(elapsed_us_since(started)));
 			}
 
 			for (auto& kv : map) {
@@ -487,6 +570,17 @@ namespace xref_index {
 			mod->sections = std::move(sections);
 			mod->to_index = std::move(map);
 			mod->state.store(static_cast<uint32_t>(build_state_t::built), std::memory_order_release);
+			diag::log_tagged_critical_fmt("xref",
+				"warm_range_worker_exit module=%s reason=built warm_lo=0x%llX warm_hi=0x%llX pages_read=%zu pages_failed=%zu bytes_read=%zu targets=%zu tid=%lu elapsed_us=%llu",
+				mod->name.c_str(),
+				static_cast<unsigned long long>(warm_lo),
+				static_cast<unsigned long long>(warm_hi),
+				pages_read,
+				pages_failed,
+				bytes_read,
+				mod->to_index.size(),
+				worker_tid,
+				static_cast<unsigned long long>(elapsed_us_since(started)));
 		}
 
 		inline void build_module_to_index_static(std::shared_ptr<module_index_t> mod) {
@@ -552,7 +646,7 @@ namespace xref_index {
 			mod->state.store(static_cast<uint32_t>(build_state_t::built), std::memory_order_release);
 		}
 
-		inline void build_module_to_index(std::shared_ptr<module_index_t> mod) {
+		inline void build_module_to_index(std::shared_ptr<module_index_t> mod, uint64_t warm_lo = 0, uint64_t warm_hi = 0) {
 			if (!mod) return;
 
 			if (mod->is_static_pe) {
@@ -569,7 +663,7 @@ namespace xref_index {
 				return;
 			}
 
-			build_module_to_index_live(mod);
+			build_module_to_index_live(mod, warm_lo, warm_hi);
 		}
 
 		inline std::shared_ptr<module_index_t> get_or_create_module_unlocked(registry_t& reg,
@@ -806,7 +900,7 @@ namespace xref_index {
 			return v;
 		}
 
-		inline void schedule_build_locked(std::shared_ptr<module_index_t> mod) {
+		inline void schedule_build_locked(std::shared_ptr<module_index_t> mod, uint64_t warm_lo = 0, uint64_t warm_hi = 0) {
 			if (!mod) return;
 			if (mod->is_static_pe
 				&& !deep_static_xref_requested().load(std::memory_order_acquire))
@@ -819,10 +913,18 @@ namespace xref_index {
 				std::memory_order_acq_rel))
 				return;
 			std::weak_ptr<module_index_t> weak = mod;
-			work_queue::post([weak]() {
+			diag::log_tagged_critical_fmt("xref",
+				"warm_range_schedule module=%s base=0x%llX size=0x%llX warm_lo=0x%llX warm_hi=0x%llX tid=%lu",
+				mod->name.c_str(),
+				static_cast<unsigned long long>(mod->base),
+				static_cast<unsigned long long>(mod->size),
+				static_cast<unsigned long long>(warm_lo),
+				static_cast<unsigned long long>(warm_hi),
+				current_worker_tid());
+			work_queue::post([weak, warm_lo, warm_hi]() {
 				auto strong = weak.lock();
 				if (!strong) return;
-				build_module_to_index(strong);
+				build_module_to_index(strong, warm_lo, warm_hi);
 			});
 		}
 
@@ -894,6 +996,15 @@ namespace xref_index {
 		if (hi_addr <= lo_addr) return;
 
 		auto& reg = detail::registry();
+		const auto started = std::chrono::steady_clock::now();
+		diag::log_tagged_critical_fmt("xref",
+			"warm_range_enter lo=0x%llX hi=0x%llX pid=%u tid=%lu table_built=%d rebuild_in_flight=%d",
+			static_cast<unsigned long long>(lo_addr),
+			static_cast<unsigned long long>(hi_addr),
+			driver_bridge::attached_pid(),
+			detail::current_worker_tid(),
+			reg.table_built.load(std::memory_order_acquire) ? 1 : 0,
+			reg.rebuild_in_flight.load(std::memory_order_acquire) ? 1 : 0);
 
 		if (!reg.table_built.load(std::memory_order_acquire)) {
 			bool expected = false;
@@ -901,9 +1012,32 @@ namespace xref_index {
 				std::memory_order_acq_rel))
 			{
 				work_queue::post([&reg]() {
+					const auto rebuild_started = std::chrono::steady_clock::now();
+					diag::log_tagged_critical_fmt("xref",
+						"warm_range_rebuild_worker_enter tid=%lu",
+						detail::current_worker_tid());
 					detail::rebuild_module_table_offlock(reg);
 					reg.rebuild_in_flight.store(false, std::memory_order_release);
+					diag::log_tagged_critical_fmt("xref",
+						"warm_range_rebuild_worker_exit tid=%lu table_built=%d elapsed_us=%llu",
+						detail::current_worker_tid(),
+						reg.table_built.load(std::memory_order_acquire) ? 1 : 0,
+						static_cast<unsigned long long>(detail::elapsed_us_since(rebuild_started)));
 				});
+				diag::log_tagged_critical_fmt("xref",
+					"warm_range_exit lo=0x%llX hi=0x%llX reason=rebuild_queued tid=%lu elapsed_us=%llu",
+					static_cast<unsigned long long>(lo_addr),
+					static_cast<unsigned long long>(hi_addr),
+					detail::current_worker_tid(),
+					static_cast<unsigned long long>(detail::elapsed_us_since(started)));
+			}
+			else {
+				diag::log_tagged_critical_fmt("xref",
+					"warm_range_exit lo=0x%llX hi=0x%llX reason=rebuild_in_flight tid=%lu elapsed_us=%llu",
+					static_cast<unsigned long long>(lo_addr),
+					static_cast<unsigned long long>(hi_addr),
+					detail::current_worker_tid(),
+					static_cast<unsigned long long>(detail::elapsed_us_since(started)));
 			}
 			return;
 		}
@@ -922,8 +1056,15 @@ namespace xref_index {
 		}
 
 		for (auto& mod : targets) {
-			detail::schedule_build_locked(mod);
+			detail::schedule_build_locked(mod, lo_addr, hi_addr);
 		}
+		diag::log_tagged_critical_fmt("xref",
+			"warm_range_exit lo=0x%llX hi=0x%llX reason=scheduled targets=%zu tid=%lu elapsed_us=%llu",
+			static_cast<unsigned long long>(lo_addr),
+			static_cast<unsigned long long>(hi_addr),
+			targets.size(),
+			detail::current_worker_tid(),
+			static_cast<unsigned long long>(detail::elapsed_us_since(started)));
 	}
 
 	inline bounded_live_range_result_t build_bounded_live_range(uint64_t lo_addr, uint64_t hi_addr, uint32_t timeout_ms = 2000) {
@@ -932,9 +1073,23 @@ namespace xref_index {
 		result.requested_hi = hi_addr;
 		result.pid = driver_bridge::attached_pid();
 		auto started = std::chrono::steady_clock::now();
+		const bool deadline_enabled = timeout_ms != 0;
+		const auto deadline = started + std::chrono::milliseconds(timeout_ms);
+		auto deadline_expired = [&]() {
+			return deadline_enabled && std::chrono::steady_clock::now() >= deadline;
+		};
 		auto& reg = detail::registry();
 		result.table_built_before = reg.table_built.load(std::memory_order_acquire);
 		result.rebuild_in_flight_before = reg.rebuild_in_flight.load(std::memory_order_acquire);
+		diag::log_tagged_critical_fmt("xref",
+			"bounded_live_range_enter lo=0x%llX hi=0x%llX timeout_ms=%u pid=%u tid=%lu table_built=%d rebuild_in_flight=%d",
+			static_cast<unsigned long long>(lo_addr),
+			static_cast<unsigned long long>(hi_addr),
+			timeout_ms,
+			result.pid,
+			detail::current_worker_tid(),
+			result.table_built_before ? 1 : 0,
+			result.rebuild_in_flight_before ? 1 : 0);
 
 		std::shared_ptr<detail::module_index_t> mod;
 		auto finish = [&](const char* error, bool ok) {
@@ -947,6 +1102,22 @@ namespace xref_index {
 			result.rebuild_in_flight_after = reg.rebuild_in_flight.load(std::memory_order_acquire);
 			result.elapsed_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
 				std::chrono::steady_clock::now() - started).count());
+			diag::log_tagged_critical_fmt("xref",
+				"bounded_live_range_exit ok=%d error=%s module=%s base=0x%llX clipped_lo=0x%llX clipped_hi=0x%llX pages_read=%zu pages_failed=%zu bytes_read=%zu targets=%zu xrefs=%zu pid=%u tid=%lu elapsed_us=%llu",
+				ok ? 1 : 0,
+				result.error.empty() ? "" : result.error.c_str(),
+				result.module.empty() ? "" : result.module.c_str(),
+				static_cast<unsigned long long>(result.module_base),
+				static_cast<unsigned long long>(result.clipped_lo),
+				static_cast<unsigned long long>(result.clipped_hi),
+				result.pages_read,
+				result.pages_failed,
+				result.bytes_read,
+				result.targets_found,
+				result.xrefs_found,
+				result.pid,
+				detail::current_worker_tid(),
+				static_cast<unsigned long long>(result.elapsed_us));
 			return result;
 		};
 
@@ -1012,6 +1183,17 @@ namespace xref_index {
 			sections = pe.sections;
 		if (sections.empty())
 			return finish("pe_sections_unavailable", false);
+		diag::log_tagged_critical_fmt("xref",
+			"bounded_live_range_module module=%s base=0x%llX size=0x%X clipped_lo=0x%llX clipped_hi=0x%llX sections=%zu pid=%u tid=%lu elapsed_us=%llu",
+			result.module.c_str(),
+			static_cast<unsigned long long>(result.module_base),
+			result.module_size,
+			static_cast<unsigned long long>(result.clipped_lo),
+			static_cast<unsigned long long>(result.clipped_hi),
+			sections.size(),
+			result.pid,
+			detail::current_worker_tid(),
+			static_cast<unsigned long long>(detail::elapsed_us_since(started)));
 
 		auto fns = detail::snapshot_functions(result.module_base, result.module_size);
 		std::unordered_map<uint64_t, std::vector<annotation_t>> map;
@@ -1027,17 +1209,62 @@ namespace xref_index {
 			uint64_t cursor = std::max(result.clipped_lo, section_start);
 			const uint64_t end = std::min(result.clipped_hi, section_end);
 			while (cursor < end) {
+				if (deadline_expired())
+					return finish("deadline_before_page_read", false);
 				size_t chunk = page_size;
 				if (cursor + chunk > end)
 					chunk = static_cast<size_t>(end - cursor);
 				std::vector<uint8_t> page_data;
+				const auto page_started = std::chrono::steady_clock::now();
+				diag::log_tagged_critical_fmt("xref",
+					"bounded_live_range_page_pre module=%s base=0x%llX section=0x%llX cursor=0x%llX chunk=%zu pid=%u tid=%lu elapsed_us=%llu",
+					result.module.c_str(),
+					static_cast<unsigned long long>(result.module_base),
+					static_cast<unsigned long long>(section_start),
+					static_cast<unsigned long long>(cursor),
+					chunk,
+					result.pid,
+					detail::current_worker_tid(),
+					static_cast<unsigned long long>(detail::elapsed_us_since(started)));
 				const bool read_ok = driver_bridge::read_memory_for(result.pid, cursor, chunk, page_data);
+				const uint64_t page_elapsed_us = detail::elapsed_us_since(page_started);
 				if (read_ok && !page_data.empty()) {
 					++result.pages_read;
 					result.bytes_read += page_data.size();
+					diag::log_tagged_critical_fmt("xref",
+						"bounded_live_range_page_post module=%s cursor=0x%llX chunk=%zu ok=1 bytes=%zu pages_read=%zu pages_failed=%zu pid=%u tid=%lu page_elapsed_us=%llu elapsed_us=%llu",
+						result.module.c_str(),
+						static_cast<unsigned long long>(cursor),
+						chunk,
+						page_data.size(),
+						result.pages_read,
+						result.pages_failed,
+						result.pid,
+						detail::current_worker_tid(),
+						static_cast<unsigned long long>(page_elapsed_us),
+						static_cast<unsigned long long>(detail::elapsed_us_since(started)));
+					if (deadline_expired())
+						return finish("deadline_after_page_read", false);
 					detail::scan_block_for_xrefs(page_data.data(), page_data.size(), cursor, fns, sections, result.module_base, result.module, map);
+					if (deadline_expired())
+						return finish("deadline_after_page_scan", false);
 				} else {
 					++result.pages_failed;
+					diag::log_tagged_critical_fmt("xref",
+						"bounded_live_range_page_post module=%s cursor=0x%llX chunk=%zu ok=%d bytes=%zu pages_read=%zu pages_failed=%zu pid=%u tid=%lu page_elapsed_us=%llu elapsed_us=%llu",
+						result.module.c_str(),
+						static_cast<unsigned long long>(cursor),
+						chunk,
+						read_ok ? 1 : 0,
+						page_data.size(),
+						result.pages_read,
+						result.pages_failed,
+						result.pid,
+						detail::current_worker_tid(),
+						static_cast<unsigned long long>(page_elapsed_us),
+						static_cast<unsigned long long>(detail::elapsed_us_since(started)));
+					if (deadline_expired())
+						return finish("deadline_after_page_read_failed", false);
 				}
 				cursor += chunk;
 			}

@@ -91,6 +91,7 @@ namespace skill_manager {
 		std::map<std::string, std::shared_ptr<install_request_t>>  install_pending;
 		std::set<std::string>                                      pending_uninstall;
 		bool                                                       preview_rendered = true;
+		int                                                        detail_preview_tab = 0;
 		float                                                      list_split = 0.32f;
 		float                                                      detail_split = 0.40f;
 		int                                                        last_skill_count = 0;
@@ -361,8 +362,8 @@ namespace skill_manager {
 		const float ctl_h = 28.f;
 		const float avail = root_w - pad * 2.f;
 
-		const float search_w = std::max(180.f, (root_w - pad * 6.f) * 0.30f);
-		const float combo_w = 200.f;
+		const float search_w = std::clamp((root_w - pad * 6.f) * 0.30f, 180.f, 260.f);
+		const float combo_w = std::min(200.f, std::max(150.f, avail * 0.58f));
 		const float refresh_w = 110.f;
 		const float addurl_w = 80.f;
 		const float url_w_full = 280.f;
@@ -372,6 +373,96 @@ namespace skill_manager {
 		const bool tb_wrap = (avail < (left_chain + gap + right_chain_full));
 
 		const float row1_y = root_y + 2.f;
+		if (avail < 520.f) {
+			const bool stack_all = avail < 340.f;
+			const float full_w = (std::max)(120.f, avail);
+			ImGui::SetCursorScreenPos(ImVec2(root_x + pad, row1_y));
+			char search_local[256];
+			std::memcpy(search_local, st.search_buf, sizeof(search_local));
+			if (aida::ui::input_text("##sm_search", search_local, sizeof(search_local),
+					"Filter skills", false, ImVec2(full_w, ctl_h))) {
+				std::lock_guard<std::mutex> lk(state_mutex());
+				std::memcpy(st.search_buf, search_local, sizeof(st.search_buf));
+			}
+
+			const float row2_y = row1_y + ctl_h + 6.f;
+			ImGui::SetCursorScreenPos(ImVec2(root_x + pad, row2_y));
+			const float compact_refresh_w = stack_all ? full_w : std::min(refresh_w, 96.f);
+			const float compact_combo_w = stack_all ? full_w : (std::max)(120.f, full_w - gap - compact_refresh_w);
+			ImGui::PushItemWidth(compact_combo_w);
+			std::string current_label = st.agent_filter.empty()
+				? std::string("All agents") : st.agent_filter;
+			if (ImGui::BeginCombo("##sm_agent_filter", current_label.c_str())) {
+				if (ImGui::Selectable("All agents", st.agent_filter.empty()))
+					st.agent_filter.clear();
+				const auto agents = ::aida::agent::primary_agents();
+				for (const auto* a : agents) {
+					if (a == nullptr) continue;
+					const bool sel = (st.agent_filter == a->name);
+					if (ImGui::Selectable(a->name.c_str(), sel))
+						st.agent_filter = a->name;
+				}
+				ImGui::EndCombo();
+			}
+			ImGui::PopItemWidth();
+
+			if (!stack_all)
+				ImGui::SameLine(0.f, gap);
+			else
+				ImGui::SetCursorScreenPos(ImVec2(root_x + pad, row2_y + ctl_h + 6.f));
+			bool refreshing_local = st.refreshing;
+			if (aida::ui::button("Refresh##sm",
+					aida::ui::button_kind_t::secondary,
+					aida::ui::size_t_::sm,
+					ImVec2(compact_refresh_w, ctl_h),
+					false, nullptr, refreshing_local)) {
+				st.refreshing = true;
+				work_queue::post([]() {
+					::aida::skills::reindex();
+					{
+						std::lock_guard<std::mutex> lk(state_mutex());
+						state().last_indexed_unix = static_cast<int64_t>(std::time(nullptr));
+						state().refreshing = false;
+					}
+					toast_notification::push("Skills re-indexed",
+						toast_notification::toast_type_t::info, 2.5f);
+				});
+			}
+
+			const float row3_y = row2_y + (stack_all ? (ctl_h + 6.f) * 2.f : ctl_h + 6.f);
+			ImGui::SetCursorScreenPos(ImVec2(root_x + pad, row3_y));
+			const float compact_add_w = stack_all ? full_w : addurl_w;
+			const float compact_url_w = stack_all ? full_w : (std::max)(120.f, full_w - gap - compact_add_w);
+			ImGui::PushItemWidth(compact_url_w);
+			ImGui::InputTextWithHint("##sm_add_url", "https://host/index.json",
+				st.add_url_buf, sizeof(st.add_url_buf));
+			ImGui::PopItemWidth();
+			if (!stack_all)
+				ImGui::SameLine(0.f, gap);
+			else
+				ImGui::SetCursorScreenPos(ImVec2(root_x + pad, row3_y + ctl_h + 6.f));
+			if (aida::ui::button("Add URL##sm",
+					aida::ui::button_kind_t::primary,
+					aida::ui::size_t_::sm,
+					ImVec2(compact_add_w, ctl_h))) {
+				std::string url(st.add_url_buf);
+				if (!url.empty()) {
+					if (::aida::skills::add_remote_url(url)) {
+						toast_notification::push("Remote URL added",
+							toast_notification::toast_type_t::info, 3.0f);
+						std::memset(st.add_url_buf, 0, sizeof(st.add_url_buf));
+						st.active_tab = source_tab_t::remote;
+						start_remote_fetch(url);
+					} else {
+						toast_notification::push("Add URL failed: " +
+							truncate_text(::aida::skills::last_error(), 160),
+							toast_notification::toast_type_t::error, 5.0f);
+					}
+				}
+			}
+
+			return stack_all ? (toolbar_h + ctl_h * 3.f + 28.f) : (toolbar_h + ctl_h * 2.f + 12.f);
+		}
 
 		ImGui::SetCursorScreenPos(ImVec2(root_x + pad, row1_y));
 		char search_local[256];
@@ -620,8 +711,9 @@ namespace skill_manager {
 		const float tab_h = 28.f;
 		const float list_y = y + tab_h + 4.f;
 		const bool remote_tab = (st.active_tab == source_tab_t::remote);
-		const float remote_panel_h = remote_tab ? 180.f : 0.f;
-		const float list_h = h - tab_h - 4.f - remote_panel_h - (remote_tab ? 6.f : 0.f);
+		const float max_remote_h = (std::max)(0.f, h - tab_h - 56.f);
+		const float remote_panel_h = remote_tab ? std::min(180.f, max_remote_h) : 0.f;
+		const float list_h = (std::max)(48.f, h - tab_h - 4.f - remote_panel_h - (remote_tab ? 6.f : 0.f));
 
 		ImGui::SetCursorScreenPos(ImVec2(x, list_y));
 		ImGui::BeginChild("##sm_list_scroll", ImVec2(w, list_h), false,
@@ -756,14 +848,19 @@ namespace skill_manager {
 				ImGui::PushID(u.c_str());
 				const ImVec2 cs = ImGui::GetCursorScreenPos();
 				const float row_w_inner = w - 16.f;
+				const bool compact_remote_row = row_w_inner < 250.f;
+				const float url_text_w = compact_remote_row ? (row_w_inner - 16.f) : (row_w_inner - 150.f);
 				dl2->AddRectFilled(ImVec2(cs.x + 4.f, cs.y),
-					ImVec2(cs.x + row_w_inner, cs.y + 24.f),
+					ImVec2(cs.x + row_w_inner, cs.y + (compact_remote_row ? 54.f : 24.f)),
 					aida::ui::with_alpha(th.panel_header, 0.7f), 6.f);
 				dl2->AddText(aida::ui::fonts::caption(), 13.f,
 					ImVec2(cs.x + 10.f, cs.y + 6.f),
-					th.text_secondary, truncate_text(u, 80).c_str());
+					th.text_secondary, aida::ui::responsive::ellipsize_middle(
+						u, aida::ui::fonts::caption(), 13.f, (std::max)(60.f, url_text_w)).c_str());
 
-				ImGui::SetCursorScreenPos(ImVec2(cs.x + row_w_inner - 140.f, cs.y));
+				ImGui::SetCursorScreenPos(ImVec2(
+					compact_remote_row ? cs.x + 10.f : cs.x + row_w_inner - 140.f,
+					compact_remote_row ? cs.y + 26.f : cs.y));
 				if (aida::ui::button("Fetch",
 						aida::ui::button_kind_t::secondary,
 						aida::ui::size_t_::sm,
@@ -785,7 +882,7 @@ namespace skill_manager {
 					}
 				}
 
-				ImGui::SetCursorScreenPos(ImVec2(cs.x, cs.y + 28.f));
+				ImGui::SetCursorScreenPos(ImVec2(cs.x, cs.y + (compact_remote_row ? 58.f : 28.f)));
 
 				bool have_index = false;
 				remote_fetch_result_t snap;
@@ -897,14 +994,17 @@ namespace skill_manager {
 				ImVec2(96.f, 24.f))) {
 			open_path_in_shell(meta->file_path, true);
 		}
-		ImGui::SameLine(0.f, 6.f);
+		const bool stack_skill_actions = w < 320.f;
+		if (!stack_skill_actions)
+			ImGui::SameLine(0.f, 6.f);
 		if (aida::ui::button("Open file",
 				aida::ui::button_kind_t::ghost,
 				aida::ui::size_t_::sm,
 				ImVec2(96.f, 24.f))) {
 			open_path_in_shell(meta->file_path, false);
 		}
-		ImGui::SameLine(0.f, 6.f);
+		if (!stack_skill_actions)
+			ImGui::SameLine(0.f, 6.f);
 		const bool en = ::aida::skills::is_enabled(meta->name);
 		if (aida::ui::button(en ? "Disable" : "Enable",
 				en ? aida::ui::button_kind_t::ghost : aida::ui::button_kind_t::primary,
@@ -1056,12 +1156,12 @@ namespace skill_manager {
 
 		const float body_y = root_y + tb_used_h + 6.f;
 		const float body_h = root_h - (tb_used_h + 8.f);
-
-		const float left_w = std::max(280.f, root_w * st.list_split);
-		const float right_w = std::max(300.f, root_w * st.detail_split);
-		const float middle_w = std::max(220.f, root_w - left_w - right_w - pad * 2.f);
-
-		render_left_column(root_x + pad, body_y, left_w, body_h, dt);
+		if (body_h < 120.f) {
+			aida::ui::responsive::draw_clamp_overlay(ImVec2(root_x, root_y),
+				ImVec2(root_w, root_h), "Increase Settings height");
+			ImGui::EndChild();
+			return;
+		}
 
 		std::vector<::aida::skills::skill_metadata_t> all_for_lookup = ::aida::skills::all();
 		const ::aida::skills::skill_metadata_t* meta = nullptr;
@@ -1069,11 +1169,59 @@ namespace skill_manager {
 			meta = find_meta_in_list(all_for_lookup, st.selected_skill_name);
 		}
 
-		const float middle_x = root_x + pad + left_w + pad;
-		render_middle_column(middle_x, body_y, middle_w, body_h, meta, alpha);
+		if (root_w >= 820.f) {
+			const float left_w = std::max(280.f, root_w * st.list_split);
+			const float right_w = std::max(300.f, root_w * st.detail_split);
+			const float middle_w = std::max(220.f, root_w - left_w - right_w - pad * 2.f);
 
-		const float right_x = middle_x + middle_w + pad;
-		render_right_column(right_x, body_y, right_w, body_h, meta, alpha);
+			render_left_column(root_x + pad, body_y, left_w, body_h, dt);
+
+			const float middle_x = root_x + pad + left_w + pad;
+			render_middle_column(middle_x, body_y, middle_w, body_h, meta, alpha);
+
+			const float right_x = middle_x + middle_w + pad;
+			render_right_column(right_x, body_y, right_w, body_h, meta, alpha);
+		} else if (root_w >= 560.f) {
+			const float left_w = std::clamp(root_w * 0.42f, 250.f, 320.f);
+			const float right_w = (std::max)(240.f, root_w - left_w - pad * 3.f);
+			render_left_column(root_x + pad, body_y, left_w, body_h, dt);
+
+			const float right_x = root_x + pad + left_w + pad;
+			const float split_space = (std::max)(120.f, body_h - pad);
+			const float detail_h = (std::max)(80.f, split_space * 0.48f);
+			const float preview_h = (std::max)(80.f, body_h - detail_h - pad);
+			render_middle_column(right_x, body_y, right_w, detail_h, meta, alpha);
+			render_right_column(right_x, body_y + detail_h + pad, right_w, preview_h, meta, alpha);
+		} else {
+			const float stack_w = (std::max)(240.f, root_w - pad * 2.f);
+			const float max_list_h = (std::max)(100.f, body_h - 150.f);
+			const float list_h = std::clamp(body_h * 0.38f, 100.f, (std::min)(260.f, max_list_h));
+			render_left_column(root_x + pad, body_y, stack_w, list_h, dt);
+
+			const float tabs_y = body_y + list_h + pad;
+			ImGui::SetCursorScreenPos(ImVec2(root_x + pad, tabs_y));
+			const float tab_w = (stack_w - 4.f) * 0.5f;
+			if (aida::ui::button("Details##sm_stack_detail",
+					st.detail_preview_tab == 0 ? aida::ui::button_kind_t::primary : aida::ui::button_kind_t::secondary,
+					aida::ui::size_t_::sm,
+					ImVec2(tab_w, 28.f))) {
+				st.detail_preview_tab = 0;
+			}
+			ImGui::SameLine(0.f, 4.f);
+			if (aida::ui::button("Preview##sm_stack_preview",
+					st.detail_preview_tab == 1 ? aida::ui::button_kind_t::primary : aida::ui::button_kind_t::secondary,
+					aida::ui::size_t_::sm,
+					ImVec2(tab_w, 28.f))) {
+				st.detail_preview_tab = 1;
+			}
+
+			const float pane_y = tabs_y + 34.f;
+			const float pane_h = (std::max)(80.f, body_h - list_h - pad - 34.f);
+			if (st.detail_preview_tab == 0)
+				render_middle_column(root_x + pad, pane_y, stack_w, pane_h, meta, alpha);
+			else
+				render_right_column(root_x + pad, pane_y, stack_w, pane_h, meta, alpha);
+		}
 
 		ImGui::EndChild();
 	}

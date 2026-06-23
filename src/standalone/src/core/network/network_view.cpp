@@ -118,6 +118,21 @@ static ImU32 protocol_stripe_color(const std::string& label) {
     return t.text_dim;
 }
 
+struct capture_row_snapshot_t {
+    int packet_index = -1;
+    uint64_t timestamp = 0;
+    std::string src;
+    std::string dst;
+    std::string protocol_label;
+    std::string summary;
+};
+
+struct capture_table_snapshot_t {
+    size_t total_count = 0;
+    int selected_index = -1;
+    std::vector<capture_row_snapshot_t> rows;
+};
+
 static ImU32 status_code_color(int code) {
     const auto& t = aida::ui::resolved();
     if (code >= 200 && code < 300) return t.success;
@@ -434,6 +449,84 @@ static bool filter_text_match(const char* filter, const std::string& text) {
     return lower_text.find(lower_filter) != std::string::npos;
 }
 
+static void clamp_capture_selection_to_buffer_locked(state_t& state) {
+    int count = static_cast<int>(state.captured_packets.size());
+    if (count <= 0) {
+        state.cap_selected = -1;
+        return;
+    }
+    if (state.cap_selected < -1)
+        state.cap_selected = -1;
+    if (state.cap_selected >= count)
+        state.cap_selected = count - 1;
+}
+
+static void shift_capture_selection_after_front_pop_locked(state_t& state) {
+    if (state.cap_selected > 0)
+        --state.cap_selected;
+    else if (state.cap_selected == 0)
+        state.cap_selected = -1;
+}
+
+static std::string capture_row_info_text(const std::string& summary) {
+    if (summary.size() <= 200)
+        return summary;
+    return summary.substr(0, 197) + "...";
+}
+
+static capture_table_snapshot_t snapshot_capture_table(state_t& state, const char* filter_text) {
+    capture_table_snapshot_t snapshot;
+    std::string filter = filter_text ? filter_text : "";
+    std::lock_guard<std::mutex> lock(state.cap_mutex);
+    clamp_capture_selection_to_buffer_locked(state);
+    snapshot.total_count = state.captured_packets.size();
+    snapshot.selected_index = state.cap_selected;
+    snapshot.rows.reserve(state.captured_packets.size());
+
+    bool selected_visible = snapshot.selected_index < 0;
+    for (size_t i = 0; i < state.captured_packets.size(); ++i) {
+        const packet_entry_t& p = state.captured_packets[i];
+        std::string src = format_ip(p.src_addr, 2) + ":" + std::to_string(p.src_port);
+        std::string dst = format_ip(p.dst_addr, 2) + ":" + std::to_string(p.dst_port);
+
+        if (!filter.empty()) {
+            std::string all = src + " " + dst + " " + p.protocol_label + " " + p.summary;
+            if (!filter_text_match(filter.c_str(), all))
+                continue;
+        }
+
+        capture_row_snapshot_t row;
+        row.packet_index = static_cast<int>(i);
+        row.timestamp = p.timestamp;
+        row.src = std::move(src);
+        row.dst = std::move(dst);
+        row.protocol_label = p.protocol_label;
+        row.summary = capture_row_info_text(p.summary);
+        if (row.packet_index == snapshot.selected_index)
+            selected_visible = true;
+        snapshot.rows.push_back(std::move(row));
+    }
+
+    if (!selected_visible) {
+        if (snapshot.rows.empty()) {
+            state.cap_selected = -1;
+        } else {
+            auto it = std::lower_bound(snapshot.rows.begin(), snapshot.rows.end(), snapshot.selected_index,
+                [](const capture_row_snapshot_t& row, int selected) {
+                    return row.packet_index < selected;
+                });
+            if (it == snapshot.rows.end()) {
+                it = snapshot.rows.end();
+                --it;
+            }
+            state.cap_selected = it->packet_index;
+        }
+        snapshot.selected_index = state.cap_selected;
+    }
+
+    return snapshot;
+}
+
 static bool driver_feature_ready(const char* feature, int iter = -1) {
     bool drv_ok = driver_bridge::using_kernel_driver();
     bool auth_ok = drv_ok && standalone_license::is_valid();
@@ -586,8 +679,10 @@ static void capture_poll_thread(state_t& state) {
                         entry.summary = det.summary;
 
                         state.captured_packets.push_back(std::move(entry));
-                        while (state.captured_packets.size() > state.cap_max_packets)
+                        while (state.captured_packets.size() > state.cap_max_packets) {
+                            shift_capture_selection_after_front_pop_locked(state);
                             state.captured_packets.pop_front();
+                        }
                     }
                     if (poll_iter <= 5 || (poll_iter % 50) == 0) {
                         diag::log_tagged_fmt("network", "capture_poll_batch packets=%zu total_buffered=%zu",
@@ -2060,29 +2155,37 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
     float detail_h = h - split_y - 30.f;
 
 
-    ImDrawList* dl = ImGui::GetWindowDrawList();
+    capture_table_snapshot_t cap_snapshot = snapshot_capture_table(state, state.cap_filter_text);
 
     ImGui::BeginChild("##cap_list", ImVec2(w - 4.f, list_h), false,
                       ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar);
 
-    {
-        std::lock_guard<std::mutex> lock(state.cap_mutex);
+    if (cap_snapshot.total_count == 0) {
         ImVec2 list_org = ImGui::GetWindowPos();
         ImVec2 list_sz  = ImGui::GetWindowSize();
+        aida::ui::empty_state::config_t cfg;
+        cfg.glyph = aida::ui::empty_state::glyph_t::network;
+        cfg.title = cap_running ? "Waiting for packets..." : "Capture not running";
+        cfg.body  = cap_running
+            ? "Packets will stream in here as they are observed by the kernel driver."
+            : "Press Start Capture above to begin recording network traffic.";
+        aida::ui::empty_state::render(ImVec2(list_org.x, list_org.y), ImVec2(list_sz.x, list_h), cfg);
+        ImGui::Dummy(ImVec2(0.f, list_h));
+        ImGui::EndChild();
+        ImGui::EndChild();
+        return;
+    }
 
-        if (state.captured_packets.empty()) {
-            aida::ui::empty_state::config_t cfg;
-            cfg.glyph = aida::ui::empty_state::glyph_t::network;
-            cfg.title = cap_running ? "Waiting for packets..." : "Capture not running";
-            cfg.body  = cap_running
-                ? "Packets will stream in here as they are observed by the kernel driver."
-                : "Press Start Capture above to begin recording network traffic.";
-            aida::ui::empty_state::render(ImVec2(list_org.x, list_org.y), ImVec2(list_sz.x, list_h), cfg);
-            ImGui::Dummy(ImVec2(0.f, list_h));
-            ImGui::EndChild();
-            ImGui::EndChild();
-            return;
-        }
+    if (cap_snapshot.rows.empty()) {
+        ImVec2 list_org = ImGui::GetWindowPos();
+        ImVec2 list_sz  = ImGui::GetWindowSize();
+        aida::ui::empty_state::config_t cfg;
+        cfg.glyph = aida::ui::empty_state::glyph_t::network;
+        cfg.title = "No packets match filter";
+        cfg.body  = "Captured packets remain buffered; clear the text filter to show them again.";
+        aida::ui::empty_state::render(ImVec2(list_org.x, list_org.y), ImVec2(list_sz.x, list_h), cfg);
+        ImGui::Dummy(ImVec2(0.f, list_h));
+    } else {
 
         ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(8.f, 7.f));
         ImGui::PushStyleColor(ImGuiCol_TableHeaderBg, aida::ui::with_alpha(th.panel_header, alpha));
@@ -2100,6 +2203,7 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
             ImGuiTableFlags_ScrollY;
 
         bool table_open = ImGui::BeginTable("##cap_table", 6, table_flags, ImVec2(0.f, 0.f));
+        int pending_selection = -1;
         if (table_open) {
             ImGui::TableSetupColumn("#",     ImGuiTableColumnFlags_WidthFixed,   48.f);
             ImGui::TableSetupColumn("Time",  ImGuiTableColumnFlags_WidthFixed,   110.f);
@@ -2110,86 +2214,99 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
             ImGui::TableSetupScrollFreeze(0, 1);
             ImGui::TableHeadersRow();
 
-            int cap_visible_row = 0;
-            for (int i = 0; i < static_cast<int>(state.captured_packets.size()); i++) {
-                auto& p = state.captured_packets[static_cast<size_t>(i)];
+            ImDrawList* table_dl = ImGui::GetWindowDrawList();
+            ImGuiListClipper clipper;
+            clipper.Begin(static_cast<int>(cap_snapshot.rows.size()));
+            while (clipper.Step()) {
+                for (int visible_i = clipper.DisplayStart; visible_i < clipper.DisplayEnd; ++visible_i) {
+                    const capture_row_snapshot_t& row = cap_snapshot.rows[static_cast<size_t>(visible_i)];
 
-                std::string src_str = format_ip(p.src_addr, 2) + ":" + std::to_string(p.src_port);
-                std::string dst_str = format_ip(p.dst_addr, 2) + ":" + std::to_string(p.dst_port);
+                    float row_alpha = 1.f;
+                    float row_yoff = 0.f;
+                    compute_row_entrance(s_cap_rows, cap_snapshot.total_count, row_alpha, row_yoff, row.packet_index);
+                    (void)row_yoff;
+                    float r_alpha = alpha * row_alpha;
 
-                if (state.cap_filter_text[0]) {
-                    std::string all = src_str + " " + dst_str + " " + p.protocol_label + " " + p.summary;
-                    if (!filter_text_match(state.cap_filter_text, all)) continue;
-                }
+                    ImGui::TableNextRow();
 
-                float row_alpha = 1.f;
-                float row_yoff = 0.f;
-                compute_row_entrance(s_cap_rows, state.captured_packets.size(), row_alpha, row_yoff, i);
-                float r_alpha = alpha * row_alpha;
+                    bool selected = (cap_snapshot.selected_index == row.packet_index);
+                    ImU32 proto_col = protocol_stripe_color(row.protocol_label);
+                    if (selected) {
+                        ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
+                                               aida::ui::with_alpha(th.selection, r_alpha * 0.55f));
+                    }
 
-                ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::PushID(row.packet_index);
+                    ImGuiSelectableFlags sel_flags =
+                        ImGuiSelectableFlags_SpanAllColumns |
+                        ImGuiSelectableFlags_AllowItemOverlap;
+                    ImU32 dim_col = aida::ui::with_alpha(th.text_dim, r_alpha);
+                    ImVec4 transparent(0.f, 0.f, 0.f, 0.f);
+                    ImGui::PushStyleColor(ImGuiCol_Header, transparent);
+                    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, transparent);
+                    ImGui::PushStyleColor(ImGuiCol_HeaderActive, transparent);
+                    float row_h = ImGui::GetTextLineHeight() + ImGui::GetStyle().CellPadding.y * 2.f;
+                    if (ImGui::Selectable("##row_select", selected, sel_flags, ImVec2(0.f, row_h))) {
+                        pending_selection = row.packet_index;
+                        cap_snapshot.selected_index = row.packet_index;
+                        selected = true;
+                        ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
+                                               aida::ui::with_alpha(th.selection, r_alpha * 0.55f));
+                    }
+                    bool hovered = ImGui::IsItemHovered();
+                    ImGui::PopStyleColor(3);
 
-                bool selected = (state.cap_selected == i);
-                ImU32 proto_col = protocol_stripe_color(p.protocol_label);
+                    if (hovered && !selected) {
+                        ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
+                                               aida::ui::with_alpha(th.hover_wash, r_alpha * 0.45f));
+                    }
 
-                ImGui::TableSetColumnIndex(0);
-                ImGui::PushID(i);
-                char sel_label[32];
-                snprintf(sel_label, sizeof(sel_label), "%d##sel_%d", i + 1, i);
-                ImGuiSelectableFlags sel_flags = ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowItemOverlap;
-                ImU32 dim_col = aida::ui::with_alpha(th.text_dim, r_alpha);
-                ImGui::PushStyleColor(ImGuiCol_Text, dim_col);
-                if (ImGui::Selectable(sel_label, selected, sel_flags)) {
-                    state.cap_selected = i;
-                }
-                ImGui::PopStyleColor();
-                ImVec2 row_min = ImGui::GetItemRectMin();
-                ImVec2 row_max = ImGui::GetItemRectMax();
-                row_max.x = list_org.x + list_sz.x;
-                dl->AddRectFilled(ImVec2(row_min.x, row_min.y),
-                                  ImVec2(row_min.x + 3.f, row_max.y),
-                                  aida::ui::with_alpha(proto_col, r_alpha));
-                if (selected) {
-                    dl->AddRectFilled(ImVec2(row_min.x + 3.f, row_min.y), row_max,
-                                      aida::ui::with_alpha(th.selection, r_alpha * 0.55f), 0.f);
-                }
+                    ImVec2 row_min = ImGui::GetItemRectMin();
+                    ImVec2 row_max = ImGui::GetItemRectMax();
+                    ImVec2 stripe_min(row_min.x, row_min.y);
+                    ImVec2 stripe_max(row_min.x + 3.f, row_max.y);
+                    table_dl->PushClipRect(stripe_min, ImVec2(stripe_max.x, stripe_max.y), true);
+                    table_dl->AddRectFilled(stripe_min, stripe_max,
+                                            aida::ui::with_alpha(proto_col, r_alpha));
+                    table_dl->PopClipRect();
 
-                ImU32 txt_col = aida::ui::with_alpha(selected ? th.text_primary : th.text_secondary, r_alpha);
+                    ImU32 txt_col = aida::ui::with_alpha(selected ? th.text_primary : th.text_secondary, r_alpha);
+                    ImGui::SetCursorScreenPos(ImVec2(row_min.x + 8.f, row_min.y + ImGui::GetStyle().CellPadding.y));
+                    ImGui::PushStyleColor(ImGuiCol_Text, dim_col);
+                    ImGui::Text("%d", row.packet_index + 1);
+                    ImGui::PopStyleColor();
 
-                ImGui::TableSetColumnIndex(1);
-                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(dim_col), "%s",
-                                   format_timestamp(p.timestamp).c_str());
+                    ImGui::TableSetColumnIndex(1);
+                    table_text(format_timestamp(row.timestamp), dim_col);
 
-                ImGui::TableSetColumnIndex(2);
-                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(txt_col), "%s", src_str.c_str());
+                    ImGui::TableSetColumnIndex(2);
+                    table_text(row.src, txt_col);
 
-                ImGui::TableSetColumnIndex(3);
-                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(txt_col), "%s", dst_str.c_str());
+                    ImGui::TableSetColumnIndex(3);
+                    table_text(row.dst, txt_col);
 
-                ImGui::TableSetColumnIndex(4);
-                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(proto_col, r_alpha)),
-                                   "%s", p.protocol_label.c_str());
+                    ImGui::TableSetColumnIndex(4);
+                    table_text(row.protocol_label, aida::ui::with_alpha(proto_col, r_alpha));
 
-                ImGui::TableSetColumnIndex(5);
-                std::string info = p.summary;
-                if (info.size() > 200) info = info.substr(0, 197) + "...";
-                ImU32 info_col = aida::ui::with_alpha(th.text_secondary, r_alpha);
-                if (!info.empty()) {
-                    const char* methods[] = {"GET ", "POST ", "PUT ", "DELETE ", "PATCH ", "HEAD ", "OPTIONS "};
-                    for (auto* m : methods) {
-                        if (info.compare(0, strlen(m), m) == 0) {
-                            info_col = ui_anim::http_method_color(m, r_alpha);
-                            break;
+                    ImGui::TableSetColumnIndex(5);
+                    ImU32 info_col = aida::ui::with_alpha(th.text_secondary, r_alpha);
+                    if (!row.summary.empty()) {
+                        const char* methods[] = {"GET ", "POST ", "PUT ", "DELETE ", "PATCH ", "HEAD ", "OPTIONS "};
+                        for (auto* m : methods) {
+                            if (row.summary.compare(0, strlen(m), m) == 0) {
+                                info_col = ui_anim::http_method_color(m, r_alpha);
+                                break;
+                            }
                         }
                     }
-                }
-                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(info_col), "%s", info.c_str());
+                    table_text(row.summary, info_col);
 
-                ImGui::PopID();
-                cap_visible_row++;
+                    ImGui::PopID();
+                }
             }
 
-            if (state.cap_auto_scroll && !state.captured_packets.empty()) {
+            if (state.cap_auto_scroll && !cap_snapshot.rows.empty()) {
                 float scroll_max_y = ImGui::GetScrollMaxY();
                 float scroll_y = ImGui::GetScrollY();
                 bool at_bottom = (scroll_max_y <= 0.f) || ((scroll_max_y - scroll_y) <= 4.f);
@@ -2202,6 +2319,14 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
             ImGui::EndTable();
         }
 
+        if (pending_selection >= 0) {
+            std::lock_guard<std::mutex> lock(state.cap_mutex);
+            if (pending_selection < static_cast<int>(state.captured_packets.size()))
+                state.cap_selected = pending_selection;
+            else
+                clamp_capture_selection_to_buffer_locked(state);
+        }
+
         ImGui::PopStyleColor(3);
         ImGui::PopStyleVar();
     }
@@ -2211,6 +2336,7 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
 
     ImGui::Spacing();
     {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
         ImVec2 wp = ImGui::GetWindowPos();
         dl->AddLine(ImVec2(wp.x + 2.f, wp.y + ImGui::GetCursorPosY()),
                     ImVec2(wp.x + w - 2.f, wp.y + ImGui::GetCursorPosY()),
@@ -2222,6 +2348,7 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
         ImGui::BeginChild("##cap_detail", ImVec2(w - 4.f, detail_h), false, ImGuiWindowFlags_NoBackground);
 
         std::lock_guard<std::mutex> lock2(state.cap_mutex);
+        clamp_capture_selection_to_buffer_locked(state);
         if (state.cap_selected >= 0 && state.cap_selected < static_cast<int>(state.captured_packets.size())) {
             auto& p = state.captured_packets[static_cast<size_t>(state.cap_selected)];
 

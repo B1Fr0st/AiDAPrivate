@@ -884,6 +884,89 @@ namespace {
 		const float right_x = middle_x + middle_w + 14.f;
 		const float right_w = card_w - (right_x - card_a.x) - 16.f;
 		if (right_w < 100.f) {
+			const float compact_x = card_a.x + 14.f;
+			const float compact_w = (std::max)(120.f, card_w - 28.f);
+			ImGui::SetCursorScreenPos(ImVec2(compact_x, card_a.y + 76.f));
+			ImGui::PushID(provider.id.c_str());
+			ImGui::PushItemWidth(compact_w);
+			const std::string preview = current_model ? current_model->name : std::string("(no model)");
+			const std::string combo_id = std::string("##model_compact_") + provider.id;
+			if (ImGui::BeginCombo(combo_id.c_str(), preview.c_str())) {
+				const auto models = collect_models_sorted(provider.id);
+				for (const auto* m : models) {
+					const bool is_sel = (current_model_id == m->id);
+					char label[160];
+					std::snprintf(label, sizeof(label), "%s  -  %s##%s",
+						m->name.c_str(),
+						format_cost_pair(m->cost.input_per_million, m->cost.output_per_million).c_str(),
+						m->id.c_str());
+					ImGui::PushID(m->id.c_str());
+					if (ImGui::Selectable(label, is_sel)) {
+						set_preferred_model_for(provider.id, m->id);
+						g_sa_settings.save();
+					}
+					if (is_sel)
+						ImGui::SetItemDefaultFocus();
+					ImGui::PopID();
+				}
+				ImGui::EndCombo();
+			}
+			ImGui::PopItemWidth();
+
+			const std::string test_key = current_model_id.empty()
+				? std::string()
+				: (provider.id + std::string("/") + current_model_id);
+			bool test_running = false;
+			if (!test_key.empty()) {
+				std::lock_guard<std::mutex> lk(st.mtx);
+				auto fit = st.in_flight_tests.find(test_key);
+				if (fit != st.in_flight_tests.end() && fit->second)
+					test_running = fit->second->load();
+			}
+			ImGui::SetCursorScreenPos(ImVec2(compact_x, card_a.y + 112.f));
+			if (aida::ui::button(test_running ? "Testing" : "Test",
+					aida::ui::button_kind_t::ghost,
+					aida::ui::size_t_::sm,
+					ImVec2(78.f, 24.f),
+					false, nullptr, test_running)) {
+				if (!test_running && !current_model_id.empty())
+					run_test_connection(provider.id, current_model_id);
+			}
+			ImGui::SameLine(0.f, 6.f);
+			const bool is_default = (g_sa_settings.default_provider_id == provider.id);
+			if (aida::ui::button(is_default ? "Default" : "Set default",
+					is_default ? aida::ui::button_kind_t::primary : aida::ui::button_kind_t::secondary,
+					aida::ui::size_t_::sm,
+					ImVec2(96.f, 24.f))) {
+				if (!current_model_id.empty()) {
+					g_sa_settings.set_selection(provider.id, current_model_id);
+					g_sa_settings.save();
+					aida::events::model_changed_t evt;
+					evt.session_id.clear();
+					evt.provider_id = provider.id;
+					evt.model_id = current_model_id;
+					aida::events::publish(aida::events::event_model_changed, evt);
+					toast_notification::push(std::string("Default set: ") + display_name + " / " + current_model_id,
+						toast_notification::toast_type_t::info, 3.5f);
+				} else {
+					toast_notification::push("Pick a model first",
+						toast_notification::toast_type_t::warning, 3.0f);
+				}
+			}
+			ImGui::SameLine(0.f, 6.f);
+			if (aida::ui::button(selected ? "Hide" : "Details",
+					aida::ui::button_kind_t::ghost,
+					aida::ui::size_t_::sm,
+					ImVec2(78.f, 24.f))) {
+				if (selected) {
+					st.selected_detail_provider_id.clear();
+					st.detail_buffers_loaded = false;
+				} else {
+					st.selected_detail_provider_id = provider.id;
+					load_detail_buffers(provider.id);
+				}
+			}
+			ImGui::PopID();
 			if (clicked) {
 				if (selected) {
 					st.selected_detail_provider_id.clear();
@@ -1108,8 +1191,9 @@ namespace {
 			ImVec2(pane_w - 28.f, 100.f));
 
 		ImGui::SetCursorScreenPos(ImVec2(a.x + 14.f, a.y + 230.f));
+		const bool detail_actions_stack = pane_w < 330.f;
 		if (aida::ui::button("Save", aida::ui::button_kind_t::primary,
-				aida::ui::size_t_::md, ImVec2(110.f, 28.f))) {
+				aida::ui::size_t_::md, ImVec2(detail_actions_stack ? (std::min)(pane_w - 28.f, 140.f) : 110.f, 28.f))) {
 			const std::string base = sa_settings_detail::trim(std::string(st.detail_base_url_buf));
 			if (base.empty())
 				g_sa_settings.provider_base_url_overrides.erase(st.selected_detail_provider_id);
@@ -1127,9 +1211,10 @@ namespace {
 					toast_notification::toast_type_t::info, 3.0f);
 			}
 		}
-		ImGui::SameLine(0.f, 8.f);
+		if (!detail_actions_stack)
+			ImGui::SameLine(0.f, 8.f);
 		if (aida::ui::button("Reset", aida::ui::button_kind_t::secondary,
-				aida::ui::size_t_::md, ImVec2(110.f, 28.f))) {
+				aida::ui::size_t_::md, ImVec2(detail_actions_stack ? (std::min)(pane_w - 28.f, 140.f) : 110.f, 28.f))) {
 			g_sa_settings.provider_base_url_overrides.erase(st.selected_detail_provider_id);
 			g_sa_settings.provider_headers_overrides.erase(st.selected_detail_provider_id);
 			g_sa_settings.save();
@@ -1137,14 +1222,15 @@ namespace {
 			toast_notification::push("Provider overrides cleared",
 				toast_notification::toast_type_t::info, 3.0f);
 		}
-		ImGui::SameLine(0.f, 12.f);
+		if (!detail_actions_stack)
+			ImGui::SameLine(0.f, 12.f);
 		aida::ui::toggle_switch("Show raw model.json", &st.show_raw_model_json,
 			aida::ui::size_t_::sm);
 
 		if (st.show_raw_model_json) {
 			const std::string mid = preferred_model_for(st.selected_detail_provider_id);
 			const std::string raw = raw_model_json_for(st.selected_detail_provider_id, mid);
-			ImGui::SetCursorScreenPos(ImVec2(a.x + 14.f, a.y + 268.f));
+			ImGui::SetCursorScreenPos(ImVec2(a.x + 14.f, a.y + (detail_actions_stack ? 326.f : 268.f)));
 			ImGui::PushTextWrapPos(a.x + pane_w - 14.f);
 			ImGui::PushStyleColor(ImGuiCol_Text,
 				ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)));
@@ -1233,8 +1319,10 @@ void render(float panel_w, float panel_h)
 
 	const float toolbar_h = 36.f;
 	const float pad = 12.f;
+	const bool toolbar_stack = root_w < 430.f;
+	const float toolbar_used_h = toolbar_stack ? 72.f : toolbar_h;
 
-	const float search_w = (root_w - pad * 3.f) * 0.62f;
+	const float search_w = toolbar_stack ? (std::max)(140.f, root_w - pad * 2.f) : (root_w - pad * 3.f) * 0.62f;
 	ImGui::SetCursorScreenPos(ImVec2(root_x + pad, root_y + 4.f));
 	char search_local[128];
 	std::memcpy(search_local, st.search_buf, sizeof(search_local));
@@ -1245,13 +1333,14 @@ void render(float panel_w, float panel_h)
 	}
 
 	const float btn_w = 220.f;
-	const float btn_x = root_x + root_w - pad - btn_w;
-	ImGui::SetCursorScreenPos(ImVec2(btn_x, root_y + 4.f));
+	const float refresh_w = toolbar_stack ? (std::max)(140.f, root_w - pad * 2.f) : btn_w;
+	const float btn_x = toolbar_stack ? (root_x + pad) : (root_x + root_w - pad - btn_w);
+	ImGui::SetCursorScreenPos(ImVec2(btn_x, root_y + (toolbar_stack ? 40.f : 4.f)));
 	const bool refreshing = st.refresh.in_flight.load();
 	if (aida::ui::button(refreshing ? "Refreshing" : "Refresh from models.dev",
 			aida::ui::button_kind_t::secondary,
 			aida::ui::size_t_::md,
-			ImVec2(btn_w, 30.f),
+			ImVec2(refresh_w, 30.f),
 			false, nullptr, refreshing)) {
 		if (!refreshing)
 			start_refresh_thread();
@@ -1267,11 +1356,12 @@ void render(float panel_w, float panel_h)
 			filtered.push_back(&p);
 	}
 
-	const float body_y = root_y + toolbar_h + 8.f;
+	const float body_y = root_y + toolbar_used_h + 8.f;
 	const bool detail_open = !st.selected_detail_provider_id.empty();
-	const float detail_w = detail_open ? std::min(420.f, root_w * 0.34f) : 0.f;
-	const float list_w = root_w - detail_w - (detail_open ? pad : 0.f);
-	const float body_h = root_h - (toolbar_h + 8.f) - 36.f;
+	const bool inline_detail = detail_open && root_w < 700.f;
+	const float detail_w = (detail_open && !inline_detail) ? std::min(420.f, root_w * 0.34f) : 0.f;
+	const float list_w = root_w - detail_w - ((detail_open && !inline_detail) ? pad : 0.f);
+	const float body_h = root_h - (toolbar_used_h + 8.f) - 36.f;
 
 	ImGui::SetCursorScreenPos(ImVec2(root_x, body_y));
 	ImGui::BeginChild("##provider_list_scroll", ImVec2(list_w, body_h), false,
@@ -1279,7 +1369,7 @@ void render(float panel_w, float panel_h)
 
 	const float list_inner_w = list_w - pad * 2.f;
 	const float card_w = list_inner_w;
-	const float card_h = 128.f;
+	const float card_h = card_w < 420.f ? 168.f : 128.f;
 	const float gap = 12.f;
 
 	if (filtered.empty()) {
@@ -1301,14 +1391,17 @@ void render(float panel_w, float panel_h)
 		ImGui::Dummy(ImVec2(pad, 0.f));
 		ImGui::SameLine();
 		const ImVec2 sp = ImGui::GetCursorScreenPos();
+		const bool selected_inline = inline_detail && st.selected_detail_provider_id == prov->id;
 		render_provider_card(sp.x, sp.y, card_w, card_h, *prov, alpha, max_cost, dt);
+		if (selected_inline)
+			render_detail_pane(sp.x, sp.y + card_h + 6.f, card_w, 360.f, alpha);
 		ImGui::SetCursorScreenPos(sp);
-		ImGui::Dummy(ImVec2(card_w, card_h + gap));
+		ImGui::Dummy(ImVec2(card_w, card_h + gap + (selected_inline ? 368.f : 0.f)));
 	}
 
 	ImGui::EndChild();
 
-	if (detail_open) {
+	if (detail_open && !inline_detail) {
 		const float detail_x = root_x + list_w + pad * 0.5f;
 		render_detail_pane(detail_x, body_y, detail_w, body_h, alpha);
 	}

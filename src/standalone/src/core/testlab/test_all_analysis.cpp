@@ -258,6 +258,397 @@ static uint64_t remote_module_base_ci(uint32_t pid, const char* module_fragment)
     return 0;
 }
 
+static std::wstring current_module_path_wide() {
+    std::vector<wchar_t> buf(MAX_PATH);
+    for (;;) {
+        SetLastError(ERROR_SUCCESS);
+        DWORD len = GetModuleFileNameW(nullptr, buf.data(), static_cast<DWORD>(buf.size()));
+        if (len == 0)
+            return {};
+        if (static_cast<size_t>(len) < buf.size() - 1)
+            return std::wstring(buf.data(), len);
+        buf.resize(buf.size() * 2);
+        if (buf.size() > 32768)
+            return {};
+    }
+}
+
+static std::wstring parent_path_wide(const std::wstring& path) {
+    if (path.empty())
+        return {};
+    std::filesystem::path p(path);
+    std::filesystem::path parent = p.parent_path();
+    return parent.wstring();
+}
+
+static std::wstring join_path_wide(const std::wstring& base, const std::wstring& leaf) {
+    if (base.empty())
+        return leaf;
+    std::filesystem::path p(base);
+    p /= leaf;
+    return p.wstring();
+}
+
+static bool file_exists_wide(const std::wstring& path) {
+    if (path.empty())
+        return false;
+    DWORD attrs = GetFileAttributesW(path.c_str());
+    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+static bool dir_exists_wide(const std::wstring& path) {
+    if (path.empty())
+        return false;
+    DWORD attrs = GetFileAttributesW(path.c_str());
+    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+static std::wstring read_env_wide_local(const wchar_t* name) {
+    if (!name || !name[0])
+        return {};
+    DWORD need = GetEnvironmentVariableW(name, nullptr, 0);
+    if (need == 0)
+        return {};
+    std::wstring value(need, L'\0');
+    DWORD got = GetEnvironmentVariableW(name, value.data(), need);
+    if (got == 0 || got >= need)
+        return {};
+    value.resize(got);
+    return value;
+}
+
+static void add_integrity_target_candidate(std::vector<std::pair<std::wstring, std::string>>& candidates,
+                                           const std::wstring& path,
+                                           const char* label) {
+    if (!path.empty())
+        candidates.emplace_back(path, label ? label : "candidate");
+}
+
+static void add_integrity_target_root_candidates(std::vector<std::pair<std::wstring, std::string>>& candidates,
+                                                 const std::wstring& root,
+                                                 const char* label) {
+    if (root.empty())
+        return;
+    std::string prefix = label ? label : "root";
+    add_integrity_target_candidate(candidates, join_path_wide(root, L"AiDA_TestTarget.exe"), (prefix + "/direct").c_str());
+    add_integrity_target_candidate(candidates, join_path_wide(join_path_wide(root, L"Release"), L"AiDA_TestTarget.exe"), (prefix + "/Release").c_str());
+    add_integrity_target_candidate(candidates, join_path_wide(join_path_wide(root, L"Debug"), L"AiDA_TestTarget.exe"), (prefix + "/Debug").c_str());
+    add_integrity_target_candidate(candidates, join_path_wide(join_path_wide(root, L"RelWithDebInfo"), L"AiDA_TestTarget.exe"), (prefix + "/RelWithDebInfo").c_str());
+    add_integrity_target_candidate(candidates, join_path_wide(join_path_wide(join_path_wide(root, L"build-ninja"), L"Release"), L"AiDA_TestTarget.exe"), (prefix + "/build-ninja/Release").c_str());
+    add_integrity_target_candidate(candidates, join_path_wide(join_path_wide(root, L"build-ninja"), L"AiDA_TestTarget.exe"), (prefix + "/build-ninja").c_str());
+    add_integrity_target_candidate(candidates, join_path_wide(join_path_wide(root, L"deps"), L"AiDA_TestTarget.exe"), (prefix + "/deps").c_str());
+    add_integrity_target_candidate(candidates, join_path_wide(join_path_wide(join_path_wide(root, L"package"), L"deps"), L"AiDA_TestTarget.exe"), (prefix + "/package/deps").c_str());
+}
+
+static std::wstring find_integrity_test_target(HANDLE hf, const char* tag) {
+    std::vector<std::pair<std::wstring, std::string>> candidates;
+    const std::wstring env = read_env_wide_local(L"AIDA_TEST_TARGET");
+    if (!env.empty()) {
+        if (dir_exists_wide(env))
+            add_integrity_target_root_candidates(candidates, env, "AIDA_TEST_TARGET");
+        else
+            add_integrity_target_candidate(candidates, env, "AIDA_TEST_TARGET");
+    }
+
+    const std::wstring module_path = current_module_path_wide();
+    const std::wstring module_dir = parent_path_wide(module_path);
+    if (!module_dir.empty())
+        add_integrity_target_root_candidates(candidates, module_dir, "module_dir");
+
+    wchar_t cwd_buf[MAX_PATH] = {};
+    DWORD cwd_len = GetCurrentDirectoryW(MAX_PATH, cwd_buf);
+    if (cwd_len != 0 && cwd_len < MAX_PATH)
+        add_integrity_target_root_candidates(candidates, cwd_buf, "cwd");
+
+    std::wstring cursor = module_dir;
+    for (int i = 0; i < 8 && !cursor.empty(); ++i) {
+        char label[64] = {};
+        _snprintf_s(label, sizeof(label), _TRUNCATE, "module_parent_%02d", i);
+        add_integrity_target_root_candidates(candidates, cursor, label);
+        std::wstring parent = parent_path_wide(cursor);
+        if (parent.empty() || _wcsicmp(parent.c_str(), cursor.c_str()) == 0)
+            break;
+        cursor = parent;
+    }
+
+    add_integrity_target_candidate(candidates, L"C:\\Users\\ruar1337\\AiDAPrivate\\build-ninja\\Release\\AiDA_TestTarget.exe", "fallback/build-ninja/Release");
+    add_integrity_target_candidate(candidates, L"C:\\Users\\ruar1337\\AiDAPrivate\\build-ninja\\AiDA_TestTarget.exe", "fallback/build-ninja");
+
+    for (const auto& candidate : candidates) {
+        const bool exists = file_exists_wide(candidate.first);
+        log_msg(hf, tag, "SIDE-FIXTURE-TARGET-CANDIDATE -- label=%s exists=%d path=%s",
+            candidate.second.c_str(),
+            exists ? 1 : 0,
+            wide_to_utf8_lossy(candidate.first).c_str());
+        if (exists)
+            return candidate.first;
+    }
+
+    log_msg(hf, tag, "FAIL -- AiDA_TestTarget.exe sidecar not found candidates=%zu module_path=%s cwd_len=%lu",
+        candidates.size(),
+        wide_to_utf8_lossy(module_path).c_str(),
+        static_cast<unsigned long>(cwd_len));
+    return {};
+}
+
+static std::wstring make_integrity_sidecar_log_path() {
+    wchar_t temp[MAX_PATH] = {};
+    DWORD temp_len = GetTempPathW(MAX_PATH, temp);
+    std::error_code temp_ec;
+    std::filesystem::path root = (temp_len != 0 && temp_len < MAX_PATH) ? std::filesystem::path(temp) : std::filesystem::temp_directory_path(temp_ec);
+    if (root.empty())
+        root = std::filesystem::current_path(temp_ec);
+    if (root.empty())
+        root = L".";
+    root /= L"AiDA_TestLab";
+    std::error_code ec;
+    std::filesystem::create_directories(root, ec);
+    wchar_t file[128] = {};
+    _snwprintf_s(file, _TRUNCATE, L"integrity_sidecar_%lu_%llu.log",
+        static_cast<unsigned long>(GetCurrentProcessId()),
+        static_cast<unsigned long long>(GetTickCount64()));
+    root /= file;
+    return root.wstring();
+}
+
+static bool env_entry_matches_key(const wchar_t* entry, const wchar_t* key) {
+    if (!entry || !key || !key[0])
+        return false;
+    const size_t key_len = std::wcslen(key);
+    return _wcsnicmp(entry, key, key_len) == 0 && entry[key_len] == L'=';
+}
+
+static std::vector<wchar_t> build_integrity_sidecar_environment(const std::vector<std::pair<std::wstring, std::wstring>>& overrides) {
+    std::vector<wchar_t> block;
+    wchar_t* inherited = GetEnvironmentStringsW();
+    if (inherited) {
+        const wchar_t* p = inherited;
+        while (*p) {
+            bool skip = false;
+            for (const auto& kv : overrides) {
+                if (env_entry_matches_key(p, kv.first.c_str())) {
+                    skip = true;
+                    break;
+                }
+            }
+            const size_t len = std::wcslen(p) + 1;
+            if (!skip)
+                block.insert(block.end(), p, p + len);
+            p += len;
+        }
+        FreeEnvironmentStringsW(inherited);
+    }
+    for (const auto& kv : overrides) {
+        if (kv.first.empty())
+            continue;
+        block.insert(block.end(), kv.first.begin(), kv.first.end());
+        block.push_back(L'=');
+        block.insert(block.end(), kv.second.begin(), kv.second.end());
+        block.push_back(L'\0');
+    }
+    block.push_back(L'\0');
+    return block;
+}
+
+struct system_export_resolution_t {
+    uint64_t address = 0;
+    uint64_t local_rva = 0;
+    std::string module_name;
+    const char* method = "unresolved";
+    bool local_export_ok = false;
+    bool module_seen = false;
+    size_t module_count = 0;
+    uint32_t slow_attempts = 0;
+    long long local_us = 0;
+    long long enum_us = 0;
+    long long slow_us = 0;
+};
+
+static const wchar_t* local_system_module_wide(const char* module_name) {
+    if (!module_name)
+        return nullptr;
+    if (_stricmp(module_name, "kernel32.dll") == 0)
+        return L"kernel32.dll";
+    if (_stricmp(module_name, "kernelbase.dll") == 0)
+        return L"kernelbase.dll";
+    if (_stricmp(module_name, "ntdll.dll") == 0)
+        return L"ntdll.dll";
+    return nullptr;
+}
+
+static bool module_matches_name_ci(const driver_bridge::module_info_t& mod, const char* module_name) {
+    if (!module_name || !module_name[0])
+        return false;
+    return _stricmp(mod.name.c_str(), module_name) == 0 ||
+        contains_ascii_ci(mod.name, module_name) ||
+        contains_ascii_ci(mod.path, module_name);
+}
+
+static system_export_resolution_t resolve_attached_system_export(HANDLE hf,
+                                                                 const char* tag,
+                                                                 uint32_t pid,
+                                                                 const char* module_name,
+                                                                 const char* export_name) {
+    system_export_resolution_t out;
+    if (pid == 0 || !module_name || !module_name[0] || !export_name || !export_name[0])
+        return out;
+
+    auto local_t0 = std::chrono::steady_clock::now();
+    HMODULE local_mod = nullptr;
+    const wchar_t* local_name = local_system_module_wide(module_name);
+    if (local_name)
+        local_mod = GetModuleHandleW(local_name);
+    FARPROC local_fn = local_mod ? GetProcAddress(local_mod, export_name) : nullptr;
+    HMODULE owner = nullptr;
+    const bool owner_ok = local_fn &&
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(local_fn), &owner) &&
+        owner == local_mod;
+    if (local_mod && local_fn && owner_ok) {
+        const uintptr_t local_base = reinterpret_cast<uintptr_t>(local_mod);
+        const uintptr_t local_addr = reinterpret_cast<uintptr_t>(local_fn);
+        if (local_addr > local_base) {
+            out.local_rva = static_cast<uint64_t>(local_addr - local_base);
+            out.local_export_ok = true;
+        }
+    }
+    out.local_us = elapsed_us_since(local_t0);
+
+    auto enum_t0 = std::chrono::steady_clock::now();
+    const auto modules = driver_bridge::enumerate_modules_for(pid);
+    out.enum_us = elapsed_us_since(enum_t0);
+    out.module_count = modules.size();
+
+    for (const auto& mod : modules) {
+        if (mod.base == 0 || !module_matches_name_ci(mod, module_name))
+            continue;
+        out.module_seen = true;
+        if (out.local_export_ok && out.local_rva != 0 && (mod.size == 0 || out.local_rva < mod.size)) {
+            out.address = mod.base + out.local_rva;
+            out.module_name = mod.name.empty() ? mod.path : mod.name;
+            out.method = "local_rva";
+            diag::log_tagged_fmt("test_analysis_detail",
+                "%s resolve_system_export name=%s module=%s pid=%u method=%s remote_module=%s base=0x%llX size=0x%llX rva=0x%llX va=0x%llX local_us=%lld enum_us=%lld modules=%zu",
+                tag ? tag : "analysis",
+                export_name,
+                module_name,
+                (unsigned)pid,
+                out.method,
+                out.module_name.empty() ? "<none>" : out.module_name.c_str(),
+                (unsigned long long)mod.base,
+                (unsigned long long)mod.size,
+                (unsigned long long)out.local_rva,
+                (unsigned long long)out.address,
+                out.local_us,
+                out.enum_us,
+                out.module_count);
+            return out;
+        }
+    }
+
+    for (const auto& mod : modules) {
+        if (mod.base == 0 || !module_matches_name_ci(mod, module_name))
+            continue;
+        auto slow_t0 = std::chrono::steady_clock::now();
+        uint64_t fn = driver_bridge::resolve_export_for(pid, mod.base, export_name);
+        const long long slow_call_us = elapsed_us_since(slow_t0);
+        out.slow_us += slow_call_us;
+        ++out.slow_attempts;
+        diag::log_tagged_fmt("test_analysis_detail",
+            "%s resolve_system_export_fallback name=%s module=%s pid=%u remote_module=%s base=0x%llX size=0x%llX result=0x%llX slow_call_us=%lld slow_total_us=%lld attempts=%u local_export_ok=%d local_rva=0x%llX enum_us=%lld status='%s' last_error='%s'",
+            tag ? tag : "analysis",
+            export_name,
+            module_name,
+            (unsigned)pid,
+            (mod.name.empty() ? mod.path : mod.name).c_str(),
+            (unsigned long long)mod.base,
+            (unsigned long long)mod.size,
+            (unsigned long long)fn,
+            slow_call_us,
+            out.slow_us,
+            out.slow_attempts,
+            out.local_export_ok ? 1 : 0,
+            (unsigned long long)out.local_rva,
+            out.enum_us,
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str());
+        if (fn != 0) {
+            out.address = fn;
+            out.module_name = mod.name.empty() ? mod.path : mod.name;
+            out.method = "driver_resolver";
+            return out;
+        }
+    }
+
+    log_msg(hf, tag ? tag : "analysis",
+        "WARN -- unresolved system export module=%s name=%s pid=%u local_export_ok=%d local_rva=0x%016llX module_seen=%d modules=%zu local_us=%lld enum_us=%lld slow_attempts=%u slow_us=%lld status=\"%s\" last_error=\"%s\"",
+        module_name,
+        export_name,
+        (unsigned)pid,
+        out.local_export_ok ? 1 : 0,
+        (unsigned long long)out.local_rva,
+        out.module_seen ? 1 : 0,
+        out.module_count,
+        out.local_us,
+        out.enum_us,
+        out.slow_attempts,
+        out.slow_us,
+        driver_bridge::status().c_str(),
+        driver_bridge::last_error().c_str());
+    return out;
+}
+
+struct integrity_sidecar_probe_t {
+    bool ok = false;
+    const char* module = "";
+    system_export_resolution_t resolved;
+    uint64_t result = 0;
+    DWORD gle = 0;
+    long long elapsed_ms = 0;
+};
+
+static integrity_sidecar_probe_t probe_integrity_sidecar_remote_call(HANDLE hf, const char* tag, uint32_t pid) {
+    integrity_sidecar_probe_t out;
+    auto t0 = std::chrono::steady_clock::now();
+    const char* modules[] = { "kernel32.dll", "kernelbase.dll" };
+    for (const char* module_name : modules) {
+        system_export_resolution_t resolved = resolve_attached_system_export(hf, tag, pid, module_name, "GetCurrentProcessId");
+        if (resolved.address == 0) {
+            out.module = module_name;
+            out.resolved = resolved;
+            continue;
+        }
+        SetLastError(ERROR_SUCCESS);
+        const uint64_t result = page_guard_engine::remote_thread_call(pid, resolved.address, 0, 0, 0, 0, 2500, "testlab_integrity_sidecar_GetCurrentProcessId");
+        const DWORD gle = result == static_cast<uint64_t>(pid) ? ERROR_SUCCESS : GetLastError();
+        out.module = module_name;
+        out.resolved = resolved;
+        out.result = result;
+        out.gle = gle;
+        out.elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        out.ok = result == static_cast<uint64_t>(pid);
+        diag::log_tagged_fmt("test_analysis_detail",
+            "%s sidecar_remote_probe pid=%u active_pid=%u module=%s fn=GetCurrentProcessId va=0x%llX method=%s result=0x%llX expected=0x%llX ok=%d gle=%lu elapsed_ms=%lld status='%s' last_error='%s'",
+            tag ? tag : "analysis",
+            (unsigned)pid,
+            (unsigned)driver_bridge::attached_pid(),
+            module_name,
+            (unsigned long long)resolved.address,
+            resolved.method,
+            (unsigned long long)result,
+            (unsigned long long)pid,
+            out.ok ? 1 : 0,
+            static_cast<unsigned long>(gle),
+            out.elapsed_ms,
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str());
+        return out;
+    }
+    out.elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    out.gle = GetLastError();
+    return out;
+}
+
 struct integrity_hunter_sidecar_t {
     HANDLE process = nullptr;
     HANDLE thread = nullptr;
@@ -265,6 +656,12 @@ struct integrity_hunter_sidecar_t {
     std::wstring exe;
     std::wstring command;
     std::wstring workdir;
+    std::wstring log_path;
+    std::wstring ready_event;
+    std::wstring done_event;
+    std::wstring run_id;
+    uint16_t port = 0;
+    uint16_t http_port = 0;
 };
 
 static bool integrity_sidecar_exited(const integrity_hunter_sidecar_t& sidecar, DWORD& exit_code) {
@@ -277,30 +674,48 @@ static bool integrity_sidecar_exited(const integrity_hunter_sidecar_t& sidecar, 
 }
 
 static bool launch_integrity_hunter_sidecar(HANDLE hf, const char* tag, integrity_hunter_sidecar_t& sidecar) {
-    wchar_t sys_dir[MAX_PATH] = {};
-    UINT sys_len = GetSystemDirectoryW(sys_dir, MAX_PATH);
-    if (sys_len == 0 || sys_len >= MAX_PATH) {
-        const DWORD err = GetLastError();
-        log_msg(hf, tag, "FAIL -- integrity sidecar GetSystemDirectoryW failed err=%lu text=%s",
-            static_cast<unsigned long>(err), format_win32_error_text(err).c_str());
+    sidecar.exe = find_integrity_test_target(hf, tag);
+    if (sidecar.exe.empty())
         return false;
-    }
 
-    sidecar.workdir.assign(sys_dir, sys_len);
-    sidecar.exe = sidecar.workdir;
-    if (!sidecar.exe.empty() && sidecar.exe.back() != L'\\' && sidecar.exe.back() != L'/')
-        sidecar.exe.push_back(L'\\');
-    sidecar.exe += L"cmd.exe";
     if (GetFileAttributesW(sidecar.exe.c_str()) == INVALID_FILE_ATTRIBUTES) {
         const DWORD err = GetLastError();
-        log_msg(hf, tag, "FAIL -- integrity sidecar cmd.exe missing path=%s err=%lu text=%s",
+        log_msg(hf, tag, "FAIL -- integrity sidecar AiDA_TestTarget.exe missing path=%s err=%lu text=%s",
             wide_to_utf8_lossy(sidecar.exe).c_str(),
             static_cast<unsigned long>(err),
             format_win32_error_text(err).c_str());
         return false;
     }
 
-    sidecar.command = quote_wide_arg(sidecar.exe) + L" /d /c ping -n 30 127.0.0.1 > nul";
+    sidecar.workdir = parent_path_wide(sidecar.exe);
+    const ULONGLONG tick = GetTickCount64();
+    sidecar.port = static_cast<uint16_t>(31000u + ((static_cast<uint32_t>(GetCurrentProcessId()) + static_cast<uint32_t>(tick)) % 20000u));
+    sidecar.http_port = static_cast<uint16_t>(sidecar.port + 1u);
+    wchar_t run_id_buf[128] = {};
+    _snwprintf_s(run_id_buf, _TRUNCATE, L"integrity_hunter_%lu_%llu",
+        static_cast<unsigned long>(GetCurrentProcessId()),
+        static_cast<unsigned long long>(tick));
+    sidecar.run_id = run_id_buf;
+    sidecar.ready_event = L"Local\\AiDAIntegrityHunterReady_" + sidecar.run_id;
+    sidecar.done_event = L"Local\\AiDAIntegrityHunterDone_" + sidecar.run_id;
+    sidecar.log_path = make_integrity_sidecar_log_path();
+
+    wchar_t args[512] = {};
+    _snwprintf_s(args, _TRUNCATE,
+        L" --no-external --skip-network --duration 180 --net-rate 2000 --port %u --http-port %u --disable-re-fixtures --disable-proto-re-fixtures --disable-protected-re-fixtures --disable-single-step-absorber",
+        static_cast<unsigned>(sidecar.port),
+        static_cast<unsigned>(sidecar.http_port));
+    sidecar.command = quote_wide_arg(sidecar.exe) + args;
+
+    std::vector<std::pair<std::wstring, std::wstring>> env_overrides = {
+        { L"AIDA_TARGET_LOG_PATH", sidecar.log_path },
+        { L"AIDA_INTEGRITY_HUNTER_SIDECAR", L"1" },
+        { L"AIDA_INTEGRITY_HUNTER_SIDECAR_RUN_ID", sidecar.run_id },
+        { L"AIDA_TEST_TARGET_READY_EVENT", sidecar.ready_event },
+        { L"AIDA_TEST_TARGET_DONE_EVENT", sidecar.done_event }
+    };
+    std::vector<wchar_t> env_block = build_integrity_sidecar_environment(env_overrides);
+
     STARTUPINFOW si{};
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi{};
@@ -312,16 +727,22 @@ static bool launch_integrity_hunter_sidecar(HANDLE hf, const char* tag, integrit
         nullptr,
         nullptr,
         FALSE,
-        CREATE_NO_WINDOW,
-        nullptr,
+        CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+        env_block.empty() ? nullptr : env_block.data(),
         sidecar.workdir.empty() ? nullptr : sidecar.workdir.c_str(),
         &si,
         &pi);
     const DWORD err = ok ? 0 : GetLastError();
-    log_msg(hf, tag, "SIDE-FIXTURE-LAUNCH -- app=%s cmd=%s cwd=%s ok=%d err=%lu text=%s",
+    log_msg(hf, tag, "SIDE-FIXTURE-LAUNCH -- app=%s cmd=%s cwd=%s log=%s run_id=%s ready_event=%s done_event=%s port=%u http_port=%u isolated_event_env=1 fixed_event_names_not_used_for_readiness=1 ok=%d err=%lu text=%s",
         wide_to_utf8_lossy(sidecar.exe).c_str(),
         wide_to_utf8_lossy(sidecar.command).c_str(),
         wide_to_utf8_lossy(sidecar.workdir).c_str(),
+        wide_to_utf8_lossy(sidecar.log_path).c_str(),
+        wide_to_utf8_lossy(sidecar.run_id).c_str(),
+        wide_to_utf8_lossy(sidecar.ready_event).c_str(),
+        wide_to_utf8_lossy(sidecar.done_event).c_str(),
+        static_cast<unsigned>(sidecar.port),
+        static_cast<unsigned>(sidecar.http_port),
         ok ? 1 : 0,
         static_cast<unsigned long>(err),
         ok ? "success" : format_win32_error_text(err).c_str());
@@ -385,20 +806,47 @@ static bool wait_integrity_hunter_sidecar_ready(HANDLE hf, const char* tag, cons
         const bool bridge_alive = selected && active == sidecar.pid && driver_bridge::attached_process_alive(&bridge_code);
         const uint64_t ntdll_base = selected ? remote_module_base_ci(sidecar.pid, "ntdll") : 0;
         const uint64_t kernel32_base = selected ? remote_module_base_ci(sidecar.pid, "kernel32") : 0;
+        const uint64_t kernelbase_base = selected ? remote_module_base_ci(sidecar.pid, "kernelbase") : 0;
         const DWORD elapsed = GetTickCount() - started;
         if (selected && bridge_alive && ntdll_base != 0 && kernel32_base != 0) {
-            log_msg(hf, tag, "SIDE-FIXTURE-READY -- pid=%lu attempts=%d active=%u ntdll=0x%016llX kernel32=0x%016llX bridge_code=0x%08X elapsed_ms=%lu",
+            integrity_sidecar_probe_t probe = probe_integrity_sidecar_remote_call(hf, tag, sidecar.pid);
+            if (probe.ok) {
+                log_msg(hf, tag, "SIDE-FIXTURE-READY -- pid=%lu attempts=%d active=%u ntdll=0x%016llX kernel32=0x%016llX kernelbase=0x%016llX probe_module=%s probe_fn=0x%016llX probe_result=0x%016llX bridge_code=0x%08X elapsed_ms=%lu probe_elapsed_ms=%lld",
+                    static_cast<unsigned long>(sidecar.pid),
+                    attempts,
+                    active,
+                    static_cast<unsigned long long>(ntdll_base),
+                    static_cast<unsigned long long>(kernel32_base),
+                    static_cast<unsigned long long>(kernelbase_base),
+                    probe.module ? probe.module : "",
+                    static_cast<unsigned long long>(probe.resolved.address),
+                    static_cast<unsigned long long>(probe.result),
+                    bridge_code,
+                    static_cast<unsigned long>(elapsed),
+                    probe.elapsed_ms);
+                return true;
+            }
+            log_msg(hf, tag, "SIDE-FIXTURE-PROBE-WAIT -- pid=%lu attempts=%d active=%u ntdll=0x%016llX kernel32=0x%016llX kernelbase=0x%016llX module=%s fn=0x%016llX method=%s result=0x%016llX expected=0x%016llX ok=0 gle=%lu text=%s elapsed_ms=%lu probe_elapsed_ms=%lld status=\"%s\" last_error=\"%s\"",
                 static_cast<unsigned long>(sidecar.pid),
                 attempts,
                 active,
                 static_cast<unsigned long long>(ntdll_base),
                 static_cast<unsigned long long>(kernel32_base),
-                bridge_code,
-                static_cast<unsigned long>(elapsed));
-            return true;
+                static_cast<unsigned long long>(kernelbase_base),
+                probe.module ? probe.module : "",
+                static_cast<unsigned long long>(probe.resolved.address),
+                probe.resolved.method,
+                static_cast<unsigned long long>(probe.result),
+                static_cast<unsigned long long>(sidecar.pid),
+                static_cast<unsigned long>(probe.gle),
+                format_win32_error_text(probe.gle).c_str(),
+                static_cast<unsigned long>(elapsed),
+                probe.elapsed_ms,
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
         }
         if (attempts == 1 || (elapsed % 500) < 100) {
-            log_msg(hf, tag, "SIDE-FIXTURE-WAIT -- pid=%lu attempt=%d selected=%d active=%u bridge_alive=%d bridge_code=0x%08X ntdll=0x%016llX kernel32=0x%016llX elapsed_ms=%lu",
+            log_msg(hf, tag, "SIDE-FIXTURE-WAIT -- pid=%lu attempt=%d selected=%d active=%u bridge_alive=%d bridge_code=0x%08X ntdll=0x%016llX kernel32=0x%016llX kernelbase=0x%016llX elapsed_ms=%lu",
                 static_cast<unsigned long>(sidecar.pid),
                 attempts,
                 selected ? 1 : 0,
@@ -407,13 +855,18 @@ static bool wait_integrity_hunter_sidecar_ready(HANDLE hf, const char* tag, cons
                 bridge_code,
                 static_cast<unsigned long long>(ntdll_base),
                 static_cast<unsigned long long>(kernel32_base),
+                static_cast<unsigned long long>(kernelbase_base),
                 static_cast<unsigned long>(elapsed));
         }
         if (elapsed >= timeout_ms) {
-            log_msg(hf, tag, "FAIL -- integrity sidecar attach readiness timeout pid=%lu attempts=%d active=%u status=\"%s\" last_error=\"%s\"",
+            log_msg(hf, tag, "FAIL -- integrity sidecar attach readiness timeout pid=%lu attempts=%d active=%u ntdll=0x%016llX kernel32=0x%016llX kernelbase=0x%016llX required_probe=GetCurrentProcessId expected_pid=%lu status=\"%s\" last_error=\"%s\"",
                 static_cast<unsigned long>(sidecar.pid),
                 attempts,
                 driver_bridge::attached_pid(),
+                static_cast<unsigned long long>(ntdll_base),
+                static_cast<unsigned long long>(kernel32_base),
+                static_cast<unsigned long long>(kernelbase_base),
+                static_cast<unsigned long>(sidecar.pid),
                 driver_bridge::status().c_str(),
                 driver_bridge::last_error().c_str());
             return false;
@@ -2256,6 +2709,7 @@ static void test_integrity_hunter_nodes(HANDLE hf, std::atomic<int>& passed, std
         const auto idle_state = integrity_hunter::wait_until_idle_result(12000);
         const char* status = idle_state.idle ? "page_guard_install_failed" : "page_guard_install_cleanup_exceeded";
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        const auto pg_failure = page_guard_engine::g_pg_engine.last_install_failure();
         diag::log_tagged_fmt("test_analysis_detail",
             "integ_nd install_failure status=%s generation=%llu install_generation=%llu pid=%u active_pid=%u addr=0x%llX size=%u install_seen=%d install_complete=%d install_success=%d raw_install_complete=%d raw_install_success=%d idle=%d cleanup_elapsed_ms=%lld pg_session=%u guard_query=%d guard_state=%d guard_protect=0x%08X nodes=%zu events=%zu total_reads=%llu status_text='%s' bridge_status='%s' last_error='%s' elapsed_ms=%lld",
             status,
@@ -2283,6 +2737,141 @@ static void test_integrity_hunter_nodes(HANDLE hf, std::atomic<int>& passed, std
             driver_bridge::status().c_str(),
             driver_bridge::last_error().c_str(),
             (long long)ms);
+        diag::log_tagged_fmt("test_analysis_detail",
+            "integ_nd pg_last_failure reason=%s detail='%s' pid=%u active_pid=%u requested_addr=0x%llX requested_size=0x%llX guard_addr=0x%llX guard_size=0x%llX region_base=0x%llX region_size=0x%llX region_state=0x%08X region_protect=0x%08X region_type=0x%08X original_protect=0x%08X proposed_protect=0x%08X attempted_protect=0x%08X ring=0x%llX shellcode=0x%llX context=0x%llX ntdll=0x%llX ntdll_size=0x%llX rtl_add=0x%llX rtl_remove=0x%llX veh_result=0x%llX remote_gle=%lu remote_elapsed_ms=%llu install_elapsed_ms=%llu install_generation=%llu current_generation=%llu cleanup_sc_ok=%u cleanup_ring_ok=%u mitigation_open=%u mitigation_open_error=%lu dyn_ok=%u dyn_error=%lu dyn_flags=0x%08X cfg_ok=%u cfg_error=%lu cfg_flags=0x%08X driver_status='%s' driver_last_error='%s' remote_status='%s' remote_last_error='%s'",
+            pg_failure.reason.c_str(),
+            pg_failure.detail.c_str(),
+            (unsigned)pg_failure.pid,
+            (unsigned)pg_failure.active_pid,
+            (unsigned long long)pg_failure.requested_addr,
+            (unsigned long long)pg_failure.requested_size,
+            (unsigned long long)pg_failure.guard_addr,
+            (unsigned long long)pg_failure.guard_size,
+            (unsigned long long)pg_failure.region_base,
+            (unsigned long long)pg_failure.region_size,
+            (unsigned)pg_failure.region_state,
+            (unsigned)pg_failure.region_protect,
+            (unsigned)pg_failure.region_type,
+            (unsigned)pg_failure.original_protect,
+            (unsigned)pg_failure.proposed_protect,
+            (unsigned)pg_failure.attempted_protect,
+            (unsigned long long)pg_failure.ring_addr,
+            (unsigned long long)pg_failure.shellcode_addr,
+            (unsigned long long)pg_failure.context_addr,
+            (unsigned long long)pg_failure.ntdll_base,
+            (unsigned long long)pg_failure.ntdll_size,
+            (unsigned long long)pg_failure.rtl_add_veh,
+            (unsigned long long)pg_failure.rtl_remove_veh,
+            (unsigned long long)pg_failure.veh_result,
+            static_cast<unsigned long>(pg_failure.remote_call_gle),
+            (unsigned long long)pg_failure.remote_call_elapsed_ms,
+            (unsigned long long)pg_failure.install_elapsed_ms,
+            (unsigned long long)pg_failure.install_generation,
+            (unsigned long long)pg_failure.current_generation,
+            (unsigned)pg_failure.cleanup_shellcode_ok,
+            (unsigned)pg_failure.cleanup_ring_ok,
+            (unsigned)pg_failure.mitigation_open_ok,
+            static_cast<unsigned long>(pg_failure.mitigation_open_error),
+            (unsigned)pg_failure.mitigation_dynamic_ok,
+            static_cast<unsigned long>(pg_failure.mitigation_dynamic_error),
+            (unsigned)pg_failure.mitigation_dynamic_flags,
+            (unsigned)pg_failure.mitigation_cfg_ok,
+            static_cast<unsigned long>(pg_failure.mitigation_cfg_error),
+            (unsigned)pg_failure.mitigation_cfg_flags,
+            pg_failure.driver_status.c_str(),
+            pg_failure.driver_last_error.c_str(),
+            pg_failure.remote_call_driver_status.c_str(),
+            pg_failure.remote_call_driver_last_error.c_str());
+        log_msg(hf, "integ_nd", "PG-LAST-FAILURE -- reason=%s detail=\"%s\" pid=%u active_pid=%u requested=0x%016llX size=0x%016llX guard=0x%016llX guard_size=0x%016llX region_base=0x%016llX region_size=0x%016llX region_state=0x%08X region_protect=0x%08X region_type=0x%08X original_protect=0x%08X proposed_protect=0x%08X attempted_protect=0x%08X ring=0x%016llX shellcode=0x%016llX context=0x%016llX ntdll=0x%016llX ntdll_size=0x%016llX rtl_add=0x%016llX rtl_remove=0x%016llX veh_result=0x%016llX remote_gle=%lu remote_elapsed_ms=%llu install_elapsed_ms=%llu install_generation=%llu current_generation=%llu cleanup_sc_ok=%u cleanup_ring_ok=%u mitigation_open=%u mitigation_open_error=%lu dyn_ok=%u dyn_error=%lu dyn_flags=0x%08X cfg_ok=%u cfg_error=%lu cfg_flags=0x%08X driver_status=\"%s\" driver_last_error=\"%s\" remote_status=\"%s\" remote_last_error=\"%s\"",
+            pg_failure.reason.c_str(),
+            pg_failure.detail.c_str(),
+            (unsigned)pg_failure.pid,
+            (unsigned)pg_failure.active_pid,
+            (unsigned long long)pg_failure.requested_addr,
+            (unsigned long long)pg_failure.requested_size,
+            (unsigned long long)pg_failure.guard_addr,
+            (unsigned long long)pg_failure.guard_size,
+            (unsigned long long)pg_failure.region_base,
+            (unsigned long long)pg_failure.region_size,
+            (unsigned)pg_failure.region_state,
+            (unsigned)pg_failure.region_protect,
+            (unsigned)pg_failure.region_type,
+            (unsigned)pg_failure.original_protect,
+            (unsigned)pg_failure.proposed_protect,
+            (unsigned)pg_failure.attempted_protect,
+            (unsigned long long)pg_failure.ring_addr,
+            (unsigned long long)pg_failure.shellcode_addr,
+            (unsigned long long)pg_failure.context_addr,
+            (unsigned long long)pg_failure.ntdll_base,
+            (unsigned long long)pg_failure.ntdll_size,
+            (unsigned long long)pg_failure.rtl_add_veh,
+            (unsigned long long)pg_failure.rtl_remove_veh,
+            (unsigned long long)pg_failure.veh_result,
+            static_cast<unsigned long>(pg_failure.remote_call_gle),
+            (unsigned long long)pg_failure.remote_call_elapsed_ms,
+            (unsigned long long)pg_failure.install_elapsed_ms,
+            (unsigned long long)pg_failure.install_generation,
+            (unsigned long long)pg_failure.current_generation,
+            (unsigned)pg_failure.cleanup_shellcode_ok,
+            (unsigned)pg_failure.cleanup_ring_ok,
+            (unsigned)pg_failure.mitigation_open_ok,
+            static_cast<unsigned long>(pg_failure.mitigation_open_error),
+            (unsigned)pg_failure.mitigation_dynamic_ok,
+            static_cast<unsigned long>(pg_failure.mitigation_dynamic_error),
+            (unsigned)pg_failure.mitigation_dynamic_flags,
+            (unsigned)pg_failure.mitigation_cfg_ok,
+            static_cast<unsigned long>(pg_failure.mitigation_cfg_error),
+            (unsigned)pg_failure.mitigation_cfg_flags,
+            pg_failure.driver_status.c_str(),
+            pg_failure.driver_last_error.c_str(),
+            pg_failure.remote_call_driver_status.c_str(),
+            pg_failure.remote_call_driver_last_error.c_str());
+        log_msg(hf, "integ_nd", "PG-LAST-FAILURE-CORE -- reason=%s detail=\"%s\" pid=%u active_pid=%u requested=0x%016llX size=0x%016llX guard=0x%016llX guard_size=0x%016llX region_base=0x%016llX region_size=0x%016llX region_state=0x%08X region_protect=0x%08X region_type=0x%08X original_protect=0x%08X proposed_protect=0x%08X attempted_protect=0x%08X",
+            pg_failure.reason.c_str(),
+            pg_failure.detail.c_str(),
+            (unsigned)pg_failure.pid,
+            (unsigned)pg_failure.active_pid,
+            (unsigned long long)pg_failure.requested_addr,
+            (unsigned long long)pg_failure.requested_size,
+            (unsigned long long)pg_failure.guard_addr,
+            (unsigned long long)pg_failure.guard_size,
+            (unsigned long long)pg_failure.region_base,
+            (unsigned long long)pg_failure.region_size,
+            (unsigned)pg_failure.region_state,
+            (unsigned)pg_failure.region_protect,
+            (unsigned)pg_failure.region_type,
+            (unsigned)pg_failure.original_protect,
+            (unsigned)pg_failure.proposed_protect,
+            (unsigned)pg_failure.attempted_protect);
+        log_msg(hf, "integ_nd", "PG-LAST-FAILURE-VEH -- ring=0x%016llX shellcode=0x%016llX context=0x%016llX ntdll=0x%016llX ntdll_size=0x%016llX rtl_add=0x%016llX rtl_remove=0x%016llX veh_result=0x%016llX remote_gle=%lu remote_elapsed_ms=%llu install_elapsed_ms=%llu install_generation=%llu current_generation=%llu cleanup_sc_ok=%u cleanup_ring_ok=%u",
+            (unsigned long long)pg_failure.ring_addr,
+            (unsigned long long)pg_failure.shellcode_addr,
+            (unsigned long long)pg_failure.context_addr,
+            (unsigned long long)pg_failure.ntdll_base,
+            (unsigned long long)pg_failure.ntdll_size,
+            (unsigned long long)pg_failure.rtl_add_veh,
+            (unsigned long long)pg_failure.rtl_remove_veh,
+            (unsigned long long)pg_failure.veh_result,
+            static_cast<unsigned long>(pg_failure.remote_call_gle),
+            (unsigned long long)pg_failure.remote_call_elapsed_ms,
+            (unsigned long long)pg_failure.install_elapsed_ms,
+            (unsigned long long)pg_failure.install_generation,
+            (unsigned long long)pg_failure.current_generation,
+            (unsigned)pg_failure.cleanup_shellcode_ok,
+            (unsigned)pg_failure.cleanup_ring_ok);
+        log_msg(hf, "integ_nd", "PG-LAST-FAILURE-MITIGATION -- mitigation_open=%u mitigation_open_error=%lu dyn_ok=%u dyn_error=%lu dyn_flags=0x%08X cfg_ok=%u cfg_error=%lu cfg_flags=0x%08X driver_status=\"%s\" driver_last_error=\"%s\" remote_status=\"%s\" remote_last_error=\"%s\"",
+            (unsigned)pg_failure.mitigation_open_ok,
+            static_cast<unsigned long>(pg_failure.mitigation_open_error),
+            (unsigned)pg_failure.mitigation_dynamic_ok,
+            static_cast<unsigned long>(pg_failure.mitigation_dynamic_error),
+            (unsigned)pg_failure.mitigation_dynamic_flags,
+            (unsigned)pg_failure.mitigation_cfg_ok,
+            static_cast<unsigned long>(pg_failure.mitigation_cfg_error),
+            (unsigned)pg_failure.mitigation_cfg_flags,
+            pg_failure.driver_status.c_str(),
+            pg_failure.driver_last_error.c_str(),
+            pg_failure.remote_call_driver_status.c_str(),
+            pg_failure.remote_call_driver_last_error.c_str());
         log_msg(hf, "integ_nd", "FAIL -- integrity hunter page-guard install failure: status=%s generation=%llu install_generation=%llu pid=%u active_pid=%u fixture=0x%016llX size=%u install_seen=%d install_complete=%d install_success=%d raw_install_complete=%d raw_install_success=%d idle=%d cleanup_elapsed_ms=%lld pg_session=%u guard_query=%d guard_state=%d guard_protect=0x%08X nodes=%zu events=%zu total_reads=%llu status_text=\"%s\" bridge_status=\"%s\" last_error=\"%s\" (elapsed %lld ms)",
             status,
             (unsigned long long)generation,

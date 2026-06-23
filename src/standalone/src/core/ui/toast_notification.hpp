@@ -108,6 +108,13 @@ namespace toast_notification
             return th.info_soft;
         }
 
+        inline float severity_wash_alpha(toast_type_t k, bool is_dark)
+        {
+            if (k == toast_type_t::info)
+                return is_dark ? 0.24f : 0.16f;
+            return is_dark ? 0.42f : 0.30f;
+        }
+
         inline ImU32 multiply_alpha(ImU32 c, float a)
         {
             if (a < 0.0f) a = 0.0f;
@@ -511,11 +518,15 @@ namespace toast_notification
 
             aida::ui::blur::render_glass_fill(dl, tl, br, TOAST_ROUNDING, alpha);
 
-            ImU32 sev_wash = detail::multiply_alpha(sev_soft, alpha * 0.60f);
+            ImU32 surface_overlay = aida::ui::with_alpha(th.bg_overlay, alpha * (th.is_dark ? 0.16f : 0.10f));
+            dl->AddRectFilled(tl, br, surface_overlay, TOAST_ROUNDING);
+
+            ImU32 sev_wash = detail::multiply_alpha(sev_soft, alpha * detail::severity_wash_alpha(t.type, th.is_dark));
             dl->AddRectFilled(tl, br, sev_wash, TOAST_ROUNDING);
 
-            ImU32 hi_top = detail::multiply_alpha(IM_COL32(255, 255, 255, 24), alpha);
-            ImU32 hi_bot = detail::multiply_alpha(IM_COL32(255, 255, 255, 0), alpha);
+            ImU32 highlight_base = th.is_dark ? th.text_primary : th.text_dim;
+            ImU32 hi_top = aida::ui::with_alpha(highlight_base, alpha * (th.is_dark ? 0.10f : 0.06f));
+            ImU32 hi_bot = aida::ui::with_alpha(highlight_base, 0.0f);
             dl->AddRectFilledMultiColor(tl, ImVec2(br.x, tl.y + h * 0.55f),
                                           hi_top, hi_top, hi_bot, hi_bot);
 
@@ -523,6 +534,7 @@ namespace toast_notification
 
             ImU32 sev_border = detail::multiply_alpha(sev_color, alpha * 0.45f);
             dl->AddRect(tl, br, sev_border, TOAST_ROUNDING, 0, 1.0f);
+            dl->AddRectFilled(tl, ImVec2(tl.x + 3.0f, br.y), detail::multiply_alpha(sev_color, alpha * 0.70f), 1.5f);
 
             float icon_cx = tl.x + PADDING + ICON_BOX * 0.5f;
             float icon_cy = tl.y + h * 0.5f;
@@ -567,9 +579,11 @@ namespace toast_notification
                                    mouse.y >= btn_tl.y && mouse.y <= btn_br.y &&
                                    !t.dismissing && !t.swipe_dismissing;
 
-                ImU32 btn_fill = detail::multiply_alpha(sev_color, alpha * (btn_hovered ? 0.28f : 0.16f));
+                float action_mix = th.is_dark ? (btn_hovered ? 0.20f : 0.14f) : (btn_hovered ? 0.14f : 0.09f);
+                ImU32 btn_fill_base = aida::ui::mix(th.bg_overlay, sev_color, action_mix);
+                ImU32 btn_fill = aida::ui::with_alpha(btn_fill_base, alpha * (btn_hovered ? 0.78f : 0.56f));
                 ImU32 btn_border = detail::multiply_alpha(sev_color, alpha * (btn_hovered ? 0.85f : 0.55f));
-                ImU32 btn_text = detail::multiply_alpha(sev_color, alpha);
+                ImU32 btn_text = detail::multiply_alpha(text_primary, alpha);
 
                 dl->AddRectFilled(btn_tl, btn_br, btn_fill, btn_h * 0.5f);
                 dl->AddRect(btn_tl, btn_br, btn_border, btn_h * 0.5f, 0, 1.0f);
