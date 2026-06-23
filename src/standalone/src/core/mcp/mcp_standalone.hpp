@@ -86,6 +86,21 @@ namespace mcp_standalone
         bool _active = false;
     };
 
+    class scoped_call_metadata_t
+    {
+    public:
+        scoped_call_metadata_t(const std::string& diag_id, const std::string& tool_name, std::uint64_t deadline_ms);
+        ~scoped_call_metadata_t();
+        scoped_call_metadata_t(const scoped_call_metadata_t&) = delete;
+        scoped_call_metadata_t& operator=(const scoped_call_metadata_t&) = delete;
+
+    private:
+        std::string _prev_diag;
+        std::string _prev_tool;
+        std::uint64_t _prev_deadline = 0;
+        bool _active = false;
+    };
+
     void set_ide_lifecycle_ready(bool ready) noexcept;
     bool lifecycle_authorized(std::string* reason = nullptr);
 

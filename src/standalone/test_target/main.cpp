@@ -21,6 +21,7 @@
 #include "http_server_tests.h"
 #include "traffic_generator.h"
 #include "resident_state.h"
+#include "debugger_hwbp_fixture.h"
 #include "re_domain_fixtures.h"
 #include "protocol_re_tests.h"
 #include "protected_re_fixtures.h"
@@ -621,6 +622,12 @@ int main(int argc, char* argv[]) {
         test_target::resident::init(rcfg, g_running);
     }
 
+    {
+        test_target::hwbp_fixture::config_t hcfg{};
+        hcfg.verbose = args.verbose;
+        test_target::hwbp_fixture::init(hcfg, g_running);
+    }
+
     if (args.re_fixtures) {
         test_target::re_fixtures::config_t rfcfg{};
         rfcfg.verbose = args.verbose;
@@ -776,6 +783,7 @@ int main(int argc, char* argv[]) {
         test_target::protocol_re::shutdown_all();
         test_target::protected_re::shutdown_all();
         test_target::re_fixtures::shutdown_all();
+        test_target::hwbp_fixture::shutdown_all();
 
         if (h_ready_local) CloseHandle(h_ready_local);
         if (h_done_local) CloseHandle(h_done_local);
@@ -812,6 +820,7 @@ int main(int argc, char* argv[]) {
     test_target::traffic::shutdown_all();
     test_target::http_server::shutdown_all();
     test_target::resident::shutdown_all();
+    test_target::hwbp_fixture::shutdown_all();
     test_target::protocol_re::shutdown_all();
     test_target::protected_re::shutdown_all();
     test_target::re_fixtures::shutdown_all();

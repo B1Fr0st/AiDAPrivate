@@ -1940,24 +1940,29 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
 
     const BOOLEAN private_get_context_available = ssdt_resolver::resolve_user_context();
     const BOOLEAN private_set_context_available = request->should_set != 0 ? ssdt_resolver::resolve_user_set_context() : FALSE;
+    const BOOLEAN debug_register_set =
+        request->should_set != 0 &&
+        tctx_diag::debug_registers_requested(request->register_mask);
     const BOOLEAN private_set_context_fast_path =
         request->should_set != 0 &&
         private_get_context_available &&
         private_set_context_available;
     const BOOLEAN private_set_without_suspend =
         private_set_context_fast_path &&
-        previous_mode != KernelMode;
+        previous_mode != KernelMode &&
+        !debug_register_set;
     const BOOLEAN private_context_fast_path =
         request->should_set != 0 ?
         private_set_context_fast_path :
         private_get_context_available;
     const BOOLEAN ps_suspend_available = (_PsSuspendThread && (_PsResumeThread || _ZwResumeThread || ssdt_resolver::g_NtResumeThread)) ? TRUE : FALSE;
     const BOOLEAN nt_suspend_available = (_ZwSuspendThread || ssdt_resolver::g_NtSuspendThread) ? TRUE : FALSE;
-    WW_LOG("TCTX route_decision phase=pre_suspend pid=%u tid=%u set=%u mask=0x%llX dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX previous_mode=%u requestor_mode=%u private_get_available=%u private_set_available=%u private_set_without_suspend=%u private_context_fast_path=%u ps_suspend_available=%u nt_suspend_available=%u ctx_thread_suspended=0 private_write_route_attempted=0 private_write_status=0x%08X private_write_status_text=%s elapsed_ms=%llu",
+    WW_LOG("TCTX route_decision phase=pre_suspend pid=%u tid=%u set=%u mask=0x%llX debug_register_set=%u dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX previous_mode=%u requestor_mode=%u private_get_available=%u private_set_available=%u private_set_without_suspend=%u private_context_fast_path=%u ps_suspend_available=%u nt_suspend_available=%u ctx_thread_suspended=0 private_write_route_attempted=0 private_write_status=0x%08X private_write_status_text=%s elapsed_ms=%llu",
         request->pid,
         request->tid,
         request->should_set,
         (unsigned long long)request->register_mask,
+        debug_register_set ? 1u : 0u,
         (unsigned long long)request->dr0,
         (unsigned long long)request->dr1,
         (unsigned long long)request->dr2,
@@ -1975,22 +1980,23 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
         (ULONG)STATUS_NOT_FOUND,
         tctx_diag::ntstatus_text(STATUS_NOT_FOUND),
         dbg_guard::elapsed_ms(tctx_start, tctx_freq));
-    if (previous_mode != KernelMode && !private_context_fast_path) {
+    if (previous_mode != KernelMode && (!private_context_fast_path || debug_register_set)) {
         NTSTATUS system_status = tctx_system_route::run(
             process,
             thread,
             thread_type,
             request,
             previous_mode,
-            "user_previous_mode",
+            debug_register_set ? "debug_register_set_requires_suspend" : "user_previous_mode",
             tctx_start,
             tctx_freq);
         if (NT_SUCCESS(system_status)) {
             tctx_diag::thread_snapshot_t thread_after_system = tctx_diag::query_thread_snapshot(request->pid, request->tid);
-            WW_LOG("TCTX exit route=system_thread pid=%u tid=%u set=%u status=0x%08X status_text=%s win32=%lu previous_mode=%u requestor_mode=%u thread_after_found=%u thread_after_status=0x%08X thread_after_status_text=%s thread_after_state=%lu thread_after_wait_reason=%lu rip=0x%llX rip_class=%s rsp=0x%llX rsp_class=%s rflags=0x%llX user_sane=%u dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX elapsed_ms=%llu",
+            WW_LOG("TCTX exit route=system_thread pid=%u tid=%u set=%u debug_register_set=%u status=0x%08X status_text=%s win32=%lu previous_mode=%u requestor_mode=%u thread_after_found=%u thread_after_status=0x%08X thread_after_status_text=%s thread_after_state=%lu thread_after_wait_reason=%lu rip=0x%llX rip_class=%s rsp=0x%llX rsp_class=%s rflags=0x%llX user_sane=%u dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX elapsed_ms=%llu",
                 request->pid,
                 request->tid,
                 request->should_set,
+                debug_register_set ? 1u : 0u,
                 (ULONG)system_status,
                 tctx_diag::ntstatus_text(system_status),
                 tctx_diag::ntstatus_win32(system_status),
@@ -2018,10 +2024,11 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
             _ObfDereferenceObject(process);
             return system_status;
         }
-        WW_LOG("TCTX system_route_continue route=inline_direct pid=%u tid=%u set=%u system_status=0x%08X system_status_text=%s win32=%lu previous_mode=%u requestor_mode=%u elapsed_ms=%llu",
+        WW_LOG("TCTX system_route_continue route=inline_direct pid=%u tid=%u set=%u debug_register_set=%u system_status=0x%08X system_status_text=%s win32=%lu previous_mode=%u requestor_mode=%u elapsed_ms=%llu",
             request->pid,
             request->tid,
             request->should_set,
+            debug_register_set ? 1u : 0u,
             (ULONG)system_status,
             tctx_diag::ntstatus_text(system_status),
             tctx_diag::ntstatus_win32(system_status),

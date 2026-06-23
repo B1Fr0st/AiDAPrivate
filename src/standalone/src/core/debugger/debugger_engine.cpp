@@ -1178,7 +1178,7 @@ void clear_all_breakpoints() {
 
 	std::vector<driver_bridge::thread_info_t> threads;
 	if (st.target_pid != 0)
-		threads = driver_bridge::enumerate_threads();
+		threads = hardware_breakpoint_threads(st, "clear_all_breakpoints");
 
 	std::lock_guard<std::mutex> lk(st.bp_mutex);
 

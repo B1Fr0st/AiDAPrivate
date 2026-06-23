@@ -143,6 +143,28 @@ namespace {
         return out;
     }
 
+    std::string compact_burp_json(const nlohmann::json& value, std::size_t cap) {
+        if (value.is_null() || value.empty())
+            return "<empty>";
+        return compact_burp_text(value.dump(), cap);
+    }
+
+    void log_camoufox_bridge_snapshot(HANDLE hf, const char* tag, const char* label, const aida::burp::camoufox::bridge_status_t& st) {
+        log_msg(hf, tag, "%s cleanup generation=%llu child_pid=%u started_ms=%llu last_cleanup_ms=%llu reason=%s",
+            label,
+            static_cast<unsigned long long>(st.cleanup_generation),
+            st.cleanup_child_pid,
+            static_cast<unsigned long long>(st.cleanup_started_ms),
+            static_cast<unsigned long long>(st.last_cleanup_ms),
+            st.cleanup_reason.empty() ? "<empty>" : compact_burp_text(st.cleanup_reason, 500).c_str());
+        log_msg(hf, tag, "%s launch_diag=%s",
+            label,
+            compact_burp_json(st.last_launch_diagnostics, 900).c_str());
+        log_msg(hf, tag, "%s cleanup_diag=%s",
+            label,
+            compact_burp_json(st.cleanup_diagnostics, 900).c_str());
+    }
+
     bool camoufox_install_status_ready(const aida::burp::camoufox::install::status_t& st) {
         if (st.state != aida::burp::camoufox::install::install_state_t::ok ||
             st.module_version.empty() ||
@@ -3269,6 +3291,7 @@ namespace {
             before.browser_process_count,
             before.page_count,
             before.last_error.empty() ? "<empty>" : compact_burp_text(before.last_error, 700).c_str());
+        log_camoufox_bridge_snapshot(hf, tag, "initial_status", before);
         if (ready) {
             log_msg(hf, tag, "PASS -- Camoufox bridge is ready");
             passed.fetch_add(1);
@@ -3299,13 +3322,14 @@ namespace {
             after.page_count,
             static_cast<unsigned long long>(GetTickCount64() - t0),
             after.last_error.empty() ? "<empty>" : compact_burp_text(after.last_error, 700).c_str());
+        log_camoufox_bridge_snapshot(hf, tag, "relaunch_status", after);
         if (ready_after) {
             log_msg(hf, tag, "PASS -- Camoufox bridge recovered from initial not-ready state child_pid=%u", after.child_pid);
             passed.fetch_add(1);
             return;
         }
         fail_empty_evidence(hf, tag, failed,
-            "Camoufox readiness is false after relaunch attempt state=%s generation=%llu child_pid=%u child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d child_processes=%u browser_processes=%u pages=%u last_error=%s",
+            "Camoufox readiness is false after relaunch attempt state=%s generation=%llu child_pid=%u child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d cleanup_generation=%llu cleanup_child_pid=%u child_processes=%u browser_processes=%u pages=%u cleanup_reason=%s last_error=%s launch_diag=%s cleanup_diag=%s",
             camoufox_bridge_state_name(after.state),
             static_cast<unsigned long long>(after.generation),
             after.child_pid,
@@ -3314,10 +3338,15 @@ namespace {
             after.page_verified ? 1 : 0,
             after.privacy_verified ? 1 : 0,
             after.cleanup_pending ? 1 : 0,
+            static_cast<unsigned long long>(after.cleanup_generation),
+            after.cleanup_child_pid,
             after.child_process_count,
             after.browser_process_count,
             after.page_count,
-            after.last_error.empty() ? "<empty>" : compact_burp_text(after.last_error, 700).c_str());
+            after.cleanup_reason.empty() ? "<empty>" : compact_burp_text(after.cleanup_reason, 240).c_str(),
+            after.last_error.empty() ? "<empty>" : compact_burp_text(after.last_error, 360).c_str(),
+            compact_burp_json(after.last_launch_diagnostics, 260).c_str(),
+            compact_burp_json(after.cleanup_diagnostics, 260).c_str());
     }
 
     void test_camoufox_last_error(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {

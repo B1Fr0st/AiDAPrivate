@@ -2768,17 +2768,92 @@ bool voyager::device_t::set_thread_context(std::uint32_t tid, const thread_conte
     req.dr0 = ctx.dr0; req.dr1 = ctx.dr1; req.dr2 = ctx.dr2; req.dr3 = ctx.dr3;
     req.dr6 = ctx.dr6; req.dr7 = ctx.dr7;
 
-    bool ok = send_request(ioctl_codes::TCTX(), &req, sizeof(req));
+    const DWORD tctx_ioctl = ioctl_codes::TCTX();
+    const bool debug_register_mask = (register_mask & ((1ULL << 18) | (1ULL << 19) | (1ULL << 20) | (1ULL << 21) | (1ULL << 22) | (1ULL << 23))) != 0;
+    diag::log_tagged_fmt("comm",
+        "TCTX set begin pid=%u tid=%u mask=0x%llX debug_register_mask=%d ioctl=0x%08X local_pid=%lu local_tid=%lu rip=0x%llX rip_class=%s rsp=0x%llX rsp_class=%s rflags=0x%llX dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX",
+        process_id_,
+        tid,
+        static_cast<unsigned long long>(register_mask),
+        debug_register_mask ? 1 : 0,
+        tctx_ioctl,
+        static_cast<unsigned long>(GetCurrentProcessId()),
+        static_cast<unsigned long>(GetCurrentThreadId()),
+        static_cast<unsigned long long>(ctx.rip),
+        tctx_address_class(ctx.rip),
+        static_cast<unsigned long long>(ctx.rsp),
+        tctx_address_class(ctx.rsp),
+        static_cast<unsigned long long>(ctx.rflags),
+        static_cast<unsigned long long>(ctx.dr0),
+        static_cast<unsigned long long>(ctx.dr1),
+        static_cast<unsigned long long>(ctx.dr2),
+        static_cast<unsigned long long>(ctx.dr3),
+        static_cast<unsigned long long>(ctx.dr6),
+        static_cast<unsigned long long>(ctx.dr7));
+
+    const ULONGLONG initial_start = GetTickCount64();
+    bool ok = send_request(tctx_ioctl, &req, sizeof(req));
     DWORD first_gle = ok ? ERROR_SUCCESS : GetLastError();
+    diag::log_tagged_fmt("comm",
+        "TCTX set initial pid=%u tid=%u ok=%d gle=%lu mask=0x%llX debug_register_mask=%d elapsed_ms=%llu ioctl=0x%08X rip=0x%llX rip_class=%s rsp=0x%llX rsp_class=%s rflags=0x%llX dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX",
+        process_id_,
+        tid,
+        ok ? 1 : 0,
+        static_cast<unsigned long>(first_gle),
+        static_cast<unsigned long long>(register_mask),
+        debug_register_mask ? 1 : 0,
+        static_cast<unsigned long long>(GetTickCount64() - initial_start),
+        tctx_ioctl,
+        static_cast<unsigned long long>(ctx.rip),
+        tctx_address_class(ctx.rip),
+        static_cast<unsigned long long>(ctx.rsp),
+        tctx_address_class(ctx.rsp),
+        static_cast<unsigned long long>(ctx.rflags),
+        static_cast<unsigned long long>(ctx.dr0),
+        static_cast<unsigned long long>(ctx.dr1),
+        static_cast<unsigned long long>(ctx.dr2),
+        static_cast<unsigned long long>(ctx.dr3),
+        static_cast<unsigned long long>(ctx.dr6),
+        static_cast<unsigned long long>(ctx.dr7));
     if (!ok) {
         std::uint32_t prev_count = 0;
+        const ULONGLONG suspend_start = GetTickCount64();
         bool suspended = suspend_thread(tid, &prev_count);
         DWORD suspend_gle = suspended ? ERROR_SUCCESS : GetLastError();
+        const ULONGLONG suspend_elapsed = GetTickCount64() - suspend_start;
         if (suspended) {
-            ok = send_request(ioctl_codes::TCTX(), &req, sizeof(req));
+            const ULONGLONG retry_start = GetTickCount64();
+            ok = send_request(tctx_ioctl, &req, sizeof(req));
             first_gle = ok ? ERROR_SUCCESS : GetLastError();
             std::uint32_t ignored = 0;
-            (void)resume_thread(tid, &ignored);
+            const ULONGLONG resume_start = GetTickCount64();
+            const bool resumed = resume_thread(tid, &ignored);
+            const DWORD resume_gle = resumed ? ERROR_SUCCESS : GetLastError();
+            diag::log_tagged_fmt("comm",
+                "TCTX set suspended_retry pid=%u tid=%u suspended=1 suspend_gle=%lu suspend_prev=%u suspend_elapsed_ms=%llu retry_ok=%d retry_gle=%lu retry_elapsed_ms=%llu resume_ok=%d resume_gle=%lu resume_prev=%u resume_elapsed_ms=%llu mask=0x%llX debug_register_mask=%d ioctl=0x%08X rip=0x%llX rsp=0x%llX dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX",
+                process_id_,
+                tid,
+                static_cast<unsigned long>(suspend_gle),
+                prev_count,
+                static_cast<unsigned long long>(suspend_elapsed),
+                ok ? 1 : 0,
+                static_cast<unsigned long>(first_gle),
+                static_cast<unsigned long long>(GetTickCount64() - retry_start),
+                resumed ? 1 : 0,
+                static_cast<unsigned long>(resume_gle),
+                ignored,
+                static_cast<unsigned long long>(GetTickCount64() - resume_start),
+                static_cast<unsigned long long>(register_mask),
+                debug_register_mask ? 1 : 0,
+                tctx_ioctl,
+                static_cast<unsigned long long>(ctx.rip),
+                static_cast<unsigned long long>(ctx.rsp),
+                static_cast<unsigned long long>(ctx.dr0),
+                static_cast<unsigned long long>(ctx.dr1),
+                static_cast<unsigned long long>(ctx.dr2),
+                static_cast<unsigned long long>(ctx.dr3),
+                static_cast<unsigned long long>(ctx.dr6),
+                static_cast<unsigned long long>(ctx.dr7));
         } else {
             RC_UM_DBG("TCTX set suspend_failed pid=%u tid=%u mask=0x%llX rip=0x%llX rsp=0x%llX gle=%lu",
                 process_id_,
@@ -2787,6 +2862,22 @@ bool voyager::device_t::set_thread_context(std::uint32_t tid, const thread_conte
                 ctx.rip,
                 ctx.rsp,
                 suspend_gle);
+            diag::log_tagged_fmt("comm",
+                "TCTX set suspend_failed pid=%u tid=%u mask=0x%llX debug_register_mask=%d initial_gle=%lu suspend_gle=%lu suspend_elapsed_ms=%llu rip=0x%llX rip_class=%s rsp=0x%llX rsp_class=%s rflags=0x%llX dr7=0x%llX ioctl=0x%08X",
+                process_id_,
+                tid,
+                static_cast<unsigned long long>(register_mask),
+                debug_register_mask ? 1 : 0,
+                static_cast<unsigned long>(first_gle),
+                static_cast<unsigned long>(suspend_gle),
+                static_cast<unsigned long long>(suspend_elapsed),
+                static_cast<unsigned long long>(ctx.rip),
+                tctx_address_class(ctx.rip),
+                static_cast<unsigned long long>(ctx.rsp),
+                tctx_address_class(ctx.rsp),
+                static_cast<unsigned long long>(ctx.rflags),
+                static_cast<unsigned long long>(ctx.dr7),
+                tctx_ioctl);
         }
     }
     if (!ok) {
@@ -2797,8 +2888,28 @@ bool voyager::device_t::set_thread_context(std::uint32_t tid, const thread_conte
             ctx.rip,
             ctx.rsp,
             first_gle,
-            ioctl_codes::TCTX());
+            tctx_ioctl);
     }
+    diag::log_tagged_fmt("comm",
+        "TCTX set final pid=%u tid=%u ok=%d gle=%lu mask=0x%llX debug_register_mask=%d ioctl=0x%08X rip=0x%llX rip_class=%s rsp=0x%llX rsp_class=%s rflags=0x%llX dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX",
+        process_id_,
+        tid,
+        ok ? 1 : 0,
+        static_cast<unsigned long>(first_gle),
+        static_cast<unsigned long long>(register_mask),
+        debug_register_mask ? 1 : 0,
+        tctx_ioctl,
+        static_cast<unsigned long long>(ctx.rip),
+        tctx_address_class(ctx.rip),
+        static_cast<unsigned long long>(ctx.rsp),
+        tctx_address_class(ctx.rsp),
+        static_cast<unsigned long long>(ctx.rflags),
+        static_cast<unsigned long long>(ctx.dr0),
+        static_cast<unsigned long long>(ctx.dr1),
+        static_cast<unsigned long long>(ctx.dr2),
+        static_cast<unsigned long long>(ctx.dr3),
+        static_cast<unsigned long long>(ctx.dr6),
+        static_cast<unsigned long long>(ctx.dr7));
     return ok;
 }
 
@@ -3138,10 +3249,52 @@ bool voyager::device_t::set_hardware_breakpoint(std::uint32_t tid, int index, st
         return false;
     }
 
+    const ULONGLONG begin = GetTickCount64();
+    diag::log_tagged_fmt("comm",
+        "HWBP set begin pid=%u tid=%u index=%d address=0x%llX type=%d size=%d connected=%d",
+        process_id_,
+        tid,
+        index,
+        static_cast<unsigned long long>(address),
+        type,
+        size,
+        is_connected() ? 1 : 0);
+
     thread_context ctx{};
     if (!get_thread_context(tid, ctx)) {
+        DWORD gle = GetLastError();
+        diag::log_tagged_fmt("comm",
+            "HWBP set get_before_failed pid=%u tid=%u index=%d address=0x%llX type=%d size=%d gle=%lu elapsed_ms=%llu",
+            process_id_,
+            tid,
+            index,
+            static_cast<unsigned long long>(address),
+            type,
+            size,
+            static_cast<unsigned long>(gle),
+            static_cast<unsigned long long>(GetTickCount64() - begin));
         return false;
     }
+    const thread_context before = ctx;
+    diag::log_tagged_fmt("comm",
+        "HWBP set before pid=%u tid=%u index=%d address=0x%llX type=%d size=%d rip=0x%llX rip_class=%s rsp=0x%llX rsp_class=%s rflags=0x%llX dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX",
+        process_id_,
+        tid,
+        index,
+        static_cast<unsigned long long>(address),
+        type,
+        size,
+        static_cast<unsigned long long>(before.rip),
+        tctx_address_class(before.rip),
+        static_cast<unsigned long long>(before.rsp),
+        tctx_address_class(before.rsp),
+        static_cast<unsigned long long>(before.rflags),
+        static_cast<unsigned long long>(before.dr0),
+        static_cast<unsigned long long>(before.dr1),
+        static_cast<unsigned long long>(before.dr2),
+        static_cast<unsigned long long>(before.dr3),
+        static_cast<unsigned long long>(before.dr6),
+        static_cast<unsigned long long>(before.dr7));
 
     switch (index) {
         case 0: ctx.dr0 = address; break;
@@ -3183,7 +3336,9 @@ bool voyager::device_t::set_hardware_breakpoint(std::uint32_t tid, int index, st
     std::uint64_t mask = (1ULL << 22) | (1ULL << 23);
     mask |= (1ULL << (18 + index));
 
+    const ULONGLONG set_start = GetTickCount64();
     if (!set_thread_context(tid, ctx, mask)) {
+        DWORD gle = GetLastError();
         RC_UM_DBG("set_hardware_breakpoint: set_context_failed pid=%u tid=%u index=%d address=0x%llX type=%d size=%d dr7=0x%llX mask=0x%llX",
             process_id_,
             tid,
@@ -3193,16 +3348,71 @@ bool voyager::device_t::set_hardware_breakpoint(std::uint32_t tid, int index, st
             size,
             ctx.dr7,
             mask);
+        diag::log_tagged_fmt("comm",
+            "HWBP set context_failed pid=%u tid=%u index=%d address=0x%llX type=%d size=%d gle=%lu mask=0x%llX before_rip=0x%llX before_rsp=0x%llX before_dr0=0x%llX before_dr1=0x%llX before_dr2=0x%llX before_dr3=0x%llX before_dr6=0x%llX before_dr7=0x%llX requested_dr0=0x%llX requested_dr1=0x%llX requested_dr2=0x%llX requested_dr3=0x%llX requested_dr6=0x%llX requested_dr7=0x%llX set_elapsed_ms=%llu total_elapsed_ms=%llu",
+            process_id_,
+            tid,
+            index,
+            static_cast<unsigned long long>(address),
+            type,
+            size,
+            static_cast<unsigned long>(gle),
+            static_cast<unsigned long long>(mask),
+            static_cast<unsigned long long>(before.rip),
+            static_cast<unsigned long long>(before.rsp),
+            static_cast<unsigned long long>(before.dr0),
+            static_cast<unsigned long long>(before.dr1),
+            static_cast<unsigned long long>(before.dr2),
+            static_cast<unsigned long long>(before.dr3),
+            static_cast<unsigned long long>(before.dr6),
+            static_cast<unsigned long long>(before.dr7),
+            static_cast<unsigned long long>(ctx.dr0),
+            static_cast<unsigned long long>(ctx.dr1),
+            static_cast<unsigned long long>(ctx.dr2),
+            static_cast<unsigned long long>(ctx.dr3),
+            static_cast<unsigned long long>(ctx.dr6),
+            static_cast<unsigned long long>(ctx.dr7),
+            static_cast<unsigned long long>(GetTickCount64() - set_start),
+            static_cast<unsigned long long>(GetTickCount64() - begin));
         return false;
     }
+    const DWORD set_gle = GetLastError();
+    diag::log_tagged_fmt("comm",
+        "HWBP set context_ok pid=%u tid=%u index=%d address=0x%llX type=%d size=%d gle=%lu mask=0x%llX requested_dr0=0x%llX requested_dr1=0x%llX requested_dr2=0x%llX requested_dr3=0x%llX requested_dr6=0x%llX requested_dr7=0x%llX set_elapsed_ms=%llu",
+        process_id_,
+        tid,
+        index,
+        static_cast<unsigned long long>(address),
+        type,
+        size,
+        static_cast<unsigned long>(set_gle),
+        static_cast<unsigned long long>(mask),
+        static_cast<unsigned long long>(ctx.dr0),
+        static_cast<unsigned long long>(ctx.dr1),
+        static_cast<unsigned long long>(ctx.dr2),
+        static_cast<unsigned long long>(ctx.dr3),
+        static_cast<unsigned long long>(ctx.dr6),
+        static_cast<unsigned long long>(ctx.dr7),
+        static_cast<unsigned long long>(GetTickCount64() - set_start));
 
     thread_context verify{};
     if (!get_thread_context(tid, verify)) {
+        DWORD gle = GetLastError();
         RC_UM_DBG("set_hardware_breakpoint: verify_get_failed pid=%u tid=%u index=%d address=0x%llX",
             process_id_,
             tid,
             index,
             address);
+        diag::log_tagged_fmt("comm",
+            "HWBP set verify_get_failed pid=%u tid=%u index=%d address=0x%llX type=%d size=%d gle=%lu total_elapsed_ms=%llu",
+            process_id_,
+            tid,
+            index,
+            static_cast<unsigned long long>(address),
+            type,
+            size,
+            static_cast<unsigned long>(gle),
+            static_cast<unsigned long long>(GetTickCount64() - begin));
         return false;
     }
 
@@ -3217,6 +3427,31 @@ bool voyager::device_t::set_hardware_breakpoint(std::uint32_t tid, int index, st
     const bool address_ok = verify_addr == address;
     const bool dr7_ok = (verify.dr7 & ((3ULL << (16 + index * 4)) | (3ULL << (18 + index * 4)))) ==
         (ctx.dr7 & ((3ULL << (16 + index * 4)) | (3ULL << (18 + index * 4))));
+    diag::log_tagged_fmt("comm",
+        "HWBP set verify pid=%u tid=%u index=%d address=0x%llX type=%d size=%d enabled=%d address_ok=%d dr7_ok=%d verify_addr=0x%llX rip=0x%llX rip_class=%s rsp=0x%llX rsp_class=%s rflags=0x%llX dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX expected_dr7=0x%llX total_elapsed_ms=%llu",
+        process_id_,
+        tid,
+        index,
+        static_cast<unsigned long long>(address),
+        type,
+        size,
+        enabled ? 1 : 0,
+        address_ok ? 1 : 0,
+        dr7_ok ? 1 : 0,
+        static_cast<unsigned long long>(verify_addr),
+        static_cast<unsigned long long>(verify.rip),
+        tctx_address_class(verify.rip),
+        static_cast<unsigned long long>(verify.rsp),
+        tctx_address_class(verify.rsp),
+        static_cast<unsigned long long>(verify.rflags),
+        static_cast<unsigned long long>(verify.dr0),
+        static_cast<unsigned long long>(verify.dr1),
+        static_cast<unsigned long long>(verify.dr2),
+        static_cast<unsigned long long>(verify.dr3),
+        static_cast<unsigned long long>(verify.dr6),
+        static_cast<unsigned long long>(verify.dr7),
+        static_cast<unsigned long long>(ctx.dr7),
+        static_cast<unsigned long long>(GetTickCount64() - begin));
     if (!enabled || !address_ok || !dr7_ok) {
         RC_UM_DBG("set_hardware_breakpoint: verify_mismatch pid=%u tid=%u index=%d address=0x%llX verify_addr=0x%llX dr7=0x%llX expected_dr7=0x%llX enabled=%d address_ok=%d dr7_ok=%d",
             process_id_,
@@ -3229,6 +3464,7 @@ bool voyager::device_t::set_hardware_breakpoint(std::uint32_t tid, int index, st
             enabled ? 1 : 0,
             address_ok ? 1 : 0,
             dr7_ok ? 1 : 0);
+        SetLastError(ERROR_INVALID_DATA);
         return false;
     }
 
@@ -3246,10 +3482,43 @@ bool voyager::device_t::clear_hardware_breakpoint(std::uint32_t tid, int index) 
         return false;
     }
 
+    const ULONGLONG begin = GetTickCount64();
+    diag::log_tagged_fmt("comm",
+        "HWBP clear begin pid=%u tid=%u index=%d connected=%d",
+        process_id_,
+        tid,
+        index,
+        is_connected() ? 1 : 0);
+
     thread_context ctx{};
     if (!get_thread_context(tid, ctx)) {
+        DWORD gle = GetLastError();
+        diag::log_tagged_fmt("comm",
+            "HWBP clear get_before_failed pid=%u tid=%u index=%d gle=%lu elapsed_ms=%llu",
+            process_id_,
+            tid,
+            index,
+            static_cast<unsigned long>(gle),
+            static_cast<unsigned long long>(GetTickCount64() - begin));
         return false;
     }
+    const thread_context before = ctx;
+    diag::log_tagged_fmt("comm",
+        "HWBP clear before pid=%u tid=%u index=%d rip=0x%llX rip_class=%s rsp=0x%llX rsp_class=%s rflags=0x%llX dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX",
+        process_id_,
+        tid,
+        index,
+        static_cast<unsigned long long>(before.rip),
+        tctx_address_class(before.rip),
+        static_cast<unsigned long long>(before.rsp),
+        tctx_address_class(before.rsp),
+        static_cast<unsigned long long>(before.rflags),
+        static_cast<unsigned long long>(before.dr0),
+        static_cast<unsigned long long>(before.dr1),
+        static_cast<unsigned long long>(before.dr2),
+        static_cast<unsigned long long>(before.dr3),
+        static_cast<unsigned long long>(before.dr6),
+        static_cast<unsigned long long>(before.dr7));
 
     switch (index) {
         case 0: ctx.dr0 = 0; break;
@@ -3272,13 +3541,90 @@ bool voyager::device_t::clear_hardware_breakpoint(std::uint32_t tid, int index) 
 
     std::uint64_t mask = (1ULL << (18 + index)) | (1ULL << 22) | (1ULL << 23);
 
+    const ULONGLONG set_start = GetTickCount64();
     if (!set_thread_context(tid, ctx, mask)) {
+        DWORD gle = GetLastError();
         RC_UM_DBG("clear_hardware_breakpoint: set_context_failed pid=%u tid=%u index=%d dr7=0x%llX mask=0x%llX",
             process_id_,
             tid,
             index,
             ctx.dr7,
             mask);
+        diag::log_tagged_fmt("comm",
+            "HWBP clear context_failed pid=%u tid=%u index=%d gle=%lu mask=0x%llX before_rip=0x%llX before_rsp=0x%llX before_dr0=0x%llX before_dr1=0x%llX before_dr2=0x%llX before_dr3=0x%llX before_dr6=0x%llX before_dr7=0x%llX requested_dr0=0x%llX requested_dr1=0x%llX requested_dr2=0x%llX requested_dr3=0x%llX requested_dr6=0x%llX requested_dr7=0x%llX set_elapsed_ms=%llu total_elapsed_ms=%llu",
+            process_id_,
+            tid,
+            index,
+            static_cast<unsigned long>(gle),
+            static_cast<unsigned long long>(mask),
+            static_cast<unsigned long long>(before.rip),
+            static_cast<unsigned long long>(before.rsp),
+            static_cast<unsigned long long>(before.dr0),
+            static_cast<unsigned long long>(before.dr1),
+            static_cast<unsigned long long>(before.dr2),
+            static_cast<unsigned long long>(before.dr3),
+            static_cast<unsigned long long>(before.dr6),
+            static_cast<unsigned long long>(before.dr7),
+            static_cast<unsigned long long>(ctx.dr0),
+            static_cast<unsigned long long>(ctx.dr1),
+            static_cast<unsigned long long>(ctx.dr2),
+            static_cast<unsigned long long>(ctx.dr3),
+            static_cast<unsigned long long>(ctx.dr6),
+            static_cast<unsigned long long>(ctx.dr7),
+            static_cast<unsigned long long>(GetTickCount64() - set_start),
+            static_cast<unsigned long long>(GetTickCount64() - begin));
+        return false;
+    }
+    const DWORD set_gle = GetLastError();
+    thread_context verify{};
+    if (!get_thread_context(tid, verify)) {
+        DWORD gle = GetLastError();
+        diag::log_tagged_fmt("comm",
+            "HWBP clear verify_get_failed pid=%u tid=%u index=%d set_gle=%lu verify_gle=%lu mask=0x%llX total_elapsed_ms=%llu",
+            process_id_,
+            tid,
+            index,
+            static_cast<unsigned long>(set_gle),
+            static_cast<unsigned long>(gle),
+            static_cast<unsigned long long>(mask),
+            static_cast<unsigned long long>(GetTickCount64() - begin));
+        return false;
+    }
+    std::uint64_t verify_addr = 0;
+    switch (index) {
+        case 0: verify_addr = verify.dr0; break;
+        case 1: verify_addr = verify.dr1; break;
+        case 2: verify_addr = verify.dr2; break;
+        case 3: verify_addr = verify.dr3; break;
+    }
+    const bool enabled_clear = (verify.dr7 & (1ULL << (index * 2))) == 0;
+    const bool address_clear = verify_addr == 0;
+    const bool dr7_clear = (verify.dr7 & ((3ULL << (16 + index * 4)) | (3ULL << (18 + index * 4)))) == 0;
+    diag::log_tagged_fmt("comm",
+        "HWBP clear verify pid=%u tid=%u index=%d enabled_clear=%d address_clear=%d dr7_clear=%d verify_addr=0x%llX set_gle=%lu mask=0x%llX rip=0x%llX rip_class=%s rsp=0x%llX rsp_class=%s rflags=0x%llX dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX total_elapsed_ms=%llu",
+        process_id_,
+        tid,
+        index,
+        enabled_clear ? 1 : 0,
+        address_clear ? 1 : 0,
+        dr7_clear ? 1 : 0,
+        static_cast<unsigned long long>(verify_addr),
+        static_cast<unsigned long>(set_gle),
+        static_cast<unsigned long long>(mask),
+        static_cast<unsigned long long>(verify.rip),
+        tctx_address_class(verify.rip),
+        static_cast<unsigned long long>(verify.rsp),
+        tctx_address_class(verify.rsp),
+        static_cast<unsigned long long>(verify.rflags),
+        static_cast<unsigned long long>(verify.dr0),
+        static_cast<unsigned long long>(verify.dr1),
+        static_cast<unsigned long long>(verify.dr2),
+        static_cast<unsigned long long>(verify.dr3),
+        static_cast<unsigned long long>(verify.dr6),
+        static_cast<unsigned long long>(verify.dr7),
+        static_cast<unsigned long long>(GetTickCount64() - begin));
+    if (!enabled_clear || !address_clear || !dr7_clear) {
+        SetLastError(ERROR_INVALID_DATA);
         return false;
     }
     return true;

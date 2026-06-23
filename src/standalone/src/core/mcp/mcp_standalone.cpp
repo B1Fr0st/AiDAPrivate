@@ -135,13 +135,13 @@ namespace
 
     struct mcp_concurrency_config_t
     {
-        std::size_t http_worker_threads = 256;
-        std::size_t http_max_queued_requests = 32768;
-        std::size_t batch_worker_threads = 128;
-        std::size_t batch_max_queued_requests = 65536;
-        std::size_t tool_worker_threads = 128;
-        std::size_t tool_max_queued_requests = 65536;
-        std::size_t max_concurrent_streams = 128;
+        std::size_t http_worker_threads = 16;
+        std::size_t http_max_queued_requests = 4096;
+        std::size_t batch_worker_threads = 8;
+        std::size_t batch_max_queued_requests = 4096;
+        std::size_t tool_worker_threads = 8;
+        std::size_t tool_max_queued_requests = 4096;
+        std::size_t max_concurrent_streams = 16;
         std::size_t hardware_threads = 16;
     };
 
@@ -191,17 +191,17 @@ namespace
     {
         mcp_concurrency_config_t cfg;
         cfg.hardware_threads = mcp_hardware_threads();
-        cfg.http_worker_threads = read_size_env_or_default("AIDA_MCP_HTTP_WORKERS", scaled_worker_count(256, 8, 768), 64, 1024);
-        cfg.http_max_queued_requests = read_size_env_or_default("AIDA_MCP_HTTP_QUEUE", 32768, 1024, 262144);
-        cfg.batch_worker_threads = read_size_env_or_default("AIDA_MCP_BATCH_WORKERS", scaled_worker_count(128, 4, 512), 32, 768);
-        cfg.batch_max_queued_requests = read_size_env_or_default("AIDA_MCP_BATCH_QUEUE", 65536, 1024, 262144);
-        cfg.tool_worker_threads = read_size_env_or_default("AIDA_MCP_TOOL_WORKERS", scaled_worker_count(128, 4, 512), 32, 768);
-        cfg.tool_max_queued_requests = read_size_env_or_default("AIDA_MCP_TOOL_QUEUE", 65536, 1024, 262144);
-        const std::size_t stream_cap = (std::max)(std::size_t{16}, (std::min)(std::size_t{512}, cfg.http_worker_threads > 16 ? cfg.http_worker_threads - 16 : cfg.http_worker_threads));
-        const std::size_t stream_floor = (std::min)(std::size_t{128}, stream_cap);
-        const std::size_t stream_scaled = cfg.hardware_threads <= stream_cap / 4 ? cfg.hardware_threads * 4 : stream_cap;
-        const std::size_t stream_fallback = clamp_size_value((std::max)(stream_floor, stream_scaled), 16, stream_cap);
-        cfg.max_concurrent_streams = read_size_env_or_default("AIDA_MCP_MAX_STREAMS", stream_fallback, 16, stream_cap);
+        cfg.http_worker_threads = read_size_env_or_default("AIDA_MCP_HTTP_WORKERS", scaled_worker_count(8, 2, 32), 1, 1024);
+        cfg.http_max_queued_requests = read_size_env_or_default("AIDA_MCP_HTTP_QUEUE", 4096, 64, 262144);
+        cfg.batch_worker_threads = read_size_env_or_default("AIDA_MCP_BATCH_WORKERS", scaled_worker_count(4, 1, 16), 1, 768);
+        cfg.batch_max_queued_requests = read_size_env_or_default("AIDA_MCP_BATCH_QUEUE", 4096, 64, 262144);
+        cfg.tool_worker_threads = read_size_env_or_default("AIDA_MCP_TOOL_WORKERS", scaled_worker_count(4, 1, 16), 1, 768);
+        cfg.tool_max_queued_requests = read_size_env_or_default("AIDA_MCP_TOOL_QUEUE", 4096, 64, 262144);
+        const std::size_t stream_cap = (std::max)(std::size_t{16}, (std::min)(std::size_t{512}, cfg.http_worker_threads));
+        const std::size_t stream_floor = (std::min)(std::size_t{16}, stream_cap);
+        const std::size_t stream_scaled = cfg.hardware_threads <= stream_cap / 2 ? cfg.hardware_threads * 2 : stream_cap;
+        const std::size_t stream_fallback = clamp_size_value((std::max)(stream_floor, stream_scaled), 1, stream_cap);
+        cfg.max_concurrent_streams = read_size_env_or_default("AIDA_MCP_MAX_STREAMS", stream_fallback, 1, stream_cap);
         return cfg;
     }
 
@@ -1835,32 +1835,6 @@ namespace
         }
     };
 
-    struct scoped_call_metadata_t
-    {
-        std::string prev_diag;
-        std::string prev_tool;
-        std::uint64_t prev_deadline = 0;
-
-        scoped_call_metadata_t(const std::string& diag_id, const std::string& tool_name, std::uint64_t deadline_ms)
-            : prev_diag(tls_current_call_diag_id)
-            , prev_tool(tls_current_call_tool_name)
-            , prev_deadline(tls_current_call_deadline_ms)
-        {
-            tls_current_call_diag_id = diag_id;
-            tls_current_call_tool_name = tool_name;
-            tls_current_call_deadline_ms = deadline_ms;
-        }
-
-        scoped_call_metadata_t(const scoped_call_metadata_t&) = delete;
-        scoped_call_metadata_t& operator=(const scoped_call_metadata_t&) = delete;
-
-        ~scoped_call_metadata_t()
-        {
-            tls_current_call_diag_id = std::move(prev_diag);
-            tls_current_call_tool_name = std::move(prev_tool);
-            tls_current_call_deadline_ms = prev_deadline;
-        }
-    };
 }
 
 cancel_token_ptr_t make_call_cancel_token(bool cancelled)
@@ -1899,6 +1873,27 @@ const char* current_call_tool_name() noexcept
 std::uint64_t current_call_deadline_ms() noexcept
 {
     return tls_current_call_deadline_ms;
+}
+
+scoped_call_metadata_t::scoped_call_metadata_t(const std::string& diag_id, const std::string& tool_name, std::uint64_t deadline_ms)
+    : _prev_diag(tls_current_call_diag_id)
+    , _prev_tool(tls_current_call_tool_name)
+    , _prev_deadline(tls_current_call_deadline_ms)
+    , _active(true)
+{
+    tls_current_call_diag_id = diag_id;
+    tls_current_call_tool_name = tool_name;
+    tls_current_call_deadline_ms = deadline_ms;
+}
+
+scoped_call_metadata_t::~scoped_call_metadata_t()
+{
+    if (!_active)
+        return;
+    tls_current_call_diag_id = std::move(_prev_diag);
+    tls_current_call_tool_name = std::move(_prev_tool);
+    tls_current_call_deadline_ms = _prev_deadline;
+    _active = false;
 }
 
 scoped_call_cancel_t::scoped_call_cancel_t(cancel_token_ptr_t token)

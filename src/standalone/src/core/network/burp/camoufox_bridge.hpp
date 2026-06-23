@@ -98,6 +98,11 @@ struct bridge_status_t
     bool           page_verified    = false;
     bool           child_alive      = false;
     bool           cleanup_pending  = false;
+    uint64_t       cleanup_generation = 0;
+    uint64_t       cleanup_started_ms = 0;
+    uint32_t       cleanup_child_pid = 0;
+    std::string    cleanup_reason;
+    nlohmann::json cleanup_diagnostics;
     uint64_t       generation       = 0;
     uint64_t       last_launch_ms   = 0;
     uint64_t       last_nav_ms      = 0;

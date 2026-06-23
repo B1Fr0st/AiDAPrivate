@@ -520,6 +520,54 @@ namespace
 
     std::unordered_map<uint32_t, process_ctx_t> g_processes;
 
+    thread_local driver_bridge::remote_call_context_t g_remote_call_context_tls;
+    thread_local bool g_remote_call_context_active_tls = false;
+
+    const char* nonempty_cstr(const char* value, const char* fallback) noexcept
+    {
+        return value && value[0] ? value : fallback;
+    }
+
+    struct remote_call_snapshot_t
+    {
+        const char* label = "";
+        const char* tool = "";
+        const char* diag_id = "";
+        uint32_t pid = 0;
+        uint32_t timeout_ms = 0;
+        uint64_t deadline_ms = 0;
+        bool cancelled = false;
+        bool require_deadline = false;
+        bool context_active = false;
+    };
+
+    remote_call_snapshot_t capture_remote_call_snapshot() noexcept
+    {
+        remote_call_snapshot_t snapshot{};
+        const driver_bridge::remote_call_context_t* ctx = g_remote_call_context_active_tls ? &g_remote_call_context_tls : nullptr;
+        snapshot.context_active = ctx != nullptr;
+        snapshot.label = ctx ? nonempty_cstr(ctx->label, "driver_bridge::call_function") : "driver_bridge::call_function";
+        snapshot.tool = ctx ? nonempty_cstr(ctx->tool, mcp_standalone::current_call_tool_name()) : mcp_standalone::current_call_tool_name();
+        snapshot.diag_id = ctx ? nonempty_cstr(ctx->diag_id, mcp_standalone::current_call_diag_id()) : mcp_standalone::current_call_diag_id();
+        snapshot.pid = ctx && ctx->pid != 0 ? ctx->pid : driver_bridge::attached_pid();
+        snapshot.timeout_ms = ctx ? ctx->timeout_ms : 0;
+        snapshot.deadline_ms = ctx && ctx->deadline_ms != 0 ? ctx->deadline_ms : mcp_standalone::current_call_deadline_ms();
+        snapshot.require_deadline = ctx ? ctx->require_deadline : false;
+        snapshot.cancelled = mcp_standalone::current_call_cancelled() ||
+            (ctx && ctx->cancel_token && ctx->cancel_token->load(std::memory_order_acquire));
+        snapshot.label = nonempty_cstr(snapshot.label, "");
+        snapshot.tool = nonempty_cstr(snapshot.tool, "");
+        snapshot.diag_id = nonempty_cstr(snapshot.diag_id, "");
+        return snapshot;
+    }
+
+    uint64_t deadline_remaining_ms(uint64_t deadline_ms, ULONGLONG now) noexcept
+    {
+        if (deadline_ms == 0 || now >= deadline_ms)
+            return 0;
+        return deadline_ms - now;
+    }
+
     void release_ctx_handle(process_ctx_t& ctx)
     {
         if (ctx.h_process) {
@@ -565,7 +613,22 @@ namespace
         va_start(ap, fmt);
         _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, ap);
         va_end(ap);
-        anti_tamper::webhook::write_log_critical("driver", buf);
+        auto starts_with = [](const char* text, const char* prefix) -> bool {
+            return text && prefix && std::strncmp(text, prefix, std::strlen(prefix)) == 0;
+        };
+        const bool routine_kernel_probe =
+            starts_with(buf, "kernel_anti_debug_query_pre ") ||
+            starts_with(buf, "kernel_anti_debug_clear_dr_pre ") ||
+            starts_with(buf, "kernel_anti_debug_clear_process_dr_pre ") ||
+            starts_with(buf, "kernel_anti_debug_scan_debuggers_pre ") ||
+            starts_with(buf, "kernel_anti_debug_query_post ok=1 ") ||
+            starts_with(buf, "kernel_anti_debug_clear_dr_post ok=1 ") ||
+            starts_with(buf, "kernel_anti_debug_clear_process_dr_post ok=1 ") ||
+            starts_with(buf, "kernel_anti_debug_scan_debuggers_post ok=1 ");
+        if (routine_kernel_probe)
+            anti_tamper::webhook::write_log("driver", buf);
+        else
+            anti_tamper::webhook::write_log_critical("driver", buf);
     }
 
     std::vector<driver_bridge::thread_info_t> enumerate_threads_usermode_snapshot(uint32_t pid)
@@ -1588,6 +1651,64 @@ namespace
 namespace driver_bridge
 {
     bool refresh_kernel_context_locked(uint32_t pid, process_ctx_t& ctx);
+
+    scoped_remote_call_context_t::scoped_remote_call_context_t(const remote_call_context_t& context)
+        : previous_(g_remote_call_context_tls)
+        , previous_active_(g_remote_call_context_active_tls)
+        , active_(true)
+    {
+        g_remote_call_context_tls = context;
+        g_remote_call_context_active_tls = true;
+    }
+
+    scoped_remote_call_context_t::~scoped_remote_call_context_t()
+    {
+        if (!active_)
+            return;
+        if (previous_active_) {
+            g_remote_call_context_tls = previous_;
+            g_remote_call_context_active_tls = true;
+        } else {
+            g_remote_call_context_tls = {};
+            g_remote_call_context_active_tls = false;
+        }
+        active_ = false;
+    }
+
+    const char* current_remote_call_label() noexcept
+    {
+        return capture_remote_call_snapshot().label;
+    }
+
+    const char* current_remote_call_tool_name() noexcept
+    {
+        return capture_remote_call_snapshot().tool;
+    }
+
+    const char* current_remote_call_diag_id() noexcept
+    {
+        return capture_remote_call_snapshot().diag_id;
+    }
+
+    uint32_t current_remote_call_pid() noexcept
+    {
+        return capture_remote_call_snapshot().pid;
+    }
+
+    uint32_t current_remote_call_timeout_ms() noexcept
+    {
+        return capture_remote_call_snapshot().timeout_ms;
+    }
+
+    uint64_t current_remote_call_deadline_ms() noexcept
+    {
+        return capture_remote_call_snapshot().deadline_ms;
+    }
+
+    bool current_remote_call_cancelled() noexcept
+    {
+        return capture_remote_call_snapshot().cancelled;
+    }
 
     void set_log_callback(log_fn_t fn)
     {
@@ -4965,37 +5086,76 @@ namespace driver_bridge
     uint64_t call_function(uint64_t function_address, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4)
     {
         const ULONGLONG call_start = GetTickCount64();
-        const std::uint64_t deadline = mcp_standalone::current_call_deadline_ms();
-        const bool cancel_at_entry = mcp_standalone::current_call_cancelled();
+        const remote_call_snapshot_t call_ctx = capture_remote_call_snapshot();
+        const uint32_t active_at_entry = attached_pid();
         diag::log_tagged_fmt("driver",
-            "call_function_entry fn=0x%llX arg1=0x%llX arg2=0x%llX arg3=0x%llX arg4=0x%llX active_pid=%u cancelled=%d deadline_ms=%llu diag_id=%s",
+            "call_function_entry label=%s tool=%s diag_id=%s pid=%u active_pid=%u fn=0x%llX arg1=0x%llX arg2=0x%llX arg3=0x%llX arg4=0x%llX timeout_ms=%u deadline_ms=%llu deadline_remaining_ms=%llu cancelled=%d require_deadline=%d context=%d",
+            call_ctx.label,
+            call_ctx.tool,
+            call_ctx.diag_id,
+            call_ctx.pid,
+            active_at_entry,
             static_cast<unsigned long long>(function_address),
             static_cast<unsigned long long>(arg1),
             static_cast<unsigned long long>(arg2),
             static_cast<unsigned long long>(arg3),
             static_cast<unsigned long long>(arg4),
-            attached_pid(),
-            cancel_at_entry ? 1 : 0,
-            static_cast<unsigned long long>(deadline),
-            mcp_standalone::current_call_diag_id());
+            call_ctx.timeout_ms,
+            static_cast<unsigned long long>(call_ctx.deadline_ms),
+            static_cast<unsigned long long>(deadline_remaining_ms(call_ctx.deadline_ms, call_start)),
+            call_ctx.cancelled ? 1 : 0,
+            call_ctx.require_deadline ? 1 : 0,
+            call_ctx.context_active ? 1 : 0);
         if (function_address == 0) {
             SetLastError(ERROR_INVALID_PARAMETER);
             diag::log_tagged_fmt("driver",
-                "call_function_reject fn=0x%llX reason=invalid_function elapsed_ms=%llu",
+                "call_function_reject label=%s tool=%s diag_id=%s pid=%u active_pid=%u fn=0x%llX reason=invalid_function elapsed_ms=%llu gle=%lu status=%s last_error=%s",
+                call_ctx.label,
+                call_ctx.tool,
+                call_ctx.diag_id,
+                call_ctx.pid,
+                attached_pid(),
                 static_cast<unsigned long long>(function_address),
-                static_cast<unsigned long long>(GetTickCount64() - call_start));
+                static_cast<unsigned long long>(GetTickCount64() - call_start),
+                static_cast<unsigned long>(GetLastError()),
+                status().c_str(),
+                last_error().c_str());
             return 0;
         }
-        if (cancel_at_entry || (deadline != 0 && GetTickCount64() >= deadline)) {
-            SetLastError(cancel_at_entry ? ERROR_CANCELLED : ERROR_TIMEOUT);
+        if (call_ctx.require_deadline && call_ctx.deadline_ms == 0) {
+            SetLastError(ERROR_TIMEOUT);
             diag::log_tagged_fmt("driver",
-                "call_function_deadline_preempt fn=0x%llX active_pid=%u cancelled=%d deadline_ms=%llu elapsed_ms=%llu diag_id=%s",
-                static_cast<unsigned long long>(function_address),
+                "call_function_reject label=%s tool=%s diag_id=%s pid=%u active_pid=%u fn=0x%llX reason=missing_required_deadline timeout_ms=%u elapsed_ms=%llu gle=%lu status=%s last_error=%s",
+                call_ctx.label,
+                call_ctx.tool,
+                call_ctx.diag_id,
+                call_ctx.pid,
                 attached_pid(),
-                cancel_at_entry ? 1 : 0,
-                static_cast<unsigned long long>(deadline),
+                static_cast<unsigned long long>(function_address),
+                call_ctx.timeout_ms,
                 static_cast<unsigned long long>(GetTickCount64() - call_start),
-                mcp_standalone::current_call_diag_id());
+                static_cast<unsigned long>(GetLastError()),
+                status().c_str(),
+                last_error().c_str());
+            return 0;
+        }
+        if (call_ctx.cancelled || (call_ctx.deadline_ms != 0 && call_start >= call_ctx.deadline_ms)) {
+            SetLastError(call_ctx.cancelled ? ERROR_CANCELLED : ERROR_TIMEOUT);
+            diag::log_tagged_fmt("driver",
+                "call_function_deadline_preempt label=%s tool=%s diag_id=%s pid=%u active_pid=%u fn=0x%llX cancelled=%d timeout_ms=%u deadline_ms=%llu elapsed_ms=%llu gle=%lu status=%s last_error=%s",
+                call_ctx.label,
+                call_ctx.tool,
+                call_ctx.diag_id,
+                call_ctx.pid,
+                attached_pid(),
+                static_cast<unsigned long long>(function_address),
+                call_ctx.cancelled ? 1 : 0,
+                call_ctx.timeout_ms,
+                static_cast<unsigned long long>(call_ctx.deadline_ms),
+                static_cast<unsigned long long>(GetTickCount64() - call_start),
+                static_cast<unsigned long>(GetLastError()),
+                status().c_str(),
+                last_error().c_str());
             return 0;
         }
 
@@ -5007,10 +5167,17 @@ namespace driver_bridge
         if (!kernel_mode) {
             require_kernel_fail("call_function");
             diag::log_tagged_fmt("driver",
-                "call_function_kernel_unavailable fn=0x%llX active_pid=%u elapsed_ms=%llu status=%s last_error=%s",
-                static_cast<unsigned long long>(function_address),
+                "call_function_kernel_unavailable label=%s tool=%s diag_id=%s pid=%u active_pid=%u fn=0x%llX timeout_ms=%u deadline_ms=%llu elapsed_ms=%llu gle=%lu status=%s last_error=%s",
+                call_ctx.label,
+                call_ctx.tool,
+                call_ctx.diag_id,
+                call_ctx.pid,
                 attached_pid(),
+                static_cast<unsigned long long>(function_address),
+                call_ctx.timeout_ms,
+                static_cast<unsigned long long>(call_ctx.deadline_ms),
                 static_cast<unsigned long long>(GetTickCount64() - call_start),
+                static_cast<unsigned long>(GetLastError()),
                 status().c_str(),
                 last_error().c_str());
             return 0;
@@ -5018,72 +5185,129 @@ namespace driver_bridge
 
         uint64_t arc_result = 0;
         diag::log_tagged_fmt("driver",
-            "call_function_arc_begin fn=0x%llX active_pid=%u cancelled=%d deadline_ms=%llu elapsed_ms=%llu diag_id=%s",
-            static_cast<unsigned long long>(function_address),
+            "call_function_arc_begin label=%s tool=%s diag_id=%s pid=%u active_pid=%u fn=0x%llX cancelled=%d timeout_ms=%u deadline_ms=%llu deadline_remaining_ms=%llu elapsed_ms=%llu",
+            call_ctx.label,
+            call_ctx.tool,
+            call_ctx.diag_id,
+            call_ctx.pid,
             attached_pid(),
-            mcp_standalone::current_call_cancelled() ? 1 : 0,
-            static_cast<unsigned long long>(deadline),
-            static_cast<unsigned long long>(GetTickCount64() - call_start),
-            mcp_standalone::current_call_diag_id());
+            static_cast<unsigned long long>(function_address),
+            current_remote_call_cancelled() ? 1 : 0,
+            call_ctx.timeout_ms,
+            static_cast<unsigned long long>(call_ctx.deadline_ms),
+            static_cast<unsigned long long>(deadline_remaining_ms(call_ctx.deadline_ms, GetTickCount64())),
+            static_cast<unsigned long long>(GetTickCount64() - call_start));
         if (arc_bridge_remote_call(function_address, arg1, arg2, arg3, arg4, arc_result)) {
             const ULONGLONG arc_end = GetTickCount64();
+            const remote_call_snapshot_t done_ctx = capture_remote_call_snapshot();
+            const bool late_completion = call_ctx.deadline_ms != 0 && arc_end >= call_ctx.deadline_ms;
+            const bool cancelled_after = done_ctx.cancelled;
             diag::log_tagged_fmt("driver",
-                "call_function_arc_done fn=0x%llX active_pid=%u result=0x%llX ok=1 cancelled=%d deadline_ms=%llu deadline_expired_after=%d elapsed_ms=%llu diag_id=%s",
-                static_cast<unsigned long long>(function_address),
+                "call_function_arc_done label=%s tool=%s diag_id=%s pid=%u active_pid=%u fn=0x%llX result=0x%llX ok=1 gle=%lu cancelled=%d timeout_ms=%u deadline_ms=%llu deadline_expired_after=%d late_completion=%d lower_uninterruptible=%d elapsed_ms=%llu status=%s last_error=%s",
+                call_ctx.label,
+                call_ctx.tool,
+                call_ctx.diag_id,
+                call_ctx.pid,
                 attached_pid(),
+                static_cast<unsigned long long>(function_address),
                 static_cast<unsigned long long>(arc_result),
-                mcp_standalone::current_call_cancelled() ? 1 : 0,
-                static_cast<unsigned long long>(deadline),
-                deadline != 0 && arc_end >= deadline ? 1 : 0,
+                static_cast<unsigned long>(late_completion ? ERROR_TIMEOUT : (cancelled_after ? ERROR_CANCELLED : ERROR_SUCCESS)),
+                cancelled_after ? 1 : 0,
+                call_ctx.timeout_ms,
+                static_cast<unsigned long long>(call_ctx.deadline_ms),
+                late_completion ? 1 : 0,
+                late_completion ? 1 : 0,
+                late_completion ? 1 : 0,
                 static_cast<unsigned long long>(arc_end - call_start),
-                mcp_standalone::current_call_diag_id());
+                status().c_str(),
+                last_error().c_str());
+            if (late_completion || cancelled_after) {
+                SetLastError(cancelled_after ? ERROR_CANCELLED : ERROR_TIMEOUT);
+                return 0;
+            }
             return arc_result;
         }
+        const DWORD arc_gle = GetLastError();
         diag::log_tagged_fmt("driver",
-            "call_function_arc_done fn=0x%llX active_pid=%u ok=0 cancelled=%d deadline_ms=%llu elapsed_ms=%llu diag_id=%s",
-            static_cast<unsigned long long>(function_address),
+            "call_function_arc_done label=%s tool=%s diag_id=%s pid=%u active_pid=%u fn=0x%llX ok=0 gle=%lu cancelled=%d timeout_ms=%u deadline_ms=%llu deadline_remaining_ms=%llu elapsed_ms=%llu status=%s last_error=%s",
+            call_ctx.label,
+            call_ctx.tool,
+            call_ctx.diag_id,
+            call_ctx.pid,
             attached_pid(),
-            mcp_standalone::current_call_cancelled() ? 1 : 0,
-            static_cast<unsigned long long>(deadline),
+            static_cast<unsigned long long>(function_address),
+            static_cast<unsigned long>(arc_gle),
+            current_remote_call_cancelled() ? 1 : 0,
+            call_ctx.timeout_ms,
+            static_cast<unsigned long long>(call_ctx.deadline_ms),
+            static_cast<unsigned long long>(deadline_remaining_ms(call_ctx.deadline_ms, GetTickCount64())),
             static_cast<unsigned long long>(GetTickCount64() - call_start),
-            mcp_standalone::current_call_diag_id());
-        if (mcp_standalone::current_call_cancelled() || (deadline != 0 && GetTickCount64() >= deadline)) {
-            const bool cancelled = mcp_standalone::current_call_cancelled();
+            status().c_str(),
+            last_error().c_str());
+        if (current_remote_call_cancelled() || (call_ctx.deadline_ms != 0 && GetTickCount64() >= call_ctx.deadline_ms)) {
+            const bool cancelled = current_remote_call_cancelled();
             SetLastError(cancelled ? ERROR_CANCELLED : ERROR_TIMEOUT);
             diag::log_tagged_fmt("driver",
-                "call_function_deadline_before_device fn=0x%llX active_pid=%u cancelled=%d deadline_ms=%llu elapsed_ms=%llu diag_id=%s",
-                static_cast<unsigned long long>(function_address),
+                "call_function_deadline_before_device label=%s tool=%s diag_id=%s pid=%u active_pid=%u fn=0x%llX cancelled=%d timeout_ms=%u deadline_ms=%llu elapsed_ms=%llu gle=%lu status=%s last_error=%s",
+                call_ctx.label,
+                call_ctx.tool,
+                call_ctx.diag_id,
+                call_ctx.pid,
                 attached_pid(),
+                static_cast<unsigned long long>(function_address),
                 cancelled ? 1 : 0,
-                static_cast<unsigned long long>(deadline),
+                call_ctx.timeout_ms,
+                static_cast<unsigned long long>(call_ctx.deadline_ms),
                 static_cast<unsigned long long>(GetTickCount64() - call_start),
-                mcp_standalone::current_call_diag_id());
+                static_cast<unsigned long>(GetLastError()),
+                status().c_str(),
+                last_error().c_str());
             return 0;
         }
 
         diag::log_tagged_fmt("driver",
-            "call_function_device_wait_begin fn=0x%llX active_pid=%u cancelled=%d deadline_ms=%llu elapsed_ms=%llu diag_id=%s",
-            static_cast<unsigned long long>(function_address),
+            "call_function_device_wait_begin label=%s tool=%s diag_id=%s pid=%u active_pid=%u fn=0x%llX cancelled=%d timeout_ms=%u deadline_ms=%llu deadline_remaining_ms=%llu elapsed_ms=%llu",
+            call_ctx.label,
+            call_ctx.tool,
+            call_ctx.diag_id,
+            call_ctx.pid,
             attached_pid(),
-            mcp_standalone::current_call_cancelled() ? 1 : 0,
-            static_cast<unsigned long long>(deadline),
-            static_cast<unsigned long long>(GetTickCount64() - call_start),
-            mcp_standalone::current_call_diag_id());
+            static_cast<unsigned long long>(function_address),
+            current_remote_call_cancelled() ? 1 : 0,
+            call_ctx.timeout_ms,
+            static_cast<unsigned long long>(call_ctx.deadline_ms),
+            static_cast<unsigned long long>(deadline_remaining_ms(call_ctx.deadline_ms, GetTickCount64())),
+            static_cast<unsigned long long>(GetTickCount64() - call_start));
         const uint64_t result = device->call_function(function_address, arg1, arg2, arg3, arg4);
         const DWORD gle = result != 0 ? ERROR_SUCCESS : GetLastError();
         const ULONGLONG call_end = GetTickCount64();
+        const remote_call_snapshot_t done_ctx = capture_remote_call_snapshot();
+        const bool late_completion = call_ctx.deadline_ms != 0 && call_end >= call_ctx.deadline_ms;
+        const bool cancelled_after = done_ctx.cancelled;
         diag::log_tagged_fmt("driver",
-            "call_function_device_wait_done fn=0x%llX active_pid=%u result=0x%llX ok=%d gle=%lu cancelled=%d deadline_ms=%llu deadline_expired_after=%d elapsed_ms=%llu diag_id=%s",
-            static_cast<unsigned long long>(function_address),
+            "call_function_device_wait_done label=%s tool=%s diag_id=%s pid=%u active_pid=%u fn=0x%llX result=0x%llX ok=%d gle=%lu cancelled=%d timeout_ms=%u deadline_ms=%llu deadline_expired_after=%d late_completion=%d lower_uninterruptible=%d elapsed_ms=%llu status=%s last_error=%s",
+            call_ctx.label,
+            call_ctx.tool,
+            call_ctx.diag_id,
+            call_ctx.pid,
             attached_pid(),
+            static_cast<unsigned long long>(function_address),
             static_cast<unsigned long long>(result),
             result != 0 ? 1 : 0,
-            static_cast<unsigned long>(gle),
-            mcp_standalone::current_call_cancelled() ? 1 : 0,
-            static_cast<unsigned long long>(deadline),
-            deadline != 0 && call_end >= deadline ? 1 : 0,
+            static_cast<unsigned long>(late_completion ? ERROR_TIMEOUT : (cancelled_after ? ERROR_CANCELLED : gle)),
+            cancelled_after ? 1 : 0,
+            call_ctx.timeout_ms,
+            static_cast<unsigned long long>(call_ctx.deadline_ms),
+            late_completion ? 1 : 0,
+            late_completion ? 1 : 0,
+            late_completion ? 1 : 0,
             static_cast<unsigned long long>(call_end - call_start),
-            mcp_standalone::current_call_diag_id());
+            status().c_str(),
+            last_error().c_str());
+        if (late_completion || cancelled_after) {
+            SetLastError(cancelled_after ? ERROR_CANCELLED : ERROR_TIMEOUT);
+            return 0;
+        }
         if (result == 0)
             SetLastError(gle);
         return result;

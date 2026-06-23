@@ -2415,7 +2415,7 @@ void helpers::render_title()
 
 		static const char* k_phase_labels[] = {
 			"Bootstrapping",
-			"Initializing chat engine",
+			"Initializing AiDA runtime core",
 			"Probing network surface",
 			"Arming memory scanner",
 			"Spinning up MITM proxy",

@@ -98,7 +98,7 @@ struct stats_t {
     std::string active_labels;
 };
 
-inline void shutdown();
+inline void shutdown(std::uint32_t timeout_ms = 5000);
 
 inline stats_t stats_for(detail::pool_t& p, int pool_size) {
     stats_t s;
@@ -289,7 +289,7 @@ inline bool post_service_labeled(const char* label, std::function<void()> f) {
     return post_to(detail::g_service_pool, SERVICE_POOL_SIZE, std::move(f), label);
 }
 
-inline void shutdown_pool(detail::pool_t& p) {
+inline void shutdown_pool(detail::pool_t& p, const char* name, std::uint32_t timeout_ms) {
     bool expected = false;
     if (!p.shutdown_called.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
     p.shutting_down.store(true, std::memory_order_release);
@@ -301,12 +301,37 @@ inline void shutdown_pool(detail::pool_t& p) {
         p.workers.clear();
         p.cv.notify_all();
     }
-    for (auto& w : to_join) if (w.joinable()) w.join();
+    const ULONGLONG deadline = timeout_ms == INFINITE ? 0 : GetTickCount64() + timeout_ms;
+    for (auto& w : to_join) {
+        if (!w.joinable())
+            continue;
+        DWORD wait_ms = INFINITE;
+        if (timeout_ms != INFINITE) {
+            const ULONGLONG now = GetTickCount64();
+            wait_ms = now >= deadline ? 0 : static_cast<DWORD>(deadline - now);
+        }
+        if (w.join_for(wait_ms))
+            continue;
+        std::size_t pending = 0;
+        {
+            std::lock_guard<std::mutex> lk(p.mtx);
+            pending = p.tasks.size();
+        }
+        diag::log_tagged_fmt("work_queue",
+            "shutdown_join_timeout pool=%s wait_ms=%lu active=%u pending=%zu started=%llu finished=%llu",
+            name ? name : "<unnamed>",
+            static_cast<unsigned long>(wait_ms),
+            static_cast<unsigned>(p.active_tasks.load(std::memory_order_acquire)),
+            pending,
+            static_cast<unsigned long long>(p.started_tasks.load(std::memory_order_acquire)),
+            static_cast<unsigned long long>(p.finished_tasks.load(std::memory_order_acquire)));
+        w.detach();
+    }
 }
 
-inline void shutdown() {
-    shutdown_pool(detail::g_pool);
-    shutdown_pool(detail::g_service_pool);
+inline void shutdown(std::uint32_t timeout_ms) {
+    shutdown_pool(detail::g_pool, "general", timeout_ms);
+    shutdown_pool(detail::g_service_pool, "service", timeout_ms);
 }
 
 struct work_queue_shutdown_guard_t {

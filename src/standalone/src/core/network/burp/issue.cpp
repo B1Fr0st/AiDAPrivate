@@ -27,7 +27,6 @@ namespace burp {
 
 const char* severity_label(severity_t s)
 {
-    diag::log_tagged_fmt("issue", "severity_label s=%d", static_cast<int>(s));
     switch (s) {
         case severity_t::info:     return "Info";
         case severity_t::low:      return "Low";
@@ -40,7 +39,6 @@ const char* severity_label(severity_t s)
 
 const char* confidence_label(confidence_t c)
 {
-    diag::log_tagged_fmt("issue", "confidence_label c=%d", static_cast<int>(c));
     switch (c) {
         case confidence_t::tentative: return "Tentative";
         case confidence_t::firm:      return "Firm";
@@ -87,6 +85,8 @@ struct store_state_t
     std::atomic<uint64_t>                   next_id{1};
     std::atomic<bool>                       initialized{false};
     std::atomic<bool>                       autosave{true};
+    std::atomic<uint64_t>                   last_save_ms{0};
+    std::atomic<uint64_t>                   unsaved_changes{0};
     std::mutex                              err_mtx;
     std::string                             last_error;
 };
@@ -251,7 +251,6 @@ void shutdown()
 
 nlohmann::json issue_to_json(const issue_t& i)
 {
-    diag::log_tagged_fmt("issue", "issue_to_json id=%llu type_key=%s host=%s", static_cast<unsigned long long>(i.id), i.type_key.c_str(), i.host.c_str());
     nlohmann::json j;
     j["id"]               = i.id;
     j["type_key"]         = i.type_key;
@@ -273,7 +272,6 @@ nlohmann::json issue_to_json(const issue_t& i)
     nlohmann::json ev_arr = nlohmann::json::array();
     for (const auto& e : i.evidence) ev_arr.push_back(evidence_to_json(e));
     j["evidence"] = std::move(ev_arr);
-    diag::log_tagged_fmt("issue", "issue_to_json done id=%llu evidence=%zu", static_cast<unsigned long long>(i.id), i.evidence.size());
     return j;
 }
 
@@ -310,8 +308,13 @@ uint64_t add(issue_t issue)
         diag::log_tagged_fmt("issue", "add inserted id=%llu total=%zu", static_cast<unsigned long long>(s.items.back().id), s.items.size());
     }
 
-    if (s.autosave.load()) {
-        diag::log_tagged_fmt("issue", "add autosave triggered");
+    const uint64_t dirty = s.unsaved_changes.fetch_add(1, std::memory_order_acq_rel) + 1;
+    const uint64_t last_save = s.last_save_ms.load(std::memory_order_acquire);
+    const uint64_t now = now_ms();
+    if (s.autosave.load() && (dirty >= 32 || last_save == 0 || now - last_save >= 5000)) {
+        diag::log_tagged_fmt("issue", "add autosave triggered dirty=%llu elapsed_ms=%llu",
+            static_cast<unsigned long long>(dirty),
+            static_cast<unsigned long long>(last_save == 0 ? 0 : now - last_save));
         save_to_disk();
     }
     uint64_t new_id = s.next_id.load() - 1;
@@ -350,6 +353,7 @@ void clear()
     }
     diag::log_tagged_fmt("issue", "clear cleared prev_count=%zu", prev);
     if (s.autosave.load()) {
+        s.unsaved_changes.fetch_add(1, std::memory_order_acq_rel);
         diag::log_tagged_fmt("issue", "clear autosave triggered");
         save_to_disk();
     }
@@ -456,6 +460,7 @@ bool save_to_disk()
     diag::log_tagged_fmt("issue", "save_to_disk entry");
     auto& s = state();
     std::vector<issue_t> snapshot;
+    const uint64_t dirty_at_start = s.unsaved_changes.load(std::memory_order_acquire);
     {
         std::lock_guard<std::mutex> lk(s.mtx);
         snapshot = s.items;
@@ -493,6 +498,13 @@ bool save_to_disk()
             }
         }
         diag::log_tagged_fmt("issue", "save_to_disk ok path=%s", path.c_str());
+        s.last_save_ms.store(now_ms(), std::memory_order_release);
+        uint64_t cur = s.unsaved_changes.load(std::memory_order_acquire);
+        while (cur != 0) {
+            const uint64_t next = cur > dirty_at_start ? cur - dirty_at_start : 0;
+            if (s.unsaved_changes.compare_exchange_weak(cur, next, std::memory_order_acq_rel, std::memory_order_acquire))
+                break;
+        }
         return true;
     } catch (...) {
         diag::log_tagged_fmt("issue", "save_to_disk exception");

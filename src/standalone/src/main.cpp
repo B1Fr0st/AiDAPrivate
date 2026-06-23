@@ -515,6 +515,7 @@ static constexpr UINT kAidaSendOnlyPeekFlags = PM_REMOVE | PM_QS_SENDMESSAGE;
 static constexpr DWORD kAidaNonSendQueueBits = QS_INPUT | QS_POSTMESSAGE | QS_TIMER | QS_PAINT | QS_HOTKEY | QS_ALLPOSTMESSAGE;
 static constexpr DWORD kAidaPumpQueueBits = kAidaNonSendQueueBits | QS_SENDMESSAGE;
 static constexpr DWORD kAidaInteractiveQueueBits = QS_INPUT | QS_POSTMESSAGE | QS_HOTKEY | QS_ALLPOSTMESSAGE;
+static constexpr DWORD kAidaFrameLatencyWaitMs = 16;
 bool CreateDeviceD3D(HWND hWnd);
 void CleanupDeviceD3D();
 void CreateRenderTarget();
@@ -1172,7 +1173,7 @@ static const char* startup_bg_phase_label(int step)
     switch (step)
     {
     case 0: return "Bootstrapping";
-    case 1: return "Loading protected runtime";
+    case 1: return "Initializing AiDA runtime core";
     case 2: return "Probing network surface";
     case 3: return "Arming memory scanner";
     case 4: return "Spinning up MITM proxy";
@@ -2660,11 +2661,64 @@ static void wait_for_frame_latency_object()
     if (!waitable)
         return;
     DWORD qs = ::GetQueueStatus(kAidaInteractiveQueueBits);
-    if ((HIWORD(qs) & kAidaInteractiveQueueBits) != 0)
+    const DWORD current = HIWORD(qs);
+    if ((current & kAidaInteractiveQueueBits) != 0)
+    {
+        static std::atomic<unsigned long long> s_last_input_skip_log_ms{0};
+        static std::atomic<unsigned long long> s_input_skip_count{0};
+        const unsigned long long skips = s_input_skip_count.fetch_add(1, std::memory_order_acq_rel) + 1;
+        const unsigned long long now = GetTickCount64();
+        unsigned long long last = s_last_input_skip_log_ms.load(std::memory_order_acquire);
+        if ((skips <= 8 || now - last >= 5000ULL) &&
+            s_last_input_skip_log_ms.compare_exchange_strong(last, now, std::memory_order_acq_rel))
+        {
+            diag::log_tagged_fmt("render",
+                "frame_latency_wait_skipped_input skips=%llu qs=0x%08lX current=0x%04lX changed=0x%04lX cursor_over=%d focused=%d hwnd=0x%llX fg=0x%llX active=0x%llX focus=0x%llX tid=%lu",
+                skips,
+                static_cast<unsigned long>(qs),
+                static_cast<unsigned long>(current),
+                static_cast<unsigned long>(LOWORD(qs)),
+                aida_cursor_over_window(g_hwnd) ? 1 : 0,
+                aida_focus_monitor::focused() ? 1 : 0,
+                static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(g_hwnd)),
+                static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(::GetForegroundWindow())),
+                static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(::GetActiveWindow())),
+                static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(::GetFocus())),
+                ::GetCurrentThreadId());
+        }
         return;
-    if (aida_cursor_over_window(g_hwnd))
-        return;
-    DWORD wait_result = MsgWaitForMultipleObjectsEx(1, &waitable, 2, kAidaInteractiveQueueBits, MWMO_INPUTAVAILABLE);
+    }
+    const unsigned long long wait_start = GetTickCount64();
+    DWORD wait_result = MsgWaitForMultipleObjectsEx(1, &waitable, kAidaFrameLatencyWaitMs, kAidaInteractiveQueueBits, MWMO_INPUTAVAILABLE);
+    const unsigned long long wait_elapsed = GetTickCount64() - wait_start;
+    static std::atomic<unsigned long long> s_last_wait_sample_ms{0};
+    static std::atomic<unsigned long long> s_wait_count{0};
+    static std::atomic<unsigned long long> s_wait_elapsed_total_ms{0};
+    const unsigned long long waits = s_wait_count.fetch_add(1, std::memory_order_acq_rel) + 1;
+    const unsigned long long total_wait = s_wait_elapsed_total_ms.fetch_add(wait_elapsed, std::memory_order_acq_rel) + wait_elapsed;
+    const unsigned long long now = GetTickCount64();
+    unsigned long long last_sample = s_last_wait_sample_ms.load(std::memory_order_acquire);
+    if ((wait_elapsed >= 16ULL || waits <= 8 || now - last_sample >= 15000ULL) &&
+        s_last_wait_sample_ms.compare_exchange_strong(last_sample, now, std::memory_order_acq_rel))
+    {
+        DWORD qs_after = ::GetQueueStatus(kAidaInteractiveQueueBits);
+        diag::log_tagged_fmt("render",
+            "frame_latency_wait_sample waits=%llu timeout_ms=%lu elapsed_ms=%llu avg_ms=%llu result=0x%08lX qs_before=0x%08lX qs_after=0x%08lX cursor_over=%d focused=%d hwnd=0x%llX fg=0x%llX active=0x%llX focus=0x%llX tid=%lu",
+            waits,
+            static_cast<unsigned long>(kAidaFrameLatencyWaitMs),
+            wait_elapsed,
+            waits ? (total_wait / waits) : 0ULL,
+            static_cast<unsigned long>(wait_result),
+            static_cast<unsigned long>(qs),
+            static_cast<unsigned long>(qs_after),
+            aida_cursor_over_window(g_hwnd) ? 1 : 0,
+            aida_focus_monitor::focused() ? 1 : 0,
+            static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(g_hwnd)),
+            static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(::GetForegroundWindow())),
+            static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(::GetActiveWindow())),
+            static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(::GetFocus())),
+            ::GetCurrentThreadId());
+    }
     if (wait_result == WAIT_FAILED) {
         DWORD gle = GetLastError();
         static std::atomic<unsigned long long> s_last_fail_log_ms{0};
@@ -2686,16 +2740,6 @@ static bool aida_cursor_over_window(HWND hwnd)
     if (!::GetWindowRect(hwnd, &rc))
         return false;
     return ::PtInRect(&rc, cursor) != FALSE;
-}
-
-static void wait_for_idle_or_input(DWORD timeout_ms)
-{
-    if (timeout_ms == 0)
-        return;
-    DWORD qs = ::GetQueueStatus(kAidaInteractiveQueueBits);
-    if ((HIWORD(qs) & kAidaInteractiveQueueBits) != 0)
-        return;
-    MsgWaitForMultipleObjectsEx(0, nullptr, timeout_ms, kAidaInteractiveQueueBits, MWMO_INPUTAVAILABLE);
 }
 
 __declspec(noinline) static DWORD seh_resize_buffers(IDXGISwapChain* sc, UINT w, UINT h, HRESULT* hr_out, uint64_t frame_number, const char* source)
@@ -4726,10 +4770,18 @@ int main(int, char**)
     startup_log_critical_fmt("focus_monitor_main_start_pre hwnd=0x%llX",
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)));
     aida_focus_monitor::start(hwnd);
+    const int ui_prior_priority = GetThreadPriority(GetCurrentThread());
+    const BOOL ui_priority_set = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     startup_log_critical_fmt("render_loop_enter pid=%lu tid=%lu tick=%llu",
         GetCurrentProcessId(),
         GetCurrentThreadId(),
         static_cast<unsigned long long>(GetTickCount64()));
+    diag::log_tagged_critical_fmt("render",
+        "ui_thread_priority prior=%d set=%d current=%d gle=%lu",
+        ui_prior_priority,
+        ui_priority_set ? 1 : 0,
+        GetThreadPriority(GetCurrentThread()),
+        ui_priority_set ? 0UL : GetLastError());
 
 
     bool done = false;
@@ -4990,11 +5042,6 @@ int main(int, char**)
             continue;
         }
         g_SwapChainOccluded = false;
-
-        if (!aida_focus_monitor::focused())
-        {
-            ::Sleep(0);
-        }
 
         static bool ide_resize_applied = false;
         if (g_ResizeWidth != 0 && g_ResizeHeight != 0)
@@ -5503,29 +5550,47 @@ int main(int, char**)
             const DWORD idle_qs = ::GetQueueStatus(kAidaInteractiveQueueBits);
             const bool interactive_pending = (HIWORD(idle_qs) & kAidaInteractiveQueueBits) != 0;
             const uint64_t tick_now_ms = static_cast<uint64_t>(GetTickCount64());
-            const uint64_t activation_done_ms = standalone_license::activation_completed_at();
-            const bool activation_settling =
-                activation_done_ms != 0 &&
-                tick_now_ms >= activation_done_ms &&
-                (tick_now_ms - activation_done_ms) < 60000ULL;
 
-            bool may_sleep = true;
-            if (bulk_busy) may_sleep = false;
-            if (full_test_running) may_sleep = false;
-            if (since_interaction_ms < 500ull) may_sleep = false;
-            if (io.WantTextInput || io.WantCaptureKeyboard) may_sleep = false;
-            if (ImGui::IsAnyItemActive()) may_sleep = false;
-            if (cursor_over_aida || interactive_pending) may_sleep = false;
-            if (!foreground && !full_test_running) may_sleep = true;
-            if (cursor_over_aida || interactive_pending) may_sleep = false;
+            uint32_t idle_block_mask = 0;
+            if (bulk_busy) idle_block_mask |= 0x00000001u;
+            if (full_test_running) idle_block_mask |= 0x00000002u;
+            if (since_interaction_ms < 150ull) idle_block_mask |= 0x00000004u;
+            if (io.WantTextInput || io.WantCaptureKeyboard) idle_block_mask |= 0x00000008u;
+            if (ImGui::IsAnyItemActive()) idle_block_mask |= 0x00000010u;
+            if (interactive_pending) idle_block_mask |= 0x00000020u;
+            if (cursor_over_aida) idle_block_mask |= 0x00000040u;
 
-            if (may_sleep) {
-                DWORD idle_wait_ms = 0;
-                if (foreground)
-                    idle_wait_ms = activation_settling ? 8u : 24u;
-                else
-                    idle_wait_ms = activation_settling ? 16u : 75u;
-                wait_for_idle_or_input(idle_wait_ms);
+            static uint64_t s_last_idle_pacing_log_ms = 0;
+            if (tick_now_ms - s_last_idle_pacing_log_ms >= 5000ULL) {
+                s_last_idle_pacing_log_ms = tick_now_ms;
+                DWORD thread_err = 0;
+                const DWORD thread_count = count_current_process_threads(&thread_err);
+                const auto wq = work_queue::stats();
+                const auto svc = work_queue::service_stats();
+                const auto cq = critical_work_queue::stats();
+                diag::log_tagged_fmt("render",
+                    "idle_pacing_sample frame=%llu post_frame_idle_wait_ms=%lu block_mask=0x%08X foreground=%d cursor_over=%d interactive_pending=%d qs=0x%08lX since_interaction_ms=%llu bulk_busy=%d full_test=%d threads=%lu thread_err=%lu wq_active=%u wq_pending=%zu wq_oldest_ms=%llu svc_active=%u svc_pending=%zu svc_oldest_ms=%llu cq_active=%u cq_pending=%zu cq_oldest_ms=%llu",
+                    static_cast<unsigned long long>(frame_number),
+                    0UL,
+                    static_cast<unsigned>(idle_block_mask),
+                    foreground ? 1 : 0,
+                    cursor_over_aida ? 1 : 0,
+                    interactive_pending ? 1 : 0,
+                    static_cast<unsigned long>(idle_qs),
+                    static_cast<unsigned long long>(since_interaction_ms),
+                    bulk_busy ? 1 : 0,
+                    full_test_running ? 1 : 0,
+                    static_cast<unsigned long>(thread_count),
+                    static_cast<unsigned long>(thread_err),
+                    static_cast<unsigned>(wq.active),
+                    wq.pending,
+                    static_cast<unsigned long long>(wq.oldest_active_ms),
+                    static_cast<unsigned>(svc.active),
+                    svc.pending,
+                    static_cast<unsigned long long>(svc.oldest_active_ms),
+                    static_cast<unsigned>(cq.active),
+                    cq.pending,
+                    static_cast<unsigned long long>(cq.oldest_active_ms));
             }
         }
     }

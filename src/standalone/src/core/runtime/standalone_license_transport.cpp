@@ -684,6 +684,15 @@ bool send_once(const winhttp_api_t& api,
     DWORD disable_features = WINHTTP_DISABLE_REDIRECTS | WINHTTP_DISABLE_KEEP_ALIVE | WINHTTP_DISABLE_AUTHENTICATION;
     api.p_set_option(h_req, WINHTTP_OPTION_DISABLE_FEATURE, &disable_features, sizeof(disable_features));
 
+    DWORD decompression_flags = WINHTTP_DECOMPRESSION_FLAG_GZIP | WINHTTP_DECOMPRESSION_FLAG_DEFLATE;
+    BOOL decompression_ok = api.p_set_option(h_req, WINHTTP_OPTION_DECOMPRESSION,
+                                             &decompression_flags, sizeof(decompression_flags));
+    DWORD decompression_gle = decompression_ok ? ERROR_SUCCESS : GetLastError();
+    trans_log_fmt("send_once_decompression_set ok=%d gle=%lu flags=0x%lx",
+        decompression_ok ? 1 : 0,
+        static_cast<unsigned long>(decompression_gle),
+        static_cast<unsigned long>(decompression_flags));
+
     std::wstring hdr_str;
     hdr_str.reserve(256u + req.headers.size() * 64u);
     for (const auto& kv : req.headers) {
@@ -827,6 +836,23 @@ bool send_once(const winhttp_api_t& api,
         }
     }
 
+    bool response_content_encoded = false;
+    {
+        wchar_t encoding_name[] = L"Content-Encoding";
+        wchar_t encoding_buf[64] = {};
+        DWORD encoding_size = sizeof(encoding_buf);
+        DWORD encoding_index = 0u;
+        if (api.p_query_headers(h_req,
+                                WINHTTP_QUERY_CUSTOM,
+                                encoding_name,
+                                encoding_buf,
+                                &encoding_size,
+                                &encoding_index) &&
+            encoding_buf[0] != L'\0') {
+            response_content_encoded = true;
+        }
+    }
+
     {
         wchar_t hdr_name[] = L"X-Debug-Reason";
         wchar_t hdr_buf[192] = {};
@@ -890,7 +916,8 @@ bool send_once(const winhttp_api_t& api,
         }
     }
     if (!body_read_failed && expected_content_length_known &&
-        resp.body.size() != static_cast<size_t>(expected_content_length)) {
+        resp.body.size() != static_cast<size_t>(expected_content_length) &&
+        !(decompression_ok && response_content_encoded)) {
         body_read_failed = true;
         body_read_gle = ERROR_HANDLE_EOF;
         body_read_phase = "content_length_mismatch";

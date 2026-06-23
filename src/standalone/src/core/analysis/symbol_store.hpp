@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <exception>
 #include "work_queue.hpp"
 #include <filesystem>
@@ -21,6 +22,7 @@
 #include "pdb_downloader.hpp"
 #include "standalone_driver.hpp"
 #include "standalone_settings.hpp"
+#include "../testlab/test_all_features.hpp"
 #include "../infra/critical_work_queue.hpp"
 #include "../../helpers/diag_log.hpp"
 
@@ -35,6 +37,7 @@ struct module_symbols_t {
 	pdb_parser::pdb_info_t                    pdb;
 	bool                                      loading = false;
 	bool                                      failed = false;
+	bool                                      load_declined = false;
 	std::string                               status_text;
 	std::string                               pdb_path;
 	uint64_t                                  pdb_file_size = 0;
@@ -97,6 +100,7 @@ inline void apply_loading_timeout(const load_timeout_context_t& ctx) noexcept
 			ms.loading = false;
 			ms.downloading = false;
 			ms.failed = true;
+			ms.load_declined = false;
 			ms.parse_completed = false;
 			ms.load_failure_detail = parser_diag;
 			ms.parse_diagnostic = parser_diag;
@@ -333,6 +337,7 @@ inline void publish_failed_load_result(const std::string& module_name, uint64_t 
 			ms.loading = false;
 			ms.downloading = false;
 			ms.failed = true;
+			ms.load_declined = false;
 			ms.parse_completed = false;
 			ms.load_failure_detail = detail_text ? detail_text : "";
 			ms.load_phase.clear();
@@ -497,8 +502,139 @@ inline void init_from_settings()
 	g_state.symbol_server_url = g_settings.symbol_server_url;
 }
 
+inline const char* log_value(const std::string& s)
+{
+	return s.empty() ? "<none>" : s.c_str();
+}
+
+inline std::string fallback_pdb_name_for_module(const std::string& module_name)
+{
+	std::filesystem::path p(module_name);
+	std::string stem = p.stem().string();
+	if (stem.empty()) stem = module_name;
+	return stem + ".pdb";
+}
+
+inline std::string expected_cache_path_for_hint(const std::string& pdb_name,
+                                                const std::string& pdb_guid,
+                                                uint32_t pdb_age)
+{
+	if (pdb_name.empty() || pdb_guid.empty()) return {};
+	char age_buf[16] = {};
+	std::snprintf(age_buf, sizeof(age_buf), "%X", static_cast<unsigned>(pdb_age));
+	return (detail::get_cache_dir() / pdb_name / (pdb_guid + age_buf) / pdb_name).string();
+}
+
+inline std::string safe_find_local_pdb_for_suppression(const std::string& module_name,
+                                                       const char* source) noexcept
+{
+	try {
+		return detail::find_pdb_local(module_name);
+	} catch (const std::exception& ex) {
+		diag::log_tagged_fmt("symbol_store",
+			"fulltest_symbol_store_pdb_candidate_error source=%s module=%s err=%s",
+			source && *source ? source : "<unknown>",
+			log_value(module_name),
+			ex.what());
+	} catch (...) {
+		diag::log_tagged_fmt("symbol_store",
+			"fulltest_symbol_store_pdb_candidate_error source=%s module=%s err=<unknown>",
+			source && *source ? source : "<unknown>",
+			log_value(module_name));
+	}
+	return {};
+}
+
+inline bool suppress_full_test_pdb_load(const char* source,
+                                        const std::string& module_name,
+                                        uint64_t base,
+                                        uint64_t size,
+                                        const std::string& pdb_name,
+                                        const std::string& pdb_guid,
+                                        uint32_t pdb_age,
+                                        const std::string& local_candidate,
+                                        const std::string& cache_path,
+                                        const std::string& explicit_path,
+                                        const char* reason,
+                                        bool update_module_state = true)
+{
+	if (!test_all_features::is_running()) return false;
+	const uint64_t generation = next_load_generation();
+	bool module_present = false;
+	bool already_loaded = false;
+	bool already_loading = false;
+	bool final_failed = false;
+	bool final_declined = false;
+	bool state_updated = false;
+	if (update_module_state && !module_name.empty()) {
+		std::lock_guard<std::mutex> lk(g_state.mutex);
+		auto it = g_state.modules.find(module_name);
+		module_present = it != g_state.modules.end();
+		auto& ms = module_present ? it->second : g_state.modules[module_name];
+		already_loaded = ms.pdb.loaded;
+		already_loading = ms.loading;
+		if (!already_loaded && !already_loading) {
+			ms.module_name = module_name;
+			ms.base = base;
+			ms.size = size;
+			ms.loading = false;
+			ms.downloading = false;
+			ms.failed = false;
+			ms.load_declined = true;
+			ms.parse_completed = false;
+			ms.load_phase.clear();
+			ms.load_generation = generation;
+			ms.load_started_ms = GetTickCount64();
+			ms.load_timeout_ms = 0;
+			ms.parse_progress = 0.0f;
+			ms.parse_progress_ms = 0;
+			ms.parse_diagnostic.clear();
+			ms.load_failure_detail.clear();
+			ms.pdb_path = explicit_path.empty() ? local_candidate : explicit_path;
+			ms.status_text = "PDB load skipped by full-test policy";
+			state_updated = true;
+		}
+		final_failed = ms.failed;
+		final_declined = ms.load_declined;
+	}
+	if (!update_module_state) {
+		final_failed = false;
+		final_declined = true;
+	}
+
+	diag::log_tagged_fmt("symbol_store",
+		"fulltest_symbol_store_pdb_suppressed decision=do_not_load_pdb source=%s module=%s base=0x%llX size=0x%llX pdb=%s guid=%s age=%u local_candidate=%s cache_path=%s explicit_path=%s reason=%s generation=%llu prompt_created=0 prompt_suppressed=1 module_present=%d loaded=%d loading=%d failed=%d declined=%d state_updated=%d",
+		source && *source ? source : "<unknown>",
+		log_value(module_name),
+		static_cast<unsigned long long>(base),
+		static_cast<unsigned long long>(size),
+		log_value(pdb_name),
+		log_value(pdb_guid),
+		static_cast<unsigned>(pdb_age),
+		log_value(local_candidate),
+		log_value(cache_path),
+		log_value(explicit_path),
+		reason && *reason ? reason : "full_test_declined_pdb_load",
+		static_cast<unsigned long long>(generation),
+		module_present ? 1 : 0,
+		already_loaded ? 1 : 0,
+		already_loading ? 1 : 0,
+		final_failed ? 1 : 0,
+		final_declined ? 1 : 0,
+		state_updated ? 1 : 0);
+	return true;
+}
+
 inline void load_pdb_for_module(const std::string& module_name, uint64_t base, uint64_t size)
 {
+	if (test_all_features::is_running()) {
+		const std::string pdb_name = fallback_pdb_name_for_module(module_name);
+		const std::string local_candidate = safe_find_local_pdb_for_suppression(module_name, "load_pdb_for_module");
+		suppress_full_test_pdb_load("load_pdb_for_module", module_name, base, size,
+			pdb_name, {}, 0, local_candidate, {}, {},
+			g_state.auto_download ? "full_test_declined_auto_symbol_server_load" : "full_test_declined_auto_local_pdb_scan");
+		return;
+	}
 	uint64_t generation = next_load_generation();
 	{
 		std::lock_guard<std::mutex> lk(g_state.mutex);
@@ -514,6 +650,7 @@ inline void load_pdb_for_module(const std::string& module_name, uint64_t base, u
 		ms.size = size;
 		ms.loading = true;
 		ms.failed = false;
+		ms.load_declined = false;
 		ms.load_phase = "queue";
 		ms.load_generation = generation;
 		ms.load_started_ms = GetTickCount64();
@@ -538,6 +675,7 @@ inline void load_pdb_for_module(const std::string& module_name, uint64_t base, u
 			} else {
 				ms.loading = false;
 				ms.failed = true;
+				ms.load_declined = false;
 				ms.load_phase.clear();
 				ms.status_text = "PDB not found";
 				return;
@@ -590,6 +728,7 @@ inline void load_pdb_for_module(const std::string& module_name, uint64_t base, u
 
 			if (ok) {
 				ms.pdb = std::move(info);
+				ms.load_declined = false;
 				char buf[64];
 				snprintf(buf, sizeof(buf), "Loaded: %zu symbols, %zu types",
 				         ms.pdb.symbols.size(), ms.pdb.structs.size());
@@ -605,6 +744,7 @@ inline void load_pdb_for_module(const std::string& module_name, uint64_t base, u
 				publish_event = true;
 			} else {
 				ms.failed = true;
+				ms.load_declined = false;
 				ms.load_phase.clear();
 				ms.status_text = pdb_parse_failure_status("Failed to parse PDB");
 
@@ -632,6 +772,7 @@ inline void load_pdb_for_module(const std::string& module_name, uint64_t base, u
 				return;
 			ms.loading = false;
 			ms.failed = true;
+			ms.load_declined = false;
 			ms.load_phase.clear();
 			ms.status_text = "Failed to queue PDB parse";
 			ev_payload.module_name = ms.module_name;
@@ -651,6 +792,39 @@ inline void load_pdb_with_hint(const std::string& module_name, uint64_t base, ui
                                const std::string& pdb_name, const std::string& pdb_guid,
                                uint32_t pdb_age, const std::string& symbol_server_base)
 {
+	if (test_all_features::is_running()) {
+		std::string cache_path;
+		try {
+			cache_path = expected_cache_path_for_hint(pdb_name, pdb_guid, pdb_age);
+		} catch (const std::exception& ex) {
+			diag::log_tagged_fmt("symbol_store",
+				"fulltest_symbol_store_pdb_cache_error source=load_pdb_with_hint module=%s pdb=%s guid=%s age=%u err=%s",
+				log_value(module_name),
+				log_value(pdb_name),
+				log_value(pdb_guid),
+				static_cast<unsigned>(pdb_age),
+				ex.what());
+		} catch (...) {
+			diag::log_tagged_fmt("symbol_store",
+				"fulltest_symbol_store_pdb_cache_error source=load_pdb_with_hint module=%s pdb=%s guid=%s age=%u err=<unknown>",
+				log_value(module_name),
+				log_value(pdb_name),
+				log_value(pdb_guid),
+				static_cast<unsigned>(pdb_age));
+		}
+		std::string local_candidate;
+		if (!cache_path.empty()) {
+			std::error_code ec;
+			if (std::filesystem::is_regular_file(cache_path, ec) && !ec)
+				local_candidate = cache_path;
+		}
+		suppress_full_test_pdb_load("load_pdb_with_hint", module_name, base, size,
+			pdb_name, pdb_guid, pdb_age, local_candidate, cache_path, {},
+			symbol_server_base.empty()
+				? "full_test_declined_hinted_symbol_load_default_server"
+				: "full_test_declined_hinted_symbol_load_configured_server");
+		return;
+	}
 	uint64_t generation = next_load_generation();
 	{
 		std::lock_guard<std::mutex> lk(g_state.mutex);
@@ -666,6 +840,7 @@ inline void load_pdb_with_hint(const std::string& module_name, uint64_t base, ui
 		ms.size = size;
 		ms.loading = true;
 		ms.failed = false;
+		ms.load_declined = false;
 		ms.load_phase = "queue";
 		ms.load_generation = generation;
 		ms.load_started_ms = GetTickCount64();
@@ -751,6 +926,7 @@ inline void load_pdb_with_hint(const std::string& module_name, uint64_t base, ui
 					ms.loading = false;
 					ms.downloading = false;
 					ms.failed = true;
+					ms.load_declined = false;
 					ms.load_phase.clear();
 					ms.status_text = "Download failed: " + result.error;
 					ev_payload.module_name = ms.module_name;
@@ -799,6 +975,7 @@ inline void load_pdb_with_hint(const std::string& module_name, uint64_t base, ui
 			ms.loading = false;
 			ms.load_phase.clear();
 			if (parse_ok) {
+				ms.load_declined = false;
 				ms.pdb = std::move(info);
 				char buf[96];
 				snprintf(buf, sizeof(buf), "Loaded: %zu symbols, %zu types",
@@ -813,6 +990,7 @@ inline void load_pdb_with_hint(const std::string& module_name, uint64_t base, ui
 				ev_payload.enum_count = static_cast<uint32_t>(ms.pdb.enums.size());
 			} else {
 				ms.failed = true;
+				ms.load_declined = false;
 				ms.load_phase.clear();
 				ms.status_text = pdb_parse_failure_status("Failed to parse PDB");
 				ev_payload.module_name = ms.module_name;
@@ -833,6 +1011,7 @@ inline void load_pdb_with_hint(const std::string& module_name, uint64_t base, ui
 			ms.loading = false;
 			ms.downloading = false;
 			ms.failed = true;
+			ms.load_declined = false;
 			ms.load_phase.clear();
 			ms.status_text = "Failed to queue hinted PDB load";
 			ev_payload.module_name = ms.module_name;
@@ -922,6 +1101,7 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 		ms.size = size;
 		ms.loading = true;
 		ms.failed = false;
+		ms.load_declined = false;
 		ms.pdb_path = exact_path;
 		ms.pdb_file_size = file_size;
 		ms.parse_completed = false;
@@ -1171,6 +1351,7 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 					ms.pdb = std::move(info);
 					ms.parse_completed = ms.pdb.loaded;
 					ms.failed = false;
+					ms.load_declined = false;
 					ms.pdb_path = path_copy;
 					ms.pdb_file_size = file_size_copy;
 					ms.load_failure_detail.clear();
@@ -1191,6 +1372,7 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 					ev_payload.enum_count = static_cast<uint32_t>(ms.pdb.enums.size());
 				} else {
 					ms.failed = true;
+					ms.load_declined = false;
 					ms.parse_completed = false;
 					ms.load_phase.clear();
 					ms.load_failure_detail = parser_status.empty() ? parser_diag : parser_status + " | " + parser_diag;
@@ -1337,6 +1519,7 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 				return;
 			ms.loading = false;
 			ms.failed = true;
+			ms.load_declined = false;
 			ms.parse_completed = false;
 			ms.load_failure_detail = parser_diag;
 			ms.load_phase.clear();
@@ -1397,6 +1580,12 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 
 inline void auto_load_attached_modules()
 {
+	if (test_all_features::is_running()) {
+		suppress_full_test_pdb_load("auto_load_attached_modules", "<attached_modules>",
+			0, 0, "<auto>", {}, 0, {}, {}, {},
+			"full_test_declined_attached_module_auto_load", false);
+		return;
+	}
 	auto modules = driver_bridge::enumerate_modules();
 	for (auto& m : modules) {
 		bool worth_loading = true;

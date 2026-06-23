@@ -109,7 +109,9 @@ inline DWORD WINAPI entry(void* arg)
 
 inline unsigned __stdcall crt_entry(void* arg)
 {
-    return static_cast<unsigned>(entry(arg));
+    const unsigned rc = static_cast<unsigned>(entry(arg));
+    _endthreadex(rc);
+    return rc;
 }
 
 inline void describe_address(const void* p, char* out, size_t out_size)

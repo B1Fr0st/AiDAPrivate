@@ -1782,13 +1782,52 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 				static_cast<unsigned long long>(addr),
 				static_cast<unsigned long long>(size), duration);
 
+			const auto request_start = std::chrono::steady_clock::now();
+			auto make_failure_payload = [&](const char* status, uint64_t generation, const integrity_hunter::idle_result_t& idle_state) {
+				const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+					std::chrono::steady_clock::now() - request_start).count();
+				json result;
+				result["status"] = status ? status : "failed";
+				result["generation"] = generation;
+				result["install_generation"] = idle_state.install_generation;
+				result["pid"] = idle_state.target_pid;
+				result["active_pid"] = driver_bridge::attached_pid();
+				result["address"] = addr_str;
+				result["target_address"] = addr_str;
+				result["size"] = size;
+				result["target_size"] = size;
+				result["install_complete"] = integrity_hunter::install_complete_for_generation(generation);
+				result["install_success"] = integrity_hunter::install_success_for_generation(generation);
+				result["raw_install_complete"] = idle_state.install_complete;
+				result["raw_install_success"] = idle_state.install_success;
+				result["worker_idle"] = idle_state.idle;
+				result["hunting"] = idle_state.hunting;
+				result["worker_active"] = idle_state.worker_active;
+				result["session"] = idle_state.session_id;
+				result["nodes"] = idle_state.nodes;
+				result["events"] = idle_state.events;
+				result["node_count"] = idle_state.nodes;
+				result["event_count"] = idle_state.events;
+				result["read_count"] = idle_state.total_reads;
+				result["total_reads"] = idle_state.total_reads;
+				result["elapsed_ms"] = elapsed;
+				result["cleanup_elapsed_ms"] = idle_state.elapsed_ms;
+				result["status_text"] = idle_state.status_text;
+				result["last_error"] = driver_bridge::last_error();
+				return result;
+			};
+
 			if (!integrity_hunter::start_hunt(addr, size)) {
 				diag::log_tagged("integrity_hunter", "mcp_hunt_start_failed");
-				return tool_result_t::error("integrity hunter could not start");
+				const uint64_t generation = integrity_hunter::g_state.generation.load(std::memory_order_acquire);
+				const auto idle_state = integrity_hunter::snapshot_idle_state();
+				auto result = make_failure_payload("start_failed", generation, idle_state);
+				return tool_result_t::error("integrity hunter could not start", result);
 			}
 
+			const uint64_t generation = integrity_hunter::g_state.generation.load(std::memory_order_acquire);
 			const auto install_start = std::chrono::steady_clock::now();
-			while (!integrity_hunter::g_state.install_complete.load() &&
+			while (!integrity_hunter::install_complete_for_generation(generation) &&
 			       (integrity_hunter::g_state.hunting.load() || integrity_hunter::g_state.worker_active.load())) {
 				const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
 					std::chrono::steady_clock::now() - install_start).count();
@@ -1801,23 +1840,63 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 						integrity_hunter::g_state.hunting.load() ? 1 : 0,
 						integrity_hunter::g_state.worker_active.load() ? 1 : 0);
 					integrity_hunter::stop_hunt();
-					const bool idle = integrity_hunter::wait_until_idle(12000);
-					diag::log_tagged_fmt("integrity_hunter", "mcp_hunt_install_timeout_idle idle=%d", idle ? 1 : 0);
-					return tool_result_t::error(idle ? "integrity hunter page guard install timed out" : "integrity hunter worker did not stop after install timeout");
+					const auto idle_state = integrity_hunter::wait_until_idle_result(12000);
+					auto result = make_failure_payload(idle_state.idle ? "page_guard_install_timeout" : "page_guard_install_timeout_cleanup_exceeded", generation, idle_state);
+					const std::string status = result.value("status", std::string());
+					const long long elapsed_ms = result.value("elapsed_ms", 0LL);
+					diag::log_tagged_fmt("integrity_hunter",
+						"mcp_hunt_install_timeout_idle gen=%llu idle=%d pid=%u active_pid=%u install_complete=%d install_success=%d nodes=%zu events=%zu reads=%llu elapsed_ms=%lld cleanup_elapsed_ms=%lld status=%s last_error=%s",
+						static_cast<unsigned long long>(generation),
+						idle_state.idle ? 1 : 0,
+						idle_state.target_pid,
+						driver_bridge::attached_pid(),
+						result.value("install_complete", false) ? 1 : 0,
+						result.value("install_success", false) ? 1 : 0,
+						idle_state.nodes,
+						idle_state.events,
+						static_cast<unsigned long long>(idle_state.total_reads),
+						elapsed_ms,
+						static_cast<long long>(idle_state.elapsed_ms),
+						status.c_str(),
+						driver_bridge::last_error().c_str());
+					return tool_result_t::error(idle_state.idle ? "integrity hunter page guard install timed out" : "integrity hunter worker did not stop after install timeout", result);
 				}
 				Sleep(25);
 			}
 
-			if (!integrity_hunter::g_state.install_success.load()) {
+			if (!integrity_hunter::install_success_for_generation(generation)) {
 				diag::log_tagged_fmt("integrity_hunter",
-					"mcp_hunt_install_failed addr=0x%llX size=%llu install_complete=%d",
+					"mcp_hunt_install_failed gen=%llu addr=0x%llX size=%llu install_complete=%d install_success=%d raw_install_complete=%d raw_install_success=%d",
+					static_cast<unsigned long long>(generation),
 					static_cast<unsigned long long>(addr),
 					static_cast<unsigned long long>(size),
-					integrity_hunter::g_state.install_complete.load() ? 1 : 0);
+					integrity_hunter::install_complete_for_generation(generation) ? 1 : 0,
+					integrity_hunter::install_success_for_generation(generation) ? 1 : 0,
+					integrity_hunter::g_state.install_complete.load() ? 1 : 0,
+					integrity_hunter::g_state.install_success.load() ? 1 : 0);
 				integrity_hunter::stop_hunt();
-				const bool idle = integrity_hunter::wait_until_idle(12000);
-				diag::log_tagged_fmt("integrity_hunter", "mcp_hunt_install_failed_idle idle=%d", idle ? 1 : 0);
-				return tool_result_t::error(idle ? "integrity hunter page guard install failed" : "integrity hunter worker did not stop after install failure");
+				const auto idle_state = integrity_hunter::wait_until_idle_result(12000);
+				auto result = make_failure_payload(idle_state.idle ? "page_guard_install_failed" : "page_guard_install_failed_cleanup_exceeded", generation, idle_state);
+				const std::string status = result.value("status", std::string());
+				const long long elapsed_ms = result.value("elapsed_ms", 0LL);
+				diag::log_tagged_fmt("integrity_hunter",
+					"mcp_hunt_install_failed_idle gen=%llu idle=%d pid=%u active_pid=%u address=0x%llX size=%llu install_complete=%d install_success=%d nodes=%zu events=%zu reads=%llu elapsed_ms=%lld cleanup_elapsed_ms=%lld status=%s last_error=%s",
+					static_cast<unsigned long long>(generation),
+					idle_state.idle ? 1 : 0,
+					idle_state.target_pid,
+					driver_bridge::attached_pid(),
+					static_cast<unsigned long long>(addr),
+					static_cast<unsigned long long>(size),
+					result.value("install_complete", false) ? 1 : 0,
+					result.value("install_success", false) ? 1 : 0,
+					idle_state.nodes,
+					idle_state.events,
+					static_cast<unsigned long long>(idle_state.total_reads),
+					elapsed_ms,
+					static_cast<long long>(idle_state.elapsed_ms),
+					status.c_str(),
+					driver_bridge::last_error().c_str());
+				return tool_result_t::error(idle_state.idle ? "integrity hunter page guard install failed" : "integrity hunter worker did not stop after install failure", result);
 			}
 
 			const auto monitor_start = std::chrono::steady_clock::now();
@@ -1830,8 +1909,8 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			}
 
 			integrity_hunter::stop_hunt();
-			const bool idle = integrity_hunter::wait_until_idle(12000);
-			if (!idle) {
+			const auto idle_state = integrity_hunter::wait_until_idle_result(12000);
+			if (!idle_state.idle) {
 				diag::log_tagged_fmt("integrity_hunter",
 					"mcp_hunt_stop_timeout addr=0x%llX size=%llu hunting=%d worker=%d session=%u",
 					static_cast<unsigned long long>(addr),
@@ -1839,7 +1918,8 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 					integrity_hunter::g_state.hunting.load() ? 1 : 0,
 					integrity_hunter::g_state.worker_active.load() ? 1 : 0,
 					integrity_hunter::g_state.pg_session_id.load());
-				return tool_result_t::error("integrity hunter worker did not stop cleanly");
+				auto result = make_failure_payload("stop_cleanup_exceeded", generation, idle_state);
+				return tool_result_t::error("integrity hunter worker did not stop cleanly", result);
 			}
 
 			std::lock_guard<std::mutex> lk(integrity_hunter::g_state.mutex);
@@ -1921,9 +2001,11 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 				result["no_stimulus_reason"] = "page guard installed but no read/access captures were observed during duration_ms";
 			if (stimulus_observed && nodes.empty())
 				result["node_suppression_reason"] = "captured readers did not reach the repeated-read threshold required for integrity nodes";
-			result["install_complete"] = integrity_hunter::g_state.install_complete.load();
-			result["install_success"] = integrity_hunter::g_state.install_success.load();
-			result["worker_idle"] = idle;
+			result["generation"] = generation;
+			result["install_generation"] = integrity_hunter::g_state.install_generation.load(std::memory_order_acquire);
+			result["install_complete"] = integrity_hunter::install_complete_for_generation(generation);
+			result["install_success"] = integrity_hunter::install_success_for_generation(generation);
+			result["worker_idle"] = idle_state.idle;
 			result["target_address"] = addr_str;
 			result["target_size"] = size;
 			result["duration_ms"] = duration;

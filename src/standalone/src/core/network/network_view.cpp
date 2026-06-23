@@ -984,20 +984,30 @@ void shutdown() {
     g_state.fuzz_thread_alive.store(false);
     g_state.fuzz_cv.notify_all();
 
-    while (!g_state.conn_thread_done.load(std::memory_order_acquire))
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    while (!g_state.cap_thread_done.load(std::memory_order_acquire))
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    while (!g_state.dns_thread_done.load(std::memory_order_acquire))
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    while (!g_state.bw_thread_done.load(std::memory_order_acquire))
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    while (!g_state.fuzz_thread_done.load(std::memory_order_acquire))
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    auto wait_done = [](const char* name, const std::atomic<bool>& done_flag) {
+        const uint64_t begin = static_cast<uint64_t>(GetTickCount64());
+        while (!done_flag.load(std::memory_order_acquire)) {
+            const uint64_t elapsed = static_cast<uint64_t>(GetTickCount64()) - begin;
+            if (elapsed >= 2500) {
+                diag::log_tagged_fmt("network", "shutdown_wait_timeout worker=%s elapsed_ms=%llu",
+                    name ? name : "<unnamed>",
+                    static_cast<unsigned long long>(elapsed));
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        diag::log_tagged_fmt("network", "shutdown_wait_done worker=%s elapsed_ms=%llu",
+            name ? name : "<unnamed>",
+            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - begin));
+    };
+    wait_done("conn", g_state.conn_thread_done);
+    wait_done("capture", g_state.cap_thread_done);
+    wait_done("dns", g_state.dns_thread_done);
+    wait_done("bandwidth", g_state.bw_thread_done);
+    wait_done("fuzzer", g_state.fuzz_thread_done);
 
     aida::burp::shutdown();
 
-    work_queue::shutdown();
     mitm_proxy::stop();
     ssl_keylog::stop_watching();
     g_state.active = false;

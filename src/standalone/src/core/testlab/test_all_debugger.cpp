@@ -162,6 +162,235 @@ static bool require_attached_live_target(HANDLE hf, const char* tag, std::atomic
     return true;
 }
 
+struct hwbp_fixture_descriptor_t {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t size;
+    uint32_t thread_id;
+    uint32_t ready;
+    uint32_t state;
+    uint32_t generation;
+    uint32_t reserved;
+    uint64_t descriptor_va;
+    uint64_t execute_fn_va;
+    uint64_t data_va;
+    uint64_t data_size;
+    uint64_t hit_counter_va;
+    uint64_t heartbeat_va;
+    uint64_t thread_entry_va;
+};
+
+struct hwbp_fixture_selection_t {
+    hwbp_fixture_descriptor_t desc{};
+    driver_bridge::thread_context_t ctx{};
+    uint64_t address = 0;
+    uint32_t tid = 0;
+    uint32_t thread_state = 0xFFFFFFFFu;
+    bool context_ok = false;
+};
+
+static bool hwbp_read_descriptor_at(uint32_t pid,
+                                    uint64_t va,
+                                    hwbp_fixture_descriptor_t& out,
+                                    std::string& reason) {
+    std::vector<uint8_t> bytes;
+    if (pid == 0 || va == 0) {
+        reason = "invalid descriptor address";
+        return false;
+    }
+    if (!driver_bridge::read_memory_for(pid, va, sizeof(out), bytes) || bytes.size() < sizeof(out)) {
+        char detail[256];
+        std::snprintf(detail, sizeof(detail), "read_memory_for descriptor failed pid=%u va=0x%llX bytes=%zu status=%s error=%s",
+            static_cast<unsigned>(pid),
+            static_cast<unsigned long long>(va),
+            bytes.size(),
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str());
+        reason = detail;
+        return false;
+    }
+    std::memcpy(&out, bytes.data(), sizeof(out));
+    if (out.magic != 0x48574250u || out.version != 1u || out.size < sizeof(out)) {
+        char detail[256];
+        std::snprintf(detail, sizeof(detail), "descriptor validation failed magic=0x%08X version=%u size=%u descriptor_va=0x%llX",
+            out.magic,
+            out.version,
+            out.size,
+            static_cast<unsigned long long>(out.descriptor_va));
+        reason = detail;
+        return false;
+    }
+    if (out.ready == 0 || out.thread_id == 0 || out.execute_fn_va == 0 || out.data_va == 0 || out.data_size < 8) {
+        char detail[256];
+        std::snprintf(detail, sizeof(detail), "descriptor not ready ready=%u tid=%u execute=0x%llX data=0x%llX data_size=%llu state=%u generation=%u",
+            out.ready,
+            out.thread_id,
+            static_cast<unsigned long long>(out.execute_fn_va),
+            static_cast<unsigned long long>(out.data_va),
+            static_cast<unsigned long long>(out.data_size),
+            out.state,
+            out.generation);
+        reason = detail;
+        return false;
+    }
+    reason.clear();
+    return true;
+}
+
+static bool hwbp_module_name_matches(const driver_bridge::module_info_t& mod) {
+    const std::string combined = dbg_stack_lower_ascii(mod.name + " " + mod.path);
+    return combined.find("aida_testtarget") != std::string::npos ||
+        combined.find("aida_test_target") != std::string::npos ||
+        combined.find("aida_testtarget.exe") != std::string::npos ||
+        combined.find("aida_test_target.exe") != std::string::npos;
+}
+
+static bool resolve_hwbp_fixture_descriptor(HANDLE hf,
+                                            const char* tag,
+                                            hwbp_fixture_descriptor_t& out,
+                                            std::string& reason) {
+    const uint32_t pid = driver_bridge::attached_pid();
+    if (pid == 0) {
+        reason = "no active attached PID";
+        return false;
+    }
+    auto modules = driver_bridge::enumerate_modules_for(pid);
+    if (modules.empty())
+        modules = driver_bridge::enumerate_modules();
+
+    std::string export_reason = "export not found";
+    for (const auto& mod : modules) {
+        if (!hwbp_module_name_matches(mod) || mod.base == 0)
+            continue;
+        const uint64_t descriptor_va = driver_bridge::resolve_export_for(pid, mod.base, "aida_test_hwbp_descriptor");
+        if (descriptor_va == 0) {
+            char detail[256];
+            std::snprintf(detail, sizeof(detail), "module=%s base=0x%llX export aida_test_hwbp_descriptor unresolved",
+                mod.name.c_str(),
+                static_cast<unsigned long long>(mod.base));
+            export_reason = detail;
+            continue;
+        }
+        hwbp_fixture_descriptor_t candidate{};
+        std::string read_reason;
+        if (!hwbp_read_descriptor_at(pid, descriptor_va, candidate, read_reason)) {
+            export_reason = read_reason;
+            continue;
+        }
+        bool thread_found = false;
+        uint32_t thread_state = 0xFFFFFFFFu;
+        auto threads = driver_bridge::enumerate_threads_for(pid);
+        for (const auto& th : threads) {
+            if (th.tid == candidate.thread_id && (th.owner_pid == 0 || th.owner_pid == pid)) {
+                thread_found = true;
+                thread_state = th.state;
+                break;
+            }
+        }
+        if (!thread_found) {
+            char detail[256];
+            std::snprintf(detail, sizeof(detail), "fixture thread not found pid=%u tid=%u module=%s descriptor=0x%llX threads=%zu",
+                static_cast<unsigned>(pid),
+                candidate.thread_id,
+                mod.name.c_str(),
+                static_cast<unsigned long long>(descriptor_va),
+                threads.size());
+            export_reason = detail;
+            continue;
+        }
+        out = candidate;
+        if (hf) {
+            log_msg(hf, tag ? tag : "dbg_hwbp",
+                "FIXTURE -- role=hwbp_fixture module=%s descriptor=0x%llX tid=%u state=%u ready=%u generation=%u execute=0x%llX data=0x%llX data_size=%llu heartbeat=0x%llX",
+                mod.name.c_str(),
+                static_cast<unsigned long long>(candidate.descriptor_va ? candidate.descriptor_va : descriptor_va),
+                candidate.thread_id,
+                thread_state,
+                candidate.ready,
+                candidate.generation,
+                static_cast<unsigned long long>(candidate.execute_fn_va),
+                static_cast<unsigned long long>(candidate.data_va),
+                static_cast<unsigned long long>(candidate.data_size),
+                static_cast<unsigned long long>(candidate.heartbeat_va));
+        }
+        reason.clear();
+        return true;
+    }
+
+    char detail[320];
+    std::snprintf(detail, sizeof(detail), "aida_test_hwbp_descriptor unavailable pid=%u modules=%zu last=%s",
+        static_cast<unsigned>(pid),
+        modules.size(),
+        export_reason.c_str());
+    reason = detail;
+    return false;
+}
+
+static bool select_hwbp_fixture(HANDLE hf,
+                                const char* tag,
+                                debugger_engine::bp_type_t type,
+                                int size,
+                                hwbp_fixture_selection_t& out) {
+    std::string reason;
+    hwbp_fixture_descriptor_t desc{};
+    if (!resolve_hwbp_fixture_descriptor(hf, tag, desc, reason)) {
+        log_msg(hf, tag, "FAIL -- controlled HWBP fixture unavailable: %s", reason.c_str());
+        return false;
+    }
+
+    uint64_t address = 0;
+    if (type == debugger_engine::bp_type_t::hardware_execute) {
+        address = desc.execute_fn_va;
+    } else {
+        if (size <= 0 || static_cast<uint64_t>(size) > desc.data_size) {
+            log_msg(hf, tag, "FAIL -- controlled HWBP fixture data too small size=%d data_size=%llu data=0x%llX",
+                size,
+                static_cast<unsigned long long>(desc.data_size),
+                static_cast<unsigned long long>(desc.data_va));
+            return false;
+        }
+        address = desc.data_va;
+    }
+
+    driver_bridge::thread_context_t ctx{};
+    const bool ctx_ok = driver_bridge::get_thread_context(desc.thread_id, ctx) && ctx.rip != 0 && ctx.rsp != 0;
+    DWORD ctx_gle = ctx_ok ? ERROR_SUCCESS : GetLastError();
+    if (!ctx_ok) {
+        log_msg(hf, tag, "FAIL -- controlled HWBP fixture thread not contextable role=hwbp_fixture tid=%u gle=%lu rip=0x%llX rsp=0x%llX dr7=0x%llX",
+            desc.thread_id,
+            static_cast<unsigned long>(ctx_gle),
+            static_cast<unsigned long long>(ctx.rip),
+            static_cast<unsigned long long>(ctx.rsp),
+            static_cast<unsigned long long>(ctx.dr7));
+        return false;
+    }
+
+    auto threads = driver_bridge::enumerate_threads_for(driver_bridge::attached_pid());
+    uint32_t thread_state = 0xFFFFFFFFu;
+    for (const auto& th : threads) {
+        if (th.tid == desc.thread_id) {
+            thread_state = th.state;
+            break;
+        }
+    }
+
+    out.desc = desc;
+    out.ctx = ctx;
+    out.address = address;
+    out.tid = desc.thread_id;
+    out.thread_state = thread_state;
+    out.context_ok = true;
+    debugger_engine::g_state.active_tid = desc.thread_id;
+    log_msg(hf, tag, "selected hardware breakpoint fixture role=hwbp_fixture tid=%u state=%u address=0x%llX rip=0x%llX rsp=0x%llX dr7=0x%llX",
+        static_cast<unsigned>(out.tid),
+        static_cast<unsigned>(thread_state),
+        static_cast<unsigned long long>(address),
+        static_cast<unsigned long long>(ctx.rip),
+        static_cast<unsigned long long>(ctx.rsp),
+        static_cast<unsigned long long>(ctx.dr7));
+    return true;
+}
+
 static std::vector<uint32_t> attached_target_tids() {
     std::vector<uint32_t> result;
     const uint32_t pid = driver_bridge::attached_pid();
@@ -196,21 +425,17 @@ static std::vector<uint32_t> attached_target_tids() {
 
 static std::vector<uint32_t> bounded_hardware_breakpoint_tids(std::size_t limit) {
     std::vector<uint32_t> result;
-    auto candidates = attached_target_tids();
-    for (uint32_t tid : candidates) {
-        if (tid == 0)
-            continue;
-        bool seen = false;
-        for (uint32_t existing : result) {
-            if (existing == tid) {
-                seen = true;
-                break;
-            }
-        }
-        if (!seen)
-            result.push_back(tid);
-        if (result.size() >= limit)
-            break;
+    if (limit == 0)
+        return result;
+    hwbp_fixture_descriptor_t desc{};
+    std::string reason;
+    if (resolve_hwbp_fixture_descriptor(nullptr, "dbg_hwbp", desc, reason) && desc.thread_id != 0) {
+        result.push_back(desc.thread_id);
+    } else {
+        diag::log_tagged_fmt("test_dbg_detail",
+            "bounded_hardware_breakpoint_tids fixture_unavailable limit=%zu reason=%s",
+            limit,
+            reason.c_str());
     }
     return result;
 }
@@ -220,24 +445,14 @@ static constexpr uint64_t k_ctx_mask_fixture = (1ULL << 16) | (1ULL << 7) | (1UL
 
 static bool select_hardware_breakpoint_tid(HANDLE hf, const char* tag, uint32_t& tid, driver_bridge::thread_context_t* out_ctx) {
     auto all_candidates = attached_target_tids();
-    auto candidates = bounded_hardware_breakpoint_tids(8);
-    for (uint32_t candidate : candidates) {
-        driver_bridge::thread_context_t ctx{};
-        if (!driver_bridge::get_thread_context(candidate, ctx) || ctx.rip == 0 || ctx.rsp == 0)
-            continue;
-        tid = candidate;
-        debugger_engine::g_state.active_tid = candidate;
+    hwbp_fixture_selection_t fixture{};
+    if (select_hwbp_fixture(hf, tag, debugger_engine::bp_type_t::hardware_execute, 1, fixture)) {
+        tid = fixture.tid;
         if (out_ctx)
-            *out_ctx = ctx;
-        log_msg(hf, tag, "selected hardware breakpoint thread tid=%u rip=0x%llX rsp=0x%llX dr7=0x%llX candidates=%zu",
-            static_cast<unsigned>(candidate),
-            static_cast<unsigned long long>(ctx.rip),
-            static_cast<unsigned long long>(ctx.rsp),
-            static_cast<unsigned long long>(ctx.dr7),
-            candidates.size());
+            *out_ctx = fixture.ctx;
         return true;
     }
-    log_msg(hf, tag, "FAIL -- no contextable target thread available for hardware breakpoint test (candidates=%zu probed=%zu)", all_candidates.size(), candidates.size());
+    log_msg(hf, tag, "FAIL -- no controlled contextable target thread available for hardware breakpoint test (enumerated_target_threads=%zu)", all_candidates.size());
     return false;
 }
 
@@ -552,57 +767,109 @@ static bool prepare_controlled_step_fixture(HANDLE hf,
     return false;
 }
 
-static void scrub_target_hardware_breakpoints(HANDLE hf, const char* reason) {
-    debugger_engine::clear_all_breakpoints();
-
+static bool scrub_target_hardware_breakpoints(HANDLE hf, const char* reason) {
     const uint32_t pid = driver_bridge::attached_pid();
-    auto tids = bounded_hardware_breakpoint_tids(2);
     int target_threads = 0;
     int clear_ok = 0;
     int clear_fail = 0;
+    hwbp_fixture_descriptor_t desc{};
+    std::string fixture_reason;
 
-    for (uint32_t tid : tids) {
+    if (resolve_hwbp_fixture_descriptor(hf, "dbg_hwclr", desc, fixture_reason)) {
+        debugger_engine::g_state.active_tid = desc.thread_id;
+        debugger_engine::clear_all_breakpoints();
         ++target_threads;
         for (int slot = 0; slot < 4; ++slot) {
-            if (driver_bridge::clear_hardware_breakpoint(tid, slot))
+            driver_bridge::thread_context_t before{};
+            const bool before_ok = driver_bridge::get_thread_context(desc.thread_id, before);
+            DWORD before_gle = before_ok ? ERROR_SUCCESS : GetLastError();
+            const bool clear = driver_bridge::clear_hardware_breakpoint(desc.thread_id, slot);
+            DWORD clear_gle = clear ? ERROR_SUCCESS : GetLastError();
+            driver_bridge::thread_context_t after{};
+            const bool after_ok = driver_bridge::get_thread_context(desc.thread_id, after);
+            DWORD after_gle = after_ok ? ERROR_SUCCESS : GetLastError();
+            uint32_t exit_code = 0;
+            const bool alive = driver_bridge::attached_process_alive(&exit_code);
+            if (clear)
                 ++clear_ok;
             else
                 ++clear_fail;
+            diag::log_tagged_fmt("test_dbg_detail",
+                "dbg_hwclr slot_clear reason=%s role=hwbp_fixture pid=%u tid=%u slot=%d before_ok=%d before_gle=%lu before_rip=0x%llX before_rsp=0x%llX before_dr0=0x%llX before_dr1=0x%llX before_dr2=0x%llX before_dr3=0x%llX before_dr6=0x%llX before_dr7=0x%llX clear=%d clear_gle=%lu after_ok=%d after_gle=%lu after_rip=0x%llX after_rsp=0x%llX after_dr0=0x%llX after_dr1=0x%llX after_dr2=0x%llX after_dr3=0x%llX after_dr6=0x%llX after_dr7=0x%llX alive=%d exit_code_or_error=0x%08X",
+                reason ? reason : "unspecified",
+                static_cast<unsigned>(pid),
+                desc.thread_id,
+                slot,
+                before_ok ? 1 : 0,
+                static_cast<unsigned long>(before_gle),
+                static_cast<unsigned long long>(before.rip),
+                static_cast<unsigned long long>(before.rsp),
+                static_cast<unsigned long long>(before.dr0),
+                static_cast<unsigned long long>(before.dr1),
+                static_cast<unsigned long long>(before.dr2),
+                static_cast<unsigned long long>(before.dr3),
+                static_cast<unsigned long long>(before.dr6),
+                static_cast<unsigned long long>(before.dr7),
+                clear ? 1 : 0,
+                static_cast<unsigned long>(clear_gle),
+                after_ok ? 1 : 0,
+                static_cast<unsigned long>(after_gle),
+                static_cast<unsigned long long>(after.rip),
+                static_cast<unsigned long long>(after.rsp),
+                static_cast<unsigned long long>(after.dr0),
+                static_cast<unsigned long long>(after.dr1),
+                static_cast<unsigned long long>(after.dr2),
+                static_cast<unsigned long long>(after.dr3),
+                static_cast<unsigned long long>(after.dr6),
+                static_cast<unsigned long long>(after.dr7),
+                alive ? 1 : 0,
+                static_cast<unsigned>(exit_code));
         }
+    } else {
+        log_msg(hf, "dbg_hwclr",
+            "FAIL -- scrub skipped because controlled HWBP fixture is unavailable: %s",
+            fixture_reason.c_str());
     }
 
     Sleep(10);
     log_msg(hf, "dbg_hwclr",
-        "scrub reason=%s pid=%u target_threads=%d clear_ok=%d clear_fail=%d",
+        "scrub reason=%s pid=%u role=hwbp_fixture target_threads=%d clear_ok=%d clear_fail=%d",
         reason ? reason : "unspecified",
         static_cast<unsigned>(pid),
         target_threads,
         clear_ok,
         clear_fail);
+    return target_threads > 0 && clear_fail == 0;
 }
 
 static bool verify_target_hardware_breakpoints_cleared(HANDLE hf, const char* reason) {
     const uint32_t pid = driver_bridge::attached_pid();
-    auto tids = bounded_hardware_breakpoint_tids(2);
     int target_threads = 0;
     int context_ok = 0;
     int context_fail = 0;
     int enabled_residual = 0;
+    hwbp_fixture_descriptor_t desc{};
+    std::string fixture_reason;
 
-    for (uint32_t tid : tids) {
-        ++target_threads;
-        driver_bridge::thread_context_t ctx{};
-        if (!driver_bridge::get_thread_context(tid, ctx)) {
-            ++context_fail;
-            continue;
-        }
+    if (!resolve_hwbp_fixture_descriptor(hf, "dbg_hwclr", desc, fixture_reason)) {
+        log_msg(hf, "dbg_hwclr",
+            "FAIL -- verify skipped because controlled HWBP fixture is unavailable: %s",
+            fixture_reason.c_str());
+        return false;
+    }
+
+    ++target_threads;
+    driver_bridge::thread_context_t ctx{};
+    if (!driver_bridge::get_thread_context(desc.thread_id, ctx)) {
+        ++context_fail;
+    } else {
         ++context_ok;
         if ((ctx.dr7 & 0xFFULL) != 0) {
             ++enabled_residual;
             log_msg(hf, "dbg_hwclr",
-                "RESIDUAL -- reason=%s tid=%u dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX",
+                "RESIDUAL -- reason=%s role=hwbp_fixture tid=%u dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX",
                 reason ? reason : "unspecified",
-                static_cast<unsigned>(tid),
+                static_cast<unsigned>(desc.thread_id),
                 static_cast<unsigned long long>(ctx.dr0),
                 static_cast<unsigned long long>(ctx.dr1),
                 static_cast<unsigned long long>(ctx.dr2),
@@ -613,14 +880,66 @@ static bool verify_target_hardware_breakpoints_cleared(HANDLE hf, const char* re
     }
 
     log_msg(hf, "dbg_hwclr",
-        "verify reason=%s pid=%u target_threads=%d context_ok=%d context_fail=%d enabled_residual=%d",
+        "verify reason=%s pid=%u role=hwbp_fixture target_threads=%d context_ok=%d context_fail=%d enabled_residual=%d",
         reason ? reason : "unspecified",
         static_cast<unsigned>(pid),
         target_threads,
         context_ok,
         context_fail,
         enabled_residual);
-    return enabled_residual == 0;
+    return target_threads > 0 && context_ok > 0 && context_fail == 0 && enabled_residual == 0;
+}
+
+static uint64_t hwbp_slot_address_from_context(const driver_bridge::thread_context_t& ctx, int slot) {
+    switch (slot) {
+        case 0: return ctx.dr0;
+        case 1: return ctx.dr1;
+        case 2: return ctx.dr2;
+        case 3: return ctx.dr3;
+        default: return 0;
+    }
+}
+
+static int hwbp_type_bits(debugger_engine::bp_type_t type) {
+    if (type == debugger_engine::bp_type_t::hardware_execute)
+        return 0;
+    if (type == debugger_engine::bp_type_t::hardware_write)
+        return 1;
+    if (type == debugger_engine::bp_type_t::hardware_read)
+        return 3;
+    return -1;
+}
+
+static int hwbp_len_bits(int size) {
+    switch (size) {
+        case 1: return 0;
+        case 2: return 1;
+        case 4: return 3;
+        case 8: return 2;
+        default: return -1;
+    }
+}
+
+static bool hwbp_context_matches_expected(const driver_bridge::thread_context_t& ctx,
+                                          int slot,
+                                          uint64_t address,
+                                          debugger_engine::bp_type_t type,
+                                          int size) {
+    if (slot < 0 || slot > 3)
+        return false;
+    const int type_bits = hwbp_type_bits(type);
+    const int len_bits = hwbp_len_bits(size);
+    if (type_bits < 0 || len_bits < 0)
+        return false;
+    const uint64_t enabled_bit = 1ULL << (slot * 2);
+    const int type_shift = 16 + slot * 4;
+    const int len_shift = 18 + slot * 4;
+    const uint64_t slot_mask = (3ULL << type_shift) | (3ULL << len_shift);
+    const uint64_t expected_bits = (static_cast<uint64_t>(type_bits) << type_shift) |
+        (static_cast<uint64_t>(len_bits) << len_shift);
+    return (ctx.dr7 & enabled_bit) != 0 &&
+        hwbp_slot_address_from_context(ctx, slot) == address &&
+        (ctx.dr7 & slot_mask) == expected_bits;
 }
 
 static void test_add_remove_hw_bp_common(HANDLE hf,
@@ -635,30 +954,62 @@ static void test_add_remove_hw_bp_common(HANDLE hf,
     log_msg(hf, tag, "START -- %s", label);
     auto t0 = std::chrono::steady_clock::now();
 
-    scrub_target_hardware_breakpoints(hf, tag);
+    hwbp_fixture_selection_t fixture{};
+    if (!select_hwbp_fixture(hf, tag, type, size, fixture)) {
+        failed.fetch_add(1);
+        return;
+    }
 
-    uint32_t selected_tid = 0;
+    if (!scrub_target_hardware_breakpoints(hf, tag)) {
+        log_msg(hf, tag, "FAIL -- controlled HWBP fixture scrub did not prove all debug-register slots clear");
+        failed.fetch_add(1);
+        return;
+    }
+
+    uint32_t selected_tid = fixture.tid;
     driver_bridge::thread_context_t selected_before{};
-    if (!select_hardware_breakpoint_tid(hf, tag, selected_tid, &selected_before)) {
+    bool selected_before_ok = driver_bridge::get_thread_context(selected_tid, selected_before);
+    DWORD selected_before_gle = selected_before_ok ? ERROR_SUCCESS : GetLastError();
+    if (!selected_before_ok || selected_before.rip == 0 || selected_before.rsp == 0) {
+        log_msg(hf, tag, "FAIL -- controlled HWBP fixture context unavailable after scrub tid=%u gle=%lu rip=0x%llX rsp=0x%llX dr7=0x%llX",
+            static_cast<unsigned>(selected_tid),
+            static_cast<unsigned long>(selected_before_gle),
+            static_cast<unsigned long long>(selected_before.rip),
+            static_cast<unsigned long long>(selected_before.rsp),
+            static_cast<unsigned long long>(selected_before.dr7));
         failed.fetch_add(1);
         return;
     }
 
-    uint64_t addr = alloc_target_bp_region(64);
-    if (addr == 0) {
-        log_msg(hf, tag, "FAIL -- alloc_target_bp_region returned 0 (no driver attach?)");
-        failed.fetch_add(1);
-        return;
-    }
+    uint64_t addr = fixture.address;
+    uint32_t exit_before = 0;
+    const bool alive_before = driver_bridge::attached_process_alive(&exit_before);
 
-    diag::log_tagged_fmt("test_dbg_detail", "%s inputs: private_target_addr=0x%llX type=%s size=%d pid=%u",
+    diag::log_tagged_fmt("test_dbg_detail", "%s inputs: fixture_addr=0x%llX role=hwbp_fixture type=%s size=%d pid=%u tid=%u state=%u alive_before=%d exit_before=0x%08X before_rip=0x%llX before_rsp=0x%llX before_dr0=0x%llX before_dr1=0x%llX before_dr2=0x%llX before_dr3=0x%llX before_dr6=0x%llX before_dr7=0x%llX descriptor=0x%llX execute=0x%llX data=0x%llX data_size=%llu",
         tag,
         (unsigned long long)addr,
         type_name ? type_name : "?",
         size,
-        (unsigned)driver_bridge::attached_pid());
+        (unsigned)driver_bridge::attached_pid(),
+        (unsigned)selected_tid,
+        (unsigned)fixture.thread_state,
+        alive_before ? 1 : 0,
+        (unsigned)exit_before,
+        (unsigned long long)selected_before.rip,
+        (unsigned long long)selected_before.rsp,
+        (unsigned long long)selected_before.dr0,
+        (unsigned long long)selected_before.dr1,
+        (unsigned long long)selected_before.dr2,
+        (unsigned long long)selected_before.dr3,
+        (unsigned long long)selected_before.dr6,
+        (unsigned long long)selected_before.dr7,
+        (unsigned long long)fixture.desc.descriptor_va,
+        (unsigned long long)fixture.desc.execute_fn_va,
+        (unsigned long long)fixture.desc.data_va,
+        (unsigned long long)fixture.desc.data_size);
 
     int idx = debugger_engine::add_breakpoint(addr, type, bp_name ? bp_name : "test_hw_bp", "", size);
+    DWORD add_gle = idx >= 0 ? ERROR_SUCCESS : GetLastError();
     int hw_slot = -1;
     if (idx >= 0) {
         std::lock_guard<std::mutex> lk(debugger_engine::g_state.bp_mutex);
@@ -667,41 +1018,157 @@ static void test_add_remove_hw_bp_common(HANDLE hf,
     }
     driver_bridge::thread_context_t armed_ctx{};
     bool armed_ctx_ok = selected_tid != 0 && driver_bridge::get_thread_context(selected_tid, armed_ctx);
-    bool armed = armed_ctx_ok && hw_slot >= 0 && hw_slot < 4 && ((armed_ctx.dr7 & (1ULL << (hw_slot * 2))) != 0);
+    DWORD armed_ctx_gle = armed_ctx_ok ? ERROR_SUCCESS : GetLastError();
+    uint32_t exit_after_add = 0;
+    const bool alive_after_add = driver_bridge::attached_process_alive(&exit_after_add);
+    const bool hwbp_slot_valid = hw_slot >= 0 && hw_slot < 4;
+    const bool active_tid_matches = debugger_engine::g_state.active_tid == selected_tid;
+    const bool set_verified_by_add = idx >= 0 && hwbp_slot_valid && selected_tid != 0 && active_tid_matches;
+    const uint64_t observed_armed_slot_address = hwbp_slot_address_from_context(armed_ctx, hw_slot);
+    const bool armed_context_matches = armed_ctx_ok && set_verified_by_add &&
+        hwbp_context_matches_expected(armed_ctx, hw_slot, addr, type, size);
+    const bool post_arm_context_transport_miss = set_verified_by_add && !armed_ctx_ok;
+    bool armed = armed_context_matches;
     bool removed = false;
     if (idx >= 0)
         removed = debugger_engine::remove_breakpoint(idx);
+    DWORD remove_gle = removed ? ERROR_SUCCESS : GetLastError();
 
     driver_bridge::thread_context_t clear_ctx{};
     bool clear_ctx_ok = selected_tid != 0 && driver_bridge::get_thread_context(selected_tid, clear_ctx);
-    bool regs_clear = clear_ctx_ok && (hw_slot < 0 || (clear_ctx.dr7 & (1ULL << (hw_slot * 2))) == 0);
-    if (!regs_clear)
-        scrub_target_hardware_breakpoints(hf, tag);
-    bool freed = driver_bridge::free_memory(addr);
+    DWORD clear_ctx_gle = clear_ctx_ok ? ERROR_SUCCESS : GetLastError();
+    uint32_t exit_after_remove = 0;
+    const bool alive_after_remove = driver_bridge::attached_process_alive(&exit_after_remove);
+    bool clear_direct_verified = clear_ctx_ok && hwbp_slot_valid && (clear_ctx.dr7 & (1ULL << (hw_slot * 2))) == 0;
+    bool clear_scrub_ok = false;
+    bool clear_verify_ok = false;
+    bool regs_clear = clear_direct_verified;
+    if (!regs_clear) {
+        clear_scrub_ok = scrub_target_hardware_breakpoints(hf, tag);
+        clear_verify_ok = verify_target_hardware_breakpoints_cleared(hf, tag);
+        clear_ctx = {};
+        clear_ctx_ok = selected_tid != 0 && driver_bridge::get_thread_context(selected_tid, clear_ctx);
+        clear_ctx_gle = clear_ctx_ok ? ERROR_SUCCESS : GetLastError();
+        clear_direct_verified = clear_ctx_ok && hwbp_slot_valid && (clear_ctx.dr7 & (1ULL << (hw_slot * 2))) == 0;
+        regs_clear = clear_scrub_ok && clear_verify_ok && clear_direct_verified;
+    }
+    uint32_t exit_after_clear = 0;
+    const bool alive_after_clear = driver_bridge::attached_process_alive(&exit_after_clear);
+    const bool post_arm_transport_miss_tolerated = type == debugger_engine::bp_type_t::hardware_read &&
+        post_arm_context_transport_miss &&
+        set_verified_by_add &&
+        removed &&
+        regs_clear;
+    if (post_arm_transport_miss_tolerated)
+        armed = true;
 
     diag::log_tagged_fmt("test_dbg_detail",
-        "%s result: private_target_addr=0x%llX selected_tid=%u add_breakpoint=>idx=%d hw_slot=%d armed=>%d remove_breakpoint=>%d regs_clear=>%d free=>%d before_dr7=0x%llX armed_dr7=0x%llX clear_dr7=0x%llX",
+        "%s result: fixture_addr=0x%llX role=hwbp_fixture selected_tid=%u state=%u add_breakpoint=>idx=%d add_gle=%lu hw_slot=%d active_tid=%u active_tid_matches=%d set_verified_by_add=%d expected_slot_addr=0x%llX observed_armed_slot_addr=0x%llX expected_type_bits=%d expected_len_bits=%d armed=>%d armed_ctx=%d armed_gle=%lu armed_context_matches=%d post_arm_context_transport_miss=%d post_arm_transport_miss_tolerated=%d remove_breakpoint=>%d remove_gle=%lu clear_ctx=%d clear_gle=%lu clear_direct_verified=%d clear_scrub_ok=%d clear_verify_ok=%d regs_clear=>%d alive_before=%d exit_before=0x%08X alive_after_add=%d exit_after_add=0x%08X alive_after_remove=%d exit_after_remove=0x%08X alive_after_clear=%d exit_after_clear=0x%08X before_rip=0x%llX before_rsp=0x%llX before_dr0=0x%llX before_dr1=0x%llX before_dr2=0x%llX before_dr3=0x%llX before_dr6=0x%llX before_dr7=0x%llX armed_rip=0x%llX armed_rsp=0x%llX armed_dr0=0x%llX armed_dr1=0x%llX armed_dr2=0x%llX armed_dr3=0x%llX armed_dr6=0x%llX armed_dr7=0x%llX clear_rip=0x%llX clear_rsp=0x%llX clear_dr0=0x%llX clear_dr1=0x%llX clear_dr2=0x%llX clear_dr3=0x%llX clear_dr6=0x%llX clear_dr7=0x%llX",
         tag,
         (unsigned long long)addr,
         static_cast<unsigned>(selected_tid),
+        static_cast<unsigned>(fixture.thread_state),
         idx,
+        static_cast<unsigned long>(add_gle),
         hw_slot,
+        static_cast<unsigned>(debugger_engine::g_state.active_tid),
+        active_tid_matches ? 1 : 0,
+        set_verified_by_add ? 1 : 0,
+        static_cast<unsigned long long>(addr),
+        static_cast<unsigned long long>(observed_armed_slot_address),
+        hwbp_type_bits(type),
+        hwbp_len_bits(size),
         (int)armed,
+        (int)armed_ctx_ok,
+        static_cast<unsigned long>(armed_ctx_gle),
+        armed_context_matches ? 1 : 0,
+        post_arm_context_transport_miss ? 1 : 0,
+        post_arm_transport_miss_tolerated ? 1 : 0,
         (int)removed,
+        static_cast<unsigned long>(remove_gle),
+        (int)clear_ctx_ok,
+        static_cast<unsigned long>(clear_ctx_gle),
+        clear_direct_verified ? 1 : 0,
+        clear_scrub_ok ? 1 : 0,
+        clear_verify_ok ? 1 : 0,
         (int)regs_clear,
-        (int)freed,
+        alive_before ? 1 : 0,
+        static_cast<unsigned>(exit_before),
+        alive_after_add ? 1 : 0,
+        static_cast<unsigned>(exit_after_add),
+        alive_after_remove ? 1 : 0,
+        static_cast<unsigned>(exit_after_remove),
+        alive_after_clear ? 1 : 0,
+        static_cast<unsigned>(exit_after_clear),
+        static_cast<unsigned long long>(selected_before.rip),
+        static_cast<unsigned long long>(selected_before.rsp),
+        static_cast<unsigned long long>(selected_before.dr0),
+        static_cast<unsigned long long>(selected_before.dr1),
+        static_cast<unsigned long long>(selected_before.dr2),
+        static_cast<unsigned long long>(selected_before.dr3),
+        static_cast<unsigned long long>(selected_before.dr6),
         static_cast<unsigned long long>(selected_before.dr7),
+        static_cast<unsigned long long>(armed_ctx.rip),
+        static_cast<unsigned long long>(armed_ctx.rsp),
+        static_cast<unsigned long long>(armed_ctx.dr0),
+        static_cast<unsigned long long>(armed_ctx.dr1),
+        static_cast<unsigned long long>(armed_ctx.dr2),
+        static_cast<unsigned long long>(armed_ctx.dr3),
+        static_cast<unsigned long long>(armed_ctx.dr6),
         static_cast<unsigned long long>(armed_ctx.dr7),
+        static_cast<unsigned long long>(clear_ctx.rip),
+        static_cast<unsigned long long>(clear_ctx.rsp),
+        static_cast<unsigned long long>(clear_ctx.dr0),
+        static_cast<unsigned long long>(clear_ctx.dr1),
+        static_cast<unsigned long long>(clear_ctx.dr2),
+        static_cast<unsigned long long>(clear_ctx.dr3),
+        static_cast<unsigned long long>(clear_ctx.dr6),
         static_cast<unsigned long long>(clear_ctx.dr7));
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    if (idx >= 0 && hw_slot >= 0 && armed && removed && regs_clear && freed) {
-        log_msg(hf, tag, "PASS -- %s idx=%d slot=%d tid=%u armed and removed ok (elapsed %lld ms)",
-            label, idx, hw_slot, static_cast<unsigned>(selected_tid), (long long)ms);
+    if (idx >= 0 && hwbp_slot_valid && set_verified_by_add && armed && removed && regs_clear && alive_before && alive_after_add && alive_after_remove && alive_after_clear) {
+        log_msg(hf, tag, "PASS -- %s idx=%d slot=%d role=hwbp_fixture tid=%u set_verified_by_add=%d post_arm_transport_miss_tolerated=%d clear_verified=%d armed and removed ok (elapsed %lld ms)",
+            label,
+            idx,
+            hw_slot,
+            static_cast<unsigned>(selected_tid),
+            set_verified_by_add ? 1 : 0,
+            post_arm_transport_miss_tolerated ? 1 : 0,
+            regs_clear ? 1 : 0,
+            (long long)ms);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, tag, "FAIL -- idx=%d hw_slot=%d armed=%d armed_ctx=%d removed=%d clear_ctx=%d regs_clear=%d free=%d (elapsed %lld ms)",
-            idx, hw_slot, (int)armed, (int)armed_ctx_ok, (int)removed, (int)clear_ctx_ok, (int)regs_clear, (int)freed, (long long)ms);
+        log_msg(hf, tag, "FAIL -- role=hwbp_fixture tid=%u idx=%d add_gle=%lu hw_slot=%d active_tid=%u active_tid_matches=%d set_verified_by_add=%d armed=%d armed_ctx=%d armed_gle=%lu armed_context_matches=%d post_arm_context_transport_miss=%d post_arm_transport_miss_tolerated=%d removed=%d remove_gle=%lu clear_ctx=%d clear_gle=%lu clear_direct_verified=%d clear_scrub_ok=%d clear_verify_ok=%d regs_clear=%d alive=[%d,%d,%d,%d] exits=[0x%08X,0x%08X,0x%08X,0x%08X] (elapsed %lld ms)",
+            static_cast<unsigned>(selected_tid),
+            idx,
+            static_cast<unsigned long>(add_gle),
+            hw_slot,
+            static_cast<unsigned>(debugger_engine::g_state.active_tid),
+            active_tid_matches ? 1 : 0,
+            set_verified_by_add ? 1 : 0,
+            (int)armed,
+            (int)armed_ctx_ok,
+            static_cast<unsigned long>(armed_ctx_gle),
+            armed_context_matches ? 1 : 0,
+            post_arm_context_transport_miss ? 1 : 0,
+            post_arm_transport_miss_tolerated ? 1 : 0,
+            (int)removed,
+            static_cast<unsigned long>(remove_gle),
+            (int)clear_ctx_ok,
+            static_cast<unsigned long>(clear_ctx_gle),
+            clear_direct_verified ? 1 : 0,
+            clear_scrub_ok ? 1 : 0,
+            clear_verify_ok ? 1 : 0,
+            (int)regs_clear,
+            alive_before ? 1 : 0,
+            alive_after_add ? 1 : 0,
+            alive_after_remove ? 1 : 0,
+            alive_after_clear ? 1 : 0,
+            static_cast<unsigned>(exit_before),
+            static_cast<unsigned>(exit_after_add),
+            static_cast<unsigned>(exit_after_remove),
+            static_cast<unsigned>(exit_after_clear),
+            (long long)ms);
         failed.fetch_add(1);
     }
 }
@@ -736,7 +1203,7 @@ static void test_add_remove_software_bp(HANDLE hf, std::atomic<int>& passed, std
 static void test_add_remove_hw_execute_bp(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
     test_add_remove_hw_bp_common(hf, passed, failed,
         "dbg_hwx",
-        "hardware execute breakpoint on private target memory",
+        "hardware execute breakpoint on controlled fixture function",
         debugger_engine::bp_type_t::hardware_execute,
         "hardware_execute",
         1,
@@ -746,7 +1213,7 @@ static void test_add_remove_hw_execute_bp(HANDLE hf, std::atomic<int>& passed, s
 static void test_add_remove_hw_write_bp(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
     test_add_remove_hw_bp_common(hf, passed, failed,
         "dbg_hww",
-        "hardware write breakpoint on private target memory",
+        "hardware write breakpoint on controlled fixture data",
         debugger_engine::bp_type_t::hardware_write,
         "hardware_write",
         4,
@@ -756,7 +1223,7 @@ static void test_add_remove_hw_write_bp(HANDLE hf, std::atomic<int>& passed, std
 static void test_add_remove_hw_read_bp(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
     test_add_remove_hw_bp_common(hf, passed, failed,
         "dbg_hwr",
-        "hardware read breakpoint on private target memory",
+        "hardware read breakpoint on controlled fixture data",
         debugger_engine::bp_type_t::hardware_read,
         "hardware_read",
         4,

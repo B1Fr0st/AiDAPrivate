@@ -379,6 +379,7 @@ inline std::string describe_pdb_status(const std::string& module_key, bool& is_d
 	if (!m.status_text.empty()) return m.status_text;
 	if (m.loading) return std::string("Loading PDB symbols...");
 	if (m.failed) return std::string("PDB load failed");
+	if (m.load_declined) return std::string("PDB load skipped by full-test policy");
 	if (m.pdb.loaded) return std::string("PDB symbols loaded");
 	return std::string("Loading PDB symbols...");
 }
@@ -391,6 +392,7 @@ inline std::string compose_dynamic_label(phase_t ph)
 		return s.milestone_label;
 	}
 	if (ph == phase_t::awaiting_pdb_decision) {
+		initial_analysis::detail::auto_decline_pdb_prompts_for_full_test("loading_binary_overlay.compose_dynamic_label");
 		bool has_remote = initial_analysis::g_state.needs_pdb_prompt.load(std::memory_order_acquire);
 		bool has_local = initial_analysis::g_state.needs_local_pdb_prompt.load(std::memory_order_acquire);
 		if (has_remote) return std::string("Waiting for PDB download confirmation...");
@@ -476,14 +478,26 @@ inline void log_state(const char* tag)
 	std::string path;
 	std::string filename;
 	std::string milestone;
+	std::string pdb_module_key;
 	{
 		std::lock_guard<std::mutex> lk(s.text_mtx);
 		path = s.path;
 		filename = s.filename;
 		milestone = s.milestone_label;
+		pdb_module_key = s.pdb_module_key;
+	}
+	bool pdb_failed = false;
+	bool pdb_declined = false;
+	if (!pdb_module_key.empty()) {
+		std::lock_guard<std::mutex> lk(symbol_store::g_state.mutex);
+		auto it = symbol_store::g_state.modules.find(pdb_module_key);
+		if (it != symbol_store::g_state.modules.end()) {
+			pdb_failed = it->second.failed;
+			pdb_declined = it->second.load_declined;
+		}
 	}
 	diag::log_tagged_fmt("loading_binary_overlay",
-		"%s phase=%u phase_name=%s active=%d worker_finished=%d completion_applied=%d load_succeeded=%d action=%u worker_state=%u generation=%llu progress=%.3f ia_running=%d ia_finished=%d ia_step=%d path=%s filename=%s milestone=%s",
+		"%s phase=%u phase_name=%s active=%d worker_finished=%d completion_applied=%d load_succeeded=%d action=%u worker_state=%u generation=%llu progress=%.3f ia_running=%d ia_finished=%d ia_step=%d pdb_module=%s failed=%d declined=%d path=%s filename=%s milestone=%s",
 		tag ? tag : "state",
 		static_cast<unsigned int>(current_phase()),
 		current_phase_name(),
@@ -498,6 +512,9 @@ inline void log_state(const char* tag)
 		initial_analysis::g_state.running.load(std::memory_order_acquire) ? 1 : 0,
 		initial_analysis::g_state.finished.load(std::memory_order_acquire) ? 1 : 0,
 		initial_analysis::g_state.active_step_index.load(std::memory_order_acquire),
+		pdb_module_key.c_str(),
+		pdb_failed ? 1 : 0,
+		pdb_declined ? 1 : 0,
 		path.c_str(),
 		filename.c_str(),
 		milestone.c_str());
@@ -726,6 +743,7 @@ inline void poll_completion()
 		return;
 	}
 
+	initial_analysis::detail::auto_decline_pdb_prompts_for_full_test("loading_binary_overlay.poll_completion");
 	bool needs_remote = initial_analysis::g_state.needs_pdb_prompt.load(std::memory_order_acquire);
 	bool needs_local = initial_analysis::g_state.needs_local_pdb_prompt.load(std::memory_order_acquire);
 	bool ia_finished = initial_analysis::g_state.finished.load(std::memory_order_acquire);
@@ -779,6 +797,7 @@ inline void render()
 	phase_t ph = detail::get_phase();
 	bool keep_open = (ph != phase_t::idle) && (ph != phase_t::complete);
 
+	initial_analysis::detail::auto_decline_pdb_prompts_for_full_test("loading_binary_overlay.render");
 	bool modal_open = initial_analysis::g_state.needs_pdb_prompt.load(std::memory_order_acquire) ||
 	                  initial_analysis::g_state.needs_local_pdb_prompt.load(std::memory_order_acquire);
 

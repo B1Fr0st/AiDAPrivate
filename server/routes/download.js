@@ -3,6 +3,7 @@
 const express = require('express');
 const crypto = require('crypto');
 const fs = require('fs');
+const zlib = require('zlib');
 const pool = require('../db/pool');
 const { encryptPage, splitIntoPages, deriveChainTag } = require('../crypto/arc-encrypt');
 const arcLicenseBind = require('../crypto/arc-license-bind');
@@ -19,6 +20,11 @@ const DOWNLOAD_EAUTH_BUDGET_MS = parseInt(process.env.DOWNLOAD_EAUTH_BUDGET_MS |
 const DOWNLOAD_EAUTH_JITTER_MS = parseInt(process.env.DOWNLOAD_EAUTH_JITTER_MS || '20', 10) || 20;
 const DOWNLOAD_EAUTH_BODY = JSON.stringify({ ok: false, error_code: 'EAUTH' });
 const DOWNLOAD_EAUTH_LENGTH = Buffer.byteLength(DOWNLOAD_EAUTH_BODY, 'utf8');
+
+function acceptsGzip(req) {
+    const value = String((req && req.headers && req.headers['accept-encoding']) || '');
+    return /(?:^|[\s,])gzip(?:[\s,;]|$)/i.test(value);
+}
 
 function dlJitter() {
     if (DOWNLOAD_EAUTH_JITTER_MS <= 0) return 0;
@@ -528,9 +534,31 @@ router.post('/arc/pages/bulk', async (req, res) => {
         const responseBody = Buffer.from(JSON.stringify(envelope), 'utf8');
         const elapsedMs = Date.now() - t0;
         console.warn(`[arc-bulk] response_sending status=200 elapsed_ms=${elapsedMs} body_size=${responseBody.length} lk_prefix=${lkPrefix}`);
+        if (acceptsGzip(req)) {
+            try {
+                const gzipStart = Date.now();
+                const compressedBody = zlib.gzipSync(responseBody, { level: 6 });
+                const gzipMs = Date.now() - gzipStart;
+                console.warn(`[arc-bulk] response_gzip_ok elapsed_ms=${gzipMs} body_size=${responseBody.length} gzip_size=${compressedBody.length} lk_prefix=${lkPrefix}`);
+                res.status(200);
+                res.set({
+                    'Content-Type': 'application/json; charset=utf-8',
+                    'Content-Encoding': 'gzip',
+                    'Content-Length': String(compressedBody.length),
+                    'Vary': 'Accept-Encoding',
+                    'Cache-Control': 'no-store',
+                    'X-AIDA-ARC-Uncompressed-Length': String(responseBody.length),
+                    'X-AIDA-ARC-Compressed-Length': String(compressedBody.length),
+                });
+                return res.end(compressedBody);
+            } catch (gzipErr) {
+                console.warn(`[arc-bulk] response_gzip_failed err=${gzipErr && gzipErr.message ? gzipErr.message : gzipErr} lk_prefix=${lkPrefix}`);
+            }
+        }
         res.set({
             'Content-Type': 'application/json; charset=utf-8',
             'Content-Length': String(responseBody.length),
+            'Vary': 'Accept-Encoding',
             'Cache-Control': 'no-store',
         });
         return res.status(200).send(responseBody);

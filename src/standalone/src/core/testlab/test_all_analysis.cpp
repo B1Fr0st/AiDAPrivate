@@ -1995,7 +1995,8 @@ static void test_integrity_hunter_start_stop(HANDLE hf, std::atomic<int>& passed
         return;
 
     integrity_hunter::stop_hunt();
-    const bool pre_idle = integrity_hunter::wait_until_idle(12000);
+    const auto pre_idle_result = integrity_hunter::wait_until_idle_result(12000);
+    const bool pre_idle = pre_idle_result.idle;
     const bool pre_hunting = integrity_hunter::g_state.hunting.load();
     const bool pre_worker = integrity_hunter::g_state.worker_active.load();
     const uint32_t pre_session = integrity_hunter::g_state.pg_session_id.load();
@@ -2041,24 +2042,42 @@ static void test_integrity_hunter_start_stop(HANDLE hf, std::atomic<int>& passed
 
     integrity_hunter::stop_hunt();
 
-    bool idle = integrity_hunter::wait_until_idle(12000);
+    const uint64_t generation = integrity_hunter::g_state.generation.load(std::memory_order_acquire);
+    auto idle_result = integrity_hunter::wait_until_idle_result(12000);
+    bool idle = idle_result.idle;
     bool hunting = integrity_hunter::g_state.hunting.load();
     bool worker = integrity_hunter::g_state.worker_active.load();
-    bool install_complete = integrity_hunter::g_state.install_complete.load();
-    bool install_success = integrity_hunter::g_state.install_success.load();
+    bool install_complete = integrity_hunter::install_complete_for_generation(generation);
+    bool install_success = integrity_hunter::install_success_for_generation(generation);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (started && idle && !hunting && !worker) {
-        log_msg(hf, "integ_ss", "PASS -- target_pid=%u driver_attached=%d target=0x%016llX started=%d idle=%d hunting_after_stop=%d worker=%d install_complete=%d install_success=%d (elapsed %lld ms)",
+        log_msg(hf, "integ_ss", "PASS -- target_pid=%u driver_attached=%d target=0x%016llX generation=%llu install_generation=%llu started=%d idle=%d cleanup_elapsed_ms=%lld hunting_after_stop=%d worker=%d install_complete=%d install_success=%d nodes=%zu events=%zu total_reads=%llu (elapsed %lld ms)",
             (unsigned)target_pid, driver_attached_flag(target_pid), (unsigned long long)addr,
-            started ? 1 : 0, idle ? 1 : 0, hunting ? 1 : 0, worker ? 1 : 0,
-            install_complete ? 1 : 0, install_success ? 1 : 0, (long long)ms);
+            (unsigned long long)generation,
+            (unsigned long long)idle_result.install_generation,
+            started ? 1 : 0, idle ? 1 : 0, (long long)idle_result.elapsed_ms, hunting ? 1 : 0, worker ? 1 : 0,
+            install_complete ? 1 : 0, install_success ? 1 : 0,
+            idle_result.nodes,
+            idle_result.events,
+            (unsigned long long)idle_result.total_reads,
+            (long long)ms);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "integ_ss", "FAIL -- target_pid=%u driver_attached=%d target=0x%016llX started=%d idle=%d hunting_after_stop=%d worker=%d install_complete=%d install_success=%d status=\"%s\" last_error=\"%s\" (elapsed %lld ms)",
-            (unsigned)target_pid, driver_attached_flag(target_pid), (unsigned long long)addr,
-            started ? 1 : 0, idle ? 1 : 0, hunting ? 1 : 0, worker ? 1 : 0,
+        log_msg(hf, "integ_ss", "FAIL -- target_pid=%u active_pid=%u driver_attached=%d target=0x%016llX generation=%llu install_generation=%llu started=%d idle=%d cleanup_elapsed_ms=%lld hunting_after_stop=%d worker=%d install_complete=%d install_success=%d raw_install_complete=%d raw_install_success=%d nodes=%zu events=%zu total_reads=%llu status=\"%s\" last_error=\"%s\" (elapsed %lld ms)",
+            (unsigned)target_pid,
+            (unsigned)driver_bridge::attached_pid(),
+            driver_attached_flag(target_pid),
+            (unsigned long long)addr,
+            (unsigned long long)generation,
+            (unsigned long long)idle_result.install_generation,
+            started ? 1 : 0, idle ? 1 : 0, (long long)idle_result.elapsed_ms, hunting ? 1 : 0, worker ? 1 : 0,
             install_complete ? 1 : 0, install_success ? 1 : 0,
+            idle_result.install_complete ? 1 : 0,
+            idle_result.install_success ? 1 : 0,
+            idle_result.nodes,
+            idle_result.events,
+            (unsigned long long)idle_result.total_reads,
             driver_bridge::status().c_str(),
             driver_bridge::last_error().c_str(),
             (long long)ms);
@@ -2188,10 +2207,34 @@ static void test_integrity_hunter_nodes(HANDLE hf, std::atomic<int>& passed, std
     }
 
     const bool started = integrity_hunter::start_hunt(fixture.address, 128);
+    const uint64_t generation = integrity_hunter::g_state.generation.load(std::memory_order_acquire);
+    if (!started) {
+        const auto idle_state = integrity_hunter::snapshot_idle_state();
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        log_msg(hf, "integ_nd", "FAIL -- integrity hunter start failed: generation=%llu install_generation=%llu pid=%u active_pid=%u addr=0x%016llX size=%u install_complete=%d install_success=%d raw_install_complete=%d raw_install_success=%d nodes=%zu events=%zu total_reads=%llu status=\"%s\" last_error=\"%s\" (elapsed %lld ms)",
+            (unsigned long long)generation,
+            (unsigned long long)idle_state.install_generation,
+            (unsigned)idle_state.target_pid,
+            (unsigned)driver_bridge::attached_pid(),
+            (unsigned long long)fixture.address,
+            128u,
+            integrity_hunter::install_complete_for_generation(generation) ? 1 : 0,
+            integrity_hunter::install_success_for_generation(generation) ? 1 : 0,
+            idle_state.install_complete ? 1 : 0,
+            idle_state.install_success ? 1 : 0,
+            idle_state.nodes,
+            idle_state.events,
+            (unsigned long long)idle_state.total_reads,
+            idle_state.status_text.c_str(),
+            driver_bridge::last_error().c_str(),
+            (long long)ms);
+        failed.fetch_add(1);
+        return;
+    }
     bool install_seen = false;
     const DWORD install_start = GetTickCount();
     while (GetTickCount() - install_start < 6500) {
-        if (integrity_hunter::g_state.install_complete.load()) {
+        if (integrity_hunter::install_complete_for_generation(generation)) {
             install_seen = true;
             break;
         }
@@ -2200,13 +2243,75 @@ static void test_integrity_hunter_nodes(HANDLE hf, std::atomic<int>& passed, std
         Sleep(25);
     }
 
-    const bool install_complete = integrity_hunter::g_state.install_complete.load();
-    const bool install_success = integrity_hunter::g_state.install_success.load();
+    const bool install_complete = integrity_hunter::install_complete_for_generation(generation);
+    const bool install_success = integrity_hunter::install_success_for_generation(generation);
     const uint32_t pg_session = integrity_hunter::g_state.pg_session_id.load();
 
     driver_bridge::memory_region_t guard_region{};
     const bool guard_query = driver_bridge::query_memory_for(target_pid, fixture.address, guard_region);
     const bool guard_set = guard_query && ((guard_region.protect & PAGE_GUARD) != 0);
+
+    if (!install_complete || !install_success) {
+        integrity_hunter::stop_hunt();
+        const auto idle_state = integrity_hunter::wait_until_idle_result(12000);
+        const char* status = idle_state.idle ? "page_guard_install_failed" : "page_guard_install_cleanup_exceeded";
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        diag::log_tagged_fmt("test_analysis_detail",
+            "integ_nd install_failure status=%s generation=%llu install_generation=%llu pid=%u active_pid=%u addr=0x%llX size=%u install_seen=%d install_complete=%d install_success=%d raw_install_complete=%d raw_install_success=%d idle=%d cleanup_elapsed_ms=%lld pg_session=%u guard_query=%d guard_state=%d guard_protect=0x%08X nodes=%zu events=%zu total_reads=%llu status_text='%s' bridge_status='%s' last_error='%s' elapsed_ms=%lld",
+            status,
+            (unsigned long long)generation,
+            (unsigned long long)idle_state.install_generation,
+            (unsigned)idle_state.target_pid,
+            (unsigned)driver_bridge::attached_pid(),
+            (unsigned long long)fixture.address,
+            128u,
+            install_seen ? 1 : 0,
+            install_complete ? 1 : 0,
+            install_success ? 1 : 0,
+            idle_state.install_complete ? 1 : 0,
+            idle_state.install_success ? 1 : 0,
+            idle_state.idle ? 1 : 0,
+            (long long)idle_state.elapsed_ms,
+            pg_session,
+            guard_query ? 1 : 0,
+            guard_set ? 1 : 0,
+            (unsigned)guard_region.protect,
+            idle_state.nodes,
+            idle_state.events,
+            (unsigned long long)idle_state.total_reads,
+            idle_state.status_text.c_str(),
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str(),
+            (long long)ms);
+        log_msg(hf, "integ_nd", "FAIL -- integrity hunter page-guard install failure: status=%s generation=%llu install_generation=%llu pid=%u active_pid=%u fixture=0x%016llX size=%u install_seen=%d install_complete=%d install_success=%d raw_install_complete=%d raw_install_success=%d idle=%d cleanup_elapsed_ms=%lld pg_session=%u guard_query=%d guard_state=%d guard_protect=0x%08X nodes=%zu events=%zu total_reads=%llu status_text=\"%s\" bridge_status=\"%s\" last_error=\"%s\" (elapsed %lld ms)",
+            status,
+            (unsigned long long)generation,
+            (unsigned long long)idle_state.install_generation,
+            (unsigned)idle_state.target_pid,
+            (unsigned)driver_bridge::attached_pid(),
+            (unsigned long long)fixture.address,
+            128u,
+            install_seen ? 1 : 0,
+            install_complete ? 1 : 0,
+            install_success ? 1 : 0,
+            idle_state.install_complete ? 1 : 0,
+            idle_state.install_success ? 1 : 0,
+            idle_state.idle ? 1 : 0,
+            (long long)idle_state.elapsed_ms,
+            pg_session,
+            guard_query ? 1 : 0,
+            guard_set ? 1 : 0,
+            (unsigned)guard_region.protect,
+            idle_state.nodes,
+            idle_state.events,
+            (unsigned long long)idle_state.total_reads,
+            idle_state.status_text.c_str(),
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str(),
+            (long long)ms);
+        failed.fetch_add(1);
+        return;
+    }
 
     uint32_t target_read_attempts = 0;
     uint32_t target_read_ok = 0;
@@ -2231,7 +2336,8 @@ static void test_integrity_hunter_nodes(HANDLE hf, std::atomic<int>& passed, std
     const bool driver_write_ok = !writeback.empty() && driver_bridge::write_memory_for(target_pid, fixture.address, writeback);
 
     integrity_hunter::stop_hunt();
-    const bool idle = integrity_hunter::wait_until_idle(12000);
+    const auto idle_state = integrity_hunter::wait_until_idle_result(12000);
+    const bool idle = idle_state.idle;
 
     size_t node_count = 0;
     size_t event_count = 0;
@@ -2260,14 +2366,20 @@ static void test_integrity_hunter_nodes(HANDLE hf, std::atomic<int>& passed, std
     const bool after_query = driver_bridge::query_memory_for(target_pid, fixture.address, after_region);
     const bool after_guard = after_query && ((after_region.protect & PAGE_GUARD) != 0);
 
-    diag::log_tagged_fmt("test_analysis_detail", "integ_nd result: pid=%u addr=0x%llX started=%d install_seen=%d install_complete=%d install_success=%d idle=%d pg_session=%u before_query=%d before_protect=0x%08X guard_query=%d guard_state=%d guard_protect=0x%08X after_query=%d after_guard=%d after_protect=0x%08X driver_read_ok=%d read_bytes=%zu driver_write_ok=%d target_read_kind=%s target_read_module=%s target_read_fn=0x%llX target_read_resolve_method=%s target_read_rva=0x%llX resolve_local_us=%lld resolve_enum_us=%lld resolve_slow_attempts=%u resolve_slow_us=%lld target_read_attempts=%u target_read_ok=%u target_read_result=0x%llX nodes=%zu events=%zu total_reads=%llu first_reader=0x%llX first_fault=0x%llX first_access=%u first_node_reads=%d status='%s'",
+    diag::log_tagged_fmt("test_analysis_detail", "integ_nd result: pid=%u active_pid=%u addr=0x%llX generation=%llu install_generation=%llu started=%d install_seen=%d install_complete=%d install_success=%d raw_install_complete=%d raw_install_success=%d idle=%d cleanup_elapsed_ms=%lld pg_session=%u before_query=%d before_protect=0x%08X guard_query=%d guard_state=%d guard_protect=0x%08X after_query=%d after_guard=%d after_protect=0x%08X driver_read_ok=%d read_bytes=%zu driver_write_ok=%d target_read_kind=%s target_read_module=%s target_read_fn=0x%llX target_read_resolve_method=%s target_read_rva=0x%llX resolve_local_us=%lld resolve_enum_us=%lld resolve_slow_attempts=%u resolve_slow_us=%lld target_read_attempts=%u target_read_ok=%u target_read_result=0x%llX nodes=%zu events=%zu total_reads=%llu first_reader=0x%llX first_fault=0x%llX first_access=%u first_node_reads=%d status='%s'",
         (unsigned)target_pid,
+        (unsigned)driver_bridge::attached_pid(),
         (unsigned long long)fixture.address,
+        (unsigned long long)generation,
+        (unsigned long long)idle_state.install_generation,
         started ? 1 : 0,
         install_seen ? 1 : 0,
         install_complete ? 1 : 0,
         install_success ? 1 : 0,
+        idle_state.install_complete ? 1 : 0,
+        idle_state.install_success ? 1 : 0,
         idle ? 1 : 0,
+        (long long)idle_state.elapsed_ms,
         pg_session,
         before_query ? 1 : 0,
         (unsigned)before_region.protect,
@@ -2303,9 +2415,14 @@ static void test_integrity_hunter_nodes(HANDLE hf, std::atomic<int>& passed, std
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (started && install_seen && install_complete && install_success && idle && guard_query && guard_set && target_read_ok > 0 && total_reads > 0 && event_count > 0 && node_count > 0) {
-        log_msg(hf, "integ_nd", "PASS -- fixture=0x%016llX guard_state=%d read_ok=%d write_ok=%d target_read=%s module=%s resolve_method=%s rva=0x%016llX resolve_local_us=%lld resolve_enum_us=%lld resolve_slow_attempts=%u resolve_slow_us=%lld attempts=%u ok=%u nodes=%zu events=%zu total_reads=%llu first_reader=0x%016llX first_fault=0x%016llX node_reads=%d status=\"%s\" (elapsed %lld ms)",
+        log_msg(hf, "integ_nd", "PASS -- generation=%llu install_generation=%llu pid=%u active_pid=%u fixture=0x%016llX guard_state=%d cleanup_elapsed_ms=%lld read_ok=%d write_ok=%d target_read=%s module=%s resolve_method=%s rva=0x%016llX resolve_local_us=%lld resolve_enum_us=%lld resolve_slow_attempts=%u resolve_slow_us=%lld attempts=%u ok=%u nodes=%zu events=%zu total_reads=%llu first_reader=0x%016llX first_fault=0x%016llX node_reads=%d status=\"%s\" (elapsed %lld ms)",
+            (unsigned long long)generation,
+            (unsigned long long)idle_state.install_generation,
+            (unsigned)target_pid,
+            (unsigned)driver_bridge::attached_pid(),
             (unsigned long long)fixture.address,
             guard_set ? 1 : 0,
+            (long long)idle_state.elapsed_ms,
             driver_read_ok ? 1 : 0,
             driver_write_ok ? 1 : 0,
             target_read_kind,
@@ -2328,13 +2445,20 @@ static void test_integrity_hunter_nodes(HANDLE hf, std::atomic<int>& passed, std
             (long long)ms);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "integ_nd", "FAIL -- integrity hunter evidence insufficient: fixture=0x%016llX started=%d install_seen=%d install_complete=%d install_success=%d idle=%d pg_session=%u guard_query=%d guard_state=%d guard_protect=0x%08X read_ok=%d read_bytes=%zu write_ok=%d target_read=%s module=%s resolve_method=%s rva=0x%016llX resolve_local_us=%lld resolve_enum_us=%lld resolve_slow_attempts=%u resolve_slow_us=%lld attempts=%u ok=%u result=0x%016llX nodes=%zu events=%zu total_reads=%llu first_reader=0x%016llX first_fault=0x%016llX first_access=%u node_reads=%d status=\"%s\" status_bridge=\"%s\" last_error=\"%s\" (elapsed %lld ms)",
+        log_msg(hf, "integ_nd", "FAIL -- integrity hunter evidence insufficient: generation=%llu install_generation=%llu pid=%u active_pid=%u fixture=0x%016llX started=%d install_seen=%d install_complete=%d install_success=%d raw_install_complete=%d raw_install_success=%d idle=%d cleanup_elapsed_ms=%lld pg_session=%u guard_query=%d guard_state=%d guard_protect=0x%08X read_ok=%d read_bytes=%zu write_ok=%d target_read=%s module=%s resolve_method=%s rva=0x%016llX resolve_local_us=%lld resolve_enum_us=%lld resolve_slow_attempts=%u resolve_slow_us=%lld attempts=%u ok=%u result=0x%016llX nodes=%zu events=%zu total_reads=%llu first_reader=0x%016llX first_fault=0x%016llX first_access=%u node_reads=%d status=\"%s\" status_bridge=\"%s\" last_error=\"%s\" (elapsed %lld ms)",
+            (unsigned long long)generation,
+            (unsigned long long)idle_state.install_generation,
+            (unsigned)target_pid,
+            (unsigned)driver_bridge::attached_pid(),
             (unsigned long long)fixture.address,
             started ? 1 : 0,
             install_seen ? 1 : 0,
             install_complete ? 1 : 0,
             install_success ? 1 : 0,
+            idle_state.install_complete ? 1 : 0,
+            idle_state.install_success ? 1 : 0,
             idle ? 1 : 0,
+            (long long)idle_state.elapsed_ms,
             pg_session,
             guard_query ? 1 : 0,
             guard_set ? 1 : 0,
@@ -3887,14 +4011,35 @@ static bool run_analysis_test_bounded(HANDLE hf, const analysis_test_entry_t& te
     }
 
     if (result.status == test_lab::bounded_run_status_t::timed_out) {
-        if (std::strcmp(test.name, "integrity_hunter_nodes") == 0) {
+        if (std::strcmp(test.name, "integrity_hunter_nodes") == 0 ||
+            std::strcmp(test.name, "integrity_hunter_start_stop") == 0) {
             integrity_hunter::stop_hunt();
-            const bool idle = integrity_hunter::wait_until_idle(3000);
-            log_msg(hf, "analysis", "TIMEOUT-CLEANUP -- %s stop_hunt issued idle_after_cleanup=%d hunting=%d worker=%d",
+            const auto idle_state = integrity_hunter::wait_until_idle_result(12000);
+            log_msg(hf, "analysis", "TIMEOUT-CLEANUP -- %s stop_hunt issued idle_after_cleanup=%d cleanup_elapsed_ms=%lld generation=%llu install_generation=%llu pid=%u active_pid=%u install_complete=%d install_success=%d raw_install_complete=%d raw_install_success=%d hunting=%d worker=%d nodes=%zu events=%zu total_reads=%llu status=\"%s\" last_error=\"%s\"",
                 test.name,
-                idle ? 1 : 0,
-                integrity_hunter::g_state.hunting.load() ? 1 : 0,
-                integrity_hunter::g_state.worker_active.load() ? 1 : 0);
+                idle_state.idle ? 1 : 0,
+                (long long)idle_state.elapsed_ms,
+                (unsigned long long)idle_state.generation,
+                (unsigned long long)idle_state.install_generation,
+                (unsigned)idle_state.target_pid,
+                (unsigned)driver_bridge::attached_pid(),
+                integrity_hunter::install_complete_for_generation(idle_state.generation) ? 1 : 0,
+                integrity_hunter::install_success_for_generation(idle_state.generation) ? 1 : 0,
+                idle_state.install_complete ? 1 : 0,
+                idle_state.install_success ? 1 : 0,
+                idle_state.hunting ? 1 : 0,
+                idle_state.worker_active ? 1 : 0,
+                idle_state.nodes,
+                idle_state.events,
+                (unsigned long long)idle_state.total_reads,
+                idle_state.status_text.c_str(),
+                driver_bridge::last_error().c_str());
+            if (!idle_state.idle) {
+                log_msg(hf, "analysis", "FAIL -- %s integrity hunter cleanup exceeded 12000 ms after watchdog",
+                    test.name);
+                failed.fetch_add(1);
+                return false;
+            }
         }
         log_msg(hf, "analysis", "FAIL -- %s exceeded %lu ms watchdog; bounded worker still draining",
             test.name, static_cast<unsigned long>(timeout_ms));
@@ -3947,7 +4092,7 @@ void phase_analysis_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>&
         { "code_patcher_format_parse",   test_code_patcher_format_parse   },
         { "code_patcher_count",          test_code_patcher_count          },
         { "integrity_hunter_state",      test_integrity_hunter_state      },
-        { "integrity_hunter_start_stop", test_integrity_hunter_start_stop },
+        { "integrity_hunter_start_stop", test_integrity_hunter_start_stop, 20000 },
         { "integrity_hunter_nodes",      test_integrity_hunter_nodes, 45000 },
         { "binary_map_generate",         test_binary_map_generate         },
         { "binary_map_options",          test_binary_map_options          },

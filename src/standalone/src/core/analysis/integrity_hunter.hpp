@@ -55,7 +55,9 @@ struct state_t {
 	std::atomic<bool> install_success{false};
 	std::atomic<uint64_t> total_reads{0};
 	std::atomic<uint64_t> generation{0};
+	std::atomic<uint64_t> install_generation{0};
 	std::atomic<uint32_t> pg_session_id{0};
+	std::atomic<uint32_t> target_pid{0};
 	uint64_t target_address = 0;
 	uint64_t target_size = 0;
 	char address_input[32] = {};
@@ -64,6 +66,59 @@ struct state_t {
 };
 
 inline state_t g_state;
+
+struct idle_result_t {
+	bool idle = false;
+	uint64_t generation = 0;
+	uint64_t install_generation = 0;
+	uint32_t session_id = 0;
+	uint32_t target_pid = 0;
+	bool hunting = false;
+	bool worker_active = false;
+	bool install_complete = false;
+	bool install_success = false;
+	size_t nodes = 0;
+	size_t events = 0;
+	uint64_t total_reads = 0;
+	int64_t elapsed_ms = 0;
+	std::string status_text;
+};
+
+inline bool install_complete_for_generation(uint64_t generation)
+{
+	return g_state.install_generation.load(std::memory_order_acquire) == generation &&
+	       g_state.install_complete.load(std::memory_order_acquire);
+}
+
+inline bool install_success_for_generation(uint64_t generation)
+{
+	return g_state.install_generation.load(std::memory_order_acquire) == generation &&
+	       g_state.install_complete.load(std::memory_order_acquire) &&
+	       g_state.install_success.load(std::memory_order_acquire);
+}
+
+inline idle_result_t snapshot_idle_state(int64_t elapsed_ms = 0)
+{
+	idle_result_t result;
+	result.generation = g_state.generation.load(std::memory_order_acquire);
+	result.install_generation = g_state.install_generation.load(std::memory_order_acquire);
+	result.session_id = g_state.pg_session_id.load(std::memory_order_acquire);
+	result.target_pid = g_state.target_pid.load(std::memory_order_acquire);
+	result.hunting = g_state.hunting.load(std::memory_order_acquire);
+	result.worker_active = g_state.worker_active.load(std::memory_order_acquire);
+	result.install_complete = g_state.install_complete.load(std::memory_order_acquire);
+	result.install_success = g_state.install_success.load(std::memory_order_acquire);
+	result.total_reads = g_state.total_reads.load(std::memory_order_acquire);
+	result.idle = !result.hunting && !result.worker_active;
+	result.elapsed_ms = elapsed_ms;
+	{
+		std::lock_guard<std::mutex> lk(g_state.mutex);
+		result.nodes = g_state.nodes.size();
+		result.events = g_state.event_log.size();
+		result.status_text = g_state.status_text;
+	}
+	return result;
+}
 
 namespace detail {
 
@@ -386,7 +441,9 @@ inline bool start_hunt(uint64_t target_address, uint64_t target_size)
 	g_state.total_reads.store(0);
 	g_state.target_address = target_address;
 	g_state.target_size = target_size;
+	g_state.target_pid.store(pid);
 	const uint64_t generation = g_state.generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+	g_state.install_generation.store(generation, std::memory_order_release);
 
 	{
 		std::lock_guard<std::mutex> lk(g_state.mutex);
@@ -414,8 +471,9 @@ inline bool start_hunt(uint64_t target_address, uint64_t target_size)
 				static_cast<unsigned long long>(target_address));
 			std::lock_guard<std::mutex> lk(g_state.mutex);
 			g_state.status_text = "Cancelled before installing page guard";
-			g_state.install_complete.store(true);
 			g_state.install_success.store(false);
+			g_state.install_generation.store(generation, std::memory_order_release);
+			g_state.install_complete.store(true);
 			g_state.worker_active.store(false);
 			g_state.hunting.store(false);
 			return;
@@ -438,8 +496,9 @@ inline bool start_hunt(uint64_t target_address, uint64_t target_size)
 				g_state.cancel.load() ? 1 : 0);
 			std::lock_guard<std::mutex> lk(g_state.mutex);
 			g_state.status_text = "Failed to install page guard";
-			g_state.install_complete.store(true);
 			g_state.install_success.store(false);
+			g_state.install_generation.store(generation, std::memory_order_release);
+			g_state.install_complete.store(true);
 			g_state.worker_active.store(false);
 			g_state.hunting.store(false);
 			return;
@@ -456,8 +515,9 @@ inline bool start_hunt(uint64_t target_address, uint64_t target_size)
 			g_state.pg_session_id.store(pg_session);
 			g_state.status_text = "Monitoring for integrity checkers...";
 		}
-		g_state.install_complete.store(true);
 		g_state.install_success.store(true);
+		g_state.install_generation.store(generation, std::memory_order_release);
+		g_state.install_complete.store(true);
 
 		std::map<uint64_t, detail::rip_stats_t> rip_stats;
 		uint64_t total = 0;
@@ -648,8 +708,9 @@ inline bool start_hunt(uint64_t target_address, uint64_t target_size)
 		std::lock_guard<std::mutex> lk(g_state.mutex);
 		g_state.status_text = "Failed to queue integrity hunter worker";
 		g_state.worker_active.store(false);
-		g_state.install_complete.store(true);
 		g_state.install_success.store(false);
+		g_state.install_generation.store(generation, std::memory_order_release);
+		g_state.install_complete.store(true);
 		g_state.hunting.store(false);
 		return false;
 	}
@@ -661,8 +722,9 @@ inline bool start_hunt(uint64_t target_address, uint64_t target_size)
 		std::lock_guard<std::mutex> lk(g_state.mutex);
 		g_state.status_text = "Failed to queue integrity hunter worker";
 		g_state.worker_active.store(false);
-		g_state.install_complete.store(true);
 		g_state.install_success.store(false);
+		g_state.install_generation.store(generation, std::memory_order_release);
+		g_state.install_complete.store(true);
 		g_state.hunting.store(false);
 		return false;
 	}
@@ -691,7 +753,7 @@ inline void stop_hunt()
 	g_state.cancel.store(true);
 }
 
-inline bool wait_until_idle(uint32_t timeout_ms)
+inline idle_result_t wait_until_idle_result(uint32_t timeout_ms)
 {
 	const auto start = std::chrono::steady_clock::now();
 	while (g_state.hunting.load() || g_state.worker_active.load()) {
@@ -700,40 +762,40 @@ inline bool wait_until_idle(uint32_t timeout_ms)
 				std::chrono::steady_clock::now() - start).count();
 			if (elapsed >= timeout_ms) {
 				diag::log_tagged_fmt("integrity_hunter",
-					"wait_idle_timeout timeout_ms=%u hunting=%d worker_active=%d install_complete=%d install_success=%d session=%u",
+					"wait_idle_timeout timeout_ms=%u elapsed_ms=%lld hunting=%d worker_active=%d install_complete=%d install_success=%d session=%u",
 					timeout_ms,
+					static_cast<long long>(elapsed),
 					g_state.hunting.load() ? 1 : 0,
 					g_state.worker_active.load() ? 1 : 0,
 					g_state.install_complete.load() ? 1 : 0,
 					g_state.install_success.load() ? 1 : 0,
 					g_state.pg_session_id.load());
-				return false;
+				return snapshot_idle_state(static_cast<int64_t>(elapsed));
 			}
 		}
 		std::this_thread::sleep_for(std::chrono::milliseconds(25));
 	}
-	size_t nodes = 0;
-	size_t events = 0;
-	{
-		std::lock_guard<std::mutex> lk(g_state.mutex);
-		nodes = g_state.nodes.size();
-		events = g_state.event_log.size();
-	}
 	const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
 		std::chrono::steady_clock::now() - start).count();
+	auto result = snapshot_idle_state(static_cast<int64_t>(elapsed));
 	diag::log_tagged_fmt("integrity_hunter",
 		"wait_idle_success timeout_ms=%u elapsed_ms=%lld hunting=%d worker_active=%d install_complete=%d install_success=%d session=%u nodes=%zu events=%zu total_reads=%llu",
 		timeout_ms,
 		static_cast<long long>(elapsed),
-		g_state.hunting.load(std::memory_order_acquire) ? 1 : 0,
-		g_state.worker_active.load(std::memory_order_acquire) ? 1 : 0,
-		g_state.install_complete.load(std::memory_order_acquire) ? 1 : 0,
-		g_state.install_success.load(std::memory_order_acquire) ? 1 : 0,
-		g_state.pg_session_id.load(std::memory_order_acquire),
-		nodes,
-		events,
-		static_cast<unsigned long long>(g_state.total_reads.load(std::memory_order_acquire)));
-	return true;
+		result.hunting ? 1 : 0,
+		result.worker_active ? 1 : 0,
+		result.install_complete ? 1 : 0,
+		result.install_success ? 1 : 0,
+		result.session_id,
+		result.nodes,
+		result.events,
+		static_cast<unsigned long long>(result.total_reads));
+	return result;
+}
+
+inline bool wait_until_idle(uint32_t timeout_ms)
+{
+	return wait_until_idle_result(timeout_ms).idle;
 }
 
 inline bool neutralize(int node_index)

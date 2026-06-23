@@ -2,6 +2,7 @@
 #pragma once
 
 #include <cstdint>
+#include <atomic>
 #include <functional>
 #include <string>
 #include <vector>
@@ -402,6 +403,38 @@ namespace driver_bridge
 
     uint64_t call_function(uint64_t function_address, uint64_t arg1 = 0, uint64_t arg2 = 0, uint64_t arg3 = 0, uint64_t arg4 = 0);
     uint64_t find_gadget(const char* pattern, size_t pattern_size);
+
+    struct remote_call_context_t {
+        const char* label = nullptr;
+        const char* tool = nullptr;
+        const char* diag_id = nullptr;
+        uint32_t pid = 0;
+        uint32_t timeout_ms = 0;
+        uint64_t deadline_ms = 0;
+        std::atomic<bool>* cancel_token = nullptr;
+        bool require_deadline = false;
+    };
+
+    class scoped_remote_call_context_t {
+    public:
+        explicit scoped_remote_call_context_t(const remote_call_context_t& context);
+        ~scoped_remote_call_context_t();
+        scoped_remote_call_context_t(const scoped_remote_call_context_t&) = delete;
+        scoped_remote_call_context_t& operator=(const scoped_remote_call_context_t&) = delete;
+
+    private:
+        remote_call_context_t previous_{};
+        bool previous_active_ = false;
+        bool active_ = false;
+    };
+
+    const char* current_remote_call_label() noexcept;
+    const char* current_remote_call_tool_name() noexcept;
+    const char* current_remote_call_diag_id() noexcept;
+    uint32_t current_remote_call_pid() noexcept;
+    uint32_t current_remote_call_timeout_ms() noexcept;
+    uint64_t current_remote_call_deadline_ms() noexcept;
+    bool current_remote_call_cancelled() noexcept;
 
     bool set_hardware_breakpoint(uint32_t tid, int index, uint64_t address, int type = 0, int size = 0);
     bool clear_hardware_breakpoint(uint32_t tid, int index);
