@@ -51,6 +51,7 @@
 #include "core/testlab/test_all_features.hpp"
 #include "core/network/burp/camoufox_bridge.hpp"
 #include "helpers/stb_image.h"
+#include <dxgi1_3.h>
 
 #include "embedded_resources.hpp"
 #include "helpers/diag_log.hpp"
@@ -497,6 +498,8 @@ static bootstrap_t g_bootstrap;
 ID3D11Device* g_pd3dDevice = nullptr;
 static ID3D11DeviceContext* g_pd3dDeviceContext = nullptr;
 static IDXGISwapChain* g_pSwapChain = nullptr;
+static HANDLE                   g_FrameLatencyWaitableObject = nullptr;
+static UINT                     g_SwapChainResizeFlags = 0;
 static bool                     g_SwapChainOccluded = false;
 static UINT                     g_ResizeWidth = 0, g_ResizeHeight = 0;
 static ID3D11RenderTargetView* g_mainRenderTargetView = nullptr;
@@ -511,6 +514,7 @@ static constexpr UINT kAidaQueuedPeekFlags = PM_REMOVE | PM_QS_INPUT | PM_QS_POS
 static constexpr UINT kAidaSendOnlyPeekFlags = PM_REMOVE | PM_QS_SENDMESSAGE;
 static constexpr DWORD kAidaNonSendQueueBits = QS_INPUT | QS_POSTMESSAGE | QS_TIMER | QS_PAINT | QS_HOTKEY | QS_ALLPOSTMESSAGE;
 static constexpr DWORD kAidaPumpQueueBits = kAidaNonSendQueueBits | QS_SENDMESSAGE;
+static constexpr DWORD kAidaInteractiveQueueBits = QS_INPUT | QS_POSTMESSAGE | QS_HOTKEY | QS_ALLPOSTMESSAGE;
 bool CreateDeviceD3D(HWND hWnd);
 void CleanupDeviceD3D();
 void CreateRenderTarget();
@@ -1168,7 +1172,7 @@ static const char* startup_bg_phase_label(int step)
     switch (step)
     {
     case 0: return "Bootstrapping";
-    case 1: return "Initializing chat engine";
+    case 1: return "Loading protected runtime";
     case 2: return "Probing network surface";
     case 3: return "Arming memory scanner";
     case 4: return "Spinning up MITM proxy";
@@ -2617,6 +2621,83 @@ __declspec(noinline) static DWORD seh_swapchain_present(IDXGISwapChain* sc, HRES
     return 0;
 }
 
+static bool aida_cursor_over_window(HWND hwnd);
+
+static void configure_frame_latency_waitable()
+{
+    if (g_FrameLatencyWaitableObject) {
+        CloseHandle(g_FrameLatencyWaitableObject);
+        g_FrameLatencyWaitableObject = nullptr;
+    }
+    if (!g_pSwapChain)
+        return;
+    IDXGISwapChain2* sc2 = nullptr;
+    HRESULT qi = g_pSwapChain->QueryInterface(__uuidof(IDXGISwapChain2), reinterpret_cast<void**>(&sc2));
+    if (FAILED(qi) || !sc2) {
+        diag::log_tagged_fmt("render", "frame_latency_waitable_unavailable qi=0x%08X", static_cast<unsigned>(qi));
+        return;
+    }
+    HRESULT set_hr = sc2->SetMaximumFrameLatency(1);
+    HANDLE waitable = sc2->GetFrameLatencyWaitableObject();
+    if (SUCCEEDED(set_hr) && waitable) {
+        g_FrameLatencyWaitableObject = waitable;
+        diag::log_tagged_critical_fmt("render", "frame_latency_waitable_enabled handle=0x%llX set_hr=0x%08X flags=0x%08X",
+            static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(waitable)),
+            static_cast<unsigned>(set_hr),
+            g_SwapChainResizeFlags);
+    } else {
+        diag::log_tagged_fmt("render", "frame_latency_waitable_disabled set_hr=0x%08X handle=0x%llX flags=0x%08X",
+            static_cast<unsigned>(set_hr),
+            static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(waitable)),
+            g_SwapChainResizeFlags);
+    }
+    sc2->Release();
+}
+
+static void wait_for_frame_latency_object()
+{
+    HANDLE waitable = g_FrameLatencyWaitableObject;
+    if (!waitable)
+        return;
+    DWORD qs = ::GetQueueStatus(kAidaInteractiveQueueBits);
+    if ((HIWORD(qs) & kAidaInteractiveQueueBits) != 0)
+        return;
+    if (aida_cursor_over_window(g_hwnd))
+        return;
+    DWORD wait_result = MsgWaitForMultipleObjectsEx(1, &waitable, 2, kAidaInteractiveQueueBits, MWMO_INPUTAVAILABLE);
+    if (wait_result == WAIT_FAILED) {
+        DWORD gle = GetLastError();
+        static std::atomic<unsigned long long> s_last_fail_log_ms{0};
+        const unsigned long long now = GetTickCount64();
+        unsigned long long last = s_last_fail_log_ms.load(std::memory_order_acquire);
+        if (now - last >= 30000ULL && s_last_fail_log_ms.compare_exchange_strong(last, now, std::memory_order_acq_rel))
+            diag::log_tagged_fmt("render", "frame_latency_wait_failed gle=%lu handle=0x%llX", gle, static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(waitable)));
+    }
+}
+
+static bool aida_cursor_over_window(HWND hwnd)
+{
+    if (!hwnd || !::IsWindow(hwnd))
+        return false;
+    POINT cursor{};
+    if (!::GetCursorPos(&cursor))
+        return false;
+    RECT rc{};
+    if (!::GetWindowRect(hwnd, &rc))
+        return false;
+    return ::PtInRect(&rc, cursor) != FALSE;
+}
+
+static void wait_for_idle_or_input(DWORD timeout_ms)
+{
+    if (timeout_ms == 0)
+        return;
+    DWORD qs = ::GetQueueStatus(kAidaInteractiveQueueBits);
+    if ((HIWORD(qs) & kAidaInteractiveQueueBits) != 0)
+        return;
+    MsgWaitForMultipleObjectsEx(0, nullptr, timeout_ms, kAidaInteractiveQueueBits, MWMO_INPUTAVAILABLE);
+}
+
 __declspec(noinline) static DWORD seh_resize_buffers(IDXGISwapChain* sc, UINT w, UINT h, HRESULT* hr_out, uint64_t frame_number, const char* source)
 {
     if (hr_out)
@@ -2633,7 +2714,7 @@ __declspec(noinline) static DWORD seh_resize_buffers(IDXGISwapChain* sc, UINT w,
         return 0;
     }
     __try {
-        *hr_out = sc->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, 0);
+        *hr_out = sc->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, g_SwapChainResizeFlags);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         return GetExceptionCode();
     }
@@ -5220,6 +5301,8 @@ int main(int, char**)
             activate_fileless_window(hwnd, "fileless_ide_region_ready", frame_number);
         }
 
+        wait_for_frame_latency_object();
+
         if (frame_number < 5)
             crash_log_write("dx11_new_frame");
         if ((frame_number >= 270ULL && frame_number <= 320ULL))
@@ -5416,6 +5499,9 @@ int main(int, char**)
             const uint64_t since_interaction_ms = (now_ms > s_last_interaction_ms)
                 ? (now_ms - s_last_interaction_ms) : 0ull;
             const bool foreground = aida_focus_monitor::focused();
+            const bool cursor_over_aida = aida_cursor_over_window(hwnd);
+            const DWORD idle_qs = ::GetQueueStatus(kAidaInteractiveQueueBits);
+            const bool interactive_pending = (HIWORD(idle_qs) & kAidaInteractiveQueueBits) != 0;
             const uint64_t tick_now_ms = static_cast<uint64_t>(GetTickCount64());
             const uint64_t activation_done_ms = standalone_license::activation_completed_at();
             const bool activation_settling =
@@ -5429,10 +5515,17 @@ int main(int, char**)
             if (since_interaction_ms < 500ull) may_sleep = false;
             if (io.WantTextInput || io.WantCaptureKeyboard) may_sleep = false;
             if (ImGui::IsAnyItemActive()) may_sleep = false;
+            if (cursor_over_aida || interactive_pending) may_sleep = false;
             if (!foreground && !full_test_running) may_sleep = true;
+            if (cursor_over_aida || interactive_pending) may_sleep = false;
 
             if (may_sleep) {
-                ::Sleep(foreground ? 1u : (activation_settling ? 1u : 4u));
+                DWORD idle_wait_ms = 0;
+                if (foreground)
+                    idle_wait_ms = activation_settling ? 8u : 24u;
+                else
+                    idle_wait_ms = activation_settling ? 16u : 75u;
+                wait_for_idle_or_input(idle_wait_ms);
             }
         }
     }
@@ -5570,12 +5663,33 @@ bool CreateDeviceD3D(HWND hWnd)
 
     D3D_FEATURE_LEVEL featureLevel;
     const D3D_FEATURE_LEVEL featureLevelArray[2] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0, };
-    HRESULT res = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, createDeviceFlags, featureLevelArray, 2, D3D11_SDK_VERSION, &sd, &g_pSwapChain, &g_pd3dDevice, &featureLevel, &g_pd3dDeviceContext);
+    DXGI_SWAP_CHAIN_DESC optimized_sd = sd;
+    optimized_sd.BufferDesc.RefreshRate.Numerator = 0;
+    optimized_sd.BufferDesc.RefreshRate.Denominator = 1;
+    optimized_sd.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+#if defined(DXGI_SWAP_EFFECT_FLIP_DISCARD)
+    optimized_sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+#else
+    optimized_sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+#endif
+    HRESULT res = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, createDeviceFlags, featureLevelArray, 2, D3D11_SDK_VERSION, &optimized_sd, &g_pSwapChain, &g_pd3dDevice, &featureLevel, &g_pd3dDeviceContext);
     if (res == DXGI_ERROR_UNSUPPORTED)
-        res = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, createDeviceFlags, featureLevelArray, 2, D3D11_SDK_VERSION, &sd, &g_pSwapChain, &g_pd3dDevice, &featureLevel, &g_pd3dDeviceContext);
+        res = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, createDeviceFlags, featureLevelArray, 2, D3D11_SDK_VERSION, &optimized_sd, &g_pSwapChain, &g_pd3dDevice, &featureLevel, &g_pd3dDeviceContext);
+    if (FAILED(res)) {
+        if (g_pSwapChain) { g_pSwapChain->Release(); g_pSwapChain = nullptr; }
+        if (g_pd3dDeviceContext) { g_pd3dDeviceContext->Release(); g_pd3dDeviceContext = nullptr; }
+        if (g_pd3dDevice) { g_pd3dDevice->Release(); g_pd3dDevice = nullptr; }
+        g_SwapChainResizeFlags = 0;
+        res = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, createDeviceFlags, featureLevelArray, 2, D3D11_SDK_VERSION, &sd, &g_pSwapChain, &g_pd3dDevice, &featureLevel, &g_pd3dDeviceContext);
+        if (res == DXGI_ERROR_UNSUPPORTED)
+            res = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, createDeviceFlags, featureLevelArray, 2, D3D11_SDK_VERSION, &sd, &g_pSwapChain, &g_pd3dDevice, &featureLevel, &g_pd3dDeviceContext);
+    } else {
+        g_SwapChainResizeFlags = optimized_sd.Flags;
+    }
     if (res != S_OK)
         return false;
 
+    configure_frame_latency_waitable();
     CreateRenderTarget();
     return true;
 }
@@ -5583,9 +5697,11 @@ bool CreateDeviceD3D(HWND hWnd)
 void CleanupDeviceD3D()
 {
     CleanupRenderTarget();
+    if (g_FrameLatencyWaitableObject) { CloseHandle(g_FrameLatencyWaitableObject); g_FrameLatencyWaitableObject = nullptr; }
     if (g_pSwapChain) { g_pSwapChain->Release(); g_pSwapChain = nullptr; }
     if (g_pd3dDeviceContext) { g_pd3dDeviceContext->Release(); g_pd3dDeviceContext = nullptr; }
     if (g_pd3dDevice) { g_pd3dDevice->Release(); g_pd3dDevice = nullptr; }
+    g_SwapChainResizeFlags = 0;
 }
 
 void CreateRenderTarget()

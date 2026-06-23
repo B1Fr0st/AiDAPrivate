@@ -7,6 +7,7 @@
 #include "work_queue.hpp"
 
 #include "standalone_driver.hpp"
+#include "../mcp/mcp_standalone.hpp"
 #include "../../helpers/diag_log.hpp"
 
 #include <algorithm>
@@ -97,6 +98,27 @@ static inline bool kernel_operation_ready(uint32_t pid,
     return ok;
 }
 
+static inline const char* cooperative_stop_reason() noexcept
+{
+    if (mcp_standalone::current_call_cancelled())
+        return "mcp_cancelled";
+    const std::uint64_t deadline = mcp_standalone::current_call_deadline_ms();
+    if (deadline != 0) {
+        const ULONGLONG now = GetTickCount64();
+        if (now >= deadline)
+            return "mcp_deadline";
+    }
+    return nullptr;
+}
+
+static inline std::uint64_t cooperative_deadline_remaining_ms(ULONGLONG now) noexcept
+{
+    const std::uint64_t deadline = mcp_standalone::current_call_deadline_ms();
+    if (deadline == 0 || now >= deadline)
+        return 0;
+    return deadline - now;
+}
+
 static inline void log_driver_region(uint32_t pid,
                                      const char* label,
                                      const char* phase,
@@ -130,8 +152,9 @@ static inline uint64_t driver_remote_call(uint32_t pid,
                                           const char* label = "remote_call")
 {
     const ULONGLONG call_start = GetTickCount64();
+    const std::uint64_t call_deadline = mcp_standalone::current_call_deadline_ms();
     diag::log_tagged_fmt("pg_sniff",
-        "driver_remote_call_entry label=%s pid=%u active_pid=%u fn=0x%llX arg1=0x%llX arg2=0x%llX arg3=0x%llX arg4=0x%llX caller_tid=%lu tick=%llu",
+        "driver_remote_call_entry label=%s pid=%u active_pid=%u fn=0x%llX arg1=0x%llX arg2=0x%llX arg3=0x%llX arg4=0x%llX caller_tid=%lu tick=%llu cancelled=%d deadline_ms=%llu deadline_remaining_ms=%llu diag_id=%s",
         label ? label : "",
         pid,
         driver_bridge::attached_pid(),
@@ -141,7 +164,11 @@ static inline uint64_t driver_remote_call(uint32_t pid,
         static_cast<unsigned long long>(arg3),
         static_cast<unsigned long long>(arg4),
         static_cast<unsigned long>(GetCurrentThreadId()),
-        static_cast<unsigned long long>(call_start));
+        static_cast<unsigned long long>(call_start),
+        mcp_standalone::current_call_cancelled() ? 1 : 0,
+        static_cast<unsigned long long>(call_deadline),
+        static_cast<unsigned long long>(cooperative_deadline_remaining_ms(call_start)),
+        mcp_standalone::current_call_diag_id());
     if (pid == 0 || function_address == 0) {
         diag::log_tagged_fmt("pg_sniff",
             "driver_remote_call_reject label=%s pid=%u fn=0x%llX reason=invalid_args elapsed_ms=%llu",
@@ -154,12 +181,41 @@ static inline uint64_t driver_remote_call(uint32_t pid,
     if (!kernel_operation_ready(pid, label, "driver_remote_call", call_start))
         return 0;
 
+    if (const char* stop_reason = cooperative_stop_reason()) {
+        SetLastError(std::strcmp(stop_reason, "mcp_deadline") == 0 ? ERROR_TIMEOUT : ERROR_CANCELLED);
+        diag::log_tagged_fmt("pg_sniff",
+            "driver_remote_call_cancelled_before_wait label=%s pid=%u active_pid=%u fn=0x%llX reason=%s cancelled=%d deadline_ms=%llu elapsed_ms=%llu diag_id=%s",
+            label ? label : "",
+            pid,
+            driver_bridge::attached_pid(),
+            static_cast<unsigned long long>(function_address),
+            stop_reason,
+            mcp_standalone::current_call_cancelled() ? 1 : 0,
+            static_cast<unsigned long long>(call_deadline),
+            static_cast<unsigned long long>(GetTickCount64() - call_start),
+            mcp_standalone::current_call_diag_id());
+        return 0;
+    }
+
     log_driver_region(pid, label, "function_before_call", function_address);
     SetLastError(ERROR_SUCCESS);
+    diag::log_tagged_fmt("pg_sniff",
+        "driver_remote_call_wait_begin label=%s pid=%u active_pid=%u fn=0x%llX cancelled=%d deadline_ms=%llu deadline_remaining_ms=%llu elapsed_ms=%llu diag_id=%s",
+        label ? label : "",
+        pid,
+        driver_bridge::attached_pid(),
+        static_cast<unsigned long long>(function_address),
+        mcp_standalone::current_call_cancelled() ? 1 : 0,
+        static_cast<unsigned long long>(call_deadline),
+        static_cast<unsigned long long>(cooperative_deadline_remaining_ms(GetTickCount64())),
+        static_cast<unsigned long long>(GetTickCount64() - call_start),
+        mcp_standalone::current_call_diag_id());
     const uint64_t result = driver_bridge::call_function(function_address, arg1, arg2, arg3, arg4);
     const DWORD gle = result != 0 ? ERROR_SUCCESS : GetLastError();
+    const ULONGLONG call_end = GetTickCount64();
+    const bool deadline_expired_after = call_deadline != 0 && call_end >= call_deadline;
     diag::log_tagged_fmt("pg_sniff",
-        "driver_remote_call_done label=%s pid=%u active_pid=%u method=driver_bridge::call_function fn=0x%llX result=0x%llX ok=%d gle=%lu status=%s last_error=%s elapsed_ms=%llu",
+        "driver_remote_call_done label=%s pid=%u active_pid=%u method=driver_bridge::call_function fn=0x%llX result=0x%llX ok=%d gle=%lu status=%s last_error=%s cancelled=%d deadline_ms=%llu deadline_expired_after=%d elapsed_ms=%llu diag_id=%s",
         label ? label : "",
         pid,
         driver_bridge::attached_pid(),
@@ -169,7 +225,11 @@ static inline uint64_t driver_remote_call(uint32_t pid,
         static_cast<unsigned long>(gle),
         driver_bridge::status().c_str(),
         driver_bridge::last_error().c_str(),
-        static_cast<unsigned long long>(GetTickCount64() - call_start));
+        mcp_standalone::current_call_cancelled() ? 1 : 0,
+        static_cast<unsigned long long>(call_deadline),
+        deadline_expired_after ? 1 : 0,
+        static_cast<unsigned long long>(call_end - call_start),
+        mcp_standalone::current_call_diag_id());
     return result;
 }
 
@@ -695,6 +755,7 @@ public:
         const ULONGLONG install_start = GetTickCount64();
         const uint64_t requested_addr = target_addr;
         const uint64_t requested_size = region_size;
+        const std::uint64_t install_generation = install_stop_generation_.load(std::memory_order_acquire);
         clear_install_failure(pid, requested_addr, requested_size);
         auto fail_install = [&](const char* reason,
                                 const char* detail,
@@ -706,7 +767,50 @@ public:
                                    guard_addr, guard_size, region, attempted_protect, GetLastError());
             return 0;
         };
-        diag::log_tagged_fmt("pg_sniff", "install_start pid=%u target=0x%llX size=0x%llX kernel=%d attached=%u payloads=%d max_drain=%u auto_poll=%d",
+        auto log_install_phase = [&](const char* phase) {
+            const ULONGLONG now = GetTickCount64();
+            diag::log_tagged_fmt("pg_sniff",
+                "install_phase phase=%s pid=%u active_pid=%u target=0x%llX size=0x%llX generation=%llu current_generation=%llu cancelled=%d deadline_ms=%llu deadline_remaining_ms=%llu elapsed_ms=%llu diag_id=%s status=%s last_error=%s",
+                phase ? phase : "",
+                pid,
+                driver_bridge::attached_pid(),
+                static_cast<unsigned long long>(target_addr),
+                static_cast<unsigned long long>(region_size),
+                static_cast<unsigned long long>(install_generation),
+                static_cast<unsigned long long>(install_stop_generation_.load(std::memory_order_acquire)),
+                mcp_standalone::current_call_cancelled() ? 1 : 0,
+                static_cast<unsigned long long>(mcp_standalone::current_call_deadline_ms()),
+                static_cast<unsigned long long>(cooperative_deadline_remaining_ms(now)),
+                static_cast<unsigned long long>(now - install_start),
+                mcp_standalone::current_call_diag_id(),
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+        };
+        auto install_stop_reason = [&]() -> const char* {
+            if (const char* reason = cooperative_stop_reason())
+                return reason;
+            return install_stop_generation_.load(std::memory_order_acquire) != install_generation ? "engine_stop" : nullptr;
+        };
+        auto check_install_cancelled = [&](const char* phase) -> const char* {
+            const char* reason = install_stop_reason();
+            if (reason) {
+                const ULONGLONG now = GetTickCount64();
+                diag::log_tagged_fmt("pg_sniff",
+                    "install_cancel_requested phase=%s pid=%u active_pid=%u reason=%s generation=%llu current_generation=%llu cancelled=%d deadline_ms=%llu elapsed_ms=%llu diag_id=%s",
+                    phase ? phase : "",
+                    pid,
+                    driver_bridge::attached_pid(),
+                    reason,
+                    static_cast<unsigned long long>(install_generation),
+                    static_cast<unsigned long long>(install_stop_generation_.load(std::memory_order_acquire)),
+                    mcp_standalone::current_call_cancelled() ? 1 : 0,
+                    static_cast<unsigned long long>(mcp_standalone::current_call_deadline_ms()),
+                    static_cast<unsigned long long>(now - install_start),
+                    mcp_standalone::current_call_diag_id());
+            }
+            return reason;
+        };
+        diag::log_tagged_fmt("pg_sniff", "install_start pid=%u target=0x%llX size=0x%llX kernel=%d attached=%u payloads=%d max_drain=%u auto_poll=%d generation=%llu cancelled=%d deadline_ms=%llu diag_id=%s",
             pid,
             static_cast<unsigned long long>(target_addr),
             static_cast<unsigned long long>(region_size),
@@ -714,7 +818,14 @@ public:
             driver_bridge::attached_pid(),
             capture_payloads ? 1 : 0,
             max_records_per_drain,
-            auto_poll ? 1 : 0);
+            auto_poll ? 1 : 0,
+            static_cast<unsigned long long>(install_generation),
+            mcp_standalone::current_call_cancelled() ? 1 : 0,
+            static_cast<unsigned long long>(mcp_standalone::current_call_deadline_ms()),
+            mcp_standalone::current_call_diag_id());
+        log_install_phase("entry");
+        if (const char* reason = check_install_cancelled("entry"))
+            return fail_install(reason, "page-guard install cancelled before validation", nullptr, 0, 0, 0);
         if (!driver_bridge::using_kernel_driver()) {
             diag::log_tagged_fmt("pg_sniff", "install_failed reason=no_kernel_driver pid=%u", pid);
             return fail_install("no_kernel_driver", "kernel driver is not connected", nullptr, 0, 0, 0);
@@ -728,11 +839,25 @@ public:
         }
 
         active_pid_scope_t active;
+        diag::log_tagged_fmt("pg_sniff",
+            "install_active_pid_enter_begin pid=%u previous=%u generation=%llu elapsed_ms=%llu",
+            pid,
+            driver_bridge::attached_pid(),
+            static_cast<unsigned long long>(install_generation),
+            static_cast<unsigned long long>(GetTickCount64() - install_start));
         if (!active.enter(pid)) {
             diag::log_tagged_fmt("pg_sniff", "install_failed reason=active_pid_enter pid=%u status=%s last_error=%s",
                 pid, driver_bridge::status().c_str(), driver_bridge::last_error().c_str());
             return fail_install("active_pid_enter", "failed to select target pid for driver-backed memory operations", nullptr, 0, 0, 0);
         }
+        diag::log_tagged_fmt("pg_sniff",
+            "install_active_pid_enter_done pid=%u active_pid=%u generation=%llu elapsed_ms=%llu",
+            pid,
+            driver_bridge::attached_pid(),
+            static_cast<unsigned long long>(install_generation),
+            static_cast<unsigned long long>(GetTickCount64() - install_start));
+        if (const char* reason = check_install_cancelled("after_active_pid_enter"))
+            return fail_install(reason, "page-guard install cancelled after active pid selection", nullptr, 0, 0, 0);
         if (driver_bridge::attached_pid() != pid) {
             diag::log_tagged_fmt("pg_sniff", "install_failed reason=active_pid_mismatch requested=%u attached=%u",
                 pid, driver_bridge::attached_pid());
@@ -743,11 +868,15 @@ public:
 
 
         driver_bridge::memory_region_t mri{};
+        log_install_phase("query_memory_begin");
         if (!driver_bridge::query_memory_for(pid, target_addr, mri)) {
             diag::log_tagged_fmt("pg_sniff", "install_failed reason=query_memory pid=%u target=0x%llX last_error=%s",
                 pid, static_cast<unsigned long long>(target_addr), driver_bridge::last_error().c_str());
             return fail_install("query_memory", "driver could not query the requested target address", nullptr, 0, 0, 0);
         }
+        log_install_phase("query_memory_done");
+        if (const char* reason = check_install_cancelled("after_query_memory"))
+            return fail_install(reason, "page-guard install cancelled after target query", &mri, 0, 0, 0);
         uint32_t orig_protect = mri.protect;
 
         SYSTEM_INFO sys_info{};
@@ -833,14 +962,28 @@ public:
             static_cast<unsigned long long>(page_size));
 
 
+        log_install_phase("module_scan_begin");
         driver_bridge::module_info_t kbase_mod = find_module_info(pid, "kernelbase.dll");
         driver_bridge::module_info_t k32_mod = find_module_info(pid, "kernel32.dll");
+        diag::log_tagged_fmt("pg_sniff",
+            "install_module_scan_done pid=%u active_pid=%u kernelbase=0x%llX kernelbase_size=0x%llX kernel32=0x%llX kernel32_size=0x%llX elapsed_ms=%llu",
+            pid,
+            driver_bridge::attached_pid(),
+            static_cast<unsigned long long>(kbase_mod.base),
+            static_cast<unsigned long long>(kbase_mod.size),
+            static_cast<unsigned long long>(k32_mod.base),
+            static_cast<unsigned long long>(k32_mod.size),
+            static_cast<unsigned long long>(GetTickCount64() - install_start));
+        if (const char* reason = check_install_cancelled("after_module_scan"))
+            return fail_install(reason, "page-guard install cancelled after module scan", &mri, target_addr, region_size, 0);
         uint64_t virt_protect_fn = kbase_mod.base != 0
             ? resolve_system_export_for_pid(pid, kbase_mod.base, kbase_mod.size, "kernelbase.dll", "VirtualProtect", "install_virtualprotect_kernelbase", install_start)
             : 0;
         const char* virt_protect_module = virt_protect_fn != 0 ? "kernelbase.dll" : "kernel32.dll";
         if (virt_protect_fn == 0 && k32_mod.base != 0)
             virt_protect_fn = resolve_system_export_for_pid(pid, k32_mod.base, k32_mod.size, "kernel32.dll", "VirtualProtect", "install_virtualprotect_kernel32", install_start);
+        if (const char* reason = check_install_cancelled("after_virtualprotect_export"))
+            return fail_install(reason, "page-guard install cancelled after VirtualProtect export resolution", &mri, target_addr, region_size, 0);
         if (virt_protect_fn == 0) {
             diag::log_tagged_fmt("pg_sniff", "install_failed reason=virtualprotect_missing pid=%u kernelbase=0x%llX kernel32=0x%llX",
                 pid,
@@ -856,11 +999,29 @@ public:
             static_cast<unsigned long long>(k32_mod.base));
 
 
+        log_install_phase("ring_alloc_begin");
         uint64_t ring_addr = driver_bridge::allocate_memory_for(pid, RING_TOTAL_SIZE + 16);
         if (ring_addr == 0) {
             diag::log_tagged_fmt("pg_sniff", "install_failed reason=ring_alloc pid=%u bytes=%u last_error=%s",
                 pid, RING_TOTAL_SIZE + 16, driver_bridge::last_error().c_str());
             return fail_install("ring_alloc", "failed to allocate the remote capture ring", &mri, target_addr, region_size, 0);
+        }
+        diag::log_tagged_fmt("pg_sniff",
+            "install_ring_alloc_done pid=%u ring=0x%llX bytes=%u elapsed_ms=%llu",
+            pid,
+            static_cast<unsigned long long>(ring_addr),
+            RING_TOTAL_SIZE + 16,
+            static_cast<unsigned long long>(GetTickCount64() - install_start));
+        if (const char* reason = check_install_cancelled("after_ring_alloc")) {
+            const bool cleanup_ring_ok = driver_bridge::free_memory_for(pid, ring_addr);
+            diag::log_tagged_fmt("pg_sniff",
+                "install_cancel_cleanup phase=after_ring_alloc pid=%u ring=0x%llX cleanup_ring_ok=%d cleanup_ring_error=%s elapsed_ms=%llu",
+                pid,
+                static_cast<unsigned long long>(ring_addr),
+                cleanup_ring_ok ? 1 : 0,
+                cleanup_ring_ok ? "" : driver_bridge::last_error().c_str(),
+                static_cast<unsigned long long>(GetTickCount64() - install_start));
+            return fail_install(reason, "page-guard install cancelled after ring allocation", &mri, target_addr, region_size, 0);
         }
         if (driver_bridge::attached_pid() != pid) {
             diag::log_tagged_fmt("pg_sniff", "install_failed reason=post_ring_active_mismatch requested=%u attached=%u ring=0x%llX",
@@ -869,6 +1030,7 @@ public:
             return fail_install("post_ring_active_mismatch", "driver active pid changed after ring allocation", &mri, target_addr, region_size, 0);
         }
 
+        log_install_phase("shellcode_alloc_begin");
         uint64_t sc_addr = driver_bridge::allocate_memory_for(pid, SHELLCODE_SIZE + 16);
         if (sc_addr == 0) {
             diag::log_tagged_fmt("pg_sniff", "install_failed reason=shellcode_alloc pid=%u bytes=%zu ring=0x%llX last_error=%s",
@@ -876,9 +1038,33 @@ public:
             driver_bridge::free_memory_for(pid, ring_addr);
             return fail_install("shellcode_alloc", "failed to allocate the remote VEH shellcode region", &mri, target_addr, region_size, 0);
         }
+        diag::log_tagged_fmt("pg_sniff",
+            "install_shellcode_alloc_done pid=%u sc=0x%llX bytes=%zu elapsed_ms=%llu",
+            pid,
+            static_cast<unsigned long long>(sc_addr),
+            SHELLCODE_SIZE + 16,
+            static_cast<unsigned long long>(GetTickCount64() - install_start));
+        if (const char* reason = check_install_cancelled("after_shellcode_alloc")) {
+            const bool cleanup_sc_ok = driver_bridge::free_memory_for(pid, sc_addr);
+            const std::string cleanup_sc_error = cleanup_sc_ok ? std::string() : driver_bridge::last_error();
+            const bool cleanup_ring_ok = driver_bridge::free_memory_for(pid, ring_addr);
+            const std::string cleanup_ring_error = cleanup_ring_ok ? std::string() : driver_bridge::last_error();
+            diag::log_tagged_fmt("pg_sniff",
+                "install_cancel_cleanup phase=after_shellcode_alloc pid=%u sc=0x%llX ring=0x%llX cleanup_sc_ok=%d cleanup_sc_error=%s cleanup_ring_ok=%d cleanup_ring_error=%s elapsed_ms=%llu",
+                pid,
+                static_cast<unsigned long long>(sc_addr),
+                static_cast<unsigned long long>(ring_addr),
+                cleanup_sc_ok ? 1 : 0,
+                cleanup_sc_error.c_str(),
+                cleanup_ring_ok ? 1 : 0,
+                cleanup_ring_error.c_str(),
+                static_cast<unsigned long long>(GetTickCount64() - install_start));
+            return fail_install(reason, "page-guard install cancelled after shellcode allocation", &mri, target_addr, region_size, 0);
+        }
 
 
         std::vector<uint8_t> zeroes(RING_TOTAL_SIZE, 0);
+        log_install_phase("ring_zero_write_begin");
         if (!driver_bridge::write_memory_for(pid, ring_addr, zeroes)) {
             diag::log_tagged_fmt("pg_sniff", "install_failed reason=ring_zero_write pid=%u ring=0x%llX last_error=%s",
                 pid, static_cast<unsigned long long>(ring_addr), driver_bridge::last_error().c_str());
@@ -886,11 +1072,30 @@ public:
             driver_bridge::free_memory_for(pid, ring_addr);
             return fail_install("ring_zero_write", "failed to initialize the remote capture ring", &mri, target_addr, region_size, 0);
         }
+        log_install_phase("ring_zero_write_done");
+        if (const char* reason = check_install_cancelled("after_ring_zero_write")) {
+            const bool cleanup_sc_ok = driver_bridge::free_memory_for(pid, sc_addr);
+            const std::string cleanup_sc_error = cleanup_sc_ok ? std::string() : driver_bridge::last_error();
+            const bool cleanup_ring_ok = driver_bridge::free_memory_for(pid, ring_addr);
+            const std::string cleanup_ring_error = cleanup_ring_ok ? std::string() : driver_bridge::last_error();
+            diag::log_tagged_fmt("pg_sniff",
+                "install_cancel_cleanup phase=after_ring_zero_write pid=%u sc=0x%llX ring=0x%llX cleanup_sc_ok=%d cleanup_sc_error=%s cleanup_ring_ok=%d cleanup_ring_error=%s elapsed_ms=%llu",
+                pid,
+                static_cast<unsigned long long>(sc_addr),
+                static_cast<unsigned long long>(ring_addr),
+                cleanup_sc_ok ? 1 : 0,
+                cleanup_sc_error.c_str(),
+                cleanup_ring_ok ? 1 : 0,
+                cleanup_ring_error.c_str(),
+                static_cast<unsigned long long>(GetTickCount64() - install_start));
+            return fail_install(reason, "page-guard install cancelled after ring initialization", &mri, target_addr, region_size, 0);
+        }
 
 
         auto sc = generate_veh_shellcode(ring_addr, target_addr,
                                          region_size, orig_protect,
                                          virt_protect_fn);
+        log_install_phase("shellcode_write_begin");
         if (!driver_bridge::write_memory_for(pid, sc_addr, sc)) {
             diag::log_tagged_fmt("pg_sniff", "install_failed reason=shellcode_write pid=%u sc=0x%llX bytes=%zu last_error=%s",
                 pid, static_cast<unsigned long long>(sc_addr), sc.size(), driver_bridge::last_error().c_str());
@@ -898,7 +1103,26 @@ public:
             driver_bridge::free_memory_for(pid, ring_addr);
             return fail_install("shellcode_write", "failed to write the remote VEH shellcode", &mri, target_addr, region_size, 0);
         }
+        log_install_phase("shellcode_write_done");
+        if (const char* reason = check_install_cancelled("after_shellcode_write")) {
+            const bool cleanup_sc_ok = driver_bridge::free_memory_for(pid, sc_addr);
+            const std::string cleanup_sc_error = cleanup_sc_ok ? std::string() : driver_bridge::last_error();
+            const bool cleanup_ring_ok = driver_bridge::free_memory_for(pid, ring_addr);
+            const std::string cleanup_ring_error = cleanup_ring_ok ? std::string() : driver_bridge::last_error();
+            diag::log_tagged_fmt("pg_sniff",
+                "install_cancel_cleanup phase=after_shellcode_write pid=%u sc=0x%llX ring=0x%llX cleanup_sc_ok=%d cleanup_sc_error=%s cleanup_ring_ok=%d cleanup_ring_error=%s elapsed_ms=%llu",
+                pid,
+                static_cast<unsigned long long>(sc_addr),
+                static_cast<unsigned long long>(ring_addr),
+                cleanup_sc_ok ? 1 : 0,
+                cleanup_sc_error.c_str(),
+                cleanup_ring_ok ? 1 : 0,
+                cleanup_ring_error.c_str(),
+                static_cast<unsigned long long>(GetTickCount64() - install_start));
+            return fail_install(reason, "page-guard install cancelled after shellcode write", &mri, target_addr, region_size, 0);
+        }
         uint32_t old_sc_protect = 0;
+        log_install_phase("shellcode_protect_begin");
         if (!driver_bridge::protect_memory_for(pid, sc_addr, SHELLCODE_SIZE,
                                                PAGE_EXECUTE_READ, &old_sc_protect)) {
             diag::log_tagged_fmt("pg_sniff", "install_failed reason=shellcode_protect pid=%u sc=0x%llX last_error=%s",
@@ -907,14 +1131,57 @@ public:
             driver_bridge::free_memory_for(pid, ring_addr);
             return fail_install("shellcode_protect", "failed to make the remote VEH shellcode executable", &mri, target_addr, region_size, PAGE_EXECUTE_READ);
         }
+        log_install_phase("shellcode_protect_done");
+        if (const char* reason = check_install_cancelled("after_shellcode_protect")) {
+            const bool cleanup_sc_ok = driver_bridge::free_memory_for(pid, sc_addr);
+            const std::string cleanup_sc_error = cleanup_sc_ok ? std::string() : driver_bridge::last_error();
+            const bool cleanup_ring_ok = driver_bridge::free_memory_for(pid, ring_addr);
+            const std::string cleanup_ring_error = cleanup_ring_ok ? std::string() : driver_bridge::last_error();
+            diag::log_tagged_fmt("pg_sniff",
+                "install_cancel_cleanup phase=after_shellcode_protect pid=%u sc=0x%llX ring=0x%llX cleanup_sc_ok=%d cleanup_sc_error=%s cleanup_ring_ok=%d cleanup_ring_error=%s elapsed_ms=%llu",
+                pid,
+                static_cast<unsigned long long>(sc_addr),
+                static_cast<unsigned long long>(ring_addr),
+                cleanup_sc_ok ? 1 : 0,
+                cleanup_sc_error.c_str(),
+                cleanup_ring_ok ? 1 : 0,
+                cleanup_ring_error.c_str(),
+                static_cast<unsigned long long>(GetTickCount64() - install_start));
+            return fail_install(reason, "page-guard install cancelled after shellcode protect", &mri, target_addr, region_size, PAGE_EXECUTE_READ);
+        }
 
 
+        log_install_phase("ntdll_scan_begin");
         driver_bridge::module_info_t ntdll_mod_install = find_module_info(pid, "ntdll.dll");
         if (ntdll_mod_install.base == 0) {
             diag::log_tagged_fmt("pg_sniff", "install_failed reason=ntdll_missing pid=%u", pid);
             driver_bridge::free_memory_for(pid, sc_addr);
             driver_bridge::free_memory_for(pid, ring_addr);
             return fail_install("ntdll_missing", "ntdll.dll is not present in target module enumeration", &mri, target_addr, region_size, 0);
+        }
+        diag::log_tagged_fmt("pg_sniff",
+            "install_ntdll_scan_done pid=%u active_pid=%u ntdll=0x%llX ntdll_size=0x%llX elapsed_ms=%llu",
+            pid,
+            driver_bridge::attached_pid(),
+            static_cast<unsigned long long>(ntdll_mod_install.base),
+            static_cast<unsigned long long>(ntdll_mod_install.size),
+            static_cast<unsigned long long>(GetTickCount64() - install_start));
+        if (const char* reason = check_install_cancelled("after_ntdll_scan")) {
+            const bool cleanup_sc_ok = driver_bridge::free_memory_for(pid, sc_addr);
+            const std::string cleanup_sc_error = cleanup_sc_ok ? std::string() : driver_bridge::last_error();
+            const bool cleanup_ring_ok = driver_bridge::free_memory_for(pid, ring_addr);
+            const std::string cleanup_ring_error = cleanup_ring_ok ? std::string() : driver_bridge::last_error();
+            diag::log_tagged_fmt("pg_sniff",
+                "install_cancel_cleanup phase=after_ntdll_scan pid=%u sc=0x%llX ring=0x%llX cleanup_sc_ok=%d cleanup_sc_error=%s cleanup_ring_ok=%d cleanup_ring_error=%s elapsed_ms=%llu",
+                pid,
+                static_cast<unsigned long long>(sc_addr),
+                static_cast<unsigned long long>(ring_addr),
+                cleanup_sc_ok ? 1 : 0,
+                cleanup_sc_error.c_str(),
+                cleanup_ring_ok ? 1 : 0,
+                cleanup_ring_error.c_str(),
+                static_cast<unsigned long long>(GetTickCount64() - install_start));
+            return fail_install(reason, "page-guard install cancelled after ntdll scan", &mri, target_addr, region_size, 0);
         }
         uint64_t rtl_add_fn = resolve_system_export_for_pid(pid,
                                                             ntdll_mod_install.base,
@@ -923,6 +1190,23 @@ public:
                                                             "RtlAddVectoredExceptionHandler",
                                                             "install_rtladdveh",
                                                             install_start);
+        if (const char* reason = check_install_cancelled("after_rtladdveh_export")) {
+            const bool cleanup_sc_ok = driver_bridge::free_memory_for(pid, sc_addr);
+            const std::string cleanup_sc_error = cleanup_sc_ok ? std::string() : driver_bridge::last_error();
+            const bool cleanup_ring_ok = driver_bridge::free_memory_for(pid, ring_addr);
+            const std::string cleanup_ring_error = cleanup_ring_ok ? std::string() : driver_bridge::last_error();
+            diag::log_tagged_fmt("pg_sniff",
+                "install_cancel_cleanup phase=after_rtladdveh_export pid=%u sc=0x%llX ring=0x%llX cleanup_sc_ok=%d cleanup_sc_error=%s cleanup_ring_ok=%d cleanup_ring_error=%s elapsed_ms=%llu",
+                pid,
+                static_cast<unsigned long long>(sc_addr),
+                static_cast<unsigned long long>(ring_addr),
+                cleanup_sc_ok ? 1 : 0,
+                cleanup_sc_error.c_str(),
+                cleanup_ring_ok ? 1 : 0,
+                cleanup_ring_error.c_str(),
+                static_cast<unsigned long long>(GetTickCount64() - install_start));
+            return fail_install(reason, "page-guard install cancelled after RtlAddVectoredExceptionHandler export resolution", &mri, target_addr, region_size, 0);
+        }
         if (rtl_add_fn == 0) {
             diag::log_tagged_fmt("pg_sniff", "install_failed reason=rtladdveh_missing pid=%u ntdll=0x%llX",
                 pid, static_cast<unsigned long long>(ntdll_mod_install.base));
@@ -937,6 +1221,23 @@ public:
                                                                "RtlRemoveVectoredExceptionHandler",
                                                                "install_cache_rtlremoveveh",
                                                                install_start);
+        if (const char* reason = check_install_cancelled("after_rtlremoveveh_export")) {
+            const bool cleanup_sc_ok = driver_bridge::free_memory_for(pid, sc_addr);
+            const std::string cleanup_sc_error = cleanup_sc_ok ? std::string() : driver_bridge::last_error();
+            const bool cleanup_ring_ok = driver_bridge::free_memory_for(pid, ring_addr);
+            const std::string cleanup_ring_error = cleanup_ring_ok ? std::string() : driver_bridge::last_error();
+            diag::log_tagged_fmt("pg_sniff",
+                "install_cancel_cleanup phase=after_rtlremoveveh_export pid=%u sc=0x%llX ring=0x%llX cleanup_sc_ok=%d cleanup_sc_error=%s cleanup_ring_ok=%d cleanup_ring_error=%s elapsed_ms=%llu",
+                pid,
+                static_cast<unsigned long long>(sc_addr),
+                static_cast<unsigned long long>(ring_addr),
+                cleanup_sc_ok ? 1 : 0,
+                cleanup_sc_error.c_str(),
+                cleanup_ring_ok ? 1 : 0,
+                cleanup_ring_error.c_str(),
+                static_cast<unsigned long long>(GetTickCount64() - install_start));
+            return fail_install(reason, "page-guard install cancelled after RtlRemoveVectoredExceptionHandler export resolution", &mri, target_addr, region_size, 0);
+        }
         diag::log_tagged_fmt("pg_sniff",
             "install_cache_rtlremoveveh pid=%u active_pid=%u module=ntdll.dll base=0x%llX function=RtlRemoveVectoredExceptionHandler va=0x%llX elapsed_ms=%llu outcome=%s",
             pid,
@@ -992,6 +1293,23 @@ public:
             veh_ring_before_error.c_str(),
             static_cast<unsigned long long>(GetTickCount64() - install_start));
 
+        if (const char* reason = check_install_cancelled("before_veh_register")) {
+            const bool cleanup_sc_ok = driver_bridge::free_memory_for(pid, sc_addr);
+            const std::string cleanup_sc_error = cleanup_sc_ok ? std::string() : driver_bridge::last_error();
+            const bool cleanup_ring_ok = driver_bridge::free_memory_for(pid, ring_addr);
+            const std::string cleanup_ring_error = cleanup_ring_ok ? std::string() : driver_bridge::last_error();
+            diag::log_tagged_fmt("pg_sniff",
+                "install_cancel_cleanup phase=before_veh_register pid=%u sc=0x%llX ring=0x%llX cleanup_sc_ok=%d cleanup_sc_error=%s cleanup_ring_ok=%d cleanup_ring_error=%s elapsed_ms=%llu",
+                pid,
+                static_cast<unsigned long long>(sc_addr),
+                static_cast<unsigned long long>(ring_addr),
+                cleanup_sc_ok ? 1 : 0,
+                cleanup_sc_error.c_str(),
+                cleanup_ring_ok ? 1 : 0,
+                cleanup_ring_error.c_str(),
+                static_cast<unsigned long long>(GetTickCount64() - install_start));
+            return fail_install(reason, "page-guard install cancelled before VEH registration", &mri, target_addr, region_size, 0);
+        }
         uint64_t veh_handle = driver_remote_call(pid, rtl_add_fn, 1, sc_addr, 0, 0, "RtlAddVectoredExceptionHandler");
         driver_bridge::memory_region_t veh_target_after{};
         driver_bridge::memory_region_t veh_handler_after{};
@@ -1064,6 +1382,31 @@ public:
                 static_cast<unsigned long long>(GetTickCount64() - install_start));
             return fail_install("veh_register_failed", "remote RtlAddVectoredExceptionHandler call failed", &mri, target_addr, region_size, 0);
         }
+        if (const char* reason = check_install_cancelled("after_veh_register")) {
+            uint64_t removed = remove_vectored_exception_handler_remote(pid,
+                                                                         ntdll_mod_install.base,
+                                                                         rtl_remove_fn,
+                                                                         veh_handle,
+                                                                         "install_cancel_after_veh_register",
+                                                                         install_start);
+            const bool cleanup_sc_ok = removed != 0 && driver_bridge::free_memory_for(pid, sc_addr);
+            const std::string cleanup_sc_error = cleanup_sc_ok ? std::string() : driver_bridge::last_error();
+            const bool cleanup_ring_ok = removed != 0 && driver_bridge::free_memory_for(pid, ring_addr);
+            const std::string cleanup_ring_error = cleanup_ring_ok ? std::string() : driver_bridge::last_error();
+            diag::log_tagged_fmt("pg_sniff",
+                "install_cancel_cleanup phase=after_veh_register pid=%u veh=0x%llX removed=0x%llX sc=0x%llX ring=0x%llX cleanup_sc_ok=%d cleanup_sc_error=%s cleanup_ring_ok=%d cleanup_ring_error=%s elapsed_ms=%llu",
+                pid,
+                static_cast<unsigned long long>(veh_handle),
+                static_cast<unsigned long long>(removed),
+                static_cast<unsigned long long>(sc_addr),
+                static_cast<unsigned long long>(ring_addr),
+                cleanup_sc_ok ? 1 : 0,
+                cleanup_sc_error.c_str(),
+                cleanup_ring_ok ? 1 : 0,
+                cleanup_ring_error.c_str(),
+                static_cast<unsigned long long>(GetTickCount64() - install_start));
+            return fail_install(reason, "page-guard install cancelled after VEH registration", &mri, target_addr, region_size, 0);
+        }
         diag::log_tagged_fmt("pg_sniff",
             "veh_register_done pid=%u active_pid=%u caller_tid=%lu module=ntdll.dll ntdll_base=0x%llX ntdll_size=0x%llX function=RtlAddVectoredExceptionHandler va=0x%llX handler=0x%llX ring=0x%llX handle=0x%llX method=driver_bridge::call_function target_after_query=%d target_after_base=0x%llX target_after_size=0x%llX target_after_state=0x%08X target_after_protect=0x%08X target_after_type=0x%08X handler_after_query=%d handler_after_base=0x%llX handler_after_size=0x%llX handler_after_state=0x%08X handler_after_protect=0x%08X handler_after_type=0x%08X ring_after_query=%d ring_after_base=0x%llX ring_after_size=0x%llX ring_after_state=0x%08X ring_after_protect=0x%08X ring_after_type=0x%08X elapsed_ms=%llu",
             pid,
@@ -1096,6 +1439,7 @@ public:
             static_cast<unsigned long long>(GetTickCount64() - install_start));
 
         uint32_t old_prot = 0;
+        log_install_phase("target_guard_protect_begin");
         if (!driver_bridge::protect_memory_for(pid, target_addr, region_size,
                                                orig_protect | PAGE_GUARD, &old_prot)) {
             diag::log_tagged_fmt("pg_sniff", "install_failed reason=target_guard_protect pid=%u target=0x%llX size=0x%llX orig=0x%08X last_error=%s",
@@ -1116,6 +1460,37 @@ public:
             driver_bridge::free_memory_for(pid, sc_addr);
             driver_bridge::free_memory_for(pid, ring_addr);
             return fail_install("target_guard_protect", "driver or OS refused PAGE_GUARD protection for the normalized target region", &mri, target_addr, region_size, orig_protect | PAGE_GUARD);
+        }
+        log_install_phase("target_guard_protect_done");
+        if (const char* reason = check_install_cancelled("after_target_guard_protect")) {
+            uint32_t cleanup_old_protect = 0;
+            const bool cleanup_restored = driver_bridge::protect_memory_for(pid, target_addr, region_size, orig_protect, &cleanup_old_protect);
+            bool cleanup_removed = false;
+            if (cleanup_restored)
+                cleanup_removed = remove_vectored_exception_handler_remote(pid,
+                                                                           ntdll_mod_install.base,
+                                                                           rtl_remove_fn,
+                                                                           veh_handle,
+                                                                           "install_cancel_after_target_guard",
+                                                                           install_start) != 0;
+            const bool cleanup_sc_ok = cleanup_restored && cleanup_removed && driver_bridge::free_memory_for(pid, sc_addr);
+            const std::string cleanup_sc_error = cleanup_sc_ok ? std::string() : driver_bridge::last_error();
+            const bool cleanup_ring_ok = cleanup_restored && cleanup_removed && driver_bridge::free_memory_for(pid, ring_addr);
+            const std::string cleanup_ring_error = cleanup_ring_ok ? std::string() : driver_bridge::last_error();
+            diag::log_tagged_fmt("pg_sniff",
+                "install_cancel_cleanup phase=after_target_guard_protect pid=%u restored=%d old=0x%08X removed=%d sc=0x%llX ring=0x%llX cleanup_sc_ok=%d cleanup_sc_error=%s cleanup_ring_ok=%d cleanup_ring_error=%s elapsed_ms=%llu",
+                pid,
+                cleanup_restored ? 1 : 0,
+                cleanup_old_protect,
+                cleanup_removed ? 1 : 0,
+                static_cast<unsigned long long>(sc_addr),
+                static_cast<unsigned long long>(ring_addr),
+                cleanup_sc_ok ? 1 : 0,
+                cleanup_sc_error.c_str(),
+                cleanup_ring_ok ? 1 : 0,
+                cleanup_ring_error.c_str(),
+                static_cast<unsigned long long>(GetTickCount64() - install_start));
+            return fail_install(reason, "page-guard install cancelled after PAGE_GUARD protection", &mri, target_addr, region_size, orig_protect | PAGE_GUARD);
         }
 
 
@@ -1139,6 +1514,40 @@ public:
         uint32_t sid = next_id_++;
         session->session_id = sid;
 
+        if (const char* reason = check_install_cancelled("before_poller_post")) {
+            uint32_t cleanup_old_protect = 0;
+            const bool cleanup_restored = driver_bridge::protect_memory_for(pid, target_addr, region_size, orig_protect, &cleanup_old_protect);
+            bool cleanup_removed = false;
+            if (cleanup_restored)
+                cleanup_removed = remove_vectored_exception_handler_remote(pid,
+                                                                           ntdll_mod_install.base,
+                                                                           rtl_remove_fn,
+                                                                           veh_handle,
+                                                                           "install_cancel_before_poller_post",
+                                                                           install_start) != 0;
+            const bool cleanup_sc_ok = cleanup_restored && cleanup_removed && driver_bridge::free_memory_for(pid, sc_addr);
+            const std::string cleanup_sc_error = cleanup_sc_ok ? std::string() : driver_bridge::last_error();
+            const bool cleanup_ring_ok = cleanup_restored && cleanup_removed && driver_bridge::free_memory_for(pid, ring_addr);
+            const std::string cleanup_ring_error = cleanup_ring_ok ? std::string() : driver_bridge::last_error();
+            session->polling.store(false);
+            session->exited.store(true);
+            diag::log_tagged_fmt("pg_sniff",
+                "install_cancel_cleanup phase=before_poller_post sid=%u pid=%u restored=%d old=0x%08X removed=%d sc=0x%llX ring=0x%llX cleanup_sc_ok=%d cleanup_sc_error=%s cleanup_ring_ok=%d cleanup_ring_error=%s elapsed_ms=%llu",
+                sid,
+                pid,
+                cleanup_restored ? 1 : 0,
+                cleanup_old_protect,
+                cleanup_removed ? 1 : 0,
+                static_cast<unsigned long long>(sc_addr),
+                static_cast<unsigned long long>(ring_addr),
+                cleanup_sc_ok ? 1 : 0,
+                cleanup_sc_error.c_str(),
+                cleanup_ring_ok ? 1 : 0,
+                cleanup_ring_error.c_str(),
+                static_cast<unsigned long long>(GetTickCount64() - install_start));
+            return fail_install(reason, "page-guard install cancelled before poll worker scheduling", &mri, target_addr, region_size, orig_protect | PAGE_GUARD);
+        }
+        log_install_phase("poller_post_begin");
         if (auto_poll && !work_queue::post([worker_session = session]() mutable {
             poll_ring(std::move(worker_session));
         })) {
@@ -1171,9 +1580,90 @@ public:
             return fail_install("poll_worker_post", "failed to schedule the page-guard poll worker", &mri, target_addr, region_size, orig_protect | PAGE_GUARD);
         }
 
-        std::lock_guard<std::mutex> lk(sessions_mutex_);
+        if (const char* reason = check_install_cancelled("before_session_register")) {
+            session->teardown_requested.store(true, std::memory_order_release);
+            session->polling.store(false, std::memory_order_release);
+            session->poll_cv.notify_all();
+            const bool poller_exited = stop_session_poller(session, 1000, "install_cancel_before_register");
+            uint32_t cleanup_old_protect = 0;
+            const bool cleanup_restored = driver_bridge::protect_memory_for(pid, target_addr, region_size, orig_protect, &cleanup_old_protect);
+            bool cleanup_removed = false;
+            if (cleanup_restored)
+                cleanup_removed = remove_vectored_exception_handler_remote(pid,
+                                                                           ntdll_mod_install.base,
+                                                                           rtl_remove_fn,
+                                                                           veh_handle,
+                                                                           "install_cancel_before_register",
+                                                                           install_start) != 0;
+            const bool cleanup_sc_ok = poller_exited && cleanup_restored && cleanup_removed && driver_bridge::free_memory_for(pid, sc_addr);
+            const std::string cleanup_sc_error = cleanup_sc_ok ? std::string() : driver_bridge::last_error();
+            const bool cleanup_ring_ok = poller_exited && cleanup_restored && cleanup_removed && driver_bridge::free_memory_for(pid, ring_addr);
+            const std::string cleanup_ring_error = cleanup_ring_ok ? std::string() : driver_bridge::last_error();
+            diag::log_tagged_fmt("pg_sniff",
+                "install_cancel_cleanup phase=before_session_register sid=%u pid=%u poller_exited=%d restored=%d old=0x%08X removed=%d sc=0x%llX ring=0x%llX cleanup_sc_ok=%d cleanup_sc_error=%s cleanup_ring_ok=%d cleanup_ring_error=%s elapsed_ms=%llu",
+                sid,
+                pid,
+                poller_exited ? 1 : 0,
+                cleanup_restored ? 1 : 0,
+                cleanup_old_protect,
+                cleanup_removed ? 1 : 0,
+                static_cast<unsigned long long>(sc_addr),
+                static_cast<unsigned long long>(ring_addr),
+                cleanup_sc_ok ? 1 : 0,
+                cleanup_sc_error.c_str(),
+                cleanup_ring_ok ? 1 : 0,
+                cleanup_ring_error.c_str(),
+                static_cast<unsigned long long>(GetTickCount64() - install_start));
+            return fail_install(reason, "page-guard install cancelled before session registration", &mri, target_addr, region_size, orig_protect | PAGE_GUARD);
+        }
+        diag::log_tagged_fmt("pg_sniff",
+            "install_session_register_begin sid=%u pid=%u active_pid=%u target=0x%llX size=0x%llX elapsed_ms=%llu",
+            sid,
+            pid,
+            driver_bridge::attached_pid(),
+            static_cast<unsigned long long>(target_addr),
+            static_cast<unsigned long long>(region_size),
+            static_cast<unsigned long long>(GetTickCount64() - install_start));
+        std::unique_lock<std::mutex> lk(sessions_mutex_);
+        if (const char* reason = check_install_cancelled("inside_session_register_lock")) {
+            lk.unlock();
+            session->teardown_requested.store(true, std::memory_order_release);
+            session->polling.store(false, std::memory_order_release);
+            session->poll_cv.notify_all();
+            const bool poller_exited = stop_session_poller(session, 1000, "install_cancel_inside_register_lock");
+            uint32_t cleanup_old_protect = 0;
+            const bool cleanup_restored = driver_bridge::protect_memory_for(pid, target_addr, region_size, orig_protect, &cleanup_old_protect);
+            bool cleanup_removed = false;
+            if (cleanup_restored)
+                cleanup_removed = remove_vectored_exception_handler_remote(pid,
+                                                                           ntdll_mod_install.base,
+                                                                           rtl_remove_fn,
+                                                                           veh_handle,
+                                                                           "install_cancel_inside_register_lock",
+                                                                           install_start) != 0;
+            const bool cleanup_sc_ok = poller_exited && cleanup_restored && cleanup_removed && driver_bridge::free_memory_for(pid, sc_addr);
+            const std::string cleanup_sc_error = cleanup_sc_ok ? std::string() : driver_bridge::last_error();
+            const bool cleanup_ring_ok = poller_exited && cleanup_restored && cleanup_removed && driver_bridge::free_memory_for(pid, ring_addr);
+            const std::string cleanup_ring_error = cleanup_ring_ok ? std::string() : driver_bridge::last_error();
+            diag::log_tagged_fmt("pg_sniff",
+                "install_cancel_cleanup phase=inside_session_register_lock sid=%u pid=%u poller_exited=%d restored=%d old=0x%08X removed=%d sc=0x%llX ring=0x%llX cleanup_sc_ok=%d cleanup_sc_error=%s cleanup_ring_ok=%d cleanup_ring_error=%s elapsed_ms=%llu",
+                sid,
+                pid,
+                poller_exited ? 1 : 0,
+                cleanup_restored ? 1 : 0,
+                cleanup_old_protect,
+                cleanup_removed ? 1 : 0,
+                static_cast<unsigned long long>(sc_addr),
+                static_cast<unsigned long long>(ring_addr),
+                cleanup_sc_ok ? 1 : 0,
+                cleanup_sc_error.c_str(),
+                cleanup_ring_ok ? 1 : 0,
+                cleanup_ring_error.c_str(),
+                static_cast<unsigned long long>(GetTickCount64() - install_start));
+            return fail_install(reason, "page-guard install cancelled while acquiring session registration lock", &mri, target_addr, region_size, orig_protect | PAGE_GUARD);
+        }
         sessions_[sid] = session;
-        diag::log_tagged_fmt("pg_sniff", "install_ok sid=%u pid=%u target=0x%llX size=0x%llX ring=0x%llX sc=0x%llX orig=0x%08X old_guard=0x%08X veh=0x%llX payloads=%d max_drain=%u auto_poll=%d",
+        diag::log_tagged_fmt("pg_sniff", "install_ok sid=%u pid=%u target=0x%llX size=0x%llX ring=0x%llX sc=0x%llX orig=0x%08X old_guard=0x%08X veh=0x%llX payloads=%d max_drain=%u auto_poll=%d generation=%llu elapsed_ms=%llu",
             sid,
             pid,
             static_cast<unsigned long long>(target_addr),
@@ -1185,7 +1675,9 @@ public:
             static_cast<unsigned long long>(veh_handle),
             capture_payloads ? 1 : 0,
             max_records_per_drain,
-            auto_poll ? 1 : 0);
+            auto_poll ? 1 : 0,
+            static_cast<unsigned long long>(install_generation),
+            static_cast<unsigned long long>(GetTickCount64() - install_start));
         return sid;
     }
 
@@ -1247,17 +1739,32 @@ public:
 
 
     bool uninstall(uint32_t session_id) {
+        const ULONGLONG cleanup_start = GetTickCount64();
+        diag::log_tagged_fmt("pg_sniff",
+            "uninstall_session_release_begin sid=%u active_pid=%u elapsed_ms=0",
+            session_id,
+            driver_bridge::attached_pid());
         std::shared_ptr<pg_session_t> sess;
         {
             std::lock_guard<std::mutex> lk(sessions_mutex_);
             auto it = sessions_.find(session_id);
-            if (it == sessions_.end()) return false;
+            if (it == sessions_.end()) {
+                diag::log_tagged_fmt("pg_sniff",
+                    "uninstall_session_release_missing sid=%u active_pid=%u elapsed_ms=%llu",
+                    session_id,
+                    driver_bridge::attached_pid(),
+                    static_cast<unsigned long long>(GetTickCount64() - cleanup_start));
+                return false;
+            }
             sess = std::move(it->second);
             sessions_.erase(it);
         }
-
-
-        const ULONGLONG cleanup_start = GetTickCount64();
+        diag::log_tagged_fmt("pg_sniff",
+            "uninstall_session_release_done sid=%u pid=%u active_pid=%u elapsed_ms=%llu",
+            session_id,
+            sess ? sess->pid : 0,
+            driver_bridge::attached_pid(),
+            static_cast<unsigned long long>(GetTickCount64() - cleanup_start));
         sess->teardown_requested.store(true, std::memory_order_release);
         diag::log_tagged_fmt("pg_sniff", "uninstall_start sid=%u pid=%u target=0x%llX size=0x%llX exited=%d",
             session_id,
@@ -1424,6 +1931,8 @@ public:
     }
 
     size_t signal_stop_all() {
+        const ULONGLONG started = GetTickCount64();
+        const std::uint64_t generation = install_stop_generation_.fetch_add(1, std::memory_order_acq_rel) + 1;
         std::vector<std::shared_ptr<pg_session_t>> snapshot;
         {
             std::lock_guard<std::mutex> lk(sessions_mutex_);
@@ -1434,6 +1943,13 @@ public:
                     snapshot.push_back(sess);
             }
         }
+        diag::log_tagged_fmt("pg_sniff",
+            "signal_stop_all_begin sessions=%zu generation=%llu cancelled=%d deadline_ms=%llu diag_id=%s",
+            snapshot.size(),
+            static_cast<unsigned long long>(generation),
+            mcp_standalone::current_call_cancelled() ? 1 : 0,
+            static_cast<unsigned long long>(mcp_standalone::current_call_deadline_ms()),
+            mcp_standalone::current_call_diag_id());
         size_t signalled = 0;
         for (auto& sess : snapshot) {
             if (!sess)
@@ -1446,6 +1962,12 @@ public:
                 sess->pid,
                 static_cast<unsigned long long>(sess->target_addr));
         }
+        diag::log_tagged_fmt("pg_sniff",
+            "signal_stop_all_done sessions=%zu signalled=%zu generation=%llu elapsed_ms=%llu",
+            snapshot.size(),
+            signalled,
+            static_cast<unsigned long long>(generation),
+            static_cast<unsigned long long>(GetTickCount64() - started));
         return signalled;
     }
 
@@ -1519,6 +2041,7 @@ public:
 
 private:
     std::vector<std::shared_ptr<pg_session_t>> retired_sessions_;
+    std::atomic<std::uint64_t> install_stop_generation_{0};
 
     void clear_install_failure(uint32_t pid, uint64_t requested_addr, uint64_t requested_size) {
         std::lock_guard<std::mutex> lk(failure_mutex_);

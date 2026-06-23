@@ -3899,16 +3899,68 @@ void register_network_tools(mcp_standalone::server_t& srv) {
          {OBFSTR("max_records_per_drain"), OBFSTR("number"), OBFSTR("Maximum page-guard ring records to drain per poll (install, default 32)"), false},
          {OBFSTR("session_id"), OBFSTR("number"), OBFSTR("Session ID returned by install (get_captures/uninstall)"), false}},
         [](const json& params) -> tool_result_t {
+            const ULONGLONG op_started = GetTickCount64();
             const std::string op = params.value("operation", "");
+            auto cancel_reason = []() -> const char* {
+                if (mcp_standalone::current_call_cancelled())
+                    return "mcp_cancelled";
+                const std::uint64_t deadline = mcp_standalone::current_call_deadline_ms();
+                if (deadline != 0 && GetTickCount64() >= deadline)
+                    return "mcp_deadline";
+                return nullptr;
+            };
+            auto log_phase = [&](const char* phase) {
+                const std::uint64_t deadline = mcp_standalone::current_call_deadline_ms();
+                const ULONGLONG now = GetTickCount64();
+                const std::uint64_t remaining = deadline != 0 && now < deadline ? deadline - now : 0;
+                diag::log_tagged_fmt("net_tools",
+                    "network_pg_sniff phase=%s op=%s active_pid=%u cancelled=%d deadline_ms=%llu deadline_remaining_ms=%llu elapsed_ms=%llu diag_id=%s",
+                    phase ? phase : "",
+                    op.c_str(),
+                    driver_bridge::attached_pid(),
+                    mcp_standalone::current_call_cancelled() ? 1 : 0,
+                    static_cast<unsigned long long>(deadline),
+                    static_cast<unsigned long long>(remaining),
+                    static_cast<unsigned long long>(now - op_started),
+                    mcp_standalone::current_call_diag_id());
+            };
+            auto cancelled_result = [&](const char* phase, uint32_t sid = 0, bool cleanup_attempted = false, bool cleanup_ok = false) -> tool_result_t {
+                const char* reason = cancel_reason();
+                json d{
+                    {"operation", op},
+                    {"phase", phase ? phase : ""},
+                    {"reason", reason ? reason : "cancelled"},
+                    {"session_id", sid},
+                    {"cleanup_attempted", cleanup_attempted},
+                    {"cleanup_ok", cleanup_ok},
+                    {"elapsed_ms", static_cast<unsigned long long>(GetTickCount64() - op_started)},
+                    {"backend", "whoswho_driver_page_guard"}
+                };
+                diag::log_tagged_fmt("net_tools",
+                    "network_pg_sniff cancelled phase=%s op=%s reason=%s sid=%u cleanup_attempted=%d cleanup_ok=%d elapsed_ms=%llu",
+                    phase ? phase : "",
+                    op.c_str(),
+                    reason ? reason : "cancelled",
+                    sid,
+                    cleanup_attempted ? 1 : 0,
+                    cleanup_ok ? 1 : 0,
+                    static_cast<unsigned long long>(GetTickCount64() - op_started));
+                return tool_result_t::error("network_pg_sniff cancelled before completion.", "cancelled", d);
+            };
             diag::log_tagged_fmt("net_tools", "network_pg_sniff op=%s", op.c_str());
+            log_phase("entry");
             if (op != "install" && op != "get_captures" && op != "uninstall" && op != "list_sessions")
                 return tool_result_t::error("Unknown operation '" + op + "'. Use install|get_captures|uninstall|list_sessions");
             if (op == "list_sessions") {
+                log_phase("list_sessions_begin");
                 json sessions = page_guard_sessions_payload();
+                log_phase("list_sessions_done");
                 return tool_result_t::ok("PAGE_GUARD sessions listed", json{{"sessions", sessions}, {"count", sessions.size()}, {"backend", "whoswho_driver_page_guard"}});
             }
             std::string error;
             if (op == "install") {
+                if (cancel_reason())
+                    return cancelled_result("before_parse");
                 uint32_t pid = driver_bridge::attached_pid();
                 if (!parse_json_u32_param(params, "pid", pid, error) || pid == 0)
                     return network_param_error(error.empty() ? "Target pid is required" : error, "pid");
@@ -3923,14 +3975,42 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                     return network_param_error(error, "max_records_per_drain");
                 const uint32_t max_records = static_cast<uint32_t>(std::min<uint64_t>(max_records_raw, 4096));
                 const bool capture_payloads = params.value("capture_payloads", true);
+                diag::log_tagged_fmt("net_tools",
+                    "network_pg_sniff install_begin pid=%u active_pid=%u address=0x%llX size=0x%llX capture_payloads=%d max_records=%u elapsed_ms=%llu",
+                    pid,
+                    driver_bridge::attached_pid(),
+                    static_cast<unsigned long long>(address),
+                    static_cast<unsigned long long>(size),
+                    capture_payloads ? 1 : 0,
+                    max_records,
+                    static_cast<unsigned long long>(GetTickCount64() - op_started));
+                if (cancel_reason())
+                    return cancelled_result("before_install");
                 const uint32_t sid = page_guard_engine::g_pg_engine.install(pid, address, size, capture_payloads, max_records, true);
+                diag::log_tagged_fmt("net_tools",
+                    "network_pg_sniff install_return sid=%u pid=%u active_pid=%u address=0x%llX size=0x%llX elapsed_ms=%llu",
+                    sid,
+                    pid,
+                    driver_bridge::attached_pid(),
+                    static_cast<unsigned long long>(address),
+                    static_cast<unsigned long long>(size),
+                    static_cast<unsigned long long>(GetTickCount64() - op_started));
                 if (sid == 0) {
                     json d{{"pid", pid}, {"address", hex_u64(address)}, {"size", size}, {"capture_payloads", capture_payloads}, {"failure", page_guard_install_failure_payload()}};
                     diag::log_tagged_fmt("net_tools", "network_pg_sniff install_failed pid=%u address=0x%llX size=0x%llX active=%u error=%s",
                         pid, static_cast<unsigned long long>(address), static_cast<unsigned long long>(size), driver_bridge::attached_pid(), driver_bridge::last_error().c_str());
                     return tool_result_t::error("Failed to install WhosWho driver-backed PAGE_GUARD capture session.", "page_guard_install_failed", d);
                 }
+                if (cancel_reason()) {
+                    const bool cleanup_ok = page_guard_engine::g_pg_engine.uninstall(sid);
+                    return cancelled_result("after_install", sid, true, cleanup_ok);
+                }
                 json r{{"session_id", sid}, {"pid", pid}, {"address", hex_u64(address)}, {"size", size}, {"capture_payloads", capture_payloads}, {"max_records_per_drain", max_records}, {"backend", "whoswho_driver_page_guard"}};
+                diag::log_tagged_fmt("net_tools",
+                    "network_pg_sniff install_success sid=%u pid=%u elapsed_ms=%llu",
+                    sid,
+                    pid,
+                    static_cast<unsigned long long>(GetTickCount64() - op_started));
                 return tool_result_t::ok("PAGE_GUARD sniffer installed", r);
             }
             uint64_t sid64 = 0;
@@ -3938,13 +4018,19 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 return network_param_error(error.empty() ? "session_id is required" : error, "session_id");
             const uint32_t sid = static_cast<uint32_t>(sid64);
             if (op == "get_captures") {
+                if (cancel_reason())
+                    return cancelled_result("before_get_captures", sid);
+                log_phase("get_captures_begin");
                 auto records = page_guard_engine::g_pg_engine.get_capture_records(sid);
+                log_phase("get_captures_done");
                 json captures = json::array();
                 for (const auto& c : records)
                     captures.push_back(page_guard_capture_payload(c));
                 return tool_result_t::ok("PAGE_GUARD captures drained", json{{"session_id", sid}, {"capture_count", captures.size()}, {"captures", captures}, {"backend", "whoswho_driver_page_guard"}});
             }
+            log_phase("uninstall_begin");
             const bool stopped = page_guard_engine::g_pg_engine.uninstall(sid);
+            log_phase("uninstall_done");
             return stopped
                 ? tool_result_t::ok("PAGE_GUARD sniffer uninstalled", json{{"session_id", sid}, {"backend", "whoswho_driver_page_guard"}})
                 : tool_result_t::error("session_id not found", json{{"session_id", sid}, {"backend", "whoswho_driver_page_guard"}});

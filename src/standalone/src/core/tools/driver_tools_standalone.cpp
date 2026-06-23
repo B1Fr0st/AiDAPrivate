@@ -501,21 +501,180 @@ static std::optional<std::uint32_t> parse_tid_param(const json& params)
 
 static bool is_probably_kernel_address(std::uint64_t address);
 
+struct teb_resolution_diagnostics_t
+{
+    std::uint32_t pid = 0;
+    std::uint32_t tid = 0;
+    bool context_available = false;
+    bool context_valid = false;
+    bool context_kernel = false;
+    std::uint64_t context_candidate = 0;
+    bool tqif_called = false;
+    bool tqif_ok = false;
+    std::uint32_t tqif_status = 0;
+    std::uint32_t tqif_return_length = 0;
+    bool tqif_valid = false;
+    bool tqif_kernel = false;
+    std::uint64_t tqif_candidate = 0;
+    std::uint64_t tqif_client_process = 0;
+    std::uint64_t tqif_client_thread = 0;
+    std::string selected_source;
+    std::string failure;
+};
+
+static json teb_resolution_diagnostics_to_json(const teb_resolution_diagnostics_t& diag)
+{
+    json out;
+    out["process_id"] = diag.pid;
+    out["thread_id"] = diag.tid;
+    out["context_available"] = diag.context_available;
+    out["context_teb_candidate"] = sa_format_address(static_cast<std::uint64_t>(diag.context_candidate));
+    out["context_candidate_valid"] = diag.context_valid;
+    out["context_candidate_kernel"] = diag.context_kernel;
+    out["tqif_called"] = diag.tqif_called;
+    out["tqif_ok"] = diag.tqif_ok;
+    out["tqif_status"] = sa_format_address(static_cast<std::uint64_t>(diag.tqif_status));
+    out["tqif_return_length"] = diag.tqif_return_length;
+    out["tqif_teb_candidate"] = sa_format_address(static_cast<std::uint64_t>(diag.tqif_candidate));
+    out["tqif_candidate_valid"] = diag.tqif_valid;
+    out["tqif_candidate_kernel"] = diag.tqif_kernel;
+    out["tqif_client_process"] = diag.tqif_client_process;
+    out["tqif_client_thread"] = diag.tqif_client_thread;
+    out["selected_source"] = diag.selected_source;
+    out["failure"] = diag.failure;
+    return out;
+}
+
 static bool resolve_teb_address_for_thread(std::uint32_t tid,
-                                           const voyager::device_t::thread_context& ctx,
+                                           const voyager::device_t::thread_context* ctx,
                                            std::uint64_t& out_teb,
                                            std::string& source,
-                                           std::string& error)
+                                           std::string& error,
+                                           teb_resolution_diagnostics_t& diag)
 {
-    out_teb = ctx.kernel_gs_base;
-    source = OBFSTR("thread_context.kernel_gs_base");
-    if (out_teb != 0 && !is_probably_kernel_address(out_teb))
-        return true;
+    diag = {};
+    diag.pid = device ? device->get_process_id() : 0;
+    diag.tid = tid;
+    out_teb = 0;
+    source.clear();
+    error.clear();
 
-    if (ctx.kernel_gs_base != 0 && is_probably_kernel_address(ctx.kernel_gs_base))
-        error = OBFSTR("driver thread context reported a kernel GS base instead of a user TEB for TID ") + std::to_string(tid);
+    if (ctx != nullptr)
+    {
+        diag.context_available = true;
+        diag.context_candidate = ctx->kernel_gs_base;
+        diag.context_kernel = diag.context_candidate != 0 && is_probably_kernel_address(diag.context_candidate);
+        diag.context_valid = diag.context_candidate != 0 && !diag.context_kernel;
+        diag::log_tagged_fmt("drv_tools",
+            "teb_resolve_context pid=%u tid=%u candidate=0x%llX valid=%d kernel=%d",
+            diag.pid,
+            diag.tid,
+            static_cast<unsigned long long>(diag.context_candidate),
+            diag.context_valid ? 1 : 0,
+            diag.context_kernel ? 1 : 0);
+
+        if (diag.context_valid)
+        {
+            out_teb = diag.context_candidate;
+            source = OBFSTR("thread_context.kernel_gs_base");
+            diag.selected_source = source;
+            diag::log_tagged_fmt("drv_tools",
+                "teb_resolve_selected pid=%u tid=%u source=%s address=0x%llX context_candidate=0x%llX tqif_candidate=0x%llX tqif_called=%d tqif_ok=%d tqif_status=0x%08X",
+                diag.pid,
+                diag.tid,
+                diag.selected_source.c_str(),
+                static_cast<unsigned long long>(out_teb),
+                static_cast<unsigned long long>(diag.context_candidate),
+                static_cast<unsigned long long>(diag.tqif_candidate),
+                diag.tqif_called ? 1 : 0,
+                diag.tqif_ok ? 1 : 0,
+                diag.tqif_status);
+            return true;
+        }
+    }
     else
-        error = OBFSTR("driver thread context did not include a valid user TEB for TID ") + std::to_string(tid);
+    {
+        diag::log_tagged_fmt("drv_tools",
+            "teb_resolve_context pid=%u tid=%u candidate=0x0 valid=0 kernel=0 unavailable=1",
+            diag.pid,
+            diag.tid);
+    }
+
+    diag.tqif_called = true;
+    voyager::detail::thread_query_information_request tqif{};
+    diag.tqif_ok = device && device->query_thread_basic_information(tid, tqif);
+    diag.tqif_status = tqif.status;
+    diag.tqif_return_length = tqif.return_length;
+    diag.tqif_candidate = tqif.teb_base;
+    diag.tqif_client_process = tqif.client_process;
+    diag.tqif_client_thread = tqif.client_thread;
+    diag.tqif_kernel = diag.tqif_candidate != 0 && is_probably_kernel_address(diag.tqif_candidate);
+    diag.tqif_valid = diag.tqif_ok && diag.tqif_candidate != 0 && !diag.tqif_kernel;
+    diag::log_tagged_fmt("drv_tools",
+        "teb_resolve_tqif pid=%u tid=%u ok=%d status=0x%08X return_length=%u candidate=0x%llX valid=%d kernel=%d client_pid=%llu client_tid=%llu",
+        diag.pid,
+        diag.tid,
+        diag.tqif_ok ? 1 : 0,
+        diag.tqif_status,
+        diag.tqif_return_length,
+        static_cast<unsigned long long>(diag.tqif_candidate),
+        diag.tqif_valid ? 1 : 0,
+        diag.tqif_kernel ? 1 : 0,
+        static_cast<unsigned long long>(diag.tqif_client_process),
+        static_cast<unsigned long long>(diag.tqif_client_thread));
+
+    if (diag.tqif_valid)
+    {
+        out_teb = diag.tqif_candidate;
+        source = OBFSTR("thread_query_information.teb_base");
+        diag.selected_source = source;
+        diag::log_tagged_fmt("drv_tools",
+            "teb_resolve_selected pid=%u tid=%u source=%s address=0x%llX context_candidate=0x%llX tqif_candidate=0x%llX tqif_called=%d tqif_ok=%d tqif_status=0x%08X",
+            diag.pid,
+            diag.tid,
+            diag.selected_source.c_str(),
+            static_cast<unsigned long long>(out_teb),
+            static_cast<unsigned long long>(diag.context_candidate),
+            static_cast<unsigned long long>(diag.tqif_candidate),
+            diag.tqif_called ? 1 : 0,
+            diag.tqif_ok ? 1 : 0,
+            diag.tqif_status);
+        return true;
+    }
+
+    std::string context_error;
+    if (!diag.context_available)
+        context_error = OBFSTR("driver thread context was unavailable for TID ") + std::to_string(tid);
+    else if (diag.context_kernel)
+        context_error = OBFSTR("driver thread context reported a kernel GS base instead of a user TEB for TID ") + std::to_string(tid);
+    else
+        context_error = OBFSTR("driver thread context did not include a valid user TEB for TID ") + std::to_string(tid);
+
+    std::string tqif_error;
+    if (!diag.tqif_ok)
+        tqif_error = OBFSTR("TQIF failed with status ") + sa_format_address(static_cast<std::uint64_t>(diag.tqif_status));
+    else if (diag.tqif_candidate == 0)
+        tqif_error = OBFSTR("TQIF returned a null TEB base");
+    else
+        tqif_error = OBFSTR("TQIF returned a kernel address instead of a user TEB");
+
+    error = context_error + OBFSTR("; ") + tqif_error;
+    diag.failure = error;
+    diag::log_tagged_fmt("drv_tools",
+        "teb_resolve_failed pid=%u tid=%u context_available=%d context_candidate=0x%llX context_valid=%d context_kernel=%d tqif_called=%d tqif_ok=%d tqif_status=0x%08X tqif_candidate=0x%llX tqif_valid=%d tqif_kernel=%d failure=%s",
+        diag.pid,
+        diag.tid,
+        diag.context_available ? 1 : 0,
+        static_cast<unsigned long long>(diag.context_candidate),
+        diag.context_valid ? 1 : 0,
+        diag.context_kernel ? 1 : 0,
+        diag.tqif_called ? 1 : 0,
+        diag.tqif_ok ? 1 : 0,
+        diag.tqif_status,
+        static_cast<unsigned long long>(diag.tqif_candidate),
+        diag.tqif_valid ? 1 : 0,
+        diag.tqif_kernel ? 1 : 0,
+        diag.failure.c_str());
     return false;
 }
 
@@ -8989,17 +9148,83 @@ tool_result_t driver_read_teb(const json& params)
         return tool_result_t::error(OBFSTR("Missing or invalid tid parameter."));
 
     const std::uint32_t tid = *tid_opt;
+    const std::uint32_t pid = device ? device->get_process_id() : 0;
 
     voyager::device_t::thread_context ctx{};
-    if (!device->get_thread_context(tid, ctx))
-        return tool_result_t::error(OBFSTR("Failed to get thread context for TID ") + std::to_string(tid));
+    const bool got_context = device && device->get_thread_context(tid, ctx);
+    if (!got_context)
+    {
+        diag::log_tagged_fmt("drv_tools",
+            "driver_read_teb_tctx_failed pid=%u tid=%u",
+            pid,
+            tid);
+    }
 
     std::uint64_t teb_addr = 0;
     std::string teb_source;
     std::string teb_error;
-    if (!resolve_teb_address_for_thread(tid, ctx, teb_addr, teb_source, teb_error))
+    teb_resolution_diagnostics_t resolution_diag{};
+    if (!resolve_teb_address_for_thread(tid, got_context ? &ctx : nullptr, teb_addr, teb_source, teb_error, resolution_diag))
+    {
+        json failure;
+        failure["process_id"] = pid;
+        failure["thread_id"] = tid;
+        failure["teb_resolution"] = teb_resolution_diagnostics_to_json(resolution_diag);
         return tool_result_t::error(OBFSTR("TEB address unavailable for TID ") +
-                                    std::to_string(tid) + OBFSTR(": ") + teb_error);
+                                    std::to_string(tid) + OBFSTR(": ") + teb_error, failure);
+    }
+
+    constexpr std::size_t teb_read_size = 0x1680;
+    std::vector<std::uint8_t> teb_bytes(teb_read_size, 0);
+    const std::size_t bytes_read = device->read_raw(teb_addr, teb_bytes.data(), teb_bytes.size());
+    diag::log_tagged_fmt("drv_tools",
+        "driver_read_teb_read pid=%u tid=%u source=%s address=0x%llX requested=%zu actual=%zu",
+        pid,
+        tid,
+        teb_source.c_str(),
+        static_cast<unsigned long long>(teb_addr),
+        teb_bytes.size(),
+        bytes_read);
+
+    json read_diag;
+    read_diag["address"] = sa_format_address(static_cast<std::uint64_t>(teb_addr));
+    read_diag["requested_size"] = teb_bytes.size();
+    read_diag["bytes_read"] = bytes_read;
+    read_diag["source"] = teb_source;
+
+    if (bytes_read < teb_bytes.size())
+    {
+        diag::log_tagged_fmt("drv_tools",
+            "driver_read_teb_read_failed pid=%u tid=%u source=%s address=0x%llX requested=%zu actual=%zu",
+            pid,
+            tid,
+            teb_source.c_str(),
+            static_cast<unsigned long long>(teb_addr),
+            teb_bytes.size(),
+            bytes_read);
+        json failure;
+        failure["process_id"] = pid;
+        failure["thread_id"] = tid;
+        failure["teb_resolution"] = teb_resolution_diagnostics_to_json(resolution_diag);
+        failure["teb_read"] = read_diag;
+        return tool_result_t::error(OBFSTR("Failed to read complete TEB at ") +
+                                    sa_format_address(static_cast<std::uint64_t>(teb_addr)) +
+                                    OBFSTR(" for TID ") + std::to_string(tid), failure);
+    }
+
+    auto read_u64 = [&](std::size_t offset) -> std::uint64_t
+    {
+        std::uint64_t value = 0;
+        std::memcpy(&value, teb_bytes.data() + offset, sizeof(value));
+        return value;
+    };
+
+    auto read_u32 = [&](std::size_t offset) -> std::uint32_t
+    {
+        std::uint32_t value = 0;
+        std::memcpy(&value, teb_bytes.data() + offset, sizeof(value));
+        return value;
+    };
 
 
     json teb;
@@ -9008,29 +9233,29 @@ tool_result_t driver_read_teb(const json& params)
     teb["teb_source"] = teb_source;
 
 
-    teb["exception_list"] = sa_format_address(static_cast<uint64_t>(device->read<std::uint64_t>(teb_addr + 0x00)));
-    teb["stack_base"] = sa_format_address(static_cast<uint64_t>(device->read<std::uint64_t>(teb_addr + 0x08)));
-    teb["stack_limit"] = sa_format_address(static_cast<uint64_t>(device->read<std::uint64_t>(teb_addr + 0x10)));
-    teb["sub_system_tib"] = sa_format_address(static_cast<uint64_t>(device->read<std::uint64_t>(teb_addr + 0x18)));
-    teb["fiber_data"] = sa_format_address(static_cast<uint64_t>(device->read<std::uint64_t>(teb_addr + 0x20)));
-    teb["arbitrary_user_pointer"] = sa_format_address(static_cast<uint64_t>(device->read<std::uint64_t>(teb_addr + 0x28)));
-    teb["self"] = sa_format_address(static_cast<uint64_t>(device->read<std::uint64_t>(teb_addr + 0x30)));
+    teb["exception_list"] = sa_format_address(static_cast<uint64_t>(read_u64(0x00)));
+    teb["stack_base"] = sa_format_address(static_cast<uint64_t>(read_u64(0x08)));
+    teb["stack_limit"] = sa_format_address(static_cast<uint64_t>(read_u64(0x10)));
+    teb["sub_system_tib"] = sa_format_address(static_cast<uint64_t>(read_u64(0x18)));
+    teb["fiber_data"] = sa_format_address(static_cast<uint64_t>(read_u64(0x20)));
+    teb["arbitrary_user_pointer"] = sa_format_address(static_cast<uint64_t>(read_u64(0x28)));
+    teb["self"] = sa_format_address(static_cast<uint64_t>(read_u64(0x30)));
 
 
-    teb["environment_pointer"] = sa_format_address(static_cast<uint64_t>(device->read<std::uint64_t>(teb_addr + 0x38)));
-    teb["client_id_process"] = device->read<std::uint64_t>(teb_addr + 0x40);
-    teb["client_id_thread"] = device->read<std::uint64_t>(teb_addr + 0x48);
-    teb["active_rpc_handle"] = sa_format_address(static_cast<uint64_t>(device->read<std::uint64_t>(teb_addr + 0x50)));
-    teb["tls_pointer"] = sa_format_address(static_cast<uint64_t>(device->read<std::uint64_t>(teb_addr + 0x58)));
-    teb["peb_address"] = sa_format_address(static_cast<uint64_t>(device->read<std::uint64_t>(teb_addr + 0x60)));
-    teb["last_error_value"] = device->read<std::uint32_t>(teb_addr + 0x68);
-    teb["count_of_owned_critical_sections"] = device->read<std::uint32_t>(teb_addr + 0x6C);
+    teb["environment_pointer"] = sa_format_address(static_cast<uint64_t>(read_u64(0x38)));
+    teb["client_id_process"] = read_u64(0x40);
+    teb["client_id_thread"] = read_u64(0x48);
+    teb["active_rpc_handle"] = sa_format_address(static_cast<uint64_t>(read_u64(0x50)));
+    teb["tls_pointer"] = sa_format_address(static_cast<uint64_t>(read_u64(0x58)));
+    teb["peb_address"] = sa_format_address(static_cast<uint64_t>(read_u64(0x60)));
+    teb["last_error_value"] = read_u32(0x68);
+    teb["count_of_owned_critical_sections"] = read_u32(0x6C);
 
 
     json tls_slots = json::array();
     for (int i = 0; i < 64; ++i)
     {
-        std::uint64_t slot_val = device->read<std::uint64_t>(teb_addr + 0x1480 + i * 8);
+        std::uint64_t slot_val = read_u64(0x1480 + static_cast<std::size_t>(i) * 8);
         if (slot_val != 0)
         {
             json slot;
@@ -9042,16 +9267,18 @@ tool_result_t driver_read_teb(const json& params)
     teb["active_tls_slots"] = std::move(tls_slots);
 
 
-    std::uint64_t dealloc_stack = device->read<std::uint64_t>(teb_addr + 0x1478);
+    std::uint64_t dealloc_stack = read_u64(0x1478);
     teb["deallocation_stack"] = sa_format_address(static_cast<uint64_t>(dealloc_stack));
 
 
-    std::uint64_t stack_base_val = device->read<std::uint64_t>(teb_addr + 0x08);
-    std::uint64_t stack_limit_val = device->read<std::uint64_t>(teb_addr + 0x10);
+    std::uint64_t stack_base_val = read_u64(0x08);
+    std::uint64_t stack_limit_val = read_u64(0x10);
     if (stack_base_val > stack_limit_val)
         teb["stack_size"] = stack_base_val - stack_limit_val;
 
     json result;
+    result["teb_resolution"] = teb_resolution_diagnostics_to_json(resolution_diag);
+    result["teb_read"] = read_diag;
     result["teb"] = std::move(teb);
     return tool_result_t::ok(OBFSTR("TEB read for TID ") + std::to_string(tid), result);
 }

@@ -491,7 +491,7 @@ namespace trapframe_ctx {
         BOOLEAN attach;
     };
 
-    NTSTATUS read_native_context(PEPROCESS process, PETHREAD thread, HANDLE thread_handle, PCONTEXT ctx, p_thread_ctx request, const char* phase) {
+    NTSTATUS read_native_context(PEPROCESS process, PETHREAD thread, HANDLE thread_handle, PCONTEXT ctx, p_thread_ctx request, const char* phase, BOOLEAN private_user_only) {
         if (!process || !thread || !ctx || !request) {
             return STATUS_INVALID_PARAMETER;
         }
@@ -530,13 +530,16 @@ namespace trapframe_ctx {
             { "ps_attach_legacy", CONTEXT_FULL | CONTEXT_DEBUG_REGISTERS, TRUE, TRUE }
         };
         ULONG attempt_index = 0;
+        const BOOLEAN private_user_read_available = ssdt_resolver::resolve_user_context();
 
-        WW_LOG("TCTX %s read_begin pid=%u tid=%u previous_mode=%u requestor_mode=%u thread_found=%u thread_status=0x%08X thread_status_text=%s thread_state=%lu wait_reason=%lu process_thread_count=%lu scanned_processes=%lu scanned_threads=%lu ps_get=%p zw_get=%p nt_get=%p handle=%p attach_available=%u ps_get_absent=%u nt_get_resolver_absent=%u handle_absent=%u",
+        WW_LOG("TCTX %s read_begin pid=%u tid=%u previous_mode=%u requestor_mode=%u private_user_only=%u private_user_read_available=%u thread_found=%u thread_status=0x%08X thread_status_text=%s thread_state=%lu wait_reason=%lu process_thread_count=%lu scanned_processes=%lu scanned_threads=%lu ps_get=%p user_get=%p internal_direct=%p zw_get=%p nt_get=%p handle=%p attach_available=%u ps_get_absent=%u nt_get_resolver_absent=%u handle_absent=%u",
             phase,
             request->pid,
             request->tid,
             (ULONG)previous_mode,
             (ULONG)previous_mode,
+            private_user_only ? 1u : 0u,
+            private_user_read_available ? 1u : 0u,
             read_thread_before.found ? 1u : 0u,
             (ULONG)read_thread_before.status,
             tctx_diag::ntstatus_text(read_thread_before.status),
@@ -546,6 +549,8 @@ namespace trapframe_ctx {
             read_thread_before.scanned_processes,
             read_thread_before.scanned_threads,
             _PsGetContextThread,
+            ssdt_resolver::g_PsGetUserContextThread,
+            ssdt_resolver::g_PspGetContextThreadInternal,
             _ZwGetContextThread,
             ssdt_resolver::g_NtGetContextThread,
             thread_handle,
@@ -554,7 +559,7 @@ namespace trapframe_ctx {
             (_ZwGetContextThread || ssdt_resolver::g_NtGetContextThread) ? 0u : 1u,
             thread_handle ? 0u : 1u);
 
-        if (ssdt_resolver::resolve_user_context()) {
+        if (private_user_read_available) {
             for (ULONG retry = 0; retry < 4; ++retry) {
                 strong::kmemset(ctx, 0, sizeof(*ctx));
                 ctx->ContextFlags = tctx_diag::kContextDebugFlags;
@@ -666,6 +671,26 @@ namespace trapframe_ctx {
                 ssdt_resolver::g_PsGetUserContextThread,
                 _InterlockedCompareExchange(&ssdt_resolver::g_user_ctx_resolved, 0, 0),
                 dbg_guard::elapsed_ms(phase_start, phase_freq));
+        }
+
+        if (private_user_only) {
+            WW_LOG("TCTX %s read_private_only_fail_closed pid=%u tid=%u status=0x%08X status_text=%s private_user_read_available=%u attempt_count=%lu last_source=%s last_status=0x%08X last_status_text=%s zero_context_seen=%u invalid_user_context_seen=%u previous_mode=%u requestor_mode=%u elapsed_ms=%llu",
+                phase,
+                request->pid,
+                request->tid,
+                (ULONG)status,
+                tctx_diag::ntstatus_text(status),
+                private_user_read_available ? 1u : 0u,
+                attempt_index,
+                last_failure_source,
+                (ULONG)last_failure_status,
+                tctx_diag::ntstatus_text(last_failure_status),
+                zero_context_seen ? 1u : 0u,
+                invalid_user_context_seen ? 1u : 0u,
+                (ULONG)previous_mode,
+                (ULONG)previous_mode,
+                dbg_guard::elapsed_ms(phase_start, phase_freq));
+            return private_user_read_available ? status : STATUS_PROCEDURE_NOT_FOUND;
         }
 
         for (ULONG route = 0; route < sizeof(attempts) / sizeof(attempts[0]); ++route) {
@@ -866,7 +891,7 @@ namespace trapframe_ctx {
         return status;
     }
 
-    NTSTATUS write_native_context(PEPROCESS process, PETHREAD thread, HANDLE thread_handle, PCONTEXT ctx, p_thread_ctx request) {
+    NTSTATUS write_native_context(PEPROCESS process, PETHREAD thread, HANDLE thread_handle, PCONTEXT ctx, p_thread_ctx request, BOOLEAN private_user_only) {
         if (!process || !thread || !ctx || !request) {
             return STATUS_INVALID_PARAMETER;
         }
@@ -911,8 +936,25 @@ namespace trapframe_ctx {
         ULONG selected_flags = 0;
         BOOLEAN selected_attached = FALSE;
         ULONG attempt_index = 0;
+        const BOOLEAN private_user_write_available = ssdt_resolver::resolve_user_set_context();
+        BOOLEAN private_write_attempted = FALSE;
 
-        if (ssdt_resolver::resolve_user_set_context()) {
+        WW_LOG("TCTX set write_route_gate pid=%u tid=%u mask=0x%llX private_user_only=%u private_user_write_available=%u internal_direct=%p ps_set=%p state=%ld previous_mode=%u requestor_mode=%u ctx_thread_handle=%p elapsed_ms=%llu",
+            request->pid,
+            request->tid,
+            (unsigned long long)request->register_mask,
+            private_user_only ? 1u : 0u,
+            private_user_write_available ? 1u : 0u,
+            ssdt_resolver::g_PspSetContextThreadInternal,
+            _PsSetContextThread,
+            _InterlockedCompareExchange(&ssdt_resolver::g_user_set_ctx_resolved, 0, 0),
+            (ULONG)previous_mode,
+            (ULONG)previous_mode,
+            thread_handle,
+            dbg_guard::elapsed_ms(phase_start, phase_freq));
+
+        if (private_user_write_available) {
+            private_write_attempted = TRUE;
             for (ULONG retry = 0; retry < 3; ++retry) {
                 ctx->ContextFlags = write_flags;
                 status = ssdt_resolver::call_PsSetUserContextThread(thread, ctx);
@@ -969,6 +1011,33 @@ namespace trapframe_ctx {
                 ssdt_resolver::g_PspSetContextThreadInternal,
                 _InterlockedCompareExchange(&ssdt_resolver::g_user_set_ctx_resolved, 0, 0),
                 dbg_guard::elapsed_ms(phase_start, phase_freq));
+        }
+
+        if (private_user_only) {
+            WW_LOG("TCTX set write_private_only_result pid=%u tid=%u status=0x%08X status_text=%s private_user_write_available=%u private_write_attempted=%u attempts=%lu ps_status=0x%08X ps_status_text=%s selected_source=%s rip=0x%llX rsp=0x%llX rflags=0x%llX dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX previous_mode=%u requestor_mode=%u elapsed_ms=%llu",
+                request->pid,
+                request->tid,
+                (ULONG)status,
+                tctx_diag::ntstatus_text(status),
+                private_user_write_available ? 1u : 0u,
+                private_write_attempted ? 1u : 0u,
+                attempt_index,
+                (ULONG)ps_status,
+                tctx_diag::ntstatus_text(ps_status),
+                selected_source,
+                (unsigned long long)ctx->Rip,
+                (unsigned long long)ctx->Rsp,
+                (unsigned long long)ctx->EFlags,
+                (unsigned long long)ctx->Dr0,
+                (unsigned long long)ctx->Dr1,
+                (unsigned long long)ctx->Dr2,
+                (unsigned long long)ctx->Dr3,
+                (unsigned long long)ctx->Dr6,
+                (unsigned long long)ctx->Dr7,
+                (ULONG)previous_mode,
+                (ULONG)previous_mode,
+                dbg_guard::elapsed_ms(phase_start, phase_freq));
+            return private_user_write_available ? status : STATUS_PROCEDURE_NOT_FOUND;
         }
 
         for (ULONG route = 0; route < sizeof(attempts) / sizeof(attempts[0]); ++route) {
@@ -1057,41 +1126,44 @@ namespace trapframe_ctx {
     }
 
     NTSTATUS get_context(PEPROCESS process, PETHREAD thread, HANDLE thread_handle, p_thread_ctx request, PCONTEXT ctx) {
-        NTSTATUS status = read_native_context(process, thread, thread_handle, ctx, request, "get");
+        NTSTATUS status = read_native_context(process, thread, thread_handle, ctx, request, "get", FALSE);
         if (NT_SUCCESS(status)) {
             copy_context_to_request(*ctx, request);
         }
         return status;
     }
 
-    NTSTATUS set_context(PEPROCESS process, PETHREAD thread, HANDLE thread_handle, p_thread_ctx request, PCONTEXT ctx) {
+    NTSTATUS set_context(PEPROCESS process, PETHREAD thread, HANDLE thread_handle, p_thread_ctx request, PCONTEXT ctx, BOOLEAN private_user_only) {
         const BOOLEAN needs_debug = tctx_diag::debug_registers_requested(request->register_mask);
-        NTSTATUS status = read_native_context(process, thread, thread_handle, ctx, request, "set_base");
+        NTSTATUS status = read_native_context(process, thread, thread_handle, ctx, request, "set_base", private_user_only);
         if (!NT_SUCCESS(status)) {
-            WW_LOG("TCTX set base_read_failed status=0x%08X pid=%u tid=%u mask=0x%llX",
+            WW_LOG("TCTX set base_read_failed status=0x%08X pid=%u tid=%u mask=0x%llX private_user_only=%u",
                 (ULONG)status,
                 request ? request->pid : 0,
                 request ? request->tid : 0,
-                request ? (unsigned long long)request->register_mask : 0ULL);
+                request ? (unsigned long long)request->register_mask : 0ULL,
+                private_user_only ? 1u : 0u);
             return status;
         }
         if (needs_debug && ((ctx->ContextFlags & CONTEXT_DEBUG_REGISTERS) == 0)) {
-            WW_LOG("TCTX set base_read_rejected_no_debug pid=%u tid=%u mask=0x%llX flags=0x%08X",
+            WW_LOG("TCTX set base_read_rejected_no_debug pid=%u tid=%u mask=0x%llX flags=0x%08X private_user_only=%u",
                 request->pid,
                 request->tid,
                 (unsigned long long)request->register_mask,
-                ctx->ContextFlags);
+                ctx->ContextFlags,
+                private_user_only ? 1u : 0u);
             return STATUS_INVALID_DEVICE_STATE;
         }
 
         apply_request_to_context(request, ctx);
         ctx->ContextFlags = needs_debug ? tctx_diag::kContextDebugFlags : tctx_diag::kContextBaseFlags;
-        WW_LOG("TCTX set applied pid=%u tid=%u mask=0x%llX flags=0x%08X needs_debug=%u rip=0x%llX rsp=0x%llX rflags=0x%llX dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX",
+        WW_LOG("TCTX set applied pid=%u tid=%u mask=0x%llX flags=0x%08X needs_debug=%u private_user_only=%u rip=0x%llX rsp=0x%llX rflags=0x%llX dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX",
             request->pid,
             request->tid,
             (unsigned long long)request->register_mask,
             ctx->ContextFlags,
             needs_debug ? 1u : 0u,
+            private_user_only ? 1u : 0u,
             (unsigned long long)ctx->Rip,
             (unsigned long long)ctx->Rsp,
             (unsigned long long)ctx->EFlags,
@@ -1101,7 +1173,7 @@ namespace trapframe_ctx {
             (unsigned long long)ctx->Dr3,
             (unsigned long long)ctx->Dr6,
             (unsigned long long)ctx->Dr7);
-        return write_native_context(process, thread, thread_handle, ctx, request);
+        return write_native_context(process, thread, thread_handle, ctx, request, private_user_only);
     }
 }
 
@@ -1371,7 +1443,7 @@ namespace tctx_system_route {
                         work->context_status = tctx_diag::core_registers_present(work->ctx) ? STATUS_INVALID_ADDRESS : STATUS_UNSUCCESSFUL;
                     }
                 } else {
-                    work->context_status = trapframe_ctx::set_context(work->process, work->thread, work->thread_handle, &work->output, &work->ctx);
+                    work->context_status = trapframe_ctx::set_context(work->process, work->thread, work->thread_handle, &work->output, &work->ctx, FALSE);
                     work->result_valid = NT_SUCCESS(work->context_status);
                 }
 
@@ -1866,10 +1938,43 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
 
     dbg_guard::timing_scatter();
 
+    const BOOLEAN private_get_context_available = ssdt_resolver::resolve_user_context();
+    const BOOLEAN private_set_context_available = request->should_set != 0 ? ssdt_resolver::resolve_user_set_context() : FALSE;
+    const BOOLEAN private_set_context_fast_path =
+        request->should_set != 0 &&
+        private_get_context_available &&
+        private_set_context_available;
+    const BOOLEAN private_set_without_suspend =
+        private_set_context_fast_path &&
+        previous_mode != KernelMode;
     const BOOLEAN private_context_fast_path =
         request->should_set != 0 ?
-        ssdt_resolver::resolve_user_set_context() :
-        ssdt_resolver::resolve_user_context();
+        private_set_context_fast_path :
+        private_get_context_available;
+    const BOOLEAN ps_suspend_available = (_PsSuspendThread && (_PsResumeThread || _ZwResumeThread || ssdt_resolver::g_NtResumeThread)) ? TRUE : FALSE;
+    const BOOLEAN nt_suspend_available = (_ZwSuspendThread || ssdt_resolver::g_NtSuspendThread) ? TRUE : FALSE;
+    WW_LOG("TCTX route_decision phase=pre_suspend pid=%u tid=%u set=%u mask=0x%llX dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX previous_mode=%u requestor_mode=%u private_get_available=%u private_set_available=%u private_set_without_suspend=%u private_context_fast_path=%u ps_suspend_available=%u nt_suspend_available=%u ctx_thread_suspended=0 private_write_route_attempted=0 private_write_status=0x%08X private_write_status_text=%s elapsed_ms=%llu",
+        request->pid,
+        request->tid,
+        request->should_set,
+        (unsigned long long)request->register_mask,
+        (unsigned long long)request->dr0,
+        (unsigned long long)request->dr1,
+        (unsigned long long)request->dr2,
+        (unsigned long long)request->dr3,
+        (unsigned long long)request->dr6,
+        (unsigned long long)request->dr7,
+        (ULONG)previous_mode,
+        (ULONG)previous_mode,
+        private_get_context_available ? 1u : 0u,
+        private_set_context_available ? 1u : 0u,
+        private_set_without_suspend ? 1u : 0u,
+        private_context_fast_path ? 1u : 0u,
+        ps_suspend_available ? 1u : 0u,
+        nt_suspend_available ? 1u : 0u,
+        (ULONG)STATUS_NOT_FOUND,
+        tctx_diag::ntstatus_text(STATUS_NOT_FOUND),
+        dbg_guard::elapsed_ms(tctx_start, tctx_freq));
     if (previous_mode != KernelMode && !private_context_fast_path) {
         NTSTATUS system_status = tctx_system_route::run(
             process,
@@ -1925,11 +2030,14 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
             dbg_guard::elapsed_ms(tctx_start, tctx_freq));
     }
     else if (previous_mode != KernelMode) {
-        WW_LOG("TCTX system_route_bypass route=inline_private pid=%u tid=%u set=%u private_context_fast_path=%u previous_mode=%u requestor_mode=%u elapsed_ms=%llu",
+        WW_LOG("TCTX system_route_bypass route=inline_private pid=%u tid=%u set=%u private_context_fast_path=%u private_get_available=%u private_set_available=%u private_set_without_suspend=%u previous_mode=%u requestor_mode=%u elapsed_ms=%llu",
             request->pid,
             request->tid,
             request->should_set,
             private_context_fast_path ? 1u : 0u,
+            private_get_context_available ? 1u : 0u,
+            private_set_context_available ? 1u : 0u,
+            private_set_without_suspend ? 1u : 0u,
             (ULONG)previous_mode,
             (ULONG)previous_mode,
             dbg_guard::elapsed_ms(tctx_start, tctx_freq));
@@ -1952,7 +2060,26 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
     const char* suspend_strategy = "none";
     const char* suspend_constraint = "none";
 
-    if (_ObOpenObjectByPointer && _ZwClose && thread_type) {
+    if (private_set_without_suspend) {
+        open_status = STATUS_SUCCESS;
+        suspend_status = STATUS_SUCCESS;
+        open_strategy = "private_internal_direct";
+        suspend_strategy = "private_internal_no_suspend";
+        suspend_constraint = "validated_private_context_route";
+        WW_LOG("TCTX suspend_bypass_private_set pid=%u tid=%u mask=0x%llX previous_mode=%u requestor_mode=%u private_get_available=%u private_set_available=%u ps_suspend_available=%u nt_suspend_available=%u ctx_thread_suspended=0 private_write_route_attempted=0 private_write_status=0x%08X private_write_status_text=%s elapsed_ms=%llu",
+            request->pid,
+            request->tid,
+            (unsigned long long)request->register_mask,
+            (ULONG)previous_mode,
+            (ULONG)previous_mode,
+            private_get_context_available ? 1u : 0u,
+            private_set_context_available ? 1u : 0u,
+            ps_suspend_available ? 1u : 0u,
+            nt_suspend_available ? 1u : 0u,
+            (ULONG)STATUS_NOT_FOUND,
+            tctx_diag::ntstatus_text(STATUS_NOT_FOUND),
+            dbg_guard::elapsed_ms(tctx_start, tctx_freq));
+    } else if (_ObOpenObjectByPointer && _ZwClose && thread_type) {
         open_strategy = "obopen_thread_object";
         ACCESS_MASK desired_access = THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT;
         if (request->should_set != 0) {
@@ -2069,7 +2196,7 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
         open_strategy = "missing_open_primitives";
     }
 
-    if (!ctx_thread_suspended && !tried_ps_suspend && _PsSuspendThread && _PsResumeThread) {
+    if (!private_set_without_suspend && !ctx_thread_suspended && !tried_ps_suspend && _PsSuspendThread && _PsResumeThread) {
         suspend_prev_count = 0;
         tried_ps_suspend = TRUE;
         __try {
@@ -2093,15 +2220,19 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
         }
     }
 
-    const UINT32 open_import_absent = (!_ObOpenObjectByPointer || !_ZwClose || !thread_type) ? 1u : 0u;
-    const UINT32 suspend_import_absent = (!_PsSuspendThread && !_ZwSuspendThread && !ssdt_resolver::g_NtSuspendThread && !suspend_nt_user_previous_mode_skipped) ? 1u : 0u;
-    const UINT32 suspend_call_failed = (!ctx_thread_suspended && !suspend_import_absent &&
+    const UINT32 open_import_absent = (!private_set_without_suspend && (!_ObOpenObjectByPointer || !_ZwClose || !thread_type)) ? 1u : 0u;
+    const UINT32 suspend_import_absent = (!private_set_without_suspend && !_PsSuspendThread && !_ZwSuspendThread && !ssdt_resolver::g_NtSuspendThread && !suspend_nt_user_previous_mode_skipped) ? 1u : 0u;
+    const UINT32 suspend_call_failed = (!private_set_without_suspend && !ctx_thread_suspended && !suspend_import_absent &&
         (tried_ps_suspend || ctx_thread_handle != nullptr || suspend_nt_user_previous_mode_skipped)) ? 1u : 0u;
     tctx_diag::thread_snapshot_t thread_after_suspend = tctx_diag::query_thread_snapshot(request->pid, request->tid);
-    WW_LOG("TCTX suspend_summary pid=%u tid=%u set=%u open_strategy=%s suspend_strategy=%s suspend_constraint=%s suspended=%u via_ps=%u tried_ps_suspend=%u open_status=0x%08X open_status_text=%s suspend_status=0x%08X suspend_status_text=%s open_import_absent=%u suspend_import_absent=%u suspend_call_failed=%u nt_user_previous_mode_skipped=%u ps_exception=%u ps_exception_code=0x%08X nt_exception=%u nt_exception_code=0x%08X handle=%p thread_found=%u thread_status=0x%08X thread_status_text=%s thread_state=%lu wait_reason=%lu elapsed_ms=%llu",
+    WW_LOG("TCTX suspend_summary pid=%u tid=%u set=%u mask=0x%llX private_set_without_suspend=%u private_get_available=%u private_set_available=%u open_strategy=%s suspend_strategy=%s suspend_constraint=%s suspended=%u via_ps=%u tried_ps_suspend=%u open_status=0x%08X open_status_text=%s suspend_status=0x%08X suspend_status_text=%s open_import_absent=%u suspend_import_absent=%u suspend_call_failed=%u nt_user_previous_mode_skipped=%u ps_exception=%u ps_exception_code=0x%08X nt_exception=%u nt_exception_code=0x%08X handle=%p thread_found=%u thread_status=0x%08X thread_status_text=%s thread_state=%lu wait_reason=%lu elapsed_ms=%llu",
         request->pid,
         request->tid,
         request->should_set,
+        (unsigned long long)request->register_mask,
+        private_set_without_suspend ? 1u : 0u,
+        private_get_context_available ? 1u : 0u,
+        private_set_context_available ? 1u : 0u,
         open_strategy,
         suspend_strategy,
         suspend_constraint,
@@ -2128,8 +2259,8 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
         thread_after_suspend.wait_reason,
         dbg_guard::elapsed_ms(tctx_start, tctx_freq));
 
-    if (!ctx_thread_suspended && request->should_set != 0) {
-        WW_LOG("TCTX reject suspend_failed pid=%u tid=%u open_status=0x%08X open_status_text=%s suspend_status=0x%08X suspend_status_text=%s handle=%p ps_suspend=%p zw_suspend=%p suspend_import_absent=%u suspend_call_failed=%u nt_user_previous_mode_skipped=%u suspend_constraint=%s",
+    if (!ctx_thread_suspended && request->should_set != 0 && !private_set_without_suspend) {
+        WW_LOG("TCTX reject suspend_failed pid=%u tid=%u open_status=0x%08X open_status_text=%s suspend_status=0x%08X suspend_status_text=%s handle=%p ps_suspend=%p zw_suspend=%p suspend_import_absent=%u suspend_call_failed=%u nt_user_previous_mode_skipped=%u suspend_constraint=%s private_get_available=%u private_set_available=%u",
             request->pid,
             request->tid,
             (ULONG)open_status,
@@ -2142,7 +2273,9 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
             suspend_import_absent,
             suspend_call_failed,
             suspend_nt_user_previous_mode_skipped ? 1u : 0u,
-            suspend_constraint);
+            suspend_constraint,
+            private_get_context_available ? 1u : 0u,
+            private_set_context_available ? 1u : 0u);
         if (ctx_thread_handle) {
             _ZwClose(ctx_thread_handle);
         }
@@ -2150,7 +2283,27 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
         _ObfDereferenceObject(process);
         return STATUS_INVALID_DEVICE_STATE;
     }
-    if (!ctx_thread_suspended) {
+    if (!ctx_thread_suspended && private_set_without_suspend) {
+        WW_LOG("TCTX set_private_without_suspend pid=%u tid=%u mask=0x%llX dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX private_get_available=%u private_set_available=%u open_status=0x%08X open_status_text=%s suspend_status=0x%08X suspend_status_text=%s private_write_route_attempted=0 private_write_status=0x%08X private_write_status_text=%s elapsed_ms=%llu",
+            request->pid,
+            request->tid,
+            (unsigned long long)request->register_mask,
+            (unsigned long long)request->dr0,
+            (unsigned long long)request->dr1,
+            (unsigned long long)request->dr2,
+            (unsigned long long)request->dr3,
+            (unsigned long long)request->dr6,
+            (unsigned long long)request->dr7,
+            private_get_context_available ? 1u : 0u,
+            private_set_context_available ? 1u : 0u,
+            (ULONG)open_status,
+            tctx_diag::ntstatus_text(open_status),
+            (ULONG)suspend_status,
+            tctx_diag::ntstatus_text(suspend_status),
+            (ULONG)STATUS_NOT_FOUND,
+            tctx_diag::ntstatus_text(STATUS_NOT_FOUND),
+            dbg_guard::elapsed_ms(tctx_start, tctx_freq));
+    } else if (!ctx_thread_suspended) {
         WW_LOG("TCTX read_without_suspend pid=%u tid=%u open_status=0x%08X open_status_text=%s suspend_status=0x%08X suspend_status_text=%s handle=%p ps_get=%p zw_get=%p suspend_import_absent=%u suspend_call_failed=%u nt_user_previous_mode_skipped=%u suspend_constraint=%s",
             request->pid,
             request->tid,
@@ -2187,10 +2340,14 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
     strong::kmemset(&ctx, 0, sizeof(ctx));
 
     ULONGLONG context_start_ms = dbg_guard::elapsed_ms(tctx_start, tctx_freq);
-    WW_LOG("TCTX context_begin pid=%u tid=%u set=%u handle=%p open_strategy=%s suspend_strategy=%s suspend_constraint=%s suspended=%u via_ps=%u open_status=0x%08X open_status_text=%s suspend_status=0x%08X suspend_status_text=%s previous_mode=%u requestor_mode=%u attach_available=%u open_import_absent=%u suspend_import_absent=%u suspend_call_failed=%u nt_user_previous_mode_skipped=%u elapsed_ms=%llu",
+    WW_LOG("TCTX context_begin pid=%u tid=%u set=%u mask=0x%llX private_set_without_suspend=%u private_get_available=%u private_set_available=%u handle=%p open_strategy=%s suspend_strategy=%s suspend_constraint=%s suspended=%u via_ps=%u open_status=0x%08X open_status_text=%s suspend_status=0x%08X suspend_status_text=%s previous_mode=%u requestor_mode=%u attach_available=%u open_import_absent=%u suspend_import_absent=%u suspend_call_failed=%u nt_user_previous_mode_skipped=%u elapsed_ms=%llu",
         request->pid,
         request->tid,
         request->should_set,
+        (unsigned long long)request->register_mask,
+        private_set_without_suspend ? 1u : 0u,
+        private_get_context_available ? 1u : 0u,
+        private_set_context_available ? 1u : 0u,
         ctx_thread_handle,
         open_strategy,
         suspend_strategy,
@@ -2214,13 +2371,14 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
         status = trapframe_ctx::get_context(process, thread, ctx_thread_handle, request, &ctx);
     }
     else {
-        status = trapframe_ctx::set_context(process, thread, ctx_thread_handle, request, &ctx);
+        status = trapframe_ctx::set_context(process, thread, ctx_thread_handle, request, &ctx, private_set_without_suspend);
     }
 
-    WW_LOG("TCTX context_end pid=%u tid=%u set=%u status=0x%08X status_text=%s rip=0x%llX rsp=0x%llX rflags=0x%llX dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX flags=0x%08X elapsed_ms=%llu",
+    WW_LOG("TCTX context_end pid=%u tid=%u set=%u private_set_without_suspend=%u status=0x%08X status_text=%s rip=0x%llX rsp=0x%llX rflags=0x%llX dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX flags=0x%08X elapsed_ms=%llu",
         request->pid,
         request->tid,
         request->should_set,
+        private_set_without_suspend ? 1u : 0u,
         (ULONG)status,
         tctx_diag::ntstatus_text(status),
         (unsigned long long)request->rip,
@@ -2326,10 +2484,13 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
     }
 
     tctx_diag::thread_snapshot_t thread_after = tctx_diag::query_thread_snapshot(request->pid, request->tid);
-    WW_LOG("TCTX exit pid=%u tid=%u set=%u status=0x%08X status_text=%s open_status=0x%08X open_status_text=%s suspend_status=0x%08X suspend_status_text=%s open_strategy=%s suspend_strategy=%s suspend_constraint=%s suspended=%u via_ps=%u open_import_absent=%u suspend_import_absent=%u suspend_call_failed=%u nt_user_previous_mode_skipped=%u ps_exception=%u ps_exception_code=0x%08X nt_exception=%u nt_exception_code=0x%08X previous_mode=%u requestor_mode=%u thread_after_found=%u thread_after_status=0x%08X thread_after_status_text=%s thread_after_state=%lu thread_after_wait_reason=%lu rip=0x%llX rip_class=%s rsp=0x%llX rsp_class=%s rflags=0x%llX user_sane=%u dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX elapsed_ms=%llu",
+    WW_LOG("TCTX exit pid=%u tid=%u set=%u private_set_without_suspend=%u private_get_available=%u private_set_available=%u status=0x%08X status_text=%s open_status=0x%08X open_status_text=%s suspend_status=0x%08X suspend_status_text=%s open_strategy=%s suspend_strategy=%s suspend_constraint=%s suspended=%u via_ps=%u open_import_absent=%u suspend_import_absent=%u suspend_call_failed=%u nt_user_previous_mode_skipped=%u ps_exception=%u ps_exception_code=0x%08X nt_exception=%u nt_exception_code=0x%08X previous_mode=%u requestor_mode=%u thread_after_found=%u thread_after_status=0x%08X thread_after_status_text=%s thread_after_state=%lu thread_after_wait_reason=%lu rip=0x%llX rip_class=%s rsp=0x%llX rsp_class=%s rflags=0x%llX user_sane=%u dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX elapsed_ms=%llu",
         request->pid,
         request->tid,
         request->should_set,
+        private_set_without_suspend ? 1u : 0u,
+        private_get_context_available ? 1u : 0u,
+        private_set_context_available ? 1u : 0u,
         (ULONG)status,
         tctx_diag::ntstatus_text(status),
         (ULONG)open_status,

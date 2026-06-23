@@ -1192,8 +1192,52 @@ static tool_result_t handle_find_what_accesses(const json& params) {
 	const uint64_t guard_end = (end + page_size - 1) & ~(page_size - 1);
 	const uint64_t guard_size = std::max<uint64_t>(page_size, guard_end - page_base);
 	const ULONGLONG started_tick = GetTickCount64();
+	auto cancel_reason = []() -> const char* {
+		if (mcp_standalone::current_call_cancelled())
+			return "mcp_cancelled";
+		const std::uint64_t deadline = mcp_standalone::current_call_deadline_ms();
+		if (deadline != 0 && GetTickCount64() >= deadline)
+			return "mcp_deadline";
+		return nullptr;
+	};
+	auto log_cancel = [&](const char* phase, const char* reason, uint32_t sid = 0) {
+		const ULONGLONG now = GetTickCount64();
+		const std::uint64_t deadline = mcp_standalone::current_call_deadline_ms();
+		const std::uint64_t remaining = deadline != 0 && now < deadline ? deadline - now : 0;
+		diag::log_tagged_fmt("scanner",
+			"find_what_accesses cancel phase=%s reason=%s sid=%u pid=%u active_pid=%u cancelled=%d deadline_ms=%llu deadline_remaining_ms=%llu elapsed_ms=%llu diag_id=%s",
+			phase ? phase : "",
+			reason ? reason : "",
+			sid,
+			pid,
+			driver_bridge::attached_pid(),
+			mcp_standalone::current_call_cancelled() ? 1 : 0,
+			static_cast<unsigned long long>(deadline),
+			static_cast<unsigned long long>(remaining),
+			static_cast<unsigned long long>(now - started_tick),
+			mcp_standalone::current_call_diag_id());
+	};
+	auto cancelled_result = [&](const char* phase, const char* reason, uint32_t sid, bool cleanup_attempted, bool cleanup_ok, size_t capture_count) -> tool_result_t {
+		json result;
+		result["address"] = sa_format_address(*address);
+		result["size"] = size;
+		result["type"] = type;
+		result["pid"] = pid;
+		result["session_id"] = sid;
+		result["guard_base"] = sa_format_address(page_base);
+		result["guard_size"] = guard_size;
+		result["wait_ms"] = wait_ms;
+		result["cancelled"] = true;
+		result["cancel_reason"] = reason ? reason : "cancelled";
+		result["cancel_phase"] = phase ? phase : "";
+		result["cleanup_attempted"] = cleanup_attempted;
+		result["cleanup_ok"] = cleanup_ok;
+		result["page_guard_captures"] = capture_count;
+		result["elapsed_ms"] = static_cast<unsigned long long>(GetTickCount64() - started_tick);
+		return tool_result_t::error(OBFSTR("find_what_accesses cancelled before completion."), "cancelled", result);
+	};
 	diag::log_tagged_fmt("scanner",
-		"find_what_accesses entry pid=%u address=0x%llX size=0x%llX type=%s wait_ms=%d limit=%zu page_base=0x%llX guard_size=0x%llX attached=%u",
+		"find_what_accesses entry pid=%u address=0x%llX size=0x%llX type=%s wait_ms=%d limit=%zu page_base=0x%llX guard_size=0x%llX attached=%u cancelled=%d deadline_ms=%llu diag_id=%s",
 		pid,
 		static_cast<unsigned long long>(*address),
 		static_cast<unsigned long long>(size),
@@ -1202,7 +1246,14 @@ static tool_result_t handle_find_what_accesses(const json& params) {
 		limit,
 		static_cast<unsigned long long>(page_base),
 		static_cast<unsigned long long>(guard_size),
-		driver_bridge::attached_pid());
+		driver_bridge::attached_pid(),
+		mcp_standalone::current_call_cancelled() ? 1 : 0,
+		static_cast<unsigned long long>(mcp_standalone::current_call_deadline_ms()),
+		mcp_standalone::current_call_diag_id());
+	if (const char* reason = cancel_reason()) {
+		log_cancel("entry", reason);
+		return cancelled_result("entry", reason, 0, false, false, 0);
+	}
 	std::vector<uint8_t> polling_last;
 	std::vector<uint8_t> polling_current;
 	bool polling_delta_seen = false;
@@ -1252,6 +1303,10 @@ static tool_result_t handle_find_what_accesses(const json& params) {
 		static_cast<unsigned long long>(guard_size),
 		max_records_per_drain,
 		static_cast<unsigned long long>(GetTickCount64() - started_tick));
+	if (const char* reason = cancel_reason()) {
+		log_cancel("before_install", reason);
+		return cancelled_result("before_install", reason, 0, false, false, 0);
+	}
 	uint32_t sid = page_guard_engine::g_pg_engine.install(pid, page_base, guard_size, true, max_records_per_drain);
 	if (sid == 0) {
 		diag::log_tagged_fmt("scanner",
@@ -1267,6 +1322,16 @@ static tool_result_t handle_find_what_accesses(const json& params) {
 		pid,
 		max_records_per_drain,
 		static_cast<unsigned long long>(GetTickCount64() - started_tick));
+	if (const char* reason = cancel_reason()) {
+		log_cancel("after_install", reason, sid);
+		const bool cleanup_ok = page_guard_engine::g_pg_engine.uninstall(sid);
+		diag::log_tagged_fmt("scanner",
+			"find_what_accesses cancel_cleanup phase=after_install sid=%u cleanup_ok=%d elapsed_ms=%llu",
+			sid,
+			cleanup_ok ? 1 : 0,
+			static_cast<unsigned long long>(GetTickCount64() - started_tick));
+		return cancelled_result("after_install", reason, sid, true, cleanup_ok, 0);
+	}
 	const size_t payload_budget = std::min<size_t>(256, std::max<size_t>(limit * 4, 16));
 	const bool payload_budget_set = page_guard_engine::g_pg_engine.set_payload_budget(sid, payload_budget);
 	diag::log_tagged_fmt("scanner",
@@ -1296,12 +1361,22 @@ static tool_result_t handle_find_what_accesses(const json& params) {
 	const auto deadline = started + std::chrono::milliseconds(wait_ms);
 	uint32_t iterations = 0;
 	size_t drained_batches = 0;
+	bool cancelled = false;
+	const char* cancelled_phase = "";
+	const char* cancelled_reason = "";
 	diag::log_tagged_fmt("scanner",
 		"find_what_accesses loop_begin sid=%u wait_ms=%d elapsed_ms=%llu",
 		sid,
 		wait_ms,
 		static_cast<unsigned long long>(GetTickCount64() - started_tick));
 	do {
+		if (const char* reason = cancel_reason()) {
+			cancelled = true;
+			cancelled_phase = "loop_before_drain";
+			cancelled_reason = reason;
+			log_cancel(cancelled_phase, reason, sid);
+			break;
+		}
 		auto batch = page_guard_engine::g_pg_engine.get_capture_records(sid);
 		++iterations;
 		drained_batches += batch.size();
@@ -1322,26 +1397,48 @@ static tool_result_t handle_find_what_accesses(const json& params) {
 				static_cast<unsigned long long>(GetTickCount64() - started_tick));
 		}
 		sample_polling_delta();
+		if (const char* reason = cancel_reason()) {
+			cancelled = true;
+			cancelled_phase = "loop_after_sample";
+			cancelled_reason = reason;
+			log_cancel(cancelled_phase, reason, sid);
+			break;
+		}
 		if (have_match && captures.size() >= limit)
 			break;
 		if (wait_ms == 0 || std::chrono::steady_clock::now() >= deadline)
 			break;
-		std::this_thread::sleep_for(std::chrono::milliseconds(25));
+		int sleep_ms = 25;
+		const std::uint64_t mcp_deadline = mcp_standalone::current_call_deadline_ms();
+		const ULONGLONG now_tick = GetTickCount64();
+		if (mcp_deadline != 0 && now_tick < mcp_deadline)
+			sleep_ms = static_cast<int>(std::min<std::uint64_t>(25, mcp_deadline - now_tick));
+		if (sleep_ms > 0)
+			std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
 	} while (true);
 	diag::log_tagged_fmt("scanner",
-		"find_what_accesses loop_end sid=%u iterations=%u drained=%zu total=%zu match=%d polling_delta=%d elapsed_ms=%llu",
+		"find_what_accesses loop_end sid=%u iterations=%u drained=%zu total=%zu match=%d polling_delta=%d cancelled=%d cancel_reason=%s elapsed_ms=%llu",
 		sid,
 		iterations,
 		drained_batches,
 		captures.size(),
 		have_match ? 1 : 0,
 		polling_delta_seen ? 1 : 0,
+		cancelled ? 1 : 0,
+		cancelled_reason ? cancelled_reason : "",
 		static_cast<unsigned long long>(GetTickCount64() - started_tick));
 	diag::log_tagged_fmt("scanner",
 		"find_what_accesses tail_begin sid=%u elapsed_ms=%llu",
 		sid,
 		static_cast<unsigned long long>(GetTickCount64() - started_tick));
-	if (!have_match || captures.size() < limit) {
+	if (cancelled) {
+		diag::log_tagged_fmt("scanner",
+			"find_what_accesses tail_skipped sid=%u reason=cancelled phase=%s total=%zu elapsed_ms=%llu",
+			sid,
+			cancelled_phase ? cancelled_phase : "",
+			captures.size(),
+			static_cast<unsigned long long>(GetTickCount64() - started_tick));
+	} else if (!have_match || captures.size() < limit) {
 		auto tail = page_guard_engine::g_pg_engine.get_capture_records(sid);
 		for (auto& c : tail) {
 			if (capture_matches(c))
@@ -1378,6 +1475,8 @@ static tool_result_t handle_find_what_accesses(const json& params) {
 		sid,
 		uninstalled ? 1 : 0,
 		static_cast<unsigned long long>(GetTickCount64() - started_tick));
+	if (cancelled)
+		return cancelled_result(cancelled_phase, cancelled_reason, sid, true, uninstalled, captures.size());
 	json arr = json::array();
 	for (const auto& c : captures) {
 		if (arr.size() >= limit)

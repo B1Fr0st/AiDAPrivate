@@ -158,6 +158,9 @@ struct managed_session_t
 
 void clear_privacy_locked();
 void clear_privacy_locked(managed_session_t& session);
+int json_int_or(const nlohmann::json& j, const char* key, int fallback);
+std::string json_string_or(const nlohmann::json& j, const char* key, const std::string& fallback);
+bool json_bool_or(const nlohmann::json& j, const char* key, bool fallback);
 
 std::recursive_mutex& sessions_mtx()
 {
@@ -3974,7 +3977,28 @@ call_result_t call_with_deadline(const std::string& tool_name, const nlohmann::j
     }
 
     const uint64_t t0 = now_ms();
+    const bool navigation_call = tool_name == "navigate";
+    const std::string navigation_page_id = navigation_call ? json_string_or(call_args, "page_id", std::string()) : std::string();
+    const std::string navigation_wait_until = navigation_call ? json_string_or(call_args, "wait_until", std::string()) : std::string();
+    const std::string navigation_url = navigation_call ? json_string_or(call_args, "url", std::string()) : std::string();
+    const url_log_t navigation_url_log = navigation_call ? summarize_url_for_log(navigation_url) : url_log_t{};
     sg().total_calls.fetch_add(1, std::memory_order_relaxed);
+    if (navigation_call)
+    {
+        diag::log_tagged_fmt("camoufox", "navigate call_with_deadline phase=before_dispatch request_id=%llu page_id=%s host=%s path=%s query=%d fragment=%d url_len=%zu wait_until=%s timeout_ms=%d generation=%llu child_pid=%lu args_shape=%s",
+            static_cast<unsigned long long>(request_id),
+            navigation_page_id.empty() ? "<empty>" : navigation_page_id.c_str(),
+            navigation_url_log.host.c_str(),
+            navigation_url_log.path.c_str(),
+            navigation_url_log.has_query ? 1 : 0,
+            navigation_url_log.has_fragment ? 1 : 0,
+            navigation_url_log.length,
+            navigation_wait_until.empty() ? "<empty>" : navigation_wait_until.c_str(),
+            timeout_ms,
+            static_cast<unsigned long long>(state->generation),
+            static_cast<unsigned long>(state->child_pid),
+            json_shape(call_args).c_str());
+    }
     diag::log_tagged_fmt("camoufox", "call_with_deadline phase=dispatch request_id=%llu tool=%s timeout_ms=%d generation=%llu child_pid=%lu args_shape=%s",
         static_cast<unsigned long long>(request_id), tool_name.c_str(), timeout_ms, static_cast<unsigned long long>(state->generation),
         static_cast<unsigned long>(state->child_pid), json_shape(call_args).c_str());
@@ -3990,6 +4014,21 @@ call_result_t call_with_deadline(const std::string& tool_name, const nlohmann::j
         diag::log_tagged_fmt("camoufox", "call_worker phase=enter request_id=%llu tool=%s generation=%llu child_pid=%lu",
             static_cast<unsigned long long>(request_id), tool_name.c_str(), static_cast<unsigned long long>(state->generation),
             static_cast<unsigned long>(state->child_pid));
+        if (tool_name == "navigate")
+        {
+            const std::string worker_page_id = json_string_or(call_args, "page_id", std::string());
+            const std::string worker_wait_until = json_string_or(call_args, "wait_until", std::string());
+            const url_log_t worker_url = summarize_url_for_log(json_string_or(call_args, "url", std::string()));
+            diag::log_tagged_fmt("camoufox", "navigate call_worker phase=before_call_tool request_id=%llu page_id=%s host=%s path=%s query=%d wait_until=%s generation=%llu child_pid=%lu",
+                static_cast<unsigned long long>(request_id),
+                worker_page_id.empty() ? "<empty>" : worker_page_id.c_str(),
+                worker_url.host.c_str(),
+                worker_url.path.c_str(),
+                worker_url.has_query ? 1 : 0,
+                worker_wait_until.empty() ? "<empty>" : worker_wait_until.c_str(),
+                static_cast<unsigned long long>(state->generation),
+                static_cast<unsigned long>(state->child_pid));
+        }
         DWORD guard_status = guarded_mcp_call(&call_ctx);
         if (guard_status != ERROR_SUCCESS)
         {
@@ -4000,9 +4039,40 @@ call_result_t call_with_deadline(const std::string& tool_name, const nlohmann::j
                 static_cast<int>(call_ctx.native_exception), static_cast<int>(call_ctx.cpp_exception),
                 static_cast<unsigned long long>(now_ms() - worker_start), r.text.c_str());
         }
+        if (tool_name == "navigate")
+        {
+            const std::string worker_page_id = json_string_or(call_args, "page_id", std::string());
+            const std::string worker_wait_until = json_string_or(call_args, "wait_until", std::string());
+            const int response_status = json_int_or(r.data, "final_status", json_int_or(r.data, "initial_status", json_int_or(r.data, "status", json_int_or(r.data, "response_status", -1))));
+            const bool navigation_timed_out = json_bool_or(r.data, "navigation_timed_out", false) || json_bool_or(r.data, "timed_out", false);
+            const url_log_t response_url = summarize_url_for_log(json_string_or(r.data, "url", json_string_or(r.data, "final_url", json_string_or(r.data, "active_url", std::string()))));
+            diag::log_tagged_fmt("camoufox", "navigate call_worker phase=after_call_tool request_id=%llu page_id=%s wait_until=%s success=%d response_status=%d navigation_timed_out=%d response_host=%s response_path=%s response_query=%d response_url_len=%zu text_len=%zu data_shape=%s elapsed_ms=%llu",
+                static_cast<unsigned long long>(request_id),
+                worker_page_id.empty() ? "<empty>" : worker_page_id.c_str(),
+                worker_wait_until.empty() ? "<empty>" : worker_wait_until.c_str(),
+                r.success ? 1 : 0,
+                response_status,
+                navigation_timed_out ? 1 : 0,
+                response_url.host.c_str(),
+                response_url.path.c_str(),
+                response_url.has_query ? 1 : 0,
+                response_url.length,
+                r.text.size(),
+                json_shape(r.data).c_str(),
+                static_cast<unsigned long long>(now_ms() - worker_start));
+        }
         diag::log_tagged_fmt("camoufox", "call_worker phase=exit request_id=%llu tool=%s success=%d text_len=%zu data_shape=%s elapsed_ms=%llu",
             static_cast<unsigned long long>(request_id), tool_name.c_str(), static_cast<int>(r.success),
             r.text.size(), json_shape(r.data).c_str(), static_cast<unsigned long long>(now_ms() - worker_start));
+        const bool late_navigation_call = tool_name == "navigate";
+        const int late_navigation_status = late_navigation_call
+            ? json_int_or(r.data, "final_status", json_int_or(r.data, "initial_status", json_int_or(r.data, "status", json_int_or(r.data, "response_status", -1))))
+            : -1;
+        const bool late_navigation_timed_out = late_navigation_call &&
+            (json_bool_or(r.data, "navigation_timed_out", false) || json_bool_or(r.data, "timed_out", false));
+        const url_log_t late_navigation_url = late_navigation_call
+            ? summarize_url_for_log(json_string_or(r.data, "url", json_string_or(r.data, "final_url", json_string_or(r.data, "active_url", std::string()))))
+            : url_log_t{};
         bool cancelled = false;
         uint64_t generation = 0;
         uint32_t child_pid = 0;
@@ -4020,6 +4090,22 @@ call_result_t call_with_deadline(const std::string& tool_name, const nlohmann::j
             diag::log_tagged_fmt("camoufox", "call_worker_late_result request_id=%llu tool=%s generation=%llu child_pid=%lu elapsed_ms=%llu",
                 static_cast<unsigned long long>(request_id), tool_name.c_str(), static_cast<unsigned long long>(generation), static_cast<unsigned long>(child_pid),
                 static_cast<unsigned long long>(now_ms() - worker_start));
+            if (late_navigation_call)
+            {
+                const std::string worker_page_id = json_string_or(call_args, "page_id", std::string());
+                const std::string worker_wait_until = json_string_or(call_args, "wait_until", std::string());
+                diag::log_tagged_fmt("camoufox", "navigate late_result phase=observed request_id=%llu page_id=%s wait_until=%s response_status=%d navigation_timed_out=%d response_host=%s response_path=%s response_query=%d response_url_len=%zu elapsed_ms=%llu",
+                    static_cast<unsigned long long>(request_id),
+                    worker_page_id.empty() ? "<empty>" : worker_page_id.c_str(),
+                    worker_wait_until.empty() ? "<empty>" : worker_wait_until.c_str(),
+                    late_navigation_status,
+                    late_navigation_timed_out ? 1 : 0,
+                    late_navigation_url.host.c_str(),
+                    late_navigation_url.path.c_str(),
+                    late_navigation_url.has_query ? 1 : 0,
+                    late_navigation_url.length,
+                    static_cast<unsigned long long>(now_ms() - worker_start));
+            }
             bool recovered = false;
             bool same_client = false;
             bool same_generation = false;
@@ -4085,6 +4171,26 @@ call_result_t call_with_deadline(const std::string& tool_name, const nlohmann::j
                 static_cast<unsigned>(child_processes), static_cast<unsigned>(browser_processes),
                 browser_open ? 1 : 0, page_verified ? 1 : 0, privacy_verified ? 1 : 0,
                 cleanup_pending ? 1 : 0, stop_requested ? 1 : 0, json_shape(r.data).c_str());
+            if (late_navigation_call)
+            {
+                const std::string worker_page_id = json_string_or(call_args, "page_id", std::string());
+                diag::log_tagged_fmt("camoufox", "navigate late_result phase=health request_id=%llu page_id=%s response_status=%d navigation_timed_out=%d recovered=%d same_client=%d same_generation=%d same_child_pid=%d child_alive=%d browser_processes=%u browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d stop_requested=%d",
+                    static_cast<unsigned long long>(request_id),
+                    worker_page_id.empty() ? "<empty>" : worker_page_id.c_str(),
+                    late_navigation_status,
+                    late_navigation_timed_out ? 1 : 0,
+                    recovered ? 1 : 0,
+                    same_client ? 1 : 0,
+                    same_generation ? 1 : 0,
+                    same_child_pid ? 1 : 0,
+                    child_alive ? 1 : 0,
+                    static_cast<unsigned>(browser_processes),
+                    browser_open ? 1 : 0,
+                    page_verified ? 1 : 0,
+                    privacy_verified ? 1 : 0,
+                    cleanup_pending ? 1 : 0,
+                    stop_requested ? 1 : 0);
+            }
             if (recovered)
                 publish_state(bridge_state_t::ready, {});
         }
@@ -4189,6 +4295,24 @@ call_result_t call_with_deadline(const std::string& tool_name, const nlohmann::j
             timeout_tree_after.size(),
             static_cast<unsigned>(browser_process_count_from_tree(timeout_tree_after)),
             timeout_tree_after.empty() ? "<empty>" : compact_process_tree(timeout_tree_after).c_str());
+        if (navigation_call)
+        {
+            diag::log_tagged_fmt("camoufox", "navigate call_with_deadline phase=timeout request_id=%llu page_id=%s host=%s path=%s query=%d wait_until=%s timeout_ms=%d retained_client=%d late_result_handling=%s cancelled_by_stop=%d generation=%llu child_pid=%lu browser_processes=%u child_processes=%zu",
+                static_cast<unsigned long long>(request_id),
+                navigation_page_id.empty() ? "<empty>" : navigation_page_id.c_str(),
+                navigation_url_log.host.c_str(),
+                navigation_url_log.path.c_str(),
+                navigation_url_log.has_query ? 1 : 0,
+                navigation_wait_until.empty() ? "<empty>" : navigation_wait_until.c_str(),
+                timeout_ms,
+                retained_timed_out_client ? 1 : 0,
+                retained_timed_out_client ? "retained_client_waiting_for_late_result" : "detached_client_no_late_recovery",
+                cancelled_by_stop ? 1 : 0,
+                static_cast<unsigned long long>(timed_out_generation),
+                static_cast<unsigned long>(timed_out_child_pid),
+                static_cast<unsigned>(browser_process_count_from_tree(timeout_tree_after)),
+                timeout_tree_after.size());
+        }
         publish_state(bridge_state_t::error, std::string(cancelled_by_stop ? "cancelled " : "timeout on ") + tool_name);
         sg().total_errors.fetch_add(1, std::memory_order_relaxed);
         fail.error = cancelled_by_stop
@@ -4213,6 +4337,16 @@ call_result_t call_with_deadline(const std::string& tool_name, const nlohmann::j
             {"process_tree", compact_process_tree(timeout_tree_after)},
             {"error", fail.error}
         };
+        if (navigation_call)
+        {
+            fail.data["page_id"] = navigation_page_id;
+            fail.data["wait_until"] = navigation_wait_until;
+            fail.data["url_host"] = navigation_url_log.host;
+            fail.data["url_path"] = navigation_url_log.path;
+            fail.data["url_has_query"] = navigation_url_log.has_query;
+            fail.data["url_len"] = navigation_url_log.length;
+            fail.data["late_result_handling"] = retained_timed_out_client ? "retained_client_waiting_for_late_result" : "detached_client_no_late_recovery";
+        }
         bridge_call_completed_t ev{tool_name, false, now_ms() - t0};
         aida::events::publish(kBridgeCallCompleted, ev);
         return fail;
@@ -4375,6 +4509,26 @@ call_result_t call_with_deadline(const std::string& tool_name, const nlohmann::j
     }
     bridge_call_completed_t ev{tool_name, out.ok, now_ms() - t0};
     aida::events::publish(kBridgeCallCompleted, ev);
+    if (navigation_call)
+    {
+        const int response_status = json_int_or(out.data, "final_status", json_int_or(out.data, "initial_status", json_int_or(out.data, "status", json_int_or(out.data, "response_status", -1))));
+        const bool navigation_timed_out = json_bool_or(out.data, "navigation_timed_out", false) || json_bool_or(out.data, "timed_out", false);
+        const url_log_t response_url = summarize_url_for_log(json_string_or(out.data, "url", json_string_or(out.data, "final_url", json_string_or(out.data, "active_url", std::string()))));
+        diag::log_tagged_fmt("camoufox", "navigate call_with_deadline phase=complete request_id=%llu page_id=%s wait_until=%s ok=%d response_status=%d navigation_timed_out=%d response_host=%s response_path=%s response_query=%d response_url_len=%zu elapsed_ms=%llu data_shape=%s error_len=%zu",
+            static_cast<unsigned long long>(request_id),
+            navigation_page_id.empty() ? "<empty>" : navigation_page_id.c_str(),
+            navigation_wait_until.empty() ? "<empty>" : navigation_wait_until.c_str(),
+            out.ok ? 1 : 0,
+            response_status,
+            navigation_timed_out ? 1 : 0,
+            response_url.host.c_str(),
+            response_url.path.c_str(),
+            response_url.has_query ? 1 : 0,
+            response_url.length,
+            static_cast<unsigned long long>(ev.duration_ms),
+            json_shape(out.data).c_str(),
+            out.error.size());
+    }
     diag::log_tagged_fmt("camoufox", "call_with_deadline phase=complete request_id=%llu tool=%s ok=%d elapsed_ms=%llu data_shape=%s error_len=%zu",
         static_cast<unsigned long long>(request_id), tool_name.c_str(), static_cast<int>(out.ok), static_cast<unsigned long long>(ev.duration_ms),
         json_shape(out.data).c_str(), out.error.size());
@@ -9546,6 +9700,7 @@ bool navigate(const std::string& url, const std::string& wait_until, int timeout
 {
     if (is_default_session_id(session_id) && page_id.empty())
         return navigate(url, wait_until, timeout_ms);
+    const uint64_t targeted_nav_start_ms = now_ms();
     const bridge_status_t before = get_status(session_id);
     const bridge_health_snapshot_t before_health = sample_bridge_health(before.child_pid, true);
     const url_log_t requested = summarize_url_for_log(url);
@@ -9576,7 +9731,36 @@ bool navigate(const std::string& url, const std::string& wait_until, int timeout
     args["include_title"] = false;
     if (!page_id.empty()) args["page_id"] = page_id;
     const int call_timeout = clamp_navigation_call_wait_ms(timeout_ms);
+    diag::log_tagged_fmt("camoufox", "navigate targeted phase=before_call_tool session_id=%s page_id=%s host=%s path=%s query=%d wait_until=%s requested_timeout_ms=%d call_timeout_ms=%d generation=%llu child_pid=%lu",
+        normalize_session_id(session_id).c_str(),
+        page_id.empty() ? "<empty>" : page_id.c_str(),
+        requested.host.c_str(),
+        requested.path.c_str(),
+        requested.has_query ? 1 : 0,
+        json_string_or(args, "wait_until", std::string()).c_str(),
+        timeout_ms,
+        call_timeout,
+        static_cast<unsigned long long>(before.generation),
+        static_cast<unsigned long>(before.child_pid));
     call_result_t r = call_tool("navigate", args, call_timeout, session_id);
+    {
+        const int response_status = json_int_or(r.data, "final_status", json_int_or(r.data, "initial_status", json_int_or(r.data, "status", json_int_or(r.data, "response_status", -1))));
+        const bool navigation_timed_out = json_bool_or(r.data, "navigation_timed_out", false) || json_bool_or(r.data, "timed_out", false);
+        const url_log_t response_url = summarize_url_for_log(json_string_or(r.data, "url", json_string_or(r.data, "final_url", json_string_or(r.data, "active_url", std::string()))));
+        diag::log_tagged_fmt("camoufox", "navigate targeted phase=after_call_tool session_id=%s page_id=%s ok=%d response_status=%d navigation_timed_out=%d response_host=%s response_path=%s response_query=%d response_url_len=%zu data_shape=%s error_len=%zu elapsed_ms=%llu",
+            normalize_session_id(session_id).c_str(),
+            page_id.empty() ? "<empty>" : page_id.c_str(),
+            r.ok ? 1 : 0,
+            response_status,
+            navigation_timed_out ? 1 : 0,
+            response_url.host.c_str(),
+            response_url.path.c_str(),
+            response_url.has_query ? 1 : 0,
+            response_url.length,
+            json_shape(r.data).c_str(),
+            r.error.size(),
+            static_cast<unsigned long long>(now_ms() - targeted_nav_start_ms));
+    }
     if (!r.ok)
     {
         const bridge_status_t after = get_status(session_id);
@@ -9740,7 +9924,35 @@ bool navigate(const std::string& url, const std::string& wait_until, int timeout
     }
     diag::log_tagged_fmt("camoufox", "navigate dispatch generation=%llu child_pid=%lu call_timeout_ms=%d",
         static_cast<unsigned long long>(nav_generation), static_cast<unsigned long>(nav_child_pid), call_timeout);
-    call_result_t r = call_with_deadline("navigate", a, call_timeout);
+    const uint64_t nav_request_id = next_request_id();
+    diag::log_tagged_fmt("camoufox", "navigate phase=before_call_with_deadline request_id=%llu host=%s path=%s query=%d wait_until=%s requested_timeout_ms=%d call_timeout_ms=%d generation=%llu child_pid=%lu",
+        static_cast<unsigned long long>(nav_request_id),
+        u.host.c_str(),
+        u.path.c_str(),
+        u.has_query ? 1 : 0,
+        json_string_or(a, "wait_until", std::string()).c_str(),
+        timeout_ms,
+        call_timeout,
+        static_cast<unsigned long long>(nav_generation),
+        static_cast<unsigned long>(nav_child_pid));
+    call_result_t r = call_with_deadline("navigate", a, call_timeout, nav_request_id);
+    {
+        const int response_status = json_int_or(r.data, "final_status", json_int_or(r.data, "initial_status", json_int_or(r.data, "status", json_int_or(r.data, "response_status", -1))));
+        const bool navigation_timed_out = json_bool_or(r.data, "navigation_timed_out", false) || json_bool_or(r.data, "timed_out", false);
+        const url_log_t response_url = summarize_url_for_log(json_string_or(r.data, "url", json_string_or(r.data, "final_url", json_string_or(r.data, "active_url", std::string()))));
+        diag::log_tagged_fmt("camoufox", "navigate phase=after_call_with_deadline request_id=%llu ok=%d response_status=%d navigation_timed_out=%d response_host=%s response_path=%s response_query=%d response_url_len=%zu data_shape=%s error_len=%zu elapsed_ms=%llu",
+            static_cast<unsigned long long>(nav_request_id),
+            r.ok ? 1 : 0,
+            response_status,
+            navigation_timed_out ? 1 : 0,
+            response_url.host.c_str(),
+            response_url.path.c_str(),
+            response_url.has_query ? 1 : 0,
+            response_url.length,
+            json_shape(r.data).c_str(),
+            r.error.size(),
+            static_cast<unsigned long long>(now_ms() - nav_start_ms));
+    }
     if (!r.ok && is_driver_closed_error(r.error))
     {
         diag::log_tagged_fmt("camoufox", "navigate driver_closed_retry host=%s path=%s err=%s",
@@ -9752,7 +9964,32 @@ bool navigate(const std::string& url, const std::string& wait_until, int timeout
                 nav_generation = sg().generation;
                 nav_child_pid = sg().child_pid;
             }
-            r = call_with_deadline("navigate", a, call_timeout);
+            const uint64_t retry_request_id = next_request_id();
+            diag::log_tagged_fmt("camoufox", "navigate phase=before_retry_call_with_deadline request_id=%llu host=%s path=%s query=%d wait_until=%s call_timeout_ms=%d generation=%llu child_pid=%lu",
+                static_cast<unsigned long long>(retry_request_id),
+                u.host.c_str(),
+                u.path.c_str(),
+                u.has_query ? 1 : 0,
+                json_string_or(a, "wait_until", std::string()).c_str(),
+                call_timeout,
+                static_cast<unsigned long long>(nav_generation),
+                static_cast<unsigned long>(nav_child_pid));
+            r = call_with_deadline("navigate", a, call_timeout, retry_request_id);
+            const int retry_response_status = json_int_or(r.data, "final_status", json_int_or(r.data, "initial_status", json_int_or(r.data, "status", json_int_or(r.data, "response_status", -1))));
+            const bool retry_navigation_timed_out = json_bool_or(r.data, "navigation_timed_out", false) || json_bool_or(r.data, "timed_out", false);
+            const url_log_t retry_response_url = summarize_url_for_log(json_string_or(r.data, "url", json_string_or(r.data, "final_url", json_string_or(r.data, "active_url", std::string()))));
+            diag::log_tagged_fmt("camoufox", "navigate phase=after_retry_call_with_deadline request_id=%llu ok=%d response_status=%d navigation_timed_out=%d response_host=%s response_path=%s response_query=%d response_url_len=%zu data_shape=%s error_len=%zu elapsed_ms=%llu",
+                static_cast<unsigned long long>(retry_request_id),
+                r.ok ? 1 : 0,
+                retry_response_status,
+                retry_navigation_timed_out ? 1 : 0,
+                retry_response_url.host.c_str(),
+                retry_response_url.path.c_str(),
+                retry_response_url.has_query ? 1 : 0,
+                retry_response_url.length,
+                json_shape(r.data).c_str(),
+                r.error.size(),
+                static_cast<unsigned long long>(now_ms() - nav_start_ms));
         }
     }
     if (!r.ok)

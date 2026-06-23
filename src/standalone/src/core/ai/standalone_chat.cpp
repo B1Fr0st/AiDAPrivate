@@ -2251,15 +2251,20 @@ void init_standalone_chat()
     themes::changed = true;
 
 
-    diag::log_tagged_fmt("init_chat", "license_initialize_start run_id=%s key_len=%zu session_len=%zu arc_ok=%d",
+    const ULONGLONG license_init_start_ms = GetTickCount64();
+    diag::log_tagged_fmt("init_chat", "license_initialize_start run_id=%s key_len=%zu session_len=%zu arc_ok=%d tick=%llu",
         run_id.c_str(),
         g_sa_settings.license_key.size(),
         g_sa_settings.license_session_token.size(),
-        g_sa_settings.license_arc_load_ok ? 1 : 0);
+        g_sa_settings.license_arc_load_ok ? 1 : 0,
+        static_cast<unsigned long long>(license_init_start_ms));
     bool license_ok = false;
     DWORD seh_lic = seh_standalone_license_initialize(g_sa_settings, license_ok);
     if (seh_lic != 0)
-        diag::log_tagged_fmt("init_chat", "license_initialize_seh code=0x%08X last_err=%lu", seh_lic, GetLastError());
+        diag::log_tagged_fmt("init_chat", "license_initialize_seh code=0x%08X last_err=%lu elapsed_ms=%llu",
+            seh_lic,
+            GetLastError(),
+            static_cast<unsigned long long>(GetTickCount64() - license_init_start_ms));
     license::validated = license_ok;
     license::saved_key = g_sa_settings.license_key;
     strncpy_s(license::key_buf, sizeof(license::key_buf),
@@ -2269,8 +2274,9 @@ void init_standalone_chat()
     license::check_failed = !license::validated && !license::error_msg.empty();
     {
         const std::string runtime_snapshot = standalone_license::runtime_state_snapshot();
-        diag::log_tagged_fmt("init_chat", "license_initialize_done run_id=%s validated=%d canonical_valid=%d arc=%d state={%.512s}",
+        diag::log_tagged_fmt("init_chat", "license_initialize_done run_id=%s elapsed_ms=%llu validated=%d canonical_valid=%d arc=%d state={%.512s}",
             run_id.c_str(),
+            static_cast<unsigned long long>(GetTickCount64() - license_init_start_ms),
             license::validated ? 1 : 0,
             standalone_license::is_valid() ? 1 : 0,
             standalone_license::is_arc_loaded() ? 1 : 0,

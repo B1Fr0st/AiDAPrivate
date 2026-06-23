@@ -327,7 +327,8 @@ namespace {
 		const bool view_changed = s_last_view.exchange(view_raw, std::memory_order_acq_rel) != view_raw;
 		const bool full_changed = s_last_full_test.exchange(full_test ? 1 : 0, std::memory_order_acq_rel) != (full_test ? 1 : 0);
 		unsigned long long last = s_last_log_ms.load(std::memory_order_acquire);
-		const bool due = view_changed || full_changed || now - last >= 1000ULL;
+		const unsigned long long interval_ms = full_test ? 1000ULL : 15000ULL;
+		const bool due = view_changed || full_changed || now - last >= interval_ms;
 		if (due && s_last_log_ms.compare_exchange_strong(last, now, std::memory_order_acq_rel)) {
 			diag::log_tagged_critical_fmt("render_center",
 				"section=%s view=%s view_id=%d overlay=%d full_test=%d frame=%d vw=%.1f vh=%.1f tid=%lu",
@@ -6677,7 +6678,9 @@ void helpers::render_title()
 	static std::atomic<unsigned long long> s_last_pump_jobs_log_ms{0};
 	const unsigned long long ui_jobs_start_ms = GetTickCount64();
 	unsigned long long last_pump_jobs_log_ms = s_last_pump_jobs_log_ms.load(std::memory_order_acquire);
-	const bool log_pump_jobs = ui_jobs_start_ms - last_pump_jobs_log_ms >= 1000ULL &&
+	const bool full_test_active_for_pump_log = test_all_features::is_running();
+	const unsigned long long pump_log_interval_ms = full_test_active_for_pump_log ? 1000ULL : 30000ULL;
+	const bool log_pump_jobs = ui_jobs_start_ms - last_pump_jobs_log_ms >= pump_log_interval_ms &&
 		s_last_pump_jobs_log_ms.compare_exchange_strong(last_pump_jobs_log_ms, ui_jobs_start_ms, std::memory_order_acq_rel);
 	char ui_phase_before[900] = {};
 	if (log_pump_jobs)
@@ -6693,7 +6696,7 @@ void helpers::render_title()
 	}
 	test_all_features::pump_ui_thread_jobs();
 	const unsigned long long ui_jobs_wall_ms = GetTickCount64() - ui_jobs_start_ms;
-	const bool slow_pump_jobs = ui_jobs_wall_ms >= 8ULL;
+	const bool slow_pump_jobs = ui_jobs_wall_ms >= (full_test_active_for_pump_log ? 8ULL : 32ULL);
 	if (log_pump_jobs || slow_pump_jobs) {
 		char ui_phase_after[900] = {};
 		test_all_features::format_ui_phase_snapshot(ui_phase_after, sizeof(ui_phase_after));

@@ -2103,6 +2103,9 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
         args["timeout_ms"] = timeout_ms;
     json capture_info = json::object();
     bool navigation_capture_body = false;
+    bool navigation_capture_from_start = false;
+    bool navigation_publish_to_burp = false;
+    std::string navigation_capture_pattern;
     if (tool_name == "take_screenshot")
     {
         args.erase("include_base64");
@@ -2116,13 +2119,16 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
         const bool capture_from_start = requested_capture_from_start || publish_to_burp;
         const bool capture_body = json_bool_param(params, "capture_body", publish_to_burp);
         navigation_capture_body = capture_body;
+        navigation_capture_from_start = capture_from_start;
+        navigation_publish_to_burp = publish_to_burp;
         const std::string capture_pattern = json_string_param(params, "capture_url_pattern", "**/*");
+        navigation_capture_pattern = capture_pattern.empty() ? std::string("**/*") : capture_pattern;
         const std::string capture_page_id = json_string_param(params, "page_id", std::string());
         if (capture_from_start)
         {
             args["capture_from_start"] = true;
             args["capture_body"] = capture_body;
-            args["capture_url_pattern"] = capture_pattern.empty() ? std::string("**/*") : capture_pattern;
+            args["capture_url_pattern"] = navigation_capture_pattern;
             capture_info["requested"] = true;
             capture_info["requested_explicitly"] = requested_capture_from_start;
             capture_info["auto_for_burp_publish"] = publish_to_burp && !requested_capture_from_start;
@@ -2133,7 +2139,66 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
             capture_info["cpp_pre_capture_rpc"] = false;
         }
     }
+    if (tool_name == "navigate")
+    {
+        const std::string page_id = json_string_param(args, "page_id", json_string_param(params, "page_id", std::string()));
+        const std::string wait_until = json_string_param(args, "wait_until", json_string_param(params, "wait_until", std::string()));
+        const std::string request_url = json_string_param(args, "url", json_string_param(params, "url", std::string()));
+        const url_log_t request_url_log = summarize_url_for_log(request_url);
+        const url_log_t active_url = summarize_url_for_log(before.active_page_url);
+        diag::log_tagged_fmt("mcp_burp", "browser_navigation phase=before_call_tool session_id=%s page_id=%s active_page_id=%s request_host=%s request_path=%s request_query=%d request_url_len=%zu active_host=%s active_path=%s wait_until=%s timeout_ms=%d capture_from_start=%d capture_body=%d publish_to_burp=%d capture_pattern=%s args_shape=%s bridge_state=%s child_pid=%lu child_alive=%d page_verified=%d",
+            session_id.c_str(),
+            page_id.empty() ? "<empty>" : page_id.c_str(),
+            before.active_page_id.empty() ? "<empty>" : before.active_page_id.c_str(),
+            request_url_log.host.c_str(),
+            request_url_log.path.c_str(),
+            request_url_log.has_query ? 1 : 0,
+            request_url_log.length,
+            active_url.host.c_str(),
+            active_url.path.c_str(),
+            wait_until.empty() ? "<empty>" : wait_until.c_str(),
+            timeout_ms,
+            navigation_capture_from_start ? 1 : 0,
+            navigation_capture_body ? 1 : 0,
+            navigation_publish_to_burp ? 1 : 0,
+            navigation_capture_pattern.empty() ? "<empty>" : navigation_capture_pattern.c_str(),
+            json_shape(args).c_str(),
+            state_label(before.state),
+            static_cast<unsigned long>(before.child_pid),
+            before.child_alive ? 1 : 0,
+            before.page_verified ? 1 : 0);
+    }
     camoufox::call_result_t bridge_result = camoufox::call_tool(tool_name, args, timeout_ms, session_id);
+    if (tool_name == "navigate")
+    {
+        const std::string page_id = json_string_param(args, "page_id", json_string_param(params, "page_id", std::string()));
+        const std::string wait_until = json_string_param(args, "wait_until", json_string_param(params, "wait_until", std::string()));
+        const int response_status = json_first_int_field(bridge_result.data, {"final_status", "initial_status", "status", "response_status"}, -1);
+        const bool navigation_timed_out = json_bool_param(bridge_result.data, "navigation_timed_out", false) ||
+            json_bool_param(bridge_result.data, "timed_out", false);
+        const std::string response_url = json_first_string_field(bridge_result.data, {"url", "final_url", "active_url", "page_url"});
+        const url_log_t response_url_log = summarize_url_for_log(response_url);
+        const auto mid = camoufox::get_status(session_id);
+        diag::log_tagged_fmt("mcp_burp", "browser_navigation phase=after_call_tool session_id=%s page_id=%s wait_until=%s ok=%d response_status=%d navigation_timed_out=%d response_host=%s response_path=%s response_query=%d response_url_len=%zu data_shape=%s error_len=%zu bridge_state=%s child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d",
+            session_id.c_str(),
+            page_id.empty() ? "<empty>" : page_id.c_str(),
+            wait_until.empty() ? "<empty>" : wait_until.c_str(),
+            bridge_result.ok ? 1 : 0,
+            response_status,
+            navigation_timed_out ? 1 : 0,
+            response_url_log.host.c_str(),
+            response_url_log.path.c_str(),
+            response_url_log.has_query ? 1 : 0,
+            response_url_log.length,
+            json_shape(bridge_result.data).c_str(),
+            bridge_result.error.size(),
+            state_label(mid.state),
+            static_cast<unsigned long>(mid.child_pid),
+            mid.child_alive ? 1 : 0,
+            mid.browser_open ? 1 : 0,
+            mid.page_verified ? 1 : 0,
+            mid.cleanup_pending ? 1 : 0);
+    }
     tool_result_t out = bridge_result_to_tool_result(bridge_result);
     if (tool_name == "list_network_requests" && out.success && browser_exchange_candidate_count(tool_name, out.data) == 0)
     {
@@ -2265,6 +2330,38 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
         if (tool_name == "list_network_requests" && out.data.is_object() && !json_string_field(out.data, "fallback").empty())
             burp_summary.fallback_used = true;
         attach_burp_bridge_summary(out, burp_summary);
+    }
+    if (tool_name == "navigate")
+    {
+        const std::string page_id = json_string_param(args, "page_id", json_string_param(params, "page_id", std::string()));
+        const std::string wait_until = json_string_param(args, "wait_until", json_string_param(params, "wait_until", std::string()));
+        const int response_status = json_first_int_field(out.data, {"final_status", "initial_status", "status", "response_status"}, -1);
+        const bool navigation_timed_out = json_bool_param(out.data, "navigation_timed_out", false) ||
+            json_bool_param(out.data, "timed_out", false);
+        const std::string response_url = json_first_string_field(out.data, {"url", "final_url", "active_url", "page_url"});
+        const url_log_t response_url_log = summarize_url_for_log(response_url);
+        diag::log_tagged_fmt("mcp_burp", "browser_navigation phase=exit session_id=%s page_id=%s wait_until=%s success=%d elapsed_ms=%lld rpc_timeout_ms=%d response_status=%d navigation_timed_out=%d status=%s response_host=%s response_path=%s response_query=%d response_url_len=%zu data_shape=%s text_len=%zu bridge_state=%s child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d",
+            session_id.c_str(),
+            page_id.empty() ? "<empty>" : page_id.c_str(),
+            wait_until.empty() ? "<empty>" : wait_until.c_str(),
+            out.success ? 1 : 0,
+            static_cast<long long>(elapsed_ms),
+            timeout_ms,
+            response_status,
+            navigation_timed_out ? 1 : 0,
+            status_string_for_log(out.data).c_str(),
+            response_url_log.host.c_str(),
+            response_url_log.path.c_str(),
+            response_url_log.has_query ? 1 : 0,
+            response_url_log.length,
+            json_shape(out.data).c_str(),
+            out.text.size(),
+            state_label(after.state),
+            static_cast<unsigned long>(after.child_pid),
+            after.child_alive ? 1 : 0,
+            after.browser_open ? 1 : 0,
+            after.page_verified ? 1 : 0,
+            after.cleanup_pending ? 1 : 0);
     }
     if (environment_probe)
     {

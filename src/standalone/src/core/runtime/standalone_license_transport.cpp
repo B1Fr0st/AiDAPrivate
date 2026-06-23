@@ -17,6 +17,7 @@
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -804,6 +805,28 @@ bool send_once(const winhttp_api_t& api,
         static_cast<unsigned long>(status_code),
         static_cast<unsigned long long>(GetTickCount64() - t0));
 
+    unsigned long long expected_content_length = 0;
+    bool expected_content_length_known = false;
+    {
+        wchar_t content_length_buf[64] = {};
+        DWORD content_length_size = sizeof(content_length_buf);
+        DWORD content_length_index = 0u;
+        if (api.p_query_headers(h_req,
+                                WINHTTP_QUERY_CONTENT_LENGTH,
+                                WINHTTP_HEADER_NAME_BY_INDEX,
+                                content_length_buf,
+                                &content_length_size,
+                                &content_length_index) &&
+            content_length_buf[0] != L'\0') {
+            wchar_t* end = nullptr;
+            unsigned long long parsed = wcstoull(content_length_buf, &end, 10);
+            if (end && end != content_length_buf) {
+                expected_content_length = parsed;
+                expected_content_length_known = true;
+            }
+        }
+    }
+
     {
         wchar_t hdr_name[] = L"X-Debug-Reason";
         wchar_t hdr_buf[192] = {};
@@ -833,13 +856,26 @@ bool send_once(const winhttp_api_t& api,
     uint8_t chunk[8192];
     trans_log_fmt("send_once_phase=read_body_begin elapsed_ms=%llu",
         static_cast<unsigned long long>(GetTickCount64() - t0));
+    bool body_read_failed = false;
+    DWORD body_read_gle = ERROR_SUCCESS;
+    const char* body_read_phase = "";
     for (;;) {
         DWORD avail = 0u;
-        if (!api.p_query_avail(h_req, &avail)) { break; }
+        if (!api.p_query_avail(h_req, &avail)) {
+            body_read_failed = true;
+            body_read_gle = GetLastError();
+            body_read_phase = "query_available_failed";
+            break;
+        }
         if (avail == 0u) { break; }
         DWORD to_read = avail > sizeof(chunk) ? static_cast<DWORD>(sizeof(chunk)) : avail;
         DWORD got = 0u;
-        if (!api.p_read_data(h_req, chunk, to_read, &got)) { break; }
+        if (!api.p_read_data(h_req, chunk, to_read, &got)) {
+            body_read_failed = true;
+            body_read_gle = GetLastError();
+            body_read_phase = "read_data_failed";
+            break;
+        }
         if (got == 0u) { break; }
         resp.body.insert(resp.body.end(), chunk, chunk + got);
         if (resp.body.size() > max_body) {
@@ -852,6 +888,27 @@ bool send_once(const winhttp_api_t& api,
             api.p_close_handle(h_session);
             return false;
         }
+    }
+    if (!body_read_failed && expected_content_length_known &&
+        resp.body.size() != static_cast<size_t>(expected_content_length)) {
+        body_read_failed = true;
+        body_read_gle = ERROR_HANDLE_EOF;
+        body_read_phase = "content_length_mismatch";
+    }
+    if (body_read_failed) {
+        last_error = format_winhttp_error(body_read_phase, body_read_gle);
+        trans_log_fmt("send_once_body_read_failed phase=%s gle=%lu body=%zu expected_known=%d expected=%llu status=%lu elapsed_ms=%llu",
+            body_read_phase,
+            static_cast<unsigned long>(body_read_gle),
+            resp.body.size(),
+            expected_content_length_known ? 1 : 0,
+            expected_content_length,
+            static_cast<unsigned long>(resp.http_status),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+        api.p_close_handle(h_req);
+        api.p_close_handle(h_connect);
+        api.p_close_handle(h_session);
+        return false;
     }
 
     api.p_close_handle(h_req);

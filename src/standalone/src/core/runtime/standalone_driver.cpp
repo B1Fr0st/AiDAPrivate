@@ -8,6 +8,7 @@
 #include "comm.h"
 #include "event_bus.hpp"
 #include "work_queue.hpp"
+#include "../mcp/mcp_standalone.hpp"
 #include "../helpers/diag_log.hpp"
 
 #include <windows.h>
@@ -4963,8 +4964,40 @@ namespace driver_bridge
 
     uint64_t call_function(uint64_t function_address, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4)
     {
-        if (function_address == 0)
+        const ULONGLONG call_start = GetTickCount64();
+        const std::uint64_t deadline = mcp_standalone::current_call_deadline_ms();
+        const bool cancel_at_entry = mcp_standalone::current_call_cancelled();
+        diag::log_tagged_fmt("driver",
+            "call_function_entry fn=0x%llX arg1=0x%llX arg2=0x%llX arg3=0x%llX arg4=0x%llX active_pid=%u cancelled=%d deadline_ms=%llu diag_id=%s",
+            static_cast<unsigned long long>(function_address),
+            static_cast<unsigned long long>(arg1),
+            static_cast<unsigned long long>(arg2),
+            static_cast<unsigned long long>(arg3),
+            static_cast<unsigned long long>(arg4),
+            attached_pid(),
+            cancel_at_entry ? 1 : 0,
+            static_cast<unsigned long long>(deadline),
+            mcp_standalone::current_call_diag_id());
+        if (function_address == 0) {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            diag::log_tagged_fmt("driver",
+                "call_function_reject fn=0x%llX reason=invalid_function elapsed_ms=%llu",
+                static_cast<unsigned long long>(function_address),
+                static_cast<unsigned long long>(GetTickCount64() - call_start));
             return 0;
+        }
+        if (cancel_at_entry || (deadline != 0 && GetTickCount64() >= deadline)) {
+            SetLastError(cancel_at_entry ? ERROR_CANCELLED : ERROR_TIMEOUT);
+            diag::log_tagged_fmt("driver",
+                "call_function_deadline_preempt fn=0x%llX active_pid=%u cancelled=%d deadline_ms=%llu elapsed_ms=%llu diag_id=%s",
+                static_cast<unsigned long long>(function_address),
+                attached_pid(),
+                cancel_at_entry ? 1 : 0,
+                static_cast<unsigned long long>(deadline),
+                static_cast<unsigned long long>(GetTickCount64() - call_start),
+                mcp_standalone::current_call_diag_id());
+            return 0;
+        }
 
         bool kernel_mode = false;
         {
@@ -4973,14 +5006,87 @@ namespace driver_bridge
         }
         if (!kernel_mode) {
             require_kernel_fail("call_function");
+            diag::log_tagged_fmt("driver",
+                "call_function_kernel_unavailable fn=0x%llX active_pid=%u elapsed_ms=%llu status=%s last_error=%s",
+                static_cast<unsigned long long>(function_address),
+                attached_pid(),
+                static_cast<unsigned long long>(GetTickCount64() - call_start),
+                status().c_str(),
+                last_error().c_str());
             return 0;
         }
 
         uint64_t arc_result = 0;
-        if (arc_bridge_remote_call(function_address, arg1, arg2, arg3, arg4, arc_result))
+        diag::log_tagged_fmt("driver",
+            "call_function_arc_begin fn=0x%llX active_pid=%u cancelled=%d deadline_ms=%llu elapsed_ms=%llu diag_id=%s",
+            static_cast<unsigned long long>(function_address),
+            attached_pid(),
+            mcp_standalone::current_call_cancelled() ? 1 : 0,
+            static_cast<unsigned long long>(deadline),
+            static_cast<unsigned long long>(GetTickCount64() - call_start),
+            mcp_standalone::current_call_diag_id());
+        if (arc_bridge_remote_call(function_address, arg1, arg2, arg3, arg4, arc_result)) {
+            const ULONGLONG arc_end = GetTickCount64();
+            diag::log_tagged_fmt("driver",
+                "call_function_arc_done fn=0x%llX active_pid=%u result=0x%llX ok=1 cancelled=%d deadline_ms=%llu deadline_expired_after=%d elapsed_ms=%llu diag_id=%s",
+                static_cast<unsigned long long>(function_address),
+                attached_pid(),
+                static_cast<unsigned long long>(arc_result),
+                mcp_standalone::current_call_cancelled() ? 1 : 0,
+                static_cast<unsigned long long>(deadline),
+                deadline != 0 && arc_end >= deadline ? 1 : 0,
+                static_cast<unsigned long long>(arc_end - call_start),
+                mcp_standalone::current_call_diag_id());
             return arc_result;
+        }
+        diag::log_tagged_fmt("driver",
+            "call_function_arc_done fn=0x%llX active_pid=%u ok=0 cancelled=%d deadline_ms=%llu elapsed_ms=%llu diag_id=%s",
+            static_cast<unsigned long long>(function_address),
+            attached_pid(),
+            mcp_standalone::current_call_cancelled() ? 1 : 0,
+            static_cast<unsigned long long>(deadline),
+            static_cast<unsigned long long>(GetTickCount64() - call_start),
+            mcp_standalone::current_call_diag_id());
+        if (mcp_standalone::current_call_cancelled() || (deadline != 0 && GetTickCount64() >= deadline)) {
+            const bool cancelled = mcp_standalone::current_call_cancelled();
+            SetLastError(cancelled ? ERROR_CANCELLED : ERROR_TIMEOUT);
+            diag::log_tagged_fmt("driver",
+                "call_function_deadline_before_device fn=0x%llX active_pid=%u cancelled=%d deadline_ms=%llu elapsed_ms=%llu diag_id=%s",
+                static_cast<unsigned long long>(function_address),
+                attached_pid(),
+                cancelled ? 1 : 0,
+                static_cast<unsigned long long>(deadline),
+                static_cast<unsigned long long>(GetTickCount64() - call_start),
+                mcp_standalone::current_call_diag_id());
+            return 0;
+        }
 
-        return device->call_function(function_address, arg1, arg2, arg3, arg4);
+        diag::log_tagged_fmt("driver",
+            "call_function_device_wait_begin fn=0x%llX active_pid=%u cancelled=%d deadline_ms=%llu elapsed_ms=%llu diag_id=%s",
+            static_cast<unsigned long long>(function_address),
+            attached_pid(),
+            mcp_standalone::current_call_cancelled() ? 1 : 0,
+            static_cast<unsigned long long>(deadline),
+            static_cast<unsigned long long>(GetTickCount64() - call_start),
+            mcp_standalone::current_call_diag_id());
+        const uint64_t result = device->call_function(function_address, arg1, arg2, arg3, arg4);
+        const DWORD gle = result != 0 ? ERROR_SUCCESS : GetLastError();
+        const ULONGLONG call_end = GetTickCount64();
+        diag::log_tagged_fmt("driver",
+            "call_function_device_wait_done fn=0x%llX active_pid=%u result=0x%llX ok=%d gle=%lu cancelled=%d deadline_ms=%llu deadline_expired_after=%d elapsed_ms=%llu diag_id=%s",
+            static_cast<unsigned long long>(function_address),
+            attached_pid(),
+            static_cast<unsigned long long>(result),
+            result != 0 ? 1 : 0,
+            static_cast<unsigned long>(gle),
+            mcp_standalone::current_call_cancelled() ? 1 : 0,
+            static_cast<unsigned long long>(deadline),
+            deadline != 0 && call_end >= deadline ? 1 : 0,
+            static_cast<unsigned long long>(call_end - call_start),
+            mcp_standalone::current_call_diag_id());
+        if (result == 0)
+            SetLastError(gle);
+        return result;
     }
 
     uint64_t find_gadget(const char* pattern, size_t pattern_size)

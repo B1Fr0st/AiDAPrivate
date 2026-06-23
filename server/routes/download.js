@@ -510,17 +510,30 @@ router.post('/arc/pages/bulk', async (req, res) => {
             licensee_id: licenseeIdBulk,
         };
 
-        const envelope = canonicalResponse.buildEnvelope({
+        const signedEnvelope = canonicalResponse.buildEnvelope({
             ...signedPayload,
             pages,
         });
+        const envelope = {
+            kid: signedEnvelope.kid,
+            payload: signedEnvelope.payload,
+            sig: signedEnvelope.sig,
+        };
+        if (signedEnvelope.next_sig) envelope.next_sig = signedEnvelope.next_sig;
+        if (signedEnvelope.next_kid) envelope.next_kid = signedEnvelope.next_kid;
         const payloadLen = typeof envelope.payload === 'string' ? envelope.payload.length : 0;
         const sigLen = typeof envelope.sig === 'string' ? envelope.sig.length : 0;
         console.warn(`[arc-bulk] envelope_built kid=${envelope.kid} payload_b64_len=${payloadLen} sig_b64_len=${sigLen} pages=${pages.length} pages_digest_prefix=${pagesDigestHex.slice(0, 16)}`);
 
+        const responseBody = Buffer.from(JSON.stringify(envelope), 'utf8');
         const elapsedMs = Date.now() - t0;
-        console.warn(`[arc-bulk] response_sending status=200 elapsed_ms=${elapsedMs} lk_prefix=${lkPrefix}`);
-        return res.json(envelope);
+        console.warn(`[arc-bulk] response_sending status=200 elapsed_ms=${elapsedMs} body_size=${responseBody.length} lk_prefix=${lkPrefix}`);
+        res.set({
+            'Content-Type': 'application/json; charset=utf-8',
+            'Content-Length': String(responseBody.length),
+            'Cache-Control': 'no-store',
+        });
+        return res.status(200).send(responseBody);
     } catch (err) {
         const elapsedMs = Date.now() - t0;
         console.error(`[arc-bulk] handler_exception err=${err && err.message ? err.message : err} elapsed_ms=${elapsedMs}`);
