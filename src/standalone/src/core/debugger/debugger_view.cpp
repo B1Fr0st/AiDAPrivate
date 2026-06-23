@@ -3102,35 +3102,35 @@ static void render_threads(ImDrawList* dl, float ox, float oy, float w, float h,
 	if (ImGui::BeginPopupModal("Terminate Thread##th", nullptr,
 		ImGuiWindowFlags_AlwaysAutoResize)) {
 		ImGui::TextWrapped(
-			"Terminate thread %u with exit code 0xDEAD?\nThis cannot be undone and may destabilise the target.",
+			"Terminate thread %u with exit code 0xDEAD?",
 			static_cast<unsigned>(ui.thread_kill_tid));
 		ImGui::Separator();
 		if (ImGui::Button("Terminate", ImVec2(130.f, 0.f))) {
 			uint32_t target_tid = ui.thread_kill_tid;
-			HANDLE th_handle = OpenThread(THREAD_TERMINATE, FALSE, target_tid);
-			bool ok = false;
-			DWORD gle = 0;
-			if (th_handle != nullptr) {
-				ok = TerminateThread(th_handle, 0xDEADu) != FALSE;
-				if (!ok) gle = GetLastError();
-				CloseHandle(th_handle);
-			} else {
-				gle = GetLastError();
-			}
+			SetLastError(ERROR_SUCCESS);
+			bool ok = driver_bridge::terminate_thread(target_tid, 0xDEADu);
+			DWORD gle = ok ? ERROR_SUCCESS : GetLastError();
+			std::string kernel_reason;
+			const bool kernel_ready = driver_bridge::using_kernel_driver() &&
+				driver_bridge::kernel_session_available(&kernel_reason) &&
+				driver_bridge::dynamic_ioctls_ready();
 			diag::log_tagged_critical_fmt("debugger",
-				"thread_kill tid=%u open_ok=%d term_ok=%d gle=%lu",
+				"thread_kill tid=%u term_ok=%d gle=%lu kernel_ready=%d reason=%s status=%s last_error=%s method=kernel_driver",
 				static_cast<unsigned>(target_tid),
-				th_handle != nullptr ? 1 : 0,
 				ok ? 1 : 0,
-				static_cast<unsigned long>(gle));
+				static_cast<unsigned long>(gle),
+				kernel_ready ? 1 : 0,
+				kernel_reason.empty() ? "<empty>" : kernel_reason.c_str(),
+				driver_bridge::status().c_str(),
+				driver_bridge::last_error().c_str());
 			anti_tamper::webhook::write_log("dbg_audit", ok
 				? "[dbg_audit] threads kill ok=1"
-				: "[dbg_audit] threads kill fail reason=open_or_terminate_failed");
+				: "[dbg_audit] threads kill fail reason=kernel_thread_terminate_failed");
 			if (ok) {
 				toast_notification::push("Thread terminated.",
 					toast_notification::toast_type_t::info);
 			} else {
-				toast_notification::push("Terminate thread failed.",
+				toast_notification::push("Kernel thread termination failed.",
 					toast_notification::toast_type_t::error);
 			}
 			ui.thread_kill_idx = -1;
@@ -4067,7 +4067,7 @@ static void render_handles(ImDrawList* dl, float ox, float oy, float w, float h,
 	if (ImGui::BeginPopupModal("Close Handle##hd", nullptr,
 		ImGuiWindowFlags_AlwaysAutoResize)) {
 		ImGui::TextWrapped(
-			"Close handle 0x%X (%s) in target process?\nName: %s\n\nThis duplicates the handle into the host with DUPLICATE_CLOSE_SOURCE, releasing it inside the target. The target may crash if it relies on this handle.",
+			"Close handle 0x%X (%s) in target process?\nName: %s",
 			static_cast<unsigned>(ui.handle_close_value),
 			ui.handle_close_type.c_str(),
 			ui.handle_close_name.empty() ? "(unnamed)" : ui.handle_close_name.c_str());
@@ -4075,40 +4075,32 @@ static void render_handles(ImDrawList* dl, float ox, float oy, float w, float h,
 		if (ImGui::Button("Close Handle", ImVec2(140.f, 0.f))) {
 			uint64_t value = ui.handle_close_value;
 			uint32_t target_pid = driver_bridge::attached_pid();
-			HANDLE target_proc = OpenProcess(PROCESS_DUP_HANDLE, FALSE, target_pid);
-			bool ok = false;
-			DWORD gle = 0;
-			if (target_proc != nullptr) {
-				HANDLE dup = nullptr;
-				BOOL dup_ok = DuplicateHandle(target_proc,
-					reinterpret_cast<HANDLE>(static_cast<uintptr_t>(value)),
-					GetCurrentProcess(), &dup, 0, FALSE,
-					DUPLICATE_SAME_ACCESS | DUPLICATE_CLOSE_SOURCE);
-				if (dup_ok) {
-					if (dup != nullptr) CloseHandle(dup);
-					ok = true;
-				} else {
-					gle = GetLastError();
-				}
-				CloseHandle(target_proc);
-			} else {
-				gle = GetLastError();
-			}
+			SetLastError(ERROR_SUCCESS);
+			bool ok = driver_bridge::close_process_handle(target_pid, value);
+			DWORD gle = ok ? ERROR_SUCCESS : GetLastError();
+			std::string kernel_reason;
+			const bool kernel_ready = driver_bridge::using_kernel_driver() &&
+				driver_bridge::kernel_session_available(&kernel_reason) &&
+				driver_bridge::dynamic_ioctls_ready();
 			diag::log_tagged_critical_fmt("handles",
-				"handles_close pid=%u handle=0x%llx ok=%d gle=%lu",
+				"handles_close pid=%u handle=0x%llx ok=%d gle=%lu kernel_ready=%d reason=%s status=%s last_error=%s method=kernel_driver",
 				static_cast<unsigned>(target_pid),
 				static_cast<unsigned long long>(value),
 				ok ? 1 : 0,
-				static_cast<unsigned long>(gle));
+				static_cast<unsigned long>(gle),
+				kernel_ready ? 1 : 0,
+				kernel_reason.empty() ? "<empty>" : kernel_reason.c_str(),
+				driver_bridge::status().c_str(),
+				driver_bridge::last_error().c_str());
 			anti_tamper::webhook::write_log("dbg_audit", ok
 				? "[dbg_audit] handles close ok=1"
-				: "[dbg_audit] handles close fail reason=duplicate_close_failed");
+				: "[dbg_audit] handles close fail reason=kernel_handle_close_failed");
 			if (ok) {
 				toast_notification::push("Handle closed in target.",
 					toast_notification::toast_type_t::info);
 				work_queue::post([]() { debugger_engine::enumerate_handles(); });
 			} else {
-				toast_notification::push("Close handle failed.",
+				toast_notification::push("Kernel handle close failed.",
 					toast_notification::toast_type_t::error);
 			}
 			ui.handle_close_idx = -1;

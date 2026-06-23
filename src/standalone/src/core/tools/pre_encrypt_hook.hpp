@@ -266,12 +266,22 @@ inline void store_auto_hook_report(uint32_t root_pid, uint32_t selected_pid, DWO
     g_state.last_auto_hook_candidates = reports;
 }
 
+inline uint64_t register_value(const driver_bridge::thread_context_t& ctx, uint32_t reg_index) {
+    switch (reg_index) {
+    case 0: return ctx.rcx;
+    case 1: return ctx.rdx;
+    case 2: return ctx.r8;
+    case 3: return ctx.r9;
+    default: return 0;
+    }
+}
+
 inline uint64_t register_value(const CONTEXT& ctx, uint32_t reg_index) {
     switch (reg_index) {
-    case 0: return static_cast<uint64_t>(ctx.Rcx);
-    case 1: return static_cast<uint64_t>(ctx.Rdx);
-    case 2: return static_cast<uint64_t>(ctx.R8);
-    case 3: return static_cast<uint64_t>(ctx.R9);
+    case 0: return ctx.Rcx;
+    case 1: return ctx.Rdx;
+    case 2: return ctx.R8;
+    case 3: return ctx.R9;
     default: return 0;
     }
 }
@@ -291,33 +301,21 @@ inline DWORD query_remote_protection(uint32_t pid, uint64_t address, size_t size
     state = 0;
     if (pid == 0 || address == 0 || size == 0)
         return 0;
-    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, pid);
-    if (!process) {
+    driver_bridge::memory_region_t region{};
+    if (!driver_bridge::query_memory_for(pid, address, region)) {
         diag::log_tagged_fmt("pre_encrypt_hook",
-            "buffer_query_open_failed pid=%u va=0x%llX size=%zu gle=%lu",
+            "buffer_query_driver_failed pid=%u va=0x%llX size=%zu driver_status=%s driver_error=%s",
             pid,
             static_cast<unsigned long long>(address),
             size,
-            GetLastError());
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str());
         return 0;
     }
-    MEMORY_BASIC_INFORMATION mbi{};
-    const SIZE_T queried = VirtualQueryEx(process, reinterpret_cast<LPCVOID>(address), &mbi, sizeof(mbi));
-    const DWORD gle = GetLastError();
-    CloseHandle(process);
-    if (queried == 0) {
-        diag::log_tagged_fmt("pre_encrypt_hook",
-            "buffer_query_failed pid=%u va=0x%llX size=%zu gle=%lu",
-            pid,
-            static_cast<unsigned long long>(address),
-            size,
-            gle);
-        return 0;
-    }
-    region_base = reinterpret_cast<uint64_t>(mbi.BaseAddress);
-    region_size = static_cast<uint64_t>(mbi.RegionSize);
-    state = mbi.State;
-    return mbi.Protect;
+    region_base = region.base;
+    region_size = region.size;
+    state = region.state;
+    return region.protect;
 }
 
 inline buffer_kind_t infer_kind_from_name(const std::string& name) {
@@ -381,13 +379,13 @@ inline bool read_target_bytes(uint32_t pid, uint64_t address, size_t size, std::
     return true;
 }
 
-inline bool capture_linear(uint32_t pid, const CONTEXT& ctx, const hook_target_t& target, std::vector<uint8_t>& out) {
+inline bool capture_linear(uint32_t pid, const driver_bridge::thread_context_t& ctx, const hook_target_t& target, std::vector<uint8_t>& out) {
     const uint64_t buffer_address = register_value(ctx, target.buffer_reg);
     const uint64_t requested_size = register_value(ctx, target.size_reg);
     return read_target_bytes(pid, buffer_address, bounded_capture_size(requested_size), out);
 }
 
-inline bool capture_wsabuf_array(uint32_t pid, const CONTEXT& ctx, const hook_target_t& target, std::vector<uint8_t>& out) {
+inline bool capture_wsabuf_array(uint32_t pid, const driver_bridge::thread_context_t& ctx, const hook_target_t& target, std::vector<uint8_t>& out) {
     struct remote_wsabuf_t {
         uint32_t len;
         uint32_t pad;
@@ -419,7 +417,7 @@ inline bool capture_wsabuf_array(uint32_t pid, const CONTEXT& ctx, const hook_ta
     return !out.empty();
 }
 
-inline bool capture_sec_buffer_desc(uint32_t pid, const CONTEXT& ctx, const hook_target_t& target, std::vector<uint8_t>& out) {
+inline bool capture_sec_buffer_desc(uint32_t pid, const driver_bridge::thread_context_t& ctx, const hook_target_t& target, std::vector<uint8_t>& out) {
     struct remote_sec_buffer_desc_t {
         uint32_t ulVersion;
         uint32_t cBuffers;
@@ -467,7 +465,7 @@ inline bool capture_sec_buffer_desc(uint32_t pid, const CONTEXT& ctx, const hook
     return !out.empty();
 }
 
-inline bool capture_target_buffer(uint32_t pid, const CONTEXT& ctx, const hook_target_t& target, std::vector<uint8_t>& out) {
+inline bool capture_target_buffer(uint32_t pid, const driver_bridge::thread_context_t& ctx, const hook_target_t& target, std::vector<uint8_t>& out) {
     if (target.kind == buffer_kind_t::wsabuf_array)
         return capture_wsabuf_array(pid, ctx, target, out);
     if (target.kind == buffer_kind_t::sec_buffer_desc)
@@ -523,17 +521,6 @@ inline std::vector<hook_target_t> targets_snapshot() {
             result.push_back(target);
     }
     return result;
-}
-
-inline bool find_target_for_hit(uint64_t rip, uint64_t exception_address, hook_target_t& out) {
-    auto targets = targets_snapshot();
-    for (const auto& target : targets) {
-        if (target.address == rip || target.address == exception_address) {
-            out = target;
-            return true;
-        }
-    }
-    return false;
 }
 
 inline void mark_thread_armed(uint64_t address, uint32_t tid) {
@@ -693,139 +680,134 @@ inline uint32_t armed_thread_count() {
     return count;
 }
 
-inline bool capture_breakpoint_hit(const DEBUG_EVENT& evt) {
-    HANDLE thread_handle = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, evt.dwThreadId);
-    if (!thread_handle) {
-        diag::log_tagged_fmt("pre_encrypt_hook",
-            "breakpoint_hit_open_thread_failed pid=%lu tid=%lu gle=%lu",
-            evt.dwProcessId,
-            evt.dwThreadId,
-            GetLastError());
-        return false;
+inline uint64_t context_dr_address(const driver_bridge::thread_context_t& ctx, uint32_t slot) {
+    switch (slot) {
+    case 0: return ctx.dr0;
+    case 1: return ctx.dr1;
+    case 2: return ctx.dr2;
+    case 3: return ctx.dr3;
+    default: return 0;
     }
+}
 
-    CONTEXT ctx{};
-    ctx.ContextFlags = CONTEXT_INTEGER | CONTEXT_CONTROL | CONTEXT_DEBUG_REGISTERS;
-    const BOOL got_context = GetThreadContext(thread_handle, &ctx);
-    if (!got_context) {
-        diag::log_tagged_fmt("pre_encrypt_hook",
-            "breakpoint_hit_get_context_failed pid=%lu tid=%lu gle=%lu",
-            evt.dwProcessId,
-            evt.dwThreadId,
-            GetLastError());
-        CloseHandle(thread_handle);
+inline bool context_matches_target(const driver_bridge::thread_context_t& ctx, const hook_target_t& target) {
+    if (target.bp_index > 3 || target.address == 0)
         return false;
+    const uint64_t slot_address = context_dr_address(ctx, target.bp_index);
+    const bool slot_matches = slot_address == target.address;
+    const bool dr6_hit = (ctx.dr6 & (1ull << target.bp_index)) != 0;
+    if (dr6_hit && slot_matches)
+        return true;
+    return slot_matches && ctx.rip == target.address;
+}
+
+inline bool find_target_for_context(const driver_bridge::thread_context_t& ctx, hook_target_t& out) {
+    auto targets = targets_snapshot();
+    for (const auto& target : targets) {
+        if (context_matches_target(ctx, target)) {
+            out = target;
+            return true;
+        }
     }
+    return false;
+}
 
-    const uint64_t exception_address = reinterpret_cast<uint64_t>(
-        evt.u.Exception.ExceptionRecord.ExceptionAddress);
-
+inline bool capture_breakpoint_hit(uint32_t pid, uint32_t tid, const driver_bridge::thread_context_t& ctx) {
     hook_target_t target;
-    if (!find_target_for_hit(static_cast<uint64_t>(ctx.Rip), exception_address, target)) {
-        diag::log_tagged_fmt("pre_encrypt_hook",
-            "breakpoint_hit_unmatched pid=%lu tid=%lu rip=0x%llX exception=0x%llX dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX",
-            evt.dwProcessId,
-            evt.dwThreadId,
-            static_cast<unsigned long long>(ctx.Rip),
-            static_cast<unsigned long long>(exception_address),
-            static_cast<unsigned long long>(ctx.Dr0),
-            static_cast<unsigned long long>(ctx.Dr1),
-            static_cast<unsigned long long>(ctx.Dr2),
-            static_cast<unsigned long long>(ctx.Dr3),
-            static_cast<unsigned long long>(ctx.Dr6),
-            static_cast<unsigned long long>(ctx.Dr7));
-        CloseHandle(thread_handle);
+    if (!find_target_for_context(ctx, target)) {
+        if ((ctx.dr6 & 0xFull) != 0)
+            diag::log_tagged_fmt("pre_encrypt_hook",
+                "breakpoint_hit_unmatched pid=%u tid=%u rip=0x%llX dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX",
+                pid,
+                tid,
+                static_cast<unsigned long long>(ctx.rip),
+                static_cast<unsigned long long>(ctx.dr0),
+                static_cast<unsigned long long>(ctx.dr1),
+                static_cast<unsigned long long>(ctx.dr2),
+                static_cast<unsigned long long>(ctx.dr3),
+                static_cast<unsigned long long>(ctx.dr6),
+                static_cast<unsigned long long>(ctx.dr7));
         return false;
     }
     const uint64_t buffer_address = register_value(ctx, target.buffer_reg);
     const uint64_t requested_size = register_value(ctx, target.size_reg);
     diag::log_tagged_fmt("pre_encrypt_hook",
-        "breakpoint_hit pid=%lu tid=%lu function=%s rip=0x%llX exception=0x%llX rcx=0x%llX rdx=0x%llX r8=0x%llX r9=0x%llX rsp=0x%llX dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX buffer_reg=%u size_reg=%u buffer_va=0x%llX requested_size=%llu",
-        evt.dwProcessId,
-        evt.dwThreadId,
+        "breakpoint_hit pid=%u tid=%u function=%s rip=0x%llX rcx=0x%llX rdx=0x%llX r8=0x%llX r9=0x%llX rsp=0x%llX dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX buffer_reg=%u size_reg=%u buffer_va=0x%llX requested_size=%llu",
+        pid,
+        tid,
         target.function_name.c_str(),
-        static_cast<unsigned long long>(ctx.Rip),
-        static_cast<unsigned long long>(exception_address),
-        static_cast<unsigned long long>(ctx.Rcx),
-        static_cast<unsigned long long>(ctx.Rdx),
-        static_cast<unsigned long long>(ctx.R8),
-        static_cast<unsigned long long>(ctx.R9),
-        static_cast<unsigned long long>(ctx.Rsp),
-        static_cast<unsigned long long>(ctx.Dr0),
-        static_cast<unsigned long long>(ctx.Dr1),
-        static_cast<unsigned long long>(ctx.Dr2),
-        static_cast<unsigned long long>(ctx.Dr3),
-        static_cast<unsigned long long>(ctx.Dr6),
-        static_cast<unsigned long long>(ctx.Dr7),
+        static_cast<unsigned long long>(ctx.rip),
+        static_cast<unsigned long long>(ctx.rcx),
+        static_cast<unsigned long long>(ctx.rdx),
+        static_cast<unsigned long long>(ctx.r8),
+        static_cast<unsigned long long>(ctx.r9),
+        static_cast<unsigned long long>(ctx.rsp),
+        static_cast<unsigned long long>(ctx.dr0),
+        static_cast<unsigned long long>(ctx.dr1),
+        static_cast<unsigned long long>(ctx.dr2),
+        static_cast<unsigned long long>(ctx.dr3),
+        static_cast<unsigned long long>(ctx.dr6),
+        static_cast<unsigned long long>(ctx.dr7),
         target.buffer_reg,
         target.size_reg,
         static_cast<unsigned long long>(buffer_address),
         static_cast<unsigned long long>(requested_size));
 
-    uint32_t pid = 0;
-    {
-        std::lock_guard<std::mutex> lock(g_state.mutex);
-        pid = g_state.attached_pid;
-    }
-    if (pid == 0) {
-        CloseHandle(thread_handle);
-        return false;
-    }
-
     std::vector<uint8_t> buffer;
-    if (!capture_target_buffer(pid, ctx, target, buffer)) {
-        ctx.EFlags |= 0x10000;
-        const BOOL set_ok = SetThreadContext(thread_handle, &ctx);
-        diag::log_tagged_fmt("pre_encrypt_hook",
-            "breakpoint_hit_capture_empty pid=%u tid=%lu function=%s set_context=%d gle=%lu",
-            pid,
-            evt.dwThreadId,
-            target.function_name.c_str(),
-            set_ok ? 1 : 0,
-            GetLastError());
-        CloseHandle(thread_handle);
-        return true;
-    }
-
-    ctx.EFlags |= 0x10000;
-    const BOOL set_ok = SetThreadContext(thread_handle, &ctx);
+    const bool captured = capture_target_buffer(pid, ctx, target, buffer);
+    driver_bridge::thread_context_t next = ctx;
+    next.rflags |= 0x10000ull;
+    next.dr6 = 0;
+    SetLastError(ERROR_SUCCESS);
+    const bool set_ok = driver_bridge::set_thread_context(tid, next, (1ull << 17) | (1ull << 22));
+    const DWORD gle = set_ok ? ERROR_SUCCESS : GetLastError();
     diag::log_tagged_fmt("pre_encrypt_hook",
-        "breakpoint_hit_capture_ready pid=%u tid=%lu function=%s captured_bytes=%zu set_context=%d gle=%lu",
+        "breakpoint_hit_resume pid=%u tid=%u function=%s captured=%d captured_bytes=%zu set_context=%d gle=%lu",
         pid,
-        evt.dwThreadId,
+        tid,
         target.function_name.c_str(),
+        captured ? 1 : 0,
         buffer.size(),
         set_ok ? 1 : 0,
-        GetLastError());
-    CloseHandle(thread_handle);
-    record_capture(evt.dwThreadId, target.function_name, std::move(buffer), static_cast<uint64_t>(ctx.Rip));
+        static_cast<unsigned long>(gle));
+    if (captured)
+        record_capture(tid, target.function_name, std::move(buffer), ctx.rip);
     return true;
 }
 
-inline void close_debug_event_handles(const DEBUG_EVENT& evt) {
-    switch (evt.dwDebugEventCode) {
-    case CREATE_PROCESS_DEBUG_EVENT:
-        if (evt.u.CreateProcessInfo.hFile)
-            CloseHandle(evt.u.CreateProcessInfo.hFile);
-        if (evt.u.CreateProcessInfo.hThread)
-            CloseHandle(evt.u.CreateProcessInfo.hThread);
-        if (evt.u.CreateProcessInfo.hProcess)
-            CloseHandle(evt.u.CreateProcessInfo.hProcess);
-        break;
-    case CREATE_THREAD_DEBUG_EVENT:
-        if (evt.u.CreateThread.hThread)
-            CloseHandle(evt.u.CreateThread.hThread);
-        break;
-    case LOAD_DLL_DEBUG_EVENT:
-        if (evt.u.LoadDll.hFile)
-            CloseHandle(evt.u.LoadDll.hFile);
-        break;
-    default:
-        break;
+inline std::vector<uint32_t> armed_threads_snapshot() {
+    std::vector<uint32_t> tids;
+    std::lock_guard<std::mutex> lock(g_state.mutex);
+    for (const auto& target : g_state.targets) {
+        for (uint32_t tid : target.armed_tids) {
+            if (tid != 0 && std::find(tids.begin(), tids.end(), tid) == tids.end())
+                tids.push_back(tid);
+        }
+    }
+    return tids;
+}
+
+inline void poll_kernel_contexts(uint32_t pid) {
+    for (uint32_t target_tid : armed_threads_snapshot()) {
+        driver_bridge::thread_context_t ctx{};
+        SetLastError(ERROR_SUCCESS);
+        if (!driver_bridge::get_thread_context(target_tid, ctx)) {
+            const DWORD gle = GetLastError();
+            diag::log_tagged_fmt("pre_encrypt_hook",
+                "kernel_context_poll_get_failed pid=%u tid=%u gle=%lu driver_error=%s",
+                pid,
+                target_tid,
+                static_cast<unsigned long>(gle),
+                driver_bridge::last_error().c_str());
+            if (gle == ERROR_INVALID_PARAMETER || gle == ERROR_NOT_FOUND || gle == ERROR_INVALID_HANDLE)
+                remove_thread_armed(target_tid);
+            continue;
+        }
+        capture_breakpoint_hit(pid, target_tid, ctx);
     }
 }
 
-inline void debug_event_loop() {
+inline void kernel_context_loop() {
     const DWORD tid = GetCurrentThreadId();
     const ULONGLONG start_ms = GetTickCount64();
     g_state.debug_loop_tid.store(tid, std::memory_order_release);
@@ -835,7 +817,7 @@ inline void debug_event_loop() {
         pid = g_state.attached_pid;
     }
     diag::log_tagged_fmt("pre_encrypt_hook",
-        "debug_loop_enter pid=%u tid=%lu polling=%d attached=%d",
+        "kernel_context_loop_enter pid=%u tid=%lu polling=%d attached=%d",
         pid,
         static_cast<unsigned long>(tid),
         g_state.polling.load() ? 1 : 0,
@@ -848,7 +830,7 @@ inline void debug_event_loop() {
         g_state.debugger_error.store(ERROR_INVALID_PARAMETER);
         g_state.debug_loop_tid.store(0, std::memory_order_release);
         diag::log_tagged_fmt("pre_encrypt_hook",
-            "debug_loop_exit_invalid pid=%u tid=%lu elapsed_ms=%llu driver=%d",
+            "kernel_context_loop_exit_invalid pid=%u tid=%lu elapsed_ms=%llu driver=%d",
             pid,
             static_cast<unsigned long>(tid),
             static_cast<unsigned long long>(GetTickCount64() - start_ms),
@@ -856,112 +838,49 @@ inline void debug_event_loop() {
         return;
     }
 
-    diag::log_tagged_fmt("pre_encrypt_hook",
-        "debug_active_process_begin pid=%u tid=%lu",
-        pid,
-        static_cast<unsigned long>(tid));
-    if (!DebugActiveProcess(pid)) {
-        g_state.debugger_error.store(GetLastError());
-        g_state.polling.store(false);
-        g_state.debug_loop_running.store(false);
-        g_state.active.store(false);
-        g_state.debug_loop_tid.store(0, std::memory_order_release);
-        diag::log_tagged_fmt("pre_encrypt_hook",
-            "debug_loop_exit_attach_failed pid=%u tid=%lu elapsed_ms=%llu error=%lu",
-            pid,
-            static_cast<unsigned long>(tid),
-            static_cast<unsigned long long>(GetTickCount64() - start_ms),
-            static_cast<unsigned long>(g_state.debugger_error.load()));
-        return;
-    }
-
-    DebugSetProcessKillOnExit(FALSE);
     g_state.debug_attached.store(true);
     g_state.debugger_error.store(0);
     const uint32_t initial_armed = arm_existing_threads();
     diag::log_tagged_fmt("pre_encrypt_hook",
-        "debug_active_process_ok pid=%u tid=%lu initial_armed=%u kill_on_exit=0",
+        "kernel_context_loop_armed pid=%u tid=%lu initial_armed=%u",
         pid,
         static_cast<unsigned long>(tid),
         initial_armed);
 
-    bool initial_break_pending = true;
-    uint64_t event_count = 0;
+    uint64_t poll_count = 0;
     while (g_state.polling.load()) {
-        DEBUG_EVENT evt{};
-        if (!WaitForDebugEvent(&evt, 100))
-            continue;
-
-        ++event_count;
-        DWORD continue_status = DBG_CONTINUE;
-        if (evt.dwDebugEventCode == EXCEPTION_DEBUG_EVENT) {
-            const DWORD code = evt.u.Exception.ExceptionRecord.ExceptionCode;
-            if (event_count <= 32 || code == EXCEPTION_SINGLE_STEP) {
-                diag::log_tagged_fmt("pre_encrypt_hook",
-                    "debug_event_exception pid=%lu tid=%lu code=0x%08lX first=%lu addr=%p count=%llu",
-                    evt.dwProcessId,
-                    evt.dwThreadId,
-                    code,
-                    evt.u.Exception.dwFirstChance,
-                    evt.u.Exception.ExceptionRecord.ExceptionAddress,
-                    static_cast<unsigned long long>(event_count));
-            }
-            if (code == EXCEPTION_SINGLE_STEP) {
-                if (!capture_breakpoint_hit(evt))
-                    continue_status = DBG_EXCEPTION_NOT_HANDLED;
-            } else if (code == EXCEPTION_BREAKPOINT && evt.u.Exception.dwFirstChance != 0 && initial_break_pending) {
-                initial_break_pending = false;
-                continue_status = DBG_CONTINUE;
-            } else {
-                continue_status = DBG_EXCEPTION_NOT_HANDLED;
-            }
-        } else if (evt.dwDebugEventCode == CREATE_THREAD_DEBUG_EVENT) {
-            diag::log_tagged_fmt("pre_encrypt_hook",
-                "debug_event_create_thread pid=%lu tid=%lu",
-                evt.dwProcessId,
-                evt.dwThreadId);
-            arm_breakpoints_for_thread(evt.dwThreadId);
-        } else if (evt.dwDebugEventCode == EXIT_THREAD_DEBUG_EVENT) {
-            diag::log_tagged_fmt("pre_encrypt_hook",
-                "debug_event_exit_thread pid=%lu tid=%lu",
-                evt.dwProcessId,
-                evt.dwThreadId);
-            remove_thread_armed(evt.dwThreadId);
-        } else if (evt.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT) {
-            diag::log_tagged_fmt("pre_encrypt_hook",
-                "debug_event_exit_process pid=%lu tid=%lu",
-                evt.dwProcessId,
-                evt.dwThreadId);
+        if (!driver_bridge::using_kernel_driver()) {
+            g_state.debugger_error.store(ERROR_INVALID_HANDLE);
             g_state.active.store(false);
             g_state.polling.store(false);
+            break;
         }
-
-        close_debug_event_handles(evt);
-        ContinueDebugEvent(evt.dwProcessId, evt.dwThreadId, continue_status);
+        if (targets_snapshot().empty()) {
+            g_state.active.store(false);
+            g_state.polling.store(false);
+            break;
+        }
+        if ((poll_count % 20) == 0)
+            arm_existing_threads();
+        poll_kernel_contexts(pid);
+        ++poll_count;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
     const uint32_t cleared = clear_armed_breakpoints();
-    if (g_state.debug_attached.exchange(false)) {
-        const BOOL stopped = DebugActiveProcessStop(pid);
-        diag::log_tagged_fmt("pre_encrypt_hook",
-            "debug_active_process_stop pid=%u ok=%d gle=%lu cleared=%u events=%llu",
-            pid,
-            stopped ? 1 : 0,
-            GetLastError(),
-            cleared,
-            static_cast<unsigned long long>(event_count));
-    }
+    g_state.debug_attached.store(false);
     g_state.polling.store(false);
     g_state.debug_loop_running.store(false);
     g_state.debug_loop_tid.store(0, std::memory_order_release);
     diag::log_tagged_fmt("pre_encrypt_hook",
-        "debug_loop_exit pid=%u tid=%lu elapsed_ms=%llu active=%d error=%lu events=%llu",
+        "kernel_context_loop_exit pid=%u tid=%lu elapsed_ms=%llu active=%d error=%lu polls=%llu cleared=%u",
         pid,
         static_cast<unsigned long>(tid),
         static_cast<unsigned long long>(GetTickCount64() - start_ms),
         g_state.active.load() ? 1 : 0,
         static_cast<unsigned long>(g_state.debugger_error.load()),
-        static_cast<unsigned long long>(event_count));
+        static_cast<unsigned long long>(poll_count),
+        cleared);
 }
 
 inline bool hook_address_with_kind(uint64_t address, const std::string& name,
@@ -1319,7 +1238,7 @@ inline uint32_t unhook_all() {
     for (int i = 0; i < 120 && g_state.debug_loop_running.load(); ++i)
         std::this_thread::sleep_for(std::chrono::milliseconds(25));
     if (g_state.debug_loop_running.load()) {
-        diag::log_tagged_fmt("pre_encrypt_hook", "debug_loop_join_timeout pid=%u attached=%d running=%d error=%lu",
+        diag::log_tagged_fmt("pre_encrypt_hook", "kernel_context_loop_join_timeout pid=%u attached=%d running=%d error=%lu",
             g_state.attached_pid,
             g_state.debug_attached.load() ? 1 : 0,
             g_state.debug_loop_running.load() ? 1 : 0,
@@ -1367,14 +1286,14 @@ inline bool start_polling() {
 
     bool posted = false;
     try {
-        posted = work_queue::post([]() { debug_event_loop(); });
+        posted = work_queue::post([]() { kernel_context_loop(); });
     } catch (...) {
         posted = false;
     }
     if (!posted) {
         const auto qs = work_queue::stats();
         diag::log_tagged_fmt("pre_encrypt_hook",
-            "debug_loop_post_failed cq_alive=%d cq_shutdown=%d cq_pending=%zu cq_active=%u cq_posted=%llu cq_rejected=%llu",
+            "kernel_context_loop_post_failed cq_alive=%d cq_shutdown=%d cq_pending=%zu cq_active=%u cq_posted=%llu cq_rejected=%llu",
             qs.alive ? 1 : 0,
             qs.shutting_down ? 1 : 0,
             qs.pending,
@@ -1388,7 +1307,7 @@ inline bool start_polling() {
     }
     const auto qs = work_queue::stats();
     diag::log_tagged_fmt("pre_encrypt_hook",
-        "debug_loop_posted cq_alive=%d cq_shutdown=%d cq_pending=%zu cq_active=%u cq_started=%llu cq_finished=%llu",
+        "kernel_context_loop_posted cq_alive=%d cq_shutdown=%d cq_pending=%zu cq_active=%u cq_started=%llu cq_finished=%llu",
         qs.alive ? 1 : 0,
         qs.shutting_down ? 1 : 0,
         qs.pending,

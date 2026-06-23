@@ -6,9 +6,65 @@
 namespace whoswho_kernel_layout {
     inline volatile ULONG g_build_number = 0;
     inline volatile LONG g_build_resolved = 0;
+    inline volatile LONG g_static_layout_logged = 0;
 
     __forceinline void cpu_pause() {
         _mm_pause();
+    }
+
+    __forceinline void log_static_layout_once(ULONG build) {
+        if (_InterlockedCompareExchange(&g_static_layout_logged, 1, 0) != 0)
+            return;
+
+        SIZE_T unique_pid = 0;
+        SIZE_T active_links = 0;
+        SIZE_T object_table = 0;
+        SIZE_T debug_port = 0;
+        SIZE_T instrumentation_callback = 0;
+        SIZE_T active_threads = 0;
+        const char* source = "unsupported_build";
+
+        if (build >= 22000) {
+            unique_pid = 0x1D0;
+            active_links = 0x1D8;
+            object_table = 0x300;
+            debug_port = 0x308;
+            instrumentation_callback = 0x168;
+            active_threads = 0x380;
+            source = "static_table_win11";
+        } else if (build >= 19041) {
+            unique_pid = 0x440;
+            active_links = 0x448;
+            object_table = 0x570;
+            debug_port = 0x578;
+            instrumentation_callback = 0x460;
+            active_threads = 0x5F0;
+            source = "static_table_win10_2004_plus";
+        } else if (build >= 17763) {
+            unique_pid = 0x440;
+            active_links = 0x448;
+            object_table = 0x570;
+            debug_port = 0x550;
+            instrumentation_callback = 0x460;
+            active_threads = 0x5F0;
+            source = "static_table_win10_1809";
+        }
+
+        BOOLEAN valid = (build != 0 && unique_pid != 0 && active_links != 0 &&
+            object_table != 0 && debug_port != 0 &&
+            instrumentation_callback != 0 && active_threads != 0);
+        WW_LOG("KVALIDATE build=%lu kind=layout name=EPROCESS source=%s offset=0x%llx validation=%s evidence=\"UniqueProcessId=0x%llx ActiveProcessLinks=0x%llx ObjectTable=0x%llx DebugPort=0x%llx InstrumentationCallback=0x%llx ActiveThreads=0x%llx\" fail_closed=%s",
+            build,
+            source,
+            static_cast<unsigned long long>(unique_pid),
+            ww_kernel_validation_state(valid),
+            static_cast<unsigned long long>(unique_pid),
+            static_cast<unsigned long long>(active_links),
+            static_cast<unsigned long long>(object_table),
+            static_cast<unsigned long long>(debug_port),
+            static_cast<unsigned long long>(instrumentation_callback),
+            static_cast<unsigned long long>(active_threads),
+            valid ? "none" : "unsupported_or_unknown_build");
     }
 
     __forceinline ULONG build_number() {
@@ -37,6 +93,7 @@ namespace whoswho_kernel_layout {
 
         KeMemoryBarrier();
         _InterlockedExchange(&g_build_resolved, 2);
+        log_static_layout_once(g_build_number);
         return g_build_number;
     }
 

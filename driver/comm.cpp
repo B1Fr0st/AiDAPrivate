@@ -2840,6 +2840,7 @@ bool voyager::device_t::suspend_thread(std::uint32_t tid, std::uint32_t* prev_co
     voyager::detail::suspend_resume_request req{};
     req.tid = tid;
     req.should_resume = 0;
+    req.pid = process_id_;
 
     bool ok = send_request(ioctl_codes::TSR(), &req, sizeof(req));
     if (ok && prev_count) *prev_count = req.previous_count;
@@ -2854,10 +2855,49 @@ bool voyager::device_t::resume_thread(std::uint32_t tid, std::uint32_t* prev_cou
     voyager::detail::suspend_resume_request req{};
     req.tid = tid;
     req.should_resume = 1;
+    req.pid = process_id_;
 
     bool ok = send_request(ioctl_codes::TSR(), &req, sizeof(req));
     if (ok && prev_count) *prev_count = req.previous_count;
     return ok;
+}
+
+bool voyager::device_t::query_thread_basic_information(std::uint32_t tid, detail::thread_query_information_request& info) noexcept {
+    std::memset(&info, 0, sizeof(info));
+    if (!is_connected() || process_id_ == 0 || tid == 0) {
+        return false;
+    }
+
+    info.pid = process_id_;
+    info.tid = tid;
+    info.info_class = 0;
+    bool ok = send_request(ioctl_codes::TQIF(), &info, sizeof(info));
+    return ok && info.status == 0;
+}
+
+bool voyager::device_t::terminate_thread(std::uint32_t tid, std::uint32_t exit_status) noexcept {
+    if (!is_connected() || process_id_ == 0 || tid == 0) {
+        return false;
+    }
+
+    voyager::detail::terminate_thread_request req{};
+    req.pid = process_id_;
+    req.tid = tid;
+    req.exit_status = exit_status;
+    bool ok = send_request(ioctl_codes::TTERM(), &req, sizeof(req));
+    return ok && req.status == 0;
+}
+
+bool voyager::device_t::close_process_handle(std::uint32_t pid, std::uint64_t handle_value) noexcept {
+    if (!is_connected() || pid == 0 || handle_value == 0) {
+        return false;
+    }
+
+    voyager::detail::close_handle_request req{};
+    req.pid = pid;
+    req.handle_value = handle_value;
+    bool ok = send_request(ioctl_codes::HCLS(), &req, sizeof(req));
+    return ok && req.status == 0;
 }
 
 bool voyager::device_t::query_memory(std::uint64_t address, memory_region_info& info) noexcept {
@@ -3143,7 +3183,62 @@ bool voyager::device_t::set_hardware_breakpoint(std::uint32_t tid, int index, st
     std::uint64_t mask = (1ULL << 22) | (1ULL << 23);
     mask |= (1ULL << (18 + index));
 
-    return set_thread_context(tid, ctx, mask);
+    if (!set_thread_context(tid, ctx, mask)) {
+        RC_UM_DBG("set_hardware_breakpoint: set_context_failed pid=%u tid=%u index=%d address=0x%llX type=%d size=%d dr7=0x%llX mask=0x%llX",
+            process_id_,
+            tid,
+            index,
+            address,
+            type,
+            size,
+            ctx.dr7,
+            mask);
+        return false;
+    }
+
+    thread_context verify{};
+    if (!get_thread_context(tid, verify)) {
+        RC_UM_DBG("set_hardware_breakpoint: verify_get_failed pid=%u tid=%u index=%d address=0x%llX",
+            process_id_,
+            tid,
+            index,
+            address);
+        return false;
+    }
+
+    std::uint64_t verify_addr = 0;
+    switch (index) {
+        case 0: verify_addr = verify.dr0; break;
+        case 1: verify_addr = verify.dr1; break;
+        case 2: verify_addr = verify.dr2; break;
+        case 3: verify_addr = verify.dr3; break;
+    }
+    const bool enabled = (verify.dr7 & (1ULL << (index * 2))) != 0;
+    const bool address_ok = verify_addr == address;
+    const bool dr7_ok = (verify.dr7 & ((3ULL << (16 + index * 4)) | (3ULL << (18 + index * 4)))) ==
+        (ctx.dr7 & ((3ULL << (16 + index * 4)) | (3ULL << (18 + index * 4))));
+    if (!enabled || !address_ok || !dr7_ok) {
+        RC_UM_DBG("set_hardware_breakpoint: verify_mismatch pid=%u tid=%u index=%d address=0x%llX verify_addr=0x%llX dr7=0x%llX expected_dr7=0x%llX enabled=%d address_ok=%d dr7_ok=%d",
+            process_id_,
+            tid,
+            index,
+            address,
+            verify_addr,
+            verify.dr7,
+            ctx.dr7,
+            enabled ? 1 : 0,
+            address_ok ? 1 : 0,
+            dr7_ok ? 1 : 0);
+        return false;
+    }
+
+    RC_UM_DBG("set_hardware_breakpoint: verify_ok pid=%u tid=%u index=%d address=0x%llX dr7=0x%llX",
+        process_id_,
+        tid,
+        index,
+        address,
+        verify.dr7);
+    return true;
 }
 
 bool voyager::device_t::clear_hardware_breakpoint(std::uint32_t tid, int index) noexcept {
@@ -3177,7 +3272,16 @@ bool voyager::device_t::clear_hardware_breakpoint(std::uint32_t tid, int index) 
 
     std::uint64_t mask = (1ULL << (18 + index)) | (1ULL << 22) | (1ULL << 23);
 
-    return set_thread_context(tid, ctx, mask);
+    if (!set_thread_context(tid, ctx, mask)) {
+        RC_UM_DBG("clear_hardware_breakpoint: set_context_failed pid=%u tid=%u index=%d dr7=0x%llX mask=0x%llX",
+            process_id_,
+            tid,
+            index,
+            ctx.dr7,
+            mask);
+        return false;
+    }
+    return true;
 }
 
 

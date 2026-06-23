@@ -468,6 +468,7 @@ namespace net_capture {
     inline volatile LONG g_wfp_initialized = 0;
     inline volatile LONG g_wfp_degraded = 0;
     inline volatile LONG g_capture_active = 0;
+    inline volatile LONG64 g_hot_filter_rejects = 0;
     inline HANDLE g_engine_handle = nullptr;
     inline PDEVICE_OBJECT g_device_object = nullptr;
 
@@ -922,6 +923,22 @@ namespace net_capture {
         return 0;
     }
 
+    __forceinline BOOLEAN packet_matches_capture_filters(UINT32 protocol,
+                                                          UINT32 pid,
+                                                          UINT32 local_port,
+                                                          UINT32 remote_port,
+                                                          UINT32 af,
+                                                          const UINT8* remote_ip) {
+        if (g_filter_pid != 0 && pid != g_filter_pid) return FALSE;
+        if (g_filter_port != 0 && local_port != g_filter_port && remote_port != g_filter_port) return FALSE;
+        if (g_filter_protocol != 0 && protocol != g_filter_protocol) return FALSE;
+        if (!is_zero_ip(g_filter_ip)) {
+            UINT8 mask[16];
+            strong::kmemset(mask, 0xFF, sizeof(mask));
+            if (!remote_ip || !ip_matches(remote_ip, g_filter_ip, mask, af)) return FALSE;
+        }
+        return TRUE;
+    }
 
     __forceinline void store_packet(UINT32 direction, UINT32 protocol,
                                      UINT32 pid, UINT32 local_port, UINT32 remote_port,
@@ -930,20 +947,9 @@ namespace net_capture {
         if (!g_ring_buffer) return;
 
         UINT32 effective_pid = pid;
-        if (effective_pid == 0 && g_filter_pid != 0) {
+        if (!packet_matches_capture_filters(protocol, effective_pid, local_port, remote_port, af, remote_ip)) {
+            _InterlockedIncrement64(&g_hot_filter_rejects);
             return;
-        }
-
-
-        if (g_filter_pid != 0 && effective_pid != g_filter_pid) {
-            return;
-        }
-        if (g_filter_port != 0 && local_port != g_filter_port && remote_port != g_filter_port) return;
-        if (g_filter_protocol != 0 && protocol != g_filter_protocol) return;
-        if (!is_zero_ip(g_filter_ip)) {
-            UINT8 mask[16];
-            strong::kmemset(mask, 0xFF, sizeof(mask));
-            if (!ip_matches(remote_ip, g_filter_ip, mask, af)) return;
         }
 
         UINT32 cap_len = payload_len;
@@ -1182,9 +1188,6 @@ namespace net_capture {
             UINT8 local_ip[16] = {};
             UINT8 remote_ip[16] = {};
             UINT32 pid = 0;
-            UINT32 metadata_pid = 0;
-            UINT32 metadata_pid_present = 0;
-            UINT32 pid_source = 0;
 
             if (inFixedValues->valueCount > FWPS_FIELD_IN_TRANS_V4_PROTOCOL) {
                 protocol = inFixedValues->incomingValue[FWPS_FIELD_IN_TRANS_V4_PROTOCOL].value.uint8;
@@ -1206,9 +1209,6 @@ namespace net_capture {
 
             if ((inMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_PROCESS_ID_) != 0) {
                 pid = (UINT32)inMetaValues->processId;
-                metadata_pid = pid;
-                metadata_pid_present = 1;
-                if (pid != 0) pid_source = 1;
             }
             if (pid != 0 && inMetaValues->transportEndpointHandle != 0) {
                 aida_store_cached_endpoint_pid(inMetaValues->transportEndpointHandle,
@@ -1217,11 +1217,9 @@ namespace net_capture {
             if (pid == 0) {
                 pid = aida_resolve_packet_pid(inMetaValues->transportEndpointHandle,
                     protocol, local_port, remote_port);
-                if (pid != 0) pid_source = 2;
             }
             if (pid == 0) {
                 pid = aida_lookup_cached_port_pid(protocol, local_port, remote_port);
-                if (pid != 0) pid_source = 3;
             }
             if (pid == 0 && protocol == 17) {
                 UINT32 lip = ((UINT32)local_ip[0] << 24) | ((UINT32)local_ip[1] << 16) |
@@ -1229,7 +1227,6 @@ namespace net_capture {
                 UINT32 rip = ((UINT32)remote_ip[0] << 24) | ((UINT32)remote_ip[1] << 16) |
                              ((UINT32)remote_ip[2] << 8) | remote_ip[3];
                 pid = net_udp_cache::lookup(rip, lip, (UINT16)remote_port, (UINT16)local_port);
-                if (pid != 0) pid_source = 4;
             }
             if (pid != 0) {
                 aida_store_cached_port_pid(protocol, local_port, pid);
@@ -1242,22 +1239,12 @@ namespace net_capture {
                     net_udp_cache::store(rip, lip, (UINT16)remote_port, (UINT16)local_port, pid);
                 }
             }
-            if (g_capture_active || net_dpi::is_active() || net_redirect::has_active_rules() || net_dns_spoof::has_active_rules()) {
-                WW_LOG("net_classify::in pid_attribution protocol=%u metadata_present=%u metadata_pid=%u final_pid=%u source=%u endpoint=0x%llX tuple=%u.%u.%u.%u:%u<-%u.%u.%u.%u:%u iface_src=%u iface_dst=%u compartment=%lu capture_active=%ld dpi_active=%u",
-                    protocol,
-                    metadata_pid_present,
-                    metadata_pid,
-                    pid,
-                    pid_source,
-                    (unsigned long long)inMetaValues->transportEndpointHandle,
-                    local_ip[0], local_ip[1], local_ip[2], local_ip[3], local_port,
-                    remote_ip[0], remote_ip[1], remote_ip[2], remote_ip[3], remote_port,
-                    inMetaValues->sourceInterfaceIndex,
-                    inMetaValues->destinationInterfaceIndex,
-                    inMetaValues->compartmentId,
-                    g_capture_active,
-                    net_dpi::is_active() ? 1u : 0u);
-            }
+            BOOLEAN capture_active_now = (g_capture_active != 0);
+            BOOLEAN capture_filter_match = capture_active_now
+                ? packet_matches_capture_filters(protocol, pid, local_port, remote_port, 2, remote_ip)
+                : FALSE;
+            if (capture_active_now && !capture_filter_match)
+                _InterlockedIncrement64(&g_hot_filter_rejects);
 
             _InterlockedIncrement64(&g_global_pkts_recv);
 
@@ -1287,16 +1274,13 @@ namespace net_capture {
                 if (g_active_rule_count != 0) need_full_pipeline = TRUE;
                 if (!need_full_pipeline && net_mod::has_active_rules()) need_full_pipeline = TRUE;
                 if (!need_full_pipeline && net_intercept::is_active()) need_full_pipeline = TRUE;
-                if (!need_full_pipeline && net_dpi::is_active()) need_full_pipeline = TRUE;
+                if (!need_full_pipeline && net_dpi::is_active() && (!capture_active_now || capture_filter_match)) need_full_pipeline = TRUE;
                 if (!need_full_pipeline && net_fingerprint::is_active()) need_full_pipeline = TRUE;
                 if (!need_full_pipeline && net_dns_spoof::has_active_rules()) need_full_pipeline = TRUE;
                 if (!need_full_pipeline && net_redirect::has_active_rules()) need_full_pipeline = TRUE;
                 if (!need_full_pipeline && net_stream::has_active_streams()) need_full_pipeline = TRUE;
                 if (!need_full_pipeline && malsafe_log_inbound) need_full_pipeline = TRUE;
-                if (!need_full_pipeline) {
-                    if (!g_capture_active || (g_filter_pid != 0 && pid != g_filter_pid))
-                        __leave;
-                }
+                if (!need_full_pipeline && !capture_filter_match) __leave;
             }
 
             pkt_data = (UINT8*)ExAllocatePool2(POOL_FLAG_NON_PAGED, NET_PKT_MAX_PAYLOAD, 'pdNW');
@@ -1306,18 +1290,6 @@ namespace net_capture {
 
             UINT32 pkt_len = 0;
             pkt_len = copy_transport_bytes(layerData, pkt_data, NET_PKT_MAX_PAYLOAD);
-            if (g_capture_active || net_dpi::is_active() || net_dns_spoof::has_active_rules()) {
-                UINT32 transport_len = get_transport_data_length(layerData);
-                WW_LOG("net_classify::in payload_copy protocol=%u pid=%u tuple=%u.%u.%u.%u:%u<-%u.%u.%u.%u:%u transport_len=%u copied_len=%u max=%u layerData=%p",
-                    protocol,
-                    pid,
-                    local_ip[0], local_ip[1], local_ip[2], local_ip[3], local_port,
-                    remote_ip[0], remote_ip[1], remote_ip[2], remote_ip[3], remote_port,
-                    transport_len,
-                    pkt_len,
-                    NET_PKT_MAX_PAYLOAD,
-                    layerData);
-            }
             if (pkt_len == 0 && layerData) {
             }
 
@@ -1647,7 +1619,7 @@ namespace net_capture {
             }
 
 
-            {
+            if (net_dpi::is_active()) {
                 LARGE_INTEGER dpi_ts;
                 KeQuerySystemTime(&dpi_ts);
                 net_dpi::analyze_packet(dpi_ts.QuadPart, 0, protocol,
@@ -1666,7 +1638,7 @@ namespace net_capture {
             }
 
 
-            if (g_capture_active) {
+            if (capture_filter_match) {
                 store_packet(0, protocol, pid, local_port, remote_port,
                     2, local_ip, remote_ip, pkt_data, pkt_len);
 
@@ -1744,9 +1716,6 @@ namespace net_capture {
             UINT8 local_ip[16] = {};
             UINT8 remote_ip[16] = {};
             UINT32 pid = 0;
-            UINT32 metadata_pid = 0;
-            UINT32 metadata_pid_present = 0;
-            UINT32 pid_source = 0;
 
             if (inFixedValues->valueCount > FWPS_FIELD_OUT_TRANS_V4_PROTOCOL) {
                 protocol = inFixedValues->incomingValue[FWPS_FIELD_OUT_TRANS_V4_PROTOCOL].value.uint8;
@@ -1768,9 +1737,6 @@ namespace net_capture {
 
             if ((inMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_PROCESS_ID_) != 0) {
                 pid = (UINT32)inMetaValues->processId;
-                metadata_pid = pid;
-                metadata_pid_present = 1;
-                if (pid != 0) pid_source = 1;
             }
             if (pid != 0 && inMetaValues->transportEndpointHandle != 0) {
                 aida_store_cached_endpoint_pid(inMetaValues->transportEndpointHandle,
@@ -1779,11 +1745,9 @@ namespace net_capture {
             if (pid == 0) {
                 pid = aida_resolve_packet_pid(inMetaValues->transportEndpointHandle,
                     protocol, local_port, remote_port);
-                if (pid != 0) pid_source = 2;
             }
             if (pid == 0) {
                 pid = aida_lookup_cached_port_pid(protocol, local_port, remote_port);
-                if (pid != 0) pid_source = 3;
             }
             if (pid == 0 && protocol == 17) {
                 UINT32 lip = ((UINT32)local_ip[0] << 24) | ((UINT32)local_ip[1] << 16) |
@@ -1791,7 +1755,6 @@ namespace net_capture {
                 UINT32 rip = ((UINT32)remote_ip[0] << 24) | ((UINT32)remote_ip[1] << 16) |
                              ((UINT32)remote_ip[2] << 8) | remote_ip[3];
                 pid = net_udp_cache::lookup(lip, rip, (UINT16)local_port, (UINT16)remote_port);
-                if (pid != 0) pid_source = 4;
             }
             if (pid != 0) {
                 aida_store_cached_port_pid(protocol, local_port, pid);
@@ -1804,24 +1767,12 @@ namespace net_capture {
                     net_udp_cache::store(lip, rip, (UINT16)local_port, (UINT16)remote_port, pid);
                 }
             }
-            if (g_capture_active || net_dpi::is_active() || net_redirect::has_active_rules() || net_dns_spoof::has_active_rules()) {
-                WW_LOG("net_classify::out pid_attribution protocol=%u metadata_present=%u metadata_pid=%u final_pid=%u source=%u endpoint=0x%llX tuple=%u.%u.%u.%u:%u->%u.%u.%u.%u:%u iface_src=%u iface_dst=%u compartment=%lu capture_active=%ld dpi_active=%u redir_active=%u dns_active=%u",
-                    protocol,
-                    metadata_pid_present,
-                    metadata_pid,
-                    pid,
-                    pid_source,
-                    (unsigned long long)inMetaValues->transportEndpointHandle,
-                    local_ip[0], local_ip[1], local_ip[2], local_ip[3], local_port,
-                    remote_ip[0], remote_ip[1], remote_ip[2], remote_ip[3], remote_port,
-                    inMetaValues->sourceInterfaceIndex,
-                    inMetaValues->destinationInterfaceIndex,
-                    inMetaValues->compartmentId,
-                    g_capture_active,
-                    net_dpi::is_active() ? 1u : 0u,
-                    net_redirect::has_active_rules() ? 1u : 0u,
-                    net_dns_spoof::has_active_rules() ? 1u : 0u);
-            }
+            BOOLEAN capture_active_now = (g_capture_active != 0);
+            BOOLEAN capture_filter_match = capture_active_now
+                ? packet_matches_capture_filters(protocol, pid, local_port, remote_port, 2, remote_ip)
+                : FALSE;
+            if (capture_active_now && !capture_filter_match)
+                _InterlockedIncrement64(&g_hot_filter_rejects);
 
             _InterlockedIncrement64(&g_global_pkts_sent);
 
@@ -1851,16 +1802,13 @@ namespace net_capture {
                 if (g_active_rule_count != 0) need_full_pipeline = TRUE;
                 if (!need_full_pipeline && net_mod::has_active_rules()) need_full_pipeline = TRUE;
                 if (!need_full_pipeline && net_intercept::is_active()) need_full_pipeline = TRUE;
-                if (!need_full_pipeline && net_dpi::is_active()) need_full_pipeline = TRUE;
+                if (!need_full_pipeline && net_dpi::is_active() && (!capture_active_now || capture_filter_match)) need_full_pipeline = TRUE;
                 if (!need_full_pipeline && net_fingerprint::is_active()) need_full_pipeline = TRUE;
                 if (!need_full_pipeline && net_dns_spoof::has_active_rules()) need_full_pipeline = TRUE;
                 if (!need_full_pipeline && net_redirect::has_active_rules()) need_full_pipeline = TRUE;
                 if (!need_full_pipeline && net_stream::has_active_streams()) need_full_pipeline = TRUE;
                 if (!need_full_pipeline && malsafe_log_outbound) need_full_pipeline = TRUE;
-                if (!need_full_pipeline) {
-                    if (!g_capture_active || (g_filter_pid != 0 && pid != g_filter_pid))
-                        __leave;
-                }
+                if (!need_full_pipeline && !capture_filter_match) __leave;
             }
 
             pkt_data = (UINT8*)ExAllocatePool2(POOL_FLAG_NON_PAGED, NET_PKT_MAX_PAYLOAD, 'pdNW');
@@ -1870,18 +1818,6 @@ namespace net_capture {
 
             UINT32 pkt_len = 0;
             pkt_len = copy_transport_bytes(layerData, pkt_data, NET_PKT_MAX_PAYLOAD);
-            if (g_capture_active || net_dpi::is_active() || net_redirect::has_active_rules() || net_dns_spoof::has_active_rules()) {
-                UINT32 transport_len = get_transport_data_length(layerData);
-                WW_LOG("net_classify::out payload_copy protocol=%u pid=%u tuple=%u.%u.%u.%u:%u->%u.%u.%u.%u:%u transport_len=%u copied_len=%u max=%u layerData=%p",
-                    protocol,
-                    pid,
-                    local_ip[0], local_ip[1], local_ip[2], local_ip[3], local_port,
-                    remote_ip[0], remote_ip[1], remote_ip[2], remote_ip[3], remote_port,
-                    transport_len,
-                    pkt_len,
-                    NET_PKT_MAX_PAYLOAD,
-                    layerData);
-            }
             if (pkt_len == 0 && layerData) {
             }
 
@@ -2097,7 +2033,7 @@ namespace net_capture {
             }
 
 
-            {
+            if (net_dpi::is_active()) {
                 LARGE_INTEGER dpi_ts;
                 KeQuerySystemTime(&dpi_ts);
                 net_dpi::analyze_packet(dpi_ts.QuadPart, 1, protocol,
@@ -2115,7 +2051,7 @@ namespace net_capture {
                 __leave;
             }
 
-            if (g_capture_active) {
+            if (capture_filter_match) {
                 store_packet(1, protocol, pid, local_port, remote_port,
                     2, local_ip, remote_ip, pkt_data, pkt_len);
 
@@ -2193,9 +2129,6 @@ namespace net_capture {
             UINT8 local_ip[16] = {};
             UINT8 remote_ip[16] = {};
             UINT32 pid = 0;
-            UINT32 metadata_pid = 0;
-            UINT32 metadata_pid_present = 0;
-            UINT32 pid_source = 0;
 
             if (inFixedValues->valueCount > FWPS_FIELD_DATAGRAM_V4_PROTOCOL) {
                 protocol = inFixedValues->incomingValue[FWPS_FIELD_DATAGRAM_V4_PROTOCOL].value.uint8;
@@ -2223,9 +2156,6 @@ namespace net_capture {
 
             if ((inMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_PROCESS_ID_) != 0) {
                 pid = (UINT32)inMetaValues->processId;
-                metadata_pid = pid;
-                metadata_pid_present = 1;
-                if (pid != 0) pid_source = 1;
             }
             if (pid != 0 && inMetaValues->transportEndpointHandle != 0) {
                 aida_store_cached_endpoint_pid(inMetaValues->transportEndpointHandle,
@@ -2234,11 +2164,9 @@ namespace net_capture {
             if (pid == 0) {
                 pid = aida_resolve_packet_pid(inMetaValues->transportEndpointHandle,
                     protocol, local_port, remote_port);
-                if (pid != 0) pid_source = 2;
             }
             if (pid == 0) {
                 pid = aida_lookup_cached_port_pid(protocol, local_port, remote_port);
-                if (pid != 0) pid_source = 3;
             }
             if (pid == 0) {
                 UINT32 lip = ((UINT32)local_ip[0] << 24) | ((UINT32)local_ip[1] << 16) |
@@ -2250,7 +2178,6 @@ namespace net_capture {
                 } else {
                     pid = net_udp_cache::lookup(lip, rip, (UINT16)local_port, (UINT16)remote_port);
                 }
-                if (pid != 0) pid_source = 4;
             }
             if (pid != 0) {
                 aida_store_cached_port_pid(protocol, local_port, pid);
@@ -2265,26 +2192,12 @@ namespace net_capture {
                     net_udp_cache::store(lip, rip, (UINT16)local_port, (UINT16)remote_port, pid);
                 }
             }
-            if (g_capture_active || net_dpi::is_active() || net_redirect::has_active_rules() || net_dns_spoof::has_active_rules()) {
-                WW_LOG("net_classify::datagram pid_attribution direction=%u protocol=%u metadata_present=%u metadata_pid=%u final_pid=%u source=%u endpoint=0x%llX tuple=%u.%u.%u.%u:%u%s%u.%u.%u.%u:%u iface_src=%u iface_dst=%u compartment=%lu capture_active=%ld dpi_active=%u redir_active=%u dns_active=%u",
-                    direction,
-                    protocol,
-                    metadata_pid_present,
-                    metadata_pid,
-                    pid,
-                    pid_source,
-                    (unsigned long long)inMetaValues->transportEndpointHandle,
-                    local_ip[0], local_ip[1], local_ip[2], local_ip[3], local_port,
-                    direction == 0 ? "<-" : "->",
-                    remote_ip[0], remote_ip[1], remote_ip[2], remote_ip[3], remote_port,
-                    inMetaValues->sourceInterfaceIndex,
-                    inMetaValues->destinationInterfaceIndex,
-                    inMetaValues->compartmentId,
-                    g_capture_active,
-                    net_dpi::is_active() ? 1u : 0u,
-                    net_redirect::has_active_rules() ? 1u : 0u,
-                    net_dns_spoof::has_active_rules() ? 1u : 0u);
-            }
+            BOOLEAN capture_active_now = (g_capture_active != 0);
+            BOOLEAN capture_filter_match = capture_active_now
+                ? packet_matches_capture_filters(protocol, pid, local_port, remote_port, 2, remote_ip)
+                : FALSE;
+            if (capture_active_now && !capture_filter_match)
+                _InterlockedIncrement64(&g_hot_filter_rejects);
 
             UINT32 data_length = get_transport_data_length(layerData);
             if (direction == 0) {
@@ -2309,14 +2222,11 @@ namespace net_capture {
             if (g_active_rule_count != 0) need_full_pipeline = TRUE;
             if (!need_full_pipeline && net_mod::has_active_rules()) need_full_pipeline = TRUE;
             if (!need_full_pipeline && net_intercept::is_active()) need_full_pipeline = TRUE;
-            if (!need_full_pipeline && net_dpi::is_active()) need_full_pipeline = TRUE;
+            if (!need_full_pipeline && net_dpi::is_active() && (!capture_active_now || capture_filter_match)) need_full_pipeline = TRUE;
             if (!need_full_pipeline && net_dns_spoof::has_active_rules()) need_full_pipeline = TRUE;
             if (!need_full_pipeline && net_redirect::has_active_rules()) need_full_pipeline = TRUE;
             if (!need_full_pipeline && malsafe_log) need_full_pipeline = TRUE;
-            if (!need_full_pipeline) {
-                if (!g_capture_active || (g_filter_pid != 0 && pid != g_filter_pid))
-                    __leave;
-            }
+            if (!need_full_pipeline && !capture_filter_match) __leave;
 
             pkt_data = (UINT8*)ExAllocatePool2(POOL_FLAG_NON_PAGED, NET_PKT_MAX_PAYLOAD, 'pdNW');
             if (!pkt_data) __leave;
@@ -2326,20 +2236,6 @@ namespace net_capture {
             }
 
             UINT32 pkt_len = copy_transport_bytes(layerData, pkt_data, NET_PKT_MAX_PAYLOAD);
-            if (g_capture_active || net_dpi::is_active() || net_redirect::has_active_rules() || net_dns_spoof::has_active_rules()) {
-                UINT32 transport_len = get_transport_data_length(layerData);
-                WW_LOG("net_classify::datagram payload_copy direction=%u protocol=%u pid=%u tuple=%u.%u.%u.%u:%u%s%u.%u.%u.%u:%u transport_len=%u copied_len=%u max=%u layerData=%p",
-                    direction,
-                    protocol,
-                    pid,
-                    local_ip[0], local_ip[1], local_ip[2], local_ip[3], local_port,
-                    direction == 0 ? "<-" : "->",
-                    remote_ip[0], remote_ip[1], remote_ip[2], remote_ip[3], remote_port,
-                    transport_len,
-                    pkt_len,
-                    NET_PKT_MAX_PAYLOAD,
-                    layerData);
-            }
             if (pkt_len == 0) __leave;
 
             if (protocol == 17 && (local_port == 53 || remote_port == 53) && net_dns_spoof::has_active_rules()) {
@@ -2617,7 +2513,7 @@ namespace net_capture {
                 }
             }
 
-            {
+            if (net_dpi::is_active()) {
                 LARGE_INTEGER dpi_ts;
                 KeQuerySystemTime(&dpi_ts);
                 net_dpi::analyze_packet(dpi_ts.QuadPart, direction, protocol,
@@ -2637,7 +2533,7 @@ namespace net_capture {
                 __leave;
             }
 
-            if (g_capture_active) {
+            if (capture_filter_match) {
                 store_packet(direction, protocol, pid, local_port, remote_port,
                     2, local_ip, remote_ip, pkt_data, pkt_len);
                 if (local_port == 53 || remote_port == 53) {
@@ -2854,6 +2750,39 @@ namespace net_capture {
                 _FwpmFilterDestroyEnumHandle0 && _FwpmFilterEnum0 &&
                 _FwpmCalloutCreateEnumHandle0 && _FwpmCalloutDestroyEnumHandle0 &&
                 _FwpmCalloutEnum0 && _FwpmFreeMemory0);
+        ULONG missing_mask = 0;
+        if (!_FwpsCalloutRegister2) missing_mask |= 0x00000001u;
+        if (!_FwpsCalloutUnregisterById0) missing_mask |= 0x00000002u;
+        if (!_FwpmEngineOpen0) missing_mask |= 0x00000004u;
+        if (!_FwpmEngineClose0) missing_mask |= 0x00000008u;
+        if (!_FwpmTransactionBegin0) missing_mask |= 0x00000010u;
+        if (!_FwpmTransactionCommit0) missing_mask |= 0x00000020u;
+        if (!_FwpmTransactionAbort0) missing_mask |= 0x00000040u;
+        if (!_FwpmCalloutAdd0) missing_mask |= 0x00000080u;
+        if (!_FwpmSubLayerAdd0) missing_mask |= 0x00000100u;
+        if (!_FwpmFilterAdd0) missing_mask |= 0x00000200u;
+        if (!_FwpmFilterDeleteById0) missing_mask |= 0x00000400u;
+        if (!_FwpmCalloutDeleteById0) missing_mask |= 0x00000800u;
+        if (!_FwpmSubLayerDeleteByKey0) missing_mask |= 0x00001000u;
+        if (!_FwpmFilterCreateEnumHandle0) missing_mask |= 0x00002000u;
+        if (!_FwpmFilterDestroyEnumHandle0) missing_mask |= 0x00004000u;
+        if (!_FwpmFilterEnum0) missing_mask |= 0x00008000u;
+        if (!_FwpmCalloutCreateEnumHandle0) missing_mask |= 0x00010000u;
+        if (!_FwpmCalloutDestroyEnumHandle0) missing_mask |= 0x00020000u;
+        if (!_FwpmCalloutEnum0) missing_mask |= 0x00040000u;
+        if (!_FwpmFreeMemory0) missing_mask |= 0x00080000u;
+        WW_LOG("KVALIDATE build=%lu kind=resolver name=WFP.FWPKCLNT.exports source=export_table value=%p validation=%s evidence=\"missing_mask=0x%08lX register=%p engine_open=%p filter_add=%p enum_filter=%p enum_callout=%p free=%p\" fail_closed=%s",
+            ww_kernel_validation_build(),
+            fwp_base,
+            ww_kernel_validation_state(ok),
+            missing_mask,
+            _FwpsCalloutRegister2,
+            _FwpmEngineOpen0,
+            _FwpmFilterAdd0,
+            _FwpmFilterEnum0,
+            _FwpmCalloutEnum0,
+            _FwpmFreeMemory0,
+            ok ? "none" : "critical_wfp_export_missing");
         NET_DBG("resolve_wfp_functions: Register2=%p UnregById=%p EngOpen=%p EngClose=%p",
                 _FwpsCalloutRegister2, _FwpsCalloutUnregisterById0,
                 _FwpmEngineOpen0, _FwpmEngineClose0);
@@ -3511,6 +3440,23 @@ namespace net_capture {
         NTSTATUS abort_status = STATUS_SUCCESS;
         if (g_engine_handle && _FwpmTransactionAbort0)
             abort_status = _FwpmTransactionAbort0(g_engine_handle);
+        WW_LOG("KVALIDATE build=%lu kind=layout name=WFP.registration source=bfe_runtime value=%p validation=fail evidence=\"step=%s status=0x%08X win32=%lu engine=%p callouts=%u/%u/%u/%u/%u filters=%llu/%llu/%llu/%llu/%llu\" fail_closed=register_wfp_abort",
+            ww_kernel_validation_build(),
+            g_engine_handle,
+            step ? step : "",
+            status,
+            status_to_win32(status),
+            g_engine_handle,
+            g_callout_id_inbound,
+            g_callout_id_outbound,
+            g_callout_id_datagram,
+            g_callout_id_ale_connect,
+            g_callout_id_ale_recv,
+            (unsigned long long)g_filter_id_inbound,
+            (unsigned long long)g_filter_id_outbound,
+            (unsigned long long)g_filter_id_datagram,
+            (unsigned long long)g_filter_id_ale_connect,
+            (unsigned long long)g_filter_id_ale_recv);
         WW_LOG("net_capture::register_wfp abort step=%s status=0x%08X win32=%lu abort_status=0x%08X abort_win32=%lu",
             step ? step : "",
             status,
@@ -3861,6 +3807,25 @@ namespace net_capture {
         NET_DBG("register_wfp: SUCCESS — inbound_id=%u outbound_id=%u ale_conn_id=%u ale_recv_id=%u",
                 g_callout_id_inbound, g_callout_id_outbound,
                 g_callout_id_ale_connect, g_callout_id_ale_recv);
+        WW_LOG("KVALIDATE build=%lu kind=layout name=WFP.registration source=bfe_runtime value=%p validation=pass evidence=\"engine=%p sublayer_weight=0xFFFF callouts=%u/%u/%u/%u/%u fwpm=%u/%u/%u/%u/%u filters=%llu/%llu/%llu/%llu/%llu layers=transport_v4,datagram_v4,ale_v4\" fail_closed=none",
+            ww_kernel_validation_build(),
+            g_engine_handle,
+            g_engine_handle,
+            g_callout_id_inbound,
+            g_callout_id_outbound,
+            g_callout_id_datagram,
+            g_callout_id_ale_connect,
+            g_callout_id_ale_recv,
+            g_fwpm_callout_id_inbound,
+            g_fwpm_callout_id_outbound,
+            g_fwpm_callout_id_datagram,
+            g_fwpm_callout_id_ale_connect,
+            g_fwpm_callout_id_ale_recv,
+            (unsigned long long)g_filter_id_inbound,
+            (unsigned long long)g_filter_id_outbound,
+            (unsigned long long)g_filter_id_datagram,
+            (unsigned long long)g_filter_id_ale_connect,
+            (unsigned long long)g_filter_id_ale_recv);
         return STATUS_SUCCESS;
     }
 
@@ -4280,10 +4245,75 @@ struct afd_endpoint_offsets_t {
 
 
 static const afd_endpoint_offsets_t g_afd_fallback_win10 = { 0xF8,  0xDC,  0xE0  };
-static const afd_endpoint_offsets_t g_afd_fallback_win11 = { 0x108, 0xEC,  0xF0  };
+static const afd_endpoint_offsets_t g_afd_fallback_win11 = { 0x110, 0xEC,  0xF0  };
 
 static afd_endpoint_offsets_t g_afd_offsets = {};
 static volatile LONG g_afd_offsets_state = 0;
+
+static __forceinline BOOLEAN afd_endpoint_signature_valid(USHORT sig) {
+    return sig == 0xAFD0 || sig == 0xAAFD || sig == 0xAFD1 || sig == 0xAFD2;
+}
+
+static __forceinline WCHAR aida_upcase_wchar(WCHAR ch) {
+    return (ch >= L'a' && ch <= L'z') ? static_cast<WCHAR>(ch - L'a' + L'A') : ch;
+}
+
+static BOOLEAN aida_unicode_ends_with_ascii(PWCH buf, USHORT chars, const char* suffix) {
+    if (!buf || !suffix) return FALSE;
+    USHORT suffix_len = 0;
+    while (suffix[suffix_len] != 0) suffix_len++;
+    if (suffix_len == 0 || chars < suffix_len) return FALSE;
+    PWCH start = buf + chars - suffix_len;
+    if (!_MmIsAddressValid(start) || !_MmIsAddressValid(start + suffix_len - 1)) return FALSE;
+    for (USHORT i = 0; i < suffix_len; ++i) {
+        WCHAR left = aida_upcase_wchar(start[i]);
+        char r = suffix[i];
+        if (r >= 'a' && r <= 'z') r = static_cast<char>(r - 'a' + 'A');
+        if (left != static_cast<WCHAR>(r)) return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOLEAN afd_classic_transport_name(UINT8* transport_info, UINT32* out_af, UINT32* out_proto) {
+    if (!transport_info || !out_af || !out_proto) return FALSE;
+    if (!_MmIsAddressValid(transport_info + 0x27)) return FALSE;
+    UNICODE_STRING* name = reinterpret_cast<UNICODE_STRING*>(transport_info + 0x18);
+    USHORT chars = static_cast<USHORT>(name->Length / sizeof(WCHAR));
+    if (name->Length == 0 || (name->Length & 1) != 0 || chars > 128 || !name->Buffer) return FALSE;
+    if (!_MmIsAddressValid(name->Buffer) || !_MmIsAddressValid(name->Buffer + chars - 1)) return FALSE;
+
+    if (aida_unicode_ends_with_ascii(name->Buffer, chars, "Tcp6")) {
+        *out_af = AF_INET6;
+        *out_proto = IPPROTO_TCP;
+        return TRUE;
+    }
+    if (aida_unicode_ends_with_ascii(name->Buffer, chars, "Udp6")) {
+        *out_af = AF_INET6;
+        *out_proto = IPPROTO_UDP;
+        return TRUE;
+    }
+    if (aida_unicode_ends_with_ascii(name->Buffer, chars, "RawIp6")) {
+        *out_af = AF_INET6;
+        *out_proto = 0;
+        return TRUE;
+    }
+    if (aida_unicode_ends_with_ascii(name->Buffer, chars, "Tcp")) {
+        *out_af = AF_INET;
+        *out_proto = IPPROTO_TCP;
+        return TRUE;
+    }
+    if (aida_unicode_ends_with_ascii(name->Buffer, chars, "Udp")) {
+        *out_af = AF_INET;
+        *out_proto = IPPROTO_UDP;
+        return TRUE;
+    }
+    if (aida_unicode_ends_with_ascii(name->Buffer, chars, "RawIp")) {
+        *out_af = AF_INET;
+        *out_proto = 0;
+        return TRUE;
+    }
+    return FALSE;
+}
 
 
 static BOOLEAN afd_resolve_offsets_by_scan() {
@@ -4293,19 +4323,33 @@ static BOOLEAN afd_resolve_offsets_by_scan() {
     if (!afd_base) afd_base = net_capture::find_module_base("afd.SYS");
     if (!afd_base) {
         NET_ERR("afd_resolve: afd.sys not found in module list");
+        WW_KERNEL_PATTERN_LOG_PTR("AFD.endpoint_offsets", "semantic_scan", "afd.sys", nullptr, FALSE,
+            "afd.sys module not present in loaded module list", "module_not_found");
         return FALSE;
     }
 
     NET_DBG("afd_resolve: afd_base=%p, starting pattern scan", afd_base);
 
 
-    static const UCHAR pat_w11_a[] = {
+    static const UCHAR pat_w11_rcx_a[] = {
+        0x48, 0x89, 0x8F, 0x00, 0x00, 0x00, 0x00,
+        0x44, 0x89, 0xA7, 0x00, 0x00, 0x00, 0x00
+    };
+    static const UCHAR pat_w11_rax_a[] = {
+        0x48, 0x89, 0x87, 0x00, 0x00, 0x00, 0x00,
+        0x44, 0x89, 0xA7, 0x00, 0x00, 0x00, 0x00
+    };
+    static const UCHAR pat_w11_rdx_a[] = {
         0x48, 0x89, 0x97, 0x00, 0x00, 0x00, 0x00,
         0x44, 0x89, 0xA7, 0x00, 0x00, 0x00, 0x00
     };
-    static const UCHAR pat_w11_b[] = {
+    static const UCHAR pat_w11_rdx_b[] = {
         0x44, 0x89, 0xA7, 0x00, 0x00, 0x00, 0x00,
         0x48, 0x89, 0x97, 0x00, 0x00, 0x00, 0x00
+    };
+    static const UCHAR pat_w11_r15_ebx_a[] = {
+        0x4C, 0x89, 0xBF, 0x00, 0x00, 0x00, 0x00,
+        0x89, 0x9F, 0x00, 0x00, 0x00, 0x00
     };
 
     static const UCHAR pat_w10_a[] = {
@@ -4318,22 +4362,53 @@ static BOOLEAN afd_resolve_offsets_by_scan() {
     };
     static const char mask_a[] = "xxx??xxxxx??xx";
     static const char mask_b[] = "xxx??xxxxx??xx";
+    static const char mask_c[] = "xxx??xxxx??xx";
+    static const UCHAR pat_ti_w11_110[] = { 0x48, 0x8D, 0x9F, 0x10, 0x01, 0x00, 0x00 };
+    static const UCHAR pat_ti_w11_110_rax[] = { 0x48, 0x8D, 0x87, 0x10, 0x01, 0x00, 0x00 };
+    static const UCHAR pat_ti_w11_108[] = { 0x48, 0x8D, 0x9F, 0x08, 0x01, 0x00, 0x00 };
+    static const UCHAR pat_ti_w11_108_rax[] = { 0x48, 0x8D, 0x87, 0x08, 0x01, 0x00, 0x00 };
+    static const UCHAR pat_ti_w10_f8_rax[] = { 0x48, 0x8D, 0x87, 0xF8, 0x00, 0x00, 0x00 };
+    static const UCHAR pat_ti_w10_f8_rbx[] = { 0x48, 0x8D, 0x9F, 0xF8, 0x00, 0x00, 0x00 };
+    static const char mask_ti[] = "xxxxxxx";
 
     ULONG local_addr_size = 0;
     ULONG local_addr_ptr  = 0;
     PVOID match = nullptr;
     BOOLEAN reversed = FALSE;
+    BOOLEAN short_local_pair = FALSE;
+    const char* pattern_name = "none";
+    const char* fail_reason = "none";
 
 
     BOOLEAN is_win11 = stealth::IsWindows11();
 
     if (is_win11) {
         NET_DBG("afd_resolve: Win11 detected, scanning Win11 patterns first...");
-        match = stealth::FindPatternInAllSections(afd_base, pat_w11_a, mask_a);
-        NET_DBG("afd_resolve: Win11 pattern A result=%p", match);
+        match = stealth::FindPatternInAllSections(afd_base, pat_w11_rcx_a, mask_a);
+        if (match) pattern_name = "win11_rcx_a";
+        NET_DBG("afd_resolve: Win11 RCX pattern A result=%p", match);
         if (!match) {
-            match = stealth::FindPatternInAllSections(afd_base, pat_w11_b, mask_b);
-            NET_DBG("afd_resolve: Win11 pattern B result=%p", match);
+            match = stealth::FindPatternInAllSections(afd_base, pat_w11_rax_a, mask_a);
+            if (match) pattern_name = "win11_rax_a";
+            NET_DBG("afd_resolve: Win11 RAX pattern A result=%p", match);
+        }
+        if (!match) {
+            match = stealth::FindPatternInAllSections(afd_base, pat_w11_rdx_a, mask_a);
+            if (match) pattern_name = "win11_rdx_a";
+            NET_DBG("afd_resolve: Win11 RDX pattern A result=%p", match);
+        }
+        if (!match) {
+            match = stealth::FindPatternInAllSections(afd_base, pat_w11_r15_ebx_a, mask_c);
+            if (match) {
+                pattern_name = "win11_r15_ebx_a";
+                short_local_pair = TRUE;
+            }
+            NET_DBG("afd_resolve: Win11 R15/EBX pattern A result=%p", match);
+        }
+        if (!match) {
+            match = stealth::FindPatternInAllSections(afd_base, pat_w11_rdx_b, mask_b);
+            if (match) pattern_name = "win11_rdx_b";
+            NET_DBG("afd_resolve: Win11 RDX pattern B result=%p", match);
             reversed = (match != nullptr);
         }
     }
@@ -4341,9 +4416,11 @@ static BOOLEAN afd_resolve_offsets_by_scan() {
     if (!match) {
         NET_DBG("afd_resolve: scanning Win10 patterns...");
         match = stealth::FindPatternInAllSections(afd_base, pat_w10_a, mask_a);
+        if (match) pattern_name = "win10_a";
         NET_DBG("afd_resolve: Win10 pattern A result=%p", match);
         if (!match) {
             match = stealth::FindPatternInAllSections(afd_base, pat_w10_b, mask_b);
+            if (match) pattern_name = "win10_b";
             NET_DBG("afd_resolve: Win10 pattern B result=%p", match);
             reversed = (match != nullptr);
         }
@@ -4351,11 +4428,31 @@ static BOOLEAN afd_resolve_offsets_by_scan() {
 
     if (!match && !is_win11) {
         NET_DBG("afd_resolve: scanning Win11 patterns as fallback...");
-        match = stealth::FindPatternInAllSections(afd_base, pat_w11_a, mask_a);
-        NET_DBG("afd_resolve: Win11 pattern A fallback result=%p", match);
+        match = stealth::FindPatternInAllSections(afd_base, pat_w11_rcx_a, mask_a);
+        if (match) pattern_name = "win11_rcx_a_fallback";
+        NET_DBG("afd_resolve: Win11 RCX pattern A fallback result=%p", match);
         if (!match) {
-            match = stealth::FindPatternInAllSections(afd_base, pat_w11_b, mask_b);
-            NET_DBG("afd_resolve: Win11 pattern B fallback result=%p", match);
+            match = stealth::FindPatternInAllSections(afd_base, pat_w11_rax_a, mask_a);
+            if (match) pattern_name = "win11_rax_a_fallback";
+            NET_DBG("afd_resolve: Win11 RAX pattern A fallback result=%p", match);
+        }
+        if (!match) {
+            match = stealth::FindPatternInAllSections(afd_base, pat_w11_rdx_a, mask_a);
+            if (match) pattern_name = "win11_rdx_a_fallback";
+            NET_DBG("afd_resolve: Win11 RDX pattern A fallback result=%p", match);
+        }
+        if (!match) {
+            match = stealth::FindPatternInAllSections(afd_base, pat_w11_r15_ebx_a, mask_c);
+            if (match) {
+                pattern_name = "win11_r15_ebx_a_fallback";
+                short_local_pair = TRUE;
+            }
+            NET_DBG("afd_resolve: Win11 R15/EBX pattern A fallback result=%p", match);
+        }
+        if (!match) {
+            match = stealth::FindPatternInAllSections(afd_base, pat_w11_rdx_b, mask_b);
+            if (match) pattern_name = "win11_rdx_b_fallback";
+            NET_DBG("afd_resolve: Win11 RDX pattern B fallback result=%p", match);
             reversed = (match != nullptr);
         }
     }
@@ -4365,6 +4462,9 @@ static BOOLEAN afd_resolve_offsets_by_scan() {
         if (reversed) {
             local_addr_size = *reinterpret_cast<ULONG*>(p + 3);
             local_addr_ptr  = *reinterpret_cast<ULONG*>(p + 10);
+        } else if (short_local_pair) {
+            local_addr_ptr  = *reinterpret_cast<ULONG*>(p + 3);
+            local_addr_size = *reinterpret_cast<ULONG*>(p + 9);
         } else {
             local_addr_ptr  = *reinterpret_cast<ULONG*>(p + 3);
             local_addr_size = *reinterpret_cast<ULONG*>(p + 10);
@@ -4373,28 +4473,144 @@ static BOOLEAN afd_resolve_offsets_by_scan() {
 
     if (!match) {
         NET_ERR("afd_resolve: no pattern match in afd.sys");
+        WW_LOG("KVALIDATE build=%lu kind=pattern name=AFD.endpoint_offsets source=semantic_scan pattern=%s value=%p validation=fail evidence=\"afd_base=%p is_win11=%u masks=%s/%s\" fail_closed=pattern_not_found",
+            ww_kernel_validation_build(),
+            pattern_name,
+            match,
+            afd_base,
+            is_win11 ? 1u : 0u,
+            mask_a,
+            mask_b);
         return FALSE;
     }
 
     if (local_addr_ptr != local_addr_size + 4) {
+        fail_reason = "ptr_size_delta_invalid";
+        WW_LOG("KVALIDATE build=%lu kind=pattern name=AFD.endpoint_offsets source=semantic_scan pattern=%s value=%p validation=fail evidence=\"transport=unresolved size=0x%X ptr=0x%X reversed=%u expected_delta=4 afd_base=%p\" fail_closed=%s",
+            ww_kernel_validation_build(),
+            pattern_name,
+            match,
+            local_addr_size,
+            local_addr_ptr,
+            reversed ? 1u : 0u,
+            afd_base,
+            fail_reason);
         NET_ERR("afd_resolve: validation failed size=0x%X ptr=0x%X (expected delta=4)",
                 local_addr_size, local_addr_ptr);
         return FALSE;
     }
 
     if (local_addr_size < 0x80 || local_addr_size > 0x400) {
+        fail_reason = "local_addr_size_out_of_range";
+        WW_LOG("KVALIDATE build=%lu kind=pattern name=AFD.endpoint_offsets source=semantic_scan pattern=%s value=%p validation=fail evidence=\"size=0x%X ptr=0x%X reversed=%u range=0x80..0x400 afd_base=%p\" fail_closed=%s",
+            ww_kernel_validation_build(),
+            pattern_name,
+            match,
+            local_addr_size,
+            local_addr_ptr,
+            reversed ? 1u : 0u,
+            afd_base,
+            fail_reason);
         NET_ERR("afd_resolve: local_addr_size 0x%X out of expected range", local_addr_size);
         return FALSE;
     }
 
-    ULONG transport_info = local_addr_size + 0x1C;
+    ULONG transport_info = 0;
+    PVOID transport_match = nullptr;
+    const char* transport_pattern = "none";
+
+    if (local_addr_size == 0xEC && local_addr_ptr == 0xF0) {
+        transport_match = stealth::FindPatternInAllSections(afd_base, pat_ti_w11_110, mask_ti);
+        if (transport_match) {
+            transport_info = 0x110;
+            transport_pattern = "win11_ti_110";
+        } else {
+            transport_match = stealth::FindPatternInAllSections(afd_base, pat_ti_w11_110_rax, mask_ti);
+            if (transport_match) {
+                transport_info = 0x110;
+                transport_pattern = "win11_ti_110_rax";
+            }
+        }
+        if (!transport_match) {
+            transport_match = stealth::FindPatternInAllSections(afd_base, pat_ti_w11_108, mask_ti);
+            if (transport_match) {
+                transport_info = 0x108;
+                transport_pattern = "win11_ti_108";
+            } else {
+                transport_match = stealth::FindPatternInAllSections(afd_base, pat_ti_w11_108_rax, mask_ti);
+                if (transport_match) {
+                    transport_info = 0x108;
+                    transport_pattern = "win11_ti_108_rax";
+                }
+            }
+        }
+    } else if (local_addr_size == 0xDC && local_addr_ptr == 0xE0) {
+        transport_match = stealth::FindPatternInAllSections(afd_base, pat_ti_w10_f8_rax, mask_ti);
+        if (transport_match) {
+            transport_info = 0xF8;
+            transport_pattern = "win10_ti_f8_rax";
+        } else {
+            transport_match = stealth::FindPatternInAllSections(afd_base, pat_ti_w10_f8_rbx, mask_ti);
+            if (transport_match) {
+                transport_info = 0xF8;
+                transport_pattern = "win10_ti_f8_rbx";
+            }
+        }
+    }
+
+    if (transport_info == 0) {
+        fail_reason = "transport_pattern_not_found";
+        WW_LOG("KVALIDATE build=%lu kind=pattern name=AFD.endpoint_transport_info source=semantic_scan pattern=%s value=%p validation=fail evidence=\"transport_pattern=%s transport_match=%p size=0x%X ptr=0x%X afd_base=%p is_win11=%u\" fail_closed=%s",
+            ww_kernel_validation_build(),
+            pattern_name,
+            match,
+            transport_pattern,
+            transport_match,
+            local_addr_size,
+            local_addr_ptr,
+            afd_base,
+            is_win11 ? 1u : 0u,
+            fail_reason);
+        NET_ERR("afd_resolve: transport_info pattern not found for size=0x%X ptr=0x%X",
+                local_addr_size, local_addr_ptr);
+        return FALSE;
+    }
+
+    if (transport_info < 0x80 || transport_info > 0x400 || (transport_info & 7) != 0) {
+        fail_reason = "transport_info_out_of_range";
+        WW_LOG("KVALIDATE build=%lu kind=pattern name=AFD.endpoint_offsets source=semantic_scan pattern=%s value=%p validation=fail evidence=\"transport_pattern=%s transport_match=%p transport=0x%X size=0x%X ptr=0x%X afd_base=%p\" fail_closed=%s",
+            ww_kernel_validation_build(),
+            pattern_name,
+            match,
+            transport_pattern,
+            transport_match,
+            transport_info,
+            local_addr_size,
+            local_addr_ptr,
+            afd_base,
+            fail_reason);
+        NET_ERR("afd_resolve: transport_info 0x%X out of expected range", transport_info);
+        return FALSE;
+    }
 
     g_afd_offsets.transport_info  = transport_info;
     g_afd_offsets.local_addr_size = local_addr_size;
     g_afd_offsets.local_addr_ptr  = local_addr_ptr;
 
-    NET_DBG("afd_resolve: SCAN OK transport=+0x%X size=+0x%X ptr=+0x%X (match=%p)",
-            transport_info, local_addr_size, local_addr_ptr, match);
+    NET_DBG("afd_resolve: SCAN OK transport=+0x%X size=+0x%X ptr=+0x%X (match=%p transport_match=%p)",
+            transport_info, local_addr_size, local_addr_ptr, match, transport_match);
+    WW_LOG("KVALIDATE build=%lu kind=layout name=AFD.endpoint_offsets source=semantic_scan offset=0x%llx validation=pass evidence=\"pattern=%s match=%p reversed=%u transport_pattern=%s transport_match=%p afd_base=%p transport=0x%X local_size=0x%X local_ptr=0x%X\" fail_closed=none",
+        ww_kernel_validation_build(),
+        static_cast<unsigned long long>(transport_info),
+        pattern_name,
+        match,
+        reversed ? 1u : 0u,
+        transport_pattern,
+        transport_match,
+        afd_base,
+        transport_info,
+        local_addr_size,
+        local_addr_ptr);
     return TRUE;
 }
 
@@ -4414,17 +4630,34 @@ static void afd_init_offsets() {
         return;
     }
 
-    if (!afd_resolve_offsets_by_scan()) {
-        if (stealth::IsWindows11_24H2OrNewer()) {
+    BOOLEAN scan_ok = afd_resolve_offsets_by_scan();
+    const char* offset_source = "semantic_scan";
+    if (!scan_ok) {
+        if (stealth::IsWindows11()) {
             g_afd_offsets = g_afd_fallback_win11;
-            NET_DBG("afd_init: fallback to Win11 offsets (build >= 26100)");
+            offset_source = "static_fallback_win11";
+            NET_DBG("afd_init: fallback to Win11 offsets");
         } else {
             g_afd_offsets = g_afd_fallback_win10;
+            offset_source = "static_fallback_win10";
             NET_DBG("afd_init: fallback to Win10 offsets (build < 26100)");
         }
     }
 
     _InterlockedExchange(&g_afd_offsets_state, 2);
+    WW_LOG("KVALIDATE build=%lu kind=layout name=AFD.endpoint_offsets.final source=%s offset=0x%llx validation=%s evidence=\"transport=0x%X local_size=0x%X local_ptr=0x%X scan_ok=%u state=%ld\" fail_closed=%s",
+        ww_kernel_validation_build(),
+        offset_source,
+        static_cast<unsigned long long>(g_afd_offsets.transport_info),
+        ww_kernel_validation_state((g_afd_offsets.transport_info != 0 &&
+            g_afd_offsets.local_addr_size != 0 &&
+            g_afd_offsets.local_addr_ptr == g_afd_offsets.local_addr_size + 4) ? TRUE : FALSE),
+        g_afd_offsets.transport_info,
+        g_afd_offsets.local_addr_size,
+        g_afd_offsets.local_addr_ptr,
+        scan_ok ? 1u : 0u,
+        _InterlockedCompareExchange(&g_afd_offsets_state, 0, 0),
+        scan_ok ? "none" : "scan_failed_static_table_selected");
 }
 
 static __forceinline const afd_endpoint_offsets_t& afd_get_offsets() {
@@ -4516,6 +4749,25 @@ static BOOLEAN aida_extract_socket_info_from_fo(PFILE_OBJECT fo, SOCKET_HANDLE_E
 
         out->afd_endpoint_addr = (UINT64)afd_endpoint;
         UINT8* ep = (UINT8*)afd_endpoint;
+        if (!_MmIsAddressValid(ep + sizeof(USHORT) - 1)) {
+            result = FALSE;
+            __leave;
+        }
+        USHORT afd_sig = *(USHORT*)ep;
+        if (!afd_endpoint_signature_valid(afd_sig)) {
+            static volatile LONG s_bad_sig_count = 0;
+            LONG cnt = _InterlockedIncrement(&s_bad_sig_count);
+            if (cnt <= 16) {
+                WW_LOG("KVALIDATE build=%lu kind=layout name=AFD.endpoint_signature source=socket_extract value=%p validation=fail evidence=\"sig=0x%04X ep=%p count=%ld\" fail_closed=bad_afd_endpoint_signature",
+                    ww_kernel_validation_build(),
+                    afd_endpoint,
+                    afd_sig,
+                    afd_endpoint,
+                    cnt);
+            }
+            result = FALSE;
+            __leave;
+        }
 
         out->address_family = 0;
         out->protocol = 0;
@@ -4526,25 +4778,86 @@ static BOOLEAN aida_extract_socket_info_from_fo(PFILE_OBJECT fo, SOCKET_HANDLE_E
         strong::kmemset(out->remote_addr, 0, 16);
 
         const auto& offsets = afd_get_offsets();
+        UINT32 afd_flags = 0;
+        if (_MmIsAddressValid(ep + 0x0B))
+            afd_flags = *(UINT32*)(ep + 0x08);
+        BOOLEAN tl_transport = (afd_flags & 0x100u) != 0;
 
 
         if (_MmIsAddressValid(ep + offsets.transport_info + sizeof(PVOID) - 1)) {
             UINT8* transport_info = *(UINT8**)(ep + offsets.transport_info);
-            NET_DBG("socket_extract: ep=0x%llx ti_offset=0x%x ti_ptr=0x%llx",
-                    (UINT64)ep, offsets.transport_info, (UINT64)transport_info);
+            NET_DBG("socket_extract: ep=0x%llx sig=0x%04x flags=0x%x ti_offset=0x%x ti_ptr=0x%llx",
+                    (UINT64)ep, afd_sig, afd_flags, offsets.transport_info, (UINT64)transport_info);
             if (transport_info && _MmIsAddressValid(transport_info) &&
                 _MmIsAddressValid(transport_info + 0x1D)) {
-                UINT16 raw_af = *(UINT16*)(transport_info + 0x16);
-                if (raw_af == 0 && _MmIsAddressValid(transport_info + 0x17)) {
-                    DWORD dw_af = *(DWORD*)(transport_info + 0x14);
-                    if (dw_af == AF_INET || dw_af == AF_INET6)
-                        raw_af = static_cast<UINT16>(dw_af);
+                if (tl_transport) {
+                    UINT16 raw_af = *(UINT16*)(transport_info + 0x16);
+                    if (raw_af == 0 && _MmIsAddressValid(transport_info + 0x17)) {
+                        DWORD dw_af = *(DWORD*)(transport_info + 0x14);
+                        if (dw_af == AF_INET || dw_af == AF_INET6)
+                            raw_af = static_cast<UINT16>(dw_af);
+                    }
+                    DWORD raw_proto = *(DWORD*)(transport_info + 0x18);
+                    NET_DBG("socket_extract: tl ti raw af=%u proto=%u (at ti+0x16, ti+0x18)",
+                            raw_af, raw_proto);
+                    if (raw_af == AF_INET || raw_af == AF_INET6)
+                        out->address_family = raw_af;
+                    out->protocol = (raw_proto <= 256) ? raw_proto : 0;
+                    static volatile LONG s_tl_af_source_count = 0;
+                    LONG cnt = _InterlockedIncrement(&s_tl_af_source_count);
+                    if (cnt <= 16) {
+                        WW_LOG("KVALIDATE build=%lu kind=layout name=AFD.address_family_source source=socket_extract value=%p validation=%s evidence=\"mode=tl ep=%p sig=0x%04X flags=0x%X ti=%p raw_af=%u raw_proto=%u af=%u proto=%u count=%ld\" fail_closed=%s",
+                            ww_kernel_validation_build(),
+                            transport_info,
+                            ww_kernel_validation_state((out->address_family == AF_INET || out->address_family == AF_INET6) ? TRUE : FALSE),
+                            afd_endpoint,
+                            afd_sig,
+                            afd_flags,
+                            transport_info,
+                            raw_af,
+                            raw_proto,
+                            out->address_family,
+                            out->protocol,
+                            cnt,
+                            (out->address_family == AF_INET || out->address_family == AF_INET6) ? "none" : "tl_address_family_unresolved");
+                    }
+                } else {
+                    UINT32 classic_af = 0;
+                    UINT32 classic_proto = 0;
+                    if (afd_classic_transport_name(transport_info, &classic_af, &classic_proto)) {
+                        out->address_family = classic_af;
+                        out->protocol = classic_proto;
+                        NET_DBG("socket_extract: classic ti device resolved af=%u proto=%u",
+                                classic_af, classic_proto);
+                        static volatile LONG s_classic_af_source_count = 0;
+                        LONG cnt = _InterlockedIncrement(&s_classic_af_source_count);
+                        if (cnt <= 16) {
+                            WW_LOG("KVALIDATE build=%lu kind=layout name=AFD.address_family_source source=socket_extract value=%p validation=pass evidence=\"mode=classic ep=%p sig=0x%04X flags=0x%X ti=%p af=%u proto=%u count=%ld\" fail_closed=none",
+                                ww_kernel_validation_build(),
+                                transport_info,
+                                afd_endpoint,
+                                afd_sig,
+                                afd_flags,
+                                transport_info,
+                                out->address_family,
+                                out->protocol,
+                                cnt);
+                        }
+                    } else {
+                        static volatile LONG s_classic_name_fail_count = 0;
+                        LONG cnt = _InterlockedIncrement(&s_classic_name_fail_count);
+                        if (cnt <= 16) {
+                            WW_LOG("KVALIDATE build=%lu kind=layout name=AFD.classic_transport_name source=socket_extract value=%p validation=fail evidence=\"ep=%p sig=0x%04X flags=0x%X ti=%p count=%ld\" fail_closed=classic_transport_name_unresolved",
+                                ww_kernel_validation_build(),
+                                transport_info,
+                                afd_endpoint,
+                                afd_sig,
+                                afd_flags,
+                                transport_info,
+                                cnt);
+                        }
+                    }
                 }
-                DWORD raw_proto = *(DWORD*)(transport_info + 0x18);
-                NET_DBG("socket_extract: ti raw af=%u proto=%u (at ti+0x16, ti+0x18)",
-                        raw_af, raw_proto);
-                out->address_family = raw_af;
-                out->protocol = (raw_proto <= 256) ? raw_proto : 0;
             }
         }
 
@@ -5028,6 +5341,18 @@ namespace net_enum {
 
         KeMemoryBarrier();
         _InterlockedExchange(&g_nsi_resolved, 2);
+        WW_LOG("KVALIDATE build=%lu kind=resolver name=NSI.NsiEnumerateObjectsAllParameters source=export_table value=%p validation=%s evidence=\"netio=%p tcp_key=%llu tcp_static=%llu udp_key=%llu udp_static=%llu query_runtime=%u store_active=%u\" fail_closed=%s",
+            ww_kernel_validation_build(),
+            _NsiEnumerate,
+            ww_kernel_validation_state(_NsiEnumerate != nullptr),
+            netio,
+            static_cast<unsigned long long>(sizeof(NSI_TCP_KEY)),
+            static_cast<unsigned long long>(sizeof(NSI_TCP_STATIC)),
+            static_cast<unsigned long long>(sizeof(NSI_UDP_KEY)),
+            static_cast<unsigned long long>(sizeof(NSI_UDP_STATIC)),
+            NSI_QUERY_RUNTIME,
+            NSI_STORE_ACTIVE,
+            _NsiEnumerate ? "none" : (netio ? "export_missing" : "netio_module_not_found"));
         NET_DBG("resolve_nsi: NsiEnumerate=%p", _NsiEnumerate);
         return _NsiEnumerate != nullptr;
     }
@@ -5386,6 +5711,7 @@ NTSTATUS functions::handle_net_cap_ctrl(p_net_cap_ctrl request) {
 
             _InterlockedExchange(&net_capture::g_total_captured, 0);
             _InterlockedExchange(&net_capture::g_total_dropped, 0);
+            _InterlockedExchange64(&net_capture::g_hot_filter_rejects, 0);
             NTSTATUS dpi_status = net_dpi::start();
             if (!NT_SUCCESS(dpi_status)) {
                 NET_ERR("handle_net_cap_ctrl: DPI start FAILED status=0x%08lx", dpi_status);
@@ -5412,18 +5738,21 @@ NTSTATUS functions::handle_net_cap_ctrl(p_net_cap_ctrl request) {
             net_capture::g_filter_protocol = 0;
             strong::kmemset(net_capture::g_filter_ip, 0, sizeof(net_capture::g_filter_ip));
             NET_DBG("handle_net_cap_ctrl: capture STOPPED");
-            WW_LOG("net_capture::ctrl STOPPED captured=%ld dropped=%ld",
+            WW_LOG("net_capture::ctrl STOPPED captured=%ld dropped=%ld filter_rejects=%lld ring_count=%ld",
                 net_capture::g_total_captured,
-                net_capture::g_total_dropped);
+                net_capture::g_total_dropped,
+                _InterlockedCompareExchange64(&net_capture::g_hot_filter_rejects, 0, 0),
+                net_capture::g_ring_count);
             request->capture_active = 0;
             break;
         }
         case 2: {
-            WW_LOG("net_capture::ctrl STATUS active=%ld captured=%ld dropped=%ld ring_count=%ld",
+            WW_LOG("net_capture::ctrl STATUS active=%ld captured=%ld dropped=%ld ring_count=%ld filter_rejects=%lld",
                 net_capture::g_capture_active,
                 net_capture::g_total_captured,
                 net_capture::g_total_dropped,
-                net_capture::g_ring_count);
+                net_capture::g_ring_count,
+                _InterlockedCompareExchange64(&net_capture::g_hot_filter_rejects, 0, 0));
             break;
         }
         default:
@@ -5470,12 +5799,13 @@ NTSTATUS functions::handle_net_cap_get(p_net_cap_get request) {
     request->packet_count = to_read;
 
     KeReleaseSpinLock(&net_capture::g_ring_lock, old_irql);
-    WW_LOG("net_capture::get packets=%u requested=%u available_before=%u active=%ld dropped=%ld",
+    WW_LOG("net_capture::get packets=%u requested=%u available_before=%u active=%ld dropped=%ld filter_rejects=%lld",
         to_read,
         max_packets,
         available,
         net_capture::g_capture_active,
-        net_capture::g_total_dropped);
+        net_capture::g_total_dropped,
+        _InterlockedCompareExchange64(&net_capture::g_hot_filter_rejects, 0, 0));
 
     return STATUS_SUCCESS;
 }
@@ -7085,6 +7415,8 @@ namespace net_inject {
         if (!fwp_base) {
             NET_ERR("resolve_inject_functions: FWPKCLNT.SYS not found");
             _InterlockedExchange(&g_inject_resolved, 2);
+            WW_KERNEL_RESOLVER_LOG_PTR("WFP.injection.exports", "export_table", nullptr, FALSE,
+                "FWPKCLNT.SYS not found before injection export resolution", "fwpkclnt_module_not_found");
             return FALSE;
         }
         NET_DBG("resolve_inject_functions: FWPKCLNT.SYS base=%p", fwp_base);
@@ -7118,14 +7450,16 @@ namespace net_inject {
             *(PVOID*)&_NdisFreeNetBufferListPool = GetProcAddress(ndis_base, n2);
         }
 
+        NTSTATUS transport_handle_status = STATUS_PROCEDURE_NOT_FOUND;
+        NTSTATUS network_handle_status = STATUS_PROCEDURE_NOT_FOUND;
         if (_FwpsInjectionHandleCreate0) {
-            NTSTATUS st = _FwpsInjectionHandleCreate0(AF_INET, FWPS_INJECTION_TYPE_TRANSPORT, &g_inject_handle_v4);
-            NET_DBG("resolve_inject_functions: transport inject handle create st=0x%08x handle=%p", st, g_inject_handle_v4);
-            if (!NT_SUCCESS(st)) g_inject_handle_v4 = nullptr;
+            transport_handle_status = _FwpsInjectionHandleCreate0(AF_INET, FWPS_INJECTION_TYPE_TRANSPORT, &g_inject_handle_v4);
+            NET_DBG("resolve_inject_functions: transport inject handle create st=0x%08x handle=%p", transport_handle_status, g_inject_handle_v4);
+            if (!NT_SUCCESS(transport_handle_status)) g_inject_handle_v4 = nullptr;
 
-            st = _FwpsInjectionHandleCreate0(AF_INET, FWPS_INJECTION_TYPE_NETWORK, &g_inject_handle_net_v4);
-            NET_DBG("resolve_inject_functions: network inject handle create st=0x%08x handle=%p", st, g_inject_handle_net_v4);
-            if (!NT_SUCCESS(st)) g_inject_handle_net_v4 = nullptr;
+            network_handle_status = _FwpsInjectionHandleCreate0(AF_INET, FWPS_INJECTION_TYPE_NETWORK, &g_inject_handle_net_v4);
+            NET_DBG("resolve_inject_functions: network inject handle create st=0x%08x handle=%p", network_handle_status, g_inject_handle_net_v4);
+            if (!NT_SUCCESS(network_handle_status)) g_inject_handle_net_v4 = nullptr;
         } else {
             NET_ERR("resolve_inject_functions: FwpsInjectionHandleCreate0 not found");
         }
@@ -7135,6 +7469,34 @@ namespace net_inject {
                 _NdisAllocateNetBufferListPool);
         KeMemoryBarrier();
         _InterlockedExchange(&g_inject_resolved, 2);
+        ULONG missing_mask = 0;
+        if (!_FwpsInjectionHandleCreate0) missing_mask |= 0x0001u;
+        if (!_FwpsInjectionHandleDestroy0) missing_mask |= 0x0002u;
+        if (!_FwpsAllocateNBL0) missing_mask |= 0x0004u;
+        if (!_FwpsFreeNBL0) missing_mask |= 0x0008u;
+        if (!_FwpsInjectSend0) missing_mask |= 0x0010u;
+        if (!_FwpsInjectRecv0) missing_mask |= 0x0020u;
+        if (!_FwpsInjectNetSend0) missing_mask |= 0x0040u;
+        if (!_FwpsInjectNetRecv0) missing_mask |= 0x0080u;
+        if (!_FwpsQueryPacketInjectionState0) missing_mask |= 0x0100u;
+        if (!_NdisAllocateNetBufferListPool) missing_mask |= 0x0200u;
+        if (!_NdisFreeNetBufferListPool) missing_mask |= 0x0400u;
+        BOOLEAN valid = (g_inject_handle_v4 != nullptr) || (g_inject_handle_net_v4 != nullptr);
+        WW_LOG("KVALIDATE build=%lu kind=resolver name=WFP.injection.exports source=export_table value=%p validation=%s evidence=\"fwpkclnt=%p ndis=%p missing_mask=0x%04lX transport_status=0x%08X network_status=0x%08X handles=%p/%p nbl_pool_fns=%p/%p query_state=%p\" fail_closed=%s",
+            ww_kernel_validation_build(),
+            _FwpsInjectionHandleCreate0,
+            ww_kernel_validation_state(valid),
+            fwp_base,
+            ndis_base,
+            missing_mask,
+            transport_handle_status,
+            network_handle_status,
+            g_inject_handle_v4,
+            g_inject_handle_net_v4,
+            _NdisAllocateNetBufferListPool,
+            _NdisFreeNetBufferListPool,
+            _FwpsQueryPacketInjectionState0,
+            valid ? "none" : "no_injection_handle");
         return (g_inject_handle_v4 != nullptr) || (g_inject_handle_net_v4 != nullptr);
     }
 
@@ -7189,14 +7551,20 @@ namespace net_inject {
         params.DataSize = 0;
 
         if (!_NdisAllocateNetBufferListPool || !_NdisFreeNetBufferListPool) {
+            WW_KERNEL_RESOLVER_LOG_PTR("WFP.injection.nbl_pool", "ndis_runtime", nullptr, FALSE,
+                "NDIS NBL pool allocation/free exports missing", "ndis_pool_exports_missing");
             return FALSE;
         }
 
         g_inject_nbl_pool = _NdisAllocateNetBufferListPool(nullptr, &params);
         if (!g_inject_nbl_pool) {
+            WW_KERNEL_RESOLVER_LOG_PTR("WFP.injection.nbl_pool", "ndis_runtime", nullptr, FALSE,
+                "NdisAllocateNetBufferListPool returned null for AiDA injection pool", "pool_allocation_failed");
             return FALSE;
         }
 
+        WW_KERNEL_RESOLVER_LOG_PTR("WFP.injection.nbl_pool", "ndis_runtime", g_inject_nbl_pool, TRUE,
+            "NET_BUFFER_LIST_POOL_PARAMETERS revision=1 fAllocateNetBuffer=1 pool_tag=jnNW", "none");
         return TRUE;
     }
 
@@ -9328,6 +9696,11 @@ namespace net_dpi {
     inline volatile LONG64 g_dpi_total_overwritten = 0;
     inline volatile LONG64 g_dpi_drop_inactive = 0;
     inline volatile LONG64 g_dpi_drop_no_ring = 0;
+    inline volatile LONG64 g_dpi_drop_capture_filter = 0;
+    inline volatile LONG64 g_dpi_http_hits = 0;
+    inline volatile LONG64 g_dpi_tls_hits = 0;
+    inline volatile LONG64 g_dpi_dns_hits = 0;
+    inline volatile LONG64 g_dpi_tcp_bounds_rejects = 0;
 
     BOOLEAN is_active() {
         return (g_dpi_active != 0);
@@ -9361,6 +9734,11 @@ namespace net_dpi {
         _InterlockedExchange64(&g_dpi_total_overwritten, 0);
         _InterlockedExchange64(&g_dpi_drop_inactive, 0);
         _InterlockedExchange64(&g_dpi_drop_no_ring, 0);
+        _InterlockedExchange64(&g_dpi_drop_capture_filter, 0);
+        _InterlockedExchange64(&g_dpi_http_hits, 0);
+        _InterlockedExchange64(&g_dpi_tls_hits, 0);
+        _InterlockedExchange64(&g_dpi_dns_hits, 0);
+        _InterlockedExchange64(&g_dpi_tcp_bounds_rejects, 0);
         _InterlockedExchange(&g_dpi_active, 1);
         NET_DBG("net_dpi::start active=1");
         WW_LOG("net_dpi::start active=1 ring=%p capacity=%u head=%ld tail=%ld count=%ld",
@@ -9375,14 +9753,19 @@ namespace net_dpi {
     void stop() {
         _InterlockedExchange(&g_dpi_active, 0);
         NET_DBG("net_dpi::stop count=%ld", g_dpi_count);
-        WW_LOG("net_dpi::stop active=0 ring_count=%ld head=%ld tail=%ld enqueued=%lld overwritten=%lld drop_inactive=%lld drop_no_ring=%lld",
+        WW_LOG("net_dpi::stop active=0 ring_count=%ld head=%ld tail=%ld enqueued=%lld overwritten=%lld http_hits=%lld tls_hits=%lld dns_hits=%lld tcp_bounds_rejects=%lld drop_inactive=%lld drop_no_ring=%lld drop_capture_filter=%lld",
             g_dpi_count,
             g_dpi_head,
             g_dpi_tail,
             _InterlockedCompareExchange64(&g_dpi_total_enqueued, 0, 0),
             _InterlockedCompareExchange64(&g_dpi_total_overwritten, 0, 0),
+            _InterlockedCompareExchange64(&g_dpi_http_hits, 0, 0),
+            _InterlockedCompareExchange64(&g_dpi_tls_hits, 0, 0),
+            _InterlockedCompareExchange64(&g_dpi_dns_hits, 0, 0),
+            _InterlockedCompareExchange64(&g_dpi_tcp_bounds_rejects, 0, 0),
             _InterlockedCompareExchange64(&g_dpi_drop_inactive, 0, 0),
-            _InterlockedCompareExchange64(&g_dpi_drop_no_ring, 0, 0));
+            _InterlockedCompareExchange64(&g_dpi_drop_no_ring, 0, 0),
+            _InterlockedCompareExchange64(&g_dpi_drop_capture_filter, 0, 0));
     }
 
     LONG entry_count() {
@@ -9504,39 +9887,18 @@ namespace net_dpi {
                         UINT32 af, UINT32 pid,
                         const UINT8* payload, UINT32 payload_len) {
         if (!g_dpi_active) {
-            LONG64 drops = _InterlockedIncrement64(&g_dpi_drop_inactive);
-            WW_LOG("net_dpi::analyze DROP reason=inactive direction=%u protocol=%u pid=%u ports=%u->%u payload_len=%u drop_inactive=%lld",
-                direction,
-                protocol,
-                pid,
-                src_port,
-                dst_port,
-                payload_len,
-                drops);
+            _InterlockedIncrement64(&g_dpi_drop_inactive);
             return;
         }
         if (!g_dpi_ring) {
-            LONG64 drops = _InterlockedIncrement64(&g_dpi_drop_no_ring);
-            WW_LOG("net_dpi::analyze DROP reason=no_ring direction=%u protocol=%u pid=%u ports=%u->%u payload_len=%u drop_no_ring=%lld",
-                direction,
-                protocol,
-                pid,
-                src_port,
-                dst_port,
-                payload_len,
-                drops);
+            _InterlockedIncrement64(&g_dpi_drop_no_ring);
             return;
         }
-        WW_LOG("net_dpi::analyze ENTER direction=%u protocol=%u pid=%u af=%u tuple=%u.%u.%u.%u:%u->%u.%u.%u.%u:%u payload_len=%u active=%ld ring_count=%ld",
-            direction,
-            protocol,
-            pid,
-            af,
-            src_addr ? src_addr[0] : 0, src_addr ? src_addr[1] : 0, src_addr ? src_addr[2] : 0, src_addr ? src_addr[3] : 0, src_port,
-            dst_addr ? dst_addr[0] : 0, dst_addr ? dst_addr[1] : 0, dst_addr ? dst_addr[2] : 0, dst_addr ? dst_addr[3] : 0, dst_port,
-            payload_len,
-            g_dpi_active,
-            g_dpi_count);
+        if (net_capture::g_capture_active &&
+            !net_capture::packet_matches_capture_filters(protocol, pid, src_port, dst_port, af, dst_addr)) {
+            _InterlockedIncrement64(&g_dpi_drop_capture_filter);
+            return;
+        }
 
         DPI_HEADER_INFO info;
         strong::kmemset(&info, 0, sizeof(info));
@@ -9580,25 +9942,8 @@ namespace net_dpi {
                 if ((src_port == 53 || dst_port == 53) && app_len > 0) {
                     info.is_dns = 1;
                 }
-                WW_LOG("net_dpi::analyze CLASSIFY protocol=6 pid=%u ports=%u->%u tcp_hdr_len=%u app_len=%u http=%u method=%u tls=%u tls_version=0x%04X dns=%u flags=0x%02X",
-                    pid,
-                    src_port,
-                    dst_port,
-                    tcp_hdr_len,
-                    app_len,
-                    info.is_http,
-                    info.http_method,
-                    info.is_tls,
-                    info.tls_version,
-                    info.is_dns,
-                    info.tcp_flags);
             } else {
-                WW_LOG("net_dpi::analyze CLASSIFY protocol=6 pid=%u ports=%u->%u tcp_hdr_len=%u payload_len=%u reason=tcp_header_bounds",
-                    pid,
-                    src_port,
-                    dst_port,
-                    tcp_hdr_len,
-                    payload_len);
+                _InterlockedIncrement64(&g_dpi_tcp_bounds_rejects);
             }
         }
 
@@ -9619,23 +9964,12 @@ namespace net_dpi {
                 }
             }
         }
-        if (protocol == 17) {
-            WW_LOG("net_dpi::analyze CLASSIFY protocol=17 pid=%u ports=%u->%u payload_len=%u dns=%u tls=%u tls_version=0x%04X content_type=%u",
-                pid,
-                src_port,
-                dst_port,
-                payload_len,
-                info.is_dns,
-                info.is_tls,
-                info.tls_version,
-                info.tls_content_type);
-        }
+        if (info.is_http) _InterlockedIncrement64(&g_dpi_http_hits);
+        if (info.is_tls) _InterlockedIncrement64(&g_dpi_tls_hits);
+        if (info.is_dns) _InterlockedIncrement64(&g_dpi_dns_hits);
 
         KIRQL irql;
         KeAcquireSpinLock(&g_dpi_lock, &irql);
-        LONG before_count = g_dpi_count;
-        LONG before_head = g_dpi_head;
-        LONG before_tail = g_dpi_tail;
         BOOLEAN overwritten = FALSE;
         if (g_dpi_count >= DPI_RING_SIZE) {
             g_dpi_tail = (g_dpi_tail + 1) % DPI_RING_SIZE;
@@ -9645,31 +9979,9 @@ namespace net_dpi {
         strong::kmemcpy(&g_dpi_ring[g_dpi_head], &info, sizeof(info));
         g_dpi_head = (g_dpi_head + 1) % DPI_RING_SIZE;
         g_dpi_count++;
-        LONG after_count = g_dpi_count;
-        LONG after_head = g_dpi_head;
-        LONG after_tail = g_dpi_tail;
         KeReleaseSpinLock(&g_dpi_lock, irql);
-        LONG64 enqueued = _InterlockedIncrement64(&g_dpi_total_enqueued);
-        LONG64 overwritten_total = overwritten ? _InterlockedIncrement64(&g_dpi_total_overwritten) :
-            _InterlockedCompareExchange64(&g_dpi_total_overwritten, 0, 0);
-        WW_LOG("net_dpi::analyze EXIT enqueued=%lld overwritten=%u overwritten_total=%lld count_before=%ld count_after=%ld head_before=%ld head_after=%ld tail_before=%ld tail_after=%ld pid=%u protocol=%u ports=%u->%u http=%u tls=%u dns=%u payload_len=%u",
-            enqueued,
-            overwritten ? 1u : 0u,
-            overwritten_total,
-            before_count,
-            after_count,
-            before_head,
-            after_head,
-            before_tail,
-            after_tail,
-            pid,
-            protocol,
-            src_port,
-            dst_port,
-            info.is_http,
-            info.is_tls,
-            info.is_dns,
-            payload_len);
+        _InterlockedIncrement64(&g_dpi_total_enqueued);
+        if (overwritten) _InterlockedIncrement64(&g_dpi_total_overwritten);
     }
 
     NTSTATUS get_results(p_dpi_request request) {
@@ -9715,7 +10027,7 @@ namespace net_dpi {
             scanned++;
         }
         KeReleaseSpinLock(&g_dpi_lock, irql);
-        WW_LOG("net_dpi::query filter_pid=%u filter_protocol=%u filter_port=%u flags=0x%08X active=%ld ring_count_before=%ld scanned=%ld returned=%u reject_pid=%u reject_protocol=%u reject_port=%u reject_http=%u reject_tls=%u reject_dns=%u head=%ld tail=%ld enqueued=%lld overwritten=%lld drop_inactive=%lld drop_no_ring=%lld",
+        WW_LOG("net_dpi::query filter_pid=%u filter_protocol=%u filter_port=%u flags=0x%08X active=%ld ring_count_before=%ld scanned=%ld returned=%u reject_pid=%u reject_protocol=%u reject_port=%u reject_http=%u reject_tls=%u reject_dns=%u head=%ld tail=%ld enqueued=%lld overwritten=%lld http_hits=%lld tls_hits=%lld dns_hits=%lld tcp_bounds_rejects=%lld drop_inactive=%lld drop_no_ring=%lld drop_capture_filter=%lld",
             requested_pid,
             requested_protocol,
             requested_port,
@@ -9734,8 +10046,13 @@ namespace net_dpi {
             g_dpi_tail,
             _InterlockedCompareExchange64(&g_dpi_total_enqueued, 0, 0),
             _InterlockedCompareExchange64(&g_dpi_total_overwritten, 0, 0),
+            _InterlockedCompareExchange64(&g_dpi_http_hits, 0, 0),
+            _InterlockedCompareExchange64(&g_dpi_tls_hits, 0, 0),
+            _InterlockedCompareExchange64(&g_dpi_dns_hits, 0, 0),
+            _InterlockedCompareExchange64(&g_dpi_tcp_bounds_rejects, 0, 0),
             _InterlockedCompareExchange64(&g_dpi_drop_inactive, 0, 0),
-            _InterlockedCompareExchange64(&g_dpi_drop_no_ring, 0, 0));
+            _InterlockedCompareExchange64(&g_dpi_drop_no_ring, 0, 0),
+            _InterlockedCompareExchange64(&g_dpi_drop_capture_filter, 0, 0));
         return STATUS_SUCCESS;
     }
 

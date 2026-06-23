@@ -2313,6 +2313,50 @@ namespace
     std::vector<code_section_hash_t> s_code_hashes;
     std::mutex s_code_hash_mtx;
 
+    constexpr DWORD kHeartbeatComposeLockTimeoutMs = 2000;
+
+    bool heartbeat_try_lock_mutex(std::mutex& mtx,
+                                  const char* name,
+                                  std::unique_lock<std::mutex>& out_lock)
+    {
+        const ULONGLONG start_ms = GetTickCount64();
+        std::unique_lock<std::mutex> lk(mtx, std::defer_lock);
+        for (;;)
+        {
+            if (lk.try_lock())
+            {
+                lic_log_fmt("heartbeat_compose_lock_acquired name=%s elapsed_ms=%llu tid=%lu",
+                    name ? name : "<null>",
+                    static_cast<unsigned long long>(GetTickCount64() - start_ms),
+                    static_cast<unsigned long>(GetCurrentThreadId()));
+                out_lock = std::move(lk);
+                return true;
+            }
+            const ULONGLONG elapsed = GetTickCount64() - start_ms;
+            if (elapsed >= kHeartbeatComposeLockTimeoutMs)
+            {
+                lic_log_fmt("heartbeat_compose_lock_timeout name=%s timeout_ms=%lu elapsed_ms=%llu tid=%lu",
+                    name ? name : "<null>",
+                    static_cast<unsigned long>(kHeartbeatComposeLockTimeoutMs),
+                    static_cast<unsigned long long>(elapsed),
+                    static_cast<unsigned long>(GetCurrentThreadId()));
+                return false;
+            }
+            Sleep(1);
+        }
+    }
+
+    bool heartbeat_lock_timeout_response(const char* name, std::string& error_out, json& response_out)
+    {
+        error_out = std::string("heartbeat_lock_timeout:") + (name ? name : "unknown");
+        response_out = json::object({
+            {"ok", false},
+            {"status", "transient"},
+            {"reason", error_out}
+        });
+        return false;
+    }
+
     constexpr uint64_t S_MAGIC2_INIT = 0xCAFE'BABE'1337'C0DEull;
     constexpr uint64_t S_ARC_MAGIC_INIT = 0x51A7'F00D'44CC'19E5ull;
     std::atomic<uint64_t> s_state_d{0};
@@ -5737,66 +5781,93 @@ namespace
                 body["req_seq"] = std::to_string(req_seq);
 
                 {
-                    std::lock_guard<std::mutex> lk(s_session_ratchet_mtx);
+                    lic_log("heartbeat_compose_ratchet_lock_pre");
+                    std::unique_lock<std::mutex> lk;
+                    if (!heartbeat_try_lock_mutex(s_session_ratchet_mtx, "session_ratchet", lk))
+                        return heartbeat_lock_timeout_response("session_ratchet", error_out, response_out);
                     if (s_session_ratchet.initialized)
                     {
                         body["ratchet_counter"] = static_cast<int64_t>(
                             s_session_ratchet.request_counter.load(std::memory_order_acquire));
                     }
+                    lic_log("heartbeat_compose_ratchet_lock_post");
                 }
 
 
                 body["gate_bitmap"] = static_cast<int64_t>(
                     s_gate_bitmap.load(std::memory_order_acquire) & 0x00FFFFFFu);
 
+                std::string rotated_heartbeat_nonce;
+                std::string rotated_bind_proof;
+                std::string next_challenge_id;
+                std::string next_challenge_nonce;
+                std::string next_challenge_signature;
                 {
-                    std::lock_guard<std::mutex> rot_lk(s_rotation_mtx);
-                    if (!s_rotated_heartbeat_nonce.empty())
-                        body["echoed_server_nonce"] = s_rotated_heartbeat_nonce;
-                    if (!s_rotated_bind_proof.empty())
-                        body["echoed_bind_proof"] = s_rotated_bind_proof;
-                    if (!s_next_challenge_id.empty())
-                        body["challenge_id"] = s_next_challenge_id;
-                    if (!s_next_challenge_signature.empty())
-                        body["challenge_signature"] = s_next_challenge_signature;
+                    lic_log("heartbeat_compose_rotation_lock_pre");
+                    std::unique_lock<std::mutex> rot_lk;
+                    if (!heartbeat_try_lock_mutex(s_rotation_mtx, "rotation", rot_lk))
+                        return heartbeat_lock_timeout_response("rotation", error_out, response_out);
+                    rotated_heartbeat_nonce = s_rotated_heartbeat_nonce;
+                    rotated_bind_proof = s_rotated_bind_proof;
+                    next_challenge_id = s_next_challenge_id;
+                    next_challenge_nonce = s_next_challenge_nonce;
+                    next_challenge_signature = s_next_challenge_signature;
+                    lic_log_fmt("heartbeat_compose_rotation_lock_post nonce_len=%zu bind_len=%zu challenge_id_len=%zu challenge_nonce_len=%zu",
+                        rotated_heartbeat_nonce.size(),
+                        rotated_bind_proof.size(),
+                        next_challenge_id.size(),
+                        next_challenge_nonce.size());
+                }
+                if (!rotated_heartbeat_nonce.empty())
+                    body["echoed_server_nonce"] = rotated_heartbeat_nonce;
+                if (!rotated_bind_proof.empty())
+                    body["echoed_bind_proof"] = rotated_bind_proof;
+                if (!next_challenge_id.empty())
+                    body["challenge_id"] = next_challenge_id;
+                if (!next_challenge_signature.empty())
+                    body["challenge_signature"] = next_challenge_signature;
 
-                    if (!s_next_challenge_nonce.empty())
+                if (!next_challenge_nonce.empty())
+                {
+                    lic_log("heartbeat_compose_challenge_tpm_pre");
+                    std::string sealed;
+                    std::string sealed_message = std::string("aida-tpm-challenge|")
+                        + next_challenge_id + "|"
+                        + next_challenge_nonce + "|"
+                        + session_token + "|"
+                        + hwid;
+                    if (anti_tamper::tpm_attest::is_available())
                     {
-                        std::string sealed;
-                        std::string sealed_message = std::string("aida-tpm-challenge|")
-                            + s_next_challenge_id + "|"
-                            + s_next_challenge_nonce + "|"
-                            + session_token + "|"
-                            + hwid;
-                        if (anti_tamper::tpm_attest::is_available())
+                        std::vector<uint8_t> sealed_msg(sealed_message.begin(), sealed_message.end());
+                        anti_tamper::tpm_attest::quote_result_t quote{};
+                        uint32_t pcrs[3] = { 0, 7, 16 };
+                        if (anti_tamper::tpm_attest::sign_with_aik(
+                                sealed_msg.data(), static_cast<uint32_t>(sealed_msg.size()),
+                                pcrs, 3, quote) && quote.valid &&
+                            !quote.signature.empty())
                         {
-                            std::vector<uint8_t> sealed_msg(sealed_message.begin(), sealed_message.end());
-                            anti_tamper::tpm_attest::quote_result_t quote{};
-                            uint32_t pcrs[3] = { 0, 7, 16 };
-                            if (anti_tamper::tpm_attest::sign_with_aik(
-                                    sealed_msg.data(), static_cast<uint32_t>(sealed_msg.size()),
-                                    pcrs, 3, quote) && quote.valid &&
-                                !quote.signature.empty())
+                            std::string hex;
+                            hex.reserve(quote.signature.size() * 2);
+                            static const char hexd[] = "0123456789abcdef";
+                            for (uint8_t b : quote.signature)
                             {
-                                std::string hex;
-                                hex.reserve(quote.signature.size() * 2);
-                                static const char hexd[] = "0123456789abcdef";
-                                for (uint8_t b : quote.signature)
-                                {
-                                    hex.push_back(hexd[(b >> 4) & 0xF]);
-                                    hex.push_back(hexd[b & 0xF]);
-                                }
-                                sealed = std::move(hex);
+                                hex.push_back(hexd[(b >> 4) & 0xF]);
+                                hex.push_back(hexd[b & 0xF]);
                             }
+                            sealed = std::move(hex);
                         }
-                        if (!sealed.empty())
-                            body["challenge_tpm_seal"] = std::move(sealed);
                     }
+                    const bool sealed_added = !sealed.empty();
+                    if (sealed_added)
+                        body["challenge_tpm_seal"] = std::move(sealed);
+                    lic_log_fmt("heartbeat_compose_challenge_tpm_post sealed=%d", sealed_added ? 1 : 0);
                 }
 
 
+                lic_log("heartbeat_compose_tpm_state_pre");
                 if (anti_tamper::tpm_attest::is_available())
                 {
+                    lic_log("heartbeat_compose_tpm_available");
                     if (anti_tamper::tpm_attest::ensure_counter_defined(
                             anti_tamper::tpm_attest::TPM_NV_INDEX_AIDA_COUNTER))
                     {
@@ -5827,32 +5898,47 @@ namespace
                     hw["txt"] = caps.txt_supported;
                     hw["pluton"] = caps.pluton_supported;
                     body["hw_attest_caps"] = std::move(hw);
+                    lic_log("heartbeat_compose_tpm_state_post");
                 }
                 else
                 {
                     body["tpm_unavailable"] = true;
+                    lic_log("heartbeat_compose_tpm_unavailable");
                 }
 
                 {
-                    std::lock_guard<std::mutex> lk(s_honeypot_names_mtx);
+                    lic_log("heartbeat_compose_honeypot_lock_pre");
+                    std::unique_lock<std::mutex> lk;
+                    if (!heartbeat_try_lock_mutex(s_honeypot_names_mtx, "honeypot_names", lk))
+                        return heartbeat_lock_timeout_response("honeypot_names", error_out, response_out);
                     body["called_honeypot_names"] = json(s_honeypot_called_names);
+                    lic_log_fmt("heartbeat_compose_honeypot_lock_post count=%zu", s_honeypot_called_names.size());
                 }
 
+                lic_log("heartbeat_compose_driver_version_pre");
                 if (driver_bridge::is_loaded())
                     body["driver_proof_version"] = 3;
+                lic_log("heartbeat_compose_driver_version_post");
 
                 size_t code_hash_region_count = 0;
                 size_t code_hash_drifted_regions = 0;
                 std::string code_hash_value;
                 std::string code_hash_live_value;
+                std::vector<code_section_hash_t> code_hashes_snapshot;
                 {
-                    std::lock_guard<std::mutex> lk(s_code_hash_mtx);
-                    code_hash_region_count = s_code_hashes.size();
-                    if (!s_code_hashes.empty()) {
+                    lic_log("heartbeat_compose_code_hash_lock_pre");
+                    std::unique_lock<std::mutex> lk;
+                    if (!heartbeat_try_lock_mutex(s_code_hash_mtx, "code_hash", lk))
+                        return heartbeat_lock_timeout_response("code_hash", error_out, response_out);
+                    code_hashes_snapshot = s_code_hashes;
+                    lic_log_fmt("heartbeat_compose_code_hash_lock_post regions=%zu", code_hashes_snapshot.size());
+                }
+                code_hash_region_count = code_hashes_snapshot.size();
+                if (!code_hashes_snapshot.empty()) {
                         uint64_t combined_snapshot = 14695981039346656037ULL;
                         uint64_t combined_live = 14695981039346656037ULL;
-                        for (size_t ri = 0; ri < s_code_hashes.size(); ++ri) {
-                            const auto& entry = s_code_hashes[ri];
+                        for (size_t ri = 0; ri < code_hashes_snapshot.size(); ++ri) {
+                            const auto& entry = code_hashes_snapshot[ri];
                             combined_snapshot ^= entry.hash;
                             combined_snapshot *= 1099511628211ULL;
                             const uint64_t live = fnv1a(
@@ -5882,7 +5968,6 @@ namespace
                         snprintf(live_buf, sizeof(live_buf), "%016llX",
                             static_cast<unsigned long long>(combined_live));
                         code_hash_live_value.assign(live_buf);
-                    }
                 }
                 {
                     char dbg_ch[384];
@@ -6065,13 +6150,19 @@ namespace
                 }
             }
 
+            lic_log("call_validation_capsule_proof_pre");
             attach_standalone_capsule_proof(body, action, key, hwid, session_token, nonce);
+            lic_log("call_validation_capsule_proof_post");
+            lic_log("call_validation_body_dump_pre");
             std::string body_str = body.dump();
+            lic_log_fmt("call_validation_body_dump_post len=%zu", body_str.size());
 
+            lic_log("call_validation_endpoint_once_pre");
             if (call_validation_endpoint_once(action, key, hwid, session_token, nonce,
                                               body_str, error_out, response_out)) {
                 return true;
             }
+            lic_log_fmt("call_validation_endpoint_once_post ok=0 err=%.128s", error_out.c_str());
 
             bool is_transport_or_server_error =
                 error_out.find("transport error") != std::string::npos ||

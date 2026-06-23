@@ -232,6 +232,7 @@ inline PETHREAD           (NTAPI* _PsGetNextProcessThread)         (PEPROCESS, P
 inline HANDLE             (NTAPI* _PsGetThreadId)                  (PETHREAD);
 inline NTSTATUS           (NTAPI* _PsGetContextThread)             (PETHREAD, PCONTEXT, KPROCESSOR_MODE);
 inline NTSTATUS           (NTAPI* _PsSetContextThread)             (PETHREAD, PCONTEXT, KPROCESSOR_MODE);
+inline NTSTATUS           (NTAPI* _PsGetUserContextThread)         (PETHREAD, PCONTEXT);
 inline NTSTATUS           (NTAPI* _ZwGetContextThread)             (HANDLE, PCONTEXT);
 inline NTSTATUS           (NTAPI* _ZwSetContextThread)             (HANDLE, PCONTEXT);
 inline NTSTATUS           (NTAPI* _PsSuspendThread)                (PETHREAD, PULONG);
@@ -242,6 +243,8 @@ inline NTSTATUS           (NTAPI* _ZwProtectVirtualMemory)         (HANDLE, PVOI
 inline NTSTATUS           (NTAPI* _ObOpenObjectByPointer)          (PVOID, ULONG, PACCESS_STATE, ACCESS_MASK, POBJECT_TYPE, KPROCESSOR_MODE, PHANDLE);
 inline NTSTATUS           (NTAPI* _ZwSuspendThread)                (HANDLE, PULONG);
 inline NTSTATUS           (NTAPI* _ZwResumeThread)                 (HANDLE, PULONG);
+inline NTSTATUS           (NTAPI* _ZwQueryInformationThread)       (HANDLE, ULONG, PVOID, ULONG, PULONG);
+inline NTSTATUS           (NTAPI* _ZwTerminateThread)              (HANDLE, NTSTATUS);
 inline NTSTATUS           (NTAPI* _ZwSetInformationThread)         (HANDLE, ULONG, PVOID, ULONG);
 
 inline POBJECT_TYPE*       _IoFileObjectType = nullptr;
@@ -288,6 +291,34 @@ namespace dbg_capture { void write_formatted(const char* fmt, ...); }
         dbg_capture::write_formatted("[WW] " fmt "\n", ##__VA_ARGS__); \
     } while(0)
 
+__forceinline ULONG ww_kernel_validation_build() {
+    RTL_OSVERSIONINFOW version = {};
+    version.dwOSVersionInfoSize = sizeof(version);
+    if (_RtlGetVersion && NT_SUCCESS(_RtlGetVersion(&version)))
+        return version.dwBuildNumber;
+    return 0;
+}
+
+__forceinline const char* ww_kernel_validation_state(BOOLEAN valid) {
+    return valid ? "pass" : "fail";
+}
+
+__forceinline const char* ww_kernel_validation_reason(const char* reason) {
+    return reason ? reason : "none";
+}
+
+#define WW_KERNEL_RESOLVER_LOG_PTR(name, source, value, valid, evidence, reason) \
+    WW_LOG("KVALIDATE build=%lu kind=resolver name=%s source=%s value=%p validation=%s evidence=\"%s\" fail_closed=%s", \
+        ww_kernel_validation_build(), (name), (source), (value), ww_kernel_validation_state((valid) ? TRUE : FALSE), (evidence), ww_kernel_validation_reason(reason))
+
+#define WW_KERNEL_LAYOUT_LOG_OFFSET(name, source, offset, valid, evidence, reason) \
+    WW_LOG("KVALIDATE build=%lu kind=layout name=%s source=%s offset=0x%llx validation=%s evidence=\"%s\" fail_closed=%s", \
+        ww_kernel_validation_build(), (name), (source), static_cast<unsigned long long>(offset), ww_kernel_validation_state((valid) ? TRUE : FALSE), (evidence), ww_kernel_validation_reason(reason))
+
+#define WW_KERNEL_PATTERN_LOG_PTR(name, source, pattern, value, valid, evidence, reason) \
+    WW_LOG("KVALIDATE build=%lu kind=pattern name=%s source=%s pattern=%s value=%p validation=%s evidence=\"%s\" fail_closed=%s", \
+        ww_kernel_validation_build(), (name), (source), (pattern), (value), ww_kernel_validation_state((valid) ? TRUE : FALSE), (evidence), ww_kernel_validation_reason(reason))
+
 
 namespace ssdt_resolver {
     typedef struct _KSERVICE_TABLE_DESCRIPTOR {
@@ -302,15 +333,23 @@ namespace ssdt_resolver {
     typedef NTSTATUS (NTAPI* fn_NtResumeThread)(HANDLE, PULONG);
     typedef NTSTATUS (NTAPI* fn_NtGetContextThread)(HANDLE, PCONTEXT);
     typedef NTSTATUS (NTAPI* fn_NtSetContextThread)(HANDLE, PCONTEXT);
+    typedef NTSTATUS (NTAPI* fn_PsGetUserContextThread)(PETHREAD, PCONTEXT);
+    typedef NTSTATUS (NTAPI* fn_PspGetContextThreadInternal)(PETHREAD, PCONTEXT, KPROCESSOR_MODE, KPROCESSOR_MODE, BOOLEAN);
+    typedef NTSTATUS (NTAPI* fn_PspSetContextThreadInternal)(PETHREAD, PCONTEXT, KPROCESSOR_MODE, KPROCESSOR_MODE, BOOLEAN);
 
     inline PKSERVICE_TABLE_DESCRIPTOR g_ssdt = nullptr;
     inline fn_NtSuspendThread g_NtSuspendThread = nullptr;
     inline fn_NtResumeThread  g_NtResumeThread  = nullptr;
     inline fn_NtGetContextThread g_NtGetContextThread = nullptr;
     inline fn_NtSetContextThread g_NtSetContextThread = nullptr;
+    inline fn_PsGetUserContextThread g_PsGetUserContextThread = nullptr;
+    inline fn_PspGetContextThreadInternal g_PspGetContextThreadInternal = nullptr;
+    inline fn_PspSetContextThreadInternal g_PspSetContextThreadInternal = nullptr;
     inline volatile LONG g_ssdt_found = 0;
     inline volatile LONG g_funcs_resolved = 0;
     inline volatile LONG g_ctx_funcs_resolved = 0;
+    inline volatile LONG g_user_ctx_resolved = 0;
+    inline volatile LONG g_user_set_ctx_resolved = 0;
     inline volatile UINT64 g_lstar = 0;
 
     struct ntdll_lookup_result_t {
@@ -499,6 +538,7 @@ namespace ssdt_resolver {
             g_lstar = lstar;
             if (lstar < 0xFFFF800000000000ULL) {
                 _InterlockedExchange(&g_ssdt_found, 2);
+                WW_KERNEL_RESOLVER_LOG_PTR("KeServiceDescriptorTable", "semantic_scan", nullptr, FALSE, "LSTAR below canonical kernel range", "invalid_lstar");
                 return FALSE;
             }
 
@@ -574,6 +614,14 @@ namespace ssdt_resolver {
 
         KeMemoryBarrier();
         _InterlockedExchange(&g_ssdt_found, 2);
+        WW_LOG("KVALIDATE build=%lu kind=resolver name=KeServiceDescriptorTable source=semantic_scan value=%p validation=%s evidence=\"lstar=0x%llx service_table=%p limit=%lu scan0=0x500 jmp_scan=0x300\" fail_closed=%s",
+            ww_kernel_validation_build(),
+            g_ssdt,
+            ww_kernel_validation_state(g_ssdt != nullptr ? TRUE : FALSE),
+            static_cast<unsigned long long>(g_lstar),
+            g_ssdt ? g_ssdt->ServiceTable : nullptr,
+            g_ssdt ? g_ssdt->ServiceLimit : 0,
+            g_ssdt ? "none" : "pattern_not_found_or_invalid_descriptor");
         return g_ssdt != nullptr;
     }
 
@@ -583,6 +631,441 @@ namespace ssdt_resolver {
 
         LONG entry = g_ssdt->ServiceTable[index];
         return (PVOID)((PUCHAR)g_ssdt->ServiceTable + (entry >> 4));
+    }
+
+    __forceinline ULONG get_image_size(PVOID image_base) {
+        if (!image_base || !_MmIsAddressValid) return 0;
+        __try {
+            auto dos = reinterpret_cast<PIMAGE_DOS_HEADER>(image_base);
+            if (!_MmIsAddressValid(dos) || dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+            auto nt = reinterpret_cast<PIMAGE_NT_HEADERS64>((PUCHAR)image_base + dos->e_lfanew);
+            if (!_MmIsAddressValid(nt) || nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+            return nt->OptionalHeader.SizeOfImage;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return 0;
+        }
+    }
+
+    __forceinline PVOID resolve_rel32_call(PUCHAR call_instruction, PUCHAR image_base, ULONG image_size) {
+        if (!call_instruction || !image_base || image_size < 5) return nullptr;
+        __try {
+            if (!_MmIsAddressValid(call_instruction) || call_instruction[0] != 0xE8) return nullptr;
+            LONG rel = *reinterpret_cast<PLONG>(call_instruction + 1);
+            PUCHAR target = call_instruction + 5 + rel;
+            if (target < image_base || target >= image_base + image_size) return nullptr;
+            return target;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return nullptr;
+        }
+    }
+
+    __forceinline BOOLEAN match_ps_get_user_context_thunk(PUCHAR p) {
+        __try {
+            return p &&
+                p[0] == 0x48 && p[1] == 0x83 && p[2] == 0xEC && p[3] == 0x38 &&
+                p[4] == 0x41 && p[5] == 0xB1 && p[6] == 0x01 &&
+                p[7] == 0xC7 && p[8] == 0x44 && p[9] == 0x24 && p[10] == 0x20 &&
+                p[11] == 0x01 && p[12] == 0x00 && p[13] == 0x00 && p[14] == 0x00 &&
+                p[15] == 0x45 && p[16] == 0x33 && p[17] == 0xC0 &&
+                p[18] == 0xE8 &&
+                p[23] == 0x48 && p[24] == 0x83 && p[25] == 0xC4 && p[26] == 0x38 &&
+                p[27] == 0xC3;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return FALSE;
+        }
+    }
+
+    __forceinline BOOLEAN has_user_context_thunk_semantics(PUCHAR function_start, PUCHAR call_site, PUCHAR image_base, ULONG image_size) {
+        if (!function_start || !call_site || !image_base || image_size < 32) return FALSE;
+        if (function_start < image_base || call_site <= function_start || call_site + 9 >= image_base + image_size) return FALSE;
+        if ((ULONG_PTR)(call_site - function_start) > 64) return FALSE;
+        __try {
+            BOOLEAN has_stack_prologue = FALSE;
+            UCHAR stack_sub = 0;
+            if (function_start[0] == 0x48 && function_start[1] == 0x83 && function_start[2] == 0xEC) {
+                has_stack_prologue = TRUE;
+                stack_sub = function_start[3];
+            }
+            if (!has_stack_prologue) return FALSE;
+
+            BOOLEAN sets_user_context = FALSE;
+            BOOLEAN clears_previous_mode = FALSE;
+            BOOLEAN sets_stack_arg = FALSE;
+            for (PUCHAR p = function_start; p < call_site; ++p) {
+                if (p + 3 <= call_site && p[0] == 0x41 && p[1] == 0xB1 && p[2] == 0x01) {
+                    sets_user_context = TRUE;
+                }
+                if (p + 3 <= call_site && p[0] == 0x45 && (p[1] == 0x33 || p[1] == 0x31) && p[2] == 0xC0) {
+                    clears_previous_mode = TRUE;
+                }
+                if (p + 8 <= call_site && p[0] == 0xC7 && p[1] == 0x44 && p[2] == 0x24 &&
+                    p[4] == 0x01 && p[5] == 0x00 && p[6] == 0x00 && p[7] == 0x00) {
+                    sets_stack_arg = TRUE;
+                }
+            }
+
+            PUCHAR epilogue = call_site + 5;
+            const BOOLEAN epilogue_ok =
+                epilogue[0] == 0x48 && epilogue[1] == 0x83 && epilogue[2] == 0xC4 &&
+                epilogue[3] == stack_sub && epilogue[4] == 0xC3;
+            return sets_user_context && clears_previous_mode && sets_stack_arg && epilogue_ok;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return FALSE;
+        }
+    }
+
+    __forceinline PUCHAR find_user_context_thunk_start(PUCHAR call_site, PUCHAR image_base, ULONG image_size) {
+        if (!call_site || !image_base || image_size < 64 || call_site <= image_base || call_site >= image_base + image_size) return nullptr;
+        if (call_site >= image_base + 18) {
+            __try {
+                PUCHAR exact_start = call_site - 18;
+                if (match_ps_get_user_context_thunk(exact_start)) {
+                    return exact_start;
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                return nullptr;
+            }
+        }
+        PUCHAR start = call_site > image_base + 64 ? call_site - 64 : image_base;
+        for (PUCHAR p = start; p + 4 <= call_site; ++p) {
+            __try {
+                if (p[0] == 0x48 && p[1] == 0x83 && p[2] == 0xEC &&
+                    has_user_context_thunk_semantics(p, call_site, image_base, image_size)) {
+                    return p;
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                return nullptr;
+            }
+        }
+        return nullptr;
+    }
+
+    __forceinline BOOLEAN resolve_user_context() {
+        LONG state = _InterlockedCompareExchange(&g_user_ctx_resolved, 0, 0);
+        if (state == 2) return g_PspGetContextThreadInternal != nullptr;
+
+        LONG prev = _InterlockedCompareExchange(&g_user_ctx_resolved, 1, 0);
+        if (prev == 2) return g_PspGetContextThreadInternal != nullptr;
+        if (prev == 1) {
+            while (_InterlockedCompareExchange(&g_user_ctx_resolved, 0, 0) == 1)
+                YieldProcessor();
+            return g_PspGetContextThreadInternal != nullptr;
+        }
+
+        const char* reason = "unresolved";
+        PVOID nt_base_ptr = nullptr;
+        ULONG nt_size = 0;
+        PVOID internal_target = nullptr;
+        PVOID found = nullptr;
+        ULONG match_count = 0;
+        ULONG call_target_match_count = 0;
+        ULONG exact_signature_match_count = 0;
+        ULONG semantic_reject_count = 0;
+        ULONG ps_get_call_offset = 0;
+        RTL_OSVERSIONINFOW os = {};
+        os.dwOSVersionInfoSize = sizeof(os);
+        NTSTATUS os_status = _RtlGetVersion ? _RtlGetVersion(&os) : STATUS_PROCEDURE_NOT_FOUND;
+
+        do {
+            if (!_PsGetContextThread || !_MmIsAddressValid) {
+                reason = "missing_primitives";
+                break;
+            }
+            if (!NT_SUCCESS(os_status) || os.dwMajorVersion != 10) {
+                reason = "unsupported_os_build";
+                break;
+            }
+
+            nt_base_ptr = reinterpret_cast<PVOID>(get_nt_base());
+            nt_size = get_image_size(nt_base_ptr);
+            if (!nt_base_ptr || nt_size < 0x100000 || nt_size > 0x2000000) {
+                reason = "bad_nt_image";
+                break;
+            }
+
+            PUCHAR nt_base = reinterpret_cast<PUCHAR>(nt_base_ptr);
+            PUCHAR ps_get = reinterpret_cast<PUCHAR>(_PsGetContextThread);
+            if (ps_get < nt_base || ps_get >= nt_base + nt_size) {
+                reason = "ps_get_out_of_image";
+                break;
+            }
+            for (ULONG off = 0; off < 64; ++off) {
+                PUCHAR call_site = ps_get + off;
+                if (call_site >= nt_base + nt_size || call_site[0] != 0xE8) {
+                    continue;
+                }
+                BOOLEAN forwards_previous_mode = FALSE;
+                BOOLEAN stores_get_flag = FALSE;
+                BOOLEAN epilogue_ok = FALSE;
+                for (PUCHAR p = ps_get; p < call_site; ++p) {
+                    if (p + 3 <= call_site && p[0] == 0x45 && p[1] == 0x8A && p[2] == 0xC8) {
+                        forwards_previous_mode = TRUE;
+                    }
+                    if (p + 8 <= call_site && p[0] == 0xC7 && p[1] == 0x44 && p[2] == 0x24 &&
+                        p[4] == 0x01 && p[5] == 0x00 && p[6] == 0x00 && p[7] == 0x00) {
+                        stores_get_flag = TRUE;
+                    }
+                }
+                PUCHAR epilogue = call_site + 5;
+                if (epilogue + 5 < nt_base + nt_size &&
+                    epilogue[0] == 0x48 && epilogue[1] == 0x83 && epilogue[2] == 0xC4 &&
+                    epilogue[4] == 0xC3) {
+                    epilogue_ok = TRUE;
+                }
+                if (!forwards_previous_mode || !stores_get_flag || !epilogue_ok) {
+                    continue;
+                }
+                internal_target = resolve_rel32_call(call_site, nt_base, nt_size);
+                ps_get_call_offset = off;
+                break;
+            }
+            if (!internal_target) {
+                reason = "missing_internal_target";
+                break;
+            }
+
+            found = internal_target;
+            match_count = 1;
+            call_target_match_count = 1;
+            g_PspGetContextThreadInternal = reinterpret_cast<fn_PspGetContextThreadInternal>(found);
+            reason = "resolved_internal_direct";
+        } while (FALSE);
+
+        BOOLEAN resolved = g_PspGetContextThreadInternal != nullptr;
+        KeMemoryBarrier();
+        _InterlockedExchange(&g_user_ctx_resolved, 2);
+        WW_KERNEL_RESOLVER_LOG_PTR("PspGetContextThreadInternal", "semantic_scan", g_PspGetContextThreadInternal, resolved, "PsGetContextThread rel32 call within ntoskrnl, previous-mode and get-flag semantics checked", resolved ? "none" : reason);
+        WW_LOG("TCTX resolve_user_context result=%u reason=%s state=%ld os_status=0x%08X os=%lu.%lu.%lu nt_base=%p nt_size=0x%08X ps_get=%p internal=%p internal_direct=%p ps_get_call_offset=%lu user_get=%p matches=%lu call_target_matches=%lu exact_matches=%lu semantic_rejects=%lu current_pid=%p current_tid=%p",
+            resolved ? 1u : 0u,
+            reason,
+            _InterlockedCompareExchange(&g_user_ctx_resolved, 0, 0),
+            (ULONG)os_status,
+            os.dwMajorVersion,
+            os.dwMinorVersion,
+            os.dwBuildNumber,
+            nt_base_ptr,
+            nt_size,
+            _PsGetContextThread,
+            internal_target,
+            g_PspGetContextThreadInternal,
+            ps_get_call_offset,
+            g_PsGetUserContextThread,
+            match_count,
+            call_target_match_count,
+            exact_signature_match_count,
+            semantic_reject_count,
+            PsGetCurrentProcessId(),
+            PsGetCurrentThreadId());
+        return resolved;
+    }
+
+    __forceinline BOOLEAN resolve_user_set_context() {
+        LONG state = _InterlockedCompareExchange(&g_user_set_ctx_resolved, 0, 0);
+        if (state == 2) return g_PspSetContextThreadInternal != nullptr;
+
+        LONG prev = _InterlockedCompareExchange(&g_user_set_ctx_resolved, 1, 0);
+        if (prev == 2) return g_PspSetContextThreadInternal != nullptr;
+        if (prev == 1) {
+            while (_InterlockedCompareExchange(&g_user_set_ctx_resolved, 0, 0) == 1)
+                YieldProcessor();
+            return g_PspSetContextThreadInternal != nullptr;
+        }
+
+        const char* reason = "unresolved";
+        PVOID nt_base_ptr = nullptr;
+        ULONG nt_size = 0;
+        PVOID internal_target = nullptr;
+        ULONG match_count = 0;
+        ULONG ps_set_call_offset = 0;
+        RTL_OSVERSIONINFOW os = {};
+        os.dwOSVersionInfoSize = sizeof(os);
+        NTSTATUS os_status = _RtlGetVersion ? _RtlGetVersion(&os) : STATUS_PROCEDURE_NOT_FOUND;
+
+        do {
+            if (!_PsSetContextThread || !_MmIsAddressValid) {
+                reason = "missing_primitives";
+                break;
+            }
+            if (!NT_SUCCESS(os_status) || os.dwMajorVersion != 10) {
+                reason = "unsupported_os_build";
+                break;
+            }
+
+            nt_base_ptr = reinterpret_cast<PVOID>(get_nt_base());
+            nt_size = get_image_size(nt_base_ptr);
+            if (!nt_base_ptr || nt_size < 0x100000 || nt_size > 0x2000000) {
+                reason = "bad_nt_image";
+                break;
+            }
+
+            PUCHAR nt_base = reinterpret_cast<PUCHAR>(nt_base_ptr);
+            PUCHAR ps_set = reinterpret_cast<PUCHAR>(_PsSetContextThread);
+            if (ps_set < nt_base || ps_set >= nt_base + nt_size) {
+                reason = "ps_set_out_of_image";
+                break;
+            }
+
+            for (ULONG off = 0; off < 64; ++off) {
+                PUCHAR call_site = ps_set + off;
+                if (call_site >= nt_base + nt_size || call_site[0] != 0xE8) {
+                    continue;
+                }
+                BOOLEAN forwards_previous_mode = FALSE;
+                BOOLEAN stores_set_flag = FALSE;
+                BOOLEAN epilogue_ok = FALSE;
+                UCHAR stack_sub = 0;
+                if (ps_set[0] == 0x48 && ps_set[1] == 0x83 && ps_set[2] == 0xEC) {
+                    stack_sub = ps_set[3];
+                }
+                for (PUCHAR p = ps_set; p < call_site; ++p) {
+                    if (p + 3 <= call_site && p[0] == 0x45 && p[1] == 0x8A && p[2] == 0xC8) {
+                        forwards_previous_mode = TRUE;
+                    }
+                    if (p + 8 <= call_site && p[0] == 0xC7 && p[1] == 0x44 && p[2] == 0x24 &&
+                        p[4] == 0x01 && p[5] == 0x00 && p[6] == 0x00 && p[7] == 0x00) {
+                        stores_set_flag = TRUE;
+                    }
+                }
+                PUCHAR epilogue = call_site + 5;
+                if (epilogue + 5 < nt_base + nt_size &&
+                    epilogue[0] == 0x48 && epilogue[1] == 0x83 && epilogue[2] == 0xC4 &&
+                    epilogue[3] == stack_sub && epilogue[4] == 0xC3) {
+                    epilogue_ok = TRUE;
+                }
+                if (!forwards_previous_mode || !stores_set_flag || !epilogue_ok) {
+                    continue;
+                }
+                internal_target = resolve_rel32_call(call_site, nt_base, nt_size);
+                ps_set_call_offset = off;
+                break;
+            }
+            if (!internal_target) {
+                reason = "missing_internal_target";
+                break;
+            }
+
+            g_PspSetContextThreadInternal = reinterpret_cast<fn_PspSetContextThreadInternal>(internal_target);
+            match_count = 1;
+            reason = "resolved_internal_direct";
+        } while (FALSE);
+
+        BOOLEAN resolved = g_PspSetContextThreadInternal != nullptr;
+        KeMemoryBarrier();
+        _InterlockedExchange(&g_user_set_ctx_resolved, 2);
+        WW_KERNEL_RESOLVER_LOG_PTR("PspSetContextThreadInternal", "semantic_scan", g_PspSetContextThreadInternal, resolved, "PsSetContextThread rel32 call within ntoskrnl, previous-mode and set-flag semantics checked", resolved ? "none" : reason);
+        WW_LOG("TCTX resolve_user_set_context result=%u reason=%s state=%ld os_status=0x%08X os=%lu.%lu.%lu nt_base=%p nt_size=0x%08X ps_set=%p internal=%p ps_set_call_offset=%lu matches=%lu current_pid=%p current_tid=%p",
+            resolved ? 1u : 0u,
+            reason,
+            _InterlockedCompareExchange(&g_user_set_ctx_resolved, 0, 0),
+            (ULONG)os_status,
+            os.dwMajorVersion,
+            os.dwMinorVersion,
+            os.dwBuildNumber,
+            nt_base_ptr,
+            nt_size,
+            _PsSetContextThread,
+            g_PspSetContextThreadInternal,
+            ps_set_call_offset,
+            match_count,
+            PsGetCurrentProcessId(),
+            PsGetCurrentThreadId());
+        return resolved;
+    }
+
+    __forceinline NTSTATUS call_PsGetUserContextThread(PETHREAD thread, PCONTEXT context) {
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_STATE;
+        if (!thread || !context) return STATUS_INVALID_PARAMETER;
+        const KPROCESSOR_MODE previous_mode = ExGetPreviousMode();
+        if (!g_PspGetContextThreadInternal) {
+            BOOLEAN resolved = resolve_user_context();
+            WW_LOG("TCTX call_PsGetUserContextThread resolve resolved=%u thread=%p flags=0x%08X previous_mode=%u internal_direct=%p user_get=%p state=%ld",
+                resolved ? 1u : 0u,
+                thread,
+                context->ContextFlags,
+                (ULONG)previous_mode,
+                g_PspGetContextThreadInternal,
+                g_PsGetUserContextThread,
+                _InterlockedCompareExchange(&g_user_ctx_resolved, 0, 0));
+        }
+        if (!g_PspGetContextThreadInternal) {
+            WW_LOG("TCTX call_PsGetUserContextThread path=missing status=0x%08X thread=%p flags=0x%08X previous_mode=%u internal_direct=%p user_get=%p state=%ld",
+                (ULONG)STATUS_PROCEDURE_NOT_FOUND,
+                thread,
+                context->ContextFlags,
+                (ULONG)previous_mode,
+                g_PspGetContextThreadInternal,
+                g_PsGetUserContextThread,
+                _InterlockedCompareExchange(&g_user_ctx_resolved, 0, 0));
+            return STATUS_PROCEDURE_NOT_FOUND;
+        }
+        NTSTATUS status = STATUS_UNSUCCESSFUL;
+        __try {
+            status = g_PspGetContextThreadInternal(thread, context, KernelMode, UserMode, TRUE);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            status = (NTSTATUS)GetExceptionCode();
+        }
+        WW_LOG("TCTX call_PsGetUserContextThread path=psp_internal_user_context status=0x%08X thread=%p flags=0x%08X rip=0x%llX rsp=0x%llX previous_mode=%u internal_direct=%p user_get=%p state=%ld",
+            (ULONG)status,
+            thread,
+            context->ContextFlags,
+            (unsigned long long)context->Rip,
+            (unsigned long long)context->Rsp,
+            (ULONG)previous_mode,
+            g_PspGetContextThreadInternal,
+            g_PsGetUserContextThread,
+            _InterlockedCompareExchange(&g_user_ctx_resolved, 0, 0));
+        return status;
+    }
+
+    __forceinline NTSTATUS call_PsSetUserContextThread(PETHREAD thread, PCONTEXT context) {
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_STATE;
+        if (!thread || !context) return STATUS_INVALID_PARAMETER;
+        const KPROCESSOR_MODE previous_mode = ExGetPreviousMode();
+        if (!g_PspSetContextThreadInternal) {
+            BOOLEAN resolved = resolve_user_set_context();
+            WW_LOG("TCTX call_PsSetUserContextThread resolve resolved=%u thread=%p flags=0x%08X previous_mode=%u internal_direct=%p ps_set=%p state=%ld",
+                resolved ? 1u : 0u,
+                thread,
+                context->ContextFlags,
+                (ULONG)previous_mode,
+                g_PspSetContextThreadInternal,
+                _PsSetContextThread,
+                _InterlockedCompareExchange(&g_user_set_ctx_resolved, 0, 0));
+        }
+        if (!g_PspSetContextThreadInternal) {
+            WW_LOG("TCTX call_PsSetUserContextThread path=missing status=0x%08X thread=%p flags=0x%08X previous_mode=%u internal_direct=%p ps_set=%p state=%ld",
+                (ULONG)STATUS_PROCEDURE_NOT_FOUND,
+                thread,
+                context->ContextFlags,
+                (ULONG)previous_mode,
+                g_PspSetContextThreadInternal,
+                _PsSetContextThread,
+                _InterlockedCompareExchange(&g_user_set_ctx_resolved, 0, 0));
+            return STATUS_PROCEDURE_NOT_FOUND;
+        }
+        NTSTATUS status = STATUS_UNSUCCESSFUL;
+        __try {
+            status = g_PspSetContextThreadInternal(thread, context, KernelMode, UserMode, TRUE);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            status = (NTSTATUS)GetExceptionCode();
+        }
+        WW_LOG("TCTX call_PsSetUserContextThread path=psp_internal_user_context status=0x%08X thread=%p flags=0x%08X rip=0x%llX rsp=0x%llX dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX previous_mode=%u internal_direct=%p ps_set=%p state=%ld",
+            (ULONG)status,
+            thread,
+            context->ContextFlags,
+            (unsigned long long)context->Rip,
+            (unsigned long long)context->Rsp,
+            (unsigned long long)context->Dr0,
+            (unsigned long long)context->Dr1,
+            (unsigned long long)context->Dr2,
+            (unsigned long long)context->Dr3,
+            (unsigned long long)context->Dr6,
+            (unsigned long long)context->Dr7,
+            (ULONG)previous_mode,
+            g_PspSetContextThreadInternal,
+            _PsSetContextThread,
+            _InterlockedCompareExchange(&g_user_set_ctx_resolved, 0, 0));
+        return status;
     }
 
 
@@ -662,6 +1145,19 @@ namespace ssdt_resolver {
 
         KeMemoryBarrier();
         _InterlockedExchange(&g_funcs_resolved, resolved ? 2 : 0);
+        WW_LOG("KVALIDATE build=%lu kind=resolver name=SSDT.NtSuspendResume source=ntdll_stub_ssdt value=%p validation=%s evidence=\"ssdt=%p table=%p limit=%lu ntdll=%p suspend_idx=%lu resume_idx=%lu suspend_stub8=0x%llx resume_stub8=0x%llx\" fail_closed=%s",
+            ww_kernel_validation_build(),
+            g_NtSuspendThread,
+            ww_kernel_validation_state(resolved),
+            g_ssdt,
+            g_ssdt ? g_ssdt->ServiceTable : nullptr,
+            g_ssdt ? g_ssdt->ServiceLimit : 0,
+            ntdll_base,
+            suspend_idx,
+            resume_idx,
+            static_cast<unsigned long long>(suspend_stub8),
+            static_cast<unsigned long long>(resume_stub8),
+            resolved ? "none" : reason);
         WW_LOG("SSDT resolve_suspend_resume result=%u reason=%s state=%ld ssdt=%p service_table=%p limit=%lu ntdll=%p suspend_stub=%p resume_stub=%p suspend_idx=%lu resume_idx=%lu nt_suspend=%p nt_resume=%p zw_suspend=%p zw_resume=%p ps_suspend=%p ps_resume=%p ps_get_peb=%p current_pid=%p current_tid=%p",
             resolved ? 1u : 0u,
             reason,
@@ -705,12 +1201,14 @@ namespace ssdt_resolver {
     __forceinline NTSTATUS call_NtSuspendThread(HANDLE thread_handle, PULONG prev_count) {
         if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_STATE;
         if (!thread_handle) return STATUS_INVALID_PARAMETER;
+        const KPROCESSOR_MODE previous_mode = ExGetPreviousMode();
         if (_ZwSuspendThread) {
             NTSTATUS status = _ZwSuspendThread(thread_handle, prev_count);
-            WW_LOG("SSDT call_NtSuspendThread path=zw_export status=0x%08X handle=%p prev=%lu zw_suspend=%p nt_suspend=%p ssdt=%p state=%ld",
+            WW_LOG("SSDT call_NtSuspendThread path=zw_export status=0x%08X handle=%p prev=%lu previous_mode=%u zw_suspend=%p nt_suspend=%p ssdt=%p state=%ld",
                 (ULONG)status,
                 thread_handle,
                 prev_count ? *prev_count : 0,
+                (ULONG)previous_mode,
                 _ZwSuspendThread,
                 g_NtSuspendThread,
                 g_ssdt,
@@ -720,29 +1218,43 @@ namespace ssdt_resolver {
         if (!g_NtSuspendThread) {
             find_ssdt();
             BOOLEAN resolved = resolve_suspend_resume();
-            WW_LOG("SSDT call_NtSuspendThread resolve resolved=%u handle=%p ssdt=%p nt_suspend=%p nt_resume=%p state=%ld",
+            WW_LOG("SSDT call_NtSuspendThread resolve resolved=%u handle=%p previous_mode=%u ssdt=%p nt_suspend=%p nt_resume=%p state=%ld",
                 resolved ? 1u : 0u,
                 thread_handle,
+                (ULONG)previous_mode,
                 g_ssdt,
                 g_NtSuspendThread,
                 g_NtResumeThread,
                 _InterlockedCompareExchange(&g_funcs_resolved, 0, 0));
         }
         if (!g_NtSuspendThread) {
-            WW_LOG("SSDT call_NtSuspendThread path=missing status=0x%08X handle=%p zw_suspend=%p nt_suspend=%p ssdt=%p state=%ld",
+            WW_LOG("SSDT call_NtSuspendThread path=missing status=0x%08X handle=%p previous_mode=%u zw_suspend=%p nt_suspend=%p ssdt=%p state=%ld",
                 (ULONG)STATUS_PROCEDURE_NOT_FOUND,
                 thread_handle,
+                (ULONG)previous_mode,
                 _ZwSuspendThread,
                 g_NtSuspendThread,
                 g_ssdt,
                 _InterlockedCompareExchange(&g_funcs_resolved, 0, 0));
             return STATUS_PROCEDURE_NOT_FOUND;
         }
+        if (previous_mode != KernelMode) {
+            WW_LOG("SSDT call_NtSuspendThread path=ssdt_rejected_user_previous_mode status=0x%08X handle=%p previous_mode=%u zw_suspend=%p nt_suspend=%p ssdt=%p state=%ld",
+                (ULONG)STATUS_INVALID_DEVICE_STATE,
+                thread_handle,
+                (ULONG)previous_mode,
+                _ZwSuspendThread,
+                g_NtSuspendThread,
+                g_ssdt,
+                _InterlockedCompareExchange(&g_funcs_resolved, 0, 0));
+            return STATUS_INVALID_DEVICE_STATE;
+        }
         NTSTATUS status = g_NtSuspendThread(thread_handle, prev_count);
-        WW_LOG("SSDT call_NtSuspendThread path=ssdt status=0x%08X handle=%p prev=%lu zw_suspend=%p nt_suspend=%p ssdt=%p state=%ld",
+        WW_LOG("SSDT call_NtSuspendThread path=ssdt status=0x%08X handle=%p prev=%lu previous_mode=%u zw_suspend=%p nt_suspend=%p ssdt=%p state=%ld",
             (ULONG)status,
             thread_handle,
             prev_count ? *prev_count : 0,
+            (ULONG)previous_mode,
             _ZwSuspendThread,
             g_NtSuspendThread,
             g_ssdt,
@@ -753,12 +1265,14 @@ namespace ssdt_resolver {
     __forceinline NTSTATUS call_NtResumeThread(HANDLE thread_handle, PULONG prev_count) {
         if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_STATE;
         if (!thread_handle) return STATUS_INVALID_PARAMETER;
+        const KPROCESSOR_MODE previous_mode = ExGetPreviousMode();
         if (_ZwResumeThread) {
             NTSTATUS status = _ZwResumeThread(thread_handle, prev_count);
-            WW_LOG("SSDT call_NtResumeThread path=zw_export status=0x%08X handle=%p prev=%lu zw_resume=%p nt_resume=%p ssdt=%p state=%ld",
+            WW_LOG("SSDT call_NtResumeThread path=zw_export status=0x%08X handle=%p prev=%lu previous_mode=%u zw_resume=%p nt_resume=%p ssdt=%p state=%ld",
                 (ULONG)status,
                 thread_handle,
                 prev_count ? *prev_count : 0,
+                (ULONG)previous_mode,
                 _ZwResumeThread,
                 g_NtResumeThread,
                 g_ssdt,
@@ -768,29 +1282,43 @@ namespace ssdt_resolver {
         if (!g_NtResumeThread) {
             find_ssdt();
             BOOLEAN resolved = resolve_suspend_resume();
-            WW_LOG("SSDT call_NtResumeThread resolve resolved=%u handle=%p ssdt=%p nt_suspend=%p nt_resume=%p state=%ld",
+            WW_LOG("SSDT call_NtResumeThread resolve resolved=%u handle=%p previous_mode=%u ssdt=%p nt_suspend=%p nt_resume=%p state=%ld",
                 resolved ? 1u : 0u,
                 thread_handle,
+                (ULONG)previous_mode,
                 g_ssdt,
                 g_NtSuspendThread,
                 g_NtResumeThread,
                 _InterlockedCompareExchange(&g_funcs_resolved, 0, 0));
         }
         if (!g_NtResumeThread) {
-            WW_LOG("SSDT call_NtResumeThread path=missing status=0x%08X handle=%p zw_resume=%p nt_resume=%p ssdt=%p state=%ld",
+            WW_LOG("SSDT call_NtResumeThread path=missing status=0x%08X handle=%p previous_mode=%u zw_resume=%p nt_resume=%p ssdt=%p state=%ld",
                 (ULONG)STATUS_PROCEDURE_NOT_FOUND,
                 thread_handle,
+                (ULONG)previous_mode,
                 _ZwResumeThread,
                 g_NtResumeThread,
                 g_ssdt,
                 _InterlockedCompareExchange(&g_funcs_resolved, 0, 0));
             return STATUS_PROCEDURE_NOT_FOUND;
         }
+        if (previous_mode != KernelMode) {
+            WW_LOG("SSDT call_NtResumeThread path=ssdt_rejected_user_previous_mode status=0x%08X handle=%p previous_mode=%u zw_resume=%p nt_resume=%p ssdt=%p state=%ld",
+                (ULONG)STATUS_INVALID_DEVICE_STATE,
+                thread_handle,
+                (ULONG)previous_mode,
+                _ZwResumeThread,
+                g_NtResumeThread,
+                g_ssdt,
+                _InterlockedCompareExchange(&g_funcs_resolved, 0, 0));
+            return STATUS_INVALID_DEVICE_STATE;
+        }
         NTSTATUS status = g_NtResumeThread(thread_handle, prev_count);
-        WW_LOG("SSDT call_NtResumeThread path=ssdt status=0x%08X handle=%p prev=%lu zw_resume=%p nt_resume=%p ssdt=%p state=%ld",
+        WW_LOG("SSDT call_NtResumeThread path=ssdt status=0x%08X handle=%p prev=%lu previous_mode=%u zw_resume=%p nt_resume=%p ssdt=%p state=%ld",
             (ULONG)status,
             thread_handle,
             prev_count ? *prev_count : 0,
+            (ULONG)previous_mode,
             _ZwResumeThread,
             g_NtResumeThread,
             g_ssdt,
@@ -869,6 +1397,19 @@ namespace ssdt_resolver {
 
         KeMemoryBarrier();
         _InterlockedExchange(&g_ctx_funcs_resolved, resolved ? 2 : 0);
+        WW_LOG("KVALIDATE build=%lu kind=resolver name=SSDT.NtGetSetContextThread source=ntdll_stub_ssdt value=%p validation=%s evidence=\"ssdt=%p table=%p limit=%lu ntdll=%p get_idx=%lu set_idx=%lu get_stub8=0x%llx set_stub8=0x%llx\" fail_closed=%s",
+            ww_kernel_validation_build(),
+            g_NtGetContextThread,
+            ww_kernel_validation_state(resolved),
+            g_ssdt,
+            g_ssdt ? g_ssdt->ServiceTable : nullptr,
+            g_ssdt ? g_ssdt->ServiceLimit : 0,
+            ntdll_base,
+            get_idx,
+            set_idx,
+            static_cast<unsigned long long>(get_stub8),
+            static_cast<unsigned long long>(set_stub8),
+            resolved ? "none" : reason);
         WW_LOG("SSDT resolve_thread_context result=%u reason=%s state=%ld ssdt=%p service_table=%p limit=%lu ntdll=%p get_stub=%p set_stub=%p get_idx=%lu set_idx=%lu nt_get=%p nt_set=%p zw_get=%p zw_set=%p ps_get=%p ps_set=%p ps_get_peb=%p current_pid=%p current_tid=%p",
             resolved ? 1u : 0u,
             reason,
@@ -911,14 +1452,16 @@ namespace ssdt_resolver {
     __forceinline NTSTATUS call_NtGetContextThread(HANDLE thread_handle, PCONTEXT context) {
         if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_STATE;
         if (!thread_handle || !context) return STATUS_INVALID_PARAMETER;
+        const KPROCESSOR_MODE previous_mode = ExGetPreviousMode();
         if (_ZwGetContextThread) {
             NTSTATUS status = _ZwGetContextThread(thread_handle, context);
-            WW_LOG("SSDT call_NtGetContextThread path=zw_export status=0x%08X handle=%p flags=0x%08X rip=0x%llX rsp=0x%llX zw_get=%p nt_get=%p ssdt=%p state=%ld",
+            WW_LOG("SSDT call_NtGetContextThread path=zw_export status=0x%08X handle=%p flags=0x%08X rip=0x%llX rsp=0x%llX previous_mode=%u zw_get=%p nt_get=%p ssdt=%p state=%ld",
                 (ULONG)status,
                 thread_handle,
                 context->ContextFlags,
                 (unsigned long long)context->Rip,
                 (unsigned long long)context->Rsp,
+                (ULONG)previous_mode,
                 _ZwGetContextThread,
                 g_NtGetContextThread,
                 g_ssdt,
@@ -928,33 +1471,48 @@ namespace ssdt_resolver {
         if (!g_NtGetContextThread) {
             find_ssdt();
             BOOLEAN resolved = resolve_thread_context();
-            WW_LOG("SSDT call_NtGetContextThread resolve resolved=%u handle=%p flags=0x%08X ssdt=%p nt_get=%p nt_set=%p state=%ld",
+            WW_LOG("SSDT call_NtGetContextThread resolve resolved=%u handle=%p flags=0x%08X previous_mode=%u ssdt=%p nt_get=%p nt_set=%p state=%ld",
                 resolved ? 1u : 0u,
                 thread_handle,
                 context->ContextFlags,
+                (ULONG)previous_mode,
                 g_ssdt,
                 g_NtGetContextThread,
                 g_NtSetContextThread,
                 _InterlockedCompareExchange(&g_ctx_funcs_resolved, 0, 0));
         }
         if (!g_NtGetContextThread) {
-            WW_LOG("SSDT call_NtGetContextThread path=missing status=0x%08X handle=%p flags=0x%08X zw_get=%p nt_get=%p ssdt=%p state=%ld",
+            WW_LOG("SSDT call_NtGetContextThread path=missing status=0x%08X handle=%p flags=0x%08X previous_mode=%u zw_get=%p nt_get=%p ssdt=%p state=%ld",
                 (ULONG)STATUS_PROCEDURE_NOT_FOUND,
                 thread_handle,
                 context->ContextFlags,
+                (ULONG)previous_mode,
                 _ZwGetContextThread,
                 g_NtGetContextThread,
                 g_ssdt,
                 _InterlockedCompareExchange(&g_ctx_funcs_resolved, 0, 0));
             return STATUS_PROCEDURE_NOT_FOUND;
         }
+        if (previous_mode != KernelMode) {
+            WW_LOG("SSDT call_NtGetContextThread path=ssdt_rejected_user_previous_mode status=0x%08X handle=%p flags=0x%08X previous_mode=%u zw_get=%p nt_get=%p ssdt=%p state=%ld",
+                (ULONG)STATUS_INVALID_DEVICE_STATE,
+                thread_handle,
+                context->ContextFlags,
+                (ULONG)previous_mode,
+                _ZwGetContextThread,
+                g_NtGetContextThread,
+                g_ssdt,
+                _InterlockedCompareExchange(&g_ctx_funcs_resolved, 0, 0));
+            return STATUS_INVALID_DEVICE_STATE;
+        }
         NTSTATUS status = g_NtGetContextThread(thread_handle, context);
-        WW_LOG("SSDT call_NtGetContextThread path=ssdt status=0x%08X handle=%p flags=0x%08X rip=0x%llX rsp=0x%llX zw_get=%p nt_get=%p ssdt=%p state=%ld",
+        WW_LOG("SSDT call_NtGetContextThread path=ssdt status=0x%08X handle=%p flags=0x%08X rip=0x%llX rsp=0x%llX previous_mode=%u zw_get=%p nt_get=%p ssdt=%p state=%ld",
             (ULONG)status,
             thread_handle,
             context->ContextFlags,
             (unsigned long long)context->Rip,
             (unsigned long long)context->Rsp,
+            (ULONG)previous_mode,
             _ZwGetContextThread,
             g_NtGetContextThread,
             g_ssdt,
@@ -965,14 +1523,16 @@ namespace ssdt_resolver {
     __forceinline NTSTATUS call_NtSetContextThread(HANDLE thread_handle, PCONTEXT context) {
         if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_STATE;
         if (!thread_handle || !context) return STATUS_INVALID_PARAMETER;
+        const KPROCESSOR_MODE previous_mode = ExGetPreviousMode();
         if (_ZwSetContextThread) {
             NTSTATUS status = _ZwSetContextThread(thread_handle, context);
-            WW_LOG("SSDT call_NtSetContextThread path=zw_export status=0x%08X handle=%p flags=0x%08X rip=0x%llX rsp=0x%llX zw_set=%p nt_set=%p ssdt=%p state=%ld",
+            WW_LOG("SSDT call_NtSetContextThread path=zw_export status=0x%08X handle=%p flags=0x%08X rip=0x%llX rsp=0x%llX previous_mode=%u zw_set=%p nt_set=%p ssdt=%p state=%ld",
                 (ULONG)status,
                 thread_handle,
                 context->ContextFlags,
                 (unsigned long long)context->Rip,
                 (unsigned long long)context->Rsp,
+                (ULONG)previous_mode,
                 _ZwSetContextThread,
                 g_NtSetContextThread,
                 g_ssdt,
@@ -982,33 +1542,48 @@ namespace ssdt_resolver {
         if (!g_NtSetContextThread) {
             find_ssdt();
             BOOLEAN resolved = resolve_thread_context();
-            WW_LOG("SSDT call_NtSetContextThread resolve resolved=%u handle=%p flags=0x%08X ssdt=%p nt_get=%p nt_set=%p state=%ld",
+            WW_LOG("SSDT call_NtSetContextThread resolve resolved=%u handle=%p flags=0x%08X previous_mode=%u ssdt=%p nt_get=%p nt_set=%p state=%ld",
                 resolved ? 1u : 0u,
                 thread_handle,
                 context->ContextFlags,
+                (ULONG)previous_mode,
                 g_ssdt,
                 g_NtGetContextThread,
                 g_NtSetContextThread,
                 _InterlockedCompareExchange(&g_ctx_funcs_resolved, 0, 0));
         }
         if (!g_NtSetContextThread) {
-            WW_LOG("SSDT call_NtSetContextThread path=missing status=0x%08X handle=%p flags=0x%08X zw_set=%p nt_set=%p ssdt=%p state=%ld",
+            WW_LOG("SSDT call_NtSetContextThread path=missing status=0x%08X handle=%p flags=0x%08X previous_mode=%u zw_set=%p nt_set=%p ssdt=%p state=%ld",
                 (ULONG)STATUS_PROCEDURE_NOT_FOUND,
                 thread_handle,
                 context->ContextFlags,
+                (ULONG)previous_mode,
                 _ZwSetContextThread,
                 g_NtSetContextThread,
                 g_ssdt,
                 _InterlockedCompareExchange(&g_ctx_funcs_resolved, 0, 0));
             return STATUS_PROCEDURE_NOT_FOUND;
         }
+        if (previous_mode != KernelMode) {
+            WW_LOG("SSDT call_NtSetContextThread path=ssdt_rejected_user_previous_mode status=0x%08X handle=%p flags=0x%08X previous_mode=%u zw_set=%p nt_set=%p ssdt=%p state=%ld",
+                (ULONG)STATUS_INVALID_DEVICE_STATE,
+                thread_handle,
+                context->ContextFlags,
+                (ULONG)previous_mode,
+                _ZwSetContextThread,
+                g_NtSetContextThread,
+                g_ssdt,
+                _InterlockedCompareExchange(&g_ctx_funcs_resolved, 0, 0));
+            return STATUS_INVALID_DEVICE_STATE;
+        }
         NTSTATUS status = g_NtSetContextThread(thread_handle, context);
-        WW_LOG("SSDT call_NtSetContextThread path=ssdt status=0x%08X handle=%p flags=0x%08X rip=0x%llX rsp=0x%llX zw_set=%p nt_set=%p ssdt=%p state=%ld",
+        WW_LOG("SSDT call_NtSetContextThread path=ssdt status=0x%08X handle=%p flags=0x%08X rip=0x%llX rsp=0x%llX previous_mode=%u zw_set=%p nt_set=%p ssdt=%p state=%ld",
             (ULONG)status,
             thread_handle,
             context->ContextFlags,
             (unsigned long long)context->Rip,
             (unsigned long long)context->Rsp,
+            (ULONG)previous_mode,
             _ZwSetContextThread,
             g_NtSetContextThread,
             g_ssdt,
@@ -1080,6 +1655,8 @@ inline bool SetupFunctions() {
     *(PVOID*)&_ObOpenObjectByPointer = GetProcAddress(kernelBase, (PCHAR)skCrypt("ObOpenObjectByPointer"));
     *(PVOID*)&_ZwSuspendThread = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwSuspendThread"));
     *(PVOID*)&_ZwResumeThread = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwResumeThread"));
+    *(PVOID*)&_ZwQueryInformationThread = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwQueryInformationThread"));
+    *(PVOID*)&_ZwTerminateThread = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwTerminateThread"));
     *(PVOID*)&_ZwSetInformationThread = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwSetInformationThread"));
 
     _IoFileObjectType = (POBJECT_TYPE*)GetProcAddress(kernelBase, (PCHAR)skCrypt("IoFileObjectType"));
@@ -1130,7 +1707,7 @@ inline bool SetupFunctions() {
     WW_LOG("SetupFunctions: _PsGetContextThread=%p _PsSetContextThread=%p _PsSuspendThread=%p _PsResumeThread=%p", _PsGetContextThread, _PsSetContextThread, _PsSuspendThread, _PsResumeThread);
     WW_LOG("SetupFunctions: _ZwGetContextThread=%p _ZwSetContextThread=%p", _ZwGetContextThread, _ZwSetContextThread);
     WW_LOG("SetupFunctions: _PsGetProcessPeb=%p _ZwQueryVirtualMemory=%p _ZwProtectVirtualMemory=%p", _PsGetProcessPeb, _ZwQueryVirtualMemory, _ZwProtectVirtualMemory);
-    WW_LOG("SetupFunctions: _ObOpenObjectByPointer=%p _ZwSuspendThread=%p _ZwResumeThread=%p _ZwSetInformationThread=%p", _ObOpenObjectByPointer, _ZwSuspendThread, _ZwResumeThread, _ZwSetInformationThread);
+    WW_LOG("SetupFunctions: _ObOpenObjectByPointer=%p _ZwSuspendThread=%p _ZwResumeThread=%p _ZwQueryInformationThread=%p _ZwTerminateThread=%p _ZwSetInformationThread=%p", _ObOpenObjectByPointer, _ZwSuspendThread, _ZwResumeThread, _ZwQueryInformationThread, _ZwTerminateThread, _ZwSetInformationThread);
     WW_LOG("SetupFunctions: _IoFileObjectType=%p _ObGetObjectType=%p _ObReferenceObjectSafe=%p", _IoFileObjectType, _ObGetObjectType, _ObReferenceObjectSafe);
     WW_LOG("SetupFunctions: _ZwOpenKey=%p _ZwQueryValueKey=%p _ZwDeleteFile=%p _ZwSetInformationFile=%p", _ZwOpenKey, _ZwQueryValueKey, _ZwDeleteFile, _ZwSetInformationFile);
     WW_LOG("SetupFunctions: _IoCreateFileEx=%p _KeBugCheckEx=%p _KdRefreshDebuggerNotPresent=%p", _IoCreateFileEx, _KeBugCheckEx, _KdRefreshDebuggerNotPresent);
@@ -1140,6 +1717,48 @@ inline bool SetupFunctions() {
     WW_LOG("SetupFunctions: _PsSetLoadImageNotifyRoutine=%p _PsRemoveLoadImageNotifyRoutine=%p", _PsSetLoadImageNotifyRoutine, _PsRemoveLoadImageNotifyRoutine);
     WW_LOG("SetupFunctions: _CmRegisterCallbackEx=%p _CmUnRegisterCallback=%p", _CmRegisterCallbackEx, _CmUnRegisterCallback);
     WW_LOG("SetupFunctions: _DbgPrintEx=%p", _DbgPrintEx);
+    WW_LOG("KVALIDATE build=%lu kind=resolver name=ntoskrnl.imports source=export_table value=%p validation=%s evidence=\"critical Rtl=%p IoCreateDevice=%p MmCopyMemory=%p PsLookupProcess=%p MmGetVirtualForPhysical=%p KeTimer=%p ExQueueWorkItem=%p\" fail_closed=%s",
+        ww_kernel_validation_build(),
+        kernelBase,
+        ww_kernel_validation_state((_RtlInitUnicodeString && _IoCreateDevice &&
+            _IoCreateSymbolicLink && _IofCompleteRequest && _MmCopyMemory &&
+            _PsLookupProcessByProcessId && _PsGetProcessSectionBaseAddress &&
+            _ObfDereferenceObject && _MmGetPhysicalMemoryRanges &&
+            _MmGetVirtualForPhysical && _MmIsAddressValid &&
+            _ZwOpenProcess && _ZwClose &&
+            _IoAllocateMdl && _IoFreeMdl && _MmBuildMdlForNonPagedPool &&
+            _MmMapLockedPagesSpecifyCache && _MmUnmapLockedPages &&
+            _MmProbeAndLockPages && _MmUnlockPages &&
+            _PsCreateSystemThread && _KeDelayExecutionThread && _PsTerminateSystemThread &&
+            _KeStackAttachProcess && _KeUnstackDetachProcess &&
+            _ZwAllocateVirtualMemory && _ZwFreeVirtualMemory &&
+            _IoDeleteDevice && _IoDeleteSymbolicLink &&
+            _KeBugCheckEx && _KeInitializeDpc && _KeInitializeTimerEx &&
+            _KeSetTimerEx && _KeCancelTimer && _KeFlushQueuedDpcs &&
+            _ExQueueWorkItem) ? TRUE : FALSE),
+        _RtlInitUnicodeString,
+        _IoCreateDevice,
+        _MmCopyMemory,
+        _PsLookupProcessByProcessId,
+        _MmGetVirtualForPhysical,
+        _KeSetTimerEx,
+        _ExQueueWorkItem,
+        (_RtlInitUnicodeString && _IoCreateDevice &&
+            _IoCreateSymbolicLink && _IofCompleteRequest && _MmCopyMemory &&
+            _PsLookupProcessByProcessId && _PsGetProcessSectionBaseAddress &&
+            _ObfDereferenceObject && _MmGetPhysicalMemoryRanges &&
+            _MmGetVirtualForPhysical && _MmIsAddressValid &&
+            _ZwOpenProcess && _ZwClose &&
+            _IoAllocateMdl && _IoFreeMdl && _MmBuildMdlForNonPagedPool &&
+            _MmMapLockedPagesSpecifyCache && _MmUnmapLockedPages &&
+            _MmProbeAndLockPages && _MmUnlockPages &&
+            _PsCreateSystemThread && _KeDelayExecutionThread && _PsTerminateSystemThread &&
+            _KeStackAttachProcess && _KeUnstackDetachProcess &&
+            _ZwAllocateVirtualMemory && _ZwFreeVirtualMemory &&
+            _IoDeleteDevice && _IoDeleteSymbolicLink &&
+            _KeBugCheckEx && _KeInitializeDpc && _KeInitializeTimerEx &&
+            _KeSetTimerEx && _KeCancelTimer && _KeFlushQueuedDpcs &&
+            _ExQueueWorkItem) ? "none" : "critical_export_missing");
 
     if (!_PsSuspendThread && !_ZwSuspendThread) {
         WW_LOG("SetupFunctions: no PsSuspendThread or ZwSuspendThread, priming SSDT suspend resolver");

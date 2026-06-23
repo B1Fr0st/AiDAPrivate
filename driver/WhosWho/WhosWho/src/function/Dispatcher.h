@@ -123,6 +123,9 @@ namespace ioctl_codes {
     __forceinline ULONG NLOG() { return make(57); }
     __forceinline ULONG NPKT() { return make(58); }
     __forceinline ULONG SSDT() { return make(59); }
+    __forceinline ULONG TQIF() { return make(60); }
+    __forceinline ULONG TTERM(){ return make(61); }
+    __forceinline ULONG HCLS() { return make(62); }
 }
 
 namespace phase3_msg {
@@ -265,7 +268,7 @@ namespace dispatcher {
         out.encoded = (code & 0x0000FFFFu) >> 2;
         if (out.encoded >= out.base) {
             ULONG candidate = out.encoded - out.base;
-            if (candidate <= 59u) {
+            if (candidate <= 62u) {
                 out.offset = candidate;
                 out.valid = TRUE;
             }
@@ -1473,6 +1476,33 @@ namespace dispatcher {
             if (input_size >= sizeof(suspend_resume_thread) && output_size >= sizeof(suspend_resume_thread)) {
                 status = functions::handle_suspend_resume_thread((p_suspend_resume_thread)buffer);
                 bytes = sizeof(suspend_resume_thread);
+            }
+            else {
+                status = STATUS_INFO_LENGTH_MISMATCH;
+            }
+        }
+        else if (code == ioctl_codes::TQIF()) {
+            if (input_size >= sizeof(thread_query_information) && output_size >= sizeof(thread_query_information)) {
+                status = functions::handle_thread_query_information((p_thread_query_information)buffer);
+                bytes = sizeof(thread_query_information);
+            }
+            else {
+                status = STATUS_INFO_LENGTH_MISMATCH;
+            }
+        }
+        else if (code == ioctl_codes::TTERM()) {
+            if (input_size >= sizeof(terminate_thread_request) && output_size >= sizeof(terminate_thread_request)) {
+                status = functions::handle_terminate_thread((p_terminate_thread_request)buffer);
+                bytes = sizeof(terminate_thread_request);
+            }
+            else {
+                status = STATUS_INFO_LENGTH_MISMATCH;
+            }
+        }
+        else if (code == ioctl_codes::HCLS()) {
+            if (input_size >= sizeof(close_handle_request) && output_size >= sizeof(close_handle_request)) {
+                status = functions::handle_close_process_handle((p_close_handle_request)buffer);
+                bytes = sizeof(close_handle_request);
             }
             else {
                 status = STATUS_INFO_LENGTH_MISMATCH;

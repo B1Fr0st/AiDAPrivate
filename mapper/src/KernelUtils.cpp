@@ -11,7 +11,18 @@ static void KDbgLog(const char* func, const char* fmt, ...) {
     char buf[2048];
     va_list args;
     va_start(args, fmt);
-    int prefixLen = snprintf(buf, sizeof(buf), "[WindMapper][%s] ", func);
+    SYSTEMTIME st = {};
+    GetLocalTime(&st);
+    int prefixLen = snprintf(buf, sizeof(buf),
+        "[%04u-%02u-%02u %02u:%02u:%02u.%03u] [WindMapper][%s] ",
+        st.wYear,
+        st.wMonth,
+        st.wDay,
+        st.wHour,
+        st.wMinute,
+        st.wSecond,
+        st.wMilliseconds,
+        func);
     if (prefixLen < 0) prefixLen = 0;
     vsnprintf(buf + prefixLen, sizeof(buf) - prefixLen, fmt, args);
     va_end(args);
@@ -692,9 +703,34 @@ namespace KernelUtils {
         KLOG("Looking up driver by name: %ls", driverFileName);
         const ULONGLONG lookupStartTick = GetTickCount64();
 
-        if (!NtQuerySystemInformationPtr) {
-            KLOG("ERROR: NtQuerySystemInformationPtr is NULL");
+        if (!driverFileName || !driverFileName[0]) {
+            KLOG("GetDriverBaseByName invalid target elapsed_ms=%llu",
+                static_cast<unsigned long long>(GetTickCount64() - lookupStartTick));
             return nullptr;
+        }
+
+        char targetNarrow[260] = {};
+        WideCharToMultiByte(CP_ACP, 0, driverFileName, -1, targetNarrow, sizeof(targetNarrow), NULL, NULL);
+
+        WindowsVersion winVer = GetWindowsVersion();
+        PVOID psapiPreferred = nullptr;
+        if (winVer.build >= 26100) {
+            psapiPreferred = ResolveDriverBaseWithPsapi(targetNarrow, lookupStartTick, "driver_base_by_name_pre_query");
+            if (psapiPreferred && !outImageSize) {
+                KLOG("GetDriverBaseByName build=%lu target=%s returning psapi_preferred base=%p reason=no_size_requested elapsed_ms=%llu",
+                    winVer.build,
+                    targetNarrow,
+                    psapiPreferred,
+                    static_cast<unsigned long long>(GetTickCount64() - lookupStartTick));
+                return psapiPreferred;
+            }
+        }
+
+        if (!NtQuerySystemInformationPtr) {
+            KLOG("ERROR: NtQuerySystemInformationPtr is NULL target=%s psapi_preferred=%p",
+                targetNarrow,
+                psapiPreferred);
+            return psapiPreferred;
         }
 
         ULONG returnLength = 0;
@@ -704,7 +740,11 @@ namespace KernelUtils {
             returnLength,
             static_cast<unsigned long long>(GetTickCount64() - lookupStartTick));
         if (returnLength == 0) {
-            return nullptr;
+            KLOG("GetDriverBaseByName probe returned zero length target=%s psapi_preferred=%p elapsed_ms=%llu",
+                targetNarrow,
+                psapiPreferred,
+                static_cast<unsigned long long>(GetTickCount64() - lookupStartTick));
+            return psapiPreferred;
         }
 
 
@@ -715,7 +755,7 @@ namespace KernelUtils {
                 bufSize,
                 GetLastError(),
                 static_cast<unsigned long long>(GetTickCount64() - lookupStartTick));
-            return nullptr;
+            return psapiPreferred;
         }
 
         status = NtQuerySystemInformationPtr(11, buffer, bufSize, &returnLength);
@@ -726,23 +766,23 @@ namespace KernelUtils {
                 returnLength,
                 static_cast<unsigned long long>(GetTickCount64() - lookupStartTick));
             VirtualFree(buffer, 0, MEM_RELEASE);
-            return nullptr;
+            return psapiPreferred;
         }
 
 
         PRTL_PROCESS_MODULES moduleInfo = reinterpret_cast<PRTL_PROCESS_MODULES>(buffer);
-        PVOID result = nullptr;
+        PVOID result = IsKernelPointer(psapiPreferred) ? psapiPreferred : nullptr;
         PVOID redactedResult = nullptr;
         ULONG resultSize = 0;
         ULONG moduleCount = moduleInfo->NumberOfModules;
 
-        char targetNarrow[260] = {};
-        WideCharToMultiByte(CP_ACP, 0, driverFileName, -1, targetNarrow, sizeof(targetNarrow), NULL, NULL);
-        KLOG("GetDriverBaseByName module_count=%lu target=%s bufSize=%lu returnLength=%lu",
+        KLOG("GetDriverBaseByName module_count=%lu target=%s bufSize=%lu returnLength=%lu build=%lu psapi_preferred=%p",
             moduleCount,
             targetNarrow,
             bufSize,
-            returnLength);
+            returnLength,
+            winVer.build,
+            psapiPreferred);
 
         for (ULONG i = 0; i < moduleCount; i++) {
             auto& mod = moduleInfo->Modules[i];
@@ -762,14 +802,17 @@ namespace KernelUtils {
             }
 
             if (_stricmp(fileName, targetNarrow) == 0) {
-                result = mod.ImageBase;
                 redactedResult = mod.ImageBase;
                 resultSize = mod.ImageSize;
-                KLOG("  FOUND '%s' Base=%p Size=0x%X index=%lu elapsed_ms=%llu",
+                if (IsKernelPointer(mod.ImageBase)) {
+                    result = mod.ImageBase;
+                }
+                KLOG("  FOUND '%s' Base=%p Size=0x%X index=%lu selected_base=%p elapsed_ms=%llu",
                     targetNarrow,
-                    result,
+                    mod.ImageBase,
                     resultSize,
                     i,
+                    result,
                     static_cast<unsigned long long>(GetTickCount64() - lookupStartTick));
                 break;
             }

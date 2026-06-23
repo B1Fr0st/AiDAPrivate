@@ -507,8 +507,8 @@ helpers helper;
 HWND g_hwnd = nullptr;
 static constexpr const wchar_t* kAidaWindowTitle = L"AiDA Standalone";
 static constexpr int kAidaFullTestHotkeyId = 0xA1DA;
-static constexpr UINT kAidaQueuedPeekFlags = PM_REMOVE | PM_QS_INPUT | PM_QS_POSTMESSAGE | PM_QS_PAINT;
-static constexpr UINT kAidaSendOnlyPeekFlags = PM_NOREMOVE | PM_QS_SENDMESSAGE;
+static constexpr UINT kAidaQueuedPeekFlags = PM_REMOVE | PM_QS_INPUT | PM_QS_POSTMESSAGE | PM_QS_PAINT | PM_QS_SENDMESSAGE;
+static constexpr UINT kAidaSendOnlyPeekFlags = PM_REMOVE | PM_QS_SENDMESSAGE;
 static constexpr DWORD kAidaNonSendQueueBits = QS_INPUT | QS_POSTMESSAGE | QS_TIMER | QS_PAINT | QS_HOTKEY | QS_ALLPOSTMESSAGE;
 static constexpr DWORD kAidaPumpQueueBits = kAidaNonSendQueueBits | QS_SENDMESSAGE;
 bool CreateDeviceD3D(HWND hWnd);
@@ -1600,36 +1600,6 @@ namespace aida_tracer {
             static_cast<unsigned long>(mapped_gle));
     }
 
-    inline void log_wait_handle_probe(const char* reg_name, uint64_t value, DWORD render_tid, uint64_t age_ms) {
-        if (!reg_name || value == 0)
-            return;
-        if ((value & 0xFFFFFFFF00000000ULL) != 0 && (value & 0xFFFFFFFF00000000ULL) != 0xFFFFFFFF00000000ULL)
-            return;
-        HANDLE h = reinterpret_cast<HANDLE>(static_cast<UINT_PTR>(value));
-        DWORD flags = 0;
-        SetLastError(0);
-        BOOL info_ok = GetHandleInformation(h, &flags);
-        DWORD info_gle = info_ok ? 0 : GetLastError();
-        DWORD wait_res = WAIT_FAILED;
-        DWORD wait_gle = 0;
-        if (info_ok) {
-            SetLastError(0);
-            wait_res = WaitForSingleObject(h, 0);
-            wait_gle = wait_res == WAIT_FAILED ? GetLastError() : 0;
-        }
-        diag::log_tagged_critical_fmt("tracer",
-            "render_thread_wait_handle_probe tid=%lu age_ms=%llu reg=%s value=0x%016llX info_ok=%d flags=0x%08lX info_gle=%lu wait0=0x%08lX wait_gle=%lu",
-            render_tid,
-            static_cast<unsigned long long>(age_ms),
-            reg_name,
-            static_cast<unsigned long long>(value),
-            info_ok ? 1 : 0,
-            static_cast<unsigned long>(flags),
-            static_cast<unsigned long>(info_gle),
-            static_cast<unsigned long>(wait_res),
-            static_cast<unsigned long>(wait_gle));
-    }
-
     inline void capture_render_thread_snapshot(DWORD render_tid, uint64_t age_ms) {
         const uint64_t now = static_cast<uint64_t>(GetTickCount64());
         uint64_t prev = g_last_thread_snapshot_ms.load(std::memory_order_acquire);
@@ -1637,127 +1607,48 @@ namespace aida_tracer {
             return;
         g_last_thread_snapshot_ms.store(now, std::memory_order_release);
 
-        HANDLE th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, render_tid);
-        if (!th) {
-            diag::log_tagged_critical_fmt("tracer", "render_thread_snapshot_open_failed tid=%lu age_ms=%llu gle=%lu",
-                render_tid, static_cast<unsigned long long>(age_ms), GetLastError());
-            return;
-        }
-
-        DWORD suspend_count = SuspendThread(th);
-        if (suspend_count == static_cast<DWORD>(-1)) {
-            DWORD gle = GetLastError();
+        HANDLE th = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, render_tid);
+        DWORD open_gle = th ? 0 : GetLastError();
+        DWORD exit_code = 0;
+        DWORD exit_gle = 0;
+        BOOL exit_ok = FALSE;
+        FILETIME create_time{};
+        FILETIME exit_time{};
+        FILETIME kernel_time{};
+        FILETIME user_time{};
+        DWORD times_gle = 0;
+        BOOL times_ok = FALSE;
+        if (th) {
+            SetLastError(0);
+            exit_ok = GetExitCodeThread(th, &exit_code);
+            exit_gle = exit_ok ? 0 : GetLastError();
+            SetLastError(0);
+            times_ok = GetThreadTimes(th, &create_time, &exit_time, &kernel_time, &user_time);
+            times_gle = times_ok ? 0 : GetLastError();
             CloseHandle(th);
-            diag::log_tagged_critical_fmt("tracer", "render_thread_snapshot_suspend_failed tid=%lu age_ms=%llu gle=%lu",
-                render_tid, static_cast<unsigned long long>(age_ms), gle);
-            return;
         }
-
-        CONTEXT ctx{};
-        ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
-        BOOL got_ctx = GetThreadContext(th, &ctx);
-#if defined(_M_X64)
-        uint64_t rip = got_ctx ? static_cast<uint64_t>(ctx.Rip) : 0;
-        uint64_t rsp = got_ctx ? static_cast<uint64_t>(ctx.Rsp) : 0;
-        uint64_t rbp = got_ctx ? static_cast<uint64_t>(ctx.Rbp) : 0;
-        uint64_t rax = got_ctx ? static_cast<uint64_t>(ctx.Rax) : 0;
-        uint64_t rcx = got_ctx ? static_cast<uint64_t>(ctx.Rcx) : 0;
-        uint64_t rdx = got_ctx ? static_cast<uint64_t>(ctx.Rdx) : 0;
-        uint64_t r8 = got_ctx ? static_cast<uint64_t>(ctx.R8) : 0;
-        uint64_t r9 = got_ctx ? static_cast<uint64_t>(ctx.R9) : 0;
-#else
-        uint64_t rip = got_ctx ? static_cast<uint64_t>(ctx.Eip) : 0;
-        uint64_t rsp = got_ctx ? static_cast<uint64_t>(ctx.Esp) : 0;
-        uint64_t rbp = got_ctx ? static_cast<uint64_t>(ctx.Ebp) : 0;
-        uint64_t rax = got_ctx ? static_cast<uint64_t>(ctx.Eax) : 0;
-        uint64_t rcx = got_ctx ? static_cast<uint64_t>(ctx.Ecx) : 0;
-        uint64_t rdx = got_ctx ? static_cast<uint64_t>(ctx.Edx) : 0;
-        uint64_t r8 = 0;
-        uint64_t r9 = 0;
-#endif
-        char rip_desc[1024] = {};
-        describe_address(rip, rip_desc, sizeof(rip_desc));
-
-        uint64_t stack_values[64] = {};
-        SIZE_T copied = 0;
-        if (rsp != 0)
-            ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(rsp), stack_values, sizeof(stack_values), &copied);
-
-        DWORD resume_prev = ResumeThread(th);
-        DWORD resume_gle = resume_prev == static_cast<DWORD>(-1) ? GetLastError() : 0;
-        DWORD rescue_resumes = 0;
-        DWORD rescue_last_prev = resume_prev;
-        DWORD rescue_gle = 0;
-        if (resume_prev != static_cast<DWORD>(-1) && suspend_count > 0) {
-            while (rescue_last_prev > 1 && rescue_resumes < 8) {
-                DWORD extra_prev = ResumeThread(th);
-                if (extra_prev == static_cast<DWORD>(-1)) {
-                    rescue_gle = GetLastError();
-                    break;
-                }
-                rescue_last_prev = extra_prev;
-                ++rescue_resumes;
-            }
-        }
-        CloseHandle(th);
-
-        log_wait_handle_probe("rcx", rcx, render_tid, age_ms);
-        log_wait_handle_probe("rdx", rdx, render_tid, age_ms);
-        log_wait_handle_probe("r8", r8, render_tid, age_ms);
-        log_wait_handle_probe("r9", r9, render_tid, age_ms);
 
         diag::log_tagged_critical_fmt("tracer",
-            "render_thread_snapshot tid=%lu age_ms=%llu suspend_count=%lu resume_prev=%lu resume_gle=%lu rescue_resumes=%lu rescue_last_prev=%lu rescue_gle=%lu ctx=%d rip=0x%016llX rsp=0x%016llX rbp=0x%016llX rax=0x%016llX rcx=0x%016llX rdx=0x%016llX r8=0x%016llX r9=0x%016llX peek_calls=%llu peek_returns=%llu dispatch_enter=%llu dispatch_exit=%llu wnd_enter=%llu wnd_exit=%llu %s",
+            "render_thread_snapshot_no_suspend tid=%lu age_ms=%llu open_ok=%d open_gle=%lu exit_ok=%d exit_code=0x%08lX exit_gle=%lu times_ok=%d times_gle=%lu kernel_time_low=0x%08lX kernel_time_high=0x%08lX user_time_low=0x%08lX user_time_high=0x%08lX peek_calls=%llu peek_returns=%llu dispatch_enter=%llu dispatch_exit=%llu wnd_enter=%llu wnd_exit=%llu",
             render_tid,
             static_cast<unsigned long long>(age_ms),
-            static_cast<unsigned long>(suspend_count),
-            static_cast<unsigned long>(resume_prev),
-            static_cast<unsigned long>(resume_gle),
-            static_cast<unsigned long>(rescue_resumes),
-            static_cast<unsigned long>(rescue_last_prev),
-            static_cast<unsigned long>(rescue_gle),
-            got_ctx ? 1 : 0,
-            static_cast<unsigned long long>(rip),
-            static_cast<unsigned long long>(rsp),
-            static_cast<unsigned long long>(rbp),
-            static_cast<unsigned long long>(rax),
-            static_cast<unsigned long long>(rcx),
-            static_cast<unsigned long long>(rdx),
-            static_cast<unsigned long long>(r8),
-            static_cast<unsigned long long>(r9),
+            th ? 1 : 0,
+            static_cast<unsigned long>(open_gle),
+            exit_ok ? 1 : 0,
+            static_cast<unsigned long>(exit_code),
+            static_cast<unsigned long>(exit_gle),
+            times_ok ? 1 : 0,
+            static_cast<unsigned long>(times_gle),
+            static_cast<unsigned long>(kernel_time.dwLowDateTime),
+            static_cast<unsigned long>(kernel_time.dwHighDateTime),
+            static_cast<unsigned long>(user_time.dwLowDateTime),
+            static_cast<unsigned long>(user_time.dwHighDateTime),
             static_cast<unsigned long long>(g_peek_call_count.load(std::memory_order_acquire)),
             static_cast<unsigned long long>(g_peek_return_count.load(std::memory_order_acquire)),
             static_cast<unsigned long long>(g_dispatch_enter_count.load(std::memory_order_acquire)),
             static_cast<unsigned long long>(g_dispatch_exit_count.load(std::memory_order_acquire)),
             static_cast<unsigned long long>(g_wndproc_enter_count.load(std::memory_order_acquire)),
-            static_cast<unsigned long long>(g_wndproc_exit_count.load(std::memory_order_acquire)),
-            rip_desc);
-        diag::log_tagged_critical_fmt("tracer",
-            "render_thread_stack copied=%llu q0=0x%016llX q1=0x%016llX q2=0x%016llX q3=0x%016llX q4=0x%016llX q5=0x%016llX q6=0x%016llX q7=0x%016llX q8=0x%016llX q9=0x%016llX q10=0x%016llX q11=0x%016llX",
-            static_cast<unsigned long long>(copied),
-            static_cast<unsigned long long>(stack_values[0]),
-            static_cast<unsigned long long>(stack_values[1]),
-            static_cast<unsigned long long>(stack_values[2]),
-            static_cast<unsigned long long>(stack_values[3]),
-            static_cast<unsigned long long>(stack_values[4]),
-            static_cast<unsigned long long>(stack_values[5]),
-            static_cast<unsigned long long>(stack_values[6]),
-            static_cast<unsigned long long>(stack_values[7]),
-            static_cast<unsigned long long>(stack_values[8]),
-            static_cast<unsigned long long>(stack_values[9]),
-            static_cast<unsigned long long>(stack_values[10]),
-            static_cast<unsigned long long>(stack_values[11]));
-        for (size_t i = 0; i < 64; ++i) {
-            if (stack_values[i] == 0)
-                continue;
-            char slot_desc[1024] = {};
-            describe_address(stack_values[i], slot_desc, sizeof(slot_desc));
-            diag::log_tagged_critical_fmt("tracer",
-                "render_thread_stack_slot idx=%llu value=0x%016llX %s",
-                static_cast<unsigned long long>(i),
-                static_cast<unsigned long long>(stack_values[i]),
-                slot_desc);
-        }
+            static_cast<unsigned long long>(g_wndproc_exit_count.load(std::memory_order_acquire)));
     }
 
     inline void mark_render_phase(const char* name) {
@@ -4816,7 +4707,7 @@ int main(int, char**)
                 if (skips <= 8 || now_ms - empty_queue_last_log_ms >= 30000) {
                     empty_queue_last_log_ms = now_ms;
                     diag::log_tagged_critical_fmt("msgpump",
-                        "peek_empty_skip frame=%llu skips=%llu qs=0x%08lX changed=0x%04lX current=0x%04lX flags=0x%08X hwnd=0x%llX fg=0x%llX active=0x%llX focus=0x%llX tid=%lu",
+                        "peek_empty_probe frame=%llu skips=%llu qs=0x%08lX changed=0x%04lX current=0x%04lX flags=0x%08X hwnd=0x%llX fg=0x%llX active=0x%llX focus=0x%llX tid=%lu",
                         (unsigned long long)frame_number,
                         (unsigned long long)skips,
                         static_cast<unsigned long>(queue_status_before),
@@ -4829,7 +4720,6 @@ int main(int, char**)
                         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(::GetFocus())),
                         ::GetCurrentThreadId());
                 }
-                break;
             }
             const bool send_message_pending = (queue_current & QS_SENDMESSAGE) != 0;
             const bool non_send_pending = (queue_current & kAidaNonSendQueueBits) != 0;
@@ -4848,7 +4738,7 @@ int main(int, char**)
                 const DWORD sent_probe_gle = ::GetLastError();
                 const uint64_t drain_elapsed = static_cast<uint64_t>(GetTickCount64()) - drain_start;
                 aida_tracer::set_peek_state(queue_status_before, sent_probe_gle);
-                if (skips <= 8 || now_ms - send_only_last_log_ms >= 1000) {
+                if (skips <= 8 || now_ms - send_only_last_log_ms >= 1000 || sent_probe_result) {
                     send_only_last_log_ms = now_ms;
                     diag::log_tagged_critical_fmt("msgpump",
                         "send_only_drain frame=%llu drains=%llu elapsed_ms=%llu result=%d gle=%lu qs=0x%08lX current=0x%04lX changed=0x%04lX queued_mask=0x%04lX flags=0x%08X hwnd=0x%llX fg=0x%llX active=0x%llX focus=0x%llX full_test=%d fileless=%d tid=%lu",
@@ -4870,8 +4760,22 @@ int main(int, char**)
                         fileless_customer_launch ? 1 : 0,
                         ::GetCurrentThreadId());
                 }
-                ::Sleep(0);
-                break;
+                if (drain_elapsed >= 50) {
+                    char stall_context[4600] = {};
+                    format_message_pump_stall_context(stall_context, sizeof(stall_context));
+                    diag::log_tagged_critical_fmt("msgpump",
+                        "send_only_drain_slow frame=%llu elapsed_ms=%llu result=%d gle=%lu qs=0x%08lX current=0x%04lX changed=0x%04lX flags=0x%08X ctx={%.3600s}",
+                        (unsigned long long)frame_number,
+                        (unsigned long long)drain_elapsed,
+                        sent_probe_result ? 1 : 0,
+                        static_cast<unsigned long>(sent_probe_gle),
+                        static_cast<unsigned long>(queue_status_before),
+                        static_cast<unsigned long>(queue_current),
+                        static_cast<unsigned long>(queue_changed),
+                        kAidaSendOnlyPeekFlags,
+                        stall_context[0] ? stall_context : "<empty>");
+                }
+                continue;
             }
             const UINT peek_remove_flags = kAidaQueuedPeekFlags;
             HWND peek_filter = nullptr;

@@ -46,25 +46,10 @@ std::string fmt_addr(std::uint64_t va)
     return os.str();
 }
 
-std::uint64_t filetime_to_u64(const FILETIME& ft)
-{
-    ULARGE_INTEGER u{};
-    u.LowPart = ft.dwLowDateTime;
-    u.HighPart = ft.dwHighDateTime;
-    return u.QuadPart;
-}
-
 std::uint64_t query_thread_cpu_time(std::uint32_t tid)
 {
-    HANDLE h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
-    if (!h)
-        return 0;
-    FILETIME create_time{}, exit_time{}, kernel_time{}, user_time{};
-    std::uint64_t total = 0;
-    if (GetThreadTimes(h, &create_time, &exit_time, &kernel_time, &user_time))
-        total = filetime_to_u64(kernel_time) + filetime_to_u64(user_time);
-    CloseHandle(h);
-    return total;
+    (void)tid;
+    return 0;
 }
 
 std::string state_name(std::uint32_t state)

@@ -499,141 +499,7 @@ static std::optional<std::uint32_t> parse_tid_param(const json& params)
     return tid;
 }
 
-static bool thread_belongs_to_attached_process(HANDLE thread, std::uint32_t tid)
-{
-    const std::uint32_t attached_pid = driver_bridge::attached_pid();
-    if (attached_pid == 0)
-        return false;
-    const DWORD owner_pid = GetProcessIdOfThread(thread);
-    if (owner_pid == 0) {
-        diag::log_tagged_fmt("drv_tools", "thread owner lookup failed tid=%u gle=%lu", tid, static_cast<unsigned long>(GetLastError()));
-        return false;
-    }
-    if (owner_pid != attached_pid) {
-        diag::log_tagged_fmt("drv_tools", "thread owner mismatch tid=%u owner_pid=%lu attached_pid=%u", tid, static_cast<unsigned long>(owner_pid), attached_pid);
-        return false;
-    }
-    return true;
-}
-
-static bool set_thread_context_win32_fallback(std::uint32_t tid,
-                                              const voyager::device_t::thread_context& requested,
-                                              std::uint64_t mask)
-{
-    HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
-    if (!thread) {
-        diag::log_tagged_fmt("drv_tools", "set_thread_context fallback OpenThread failed tid=%u gle=%lu", tid, static_cast<unsigned long>(GetLastError()));
-        return false;
-    }
-
-    auto close_and_return = [&](bool result) {
-        CloseHandle(thread);
-        return result;
-    };
-
-    if (!thread_belongs_to_attached_process(thread, tid))
-        return close_and_return(false);
-
-    const DWORD suspend_previous = SuspendThread(thread);
-    if (suspend_previous == static_cast<DWORD>(-1)) {
-        diag::log_tagged_fmt("drv_tools", "set_thread_context fallback SuspendThread failed tid=%u gle=%lu", tid, static_cast<unsigned long>(GetLastError()));
-        return close_and_return(false);
-    }
-
-    CONTEXT native{};
-    native.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_DEBUG_REGISTERS;
-    if (!GetThreadContext(thread, &native)) {
-        diag::log_tagged_fmt("drv_tools", "set_thread_context fallback GetThreadContext failed tid=%u gle=%lu", tid, static_cast<unsigned long>(GetLastError()));
-        (void)ResumeThread(thread);
-        return close_and_return(false);
-    }
-
-    if (mask & (1ULL << 0)) native.Rax = requested.rax;
-    if (mask & (1ULL << 1)) native.Rbx = requested.rbx;
-    if (mask & (1ULL << 2)) native.Rcx = requested.rcx;
-    if (mask & (1ULL << 3)) native.Rdx = requested.rdx;
-    if (mask & (1ULL << 4)) native.Rsi = requested.rsi;
-    if (mask & (1ULL << 5)) native.Rdi = requested.rdi;
-    if (mask & (1ULL << 6)) native.Rbp = requested.rbp;
-    if (mask & (1ULL << 7)) native.Rsp = requested.rsp;
-    if (mask & (1ULL << 8)) native.R8 = requested.r8;
-    if (mask & (1ULL << 9)) native.R9 = requested.r9;
-    if (mask & (1ULL << 10)) native.R10 = requested.r10;
-    if (mask & (1ULL << 11)) native.R11 = requested.r11;
-    if (mask & (1ULL << 12)) native.R12 = requested.r12;
-    if (mask & (1ULL << 13)) native.R13 = requested.r13;
-    if (mask & (1ULL << 14)) native.R14 = requested.r14;
-    if (mask & (1ULL << 15)) native.R15 = requested.r15;
-    if (mask & (1ULL << 16)) native.Rip = requested.rip;
-    if (mask & (1ULL << 17)) native.EFlags = static_cast<DWORD>(requested.rflags);
-    if (mask & (1ULL << 18)) native.Dr0 = requested.dr0;
-    if (mask & (1ULL << 19)) native.Dr1 = requested.dr1;
-    if (mask & (1ULL << 20)) native.Dr2 = requested.dr2;
-    if (mask & (1ULL << 21)) native.Dr3 = requested.dr3;
-    if (mask & (1ULL << 22)) native.Dr6 = requested.dr6;
-    if (mask & (1ULL << 23)) native.Dr7 = requested.dr7;
-
-    const bool ok = SetThreadContext(thread, &native) != FALSE;
-    if (!ok)
-        diag::log_tagged_fmt("drv_tools", "set_thread_context fallback SetThreadContext failed tid=%u mask=0x%llX gle=%lu", tid, static_cast<unsigned long long>(mask), static_cast<unsigned long>(GetLastError()));
-    else
-        diag::log_tagged_fmt("drv_tools", "set_thread_context fallback succeeded tid=%u mask=0x%llX suspend_previous=%lu", tid, static_cast<unsigned long long>(mask), static_cast<unsigned long>(suspend_previous));
-
-    if (ResumeThread(thread) == static_cast<DWORD>(-1))
-        diag::log_tagged_fmt("drv_tools", "set_thread_context fallback ResumeThread failed tid=%u gle=%lu", tid, static_cast<unsigned long>(GetLastError()));
-
-    return close_and_return(ok);
-}
-
 static bool is_probably_kernel_address(std::uint64_t address);
-
-struct native_client_id_t
-{
-    void* unique_process = nullptr;
-    void* unique_thread = nullptr;
-};
-
-struct native_thread_basic_information_t
-{
-    NTSTATUS exit_status = 0;
-    void* teb_base_address = nullptr;
-    native_client_id_t client_id{};
-    std::uintptr_t affinity_mask = 0;
-    LONG priority = 0;
-    LONG base_priority = 0;
-};
-
-static bool query_thread_teb_address(std::uint32_t tid, std::uint64_t& out_teb, std::string& error)
-{
-    out_teb = 0;
-    native_thread_basic_information_t tbi{};
-    std::uint32_t returned = 0;
-    if (!driver_bridge::query_thread_information(tid, 0, &tbi, static_cast<std::uint32_t>(sizeof(tbi)), &returned))
-    {
-        error = OBFSTR("NtQueryInformationThread(ThreadBasicInformation) failed for TID ") + std::to_string(tid);
-        return false;
-    }
-
-    const std::uint64_t teb = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(tbi.teb_base_address));
-    if (teb == 0 || is_probably_kernel_address(teb))
-    {
-        error = OBFSTR("ThreadBasicInformation returned an invalid TEB address for TID ") + std::to_string(tid);
-        return false;
-    }
-
-    const std::uint32_t attached_pid = driver_bridge::attached_pid();
-    const std::uint32_t tbi_pid = static_cast<std::uint32_t>(
-        reinterpret_cast<std::uintptr_t>(tbi.client_id.unique_process) & 0xFFFFFFFFu);
-    if (attached_pid != 0 && tbi_pid != 0 && tbi_pid != attached_pid)
-    {
-        error = OBFSTR("TID ") + std::to_string(tid) + OBFSTR(" belongs to PID ") +
-            std::to_string(tbi_pid) + OBFSTR(", not attached PID ") + std::to_string(attached_pid);
-        return false;
-    }
-
-    out_teb = teb;
-    return true;
-}
 
 static bool resolve_teb_address_for_thread(std::uint32_t tid,
                                            const voyager::device_t::thread_context& ctx,
@@ -646,32 +512,10 @@ static bool resolve_teb_address_for_thread(std::uint32_t tid,
     if (out_teb != 0 && !is_probably_kernel_address(out_teb))
         return true;
 
-    if (query_thread_teb_address(tid, out_teb, error))
-    {
-        source = OBFSTR("NtQueryInformationThread.ThreadBasicInformation.TebBaseAddress");
-        return true;
-    }
-
     if (ctx.kernel_gs_base != 0 && is_probably_kernel_address(ctx.kernel_gs_base))
-        error = OBFSTR("thread context reported a kernel GS base instead of a user TEB and ") + error;
-    return false;
-}
-
-static bool resolve_teb_address_for_thread(std::uint32_t tid,
-                                           const driver_bridge::thread_context_t& ctx,
-                                           std::uint64_t& out_teb,
-                                           std::string& source,
-                                           std::string& error)
-{
-    out_teb = 0;
-    if (query_thread_teb_address(tid, out_teb, error))
-    {
-        source = OBFSTR("NtQueryInformationThread.ThreadBasicInformation.TebBaseAddress");
-        return true;
-    }
-    source = OBFSTR("bridge_thread_context");
-    if (ctx.rip == 0 || ctx.rsp == 0)
-        error = OBFSTR("bridge context did not contain a valid RIP/RSP and ") + error;
+        error = OBFSTR("driver thread context reported a kernel GS base instead of a user TEB for TID ") + std::to_string(tid);
+    else
+        error = OBFSTR("driver thread context did not include a valid user TEB for TID ") + std::to_string(tid);
     return false;
 }
 
@@ -3801,44 +3645,6 @@ static int force_code_pages_in_memory(
     if (!has_valid_pe || !dev || !dev->is_connected() || dev->get_process_id() == 0)
         return 0;
 
-    auto modules = enumerate_ldr_modules_for_iat(dev);
-
-    std::uint64_t kernel32_base = 0;
-    for (const auto& m : modules)
-    {
-        std::string lower = m.name;
-        std::transform(lower.begin(), lower.end(), lower.begin(),
-            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        if (lower == "kernel32.dll")
-        {
-            kernel32_base = m.base;
-            break;
-        }
-    }
-
-    if (kernel32_base == 0)
-    {
-        steps.push_back({{"step", "force_page_in"}, {"ok", false},
-            {"detail", "kernel32.dll not found in target - skipping active page forcing"}});
-        return 0;
-    }
-
-    std::uint64_t vp_addr = dev->resolve_export(kernel32_base, "VirtualProtect");
-    if (vp_addr == 0)
-    {
-        steps.push_back({{"step", "force_page_in"}, {"ok", false},
-            {"detail", "Could not resolve VirtualProtect - skipping active page forcing"}});
-        return 0;
-    }
-
-    std::uint64_t old_prot_buf = dev->allocate_memory(0x1000);
-    if (old_prot_buf == 0)
-    {
-        steps.push_back({{"step", "force_page_in"}, {"ok", false},
-            {"detail", "Could not allocate scratch buffer - skipping active page forcing"}});
-        return 0;
-    }
-
     int pages_forced = 0;
     constexpr std::uint32_t kPageExecReadWrite = 0x40;
     constexpr std::uint64_t VP_CHUNK = 0x10000;
@@ -3862,18 +3668,11 @@ static int force_code_pages_in_memory(
         for (std::uint64_t off = 0; off < sec_size; off += VP_CHUNK)
         {
             std::uint64_t chunk_size = std::min(VP_CHUNK, sec_size - off);
-            std::uint64_t ret = dev->call_function(vp_addr,
-                sec_addr + off,
-                chunk_size,
-                kPageExecReadWrite,
-                old_prot_buf);
-
-            if (ret != 0)
+            std::uint32_t old_protect = 0;
+            if (dev->protect_memory(sec_addr + off, chunk_size, kPageExecReadWrite, &old_protect))
                 pages_forced += static_cast<int>(chunk_size / 0x1000);
         }
     }
-
-    dev->free_memory(old_prot_buf);
 
     if (pages_forced > 0)
     {
@@ -3881,13 +3680,13 @@ static int force_code_pages_in_memory(
 
         steps.push_back({{"step", "force_page_in"}, {"ok", true},
             {"detail", std::to_string(pages_forced) +
-                " code pages forced via VirtualProtect to trigger decryption/COW"}});
-        msg(OBFSTR_C("AiDA: Forced %d code pages into memory via VirtualProtect\n"), pages_forced);
+                " code pages forced via driver-backed protection changes to trigger decryption/COW"}});
+        msg(OBFSTR_C("AiDA: Forced %d code pages into memory via driver-backed protection changes\n"), pages_forced);
     }
     else
     {
         steps.push_back({{"step", "force_page_in"}, {"ok", false},
-            {"detail", "VirtualProtect calls returned 0 - anti-cheat may have blocked protection changes"}});
+            {"detail", "Driver-backed protection changes returned 0 - kernel path or target policy rejected the request"}});
     }
 
     return pages_forced;
@@ -5706,7 +5505,7 @@ tool_result_t driver_set_hw_breakpoint(const json& params)
         else size = 0;
     }
 
-    if (!driver_bridge::set_hardware_breakpoint(tid, index, address, type, size))
+    if (!device->set_hardware_breakpoint(tid, index, address, type, size))
         return tool_result_t::error(OBFSTR("Failed to set hardware breakpoint"));
 
     json result;
@@ -5731,7 +5530,7 @@ tool_result_t driver_clear_hw_breakpoint(const json& params)
     int index = 0;
     if (params.contains("index")) index = params["index"].get<int>();
 
-    if (!driver_bridge::clear_hardware_breakpoint(tid, index))
+    if (!device->clear_hardware_breakpoint(tid, index))
         return tool_result_t::error(OBFSTR("Failed to clear hardware breakpoint"));
 
     json result;
@@ -9191,8 +8990,8 @@ tool_result_t driver_read_teb(const json& params)
 
     const std::uint32_t tid = *tid_opt;
 
-    driver_bridge::thread_context_t ctx{};
-    if (!driver_bridge::get_thread_context(tid, ctx))
+    voyager::device_t::thread_context ctx{};
+    if (!device->get_thread_context(tid, ctx))
         return tool_result_t::error(OBFSTR("Failed to get thread context for TID ") + std::to_string(tid));
 
     std::uint64_t teb_addr = 0;

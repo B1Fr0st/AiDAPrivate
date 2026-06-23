@@ -567,300 +567,6 @@ namespace
         anti_tamper::webhook::write_log_critical("driver", buf);
     }
 
-    void copy_native_context(CONTEXT& dst, const driver_bridge::thread_context_t& src, uint64_t register_mask)
-    {
-        bool all = register_mask == ~0ULL;
-        if (all) {
-            dst.Rax = src.rax; dst.Rbx = src.rbx; dst.Rcx = src.rcx; dst.Rdx = src.rdx;
-            dst.Rsi = src.rsi; dst.Rdi = src.rdi; dst.Rbp = src.rbp; dst.Rsp = src.rsp;
-            dst.R8 = src.r8; dst.R9 = src.r9; dst.R10 = src.r10; dst.R11 = src.r11;
-            dst.R12 = src.r12; dst.R13 = src.r13; dst.R14 = src.r14; dst.R15 = src.r15;
-            dst.Rip = src.rip; dst.EFlags = static_cast<DWORD>(src.rflags);
-            dst.SegCs = static_cast<WORD>(src.cs); dst.SegSs = static_cast<WORD>(src.ss);
-            dst.Dr0 = src.dr0; dst.Dr1 = src.dr1; dst.Dr2 = src.dr2; dst.Dr3 = src.dr3;
-            dst.Dr6 = src.dr6; dst.Dr7 = src.dr7;
-            return;
-        }
-        if (register_mask & (1ULL << 18)) dst.Dr0 = src.dr0;
-        if (register_mask & (1ULL << 19)) dst.Dr1 = src.dr1;
-        if (register_mask & (1ULL << 20)) dst.Dr2 = src.dr2;
-        if (register_mask & (1ULL << 21)) dst.Dr3 = src.dr3;
-        if (register_mask & (1ULL << 22)) dst.Dr6 = src.dr6;
-        if (register_mask & (1ULL << 23)) dst.Dr7 = src.dr7;
-    }
-
-    void copy_bridge_context(driver_bridge::thread_context_t& dst, const CONTEXT& src)
-    {
-        dst.rax = src.Rax; dst.rbx = src.Rbx; dst.rcx = src.Rcx; dst.rdx = src.Rdx;
-        dst.rsi = src.Rsi; dst.rdi = src.Rdi; dst.rbp = src.Rbp; dst.rsp = src.Rsp;
-        dst.r8 = src.R8; dst.r9 = src.R9; dst.r10 = src.R10; dst.r11 = src.R11;
-        dst.r12 = src.R12; dst.r13 = src.R13; dst.r14 = src.R14; dst.r15 = src.R15;
-        dst.rip = src.Rip; dst.rflags = src.EFlags;
-        dst.cs = src.SegCs; dst.ss = src.SegSs;
-        dst.dr0 = src.Dr0; dst.dr1 = src.Dr1; dst.dr2 = src.Dr2; dst.dr3 = src.Dr3;
-        dst.dr6 = src.Dr6; dst.dr7 = src.Dr7;
-    }
-
-    bool usermode_suspend_thread(uint32_t tid, uint32_t* prev_count, const char* source)
-    {
-        unique_handle thread(make_handle(OpenThread(THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(tid))));
-        if (!thread) {
-            DWORD gle = GetLastError();
-            diag::log_tagged_fmt("driver",
-                "%s user_suspend_open_failed tid=%u gle=%lu",
-                source ? source : "thread",
-                tid,
-                gle);
-            SetLastError(gle);
-            return false;
-        }
-        DWORD prev = SuspendThread(thread.get());
-        if (prev == static_cast<DWORD>(-1)) {
-            DWORD gle = GetLastError();
-            diag::log_tagged_fmt("driver",
-                "%s user_suspend_failed tid=%u gle=%lu",
-                source ? source : "thread",
-                tid,
-                gle);
-            SetLastError(gle);
-            return false;
-        }
-        if (prev_count)
-            *prev_count = prev;
-        diag::log_tagged_fmt("driver",
-            "%s user_suspend_ok tid=%u prev=%lu",
-            source ? source : "thread",
-            tid,
-            prev);
-        return true;
-    }
-
-    bool usermode_resume_thread(uint32_t tid, uint32_t* prev_count, const char* source)
-    {
-        unique_handle thread(make_handle(OpenThread(THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(tid))));
-        if (!thread) {
-            DWORD gle = GetLastError();
-            diag::log_tagged_fmt("driver",
-                "%s user_resume_open_failed tid=%u gle=%lu",
-                source ? source : "thread",
-                tid,
-                gle);
-            SetLastError(gle);
-            return false;
-        }
-        DWORD prev = ResumeThread(thread.get());
-        if (prev == static_cast<DWORD>(-1)) {
-            DWORD gle = GetLastError();
-            diag::log_tagged_fmt("driver",
-                "%s user_resume_failed tid=%u gle=%lu",
-                source ? source : "thread",
-                tid,
-                gle);
-            SetLastError(gle);
-            return false;
-        }
-        if (prev_count)
-            *prev_count = prev;
-        diag::log_tagged_fmt("driver",
-            "%s user_resume_ok tid=%u prev=%lu",
-            source ? source : "thread",
-            tid,
-            prev);
-        return true;
-    }
-
-    bool usermode_get_thread_context(uint32_t tid, driver_bridge::thread_context_t& ctx, const char* source)
-    {
-        const DWORD current_tid = GetCurrentThreadId();
-        if (tid == current_tid) {
-            diag::log_tagged_fmt("driver",
-                "%s user_getctx_rejected_self tid=%u",
-                source ? source : "thread",
-                tid);
-            SetLastError(ERROR_INVALID_PARAMETER);
-            return false;
-        }
-
-        unique_handle thread(make_handle(OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(tid))));
-        if (!thread) {
-            DWORD gle = GetLastError();
-            diag::log_tagged_fmt("driver",
-                "%s user_getctx_open_failed tid=%u gle=%lu",
-                source ? source : "thread",
-                tid,
-                gle);
-            SetLastError(gle);
-            return false;
-        }
-        DWORD prev = SuspendThread(thread.get());
-        if (prev == static_cast<DWORD>(-1)) {
-            DWORD gle = GetLastError();
-            diag::log_tagged_fmt("driver",
-                "%s user_getctx_suspend_failed tid=%u gle=%lu",
-                source ? source : "thread",
-                tid,
-                gle);
-            SetLastError(gle);
-            return false;
-        }
-        CONTEXT native{};
-        native.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS | CONTEXT_DEBUG_REGISTERS;
-        BOOL ok = GetThreadContext(thread.get(), &native);
-        DWORD gle = ok ? ERROR_SUCCESS : GetLastError();
-        DWORD resume_prev = ResumeThread(thread.get());
-        if (!ok) {
-            diag::log_tagged_fmt("driver",
-                "%s user_getctx_failed tid=%u gle=%lu suspend_prev=%lu resume_prev=%lu",
-                source ? source : "thread",
-                tid,
-                gle,
-                prev,
-                resume_prev);
-            SetLastError(gle);
-            return false;
-        }
-        copy_bridge_context(ctx, native);
-        bool sane = ctx.rip != 0 && ctx.rsp != 0 && ctx.rflags != 0;
-        diag::log_tagged_fmt("driver",
-            "%s user_getctx_ok tid=%u rip=0x%llX rsp=0x%llX rflags=0x%llX dr7=0x%llX suspend_prev=%lu resume_prev=%lu sane=%d",
-            source ? source : "thread",
-            tid,
-            static_cast<unsigned long long>(ctx.rip),
-            static_cast<unsigned long long>(ctx.rsp),
-            static_cast<unsigned long long>(ctx.rflags),
-            static_cast<unsigned long long>(ctx.dr7),
-            prev,
-            resume_prev,
-            sane ? 1 : 0);
-        return sane;
-    }
-
-    bool usermode_set_thread_context(uint32_t tid, const driver_bridge::thread_context_t& ctx, uint64_t register_mask, const char* source)
-    {
-        unique_handle thread(make_handle(OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(tid))));
-        if (!thread) {
-            DWORD gle = GetLastError();
-            diag::log_tagged_fmt("driver",
-                "%s user_setctx_open_failed tid=%u mask=0x%llX gle=%lu",
-                source ? source : "thread",
-                tid,
-                static_cast<unsigned long long>(register_mask),
-                gle);
-            SetLastError(gle);
-            return false;
-        }
-        DWORD prev = SuspendThread(thread.get());
-        if (prev == static_cast<DWORD>(-1)) {
-            DWORD gle = GetLastError();
-            diag::log_tagged_fmt("driver",
-                "%s user_setctx_suspend_failed tid=%u mask=0x%llX gle=%lu",
-                source ? source : "thread",
-                tid,
-                static_cast<unsigned long long>(register_mask),
-                gle);
-            SetLastError(gle);
-            return false;
-        }
-        CONTEXT native{};
-        native.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS | CONTEXT_DEBUG_REGISTERS;
-        BOOL got = GetThreadContext(thread.get(), &native);
-        DWORD get_gle = got ? ERROR_SUCCESS : GetLastError();
-        BOOL set_ok = FALSE;
-        DWORD set_gle = ERROR_SUCCESS;
-        if (got) {
-            copy_native_context(native, ctx, register_mask);
-            native.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS | CONTEXT_DEBUG_REGISTERS;
-            set_ok = SetThreadContext(thread.get(), &native);
-            set_gle = set_ok ? ERROR_SUCCESS : GetLastError();
-        }
-        DWORD resume_prev = ResumeThread(thread.get());
-        if (!got || !set_ok) {
-            DWORD gle = got ? set_gle : get_gle;
-            diag::log_tagged_fmt("driver",
-                "%s user_setctx_failed tid=%u mask=0x%llX get_ok=%d set_ok=%d gle=%lu suspend_prev=%lu resume_prev=%lu",
-                source ? source : "thread",
-                tid,
-                static_cast<unsigned long long>(register_mask),
-                got ? 1 : 0,
-                set_ok ? 1 : 0,
-                gle,
-                prev,
-                resume_prev);
-            SetLastError(gle);
-            return false;
-        }
-        diag::log_tagged_fmt("driver",
-            "%s user_setctx_ok tid=%u mask=0x%llX rip=0x%llX rsp=0x%llX dr7=0x%llX suspend_prev=%lu resume_prev=%lu",
-            source ? source : "thread",
-            tid,
-            static_cast<unsigned long long>(register_mask),
-            static_cast<unsigned long long>(ctx.rip),
-            static_cast<unsigned long long>(ctx.rsp),
-            static_cast<unsigned long long>(ctx.dr7),
-            prev,
-            resume_prev);
-        return true;
-    }
-
-    bool usermode_set_hardware_breakpoint(uint32_t tid, int index, uint64_t address, int type, int size)
-    {
-        if (tid == 0 || index < 0 || index > 3)
-            return false;
-        driver_bridge::thread_context_t ctx{};
-        if (!usermode_get_thread_context(tid, ctx, "set_hw_breakpoint"))
-            return false;
-        switch (index) {
-            case 0: ctx.dr0 = address; break;
-            case 1: ctx.dr1 = address; break;
-            case 2: ctx.dr2 = address; break;
-            case 3: ctx.dr3 = address; break;
-        }
-        ctx.dr6 = 0;
-        uint64_t dr7 = ctx.dr7;
-        constexpr uint64_t kDr7UserMask = 0xFFFF0355ULL;
-        constexpr uint64_t kDr7GlobalEnableMask = 0xAAULL;
-        dr7 &= kDr7UserMask;
-        dr7 &= ~kDr7GlobalEnableMask;
-        int rw_shift = 16 + index * 4;
-        int len_shift = 18 + index * 4;
-        dr7 &= ~(3ULL << (index * 2));
-        dr7 &= ~(3ULL << rw_shift);
-        dr7 &= ~(3ULL << len_shift);
-        dr7 |= (1ULL << (index * 2));
-        dr7 |= ((static_cast<uint64_t>(type) & 3ULL) << rw_shift);
-        dr7 |= ((static_cast<uint64_t>(size) & 3ULL) << len_shift);
-        ctx.dr7 = dr7;
-        uint64_t mask = (1ULL << 22) | (1ULL << 23) | (1ULL << (18 + index));
-        return usermode_set_thread_context(tid, ctx, mask, "set_hw_breakpoint");
-    }
-
-    bool usermode_clear_hardware_breakpoint(uint32_t tid, int index)
-    {
-        if (tid == 0 || index < 0 || index > 3)
-            return false;
-        driver_bridge::thread_context_t ctx{};
-        if (!usermode_get_thread_context(tid, ctx, "clear_hw_breakpoint"))
-            return false;
-        switch (index) {
-            case 0: ctx.dr0 = 0; break;
-            case 1: ctx.dr1 = 0; break;
-            case 2: ctx.dr2 = 0; break;
-            case 3: ctx.dr3 = 0; break;
-        }
-        uint64_t dr7 = ctx.dr7;
-        constexpr uint64_t kDr7UserMask = 0xFFFF0355ULL;
-        constexpr uint64_t kDr7GlobalEnableMask = 0xAAULL;
-        dr7 &= kDr7UserMask;
-        dr7 &= ~kDr7GlobalEnableMask;
-        dr7 &= ~(3ULL << (index * 2));
-        dr7 &= ~(3ULL << (16 + index * 4));
-        dr7 &= ~(3ULL << (18 + index * 4));
-        ctx.dr6 = 0;
-        ctx.dr7 = dr7;
-        uint64_t mask = (1ULL << (18 + index)) | (1ULL << 22) | (1ULL << 23);
-        return usermode_set_thread_context(tid, ctx, mask, "clear_hw_breakpoint");
-    }
-
     std::vector<driver_bridge::thread_info_t> enumerate_threads_usermode_snapshot(uint32_t pid)
     {
         std::vector<driver_bridge::thread_info_t> result;
@@ -1596,22 +1302,19 @@ namespace
     void arm_tctx_kernel_bypass(const char* op, uint32_t pid, uint32_t tid, DWORD gle, uint64_t elapsed_ms, uint32_t failures, uint32_t key_repeats, uint32_t distinct_stable_failures, const char* reason)
     {
         const uint64_t now = static_cast<uint64_t>(GetTickCount64());
-        const uint64_t until = now + kTctxKernelBypassMs;
-        const uint64_t previous = g_tctx_kernel_bypass_until_ms.exchange(until, std::memory_order_acq_rel);
-        if (previous < now) {
-            diag::log_tagged_fmt("driver",
-                "tctx_kernel_bypass_armed op=%s pid=%u tid=%u gle=%lu elapsed_ms=%llu failures=%u key_repeats=%u distinct_stable_failures=%u bypass_ms=%llu reason=%s",
-                op ? op : "tctx",
-                pid,
-                tid,
-                static_cast<unsigned long>(gle),
-                static_cast<unsigned long long>(elapsed_ms),
-                failures,
-                key_repeats,
-                distinct_stable_failures,
-                static_cast<unsigned long long>(kTctxKernelBypassMs),
-                reason ? reason : "unspecified");
-        }
+        const uint64_t previous = g_tctx_kernel_bypass_until_ms.exchange(0, std::memory_order_acq_rel);
+        diag::log_tagged_fmt("driver",
+            "tctx_kernel_bypass_rejected op=%s pid=%u tid=%u gle=%lu elapsed_ms=%llu failures=%u key_repeats=%u distinct_stable_failures=%u previous_remaining_ms=%llu reason=%s fail_closed=1",
+            op ? op : "tctx",
+            pid,
+            tid,
+            static_cast<unsigned long>(gle),
+            static_cast<unsigned long long>(elapsed_ms),
+            failures,
+            key_repeats,
+            distinct_stable_failures,
+            previous > now ? static_cast<unsigned long long>(previous - now) : 0ULL,
+            reason ? reason : "unspecified");
     }
 
     void note_tctx_kernel_failure(const char* op, uint32_t pid, uint32_t tid, DWORD gle, uint64_t elapsed_ms)
@@ -1883,6 +1586,8 @@ namespace
 
 namespace driver_bridge
 {
+    bool refresh_kernel_context_locked(uint32_t pid, process_ctx_t& ctx);
+
     void set_log_callback(log_fn_t fn)
     {
         std::lock_guard<std::mutex> lk(g_callback_mtx);
@@ -2564,10 +2269,7 @@ namespace driver_bridge
     bool can_read_memory()
     {
         std::lock_guard<std::mutex> lk(g_state_mtx);
-        if (g_pid == 0) return false;
-        if (g_kernel_attached) return true;
-        if (g_has_vm_read && g_process) return true;
-        return false;
+        return g_pid != 0 && g_kernel_attached && g_kernel_mode && device && device->is_connected();
     }
 
     bool attach(uint32_t pid)
@@ -2597,34 +2299,32 @@ namespace driver_bridge
         std::lock_guard<std::mutex> lk(g_state_mtx);
         diag::log_tagged_critical("driver", "attach_post_state_mtx_lock");
 
-        DWORD access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ |
-                       PROCESS_VM_WRITE | PROCESS_VM_OPERATION;
+        constexpr DWORD access = PROCESS_QUERY_LIMITED_INFORMATION;
         diag::log_tagged_critical_fmt("driver", "attach_pre_OpenProcess access=0x%X pid=%u", access, pid);
         unique_handle process(OpenProcess(access, FALSE, pid));
         diag::log_tagged_critical_fmt("driver", "attach_post_OpenProcess handle=%p gle=%lu",
             process.get(), process ? 0UL : GetLastError());
-        bool has_vm_read = true;
         if (!process) {
-            access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ;
-            diag::log_tagged_critical_fmt("driver", "attach_retry_OpenProcess access=0x%X pid=%u", access, pid);
-            process.reset(OpenProcess(access, FALSE, pid));
+            set_last_error_locked("OpenProcess query failed for PID " + std::to_string(pid) +
+                                  " (error " + std::to_string(GetLastError()) + ")");
+            return false;
         }
-        if (!process) {
-            has_vm_read = false;
-            access = PROCESS_QUERY_LIMITED_INFORMATION;
-            diag::log_tagged_critical_fmt("driver", "attach_retry_OpenProcess access=0x%X pid=%u", access, pid);
-            process.reset(OpenProcess(access, FALSE, pid));
-            if (!process) {
-                set_last_error_locked("OpenProcess failed for PID " + std::to_string(pid) +
-                                      " (error " + std::to_string(GetLastError()) + ")");
-                return false;
-            }
+
+        bool kernel_ok = g_kernel_mode && device && device->is_connected();
+        diag::log_tagged_critical_fmt("driver", "attach_kernel_check kernel_mode=%d device=%p connected=%d kernel_ok=%d",
+            g_kernel_mode ? 1 : 0, device.get(),
+            (device && device->is_connected()) ? 1 : 0,
+            kernel_ok ? 1 : 0);
+        if (!kernel_ok) {
+            require_kernel_fail("attach");
+            set_last_error_locked("attach requires WhosWho kernel driver for PID " + std::to_string(pid));
+            return false;
         }
 
         close_process_handle_locked();
         g_process = process.release();
         g_pid = pid;
-        g_has_vm_read = has_vm_read;
+        g_has_vm_read = false;
         g_kernel_attached = false;
         if (!refresh_process_name_locked())
             g_process_name = process_name_from_pid(pid);
@@ -2637,116 +2337,86 @@ namespace driver_bridge
             }
         }
 
-        bool kernel_ok = g_kernel_mode && device && device->is_connected();
-        diag::log_tagged_critical_fmt("driver", "attach_kernel_check kernel_mode=%d device=%p connected=%d kernel_ok=%d",
-            g_kernel_mode ? 1 : 0, device.get(),
-            (device && device->is_connected()) ? 1 : 0,
-            kernel_ok ? 1 : 0);
-        if (kernel_ok) {
-            diag::log_tagged_critical("driver", "attach_pre_set_process_id");
-            device->set_process_id(pid);
-            diag::log_tagged_critical("driver", "attach_post_set_process_id");
+        diag::log_tagged_critical("driver", "attach_pre_set_process_id");
+        device->set_process_id(pid);
+        diag::log_tagged_critical("driver", "attach_post_set_process_id");
 
-            const ULONGLONG arc_bridge_t0 = GetTickCount64();
-            diag::log_tagged_critical("driver", "attach_pre_get_arc_vtable");
-            arc_attach_resolution_t arc_attach_ctx{};
-            arc_attach_ctx.pid = pid;
-            arc_attach_ctx.started_ms = arc_bridge_t0;
-            const bool arc_bridge_ok = arc_bridge_attach_resolution(arc_attach_ctx);
-            diag::log_tagged_critical_fmt("driver",
-                "attach_arc_vtable_wrapper_result ok=%d solved=%d dtb=0x%llX image=0x%llX elapsed_ms=%llu",
-                arc_bridge_ok ? 1 : 0,
-                arc_attach_ctx.solved ? 1 : 0,
-                static_cast<unsigned long long>(arc_attach_ctx.dtb),
-                static_cast<unsigned long long>(arc_attach_ctx.image_base),
-                static_cast<unsigned long long>(GetTickCount64() - arc_bridge_t0));
-            bool vtable_solved = arc_bridge_ok && arc_attach_ctx.solved;
-            if (vtable_solved) {
-                diag::log_tagged_critical("driver", "attach_pre_device_solve_dtb_after_vtable");
-                device->solve_dtb();
-                diag::log_tagged_critical("driver", "attach_post_device_solve_dtb_after_vtable");
-                if (arc_attach_ctx.image_base != 0)
-                    device->set_base_address(arc_attach_ctx.image_base);
-            }
+        const ULONGLONG arc_bridge_t0 = GetTickCount64();
+        diag::log_tagged_critical("driver", "attach_pre_get_arc_vtable");
+        arc_attach_resolution_t arc_attach_ctx{};
+        arc_attach_ctx.pid = pid;
+        arc_attach_ctx.started_ms = arc_bridge_t0;
+        const bool arc_bridge_ok = arc_bridge_attach_resolution(arc_attach_ctx);
+        diag::log_tagged_critical_fmt("driver",
+            "attach_arc_vtable_wrapper_result ok=%d solved=%d dtb=0x%llX image=0x%llX elapsed_ms=%llu",
+            arc_bridge_ok ? 1 : 0,
+            arc_attach_ctx.solved ? 1 : 0,
+            static_cast<unsigned long long>(arc_attach_ctx.dtb),
+            static_cast<unsigned long long>(arc_attach_ctx.image_base),
+            static_cast<unsigned long long>(GetTickCount64() - arc_bridge_t0));
+        bool vtable_solved = arc_bridge_ok && arc_attach_ctx.solved;
+        if (vtable_solved) {
+            diag::log_tagged_critical("driver", "attach_pre_device_solve_dtb_after_vtable");
+            device->solve_dtb();
+            diag::log_tagged_critical("driver", "attach_post_device_solve_dtb_after_vtable");
+            if (arc_attach_ctx.image_base != 0)
+                device->set_base_address(arc_attach_ctx.image_base);
+        }
 
-            if (!vtable_solved) {
-                diag::log_tagged_critical("driver", "attach_pre_device_solve_dtb_fallback");
-                device->solve_dtb();
-                diag::log_tagged_critical_fmt("driver", "attach_post_device_solve_dtb_fallback dtb=0x%llX",
-                    (unsigned long long)device->get_dtb());
-                if (device->get_dtb() == 0) {
-                    diag::log_tagged_critical_fmt("driver",
-                        "attach_device_solve_dtb_zero connected=%d hb_err=%lu hb_bytes=%lu hb_ioctl=0x%08X hb_magic=0x%08X hb_dioctl=%d",
-                        device->is_connected() ? 1 : 0,
-                        static_cast<unsigned long>(device->get_last_heartbeat_error()),
-                        static_cast<unsigned long>(device->get_last_heartbeat_bytes_returned()),
-                        device->get_last_heartbeat_ioctl_code(),
-                        device->get_last_heartbeat_magic(),
-                        device->get_last_heartbeat_dioctl_result() ? 1 : 0);
-                    kernel_ok = false;
-                } else {
-                    diag::log_tagged_critical("driver", "attach_pre_device_find_image_fallback");
-                    const auto image_base = device->find_image();
-                    diag::log_tagged_critical_fmt("driver", "attach_post_device_find_image_fallback base=0x%llX",
-                        (unsigned long long)image_base);
-                    if (image_base != 0)
-                        device->set_base_address(image_base);
-                }
+        if (!vtable_solved) {
+            diag::log_tagged_critical("driver", "attach_pre_device_solve_dtb_fallback");
+            device->solve_dtb();
+            diag::log_tagged_critical_fmt("driver", "attach_post_device_solve_dtb_fallback dtb=0x%llX",
+                (unsigned long long)device->get_dtb());
+            if (device->get_dtb() == 0) {
+                diag::log_tagged_critical_fmt("driver",
+                    "attach_device_solve_dtb_zero connected=%d hb_err=%lu hb_bytes=%lu hb_ioctl=0x%08X hb_magic=0x%08X hb_dioctl=%d",
+                    device->is_connected() ? 1 : 0,
+                    static_cast<unsigned long>(device->get_last_heartbeat_error()),
+                    static_cast<unsigned long>(device->get_last_heartbeat_bytes_returned()),
+                    device->get_last_heartbeat_ioctl_code(),
+                    device->get_last_heartbeat_magic(),
+                    device->get_last_heartbeat_dioctl_result() ? 1 : 0);
+                set_last_error_locked("WhosWho failed to resolve DTB for PID " + std::to_string(pid));
+                return false;
             }
+            diag::log_tagged_critical("driver", "attach_pre_device_find_image_fallback");
+            const auto image_base = device->find_image();
+            diag::log_tagged_critical_fmt("driver", "attach_post_device_find_image_fallback base=0x%llX",
+                (unsigned long long)image_base);
+            if (image_base != 0)
+                device->set_base_address(image_base);
+        }
 
-            if (kernel_ok) {
-                g_kernel_attached = true;
-                diag::log_tagged_critical("driver", "attach_pre_solve_kernel_dtb");
-                device->solve_kernel_dtb();
-                diag::log_tagged_critical_fmt("driver", "attach_post_solve_kernel_dtb kdtb=0x%llX",
-                    (unsigned long long)device->get_kernel_dtb());
-                if (device->get_kernel_dtb() != 0) {
-                    logf("AiDA Standalone: Kernel DTB solved: 0x%llX\n",
-                         static_cast<unsigned long long>(device->get_kernel_dtb()));
-                }
-            }
+        g_kernel_attached = true;
+        diag::log_tagged_critical("driver", "attach_pre_solve_kernel_dtb");
+        device->solve_kernel_dtb();
+        diag::log_tagged_critical_fmt("driver", "attach_post_solve_kernel_dtb kdtb=0x%llX",
+            (unsigned long long)device->get_kernel_dtb());
+        if (device->get_kernel_dtb() != 0) {
+            logf("AiDA Standalone: Kernel DTB solved: 0x%llX\n",
+                 static_cast<unsigned long long>(device->get_kernel_dtb()));
         }
 
         clear_last_error_locked_after_success("attach");
-        if (kernel_ok) {
-            logf("AiDA Standalone: Attached to PID %u (%s) via kernel driver. DTB=0x%llX\n",
-                 g_pid, g_process_name.empty() ? "unknown" : g_process_name.c_str(),
-                 static_cast<unsigned long long>(device->get_dtb()));
-        } else if (has_vm_read) {
-            diag::log_tagged_critical_fmt("driver",
-                "attach_DEGRADED_USERMODE_VM_READ pid=%u kernel_mode=%d device=%p connected=%d",
-                pid, g_kernel_mode ? 1 : 0, device.get(), (device && device->is_connected()) ? 1 : 0);
-            logf("AiDA Standalone: Attached to PID %u (%s) via user-mode handle (VM_READ).\n",
-                 g_pid, g_process_name.empty() ? "unknown" : g_process_name.c_str());
-        } else {
-            diag::log_tagged_critical_fmt("driver",
-                "attach_DEGRADED_QUERY_ONLY pid=%u kernel_mode=%d device=%p connected=%d",
-                pid, g_kernel_mode ? 1 : 0, device.get(), (device && device->is_connected()) ? 1 : 0);
-            logf("AiDA Standalone: Attached to PID %u (%s) via limited handle (query-only).\n",
-                 g_pid, g_process_name.empty() ? "unknown" : g_process_name.c_str());
-        }
+        logf("AiDA Standalone: Attached to PID %u (%s) via kernel driver. DTB=0x%llX\n",
+             g_pid, g_process_name.empty() ? "unknown" : g_process_name.c_str(),
+             static_cast<unsigned long long>(device->get_dtb()));
 
-        {
-            process_ctx_t ctx;
-            ctx.h_process = nullptr;
-            ctx.kernel_attached = g_kernel_attached;
-            ctx.has_vm_read = g_has_vm_read;
-            ctx.name = g_process_name;
-            if (g_kernel_attached && device) {
-                diag::log_tagged_critical("driver", "attach_pre_ctx_cached_find_image");
-                ctx.cached_image_base = device->find_image();
-                diag::log_tagged_critical_fmt("driver", "attach_post_ctx_cached_find_image base=0x%llX",
-                    static_cast<unsigned long long>(ctx.cached_image_base));
-            } else {
-                ctx.cached_image_base = 0;
-            }
-            ctx.cached_dtb = (g_kernel_attached && device) ? device->get_dtb() : 0;
-            ctx.cached_kernel_dtb = (g_kernel_attached && device) ? device->get_kernel_dtb() : 0;
-            g_processes[pid] = std::move(ctx);
-        }
+        process_ctx_t ctx;
+        ctx.h_process = nullptr;
+        ctx.kernel_attached = g_kernel_attached;
+        ctx.has_vm_read = false;
+        ctx.name = g_process_name;
+        diag::log_tagged_critical("driver", "attach_pre_ctx_cached_find_image");
+        ctx.cached_image_base = device->find_image();
+        diag::log_tagged_critical_fmt("driver", "attach_post_ctx_cached_find_image base=0x%llX",
+            static_cast<unsigned long long>(ctx.cached_image_base));
+        ctx.cached_dtb = device->get_dtb();
+        ctx.cached_kernel_dtb = device->get_kernel_dtb();
+        g_processes[pid] = std::move(ctx);
 
-        diag::log_tagged_critical_fmt("driver", "attach_exit_ok pid=%u kernel_ok=%d has_vm_read=%d",
-            pid, kernel_ok ? 1 : 0, has_vm_read ? 1 : 0);
+        diag::log_tagged_critical_fmt("driver", "attach_exit_ok pid=%u kernel_ok=1 has_vm_read=0", pid);
         return true;
     }
 
@@ -2820,36 +2490,36 @@ namespace driver_bridge
             return true;
         }
 
-        DWORD access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ |
-                       PROCESS_VM_WRITE | PROCESS_VM_OPERATION;
-        unique_handle process(OpenProcess(access, FALSE, pid));
-        bool has_vm_read = true;
-        if (!process) {
-            access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ;
-            process.reset(OpenProcess(access, FALSE, pid));
+        if (!g_kernel_mode || !device || !device->is_connected()) {
+            require_kernel_fail("attach_additional");
+            set_last_error_locked("attach_additional requires WhosWho kernel driver for PID " + std::to_string(pid));
+            return false;
         }
+
+        constexpr DWORD access = PROCESS_QUERY_LIMITED_INFORMATION;
+        unique_handle process(OpenProcess(access, FALSE, pid));
         if (!process) {
-            has_vm_read = false;
-            access = PROCESS_QUERY_LIMITED_INFORMATION;
-            process.reset(OpenProcess(access, FALSE, pid));
-            if (!process) {
-                set_last_error_locked("OpenProcess failed for PID " + std::to_string(pid) +
-                                      " (error " + std::to_string(GetLastError()) + ")");
-                return false;
-            }
+            set_last_error_locked("OpenProcess query failed for PID " + std::to_string(pid) +
+                                  " (error " + std::to_string(GetLastError()) + ")");
+            return false;
         }
 
         process_ctx_t ctx;
         ctx.h_process = process.release();
-        ctx.has_vm_read = has_vm_read;
+        ctx.has_vm_read = false;
         ctx.kernel_attached = false;
         ctx.name = process_name_from_pid(pid);
         ctx.cached_image_base = 0;
         ctx.cached_dtb = 0;
         ctx.cached_kernel_dtb = 0;
+        if (!refresh_kernel_context_locked(pid, ctx)) {
+            release_ctx_handle(ctx);
+            set_last_error_locked("WhosWho failed to attach additional PID " + std::to_string(pid));
+            return false;
+        }
         g_processes[pid] = std::move(ctx);
 
-        diag::log_tagged_fmt("driver", "attach_additional_ok pid=%u has_vm_read=%d", pid, has_vm_read ? 1 : 0);
+        diag::log_tagged_fmt("driver", "attach_additional_ok pid=%u kernel_attached=1 has_vm_read=0", pid);
         clear_last_error_locked_after_success("attach_additional");
         return true;
     }
@@ -3681,105 +3351,84 @@ namespace driver_bridge
         }
 
         out.clear();
-        HANDLE process = nullptr;
         bool kernel_mode = false;
-        bool has_vm_read = false;
+        bool kernel_attached = false;
         {
             std::lock_guard<std::mutex> lk(g_state_mtx);
-            process = g_process;
             kernel_mode = g_kernel_mode && device && device->is_connected();
-            has_vm_read = g_has_vm_read;
+            kernel_attached = g_kernel_attached;
         }
         if (size == 0)
             return false;
 
-        if (kernel_mode) {
-            bool kernel_attached = false;
-            {
-                std::lock_guard<std::mutex> lk2(g_state_mtx);
-                kernel_attached = g_kernel_attached;
-            }
-            if (!kernel_attached) {
-                static int s_skip_kernel_log = 0;
-                if (s_skip_kernel_log++ < 10)
-                    logf("read_memory: SKIPPING kernel path (not kernel_attached), falling through to RPM\n");
-            } else {
-                out.resize(size);
-                size_t bytes_read = 0;
-                bool arc_read_invoked = false;
-                bytes_read = arc_bridge_read_raw(address, out.data(), size, &arc_read_invoked);
+        if (!kernel_mode || !kernel_attached) {
+            diag::log_tagged_fmt("driver",
+                "read_memory_kernel_required addr=0x%llX sz=%llu kernel=%d attached=%d",
+                static_cast<unsigned long long>(address),
+                static_cast<unsigned long long>(size),
+                kernel_mode ? 1 : 0,
+                kernel_attached ? 1 : 0);
+            require_kernel_fail("read_memory");
+            return false;
+        }
 
-                if (bytes_read == 0 && device && device->get_dtb() != 0) {
+        out.resize(size);
+        size_t bytes_read = 0;
+        bool arc_read_invoked = false;
+        bytes_read = arc_bridge_read_raw(address, out.data(), size, &arc_read_invoked);
+
+        if (bytes_read == 0 && device && device->get_dtb() != 0) {
+            bytes_read = device->read_raw(address, out.data(), size);
+        }
+
+        {
+            static int s_read_log_count = 0;
+            if (s_read_log_count < 50) {
+                s_read_log_count++;
+                logf("read_memory: addr=0x%llX sz=%llu kernel=%d vtable=%d dtb=0x%llX bytes=%llu\n",
+                    (unsigned long long)address, (unsigned long long)size,
+                    kernel_mode ? 1 : 0,
+                    arc_read_invoked ? 1 : 0,
+                    device ? (unsigned long long)device->get_dtb() : 0ULL,
+                    (unsigned long long)bytes_read);
+            }
+        }
+
+        if (bytes_read == 0) {
+            bool re_resolved = false;
+            {
+                std::lock_guard<std::mutex> lk(g_state_mtx);
+                if (device) {
+                    device->solve_dtb();
+                    re_resolved = (device->get_dtb() != 0);
+                }
+                if (!re_resolved) {
+                    uint64_t new_dtb = arc_bridge_solve_dtb(true);
+                    re_resolved = (new_dtb != 0);
+                }
+            }
+
+            if (re_resolved) {
+                std::memset(out.data(), 0, size);
+                bytes_read = arc_bridge_read_raw(address, out.data(), size);
+                if (bytes_read == 0 && device) {
                     bytes_read = device->read_raw(address, out.data(), size);
                 }
-
-                {
-                    static int s_read_log_count = 0;
-                    if (s_read_log_count < 50) {
-                        s_read_log_count++;
-                        logf("read_memory: addr=0x%llX sz=%llu kernel=%d vtable=%d dtb=0x%llX bytes=%llu\n",
-                            (unsigned long long)address, (unsigned long long)size,
-                            kernel_mode ? 1 : 0,
-                            arc_read_invoked ? 1 : 0,
-                            device ? (unsigned long long)device->get_dtb() : 0ULL,
-                            (unsigned long long)bytes_read);
-                    }
-                }
-
-                if (bytes_read == 0) {
-                    bool re_resolved = false;
-                    {
-                        std::lock_guard<std::mutex> lk(g_state_mtx);
-                        if (device) {
-                            device->solve_dtb();
-                            re_resolved = (device->get_dtb() != 0);
-                        }
-                        if (!re_resolved) {
-                            uint64_t new_dtb = arc_bridge_solve_dtb(true);
-                            re_resolved = (new_dtb != 0);
-                        }
-                    }
-
-                    if (re_resolved) {
-                        std::memset(out.data(), 0, size);
-                        bytes_read = arc_bridge_read_raw(address, out.data(), size);
-                        if (bytes_read == 0) {
-                            bytes_read = device->read_raw(address, out.data(), size);
-                        }
-                    }
-                }
-
-                if (bytes_read > 0) {
-                    out.resize(bytes_read);
-                    clear_last_error_after_success("read_memory_kernel");
-                    return true;
-                }
-                out.clear();
             }
         }
 
-        if (has_vm_read && process && size <= 0x10000000) {
-            out.resize(size);
-            SIZE_T bytes_rpm = 0;
-            BOOL rpm_ok = ReadProcessMemory(process, reinterpret_cast<LPCVOID>(static_cast<uintptr_t>(address)),
-                                  out.data(), size, &bytes_rpm);
-            {
-                static int s_rpm_log_count = 0;
-                if (s_rpm_log_count < 50) {
-                    s_rpm_log_count++;
-                    logf("read_memory RPM fallback: addr=0x%llX sz=%llu ok=%d bytes=%llu err=%lu\n",
-                        (unsigned long long)address, (unsigned long long)size,
-                        rpm_ok ? 1 : 0, (unsigned long long)bytes_rpm, rpm_ok ? 0UL : GetLastError());
-                }
-            }
-            if (rpm_ok && bytes_rpm > 0) {
-                out.resize(static_cast<size_t>(bytes_rpm));
-                clear_last_error_after_success("read_memory_rpm");
-                return true;
-            }
-            out.clear();
+        if (bytes_read > 0) {
+            out.resize(bytes_read);
+            clear_last_error_after_success("read_memory_kernel");
+            return true;
         }
 
+        out.clear();
+        diag::log_tagged_fmt("driver",
+            "read_memory_kernel_failed addr=0x%llX sz=%llu dtb=0x%llX",
+            static_cast<unsigned long long>(address),
+            static_cast<unsigned long long>(size),
+            static_cast<unsigned long long>(device ? device->get_dtb() : 0));
         return false;
     }
 
@@ -3799,11 +3448,22 @@ namespace driver_bridge
 
         constexpr size_t kVerifyLimit = 4096;
         bool kernel_mode = false;
-        HANDLE process = nullptr;
+        bool kernel_attached = false;
         {
             std::lock_guard<std::mutex> lk(g_state_mtx);
             kernel_mode = g_kernel_mode && device && device->is_connected();
-            process = g_process;
+            kernel_attached = g_kernel_attached;
+        }
+
+        if (!kernel_mode || !kernel_attached) {
+            diag::log_tagged_fmt("driver",
+                "write_memory_kernel_required addr=0x%llX sz=%llu kernel=%d attached=%d",
+                static_cast<unsigned long long>(address),
+                static_cast<unsigned long long>(data.size()),
+                kernel_mode ? 1 : 0,
+                kernel_attached ? 1 : 0);
+            require_kernel_fail("write_memory");
+            return false;
         }
 
         auto first_mismatch = [](const std::vector<uint8_t>& expected, const std::vector<uint8_t>& actual) -> size_t {
@@ -3814,140 +3474,82 @@ namespace driver_bridge
             }
             return n;
         };
-        auto verify_with_rpm = [&](std::vector<uint8_t>& actual, SIZE_T& bytes_read, DWORD& err) -> bool {
-            actual.clear();
-            bytes_read = 0;
-            err = 0;
-            if (!process || data.size() > kVerifyLimit)
-                return false;
-            actual.resize(data.size());
-            BOOL ok = ReadProcessMemory(process,
-                reinterpret_cast<LPCVOID>(static_cast<uintptr_t>(address)),
-                actual.data(), actual.size(), &bytes_read);
-            if (!ok) {
-                err = GetLastError();
-                actual.clear();
-                return false;
-            }
-            if (bytes_read != data.size()) {
-                actual.resize(static_cast<size_t>(bytes_read));
-                return false;
-            }
-            return std::equal(data.begin(), data.end(), actual.begin());
-        };
 
-        if (kernel_mode) {
-            size_t bytes_written = 0;
-            bytes_written = arc_bridge_write_raw(address, data.data(), data.size());
+        size_t bytes_written = arc_bridge_write_raw(address, data.data(), data.size());
 
-            if (bytes_written != data.size() && device && device->get_dtb() != 0) {
-                const size_t direct_written = device->write_raw(address, data.data(), data.size());
-                if (direct_written > bytes_written)
-                    bytes_written = direct_written;
-            }
+        if (bytes_written != data.size() && device && device->get_dtb() != 0) {
+            const size_t direct_written = device->write_raw(address, data.data(), data.size());
+            if (direct_written > bytes_written)
+                bytes_written = direct_written;
+        }
 
-            if (bytes_written != data.size()) {
-                bool re_resolved = false;
-                {
-                    std::lock_guard<std::mutex> lk(g_state_mtx);
-                    if (device) {
-                        device->solve_dtb();
-                        re_resolved = (device->get_dtb() != 0);
-                    }
-                    if (!re_resolved) {
-                        uint64_t new_dtb = arc_bridge_solve_dtb(true);
-                        re_resolved = (new_dtb != 0);
-                    }
+        if (bytes_written != data.size()) {
+            bool re_resolved = false;
+            {
+                std::lock_guard<std::mutex> lk(g_state_mtx);
+                if (device) {
+                    device->solve_dtb();
+                    re_resolved = (device->get_dtb() != 0);
                 }
-
-                if (re_resolved) {
-                    const size_t retry_written = arc_bridge_write_raw(address, data.data(), data.size());
-                    if (retry_written > bytes_written)
-                        bytes_written = retry_written;
-                    if (bytes_written != data.size() && device) {
-                        const size_t retry_direct_written = device->write_raw(address, data.data(), data.size());
-                        if (retry_direct_written > bytes_written)
-                            bytes_written = retry_direct_written;
-                    }
+                if (!re_resolved) {
+                    uint64_t new_dtb = arc_bridge_solve_dtb(true);
+                    re_resolved = (new_dtb != 0);
                 }
             }
 
-            if (bytes_written == data.size()) {
-                if (data.size() > kVerifyLimit)
-                    return true;
-                std::vector<uint8_t> bridge_verify;
-                bool bridge_read_ok = read_memory(address, data.size(), bridge_verify);
-                bool bridge_match = bridge_read_ok &&
-                    bridge_verify.size() == data.size() &&
-                    std::equal(data.begin(), data.end(), bridge_verify.begin());
-                if (bridge_match)
-                    return true;
-                std::vector<uint8_t> rpm_verify;
-                SIZE_T rpm_bytes = 0;
-                DWORD rpm_err = 0;
-                bool rpm_match = verify_with_rpm(rpm_verify, rpm_bytes, rpm_err);
-                if (rpm_match)
-                    return true;
-                const size_t mismatch = first_mismatch(data, bridge_verify);
-                const uint8_t expected = mismatch < data.size() ? data[mismatch] : 0;
-                const uint8_t actual = mismatch < bridge_verify.size() ? bridge_verify[mismatch] : 0;
-                diag::log_tagged_fmt("driver",
-                    "write_memory kernel verify_mismatch addr=0x%llX sz=%llu bridge_read=%d bridge_bytes=%llu rpm_bytes=%llu rpm_err=%lu mismatch=%llu expected=0x%02X actual=0x%02X",
-                    static_cast<unsigned long long>(address),
-                    static_cast<unsigned long long>(data.size()),
-                    bridge_read_ok ? 1 : 0,
-                    static_cast<unsigned long long>(bridge_verify.size()),
-                    static_cast<unsigned long long>(rpm_bytes),
-                    static_cast<unsigned long>(rpm_err),
-                    static_cast<unsigned long long>(mismatch),
-                    static_cast<unsigned>(expected),
-                    static_cast<unsigned>(actual));
-            }
-            if (bytes_written > 0) {
-                diag::log_tagged_fmt("driver",
-                    "write_memory kernel partial addr=0x%llX sz=%llu bytes=%llu",
-                    static_cast<unsigned long long>(address),
-                    static_cast<unsigned long long>(data.size()),
-                    static_cast<unsigned long long>(bytes_written));
+            if (re_resolved) {
+                const size_t retry_written = arc_bridge_write_raw(address, data.data(), data.size());
+                if (retry_written > bytes_written)
+                    bytes_written = retry_written;
+                if (bytes_written != data.size() && device) {
+                    const size_t retry_direct_written = device->write_raw(address, data.data(), data.size());
+                    if (retry_direct_written > bytes_written)
+                        bytes_written = retry_direct_written;
+                }
             }
         }
 
-        if (process) {
-            SIZE_T bytes_written = 0;
-            BOOL ok = WriteProcessMemory(process,
-                reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)),
-                data.data(), data.size(), &bytes_written);
-            diag::log_tagged_fmt("driver",
-                "write_memory WPM fallback addr=0x%llX sz=%llu ok=%d bytes=%llu err=%lu",
-                static_cast<unsigned long long>(address),
-                static_cast<unsigned long long>(data.size()),
-                ok ? 1 : 0,
-                static_cast<unsigned long long>(bytes_written),
-                ok ? 0UL : GetLastError());
-            if (ok && bytes_written == data.size()) {
-                if (data.size() <= kVerifyLimit) {
-                    std::vector<uint8_t> rpm_verify;
-                    SIZE_T rpm_bytes = 0;
-                    DWORD rpm_err = 0;
-                    if (!verify_with_rpm(rpm_verify, rpm_bytes, rpm_err)) {
-                        const size_t mismatch = first_mismatch(data, rpm_verify);
-                        const uint8_t expected = mismatch < data.size() ? data[mismatch] : 0;
-                        const uint8_t actual = mismatch < rpm_verify.size() ? rpm_verify[mismatch] : 0;
-                        diag::log_tagged_fmt("driver",
-                            "write_memory WPM verify_FAILED addr=0x%llX sz=%llu bytes=%llu read_bytes=%llu read_err=%lu mismatch=%llu expected=0x%02X actual=0x%02X",
-                            static_cast<unsigned long long>(address),
-                            static_cast<unsigned long long>(data.size()),
-                            static_cast<unsigned long long>(bytes_written),
-                            static_cast<unsigned long long>(rpm_bytes),
-                            static_cast<unsigned long>(rpm_err),
-                            static_cast<unsigned long long>(mismatch),
-                            static_cast<unsigned>(expected),
-                            static_cast<unsigned>(actual));
-                        return false;
-                    }
-                }
+        if (bytes_written == data.size()) {
+            if (data.size() > kVerifyLimit) {
+                clear_last_error_after_success("write_memory_kernel");
                 return true;
             }
+            std::vector<uint8_t> bridge_verify;
+            bool bridge_read_ok = read_memory(address, data.size(), bridge_verify);
+            bool bridge_match = bridge_read_ok &&
+                bridge_verify.size() == data.size() &&
+                std::equal(data.begin(), data.end(), bridge_verify.begin());
+            if (bridge_match) {
+                clear_last_error_after_success("write_memory_kernel_verified");
+                return true;
+            }
+            const size_t mismatch = first_mismatch(data, bridge_verify);
+            const uint8_t expected = mismatch < data.size() ? data[mismatch] : 0;
+            const uint8_t actual = mismatch < bridge_verify.size() ? bridge_verify[mismatch] : 0;
+            diag::log_tagged_fmt("driver",
+                "write_memory kernel verify_mismatch addr=0x%llX sz=%llu bridge_read=%d bridge_bytes=%llu mismatch=%llu expected=0x%02X actual=0x%02X",
+                static_cast<unsigned long long>(address),
+                static_cast<unsigned long long>(data.size()),
+                bridge_read_ok ? 1 : 0,
+                static_cast<unsigned long long>(bridge_verify.size()),
+                static_cast<unsigned long long>(mismatch),
+                static_cast<unsigned>(expected),
+                static_cast<unsigned>(actual));
+            return false;
+        }
+
+        if (bytes_written > 0) {
+            diag::log_tagged_fmt("driver",
+                "write_memory kernel partial addr=0x%llX sz=%llu bytes=%llu",
+                static_cast<unsigned long long>(address),
+                static_cast<unsigned long long>(data.size()),
+                static_cast<unsigned long long>(bytes_written));
+        } else {
+            diag::log_tagged_fmt("driver",
+                "write_memory kernel failed addr=0x%llX sz=%llu dtb=0x%llX",
+                static_cast<unsigned long long>(address),
+                static_cast<unsigned long long>(data.size()),
+                static_cast<unsigned long long>(device ? device->get_dtb() : 0));
         }
 
         return false;
@@ -4411,31 +4013,31 @@ namespace driver_bridge
             return 0;
 
         bool kernel_mode = false;
-        HANDLE process = nullptr;
+        bool kernel_attached = false;
         {
             std::lock_guard<std::mutex> lk(g_state_mtx);
             kernel_mode = g_kernel_mode && device && device->is_connected();
-            process = g_process;
+            kernel_attached = g_kernel_attached;
         }
 
-        if (kernel_mode) {
-            const uint64_t remote = device->allocate_memory(size);
+        if (!kernel_mode || !kernel_attached) {
             diag::log_tagged_fmt("driver",
-                "allocate_memory kernel sz=%llu addr=0x%llX",
+                "allocate_memory_kernel_required sz=%llu kernel=%d attached=%d",
                 static_cast<unsigned long long>(size),
-                static_cast<unsigned long long>(remote));
-            if (remote != 0)
-                return remote;
+                kernel_mode ? 1 : 0,
+                kernel_attached ? 1 : 0);
+            require_kernel_fail("allocate_memory");
+            return 0;
         }
 
-        if (!process)
-            return 0;
-
-        LPVOID remote = VirtualAllocEx(process, nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        const uint64_t remote = device->allocate_memory(size);
         diag::log_tagged_fmt("driver",
-            "allocate_memory VAE fallback sz=%llu addr=%p err=%lu",
-            static_cast<unsigned long long>(size), remote, remote ? 0UL : GetLastError());
-        return reinterpret_cast<uint64_t>(remote);
+            "allocate_memory kernel sz=%llu addr=0x%llX",
+            static_cast<unsigned long long>(size),
+            static_cast<unsigned long long>(remote));
+        if (remote != 0)
+            clear_last_error_after_success("allocate_memory_kernel");
+        return remote;
     }
 
     bool free_memory(uint64_t address)
@@ -4444,87 +4046,84 @@ namespace driver_bridge
             return false;
 
         bool kernel_mode = false;
-        HANDLE process = nullptr;
+        bool kernel_attached = false;
         {
             std::lock_guard<std::mutex> lk(g_state_mtx);
             kernel_mode = g_kernel_mode && device && device->is_connected();
-            process = g_process;
+            kernel_attached = g_kernel_attached;
         }
 
-        if (kernel_mode) {
-            const bool ok = device->free_memory(address);
+        if (!kernel_mode || !kernel_attached) {
             diag::log_tagged_fmt("driver",
-                "free_memory kernel addr=0x%llX ok=%d",
-                static_cast<unsigned long long>(address), ok ? 1 : 0);
-            if (ok)
-                return true;
+                "free_memory_kernel_required addr=0x%llX kernel=%d attached=%d",
+                static_cast<unsigned long long>(address),
+                kernel_mode ? 1 : 0,
+                kernel_attached ? 1 : 0);
+            require_kernel_fail("free_memory");
+            return false;
         }
 
-        if (!process)
-            return false;
-
-        BOOL ok = VirtualFreeEx(process,
-            reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)), 0, MEM_RELEASE);
+        const bool ok = device->free_memory(address);
         diag::log_tagged_fmt("driver",
-            "free_memory VFE fallback addr=0x%llX ok=%d err=%lu",
-            static_cast<unsigned long long>(address), ok ? 1 : 0, ok ? 0UL : GetLastError());
-        return ok != FALSE;
+            "free_memory kernel addr=0x%llX ok=%d",
+            static_cast<unsigned long long>(address), ok ? 1 : 0);
+        if (ok)
+            clear_last_error_after_success("free_memory_kernel");
+        return ok;
     }
 
     bool protect_memory(uint64_t address, uint64_t size, uint32_t new_protect, uint32_t* old_protect)
     {
         bool kernel_mode = false;
-        HANDLE process = nullptr;
+        bool kernel_attached = false;
         {
             std::lock_guard<std::mutex> lk(g_state_mtx);
             kernel_mode = g_kernel_mode && device && device->is_connected();
-            process = g_process;
+            kernel_attached = g_kernel_attached;
         }
 
-        if (kernel_mode) {
-            const bool ok = device->protect_memory(address, size, new_protect, old_protect);
+        if (!kernel_mode || !kernel_attached || size == 0) {
             diag::log_tagged_fmt("driver",
-                "protect_memory kernel addr=0x%llX sz=0x%llX protect=0x%X ok=%d",
+                "protect_memory_kernel_required addr=0x%llX sz=0x%llX protect=0x%X kernel=%d attached=%d",
                 static_cast<unsigned long long>(address),
                 static_cast<unsigned long long>(size),
-                new_protect, ok ? 1 : 0);
-            if (ok) {
-                clear_last_error_after_success("protect_memory_kernel");
-                return true;
-            }
+                new_protect,
+                kernel_mode ? 1 : 0,
+                kernel_attached ? 1 : 0);
+            require_kernel_fail("protect_memory");
+            return false;
         }
 
-        if (!process || size == 0)
-            return false;
-
-        DWORD old = 0;
-        BOOL ok = VirtualProtectEx(process,
-            reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)),
-            static_cast<SIZE_T>(size),
-            static_cast<DWORD>(new_protect),
-            &old);
-        if (ok && old_protect)
-            *old_protect = old;
+        const bool ok = device->protect_memory(address, size, new_protect, old_protect);
         diag::log_tagged_fmt("driver",
-            "protect_memory VPE fallback addr=0x%llX sz=0x%llX protect=0x%X ok=%d old=0x%X err=%lu",
+            "protect_memory kernel addr=0x%llX sz=0x%llX protect=0x%X ok=%d",
             static_cast<unsigned long long>(address),
             static_cast<unsigned long long>(size),
-            new_protect, ok ? 1 : 0, old, ok ? 0UL : GetLastError());
+            new_protect, ok ? 1 : 0);
         if (ok)
-            clear_last_error_after_success("protect_memory_vpe");
-        return ok != FALSE;
+            clear_last_error_after_success("protect_memory_kernel");
+        return ok;
     }
 
 
     bool get_thread_context(uint32_t tid, thread_context_t& ctx)
     {
         bool kernel_mode = false;
+        bool kernel_attached = false;
         {
             std::lock_guard<std::mutex> lk(g_state_mtx);
             kernel_mode = g_kernel_mode && device && device->is_connected();
+            kernel_attached = g_kernel_attached;
         }
-        if (!kernel_mode || tctx_kernel_bypass_active()) {
-            return usermode_get_thread_context(tid, ctx, "get_thread_context.no_kernel");
+        if (!kernel_mode || !kernel_attached) {
+            diag::log_tagged_fmt("driver",
+                "get_thread_context_kernel_required tid=%u kernel=%d attached=%d bypass=%d",
+                tid,
+                kernel_mode ? 1 : 0,
+                kernel_attached ? 1 : 0,
+                tctx_kernel_bypass_active() ? 1 : 0);
+            require_kernel_fail("get_thread_context");
+            return false;
         }
 
         voyager::device_t::thread_context kctx{};
@@ -4535,13 +4134,11 @@ namespace driver_bridge
             const uint32_t pid = attached_pid();
             note_tctx_kernel_failure("get_thread_context", pid, tid, gle, elapsed_ms);
             diag::log_tagged_fmt("driver",
-                "get_thread_context_kernel_failed tid=%u gle=%lu attached_pid=%u elapsed_ms=%llu fallback=user",
+                "get_thread_context_kernel_failed tid=%u gle=%lu attached_pid=%u elapsed_ms=%llu fail_closed=1",
                 tid,
                 gle,
                 pid,
                 static_cast<unsigned long long>(elapsed_ms));
-            if (usermode_get_thread_context(tid, ctx, "get_thread_context.kernel_failed"))
-                return true;
             SetLastError(gle);
             return false;
         }
@@ -4557,13 +4154,11 @@ namespace driver_bridge
         ctx.dr6 = kctx.dr6;  ctx.dr7 = kctx.dr7;
         if (ctx.rip == 0 || ctx.rsp == 0 || ctx.rflags == 0) {
             diag::log_tagged_fmt("driver",
-                "get_thread_context_REJECTED_ZERO tid=%u rip=0x%llX rsp=0x%llX rflags=0x%llX fallback=user",
+                "get_thread_context_REJECTED_ZERO tid=%u rip=0x%llX rsp=0x%llX rflags=0x%llX fail_closed=1",
                 tid,
                 static_cast<unsigned long long>(ctx.rip),
                 static_cast<unsigned long long>(ctx.rsp),
                 static_cast<unsigned long long>(ctx.rflags));
-            if (usermode_get_thread_context(tid, ctx, "get_thread_context.zero_kernel"))
-                return true;
             SetLastError(ERROR_INVALID_DATA);
             return false;
         }
@@ -4579,12 +4174,22 @@ namespace driver_bridge
     bool set_thread_context(uint32_t tid, const thread_context_t& ctx, uint64_t register_mask)
     {
         bool kernel_mode = false;
+        bool kernel_attached = false;
         {
             std::lock_guard<std::mutex> lk(g_state_mtx);
             kernel_mode = g_kernel_mode && device && device->is_connected();
+            kernel_attached = g_kernel_attached;
         }
-        if (!kernel_mode || tctx_kernel_bypass_active()) {
-            return usermode_set_thread_context(tid, ctx, register_mask, "set_thread_context.no_kernel");
+        if (!kernel_mode || !kernel_attached) {
+            diag::log_tagged_fmt("driver",
+                "set_thread_context_kernel_required tid=%u mask=0x%llX kernel=%d attached=%d bypass=%d",
+                tid,
+                static_cast<unsigned long long>(register_mask),
+                kernel_mode ? 1 : 0,
+                kernel_attached ? 1 : 0,
+                tctx_kernel_bypass_active() ? 1 : 0);
+            require_kernel_fail("set_thread_context");
+            return false;
         }
 
         voyager::device_t::thread_context kctx{};
@@ -4604,7 +4209,7 @@ namespace driver_bridge
             const uint32_t pid = attached_pid();
             note_tctx_kernel_failure("set_thread_context", pid, tid, gle, elapsed_ms);
             diag::log_tagged_fmt("driver",
-                "set_thread_context_KERNEL_FAILED tid=%u mask=0x%llX rip=0x%llX rsp=0x%llX attached_pid=%u kernel_mode=%d gle=%lu elapsed_ms=%llu fallback=user",
+                "set_thread_context_KERNEL_FAILED tid=%u mask=0x%llX rip=0x%llX rsp=0x%llX attached_pid=%u kernel_mode=%d gle=%lu elapsed_ms=%llu fail_closed=1",
                 tid,
                 static_cast<unsigned long long>(register_mask),
                 static_cast<unsigned long long>(ctx.rip),
@@ -4613,8 +4218,6 @@ namespace driver_bridge
                 kernel_mode ? 1 : 0,
                 gle,
                 static_cast<unsigned long long>(elapsed_ms));
-            if (usermode_set_thread_context(tid, ctx, register_mask, "set_thread_context.kernel_failed"))
-                return true;
             SetLastError(gle);
         } else {
             note_tctx_kernel_success();
@@ -4632,23 +4235,29 @@ namespace driver_bridge
     bool suspend_thread(uint32_t tid, uint32_t* prev_count)
     {
         bool kernel_mode = false;
+        bool kernel_attached = false;
         {
             std::lock_guard<std::mutex> lk(g_state_mtx);
             kernel_mode = g_kernel_mode && device && device->is_connected();
+            kernel_attached = g_kernel_attached;
         }
-        if (!kernel_mode) {
-            return usermode_suspend_thread(tid, prev_count, "suspend_thread.no_kernel");
+        if (!kernel_mode || !kernel_attached) {
+            diag::log_tagged_fmt("driver",
+                "suspend_thread_kernel_required tid=%u kernel=%d attached=%d",
+                tid,
+                kernel_mode ? 1 : 0,
+                kernel_attached ? 1 : 0);
+            require_kernel_fail("suspend_thread");
+            return false;
         }
 
         bool ok = device->suspend_thread(tid, prev_count);
         if (!ok) {
             DWORD gle = GetLastError();
             diag::log_tagged_fmt("driver",
-                "suspend_thread_kernel_failed tid=%u gle=%lu fallback=user",
+                "suspend_thread_kernel_failed tid=%u gle=%lu fail_closed=1",
                 tid,
                 gle);
-            if (usermode_suspend_thread(tid, prev_count, "suspend_thread.kernel_failed"))
-                return true;
             SetLastError(gle);
         }
         return ok;
@@ -4657,23 +4266,29 @@ namespace driver_bridge
     bool resume_thread(uint32_t tid, uint32_t* prev_count)
     {
         bool kernel_mode = false;
+        bool kernel_attached = false;
         {
             std::lock_guard<std::mutex> lk(g_state_mtx);
             kernel_mode = g_kernel_mode && device && device->is_connected();
+            kernel_attached = g_kernel_attached;
         }
-        if (!kernel_mode) {
-            return usermode_resume_thread(tid, prev_count, "resume_thread.no_kernel");
+        if (!kernel_mode || !kernel_attached) {
+            diag::log_tagged_fmt("driver",
+                "resume_thread_kernel_required tid=%u kernel=%d attached=%d",
+                tid,
+                kernel_mode ? 1 : 0,
+                kernel_attached ? 1 : 0);
+            require_kernel_fail("resume_thread");
+            return false;
         }
 
         bool ok = device->resume_thread(tid, prev_count);
         if (!ok) {
             DWORD gle = GetLastError();
             diag::log_tagged_fmt("driver",
-                "resume_thread_kernel_failed tid=%u gle=%lu fallback=user",
+                "resume_thread_kernel_failed tid=%u gle=%lu fail_closed=1",
                 tid,
                 gle);
-            if (usermode_resume_thread(tid, prev_count, "resume_thread.kernel_failed"))
-                return true;
             SetLastError(gle);
         }
         return ok;
@@ -4681,28 +4296,129 @@ namespace driver_bridge
 
     bool query_thread_information(uint32_t tid, uint32_t info_class, void* buffer, uint32_t buffer_size, uint32_t* return_length)
     {
+        if (return_length != nullptr)
+            *return_length = 0;
         if (tid == 0 || buffer == nullptr || buffer_size == 0)
             return false;
-
-        using NtQueryInformationThread_fn = LONG(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
-        static auto pNtQueryInformationThread = reinterpret_cast<NtQueryInformationThread_fn>(
-            GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
-        if (pNtQueryInformationThread == nullptr)
+        if (info_class != 0)
             return false;
 
-        unique_handle thread_handle(OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(tid)));
-        if (!thread_handle) {
-            thread_handle.reset(OpenThread(THREAD_QUERY_INFORMATION, FALSE, static_cast<DWORD>(tid)));
-            if (!thread_handle)
-                return false;
+        bool kernel_mode = false;
+        bool kernel_attached = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+            kernel_attached = g_kernel_attached;
+        }
+        if (!kernel_mode || !kernel_attached) {
+            diag::log_tagged_fmt("driver",
+                "query_thread_information_kernel_required tid=%u class=%u size=%u kernel=%d attached=%d",
+                tid,
+                info_class,
+                buffer_size,
+                kernel_mode ? 1 : 0,
+                kernel_attached ? 1 : 0);
+            require_kernel_fail("query_thread_information");
+            return false;
         }
 
-        ULONG returned = 0;
-        LONG status = pNtQueryInformationThread(thread_handle.get(), static_cast<ULONG>(info_class),
-                                                buffer, static_cast<ULONG>(buffer_size), &returned);
+        voyager::detail::thread_query_information_request info{};
+        if (!device->query_thread_basic_information(tid, info)) {
+            diag::log_tagged_fmt("driver",
+                "query_thread_information_kernel_failed tid=%u status=0x%08X",
+                tid,
+                info.status);
+            SetLastError(ERROR_GEN_FAILURE);
+            return false;
+        }
+
+        struct teb_basic_t {
+            long      exit_status;
+            void*     teb_base;
+            void*     unique_process;
+            void*     unique_thread;
+            uintptr_t affinity_mask;
+            long      priority;
+            long      base_priority;
+        };
+        if (buffer_size < sizeof(teb_basic_t)) {
+            SetLastError(ERROR_INSUFFICIENT_BUFFER);
+            return false;
+        }
+        teb_basic_t out{};
+        out.exit_status = static_cast<long>(info.exit_status);
+        out.teb_base = reinterpret_cast<void*>(static_cast<uintptr_t>(info.teb_base));
+        out.unique_process = reinterpret_cast<void*>(static_cast<uintptr_t>(info.client_process));
+        out.unique_thread = reinterpret_cast<void*>(static_cast<uintptr_t>(info.client_thread));
+        out.affinity_mask = static_cast<uintptr_t>(info.affinity_mask);
+        out.priority = static_cast<long>(info.priority);
+        out.base_priority = static_cast<long>(info.base_priority);
+        std::memcpy(buffer, &out, sizeof(out));
         if (return_length != nullptr)
-            *return_length = static_cast<uint32_t>(returned);
-        return status >= 0;
+            *return_length = sizeof(out);
+        clear_last_error_after_success("query_thread_information_kernel");
+        return true;
+    }
+
+    bool terminate_thread(uint32_t tid, uint32_t exit_status)
+    {
+        if (tid == 0)
+            return false;
+        bool kernel_mode = false;
+        bool kernel_attached = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+            kernel_attached = g_kernel_attached;
+        }
+        if (!kernel_mode || !kernel_attached) {
+            diag::log_tagged_fmt("driver",
+                "terminate_thread_kernel_required tid=%u exit=0x%08X kernel=%d attached=%d",
+                tid,
+                exit_status,
+                kernel_mode ? 1 : 0,
+                kernel_attached ? 1 : 0);
+            require_kernel_fail("terminate_thread");
+            return false;
+        }
+        const bool ok = device->terminate_thread(tid, exit_status);
+        diag::log_tagged_fmt("driver",
+            "terminate_thread_kernel tid=%u exit=0x%08X ok=%d",
+            tid,
+            exit_status,
+            ok ? 1 : 0);
+        if (ok)
+            clear_last_error_after_success("terminate_thread_kernel");
+        return ok;
+    }
+
+    bool close_process_handle(uint32_t pid, uint64_t handle_value)
+    {
+        if (pid == 0 || handle_value == 0)
+            return false;
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            diag::log_tagged_fmt("driver",
+                "close_process_handle_kernel_required pid=%u handle=0x%llX kernel=%d",
+                pid,
+                static_cast<unsigned long long>(handle_value),
+                kernel_mode ? 1 : 0);
+            require_kernel_fail("close_process_handle");
+            return false;
+        }
+        const bool ok = device->close_process_handle(pid, handle_value);
+        diag::log_tagged_fmt("driver",
+            "close_process_handle_kernel pid=%u handle=0x%llX ok=%d",
+            pid,
+            static_cast<unsigned long long>(handle_value),
+            ok ? 1 : 0);
+        if (ok)
+            clear_last_error_after_success("close_process_handle_kernel");
+        return ok;
     }
 
 
@@ -5288,12 +5004,25 @@ namespace driver_bridge
     bool set_hardware_breakpoint(uint32_t tid, int index, uint64_t address, int type, int size)
     {
         bool kernel_mode = false;
+        bool kernel_attached = false;
         {
             std::lock_guard<std::mutex> lk(g_state_mtx);
             kernel_mode = g_kernel_mode && device && device->is_connected();
+            kernel_attached = g_kernel_attached;
         }
-        if (!kernel_mode || tctx_kernel_bypass_active()) {
-            return usermode_set_hardware_breakpoint(tid, index, address, type, size);
+        if (!kernel_mode || !kernel_attached) {
+            diag::log_tagged_fmt("driver",
+                "set_hardware_breakpoint_kernel_required tid=%u index=%d addr=0x%llX type=%d size=%d kernel=%d attached=%d bypass=%d",
+                tid,
+                index,
+                static_cast<unsigned long long>(address),
+                type,
+                size,
+                kernel_mode ? 1 : 0,
+                kernel_attached ? 1 : 0,
+                tctx_kernel_bypass_active() ? 1 : 0);
+            require_kernel_fail("set_hardware_breakpoint");
+            return false;
         }
 
         const uint64_t kernel_t0 = static_cast<uint64_t>(GetTickCount64());
@@ -5304,7 +5033,7 @@ namespace driver_bridge
             const uint32_t pid = attached_pid();
             note_tctx_kernel_failure("set_hardware_breakpoint", pid, tid, gle, elapsed_ms);
             diag::log_tagged_fmt("driver",
-                "set_hardware_breakpoint_kernel_failed pid=%u tid=%u index=%d addr=0x%llX type=%d size=%d gle=%lu elapsed_ms=%llu fallback=user",
+                "set_hardware_breakpoint_kernel_failed pid=%u tid=%u index=%d addr=0x%llX type=%d size=%d gle=%lu elapsed_ms=%llu fail_closed=1",
                 pid,
                 tid,
                 index,
@@ -5313,8 +5042,6 @@ namespace driver_bridge
                 size,
                 gle,
                 static_cast<unsigned long long>(elapsed_ms));
-            if (usermode_set_hardware_breakpoint(tid, index, address, type, size))
-                return true;
             SetLastError(gle);
         } else {
             note_tctx_kernel_success();
@@ -5325,12 +5052,22 @@ namespace driver_bridge
     bool clear_hardware_breakpoint(uint32_t tid, int index)
     {
         bool kernel_mode = false;
+        bool kernel_attached = false;
         {
             std::lock_guard<std::mutex> lk(g_state_mtx);
             kernel_mode = g_kernel_mode && device && device->is_connected();
+            kernel_attached = g_kernel_attached;
         }
-        if (!kernel_mode || tctx_kernel_bypass_active()) {
-            return usermode_clear_hardware_breakpoint(tid, index);
+        if (!kernel_mode || !kernel_attached) {
+            diag::log_tagged_fmt("driver",
+                "clear_hardware_breakpoint_kernel_required tid=%u index=%d kernel=%d attached=%d bypass=%d",
+                tid,
+                index,
+                kernel_mode ? 1 : 0,
+                kernel_attached ? 1 : 0,
+                tctx_kernel_bypass_active() ? 1 : 0);
+            require_kernel_fail("clear_hardware_breakpoint");
+            return false;
         }
 
         const uint64_t kernel_t0 = static_cast<uint64_t>(GetTickCount64());
@@ -5341,14 +5078,12 @@ namespace driver_bridge
             const uint32_t pid = attached_pid();
             note_tctx_kernel_failure("clear_hardware_breakpoint", pid, tid, gle, elapsed_ms);
             diag::log_tagged_fmt("driver",
-                "clear_hardware_breakpoint_kernel_failed pid=%u tid=%u index=%d gle=%lu elapsed_ms=%llu fallback=user",
+                "clear_hardware_breakpoint_kernel_failed pid=%u tid=%u index=%d gle=%lu elapsed_ms=%llu fail_closed=1",
                 pid,
                 tid,
                 index,
                 gle,
                 static_cast<unsigned long long>(elapsed_ms));
-            if (usermode_clear_hardware_breakpoint(tid, index))
-                return true;
             SetLastError(gle);
         } else {
             note_tctx_kernel_success();

@@ -1924,26 +1924,26 @@ json preview_floats(const std::vector<std::uint8_t>& bytes)
     return arr;
 }
 
-json register_snapshot(const CONTEXT& ctx)
+json register_snapshot(const driver_bridge::thread_context_t& ctx)
 {
     return json{
-        {"rip", sa_format_address(static_cast<std::uint64_t>(ctx.Rip))},
-        {"rsp", sa_format_address(static_cast<std::uint64_t>(ctx.Rsp))},
-        {"rbp", sa_format_address(static_cast<std::uint64_t>(ctx.Rbp))},
-        {"rax", sa_format_address(static_cast<std::uint64_t>(ctx.Rax))},
-        {"rbx", sa_format_address(static_cast<std::uint64_t>(ctx.Rbx))},
-        {"rcx", sa_format_address(static_cast<std::uint64_t>(ctx.Rcx))},
-        {"rdx", sa_format_address(static_cast<std::uint64_t>(ctx.Rdx))},
-        {"rsi", sa_format_address(static_cast<std::uint64_t>(ctx.Rsi))},
-        {"rdi", sa_format_address(static_cast<std::uint64_t>(ctx.Rdi))},
-        {"r8", sa_format_address(static_cast<std::uint64_t>(ctx.R8))},
-        {"r9", sa_format_address(static_cast<std::uint64_t>(ctx.R9))},
-        {"r10", sa_format_address(static_cast<std::uint64_t>(ctx.R10))},
-        {"r11", sa_format_address(static_cast<std::uint64_t>(ctx.R11))},
-        {"r12", sa_format_address(static_cast<std::uint64_t>(ctx.R12))},
-        {"r13", sa_format_address(static_cast<std::uint64_t>(ctx.R13))},
-        {"r14", sa_format_address(static_cast<std::uint64_t>(ctx.R14))},
-        {"r15", sa_format_address(static_cast<std::uint64_t>(ctx.R15))}
+        {"rip", sa_format_address(ctx.rip)},
+        {"rsp", sa_format_address(ctx.rsp)},
+        {"rbp", sa_format_address(ctx.rbp)},
+        {"rax", sa_format_address(ctx.rax)},
+        {"rbx", sa_format_address(ctx.rbx)},
+        {"rcx", sa_format_address(ctx.rcx)},
+        {"rdx", sa_format_address(ctx.rdx)},
+        {"rsi", sa_format_address(ctx.rsi)},
+        {"rdi", sa_format_address(ctx.rdi)},
+        {"r8", sa_format_address(ctx.r8)},
+        {"r9", sa_format_address(ctx.r9)},
+        {"r10", sa_format_address(ctx.r10)},
+        {"r11", sa_format_address(ctx.r11)},
+        {"r12", sa_format_address(ctx.r12)},
+        {"r13", sa_format_address(ctx.r13)},
+        {"r14", sa_format_address(ctx.r14)},
+        {"r15", sa_format_address(ctx.r15)}
     };
 }
 
@@ -1952,27 +1952,6 @@ std::uint64_t stack_arg64(std::uint32_t pid, std::uint64_t rsp, std::uint32_t in
     std::uint64_t value = 0;
     read_u64(pid, rsp + 0x28ull + static_cast<std::uint64_t>(index) * 8ull, value);
     return value;
-}
-
-bool enable_debug_privilege()
-{
-    HANDLE token = nullptr;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token))
-        return false;
-    LUID luid{};
-    if (!LookupPrivilegeValueW(nullptr, SE_DEBUG_NAME, &luid))
-    {
-        CloseHandle(token);
-        return false;
-    }
-    TOKEN_PRIVILEGES tp{};
-    tp.PrivilegeCount = 1;
-    tp.Privileges[0].Luid = luid;
-    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-    const BOOL ok = AdjustTokenPrivileges(token, FALSE, &tp, sizeof(tp), nullptr, nullptr);
-    const DWORD gle = GetLastError();
-    CloseHandle(token);
-    return ok && gle == ERROR_SUCCESS;
 }
 
 std::uint32_t matrix_run_count(const std::vector<std::uint8_t>& bytes, std::size_t off, std::size_t stride, double world_max, std::uint32_t max_count)
@@ -2201,21 +2180,21 @@ json scan_memory_cbuffer_candidates(std::uint32_t pid, std::size_t limit, double
     return out;
 }
 
-json collect_cbuffer_candidates_from_context(std::uint32_t pid, const CONTEXT& ctx, const store::dx_hook_record_t& record)
+json collect_cbuffer_candidates_from_context(std::uint32_t pid, const driver_bridge::thread_context_t& ctx, const store::dx_hook_record_t& record)
 {
     json out = json::array();
     std::set<std::uint64_t> seen;
     const std::string api = lower_ascii(record.api);
     const bool cbuffer_bind = record.action == "cbuffer_bind";
     if (cbuffer_bind && api.find("d3d11") != std::string::npos)
-        collect_resource_array_candidates(pid, static_cast<std::uint64_t>(ctx.Rdx), static_cast<std::uint64_t>(ctx.R8), static_cast<std::uint64_t>(ctx.R9), out, seen, record.max_captures ? record.max_captures : 32);
+        collect_resource_array_candidates(pid, ctx.rdx, ctx.r8, ctx.r9, out, seen, record.max_captures ? record.max_captures : 32);
     if (cbuffer_bind && api.find("d3d12") != std::string::npos)
     {
-        auto row = make_cbuffer_candidate(pid, static_cast<int>(ctx.Rdx), static_cast<std::uint64_t>(ctx.R8), 0, 0, "d3d12_root_cbv_gpu_va_candidate", 0.40);
+        auto row = make_cbuffer_candidate(pid, static_cast<int>(ctx.rdx), ctx.r8, 0, 0, "d3d12_root_cbv_gpu_va_candidate", 0.40);
         if (row)
             append_unique_candidate(out, *row, seen, record.max_captures ? record.max_captures : 32);
     }
-    collect_pointer_candidates(pid, static_cast<std::uint64_t>(ctx.Rcx), 0x1000, "d3d_context_object_pointer_snapshot", -1, out, seen, record.max_captures ? record.max_captures : 32);
+    collect_pointer_candidates(pid, ctx.rcx, 0x1000, "d3d_context_object_pointer_snapshot", -1, out, seen, record.max_captures ? record.max_captures : 32);
     if (record.capture_cbuffers && out.size() < std::min<std::uint32_t>(record.max_captures ? record.max_captures : 32, 16))
     {
         json scanned = scan_memory_cbuffer_candidates(pid, 16, 1000000.0, 256);
@@ -2225,42 +2204,42 @@ json collect_cbuffer_candidates_from_context(std::uint32_t pid, const CONTEXT& c
     return out;
 }
 
-json dx_args_json(std::uint32_t pid, const CONTEXT& ctx, const store::dx_hook_record_t& record)
+json dx_args_json(std::uint32_t pid, const driver_bridge::thread_context_t& ctx, const store::dx_hook_record_t& record)
 {
     json args;
-    args["this"] = sa_format_address(static_cast<std::uint64_t>(ctx.Rcx));
-    args["arg0"] = static_cast<std::uint64_t>(ctx.Rdx);
-    args["arg1"] = static_cast<std::uint64_t>(ctx.R8);
-    args["arg2"] = static_cast<std::uint64_t>(ctx.R9);
-    args["stack_arg0"] = stack_arg64(pid, static_cast<std::uint64_t>(ctx.Rsp), 0);
-    args["stack_arg1"] = stack_arg64(pid, static_cast<std::uint64_t>(ctx.Rsp), 1);
+    args["this"] = sa_format_address(ctx.rcx);
+    args["arg0"] = ctx.rdx;
+    args["arg1"] = ctx.r8;
+    args["arg2"] = ctx.r9;
+    args["stack_arg0"] = stack_arg64(pid, ctx.rsp, 0);
+    args["stack_arg1"] = stack_arg64(pid, ctx.rsp, 1);
     if (record.action == "present")
     {
-        args["swap_chain"] = sa_format_address(static_cast<std::uint64_t>(ctx.Rcx));
-        args["sync_interval"] = static_cast<std::uint64_t>(ctx.Rdx);
-        args["flags"] = static_cast<std::uint64_t>(ctx.R8);
+        args["swap_chain"] = sa_format_address(ctx.rcx);
+        args["sync_interval"] = ctx.rdx;
+        args["flags"] = ctx.r8;
     }
     else if (record.action == "cbuffer_bind")
     {
         if (lower_ascii(record.api).find("d3d11") != std::string::npos)
         {
-            args["start_slot"] = static_cast<std::uint64_t>(ctx.Rdx);
-            args["buffer_count"] = static_cast<std::uint64_t>(ctx.R8);
-            args["buffer_array"] = sa_format_address(static_cast<std::uint64_t>(ctx.R9));
+            args["start_slot"] = ctx.rdx;
+            args["buffer_count"] = ctx.r8;
+            args["buffer_array"] = sa_format_address(ctx.r9);
         }
         else if (lower_ascii(record.api).find("d3d12") != std::string::npos)
         {
-            args["root_parameter_index"] = static_cast<std::uint64_t>(ctx.Rdx);
-            args["buffer_location"] = sa_format_address(static_cast<std::uint64_t>(ctx.R8));
+            args["root_parameter_index"] = ctx.rdx;
+            args["buffer_location"] = sa_format_address(ctx.r8);
         }
     }
     else if (record.action == "draw")
     {
-        args["index_or_vertex_count"] = static_cast<std::uint64_t>(ctx.Rdx);
-        args["instance_or_start_index"] = static_cast<std::uint64_t>(ctx.R8);
-        args["start_index_or_vertex"] = static_cast<std::uint64_t>(ctx.R9);
-        args["stack_draw_arg0"] = stack_arg64(pid, static_cast<std::uint64_t>(ctx.Rsp), 0);
-        args["stack_draw_arg1"] = stack_arg64(pid, static_cast<std::uint64_t>(ctx.Rsp), 1);
+        args["index_or_vertex_count"] = ctx.rdx;
+        args["instance_or_start_index"] = ctx.r8;
+        args["start_index_or_vertex"] = ctx.r9;
+        args["stack_draw_arg0"] = stack_arg64(pid, ctx.rsp, 0);
+        args["stack_draw_arg1"] = stack_arg64(pid, ctx.rsp, 1);
     }
     return args;
 }
@@ -2276,13 +2255,13 @@ void append_capture(store::dx_hook_record_t record, json capture)
 
 json make_debug_capture(std::uint32_t pid,
                         std::uint32_t tid,
-                        const CONTEXT& ctx,
+                        const driver_bridge::thread_context_t& ctx,
                         const store::dx_hook_record_t& record,
                         std::uint64_t exception_address,
                         const std::string& backend)
 {
     json cap;
-    cap["event_type"] = backend == "hardware_breakpoint_debug_event" ? "breakpoint_hit" : "snapshot";
+    cap["event_type"] = backend == "hardware_breakpoint_kernel_context" ? "breakpoint_hit" : "snapshot";
     cap["backend"] = backend;
     cap["timestamp_ms"] = unix_time_ms();
     cap["process_id"] = pid;
@@ -2311,7 +2290,7 @@ json make_debug_capture(std::uint32_t pid,
         cap["cbuffers"] = json::array();
     cap["evidence"] = {
         {"source", backend},
-        {"thread_context_captured", backend == "hardware_breakpoint_debug_event"},
+        {"thread_context_captured", backend == "hardware_breakpoint_kernel_context"},
         {"cbuffer_source", record.capture_cbuffers ? "d3d_bind_args_context_pointer_or_bounded_memory_snapshot" : "disabled"},
         {"gpu_texture_readback", false}
     };
@@ -2374,55 +2353,70 @@ std::vector<json> stored_cbuffer_rows(std::uint32_t pid)
     return out;
 }
 
-void close_debug_event_handles(const DEBUG_EVENT& evt)
+std::uint64_t context_dr_address(const driver_bridge::thread_context_t& ctx, int slot)
 {
-    switch (evt.dwDebugEventCode)
+    switch (slot)
     {
-    case CREATE_PROCESS_DEBUG_EVENT:
-        if (evt.u.CreateProcessInfo.hFile) CloseHandle(evt.u.CreateProcessInfo.hFile);
-        if (evt.u.CreateProcessInfo.hThread) CloseHandle(evt.u.CreateProcessInfo.hThread);
-        if (evt.u.CreateProcessInfo.hProcess) CloseHandle(evt.u.CreateProcessInfo.hProcess);
-        break;
-    case CREATE_THREAD_DEBUG_EVENT:
-        if (evt.u.CreateThread.hThread) CloseHandle(evt.u.CreateThread.hThread);
-        break;
-    case LOAD_DLL_DEBUG_EVENT:
-        if (evt.u.LoadDll.hFile) CloseHandle(evt.u.LoadDll.hFile);
-        break;
-    default:
-        break;
+    case 0: return ctx.dr0;
+    case 1: return ctx.dr1;
+    case 2: return ctx.dr2;
+    case 3: return ctx.dr3;
+    default: return 0;
     }
 }
 
-bool capture_dx_breakpoint_hit(std::uint32_t pid, const DEBUG_EVENT& evt)
+bool dx_context_matches_record(const driver_bridge::thread_context_t& ctx, const store::dx_hook_record_t& record)
 {
-    HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, evt.dwThreadId);
-    if (!thread)
+    if (record.target_va == 0 || record.hw_slot < 0 || record.hw_slot > 3)
         return false;
-    CONTEXT ctx{};
-    ctx.ContextFlags = CONTEXT_INTEGER | CONTEXT_CONTROL | CONTEXT_DEBUG_REGISTERS;
-    if (!GetThreadContext(thread, &ctx))
+    const std::uint64_t slot_address = context_dr_address(ctx, record.hw_slot);
+    const bool slot_matches = slot_address == record.target_va;
+    const bool dr6_hit = (ctx.dr6 & (1ull << static_cast<unsigned>(record.hw_slot))) != 0;
+    if (dr6_hit && slot_matches)
+        return true;
+    return slot_matches && ctx.rip == record.target_va;
+}
+
+void remove_dx_thread(std::uint32_t pid, std::uint32_t tid)
+{
+    for (auto record : store::list_dx_hooks(pid))
     {
-        CloseHandle(thread);
-        return false;
+        auto& tids = record.tids;
+        const auto before = tids.size();
+        tids.erase(std::remove(tids.begin(), tids.end(), tid), tids.end());
+        if (tids.size() != before)
+            store::update_dx_hook(record);
     }
-    const std::uint64_t exception_address = reinterpret_cast<std::uint64_t>(evt.u.Exception.ExceptionRecord.ExceptionAddress);
+}
+
+bool capture_dx_breakpoint_hit(std::uint32_t pid, std::uint32_t tid, const driver_bridge::thread_context_t& ctx)
+{
     bool matched = false;
     for (auto record : store::list_dx_hooks(pid))
     {
-        if (record.target_va == 0)
+        if (!dx_context_matches_record(ctx, record))
             continue;
-        if (record.target_va != static_cast<std::uint64_t>(ctx.Rip) && record.target_va != exception_address)
-            continue;
-        append_capture(record, make_debug_capture(pid, evt.dwThreadId, ctx, record, exception_address, "hardware_breakpoint_debug_event"));
+        append_capture(record, make_debug_capture(pid, tid, ctx, record, ctx.rip, "hardware_breakpoint_kernel_context"));
         matched = true;
     }
     if (matched)
     {
-        ctx.EFlags |= 0x10000;
-        SetThreadContext(thread, &ctx);
+        driver_bridge::thread_context_t next = ctx;
+        next.rflags |= 0x10000ull;
+        next.dr6 = 0;
+        SetLastError(ERROR_SUCCESS);
+        const bool set_ok = driver_bridge::set_thread_context(tid, next, (1ull << 17) | (1ull << 22));
+        const DWORD gle = set_ok ? ERROR_SUCCESS : GetLastError();
+        diag::log_tagged_fmt("dx_hook",
+            "kernel_context_hit_resume pid=%u tid=%u set_ok=%d gle=%lu rip=%s dr6=0x%llX dr7=0x%llX",
+            pid,
+            tid,
+            set_ok ? 1 : 0,
+            static_cast<unsigned long>(gle),
+            sa_format_address(ctx.rip).c_str(),
+            static_cast<unsigned long long>(ctx.dr6),
+            static_cast<unsigned long long>(ctx.dr7));
     }
-    CloseHandle(thread);
     return matched;
 }
 
@@ -2454,6 +2448,43 @@ void clear_dx_record_breakpoints(std::uint32_t pid)
     }
 }
 
+std::vector<std::uint32_t> dx_armed_threads(std::uint32_t pid)
+{
+    std::vector<std::uint32_t> tids;
+    for (const auto& record : store::list_dx_hooks(pid))
+    {
+        for (const auto tid : record.tids)
+        {
+            if (tid != 0 && std::find(tids.begin(), tids.end(), tid) == tids.end())
+                tids.push_back(tid);
+        }
+    }
+    return tids;
+}
+
+void poll_dx_thread_contexts(std::uint32_t pid)
+{
+    for (const auto tid : dx_armed_threads(pid))
+    {
+        driver_bridge::thread_context_t ctx{};
+        SetLastError(ERROR_SUCCESS);
+        if (!driver_bridge::get_thread_context(tid, ctx))
+        {
+            const DWORD gle = GetLastError();
+            diag::log_tagged_fmt("dx_hook",
+                "kernel_context_poll_get_failed pid=%u tid=%u gle=%lu driver_error=%s",
+                pid,
+                tid,
+                static_cast<unsigned long>(gle),
+                driver_bridge::last_error().c_str());
+            if (gle == ERROR_INVALID_PARAMETER || gle == ERROR_NOT_FOUND || gle == ERROR_INVALID_HANDLE)
+                remove_dx_thread(pid, tid);
+            continue;
+        }
+        capture_dx_breakpoint_hit(pid, tid, ctx);
+    }
+}
+
 struct dx_debug_state_t
 {
     std::atomic<bool> running{false};
@@ -2473,73 +2504,50 @@ void dx_debug_loop()
 {
     auto& state = dx_debug_state();
     const std::uint32_t pid = state.pid.load(std::memory_order_acquire);
-    enable_debug_privilege();
-    if (pid == 0 || !DebugActiveProcess(pid))
+    if (pid == 0 || !driver_bridge::using_kernel_driver())
     {
-        state.error.store(GetLastError(), std::memory_order_release);
+        state.error.store(pid == 0 ? ERROR_INVALID_PARAMETER : ERROR_INVALID_HANDLE, std::memory_order_release);
         state.attached.store(false, std::memory_order_release);
         state.polling.store(false, std::memory_order_release);
         state.running.store(false, std::memory_order_release);
+        diag::log_tagged_fmt("dx_hook",
+            "kernel_context_loop_exit_invalid pid=%u kernel=%d",
+            pid,
+            driver_bridge::using_kernel_driver() ? 1 : 0);
         return;
     }
-    DebugSetProcessKillOnExit(FALSE);
     state.error.store(0, std::memory_order_release);
     state.attached.store(true, std::memory_order_release);
     for (const auto& th : threads_for(pid))
         arm_dx_records_for_thread(pid, th.tid);
-    bool initial_break_pending = true;
+    std::uint64_t poll_count = 0;
     while (state.polling.load(std::memory_order_acquire))
     {
+        if (!driver_bridge::using_kernel_driver())
+        {
+            state.error.store(ERROR_INVALID_HANDLE, std::memory_order_release);
+            state.polling.store(false, std::memory_order_release);
+            break;
+        }
         if (store::list_dx_hooks(pid).empty())
             break;
-        DEBUG_EVENT evt{};
-        if (!WaitForDebugEvent(&evt, 100))
-            continue;
-        DWORD continue_status = DBG_CONTINUE;
-        if (evt.dwDebugEventCode == EXCEPTION_DEBUG_EVENT)
+        if ((poll_count++ % 20) == 0)
         {
-            const DWORD code = evt.u.Exception.ExceptionRecord.ExceptionCode;
-            if (code == EXCEPTION_SINGLE_STEP)
-            {
-                if (!capture_dx_breakpoint_hit(pid, evt))
-                    continue_status = DBG_EXCEPTION_NOT_HANDLED;
-            }
-            else if (code == EXCEPTION_BREAKPOINT && evt.u.Exception.dwFirstChance != 0 && initial_break_pending)
-            {
-                initial_break_pending = false;
-                continue_status = DBG_CONTINUE;
-            }
-            else
-            {
-                continue_status = DBG_EXCEPTION_NOT_HANDLED;
-            }
+            for (const auto& th : threads_for(pid))
+                arm_dx_records_for_thread(pid, th.tid);
         }
-        else if (evt.dwDebugEventCode == CREATE_THREAD_DEBUG_EVENT)
-        {
-            arm_dx_records_for_thread(pid, evt.dwThreadId);
-        }
-        else if (evt.dwDebugEventCode == EXIT_THREAD_DEBUG_EVENT)
-        {
-            for (auto record : store::list_dx_hooks(pid))
-            {
-                auto& tids = record.tids;
-                tids.erase(std::remove(tids.begin(), tids.end(), evt.dwThreadId), tids.end());
-                store::update_dx_hook(record);
-            }
-        }
-        else if (evt.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT)
-        {
-            state.polling.store(false, std::memory_order_release);
-        }
-        close_debug_event_handles(evt);
-        ContinueDebugEvent(evt.dwProcessId, evt.dwThreadId, continue_status);
+        poll_dx_thread_contexts(pid);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     clear_dx_record_breakpoints(pid);
-    if (state.attached.exchange(false, std::memory_order_acq_rel))
-        DebugActiveProcessStop(pid);
+    state.attached.store(false, std::memory_order_release);
     state.polling.store(false, std::memory_order_release);
     state.pid.store(0, std::memory_order_release);
     state.running.store(false, std::memory_order_release);
+    diag::log_tagged_fmt("dx_hook",
+        "kernel_context_loop_exit pid=%u polls=%llu",
+        pid,
+        static_cast<unsigned long long>(poll_count));
 }
 
 bool start_dx_debug_loop(std::uint32_t pid, std::string& error)
@@ -2553,7 +2561,7 @@ bool start_dx_debug_loop(std::uint32_t pid, std::string& error)
                 arm_dx_records_for_thread(pid, th.tid);
             return true;
         }
-        error = "another DirectX debug-event consumer is already active";
+        error = "another DirectX kernel context consumer is already active";
         return false;
     }
     state.pid.store(pid, std::memory_order_release);
@@ -2565,7 +2573,7 @@ bool start_dx_debug_loop(std::uint32_t pid, std::string& error)
     {
         state.polling.store(false, std::memory_order_release);
         state.running.store(false, std::memory_order_release);
-        error = "failed to schedule DirectX debug-event consumer";
+        error = "failed to schedule DirectX kernel context consumer";
         return false;
     }
     for (int i = 0; i < 80; ++i)
@@ -2577,7 +2585,7 @@ bool start_dx_debug_loop(std::uint32_t pid, std::string& error)
         std::this_thread::sleep_for(std::chrono::milliseconds(25));
     }
     const DWORD gle = state.error.load(std::memory_order_acquire);
-    error = "DebugActiveProcess failed or timed out, error=" + std::to_string(static_cast<unsigned long>(gle));
+    error = "DirectX kernel context consumer failed or timed out, error=" + std::to_string(static_cast<unsigned long>(gle));
     return false;
 }
 
@@ -3090,8 +3098,9 @@ tool_result_t hook_manage(const json& params)
     result["target_name"] = target->name;
     result["target_hint"] = target->hint;
     result["callback_mode"] = callback_mode;
-    result["capture_backend"] = debug_started ? "hardware_breakpoint_debug_events" : "bounded_snapshot_fallback";
-    result["debug_event_consumer"] = debug_started;
+    result["capture_backend"] = debug_started ? "hardware_breakpoint_kernel_context" : "bounded_snapshot_fallback";
+    result["debug_event_consumer"] = false;
+    result["kernel_context_consumer"] = debug_started;
     result["fallback_reason"] = debug_started ? json(nullptr) : json(debug_error.empty() ? "snapshot mode requested" : debug_error);
     result["armed_threads"] = total_armed_threads;
     result["auxiliary_cbuffer_hook"] = std::move(auxiliary);
@@ -3107,7 +3116,7 @@ tool_result_t hook_manage(const json& params)
                          debug_started ? 1 : 0,
                          total_armed_threads,
                          static_cast<unsigned long long>(GetTickCount64() - started_ms));
-    return tool_result_t::ok(debug_started ? "DX hook armed with debug-event capture." : "DX hook recorded with bounded snapshot fallback.", result);
+    return tool_result_t::ok(debug_started ? "DX hook armed with kernel-context capture." : "DX hook recorded with bounded snapshot fallback.", result);
 }
 
 tool_result_t list_bound_cbuffers(const json& params)

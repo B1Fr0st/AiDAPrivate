@@ -14,7 +14,6 @@
 #include "decoder_pipeline.hpp"
 #include "script_engine.hpp"
 #include "tcp_stream_tracker.hpp"
-#include "page_guard_engine.hpp"
 #include "packet_callstack.hpp"
 #include "pre_encrypt_hook.hpp"
 #include "api_monitor.hpp"
@@ -22,6 +21,7 @@
 #include "protobuf_codec.hpp"
 #include "network_view.hpp"
 #include "mitm_proxy.hpp"
+#include "../debugger/page_guard_engine.hpp"
 #include "../infra/work_queue.hpp"
 #include "helpers/diag_log.hpp"
 #include "burp/burp_module.hpp"
@@ -214,6 +214,97 @@ static bool parse_json_u32_param(const json& params, const char* name, uint32_t&
     }
     error = std::string("'") + name + "' must be a number or numeric string";
     return false;
+}
+
+static bool parse_json_u64_param(const json& params, const char* name, uint64_t& out, std::string& error) {
+    if (!params.contains(name))
+        return true;
+    const auto& v = params[name];
+    if (v.is_number_unsigned()) {
+        out = v.get<uint64_t>();
+        return true;
+    }
+    if (v.is_number_integer()) {
+        const int64_t raw = v.get<int64_t>();
+        if (raw < 0) {
+            error = std::string("'") + name + "' must be unsigned";
+            return false;
+        }
+        out = static_cast<uint64_t>(raw);
+        return true;
+    }
+    if (v.is_string()) {
+        std::string s = v.get<std::string>();
+        auto not_space = [](unsigned char c) { return !std::isspace(c); };
+        s.erase(s.begin(), std::find_if(s.begin(), s.end(), not_space));
+        s.erase(std::find_if(s.rbegin(), s.rend(), not_space).base(), s.end());
+        if (s.empty()) {
+            error = std::string("'") + name + "' is empty";
+            return false;
+        }
+        char* end = nullptr;
+        errno = 0;
+        const unsigned long long raw = std::strtoull(s.c_str(), &end, 0);
+        if (errno != 0 || end == s.c_str() || *end != '\0') {
+            error = std::string("'") + name + "' must be an unsigned integer or hex string";
+            return false;
+        }
+        out = static_cast<uint64_t>(raw);
+        return true;
+    }
+    error = std::string("'") + name + "' must be a number or numeric string";
+    return false;
+}
+
+static json page_guard_install_failure_payload() {
+    const auto f = page_guard_engine::g_pg_engine.last_install_failure();
+    return json{
+        {"reason", f.reason},
+        {"detail", f.detail},
+        {"driver_status", f.driver_status},
+        {"driver_last_error", f.driver_last_error},
+        {"pid", f.pid},
+        {"win32_error", f.win32_error},
+        {"region_state", f.region_state},
+        {"region_protect", f.region_protect},
+        {"region_type", f.region_type},
+        {"attempted_protect", f.attempted_protect},
+        {"requested_addr", hex_u64(f.requested_addr)},
+        {"requested_size", f.requested_size},
+        {"guard_addr", hex_u64(f.guard_addr)},
+        {"guard_size", f.guard_size},
+        {"region_base", hex_u64(f.region_base)},
+        {"region_size", f.region_size}
+    };
+}
+
+static json page_guard_capture_payload(const page_guard_engine::pg_capture_record_t& c) {
+    const auto& m = c.metadata;
+    json out;
+    out["fault_address"] = hex_u64(m.fault_addr);
+    out["rip"] = hex_u64(m.rip);
+    out["rax"] = hex_u64(m.ctx_rax);
+    out["rcx"] = hex_u64(m.ctx_rcx);
+    out["rdx"] = hex_u64(m.ctx_rdx);
+    out["exception_code"] = m.exception_code;
+    out["access_type"] = m.access_type;
+    out["timestamp_tsc"] = m.timestamp;
+    page_guard_engine::serialize_payload_fields(out, c);
+    return out;
+}
+
+static json page_guard_sessions_payload() {
+    json arr = json::array();
+    for (const auto& s : page_guard_engine::g_pg_engine.list_sessions()) {
+        arr.push_back(json{
+            {"session_id", s.session_id},
+            {"pid", s.pid},
+            {"target_addr", hex_u64(s.target_addr)},
+            {"region_size", s.region_size},
+            {"pending_captures", s.pending_captures}
+        });
+    }
+    return arr;
 }
 
 static std::uint32_t pre_encrypt_armed_thread_count_locked() {
@@ -3799,14 +3890,8 @@ void register_network_tools(mcp_standalone::server_t& srv) {
 
     register_compat(srv, {
         OBFSTR("network_pg_sniff"), OBFSTR("network"),
-        OBFSTR("Pre-encryption page guard sniffer. Installs a VEH-based PAGE_GUARD trap on a "
-               "target memory region in another process to capture all reads/writes before "
-               "encryption occurs. Uses page-fault + single-step re-arm (no HW breakpoint limit). "
-               "Capture output includes bounded plaintext and hex previews from the guarded region. "
-               "Operations: 'install' (pid, address, size) returns session_id; "
-               "'get_captures' (session_id) drains pending captures; "
-               "'uninstall' (session_id) removes the guard and restores protection; "
-               "'list_sessions' lists all active sessions."),
+        OBFSTR("Pre-encryption page guard sniffer. PAGE_GUARD capture requires a WhosWho driver-backed "
+               "capture backend; the legacy user-mode VEH backend is disabled."),
         {{OBFSTR("operation"),  OBFSTR("string"), OBFSTR("install|get_captures|uninstall|list_sessions"), true},
          {OBFSTR("pid"),        OBFSTR("number"), OBFSTR("Target process ID (install)"), false},
          {OBFSTR("address"),    OBFSTR("string"), OBFSTR("Target memory address as hex string, e.g. '0x7FFE0000' (install)"), false},
@@ -3816,171 +3901,53 @@ void register_network_tools(mcp_standalone::server_t& srv) {
         [](const json& params) -> tool_result_t {
             const std::string op = params.value("operation", "");
             diag::log_tagged_fmt("net_tools", "network_pg_sniff op=%s", op.c_str());
-
-            if (op == "install") {
-                uint32_t pid = params.value("pid", 0u);
-                if (pid == 0)
-                    return tool_result_t::error("'pid' is required for install");
-
-
-                uint64_t addr = 0;
-                if (params.contains("address")) {
-                    auto& av = params["address"];
-                    if (av.is_string()) {
-                        std::string s = av.get<std::string>();
-                        char* end = nullptr;
-                        errno = 0;
-                        unsigned long long v = strtoull(s.c_str(), &end, 0);
-                        if (errno == 0 && end != s.c_str()) addr = static_cast<uint64_t>(v);
-                    } else if (av.is_number()) {
-                        addr = av.get<uint64_t>();
-                    }
-                }
-                if (addr == 0)
-                    return tool_result_t::error("'address' is required for install");
-
-                uint64_t size = params.value("size", static_cast<uint64_t>(0x1000));
-                uint32_t max_records = params.value("max_records_per_drain", 32u);
-                if (max_records == 0)
-                    max_records = 32;
-                if (max_records > 256)
-                    max_records = 256;
-
-                const ULONGLONG t0 = GetTickCount64();
-                diag::log_tagged_fmt("net_tools", "network_pg_sniff install pid=%u addr=0x%llX size=%llu max_drain=%u", pid, static_cast<unsigned long long>(addr), static_cast<unsigned long long>(size), max_records);
-                uint32_t sid = page_guard_engine::g_pg_engine.install(pid, addr, size, true, max_records);
-                diag::log_tagged_fmt("net_tools", "network_pg_sniff install sid=%u max_drain=%u elapsed_ms=%llu", sid, max_records, static_cast<unsigned long long>(GetTickCount64() - t0));
-                if (sid == 0) {
-                    auto failure = page_guard_engine::g_pg_engine.last_install_failure();
-                    json d;
-                    char buf[32];
-                    d["success"] = false;
-                    d["reason"] = failure.reason.empty() ? "install_failed" : failure.reason;
-                    d["detail"] = failure.detail;
-                    d["pid"] = failure.pid != 0 ? failure.pid : pid;
-                    qsnprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(failure.requested_addr != 0 ? failure.requested_addr : addr));
-                    d["requested_address"] = buf;
-                    d["requested_size"] = failure.requested_size != 0 ? failure.requested_size : size;
-                    qsnprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(failure.guard_addr));
-                    d["guard_address"] = buf;
-                    d["guard_size"] = failure.guard_size;
-                    qsnprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(failure.region_base));
-                    d["region_base"] = buf;
-                    d["region_size"] = failure.region_size;
-                    d["region_state"] = failure.region_state;
-                    d["region_protect"] = failure.region_protect;
-                    d["region_type"] = failure.region_type;
-                    d["attempted_protect"] = failure.attempted_protect;
-                    d["win32_error"] = failure.win32_error;
-                    d["driver_status"] = failure.driver_status;
-                    d["driver_last_error"] = failure.driver_last_error;
-                    const std::string reason = d["reason"].get<std::string>();
-                    diag::log_tagged_fmt("net_tools", "network_pg_sniff install_failed reason=%s detail=%s requested=0x%llX size=%llu guard=0x%llX guard_size=%llu region_base=0x%llX region_size=%llu state=0x%08X protect=0x%08X type=0x%08X attempted=0x%08X win32=%u driver_status=%s driver_last_error=%s",
-                        reason.c_str(),
-                        failure.detail.c_str(),
-                        static_cast<unsigned long long>(failure.requested_addr),
-                        static_cast<unsigned long long>(failure.requested_size),
-                        static_cast<unsigned long long>(failure.guard_addr),
-                        static_cast<unsigned long long>(failure.guard_size),
-                        static_cast<unsigned long long>(failure.region_base),
-                        static_cast<unsigned long long>(failure.region_size),
-                        failure.region_state,
-                        failure.region_protect,
-                        failure.region_type,
-                        failure.attempted_protect,
-                        failure.win32_error,
-                        failure.driver_status.c_str(),
-                        failure.driver_last_error.c_str());
-                    return tool_result_t::error(std::string("Failed to install page guard: ") + reason, "page_guard_install_failed", d);
-                }
-                json r;
-                r["session_id"] = sid;
-                r["pid"]        = pid;
-                char buf[32];
-                snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(addr));
-                r["address"]    = buf;
-                r["size"]       = size;
-                r["max_records_per_drain"] = max_records;
-                return tool_result_t::ok("Page guard installed, session_id=" +
-                                         std::to_string(sid), r);
-            }
-
-            if (op == "get_captures") {
-                uint32_t sid = params.value("session_id", 0u);
-                if (sid == 0)
-                    return tool_result_t::error("'session_id' is required");
-
-                const ULONGLONG t0 = GetTickCount64();
-                diag::log_tagged_fmt("net_tools", "network_pg_sniff get_captures sid=%u", sid);
-                auto caps = page_guard_engine::g_pg_engine.get_capture_records(sid);
-                diag::log_tagged_fmt("net_tools", "network_pg_sniff get_captures count=%zu elapsed_ms=%llu", caps.size(), static_cast<unsigned long long>(GetTickCount64() - t0));
-                json arr  = json::array();
-                for (auto& c : caps) {
-                    const auto& meta = c.metadata;
-                    json o;
-                    char buf[32];
-                    snprintf(buf, sizeof(buf), "0x%llX",
-                             static_cast<unsigned long long>(meta.fault_addr));
-                    o["fault_addr"]     = buf;
-                    snprintf(buf, sizeof(buf), "0x%llX",
-                             static_cast<unsigned long long>(meta.rip));
-                    o["rip"]            = buf;
-                    snprintf(buf, sizeof(buf), "0x%llX",
-                             static_cast<unsigned long long>(meta.ctx_rax));
-                    o["rax"]            = buf;
-                    snprintf(buf, sizeof(buf), "0x%llX",
-                             static_cast<unsigned long long>(meta.ctx_rcx));
-                    o["rcx"]            = buf;
-                    snprintf(buf, sizeof(buf), "0x%llX",
-                             static_cast<unsigned long long>(meta.ctx_rdx));
-                    o["rdx"]            = buf;
-                    o["timestamp"]      = meta.timestamp;
-                    o["exception_code"] = meta.exception_code;
-                    o["access_type"]    = meta.access_type == 0 ? "read" : (meta.access_type == 8 ? "execute" : "write");
-                    page_guard_engine::serialize_payload_fields(o, c);
-                    arr.push_back(o);
-                }
-                json r;
-                r["session_id"] = sid;
-                r["captures"]   = arr;
-                r["count"]      = static_cast<int>(caps.size());
-                return tool_result_t::ok(std::to_string(caps.size()) + " capture(s)", r);
-            }
-
-            if (op == "uninstall") {
-                uint32_t sid = params.value("session_id", 0u);
-                if (sid == 0)
-                    return tool_result_t::error("'session_id' is required");
-
-                bool ok = page_guard_engine::g_pg_engine.uninstall(sid);
-                if (!ok)
-                    return tool_result_t::error("Session " + std::to_string(sid) + " not found");
-                return tool_result_t::ok("Session " + std::to_string(sid) + " uninstalled");
-            }
-
+            if (op != "install" && op != "get_captures" && op != "uninstall" && op != "list_sessions")
+                return tool_result_t::error("Unknown operation '" + op + "'. Use install|get_captures|uninstall|list_sessions");
             if (op == "list_sessions") {
-                auto sessions = page_guard_engine::g_pg_engine.list_sessions();
-                json arr = json::array();
-                for (auto& s : sessions) {
-                    json o;
-                    char buf[32];
-                    snprintf(buf, sizeof(buf), "0x%llX",
-                             static_cast<unsigned long long>(s.target_addr));
-                    o["session_id"]       = s.session_id;
-                    o["pid"]              = s.pid;
-                    o["target_addr"]      = buf;
-                    o["region_size"]      = s.region_size;
-                    o["pending_captures"] = static_cast<int>(s.pending_captures);
-                    arr.push_back(o);
-                }
-                json r;
-                r["sessions"] = arr;
-                r["count"]    = static_cast<int>(sessions.size());
-                return tool_result_t::ok(std::to_string(sessions.size()) + " session(s) active", r);
+                json sessions = page_guard_sessions_payload();
+                return tool_result_t::ok("PAGE_GUARD sessions listed", json{{"sessions", sessions}, {"count", sessions.size()}, {"backend", "whoswho_driver_page_guard"}});
             }
-
-            return tool_result_t::error("Unknown operation '" + op +
-                                        "'. Use install|get_captures|uninstall|list_sessions");
+            std::string error;
+            if (op == "install") {
+                uint32_t pid = driver_bridge::attached_pid();
+                if (!parse_json_u32_param(params, "pid", pid, error) || pid == 0)
+                    return network_param_error(error.empty() ? "Target pid is required" : error, "pid");
+                uint64_t address = 0;
+                if (!parse_json_u64_param(params, "address", address, error) || address == 0)
+                    return network_param_error(error.empty() ? "Target address is required" : error, "address");
+                uint64_t size = 0x1000;
+                if (!parse_json_u64_param(params, "size", size, error) || size == 0)
+                    return network_param_error(error.empty() ? "Region size must be nonzero" : error, "size");
+                uint64_t max_records_raw = 32;
+                if (!parse_json_u64_param(params, "max_records_per_drain", max_records_raw, error))
+                    return network_param_error(error, "max_records_per_drain");
+                const uint32_t max_records = static_cast<uint32_t>(std::min<uint64_t>(max_records_raw, 4096));
+                const bool capture_payloads = params.value("capture_payloads", true);
+                const uint32_t sid = page_guard_engine::g_pg_engine.install(pid, address, size, capture_payloads, max_records, true);
+                if (sid == 0) {
+                    json d{{"pid", pid}, {"address", hex_u64(address)}, {"size", size}, {"capture_payloads", capture_payloads}, {"failure", page_guard_install_failure_payload()}};
+                    diag::log_tagged_fmt("net_tools", "network_pg_sniff install_failed pid=%u address=0x%llX size=0x%llX active=%u error=%s",
+                        pid, static_cast<unsigned long long>(address), static_cast<unsigned long long>(size), driver_bridge::attached_pid(), driver_bridge::last_error().c_str());
+                    return tool_result_t::error("Failed to install WhosWho driver-backed PAGE_GUARD capture session.", "page_guard_install_failed", d);
+                }
+                json r{{"session_id", sid}, {"pid", pid}, {"address", hex_u64(address)}, {"size", size}, {"capture_payloads", capture_payloads}, {"max_records_per_drain", max_records}, {"backend", "whoswho_driver_page_guard"}};
+                return tool_result_t::ok("PAGE_GUARD sniffer installed", r);
+            }
+            uint64_t sid64 = 0;
+            if (!parse_json_u64_param(params, "session_id", sid64, error) || sid64 == 0 || sid64 > UINT32_MAX)
+                return network_param_error(error.empty() ? "session_id is required" : error, "session_id");
+            const uint32_t sid = static_cast<uint32_t>(sid64);
+            if (op == "get_captures") {
+                auto records = page_guard_engine::g_pg_engine.get_capture_records(sid);
+                json captures = json::array();
+                for (const auto& c : records)
+                    captures.push_back(page_guard_capture_payload(c));
+                return tool_result_t::ok("PAGE_GUARD captures drained", json{{"session_id", sid}, {"capture_count", captures.size()}, {"captures", captures}, {"backend", "whoswho_driver_page_guard"}});
+            }
+            const bool stopped = page_guard_engine::g_pg_engine.uninstall(sid);
+            return stopped
+                ? tool_result_t::ok("PAGE_GUARD sniffer uninstalled", json{{"session_id", sid}, {"backend", "whoswho_driver_page_guard"}})
+                : tool_result_t::error("session_id not found", json{{"session_id", sid}, {"backend", "whoswho_driver_page_guard"}});
         }, false});
 
     register_compat(srv, {

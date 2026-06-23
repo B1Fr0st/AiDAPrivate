@@ -1,170 +1,153 @@
-# AFD_ENDPOINT Reverse Engineering — Windows 11 24H2
+# AFD_ENDPOINT Reverse Engineering - Windows 11 24H2
 
 ## Binary Analyzed
-- **File**: afd.sys (Windows 11 24H2, version 10.0.26100.8115)
-- **Architecture**: x64
-- **Tool**: IDA Pro via AiDA MCP
-- **Functions**: 1122, 13 segments, **PDB symbols loaded**
-- **Image base**: 0x140000000
 
-## Key Functions (PDB Names)
+- File: 5900FEED6BA94185AF1F9D7D0200778D474EFA89179BF337DE8C180D93117AF800.sys
+- OS target: Windows 11 24H2
+- Architecture: x64
+- Image base: 0x140000000
+- Image size: 0xB2000
+- SHA-256: d087cc6d40354cbcfbe8f80e0aa42da3d30dcfa7bd3f814f74e0fe4e8aa703ce
+- IDA source: C:\Users\ruar1337\Downloads\win11_25h2_afd.sys.i64, loaded through IDA Pro MCP and hash-matched to the 24H2 SYS above
+- PDB symbols: loaded
+- Verification date: 2026-06-23
+
+The separate Windows 11 25H2 sample `C:\Users\ruar1337\Downloads\win11_25h2_afd.sys` was verified on 2026-06-23 and has the same MD5 (`d5a307b63f426720b11d1136162731a1`), SHA-256 (`d087cc6d40354cbcfbe8f80e0aa42da3d30dcfa7bd3f814f74e0fe4e8aa703ce`), image size (`0xB2000`), function addresses, and AfdBind signature hits as this 24H2 image. The hash-named 24H2 SYS exists at `C:\Users\ruar1337\Downloads\5900FEED6BA94185AF1F9D7D0200778D474EFA89179BF337DE8C180D93117AF800.sys`; its `.i64` database was not present during this verification. The duplicate `win11_25h2_afd.md` file was removed; use this document for both verified 24H2 and 25H2 samples.
+
+## Key Functions
+
 | Address | Name | Size | Role |
 |---------|------|------|------|
-| 0x140017630 | AfdCreate | 2470 | IRP_MJ_CREATE dispatch, dispatches to AfdOpenPacketXX / AfdSwOpenPacket / AfdRioRDOpenPacket |
-| 0x14000AB80 | AfdAllocateEndpoint | 1929 | Allocates 480/512 byte endpoint, populates all initial fields |
-| 0x14000BBD4 | AfdGetTransportInfo | 670 | Walks AfdTransportInfoListHead by device name (UNICODE_STRING) |
-| 0x14002A2E0 | AfdBind | 2986 | Sets state=3/4, writes local address to ep+0xEC/0xF0 |
-| 0x14002DD70 | AfdConnect | 3605 | Checks state, creates connection, sets ep+0xC0 |
-| 0x14002CD3C | AfdCreateConnection | 1330 | Creates connection object |
+| 0x1400178C0 | AfdCreate | 0x9A6 | IRP_MJ_CREATE path, references AfdOpenPacketXX and AfdSwOpenPacket |
+| 0x14000ABE0 | AfdAllocateEndpoint | 0x789 | Allocates and initializes endpoint objects |
+| 0x14000B4AC | AfdTlFindAndReferenceTransport | 0xB7 | Walks AfdTlTransportListHead and matches AF/protocol/socket type |
+| 0x14000BC34 | AfdGetTransportInfo | 0x332 | Resolves classic transport info by UNICODE_STRING device name |
+| 0x14002A2F0 | AfdBind | 0xB0F | Stores local address and resolves classic transport info |
+| 0x14002DE20 | AfdConnect | 0xED9 | Connect path, validates endpoint state and uses transport/handle fields |
+| 0x14002CE08 | AfdCreateConnection | 0x516 | Creates connection object |
 
-## AFD_ENDPOINT Structure (480/512 bytes)
+## Endpoint Allocation
 
-### Size Change from Win10
-- Win10: 448 bytes (standard) / 480 bytes (with TL extended transport)
-- Win11: 480 bytes (standard) / 512 bytes (with TL extended transport)
-- Delta: +32 bytes
+Current Win11 24H2 endpoint allocation sizes are:
 
-### Offsets Used in Network.cpp — ALL VERIFIED ✅
+| Mode | Size | Evidence |
+|------|------|----------|
+| Standard endpoint | 0x1F0 bytes | AfdAllocateEndpoint `mov ecx, 1F0h`, standard memset path `mov r8d, 1F0h` |
+| TL extended endpoint | 0x210 bytes | AfdAllocateEndpoint `mov eax, 210h`, TL memset path `mov r8d, 210h` |
 
-| Offset | Size | Field | Win10 Offset | Delta | Verification |
-|--------|------|-------|-------------|-------|-------------|
-| +0x00 | WORD | Type/Signature | +0x00 | 0 | AfdAllocateEndpoint: `LOWORD(v19->Count) = 0xAFD0`; AfdConnect: checks 0xAAFD, 0xAFD1, 0xAFD2 |
-| +0x02 | BYTE | State | +0x02 | 0 | AfdBind: `mov al, [rdi+2]`, `mov [rdi+2], r12b` (=3 bound); AfdConnect: checks `*(_BYTE*)(v6+2)==3` |
-| +0x08 | DWORD | Flags | +0x08 | 0 | AfdBind: `mov eax, [rdi+8]; bt eax, 8`; AfdConnect: `*(_DWORD*)(v6+8) & 0x100` |
-| +0x10 | DWORD | TransportFlags | +0x10 | 0 | AfdBind: `mov ecx, [rax+38h]; mov [rdi+10h], ecx`; AfdConnect: `*(_DWORD*)(v6+16) & 0x200` |
-| **+0x30** | QWORD | PEPROCESS | +0x28 | **+8** | AfdAllocateEndpoint: `v19[6].Count = IoGetCurrentProcess()`; AfdConnect: `*(_QWORD*)(v6+48)` |
-| +0x38 | KSPIN_LOCK | SpinLock | +0x30 | +8 | AfdBind: `lea rcx, [rdi+38h] ; SpinLock`; AfdConnect: `KeAcquireInStackQueuedSpinLock(v6+56)` |
-| +0x40 | QWORD | RefCount | +0x38 | +8 | AfdAllocateEndpoint: `v19[8].Count = 2`; AfdConnect: `_InterlockedIncrement64(v6+64)` |
-| +0xC0 | QWORD | Connection/Listener | +0xB0 | +0x10 | AfdBind: `mov [rdi+0C0h], rbx`; AfdConnect: `*(_QWORD*)(v6+192) = conn` |
-| **+0xEC** | DWORD | LocalAddr Size | **+0xDC** | **+0x10** | AfdBind: `mov [rdi+0ECh], r12d` |
-| **+0xF0** | QWORD | LocalAddr Ptr | **+0xE0** | **+0x10** | AfdBind: `mov [rdi+0F0h], rdx` |
-| +0xF8 | DWORD | PendingOpCount | +0xE8 | +0x10 | AfdBind: `lock add [rdi+0F8h], r14d`; AfdConnect: `_InterlockedAdd(v6+248, 1)` |
-| +0x100 | QWORD | TDI Handle | +0xF0 | +0x10 | AfdBind: `mov rcx, [rdi+100h] ; Handle` then `ZwClose` |
-| **+0x108** | QWORD | TransportInfo Ptr | **+0xF8** | **+0x10** | AfdBind: `lea rbx, [rdi+108h]`; AfdAllocateEndpoint: `v19[33].Count = transport` |
-| +0x168 | DWORD | Bind/Connect Lock | +0x158 | +0x10 | AfdBind: `lock cmpxchg [rdi+168h], r9d`; AfdConnect: `_InterlockedCompareExchange(v6+360, 4, 0)` |
+These sizes replace the stale 0x1E0/0x200 values from older notes.
 
-### Additional Win11 Fields
+## AFD_ENDPOINT Offsets
+
 | Offset | Size | Field | Evidence |
 |--------|------|-------|----------|
-| +0x18 | QWORD | TDI Object | AfdBind: `mov rcx, [rdi+18h] ; Object` then `ObfDereferenceObject` |
-| +0x28 | QWORD | DeviceObject/TDI | AfdBind: `mov rcx, [rdi+28h]` then `IofCallDriver` |
-| +0x48 | DWORD | ListenBacklog | AfdBind: `mov dword ptr [rdi+48h], 4` |
-| +0x110 | QWORD | TL Extended Info | AfdConnect: `*(_QWORD*)(v6+272)` for TL route |
-| +0x120 | LIST_ENTRY | IRP List | AfdAllocateEndpoint: `v19[36/37]` self-referencing init |
-| +0x180 | EX_RUNDOWN_REF | RundownProtection | AfdAllocateEndpoint: `ExInitializeRundownProtection(v19+48)` |
-| +0x1C8 | DWORD | GroupID | AfdAllocateEndpoint: `v19[57].Count = groupId` |
-| +0x1F0 | QWORD | TL Extended Transport | AfdAllocateEndpoint: `v19[62].Count = v11` |
+| +0x00 | USHORT | Signature/type | AfdAllocateEndpoint stores 0xAFD0 or 0xAAFD; AfdConnect checks 0xAAFD and 0xAFD1 |
+| +0x02 | UCHAR | State | AfdAllocateEndpoint initializes state 1 or 8; bind/connect paths read endpoint state here |
+| +0x08 | ULONG | Flags | TL path sets bit 0x100; AfdBind and AfdConnect test bit 8 |
+| +0x10 | ULONG | TransportFlags | AfdAllocateEndpoint/AfdBind copy current transport flags here |
+| +0x30 | PEPROCESS | Owning process | AfdAllocateEndpoint stores IoGetCurrentProcess result at [rbx+30h] |
+| +0x38 | KSPIN_LOCK | Endpoint spin lock | AfdAllocateEndpoint initializes [rbx+38h] |
+| +0x40 | LONG64 | Refcount | AfdAllocateEndpoint stores 2 at [rbx+40h] |
+| +0xC0 | PVOID | Connection/listener | AfdConnect stores connection at [rbx+0C0h] |
+| +0xD0 | PVOID | Connect data buffer/state pointer | AfdConnect checks [rbx+0D0h] |
+| +0xEC | ULONG | LocalAddr size | AfdBind stores r12d at [rdi+0ECh] in TL and classic paths |
+| +0xF0 | PVOID | LocalAddr pointer | AfdBind stores rcx at [rdi+0F0h] in TL path and rax at [rdi+0F0h] in classic path |
+| +0xF8 | ULONG | Pending operation count | AfdBind uses [rdi+0F8h] |
+| +0x100 | PVOID | TDI handle/object | AfdConnect reads [r15+100h]/[rbx+100h] for connection creation |
+| +0x110 | PVOID | TransportInfo pointer | AfdAllocateEndpoint stores at [rbx+110h]; AfdBind uses `lea rbx, [rdi+110h]`; AfdConnect reads [rbx+110h] |
+| +0x128 | LIST_ENTRY | Endpoint list entry | AfdAllocateEndpoint initializes self-referencing list at [rbx+128h] |
+| +0x170 | LONG | Bind/connect lock | AfdBind and AfdConnect use lock cmpxchg/xchg at [endpoint+170h] |
+| +0x188 | EX_RUNDOWN_REF | Rundown protection | AfdAllocateEndpoint passes [rbx+188h] to ExInitializeRundownProtection |
+| +0x1D0 | ULONG | Group id / creation field | AfdAllocateEndpoint stores esi at [rbx+1D0h] and edi at [rbx+1D4h] |
+| +0x200 | PVOID | TL extended transport pointer | AfdAllocateEndpoint stores r13 at [rbx+200h] when extended TL data exists |
 
-## TransportInfo Sub-Structure — CONFIRMED SAME AS WIN10 ✅
+## Network.cpp-Relevant Offsets
 
-### Evidence from AfdAllocateEndpoint (TlTransportListHead traversal):
-```c
-// AfdAllocateEndpoint walks AfdTlTransportListHead:
-for ( i = AfdTlTransportListHead; i != &AfdTlTransportListHead; i = *(_QWORD*)i )
-{
-    if ( *(_WORD *)(i + 28) == (_WORD)a3 )        // +0x1C = SocketType
-    {
-        v22 = *(unsigned __int16 *)(i + 22);       // +0x16 = AddressFamily
-        if ( (v22 == a2 || !(_WORD)v22)
-            && (*(_DWORD *)(i + 24) == a4 || a3 == 3)  // +0x18 = Protocol
-            && AfdTlReferenceTransport(i) )
-        { /* found */ }
-    }
-}
-```
+| Field | Win10 22H2 | Current Win11 24H2 | Delta |
+|-------|------------|--------------------|-------|
+| TransportInfo pointer | +0xF8 | +0x110 | +0x18 |
+| LocalAddr size | +0xDC | +0xEC | +0x10 |
+| LocalAddr pointer | +0xE0 | +0xF0 | +0x10 |
 
-### Evidence from AfdBind (TransportInfo flag read):
-```asm
-lea     rbx, [rdi+108h]        ; rbx = &ep->TransportInfo
-mov     rcx, [rbx]             ; rcx = TransportInfo ptr
-cmp     [rcx+14h], sil         ; TransportInfo+0x14 = QualifiedFlag
-jnz     short ...
-; If not qualified, call AfdGetTransportInfo:
-add     rcx, 18h               ; rcx = TransportInfo+0x18 (device name UNICODE_STRING for classic)
-mov     rdx, rbx               ; rdx = &ep->TransportInfo (output)
-call    AfdGetTransportInfo
-; After:
-mov     rax, [rbx]             ; reload TransportInfo
-mov     ecx, [rax+38h]         ; TransportInfo+0x38 = TransportFlags
-mov     [rdi+10h], ecx         ; store to endpoint TransportFlags
-```
+The old Win11 24H2 note that used TransportInfo +0x108 is stale for the currently loaded image. Current AfdBind has exactly one `lea rbx, [rdi+110h]` match at 0x14002A6A3 and no `lea ... +108h` match.
 
-| Offset | Size | Field | Status |
-|--------|------|-------|--------|
-| +0x00 | LIST_ENTRY | LinkedList | SAME |
-| +0x10 | LONG | RefCount | SAME |
-| +0x14 | BYTE | QualifiedFlag | SAME — AfdBind: `cmp [rcx+14h], sil` |
-| +0x16 | USHORT | AddressFamily | SAME — AfdAllocateEndpoint: `*(USHORT*)(i+22)` |
-| +0x18 | DWORD | Protocol | SAME — AfdAllocateEndpoint: `*(DWORD*)(i+24)` |
-| +0x1C | WORD | SocketType | SAME — AfdAllocateEndpoint: `*(WORD*)(i+28)` |
-| +0x38 | DWORD | TransportFlags | SAME — AfdBind: `mov ecx, [rax+38h]` |
+## TransportInfo Layout
 
-### Note on Dual Transport Lists (Win11)
-Win11 has TWO transport info lists:
-1. **AfdTlTransportListHead** (TL/modern path) — AF/Proto/SocketType at +0x16/+0x18/+0x1C
-2. **AfdTransportInfoListHead** (classic/TDI path) — UNICODE_STRING at +0x18 (device name)
+### TL Transport List
 
-For TL endpoints (flags & 0x100), the TransportInfo pointer points to the TL transport
-with AF/Proto/SocketType at the expected offsets. For classic endpoints (!(flags & 0x100)),
-the TransportInfo pointer points to the classic info where +0x18 is a UNICODE_STRING.
+AfdTlFindAndReferenceTransport and the TL scan inside AfdAllocateEndpoint confirm:
 
-**Most modern Windows sockets use the TL path**, so reading AF/Proto from the TransportInfo
-at +0x16/+0x18 is correct for the vast majority of cases.
+| Offset | Size | Field | Evidence |
+|--------|------|-------|----------|
+| +0x00 | LIST_ENTRY | List links | Traversal uses first pointer as next |
+| +0x16 | USHORT | AddressFamily | Compared with requested address family |
+| +0x18 | ULONG | Protocol | Compared with requested protocol, except raw socket type |
+| +0x1C | USHORT | SocketType | Compared with requested socket type |
 
-## Summary of Changes from Win10 to Win11 24H2
+### Classic Transport Info
 
-### Offsets That Changed (Network.cpp-relevant only)
-| Field | Win10 22H2 | Win11 24H2 | Delta |
-|-------|-----------|-----------|-------|
-| **TransportInfo Ptr** | +0xF8 | +0x108 | +0x10 |
-| **LocalAddr Size** | +0xDC | +0xEC | +0x10 |
-| **LocalAddr Ptr** | +0xE0 | +0xF0 | +0x10 |
+AfdGetTransportInfo confirms:
 
-### Offsets That Did NOT Change
-| Field | Offset | Same? |
-|-------|--------|-------|
-| Type/Signature | +0x00 | ✅ |
-| State | +0x02 | ✅ |
-| Flags | +0x08 | ✅ |
-| TransportFlags | +0x10 | ✅ |
-| TransportInfo.AddressFamily | +0x16 | ✅ |
-| TransportInfo.Protocol | +0x18 | ✅ |
-| TransportInfo.SocketType | +0x1C | ✅ |
-| TransportInfo.TransportFlags | +0x38 | ✅ |
+| Offset | Size | Field | Evidence |
+|--------|------|-------|----------|
+| +0x00 | LIST_ENTRY | AfdTransportInfoListHead links | Classic list traversal |
+| +0x10 | LONG | Refcount | Interlocked increment path |
+| +0x14 | UCHAR | Qualified flag | AfdBind checks [TransportInfo+14h] |
+| +0x18 | UNICODE_STRING | Device name | AfdBind passes TransportInfo+18h to AfdGetTransportInfo |
+| +0x40 | ULONG | TransportFlags | AfdBind loads [rax+40h] and stores to endpoint +0x10 |
+| +0x58 | WCHAR[] | Inline device-name buffer | AfdGetTransportInfo allocation path stores the copied name buffer here |
 
-## Pattern Scan Signatures
+Classic transport names still map through device suffixes:
 
-### For finding TransportInfo offset in AfdBind
-Win10 pattern: `48 8D 9F F8 00 00 00` → `lea rbx, [rdi+0F8h]`
-Win11 pattern: `48 8D 9F 08 01 00 00` → `lea rbx, [rdi+108h]`
-Generic: `48 8D 9F ?? ?? 00 00` within AfdBind → offset is the DWORD at pattern+3
+| Device suffix | Address family | Protocol |
+|---------------|----------------|----------|
+| Tcp | AF_INET | IPPROTO_TCP |
+| Udp | AF_INET | IPPROTO_UDP |
+| RawIp | AF_INET | 0 |
+| Tcp6 | AF_INET6 | IPPROTO_TCP |
+| Udp6 | AF_INET6 | IPPROTO_UDP |
+| RawIp6 | AF_INET6 | 0 |
 
-### For finding LocalAddr Ptr offset in AfdBind
-Win10 pattern: `48 89 97 E0 00 00 00` → `mov [rdi+0E0h], rdx`
-Win11 pattern: `48 89 97 F0 00 00 00` → `mov [rdi+0F0h], rdx`
-Context: appears right after `mov [rdi+XX], r12d` (size store) with flags check `bt eax, 8`
+## Exact Pattern Evidence
 
-### For finding LocalAddr Size offset in AfdBind
-Win10 pattern: `44 89 A7 DC 00 00 00` → `mov [rdi+0DCh], r12d`
-Win11 pattern: `44 89 A7 EC 00 00 00` → `mov [rdi+0ECh], r12d`
-Context: immediately before LocalAddr Ptr store
+All patterns below were checked against the loaded IDA MCP image `win11_25h2_afd.sys.i64`, whose input SYS is byte-hash identical to the 24H2 SYS named above.
 
-### Recommended Dynamic Detection Strategy
-1. Find AfdBind export/function in afd.sys
-2. Scan for `48 8D 9F` (lea rbx, [rdi+imm32]) — the TransportInfo offset
-3. Scan for `44 89 A7` (mov [rdi+imm32], r12d) near `48 89 97` (mov [rdi+imm32], rdx) — LocalAddr Size/Ptr pair
-4. Alternatively: use NtBuildNumber-based offset table (simpler, more reliable)
+| Purpose | Pattern | Result |
+|---------|---------|--------|
+| TL local address store | `48 89 8F F0 00 00 00 44 89 A7 EC 00 00 00` | 0x14002A659 |
+| Classic local address store | `48 89 87 F0 00 00 00 44 89 A7 EC 00 00 00` | 0x14002A6F6 |
+| Old rdx local pointer store | `48 89 97 F0 00 00 00` | no matches in this image |
+| Current TransportInfo lea | `48 8D 9F 10 01 00 00` | 0x14002A6A3 |
+| Old +0x108 TransportInfo lea | `48 8D 9F 08 01 00 00` | no matches in this image |
+| Old +0x108 rax lea | `48 8D 87 08 01 00 00` | no matches in this image |
 
-### Build Number Mapping
-| Build | Version | TransportInfo | LocalAddr Size | LocalAddr Ptr |
-|-------|---------|--------------|----------------|---------------|
-| 19041-19045 | Win10 22H2 | +0xF8 | +0xDC | +0xE0 |
-| 26100 | Win11 24H2 | +0x108 | +0xEC | +0xF0 |
+## Dynamic Detection Requirements
 
-## Device Name Mapping (Unchanged)
-- AF_INET + STREAM + TCP(6) → \\Device\\Tcp
-- AF_INET + DGRAM + UDP(17) → \\Device\\Udp
-- AF_INET + RAW → \\Device\\RawIp
-- AF_INET6 + STREAM + TCP(6) → \\Device\\Tcp6
-- AF_INET6 + DGRAM + UDP(17) → \\Device\\Udp6
-- AF_INET6 + RAW → \\Device\\RawIp6
+Runtime code must not derive Win11 TransportInfo as `LocalAddrSize + 0x1C`. That old relationship produces +0x108 for current 24H2 and is wrong for this image.
+
+Required detection order:
+
+1. Resolve LocalAddr size/pointer from paired stores in AfdBind.
+2. For Win11 local `+0xEC/+0xF0`, independently scan TransportInfo lea signatures.
+3. Prefer current `48 8D 9F 10 01 00 00` -> +0x110.
+4. Keep old `48 8D 9F 08 01 00 00` -> +0x108 as a compatibility signature only if it is present in the loaded afd.sys.
+5. Log the matched local pattern, matched TransportInfo pattern, offsets, OS build, afd base, and fallback source.
+
+## Build Mapping
+
+| OS build family | TransportInfo | LocalAddr size | LocalAddr pointer | Status |
+|-----------------|---------------|----------------|-------------------|--------|
+| 19041-19045 Win10 22H2 | +0xF8 | +0xDC | +0xE0 | Verified in win10afd.md |
+| 26100 current Win11 24H2 / 25H2 image | +0x110 | +0xEC | +0xF0 | Verified here; identical binary hash for the checked 25H2 sample |
+| 26100 older/stale note | +0x108 | +0xEC | +0xF0 | Do not use unless the +0x108 lea pattern exists in the loaded image |
+
+## Driver Alignment
+
+Network code must:
+
+- Accept endpoint signatures 0xAFD0, 0xAAFD, 0xAFD1, and 0xAFD2 before dereferencing endpoint fields.
+- Treat `endpoint->Flags & 0x100` as the TL/classic discriminator.
+- For TL endpoints, read address family/protocol from TransportInfo +0x16/+0x18 only after pointer validation.
+- For classic endpoints, parse the UNICODE_STRING at TransportInfo +0x18 and map the device suffix to AF/protocol.
+- Resolve TransportInfo independently from explicit AfdBind lea signatures, not by a fixed local-address delta.
+- Emit KVALIDATE logs for the final offset source, local pattern, TransportInfo pattern, address family source, endpoint signature failures, and classic transport-name failures.

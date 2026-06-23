@@ -162,7 +162,7 @@ json capture_json(const store::heap_session_t& session, const store::heap_captur
     out["allocation_size_estimate"] = cap.size;
     out["alignment"] = cap.alignment;
     out["timestamp_ms"] = cap.timestamp_ms;
-    out["backend"] = session.hw_slot >= 0 && !session.tids.empty() ? "rtlallocateheap_return_debug_event" : "snapshot_diff";
+    out["backend"] = session.hw_slot >= 0 && !session.tids.empty() ? "rtlallocateheap_return_kernel_context" : "snapshot_diff";
     driver_bridge::memory_region_t region{};
     if (query_region(session.pid, cap.va, region))
     {
@@ -219,7 +219,7 @@ json session_json(const store::heap_session_t& session)
     out["functional_success"] = !session.captures.empty();
     if (session.captures.empty())
         out["zero_capture_reason"] = session.active ? "heap tracking session is active but no allocation or snapshot-diff captures have been observed yet" : "heap tracking session stopped with zero allocation or snapshot-diff captures";
-    out["backend"] = session.hw_slot >= 0 && !session.tids.empty() ? "rtlallocateheap_return_debug_event" : "snapshot_diff";
+    out["backend"] = session.hw_slot >= 0 && !session.tids.empty() ? "rtlallocateheap_return_kernel_context" : "snapshot_diff";
     out["event_capture_active"] = session.hw_slot >= 0 && !session.tids.empty();
     out["snapshot_diff_available"] = true;
     return out;
@@ -266,27 +266,6 @@ void clear_session_breakpoints(const store::heap_session_t& session)
         driver_bridge::clear_hardware_breakpoint(tid, session.hw_slot);
 }
 
-bool enable_debug_privilege()
-{
-    HANDLE token = nullptr;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token))
-        return false;
-    LUID luid{};
-    if (!LookupPrivilegeValueW(nullptr, SE_DEBUG_NAME, &luid))
-    {
-        CloseHandle(token);
-        return false;
-    }
-    TOKEN_PRIVILEGES tp{};
-    tp.PrivilegeCount = 1;
-    tp.Privileges[0].Luid = luid;
-    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-    const BOOL ok = AdjustTokenPrivileges(token, FALSE, &tp, sizeof(tp), nullptr, nullptr);
-    const DWORD gle = GetLastError();
-    CloseHandle(token);
-    return ok && gle == ERROR_SUCCESS;
-}
-
 std::optional<store::heap_session_t> event_session_for_pid(std::uint32_t pid)
 {
     for (const auto& session : store::list_heap_sessions(pid))
@@ -307,7 +286,7 @@ bool has_other_event_session(std::uint32_t pid, const std::string& except_id)
     return false;
 }
 
-std::vector<std::uint64_t> capture_callstack_addresses(std::uint32_t pid, const CONTEXT& ctx, std::uint64_t return_address, bool enabled)
+std::vector<std::uint64_t> capture_callstack_addresses(std::uint32_t pid, const driver_bridge::thread_context_t& ctx, std::uint64_t return_address, bool enabled)
 {
     std::vector<std::uint64_t> frames;
     if (!enabled)
@@ -318,9 +297,9 @@ std::vector<std::uint64_t> capture_callstack_addresses(std::uint32_t pid, const 
         if (std::find(frames.begin(), frames.end(), address) == frames.end())
             frames.push_back(address);
     };
-    add_frame(static_cast<std::uint64_t>(ctx.Rip));
+    add_frame(ctx.rip);
     add_frame(return_address);
-    std::uint64_t rbp = static_cast<std::uint64_t>(ctx.Rbp);
+    std::uint64_t rbp = ctx.rbp;
     for (int i = 0; i < 24 && rbp >= 0x10000; ++i)
     {
         std::uint64_t next_rbp = 0;
@@ -335,7 +314,7 @@ std::vector<std::uint64_t> capture_callstack_addresses(std::uint32_t pid, const 
     if (frames.size() < 8)
     {
         std::vector<std::uint8_t> stack;
-        if (read_bytes(pid, static_cast<std::uint64_t>(ctx.Rsp), 0x200, stack))
+        if (read_bytes(pid, ctx.rsp, 0x200, stack))
         {
             const std::size_t aligned = stack.size() & ~static_cast<std::size_t>(7);
             for (std::size_t off = 0; off + 8 <= aligned && frames.size() < 32; off += 8)
@@ -416,170 +395,179 @@ void arm_heap_existing_threads(std::uint32_t pid)
         arm_heap_session_for_thread(*session, th.tid);
 }
 
-void close_debug_event_handles(const DEBUG_EVENT& evt)
+std::uint64_t context_dr_address(const driver_bridge::thread_context_t& ctx, int slot)
 {
-    switch (evt.dwDebugEventCode)
+    switch (slot)
     {
-    case CREATE_PROCESS_DEBUG_EVENT:
-        if (evt.u.CreateProcessInfo.hFile) CloseHandle(evt.u.CreateProcessInfo.hFile);
-        if (evt.u.CreateProcessInfo.hThread) CloseHandle(evt.u.CreateProcessInfo.hThread);
-        if (evt.u.CreateProcessInfo.hProcess) CloseHandle(evt.u.CreateProcessInfo.hProcess);
-        break;
-    case CREATE_THREAD_DEBUG_EVENT:
-        if (evt.u.CreateThread.hThread) CloseHandle(evt.u.CreateThread.hThread);
-        break;
-    case LOAD_DLL_DEBUG_EVENT:
-        if (evt.u.LoadDll.hFile) CloseHandle(evt.u.LoadDll.hFile);
-        break;
-    default:
-        break;
+    case 0: return ctx.dr0;
+    case 1: return ctx.dr1;
+    case 2: return ctx.dr2;
+    case 3: return ctx.dr3;
+    default: return 0;
     }
 }
 
-bool handle_heap_single_step(std::uint32_t pid, const DEBUG_EVENT& evt)
+bool heap_context_reports_slot(const driver_bridge::thread_context_t& ctx, int slot, std::uint64_t expected)
+{
+    if (slot < 0 || slot > 3 || expected == 0)
+        return false;
+    const bool dr6_hit = (ctx.dr6 & (1ull << static_cast<unsigned>(slot))) != 0;
+    const bool slot_matches = context_dr_address(ctx, slot) == expected;
+    if (dr6_hit && slot_matches)
+        return true;
+    return slot_matches && ctx.rip == expected;
+}
+
+void remove_heap_thread(const store::heap_session_t& source_session, std::uint32_t tid)
+{
+    auto session = source_session;
+    session.tids.erase(std::remove(session.tids.begin(), session.tids.end(), tid), session.tids.end());
+    store::update_heap_session(session);
+    auto& state = heap_debug_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    state.pending.erase(tid);
+}
+
+bool handle_heap_single_step(std::uint32_t pid, std::uint32_t tid, const driver_bridge::thread_context_t& ctx)
 {
     auto session_opt = event_session_for_pid(pid);
     if (!session_opt)
         return false;
     auto session = *session_opt;
-    HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, evt.dwThreadId);
-    if (!thread)
-        return false;
-    CONTEXT ctx{};
-    ctx.ContextFlags = CONTEXT_INTEGER | CONTEXT_CONTROL | CONTEXT_DEBUG_REGISTERS;
-    if (!GetThreadContext(thread, &ctx))
-    {
-        CloseHandle(thread);
-        return false;
-    }
-    const std::uint64_t exception_address = reinterpret_cast<std::uint64_t>(evt.u.Exception.ExceptionRecord.ExceptionAddress);
     bool handled = false;
     auto& state = heap_debug_state();
     pending_alloc_t pending;
     bool had_pending = false;
     {
         std::lock_guard<std::mutex> lock(state.mutex);
-        auto it = state.pending.find(evt.dwThreadId);
+        auto it = state.pending.find(tid);
         if (it != state.pending.end())
         {
             pending = it->second;
             had_pending = true;
         }
     }
-    if (had_pending && (pending.return_address == static_cast<std::uint64_t>(ctx.Rip) || pending.return_address == exception_address))
+    if (had_pending && heap_context_reports_slot(ctx, session.hw_slot, pending.return_address))
     {
-        if (static_cast<std::uint64_t>(ctx.Rax) != 0)
-            append_event_capture(session, pending, static_cast<std::uint64_t>(ctx.Rax));
+        if (ctx.rax != 0)
+            append_event_capture(session, pending, ctx.rax);
         {
             std::lock_guard<std::mutex> lock(state.mutex);
-            state.pending.erase(evt.dwThreadId);
+            state.pending.erase(tid);
         }
-        driver_bridge::set_hardware_breakpoint(evt.dwThreadId, session.hw_slot, session.rtl_allocate_heap, 0, 0);
+        driver_bridge::set_hardware_breakpoint(tid, session.hw_slot, session.rtl_allocate_heap, 0, 0);
         handled = true;
     }
-    else if (session.rtl_allocate_heap == static_cast<std::uint64_t>(ctx.Rip) || session.rtl_allocate_heap == exception_address)
+    else if (heap_context_reports_slot(ctx, session.hw_slot, session.rtl_allocate_heap))
     {
-        const std::uint64_t requested_size = static_cast<std::uint64_t>(ctx.R8);
+        const std::uint64_t requested_size = ctx.r8;
         if (requested_size != 0 && (session.min_size == 0 || requested_size >= session.min_size) && (session.max_size == 0 || requested_size <= session.max_size))
         {
             std::uint64_t return_address = 0;
-            if (read_u64(pid, static_cast<std::uint64_t>(ctx.Rsp), return_address) && return_address != 0)
+            if (read_u64(pid, ctx.rsp, return_address) && return_address != 0)
             {
                 pending_alloc_t next;
-                next.heap = static_cast<std::uint64_t>(ctx.Rcx);
-                next.flags = static_cast<std::uint64_t>(ctx.Rdx);
+                next.heap = ctx.rcx;
+                next.flags = ctx.rdx;
                 next.size = requested_size;
                 next.return_address = return_address;
                 next.timestamp_ms = unix_time_ms();
                 next.callstack = capture_callstack_addresses(pid, ctx, return_address, session.capture_callstack);
                 {
                     std::lock_guard<std::mutex> lock(state.mutex);
-                    state.pending[evt.dwThreadId] = std::move(next);
+                    state.pending[tid] = std::move(next);
                 }
-                driver_bridge::set_hardware_breakpoint(evt.dwThreadId, session.hw_slot, return_address, 0, 0);
+                driver_bridge::set_hardware_breakpoint(tid, session.hw_slot, return_address, 0, 0);
             }
         }
         handled = true;
     }
     if (handled)
     {
-        ctx.EFlags |= 0x10000;
-        SetThreadContext(thread, &ctx);
+        driver_bridge::thread_context_t next = ctx;
+        next.rflags |= 0x10000ull;
+        next.dr6 = 0;
+        SetLastError(ERROR_SUCCESS);
+        const bool set_ok = driver_bridge::set_thread_context(tid, next, (1ull << 17) | (1ull << 22));
+        diag::log_tagged_fmt("heap_track",
+            "kernel_context_hit_resume pid=%u tid=%u set_ok=%d gle=%lu rip=0x%llX dr6=0x%llX dr7=0x%llX",
+            pid,
+            tid,
+            set_ok ? 1 : 0,
+            static_cast<unsigned long>(set_ok ? ERROR_SUCCESS : GetLastError()),
+            static_cast<unsigned long long>(ctx.rip),
+            static_cast<unsigned long long>(ctx.dr6),
+            static_cast<unsigned long long>(ctx.dr7));
     }
-    CloseHandle(thread);
     return handled;
+}
+
+void poll_heap_thread_contexts(std::uint32_t pid)
+{
+    auto session = event_session_for_pid(pid);
+    if (!session)
+        return;
+    std::vector<std::uint32_t> tids;
+    for (const auto tid : session->tids)
+    {
+        if (tid != 0 && std::find(tids.begin(), tids.end(), tid) == tids.end())
+            tids.push_back(tid);
+    }
+    for (const auto tid : tids)
+    {
+        driver_bridge::thread_context_t ctx{};
+        SetLastError(ERROR_SUCCESS);
+        if (!driver_bridge::get_thread_context(tid, ctx))
+        {
+            const DWORD gle = GetLastError();
+            diag::log_tagged_fmt("heap_track",
+                "kernel_context_poll_get_failed pid=%u tid=%u gle=%lu driver_error=%s",
+                pid,
+                tid,
+                static_cast<unsigned long>(gle),
+                driver_bridge::last_error().c_str());
+            if (gle == ERROR_INVALID_PARAMETER || gle == ERROR_NOT_FOUND || gle == ERROR_INVALID_HANDLE)
+                remove_heap_thread(*session, tid);
+            continue;
+        }
+        handle_heap_single_step(pid, tid, ctx);
+    }
 }
 
 void heap_debug_loop()
 {
     auto& state = heap_debug_state();
     const std::uint32_t pid = state.pid.load(std::memory_order_acquire);
-    enable_debug_privilege();
-    if (pid == 0 || !DebugActiveProcess(pid))
+    if (pid == 0 || !driver_bridge::using_kernel_driver())
     {
-        state.error.store(GetLastError(), std::memory_order_release);
+        state.error.store(pid == 0 ? ERROR_INVALID_PARAMETER : ERROR_INVALID_HANDLE, std::memory_order_release);
         state.attached.store(false, std::memory_order_release);
         state.polling.store(false, std::memory_order_release);
         state.running.store(false, std::memory_order_release);
+        diag::log_tagged_fmt("heap_track",
+            "kernel_context_loop_exit_invalid pid=%u kernel=%d",
+            pid,
+            driver_bridge::using_kernel_driver() ? 1 : 0);
         return;
     }
-    DebugSetProcessKillOnExit(FALSE);
     state.error.store(0, std::memory_order_release);
     state.attached.store(true, std::memory_order_release);
     arm_heap_existing_threads(pid);
-    bool initial_break_pending = true;
+    std::uint64_t poll_count = 0;
     while (state.polling.load(std::memory_order_acquire))
     {
+        if (!driver_bridge::using_kernel_driver())
+        {
+            state.error.store(ERROR_INVALID_HANDLE, std::memory_order_release);
+            state.polling.store(false, std::memory_order_release);
+            break;
+        }
         if (!event_session_for_pid(pid))
             break;
-        DEBUG_EVENT evt{};
-        if (!WaitForDebugEvent(&evt, 100))
-            continue;
-        DWORD continue_status = DBG_CONTINUE;
-        if (evt.dwDebugEventCode == EXCEPTION_DEBUG_EVENT)
-        {
-            const DWORD code = evt.u.Exception.ExceptionRecord.ExceptionCode;
-            if (code == EXCEPTION_SINGLE_STEP)
-            {
-                if (!handle_heap_single_step(pid, evt))
-                    continue_status = DBG_EXCEPTION_NOT_HANDLED;
-            }
-            else if (code == EXCEPTION_BREAKPOINT && evt.u.Exception.dwFirstChance != 0 && initial_break_pending)
-            {
-                initial_break_pending = false;
-                continue_status = DBG_CONTINUE;
-            }
-            else
-            {
-                continue_status = DBG_EXCEPTION_NOT_HANDLED;
-            }
-        }
-        else if (evt.dwDebugEventCode == CREATE_THREAD_DEBUG_EVENT)
-        {
-            auto session = event_session_for_pid(pid);
-            if (session)
-                arm_heap_session_for_thread(*session, evt.dwThreadId);
-        }
-        else if (evt.dwDebugEventCode == EXIT_THREAD_DEBUG_EVENT)
-        {
-            {
-                std::lock_guard<std::mutex> lock(state.mutex);
-                state.pending.erase(evt.dwThreadId);
-            }
-            auto session = event_session_for_pid(pid);
-            if (session)
-            {
-                auto updated = *session;
-                updated.tids.erase(std::remove(updated.tids.begin(), updated.tids.end(), evt.dwThreadId), updated.tids.end());
-                store::update_heap_session(updated);
-            }
-        }
-        else if (evt.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT)
-        {
-            state.polling.store(false, std::memory_order_release);
-        }
-        close_debug_event_handles(evt);
-        ContinueDebugEvent(evt.dwProcessId, evt.dwThreadId, continue_status);
+        if ((poll_count++ % 20) == 0)
+            arm_heap_existing_threads(pid);
+        poll_heap_thread_contexts(pid);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     if (auto session = event_session_for_pid(pid))
         clear_session_breakpoints(*session);
@@ -587,11 +575,14 @@ void heap_debug_loop()
         std::lock_guard<std::mutex> lock(state.mutex);
         state.pending.clear();
     }
-    if (state.attached.exchange(false, std::memory_order_acq_rel))
-        DebugActiveProcessStop(pid);
+    state.attached.store(false, std::memory_order_release);
     state.polling.store(false, std::memory_order_release);
     state.pid.store(0, std::memory_order_release);
     state.running.store(false, std::memory_order_release);
+    diag::log_tagged_fmt("heap_track",
+        "kernel_context_loop_exit pid=%u polls=%llu",
+        pid,
+        static_cast<unsigned long long>(poll_count));
 }
 
 bool start_heap_debug_loop(std::uint32_t pid, std::string& error)
@@ -604,7 +595,7 @@ bool start_heap_debug_loop(std::uint32_t pid, std::string& error)
             arm_heap_existing_threads(pid);
             return true;
         }
-        error = "another heap debug-event consumer is already active";
+        error = "another heap kernel context consumer is already active";
         return false;
     }
     state.pid.store(pid, std::memory_order_release);
@@ -616,7 +607,7 @@ bool start_heap_debug_loop(std::uint32_t pid, std::string& error)
     {
         state.polling.store(false, std::memory_order_release);
         state.running.store(false, std::memory_order_release);
-        error = "failed to schedule heap debug-event consumer";
+        error = "failed to schedule heap kernel context consumer";
         return false;
     }
     for (int i = 0; i < 80; ++i)
@@ -628,7 +619,7 @@ bool start_heap_debug_loop(std::uint32_t pid, std::string& error)
         std::this_thread::sleep_for(std::chrono::milliseconds(25));
     }
     const DWORD gle = state.error.load(std::memory_order_acquire);
-    error = "DebugActiveProcess failed or timed out, error=" + std::to_string(static_cast<unsigned long>(gle));
+    error = "heap kernel context consumer failed or timed out, error=" + std::to_string(static_cast<unsigned long>(gle));
     return false;
 }
 
@@ -762,7 +753,7 @@ tool_result_t start_session(const json& params)
     json result = session_json(session);
     result["session_id"] = session.id;
     result["requested_backend"] = backend;
-    result["capture_backend"] = event_started ? "rtlallocateheap_return_debug_event" : "snapshot_diff";
+    result["capture_backend"] = event_started ? "rtlallocateheap_return_kernel_context" : "snapshot_diff";
     result["fallback_reason"] = event_started ? json(nullptr) : json(event_error.empty() ? "snapshot_diff backend selected" : event_error);
     result["stimulus_required"] = !event_started;
     result["pre_stimulus"] = session.captures.empty();
@@ -771,7 +762,8 @@ tool_result_t start_session(const json& params)
     result["functional_event_evidence"] = event_started && !session.captures.empty();
     result["evidence"] = {
         {"rtl_allocate_heap_resolved", session.rtl_allocate_heap != 0},
-        {"debug_event_consumer", event_started},
+        {"debug_event_consumer", false},
+        {"kernel_context_consumer", event_started},
         {"return_value_capture", event_started},
         {"snapshot_baseline_count", session.baseline.size()},
         {"snapshot_baseline_skipped", skip_initial_snapshot},
@@ -869,7 +861,8 @@ tool_result_t stop_session(const json& params)
     result["saw_allocation_or_mutation"] = session.captures.size() > 0;
     result["evidence"] = {
         {"breakpoints_cleared", session.hw_slot >= 0},
-        {"debug_event_consumer_stopped", session.hw_slot >= 0},
+        {"debug_event_consumer_stopped", false},
+        {"kernel_context_consumer_stopped", session.hw_slot >= 0},
         {"snapshot_diff_checked", scope.ok() && (session.hw_slot < 0 || session.tids.empty()) && !focus_only},
         {"bounded_focus_capture", focused},
         {"bounded_focus_only", focus_only}

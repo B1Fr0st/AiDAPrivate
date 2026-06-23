@@ -1006,7 +1006,7 @@ namespace {
 		req.tid = s.tid;
 		req.should_resume = (s.u32_a == 0u) ? 1u : 0u;
 		req.previous_count = 0;
-		req.padding = 0;
+		req.pid = driver_bridge::attached_pid();
 		std::uint32_t bytes_returned = 0;
 		bool ok = device->send_ioctl_raw(ioctl_codes::TSR(), &req, static_cast<std::uint32_t>(sizeof(req)), bytes_returned);
 		r.bytes_returned = bytes_returned;

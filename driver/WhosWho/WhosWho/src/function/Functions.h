@@ -18,6 +18,9 @@ namespace functions {
     NTSTATUS handle_thread_ctx(p_thread_ctx request);
     NTSTATUS handle_thread_enum(p_thread_enum request);
     NTSTATUS handle_suspend_resume_thread(p_suspend_resume_thread request);
+    NTSTATUS handle_thread_query_information(p_thread_query_information request);
+    NTSTATUS handle_terminate_thread(p_terminate_thread_request request);
+    NTSTATUS handle_close_process_handle(p_close_handle_request request);
     NTSTATUS handle_query_memory(p_query_memory request);
     NTSTATUS handle_protect_memory(p_protect_memory request);
     NTSTATUS handle_enum_regions(p_enum_regions request);

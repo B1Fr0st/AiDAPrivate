@@ -186,6 +186,9 @@ namespace ioctl_codes {
     __forceinline DWORD NLOG() { return make(57); }
     __forceinline DWORD NPKT() { return make(58); }
     __forceinline DWORD SSDT() { return make(59); }
+    __forceinline DWORD TQIF() { return make(60); }
+    __forceinline DWORD TTERM(){ return make(61); }
+    __forceinline DWORD HCLS() { return make(62); }
 
     __forceinline DWORD HWID() {
         return static_cast<DWORD>(CTL_CODE(FILE_DEVICE_UNKNOWN, 0xA1D0, METHOD_BUFFERED, FILE_READ_DATA));
@@ -389,9 +392,41 @@ namespace voyager {
             std::uint32_t tid;
             std::uint32_t should_resume;
             std::uint32_t previous_count;
-            std::uint32_t padding;
+            std::uint32_t pid;
         };
         static_assert(sizeof(suspend_resume_request) == 16, "suspend_resume_request size mismatch");
+
+        struct thread_query_information_request {
+            std::uint32_t pid;
+            std::uint32_t tid;
+            std::uint32_t info_class;
+            std::uint32_t return_length;
+            std::uint32_t status;
+            std::uint32_t padding;
+            std::int64_t exit_status;
+            std::uint64_t teb_base;
+            std::uint64_t client_process;
+            std::uint64_t client_thread;
+            std::uint64_t affinity_mask;
+            std::int32_t priority;
+            std::int32_t base_priority;
+        };
+        static_assert(sizeof(thread_query_information_request) == 72, "thread_query_information_request size mismatch");
+
+        struct terminate_thread_request {
+            std::uint32_t pid;
+            std::uint32_t tid;
+            std::uint32_t exit_status;
+            std::uint32_t status;
+        };
+        static_assert(sizeof(terminate_thread_request) == 16, "terminate_thread_request size mismatch");
+
+        struct close_handle_request {
+            std::uint32_t pid;
+            std::uint32_t status;
+            std::uint64_t handle_value;
+        };
+        static_assert(sizeof(close_handle_request) == 16, "close_handle_request size mismatch");
 
         struct query_memory_request {
             std::uint32_t pid;
@@ -1490,6 +1525,9 @@ namespace voyager {
         std::vector<thread_info> enumerate_threads() noexcept;
         bool suspend_thread(std::uint32_t tid, std::uint32_t* prev_count = nullptr) noexcept;
         bool resume_thread(std::uint32_t tid, std::uint32_t* prev_count = nullptr) noexcept;
+        bool query_thread_basic_information(std::uint32_t tid, detail::thread_query_information_request& info) noexcept;
+        bool terminate_thread(std::uint32_t tid, std::uint32_t exit_status = 0xDEADu) noexcept;
+        bool close_process_handle(std::uint32_t pid, std::uint64_t handle_value) noexcept;
         bool query_memory(std::uint64_t address, memory_region_info& info) noexcept;
         bool protect_memory(std::uint64_t address, std::uint64_t size, std::uint32_t new_protect, std::uint32_t* old_protect = nullptr) noexcept;
         std::vector<detail::region_entry> enumerate_memory_regions(std::uint64_t start = 0, std::uint64_t end_addr = 0, bool include_all = false) noexcept;

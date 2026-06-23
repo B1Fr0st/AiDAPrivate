@@ -1280,6 +1280,7 @@ bool launch_appcontainer(const launch_options_t& opts, launch_result_t& out) {
 
 	out.ok = true;
 	out.pid = pi.dwProcessId;
+	out.thread_id = pi.dwThreadId;
 	out.process_handle = reinterpret_cast<uintptr_t>(pi.hProcess);
 	out.thread_handle = reinterpret_cast<uintptr_t>(pi.hThread);
 	out.job_handle = reinterpret_cast<uintptr_t>(job);
@@ -1416,6 +1417,7 @@ bool launch_jobbed(const launch_options_t& opts, launch_result_t& out, bool /*in
 
 	out.ok = true;
 	out.pid = pi.dwProcessId;
+	out.thread_id = pi.dwThreadId;
 	out.process_handle = reinterpret_cast<uintptr_t>(pi.hProcess);
 	out.thread_handle = reinterpret_cast<uintptr_t>(pi.hThread);
 	out.job_handle = reinterpret_cast<uintptr_t>(job);
@@ -1809,6 +1811,7 @@ bool launch_malware_safe_desktop(const launch_options_t& opts, launch_result_t& 
 
 	out.ok = true;
 	out.pid = pi.dwProcessId;
+	out.thread_id = pi.dwThreadId;
 	out.process_handle = reinterpret_cast<uintptr_t>(pi.hProcess);
 	out.thread_handle = reinterpret_cast<uintptr_t>(pi.hThread);
 	out.job_handle = reinterpret_cast<uintptr_t>(job);
@@ -2082,6 +2085,7 @@ bool launch_windows_sandbox(const launch_options_t& opts, launch_result_t& out) 
 
 	out.ok = true;
 	out.pid = 0;
+	out.thread_id = 0;
 	out.process_handle = reinterpret_cast<uintptr_t>(pi.hProcess);
 	out.thread_handle = 0;
 	out.job_handle = 0;

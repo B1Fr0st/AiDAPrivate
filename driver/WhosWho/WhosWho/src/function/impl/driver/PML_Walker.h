@@ -31,6 +31,7 @@ namespace pml4
 
     inline void* g_mmonp_MmPfnDatabase = nullptr;
     inline volatile LONG g_pfndb_initialized = 0;
+    inline volatile LONG g_pfndb_summary_logged = 0;
 
     inline NTSTATUS InitializeMmPfnDatabase()
     {
@@ -75,6 +76,10 @@ namespace pml4
 
         if (!_MmGetVirtualForPhysical) {
             _InterlockedExchange(&g_pfndb_initialized, 2);
+            if (_InterlockedCompareExchange(&g_pfndb_summary_logged, 1, 0) == 0) {
+                WW_KERNEL_PATTERN_LOG_PTR("MmPfnDatabase", "semantic_scan", "MmGetVirtualForPhysical.Win10x64", nullptr, FALSE,
+                    "MmGetVirtualForPhysical export missing before pattern scan", "missing_MmGetVirtualForPhysical");
+            }
             return STATUS_PROCEDURE_NOT_FOUND;
         }
 
@@ -83,9 +88,14 @@ namespace pml4
         auto found = reinterpret_cast<UCHAR*>(split_memory(p_MmGetVirtualForPhysical, 0x30, patterns.bytes, patterns.bytes_size));
         if (!found) {
             _InterlockedExchange(&g_pfndb_initialized, 2);
+            if (_InterlockedCompareExchange(&g_pfndb_summary_logged, 1, 0) == 0) {
+                WW_KERNEL_PATTERN_LOG_PTR("MmPfnDatabase", "semantic_scan", "MmGetVirtualForPhysical.Win10x64", nullptr, FALSE,
+                    "searched first 0x30 bytes of MmGetVirtualForPhysical for PFN database immediate", "pattern_not_found");
+            }
             return STATUS_UNSUCCESSFUL;
         }
 
+        UCHAR* pattern_match = found;
         found += patterns.bytes_size;
 
         void* pfn_db = nullptr;
@@ -101,12 +111,29 @@ namespace pml4
 
         if (!pfn_db) {
             _InterlockedExchange(&g_pfndb_initialized, 2);
+            if (_InterlockedCompareExchange(&g_pfndb_summary_logged, 1, 0) == 0) {
+                WW_KERNEL_PATTERN_LOG_PTR("MmPfnDatabase", patterns.hard_coded ? "hardcoded_pattern" : "semantic_scan",
+                    "MmGetVirtualForPhysical.Win10x64", nullptr, FALSE,
+                    "pattern matched but decoded PFN database pointer was null after PAGE_ALIGN", "null_decoded_pointer");
+            }
             return STATUS_UNSUCCESSFUL;
         }
 
         g_mmonp_MmPfnDatabase = pfn_db;
         KeMemoryBarrier();
         _InterlockedExchange(&g_pfndb_initialized, 2);
+        if (_InterlockedCompareExchange(&g_pfndb_summary_logged, 1, 0) == 0) {
+            WW_LOG("KVALIDATE build=%lu kind=pattern name=MmPfnDatabase source=%s pattern=MmGetVirtualForPhysical.Win10x64 value=%p validation=%s evidence=\"primitive=%p match=%p search=0x30 pattern_len=%llu hardcoded=%u aligned=%p\" fail_closed=none",
+                ww_kernel_validation_build(),
+                patterns.hard_coded ? "hardcoded_pattern" : "semantic_scan",
+                pfn_db,
+                ww_kernel_validation_state(TRUE),
+                p_MmGetVirtualForPhysical,
+                pattern_match,
+                static_cast<unsigned long long>(patterns.bytes_size),
+                patterns.hard_coded ? 1u : 0u,
+                pfn_db);
+        }
 
         return STATUS_SUCCESS;
     }

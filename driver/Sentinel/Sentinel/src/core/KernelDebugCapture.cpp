@@ -313,6 +313,22 @@ namespace dbg_capture {
     {
         if (!data || len == 0 || KeGetCurrentIrql() != PASSIVE_LEVEL) return;
 
+        char ts[40];
+        size_t ts_len = 0;
+        LARGE_INTEGER sys_time, local_time;
+        TIME_FIELDS tf = {};
+        KeQuerySystemTime(&sys_time);
+        ExSystemTimeToLocalTime(&sys_time, &local_time);
+        RtlTimeToTimeFields(&local_time, &tf);
+        NTSTATUS ts_status = RtlStringCbPrintfA(ts, sizeof(ts),
+            "[%04u-%02u-%02u %02u:%02u:%02u.%03u] ",
+            (ULONG)tf.Year, (ULONG)tf.Month, (ULONG)tf.Day,
+            (ULONG)tf.Hour, (ULONG)tf.Minute, (ULONG)tf.Second,
+            (ULONG)tf.Milliseconds);
+        if (!NT_SUCCESS(ts_status) || !NT_SUCCESS(RtlStringCbLengthA(ts, sizeof(ts), &ts_len))) {
+            ts_len = 0;
+        }
+
         UNICODE_STRING path = current_log_path();
 
         OBJECT_ATTRIBUTES oa;
@@ -338,8 +354,14 @@ namespace dbg_capture {
             LARGE_INTEGER offset_li;
             offset_li.HighPart = -1;
             offset_li.LowPart = FILE_WRITE_TO_END_OF_FILE;
-            write_status = ZwWriteFile(hFile, NULL, NULL, NULL, &iosb,
-                const_cast<char*>(data), len, &offset_li, NULL);
+            if (ts_len > 0) {
+                write_status = ZwWriteFile(hFile, NULL, NULL, NULL, &iosb,
+                    ts, static_cast<ULONG>(ts_len), &offset_li, NULL);
+            }
+            if (NT_SUCCESS(write_status)) {
+                write_status = ZwWriteFile(hFile, NULL, NULL, NULL, &iosb,
+                    const_cast<char*>(data), len, &offset_li, NULL);
+            }
             ZwClose(hFile);
         } else if (NT_SUCCESS(st)) {
             write_status = STATUS_INVALID_HANDLE;

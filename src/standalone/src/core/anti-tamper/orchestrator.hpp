@@ -3297,6 +3297,70 @@ static bool finalize_post_resnap_inner()
             return false;
     }
 
+    {
+        bool reuse_existing = false;
+        size_t expected_pages = 0;
+        size_t existing_pages = 0;
+        uint64_t existing_epoch = 0;
+        uint64_t first_seq = 0;
+        uint64_t last_seq = 0;
+        {
+            std::lock_guard<std::mutex> lk(pt.mtx);
+            expected_pages = (rt.code_snap.text_size + integrity::detail::kPageSize - 1) / integrity::detail::kPageSize;
+            existing_pages = pt.entries.size();
+            existing_epoch = pt.key_epoch.load(std::memory_order_acquire);
+            if (!pt.entries.empty())
+            {
+                first_seq = pt.entries.front().seq;
+                last_seq = pt.entries.back().seq;
+            }
+            reuse_existing = pt.base == rt.code_snap.text_base &&
+                pt.size == rt.code_snap.text_size &&
+                expected_pages != 0 &&
+                existing_pages == expected_pages &&
+                !rt.block_chain.empty();
+            if (reuse_existing)
+            {
+                for (size_t i = 0; i < pt.entries.size(); ++i)
+                {
+                    if (pt.entries[i].seq != i)
+                    {
+                        reuse_existing = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if (reuse_existing)
+        {
+            integrity::clear_periodic_violation_flag();
+            webhook::write_log_critical_fmt("init",
+                "post_finalize_integrity_resnap_reuse_existing base=0x%llX size=0x%X pages=%zu expected_pages=%zu epoch=%llu hash=0x%016llX blocks=%zu module_base=0x%llX module_end=0x%llX first_seq=%llu last_seq=%llu",
+                static_cast<unsigned long long>(rt.code_snap.text_base),
+                rt.code_snap.text_size,
+                existing_pages,
+                expected_pages,
+                static_cast<unsigned long long>(existing_epoch),
+                static_cast<unsigned long long>(rt.code_snap.text_hash),
+                rt.block_chain.size(),
+                static_cast<unsigned long long>(rt.code_snap.module_base),
+                static_cast<unsigned long long>(rt.code_snap.module_end),
+                static_cast<unsigned long long>(first_seq),
+                static_cast<unsigned long long>(last_seq));
+            return true;
+        }
+        webhook::write_log_critical_fmt("init",
+            "post_finalize_integrity_resnap_rebuild_required base=0x%llX size=0x%X pages=%zu expected_pages=%zu epoch=%llu blocks=%zu first_seq=%llu last_seq=%llu",
+            static_cast<unsigned long long>(rt.code_snap.text_base),
+            rt.code_snap.text_size,
+            existing_pages,
+            expected_pages,
+            static_cast<unsigned long long>(existing_epoch),
+            rt.block_chain.size(),
+            static_cast<unsigned long long>(first_seq),
+            static_cast<unsigned long long>(last_seq));
+    }
+
     bool ok = false;
     size_t pages = 0;
     uint64_t old_base = 0;

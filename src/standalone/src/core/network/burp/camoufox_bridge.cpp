@@ -96,6 +96,12 @@ struct singleton_t
     uint64_t                                auto_restart_block_until_ms = 0;
     uint64_t                                auto_restart_block_generation = 0;
     std::string                             auto_restart_block_reason;
+    uint64_t                                launch_init_failure_block_until_ms = 0;
+    uint64_t                                launch_init_failure_block_generation = 0;
+    uint32_t                                launch_init_failure_block_count = 0;
+    DWORD                                   launch_init_failure_exit_code = 0;
+    std::string                             launch_init_failure_block_command;
+    std::string                             launch_init_failure_block_reason;
     std::atomic<bool>                       stop_requested{false};
     std::atomic<uint64_t>                   stop_epoch{0};
     std::atomic<uint32_t>                   tracked_child_pid{0};
@@ -213,12 +219,65 @@ constexpr int kNavigationWaitMaxMs = 50000;
 constexpr uint64_t kPythonDiscoveryBudgetMs = 15000;
 constexpr uint64_t kActivityDrainWaitMs = 45000;
 constexpr uint64_t kAutoRestartBlockMs = 120000;
+constexpr DWORD kBridgeChildErrorMode = SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX;
+constexpr DWORD kProcessInitializationFailureExitCode = 0xC0000142;
+constexpr uint64_t kLaunchInitFailureBlockBaseMs = 120000;
+constexpr uint64_t kLaunchInitFailureBlockMaxMs = 600000;
 thread_local uint32_t g_bridge_activity_depth = 0;
 
 const char* safe_reason(const char* reason)
 {
     return (reason && reason[0]) ? reason : "unspecified";
 }
+
+class scoped_child_error_mode_t
+{
+public:
+    scoped_child_error_mode_t(const char* phase, DWORD create_flags, const char* command)
+        : phase_(safe_reason(phase)),
+          command_(command ? command : "<null>"),
+          previous_(GetErrorMode()),
+          desired_(previous_ | kBridgeChildErrorMode)
+    {
+        const DWORD returned_previous = SetErrorMode(desired_);
+        applied_ = GetErrorMode();
+        diag::log_tagged_fmt("camoufox", "child_error_mode_set phase=%s create_flags=0x%08lX inherited_error_mode=%d default_error_mode_flag=%d previous=0x%08lX returned_previous=0x%08lX desired=0x%08lX applied=0x%08lX command=%s",
+            phase_.c_str(),
+            static_cast<unsigned long>(create_flags),
+            (create_flags & CREATE_DEFAULT_ERROR_MODE) == 0 ? 1 : 0,
+            (create_flags & CREATE_DEFAULT_ERROR_MODE) != 0 ? 1 : 0,
+            static_cast<unsigned long>(previous_),
+            static_cast<unsigned long>(returned_previous),
+            static_cast<unsigned long>(desired_),
+            static_cast<unsigned long>(applied_),
+            command_.c_str());
+    }
+
+    scoped_child_error_mode_t(const scoped_child_error_mode_t&) = delete;
+    scoped_child_error_mode_t& operator=(const scoped_child_error_mode_t&) = delete;
+
+    ~scoped_child_error_mode_t()
+    {
+        const DWORD before_restore = GetErrorMode();
+        const DWORD returned_previous = SetErrorMode(previous_);
+        const DWORD after_restore = GetErrorMode();
+        diag::log_tagged_fmt("camoufox", "child_error_mode_restore phase=%s previous=0x%08lX applied=0x%08lX before_restore=0x%08lX returned_previous=0x%08lX after_restore=0x%08lX command=%s",
+            phase_.c_str(),
+            static_cast<unsigned long>(previous_),
+            static_cast<unsigned long>(applied_),
+            static_cast<unsigned long>(before_restore),
+            static_cast<unsigned long>(returned_previous),
+            static_cast<unsigned long>(after_restore),
+            command_.c_str());
+    }
+
+private:
+    std::string phase_;
+    std::string command_;
+    DWORD previous_ = 0;
+    DWORD desired_ = 0;
+    DWORD applied_ = 0;
+};
 
 std::atomic<bool>& prewarm_default_requested()
 {
@@ -1547,68 +1606,85 @@ bool spawn_capture_impl(const std::wstring& application_path, std::wstring cmdli
     create_flags |= EXTENDED_STARTUPINFO_PRESENT;
     sx.StartupInfo.cb = sizeof(sx);
     const uint64_t create_t0 = now_ms();
-    diag::log_tagged_fmt("camoufox", "spawn_capture create_begin label=%s app=%s cwd=%s cmd_len=%zu timeout_ms=%lu handle_list=%d elapsed_ms=%llu",
+    diag::log_tagged_fmt("camoufox", "spawn_capture create_begin label=%s app=%s cwd=%s cmd_len=%zu timeout_ms=%lu handle_list=%d create_flags=0x%08lX inherited_error_mode=%d process_error_mode_before=0x%08lX desired_child_error_mode=0x%08lX elapsed_ms=%llu",
         spawn_label,
         app_log.c_str(),
         cwd_log.c_str(),
         cmdline.size(),
         static_cast<unsigned long>(timeout_ms),
         attr_ready ? 1 : 0,
+        static_cast<unsigned long>(create_flags),
+        (create_flags & CREATE_DEFAULT_ERROR_MODE) == 0 ? 1 : 0,
+        static_cast<unsigned long>(GetErrorMode()),
+        static_cast<unsigned long>(GetErrorMode() | kBridgeChildErrorMode),
         static_cast<unsigned long long>(create_t0 - t0));
-    std::wstring primary_cmdline = cmdline;
-    BOOL ok = CreateProcessW(
-        application_path.empty() ? nullptr : application_path.c_str(),
-        primary_cmdline.empty() ? nullptr : primary_cmdline.data(),
-        nullptr,
-        nullptr,
-        TRUE,
-        create_flags,
-        nullptr,
-        working_directory.empty() ? nullptr : working_directory.c_str(),
-        &sx.StartupInfo,
-        &pi);
-    DWORD create_gle = ok ? 0 : GetLastError();
-    diag::log_tagged_fmt("camoufox", "spawn_capture create_result label=%s ok=%d gle=%lu elapsed_ms=%llu create_elapsed_ms=%llu cmd_len=%zu",
-        spawn_label,
-        ok ? 1 : 0,
-        create_gle,
-        static_cast<unsigned long long>(now_ms() - t0),
-        static_cast<unsigned long long>(now_ms() - create_t0),
-        cmdline.size());
-    if (attr_ready)
-        DeleteProcThreadAttributeList(sx.lpAttributeList);
-    if (!ok && create_gle == ERROR_INVALID_PARAMETER)
+    BOOL ok = FALSE;
+    DWORD create_gle = ERROR_SUCCESS;
     {
-        STARTUPINFOW si{};
-        si.cb         = sizeof(si);
-        si.dwFlags    = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
-        si.hStdOutput = wr;
-        si.hStdError  = wr;
-        si.hStdInput  = child_stdin;
-        si.wShowWindow = SW_HIDE;
-        const uint64_t fallback_t0 = now_ms();
-        std::wstring fallback_cmdline = cmdline;
-        SetLastError(0);
+        scoped_child_error_mode_t child_error_mode("spawn_capture", create_flags, app_log.c_str());
+        std::wstring primary_cmdline = cmdline;
         ok = CreateProcessW(
             application_path.empty() ? nullptr : application_path.c_str(),
-            fallback_cmdline.empty() ? nullptr : fallback_cmdline.data(),
+            primary_cmdline.empty() ? nullptr : primary_cmdline.data(),
             nullptr,
             nullptr,
             TRUE,
-            CREATE_NO_WINDOW,
+            create_flags,
             nullptr,
             working_directory.empty() ? nullptr : working_directory.c_str(),
-            &si,
+            &sx.StartupInfo,
             &pi);
         create_gle = ok ? 0 : GetLastError();
-        diag::log_tagged_fmt("camoufox", "spawn_capture fallback_create_result label=%s ok=%d gle=%lu elapsed_ms=%llu fallback_elapsed_ms=%llu cmd_len=%zu",
+        diag::log_tagged_fmt("camoufox", "spawn_capture create_result label=%s ok=%d gle=%lu elapsed_ms=%llu create_elapsed_ms=%llu cmd_len=%zu",
             spawn_label,
             ok ? 1 : 0,
             create_gle,
             static_cast<unsigned long long>(now_ms() - t0),
-            static_cast<unsigned long long>(now_ms() - fallback_t0),
+            static_cast<unsigned long long>(now_ms() - create_t0),
             cmdline.size());
+        if (!ok && create_gle == ERROR_INVALID_PARAMETER)
+        {
+            STARTUPINFOW si{};
+            si.cb         = sizeof(si);
+            si.dwFlags    = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+            si.hStdOutput = wr;
+            si.hStdError  = wr;
+            si.hStdInput  = child_stdin;
+            si.wShowWindow = SW_HIDE;
+            const DWORD fallback_create_flags = CREATE_NO_WINDOW;
+            const uint64_t fallback_t0 = now_ms();
+            std::wstring fallback_cmdline = cmdline;
+            diag::log_tagged_fmt("camoufox", "spawn_capture fallback_create_begin label=%s create_flags=0x%08lX inherited_error_mode=%d process_error_mode_current=0x%08lX desired_child_error_mode=0x%08lX cmd_len=%zu",
+                spawn_label,
+                static_cast<unsigned long>(fallback_create_flags),
+                (fallback_create_flags & CREATE_DEFAULT_ERROR_MODE) == 0 ? 1 : 0,
+                static_cast<unsigned long>(GetErrorMode()),
+                static_cast<unsigned long>(GetErrorMode() | kBridgeChildErrorMode),
+                cmdline.size());
+            SetLastError(0);
+            ok = CreateProcessW(
+                application_path.empty() ? nullptr : application_path.c_str(),
+                fallback_cmdline.empty() ? nullptr : fallback_cmdline.data(),
+                nullptr,
+                nullptr,
+                TRUE,
+                fallback_create_flags,
+                nullptr,
+                working_directory.empty() ? nullptr : working_directory.c_str(),
+                &si,
+                &pi);
+            create_gle = ok ? 0 : GetLastError();
+            diag::log_tagged_fmt("camoufox", "spawn_capture fallback_create_result label=%s ok=%d gle=%lu elapsed_ms=%llu fallback_elapsed_ms=%llu cmd_len=%zu",
+                spawn_label,
+                ok ? 1 : 0,
+                create_gle,
+                static_cast<unsigned long long>(now_ms() - t0),
+                static_cast<unsigned long long>(now_ms() - fallback_t0),
+                cmdline.size());
+        }
     }
+    if (attr_ready)
+        DeleteProcThreadAttributeList(sx.lpAttributeList);
     CloseHandle(wr);
     CloseHandle(child_stdin);
     if (!ok)
@@ -2407,6 +2483,128 @@ bool auto_restart_blocked_locked(uint64_t now, std::string& reason, uint64_t& re
     return true;
 }
 
+std::string ascii_lower_copy(std::string text)
+{
+    for (char& ch : text)
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    return text;
+}
+
+bool reports_process_initialization_failure(const std::string& error)
+{
+    if (error.empty())
+        return false;
+    const std::string lower = ascii_lower_copy(error);
+    return lower.find("3221225794") != std::string::npos ||
+           lower.find("0xc0000142") != std::string::npos ||
+           lower.find("c0000142") != std::string::npos;
+}
+
+uint64_t launch_init_failure_block_duration_locked()
+{
+    uint64_t duration = kLaunchInitFailureBlockBaseMs;
+    const uint32_t multiplier_steps = sg().launch_init_failure_block_count > 4 ? 4 : sg().launch_init_failure_block_count;
+    for (uint32_t i = 0; i < multiplier_steps; ++i)
+    {
+        if (duration >= kLaunchInitFailureBlockMaxMs / 2)
+        {
+            duration = kLaunchInitFailureBlockMaxMs;
+            break;
+        }
+        duration *= 2;
+    }
+    if (duration > kLaunchInitFailureBlockMaxMs)
+        duration = kLaunchInitFailureBlockMaxMs;
+    return duration;
+}
+
+void clear_launch_init_failure_block_locked(const char* reason)
+{
+    if (sg().launch_init_failure_block_until_ms == 0)
+        return;
+    const uint64_t now = now_ms();
+    diag::log_tagged_fmt("camoufox", "launch_init_failure_block_clear reason=%s blocked_reason=%s generation=%llu count=%lu exit_code=0x%08lX remaining_ms=%llu command=%s",
+        safe_reason(reason),
+        sg().launch_init_failure_block_reason.c_str(),
+        static_cast<unsigned long long>(sg().launch_init_failure_block_generation),
+        static_cast<unsigned long>(sg().launch_init_failure_block_count),
+        static_cast<unsigned long>(sg().launch_init_failure_exit_code),
+        static_cast<unsigned long long>(sg().launch_init_failure_block_until_ms > now ? sg().launch_init_failure_block_until_ms - now : 0),
+        sg().launch_init_failure_block_command.empty() ? "<empty>" : sg().launch_init_failure_block_command.c_str());
+    sg().launch_init_failure_block_until_ms = 0;
+    sg().launch_init_failure_block_generation = 0;
+    sg().launch_init_failure_exit_code = 0;
+    sg().launch_init_failure_block_command.clear();
+    sg().launch_init_failure_block_reason.clear();
+}
+
+void reset_launch_init_failure_block_locked(const char* reason)
+{
+    const uint32_t old_count = sg().launch_init_failure_block_count;
+    const uint64_t old_until = sg().launch_init_failure_block_until_ms;
+    clear_launch_init_failure_block_locked(reason);
+    if (old_count != 0 || old_until != 0)
+    {
+        diag::log_tagged_fmt("camoufox", "launch_init_failure_block_reset reason=%s old_count=%lu active=%d",
+            safe_reason(reason),
+            static_cast<unsigned long>(old_count),
+            old_until != 0 ? 1 : 0);
+    }
+    sg().launch_init_failure_block_count = 0;
+    sg().launch_init_failure_exit_code = 0;
+    sg().launch_init_failure_block_command.clear();
+    sg().launch_init_failure_block_reason.clear();
+}
+
+void block_launch_after_process_init_failure_locked(const std::string& command, uint64_t generation, const std::string& reason)
+{
+    if (_stricmp(sg().launch_init_failure_block_command.c_str(), command.c_str()) != 0)
+        sg().launch_init_failure_block_count = 0;
+    const uint64_t duration_ms = launch_init_failure_block_duration_locked();
+    sg().launch_init_failure_block_count++;
+    if (sg().launch_init_failure_block_count > 16)
+        sg().launch_init_failure_block_count = 16;
+    const uint64_t until_ms = now_ms() + duration_ms;
+    sg().launch_init_failure_block_until_ms = until_ms;
+    sg().launch_init_failure_block_generation = generation;
+    sg().launch_init_failure_exit_code = kProcessInitializationFailureExitCode;
+    sg().launch_init_failure_block_command = command;
+    sg().launch_init_failure_block_reason = reason;
+    diag::log_tagged_fmt("camoufox", "launch_init_failure_block_set generation=%llu count=%lu duration_ms=%llu until_ms=%llu exit_code=0x%08lX command=%s reason=%s",
+        static_cast<unsigned long long>(generation),
+        static_cast<unsigned long>(sg().launch_init_failure_block_count),
+        static_cast<unsigned long long>(duration_ms),
+        static_cast<unsigned long long>(until_ms),
+        static_cast<unsigned long>(kProcessInitializationFailureExitCode),
+        command.empty() ? "<empty>" : command.c_str(),
+        reason.c_str());
+}
+
+bool launch_init_failure_blocked_locked(const std::string& command, uint64_t now, std::string& reason, uint64_t& remaining_ms, uint64_t& generation, uint32_t& count)
+{
+    if (sg().launch_init_failure_block_until_ms == 0)
+        return false;
+    if (now >= sg().launch_init_failure_block_until_ms)
+    {
+        clear_launch_init_failure_block_locked("expired");
+        return false;
+    }
+    if (_stricmp(sg().launch_init_failure_block_command.c_str(), command.c_str()) != 0)
+    {
+        diag::log_tagged_fmt("camoufox", "launch_init_failure_block_command_changed old=%s new=%s remaining_ms=%llu",
+            sg().launch_init_failure_block_command.empty() ? "<empty>" : sg().launch_init_failure_block_command.c_str(),
+            command.empty() ? "<empty>" : command.c_str(),
+            static_cast<unsigned long long>(sg().launch_init_failure_block_until_ms - now));
+        clear_launch_init_failure_block_locked("command_changed");
+        return false;
+    }
+    reason = sg().launch_init_failure_block_reason;
+    remaining_ms = sg().launch_init_failure_block_until_ms - now;
+    generation = sg().launch_init_failure_block_generation;
+    count = sg().launch_init_failure_block_count;
+    return true;
+}
+
 int clamp_launch_wait_ms(int requested)
 {
     int wait_ms = requested > 0 ? requested : kLaunchWaitMaxMs;
@@ -2557,15 +2755,6 @@ void clear_error_locked()
         diag::log_tagged_fmt("camoufox", "clearing_last_error previous_len=%zu", sg().last_error.size());
         sg().last_error.clear();
     }
-}
-
-std::string ascii_lower_copy(std::string s)
-{
-    for (char& c : s)
-    {
-        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + 32);
-    }
-    return s;
 }
 
 bool is_driver_closed_error(const std::string& msg)
@@ -6148,12 +6337,45 @@ bool start_bridge(const launch_config_t& cfg)
     scfg.auto_connect            = false;
     scfg.oauth_enabled           = false;
 
+    const DWORD mcp_create_flags = CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT;
+    std::string init_block_reason;
+    uint64_t init_block_remaining_ms = 0;
+    uint64_t init_block_generation = 0;
+    uint32_t init_block_count = 0;
+    if (launch_init_failure_blocked_locked(scfg.command, now_ms(), init_block_reason, init_block_remaining_ms, init_block_generation, init_block_count))
+    {
+        sg().state = bridge_state_t::error;
+        sg().last_launch_ms = now_ms() - bridge_start_ms;
+        sg().last_error = "camoufox reverse-MCP launch blocked after immediate process initialization failure; retry after " +
+            std::to_string(init_block_remaining_ms) + "ms";
+        sg().last_launch_diagnostics = {
+            {"status", "blocked"},
+            {"phase", "process_initialization_failure_backoff"},
+            {"generation", start_generation},
+            {"blocked_generation", init_block_generation},
+            {"remaining_ms", init_block_remaining_ms},
+            {"count", init_block_count},
+            {"exit_code", "0xC0000142"},
+            {"command", scfg.command},
+            {"reason", init_block_reason}
+        };
+        diag::log_tagged_fmt("camoufox", "start_bridge launch_init_failure_blocked generation=%llu blocked_generation=%llu remaining_ms=%llu count=%lu command=%s reason=%s",
+            static_cast<unsigned long long>(start_generation),
+            static_cast<unsigned long long>(init_block_generation),
+            static_cast<unsigned long long>(init_block_remaining_ms),
+            static_cast<unsigned long>(init_block_count),
+            scfg.command.empty() ? "<empty>" : scfg.command.c_str(),
+            init_block_reason.c_str());
+        publish_state(bridge_state_t::error, sg().last_error);
+        return false;
+    }
+
     sg().client = std::make_shared<mcp_client::client_t>();
     const std::string cwd_log = wide_to_utf8(current_dir_w());
     const auto workdir_it = scfg.env.find("AIDA_CAMOUFOX_WORKING_DIR");
     const auto profile_it = scfg.env.find("AIDA_CAMOUFOX_PROFILE_ROOT");
 
-    diag::log_tagged_fmt("camoufox", "start_bridge mcp_connect_begin generation=%llu mode=%s command=%s module=%s args=%zu cwd=%s workdir=%s profile_root=%s debug_log=%s timeout_ms=%d env_pythonio=%d env_browser=%d env_debug_log=%d env_workdir=%d env_profile=%d browser_exists=%d last_gle=%lu",
+    diag::log_tagged_fmt("camoufox", "start_bridge mcp_connect_begin generation=%llu mode=%s command=%s module=%s args=%zu cwd=%s workdir=%s profile_root=%s debug_log=%s timeout_ms=%d env_pythonio=%d env_browser=%d env_debug_log=%d env_workdir=%d env_profile=%d browser_exists=%d last_gle=%lu create_flags=0x%08lX inherited_error_mode=%d process_error_mode_before=0x%08lX desired_child_error_mode=0x%08lX",
         static_cast<unsigned long long>(start_generation),
         runtime_mode_name(use_server_executable),
         scfg.command.c_str(),
@@ -6170,18 +6392,44 @@ bool start_bridge(const launch_config_t& cfg)
         static_cast<int>(scfg.env.find("AIDA_CAMOUFOX_WORKING_DIR") != scfg.env.end()),
         static_cast<int>(scfg.env.find("AIDA_CAMOUFOX_PROFILE_ROOT") != scfg.env.end()),
         static_cast<int>(browser_attr != INVALID_FILE_ATTRIBUTES && (browser_attr & FILE_ATTRIBUTE_DIRECTORY) == 0),
-        static_cast<unsigned long>(server_attr_gle));
-    if (!sg().client->connect(scfg))
+        static_cast<unsigned long>(server_attr_gle),
+        static_cast<unsigned long>(mcp_create_flags),
+        (mcp_create_flags & CREATE_DEFAULT_ERROR_MODE) == 0 ? 1 : 0,
+        static_cast<unsigned long>(GetErrorMode()),
+        static_cast<unsigned long>(GetErrorMode() | kBridgeChildErrorMode));
+    bool connect_ok = false;
+    {
+        scoped_child_error_mode_t mcp_child_error_mode("start_bridge_mcp_connect", mcp_create_flags, scfg.command.c_str());
+        connect_ok = sg().client->connect(scfg);
+    }
+    if (!connect_ok)
     {
         std::string inner = sg().client->last_error();
+        const bool process_init_failure = use_server_executable && reports_process_initialization_failure(inner);
+        if (process_init_failure)
+            block_launch_after_process_init_failure_locked(scfg.command, start_generation, inner);
         sg().client.reset();
         sg().state      = bridge_state_t::error;
         sg().last_error = std::string("client connect failed: ") + (inner.empty() ? std::string("(no detail)") : inner);
-        diag::log_tagged_fmt("camoufox", "start_bridge mcp_connect_failed generation=%llu err=%s",
-            static_cast<unsigned long long>(start_generation), sg().last_error.c_str());
+        if (process_init_failure)
+        {
+            sg().last_launch_diagnostics = {
+                {"status", "error"},
+                {"phase", "process_initialization_failure"},
+                {"generation", start_generation},
+                {"exit_code", "0xC0000142"},
+                {"command", scfg.command},
+                {"error", inner}
+            };
+        }
+        diag::log_tagged_fmt("camoufox", "start_bridge mcp_connect_failed generation=%llu process_init_failure=%d err=%s",
+            static_cast<unsigned long long>(start_generation),
+            process_init_failure ? 1 : 0,
+            sg().last_error.c_str());
         publish_state(bridge_state_t::error, sg().last_error);
         return false;
     }
+    reset_launch_init_failure_block_locked("start_bridge_mcp_connect_success");
     sg().server_command = use_server_executable
         ? server_executable
         : python_path + " -m " + (effective_cfg.server_module.empty() ? std::string("camoufox_reverse_mcp") : effective_cfg.server_module);
@@ -8230,11 +8478,46 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
         session->active_profile_generated = false;
         session->active_page_id.clear();
         session->generation++;
+        managed_generation = session->generation;
     }
     const std::string cwd_log = wide_to_utf8(current_dir_w());
     const auto workdir_it = scfg.env.find("AIDA_CAMOUFOX_WORKING_DIR");
     const auto profile_it = scfg.env.find("AIDA_CAMOUFOX_PROFILE_ROOT");
-    diag::log_tagged_fmt("camoufox", "managed_start connect session_id=%s mode=%s command=%s module=%s args=%zu cwd=%s workdir=%s profile_root=%s debug_log=%s timeout_ms=%d env_browser=%d env_workdir=%d env_profile=%d last_gle=%lu",
+    const DWORD mcp_create_flags = CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT;
+    {
+        std::lock_guard<std::recursive_mutex> glk(sg().mtx);
+        std::string init_block_reason;
+        uint64_t init_block_remaining_ms = 0;
+        uint64_t init_block_generation = 0;
+        uint32_t init_block_count = 0;
+        if (launch_init_failure_blocked_locked(scfg.command, now_ms(), init_block_reason, init_block_remaining_ms, init_block_generation, init_block_count))
+        {
+            std::lock_guard<std::recursive_mutex> lk(session->mtx);
+            session->state = bridge_state_t::error;
+            session->last_error = "camoufox reverse-MCP launch blocked after immediate process initialization failure; retry after " +
+                std::to_string(init_block_remaining_ms) + "ms";
+            session->last_launch_diagnostics = {
+                {"status", "blocked"},
+                {"phase", "process_initialization_failure_backoff"},
+                {"session_id", sid},
+                {"blocked_generation", init_block_generation},
+                {"remaining_ms", init_block_remaining_ms},
+                {"count", init_block_count},
+                {"exit_code", "0xC0000142"},
+                {"command", scfg.command},
+                {"reason", init_block_reason}
+            };
+            diag::log_tagged_fmt("camoufox", "managed_start launch_init_failure_blocked session_id=%s blocked_generation=%llu remaining_ms=%llu count=%lu command=%s reason=%s",
+                sid.c_str(),
+                static_cast<unsigned long long>(init_block_generation),
+                static_cast<unsigned long long>(init_block_remaining_ms),
+                static_cast<unsigned long>(init_block_count),
+                scfg.command.empty() ? "<empty>" : scfg.command.c_str(),
+                init_block_reason.c_str());
+            return false;
+        }
+    }
+    diag::log_tagged_fmt("camoufox", "managed_start connect session_id=%s mode=%s command=%s module=%s args=%zu cwd=%s workdir=%s profile_root=%s debug_log=%s timeout_ms=%d env_browser=%d env_workdir=%d env_profile=%d last_gle=%lu create_flags=0x%08lX inherited_error_mode=%d process_error_mode_before=0x%08lX desired_child_error_mode=0x%08lX",
         sid.c_str(),
         runtime_mode_name(use_server_executable),
         scfg.command.c_str(),
@@ -8248,13 +8531,50 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
         static_cast<int>(scfg.env.find("AIDA_CAMOUFOX_EXECUTABLE") != scfg.env.end()),
         static_cast<int>(scfg.env.find("AIDA_CAMOUFOX_WORKING_DIR") != scfg.env.end()),
         static_cast<int>(scfg.env.find("AIDA_CAMOUFOX_PROFILE_ROOT") != scfg.env.end()),
-        static_cast<unsigned long>(server_attr_gle));
-    if (!cli->connect(scfg))
+        static_cast<unsigned long>(server_attr_gle),
+        static_cast<unsigned long>(mcp_create_flags),
+        (mcp_create_flags & CREATE_DEFAULT_ERROR_MODE) == 0 ? 1 : 0,
+        static_cast<unsigned long>(GetErrorMode()),
+        static_cast<unsigned long>(GetErrorMode() | kBridgeChildErrorMode));
+    bool managed_connect_ok = false;
     {
+        scoped_child_error_mode_t mcp_child_error_mode("managed_start_mcp_connect", mcp_create_flags, scfg.command.c_str());
+        managed_connect_ok = cli->connect(scfg);
+    }
+    if (!managed_connect_ok)
+    {
+        const std::string connect_error = cli->last_error();
+        const bool process_init_failure = use_server_executable && reports_process_initialization_failure(connect_error);
+        if (process_init_failure)
+        {
+            std::lock_guard<std::recursive_mutex> glk(sg().mtx);
+            block_launch_after_process_init_failure_locked(scfg.command, managed_generation, connect_error);
+        }
         std::lock_guard<std::recursive_mutex> lk(session->mtx);
         session->state = bridge_state_t::error;
-        session->last_error = std::string("managed client connect failed: ") + cli->last_error();
+        session->last_error = std::string("managed client connect failed: ") + connect_error;
+        if (process_init_failure)
+        {
+            session->last_launch_diagnostics = {
+                {"status", "error"},
+                {"phase", "process_initialization_failure"},
+                {"session_id", sid},
+                {"generation", managed_generation},
+                {"exit_code", "0xC0000142"},
+                {"command", scfg.command},
+                {"error", connect_error}
+            };
+        }
+        diag::log_tagged_fmt("camoufox", "managed_start connect_failed session_id=%s generation=%llu process_init_failure=%d err=%s",
+            sid.c_str(),
+            static_cast<unsigned long long>(managed_generation),
+            process_init_failure ? 1 : 0,
+            session->last_error.c_str());
         return false;
+    }
+    {
+        std::lock_guard<std::recursive_mutex> glk(sg().mtx);
+        reset_launch_init_failure_block_locked("managed_start_mcp_connect_success");
     }
     {
         std::lock_guard<std::recursive_mutex> lk(session->mtx);

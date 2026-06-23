@@ -718,6 +718,166 @@ static PDRIVER_OBJECT find_target_driver_object(PVOID target_base) {
     return nullptr;
 }
 
+static BOOLEAN refresh_target_handoff_from_partial_state(const char* phase) {
+    LARGE_INTEGER freq = {};
+    LARGE_INTEGER start = KeQueryPerformanceCounter(&freq);
+    PVOID handoff_base = nullptr;
+    PVOID handoff_object = nullptr;
+    ULONG handoff_size = 0;
+    init_read_target_handoff(&handoff_base, &handoff_size, &handoff_object);
+
+    if (init_target_handoff_ready(handoff_base, handoff_size)) {
+        SN_LOG("init_thread: partial_refresh phase=%s already_ready base=%p size=0x%lx object=%p elapsed_us=%lu",
+            phase ? phase : "unknown",
+            handoff_base,
+            handoff_size,
+            handoff_object,
+            init_elapsed_us(start, freq));
+        return TRUE;
+    }
+
+    SN_LOG("init_thread: partial_refresh phase=%s entry base=%p size=0x%lx object=%p irql=%lu elapsed_us=%lu",
+        phase ? phase : "unknown",
+        handoff_base,
+        handoff_size,
+        handoff_object,
+        static_cast<ULONG>(KeGetCurrentIrql()),
+        init_elapsed_us(start, freq));
+
+    if (handoff_object) {
+        PDRIVER_OBJECT driver_object = static_cast<PDRIVER_OBJECT>(handoff_object);
+        PDEVICE_OBJECT device_object = nullptr;
+        PVOID candidate_base = nullptr;
+        ULONG candidate_size = 0;
+        BOOLEAN object_valid = FALSE;
+        BOOLEAN shape_ok = FALSE;
+        BOOLEAN base_match = FALSE;
+        BOOLEAN bridge_ok = FALSE;
+
+        __try {
+            if (_MmIsAddressValid(driver_object))
+                device_object = driver_object->DeviceObject;
+            shape_ok = extract_target_driver_image_candidate(driver_object, device_object, &candidate_base, &candidate_size);
+            base_match = (!handoff_base || candidate_base == handoff_base) ? TRUE : FALSE;
+            if (shape_ok && base_match)
+                bridge_ok = heartbeat::locate_bridge(candidate_base, candidate_size) ? TRUE : FALSE;
+            if (shape_ok && base_match && bridge_ok)
+                object_valid = validate_target_driver_object(driver_object, candidate_base);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            SN_LOG("init_thread: partial_refresh phase=%s object_exception code=0x%08lx object=%p elapsed_us=%lu",
+                phase ? phase : "unknown",
+                GetExceptionCode(),
+                handoff_object,
+                init_elapsed_us(start, freq));
+        }
+
+        SN_LOG("init_thread: partial_refresh phase=%s object_candidate shape=%u base_match=%u bridge=%u object_valid=%u object=%p device=%p candidate_base=%p candidate_size=0x%lx handoff_base=%p handoff_size=0x%lx elapsed_us=%lu",
+            phase ? phase : "unknown",
+            shape_ok ? 1u : 0u,
+            base_match ? 1u : 0u,
+            bridge_ok ? 1u : 0u,
+            object_valid ? 1u : 0u,
+            handoff_object,
+            device_object,
+            candidate_base,
+            candidate_size,
+            handoff_base,
+            handoff_size,
+            init_elapsed_us(start, freq));
+
+        if (shape_ok && base_match && bridge_ok && object_valid && init_target_handoff_ready(candidate_base, candidate_size)) {
+            g_target_driver_base = candidate_base;
+            g_target_driver_size = candidate_size;
+            g_target_driver_object = driver_object;
+            SN_LOG("init_thread: partial_refresh phase=%s object_success base=%p size=0x%lx object=%p bridge=%p elapsed_us=%lu",
+                phase ? phase : "unknown",
+                candidate_base,
+                candidate_size,
+                driver_object,
+                heartbeat::g_bridge,
+                init_elapsed_us(start, freq));
+            return TRUE;
+        }
+    }
+
+    if (handoff_base) {
+        PVOID candidate_base = handoff_base;
+        ULONG candidate_size = 0;
+        BOOLEAN header_ok = FALSE;
+        BOOLEAN size_match = FALSE;
+        BOOLEAN bridge_ok = FALSE;
+        BOOLEAN object_ok = FALSE;
+
+        __try {
+            if (reinterpret_cast<ULONG_PTR>(candidate_base) >= 0xFFFF800000000000ULL &&
+                _MmIsAddressValid(candidate_base)) {
+                PIMAGE_DOS_HEADER dos = static_cast<PIMAGE_DOS_HEADER>(candidate_base);
+                if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+                    PIMAGE_NT_HEADERS64 nt = reinterpret_cast<PIMAGE_NT_HEADERS64>(
+                        static_cast<UCHAR*>(candidate_base) + dos->e_lfanew);
+                    if (_MmIsAddressValid(nt) &&
+                        nt->Signature == IMAGE_NT_SIGNATURE &&
+                        nt->OptionalHeader.SizeOfImage != 0 &&
+                        nt->OptionalHeader.SizeOfImage <= 50 * 1024 * 1024) {
+                        candidate_size = nt->OptionalHeader.SizeOfImage;
+                        header_ok = TRUE;
+                    }
+                }
+            }
+            size_match = (handoff_size == 0 || handoff_size == candidate_size) ? TRUE : FALSE;
+            if (header_ok && size_match)
+                bridge_ok = heartbeat::locate_bridge(candidate_base, candidate_size) ? TRUE : FALSE;
+            if (bridge_ok && handoff_object)
+                object_ok = validate_target_driver_object(static_cast<PDRIVER_OBJECT>(handoff_object), candidate_base);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            SN_LOG("init_thread: partial_refresh phase=%s header_exception code=0x%08lx base=%p elapsed_us=%lu",
+                phase ? phase : "unknown",
+                GetExceptionCode(),
+                handoff_base,
+                init_elapsed_us(start, freq));
+        }
+
+        SN_LOG("init_thread: partial_refresh phase=%s header_candidate header=%u size_match=%u bridge=%u object_valid=%u base=%p candidate_size=0x%lx handoff_size=0x%lx object=%p elapsed_us=%lu",
+            phase ? phase : "unknown",
+            header_ok ? 1u : 0u,
+            size_match ? 1u : 0u,
+            bridge_ok ? 1u : 0u,
+            object_ok ? 1u : 0u,
+            candidate_base,
+            candidate_size,
+            handoff_size,
+            handoff_object,
+            init_elapsed_us(start, freq));
+
+        if (header_ok && size_match && bridge_ok && init_target_handoff_ready(candidate_base, candidate_size)) {
+            g_target_driver_base = candidate_base;
+            g_target_driver_size = candidate_size;
+            if (object_ok)
+                g_target_driver_object = handoff_object;
+            SN_LOG("init_thread: partial_refresh phase=%s header_success base=%p size=0x%lx object=%p object_valid=%u bridge=%p elapsed_us=%lu",
+                phase ? phase : "unknown",
+                candidate_base,
+                candidate_size,
+                handoff_object,
+                object_ok ? 1u : 0u,
+                heartbeat::g_bridge,
+                init_elapsed_us(start, freq));
+            return TRUE;
+        }
+    }
+
+    heartbeat::g_bridge = nullptr;
+    heartbeat::g_last_whoswho_tsc = 0;
+    heartbeat::g_last_check_tsc = 0;
+    SN_LOG("init_thread: partial_refresh phase=%s reject base=%p size=0x%lx object=%p reset_bridge=1 elapsed_us=%lu",
+        phase ? phase : "unknown",
+        handoff_base,
+        handoff_size,
+        handoff_object,
+        init_elapsed_us(start, freq));
+    return FALSE;
+}
+
 
 static BOOLEAN ForceDeleteFileByPath(PUNICODE_STRING FilePath) {
     if (!FilePath || !FilePath->Buffer || !_ZwSetInformationFile)
@@ -970,6 +1130,18 @@ static void NTAPI init_thread_routine(PVOID ) {
         (PVOID)g_target_driver_object,
         init_elapsed_us(init_start, init_freq));
 
+    if (!init_target_handoff_ready((PVOID)g_target_driver_base, g_target_driver_size)) {
+        if (refresh_target_handoff_from_partial_state("pre_settle")) {
+            SN_LOG("init_thread: pre_settle partial handoff refresh succeeded");
+            goto discovery_done;
+        }
+
+        if (discover_target_driver_from_device()) {
+            SN_LOG("init_thread: pre_settle device discovery succeeded");
+            goto discovery_done;
+        }
+    }
+
     for (ULONG i = 0; i < SETTLE_POLLS; i++) {
         if (_InterlockedCompareExchange(&g_shutdown_flag, 0, 0)) {
             SN_LOG("init_thread: shutdown flag set at settle %lu", i);
@@ -1002,6 +1174,24 @@ static void NTAPI init_thread_routine(PVOID ) {
                 i, handoff_base, handoff_size, handoff_object);
         }
 
+        if (refresh_target_handoff_from_partial_state("settle_probe")) {
+            SN_LOG("init_thread: target handoff repaired during settle poll=%lu base=%p size=0x%lx object=%p",
+                i,
+                (PVOID)g_target_driver_base,
+                g_target_driver_size,
+                (PVOID)g_target_driver_object);
+            break;
+        }
+
+        if ((i & 1u) == 0 && discover_target_driver_from_device()) {
+            SN_LOG("init_thread: device discovery completed during settle poll=%lu base=%p size=0x%lx object=%p",
+                i,
+                (PVOID)g_target_driver_base,
+                g_target_driver_size,
+                (PVOID)g_target_driver_object);
+            break;
+        }
+
         _KeDelayExecutionThread(KernelMode, FALSE, &interval);
     }
 
@@ -1026,6 +1216,19 @@ static void NTAPI init_thread_routine(PVOID ) {
         if (discover_target_driver_from_device()) {
             SN_LOG("init_thread: device discovery completed before module list scan");
             goto discovery_done;
+        }
+
+        {
+            ULONG build_number = init_read_kuser_u32(0x260) & 0xFFFFu;
+            if (build_number >= 26100) {
+                SN_LOG("init_thread: module list bridge scan skipped build=%lu reason=win11_fail_closed_without_handoff base=%p size=0x%lx object=%p elapsed_us=%lu",
+                    build_number,
+                    (PVOID)g_target_driver_base,
+                    g_target_driver_size,
+                    (PVOID)g_target_driver_object,
+                    init_elapsed_us(init_start, init_freq));
+                goto discovery_done;
+            }
         }
 
         SN_LOG("init_thread: device discovery unavailable, scanning module list for bridge magic...");

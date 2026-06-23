@@ -18,7 +18,6 @@
 #include <cctype>
 #include <chrono>
 #include <cinttypes>
-#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -30,17 +29,6 @@
 #include <unordered_map>
 
 namespace {
-
-struct handle_closer_t {
-	void operator()(HANDLE h) const {
-		if (h && h != INVALID_HANDLE_VALUE) CloseHandle(h);
-	}
-};
-using unique_handle_t = std::unique_ptr<std::remove_pointer_t<HANDLE>, handle_closer_t>;
-
-inline unique_handle_t wrap_handle(HANDLE h) {
-	return unique_handle_t((h && h != INVALID_HANDLE_VALUE) ? h : nullptr);
-}
 
 struct system_handle_entry_t {
 	USHORT pid;
@@ -59,58 +47,6 @@ struct system_handle_information_t {
 
 using nt_query_system_information_fn = NTSTATUS(NTAPI*)(ULONG, PVOID, ULONG, PULONG);
 
-struct ng_unicode_string_t {
-	USHORT  length;
-	USHORT  maximum_length;
-	wchar_t* buffer;
-};
-
-struct ng_object_name_information_t {
-	ng_unicode_string_t name;
-};
-
-struct ng_object_type_information_t {
-	ng_unicode_string_t type_name;
-	ULONG total_number_of_objects;
-	ULONG total_number_of_handles;
-	ULONG total_paged_pool_usage;
-	ULONG total_non_paged_pool_usage;
-	ULONG total_name_pool_usage;
-	ULONG total_handle_table_usage;
-	ULONG high_water_number_of_objects;
-	ULONG high_water_number_of_handles;
-	ULONG high_water_paged_pool_usage;
-	ULONG high_water_non_paged_pool_usage;
-	ULONG high_water_name_pool_usage;
-	ULONG high_water_handle_table_usage;
-	ULONG invalid_attributes;
-	ULONG generic_mapping[4];
-	ULONG valid_access_mask;
-	BOOLEAN security_required;
-	BOOLEAN maintain_handle_count;
-	UCHAR type_index;
-	UCHAR reserved_byte;
-	ULONG pool_type;
-	ULONG default_paged_pool_charge;
-	ULONG default_non_paged_pool_charge;
-};
-
-using nt_query_object_fn = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
-
-constexpr ULONG ng_object_type_information_class = 2;
-constexpr ULONG ng_object_name_information_class = 1;
-
-inline std::string utf8_from_unicode_string(const ng_unicode_string_t& us) {
-	if (us.buffer == nullptr || us.length == 0)
-		return {};
-	int wlen = static_cast<int>(us.length / sizeof(wchar_t));
-	int needed = WideCharToMultiByte(CP_UTF8, 0, us.buffer, wlen, nullptr, 0, nullptr, nullptr);
-	if (needed <= 0) return {};
-	std::string out(static_cast<size_t>(needed), '\0');
-	WideCharToMultiByte(CP_UTF8, 0, us.buffer, wlen, out.data(), needed, nullptr, nullptr);
-	return out;
-}
-
 }
 
 namespace debugger_engine {
@@ -124,6 +60,68 @@ std::string& last_error_ref() {
 
 void set_last_error(const std::string& msg) {
 	last_error_ref() = msg;
+}
+
+constexpr uint64_t ctx_mask_rax = 1ULL << 0;
+constexpr uint64_t ctx_mask_rbx = 1ULL << 1;
+constexpr uint64_t ctx_mask_rcx = 1ULL << 2;
+constexpr uint64_t ctx_mask_rdx = 1ULL << 3;
+constexpr uint64_t ctx_mask_rsi = 1ULL << 4;
+constexpr uint64_t ctx_mask_rdi = 1ULL << 5;
+constexpr uint64_t ctx_mask_rbp = 1ULL << 6;
+constexpr uint64_t ctx_mask_rsp = 1ULL << 7;
+constexpr uint64_t ctx_mask_r8 = 1ULL << 8;
+constexpr uint64_t ctx_mask_r9 = 1ULL << 9;
+constexpr uint64_t ctx_mask_r10 = 1ULL << 10;
+constexpr uint64_t ctx_mask_r11 = 1ULL << 11;
+constexpr uint64_t ctx_mask_r12 = 1ULL << 12;
+constexpr uint64_t ctx_mask_r13 = 1ULL << 13;
+constexpr uint64_t ctx_mask_r14 = 1ULL << 14;
+constexpr uint64_t ctx_mask_r15 = 1ULL << 15;
+constexpr uint64_t ctx_mask_rip = 1ULL << 16;
+constexpr uint64_t ctx_mask_rflags = 1ULL << 17;
+constexpr uint64_t ctx_mask_base = (1ULL << 18) - 1ULL;
+constexpr uint64_t ctx_mask_step = ctx_mask_rip | ctx_mask_rsp | ctx_mask_rflags;
+
+uint64_t register_context_mask(const std::string& lower) {
+	if      (lower == "rax") return ctx_mask_rax;
+	else if (lower == "rbx") return ctx_mask_rbx;
+	else if (lower == "rcx") return ctx_mask_rcx;
+	else if (lower == "rdx") return ctx_mask_rdx;
+	else if (lower == "rsi") return ctx_mask_rsi;
+	else if (lower == "rdi") return ctx_mask_rdi;
+	else if (lower == "rbp") return ctx_mask_rbp;
+	else if (lower == "rsp") return ctx_mask_rsp;
+	else if (lower == "r8")  return ctx_mask_r8;
+	else if (lower == "r9")  return ctx_mask_r9;
+	else if (lower == "r10") return ctx_mask_r10;
+	else if (lower == "r11") return ctx_mask_r11;
+	else if (lower == "r12") return ctx_mask_r12;
+	else if (lower == "r13") return ctx_mask_r13;
+	else if (lower == "r14") return ctx_mask_r14;
+	else if (lower == "r15") return ctx_mask_r15;
+	else if (lower == "rip") return ctx_mask_rip;
+	else if (lower == "rflags" || lower == "eflags") return ctx_mask_rflags;
+	return 0;
+}
+
+bool kernel_target_operations_ready(const char* caller) {
+	std::string reason;
+	const bool ready = driver_bridge::using_kernel_driver() &&
+		driver_bridge::kernel_session_available(&reason) &&
+		driver_bridge::dynamic_ioctls_ready();
+	if (!ready) {
+		diag::log_tagged_fmt("dbg_engine",
+			"kernel_target_operations_fail_closed caller=%s loaded=%d kernel=%d dyn_ready=%d reason=%s status=%s last_error=%s",
+			caller ? caller : "",
+			driver_bridge::is_loaded() ? 1 : 0,
+			driver_bridge::using_kernel_driver() ? 1 : 0,
+			driver_bridge::dynamic_ioctls_ready() ? 1 : 0,
+			reason.empty() ? "<empty>" : reason.c_str(),
+			driver_bridge::status().c_str(),
+			driver_bridge::last_error().c_str());
+	}
+	return ready;
 }
 
 struct call_stack_symbol_resolution_t {
@@ -1358,30 +1356,39 @@ bool spawn_and_attach_target(const run_target::launch_options_t& opts,
 	}
 
 	if (lr.thread_handle != 0) {
-		HANDLE t = reinterpret_cast<HANDLE>(lr.thread_handle);
 		diag::log_tagged_critical_fmt("spawn",
-			"spawn_pre_ResumeThread pid=%u thread_handle=%p",
-			static_cast<unsigned>(lr.pid), t);
-		DWORD prev_count = ResumeThread(t);
-		if (prev_count == static_cast<DWORD>(-1)) {
-			DWORD gle = GetLastError();
-			char err[256];
-			std::snprintf(err, sizeof(err),
-				"ResumeThread failed (gle=%lu)", static_cast<unsigned long>(gle));
-			set_last_error(err);
+			"spawn_pre_kernel_resume_thread pid=%u tid=%u thread_handle=%p",
+			static_cast<unsigned>(lr.pid),
+			static_cast<unsigned>(lr.thread_id),
+			reinterpret_cast<void*>(lr.thread_handle));
+		uint32_t prev_count = 0;
+		const bool resumed = lr.thread_id != 0 && driver_bridge::resume_thread(lr.thread_id, &prev_count);
+		if (!resumed) {
+			const DWORD kernel_resume_gle = GetLastError();
+			const std::string kernel_resume_error = driver_bridge::last_error();
 			diag::log_tagged_critical_fmt("spawn",
-				"spawn_ResumeThread_FAILED pid=%u gle=%lu",
+				"spawn_kernel_resume_thread_FAILED pid=%u tid=%u driver_status='%s' last_error='%s'",
 				static_cast<unsigned>(lr.pid),
-				static_cast<unsigned long>(gle));
+				static_cast<unsigned>(lr.thread_id),
+				driver_bridge::status().c_str(),
+				driver_bridge::last_error().c_str());
+			char err[320];
+			std::snprintf(err, sizeof(err),
+				"kernel resume_thread failed for tid=%u (gle=%lu: %s)",
+				static_cast<unsigned>(lr.thread_id),
+				static_cast<unsigned long>(kernel_resume_gle),
+				kernel_resume_error.empty() ? "(no detail)" : kernel_resume_error.c_str());
+			set_last_error(err);
 			HANDLE p = reinterpret_cast<HANDLE>(lr.process_handle);
 			if (p) TerminateProcess(p, 0xDEADu);
 			run_target::cleanup(lr);
 			return false;
 		}
 		diag::log_tagged_critical_fmt("spawn",
-			"spawn_ResumeThread_ok pid=%u prev_suspend_count=%lu",
+			"spawn_resume_thread_ok pid=%u tid=%u prev_suspend_count=%u kernel_path=1",
 			static_cast<unsigned>(lr.pid),
-			static_cast<unsigned long>(prev_count));
+			static_cast<unsigned>(lr.thread_id),
+			static_cast<unsigned>(prev_count));
 		HANDLE p = reinterpret_cast<HANDLE>(lr.process_handle);
 		DWORD exit_code = STILL_ACTIVE;
 		DWORD wait0 = p ? WaitForSingleObject(p, 0) : WAIT_FAILED;
@@ -1624,8 +1631,8 @@ bool step_into() {
 		if (ins.is_nop && ins.len > 0 && ins.len <= 15) {
 			kctx.rip += static_cast<uint64_t>(ins.len);
 			kctx.rflags &= ~0x100ULL;
-			if (!driver_bridge::set_thread_context(st.active_tid, kctx, ~0ULL)) {
-				driver_bridge::set_thread_context(st.active_tid, original_step_ctx, ~0ULL);
+			if (!driver_bridge::set_thread_context(st.active_tid, kctx, ctx_mask_base)) {
+				driver_bridge::set_thread_context(st.active_tid, original_step_ctx, ctx_mask_base);
 				diag::log_tagged_fmt("debugger",
 					"step_into_context_only_set_FAILED pid=%u tid=%u pre_rip=0x%llx desired_rip=0x%llx rsp=0x%llx prev_suspend=%u",
 					static_cast<unsigned>(st.target_pid),
@@ -1679,8 +1686,8 @@ bool step_into() {
 		static_cast<unsigned long long>(kctx.rflags),
 		static_cast<unsigned>(previous_suspend_count));
 
-	if (!driver_bridge::set_thread_context(st.active_tid, kctx, ~0ULL)) {
-		driver_bridge::set_thread_context(st.active_tid, original_step_ctx, ~0ULL);
+	if (!driver_bridge::set_thread_context(st.active_tid, kctx, ctx_mask_base)) {
+		driver_bridge::set_thread_context(st.active_tid, original_step_ctx, ctx_mask_base);
 		diag::log_tagged_fmt("debugger",
 			"step_into_trap_set_FAILED pid=%u tid=%u rip=0x%llx rsp=0x%llx prev_suspend=%u",
 			static_cast<unsigned>(st.target_pid),
@@ -1735,7 +1742,7 @@ bool step_into() {
 			driver_bridge::thread_context_t stable{};
 			if (driver_bridge::get_thread_context(st.active_tid, stable)) {
 				stable.rflags &= ~0x100ULL;
-				driver_bridge::set_thread_context(st.active_tid, stable, ~0ULL);
+				driver_bridge::set_thread_context(st.active_tid, stable, ctx_mask_base);
 				post_regs = capture_registers_from_context(stable);
 				advanced = true;
 				diag::log_tagged_fmt("debugger",
@@ -1750,7 +1757,7 @@ bool step_into() {
 				break;
 			}
 			probe.rflags &= ~0x100ULL;
-			driver_bridge::set_thread_context(st.active_tid, probe, ~0ULL);
+			driver_bridge::set_thread_context(st.active_tid, probe, ctx_mask_base);
 			post_regs = capture_registers_from_context(probe);
 			advanced = true;
 			diag::log_tagged_fmt("debugger",
@@ -1767,7 +1774,7 @@ bool step_into() {
 		driver_bridge::thread_context_t restore_ctx{};
 		if (driver_bridge::get_thread_context(st.active_tid, restore_ctx)) {
 			restore_ctx.rflags &= ~0x100ULL;
-			driver_bridge::set_thread_context(st.active_tid, restore_ctx, ~0ULL);
+			driver_bridge::set_thread_context(st.active_tid, restore_ctx, ctx_mask_base);
 		}
 		st.status.store(dbg_status_t::paused);
 		set_last_error("step_into: thread did not advance within timeout");
@@ -1932,7 +1939,7 @@ bool step_out() {
 				kctx.rip = ret_addr;
 				kctx.rsp += 8;
 				kctx.rflags &= ~0x100ULL;
-				if (!driver_bridge::set_thread_context(selected_tid, kctx, ~0ULL)) {
+				if (!driver_bridge::set_thread_context(selected_tid, kctx, ctx_mask_base)) {
 					diag::log_tagged_fmt("debugger",
 						"step_out_return_set_FAILED pid=%u tid=%u ret_addr=0x%llx rsp=0x%llx prev_suspend=%u",
 						static_cast<unsigned>(st.target_pid),
@@ -2030,7 +2037,7 @@ bool run_to_address(uint64_t address, bool wait_for_completion, uint32_t timeout
 			bool adjusted = false;
 			if (pre_ctx.rip == address + 1) {
 				pre_ctx.rip = address;
-				adjusted = driver_bridge::set_thread_context(active_tid_at_entry, pre_ctx, ~0ULL);
+				adjusted = driver_bridge::set_thread_context(active_tid_at_entry, pre_ctx, ctx_mask_base);
 			}
 			bool release_added_suspend = false;
 			uint32_t release_previous = 0;
@@ -2237,7 +2244,7 @@ bool run_to_address(uint64_t address, bool wait_for_completion, uint32_t timeout
 				hit_tid = th.tid;
 				if (kctx.rip == address + 1) {
 					kctx.rip = address;
-					driver_bridge::set_thread_context(th.tid, kctx, ~0ULL);
+					driver_bridge::set_thread_context(th.tid, kctx, ctx_mask_base);
 				}
 				break;
 			}
@@ -2264,7 +2271,7 @@ bool run_to_address(uint64_t address, bool wait_for_completion, uint32_t timeout
 			hit_final_rflags = hit_ctx.rflags;
 			if (hit_context_ok && hit_ctx.rip == address + 1) {
 				hit_ctx.rip = address;
-				hit_adjusted = driver_bridge::set_thread_context(hit_tid, hit_ctx, ~0ULL);
+				hit_adjusted = driver_bridge::set_thread_context(hit_tid, hit_ctx, ctx_mask_base);
 				hit_final_rip = hit_ctx.rip;
 			}
 			if (hit_context_ok) {
@@ -2316,7 +2323,7 @@ bool run_to_address(uint64_t address, bool wait_for_completion, uint32_t timeout
 				item.rflags = kctx.rflags;
 				if (item.context_ok && kctx.rip == address + 1) {
 					kctx.rip = address;
-					item.adjusted = driver_bridge::set_thread_context(th.tid, kctx, ~0ULL);
+					item.adjusted = driver_bridge::set_thread_context(th.tid, kctx, ctx_mask_base);
 					item.rip = kctx.rip;
 				}
 			}
@@ -2495,6 +2502,7 @@ bool set_register(const std::string& name, uint64_t value) {
 
 	auto lower = name;
 	for (auto& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+	const uint64_t register_mask = register_context_mask(lower);
 
 	if      (lower == "rax") kctx.rax = value;
 	else if (lower == "rbx") kctx.rbx = value;
@@ -2519,12 +2527,13 @@ bool set_register(const std::string& name, uint64_t value) {
 		return false;
 	}
 
-	bool ok = driver_bridge::set_thread_context(st.active_tid, kctx, ~0ULL);
+	bool ok = driver_bridge::set_thread_context(st.active_tid, kctx, register_mask);
 	diag::log_tagged_fmt("cpu",
-		"set_register name='%s' value=0x%llx tid=%u ok=%d",
+		"set_register name='%s' value=0x%llx tid=%u mask=0x%llx ok=%d",
 		name.c_str(),
 		static_cast<unsigned long long>(value),
 		static_cast<unsigned>(st.active_tid),
+		static_cast<unsigned long long>(register_mask),
 		ok ? 1 : 0);
 
 	if (suspended) driver_bridge::resume_thread(st.active_tid);
@@ -2828,9 +2837,6 @@ void enumerate_handles() {
 		return;
 	}
 
-	static auto nt_query_object = reinterpret_cast<nt_query_object_fn>(
-		GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryObject"));
-
 	ULONG buf_size = 1024 * 1024;
 	std::vector<uint8_t> buffer;
 	NTSTATUS nts = 0;
@@ -2849,9 +2855,6 @@ void enumerate_handles() {
 	auto* info = reinterpret_cast<system_handle_information_t*>(buffer.data());
 	std::vector<handle_info_t> result;
 
-	HANDLE proc = OpenProcess(PROCESS_DUP_HANDLE, FALSE, st.target_pid);
-	HANDLE current_proc = GetCurrentProcess();
-	const auto metadata_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(750);
 	size_t metadata_attempted = 0;
 	size_t metadata_named = 0;
 	size_t metadata_typed = 0;
@@ -2867,121 +2870,17 @@ void enumerate_handles() {
 		hi.handle = entry.handle_value;
 		hi.type_index = entry.object_type_index;
 		hi.access = entry.granted_access;
-
-		bool metadata_budget = metadata_attempted < 64 &&
-			std::chrono::steady_clock::now() < metadata_deadline;
-		if (proc != nullptr && nt_query_object != nullptr && metadata_budget) {
-			HANDLE dup = nullptr;
-			if (DuplicateHandle(proc,
-								reinterpret_cast<HANDLE>(static_cast<uintptr_t>(entry.handle_value)),
-								current_proc, &dup, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
-				++metadata_attempted;
-				struct query_ctx_t {
-					std::mutex              mtx;
-					std::condition_variable cv;
-					bool                    done = false;
-					bool                    ok = false;
-					std::vector<uint8_t>    out;
-					HANDLE                  target = nullptr;
-					ULONG                   info_class = 0;
-					nt_query_object_fn      fn = nullptr;
-					bool                    handle_owned = true;
-				};
-
-				auto run_query = [&](ULONG info_class, std::vector<uint8_t>& out_buf, bool& abandoned) -> bool {
-					auto ctx = std::make_shared<query_ctx_t>();
-					ctx->target = dup;
-					ctx->info_class = info_class;
-					ctx->fn = nt_query_object;
-
-					if (!work_queue::post([ctx]() {
-						ULONG required = 0;
-						std::vector<uint8_t> local_buf(0x1000);
-						NTSTATUS st_q = ctx->fn(ctx->target, ctx->info_class,
-												 local_buf.data(),
-												 static_cast<ULONG>(local_buf.size()),
-												 &required);
-						if (st_q == static_cast<NTSTATUS>(0xC0000004) && required > 0) {
-							local_buf.resize(required);
-							st_q = ctx->fn(ctx->target, ctx->info_class,
-										   local_buf.data(),
-										   static_cast<ULONG>(local_buf.size()),
-										   &required);
-						}
-						bool close_here = false;
-						{
-							std::lock_guard<std::mutex> lk(ctx->mtx);
-							ctx->ok = (st_q == 0);
-							if (ctx->ok)
-								ctx->out = std::move(local_buf);
-							ctx->done = true;
-							close_here = !ctx->handle_owned;
-						}
-						ctx->cv.notify_all();
-						if (close_here && ctx->target)
-							CloseHandle(ctx->target);
-					}))
-					{
-						std::lock_guard<std::mutex> lk(ctx->mtx);
-						ctx->done = true;
-						ctx->ok = false;
-					}
-
-					std::unique_lock<std::mutex> lk(ctx->mtx);
-					if (!ctx->cv.wait_for(lk, std::chrono::milliseconds(35),
-										   [&ctx]() { return ctx->done; })) {
-						ctx->handle_owned = false;
-						abandoned = true;
-						return false;
-					}
-					if (!ctx->ok) return false;
-					out_buf = std::move(ctx->out);
-					return true;
-				};
-
-				bool abandoned = false;
-				std::vector<uint8_t> type_buf;
-				if (run_query(ng_object_type_information_class, type_buf, abandoned) &&
-					type_buf.size() >= sizeof(ng_object_type_information_t)) {
-					auto* tinfo = reinterpret_cast<ng_object_type_information_t*>(type_buf.data());
-					hi.type_name = utf8_from_unicode_string(tinfo->type_name);
-					if (!hi.type_name.empty())
-						++metadata_typed;
-				}
-
-				if (!abandoned) {
-					std::vector<uint8_t> name_buf;
-					if (run_query(ng_object_name_information_class, name_buf, abandoned) &&
-						name_buf.size() >= sizeof(ng_object_name_information_t)) {
-						auto* ninfo = reinterpret_cast<ng_object_name_information_t*>(name_buf.data());
-						hi.name = utf8_from_unicode_string(ninfo->name);
-						if (!hi.name.empty())
-							++metadata_named;
-					}
-				}
-
-				if (abandoned)
-					++metadata_abandoned;
-				if (!abandoned)
-					CloseHandle(dup);
-			} else {
-				++duplicate_failed;
-			}
-		} else if (proc != nullptr && nt_query_object != nullptr) {
-			++metadata_skipped_budget;
-		}
+		++metadata_skipped_budget;
 
 		result.push_back(std::move(hi));
 	}
-
-	if (proc != nullptr) CloseHandle(proc);
 
 	std::lock_guard<std::mutex> lk(st.handle_mutex);
 	st.handles = std::move(result);
 	const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
 		std::chrono::steady_clock::now() - started).count();
 	diag::log_tagged_fmt("handles",
-		"enumerate_handles_done pid=%u handles=%zu metadata_attempted=%zu typed=%zu named=%zu abandoned=%zu duplicate_failed=%zu skipped_budget=%zu elapsed_ms=%lld",
+		"enumerate_handles_done pid=%u handles=%zu metadata_attempted=%zu typed=%zu named=%zu abandoned=%zu duplicate_failed=%zu skipped_budget=%zu metadata_method=none_fail_closed elapsed_ms=%lld",
 		static_cast<unsigned>(st.target_pid),
 		st.handles.size(),
 		metadata_attempted,
@@ -3389,7 +3288,7 @@ bp_hit_action_t handle_breakpoint_hit(uint64_t address) {
 		if (driver_bridge::get_thread_context(st.active_tid, adj)) {
 			if (adj.rip == address) {
 				adj.rip = bp_address_matched;
-				driver_bridge::set_thread_context(st.active_tid, adj, ~0ULL);
+				driver_bridge::set_thread_context(st.active_tid, adj, ctx_mask_base);
 			}
 		}
 	}
@@ -3510,6 +3409,8 @@ std::vector<uint8_t> cached_disasm_window(uint64_t& base_out) {
 void sync_attached_state() {
 	auto& st = g_state;
 	uint32_t live_pid = driver_bridge::attached_pid();
+	if (live_pid != 0 && !kernel_target_operations_ready("sync_attached_state"))
+		live_pid = 0;
 	if (live_pid != st.target_pid) {
 		st.target_pid = live_pid;
 		st.active_tid = 0;

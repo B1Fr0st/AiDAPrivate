@@ -215,8 +215,12 @@ static std::vector<uint32_t> bounded_hardware_breakpoint_tids(std::size_t limit)
     return result;
 }
 
+static constexpr uint64_t k_ctx_mask_base = (1ULL << 18) - 1ULL;
+static constexpr uint64_t k_ctx_mask_fixture = (1ULL << 16) | (1ULL << 7) | (1ULL << 17);
+
 static bool select_hardware_breakpoint_tid(HANDLE hf, const char* tag, uint32_t& tid, driver_bridge::thread_context_t* out_ctx) {
-    auto candidates = attached_target_tids();
+    auto all_candidates = attached_target_tids();
+    auto candidates = bounded_hardware_breakpoint_tids(8);
     for (uint32_t candidate : candidates) {
         driver_bridge::thread_context_t ctx{};
         if (!driver_bridge::get_thread_context(candidate, ctx) || ctx.rip == 0 || ctx.rsp == 0)
@@ -233,7 +237,7 @@ static bool select_hardware_breakpoint_tid(HANDLE hf, const char* tag, uint32_t&
             candidates.size());
         return true;
     }
-    log_msg(hf, tag, "FAIL -- no contextable target thread available for hardware breakpoint test (candidates=%zu)", candidates.size());
+    log_msg(hf, tag, "FAIL -- no contextable target thread available for hardware breakpoint test (candidates=%zu probed=%zu)", all_candidates.size(), candidates.size());
     return false;
 }
 
@@ -258,7 +262,7 @@ static bool restore_context_and_suspend_count(uint32_t tid,
     if (!driver_bridge::suspend_thread(tid, &prev))
         return false;
     uint32_t current = prev < 0xFFFFFFFFu ? prev + 1 : prev;
-    bool ctx_ok = driver_bridge::set_thread_context(tid, ctx, ~0ULL);
+    bool ctx_ok = driver_bridge::set_thread_context(tid, ctx, k_ctx_mask_base);
     bool depth_ok = true;
     for (int guard = 0; current > desired_suspend_count && guard < 64; ++guard) {
         uint32_t resume_prev = 0;
@@ -361,7 +365,8 @@ static bool prepare_controlled_step_fixture(HANDLE hf,
                                             controlled_step_fixture_t& fx,
                                             const std::vector<uint8_t>& code_bytes,
                                             bool use_stack_return) {
-    auto candidates = attached_target_tids();
+    auto all_candidates = attached_target_tids();
+    auto candidates = bounded_hardware_breakpoint_tids(8);
     if (candidates.empty()) {
         log_msg(hf, tag, "FAIL -- no live target thread available for controlled step fixture");
         return false;
@@ -370,6 +375,7 @@ static bool prepare_controlled_step_fixture(HANDLE hf,
     std::string last_detail = "none";
     for (uint32_t tid : candidates) {
         controlled_step_fixture_t trial;
+        std::string failed_stage = "start";
         trial.tid = tid;
         debugger_engine::g_state.active_tid = trial.tid;
         if (!driver_bridge::suspend_thread(trial.tid, &trial.original_suspend_count)) {
@@ -398,6 +404,8 @@ static bool prepare_controlled_step_fixture(HANDLE hf,
             trial.stack = driver_bridge::allocate_memory(0x1000);
 
         bool ok = trial.code != 0 && (!use_stack_return || trial.stack != 0);
+        if (!ok)
+            failed_stage = use_stack_return && trial.stack == 0 ? "allocate_stack" : "allocate_code";
         if (ok) {
             std::vector<uint8_t> code(64, 0x90);
             for (size_t i = 0; i < code_bytes.size() && i < code.size(); ++i)
@@ -427,6 +435,8 @@ static bool prepare_controlled_step_fixture(HANDLE hf,
                     (unsigned)write_region.protect);
             }
             ok = verify_ok;
+            if (!ok)
+                failed_stage = write_ok ? "code_verify" : "code_write";
         }
         if (ok) {
             uint32_t old_protect = 0;
@@ -443,6 +453,8 @@ static bool prepare_controlled_step_fixture(HANDLE hf,
                 prot_region_ok ? 1 : 0,
                 (unsigned)prot_region.state,
                 (unsigned)prot_region.protect);
+            if (!ok)
+                failed_stage = "code_protect";
         }
         if (ok && use_stack_return) {
             trial.expected_rip = trial.code + 0x10;
@@ -469,6 +481,8 @@ static bool prepare_controlled_step_fixture(HANDLE hf,
                     (unsigned)actual);
             }
             ok = stack_verify_ok;
+            if (!ok)
+                failed_stage = stack_write_ok ? "stack_verify" : "stack_write";
         } else if (ok) {
             trial.expected_rip = trial.code + 1;
         }
@@ -480,17 +494,21 @@ static bool prepare_controlled_step_fixture(HANDLE hf,
             if (use_stack_return)
                 entry_ctx.rsp = trial.rsp;
             entry_ctx.rflags &= ~0x100ULL;
-            ok = driver_bridge::set_thread_context(trial.tid, entry_ctx, ~0ULL);
+            ok = driver_bridge::set_thread_context(trial.tid, entry_ctx, k_ctx_mask_fixture);
             trial.context_entered = ok;
+            if (!ok)
+                failed_stage = "entry_set_context";
         }
         if (ok) {
             auto verify_ctx = entry_ctx;
             verify_ctx.rip = trial.expected_rip;
             if (use_stack_return)
                 verify_ctx.rsp = trial.rsp + 8;
-            bool verify_set = driver_bridge::set_thread_context(trial.tid, verify_ctx, ~0ULL);
-            bool restore_entry = verify_set && driver_bridge::set_thread_context(trial.tid, entry_ctx, ~0ULL);
+            bool verify_set = driver_bridge::set_thread_context(trial.tid, verify_ctx, k_ctx_mask_fixture);
+            bool restore_entry = verify_set && driver_bridge::set_thread_context(trial.tid, entry_ctx, k_ctx_mask_fixture);
             ok = verify_set && restore_entry;
+            if (!ok)
+                failed_stage = verify_set ? "restore_entry_context" : "verify_set_context";
         }
 
         if (!ok) {
@@ -502,7 +520,8 @@ static bool prepare_controlled_step_fixture(HANDLE hf,
             cleanup_controlled_step_fixture(trial, &restored, &freed_code, &freed_stack, hf, tag);
             char detail[220];
             std::snprintf(detail, sizeof(detail),
-                "build tid=%u code=0x%llX stack=0x%llX restored=%d free_code=%d free_stack=%d failed",
+                "build stage=%s tid=%u code=0x%llX stack=0x%llX restored=%d free_code=%d free_stack=%d failed",
+                failed_stage.c_str(),
                 tid,
                 (unsigned long long)failed_code,
                 (unsigned long long)failed_stack,
@@ -515,17 +534,19 @@ static bool prepare_controlled_step_fixture(HANDLE hf,
         }
 
         fx = trial;
-        log_msg(hf, tag, "INFO -- controlled step fixture tid=%u entry=0x%llX expected=0x%llX stack=0x%llX original_suspend=%u candidates=%zu",
+        log_msg(hf, tag, "INFO -- controlled step fixture tid=%u entry=0x%llX expected=0x%llX stack=0x%llX original_suspend=%u candidates=%zu probed=%zu",
             fx.tid,
             (unsigned long long)fx.code,
             (unsigned long long)fx.expected_rip,
             (unsigned long long)fx.rsp,
             (unsigned)fx.original_suspend_count,
+            all_candidates.size(),
             candidates.size());
         return true;
     }
 
-    log_msg(hf, tag, "FAIL -- could not build controlled step fixture across %zu candidate thread(s); last=%s",
+    log_msg(hf, tag, "FAIL -- could not build controlled step fixture across %zu candidate thread(s), probed %zu; last=%s",
+        all_candidates.size(),
         candidates.size(),
         last_detail.c_str());
     return false;

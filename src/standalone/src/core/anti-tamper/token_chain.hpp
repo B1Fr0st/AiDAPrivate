@@ -125,6 +125,85 @@ namespace token_chain {
             return v;
         }
 
+        inline std::atomic<uint64_t>& rdtsc_timing_last_delta()
+        {
+            static std::atomic<uint64_t> v{0};
+            return v;
+        }
+
+        inline std::atomic<uint32_t>& rdtsc_timing_persist_count()
+        {
+            static std::atomic<uint32_t> v{0};
+            return v;
+        }
+
+        inline std::atomic<int64_t>& rdtsc_timing_window_start_ms()
+        {
+            static std::atomic<int64_t> v{0};
+            return v;
+        }
+
+        inline std::atomic<int64_t>& rdtsc_timing_last_log_ms()
+        {
+            static std::atomic<int64_t> v{0};
+            return v;
+        }
+
+        inline void reset_rdtsc_timing_quorum()
+        {
+            rdtsc_timing_persist_count().store(0, std::memory_order_release);
+            rdtsc_timing_window_start_ms().store(0, std::memory_order_release);
+        }
+
+        inline bool rdtsc_timing_quorum_reached(state::runtime_t& rt, int64_t now)
+        {
+            constexpr int64_t kWindowMs = 15000;
+            constexpr int64_t kMinEscalateAgeMs = 1200;
+            constexpr uint32_t kRequiredSignals = 3;
+
+            int64_t window_start = rdtsc_timing_window_start_ms().load(std::memory_order_acquire);
+            uint32_t count = rdtsc_timing_persist_count().load(std::memory_order_acquire);
+            if (window_start == 0 || now < window_start || now - window_start > kWindowMs)
+            {
+                window_start = now;
+                count = 0;
+                rdtsc_timing_window_start_ms().store(window_start, std::memory_order_release);
+                rdtsc_timing_persist_count().store(0, std::memory_order_release);
+            }
+
+            count = rdtsc_timing_persist_count().fetch_add(1, std::memory_order_acq_rel) + 1;
+            const int64_t age_ms = now >= window_start ? now - window_start : 0;
+            const bool lifecycle_settling =
+                rt.driver_hardening_active.load(std::memory_order_acquire) ||
+                rt.license_pending_activation.load(std::memory_order_acquire) ||
+                !rt.activation_hardening_done.load(std::memory_order_acquire);
+
+            const bool escalate =
+                !lifecycle_settling &&
+                count >= kRequiredSignals &&
+                age_ms >= kMinEscalateAgeMs;
+
+            int64_t last_log = rdtsc_timing_last_log_ms().load(std::memory_order_acquire);
+            if ((now - last_log) > 1000 &&
+                rdtsc_timing_last_log_ms().compare_exchange_strong(last_log, now, std::memory_order_acq_rel))
+            {
+                webhook::write_log_critical_fmt("token_chain",
+                    "rdtsc_timing_quorum delta=%llu count=%u window_age_ms=%lld lifecycle_settling=%d escalate=%d pending=%d activation_done=%d driver_hardening=%d",
+                    static_cast<unsigned long long>(rdtsc_timing_last_delta().load(std::memory_order_acquire)),
+                    count,
+                    static_cast<long long>(age_ms),
+                    lifecycle_settling ? 1 : 0,
+                    escalate ? 1 : 0,
+                    rt.license_pending_activation.load(std::memory_order_acquire) ? 1 : 0,
+                    rt.activation_hardening_done.load(std::memory_order_acquire) ? 1 : 0,
+                    rt.driver_hardening_active.load(std::memory_order_acquire) ? 1 : 0);
+            }
+
+            if (escalate)
+                reset_rdtsc_timing_quorum();
+            return escalate;
+        }
+
         inline void log_code_integrity_deferred(const char* reason, state::runtime_t& rt)
         {
             const uint64_t now = static_cast<uint64_t>(GetTickCount64());
@@ -207,7 +286,9 @@ namespace token_chain {
             volatile int x = 0;
             for (int i = 0; i < 100; ++i) x += i;
             uint64_t t1 = __rdtscp(&aux);
-            if ((t1 - t0) > 10000000ULL)
+            const uint64_t rdtsc_delta = t1 - t0;
+            rdtsc_timing_last_delta().store(rdtsc_delta, std::memory_order_release);
+            if (rdtsc_delta > 10000000ULL)
                 result |= 4ULL;
 
             auto* kuser = reinterpret_cast<const volatile uint8_t*>(
@@ -363,7 +444,23 @@ namespace token_chain {
                 check_result = detail::run_fast_checks(rt);
                 rt.chain.last_fast_check_ms.store(now, std::memory_order_release);
                 rt.chain.fast_check_count.fetch_add(1, std::memory_order_relaxed);
-                if (check_result & 0x1F)
+                if (check_result == 4ULL)
+                {
+                    if (detail::rdtsc_timing_quorum_reached(rt, now))
+                    {
+                        violation = true;
+                        violation_reason = "fast_check_tamper";
+                    }
+                    else
+                    {
+                        check_result = 0;
+                    }
+                }
+                else
+                {
+                    detail::reset_rdtsc_timing_quorum();
+                }
+                if (!violation && (check_result & 0x1F))
                 {
                     violation = true;
                     violation_reason = "fast_check_tamper";

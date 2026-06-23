@@ -173,9 +173,42 @@ typedef struct _TSR {
     UINT32 tid;
     UINT32 should_resume;
     ULONG  previous_count;
-    UINT32 padding;
+    UINT32 pid;
 } suspend_resume_thread, * p_suspend_resume_thread;
 static_assert(sizeof(suspend_resume_thread) == 16, "suspend_resume_thread size must be 16 bytes");
+
+
+typedef struct _TQIF {
+    UINT32 pid;
+    UINT32 tid;
+    UINT32 info_class;
+    UINT32 return_length;
+    UINT32 status;
+    UINT32 padding;
+    INT64  exit_status;
+    UINT64 teb_base;
+    UINT64 client_process;
+    UINT64 client_thread;
+    UINT64 affinity_mask;
+    INT32  priority;
+    INT32  base_priority;
+} thread_query_information, * p_thread_query_information;
+static_assert(sizeof(thread_query_information) == 72, "thread_query_information size must be 72 bytes");
+
+typedef struct _TTERM {
+    UINT32 pid;
+    UINT32 tid;
+    UINT32 exit_status;
+    UINT32 status;
+} terminate_thread_request, * p_terminate_thread_request;
+static_assert(sizeof(terminate_thread_request) == 16, "terminate_thread_request size must be 16 bytes");
+
+typedef struct _HCLS {
+    UINT32 pid;
+    UINT32 status;
+    UINT64 handle_value;
+} close_handle_request, * p_close_handle_request;
+static_assert(sizeof(close_handle_request) == 16, "close_handle_request size must be 16 bytes");
 
 
 typedef struct _QM {

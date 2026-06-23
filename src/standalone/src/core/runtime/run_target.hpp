@@ -38,6 +38,7 @@ struct launch_options_t {
 struct launch_result_t {
 	bool        ok = false;
 	uint32_t    pid = 0;
+	uint32_t    thread_id = 0;
 	uintptr_t   process_handle = 0;
 	uintptr_t   thread_handle = 0;
 	uintptr_t   job_handle = 0;

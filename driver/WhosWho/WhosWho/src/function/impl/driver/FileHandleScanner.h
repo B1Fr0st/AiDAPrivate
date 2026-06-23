@@ -37,6 +37,7 @@ namespace file_handle_scanner {
     inline volatile LONG g_scan_timer_initialized = 0;
     inline volatile LONG g_scan_interval_seconds = 30;
     inline volatile LONG64 g_scan_cycle_id = 0;
+    inline volatile LONG g_vad_layout_logged = 0;
     inline volatile ULONG g_start_session_counter = 0;
     inline volatile ULONG g_start_client_pid = 0;
 
@@ -146,13 +147,27 @@ namespace file_handle_scanner {
 
     __forceinline ULONG vad_root_offset() {
         ULONG build = get_build_number();
-        if (build >= 26200) return 0x7D8;
-        if (build >= 26100) return 0x7D8;
-        if (build >= 22631) return 0x7D8;
-        if (build >= 22621) return 0x7D8;
-        if (build >= 22000) return 0x7D8;
-        if (build >= 19041) return 0x7D8;
-        return 0x658;
+        ULONG offset = 0x658;
+        const char* source = "static_table_legacy";
+        if (build >= 19041) {
+            offset = 0x7D8;
+            source = build >= 22000 ? "static_table_win11" : "static_table_win10_2004_plus";
+        }
+        if (_InterlockedCompareExchange(&g_vad_layout_logged, 1, 0) == 0) {
+            WW_KERNEL_LAYOUT_LOG_OFFSET("EPROCESS.VadRoot", source, offset, offset != 0,
+                "static VAD root table used by scheduled file/VAD scanner", offset != 0 ? "none" : "zero_offset");
+            WW_LOG("KVALIDATE build=%lu kind=layout name=EPROCESS.VadRoot.details source=%s offset=0x%llx validation=%s evidence=\"scanner_interval=%ld active=%ld queued=%ld running=%ld\" fail_closed=%s",
+                build,
+                source,
+                static_cast<unsigned long long>(offset),
+                ww_kernel_validation_state(offset != 0),
+                _InterlockedCompareExchange(&g_scan_interval_seconds, 0, 0),
+                _InterlockedCompareExchange(&g_scanner_active, 0, 0),
+                _InterlockedCompareExchange(&g_scan_work_queued, 0, 0),
+                _InterlockedCompareExchange(&g_scan_work_running, 0, 0),
+                offset != 0 ? "none" : "zero_offset");
+        }
+        return offset;
     }
 
     __forceinline void scan_file_handles(file_handle_scan_stats_t* stats) {

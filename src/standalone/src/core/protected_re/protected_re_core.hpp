@@ -10,9 +10,10 @@
 
 #include "standalone_compat.hpp"
 #include "standalone_driver.hpp"
+#include "comm.h"
 #include "emulation_engine.hpp"
-#include "../analysis/code_patcher.hpp"
 #include "../debugger/page_guard_engine.hpp"
+#include "../analysis/code_patcher.hpp"
 #include "../disasm/zydis_disasm.hpp"
 #include "../../helpers/diag_log.hpp"
 
@@ -146,25 +147,54 @@ inline bool unsafe_confirmed(const json& params)
 
 inline tool_result_t require_driver()
 {
-    if (!driver_bridge::using_kernel_driver())
+    if (!driver_bridge::using_kernel_driver() || !device || !device->is_connected())
         return tool_result_t::error("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first.");
     return tool_result_t::ok(json{{"status", "ok"}});
+}
+
+inline std::recursive_mutex& active_pid_scope_mutex()
+{
+    static std::recursive_mutex m;
+    return m;
 }
 
 struct active_pid_scope_t {
     std::uint32_t previous = 0;
     std::uint32_t requested = 0;
     bool changed = false;
-    bool ok = true;
+    bool ok = false;
+    std::unique_lock<std::recursive_mutex> lock;
 
     explicit active_pid_scope_t(std::uint32_t pid)
+        : lock(active_pid_scope_mutex())
     {
-        requested = pid;
+        requested = pid != 0 ? pid : driver_bridge::attached_pid();
         previous = driver_bridge::attached_pid();
-        if (pid != 0 && previous != pid) {
-            ok = driver_bridge::set_active_pid(pid);
-            changed = ok;
+        if (requested == 0 || !driver_bridge::using_kernel_driver() || !device || !device->is_connected())
+            return;
+        if (previous != requested) {
+            const auto attached = driver_bridge::attached_pids();
+            bool known = false;
+            for (const auto attached_pid : attached) {
+                if (attached_pid == requested) {
+                    known = true;
+                    break;
+                }
+            }
+            if (!known && !driver_bridge::attach_additional(requested))
+                return;
+            if (!driver_bridge::set_active_pid(requested))
+                return;
+            changed = true;
         }
+        if (device->get_process_id() != requested)
+            device->set_process_id(requested);
+        if (device->get_dtb() == 0)
+            device->solve_dtb();
+        ok = device->get_dtb() != 0;
+        if (!ok)
+            diag::log_tagged_fmt("protected_re", "active_pid_scope_dtb_failed requested=%u previous=%u active=%u status=%s last_error=%s",
+                requested, previous, driver_bridge::attached_pid(), driver_bridge::status().c_str(), driver_bridge::last_error().c_str());
     }
 
     ~active_pid_scope_t()
@@ -178,6 +208,60 @@ struct active_pid_scope_t {
     }
 };
 
+inline json page_guard_install_failure_json()
+{
+    const auto f = page_guard_engine::g_pg_engine.last_install_failure();
+    return json{
+        {"reason", f.reason},
+        {"detail", f.detail},
+        {"driver_status", f.driver_status},
+        {"driver_last_error", f.driver_last_error},
+        {"pid", f.pid},
+        {"win32_error", f.win32_error},
+        {"region_state", f.region_state},
+        {"region_protect", f.region_protect},
+        {"region_type", f.region_type},
+        {"attempted_protect", f.attempted_protect},
+        {"requested_addr", sa_format_address(f.requested_addr)},
+        {"requested_size", f.requested_size},
+        {"guard_addr", sa_format_address(f.guard_addr)},
+        {"guard_size", f.guard_size},
+        {"region_base", sa_format_address(f.region_base)},
+        {"region_size", f.region_size}
+    };
+}
+
+inline json page_guard_capture_json(const page_guard_engine::pg_capture_record_t& c)
+{
+    const auto& m = c.metadata;
+    json out;
+    out["fault_address"] = sa_format_address(m.fault_addr);
+    out["rip"] = sa_format_address(m.rip);
+    out["rax"] = sa_format_address(m.ctx_rax);
+    out["rcx"] = sa_format_address(m.ctx_rcx);
+    out["rdx"] = sa_format_address(m.ctx_rdx);
+    out["exception_code"] = m.exception_code;
+    out["access_type"] = m.access_type;
+    out["timestamp_tsc"] = m.timestamp;
+    page_guard_engine::serialize_payload_fields(out, c);
+    return out;
+}
+
+inline json page_guard_sessions_json()
+{
+    json arr = json::array();
+    for (const auto& s : page_guard_engine::g_pg_engine.list_sessions()) {
+        arr.push_back(json{
+            {"session_id", s.session_id},
+            {"pid", s.pid},
+            {"target_addr", sa_format_address(s.target_addr)},
+            {"region_size", s.region_size},
+            {"pending_captures", s.pending_captures}
+        });
+    }
+    return arr;
+}
+
 inline bool read_target_memory(std::uint32_t pid, std::uint64_t address, std::size_t size, std::vector<std::uint8_t>& out)
 {
     out.clear();
@@ -187,9 +271,26 @@ inline bool read_target_memory(std::uint32_t pid, std::uint64_t address, std::si
         size = 16u * 1024u * 1024u;
     if (is_kernel_address(address))
         return driver_bridge::read_kernel_memory(address, size, out);
-    if (pid != 0)
-        return driver_bridge::read_memory_for(pid, address, size, out);
-    return driver_bridge::read_memory(address, size, out);
+    active_pid_scope_t scope(pid);
+    if (!scope.ok) {
+        diag::log_tagged_fmt("protected_re", "read_target_memory_scope_failed pid=%u addr=0x%llX size=%zu active=%u",
+            pid, static_cast<unsigned long long>(address), size, driver_bridge::attached_pid());
+        return false;
+    }
+    out.resize(size);
+    const std::size_t got = device->read_raw(address, out.data(), size);
+    if (got == 0) {
+        out.clear();
+        diag::log_tagged_fmt("protected_re", "read_target_memory_driver_failed pid=%u addr=0x%llX size=%zu active=%u dtb=0x%llX",
+            scope.requested,
+            static_cast<unsigned long long>(address),
+            size,
+            driver_bridge::attached_pid(),
+            static_cast<unsigned long long>(device->get_dtb()));
+        return false;
+    }
+    out.resize(got);
+    return true;
 }
 
 template <typename T>
@@ -206,9 +307,56 @@ inline bool write_target_memory(std::uint32_t pid, std::uint64_t address, const 
 {
     if (address == 0 || bytes.empty() || is_kernel_address(address))
         return false;
-    if (pid != 0)
-        return driver_bridge::write_memory_for(pid, address, bytes);
-    return driver_bridge::write_memory(address, bytes);
+    active_pid_scope_t scope(pid);
+    if (!scope.ok) {
+        diag::log_tagged_fmt("protected_re", "write_target_memory_scope_failed pid=%u addr=0x%llX size=%zu active=%u",
+            pid, static_cast<unsigned long long>(address), bytes.size(), driver_bridge::attached_pid());
+        return false;
+    }
+    const std::size_t written = device->write_raw(address, bytes.data(), bytes.size());
+    if (written != bytes.size()) {
+        diag::log_tagged_fmt("protected_re", "write_target_memory_driver_failed pid=%u addr=0x%llX size=%zu written=%zu active=%u dtb=0x%llX",
+            scope.requested,
+            static_cast<unsigned long long>(address),
+            bytes.size(),
+            written,
+            driver_bridge::attached_pid(),
+            static_cast<unsigned long long>(device->get_dtb()));
+        return false;
+    }
+    return true;
+}
+
+inline std::vector<voyager::device_t::thread_info> enumerate_target_threads(std::uint32_t pid)
+{
+    active_pid_scope_t scope(pid);
+    if (!scope.ok)
+        return {};
+    return device->enumerate_threads();
+}
+
+inline bool read_target_thread_context(std::uint32_t pid, std::uint32_t tid, voyager::device_t::thread_context& ctx)
+{
+    active_pid_scope_t scope(pid);
+    if (!scope.ok || tid == 0)
+        return false;
+    return device->get_thread_context(tid, ctx);
+}
+
+inline bool set_target_hardware_breakpoint(std::uint32_t pid, std::uint32_t tid, int index, std::uint64_t address, int type, int size)
+{
+    active_pid_scope_t scope(pid);
+    if (!scope.ok || tid == 0)
+        return false;
+    return device->set_hardware_breakpoint(tid, index, address, type, size);
+}
+
+inline bool clear_target_hardware_breakpoint(std::uint32_t pid, std::uint32_t tid, int index)
+{
+    active_pid_scope_t scope(pid);
+    if (!scope.ok || tid == 0)
+        return false;
+    return device->clear_hardware_breakpoint(tid, index);
 }
 
 inline std::string bytes_to_hex(const std::vector<std::uint8_t>& bytes, std::size_t limit = std::numeric_limits<std::size_t>::max())
@@ -1385,7 +1533,7 @@ inline tool_result_t vm_trace_bytecode(const json& params)
             "vm_trace_bytecode thread_enum_begin pid=%u active_pid=%u",
             pid,
             driver_bridge::attached_pid());
-        auto threads = driver_bridge::enumerate_threads_for(pid);
+        auto threads = enumerate_target_threads(pid);
         diag::log_tagged_fmt("protected_re",
             "vm_trace_bytecode thread_enum_end pid=%u count=%zu",
             pid,
@@ -4029,45 +4177,12 @@ inline tool_result_t drv_send_ioctl(const json& params)
     return ok ? tool_result_t::ok("DeviceIoControl completed", out) : tool_result_t::error("DeviceIoControl failed", out);
 }
 
-struct smc_session_t {
-    std::string id;
-    std::uint32_t pid = 0;
-    std::uint32_t page_guard_id = 0;
-    std::uint64_t watch_va = 0;
-    std::uint64_t watch_size = 0;
-    bool capture_on_write = true;
-    bool capture_on_execute = true;
-};
-
-inline std::mutex& smc_mutex()
-{
-    static std::mutex m;
-    return m;
-}
-
-inline std::map<std::string, smc_session_t>& smc_sessions()
-{
-    static std::map<std::string, smc_session_t> s;
-    return s;
-}
-
 inline std::string next_prefixed_id(const char* prefix)
 {
     static std::atomic<std::uint64_t> next{1};
     char buf[64] = {};
     std::snprintf(buf, sizeof(buf), "%s-%06llu", prefix, static_cast<unsigned long long>(next.fetch_add(1)));
     return std::string(buf);
-}
-
-inline std::string pg_access_name(std::uint32_t access)
-{
-    if (access == 0)
-        return "execute";
-    if (access == 1)
-        return "write";
-    if (access == 8)
-        return "execute";
-    return "access_" + std::to_string(access);
 }
 
 inline json disasm_preview_for_bytes(std::uint64_t va, const std::vector<std::uint8_t>& bytes, std::size_t max_insns = 16)
@@ -4104,61 +4219,39 @@ inline tool_result_t smc_manage(const json& params)
             return tool_result_t::error("An attached process or process_id is required");
         const std::uint64_t bounded_size = std::min<std::uint64_t>(*size, 1024ull * 1024ull);
         const bool capture_payloads = p.value("capture_on_write", true) || p.value("capture_on_execute", true);
-        const std::uint32_t sid = page_guard_engine::g_pg_engine.install(pid, *va, bounded_size, capture_payloads, 128);
-        if (sid == 0)
-            return tool_result_t::error("PAGE_GUARD capture backend failed to start");
-        smc_session_t s;
-        s.id = next_prefixed_id("smc");
-        s.pid = pid;
-        s.page_guard_id = sid;
-        s.watch_va = *va;
-        s.watch_size = bounded_size;
-        s.capture_on_write = p.value("capture_on_write", true);
-        s.capture_on_execute = p.value("capture_on_execute", true);
-        {
-            std::lock_guard<std::mutex> lk(smc_mutex());
-            smc_sessions()[s.id] = s;
+        const std::uint32_t max_records = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(parse_param_u64(p, "max_records_per_drain").value_or(64), 4096));
+        const std::uint32_t sid = page_guard_engine::g_pg_engine.install(pid, *va, bounded_size, capture_payloads, max_records, true);
+        if (sid == 0) {
+            return tool_result_t::error("Failed to install WhosWho driver-backed PAGE_GUARD capture session.",
+                json{{"pid", pid}, {"watch_va", sa_format_address(*va)}, {"watch_size", bounded_size}, {"capture_payloads", capture_payloads}, {"failure", page_guard_install_failure_json()}});
         }
-        return tool_result_t::ok(json{{"session_id", s.id}, {"page_guard_session_id", sid}, {"watch_va", sa_format_address(*va)}, {"watch_size", bounded_size}, {"pid", pid}});
+        return tool_result_t::ok("SMC PAGE_GUARD capture session started",
+            json{{"session_id", sid}, {"page_guard_session_id", sid}, {"pid", pid}, {"watch_va", sa_format_address(*va)}, {"watch_size", bounded_size}, {"capture_payloads", capture_payloads}, {"max_records_per_drain", max_records}, {"backend", "whoswho_driver_page_guard"}});
     }
     if (action == "captures") {
-        const std::string id = p.value("session_id", std::string());
-        smc_session_t s;
-        {
-            std::lock_guard<std::mutex> lk(smc_mutex());
-            auto it = smc_sessions().find(id);
-            if (it == smc_sessions().end())
-                return tool_result_t::error("session_id not found");
-            s = it->second;
-        }
-        auto records = page_guard_engine::g_pg_engine.get_capture_records(s.page_guard_id);
-        json arr = json::array();
-        for (const auto& r : records) {
-            const std::string event = pg_access_name(r.metadata.access_type);
-            if (event == "write" && !s.capture_on_write)
-                continue;
-            if (event == "execute" && !s.capture_on_execute)
-                continue;
-            std::vector<std::uint8_t> bytes = r.payload;
-            if (bytes.empty())
-                read_target_memory(s.pid, s.watch_va, static_cast<std::size_t>(std::min<std::uint64_t>(s.watch_size, 128)), bytes);
-            arr.push_back(json{{"event_type", event}, {"trigger_va", sa_format_address(r.metadata.fault_addr)}, {"decryptor_va", sa_format_address(r.metadata.rip)}, {"decryptor_callstack", json::array()}, {"captured_bytes_hex", bytes_to_hex(bytes, 256)}, {"payload_source", r.payload_source}, {"payload_va", r.payload_addr ? sa_format_address(r.payload_addr) : "unknown"}, {"disasm_preview", disasm_preview_for_bytes(r.payload_addr ? r.payload_addr : s.watch_va, bytes, 16)}});
-        }
-        return tool_result_t::ok(json{{"session_id", id}, {"captures", arr}, {"count", arr.size()}});
+        const auto id = parse_param_u64(p, "session_id");
+        if (!id || *id == 0 || *id > 0xFFFFFFFFULL)
+            return tool_result_t::error("session_id is required for captures");
+        auto records = page_guard_engine::g_pg_engine.get_capture_records(static_cast<std::uint32_t>(*id));
+        json captures = json::array();
+        for (const auto& c : records)
+            captures.push_back(page_guard_capture_json(c));
+        return tool_result_t::ok("SMC PAGE_GUARD captures drained",
+            json{{"session_id", *id}, {"capture_count", captures.size()}, {"captures", captures}, {"backend", "whoswho_driver_page_guard"}});
     }
     if (action == "stop") {
-        const std::string id = p.value("session_id", std::string());
-        smc_session_t s;
-        {
-            std::lock_guard<std::mutex> lk(smc_mutex());
-            auto it = smc_sessions().find(id);
-            if (it == smc_sessions().end())
-                return tool_result_t::error("session_id not found");
-            s = it->second;
-            smc_sessions().erase(it);
-        }
-        const bool ok = page_guard_engine::g_pg_engine.uninstall(s.page_guard_id);
-        return ok ? tool_result_t::ok(json{{"session_id", id}, {"stopped", true}}) : tool_result_t::error("PAGE_GUARD session uninstall failed", json{{"session_id", id}, {"page_guard_session_id", s.page_guard_id}});
+        const auto id = parse_param_u64(p, "session_id");
+        if (!id || *id == 0 || *id > 0xFFFFFFFFULL)
+            return tool_result_t::error("session_id is required for stop");
+        const bool stopped = page_guard_engine::g_pg_engine.uninstall(static_cast<std::uint32_t>(*id));
+        return stopped
+            ? tool_result_t::ok("SMC PAGE_GUARD capture session stopped", json{{"session_id", *id}, {"backend", "whoswho_driver_page_guard"}})
+            : tool_result_t::error("session_id not found", json{{"session_id", *id}, {"backend", "whoswho_driver_page_guard"}});
+    }
+    if (action == "list_sessions") {
+        json sessions = page_guard_sessions_json();
+        return tool_result_t::ok("SMC PAGE_GUARD sessions listed", json{{"sessions", sessions}, {"count", sessions.size()}, {"backend", "whoswho_driver_page_guard"}});
     }
     return compat_unknown_action("smc_manage", action);
 }
@@ -4835,22 +4928,6 @@ inline void append_oep_candidate(json& candidates, json candidate)
     candidates.push_back(std::move(candidate));
 }
 
-inline json pg_record_evidence(const page_guard_engine::pg_capture_record_t& r)
-{
-    json ev;
-    ev["fault_addr"] = sa_format_address(r.metadata.fault_addr);
-    ev["rip"] = sa_format_address(r.metadata.rip);
-    ev["ctx_rax"] = sa_format_address(r.metadata.ctx_rax);
-    ev["ctx_rcx"] = sa_format_address(r.metadata.ctx_rcx);
-    ev["ctx_rdx"] = sa_format_address(r.metadata.ctx_rdx);
-    ev["access_type"] = pg_access_name(r.metadata.access_type);
-    ev["exception_code"] = sa_format_address(r.metadata.exception_code);
-    ev["payload_source"] = r.payload_source;
-    ev["payload_addr"] = r.payload_addr ? sa_format_address(r.payload_addr) : "unknown";
-    ev["payload_read"] = r.payload_read;
-    return ev;
-}
-
 inline void run_stack_restore_oep_heuristic(std::uint32_t pid, std::uint32_t tid, const target_module_t& mod, const pe_layout_t& pe, json& candidates, json& evidence)
 {
     json ev;
@@ -4858,8 +4935,8 @@ inline void run_stack_restore_oep_heuristic(std::uint32_t pid, std::uint32_t tid
     ev["tid"] = tid;
     ev["module_is_64"] = pe.is_64;
     if (tid != 0) {
-        driver_bridge::thread_context_t ctx{};
-        if (driver_bridge::get_thread_context(tid, ctx)) {
+        voyager::device_t::thread_context ctx{};
+        if (read_target_thread_context(pid, tid, ctx)) {
             ev["thread_rip"] = sa_format_address(ctx.rip);
             ev["thread_rsp"] = sa_format_address(ctx.rsp);
         } else {
@@ -4954,7 +5031,7 @@ inline tool_result_t pack_find_oep(const json& params)
     if (auto t = parse_param_u64(params, "tid"))
         tid = static_cast<std::uint32_t>(*t);
     if (tid == 0) {
-        auto threads = driver_bridge::enumerate_threads_for(pid);
+        auto threads = enumerate_target_threads(pid);
         if (!threads.empty())
             tid = threads.front().tid;
     }
@@ -4969,55 +5046,65 @@ inline tool_result_t pack_find_oep(const json& params)
         ev["strategy"] = "page_guard";
         ev["section_count"] = sections.size();
         ev["timeout_ms"] = timeout_ms;
-        evidence.push_back(ev);
-        const ULONGLONG deadline = GetTickCount64() + timeout_ms;
+        ev["backend"] = "whoswho_driver_page_guard";
+        json installed = json::array();
+        json failures = json::array();
+        json capture_evidence = json::array();
+        std::vector<std::pair<std::uint32_t, mapped_section_t>> sessions;
+        const std::uint32_t max_sections = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(parse_param_u64(params, "page_guard_section_limit").value_or(4), 16));
         for (const auto& sec : sections) {
-            const std::uint64_t watch_size = std::min<std::uint64_t>(sec.virtual_size ? sec.virtual_size : sec.raw_size, 1024ull * 1024ull);
-            if (watch_size == 0)
-                continue;
-            const std::uint32_t sid = page_guard_engine::g_pg_engine.install(pid, sec.va, watch_size, true, 256);
-            json sec_ev;
-            sec_ev["strategy"] = "page_guard";
-            sec_ev["section"] = sec.name;
-            sec_ev["section_va"] = sa_format_address(sec.va);
-            sec_ev["section_size"] = watch_size;
-            sec_ev["session_id"] = sid;
-            if (sid == 0) {
-                sec_ev["result"] = "install_failed";
-                evidence.push_back(std::move(sec_ev));
-                continue;
-            }
-            bool saw_write = false;
-            json events = json::array();
-            while (GetTickCount64() < deadline) {
-                auto records = page_guard_engine::g_pg_engine.get_capture_records(sid);
-                for (const auto& r : records) {
-                    const std::string access = pg_access_name(r.metadata.access_type);
-                    if (events.size() < 16)
-                        events.push_back(pg_record_evidence(r));
-                    if (access == "write")
-                        saw_write = true;
-                    if (access != "execute")
-                        continue;
-                    std::vector<std::uint8_t> bytes;
-                    read_target_memory(pid, r.metadata.fault_addr, 32, bytes);
-                    append_oep_candidate(candidates, json{{"va", sa_format_address(r.metadata.fault_addr)}, {"strategy_used", "page_guard"}, {"confidence", saw_write ? "high" : "medium"}, {"first_instruction_preview", disasm_preview_for_bytes(r.metadata.fault_addr, bytes, 4)}, {"section", sec.name}, {"evidence", json{{"saw_write_before_execute", saw_write}, {"page_guard_session_id", sid}, {"record", pg_record_evidence(r)}, {"section_entropy", sec.entropy}}}});
-                    break;
-                }
-                if (!records.empty() && candidates.size() >= 16)
-                    break;
-                if (mcp_standalone::current_call_cancelled())
-                    break;
-                std::this_thread::sleep_for(std::chrono::milliseconds(25));
-            }
-            page_guard_engine::g_pg_engine.uninstall(sid);
-            sec_ev["events"] = std::move(events);
-            sec_ev["saw_write"] = saw_write;
-            sec_ev["result"] = "completed";
-            evidence.push_back(std::move(sec_ev));
-            if (mcp_standalone::current_call_cancelled() || GetTickCount64() >= deadline)
+            if (sessions.size() >= max_sections)
                 break;
+            const std::uint64_t sec_size = std::min<std::uint64_t>(sec.virtual_size ? sec.virtual_size : sec.raw_size, 1024ull * 1024ull);
+            if (sec.va == 0 || sec_size == 0)
+                continue;
+            const std::uint32_t sid = page_guard_engine::g_pg_engine.install(pid, sec.va, sec_size, false, 64, true);
+            if (sid == 0) {
+                failures.push_back(json{{"section", sec.name}, {"va", sa_format_address(sec.va)}, {"size", sec_size}, {"failure", page_guard_install_failure_json()}});
+                continue;
+            }
+            sessions.emplace_back(sid, sec);
+            installed.push_back(json{{"session_id", sid}, {"section", sec.name}, {"va", sa_format_address(sec.va)}, {"size", sec_size}});
         }
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        std::set<std::uint64_t> seen_candidates;
+        while (!sessions.empty() && std::chrono::steady_clock::now() < deadline) {
+            bool any = false;
+            for (const auto& session : sessions) {
+                auto records = page_guard_engine::g_pg_engine.get_capture_records(session.first);
+                if (!records.empty())
+                    any = true;
+                for (const auto& rec : records) {
+                    const auto& meta = rec.metadata;
+                    json cap = page_guard_capture_json(rec);
+                    cap["session_id"] = session.first;
+                    cap["section"] = session.second.name;
+                    capture_evidence.push_back(cap);
+                    const std::uint64_t candidate = address_in_module(*mod, pe, meta.fault_addr) ? meta.fault_addr : (address_in_module(*mod, pe, meta.rip) ? meta.rip : 0);
+                    if (candidate != 0 && seen_candidates.insert(candidate).second) {
+                        std::vector<std::uint8_t> bytes;
+                        read_target_memory(pid, candidate, 32, bytes);
+                        const std::string sec_name = section_for_va(pe, candidate);
+                        append_oep_candidate(candidates, json{{"va", sa_format_address(candidate)}, {"strategy_used", "page_guard"}, {"confidence", meta.access_type == 8 ? "high" : "medium"}, {"first_instruction_preview", disasm_preview_for_bytes(candidate, bytes, 4)}, {"section", sec_name.empty() ? session.second.name : sec_name}, {"evidence", json{{"session_id", session.first}, {"fault_va", sa_format_address(meta.fault_addr)}, {"rip", sa_format_address(meta.rip)}, {"access_type", meta.access_type}, {"exception_code", meta.exception_code}}}});
+                    }
+                }
+            }
+            if (seen_candidates.size() >= 8)
+                break;
+            if (!any)
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+        json uninstalled = json::array();
+        for (const auto& session : sessions)
+            uninstalled.push_back(json{{"session_id", session.first}, {"ok", page_guard_engine::g_pg_engine.uninstall(session.first)}});
+        ev["installed"] = installed;
+        ev["install_failures"] = failures;
+        ev["captures"] = capture_evidence;
+        ev["capture_count"] = capture_evidence.size();
+        ev["uninstalled"] = uninstalled;
+        ev["result"] = seen_candidates.empty() ? (installed.empty() ? "install_failed" : "no_page_guard_hits") : "candidate_found";
+        evidence.push_back(std::move(ev));
     }
     if (strategy == "tail_jump" || strategy == "all") {
         json ev;
@@ -5052,6 +5139,8 @@ inline tool_result_t pack_find_oep(const json& params)
     out["module"] = mod->name;
     out["module_base"] = sa_format_address(mod->base);
     out["timeout_ms"] = timeout_ms;
+    if (strategy == "page_guard" && candidates.empty())
+        return tool_result_t::error("PAGE_GUARD OEP scan completed without live OEP hits.", out);
     return tool_result_t::ok("OEP scan completed", out);
 }
 
@@ -5198,7 +5287,7 @@ inline tool_result_t pack_iat_manage(const json& params)
             std::uint64_t va;
         };
         std::vector<resolved_export_t> resolved;
-        auto threads = driver_bridge::enumerate_threads_for(pid);
+        auto threads = enumerate_target_threads(pid);
         iat_session_t s;
         s.id = next_prefixed_id("iat");
         s.pid = pid;
@@ -5227,14 +5316,15 @@ inline tool_result_t pack_iat_manage(const json& params)
                     continue;
                 }
                 bp["slot"] = slot;
-                if (driver_bridge::set_hardware_breakpoint(th.tid, slot, ex.va, 0, 0)) {
+                if (set_target_hardware_breakpoint(pid, th.tid, slot, ex.va, 0, 0)) {
                     s.breakpoints.push_back({th.tid, slot});
                     bp["armed"] = true;
                     ++slot;
                 } else {
                     ++s.failed_arms;
                     bp["armed"] = false;
-                    bp["reason"] = driver_bridge::last_error().empty() ? "set_hardware_breakpoint_failed" : driver_bridge::last_error();
+                    bp["reason"] = "set_hardware_breakpoint_failed";
+                    bp["win32_error"] = static_cast<unsigned long>(GetLastError());
                     ++slot;
                 }
                 if (s.breakpoint_evidence.size() < 512)
@@ -5285,7 +5375,7 @@ inline tool_result_t pack_iat_manage(const json& params)
         }
         int cleared = 0;
         for (const auto& bp : s.breakpoints) {
-            if (driver_bridge::clear_hardware_breakpoint(bp.first, bp.second))
+            if (clear_target_hardware_breakpoint(s.pid, bp.first, bp.second))
                 ++cleared;
         }
         return tool_result_t::ok(json{{"session_id", id}, {"cleared_breakpoints", cleared}});

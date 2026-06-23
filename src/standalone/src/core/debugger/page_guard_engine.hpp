@@ -5,7 +5,6 @@
 #endif
 #include <windows.h>
 #include "work_queue.hpp"
-#include <tlhelp32.h>
 
 #include "standalone_driver.hpp"
 #include "../../helpers/diag_log.hpp"
@@ -67,40 +66,111 @@ static constexpr size_t PATCH_PAGE_SIZE         = 196;
 static constexpr size_t PATCH_ORIG_PROTECT      = 208;
 static constexpr size_t PATCH_VIRT_PROTECT      = 227;
 
-struct remote_call_state_t {
-    uint64_t function_address;
-    uint64_t arg1;
-    uint64_t arg2;
-    uint64_t arg3;
-    uint64_t arg4;
-    uint64_t result;
-};
-
-static_assert(sizeof(remote_call_state_t) == 48, "remote_call_state_t layout mismatch");
-
-static inline void log_remote_region(HANDLE process,
-                                     const char* label,
-                                     uint32_t pid,
-                                     const char* phase,
-                                     const void* address)
+static inline bool kernel_operation_ready(uint32_t pid,
+                                          const char* label,
+                                          const char* operation,
+                                          ULONGLONG started)
 {
-    MEMORY_BASIC_INFORMATION mbi{};
-    SIZE_T got = VirtualQueryEx(process, address, &mbi, sizeof(mbi));
-    DWORD err = got == sizeof(mbi) ? 0 : GetLastError();
+    std::string session_reason;
+    const bool loaded = driver_bridge::is_loaded();
+    const bool kernel = driver_bridge::using_kernel_driver();
+    const bool session = driver_bridge::kernel_session_available(&session_reason);
+    const bool dyn_ready = driver_bridge::dynamic_ioctls_ready();
+    const uint32_t active = driver_bridge::attached_pid();
+    const bool ok = pid != 0 && loaded && kernel && session && dyn_ready && active == pid;
+    if (!ok) {
+        diag::log_tagged_fmt("pg_sniff",
+            "kernel_operation_fail_closed op=%s label=%s pid=%u active_pid=%u loaded=%d kernel=%d session=%d dyn_ready=%d reason=%s status=%s last_error=%s elapsed_ms=%llu",
+            operation ? operation : "",
+            label ? label : "",
+            pid,
+            active,
+            loaded ? 1 : 0,
+            kernel ? 1 : 0,
+            session ? 1 : 0,
+            dyn_ready ? 1 : 0,
+            session_reason.empty() ? "<empty>" : session_reason.c_str(),
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str(),
+            static_cast<unsigned long long>(GetTickCount64() - started));
+    }
+    return ok;
+}
+
+static inline void log_driver_region(uint32_t pid,
+                                     const char* label,
+                                     const char* phase,
+                                     uint64_t address)
+{
+    driver_bridge::memory_region_t region{};
+    const bool ok = driver_bridge::query_memory_for(pid, address, region);
     diag::log_tagged_fmt("pg_sniff",
-        "remote_thread_call_region label=%s pid=%u phase=%s addr=%p query=%llu base=%p alloc_base=%p size=0x%llX state=0x%08lX protect=0x%08lX type=0x%08lX err=%lu",
+        "driver_remote_call_region label=%s pid=%u active_pid=%u phase=%s addr=0x%llX query=%d base=0x%llX size=0x%llX state=0x%08X protect=0x%08X type=0x%08X status=%s last_error=%s",
         label ? label : "",
         pid,
+        driver_bridge::attached_pid(),
         phase ? phase : "",
-        address,
-        static_cast<unsigned long long>(got),
-        got == sizeof(mbi) ? mbi.BaseAddress : nullptr,
-        got == sizeof(mbi) ? mbi.AllocationBase : nullptr,
-        got == sizeof(mbi) ? static_cast<unsigned long long>(mbi.RegionSize) : 0ULL,
-        got == sizeof(mbi) ? static_cast<unsigned long>(mbi.State) : 0UL,
-        got == sizeof(mbi) ? static_cast<unsigned long>(mbi.Protect) : 0UL,
-        got == sizeof(mbi) ? static_cast<unsigned long>(mbi.Type) : 0UL,
-        static_cast<unsigned long>(err));
+        static_cast<unsigned long long>(address),
+        ok ? 1 : 0,
+        static_cast<unsigned long long>(region.base),
+        static_cast<unsigned long long>(region.size),
+        region.state,
+        region.protect,
+        region.type,
+        driver_bridge::status().c_str(),
+        driver_bridge::last_error().c_str());
+}
+
+static inline uint64_t driver_remote_call(uint32_t pid,
+                                          uint64_t function_address,
+                                          uint64_t arg1,
+                                          uint64_t arg2 = 0,
+                                          uint64_t arg3 = 0,
+                                          uint64_t arg4 = 0,
+                                          const char* label = "remote_call")
+{
+    const ULONGLONG call_start = GetTickCount64();
+    diag::log_tagged_fmt("pg_sniff",
+        "driver_remote_call_entry label=%s pid=%u active_pid=%u fn=0x%llX arg1=0x%llX arg2=0x%llX arg3=0x%llX arg4=0x%llX caller_tid=%lu tick=%llu",
+        label ? label : "",
+        pid,
+        driver_bridge::attached_pid(),
+        static_cast<unsigned long long>(function_address),
+        static_cast<unsigned long long>(arg1),
+        static_cast<unsigned long long>(arg2),
+        static_cast<unsigned long long>(arg3),
+        static_cast<unsigned long long>(arg4),
+        static_cast<unsigned long>(GetCurrentThreadId()),
+        static_cast<unsigned long long>(call_start));
+    if (pid == 0 || function_address == 0) {
+        diag::log_tagged_fmt("pg_sniff",
+            "driver_remote_call_reject label=%s pid=%u fn=0x%llX reason=invalid_args elapsed_ms=%llu",
+            label ? label : "",
+            pid,
+            static_cast<unsigned long long>(function_address),
+            static_cast<unsigned long long>(GetTickCount64() - call_start));
+        return 0;
+    }
+    if (!kernel_operation_ready(pid, label, "driver_remote_call", call_start))
+        return 0;
+
+    log_driver_region(pid, label, "function_before_call", function_address);
+    SetLastError(ERROR_SUCCESS);
+    const uint64_t result = driver_bridge::call_function(function_address, arg1, arg2, arg3, arg4);
+    const DWORD gle = result != 0 ? ERROR_SUCCESS : GetLastError();
+    diag::log_tagged_fmt("pg_sniff",
+        "driver_remote_call_done label=%s pid=%u active_pid=%u method=driver_bridge::call_function fn=0x%llX result=0x%llX ok=%d gle=%lu status=%s last_error=%s elapsed_ms=%llu",
+        label ? label : "",
+        pid,
+        driver_bridge::attached_pid(),
+        static_cast<unsigned long long>(function_address),
+        static_cast<unsigned long long>(result),
+        result != 0 ? 1 : 0,
+        static_cast<unsigned long>(gle),
+        driver_bridge::status().c_str(),
+        driver_bridge::last_error().c_str(),
+        static_cast<unsigned long long>(GetTickCount64() - call_start));
+    return result;
 }
 
 static inline uint64_t remote_thread_call(uint32_t pid,
@@ -109,321 +179,11 @@ static inline uint64_t remote_thread_call(uint32_t pid,
                                           uint64_t arg2 = 0,
                                           uint64_t arg3 = 0,
                                           uint64_t arg4 = 0,
-                                          DWORD timeout_ms = 5000,
+                                          uint32_t timeout_ms = 0,
                                           const char* label = "remote_call")
 {
-    const ULONGLONG call_start = GetTickCount64();
-    diag::log_tagged_fmt("pg_sniff",
-        "remote_thread_call_entry label=%s pid=%u fn=0x%llX arg1=0x%llX arg2=0x%llX arg3=0x%llX arg4=0x%llX timeout_ms=%lu caller_tid=%lu tick=%llu",
-        label ? label : "",
-        pid,
-        static_cast<unsigned long long>(function_address),
-        static_cast<unsigned long long>(arg1),
-        static_cast<unsigned long long>(arg2),
-        static_cast<unsigned long long>(arg3),
-        static_cast<unsigned long long>(arg4),
-        static_cast<unsigned long>(timeout_ms),
-        static_cast<unsigned long>(GetCurrentThreadId()),
-        static_cast<unsigned long long>(call_start));
-    if (pid == 0 || function_address == 0) {
-        diag::log_tagged_fmt("pg_sniff",
-            "remote_thread_call_reject label=%s pid=%u fn=0x%llX",
-            label ? label : "",
-            pid,
-            static_cast<unsigned long long>(function_address));
-        return 0;
-    }
-
-    HANDLE process = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_LIMITED_INFORMATION |
-                                 PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ,
-                                 FALSE, pid);
-    if (!process) {
-        diag::log_tagged_fmt("pg_sniff", "remote_thread_call_open_failed label=%s pid=%u err=%lu",
-            label ? label : "", pid, static_cast<unsigned long>(GetLastError()));
-        return 0;
-    }
-    DWORD process_exit = STILL_ACTIVE;
-    BOOL process_exit_ok = GetExitCodeProcess(process, &process_exit);
-    diag::log_tagged_fmt("pg_sniff",
-        "remote_thread_call_open_ok label=%s pid=%u process=%p exit_ok=%d exit=0x%08lX elapsed_ms=%llu",
-        label ? label : "",
-        pid,
-        process,
-        process_exit_ok ? 1 : 0,
-        static_cast<unsigned long>(process_exit),
-        static_cast<unsigned long long>(GetTickCount64() - call_start));
-
-    static const uint8_t kStub[] = {
-        0x53,
-        0x48, 0x89, 0xCB,
-        0x48, 0x83, 0xEC, 0x20,
-        0x48, 0x8B, 0x03,
-        0x48, 0x8B, 0x4B, 0x08,
-        0x48, 0x8B, 0x53, 0x10,
-        0x4C, 0x8B, 0x43, 0x18,
-        0x4C, 0x8B, 0x4B, 0x20,
-        0xFF, 0xD0,
-        0x48, 0x89, 0x43, 0x28,
-        0x48, 0x83, 0xC4, 0x20,
-        0x5B,
-        0xC3
-    };
-
-    remote_call_state_t state{};
-    state.function_address = function_address;
-    state.arg1 = arg1;
-    state.arg2 = arg2;
-    state.arg3 = arg3;
-    state.arg4 = arg4;
-
-    SetLastError(0);
-    LPVOID remote_state = VirtualAllocEx(process, nullptr, sizeof(state), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-    DWORD state_alloc_err = remote_state ? 0 : GetLastError();
-    SetLastError(0);
-    LPVOID remote_code = VirtualAllocEx(process, nullptr, sizeof(kStub), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-    DWORD code_alloc_err = remote_code ? 0 : GetLastError();
-    diag::log_tagged_fmt("pg_sniff",
-        "remote_thread_call_alloc_result label=%s pid=%u state=%p state_size=%llu state_err=%lu code=%p code_size=%llu code_err=%lu elapsed_ms=%llu",
-        label ? label : "",
-        pid,
-        remote_state,
-        static_cast<unsigned long long>(sizeof(state)),
-        static_cast<unsigned long>(state_alloc_err),
-        remote_code,
-        static_cast<unsigned long long>(sizeof(kStub)),
-        static_cast<unsigned long>(code_alloc_err),
-        static_cast<unsigned long long>(GetTickCount64() - call_start));
-    if (!remote_state || !remote_code) {
-        BOOL free_state_ok = TRUE;
-        DWORD free_state_err = 0;
-        BOOL free_code_ok = TRUE;
-        DWORD free_code_err = 0;
-        if (remote_state) {
-            SetLastError(0);
-            free_state_ok = VirtualFreeEx(process, remote_state, 0, MEM_RELEASE);
-            free_state_err = free_state_ok ? 0 : GetLastError();
-        }
-        if (remote_code) {
-            SetLastError(0);
-            free_code_ok = VirtualFreeEx(process, remote_code, 0, MEM_RELEASE);
-            free_code_err = free_code_ok ? 0 : GetLastError();
-        }
-        diag::log_tagged_fmt("pg_sniff", "remote_thread_call_alloc_failed label=%s pid=%u state=%p state_err=%lu code=%p code_err=%lu free_state_ok=%d free_state_err=%lu free_code_ok=%d free_code_err=%lu",
-            label ? label : "", pid, remote_state, static_cast<unsigned long>(state_alloc_err), remote_code, static_cast<unsigned long>(code_alloc_err),
-            free_state_ok ? 1 : 0, static_cast<unsigned long>(free_state_err),
-            free_code_ok ? 1 : 0, static_cast<unsigned long>(free_code_err));
-        CloseHandle(process);
-        return 0;
-    }
-    log_remote_region(process, label, pid, "state_after_alloc", remote_state);
-    log_remote_region(process, label, pid, "code_after_alloc", remote_code);
-
-    SIZE_T wrote_state = 0;
-    SIZE_T wrote_code = 0;
-    SetLastError(0);
-    BOOL wrote_state_ok = WriteProcessMemory(process, remote_state, &state, sizeof(state), &wrote_state);
-    DWORD wrote_state_err = wrote_state_ok ? 0 : GetLastError();
-    SetLastError(0);
-    BOOL wrote_code_ok = WriteProcessMemory(process, remote_code, kStub, sizeof(kStub), &wrote_code);
-    DWORD wrote_code_err = wrote_code_ok ? 0 : GetLastError();
-    BOOL wrote_ok = wrote_state_ok && wrote_code_ok;
-    DWORD old_protect = 0;
-    SetLastError(0);
-    BOOL protect_ok = wrote_ok && VirtualProtectEx(process, remote_code, sizeof(kStub), PAGE_EXECUTE_READ, &old_protect);
-    DWORD protect_err = protect_ok ? 0 : GetLastError();
-    diag::log_tagged_fmt("pg_sniff",
-        "remote_thread_call_write_protect label=%s pid=%u wrote_state_ok=%d wrote_state=%llu wrote_state_err=%lu wrote_code_ok=%d wrote_code=%llu wrote_code_err=%lu protect_ok=%d old_protect=0x%08lX protect_err=%lu elapsed_ms=%llu",
-        label ? label : "",
-        pid,
-        wrote_state_ok ? 1 : 0,
-        static_cast<unsigned long long>(wrote_state),
-        static_cast<unsigned long>(wrote_state_err),
-        wrote_code_ok ? 1 : 0,
-        static_cast<unsigned long long>(wrote_code),
-        static_cast<unsigned long>(wrote_code_err),
-        protect_ok ? 1 : 0,
-        static_cast<unsigned long>(old_protect),
-        static_cast<unsigned long>(protect_err),
-        static_cast<unsigned long long>(GetTickCount64() - call_start));
-    log_remote_region(process, label, pid, "code_after_protect", remote_code);
-    if (!wrote_ok || !protect_ok || wrote_state != sizeof(state) || wrote_code != sizeof(kStub)) {
-        SetLastError(0);
-        BOOL free_code_ok = VirtualFreeEx(process, remote_code, 0, MEM_RELEASE);
-        DWORD free_code_err = free_code_ok ? 0 : GetLastError();
-        SetLastError(0);
-        BOOL free_state_ok = VirtualFreeEx(process, remote_state, 0, MEM_RELEASE);
-        DWORD free_state_err = free_state_ok ? 0 : GetLastError();
-        diag::log_tagged_fmt("pg_sniff", "remote_thread_call_write_failed label=%s pid=%u wrote_state_ok=%d wrote_state=%llu wrote_state_err=%lu wrote_code_ok=%d wrote_code=%llu wrote_code_err=%lu protect_ok=%d protect_err=%lu cleanup_code_ok=%d cleanup_code_err=%lu cleanup_state_ok=%d cleanup_state_err=%lu err=%lu",
-            label ? label : "", pid,
-            wrote_state_ok ? 1 : 0,
-            static_cast<unsigned long long>(wrote_state),
-            static_cast<unsigned long>(wrote_state_err),
-            wrote_code_ok ? 1 : 0,
-            static_cast<unsigned long long>(wrote_code),
-            static_cast<unsigned long>(wrote_code_err),
-            protect_ok ? 1 : 0,
-            static_cast<unsigned long>(protect_err),
-            free_code_ok ? 1 : 0,
-            static_cast<unsigned long>(free_code_err),
-            free_state_ok ? 1 : 0,
-            static_cast<unsigned long>(free_state_err),
-            static_cast<unsigned long>(protect_err != 0 ? protect_err : (wrote_state_err != 0 ? wrote_state_err : wrote_code_err)));
-        CloseHandle(process);
-        return 0;
-    }
-
-    BOOL flush_ok = FlushInstructionCache(process, remote_code, sizeof(kStub));
-    DWORD flush_err = flush_ok ? 0 : GetLastError();
-    diag::log_tagged_fmt("pg_sniff",
-        "remote_thread_call_flush label=%s pid=%u ok=%d err=%lu elapsed_ms=%llu",
-        label ? label : "",
-        pid,
-        flush_ok ? 1 : 0,
-        static_cast<unsigned long>(flush_err),
-        static_cast<unsigned long long>(GetTickCount64() - call_start));
-    DWORD remote_tid = 0;
-    SetLastError(0);
-    HANDLE thread = CreateRemoteThread(process, nullptr, 0,
-        reinterpret_cast<LPTHREAD_START_ROUTINE>(remote_code),
-        remote_state, 0, &remote_tid);
-    DWORD create_err = thread ? 0 : GetLastError();
-    if (!thread) {
-        log_remote_region(process, label, pid, "code_create_failed", remote_code);
-        log_remote_region(process, label, pid, "state_create_failed", remote_state);
-        SetLastError(0);
-        BOOL free_code_ok = VirtualFreeEx(process, remote_code, 0, MEM_RELEASE);
-        DWORD free_code_err = free_code_ok ? 0 : GetLastError();
-        SetLastError(0);
-        BOOL free_state_ok = VirtualFreeEx(process, remote_state, 0, MEM_RELEASE);
-        DWORD free_state_err = free_state_ok ? 0 : GetLastError();
-        diag::log_tagged_fmt("pg_sniff", "remote_thread_call_create_failed label=%s pid=%u method=CreateRemoteThread err=%lu code=%p state=%p cleanup_code_ok=%d cleanup_code_err=%lu cleanup_state_ok=%d cleanup_state_err=%lu elapsed_ms=%llu",
-            label ? label : "", pid, static_cast<unsigned long>(create_err),
-            remote_code, remote_state,
-            free_code_ok ? 1 : 0, static_cast<unsigned long>(free_code_err),
-            free_state_ok ? 1 : 0, static_cast<unsigned long>(free_state_err),
-            static_cast<unsigned long long>(GetTickCount64() - call_start));
-        CloseHandle(process);
-        return 0;
-    }
-    diag::log_tagged_fmt("pg_sniff",
-        "remote_thread_call_thread_created label=%s pid=%u method=CreateRemoteThread remote_tid=%lu thread=%p start=%p parameter=%p function=0x%llX elapsed_ms=%llu",
-        label ? label : "",
-        pid,
-        static_cast<unsigned long>(remote_tid),
-        thread,
-        remote_code,
-        remote_state,
-        static_cast<unsigned long long>(function_address),
-        static_cast<unsigned long long>(GetTickCount64() - call_start));
-
-    const ULONGLONG wait_start = GetTickCount64();
-    diag::log_tagged_fmt("pg_sniff",
-        "remote_thread_call_wait_begin label=%s pid=%u remote_tid=%lu timeout_ms=%lu elapsed_ms=%llu",
-        label ? label : "",
-        pid,
-        static_cast<unsigned long>(remote_tid),
-        static_cast<unsigned long>(timeout_ms),
-        static_cast<unsigned long long>(wait_start - call_start));
-    DWORD wait = WaitForSingleObject(thread, timeout_ms);
-    const ULONGLONG wait_elapsed = GetTickCount64() - wait_start;
-    if (wait != WAIT_OBJECT_0) {
-        DWORD thread_exit = STILL_ACTIVE;
-        GetExitCodeThread(thread, &thread_exit);
-        DWORD after_exit = STILL_ACTIVE;
-        BOOL after_exit_ok = GetExitCodeProcess(process, &after_exit);
-        log_remote_region(process, label, pid, "code_wait_failed", remote_code);
-        log_remote_region(process, label, pid, "state_wait_failed", remote_state);
-        diag::log_tagged_fmt("pg_sniff", "remote_thread_call_timeout label=%s pid=%u method=CreateRemoteThread remote_tid=%lu wait=0x%08lX wait_elapsed_ms=%llu thread_exit=0x%08lX process_exit_ok=%d process_exit=0x%08lX cleanup_code_skipped=1 cleanup_state_skipped=1 cleanup_reason=remote_thread_not_signaled total_elapsed_ms=%llu",
-            label ? label : "",
-            pid,
-            static_cast<unsigned long>(remote_tid),
-            static_cast<unsigned long>(wait),
-            static_cast<unsigned long long>(wait_elapsed),
-            static_cast<unsigned long>(thread_exit),
-            after_exit_ok ? 1 : 0,
-            static_cast<unsigned long>(after_exit),
-            static_cast<unsigned long long>(GetTickCount64() - call_start));
-        SetLastError(0);
-        BOOL close_thread_ok = CloseHandle(thread);
-        DWORD close_thread_err = close_thread_ok ? 0 : GetLastError();
-        SetLastError(0);
-        BOOL close_process_ok = CloseHandle(process);
-        DWORD close_process_err = close_process_ok ? 0 : GetLastError();
-        diag::log_tagged_fmt("pg_sniff",
-            "remote_thread_call_timeout_cleanup label=%s pid=%u remote_tid=%lu close_thread_ok=%d close_thread_err=%lu close_process_ok=%d close_process_err=%lu cleanup_code_skipped=1 cleanup_state_skipped=1 elapsed_ms=%llu",
-            label ? label : "",
-            pid,
-            static_cast<unsigned long>(remote_tid),
-            close_thread_ok ? 1 : 0,
-            static_cast<unsigned long>(close_thread_err),
-            close_process_ok ? 1 : 0,
-            static_cast<unsigned long>(close_process_err),
-            static_cast<unsigned long long>(GetTickCount64() - call_start));
-        return 0;
-    }
-    diag::log_tagged_fmt("pg_sniff",
-        "remote_thread_call_wait_done label=%s pid=%u remote_tid=%lu wait_elapsed_ms=%llu total_elapsed_ms=%llu",
-        label ? label : "",
-        pid,
-        static_cast<unsigned long>(remote_tid),
-        static_cast<unsigned long long>(wait_elapsed),
-        static_cast<unsigned long long>(GetTickCount64() - call_start));
-
-    SIZE_T read = 0;
-    remote_call_state_t out_state{};
-    SetLastError(0);
-    BOOL read_ok = ReadProcessMemory(process, remote_state, &out_state, sizeof(out_state), &read);
-    DWORD read_err = read_ok ? 0 : GetLastError();
-    DWORD exit_code = 0;
-    BOOL exit_ok = GetExitCodeThread(thread, &exit_code);
-    diag::log_tagged_fmt("pg_sniff",
-        "remote_thread_call_read_exit label=%s pid=%u remote_tid=%lu read_ok=%d read=%llu read_err=%lu exit_ok=%d exit=0x%08lX result=0x%llX elapsed_ms=%llu",
-        label ? label : "",
-        pid,
-        static_cast<unsigned long>(remote_tid),
-        read_ok ? 1 : 0,
-        static_cast<unsigned long long>(read),
-        static_cast<unsigned long>(read_err),
-        exit_ok ? 1 : 0,
-        static_cast<unsigned long>(exit_code),
-        static_cast<unsigned long long>(out_state.result),
-        static_cast<unsigned long long>(GetTickCount64() - call_start));
-    CloseHandle(thread);
-    SetLastError(0);
-    BOOL free_code_ok = VirtualFreeEx(process, remote_code, 0, MEM_RELEASE);
-    DWORD free_code_err = free_code_ok ? 0 : GetLastError();
-    SetLastError(0);
-    BOOL free_state_ok = VirtualFreeEx(process, remote_state, 0, MEM_RELEASE);
-    DWORD free_state_err = free_state_ok ? 0 : GetLastError();
-    diag::log_tagged_fmt("pg_sniff",
-        "remote_thread_call_free label=%s pid=%u code=%p free_code_ok=%d free_code_err=%lu state=%p free_state_ok=%d free_state_err=%lu elapsed_ms=%llu",
-        label ? label : "",
-        pid,
-        remote_code,
-        free_code_ok ? 1 : 0,
-        static_cast<unsigned long>(free_code_err),
-        remote_state,
-        free_state_ok ? 1 : 0,
-        static_cast<unsigned long>(free_state_err),
-        static_cast<unsigned long long>(GetTickCount64() - call_start));
-    CloseHandle(process);
-
-    if (!read_ok || read != sizeof(out_state)) {
-        diag::log_tagged_fmt("pg_sniff", "remote_thread_call_read_failed label=%s pid=%u read=%llu err=%lu",
-            label ? label : "", pid,
-            static_cast<unsigned long long>(read),
-            static_cast<unsigned long>(read_err));
-        return 0;
-    }
-
-    diag::log_tagged_fmt("pg_sniff", "remote_thread_call_done label=%s pid=%u fn=0x%llX result=0x%llX exit=0x%08lX total_elapsed_ms=%llu",
-        label ? label : "",
-        pid,
-        static_cast<unsigned long long>(function_address),
-        static_cast<unsigned long long>(out_state.result),
-        static_cast<unsigned long>(exit_code),
-        static_cast<unsigned long long>(GetTickCount64() - call_start));
-    return out_state.result;
+    (void)timeout_ms;
+    return driver_remote_call(pid, function_address, arg1, arg2, arg3, arg4, label);
 }
 
 
@@ -699,7 +459,7 @@ static inline uint64_t remove_vectored_exception_handler_remote(uint32_t pid,
             static_cast<unsigned long long>(GetTickCount64() - phase_start));
         return 0;
     }
-    const uint64_t removed = remote_thread_call(pid, remove_fn, veh_handle, 0, 0, 0, 5000, "RtlRemoveVectoredExceptionHandler");
+    const uint64_t removed = driver_remote_call(pid, remove_fn, veh_handle, 0, 0, 0, "RtlRemoveVectoredExceptionHandler");
     diag::log_tagged_fmt("pg_sniff",
         "remove_veh_remote_done phase=%s pid=%u active_pid=%u module=ntdll.dll base=0x%llX function=RtlRemoveVectoredExceptionHandler va=0x%llX handle=0x%llX result=0x%llX ok=%d elapsed_ms=%llu phase_elapsed_ms=%llu",
         phase ? phase : "",
@@ -978,6 +738,8 @@ public:
                 pid, driver_bridge::attached_pid());
             return fail_install("active_pid_mismatch", "driver active pid differs from requested pid", nullptr, 0, 0, 0);
         }
+        if (!kernel_operation_ready(pid, "install", "page_guard_install", install_start))
+            return fail_install("kernel_unavailable", "kernel driver session is not ready for page-guard installation", nullptr, 0, 0, 0);
 
 
         driver_bridge::memory_region_t mri{};
@@ -1199,7 +961,7 @@ public:
         const bool veh_ring_before_ok = driver_bridge::query_memory_for(pid, ring_addr, veh_ring_before);
         const std::string veh_ring_before_error = veh_ring_before_ok ? std::string() : driver_bridge::last_error();
         diag::log_tagged_fmt("pg_sniff",
-            "veh_register_begin pid=%u active_pid=%u caller_tid=%lu module=ntdll.dll ntdll_base=0x%llX ntdll_size=0x%llX function=RtlAddVectoredExceptionHandler va=0x%llX remove_va=0x%llX handler=0x%llX ring=0x%llX method=remote_thread_call/CreateRemoteThread target_base=0x%llX target_size=0x%llX target_state=0x%08X target_protect=0x%08X target_type=0x%08X handler_query=%d handler_base=0x%llX handler_size=0x%llX handler_state=0x%08X handler_protect=0x%08X handler_type=0x%08X handler_error=%s ring_query=%d ring_base=0x%llX ring_size=0x%llX ring_state=0x%08X ring_protect=0x%08X ring_type=0x%08X ring_error=%s elapsed_ms=%llu",
+            "veh_register_begin pid=%u active_pid=%u caller_tid=%lu module=ntdll.dll ntdll_base=0x%llX ntdll_size=0x%llX function=RtlAddVectoredExceptionHandler va=0x%llX remove_va=0x%llX handler=0x%llX ring=0x%llX method=driver_bridge::call_function target_base=0x%llX target_size=0x%llX target_state=0x%08X target_protect=0x%08X target_type=0x%08X handler_query=%d handler_base=0x%llX handler_size=0x%llX handler_state=0x%08X handler_protect=0x%08X handler_type=0x%08X handler_error=%s ring_query=%d ring_base=0x%llX ring_size=0x%llX ring_state=0x%08X ring_protect=0x%08X ring_type=0x%08X ring_error=%s elapsed_ms=%llu",
             pid,
             driver_bridge::attached_pid(),
             static_cast<unsigned long>(GetCurrentThreadId()),
@@ -1230,7 +992,7 @@ public:
             veh_ring_before_error.c_str(),
             static_cast<unsigned long long>(GetTickCount64() - install_start));
 
-        uint64_t veh_handle = remote_thread_call(pid, rtl_add_fn, 1, sc_addr, 0, 0, 5000, "RtlAddVectoredExceptionHandler");
+        uint64_t veh_handle = driver_remote_call(pid, rtl_add_fn, 1, sc_addr, 0, 0, "RtlAddVectoredExceptionHandler");
         driver_bridge::memory_region_t veh_target_after{};
         driver_bridge::memory_region_t veh_handler_after{};
         driver_bridge::memory_region_t veh_ring_after{};
@@ -1246,7 +1008,7 @@ public:
             const bool cleanup_ring_ok = driver_bridge::free_memory_for(pid, ring_addr);
             const std::string cleanup_ring_error = cleanup_ring_ok ? std::string() : driver_bridge::last_error();
             diag::log_tagged_fmt("pg_sniff",
-                "veh_register_failed pid=%u active_pid=%u caller_tid=%lu module=ntdll.dll ntdll_base=0x%llX ntdll_size=0x%llX function=RtlAddVectoredExceptionHandler va=0x%llX remove_va=0x%llX handler=0x%llX ring=0x%llX method=remote_thread_call/CreateRemoteThread result=0x%llX target_before_base=0x%llX target_before_size=0x%llX target_before_state=0x%08X target_before_protect=0x%08X target_before_type=0x%08X target_after_query=%d target_after_base=0x%llX target_after_size=0x%llX target_after_state=0x%08X target_after_protect=0x%08X target_after_type=0x%08X target_after_error=%s handler_before_query=%d handler_before_base=0x%llX handler_before_size=0x%llX handler_before_state=0x%08X handler_before_protect=0x%08X handler_before_type=0x%08X handler_after_query=%d handler_after_base=0x%llX handler_after_size=0x%llX handler_after_state=0x%08X handler_after_protect=0x%08X handler_after_type=0x%08X handler_after_error=%s ring_before_query=%d ring_before_base=0x%llX ring_before_size=0x%llX ring_before_state=0x%08X ring_before_protect=0x%08X ring_before_type=0x%08X ring_after_query=%d ring_after_base=0x%llX ring_after_size=0x%llX ring_after_state=0x%08X ring_after_protect=0x%08X ring_after_type=0x%08X ring_after_error=%s cleanup_sc_ok=%d cleanup_sc_error=%s cleanup_ring_ok=%d cleanup_ring_error=%s elapsed_ms=%llu",
+                "veh_register_failed pid=%u active_pid=%u caller_tid=%lu module=ntdll.dll ntdll_base=0x%llX ntdll_size=0x%llX function=RtlAddVectoredExceptionHandler va=0x%llX remove_va=0x%llX handler=0x%llX ring=0x%llX method=driver_bridge::call_function result=0x%llX target_before_base=0x%llX target_before_size=0x%llX target_before_state=0x%08X target_before_protect=0x%08X target_before_type=0x%08X target_after_query=%d target_after_base=0x%llX target_after_size=0x%llX target_after_state=0x%08X target_after_protect=0x%08X target_after_type=0x%08X target_after_error=%s handler_before_query=%d handler_before_base=0x%llX handler_before_size=0x%llX handler_before_state=0x%08X handler_before_protect=0x%08X handler_before_type=0x%08X handler_after_query=%d handler_after_base=0x%llX handler_after_size=0x%llX handler_after_state=0x%08X handler_after_protect=0x%08X handler_after_type=0x%08X handler_after_error=%s ring_before_query=%d ring_before_base=0x%llX ring_before_size=0x%llX ring_before_state=0x%08X ring_before_protect=0x%08X ring_before_type=0x%08X ring_after_query=%d ring_after_base=0x%llX ring_after_size=0x%llX ring_after_state=0x%08X ring_after_protect=0x%08X ring_after_type=0x%08X ring_after_error=%s cleanup_sc_ok=%d cleanup_sc_error=%s cleanup_ring_ok=%d cleanup_ring_error=%s elapsed_ms=%llu",
                 pid,
                 driver_bridge::attached_pid(),
                 static_cast<unsigned long>(GetCurrentThreadId()),
@@ -1303,7 +1065,7 @@ public:
             return fail_install("veh_register_failed", "remote RtlAddVectoredExceptionHandler call failed", &mri, target_addr, region_size, 0);
         }
         diag::log_tagged_fmt("pg_sniff",
-            "veh_register_done pid=%u active_pid=%u caller_tid=%lu module=ntdll.dll ntdll_base=0x%llX ntdll_size=0x%llX function=RtlAddVectoredExceptionHandler va=0x%llX handler=0x%llX ring=0x%llX handle=0x%llX method=remote_thread_call/CreateRemoteThread target_after_query=%d target_after_base=0x%llX target_after_size=0x%llX target_after_state=0x%08X target_after_protect=0x%08X target_after_type=0x%08X handler_after_query=%d handler_after_base=0x%llX handler_after_size=0x%llX handler_after_state=0x%08X handler_after_protect=0x%08X handler_after_type=0x%08X ring_after_query=%d ring_after_base=0x%llX ring_after_size=0x%llX ring_after_state=0x%08X ring_after_protect=0x%08X ring_after_type=0x%08X elapsed_ms=%llu",
+            "veh_register_done pid=%u active_pid=%u caller_tid=%lu module=ntdll.dll ntdll_base=0x%llX ntdll_size=0x%llX function=RtlAddVectoredExceptionHandler va=0x%llX handler=0x%llX ring=0x%llX handle=0x%llX method=driver_bridge::call_function target_after_query=%d target_after_base=0x%llX target_after_size=0x%llX target_after_state=0x%08X target_after_protect=0x%08X target_after_type=0x%08X handler_after_query=%d handler_after_base=0x%llX handler_after_size=0x%llX handler_after_state=0x%08X handler_after_protect=0x%08X handler_after_type=0x%08X ring_after_query=%d ring_after_base=0x%llX ring_after_size=0x%llX ring_after_state=0x%08X ring_after_protect=0x%08X ring_after_type=0x%08X elapsed_ms=%llu",
             pid,
             driver_bridge::attached_pid(),
             static_cast<unsigned long>(GetCurrentThreadId()),
@@ -1885,6 +1647,20 @@ private:
             }
         } drain_scope(sess);
 
+        active_pid_scope_t active;
+        if (!active.enter(sess->pid)) {
+            diag::log_tagged_fmt("pg_sniff", "drain_active_pid_failed sid=%u pid=%u active_pid=%u status=%s last_error=%s elapsed_ms=%llu",
+                sess->session_id,
+                sess->pid,
+                driver_bridge::attached_pid(),
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str(),
+                static_cast<unsigned long long>(GetTickCount64() - t0));
+            return;
+        }
+        if (!kernel_operation_ready(sess->pid, "drain", "page_guard_drain", t0))
+            return;
+
         pg_ring_header_t hdr{};
         std::vector<uint8_t> hdr_buf;
         if (!driver_bridge::read_memory_for(sess->pid, sess->ring_addr, sizeof(hdr), hdr_buf) || hdr_buf.size() < sizeof(hdr)) {
@@ -2057,6 +1833,9 @@ private:
         if (!sess->polling.load(std::memory_order_acquire) ||
             sess->teardown_requested.load(std::memory_order_acquire))
             return;
+        const ULONGLONG t0 = GetTickCount64();
+        if (!kernel_operation_ready(sess->pid, "rearm", "page_guard_rearm", t0))
+            return;
         ++sess->rearm_attempts;
         uint32_t old_protect = 0;
         const bool ok = driver_bridge::protect_memory_for(sess->pid, sess->target_addr, sess->region_size,
@@ -2087,6 +1866,9 @@ private:
         pg_capture_record_t record;
         record.metadata = entry;
         record.payload_addr = choose_payload_address(sess, entry, record.payload_source);
+        const ULONGLONG t0 = GetTickCount64();
+        if (!kernel_operation_ready(sess ? sess->pid : 0, "payload", "page_guard_payload", t0))
+            return record;
         if (record.payload_addr == 0) {
             diag::log_tagged_fmt("pg_sniff", "payload_addr_unavailable sid=%u fault=0x%llX rip=0x%llX access=%u source=%s",
                 sess ? sess->session_id : 0,

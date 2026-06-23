@@ -325,6 +325,7 @@ namespace detail {
     }
 
     inline long dispatch(PEXCEPTION_POINTERS ep);
+    inline void log_init_event(const char* message);
 
     inline __declspec(noinline) long ghost_veh_thunk(PEXCEPTION_POINTERS ep)
     {
@@ -607,8 +608,24 @@ namespace detail {
             std::lock_guard<std::mutex> lk(s.mtx);
             if (!s.active.load(std::memory_order_acquire)) continue;
 
+            const uint32_t prior_offset = s.selected_offset;
             uninstall_current_offset(s);
-            select_and_install_offset(s);
+            if (!select_and_install_offset(s))
+            {
+                s.selected_offset = prior_offset;
+                if (s.selected_offset < s.candidate_count)
+                {
+                    const auto& c = s.candidates[s.selected_offset];
+                    if (c.dispatcher && c.saved_len &&
+                        emit_trampoline_into_rw(s, c.dispatcher, c.saved_bytes,
+                            c.saved_len, s.current_nonce) &&
+                        install_detour_at(c.dispatcher, c.saved_len, s.tramp_rx))
+                    {
+                        s.detour_hash = hash_bytes(c.dispatcher, kDetourSize);
+                    }
+                }
+                log_init_event("regen_rotation_failed_restored_previous");
+            }
         }
     }
 
@@ -819,6 +836,8 @@ inline void unregister_handler(registration_t reg)
 inline bool verify_detour()
 {
     auto& s = detail::state();
+    if (!s.active.load(std::memory_order_acquire)) return true;
+    std::lock_guard<std::mutex> lk(s.mtx);
     if (!s.active.load(std::memory_order_acquire)) return true;
     if (s.selected_offset >= s.candidate_count) return true;
     const auto& c = s.candidates[s.selected_offset];

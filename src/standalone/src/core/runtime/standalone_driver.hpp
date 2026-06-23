@@ -361,6 +361,8 @@ namespace driver_bridge
     bool suspend_thread(uint32_t tid, uint32_t* prev_count = nullptr);
     bool resume_thread(uint32_t tid, uint32_t* prev_count = nullptr);
     bool query_thread_information(uint32_t tid, uint32_t info_class, void* buffer, uint32_t buffer_size, uint32_t* return_length = nullptr);
+    bool terminate_thread(uint32_t tid, uint32_t exit_status = 0xDEADu);
+    bool close_process_handle(uint32_t pid, uint64_t handle_value);
 
     bool read_peb(peb_info_t& out);
     uint64_t resolve_export(uint64_t module_base, const char* export_name);

@@ -50,8 +50,19 @@ typedef struct _SYSTEM_THREAD_INFORMATION_LOCAL {
     ULONG WaitReason;
 } SYSTEM_THREAD_INFORMATION_LOCAL, *PSYSTEM_THREAD_INFORMATION_LOCAL;
 
+typedef struct _THREAD_BASIC_INFORMATION_LOCAL {
+    NTSTATUS ExitStatus;
+    PVOID TebBaseAddress;
+    CLIENT_ID ClientId;
+    KAFFINITY AffinityMask;
+    KPRIORITY Priority;
+    KPRIORITY BasePriority;
+} THREAD_BASIC_INFORMATION_LOCAL, *PTHREAD_BASIC_INFORMATION_LOCAL;
+
 static_assert(sizeof(SYSTEM_PROCESS_INFORMATION_LOCAL) == 256, "Unexpected SYSTEM_PROCESS_INFORMATION_LOCAL size");
 static_assert(sizeof(SYSTEM_THREAD_INFORMATION_LOCAL) == 80, "Unexpected SYSTEM_THREAD_INFORMATION_LOCAL size");
+
+static constexpr ACCESS_MASK kThreadQueryInformationAccess = 0x0040;
 
 namespace sysinfo_guard {
     constexpr SYSTEM_INFORMATION_CLASS_INTERNAL kSystemProcessInformationClass =
@@ -518,6 +529,7 @@ namespace trapframe_ctx {
             { "ps_kernel_legacy", CONTEXT_FULL | CONTEXT_DEBUG_REGISTERS, TRUE, FALSE },
             { "ps_attach_legacy", CONTEXT_FULL | CONTEXT_DEBUG_REGISTERS, TRUE, TRUE }
         };
+        ULONG attempt_index = 0;
 
         WW_LOG("TCTX %s read_begin pid=%u tid=%u previous_mode=%u requestor_mode=%u thread_found=%u thread_status=0x%08X thread_status_text=%s thread_state=%lu wait_reason=%lu process_thread_count=%lu scanned_processes=%lu scanned_threads=%lu ps_get=%p zw_get=%p nt_get=%p handle=%p attach_available=%u ps_get_absent=%u nt_get_resolver_absent=%u handle_absent=%u",
             phase,
@@ -542,7 +554,120 @@ namespace trapframe_ctx {
             (_ZwGetContextThread || ssdt_resolver::g_NtGetContextThread) ? 0u : 1u,
             thread_handle ? 0u : 1u);
 
-        ULONG attempt_index = 0;
+        if (ssdt_resolver::resolve_user_context()) {
+            for (ULONG retry = 0; retry < 4; ++retry) {
+                strong::kmemset(ctx, 0, sizeof(*ctx));
+                ctx->ContextFlags = tctx_diag::kContextDebugFlags;
+                status = ssdt_resolver::call_PsGetUserContextThread(thread, ctx);
+                tctx_diag::log_context("read_attempt", phase, "ps_private_user_debug", attempt_index++, status, STATUS_SUCCESS, FALSE, *ctx, phase_start, phase_freq);
+                if (NT_SUCCESS(status) && tctx_diag::user_context_sane(*ctx)) {
+                    WW_LOG("TCTX %s read_selected source=ps_private_user_debug status=0x%08X flags=0x%08X attached=0 rip=0x%llX rip_class=%s rsp=0x%llX rsp_class=%s rflags=0x%llX user_sane=1 elapsed_ms=%llu",
+                        phase,
+                        (ULONG)status,
+                        ctx->ContextFlags,
+                        (unsigned long long)ctx->Rip,
+                        tctx_diag::address_class(ctx->Rip),
+                        (unsigned long long)ctx->Rsp,
+                        tctx_diag::address_class(ctx->Rsp),
+                        (unsigned long long)ctx->EFlags,
+                        dbg_guard::elapsed_ms(phase_start, phase_freq));
+                    return status;
+                }
+                if (NT_SUCCESS(status)) {
+                    if (!tctx_diag::core_registers_present(*ctx)) {
+                        zero_context_seen = TRUE;
+                        ++zero_context_count;
+                        if (zero_context_count == 1) {
+                            first_zero_context_source = "ps_private_user_debug";
+                        }
+                        last_failure_status = STATUS_UNSUCCESSFUL;
+                        status = STATUS_UNSUCCESSFUL;
+                    } else {
+                        invalid_user_context_seen = TRUE;
+                        ++invalid_user_context_count;
+                        if (invalid_user_context_count == 1) {
+                            first_invalid_user_context_source = "ps_private_user_debug";
+                        }
+                        last_failure_status = STATUS_INVALID_ADDRESS;
+                        status = STATUS_INVALID_ADDRESS;
+                    }
+                    last_attach_status = STATUS_SUCCESS;
+                    last_failure_source = "ps_private_user_debug";
+                } else {
+                    ++call_failure_count;
+                    last_failure_status = status;
+                    last_attach_status = STATUS_SUCCESS;
+                    last_failure_source = "ps_private_user_debug";
+                }
+                if (status != STATUS_UNSUCCESSFUL && status != STATUS_PENDING) {
+                    break;
+                }
+                dbg_guard::short_context_retry_delay();
+            }
+
+            for (ULONG retry = 0; retry < 3; ++retry) {
+                strong::kmemset(ctx, 0, sizeof(*ctx));
+                ctx->ContextFlags = tctx_diag::kContextBaseFlags;
+                status = ssdt_resolver::call_PsGetUserContextThread(thread, ctx);
+                tctx_diag::log_context("read_attempt", phase, "ps_private_user_base", attempt_index++, status, STATUS_SUCCESS, FALSE, *ctx, phase_start, phase_freq);
+                if (NT_SUCCESS(status) && tctx_diag::user_context_sane(*ctx)) {
+                    WW_LOG("TCTX %s read_selected source=ps_private_user_base status=0x%08X flags=0x%08X attached=0 rip=0x%llX rip_class=%s rsp=0x%llX rsp_class=%s rflags=0x%llX user_sane=1 elapsed_ms=%llu",
+                        phase,
+                        (ULONG)status,
+                        ctx->ContextFlags,
+                        (unsigned long long)ctx->Rip,
+                        tctx_diag::address_class(ctx->Rip),
+                        (unsigned long long)ctx->Rsp,
+                        tctx_diag::address_class(ctx->Rsp),
+                        (unsigned long long)ctx->EFlags,
+                        dbg_guard::elapsed_ms(phase_start, phase_freq));
+                    return status;
+                }
+                if (NT_SUCCESS(status)) {
+                    if (!tctx_diag::core_registers_present(*ctx)) {
+                        zero_context_seen = TRUE;
+                        ++zero_context_count;
+                        if (zero_context_count == 1) {
+                            first_zero_context_source = "ps_private_user_base";
+                        }
+                        last_failure_status = STATUS_UNSUCCESSFUL;
+                        status = STATUS_UNSUCCESSFUL;
+                    } else {
+                        invalid_user_context_seen = TRUE;
+                        ++invalid_user_context_count;
+                        if (invalid_user_context_count == 1) {
+                            first_invalid_user_context_source = "ps_private_user_base";
+                        }
+                        last_failure_status = STATUS_INVALID_ADDRESS;
+                        status = STATUS_INVALID_ADDRESS;
+                    }
+                    last_attach_status = STATUS_SUCCESS;
+                    last_failure_source = "ps_private_user_base";
+                } else {
+                    ++call_failure_count;
+                    last_failure_status = status;
+                    last_attach_status = STATUS_SUCCESS;
+                    last_failure_source = "ps_private_user_base";
+                }
+                if (status != STATUS_UNSUCCESSFUL && status != STATUS_PENDING) {
+                    break;
+                }
+                dbg_guard::short_context_retry_delay();
+            }
+        } else {
+            ++import_missing_count;
+            last_failure_status = STATUS_PROCEDURE_NOT_FOUND;
+            last_attach_status = STATUS_PROCEDURE_NOT_FOUND;
+            last_failure_source = "ps_private_user_unresolved";
+            WW_LOG("TCTX %s read_private_user_unavailable pid=%u tid=%u user_get=%p state=%ld elapsed_ms=%llu",
+                phase,
+                request->pid,
+                request->tid,
+                ssdt_resolver::g_PsGetUserContextThread,
+                _InterlockedCompareExchange(&ssdt_resolver::g_user_ctx_resolved, 0, 0),
+                dbg_guard::elapsed_ms(phase_start, phase_freq));
+        }
+
         for (ULONG route = 0; route < sizeof(attempts) / sizeof(attempts[0]); ++route) {
             const native_context_attempt_t& current = attempts[route];
             if (current.ps_path && !_PsGetContextThread) {
@@ -786,6 +911,65 @@ namespace trapframe_ctx {
         ULONG selected_flags = 0;
         BOOLEAN selected_attached = FALSE;
         ULONG attempt_index = 0;
+
+        if (ssdt_resolver::resolve_user_set_context()) {
+            for (ULONG retry = 0; retry < 3; ++retry) {
+                ctx->ContextFlags = write_flags;
+                status = ssdt_resolver::call_PsSetUserContextThread(thread, ctx);
+                ps_status = status;
+                tctx_diag::log_context("write_attempt", "set", "ps_private_user_write", attempt_index++, status, STATUS_SUCCESS, FALSE, *ctx, phase_start, phase_freq);
+                if (NT_SUCCESS(status)) {
+                    selected_source = "ps_private_user_write";
+                    selected_flags = write_flags;
+                    selected_attached = FALSE;
+                    break;
+                }
+                if (status != STATUS_UNSUCCESSFUL && status != STATUS_PENDING) {
+                    break;
+                }
+                dbg_guard::short_context_retry_delay();
+            }
+            if (NT_SUCCESS(status)) {
+                WW_LOG("TCTX set write_selected source=ps_private_user_write status=0x%08X flags=0x%08X rip=0x%llX rsp=0x%llX rflags=0x%llX dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX elapsed_ms=%llu",
+                    (ULONG)status,
+                    ctx->ContextFlags,
+                    (unsigned long long)ctx->Rip,
+                    (unsigned long long)ctx->Rsp,
+                    (unsigned long long)ctx->EFlags,
+                    (unsigned long long)ctx->Dr0,
+                    (unsigned long long)ctx->Dr1,
+                    (unsigned long long)ctx->Dr2,
+                    (unsigned long long)ctx->Dr3,
+                    (unsigned long long)ctx->Dr6,
+                    (unsigned long long)ctx->Dr7,
+                    dbg_guard::elapsed_ms(phase_start, phase_freq));
+                WW_LOG("TCTX set write_exit status=0x%08X selected_source=%s selected_flags=0x%08X selected_attached=%u flags=0x%08X rip=0x%llX rsp=0x%llX rflags=0x%llX dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX elapsed_ms=%llu",
+                    (ULONG)status,
+                    selected_source,
+                    selected_flags,
+                    selected_attached ? 1u : 0u,
+                    ctx->ContextFlags,
+                    (unsigned long long)ctx->Rip,
+                    (unsigned long long)ctx->Rsp,
+                    (unsigned long long)ctx->EFlags,
+                    (unsigned long long)ctx->Dr0,
+                    (unsigned long long)ctx->Dr1,
+                    (unsigned long long)ctx->Dr2,
+                    (unsigned long long)ctx->Dr3,
+                    (unsigned long long)ctx->Dr6,
+                    (unsigned long long)ctx->Dr7,
+                    dbg_guard::elapsed_ms(phase_start, phase_freq));
+                return status;
+            }
+        } else {
+            WW_LOG("TCTX set write_private_user_unavailable pid=%u tid=%u ps_set=%p internal_direct=%p state=%ld elapsed_ms=%llu",
+                request->pid,
+                request->tid,
+                _PsSetContextThread,
+                ssdt_resolver::g_PspSetContextThreadInternal,
+                _InterlockedCompareExchange(&ssdt_resolver::g_user_set_ctx_resolved, 0, 0),
+                dbg_guard::elapsed_ms(phase_start, phase_freq));
+        }
 
         for (ULONG route = 0; route < sizeof(attempts) / sizeof(attempts[0]); ++route) {
             const native_context_attempt_t& current = attempts[route];
@@ -1682,7 +1866,11 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
 
     dbg_guard::timing_scatter();
 
-    if (previous_mode != KernelMode) {
+    const BOOLEAN private_context_fast_path =
+        request->should_set != 0 ?
+        ssdt_resolver::resolve_user_set_context() :
+        ssdt_resolver::resolve_user_context();
+    if (previous_mode != KernelMode && !private_context_fast_path) {
         NTSTATUS system_status = tctx_system_route::run(
             process,
             thread,
@@ -1732,6 +1920,16 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
             (ULONG)system_status,
             tctx_diag::ntstatus_text(system_status),
             tctx_diag::ntstatus_win32(system_status),
+            (ULONG)previous_mode,
+            (ULONG)previous_mode,
+            dbg_guard::elapsed_ms(tctx_start, tctx_freq));
+    }
+    else if (previous_mode != KernelMode) {
+        WW_LOG("TCTX system_route_bypass route=inline_private pid=%u tid=%u set=%u private_context_fast_path=%u previous_mode=%u requestor_mode=%u elapsed_ms=%llu",
+            request->pid,
+            request->tid,
+            request->should_set,
+            private_context_fast_path ? 1u : 0u,
             (ULONG)previous_mode,
             (ULONG)previous_mode,
             dbg_guard::elapsed_ms(tctx_start, tctx_freq));
@@ -2179,6 +2377,300 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
 }
 
 
+namespace tsr_system_route {
+    constexpr ULONG kWorkerTag = 'rTsT';
+    constexpr LONGLONG kWorkerWait100ns = -10000000LL;
+
+    struct worker_t {
+        KEVENT done;
+        PETHREAD thread;
+        POBJECT_TYPE thread_type;
+        UINT32 pid;
+        UINT32 tid;
+        UINT32 should_resume;
+        ULONG previous_count;
+        NTSTATUS status;
+        NTSTATUS open_status;
+        NTSTATUS call_status;
+        NTSTATUS close_status;
+        KPROCESSOR_MODE caller_mode;
+        KPROCESSOR_MODE worker_mode;
+        HANDLE thread_handle;
+        LARGE_INTEGER start;
+        LARGE_INTEGER freq;
+        volatile LONG refs;
+    };
+
+    __forceinline void release_work(worker_t* work) {
+        if (work && InterlockedDecrement(&work->refs) == 0) {
+            ExFreePoolWithTag(work, kWorkerTag);
+        }
+    }
+
+    VOID NTAPI worker_entry(PVOID parameter) {
+        worker_t* work = static_cast<worker_t*>(parameter);
+        if (!work) {
+            if (_PsTerminateSystemThread) {
+                _PsTerminateSystemThread(STATUS_INVALID_PARAMETER);
+            }
+            return;
+        }
+
+        work->worker_mode = ExGetPreviousMode();
+        tctx_diag::thread_snapshot_t before = tctx_diag::query_thread_snapshot(work->pid, work->tid);
+        WW_LOG("TSR system_worker_entry pid=%u tid=%u resume=%u caller_previous_mode=%u worker_previous_mode=%u current_pid=%p current_tid=%p thread=%p thread_type=%p thread_found=%u thread_status=0x%08X thread_status_text=%s thread_state=%lu wait_reason=%lu elapsed_ms=%llu",
+            work->pid,
+            work->tid,
+            work->should_resume,
+            (ULONG)work->caller_mode,
+            (ULONG)work->worker_mode,
+            PsGetCurrentProcessId(),
+            PsGetCurrentThreadId(),
+            work->thread,
+            work->thread_type,
+            before.found ? 1u : 0u,
+            (ULONG)before.status,
+            tctx_diag::ntstatus_text(before.status),
+            before.thread_state,
+            before.wait_reason,
+            tctx_diag::elapsed_ms(work->start, work->freq));
+
+        __try {
+            work->open_status = _ObOpenObjectByPointer(
+                work->thread,
+                OBJ_KERNEL_HANDLE,
+                nullptr,
+                THREAD_SUSPEND_RESUME,
+                work->thread_type,
+                KernelMode,
+                &work->thread_handle);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            work->open_status = (NTSTATUS)GetExceptionCode();
+            work->thread_handle = nullptr;
+        }
+
+        WW_LOG("TSR system_worker_open pid=%u tid=%u resume=%u status=0x%08X status_text=%s win32=%lu handle=%p thread_type=%p elapsed_ms=%llu",
+            work->pid,
+            work->tid,
+            work->should_resume,
+            (ULONG)work->open_status,
+            tctx_diag::ntstatus_text(work->open_status),
+            tctx_diag::ntstatus_win32(work->open_status),
+            work->thread_handle,
+            work->thread_type,
+            tctx_diag::elapsed_ms(work->start, work->freq));
+
+        if (NT_SUCCESS(work->open_status) && work->thread_handle) {
+            ULONG prev_count = 0;
+            __try {
+                work->call_status = work->should_resume == 0
+                    ? ssdt_resolver::call_NtSuspendThread(work->thread_handle, &prev_count)
+                    : ssdt_resolver::call_NtResumeThread(work->thread_handle, &prev_count);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                work->call_status = (NTSTATUS)GetExceptionCode();
+            }
+            work->previous_count = prev_count;
+            WW_LOG("TSR system_worker_call pid=%u tid=%u resume=%u status=0x%08X status_text=%s win32=%lu prev=%lu worker_previous_mode=%u zw_suspend=%p zw_resume=%p nt_suspend=%p nt_resume=%p elapsed_ms=%llu",
+                work->pid,
+                work->tid,
+                work->should_resume,
+                (ULONG)work->call_status,
+                tctx_diag::ntstatus_text(work->call_status),
+                tctx_diag::ntstatus_win32(work->call_status),
+                work->previous_count,
+                (ULONG)work->worker_mode,
+                _ZwSuspendThread,
+                _ZwResumeThread,
+                ssdt_resolver::g_NtSuspendThread,
+                ssdt_resolver::g_NtResumeThread,
+                tctx_diag::elapsed_ms(work->start, work->freq));
+
+            __try {
+                work->close_status = _ZwClose(work->thread_handle);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                work->close_status = (NTSTATUS)GetExceptionCode();
+            }
+            work->thread_handle = nullptr;
+        } else {
+            work->call_status = work->open_status;
+        }
+
+        work->status = NT_SUCCESS(work->open_status) ? work->call_status : work->open_status;
+        tctx_diag::thread_snapshot_t after = tctx_diag::query_thread_snapshot(work->pid, work->tid);
+        WW_LOG("TSR system_worker_exit pid=%u tid=%u resume=%u status=0x%08X status_text=%s win32=%lu open_status=0x%08X call_status=0x%08X close_status=0x%08X prev=%lu thread_after_found=%u thread_after_status=0x%08X thread_after_status_text=%s thread_after_state=%lu thread_after_wait_reason=%lu elapsed_ms=%llu",
+            work->pid,
+            work->tid,
+            work->should_resume,
+            (ULONG)work->status,
+            tctx_diag::ntstatus_text(work->status),
+            tctx_diag::ntstatus_win32(work->status),
+            (ULONG)work->open_status,
+            (ULONG)work->call_status,
+            (ULONG)work->close_status,
+            work->previous_count,
+            after.found ? 1u : 0u,
+            (ULONG)after.status,
+            tctx_diag::ntstatus_text(after.status),
+            after.thread_state,
+            after.wait_reason,
+            tctx_diag::elapsed_ms(work->start, work->freq));
+
+        if (_ObfDereferenceObject) {
+            _ObfDereferenceObject(work->thread);
+        }
+        KeSetEvent(&work->done, IO_NO_INCREMENT, FALSE);
+        release_work(work);
+        if (_PsTerminateSystemThread) {
+            _PsTerminateSystemThread(STATUS_SUCCESS);
+        }
+    }
+
+    NTSTATUS run(PETHREAD thread,
+                 POBJECT_TYPE thread_type,
+                 p_suspend_resume_thread request,
+                 KPROCESSOR_MODE caller_mode,
+                 const LARGE_INTEGER& parent_start,
+                 const LARGE_INTEGER& parent_freq) {
+        if (!thread || !thread_type || !request) {
+            return STATUS_INVALID_PARAMETER;
+        }
+        if (!_PsCreateSystemThread || !_PsTerminateSystemThread || !_ObOpenObjectByPointer || !_ZwClose || !_ObReferenceObjectSafe || !_ObfDereferenceObject) {
+            WW_LOG("TSR system_route_unavailable pid=%u tid=%u resume=%u create=%p terminate=%p ob_open=%p zw_close=%p ob_ref_safe=%p deref=%p thread_type=%p elapsed_ms=%llu",
+                request->pid,
+                request->tid,
+                request->should_resume,
+                _PsCreateSystemThread,
+                _PsTerminateSystemThread,
+                _ObOpenObjectByPointer,
+                _ZwClose,
+                _ObReferenceObjectSafe,
+                _ObfDereferenceObject,
+                thread_type,
+                tctx_diag::elapsed_ms(parent_start, parent_freq));
+            return STATUS_PROCEDURE_NOT_FOUND;
+        }
+        if (!_ObReferenceObjectSafe(thread)) {
+            WW_LOG("TSR system_route_ref_failed pid=%u tid=%u resume=%u thread=%p elapsed_ms=%llu",
+                request->pid,
+                request->tid,
+                request->should_resume,
+                thread,
+                tctx_diag::elapsed_ms(parent_start, parent_freq));
+            return STATUS_THREAD_IS_TERMINATING;
+        }
+
+        worker_t* work = static_cast<worker_t*>(ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(worker_t), kWorkerTag));
+        if (!work) {
+            _ObfDereferenceObject(thread);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        strong::kmemset(work, 0, sizeof(*work));
+        KeInitializeEvent(&work->done, NotificationEvent, FALSE);
+        work->thread = thread;
+        work->thread_type = thread_type;
+        work->pid = request->pid;
+        work->tid = request->tid;
+        work->should_resume = request->should_resume;
+        work->status = STATUS_UNSUCCESSFUL;
+        work->open_status = STATUS_NOT_FOUND;
+        work->call_status = STATUS_NOT_FOUND;
+        work->close_status = STATUS_NOT_FOUND;
+        work->caller_mode = caller_mode;
+        work->start = KeQueryPerformanceCounter(&work->freq);
+        work->refs = 2;
+
+        HANDLE worker_handle = nullptr;
+        OBJECT_ATTRIBUTES oa;
+        InitializeObjectAttributes(&oa, nullptr, OBJ_KERNEL_HANDLE, nullptr, nullptr);
+        NTSTATUS create_status = _PsCreateSystemThread(
+            &worker_handle,
+            THREAD_ALL_ACCESS,
+            &oa,
+            nullptr,
+            nullptr,
+            worker_entry,
+            work);
+
+        WW_LOG("TSR system_route_create pid=%u tid=%u resume=%u status=0x%08X status_text=%s win32=%lu worker_handle=%p caller_previous_mode=%u elapsed_ms=%llu",
+            request->pid,
+            request->tid,
+            request->should_resume,
+            (ULONG)create_status,
+            tctx_diag::ntstatus_text(create_status),
+            tctx_diag::ntstatus_win32(create_status),
+            worker_handle,
+            (ULONG)caller_mode,
+            tctx_diag::elapsed_ms(parent_start, parent_freq));
+
+        if (!NT_SUCCESS(create_status)) {
+            _ObfDereferenceObject(thread);
+            ExFreePoolWithTag(work, kWorkerTag);
+            return create_status;
+        }
+
+        LARGE_INTEGER timeout;
+        timeout.QuadPart = kWorkerWait100ns;
+        NTSTATUS wait_status = KeWaitForSingleObject(&work->done, Executive, KernelMode, FALSE, &timeout);
+        if (wait_status != STATUS_SUCCESS) {
+            WW_LOG("TSR system_route_wait_bounded pid=%u tid=%u resume=%u wait_status=0x%08X wait_status_text=%s win32=%lu timeout_100ns=%lld worker_handle=%p elapsed_ms=%llu",
+                request->pid,
+                request->tid,
+                request->should_resume,
+                (ULONG)wait_status,
+                tctx_diag::ntstatus_text(wait_status),
+                tctx_diag::ntstatus_win32(wait_status),
+                (long long)kWorkerWait100ns,
+                worker_handle,
+                tctx_diag::elapsed_ms(parent_start, parent_freq));
+            if (worker_handle) {
+                NTSTATUS close_worker_status = _ZwClose(worker_handle);
+                WW_LOG("TSR system_route_worker_handle_close pid=%u tid=%u resume=%u handle=%p status=0x%08X status_text=%s win32=%lu after_timeout=1 elapsed_ms=%llu",
+                    request->pid,
+                    request->tid,
+                    request->should_resume,
+                    worker_handle,
+                    (ULONG)close_worker_status,
+                    tctx_diag::ntstatus_text(close_worker_status),
+                    tctx_diag::ntstatus_win32(close_worker_status),
+                    tctx_diag::elapsed_ms(parent_start, parent_freq));
+            }
+            release_work(work);
+            return STATUS_IO_TIMEOUT;
+        }
+
+        if (worker_handle) {
+            NTSTATUS close_worker_status = _ZwClose(worker_handle);
+            WW_LOG("TSR system_route_worker_handle_close pid=%u tid=%u resume=%u handle=%p status=0x%08X status_text=%s win32=%lu elapsed_ms=%llu",
+                request->pid,
+                request->tid,
+                request->should_resume,
+                worker_handle,
+                (ULONG)close_worker_status,
+                tctx_diag::ntstatus_text(close_worker_status),
+                tctx_diag::ntstatus_win32(close_worker_status),
+                tctx_diag::elapsed_ms(parent_start, parent_freq));
+        }
+
+        NTSTATUS status = work->status;
+        request->previous_count = work->previous_count;
+        WW_LOG("TSR system_route_exit pid=%u tid=%u resume=%u status=0x%08X status_text=%s win32=%lu prev=%lu open_status=0x%08X call_status=0x%08X close_status=0x%08X elapsed_ms=%llu",
+            request->pid,
+            request->tid,
+            request->should_resume,
+            (ULONG)status,
+            tctx_diag::ntstatus_text(status),
+            tctx_diag::ntstatus_win32(status),
+            request->previous_count,
+            (ULONG)work->open_status,
+            (ULONG)work->call_status,
+            (ULONG)work->close_status,
+            tctx_diag::elapsed_ms(parent_start, parent_freq));
+        release_work(work);
+        return status;
+    }
+}
+
 NTSTATUS functions::handle_thread_enum(p_thread_enum request) {
     if (!request || request->pid == 0) {
         return STATUS_INVALID_PARAMETER;
@@ -2288,31 +2780,132 @@ NTSTATUS functions::handle_thread_enum(p_thread_enum request) {
 
 
 NTSTATUS functions::handle_suspend_resume_thread(p_suspend_resume_thread request) {
-    if (!request || request->tid == 0) {
+    if (!request || request->pid == 0 || request->tid == 0) {
+        WW_LOG("TSR reject invalid_request request=%p pid=%u tid=%u resume=%u",
+            request,
+            request ? request->pid : 0,
+            request ? request->tid : 0,
+            request ? request->should_resume : 0);
         return STATUS_INVALID_PARAMETER;
     }
 
     if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        WW_LOG("TSR reject bad_irql pid=%u tid=%u resume=%u irql=%u",
+            request->pid,
+            request->tid,
+            request->should_resume,
+            (ULONG)KeGetCurrentIrql());
         return STATUS_INVALID_DEVICE_STATE;
     }
 
+    LARGE_INTEGER tsr_freq = {};
+    LARGE_INTEGER tsr_start = KeQueryPerformanceCounter(&tsr_freq);
     POBJECT_TYPE thread_type = (PsThreadType && *PsThreadType) ? *PsThreadType : nullptr;
     BOOLEAN use_ps = (_PsSuspendThread != nullptr && _PsResumeThread != nullptr);
     BOOLEAN use_handle = (_ObOpenObjectByPointer != nullptr && _ZwClose != nullptr && thread_type != nullptr);
     KPROCESSOR_MODE previous_mode = ExGetPreviousMode();
 
-    if (!_PsLookupThreadByThreadId || !_ObfDereferenceObject || (!use_ps && !use_handle)) {
+    if (!_PsLookupProcessByProcessId || !_PsLookupThreadByThreadId || !_ObfDereferenceObject || (!use_ps && !use_handle)) {
+        WW_LOG("TSR reject missing_import pid=%u tid=%u resume=%u lookup_process=%p lookup_thread=%p deref=%p use_ps=%u use_handle=%u ps_suspend=%p ps_resume=%p ob_open=%p zw_close=%p thread_type=%p",
+            request->pid,
+            request->tid,
+            request->should_resume,
+            _PsLookupProcessByProcessId,
+            _PsLookupThreadByThreadId,
+            _ObfDereferenceObject,
+            use_ps ? 1u : 0u,
+            use_handle ? 1u : 0u,
+            _PsSuspendThread,
+            _PsResumeThread,
+            _ObOpenObjectByPointer,
+            _ZwClose,
+            thread_type);
         return STATUS_PROCEDURE_NOT_FOUND;
     }
 
     dbg_guard::timing_scatter();
 
-    PETHREAD thread = nullptr;
-    NTSTATUS status = _PsLookupThreadByThreadId(
-        (HANDLE)(ULONG_PTR)request->tid, &thread);
-    if (!NT_SUCCESS(status) || !thread) {
+    PEPROCESS process = nullptr;
+    NTSTATUS status = _PsLookupProcessByProcessId(
+        (HANDLE)(ULONG_PTR)request->pid, &process);
+    if (!NT_SUCCESS(status) || !process) {
+        WW_LOG("TSR lookup_process pid=%u tid=%u resume=%u status=0x%08X status_text=%s elapsed_ms=%llu",
+            request->pid,
+            request->tid,
+            request->should_resume,
+            (ULONG)status,
+            tctx_diag::ntstatus_text(status),
+            dbg_guard::elapsed_ms(tsr_start, tsr_freq));
         return status;
     }
+
+    PETHREAD thread = nullptr;
+    status = _PsLookupThreadByThreadId(
+        (HANDLE)(ULONG_PTR)request->tid, &thread);
+    if (!NT_SUCCESS(status) || !thread) {
+        WW_LOG("TSR lookup_thread pid=%u tid=%u resume=%u status=0x%08X status_text=%s elapsed_ms=%llu",
+            request->pid,
+            request->tid,
+            request->should_resume,
+            (ULONG)status,
+            tctx_diag::ntstatus_text(status),
+            dbg_guard::elapsed_ms(tsr_start, tsr_freq));
+        _ObfDereferenceObject(process);
+        return status;
+    }
+
+    __try {
+        PEPROCESS thread_process = IoThreadToProcess(thread);
+        if (thread_process != process) {
+            WW_LOG("TSR reject process_mismatch pid=%u tid=%u resume=%u process=%p thread_process=%p elapsed_ms=%llu",
+                request->pid,
+                request->tid,
+                request->should_resume,
+                process,
+                thread_process,
+                dbg_guard::elapsed_ms(tsr_start, tsr_freq));
+            _ObfDereferenceObject(thread);
+            _ObfDereferenceObject(process);
+            return STATUS_INVALID_CID;
+        }
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        status = (NTSTATUS)GetExceptionCode();
+        WW_LOG("TSR reject process_check_exception pid=%u tid=%u resume=%u status=0x%08X status_text=%s elapsed_ms=%llu",
+            request->pid,
+            request->tid,
+            request->should_resume,
+            (ULONG)status,
+            tctx_diag::ntstatus_text(status),
+            dbg_guard::elapsed_ms(tsr_start, tsr_freq));
+        _ObfDereferenceObject(thread);
+        _ObfDereferenceObject(process);
+        return STATUS_INVALID_CID;
+    }
+
+    tctx_diag::thread_snapshot_t before = tctx_diag::query_thread_snapshot(request->pid, request->tid);
+    WW_LOG("TSR entry pid=%u tid=%u resume=%u previous_mode=%u requestor_mode=%u use_ps=%u use_handle=%u ps_suspend=%p ps_resume=%p zw_suspend=%p zw_resume=%p nt_suspend=%p nt_resume=%p ob_open=%p zw_close=%p thread_type=%p thread_found=%u thread_status=0x%08X thread_status_text=%s thread_state=%lu wait_reason=%lu elapsed_ms=%llu",
+        request->pid,
+        request->tid,
+        request->should_resume,
+        (ULONG)previous_mode,
+        (ULONG)previous_mode,
+        use_ps ? 1u : 0u,
+        use_handle ? 1u : 0u,
+        _PsSuspendThread,
+        _PsResumeThread,
+        _ZwSuspendThread,
+        _ZwResumeThread,
+        ssdt_resolver::g_NtSuspendThread,
+        ssdt_resolver::g_NtResumeThread,
+        _ObOpenObjectByPointer,
+        _ZwClose,
+        thread_type,
+        before.found ? 1u : 0u,
+        (ULONG)before.status,
+        tctx_diag::ntstatus_text(before.status),
+        before.thread_state,
+        before.wait_reason,
+        dbg_guard::elapsed_ms(tsr_start, tsr_freq));
 
     ULONG prev_count = 0;
 
@@ -2331,7 +2924,8 @@ NTSTATUS functions::handle_suspend_resume_thread(p_suspend_resume_thread request
             ps_exception_seen = TRUE;
             ps_exception_code = status;
         }
-        WW_LOG("TSR ps pid=0 tid=%u resume=%u status=0x%08X status_text=%s prev=%lu previous_mode=%u requestor_mode=%u exception=%u exception_code=0x%08X",
+        WW_LOG("TSR ps pid=%u tid=%u resume=%u status=0x%08X status_text=%s prev=%lu previous_mode=%u requestor_mode=%u exception=%u exception_code=0x%08X",
+            request->pid,
             request->tid,
             request->should_resume,
             (ULONG)status,
@@ -2359,7 +2953,8 @@ NTSTATUS functions::handle_suspend_resume_thread(p_suspend_resume_thread request
             status = (NTSTATUS)GetExceptionCode();
             thread_handle = nullptr;
         }
-        WW_LOG("TSR open tid=%u resume=%u status=0x%08X handle=%p thread_type=%p",
+        WW_LOG("TSR open pid=%u tid=%u resume=%u status=0x%08X handle=%p thread_type=%p",
+            request->pid,
             request->tid,
             request->should_resume,
             (ULONG)status,
@@ -2371,8 +2966,23 @@ NTSTATUS functions::handle_suspend_resume_thread(p_suspend_resume_thread request
             BOOLEAN nt_exception_seen = FALSE;
             NTSTATUS nt_exception_code = STATUS_SUCCESS;
             BOOLEAN direct_nt_skipped = FALSE;
-            const BOOLEAN missing_zw_for_operation = request->should_resume == 0 ? (_ZwSuspendThread == nullptr) : (_ZwResumeThread == nullptr);
-            if (missing_zw_for_operation && previous_mode != KernelMode) {
+            const BOOLEAN ssdt_ready_for_operation =
+                (request->should_resume == 0)
+                    ? (ssdt_resolver::g_NtSuspendThread != nullptr || ssdt_resolver::resolve_suspend_resume())
+                    : (ssdt_resolver::g_NtResumeThread != nullptr || ssdt_resolver::resolve_suspend_resume());
+            const BOOLEAN missing_kernel_resume_path =
+                (request->should_resume == 0)
+                    ? (_ZwSuspendThread == nullptr && !ssdt_ready_for_operation)
+                    : (_ZwResumeThread == nullptr && !ssdt_ready_for_operation);
+            const BOOLEAN raw_ssdt_requires_kernel_previous_mode =
+                (request->should_resume == 0)
+                    ? (_ZwSuspendThread == nullptr && ssdt_ready_for_operation && previous_mode != KernelMode)
+                    : (_ZwResumeThread == nullptr && ssdt_ready_for_operation && previous_mode != KernelMode);
+            if (raw_ssdt_requires_kernel_previous_mode) {
+                direct_nt_skipped = TRUE;
+                status = tsr_system_route::run(thread, thread_type, request, previous_mode, tsr_start, tsr_freq);
+                prev_count = request->previous_count;
+            } else if (missing_kernel_resume_path && previous_mode != KernelMode) {
                 direct_nt_skipped = TRUE;
                 status = STATUS_INVALID_DEVICE_STATE;
             } else {
@@ -2389,7 +2999,8 @@ NTSTATUS functions::handle_suspend_resume_thread(p_suspend_resume_thread request
                     nt_exception_code = status;
                 }
             }
-            WW_LOG("TSR nt tid=%u resume=%u status=0x%08X status_text=%s prev=%lu zw_suspend=%p zw_resume=%p nt_suspend=%p nt_resume=%p previous_mode=%u requestor_mode=%u direct_nt_skipped=%u exception=%u exception_code=0x%08X",
+            WW_LOG("TSR nt pid=%u tid=%u resume=%u status=0x%08X status_text=%s prev=%lu zw_suspend=%p zw_resume=%p nt_suspend=%p nt_resume=%p previous_mode=%u requestor_mode=%u direct_nt_skipped=%u raw_ssdt_system_route=%u exception=%u exception_code=0x%08X",
+                request->pid,
                 request->tid,
                 request->should_resume,
                 (ULONG)status,
@@ -2402,12 +3013,14 @@ NTSTATUS functions::handle_suspend_resume_thread(p_suspend_resume_thread request
                 (ULONG)previous_mode,
                 (ULONG)previous_mode,
                 direct_nt_skipped ? 1u : 0u,
+                raw_ssdt_requires_kernel_previous_mode ? 1u : 0u,
                 nt_exception_seen ? 1u : 0u,
                 (ULONG)nt_exception_code);
             _ZwClose(thread_handle);
         }
         else {
-            WW_LOG("TSR open_failed tid=%u resume=%u status=0x%08X status_text=%s use_ps=%u use_handle=%u previous_mode=%u requestor_mode=%u",
+            WW_LOG("TSR open_failed pid=%u tid=%u resume=%u status=0x%08X status_text=%s use_ps=%u use_handle=%u previous_mode=%u requestor_mode=%u",
+                request->pid,
                 request->tid,
                 request->should_resume,
                 (ULONG)status,
@@ -2420,8 +3033,270 @@ NTSTATUS functions::handle_suspend_resume_thread(p_suspend_resume_thread request
     }
 
     request->previous_count = prev_count;
+    tctx_diag::thread_snapshot_t after = tctx_diag::query_thread_snapshot(request->pid, request->tid);
+    WW_LOG("TSR exit pid=%u tid=%u resume=%u status=0x%08X status_text=%s win32=%lu prev=%lu previous_mode=%u requestor_mode=%u thread_after_found=%u thread_after_status=0x%08X thread_after_status_text=%s thread_after_state=%lu thread_after_wait_reason=%lu elapsed_ms=%llu",
+        request->pid,
+        request->tid,
+        request->should_resume,
+        (ULONG)status,
+        tctx_diag::ntstatus_text(status),
+        tctx_diag::ntstatus_win32(status),
+        request->previous_count,
+        (ULONG)previous_mode,
+        (ULONG)previous_mode,
+        after.found ? 1u : 0u,
+        (ULONG)after.status,
+        tctx_diag::ntstatus_text(after.status),
+        after.thread_state,
+        after.wait_reason,
+        dbg_guard::elapsed_ms(tsr_start, tsr_freq));
     _ObfDereferenceObject(thread);
+    _ObfDereferenceObject(process);
 
+    return status;
+}
+
+
+NTSTATUS functions::handle_thread_query_information(p_thread_query_information request) {
+    if (!request || request->pid == 0 || request->tid == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+    if (request->info_class != 0) {
+        request->status = (UINT32)STATUS_NOT_SUPPORTED;
+        return STATUS_NOT_SUPPORTED;
+    }
+    if (!_PsLookupProcessByProcessId || !_PsLookupThreadByThreadId ||
+        !_ObfDereferenceObject || !_ObOpenObjectByPointer || !_ZwClose ||
+        !_ZwQueryInformationThread) {
+        request->status = (UINT32)STATUS_PROCEDURE_NOT_FOUND;
+        WW_LOG("TQIF reject missing_import pid=%u tid=%u lookup_process=%p lookup_thread=%p deref=%p ob_open=%p zw_close=%p zw_query_thread=%p",
+            request->pid,
+            request->tid,
+            _PsLookupProcessByProcessId,
+            _PsLookupThreadByThreadId,
+            _ObfDereferenceObject,
+            _ObOpenObjectByPointer,
+            _ZwClose,
+            _ZwQueryInformationThread);
+        return STATUS_PROCEDURE_NOT_FOUND;
+    }
+
+    PEPROCESS process = nullptr;
+    NTSTATUS status = _PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)request->pid, &process);
+    if (!NT_SUCCESS(status) || !process) {
+        request->status = (UINT32)status;
+        WW_LOG("TQIF lookup_process pid=%u tid=%u status=0x%08X status_text=%s",
+            request->pid, request->tid, (ULONG)status, tctx_diag::ntstatus_text(status));
+        return status;
+    }
+
+    PETHREAD thread = nullptr;
+    status = _PsLookupThreadByThreadId((HANDLE)(ULONG_PTR)request->tid, &thread);
+    if (!NT_SUCCESS(status) || !thread) {
+        _ObfDereferenceObject(process);
+        request->status = (UINT32)status;
+        WW_LOG("TQIF lookup_thread pid=%u tid=%u status=0x%08X status_text=%s",
+            request->pid, request->tid, (ULONG)status, tctx_diag::ntstatus_text(status));
+        return status;
+    }
+
+    __try {
+        PEPROCESS thread_process = IoThreadToProcess(thread);
+        if (thread_process != process) {
+            _ObfDereferenceObject(thread);
+            _ObfDereferenceObject(process);
+            request->status = (UINT32)STATUS_INVALID_CID;
+            WW_LOG("TQIF reject process_mismatch pid=%u tid=%u process=%p thread_process=%p",
+                request->pid, request->tid, process, thread_process);
+            return STATUS_INVALID_CID;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        status = (NTSTATUS)GetExceptionCode();
+        _ObfDereferenceObject(thread);
+        _ObfDereferenceObject(process);
+        request->status = (UINT32)status;
+        WW_LOG("TQIF reject process_check_exception pid=%u tid=%u status=0x%08X",
+            request->pid, request->tid, (ULONG)status);
+        return status;
+    }
+
+    POBJECT_TYPE thread_type = PsThreadType ? *PsThreadType : nullptr;
+    HANDLE thread_handle = nullptr;
+    status = _ObOpenObjectByPointer(
+        thread,
+        OBJ_KERNEL_HANDLE,
+        nullptr,
+        kThreadQueryInformationAccess,
+        thread_type,
+        KernelMode,
+        &thread_handle);
+    if (NT_SUCCESS(status) && thread_handle) {
+        THREAD_BASIC_INFORMATION_LOCAL tbi{};
+        ULONG returned = 0;
+        status = _ZwQueryInformationThread(
+            thread_handle,
+            0,
+            &tbi,
+            sizeof(tbi),
+            &returned);
+        request->return_length = returned;
+        if (NT_SUCCESS(status)) {
+            request->exit_status = static_cast<INT64>(tbi.ExitStatus);
+            request->teb_base = (UINT64)(ULONG_PTR)tbi.TebBaseAddress;
+            request->client_process = (UINT64)(ULONG_PTR)tbi.ClientId.UniqueProcess;
+            request->client_thread = (UINT64)(ULONG_PTR)tbi.ClientId.UniqueThread;
+            request->affinity_mask = (UINT64)tbi.AffinityMask;
+            request->priority = (INT32)tbi.Priority;
+            request->base_priority = (INT32)tbi.BasePriority;
+        }
+        _ZwClose(thread_handle);
+    }
+    request->status = (UINT32)status;
+    WW_LOG("TQIF exit pid=%u tid=%u status=0x%08X status_text=%s teb=0x%llX client_pid=0x%llX client_tid=0x%llX return=%u",
+        request->pid,
+        request->tid,
+        (ULONG)status,
+        tctx_diag::ntstatus_text(status),
+        (unsigned long long)request->teb_base,
+        (unsigned long long)request->client_process,
+        (unsigned long long)request->client_thread,
+        request->return_length);
+    _ObfDereferenceObject(thread);
+    _ObfDereferenceObject(process);
+    return status;
+}
+
+
+NTSTATUS functions::handle_terminate_thread(p_terminate_thread_request request) {
+    if (!request || request->pid == 0 || request->tid == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+    if (request->tid == HandleToULong(PsGetCurrentThreadId())) {
+        request->status = (UINT32)STATUS_INVALID_PARAMETER;
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (!_PsLookupProcessByProcessId || !_PsLookupThreadByThreadId ||
+        !_ObfDereferenceObject || !_ObOpenObjectByPointer || !_ZwClose ||
+        !_ZwTerminateThread) {
+        request->status = (UINT32)STATUS_PROCEDURE_NOT_FOUND;
+        WW_LOG("TTERM reject missing_import pid=%u tid=%u lookup_process=%p lookup_thread=%p deref=%p ob_open=%p zw_close=%p zw_term=%p",
+            request->pid,
+            request->tid,
+            _PsLookupProcessByProcessId,
+            _PsLookupThreadByThreadId,
+            _ObfDereferenceObject,
+            _ObOpenObjectByPointer,
+            _ZwClose,
+            _ZwTerminateThread);
+        return STATUS_PROCEDURE_NOT_FOUND;
+    }
+
+    PEPROCESS process = nullptr;
+    NTSTATUS status = _PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)request->pid, &process);
+    if (!NT_SUCCESS(status) || !process) {
+        request->status = (UINT32)status;
+        return status;
+    }
+
+    PETHREAD thread = nullptr;
+    status = _PsLookupThreadByThreadId((HANDLE)(ULONG_PTR)request->tid, &thread);
+    if (!NT_SUCCESS(status) || !thread) {
+        _ObfDereferenceObject(process);
+        request->status = (UINT32)status;
+        return status;
+    }
+
+    __try {
+        PEPROCESS thread_process = IoThreadToProcess(thread);
+        if (thread_process != process) {
+            _ObfDereferenceObject(thread);
+            _ObfDereferenceObject(process);
+            request->status = (UINT32)STATUS_INVALID_CID;
+            WW_LOG("TTERM reject process_mismatch pid=%u tid=%u process=%p thread_process=%p",
+                request->pid, request->tid, process, thread_process);
+            return STATUS_INVALID_CID;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        status = (NTSTATUS)GetExceptionCode();
+        _ObfDereferenceObject(thread);
+        _ObfDereferenceObject(process);
+        request->status = (UINT32)status;
+        return status;
+    }
+
+    POBJECT_TYPE thread_type = PsThreadType ? *PsThreadType : nullptr;
+    HANDLE thread_handle = nullptr;
+    status = _ObOpenObjectByPointer(
+        thread,
+        OBJ_KERNEL_HANDLE,
+        nullptr,
+        THREAD_TERMINATE,
+        thread_type,
+        KernelMode,
+        &thread_handle);
+    if (NT_SUCCESS(status) && thread_handle) {
+        status = _ZwTerminateThread(thread_handle, (NTSTATUS)request->exit_status);
+        _ZwClose(thread_handle);
+    }
+    request->status = (UINT32)status;
+    WW_LOG("TTERM exit pid=%u tid=%u exit=0x%08X status=0x%08X status_text=%s",
+        request->pid,
+        request->tid,
+        request->exit_status,
+        (ULONG)status,
+        tctx_diag::ntstatus_text(status));
+    _ObfDereferenceObject(thread);
+    _ObfDereferenceObject(process);
+    return status;
+}
+
+
+NTSTATUS functions::handle_close_process_handle(p_close_handle_request request) {
+    if (!request || request->pid == 0 || request->handle_value == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+    if (!_ZwOpenProcess || !_ZwClose) {
+        request->status = (UINT32)STATUS_PROCEDURE_NOT_FOUND;
+        return STATUS_PROCEDURE_NOT_FOUND;
+    }
+
+    HANDLE owner_handle = nullptr;
+    OBJECT_ATTRIBUTES oa;
+    InitializeObjectAttributes(&oa, nullptr, OBJ_KERNEL_HANDLE, nullptr, nullptr);
+    CLIENT_ID cid{};
+    cid.UniqueProcess = (HANDLE)(ULONG_PTR)request->pid;
+    cid.UniqueThread = nullptr;
+    NTSTATUS status = _ZwOpenProcess(&owner_handle, PROCESS_DUP_HANDLE, &oa, &cid);
+    if (NT_SUCCESS(status) && owner_handle) {
+        HANDLE dup = nullptr;
+        status = ZwDuplicateObject(
+            owner_handle,
+            (HANDLE)(ULONG_PTR)request->handle_value,
+            NtCurrentProcess(),
+            &dup,
+            0,
+            OBJ_KERNEL_HANDLE,
+            DUPLICATE_SAME_ACCESS | DUPLICATE_CLOSE_SOURCE);
+        if (dup) {
+            _ZwClose(dup);
+        }
+        _ZwClose(owner_handle);
+    }
+    request->status = (UINT32)status;
+    WW_LOG("HCLS exit pid=%u handle=0x%llX status=0x%08X status_text=%s",
+        request->pid,
+        (unsigned long long)request->handle_value,
+        (ULONG)status,
+        tctx_diag::ntstatus_text(status));
     return status;
 }
 

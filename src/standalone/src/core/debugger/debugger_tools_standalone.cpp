@@ -64,6 +64,24 @@ static std::optional<tool_result_t> ensure_attached(const json& params)
         diag::log_tagged_fmt("dbg_tools", "ensure_attached: driver not connected");
         return tool_result_t::error(OBFSTR("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
     }
+    std::string kernel_reason;
+    const bool kernel_ready = driver_bridge::using_kernel_driver() &&
+        driver_bridge::kernel_session_available(&kernel_reason) &&
+        driver_bridge::dynamic_ioctls_ready();
+    if (!kernel_ready) {
+        diag::log_tagged_fmt("dbg_tools", "ensure_attached: kernel path unavailable loaded=%d kernel=%d dyn_ready=%d reason=%s status=%s last_error=%s",
+            driver_bridge::is_loaded() ? 1 : 0,
+            driver_bridge::using_kernel_driver() ? 1 : 0,
+            driver_bridge::dynamic_ioctls_ready() ? 1 : 0,
+            kernel_reason.empty() ? "<empty>" : kernel_reason.c_str(),
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str());
+        std::string detail = kernel_reason.empty() ? driver_bridge::last_error() : kernel_reason;
+        if (detail.empty())
+            detail = "kernel_driver_unavailable";
+        return tool_result_t::error(OBFSTR("Kernel driver path is unavailable for debugger target operations: ") +
+            detail);
+    }
 
     std::uint32_t requested_pid = 0;
     for (const char* key : {"target_pid", "process_id", "pid"})
@@ -184,106 +202,6 @@ static std::optional<std::uint32_t> parse_tid(const json& params)
     else
         diag::log_tagged_fmt("dbg_tools", "parse_tid: failed to parse tid");
     return (tid != 0) ? std::optional<std::uint32_t>{tid} : std::nullopt;
-}
-
-static bool thread_belongs_to_attached_process(HANDLE thread, std::uint32_t tid, const char* caller)
-{
-    const std::uint32_t attached_pid = driver_bridge::attached_pid();
-    if (attached_pid == 0)
-        return false;
-
-    const DWORD owner_pid = GetProcessIdOfThread(thread);
-    if (owner_pid == 0) {
-        diag::log_tagged_fmt("dbg_tools", "%s: GetProcessIdOfThread failed tid=%u gle=%lu", caller, tid, static_cast<unsigned long>(GetLastError()));
-        return false;
-    }
-    if (owner_pid != attached_pid) {
-        diag::log_tagged_fmt("dbg_tools", "%s: tid=%u owner_pid=%lu attached_pid=%u mismatch", caller, tid, static_cast<unsigned long>(owner_pid), attached_pid);
-        return false;
-    }
-    return true;
-}
-
-static void copy_native_context(const CONTEXT& native, voyager::device_t::thread_context& ctx)
-{
-    ctx.rax = native.Rax;
-    ctx.rbx = native.Rbx;
-    ctx.rcx = native.Rcx;
-    ctx.rdx = native.Rdx;
-    ctx.rsi = native.Rsi;
-    ctx.rdi = native.Rdi;
-    ctx.rbp = native.Rbp;
-    ctx.rsp = native.Rsp;
-    ctx.r8 = native.R8;
-    ctx.r9 = native.R9;
-    ctx.r10 = native.R10;
-    ctx.r11 = native.R11;
-    ctx.r12 = native.R12;
-    ctx.r13 = native.R13;
-    ctx.r14 = native.R14;
-    ctx.r15 = native.R15;
-    ctx.rip = native.Rip;
-    ctx.rflags = native.EFlags;
-    ctx.cs = native.SegCs;
-    ctx.ss = native.SegSs;
-    ctx.dr0 = native.Dr0;
-    ctx.dr1 = native.Dr1;
-    ctx.dr2 = native.Dr2;
-    ctx.dr3 = native.Dr3;
-    ctx.dr6 = native.Dr6;
-    ctx.dr7 = native.Dr7;
-    ctx.kernel_gs_base = 0;
-}
-
-static bool get_thread_context_win32_fallback(std::uint32_t tid,
-                                              voyager::device_t::thread_context& ctx,
-                                              bool suspend_for_context,
-                                              const char* caller)
-{
-    HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
-    if (!thread) {
-        diag::log_tagged_fmt("dbg_tools", "%s: fallback OpenThread failed tid=%u gle=%lu", caller, tid, static_cast<unsigned long>(GetLastError()));
-        return false;
-    }
-
-    auto close_and_return = [&](bool result) {
-        CloseHandle(thread);
-        return result;
-    };
-
-    if (!thread_belongs_to_attached_process(thread, tid, caller))
-        return close_and_return(false);
-
-    bool suspended = false;
-    DWORD suspend_previous = 0;
-    if (suspend_for_context) {
-        suspend_previous = SuspendThread(thread);
-        if (suspend_previous == static_cast<DWORD>(-1)) {
-            diag::log_tagged_fmt("dbg_tools", "%s: fallback SuspendThread failed tid=%u gle=%lu", caller, tid, static_cast<unsigned long>(GetLastError()));
-            return close_and_return(false);
-        }
-        suspended = true;
-    }
-
-    CONTEXT native{};
-    native.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_DEBUG_REGISTERS | CONTEXT_SEGMENTS;
-    const bool ok = GetThreadContext(thread, &native) != FALSE;
-    if (!ok) {
-        diag::log_tagged_fmt("dbg_tools", "%s: fallback GetThreadContext failed tid=%u gle=%lu", caller, tid, static_cast<unsigned long>(GetLastError()));
-    } else {
-        copy_native_context(native, ctx);
-        diag::log_tagged_fmt("dbg_tools", "%s: fallback GetThreadContext succeeded tid=%u rip=0x%llX rsp=0x%llX suspend_previous=%lu",
-            caller,
-            tid,
-            static_cast<unsigned long long>(ctx.rip),
-            static_cast<unsigned long long>(ctx.rsp),
-            static_cast<unsigned long>(suspend_previous));
-    }
-
-    if (suspended && ResumeThread(thread) == static_cast<DWORD>(-1))
-        diag::log_tagged_fmt("dbg_tools", "%s: fallback ResumeThread failed tid=%u gle=%lu", caller, tid, static_cast<unsigned long>(GetLastError()));
-
-    return close_and_return(ok && ctx.rip != 0 && ctx.rsp != 0);
 }
 
 static int int_param_clamped(const json& params, const char* key, int fallback, int lo, int hi)
@@ -1906,12 +1824,18 @@ static tool_result_t handle_debugger_get_callstack_impl(const json& params)
     voyager::device_t::thread_context ctx{};
     if (!device->get_thread_context(tid, ctx))
     {
-        diag::log_tagged_fmt("dbg_tools", "debugger_get_callstack_impl: get_thread_context failed for tid=%u", tid);
-        if (!get_thread_context_win32_fallback(tid, ctx, true, "debugger_get_callstack_impl")) {
-            if (did_suspend) device->resume_thread(tid);
-            return tool_result_t::error(
-                OBFSTR("Failed to get thread context for TID ") + std::to_string(tid));
-        }
+        const DWORD gle = GetLastError();
+        diag::log_tagged_fmt("dbg_tools", "debugger_get_callstack_impl: kernel get_thread_context failed tid=%u gle=%lu kernel=%d attached_pid=%u status=%s last_error=%s",
+            tid,
+            static_cast<unsigned long>(gle),
+            driver_bridge::using_kernel_driver() ? 1 : 0,
+            driver_bridge::attached_pid(),
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str());
+        if (did_suspend) device->resume_thread(tid);
+        SetLastError(gle);
+        return tool_result_t::error(
+            OBFSTR("Failed to get thread context for TID ") + std::to_string(tid));
     }
     diag::log_tagged_fmt("dbg_tools", "debugger_get_callstack_impl: thread context RIP=0x%llX RSP=0x%llX RBP=0x%llX", (unsigned long long)ctx.rip, (unsigned long long)ctx.rsp, (unsigned long long)ctx.rbp);
 
@@ -2098,12 +2022,18 @@ static tool_result_t dbg_snapshot_state(const json& params)
     voyager::device_t::thread_context ctx{};
     if (!device->get_thread_context(tid, ctx))
     {
-        diag::log_tagged_fmt("dbg_tools", "dbg_snapshot_state: get_thread_context failed for tid=%u", tid);
-        if (!get_thread_context_win32_fallback(tid, ctx, true, "dbg_snapshot_state")) {
-            if (did_suspend) device->resume_thread(tid);
-            return tool_result_t::error(
-                OBFSTR("Failed to get thread context for TID ") + std::to_string(tid));
-        }
+        const DWORD gle = GetLastError();
+        diag::log_tagged_fmt("dbg_tools", "dbg_snapshot_state: kernel get_thread_context failed tid=%u gle=%lu kernel=%d attached_pid=%u status=%s last_error=%s",
+            tid,
+            static_cast<unsigned long>(gle),
+            driver_bridge::using_kernel_driver() ? 1 : 0,
+            driver_bridge::attached_pid(),
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str());
+        if (did_suspend) device->resume_thread(tid);
+        SetLastError(gle);
+        return tool_result_t::error(
+            OBFSTR("Failed to get thread context for TID ") + std::to_string(tid));
     }
 
     execution_snapshot snap;

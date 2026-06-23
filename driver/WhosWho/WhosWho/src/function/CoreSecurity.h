@@ -194,6 +194,7 @@ namespace caller_validation {
 
     inline volatile ULONG g_DirectoryTableBase_offset = 0;
     inline volatile LONG g_offsets_initialized = 0;
+    inline volatile LONG g_offsets_summary_logged = 0;
 
     __forceinline BOOLEAN initialize_eprocess_offsets() {
         LONG prev = _InterlockedCompareExchange(&g_offsets_initialized, 1, 0);
@@ -206,7 +207,8 @@ namespace caller_validation {
         }
 
         RTL_OSVERSIONINFOW version_info = { sizeof(RTL_OSVERSIONINFOW) };
-        if (_RtlGetVersion && NT_SUCCESS(_RtlGetVersion(&version_info))) {
+        NTSTATUS version_status = _RtlGetVersion ? _RtlGetVersion(&version_info) : STATUS_PROCEDURE_NOT_FOUND;
+        if (NT_SUCCESS(version_status)) {
             g_DirectoryTableBase_offset = 0x28;
         } else {
             g_DirectoryTableBase_offset = 0x28;
@@ -214,6 +216,23 @@ namespace caller_validation {
 
         KeMemoryBarrier();
         _InterlockedExchange(&g_offsets_initialized, 2);
+        if (_InterlockedCompareExchange(&g_offsets_summary_logged, 1, 0) == 0) {
+            WW_KERNEL_LAYOUT_LOG_OFFSET("EPROCESS.DirectoryTableBase", NT_SUCCESS(version_status) ? "static_table" : "fallback_static_table",
+                g_DirectoryTableBase_offset,
+                g_DirectoryTableBase_offset != 0,
+                NT_SUCCESS(version_status) ? "RtlGetVersion succeeded; DirectoryTableBase fixed architectural offset" : "RtlGetVersion unavailable; DirectoryTableBase fixed architectural offset",
+                g_DirectoryTableBase_offset != 0 ? "none" : "zero_offset");
+            WW_LOG("KVALIDATE build=%lu kind=layout name=EPROCESS.DirectoryTableBase.details source=%s offset=0x%llx validation=%s evidence=\"version_status=0x%08X os=%lu.%lu.%lu\" fail_closed=%s",
+                version_info.dwBuildNumber,
+                NT_SUCCESS(version_status) ? "static_table" : "fallback_static_table",
+                static_cast<unsigned long long>(g_DirectoryTableBase_offset),
+                ww_kernel_validation_state(g_DirectoryTableBase_offset != 0),
+                static_cast<ULONG>(version_status),
+                version_info.dwMajorVersion,
+                version_info.dwMinorVersion,
+                version_info.dwBuildNumber,
+                g_DirectoryTableBase_offset != 0 ? "none" : "zero_offset");
+        }
         return TRUE;
     }
 

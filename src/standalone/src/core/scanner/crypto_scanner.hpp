@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "../infra/critical_work_queue.hpp"
+#include "comm.h"
 #include "standalone_driver.hpp"
 #include "standalone_ai_client.hpp"
 #include "standalone_settings.hpp"
@@ -472,35 +473,117 @@ inline std::vector<uint64_t> find_pattern_in_region(const uint8_t* data, size_t 
 	return hits;
 }
 
+inline std::recursive_mutex& driver_access_mutex()
+{
+	static std::recursive_mutex m;
+	return m;
+}
+
+struct active_pid_scope_t {
+	uint32_t previous = 0;
+	uint32_t requested = 0;
+	bool changed = false;
+	bool ok = false;
+	std::unique_lock<std::recursive_mutex> lock;
+
+	explicit active_pid_scope_t(uint32_t pid)
+	    : lock(driver_access_mutex())
+	{
+		requested = pid != 0 ? pid : driver_bridge::attached_pid();
+		previous = driver_bridge::attached_pid();
+		if (requested == 0 || !driver_bridge::using_kernel_driver() || !device || !device->is_connected())
+			return;
+		if (previous != requested) {
+			const auto attached = driver_bridge::attached_pids();
+			bool known = false;
+			for (const auto attached_pid : attached) {
+				if (attached_pid == requested) {
+					known = true;
+					break;
+				}
+			}
+			if (!known && !driver_bridge::attach_additional(requested))
+				return;
+			if (!driver_bridge::set_active_pid(requested))
+				return;
+			changed = true;
+		}
+		if (device->get_process_id() != requested)
+			device->set_process_id(requested);
+		if (device->get_dtb() == 0)
+			device->solve_dtb();
+		ok = device->get_dtb() != 0;
+		if (!ok)
+			diag::log_tagged_fmt("crypto_scan", "active_pid_scope_dtb_failed requested=%u previous=%u active=%u status=%s last_error=%s",
+				requested, previous, driver_bridge::attached_pid(), driver_bridge::status().c_str(), driver_bridge::last_error().c_str());
+	}
+
+	~active_pid_scope_t()
+	{
+		if (!changed)
+			return;
+		if (previous != 0)
+			driver_bridge::set_active_pid(previous);
+		else
+			driver_bridge::clear_active_pid();
+	}
+};
+
+inline bool strict_kernel_ready()
+{
+	return driver_bridge::using_kernel_driver() && device && device->is_connected() && driver_bridge::attached_pid() != 0;
+}
+
+inline std::vector<driver_bridge::memory_region_t> enumerate_target_regions_strict(size_t max_regions)
+{
+	std::vector<driver_bridge::memory_region_t> out;
+	active_pid_scope_t scope(driver_bridge::attached_pid());
+	if (!scope.ok)
+		return out;
+	auto raw = device->enumerate_memory_regions(0, 0x00007FFFFFFFFFFFULL, false);
+	out.reserve(std::min(max_regions, raw.size()));
+	for (const auto& r : raw) {
+		if (max_regions != 0 && out.size() >= max_regions)
+			break;
+		driver_bridge::memory_region_t region;
+		region.base = r.base;
+		region.size = r.size;
+		region.state = r.state;
+		region.protect = r.protect;
+		region.type = r.type;
+		out.push_back(region);
+	}
+	return out;
+}
+
 inline bool read_target_region(uint32_t pid, uint64_t address, size_t size, std::vector<uint8_t>& out)
 {
 	out.clear();
-	if (size == 0)
+	if (address == 0 || size == 0)
 		return false;
-
-	if (pid != 0) {
-		HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, pid);
-		if (hp) {
-			out.resize(size);
-			SIZE_T br = 0;
-			BOOL ok = ReadProcessMemory(hp, reinterpret_cast<LPCVOID>(static_cast<uintptr_t>(address)), out.data(), size, &br);
-			DWORD gle = ok ? ERROR_SUCCESS : GetLastError();
-			CloseHandle(hp);
-			if (ok && br > 0) {
-				out.resize(static_cast<size_t>(br));
-				return true;
-			}
-			out.clear();
-			diag::log_tagged_fmt("crypto_scan", "read_target_region rpm failed pid=%u addr=0x%llX size=%zu gle=%lu bytes=%llu",
-				pid,
-				static_cast<unsigned long long>(address),
-				size,
-				static_cast<unsigned long>(gle),
-				static_cast<unsigned long long>(br));
-		}
+	active_pid_scope_t scope(pid);
+	if (!scope.ok) {
+		diag::log_tagged_fmt("crypto_scan", "read_target_region scope_failed pid=%u addr=0x%llX size=%zu active=%u",
+			pid,
+			static_cast<unsigned long long>(address),
+			size,
+			driver_bridge::attached_pid());
+		return false;
 	}
-
-	return driver_bridge::read_memory(address, size, out) && !out.empty();
+	out.resize(size);
+	const std::size_t got = device->read_raw(address, out.data(), size);
+	if (got == 0) {
+		out.clear();
+		diag::log_tagged_fmt("crypto_scan", "read_target_region driver_failed pid=%u addr=0x%llX size=%zu active=%u dtb=0x%llX",
+			scope.requested,
+			static_cast<unsigned long long>(address),
+			size,
+			driver_bridge::attached_pid(),
+			static_cast<unsigned long long>(device->get_dtb()));
+		return false;
+	}
+	out.resize(got);
+	return true;
 }
 
 template <typename Fn>
@@ -672,9 +755,12 @@ inline void scan_process(const process_scan_config_t& cfg)
 		diag::log_tagged("crypto_scan", "scan_process refused already_scanning");
 		return;
 	}
-	if (!driver_bridge::is_loaded() || driver_bridge::attached_pid() == 0) {
-		diag::log_tagged_fmt("crypto_scan", "scan_process refused not_attached driver_loaded=%d pid=%u",
-			static_cast<int>(driver_bridge::is_loaded()), driver_bridge::attached_pid());
+	if (!detail::strict_kernel_ready()) {
+		diag::log_tagged_fmt("crypto_scan", "scan_process refused kernel_unavailable driver_loaded=%d kernel=%d pid=%u connected=%d",
+			static_cast<int>(driver_bridge::is_loaded()),
+			static_cast<int>(driver_bridge::using_kernel_driver()),
+			driver_bridge::attached_pid(),
+			(device && device->is_connected()) ? 1 : 0);
 		return;
 	}
 	diag::log_tagged_fmt("crypto_scan", "scan_process start pid=%u max_regions=%zu max_bytes=%llu max_hits=%zu timeout_ms=%u range=0x%llX+0x%llX module_filter='%s'",
@@ -723,7 +809,7 @@ inline void scan_process(const process_scan_config_t& cfg)
 		uint32_t pid = driver_bridge::attached_pid();
 		diag::log_tagged_fmt("crypto_scan", "scan_process worker_enter pid=%u builtins_plus_custom=%zu",
 			pid, signatures.size());
-		auto regions = driver_bridge::enumerate_memory_regions(4096);
+		auto regions = detail::enumerate_target_regions_strict(4096);
 		auto modules = driver_bridge::enumerate_modules();
 
 		auto find_module = [&](uint64_t addr) -> std::pair<std::string, uint64_t> {
@@ -1017,7 +1103,7 @@ inline void auto_label_references()
 				mc.base = m.base;
 				mc.size = m.size;
 				size_t read_size = static_cast<size_t>((std::min)(static_cast<uint64_t>(m.size), static_cast<uint64_t>(0x400000)));
-				driver_bridge::read_memory(m.base, read_size, mc.data);
+				detail::read_target_region(driver_bridge::attached_pid(), m.base, read_size, mc.data);
 				if (mc.data.empty()) break;
 				++diag.scanned_regions;
 				cache_it = mod_cache.emplace(m.base, std::move(mc)).first;
@@ -1142,9 +1228,12 @@ inline void scan_entropy()
 		diag::log_tagged("crypto_scan", "scan_entropy refused already_scanning");
 		return;
 	}
-	if (!driver_bridge::is_loaded() || driver_bridge::attached_pid() == 0) {
-		diag::log_tagged_fmt("crypto_scan", "scan_entropy refused not_attached driver_loaded=%d pid=%u",
-			static_cast<int>(driver_bridge::is_loaded()), driver_bridge::attached_pid());
+	if (!detail::strict_kernel_ready()) {
+		diag::log_tagged_fmt("crypto_scan", "scan_entropy refused kernel_unavailable driver_loaded=%d kernel=%d pid=%u connected=%d",
+			static_cast<int>(driver_bridge::is_loaded()),
+			static_cast<int>(driver_bridge::using_kernel_driver()),
+			driver_bridge::attached_pid(),
+			(device && device->is_connected()) ? 1 : 0);
 		return;
 	}
 	diag::log_tagged_fmt("crypto_scan", "scan_entropy start pid=%u threshold=%.2f",
@@ -1160,7 +1249,7 @@ inline void scan_entropy()
 
 	detail::launch_scan_worker("scan_entropy", []() {
 		auto t_start = std::chrono::steady_clock::now();
-		auto regions = driver_bridge::enumerate_memory_regions(4096);
+		auto regions = detail::enumerate_target_regions_strict(4096);
 		auto modules = driver_bridge::enumerate_modules();
 
 		auto find_module = [&](uint64_t addr) -> std::string {
@@ -1193,7 +1282,7 @@ inline void scan_entropy()
 			if (g_state.cancel.load()) break;
 
 			std::vector<uint8_t> data;
-			driver_bridge::read_memory(region.base, static_cast<size_t>(region.size), data);
+			detail::read_target_region(driver_bridge::attached_pid(), region.base, static_cast<size_t>(region.size), data);
 			if (data.empty()) {
 				scanned += region.size;
 				g_state.progress.store(static_cast<float>(scanned) / static_cast<float>(total_bytes));

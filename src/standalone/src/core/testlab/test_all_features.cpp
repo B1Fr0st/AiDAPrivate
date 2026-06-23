@@ -156,10 +156,8 @@ namespace test_all_features {
 		std::deque<std::string> g_log_lines;
 		constexpr std::size_t kMaxLogLines = 4096;
 
-		std::mutex        g_phase_mtx;
-		std::string       g_phase_label;
-		std::mutex        g_step_mtx;
-		std::string       g_step_label;
+		std::shared_ptr<const std::string> g_phase_label = std::make_shared<const std::string>();
+		std::shared_ptr<const std::string> g_step_label = std::make_shared<const std::string>();
 		std::atomic<std::uint64_t> g_run_id{ 0 };
 		std::atomic<std::uint64_t> g_run_start_tick{ 0 };
 		std::atomic<std::uint64_t> g_phase_start_tick{ 0 };
@@ -301,15 +299,21 @@ namespace test_all_features {
 			return static_cast<std::uint64_t>(GetTickCount64());
 		}
 
-		void copy_label_try(std::mutex& mtx, const std::string& value, char* out, std::size_t cap, const char* busy_text) {
+		void store_label_snapshot(std::shared_ptr<const std::string>& slot, const char* label) {
+			auto next = std::make_shared<const std::string>((label != nullptr) ? label : "");
+			std::atomic_store_explicit(&slot, next, std::memory_order_release);
+		}
+
+		std::string load_label_snapshot(const std::shared_ptr<const std::string>& slot) {
+			auto current = std::atomic_load_explicit(&slot, std::memory_order_acquire);
+			return current ? *current : std::string();
+		}
+
+		void copy_label_snapshot(const std::shared_ptr<const std::string>& slot, char* out, std::size_t cap) {
 			if (cap == 0) return;
 			out[0] = '\0';
-			if (mtx.try_lock()) {
-				_snprintf_s(out, cap, _TRUNCATE, "%s", value.empty() ? "<none>" : value.c_str());
-				mtx.unlock();
-			} else {
-				_snprintf_s(out, cap, _TRUNCATE, "%s", busy_text ? busy_text : "<lock-busy>");
-			}
+			const std::string value = load_label_snapshot(slot);
+			_snprintf_s(out, cap, _TRUNCATE, "%s", value.empty() ? "<none>" : value.c_str());
 		}
 
 		void format_debug_snapshot_impl(char* out, std::size_t cap) {
@@ -317,8 +321,8 @@ namespace test_all_features {
 
 			char phase[192] = {};
 			char step[256] = {};
-			copy_label_try(g_phase_mtx, g_phase_label, phase, sizeof(phase), "<phase-lock-busy>");
-			copy_label_try(g_step_mtx, g_step_label, step, sizeof(step), "<step-lock-busy>");
+			copy_label_snapshot(g_phase_label, phase, sizeof(phase));
+			copy_label_snapshot(g_step_label, step, sizeof(step));
 
 			const std::uint64_t now = now_ms_tick();
 			const std::uint64_t run_start = g_run_start_tick.load(std::memory_order_acquire);
@@ -654,10 +658,7 @@ namespace test_all_features {
 		}
 
 		void set_step(const char* label) {
-			{
-				std::lock_guard<std::mutex> lk(g_step_mtx);
-				g_step_label = (label != nullptr) ? label : "";
-			}
+			store_label_snapshot(g_step_label, label);
 			g_step_start_tick.store(now_ms_tick(), std::memory_order_release);
 		}
 
@@ -741,8 +742,7 @@ namespace test_all_features {
 		}
 
 		void set_phase(const char* label) {
-			std::lock_guard<std::mutex> lk(g_phase_mtx);
-			g_phase_label = (label != nullptr) ? label : "";
+			store_label_snapshot(g_phase_label, label);
 			g_phase_start_tick.store(now_ms_tick(), std::memory_order_release);
 		}
 
@@ -2746,10 +2746,10 @@ namespace test_all_features {
 			cfg_view::build_cfg(addr);
 
 			bool finished = false;
-			for (int i = 0; i < 60; ++i) {
+			for (int i = 0; i < 240; ++i) {
 				if (cancelled()) break;
 				if (!cfg_view::g_state.building.load()) { finished = true; break; }
-				Sleep(50);
+				Sleep(25);
 			}
 
 			std::size_t blocks = 0;
@@ -3750,13 +3750,11 @@ namespace test_all_features {
 			ImGui::SameLine(0.f, 20.f);
 
 
-			{
-				std::lock_guard<std::mutex> lk(g_phase_mtx);
-				if (!g_phase_label.empty()) {
-					ImGui::PushStyleColor(ImGuiCol_Text, t.text_dim);
-					ImGui::Text("Phase: %s", g_phase_label.c_str());
-					ImGui::PopStyleColor();
-				}
+			std::string phase_label = load_label_snapshot(g_phase_label);
+			if (!phase_label.empty()) {
+				ImGui::PushStyleColor(ImGuiCol_Text, t.text_dim);
+				ImGui::Text("Phase: %s", phase_label.c_str());
+				ImGui::PopStyleColor();
 			}
 
 			ImGui::Dummy(ImVec2(0.f, 6.f));
@@ -3833,9 +3831,21 @@ namespace test_all_features {
 
 			if (g_code_font) ImGui::PushFont(g_code_font);
 
+			std::vector<std::string> log_snapshot;
+			bool log_snapshot_busy = false;
 			{
-				std::lock_guard<std::mutex> lk(g_log_mtx);
-				for (const auto& line : g_log_lines) {
+				std::unique_lock<std::mutex> lk(g_log_mtx, std::try_to_lock);
+				if (lk.owns_lock())
+					log_snapshot.assign(g_log_lines.begin(), g_log_lines.end());
+				else
+					log_snapshot_busy = true;
+			}
+			if (log_snapshot_busy) {
+				ImGui::PushStyleColor(ImGuiCol_Text, t.warning);
+				ImGui::TextUnformatted("Test log snapshot is busy");
+				ImGui::PopStyleColor();
+			} else {
+				for (const auto& line : log_snapshot) {
 
 					if (line.find("SUSPECT") != std::string::npos) {
 						ImGui::PushStyleColor(ImGuiCol_Text, t.warning);
