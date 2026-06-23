@@ -26,6 +26,8 @@ namespace module_view {
 struct ui_state_t {
 	std::vector<driver_bridge::module_info_t> modules;
 	int                                       selected_module = -1;
+	uint64_t                                  selected_module_base = 0;
+	std::string                               selected_module_name;
 	int                                       active_sub = 0;
 	std::vector<pe_parser::export_entry_t>    exports;
 	std::vector<pe_parser::import_entry_t>    imports;
@@ -54,6 +56,61 @@ struct ui_state_t {
 
 inline ui_state_t g_ui;
 
+struct selected_module_snapshot_t {
+	uint64_t    base = 0;
+	uint64_t    size = 0;
+	std::string name;
+	std::string path;
+	bool        present = false;
+};
+
+inline void sync_selected_module_locked()
+{
+	g_ui.selected_module = -1;
+	if (g_ui.selected_module_base == 0) {
+		g_ui.selected_module_name.clear();
+		return;
+	}
+	for (size_t i = 0; i < g_ui.modules.size(); ++i) {
+		const auto& m = g_ui.modules[i];
+		if (m.base == g_ui.selected_module_base) {
+			g_ui.selected_module = static_cast<int>(i);
+			g_ui.selected_module_name = m.name;
+			return;
+		}
+	}
+}
+
+inline void select_module_by_base(uint64_t base, const std::string& fallback_name = std::string())
+{
+	std::lock_guard<std::mutex> lk(g_ui.modules_mutex);
+	bool same_base = (g_ui.selected_module_base == base);
+	g_ui.selected_module_base = base;
+	if (!same_base || !fallback_name.empty())
+		g_ui.selected_module_name = fallback_name;
+	sync_selected_module_locked();
+}
+
+inline selected_module_snapshot_t selected_module_snapshot()
+{
+	selected_module_snapshot_t out;
+	std::lock_guard<std::mutex> lk(g_ui.modules_mutex);
+	sync_selected_module_locked();
+	out.base = g_ui.selected_module_base;
+	out.name = g_ui.selected_module_name;
+	for (const auto& m : g_ui.modules) {
+		if (m.base == g_ui.selected_module_base) {
+			out.base = m.base;
+			out.size = static_cast<uint64_t>(m.size);
+			out.name = m.name;
+			out.path = m.path;
+			out.present = true;
+			break;
+		}
+	}
+	return out;
+}
+
 inline void refresh()
 {
 	if (!driver_bridge::is_loaded() || driver_bridge::attached_pid() == 0) {
@@ -79,6 +136,7 @@ inline void refresh()
 		{
 			std::lock_guard<std::mutex> lk(g_ui.modules_mutex);
 			g_ui.modules = std::move(mods);
+			sync_selected_module_locked();
 		}
 		diag::log_tagged_fmt("modules",
 			"modules_refresh_done count=%zu", n);
@@ -137,6 +195,8 @@ inline void load_module_details_by_base(uint64_t base)
 {
 	if (base == 0)
 		return;
+
+	select_module_by_base(base);
 
 	bool expected = false;
 	if (!g_ui.loading.compare_exchange_strong(expected, true))
@@ -334,8 +394,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	dl->PushClipRect(ImVec2(pos_x, mod_list_y), ImVec2(pos_x + left_w, mod_list_y + mod_list_h), true);
 
 	std::vector<driver_bridge::module_info_t> mods_snapshot;
+	uint64_t selected_base = 0;
 	{
 		std::lock_guard<std::mutex> lk(g_ui.modules_mutex);
+		sync_selected_module_locked();
+		selected_base = g_ui.selected_module_base;
 		for (auto& m : g_ui.modules) {
 			if (detail::match_filter(m.name, mod_list_filter))
 				mods_snapshot.push_back(m);
@@ -354,6 +417,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	int mod_first = static_cast<int>(g_ui.module_scroll_y / row_h);
 	if (mod_first < 0) mod_first = 0;
 	int mod_vis = static_cast<int>(mod_list_h / row_h) + 2;
+	int selected_filtered_idx = -1;
+	for (int i = 0; i < static_cast<int>(mods_snapshot.size()); ++i) {
+		if (mods_snapshot[i].base == selected_base) {
+			selected_filtered_idx = i;
+			break;
+		}
+	}
 
 	for (int vi = 0; vi < mod_vis; ++vi) {
 		int idx = mod_first + vi;
@@ -364,11 +434,14 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		if (ry + row_h < mod_list_y || ry > mod_list_y + mod_list_h) continue;
 
 		bool clicked = ui_anim::row_hover_select(dl, pos_x, ry, left_w - 12.f, row_h,
-												  idx, g_ui.selected_module, alpha, ar, ag, ab);
+												  idx, selected_filtered_idx, alpha, ar, ag, ab);
 		float mod_row_alpha = ui_anim::render_row_entrance(idx, static_cast<float>(mod_first), dt, alpha);
 		(void)mod_row_alpha;
-		if (clicked)
+		if (clicked) {
+			select_module_by_base(m.base, m.name);
+			selected_base = m.base;
 			load_module_details_by_base(m.base);
+		}
 
 		std::string display_name = m.name;
 		float max_name_w = name_col_w;

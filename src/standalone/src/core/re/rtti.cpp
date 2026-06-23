@@ -69,6 +69,19 @@ struct type_info_t
     int best_vtable_score = 0;
 };
 
+struct type_resolution_record_t
+{
+    std::string name;
+    std::string decorated_name;
+    std::uint64_t type_descriptor_va = 0;
+    std::uint64_t vtable_va = 0;
+    std::uint64_t hierarchy_descriptor_va = 0;
+    std::vector<vtable_record_t> vtables;
+    std::vector<std::string> base_classes;
+    std::vector<base_class_record_t> base_class_records;
+    std::string module_name;
+};
+
 struct col_info_t
 {
     std::uint32_t signature = 0;
@@ -144,6 +157,8 @@ struct scan_result_t
     std::string module_filter;
     std::string scan_mode;
     std::vector<std::string> sample_type_names;
+    std::vector<type_resolution_record_t> type_index;
+    json error_details = json::object();
 };
 
 std::string undecorate_rtti_name(std::string decorated)
@@ -692,6 +707,201 @@ void merge_type_info(type_info_t& dst, const type_info_t& src)
         dst.base_class_records = src.base_class_records;
 }
 
+type_resolution_record_t type_resolution_record_from(const type_info_t& type)
+{
+    type_resolution_record_t out;
+    out.name = type.name;
+    out.decorated_name = type.decorated_name;
+    out.type_descriptor_va = type.type_descriptor_va;
+    out.vtable_va = type.vtable_va;
+    out.hierarchy_descriptor_va = type.hierarchy_descriptor_va;
+    out.vtables = type.vtables;
+    out.base_classes = type.base_classes;
+    out.base_class_records = type.base_class_records;
+    out.module_name = type.module_name;
+    return out;
+}
+
+std::vector<type_resolution_record_t> build_type_index(const std::vector<type_info_t>& types)
+{
+    std::vector<type_resolution_record_t> out;
+    out.reserve(types.size());
+    for (const auto& type : types)
+        out.push_back(type_resolution_record_from(type));
+    return out;
+}
+
+const type_resolution_record_t* find_type_in_index(const std::vector<type_resolution_record_t>& index,
+                                                   const base_class_record_t* base,
+                                                   const std::string& fallback_name)
+{
+    if (base && base->type_descriptor_va != 0)
+    {
+        for (const auto& item : index)
+        {
+            if (item.type_descriptor_va == base->type_descriptor_va)
+                return &item;
+        }
+    }
+    const std::string name = lower_ascii(base && !base->name.empty() ? base->name : fallback_name);
+    const std::string decorated = lower_ascii(base ? base->decorated_name : std::string());
+    if (name.empty() && decorated.empty())
+        return nullptr;
+    for (const auto& item : index)
+    {
+        if (!name.empty() && lower_ascii(item.name) == name)
+            return &item;
+        if (!decorated.empty() && lower_ascii(item.decorated_name) == decorated)
+            return &item;
+    }
+    return nullptr;
+}
+
+json vtable_records_json(const type_resolution_record_t& item, std::size_t max_vtables)
+{
+    json out = json::array();
+    std::size_t emitted = 0;
+    for (const auto& vt : item.vtables)
+    {
+        if (emitted >= max_vtables)
+            break;
+        json row;
+        row["vtable_va"] = sa_format_address(vt.vtable_va);
+        row["complete_object_locator_va"] = vt.complete_object_locator_va ? json(sa_format_address(vt.complete_object_locator_va)) : json(nullptr);
+        row["confidence"] = vt.confidence;
+        out.push_back(std::move(row));
+        ++emitted;
+    }
+    return out;
+}
+
+std::string mro_visit_key(const type_resolution_record_t& item)
+{
+    if (item.type_descriptor_va != 0)
+        return "td:" + sa_format_address(item.type_descriptor_va);
+    if (!item.decorated_name.empty())
+        return "decorated:" + lower_ascii(item.decorated_name);
+    return "name:" + lower_ascii(item.name);
+}
+
+void append_mro_entries(json& out,
+                        const type_resolution_record_t& item,
+                        const std::vector<type_resolution_record_t>& index,
+                        std::set<std::string>& visited,
+                        std::size_t depth,
+                        std::size_t max_depth,
+                        std::size_t max_vtables_per_type,
+                        std::size_t& unresolved)
+{
+    if (depth > max_depth)
+        return;
+    const std::string key = mro_visit_key(item);
+    if (!visited.insert(key).second)
+        return;
+    json row;
+    row["depth"] = depth;
+    row["name"] = item.name;
+    row["decorated_name"] = item.decorated_name.empty() ? json(nullptr) : json(item.decorated_name);
+    row["type_descriptor_va"] = item.type_descriptor_va ? json(sa_format_address(item.type_descriptor_va)) : json(nullptr);
+    row["vtable_va"] = item.vtable_va ? json(sa_format_address(item.vtable_va)) : json(nullptr);
+    row["vtables"] = vtable_records_json(item, max_vtables_per_type);
+    row["module_name"] = item.module_name;
+    row["depth_semantics"] = "recursive_raw_descriptor_walk_depth";
+    row["base_descriptor_count"] = std::max(item.base_classes.size(), item.base_class_records.size());
+    row["ordering_semantics"] = "msvc_chd_base_class_array_raw_descriptor_order";
+    out.push_back(std::move(row));
+    const std::size_t count = std::max(item.base_classes.size(), item.base_class_records.size());
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        const base_class_record_t* base = i < item.base_class_records.size() ? &item.base_class_records[i] : nullptr;
+        const std::string fallback_name = i < item.base_classes.size() ? item.base_classes[i] : std::string();
+        const auto* parent = find_type_in_index(index, base, fallback_name);
+        if (!parent)
+        {
+            ++unresolved;
+            continue;
+        }
+        append_mro_entries(out, *parent, index, visited, depth + 1, max_depth, max_vtables_per_type, unresolved);
+    }
+}
+
+void attach_hierarchy(json& out,
+                      const type_info_t& type,
+                      const std::vector<type_resolution_record_t>& index,
+                      std::size_t max_vtables_per_type)
+{
+    json hierarchy = json::array();
+    std::size_t unresolved = 0;
+    const std::size_t count = std::max(type.base_classes.size(), type.base_class_records.size());
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        const base_class_record_t* base = i < type.base_class_records.size() ? &type.base_class_records[i] : nullptr;
+        const std::string fallback_name = i < type.base_classes.size() ? type.base_classes[i] : std::string();
+        const auto* parent = find_type_in_index(index, base, fallback_name);
+        json row;
+        row["order"] = i;
+        row["order_semantics"] = "msvc_chd_base_class_array_raw_descriptor_order";
+        row["relationship_precision"] = "base_descriptor_entry_not_direct_base_proof";
+        row["name"] = base && !base->name.empty() ? base->name : fallback_name;
+        row["decorated_name"] = base && !base->decorated_name.empty() ? json(base->decorated_name) : json(nullptr);
+        row["type_descriptor_va"] = base && base->type_descriptor_va ? json(sa_format_address(base->type_descriptor_va)) :
+            (parent && parent->type_descriptor_va ? json(sa_format_address(parent->type_descriptor_va)) : json(nullptr));
+        row["base_descriptor_va"] = base && base->base_descriptor_va ? json(sa_format_address(base->base_descriptor_va)) : json(nullptr);
+        row["mdisp"] = base ? base->mdisp : 0;
+        row["pdisp"] = base ? base->pdisp : 0;
+        row["vdisp"] = base ? base->vdisp : 0;
+        row["attributes"] = base ? json(sa_format_address(base->attributes)) : json(nullptr);
+        if (parent && parent->vtable_va != 0)
+        {
+            row["vtable_va"] = sa_format_address(parent->vtable_va);
+            row["vtables"] = vtable_records_json(*parent, max_vtables_per_type);
+            row["vtable_resolution"] = "validated_parent_type";
+        }
+        else
+        {
+            row["vtable_va"] = nullptr;
+            row["vtables"] = json::array();
+            ++unresolved;
+            if (parent)
+                row["vtable_resolution"] = "parent_type_found_without_validated_vtable";
+            else if (base && base->type_descriptor_va != 0)
+                row["vtable_resolution"] = "base_type_descriptor_found_but_parent_type_not_in_scan_scope";
+            else if (type.hierarchy_descriptor_va == 0)
+                row["vtable_resolution"] = "hierarchy_descriptor_unresolved";
+            else
+                row["vtable_resolution"] = "base_record_missing_type_descriptor";
+        }
+        hierarchy.push_back(std::move(row));
+    }
+    out["hierarchy"] = std::move(hierarchy);
+    out["hierarchy_count"] = count;
+    out["hierarchy_unresolved_vtable_count"] = unresolved;
+    out["hierarchy_ordering_semantics"] = "msvc_chd_base_class_array_raw_descriptor_order";
+    out["hierarchy_relationship_precision"] = "raw_base_descriptor_entries_not_verified_direct_base_graph";
+    if (count == 0)
+        out["hierarchy_resolution"] = type.hierarchy_descriptor_va == 0 ? "hierarchy_descriptor_unresolved" : "no_base_classes_reported";
+    else if (unresolved == 0)
+        out["hierarchy_resolution"] = "raw_descriptor_order_complete";
+    else
+        out["hierarchy_resolution"] = "raw_descriptor_order_partial";
+    type_resolution_record_t root = type_resolution_record_from(type);
+    json mro = json::array();
+    std::set<std::string> visited;
+    std::size_t mro_unresolved = 0;
+    append_mro_entries(mro, root, index, visited, 0, 16, max_vtables_per_type, mro_unresolved);
+    out["mro"] = std::move(mro);
+    out["mro_count"] = out["mro"].size();
+    out["mro_unresolved_base_count"] = mro_unresolved;
+    out["mro_semantics"] = "compatibility_field_recursive_raw_descriptor_walk_not_canonical_cxx_mro";
+    out["hierarchy_shape"] = {
+        {"base_descriptor_count", count},
+        {"base_descriptor_unresolved_vtable_count", unresolved},
+        {"mro_count", out["mro_count"]},
+        {"mro_unresolved_base_count", mro_unresolved},
+        {"ordering_semantics", "msvc_chd_base_class_array_raw_descriptor_order"}
+    };
+}
+
 bool type_from_vtable(std::uint32_t pid,
                       const driver_bridge::module_info_t& module,
                       std::uint64_t vtable_va,
@@ -1043,6 +1253,79 @@ bool type_matches_filter(const type_info_t& type, const std::optional<std::regex
     return std::regex_search(type.name, *filter) || std::regex_search(type.decorated_name, *filter);
 }
 
+std::string json_value_preview(const json& value)
+{
+    if (value.is_string())
+        return value.get<std::string>();
+    return value.dump();
+}
+
+bool parse_address_selector(const json& params,
+                            const char* first_key,
+                            const char* second_key,
+                            std::uint64_t& out,
+                            bool& provided,
+                            std::string& used_key,
+                            std::string& provided_value,
+                            std::string& error)
+{
+    provided = false;
+    used_key.clear();
+    provided_value.clear();
+    error.clear();
+    auto parse_one = [&](const char* key) -> bool {
+        if (!key || !params.contains(key))
+            return false;
+        provided = true;
+        used_key = key;
+        provided_value = json_value_preview(params[key]);
+        if (!parse_u64_value(params[key], out))
+            error = std::string("Invalid RTTI address selector '") + key + "'.";
+        return true;
+    };
+    if (parse_one(first_key))
+        return error.empty();
+    if (parse_one(second_key))
+        return error.empty();
+    return true;
+}
+
+json module_sample_json(const std::vector<driver_bridge::module_info_t>& modules, std::size_t limit)
+{
+    json sample = json::array();
+    for (const auto& module : modules)
+    {
+        if (sample.size() >= limit)
+            break;
+        sample.push_back(module_json(module));
+    }
+    return sample;
+}
+
+json selector_failure_details(std::uint32_t pid,
+                              const std::string& selector_kind,
+                              const std::string& selector_key,
+                              const std::string& selector_value,
+                              const std::string& module_name,
+                              const std::string& module_filter,
+                              bool include_system_modules,
+                              std::uint64_t module_limit,
+                              const std::vector<driver_bridge::module_info_t>& available_modules)
+{
+    json details;
+    details["process_id"] = pid;
+    details["selector_kind"] = selector_kind;
+    details["selector_key"] = selector_key;
+    details["selector_value"] = selector_value;
+    details["module_name"] = module_name;
+    details["module_filter"] = module_filter;
+    details["include_system_modules"] = include_system_modules;
+    details["module_limit"] = module_limit;
+    details["available_module_count"] = available_modules.size();
+    details["available_modules_sample"] = module_sample_json(available_modules, 24);
+    return details;
+}
+
 scan_result_t scan_types(const json& params)
 {
     const std::uint64_t started_ms = GetTickCount64();
@@ -1054,8 +1337,28 @@ scan_result_t scan_types(const json& params)
         result.elapsed_ms = GetTickCount64() - started_ms;
         return result;
     }
-    result.ok = true;
     result.pid = scope.pid();
+    if (params.contains("filter") && !params["filter"].is_string())
+    {
+        result.error = "Invalid RTTI filter: 'filter' must be a regular expression string.";
+        result.error_details = json{{"filter_value", json_value_preview(params["filter"])}};
+        result.elapsed_ms = GetTickCount64() - started_ms;
+        return result;
+    }
+    if (params.contains("module_filter") && !params["module_filter"].is_string())
+    {
+        result.error = "Invalid RTTI module_filter: expected a string.";
+        result.error_details = json{{"module_filter_value", json_value_preview(params["module_filter"])}};
+        result.elapsed_ms = GetTickCount64() - started_ms;
+        return result;
+    }
+    if (params.contains("module_name") && !params["module_name"].is_string())
+    {
+        result.error = "Invalid RTTI module_name: expected a string.";
+        result.error_details = json{{"module_name_value", json_value_preview(params["module_name"])}};
+        result.elapsed_ms = GetTickCount64() - started_ms;
+        return result;
+    }
     const std::string module_name = string_param(params, "module_name");
     const std::string filter_text = string_param(params, "filter");
     const std::string module_filter = lower_ascii(trim_ascii(string_param(params, "module_filter")));
@@ -1064,6 +1367,20 @@ scan_result_t scan_types(const json& params)
     if (scan_mode != "deep")
         scan_mode = "fast";
     const bool deep_scan = scan_mode == "deep";
+    const std::size_t max_results = static_cast<std::size_t>(numeric_param(params, "max_results", 2000, 1, 20000));
+    const std::uint64_t timeout_ms = numeric_param(params, "timeout_ms", 30000, 500, 120000);
+    const std::uint64_t module_limit = numeric_param(params, "module_limit", 0, 0, 4096);
+    auto fail_scan = [&](const std::string& message, json details = json::object()) -> scan_result_t {
+        result.ok = false;
+        result.error = message;
+        result.filter = filter_text;
+        result.module_filter = module_filter;
+        result.scan_mode = scan_mode;
+        result.timeout_ms = timeout_ms;
+        result.elapsed_ms = GetTickCount64() - started_ms;
+        result.error_details = std::move(details);
+        return result;
+    };
     std::optional<std::regex> filter;
     if (!filter_text.empty())
     {
@@ -1071,14 +1388,12 @@ scan_result_t scan_types(const json& params)
         {
             filter.emplace(filter_text, std::regex::icase);
         }
-        catch (...)
+        catch (const std::regex_error& e)
         {
-            filter.reset();
+            return fail_scan("Invalid RTTI filter regular expression.",
+                json{{"filter", filter_text}, {"regex_error", e.what()}, {"regex_code", static_cast<int>(e.code())}});
         }
     }
-    const std::size_t max_results = static_cast<std::size_t>(numeric_param(params, "max_results", 2000, 1, 20000));
-    const std::uint64_t timeout_ms = numeric_param(params, "timeout_ms", 30000, 500, 120000);
-    const std::uint64_t module_limit = numeric_param(params, "module_limit", 0, 0, 4096);
     const std::uint64_t default_unfiltered_cap = deep_scan ?
         std::max<std::uint64_t>(12000, static_cast<std::uint64_t>(max_results) * 24ull) :
         std::max<std::uint64_t>(4096, static_cast<std::uint64_t>(max_results) * 16ull);
@@ -1088,37 +1403,173 @@ scan_result_t scan_types(const json& params)
     std::uint64_t exact_type_descriptor_va = 0;
     std::uint64_t exact_col_va = 0;
     std::uint64_t hint_va = 0;
-    const bool has_exact_type_descriptor = parse_address_param(params, "type_descriptor_va", exact_type_descriptor_va) ||
-        parse_address_param(params, "type_va", exact_type_descriptor_va);
-    const bool has_exact_col = parse_address_param(params, "complete_object_locator_va", exact_col_va) ||
-        parse_address_param(params, "col_va", exact_col_va);
     std::uint64_t vtable_hint_va = 0;
-    const bool has_vtable_hint = parse_address_param(params, "vtable_va", vtable_hint_va) && vtable_hint_va != 0;
+    bool module_base_provided = false;
+    bool exact_type_descriptor_provided = false;
+    bool exact_col_provided = false;
+    bool vtable_hint_provided = false;
+    bool hint_provided = false;
+    std::string module_base_key;
+    std::string exact_type_descriptor_key;
+    std::string exact_col_key;
+    std::string vtable_hint_key;
+    std::string hint_key;
+    std::string module_base_value;
+    std::string exact_type_descriptor_value;
+    std::string exact_col_value;
+    std::string vtable_hint_value;
+    std::string hint_value;
+    std::string address_error;
+    if (!parse_address_selector(params, "module_base_va", "module_base", module_base, module_base_provided, module_base_key, module_base_value, address_error))
+        return fail_scan(address_error, json{{"selector_key", module_base_key}, {"selector_value", module_base_value}});
+    if (!parse_address_selector(params, "type_descriptor_va", "type_va", exact_type_descriptor_va, exact_type_descriptor_provided, exact_type_descriptor_key, exact_type_descriptor_value, address_error))
+        return fail_scan(address_error, json{{"selector_key", exact_type_descriptor_key}, {"selector_value", exact_type_descriptor_value}});
+    if (!parse_address_selector(params, "complete_object_locator_va", "col_va", exact_col_va, exact_col_provided, exact_col_key, exact_col_value, address_error))
+        return fail_scan(address_error, json{{"selector_key", exact_col_key}, {"selector_value", exact_col_value}});
+    if (!parse_address_selector(params, "vtable_va", nullptr, vtable_hint_va, vtable_hint_provided, vtable_hint_key, vtable_hint_value, address_error))
+        return fail_scan(address_error, json{{"selector_key", vtable_hint_key}, {"selector_value", vtable_hint_value}});
+    if (!parse_address_selector(params, "hint_va", nullptr, hint_va, hint_provided, hint_key, hint_value, address_error))
+        return fail_scan(address_error, json{{"selector_key", hint_key}, {"selector_value", hint_value}});
+    const bool has_exact_type_descriptor = exact_type_descriptor_provided;
+    const bool has_exact_col = exact_col_provided;
+    const bool has_vtable_hint = vtable_hint_provided && vtable_hint_va != 0;
+    std::vector<driver_bridge::module_info_t> available_modules;
+    bool available_modules_loaded = false;
+    auto load_available_modules = [&]() -> const std::vector<driver_bridge::module_info_t>& {
+        if (!available_modules_loaded)
+        {
+            available_modules = modules_for(scope.pid());
+            available_modules_loaded = true;
+        }
+        return available_modules;
+    };
+    auto find_available_by_base = [&](std::uint64_t base) -> std::optional<driver_bridge::module_info_t> {
+        if (base == 0)
+            return std::nullopt;
+        for (const auto& module : load_available_modules())
+        {
+            if (module.base == base)
+                return module;
+        }
+        return std::nullopt;
+    };
+    auto find_available_for_address = [&](std::uint64_t address) -> std::optional<driver_bridge::module_info_t> {
+        for (const auto& module : load_available_modules())
+        {
+            const std::uint64_t end = module.base + static_cast<std::uint64_t>(module.size);
+            if (module.base != 0 && address >= module.base && address < end)
+                return module;
+        }
+        return std::nullopt;
+    };
+    auto find_available_by_name = [&](const std::string& name) -> std::optional<driver_bridge::module_info_t> {
+        const std::string wanted = lower_ascii(name);
+        for (const auto& module : load_available_modules())
+        {
+            if (lower_ascii(module.name) == wanted)
+                return module;
+            if (!module.path.empty())
+            {
+                std::filesystem::path path(module.path);
+                if (lower_ascii(path.filename().string()) == wanted)
+                    return module;
+            }
+        }
+        return std::nullopt;
+    };
+    auto fail_module_selector = [&](const std::string& message,
+                                    const std::string& selector_kind,
+                                    const std::string& selector_key,
+                                    const std::string& selector_value) -> scan_result_t {
+        return fail_scan(message, selector_failure_details(scope.pid(),
+                                                           selector_kind,
+                                                           selector_key,
+                                                           selector_value,
+                                                           module_name,
+                                                           module_filter,
+                                                           include_system_modules,
+                                                           module_limit,
+                                                           load_available_modules()));
+    };
     bool explicit_module = false;
-    if (parse_address_param(params, "module_base_va", module_base) || parse_address_param(params, "module_base", module_base))
+    if (module_base_provided)
     {
         explicit_module = true;
-        if (auto module = find_module_by_base(scope.pid(), module_base))
+        if (auto module = find_available_by_base(module_base))
             modules.push_back(*module);
+        else
+            return fail_module_selector("RTTI module selector did not resolve a loaded module.", "module_base", module_base_key, module_base_value);
     }
-    else if ((has_vtable_hint && (hint_va = vtable_hint_va) != 0) ||
-             (has_exact_type_descriptor && (hint_va = exact_type_descriptor_va) != 0) ||
-             (has_exact_col && (hint_va = exact_col_va) != 0) ||
-             parse_address_param(params, "hint_va", hint_va))
+    else if (vtable_hint_provided || exact_type_descriptor_provided || exact_col_provided || hint_provided)
     {
         explicit_module = true;
-        if (auto module = find_module_for_address(scope.pid(), hint_va))
+        std::string selector_kind;
+        std::string selector_key;
+        std::string selector_value;
+        if (vtable_hint_provided && vtable_hint_va != 0)
+        {
+            hint_va = vtable_hint_va;
+            selector_kind = "vtable_hint";
+            selector_key = vtable_hint_key;
+            selector_value = vtable_hint_value;
+        }
+        else if (exact_type_descriptor_provided && exact_type_descriptor_va != 0)
+        {
+            hint_va = exact_type_descriptor_va;
+            selector_kind = "type_descriptor_hint";
+            selector_key = exact_type_descriptor_key;
+            selector_value = exact_type_descriptor_value;
+        }
+        else if (exact_col_provided && exact_col_va != 0)
+        {
+            hint_va = exact_col_va;
+            selector_kind = "complete_object_locator_hint";
+            selector_key = exact_col_key;
+            selector_value = exact_col_value;
+        }
+        else if (hint_provided)
+        {
+            selector_kind = "hint_va";
+            selector_key = hint_key;
+            selector_value = hint_value;
+        }
+        else if (vtable_hint_provided)
+        {
+            hint_va = vtable_hint_va;
+            selector_kind = "vtable_hint";
+            selector_key = vtable_hint_key;
+            selector_value = vtable_hint_value;
+        }
+        else if (exact_type_descriptor_provided)
+        {
+            hint_va = exact_type_descriptor_va;
+            selector_kind = "type_descriptor_hint";
+            selector_key = exact_type_descriptor_key;
+            selector_value = exact_type_descriptor_value;
+        }
+        else
+        {
+            hint_va = exact_col_va;
+            selector_kind = "complete_object_locator_hint";
+            selector_key = exact_col_key;
+            selector_value = exact_col_value;
+        }
+        if (auto module = find_available_for_address(hint_va))
             modules.push_back(*module);
+        else
+            return fail_module_selector("RTTI address selector did not resolve a loaded module.", selector_kind, selector_key, selector_value);
     }
     else if (!module_name.empty())
     {
         explicit_module = true;
-        if (auto module = find_module_by_name(scope.pid(), module_name))
+        if (auto module = find_available_by_name(module_name))
             modules.push_back(*module);
+        else
+            return fail_module_selector("RTTI module_name selector did not resolve a loaded module.", "module_name", "module_name", module_name);
     }
     else
     {
-        modules = modules_for(scope.pid());
+        modules = load_available_modules();
         std::stable_sort(modules.begin(), modules.end(), [](const driver_bridge::module_info_t& a, const driver_bridge::module_info_t& b) {
             const int pa = module_scan_priority(a);
             const int pb = module_scan_priority(b);
@@ -1137,7 +1588,10 @@ scan_result_t scan_types(const json& params)
         }), modules.end());
         if (module_limit != 0 && modules.size() > module_limit)
             modules.resize(static_cast<std::size_t>(module_limit));
+        if (!module_filter.empty() && modules.empty())
+            return fail_module_selector("RTTI module_filter matched no loaded modules.", "module_filter", "module_filter", module_filter);
     }
+    result.ok = true;
     diag::log_tagged_fmt("rtti",
                          "scan_types enter pid=%u module_name=%s module_count=%zu explicit=%d filter=%s module_filter=%s include_system=%d scan_mode=%s max_results=%zu timeout_ms=%llu hint_va=%s elapsed_ms=%llu",
                          scope.pid(),
@@ -1172,7 +1626,26 @@ scan_result_t scan_types(const json& params)
         {
             type_info_t hinted;
             if (type_from_vtable(scope.pid(), *module, vtable_hint_va, hinted))
+            {
                 merge_found(hinted);
+            }
+            else
+            {
+                return fail_scan("RTTI vtable_va selector did not resolve a valid RTTI type.",
+                    selector_failure_details(scope.pid(),
+                                             "vtable_hint",
+                                             vtable_hint_key,
+                                             vtable_hint_value,
+                                             module_name,
+                                             module_filter,
+                                             include_system_modules,
+                                             module_limit,
+                                             load_available_modules()));
+            }
+        }
+        else
+        {
+            return fail_module_selector("RTTI vtable_va selector did not resolve a loaded module.", "vtable_hint", vtable_hint_key, vtable_hint_value);
         }
     }
     for (const auto& module : modules)
@@ -1207,6 +1680,7 @@ scan_result_t scan_types(const json& params)
     std::sort(unfiltered.begin(), unfiltered.end(), [](const type_info_t& a, const type_info_t& b) {
         return a.name < b.name;
     });
+    result.type_index = build_type_index(unfiltered);
     result.unfiltered_type_count = unfiltered.size();
     for (const auto& type : unfiltered)
     {
@@ -1243,6 +1717,29 @@ scan_result_t scan_types(const json& params)
     result.filter = filter_text;
     result.module_filter = module_filter;
     result.scan_mode = scan_mode;
+    if ((has_exact_type_descriptor || has_exact_col) && result.types.empty())
+    {
+        result.ok = false;
+        const bool type_selector = has_exact_type_descriptor;
+        result.error = type_selector ?
+            "RTTI type_descriptor_va selector did not match a recovered RTTI type." :
+            "RTTI complete_object_locator_va selector did not match a recovered RTTI type.";
+        result.error_details = selector_failure_details(scope.pid(),
+                                                        type_selector ? "type_descriptor_hint" : "complete_object_locator_hint",
+                                                        type_selector ? exact_type_descriptor_key : exact_col_key,
+                                                        type_selector ? exact_type_descriptor_value : exact_col_value,
+                                                        module_name,
+                                                        module_filter,
+                                                        include_system_modules,
+                                                        module_limit,
+                                                        load_available_modules());
+        result.error_details["explicit_selector_fail_closed"] = true;
+        result.error_details["unfiltered_type_count"] = result.unfiltered_type_count;
+        result.error_details["type_descriptor_count"] = result.type_descriptor_count;
+        result.error_details["complete_object_locator_count"] = result.complete_object_locator_count;
+        result.error_details["vtable_count"] = result.vtable_count;
+        return result;
+    }
     diag::log_tagged_fmt("rtti",
                          "scan_types exit pid=%u count=%zu unfiltered=%zu deadline=%d cancelled=%d elapsed_ms=%llu",
                          scope.pid(),
@@ -1334,6 +1831,15 @@ void add_scan_diagnostics(json& out, const scan_result_t& scan, bool include_dia
     out["unfiltered_type_count"] = scan.unfiltered_type_count;
     out["sample_type_names"] = scan.sample_type_names;
     out["scanned_modules"] = include_diagnostics ? json(scan.scanned_modules) : json::array();
+}
+
+json scan_error_payload(const scan_result_t& scan, bool include_diagnostics)
+{
+    json out = scan.error_details.is_object() ? scan.error_details : json::object();
+    if (!scan.error.empty())
+        out["error"] = scan.error;
+    add_scan_diagnostics(out, scan, include_diagnostics);
+    return out;
 }
 
 std::uint64_t approximate_function_start(std::uint32_t pid, std::uint64_t ref_va)
@@ -1524,10 +2030,10 @@ void update_value_registers(std::uint32_t pid,
 tool_result_t scan(const json& params)
 {
     auto scan = scan_types(params);
-    if (!scan.ok)
-        return tool_result_t::error(scan.error);
-    const std::size_t max_vtables_per_type = static_cast<std::size_t>(numeric_param(params, "max_vtables_per_type", 64, 1, 512));
     const bool include_diagnostics = bool_param(params, "include_diagnostics", true);
+    if (!scan.ok)
+        return tool_result_t::error(scan.error, scan_error_payload(scan, include_diagnostics));
+    const std::size_t max_vtables_per_type = static_cast<std::size_t>(numeric_param(params, "max_vtables_per_type", 64, 1, 512));
     json arr = json::array();
     for (const auto& type : scan.types)
         arr.push_back(type_to_json(type, max_vtables_per_type));
@@ -1547,19 +2053,27 @@ tool_result_t find_type(const json& params)
     json scan_params = params;
     scan_params["filter"] = pattern;
     auto scan = scan_types(scan_params);
-    if (!scan.ok)
-        return tool_result_t::error(scan.error);
-    const std::size_t max_vtables_per_type = static_cast<std::size_t>(numeric_param(params, "max_vtables_per_type", 64, 1, 512));
     const bool include_diagnostics = bool_param(params, "include_diagnostics", true);
+    if (!scan.ok)
+        return tool_result_t::error(scan.error, scan_error_payload(scan, include_diagnostics));
+    const std::size_t max_vtables_per_type = static_cast<std::size_t>(numeric_param(params, "max_vtables_per_type", 64, 1, 512));
     json matches = json::array();
     for (const auto& type : scan.types)
-        matches.push_back(type_to_json(type, max_vtables_per_type));
+    {
+        json row = type_to_json(type, max_vtables_per_type);
+        attach_hierarchy(row, type, scan.type_index, max_vtables_per_type);
+        matches.push_back(std::move(row));
+    }
     json result;
     result["pattern"] = pattern;
     result["matches"] = std::move(matches);
     result["count"] = result["matches"].size();
     if (!scan.types.empty())
-        result["best"] = type_to_json(scan.types.front(), max_vtables_per_type);
+    {
+        json best = type_to_json(scan.types.front(), max_vtables_per_type);
+        attach_hierarchy(best, scan.types.front(), scan.type_index, max_vtables_per_type);
+        result["best"] = std::move(best);
+    }
     add_scan_diagnostics(result, scan, include_diagnostics);
     return tool_result_t::ok(result);
 }
@@ -1573,6 +2087,7 @@ tool_result_t list_hierarchy(const json& params)
     const std::string query = string_param(params, "type_name_or_va");
     if (query.empty())
         return tool_result_t::error("'type_name_or_va' is required.");
+    const bool include_diagnostics = bool_param(params, "include_diagnostics", true);
     std::uint64_t va = 0;
     const auto parsed_va = sa_parse_address(query);
     const bool query_is_va = parsed_va.has_value();
@@ -1601,20 +2116,39 @@ tool_result_t list_hierarchy(const json& params)
                 if (match)
                 {
                     const std::size_t max_vtables_per_type = static_cast<std::size_t>(numeric_param(params, "max_vtables_per_type", 64, 1, 512));
-                    json result = type_to_json(hinted, max_vtables_per_type);
-                    json hierarchy = json::array();
-                    for (std::size_t i = 0; i < hinted.base_classes.size(); ++i)
+                    json hierarchy_scan_params = params;
+                    hierarchy_scan_params["module_base_va"] = sa_format_address(module->base);
+                    hierarchy_scan_params["type_descriptor_va"] = sa_format_address(hinted.type_descriptor_va);
+                    hierarchy_scan_params["max_results"] = 1;
+                    auto hierarchy_scan = scan_types(hierarchy_scan_params);
+                    type_info_t resolved = hinted;
+                    std::vector<type_resolution_record_t> index;
+                    if (hierarchy_scan.ok)
                     {
-                        json row;
-                        row["order"] = i;
-                        row["name"] = hinted.base_classes[i];
-                        row["vtable_va"] = nullptr;
-                        row["type_descriptor_va"] = i < hinted.base_class_records.size() && hinted.base_class_records[i].type_descriptor_va ?
-                            json(sa_format_address(hinted.base_class_records[i].type_descriptor_va)) : json(nullptr);
-                        hierarchy.push_back(std::move(row));
+                        index = hierarchy_scan.type_index;
+                        for (const auto& scanned_type : hierarchy_scan.types)
+                        {
+                            if (scanned_type.type_descriptor_va == hinted.type_descriptor_va)
+                            {
+                                resolved = scanned_type;
+                                break;
+                            }
+                        }
                     }
-                    result["hierarchy"] = std::move(hierarchy);
+                    if (index.empty())
+                    {
+                        std::vector<type_info_t> fallback_types;
+                        fallback_types.push_back(resolved);
+                        index = build_type_index(fallback_types);
+                    }
+                    json result = type_to_json(resolved, max_vtables_per_type);
+                    attach_hierarchy(result, resolved, index, max_vtables_per_type);
                     result["resolution"] = "vtable_hint_col";
+                    if (hierarchy_scan.ok)
+                        add_scan_diagnostics(result, hierarchy_scan, include_diagnostics);
+                    else
+                        return tool_result_t::error(hierarchy_scan.error.empty() ? "Focused RTTI hierarchy scan failed." : hierarchy_scan.error,
+                            scan_error_payload(hierarchy_scan, include_diagnostics));
                     return tool_result_t::ok(result);
                 }
             }
@@ -1627,7 +2161,7 @@ tool_result_t list_hierarchy(const json& params)
         scan_params["max_results"] = 256;
     auto scan = scan_types(scan_params);
     if (!scan.ok)
-        return tool_result_t::error(scan.error);
+        return tool_result_t::error(scan.error, scan_error_payload(scan, include_diagnostics));
     const auto& types = scan.types;
     diag::log_tagged_fmt("rtti",
                          "list_hierarchy scanned pid=%u query=%s query_is_va=%d types=%zu elapsed_ms=%llu",
@@ -1645,24 +2179,8 @@ tool_result_t list_hierarchy(const json& params)
             continue;
         const std::size_t max_vtables_per_type = static_cast<std::size_t>(numeric_param(params, "max_vtables_per_type", 64, 1, 512));
         json result = type_to_json(type, max_vtables_per_type);
-        json hierarchy = json::array();
-        std::map<std::string, type_info_t> by_name;
-        for (const auto& candidate : types)
-            by_name[lower_ascii(candidate.name)] = candidate;
-        for (std::size_t i = 0; i < type.base_classes.size(); ++i)
-        {
-            json row;
-            row["order"] = i;
-            row["name"] = type.base_classes[i];
-            auto parent = by_name.find(lower_ascii(type.base_classes[i]));
-            row["vtable_va"] = parent != by_name.end() && parent->second.vtable_va ? json(sa_format_address(parent->second.vtable_va)) : json(nullptr);
-            row["type_descriptor_va"] = i < type.base_class_records.size() && type.base_class_records[i].type_descriptor_va ?
-                json(sa_format_address(type.base_class_records[i].type_descriptor_va)) :
-                (parent != by_name.end() && parent->second.type_descriptor_va ? json(sa_format_address(parent->second.type_descriptor_va)) : json(nullptr));
-            hierarchy.push_back(std::move(row));
-        }
-        result["hierarchy"] = std::move(hierarchy);
-        add_scan_diagnostics(result, scan, bool_param(params, "include_diagnostics", true));
+        attach_hierarchy(result, type, scan.type_index, max_vtables_per_type);
+        add_scan_diagnostics(result, scan, include_diagnostics);
         diag::log_tagged_fmt("rtti",
                              "list_hierarchy match pid=%u query=%s type=%s bases=%zu elapsed_ms=%llu",
                              scope.pid(),
@@ -1679,7 +2197,7 @@ tool_result_t list_hierarchy(const json& params)
                          types.size(),
                          static_cast<unsigned long long>(GetTickCount64() - started_ms));
     json details;
-    add_scan_diagnostics(details, scan, bool_param(params, "include_diagnostics", true));
+    add_scan_diagnostics(details, scan, include_diagnostics);
     return tool_result_t::error("RTTI type not found.", details);
 }
 

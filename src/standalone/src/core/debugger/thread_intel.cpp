@@ -3,6 +3,7 @@
 
 #include "thread_intel.hpp"
 
+#include "../analysis/symbol_store.hpp"
 #include "standalone_driver.hpp"
 
 #include <algorithm>
@@ -23,6 +24,8 @@ namespace {
 struct rip_sample_t {
     std::uint64_t rip = 0;
     std::string module;
+    std::string function_name;
+    std::string source;
     std::uint64_t module_offset = 0;
 };
 
@@ -31,6 +34,12 @@ struct thread_sample_state_t {
     std::vector<rip_sample_t> samples;
     std::uint64_t cpu_start_100ns = 0;
     std::uint64_t cpu_end_100ns = 0;
+    std::uint64_t cycle_start = 0;
+    std::uint64_t cycle_end = 0;
+    bool cpu_start_available = false;
+    bool cpu_end_available = false;
+    bool cycle_start_available = false;
+    bool cycle_end_available = false;
 };
 
 std::string lower_copy(std::string s)
@@ -46,10 +55,42 @@ std::string fmt_addr(std::uint64_t va)
     return os.str();
 }
 
-std::uint64_t query_thread_cpu_time(std::uint32_t tid)
+std::uint64_t filetime_to_100ns(const FILETIME& ft)
 {
-    (void)tid;
-    return 0;
+    return (static_cast<std::uint64_t>(ft.dwHighDateTime) << 32) | static_cast<std::uint64_t>(ft.dwLowDateTime);
+}
+
+struct thread_timing_sample_t {
+    std::uint64_t cpu_100ns = 0;
+    std::uint64_t cycles = 0;
+    bool cpu_available = false;
+    bool cycles_available = false;
+};
+
+thread_timing_sample_t query_thread_timing(std::uint32_t tid)
+{
+    thread_timing_sample_t sample;
+    HANDLE thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
+    if (!thread)
+        return sample;
+
+    FILETIME create_time{};
+    FILETIME exit_time{};
+    FILETIME kernel_time{};
+    FILETIME user_time{};
+    if (GetThreadTimes(thread, &create_time, &exit_time, &kernel_time, &user_time)) {
+        sample.cpu_100ns = filetime_to_100ns(kernel_time) + filetime_to_100ns(user_time);
+        sample.cpu_available = true;
+    }
+
+    ULONG64 cycles = 0;
+    if (QueryThreadCycleTime(thread, &cycles)) {
+        sample.cycles = static_cast<std::uint64_t>(cycles);
+        sample.cycles_available = true;
+    }
+
+    CloseHandle(thread);
+    return sample;
 }
 
 std::string state_name(std::uint32_t state)
@@ -111,10 +152,11 @@ bool ensure_process_context(std::uint32_t requested_pid, std::uint32_t& resolved
     return true;
 }
 
-rip_sample_t describe_rip(std::uint64_t rip, const std::vector<driver_bridge::module_info_t>& modules)
+rip_sample_t describe_rip(std::uint64_t rip, const std::vector<driver_bridge::module_info_t>& modules, const char* source)
 {
     rip_sample_t sample;
     sample.rip = rip;
+    sample.source = source ? source : "context";
     for (const auto& module : modules) {
         const std::uint64_t end = module.base + module.size;
         if (rip >= module.base && rip < end) {
@@ -123,6 +165,11 @@ rip_sample_t describe_rip(std::uint64_t rip, const std::vector<driver_bridge::mo
             break;
         }
     }
+    std::string exact = symbol_store::resolve_symbol_exact(rip);
+    if (exact.empty())
+        exact = symbol_store::resolve_symbol(rip);
+    if (!exact.empty())
+        sample.function_name = std::move(exact);
     return sample;
 }
 
@@ -145,7 +192,7 @@ bool sample_thread_rip(std::uint32_t tid,
     } else {
         return false;
     }
-    out = describe_rip(ctx.rip, modules);
+    out = describe_rip(ctx.rip, modules, "suspended_context");
     return out.rip != 0;
 }
 
@@ -158,8 +205,20 @@ double module_role_score(const std::string& module, const char* const* names, st
     return 0.0;
 }
 
+double text_role_score(const std::string& text, const char* const* names, std::size_t count)
+{
+    const std::string lower = lower_copy(text);
+    double score = 0.0;
+    for (std::size_t i = 0; i < count; ++i)
+        if (lower.find(names[i]) != std::string::npos)
+            score = (std::max)(score, 1.0);
+    return score;
+}
+
 std::string module_hint(const rip_sample_t& sample)
 {
+    if (!sample.function_name.empty())
+        return sample.function_name;
     if (sample.module.empty())
         return "unknown";
     return sample.module + "+" + fmt_addr(sample.module_offset);
@@ -175,23 +234,43 @@ nlohmann::json classify_one(const thread_sample_state_t& t,
     static const char* audio_mods[] = {"xaudio", "dsound", "audioses", "mmdevapi", "openal", "fmod", "wwise"};
     static const char* physics_mods[] = {"physx", "havok", "bullet", "chaos", "physics"};
     static const char* wait_mods[] = {"ntdll", "kernelbase", "kernel32"};
+    static const char* render_funcs[] = {"present", "swapchain", "render", "draw", "paint", "frame", "d3d", "dxgi", "vulkan", "opengl", "imgui"};
+    static const char* network_funcs[] = {"recv", "send", "select", "poll", "socket", "connect", "accept", "http", "tls", "ssl", "websocket", "network"};
+    static const char* audio_funcs[] = {"audio", "sound", "voice", "mix", "xaudio", "dsound", "fmod", "wwise", "openal"};
+    static const char* physics_funcs[] = {"physics", "simulate", "collision", "rigid", "constraint", "havok", "physx", "bullet", "chaos"};
+    static const char* main_funcs[] = {"winmain", "main", "wndproc", "dispatchmessage", "peekmessage", "getmessage", "tick", "update", "logic", "game"};
+    static const char* wait_funcs[] = {"waitforsingleobject", "waitformultipleobjects", "ntwait", "sleep", "condition", "futex", "delayexecution"};
 
     double render = 0.0;
     double network = 0.0;
     double audio = 0.0;
     double physics = 0.0;
+    double main_logic = 0.0;
     double idle = 0.0;
     std::map<std::string, std::uint32_t> module_counts;
+    std::map<std::string, std::uint32_t> function_counts;
+    std::map<std::string, std::uint32_t> source_counts;
     nlohmann::json evidence = nlohmann::json::array();
 
     for (const auto& sample : t.samples) {
         if (!sample.module.empty())
             ++module_counts[sample.module];
+        if (!sample.function_name.empty())
+            ++function_counts[sample.function_name];
+        if (!sample.source.empty())
+            ++source_counts[sample.source];
         render += module_role_score(sample.module, render_mods, sizeof(render_mods) / sizeof(render_mods[0]));
         network += module_role_score(sample.module, network_mods, sizeof(network_mods) / sizeof(network_mods[0]));
         audio += module_role_score(sample.module, audio_mods, sizeof(audio_mods) / sizeof(audio_mods[0]));
         physics += module_role_score(sample.module, physics_mods, sizeof(physics_mods) / sizeof(physics_mods[0]));
         idle += module_role_score(sample.module, wait_mods, sizeof(wait_mods) / sizeof(wait_mods[0]));
+        const std::string text = sample.module + " " + sample.function_name;
+        render += text_role_score(text, render_funcs, sizeof(render_funcs) / sizeof(render_funcs[0])) * 1.35;
+        network += text_role_score(text, network_funcs, sizeof(network_funcs) / sizeof(network_funcs[0])) * 1.35;
+        audio += text_role_score(text, audio_funcs, sizeof(audio_funcs) / sizeof(audio_funcs[0])) * 1.35;
+        physics += text_role_score(text, physics_funcs, sizeof(physics_funcs) / sizeof(physics_funcs[0])) * 1.35;
+        main_logic += text_role_score(text, main_funcs, sizeof(main_funcs) / sizeof(main_funcs[0])) * 1.2;
+        idle += text_role_score(text, wait_funcs, sizeof(wait_funcs) / sizeof(wait_funcs[0])) * 1.2;
     }
 
     const double denom = t.samples.empty() ? 1.0 : static_cast<double>(t.samples.size());
@@ -199,11 +278,21 @@ nlohmann::json classify_one(const thread_sample_state_t& t,
     network /= denom;
     audio /= denom;
     physics /= denom;
+    main_logic /= denom;
     idle /= denom;
+
+    const std::uint64_t cycle_delta = t.cycle_end > t.cycle_start ? t.cycle_end - t.cycle_start : 0;
+    const bool cpu_time_available = t.cpu_start_available && t.cpu_end_available;
+    const bool cycle_available = t.cycle_start_available && t.cycle_end_available;
+    const bool cycle_active = !cpu_time_available && cycle_available && cycle_delta >= 1000000ull;
 
     if (cpu_percent >= 8.0) {
         render += 0.12;
         evidence.push_back("sustained_cpu_percent=" + std::to_string(cpu_percent));
+    }
+    if (cycle_active) {
+        main_logic += 0.08;
+        evidence.push_back("thread_cycle_delta=" + std::to_string(cycle_delta));
     }
     if (t.info.priority >= 10) {
         render += 0.05;
@@ -225,19 +314,21 @@ nlohmann::json classify_one(const thread_sample_state_t& t,
         }
     };
 
-    choose("render", (std::min)(0.9, render), "render_module_rip_samples");
-    choose("network", (std::min)(0.9, network), "network_module_rip_samples");
-    choose("audio", (std::min)(0.86, audio), "audio_module_rip_samples");
-    choose("physics", (std::min)(0.86, physics), "physics_module_rip_samples");
+    choose("render", (std::min)(0.9, render), "render_api_or_rip_hints");
+    choose("network", (std::min)(0.9, network), "network_api_or_rip_hints");
+    choose("audio", (std::min)(0.86, audio), "audio_api_or_rip_hints");
+    choose("physics", (std::min)(0.86, physics), "physics_api_or_rip_hints");
+    choose("main_or_logic", (std::min)(0.84, main_logic), "main_or_logic_rip_hints");
     if (idle > confidence && idle > 0.55) {
         role = "idle_or_wait";
         confidence = (std::min)(0.78, idle);
+        evidence.push_back("wait_function_or_module_rip_samples");
     }
     if (t.info.tid == lowest_tid && confidence < 0.58) {
         role = "main_or_logic";
         confidence = 0.52 + (cpu_percent >= 3.0 ? 0.08 : 0.0);
     }
-    if (role == "worker_or_unknown" && cpu_percent >= 5.0) {
+    if (role == "worker_or_unknown" && (cpu_percent >= 5.0 || cycle_active)) {
         role = "active_worker_or_logic";
         confidence = 0.46;
     }
@@ -255,6 +346,30 @@ nlohmann::json classify_one(const thread_sample_state_t& t,
     while (modules.size() > 8)
         modules.erase(modules.size() - 1);
 
+    nlohmann::json functions = nlohmann::json::array();
+    for (const auto& [name, count] : function_counts) {
+        nlohmann::json f;
+        f["function"] = name;
+        f["hits"] = count;
+        functions.push_back(std::move(f));
+    }
+    std::sort(functions.begin(), functions.end(), [](const nlohmann::json& a, const nlohmann::json& b) {
+        return a.value("hits", 0u) > b.value("hits", 0u);
+    });
+    while (functions.size() > 8)
+        functions.erase(functions.size() - 1);
+
+    nlohmann::json sources = nlohmann::json::array();
+    for (const auto& [name, count] : source_counts) {
+        nlohmann::json s;
+        s["source"] = name;
+        s["hits"] = count;
+        sources.push_back(std::move(s));
+    }
+    std::sort(sources.begin(), sources.end(), [](const nlohmann::json& a, const nlohmann::json& b) {
+        return a.value("hits", 0u) > b.value("hits", 0u);
+    });
+
     nlohmann::json out;
     out["tid"] = t.info.tid;
     out["role"] = role;
@@ -262,14 +377,34 @@ nlohmann::json classify_one(const thread_sample_state_t& t,
     out["priority"] = t.info.priority;
     out["state"] = state_name(t.info.state);
     out["cpu_percent"] = cpu_percent;
+    out["cpu_start_100ns"] = t.cpu_start_100ns;
+    out["cpu_end_100ns"] = t.cpu_end_100ns;
+    out["cpu_delta_100ns"] = t.cpu_end_100ns > t.cpu_start_100ns ? t.cpu_end_100ns - t.cpu_start_100ns : 0;
+    out["cpu_measurement_available"] = cpu_time_available;
+    out["cycle_start"] = t.cycle_start;
+    out["cycle_end"] = t.cycle_end;
+    out["cycle_delta"] = cycle_delta;
+    out["cycle_measurement_available"] = cycle_available;
     out["sample_count"] = sample_count;
     out["observed_sample_count"] = t.samples.size();
     out["hot_modules"] = std::move(modules);
+    out["hot_functions"] = std::move(functions);
+    out["sample_sources"] = std::move(sources);
+    out["role_scores"] = {
+        {"render", render},
+        {"network", network},
+        {"audio", audio},
+        {"physics", physics},
+        {"main_or_logic", main_logic},
+        {"idle_or_wait", idle}
+    };
     out["evidence"] = std::move(evidence);
     if (!t.samples.empty()) {
         const auto& last = t.samples.back();
         out["last_rip"] = fmt_addr(last.rip);
         out["last_module_hint"] = module_hint(last);
+        out["last_function_name"] = last.function_name;
+        out["last_sample_source"] = last.source;
     } else if (t.info.rip) {
         out["last_rip"] = fmt_addr(t.info.rip);
     }
@@ -313,13 +448,20 @@ bool classify_threads(const classify_options_t& input,
     for (const auto& th : threads) {
         thread_sample_state_t st;
         st.info = th;
-        st.cpu_start_100ns = query_thread_cpu_time(th.tid);
+        const thread_timing_sample_t timing = query_thread_timing(th.tid);
+        st.cpu_start_100ns = timing.cpu_100ns;
+        st.cycle_start = timing.cycles;
+        st.cpu_start_available = timing.cpu_available;
+        st.cycle_start_available = timing.cycles_available;
+        if (th.rip != 0)
+            st.samples.push_back(describe_rip(th.rip, modules, "enumerated_thread"));
         if (th.tid < lowest_tid)
             lowest_tid = th.tid;
         states.push_back(std::move(st));
     }
 
     const std::uint32_t sample_count = (std::max)(1u, options.sample_ms / options.interval_ms);
+    const auto sample_started = std::chrono::steady_clock::now();
     for (std::uint32_t i = 0; i < sample_count; ++i) {
         for (auto& st : states) {
             rip_sample_t sample;
@@ -330,14 +472,28 @@ bool classify_threads(const classify_options_t& input,
             std::this_thread::sleep_for(std::chrono::milliseconds(options.interval_ms));
     }
 
-    for (auto& st : states)
-        st.cpu_end_100ns = query_thread_cpu_time(st.info.tid);
+    const auto sample_elapsed_ms_raw = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - sample_started).count());
+    const std::uint64_t sample_elapsed_ms = (std::max<std::uint64_t>)(1, sample_elapsed_ms_raw);
+
+    for (auto& st : states) {
+        const thread_timing_sample_t timing = query_thread_timing(st.info.tid);
+        st.cpu_end_100ns = timing.cpu_100ns;
+        st.cycle_end = timing.cycles;
+        st.cpu_end_available = timing.cpu_available;
+        st.cycle_end_available = timing.cycles_available;
+    }
 
     nlohmann::json arr = nlohmann::json::array();
     for (const auto& st : states) {
-        const std::uint64_t delta = st.cpu_end_100ns > st.cpu_start_100ns ? st.cpu_end_100ns - st.cpu_start_100ns : 0;
-        const double cpu_percent = options.sample_ms ? (static_cast<double>(delta) / (static_cast<double>(options.sample_ms) * 10000.0)) * 100.0 : 0.0;
-        arr.push_back(classify_one(st, lowest_tid, cpu_percent, sample_count));
+        const bool cpu_time_available = st.cpu_start_available && st.cpu_end_available;
+        const std::uint64_t cpu_delta = st.cpu_end_100ns > st.cpu_start_100ns ? st.cpu_end_100ns - st.cpu_start_100ns : 0;
+        const double cpu_percent = cpu_time_available ? (static_cast<double>(cpu_delta) / (static_cast<double>(sample_elapsed_ms) * 10000.0)) * 100.0 : 0.0;
+        nlohmann::json row = classify_one(st, lowest_tid, cpu_percent, sample_count);
+        row["cpu_percent_available"] = cpu_time_available;
+        row["cpu_percent_source"] = cpu_time_available ? "GetThreadTimes" : "unavailable";
+        row["kernel_only_capture"] = !cpu_time_available && !(st.cycle_start_available && st.cycle_end_available);
+        arr.push_back(std::move(row));
     }
 
     std::sort(arr.begin(), arr.end(), [](const nlohmann::json& a, const nlohmann::json& b) {
@@ -350,11 +506,13 @@ bool classify_threads(const classify_options_t& input,
 
     out["process_id"] = pid;
     out["sample_ms"] = options.sample_ms;
+    out["sample_elapsed_ms"] = sample_elapsed_ms;
     out["interval_ms"] = options.interval_ms;
     out["thread_count"] = threads.size();
     out["threads"] = std::move(arr);
     out["limitations"] = nlohmann::json::array({
-        "roles are heuristic and based on bounded RIP samples, module names, thread state, priority, and CPU time deltas",
+        "roles are heuristic and based on kernel-driver thread enumeration, bounded RIP samples, module names, thread state, priority, CPU time, and thread cycle deltas when available",
+        "user-mode OpenThread/GetThreadTimes/QueryThreadCycleTime timing may be unavailable for protected or inaccessible threads",
         "threads blocked in waits may hide their eventual application callback role",
         "render and network confidence improves when sampling catches API module frames"
     });

@@ -14,6 +14,7 @@
 #include "imgui/imgui_internal.h"
 #include "../../ui/theme.hpp"
 #include "../../ui/ui_anim.hpp"
+#include "../../ui/components.hpp"
 #include "../../infra/event_bus.hpp"
 #include "../../infra/work_queue.hpp"
 #include "helpers/diag_log.hpp"
@@ -589,6 +590,27 @@ void draw_panel_header(ImDrawList* dl, ImVec2 org, float width, const aida::ui::
                 aida::ui::with_alpha(th.text_primary, alpha), label);
 }
 
+bool same_line_if_fits(float next_w, float spacing = 8.f)
+{
+    if (ImGui::GetContentRegionAvail().x >= next_w + spacing) {
+        ImGui::SameLine(0.f, spacing);
+        return true;
+    }
+    return false;
+}
+
+float pill_width(const char* label)
+{
+    return ImGui::CalcTextSize(label ? label : "").x + 28.f;
+}
+
+void status_pill(const char* label, bool ok, bool neutral_when_false = false)
+{
+    aida::ui::pill_kind_t kind = ok ? aida::ui::pill_kind_t::success :
+        (neutral_when_false ? aida::ui::pill_kind_t::neutral : aida::ui::pill_kind_t::warning);
+    aida::ui::pill_kind(label, kind, aida::ui::size_t_::sm, false);
+}
+
 const char* install_state_label(const aida::burp::camoufox::install::status_t& s)
 {
     if (s.state == aida::burp::camoufox::install::install_state_t::ok) return "Ready";
@@ -762,6 +784,19 @@ void render_status_header(float pos_x, float pos_y, float width, float height,
         dl->AddText(ImVec2(org.x + width - esz.x - 12.f, org.y + 22.f),
                     aida::ui::with_alpha(th.error, alpha), err_line.c_str());
     }
+
+    const bool native_ua = !s.ua_override &&
+        (s.effective_ua_policy.empty() || s.effective_ua_policy == "camoufox_native");
+    ImGui::SetCursorPos(ImVec2(pos_x + 28.f, pos_y + 39.f));
+    status_pill("Camoufox only", true);
+    if (same_line_if_fits(pill_width("WebRTC blocked")))
+        status_pill("WebRTC blocked", s.webrtc_blocked || s.state == aida::burp::camoufox::bridge_state_t::stopped, true);
+    if (same_line_if_fits(pill_width("Native UA")))
+        status_pill("Native UA", native_ua, true);
+    if (same_line_if_fits(pill_width("Page verified")))
+        status_pill("Page verified", s.page_verified, true);
+    if (same_line_if_fits(pill_width("Privacy verified")))
+        status_pill("Privacy verified", s.privacy_verified, true);
 }
 
 void render_bridge_controls(float pos_x, float pos_y, float width, float height,
@@ -792,28 +827,25 @@ void render_bridge_controls(float pos_x, float pos_y, float width, float height,
     if (ready || starting) ImGui::BeginDisabled();
     if (ImGui::Button("Start", ImVec2(80.f, 26.f))) { run_start_bridge(); }
     if (ready || starting) ImGui::EndDisabled();
-    ImGui::SameLine();
+    same_line_if_fits(80.f);
 
     if (stopped || starting) ImGui::BeginDisabled();
     if (ImGui::Button("Stop", ImVec2(80.f, 26.f))) { run_stop_bridge(); }
     if (stopped || starting) ImGui::EndDisabled();
-    ImGui::SameLine();
+    same_line_if_fits(110.f);
 
     if (!ready) ImGui::BeginDisabled();
     if (ImGui::Button("Reset State", ImVec2(110.f, 26.f))) { run_reset_state(); }
     if (!ready) ImGui::EndDisabled();
-    ImGui::SameLine();
+    same_line_if_fits(86.f);
 
     ImGui::Checkbox("Headless", &g_state.cfg_headless);
-    ImGui::SameLine();
+    same_line_if_fits(88.f);
     ImGui::Checkbox("Humanize", &g_state.cfg_humanize);
-    ImGui::SameLine();
+    same_line_if_fits(108.f);
     ImGui::Checkbox("Block Images", &g_state.cfg_block_images);
-    ImGui::SameLine();
-    bool webrtc_locked = true;
-    ImGui::BeginDisabled();
-    ImGui::Checkbox("WebRTC Guard", &webrtc_locked);
-    ImGui::EndDisabled();
+    same_line_if_fits(pill_width("WebRTC blocked"));
+    status_pill("WebRTC blocked", true);
 
     ImGui::PopID();
 }
@@ -844,14 +876,14 @@ void render_url_bar(float pos_x, float pos_y, float width, float height,
     ImGui::SetNextItemWidth(input_w);
     ImGui::InputTextWithHint("##headless_url", "https://example.com",
                              g_state.url_input, sizeof(g_state.url_input));
-    ImGui::SameLine();
+    same_line_if_fits(90.f);
     if (!ready) ImGui::BeginDisabled();
     if (ImGui::Button("Navigate", ImVec2(90.f, 26.f))) {
         run_navigate(std::string(g_state.url_input));
     }
-    ImGui::SameLine();
+    same_line_if_fits(90.f);
     if (ImGui::Button("Reload", ImVec2(90.f, 26.f))) { run_reload(); }
-    ImGui::SameLine();
+    same_line_if_fits(110.f);
     if (ImGui::Button("Screenshot", ImVec2(110.f, 26.f))) { run_screenshot(); }
     if (!ready) ImGui::EndDisabled();
 
@@ -1330,8 +1362,8 @@ void render(float pos_x, float pos_y, float width, float height,
     const float content_w = width - pad_x * 2.f;
     float cursor_y = 0.f;
 
-    render_status_header(pad_x, cursor_y, content_w, 40.f, th, alpha);
-    cursor_y += 44.f;
+    render_status_header(pad_x, cursor_y, content_w, 66.f, th, alpha);
+    cursor_y += 70.f;
 
     {
         const char* lbl = g_state.show_install_panel ? "Hide install panel" : "Show install panel";
@@ -1360,11 +1392,13 @@ void render(float pos_x, float pos_y, float width, float height,
         cursor_y += consumed + 6.f;
     }
 
-    render_bridge_controls(pad_x, cursor_y, content_w, 40.f, th, alpha);
-    cursor_y += 44.f;
+    const float controls_h = content_w < 760.f ? 72.f : 40.f;
+    render_bridge_controls(pad_x, cursor_y, content_w, controls_h, th, alpha);
+    cursor_y += controls_h + 4.f;
 
-    render_url_bar(pad_x, cursor_y, content_w, 40.f, th, alpha);
-    cursor_y += 44.f;
+    const float url_h = content_w < 640.f ? 72.f : 40.f;
+    render_url_bar(pad_x, cursor_y, content_w, url_h, th, alpha);
+    cursor_y += url_h + 4.f;
 
     const float split_y0 = cursor_y;
     const float split_h  = std::max(120.f, height - split_y0 - 8.f);

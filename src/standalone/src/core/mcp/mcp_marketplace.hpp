@@ -1,8 +1,10 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <atomic>
 #include <thread>
@@ -50,8 +52,8 @@ struct installed_server_t
     std::string command;
     std::vector<std::string> args;
     std::map<std::string, std::string> env;
-    bool        enabled = true;
-    bool        auto_connect = true;
+    bool        enabled = false;
+    bool        auto_connect = false;
 };
 
 
@@ -74,6 +76,18 @@ enum class install_state_t
 
 
 void search_async(const std::string& query, registry_t reg = registry_t::npm);
+
+
+std::string registry_label(registry_t reg);
+
+
+std::string install_root();
+
+
+installed_server_t preview_install(const package_info_t& pkg);
+
+
+std::string launch_command_preview(const installed_server_t& srv);
 
 
 search_state_t get_search_state();
@@ -104,6 +118,9 @@ void activate_server(const installed_server_t& srv);
 
 
 void deactivate_server(const std::string& package_name);
+
+
+bool set_server_policy(const std::string& package_name, bool enabled, bool auto_connect);
 
 
 void load_installed(const std::string& json_str);

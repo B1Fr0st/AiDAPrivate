@@ -5070,14 +5070,16 @@ nlohmann::json build_launch_args(const launch_config_t& cfg)
     j["webrtc_policy"] = "disabled";
     j["privacy_fail_closed"] = true;
     const bool block_service_workers = env_flag_enabled_a("AIDA_CAMOUFOX_BLOCK_SERVICE_WORKERS");
-    const bool fast_visible_fallback = env_flag_enabled_a("AIDA_CAMOUFOX_FAST_VISIBLE_FALLBACK");
+    const bool fast_visible_fallback_requested = env_flag_enabled_a("AIDA_CAMOUFOX_FAST_VISIBLE_FALLBACK");
+    if (fast_visible_fallback_requested)
+        diag::log_tagged("camoufox", "ignored_fast_fallback env_flag=AIDA_CAMOUFOX_FAST_VISIBLE_FALLBACK forced_launch_path=async_camoufox");
     j["service_workers"] = block_service_workers ? std::string("block") : std::string("allow");
     j["block_service_workers"] = block_service_workers;
     const std::string ua_policy = normalize_camoufox_ua_policy_for_sidecar(
         cfg.ua_policy,
         !trim_launch_token(cfg.user_agent).empty());
     j["ua_policy"] = ua_policy;
-    j["aida_fast_visible_launch"] = fast_visible_fallback;
+    j["aida_fast_visible_launch"] = false;
     j["aida_launch_policy_marker"] = "aida_camoufox_bridge_20260620_crash_diag_1";
     if (!cfg.user_agent.empty())
         j["user_agent"] = cfg.user_agent;

@@ -852,7 +852,7 @@ namespace file_metadata_banner {
 
 		inline std::string make_address_prefix(const std::string& seg, uint64_t addr) {
 			char buf[64] = {};
-			std::snprintf(buf, sizeof(buf), "%s:%08llX", seg.c_str(), static_cast<unsigned long long>(addr));
+			std::snprintf(buf, sizeof(buf), "%s:%016llX", seg.c_str(), static_cast<unsigned long long>(addr));
 			return std::string(buf);
 		}
 
@@ -1114,7 +1114,16 @@ namespace file_metadata_banner {
 
 		ImDrawList* dl = ImGui::GetWindowDrawList();
 		const ImVec2 origin = ImGui::GetCursorScreenPos();
-		const float prefix_width = code_font->CalcTextSizeA(font_size, FLT_MAX, 0.f, "FLAT:00000000").x;
+		float prefix_width = code_font->CalcTextSizeA(font_size, FLT_MAX, 0.f, "FLAT:0000000000000000").x;
+		for (const auto& ln : lines) {
+			if (ln.no_address) continue;
+			char probe[64] = {};
+			std::snprintf(probe, sizeof(probe), "%s:%016llX",
+				ln.segment_label.c_str(),
+				static_cast<unsigned long long>(ln.address));
+			prefix_width = std::max(prefix_width,
+				code_font->CalcTextSizeA(font_size, FLT_MAX, 0.f, probe).x);
+		}
 		const float prefix_pad = code_font->CalcTextSizeA(font_size, FLT_MAX, 0.f, "  ").x;
 		const float text_x = origin.x + prefix_width + prefix_pad * 4.f;
 
@@ -1126,8 +1135,8 @@ namespace file_metadata_banner {
 		for (const auto& ln : lines) {
 			ImVec2 addr_pos(origin.x, y);
 			if (!ln.no_address) {
-				char prefix[32] = {};
-				std::snprintf(prefix, sizeof(prefix), "%s:%08llX",
+				char prefix[64] = {};
+				std::snprintf(prefix, sizeof(prefix), "%s:%016llX",
 					ln.segment_label.c_str(),
 					static_cast<unsigned long long>(ln.address));
 				size_t colon = ln.segment_label.size();

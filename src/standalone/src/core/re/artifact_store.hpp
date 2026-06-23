@@ -79,6 +79,7 @@ struct offset_record_t
     std::string aob_pattern;
     std::string rtti_path;
     std::string xref_context;
+    json fingerprint;
     std::string status;
     std::uint64_t last_found_va = 0;
     std::uint64_t created_ms = 0;

@@ -1,5 +1,15 @@
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef CPPHTTPLIB_OPENSSL_SUPPORT
 #define CPPHTTPLIB_OPENSSL_SUPPORT
+#endif
+#include <windows.h>
+#include <shlobj.h>
+
 #include "mcp_marketplace.hpp"
 #include "work_queue.hpp"
 #include "mcp_client.hpp"
@@ -15,6 +25,7 @@
 #include <fstream>
 #include <sstream>
 #include <algorithm>
+#include <cctype>
 
 extern mcp_client::manager_t s_mcp_client_mgr;
 
@@ -71,6 +82,165 @@ static std::filesystem::path marketplace_dir()
     std::error_code ec;
     std::filesystem::create_directories(base, ec);
     return base;
+}
+
+
+std::string registry_label(registry_t reg)
+{
+    return reg == registry_t::pypi ? "PyPI" : "npm";
+}
+
+
+std::string install_root()
+{
+    return marketplace_dir().string();
+}
+
+
+static bool safe_for_shell_identifier(const std::string& s)
+{
+    for (unsigned char c : s) {
+        const bool ok = (c >= '0' && c <= '9')
+                     || (c >= 'A' && c <= 'Z')
+                     || (c >= 'a' && c <= 'z')
+                     || c == '-' || c == '_' || c == '.'
+                     || c == '/' || c == '@';
+        if (!ok) return false;
+    }
+    return !s.empty();
+}
+
+
+static std::string make_safe_package_dir_name(const std::string& name)
+{
+    std::string safe_name;
+    safe_name.reserve(name.size());
+    for (char c : name) {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        const bool keep = (uc >= '0' && uc <= '9')
+                       || (uc >= 'A' && uc <= 'Z')
+                       || (uc >= 'a' && uc <= 'z')
+                       || uc == '-'
+                       || uc == '_'
+                       || uc == '.';
+        safe_name.push_back(keep ? static_cast<char>(uc) : '_');
+    }
+    while (!safe_name.empty() && safe_name.front() == '.') safe_name.erase(safe_name.begin());
+    return safe_name;
+}
+
+
+static bool is_child_path(const std::filesystem::path& root, const std::filesystem::path& child)
+{
+    const std::string root_str = root.lexically_normal().string();
+    const std::string child_str = child.lexically_normal().string();
+    if (root_str.empty() || child_str.size() < root_str.size())
+        return false;
+    if (child_str.compare(0, root_str.size(), root_str) != 0)
+        return false;
+    if (child_str.size() == root_str.size())
+        return true;
+    const char sep = child_str[root_str.size()];
+    return sep == '\\' || sep == '/';
+}
+
+
+static bool resolve_install_path(const std::string& name, std::filesystem::path& out, std::string& error)
+{
+    std::string safe_name = make_safe_package_dir_name(name);
+    if (safe_name.empty() || safe_name == "." || safe_name == "..") {
+        error = "Refusing to install package with unsafe name: " + name;
+        return false;
+    }
+
+    auto dir = marketplace_dir();
+    std::error_code can_ec;
+    auto root = std::filesystem::weakly_canonical(dir, can_ec);
+    if (can_ec) root = dir;
+    auto pkg_path = std::filesystem::weakly_canonical(dir / safe_name, can_ec);
+    if (can_ec) pkg_path = dir / safe_name;
+
+    if (!is_child_path(root, pkg_path)) {
+        error = "Refusing to install outside marketplace directory: " + name;
+        return false;
+    }
+
+    out = std::move(pkg_path);
+    return true;
+}
+
+
+static installed_server_t make_install_preview(const package_info_t& p, const std::string& pkg_dir)
+{
+    installed_server_t srv;
+    srv.package_name = p.name;
+    srv.version = p.version;
+    srv.registry = p.registry;
+    srv.install_path = pkg_dir;
+    srv.transport = "stdio";
+    srv.enabled = false;
+    srv.auto_connect = false;
+    if (p.registry == registry_t::npm) {
+        srv.command = "cmd.exe";
+        srv.args = {"/c", "npx", "-y", p.name};
+    } else {
+        std::string venv_dir = pkg_dir + "\\venv";
+        srv.command = venv_dir + "\\Scripts\\python.exe";
+        srv.args = {"-m", p.name};
+    }
+    return srv;
+}
+
+
+installed_server_t preview_install(const package_info_t& pkg)
+{
+    std::filesystem::path path;
+    std::string error;
+    if (!resolve_install_path(pkg.name, path, error)) {
+        installed_server_t srv;
+        srv.package_name = pkg.name;
+        srv.version = pkg.version;
+        srv.registry = pkg.registry;
+        srv.install_path = marketplace_dir().string();
+        return srv;
+    }
+    return make_install_preview(pkg, path.string());
+}
+
+
+static std::string quote_display_arg(const std::string& arg)
+{
+    if (arg.empty())
+        return "\"\"";
+    bool needs_quote = false;
+    for (char c : arg) {
+        if (c == ' ' || c == '\t' || c == '"' || c == '\'') {
+            needs_quote = true;
+            break;
+        }
+    }
+    if (!needs_quote)
+        return arg;
+    std::string out = "\"";
+    for (char c : arg) {
+        if (c == '"')
+            out += "\\\"";
+        else
+            out.push_back(c);
+    }
+    out.push_back('"');
+    return out;
+}
+
+
+std::string launch_command_preview(const installed_server_t& srv)
+{
+    std::string out = quote_display_arg(srv.command);
+    for (const auto& arg : srv.args) {
+        out.push_back(' ');
+        out += quote_display_arg(arg);
+    }
+    return out;
 }
 
 
@@ -227,7 +397,8 @@ static std::vector<package_info_t> search_npm(const std::string& query, std::str
         }
 
         if (!info.display_name.empty())
-            info.display_name[0] = static_cast<char>(toupper(info.display_name[0]));
+            info.display_name[0] = static_cast<char>(
+                std::toupper(static_cast<unsigned char>(info.display_name[0])));
 
         if (!info.name.empty())
             results.push_back(std::move(info));
@@ -426,41 +597,13 @@ void install_async(const package_info_t& pkg)
 
     package_info_t p = pkg;
     work_queue::post([p]() {
-        auto dir = marketplace_dir();
-
-        std::string safe_name;
-        safe_name.reserve(p.name.size());
-        for (char c : p.name) {
-            const unsigned char uc = static_cast<unsigned char>(c);
-            const bool keep = (uc >= '0' && uc <= '9')
-                           || (uc >= 'A' && uc <= 'Z')
-                           || (uc >= 'a' && uc <= 'z')
-                           || uc == '-'
-                           || uc == '_'
-                           || uc == '.';
-            safe_name.push_back(keep ? static_cast<char>(uc) : '_');
-        }
-        while (!safe_name.empty() && safe_name.front() == '.') safe_name.erase(safe_name.begin());
-        if (safe_name.empty() || safe_name == "." || safe_name == "..") {
+        std::filesystem::path pkg_path;
+        std::string path_error;
+        if (!resolve_install_path(p.name, pkg_path, path_error)) {
             std::lock_guard<std::mutex> lk(s_mtx);
             s_install_state = install_state_t::error_state;
-            s_install_error = "Refusing to install package with unsafe name: " + p.name;
+            s_install_error = path_error;
             return;
-        }
-        std::error_code can_ec;
-        auto root = std::filesystem::weakly_canonical(dir, can_ec);
-        if (can_ec) root = dir;
-        auto pkg_path = std::filesystem::weakly_canonical(dir / safe_name, can_ec);
-        if (can_ec) pkg_path = dir / safe_name;
-        {
-            const std::string root_str = root.string();
-            const std::string pkg_str = pkg_path.string();
-            if (pkg_str.size() < root_str.size() || pkg_str.compare(0, root_str.size(), root_str) != 0) {
-                std::lock_guard<std::mutex> lk(s_mtx);
-                s_install_state = install_state_t::error_state;
-                s_install_error = "Refusing to install outside marketplace directory: " + p.name;
-                return;
-            }
         }
         std::string pkg_dir = pkg_path.string();
 
@@ -468,21 +611,10 @@ void install_async(const package_info_t& pkg)
         std::filesystem::create_directories(pkg_dir, ec);
 
         std::string output;
-        installed_server_t srv;
+        installed_server_t srv = make_install_preview(p, pkg_dir);
 
-        auto safe_for_shell = [](const std::string& s) -> bool {
-            for (unsigned char c : s) {
-                const bool ok = (c >= '0' && c <= '9')
-                             || (c >= 'A' && c <= 'Z')
-                             || (c >= 'a' && c <= 'z')
-                             || c == '-' || c == '_' || c == '.'
-                             || c == '/' || c == '@';
-                if (!ok) return false;
-            }
-            return !s.empty();
-        };
-
-        if (!safe_for_shell(p.name) || (!p.version.empty() && !safe_for_shell(p.version))) {
+        if (!safe_for_shell_identifier(p.name) ||
+            (!p.version.empty() && !safe_for_shell_identifier(p.version))) {
             std::lock_guard<std::mutex> lk(s_mtx);
             s_install_state = install_state_t::error_state;
             s_install_error = "Refusing to install package with shell-unsafe identifier: " + p.name;
@@ -495,14 +627,6 @@ void install_async(const package_info_t& pkg)
             std::string spec = p.name + (p.version.empty() ? std::string{} : "@" + p.version);
             std::string cmd = "cmd.exe /c npm install --prefix \"" + pkg_dir + "\" \"" + spec + "\"";
             output = run_process_capture(cmd, pkg_dir, 120000);
-
-            srv.package_name = p.name;
-            srv.version = p.version;
-            srv.registry = registry_t::npm;
-            srv.install_path = pkg_dir;
-            srv.transport = "stdio";
-            srv.command = "cmd.exe";
-            srv.args = {"/c", "npx", "-y", p.name};
         } else {
             diag::log_tagged_fmt("mcp_market", "install_async pypi pkg='%s' dir='%.120s'",
                 p.name.c_str(), pkg_dir.c_str());
@@ -514,14 +638,6 @@ void install_async(const package_info_t& pkg)
             std::string spec = p.version.empty() ? p.name : (p.name + "==" + p.version);
             std::string cmd_install = "\"" + pip + "\" install \"" + spec + "\"";
             output = run_process_capture(cmd_install, pkg_dir, 120000);
-
-            srv.package_name = p.name;
-            srv.version = p.version;
-            srv.registry = registry_t::pypi;
-            srv.install_path = pkg_dir;
-            srv.transport = "stdio";
-            srv.command = venv_dir + "\\Scripts\\python.exe";
-            srv.args = {"-m", p.name};
         }
 
 
@@ -560,7 +676,7 @@ void install_async(const package_info_t& pkg)
         s_install_persist_pending.store(true, std::memory_order_release);
 
         enqueue_deferred_log(bottom_tab_t::output,
-            "[marketplace] Installed " + p.name + "@" + p.version);
+            "[marketplace] Installed disabled server " + p.name + "@" + p.version);
     });
 }
 
@@ -632,6 +748,13 @@ std::vector<installed_server_t> get_installed()
 void activate_server(const installed_server_t& srv)
 {
     diag::log_tagged_fmt("mcp_market", "activate_server pkg='%s'", srv.package_name.c_str());
+    if (!srv.enabled) {
+        diag::log_tagged_fmt("mcp_market", "activate_server blocked_disabled pkg='%s'",
+            srv.package_name.c_str());
+        enqueue_deferred_log(bottom_tab_t::mcp_log,
+            "[marketplace] Enable before connecting: " + srv.package_name);
+        return;
+    }
     mcp_client::server_config_t cfg;
     cfg.name = srv.package_name;
     cfg.transport = (srv.transport == "stdio")
@@ -663,6 +786,38 @@ void deactivate_server(const std::string& package_name)
 }
 
 
+bool set_server_policy(const std::string& package_name, bool enabled, bool auto_connect)
+{
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lk(s_installed_mtx);
+        for (auto& srv : s_installed) {
+            if (srv.package_name != package_name)
+                continue;
+            srv.enabled = enabled;
+            srv.auto_connect = enabled && auto_connect;
+            changed = true;
+            break;
+        }
+    }
+
+    if (!changed)
+        return false;
+
+    if (!enabled) {
+        ::s_mcp_client_mgr.disconnect_server(package_name);
+        ::s_mcp_client_mgr.remove_server(package_name);
+    }
+
+    s_install_persist_pending.store(true, std::memory_order_release);
+    diag::log_tagged_fmt("mcp_market", "set_server_policy pkg='%s' enabled=%d auto_connect=%d",
+        package_name.c_str(), enabled ? 1 : 0, (enabled && auto_connect) ? 1 : 0);
+    enqueue_deferred_log(bottom_tab_t::mcp_log,
+        std::string("[marketplace] Policy updated: ") + package_name);
+    return true;
+}
+
+
 void load_installed(const std::string& json_str)
 {
     if (json_str.empty()) return;
@@ -691,8 +846,8 @@ void load_installed(const std::string& json_str)
                     srv.env[it2.key()] = it2.value().get<std::string>();
             }
         }
-        srv.enabled      = item.value("enabled", true);
-        srv.auto_connect  = item.value("auto_connect", true);
+        srv.enabled      = item.value("enabled", false);
+        srv.auto_connect  = srv.enabled && item.value("auto_connect", false);
 
         if (!srv.package_name.empty())
             s_installed.push_back(std::move(srv));

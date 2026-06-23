@@ -93,6 +93,28 @@ void register_protected_re_tools(mcp_standalone::server_t& srv)
         protected_re::mba_simplify, true});
 
     register_compat(srv, {
+        "obf_detect_mba", "protected_re",
+        "Alias for mba_simplify with the protected RE obfuscation naming contract.",
+        {{"address", "string", "Region start address", true},
+         {"size", "number", "Region size", false},
+         {"use_z3", "boolean", "Request Z3-backed proof where backend support exists", false},
+         {"process_id", "number", "Optional target process id", false}},
+        protected_re::obf_detect_mba, true});
+
+    register_compat(srv, {
+        "obf_simplify_expr", "protected_re",
+        "Simplify a bounded symbolic expression using deterministic verified identities.",
+        {{"expr", "string", "Expression text", true}},
+        protected_re::obf_simplify_expr, true});
+
+    register_compat(srv, {
+        "obf_rename_symbols", "protected_re",
+        "Generate a read-only semantic rename plan for protected RE findings.",
+        {{"symbols", "array", "Symbol evidence objects", true},
+         {"apply", "boolean", "Rejected in standalone protected RE mode", false}},
+        protected_re::obf_rename_symbols, true});
+
+    register_compat(srv, {
         "opaque_predicate_detect", "protected_re",
         "Find syntactically provable opaque predicates in a bounded code region.",
         {{"address", "string", "Region start address", true},
@@ -148,6 +170,13 @@ void register_protected_re_tools(mcp_standalone::server_t& srv)
         "Decode IOCTL bitfields and surface buffer-method risk metadata.",
         {{"ioctl_handlers", "array", "Handlers from drv_find_ioctl_dispatch", true}},
         protected_re::drv_enumerate_ioctls, true});
+
+    register_compat(srv, {
+        "drv_map_ioctls", "protected_re",
+        "Map and decode IOCTL handlers from a device-control handler or supplied handler list.",
+        {{"device_control_handler_va", "string", "Device control handler address", false},
+         {"ioctl_handlers", "array", "Handlers from drv_find_ioctl_dispatch", false}},
+        protected_re::drv_map_ioctls, true});
 
     register_compat(srv, {
         "drv_find_device_names", "protected_re",
@@ -214,6 +243,25 @@ void register_protected_re_tools(mcp_standalone::server_t& srv)
         protected_re::smc_scan_encrypted_regions, true});
 
     register_compat(srv, {
+        "smc_detect_selfmod", "protected_re",
+        "Alias for smc_scan_encrypted_regions that reports self-modifying or mutated mapped regions.",
+        {{"process_id", "number", "Optional target process id", false},
+         {"module_name", "string", "Optional module filter", false},
+         {"module_base", "string", "Optional module base", false},
+         {"include_all", "boolean", "Return all scanned sections", false}},
+        protected_re::smc_detect_selfmod, true});
+
+    register_compat(srv, {
+        "smc_snapshot_pages", "protected_re",
+        "Snapshot bounded target pages with entropy, bytes, protection, and disassembly previews.",
+        {{"target_va", "string", "Range start address", false},
+         {"address", "string", "Alternative range start address", false},
+         {"target_size", "number", "Range size", false},
+         {"size", "number", "Alternative range size", false},
+         {"process_id", "number", "Optional target process id", false}},
+        protected_re::smc_snapshot_pages, true});
+
+    register_compat(srv, {
         "smc_find_decryptor", "protected_re",
         "Find candidate decryptor/write instructions for a known decrypted target range.",
         {{"target_va", "string", "Known decrypted region address", true},
@@ -259,6 +307,15 @@ void register_protected_re_tools(mcp_standalone::server_t& srv)
          {"confirm_unsafe", "boolean", "Required for start", false},
          {"allow_unsafe", "boolean", "Alternative unsafe confirmation", false}},
         protected_re::pack_iat_manage, false});
+
+    register_compat(srv, {
+        "pack_iat_recover", "protected_re",
+        "Read the current import table and return resolved IAT slot evidence without live hit collection.",
+        {{"process_id", "number", "Optional target process id", false},
+         {"module_name", "string", "Optional module filter", false},
+         {"module_base", "string", "Optional module base", false},
+         {"max_entries", "number", "Maximum IAT entries returned", false}},
+        protected_re::pack_iat_recover, true});
 
 }
 

@@ -1340,6 +1340,251 @@ static std::string truncate_session_tab_label(const std::string& s, size_t max_c
 	return s.substr(0, max_chars - 3) + std::string("...");
 }
 
+static std::string shell_leaf_name(const std::string& path)
+{
+	size_t slash = path.find_last_of("/\\");
+	if (slash == std::string::npos)
+		return path;
+	return path.substr(slash + 1);
+}
+
+static const char* shell_center_view_label(center_view_t view)
+{
+	switch (view) {
+	case center_view_t::code_editor: return "Editor";
+	case center_view_t::disassembly: return "Disassembly";
+	case center_view_t::hex_view: return "Hex";
+	case center_view_t::welcome: return "Welcome";
+	case center_view_t::settings_view: return "Settings";
+	case center_view_t::network_view: return "Network";
+	case center_view_t::memory_scanner: return "Memory";
+	case center_view_t::debugger_view: return "Debugger";
+	case center_view_t::pseudocode: return "Pseudocode";
+	case center_view_t::struct_recon: return "Structures";
+	case center_view_t::crypto_scanner: return "Crypto";
+	case center_view_t::aob_generator: return "AOB";
+	case center_view_t::fuzzer_view: return "Fuzzer";
+	case center_view_t::xref_browser: return "Xrefs";
+	case center_view_t::snapshot_diff: return "Snapshots";
+	case center_view_t::pointer_scanner: return "Pointers";
+	case center_view_t::decrypt_oracle: return "Decrypt";
+	case center_view_t::integrity_hunter: return "Integrity";
+	case center_view_t::symbolic_view: return "Symbolic";
+	case center_view_t::taint_view: return "Taint";
+	case center_view_t::deobfuscation_view: return "Deobfuscation";
+	case center_view_t::stealth_view: return "Stealth";
+	case center_view_t::scan_hub: return "Scan";
+	case center_view_t::types_hub: return "Types";
+	case center_view_t::analysis_hub: return "Analysis";
+	case center_view_t::binary_map: return "Binary Map";
+	case center_view_t::graph_view: return "Graph";
+	case center_view_t::image_view: return "Image";
+	case center_view_t::test_lab: return "Test Lab";
+	default: return "Workbench";
+	}
+}
+
+static std::string shell_file_status_text()
+{
+	if (!globals::ui::status_file_info.empty())
+		return globals::ui::status_file_info;
+	if (code_editor::active && !code_editor::filename.empty())
+		return std::string("File: ") + code_editor::filename;
+	const size_t count = analysis_session::session_count();
+	if (count > 0) {
+		size_t idx = analysis_session::active_session_idx();
+		if (idx >= count) idx = 0;
+		if (const auto* sess = analysis_session::session_at(idx)) {
+			std::string name = sess->filename.empty() ? shell_leaf_name(sess->path) : sess->filename;
+			if (!name.empty())
+				return std::string(sess->attached_pid ? "Process: " : "Binary: ") + name;
+		}
+	}
+	if (g_disasm.file.loaded && !g_disasm.file.filename.empty())
+		return std::string("Binary: ") + g_disasm.file.filename;
+	return "No binary loaded";
+}
+
+static std::string shell_driver_status_text()
+{
+	if (!globals::ui::status_driver_info.empty())
+		return globals::ui::status_driver_info;
+	const uint32_t pid = driver_bridge::attached_pid();
+	if (pid != 0) {
+		char buf[96];
+		snprintf(buf, sizeof(buf), "Driver: attached PID %u", static_cast<unsigned>(pid));
+		return buf;
+	}
+	if (driver_bridge::is_loaded())
+		return driver_bridge::using_kernel_driver() ? "Driver: kernel ready" : "Driver: bridge ready";
+	return "Driver: offline";
+}
+
+static std::string shell_model_status_text()
+{
+	if (!globals::ui::status_model_info.empty())
+		return globals::ui::status_model_info;
+	std::string provider = g_sa_settings.default_provider_id;
+	std::string model = g_sa_settings.default_model_id;
+	const provider_profile_t* active = nullptr;
+	if (!g_sa_settings.provider_profiles.empty()) {
+		for (const auto& profile : g_sa_settings.provider_profiles) {
+			if (profile.id == g_sa_settings.active_provider_profile_id) {
+				active = &profile;
+				break;
+			}
+		}
+		if (!active)
+			active = &g_sa_settings.provider_profiles.front();
+	}
+	if (provider.empty() && active)
+		provider = active->kind;
+	if (model.empty() && active)
+		model = active->model;
+	if (provider.empty())
+		provider = g_sa_settings.api_provider;
+	if (model.empty())
+		model = g_sa_settings.openai_model_name;
+	if (model.empty())
+		return std::string("Model: ") + provider;
+	return std::string("Model: ") + provider + " / " + model;
+}
+
+struct shell_status_segment_t {
+	std::string text;
+	ImU32 color = 0;
+	bool dot = true;
+	bool strong = false;
+};
+
+static float shell_status_segment_width(ImFont* font, float font_size, const aida::ui::shell_metrics_t& metrics, const shell_status_segment_t& seg)
+{
+	if (seg.text.empty())
+		return 0.f;
+	ImVec2 ts = font->CalcTextSizeA(font_size, FLT_MAX, 0.f, seg.text.c_str());
+	float dot_w = seg.dot ? metrics.status_dot_r * 2.f + metrics.status_gap * 0.55f : 0.f;
+	return ts.x + dot_w + metrics.status_segment_pad_x * 2.f;
+}
+
+static float shell_draw_status_segment(ImDrawList* dl, ImFont* font, float font_size, float x, float y0, float y1, float max_x, const aida::ui::shell_metrics_t& metrics, const shell_status_segment_t& seg, float alpha)
+{
+	if (seg.text.empty() || x >= max_x)
+		return x;
+	float raw_w = shell_status_segment_width(font, font_size, metrics, seg);
+	float w = (std::min)(raw_w, max_x - x);
+	if (w < metrics.status_h * 0.75f)
+		return x;
+	const auto& th = aida::ui::resolved();
+	ImVec2 a(x, y0 + aida::ui::scale_px(2.f, metrics.scale));
+	ImVec2 b(x + w, y1 - aida::ui::scale_px(2.f, metrics.scale));
+	dl->AddRectFilled(a, b, aida::ui::with_alpha(th.bg_elevated, 0.32f * alpha), metrics.control_radius);
+	dl->AddRect(a, b, aida::ui::with_alpha(th.border_subtle, 0.55f * alpha), metrics.control_radius, 0, 1.f);
+	float tx = a.x + metrics.status_segment_pad_x;
+	if (seg.dot) {
+		float cy = (a.y + b.y) * 0.5f;
+		float r = metrics.status_dot_r;
+		dl->AddCircleFilled(ImVec2(tx + r, cy), r + aida::ui::scale_px(1.f, metrics.scale), aida::ui::with_alpha(seg.color, 0.18f * alpha), 16);
+		dl->AddCircleFilled(ImVec2(tx + r, cy), r, aida::ui::with_alpha(seg.color, alpha), 16);
+		tx += r * 2.f + metrics.status_gap * 0.55f;
+	}
+	ImU32 text_col = seg.strong ? th.text_primary : th.text_secondary;
+	ImVec4 clip(tx, a.y, b.x - metrics.status_segment_pad_x, b.y);
+	dl->AddText(font, font_size,
+		ImVec2(tx, a.y + ((b.y - a.y) - font_size) * 0.5f),
+		aida::ui::with_alpha(text_col, alpha),
+		seg.text.c_str(), nullptr, 0.f, &clip);
+	return b.x + metrics.status_gap;
+}
+
+static void shell_render_status_bar(float ww, float wh, const aida::ui::shell_metrics_t& metrics, float alpha, bool runtime_ready)
+{
+	if (metrics.status_h <= 1.f)
+		return;
+	ImDrawList* dl = ImGui::GetWindowDrawList();
+	ImVec2 wp = ImGui::GetWindowPos();
+	const auto& th = aida::ui::resolved();
+	const float y0 = wp.y + wh - metrics.pad - metrics.status_h;
+	const float y1 = y0 + metrics.status_h;
+	if (y1 <= wp.y)
+		return;
+
+	aida::ui::blur::layer_request_t req;
+	req.pos = ImVec2(wp.x, y0);
+	req.size = ImVec2(ww, metrics.status_h);
+	req.radius = 0.f;
+	req.strength = 0.45f;
+	req.alpha = alpha;
+	aida::ui::blur::schedule(req);
+	dl->AddRectFilled(ImVec2(wp.x, y0), ImVec2(wp.x + ww, y1),
+		aida::ui::with_alpha(th.title_bar, alpha), metrics.corner_radius, ImDrawFlags_RoundCornersBottom);
+	dl->AddLine(ImVec2(wp.x, y0), ImVec2(wp.x + ww, y0),
+		aida::ui::with_alpha(th.border_subtle, alpha), 1.f);
+
+	ImFont* font = aida::ui::fonts::caption();
+	if (!font) font = aida::ui::fonts::body();
+	if (!font) font = ImGui::GetFont();
+	const float fs = aida::ui::fonts::size_or(font, metrics.caption_font);
+	const bool runtime_locked = anti_tamper::state::get().violation_latched.load(std::memory_order_acquire);
+	const bool arc_loading = standalone_license::is_arc_download_in_progress() || standalone_license::is_arc_transfer_in_progress();
+
+	shell_status_segment_t runtime_seg;
+	if (runtime_locked) {
+		runtime_seg = { "Runtime: locked", th.error, true, true };
+	} else if (arc_loading || license::checking) {
+		runtime_seg = { arc_loading ? "ARC: loading" : "Session: validating", th.warning, true, true };
+	} else if (runtime_ready) {
+		runtime_seg = { "Session: ready", th.success, true, true };
+	} else {
+		runtime_seg = { "Session: gated", th.warning, true, true };
+	}
+
+	shell_status_segment_t driver_seg{ shell_driver_status_text(), driver_bridge::is_loaded() ? th.success : th.warning, true, false };
+	if (driver_bridge::attached_pid() != 0)
+		driver_seg.color = th.accent_u32;
+	shell_status_segment_t model_seg{ shell_model_status_text(), th.info, true, false };
+	std::string encoding = globals::ui::current_encoding + "  " + globals::ui::current_line_ending + "  " + globals::ui::current_indent;
+	shell_status_segment_t encoding_seg{ encoding, th.text_dim, false, false };
+
+	std::vector<shell_status_segment_t> left;
+	left.push_back({ shell_file_status_text(), th.accent_u32, true, true });
+	left.push_back({ std::string("View: ") + shell_center_view_label(globals::ui::active_center_view), th.info, true, false });
+	left.push_back(runtime_seg);
+
+	std::vector<shell_status_segment_t> right;
+	right.push_back(driver_seg);
+	right.push_back(model_seg);
+	right.push_back(encoding_seg);
+
+	const float x0 = wp.x + metrics.pad + metrics.status_pad_x;
+	const float x1 = wp.x + ww - metrics.pad - metrics.status_pad_x;
+	float split_x = wp.x + ww * 0.58f;
+	if (split_x < x0 + aida::ui::scale_px(280.f, metrics.scale))
+		split_x = x0 + aida::ui::scale_px(280.f, metrics.scale);
+	if (split_x > x1 - aida::ui::scale_px(220.f, metrics.scale))
+		split_x = x1 - aida::ui::scale_px(220.f, metrics.scale);
+
+	float rx = x1;
+	for (int i = static_cast<int>(right.size()) - 1; i >= 0; --i) {
+		float w = shell_status_segment_width(font, fs, metrics, right[static_cast<size_t>(i)]);
+		if (w > ww * 0.30f)
+			w = ww * 0.30f;
+		float nx = rx - w;
+		if (nx < split_x + metrics.status_gap)
+			continue;
+		shell_draw_status_segment(dl, font, fs, nx, y0, y1, rx, metrics, right[static_cast<size_t>(i)], alpha);
+		rx = nx - metrics.status_gap;
+	}
+
+	float lx = x0;
+	float left_max = (std::min)(split_x, rx - metrics.status_gap);
+	for (const auto& seg : left) {
+		float next = shell_draw_status_segment(dl, font, fs, lx, y0, y1, left_max, metrics, seg, alpha);
+		if (next <= lx)
+			break;
+		lx = next;
+	}
+}
+
 static void render_session_tabs(float x, float y, float width, float height, float alpha)
 {
 	const auto& th = aida::ui::resolved();
@@ -1792,7 +2037,7 @@ void helpers::render_title()
 	} else {
 		themes::resolved = themes::presets[themes::active];
 	}
-	globals::ui::accent = themes::resolved.accent;
+	globals::ui::accent = aida::ui::resolved().accent;
 
 	{
 		static int s_last_applied_theme_idx = -1;
@@ -1844,16 +2089,18 @@ void helpers::render_title()
 			}
 		}
 	}
+	globals::ui::accent = aida::ui::resolved().accent;
 
-	const int th_ph_r = (themes::resolved.panel_header >>  0) & 0xFF;
-	const int th_ph_g = (themes::resolved.panel_header >>  8) & 0xFF;
-	const int th_ph_b = (themes::resolved.panel_header >> 16) & 0xFF;
-	const int th_pb_r = (themes::resolved.panel_bg >>  0) & 0xFF;
-	const int th_pb_g = (themes::resolved.panel_bg >>  8) & 0xFF;
-	const int th_pb_b = (themes::resolved.panel_bg >> 16) & 0xFF;
-	const int th_bb_r = (themes::resolved.bg_base >>  0) & 0xFF;
-	const int th_bb_g = (themes::resolved.bg_base >>  8) & 0xFF;
-	const int th_bb_b = (themes::resolved.bg_base >> 16) & 0xFF;
+	const auto& shell_theme = aida::ui::resolved();
+	const int th_ph_r = (shell_theme.panel_header >>  0) & 0xFF;
+	const int th_ph_g = (shell_theme.panel_header >>  8) & 0xFF;
+	const int th_ph_b = (shell_theme.panel_header >> 16) & 0xFF;
+	const int th_pb_r = (shell_theme.panel_bg >>  0) & 0xFF;
+	const int th_pb_g = (shell_theme.panel_bg >>  8) & 0xFF;
+	const int th_pb_b = (shell_theme.panel_bg >> 16) & 0xFF;
+	const int th_bb_r = (shell_theme.bg_base >>  0) & 0xFF;
+	const int th_bb_g = (shell_theme.bg_base >>  8) & 0xFF;
+	const int th_bb_b = (shell_theme.bg_base >> 16) & 0xFF;
 
 
 	chat_handle_agent_shortcuts();
@@ -3315,11 +3562,12 @@ void helpers::render_title()
 	float a = globals::ui::ui_alpha;
 
 
-	const float pad      = 6.f;
-	const float gap      = 4.f;
-	const float title_h  = 32.f;
-	const float menu_h   = 32.f;
-	const float status_h = 0.f;
+	const auto metrics = aida::ui::shell_metrics(globals::ui::dpi_scale);
+	const float pad      = metrics.pad;
+	const float gap      = metrics.gap;
+	const float title_h  = metrics.title_h;
+	const float menu_h   = metrics.menu_h;
+	const float status_h = metrics.status_h;
 	float ww = globals::ui::window_w;
 	float wh = globals::ui::window_h;
 
@@ -3337,9 +3585,9 @@ void helpers::render_title()
 		}
 	}
 
-	float ab_for_layout = g_sa_settings.activity_bar_visible ? globals::ui::activity_bar_w : 0.f;
+	float ab_for_layout = g_sa_settings.activity_bar_visible ? metrics.activity_bar_w : 0.f;
 	float usable = ww - pad * 2.f - gap * 2.f - ab_for_layout;
-	float min_panel = 80.f;
+	float min_panel = metrics.min_panel_w;
 	float max_left  = usable * 0.3f;
 	float max_right = usable * 0.5f;
 
@@ -3405,15 +3653,15 @@ void helpers::render_title()
 		tb_req.strength = 0.55f;
 		tb_req.alpha = a;
 		aida::ui::blur::schedule(tb_req);
-		dl->AddRectFilled(tb_a, tb_b, aida::ui::with_alpha(th_tb.title_bar, a), 8.f, ImDrawFlags_RoundCornersTop);
-		dl->AddRectFilled(tb_a, tb_b, aida::ui::with_alpha(th_tb.glass_tint, a * 0.5f), 8.f, ImDrawFlags_RoundCornersTop);
+		dl->AddRectFilled(tb_a, tb_b, aida::ui::with_alpha(th_tb.title_bar, a), metrics.corner_radius, ImDrawFlags_RoundCornersTop);
+		dl->AddRectFilled(tb_a, tb_b, aida::ui::with_alpha(th_tb.glass_tint, a * 0.5f), metrics.corner_radius, ImDrawFlags_RoundCornersTop);
 		dl->AddLine(ImVec2(wp.x, wp.y + title_h), ImVec2(wp.x + ww, wp.y + title_h),
 			aida::ui::with_alpha(th_tb.border_subtle, a));
 
 		float pulse = aida::ui::clock::pulse(0.6f, 0.0f, 1.0f);
-		ImVec2 logo_c(wp.x + 22.f, wp.y + title_h * 0.5f);
+		ImVec2 logo_c(wp.x + pad + metrics.title_logo * 0.5f + gap, wp.y + title_h * 0.5f);
 		if (g_aida_logo_srv && g_aida_logo_w > 0 && g_aida_logo_h > 0) {
-			float ls = 22.f * (0.95f + 0.05f * pulse);
+			float ls = metrics.title_logo * (0.95f + 0.05f * pulse);
 			float aspect = (float)g_aida_logo_w / (float)g_aida_logo_h;
 			float lw = ls * aspect;
 			float lh = ls;
@@ -3423,22 +3671,25 @@ void helpers::render_title()
 				ImVec2(logo_c.x + lw * 0.5f, logo_c.y + lh * 0.5f),
 				ImVec2(0.f, 0.f), ImVec2(1.f, 1.f), logo_tint);
 		} else {
-			aida::ui::brand::render_logomark(dl, logo_c, 22.f, 1.0f, pulse, a);
+			aida::ui::brand::render_logomark(dl, logo_c, metrics.title_logo, 1.0f, pulse, a);
 		}
 
 		ImFont* h2f = aida::ui::fonts::h2();
 		if (!h2f) h2f = ImGui::GetFont();
 		const char* app_name = "AiDA";
-		ImVec2 name_ts = h2f->CalcTextSizeA(14.f, FLT_MAX, 0.f, app_name);
-		dl->AddText(h2f, 14.f,
-			ImVec2(wp.x + 38.f, wp.y + (title_h - 14.f) * 0.5f),
+		const float title_font_sz = aida::ui::fonts::size_or(h2f, metrics.title_font);
+		const float title_x = logo_c.x + metrics.title_logo * 0.5f + gap * 2.f;
+		ImVec2 name_ts = h2f->CalcTextSizeA(title_font_sz, FLT_MAX, 0.f, app_name);
+		dl->AddText(h2f, title_font_sz,
+			ImVec2(title_x, wp.y + (title_h - title_font_sz) * 0.5f),
 			aida::ui::with_alpha(th_tb.text_primary, a), app_name);
 
 		{
-			ImFont* body = aida::ui::fonts::body();
+			ImFont* body = aida::ui::fonts::caption();
 			if (!body) body = ImGui::GetFont();
-			float bc_x = wp.x + 38.f + name_ts.x + 10.f;
-			float bc_y = wp.y + (title_h - 12.f) * 0.5f;
+			const float bc_font_sz = aida::ui::fonts::size_or(body, metrics.caption_font);
+			float bc_x = title_x + name_ts.x + gap * 2.f;
+			float bc_y = wp.y + (title_h - bc_font_sz) * 0.5f;
 			std::vector<std::string> segs;
 			if (g_disasm.file.loaded) segs.push_back(g_disasm.file.filename);
 			if (code_editor::active && !code_editor::filename.empty())
@@ -3457,32 +3708,32 @@ void helpers::render_title()
 				case center_view_t::welcome:
 				default: break;
 			}
-			float sep_w = body->CalcTextSizeA(12.f, FLT_MAX, 0.f, "›").x;
+			float sep_w = body->CalcTextSizeA(bc_font_sz, FLT_MAX, 0.f, ">").x;
 			for (size_t si = 0; si < segs.size(); ++si) {
-				dl->AddText(body, 12.f, ImVec2(bc_x, bc_y),
-					aida::ui::with_alpha(th_tb.text_dim, a), "›");
-				bc_x += sep_w + 8.f;
-				ImVec2 ss = body->CalcTextSizeA(12.f, FLT_MAX, 0.f, segs[si].c_str());
-				ImVec2 sa(bc_x - 4.f, bc_y - 2.f);
-				ImVec2 sb_pt(bc_x + ss.x + 4.f, bc_y + ss.y + 2.f);
+				dl->AddText(body, bc_font_sz, ImVec2(bc_x, bc_y),
+					aida::ui::with_alpha(th_tb.text_dim, a), ">");
+				bc_x += sep_w + gap * 1.5f;
+				ImVec2 ss = body->CalcTextSizeA(bc_font_sz, FLT_MAX, 0.f, segs[si].c_str());
+				ImVec2 sa(bc_x - gap, bc_y - 2.f);
+				ImVec2 sb_pt(bc_x + ss.x + gap, bc_y + ss.y + 2.f);
 				bool h_seg = ImGui::IsMouseHoveringRect(sa, sb_pt);
-				if (h_seg) dl->AddRectFilled(sa, sb_pt, aida::ui::with_alpha(th_tb.hover_wash, a), 4.f);
+				if (h_seg) dl->AddRectFilled(sa, sb_pt, aida::ui::with_alpha(th_tb.hover_wash, a), metrics.control_radius);
 				ImU32 col = (si == segs.size() - 1) ? th_tb.text_primary : th_tb.text_secondary;
-				dl->AddText(body, 12.f, ImVec2(bc_x, bc_y - (h_seg ? 1.f : 0.f)),
+				dl->AddText(body, bc_font_sz, ImVec2(bc_x, bc_y - (h_seg ? 1.f : 0.f)),
 					aida::ui::with_alpha(col, a), segs[si].c_str());
-				bc_x += ss.x + 8.f;
+				bc_x += ss.x + gap * 2.f;
 			}
 		}
 
 		auto draw_ctl = [&](float right_offset, const char* tag) -> std::pair<ImVec2, ImVec2> {
-			float ctl_sz = 22.f;
+			float ctl_sz = metrics.title_control;
 			ImVec2 cp(wp.x + ww - right_offset - ctl_sz, wp.y + (title_h - ctl_sz) * 0.5f);
 			ImVec2 ce(cp.x + ctl_sz, cp.y + ctl_sz);
 			(void)tag;
 			return {cp, ce};
 		};
 
-		float ctl_off = 8.f;
+		float ctl_off = pad + gap;
 
 		auto [close_a, close_b] = draw_ctl(ctl_off, "x");
 		bool close_hov = ImGui::IsMouseHoveringRect(close_a, close_b);
@@ -3490,7 +3741,7 @@ void helpers::render_title()
 		float chv = close_h.tick(close_hov, dt, aida::motion::spring::balanced);
 		if (chv > 0.01f) {
 			dl->AddRectFilled(close_a, close_b,
-				aida::ui::with_alpha(th_tb.error, 0.20f * chv * a), 6.f);
+				aida::ui::with_alpha(th_tb.error, 0.20f * chv * a), metrics.control_radius);
 		}
 		ImVec2 xc((close_a.x + close_b.x) * 0.5f, (close_a.y + close_b.y) * 0.5f);
 		float xr = 5.f;
@@ -3518,7 +3769,7 @@ void helpers::render_title()
 				ui_input_gate::chrome_input_blocked() ? 1 : 0);
 			request_chrome_shutdown_from_render("close_button", "chrome.close_button");
 		}
-		ctl_off += 22.f + 6.f;
+		ctl_off += metrics.title_control + gap * 1.5f;
 
 		auto [max_a, max_b] = draw_ctl(ctl_off, "m");
 		bool max_hov = ImGui::IsMouseHoveringRect(max_a, max_b);
@@ -3526,7 +3777,7 @@ void helpers::render_title()
 		float mhv = max_h.tick(max_hov, dt, aida::motion::spring::balanced);
 		if (mhv > 0.01f) {
 			dl->AddRectFilled(max_a, max_b,
-				aida::ui::with_alpha(th_tb.hover_wash, mhv * a), 6.f);
+				aida::ui::with_alpha(th_tb.hover_wash, mhv * a), metrics.control_radius);
 		}
 		ImVec2 mc((max_a.x + max_b.x) * 0.5f, (max_a.y + max_b.y) * 0.5f);
 		float mr = 5.f;
@@ -3574,7 +3825,7 @@ void helpers::render_title()
 				DwmSetWindowAttribute(g_hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cp_w, sizeof(cp_w));
 			}
 		}
-		ctl_off += 22.f + 6.f;
+		ctl_off += metrics.title_control + gap * 1.5f;
 
 		auto [min_a, min_b] = draw_ctl(ctl_off, "n");
 		bool min_hov = ImGui::IsMouseHoveringRect(min_a, min_b);
@@ -3582,7 +3833,7 @@ void helpers::render_title()
 		float mnv = min_hh.tick(min_hov, dt, aida::motion::spring::balanced);
 		if (mnv > 0.01f) {
 			dl->AddRectFilled(min_a, min_b,
-				aida::ui::with_alpha(th_tb.hover_wash, mnv * a), 6.f);
+				aida::ui::with_alpha(th_tb.hover_wash, mnv * a), metrics.control_radius);
 		}
 		ImU32 mncol = th_tb.text_primary;
 		float minc_x = (min_a.x + min_b.x) * 0.5f;
@@ -3591,11 +3842,11 @@ void helpers::render_title()
 			aida::ui::with_alpha(mncol, a), 1.7f);
 		if (min_hov && !ui_input_gate::chrome_input_blocked() && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
 			ShowWindow(g_hwnd, SW_MINIMIZE);
-		ctl_off += 22.f + 12.f;
+		ctl_off += metrics.title_control + gap * 3.f;
 
 
 		{
-			float toggle_sz = 22.f;
+			float toggle_sz = metrics.title_control;
 			ImVec2 tgl_a(wp.x + ww - ctl_off - toggle_sz, wp.y + (title_h - toggle_sz) * 0.5f);
 			ImVec2 tgl_b(tgl_a.x + toggle_sz, tgl_a.y + toggle_sz);
 			bool tgl_hov = ImGui::IsMouseHoveringRect(tgl_a, tgl_b);
@@ -3603,7 +3854,7 @@ void helpers::render_title()
 			float thv = tgl_h.tick(tgl_hov, dt, aida::motion::spring::balanced);
 			if (thv > 0.01f) {
 				dl->AddRectFilled(tgl_a, tgl_b,
-					aida::ui::with_alpha(th_tb.hover_wash, thv * a), 6.f);
+					aida::ui::with_alpha(th_tb.hover_wash, thv * a), metrics.control_radius);
 			}
 			ImU32 tcol = aida::ui::mix(th_tb.text_secondary, th_tb.text_primary, thv);
 			ImVec2 tcc((tgl_a.x + tgl_b.x) * 0.5f, (tgl_a.y + tgl_b.y) * 0.5f);
@@ -3637,14 +3888,14 @@ void helpers::render_title()
 				g_sa_settings_request_save();
 			}
 			if (tgl_hov) ImGui::SetTooltip("Toggle dark/light mode");
-			ctl_off += toggle_sz + 8.f;
+			ctl_off += toggle_sz + gap * 2.f;
 		}
 
 		{
 			static int theme_popup_open_frame = 0;
 			ImVec2 th_pos(wp.x + ww - 200.f, wp.y + 8.f);
 			(void)th_pos;
-			ImVec2 fake_pos(wp.x + ww - ctl_off - 22.f, wp.y + (title_h - 22.f) * 0.5f);
+			ImVec2 fake_pos(wp.x + ww - ctl_off - metrics.title_control, wp.y + (title_h - metrics.title_control) * 0.5f);
 			(void)fake_pos;
 			bool dummy_hov = false;
 			(void)dummy_hov;
@@ -3655,8 +3906,8 @@ void helpers::render_title()
 				popup_x = std::max(wp.x + 8.f, popup_x);
 				ImGui::SetNextWindowPos(ImVec2(popup_x, wp.y + title_h + 2.f));
 				ImGui::SetNextWindowBgAlpha(0.96f);
-				ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.f);
-				ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.f, 8.f));
+				ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, metrics.corner_radius);
+				ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(gap * 2.f, gap * 2.f));
 				const auto& th_tp = aida::ui::resolved();
 				ImGui::PushStyleColor(ImGuiCol_PopupBg, ImGui::ColorConvertU32ToFloat4(th_tp.bg_overlay));
 				ImGui::PushStyleColor(ImGuiCol_Border, ImGui::ColorConvertU32ToFloat4(th_tp.border_strong));
@@ -4101,14 +4352,14 @@ void helpers::render_title()
 		ImFont* mb_label_font = aida::ui::fonts::lg();
 		if (!mb_label_font) mb_label_font = aida::ui::fonts::body();
 		if (!mb_label_font) mb_label_font = ImGui::GetFont();
-		const float mb_label_size = 16.f;
-		float mx_cursor = wp.x + 14.f;
+		const float mb_label_size = aida::ui::fonts::size_or(mb_label_font, metrics.menu_font);
+		float mx_cursor = wp.x + metrics.menu_pad_x;
 		ImGuiStorage* mb_storage = ImGui::GetStateStorage();
 		for (int i = 0; i < 6; i++) {
 			ImVec2 ts = mb_label_font->CalcTextSizeA(mb_label_size, FLT_MAX, 0.f, menus[i].label);
-			float btn_w = ts.x + 24.f;
-			ImVec2 bmin(mx_cursor, my0 + 3.f);
-			ImVec2 bmax(mx_cursor + btn_w, my1 - 3.f);
+			float btn_w = ts.x + metrics.menu_item_pad_x * 2.f;
+			ImVec2 bmin(mx_cursor, my0 + gap * 0.75f);
+			ImVec2 bmax(mx_cursor + btn_w, my1 - gap * 0.75f);
 			bool is_open = (menu_bar::open_menu == i);
 
 			ImGui::PushID(menus[i].label);
@@ -4126,12 +4377,12 @@ void helpers::render_title()
 
 			if (h_v > 0.01f) {
 				ImU32 mfill = is_open ? th_mb.selection_strong : th_mb.hover_wash;
-				dl->AddRectFilled(bmin, bmax, aida::ui::with_alpha(mfill, h_v * a), 7.f);
+				dl->AddRectFilled(bmin, bmax, aida::ui::with_alpha(mfill, h_v * a), metrics.control_radius);
 			}
 
 			ImU32 tcol = (hov || is_open) ? th_mb.text_primary : th_mb.text_secondary;
 			dl->AddText(mb_label_font, mb_label_size,
-				ImVec2(mx_cursor + 12.f, my0 + (menu_h - mb_label_size) * 0.5f),
+				ImVec2(mx_cursor + metrics.menu_item_pad_x, my0 + (menu_h - mb_label_size) * 0.5f),
 				aida::ui::with_alpha(tcol, a), menus[i].label);
 
 			bool need_open = false;
@@ -4151,8 +4402,8 @@ void helpers::render_title()
 			if (is_open) {
 				ImGui::SetNextWindowPos(ImVec2(bmin.x, my1 + 4.f));
 				ImGui::SetNextWindowBgAlpha(1.0f);
-				ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10.f);
-				ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6.f, 8.f));
+				ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, metrics.corner_radius);
+				ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(gap * 1.5f, gap * 2.f));
 				ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.f, 0.f));
 				ImGui::PushStyleColor(ImGuiCol_PopupBg, ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th_mb.panel_bg, 1.f)));
 				ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0,0,0,0));
@@ -4163,7 +4414,7 @@ void helpers::render_title()
 
 				if (ImGui::BeginPopup(popup_id)) {
 					float mw = 280.f;
-					float ih = 34.f;
+					float ih = aida::ui::scale_px(32.f, metrics.scale);
 
 					ImVec2 pwp = ImGui::GetWindowPos();
 					ImVec2 pws = ImGui::GetWindowSize();
@@ -4171,15 +4422,15 @@ void helpers::render_title()
 					ImVec2 pb(pwp.x + pws.x, pwp.y + pws.y);
 					ImDrawList* pdl = ImGui::GetWindowDrawList();
 					aida::ui::blur::layer_request_t pr;
-					pr.pos = pa; pr.size = pws; pr.radius = 10.f; pr.strength = 0.85f; pr.alpha = 1.f;
+					pr.pos = pa; pr.size = pws; pr.radius = metrics.corner_radius; pr.strength = 0.85f; pr.alpha = 1.f;
 					aida::ui::blur::schedule(pr);
-					aida::ui::blur::render_drop_shadow(pdl, pa, pb, 10.f, 5, 0.55f, ImVec2(0.f, 8.f));
+					aida::ui::blur::render_drop_shadow(pdl, pa, pb, metrics.corner_radius, 5, 0.55f, ImVec2(0.f, gap * 2.f));
 					{
 						const auto& th_pp = aida::ui::resolved();
 						pdl->AddRectFilled(pa, pb,
-							aida::ui::with_alpha(th_pp.panel_bg, 1.0f), 10.f);
+							aida::ui::with_alpha(th_pp.panel_bg, 1.0f), metrics.corner_radius);
 					}
-					aida::ui::blur::render_glass_border(pdl, pa, pb, 10.f, 1.f, 1.f);
+					aida::ui::blur::render_glass_border(pdl, pa, pb, metrics.corner_radius, 1.f, 1.f);
 
 					auto menu_item = [&](const char* label, const char* shortcut, bool enabled = true) -> bool {
 						const auto& th_p = aida::ui::resolved();
@@ -4428,10 +4679,10 @@ void helpers::render_title()
 
 	{
 		ImVec2 wp = ImGui::GetWindowPos();
-		float  sp_w = 5.f;
+		float  sp_w = metrics.splitter_w;
 
 
-		float ab_offset = g_sa_settings.activity_bar_visible ? globals::ui::activity_bar_w : 0.f;
+		float ab_offset = g_sa_settings.activity_bar_visible ? metrics.activity_bar_w : 0.f;
 		float ls_x = wp.x + pad + ab_offset + left_w;
 		ImVec2 ls_min(ls_x - sp_w * 0.5f, wp.y + content_top);
 		ImVec2 ls_max(ls_x + sp_w * 0.5f + gap, wp.y + content_top + total_h);
@@ -4488,7 +4739,7 @@ void helpers::render_title()
 				globals::ui::dragging_bottom_splitter = false;
 			if (globals::ui::dragging_bottom_splitter) {
 				float my = wp.y + wh - pad - status_h - ImGui::GetIO().MousePos.y;
-				globals::ui::panel_bottom_h = std::clamp(my, 80.f, wh * 0.5f);
+				globals::ui::panel_bottom_h = std::clamp(my, aida::ui::scale_px(96.f, metrics.scale), wh * 0.5f);
 
 			}
 			if (bs_hov || globals::ui::dragging_bottom_splitter)
@@ -4517,7 +4768,7 @@ void helpers::render_title()
 			float ax_sp = globals::ui::accent.x, ay_sp = globals::ui::accent.y, az_sp = globals::ui::accent.z;
 			ImU32 accent_line = IM_COL32((int)(ax_sp*255),(int)(ay_sp*255),(int)(az_sp*255),(int)(220 * a));
 			ImU32 idle_line   = aida::ui::with_alpha(th_sp.border_strong, 0.55f * a);
-			float ab_off_line = g_sa_settings.activity_bar_visible ? globals::ui::activity_bar_w : 0.f;
+			float ab_off_line = g_sa_settings.activity_bar_visible ? metrics.activity_bar_w : 0.f;
 			if (globals::ui::panel_left_visible && left_w > 1.f) {
 				float lsx = wp.x + pad + ab_off_line + left_w + gap * 0.5f;
 				bool active = globals::ui::dragging_left_splitter ||
@@ -4571,7 +4822,7 @@ void helpers::render_title()
 
 	if (g_sa_settings.activity_bar_visible) {
 		const auto& th_ab = aida::ui::resolved();
-		const float ab_w = globals::ui::activity_bar_w;
+		const float ab_w = metrics.activity_bar_w;
 		ImVec2 ab_pos(wp_m.x + pad, wp_m.y + content_top);
 		ImVec2 ab_end(ab_pos.x + ab_w, ab_pos.y + total_h);
 
@@ -4599,7 +4850,7 @@ void helpers::render_title()
 		ImGuiStorage* ab_storage = ImGui::GetStateStorage();
 		for (int ai = 0; ai < ab_count; ai++) {
 			bool active = (globals::ui::active_activity == ab_items[ai].item);
-			float icon_sz = 36.f;
+			float icon_sz = metrics.activity_icon;
 			ImVec2 imin(ab_pos.x + (ab_w - icon_sz) * 0.5f, iy);
 			ImVec2 imax(imin.x + icon_sz, imin.y + icon_sz);
 			bool ihov = ImGui::IsMouseHoveringRect(imin, imax);
@@ -4645,7 +4896,7 @@ void helpers::render_title()
 					globals::ui::panel_left_visible = true;
 				}
 			}
-			iy += icon_sz + 8.f;
+			iy += icon_sz + gap * 2.f;
 		}
 
 		if (ab_active_y0 >= 0.f && globals::ui::panel_left_visible) {
@@ -4672,14 +4923,14 @@ void helpers::render_title()
 
 
 		{
-			float footer_h = 52.f;
+			float footer_h = metrics.activity_footer_h;
 			ImVec2 fmin(ab_pos.x, ab_end.y - footer_h);
 			ImVec2 fmax(ab_pos.x + ab_w, ab_end.y);
 			wdl->AddLine(ImVec2(fmin.x + 6.f, fmin.y),
 				ImVec2(fmax.x - 6.f, fmin.y),
 				aida::ui::with_alpha(th_ab.border_subtle, a * 0.7f), 1.f);
 
-			float gear_sz = 32.f;
+			float gear_sz = metrics.activity_icon * 0.89f;
 			ImVec2 gmin(ab_pos.x + (ab_w - gear_sz) * 0.5f, fmin.y + (footer_h - gear_sz) * 0.5f);
 			ImVec2 gmax(gmin.x + gear_sz, gmin.y + gear_sz);
 			bool ghov = ImGui::IsMouseHoveringRect(gmin, gmax);
@@ -5210,7 +5461,7 @@ void helpers::render_title()
 	g_render_section = "left_panel_done";
 	}
 
-	float ab_extra = g_sa_settings.activity_bar_visible ? globals::ui::activity_bar_w : 0.f;
+	float ab_extra = g_sa_settings.activity_bar_visible ? metrics.activity_bar_w : 0.f;
 	float left_gap = (left_w > 1.f) ? (left_w + gap + ab_extra) : ab_extra;
 	float right_gap_w = globals::ui::panel_right_visible ? (right_w + gap) : 0.f;
 	float hx0 = wp_m.x + pad + left_gap, hy0 = wp_m.y + content_top;
@@ -5218,14 +5469,14 @@ void helpers::render_title()
 	float hy1  = hy0 + hdr_h;
 	float dc_y1 = wp_m.y + content_top + total_h;
 
-	auto& th_cp = themes::resolved;
+	const auto& th_cp = aida::ui::resolved();
 
 	wdl->AddRectFilled(ImVec2(hx0, hy0), ImVec2(hx1, dc_y1),
-		th_cp.panel_bg, 8.f);
+		th_cp.panel_bg, metrics.corner_radius);
 
 
 	wdl->AddRectFilled(ImVec2(hx0, hy0), ImVec2(hx1, hy1),
-		th_cp.panel_header, 8.f, ImDrawFlags_RoundCornersTop);
+		th_cp.panel_header, metrics.corner_radius, ImDrawFlags_RoundCornersTop);
 
 
 	const float sep_y = hy0 + hdr_h * 0.5f;
@@ -8453,8 +8704,8 @@ void helpers::render_title()
 
 
 			const char* btab_names[] = { "Output", "MCP Log", "Driver", "Sandbox", "Terminal" };
-			float btab_x = 8.f;
-			float btab_h = 24.f;
+			float btab_x = gap * 2.f;
+			float btab_h = metrics.bottom_tab_h;
 
 			ImGuiID ul_xid = ImGui::GetID("##bt_ul_x");
 			ImGuiID ul_wid = ImGui::GetID("##bt_ul_w");
@@ -8464,9 +8715,9 @@ void helpers::render_title()
 
 			for (int bt = 0; bt < (int)bottom_tab_t::COUNT; bt++) {
 				ImVec2 bts = ImGui::CalcTextSize(btab_names[bt]);
-				float btw = bts.x + 16.f;
-				ImVec2 btmin(bwp.x + btab_x, bwp.y + 2.f);
-				ImVec2 btmax(btmin.x + btw, btmin.y + btab_h - 2.f);
+				float btw = bts.x + gap * 4.f;
+				ImVec2 btmin(bwp.x + btab_x, bwp.y + gap * 0.5f);
+				ImVec2 btmax(btmin.x + btw, btmin.y + btab_h - gap * 0.5f);
 				bool btact = (static_cast<int>(globals::ui::active_bottom_tab) == bt);
 
 				ImGui::PushID(btab_names[bt]);
@@ -8477,9 +8728,9 @@ void helpers::render_title()
 				ImGui::PopID();
 
 				if (btact)
-					bdl->AddRectFilled(btmin, btmax, aida::ui::with_alpha(th_lp.border_subtle, a), 3.f);
+					bdl->AddRectFilled(btmin, btmax, aida::ui::with_alpha(th_lp.border_subtle, a), metrics.control_radius);
 				else if (bthov)
-					bdl->AddRectFilled(btmin, btmax, aida::ui::with_alpha(th_lp.hover_wash, 0.45f * a), 3.f);
+					bdl->AddRectFilled(btmin, btmax, aida::ui::with_alpha(th_lp.hover_wash, 0.45f * a), metrics.control_radius);
 
 				if (btact) {
 					ul_tgt_x = btmin.x + 4.f;
@@ -8488,12 +8739,12 @@ void helpers::render_title()
 
 				ImU32 btc = btact ? aida::ui::with_alpha(th_lp.text_primary, a)
 				                  : aida::ui::with_alpha(th_lp.text_secondary, a);
-				bdl->AddText(ImVec2(btmin.x + 8.f, btmin.y + (btab_h - 2.f - bts.y) * 0.5f), btc, btab_names[bt]);
+				bdl->AddText(ImVec2(btmin.x + gap * 2.f, btmin.y + ((btmax.y - btmin.y) - bts.y) * 0.5f), btc, btab_names[bt]);
 
 				if (btclick)
 					globals::ui::active_bottom_tab = static_cast<bottom_tab_t>(bt);
 
-				btab_x += btw + 2.f;
+				btab_x += btw + gap * 0.5f;
 			}
 
 			if (ul_tgt_x >= 0.f) {
@@ -8515,16 +8766,17 @@ void helpers::render_title()
 				g_render_section = "bottom_panel_actions";
 				const char* clr = "Clear";
 				ImVec2 cts = ImGui::CalcTextSize(clr);
-				ImVec2 cmin(bwp.x + bfw - cts.x - 16.f, bwp.y + 4.f);
-				ImVec2 cmax(cmin.x + cts.x + 8.f, cmin.y + btab_h - 6.f);
+				float action_h = metrics.bottom_action_h;
+				ImVec2 cmin(bwp.x + bfw - cts.x - gap * 4.f, bwp.y + (btab_h - action_h) * 0.5f);
+				ImVec2 cmax(cmin.x + cts.x + gap * 2.f, cmin.y + action_h);
 				ImGui::PushID("##bottom_clear");
 				ImGui::SetCursorScreenPos(cmin);
 				ImGui::InvisibleButton("##bclear", ImVec2(cmax.x - cmin.x, cmax.y - cmin.y));
 				bool chov = ImGui::IsItemHovered();
 				bool cclick = ImGui::IsItemClicked(ImGuiMouseButton_Left);
 				ImGui::PopID();
-				if (chov) bdl->AddRectFilled(cmin, cmax, aida::ui::with_alpha(th_lp.hover_wash, a), 3.f);
-				bdl->AddText(ImVec2(cmin.x + 4.f, cmin.y + 1.f), aida::ui::with_alpha(th_lp.text_secondary, (chov ? 1.f : 0.64f) * a), clr);
+				if (chov) bdl->AddRectFilled(cmin, cmax, aida::ui::with_alpha(th_lp.hover_wash, a), metrics.control_radius);
+				bdl->AddText(ImVec2(cmin.x + gap, cmin.y + (action_h - cts.y) * 0.5f), aida::ui::with_alpha(th_lp.text_secondary, (chov ? 1.f : 0.64f) * a), clr);
 				if (cclick) {
 					if (globals::ui::active_bottom_tab == bottom_tab_t::terminal) {
 						auto& tmgr_clear = globals::terminal_mgr;
@@ -8543,16 +8795,16 @@ void helpers::render_title()
 
 				const char* cpy = "Copy";
 				ImVec2 yts = ImGui::CalcTextSize(cpy);
-				ImVec2 ymin(cmin.x - yts.x - 22.f, cmin.y);
-				ImVec2 ymax(ymin.x + yts.x + 8.f, cmin.y + btab_h - 6.f);
+				ImVec2 ymin(cmin.x - yts.x - gap * 4.f, cmin.y);
+				ImVec2 ymax(ymin.x + yts.x + gap * 2.f, cmin.y + action_h);
 				ImGui::PushID("##bottom_copy");
 				ImGui::SetCursorScreenPos(ymin);
 				ImGui::InvisibleButton("##bcopy", ImVec2(ymax.x - ymin.x, ymax.y - ymin.y));
 				bool yhov = ImGui::IsItemHovered();
 				bool yclick = ImGui::IsItemClicked(ImGuiMouseButton_Left);
 				ImGui::PopID();
-				if (yhov) bdl->AddRectFilled(ymin, ymax, aida::ui::with_alpha(th_lp.hover_wash, a), 3.f);
-				bdl->AddText(ImVec2(ymin.x + 4.f, ymin.y + 1.f), aida::ui::with_alpha(th_lp.text_secondary, (yhov ? 1.f : 0.64f) * a), cpy);
+				if (yhov) bdl->AddRectFilled(ymin, ymax, aida::ui::with_alpha(th_lp.hover_wash, a), metrics.control_radius);
+				bdl->AddText(ImVec2(ymin.x + gap, ymin.y + (action_h - yts.y) * 0.5f), aida::ui::with_alpha(th_lp.text_secondary, (yhov ? 1.f : 0.64f) * a), cpy);
 				if (yclick) {
 					if (globals::ui::active_bottom_tab == bottom_tab_t::terminal) {
 						auto& tmgr_cpy = globals::terminal_mgr;
@@ -8588,7 +8840,7 @@ void helpers::render_title()
 				aida::ui::with_alpha(th_lp.border_subtle, a));
 
 
-			float log_y = btab_h + 4.f;
+			float log_y = btab_h + gap;
 			ImGui::SetCursorPos(ImVec2(0.f, log_y));
 			ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 0.f));
 			g_render_section = "bottom_panel_scroll_begin";
@@ -8755,6 +9007,9 @@ void helpers::render_title()
 		g_render_section = "bottom_panel_end_child";
 		end_child();
 	}
+
+	g_render_section = "status_bar";
+	shell_render_status_bar(ww, wh, metrics, a, runtime_ready);
 
 
 	{

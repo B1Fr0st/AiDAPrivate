@@ -4,7 +4,6 @@
 #include "net_proto_analysis.hpp"
 
 #include "game_protocol.hpp"
-#include "pre_encrypt_hook.hpp"
 #include "standalone_driver.hpp"
 #include "../mcp/mcp_standalone.hpp"
 #include "helpers/diag_log.hpp"
@@ -12,10 +11,12 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <set>
@@ -42,13 +43,28 @@ enum class socket_module_kind_t {
 
 struct udp_message_t {
     std::uint64_t sequence = 0;
+    std::uint64_t ack = 0;
     std::vector<std::uint8_t> payload;
     std::uint32_t local_port = 0;
     std::uint32_t remote_port = 0;
     std::uint32_t address_family = 2;
     std::uint8_t local_addr[16] = {};
     std::uint8_t remote_addr[16] = {};
+    std::string src;
+    std::string dst;
+    std::string src_ip;
+    std::string dst_ip;
+    std::uint32_t src_port = 0;
+    std::uint32_t dst_port = 0;
     std::string scheme;
+    bool reassembled = false;
+    bool reassembly_complete = true;
+    std::uint32_t fragment_id = 0;
+    std::uint32_t fragment_index = 0;
+    std::uint32_t fragment_count = 0;
+    std::uint32_t fragment_offset = 0;
+    std::uint32_t logical_size = 0;
+    nlohmann::json reassembly_evidence = nlohmann::json::array();
 };
 
 struct udp_session_t {
@@ -56,6 +72,92 @@ struct udp_session_t {
     std::string key;
     std::uint64_t created_ms = 0;
     std::vector<udp_message_t> messages;
+};
+
+struct internal_call_t {
+    std::uint64_t call_va = 0;
+    std::uint64_t target_va = 0;
+    std::size_t offset = 0;
+    std::string relation;
+};
+
+struct callsite_context_t {
+    std::uint64_t function_start = 0;
+    std::uint64_t function_end = 0;
+    std::uint64_t basic_block_start = 0;
+    std::uint64_t basic_block_end = 0;
+    std::uint64_t serializer_candidate = 0;
+    std::uint64_t deserializer_candidate = 0;
+    double candidate_confidence = 0.0;
+    nlohmann::json upstream_calls = nlohmann::json::array();
+    nlohmann::json downstream_calls = nlohmann::json::array();
+    nlohmann::json evidence = nlohmann::json::array();
+};
+
+struct serializer_sample_t {
+    std::vector<std::uint8_t> buffer;
+    std::uint64_t timestamp = 0;
+    std::uint64_t thread_id = 0;
+    std::uint64_t rip = 0;
+    std::string function_name;
+    std::string backend;
+    std::string module_name;
+    std::uint64_t module_offset = 0;
+};
+
+struct udp_fragment_info_t {
+    bool valid = false;
+    std::size_t header_size = 0;
+    std::uint64_t sequence = 0;
+    std::uint64_t ack = 0;
+    std::uint32_t fragment_id = 0;
+    std::uint32_t fragment_index = 0;
+    std::uint32_t fragment_count = 0;
+    std::uint32_t fragment_offset = 0;
+    std::uint32_t declared_payload_size = 0;
+    std::uint32_t logical_size = 0;
+    std::string scheme;
+    double confidence = 0.0;
+    nlohmann::json evidence = nlohmann::json::array();
+};
+
+struct udp_fragment_piece_t {
+    udp_message_t message;
+    udp_fragment_info_t fragment;
+};
+
+struct udp_fragment_group_t {
+    std::string session_key;
+    std::vector<udp_message_t> pieces;
+};
+
+struct scored_call_t {
+    internal_call_t call;
+    double score = 0.0;
+    nlohmann::json evidence = nlohmann::json::array();
+    nlohmann::json nested_calls = nlohmann::json::array();
+};
+
+struct numeric_field_candidate_t {
+    std::size_t offset = 0;
+    std::size_t size = 0;
+    bool big_endian = false;
+    std::uint64_t value = 0;
+    std::string type;
+    double confidence = 0.0;
+    nlohmann::json evidence = nlohmann::json::array();
+};
+
+struct mutation_payload_t {
+    std::vector<std::uint8_t> payload;
+    nlohmann::json evidence;
+    std::size_t source_message_index = 0;
+    std::size_t field_offset = 0;
+    std::size_t field_size = 0;
+    bool big_endian = false;
+    std::uint64_t original_value = 0;
+    std::uint64_t mutated_value = 0;
+    std::string strategy;
 };
 
 struct scan_deadline_t {
@@ -167,6 +269,8 @@ nlohmann::json replay_mutate_error_data(const replay_mutate_options_t& input,
         {"active_session_ids", active_ids},
         {"target_ip", input.target_ip},
         {"target_port", input.target_port},
+        {"mutation_strategy", input.mutation_strategy},
+        {"allowed_mutation_strategies", nlohmann::json::array({"boundary", "random", "bitflip"})},
         {"allow_unsafe", input.allow_unsafe},
         {"confirm_unsafe", input.confirm_unsafe},
         {"allow_non_loopback", input.allow_non_loopback},
@@ -1404,6 +1508,454 @@ std::uint64_t nearest_internal_call(const std::vector<std::uint8_t>& bytes,
     return 0;
 }
 
+bool va_in_scan(std::uint64_t va, std::uint64_t base, std::size_t size)
+{
+    const std::uint64_t span = static_cast<std::uint64_t>(size);
+    if (span > UINT64_MAX - base)
+        return va >= base;
+    return va >= base && va < base + span;
+}
+
+bool is_ret_or_trap(std::uint8_t op)
+{
+    return op == 0xc3 || op == 0xc2 || op == 0xcc;
+}
+
+bool is_branch_opcode(const std::vector<std::uint8_t>& bytes, std::size_t off)
+{
+    if (off >= bytes.size())
+        return false;
+    const std::uint8_t op = bytes[off];
+    if (op == 0xe9 || op == 0xeb || op == 0xff || (op >= 0x70 && op <= 0x7f) || is_ret_or_trap(op))
+        return true;
+    return op == 0x0f && off + 1 < bytes.size() && bytes[off + 1] >= 0x80 && bytes[off + 1] <= 0x8f;
+}
+
+std::size_t find_probable_function_end(const std::vector<std::uint8_t>& bytes,
+                                       std::size_t call_off,
+                                       std::size_t function_start)
+{
+    const std::size_t max_end = (std::min)(bytes.size(), (std::max)(call_off + 6, function_start) + std::size_t(8192));
+    for (std::size_t i = call_off + 5; i < max_end; ++i) {
+        if (is_ret_or_trap(bytes[i])) {
+            std::size_t end = i + 1;
+            while (end < bytes.size() && bytes[end] == 0xcc && end - i < 32)
+                ++end;
+            return end;
+        }
+        if (i + 4 < max_end) {
+            const bool prologue = bytes[i] == 0x40 && (bytes[i + 1] == 0x53 || bytes[i + 1] == 0x55 || bytes[i + 1] == 0x57);
+            if (prologue && i > call_off + 16)
+                return i;
+        }
+    }
+    return max_end;
+}
+
+std::size_t find_basic_block_start(const std::vector<std::uint8_t>& bytes,
+                                   std::size_t function_start,
+                                   std::size_t call_off)
+{
+    std::size_t best = function_start;
+    const std::size_t lo = call_off > 256 ? call_off - 256 : function_start;
+    for (std::size_t i = call_off; i-- > lo; ) {
+        if (is_branch_opcode(bytes, i)) {
+            best = (std::min)(call_off, i + 1);
+            break;
+        }
+    }
+    return (std::max)(best, function_start);
+}
+
+std::size_t find_basic_block_end(const std::vector<std::uint8_t>& bytes,
+                                 std::size_t call_off,
+                                 std::size_t function_end)
+{
+    const std::size_t hi = (std::min)(function_end, call_off + std::size_t(256));
+    for (std::size_t i = call_off + 5; i < hi; ++i) {
+        if (is_branch_opcode(bytes, i))
+            return i + 1;
+    }
+    return hi;
+}
+
+std::vector<internal_call_t> collect_internal_calls(const std::vector<std::uint8_t>& bytes,
+                                                    std::size_t start,
+                                                    std::size_t end,
+                                                    std::uint64_t base,
+                                                    const std::set<std::uint64_t>& excluded_targets)
+{
+    std::vector<internal_call_t> calls;
+    end = (std::min)(end, bytes.size());
+    for (std::size_t i = start; i + 5 <= end; ++i) {
+        if (bytes[i] != 0xe8)
+            continue;
+        std::int32_t rel = 0;
+        std::memcpy(&rel, bytes.data() + i + 1, sizeof(rel));
+        const std::uint64_t target = rel32_target(base + i + 5, rel);
+        if (excluded_targets.find(target) != excluded_targets.end())
+            continue;
+        if (!va_in_scan(target, base, bytes.size()))
+            continue;
+        internal_call_t c;
+        c.call_va = base + i;
+        c.target_va = target;
+        c.offset = i;
+        calls.push_back(c);
+    }
+    return calls;
+}
+
+bool window_has_bytes(const std::vector<std::uint8_t>& bytes,
+                      std::size_t start,
+                      std::size_t end,
+                      const std::vector<std::uint8_t>& pattern)
+{
+    if (pattern.empty())
+        return false;
+    end = (std::min)(end, bytes.size());
+    for (std::size_t i = start; i + pattern.size() <= end; ++i) {
+        bool match = true;
+        for (std::size_t j = 0; j < pattern.size(); ++j) {
+            if (bytes[i + j] != pattern[j]) {
+                match = false;
+                break;
+            }
+        }
+        if (match)
+            return true;
+    }
+    return false;
+}
+
+nlohmann::json calls_to_json(const std::vector<internal_call_t>& calls,
+                             std::size_t call_off,
+                             std::size_t max_items)
+{
+    nlohmann::json out = nlohmann::json::array();
+    for (const auto& c : calls) {
+        if (out.size() >= max_items)
+            break;
+        nlohmann::json item;
+        item["call_va"] = fmt_addr(c.call_va);
+        item["target_va"] = fmt_addr(c.target_va);
+        item["distance_bytes"] = c.offset > call_off ? c.offset - call_off : call_off - c.offset;
+        item["relation"] = c.offset < call_off ? "upstream" : "downstream";
+        out.push_back(std::move(item));
+    }
+    return out;
+}
+
+std::pair<std::size_t, std::size_t> target_function_bounds(const std::vector<std::uint8_t>& bytes,
+                                                           std::uint64_t base,
+                                                           std::uint64_t target_va)
+{
+    if (!va_in_scan(target_va, base, bytes.size()))
+        return {0, 0};
+    const std::size_t target_off = static_cast<std::size_t>(target_va - base);
+    const std::size_t end = find_probable_function_end(bytes, target_off, target_off);
+    return {target_off, end};
+}
+
+std::size_t count_byte_pattern(const std::vector<std::uint8_t>& bytes,
+                               std::size_t start,
+                               std::size_t end,
+                               const std::vector<std::uint8_t>& pattern)
+{
+    if (pattern.empty())
+        return 0;
+    std::size_t count = 0;
+    end = (std::min)(end, bytes.size());
+    for (std::size_t i = start; i + pattern.size() <= end; ++i) {
+        bool match = true;
+        for (std::size_t j = 0; j < pattern.size(); ++j) {
+            if (bytes[i + j] != pattern[j]) {
+                match = false;
+                break;
+            }
+        }
+        if (match)
+            ++count;
+    }
+    return count;
+}
+
+std::size_t count_store_like_ops(const std::vector<std::uint8_t>& bytes,
+                                 std::size_t start,
+                                 std::size_t end)
+{
+    std::size_t count = 0;
+    end = (std::min)(end, bytes.size());
+    for (std::size_t i = start; i < end; ++i) {
+        const std::uint8_t op = bytes[i];
+        if (op == 0x88 || op == 0x89 || op == 0xc6 || op == 0xc7)
+            ++count;
+        if (i + 2 < end && (op == 0x66 || op == 0x44 || op == 0x48) && (bytes[i + 1] == 0x89 || bytes[i + 1] == 0x88))
+            ++count;
+    }
+    return count;
+}
+
+std::size_t count_compare_like_ops(const std::vector<std::uint8_t>& bytes,
+                                   std::size_t start,
+                                   std::size_t end)
+{
+    std::size_t count = 0;
+    end = (std::min)(end, bytes.size());
+    for (std::size_t i = start; i < end; ++i) {
+        const std::uint8_t op = bytes[i];
+        if (op == 0x38 || op == 0x39 || op == 0x3a || op == 0x3b || op == 0x3c || op == 0x3d || op == 0x80 || op == 0x81 || op == 0x83 || op == 0x84 || op == 0x85)
+            ++count;
+    }
+    return count;
+}
+
+nlohmann::json nested_calls_to_json(const std::vector<std::uint8_t>& bytes,
+                                    std::uint64_t base,
+                                    std::uint64_t target_va,
+                                    const std::set<std::uint64_t>& excluded_targets)
+{
+    nlohmann::json out = nlohmann::json::array();
+    const auto bounds = target_function_bounds(bytes, base, target_va);
+    if (bounds.first == bounds.second)
+        return out;
+    const auto nested = collect_internal_calls(bytes, bounds.first, bounds.second, base, excluded_targets);
+    for (const auto& c : nested) {
+        if (out.size() >= 6)
+            break;
+        out.push_back(nlohmann::json{{"call_va", fmt_addr(c.call_va)}, {"target_va", fmt_addr(c.target_va)}});
+    }
+    return out;
+}
+
+scored_call_t score_internal_call_candidate(const std::vector<std::uint8_t>& bytes,
+                                            std::uint64_t base,
+                                            const internal_call_t& call,
+                                            std::size_t api_call_off,
+                                            std::size_t block_start,
+                                            std::size_t block_end,
+                                            bool serializer,
+                                            const std::set<std::uint64_t>& excluded_targets)
+{
+    scored_call_t scored;
+    scored.call = call;
+    const std::size_t distance = call.offset > api_call_off ? call.offset - api_call_off : api_call_off - call.offset;
+    scored.score = serializer ? 0.48 : 0.46;
+    scored.evidence.push_back(serializer ? "candidate_precedes_send_api" : "candidate_follows_recv_api");
+    scored.evidence.push_back("distance_bytes=" + std::to_string(distance));
+    if (call.offset >= block_start && call.offset < block_end) {
+        scored.score += 0.09;
+        scored.evidence.push_back("same_basic_block");
+    }
+    if (distance <= 64) {
+        scored.score += 0.08;
+        scored.evidence.push_back("near_api_callsite");
+    } else if (distance <= 192) {
+        scored.score += 0.04;
+        scored.evidence.push_back("same_function_near_api_callsite");
+    }
+
+    const std::size_t lo = serializer ? (std::min)(call.offset + std::size_t(5), api_call_off) : api_call_off + 5;
+    const std::size_t hi = serializer ? api_call_off : call.offset;
+    if (serializer) {
+        if (window_has_bytes(bytes, lo, hi, {0x48, 0x8b, 0xd0}) || window_has_bytes(bytes, lo, hi, {0x48, 0x89, 0xc2}) ||
+            window_has_bytes(bytes, lo, hi, {0x4c, 0x8b, 0xc0}) || window_has_bytes(bytes, lo, hi, {0x49, 0x89, 0xc0})) {
+            scored.score += 0.09;
+            scored.evidence.push_back("return_value_or_buffer_register_forwarded");
+        }
+        if (window_has_bytes(bytes, lo, hi, {0x48, 0x8d}) || window_has_bytes(bytes, lo, hi, {0x4c, 0x8d})) {
+            scored.score += 0.04;
+            scored.evidence.push_back("buffer_address_materialized");
+        }
+    } else {
+        if (window_has_bytes(bytes, lo, hi, {0x85, 0xc0}) || window_has_bytes(bytes, lo, hi, {0x83, 0xf8}) || window_has_bytes(bytes, lo, hi, {0x3d})) {
+            scored.score += 0.09;
+            scored.evidence.push_back("recv_result_checked_before_candidate");
+        }
+        if (window_has_bytes(bytes, lo, hi, {0x48, 0x8d}) || window_has_bytes(bytes, lo, hi, {0x48, 0x8b}) || window_has_bytes(bytes, lo, hi, {0x4c, 0x8d})) {
+            scored.score += 0.04;
+            scored.evidence.push_back("receive_buffer_forwarded_to_candidate");
+        }
+    }
+
+    const auto bounds = target_function_bounds(bytes, base, call.target_va);
+    if (bounds.first != bounds.second) {
+        const std::size_t stores = count_store_like_ops(bytes, bounds.first, bounds.second);
+        const std::size_t compares = count_compare_like_ops(bytes, bounds.first, bounds.second);
+        const std::size_t nested_count = collect_internal_calls(bytes, bounds.first, bounds.second, base, excluded_targets).size();
+        if (serializer && stores >= 3) {
+            scored.score += 0.07;
+            scored.evidence.push_back("candidate_body_has_multiple_store_ops");
+        }
+        if (!serializer && compares >= 3) {
+            scored.score += 0.07;
+            scored.evidence.push_back("candidate_body_has_multiple_compare_ops");
+        }
+        if (count_byte_pattern(bytes, bounds.first, bounds.second, {0x0f, 0xb6}) != 0 || count_byte_pattern(bytes, bounds.first, bounds.second, {0x0f, 0xb7}) != 0) {
+            scored.score += 0.03;
+            scored.evidence.push_back(serializer ? "candidate_body_byte_word_materialization" : "candidate_body_byte_word_parse");
+        }
+        if (nested_count != 0) {
+            scored.score += 0.02;
+            scored.evidence.push_back("candidate_body_has_nested_calls=" + std::to_string(nested_count));
+            scored.nested_calls = nested_calls_to_json(bytes, base, call.target_va, excluded_targets);
+        }
+        scored.evidence.push_back("candidate_body_range=" + fmt_addr(base + bounds.first) + "-" + fmt_addr(base + bounds.second));
+    }
+    scored.score = (std::min)(0.93, scored.score);
+    return scored;
+}
+
+nlohmann::json scored_calls_to_json(const std::vector<scored_call_t>& calls,
+                                    std::size_t max_items)
+{
+    nlohmann::json out = nlohmann::json::array();
+    for (const auto& c : calls) {
+        if (out.size() >= max_items)
+            break;
+        nlohmann::json item;
+        item["call_va"] = fmt_addr(c.call.call_va);
+        item["target_va"] = fmt_addr(c.call.target_va);
+        item["score"] = c.score;
+        item["evidence"] = c.evidence;
+        item["nested_calls"] = c.nested_calls;
+        out.push_back(std::move(item));
+    }
+    return out;
+}
+
+int register_call_id(const std::vector<std::uint8_t>& bytes, std::size_t off, std::size_t& call_size)
+{
+    call_size = 0;
+    if (off + 2 <= bytes.size() && bytes[off] == 0xff && bytes[off + 1] >= 0xd0 && bytes[off + 1] <= 0xd7) {
+        call_size = 2;
+        return bytes[off + 1] - 0xd0;
+    }
+    if (off + 3 <= bytes.size() && bytes[off] == 0x41 && bytes[off + 1] == 0xff && bytes[off + 2] >= 0xd0 && bytes[off + 2] <= 0xd7) {
+        call_size = 3;
+        return 8 + bytes[off + 2] - 0xd0;
+    }
+    return -1;
+}
+
+const api_target_t* resolve_recent_register_import_call(const std::vector<std::uint8_t>& bytes,
+                                                        std::size_t call_off,
+                                                        std::uint64_t base,
+                                                        const std::map<std::uint64_t, const api_target_t*>& import_slots,
+                                                        std::uint64_t& slot_va,
+                                                        std::uint64_t& load_va)
+{
+    std::size_t call_size = 0;
+    const int reg = register_call_id(bytes, call_off, call_size);
+    if (reg < 0)
+        return nullptr;
+    (void)call_size;
+    const std::size_t start = call_off > 48 ? call_off - 48 : 0;
+    for (std::size_t j = call_off; j-- > start; ) {
+        if (j + 7 > bytes.size())
+            continue;
+        const std::uint8_t rex = bytes[j];
+        if ((rex != 0x48 && rex != 0x4c) || bytes[j + 1] != 0x8b)
+            continue;
+        const std::uint8_t modrm = bytes[j + 2];
+        if ((modrm & 0xc7) != 0x05)
+            continue;
+        const int loaded_reg = ((modrm >> 3) & 0x7) + (rex == 0x4c ? 8 : 0);
+        if (loaded_reg != reg)
+            continue;
+        std::int32_t rel = 0;
+        std::memcpy(&rel, bytes.data() + j + 3, sizeof(rel));
+        const std::uint64_t candidate_slot = rel32_target(base + j + 7, rel);
+        auto it = import_slots.find(candidate_slot);
+        if (it != import_slots.end()) {
+            slot_va = candidate_slot;
+            load_va = base + j;
+            return it->second;
+        }
+    }
+    return nullptr;
+}
+
+callsite_context_t analyze_sendrecv_context(const std::vector<std::uint8_t>& bytes,
+                                            std::uint64_t bytes_base,
+                                            std::size_t call_off,
+                                            const api_target_t& api,
+                                            const std::set<std::uint64_t>& excluded_targets)
+{
+    callsite_context_t ctx;
+    if (call_off >= bytes.size())
+        return ctx;
+    const std::uint64_t function_start_va = find_probable_function_start(bytes, call_off, bytes_base);
+    std::size_t function_start = function_start_va >= bytes_base && function_start_va < bytes_base + bytes.size()
+        ? static_cast<std::size_t>(function_start_va - bytes_base)
+        : (call_off > 512 ? call_off - 512 : 0);
+    const std::size_t function_end = find_probable_function_end(bytes, call_off, function_start);
+    const std::size_t block_start = find_basic_block_start(bytes, function_start, call_off);
+    const std::size_t block_end = find_basic_block_end(bytes, call_off, function_end);
+    ctx.function_start = bytes_base + function_start;
+    ctx.function_end = bytes_base + function_end;
+    ctx.basic_block_start = bytes_base + block_start;
+    ctx.basic_block_end = bytes_base + block_end;
+
+    auto upstream = collect_internal_calls(bytes, function_start, call_off, bytes_base, excluded_targets);
+    auto downstream = collect_internal_calls(bytes, call_off + 5, function_end, bytes_base, excluded_targets);
+    std::sort(upstream.begin(), upstream.end(), [call_off](const internal_call_t& a, const internal_call_t& b) {
+        const std::size_t da = a.offset > call_off ? a.offset - call_off : call_off - a.offset;
+        const std::size_t db = b.offset > call_off ? b.offset - call_off : call_off - b.offset;
+        return da < db;
+    });
+    std::sort(downstream.begin(), downstream.end(), [call_off](const internal_call_t& a, const internal_call_t& b) {
+        const std::size_t da = a.offset > call_off ? a.offset - call_off : call_off - a.offset;
+        const std::size_t db = b.offset > call_off ? b.offset - call_off : call_off - b.offset;
+        return da < db;
+    });
+    ctx.upstream_calls = calls_to_json(upstream, call_off, 8);
+    ctx.downstream_calls = calls_to_json(downstream, call_off, 8);
+    ctx.evidence.push_back("same_function_cfg_window");
+    ctx.evidence.push_back("function_start=" + fmt_addr(ctx.function_start));
+    ctx.evidence.push_back("basic_block=" + fmt_addr(ctx.basic_block_start) + "-" + fmt_addr(ctx.basic_block_end));
+
+    if (api.direction == "send" && !upstream.empty()) {
+        std::vector<scored_call_t> scored;
+        for (const auto& c : upstream)
+            scored.push_back(score_internal_call_candidate(bytes, bytes_base, c, call_off, block_start, block_end, true, excluded_targets));
+        std::sort(scored.begin(), scored.end(), [](const scored_call_t& a, const scored_call_t& b) {
+            if (std::fabs(a.score - b.score) > 0.0001)
+                return a.score > b.score;
+            return a.call.offset > b.call.offset;
+        });
+        const auto& best = scored.front();
+        ctx.serializer_candidate = best.call.target_va;
+        ctx.candidate_confidence = best.score;
+        ctx.upstream_calls = scored_calls_to_json(scored, 8);
+        ctx.evidence.push_back("ranked_upstream_serializer_walk");
+        for (const auto& item : best.evidence)
+            ctx.evidence.push_back(item);
+        ctx.evidence.push_back("upstream_serializer_candidate=" + fmt_addr(best.call.target_va));
+    } else if (api.direction == "recv" && !downstream.empty()) {
+        std::vector<scored_call_t> scored;
+        for (const auto& c : downstream)
+            scored.push_back(score_internal_call_candidate(bytes, bytes_base, c, call_off, block_start, block_end, false, excluded_targets));
+        std::sort(scored.begin(), scored.end(), [](const scored_call_t& a, const scored_call_t& b) {
+            if (std::fabs(a.score - b.score) > 0.0001)
+                return a.score > b.score;
+            return a.call.offset < b.call.offset;
+        });
+        const auto& best = scored.front();
+        ctx.deserializer_candidate = best.call.target_va;
+        ctx.candidate_confidence = best.score;
+        ctx.downstream_calls = scored_calls_to_json(scored, 8);
+        ctx.evidence.push_back("ranked_downstream_deserializer_walk");
+        for (const auto& item : best.evidence)
+            ctx.evidence.push_back(item);
+        ctx.evidence.push_back("downstream_deserializer_candidate=" + fmt_addr(best.call.target_va));
+    } else {
+        ctx.candidate_confidence = 0.38;
+        ctx.evidence.push_back(api.direction == "send" ? "no_upstream_internal_serializer_call_in_window" : "no_downstream_internal_deserializer_call_in_window");
+    }
+    return ctx;
+}
+
 void add_sendrecv_result(nlohmann::json& results,
                          std::set<std::uint64_t>& seen_callsites,
                          const driver_bridge::module_info_t& module,
@@ -1425,9 +1977,30 @@ void add_sendrecv_result(nlohmann::json& results,
     const std::size_t call_off = static_cast<std::size_t>(callsite - bytes_base);
     if (call_off >= bytes.size())
         return;
-    std::uint64_t neighbor = adjacent;
-    if (neighbor == 0)
-        neighbor = nearest_internal_call(bytes, call_off, bytes_base, excluded_targets, api.direction == "recv");
+    callsite_context_t ctx = analyze_sendrecv_context(bytes, bytes_base, call_off, api, excluded_targets);
+    if (adjacent != 0 && api.direction == "send" && ctx.serializer_candidate == 0) {
+        ctx.serializer_candidate = adjacent;
+        ctx.candidate_confidence = (std::max)(ctx.candidate_confidence, 0.54);
+        ctx.evidence.push_back("explicit_adjacent_serializer_candidate");
+    } else if (adjacent != 0 && api.direction == "recv" && ctx.deserializer_candidate == 0) {
+        ctx.deserializer_candidate = adjacent;
+        ctx.candidate_confidence = (std::max)(ctx.candidate_confidence, 0.54);
+        ctx.evidence.push_back("explicit_adjacent_deserializer_candidate");
+    } else if (api.direction == "send" && ctx.serializer_candidate == 0) {
+        const std::uint64_t fallback = nearest_internal_call(bytes, call_off, bytes_base, excluded_targets, false);
+        if (fallback != 0 && va_in_scan(fallback, bytes_base, bytes.size())) {
+            ctx.serializer_candidate = fallback;
+            ctx.candidate_confidence = (std::max)(ctx.candidate_confidence, 0.46);
+            ctx.evidence.push_back("low_confidence_nearest_call_fallback");
+        }
+    } else if (api.direction == "recv" && ctx.deserializer_candidate == 0) {
+        const std::uint64_t fallback = nearest_internal_call(bytes, call_off, bytes_base, excluded_targets, true);
+        if (fallback != 0 && va_in_scan(fallback, bytes_base, bytes.size())) {
+            ctx.deserializer_candidate = fallback;
+            ctx.candidate_confidence = (std::max)(ctx.candidate_confidence, 0.46);
+            ctx.evidence.push_back("low_confidence_nearest_call_fallback");
+        }
+    }
 
     nlohmann::json r;
     r["direction"] = api.direction;
@@ -1438,15 +2011,38 @@ void add_sendrecv_result(nlohmann::json& results,
     r["module"] = module.name;
     r["serializer_va"] = nullptr;
     r["deserializer_va"] = nullptr;
-    if (api.direction == "send")
-        r["serializer_va"] = neighbor ? fmt_addr(neighbor) : fmt_addr(handler);
-    else
-        r["deserializer_va"] = neighbor ? fmt_addr(neighbor) : fmt_addr(handler);
-    r["confidence"] = iat_indirect ? 0.78 : 0.7;
-    r["evidence"] = nlohmann::json::array({
+    if (api.direction == "send" && ctx.serializer_candidate != 0)
+        r["serializer_va"] = fmt_addr(ctx.serializer_candidate);
+    else if (api.direction == "recv" && ctx.deserializer_candidate != 0)
+        r["deserializer_va"] = fmt_addr(ctx.deserializer_candidate);
+    nlohmann::json handler_range;
+    handler_range["start"] = fmt_addr(ctx.function_start ? ctx.function_start : handler);
+    handler_range["end"] = ctx.function_end ? nlohmann::json(fmt_addr(ctx.function_end)) : nlohmann::json(nullptr);
+    handler_range["basic_block_start"] = ctx.basic_block_start ? nlohmann::json(fmt_addr(ctx.basic_block_start)) : nlohmann::json(nullptr);
+    handler_range["basic_block_end"] = ctx.basic_block_end ? nlohmann::json(fmt_addr(ctx.basic_block_end)) : nlohmann::json(nullptr);
+    r["handler_range"] = std::move(handler_range);
+    r["upstream_calls"] = ctx.upstream_calls;
+    r["downstream_calls"] = ctx.downstream_calls;
+    r["serializer_candidate"] = {
+        {"va", ctx.serializer_candidate ? nlohmann::json(fmt_addr(ctx.serializer_candidate)) : nlohmann::json(nullptr)},
+        {"confidence", api.direction == "send" ? ctx.candidate_confidence : 0.0},
+        {"method", "same_function_cfg_window"}
+    };
+    r["deserializer_candidate"] = {
+        {"va", ctx.deserializer_candidate ? nlohmann::json(fmt_addr(ctx.deserializer_candidate)) : nlohmann::json(nullptr)},
+        {"confidence", api.direction == "recv" ? ctx.candidate_confidence : 0.0},
+        {"method", "same_function_cfg_window"}
+    };
+    r["confidence"] = (std::min)(0.94, (iat_indirect ? 0.72 : 0.66) + (ctx.candidate_confidence >= 0.6 ? 0.12 : 0.0));
+    nlohmann::json evidence = nlohmann::json::array({
         iat_indirect ? "call_indirect_through_import_slot" : "direct_relative_call_or_import_thunk",
         "handler_start_heuristic=" + fmt_addr(handler)
     });
+    if (ctx.evidence.is_array()) {
+        for (const auto& item : ctx.evidence)
+            evidence.push_back(item);
+    }
+    r["evidence"] = std::move(evidence);
     results.push_back(std::move(r));
 }
 
@@ -1455,6 +2051,131 @@ std::string endpoint_key(const driver_bridge::captured_packet_t& p)
     const std::string a = format_ip(p.local_addr, p.address_family) + ":" + std::to_string(p.local_port);
     const std::string b = format_ip(p.remote_addr, p.address_family) + ":" + std::to_string(p.remote_port);
     return a < b ? a + "<->" + b : b + "<->" + a;
+}
+
+std::string packet_src(const driver_bridge::captured_packet_t& p)
+{
+    if (p.direction == 0)
+        return format_ip(p.remote_addr, p.address_family) + ":" + std::to_string(p.remote_port);
+    return format_ip(p.local_addr, p.address_family) + ":" + std::to_string(p.local_port);
+}
+
+std::string packet_dst(const driver_bridge::captured_packet_t& p)
+{
+    if (p.direction == 0)
+        return format_ip(p.local_addr, p.address_family) + ":" + std::to_string(p.local_port);
+    return format_ip(p.remote_addr, p.address_family) + ":" + std::to_string(p.remote_port);
+}
+
+udp_fragment_info_t choose_fragment_info(const udp_fragment_info_t& current,
+                                         const udp_fragment_info_t& candidate)
+{
+    if (!candidate.valid)
+        return current;
+    if (!current.valid || candidate.confidence > current.confidence)
+        return candidate;
+    return current;
+}
+
+udp_fragment_info_t parse_udp_fragment_header(const std::vector<std::uint8_t>& data)
+{
+    udp_fragment_info_t best;
+    auto consider = [&](std::size_t header_size, bool has_ack, bool big, const char* scheme) {
+        if (data.size() < header_size)
+            return;
+        const std::uint64_t seq = big ? be32(data.data()) : le32(data.data());
+        const std::uint64_t ack = has_ack ? (big ? be32(data.data() + 4) : le32(data.data() + 4)) : 0;
+        const std::size_t base = has_ack ? 8 : 4;
+        const std::uint32_t frag_id = big ? be16(data.data() + base) : le16(data.data() + base);
+        const std::uint32_t frag_index = big ? be16(data.data() + base + 2) : le16(data.data() + base + 2);
+        const std::uint32_t frag_count = big ? be16(data.data() + base + 4) : le16(data.data() + base + 4);
+        const std::uint32_t declared = big ? be16(data.data() + base + 6) : le16(data.data() + base + 6);
+        const std::size_t available = data.size() - header_size;
+        if (frag_count < 2 || frag_count > 1024 || frag_index >= frag_count || declared == 0 || declared > available)
+            return;
+        udp_fragment_info_t c;
+        c.valid = true;
+        c.header_size = header_size;
+        c.sequence = seq;
+        c.ack = ack;
+        c.fragment_id = frag_id;
+        c.fragment_index = frag_index;
+        c.fragment_count = frag_count;
+        c.fragment_offset = frag_index * declared;
+        c.declared_payload_size = declared;
+        c.logical_size = 0;
+        c.scheme = scheme;
+        c.confidence = 0.78;
+        if (declared == available)
+            c.confidence += 0.08;
+        if (seq != 0 || ack != 0)
+            c.confidence += 0.04;
+        c.evidence = nlohmann::json::array({
+            has_ack ? "sequence_ack_fragment_header" : "sequence_fragment_header",
+            big ? "big_endian_header" : "little_endian_header",
+            "fragment_index=" + std::to_string(frag_index),
+            "fragment_count=" + std::to_string(frag_count)
+        });
+        best = choose_fragment_info(best, c);
+    };
+    consider(16, true, true, "seq_ack_frag16be");
+    consider(16, true, false, "seq_ack_frag16le");
+    consider(12, false, true, "seq_frag12be");
+    consider(12, false, false, "seq_frag12le");
+
+    if (data.size() >= 28) {
+        const std::uint8_t command_id = data[4] & 0x0f;
+        if (command_id == 8 || command_id == 12) {
+            const std::uint32_t count = be32(data.data() + 12);
+            const std::uint32_t index = be32(data.data() + 16);
+            const std::uint32_t total_length = be32(data.data() + 20);
+            const std::uint32_t fragment_offset = be32(data.data() + 24);
+            if (count >= 2 && count <= 4096 && index < count && total_length >= data.size() - 28 && fragment_offset < total_length) {
+                udp_fragment_info_t c;
+                c.valid = true;
+                c.header_size = 28;
+                c.sequence = be16(data.data() + 6);
+                c.ack = be16(data.data() + 2);
+                c.fragment_id = static_cast<std::uint32_t>(c.sequence & 0xffffffffu);
+                c.fragment_index = index;
+                c.fragment_count = count;
+                c.fragment_offset = fragment_offset;
+                c.declared_payload_size = static_cast<std::uint32_t>(data.size() - 28);
+                c.logical_size = total_length;
+                c.scheme = "enet_send_fragment";
+                c.confidence = 0.86;
+                c.evidence = nlohmann::json::array({
+                    "enet_fragment_command",
+                    "fragment_offset=" + std::to_string(fragment_offset),
+                    "fragment_count=" + std::to_string(count)
+                });
+                best = choose_fragment_info(best, c);
+            }
+        }
+    }
+    return best;
+}
+
+void fill_udp_message_endpoints(udp_message_t& m, const driver_bridge::captured_packet_t& p)
+{
+    m.local_port = p.local_port;
+    m.remote_port = p.remote_port;
+    m.address_family = p.address_family;
+    std::memcpy(m.local_addr, p.local_addr, sizeof(m.local_addr));
+    std::memcpy(m.remote_addr, p.remote_addr, sizeof(m.remote_addr));
+    m.src = packet_src(p);
+    m.dst = packet_dst(p);
+    if (p.direction == 0) {
+        m.src_ip = format_ip(p.remote_addr, p.address_family);
+        m.src_port = p.remote_port;
+        m.dst_ip = format_ip(p.local_addr, p.address_family);
+        m.dst_port = p.local_port;
+    } else {
+        m.src_ip = format_ip(p.local_addr, p.address_family);
+        m.src_port = p.local_port;
+        m.dst_ip = format_ip(p.remote_addr, p.address_family);
+        m.dst_port = p.remote_port;
+    }
 }
 
 std::vector<udp_message_t> split_udp_messages(const driver_bridge::captured_packet_t& p)
@@ -1469,14 +2190,30 @@ std::vector<udp_message_t> split_udp_messages(const driver_bridge::captured_pack
         m.sequence = seq;
         m.payload.assign(data.begin() + static_cast<std::ptrdiff_t>(off),
                          data.begin() + static_cast<std::ptrdiff_t>(off + len));
-        m.local_port = p.local_port;
-        m.remote_port = p.remote_port;
-        m.address_family = p.address_family;
-        std::memcpy(m.local_addr, p.local_addr, sizeof(m.local_addr));
-        std::memcpy(m.remote_addr, p.remote_addr, sizeof(m.remote_addr));
+        fill_udp_message_endpoints(m, p);
         m.scheme = scheme;
         messages.push_back(std::move(m));
     };
+
+    const udp_fragment_info_t fragment = parse_udp_fragment_header(data);
+    if (fragment.valid && fragment.header_size < data.size()) {
+        udp_message_t m;
+        m.sequence = fragment.sequence;
+        m.ack = fragment.ack;
+        m.fragment_id = fragment.fragment_id;
+        m.fragment_index = fragment.fragment_index;
+        m.fragment_count = fragment.fragment_count;
+        m.fragment_offset = fragment.fragment_offset;
+        m.logical_size = fragment.logical_size;
+        m.reassembly_complete = false;
+        m.reassembly_evidence = fragment.evidence;
+        m.payload.assign(data.begin() + static_cast<std::ptrdiff_t>(fragment.header_size),
+                         data.begin() + static_cast<std::ptrdiff_t>(fragment.header_size + (std::min<std::size_t>)(fragment.declared_payload_size, data.size() - fragment.header_size)));
+        fill_udp_message_endpoints(m, p);
+        m.scheme = fragment.scheme;
+        messages.push_back(std::move(m));
+        return messages;
+    }
 
     bool split = false;
     if (data.size() >= 4) {
@@ -1520,102 +2257,625 @@ std::vector<udp_message_t> split_udp_messages(const driver_bridge::captured_pack
     return messages;
 }
 
-std::vector<std::pair<std::size_t, std::size_t>> numeric_offsets(const std::vector<std::uint8_t>& payload)
+std::string udp_fragment_group_key(const std::string& session_key, const udp_message_t& m)
 {
-    std::vector<std::pair<std::size_t, std::size_t>> out;
+    std::ostringstream os;
+    os << session_key << "|" << m.src << ">" << m.dst << "|"
+       << m.scheme << "|" << m.sequence << "|" << m.ack << "|"
+       << m.fragment_id << "|" << m.fragment_count;
+    return os.str();
+}
+
+void append_udp_message_limited(udp_session_t& session, udp_message_t&& message)
+{
+    if (session.messages.size() < 256)
+        session.messages.push_back(std::move(message));
+}
+
+bool reassemble_fragment_group(const udp_fragment_group_t& group, udp_message_t& out)
+{
+    if (group.pieces.empty())
+        return false;
+    std::map<std::uint32_t, const udp_message_t*> by_index;
+    std::uint32_t expected = group.pieces.front().fragment_count;
+    if (expected < 2 || expected > 4096)
+        return false;
+    bool has_offset_evidence = false;
+    std::uint32_t logical_size = 0;
+    for (const auto& piece : group.pieces) {
+        if (piece.fragment_count != expected || piece.fragment_index >= expected)
+            return false;
+        if (piece.logical_size != 0) {
+            has_offset_evidence = true;
+            logical_size = (std::max)(logical_size, piece.logical_size);
+        }
+        by_index[piece.fragment_index] = &piece;
+    }
+    if (by_index.size() != expected)
+        return false;
+    out = group.pieces.front();
+    out.payload.clear();
+    out.reassembly_evidence = nlohmann::json::array();
+    out.reassembly_evidence.push_back("all_fragments_present");
+    out.reassembly_evidence.push_back("fragment_count=" + std::to_string(expected));
+    if (has_offset_evidence) {
+        if (logical_size == 0 || logical_size > 1048576)
+            return false;
+        std::vector<std::uint8_t> assembled(logical_size);
+        std::vector<bool> covered(logical_size, false);
+        for (const auto& [index, piece] : by_index) {
+            (void)index;
+            const std::size_t off = piece->fragment_offset;
+            if (off > assembled.size() || piece->payload.size() > assembled.size() - off)
+                return false;
+            for (std::size_t i = 0; i < piece->payload.size(); ++i) {
+                if (covered[off + i])
+                    return false;
+                assembled[off + i] = piece->payload[i];
+                covered[off + i] = true;
+            }
+        }
+        for (bool b : covered)
+            if (!b)
+                return false;
+        out.payload = std::move(assembled);
+        out.logical_size = logical_size;
+        out.reassembly_evidence.push_back("fragment_offsets_cover_declared_logical_size");
+    } else {
+        for (std::uint32_t i = 0; i < expected; ++i) {
+            auto it = by_index.find(i);
+            if (it == by_index.end())
+                return false;
+            out.payload.insert(out.payload.end(), it->second->payload.begin(), it->second->payload.end());
+        }
+        out.logical_size = static_cast<std::uint32_t>((std::min<std::size_t>)(out.payload.size(), std::numeric_limits<std::uint32_t>::max()));
+        out.reassembly_evidence.push_back("fragment_index_order_reassembly");
+    }
+    out.reassembled = true;
+    out.reassembly_complete = true;
+    out.fragment_index = 0;
+    out.scheme += "_reassembled";
+    return true;
+}
+
+nlohmann::json udp_message_to_json(const udp_message_t& message)
+{
+    nlohmann::json mj;
+    mj["sequence"] = message.sequence;
+    mj["ack"] = message.ack;
+    mj["scheme"] = message.scheme;
+    mj["src"] = message.src;
+    mj["dst"] = message.dst;
+    mj["src_ip"] = message.src_ip;
+    mj["src_port"] = message.src_port;
+    mj["dst_ip"] = message.dst_ip;
+    mj["dst_port"] = message.dst_port;
+    mj["local_ip"] = format_ip(message.local_addr, message.address_family);
+    mj["local_port"] = message.local_port;
+    mj["remote_ip"] = format_ip(message.remote_addr, message.address_family);
+    mj["remote_port"] = message.remote_port;
+    mj["payload_size"] = message.payload.size();
+    mj["payload_hex"] = game_protocol::bytes_to_hex(message.payload, 128);
+    mj["reassembled"] = message.reassembled;
+    mj["reassembly_complete"] = message.reassembly_complete;
+    if (message.fragment_count != 0) {
+        mj["fragment_id"] = message.fragment_id;
+        mj["fragment_index"] = message.fragment_index;
+        mj["fragment_count"] = message.fragment_count;
+        mj["fragment_offset"] = message.fragment_offset;
+        mj["logical_size"] = message.logical_size;
+        mj["reassembly_evidence"] = message.reassembly_evidence;
+    }
+    return mj;
+}
+
+std::uint64_t read_integer_field(const std::vector<std::uint8_t>& payload,
+                                 std::size_t off,
+                                 std::size_t size,
+                                 bool big_endian)
+{
+    std::uint64_t value = 0;
+    if (off >= payload.size())
+        return 0;
+    const std::size_t available = (std::min)(size, payload.size() - off);
+    for (std::size_t i = 0; i < available; ++i) {
+        const std::size_t index = big_endian ? i : available - 1 - i;
+        value = (value << 8) | payload[off + index];
+    }
+    return value;
+}
+
+void write_integer_field(std::vector<std::uint8_t>& payload,
+                         std::size_t off,
+                         std::size_t size,
+                         bool big_endian,
+                         std::uint64_t value)
+{
+    for (std::size_t i = 0; i < size && off + i < payload.size(); ++i) {
+        const std::size_t shift_index = big_endian ? size - 1 - i : i;
+        payload[off + i] = static_cast<std::uint8_t>((value >> (shift_index * 8)) & 0xffu);
+    }
+}
+
+std::uint64_t integer_mask(std::size_t size)
+{
+    if (size >= 8)
+        return std::numeric_limits<std::uint64_t>::max();
+    return (1ULL << (size * 8)) - 1ULL;
+}
+
+bool uniform_field_bytes(const std::vector<std::uint8_t>& payload, std::size_t off, std::size_t size, std::uint8_t value)
+{
+    if (off + size > payload.size())
+        return false;
+    for (std::size_t i = 0; i < size; ++i)
+        if (payload[off + i] != value)
+            return false;
+    return true;
+}
+
+bool printable_ascii_field(const std::vector<std::uint8_t>& payload, std::size_t off, std::size_t size)
+{
+    if (size < 2 || off + size > payload.size())
+        return false;
+    for (std::size_t i = 0; i < size; ++i) {
+        const std::uint8_t c = payload[off + i];
+        if (c < 0x20 || c > 0x7e)
+            return false;
+    }
+    return true;
+}
+
+void add_numeric_candidate(std::vector<numeric_field_candidate_t>& out,
+                           const numeric_field_candidate_t& candidate)
+{
+    if (candidate.offset + candidate.size == 0)
+        return;
+    for (auto& existing : out) {
+        if (existing.offset == candidate.offset && existing.size == candidate.size && existing.big_endian == candidate.big_endian) {
+            if (candidate.confidence > existing.confidence)
+                existing = candidate;
+            return;
+        }
+    }
+    out.push_back(candidate);
+}
+
+std::vector<numeric_field_candidate_t> numeric_field_candidates(const udp_session_t& session,
+                                                               const udp_message_t& message)
+{
+    std::vector<numeric_field_candidate_t> out;
+    const auto& payload = message.payload;
     const std::size_t limit = (std::min)(payload.size(), std::size_t(512));
-    for (std::size_t off = 0; off + 4 <= limit && out.size() < 48; off += 4) {
-        const std::uint32_t v = le32(payload.data() + off);
-        if (v != 0 && v != 0xffffffffu)
-            out.push_back({off, 4});
+    static const std::size_t sizes[] = {1, 2, 4, 8};
+    for (std::size_t off = 0; off < limit && out.size() < 128; ++off) {
+        for (std::size_t size : sizes) {
+            if (off + size > limit)
+                continue;
+            if (uniform_field_bytes(payload, off, size, 0x00) || uniform_field_bytes(payload, off, size, 0xff))
+                continue;
+            if (printable_ascii_field(payload, off, size))
+                continue;
+            const bool endian_modes[] = {false, true};
+            for (bool big : endian_modes) {
+                if (size == 1 && big)
+                    continue;
+                const std::uint64_t value = read_integer_field(payload, off, size, big);
+                if (value == 0 || value == integer_mask(size))
+                    continue;
+                numeric_field_candidate_t c;
+                c.offset = off;
+                c.size = size;
+                c.big_endian = big;
+                c.value = value;
+                c.type = "integer";
+                c.confidence = 0.34;
+                c.evidence.push_back(big ? "big_endian_interpretation" : "little_endian_interpretation");
+                if (off % size == 0) {
+                    c.confidence += 0.08;
+                    c.evidence.push_back("natural_alignment");
+                }
+                if (off <= 16) {
+                    c.confidence += 0.04;
+                    c.evidence.push_back("protocol_header_region");
+                }
+                const std::size_t remaining_after_field = payload.size() > off + size ? payload.size() - off - size : 0;
+                if ((size == 2 || size == 4) && (value == payload.size() || value == remaining_after_field || value == payload.size() - off)) {
+                    c.type = "length";
+                    c.confidence += 0.24;
+                    c.evidence.push_back("matches_payload_or_remaining_length");
+                }
+                if (message.fragment_count >= 2 && (value == message.fragment_index || value == message.fragment_count || value == message.fragment_offset || value == message.logical_size)) {
+                    c.type = "fragment_metadata";
+                    c.confidence += 0.18;
+                    c.evidence.push_back("matches_reassembly_metadata");
+                }
+                std::vector<std::uint64_t> peer_values;
+                for (const auto& peer : session.messages) {
+                    if (&peer == &message || peer.payload.size() < off + size)
+                        continue;
+                    if (peer.payload.size() != payload.size() && c.type != "length")
+                        continue;
+                    const std::uint64_t peer_value = read_integer_field(peer.payload, off, size, big);
+                    if (peer_value != 0 && peer_value != integer_mask(size))
+                        peer_values.push_back(peer_value);
+                }
+                if (!peer_values.empty()) {
+                    std::set<std::uint64_t> distinct(peer_values.begin(), peer_values.end());
+                    distinct.insert(value);
+                    if (distinct.size() > 1) {
+                        c.confidence += 0.12;
+                        c.evidence.push_back("varies_across_session_messages");
+                        bool monotonic = true;
+                        std::uint64_t prev = value;
+                        for (std::uint64_t peer_value : peer_values) {
+                            if (peer_value < prev) {
+                                monotonic = false;
+                                break;
+                            }
+                            prev = peer_value;
+                        }
+                        if (monotonic) {
+                            c.type = c.type == "integer" ? "counter_or_sequence" : c.type;
+                            c.confidence += 0.07;
+                            c.evidence.push_back("nondecreasing_across_session_messages");
+                        }
+                    }
+                }
+                if (value <= 0xffff && c.type == "integer") {
+                    c.type = "small_integer";
+                    c.confidence += 0.03;
+                }
+                if (c.confidence >= 0.45)
+                    add_numeric_candidate(out, c);
+            }
+        }
     }
-    for (std::size_t off = 0; off + 2 <= limit && out.size() < 64; off += 2) {
-        const std::uint16_t v = le16(payload.data() + off);
-        if (v != 0 && v != 0xffffu)
-            out.push_back({off, 2});
+    std::sort(out.begin(), out.end(), [](const numeric_field_candidate_t& a, const numeric_field_candidate_t& b) {
+        if (std::fabs(a.confidence - b.confidence) > 0.0001)
+            return a.confidence > b.confidence;
+        if (a.offset != b.offset)
+            return a.offset < b.offset;
+        return a.size > b.size;
+    });
+    if (out.size() > 80)
+        out.resize(80);
+    if (out.empty() && !payload.empty()) {
+        numeric_field_candidate_t c;
+        c.offset = 0;
+        c.size = 1;
+        c.big_endian = false;
+        c.value = payload[0];
+        c.type = "single_byte_fallback";
+        c.confidence = 0.28;
+        c.evidence = nlohmann::json::array({"no_structured_numeric_field_detected", "fallback_first_byte"});
+        out.push_back(std::move(c));
     }
-    if (out.empty() && !payload.empty())
-        out.push_back({0, 1});
     return out;
 }
 
-void write_le(std::vector<std::uint8_t>& payload, std::size_t off, std::size_t size, std::uint64_t value)
+nlohmann::json numeric_field_to_json(const numeric_field_candidate_t& field)
 {
-    for (std::size_t i = 0; i < size && off + i < payload.size(); ++i)
-        payload[off + i] = static_cast<std::uint8_t>((value >> (i * 8)) & 0xffu);
+    nlohmann::json f;
+    f["offset"] = field.offset;
+    f["size"] = field.size;
+    f["endian"] = field.big_endian ? "big" : "little";
+    f["value"] = field.value;
+    f["type"] = field.type;
+    f["confidence"] = field.confidence;
+    f["evidence"] = field.evidence;
+    return f;
 }
 
-std::vector<std::vector<std::uint8_t>> make_mutations(const udp_session_t& session,
-                                                      const std::string& strategy,
-                                                      std::uint32_t max_mutations,
-                                                      std::uint32_t payload_cap)
+std::vector<std::uint64_t> boundary_values_for_size(std::size_t size)
 {
-    std::vector<std::vector<std::uint8_t>> out;
-    std::set<std::vector<std::uint8_t>> seen;
-    std::uint64_t lcg = 0xA1DA5EED12345678ULL ^ static_cast<std::uint64_t>(GetTickCount64());
+    std::vector<std::uint64_t> values = {0ULL, 1ULL};
+    if (size >= 1) {
+        values.push_back(0x7fULL);
+        values.push_back(0x80ULL);
+        values.push_back(0xffULL);
+    }
+    if (size >= 2) {
+        values.push_back(0x100ULL);
+        values.push_back(0x7fffULL);
+        values.push_back(0x8000ULL);
+        values.push_back(0xffffULL);
+    }
+    if (size >= 4) {
+        values.push_back(0x10000ULL);
+        values.push_back(0x7fffffffULL);
+        values.push_back(0x80000000ULL);
+        values.push_back(0xffffffffULL);
+    }
+    if (size >= 8) {
+        values.push_back(0x100000000ULL);
+        values.push_back(0x7fffffffffffffffULL);
+        values.push_back(0x8000000000000000ULL);
+        values.push_back(std::numeric_limits<std::uint64_t>::max());
+    }
+    const std::uint64_t mask = integer_mask(size);
+    for (auto& v : values)
+        v &= mask;
+    std::sort(values.begin(), values.end());
+    values.erase(std::unique(values.begin(), values.end()), values.end());
+    return values;
+}
 
+std::uint64_t stable_payload_seed(const udp_session_t& session)
+{
+    std::uint64_t h = 1469598103934665603ULL;
+    auto mix = [&](std::uint8_t b) {
+        h ^= b;
+        h *= 1099511628211ULL;
+    };
+    for (char c : session.id)
+        mix(static_cast<std::uint8_t>(c));
+    for (const auto& message : session.messages) {
+        for (std::uint8_t b : message.payload)
+            mix(b);
+    }
+    return h;
+}
+
+std::vector<mutation_payload_t> make_mutations(const udp_session_t& session,
+                                               const std::string& strategy,
+                                               std::uint32_t max_mutations,
+                                               std::uint32_t payload_cap,
+                                               nlohmann::json& field_inventory)
+{
+    std::vector<mutation_payload_t> out;
+    std::set<std::vector<std::uint8_t>> seen;
+    std::uint64_t lcg = 0xA1DA5EED12345678ULL ^ stable_payload_seed(session);
+    field_inventory = nlohmann::json::array();
+
+    std::size_t message_index = 0;
     for (const auto& message : session.messages) {
         if (out.size() >= max_mutations)
             break;
-        if (message.payload.empty() || message.payload.size() > payload_cap)
+        if (message.payload.empty() || message.payload.size() > payload_cap) {
+            ++message_index;
             continue;
+        }
 
-        auto offsets = numeric_offsets(message.payload);
+        auto fields = numeric_field_candidates(session, message);
+        nlohmann::json message_fields;
+        message_fields["message_index"] = message_index;
+        message_fields["scheme"] = message.scheme;
+        message_fields["payload_size"] = message.payload.size();
+        message_fields["field_count"] = fields.size();
+        message_fields["fields"] = nlohmann::json::array();
+        for (const auto& field : fields) {
+            if (message_fields["fields"].size() >= 24)
+                break;
+            message_fields["fields"].push_back(numeric_field_to_json(field));
+        }
+        if (field_inventory.size() < 32)
+            field_inventory.push_back(std::move(message_fields));
+
         if (strategy == "bitflip") {
-            for (const auto& [off, size] : offsets) {
-                for (std::uint8_t bit : {std::uint8_t(0x01), std::uint8_t(0x80)}) {
+            for (const auto& field : fields) {
+                for (std::size_t byte_index : {std::size_t(0), field.size - 1}) {
                     if (out.size() >= max_mutations)
                         break;
                     auto m = message.payload;
-                    if (off < m.size())
-                        m[off] ^= bit;
-                    if (seen.insert(m).second)
-                        out.push_back(std::move(m));
+                    const std::size_t byte_off = field.offset + byte_index;
+                    if (byte_off >= m.size())
+                        continue;
+                    const std::uint8_t bit = byte_index == 0 ? std::uint8_t(0x01) : std::uint8_t(0x80);
+                    m[byte_off] ^= bit;
+                    if (seen.insert(m).second) {
+                        mutation_payload_t mp;
+                        mp.payload = std::move(m);
+                        mp.source_message_index = message_index;
+                        mp.field_offset = field.offset;
+                        mp.field_size = field.size;
+                        mp.big_endian = field.big_endian;
+                        mp.original_value = field.value;
+                        mp.mutated_value = read_integer_field(mp.payload, field.offset, field.size, field.big_endian);
+                        mp.strategy = strategy;
+                        mp.evidence = nlohmann::json::array({"bitflip_numeric_field", numeric_field_to_json(field)});
+                        out.push_back(std::move(mp));
+                    }
                 }
             }
         } else if (strategy == "random") {
-            for (const auto& [off, size] : offsets) {
+            for (const auto& field : fields) {
                 if (out.size() >= max_mutations)
                     break;
                 lcg = lcg * 6364136223846793005ULL + 1442695040888963407ULL;
                 auto m = message.payload;
-                write_le(m, off, size, lcg);
-                if (seen.insert(m).second)
-                    out.push_back(std::move(m));
+                const std::uint64_t value = lcg & integer_mask(field.size);
+                write_integer_field(m, field.offset, field.size, field.big_endian, value);
+                if (seen.insert(m).second) {
+                    mutation_payload_t mp;
+                    mp.payload = std::move(m);
+                    mp.source_message_index = message_index;
+                    mp.field_offset = field.offset;
+                    mp.field_size = field.size;
+                    mp.big_endian = field.big_endian;
+                    mp.original_value = field.value;
+                    mp.mutated_value = value;
+                    mp.strategy = strategy;
+                    mp.evidence = nlohmann::json::array({"deterministic_lcg_numeric_field", numeric_field_to_json(field)});
+                    out.push_back(std::move(mp));
+                }
             }
         } else {
-            static const std::uint64_t values[] = {
-                0ULL, 1ULL, 0x7fULL, 0x80ULL, 0xffULL, 0x100ULL,
-                0x7fffULL, 0x8000ULL, 0xffffULL, 0x10000ULL,
-                0x7fffffffULL, 0x80000000ULL, 0xffffffffULL
-            };
-            for (const auto& [off, size] : offsets) {
-                for (std::uint64_t value : values) {
+            for (const auto& field : fields) {
+                for (std::uint64_t value : boundary_values_for_size(field.size)) {
                     if (out.size() >= max_mutations)
                         break;
+                    if (value == field.value)
+                        continue;
                     auto m = message.payload;
-                    write_le(m, off, size, value);
-                    if (seen.insert(m).second)
-                        out.push_back(std::move(m));
+                    write_integer_field(m, field.offset, field.size, field.big_endian, value);
+                    if (seen.insert(m).second) {
+                        mutation_payload_t mp;
+                        mp.payload = std::move(m);
+                        mp.source_message_index = message_index;
+                        mp.field_offset = field.offset;
+                        mp.field_size = field.size;
+                        mp.big_endian = field.big_endian;
+                        mp.original_value = field.value;
+                        mp.mutated_value = value;
+                        mp.strategy = strategy;
+                        mp.evidence = nlohmann::json::array({"boundary_numeric_field", numeric_field_to_json(field)});
+                        out.push_back(std::move(mp));
+                    }
                 }
             }
         }
+        ++message_index;
     }
     return out;
 }
 
-int pre_encrypt_arg_index(const std::string& reg)
+bool valid_mutation_strategy(const std::string& strategy)
 {
-    const std::string r = lower_copy(reg);
-    if (r == "rcx")
-        return 0;
-    if (r == "rdx")
-        return 1;
-    if (r == "r8")
-        return 2;
-    if (r == "r9")
-        return 3;
-    return -1;
+    return strategy == "boundary" || strategy == "random" || strategy == "bitflip";
+}
+
+bool same_ipv4(const std::uint8_t* a, const std::uint8_t* b)
+{
+    return a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3];
+}
+
+nlohmann::json payload_diff_summary(const std::vector<std::uint8_t>& reference,
+                                    const std::vector<std::uint8_t>& observed,
+                                    const std::string& label)
+{
+    const std::size_t compared = (std::min)((std::min)(reference.size(), observed.size()), std::size_t(512));
+    std::size_t changed = 0;
+    std::size_t first_diff = std::numeric_limits<std::size_t>::max();
+    for (std::size_t i = 0; i < compared; ++i) {
+        if (reference[i] != observed[i]) {
+            if (first_diff == std::numeric_limits<std::size_t>::max())
+                first_diff = i;
+            ++changed;
+        }
+    }
+    if (reference.size() != observed.size() && first_diff == std::numeric_limits<std::size_t>::max())
+        first_diff = compared;
+    nlohmann::json diff;
+    diff["reference"] = label;
+    diff["reference_size"] = reference.size();
+    diff["observed_size"] = observed.size();
+    diff["compared_prefix_bytes"] = compared;
+    diff["changed_prefix_bytes"] = changed;
+    diff["size_delta"] = static_cast<std::int64_t>(observed.size()) - static_cast<std::int64_t>(reference.size());
+    diff["first_diff_offset"] = first_diff == std::numeric_limits<std::size_t>::max() ? nlohmann::json(nullptr) : nlohmann::json(first_diff);
+    return diff;
+}
+
+nlohmann::json best_payload_diff(const std::vector<std::uint8_t>& observed,
+                                 const udp_session_t& session,
+                                 const std::vector<mutation_payload_t>& mutations,
+                                 const std::string& set_name)
+{
+    bool found = false;
+    nlohmann::json best;
+    std::uint64_t best_score = std::numeric_limits<std::uint64_t>::max();
+    if (set_name == "original") {
+        for (std::size_t i = 0; i < session.messages.size() && i < 128; ++i) {
+            const auto diff = payload_diff_summary(session.messages[i].payload, observed, "original_message_" + std::to_string(i));
+            const std::int64_t delta = diff.value("size_delta", 0ll);
+            const std::uint64_t score = diff.value("changed_prefix_bytes", 0ull) +
+                static_cast<std::uint64_t>(delta < 0 ? -delta : delta);
+            if (!found || score < best_score) {
+                found = true;
+                best_score = score;
+                best = diff;
+            }
+        }
+    } else {
+        for (std::size_t i = 0; i < mutations.size() && i < 128; ++i) {
+            const auto diff = payload_diff_summary(mutations[i].payload, observed, "mutation_" + std::to_string(i));
+            const std::int64_t delta = diff.value("size_delta", 0ll);
+            const std::uint64_t score = diff.value("changed_prefix_bytes", 0ull) +
+                static_cast<std::uint64_t>(delta < 0 ? -delta : delta);
+            if (!found || score < best_score) {
+                found = true;
+                best_score = score;
+                best = diff;
+            }
+        }
+    }
+    if (!found)
+        return nlohmann::json(nullptr);
+    best["score"] = best_score;
+    return best;
+}
+
+bool payload_seen_in_mutations(const std::vector<std::uint8_t>& payload,
+                               const std::vector<mutation_payload_t>& mutations)
+{
+    for (const auto& m : mutations)
+        if (m.payload == payload)
+            return true;
+    return false;
+}
+
+nlohmann::json classify_response_packet(const driver_bridge::captured_packet_t& p,
+                                        const std::uint8_t* target_addr,
+                                        std::uint32_t target_port,
+                                        std::uint32_t source_port,
+                                        const udp_session_t& session,
+                                        const std::vector<mutation_payload_t>& mutations,
+                                        bool& interesting)
+{
+    const bool remote_is_target = p.address_family == 2 && same_ipv4(p.remote_addr, target_addr) && p.remote_port == target_port;
+    const bool local_is_target = p.address_family == 2 && same_ipv4(p.local_addr, target_addr) && p.local_port == target_port;
+    const bool inbound_from_target = p.direction == 0 && remote_is_target && (source_port == 0 || p.local_port == source_port);
+    const bool outbound_to_target = p.direction != 0 && remote_is_target && (source_port == 0 || p.local_port == source_port);
+    const bool target_local_response = p.direction == 0 && local_is_target;
+    const bool echoed_mutation = payload_seen_in_mutations(p.payload, mutations);
+
+    nlohmann::json r;
+    r["pid"] = p.pid;
+    r["direction"] = p.direction == 0 ? "inbound" : "outbound";
+    r["src"] = packet_src(p);
+    r["dst"] = packet_dst(p);
+    if (p.direction == 0) {
+        r["src_ip"] = format_ip(p.remote_addr, p.address_family);
+        r["src_port"] = p.remote_port;
+        r["dst_ip"] = format_ip(p.local_addr, p.address_family);
+        r["dst_port"] = p.local_port;
+    } else {
+        r["src_ip"] = format_ip(p.local_addr, p.address_family);
+        r["src_port"] = p.local_port;
+        r["dst_ip"] = format_ip(p.remote_addr, p.address_family);
+        r["dst_port"] = p.remote_port;
+    }
+    r["local"] = format_ip(p.local_addr, p.address_family) + ":" + std::to_string(p.local_port);
+    r["remote"] = format_ip(p.remote_addr, p.address_family) + ":" + std::to_string(p.remote_port);
+    r["payload_size"] = p.payload.size();
+    r["hex_preview"] = game_protocol::bytes_to_hex(p.payload, 96);
+    r["diff_vs_original"] = best_payload_diff(p.payload, session, mutations, "original");
+    r["diff_vs_mutation"] = best_payload_diff(p.payload, session, mutations, "mutation");
+
+    interesting = false;
+    if (inbound_from_target && !echoed_mutation) {
+        r["classification"] = "response_from_target";
+        r["interesting_reason"] = "inbound_payload_from_target_differs_from_sent_mutations";
+        interesting = true;
+    } else if (inbound_from_target && echoed_mutation) {
+        r["classification"] = "echoed_mutation_from_target";
+        r["interesting_reason"] = "target_echoed_mutated_payload";
+        interesting = true;
+    } else if (outbound_to_target) {
+        r["classification"] = echoed_mutation ? "outbound_replay_observed" : "outbound_udp_to_target";
+        r["interesting_reason"] = echoed_mutation ? "driver_capture_observed_successful_replay_send" : "outbound_context_packet_to_target";
+        interesting = echoed_mutation;
+    } else if (target_local_response) {
+        r["classification"] = "target_local_inbound_context";
+        r["interesting_reason"] = "capture_endpoint_matches_target_local_port";
+        interesting = !p.payload.empty();
+    } else {
+        r["classification"] = "unrelated_udp_capture_context";
+        r["interesting_reason"] = nullptr;
+    }
+    r["interesting"] = interesting;
+    return r;
 }
 
 bool driver_reg_index_checked(const std::string& reg, std::uint32_t& out)
@@ -1634,29 +2894,78 @@ bool driver_reg_index_checked(const std::string& reg, std::uint32_t& out)
     return false;
 }
 
-nlohmann::json captures_to_fields(const std::vector<std::vector<std::uint8_t>>& samples)
+nlohmann::json output_byte_provenance(const std::vector<serializer_sample_t>& samples,
+                                      std::size_t start,
+                                      std::size_t size)
+{
+    nlohmann::json p;
+    p["kind"] = "serializer_output_bytes";
+    p["source_va_resolved"] = false;
+    p["source_va_status"] = "not_available_from_capture_backend";
+    p["byte_range"] = {{"offset", start}, {"size", size}};
+    p["captures"] = nlohmann::json::array();
+    std::set<std::string> unique_values;
+    std::set<std::uint64_t> threads;
+    std::set<std::uint64_t> rips;
+    for (std::size_t i = 0; i < samples.size() && i < 16; ++i) {
+        const auto& sample = samples[i];
+        if (start >= sample.buffer.size())
+            continue;
+        const std::size_t n = (std::min)(size, sample.buffer.size() - start);
+        const std::string hex = game_protocol::bytes_to_hex(sample.buffer.data() + start, n, 64);
+        unique_values.insert(hex);
+        if (sample.thread_id != 0)
+            threads.insert(sample.thread_id);
+        if (sample.rip != 0)
+            rips.insert(sample.rip);
+        nlohmann::json c;
+        c["index"] = i;
+        c["timestamp"] = sample.timestamp;
+        c["thread_id"] = sample.thread_id;
+        c["rip"] = sample.rip ? nlohmann::json(fmt_addr(sample.rip)) : nlohmann::json(nullptr);
+        c["function"] = sample.function_name;
+        c["backend"] = sample.backend;
+        c["module"] = sample.module_name;
+        c["module_offset"] = sample.module_offset ? nlohmann::json(fmt_addr(sample.module_offset)) : nlohmann::json(nullptr);
+        c["bytes_observed"] = n;
+        c["hex"] = hex;
+        p["captures"].push_back(std::move(c));
+    }
+    p["capture_count"] = p["captures"].size();
+    p["unique_value_count"] = unique_values.size();
+    p["thread_count"] = threads.size();
+    p["rip_count"] = rips.size();
+    p["stable_across_captures"] = unique_values.size() <= 1 && p["capture_count"].get<std::size_t>() > 1;
+    return p;
+}
+
+nlohmann::json captures_to_fields(const std::vector<serializer_sample_t>& samples)
 {
     nlohmann::json fields = nlohmann::json::array();
     if (samples.empty())
         return fields;
 
-    const auto& first = samples.front();
+    const auto& first = samples.front().buffer;
     nlohmann::json heuristic = game_protocol::decode_payload_heuristic(first, "serializer_buffer");
     if (heuristic.contains("fields") && heuristic["fields"].is_array()) {
         for (const auto& f : heuristic["fields"]) {
             if (fields.size() >= 64)
                 break;
             nlohmann::json out;
-            out["buffer_offset"] = f.value("offset", 0);
-            out["size"] = f.value("size", 0);
-            out["source_va"] = nullptr;
+            const std::size_t offset = f.value("offset", 0u);
+            const std::size_t size = f.value("size", 0u);
+            out["buffer_offset"] = offset;
+            out["size"] = size;
+            out["source_va_resolved"] = false;
+            out["source_va_status"] = "not_available_from_capture_backend";
             out["source_type"] = "serializer_output_payload_heuristic";
             out["field_type_guess"] = f.value("type_guess", "unknown");
             out["confidence"] = f.value("confidence", 0.0);
             out["value_examples"] = f.value("sample_values", nlohmann::json::array());
             nlohmann::json evidence = f.contains("evidence") && f["evidence"].is_array() ? f["evidence"] : nlohmann::json::array();
-            evidence.push_back("source_va_not_resolved_by_output_sampling");
+            evidence.push_back("output_byte_provenance_recorded");
             out["evidence"] = std::move(evidence);
+            out["output_byte_provenance"] = output_byte_provenance(samples, offset, size);
             fields.push_back(std::move(out));
         }
     }
@@ -1667,9 +2976,9 @@ nlohmann::json captures_to_fields(const std::vector<std::vector<std::uint8_t>>& 
         while (off < limit && fields.size() < 96) {
             bool varies = false;
             for (std::size_t i = 1; i < samples.size(); ++i) {
-                if (off >= samples[i].size())
+                if (off >= samples[i].buffer.size())
                     continue;
-                if (samples[i][off] != first[off]) {
+                if (samples[i].buffer[off] != first[off]) {
                     varies = true;
                     break;
                 }
@@ -1682,7 +2991,7 @@ nlohmann::json captures_to_fields(const std::vector<std::vector<std::uint8_t>>& 
             while (off < limit) {
                 bool v = false;
                 for (std::size_t i = 1; i < samples.size(); ++i) {
-                    if (off < samples[i].size() && samples[i][off] != first[off]) {
+                    if (off < samples[i].buffer.size() && samples[i].buffer[off] != first[off]) {
                         v = true;
                         break;
                     }
@@ -1693,18 +3002,20 @@ nlohmann::json captures_to_fields(const std::vector<std::vector<std::uint8_t>>& 
             }
             nlohmann::json examples = nlohmann::json::array();
             for (std::size_t i = 0; i < samples.size() && i < 4; ++i) {
-                const std::size_t n = (std::min)(off - start, samples[i].size() > start ? samples[i].size() - start : std::size_t(0));
-                examples.push_back(n == 0 ? std::string() : game_protocol::bytes_to_hex(samples[i].data() + start, n, 32));
+                const std::size_t n = (std::min)(off - start, samples[i].buffer.size() > start ? samples[i].buffer.size() - start : std::size_t(0));
+                examples.push_back(n == 0 ? std::string() : game_protocol::bytes_to_hex(samples[i].buffer.data() + start, n, 32));
             }
             nlohmann::json f;
             f["buffer_offset"] = start;
             f["size"] = off - start;
-            f["source_va"] = nullptr;
+            f["source_va_resolved"] = false;
+            f["source_va_status"] = "not_available_from_capture_backend";
             f["source_type"] = "serializer_output_byte_variance";
             f["field_type_guess"] = "variable_bytes";
             f["confidence"] = 0.56;
             f["value_examples"] = std::move(examples);
-            f["evidence"] = nlohmann::json::array({"field_bytes_varied_across_captures", "source_va_not_resolved_by_output_sampling"});
+            f["evidence"] = nlohmann::json::array({"field_bytes_varied_across_captures", "output_byte_provenance_recorded"});
+            f["output_byte_provenance"] = output_byte_provenance(samples, start, off - start);
             fields.push_back(std::move(f));
         }
     }
@@ -2199,6 +3510,7 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
             }
             const api_target_t* api = nullptr;
             bool iat = false;
+            bool register_indirect_import = false;
             std::uint64_t callsite = read_base + i;
 
             if (bytes[i] == 0xe8 && i + 5 <= bytes.size()) {
@@ -2207,8 +3519,10 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
                 const std::uint64_t target = rel32_target(read_base + i + 5, rel);
                 if (auto ait = api_by_address.find(target); ait != api_by_address.end())
                     api = ait->second;
-                else if (auto tit = thunks.find(target); tit != thunks.end())
+                else if (auto tit = thunks.find(target); tit != thunks.end()) {
                     api = tit->second;
+                    iat = true;
+                }
             } else if (bytes[i] == 0xff && bytes[i + 1] == 0x15) {
                 std::int32_t rel = 0;
                 std::memcpy(&rel, bytes.data() + i + 2, sizeof(rel));
@@ -2217,6 +3531,19 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
                     api = sit->second;
                     iat = true;
                 }
+            } else {
+                std::uint64_t register_slot = 0;
+                std::uint64_t register_load = 0;
+                if (const api_target_t* reg_api = resolve_recent_register_import_call(bytes, i, read_base, import_slots, register_slot, register_load)) {
+                    api = reg_api;
+                    iat = true;
+                    register_indirect_import = true;
+                    module_diag["register_indirect_import_hits"] = module_diag.value("register_indirect_import_hits", 0u) + 1;
+                    if (!module_diag.contains("register_indirect_import_samples"))
+                        module_diag["register_indirect_import_samples"] = nlohmann::json::array();
+                    if (module_diag["register_indirect_import_samples"].size() < 8)
+                        module_diag["register_indirect_import_samples"].push_back(nlohmann::json{{"call_va", fmt_addr(callsite)}, {"load_va", fmt_addr(register_load)}, {"slot_va", fmt_addr(register_slot)}, {"api", reg_api->name}});
+                }
             }
 
             if (!api)
@@ -2224,7 +3551,10 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
             ++candidate_hits;
             ++module_candidate_hits;
             const std::uint64_t handler = find_probable_function_start(bytes, i, read_base);
+            const std::size_t result_count_before = results.size();
             add_sendrecv_result(results, seen_callsites, module, bytes, read_base, *api, callsite, handler, 0, iat, excluded_targets, options.max_results);
+            if (register_indirect_import && results.size() > result_count_before)
+                results.back()["callsite_resolution"] = "register_indirect_import_slot_load";
         }
         module_diag["callsite_scan_elapsed_ms"] = GetTickCount64() - callsites_t0;
         module_diag["candidate_hit_count"] = module_candidate_hits;
@@ -2288,8 +3618,8 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
         {"scan_size", options.scan_size}
     };
     out["limitations"] = nlohmann::json::array({
-        "IAT and direct relative calls are detected; custom syscall wrappers may require manual follow-up",
-        "serializer and deserializer addresses are nearest-call heuristics unless a dedicated trace confirms writes",
+        "direct relative, import thunk, IAT indirect, and recent register-loaded IAT calls are detected; custom syscall wrappers may require manual follow-up",
+        "serializer and deserializer addresses are ranked same-function call graph candidates unless net_proto_trace_serializer confirms runtime buffer writes",
         "system modules are skipped to focus on application handlers",
         "bounded deadline returns partial diagnostics without inventing send/recv handlers"
     });
@@ -2334,8 +3664,6 @@ bool trace_serializer(const serializer_trace_options_t& input,
     if (options.sample_ms > 10000)
         options.sample_ms = 10000;
 
-    const int buf_arg = pre_encrypt_arg_index(options.buffer_reg);
-    const int size_arg = pre_encrypt_arg_index(options.size_reg);
     std::uint32_t driver_buf_reg = 0;
     std::uint32_t driver_size_reg = 0;
     if (!driver_reg_index_checked(options.buffer_reg, driver_buf_reg)) {
@@ -2364,137 +3692,75 @@ bool trace_serializer(const serializer_trace_options_t& input,
         diag::log_tagged_fmt("net_proto", "trace_serializer invalid_register_pair reg=%s", options.buffer_reg.c_str());
         return false;
     }
-    std::vector<std::vector<std::uint8_t>> samples;
+    std::vector<serializer_sample_t> samples;
     nlohmann::json captures = nlohmann::json::array();
-    std::string backend = "pre_encrypt_hook";
-    bool pre_encrypt_attempted = buf_arg >= 0 && size_arg >= 0;
-    bool pre_encrypt_hook_installed = false;
-    bool pre_encrypt_polling_started = false;
-    bool pre_encrypt_started = false;
-    std::uint32_t pre_encrypt_unhook_removed = 0;
-    DWORD pre_encrypt_debugger_error = ERROR_SUCCESS;
-    std::string pre_encrypt_fallback_reason;
-    bool driver_sniff_attempted = false;
+    std::string backend = "driver_sniff_net_buffers";
+    bool driver_sniff_attempted = true;
     bool driver_sniff_started = false;
     bool driver_sniff_active_after_get = false;
 
     diag::log_tagged_fmt("net_proto",
-        "trace_serializer begin pid=%u serializer=0x%llX buffer_reg=%s size_reg=%s pre_buf=%d pre_size=%d driver_buf=%u driver_size=%u sample_ms=%u max_captures=%u",
+        "trace_serializer begin pid=%u serializer=0x%llX buffer_reg=%s size_reg=%s driver_buf=%u driver_size=%u sample_ms=%u max_captures=%u backend=driver_sniff_net_buffers",
         pid,
         static_cast<unsigned long long>(options.serializer_va),
         options.buffer_reg.c_str(),
         options.size_reg.c_str(),
-        buf_arg,
-        size_arg,
         driver_buf_reg,
         driver_size_reg,
         options.sample_ms,
         options.max_captures);
 
-    if (buf_arg >= 0 && size_arg >= 0) {
-        pre_encrypt_hook_installed = pre_encrypt_hook::hook_address(options.serializer_va, "net_proto_serializer",
-            static_cast<std::uint32_t>(buf_arg),
-            static_cast<std::uint32_t>(size_arg));
-        if (pre_encrypt_hook_installed)
-            pre_encrypt_polling_started = pre_encrypt_hook::start_polling();
-        pre_encrypt_debugger_error = pre_encrypt_hook::g_state.debugger_error.load();
-        if (!pre_encrypt_hook_installed)
-            pre_encrypt_fallback_reason = "pre_encrypt_hook_install_failed";
-        else if (!pre_encrypt_polling_started)
-            pre_encrypt_fallback_reason = "pre_encrypt_polling_start_failed";
-        diag::log_tagged_fmt("net_proto",
-            "trace_serializer pre_encrypt_setup attempted=1 installed=%d polling_started=%d debugger_error=%lu fallback_reason=%s",
-            pre_encrypt_hook_installed ? 1 : 0,
-            pre_encrypt_polling_started ? 1 : 0,
-            static_cast<unsigned long>(pre_encrypt_debugger_error),
-            pre_encrypt_fallback_reason.empty() ? "<none>" : pre_encrypt_fallback_reason.c_str());
+    if (!driver_bridge::sniff_net_buffers_start(options.serializer_va,
+            driver_buf_reg,
+            driver_size_reg,
+            options.max_captures,
+            options.tid,
+            0)) {
+        error = driver_bridge::last_error().empty() ? "failed to start kernel serializer buffer sniffing" : driver_bridge::last_error();
+        out["process_id"] = pid;
+        out["serializer_va"] = fmt_addr(options.serializer_va);
+        out["buffer_reg"] = options.buffer_reg;
+        out["size_reg"] = options.size_reg;
+        out["backend"] = backend;
+        out["kernel_only_capture"] = true;
+        out["driver_sniff_attempted"] = driver_sniff_attempted;
+        out["driver_sniff_started"] = driver_sniff_started;
+        out["driver_error"] = error;
+        out["functional_success"] = false;
+        out["zero_capture_reason"] = "kernel serializer buffer sniffing did not start";
+        return false;
     }
-
-    if (pre_encrypt_hook_installed && pre_encrypt_polling_started) {
-        pre_encrypt_started = true;
-        std::this_thread::sleep_for(std::chrono::milliseconds(options.sample_ms));
-        auto caps = pre_encrypt_hook::get_captures(options.max_captures);
-        pre_encrypt_unhook_removed = pre_encrypt_hook::unhook_all();
-        diag::log_tagged_fmt("net_proto",
-            "trace_serializer pre_encrypt_done installed=%d polling_started=%d captures=%zu sample_ms=%u unhook_removed=%u debugger_error=%lu",
-            pre_encrypt_hook_installed ? 1 : 0,
-            pre_encrypt_polling_started ? 1 : 0,
-            caps.size(),
-            options.sample_ms,
-            pre_encrypt_unhook_removed,
-            static_cast<unsigned long>(pre_encrypt_debugger_error));
-        for (const auto& cap : caps) {
-            samples.push_back(cap.buffer);
-            nlohmann::json c;
-            c["timestamp"] = cap.timestamp;
-            c["thread_id"] = cap.tid;
-            c["rip"] = fmt_addr(cap.rip);
-            c["function"] = cap.function_name;
-            c["size"] = cap.buffer.size();
-            c["hex_preview"] = game_protocol::bytes_to_hex(cap.buffer, 128);
-            captures.push_back(std::move(c));
-        }
-    } else {
-        pre_encrypt_unhook_removed = pre_encrypt_hook::unhook_all();
-        backend = "driver_sniff_net_buffers";
-        driver_sniff_attempted = true;
-        diag::log_tagged_fmt("net_proto",
-            "trace_serializer driver_fallback pre_attempted=%d installed=%d polling_started=%d unhook_removed=%u debugger_error=%lu reason=%s",
-            pre_encrypt_attempted ? 1 : 0,
-            pre_encrypt_hook_installed ? 1 : 0,
-            pre_encrypt_polling_started ? 1 : 0,
-            pre_encrypt_unhook_removed,
-            static_cast<unsigned long>(pre_encrypt_debugger_error),
-            pre_encrypt_fallback_reason.empty() ? "<none>" : pre_encrypt_fallback_reason.c_str());
-        if (!driver_bridge::sniff_net_buffers_start(options.serializer_va,
-                driver_buf_reg,
-                driver_size_reg,
-                options.max_captures,
-                options.tid,
-                0)) {
-            error = driver_bridge::last_error().empty() ? "failed to start serializer trace" : driver_bridge::last_error();
-            out["process_id"] = pid;
-            out["serializer_va"] = fmt_addr(options.serializer_va);
-            out["buffer_reg"] = options.buffer_reg;
-            out["size_reg"] = options.size_reg;
-            out["backend"] = backend;
-            out["pre_encrypt_attempted"] = pre_encrypt_attempted;
-            out["pre_encrypt_hook_installed"] = pre_encrypt_hook_installed;
-            out["pre_encrypt_polling_started"] = pre_encrypt_polling_started;
-            out["pre_encrypt_started"] = pre_encrypt_started;
-            out["pre_encrypt_unhook_removed"] = pre_encrypt_unhook_removed;
-            out["pre_encrypt_debugger_error"] = static_cast<unsigned long>(pre_encrypt_debugger_error);
-            out["pre_encrypt_fallback_reason"] = pre_encrypt_fallback_reason;
-            out["driver_sniff_attempted"] = driver_sniff_attempted;
-            out["driver_sniff_started"] = driver_sniff_started;
-            out["driver_error"] = error;
-            out["functional_success"] = false;
-            out["zero_capture_reason"] = "driver serializer buffer sniffing did not start after pre-encrypt hook fallback";
-            return false;
-        }
-        driver_sniff_started = true;
-        std::this_thread::sleep_for(std::chrono::milliseconds(options.sample_ms));
-        bool active = false;
-        auto caps = driver_bridge::sniff_net_buffers_get(active);
-        driver_bridge::sniff_net_buffers_stop();
-        driver_sniff_active_after_get = active;
-        diag::log_tagged_fmt("net_proto",
-            "trace_serializer driver_sniff_done captures=%zu active_after_get=%d sample_ms=%u driver_error=%s",
-            caps.size(),
-            active ? 1 : 0,
-            options.sample_ms,
-            driver_bridge::last_error().c_str());
-        for (const auto& cap : caps) {
-            samples.push_back(cap.buffer);
-            nlohmann::json c;
-            c["timestamp"] = cap.timestamp;
-            c["thread_id"] = cap.thread_id;
-            c["size"] = cap.buffer.size();
-            c["hex_preview"] = game_protocol::bytes_to_hex(cap.buffer, 128);
-            captures.push_back(std::move(c));
-        }
-        out["driver_sniff_active_after_get"] = driver_sniff_active_after_get;
+    driver_sniff_started = true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(options.sample_ms));
+    bool active = false;
+    auto caps = driver_bridge::sniff_net_buffers_get(active);
+    driver_bridge::sniff_net_buffers_stop();
+    driver_sniff_active_after_get = active;
+    diag::log_tagged_fmt("net_proto",
+        "trace_serializer driver_sniff_done captures=%zu active_after_get=%d sample_ms=%u driver_error=%s",
+        caps.size(),
+        active ? 1 : 0,
+        options.sample_ms,
+        driver_bridge::last_error().c_str());
+    for (const auto& cap : caps) {
+        serializer_sample_t sample;
+        sample.buffer = cap.buffer;
+        sample.timestamp = cap.timestamp;
+        sample.thread_id = cap.thread_id;
+        sample.backend = "driver_sniff_net_buffers";
+        samples.push_back(std::move(sample));
+        nlohmann::json c;
+        c["timestamp"] = cap.timestamp;
+        c["thread_id"] = cap.thread_id;
+        c["size"] = cap.buffer.size();
+        c["hex_preview"] = game_protocol::bytes_to_hex(cap.buffer, 128);
+        c["output_byte_origin"] = "driver_sniffed_serializer_buffer";
+        c["source_va_resolved"] = false;
+        c["source_va_status"] = "not_available_from_driver_sniff";
+        c["register_provenance"] = nlohmann::json{{"buffer_reg", options.buffer_reg}, {"size_reg", options.size_reg}, {"capture_rip", nullptr}};
+        captures.push_back(std::move(c));
     }
+    out["driver_sniff_active_after_get"] = driver_sniff_active_after_get;
 
     out["process_id"] = pid;
     out["serializer_va"] = fmt_addr(options.serializer_va);
@@ -2502,7 +3768,12 @@ bool trace_serializer(const serializer_trace_options_t& input,
     out["size_reg"] = options.size_reg;
     out["backend"] = backend;
     out["trace_method"] = "output_buffer_sampling";
-    out["source_resolution"] = "source_va is null unless a capture backend reports a concrete source address; current fields are inferred from serializer output bytes";
+    out["source_resolution"] = "capture backends provide output-buffer byte provenance, thread, timestamp, and hook RIP when available; memory source addresses require a taint backend and are not claimed here";
+    out["source_va_resolved"] = false;
+    out["provenance_kind"] = "output_byte_capture";
+    out["register_trace_method"] = "driver_debug_register_buffer_sniff";
+    out["kernel_only_capture"] = true;
+    out["taint_backend_status"] = "no live source-memory taint backend is exposed by these capture APIs; output bytes are tied to bounded register-derived buffer captures only";
     out["sample_ms"] = options.sample_ms;
     out["elapsed_ms"] = static_cast<std::uint64_t>(GetTickCount64()) - started;
     out["capture_window_ms"] = options.sample_ms;
@@ -2511,27 +3782,20 @@ bool trace_serializer(const serializer_trace_options_t& input,
     out["saw_serializer_output"] = !samples.empty();
     out["stimulus_observed"] = !samples.empty();
     out["functional_success"] = !samples.empty();
-    out["pre_encrypt_attempted"] = pre_encrypt_attempted;
-    out["pre_encrypt_hook_installed"] = pre_encrypt_hook_installed;
-    out["pre_encrypt_polling_started"] = pre_encrypt_polling_started;
-    out["pre_encrypt_started"] = pre_encrypt_started;
-    out["pre_encrypt_unhook_removed"] = pre_encrypt_unhook_removed;
-    out["pre_encrypt_debugger_error"] = static_cast<unsigned long>(pre_encrypt_debugger_error);
-    out["pre_encrypt_fallback_reason"] = pre_encrypt_fallback_reason;
+    out["user_mode_hook_attempted"] = false;
+    out["user_mode_hook_disabled_reason"] = "kernel_only_stealth_policy";
     out["driver_sniff_attempted"] = driver_sniff_attempted;
     out["driver_sniff_started"] = driver_sniff_started;
     out["driver_sniff_active_after_get"] = driver_sniff_active_after_get;
     if (samples.empty())
-        out["zero_capture_reason"] = backend == "pre_encrypt_hook"
-            ? "pre-encrypt hook sampling completed without observing serializer output"
-            : "driver serializer buffer sniffing completed without observing serializer output";
+        out["zero_capture_reason"] = "kernel serializer buffer sniffing completed without observing serializer output";
     out["captures"] = std::move(captures);
     out["fields"] = captures_to_fields(samples);
     out["field_count"] = out["fields"].size();
     out["confidence"] = samples.empty() ? 0.18 : (std::min)(0.78, 0.42 + 0.06 * static_cast<double>((std::min)(samples.size(), std::size_t(6))));
     out["evidence"] = samples.empty()
         ? nlohmann::json::array({"no serializer breakpoint hits observed during bounded sample"})
-        : nlohmann::json::array({"captured serializer output buffers", "field offsets are inferred from payload bytes and sample variance", "source addresses are not claimed without taint provenance"});
+        : nlohmann::json::array({"captured serializer output buffers", "field offsets are inferred from payload bytes and sample variance", "output_byte_provenance recorded per field", "source addresses are not claimed without taint provenance"});
     diag::log_tagged_fmt("net_proto",
         "trace_serializer done backend=%s captures=%u fields=%u confidence=%.3f elapsed_ms=%llu functional_success=%d",
         backend.c_str(),
@@ -2568,7 +3832,6 @@ bool reassemble_udp_sessions(const udp_reassemble_options_t& input,
     std::vector<driver_bridge::captured_packet_t> packets;
     if (!options.fixture_payloads.empty()) {
         backend = "provided_payload";
-        std::uint32_t index = 0;
         for (const auto& payload : options.fixture_payloads) {
             if (payload.empty())
                 continue;
@@ -2581,12 +3844,11 @@ bool reassemble_udp_sessions(const udp_reassemble_options_t& input,
             p.local_addr[3] = 1;
             p.remote_addr[0] = 127;
             p.remote_addr[3] = 1;
-            p.local_port = 41000 + index;
-            p.remote_port = 42000 + index;
+            p.local_port = 41000;
+            p.remote_port = 42000;
             p.payload = payload;
             p.payload_size = static_cast<std::uint32_t>(p.payload.size());
             packets.push_back(std::move(p));
-            ++index;
         }
         diag::log_tagged_fmt("net_proto",
             "udp_reassemble provided_payload payloads=%zu packets=%zu pid=%u max_payload=%u",
@@ -2625,6 +3887,7 @@ bool reassemble_udp_sessions(const udp_reassemble_options_t& input,
     }
 
     std::map<std::string, udp_session_t> grouped;
+    std::map<std::string, udp_fragment_group_t> fragment_groups;
     for (const auto& p : packets) {
         if (p.protocol != 17)
             continue;
@@ -2635,8 +3898,38 @@ bool reassemble_udp_sessions(const udp_reassemble_options_t& input,
         session.key = key;
         auto messages = split_udp_messages(p);
         for (auto& m : messages) {
-            if (session.messages.size() < 256)
-                session.messages.push_back(std::move(m));
+            if (m.fragment_count >= 2 && !m.reassembly_complete) {
+                const std::string group_key = udp_fragment_group_key(key, m);
+                auto& group = fragment_groups[group_key];
+                group.session_key = key;
+                if (group.pieces.size() < 4096)
+                    group.pieces.push_back(std::move(m));
+            } else {
+                append_udp_message_limited(session, std::move(m));
+            }
+        }
+    }
+
+    std::uint32_t reassembled_group_count = 0;
+    std::uint32_t incomplete_fragment_group_count = 0;
+    for (auto& [group_key, group] : fragment_groups) {
+        (void)group_key;
+        auto& session = grouped[group.session_key];
+        session.key = group.session_key;
+        udp_message_t reassembled;
+        if (reassemble_fragment_group(group, reassembled)) {
+            append_udp_message_limited(session, std::move(reassembled));
+            ++reassembled_group_count;
+        } else {
+            ++incomplete_fragment_group_count;
+            for (auto& piece : group.pieces) {
+                piece.reassembly_complete = false;
+                piece.reassembled = false;
+                if (!piece.reassembly_evidence.is_array())
+                    piece.reassembly_evidence = nlohmann::json::array();
+                piece.reassembly_evidence.push_back("fragment_group_incomplete_or_overlapping");
+                append_udp_message_limited(session, std::move(piece));
+            }
         }
     }
 
@@ -2654,7 +3947,17 @@ bool reassemble_udp_sessions(const udp_reassemble_options_t& input,
             sj["session_id"] = session.id;
             sj["key"] = key;
             sj["message_count"] = session.messages.size();
-            sj["confidence"] = session.messages.size() >= 2 ? 0.62 : 0.36;
+            std::uint32_t reassembled_messages = 0;
+            std::uint32_t incomplete_fragments = 0;
+            for (const auto& message : session.messages) {
+                if (message.reassembled)
+                    ++reassembled_messages;
+                if (message.fragment_count >= 2 && !message.reassembly_complete)
+                    ++incomplete_fragments;
+            }
+            sj["reassembled_message_count"] = reassembled_messages;
+            sj["incomplete_fragment_count"] = incomplete_fragments;
+            sj["confidence"] = reassembled_messages != 0 ? 0.82 : (session.messages.size() >= 2 ? 0.62 : 0.36);
             sj["evidence"] = nlohmann::json::array();
             nlohmann::json messages_json = nlohmann::json::array();
             std::set<std::string> schemes;
@@ -2662,15 +3965,14 @@ bool reassemble_udp_sessions(const udp_reassemble_options_t& input,
                 schemes.insert(message.scheme);
                 if (messages_json.size() >= 32)
                     continue;
-                nlohmann::json mj;
-                mj["sequence"] = message.sequence;
-                mj["scheme"] = message.scheme;
-                mj["payload_size"] = message.payload.size();
-                mj["payload_hex"] = game_protocol::bytes_to_hex(message.payload, 128);
-                messages_json.push_back(std::move(mj));
+                messages_json.push_back(udp_message_to_json(message));
             }
             for (const auto& scheme : schemes)
                 sj["evidence"].push_back(scheme);
+            if (reassembled_messages != 0)
+                sj["evidence"].push_back("complete_multi_datagram_reassembly");
+            if (incomplete_fragments != 0)
+                sj["evidence"].push_back("incomplete_fragment_groups_retained");
             sj["messages"] = std::move(messages_json);
 
             sessions_json.push_back(std::move(sj));
@@ -2694,6 +3996,9 @@ bool reassemble_udp_sessions(const udp_reassemble_options_t& input,
     out["max_packets"] = options.max_packets;
     out["max_payload"] = options.max_payload;
     out["packet_count"] = packets.size();
+    out["fragment_group_count"] = fragment_groups.size();
+    out["reassembled_group_count"] = reassembled_group_count;
+    out["incomplete_fragment_group_count"] = incomplete_fragment_group_count;
     out["sessions"] = std::move(sessions_json);
     out["session_count"] = out["sessions"].size();
     out["produces_recorded_sessions"] = true;
@@ -2755,6 +4060,14 @@ bool replay_mutate(const replay_mutate_options_t& input,
         options.payload_cap = 4096;
     if (options.response_wait_ms > 5000)
         options.response_wait_ms = 5000;
+    options.mutation_strategy = lower_copy(options.mutation_strategy);
+    if (options.mutation_strategy.empty())
+        options.mutation_strategy = "boundary";
+    if (!valid_mutation_strategy(options.mutation_strategy)) {
+        error = "mutation_strategy must be one of boundary, random, or bitflip";
+        out = replay_mutate_error_data(input, "invalid_mutation_strategy", "strategy_validation", error.c_str());
+        return false;
+    }
 
     udp_session_t session;
     bool found_session = false;
@@ -2778,7 +4091,8 @@ bool replay_mutate(const replay_mutate_options_t& input,
         return false;
     }
 
-    auto mutations = make_mutations(session, lower_copy(options.mutation_strategy), options.max_mutations, options.payload_cap);
+    nlohmann::json numeric_field_inventory;
+    auto mutations = make_mutations(session, options.mutation_strategy, options.max_mutations, options.payload_cap, numeric_field_inventory);
     if (mutations.empty()) {
         error = "no mutations generated within payload cap";
         out = replay_mutate_error_data(input, "no_mutations_generated", "mutation_generation", error.c_str());
@@ -2796,40 +4110,50 @@ bool replay_mutate(const replay_mutate_options_t& input,
     std::uint32_t sent = 0;
     nlohmann::json sent_json = nlohmann::json::array();
 
-    for (const auto& payload : mutations) {
+    std::size_t mutation_index = 0;
+    for (const auto& mutation : mutations) {
         const bool ok = driver_bridge::inject_packet(1, 17, 2, src_port, options.target_port,
-            src_addr, target_addr, payload.data(), static_cast<std::uint32_t>(payload.size()));
+            src_addr, target_addr, mutation.payload.data(), static_cast<std::uint32_t>(mutation.payload.size()));
         if (ok)
             ++sent;
         if (sent_json.size() < 32) {
             nlohmann::json sj;
+            sj["mutation_index"] = mutation_index;
             sj["ok"] = ok;
-            sj["payload_size"] = payload.size();
-            sj["hex_preview"] = game_protocol::bytes_to_hex(payload, 96);
+            sj["payload_size"] = mutation.payload.size();
+            sj["hex_preview"] = game_protocol::bytes_to_hex(mutation.payload, 96);
+            sj["strategy"] = mutation.strategy;
+            sj["source_message_index"] = mutation.source_message_index;
+            sj["field_offset"] = mutation.field_offset;
+            sj["field_size"] = mutation.field_size;
+            sj["endian"] = mutation.big_endian ? "big" : "little";
+            sj["original_value"] = mutation.original_value;
+            sj["mutated_value"] = mutation.mutated_value;
+            sj["evidence"] = mutation.evidence;
             sent_json.push_back(std::move(sj));
         }
+        ++mutation_index;
     }
 
     if (options.response_wait_ms)
         std::this_thread::sleep_for(std::chrono::milliseconds(options.response_wait_ms));
 
     nlohmann::json responses = nlohmann::json::array();
+    nlohmann::json captured_responses = nlohmann::json::array();
+    std::uint32_t captured_response_count = 0;
     if (capture_started) {
         auto packets = driver_bridge::get_captured_packets(64);
         driver_bridge::stop_capture();
         for (const auto& p : packets) {
-            if (responses.size() >= 32)
-                break;
             if (p.protocol != 17)
                 continue;
-            nlohmann::json r;
-            r["pid"] = p.pid;
-            r["direction"] = p.direction == 0 ? "inbound" : "outbound";
-            r["local"] = format_ip(p.local_addr, p.address_family) + ":" + std::to_string(p.local_port);
-            r["remote"] = format_ip(p.remote_addr, p.address_family) + ":" + std::to_string(p.remote_port);
-            r["payload_size"] = p.payload.size();
-            r["hex_preview"] = game_protocol::bytes_to_hex(p.payload, 96);
-            responses.push_back(std::move(r));
+            bool interesting = false;
+            nlohmann::json r = classify_response_packet(p, target_addr, options.target_port, src_port, session, mutations, interesting);
+            ++captured_response_count;
+            if (captured_responses.size() < 64)
+                captured_responses.push_back(r);
+            if (interesting && responses.size() < 32)
+                responses.push_back(std::move(r));
         }
     }
 
@@ -2839,16 +4163,28 @@ bool replay_mutate(const replay_mutate_options_t& input,
     out["recorded_message_count"] = session.messages.size();
     out["target"] = options.target_ip + ":" + std::to_string(options.target_port);
     out["mutation_strategy"] = options.mutation_strategy;
+    out["allowed_mutation_strategies"] = nlohmann::json::array({"boundary", "random", "bitflip"});
     out["max_mutations"] = options.max_mutations;
     out["payload_cap"] = options.payload_cap;
+    out["numeric_field_inventory"] = std::move(numeric_field_inventory);
     out["mutations_generated"] = mutations.size();
     out["mutations_sent"] = sent;
     out["sent_preview"] = std::move(sent_json);
     out["response_capture_started"] = capture_started;
+    out["captured_response_count"] = captured_response_count;
+    out["captured_responses"] = std::move(captured_responses);
+    out["interesting_response_count"] = responses.size();
     out["interesting_responses"] = std::move(responses);
+    out["replay_evidence"] = nlohmann::json::array({
+        capture_started ? "response_capture_started" : "response_capture_start_failed",
+        sent != 0 ? "at_least_one_mutation_sent" : "no_mutations_sent",
+        captured_response_count != 0 ? "udp_packets_observed_after_replay" : "no_udp_packets_observed_after_replay"
+    });
+    out["replay_successful"] = sent != 0;
+    out["response_observed"] = captured_response_count != 0;
     out["limitations"] = nlohmann::json::array({
         "mutations are generated from inferred numeric fields and may not preserve checksums or encryption",
-        "responses are bounded packet previews, not proof of server-side state changes",
+        "interesting responses are classified from bounded UDP packet capture and payload diffs, not proof of server-side state changes",
         "loopback is enforced unless allow_non_loopback is explicitly set"
     });
     return true;

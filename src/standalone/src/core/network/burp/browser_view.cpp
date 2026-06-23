@@ -8,6 +8,7 @@
 #include "imgui/imgui_internal.h"
 #include "../../ui/theme.hpp"
 #include "../../ui/ui_anim.hpp"
+#include "../../ui/components.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -113,6 +114,27 @@ const char* bridge_state_label(aida::burp::camoufox::bridge_state_t state)
     }
 }
 
+bool same_line_if_fits(float next_w, float spacing = 8.f)
+{
+    if (ImGui::GetContentRegionAvail().x >= next_w + spacing) {
+        ImGui::SameLine(0.f, spacing);
+        return true;
+    }
+    return false;
+}
+
+float pill_width(const char* label)
+{
+    return ImGui::CalcTextSize(label ? label : "").x + 28.f;
+}
+
+void status_pill(const char* label, bool ok, bool neutral_when_false = false)
+{
+    aida::ui::pill_kind_t kind = ok ? aida::ui::pill_kind_t::success :
+        (neutral_when_false ? aida::ui::pill_kind_t::neutral : aida::ui::pill_kind_t::warning);
+    aida::ui::pill_kind(label, kind, aida::ui::size_t_::sm, false);
+}
+
 }
 
 void render(float pos_x, float pos_y, float width, float height,
@@ -142,37 +164,51 @@ void render(float pos_x, float pos_y, float width, float height,
         bridge_status.child_alive && bridge_status.browser_open && bridge_status.page_verified && !bridge_status.cleanup_pending;
     refresh_cert_status(st);
 
+    char status_line[256];
+    _snprintf_s(status_line, sizeof(status_line), _TRUNCATE,
+                "state=%s  pid=%u  open=%s  cleanup=%s  spki=%s",
+                bridge_ready ? "ready" : bridge_state_label(bridge_status.state),
+                static_cast<unsigned>(bridge_status.child_pid),
+                bridge_status.browser_open ? "yes" : "no",
+                bridge_status.cleanup_pending ? "yes" : "no",
+                st.spki_prefix.empty() ? "-" : st.spki_prefix.c_str());
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
-                       "Camoufox %s   PID %u   open %s   verified %s   cleanup %s",
-                       bridge_ready ? "ready" : bridge_state_label(bridge_status.state),
-                       static_cast<unsigned>(bridge_status.child_pid),
-                       bridge_status.browser_open ? "yes" : "no",
-                       bridge_status.page_verified ? "yes" : "no",
-                       bridge_status.cleanup_pending ? "yes" : "no");
-    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
-                       "CA ready %s   Installed %s   SPKI %s",
-                       st.ca_ready ? "yes" : "no",
-                       st.ca_installed ? "yes" : "no",
-                       st.spki_prefix.empty() ? "-" : st.spki_prefix.c_str());
+                       "%s", status_line);
+
+    const bool native_ua = !bridge_status.ua_override &&
+        (bridge_status.effective_ua_policy.empty() || bridge_status.effective_ua_policy == "camoufox_native");
+    status_pill("Camoufox only", true);
+    same_line_if_fits(pill_width("WebRTC blocked"));
+    status_pill("WebRTC blocked", bridge_status.webrtc_blocked || bridge_status.state == aida::burp::camoufox::bridge_state_t::stopped, true);
+    same_line_if_fits(pill_width("Native UA"));
+    status_pill("Native UA", native_ua, true);
+    same_line_if_fits(pill_width("Page verified"));
+    status_pill("Page verified", bridge_status.page_verified, true);
+    same_line_if_fits(pill_width("Privacy verified"));
+    status_pill("Privacy verified", bridge_status.privacy_verified, true);
+    same_line_if_fits(pill_width("Proxy active"));
+    status_pill("Proxy active", mitm_proxy::is_running(), true);
+    same_line_if_fits(pill_width(st.ca_installed ? "AiDA CA trusted" : "AiDA CA not trusted"));
+    status_pill(st.ca_installed ? "AiDA CA trusted" : "AiDA CA not trusted", st.ca_installed, true);
 
     ImGui::Spacing();
 
     ImGui::AlignTextToFramePadding();
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)), "URL:");
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(420.f);
+    same_line_if_fits(220.f);
+    ImGui::SetNextItemWidth(std::min(420.f, std::max(180.f, ImGui::GetContentRegionAvail().x)));
     ImGui::InputTextWithHint("##bb_url", "about:blank", st.initial_url, sizeof(st.initial_url));
 
     ImGui::AlignTextToFramePadding();
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)), "Profile subdir:");
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(220.f);
+    same_line_if_fits(220.f);
+    ImGui::SetNextItemWidth(std::min(260.f, std::max(160.f, ImGui::GetContentRegionAvail().x)));
     ImGui::InputTextWithHint("##bb_profile", "BurpBrowser", st.profile_subdir, sizeof(st.profile_subdir));
 
     const char* strategy_names[] = {
         "trust_store_only",
         "camoufox_spki_allowlist",
-        "unsafe_ignore_all_for_debug_builds_only"
+        "debug unsafe ignore"
     };
     int strategy_values[] = {
         static_cast<int>(certificate_strategy_t::trust_store_only),
@@ -187,16 +223,20 @@ void render(float pos_x, float pos_y, float width, float height,
             break;
         }
     }
-    ImGui::SetNextItemWidth(250.f);
+    ImGui::SetNextItemWidth(std::min(280.f, std::max(180.f, ImGui::GetContentRegionAvail().x)));
     if (ImGui::Combo("Certificate strategy", &strategy_index, strategy_names, strategy_count)) {
         st.certificate_strategy = strategy_values[strategy_index];
     }
-    ImGui::SameLine();
+    same_line_if_fits(150.f);
     ImGui::Checkbox("Clear profile first", &st.clear_profile_first);
+    if (selected_certificate_strategy(st) == certificate_strategy_t::unsafe_ignore_all_for_debug_builds_only) {
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.warning, alpha)),
+                           "Debug-only certificate bypass is selected.");
+    }
 
     ImGui::Checkbox("Override proxy port", &st.use_proxy_override);
     if (st.use_proxy_override) {
-        ImGui::SameLine();
+        same_line_if_fits(100.f);
         ImGui::SetNextItemWidth(100.f);
         ImGui::InputInt("##bb_port", &st.proxy_port_override);
         if (st.proxy_port_override < 1) st.proxy_port_override = 1;
@@ -236,7 +276,7 @@ void render(float pos_x, float pos_y, float width, float height,
         st.last_launch_status = buf;
     }
     if (busy) ImGui::EndDisabled();
-    ImGui::SameLine();
+    same_line_if_fits(160.f);
     if (ImGui::Button("Stop Camoufox", ImVec2(160.f, 28.f))) {
         kill_all();
         std::lock_guard<std::mutex> lk(st.status_mtx);
@@ -253,93 +293,100 @@ void render(float pos_x, float pos_y, float width, float height,
 
     ImGui::PopID();
 
-    ImGui::SetCursorPos(ImVec2(pos_x + 6.f, pos_y + 240.f));
-    ImGui::BeginChild("##burp_browser_table", ImVec2(width - 12.f, height - 250.f),
+    ImGui::SetCursorPos(ImVec2(pos_x + 6.f, ImGui::GetCursorPosY() + 8.f));
+    float table_y = ImGui::GetCursorPosY();
+    ImGui::BeginChild("##burp_browser_table",
+                      ImVec2(std::max(120.f, width - 12.f), std::max(80.f, height - table_y - 8.f)),
                       false, ImGuiWindowFlags_NoBackground);
 
     st.anim_time += ImGui::GetIO().DeltaTime;
     auto rows = list_running();
 
-    ImVec2 table_org = ImGui::GetWindowPos();
     const float row_h = 24.f;
-    const float text_oy = (row_h - ImGui::GetTextLineHeight()) * 0.5f;
-    const float col_pid = 72.f;
-    const float col_port = 80.f;
-    const float col_elapsed = 90.f;
-    const float col_strategy = 172.f;
-    const float col_spki = 88.f;
-    const float col_actions = 96.f;
-    const float remain = (width - 12.f) - col_pid - col_port - col_elapsed - col_strategy - col_spki - col_actions - 24.f;
-    const float col_profile = std::max(160.f, remain * 0.5f);
-    const float col_browser = std::max(160.f, remain - col_profile);
+    const ImGuiTableFlags table_flags =
+        ImGuiTableFlags_RowBg |
+        ImGuiTableFlags_BordersInnerH |
+        ImGuiTableFlags_Resizable |
+        ImGuiTableFlags_Reorderable |
+        ImGuiTableFlags_ScrollX |
+        ImGuiTableFlags_SizingFixedFit;
+    auto table_text = [&](const char* text, ImU32 color)
+    {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(color));
+        ImGui::TextUnformatted(text ? text : "");
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered() && text != nullptr && ImGui::CalcTextSize(text).x > ImGui::GetContentRegionAvail().x) {
+            ImGui::BeginTooltip();
+            ImGui::PushTextWrapPos(640.f);
+            ImGui::TextUnformatted(text);
+            ImGui::PopTextWrapPos();
+            ImGui::EndTooltip();
+        }
+    };
 
-    dl->AddRectFilled(ImVec2(table_org.x, table_org.y), ImVec2(table_org.x + width - 12.f, table_org.y + row_h),
-                      aida::ui::with_alpha(th.panel_header, alpha));
-    float cx = table_org.x + 8.f;
-    ImU32 hdr_col = aida::ui::with_alpha(th.text_secondary, alpha);
-    dl->AddText(ImVec2(cx, table_org.y + text_oy), hdr_col, "PID");       cx += col_pid;
-    dl->AddText(ImVec2(cx, table_org.y + text_oy), hdr_col, "Proxy");     cx += col_port;
-    dl->AddText(ImVec2(cx, table_org.y + text_oy), hdr_col, "Uptime");    cx += col_elapsed;
-    dl->AddText(ImVec2(cx, table_org.y + text_oy), hdr_col, "Strategy");  cx += col_strategy;
-    dl->AddText(ImVec2(cx, table_org.y + text_oy), hdr_col, "SPKI");      cx += col_spki;
-    dl->AddText(ImVec2(cx, table_org.y + text_oy), hdr_col, "Browser");   cx += col_browser;
-    dl->AddText(ImVec2(cx, table_org.y + text_oy), hdr_col, "Profile");   cx += col_profile;
-    dl->AddText(ImVec2(cx, table_org.y + text_oy), hdr_col, "Actions");
+    if (ImGui::BeginTable("##burp_browser_process_table", 8, table_flags, ImVec2(0.f, 0.f))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("PID", ImGuiTableColumnFlags_WidthFixed, 72.f);
+        ImGui::TableSetupColumn("Proxy", ImGuiTableColumnFlags_WidthFixed, 80.f);
+        ImGui::TableSetupColumn("Uptime", ImGuiTableColumnFlags_WidthFixed, 90.f);
+        ImGui::TableSetupColumn("Strategy", ImGuiTableColumnFlags_WidthFixed, 172.f);
+        ImGui::TableSetupColumn("SPKI", ImGuiTableColumnFlags_WidthFixed, 88.f);
+        ImGui::TableSetupColumn("Browser", ImGuiTableColumnFlags_WidthFixed, 220.f);
+        ImGui::TableSetupColumn("Profile", ImGuiTableColumnFlags_WidthFixed, 220.f);
+        ImGui::TableSetupColumn("Actions", ImGuiTableColumnFlags_WidthFixed, 96.f);
+        ImGui::TableHeadersRow();
 
-    ImGui::SetCursorPosY(row_h + 4.f);
-
-    int visible = 0;
-    for (size_t i = 0; i < rows.size(); ++i) {
-        const auto& r = rows[i];
-        float ra = ui_anim::render_row_entrance(visible, st.anim_time, 0.012f);
-        float r_alpha = alpha * ra;
-        float abs_ry = ImGui::GetCursorScreenPos().y;
-        if (visible & 1) {
-            dl->AddRectFilled(ImVec2(table_org.x, abs_ry),
-                              ImVec2(table_org.x + width - 12.f, abs_ry + row_h),
-                              aida::ui::with_alpha(th.hover_wash, r_alpha * 0.30f));
+        if (rows.empty()) {
+            ImGui::TableNextRow(ImGuiTableRowFlags_None, row_h);
+            ImGui::TableSetColumnIndex(0);
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)));
+            ImGui::TextUnformatted("No tracked browser processes.");
+            ImGui::PopStyleColor();
         }
 
-        ImGui::PushID(static_cast<int>(r.pid));
-        ImGui::InvisibleButton("##bb_row", ImVec2(width - 12.f, row_h));
+        for (size_t i = 0; i < rows.size(); ++i) {
+            const auto& r = rows[i];
+            float ra = ui_anim::render_row_entrance(static_cast<int>(i), st.anim_time, 0.012f);
+            float r_alpha = alpha * ra;
+            ImU32 txt = aida::ui::with_alpha(r.running ? th.text_primary : th.text_dim, r_alpha);
+            ImU32 status_col = aida::ui::with_alpha(r.running ? th.success : th.error, r_alpha);
 
-        ImU32 txt = aida::ui::with_alpha(r.running ? th.text_primary : th.text_dim, r_alpha);
-        ImU32 status_col = aida::ui::with_alpha(r.running ? th.success : th.error, r_alpha);
-        float ty = abs_ry + text_oy;
-        float lx = table_org.x + 8.f;
+            ImGui::PushID(static_cast<int>(r.pid));
+            ImGui::TableNextRow(ImGuiTableRowFlags_None, row_h);
 
-        char buf[64];
-        _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%u", static_cast<unsigned>(r.pid));
-        dl->AddText(ImVec2(lx, ty), txt, buf); lx += col_pid;
+            char buf[64];
+            ImGui::TableSetColumnIndex(0);
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%u", static_cast<unsigned>(r.pid));
+            table_text(buf, txt);
 
-        _snprintf_s(buf, sizeof(buf), _TRUNCATE, ":%u", static_cast<unsigned>(r.proxy_port));
-        dl->AddText(ImVec2(lx, ty), txt, buf); lx += col_port;
+            ImGui::TableSetColumnIndex(1);
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE, ":%u", static_cast<unsigned>(r.proxy_port));
+            table_text(buf, txt);
 
-        std::string elapsed = format_elapsed(r.launched_ms);
-        dl->AddText(ImVec2(lx, ty), status_col, elapsed.c_str()); lx += col_elapsed;
+            ImGui::TableSetColumnIndex(2);
+            std::string elapsed = format_elapsed(r.launched_ms);
+            table_text(elapsed.c_str(), status_col);
 
-        dl->AddText(ImVec2(lx, ty), txt, certificate_strategy_name(r.certificate_strategy)); lx += col_strategy;
+            ImGui::TableSetColumnIndex(3);
+            table_text(certificate_strategy_name(r.certificate_strategy), txt);
 
-        const char* spki = r.spki_hash_prefix.empty() ? "-" : r.spki_hash_prefix.c_str();
-        dl->AddText(ImVec2(lx, ty), txt, spki); lx += col_spki;
+            ImGui::TableSetColumnIndex(4);
+            table_text(r.spki_hash_prefix.empty() ? "-" : r.spki_hash_prefix.c_str(), txt);
 
-        const char* bp = r.browser_path.c_str();
-        dl->AddText(ImVec2(lx, ty), txt, bp); lx += col_browser;
+            ImGui::TableSetColumnIndex(5);
+            table_text(r.browser_path.c_str(), txt);
 
-        const char* pp = r.profile_path.c_str();
-        dl->AddText(ImVec2(lx, ty), txt, pp); lx += col_profile;
+            ImGui::TableSetColumnIndex(6);
+            table_text(r.profile_path.c_str(), txt);
 
-        ImGui::SetCursorScreenPos(ImVec2(lx, abs_ry + (row_h - ImGui::GetFrameHeight()) * 0.5f));
-        if (ImGui::SmallButton("Kill")) {
-            kill(r.pid);
+            ImGui::TableSetColumnIndex(7);
+            if (ImGui::SmallButton("Kill")) {
+                kill(r.pid);
+            }
+            ImGui::PopID();
         }
-        ImGui::PopID();
-        ++visible;
-    }
 
-    if (rows.empty()) {
-        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
-                           "No tracked browser processes.");
+        ImGui::EndTable();
     }
 
     ImGui::EndChild();

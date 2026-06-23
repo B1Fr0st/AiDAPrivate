@@ -16,6 +16,19 @@ namespace re::heap_track
 {
 namespace
 {
+constexpr const char* kHeapEventBackend = "kernel_context_hwbp_rtlallocateheap_return_poll";
+constexpr const char* kHeapSnapshotBackend = "snapshot_diff";
+
+bool session_event_active(const store::heap_session_t& session)
+{
+    return session.hw_slot >= 0 && !session.tids.empty();
+}
+
+const char* effective_backend(const store::heap_session_t& session)
+{
+    return session_event_active(session) ? kHeapEventBackend : kHeapSnapshotBackend;
+}
+
 bool capture_matches(const store::heap_session_t& session, const store::heap_capture_t& cap)
 {
     if (cap.va == 0 || cap.size == 0)
@@ -162,7 +175,7 @@ json capture_json(const store::heap_session_t& session, const store::heap_captur
     out["allocation_size_estimate"] = cap.size;
     out["alignment"] = cap.alignment;
     out["timestamp_ms"] = cap.timestamp_ms;
-    out["backend"] = session.hw_slot >= 0 && !session.tids.empty() ? "rtlallocateheap_return_kernel_context" : "snapshot_diff";
+    out["backend"] = effective_backend(session);
     driver_bridge::memory_region_t region{};
     if (query_region(session.pid, cap.va, region))
     {
@@ -212,15 +225,21 @@ json session_json(const store::heap_session_t& session)
     out["baseline_count"] = session.baseline.size();
     out["capture_count"] = session.captures.size();
     out["positive_capture_count"] = session.captures.size();
-    out["snapshot_capture_count"] = session.hw_slot >= 0 && !session.tids.empty() ? 0 : session.captures.size();
-    out["event_capture_count"] = session.hw_slot >= 0 && !session.tids.empty() ? session.captures.size() : 0;
-    out["saw_allocation_event"] = session.hw_slot >= 0 && !session.tids.empty() && !session.captures.empty();
+    out["snapshot_capture_count"] = session_event_active(session) ? 0 : session.captures.size();
+    out["event_capture_count"] = session_event_active(session) ? session.captures.size() : 0;
+    out["saw_allocation_event"] = session_event_active(session) && !session.captures.empty();
     out["mutation_observed"] = !session.captures.empty();
     out["functional_success"] = !session.captures.empty();
     if (session.captures.empty())
         out["zero_capture_reason"] = session.active ? "heap tracking session is active but no allocation or snapshot-diff captures have been observed yet" : "heap tracking session stopped with zero allocation or snapshot-diff captures";
-    out["backend"] = session.hw_slot >= 0 && !session.tids.empty() ? "rtlallocateheap_return_kernel_context" : "snapshot_diff";
-    out["event_capture_active"] = session.hw_slot >= 0 && !session.tids.empty();
+    out["backend"] = effective_backend(session);
+    out["event_capture_active"] = session_event_active(session);
+    out["event_backend_kind"] = kHeapEventBackend;
+    out["snapshot_backend_kind"] = kHeapSnapshotBackend;
+    out["event_backend_uses_debug_events"] = false;
+    out["rtlallocateheap_inline_hook"] = false;
+    out["kernel_context_polling"] = session_event_active(session);
+    out["alignment_filter_active"] = session.alignment != 0;
     out["snapshot_diff_available"] = true;
     return out;
 }
@@ -680,8 +699,10 @@ tool_result_t start_session(const json& params)
         return tool_result_t::error(scope.error());
 
     const std::string backend = backend_param(params);
-    if (backend != "auto" && !event_backend_required(backend) && !snapshot_backend_requested(backend))
-        return tool_result_t::error("'backend' must be auto, snapshot_diff, polling, event, hwbp, hardware_breakpoint, or debug_events.");
+    if (snapshot_backend_requested(backend))
+        return tool_result_t::error("snapshot_diff/polling heap tracking is disabled by kernel-only stealth policy.");
+    if (backend != "auto" && !event_backend_required(backend))
+        return tool_result_t::error("'backend' must be auto, event, hwbp, hardware_breakpoint, or debug_events.");
 
     store::heap_session_t session;
     session.id = store::next_id("heap");
@@ -701,15 +722,11 @@ tool_result_t start_session(const json& params)
     const bool require_event = event_backend_required(backend);
     if (!snapshot_backend_requested(backend) && session.rtl_allocate_heap == 0)
     {
-        if (require_event)
-            return tool_result_t::error("RtlAllocateHeap could not be resolved; event backend was requested and will not downgrade silently.");
-        session.hw_slot = -1;
+        return tool_result_t::error("RtlAllocateHeap could not be resolved; heap tracking is fail-closed under kernel-only stealth policy.");
     }
     if (session.hw_slot >= 0 && has_other_event_session(scope.pid(), session.id))
     {
-        if (require_event)
-            return tool_result_t::error("Another heap event session is already active for this process.");
-        session.hw_slot = -1;
+        return tool_result_t::error("Another heap event session is already active for this process; heap tracking will not downgrade to snapshot_diff.");
     }
 
     store::add_heap_session(session);
@@ -720,14 +737,8 @@ tool_result_t start_session(const json& params)
     if (session.hw_slot >= 0 && !event_started)
     {
         clear_session_breakpoints(session);
-        if (require_event)
-        {
-            store::remove_heap_session(session.id, nullptr);
-            return tool_result_t::error("Heap event backend failed: " + event_error);
-        }
-        session.hw_slot = -1;
-        session.tids.clear();
-        store::update_heap_session(session);
+        store::remove_heap_session(session.id, nullptr);
+        return tool_result_t::error("Heap event backend failed under kernel-only stealth policy: " + event_error);
     }
     for (const auto& updated : store::list_heap_sessions(scope.pid()))
     {
@@ -741,21 +752,18 @@ tool_result_t start_session(const json& params)
     {
         event_error = "RtlAllocateHeap breakpoint could not be armed on any target thread";
         stop_heap_debug_loop(scope.pid());
-        if (require_event)
-        {
-            store::remove_heap_session(session.id, nullptr);
-            return tool_result_t::error("Heap event backend failed: " + event_error);
-        }
-        session.hw_slot = -1;
-        store::update_heap_session(session);
-        event_started = false;
+        store::remove_heap_session(session.id, nullptr);
+        return tool_result_t::error("Heap event backend failed under kernel-only stealth policy: " + event_error);
     }
     json result = session_json(session);
     result["session_id"] = session.id;
     result["requested_backend"] = backend;
-    result["capture_backend"] = event_started ? "rtlallocateheap_return_kernel_context" : "snapshot_diff";
-    result["fallback_reason"] = event_started ? json(nullptr) : json(event_error.empty() ? "snapshot_diff backend selected" : event_error);
-    result["stimulus_required"] = !event_started;
+    result["capture_backend"] = kHeapEventBackend;
+    result["fallback_reason"] = nullptr;
+    result["event_backend_attempted"] = session.rtl_allocate_heap != 0;
+    result["event_backend_required"] = require_event;
+    result["snapshot_diff_selected"] = false;
+    result["stimulus_required"] = false;
     result["pre_stimulus"] = session.captures.empty();
     result["observation_state"] = session.captures.empty() ? "awaiting_stimulus_or_results_poll" : "captures_observed";
     result["functional_snapshot_evidence"] = false;
@@ -763,13 +771,19 @@ tool_result_t start_session(const json& params)
     result["evidence"] = {
         {"rtl_allocate_heap_resolved", session.rtl_allocate_heap != 0},
         {"debug_event_consumer", false},
+        {"rtlallocateheap_inline_hook", false},
+        {"event_backend_kind", kHeapEventBackend},
+        {"snapshot_backend_kind", kHeapSnapshotBackend},
+        {"auto_fallback_policy", "auto is kernel-event-only and fails closed; snapshot_diff is disabled"},
         {"kernel_context_consumer", event_started},
         {"return_value_capture", event_started},
+        {"alignment_filter", session.alignment},
+        {"capture_callstack", session.capture_callstack},
         {"snapshot_baseline_count", session.baseline.size()},
         {"snapshot_baseline_skipped", skip_initial_snapshot},
         {"zero_capture_expected_on_start", session.captures.empty()}
     };
-    return tool_result_t::ok(event_started ? "Heap tracking session started with RtlAllocateHeap return capture." : "Heap tracking session started in snapshot-diff mode.", result);
+    return tool_result_t::ok("Heap tracking session started with kernel-context RtlAllocateHeap return polling.", result);
 }
 
 tool_result_t results_session(const json& params)
@@ -789,10 +803,11 @@ tool_result_t results_session(const json& params)
     const bool focused = append_focus_captures(session, params);
     if (session.hw_slot < 0 || session.tids.empty())
     {
-        if (!focus_only)
-            append_snapshot_diff(session);
-        else
-            store::update_heap_session(session);
+        json result = session_json(session);
+        result["kernel_only_capture"] = true;
+        result["snapshot_diff_checked"] = false;
+        result["reason"] = "heap session has no active kernel HWBP/context backend";
+        return tool_result_t::error("Heap tracking session is not kernel-event-backed; snapshot_diff fallback is disabled.", result);
     }
     else
         store::find_heap_session(id, session);
@@ -805,13 +820,18 @@ tool_result_t results_session(const json& params)
     json result = session_json(session);
     result["events"] = std::move(arr);
     result["returned"] = result["events"].size();
-    result["functional_snapshot_evidence"] = (session.hw_slot < 0 || session.tids.empty()) && session.captures.size() > 0;
-    result["functional_event_evidence"] = session.hw_slot >= 0 && !session.tids.empty() && session.captures.size() > 0;
+    result["functional_snapshot_evidence"] = false;
+    result["functional_event_evidence"] = session_event_active(session) && session.captures.size() > 0;
     result["observation_complete"] = true;
     result["saw_allocation_or_mutation"] = session.captures.size() > 0;
     result["evidence"] = {
         {"backend", result["backend"]},
-        {"snapshot_diff_baseline_count", session.baseline.size()},
+        {"event_backend_kind", kHeapEventBackend},
+        {"snapshot_backend_kind", kHeapSnapshotBackend},
+        {"debug_event_consumer", false},
+        {"rtlallocateheap_inline_hook", false},
+        {"kernel_context_polling", session_event_active(session)},
+        {"snapshot_diff_baseline_count", 0},
         {"allocation_size_estimates", true},
         {"heap_membership_checked", true},
         {"synthetic_breakpoint_events", false},
@@ -837,14 +857,7 @@ tool_result_t stop_session(const json& params)
     active_process_scope_t scope(session.pid);
     const bool focus_only = bool_param(params, "focus_only", false) || bool_param(params, "bounded_only", false);
     const bool focused = scope.ok() ? append_focus_captures(session, params) : false;
-    if (scope.ok() && (session.hw_slot < 0 || session.tids.empty()))
-    {
-        if (!focus_only)
-            append_snapshot_diff(session);
-        else
-            store::update_heap_session(session);
-    }
-    else
+    if (scope.ok() && !(session.hw_slot < 0 || session.tids.empty()))
         store::find_heap_session(id, session);
     if (!store::remove_heap_session(id, &session))
         return tool_result_t::error("Unknown heap tracking session.", heap_session_lookup_error("stop_remove", id));
@@ -855,15 +868,18 @@ tool_result_t stop_session(const json& params)
     session.active = false;
     json result = session_json(session);
     result["stopped"] = true;
-    result["functional_snapshot_evidence"] = (session.hw_slot < 0 || session.tids.empty()) && session.captures.size() > 0;
-    result["functional_event_evidence"] = session.hw_slot >= 0 && !session.tids.empty() && session.captures.size() > 0;
+    result["functional_snapshot_evidence"] = false;
+    result["functional_event_evidence"] = session_event_active(session) && session.captures.size() > 0;
     result["observation_complete"] = true;
     result["saw_allocation_or_mutation"] = session.captures.size() > 0;
     result["evidence"] = {
         {"breakpoints_cleared", session.hw_slot >= 0},
         {"debug_event_consumer_stopped", false},
+        {"rtlallocateheap_inline_hook", false},
         {"kernel_context_consumer_stopped", session.hw_slot >= 0},
-        {"snapshot_diff_checked", scope.ok() && (session.hw_slot < 0 || session.tids.empty()) && !focus_only},
+        {"event_backend_kind", kHeapEventBackend},
+        {"snapshot_backend_kind", kHeapSnapshotBackend},
+        {"snapshot_diff_checked", false},
         {"bounded_focus_capture", focused},
         {"bounded_focus_only", focus_only}
     };

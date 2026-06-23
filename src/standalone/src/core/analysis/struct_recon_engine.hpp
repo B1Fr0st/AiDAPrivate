@@ -73,6 +73,17 @@ struct access_record_t {
 	bool        is_write = false;
 	std::string disasm_text;
 	int         hit_count = 0;
+	std::string source;
+	uint32_t    thread_id = 0;
+	uint32_t    sample_index = 0;
+	uint32_t    capture_session_id = 0;
+	bool        initial_value_captured = false;
+	uint64_t    initial_value = 0;
+	std::vector<uint8_t> initial_bytes;
+	bool        value_captured = false;
+	bool        value_after_access = false;
+	uint64_t    observed_value = 0;
+	std::vector<uint8_t> observed_bytes;
 };
 
 struct vtable_entry_t {
@@ -268,6 +279,92 @@ inline float score_pointer64(const uint8_t* data)
 	return static_cast<float>(features_passed) / static_cast<float>(features_total) * 100.f;
 }
 
+inline bool is_user_canonical_pointer(uint64_t value)
+{
+	return value >= 0x10000 && value <= 0x00007FFFFFFFFFFFULL;
+}
+
+inline uint32_t normalized_page_protect(uint32_t protect)
+{
+	return protect & 0xFFu;
+}
+
+inline bool is_region_committed_accessible(const driver_bridge::memory_region_t& region)
+{
+	if ((region.state & MEM_COMMIT) == 0)
+		return false;
+	if ((region.protect & PAGE_GUARD) != 0)
+		return false;
+	uint32_t protect = normalized_page_protect(region.protect);
+	return protect != 0 && protect != PAGE_NOACCESS;
+}
+
+inline bool is_region_readable(const driver_bridge::memory_region_t& region)
+{
+	if (!is_region_committed_accessible(region))
+		return false;
+	switch (normalized_page_protect(region.protect)) {
+	case PAGE_READONLY:
+	case PAGE_READWRITE:
+	case PAGE_WRITECOPY:
+	case PAGE_EXECUTE_READ:
+	case PAGE_EXECUTE_READWRITE:
+	case PAGE_EXECUTE_WRITECOPY:
+		return true;
+	default:
+		return false;
+	}
+}
+
+inline bool is_region_executable(const driver_bridge::memory_region_t& region)
+{
+	if (!is_region_committed_accessible(region))
+		return false;
+	switch (normalized_page_protect(region.protect)) {
+	case PAGE_EXECUTE:
+	case PAGE_EXECUTE_READ:
+	case PAGE_EXECUTE_READWRITE:
+	case PAGE_EXECUTE_WRITECOPY:
+		return true;
+	default:
+		return false;
+	}
+}
+
+inline bool region_contains_range(const driver_bridge::memory_region_t& region, uint64_t address, uint64_t size)
+{
+	if (address < region.base)
+		return false;
+	uint64_t offset = address - region.base;
+	if (offset > region.size)
+		return false;
+	return size <= region.size - offset;
+}
+
+inline bool query_readable_target_range(uint64_t address, uint64_t size, driver_bridge::memory_region_t* out = nullptr)
+{
+	driver_bridge::memory_region_t region{};
+	if (!driver_bridge::query_memory(address, region))
+		return false;
+	if (!is_region_readable(region) || !region_contains_range(region, address, size))
+		return false;
+	if (out)
+		*out = region;
+	return true;
+}
+
+inline bool query_executable_target_range(uint64_t address, uint64_t size, driver_bridge::memory_region_t* out = nullptr)
+{
+	driver_bridge::memory_region_t region{};
+	if (!driver_bridge::query_memory(address, region))
+		return false;
+	if (!is_region_executable(region) || !region_contains_range(region, address, size))
+		return false;
+	if (out)
+		*out = region;
+	return true;
+}
+
 inline float score_vtable_ptr(const uint8_t* data, uint64_t base_addr)
 {
 	uint64_t val;
@@ -275,6 +372,8 @@ inline float score_vtable_ptr(const uint8_t* data, uint64_t base_addr)
 
 	float ptr_score = score_pointer64(data);
 	if (ptr_score < 50.f) return 0.f;
+	if (!is_user_canonical_pointer(val)) return 0.f;
+	if (!query_readable_target_range(val, 16)) return 0.f;
 
 	std::vector<uint8_t> vtable_data;
 	driver_bridge::read_memory(val, 32, vtable_data);
@@ -284,7 +383,8 @@ inline float score_vtable_ptr(const uint8_t* data, uint64_t base_addr)
 	for (size_t i = 0; i + 8 <= vtable_data.size(); i += 8) {
 		uint64_t func;
 		std::memcpy(&func, vtable_data.data() + i, 8);
-		if (func < 0x10000 || func > 0x0000800000000000ULL) break;
+		if (!is_user_canonical_pointer(func)) break;
+		if (!query_executable_target_range(func, 4)) break;
 		std::vector<uint8_t> fb;
 		driver_bridge::read_memory(func, 4, fb);
 		if (fb.size() < 4) break;
@@ -503,9 +603,134 @@ inline field_type_t infer_type_from_value(const uint8_t* data, int size, uint64_
 	return infer_type_scored(data, size, base_addr).type;
 }
 
+inline void append_field_evidence(struct_field_t& field, const std::string& evidence)
+{
+	if (evidence.empty())
+		return;
+	if (field.comment.find(evidence) != std::string::npos)
+		return;
+	if (!field.comment.empty())
+		field.comment += "; ";
+	field.comment += evidence;
+}
+
+inline void record_unproven_vtable_candidate(std::vector<struct_field_t>& fields,
+                                             uint64_t candidate,
+                                             const char* reason,
+                                             int sampled_entries,
+                                             int proven_entries,
+                                             uint64_t failed_entry,
+                                             float pointer_score)
+{
+	char evidence_buf[256];
+	std::snprintf(evidence_buf,
+	              sizeof(evidence_buf),
+	              "unproven_vtable_candidate=0x%llX reason=%s proven_exec=%d sampled=%d failed=0x%llX",
+	              static_cast<unsigned long long>(candidate),
+	              reason ? reason : "unproven",
+	              proven_entries,
+	              sampled_entries,
+	              static_cast<unsigned long long>(failed_entry));
+	std::string evidence = evidence_buf;
+
+	auto apply = [&](struct_field_t& field) {
+		if (field.size <= 0)
+			field.size = 8;
+		if (field.name.empty() || field.name == "__vtable")
+			field.name = "field_000";
+		if (field.type == field_type_t::vtable_ptr) {
+			field.type = pointer_score >= 50.f ? field_type_t::pointer : field_type_t::unknown;
+			field.vtable_entries.clear();
+		} else if (field.type == field_type_t::unknown && pointer_score >= 50.f) {
+			field.type = field_type_t::pointer;
+		}
+		if (pointer_score > field.type_confidence)
+			field.type_confidence = pointer_score;
+		append_field_evidence(field, evidence);
+	};
+
+	for (auto& field : fields) {
+		if (field.offset == 0) {
+			apply(field);
+			return;
+		}
+	}
+
+	struct_field_t field;
+	field.offset = 0;
+	field.size = 8;
+	field.type = pointer_score >= 50.f ? field_type_t::pointer : field_type_t::unknown;
+	field.name = "field_000";
+	field.comment = std::move(evidence);
+	field.type_confidence = pointer_score;
+	fields.insert(fields.begin(), std::move(field));
+}
+
+inline void promote_proven_vtable(std::vector<struct_field_t>& fields, std::vector<vtable_entry_t> entries)
+{
+	for (auto& field : fields) {
+		if (field.offset == 0) {
+			field.size = 8;
+			field.type = field_type_t::vtable_ptr;
+			field.name = "__vtable";
+			field.vtable_entries = std::move(entries);
+			field.type_confidence = 100.f;
+			return;
+		}
+	}
+
+	struct_field_t field;
+	field.offset = 0;
+	field.size = 8;
+	field.type = field_type_t::vtable_ptr;
+	field.name = "__vtable";
+	field.vtable_entries = std::move(entries);
+	field.type_confidence = 100.f;
+	fields.insert(fields.begin(), std::move(field));
+}
+
+inline bool has_proven_vtable_field(const struct_field_t& field)
+{
+	if (field.type != field_type_t::vtable_ptr || field.vtable_entries.size() < 2)
+		return false;
+	for (const auto& entry : field.vtable_entries) {
+		if (!is_user_canonical_pointer(entry.func_addr))
+			return false;
+		if (!query_executable_target_range(entry.func_addr, 4))
+			return false;
+	}
+	return true;
+}
+
+inline void enforce_vtable_field_proof(struct_field_t& field)
+{
+	if (field.type != field_type_t::vtable_ptr)
+		return;
+	if (has_proven_vtable_field(field))
+		return;
+	field.type = field_type_t::pointer;
+	field.vtable_entries.clear();
+	if (field.name == "__vtable" || field.name.empty())
+		field.name = "field_000";
+	append_field_evidence(field, "vtable_label_removed_unproven_executable_method_targets");
+	if (field.type_confidence > 75.f)
+		field.type_confidence = 75.f;
+}
+
+inline bool has_proven_vtable_at_zero(std::vector<struct_field_t>& fields)
+{
+	if (fields.empty() || fields[0].offset != 0)
+		return false;
+	enforce_vtable_field_proof(fields[0]);
+	return has_proven_vtable_field(fields[0]);
+}
+
 inline void detect_vtable(uint64_t base_addr, int struct_size,
                            std::vector<struct_field_t>& fields)
 {
+	if (struct_size < 8)
+		return;
+
 	std::vector<uint8_t> data;
 	driver_bridge::read_memory(base_addr, 8, data);
 	if (data.size() < 8) return;
@@ -513,26 +738,60 @@ inline void detect_vtable(uint64_t base_addr, int struct_size,
 	uint64_t potential_vtable;
 	std::memcpy(&potential_vtable, data.data(), 8);
 
-	if (potential_vtable < 0x10000 || potential_vtable > 0x00007FFFFFFFFFFF)
+	if (!is_user_canonical_pointer(potential_vtable))
 		return;
+
+	const float pointer_score = score_pointer64(data.data());
+	auto record_unproven = [&](const char* reason, int sampled, int proven, uint64_t failed) {
+		if (pointer_score >= 50.f)
+			record_unproven_vtable_candidate(fields, potential_vtable, reason, sampled, proven, failed, pointer_score);
+	};
+
+	if (!query_readable_target_range(potential_vtable, 16)) {
+		record_unproven("table_not_committed_readable", 0, 0, potential_vtable);
+		return;
+	}
 
 	std::vector<uint8_t> vtable_data;
 	driver_bridge::read_memory(potential_vtable, 256, vtable_data);
-	if (vtable_data.size() < 16) return;
+	if (vtable_data.size() < 16) {
+		record_unproven("table_read_unproven", 0, 0, potential_vtable);
+		return;
+	}
 
 	auto modules = driver_bridge::enumerate_modules();
 
 	std::vector<vtable_entry_t> entries;
+	int sampled_entries = 0;
+	const char* unproven_reason = "insufficient_executable_entries";
+	uint64_t failed_entry = 0;
+
 	for (size_t i = 0; i + 8 <= vtable_data.size(); i += 8) {
 		uint64_t func_addr;
 		std::memcpy(&func_addr, vtable_data.data() + i, 8);
 
-		if (func_addr < 0x10000 || func_addr > 0x00007FFFFFFFFFFF)
+		if (!is_user_canonical_pointer(func_addr)) {
+			if (entries.size() < 2) {
+				unproven_reason = "entry_noncanonical";
+				failed_entry = func_addr;
+			}
 			break;
+		}
+
+		++sampled_entries;
+		if (!query_executable_target_range(func_addr, 4)) {
+			unproven_reason = "entry_not_committed_executable";
+			failed_entry = func_addr;
+			break;
+		}
 
 		std::vector<uint8_t> func_bytes;
 		driver_bridge::read_memory(func_addr, 4, func_bytes);
-		if (func_bytes.size() < 4) break;
+		if (func_bytes.size() < 4) {
+			unproven_reason = "entry_read_unproven";
+			failed_entry = func_addr;
+			break;
+		}
 
 		vtable_entry_t entry;
 		entry.func_addr = func_addr;
@@ -540,7 +799,7 @@ inline void detect_vtable(uint64_t base_addr, int struct_size,
 
 		bool resolved = false;
 		for (auto& m : modules) {
-			if (func_addr >= m.base && func_addr < m.base + m.size) {
+			if (func_addr >= m.base && func_addr - m.base < m.size) {
 				uint64_t rva = func_addr - m.base;
 				std::string mod_name = m.name;
 				size_t dot_pos = mod_name.rfind('.');
@@ -637,22 +896,9 @@ inline void detect_vtable(uint64_t base_addr, int struct_size,
 	}
 
 	if (entries.size() >= 2) {
-		for (auto& f : fields) {
-			if (f.offset == 0 && f.size == 8) {
-				f.type = field_type_t::vtable_ptr;
-				f.name = "__vtable";
-				f.vtable_entries = std::move(entries);
-				return;
-			}
-		}
-
-		struct_field_t vf;
-		vf.offset = 0;
-		vf.size = 8;
-		vf.type = field_type_t::vtable_ptr;
-		vf.name = "__vtable";
-		vf.vtable_entries = std::move(entries);
-		fields.insert(fields.begin(), vf);
+		promote_proven_vtable(fields, std::move(entries));
+	} else {
+		record_unproven(unproven_reason, sampled_entries, static_cast<int>(entries.size()), failed_entry);
 	}
 }
 
@@ -932,7 +1178,7 @@ inline void reconstruct_from_snapshot(uint64_t base_address, int struct_size, co
 			}
 		}
 
-		result.has_vtable = !result.fields.empty() && result.fields[0].type == field_type_t::vtable_ptr;
+		result.has_vtable = detail::has_proven_vtable_at_zero(result.fields);
 
 		{
 			std::lock_guard<std::mutex> lk(g_state.mutex);
@@ -1026,6 +1272,27 @@ struct decoded_access_t {
 	std::string  disasm;
 };
 
+inline bool disasm_suggests_write(const char* mnem, const char* ops)
+{
+	std::string m = mnem ? mnem : "";
+	std::string o = ops ? ops : "";
+	for (auto& c : m) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+	for (auto& c : o) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+	const size_t comma = o.find(',');
+	const std::string first = comma == std::string::npos ? o : o.substr(0, comma);
+	const bool memory_dest = first.find('[') != std::string::npos;
+	if (!memory_dest)
+		return false;
+	if (m == "cmp" || m == "test" || m == "bt" || m == "lea" || m == "prefetchnta" ||
+	    m == "prefetcht0" || m == "prefetcht1" || m == "prefetcht2")
+		return false;
+	if (m.find("mov") == 0 || m.find("stos") == 0 || m.find("xchg") == 0 || m.find("cmpxchg") == 0 ||
+	    m == "add" || m == "sub" || m == "inc" || m == "dec" || m == "and" || m == "or" ||
+	    m == "xor" || m == "not" || m == "neg" || m == "imul" || m == "lock")
+		return true;
+	return memory_dest;
+}
+
 inline decoded_access_t analyze_captured_rip(uint64_t rip, uint64_t fault_addr, uint32_t access_type)
 {
 	decoded_access_t result;
@@ -1048,6 +1315,8 @@ inline decoded_access_t analyze_captured_rip(uint64_t rip, uint64_t fault_addr, 
 	char disasm_buf[192];
 	std::snprintf(disasm_buf, sizeof(disasm_buf), "%s %s", ins.mnem, ins.ops);
 	result.disasm = disasm_buf;
+	if (access_type != 0 && access_type != 1)
+		result.is_write = disasm_suggests_write(ins.mnem, ins.ops);
 
 	std::string ops_lower(ins.ops);
 	for (auto& c : ops_lower) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
@@ -1064,6 +1333,137 @@ inline decoded_access_t analyze_captured_rip(uint64_t rip, uint64_t fault_addr, 
 	result.inferred_type = infer_type_from_instruction(ins, result.access_size);
 
 	return result;
+}
+
+struct access_key_t {
+	uint64_t offset = 0;
+	uint64_t rip = 0;
+	int      size = 0;
+	bool     is_write = false;
+
+	bool operator<(const access_key_t& other) const {
+		if (offset != other.offset) return offset < other.offset;
+		if (rip != other.rip) return rip < other.rip;
+		if (size != other.size) return size < other.size;
+		return is_write < other.is_write;
+	}
+};
+
+inline uint64_t context_dr_address(const driver_bridge::thread_context_t& ctx, int slot)
+{
+	switch (slot) {
+	case 0: return ctx.dr0;
+	case 1: return ctx.dr1;
+	case 2: return ctx.dr2;
+	case 3: return ctx.dr3;
+	default: return 0;
+	}
+}
+
+inline bool context_reports_hwbp_slot(const driver_bridge::thread_context_t& ctx, int slot, uint64_t expected)
+{
+	if (slot < 0 || slot > 3 || expected == 0)
+		return false;
+	const bool dr6_hit = (ctx.dr6 & (1ull << static_cast<unsigned>(slot))) != 0;
+	return dr6_hit && context_dr_address(ctx, slot) == expected;
+}
+
+inline std::vector<uint64_t> build_watch_offsets(int struct_size)
+{
+	std::vector<uint64_t> offsets;
+	if (struct_size <= 0)
+		return offsets;
+	const int limit = (std::min)(struct_size, 65536);
+	offsets.reserve(static_cast<size_t>(limit));
+	std::vector<uint8_t> seen(static_cast<size_t>(limit), 0);
+	auto add = [&](int off) {
+		if (off < 0 || off >= limit)
+			return;
+		auto idx = static_cast<size_t>(off);
+		if (seen[idx] != 0)
+			return;
+		seen[idx] = 1;
+		offsets.push_back(static_cast<uint64_t>(off));
+	};
+	for (int i = 0; i < limit; i += 8)
+		add(i);
+	for (int i = 4; i < limit; i += 8)
+		add(i);
+	for (int i = 2; i < limit; i += 4)
+		add(i);
+	for (int i = 1; i < limit; i += 2)
+		add(i);
+	for (int i = 0; i < limit; ++i)
+		add(i);
+	return offsets;
+}
+
+inline void capture_observed_value(uint64_t base_address,
+                                   int struct_size,
+                                   const std::vector<uint8_t>& initial_data,
+                                   access_record_t& rec,
+                                   bool value_after_access)
+{
+	rec.initial_value_captured = false;
+	rec.initial_value = 0;
+	rec.initial_bytes.clear();
+	rec.value_captured = false;
+	rec.value_after_access = value_after_access;
+	rec.observed_value = 0;
+	rec.observed_bytes.clear();
+	if (rec.access_offset >= static_cast<uint64_t>((std::max)(struct_size, 0)))
+		return;
+	const uint64_t remaining = static_cast<uint64_t>(struct_size) - rec.access_offset;
+	const auto requested = static_cast<uint64_t>((std::max)(rec.access_size, 1));
+	const size_t read_size = static_cast<size_t>(std::min<uint64_t>(requested, std::min<uint64_t>(remaining, 8)));
+	if (read_size == 0)
+		return;
+	if (rec.access_offset < initial_data.size()) {
+		const size_t initial_size = (std::min)(read_size, initial_data.size() - static_cast<size_t>(rec.access_offset));
+		rec.initial_bytes.assign(initial_data.begin() + static_cast<std::ptrdiff_t>(rec.access_offset),
+		                         initial_data.begin() + static_cast<std::ptrdiff_t>(rec.access_offset + initial_size));
+		std::memcpy(&rec.initial_value, rec.initial_bytes.data(), (std::min)(rec.initial_bytes.size(), sizeof(rec.initial_value)));
+		rec.initial_value_captured = !rec.initial_bytes.empty();
+	}
+	std::vector<uint8_t> value;
+	if (!driver_bridge::read_memory(base_address + rec.access_offset, read_size, value) || value.empty())
+		return;
+	rec.observed_bytes = std::move(value);
+	std::memcpy(&rec.observed_value, rec.observed_bytes.data(), (std::min)(rec.observed_bytes.size(), sizeof(rec.observed_value)));
+	rec.value_captured = true;
+}
+
+inline void merge_access_record(std::map<access_key_t, access_record_t>& access_map, access_record_t rec)
+{
+	if (rec.access_size <= 0)
+		rec.access_size = 1;
+	access_key_t key{rec.access_offset, rec.instruction_addr, rec.access_size, rec.is_write};
+	auto it = access_map.find(key);
+	if (it == access_map.end()) {
+		access_map.emplace(key, std::move(rec));
+	} else {
+		it->second.hit_count += (std::max)(rec.hit_count, 1);
+		if (!rec.source.empty() && !it->second.source.empty() && rec.source != it->second.source)
+			it->second.source = "mixed";
+		else if (it->second.source.empty())
+			it->second.source = rec.source;
+		if (it->second.thread_id == 0)
+			it->second.thread_id = rec.thread_id;
+		if (it->second.capture_session_id == 0)
+			it->second.capture_session_id = rec.capture_session_id;
+		it->second.sample_index = (std::min)(it->second.sample_index, rec.sample_index);
+		if (rec.initial_value_captured) {
+			it->second.initial_value_captured = true;
+			it->second.initial_value = rec.initial_value;
+			it->second.initial_bytes = std::move(rec.initial_bytes);
+		}
+		if (rec.value_captured) {
+			it->second.value_captured = true;
+			it->second.value_after_access = rec.value_after_access;
+			it->second.observed_value = rec.observed_value;
+			it->second.observed_bytes = std::move(rec.observed_bytes);
+		}
+	}
 }
 
 }
@@ -1166,7 +1566,7 @@ inline void monitor_with_hwbp(uint64_t base_address, int struct_size, const std:
 		}
 		std::sort(result.fields.begin(), result.fields.end(),
 			[](const struct_field_t& a, const struct_field_t& b) { return a.offset < b.offset; });
-		result.has_vtable = !result.fields.empty() && result.fields[0].type == field_type_t::vtable_ptr;
+		result.has_vtable = detail::has_proven_vtable_at_zero(result.fields);
 
 		{
 			std::lock_guard<std::mutex> lk(g_state.mutex);
@@ -1186,6 +1586,8 @@ inline void monitor_with_hwbp(uint64_t base_address, int struct_size, const std:
 		uint32_t pg_session_id = 0;
 
 		std::vector<uint32_t> tids;
+		std::vector<uint64_t> hwbp_offsets;
+		size_t hwbp_thread_count = 0;
 		bool use_hwbp_fallback = false;
 		diag::log_tagged_fmt("struct_recon", "monitor_backend_select base=0x%llX pid=%u using_kernel=%d use_page_guard_initial=%d",
 			static_cast<unsigned long long>(base_address),
@@ -1227,36 +1629,49 @@ inline void monitor_with_hwbp(uint64_t base_address, int struct_size, const std:
 			diag::log_tagged_fmt("struct_recon", "monitor_hwbp_enum_begin pid=%u base=0x%llX", pid, static_cast<unsigned long long>(base_address));
 			auto threads = driver_bridge::enumerate_threads();
 			for (auto& t : threads) tids.push_back(t.tid);
+			hwbp_offsets = insn_analysis::build_watch_offsets(struct_size);
+			hwbp_thread_count = (std::min<size_t>)(tids.size(), 32);
 			diag::log_tagged_fmt("struct_recon", "monitor_hwbp_enum_end pid=%u base=0x%llX threads=%zu",
 				pid,
 				static_cast<unsigned long long>(base_address),
 				tids.size());
-
-			int hwbp_offsets[] = {0, 8, 16, 32};
-			int num_slots = (std::min)(4, static_cast<int>(std::size(hwbp_offsets)));
-			if (!tids.empty()) {
-				for (int i = 0; i < num_slots; ++i) {
-					if (g_state.cancel.load()) break;
-					if (hwbp_offsets[i] >= struct_size) continue;
-					uint64_t watch_addr = base_address + static_cast<uint64_t>(hwbp_offsets[i]);
-					const bool armed = driver_bridge::set_hardware_breakpoint(tids[0], i, watch_addr, 1, 3);
-					diag::log_tagged_fmt("struct_recon", "monitor_hwbp_set pid=%u tid=%u slot=%d addr=0x%llX armed=%d status=%s error=%s",
-						pid,
-						tids[0],
-						i,
-						static_cast<unsigned long long>(watch_addr),
-						armed ? 1 : 0,
-						driver_bridge::status().c_str(),
-						driver_bridge::last_error().c_str());
-				}
-			}
+			diag::log_tagged_fmt("struct_recon", "monitor_hwbp_plan pid=%u base=0x%llX watch_offsets=%zu sampled_threads=%zu slot_count=%zu access_type=read_write len=byte",
+				pid,
+				static_cast<unsigned long long>(base_address),
+				hwbp_offsets.size(),
+				hwbp_thread_count,
+				(std::min<size_t>)(hwbp_offsets.size(), 4));
 		}
 
 		g_state.progress.store(0.3f);
 
 		std::map<uint64_t, insn_analysis::decoded_access_t> rip_cache;
-		std::map<uint64_t, access_record_t> offset_access_map;
+		std::map<insn_analysis::access_key_t, access_record_t> offset_access_map;
 		int sample_count = g_state.config.sample_count;
+		auto record_access = [&](uint64_t rip,
+		                         uint64_t field_offset,
+		                         const insn_analysis::decoded_access_t& decoded,
+		                         bool value_after_access,
+		                         const char* source,
+		                         uint32_t tid,
+		                         uint32_t sample_index,
+		                         uint32_t capture_session_id) {
+			if (field_offset >= static_cast<uint64_t>(struct_size))
+				return;
+			access_record_t rec;
+			rec.instruction_addr = rip;
+			rec.access_offset = field_offset;
+			rec.access_size = decoded.access_size > 0 ? decoded.access_size : 1;
+			rec.is_write = decoded.is_write;
+			rec.disasm_text = decoded.disasm;
+			rec.hit_count = 1;
+			rec.source = source ? source : "unknown";
+			rec.thread_id = tid;
+			rec.sample_index = sample_index;
+			rec.capture_session_id = capture_session_id;
+			insn_analysis::capture_observed_value(base_address, struct_size, data, rec, value_after_access);
+			insn_analysis::merge_access_record(offset_access_map, std::move(rec));
+		};
 		diag::log_tagged_fmt("struct_recon", "monitor_sample_loop_begin base=0x%llX pid=%u samples=%d page_guard=%d sid=%u hwbp=%d",
 			static_cast<unsigned long long>(base_address),
 			pid,
@@ -1266,10 +1681,78 @@ inline void monitor_with_hwbp(uint64_t base_address, int struct_size, const std:
 			use_hwbp_fallback ? 1 : 0);
 
 		for (int sample = 0; sample < sample_count && !g_state.cancel.load(); ++sample) {
+			uint64_t active_hwbp_addrs[4] = {};
+			if (use_hwbp_fallback && !hwbp_offsets.empty() && hwbp_thread_count != 0) {
+				const size_t slot_count = (std::min<size_t>)(hwbp_offsets.size(), 4);
+				const size_t base_index = (static_cast<size_t>(sample) * slot_count) % hwbp_offsets.size();
+				for (size_t slot = 0; slot < slot_count; ++slot) {
+					const uint64_t off = hwbp_offsets[(base_index + slot) % hwbp_offsets.size()];
+					const uint64_t watch_addr = base_address + off;
+					active_hwbp_addrs[slot] = watch_addr;
+					for (size_t ti = 0; ti < hwbp_thread_count; ++ti) {
+						const bool armed = driver_bridge::set_hardware_breakpoint(tids[ti], static_cast<int>(slot), watch_addr, 3, 0);
+						if ((sample == 0 || sample + 1 == sample_count) && ti == 0) {
+							diag::log_tagged_fmt("struct_recon", "monitor_hwbp_set pid=%u tid=%u slot=%zu offset=0x%llX addr=0x%llX armed=%d status=%s error=%s",
+								pid,
+								tids[ti],
+								slot,
+								static_cast<unsigned long long>(off),
+								static_cast<unsigned long long>(watch_addr),
+								armed ? 1 : 0,
+								driver_bridge::status().c_str(),
+								driver_bridge::last_error().c_str());
+						}
+					}
+				}
+			}
+
 			std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
 			float phase_progress = 0.3f + 0.5f * (static_cast<float>(sample) / static_cast<float>(sample_count));
 			g_state.progress.store(phase_progress);
+
+			if (use_hwbp_fallback && active_hwbp_addrs[0] != 0) {
+				for (size_t ti = 0; ti < hwbp_thread_count; ++ti) {
+					driver_bridge::thread_context_t ctx{};
+					if (!driver_bridge::get_thread_context(tids[ti], ctx))
+						continue;
+					for (int slot = 0; slot < 4; ++slot) {
+						if (active_hwbp_addrs[slot] == 0)
+							continue;
+						if (!insn_analysis::context_reports_hwbp_slot(ctx, slot, active_hwbp_addrs[slot]))
+							continue;
+						auto decoded = insn_analysis::analyze_captured_rip(ctx.rip, active_hwbp_addrs[slot], 3);
+						rip_cache[ctx.rip] = decoded;
+						record_access(ctx.rip,
+						              active_hwbp_addrs[slot] - base_address,
+						              decoded,
+						              true,
+						              "hwbp",
+						              tids[ti],
+						              static_cast<uint32_t>(sample),
+						              0);
+						driver_bridge::thread_context_t next = ctx;
+						next.rflags |= 0x10000ull;
+						next.dr6 = 0;
+						driver_bridge::set_thread_context(tids[ti], next, (1ull << 17) | (1ull << 22));
+						diag::log_tagged_fmt("struct_recon", "monitor_hwbp_hit pid=%u tid=%u slot=%d offset=0x%llX rip=0x%llX write=%d offsets=%zu elapsed_ms=%llu",
+							pid,
+							tids[ti],
+							slot,
+							static_cast<unsigned long long>(active_hwbp_addrs[slot] - base_address),
+							static_cast<unsigned long long>(ctx.rip),
+							decoded.is_write ? 1 : 0,
+							offset_access_map.size(),
+							static_cast<unsigned long long>(GetTickCount64() - worker_start_ms));
+					}
+				}
+				for (size_t ti = 0; ti < hwbp_thread_count; ++ti) {
+					for (int slot = 0; slot < 4; ++slot) {
+						if (active_hwbp_addrs[slot] != 0)
+							driver_bridge::clear_hardware_breakpoint(tids[ti], slot);
+					}
+				}
+			}
 
 			if (use_page_guard && pg_session_id != 0) {
 				auto captures = page_guard_engine::g_pg_engine.get_captures(pg_session_id);
@@ -1296,20 +1779,14 @@ inline void monitor_with_hwbp(uint64_t base_address, int struct_size, const std:
 
 					auto& decoded = rip_it->second;
 					uint64_t field_offset = cap.fault_addr - base_address;
-
-					auto oa_it = offset_access_map.find(field_offset);
-					if (oa_it == offset_access_map.end()) {
-						access_record_t rec;
-						rec.instruction_addr = cap.rip;
-						rec.access_offset = field_offset;
-						rec.access_size = decoded.access_size;
-						rec.is_write = decoded.is_write;
-						rec.disasm_text = decoded.disasm;
-						rec.hit_count = 1;
-						offset_access_map[field_offset] = rec;
-					} else {
-						oa_it->second.hit_count++;
-					}
+					record_access(cap.rip,
+					              field_offset,
+					              decoded,
+					              cap.access_type == 1,
+					              "page_guard",
+					              0,
+					              static_cast<uint32_t>(sample),
+					              pg_session_id);
 				}
 			}
 		}
@@ -1348,20 +1825,14 @@ inline void monitor_with_hwbp(uint64_t base_address, int struct_size, const std:
 
 				auto& decoded = rip_it->second;
 				uint64_t field_offset = cap.fault_addr - base_address;
-
-				auto oa_it = offset_access_map.find(field_offset);
-				if (oa_it == offset_access_map.end()) {
-					access_record_t rec;
-					rec.instruction_addr = cap.rip;
-					rec.access_offset = field_offset;
-					rec.access_size = decoded.access_size;
-					rec.is_write = decoded.is_write;
-					rec.disasm_text = decoded.disasm;
-					rec.hit_count = 1;
-					offset_access_map[field_offset] = rec;
-				} else {
-					oa_it->second.hit_count++;
-				}
+				record_access(cap.rip,
+				              field_offset,
+				              decoded,
+				              cap.access_type == 1,
+				              "page_guard",
+				              0,
+				              static_cast<uint32_t>((std::max)(sample_count, 0)),
+				              pg_session_id);
 			}
 			diag::log_tagged_fmt("struct_recon", "monitor_page_guard_uninstall_begin pid=%u sid=%u", pid, pg_session_id);
 			page_guard_engine::g_pg_engine.uninstall(pg_session_id);
@@ -1372,13 +1843,17 @@ inline void monitor_with_hwbp(uint64_t base_address, int struct_size, const std:
 		}
 
 		if (use_hwbp_fallback && !tids.empty()) {
-			for (int i = 0; i < 4; ++i) {
-				const bool cleared = driver_bridge::clear_hardware_breakpoint(tids[0], i);
-				diag::log_tagged_fmt("struct_recon", "monitor_hwbp_clear pid=%u tid=%u slot=%d cleared=%d",
-					pid,
-					tids[0],
-					i,
-					cleared ? 1 : 0);
+			for (size_t ti = 0; ti < hwbp_thread_count; ++ti) {
+				for (int i = 0; i < 4; ++i) {
+					const bool cleared = driver_bridge::clear_hardware_breakpoint(tids[ti], i);
+					if (ti == 0) {
+						diag::log_tagged_fmt("struct_recon", "monitor_hwbp_clear pid=%u tid=%u slot=%d cleared=%d",
+							pid,
+							tids[ti],
+							i,
+							cleared ? 1 : 0);
+					}
+				}
 			}
 		}
 
@@ -1393,12 +1868,15 @@ inline void monitor_with_hwbp(uint64_t base_address, int struct_size, const std:
 			std::lock_guard<std::mutex> lk(g_state.mutex);
 			g_state.access_log.clear();
 
-			for (auto& [off, access_rec] : offset_access_map) {
+			for (auto& entry : offset_access_map) {
+				auto& access_rec = entry.second;
 				g_state.access_log.push_back(access_rec);
 			}
 
 			for (auto& field : g_state.current.fields) {
-				for (auto& [off, access_rec] : offset_access_map) {
+				for (auto& entry : offset_access_map) {
+					auto& access_rec = entry.second;
+					const uint64_t off = access_rec.access_offset;
 					if (off >= field.offset &&
 					    off < field.offset + static_cast<uint64_t>(field.size)) {
 
@@ -1425,7 +1903,9 @@ inline void monitor_with_hwbp(uint64_t base_address, int struct_size, const std:
 				existing_offsets.insert(f.offset);
 			}
 
-			for (auto& [off, access_rec] : offset_access_map) {
+			for (auto& entry : offset_access_map) {
+				auto& access_rec = entry.second;
+				const uint64_t off = access_rec.access_offset;
 				if (existing_offsets.count(off) == 0) {
 					struct_field_t new_field;
 					new_field.offset = off;
@@ -1455,8 +1935,7 @@ inline void monitor_with_hwbp(uint64_t base_address, int struct_size, const std:
 			detail::refine_types_from_accesses(g_state.current.fields);
 			detect_arrays(g_state.current.fields);
 
-			g_state.current.has_vtable = !g_state.current.fields.empty() &&
-			                              g_state.current.fields[0].type == field_type_t::vtable_ptr;
+			g_state.current.has_vtable = detail::has_proven_vtable_at_zero(g_state.current.fields);
 
 			g_state.history.push_back(g_state.current);
 			diag::log_tagged_fmt("struct_recon", "monitor_inference_state base=0x%llX fields=%zu access_log=%zu history=%zu has_vtable=%d",
@@ -1886,6 +2365,13 @@ inline void load_structs_from_disk()
 				s.fields.push_back(f);
 			}
 		}
+		for (auto& f : s.fields)
+			detail::enforce_vtable_field_proof(f);
+		std::sort(s.fields.begin(), s.fields.end(),
+			[](const struct_field_t& a, const struct_field_t& b) { return a.offset < b.offset; });
+		s.has_vtable = detail::has_proven_vtable_at_zero(s.fields);
+		if (!s.has_vtable)
+			s.vtable_address = 0;
 
 		g_state.saved_structs.push_back(std::move(s));
 	}

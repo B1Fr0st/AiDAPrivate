@@ -9,13 +9,17 @@
 #include "../infra/critical_work_queue.hpp"
 #include "../ui/theme.hpp"
 #include "../ui/ui_anim.hpp"
+#include "../ui/empty_state.hpp"
 #include "../../../../driver/comm.h"
 #include "../../helpers/diag_log.hpp"
 
 #include <Windows.h>
+#include <Shellapi.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <deque>
 #include <exception>
 #include <cstdio>
 #include <cstring>
@@ -62,6 +66,167 @@ namespace test_lab_view {
 			return aida::ui::with_alpha(t.text_dim, alpha);
 		}
 
+		const char* result_state_label(test_lab::run_state_e s, bool ok, bool skipped) {
+			switch (s) {
+				case test_lab::run_state_e::idle: return "Idle";
+				case test_lab::run_state_e::running: return "Running";
+				case test_lab::run_state_e::complete: return skipped ? "Skipped" : (ok ? "Pass" : "Fail");
+			}
+			return "Idle";
+		}
+
+		const char* result_state_badge(test_lab::run_state_e s, bool ok, bool skipped) {
+			switch (s) {
+				case test_lab::run_state_e::idle: return "IDLE";
+				case test_lab::run_state_e::running: return "RUN";
+				case test_lab::run_state_e::complete: return skipped ? "SKIP" : (ok ? "PASS" : "FAIL");
+			}
+			return "IDLE";
+		}
+
+		ImU32 result_state_color(test_lab::run_state_e s, bool ok, bool skipped) {
+			const auto& t = aida::ui::resolved();
+			switch (s) {
+				case test_lab::run_state_e::idle: return t.text_dim;
+				case test_lab::run_state_e::running: return t.accent_u32;
+				case test_lab::run_state_e::complete: return skipped ? t.warning : (ok ? t.success : t.error);
+			}
+			return t.text_dim;
+		}
+
+		std::string format_elapsed(std::uint64_t elapsed_us) {
+			char buf[64];
+			if (elapsed_us >= 1000000ull) {
+				std::snprintf(buf, sizeof(buf), "%.2f s", static_cast<double>(elapsed_us) / 1000000.0);
+			} else if (elapsed_us >= 1000ull) {
+				std::snprintf(buf, sizeof(buf), "%.2f ms", static_cast<double>(elapsed_us) / 1000.0);
+			} else {
+				std::snprintf(buf, sizeof(buf), "%llu us", static_cast<unsigned long long>(elapsed_us));
+			}
+			return std::string(buf);
+		}
+
+		void render_chip(const char* label, ImU32 color, float min_w = 0.f) {
+			const auto& t = aida::ui::resolved();
+			const char* text = label != nullptr ? label : "";
+			ImVec2 ts = ImGui::CalcTextSize(text);
+			float h = 22.f;
+			float w = (std::max)(min_w, ts.x + 18.f);
+			ImVec2 p = ImGui::GetCursorScreenPos();
+			ImGui::Dummy(ImVec2(w, h));
+			ImDrawList* dl = ImGui::GetWindowDrawList();
+			ImVec2 b(p.x + w, p.y + h);
+			dl->AddRectFilled(p, b, aida::ui::with_alpha(color, 0.18f), h * 0.5f);
+			dl->AddRect(p, b, aida::ui::with_alpha(color, 0.62f), h * 0.5f, 0, 1.f);
+			dl->AddText(ImVec2(p.x + (w - ts.x) * 0.5f, p.y + (h - ts.y) * 0.5f - 0.5f),
+				aida::ui::with_alpha(color == 0 ? t.text_secondary : color, 0.95f), text);
+		}
+
+		void render_metric_chip(const char* label, const char* value, ImU32 color, float min_w = 0.f) {
+			std::string text;
+			if (label != nullptr && label[0] != '\0') {
+				text.append(label);
+				text.append(": ");
+			}
+			text.append(value != nullptr ? value : "");
+			render_chip(text.c_str(), color, min_w);
+		}
+
+		void render_empty_panel(const char* title, const char* body, float height = 72.f) {
+			const auto& t = aida::ui::resolved();
+			ImVec2 p = ImGui::GetCursorScreenPos();
+			float w = ImGui::GetContentRegionAvail().x;
+			if (w < 80.f) w = 80.f;
+			ImGui::Dummy(ImVec2(w, height));
+			ImDrawList* dl = ImGui::GetWindowDrawList();
+			ImVec2 b(p.x + w, p.y + height);
+			dl->AddRectFilled(p, b, aida::ui::with_alpha(t.panel_header, 0.35f), 6.f);
+			dl->AddRect(p, b, aida::ui::with_alpha(t.border_subtle, 0.75f), 6.f, 0, 1.f);
+			float y = p.y + 12.f;
+			if (title != nullptr && title[0] != '\0') {
+				dl->AddText(ImVec2(p.x + 14.f, y), t.text_secondary, title);
+				y += ImGui::GetTextLineHeight() + 4.f;
+			}
+			if (body != nullptr && body[0] != '\0') {
+				ImVec4 clip(p.x + 14.f, y, b.x - 14.f, b.y - 8.f);
+				dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), ImVec2(p.x + 14.f, y),
+					t.text_dim, body, nullptr, w - 28.f, &clip);
+			}
+		}
+
+		void render_clipped_cell(const char* id, const std::string& text, ImU32 color) {
+			float avail_w = ImGui::GetContentRegionAvail().x;
+			if (avail_w < 24.f) avail_w = 24.f;
+			float h = ImGui::GetTextLineHeight();
+			ImVec2 p = ImGui::GetCursorScreenPos();
+			ImGui::InvisibleButton(id != nullptr ? id : "##cell", ImVec2(avail_w, h));
+			ImVec4 clip(p.x, p.y, p.x + avail_w, p.y + h);
+			ImGui::GetWindowDrawList()->AddText(ImGui::GetFont(), ImGui::GetFontSize(), p, color,
+				text.c_str(), nullptr, 0.f, &clip);
+			if (ImGui::IsItemHovered() && ImGui::CalcTextSize(text.c_str()).x > avail_w) {
+				ImGui::BeginTooltip();
+				ImGui::PushTextWrapPos(560.f);
+				ImGui::TextUnformatted(text.c_str());
+				ImGui::PopTextWrapPos();
+				ImGui::EndTooltip();
+			}
+		}
+
+		std::string format_result_summary(const test_lab::feature_t& f, const test_lab::result_t& r) {
+			std::string out;
+			out.reserve(512);
+			out.append("feature: ");
+			out.append(f.category != nullptr ? f.category : "?");
+			out.append("/");
+			out.append(f.name != nullptr ? f.name : "?");
+			out.append("\n");
+			out.append("driver: ");
+			out.append(driver_label(f.driver));
+			out.append("\n");
+			out.append("status: ");
+			out.append(result_state_label(r.state.load(std::memory_order_acquire), r.ok, r.skipped));
+			out.append("\n");
+			char buf[128];
+			std::snprintf(buf, sizeof(buf), "ntstatus: %s (0x%08X)\n",
+				test_lab_format::ntstatus_to_string(r.ntstatus),
+				static_cast<unsigned>(static_cast<std::uint32_t>(r.ntstatus)));
+			out.append(buf);
+			std::snprintf(buf, sizeof(buf), "bytes_returned: %u\nelapsed_us: %llu\nraw_size: %zu\nparsed_fields: %zu\n",
+				static_cast<unsigned>(r.bytes_returned),
+				static_cast<unsigned long long>(r.elapsed_us),
+				r.raw.size(),
+				r.parsed.size());
+			out.append(buf);
+			if (!r.error.empty()) {
+				out.append("error: ");
+				out.append(r.error);
+				out.append("\n");
+			}
+			return out;
+		}
+
+		std::string format_raw_hex(const std::vector<std::uint8_t>& raw) {
+			std::string out;
+			out.reserve(raw.size() * 3);
+			char tmp[8];
+			for (std::size_t i = 0; i < raw.size(); ++i) {
+				std::snprintf(tmp, sizeof(tmp), "%02X ", static_cast<unsigned>(raw[i]));
+				out.append(tmp);
+			}
+			return out;
+		}
+
+		std::string format_parsed_fields(const std::vector<test_lab::parsed_field_t>& parsed) {
+			std::string out;
+			for (const auto& p : parsed) {
+				out.append(p.label);
+				out.append(": ");
+				out.append(p.value);
+				out.append("\n");
+			}
+			return out;
+		}
+
 		std::atomic<bool> g_run_all_active{ false };
 		std::atomic<int>  g_run_all_current{ 0 };
 		std::atomic<int>  g_run_all_total{ 0 };
@@ -71,6 +236,151 @@ namespace test_lab_view {
 		std::mutex        g_run_all_status_mtx;
 		std::string       g_run_all_status_line;
 		std::string       g_run_all_current_name;
+
+		struct log_tail_line_t {
+			std::uint64_t index = 0;
+			std::string text;
+		};
+
+		struct feature_run_summary_t {
+			test_lab::run_state_e state = test_lab::run_state_e::idle;
+			bool ok = false;
+			bool skipped = false;
+			std::int32_t ntstatus = 0;
+			std::uint32_t bytes_returned = 0;
+			std::uint64_t elapsed_us = 0;
+			std::string error;
+			std::uint64_t started_ms = 0;
+			std::uint64_t finished_ms = 0;
+			std::uint64_t log_line_index = 0;
+		};
+
+		std::mutex g_log_tail_mtx;
+		std::deque<log_tail_line_t> g_log_tail;
+		std::uint64_t g_log_tail_next_index = 1;
+
+		std::mutex g_feature_summary_mtx;
+		std::vector<feature_run_summary_t> g_feature_summaries;
+
+		constexpr std::size_t k_log_tail_max_lines = 96;
+
+		void log_render_lock_busy(const char* site, const char* lock_name);
+
+		std::uint64_t now_ms() {
+			return static_cast<std::uint64_t>(GetTickCount64());
+		}
+
+		void ensure_feature_summary_size_locked(std::size_t feature_count) {
+			if (g_feature_summaries.size() != feature_count)
+				g_feature_summaries.assign(feature_count, feature_run_summary_t{});
+		}
+
+		void reset_feature_summaries() {
+			std::lock_guard<std::mutex> lk(g_feature_summary_mtx);
+			g_feature_summaries.assign(test_lab::all_features().size(), feature_run_summary_t{});
+		}
+
+		void update_feature_summary_start(std::size_t feature_index, std::uint64_t log_index) {
+			std::lock_guard<std::mutex> lk(g_feature_summary_mtx);
+			const auto& features = test_lab::all_features();
+			ensure_feature_summary_size_locked(features.size());
+			if (feature_index >= g_feature_summaries.size()) return;
+			feature_run_summary_t& s = g_feature_summaries[feature_index];
+			s.state = test_lab::run_state_e::running;
+			s.ok = false;
+			s.skipped = false;
+			s.ntstatus = 0;
+			s.bytes_returned = 0;
+			s.elapsed_us = 0;
+			s.error.clear();
+			s.started_ms = now_ms();
+			s.finished_ms = 0;
+			if (log_index != 0) s.log_line_index = log_index;
+		}
+
+		void update_feature_summary_skip(std::size_t feature_index, const char* reason, std::uint64_t log_index) {
+			std::lock_guard<std::mutex> lk(g_feature_summary_mtx);
+			const auto& features = test_lab::all_features();
+			ensure_feature_summary_size_locked(features.size());
+			if (feature_index >= g_feature_summaries.size()) return;
+			feature_run_summary_t& s = g_feature_summaries[feature_index];
+			if (s.started_ms == 0) s.started_ms = now_ms();
+			s.state = test_lab::run_state_e::complete;
+			s.ok = false;
+			s.skipped = true;
+			s.ntstatus = 0;
+			s.bytes_returned = 0;
+			s.elapsed_us = 0;
+			s.error = reason != nullptr ? reason : "skipped";
+			s.finished_ms = now_ms();
+			if (log_index != 0) s.log_line_index = log_index;
+		}
+
+		void update_feature_summary_result(std::size_t feature_index, const test_lab::result_t& r, std::uint64_t log_index) {
+			std::lock_guard<std::mutex> lk(g_feature_summary_mtx);
+			const auto& features = test_lab::all_features();
+			ensure_feature_summary_size_locked(features.size());
+			if (feature_index >= g_feature_summaries.size()) return;
+			feature_run_summary_t& s = g_feature_summaries[feature_index];
+			if (s.started_ms == 0) s.started_ms = now_ms();
+			s.state = test_lab::run_state_e::complete;
+			s.ok = r.ok;
+			s.skipped = r.skipped;
+			s.ntstatus = r.ntstatus;
+			s.bytes_returned = r.bytes_returned;
+			s.elapsed_us = r.elapsed_us;
+			s.error = r.error;
+			s.finished_ms = now_ms();
+			if (log_index != 0) s.log_line_index = log_index;
+		}
+
+		bool try_copy_feature_summaries(const char* site, std::vector<feature_run_summary_t>& out) {
+			std::unique_lock<std::mutex> lk(g_feature_summary_mtx, std::try_to_lock);
+			if (!lk.owns_lock()) {
+				log_render_lock_busy(site, "g_feature_summary_mtx");
+				return false;
+			}
+			ensure_feature_summary_size_locked(test_lab::all_features().size());
+			out = g_feature_summaries;
+			return true;
+		}
+
+		std::uint64_t append_log_tail(const std::string& text) {
+			std::lock_guard<std::mutex> lk(g_log_tail_mtx);
+			std::uint64_t first_index = 0;
+			std::size_t pos = 0;
+			while (pos <= text.size()) {
+				std::size_t nl = text.find('\n', pos);
+				std::size_t end = (nl == std::string::npos) ? text.size() : nl;
+				std::string line = text.substr(pos, end - pos);
+				if (!line.empty() && line.back() == '\r') line.pop_back();
+				if (line.size() > 900) {
+					line.resize(897);
+					line.append("...");
+				}
+				log_tail_line_t item;
+				item.index = g_log_tail_next_index++;
+				item.text = std::move(line);
+				if (first_index == 0) first_index = item.index;
+				g_log_tail.push_back(std::move(item));
+				while (g_log_tail.size() > k_log_tail_max_lines)
+					g_log_tail.pop_front();
+				if (nl == std::string::npos) break;
+				pos = nl + 1;
+				if (pos == text.size()) break;
+			}
+			return first_index;
+		}
+
+		bool try_copy_log_tail(const char* site, std::vector<log_tail_line_t>& out) {
+			std::unique_lock<std::mutex> lk(g_log_tail_mtx, std::try_to_lock);
+			if (!lk.owns_lock()) {
+				log_render_lock_busy(site, "g_log_tail_mtx");
+				return false;
+			}
+			out.assign(g_log_tail.begin(), g_log_tail.end());
+			return true;
+		}
 
 		void log_render_lock_busy(const char* site, const char* lock_name) {
 			static std::atomic<unsigned long long> s_last_busy_log_ms{0};
@@ -192,6 +502,15 @@ namespace test_lab_view {
 			return path.c_str();
 		}
 
+		void open_run_all_log_folder() {
+			std::string path = run_all_log_path();
+			std::size_t cut = path.find_last_of("\\/");
+			if (cut == std::string::npos) return;
+			std::string folder = path.substr(0, cut);
+			if (folder.empty()) return;
+			ShellExecuteA(nullptr, "open", folder.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+		}
+
 		void populate_safe_defaults(test_lab::state_t& s) {
 			s.pid = static_cast<std::uint32_t>(GetCurrentProcessId());
 			s.tid = static_cast<std::uint32_t>(GetCurrentThreadId());
@@ -232,8 +551,9 @@ namespace test_lab_view {
 				FlushFileBuffers(hFile);
 		}
 
-		void append_log_line(HANDLE hFile, const std::string& line, bool force_flush = false) {
-			if (hFile == INVALID_HANDLE_VALUE) return;
+		std::uint64_t append_log_line(HANDLE hFile, const std::string& line, bool force_flush = false) {
+			const std::uint64_t line_index = append_log_tail(line);
+			if (hFile == INVALID_HANDLE_VALUE) return line_index;
 			static std::mutex s_log_mtx;
 			static std::uint64_t s_last_flush_ms = 0;
 			static std::uint32_t s_bytes_since_flush = 0;
@@ -253,9 +573,10 @@ namespace test_lab_view {
 				s_last_flush_ms = now;
 				s_bytes_since_flush = 0;
 			}
+			return line_index;
 		}
 
-		void append_log_starting(HANDLE hFile,
+		std::uint64_t append_log_starting(HANDLE hFile,
 			const test_lab::feature_t& f,
 			const test_lab::state_t& s)
 		{
@@ -275,10 +596,10 @@ namespace test_lab_view {
 				static_cast<unsigned>(s.size),
 				static_cast<unsigned>(s.u32_a));
 			line.append(tmp);
-			append_log_line(hFile, line);
+			return append_log_line(hFile, line);
 		}
 
-		void append_log_skip(HANDLE hFile, const test_lab::feature_t& f, const char* reason) {
+		std::uint64_t append_log_skip(HANDLE hFile, const test_lab::feature_t& f, const char* reason) {
 			char ts[40];
 			format_local_timestamp(ts, sizeof(ts));
 			std::string line;
@@ -287,10 +608,10 @@ namespace test_lab_view {
 			line.append(f.category != nullptr ? f.category : "?").append("/");
 			line.append(f.name != nullptr ? f.name : "?");
 			line.append(" -- SKIPPED (").append(reason != nullptr ? reason : "no reason").append(")\n");
-			append_log_line(hFile, line);
+			return append_log_line(hFile, line);
 		}
 
-		void append_log_result(HANDLE hFile,
+		std::uint64_t append_log_result(HANDLE hFile,
 			const test_lab::feature_t& f,
 			const test_lab::state_t& s,
 			const test_lab::result_t& r,
@@ -337,7 +658,7 @@ namespace test_lab_view {
 				}
 				line.append("\n");
 			}
-			append_log_line(hFile, line);
+			return append_log_line(hFile, line);
 		}
 
 		HANDLE open_log_for_append() {
@@ -540,6 +861,7 @@ namespace test_lab_view {
 			g_run_all_ok.store(0);
 			g_run_all_fail.store(0);
 			g_run_all_skipped.store(0);
+			reset_feature_summaries();
 			{
 				std::unique_lock<std::mutex> lk(g_run_all_status_mtx, std::try_to_lock);
 				if (lk.owns_lock()) {
@@ -580,18 +902,21 @@ namespace test_lab_view {
 						std::lock_guard<std::mutex> lk(g_run_all_status_mtx);
 						g_run_all_current_name = (f.name != nullptr ? f.name : "?");
 					}
+					update_feature_summary_start(i, 0);
 
 					const char* destructive_reason = test_lab::destructive_guard_reason(f.category, f.name);
 					if (destructive_reason != nullptr) {
 						g_run_all_skipped.fetch_add(1);
 						std::string reason = std::string("destructive guard: ") + destructive_reason;
-						append_log_skip(hFile, f, reason.c_str());
+						std::uint64_t log_index = append_log_skip(hFile, f, reason.c_str());
+						update_feature_summary_skip(i, reason.c_str(), log_index);
 						test_lab_format::testlab_diag_log_skip(f, reason.c_str());
 						continue;
 					}
 					if (f.run == nullptr) {
 						g_run_all_skipped.fetch_add(1);
-						append_log_skip(hFile, f, "no run function");
+						std::uint64_t log_index = append_log_skip(hFile, f, "no run function");
+						update_feature_summary_skip(i, "no run function", log_index);
 						test_lab_format::testlab_diag_log_skip(f, "no run function");
 						continue;
 					}
@@ -600,7 +925,8 @@ namespace test_lab_view {
 					populate_safe_defaults(s);
 					apply_smart_defaults(f, s, cache);
 					test_lab::result_t r;
-					append_log_starting(hFile, f, s);
+					std::uint64_t start_log_index = append_log_starting(hFile, f, s);
+					update_feature_summary_start(i, start_log_index);
 					test_lab_format::testlab_diag_log_entry(f, s);
 					auto t0 = std::chrono::steady_clock::now();
 					f.run(s, r);
@@ -613,7 +939,8 @@ namespace test_lab_view {
 					else if (r.ok) g_run_all_ok.fetch_add(1);
 					else           g_run_all_fail.fetch_add(1);
 
-					append_log_result(hFile, f, s, r, r.elapsed_us);
+					std::uint64_t result_log_index = append_log_result(hFile, f, s, r, r.elapsed_us);
+					update_feature_summary_result(i, r, result_log_index);
 					test_lab_format::testlab_diag_log_exit(f, r, r.elapsed_us);
 				}
 
@@ -673,6 +1000,45 @@ namespace test_lab_view {
 			std::string header_text;
 		};
 
+		struct category_counts_t {
+			int pass = 0;
+			int fail = 0;
+			int skip = 0;
+			int running = 0;
+		};
+
+		category_counts_t category_counts(const std::string& category,
+			const std::vector<feature_run_summary_t>& summaries)
+		{
+			category_counts_t counts;
+			const auto& features = test_lab::all_features();
+			for (std::size_t i = 0; i < features.size(); ++i) {
+				const char* cat = features[i].category != nullptr ? features[i].category : "Uncategorized";
+				if (category != cat || i >= summaries.size()) continue;
+				const feature_run_summary_t& s = summaries[i];
+				if (s.state == test_lab::run_state_e::running) {
+					++counts.running;
+				} else if (s.state == test_lab::run_state_e::complete) {
+					if (s.skipped) ++counts.skip;
+					else if (s.ok) ++counts.pass;
+					else ++counts.fail;
+				}
+			}
+			return counts;
+		}
+
+		std::string format_category_counts(const category_counts_t& counts) {
+			char buf[96];
+			if (counts.running > 0) {
+				std::snprintf(buf, sizeof(buf), "%d run / %d pass / %d fail / %d skip",
+					counts.running, counts.pass, counts.fail, counts.skip);
+			} else {
+				std::snprintf(buf, sizeof(buf), "%d pass / %d fail / %d skip",
+					counts.pass, counts.fail, counts.skip);
+			}
+			return std::string(buf);
+		}
+
 		void build_grouped_rows(std::vector<grouped_row_t>& out) {
 			out.clear();
 			const auto& features = test_lab::all_features();
@@ -722,6 +1088,13 @@ namespace test_lab_view {
 			std::vector<grouped_row_t> rows;
 			build_grouped_rows(rows);
 			const auto& features = test_lab::all_features();
+			static std::vector<feature_run_summary_t> s_last_summaries;
+			std::vector<feature_run_summary_t> summaries;
+			if (try_copy_feature_summaries("left_pane_summary_snapshot", summaries)) {
+				s_last_summaries = summaries;
+			} else {
+				summaries = s_last_summaries;
+			}
 
 			int rendered_index = 0;
 			for (std::size_t r = 0; r < rows.size(); ++r) {
@@ -736,6 +1109,19 @@ namespace test_lab_view {
 						aida::ui::with_alpha(t.text_dim, ent));
 					ImGui::TextUnformatted(row.header_text.c_str());
 					ImGui::PopStyleColor();
+					category_counts_t counts = category_counts(row.header_text, summaries);
+					if (counts.pass != 0 || counts.fail != 0 || counts.skip != 0 || counts.running != 0) {
+						std::string count_text = format_category_counts(counts);
+						float tw = ImGui::CalcTextSize(count_text.c_str()).x;
+						float x = pane_w - tw - 22.f;
+						if (x > ImGui::GetCursorPosX()) {
+							ImGui::SameLine(x);
+							ImGui::PushStyleColor(ImGuiCol_Text,
+								aida::ui::with_alpha(t.text_dim, ent * 0.86f));
+							ImGui::TextUnformatted(count_text.c_str());
+							ImGui::PopStyleColor();
+						}
+					}
 					ImGui::Unindent(10.f);
 					continue;
 				}
@@ -767,8 +1153,17 @@ namespace test_lab_view {
 				test_lab::run_state_e rs = test_lab::run_state_e::idle;
 				bool rok = false;
 				bool rskipped = false;
-				if (is_selected) {
+				feature_run_summary_t row_summary;
+				if (static_cast<std::size_t>(fidx) < summaries.size()) {
+					row_summary = summaries[static_cast<std::size_t>(fidx)];
+					rs = row_summary.state;
+					rok = row_summary.ok;
+					rskipped = row_summary.skipped;
+				} else if (is_selected) {
 					try_copy_result_summary("left_pane_selected_row", rs, rok, rskipped);
+					row_summary.state = rs;
+					row_summary.ok = rok;
+					row_summary.skipped = rskipped;
 				}
 				rdl->AddCircleFilled(dot_p, dot_r, status_dot_color(rs, rok, rskipped, ent));
 
@@ -786,12 +1181,50 @@ namespace test_lab_view {
 
 				ImU32 name_col = aida::ui::with_alpha(
 					is_selected ? t.text_primary : t.text_secondary, ent);
-				rdl->AddText(ImVec2(row_start.x + 64.f, row_start.y + (row_h - ImGui::GetTextLineHeight()) * 0.5f),
-					name_col, f.name != nullptr ? f.name : "");
+				const char* state_badge = result_state_badge(rs, rok, rskipped);
+				ImU32 state_col = result_state_color(rs, rok, rskipped);
+				float state_badge_w = 44.f;
+				float state_badge_h = 16.f;
+				ImVec2 sa(row_start.x + pane_w - 24.f - state_badge_w - 8.f,
+					row_start.y + (row_h - state_badge_h) * 0.5f);
+				ImVec2 sb(sa.x + state_badge_w, sa.y + state_badge_h);
+				rdl->AddRectFilled(sa, sb, aida::ui::with_alpha(state_col, 0.16f * ent), 3.f);
+				rdl->AddRect(sa, sb, aida::ui::with_alpha(state_col, 0.58f * ent), 3.f, 0, 1.f);
+				ImVec2 sts = ImGui::CalcTextSize(state_badge);
+				rdl->AddText(ImVec2(sa.x + (state_badge_w - sts.x) * 0.5f,
+						sa.y + (state_badge_h - sts.y) * 0.5f),
+					aida::ui::with_alpha(state_col, ent), state_badge);
+
+				ImVec4 name_clip(row_start.x + 64.f, row_start.y,
+					sa.x - 6.f, row_start.y + row_h);
+				rdl->AddText(ImGui::GetFont(), ImGui::GetFontSize(),
+					ImVec2(row_start.x + 64.f, row_start.y + (row_h - ImGui::GetTextLineHeight()) * 0.5f),
+					name_col, f.name != nullptr ? f.name : "", nullptr, 0.f, &name_clip);
 
 				if (clicked && fidx != g_selected_idx) {
 					g_selected_idx = fidx;
 					try_replace_result("left_pane_select_reset", std::make_shared<test_lab::result_t>());
+				}
+				if (hov) {
+					ImGui::BeginTooltip();
+					ImGui::Text("%s/%s",
+						f.category != nullptr ? f.category : "?",
+						f.name != nullptr ? f.name : "?");
+					ImGui::Text("Status: %s", result_state_label(rs, rok, rskipped));
+					if (rs == test_lab::run_state_e::complete) {
+						ImGui::Text("NTSTATUS: %s", test_lab_format::ntstatus_to_string(row_summary.ntstatus));
+						ImGui::Text("Bytes: %u  Elapsed: %s",
+							static_cast<unsigned>(row_summary.bytes_returned),
+							format_elapsed(row_summary.elapsed_us).c_str());
+						if (row_summary.log_line_index != 0)
+							ImGui::Text("Evidence line: %llu", static_cast<unsigned long long>(row_summary.log_line_index));
+						if (!row_summary.error.empty()) {
+							ImGui::PushTextWrapPos(520.f);
+							ImGui::Text("Detail: %s", row_summary.error.c_str());
+							ImGui::PopTextWrapPos();
+						}
+					}
+					ImGui::EndTooltip();
 				}
 				ImGui::PopID();
 			}
@@ -818,11 +1251,11 @@ namespace test_lab_view {
 			}
 		}
 
-		void run_fn_post_with_feature(const test_lab::feature_t& f);
+		void run_fn_post_with_feature(const test_lab::feature_t& f, int feature_idx);
 
 		void render_action_row(const test_lab::feature_t& f) {
 			test_lab::result_t action_copy;
-			const bool action_snapshot_ok = try_copy_result_full("action_row_snapshot", action_copy);
+			try_copy_result_full("action_row_snapshot", action_copy);
 			test_lab::run_state_e rs = action_copy.state.load(std::memory_order_acquire);
 			bool running = (rs == test_lab::run_state_e::running);
 
@@ -830,43 +1263,17 @@ namespace test_lab_view {
 
 			if (running) ImGui::BeginDisabled();
 			if (ImGui::Button("Run", ImVec2(110.f, 28.f))) {
-				run_fn_post_with_feature(f);
+				run_fn_post_with_feature(f, g_selected_idx);
 			}
 			if (running) ImGui::EndDisabled();
 			ImGui::SameLine();
 
-			bool has_result = action_snapshot_ok && (rs == test_lab::run_state_e::complete);
-
-			if (!has_result) ImGui::BeginDisabled();
-			if (ImGui::Button("Copy raw", ImVec2(110.f, 28.f))) {
-				std::string out;
-				out.reserve(action_copy.raw.size() * 3);
-				char tmp[8];
-				for (std::size_t i = 0; i < action_copy.raw.size(); ++i) {
-					std::snprintf(tmp, sizeof(tmp), "%02X ", static_cast<unsigned>(action_copy.raw[i]));
-					out.append(tmp);
-				}
-				ImGui::SetClipboardText(out.c_str());
-			}
-			ImGui::SameLine();
-			if (ImGui::Button("Copy parsed", ImVec2(110.f, 28.f))) {
-				std::string out;
-				for (const auto& p : action_copy.parsed) {
-					out.append(p.label);
-					out.append(": ");
-					out.append(p.value);
-					out.append("\n");
-				}
-				ImGui::SetClipboardText(out.c_str());
-			}
-			if (!has_result) ImGui::EndDisabled();
-			ImGui::SameLine();
 			if (ImGui::Button("Clear", ImVec2(110.f, 28.f))) {
 				try_replace_result("action_row_clear", std::make_shared<test_lab::result_t>());
 			}
 		}
 
-		void run_fn_post_with_feature(const test_lab::feature_t& f) {
+		void run_fn_post_with_feature(const test_lab::feature_t& f, int feature_idx) {
 			test_lab::state_t snapshot = g_state;
 			std::shared_ptr<test_lab::result_t> new_result = std::make_shared<test_lab::result_t>();
 			new_result->state.store(test_lab::run_state_e::running, std::memory_order_release);
@@ -874,16 +1281,22 @@ namespace test_lab_view {
 				new_result->ok = false;
 				new_result->error = "result lock busy";
 				new_result->state.store(test_lab::run_state_e::complete, std::memory_order_release);
+				if (feature_idx >= 0)
+					update_feature_summary_result(static_cast<std::size_t>(feature_idx), *new_result, 0);
 				return;
 			}
+			if (feature_idx >= 0)
+				update_feature_summary_start(static_cast<std::size_t>(feature_idx), 0);
 			test_lab::feature_t feature_copy = f;
-			if (!critical_work_queue::post([feature_copy, snapshot, new_result]() mutable {
+			if (!critical_work_queue::post([feature_copy, snapshot, new_result, feature_idx]() mutable {
 				full_test_scope_t full_test_scope("test_lab_view_single_feature");
 				if (feature_copy.run == nullptr) {
 					new_result->ok = false;
 					new_result->error = "no run function";
 					test_lab_format::testlab_diag_log_skip(feature_copy, "no run function");
 					new_result->state.store(test_lab::run_state_e::complete, std::memory_order_release);
+					if (feature_idx >= 0)
+						update_feature_summary_result(static_cast<std::size_t>(feature_idx), *new_result, 0);
 					return;
 				}
 				test_lab_format::testlab_diag_log_entry(feature_copy, snapshot);
@@ -908,21 +1321,50 @@ namespace test_lab_view {
 					new_result->parsed = std::move(local.parsed);
 				}
 				new_result->state.store(test_lab::run_state_e::complete, std::memory_order_release);
+				if (feature_idx >= 0)
+					update_feature_summary_result(static_cast<std::size_t>(feature_idx), *new_result, 0);
 			})) {
 				new_result->ok = false;
 				new_result->error = "critical queue unavailable";
 				new_result->state.store(test_lab::run_state_e::complete, std::memory_order_release);
+				if (feature_idx >= 0)
+					update_feature_summary_result(static_cast<std::size_t>(feature_idx), *new_result, 0);
 				diag::log_tagged_fmt("test_lab", "single_feature critical_queue post failed name=%s",
 					feature_copy.name ? feature_copy.name : "?");
 			}
 		}
 
-		void render_result_section() {
+		void render_result_section(const test_lab::feature_t& f, int feature_idx) {
 			const auto& t = aida::ui::resolved();
 
 			test_lab::result_t local_copy;
 			const bool result_snapshot_ok = try_copy_result_full("result_section_snapshot", local_copy);
 			test_lab::run_state_e rs = local_copy.state.load(std::memory_order_acquire);
+			bool using_cached_summary = false;
+
+			if (rs == test_lab::run_state_e::idle && feature_idx >= 0) {
+				static std::vector<feature_run_summary_t> s_last_result_summaries;
+				std::vector<feature_run_summary_t> summaries;
+				if (try_copy_feature_summaries("result_section_feature_summary", summaries)) {
+					s_last_result_summaries = summaries;
+				} else {
+					summaries = s_last_result_summaries;
+				}
+				if (static_cast<std::size_t>(feature_idx) < summaries.size()) {
+					const feature_run_summary_t& cached = summaries[static_cast<std::size_t>(feature_idx)];
+					if (cached.state != test_lab::run_state_e::idle) {
+						local_copy.state.store(cached.state, std::memory_order_release);
+						local_copy.ok = cached.ok;
+						local_copy.skipped = cached.skipped;
+						local_copy.ntstatus = cached.ntstatus;
+						local_copy.bytes_returned = cached.bytes_returned;
+						local_copy.elapsed_us = cached.elapsed_us;
+						local_copy.error = cached.error;
+						rs = cached.state;
+						using_cached_summary = true;
+					}
+				}
+			}
 
 			ImGui::PushStyleColor(ImGuiCol_Text, t.text_secondary);
 			ImGui::TextUnformatted("RESULT");
@@ -931,74 +1373,163 @@ namespace test_lab_view {
 			ImGui::Dummy(ImVec2(0.f, 4.f));
 
 			if (!result_snapshot_ok) {
-				ImGui::PushStyleColor(ImGuiCol_Text, t.warning);
-				ImGui::TextUnformatted("Result snapshot busy");
-				ImGui::PopStyleColor();
+				render_empty_panel("Result snapshot busy", "The worker is updating the selected result. Per-feature run status remains visible in the feature list.", 82.f);
 				return;
+			}
+
+			ImU32 status_col = result_state_color(rs, local_copy.ok, local_copy.skipped);
+			char ntbuf[96];
+			std::snprintf(ntbuf, sizeof(ntbuf), "%s / 0x%08X",
+				test_lab_format::ntstatus_to_string(local_copy.ntstatus),
+				static_cast<unsigned>(static_cast<std::uint32_t>(local_copy.ntstatus)));
+			char bytesbuf[32];
+			std::snprintf(bytesbuf, sizeof(bytesbuf), "%u", static_cast<unsigned>(local_copy.bytes_returned));
+			std::string elapsed = format_elapsed(local_copy.elapsed_us);
+
+			render_chip(result_state_label(rs, local_copy.ok, local_copy.skipped), status_col, 74.f);
+			if (ImGui::GetContentRegionAvail().x > 172.f) ImGui::SameLine();
+			render_metric_chip("NTSTATUS", ntbuf, status_col, 168.f);
+			if (ImGui::GetContentRegionAvail().x > 100.f) ImGui::SameLine();
+			render_metric_chip("Driver", driver_label(f.driver), driver_badge_color(f.driver, 0.95f), 86.f);
+			if (ImGui::GetContentRegionAvail().x > 96.f) ImGui::SameLine();
+			render_metric_chip("Bytes", bytesbuf, t.text_secondary, 82.f);
+			if (ImGui::GetContentRegionAvail().x > 110.f) ImGui::SameLine();
+			render_metric_chip("Elapsed", elapsed.c_str(), t.text_secondary, 102.f);
+
+			ImGui::Dummy(ImVec2(0.f, 8.f));
+
+			if (using_cached_summary) {
+				ImGui::PushStyleColor(ImGuiCol_Text, t.text_dim);
+				ImGui::TextWrapped("Showing the cached run summary for this feature. Raw bytes and parsed fields are shown when the selected feature has a direct result snapshot; run-all evidence remains in the log tail below.");
+				ImGui::PopStyleColor();
+				ImGui::Dummy(ImVec2(0.f, 6.f));
 			}
 
 			if (rs == test_lab::run_state_e::idle) {
-				ImGui::TextDisabled("No execution yet.");
+				render_empty_panel("No execution yet", "Run this feature or use Run All Safe Tests to collect driver evidence.", 86.f);
 				return;
 			}
 			if (rs == test_lab::run_state_e::running) {
-				ImGui::PushStyleColor(ImGuiCol_Text, t.accent_u32);
-				ImGui::TextUnformatted("Running...");
-				ImGui::PopStyleColor();
+				ImGui::ProgressBar(0.35f, ImVec2(-1.f, 7.f), "");
+				ImGui::Dummy(ImVec2(0.f, 6.f));
+				render_empty_panel("Running", "The worker is executing the selected feature and collecting diagnostics.", 86.f);
 				return;
 			}
 
-			ImU32 status_col = local_copy.skipped ? t.warning : (local_copy.ok ? t.success : t.error);
-			ImGui::PushStyleColor(ImGuiCol_Text, status_col);
-			ImGui::Text("%s  (0x%08X)",
-				test_lab_format::ntstatus_to_string(local_copy.ntstatus),
-				static_cast<unsigned>(static_cast<std::uint32_t>(local_copy.ntstatus)));
-			ImGui::PopStyleColor();
-
-			ImGui::Text("bytes_returned: %u    elapsed: %llu us",
-				static_cast<unsigned>(local_copy.bytes_returned),
-				static_cast<unsigned long long>(local_copy.elapsed_us));
+			if (ImGui::Button("Copy summary", ImVec2(116.f, 28.f))) {
+				std::string out = format_result_summary(f, local_copy);
+				ImGui::SetClipboardText(out.c_str());
+			}
+			if (ImGui::GetContentRegionAvail().x > 118.f) ImGui::SameLine();
+			if (ImGui::Button("Copy parsed", ImVec2(110.f, 28.f))) {
+				std::string out = format_parsed_fields(local_copy.parsed);
+				ImGui::SetClipboardText(out.c_str());
+			}
+			if (ImGui::GetContentRegionAvail().x > 104.f) ImGui::SameLine();
+			if (ImGui::Button("Copy raw", ImVec2(96.f, 28.f))) {
+				std::string out = format_raw_hex(local_copy.raw);
+				ImGui::SetClipboardText(out.c_str());
+			}
 
 			if (!local_copy.error.empty()) {
+				ImGui::Dummy(ImVec2(0.f, 8.f));
 				ImGui::PushStyleColor(ImGuiCol_Text, t.error);
 				ImGui::TextWrapped("error: %s", local_copy.error.c_str());
 				ImGui::PopStyleColor();
 			}
 
-			ImGui::Dummy(ImVec2(0.f, 6.f));
-			ImGui::PushStyleColor(ImGuiCol_Text, t.text_dim);
-			ImGui::TextUnformatted("RAW BYTES");
-			ImGui::PopStyleColor();
-			ImGui::Separator();
-			ImGui::BeginChild("##testlab_raw_dump", ImVec2(0.f, 180.f), true,
-				ImGuiWindowFlags_HorizontalScrollbar);
-			test_lab_format::render_hex_ascii(local_copy.raw);
-			ImGui::EndChild();
+			ImGui::Dummy(ImVec2(0.f, 8.f));
+			if (ImGui::CollapsingHeader("Raw bytes", ImGuiTreeNodeFlags_DefaultOpen)) {
+				if (local_copy.raw.empty()) {
+					render_empty_panel("No raw bytes", "This feature completed without a raw byte buffer.", 70.f);
+				} else {
+					float rows = static_cast<float>((local_copy.raw.size() + 15u) / 16u);
+					float raw_h = (std::min)(180.f, (std::max)(92.f, 36.f + rows * ImGui::GetTextLineHeight()));
+					ImGui::BeginChild("##testlab_raw_dump", ImVec2(0.f, raw_h), true,
+						ImGuiWindowFlags_HorizontalScrollbar);
+					test_lab_format::render_hex_ascii(local_copy.raw);
+					ImGui::EndChild();
+				}
+			}
 
-			ImGui::Dummy(ImVec2(0.f, 6.f));
-			ImGui::PushStyleColor(ImGuiCol_Text, t.text_dim);
-			ImGui::TextUnformatted("PARSED FIELDS");
-			ImGui::PopStyleColor();
-			ImGui::Separator();
-			if (local_copy.parsed.empty()) {
-				ImGui::TextDisabled("(none)");
-			} else {
-				if (ImGui::BeginTable("##testlab_parsed", 2,
+			ImGui::Dummy(ImVec2(0.f, 8.f));
+			if (ImGui::CollapsingHeader("Parsed fields", ImGuiTreeNodeFlags_DefaultOpen)) {
+				if (local_copy.parsed.empty()) {
+					render_empty_panel("No parsed fields", "The feature did not return structured parsed fields for this run.", 70.f);
+				} else if (ImGui::BeginTable("##testlab_parsed", 2,
 					ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg |
-					ImGuiTableFlags_SizingStretchProp)) {
-					ImGui::TableSetupColumn("Field", ImGuiTableColumnFlags_WidthStretch, 0.35f);
-					ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 0.65f);
+					ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp)) {
+					ImGui::TableSetupColumn("Field", ImGuiTableColumnFlags_WidthStretch, 0.34f);
+					ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 0.66f);
 					ImGui::TableHeadersRow();
-					for (const auto& p : local_copy.parsed) {
-						ImGui::TableNextRow();
+					for (std::size_t i = 0; i < local_copy.parsed.size(); ++i) {
+						const auto& p = local_copy.parsed[i];
+						ImGui::TableNextRow(ImGuiTableRowFlags_None, ImGui::GetTextLineHeight() + 4.f);
+						ImGui::PushID(static_cast<int>(i));
 						ImGui::TableSetColumnIndex(0);
-						ImGui::TextUnformatted(p.label.c_str());
+						render_clipped_cell("label", p.label, t.text_secondary);
 						ImGui::TableSetColumnIndex(1);
-						ImGui::TextWrapped("%s", p.value.c_str());
+						render_clipped_cell("value", p.value, t.text_primary);
+						ImGui::PopID();
 					}
 					ImGui::EndTable();
 				}
 			}
+		}
+
+		void render_run_all_evidence_panel(float max_h = 170.f) {
+			const auto& t = aida::ui::resolved();
+			ImGui::PushStyleColor(ImGuiCol_Text, t.text_secondary);
+			ImGui::TextUnformatted("RECENT RUN EVIDENCE");
+			ImGui::PopStyleColor();
+			ImGui::Separator();
+
+			ImGui::PushStyleColor(ImGuiCol_Text, t.text_dim);
+			ImGui::TextWrapped("Log: %s", run_all_log_path());
+			ImGui::PopStyleColor();
+
+			if (ImGui::Button("Copy log path", ImVec2(118.f, 26.f))) {
+				ImGui::SetClipboardText(run_all_log_path());
+			}
+			if (ImGui::GetContentRegionAvail().x > 128.f) ImGui::SameLine();
+			if (ImGui::Button("Open log folder", ImVec2(126.f, 26.f))) {
+				open_run_all_log_folder();
+			}
+
+			static std::vector<log_tail_line_t> s_last_tail;
+			std::vector<log_tail_line_t> tail;
+			bool tail_ok = try_copy_log_tail("run_all_log_tail_panel", tail);
+			if (tail_ok) {
+				s_last_tail = tail;
+			} else {
+				tail = s_last_tail;
+			}
+
+			ImGui::Dummy(ImVec2(0.f, 6.f));
+			if (!tail_ok) {
+				ImGui::PushStyleColor(ImGuiCol_Text, t.warning);
+				ImGui::TextUnformatted("Log tail snapshot busy; showing the last stable frame.");
+				ImGui::PopStyleColor();
+			}
+
+			float child_h = max_h;
+			if (child_h < 90.f) child_h = 90.f;
+			ImGui::BeginChild("##testlab_run_all_tail", ImVec2(0.f, child_h), true,
+				ImGuiWindowFlags_HorizontalScrollbar);
+			if (tail.empty()) {
+				render_empty_panel("No run-all evidence yet", "Run All Safe Tests writes target launch, driver attach, diagnostics, and result evidence here.", 82.f);
+			} else {
+				ImGui::PushStyleColor(ImGuiCol_Text, t.text_secondary);
+				for (const auto& line : tail) {
+					ImGui::Text("[%04llu] %s",
+						static_cast<unsigned long long>(line.index),
+						line.text.c_str());
+				}
+				ImGui::PopStyleColor();
+				if (g_run_all_active.load(std::memory_order_acquire))
+					ImGui::SetScrollHereY(1.f);
+			}
+			ImGui::EndChild();
 		}
 
 		void render_right_pane(float pane_w, float pane_h) {
@@ -1015,9 +1546,22 @@ namespace test_lab_view {
 
 			const auto& features = test_lab::all_features();
 			if (g_selected_idx < 0 || g_selected_idx >= static_cast<int>(features.size())) {
-				ImGui::PushStyleColor(ImGuiCol_Text, t.text_dim);
-				ImGui::TextUnformatted("Select a feature from the left to begin.");
-				ImGui::PopStyleColor();
+				ImGui::BeginChild("##testlab_right_scroll_empty",
+					ImVec2(pane_w - 32.f, pane_h - 28.f), false, ImGuiWindowFlags_None);
+				render_run_all_evidence_panel((std::min)(170.f, (std::max)(100.f, pane_h * 0.36f)));
+				ImGui::Dummy(ImVec2(0.f, 10.f));
+				ImVec2 empty_pos = ImGui::GetCursorScreenPos();
+				float empty_w = ImGui::GetContentRegionAvail().x;
+				if (empty_w < 120.f) empty_w = 120.f;
+				ImVec2 empty_size(empty_w, (std::max)(140.f, pane_h * 0.34f));
+				ImGui::Dummy(empty_size);
+				aida::ui::empty_state::config_t cfg;
+				cfg.glyph = aida::ui::empty_state::glyph_t::shield;
+				cfg.title = "No feature selected";
+				cfg.body = "Select a Test Lab feature to inspect inputs, run status, and per-feature evidence.";
+				cfg.max_width = 420.f;
+				aida::ui::empty_state::render(empty_pos, empty_size, cfg);
+				ImGui::EndChild();
 				ImGui::Unindent(12.f);
 				ImGui::EndChild();
 				return;
@@ -1042,7 +1586,9 @@ namespace test_lab_view {
 			ImGui::Dummy(ImVec2(0.f, 8.f));
 			render_action_row(f);
 			ImGui::Dummy(ImVec2(0.f, 10.f));
-			render_result_section();
+			render_result_section(f, g_selected_idx);
+			ImGui::Dummy(ImVec2(0.f, 12.f));
+			render_run_all_evidence_panel((std::min)(180.f, (std::max)(110.f, pane_h * 0.28f)));
 
 			ImGui::EndChild();
 			ImGui::Unindent(12.f);
@@ -1052,7 +1598,8 @@ namespace test_lab_view {
 	}
 
 	void render(float vw, float vh, float accumulated_time) {
-		const float top_bar_h = 38.f;
+		const bool stack_main_panes = vw < 620.f;
+		const float top_bar_h = stack_main_panes ? 76.f : 58.f;
 		const float gap = 8.f;
 
 		ImVec2 origin_top = ImGui::GetCursorPos();
@@ -1068,11 +1615,11 @@ namespace test_lab_view {
 
 		bool running = g_run_all_active.load(std::memory_order_acquire);
 		if (running) ImGui::BeginDisabled();
-		if (ImGui::Button("Run All Safe Tests", ImVec2(180.f, 26.f))) {
+		const float run_button_w = std::min(180.f, std::max(136.f, vw - 24.f));
+		if (ImGui::Button("Run All Safe Tests", ImVec2(run_button_w, 26.f))) {
 			start_run_all_safe();
 		}
 		if (running) ImGui::EndDisabled();
-		ImGui::SameLine();
 
 		std::string status_copy;
 		std::string current_name_copy;
@@ -1092,19 +1639,40 @@ namespace test_lab_view {
 			}
 		}
 
-		ImGui::PushStyleColor(ImGuiCol_Text, t.text_dim);
+		char run_status_buf[768];
 		if (running) {
-			ImGui::Text("Running %d / %d  (%s)",
-				g_run_all_current.load(),
-				g_run_all_total.load(),
-				current_name_copy.c_str());
+			std::snprintf(run_status_buf, sizeof(run_status_buf),
+				"Running %d / %d  (%s)   pass=%d fail=%d skip=%d",
+				g_run_all_current.load(std::memory_order_acquire),
+				g_run_all_total.load(std::memory_order_acquire),
+				current_name_copy.c_str(),
+				g_run_all_ok.load(std::memory_order_acquire),
+				g_run_all_fail.load(std::memory_order_acquire),
+				g_run_all_skipped.load(std::memory_order_acquire));
 		}
 		else if (!status_copy.empty()) {
-			ImGui::Text("%s", status_copy.c_str());
+			std::snprintf(run_status_buf, sizeof(run_status_buf), "%s", status_copy.c_str());
 		}
 		else {
-			ImGui::Text("Output: %s", run_all_log_path());
+			std::snprintf(run_status_buf, sizeof(run_status_buf), "Evidence log: %s", run_all_log_path());
 		}
+		const ImGuiStyle& style = ImGui::GetStyle();
+		if (ImGui::GetItemRectMax().x + style.ItemSpacing.x + 160.f <= wp_top.x + vw - 12.f) {
+			ImGui::SameLine();
+		}
+		render_clipped_cell("##testlab_run_status", std::string(run_status_buf), t.text_dim);
+
+		ImGui::Dummy(ImVec2(0.f, 3.f));
+		int total = g_run_all_total.load(std::memory_order_acquire);
+		int current = g_run_all_current.load(std::memory_order_acquire);
+		float progress = (total > 0) ? (static_cast<float>(current) / static_cast<float>(total)) : 0.f;
+		if (!running && !status_copy.empty() && total > 0)
+			progress = 1.f;
+		ImGui::PushStyleColor(ImGuiCol_PlotHistogram, running ? t.accent_u32 :
+			(g_run_all_fail.load(std::memory_order_acquire) > 0 ? t.error : t.success));
+		float progress_w = ImGui::GetContentRegionAvail().x;
+		if (progress_w < 120.f) progress_w = 120.f;
+		ImGui::ProgressBar(progress, ImVec2(progress_w, 6.f), "");
 		ImGui::PopStyleColor();
 		ImGui::Unindent(10.f);
 
@@ -1117,10 +1685,19 @@ namespace test_lab_view {
 		if (remaining_h < 100.f) remaining_h = 100.f;
 
 		ImVec2 origin = ImGui::GetCursorPos();
-		render_left_pane(left_pane_w, remaining_h, accumulated_time);
-
-		ImGui::SetCursorPos(ImVec2(origin.x + left_pane_w + gap, origin.y));
-		render_right_pane(right_pane_w, remaining_h);
+		if (stack_main_panes) {
+			float left_h = std::min(220.f, std::max(128.f, remaining_h * 0.38f));
+			if (remaining_h - left_h - gap < 150.f)
+				left_h = std::max(92.f, remaining_h - gap - 150.f);
+			float right_h = std::max(120.f, remaining_h - left_h - gap);
+			render_left_pane(vw, left_h, accumulated_time);
+			ImGui::SetCursorPos(ImVec2(origin.x, origin.y + left_h + gap));
+			render_right_pane(vw, right_h);
+		} else {
+			render_left_pane(left_pane_w, remaining_h, accumulated_time);
+			ImGui::SetCursorPos(ImVec2(origin.x + left_pane_w + gap, origin.y));
+			render_right_pane(right_pane_w, remaining_h);
+		}
 	}
 
 }

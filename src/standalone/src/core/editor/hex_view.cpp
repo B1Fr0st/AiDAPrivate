@@ -1079,6 +1079,31 @@ void render(float pos_x, float pos_y, float width, float height,
             ui_anim::render_custom_scrollbar(dl, track_x, track_y0, sb_w, track_h,
                 st.scroll_y, total_content, height, a,
                 st.sb_dragging, st.sb_drag_offset);
+
+            float ratio = height / total_content;
+            float thumb_h = std::max(track_h * ratio, 20.f);
+            float track_range = std::max(0.f, track_h - thumb_h);
+            float scroll_ratio = max_scroll > 0.f ? st.scroll_y / max_scroll : 0.f;
+            scroll_ratio = std::max(0.f, std::min(scroll_ratio, 1.f));
+            float thumb_y = track_y0 + track_range * scroll_ratio;
+            ImVec2 track_min(track_x, track_y0);
+            ImVec2 track_max(track_x + sb_w, track_y0 + track_h);
+            ImVec2 thumb_min(track_x, thumb_y);
+            ImVec2 thumb_max(track_x + sb_w, thumb_y + thumb_h);
+            bool track_hovered = ImGui::IsMouseHoveringRect(track_min, track_max, false);
+            bool thumb_hovered = ImGui::IsMouseHoveringRect(thumb_min, thumb_max, false);
+            if (track_hovered && !thumb_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                float page = std::max(line_h, height - line_h);
+                st.target_scroll_y += ImGui::GetMousePos().y < thumb_y ? -page : page;
+                st.target_scroll_y = std::max(0.f, std::min(st.target_scroll_y, max_scroll));
+            }
+            if (st.sb_dragging && ImGui::IsMouseDown(ImGuiMouseButton_Left) && track_range > 0.f) {
+                float new_thumb_y = ImGui::GetMousePos().y - st.sb_drag_offset;
+                float new_ratio = (new_thumb_y - track_y0) / track_range;
+                new_ratio = std::max(0.f, std::min(new_ratio, 1.f));
+                st.target_scroll_y = new_ratio * max_scroll;
+                st.scroll_y = st.target_scroll_y;
+            }
         }
     }
 

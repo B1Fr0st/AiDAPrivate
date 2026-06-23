@@ -3915,35 +3915,6 @@ namespace {
                 return true;
             }
         }
-        if (tool_lc == "dx_hook_manage" &&
-            (action_lc == "present" || action_lc == "draw") &&
-            zero_reason.find("thread_count=0") != std::string::npos) {
-            std::string hook_id;
-            std::string backend;
-            payload_string_field(ir.data, "hook_id", hook_id);
-            payload_string_field(ir.data, "backend", backend);
-            if (backend.empty())
-                payload_string_field(ir.data, "capture_backend", backend);
-            const bool backend_snapshot = lower_copy(backend).find("snapshot") != std::string::npos;
-            uint64_t capture_count = 0;
-            size_t captures_array = 0;
-            payload_u64_field(ir.data, "capture_count", capture_count);
-            payload_array_count(ir.data, "captures", captures_array);
-            if (backend_snapshot && !hook_id.empty() && capture_count == 0 && captures_array == 0) {
-                status = mcp_tool_call_status_t::contract_pass;
-                proof = "dx hook armed before stimulus hook_id=" + hook_id + " backend=" + backend +
-                    " capture_count=0 captures=0 zero_reason=" + zero_reason;
-                return true;
-            }
-            if (backend_snapshot && !hook_id.empty() && (capture_count > 0 || captures_array > 0)) {
-                status = mcp_tool_call_status_t::functional_pass;
-                proof = "functional dx snapshot capture hook_id=" + hook_id + " backend=" + backend +
-                    " capture_count=" + std::to_string(static_cast<unsigned long long>(capture_count)) +
-                    " captures=" + std::to_string(static_cast<unsigned long long>(captures_array)) +
-                    " zero_reason=" + zero_reason;
-                return true;
-            }
-        }
         if (tool_lc == "drv_find_dispatch_table") {
             std::string structural_reason;
             if (drv_find_dispatch_table_structural_json_proof(ir, structural_reason)) {
@@ -6715,10 +6686,9 @@ namespace {
         }
     }
 
-    bool dx_hook_snapshot_functional_payload(const mcp_standalone::json& data, std::string& reason) {
+    bool dx_hook_live_event_functional_payload(const mcp_standalone::json& data, std::string& reason) {
         std::string hook_id;
         std::string backend;
-        std::string capture_reason;
         payload_string_field(data, "backend", backend);
         if (backend.empty())
             payload_string_field(data, "capture_backend", backend);
@@ -6727,22 +6697,33 @@ namespace {
             reason = "dx_hook_hook_id_missing";
             return false;
         }
-        if (backend_lc.find("snapshot") == std::string::npos) {
-            reason = "dx_hook_snapshot_backend_missing backend=" + (backend.empty() ? std::string("<empty>") : backend);
+        if (backend_lc != "hardware_breakpoint_kernel_context") {
+            reason = "dx_hook_live_backend_missing backend=" + (backend.empty() ? std::string("<empty>") : backend);
             return false;
         }
-        if (!payload_capture_or_result_evidence(data, capture_reason)) {
-            reason = "dx_hook_capture_evidence_missing hook_id=" + hook_id + " " + capture_reason;
+        bool kernel_context_consumer = false;
+        payload_bool_field(data, "kernel_context_consumer", kernel_context_consumer);
+        if (!kernel_context_consumer) {
+            reason = "dx_hook_kernel_context_consumer_missing hook_id=" + hook_id;
             return false;
         }
-        uint64_t capture_count = 0;
+        bool snapshot_evidence = false;
+        payload_bool_field(data, "functional_snapshot_evidence", snapshot_evidence);
+        if (snapshot_evidence) {
+            reason = "dx_hook_snapshot_evidence_rejected hook_id=" + hook_id;
+            return false;
+        }
+        uint64_t event_capture_count = 0;
         size_t capture_array = 0;
-        payload_u64_field(data, "capture_count", capture_count);
+        payload_u64_field(data, "event_capture_count", event_capture_count);
         payload_array_count(data, "captures", capture_array);
-        reason = "dx_hook_snapshot_capture hook_id=" + hook_id + " backend=" + backend +
-            " capture_count=" + std::to_string(static_cast<unsigned long long>(capture_count)) +
-            " captures=" + std::to_string(static_cast<unsigned long long>(capture_array)) +
-            " " + capture_reason;
+        if (event_capture_count == 0 && capture_array == 0) {
+            reason = "dx_hook_live_capture_missing hook_id=" + hook_id + " backend=" + backend;
+            return false;
+        }
+        reason = "dx_hook_live_kernel_context_capture hook_id=" + hook_id + " backend=" + backend +
+            " event_capture_count=" + std::to_string(static_cast<unsigned long long>(event_capture_count)) +
+            " captures=" + std::to_string(static_cast<unsigned long long>(capture_array));
         return true;
     }
 
@@ -6806,8 +6787,10 @@ namespace {
             }
         }
         if (tool_lc == "dx_hook_manage" && (effective_action_lc == "present" || effective_action_lc == "draw")) {
-            if (dx_hook_snapshot_functional_payload(ir.data, evidence))
+            if (dx_hook_live_event_functional_payload(ir.data, evidence))
                 return mcp_tool_call_status_t::functional_pass;
+            if (evidence.find("snapshot") != std::string::npos)
+                return mcp_tool_call_status_t::security_guard_pass;
             return mcp_tool_call_status_t::contract_pass;
         }
         if (tool_lc == "network_pre_encrypt_hook") {
@@ -10153,7 +10136,6 @@ namespace {
                 }, passed, failed);
         }
 
-        std::string dx_present_hook_id;
         {
             mcp_standalone::json args = test_coverage_domains_1_8_safe_args();
             args["action"] = "present";
@@ -10163,25 +10145,12 @@ namespace {
             args["max_captures"] = 2;
             if (have_desc && desc.matrix_buffer_va != 0)
                 args["matrix_buffer_va"] = test_coverage_domains_1_8_hex_ptr(desc.matrix_buffer_va);
-            invoke_result_t out;
-            test_coverage_domains_1_8_case(hf, tag, "dx_hook_manage", "present_hook_safe_fixture", args, 7000,
+            test_coverage_domains_1_8_case(hf, tag, "dx_hook_manage", "present_hook_snapshot_rejected", args, 7000,
                 [](const invoke_result_t& ir, std::string& reason) {
-                    if (!ir.success) {
-                        reason = "DX hook install failed text=" + compact_text(ir.text, 360) + " data=" + compact_json(ir.data, 500);
-                        return false;
-                    }
-                    std::string hook_id;
-                    if (!payload_string_field(ir.data, "hook_id", hook_id) || hook_id.empty()) {
-                        reason = "hook_id missing";
-                        return false;
-                    }
-                    return true;
-                }, passed, failed, &out);
-            if (out.success)
-                payload_string_field(out.data, "hook_id", dx_present_hook_id);
+                    return test_coverage_domains_1_8_expect_error_any(ir, {"snapshot", "polling", "cannot install"}, reason);
+                }, passed, failed);
         }
 
-        std::string dx_draw_hook_id;
         {
             mcp_standalone::json args = test_coverage_domains_1_8_safe_args();
             args["action"] = "draw";
@@ -10192,31 +10161,20 @@ namespace {
             args["capture_cbuffers"] = true;
             if (have_desc && desc.matrix_buffer_va != 0)
                 args["matrix_buffer_va"] = test_coverage_domains_1_8_hex_ptr(desc.matrix_buffer_va);
-            invoke_result_t out;
-            test_coverage_domains_1_8_case(hf, tag, "dx_hook_manage", "draw_hook_safe_fixture", args, 7000,
+            test_coverage_domains_1_8_case(hf, tag, "dx_hook_manage", "draw_hook_snapshot_rejected", args, 7000,
                 [](const invoke_result_t& ir, std::string& reason) {
-                    if (!ir.success) {
-                        reason = "DX draw hook install failed text=" + compact_text(ir.text, 360) + " data=" + compact_json(ir.data, 500);
-                        return false;
-                    }
-                    std::string hook_id;
-                    if (!payload_string_field(ir.data, "hook_id", hook_id) || hook_id.empty()) {
-                        reason = "draw hook_id missing";
-                        return false;
-                    }
-                    return true;
-                }, passed, failed, &out);
-            if (out.success)
-                payload_string_field(out.data, "hook_id", dx_draw_hook_id);
+                    return test_coverage_domains_1_8_expect_error_any(ir, {"snapshot", "polling", "cannot install"}, reason);
+                }, passed, failed);
         }
 
+        if (have_desc && desc.matrix_buffer_va != 0) {
         {
             mcp_standalone::json args;
             args["process_id"] = pid;
             args["api"] = "d3d11";
-            if (have_desc && desc.matrix_buffer_va != 0)
-                args["matrix_buffer_va"] = test_coverage_domains_1_8_hex_ptr(desc.matrix_buffer_va);
-            test_coverage_domains_1_8_case(hf, tag, "dx_list_bound_cbuffers", "list_bound_cbuffers_after_safe_hook", args, 4000,
+            args["include_snapshot_fallback"] = true;
+            args["matrix_buffer_va"] = test_coverage_domains_1_8_hex_ptr(desc.matrix_buffer_va);
+            test_coverage_domains_1_8_case(hf, tag, "dx_list_bound_cbuffers", "list_bound_cbuffers_explicit_diagnostic_fallback", args, 4000,
                 [](const invoke_result_t& ir, std::string& reason) {
                     if (!ir.success) {
                         reason = "list_bound_cbuffers failed text=" + compact_text(ir.text, 300);
@@ -10224,11 +10182,20 @@ namespace {
                     }
                     uint64_t count = 0;
                     if (!payload_u64_field(ir.data, "count", count) || count == 0) {
-                        reason = "no cbuffer captures available; DX fixture hook did not seed bounded cbuffer evidence";
+                        reason = "no explicit diagnostic cbuffer candidates available";
+                        return false;
+                    }
+                    std::string capture_source;
+                    if (!payload_string_field(ir.data, "capture_source", capture_source) ||
+                        lower_copy(capture_source).find("bounded") == std::string::npos) {
+                        reason = "cbuffer diagnostic fallback was not labeled as bounded data=" + compact_json(ir.data, 700);
                         return false;
                     }
                     return true;
                 }, passed, failed);
+        }
+        } else {
+            test_coverage_domains_1_8_fixture_fail(hf, tag, "dx_list_bound_cbuffers", "RE descriptor missing matrix_buffer_va: " + descriptor_reason, failed);
         }
 
         if (have_desc && desc.matrix_buffer_va != 0 && desc.matrix_count >= 4 && desc.matrix_stride != 0) {
@@ -10236,6 +10203,7 @@ namespace {
             bone_args["process_id"] = pid;
             bone_args["min_bones"] = 4;
             bone_args["max_bones"] = std::max<std::uint32_t>(desc.matrix_count, 4);
+            bone_args["allow_memory_fallback"] = false;
             bone_args["matrix_buffer_va"] = test_coverage_domains_1_8_hex_ptr(desc.matrix_buffer_va);
             test_coverage_domains_1_8_case(hf, tag, "dx_identify_bone_buffer", "identify_fixture_matrix_buffer", bone_args, 6000,
                 [](const invoke_result_t& ir, std::string& reason) {
@@ -10250,13 +10218,29 @@ namespace {
                         reason = "fixture matrix buffer was not identified data=" + compact_json(ir.data, 700);
                         return false;
                     }
+                    bool found = false;
+                    if (!payload_bool_field(ir.data, "found", found) || !found) {
+                        reason = "matrix-run candidate found flag missing or false data=" + compact_json(ir.data, 700);
+                        return false;
+                    }
+                    bool proven_skeleton = true;
+                    if (!payload_bool_field(ir.data, "proven_skeleton", proven_skeleton) || proven_skeleton) {
+                        reason = "matrix-run evidence was incorrectly reported as a proven skeleton data=" + compact_json(ir.data, 700);
+                        return false;
+                    }
+                    std::string semantics;
+                    if (!payload_string_field(ir.data, "finding_semantics", semantics) || semantics != "matrix_run_candidate_only") {
+                        reason = "matrix-run evidence semantics missing data=" + compact_json(ir.data, 700);
+                        return false;
+                    }
                     return true;
                 }, passed, failed);
 
             mcp_standalone::json matrix_args;
             matrix_args["process_id"] = pid;
             matrix_args["scan_cbuffers_only"] = true;
-            matrix_args["matrix_buffer_va"] = test_coverage_domains_1_8_hex_ptr(desc.matrix_buffer_va);
+            matrix_args["allow_memory_fallback"] = false;
+            matrix_args["matrix_buffer_va"] = test_coverage_domains_1_8_hex_ptr(desc.matrix_buffer_va + desc.matrix_stride);
             test_coverage_domains_1_8_case(hf, tag, "dx_find_view_matrix", "find_fixture_view_matrix", matrix_args, 6000,
                 [](const invoke_result_t& ir, std::string& reason) {
                     if (!ir.success) {
@@ -10266,6 +10250,11 @@ namespace {
                     uint64_t count = 0;
                     if (!payload_u64_field(ir.data, "count", count) || count == 0) {
                         reason = "view matrix count missing or zero data=" + compact_json(ir.data, 700);
+                        return false;
+                    }
+                    std::string semantics;
+                    if (!payload_string_field(ir.data, "finding_semantics", semantics) || semantics != "matrix_candidate_evidence_not_camera_object") {
+                        reason = "view-matrix evidence semantics missing data=" + compact_json(ir.data, 700);
                         return false;
                     }
                     return true;
@@ -10317,43 +10306,42 @@ namespace {
             args["process_id"] = pid;
             args["format"] = "rgba";
             args["output_path"] = render_path.path;
-            test_coverage_domains_1_8_case(hf, tag, "dx_dump_render_targets", "dump_render_targets_safe_fixture", args, 7000,
+            test_coverage_domains_1_8_case(hf, tag, "dx_dump_render_targets", "dump_render_targets_kernel_only_fail_closed", args, 7000,
                 [&render_path](const invoke_result_t& ir, std::string& reason) {
-                    if (!ir.success) {
-                        reason = "render target capture failed text=" + compact_text(ir.text, 360) + " data=" + compact_json(ir.data, 700);
+                    if (ir.success) {
+                        reason = "render target dump unexpectedly succeeded data=" + compact_json(ir.data, 700);
                         return false;
                     }
                     bool captured = false;
-                    uint64_t bytes = 0;
-                    if (!payload_bool_field(ir.data, "captured", captured) || !captured ||
-                        !payload_u64_field(ir.data, "bytes", bytes) || bytes == 0 ||
-                        !file_exists_narrow(render_path.path)) {
-                        reason = "capture result missing captured=true, bytes, or temp output file";
+                    std::string source;
+                    if (!payload_bool_field(ir.data, "captured", captured) || captured ||
+                        !payload_string_field(ir.data, "source", source) ||
+                        lower_copy(source) != "gpu_render_target_readback" ||
+                        file_exists_narrow(render_path.path)) {
+                        reason = "render target fail-closed payload missing captured=false/source or wrote fallback file data=" + compact_json(ir.data, 700);
                         return false;
                     }
                     return true;
                 }, passed, failed);
         }
 
-        if (!dx_present_hook_id.empty() || !dx_draw_hook_id.empty()) {
+        {
             mcp_standalone::json cleanup = test_coverage_domains_1_8_safe_args();
             cleanup["action"] = "remove";
             cleanup["process_id"] = pid;
-            test_coverage_domains_1_8_case(hf, tag, "dx_hook_manage", "remove_safe_fixture_hooks", cleanup, 5000,
+            test_coverage_domains_1_8_case(hf, tag, "dx_hook_manage", "remove_after_fail_closed_snapshot_hooks", cleanup, 5000,
                 [](const invoke_result_t& ir, std::string& reason) {
                     if (!ir.success) {
                         reason = "DX hook remove failed text=" + compact_text(ir.text, 300);
                         return false;
                     }
                     uint64_t removed = 0;
-                    if (!payload_u64_field(ir.data, "removed_count", removed) || removed == 0) {
-                        reason = "removed_count missing or zero";
+                    if (!payload_u64_field(ir.data, "removed_count", removed)) {
+                        reason = "removed_count missing";
                         return false;
                     }
                     return true;
                 }, passed, failed);
-        } else {
-            test_coverage_domains_1_8_fixture_fail(hf, tag, "dx_hook_manage", "DX hook install did not produce a hook_id for explicit remove", failed);
         }
 
         {
@@ -11629,10 +11617,10 @@ namespace {
         test_coverage_domains_1_8_schema(hf, tag, "dx_find_device_vtable", true, {{"api", false}, {"process_id", false}}, passed, failed);
         test_coverage_domains_1_8_schema(hf, tag, "dx_hook_manage", false, {{"action", true}, {"process_id", true}, {"confirm_unsafe", false}}, passed, failed);
         test_coverage_domains_1_8_schema(hf, tag, "dx_list_bound_cbuffers", true, {{"process_id", true}}, passed, failed);
-        test_coverage_domains_1_8_schema(hf, tag, "dx_identify_bone_buffer", true, {{"process_id", true}}, passed, failed);
+        test_coverage_domains_1_8_schema(hf, tag, "dx_identify_bone_buffer", true, {{"process_id", true}, {"allow_memory_fallback", false}}, passed, failed);
         test_coverage_domains_1_8_schema(hf, tag, "dx_map_resource_to_va", true, {{"resource_handle", true}, {"process_id", true}}, passed, failed);
         test_coverage_domains_1_8_schema(hf, tag, "dx_dump_render_targets", false, {{"process_id", true}, {"confirm_unsafe", false}}, passed, failed);
-        test_coverage_domains_1_8_schema(hf, tag, "dx_find_view_matrix", true, {{"process_id", true}}, passed, failed);
+        test_coverage_domains_1_8_schema(hf, tag, "dx_find_view_matrix", true, {{"process_id", true}, {"allow_memory_fallback", false}}, passed, failed);
         test_coverage_domains_1_8_schema(hf, tag, "vmt_read", true, {{"address", true}}, passed, failed);
         test_coverage_domains_1_8_schema(hf, tag, "vmt_hook_manage", false, {{"action", true}, {"confirm_unsafe", false}}, passed, failed);
         test_coverage_domains_1_8_schema(hf, tag, "vmt_copy", false, {{"object_va", true}, {"confirm_unsafe", false}}, passed, failed);
@@ -11647,7 +11635,7 @@ namespace {
         test_coverage_domains_1_8_schema(hf, tag, "encptr_emit_resolver", true, {{"chain", true}}, passed, failed);
         test_coverage_domains_1_8_schema(hf, tag, "encptr_verify_stable", true, {{"chain", true}}, passed, failed);
         test_coverage_domains_1_8_schema(hf, tag, "offsets_manage", false, {{"action", true}, {"confirm_unsafe", false}}, passed, failed);
-        test_coverage_domains_1_8_schema(hf, tag, "heap_track_manage", false, {{"action", true}, {"session_id", false}, {"confirm_unsafe", false}}, passed, failed);
+        test_coverage_domains_1_8_schema(hf, tag, "heap_track_manage", false, {{"action", true}, {"session_id", false}, {"backend", false}, {"alignment", false}, {"capture_callstack", false}, {"confirm_unsafe", false}}, passed, failed);
         test_coverage_domains_1_8_schema(hf, tag, "sigs_manage", false, {{"action", true}, {"confirm_unsafe", false}}, passed, failed);
         test_coverage_domains_1_8_schema(hf, tag, "struct_observe", false, {{"base_va", true}, {"confirm_unsafe", false}}, passed, failed);
         test_coverage_domains_1_8_schema(hf, tag, "struct_correlate", true, {{"field_addresses", true}}, passed, failed);

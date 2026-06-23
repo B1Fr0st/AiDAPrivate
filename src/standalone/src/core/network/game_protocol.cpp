@@ -15,11 +15,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <set>
 #include <sstream>
 #include <thread>
+#include <utility>
 
 namespace game_protocol {
 namespace {
@@ -345,6 +347,292 @@ void add_field(nlohmann::json& fields,
     f["sample_values"] = samples;
     f["evidence"] = evidence;
     fields.push_back(std::move(f));
+}
+
+double printable_ratio_range(const std::vector<std::uint8_t>& data, std::size_t off, std::size_t len)
+{
+    if (off >= data.size() || len == 0)
+        return 0.0;
+    const std::size_t end = (std::min)(data.size(), off + len);
+    std::size_t printable = 0;
+    for (std::size_t i = off; i < end; ++i)
+        if (is_printable(data[i]))
+            ++printable;
+    return static_cast<double>(printable) / static_cast<double>(end - off);
+}
+
+double entropy_range(const std::vector<std::uint8_t>& data, std::size_t off, std::size_t len)
+{
+    if (off >= data.size() || len == 0)
+        return 0.0;
+    const std::size_t n = (std::min)(len, data.size() - off);
+    return shannon_entropy(data.data() + off, n);
+}
+
+void add_boundary(std::set<std::size_t>& boundaries, std::size_t offset, std::size_t limit)
+{
+    if (offset <= limit)
+        boundaries.insert(offset);
+}
+
+std::string segment_kind(double entropy, double printable, std::size_t size)
+{
+    if (size == 0)
+        return "empty";
+    if (printable >= 0.85 && entropy < 6.2)
+        return "text_or_identifier";
+    if (entropy >= 7.1)
+        return "compressed_or_encrypted_blob";
+    if (entropy >= 5.8)
+        return "high_entropy_binary";
+    if (printable <= 0.20 && entropy <= 2.4)
+        return "low_entropy_control_or_padding";
+    return "structured_binary";
+}
+
+nlohmann::json boundary_segments(const std::vector<std::uint8_t>& payload, std::size_t limit)
+{
+    nlohmann::json segments = nlohmann::json::array();
+    if (limit == 0)
+        return segments;
+
+    std::set<std::size_t> boundaries;
+    add_boundary(boundaries, 0, limit);
+    add_boundary(boundaries, limit, limit);
+
+    for (std::size_t i = 0; i < limit; ) {
+        const bool printable = is_printable(payload[i]);
+        std::size_t j = i + 1;
+        while (j < limit && is_printable(payload[j]) == printable && j - i < 1024)
+            ++j;
+        if (j - i >= 4) {
+            add_boundary(boundaries, i, limit);
+            add_boundary(boundaries, j, limit);
+        }
+        i = j;
+    }
+
+    for (std::size_t i = 0; i < limit; ) {
+        if (payload[i] != 0x00 && payload[i] != 0xff) {
+            ++i;
+            continue;
+        }
+        const std::uint8_t value = payload[i];
+        std::size_t j = i + 1;
+        while (j < limit && payload[j] == value)
+            ++j;
+        if (j - i >= 4) {
+            add_boundary(boundaries, i, limit);
+            add_boundary(boundaries, j, limit);
+        }
+        i = j;
+    }
+
+    for (std::size_t i = 0; i + 2 <= limit; ++i) {
+        const std::uint8_t len8 = payload[i];
+        if (len8 >= 3 && len8 <= 240 && i + 1 + len8 <= limit) {
+            const double body_printable = printable_ratio_range(payload, i + 1, len8);
+            const double body_entropy = entropy_range(payload, i + 1, len8);
+            if (body_printable >= 0.65 || body_entropy >= 4.0 || len8 >= 8) {
+                add_boundary(boundaries, i, limit);
+                add_boundary(boundaries, i + 1, limit);
+                add_boundary(boundaries, i + 1 + len8, limit);
+            }
+        }
+        if (i + 4 <= limit) {
+            const std::uint16_t l16le = le16(payload.data() + i);
+            const std::uint16_t l16be = be16(payload.data() + i);
+            for (const auto len : {l16le, l16be}) {
+                if (len >= 4 && len <= 4096 && i + 2 + len <= limit) {
+                    add_boundary(boundaries, i, limit);
+                    add_boundary(boundaries, i + 2, limit);
+                    add_boundary(boundaries, i + 2 + len, limit);
+                }
+            }
+        }
+    }
+
+    if (limit >= 32) {
+        const std::size_t window = limit >= 128 ? 32 : 16;
+        double previous = entropy_range(payload, 0, window);
+        for (std::size_t i = window; i + window <= limit; i += window) {
+            const double current = entropy_range(payload, i, window);
+            if (std::fabs(current - previous) >= 1.15)
+                add_boundary(boundaries, i, limit);
+            previous = current;
+        }
+    }
+
+    std::size_t last = *boundaries.begin();
+    for (auto it = std::next(boundaries.begin()); it != boundaries.end() && segments.size() < 96; ++it) {
+        const std::size_t off = last;
+        const std::size_t end = *it;
+        last = end;
+        if (end <= off)
+            continue;
+        const std::size_t size = end - off;
+        if (size == 1 && segments.size() > 0)
+            continue;
+        const double ent = entropy_range(payload, off, size);
+        const double printable = printable_ratio_range(payload, off, size);
+        nlohmann::json evidence = nlohmann::json::array();
+        if (printable >= 0.85)
+            evidence.push_back("printable_boundary_run");
+        if (ent >= 5.8)
+            evidence.push_back("entropy_window_boundary");
+        if (printable <= 0.20 && ent <= 2.4)
+            evidence.push_back("low_entropy_control_boundary");
+        nlohmann::json s;
+        s["offset"] = off;
+        s["size"] = size;
+        s["entropy"] = ent;
+        s["printable_ratio"] = printable;
+        s["classification"] = segment_kind(ent, printable, size);
+        s["evidence"] = std::move(evidence);
+        segments.push_back(std::move(s));
+    }
+    return segments;
+}
+
+bool near_boundary(const std::set<std::size_t>& boundaries, std::size_t offset, std::size_t radius)
+{
+    if (boundaries.empty())
+        return false;
+    auto it = boundaries.lower_bound(offset);
+    if (it != boundaries.end() && (*it >= offset ? *it - offset : offset - *it) <= radius)
+        return true;
+    if (it != boundaries.begin()) {
+        --it;
+        if (offset >= *it && offset - *it <= radius)
+            return true;
+    }
+    return false;
+}
+
+std::string record_cell_kind(const std::vector<std::uint8_t>& payload, std::size_t off)
+{
+    if (off + 4 > payload.size())
+        return "short";
+    bool all_zero = true;
+    bool all_ff = true;
+    bool all_printable = true;
+    for (std::size_t i = 0; i < 4; ++i) {
+        all_zero = all_zero && payload[off + i] == 0;
+        all_ff = all_ff && payload[off + i] == 0xff;
+        all_printable = all_printable && is_printable(payload[off + i]);
+    }
+    if (all_zero)
+        return "zero";
+    if (all_ff)
+        return "ff";
+    if (all_printable)
+        return "ascii4";
+    float f = 0.0f;
+    std::memcpy(&f, payload.data() + off, sizeof(f));
+    if (std::isfinite(f) && std::fabs(f) > 0.00001f && std::fabs(f) < 1000000.0f)
+        return "float32";
+    const std::uint32_t u = le32(payload.data() + off);
+    if (u < 0x01000000u)
+        return "small_u32";
+    if (u < 0x80000000u)
+        return "u32";
+    return "bytes4";
+}
+
+nlohmann::json repeated_entity_candidates(const std::vector<std::uint8_t>& payload, std::size_t limit)
+{
+    nlohmann::json candidates = nlohmann::json::array();
+    struct candidate_t {
+        std::size_t stride = 0;
+        std::size_t rows = 0;
+        double confidence = 0.0;
+        std::uint32_t similar_rows = 0;
+        std::uint32_t stable_columns = 0;
+        std::uint32_t typed_columns = 0;
+        nlohmann::json evidence;
+    };
+    std::vector<candidate_t> found;
+    for (std::size_t stride : {std::size_t(8), std::size_t(12), std::size_t(16), std::size_t(20), std::size_t(24), std::size_t(28), std::size_t(32), std::size_t(40), std::size_t(48), std::size_t(64), std::size_t(96)}) {
+        if (limit < stride * 3)
+            continue;
+        const std::size_t rows = (std::min)(limit / stride, std::size_t(64));
+        std::uint32_t similar_rows = 0;
+        std::uint32_t stable_columns = 0;
+        std::uint32_t typed_columns = 0;
+        for (std::size_t off = 0; off + 4 <= stride; off += 4) {
+            const auto first_kind = record_cell_kind(payload, off);
+            bool stable = true;
+            bool typed = first_kind == "float32" || first_kind == "small_u32" || first_kind == "u32" || first_kind == "ascii4" || first_kind == "zero";
+            for (std::size_t row = 1; row < rows; ++row) {
+                const std::size_t cell = row * stride + off;
+                if (cell + 4 > limit) {
+                    stable = false;
+                    break;
+                }
+                const auto kind = record_cell_kind(payload, cell);
+                if (kind != first_kind)
+                    stable = false;
+                if (kind == "float32" || kind == "small_u32" || kind == "u32" || kind == "ascii4" || kind == "zero")
+                    typed = true;
+            }
+            if (stable)
+                ++stable_columns;
+            if (typed)
+                ++typed_columns;
+        }
+        for (std::size_t row = 1; row < rows; ++row) {
+            std::uint32_t matching_cells = 0;
+            std::uint32_t compared_cells = 0;
+            for (std::size_t off = 0; off + 4 <= stride; off += 4) {
+                const std::size_t prev = (row - 1) * stride + off;
+                const std::size_t cur = row * stride + off;
+                if (cur + 4 > limit || prev + 4 > limit)
+                    continue;
+                ++compared_cells;
+                if (record_cell_kind(payload, prev) == record_cell_kind(payload, cur))
+                    ++matching_cells;
+            }
+            if (compared_cells != 0 && matching_cells * 100 >= compared_cells * 55)
+                ++similar_rows;
+        }
+        const double row_score = rows > 1 ? static_cast<double>(similar_rows) / static_cast<double>(rows - 1) : 0.0;
+        const double column_score = stride >= 4 ? static_cast<double>(stable_columns + typed_columns) / static_cast<double>((stride / 4) * 2) : 0.0;
+        const double confidence = (std::min)(0.92, 0.22 + row_score * 0.42 + column_score * 0.36);
+        if (confidence < 0.54 || similar_rows < 2 || typed_columns < 2)
+            continue;
+        candidate_t c;
+        c.stride = stride;
+        c.rows = rows;
+        c.confidence = confidence;
+        c.similar_rows = similar_rows;
+        c.stable_columns = stable_columns;
+        c.typed_columns = typed_columns;
+        c.evidence = nlohmann::json::array({
+            "row_type_similarity=" + std::to_string(similar_rows),
+            "stable_columns=" + std::to_string(stable_columns),
+            "typed_columns=" + std::to_string(typed_columns)
+        });
+        found.push_back(std::move(c));
+    }
+    std::sort(found.begin(), found.end(), [](const candidate_t& a, const candidate_t& b) {
+        if (a.confidence != b.confidence)
+            return a.confidence > b.confidence;
+        return a.stride < b.stride;
+    });
+    for (const auto& c : found) {
+        if (candidates.size() >= 6)
+            break;
+        candidates.push_back({
+            {"stride", c.stride},
+            {"rows_observed", c.rows},
+            {"confidence", c.confidence},
+            {"similar_rows", c.similar_rows},
+            {"stable_columns", c.stable_columns},
+            {"typed_columns", c.typed_columns},
+            {"evidence", c.evidence}
+        });
+    }
+    return candidates;
 }
 
 } 
@@ -780,8 +1068,10 @@ nlohmann::json decode_payload_heuristic(const std::vector<std::uint8_t>& payload
     nlohmann::json out;
     out["payload_size"] = payload.size();
     out["context_hint"] = context_hint;
-    out["entropy"] = shannon_entropy(payload.data(), payload.size());
-    out["printable_ratio"] = printable_ratio(payload);
+    const double payload_entropy = shannon_entropy(payload.data(), payload.size());
+    const double payload_printable = printable_ratio(payload);
+    out["entropy"] = payload_entropy;
+    out["printable_ratio"] = payload_printable;
     out["fields"] = nlohmann::json::array();
     out["evidence"] = nlohmann::json::array();
 
@@ -796,6 +1086,119 @@ nlohmann::json decode_payload_heuristic(const std::vector<std::uint8_t>& payload
 
     const std::size_t limit = (std::min)(payload.size(), std::size_t(8192));
     nlohmann::json& fields = out["fields"];
+    out["segments"] = boundary_segments(payload, limit);
+    out["segment_count"] = out["segments"].size();
+    if (out["segment_count"].get<std::size_t>() > 1)
+        out["evidence"].push_back("entropy_and_transition_boundaries_identified");
+
+    std::set<std::size_t> segment_boundaries;
+    nlohmann::json boundary_offsets = nlohmann::json::array();
+    if (out["segments"].is_array()) {
+        for (const auto& segment : out["segments"]) {
+            if (!segment.is_object())
+                continue;
+            const std::size_t off = segment.value("offset", 0u);
+            const std::size_t size = segment.value("size", 0u);
+            if (off <= limit)
+                segment_boundaries.insert(off);
+            if (off + size <= limit)
+                segment_boundaries.insert(off + size);
+        }
+    }
+    for (auto boundary : segment_boundaries) {
+        if (boundary_offsets.size() >= 64)
+            break;
+        boundary_offsets.push_back(boundary);
+    }
+    out["boundary_offsets"] = std::move(boundary_offsets);
+
+    if (out["segments"].is_array()) {
+        for (const auto& segment : out["segments"]) {
+            if (fields.size() >= 48)
+                break;
+            if (!segment.is_object())
+                continue;
+            const std::size_t off = segment.value("offset", 0u);
+            const std::size_t size = segment.value("size", 0u);
+            if (size < 4 || off >= payload.size())
+                continue;
+            const std::size_t capped = (std::min)(size, payload.size() - off);
+            const std::string kind = segment.value("classification", std::string("structured_binary"));
+            const double ent = segment.value("entropy", 0.0);
+            if (kind == "compressed_or_encrypted_blob" || kind == "high_entropy_binary" || kind == "structured_binary") {
+                nlohmann::json ev = nlohmann::json::array({"boundary_segment", "segment_entropy=" + std::to_string(ent)});
+                if (segment.contains("evidence") && segment["evidence"].is_array()) {
+                    for (const auto& item : segment["evidence"])
+                        ev.push_back(item);
+                }
+                add_field(fields, off, capped, kind, kind == "structured_binary" ? 0.44 : 0.5,
+                          nlohmann::json::array({bytes_to_hex(payload.data() + off, capped, 32)}),
+                          ev);
+            }
+        }
+    }
+
+    std::set<std::string> boundary_scalar_keys;
+    std::size_t boundary_scalar_count = 0;
+    for (auto boundary : segment_boundaries) {
+        if (fields.size() >= 56)
+            break;
+        const std::size_t begin = boundary > 2 ? boundary - 2 : 0;
+        const std::size_t end = (std::min)(limit, boundary + 3);
+        for (std::size_t i = begin; i < end && fields.size() < 56; ++i) {
+            const double local_entropy = entropy_range(payload, i > 8 ? i - 8 : 0, (std::min)(std::size_t(24), limit - (i > 8 ? i - 8 : 0)));
+            if (i + 1 <= limit) {
+                const std::uint8_t v = payload[i];
+                if ((v <= 0x20 || v >= 0x80) && v != 0xff) {
+                    const std::string key = std::to_string(i) + ":1:u8";
+                    if (boundary_scalar_keys.insert(key).second) {
+                        add_field(fields, i, 1, "u8_boundary_control_candidate", 0.36,
+                                  nlohmann::json::array({v}),
+                                  nlohmann::json::array({"near_local_boundary", "local_entropy=" + std::to_string(local_entropy)}));
+                        ++boundary_scalar_count;
+                    }
+                }
+            }
+            if (i + 2 <= limit) {
+                const std::uint16_t le = le16(payload.data() + i);
+                const std::uint16_t be = be16(payload.data() + i);
+                for (const auto tagged : {std::pair<const char*, std::uint16_t>{"le", le}, std::pair<const char*, std::uint16_t>{"be", be}}) {
+                    if (tagged.second == 0 || tagged.second > limit)
+                        continue;
+                    const bool possible_length = i + 2 + tagged.second <= limit;
+                    const bool compact_counter = tagged.second < 4096;
+                    if (!possible_length && !compact_counter)
+                        continue;
+                    const std::string key = std::to_string(i) + ":2:u16:" + tagged.first;
+                    if (!boundary_scalar_keys.insert(key).second)
+                        continue;
+                    nlohmann::json ev = nlohmann::json::array({"near_local_boundary", "local_entropy=" + std::to_string(local_entropy), std::string("endian=") + tagged.first});
+                    if (possible_length)
+                        ev.push_back("length_reaches_valid_boundary");
+                    add_field(fields, i, 2, std::string("u16_") + tagged.first + "_boundary_scalar", possible_length ? 0.53 : 0.42,
+                              nlohmann::json::array({tagged.second}), ev);
+                    ++boundary_scalar_count;
+                }
+            }
+            if (i + 4 <= limit) {
+                const std::uint32_t u = le32(payload.data() + i);
+                if (u != 0 && u != 0xffffffffu && u < 0x40000000u) {
+                    const std::string key = std::to_string(i) + ":4:u32le";
+                    if (boundary_scalar_keys.insert(key).second) {
+                        double conf = u < 1000000u ? 0.43 : 0.34;
+                        if (near_boundary(segment_boundaries, i, 1))
+                            conf += 0.05;
+                        add_field(fields, i, 4, "uint32_le_boundary_candidate", (std::min)(0.58, conf),
+                                  nlohmann::json::array({u}),
+                                  nlohmann::json::array({"near_local_boundary", "local_entropy=" + std::to_string(local_entropy)}));
+                        ++boundary_scalar_count;
+                    }
+                }
+            }
+        }
+    }
+    if (boundary_scalar_count != 0)
+        out["evidence"].push_back("boundary_scalar_candidates=" + std::to_string(boundary_scalar_count));
 
     auto proto_fields = protobuf_codec::decode(payload.data(), limit);
     if (!proto_fields.empty()) {
@@ -891,9 +1294,16 @@ nlohmann::json decode_payload_heuristic(const std::vector<std::uint8_t>& payload
         std::uint32_t u = le32(payload.data() + i);
         float f = 0.0f;
         std::memcpy(&f, payload.data() + i, sizeof(f));
+        const bool boundary_hint = near_boundary(segment_boundaries, i, 4);
+        const std::size_t ent_start = i > 8 ? i - 8 : 0;
+        const double local_entropy = entropy_range(payload, ent_start, (std::min)(std::size_t(24), limit - ent_start));
         if (std::isfinite(f) && std::fabs(f) > 0.00001f && std::fabs(f) < 1000000.0f) {
             double conf = 0.34;
-            nlohmann::json ev = nlohmann::json::array({"finite_ieee754_le"});
+            nlohmann::json ev = nlohmann::json::array({"finite_ieee754_le", "local_entropy=" + std::to_string(local_entropy)});
+            if (boundary_hint) {
+                conf += 0.05;
+                ev.push_back("near_local_boundary");
+            }
             if (context_hint == "position" || context_hint == "entity_update") {
                 if (i + 12 <= limit) {
                     float f2 = 0.0f;
@@ -911,35 +1321,31 @@ nlohmann::json decode_payload_heuristic(const std::vector<std::uint8_t>& payload
                       nlohmann::json::array({f}), ev);
         } else if (u != 0 && u != 0xffffffffu && u < 0x40000000u) {
             double conf = (u < 1000000u) ? 0.42 : 0.3;
+            nlohmann::json ev = nlohmann::json::array({"aligned_nonzero_integer", "local_entropy=" + std::to_string(local_entropy)});
+            if (boundary_hint) {
+                conf += 0.05;
+                ev.push_back("near_local_boundary");
+            }
             add_field(fields, i, 4, "uint32_le_candidate", conf,
                       nlohmann::json::array({u}),
-                      nlohmann::json::array({"aligned_nonzero_integer"}));
+                      ev);
         }
     }
 
-    for (std::size_t stride : {std::size_t(8), std::size_t(12), std::size_t(16), std::size_t(24), std::size_t(32), std::size_t(48), std::size_t(64)}) {
-        if (limit < stride * 3)
-            continue;
-        std::uint32_t similar = 0;
-        const std::size_t rows = limit / stride;
-        for (std::size_t row = 1; row < rows && row < 32; ++row) {
-            std::uint32_t small_delta = 0;
-            for (std::size_t off = 0; off + 4 <= stride; off += 4) {
-                const std::uint32_t a = le32(payload.data() + off);
-                const std::uint32_t b = le32(payload.data() + row * stride + off);
-                if ((a == 0 && b == 0) || (a != 0 && b != 0 && std::llabs(static_cast<long long>(a) - static_cast<long long>(b)) < 1000000))
-                    ++small_delta;
+    out["repeated_entities"] = repeated_entity_candidates(payload, limit);
+    out["repeated_entity_count"] = out["repeated_entities"].size();
+    if (!out["repeated_entities"].empty()) {
+        out["evidence"].push_back("repeated_entity_stride_candidates_identified");
+        const auto& best = out["repeated_entities"].front();
+        out["repeated_record_candidate"] = best;
+        if (best.is_object()) {
+            const std::size_t stride = best.value("stride", 0u);
+            const std::size_t rows = best.value("rows_observed", 0u);
+            if (stride >= 4 && rows >= 2) {
+                add_field(fields, 0, (std::min)(stride, limit), "repeated_entity_record", best.value("confidence", 0.0),
+                          nlohmann::json::array({"stride=" + std::to_string(stride), "rows=" + std::to_string(rows)}),
+                          best.value("evidence", nlohmann::json::array()));
             }
-            if (small_delta >= 2)
-                ++similar;
-        }
-        if (similar >= 2) {
-            out["repeated_record_candidate"] = {
-                {"stride", stride},
-                {"rows_observed", rows},
-                {"confidence", (std::min)(0.7, 0.36 + 0.04 * static_cast<double>(similar))}
-            };
-            break;
         }
     }
 

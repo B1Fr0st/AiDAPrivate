@@ -1037,76 +1037,375 @@ static const char* tab_short_names[] = {
     "Up", "Brw", "Rpt", "HL"
 };
 
+static const sub_tab_t k_monitor_tabs[] = {
+    sub_tab_t::connections,
+    sub_tab_t::capture,
+    sub_tab_t::dns,
+    sub_tab_t::filters,
+    sub_tab_t::bandwidth,
+    sub_tab_t::keylog,
+    sub_tab_t::pcap_export
+};
 
-static void render_tab_bar(state_t& state, float x, float y, float w, float alpha,
+static const sub_tab_t k_proxy_tabs[] = {
+    sub_tab_t::proxy,
+    sub_tab_t::intercept,
+    sub_tab_t::repeater,
+    sub_tab_t::logger,
+    sub_tab_t::scope,
+    sub_tab_t::cookies,
+    sub_tab_t::upstream
+};
+
+static const sub_tab_t k_web_tabs[] = {
+    sub_tab_t::browser,
+    sub_tab_t::headless,
+    sub_tab_t::sitemap,
+    sub_tab_t::recon,
+    sub_tab_t::scanner,
+    sub_tab_t::reports,
+    sub_tab_t::csp
+};
+
+static const sub_tab_t k_api_tabs[] = {
+    sub_tab_t::api
+};
+
+static const sub_tab_t k_attack_tabs[] = {
+    sub_tab_t::intruder,
+    sub_tab_t::fuzzer,
+    sub_tab_t::jwt,
+    sub_tab_t::mr,
+    sub_tab_t::session,
+    sub_tab_t::collab,
+    sub_tab_t::sequencer,
+    sub_tab_t::comparer
+};
+
+static const sub_tab_t k_protocol_tabs[] = {
+    sub_tab_t::websocket,
+    sub_tab_t::ws_edit,
+    sub_tab_t::h2_edit,
+    sub_tab_t::decoder
+};
+
+static const sub_tab_t k_automation_tabs[] = {
+    sub_tab_t::scripting
+};
+
+struct nav_group_t {
+    const char* label;
+    const char* short_label;
+    const char* status;
+    const sub_tab_t* tabs;
+    int tab_count;
+};
+
+static const nav_group_t k_nav_groups[] = {
+    { "Monitor", "Mon", "Driver capture and packet evidence", k_monitor_tabs, static_cast<int>(sizeof(k_monitor_tabs) / sizeof(k_monitor_tabs[0])) },
+    { "Proxy", "Proxy", "MITM, intercept, replay, logs, and scope", k_proxy_tabs, static_cast<int>(sizeof(k_proxy_tabs) / sizeof(k_proxy_tabs[0])) },
+    { "Web", "Web", "Camoufox-only browser automation and web scans", k_web_tabs, static_cast<int>(sizeof(k_web_tabs) / sizeof(k_web_tabs[0])) },
+    { "API", "API", "API request workbench", k_api_tabs, static_cast<int>(sizeof(k_api_tabs) / sizeof(k_api_tabs[0])) },
+    { "Attack", "Attack", "Fuzzing, sessions, tokens, and comparison tools", k_attack_tabs, static_cast<int>(sizeof(k_attack_tabs) / sizeof(k_attack_tabs[0])) },
+    { "Protocol", "Proto", "WebSocket, HTTP/2, and decoding tools", k_protocol_tabs, static_cast<int>(sizeof(k_protocol_tabs) / sizeof(k_protocol_tabs[0])) },
+    { "Automation", "Auto", "Network scripting and workflow automation", k_automation_tabs, static_cast<int>(sizeof(k_automation_tabs) / sizeof(k_automation_tabs[0])) }
+};
+
+static int nav_group_count() {
+    return static_cast<int>(sizeof(k_nav_groups) / sizeof(k_nav_groups[0]));
+}
+
+static int nav_group_for_tab(sub_tab_t tab) {
+    for (int g = 0; g < nav_group_count(); ++g) {
+        const nav_group_t& group = k_nav_groups[g];
+        for (int i = 0; i < group.tab_count; ++i) {
+            if (group.tabs[i] == tab) return g;
+        }
+    }
+    return 0;
+}
+
+static int tab_index_in_group(const nav_group_t& group, sub_tab_t tab) {
+    for (int i = 0; i < group.tab_count; ++i) {
+        if (group.tabs[i] == tab) return i;
+    }
+    return 0;
+}
+
+static bool tab_requires_target(sub_tab_t tab) {
+    switch (tab) {
+        case sub_tab_t::connections:
+        case sub_tab_t::capture:
+        case sub_tab_t::dns:
+        case sub_tab_t::filters:
+        case sub_tab_t::bandwidth:
+        case sub_tab_t::keylog:
+        case sub_tab_t::pcap_export:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static float estimate_chip_w(const char* label, float pad) {
+    return ImGui::CalcTextSize(label ? label : "").x + pad;
+}
+
+static bool same_line_if_fits(float next_w, float spacing = 8.f) {
+    if (ImGui::GetContentRegionAvail().x >= next_w + spacing) {
+        ImGui::SameLine(0.f, spacing);
+        return true;
+    }
+    return false;
+}
+
+static void clipped_text(const char* text, ImU32 color, float max_w = 0.f) {
+    const char* safe = text ? text : "";
+    bool clipped = max_w > 0.f && ImGui::CalcTextSize(safe).x > max_w;
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(color));
+    ImGui::TextUnformatted(safe);
+    ImGui::PopStyleColor();
+    if (ImGui::IsItemHovered() && clipped) {
+        ImGui::BeginTooltip();
+        ImGui::TextUnformatted(safe);
+        ImGui::EndTooltip();
+    }
+}
+
+static void table_text(const std::string& text, ImU32 color) {
+    clipped_text(text.c_str(), color, ImGui::GetContentRegionAvail().x);
+}
+
+static void table_text(const char* text, ImU32 color) {
+    clipped_text(text ? text : "", color, ImGui::GetContentRegionAvail().x);
+}
+
+static std::string payload_display_text(const std::vector<uint8_t>& bytes, size_t cap = 262144) {
+    std::string out;
+    size_t n = std::min(bytes.size(), cap);
+    out.reserve(n + 64);
+    for (size_t i = 0; i < n; ++i) {
+        uint8_t b = bytes[i];
+        if (b == '\r' || b == '\n' || b == '\t' || (b >= 32 && b < 127))
+            out.push_back(static_cast<char>(b));
+        else
+            out.push_back('.');
+    }
+    if (bytes.size() > n) {
+        out += "\n[truncated ";
+        out += std::to_string(bytes.size() - n);
+        out += " bytes]";
+    }
+    return out;
+}
+
+static void render_payload_box(const char* id, const char* title, const std::string& meta,
+                               const std::string& text, ImVec2 size,
+                               const aida::ui::theme_t& th, float alpha) {
+    ImGui::BeginChild(id, size, true, ImGuiWindowFlags_HorizontalScrollbar);
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)));
+    ImGui::TextUnformatted(title ? title : "");
+    ImGui::PopStyleColor();
+    if (!meta.empty()) {
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)));
+        ImGui::TextUnformatted(meta.c_str());
+        ImGui::PopStyleColor();
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Copy")) {
+        ImGui::SetClipboardText(text.c_str());
+    }
+    ImGui::Separator();
+    ImFont* code_font = aida::ui::fonts::code();
+    bool pushed = false;
+    if (code_font) {
+        ImGui::PushFont(code_font);
+        pushed = true;
+    }
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_primary, alpha)));
+    ImGui::TextUnformatted(text.empty() ? "(empty)" : text.c_str());
+    ImGui::PopStyleColor();
+    if (pushed)
+        ImGui::PopFont();
+    ImGui::EndChild();
+}
+
+static float render_no_target_banner(float x, float y, float w, float alpha) {
+    const auto& th = aida::ui::resolved();
+    ImVec2 wp = ImGui::GetWindowPos();
+    ImVec2 a(wp.x + x, wp.y + y);
+    ImVec2 b(wp.x + x + w, wp.y + y + 34.f);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(a, b, aida::ui::with_alpha(th.warning_soft, alpha * 2.4f), 6.f);
+    dl->AddRect(a, b, aida::ui::with_alpha(th.warning, alpha * 0.55f), 6.f, 0, 1.f);
+    dl->PushClipRect(a, b, true);
+    dl->AddText(ImVec2(a.x + 10.f, a.y + 8.f), aida::ui::with_alpha(th.warning, alpha), "No target attached");
+    const char* msg = w < 620.f
+        ? "Driver capture disabled; web, proxy, API, protocol, and Camoufox prep remain available."
+        : "Driver capture and native process diagnostics are disabled; web, proxy, API, protocol, and Camoufox prep tools remain available.";
+    dl->AddText(ImVec2(a.x + 140.f, a.y + 8.f), aida::ui::with_alpha(th.text_secondary, alpha), msg);
+    dl->PopClipRect();
+    return 40.f;
+}
+
+static float render_tab_bar(state_t& state, float x, float y, float w, float alpha,
                             float ar, float ag, float ab, float dt) {
     const auto& th = aida::ui::resolved();
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 origin = ImGui::GetWindowPos();
 
-    float tab_h = 32.f;
-    int count = static_cast<int>(sub_tab_t::COUNT);
+    const float primary_h = 32.f;
+    const float secondary_h = 30.f;
+    const float gap_h = 4.f;
+    const float nav_h = primary_h + secondary_h + gap_h;
+    const int group_count = nav_group_count();
+    const int active_group_idx = nav_group_for_tab(state.active_tab);
+    const nav_group_t& active_group = k_nav_groups[active_group_idx];
 
-    float clip_x0 = origin.x + x;
-    float clip_x1 = origin.x + x + w;
-    float clip_y0 = origin.y + y;
-    float clip_y1 = origin.y + y + tab_h;
+    float nav_x0 = origin.x + x;
+    float nav_x1 = origin.x + x + w;
+    float nav_y0 = origin.y + y;
+    float nav_y1 = origin.y + y + primary_h;
+    float second_y0 = nav_y1 + gap_h;
+    float second_y1 = second_y0 + secondary_h;
 
-    ui_anim::render_gradient_header(dl, clip_x0, clip_y0, w, tab_h, ar, ag, ab, alpha * 0.65f);
-    dl->AddRectFilled(ImVec2(clip_x0, clip_y0), ImVec2(clip_x1, clip_y1),
+    ui_anim::render_gradient_header(dl, nav_x0, nav_y0, w, primary_h, ar, ag, ab, alpha * 0.65f);
+    dl->AddRectFilled(ImVec2(nav_x0, nav_y0), ImVec2(nav_x1, nav_y1),
                       aida::ui::with_alpha(th.panel_header, alpha * 0.55f));
 
-    float total_full_w = 0.f;
-    float total_short_w = 0.f;
-    for (int i = 0; i < count; i++) {
-        total_full_w += ImGui::CalcTextSize(tab_names[i]).x + 22.f + 2.f;
-        total_short_w += ImGui::CalcTextSize(tab_short_names[i]).x + 18.f + 2.f;
+    float primary_total = 0.f;
+    float primary_full[16] = {};
+    float primary_short[16] = {};
+    for (int i = 0; i < group_count; ++i) {
+        primary_full[i] = std::max(64.f, ImGui::CalcTextSize(k_nav_groups[i].label).x + 26.f);
+        primary_short[i] = std::max(44.f, ImGui::CalcTextSize(k_nav_groups[i].short_label).x + 20.f);
+        primary_total += primary_full[i];
     }
-    bool use_short = (w < total_full_w) && (w + 24.f >= total_short_w * 0.6f);
+    const bool primary_equal = primary_total > w;
+    const bool primary_short_labels = primary_equal || w < 720.f;
+    float gx = nav_x0;
+    static aida::ui::hover_state_t s_group_hover[16];
+    static aida::ui::press_state_t s_group_press[16];
+    for (int i = 0; i < group_count; ++i) {
+        float gw = primary_equal ? w / static_cast<float>(group_count)
+                                 : primary_full[i];
+        if (i == group_count - 1)
+            gw = nav_x1 - gx;
+        bool active = i == active_group_idx;
+        ImVec2 a(gx, nav_y0 + 3.f);
+        ImVec2 b(gx + gw - 2.f, nav_y1 - 3.f);
+        ImGui::SetCursorScreenPos(a);
+        ImGui::PushID(0x4E475250 + i);
+        ImGui::InvisibleButton("##network_group", ImVec2(std::max(1.f, b.x - a.x), std::max(1.f, b.y - a.y)));
+        bool hovered = ImGui::IsItemHovered();
+        bool pressed = hovered && ImGui::IsMouseDown(ImGuiMouseButton_Left);
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+            sub_tab_t next_tab = k_nav_groups[i].tabs[0];
+            if (state.active_tab != next_tab) {
+                state.prev_tab = state.active_tab;
+                state.content_fade = 0.f;
+            }
+            state.active_tab = next_tab;
+        }
+        ImGui::PopID();
 
-    static bool s_logged_net_short = false;
-    if (use_short && !s_logged_net_short) {
-        s_logged_net_short = true;
-        ::diag::log_tagged_fmt("responsive",
-            "network_view tabs short_labels w=%.0f full=%.0f short=%.0f",
-            w, total_full_w, total_short_w);
-    } else if (!use_short && s_logged_net_short) {
-        s_logged_net_short = false;
+        float hv = s_group_hover[i].tick(hovered, dt, aida::motion::spring::balanced);
+        float pv = s_group_press[i].tick(pressed, dt);
+        if (active) {
+            dl->AddRectFilled(a, b, aida::ui::with_alpha(th.selection, alpha), 7.f);
+            dl->AddRect(a, b, aida::ui::with_alpha(th.accent_u32, alpha * 0.55f), 7.f, 0, 1.f);
+        } else if (hv > 0.001f) {
+            dl->AddRectFilled(a, b, aida::ui::with_alpha(th.hover_wash, alpha * hv), 7.f);
+        }
+        const char* label = primary_short_labels ? k_nav_groups[i].short_label : k_nav_groups[i].label;
+        ImVec2 ts = ImGui::CalcTextSize(label);
+        ImU32 text_col = active
+            ? aida::ui::with_alpha(th.text_primary, alpha)
+            : aida::ui::with_alpha(th.text_secondary, alpha * (0.70f + 0.25f * hv));
+        ImVec2 ta(a.x + std::max(8.f, (gw - ts.x) * 0.5f), a.y + (b.y - a.y - ts.y) * 0.5f - pv * 0.5f);
+        dl->PushClipRect(a, b, true);
+        dl->AddText(ta, text_col, label);
+        dl->PopClipRect();
+        if (hovered) {
+            ImGui::BeginTooltip();
+            ImGui::TextUnformatted(k_nav_groups[i].label);
+            ImGui::TextUnformatted(k_nav_groups[i].status);
+            ImGui::EndTooltip();
+        }
+        gx += gw;
     }
 
+    if (w >= 760.f) {
+        const char* status = active_group.status;
+        ImVec2 ss = ImGui::CalcTextSize(status);
+        float sx = nav_x1 - ss.x - 12.f;
+        if (sx > nav_x0 + primary_total + 16.f) {
+            dl->AddText(ImVec2(sx, nav_y0 + (primary_h - ss.y) * 0.5f),
+                        aida::ui::with_alpha(th.text_dim, alpha), status);
+        }
+    }
+    dl->AddLine(ImVec2(nav_x0, nav_y1), ImVec2(nav_x1, nav_y1),
+                aida::ui::with_alpha(th.border_subtle, alpha));
+
+    dl->AddRectFilled(ImVec2(nav_x0, second_y0), ImVec2(nav_x1, second_y1),
+                      aida::ui::with_alpha(th.panel_bg, alpha * 0.55f));
+
+    const int count = active_group.tab_count;
     float total_w = 0.f;
     float tab_widths[static_cast<int>(sub_tab_t::COUNT)];
     float tab_offsets[static_cast<int>(sub_tab_t::COUNT)];
     for (int i = 0; i < count; i++) {
-        const char* lbl = use_short ? tab_short_names[i] : tab_names[i];
-        tab_widths[i] = ImGui::CalcTextSize(lbl).x + (use_short ? 18.f : 22.f);
+        int tab_idx = static_cast<int>(active_group.tabs[i]);
+        const char* full = tab_names[tab_idx];
+        const char* short_name = tab_short_names[tab_idx];
+        bool use_short_preview = (w < 520.f);
+        const char* lbl = use_short_preview ? short_name : full;
+        tab_widths[i] = ImGui::CalcTextSize(lbl).x + (use_short_preview ? 18.f : 22.f);
         tab_offsets[i] = total_w;
         total_w += tab_widths[i] + 2.f;
     }
 
-    if (ImGui::IsMouseHoveringRect(ImVec2(clip_x0, clip_y0), ImVec2(clip_x1, clip_y1), false)) {
+    float view_x0 = nav_x0;
+    float view_x1 = nav_x1;
+    if (total_w > w) {
+        view_x0 += 28.f;
+        view_x1 -= 28.f;
+    }
+    float view_w = std::max(1.f, view_x1 - view_x0);
+
+    static int s_last_group_idx = -1;
+    if (s_last_group_idx != active_group_idx) {
+        state.tab_scroll_x = 0.f;
+        state.tab_target_scroll_x = 0.f;
+        state.tab_last_ensured = -1;
+        s_last_group_idx = active_group_idx;
+    }
+
+    if (ImGui::IsMouseHoveringRect(ImVec2(view_x0, second_y0), ImVec2(view_x1, second_y1), false)) {
         float wheel = ImGui::GetIO().MouseWheel;
         if (wheel != 0.f)
             state.tab_target_scroll_x -= wheel * 60.f;
     }
 
-    float max_scroll = std::max(0.f, total_w - w);
+    float max_scroll = std::max(0.f, total_w - view_w);
     state.tab_target_scroll_x = std::clamp(state.tab_target_scroll_x, 0.f, max_scroll);
     state.tab_scroll_x = ui_anim::smooth_lerp(state.tab_scroll_x, state.tab_target_scroll_x, 14.f, dt);
 
-    int active_idx = static_cast<int>(state.active_tab);
-    if (state.tab_last_ensured != active_idx) {
+    int active_idx = tab_index_in_group(active_group, state.active_tab);
+    int active_tab_int = static_cast<int>(state.active_tab);
+    if (state.tab_last_ensured != active_tab_int) {
         float active_left = tab_offsets[active_idx] - state.tab_scroll_x;
         float active_right = active_left + tab_widths[active_idx];
         if (active_left < 0.f)
             state.tab_target_scroll_x = tab_offsets[active_idx];
-        else if (active_right > w)
-            state.tab_target_scroll_x = tab_offsets[active_idx] + tab_widths[active_idx] - w;
+        else if (active_right > view_w)
+            state.tab_target_scroll_x = tab_offsets[active_idx] + tab_widths[active_idx] - view_w;
         state.tab_target_scroll_x = std::clamp(state.tab_target_scroll_x, 0.f, max_scroll);
-        state.tab_last_ensured = active_idx;
+        state.tab_last_ensured = active_tab_int;
     }
 
-    float target_ux = clip_x0 + tab_offsets[active_idx] - state.tab_scroll_x + 6.f;
+    float target_ux = view_x0 + tab_offsets[active_idx] - state.tab_scroll_x + 6.f;
     float target_uw = tab_widths[active_idx] - 12.f;
     if (state.underline_w < 0.1f) {
         state.underline_x = target_ux;
@@ -1115,34 +1414,35 @@ static void render_tab_bar(state_t& state, float x, float y, float w, float alph
     state.underline_x = ui_anim::spring_interp(state.underline_x, target_ux, state.underline_vel, 280.f, 22.f, dt);
     state.underline_w = ui_anim::smooth_lerp(state.underline_w, target_uw, 16.f, dt);
 
-    ImGui::PushClipRect(ImVec2(clip_x0, clip_y0), ImVec2(clip_x1, clip_y1), true);
+    ImGui::PushClipRect(ImVec2(view_x0, second_y0), ImVec2(view_x1, second_y1), true);
 
     static aida::ui::hover_state_t s_tab_hover[static_cast<int>(sub_tab_t::COUNT)];
     static aida::ui::press_state_t s_tab_press[static_cast<int>(sub_tab_t::COUNT)];
 
     for (int i = 0; i < count; i++) {
-        float bx0 = clip_x0 + tab_offsets[i] - state.tab_scroll_x;
+        int tab_idx = static_cast<int>(active_group.tabs[i]);
+        float bx0 = view_x0 + tab_offsets[i] - state.tab_scroll_x;
         float bx1 = bx0 + tab_widths[i];
-        float by0 = clip_y0;
-        float by1 = clip_y0 + tab_h;
-        bool is_active = (i == active_idx);
+        float by0 = second_y0;
+        float by1 = second_y1;
+        bool is_active = active_group.tabs[i] == state.active_tab;
 
         ImVec2 mouse = ImGui::GetMousePos();
         bool hovered = (mouse.x >= bx0 && mouse.x < bx1 && mouse.y >= by0 && mouse.y < by1);
         bool pressed = hovered && ImGui::IsMouseDown(ImGuiMouseButton_Left);
         if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-            if (state.active_tab != static_cast<sub_tab_t>(i)) {
+            if (state.active_tab != active_group.tabs[i]) {
                 state.prev_tab = state.active_tab;
                 state.content_fade = 0.f;
             }
-            state.active_tab = static_cast<sub_tab_t>(i);
+            state.active_tab = active_group.tabs[i];
         }
 
-        float hov_v = s_tab_hover[i].tick(hovered, dt, aida::motion::spring::balanced);
-        float prs_v = s_tab_press[i].tick(pressed, dt);
+        float hov_v = s_tab_hover[tab_idx].tick(hovered, dt, aida::motion::spring::balanced);
+        float prs_v = s_tab_press[tab_idx].tick(pressed, dt);
         float scale = 1.f - (1.f - 0.96f) * prs_v;
         float pad_x = (1.f - scale) * tab_widths[i] * 0.5f;
-        float pad_y = (1.f - scale) * tab_h * 0.5f;
+        float pad_y = (1.f - scale) * secondary_h * 0.5f;
 
         if (is_active) {
             ImU32 fill_top = aida::ui::with_alpha(th.accent_grad_top, 0.22f * alpha);
@@ -1158,12 +1458,13 @@ static void render_tab_bar(state_t& state, float x, float y, float w, float alph
                 aida::ui::with_alpha(th.hover_wash, hov_v * alpha), 8.f);
         }
 
-        const char* draw_label = use_short ? tab_short_names[i] : tab_names[i];
+        bool use_short = (w < 520.f);
+        const char* draw_label = use_short ? tab_short_names[tab_idx] : tab_names[tab_idx];
         ImVec2 ts = ImGui::CalcTextSize(draw_label);
         ImU32 text_col = is_active
             ? aida::ui::with_alpha(th.text_primary, alpha)
             : aida::ui::with_alpha(th.text_secondary, alpha * (0.65f + 0.30f * hov_v));
-        dl->AddText(ImVec2(bx0 + (tab_widths[i] - ts.x) * 0.5f, by0 + (tab_h - ts.y) * 0.5f - prs_v * 0.5f),
+        dl->AddText(ImVec2(bx0 + (tab_widths[i] - ts.x) * 0.5f, by0 + (secondary_h - ts.y) * 0.5f - prs_v * 0.5f),
             text_col, draw_label);
 
         if (use_short && hovered) {
@@ -1171,7 +1472,7 @@ static void render_tab_bar(state_t& state, float x, float y, float w, float alph
             ImGui::PushStyleColor(ImGuiCol_PopupBg, ImGui::ColorConvertU32ToFloat4(th.bg_overlay));
             if (ImGui::BeginTooltip()) {
                 ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(th.text_primary));
-                ImGui::TextUnformatted(tab_names[i]);
+                ImGui::TextUnformatted(tab_names[tab_idx]);
                 ImGui::PopStyleColor();
                 ImGui::EndTooltip();
             }
@@ -1181,13 +1482,13 @@ static void render_tab_bar(state_t& state, float x, float y, float w, float alph
     }
 
     ui_anim::render_tab_underline_glow(dl, state.underline_x, state.underline_w,
-        clip_y1 - 3.f, alpha);
+        second_y1 - 3.f, alpha);
 
     ImGui::PopClipRect();
 
     if (state.tab_scroll_x > 1.f) {
         dl->AddRectFilledMultiColor(
-            ImVec2(clip_x0, clip_y0), ImVec2(clip_x0 + 30.f, clip_y1),
+            ImVec2(view_x0, second_y0), ImVec2(view_x0 + 30.f, second_y1),
             aida::ui::with_alpha(th.bg_base, alpha * 0.94f),
             aida::ui::with_alpha(th.bg_base, 0.f),
             aida::ui::with_alpha(th.bg_base, 0.f),
@@ -1195,17 +1496,41 @@ static void render_tab_bar(state_t& state, float x, float y, float w, float alph
     }
     if (state.tab_scroll_x < max_scroll - 1.f) {
         dl->AddRectFilledMultiColor(
-            ImVec2(clip_x1 - 30.f, clip_y0), ImVec2(clip_x1, clip_y1),
+            ImVec2(view_x1 - 30.f, second_y0), ImVec2(view_x1, second_y1),
             aida::ui::with_alpha(th.bg_base, 0.f),
             aida::ui::with_alpha(th.bg_base, alpha * 0.94f),
             aida::ui::with_alpha(th.bg_base, alpha * 0.94f),
             aida::ui::with_alpha(th.bg_base, 0.f));
     }
 
+    if (max_scroll > 1.f) {
+        ImGui::SetCursorScreenPos(ImVec2(nav_x0 + 2.f, second_y0 + 2.f));
+        ImGui::PushID("net_tabs_left");
+        ImGui::BeginDisabled(state.tab_target_scroll_x <= 1.f);
+        if (ImGui::InvisibleButton("##left", ImVec2(22.f, secondary_h - 4.f)))
+            state.tab_target_scroll_x = std::max(0.f, state.tab_target_scroll_x - view_w * 0.6f);
+        ImGui::EndDisabled();
+        ImGui::PopID();
+        dl->AddText(ImVec2(nav_x0 + 10.f, second_y0 + 7.f),
+                    aida::ui::with_alpha(state.tab_target_scroll_x <= 1.f ? th.text_dim : th.text_secondary, alpha), "<");
+
+        ImGui::SetCursorScreenPos(ImVec2(nav_x1 - 24.f, second_y0 + 2.f));
+        ImGui::PushID("net_tabs_right");
+        ImGui::BeginDisabled(state.tab_target_scroll_x >= max_scroll - 1.f);
+        if (ImGui::InvisibleButton("##right", ImVec2(22.f, secondary_h - 4.f)))
+            state.tab_target_scroll_x = std::min(max_scroll, state.tab_target_scroll_x + view_w * 0.6f);
+        ImGui::EndDisabled();
+        ImGui::PopID();
+        dl->AddText(ImVec2(nav_x1 - 16.f, second_y0 + 7.f),
+                    aida::ui::with_alpha(state.tab_target_scroll_x >= max_scroll - 1.f ? th.text_dim : th.text_secondary, alpha), ">");
+    }
+
     dl->AddLine(
-        ImVec2(origin.x + x, origin.y + y + tab_h),
-        ImVec2(origin.x + x + w, origin.y + y + tab_h),
+        ImVec2(origin.x + x, second_y1),
+        ImVec2(origin.x + x + w, second_y1),
         aida::ui::with_alpha(th.border_subtle, alpha));
+
+    return nav_h;
 }
 
 
@@ -2199,26 +2524,26 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
 
     bool running = mitm_proxy::is_running();
 
-
+    ImGui::PushID("proxy_toolbar");
     if (!running) {
         ImGui::AlignTextToFramePadding();
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
                            "Bind:");
-        ImGui::SameLine();
+        same_line_if_fits(140.f);
         aida::ui::input_text("##proxy_addr", state.proxy_bind_addr, sizeof(state.proxy_bind_addr),
-                              "127.0.0.1", false, ImVec2(140.f, 28.f));
-        ImGui::SameLine();
+                              "127.0.0.1", false, ImVec2(std::min(180.f, std::max(128.f, w * 0.22f)), 28.f));
+        same_line_if_fits(56.f);
         ImGui::AlignTextToFramePadding();
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
                            "Port:");
-        ImGui::SameLine();
+        same_line_if_fits(82.f);
         aida::ui::input_int("##proxy_port", &state.proxy_port, ImVec2(80.f, 28.f));
-        ImGui::SameLine();
+        same_line_if_fits(96.f);
         aida::ui::toggle_switch("##proxy_tls", &state.proxy_decode_tls);
-        ImGui::SameLine();
+        same_line_if_fits(72.f);
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
                            "TLS MITM");
-        ImGui::SameLine();
+        same_line_if_fits(110.f);
 
         if (aida::ui::button("Start Proxy", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm)) {
             mitm_proxy::proxy_config cfg;
@@ -2246,10 +2571,10 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
         proxy_chart_tick(stats.total_requests);
 
         char run_buf[64];
-        snprintf(run_buf, sizeof(run_buf), "PROXY RUNNING  -  %s:%d", state.proxy_bind_addr, state.proxy_port);
+        snprintf(run_buf, sizeof(run_buf), "Proxy running  %s:%d", state.proxy_bind_addr, state.proxy_port);
         aida::ui::pill_kind(run_buf, aida::ui::pill_kind_t::success, aida::ui::size_t_::sm, true);
 
-        ImGui::SameLine();
+        same_line_if_fits(112.f);
         ImDrawList* dl_top = ImGui::GetWindowDrawList();
         ImVec2 sp_pos = ImGui::GetCursorScreenPos();
         float sp_w = 96.f, sp_h = 22.f;
@@ -2264,20 +2589,21 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
                                    ordered, proxy_history_chart_t::N, spark_line, spark_fill);
         ImGui::Dummy(ImVec2(sp_w + 8.f, sp_h + 6.f));
 
-        ImGui::SameLine();
-        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
-            "%llu req  -  %u active  -  In: %s  -  Out: %s",
+        char stats_buf[192];
+        snprintf(stats_buf, sizeof(stats_buf), "%llu req  %u active  In %s  Out %s",
             static_cast<unsigned long long>(stats.total_requests),
             stats.active_connections,
             format_bytes(stats.total_bytes_in).c_str(),
             format_bytes(stats.total_bytes_out).c_str());
+        same_line_if_fits(estimate_chip_w(stats_buf, 10.f));
+        clipped_text(stats_buf, aida::ui::with_alpha(th.text_dim, alpha), ImGui::GetContentRegionAvail().x);
 
-        ImGui::SameLine();
+        same_line_if_fits(64.f);
         if (aida::ui::button("Stop", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
             diag::log_tagged("network", "proxy_stop_clicked");
             mitm_proxy::stop();
         }
-        ImGui::SameLine();
+        same_line_if_fits(112.f);
         if (aida::ui::button("Clear History", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
             size_t prev = mitm_proxy::history_count();
             mitm_proxy::clear_history();
@@ -2285,9 +2611,10 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
         }
     }
 
-    ImGui::SameLine();
+    same_line_if_fits(230.f);
     aida::ui::input_text("##proxy_filter", state.proxy_filter_text, sizeof(state.proxy_filter_text),
                           "Filter requests...", false, ImVec2(220.f, 28.f));
+    ImGui::PopID();
 
 
     ImGui::Spacing();
@@ -2308,25 +2635,35 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
         }
     }
 
-    aida::ui::pill_kind("Interception readiness", aida::ui::pill_kind_t::info, aida::ui::size_t_::sm, false);
-    ImGui::SameLine();
+    bool first_pill = true;
+    auto readiness_pill = [&](const char* label, aida::ui::pill_kind_t kind) {
+        if (!first_pill)
+            same_line_if_fits(estimate_chip_w(label, 24.f));
+        aida::ui::pill_kind(label, kind, aida::ui::size_t_::sm, false);
+        first_pill = false;
+    };
+    readiness_pill("Interception readiness", aida::ui::pill_kind_t::info);
     aida::ui::pill_kind(mitm_proxy::is_running() ? "Proxy running" : "Proxy stopped",
         mitm_proxy::is_running() ? aida::ui::pill_kind_t::success : aida::ui::pill_kind_t::warning,
         aida::ui::size_t_::sm, false);
-    ImGui::SameLine();
+    same_line_if_fits(estimate_chip_w(ca_installed ? "AiDA CA trusted" : "AiDA CA not trusted", 24.f));
     aida::ui::pill_kind(ca_installed ? "AiDA CA trusted" : "AiDA CA not trusted",
         ca_installed ? aida::ui::pill_kind_t::success : aida::ui::pill_kind_t::warning,
         aida::ui::size_t_::sm, false);
-    ImGui::SameLine();
+    same_line_if_fits(estimate_chip_w(controlled_browser_running ? "Controlled active" : "Controlled ready", 24.f));
     aida::ui::pill_kind(controlled_browser_running ? "Controlled active" : "Controlled ready",
         controlled_browser_running ? aida::ui::pill_kind_t::success : aida::ui::pill_kind_t::neutral,
         aida::ui::size_t_::sm, false);
-    ImGui::SameLine();
+    same_line_if_fits(estimate_chip_w("Camoufox only", 24.f));
+    aida::ui::pill_kind("Camoufox only", aida::ui::pill_kind_t::success, aida::ui::size_t_::sm, false);
+    same_line_if_fits(estimate_chip_w("WebRTC blocked", 24.f));
+    aida::ui::pill_kind("WebRTC blocked", aida::ui::pill_kind_t::success, aida::ui::size_t_::sm, false);
+    same_line_if_fits(estimate_chip_w("QUIC disabled", 24.f));
     aida::ui::pill_kind("QUIC disabled", aida::ui::pill_kind_t::info, aida::ui::size_t_::sm, false);
     if (!spki_prefix.empty()) {
-        ImGui::SameLine();
         char spki_buf[64];
         snprintf(spki_buf, sizeof(spki_buf), "SPKI %s", spki_prefix.c_str());
+        same_line_if_fits(estimate_chip_w(spki_buf, 24.f));
         aida::ui::pill_kind(spki_buf, aida::ui::pill_kind_t::neutral, aida::ui::size_t_::sm, false);
     }
     ImGui::Spacing();
@@ -2334,7 +2671,7 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
         state.prev_tab = state.active_tab;
         state.active_tab = sub_tab_t::browser;
     }
-    ImGui::SameLine();
+    same_line_if_fits(92.f);
     if (aida::ui::button("Repair trust", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
         bool ok = cert_generator::initialize();
         if (ok && cert_generator::is_ready()) {
@@ -2343,7 +2680,7 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
         toast_notification::push(ok ? "AiDA CA trust repaired." : "AiDA CA trust repair failed.",
             ok ? toast_notification::toast_type_t::success : toast_notification::toast_type_t::error);
     }
-    ImGui::SameLine();
+    same_line_if_fits(154.f);
     if (aida::ui::button("Open Camoufox controls", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
         state.prev_tab = state.active_tab;
         state.active_tab = sub_tab_t::browser;
@@ -2351,11 +2688,11 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
     }
     if (cert_pin_bypass::is_bypass_active()) {
         auto active_bypasses = cert_pin_bypass::get_active_bypasses();
-        ImGui::SameLine();
         char legacy_buf[96];
         snprintf(legacy_buf, sizeof(legacy_buf), "Legacy cleanup  -  %zu patches", active_bypasses.size());
+        same_line_if_fits(estimate_chip_w(legacy_buf, 24.f));
         aida::ui::pill_kind(legacy_buf, aida::ui::pill_kind_t::warning, aida::ui::size_t_::sm, false);
-        ImGui::SameLine();
+        same_line_if_fits(142.f);
         if (aida::ui::button("Revert legacy patches", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
             diag::log_tagged_fmt("network", "cert_pin_revert_clicked patches=%zu",
                 active_bypasses.size());
@@ -2367,11 +2704,11 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
     ImGui::AlignTextToFramePadding();
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
         "Target PID:");
-    ImGui::SameLine();
+    same_line_if_fits(112.f);
     ImGui::SetNextItemWidth(110.f);
     ImGui::InputInt("##cert_diag_pid", &s_cert_diag_ui.target_pid, 1, 100, ImGuiInputTextFlags_CharsDecimal);
     if (s_cert_diag_ui.target_pid < 0) s_cert_diag_ui.target_pid = 0;
-    ImGui::SameLine();
+    same_line_if_fits(118.f);
     if (aida::ui::button("Diagnose target", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
         cert_intercept::diagnostic_context_t context;
         context.proxy_running = mitm_proxy::is_running();
@@ -2392,9 +2729,8 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
         }
     }
     if (!s_cert_diag_ui.status.empty()) {
-        ImGui::SameLine();
-        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
-            "%s", s_cert_diag_ui.status.c_str());
+        same_line_if_fits(std::min(360.f, ImGui::CalcTextSize(s_cert_diag_ui.status.c_str()).x + 8.f));
+        clipped_text(s_cert_diag_ui.status.c_str(), aida::ui::with_alpha(th.text_dim, alpha), ImGui::GetContentRegionAvail().x);
     }
     if (s_cert_diag_ui.has_report) {
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
@@ -2404,22 +2740,23 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
             if (shown++ >= 3) break;
             ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
                 "%s: %s", cert_intercept::to_string(finding.severity).c_str(), finding.title.c_str());
-            ImGui::SameLine();
-            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha * th.disabled_alpha)),
-                "%s", finding.next_action.c_str());
+            clipped_text(finding.next_action.c_str(), aida::ui::with_alpha(th.text_dim, alpha * th.disabled_alpha), ImGui::GetContentRegionAvail().x);
         }
         if (!s_cert_diag_ui.providers.empty()) {
             ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
                 "Providers:");
+            bool first_provider = true;
             for (const auto& provider : s_cert_diag_ui.providers) {
-                ImGui::SameLine();
                 char provider_buf[160];
                 snprintf(provider_buf, sizeof(provider_buf), "%s:%s",
                     provider.descriptor.provider_id.c_str(),
                     cert_intercept::to_string(provider.state).c_str());
+                if (!first_provider)
+                    same_line_if_fits(estimate_chip_w(provider_buf, 24.f));
                 aida::ui::pill_kind(provider_buf,
                     provider.state == cert_intercept::provider_state_t::available ? aida::ui::pill_kind_t::success : aida::ui::pill_kind_t::neutral,
                     aida::ui::size_t_::sm, false);
+                first_provider = false;
             }
         }
         bool can_handoff = s_cert_diag_ui.report.primary == cert_intercept::classification_t::true_pinning ||
@@ -2448,9 +2785,8 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
                 }
             }
             if (!s_cert_diag_ui.handoff_status.empty()) {
-                ImGui::SameLine();
-                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
-                    "%s", s_cert_diag_ui.handoff_status.c_str());
+                same_line_if_fits(std::min(360.f, ImGui::CalcTextSize(s_cert_diag_ui.handoff_status.c_str()).x + 8.f));
+                clipped_text(s_cert_diag_ui.handoff_status.c_str(), aida::ui::with_alpha(th.text_dim, alpha), ImGui::GetContentRegionAvail().x);
             }
         }
     }
@@ -2459,153 +2795,128 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 org = ImGui::GetWindowPos();
-    ImVec2 cursor = ImGui::GetCursorPos();
-    float row_h = 22.f;
-    const float text_oy = (row_h - ImGui::GetTextLineHeight()) * 0.5f;
-    float hdr_y = org.y + cursor.y;
-
-    float col_id = 50.f, col_method = 64.f, col_status = 60.f, col_lat = 64.f, col_size = 64.f, col_tls = 36.f;
-    float col_host = (w - col_id - col_method - col_status - col_lat - col_size - col_tls - 24.f) * 0.35f;
-    float col_path = w - col_id - col_method - col_host - col_status - col_lat - col_size - col_tls - 24.f;
-
-    dl->AddRectFilled(ImVec2(org.x, hdr_y), ImVec2(org.x + w, hdr_y + row_h),
-                      aida::ui::with_alpha(th.panel_header, alpha));
-    ui_anim::render_gradient_header(dl, org.x, hdr_y, w, row_h, ar, ag, ab, alpha * 0.30f);
-
-    float cx = org.x + 8.f;
-    ImU32 hdr_col = aida::ui::with_alpha(th.text_secondary, alpha);
-    dl->AddText(ImVec2(cx, hdr_y + text_oy), hdr_col, "#");       cx += col_id;
-    dl->AddText(ImVec2(cx, hdr_y + text_oy), hdr_col, "Method");  cx += col_method;
-    dl->AddText(ImVec2(cx, hdr_y + text_oy), hdr_col, "Host");    cx += col_host;
-    dl->AddText(ImVec2(cx, hdr_y + text_oy), hdr_col, "Path");    cx += col_path;
-    dl->AddText(ImVec2(cx, hdr_y + text_oy), hdr_col, "Status");  cx += col_status;
-    dl->AddText(ImVec2(cx, hdr_y + text_oy), hdr_col, "Time");    cx += col_lat;
-    dl->AddText(ImVec2(cx, hdr_y + text_oy), hdr_col, "Size");    cx += col_size;
-    dl->AddText(ImVec2(cx, hdr_y + text_oy), hdr_col, "TLS");
-
-    ImGui::SetCursorPosY(cursor.y + row_h + 4.f);
-    dl->AddLine(ImVec2(org.x, hdr_y + row_h - 1.f), ImVec2(org.x + w, hdr_y + row_h - 1.f),
-                aida::ui::with_alpha(th.border_subtle, alpha));
-
-    float split_y_proxy = (h - cursor.y - row_h - 12.f) * 0.6f;
-    float list_h = split_y_proxy;
-
-    ImGui::BeginChild("##proxy_list", ImVec2(w - 4.f, list_h), false, ImGuiWindowFlags_NoBackground);
-
+    float cursor_y = ImGui::GetCursorPosY();
+    float list_h = std::max(120.f, (h - cursor_y - 16.f) * 0.58f);
     auto history = mitm_proxy::get_history();
-    ImVec2 list_org = ImGui::GetWindowPos();
-    ImVec2 list_sz  = ImGui::GetWindowSize();
-    dl->PushClipRect(list_org, ImVec2(list_org.x + list_sz.x, list_org.y + list_sz.y), true);
 
     if (history.empty()) {
-        dl->PopClipRect();
-        ImGui::EndChild();
+        ImVec2 list_org = ImGui::GetCursorScreenPos();
         aida::ui::empty_state::config_t cfg;
         cfg.glyph = aida::ui::empty_state::glyph_t::network;
         cfg.title = running ? "Awaiting requests" : "Proxy idle";
         cfg.body  = running
             ? "Configure a client to use this proxy. Captured exchanges will appear here."
             : "Start the proxy to intercept and inspect HTTP/S traffic.";
-        aida::ui::empty_state::render(ImVec2(list_org.x, list_org.y), ImVec2(list_sz.x, list_h), cfg);
+        aida::ui::empty_state::render(list_org, ImVec2(w - 4.f, list_h), cfg);
         ImGui::Dummy(ImVec2(0.f, list_h));
         ImGui::EndChild();
         return;
     }
 
-    int proxy_visible_row = 0;
-    for (int i = 0; i < static_cast<int>(history.size()); i++) {
-        auto& ex = history[static_cast<size_t>(i)];
+    const ImGuiTableFlags table_flags =
+        ImGuiTableFlags_RowBg |
+        ImGuiTableFlags_BordersInnerH |
+        ImGuiTableFlags_ScrollY |
+        ImGuiTableFlags_Resizable |
+        ImGuiTableFlags_Reorderable |
+        ImGuiTableFlags_Hideable |
+        ImGuiTableFlags_SizingStretchProp;
 
-        if (state.proxy_filter_text[0]) {
-            std::string all = ex.target_host + " " + ex.request.method + " " + ex.request.uri;
-            if (!filter_text_match(state.proxy_filter_text, all)) continue;
-        }
+    int visible_rows = 0;
+    if (ImGui::BeginTable("##proxy_history_table", 8, table_flags, ImVec2(w - 4.f, list_h))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 54.f);
+        ImGui::TableSetupColumn("Method", ImGuiTableColumnFlags_WidthFixed, 72.f);
+        ImGui::TableSetupColumn("Host", ImGuiTableColumnFlags_WidthStretch, 0.75f);
+        ImGui::TableSetupColumn("Path", ImGuiTableColumnFlags_WidthStretch, 1.35f);
+        ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed, 70.f);
+        ImGui::TableSetupColumn("Time", ImGuiTableColumnFlags_WidthFixed, 76.f);
+        ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 76.f);
+        ImGui::TableSetupColumn("TLS", ImGuiTableColumnFlags_WidthFixed, 48.f);
+        ImGui::TableHeadersRow();
 
-        float row_alpha = 1.f;
-        float row_yoff = 0.f;
-        compute_row_entrance(s_proxy_rows, history.size(), row_alpha, row_yoff, i);
-        float r_alpha = alpha * row_alpha;
+        for (int i = 0; i < static_cast<int>(history.size()); i++) {
+            auto& ex = history[static_cast<size_t>(i)];
 
-        float ry = ImGui::GetCursorPosY();
-        float abs_ry = ImGui::GetCursorScreenPos().y - row_yoff;
-        ImVec2 mouse = ImGui::GetMousePos();
-        bool hovered = (mouse.x >= list_org.x && mouse.x < list_org.x + w &&
-                        mouse.y >= abs_ry && mouse.y < abs_ry + row_h);
-        bool selected = (state.proxy_selected == i);
-
-        if (proxy_visible_row & 1)
-            dl->AddRectFilled(ImVec2(list_org.x, abs_ry), ImVec2(list_org.x + w, abs_ry + row_h),
-                              aida::ui::with_alpha(th.hover_wash, r_alpha * 0.30f));
-
-        if (selected) {
-            dl->AddRectFilled(ImVec2(list_org.x, abs_ry), ImVec2(list_org.x + w, abs_ry + row_h),
-                              aida::ui::with_alpha(th.selection, r_alpha), 4.f);
-            dl->AddRectFilled(ImVec2(list_org.x, abs_ry), ImVec2(list_org.x + 3.f, abs_ry + row_h),
-                              aida::ui::with_alpha(th.accent_u32, r_alpha));
-        } else if (hovered) {
-            dl->AddRectFilled(ImVec2(list_org.x, abs_ry), ImVec2(list_org.x + w, abs_ry + row_h),
-                              aida::ui::with_alpha(th.hover_wash, r_alpha), 4.f);
-        }
-
-        if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
-            state.proxy_selected = i;
-
-        ImU32 txt_col = aida::ui::with_alpha(selected ? th.text_primary : th.text_secondary, r_alpha);
-        ImU32 dim_col = aida::ui::with_alpha(th.text_dim, r_alpha);
-        cx = list_org.x + 8.f;
-
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%llu", static_cast<unsigned long long>(ex.id));
-        dl->AddText(ImVec2(cx, abs_ry + text_oy), dim_col, buf);
-        cx += col_id;
-
-        ImU32 method_col = ui_anim::http_method_color(ex.request.method.c_str(), r_alpha);
-        dl->AddText(ImVec2(cx, abs_ry + text_oy), method_col, ex.request.method.c_str()); cx += col_method;
-
-        dl->AddText(ImVec2(cx, abs_ry + text_oy), txt_col, ex.target_host.c_str()); cx += col_host;
-
-        std::string path = ex.request.uri;
-        if (path.size() > 50) path = path.substr(0, 47) + "...";
-        dl->AddText(ImVec2(cx, abs_ry + text_oy), txt_col, path.c_str()); cx += col_path;
-
-
-        if (ex.response.status_code > 0) {
-            ImU32 status_col = aida::ui::with_alpha(status_code_color(ex.response.status_code), r_alpha);
-            snprintf(buf, sizeof(buf), "%d", ex.response.status_code);
-            dl->AddText(ImVec2(cx, abs_ry + text_oy), status_col, buf);
-        } else {
-            const char* st = "...";
-            ImU32 st_col = dim_col;
-            if (ex.state == mitm_proxy::http_exchange::state_t::dropped) {
-                st = "DROP";
-                st_col = aida::ui::with_alpha(th.error, r_alpha);
-            } else if (ex.state == mitm_proxy::http_exchange::state_t::error) {
-                st = "ERR";
-                st_col = aida::ui::with_alpha(th.error, r_alpha);
+            if (state.proxy_filter_text[0]) {
+                std::string all = ex.target_host + " " + ex.request.method + " " + ex.request.uri;
+                if (!filter_text_match(state.proxy_filter_text, all)) continue;
             }
-            dl->AddText(ImVec2(cx, abs_ry + text_oy), st_col, st);
+
+            float row_alpha = 1.f;
+            float row_yoff = 0.f;
+            compute_row_entrance(s_proxy_rows, history.size(), row_alpha, row_yoff, i);
+            (void)row_yoff;
+            float r_alpha = alpha * row_alpha;
+            bool selected = (state.proxy_selected == i);
+            ImU32 txt_col = aida::ui::with_alpha(selected ? th.text_primary : th.text_secondary, r_alpha);
+            ImU32 dim_col = aida::ui::with_alpha(th.text_dim, r_alpha);
+
+            ImGui::TableNextRow(ImGuiTableRowFlags_None, 24.f);
+            ImGui::TableSetColumnIndex(0);
+            ImGui::PushID(i);
+            char buf[64];
+            snprintf(buf, sizeof(buf), "%llu", static_cast<unsigned long long>(ex.id));
+            if (ImGui::Selectable(buf, selected,
+                                  ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap,
+                                  ImVec2(0.f, 22.f))) {
+                state.proxy_selected = i;
+            }
+            ImGui::PopID();
+
+            ImGui::TableSetColumnIndex(1);
+            table_text(ex.request.method, ui_anim::http_method_color(ex.request.method.c_str(), r_alpha));
+
+            ImGui::TableSetColumnIndex(2);
+            table_text(ex.target_host, txt_col);
+
+            ImGui::TableSetColumnIndex(3);
+            table_text(ex.request.uri, txt_col);
+
+            ImGui::TableSetColumnIndex(4);
+            if (ex.response.status_code > 0) {
+                snprintf(buf, sizeof(buf), "%d", ex.response.status_code);
+                table_text(buf, aida::ui::with_alpha(status_code_color(ex.response.status_code), r_alpha));
+            } else {
+                const char* st = "...";
+                ImU32 st_col = dim_col;
+                if (ex.state == mitm_proxy::http_exchange::state_t::dropped) {
+                    st = "DROP";
+                    st_col = aida::ui::with_alpha(th.error, r_alpha);
+                } else if (ex.state == mitm_proxy::http_exchange::state_t::error) {
+                    st = "ERR";
+                    st_col = aida::ui::with_alpha(th.error, r_alpha);
+                }
+                table_text(st, st_col);
+            }
+
+            ImGui::TableSetColumnIndex(5);
+            snprintf(buf, sizeof(buf), "%llums", static_cast<unsigned long long>(ex.latency_ms));
+            table_text(buf, txt_col);
+
+            ImGui::TableSetColumnIndex(6);
+            table_text(format_bytes(ex.response_size), txt_col);
+
+            ImGui::TableSetColumnIndex(7);
+            table_text(ex.is_tls ? "TLS" : "-", ex.is_tls ? aida::ui::with_alpha(th.success, r_alpha)
+                                                          : dim_col);
+            ++visible_rows;
         }
-        cx += col_status;
-
-        snprintf(buf, sizeof(buf), "%llums", static_cast<unsigned long long>(ex.latency_ms));
-        dl->AddText(ImVec2(cx, abs_ry + text_oy), txt_col, buf); cx += col_lat;
-
-        dl->AddText(ImVec2(cx, abs_ry + text_oy), txt_col, format_bytes(ex.response_size).c_str()); cx += col_size;
-
-        dl->AddText(ImVec2(cx, abs_ry + text_oy),
-            ex.is_tls ? aida::ui::with_alpha(th.success, r_alpha)
-                      : aida::ui::with_alpha(th.text_dim, r_alpha),
-            ex.is_tls ? "TLS" : "-");
-
-        proxy_visible_row++;
-        ImGui::SetCursorPosY(ry + row_h);
+        ImGui::EndTable();
     }
-    dl->PopClipRect();
 
-    ImGui::EndChild();
+    if (visible_rows == 0) {
+        ImVec2 empty_pos = ImGui::GetCursorScreenPos();
+        aida::ui::empty_state::config_t cfg;
+        cfg.glyph = aida::ui::empty_state::glyph_t::network;
+        cfg.title = "No matching requests";
+        cfg.body = "Clear or adjust the proxy filter to show captured exchanges.";
+        aida::ui::empty_state::render(empty_pos, ImVec2(w - 4.f, 80.f), cfg);
+        ImGui::Dummy(ImVec2(0.f, 80.f));
+    }
 
 
-    float detail_h = h - cursor.y - row_h - list_h - 20.f;
+    float detail_h = h - ImGui::GetCursorPosY() - 8.f;
     if (detail_h > 30.f && state.proxy_selected >= 0 && state.proxy_selected < static_cast<int>(history.size())) {
         dl->AddLine(ImVec2(org.x + 2.f, org.y + ImGui::GetCursorPosY()),
                     ImVec2(org.x + w - 2.f, org.y + ImGui::GetCursorPosY()),
@@ -2617,57 +2928,19 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
         ImU32 method_col = ui_anim::http_method_color(ex.request.method.c_str(), alpha);
 
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(method_col), "%s", ex.request.method.c_str());
-        ImGui::SameLine();
+        same_line_if_fits(std::min(520.f, ImGui::CalcTextSize(ex.request.uri.c_str()).x + 8.f));
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_primary, alpha)),
                             "%s", ex.request.uri.c_str());
 
-        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
-            "Host: %s:%u  -  %s  -  %llu ms",
+        char meta_buf[256];
+        snprintf(meta_buf, sizeof(meta_buf), "%s:%u  %s  %llums  req=%s  resp=%s",
             ex.target_host.c_str(), ex.target_port,
             ex.is_tls ? "TLS" : "Plain",
-            static_cast<unsigned long long>(ex.latency_ms));
+            static_cast<unsigned long long>(ex.latency_ms),
+            format_bytes(ex.raw_request.size()).c_str(),
+            format_bytes(ex.response_size).c_str());
+        clipped_text(meta_buf, aida::ui::with_alpha(th.text_secondary, alpha), ImGui::GetContentRegionAvail().x);
 
-        ImGui::Spacing();
-
-        if (!ex.request.headers.empty()) {
-            char hdr_label[64];
-            snprintf(hdr_label, sizeof(hdr_label), "Request Headers (%zu)", ex.request.headers.size());
-            if (ImGui::CollapsingHeader(hdr_label, ImGuiTreeNodeFlags_DefaultOpen)) {
-                for (auto& hd : ex.request.headers) {
-                    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.syn_keyword, alpha)),
-                                        "  %s", hd.name.c_str());
-                    ImGui::SameLine();
-                    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_primary, alpha)),
-                                        ": %s", hd.value.c_str());
-                }
-            }
-        }
-
-
-        if (ex.response.status_code > 0) {
-            char rsp_label[96];
-            ImU32 status_col = aida::ui::with_alpha(status_code_color(ex.response.status_code), alpha);
-            snprintf(rsp_label, sizeof(rsp_label), "Response %d %s  (%zu headers)",
-                     ex.response.status_code, ex.response.reason.c_str(), ex.response.headers.size());
-            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(status_col), "%s", rsp_label);
-
-            if (!ex.response.headers.empty()) {
-                char rh_label[64];
-                snprintf(rh_label, sizeof(rh_label), "Response Headers (%zu)", ex.response.headers.size());
-                if (ImGui::CollapsingHeader(rh_label, ImGuiTreeNodeFlags_DefaultOpen)) {
-                    for (auto& hd : ex.response.headers) {
-                        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.syn_keyword, alpha)),
-                                            "  %s", hd.name.c_str());
-                        ImGui::SameLine();
-                        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_primary, alpha)),
-                                            ": %s", hd.value.c_str());
-                    }
-                }
-            }
-        }
-
-
-        ImGui::Spacing();
         if (aida::ui::button("Send to Repeater", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
             auto rep = std::make_shared<repeater_entry_t>();
             rep->host = ex.target_host;
@@ -2679,6 +2952,43 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
                 ex.is_tls ? 1 : 0, rep->raw_request.size());
             state.repeater_entries.push_back(std::move(rep));
             state.repeater_selected = static_cast<int>(state.repeater_entries.size()) - 1;
+        }
+        same_line_if_fits(96.f);
+        if (aida::ui::button("Copy URL", aida::ui::button_kind_t::ghost, aida::ui::size_t_::sm)) {
+            std::string url = std::string(ex.is_tls ? "https://" : "http://") + ex.target_host + ex.request.uri;
+            ImGui::SetClipboardText(url.c_str());
+        }
+
+        ImGui::Spacing();
+        std::string request_text = payload_display_text(ex.raw_request);
+        std::string response_text = payload_display_text(ex.raw_response);
+        char req_meta[96];
+        snprintf(req_meta, sizeof(req_meta), "%zu headers  %s",
+            ex.request.headers.size(), format_bytes(ex.raw_request.size()).c_str());
+        char resp_meta[128];
+        if (ex.response.status_code > 0) {
+            snprintf(resp_meta, sizeof(resp_meta), "%d %s  %zu headers  %s",
+                ex.response.status_code,
+                ex.response.reason.c_str(),
+                ex.response.headers.size(),
+                format_bytes(ex.raw_response.size()).c_str());
+        } else {
+            snprintf(resp_meta, sizeof(resp_meta), "pending  %s", format_bytes(ex.raw_response.size()).c_str());
+        }
+        float pane_h = std::max(80.f, detail_h - ImGui::GetCursorPosY() - 6.f);
+        if (w >= 900.f) {
+            float pane_w = (w - 16.f) * 0.5f;
+            render_payload_box("##proxy_request_payload", "Request", req_meta, request_text,
+                               ImVec2(pane_w, pane_h), th, alpha);
+            ImGui::SameLine();
+            render_payload_box("##proxy_response_payload", "Response", resp_meta, response_text,
+                               ImVec2(pane_w, pane_h), th, alpha);
+        } else {
+            float each_h = std::max(72.f, (pane_h - 6.f) * 0.5f);
+            render_payload_box("##proxy_request_payload", "Request", req_meta, request_text,
+                               ImVec2(w - 8.f, each_h), th, alpha);
+            render_payload_box("##proxy_response_payload", "Response", resp_meta, response_text,
+                               ImVec2(w - 8.f, each_h), th, alpha);
         }
 
         ImGui::EndChild();
@@ -3089,11 +3399,21 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
             auto rep_ptr = state.repeater_entries[static_cast<size_t>(state.repeater_selected)];
             auto& rep = *rep_ptr;
 
+            const bool stack_editors = w < 760.f;
             float half_w = (w - 8.f) * 0.5f;
             float panel_h = h - ImGui::GetCursorPosY() - 40.f;
+            if (panel_h < 160.f) panel_h = 160.f;
+            float req_w = stack_editors ? std::max(120.f, w - 4.f) : half_w;
+            float resp_w = req_w;
+            float req_h = panel_h;
+            float resp_h = panel_h;
+            if (stack_editors) {
+                req_h = std::max(124.f, (panel_h - 8.f) * 0.5f);
+                resp_h = std::max(124.f, panel_h - req_h - 8.f);
+            }
 
 
-            ImGui::BeginChild("##rep_req", ImVec2(half_w, panel_h), false, ImGuiWindowFlags_NoBackground);
+            ImGui::BeginChild("##rep_req", ImVec2(req_w, req_h), false, ImGuiWindowFlags_NoBackground);
             ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.accent_u32, alpha)),
                                "Request");
 
@@ -3110,7 +3430,7 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
                 req_buf_dirty = false;
             }
             if (ImGui::InputTextMultiline("##rep_req_edit", req_buf, sizeof(req_buf),
-                ImVec2(half_w - 4.f, panel_h - 78.f))) {
+                ImVec2(req_w - 4.f, std::max(72.f, req_h - 78.f)))) {
                 rep.raw_request = req_buf;
                 req_buf_dirty = true;
             }
@@ -3164,10 +3484,14 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
 
             ImGui::EndChild();
 
-            ImGui::SameLine();
+            if (stack_editors) {
+                ImGui::Dummy(ImVec2(0.f, 8.f));
+            } else {
+                ImGui::SameLine();
+            }
 
 
-            ImGui::BeginChild("##rep_resp", ImVec2(half_w, panel_h), false, ImGuiWindowFlags_NoBackground);
+            ImGui::BeginChild("##rep_resp", ImVec2(resp_w, resp_h), false, ImGuiWindowFlags_NoBackground);
             ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.accent_u32, alpha)),
                                "Response");
 
@@ -3182,7 +3506,7 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
 
             ImGui::InputTextMultiline("##rep_resp_view", rep.raw_response.data(),
                 rep.raw_response.size() + 1,
-                ImVec2(half_w - 4.f, panel_h - 78.f),
+                ImVec2(resp_w - 4.f, std::max(72.f, resp_h - 78.f)),
                 ImGuiInputTextFlags_ReadOnly);
 
             ImGui::EndChild();
@@ -3470,12 +3794,17 @@ static void render_intercept(state_t& state, float x, float y, float w, float h,
         ImGui::Spacing();
 
 
+        const bool stack_editors = w < 760.f;
         float detail_h = h - ImGui::GetCursorPosY() + y - 8.f;
+        if (detail_h < 170.f) detail_h = 170.f;
         ImGui::BeginChild("##intercept_detail", ImVec2(w - 4.f, detail_h), false, ImGuiWindowFlags_NoBackground);
 
         float half_w = (w - 12.f) * 0.5f;
+        float pane_w = stack_editors ? std::max(120.f, w - 8.f) : half_w;
+        float pane_h = stack_editors ? std::max(128.f, (detail_h - 12.f) * 0.5f) : detail_h - 4.f;
+        float edit_pane_h = stack_editors ? std::max(128.f, detail_h - pane_h - 12.f) : detail_h - 4.f;
 
-        ImGui::BeginChild("##int_req_pane", ImVec2(half_w, detail_h - 4.f), false, ImGuiWindowFlags_NoBackground);
+        ImGui::BeginChild("##int_req_pane", ImVec2(pane_w, pane_h), false, ImGuiWindowFlags_NoBackground);
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
                            "Original Request");
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
@@ -3487,18 +3816,22 @@ static void render_intercept(state_t& state, float x, float y, float w, float h,
             int_orig_buf[sel.raw_request.size()] = '\0';
         }
         ImGui::InputTextMultiline("##int_req_orig", int_orig_buf, sizeof(int_orig_buf),
-            ImVec2(half_w - 4.f, detail_h - 50.f), ImGuiInputTextFlags_ReadOnly);
+            ImVec2(pane_w - 4.f, std::max(72.f, pane_h - 50.f)), ImGuiInputTextFlags_ReadOnly);
         ImGui::EndChild();
 
-        ImGui::SameLine();
+        if (stack_editors) {
+            ImGui::Dummy(ImVec2(0.f, 8.f));
+        } else {
+            ImGui::SameLine();
+        }
 
-        ImGui::BeginChild("##int_req_edit_pane", ImVec2(half_w, detail_h - 4.f), false, ImGuiWindowFlags_NoBackground);
+        ImGui::BeginChild("##int_req_edit_pane", ImVec2(pane_w, edit_pane_h), false, ImGuiWindowFlags_NoBackground);
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.accent_u32, alpha)),
                            "Modified Request");
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
                            "Editable buffer");
         ImGui::InputTextMultiline("##mod_buf", mod_buf, sizeof(mod_buf),
-            ImVec2(half_w - 4.f, detail_h - 50.f));
+            ImVec2(pane_w - 4.f, std::max(72.f, edit_pane_h - 50.f)));
         ImGui::EndChild();
 
         ImGui::EndChild();
@@ -5886,17 +6219,7 @@ void render(float pos_x, float pos_y, float width, float height,
             float alpha, float accent_r, float accent_g, float accent_b) {
     float dt = ImGui::GetIO().DeltaTime;
     const auto& th = aida::ui::resolved();
-
-    if (!analysis_session::has_active_target()) {
-        ImVec2 wp = ImGui::GetWindowPos();
-        aida::ui::no_target_overlay::render(
-            ImVec2(wp.x + pos_x, wp.y + pos_y),
-            ImVec2(width, height),
-            "No target attached",
-            "The Network panel needs an attached process to enumerate connections, capture packets and run DPI. Attach to a running process or launch a binary to begin.",
-            alpha, aida::ui::empty_state::glyph_t::network);
-        return;
-    }
+    const bool has_target = analysis_session::has_active_target();
     g_state.last_render_tick_ms.store(static_cast<uint64_t>(GetTickCount64()), std::memory_order_release);
 
     const float kNetMinWidth = 320.f;
@@ -5917,14 +6240,28 @@ void render(float pos_x, float pos_y, float width, float height,
     }
 
 
-    float tab_h = 32.f;
-    render_tab_bar(g_state, pos_x, pos_y, width, alpha, accent_r, accent_g, accent_b, dt);
+    float tab_h = render_tab_bar(g_state, pos_x, pos_y, width, alpha, accent_r, accent_g, accent_b, dt);
 
     g_state.content_fade = ui_anim::smooth_lerp(g_state.content_fade, 1.f, 14.f, dt);
     float ca = alpha * std::max(g_state.content_fade, 0.3f);
 
     float content_y = pos_y + tab_h + 6.f;
     float content_h = height - tab_h - 6.f;
+    if (!has_target && tab_requires_target(g_state.active_tab)) {
+        ImVec2 wp = ImGui::GetWindowPos();
+        aida::ui::no_target_overlay::render(
+            ImVec2(wp.x + pos_x, wp.y + content_y),
+            ImVec2(width, content_h),
+            "No target attached",
+            "This Network tool needs an attached process for driver-backed capture, PID filtering, TLS key capture, or PCAP export. Attach or launch a target to enable it.",
+            alpha, aida::ui::empty_state::glyph_t::network);
+        return;
+    }
+    if (!has_target) {
+        float banner_h = render_no_target_banner(pos_x, content_y, width, ca);
+        content_y += banner_h;
+        content_h = std::max(0.f, content_h - banner_h);
+    }
 
     int active_now = static_cast<int>(g_state.active_tab);
     if (active_now != s_last_active_tab) {

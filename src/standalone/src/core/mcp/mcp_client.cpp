@@ -2626,6 +2626,15 @@ bool manager_t::connect_server(const std::string& name)
             }
         }
         if (!found) return false;
+        if (!cfg.enabled) {
+            diag::log_tagged_fmt("mcp",
+                "connect_server_blocked_disabled name_hash=0x%016llX name_len=%zu auto_connect=%d transport=%d",
+                static_cast<unsigned long long>(mcp_log_hash(cfg.name)),
+                cfg.name.size(),
+                static_cast<int>(cfg.auto_connect),
+                static_cast<int>(cfg.transport));
+            return false;
+        }
         for (const auto& n : _in_flight_connects) {
             if (n == name) return true;
         }

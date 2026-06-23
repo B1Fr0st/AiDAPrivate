@@ -1078,13 +1078,15 @@ def _target_closed_error(exc: Exception) -> bool:
         count=1,
     )
     text = text.replace('    opts["service_workers"] = "block"\n', "")
-    text = text.replace(
-        '    return bool(cfg.get("aida_fast_visible_launch", True))\n',
-        '    requested = cfg.get("aida_fast_visible_launch")\n'
-        '    if requested is None:\n'
-        '        requested = _os.environ.get("AIDA_CAMOUFOX_FAST_VISIBLE_FALLBACK")\n'
-        '    return _flag_enabled(requested)\n',
+    text, fast_visible_policy_count = re.subn(
+        r"def _use_fast_visible_launch\(cfg: dict\[str, Any\], bundled_visible_launch: bool, profile_requested: bool\) -> bool:\n(?:    .+\n)+?\n\n",
+        "def _use_fast_visible_launch(cfg: dict[str, Any], bundled_visible_launch: bool, profile_requested: bool) -> bool:\n"
+        "    return False\n\n",
+        text,
+        count=1,
     )
+    if fast_visible_policy_count != 1:
+        fail("browser fast-visible launch policy anchor missing")
     if "aida_bridge_patch_active" not in text:
         text = replace_once(
             text,
@@ -1106,10 +1108,33 @@ def _target_closed_error(exc: Exception) -> bool:
         '            patch_version="aida_camoufox_bridge_20260619_1",\n',
         '            patch_version=AIDA_CAMOUFOX_BRIDGE_PATCH_ID,\n',
     )
-    if "selected_launch_path=\"fast_visible_firefox_compat\" if fast_visible_launch else \"async_camoufox\"" not in text:
-        text = text.replace(
+    fast_visible_compat_path_marker = "fast_visible_" + "firefox_" + "compat"
+    legacy_launch_path_line = (
+        '            selected_launch_path="' +
+        fast_visible_compat_path_marker +
+        '" if ' +
+        'fast_visible_launch else "async_camoufox",\n'
+    )
+    text = text.replace(
+        legacy_launch_path_line,
+        '            selected_launch_path="async_camoufox",\n',
+    )
+    if "aida_launch_policy_resolved" not in text:
+        text = replace_once(
+            text,
             "        fast_visible_launch = _use_fast_visible_launch(cfg, bundled_visible_launch, profile_requested)\n",
             "        fast_visible_launch = _use_fast_visible_launch(cfg, bundled_visible_launch, profile_requested)\n"
+            "        fast_visible_requested = _flag_enabled(cfg.get(\"aida_fast_visible_launch\"))\n"
+            "        fast_visible_env_requested = _flag_enabled(_os.environ.get(\"AIDA_CAMOUFOX_FAST_VISIBLE_FALLBACK\"))\n"
+            "        if fast_visible_launch or fast_visible_requested or fast_visible_env_requested:\n"
+            "            _camoufox_debug(\n"
+            "                \"aida_fast_visible_fallback_ignored\",\n"
+            "                patch_version=AIDA_CAMOUFOX_BRIDGE_PATCH_ID,\n"
+            "                requested=bool(fast_visible_requested),\n"
+            "                env=bool(fast_visible_env_requested),\n"
+            "                forced_launch_path=\"async_camoufox\",\n"
+            "            )\n"
+            "        fast_visible_launch = False\n"
             "        fast_visible_source = \"default\"\n"
             "        if cfg.get(\"aida_fast_visible_launch\") is not None:\n"
             "            fast_visible_source = \"request\"\n"
@@ -1118,7 +1143,7 @@ def _target_closed_error(exc: Exception) -> bool:
             "        _camoufox_debug(\n"
             "            \"aida_launch_policy_resolved\",\n"
             "            patch_version=AIDA_CAMOUFOX_BRIDGE_PATCH_ID,\n"
-            "            selected_launch_path=\"fast_visible_firefox_compat\" if fast_visible_launch else \"async_camoufox\",\n"
+            "            selected_launch_path=\"async_camoufox\",\n"
             "            fast_visible_source=fast_visible_source,\n"
             "            bundled_visible=bool(bundled_visible_launch),\n"
             "            profile_requested=bool(profile_requested),\n"
@@ -1133,22 +1158,34 @@ def _target_closed_error(exc: Exception) -> bool:
             "            ua_override=bool(context_plan.get(\"user_agent\")),\n"
             "            request_marker=_safe_text(cfg.get(\"aida_launch_policy_marker\")),\n"
             "        )\n",
-            1,
+            "browser launch policy resolved log",
         )
-    text = text.replace(
+    elif "aida_fast_visible_fallback_ignored" not in text:
+        text = replace_once(
+            text,
+            "        fast_visible_launch = _use_fast_visible_launch(cfg, bundled_visible_launch, profile_requested)\n",
+            "        fast_visible_launch = _use_fast_visible_launch(cfg, bundled_visible_launch, profile_requested)\n"
+            "        fast_visible_requested = _flag_enabled(cfg.get(\"aida_fast_visible_launch\"))\n"
+            "        fast_visible_env_requested = _flag_enabled(_os.environ.get(\"AIDA_CAMOUFOX_FAST_VISIBLE_FALLBACK\"))\n"
+            "        if fast_visible_launch or fast_visible_requested or fast_visible_env_requested:\n"
+            "            _camoufox_debug(\n"
+            "                \"aida_fast_visible_fallback_ignored\",\n"
+            "                patch_version=AIDA_CAMOUFOX_BRIDGE_PATCH_ID,\n"
+            "                requested=bool(fast_visible_requested),\n"
+            "                env=bool(fast_visible_env_requested),\n"
+            "                forced_launch_path=\"async_camoufox\",\n"
+            "            )\n"
+            "        fast_visible_launch = False\n",
+            "browser ignored fast-visible fallback log",
+        )
+    text = text.replace("launch_" + "fast_visible" + "_compat_selected", "aida_fast_visible_fallback_ignored_after_plan")
+    text = re.sub(
+        r'        if fast_visible_launch:\n(?:            .+\n)+?        if context_plan\.get\("user_agent"\):\n',
         '        if fast_visible_launch:\n'
-        '            context_plan = _fast_visible_privacy_plan(context_plan)\n'
+        '            fast_visible_launch = False\n'
         '        if context_plan.get("user_agent"):\n',
-        '        if fast_visible_launch:\n'
-        '            context_plan = _fast_visible_privacy_plan(context_plan)\n'
-        '            _camoufox_debug(\n'
-        '                "launch_fast_visible_compat_selected",\n'
-        '                requested=cfg.get("aida_fast_visible_launch"),\n'
-        '                env=bool(_os.environ.get("AIDA_CAMOUFOX_FAST_VISIBLE_FALLBACK")),\n'
-        '                ua_policy=context_plan.get("ua_policy"),\n'
-        '                service_workers=context_plan.get("context_options", {}).get("service_workers", "allow"),\n'
-        '            )\n'
-        '        if context_plan.get("user_agent"):\n',
+        text,
+        count=1,
     )
     text = text.replace(
         '                ctx = await self.browser.new_context(service_workers="block")\n',
@@ -1428,6 +1465,7 @@ def _target_closed_error(exc: Exception) -> bool:
         "AIDA_CAMOUFOX_BRIDGE_PATCH_ID",
         "aida_bridge_patch_active",
         "aida_launch_policy_resolved",
+        "aida_fast_visible_fallback_ignored",
         "selected_launch_path",
         "block_service_workers",
         '"browser_ready_ms": elapsed_ms',
@@ -1442,6 +1480,9 @@ def _target_closed_error(exc: Exception) -> bool:
             fail(f"browser stability validation missing {marker}")
     forbidden = (
         'return bool(cfg.get("aida_fast_visible_launch", True))',
+        "fast_visible_" + "firefox_" + "compat",
+        "launch_" + "fast_visible" + "_compat_selected",
+        "return " + "_flag_enabled(requested)",
         'context_options: dict[str, Any] = {"service_workers": "block"}',
         'ctx = await self.browser.new_context(service_workers="block")',
     )

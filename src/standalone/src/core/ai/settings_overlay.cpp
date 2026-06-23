@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -22,6 +23,7 @@
 #include "skill_manager_view.hpp"
 
 #include "mcp_client.hpp"
+#include "mcp_marketplace.hpp"
 #include "standalone_settings.hpp"
 #include "toast_notification.hpp"
 
@@ -369,6 +371,346 @@ namespace settings_overlay {
 		}
 
 
+		inline std::string trim_copy(const std::string& v)
+		{
+			size_t first = 0;
+			while (first < v.size() && std::isspace(static_cast<unsigned char>(v[first]))) ++first;
+			size_t last = v.size();
+			while (last > first && std::isspace(static_cast<unsigned char>(v[last - 1]))) --last;
+			return v.substr(first, last - first);
+		}
+
+
+		inline bool parse_mcp_args(const std::string& text, std::vector<std::string>& out,
+			std::string& error)
+		{
+			out.clear();
+			error.clear();
+			std::string cur;
+			bool in_quote = false;
+			char quote_char = 0;
+			bool escaped = false;
+			for (char c : text) {
+				if (escaped) {
+					cur.push_back(c);
+					escaped = false;
+					continue;
+				}
+				if (in_quote) {
+					if (c == '\\') {
+						escaped = true;
+					} else if (c == quote_char) {
+						in_quote = false;
+						quote_char = 0;
+					} else {
+						cur.push_back(c);
+					}
+					continue;
+				}
+				if (c == '"' || c == '\'') {
+					in_quote = true;
+					quote_char = c;
+					continue;
+				}
+				if (std::isspace(static_cast<unsigned char>(c))) {
+					if (!cur.empty()) {
+						out.push_back(cur);
+						cur.clear();
+					}
+					continue;
+				}
+				cur.push_back(c);
+			}
+			if (escaped)
+				cur.push_back('\\');
+			if (in_quote) {
+				error = "Unclosed quote in args";
+				return false;
+			}
+			if (!cur.empty())
+				out.push_back(cur);
+			return true;
+		}
+
+
+		inline std::string quote_argv_preview(const std::string& arg)
+		{
+			if (arg.empty())
+				return "\"\"";
+			bool quote = false;
+			for (char c : arg) {
+				if (std::isspace(static_cast<unsigned char>(c)) || c == '"' || c == '\'') {
+					quote = true;
+					break;
+				}
+			}
+			if (!quote)
+				return arg;
+			std::string out = "\"";
+			for (char c : arg) {
+				if (c == '"')
+					out += "\\\"";
+				else
+					out.push_back(c);
+			}
+			out.push_back('"');
+			return out;
+		}
+
+
+		inline std::string make_argv_preview(const std::string& command,
+			const std::vector<std::string>& args)
+		{
+			std::string out = quote_argv_preview(command);
+			for (const auto& arg : args) {
+				out.push_back(' ');
+				out += quote_argv_preview(arg);
+			}
+			return out;
+		}
+
+
+		inline bool build_mcp_client_config(const mcp_client_server_t& srv,
+			mcp_client::server_config_t& cfg,
+			std::string& error)
+		{
+			error.clear();
+			cfg = {};
+			cfg.name = trim_copy(srv.name);
+			cfg.url = trim_copy(srv.url);
+			cfg.api_key = srv.api_key;
+			cfg.enabled = srv.enabled;
+			cfg.auto_connect = srv.enabled && srv.auto_connect;
+			if (cfg.name.empty()) {
+				error = "Server name is required";
+				return false;
+			}
+			if (srv.transport == "stdio") {
+				cfg.transport = mcp_client::transport_type_t::stdio;
+				cfg.command = trim_copy(srv.command);
+				if (cfg.command.empty()) {
+					error = "Stdio command is required for " + cfg.name;
+					return false;
+				}
+				if (!parse_mcp_args(srv.args, cfg.args, error)) {
+					error = cfg.name + ": " + error;
+					return false;
+				}
+			} else {
+				cfg.transport = mcp_client::transport_type_t::http_sse;
+				if (cfg.url.empty()) {
+					error = "URL is required for " + cfg.name;
+					return false;
+				}
+			}
+			return true;
+		}
+
+
+		inline mcp_client::connection_state_t status_for_server(
+			const std::vector<mcp_client::manager_t::server_status_t>& statuses,
+			const std::string& name)
+		{
+			for (const auto& st : statuses)
+				if (st.name == name)
+					return st.state;
+			return mcp_client::connection_state_t::disconnected;
+		}
+
+
+		inline const char* connection_label(mcp_client::connection_state_t st)
+		{
+			switch (st) {
+			case mcp_client::connection_state_t::connected: return "Connected";
+			case mcp_client::connection_state_t::connecting: return "Connecting";
+			case mcp_client::connection_state_t::reconnecting: return "Reconnecting";
+			case mcp_client::connection_state_t::error: return "Error";
+			default: return "Disconnected";
+			}
+		}
+
+
+		inline aida::ui::pill_kind_t connection_pill_kind(mcp_client::connection_state_t st)
+		{
+			switch (st) {
+			case mcp_client::connection_state_t::connected: return aida::ui::pill_kind_t::success;
+			case mcp_client::connection_state_t::connecting:
+			case mcp_client::connection_state_t::reconnecting: return aida::ui::pill_kind_t::warning;
+			case mcp_client::connection_state_t::error: return aida::ui::pill_kind_t::error;
+			default: return aida::ui::pill_kind_t::neutral;
+			}
+		}
+
+
+		inline void render_marketplace_server_review(
+			mcp_client::manager_t& mgr,
+			const std::vector<mcp_client::manager_t::server_status_t>& statuses)
+		{
+			const auto& th = aida::ui::resolved();
+			auto installed = ::mcp_marketplace::get_installed();
+			ImGui::Separator();
+			ImGui::Dummy(ImVec2(0.f, 6.f));
+			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_primary),
+				"Marketplace Installed");
+			ImGui::TextWrapped("%s",
+				"Installed marketplace servers stay disabled until explicitly enabled here. Connecting starts local third-party MCP code and exposes any tools it registers.");
+			ImGui::Dummy(ImVec2(0.f, 4.f));
+
+			if (installed.empty()) {
+				ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_dim),
+					"No marketplace servers installed.");
+				return;
+			}
+
+			for (auto srv : installed) {
+				ImGui::PushID(srv.package_name.c_str());
+				ImGui::BeginGroup();
+				const float group_w = (std::max)(96.f, ImGui::GetContentRegionAvail().x);
+				auto calc_label_w = [](const char* label, float pad) {
+					return ImGui::CalcTextSize(label ? label : "").x + pad;
+				};
+				auto place_wrapped = [&](float& used, bool& first, float width) {
+					const float gap = 8.f;
+					width = (std::min)(width, group_w);
+					if (first) {
+						first = false;
+						used = width;
+						return;
+					}
+					if (used + gap + width <= group_w) {
+						ImGui::SameLine(0.f, gap);
+						used += gap + width;
+					} else {
+						used = width;
+					}
+				};
+
+				ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + group_w);
+				ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_primary),
+					"%s", srv.package_name.c_str());
+				ImGui::PopTextWrapPos();
+
+				float badge_used = 0.f;
+				bool badge_first = true;
+				const std::string registry = ::mcp_marketplace::registry_label(srv.registry);
+				place_wrapped(badge_used, badge_first, calc_label_w(registry.c_str(), 20.f));
+				aida::ui::components::badge(registry.c_str(),
+					aida::ui::with_alpha(th.info, 0.9f), 4.f);
+				if (!srv.version.empty()) {
+					place_wrapped(badge_used, badge_first, calc_label_w(srv.version.c_str(), 20.f));
+					aida::ui::components::badge(srv.version.c_str(),
+						aida::ui::with_alpha(th.text_secondary, 0.9f), 4.f);
+				}
+				const char* enabled_label = srv.enabled ? "Enabled" : "Disabled";
+				place_wrapped(badge_used, badge_first, calc_label_w(enabled_label, 34.f));
+				aida::ui::pill_kind(srv.enabled ? "Enabled" : "Disabled",
+					srv.enabled ? aida::ui::pill_kind_t::warning : aida::ui::pill_kind_t::neutral,
+					aida::ui::size_t_::sm, false);
+				if (srv.auto_connect) {
+					place_wrapped(badge_used, badge_first, calc_label_w("Auto-connect", 34.f));
+					aida::ui::pill_kind("Auto-connect", aida::ui::pill_kind_t::warning,
+						aida::ui::size_t_::sm, false);
+				}
+				mcp_client::connection_state_t st = status_for_server(statuses, srv.package_name);
+				place_wrapped(badge_used, badge_first, calc_label_w(connection_label(st), 34.f));
+				aida::ui::pill_kind(connection_label(st), connection_pill_kind(st),
+					aida::ui::size_t_::sm, false);
+
+				ImGui::Dummy(ImVec2(0.f, 5.f));
+				ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary),
+					"Launch command");
+				std::string launch = ::mcp_marketplace::launch_command_preview(srv);
+				ImFont* code_font = aida::ui::fonts::code() ? aida::ui::fonts::code() : ImGui::GetFont();
+				const float code_fs = code_font->FontSize > 0.f ? code_font->FontSize : ImGui::GetFontSize();
+				const float command_w = (std::max)(72.f, group_w - 16.f);
+				ImVec2 command_sz = code_font->CalcTextSizeA(code_fs, FLT_MAX, command_w,
+					launch.c_str());
+				const float command_h = (std::min)(92.f, (std::max)(38.f, command_sz.y + 16.f));
+				ImGui::PushStyleColor(ImGuiCol_ChildBg,
+					ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.panel_header, 0.42f)));
+				ImGui::BeginChild("##market_launch_cmd", ImVec2(0.f, command_h), true,
+					ImGuiWindowFlags_NoSavedSettings);
+				ImGui::PushFont(code_font);
+				ImGui::PushTextWrapPos(ImGui::GetCursorPosX() +
+					(std::max)(64.f, ImGui::GetContentRegionAvail().x - 4.f));
+				ImGui::TextWrapped("%s", launch.c_str());
+				ImGui::PopTextWrapPos();
+				ImGui::PopFont();
+				ImGui::EndChild();
+				ImGui::PopStyleColor();
+				ImGui::Dummy(ImVec2(0.f, 5.f));
+
+				const bool connected = st == mcp_client::connection_state_t::connected;
+				float action_used = 0.f;
+				bool action_first = true;
+				auto action_w = [&](float preferred) {
+					return (std::min)(preferred, (std::max)(72.f, group_w));
+				};
+				if (!srv.enabled) {
+					const float bw = action_w(84.f);
+					place_wrapped(action_used, action_first, bw);
+					if (aida::ui::button("Enable",
+							aida::ui::button_kind_t::primary,
+							aida::ui::size_t_::sm,
+							ImVec2(bw, 28.f))) {
+						if (::mcp_marketplace::set_server_policy(srv.package_name, true, false))
+							toast_notification::push("Marketplace server enabled with auto-connect off.",
+								toast_notification::toast_type_t::info);
+					}
+				} else {
+					const float disable_w = action_w(84.f);
+					place_wrapped(action_used, action_first, disable_w);
+					if (aida::ui::button("Disable",
+							aida::ui::button_kind_t::destructive,
+							aida::ui::size_t_::sm,
+							ImVec2(disable_w, 28.f))) {
+						if (::mcp_marketplace::set_server_policy(srv.package_name, false, false))
+							toast_notification::push("Marketplace server disabled.",
+								toast_notification::toast_type_t::info);
+					}
+					if (connected) {
+						const float bw = action_w(104.f);
+						place_wrapped(action_used, action_first, bw);
+						if (aida::ui::button("Disconnect",
+								aida::ui::button_kind_t::secondary,
+								aida::ui::size_t_::sm,
+								ImVec2(bw, 28.f))) {
+							::mcp_marketplace::deactivate_server(srv.package_name);
+						}
+					} else {
+						const float bw = action_w(92.f);
+						place_wrapped(action_used, action_first, bw);
+						if (aida::ui::button("Connect",
+								aida::ui::button_kind_t::primary,
+								aida::ui::size_t_::sm,
+								ImVec2(bw, 28.f))) {
+							::mcp_marketplace::activate_server(srv);
+						}
+					}
+					const float auto_w = action_w(90.f);
+					place_wrapped(action_used, action_first, auto_w);
+					if (aida::ui::button(srv.auto_connect ? "Auto off" : "Auto on",
+							aida::ui::button_kind_t::secondary,
+							aida::ui::size_t_::sm,
+							ImVec2(auto_w, 28.f))) {
+						if (::mcp_marketplace::set_server_policy(
+								srv.package_name, true, !srv.auto_connect)) {
+							toast_notification::push(
+								srv.auto_connect ? "Marketplace auto-connect disabled."
+								                 : "Marketplace auto-connect enabled.",
+								toast_notification::toast_type_t::info);
+						}
+					}
+				}
+				ImGui::EndGroup();
+				ImGui::Dummy(ImVec2(0.f, 8.f));
+				ImGui::Separator();
+				ImGui::PopID();
+			}
+			(void)mgr;
+		}
+
+
 		inline void render_tab_mcp_servers(float content_w, float content_h)
 		{
 			auto& s = state();
@@ -398,14 +740,27 @@ namespace settings_overlay {
 			static int  s_transport = 0;
 			static bool s_enabled = true;
 			static bool s_auto = true;
-			static bool s_first_load = true;
+			static bool s_draft_loaded = false;
+			static bool s_dirty = false;
+			static std::vector<mcp_client_server_t> s_draft_servers;
+			static int s_remove_index = -1;
 
 			auto& mgr = get_mcp_client_manager();
 			auto statuses = mgr.get_status();
-			auto& servers = g_sa_settings.mcp_client_servers;
+			auto& servers = s_draft_servers;
 
 			auto refresh_buf = [&]() {
-				if (s_sel_index < 0 || s_sel_index >= static_cast<int>(servers.size())) return;
+				if (servers.empty()) {
+					s_sel_index = -1;
+					s_name[0] = s_url[0] = s_key[0] = s_cmd[0] = s_args[0] = '\0';
+					s_transport = 0;
+					s_enabled = false;
+					s_auto = false;
+					return;
+				}
+				if (s_sel_index < 0) s_sel_index = 0;
+				if (s_sel_index >= static_cast<int>(servers.size()))
+					s_sel_index = static_cast<int>(servers.size()) - 1;
 				const auto& srv = servers[s_sel_index];
 				std::snprintf(s_name, sizeof(s_name), "%s", srv.name.c_str());
 				std::snprintf(s_url,  sizeof(s_url),  "%s", srv.url.c_str());
@@ -414,13 +769,35 @@ namespace settings_overlay {
 				std::snprintf(s_args, sizeof(s_args), "%s", srv.args.c_str());
 				s_transport = (srv.transport == "stdio") ? 1 : 0;
 				s_enabled = srv.enabled;
-				s_auto    = srv.auto_connect;
+				s_auto    = srv.enabled && srv.auto_connect;
 			};
 
-			if (s_first_load) {
-				s_first_load = false;
-				if (!servers.empty()) refresh_buf();
-			}
+			auto load_draft = [&]() {
+				s_draft_servers = g_sa_settings.mcp_client_servers;
+				if (s_draft_servers.empty()) s_sel_index = -1;
+				else if (s_sel_index < 0 || s_sel_index >= static_cast<int>(s_draft_servers.size()))
+					s_sel_index = 0;
+				refresh_buf();
+				s_dirty = false;
+				s_draft_loaded = true;
+			};
+
+			auto commit_buf = [&]() {
+				if (s_sel_index < 0 || s_sel_index >= static_cast<int>(servers.size()))
+					return;
+				auto& srv = servers[s_sel_index];
+				srv.name = s_name;
+				srv.url = s_url;
+				srv.api_key = s_key;
+				srv.command = s_cmd;
+				srv.args = s_args;
+				srv.transport = (s_transport == 1) ? "stdio" : "http_sse";
+				srv.enabled = s_enabled;
+				srv.auto_connect = s_enabled && s_auto;
+			};
+
+			if (!s_draft_loaded)
+				load_draft();
 
 			float avail_w = ImGui::GetContentRegionAvail().x;
 			float left_w = 280.f;
@@ -511,9 +888,14 @@ namespace settings_overlay {
 				aida::ui::pill_kind(oauth_pill_label(oauth), oauth_pill_kind(oauth),
 					aida::ui::size_t_::md, false);
 
-				if (clicked) {
-					s_sel_index = i;
-					refresh_buf();
+				if (clicked && i != s_sel_index) {
+					if (s_dirty) {
+						toast_notification::push("Apply or discard MCP server changes before switching.",
+							toast_notification::toast_type_t::warning);
+					} else {
+						s_sel_index = i;
+						refresh_buf();
+					}
 				}
 
 				if (oauth == mcp_client::oauth_status_t::needs_auth ||
@@ -553,6 +935,7 @@ namespace settings_overlay {
 			const bool btn_narrow = footer_avail < 440.f;
 			const char* lbl_add    = "+ Add Server";
 			const char* lbl_apply  = btn_narrow ? "Apply" : "Apply Changes";
+			const char* lbl_discard = btn_narrow ? "Discard" : "Discard Draft";
 			const char* lbl_remove = btn_narrow ? "Remove" : "Remove Selected";
 			const char* lbl_market = btn_narrow ? "Market..." : "Marketplace...";
 
@@ -564,9 +947,10 @@ namespace settings_overlay {
 			};
 			const float w_add    = std::max(mcp_bw(lbl_add), 90.f);
 			const float w_apply  = std::max(mcp_bw(lbl_apply), 90.f);
+			const float w_discard = std::max(mcp_bw(lbl_discard), 90.f);
 			const float w_remove = std::max(mcp_bw(lbl_remove), 90.f);
 			const float w_market = std::max(mcp_bw(lbl_market), 90.f);
-			const float btn_total_w = w_add + w_apply + w_remove + w_market + btn_sep * 3.f;
+			const float btn_total_w = w_add + w_apply + w_discard + w_remove + w_market + btn_sep * 4.f;
 			const bool btn_wrap = (footer_avail < btn_total_w);
 
 			int btn_rows = 1;
@@ -578,7 +962,7 @@ namespace settings_overlay {
 					if (btn_wrap && (cx + btn_sep + w) > footer_avail) { cx = w; ++rows; }
 					else cx += btn_sep + w;
 				};
-				adv(w_add); adv(w_apply); adv(w_remove); adv(w_market);
+				adv(w_add); adv(w_apply); adv(w_discard); adv(w_remove); adv(w_market);
 				btn_rows = rows;
 			}
 			const float footer_h = btn_rows * 36.f + (btn_rows - 1) * btn_sep + 12.f + 6.f;
@@ -591,7 +975,7 @@ namespace settings_overlay {
 				ImGui::SameLine();
 			}
 			ImGui::BeginChild("##mcp_detail", ImVec2(0, detail_h), false,
-				ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_HorizontalScrollbar);
+				ImGuiWindowFlags_NoSavedSettings);
 
 			ImDrawList* ddl = ImGui::GetWindowDrawList();
 			ImVec2 dp = ImGui::GetCursorScreenPos();
@@ -600,54 +984,102 @@ namespace settings_overlay {
 				ImVec2(dp.x + 8.f, dp.y + 4.f),
 				th.text_primary, "Server Configuration");
 			ImGui::Dummy(ImVec2(0.f, 30.f));
+			if (s_dirty) {
+				aida::ui::pill_kind("Unsaved changes", aida::ui::pill_kind_t::warning,
+					aida::ui::size_t_::sm, false);
+				ImGui::SameLine(0.f, 8.f);
+				ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_dim),
+					"Apply reconnects configured MCP clients.");
+			} else {
+				ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_dim),
+					"Edits are staged until Apply.");
+			}
+			ImGui::Dummy(ImVec2(0.f, 4.f));
 			ImGui::Separator();
 			ImGui::Dummy(ImVec2(0.f, 4.f));
 
 			if (s_sel_index >= 0 && s_sel_index < static_cast<int>(servers.size())) {
+				bool field_changed = false;
 				ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "Name");
-				aida::ui::input_text("##mcp_name", s_name, sizeof(s_name),
+				field_changed |= aida::ui::input_text("##mcp_name", s_name, sizeof(s_name),
 					"Server name", false, ImVec2(0.f, 36.f));
 
 				ImGui::Dummy(ImVec2(0.f, 4.f));
 				const char* transports[] = { "HTTP/SSE", "Stdio" };
 				ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "Transport");
 				ImGui::SetNextItemWidth(-12.f);
-				ImGui::Combo("##mcp_transport", &s_transport, transports, 2);
+				if (ImGui::Combo("##mcp_transport", &s_transport, transports, 2))
+					field_changed = true;
 
 				if (s_transport == 0) {
 					ImGui::Dummy(ImVec2(0.f, 4.f));
 					ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "URL");
-					aida::ui::input_text("##mcp_url", s_url, sizeof(s_url),
+					field_changed |= aida::ui::input_text("##mcp_url", s_url, sizeof(s_url),
 						"https://server", false, ImVec2(0.f, 36.f));
 					ImGui::Dummy(ImVec2(0.f, 4.f));
 					ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "API Key");
-					aida::ui::input_text("##mcp_key", s_key, sizeof(s_key),
+					field_changed |= aida::ui::input_text("##mcp_key", s_key, sizeof(s_key),
 						"secret", true, ImVec2(0.f, 36.f));
 				} else {
 					ImGui::Dummy(ImVec2(0.f, 4.f));
 					ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "Command");
-					aida::ui::input_text("##mcp_cmd", s_cmd, sizeof(s_cmd),
+					field_changed |= aida::ui::input_text("##mcp_cmd", s_cmd, sizeof(s_cmd),
 						"node server.js", false, ImVec2(0.f, 36.f));
 					ImGui::Dummy(ImVec2(0.f, 4.f));
 					ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "Args");
-					aida::ui::input_text("##mcp_args", s_args, sizeof(s_args),
+					field_changed |= aida::ui::input_text("##mcp_args", s_args, sizeof(s_args),
 						"--port 3001", false, ImVec2(0.f, 36.f));
+					std::vector<std::string> parsed_args;
+					std::string parse_error;
+					const bool args_ok = parse_mcp_args(s_args, parsed_args, parse_error);
+					ImGui::Dummy(ImVec2(0.f, 4.f));
+					ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(args_ok ? th.text_secondary : th.error),
+						"%s", args_ok ? "Argv preview" : parse_error.c_str());
+					if (args_ok) {
+						ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - 8.f);
+						ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_dim),
+							"%s", make_argv_preview(s_cmd, parsed_args).c_str());
+						ImGui::PopTextWrapPos();
+					}
 				}
 
 				ImGui::Dummy(ImVec2(0.f, 6.f));
-				aida::ui::toggle_switch("Enabled##mcp", &s_enabled, aida::ui::size_t_::md);
+				field_changed |= aida::ui::toggle_switch("Enabled##mcp", &s_enabled, aida::ui::size_t_::md);
 				ImGui::SameLine(140.f);
-				aida::ui::toggle_switch("Auto-connect", &s_auto, aida::ui::size_t_::md);
+				field_changed |= aida::ui::toggle_switch("Auto-connect", &s_auto, aida::ui::size_t_::md);
+				if (!s_enabled && s_auto) {
+					s_auto = false;
+					field_changed = true;
+				}
+				if (field_changed)
+					s_dirty = true;
 
-				auto& srv = servers[s_sel_index];
-				srv.name = s_name;
-				srv.url = s_url;
-				srv.api_key = s_key;
-				srv.command = s_cmd;
-				srv.args = s_args;
-				srv.transport = (s_transport == 1) ? "stdio" : "http_sse";
-				srv.enabled = s_enabled;
-				srv.auto_connect = s_auto;
+				ImGui::Dummy(ImVec2(0.f, 8.f));
+				const bool actions_disabled = s_dirty || !s_enabled;
+				if (aida::ui::button("Reconnect",
+						aida::ui::button_kind_t::secondary,
+						aida::ui::size_t_::sm,
+						ImVec2(98.f, 28.f),
+						actions_disabled)) {
+					commit_buf();
+					mcp_client::server_config_t cfg;
+					std::string err;
+					if (build_mcp_client_config(servers[s_sel_index], cfg, err)) {
+						mgr.add_server(cfg);
+						mgr.disconnect_server(cfg.name);
+						mgr.connect_server(cfg.name);
+					} else {
+						toast_notification::push(err, toast_notification::toast_type_t::error);
+					}
+				}
+				ImGui::SameLine(0.f, 8.f);
+				if (aida::ui::button("Disconnect",
+						aida::ui::button_kind_t::secondary,
+						aida::ui::size_t_::sm,
+						ImVec2(104.f, 28.f),
+						s_dirty)) {
+					mgr.disconnect_server(servers[s_sel_index].name);
+				}
 			} else {
 				ImVec2 region_pos = ImGui::GetCursorScreenPos();
 				ImVec2 region_size(ImGui::GetContentRegionAvail().x, 200.f);
@@ -658,6 +1090,9 @@ namespace settings_overlay {
 				cfg.max_width = region_size.x * 0.8f;
 				aida::ui::empty_state::render(region_pos, region_size, cfg);
 			}
+
+			ImGui::Dummy(ImVec2(0.f, 10.f));
+			render_marketplace_server_review(mgr, statuses);
 
 			ImGui::EndChild();
 
@@ -682,42 +1117,79 @@ namespace settings_overlay {
 					aida::ui::button_kind_t::primary,
 					aida::ui::size_t_::md,
 					ImVec2(w_add, 36.f))) {
+				commit_buf();
 				mcp_client_server_t srv;
-				srv.name = "New Server";
+				std::string base = "New Server";
+				std::string candidate = base;
+				int suffix = 2;
+				bool unique = false;
+				while (!unique) {
+					unique = true;
+					for (const auto& existing : servers) {
+						if (existing.name == candidate) {
+							unique = false;
+							candidate = base + " " + std::to_string(suffix++);
+							break;
+						}
+					}
+				}
+				srv.name = candidate;
 				srv.url = "http://localhost:3001";
+				srv.enabled = false;
+				srv.auto_connect = false;
 				servers.push_back(srv);
 				s_sel_index = static_cast<int>(servers.size()) - 1;
 				refresh_buf();
-				g_sa_settings.save();
+				s_dirty = true;
 			}
 			if (place_button(w_apply)) ImGui::SameLine(0.f, btn_sep);
 			if (aida::ui::button(lbl_apply,
 					aida::ui::button_kind_t::secondary,
 					aida::ui::size_t_::md,
-					ImVec2(w_apply, 36.f))) {
-				mgr.disconnect_all();
+					ImVec2(w_apply, 36.f),
+					!s_dirty)) {
+				commit_buf();
+				bool ok = true;
+				std::string apply_error;
+				std::vector<mcp_client::server_config_t> configs;
+				configs.reserve(servers.size());
+				std::unordered_map<std::string, int> seen_names;
 				for (const auto& srv : servers) {
 					mcp_client::server_config_t cfg;
-					cfg.name = srv.name;
-					cfg.url = srv.url;
-					cfg.api_key = srv.api_key;
-					cfg.enabled = srv.enabled;
-					cfg.auto_connect = srv.auto_connect;
-					if (srv.transport == "stdio") {
-						cfg.transport = mcp_client::transport_type_t::stdio;
-						cfg.command = srv.command;
-						if (!srv.args.empty()) {
-							std::istringstream iss(srv.args);
-							std::string a;
-							while (iss >> a) cfg.args.push_back(a);
-						}
-					} else {
-						cfg.transport = mcp_client::transport_type_t::http_sse;
+					if (!build_mcp_client_config(srv, cfg, apply_error)) {
+						ok = false;
+						break;
 					}
-					mgr.add_server(cfg);
+					if (++seen_names[cfg.name] > 1) {
+						apply_error = "Duplicate MCP server name: " + cfg.name;
+						ok = false;
+						break;
+					}
+					configs.push_back(std::move(cfg));
 				}
-				mgr.connect_all();
-				g_sa_settings.save();
+				if (!ok) {
+					toast_notification::push(apply_error, toast_notification::toast_type_t::error);
+				} else {
+					g_sa_settings.mcp_client_servers = servers;
+					mgr.disconnect_all();
+					for (const auto& cfg : configs)
+						mgr.add_server(cfg);
+					mgr.connect_all();
+					g_sa_settings.save();
+					s_dirty = false;
+					toast_notification::push("MCP server settings applied.",
+						toast_notification::toast_type_t::info);
+				}
+			}
+			if (place_button(w_discard)) ImGui::SameLine(0.f, btn_sep);
+			if (aida::ui::button(lbl_discard,
+					aida::ui::button_kind_t::secondary,
+					aida::ui::size_t_::md,
+					ImVec2(w_discard, 36.f),
+					!s_dirty)) {
+				load_draft();
+				toast_notification::push("MCP server draft discarded.",
+					toast_notification::toast_type_t::info);
 			}
 			if (place_button(w_remove)) ImGui::SameLine(0.f, btn_sep);
 			if (aida::ui::button(lbl_remove,
@@ -726,10 +1198,9 @@ namespace settings_overlay {
 					ImVec2(w_remove, 36.f)) &&
 				s_sel_index >= 0 && s_sel_index < static_cast<int>(servers.size()))
 			{
-				servers.erase(servers.begin() + s_sel_index);
-				if (s_sel_index > 0) --s_sel_index;
-				refresh_buf();
-				g_sa_settings.save();
+				commit_buf();
+				s_remove_index = s_sel_index;
+				ImGui::OpenPopup("Remove MCP server##mcp_remove_confirm");
 			}
 			if (place_button(w_market)) ImGui::SameLine(0.f, btn_sep);
 			if (aida::ui::button(lbl_market,
@@ -737,6 +1208,44 @@ namespace settings_overlay {
 					aida::ui::size_t_::md,
 					ImVec2(w_market, 36.f))) {
 				aida::mcp_marketplace_view::open();
+			}
+
+			if (ImGui::BeginPopupModal("Remove MCP server##mcp_remove_confirm",
+					nullptr,
+					ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
+				std::string remove_name = "selected server";
+				if (s_remove_index >= 0 && s_remove_index < static_cast<int>(servers.size()))
+					remove_name = servers[s_remove_index].name;
+				ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 420.f);
+				ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_primary),
+					"Remove %s?", remove_name.c_str());
+				ImGui::TextWrapped("%s",
+					"Removal is staged as a draft. Apply Changes will disconnect and remove this server from the MCP client configuration.");
+				ImGui::PopTextWrapPos();
+				ImGui::Dummy(ImVec2(0.f, 10.f));
+				if (aida::ui::button("Remove",
+						aida::ui::button_kind_t::destructive,
+						aida::ui::size_t_::md,
+						ImVec2(104.f, 34.f))) {
+					if (s_remove_index >= 0 && s_remove_index < static_cast<int>(servers.size())) {
+						servers.erase(servers.begin() + s_remove_index);
+						if (servers.empty()) s_sel_index = -1;
+						else if (s_remove_index <= s_sel_index && s_sel_index > 0) --s_sel_index;
+						refresh_buf();
+						s_dirty = true;
+					}
+					s_remove_index = -1;
+					ImGui::CloseCurrentPopup();
+				}
+				ImGui::SameLine(0.f, 8.f);
+				if (aida::ui::button("Cancel",
+						aida::ui::button_kind_t::secondary,
+						aida::ui::size_t_::md,
+						ImVec2(96.f, 34.f))) {
+					s_remove_index = -1;
+					ImGui::CloseCurrentPopup();
+				}
+				ImGui::EndPopup();
 			}
 
 			if (footer_avail < 200.f) {

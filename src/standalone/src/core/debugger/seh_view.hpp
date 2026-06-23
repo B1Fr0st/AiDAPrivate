@@ -3,6 +3,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include "work_queue.hpp"
@@ -47,6 +48,19 @@ struct ui_state_t {
 };
 
 inline ui_state_t g_ui;
+
+inline void draw_clipped_text(ImDrawList* dl, ImVec2 pos, float width, float row_h, ImU32 color, const char* text)
+{
+	const char* value = (text && text[0]) ? text : "Unresolved";
+	float clipped_w = std::max(4.f, width);
+	ImVec2 a(pos.x, pos.y - 2.f);
+	ImVec2 b(pos.x + clipped_w, pos.y + row_h);
+	dl->PushClipRect(a, b, true);
+	dl->AddText(pos, color, value);
+	dl->PopClipRect();
+	if (ImGui::IsMouseHoveringRect(a, b, false) && ImGui::CalcTextSize(value).x > clipped_w)
+		ImGui::SetTooltip("%s", value);
+}
 
 inline uint64_t resolve_thread_teb(uint32_t tid)
 {
@@ -230,6 +244,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		int depth = 0;
 		int unresolved = 0;
 		int distinct_modules = 0;
+		uint32_t active_tid = debugger_engine::g_state.active_tid;
 		{
 			std::lock_guard<std::mutex> lk(g_ui.mutex);
 			depth = static_cast<int>(g_ui.entries.size());
@@ -248,9 +263,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			distinct_modules = static_cast<int>(seen_modules.size());
 		}
 		char depth_buf[16];
+		char tid_buf[16];
 		char unres_buf[16];
 		char mod_buf[16];
 		std::snprintf(depth_buf, sizeof(depth_buf), "%d", depth);
+		std::snprintf(tid_buf, sizeof(tid_buf), "%u", active_tid);
 		std::snprintf(unres_buf, sizeof(unres_buf), "%d", unresolved);
 		std::snprintf(mod_buf, sizeof(mod_buf), "%d", distinct_modules);
 
@@ -258,24 +275,46 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			? _t.warning
 			: _t.success;
 
-		ui_anim::stat_strip_item_t items[3];
+		ui_anim::stat_strip_item_t items[4];
 		items[0] = { "Chain Depth", depth_buf, nullptr, 0, nullptr, 0, 0 };
-		items[1] = { "Unresolved",  unres_buf, nullptr, 0, nullptr, 0, unres_col };
-		items[2] = { "Modules",     mod_buf,   nullptr, 0, nullptr, 0, 0 };
+		items[1] = { "Active TID",   tid_buf,   nullptr, 0, nullptr, 0, 0 };
+		items[2] = { "Unresolved",   unres_buf, nullptr, 0, nullptr, 0, unres_col };
+		items[3] = { "Modules",      mod_buf,   nullptr, 0, nullptr, 0, 0 };
 		ui_anim::render_stat_strip(dl, pos_x + 6.f, strip_y + 4.f, width - 12.f, strip_h - 8.f,
-			items, 3, ar, ag, ab, alpha);
+			items, 4, ar, ag, ab, alpha);
 	}
 
 	float table_y = strip_y + strip_h;
 
-	float col_idx = pos_x + width * 0.01f;
-	float col_frame = pos_x + width * 0.06f;
-	float col_handler = pos_x + width * 0.28f;
-	float col_module = pos_x + width * 0.52f;
-	float col_name = pos_x + width * 0.70f;
+	const float table_pad = 10.f;
+	float content_w = std::max(240.f, width - table_pad * 2.f);
+	float idx_w = 44.f;
+	float frame_w = std::min(172.f, std::max(126.f, content_w * 0.20f));
+	float handler_w = std::min(180.f, std::max(132.f, content_w * 0.22f));
+	float module_w = std::min(180.f, std::max(96.f, content_w * 0.18f));
+	float name_w = content_w - idx_w - frame_w - handler_w - module_w;
+	if (name_w < 96.f) {
+		float deficit = 96.f - name_w;
+		auto shrink = [](float& value, float min_value, float& amount) {
+			float room = std::max(0.f, value - min_value);
+			float cut = std::min(room, amount);
+			value -= cut;
+			amount -= cut;
+		};
+		shrink(module_w, 72.f, deficit);
+		shrink(handler_w, 116.f, deficit);
+		shrink(frame_w, 116.f, deficit);
+		name_w = std::max(72.f, content_w - idx_w - frame_w - handler_w - module_w);
+	}
+
+	float col_idx = pos_x + table_pad;
+	float col_frame = col_idx + idx_w;
+	float col_handler = col_frame + frame_w;
+	float col_module = col_handler + handler_w;
+	float col_name = col_module + module_w;
 
 	{
-		ui_anim::table_col_t cols[] = {{"#", 40.f}, {"Frame Address", 170.f}, {"Handler Address", 180.f}, {"Module", 140.f}, {"Name", 200.f}};
+		ui_anim::table_col_t cols[] = {{"#", idx_w}, {"Frame Address", frame_w}, {"Handler Address", handler_w}, {"Module", module_w}, {"Name", name_w}};
 		ui_anim::render_table_header(dl, pos_x, table_y, width, col_header_h, cols, 5, ar, ag, ab, alpha);
 	}
 
@@ -292,13 +331,17 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	}
 
 	if (snapshot.empty()) {
-		float cw = std::min(width - 40.f, 560.f);
+		float cw = std::min(width - 40.f, 540.f);
 		if (cw < 160.f) cw = std::max(160.f, width - 20.f);
 		float cx = pos_x + (width - cw) * 0.5f;
-		float cy = list_y + list_h * 0.5f - 26.f;
+		float cy = list_y + list_h * 0.5f - 34.f;
 		ui_anim::render_inline_callout(dl, cx, cy, cw, 52.f,
-			"No SEH chain found. Attach to a 32-bit process and click Refresh — SEH is unwound per-thread.",
+			"No SEH chain found. Empty chains are normal for many x64 targets.",
 			ui_anim::callout_kind_t::info, ar, ag, ab, alpha);
+		const char* hint = "SEH is per active thread; switch threads and refresh when needed.";
+		ImVec2 hint_sz = ImGui::CalcTextSize(hint);
+		dl->AddText(ImVec2(pos_x + (width - hint_sz.x) * 0.5f, cy + 58.f),
+			_ta(_t.text_secondary), hint);
 		dl->PopClipRect();
 		return;
 	}
@@ -329,24 +372,24 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		char idx_buf[8];
 		snprintf(idx_buf, sizeof(idx_buf), "%d", e.index);
-		dl->AddText(ImVec2(col_idx, ry + 2.f),
-					_ta(_t.text_secondary), idx_buf);
+		draw_clipped_text(dl, ImVec2(col_idx, ry + 2.f), idx_w - 6.f, row_h,
+			_ta(_t.text_secondary), idx_buf);
 
 		char frame_buf[24];
 		snprintf(frame_buf, sizeof(frame_buf), "%016llX", static_cast<unsigned long long>(e.frame_addr));
-		dl->AddText(ImVec2(col_frame, ry + 2.f),
-					_ta(_t.text_primary), frame_buf);
+		draw_clipped_text(dl, ImVec2(col_frame, ry + 2.f), frame_w - 8.f, row_h,
+			_ta(_t.text_primary), frame_buf);
 
 		char handler_buf[24];
 		snprintf(handler_buf, sizeof(handler_buf), "%016llX", static_cast<unsigned long long>(e.handler_addr));
-		dl->AddText(ImVec2(col_handler, ry + 2.f),
-					_ta(_t.text_primary), handler_buf);
+		draw_clipped_text(dl, ImVec2(col_handler, ry + 2.f), handler_w - 8.f, row_h,
+			_ta(_t.text_primary), handler_buf);
 
-		dl->AddText(ImVec2(col_module, ry + 2.f),
-					_ta(_t.text_secondary), e.module_name.c_str());
+		draw_clipped_text(dl, ImVec2(col_module, ry + 2.f), module_w - 8.f, row_h,
+			_ta(_t.text_secondary), e.module_name.c_str());
 
-		dl->AddText(ImVec2(col_name, ry + 2.f),
-					_ta(_t.text_primary), e.handler_name.c_str());
+		draw_clipped_text(dl, ImVec2(col_name, ry + 2.f), name_w - 8.f, row_h,
+			_ta(_t.text_primary), e.handler_name.c_str());
 
 		if (idx == g_ui.selected && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
 			ImGui::OpenPopup("##seh_ctx");

@@ -648,7 +648,8 @@ static void merge_icon_font(ImGuiIO& io, float pixel_size)
     ImFontConfig icon_cfg{};
     icon_cfg.MergeMode = true;
     icon_cfg.PixelSnapH = true;
-    icon_cfg.GlyphMinAdvanceX = pixel_size;
+    icon_cfg.GlyphMinAdvanceX = pixel_size * 0.92f;
+    icon_cfg.GlyphOffset = ImVec2(0.f, pixel_size * 0.05f);
     const bool fileless = fileless_launch_active();
     if (!fileless) {
         icon_cfg.FontBuilderFlags = ImGuiFreeTypeBuilderFlags_LightHinting;
@@ -696,35 +697,25 @@ static void rebuild_fonts(float dpi_scale)
         io.Fonts ? static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(io.Fonts->FontBuilderIO)) : 0ULL,
         io.Fonts ? io.Fonts->FontBuilderFlags : 0U);
 
-    float screen_factor = 1.0f;
-    {
-        HMONITOR hm = MonitorFromWindow(g_hwnd ? g_hwnd : GetDesktopWindow(), MONITOR_DEFAULTTONEAREST);
-        MONITORINFO mi{ sizeof(mi) };
-        if (GetMonitorInfoW(hm, &mi)) {
-            int mw = mi.rcMonitor.right - mi.rcMonitor.left;
-            int mh = mi.rcMonitor.bottom - mi.rcMonitor.top;
-            int diag = (int)sqrtf((float)(mw * mw + mh * mh));
-            if (diag >= 3000) screen_factor = 1.35f;
-            else if (diag >= 2400) screen_factor = 1.25f;
-            else if (diag >= 2050) screen_factor = 1.18f;
-            else screen_factor = 1.10f;
-        }
-    }
-
-    const float texture_scale = dpi_scale * screen_factor;
+    const auto font_policy = aida::ui::fonts::policy_for_dpi(dpi_scale);
+    const float screen_factor = 1.0f;
+    const float texture_scale = font_policy.scale;
     diag::log_tagged_critical_fmt("fonts",
-        "rebuild_fonts_scale screen_factor=%.3f texture_scale=%.3f",
+        "rebuild_fonts_scale screen_factor=%.3f texture_scale=%.3f body=%.2f caption=%.2f code=%.2f",
         screen_factor,
-        texture_scale);
-    const float base = 16.0f * texture_scale;
-    const float lg   = 18.0f * texture_scale;
-    const float sm   = 13.0f * texture_scale;
-    const float xl   = 32.0f * texture_scale;
-    const float code = 14.0f * texture_scale;
-    const float code_lg = 28.0f * texture_scale;
+        texture_scale,
+        font_policy.body_px,
+        font_policy.caption_px,
+        font_policy.code_px);
+    const float base = font_policy.body_px;
+    const float lg   = font_policy.large_px;
+    const float sm   = font_policy.caption_px;
+    const float xl   = font_policy.display_px;
+    const float code = font_policy.code_px;
+    const float code_lg = font_policy.code_large_px;
     io.FontGlobalScale = 1.0f;
 
-    const bool enable_lcd = dpi_scale >= 1.5f;
+    const bool enable_lcd = font_policy.enable_lcd;
     constexpr unsigned int lcd_flag_value = 1u << 10;
 
     auto cfg_ui_smooth = [&](float multiply) {
@@ -757,9 +748,15 @@ static void rebuild_fonts(float dpi_scale)
             c.FontBuilderFlags = ImGuiFreeTypeBuilderFlags_LightHinting;
         }
         c.PixelSnapH = true;
-        c.OversampleH = 1;
+        c.OversampleH = 2;
         c.OversampleV = 1;
         c.RasterizerMultiply = multiply;
+        return c;
+    };
+    auto cfg_caption = [&](float multiply) {
+        ImFontConfig c = cfg_ui_hinted(multiply);
+        c.PixelSnapH = true;
+        c.OversampleH = 2;
         return c;
     };
 
@@ -818,10 +815,11 @@ static void rebuild_fonts(float dpi_scale)
     auto jbm_600 = jbm_paths("JetBrainsMono-SemiBold.ttf");
     jbm_600.push_back(cascadia_mono); jbm_600.push_back(consolasb); jbm_600.push_back(consolas);
 
-    ImFontConfig c_400 = cfg_ui_smooth(1.15f);
-    ImFontConfig c_500 = cfg_ui_smooth(1.15f);
+    ImFontConfig c_400 = cfg_ui_hinted(1.08f);
+    ImFontConfig c_500 = cfg_ui_hinted(1.08f);
     ImFontConfig c_600 = cfg_ui_hinted(1.05f);
     ImFontConfig c_700 = cfg_ui_hinted(1.05f);
+    ImFontConfig c_caption = cfg_caption(1.08f);
     ImFontConfig c_mono = cfg_mono(1.00f);
 
     g_font_ui_400 = load_font_with_fallbacks(io, (const char*)verdana, sizeof(verdana),
@@ -848,7 +846,7 @@ static void rebuild_fonts(float dpi_scale)
     diag::log_tagged_critical_fmt("fonts", "rebuild_fonts_ui400_lg font=0x%llX",
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(g_font_ui_400_lg)));
     g_font_ui_500_sm = load_font_with_fallbacks(io, (const char*)verdana, sizeof(verdana),
-                                                 inter_500, sm, c_500);
+                                                 inter_500, sm, c_caption);
     diag::log_tagged_critical_fmt("fonts", "rebuild_fonts_ui500_sm font=0x%llX",
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(g_font_ui_500_sm)));
     g_font_ui_700_xl = load_font_with_fallbacks(io, (const char*)verdana, sizeof(verdana),
@@ -4320,6 +4318,7 @@ int main(int, char**)
         UINT dpi = GetDpiForWindow(hwnd);
         aida::manual_map_tls::ensure_current_thread();
         globals::ui::dpi_scale = (dpi > 0) ? (static_cast<float>(dpi) / 96.0f) : 1.0f;
+        aida::ui::set_dpi_scale(globals::ui::dpi_scale);
         startup_log_critical_fmt("dpi_scale_query_post dpi=%u scale=%.3f last_err=%lu",
             dpi,
             globals::ui::dpi_scale,
@@ -6109,6 +6108,7 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
     {
         UINT dpi = HIWORD(wParam);
         globals::ui::dpi_scale = (dpi > 0) ? (static_cast<float>(dpi) / 96.0f) : 1.0f;
+        aida::ui::set_dpi_scale(globals::ui::dpi_scale);
         RECT* suggested = reinterpret_cast<RECT*>(lParam);
         aida_tracer::set_wndproc_state("dpichanged_setwindowpos", hWnd, msg, wParam, lParam);
         SetWindowPos(hWnd, nullptr,
@@ -6118,6 +6118,7 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
             SWP_NOZORDER | SWP_NOACTIVATE);
         aida_tracer::set_wndproc_state("dpichanged_rebuild_fonts", hWnd, msg, wParam, lParam);
         rebuild_fonts(globals::ui::dpi_scale);
+        aida::ui::apply_imgui_style(aida::ui::resolved());
         return finish("dpichanged", 0);
     }
     case WM_SETTINGCHANGE:

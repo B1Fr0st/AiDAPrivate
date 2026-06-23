@@ -2064,6 +2064,14 @@ static void render_modules_overlay(ImDrawList* dl, float ox, float oy, float w, 
 			anti_tamper::webhook::write_log("dbg_audit",
 				"[dbg_audit] modules enter ok=1");
 		}
+		static bool s_cap_logged_once = false;
+		if (!s_cap_logged_once) {
+			s_cap_logged_once = true;
+			anti_tamper::webhook::write_log("dbg_audit",
+				"[dbg_audit] modules capability_unavailable feature=modules_inject_dll reason=driver_bridge_has_no_LoadLibrary_helper");
+			anti_tamper::webhook::write_log("dbg_audit",
+				"[dbg_audit] modules capability_unavailable feature=modules_unload reason=driver_bridge_has_no_FreeLibrary_helper");
+		}
 	}
 
 	float overlay_h = 36.f;
@@ -2072,35 +2080,36 @@ static void render_modules_overlay(ImDrawList* dl, float ox, float oy, float w, 
 	float btn_w = 120.f;
 	float btn_gap = 6.f;
 
-	bool can_act = driver_bridge::attached_pid() != 0;
+	auto selected = module_view::selected_module_snapshot();
+	bool attached = driver_bridge::attached_pid() != 0;
+	bool selection_stale = (selected.base != 0 && !selected.present);
+	bool can_dump = attached && selected.present && selected.size != 0;
 
 	ImGui::SetCursorScreenPos(ImVec2(ox + pad, oy + (overlay_h - btn_h) * 0.5f));
 	ImGui::PushID("##modules_overlay");
 	bool dump_clicked = aida::ui::button("Dump Selected",
 		aida::ui::button_kind_t::primary,
 		aida::ui::size_t_::sm, ImVec2(btn_w, btn_h),
-		!can_act);
+		!can_dump);
 	if (dump_clicked) {
-		uint64_t base = 0;
-		uint64_t size = 0;
-		std::string name;
-		{
-			std::lock_guard<std::mutex> lk(module_view::g_ui.modules_mutex);
-			int sel = module_view::g_ui.selected_module;
-			if (sel >= 0 && sel < static_cast<int>(module_view::g_ui.modules.size())) {
-				base = module_view::g_ui.modules[sel].base;
-				size = static_cast<uint64_t>(module_view::g_ui.modules[sel].size);
-				name = module_view::g_ui.modules[sel].name;
-			}
-		}
-		if (base == 0 || size == 0) {
-			toast_notification::push("Select a module first.",
+		auto dump_target = module_view::selected_module_snapshot();
+		if (driver_bridge::attached_pid() == 0) {
+			toast_notification::push("Attach to a target first.",
 				toast_notification::toast_type_t::warning);
 			anti_tamper::webhook::write_log("dbg_audit",
-				"[dbg_audit] modules dump fail reason=no_selection");
+				"[dbg_audit] modules dump fail reason=no_attached_target");
+		} else if (!dump_target.present || dump_target.base == 0 || dump_target.size == 0) {
+			toast_notification::push(dump_target.base != 0
+				? "Selected module is no longer loaded."
+				: "Select a module first.",
+				toast_notification::toast_type_t::warning);
+			anti_tamper::webhook::write_log("dbg_audit",
+				dump_target.base != 0
+					? "[dbg_audit] modules dump fail reason=selected_module_unloaded"
+					: "[dbg_audit] modules dump fail reason=no_selection");
 		} else {
 			const uint64_t cap = 256ULL * 1024ULL * 1024ULL;
-			if (size > cap) {
+			if (dump_target.size > cap) {
 				toast_notification::push("Module exceeds 256 MiB dump cap.",
 					toast_notification::toast_type_t::warning);
 				anti_tamper::webhook::write_log("dbg_audit",
@@ -2109,8 +2118,8 @@ static void render_modules_overlay(ImDrawList* dl, float ox, float oy, float w, 
 				char default_name[160] = {};
 				std::snprintf(default_name, sizeof(default_name),
 					"%s_%016llX.bin",
-					name.empty() ? "module" : name.c_str(),
-					static_cast<unsigned long long>(base));
+					dump_target.name.empty() ? "module" : dump_target.name.c_str(),
+					static_cast<unsigned long long>(dump_target.base));
 				char path_buf[MAX_PATH] = {};
 				std::strncpy(path_buf, default_name, sizeof(path_buf) - 1);
 				static const char k_module_filter[] =
@@ -2121,10 +2130,10 @@ static void render_modules_overlay(ImDrawList* dl, float ox, float oy, float w, 
 						"bin",
 						path_buf, sizeof(path_buf),
 						"debugger_view::modules_dump")) {
-					uint64_t base_copy = base;
-					uint64_t size_copy = size;
+					uint64_t base_copy = dump_target.base;
+					uint64_t size_copy = dump_target.size;
 					std::string path_copy = path_buf;
-					std::string name_copy = name;
+					std::string name_copy = dump_target.name;
 					work_queue::post([base_copy, size_copy, path_copy, name_copy]() {
 						std::vector<uint8_t> buf;
 						bool read_ok = driver_bridge::read_memory(base_copy,
@@ -2169,46 +2178,43 @@ static void render_modules_overlay(ImDrawList* dl, float ox, float oy, float w, 
 		}
 	}
 	ImGui::SameLine(0.f, btn_gap);
-
-	bool inject_clicked = aida::ui::button("Inject DLL...",
-		aida::ui::button_kind_t::secondary,
-		aida::ui::size_t_::sm, ImVec2(btn_w, btn_h),
-		true);
-	if (inject_clicked) {
-		anti_tamper::webhook::write_log("dbg_audit",
-			"[dbg_audit] BROKEN feature=modules_inject_dll reason=driver_bridge_has_no_LoadLibrary_helper");
+	aida::ui::pill_kind(
+		selected.present ? "Module selected" : (selection_stale ? "Selection unloaded" : "No module selected"),
+		selected.present ? aida::ui::pill_kind_t::success :
+			(selection_stale ? aida::ui::pill_kind_t::warning : aida::ui::pill_kind_t::neutral),
+		aida::ui::size_t_::sm, false);
+	if (ImGui::IsItemHovered() && selected.base != 0) {
+		char tip[256];
+		std::snprintf(tip, sizeof(tip), "%s base=0x%016llX",
+			selected.name.empty() ? "Selected module" : selected.name.c_str(),
+			static_cast<unsigned long long>(selected.base));
+		ImGui::SetTooltip("%s", tip);
 	}
-	if (ImGui::IsItemHovered())
-		ImGui::SetTooltip(
-			"Inject DLL is not wired: driver_bridge does not expose a remote LoadLibrary helper. "
-			"Use the manual mapper from the disassembly toolbar instead.");
 	ImGui::SameLine(0.f, btn_gap);
-
-	bool unload_clicked = aida::ui::button("Unload Module",
-		aida::ui::button_kind_t::secondary,
-		aida::ui::size_t_::sm, ImVec2(btn_w, btn_h),
-		true);
-	if (unload_clicked) {
-		anti_tamper::webhook::write_log("dbg_audit",
-			"[dbg_audit] BROKEN feature=modules_unload reason=driver_bridge_has_no_FreeLibrary_helper");
-	}
+	aida::ui::pill_kind("Inject unavailable", aida::ui::pill_kind_t::warning,
+		aida::ui::size_t_::sm, false);
 	if (ImGui::IsItemHovered())
-		ImGui::SetTooltip(
-			"Unload Module is not wired: driver_bridge does not expose a remote FreeLibrary helper. "
-			"Detach and use Process Hacker to unload.");
+		ImGui::SetTooltip("Remote LoadLibrary is not exposed by driver_bridge in this build.");
+	ImGui::SameLine(0.f, btn_gap);
+	aida::ui::pill_kind("Unload unavailable", aida::ui::pill_kind_t::warning,
+		aida::ui::size_t_::sm, false);
+	if (ImGui::IsItemHovered())
+		ImGui::SetTooltip("Remote FreeLibrary is not exposed by driver_bridge in this build.");
 	ImGui::PopID();
 
 	float cb_y = oy + overlay_h + 2.f;
 	float cb_h = 20.f;
 	float cb_w = w - 24.f;
+	const char* callout_text = selection_stale
+		? "Selected module is no longer loaded. Refresh modules or choose another row."
+		: "Dump uses kernel read_memory. Injection and unload require unavailable remote module helpers.";
 	ui_anim::render_inline_callout(dl, ox + 12.f, cb_y, cb_w, cb_h,
-		"Inject DLL and Unload Module are unavailable in this build (driver helpers missing). Dump uses kernel read_memory.",
+		callout_text,
 		ui_anim::callout_kind_t::info,
 		t.accent.x, t.accent.y, t.accent.z, a);
 }
 
 static void render_seh_overlay(ImDrawList* dl, float ox, float oy, float w, float a) {
-	auto& ui = g_ui;
 	const auto& t = aida::ui::resolved();
 
 	{
@@ -2218,39 +2224,37 @@ static void render_seh_overlay(ImDrawList* dl, float ox, float oy, float w, floa
 			anti_tamper::webhook::write_log("dbg_audit",
 				"[dbg_audit] seh enter ok=1");
 		}
+		static bool s_cap_logged_once = false;
+		if (!s_cap_logged_once) {
+			s_cap_logged_once = true;
+			anti_tamper::webhook::write_log("dbg_audit",
+				"[dbg_audit] seh capability_unavailable feature=seh_break_on_exception reason=driver_bridge_has_no_debug_event_subscription");
+		}
 	}
 
 	float overlay_h = 36.f;
 	float pad = 8.f;
 	float btn_h = 22.f;
-	float btn_w = 200.f;
+	float btn_gap = 6.f;
 
 	ImGui::SetCursorScreenPos(ImVec2(ox + pad, oy + (overlay_h - btn_h) * 0.5f));
 	ImGui::PushID("##seh_overlay");
-	bool break_clicked = aida::ui::button(
-		ui.seh_break_request_active
-			? "Break on Next Exception (armed)"
-			: "Break on Next Exception",
-		ui.seh_break_request_active
-			? aida::ui::button_kind_t::destructive
-			: aida::ui::button_kind_t::secondary,
-		aida::ui::size_t_::sm, ImVec2(btn_w + 40.f, btn_h),
-		true);
-	if (break_clicked) {
-		anti_tamper::webhook::write_log("dbg_audit",
-			"[dbg_audit] BROKEN feature=seh_break_on_exception reason=driver_bridge_has_no_debug_event_subscription");
-	}
+	aida::ui::pill_kind("SEH per active thread", aida::ui::pill_kind_t::info,
+		aida::ui::size_t_::sm, false);
 	if (ImGui::IsItemHovered())
-		ImGui::SetTooltip(
-			"Break on Exception requires a debug-event subscription that this build's driver_bridge does not expose. "
-			"Use a HW BP on the SEH handler address instead.");
+		ImGui::SetTooltip("Refresh reads the chain for the active debugger thread.");
+	ImGui::SameLine(0.f, btn_gap);
+	aida::ui::pill_kind("Debug-event break unavailable", aida::ui::pill_kind_t::warning,
+		aida::ui::size_t_::sm, false);
+	if (ImGui::IsItemHovered())
+		ImGui::SetTooltip("driver_bridge does not expose a debug-event subscription in this build.");
 	ImGui::PopID();
 
 	float cb_y = oy + overlay_h + 2.f;
 	float cb_h = 20.f;
 	float cb_w = w - 24.f;
 	ui_anim::render_inline_callout(dl, ox + 12.f, cb_y, cb_w, cb_h,
-		"Break-on-next-exception is unavailable (no debug-event channel). Use HW exec breakpoint on the handler address instead.",
+		"No debug-event channel is exposed. Use a hardware execute breakpoint on a handler address.",
 		ui_anim::callout_kind_t::warn,
 		t.accent.x, t.accent.y, t.accent.z, a);
 }

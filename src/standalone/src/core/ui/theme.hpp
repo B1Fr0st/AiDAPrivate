@@ -69,6 +69,83 @@ namespace aida::ui {
 		ImU32 syn_operator;
 	};
 
+	inline float ui_scale_for_dpi(float dpi_scale) {
+		if (!(dpi_scale > 0.f)) return 1.f;
+		if (dpi_scale < 0.85f) return 0.85f;
+		if (dpi_scale > 2.50f) return 2.50f;
+		return dpi_scale;
+	}
+
+	inline float scale_px(float value, float dpi_scale) {
+		float scaled = value * ui_scale_for_dpi(dpi_scale);
+		if (scaled >= 1.f)
+			return static_cast<float>(static_cast<int>(scaled + 0.5f));
+		return scaled;
+	}
+
+	struct shell_metrics_t {
+		float scale = 1.f;
+		float pad = 6.f;
+		float gap = 4.f;
+		float title_h = 34.f;
+		float menu_h = 30.f;
+		float status_h = 24.f;
+		float splitter_w = 5.f;
+		float corner_radius = 8.f;
+		float panel_radius = 6.f;
+		float control_radius = 6.f;
+		float title_logo = 22.f;
+		float title_control = 24.f;
+		float title_font = 14.f;
+		float caption_font = 12.f;
+		float menu_font = 14.f;
+		float menu_pad_x = 12.f;
+		float menu_item_pad_x = 12.f;
+		float activity_bar_w = 56.f;
+		float activity_icon = 36.f;
+		float activity_footer_h = 52.f;
+		float bottom_tab_h = 26.f;
+		float bottom_action_h = 22.f;
+		float status_pad_x = 10.f;
+		float status_gap = 8.f;
+		float status_segment_pad_x = 7.f;
+		float status_dot_r = 3.f;
+		float min_panel_w = 96.f;
+	};
+
+	inline shell_metrics_t shell_metrics(float dpi_scale) {
+		const float s = ui_scale_for_dpi(dpi_scale);
+		shell_metrics_t m;
+		m.scale = s;
+		m.pad = scale_px(6.f, s);
+		m.gap = scale_px(4.f, s);
+		m.title_h = scale_px(34.f, s);
+		m.menu_h = scale_px(30.f, s);
+		m.status_h = scale_px(24.f, s);
+		m.splitter_w = scale_px(5.f, s);
+		m.corner_radius = scale_px(8.f, s);
+		m.panel_radius = scale_px(6.f, s);
+		m.control_radius = scale_px(6.f, s);
+		m.title_logo = scale_px(22.f, s);
+		m.title_control = scale_px(24.f, s);
+		m.title_font = scale_px(14.f, s);
+		m.caption_font = scale_px(12.f, s);
+		m.menu_font = scale_px(14.f, s);
+		m.menu_pad_x = scale_px(12.f, s);
+		m.menu_item_pad_x = scale_px(12.f, s);
+		m.activity_bar_w = scale_px(56.f, s);
+		m.activity_icon = scale_px(36.f, s);
+		m.activity_footer_h = scale_px(52.f, s);
+		m.bottom_tab_h = scale_px(26.f, s);
+		m.bottom_action_h = scale_px(22.f, s);
+		m.status_pad_x = scale_px(10.f, s);
+		m.status_gap = scale_px(8.f, s);
+		m.status_segment_pad_x = scale_px(7.f, s);
+		m.status_dot_r = scale_px(3.f, s);
+		m.min_panel_w = scale_px(96.f, s);
+		return m;
+	}
+
 	namespace detail {
 
 		inline ImU32 from_rgba(int r, int g, int b, int a) { return IM_COL32(r, g, b, a); }
@@ -382,6 +459,7 @@ namespace aida::ui {
 		inline std::atomic<bool> s_user_override { false };
 		inline std::atomic<bool> s_swap_pending  { false };
 		inline std::atomic<uint32_t> s_theme_generation{ 1 };
+		inline float s_style_dpi_scale = 1.f;
 
 		inline ImU32 lerp_u32(ImU32 a, ImU32 b, float t) {
 			float ar = (float)((a >> IM_COL32_R_SHIFT) & 0xFF);
@@ -460,28 +538,38 @@ namespace aida::ui {
 
 	inline const theme_t& resolved() { return detail::s_resolved; }
 
+	inline void set_dpi_scale(float dpi_scale) {
+		detail::s_style_dpi_scale = ui_scale_for_dpi(dpi_scale);
+	}
+
+	inline float dpi_scale() {
+		return detail::s_style_dpi_scale;
+	}
+
 	inline uint32_t theme_generation() {
 		return detail::s_theme_generation.load(std::memory_order_acquire);
 	}
 
 	inline void apply_imgui_style(const theme_t& t) {
 		ImGuiStyle& s = ImGui::GetStyle();
+		s = ImGuiStyle();
+		const float ds = detail::s_style_dpi_scale;
 
-		s.WindowPadding     = ImVec2(16.f, 12.f);
-		s.FramePadding      = ImVec2(10.f, 6.f);
-		s.CellPadding       = ImVec2(8.f, 4.f);
-		s.ItemSpacing       = ImVec2(8.f, 6.f);
-		s.ItemInnerSpacing  = ImVec2(6.f, 4.f);
-		s.IndentSpacing     = 20.f;
-		s.ScrollbarSize     = 10.f;
-		s.GrabMinSize       = 12.f;
-		s.WindowRounding    = 12.f;
-		s.ChildRounding     = 10.f;
-		s.FrameRounding     = 8.f;
-		s.PopupRounding     = 14.f;
-		s.ScrollbarRounding = 10.f;
-		s.GrabRounding      = 6.f;
-		s.TabRounding       = 8.f;
+		s.WindowPadding     = ImVec2(scale_px(12.f, ds), scale_px(10.f, ds));
+		s.FramePadding      = ImVec2(scale_px(9.f, ds), scale_px(5.f, ds));
+		s.CellPadding       = ImVec2(scale_px(8.f, ds), scale_px(4.f, ds));
+		s.ItemSpacing       = ImVec2(scale_px(8.f, ds), scale_px(6.f, ds));
+		s.ItemInnerSpacing  = ImVec2(scale_px(6.f, ds), scale_px(4.f, ds));
+		s.IndentSpacing     = scale_px(18.f, ds);
+		s.ScrollbarSize     = scale_px(10.f, ds);
+		s.GrabMinSize       = scale_px(12.f, ds);
+		s.WindowRounding    = scale_px(8.f, ds);
+		s.ChildRounding     = scale_px(6.f, ds);
+		s.FrameRounding     = scale_px(6.f, ds);
+		s.PopupRounding     = scale_px(8.f, ds);
+		s.ScrollbarRounding = scale_px(8.f, ds);
+		s.GrabRounding      = scale_px(5.f, ds);
+		s.TabRounding       = scale_px(6.f, ds);
 		s.WindowBorderSize  = 0.f;
 		s.ChildBorderSize   = 0.f;
 		s.PopupBorderSize   = 0.f;
@@ -588,7 +676,7 @@ namespace aida::ui {
 	}
 
 	inline void use_dark()  { apply(detail::make_aida_dark()); }
-	inline void use_light() { apply(detail::make_midnight_light()); }
+	inline void use_light() { apply(detail::make_aida_light()); }
 
 	inline theme_t make_theme_for_index(int idx) {
 		switch (idx) {

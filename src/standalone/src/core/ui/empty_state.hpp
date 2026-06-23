@@ -5,6 +5,9 @@
 #include "clock.hpp"
 #include "motion.hpp"
 #include "fonts.hpp"
+#include "metrics.hpp"
+#include "responsive.hpp"
+#include "components.hpp"
 #include <vector>
 #include <string>
 
@@ -31,11 +34,27 @@ namespace aida::ui::empty_state {
 		std::string label;
 	};
 
+	struct action_t {
+		std::string id;
+		std::string label;
+		aida::ui::components::button_kind_t kind = aida::ui::components::button_kind_t::secondary;
+		bool disabled = false;
+		std::string tooltip;
+	};
+
+	struct render_result_t {
+		int action_index = -1;
+		std::string action_id;
+		bool activated() const { return action_index >= 0; }
+	};
+
 	struct config_t {
 		glyph_t     glyph = glyph_t::dots;
 		std::string title;
 		std::string body;
+		std::string footer;
 		std::vector<kbd_hint_t> hints;
+		std::vector<action_t> actions;
 		float       max_width = 360.f;
 	};
 
@@ -209,6 +228,105 @@ namespace aida::ui::empty_state {
 		}
 	}
 
+	inline void render_glyph_flask(ImDrawList* dl, ImVec2 center, float size, ImU32 col, float alpha) {
+		float neck_w = size * 0.20f;
+		float neck_h = size * 0.30f;
+		float body_w = size * 0.58f;
+		float body_h = size * 0.46f;
+		ImVec2 n0(center.x - neck_w * 0.5f, center.y - size * 0.42f);
+		ImVec2 n1(center.x + neck_w * 0.5f, center.y - size * 0.10f);
+		ImVec2 bl(center.x - body_w * 0.5f, center.y + body_h * 0.38f);
+		ImVec2 br(center.x + body_w * 0.5f, center.y + body_h * 0.38f);
+		ImVec2 sl(center.x - body_w * 0.22f, center.y - body_h * 0.08f);
+		ImVec2 sr(center.x + body_w * 0.22f, center.y - body_h * 0.08f);
+		dl->AddLine(ImVec2(n0.x, n0.y), ImVec2(n0.x, n0.y + neck_h), aida::ui::with_alpha(col, alpha * 0.75f), 1.5f);
+		dl->AddLine(ImVec2(n1.x, n0.y), ImVec2(n1.x, n1.y), aida::ui::with_alpha(col, alpha * 0.75f), 1.5f);
+		dl->AddLine(ImVec2(n0.x - size * 0.07f, n0.y), ImVec2(n1.x + size * 0.07f, n0.y), aida::ui::with_alpha(col, alpha * 0.78f), 1.5f);
+		dl->PathLineTo(sl);
+		dl->PathLineTo(bl);
+		dl->PathLineTo(br);
+		dl->PathLineTo(sr);
+		dl->PathStroke(aida::ui::with_alpha(col, alpha * 0.82f), ImDrawFlags_Closed, 1.6f);
+		float liquid_y = center.y + body_h * 0.12f;
+		dl->AddRectFilled(ImVec2(bl.x + size * 0.08f, liquid_y),
+			ImVec2(br.x - size * 0.08f, br.y - size * 0.06f),
+			aida::ui::with_alpha(col, alpha * 0.18f), size * 0.05f);
+		float t = aida::ui::clock::seconds();
+		for (int i = 0; i < 3; ++i) {
+			float bx = center.x - size * 0.18f + static_cast<float>(i) * size * 0.18f;
+			float by = center.y - size * 0.06f + sinf(t * 1.7f + static_cast<float>(i)) * size * 0.025f;
+			dl->AddCircleFilled(ImVec2(bx, by), size * 0.035f,
+				aida::ui::with_alpha(col, alpha * 0.45f), 12);
+		}
+	}
+
+	inline void render_glyph_bug(ImDrawList* dl, ImVec2 center, float size, ImU32 col, float alpha) {
+		float body_r = size * 0.22f;
+		float head_r = size * 0.13f;
+		ImVec2 body(center.x, center.y + size * 0.08f);
+		ImVec2 head(center.x, center.y - size * 0.23f);
+		dl->AddCircleFilled(body, body_r, aida::ui::with_alpha(col, alpha * 0.18f), 28);
+		dl->AddCircle(body, body_r, aida::ui::with_alpha(col, alpha * 0.78f), 28, 1.5f);
+		dl->AddCircle(head, head_r, aida::ui::with_alpha(col, alpha * 0.68f), 24, 1.4f);
+		dl->AddLine(ImVec2(center.x, body.y - body_r), ImVec2(center.x, body.y + body_r),
+			aida::ui::with_alpha(col, alpha * 0.45f), 1.f);
+		for (int i = 0; i < 3; ++i) {
+			float y = body.y - body_r * 0.55f + static_cast<float>(i) * body_r * 0.55f;
+			float span = size * (0.30f + static_cast<float>(i == 1) * 0.05f);
+			dl->AddLine(ImVec2(center.x - body_r * 0.76f, y), ImVec2(center.x - span, y + size * 0.06f),
+				aida::ui::with_alpha(col, alpha * 0.62f), 1.4f);
+			dl->AddLine(ImVec2(center.x + body_r * 0.76f, y), ImVec2(center.x + span, y + size * 0.06f),
+				aida::ui::with_alpha(col, alpha * 0.62f), 1.4f);
+		}
+		dl->AddLine(ImVec2(head.x - head_r * 0.5f, head.y - head_r * 0.75f),
+			ImVec2(head.x - size * 0.20f, head.y - size * 0.32f),
+			aida::ui::with_alpha(col, alpha * 0.60f), 1.2f);
+		dl->AddLine(ImVec2(head.x + head_r * 0.5f, head.y - head_r * 0.75f),
+			ImVec2(head.x + size * 0.20f, head.y - size * 0.32f),
+			aida::ui::with_alpha(col, alpha * 0.60f), 1.2f);
+	}
+
+	inline void render_glyph_flow(ImDrawList* dl, ImVec2 center, float size, ImU32 col, float alpha) {
+		ImVec2 nodes[4] = {
+			ImVec2(center.x - size * 0.28f, center.y - size * 0.22f),
+			ImVec2(center.x + size * 0.26f, center.y - size * 0.10f),
+			ImVec2(center.x - size * 0.18f, center.y + size * 0.24f),
+			ImVec2(center.x + size * 0.30f, center.y + size * 0.30f)
+		};
+		int edges[4][2] = { {0, 1}, {0, 2}, {1, 3}, {2, 3} };
+		float t = aida::ui::clock::seconds();
+		for (int i = 0; i < 4; ++i) {
+			ImVec2 a = nodes[edges[i][0]];
+			ImVec2 b = nodes[edges[i][1]];
+			float pulse = sinf(t * 1.5f + static_cast<float>(i) * 0.7f) * 0.5f + 0.5f;
+			dl->AddLine(a, b, aida::ui::with_alpha(col, alpha * (0.35f + pulse * 0.35f)), 1.5f);
+		}
+		for (int i = 0; i < 4; ++i) {
+			float r = (i == 0) ? size * 0.085f : size * 0.070f;
+			dl->AddCircleFilled(nodes[i], r + 2.f, aida::ui::with_alpha(col, alpha * 0.14f), 18);
+			dl->AddCircleFilled(nodes[i], r, aida::ui::with_alpha(col, alpha * 0.72f), 18);
+		}
+	}
+
+	inline void render_glyph_spark(ImDrawList* dl, ImVec2 center, float size, ImU32 col, float alpha) {
+		float t = aida::ui::clock::seconds();
+		float pulse = sinf(t * 1.8f) * 0.5f + 0.5f;
+		float r1 = size * (0.34f + pulse * 0.025f);
+		float r2 = size * 0.12f;
+		dl->AddQuadFilled(ImVec2(center.x, center.y - r1),
+			ImVec2(center.x + r2, center.y),
+			ImVec2(center.x, center.y + r1),
+			ImVec2(center.x - r2, center.y),
+			aida::ui::with_alpha(col, alpha * 0.18f));
+		for (int i = 0; i < 8; ++i) {
+			float a = -1.5707963f + static_cast<float>(i) * 0.7853982f;
+			float r = (i % 2 == 0) ? r1 : r2;
+			dl->PathLineTo(ImVec2(center.x + cosf(a) * r, center.y + sinf(a) * r));
+		}
+		dl->PathStroke(aida::ui::with_alpha(col, alpha * 0.78f), ImDrawFlags_Closed, 1.5f);
+		dl->AddCircleFilled(center, size * 0.045f, aida::ui::with_alpha(col, alpha * 0.90f), 12);
+	}
+
 	inline void render_glyph(glyph_t g, ImDrawList* dl, ImVec2 center, float size, ImU32 col, float alpha) {
 		switch (g) {
 			case glyph_t::dots:        render_glyph_dots(dl, center, size, col, alpha); break;
@@ -219,20 +337,79 @@ namespace aida::ui::empty_state {
 			case glyph_t::message:     render_glyph_message(dl, center, size, col, alpha); break;
 			case glyph_t::search:      render_glyph_search(dl, center, size, col, alpha); break;
 			case glyph_t::key:         render_glyph_key(dl, center, size, col, alpha); break;
+			case glyph_t::flask:       render_glyph_flask(dl, center, size, col, alpha); break;
 			case glyph_t::layers:      render_glyph_layers(dl, center, size, col, alpha); break;
 			case glyph_t::cpu:         render_glyph_cpu(dl, center, size, col, alpha); break;
+			case glyph_t::bug:         render_glyph_bug(dl, center, size, col, alpha); break;
+			case glyph_t::flow:        render_glyph_flow(dl, center, size, col, alpha); break;
+			case glyph_t::spark:       render_glyph_spark(dl, center, size, col, alpha); break;
 			default:                   render_glyph_message(dl, center, size, col, alpha); break;
 		}
 	}
 
-	inline void render(ImVec2 region_pos, ImVec2 region_size, const config_t& cfg) {
+	inline render_result_t render_actions(ImVec2 region_pos, ImVec2 region_size,
+		const config_t& cfg, float center_y, float body_bottom_y) {
+		render_result_t result;
+		if (cfg.actions.empty()) return result;
+		ImVec2 saved = ImGui::GetCursorScreenPos();
+		ImFont* font = ImGui::GetFont();
+		float fs = ImGui::GetFontSize();
+		float max_w = (std::min)(cfg.max_width, region_size.x - aida::ui::metrics::panel::padding * 2.f);
+		if (max_w < 120.f) max_w = (std::max)(1.f, region_size.x - aida::ui::metrics::panel::padding * 2.f);
+		float preferred_w = 132.f;
+		float compact_w = 108.f;
+		aida::ui::responsive::action_row_fit_t fit = aida::ui::responsive::fit_action_row(
+			max_w, static_cast<int>(cfg.actions.size()), preferred_w, compact_w);
+		float btn_h = aida::ui::metrics::control::height_md;
+		float y = body_bottom_y + aida::ui::metrics::spacing::lg;
+		float row_w = fit.stack ? fit.item_width :
+			fit.item_width * static_cast<float>(cfg.actions.size()) +
+			fit.gap * static_cast<float>(cfg.actions.size() - 1);
+		float x = region_pos.x + (region_size.x - row_w) * 0.5f;
+		if (fit.stack) {
+			x = region_pos.x + (region_size.x - fit.item_width) * 0.5f;
+			float total_h = static_cast<float>(cfg.actions.size()) * btn_h +
+				static_cast<float>(cfg.actions.size() - 1) * fit.gap;
+			float max_bottom = region_pos.y + region_size.y - aida::ui::metrics::panel::padding;
+			if (y + total_h > max_bottom) y = (std::max)(center_y + 44.f, max_bottom - total_h);
+		}
+		for (size_t i = 0; i < cfg.actions.size(); ++i) {
+			const auto& action = cfg.actions[i];
+			std::string stable_id = action.id.empty()
+				? std::string("empty_action_") + std::to_string(i)
+				: action.id;
+			std::string display = aida::ui::responsive::button_label_for_width(
+				action.label.c_str(), action.label.c_str(), font, fs, fit.item_width - 18.f);
+			ImGui::SetCursorScreenPos(ImVec2(x, y));
+			if (aida::ui::components::button(
+				(display + "##" + stable_id).c_str(),
+				action.kind,
+				aida::ui::components::size_t_::sm,
+				ImVec2(fit.item_width, btn_h),
+				action.disabled)) {
+				result.action_index = static_cast<int>(i);
+				result.action_id = stable_id;
+			}
+			if (!action.tooltip.empty()) aida::ui::components::tooltip_for_last_item(action.tooltip.c_str());
+			if (fit.stack) {
+				y += btn_h + fit.gap;
+			} else {
+				x += fit.item_width + fit.gap;
+			}
+		}
+		ImGui::SetCursorScreenPos(saved);
+		return result;
+	}
+
+	inline render_result_t render(ImVec2 region_pos, ImVec2 region_size, const config_t& cfg, float alpha = 1.f) {
+		render_result_t result;
 		const auto& t = aida::ui::resolved();
 		ImDrawList* dl = ImGui::GetWindowDrawList();
 		ImVec2 center = ImVec2(region_pos.x + region_size.x * 0.5f,
 		                        region_pos.y + region_size.y * 0.5f);
 		float glyph_size = 56.f;
 
-		render_glyph(cfg.glyph, dl, ImVec2(center.x, center.y - 60.f), glyph_size, t.accent_dim, 1.f);
+		render_glyph(cfg.glyph, dl, ImVec2(center.x, center.y - 60.f), glyph_size, t.accent_dim, alpha);
 
 		ImFont* body_font = ImGui::GetFont();
 		ImFont* title_font = aida::ui::fonts::body_strong();
@@ -246,16 +423,27 @@ namespace aida::ui::empty_state {
 			ImVec2 sz = title_font->CalcTextSizeA(title_size, FLT_MAX, 0.f, cfg.title.c_str());
 			dl->AddText(title_font, title_size,
 			            ImVec2(center.x - sz.x * 0.5f, center.y - 14.f),
-			            t.text_primary, cfg.title.c_str());
+			            aida::ui::with_alpha(t.text_primary, alpha), cfg.title.c_str());
 		}
+		float body_bottom_y = center.y + 16.f;
 		if (!cfg.body.empty()) {
 			float wrap = cfg.max_width;
 			ImVec2 sz = body_font->CalcTextSizeA(body_size, FLT_MAX, wrap, cfg.body.c_str());
 			ImVec2 origin = ImVec2(center.x - sz.x * 0.5f, center.y + 16.f);
-			dl->AddText(body_font, body_size, origin, t.text_secondary, cfg.body.c_str(),
+			dl->AddText(body_font, body_size, origin, aida::ui::with_alpha(t.text_secondary, alpha), cfg.body.c_str(),
 			            nullptr, wrap);
+			body_bottom_y = origin.y + sz.y;
+		}
+		if (!cfg.footer.empty()) {
+			float wrap = cfg.max_width;
+			float footer_size = ui_size * 0.78f;
+			ImVec2 sz = body_font->CalcTextSizeA(footer_size, FLT_MAX, wrap, cfg.footer.c_str());
+			ImVec2 origin = ImVec2(center.x - sz.x * 0.5f, body_bottom_y + aida::ui::metrics::spacing::md);
+			dl->AddText(body_font, footer_size, origin, aida::ui::with_alpha(t.accent_u32, alpha), cfg.footer.c_str(), nullptr, wrap);
+			body_bottom_y = origin.y + sz.y;
 		}
 		ImFont* font = body_font;
+		result = render_actions(region_pos, region_size, cfg, center.y, body_bottom_y);
 
 		if (!cfg.hints.empty()) {
 			float pad_x = 8.f, pad_y = 4.f;
@@ -273,13 +461,37 @@ namespace aida::ui::empty_state {
 				ImVec2 sz = font->CalcTextSizeA(hint_size, FLT_MAX, 0.f, h.label.c_str());
 				ImVec2 a = ImVec2(x, y);
 				ImVec2 b = ImVec2(x + sz.x + pad_x * 2.f, y + kbd_h);
-				dl->AddRectFilled(a, b, t.panel_header, 6.f);
-				dl->AddRect(a, b, t.border_subtle, 6.f, 0, 1.f);
+				dl->AddRectFilled(a, b, aida::ui::with_alpha(t.panel_header, alpha), 6.f);
+				dl->AddRect(a, b, aida::ui::with_alpha(t.border_subtle, alpha), 6.f, 0, 1.f);
 				dl->AddText(font, hint_size, ImVec2(a.x + pad_x, a.y + pad_y - 1.f),
-				            t.text_secondary, h.label.c_str());
+				            aida::ui::with_alpha(t.text_secondary, alpha), h.label.c_str());
 				x += sz.x + pad_x * 2.f + gap;
 			}
 		}
+		return result;
+	}
+
+	inline render_result_t render_panel(ImVec2 region_pos, ImVec2 region_size,
+		const config_t& cfg, float alpha = 1.f) {
+		const auto& t = aida::ui::resolved();
+		ImDrawList* dl = ImGui::GetWindowDrawList();
+		ImVec2 card_size = aida::ui::responsive::clamp_overlay_panel(
+			region_size, ImVec2(480.f, cfg.actions.empty() ? 300.f : 330.f), ImVec2(280.f, 220.f));
+		ImVec2 card_pos(region_pos.x + (region_size.x - card_size.x) * 0.5f,
+			region_pos.y + (region_size.y - card_size.y) * 0.5f);
+		ImVec2 card_max(card_pos.x + card_size.x, card_pos.y + card_size.y);
+		dl->AddRectFilled(card_pos, card_max,
+			aida::ui::with_alpha(t.panel_bg, alpha * 0.92f), aida::ui::metrics::radius::lg);
+		dl->AddRect(card_pos, card_max,
+			aida::ui::with_alpha(t.border_subtle, alpha * 0.85f),
+			aida::ui::metrics::radius::lg, 0, 1.2f);
+		config_t local = cfg;
+		float inner_pad = aida::ui::metrics::panel::padding * 2.f;
+		local.max_width = (std::min)(cfg.max_width, (std::max)(120.f, card_size.x - inner_pad));
+		ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * alpha);
+		render_result_t result = render(card_pos, card_size, local, alpha);
+		ImGui::PopStyleVar();
+		return result;
 	}
 
 }

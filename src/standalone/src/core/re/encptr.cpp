@@ -43,6 +43,27 @@ bool canonical_pointer(std::uint64_t value)
     return (value & 0x7ull) == 0 && canonical_address(value);
 }
 
+int transform_specificity(const std::string& type, std::uint64_t key, bool derived_key)
+{
+    if (type == "identity" || type == "deref")
+        return 1000;
+    if (type == "xor_address")
+        return derived_key ? 840 : 930;
+    if (type == "rol" || type == "ror")
+        return 880 - static_cast<int>(std::min<std::uint64_t>(key & 63ull, 32ull));
+    if (type == "add" || type == "sub")
+    {
+        if (key <= 0x1000ull)
+            return 780;
+        if (key <= 0x100000ull)
+            return 720;
+        return derived_key ? 560 : 640;
+    }
+    if (type == "xor")
+        return derived_key ? 500 : 620;
+    return 400;
+}
+
 bool valid_address(std::uint32_t pid, std::uint64_t value)
 {
     if (!canonical_address(value))
@@ -71,16 +92,61 @@ bool add_signed(std::uint64_t value, std::int64_t delta, std::uint64_t& out)
     return true;
 }
 
-json transform_json(const std::string& type, std::uint64_t key, std::uint64_t raw, std::uint64_t expected, std::uint64_t address, bool has_address)
+json transform_json(const std::string& type,
+                    std::uint64_t key,
+                    std::uint64_t raw,
+                    std::uint64_t expected,
+                    std::uint64_t address,
+                    bool has_address,
+                    bool derived_key = false)
 {
     json out;
     out["transform_type"] = type;
     out["key"] = sa_format_address(key);
     out["raw_value"] = sa_format_address(raw);
     out["expected_next"] = sa_format_address(expected);
+    out["specificity"] = transform_specificity(type, key, derived_key);
+    out["derived_key"] = derived_key;
     if (has_address)
         out["address_va"] = sa_format_address(address);
     return out;
+}
+
+void rank_transform_json(std::vector<json>& items)
+{
+    for (auto& item : items)
+    {
+        const std::string type = item.value("transform_type", std::string());
+        std::uint64_t key = 0;
+        if (item.contains("key"))
+            parse_u64_value(item["key"], key);
+        const bool derived = item.value("derived_key", false);
+        item["specificity"] = transform_specificity(type, key, derived);
+    }
+    std::stable_sort(items.begin(), items.end(), [](const json& a, const json& b) {
+        const int sa = a.value("specificity", 0);
+        const int sb = b.value("specificity", 0);
+        if (sa != sb)
+            return sa > sb;
+        return a.value("transform_type", std::string()) < b.value("transform_type", std::string());
+    });
+    const bool ambiguous = items.size() > 1;
+    const int top_specificity = items.empty() ? 0 : items.front().value("specificity", 0);
+    std::size_t top_tie_count = 0;
+    for (const auto& item : items)
+    {
+        if (item.value("specificity", 0) == top_specificity)
+            ++top_tie_count;
+    }
+    for (std::size_t i = 0; i < items.size(); ++i)
+    {
+        items[i]["rank"] = i + 1;
+        items[i]["ambiguous"] = ambiguous;
+        items[i]["top_specificity"] = top_specificity;
+        items[i]["top_tie"] = items[i].value("specificity", 0) == top_specificity;
+        items[i]["top_tie_count"] = top_tie_count;
+        items[i]["specificity_margin_from_top"] = top_specificity - items[i].value("specificity", 0);
+    }
 }
 
 std::vector<std::uint64_t> numeric_array_param(const json& params, const char* key)
@@ -123,7 +189,9 @@ std::vector<json> detect_transforms(std::uint64_t raw,
         if (has_address && (raw ^ address) == expected)
             out.push_back(transform_json("xor_address", 0, raw, expected, address, true));
         if (allow_derived_keys && raw != expected)
-            out.push_back(transform_json("xor", raw ^ expected, raw, expected, address, has_address));
+            out.push_back(transform_json("xor", raw ^ expected, raw, expected, address, has_address, true));
+        if (allow_derived_keys && has_address && (raw ^ address) != expected)
+            out.push_back(transform_json("xor_address", raw ^ address ^ expected, raw, expected, address, true, true));
     }
     if (test_add)
     {
@@ -131,13 +199,13 @@ std::vector<json> detect_transforms(std::uint64_t raw,
         {
             const std::uint64_t key = expected - raw;
             if (allow_derived_keys || key <= 0x100000ull)
-                out.push_back(transform_json("add", key, raw, expected, address, has_address));
+                out.push_back(transform_json("add", key, raw, expected, address, has_address, allow_derived_keys));
         }
         if (raw >= expected)
         {
             const std::uint64_t key = raw - expected;
             if (allow_derived_keys || key <= 0x100000ull)
-                out.push_back(transform_json("sub", key, raw, expected, address, has_address));
+                out.push_back(transform_json("sub", key, raw, expected, address, has_address, allow_derived_keys));
         }
     }
     if (test_rol)
@@ -150,6 +218,7 @@ std::vector<json> detect_transforms(std::uint64_t raw,
                 out.push_back(transform_json("ror", bits, raw, expected, address, has_address));
         }
     }
+    rank_transform_json(out);
     return out;
 }
 
@@ -181,28 +250,62 @@ struct transform_candidate_t
     std::string type;
     std::uint64_t key = 0;
     std::uint64_t result = 0;
+    int specificity = 0;
+    bool derived_key = false;
+    bool exact_target = false;
 };
 
 void add_candidate(std::vector<transform_candidate_t>& out,
                    std::set<std::pair<std::string, std::uint64_t>>& seen,
                    const std::string& type,
                    std::uint64_t key,
-                   std::uint64_t result)
+                   std::uint64_t result,
+                   bool derived_key = false)
 {
     if (!canonical_address(result))
         return;
     if (seen.insert({type + ":" + sa_format_address(key), result}).second)
-        out.push_back({type, key, result});
+        out.push_back({type, key, result, transform_specificity(type, key, derived_key), derived_key, false});
+}
+
+std::vector<std::uint64_t> common_add_sub_keys()
+{
+    std::vector<std::uint64_t> keys;
+    for (std::uint64_t value = 8; value <= 0x100; value += 8)
+        keys.push_back(value);
+    for (std::uint64_t value = 0x200; value <= 0x1000; value <<= 1)
+        keys.push_back(value);
+    keys.push_back(0x10000);
+    keys.push_back(0x100000);
+    return keys;
+}
+
+void append_unique_keys(std::vector<std::uint64_t>& dst, const std::vector<std::uint64_t>& src)
+{
+    for (auto key : src)
+    {
+        if (std::find(dst.begin(), dst.end(), key) == dst.end())
+            dst.push_back(key);
+    }
+}
+
+void append_unique_key(std::vector<std::uint64_t>& dst, std::uint64_t key)
+{
+    if (std::find(dst.begin(), dst.end(), key) == dst.end())
+        dst.push_back(key);
 }
 
 std::vector<transform_candidate_t> build_candidates(std::uint64_t raw,
                                                     std::uint64_t slot_va,
+                                                    std::uint64_t final_target,
                                                     const std::vector<std::uint64_t>& xor_keys,
                                                     const std::vector<std::uint64_t>& add_keys,
                                                     const std::vector<std::uint64_t>& sub_keys,
                                                     bool test_xor,
                                                     bool test_rol,
-                                                    bool test_add)
+                                                    bool test_add,
+                                                    bool auto_derive,
+                                                    std::size_t max_candidates)
 {
     std::vector<transform_candidate_t> out;
     std::set<std::pair<std::string, std::uint64_t>> seen;
@@ -212,18 +315,35 @@ std::vector<transform_candidate_t> build_candidates(std::uint64_t raw,
         add_candidate(out, seen, "xor_address", 0, raw ^ slot_va);
         for (auto key : xor_keys)
             add_candidate(out, seen, "xor", key, raw ^ key);
+        if (auto_derive && final_target != 0)
+        {
+            add_candidate(out, seen, "xor", raw ^ final_target, final_target, true);
+            add_candidate(out, seen, "xor_address", raw ^ slot_va ^ final_target, final_target, true);
+        }
     }
     if (test_add)
     {
-        for (auto key : add_keys)
+        std::vector<std::uint64_t> effective_add_keys = add_keys;
+        std::vector<std::uint64_t> effective_sub_keys = sub_keys;
+        if (auto_derive)
+        {
+            const auto common = common_add_sub_keys();
+            append_unique_keys(effective_add_keys, common);
+            append_unique_keys(effective_sub_keys, common);
+            if (final_target != 0 && final_target >= raw)
+                append_unique_key(effective_add_keys, final_target - raw);
+            if (final_target != 0 && raw >= final_target)
+                append_unique_key(effective_sub_keys, raw - final_target);
+        }
+        for (auto key : effective_add_keys)
         {
             if (raw <= UINT64_MAX - key)
-                add_candidate(out, seen, "add", key, raw + key);
+                add_candidate(out, seen, "add", key, raw + key, auto_derive && std::find(add_keys.begin(), add_keys.end(), key) == add_keys.end());
         }
-        for (auto key : sub_keys)
+        for (auto key : effective_sub_keys)
         {
             if (raw >= key)
-                add_candidate(out, seen, "sub", key, raw - key);
+                add_candidate(out, seen, "sub", key, raw - key, auto_derive && std::find(sub_keys.begin(), sub_keys.end(), key) == sub_keys.end());
         }
     }
     if (test_rol)
@@ -234,6 +354,19 @@ std::vector<transform_candidate_t> build_candidates(std::uint64_t raw,
             add_candidate(out, seen, "ror", bits, rotr64(raw, bits));
         }
     }
+    for (auto& candidate : out)
+        candidate.exact_target = final_target != 0 && candidate.result == final_target;
+    std::stable_sort(out.begin(), out.end(), [](const transform_candidate_t& a, const transform_candidate_t& b) {
+        if (a.exact_target != b.exact_target)
+            return a.exact_target;
+        if (a.specificity != b.specificity)
+            return a.specificity > b.specificity;
+        if (a.result != b.result)
+            return a.result < b.result;
+        return a.type < b.type;
+    });
+    if (out.size() > max_candidates)
+        out.resize(max_candidates);
     return out;
 }
 
@@ -243,9 +376,13 @@ json hop_json(const transform_candidate_t& candidate, std::int64_t offset, std::
     hop["type"] = candidate.type;
     hop["offset"] = offset;
     hop["value"] = sa_format_address(candidate.key);
+    hop["key"] = sa_format_address(candidate.key);
     hop["raw_value"] = sa_format_address(raw);
     hop["result"] = sa_format_address(candidate.result);
     hop["slot_va"] = sa_format_address(slot_va);
+    hop["specificity"] = candidate.specificity;
+    hop["derived_key"] = candidate.derived_key;
+    hop["exact_target"] = candidate.exact_target;
     return hop;
 }
 
@@ -285,6 +422,44 @@ std::string resolver_function_name(const json& params)
 {
     return sanitize_identifier(string_param(params, "function_name", "resolve_ptr"), "resolve_ptr");
 }
+
+bool select_chain_input(const json& params, json& out, std::string& error)
+{
+    const json* input = &params;
+    if (params.contains("chain") && params["chain"].is_object())
+        input = &params["chain"];
+    if (input->contains("chain") && (*input)["chain"].is_object())
+        input = &(*input)["chain"];
+    const std::size_t path_index = static_cast<std::size_t>(numeric_param(params, "path_index", 0, 0, 1024));
+    if (input->contains("paths") && (*input)["paths"].is_array())
+    {
+        const auto& paths = (*input)["paths"];
+        if (paths.empty())
+        {
+            error = "chain.paths is empty.";
+            return false;
+        }
+        if (path_index >= paths.size())
+        {
+            error = "'path_index' is outside chain.paths.";
+            return false;
+        }
+        if (!paths[path_index].is_object() || !paths[path_index].contains("hops"))
+        {
+            error = "Selected path is not a chain object.";
+            return false;
+        }
+        out = paths[path_index];
+        return true;
+    }
+    if (input->contains("hops") && (*input)["hops"].is_array())
+    {
+        out = *input;
+        return true;
+    }
+    error = "A chain object or scan result with paths is required.";
+    return false;
+}
 }
 
 tool_result_t detect_transform(const json& params)
@@ -306,6 +481,13 @@ tool_result_t detect_transform(const json& params)
     }
     result = transforms.front();
     result["candidates"] = transforms;
+    result["candidate_count"] = transforms.size();
+    result["ambiguity"] = {
+        {"candidate_count", transforms.size()},
+        {"top_specificity", result.value("top_specificity", result.value("specificity", 0))},
+        {"top_tie_count", result.value("top_tie_count", 1)},
+        {"selected_margin_from_top", result.value("specificity_margin_from_top", 0)}
+    };
     return tool_result_t::ok(result);
 }
 
@@ -326,8 +508,10 @@ tool_result_t scan_chain(const json& params)
     const bool test_xor = bool_param(params, "test_xor", true);
     const bool test_rol = bool_param(params, "test_rol", true);
     const bool test_add = bool_param(params, "test_add", true);
+    const bool auto_derive = bool_param(params, "auto_derive", true);
     const std::int64_t max_offset = static_cast<std::int64_t>(numeric_param(params, "max_offset", 0x400, 0, 0x4000));
     const std::size_t max_paths = static_cast<std::size_t>(numeric_param(params, "max_results", 64, 1, 512));
+    const std::size_t max_candidates_per_slot = static_cast<std::size_t>(numeric_param(params, "max_candidates_per_slot", 96, 8, 512));
     std::vector<std::uint64_t> xor_keys = numeric_array_param(params, "xor_keys");
     std::vector<std::uint64_t> add_keys = numeric_array_param(params, "add_keys");
     std::vector<std::uint64_t> sub_keys = numeric_array_param(params, "sub_keys");
@@ -376,7 +560,17 @@ tool_result_t scan_chain(const json& params)
                 std::uint64_t raw = 0;
                 if (!read_u64(scope.pid(), slot_va, raw))
                     continue;
-                auto candidates = build_candidates(raw, slot_va, xor_keys, add_keys, sub_keys, test_xor, test_rol, test_add);
+                auto candidates = build_candidates(raw,
+                                                   slot_va,
+                                                   target,
+                                                   xor_keys,
+                                                   add_keys,
+                                                   sub_keys,
+                                                   test_xor,
+                                                   test_rol,
+                                                   test_add,
+                                                   auto_derive,
+                                                   max_candidates_per_slot);
                 for (const auto& candidate : candidates)
                 {
                     if (candidate.result != target)
@@ -426,6 +620,8 @@ tool_result_t scan_chain(const json& params)
     result["process_id"] = scope.pid();
     result["source_va"] = sa_format_address(source);
     result["target_va"] = sa_format_address(target);
+    result["auto_derive"] = auto_derive;
+    result["max_candidates_per_slot"] = max_candidates_per_slot;
     if (auto module = find_module_for_address(scope.pid(), source))
     {
         result["source_module_name"] = module->name;
@@ -440,9 +636,11 @@ tool_result_t scan_chain(const json& params)
 
 tool_result_t emit_resolver(const json& params)
 {
-    if (!params.contains("chain") || !params["chain"].is_object())
-        return tool_result_t::error("'chain' object is required.");
-    const json& chain = params["chain"];
+    json selected_chain;
+    std::string chain_error;
+    if (!select_chain_input(params, selected_chain, chain_error))
+        return tool_result_t::error(chain_error);
+    const json& chain = selected_chain;
     const std::string fn = resolver_function_name(params);
     const std::string base_symbol = sanitize_identifier(string_param(params, "base_symbol", "base"), "base");
     std::uint64_t source = 0;

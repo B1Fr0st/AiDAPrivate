@@ -91,6 +91,65 @@ static inline uint64_t now_ns() {
         std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
+static std::string trim_middle_to_width(ImFont* font, float font_size, const std::string& text, float max_w) {
+    if (text.empty() || max_w <= 0.f) return std::string();
+    if (!font || font->CalcTextSizeA(font_size, FLT_MAX, 0.f, text.c_str()).x <= max_w)
+        return text;
+    const char* ellipsis = "...";
+    const float ellipsis_w = font->CalcTextSizeA(font_size, FLT_MAX, 0.f, ellipsis).x;
+    if (ellipsis_w > max_w) return std::string();
+    size_t keep = text.size();
+    while (keep > 0) {
+        size_t left = (keep + 1) / 2;
+        size_t right = keep / 2;
+        if (left + right >= text.size()) {
+            --keep;
+            continue;
+        }
+        std::string candidate = text.substr(0, left) + ellipsis + text.substr(text.size() - right);
+        if (font->CalcTextSizeA(font_size, FLT_MAX, 0.f, candidate.c_str()).x <= max_w)
+            return candidate;
+        --keep;
+    }
+    return std::string();
+}
+
+static std::string format_byte_preview(const uint8_t* bytes, int len, int max_pairs, const char* overflow_suffix) {
+    if (!bytes || len <= 0 || max_pairs <= 0) return std::string();
+    char bytes_buf[128] = {};
+    int boff = 0;
+    int show_n = len < max_pairs ? len : max_pairs;
+    for (int b = 0; b < show_n && boff + 4 < static_cast<int>(sizeof(bytes_buf)); ++b) {
+        boff += std::snprintf(bytes_buf + boff, sizeof(bytes_buf) - boff,
+            b ? " %02X" : "%02X", static_cast<unsigned int>(bytes[b]));
+    }
+    if (len > max_pairs && overflow_suffix && boff + 4 < static_cast<int>(sizeof(bytes_buf))) {
+        std::snprintf(bytes_buf + boff, sizeof(bytes_buf) - boff, "%s", overflow_suffix);
+    }
+    return std::string(bytes_buf);
+}
+
+static std::string format_repeated_byte_preview(uint8_t value, uint64_t len, int max_pairs, const char* overflow_suffix) {
+    if (len == 0 || max_pairs <= 0) return std::string();
+    char bytes_buf[128] = {};
+    int boff = 0;
+    int show_n = len < static_cast<uint64_t>(max_pairs) ? static_cast<int>(len) : max_pairs;
+    for (int b = 0; b < show_n && boff + 4 < static_cast<int>(sizeof(bytes_buf)); ++b) {
+        boff += std::snprintf(bytes_buf + boff, sizeof(bytes_buf) - boff,
+            b ? " %02X" : "%02X", static_cast<unsigned int>(value));
+    }
+    if (len > static_cast<uint64_t>(max_pairs) && overflow_suffix && boff + 4 < static_cast<int>(sizeof(bytes_buf))) {
+        std::snprintf(bytes_buf + boff, sizeof(bytes_buf) - boff, "%s", overflow_suffix);
+    }
+    return std::string(bytes_buf);
+}
+
+static std::string byte_width_probe(int max_pairs, const char* overflow_suffix) {
+    uint8_t probe[16] = {};
+    for (int i = 0; i < 16; ++i) probe[i] = 0xFFu;
+    return format_byte_preview(probe, max_pairs + 1, max_pairs, overflow_suffix);
+}
+
 static inline bool throttle_active() {
     uint64_t until = s_throttle_until_ns.load(std::memory_order_acquire);
     if (until == 0) return false;
@@ -773,7 +832,7 @@ static std::string format_segment_address(const DisasmFile& file, uint64_t addr,
         std::snprintf(buf, sizeof(buf), "%s:+%08llX",
             seg.c_str(), static_cast<unsigned long long>(rva));
     } else {
-        std::snprintf(buf, sizeof(buf), "%s:%08llX",
+        std::snprintf(buf, sizeof(buf), "%s:%016llX",
             seg.c_str(), static_cast<unsigned long long>(addr));
     }
     return std::string(buf);
@@ -1791,9 +1850,9 @@ static void pad_to_visual_col(std::string& s, int target) {
 }
 
 static std::string addr_prefix(const std::string& seg, uint64_t addr) {
-    char buf[40];
+    char buf[96];
     const char* sp = seg.empty() ? ".text" : seg.c_str();
-    std::snprintf(buf, sizeof(buf), "%s:%08llX", sp, static_cast<unsigned long long>(addr));
+    std::snprintf(buf, sizeof(buf), "%s:%016llX", sp, static_cast<unsigned long long>(addr));
     return std::string(buf);
 }
 
@@ -4757,20 +4816,6 @@ void render(float pos_x, float pos_y, float width, float height,
     const float ch_w_safe = ch_w > 0.f ? ch_w : 7.f;
 
     const float gutter_w = 20.f;
-    const float seg_addr_chars = 22.f;
-    const char* const kBytesWidthProbe = "XX XX XX XX XX XX XX..";
-    const float bytes_pixel_w = code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f, kBytesWidthProbe).x;
-    const float mnem_chars = 6.f;
-    const float operand_chars = 28.f;
-    const float comment_indent_chars = static_cast<float>(ida_export::kColComment);
-
-    const float x_seg_addr = ox + gutter_w + 4.f;
-    const float x_bytes = x_seg_addr + seg_addr_chars * ch_w_safe + 2.f * ch_w_safe;
-    const float x_mnem = st.show_bytes
-        ? (x_bytes + bytes_pixel_w + 1.f * ch_w_safe)
-        : (x_seg_addr + seg_addr_chars * ch_w_safe + 2.f * ch_w_safe);
-    const float x_operand = x_mnem + mnem_chars * ch_w_safe;
-    const float x_comment = x_seg_addr + comment_indent_chars * ch_w_safe;
     const uint32_t cur_gen = s_format_gen.load(std::memory_order_acquire);
 
     dl->AddRectFilled(ImVec2(ox, oy_content), ImVec2(ox + width, oy_content + content_height),
@@ -4836,6 +4881,59 @@ void render(float pos_x, float pos_y, float width, float height,
         s_banner_row_hover.clear();
     }
 
+    const float x_seg_addr = ox + gutter_w + 4.f;
+    const float content_right = std::max(x_seg_addr + ch_w_safe, ox + width - 24.f);
+    const float min_addr_prefix_w = code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f,
+        (g_state.addr_format == addr_format_t::rva) ? ".text:+00000000" : ".text:0000000000000000").x;
+    float addr_prefix_w = min_addr_prefix_w;
+    auto measure_prefix = [&](uint64_t va, const std::string& seg_override) {
+        std::string seg = seg_override.empty() ? ida_section_name_for_va(file, va) : seg_override;
+        if (seg.empty()) seg = ".text";
+        char sample[96];
+        if (g_state.addr_format == addr_format_t::rva && file.image_base != 0 && va >= file.image_base) {
+            std::snprintf(sample, sizeof(sample), "%s:+%08llX",
+                seg.c_str(), static_cast<unsigned long long>(va - file.image_base));
+        } else {
+            char addr_part[32];
+            std::snprintf(addr_part, sizeof(addr_part), "%016llX",
+                static_cast<unsigned long long>(va));
+            std::snprintf(sample, sizeof(sample), "%s:%s", seg.c_str(), addr_part);
+        }
+        addr_prefix_w = std::max(addr_prefix_w,
+            code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f, sample).x);
+    };
+    if (banner_lines > 0) {
+        const uint64_t banner_addr = instrs.empty() ? file.image_base : instrs.front().addr;
+        const std::string banner_seg = instrs.empty()
+            ? std::string(".text")
+            : ida_export::section_for(banner_addr);
+        measure_prefix(banner_addr, banner_seg.empty() ? std::string(".text") : banner_seg);
+    }
+    if (first_row >= 0 && last_row >= first_row) {
+        const int sample_hi = std::min(last_row, first_row + 256);
+        for (int si = first_row; si <= sample_hi; ++si)
+            measure_prefix(instrs[si].addr, std::string());
+    }
+    const std::string bytes_probe = byte_width_probe(10, "...");
+    const float bytes_pixel_w = code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f, bytes_probe.c_str()).x;
+    const float mnem_chars = 7.f;
+    const float operand_chars = 28.f;
+    const float default_comment_x = x_seg_addr + static_cast<float>(ida_export::kColComment) * ch_w_safe;
+    const float min_tail_w = (mnem_chars + 12.f) * ch_w_safe;
+    const float max_prefix_w = std::max(min_addr_prefix_w,
+        content_right - x_seg_addr - min_tail_w - (st.show_bytes ? bytes_pixel_w + 3.f * ch_w_safe : 0.f));
+    addr_prefix_w = std::max(min_addr_prefix_w, std::min(addr_prefix_w, max_prefix_w));
+    const bool draw_bytes_column = st.show_bytes
+        && content_right - (x_seg_addr + addr_prefix_w + 3.f * ch_w_safe + bytes_pixel_w) > min_tail_w;
+    const float x_bytes = x_seg_addr + addr_prefix_w + 2.f * ch_w_safe;
+    const float x_mnem = draw_bytes_column
+        ? (x_bytes + bytes_pixel_w + 1.f * ch_w_safe)
+        : (x_seg_addr + addr_prefix_w + 2.f * ch_w_safe);
+    const float x_operand = x_mnem + mnem_chars * ch_w_safe;
+    const float x_comment = std::max(default_comment_x, x_operand + operand_chars * ch_w_safe);
+    const float prefix_clip_right = std::max(x_seg_addr + ch_w_safe,
+        std::min(x_seg_addr + addr_prefix_w, content_right));
+
     const int banner_sel_lo = (st.banner_sel_anchor < 0 || st.banner_sel_extent < 0)
         ? -1 : std::min(st.banner_sel_anchor, st.banner_sel_extent);
     const int banner_sel_hi = (st.banner_sel_anchor < 0 || st.banner_sel_extent < 0)
@@ -4853,9 +4951,22 @@ void render(float pos_x, float pos_y, float width, float height,
                 : ida_export::section_for(banner_addr);
             const std::string seg_part = banner_seg.empty() ? std::string(".text") : banner_seg;
             char addr_buf[24];
-            std::snprintf(addr_buf, sizeof(addr_buf), "%08llX",
-                static_cast<unsigned long long>(banner_addr));
-            const float seg_w = code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f, seg_part.c_str()).x;
+            if (g_state.addr_format == addr_format_t::rva && file.image_base != 0 && banner_addr >= file.image_base) {
+                std::snprintf(addr_buf, sizeof(addr_buf), "+%08llX",
+                    static_cast<unsigned long long>(banner_addr - file.image_base));
+            } else {
+                std::snprintf(addr_buf, sizeof(addr_buf), "%016llX",
+                    static_cast<unsigned long long>(banner_addr));
+            }
+            const float banner_colon_w = code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f, ":").x;
+            const float banner_addr_w = code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f, addr_buf).x;
+            const float banner_seg_max_w = prefix_clip_right - x_seg_addr - banner_addr_w - banner_colon_w - ch_w_safe;
+            const std::string seg_draw = banner_seg_max_w > ch_w_safe
+                ? trim_middle_to_width(code_font, code_size, seg_part, banner_seg_max_w)
+                : std::string();
+            const float seg_w = seg_draw.empty() ? 0.f
+                : code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f, seg_draw.c_str()).x;
+            ImVec4 prefix_clip(x_seg_addr, oy_content, prefix_clip_right, oy_content + content_height);
 
             for (int bi = b_first; bi <= b_last; ++bi) {
                 if (bi >= static_cast<int>(s_banner_cache.size())) break;
@@ -4888,18 +4999,27 @@ void render(float pos_x, float pos_y, float width, float height,
                         aida::ui::with_alpha(tk.accent_u32, a));
                 }
 
-                dl->AddText(code_font, code_size, ImVec2(x_seg_addr, y + disasm_text_oy),
-                    aida::ui::with_alpha(disasm_theme::segment(), a * 0.85f),
-                    seg_part.c_str());
-                dl->AddText(code_font, code_size, ImVec2(x_seg_addr + seg_w, y + disasm_text_oy),
-                    aida::ui::with_alpha(disasm_theme::separator(), a * 0.85f), ":");
-                dl->AddText(code_font, code_size, ImVec2(x_seg_addr + seg_w + ch_w_safe, y + disasm_text_oy),
-                    aida::ui::with_alpha(disasm_theme::address(), a * 0.85f), addr_buf);
+                if (!seg_draw.empty()) {
+                    dl->AddText(code_font, code_size, ImVec2(x_seg_addr, y + disasm_text_oy),
+                        aida::ui::with_alpha(disasm_theme::segment(), a * 0.85f),
+                        seg_draw.c_str(), nullptr, 0.f, &prefix_clip);
+                    dl->AddText(code_font, code_size, ImVec2(x_seg_addr + seg_w, y + disasm_text_oy),
+                        aida::ui::with_alpha(disasm_theme::separator(), a * 0.85f), ":",
+                        nullptr, 0.f, &prefix_clip);
+                    dl->AddText(code_font, code_size, ImVec2(x_seg_addr + seg_w + banner_colon_w, y + disasm_text_oy),
+                        aida::ui::with_alpha(disasm_theme::address(), a * 0.85f), addr_buf,
+                        nullptr, 0.f, &prefix_clip);
+                } else {
+                    dl->AddText(code_font, code_size, ImVec2(x_seg_addr, y + disasm_text_oy),
+                        aida::ui::with_alpha(disasm_theme::address(), a * 0.85f), addr_buf,
+                        nullptr, 0.f, &prefix_clip);
+                }
 
                 if (!bl.text.empty()) {
                     ImU32 col = aida::ui::with_alpha(bl.color, a);
+                    ImVec4 text_clip(x_banner_text, oy_content, content_right, oy_content + content_height);
                     dl->AddText(code_font, code_size, ImVec2(x_banner_text, y + disasm_text_oy),
-                        col, bl.text.c_str());
+                        col, bl.text.c_str(), nullptr, 0.f, &text_clip);
                 }
 
                 if (banner_row_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
@@ -5027,19 +5147,39 @@ void render(float pos_x, float pos_y, float width, float height,
         const std::string& seg_part = *seg_part_ptr;
         const std::string& addr_part = *addr_part_ptr;
         const float addr_text_oy = (line_h - code_size) * 0.5f;
+        const float colon_w = code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f, ":").x;
+        const float addr_w = code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f, addr_part.c_str()).x;
+        std::string seg_draw = seg_part;
+        float seg_draw_w = seg_part_w;
+        if (!seg_draw.empty()) {
+            const float seg_max_w = prefix_clip_right - x_seg_addr - addr_w - colon_w - ch_w_safe;
+            if (seg_max_w <= ch_w_safe) {
+                seg_draw.clear();
+                seg_draw_w = 0.f;
+            } else if (seg_draw_w > seg_max_w) {
+                seg_draw = trim_middle_to_width(code_font, code_size, seg_draw, seg_max_w);
+                seg_draw_w = seg_draw.empty() ? 0.f
+                    : code_font->CalcTextSizeA(code_size, FLT_MAX, 0.f, seg_draw.c_str()).x;
+            }
+        }
+        ImVec4 prefix_clip(x_seg_addr, oy_content, prefix_clip_right, oy_content + content_height);
         ImVec2 sp(x_seg_addr, yy + addr_text_oy - yoff);
-        dl->AddText(code_font, code_size, sp,
-            aida::ui::with_alpha(disasm_theme::segment(), row_alpha), seg_part.c_str());
-        if (!seg_part.empty()) {
-            ImVec2 cp(x_seg_addr + seg_part_w, yy + addr_text_oy - yoff);
+        if (!seg_draw.empty()) {
+            dl->AddText(code_font, code_size, sp,
+                aida::ui::with_alpha(disasm_theme::segment(), row_alpha), seg_draw.c_str(),
+                nullptr, 0.f, &prefix_clip);
+            ImVec2 cp(x_seg_addr + seg_draw_w, yy + addr_text_oy - yoff);
             dl->AddText(code_font, code_size, cp,
-                aida::ui::with_alpha(disasm_theme::separator(), row_alpha), ":");
-            ImVec2 ap(x_seg_addr + seg_part_w + ch_w_safe, yy + addr_text_oy - yoff);
+                aida::ui::with_alpha(disasm_theme::separator(), row_alpha), ":",
+                nullptr, 0.f, &prefix_clip);
+            ImVec2 ap(x_seg_addr + seg_draw_w + colon_w, yy + addr_text_oy - yoff);
             dl->AddText(code_font, code_size, ap,
-                aida::ui::with_alpha(disasm_theme::address(), row_alpha), addr_part.c_str());
+                aida::ui::with_alpha(disasm_theme::address(), row_alpha), addr_part.c_str(),
+                nullptr, 0.f, &prefix_clip);
         } else {
             dl->AddText(code_font, code_size, sp,
-                aida::ui::with_alpha(disasm_theme::address(), row_alpha), addr_part.c_str());
+                aida::ui::with_alpha(disasm_theme::address(), row_alpha), addr_part.c_str(),
+                nullptr, 0.f, &prefix_clip);
         }
     };
 
@@ -5051,7 +5191,10 @@ void render(float pos_x, float pos_y, float width, float height,
 
     const float disasm_text_oy = (line_h - code_size) * 0.5f;
     auto draw_text_at = [&](float xx, float yy, ImU32 col, const char* str, float yoff) {
-        dl->AddText(code_font, code_size, ImVec2(xx, yy + disasm_text_oy - yoff), col, str);
+        if (!str || !*str || xx >= content_right) return;
+        ImVec4 clip(ox, oy_content, content_right, oy_content + content_height);
+        dl->AddText(code_font, code_size, ImVec2(xx, yy + disasm_text_oy - yoff), col,
+            str, nullptr, 0.f, &clip);
     };
 
     auto fill_row_bg = [&](float yy, ImU32 col) {
@@ -5307,26 +5450,14 @@ void render(float pos_x, float pos_y, float width, float height,
                 draw_addr_prefix(y_directive, arun.addr, sec_name_a,
                     row_a_inner_a * 0.95f, row_y_off_a);
 
-                if (st.show_bytes) {
+                if (draw_bytes_column) {
                     uint64_t run_len = (arun.end > arun.addr) ? (arun.end - arun.addr) : 0;
                     const int max_pairs = 10;
-                    int show_n = run_len < static_cast<uint64_t>(max_pairs)
-                        ? static_cast<int>(run_len) : max_pairs;
-                    char bytes_buf[96] = {};
-                    int boff = 0;
-                    for (int b = 0; b < show_n && boff + 4 < static_cast<int>(sizeof(bytes_buf)); ++b) {
-                        boff += std::snprintf(bytes_buf + boff, sizeof(bytes_buf) - boff,
-                            b ? " %02X" : "%02X",
-                            static_cast<unsigned int>(arun.fill_byte));
-                    }
-                    if (run_len > static_cast<uint64_t>(max_pairs)
-                        && boff + 4 < static_cast<int>(sizeof(bytes_buf)))
-                    {
-                        std::snprintf(bytes_buf + boff, sizeof(bytes_buf) - boff, "...");
-                    }
+                    std::string bytes_buf = format_repeated_byte_preview(
+                        arun.fill_byte, run_len, max_pairs, "...");
                     ImU32 bytes_col = aida::ui::with_alpha(disasm_theme::bytes(),
                         row_a_inner_a);
-                    draw_text_at(x_bytes, y_directive, bytes_col, bytes_buf, row_y_off_a);
+                    draw_text_at(x_bytes, y_directive, bytes_col, bytes_buf.c_str(), row_y_off_a);
                 }
 
                 char align_buf[40];
@@ -5816,17 +5947,12 @@ void render(float pos_x, float pos_y, float width, float height,
 
         draw_addr_prefix_cached(y, &cache, ins.addr, sec_name, row_a_inner * 0.95f, row_y_off);
 
-        if (st.show_bytes) {
+        if (draw_bytes_column) {
             if (!cache.bytes_valid) {
-                char bytes_buf[96] = {};
-                int boff = 0;
                 int max_pairs = 7;
-                int show_n = ins.len < max_pairs ? ins.len : max_pairs;
-                for (int b = 0; b < show_n && boff + 4 < static_cast<int>(sizeof(bytes_buf)); b++)
-                    boff += std::snprintf(bytes_buf + boff, sizeof(bytes_buf) - boff,
-                        b ? " %02X" : "%02X", ins.raw[b]);
-                if (ins.len > max_pairs && boff + 4 < static_cast<int>(sizeof(bytes_buf))) {
-                    std::snprintf(bytes_buf + boff, sizeof(bytes_buf) - boff, "..");
+                std::string bytes_buf = format_byte_preview(
+                    ins.raw, ins.len, max_pairs, "..");
+                if (ins.len > max_pairs) {
                     s_bytes_overflow_log_seen.fetch_add(1, std::memory_order_relaxed);
                     uint32_t prev_max = s_bytes_overflow_log_max_len.load(std::memory_order_relaxed);
                     while (static_cast<uint32_t>(ins.len) > prev_max
@@ -6658,7 +6784,7 @@ void render(float pos_x, float pos_y, float width, float height,
         char line_buf[640];
         for (int bi = lo; bi <= hi; ++bi) {
             const auto& bl = s_banner_cache[bi];
-            std::snprintf(line_buf, sizeof(line_buf), "%s:%08llX %s",
+            std::snprintf(line_buf, sizeof(line_buf), "%s:%016llX %s",
                 banner_seg2.c_str(),
                 static_cast<unsigned long long>(banner_addr2),
                 bl.text.c_str());

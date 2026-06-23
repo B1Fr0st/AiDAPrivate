@@ -8,12 +8,15 @@
 #include "brand.hpp"
 #include "components.hpp"
 #include "fonts.hpp"
+#include "toast_notification.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
+#include <vector>
 
 
 namespace {
@@ -198,6 +201,53 @@ void parse_inline(const std::string& src, std::vector<inline_emit_t>& out) {
     }
 
     flush();
+}
+
+inline uint32_t block_hash(const std::string& a, const std::string& b, uint32_t seed = 2166136261u)
+{
+    uint32_t h = seed;
+    auto mix = [&](uint8_t v) {
+        h ^= v;
+        h *= 16777619u;
+    };
+    for (char c : a) mix((uint8_t)c);
+    mix(0x7cu);
+    for (char c : b) mix((uint8_t)c);
+    return h ? h : 1u;
+}
+
+inline float bounded_body_height(float natural_h, bool expanded, float collapsed_cap, float expanded_cap)
+{
+    float viewport_y = ImGui::GetIO().DisplaySize.y;
+    float cap = expanded ? expanded_cap : collapsed_cap;
+    if (viewport_y > 0.f) {
+        float viewport_cap = viewport_y * (expanded ? 0.58f : 0.36f);
+        cap = (std::min)(cap, (std::max)(collapsed_cap, viewport_cap));
+    }
+    return (std::min)(natural_h, cap);
+}
+
+inline float measured_max_line_width(ImFont* font, float fs, const std::string& text)
+{
+    float max_w = 0.f;
+    const char* base = text.data();
+    const char* p = base;
+    const char* end = base + text.size();
+    while (p <= end) {
+        const char* line_start = p;
+        while (p < end && *p != '\n') ++p;
+        ImVec2 sz = font->CalcTextSizeA(fs, FLT_MAX, 0.f, line_start, p);
+        if (sz.x > max_w) max_w = sz.x;
+        if (p >= end) break;
+        ++p;
+    }
+    return max_w;
+}
+
+inline void copied_toast(const char* message)
+{
+    toast_notification::push(message ? message : "Copied to clipboard",
+        toast_notification::toast_type_t::info, 2.2f);
 }
 
 }
@@ -487,6 +537,114 @@ static ImU32 token_color_for(syntax::token_type tt, const code_token_pal_t& p)
     }
 }
 
+struct payload_metrics_t {
+    int   line_count = 1;
+    float content_h = 0.f;
+    float content_w = 0.f;
+};
+
+static payload_metrics_t measure_payload_metrics(
+    const std::string& text,
+    ImFont* font,
+    float fs,
+    float line_h,
+    float min_w)
+{
+    payload_metrics_t m;
+    m.line_count = 1;
+    for (char c : text) if (c == '\n') ++m.line_count;
+    m.content_h = (float)m.line_count * line_h;
+    m.content_w = (std::max)(min_w + 1.f, measured_max_line_width(font, fs, text) + 10.f);
+    if (m.content_w > min_w + 1.5f) {
+        m.content_h += ImGui::GetStyle().ScrollbarSize + 2.f;
+    }
+    return m;
+}
+
+static void render_payload_scroll_child(
+    const char* id,
+    ImVec2 pos,
+    ImVec2 size,
+    const std::string& text,
+    const payload_metrics_t& metrics,
+    ImFont* font,
+    float fs,
+    float line_h,
+    float alpha,
+    bool json_tokens)
+{
+    if (size.x < 8.f || size.y < 8.f) return;
+
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 0.f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.f, 0.f));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.f, 0.f, 0.f, 0.f));
+    ImGui::SetCursorScreenPos(pos);
+    ImGui::BeginChild(id, size, false,
+        ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoNavFocus | ImGuiWindowFlags_HorizontalScrollbar);
+
+    ImVec2 content_origin = ImGui::GetCursorScreenPos();
+    ImGui::Dummy(ImVec2(metrics.content_w, metrics.content_h));
+    ImDrawList* child_dl = ImGui::GetWindowDrawList();
+
+    float text_x = content_origin.x + 4.f;
+    float text_y = content_origin.y;
+    if (json_tokens) {
+        auto json_def = syntax::lang_json();
+        std::vector<syntax::token_t> tokens;
+        syntax::tokenize(text, json_def, tokens);
+        code_token_pal_t pal = make_themed_token_palette(alpha);
+        float x = text_x;
+        float y = text_y;
+        for (size_t ti = 0; ti < tokens.size(); ++ti) {
+            const auto& tok = tokens[ti];
+            ImU32 col = token_color_for(tok.type, pal);
+            const char* sp = text.data() + tok.start;
+            size_t sl = tok.length;
+            size_t k = 0;
+            while (k < sl) {
+                char ch = sp[k];
+                if (ch == '\n') {
+                    y += line_h;
+                    x = text_x;
+                    ++k;
+                    continue;
+                }
+                if (ch == '\t') {
+                    ImVec2 tabsz = font->CalcTextSizeA(fs, FLT_MAX, 0.f, "  ");
+                    x += tabsz.x;
+                    ++k;
+                    continue;
+                }
+                size_t re = k;
+                while (re < sl && sp[re] != '\n' && sp[re] != '\t') ++re;
+                ImVec2 rs = font->CalcTextSizeA(fs, FLT_MAX, 0.f, sp + k, sp + re);
+                child_dl->AddText(font, fs, ImVec2(x, y), col, sp + k, sp + re);
+                x += rs.x;
+                k = re;
+            }
+        }
+    } else {
+        const auto& th = aida::ui::resolved();
+        ImU32 col = aida::ui::with_alpha(th.text_secondary, alpha);
+        const char* p = text.data();
+        const char* end = p + text.size();
+        float y = text_y;
+        while (p <= end) {
+            const char* line_start = p;
+            while (p < end && *p != '\n') ++p;
+            child_dl->AddText(font, fs, ImVec2(text_x, y), col, line_start, p);
+            y += line_h;
+            if (p >= end) break;
+            ++p;
+        }
+    }
+
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar(2);
+}
+
 
 float chat_render::render_code_block(
     ImDrawList* dl,
@@ -506,15 +664,36 @@ float chat_render::render_code_block(
     float code_fs = code_font->FontSize;
     if (code_fs <= 0.f) code_fs = ImGui::GetFontSize();
 
-    float pad      = 12.f;
+    float pad      = 10.f;
     float header_h = 32.f;
     float line_h   = code_fs + 4.f;
 
     int line_count = 1;
     for (char ch : code) if (ch == '\n') ++line_count;
 
-    float code_h  = (float)line_count * line_h + pad;
-    float total_h = header_h + code_h + pad * 0.5f;
+    char gutter_max[12];
+    snprintf(gutter_max, sizeof(gutter_max), "%d", line_count);
+    ImVec2 gmsz = code_font->CalcTextSizeA(code_fs, FLT_MAX, 0.f, gutter_max);
+    float gutter_w = gmsz.x + 18.f;
+    float code_area_w_pre = (std::max)(24.f, max_w - gutter_w - 1.f);
+    float max_line_w = measured_max_line_width(code_font, code_fs, code);
+    float content_w = (std::max)(code_area_w_pre + 1.f, max_line_w + 18.f);
+    float horizontal_scroll_extra = content_w > code_area_w_pre + 1.5f
+        ? ImGui::GetStyle().ScrollbarSize + 2.f
+        : 0.f;
+
+    uint32_t cb_hash = block_hash(code, language);
+    ImGui::PushID((int)(cb_hash & 0x7FFFFFFF));
+    ImGuiStorage* storage = ImGui::GetStateStorage();
+    ImGuiID expanded_id = ImGui::GetID("##cb_expanded");
+    bool expanded = storage->GetBool(expanded_id, false);
+
+    float natural_body_h = (float)line_count * line_h + pad + horizontal_scroll_extra;
+    float compact_body_h = bounded_body_height(natural_body_h, false, 260.f, 520.f);
+    float body_h = bounded_body_height(natural_body_h, expanded, 260.f, 520.f);
+    bool height_toggle = natural_body_h > compact_body_h + 0.5f;
+
+    float total_h = header_h + body_h;
     float block_w = max_w;
 
     ImVec2 bmin = origin;
@@ -536,7 +715,8 @@ float chat_render::render_code_block(
                 aida::ui::with_alpha(th.border_subtle, alpha), 1.f);
 
     std::string lang_label = language.empty() ? "code" : language;
-    for (char& c : lang_label) c = (char)tolower((unsigned char)c);
+    for (char& c : lang_label)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
 
     ImFont* ui_font = aida::ui::fonts::body_strong() ? aida::ui::fonts::body_strong() : ImGui::GetFont();
     float lang_fs = 13.f;
@@ -555,96 +735,58 @@ float chat_render::render_code_block(
                 ImVec2(lpmin.x + 8.f, lpmin.y + (lang_pill_h - lang_fs) * 0.5f),
                 aida::ui::with_alpha(th.accent_u32, alpha), lang_label.c_str());
 
-    const char* copy_label = ICON_COPY;
-    ImFont* icon_font = ImGui::GetFont();
-    float icon_fs = 14.f;
-    ImVec2 cts = icon_font->CalcTextSizeA(icon_fs, FLT_MAX, 0.f, copy_label);
-    float copy_btn_w = cts.x + 16.f;
-    float copy_btn_h = 22.f;
-    ImVec2 cmin(hmax.x - copy_btn_w - 10.f, hmin.y + (header_h - copy_btn_h) * 0.5f);
-    ImVec2 cmax(cmin.x + copy_btn_w, cmin.y + copy_btn_h);
+    float header_action_y = hmin.y + (header_h - aida::ui::metrics::control::icon_button) * 0.5f;
+    float action_x = hmax.x - 10.f - aida::ui::metrics::control::icon_button;
 
-    uint32_t cb_hash = 2166136261u;
-    cb_hash ^= (uint32_t)code.size(); cb_hash *= 16777619u;
-    size_t cb_hash_n = code.size() < 64 ? code.size() : 64;
-    for (size_t hi = 0; hi < cb_hash_n; ++hi) {
-        cb_hash ^= (uint8_t)code[hi];
-        cb_hash *= 16777619u;
-    }
-    cb_hash ^= (uint32_t)language.size(); cb_hash *= 16777619u;
-    for (char lc : language) { cb_hash ^= (uint8_t)lc; cb_hash *= 16777619u; }
-    ImGui::PushID((int)(cb_hash & 0x7FFFFFFF));
-    ImGuiID copy_id = ImGui::GetID("##cb_copy");
-    ImGui::SetCursorScreenPos(cmin);
-    ImGui::InvisibleButton("##cb_copy_btn", ImVec2(copy_btn_w, copy_btn_h));
-    bool copy_hov = ImGui::IsItemHovered();
-    bool copy_clk = ImGui::IsItemClicked();
-
-    auto& cb_st = aida::ui::components::detail::bstate(copy_id);
-    float chov  = cb_st.hover.tick(copy_hov, aida::ui::clock::dt());
-    float cflash = cb_st.flash.tick(aida::ui::clock::dt(), 2.5f);
-    if (copy_clk) { cb_st.flash.trigger(); ImGui::SetClipboardText(code.c_str()); }
-    ImGui::PopID();
-
-    ImU32 copy_fill = aida::ui::with_alpha(aida::ui::mix(th.panel_header, th.accent_grad_top, chov * 0.45f), alpha);
-    ImU32 copy_brd  = aida::ui::with_alpha(aida::ui::mix(th.border_subtle, th.accent_hover, chov), alpha);
-    dl->AddRectFilled(cmin, cmax, copy_fill, copy_btn_h * 0.5f);
-    dl->AddRect(cmin, cmax, copy_brd, copy_btn_h * 0.5f, 0, 1.f);
-    if (cflash > 0.001f) {
-        dl->AddRectFilled(cmin, cmax,
-            aida::ui::with_alpha(IM_COL32(255, 255, 255, 255), cflash * 0.18f * alpha),
-            copy_btn_h * 0.5f);
+    ImGuiID copy_state_id = ImGui::GetID("##cb_copy_state");
+    auto& copy_state = aida::ui::components::control_state(copy_state_id);
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * alpha);
+    ImGui::SetCursorScreenPos(ImVec2(action_x, header_action_y));
+    if (aida::ui::components::copy_button("##cb_copy_btn", &copy_state.flash, "Copy code")) {
+        ImGui::SetClipboardText(code.c_str());
+        copied_toast("Code block copied");
     }
 
-    ImU32 copy_text_col = aida::ui::with_alpha(
-        aida::ui::mix(th.text_secondary, th.accent_u32, chov), alpha);
-    dl->AddText(icon_font, icon_fs,
-                ImVec2(cmin.x + (copy_btn_w - cts.x) * 0.5f, cmin.y + (copy_btn_h - icon_fs) * 0.5f),
-                copy_text_col, copy_label);
-
-    if (cflash > 0.001f) {
-        aida::ui::brand::render_check_drawn(dl,
-            ImVec2(cmin.x + copy_btn_w * 0.5f, cmin.y + copy_btn_h * 0.5f),
-            10.f, 1.f - cflash,
-            aida::ui::with_alpha(th.success, alpha), 1.8f);
+    if (height_toggle) {
+        const char* label = expanded ? "Collapse" : "Expand";
+        float expand_w = expanded ? 72.f : 64.f;
+        action_x -= expand_w + 6.f;
+        if (action_x > lpmax.x + 8.f) {
+            ImGui::SetCursorScreenPos(ImVec2(action_x, hmin.y + (header_h - aida::ui::metrics::control::toolbar_h) * 0.5f));
+            if (aida::ui::components::toolbar_button("##cb_expand_btn", label, expanded, false,
+                    expanded ? "Use compact code block height" : "Show a taller code block", expand_w)) {
+                storage->SetBool(expanded_id, !expanded);
+            }
+        }
     }
+    ImGui::PopStyleVar();
 
     auto lang_def = get_lang_def(language);
     std::vector<syntax::token_t> tokens;
     syntax::tokenize(code, lang_def, tokens);
     code_token_pal_t pal = make_themed_token_palette(alpha);
 
-    char gutter_max[12];
-    snprintf(gutter_max, sizeof(gutter_max), "%d", line_count);
-    ImVec2 gmsz = code_font->CalcTextSizeA(code_fs, FLT_MAX, 0.f, gutter_max);
-    float gutter_w = gmsz.x + 18.f;
+    float body_top = hmax.y;
+    float body_bottom = bmax.y;
+    float code_area_x = bmin.x + gutter_w;
+    float code_area_w = code_area_w_pre;
+    float scroll_y = 0.f;
 
-    ImU32 gutter_bg = aida::ui::with_alpha(th.panel_header, alpha * 0.55f);
-    dl->AddRectFilled(
-        ImVec2(bmin.x, hmax.y),
-        ImVec2(bmin.x + gutter_w, bmax.y),
-        gutter_bg, 10.f, ImDrawFlags_RoundCornersBottomLeft);
-    dl->AddLine(
-        ImVec2(bmin.x + gutter_w, hmax.y + 1.f),
-        ImVec2(bmin.x + gutter_w, bmax.y - 1.f),
-        aida::ui::with_alpha(th.border_subtle, alpha), 1.f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 0.f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.f, 0.f));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.f, 0.f, 0.f, 0.f));
+    ImGui::SetCursorScreenPos(ImVec2(code_area_x, body_top));
+    ImGui::BeginChild("##cb_code_scroll", ImVec2(code_area_w, body_h), false,
+        ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoNavFocus | ImGuiWindowFlags_HorizontalScrollbar);
 
-    float code_origin_x = bmin.x + gutter_w + 8.f;
-    float code_origin_y = hmax.y + pad * 0.5f;
-    float cy = code_origin_y;
+    ImVec2 content_origin = ImGui::GetCursorScreenPos();
+    ImGui::Dummy(ImVec2(content_w, natural_body_h));
+    scroll_y = ImGui::GetScrollY();
 
-    auto draw_gutter_for_line = [&](int line_num) {
-        char buf[12];
-        snprintf(buf, sizeof(buf), "%d", line_num);
-        ImVec2 sz = code_font->CalcTextSizeA(code_fs, FLT_MAX, 0.f, buf);
-        ImU32 col = aida::ui::with_alpha(th.text_lineno, alpha);
-        dl->AddText(code_font, code_fs,
-            ImVec2(bmin.x + gutter_w - sz.x - 8.f, cy),
-            col, buf);
-    };
-
-    int line_num = 1;
-    draw_gutter_for_line(line_num);
+    ImDrawList* code_dl = ImGui::GetWindowDrawList();
+    float code_origin_x = content_origin.x + 8.f;
+    float cy = content_origin.y + pad * 0.5f;
 
     float text_x = code_origin_x;
     for (size_t ti = 0; ti < tokens.size(); ++ti) {
@@ -659,8 +801,6 @@ float chat_render::render_code_block(
             if (ch == '\n') {
                 cy += line_h;
                 text_x = code_origin_x;
-                ++line_num;
-                draw_gutter_for_line(line_num);
                 ++k;
                 continue;
             }
@@ -675,14 +815,47 @@ float chat_render::render_code_block(
                 ++run_end;
             ImVec2 run_sz = code_font->CalcTextSizeA(code_fs, FLT_MAX, 0.f,
                 span_start + k, span_start + run_end);
-            dl->AddText(code_font, code_fs, ImVec2(text_x, cy), col,
+            code_dl->AddText(code_font, code_fs, ImVec2(text_x, cy), col,
                 span_start + k, span_start + run_end);
             text_x += run_sz.x;
             k = run_end;
         }
     }
 
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar(2);
+
+    ImU32 gutter_bg = aida::ui::with_alpha(th.panel_header, alpha * 0.55f);
+    dl->AddRectFilled(
+        ImVec2(bmin.x, body_top),
+        ImVec2(bmin.x + gutter_w, body_bottom),
+        gutter_bg, 10.f, ImDrawFlags_RoundCornersBottomLeft);
+
+    dl->PushClipRect(ImVec2(bmin.x, body_top), ImVec2(bmin.x + gutter_w, body_bottom), true);
+    int first_line = (int)(scroll_y / line_h) + 1;
+    int last_line = (int)((scroll_y + body_h) / line_h) + 2;
+    if (first_line < 1) first_line = 1;
+    if (last_line > line_count) last_line = line_count;
+    for (int ln = first_line; ln <= last_line; ++ln) {
+        float gy = body_top + pad * 0.5f + (float)(ln - 1) * line_h - scroll_y;
+        char buf[12];
+        snprintf(buf, sizeof(buf), "%d", ln);
+        ImVec2 sz = code_font->CalcTextSizeA(code_fs, FLT_MAX, 0.f, buf);
+        ImU32 col = aida::ui::with_alpha(th.text_lineno, alpha);
+        dl->AddText(code_font, code_fs,
+            ImVec2(bmin.x + gutter_w - sz.x - 8.f, gy),
+            col, buf);
+    }
+    dl->PopClipRect();
+
+    dl->AddLine(
+        ImVec2(bmin.x + gutter_w, body_top + 1.f),
+        ImVec2(bmin.x + gutter_w, body_bottom - 1.f),
+        aida::ui::with_alpha(th.border_subtle, alpha), 1.f);
+
     (void)accent_r; (void)accent_g; (void)accent_b;
+    ImGui::PopID();
     return total_h;
 }
 
@@ -889,25 +1062,18 @@ static float render_tool_call_card(
 
     ImFont* code_font = aida::ui::fonts::code() ? aida::ui::fonts::code() : ImGui::GetFont();
     float code_fs = code_font->FontSize > 0.f ? code_font->FontSize : ImGui::GetFontSize();
-    int line_count = 1;
-    for (char c : payload) if (c == '\n') ++line_count;
     float code_line_h = code_fs + 4.f;
-    float full_body_h = (float)line_count * code_line_h + body_pad * 2.f;
-    if (full_body_h > 360.f) full_body_h = 360.f;
+    payload_metrics_t payload_metrics = measure_payload_metrics(
+        payload, code_font, code_fs, code_line_h, (std::max)(40.f, max_w - body_pad * 2.f));
+    float full_body_h = payload_metrics.content_h + body_pad * 2.f;
+    float visible_body_h = bounded_body_height(full_body_h, false, 300.f, 300.f);
 
-    float target_h = collapsed ? header_h : (header_h + full_body_h);
+    float target_h = collapsed ? header_h : (header_h + visible_body_h);
     float current_h = storage->GetFloat(anim_id, target_h);
     float current_v = storage->GetFloat(vel_id, 0.f);
     current_h = aida::motion::spring_step(current_h, target_h, current_v,
                                            aida::motion::spring::balanced, dt);
     storage->SetFloat(anim_id, current_h);
-
-    std::vector<syntax::token_t> jt;
-    bool body_visible = current_h > header_h + 4.f;
-    if (body_visible) {
-        auto json_def = syntax::lang_json();
-        syntax::tokenize(payload, json_def, jt);
-    }
     storage->SetFloat(vel_id, current_v);
 
     ImVec2 a = origin;
@@ -928,6 +1094,8 @@ static float render_tool_call_card(
     aida::ui::components::status_dot(status_center, 4.5f,
         aida::ui::with_alpha(th.warning, alpha), true, 1.4f);
 
+    ImGui::PushID(id_buf);
+
     char chev_buf[8];
     if (collapsed) std::strcpy(chev_buf, "\xe2\x96\xb6");
     else           std::strcpy(chev_buf, "\xe2\x96\xbc");
@@ -937,28 +1105,46 @@ static float render_tool_call_card(
         ImVec2(ha.x + 32.f, ha.y + (header_h - chsz.y) * 0.5f),
         aida::ui::with_alpha(th.text_secondary, alpha), chev_buf);
 
-    std::string label = std::string("\xe2\x9a\x99 ") + tool_name;
-    dl->AddText(ui_font, fs,
-        ImVec2(ha.x + 50.f, ha.y + (header_h - fs) * 0.5f),
-        aida::ui::with_alpha(th.text_primary, alpha), label.c_str());
+    const char* args_label = "args";
+    ImFont* tag_font = aida::ui::fonts::caption() ? aida::ui::fonts::caption() : ImGui::GetFont();
+    float tag_fs = 12.f;
+    ImVec2 ts = tag_font->CalcTextSizeA(tag_fs, FLT_MAX, 0.f, args_label);
+    float pill_w = ts.x + 14.f;
+    float pill_h = 16.f;
+    ImVec2 pa(hb.x - pill_w - 12.f, ha.y + (header_h - pill_h) * 0.5f);
+    ImVec2 pb(pa.x + pill_w, pa.y + pill_h);
+    float copy_side = aida::ui::metrics::control::icon_button;
+    float copy_x = pa.x - copy_side - 6.f;
+    float label_x = ha.x + 50.f;
+    float label_right = (copy_x > label_x + 76.f) ? copy_x - 8.f : pa.x - 8.f;
 
-    {
-        const char* args_label = "args";
-        ImFont* tag_font = aida::ui::fonts::caption() ? aida::ui::fonts::caption() : ImGui::GetFont();
-        float tag_fs = 12.f;
-        ImVec2 ts = tag_font->CalcTextSizeA(tag_fs, FLT_MAX, 0.f, args_label);
-        float pill_w = ts.x + 14.f;
-        float pill_h = 16.f;
-        ImVec2 pa(hb.x - pill_w - 12.f, ha.y + (header_h - pill_h) * 0.5f);
-        ImVec2 pb(pa.x + pill_w, pa.y + pill_h);
-        dl->AddRectFilled(pa, pb, aida::ui::with_alpha(th.accent_grad_top, alpha * 0.18f), pill_h * 0.5f);
-        dl->AddRect(pa, pb, aida::ui::with_alpha(th.accent_dim, alpha * 0.7f), pill_h * 0.5f, 0, 1.f);
-        dl->AddText(tag_font, tag_fs,
-            ImVec2(pa.x + 7.f, pa.y + (pill_h - tag_fs) * 0.5f),
-            aida::ui::with_alpha(th.accent_u32, alpha), args_label);
+    std::string label = std::string("\xe2\x9a\x99 ") + tool_name;
+    dl->PushClipRect(ImVec2(label_x, ha.y), ImVec2((std::max)(label_x, label_right), hb.y), true);
+    dl->AddText(ui_font, fs,
+        ImVec2(label_x, ha.y + (header_h - fs) * 0.5f),
+        aida::ui::with_alpha(th.text_primary, alpha), label.c_str());
+    dl->PopClipRect();
+
+    if (copy_x > label_x + 76.f) {
+        ImGuiID copy_state_id = ImGui::GetID("##tcc_copy_state");
+        auto& copy_state = aida::ui::components::control_state(copy_state_id);
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * alpha);
+        ImGui::SetCursorScreenPos(ImVec2(copy_x, ha.y + (header_h - copy_side) * 0.5f));
+        if (aida::ui::components::copy_button("##tcc_copy_btn", &copy_state.flash, "Copy tool arguments")) {
+            ImGui::SetClipboardText(payload.c_str());
+            copied_toast("Tool arguments copied");
+        }
+        ImGui::PopStyleVar();
     }
 
-    bool hov_header = ImGui::IsMouseHoveringRect(ha, hb);
+    dl->AddRectFilled(pa, pb, aida::ui::with_alpha(th.accent_grad_top, alpha * 0.18f), pill_h * 0.5f);
+    dl->AddRect(pa, pb, aida::ui::with_alpha(th.accent_dim, alpha * 0.7f), pill_h * 0.5f, 0, 1.f);
+    dl->AddText(tag_font, tag_fs,
+        ImVec2(pa.x + 7.f, pa.y + (pill_h - tag_fs) * 0.5f),
+        aida::ui::with_alpha(th.accent_u32, alpha), args_label);
+
+    float header_click_right = (copy_x > label_x + 76.f) ? copy_x - 4.f : pa.x - 4.f;
+    bool hov_header = ImGui::IsMouseHoveringRect(ha, ImVec2((std::max)(ha.x, header_click_right), hb.y));
     if (hov_header) {
         dl->AddRectFilled(ha, hb,
             aida::ui::with_alpha(IM_COL32(255, 255, 255, 255), alpha * 0.04f),
@@ -969,42 +1155,15 @@ static float render_tool_call_card(
     }
 
     if (current_h > header_h + 4.f) {
-        ImVec2 body_clip_a(a.x + 1.f, hb.y);
-        ImVec2 body_clip_b(b.x - 1.f, b.y - 1.f);
-        dl->PushClipRect(body_clip_a, body_clip_b, true);
-
-        code_token_pal_t pal = make_themed_token_palette(alpha);
-        float text_x = a.x + body_pad;
-        float text_y = hb.y + body_pad;
-
-        for (size_t ti = 0; ti < jt.size(); ++ti) {
-            const auto& tok = jt[ti];
-            ImU32 col = token_color_for(tok.type, pal);
-            const char* sp = payload.data() + tok.start;
-            size_t sl = tok.length;
-            size_t k = 0;
-            while (k < sl) {
-                char ch = sp[k];
-                if (ch == '\n') {
-                    text_y += code_line_h;
-                    text_x = a.x + body_pad;
-                    ++k; continue;
-                }
-                if (ch == '\t') {
-                    ImVec2 tabsz = code_font->CalcTextSizeA(code_fs, FLT_MAX, 0.f, "  ");
-                    text_x += tabsz.x; ++k; continue;
-                }
-                size_t re = k;
-                while (re < sl && sp[re] != '\n' && sp[re] != '\t') ++re;
-                ImVec2 rs = code_font->CalcTextSizeA(code_fs, FLT_MAX, 0.f, sp + k, sp + re);
-                dl->AddText(code_font, code_fs, ImVec2(text_x, text_y), col, sp + k, sp + re);
-                text_x += rs.x;
-                k = re;
-            }
-        }
-        dl->PopClipRect();
+        float body_visible_h = current_h - header_h;
+        ImVec2 child_pos(a.x + body_pad, hb.y + body_pad);
+        ImVec2 child_size((std::max)(24.f, max_w - body_pad * 2.f),
+            (std::max)(8.f, body_visible_h - body_pad * 2.f));
+        render_payload_scroll_child("##tcc_payload_scroll", child_pos, child_size,
+            payload, payload_metrics, code_font, code_fs, code_line_h, alpha, true);
     }
 
+    ImGui::PopID();
     return current_h;
 }
 
@@ -1025,14 +1184,17 @@ static float render_tool_result_card(
     float code_fs = code_font->FontSize > 0.f ? code_font->FontSize : ImGui::GetFontSize();
     float fs = 14.f;
 
-    std::string display = payload;
-    bool truncated = display.size() > 500;
-    if (truncated) display = display.substr(0, 500) + "\n... (truncated)";
-
     char ck_buf[64]; snprintf(ck_buf, sizeof(ck_buf), "trc_%d_%d", msg_idx, span_idx);
     ImGuiID col_id = ImGui::GetID(ck_buf);
     ImGuiStorage* storage = ImGui::GetStateStorage();
     bool collapsed = storage->GetBool(col_id, true);
+
+    char full_buf[64]; snprintf(full_buf, sizeof(full_buf), "trc_full_%d_%d", msg_idx, span_idx);
+    ImGuiID full_id = ImGui::GetID(full_buf);
+    bool show_full = storage->GetBool(full_id, false);
+
+    bool truncated = payload.size() > 500;
+    std::string display = (truncated && !show_full) ? payload.substr(0, 500) : payload;
 
     char ch_buf[64]; snprintf(ch_buf, sizeof(ch_buf), "trc_h_%d_%d", msg_idx, span_idx);
     ImGuiID anim_id = ImGui::GetID(ch_buf);
@@ -1041,11 +1203,13 @@ static float render_tool_result_card(
 
     float header_h = 32.f;
     float body_pad = 12.f;
-    ImVec2 wrap_sz = code_font->CalcTextSizeA(code_fs, max_w - body_pad * 2.f, max_w - body_pad * 2.f, display.c_str());
-    float full_body_h = wrap_sz.y + body_pad * 2.f;
-    if (full_body_h > 380.f) full_body_h = 380.f;
+    float code_line_h = code_fs + 4.f;
+    payload_metrics_t payload_metrics = measure_payload_metrics(
+        display, code_font, code_fs, code_line_h, (std::max)(40.f, max_w - body_pad * 2.f));
+    float full_body_h = payload_metrics.content_h + body_pad * 2.f;
+    float visible_body_h = bounded_body_height(full_body_h, show_full, 260.f, 380.f);
 
-    float target_h = collapsed ? header_h : (header_h + full_body_h);
+    float target_h = collapsed ? header_h : (header_h + visible_body_h);
     float current_h = storage->GetFloat(anim_id, target_h);
     float current_v = storage->GetFloat(vel_id, 0.f);
     current_h = aida::motion::spring_step(current_h, target_h, current_v,
@@ -1074,6 +1238,8 @@ static float render_tool_result_card(
     aida::ui::components::status_dot(status_c, 4.5f,
         aida::ui::with_alpha(th.success, alpha), true, 1.2f);
 
+    ImGui::PushID(ck_buf);
+
     char chev_buf[8];
     if (collapsed) std::strcpy(chev_buf, "\xe2\x96\xb6");
     else           std::strcpy(chev_buf, "\xe2\x96\xbc");
@@ -1084,47 +1250,46 @@ static float render_tool_result_card(
         aida::ui::with_alpha(th.text_secondary, alpha), chev_buf);
 
     char hdr_buf[96];
-    snprintf(hdr_buf, sizeof(hdr_buf), "result \xc2\xb7 %zu chars%s",
-        payload.size(), truncated ? " (truncated)" : "");
+    if (truncated && !show_full) {
+        snprintf(hdr_buf, sizeof(hdr_buf), "result \xc2\xb7 500 of %zu chars shown", payload.size());
+    } else {
+        snprintf(hdr_buf, sizeof(hdr_buf), "result \xc2\xb7 %zu chars", payload.size());
+    }
+
+    float copy_side = aida::ui::metrics::control::icon_button;
+    float action_x = hb.x - copy_side - 10.f;
+    float full_w = show_full ? 72.f : 52.f;
+    float full_x = action_x - full_w - 6.f;
+    bool full_button_visible = truncated && full_x > ha.x + 140.f;
+    float label_right = full_button_visible ? full_x - 8.f : action_x - 8.f;
+
+    dl->PushClipRect(ImVec2(ha.x + 46.f, ha.y), ImVec2((std::max)(ha.x + 46.f, label_right), hb.y), true);
     dl->AddText(ui_font, fs,
         ImVec2(ha.x + 46.f, ha.y + (header_h - fs) * 0.5f),
         aida::ui::with_alpha(th.text_primary, alpha), hdr_buf);
+    dl->PopClipRect();
 
-    float cb_w = 24.f;
-    float cb_h = 22.f;
-    ImVec2 cba(hb.x - cb_w - 10.f, ha.y + (header_h - cb_h) * 0.5f);
-    ImVec2 cbb(cba.x + cb_w, cba.y + cb_h);
-
-    char cid[64]; snprintf(cid, sizeof(cid), "trc_cp_%d_%d", msg_idx, span_idx);
-    ImGui::PushID(cid);
-    ImGuiID copy_id = ImGui::GetID("##cp");
-    ImGui::SetCursorScreenPos(cba);
-    ImGui::InvisibleButton("##cpbtn", ImVec2(cb_w, cb_h));
-    bool cp_hov = ImGui::IsItemHovered();
-    bool cp_clk = ImGui::IsItemClicked();
-    auto& cp_st = aida::ui::components::detail::bstate(copy_id);
-    float chov = cp_st.hover.tick(cp_hov, aida::ui::clock::dt());
-    float cflash = cp_st.flash.tick(aida::ui::clock::dt(), 2.5f);
-    if (cp_clk) { cp_st.flash.trigger(); ImGui::SetClipboardText(payload.c_str()); }
-    ImGui::PopID();
-
-    ImU32 cb_fill = aida::ui::with_alpha(aida::ui::mix(th.panel_header, th.accent_grad_top, chov * 0.45f), alpha);
-    ImU32 cb_brd  = aida::ui::with_alpha(aida::ui::mix(th.border_subtle, th.accent_hover, chov), alpha);
-    dl->AddRectFilled(cba, cbb, cb_fill, cb_h * 0.5f);
-    dl->AddRect(cba, cbb, cb_brd, cb_h * 0.5f, 0, 1.f);
-    if (cflash > 0.001f) {
-        dl->AddRectFilled(cba, cbb,
-            aida::ui::with_alpha(IM_COL32(255, 255, 255, 255), cflash * 0.18f * alpha),
-            cb_h * 0.5f);
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * alpha);
+    if (full_button_visible) {
+        ImGui::SetCursorScreenPos(ImVec2(full_x, ha.y + (header_h - aida::ui::metrics::control::toolbar_h) * 0.5f));
+        if (aida::ui::components::toolbar_button("##trc_full_btn", show_full ? "Preview" : "Full",
+                show_full, false, show_full ? "Show 500 character preview" : "Expand full result", full_w)) {
+            storage->SetBool(full_id, !show_full);
+            if (!show_full) storage->SetBool(col_id, false);
+        }
     }
-    ImFont* icf = ImGui::GetFont();
-    ImVec2 ics = icf->CalcTextSizeA(13.f, FLT_MAX, 0.f, ICON_COPY);
-    dl->AddText(icf, 13.f,
-        ImVec2(cba.x + (cb_w - ics.x) * 0.5f, cba.y + (cb_h - 13.f) * 0.5f),
-        aida::ui::with_alpha(aida::ui::mix(th.text_secondary, th.accent_u32, chov), alpha),
-        ICON_COPY);
 
-    bool hov_header = ImGui::IsMouseHoveringRect(ha, ImVec2(cba.x - 4.f, hb.y));
+    ImGuiID copy_state_id = ImGui::GetID("##trc_copy_state");
+    auto& copy_state = aida::ui::components::control_state(copy_state_id);
+    ImGui::SetCursorScreenPos(ImVec2(action_x, ha.y + (header_h - copy_side) * 0.5f));
+    if (aida::ui::components::copy_button("##trc_copy_btn", &copy_state.flash, "Copy full result")) {
+        ImGui::SetClipboardText(payload.c_str());
+        copied_toast("Tool result copied");
+    }
+    ImGui::PopStyleVar();
+
+    float header_click_right = full_button_visible ? full_x - 4.f : action_x - 4.f;
+    bool hov_header = ImGui::IsMouseHoveringRect(ha, ImVec2((std::max)(ha.x, header_click_right), hb.y));
     if (hov_header) {
         dl->AddRectFilled(ha, hb,
             aida::ui::with_alpha(IM_COL32(255, 255, 255, 255), alpha * 0.04f),
@@ -1135,16 +1300,15 @@ static float render_tool_result_card(
     }
 
     if (current_h > header_h + 4.f) {
-        ImVec2 body_clip_a(a.x + 1.f, hb.y);
-        ImVec2 body_clip_b(b.x - 1.f, b.y - 1.f);
-        dl->PushClipRect(body_clip_a, body_clip_b, true);
-        dl->AddText(code_font, code_fs,
-            ImVec2(a.x + body_pad, hb.y + body_pad),
-            aida::ui::with_alpha(th.text_secondary, alpha),
-            display.c_str(), nullptr, max_w - body_pad * 2.f);
-        dl->PopClipRect();
+        float body_visible_h = current_h - header_h;
+        ImVec2 child_pos(a.x + body_pad, hb.y + body_pad);
+        ImVec2 child_size((std::max)(24.f, max_w - body_pad * 2.f),
+            (std::max)(8.f, body_visible_h - body_pad * 2.f));
+        render_payload_scroll_child("##trc_payload_scroll", child_pos, child_size,
+            display, payload_metrics, code_font, code_fs, code_line_h, alpha, false);
     }
 
+    ImGui::PopID();
     return current_h;
 }
 
@@ -1457,8 +1621,32 @@ chat_render::render_result_t chat_render::render_rich_message(
             ImVec2 hit_b(cursor_x + measure.x, cursor_y + body_fs + 2.f);
             bool hov = ImGui::IsMouseHoveringRect(hit_a, hit_b);
             run_inline_in_box(span.text, c, body_font, body_fs, hov, false, c);
+            if (hov) {
+                ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.f, 6.f));
+                ImGui::PushStyleColor(ImGuiCol_PopupBg, ImGui::ColorConvertU32ToFloat4(th.bg_overlay));
+                if (ImGui::BeginTooltip()) {
+                    ImGui::TextUnformatted("Click to copy link");
+                    ImGui::EndTooltip();
+                }
+                ImGui::PopStyleColor();
+                ImGui::PopStyleVar();
+            }
             if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !span.url.empty()) {
                 ImGui::SetClipboardText(span.url.c_str());
+                copied_toast("Link copied");
+            }
+            if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right) && !span.url.empty()) {
+                char link_popup[64]; snprintf(link_popup, sizeof(link_popup), "##linkctx_%d_%d", msg_idx, span_idx);
+                ImGui::OpenPopup(link_popup);
+            }
+            char link_popup[64]; snprintf(link_popup, sizeof(link_popup), "##linkctx_%d_%d", msg_idx, span_idx);
+            if (ImGui::BeginPopup(link_popup)) {
+                if (ImGui::MenuItem("Copy Link")) {
+                    ImGui::SetClipboardText(span.url.c_str());
+                    copied_toast("Link copied");
+                }
+                ImGui::EndPopup();
             }
             break;
         }
@@ -1683,73 +1871,45 @@ chat_render::render_result_t chat_render::render_rich_message(
     result.height = content_h;
 
     if (show_actions) {
-        float btn_h = 22.f;
+        float btn_h = aida::ui::metrics::control::icon_button;
         float btn_y = card_b.y + 8.f;
-        float btn_gap = 8.f;
-
-        struct btn_def_t { const char* glyph; action_t action; };
-        btn_def_t buttons[3] = {
-            { ICON_COPY, action_t::copy },
-            { "Aa", action_t::select_text },
-            { ICON_HISTORY, action_t::retry }
-        };
-
-        float total_btn_w = 0.f;
-        float btn_widths[3];
-        ImFont* icon_font = ImGui::GetFont();
-        for (int bi = 0; bi < 3; ++bi) {
-            ImVec2 ts = icon_font->CalcTextSizeA(13.f, FLT_MAX, 0.f, buttons[bi].glyph);
-            btn_widths[bi] = ts.x + 16.f;
-            total_btn_w += btn_widths[bi];
-        }
-        total_btn_w += btn_gap * 2.f;
+        float btn_gap = 6.f;
+        float copy_w = aida::ui::metrics::control::icon_button;
+        float select_w = 36.f;
+        float retry_w = aida::ui::metrics::control::icon_button;
+        float total_btn_w = copy_w + select_w + retry_w + btn_gap * 2.f;
 
         float bx = card_b.x - total_btn_w;
+        if (bx < card_a.x) bx = card_a.x;
 
-        for (int bi = 0; bi < 3; ++bi) {
-            float bw = btn_widths[bi];
-            ImVec2 bmin(bx, btn_y);
-            ImVec2 bmax_pt(bx + bw, btn_y + btn_h);
+        ImGui::PushID(msg_idx);
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * alpha);
 
-            char id_buf[48]; snprintf(id_buf, sizeof(id_buf), "rmact_%d_%d", msg_idx, bi);
-            ImGui::PushID(id_buf);
-            ImGuiID id = ImGui::GetID("##act");
-            ImGui::SetCursorScreenPos(bmin);
-            ImGui::InvisibleButton("##actb", ImVec2(bw, btn_h));
-            bool hov = ImGui::IsItemHovered();
-            bool clk = ImGui::IsItemClicked();
-            auto& bs = aida::ui::components::detail::bstate(id);
-            float h_v = bs.hover.tick(hov, aida::ui::clock::dt());
-            float fl  = bs.flash.tick(aida::ui::clock::dt(), 2.5f);
-            if (clk) bs.flash.trigger();
-            ImGui::PopID();
-
-            ImU32 fill = aida::ui::with_alpha(
-                aida::ui::mix(th.panel_header, th.accent_grad_top, h_v * 0.40f), alpha);
-            ImU32 brd = aida::ui::with_alpha(
-                aida::ui::mix(th.border_subtle, th.accent_hover, h_v), alpha);
-            dl->AddRectFilled(bmin, bmax_pt, fill, btn_h * 0.5f);
-            dl->AddRect(bmin, bmax_pt, brd, btn_h * 0.5f, 0, 1.f);
-            if (fl > 0.001f) {
-                dl->AddRectFilled(bmin, bmax_pt,
-                    aida::ui::with_alpha(IM_COL32(255, 255, 255, 255), fl * 0.20f * alpha),
-                    btn_h * 0.5f);
-            }
-            ImU32 ic_col = aida::ui::with_alpha(
-                aida::ui::mix(th.text_secondary, th.accent_u32, h_v), alpha);
-            ImVec2 ts = icon_font->CalcTextSizeA(13.f, FLT_MAX, 0.f, buttons[bi].glyph);
-            dl->AddText(icon_font, 13.f,
-                ImVec2(bmin.x + (bw - ts.x) * 0.5f, bmin.y + (btn_h - 13.f) * 0.5f),
-                ic_col, buttons[bi].glyph);
-
-            if (clk) {
-                result.action = buttons[bi].action;
-                if (result.action == action_t::copy)
-                    ImGui::SetClipboardText(text.c_str());
-            }
-
-            bx += bw + btn_gap;
+        ImGuiID copy_state_id = ImGui::GetID("##rm_copy_state");
+        auto& copy_state = aida::ui::components::control_state(copy_state_id);
+        ImGui::SetCursorScreenPos(ImVec2(bx, btn_y));
+        if (aida::ui::components::copy_button("##rm_copy_btn", &copy_state.flash, "Copy message")) {
+            result.action = action_t::copy;
+            ImGui::SetClipboardText(text.c_str());
+            copied_toast("Message copied");
         }
+        bx += copy_w + btn_gap;
+
+        ImGui::SetCursorScreenPos(ImVec2(bx, btn_y));
+        if (aida::ui::components::toolbar_button("##rm_select_btn", "Aa", false, false, "Select message text", select_w)) {
+            result.action = action_t::select_text;
+        }
+        bx += select_w + btn_gap;
+
+        ImGui::SetCursorScreenPos(ImVec2(bx, btn_y));
+        if (aida::ui::components::icon_button("##rm_retry_btn", ICON_HISTORY,
+                aida::ui::metrics::control::icon_button,
+                aida::ui::components::button_kind_t::ghost, false, "Retry from here")) {
+            result.action = action_t::retry;
+        }
+
+        ImGui::PopStyleVar();
+        ImGui::PopID();
 
         result.height += btn_h + 12.f;
 

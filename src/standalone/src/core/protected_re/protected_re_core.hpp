@@ -28,9 +28,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <iomanip>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -38,6 +40,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -231,6 +234,16 @@ inline json page_guard_install_failure_json()
     };
 }
 
+inline std::string page_guard_access_kind(std::uint32_t access_type)
+{
+    switch (access_type) {
+    case 0: return "read";
+    case 1: return "write";
+    case 8: return "execute";
+    default: return "unknown";
+    }
+}
+
 inline json page_guard_capture_json(const page_guard_engine::pg_capture_record_t& c)
 {
     const auto& m = c.metadata;
@@ -242,6 +255,8 @@ inline json page_guard_capture_json(const page_guard_engine::pg_capture_record_t
     out["rdx"] = sa_format_address(m.ctx_rdx);
     out["exception_code"] = m.exception_code;
     out["access_type"] = m.access_type;
+    out["access_kind"] = page_guard_access_kind(m.access_type);
+    out["event_kind"] = out["access_kind"];
     out["timestamp_tsc"] = m.timestamp;
     page_guard_engine::serialize_payload_fields(out, c);
     return out;
@@ -357,6 +372,69 @@ inline bool clear_target_hardware_breakpoint(std::uint32_t pid, std::uint32_t ti
     if (!scope.ok || tid == 0)
         return false;
     return device->clear_hardware_breakpoint(tid, index);
+}
+
+inline bool set_target_thread_context(std::uint32_t pid, std::uint32_t tid, const voyager::device_t::thread_context& ctx, std::uint64_t register_mask)
+{
+    active_pid_scope_t scope(pid);
+    if (!scope.ok || tid == 0)
+        return false;
+    return device->set_thread_context(tid, ctx, register_mask);
+}
+
+inline const char* drv_gpr_name(std::uint16_t reg)
+{
+    switch (static_cast<ZydisRegister>(reg)) {
+    case ZYDIS_REGISTER_RAX: case ZYDIS_REGISTER_EAX: case ZYDIS_REGISTER_AX: case ZYDIS_REGISTER_AL: case ZYDIS_REGISTER_AH: return "rax";
+    case ZYDIS_REGISTER_RBX: case ZYDIS_REGISTER_EBX: case ZYDIS_REGISTER_BX: case ZYDIS_REGISTER_BL: case ZYDIS_REGISTER_BH: return "rbx";
+    case ZYDIS_REGISTER_RCX: case ZYDIS_REGISTER_ECX: case ZYDIS_REGISTER_CX: case ZYDIS_REGISTER_CL: case ZYDIS_REGISTER_CH: return "rcx";
+    case ZYDIS_REGISTER_RDX: case ZYDIS_REGISTER_EDX: case ZYDIS_REGISTER_DX: case ZYDIS_REGISTER_DL: case ZYDIS_REGISTER_DH: return "rdx";
+    case ZYDIS_REGISTER_RSI: case ZYDIS_REGISTER_ESI: case ZYDIS_REGISTER_SI: case ZYDIS_REGISTER_SIL: return "rsi";
+    case ZYDIS_REGISTER_RDI: case ZYDIS_REGISTER_EDI: case ZYDIS_REGISTER_DI: case ZYDIS_REGISTER_DIL: return "rdi";
+    case ZYDIS_REGISTER_RBP: case ZYDIS_REGISTER_EBP: case ZYDIS_REGISTER_BP: case ZYDIS_REGISTER_BPL: return "rbp";
+    case ZYDIS_REGISTER_RSP: case ZYDIS_REGISTER_ESP: case ZYDIS_REGISTER_SP: case ZYDIS_REGISTER_SPL: return "rsp";
+    case ZYDIS_REGISTER_R8: case ZYDIS_REGISTER_R8D: case ZYDIS_REGISTER_R8W: case ZYDIS_REGISTER_R8B: return "r8";
+    case ZYDIS_REGISTER_R9: case ZYDIS_REGISTER_R9D: case ZYDIS_REGISTER_R9W: case ZYDIS_REGISTER_R9B: return "r9";
+    case ZYDIS_REGISTER_R10: case ZYDIS_REGISTER_R10D: case ZYDIS_REGISTER_R10W: case ZYDIS_REGISTER_R10B: return "r10";
+    case ZYDIS_REGISTER_R11: case ZYDIS_REGISTER_R11D: case ZYDIS_REGISTER_R11W: case ZYDIS_REGISTER_R11B: return "r11";
+    case ZYDIS_REGISTER_R12: case ZYDIS_REGISTER_R12D: case ZYDIS_REGISTER_R12W: case ZYDIS_REGISTER_R12B: return "r12";
+    case ZYDIS_REGISTER_R13: case ZYDIS_REGISTER_R13D: case ZYDIS_REGISTER_R13W: case ZYDIS_REGISTER_R13B: return "r13";
+    case ZYDIS_REGISTER_R14: case ZYDIS_REGISTER_R14D: case ZYDIS_REGISTER_R14W: case ZYDIS_REGISTER_R14B: return "r14";
+    case ZYDIS_REGISTER_R15: case ZYDIS_REGISTER_R15D: case ZYDIS_REGISTER_R15W: case ZYDIS_REGISTER_R15B: return "r15";
+    default: return "";
+    }
+}
+
+inline std::uint64_t context_dr_address(const voyager::device_t::thread_context& ctx, std::uint32_t slot)
+{
+    switch (slot) {
+    case 0: return ctx.dr0;
+    case 1: return ctx.dr1;
+    case 2: return ctx.dr2;
+    case 3: return ctx.dr3;
+    default: return 0;
+    }
+}
+
+inline json thread_context_register_json(const voyager::device_t::thread_context& ctx)
+{
+    return json{{"rip", sa_format_address(ctx.rip)},
+                {"rsp", sa_format_address(ctx.rsp)},
+                {"rax", sa_format_address(ctx.rax)},
+                {"rbx", sa_format_address(ctx.rbx)},
+                {"rcx", sa_format_address(ctx.rcx)},
+                {"rdx", sa_format_address(ctx.rdx)},
+                {"r8", sa_format_address(ctx.r8)},
+                {"r9", sa_format_address(ctx.r9)},
+                {"r10", sa_format_address(ctx.r10)},
+                {"r11", sa_format_address(ctx.r11)},
+                {"rflags", sa_format_address(ctx.rflags)},
+                {"dr0", sa_format_address(ctx.dr0)},
+                {"dr1", sa_format_address(ctx.dr1)},
+                {"dr2", sa_format_address(ctx.dr2)},
+                {"dr3", sa_format_address(ctx.dr3)},
+                {"dr6", sa_format_address(ctx.dr6)},
+                {"dr7", sa_format_address(ctx.dr7)}};
 }
 
 inline std::string bytes_to_hex(const std::vector<std::uint8_t>& bytes, std::size_t limit = std::numeric_limits<std::size_t>::max())
@@ -1139,7 +1217,213 @@ inline std::uint64_t candidate_table_from_instruction(const AsmInstr& ins)
         return ins.addr + static_cast<std::uint64_t>(std::max(ins.len, 1)) + static_cast<std::uint64_t>(ins.mem_op.disp);
     if (ins.mem_op.base_reg == static_cast<std::uint16_t>(ZYDIS_REGISTER_NONE) && ins.mem_op.index_reg != static_cast<std::uint16_t>(ZYDIS_REGISTER_NONE))
         return static_cast<std::uint64_t>(ins.mem_op.disp);
+    if (ins.mem_op.base_reg == static_cast<std::uint16_t>(ZYDIS_REGISTER_NONE) && ins.mem_op.has_disp)
+        return static_cast<std::uint64_t>(ins.mem_op.disp);
     return 0;
+}
+
+inline std::string zydis_reg_name(std::uint16_t reg)
+{
+    if (reg == static_cast<std::uint16_t>(ZYDIS_REGISTER_NONE))
+        return {};
+    const char* name = ZydisRegisterGetString(static_cast<ZydisRegister>(reg));
+    return name ? lower_ascii(name) : std::string();
+}
+
+inline bool instruction_is_indirect_transfer(const AsmInstr& ins)
+{
+    const std::string m = mnemonic_of(ins);
+    if (m != "jmp" && m != "call")
+        return false;
+    return ins.branch_target == 0 || operand_is_memory(ins.ops) || lower_ascii(ins.ops).find(" ptr ") != std::string::npos;
+}
+
+inline bool mnemonic_writes_flags(const std::string& m)
+{
+    static const std::unordered_set<std::string> flag_ops = {
+        "add","adc","sub","sbb","cmp","test","xor","and","or","neg","inc","dec","shl","shr","sar","sal","rol","ror","imul","mul"
+    };
+    return flag_ops.count(m) != 0;
+}
+
+inline std::string condition_from_branch(const std::string& mnemonic)
+{
+    const std::string m = lower_ascii(mnemonic);
+    if (m == "je" || m == "jz") return "ZF == 1";
+    if (m == "jne" || m == "jnz") return "ZF == 0";
+    if (m == "ja" || m == "jnbe") return "CF == 0 && ZF == 0";
+    if (m == "jae" || m == "jnb" || m == "jnc") return "CF == 0";
+    if (m == "jb" || m == "jc" || m == "jnae") return "CF == 1";
+    if (m == "jbe" || m == "jna") return "CF == 1 || ZF == 1";
+    if (m == "jg" || m == "jnle") return "ZF == 0 && SF == OF";
+    if (m == "jge" || m == "jnl") return "SF == OF";
+    if (m == "jl" || m == "jnge") return "SF != OF";
+    if (m == "jle" || m == "jng") return "ZF == 1 || SF != OF";
+    if (m == "js") return "SF == 1";
+    if (m == "jns") return "SF == 0";
+    if (m == "jo") return "OF == 1";
+    if (m == "jno") return "OF == 0";
+    if (m == "jp" || m == "jpe") return "PF == 1";
+    if (m == "jnp" || m == "jpo") return "PF == 0";
+    return {};
+}
+
+inline std::uint64_t trace_reg_value(const emulation::trace_entry_t& t, const std::string& reg)
+{
+    const std::string r = lower_ascii(reg);
+    if (r == "rax" || r == "eax" || r == "ax" || r == "al") return t.rax;
+    if (r == "rbx" || r == "ebx" || r == "bx" || r == "bl") return t.rbx;
+    if (r == "rcx" || r == "ecx" || r == "cx" || r == "cl") return t.rcx;
+    if (r == "rdx" || r == "edx" || r == "dx" || r == "dl") return t.rdx;
+    if (r == "rsi" || r == "esi" || r == "si" || r == "sil") return t.rsi;
+    if (r == "rdi" || r == "edi" || r == "di" || r == "dil") return t.rdi;
+    if (r == "rbp" || r == "ebp" || r == "bp" || r == "bpl") return t.rbp;
+    if (r == "rsp" || r == "esp" || r == "sp" || r == "spl") return t.rsp;
+    if (r == "r8" || r == "r8d" || r == "r8w" || r == "r8b") return t.r8;
+    if (r == "r9" || r == "r9d" || r == "r9w" || r == "r9b") return t.r9;
+    if (r == "r10" || r == "r10d" || r == "r10w" || r == "r10b") return t.r10;
+    if (r == "r11" || r == "r11d" || r == "r11w" || r == "r11b") return t.r11;
+    if (r == "r12" || r == "r12d" || r == "r12w" || r == "r12b") return t.r12;
+    if (r == "r13" || r == "r13d" || r == "r13w" || r == "r13b") return t.r13;
+    if (r == "r14" || r == "r14d" || r == "r14w" || r == "r14b") return t.r14;
+    if (r == "r15" || r == "r15d" || r == "r15w" || r == "r15b") return t.r15;
+    if (r == "rip") return t.rip;
+    if (r == "rflags" || r == "eflags") return t.rflags;
+    return 0;
+}
+
+inline json trace_register_delta_json(const emulation::trace_entry_t& before, const emulation::trace_entry_t& after)
+{
+    json deltas = json::array();
+    static const std::array<const char*, 17> regs = {
+        "RAX","RBX","RCX","RDX","RSI","RDI","RBP","RSP","R8","R9","R10","R11","R12","R13","R14","R15","RFLAGS"
+    };
+    for (const char* reg : regs) {
+        const std::uint64_t a = trace_reg_value(before, reg);
+        const std::uint64_t b = trace_reg_value(after, reg);
+        if (a != b)
+            deltas.push_back(json{{"register", reg}, {"before", sa_format_address(a)}, {"after", sa_format_address(b)}});
+    }
+    return deltas;
+}
+
+inline std::set<std::uint64_t> trace_addresses_between(const std::vector<emulation::trace_entry_t>& trace, std::size_t begin, std::size_t end)
+{
+    std::set<std::uint64_t> addrs;
+    if (trace.empty() || begin >= trace.size())
+        return addrs;
+    end = std::min<std::size_t>(end, trace.size() - 1);
+    for (std::size_t i = begin; i <= end; ++i)
+        addrs.insert(trace[i].address);
+    return addrs;
+}
+
+inline json trace_reads_json(std::uint32_t pid, const std::vector<emulation::mem_read_t>& reads, const std::set<std::uint64_t>& insn_addrs, std::size_t limit)
+{
+    json out = json::array();
+    for (const auto& r : reads) {
+        if (!insn_addrs.count(r.insn_address))
+            continue;
+        json j{{"address", sa_format_address(r.address)}, {"size", r.size}, {"from_insn", sa_format_address(r.insn_address)}};
+        if (r.size > 0 && r.size <= 8) {
+            std::vector<std::uint8_t> bytes;
+            if (read_target_memory(pid, r.address, static_cast<std::size_t>(r.size), bytes) && !bytes.empty()) {
+                std::uint64_t value = 0;
+                std::memcpy(&value, bytes.data(), std::min<std::size_t>(bytes.size(), sizeof(value)));
+                j["value"] = sa_format_address(value);
+                j["hex"] = bytes_to_hex(bytes, 16);
+            }
+        }
+        out.push_back(std::move(j));
+        if (out.size() >= limit)
+            break;
+    }
+    return out;
+}
+
+inline json trace_writes_json(const std::vector<emulation::mem_write_t>& writes, const std::set<std::uint64_t>& insn_addrs, std::size_t limit)
+{
+    json out = json::array();
+    for (const auto& w : writes) {
+        if (!insn_addrs.count(w.insn_address))
+            continue;
+        out.push_back(json{{"address", sa_format_address(w.address)}, {"size", w.size}, {"from_insn", sa_format_address(w.insn_address)}, {"hex", bytes_to_hex(w.data, 16)}});
+        if (out.size() >= limit)
+            break;
+    }
+    return out;
+}
+
+struct vm_table_scan_result_t {
+    bool read_ok = false;
+    std::uint32_t entries_read = 0;
+    std::uint32_t valid = 0;
+    std::uint32_t nulls = 0;
+    std::uint32_t entry_size = 8;
+    double density = 0.0;
+    json sample = json::array();
+    std::vector<std::uint64_t> handlers;
+};
+
+inline vm_table_scan_result_t scan_vm_handler_table(std::uint32_t pid, std::uint64_t table, std::uint32_t count, std::uint32_t entry_size, bool relative, std::uint64_t image_base, std::size_t sample_limit)
+{
+    vm_table_scan_result_t result;
+    result.entry_size = std::clamp<std::uint32_t>(entry_size, 1, 8);
+    count = std::clamp<std::uint32_t>(count, 1, 4096);
+    if (table == 0)
+        return result;
+    std::vector<std::uint8_t> bytes;
+    result.read_ok = read_target_memory(pid, table, static_cast<std::size_t>(count) * result.entry_size, bytes);
+    if (!result.read_ok || bytes.size() < result.entry_size)
+        return result;
+    result.entries_read = static_cast<std::uint32_t>(bytes.size() / result.entry_size);
+    result.handlers.resize(result.entries_read);
+    for (std::uint32_t i = 0; i < result.entries_read; ++i) {
+        std::uint64_t raw = 0;
+        std::memcpy(&raw, bytes.data() + static_cast<std::size_t>(i) * result.entry_size, result.entry_size);
+        if (result.entry_size == 4)
+            raw = static_cast<std::uint64_t>(static_cast<std::int32_t>(raw & 0xFFFFFFFFULL));
+        std::uint64_t handler = relative ? image_base + raw : raw;
+        result.handlers[i] = handler;
+        if (handler == 0 || handler < 0x10000) {
+            ++result.nulls;
+            continue;
+        }
+        if (pointer_looks_executable(pid, handler)) {
+            ++result.valid;
+            if (result.sample.size() < sample_limit)
+                result.sample.push_back(json{{"index", i}, {"raw_value", sa_format_address(raw)}, {"handler_va", sa_format_address(handler)}});
+        }
+    }
+    result.density = result.entries_read ? static_cast<double>(result.valid) / static_cast<double>(result.entries_read) : 0.0;
+    return result;
+}
+
+inline json register_score_array(const std::map<std::string, double>& scores, std::size_t limit)
+{
+    std::vector<std::pair<std::string, double>> items(scores.begin(), scores.end());
+    std::sort(items.begin(), items.end(), [](const auto& a, const auto& b) {
+        if (a.second == b.second)
+            return a.first < b.first;
+        return a.second > b.second;
+    });
+    json out = json::array();
+    for (const auto& item : items) {
+        if (item.second <= 0.0)
+            continue;
+        out.push_back(json{{"register", item.first}, {"score", item.second}});
+        if (out.size() >= limit)
+            break;
+    }
+    return out;
+}
+
+inline json register_score_array_int(const std::map<std::string, int>& scores, std::size_t limit)
+{
+    std::map<std::string, double> converted;
+    for (const auto& item : scores)
+        converted[item.first] = static_cast<double>(item.second);
+    return register_score_array(converted, limit);
 }
 
 inline std::string most_likely_vm_register(const std::vector<AsmInstr>& insns, const std::vector<const char*>& candidates)
@@ -1166,35 +1450,61 @@ inline std::string most_likely_vm_register(const std::vector<AsmInstr>& insns, c
 
 inline json classify_handler_static(std::uint32_t pid, std::uint64_t handler, std::uint32_t size, std::uint32_t num_inputs)
 {
-    size = std::clamp<std::uint32_t>(size, 32, 4096);
+    size = std::clamp<std::uint32_t>(size, 1, 4096);
+    const std::uint32_t read_size = std::clamp<std::uint32_t>(std::max<std::uint32_t>(size, 16), 16, 4096);
     auto insns = disassemble_target(pid, handler, size, 256);
     std::map<std::string, int> mcounts;
+    std::map<std::string, int> written_reg_counts;
+    std::map<std::string, int> read_reg_counts;
     bool branch = false;
     bool flags = false;
     bool mem_read = false;
     bool mem_write = false;
+    bool self_zero = false;
+    bool terminal_only = true;
+    std::string primary_mnemonic;
     json evidence = json::array();
     for (const auto& ins : insns) {
         const std::string m = mnemonic_of(ins);
         ++mcounts[m];
         if (ins.is_branch || ins.is_call || ins.is_ret)
             branch = true;
-        if (m == "cmp" || m == "test" || m == "add" || m == "sub" || m == "xor" || m == "and" || m == "or")
+        else
+            terminal_only = false;
+        if (mnemonic_writes_flags(m))
             flags = true;
         const std::string dir = classify_memory_direction(ins);
         if (dir == "read")
             mem_read = true;
         if (dir == "write")
             mem_write = true;
+        auto ops = split_operands(ins.ops);
+        if (!ops.empty() && !ins.is_branch && !ins.is_call && !ins.is_ret) {
+            const std::string dst = reg_from_operand(ops[0]);
+            if (!dst.empty())
+                written_reg_counts[dst]++;
+            for (std::size_t i = 1; i < ops.size(); ++i) {
+                const std::string src = reg_from_operand(ops[i]);
+                if (!src.empty())
+                    read_reg_counts[src]++;
+            }
+            if (primary_mnemonic.empty())
+                primary_mnemonic = m;
+            if ((m == "xor" || m == "sub") && ops.size() >= 2 && lower_ascii(ops[0]) == lower_ascii(ops[1]))
+                self_zero = true;
+        }
     }
     auto count = [&](const char* m) { auto it = mcounts.find(m); return it == mcounts.end() ? 0 : it->second; };
     std::string semantic = "UNKNOWN";
+    std::string normalized_semantic;
     double confidence = 0.25;
-    if (count("ret") > 0) { semantic = "RET"; confidence = 0.82; }
-    else if (count("call") > 0) { semantic = "CALL"; confidence = 0.74; }
+    if (self_zero && count("xor") > 0) { semantic = "XOR"; normalized_semantic = "CONST_ZERO"; confidence = 0.78; }
+    else if (self_zero && count("sub") > 0) { semantic = "SUB"; normalized_semantic = "CONST_ZERO"; confidence = 0.76; }
+    else if (mem_write && count("mov") > 0) { semantic = "STORE"; confidence = 0.7; }
+    else if (mem_read && count("mov") > 0) { semantic = "LOAD"; confidence = 0.7; }
     else if (branch && (count("cmp") > 0 || count("test") > 0)) { semantic = "JCC"; confidence = 0.72; }
-    else if (mem_write && count("mov") > 0) { semantic = "STORE"; confidence = 0.68; }
-    else if (mem_read && count("mov") > 0) { semantic = "LOAD"; confidence = 0.68; }
+    else if (count("call") > 0) { semantic = "CALL"; confidence = 0.74; }
+    else if (terminal_only && count("ret") > 0) { semantic = "RET"; confidence = 0.82; }
     else if (count("push") > count("pop")) { semantic = "PUSH"; confidence = 0.64; }
     else if (count("pop") > count("push")) { semantic = "POP"; confidence = 0.64; }
     else if (count("add") > 0 || count("adc") > 0 || count("lea") > 1) { semantic = "ADD"; confidence = 0.66; }
@@ -1209,13 +1519,15 @@ inline json classify_handler_static(std::uint32_t pid, std::uint64_t handler, st
     else if (count("mov") > 0 || count("cmovz") > 0 || count("cmovnz") > 0) { semantic = "MOV"; confidence = 0.58; }
 
     if (!insns.empty()) {
-        for (std::size_t i = 0; i < insns.size() && i < 8; ++i)
+        for (std::size_t i = 0; i < insns.size() && i < 16; ++i)
             evidence.push_back(instruction_to_json(insns[i]));
     }
 
     json roles;
     if (!insns.empty()) {
         for (const auto& ins : insns) {
+            if (ins.is_branch || ins.is_call || ins.is_ret)
+                continue;
             auto ops = split_operands(ins.ops);
             if (ops.size() >= 1 && !roles.contains("dst"))
                 roles["dst"] = ops[0];
@@ -1229,20 +1541,31 @@ inline json classify_handler_static(std::uint32_t pid, std::uint64_t handler, st
     }
 
     json differential = json::array();
+    json differential_summary;
+    std::uint32_t successful_inputs = 0;
+    std::uint32_t flags_changed_inputs = 0;
+    std::uint64_t total_reads = 0;
+    std::uint64_t total_writes = 0;
+    std::set<std::uint64_t> unique_ends;
+    std::set<std::string> changed_regs;
 #ifdef __NT__
     if (!insns.empty() && num_inputs > 0) {
         std::vector<std::uint8_t> code;
-        if (read_target_memory(pid, handler, size, code) && !code.empty()) {
+        if (read_target_memory(pid, handler, read_size, code) && !code.empty()) {
             const std::uint32_t traces = std::min<std::uint32_t>(num_inputs, 8);
             for (std::uint32_t i = 0; i < traces; ++i) {
                 emulation::process_snapshot_t snap;
                 snap.success = true;
                 snap.rip = handler;
                 snap.rflags = 0x202;
-                snap.rax = 0x11110000ULL + i;
-                snap.rbx = 0x22220000ULL + i * 3;
-                snap.rcx = 0x33330000ULL + i * 5;
-                snap.rdx = 0x44440000ULL + i * 7;
+                snap.rax = 0x1111000011110000ULL ^ (0x101010101010101ULL * (i + 1));
+                snap.rbx = 0x2222000022220000ULL ^ (0x0101010101010101ULL * (i + 3));
+                snap.rcx = 0x3333000033330000ULL ^ (0x1111111111111111ULL * (i + 5));
+                snap.rdx = 0x4444000044440000ULL ^ (0x0102030405060708ULL * (i + 7));
+                snap.rsi = 0x5555000055550000ULL + i * 0x101;
+                snap.rdi = 0x6666000066660000ULL + i * 0x203;
+                snap.r8 = 0x7777000077770000ULL + i * 0x307;
+                snap.r9 = 0x8888000088880000ULL + i * 0x409;
                 emulation::memory_snapshot_region_t code_region;
                 code_region.base = handler & ~0xFFFULL;
                 code_region.size = (static_cast<std::uint64_t>(code.size()) + 0xFFF + (handler & 0xFFFULL)) & ~0xFFFULL;
@@ -1259,30 +1582,79 @@ inline json classify_handler_static(std::uint32_t pid, std::uint64_t handler, st
                 cfg.start_address = handler;
                 cfg.max_instructions = 512;
                 cfg.max_trace_entries = 32;
-                cfg.record_mem_reads = false;
+                cfg.record_mem_reads = true;
                 cfg.record_mem_writes = true;
                 cfg.record_registers = true;
                 cfg.timeout_us = 1000000;
                 auto r = emulation::emulate_from_snapshot(snap, cfg);
-                differential.push_back(json{{"input_index", i}, {"success", r.success}, {"instructions", r.total_instructions}, {"writes", r.mem_writes.size()}, {"reg_deltas", r.reg_deltas.size()}});
+                if (r.success)
+                    ++successful_inputs;
+                unique_ends.insert(r.end_address);
+                total_reads += r.mem_reads.size();
+                total_writes += r.mem_writes.size();
+                json regs = json::array();
+                for (const auto& d : r.reg_deltas) {
+                    changed_regs.insert(d.name);
+                    if (d.name == "RFLAGS")
+                        ++flags_changed_inputs;
+                    regs.push_back(json{{"register", d.name}, {"before", sa_format_address(d.before)}, {"after", sa_format_address(d.after)}});
+                }
+                json reads = json::array();
+                for (std::size_t ri = 0; ri < r.mem_reads.size() && ri < 8; ++ri)
+                    reads.push_back(json{{"address", sa_format_address(r.mem_reads[ri].address)}, {"size", r.mem_reads[ri].size}, {"from_insn", sa_format_address(r.mem_reads[ri].insn_address)}});
+                json writes = json::array();
+                for (std::size_t wi = 0; wi < r.mem_writes.size() && wi < 8; ++wi)
+                    writes.push_back(json{{"address", sa_format_address(r.mem_writes[wi].address)}, {"size", r.mem_writes[wi].size}, {"from_insn", sa_format_address(r.mem_writes[wi].insn_address)}, {"hex", bytes_to_hex(r.mem_writes[wi].data, 16)}});
+                differential.push_back(json{{"input_index", i}, {"success", r.success}, {"error", r.error}, {"instructions", r.total_instructions}, {"end_address", sa_format_address(r.end_address)}, {"hit_ret", r.hit_ret}, {"reads", reads}, {"writes", writes}, {"register_deltas", regs}});
             }
-            if (!differential.empty())
-                confidence = std::min(0.95, confidence + 0.06);
+            if (!differential.empty()) {
+                confidence = std::min(0.95, confidence + 0.08 + (successful_inputs == traces ? 0.04 : 0.0));
+                if (total_writes > 0 && semantic == "UNKNOWN") {
+                    semantic = "STORE";
+                    confidence = std::max(confidence, 0.66);
+                } else if (total_reads > 0 && semantic == "UNKNOWN") {
+                    semantic = "LOAD";
+                    confidence = std::max(confidence, 0.62);
+                }
+                if (unique_ends.size() > 1 && branch) {
+                    semantic = "JCC";
+                    confidence = std::max(confidence, 0.78);
+                }
+                if (flags_changed_inputs > 0)
+                    flags = true;
+            }
         }
     }
 #else
     (void)num_inputs;
 #endif
+    json changed = json::array();
+    for (const auto& r : changed_regs)
+        changed.push_back(r);
+    json ends = json::array();
+    for (const auto e : unique_ends)
+        ends.push_back(sa_format_address(e));
+    differential_summary["inputs_run"] = differential.size();
+    differential_summary["successful_inputs"] = successful_inputs;
+    differential_summary["unique_end_addresses"] = ends;
+    differential_summary["changed_registers"] = changed;
+    differential_summary["total_memory_reads"] = total_reads;
+    differential_summary["total_memory_writes"] = total_writes;
+    differential_summary["flags_changed_inputs"] = flags_changed_inputs;
 
     json out;
     out["handler_va"] = sa_format_address(handler);
     out["semantic"] = semantic;
+    if (!normalized_semantic.empty())
+        out["normalized_semantic"] = normalized_semantic;
     out["operand_roles"] = roles;
     out["affects_flags"] = flags;
     out["is_branch"] = branch;
     out["confidence"] = confidence;
     out["instruction_count"] = insns.size();
     out["evidence"] = evidence;
+    out["static_features"] = json{{"primary_mnemonic", primary_mnemonic}, {"memory_read", mem_read}, {"memory_write", mem_write}, {"terminal_only", terminal_only}, {"self_zero", self_zero}, {"written_register_scores", register_score_array_int(written_reg_counts, 8)}, {"read_register_scores", register_score_array_int(read_reg_counts, 8)}};
+    out["differential_summary"] = differential_summary;
     if (!differential.empty())
         out["differential_emulation"] = differential;
     return out;
@@ -1430,19 +1802,54 @@ inline tool_result_t vm_identify(const json& params)
     if (!addr)
         return tool_result_t::error("address is required");
     const std::uint32_t pid = requested_pid(params);
-    auto insns = disassemble_target(pid, *addr, 0x4000, 1024);
+    const std::uint32_t scan_size = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(parse_param_u64(params, "size").value_or(0x4000)), 0x40, 0x20000);
+    auto insns = disassemble_target(pid, *addr, scan_size, 8192);
     if (insns.empty())
         return tool_result_t::error("No code could be decoded at " + sa_format_address(*addr));
     std::uint64_t best_table = 0;
     double best_density = 0.0;
     json table_sample = json::array();
+    json table_candidates = json::array();
+    json dispatch_candidates = json::array();
+    json bytecode_fetches = json::array();
     int indirect_dispatches = 0;
+    int scaled_dispatches = 0;
+    int bytecode_reads = 0;
+    int vip_updates = 0;
     int arithmetic = 0;
     int stack_ops = 0;
     int rotate_ops = 0;
     int branch_ops = 0;
+    std::uint64_t best_dispatch = 0;
+    std::uint64_t bytecode_va = parse_param_u64(params, "bytecode_va").value_or(0);
+    std::map<std::string, double> vip_scores;
+    std::map<std::string, double> vsp_scores;
     json evidence = json::array();
-    for (const auto& ins : insns) {
+    auto score_reg = [](std::map<std::string, double>& scores, const std::string& reg, double score) {
+        if (!reg.empty() && reg != "rip" && reg != "rsp")
+            scores[reg] += score;
+    };
+    const bool relative_table = params.value("relative", false);
+    const std::uint64_t image_base = parse_param_u64(params, "image_base").value_or(0);
+    const std::uint32_t entry_size = static_cast<std::uint32_t>(std::clamp<std::uint64_t>(parse_param_u64(params, "entry_size").value_or(8), 1, 8));
+    const std::uint32_t handler_count = static_cast<std::uint32_t>(std::clamp<std::uint64_t>(parse_param_u64(params, "handler_count").value_or(256), 1, 4096));
+    auto evaluate_table = [&](std::uint64_t cand, std::uint64_t dispatch_va, const char* source) {
+        if (cand == 0)
+            return;
+        auto scan = scan_vm_handler_table(pid, cand, handler_count, entry_size, relative_table, image_base, 16);
+        json tc{{"table_va", sa_format_address(cand)}, {"dispatch_va", sa_format_address(dispatch_va)}, {"source", source ? source : "unknown"}, {"read_ok", scan.read_ok}, {"entry_size", scan.entry_size}, {"entries_read", scan.entries_read}, {"valid_handlers", scan.valid}, {"null_entries", scan.nulls}, {"density", scan.density}, {"sample", scan.sample}};
+        table_candidates.push_back(tc);
+        if (scan.density > best_density) {
+            best_density = scan.density;
+            best_table = cand;
+            table_sample = scan.sample;
+            best_dispatch = dispatch_va;
+        }
+    };
+    if (auto explicit_table = parse_param_u64(params, "handler_table_va"))
+        evaluate_table(*explicit_table, *addr, "explicit_handler_table");
+    for (std::size_t idx = 0; idx < insns.size(); ++idx) {
+        const auto& ins = insns[idx];
         const std::string m = mnemonic_of(ins);
         if (ins.is_branch)
             ++branch_ops;
@@ -1452,17 +1859,58 @@ inline tool_result_t vm_identify(const json& params)
             ++rotate_ops;
         if (m == "push" || m == "pop" || m == "pushfq" || m == "popfq")
             ++stack_ops;
-        if ((m == "jmp" || m == "call") && (std::string(ins.ops).find('[') != std::string::npos || ins.branch_target == 0)) {
+        auto ops = split_operands(ins.ops);
+        if ((m == "inc" || m == "dec" || m == "add" || m == "sub" || m == "lea") && !ops.empty()) {
+            const std::string dst = reg_from_operand(ops[0]);
+            score_reg(vip_scores, dst, (m == "inc" || m == "add" || m == "lea") ? 1.8 : 0.8);
+        }
+        if (ins.has_mem_op) {
+            const std::string base = zydis_reg_name(ins.mem_op.base_reg);
+            const std::string index = zydis_reg_name(ins.mem_op.index_reg);
+            const std::string dir = classify_memory_direction(ins);
+            if (dir == "read" && (m == "movzx" || m == "movsx" || m == "movsxd" || m == "mov")) {
+                ++bytecode_reads;
+                score_reg(vip_scores, base, 3.0);
+                score_reg(vip_scores, index, 2.0);
+                std::uint64_t rip_va = 0;
+                if (ins.mem_op.base_reg == static_cast<std::uint16_t>(ZYDIS_REGISTER_RIP))
+                    rip_va = ins.addr + static_cast<std::uint64_t>(std::max(ins.len, 1)) + static_cast<std::uint64_t>(ins.mem_op.disp);
+                if (rip_va && bytecode_va == 0)
+                    bytecode_va = rip_va;
+                if (bytecode_fetches.size() < 32)
+                    bytecode_fetches.push_back(json{{"va", sa_format_address(ins.addr)}, {"instruction", std::string(ins.mnem) + " " + ins.ops}, {"base_reg", base}, {"index_reg", index}, {"memory_va", rip_va ? sa_format_address(rip_va) : "dynamic"}, {"mem_size_bits", ins.mem_op.size}});
+            }
+            if (dir == "read" || dir == "write") {
+                score_reg(vsp_scores, base, dir == "write" ? 1.6 : 1.0);
+                score_reg(vsp_scores, index, 0.6);
+            }
+        }
+        if (instruction_is_indirect_transfer(ins)) {
             ++indirect_dispatches;
-            evidence.push_back(instruction_to_json(ins));
+            if (ins.has_mem_op && ins.mem_op.index_reg != static_cast<std::uint16_t>(ZYDIS_REGISTER_NONE) && ins.mem_op.scale > 1)
+                ++scaled_dispatches;
             std::uint64_t cand = candidate_table_from_instruction(ins);
+            json dc = instruction_to_json(ins);
+            dc["type"] = ins.has_mem_op && ins.mem_op.index_reg != static_cast<std::uint16_t>(ZYDIS_REGISTER_NONE) && ins.mem_op.scale > 1 ? "scaled_table_dispatch" : "indirect_dispatch";
+            dc["table_candidate"] = cand ? sa_format_address(cand) : "unknown";
+            dc["index_reg"] = ins.has_mem_op ? zydis_reg_name(ins.mem_op.index_reg) : "";
+            dc["base_reg"] = ins.has_mem_op ? zydis_reg_name(ins.mem_op.base_reg) : "";
+            dc["scale"] = ins.has_mem_op ? ins.mem_op.scale : 0;
+            dispatch_candidates.push_back(dc);
+            if (evidence.size() < 64)
+                evidence.push_back(instruction_to_json(ins));
             if (cand) {
-                json sample = json::array();
-                const double density = table_density(pid, cand, 256, &sample);
-                if (density > best_density) {
-                    best_density = density;
-                    best_table = cand;
-                    table_sample = std::move(sample);
+                evaluate_table(cand, ins.addr, "indirect_dispatch_memory_operand");
+            }
+        }
+        if ((m == "mov" || m == "lea") && ops.size() >= 2 && operand_is_memory(ops[1])) {
+            const std::string dst = reg_from_operand(ops[0]);
+            if (!dst.empty() && idx + 4 < insns.size()) {
+                for (std::size_t j = idx + 1; j < insns.size() && j <= idx + 4; ++j) {
+                    if (instruction_is_indirect_transfer(insns[j]) && lower_ascii(insns[j].ops).find(dst) != std::string::npos) {
+                        ++vip_updates;
+                        score_reg(vip_scores, dst, 2.5);
+                    }
                 }
             }
         }
@@ -1470,8 +1918,14 @@ inline tool_result_t vm_identify(const json& params)
     double confidence = 0.15;
     if (indirect_dispatches > 0)
         confidence += 0.25;
+    if (scaled_dispatches > 0)
+        confidence += 0.18;
     if (best_density > 0.35)
         confidence += 0.35;
+    if (bytecode_reads > 0)
+        confidence += 0.12;
+    if (vip_updates > 0)
+        confidence += 0.08;
     if (arithmetic > 20)
         confidence += 0.1;
     if (rotate_ops > 4)
@@ -1487,22 +1941,37 @@ inline tool_result_t vm_identify(const json& params)
     } else if (branch_ops > 80 && best_density > 0.45) {
         name = "themida_or_code_virtualizer_like";
     }
+    const json vip_rank = register_score_array(vip_scores, 8);
+    const json vsp_rank = register_score_array(vsp_scores, 8);
     json out;
     out["name"] = name;
     out["version"] = version;
     out["confidence"] = confidence;
-    out["dispatcher_va"] = sa_format_address(*addr);
+    out["dispatcher_va"] = best_dispatch ? sa_format_address(best_dispatch) : sa_format_address(*addr);
+    out["dispatcher_candidates"] = dispatch_candidates;
     out["handler_table_va"] = best_table ? sa_format_address(best_table) : "unknown";
     out["handler_table_density"] = best_density;
     out["handler_table_sample"] = table_sample;
-    out["bytecode_va"] = "unknown";
-    out["vm_stack_reg"] = most_likely_vm_register(insns, {"rsp","rbp","rsi","rdi","rbx"});
-    out["vip_reg"] = most_likely_vm_register(insns, {"rsi","rdi","rbx","rcx","rdx","r8","r9"});
+    out["handler_table_candidates"] = table_candidates;
+    out["bytecode_va"] = bytecode_va ? sa_format_address(bytecode_va) : "unknown";
+    out["bytecode_fetches"] = bytecode_fetches;
+    out["vm_stack_reg"] = !vsp_rank.empty() ? vsp_rank[0].value("register", std::string("unknown")) : most_likely_vm_register(insns, {"rsp","rbp","rsi","rdi","rbx"});
+    out["vip_reg"] = !vip_rank.empty() ? vip_rank[0].value("register", std::string("unknown")) : most_likely_vm_register(insns, {"rsi","rdi","rbx","rcx","rdx","r8","r9"});
+    out["vip_candidates"] = vip_rank;
+    out["vsp_candidates"] = vsp_rank;
     out["indirect_dispatches"] = indirect_dispatches;
+    out["scaled_table_jumps"] = scaled_dispatches;
+    out["memory_reads"] = bytecode_reads;
+    out["dispatch_candidates"] = dispatch_candidates.size();
+    out["dbg_style_evidence"] = json{{"indirect_jumps", indirect_dispatches}, {"scaled_table_jumps", scaled_dispatches}, {"memory_reads", bytecode_reads}, {"dispatch_candidates", dispatch_candidates.size()}};
     out["instruction_count"] = insns.size();
     out["evidence"] = evidence;
-    return tool_result_t::ok("VM identification completed with heuristic confidence " + std::to_string(confidence), out);
+    return tool_result_t::ok("VM identification completed with evidence confidence " + std::to_string(confidence), out);
 }
+
+inline std::string infer_vm_semantic_from_trace_step(const json& step);
+inline std::string condition_from_trace_step(const json& step);
+inline std::optional<std::uint64_t> branch_target_from_trace_step(const json& step);
 
 inline tool_result_t vm_trace_bytecode(const json& params)
 {
@@ -1683,43 +2152,102 @@ inline tool_result_t vm_trace_bytecode(const json& params)
     const auto handler_lookup = handler_opcode_lookup_from_params(pid, params);
     const json opcode_map = params.contains("opcode_map") ? params["opcode_map"] : json::object();
     json steps = json::array();
-    for (std::size_t i = 0; i + 1 < r.trace.size() && steps.size() < return_limit; ++i) {
+    std::vector<std::size_t> dispatch_indices;
+    for (std::size_t i = 0; i + 1 < r.trace.size(); ++i) {
         const auto& cur = r.trace[i];
         const auto& next = r.trace[i + 1];
         const std::string d = lower_ascii(cur.disasm);
-        if (d.find("jmp") == std::string::npos && d.find("call") == std::string::npos)
-            continue;
-        json side_effects;
-        json writes = json::array();
-        for (const auto& w : r.mem_writes) {
-            if (w.insn_address >= cur.address && w.insn_address <= next.address + 16) {
-                writes.push_back(json{{"address", sa_format_address(w.address)}, {"size", w.size}, {"from_insn", sa_format_address(w.insn_address)}, {"hex", bytes_to_hex(w.data, 16)}});
-                if (writes.size() >= 8)
-                    break;
-            }
+        const bool transfer = (d.find("jmp") == 0 || d.find("call") == 0) && (d.find('[') != std::string::npos || next.address != cur.address + std::max<std::uint32_t>(cur.insn_size, 1));
+        const bool next_known_handler = handler_lookup.find(next.address) != handler_lookup.end() || opcode_map_entry_by_handler(opcode_map, next.address) != nullptr;
+        if (transfer || next_known_handler)
+            dispatch_indices.push_back(i);
+    }
+    if (dispatch_indices.empty() && !r.trace.empty())
+        dispatch_indices.push_back(0);
+    const std::uint64_t bytecode_va = parse_param_u64(params, "bytecode_va").value_or(0);
+    const std::uint64_t bytecode_size = parse_param_u64(params, "bytecode_size").value_or(0);
+    auto read_opcode_from_side_effects = [&](const std::set<std::uint64_t>& insn_addrs) -> std::optional<std::uint64_t> {
+        if (bytecode_va == 0)
+            return std::nullopt;
+        for (const auto& rd : r.mem_reads) {
+            if (!insn_addrs.count(rd.insn_address) || rd.size == 0 || rd.size > 8)
+                continue;
+            if (rd.address < bytecode_va)
+                continue;
+            if (bytecode_size != 0 && rd.address + rd.size > bytecode_va + bytecode_size)
+                continue;
+            std::vector<std::uint8_t> bytes;
+            if (!read_target_memory(pid, rd.address, static_cast<std::size_t>(rd.size), bytes) || bytes.empty())
+                continue;
+            std::uint64_t value = 0;
+            std::memcpy(&value, bytes.data(), std::min<std::size_t>(bytes.size(), sizeof(value)));
+            return value;
         }
-        side_effects["writes"] = std::move(writes);
+        return std::nullopt;
+    };
+    for (std::size_t di = 0; di < dispatch_indices.size() && steps.size() < return_limit; ++di) {
+        const std::size_t dispatch_index = dispatch_indices[di];
+        const std::size_t handler_index = dispatch_index + 1 < r.trace.size() ? dispatch_index + 1 : dispatch_index;
+        const std::size_t next_dispatch_index = di + 1 < dispatch_indices.size() ? dispatch_indices[di + 1] : r.trace.size();
+        const std::size_t end_index = next_dispatch_index > handler_index ? std::min<std::size_t>(next_dispatch_index - 1, r.trace.size() - 1) : handler_index;
+        const auto& cur = r.trace[dispatch_index];
+        const auto& first = r.trace[handler_index];
+        const auto& last = r.trace[end_index];
+        const auto insn_addrs = trace_addresses_between(r.trace, handler_index, end_index);
+        json side_effects;
+        side_effects["reads"] = trace_reads_json(pid, r.mem_reads, insn_addrs, 16);
+        side_effects["writes"] = trace_writes_json(r.mem_writes, insn_addrs, 16);
+        side_effects["register_deltas"] = trace_register_delta_json(first, last);
+        side_effects["flags_before"] = sa_format_address(first.rflags);
+        side_effects["flags_after"] = sa_format_address(last.rflags);
+        side_effects["flags_changed"] = first.rflags != last.rflags;
+        json effective_ops = json::array();
+        for (std::size_t ti = handler_index; ti <= end_index && ti < r.trace.size(); ++ti) {
+            effective_ops.push_back(json{{"va", sa_format_address(r.trace[ti].address)}, {"disasm", r.trace[ti].disasm}});
+            if (effective_ops.size() >= 32)
+                break;
+        }
+        side_effects["native_ops"] = effective_ops;
         json st;
         st["step"] = steps.size();
-        st["handler_va"] = sa_format_address(next.address);
+        st["handler_va"] = sa_format_address(first.address);
         st["dispatch_va"] = sa_format_address(cur.address);
         st["dispatch_disasm"] = cur.disasm;
+        st["native_start_va"] = sa_format_address(first.address);
+        st["native_end_va"] = sa_format_address(last.address);
+        st["native_instruction_count"] = end_index >= handler_index ? (end_index - handler_index + 1) : 1;
         st["side_effects"] = std::move(side_effects);
-        st["flags_affected"] = d.find("cmp") != std::string::npos || d.find("test") != std::string::npos;
+        bool flags_affected = first.rflags != last.rflags;
+        for (std::size_t ti = handler_index; ti <= end_index && ti < r.trace.size(); ++ti) {
+            const std::string text = lower_ascii(r.trace[ti].disasm);
+            const std::string mnemonic = text.substr(0, text.find(' '));
+            if (mnemonic_writes_flags(mnemonic)) {
+                flags_affected = true;
+                break;
+            }
+        }
+        st["flags_affected"] = flags_affected;
         std::string opcode;
         std::string opcode_source = "unresolved";
-        if (auto it = handler_lookup.find(next.address); it != handler_lookup.end()) {
+        if (auto it = handler_lookup.find(first.address); it != handler_lookup.end()) {
             opcode = it->second;
             opcode_source = "handler_table_or_opcode_map";
         } else {
-            opcode = opcode_key_by_handler(opcode_map, next.address);
+            opcode = opcode_key_by_handler(opcode_map, first.address);
             if (!opcode.empty())
                 opcode_source = "opcode_map_handler_va";
         }
         if (opcode.empty()) {
+            if (auto decoded = read_opcode_from_side_effects(insn_addrs)) {
+                opcode = opcode_key_from_index(*decoded);
+                opcode_source = "bytecode_memory_read";
+                st["decoded_vopcode_value"] = sa_format_address(*decoded);
+            }
+        }
+        if (opcode.empty()) {
             st["vopcode"] = "unresolved";
             st["vopcode_resolved"] = false;
-            st["unresolved_reason"] = "handler address was not present in the supplied opcode map or handler table";
+            st["unresolved_reason"] = "handler address and bytecode read were not present in the supplied opcode map or handler table";
         } else {
             st["vopcode"] = opcode;
             st["vopcode_resolved"] = true;
@@ -1729,9 +2257,48 @@ inline tool_result_t vm_trace_bytecode(const json& params)
                 st["handler_confidence"] = entry_json->value("confidence", 0.0);
                 if (entry_json->contains("operand_roles"))
                     st["operand_roles"] = (*entry_json)["operand_roles"];
+            } else if (const json* entry_json = opcode_map_entry_by_handler(opcode_map, first.address)) {
+                st["semantic"] = entry_json->value("semantic", std::string("UNKNOWN"));
+                st["handler_confidence"] = entry_json->value("confidence", 0.0);
+                if (entry_json->contains("operand_roles"))
+                    st["operand_roles"] = (*entry_json)["operand_roles"];
             }
         }
+        const std::string inferred_semantic = infer_vm_semantic_from_trace_step(st);
+        if (!inferred_semantic.empty() && inferred_semantic != "UNKNOWN") {
+            st["inferred_semantic"] = inferred_semantic;
+            if (!st.contains("semantic") || !st["semantic"].is_string() || st["semantic"].get<std::string>().empty() || st["semantic"].get<std::string>() == "UNKNOWN") {
+                st["semantic"] = inferred_semantic;
+                st["semantic_source"] = "trace_window_side_effects";
+            }
+        }
+        if (st.value("semantic", std::string()) == "JCC") {
+            const std::string cond = condition_from_trace_step(st);
+            if (!cond.empty())
+                st["condition"] = cond;
+        }
+        if (auto target_va = branch_target_from_trace_step(st))
+            st["target_native_va"] = sa_format_address(*target_va);
         steps.push_back(std::move(st));
+    }
+    std::map<std::uint64_t, std::uint64_t> step_by_native_start;
+    for (std::size_t i = 0; i < steps.size(); ++i) {
+        if (auto h = parse_u64_json(steps[i].value("handler_va", json())))
+            step_by_native_start[*h] = static_cast<std::uint64_t>(i);
+        if (auto h = parse_u64_json(steps[i].value("native_start_va", json())))
+            step_by_native_start[*h] = static_cast<std::uint64_t>(i);
+    }
+    for (auto& st : steps) {
+        auto target = parse_u64_json(st.value("target_native_va", json()));
+        if (!target)
+            continue;
+        auto it = step_by_native_start.find(*target);
+        if (it != step_by_native_start.end()) {
+            st["target_index"] = it->second;
+            st["target_resolved"] = true;
+        } else {
+            st["target_resolved"] = false;
+        }
     }
     json out;
     out["entry_va"] = sa_format_address(*entry);
@@ -1741,8 +2308,23 @@ inline tool_result_t vm_trace_bytecode(const json& params)
     out["emulated_instructions"] = r.total_instructions;
     out["trace_entries"] = r.trace.size();
     out["returned_steps"] = steps.size();
-    out["truncated"] = r.trace.size() > return_limit;
+    out["truncated"] = dispatch_indices.size() > return_limit;
     out["opcode_lookup_entries"] = handler_lookup.size();
+    out["dispatch_windows"] = dispatch_indices.size();
+    out["memory_reads_total"] = r.mem_reads.size();
+    out["memory_writes_total"] = r.mem_writes.size();
+    out["register_delta_total"] = r.reg_deltas.size();
+    json global_deltas = json::array();
+    for (const auto& d : r.reg_deltas)
+        global_deltas.push_back(json{{"register", d.name}, {"before", sa_format_address(d.before)}, {"after", sa_format_address(d.after)}});
+    out["register_deltas"] = global_deltas;
+    json effective = json::array();
+    for (const auto& op : r.effective_ops) {
+        effective.push_back(op);
+        if (effective.size() >= 128)
+            break;
+    }
+    out["effective_operations"] = effective;
     out["steps"] = steps;
     if (!r.success)
         out["error"] = r.error;
@@ -1809,33 +2391,54 @@ inline tool_result_t vm_build_opcode_map(const json& params)
         return tool_result_t::error("handler_table_va is required");
     const std::uint32_t pid = requested_pid(params);
     std::uint32_t count = static_cast<std::uint32_t>(parse_param_u64(params, "handler_count").value_or(256));
-    count = std::clamp<std::uint32_t>(count, 1, 512);
-    std::vector<std::uint8_t> bytes;
+    count = std::clamp<std::uint32_t>(count, 1, 4096);
+    const std::uint32_t entry_size = static_cast<std::uint32_t>(std::clamp<std::uint64_t>(parse_param_u64(params, "entry_size").value_or(8), 1, 8));
+    const bool relative = params.value("relative", false);
+    const std::uint64_t image_base = parse_param_u64(params, "image_base").value_or(0);
     const json table_region = vm_region_evidence(pid, *table);
-    const bool table_read_ok = read_target_memory(pid, *table, static_cast<std::size_t>(count) * sizeof(std::uint64_t), bytes);
+    auto table_scan = scan_vm_handler_table(pid, *table, count, entry_size, relative, image_base, 32);
     diag::log_tagged_fmt("protected_re",
         "vm_build_opcode_map table_read pid=%u table=0x%llX count=%u read_ok=%d bytes=%zu active_pid=%u table_region=%s bridge_status='%s' bridge_last_error='%s'",
         pid,
         static_cast<unsigned long long>(*table),
         count,
-        table_read_ok ? 1 : 0,
-        bytes.size(),
+        table_scan.read_ok ? 1 : 0,
+        static_cast<std::size_t>(table_scan.entries_read) * static_cast<std::size_t>(table_scan.entry_size),
         driver_bridge::attached_pid(),
         table_region.dump().c_str(),
         driver_bridge::status().c_str(),
         driver_bridge::last_error().c_str());
-    if (!table_read_ok || bytes.size() < sizeof(std::uint64_t))
+    if (!table_scan.read_ok || table_scan.entries_read == 0)
         return tool_result_t::error("Could not read handler table at " + sa_format_address(*table));
+    std::vector<std::uint8_t> bytecode;
+    const std::uint64_t bytecode_va = parse_param_u64(params, "bytecode_va").value_or(0);
+    const std::uint32_t opcode_width = static_cast<std::uint32_t>(std::clamp<std::uint64_t>(parse_param_u64(params, "opcode_width").value_or(1), 1, 4));
+    const std::uint32_t bytecode_count = static_cast<std::uint32_t>(std::clamp<std::uint64_t>(parse_param_u64(params, "bytecode_count").value_or(count), 1, 4096));
+    if (bytecode_va != 0)
+        read_target_memory(pid, bytecode_va, static_cast<std::size_t>(bytecode_count) * opcode_width, bytecode);
+    std::map<std::uint64_t, json> decoded_vopcode_offsets;
+    if (!bytecode.empty()) {
+        const std::size_t available = bytecode.size() / opcode_width;
+        for (std::size_t i = 0; i < available; ++i) {
+            std::uint64_t op = 0;
+            std::memcpy(&op, bytecode.data() + i * opcode_width, opcode_width);
+            if (op >= table_scan.handlers.size())
+                continue;
+            decoded_vopcode_offsets[op].push_back(json{{"bytecode_va", sa_format_address(bytecode_va + i * opcode_width)}, {"offset", i * opcode_width}});
+            if (decoded_vopcode_offsets[op].size() >= 16)
+                continue;
+        }
+    }
     json map = json::object();
+    json decoded_map = json::object();
     std::uint32_t classified = 0;
     std::uint32_t unknown = 0;
-    const std::uint32_t got = static_cast<std::uint32_t>(bytes.size() / sizeof(std::uint64_t));
+    const std::uint32_t got = table_scan.entries_read;
     for (std::uint32_t i = 0; i < got; ++i) {
-        std::uint64_t handler = 0;
-        std::memcpy(&handler, bytes.data() + static_cast<std::size_t>(i) * sizeof(handler), sizeof(handler));
+        const std::uint64_t handler = table_scan.handlers[static_cast<std::size_t>(i)];
         if (!pointer_looks_executable(pid, handler))
             continue;
-        json cls = classify_handler_static(pid, handler, 512, 4);
+        json cls = classify_handler_static(pid, handler, static_cast<std::uint32_t>(parse_param_u64(params, "handler_size").value_or(512)), static_cast<std::uint32_t>(parse_param_u64(params, "num_test_inputs").value_or(4)));
         const std::string sem = cls.value("semantic", std::string("UNKNOWN"));
         if (sem == "UNKNOWN")
             ++unknown;
@@ -1844,7 +2447,17 @@ inline tool_result_t vm_build_opcode_map(const json& params)
         const std::string key = opcode_key_from_index(i);
         cls["opcode"] = key;
         cls["opcode_index"] = i;
+        cls["vopcode"] = key;
+        cls["vopcode_source"] = "handler_table_index";
         cls["handler_va"] = sa_format_address(handler);
+        if (auto it = decoded_vopcode_offsets.find(i); it != decoded_vopcode_offsets.end()) {
+            cls["decoded_from_bytecode"] = true;
+            cls["bytecode_uses"] = it->second;
+            cls["vopcode_source"] = "bytecode_stream_and_handler_table";
+            decoded_map[key] = cls;
+        } else {
+            cls["decoded_from_bytecode"] = false;
+        }
         map[key] = std::move(cls);
     }
     diag::log_tagged_fmt("protected_re",
@@ -1860,10 +2473,21 @@ inline tool_result_t vm_build_opcode_map(const json& params)
     out["handler_table_va"] = sa_format_address(*table);
     out["handler_count_requested"] = count;
     out["handler_count_read"] = got;
+    out["entry_size"] = entry_size;
+    out["relative"] = relative;
+    if (relative)
+        out["image_base"] = sa_format_address(image_base);
+    out["handler_table_density"] = table_scan.density;
+    out["handler_table_sample"] = table_scan.sample;
+    out["bytecode_va"] = bytecode_va ? sa_format_address(bytecode_va) : "unknown";
+    out["opcode_width"] = opcode_width;
+    out["bytecode_bytes_read"] = bytecode.size();
+    out["decoded_opcode_map"] = decoded_map;
+    out["decoded_opcode_count"] = decoded_map.size();
     out["opcode_map"] = std::move(map);
     out["classified_count"] = classified;
     out["unknown_count"] = unknown;
-    out["confidence"] = got ? static_cast<double>(classified) / static_cast<double>(got) : 0.0;
+    out["confidence"] = got ? (static_cast<double>(classified) / static_cast<double>(got)) * std::max(0.25, table_scan.density) : 0.0;
     return tool_result_t::ok("VM opcode map classified " + std::to_string(classified) + " handlers", out);
 }
 
@@ -1872,6 +2496,164 @@ inline std::string semantic_from_opcode_map(const json& map, const std::string& 
     if (const json* entry = opcode_map_entry_by_opcode(map, opcode))
         return entry->value("semantic", std::string("UNKNOWN"));
     return "UNKNOWN";
+}
+
+inline std::string il_operand_name(const std::string& operand)
+{
+    const std::string trimmed = trim_ascii(operand);
+    if (trimmed.empty())
+        return {};
+    if (operand_is_memory(trimmed))
+        return "mem" + trimmed.substr(trimmed.find('['));
+    const std::string reg = reg_from_operand(trimmed);
+    if (!reg.empty() && reg.find(' ') == std::string::npos && reg.find('[') == std::string::npos && !std::isdigit(static_cast<unsigned char>(reg.front())))
+        return "v_" + reg;
+    return trimmed;
+}
+
+inline std::string il_operator_for_semantic(const std::string& semantic)
+{
+    const std::string s = lower_ascii(semantic);
+    if (s == "xor") return "^";
+    if (s == "add") return "+";
+    if (s == "sub") return "-";
+    if (s == "and") return "&";
+    if (s == "or") return "|";
+    if (s == "mul") return "*";
+    if (s == "shl") return "<<";
+    if (s == "shr") return ">>";
+    return {};
+}
+
+inline std::string native_op_text(const json& op)
+{
+    if (op.is_string())
+        return op.get<std::string>();
+    if (op.is_object()) {
+        if (op.contains("disasm") && op["disasm"].is_string())
+            return op["disasm"].get<std::string>();
+        if (op.contains("text") && op["text"].is_string())
+            return op["text"].get<std::string>();
+    }
+    return {};
+}
+
+inline std::string mnemonic_from_disasm_text(const std::string& text)
+{
+    const std::string t = lower_ascii(trim_ascii(text));
+    const std::size_t sp = t.find_first_of(" \t");
+    return sp == std::string::npos ? t : t.substr(0, sp);
+}
+
+inline json native_ops_from_step(const json& step)
+{
+    if (step.is_object() && step.contains("side_effects") && step["side_effects"].is_object()) {
+        const json& effects = step["side_effects"];
+        if (effects.contains("native_ops") && effects["native_ops"].is_array())
+            return effects["native_ops"];
+    }
+    return json::array();
+}
+
+inline std::string infer_vm_semantic_from_trace_step(const json& step)
+{
+    const json native_ops = native_ops_from_step(step);
+    const json effects = step.is_object() && step.contains("side_effects") && step["side_effects"].is_object() ? step["side_effects"] : json::object();
+    int add = 0, sub = 0, bit_xor = 0, bit_and = 0, bit_or = 0, shifts = 0, movs = 0;
+    bool saw_ret = false;
+    bool saw_call = false;
+    bool saw_cond = false;
+    bool saw_uncond = false;
+    bool self_zero = false;
+    for (const auto& op : native_ops) {
+        const std::string text = native_op_text(op);
+        const std::string m = mnemonic_from_disasm_text(text);
+        if (m.empty())
+            continue;
+        if (m == "ret")
+            saw_ret = true;
+        else if (m == "call")
+            saw_call = true;
+        else if (condition_from_branch(m).size())
+            saw_cond = true;
+        else if (m == "jmp")
+            saw_uncond = true;
+        else if (m == "add" || m == "adc" || m == "lea")
+            ++add;
+        else if (m == "sub" || m == "sbb")
+            ++sub;
+        else if (m == "xor")
+            ++bit_xor;
+        else if (m == "and")
+            ++bit_and;
+        else if (m == "or")
+            ++bit_or;
+        else if (m == "shl" || m == "shr" || m == "sar" || m == "sal")
+            ++shifts;
+        else if (m == "mov" || m == "movzx" || m == "movsx" || m == "movsxd" || m == "cmovz" || m == "cmovnz")
+            ++movs;
+        const std::size_t sp = text.find_first_of(" \t");
+        if (sp != std::string::npos) {
+            auto ops = split_operands(text.substr(sp + 1).c_str());
+            if ((m == "xor" || m == "sub") && ops.size() >= 2 && lower_ascii(ops[0]) == lower_ascii(ops[1]))
+                self_zero = true;
+        }
+    }
+    if (saw_ret)
+        return "RET";
+    if (saw_cond)
+        return "JCC";
+    if (saw_call)
+        return "CALL";
+    if (effects.contains("writes") && effects["writes"].is_array() && !effects["writes"].empty())
+        return "STORE";
+    if (effects.contains("reads") && effects["reads"].is_array() && !effects["reads"].empty())
+        return "LOAD";
+    if (self_zero && bit_xor > 0)
+        return "XOR";
+    if (self_zero && sub > 0)
+        return "SUB";
+    if (add > 0)
+        return "ADD";
+    if (sub > 0)
+        return "SUB";
+    if (bit_xor > 0)
+        return "XOR";
+    if (bit_and > 0)
+        return "AND";
+    if (bit_or > 0)
+        return "OR";
+    if (shifts > 0)
+        return "SHL";
+    if (movs > 0)
+        return "MOV";
+    return saw_uncond ? "JMP" : "UNKNOWN";
+}
+
+inline std::string condition_from_trace_step(const json& step)
+{
+    for (const auto& op : native_ops_from_step(step)) {
+        const std::string m = mnemonic_from_disasm_text(native_op_text(op));
+        const std::string cond = condition_from_branch(m);
+        if (!cond.empty())
+            return cond;
+    }
+    return {};
+}
+
+inline std::optional<std::uint64_t> branch_target_from_trace_step(const json& step)
+{
+    for (const auto& op : native_ops_from_step(step)) {
+        const std::string text = native_op_text(op);
+        const std::string m = mnemonic_from_disasm_text(text);
+        if (m != "jmp" && m != "call" && condition_from_branch(m).empty())
+            continue;
+        if (text.find('[') != std::string::npos)
+            continue;
+        if (auto target = parse_hex_in_text(text))
+            return target;
+    }
+    return std::nullopt;
 }
 
 inline tool_result_t vm_lift_to_il(const json& params)
@@ -1890,6 +2672,14 @@ inline tool_result_t vm_lift_to_il(const json& params)
     std::uint64_t resolved_by_opcode = 0;
     std::uint64_t resolved_by_handler = 0;
     std::uint64_t unresolved = 0;
+    json virtual_reg_map = json::object();
+    json memory_accesses = json::array();
+    auto note_vreg = [&](const std::string& operand) {
+        const std::string v = il_operand_name(operand);
+        if (v.rfind("v_", 0) == 0 && !virtual_reg_map.contains(v))
+            virtual_reg_map[v] = json{{"source", operand}, {"width_bits", 64}};
+        return v;
+    };
     for (const auto& s : steps) {
         const std::string opcode = s.value("vopcode", std::string("unknown"));
         std::string semantic = s.value("semantic", std::string());
@@ -1912,39 +2702,111 @@ inline tool_result_t vm_lift_to_il(const json& params)
                 ++resolved_by_handler;
             }
         }
+        if (semantic.empty() || semantic == "UNKNOWN" || semantic == "UNRESOLVED") {
+            const std::string inferred = infer_vm_semantic_from_trace_step(s);
+            if (!inferred.empty() && inferred != "UNKNOWN") {
+                semantic = inferred;
+                resolution = "trace_window_side_effects";
+            }
+        }
         if (semantic.empty() || semantic == "UNKNOWN")
             semantic = "UNRESOLVED";
         json node;
         node["index"] = il.size();
         node["op"] = semantic;
+        node["kind"] = "operation";
         node["opcode"] = opcode;
         node["handler_va"] = s.value("handler_va", std::string("unknown"));
         node["resolution"] = resolution;
+        node["trace_step"] = s.value("step", static_cast<std::uint64_t>(il.size()));
         if (map_entry) {
             node["confidence"] = map_entry->value("confidence", 0.0);
             if (map_entry->contains("operand_roles")) {
                 const json& roles = (*map_entry)["operand_roles"];
                 if (roles.is_object()) {
-                    if (roles.contains("dst"))
-                        node["dst"] = roles["dst"];
-                    if (roles.contains("src1"))
-                        node["src1"] = roles["src1"];
-                    if (roles.contains("src2"))
-                        node["src2"] = roles["src2"];
+                    if (roles.contains("dst") && roles["dst"].is_string()) {
+                        node["dst"] = note_vreg(roles["dst"].get<std::string>());
+                        node["native_dst"] = roles["dst"];
+                    }
+                    if (roles.contains("src1") && roles["src1"].is_string()) {
+                        node["src1"] = note_vreg(roles["src1"].get<std::string>());
+                        node["native_src1"] = roles["src1"];
+                    }
+                    if (roles.contains("src2") && roles["src2"].is_string()) {
+                        node["src2"] = note_vreg(roles["src2"].get<std::string>());
+                        node["native_src2"] = roles["src2"];
+                    }
                 }
             }
             if (map_entry->contains("evidence"))
                 node["handler_evidence"] = (*map_entry)["evidence"];
         }
+        if (!node.contains("dst") && s.contains("operand_roles") && s["operand_roles"].is_object()) {
+            const json& roles = s["operand_roles"];
+            if (roles.contains("dst") && roles["dst"].is_string())
+                node["dst"] = note_vreg(roles["dst"].get<std::string>());
+            if (roles.contains("src1") && roles["src1"].is_string())
+                node["src1"] = note_vreg(roles["src1"].get<std::string>());
+            if (roles.contains("src2") && roles["src2"].is_string())
+                node["src2"] = note_vreg(roles["src2"].get<std::string>());
+        }
         json effects = s.value("side_effects", json::object());
         if (!effects.is_object())
             effects = json::object({{"raw", effects}});
+        if (effects.contains("reads") && effects["reads"].is_array()) {
+            for (const auto& rd : effects["reads"]) {
+                json ma = rd;
+                ma["access"] = "read";
+                ma["il_index"] = node["index"];
+                memory_accesses.push_back(ma);
+            }
+        }
+        if (effects.contains("writes") && effects["writes"].is_array()) {
+            for (const auto& wr : effects["writes"]) {
+                json ma = wr;
+                ma["access"] = "write";
+                ma["il_index"] = node["index"];
+                memory_accesses.push_back(ma);
+            }
+        }
         if (semantic == "UNRESOLVED") {
             ++unresolved;
             effects["unresolved"] = true;
             effects["unresolved_reason"] = handler_va ? "no opcode-map entry matched handler_va" : "trace step did not include a parseable handler_va";
         }
         node["effects"] = std::move(effects);
+        const std::string op_token = il_operator_for_semantic(semantic);
+        if (!op_token.empty() && node.contains("dst") && node.contains("src1")) {
+            node["kind"] = "assign";
+            if (node.contains("src2"))
+                node["expr"] = node["src1"].get<std::string>() + " " + op_token + " " + node["src2"].get<std::string>();
+            else
+                node["expr"] = node["dst"].get<std::string>() + " " + op_token + " " + node["src1"].get<std::string>();
+        } else if (semantic == "MOV" && node.contains("dst") && node.contains("src1")) {
+            node["kind"] = "assign";
+            node["expr"] = node["src1"];
+        } else if (semantic == "LOAD") {
+            node["kind"] = "load";
+        } else if (semantic == "STORE") {
+            node["kind"] = "store";
+        } else if (semantic == "JCC") {
+            node["kind"] = "branch";
+            node["condition"] = s.value("condition", std::string("vflags"));
+        } else if (semantic == "RET") {
+            node["kind"] = "return";
+        } else if (semantic == "CALL") {
+            node["kind"] = "call";
+        }
+        if (s.contains("native_start_va"))
+            node["native_start_va"] = s["native_start_va"];
+        if (s.contains("native_end_va"))
+            node["native_end_va"] = s["native_end_va"];
+        if (s.contains("target_native_va"))
+            node["target_native_va"] = s["target_native_va"];
+        if (s.contains("target_index") && s["target_index"].is_number())
+            node["target_index"] = s["target_index"];
+        if (s.contains("flags_affected"))
+            node["flags_affected"] = s["flags_affected"];
         if (semantic == "JCC" || semantic == "RET" || semantic == "CALL")
             node["terminator"] = true;
         if (optimize && semantic == "MOV" && node.contains("src1") && node.contains("dst") && node["src1"] == node["dst"]) {
@@ -1952,7 +2814,20 @@ inline tool_result_t vm_lift_to_il(const json& params)
             continue;
         }
         if (optimize && semantic == "XOR" && node.contains("src1") && node.contains("src2") && node["src1"] == node["src2"]) {
-            node["op"] = "CONST";
+            node["op"] = "ASSIGN_CONST";
+            node["kind"] = "assign";
+            if (!node.contains("dst"))
+                node["dst"] = node["src1"];
+            node["expr"] = "0x0";
+            node["value"] = "0x0";
+            ++folded;
+        }
+        if (optimize && semantic == "SUB" && node.contains("src1") && node.contains("src2") && node["src1"] == node["src2"]) {
+            node["op"] = "ASSIGN_CONST";
+            node["kind"] = "assign";
+            if (!node.contains("dst"))
+                node["dst"] = node["src1"];
+            node["expr"] = "0x0";
             node["value"] = "0x0";
             ++folded;
         }
@@ -1960,8 +2835,8 @@ inline tool_result_t vm_lift_to_il(const json& params)
     }
     json out;
     out["il_instructions"] = il;
-    out["virtual_reg_map"] = json::object();
-    out["memory_accesses"] = json::array();
+    out["virtual_reg_map"] = virtual_reg_map;
+    out["memory_accesses"] = memory_accesses;
     out["optimization_stats"] = json{{"enabled", optimize}, {"dead_assignments_removed", dead_assignments}, {"constant_folds", folded}, {"input_steps", steps.size()}, {"output_il", il.size()}, {"resolved_by_opcode", resolved_by_opcode}, {"resolved_by_handler_va", resolved_by_handler}, {"unresolved", unresolved}};
     return tool_result_t::ok("Lifted VM trace to IL", out);
 }
@@ -1973,32 +2848,92 @@ inline tool_result_t vm_recover_cfg(const json& params)
         il = il["il_instructions"];
     if (!il.is_array())
         return tool_result_t::error("optimized_il with il_instructions is required");
-    json nodes = json::array();
-    json current;
-    current["id"] = 0;
-    current["il_instructions"] = json::array();
-    current["successors"] = json::array();
-    std::vector<int> exits;
-    for (const auto& n : il) {
-        current["il_instructions"].push_back(n);
+    std::set<int> leaders;
+    leaders.insert(0);
+    for (std::size_t i = 0; i < il.size(); ++i) {
+        const auto& n = il[i];
+        const std::string kind = n.value("kind", std::string());
         const std::string op = n.value("op", std::string());
-        if (op == "JCC" || op == "RET" || op == "CALL") {
-            const int id = current["id"].get<int>();
-            if (op == "RET")
-                exits.push_back(id);
-            else {
-                current["successors"].push_back(id + 1);
-                if (n.contains("target"))
-                    current["successors"].push_back(n["target"]);
+        if (kind == "branch" || op == "JCC" || op == "RET" || op == "CALL" || n.value("terminator", false)) {
+            if (i + 1 < il.size())
+                leaders.insert(static_cast<int>(i + 1));
+            if (n.contains("target_index") && n["target_index"].is_number_integer()) {
+                const int target = n["target_index"].get<int>();
+                if (target >= 0 && target < static_cast<int>(il.size()))
+                    leaders.insert(target);
             }
-            nodes.push_back(current);
-            current = json{{"id", id + 1}, {"il_instructions", json::array()}, {"successors", json::array()}};
         }
     }
-    if (!current["il_instructions"].empty())
-        nodes.push_back(current);
+    std::map<int, int> index_to_block;
+    json nodes = json::array();
+    std::vector<std::pair<int, int>> block_ranges;
+    std::vector<int> sorted_leaders(leaders.begin(), leaders.end());
+    std::sort(sorted_leaders.begin(), sorted_leaders.end());
+    for (std::size_t bi = 0; bi < sorted_leaders.size(); ++bi) {
+        const int start = sorted_leaders[bi];
+        const int end = bi + 1 < sorted_leaders.size() ? sorted_leaders[bi + 1] - 1 : static_cast<int>(il.size()) - 1;
+        if (start < 0 || start >= static_cast<int>(il.size()) || end < start)
+            continue;
+        const int id = static_cast<int>(block_ranges.size());
+        block_ranges.push_back({start, end});
+        for (int idx = start; idx <= end; ++idx)
+            index_to_block[idx] = id;
+    }
+    std::vector<int> exits;
+    json edges = json::array();
+    for (std::size_t bi = 0; bi < block_ranges.size(); ++bi) {
+        const int start = block_ranges[bi].first;
+        const int end = block_ranges[bi].second;
+        json node{{"id", static_cast<int>(bi)}, {"start_index", start}, {"end_index", end}, {"il_instructions", json::array()}, {"successors", json::array()}};
+        for (int idx = start; idx <= end; ++idx)
+            node["il_instructions"].push_back(il[static_cast<std::size_t>(idx)]);
+        const json& last = il[static_cast<std::size_t>(end)];
+        const std::string kind = last.value("kind", std::string());
+        const std::string op = last.value("op", std::string());
+        if (kind == "return" || op == "RET") {
+            exits.push_back(static_cast<int>(bi));
+        } else {
+            auto add_successor = [&](int target_block, const char* type) {
+                if (target_block < 0 || target_block >= static_cast<int>(block_ranges.size()))
+                    return;
+                bool present = false;
+                for (const auto& existing : node["successors"]) {
+                    if (existing.is_number_integer() && existing.get<int>() == target_block) {
+                        present = true;
+                        break;
+                    }
+                }
+                if (!present)
+                    node["successors"].push_back(target_block);
+                edges.push_back(json{{"from", static_cast<int>(bi)}, {"to", target_block}, {"type", type ? type : "flow"}, {"from_il_index", end}});
+            };
+            if ((kind == "branch" || op == "JCC") && last.contains("target_index") && last["target_index"].is_number_integer()) {
+                const int target = last["target_index"].get<int>();
+                auto it = index_to_block.find(target);
+                if (it != index_to_block.end())
+                    add_successor(it->second, "taken");
+                auto ft = index_to_block.find(end + 1);
+                if (ft != index_to_block.end())
+                    add_successor(ft->second, "fallthrough");
+            } else if (kind == "branch" || op == "JCC") {
+                auto ft = index_to_block.find(end + 1);
+                if (ft != index_to_block.end())
+                    add_successor(ft->second, "fallthrough_unresolved_target");
+            } else if (kind == "call" || op == "CALL") {
+                auto ft = index_to_block.find(end + 1);
+                if (ft != index_to_block.end())
+                    add_successor(ft->second, "return_continuation");
+            } else {
+                auto ft = index_to_block.find(end + 1);
+                if (ft != index_to_block.end())
+                    add_successor(ft->second, "fallthrough");
+            }
+        }
+        nodes.push_back(std::move(node));
+    }
     json out;
     out["nodes"] = nodes;
+    out["edges"] = edges;
     out["entry_node"] = nodes.empty() ? -1 : 0;
     out["exit_nodes"] = exits;
     out["node_count"] = nodes.size();
@@ -2016,21 +2951,77 @@ inline tool_result_t vm_emit_pseudocode(const json& params)
         return tool_result_t::error("cfg.nodes must be an array");
     std::ostringstream ps;
     std::set<std::string> unresolved;
+    std::map<int, int> taken_targets;
+    std::map<int, int> fallthrough_targets;
+    const json edges = cfg.contains("edges") && cfg["edges"].is_array() ? cfg["edges"] : json::array();
+    for (const auto& e : edges) {
+        if (!e.is_object())
+            continue;
+        const int from = e.value("from", -1);
+        const int to = e.value("to", -1);
+        const std::string type = e.value("type", std::string());
+        if (from < 0 || to < 0)
+            continue;
+        if (type == "taken")
+            taken_targets[from] = to;
+        else if (type.find("fallthrough") != std::string::npos || type == "return_continuation")
+            fallthrough_targets[from] = to;
+    }
+    auto emit_statement = [&](const json& ins, int branch_target) -> std::string {
+        const std::string kind = ins.value("kind", std::string());
+        const std::string op = ins.value("op", std::string("UNKNOWN"));
+        const std::string dst = ins.value("dst", std::string());
+        const std::string expr = ins.value("expr", std::string());
+        if (kind == "assign" && !dst.empty() && !expr.empty())
+            return dst + " = " + expr + ";";
+        if (kind == "load" && !dst.empty())
+            return dst + " = vm_load();";
+        if (kind == "store")
+            return "vm_store();";
+        if (kind == "branch") {
+            const std::string target = branch_target >= 0 ? ("block_" + std::to_string(branch_target)) : std::string("unresolved_target");
+            return "if (" + ins.value("condition", std::string("vflags")) + ") goto " + target + ";";
+        }
+        if (kind == "call")
+            return "vm_call(" + ins.value("handler_va", std::string("unknown")) + ");";
+        if (kind == "return")
+            return "return;";
+        if (op == "ASSIGN_CONST" && !dst.empty())
+            return dst + " = " + ins.value("value", std::string("0x0")) + ";";
+        if (op == "UNRESOLVED" || op == "UNKNOWN")
+            return "vm_unresolved(" + ins.value("handler_va", std::string("unknown")) + ");";
+        return lower_ascii(op) + "();";
+    };
     if (style == "asm_comments") {
         for (const auto& n : nodes) {
             ps << "block_" << n.value("id", 0) << ":\n";
             for (const auto& ins : n.value("il_instructions", json::array()))
-                ps << "  ; " << ins.value("op", std::string("UNKNOWN")) << " " << ins.value("handler_va", std::string()) << "\n";
+                ps << "  " << ins.value("handler_va", std::string()) << " " << emit_statement(ins, -1) << "\n";
         }
     } else {
         ps << "void recovered_vm_function(void) {\n";
         for (const auto& n : nodes) {
-            ps << "block_" << n.value("id", 0) << ":\n";
+            const int block_id = n.value("id", 0);
+            ps << "block_" << block_id << ":\n";
+            bool ended_return = false;
+            bool emitted_branch = false;
             for (const auto& ins : n.value("il_instructions", json::array())) {
                 const std::string op = ins.value("op", std::string("UNKNOWN"));
                 if (op == "UNKNOWN" || op == "UNRESOLVED")
                     unresolved.insert(ins.value("handler_va", std::string("unknown")));
-                ps << "    " << lower_ascii(op) << "();\n";
+                const bool is_branch = ins.value("kind", std::string()) == "branch";
+                const int branch_target = is_branch && taken_targets.count(block_id) ? taken_targets[block_id] : -1;
+                if (is_branch)
+                    emitted_branch = true;
+                if (ins.value("kind", std::string()) == "return")
+                    ended_return = true;
+                ps << "    " << emit_statement(ins, branch_target) << "\n";
+            }
+            if (n.contains("successors") && n["successors"].is_array() && !n["successors"].empty()) {
+                if (n["successors"].size() == 1 && !ended_return)
+                    ps << "    goto block_" << n["successors"][0].get<int>() << ";\n";
+                else if (emitted_branch && fallthrough_targets.count(block_id))
+                    ps << "    goto block_" << fallthrough_targets[block_id] << ";\n";
             }
         }
         ps << "}\n";
@@ -2057,13 +3048,73 @@ inline std::optional<std::uint64_t> first_immediate_in_block(const block_t& b)
     return std::nullopt;
 }
 
+inline std::string cff_state_operand_key(const std::string& operand)
+{
+    std::string s = lower_ascii(trim_ascii(operand));
+    for (const char* prefix : { "qword ptr ", "dword ptr ", "word ptr ", "byte ptr ", "ptr " }) {
+        const std::string p(prefix);
+        const std::size_t pos = s.find(p);
+        if (pos != std::string::npos)
+            s.erase(pos, p.size());
+    }
+    s = trim_ascii(s);
+    if (operand_is_memory(s))
+        return s;
+    return reg_from_operand(s);
+}
+
+inline std::optional<std::uint64_t> immediate_operand_value(const std::string& operand)
+{
+    std::string s = lower_ascii(trim_ascii(operand));
+    if (auto v = sa_parse_address(s))
+        return v;
+    return parse_hex_in_text(s);
+}
+
+inline bool cff_operand_is_immediate(const std::string& operand)
+{
+    const std::string s = lower_ascii(trim_ascii(operand));
+    if (s.empty())
+        return false;
+    if (s.front() == '-' || std::isdigit(static_cast<unsigned char>(s.front())))
+        return true;
+    return s.rfind("0x", 0) == 0;
+}
+
+inline std::string cff_state_key_from_compare(const std::vector<std::string>& ops)
+{
+    if (ops.size() < 2)
+        return {};
+    const bool lhs_imm = cff_operand_is_immediate(ops[0]);
+    const bool rhs_imm = cff_operand_is_immediate(ops[1]);
+    if (!lhs_imm)
+        return cff_state_operand_key(ops[0]);
+    if (!rhs_imm)
+        return cff_state_operand_key(ops[1]);
+    return {};
+}
+
+inline std::optional<std::uint64_t> cff_case_value_from_compare(const std::vector<std::string>& ops)
+{
+    if (ops.size() < 2)
+        return std::nullopt;
+    if (auto rhs = immediate_operand_value(ops[1]))
+        return rhs;
+    if (auto lhs = immediate_operand_value(ops[0]))
+        return lhs;
+    return std::nullopt;
+}
+
 inline json detect_flattening(std::uint32_t pid, std::uint64_t address, std::uint32_t size)
 {
     auto insns = disassemble_target(pid, address, size, 8192);
     auto blocks = build_blocks(insns);
     int dispatcher = -1;
     std::size_t max_edges = 0;
-    std::map<std::int64_t, int> state_disp_counts;
+    std::map<std::string, int> state_compare_counts;
+    std::map<std::string, int> state_write_counts;
+    std::map<std::string, json> state_samples;
+    json transition_evidence = json::array();
     for (const auto& b : blocks) {
         if (b.successors.size() > max_edges) {
             max_edges = b.successors.size();
@@ -2071,16 +3122,64 @@ inline json detect_flattening(std::uint32_t pid, std::uint64_t address, std::uin
         }
         for (const auto& ins : b.insns) {
             const std::string m = mnemonic_of(ins);
-            if ((m == "mov" || m == "cmp") && ins.has_mem_op && ins.mem_op.has_disp)
-                state_disp_counts[ins.mem_op.disp]++;
+            auto ops = split_operands(ins.ops);
+            if ((m == "cmp" || m == "test") && ops.size() >= 2) {
+                const std::string key = cff_state_key_from_compare(ops);
+                if (!key.empty()) {
+                    state_compare_counts[key]++;
+                    if (!state_samples.count(key))
+                        state_samples[key] = json{{"kind", operand_is_memory(key) ? "memory" : "register"}, {"operand", key}, {"first_compare_va", sa_format_address(ins.addr)}};
+                }
+            }
+            if ((m == "mov" || m == "lea") && ops.size() >= 2) {
+                const std::string key = cff_state_operand_key(ops[0]);
+                if (!key.empty() && immediate_operand_value(ops[1])) {
+                    state_write_counts[key]++;
+                    if (!state_samples.count(key))
+                        state_samples[key] = json{{"kind", operand_is_memory(ops[0]) ? "memory" : "register"}, {"operand", ops[0]}, {"first_write_va", sa_format_address(ins.addr)}};
+                    if (transition_evidence.size() < 128)
+                        transition_evidence.push_back(json{{"block_id", b.id}, {"write_va", sa_format_address(ins.addr)}, {"state_operand", ops[0]}, {"state_value", sa_format_address(*immediate_operand_value(ops[1]))}});
+                }
+            }
         }
     }
-    std::int64_t state_disp = 0;
+    std::string state_key;
     int state_score = 0;
-    for (const auto& it : state_disp_counts) {
-        if (it.second > state_score) {
-            state_score = it.second;
-            state_disp = it.first;
+    for (const auto& it : state_compare_counts) {
+        const int score = it.second * 2 + state_write_counts[it.first];
+        if (score > state_score) {
+            state_score = score;
+            state_key = it.first;
+        }
+    }
+    if (state_key.empty()) {
+        for (const auto& it : state_write_counts) {
+            if (it.second > state_score) {
+                state_score = it.second;
+                state_key = it.first;
+            }
+        }
+    }
+    int dispatcher_state_compares = 0;
+    int proven_transitions = 0;
+    json state_cases = json::array();
+    if (!state_key.empty()) {
+        for (const auto& b : blocks) {
+            for (const auto& ins : b.insns) {
+                const std::string m = mnemonic_of(ins);
+                auto ops = split_operands(ins.ops);
+                if ((m == "cmp" || m == "test") && ops.size() >= 2 && cff_state_key_from_compare(ops) == state_key) {
+                    if (b.id == dispatcher)
+                        ++dispatcher_state_compares;
+                    if (auto imm = cff_case_value_from_compare(ops)) {
+                        state_cases.push_back(json{{"block_id", b.id}, {"compare_va", sa_format_address(ins.addr)}, {"state_value", sa_format_address(*imm)}});
+                        if (state_cases.size() >= 128)
+                            break;
+                    }
+                }
+                if ((m == "mov" || m == "lea") && ops.size() >= 2 && cff_state_operand_key(ops[0]) == state_key && immediate_operand_value(ops[1]))
+                    ++proven_transitions;
+            }
         }
     }
     int back_to_dispatcher = 0;
@@ -2094,14 +3193,23 @@ inline json detect_flattening(std::uint32_t pid, std::uint64_t address, std::uin
     }
     const double block_factor = blocks.size() >= 12 ? 0.25 : (blocks.size() >= 6 ? 0.12 : 0.0);
     const double edge_factor = max_edges >= 4 ? 0.3 : (max_edges >= 2 ? 0.12 : 0.0);
-    const double state_factor = state_score >= 4 ? 0.25 : (state_score >= 2 ? 0.1 : 0.0);
+    const double state_factor = state_score >= 6 ? 0.25 : (state_score >= 3 ? 0.14 : 0.0);
+    const double proof_factor = dispatcher_state_compares >= 2 && proven_transitions >= 2 ? 0.2 : (dispatcher_state_compares >= 1 && proven_transitions >= 1 ? 0.1 : 0.0);
     const double loop_factor = blocks.empty() ? 0.0 : std::min(0.2, static_cast<double>(back_to_dispatcher) / static_cast<double>(blocks.size()));
-    const double confidence = std::min(0.95, block_factor + edge_factor + state_factor + loop_factor);
+    const double confidence = std::min(0.95, block_factor + edge_factor + state_factor + proof_factor + loop_factor);
     json out;
     out["is_flattened"] = confidence >= 0.55;
     out["confidence"] = confidence;
     out["dispatcher_va"] = dispatcher >= 0 && dispatcher < static_cast<int>(blocks.size()) ? sa_format_address(blocks[static_cast<std::size_t>(dispatcher)].start) : "unknown";
-    out["state_var_offset"] = state_score ? sa_format_address(static_cast<std::uint64_t>(state_disp)) : "unknown";
+    out["dispatcher_block_id"] = dispatcher;
+    out["state_var_offset"] = !state_key.empty() && state_key.find('[') != std::string::npos ? state_key : "unknown";
+    out["state_variable"] = !state_key.empty() ? state_key : "unknown";
+    out["state_variable_evidence"] = !state_key.empty() && state_samples.count(state_key) ? state_samples[state_key] : json::object();
+    out["dispatcher_state_compares"] = dispatcher_state_compares;
+    out["proven_state_transitions"] = proven_transitions;
+    out["state_cases"] = state_cases;
+    out["transition_evidence"] = transition_evidence;
+    out["dispatcher_proven"] = dispatcher >= 0 && dispatcher_state_compares > 0 && proven_transitions > 0;
     out["block_count"] = blocks.size();
     out["dispatcher_edges"] = max_edges;
     out["back_edges_to_dispatcher"] = back_to_dispatcher;
@@ -2135,16 +3243,69 @@ inline tool_result_t cff_recover_cfg(const json& params)
     const std::uint32_t size = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(parse_param_u64(params, "size").value_or(0x10000)), 0x100, 0x20000);
     auto insns = disassemble_target(pid, *address, size, 8192);
     auto blocks = build_blocks(insns);
+    json detection = detect_flattening(pid, *address, size);
+    std::string state_key = params.value("state_var_hint", std::string());
+    if (state_key.empty())
+        state_key = detection.value("state_variable", std::string("unknown"));
+    std::map<std::uint64_t, int> state_to_block;
+    for (const auto& b : blocks) {
+        for (const auto& ins : b.insns) {
+            const std::string m = mnemonic_of(ins);
+            auto ops = split_operands(ins.ops);
+            if ((m == "cmp" || m == "test") && ops.size() >= 2 && cff_state_key_from_compare(ops) == state_key) {
+                if (auto imm = cff_case_value_from_compare(ops))
+                    state_to_block[*imm] = b.id;
+            }
+        }
+    }
     json recovered = json::array();
+    json recovered_edges = json::array();
     for (const auto& b : blocks) {
         json rb;
         rb["id"] = b.id;
-        rb["state_in"] = first_immediate_in_block(b).has_value() ? sa_format_address(*first_immediate_in_block(b)) : "unknown";
+        std::optional<std::uint64_t> state_in;
+        json state_writes = json::array();
+        for (const auto& ins : b.insns) {
+            const std::string m = mnemonic_of(ins);
+            auto ops = split_operands(ins.ops);
+            if ((m == "cmp" || m == "test") && ops.size() >= 2 && cff_state_key_from_compare(ops) == state_key) {
+                if (auto imm = cff_case_value_from_compare(ops))
+                    state_in = imm;
+            }
+            if ((m == "mov" || m == "lea") && ops.size() >= 2 && cff_state_operand_key(ops[0]) == state_key) {
+                if (auto imm = immediate_operand_value(ops[1]))
+                    state_writes.push_back(json{{"write_va", sa_format_address(ins.addr)}, {"state_out", sa_format_address(*imm)}});
+            }
+        }
+        if (!state_in)
+            state_in = first_immediate_in_block(b);
+        rb["state_in"] = state_in ? sa_format_address(*state_in) : "unknown";
+        rb["state_writes"] = state_writes;
         json outs = json::array();
+        for (const auto& sw : state_writes) {
+            auto v = parse_u64_json(sw.value("state_out", json()));
+            if (v) {
+                auto it = state_to_block.find(*v);
+                if (it != state_to_block.end()) {
+                    outs.push_back(sa_format_address(*v));
+                    recovered_edges.push_back(json{{"from", b.id}, {"to", it->second}, {"state_value", sa_format_address(*v)}, {"proof", "state_write_to_dispatcher_case"}});
+                }
+            }
+        }
         for (int sid : b.successors) {
             if (sid >= 0 && sid < static_cast<int>(blocks.size())) {
                 auto imm = first_immediate_in_block(blocks[static_cast<std::size_t>(sid)]);
-                outs.push_back(imm ? sa_format_address(*imm) : sa_format_address(blocks[static_cast<std::size_t>(sid)].start));
+                const std::string out_state = imm ? sa_format_address(*imm) : sa_format_address(blocks[static_cast<std::size_t>(sid)].start);
+                bool present = false;
+                for (const auto& existing : outs) {
+                    if (existing.is_string() && existing.get<std::string>() == out_state) {
+                        present = true;
+                        break;
+                    }
+                }
+                if (!present)
+                    outs.push_back(out_state);
+                recovered_edges.push_back(json{{"from", b.id}, {"to", sid}, {"state_value", out_state}, {"proof", "native_cfg_edge"}});
             }
         }
         rb["state_out"] = outs;
@@ -2156,24 +3317,192 @@ inline tool_result_t cff_recover_cfg(const json& params)
     }
     std::ostringstream ps;
     ps << "void recovered_flattened_function(void) {\n";
+    if (state_key != "unknown")
+        ps << "uint64_t state = load_state(\"" << state_key << "\");\n";
     for (const auto& b : blocks) {
         ps << "block_" << b.id << ":\n";
-        if (!b.successors.empty())
+        bool emitted = false;
+        for (const auto& e : recovered_edges) {
+            if (!e.is_object() || e.value("from", -1) != b.id)
+                continue;
+            ps << "    goto block_" << e.value("to", -1) << ";\n";
+            emitted = true;
+            break;
+        }
+        if (!emitted && !b.successors.empty())
             ps << "    goto block_" << b.successors.front() << ";\n";
     }
     ps << "}\n";
     json out;
     out["recovered_blocks"] = recovered;
+    out["recovered_edges"] = recovered_edges;
     out["cfg_dot"] = cfg_to_dot(blocks, "cff_recovered");
     out["pseudocode"] = ps.str();
-    out["detection"] = detect_flattening(pid, *address, size);
-    return tool_result_t::ok("Recovered a heuristic CFG from flattened control flow", out);
+    out["detection"] = detection;
+    out["confidence"] = detection.value("confidence", 0.0);
+    out["state_variable"] = state_key;
+    out["transition_count"] = recovered_edges.size();
+    return tool_result_t::ok("Recovered CFG from flattened control flow evidence", out);
+}
+
+inline HMODULE z3_module_handle(bool allow_load)
+{
+    HMODULE mod = GetModuleHandleW(L"libz3.dll");
+    if (mod || !allow_load)
+        return mod;
+    wchar_t preload_dir[MAX_PATH] = {};
+    const DWORD preload_len = GetEnvironmentVariableW(L"AIDA_Z3_PRELOAD_DIR", preload_dir, MAX_PATH);
+    if (preload_len > 0 && preload_len < MAX_PATH) {
+        std::wstring path(preload_dir, preload_dir + preload_len);
+        if (!path.empty() && path.back() != L'\\' && path.back() != L'/')
+            path.push_back(L'\\');
+        path += L"libz3.dll";
+        mod = LoadLibraryW(path.c_str());
+    }
+    if (!mod)
+        mod = LoadLibraryW(L"libz3.dll");
+    return mod;
+}
+
+struct z3_dynamic_api_t {
+    using z3_ptr = void*;
+    using mk_config_fn = z3_ptr (__cdecl*)();
+    using del_config_fn = void (__cdecl*)(z3_ptr);
+    using mk_context_fn = z3_ptr (__cdecl*)(z3_ptr);
+    using del_context_fn = void (__cdecl*)(z3_ptr);
+    using mk_solver_fn = z3_ptr (__cdecl*)(z3_ptr);
+    using solver_ref_fn = void (__cdecl*)(z3_ptr, z3_ptr);
+    using solver_assert_fn = void (__cdecl*)(z3_ptr, z3_ptr, z3_ptr);
+    using solver_check_fn = int (__cdecl*)(z3_ptr, z3_ptr);
+    using mk_bv_sort_fn = z3_ptr (__cdecl*)(z3_ptr, unsigned);
+    using mk_string_symbol_fn = z3_ptr (__cdecl*)(z3_ptr, const char*);
+    using mk_const_fn = z3_ptr (__cdecl*)(z3_ptr, z3_ptr, z3_ptr);
+    using mk_numeral_fn = z3_ptr (__cdecl*)(z3_ptr, const char*, z3_ptr);
+    using mk_unary_ast_fn = z3_ptr (__cdecl*)(z3_ptr, z3_ptr);
+    using mk_binary_ast_fn = z3_ptr (__cdecl*)(z3_ptr, z3_ptr, z3_ptr);
+
+    HMODULE module = nullptr;
+    mk_config_fn mk_config = nullptr;
+    del_config_fn del_config = nullptr;
+    mk_context_fn mk_context = nullptr;
+    del_context_fn del_context = nullptr;
+    mk_solver_fn mk_solver = nullptr;
+    solver_ref_fn solver_inc_ref = nullptr;
+    solver_ref_fn solver_dec_ref = nullptr;
+    solver_assert_fn solver_assert = nullptr;
+    solver_check_fn solver_check = nullptr;
+    mk_bv_sort_fn mk_bv_sort = nullptr;
+    mk_string_symbol_fn mk_string_symbol = nullptr;
+    mk_const_fn mk_const = nullptr;
+    mk_numeral_fn mk_numeral = nullptr;
+    mk_binary_ast_fn mk_eq = nullptr;
+    mk_unary_ast_fn mk_not = nullptr;
+    mk_binary_ast_fn mk_bvadd = nullptr;
+    mk_binary_ast_fn mk_bvsub = nullptr;
+    mk_binary_ast_fn mk_bvmul = nullptr;
+    mk_binary_ast_fn mk_bvand = nullptr;
+    mk_binary_ast_fn mk_bvor = nullptr;
+    mk_binary_ast_fn mk_bvxor = nullptr;
+    mk_binary_ast_fn mk_bvshl = nullptr;
+
+    bool load(bool allow_load)
+    {
+        module = z3_module_handle(allow_load);
+        if (!module)
+            return false;
+        bool ok = true;
+#define AIDA_Z3_LOAD(field, name) field = reinterpret_cast<decltype(field)>(GetProcAddress(module, name)); ok = ok && field != nullptr
+        AIDA_Z3_LOAD(mk_config, "Z3_mk_config");
+        AIDA_Z3_LOAD(del_config, "Z3_del_config");
+        AIDA_Z3_LOAD(mk_context, "Z3_mk_context");
+        AIDA_Z3_LOAD(del_context, "Z3_del_context");
+        AIDA_Z3_LOAD(mk_solver, "Z3_mk_solver");
+        AIDA_Z3_LOAD(solver_inc_ref, "Z3_solver_inc_ref");
+        AIDA_Z3_LOAD(solver_dec_ref, "Z3_solver_dec_ref");
+        AIDA_Z3_LOAD(solver_assert, "Z3_solver_assert");
+        AIDA_Z3_LOAD(solver_check, "Z3_solver_check");
+        AIDA_Z3_LOAD(mk_bv_sort, "Z3_mk_bv_sort");
+        AIDA_Z3_LOAD(mk_string_symbol, "Z3_mk_string_symbol");
+        AIDA_Z3_LOAD(mk_const, "Z3_mk_const");
+        AIDA_Z3_LOAD(mk_numeral, "Z3_mk_numeral");
+        AIDA_Z3_LOAD(mk_eq, "Z3_mk_eq");
+        AIDA_Z3_LOAD(mk_not, "Z3_mk_not");
+        AIDA_Z3_LOAD(mk_bvadd, "Z3_mk_bvadd");
+        AIDA_Z3_LOAD(mk_bvsub, "Z3_mk_bvsub");
+        AIDA_Z3_LOAD(mk_bvmul, "Z3_mk_bvmul");
+        AIDA_Z3_LOAD(mk_bvand, "Z3_mk_bvand");
+        AIDA_Z3_LOAD(mk_bvor, "Z3_mk_bvor");
+        AIDA_Z3_LOAD(mk_bvxor, "Z3_mk_bvxor");
+        AIDA_Z3_LOAD(mk_bvshl, "Z3_mk_bvshl");
+#undef AIDA_Z3_LOAD
+        return ok;
+    }
+};
+
+inline bool z3_prove_bv_add_xor_and_identity(json& proof)
+{
+    proof = json{{"identity", "bvadd_xor_and_carry"}, {"bit_width", 64}, {"solver_invoked", false}, {"z3_used", false}, {"proved", false}};
+    z3_dynamic_api_t api;
+    if (!api.load(true)) {
+        proof["reason"] = "z3_backend_unavailable";
+        return false;
+    }
+    proof["module_handle"] = sa_format_address(static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(api.module)));
+    auto cfg = api.mk_config();
+    if (!cfg) {
+        proof["reason"] = "mk_config_failed";
+        return false;
+    }
+    auto ctx = api.mk_context(cfg);
+    api.del_config(cfg);
+    if (!ctx) {
+        proof["reason"] = "mk_context_failed";
+        return false;
+    }
+    auto solver = api.mk_solver(ctx);
+    if (!solver) {
+        api.del_context(ctx);
+        proof["reason"] = "mk_solver_failed";
+        return false;
+    }
+    api.solver_inc_ref(ctx, solver);
+    auto cleanup = [&]() {
+        api.solver_dec_ref(ctx, solver);
+        api.del_context(ctx);
+    };
+    auto bv64 = api.mk_bv_sort(ctx, 64);
+    auto x = api.mk_const(ctx, api.mk_string_symbol(ctx, "x"), bv64);
+    auto y = api.mk_const(ctx, api.mk_string_symbol(ctx, "y"), bv64);
+    auto one = api.mk_numeral(ctx, "1", bv64);
+    if (!bv64 || !x || !y || !one) {
+        cleanup();
+        proof["reason"] = "ast_construction_failed";
+        return false;
+    }
+    auto lhs = api.mk_bvadd(ctx, api.mk_bvxor(ctx, x, y), api.mk_bvshl(ctx, api.mk_bvand(ctx, x, y), one));
+    auto rhs = api.mk_bvadd(ctx, x, y);
+    auto neq = api.mk_not(ctx, api.mk_eq(ctx, lhs, rhs));
+    if (!lhs || !rhs || !neq) {
+        cleanup();
+        proof["reason"] = "identity_ast_failed";
+        return false;
+    }
+    api.solver_assert(ctx, solver, neq);
+    proof["solver_invoked"] = true;
+    proof["z3_used"] = true;
+    const int result = api.solver_check(ctx, solver);
+    proof["solver_result"] = result == -1 ? "unsat" : (result == 1 ? "sat" : "unknown");
+    const bool proved = result == -1;
+    proof["proved"] = proved;
+    proof["proof_method"] = proved ? "z3_bv64_unsat_negated_equivalence" : "z3_bv64_solver_not_unsat";
+    cleanup();
+    return proved;
 }
 
 inline json z3_backend_state()
 {
     json state;
-    HMODULE mod = GetModuleHandleW(L"libz3.dll");
+    HMODULE mod = z3_module_handle(false);
     state["module_loaded"] = mod != nullptr;
     state["module_handle"] = mod ? sa_format_address(static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(mod))) : "0x0";
     if (mod) {
@@ -2211,12 +3540,15 @@ inline tool_result_t mba_simplify(const json& params)
     const std::uint32_t size = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(parse_param_u64(params, "size").value_or(4096)), 16, 65536);
     const bool use_z3 = params.value("use_z3", false);
     const bool z3_explicit = params.contains("use_z3");
-    const json z3_state = z3_backend_state();
+    json z3_state = z3_backend_state();
     auto insns = disassemble_target(pid, *address, size, 4096);
     json out = json::array();
     std::uint64_t deterministic_count = 0;
     std::uint64_t heuristic_count = 0;
     bool solver_required = false;
+    bool solver_invoked = false;
+    bool z3_used_any = false;
+    json solver_proofs = json::array();
     for (std::size_t i = 0; i < insns.size(); ++i) {
         const auto& ins = insns[i];
         const std::string m = mnemonic_of(ins);
@@ -2239,14 +3571,23 @@ inline tool_result_t mba_simplify(const json& params)
             if ((m == "xor" && m1 == "and" && (m2 == "lea" || m2 == "add")) || (m == "and" && m1 == "xor" && (m2 == "lea" || m2 == "add"))) {
                 ++heuristic_count;
                 solver_required = true;
-                const bool z3_api_available = z3_state.value("api_available", false);
-                const std::string reason = !use_z3 ? "z3_not_requested" : (!z3_api_available ? "z3_backend_unavailable" : "z3_backend_available_no_owned_mba_solver_adapter");
-                out.push_back(json{{"original_va", sa_format_address(ins.addr)}, {"original_expr", "xor/and/add MBA window"}, {"simplified_expr", "candidate_addition_or_bit_blend"}, {"verified", false}, {"proof_method", use_z3 ? "unverified_mba_heuristic_z3_not_invoked" : "unverified_mba_heuristic"}, {"solver_required", true}, {"solver_invoked", false}, {"solver_selection_reason", reason}, {"z3_skip_reason", reason}, {"z3_used", false}});
+                json proof = json{{"solver_invoked", false}, {"z3_used", false}, {"reason", "z3_not_requested"}};
+                bool verified = false;
+                if (use_z3) {
+                    verified = z3_prove_bv_add_xor_and_identity(proof);
+                    solver_invoked = solver_invoked || proof.value("solver_invoked", false);
+                    z3_used_any = z3_used_any || proof.value("z3_used", false);
+                    if (solver_proofs.size() < 16)
+                        solver_proofs.push_back(proof);
+                }
+                const std::string reason = !use_z3 ? "z3_not_requested" : (proof.value("z3_used", false) ? (verified ? "z3_proved_bv64_identity" : "z3_solver_not_unsat") : proof.value("reason", std::string("z3_backend_unavailable")));
+                out.push_back(json{{"original_va", sa_format_address(ins.addr)}, {"original_expr", "(x ^ y) + ((x & y) << 1)"}, {"simplified_expr", "x + y"}, {"verified", verified}, {"proof_method", verified ? "z3_bv64_unsat_negated_equivalence" : (use_z3 ? "z3_identity_proof_unavailable" : "unverified_mba_heuristic")}, {"solver_required", true}, {"solver_invoked", proof.value("solver_invoked", false)}, {"solver_selection_reason", reason}, {"z3_skip_reason", verified ? "" : reason}, {"z3_used", proof.value("z3_used", false)}, {"z3_proof", proof}});
             }
         }
     }
+    if (z3_used_any)
+        z3_state = z3_backend_state();
     const bool z3_api_available = z3_state.value("api_available", false);
-    const bool solver_invoked = false;
     std::string selection_reason;
     std::string skip_reason;
     if (!use_z3) {
@@ -2256,11 +3597,11 @@ inline tool_result_t mba_simplify(const json& params)
         selection_reason = "deterministic_identities_do_not_require_solver";
         skip_reason = "solver_not_required_for_detected_identities";
     } else if (!z3_api_available) {
-        selection_reason = "z3_backend_unavailable";
-        skip_reason = "z3_backend_unavailable";
+        selection_reason = z3_used_any ? "z3_loaded_for_dynamic_identity_proof" : "z3_backend_unavailable";
+        skip_reason = z3_used_any ? "" : "z3_backend_unavailable";
     } else {
-        selection_reason = "z3_backend_available_no_owned_mba_solver_adapter";
-        skip_reason = "z3_backend_available_no_owned_mba_solver_adapter";
+        selection_reason = z3_used_any ? "z3_loaded_for_dynamic_identity_proof" : "z3_backend_available_but_no_solver_candidate_invoked";
+        skip_reason = z3_used_any ? "" : "z3_backend_available_but_no_solver_candidate_invoked";
     }
     const bool z3_requested = use_z3 && solver_required;
     diag::log_tagged_fmt("protected_re",
@@ -2285,12 +3626,13 @@ inline tool_result_t mba_simplify(const json& params)
     result["z3_requested"] = z3_requested;
     result["z3_preference_requested"] = use_z3;
     result["z3_request_explicit"] = z3_explicit;
-    result["z3_used"] = false;
+    result["z3_used"] = z3_used_any;
     result["z3_backend"] = z3_state;
     result["solver_required"] = solver_required;
     result["solver_invoked"] = solver_invoked;
     result["solver_selection_reason"] = selection_reason;
     result["z3_skip_reason"] = skip_reason;
+    result["solver_proofs"] = solver_proofs;
     result["expression_complexity"] = json{{"instructions_decoded", insns.size()}, {"deterministic_identity_count", deterministic_count}, {"heuristic_candidate_count", heuristic_count}, {"solver_candidate_count", heuristic_count}, {"scan_size", size}};
     result["proof_backend"] = solver_required ? "deterministic_local_identities_with_unverified_solver_candidates" : "deterministic_local_identities_only";
     result["confidence"] = out.empty() ? 0.0 : 0.65;
@@ -2650,15 +3992,38 @@ inline tool_result_t opaque_predicate_patch(const json& params)
         auto va = parse_u64_json(pred.value("va", json()));
         if (!va)
             continue;
-        auto patch = patch_bytes_for_predicate(pid, pred);
-        if (!patch)
+        const std::uint64_t verify_base = *va > 32 ? *va - 32 : *va;
+        auto verified_scan = opaque_predicate_detect(json{{"address", sa_format_address(verify_base)}, {"size", 96}, {"process_id", pid}});
+        bool still_proven = false;
+        if (verified_scan.success && verified_scan.data.contains("predicates") && verified_scan.data["predicates"].is_array()) {
+            for (const auto& p : verified_scan.data["predicates"]) {
+                auto pva = parse_u64_json(p.value("va", json()));
+                if (pva && *pva == *va && p.value("result", std::string()) == pred.value("result", std::string())) {
+                    still_proven = true;
+                    break;
+                }
+            }
+        }
+        if (!still_proven) {
+            log.push_back(json{{"va", sa_format_address(*va)}, {"applied", false}, {"skipped", true}, {"reason", "predicate_not_reproven_before_patch"}, {"verification", verified_scan.data}});
             continue;
+        }
+        auto patch = patch_bytes_for_predicate(pid, pred);
+        if (!patch) {
+            log.push_back(json{{"va", sa_format_address(*va)}, {"applied", false}, {"skipped", true}, {"reason", "patch_bytes_unavailable_after_validation"}});
+            continue;
+        }
+        std::vector<std::uint8_t> before;
+        read_target_memory(pid, *va, patch->size(), before);
         const std::string desc = "opaque_predicate_patch " + pred.value("result", std::string("unknown"));
         const int idx = code_patcher::create_patch(*va, *patch, desc);
         bool ok = idx >= 0 && code_patcher::apply_patch(idx);
+        std::vector<std::uint8_t> after;
+        if (ok)
+            read_target_memory(pid, *va, patch->size(), after);
         if (ok)
             ++patched;
-        log.push_back(json{{"va", sa_format_address(*va)}, {"action", pred.value("result", std::string()) == "always_true" ? "replace_with_unconditional_jump" : "nop_conditional_jump"}, {"patch_index", idx}, {"applied", ok}, {"bytes", bytes_to_hex(*patch)}});
+        log.push_back(json{{"va", sa_format_address(*va)}, {"action", pred.value("result", std::string()) == "always_true" ? "replace_with_unconditional_jump" : "nop_conditional_jump"}, {"patch_index", idx}, {"applied", ok}, {"validation", "predicate_reproven_before_patch"}, {"original_bytes", bytes_to_hex(before)}, {"patch_bytes", bytes_to_hex(*patch)}, {"after_bytes", bytes_to_hex(after)}, {"after_matches_patch", ok && after == *patch}});
     }
     json out;
     out["patched_count"] = patched;
@@ -2923,6 +4288,96 @@ inline json dispatch_accepted_slots_json(const json& assignments)
                              {"assignment_va", a.value("assignment_va", json(nullptr))}});
     }
     return slots;
+}
+
+inline bool drv_add_signed_offset(std::uint64_t base, std::int64_t disp, std::uint64_t& out)
+{
+    if (disp >= 0) {
+        const std::uint64_t udisp = static_cast<std::uint64_t>(disp);
+        if (base > std::numeric_limits<std::uint64_t>::max() - udisp)
+            return false;
+        out = base + udisp;
+        return true;
+    }
+    const std::uint64_t magnitude = static_cast<std::uint64_t>(-(disp + 1)) + 1;
+    if (base < magnitude)
+        return false;
+    out = base - magnitude;
+    return true;
+}
+
+inline json driver_object_assignment_evidence(const AsmInstr& ins,
+                                             const std::map<std::string, std::uint64_t>& reg_values,
+                                             std::int64_t disp)
+{
+    json ev;
+    const std::string base_reg = drv_gpr_name(ins.mem_op.base_reg);
+    const std::string index_reg = drv_gpr_name(ins.mem_op.index_reg);
+    ev["memory_base_register"] = base_reg.empty() ? "none" : base_reg;
+    ev["memory_index_register"] = index_reg.empty() ? "none" : index_reg;
+    ev["memory_displacement"] = disp;
+    ev["major_function_offset"] = sa_format_address(static_cast<std::uint64_t>(disp));
+    ev["assignment_instruction"] = instruction_to_json(ins);
+    ev["driver_object_source"] = base_reg == "rcx" ? "driver_entry_rcx_argument" : (base_reg.empty() ? "unresolved" : "tracked_register_or_alias");
+    ev["dispatch_table_va_known"] = false;
+    ev["dispatch_slot_va"] = nullptr;
+    ev["driver_object_va"] = nullptr;
+    if (!base_reg.empty()) {
+        if (auto base = resolve_last_register_value(reg_values, base_reg)) {
+            std::uint64_t slot_va = 0;
+            if (drv_add_signed_offset(*base, disp, slot_va)) {
+                ev["driver_object_va"] = sa_format_address(*base);
+                ev["dispatch_slot_va"] = sa_format_address(slot_va);
+                ev["dispatch_table_va"] = sa_format_address(*base + 0x70);
+                ev["dispatch_table_va_known"] = true;
+                ev["driver_object_source"] = "tracked_register_constant";
+            }
+        }
+    }
+    if (!ev.value("dispatch_table_va_known", false))
+        ev["dispatch_table_va"] = "driver_object+0x70";
+    return ev;
+}
+
+inline json apply_explicit_driver_object_to_assignments(json& assignments, std::uint64_t driver_object_va)
+{
+    json evidence;
+    evidence["driver_object_va"] = sa_format_address(driver_object_va);
+    evidence["dispatch_table_va"] = sa_format_address(driver_object_va + 0x70);
+    evidence["source"] = "explicit_driver_object_va_parameter";
+    evidence["slot_count_updated"] = 0;
+    if (!assignments.is_array() || driver_object_va == 0)
+        return evidence;
+    std::size_t updated = 0;
+    for (auto& a : assignments) {
+        if (!a.is_object())
+            continue;
+        const std::uint32_t irp = a.value("irp_code", 0u);
+        const std::uint64_t slot = driver_object_va + 0x70 + static_cast<std::uint64_t>(irp) * 8ull;
+        a["driver_object_va"] = sa_format_address(driver_object_va);
+        a["dispatch_table_va"] = sa_format_address(driver_object_va + 0x70);
+        a["dispatch_slot_va"] = sa_format_address(slot);
+        a["dispatch_table_va_source"] = "explicit_driver_object_va_parameter";
+        ++updated;
+    }
+    evidence["slot_count_updated"] = updated;
+    return evidence;
+}
+
+inline json driver_entry_evidence_json(std::uint32_t pid, const target_module_t& mod, const pe_layout_t& pe, const json& diagnostics)
+{
+    json ev;
+    ev["driver_entry_va"] = sa_format_address(pe.entry);
+    ev["driver_entry_rva"] = pe.entry >= pe.base ? json(sa_format_address(pe.entry - pe.base)) : json(nullptr);
+    ev["entry_section"] = section_evidence_for_va(pe, pe.entry);
+    ev["entry_protection"] = memory_protection_evidence(pid, pe.entry);
+    ev["module"] = target_module_json(mod);
+    ev["scan_window"] = diagnostics.value("scan_window", json::object());
+    ev["instructions_decoded"] = diagnostics.value("instructions_decoded", 0);
+    ev["accepted_assignment_count"] = diagnostics.value("accepted_assignment_count", 0);
+    ev["candidate_count"] = diagnostics.value("candidate_count", 0);
+    ev["accepted_slots"] = diagnostics.value("accepted_slots", json::array());
+    return ev;
 }
 
 struct drv_dispatch_scan_limits_t {
@@ -3251,7 +4706,18 @@ inline bool parse_driver_entry_assignments(std::uint32_t pid, const target_modul
         a["irp_name"] = irp_name(code);
         a["handler_va"] = handler ? json(sa_format_address(handler)) : json(nullptr);
         a["driver_object_offset"] = sa_format_address(static_cast<std::uint64_t>(disp));
+        a["major_function_offset"] = sa_format_address(static_cast<std::uint64_t>(disp));
         a["evidence"] = instruction_to_json(ins);
+        a["dispatch_table_evidence"] = driver_object_assignment_evidence(ins, reg_values, disp);
+        if (a["dispatch_table_evidence"].value("dispatch_table_va_known", false)) {
+            a["driver_object_va"] = a["dispatch_table_evidence"].value("driver_object_va", json(nullptr));
+            a["dispatch_table_va"] = a["dispatch_table_evidence"].value("dispatch_table_va", json(nullptr));
+            a["dispatch_slot_va"] = a["dispatch_table_evidence"].value("dispatch_slot_va", json(nullptr));
+            a["dispatch_table_va_source"] = a["dispatch_table_evidence"].value("driver_object_source", std::string("tracked_register_constant"));
+        } else {
+            a["dispatch_table_va"] = "driver_object+0x70";
+            a["dispatch_table_va_source"] = a["dispatch_table_evidence"].value("driver_object_source", std::string("driver_entry_argument_unmaterialized"));
+        }
         a["handler_plausibility"] = handler_plausibility(pid, mod, pe, handler);
         const bool plausible = a["handler_plausibility"].value("plausible", false);
         a["accepted"] = plausible;
@@ -3330,6 +4796,9 @@ inline tool_result_t drv_find_dispatch_table(const json& params)
     tool_result_t chk;
     if (!static_image_mode)
         chk = require_driver();
+    auto explicit_driver_object = parse_param_u64(params, "driver_object_va");
+    if (!explicit_driver_object)
+        explicit_driver_object = parse_param_u64(params, "driver_object");
     const drv_dispatch_scan_limits_t limits = drv_dispatch_limits_from_params(params);
     drv_dispatch_scan_context_t scan_ctx(limits);
     const json scan_budget_start = scan_ctx.status();
@@ -3389,6 +4858,7 @@ inline tool_result_t drv_find_dispatch_table(const json& params)
         json assignments = json::array();
         json diagnostics = json::object();
         parse_driver_entry_assignments(0, static_mod, pe, assignments, diagnostics, scan_ctx, &image);
+        json explicit_dispatch_evidence = explicit_driver_object ? apply_explicit_driver_object_to_assignments(assignments, *explicit_driver_object) : json::object();
         json out;
         out["driver_name"] = static_mod.name;
         out["selected_module"] = target_module_json(static_mod);
@@ -3414,7 +4884,10 @@ inline tool_result_t drv_find_dispatch_table(const json& params)
         out["entry_protection"] = json{{"queried", false}, {"reason", "static_pe_image_fixture"}, {"protect", "unknown"}};
         out["driver_entry_va"] = sa_format_address(pe.entry);
         out["driver_entry_rva"] = pe.entry >= pe.base ? json(sa_format_address(pe.entry - pe.base)) : json(nullptr);
-        out["dispatch_table_va"] = "driver_object+0x70";
+        out["driver_entry_evidence"] = driver_entry_evidence_json(0, static_mod, pe, diagnostics);
+        out["dispatch_table_va"] = explicit_driver_object ? json(sa_format_address(*explicit_driver_object + 0x70)) : json("driver_object+0x70");
+        out["dispatch_table_va_known"] = explicit_driver_object.has_value();
+        out["dispatch_table_va_evidence"] = explicit_driver_object ? explicit_dispatch_evidence : json{{"source", "driver_entry_argument_unmaterialized"}, {"relative", "driver_object+0x70"}, {"actual_va_available", false}};
         out["assignments"] = assignments;
         out["candidate_count"] = diagnostics.value("candidate_count", 0);
         out["accepted_assignment_count"] = diagnostics.value("accepted_assignment_count", 0);
@@ -3426,7 +4899,7 @@ inline tool_result_t drv_find_dispatch_table(const json& params)
         out["cancelled"] = scan_ctx.cancelled;
         out["handler_plausibility_policy"] = "handler must resolve inside an executable section of the selected driver image";
         out["confidence"] = assignments.empty() ? 0.25 : std::min(0.95, 0.45 + assignments.size() * 0.04);
-        out["note"] = assignments.empty() ? "No accepted MajorFunction assignments were found in the static DriverEntry fixture." : "dispatch_table_va is expressed relative to the runtime DRIVER_OBJECT because the object pointer is not exposed by this read-only analysis path.";
+        out["note"] = assignments.empty() ? "No accepted MajorFunction assignments were found in the static DriverEntry fixture." : (explicit_driver_object ? "dispatch_table_va was derived from the explicit driver_object_va parameter." : "dispatch_table_va is expressed relative to the runtime DRIVER_OBJECT because the object pointer is not exposed by this read-only analysis path.");
         if (assignments.empty())
             out["rejection_reason"] = diagnostics.value("rejection_reason", std::string("no_accepted_dispatch_handlers"));
         diag::log_tagged_fmt("protected_re",
@@ -3758,10 +5231,14 @@ inline tool_result_t drv_find_dispatch_table(const json& params)
     json diagnostics = have_preselected_analysis ? std::move(preselected_diagnostics) : json::object();
     if (!have_preselected_analysis)
         parse_driver_entry_assignments(0, *mod, pe, assignments, diagnostics, scan_ctx);
+    json explicit_dispatch_evidence = explicit_driver_object ? apply_explicit_driver_object_to_assignments(assignments, *explicit_driver_object) : json::object();
     json out = base_out;
     out["driver_entry_va"] = sa_format_address(pe.entry);
     out["driver_entry_rva"] = pe.entry >= pe.base ? json(sa_format_address(pe.entry - pe.base)) : json(nullptr);
-    out["dispatch_table_va"] = "driver_object+0x70";
+    out["driver_entry_evidence"] = driver_entry_evidence_json(0, *mod, pe, diagnostics);
+    out["dispatch_table_va"] = explicit_driver_object ? json(sa_format_address(*explicit_driver_object + 0x70)) : json("driver_object+0x70");
+    out["dispatch_table_va_known"] = explicit_driver_object.has_value();
+    out["dispatch_table_va_evidence"] = explicit_driver_object ? explicit_dispatch_evidence : json{{"source", "driver_entry_argument_unmaterialized"}, {"relative", "driver_object+0x70"}, {"actual_va_available", false}};
     out["assignments"] = assignments;
     out["candidate_count"] = diagnostics.value("candidate_count", 0);
     out["accepted_assignment_count"] = diagnostics.value("accepted_assignment_count", 0);
@@ -3774,7 +5251,7 @@ inline tool_result_t drv_find_dispatch_table(const json& params)
     out["cancelled"] = scan_ctx.cancelled;
     out["handler_plausibility_policy"] = "handler must resolve inside an executable section of the selected driver image";
     out["confidence"] = assignments.empty() ? 0.25 : std::min(0.95, 0.45 + assignments.size() * 0.04);
-    out["note"] = assignments.empty() ? "No accepted MajorFunction assignments were found in the bounded DriverEntry scan; inspect diagnostics.candidates and breadcrumbs for rejected or bounded evidence." : "dispatch_table_va is expressed relative to the runtime DRIVER_OBJECT because the object pointer is not exposed by this read-only analysis path.";
+    out["note"] = assignments.empty() ? "No accepted MajorFunction assignments were found in the bounded DriverEntry scan; inspect diagnostics.candidates and breadcrumbs for rejected or bounded evidence." : (explicit_driver_object ? "dispatch_table_va was derived from the explicit driver_object_va parameter." : "dispatch_table_va is expressed relative to the runtime DRIVER_OBJECT because the object pointer is not exposed by this read-only analysis path.");
     if (assignments.empty())
         out["rejection_reason"] = diagnostics.value("rejection_reason", std::string("no_accepted_dispatch_handlers"));
     diag::log_tagged_fmt("protected_re",
@@ -3790,6 +5267,73 @@ inline tool_result_t drv_find_dispatch_table(const json& params)
     return tool_result_t::ok("Driver dispatch assignment scan completed", out);
 }
 
+inline json drv_analyze_handler_function(std::uint32_t pid, std::uint64_t handler, std::uint32_t max_bytes = 0x8000, std::uint32_t max_insns = 2048)
+{
+    auto insns = disassemble_target(pid, handler, max_bytes, max_insns);
+    json preview = json::array();
+    json pseudo = json::array();
+    json param_events = json::array();
+    json control_transfers = json::array();
+    std::uint64_t end = handler;
+    std::string stop_reason = insns.empty() ? "no_instructions_decoded" : "max_scan_reached";
+    bool uses_driver_object = false;
+    bool uses_irp = false;
+    bool calls_helpers = false;
+    for (std::size_t i = 0; i < insns.size(); ++i) {
+        const auto& ins = insns[i];
+        const std::string text = lower_ascii(std::string(ins.mnem) + " " + ins.ops);
+        end = ins.addr + static_cast<std::uint64_t>(std::max(ins.len, 1));
+        if (preview.size() < 48)
+            preview.push_back(instruction_to_json(ins));
+        if (pseudo.size() < 32)
+            pseudo.push_back(json{{"va", sa_format_address(ins.addr)}, {"text", std::string(ins.mnem) + (std::strlen(ins.ops) ? " " + std::string(ins.ops) : "")}});
+        if (text.find("rcx") != std::string::npos) {
+            uses_driver_object = true;
+            if (param_events.size() < 64)
+                param_events.push_back(json{{"va", sa_format_address(ins.addr)}, {"parameter", "driver_object"}, {"register", "rcx"}, {"instruction", instruction_to_json(ins)}});
+        }
+        if (text.find("rdx") != std::string::npos) {
+            uses_irp = true;
+            if (param_events.size() < 64)
+                param_events.push_back(json{{"va", sa_format_address(ins.addr)}, {"parameter", "irp"}, {"register", "rdx"}, {"instruction", instruction_to_json(ins)}});
+        }
+        if (ins.is_call) {
+            calls_helpers = true;
+            if (control_transfers.size() < 64)
+                control_transfers.push_back(json{{"va", sa_format_address(ins.addr)}, {"kind", "call"}, {"target", ins.branch_target ? json(sa_format_address(ins.branch_target)) : json(nullptr)}, {"instruction", instruction_to_json(ins)}});
+        } else if (ins.is_branch && ins.branch_target) {
+            if (control_transfers.size() < 64)
+                control_transfers.push_back(json{{"va", sa_format_address(ins.addr)}, {"kind", "branch"}, {"target", sa_format_address(ins.branch_target)}, {"instruction", instruction_to_json(ins)}});
+        }
+        if (ins.is_ret) {
+            stop_reason = "ret";
+            break;
+        }
+        const std::string m = mnemonic_of(ins);
+        if (m == "jmp" && ins.branch_target != 0 && (ins.branch_target < handler || ins.branch_target >= handler + max_bytes)) {
+            stop_reason = "tail_jump_outside_scan_window";
+            break;
+        }
+        if (i + 1 >= max_insns)
+            stop_reason = "instruction_limit";
+    }
+    json out;
+    out["handler_va"] = sa_format_address(handler);
+    out["function_start_va"] = sa_format_address(handler);
+    out["function_end_va"] = end > handler ? json(sa_format_address(end)) : json(nullptr);
+    out["size"] = end > handler ? end - handler : 0;
+    out["stop_reason"] = stop_reason;
+    out["instructions_decoded"] = insns.size();
+    out["pseudocode_preview"] = preview;
+    out["linear_preview"] = pseudo;
+    out["parameter_usage"] = json{{"driver_object", json{{"register", "rcx"}, {"observed", uses_driver_object}}},
+                                  {"irp", json{{"register", "rdx"}, {"observed", uses_irp}}},
+                                  {"events", param_events}};
+    out["control_transfers"] = control_transfers;
+    out["calls_helpers"] = calls_helpers;
+    return out;
+}
+
 inline tool_result_t drv_decode_irp_handlers(const json& params)
 {
     if (!params.contains("dispatch_table") || !params["dispatch_table"].is_object())
@@ -3803,17 +5347,11 @@ inline tool_result_t drv_decode_irp_handlers(const json& params)
         auto handler = parse_u64_json(a.value("handler_va", json()));
         if (!handler)
             continue;
-        auto insns = disassemble_target(0, *handler, 4096, 512);
-        std::uint64_t end = *handler;
-        json preview = json::array();
-        for (std::size_t i = 0; i < insns.size(); ++i) {
-            end = insns[i].addr + static_cast<std::uint64_t>(std::max(insns[i].len, 1));
-            if (i < 24)
-                preview.push_back(instruction_to_json(insns[i]));
-            if (insns[i].is_ret)
-                break;
-        }
-        arr.push_back(json{{"irp_code", a.value("irp_code", 0)}, {"irp_name", a.value("irp_name", std::string("IRP_MJ_UNKNOWN"))}, {"handler_va", sa_format_address(*handler)}, {"size", end > *handler ? end - *handler : 0}, {"pseudocode_preview", preview}, {"parameter_usage", json{{"driver_object", "rcx"}, {"irp", "rdx"}}}});
+        json analysis = drv_analyze_handler_function(0, *handler);
+        analysis["irp_code"] = a.value("irp_code", 0);
+        analysis["irp_name"] = a.value("irp_name", std::string("IRP_MJ_UNKNOWN"));
+        analysis["dispatch_assignment_va"] = a.value("assignment_va", json(nullptr));
+        arr.push_back(std::move(analysis));
     }
     return tool_result_t::ok(json(arr));
 }
@@ -3823,6 +5361,190 @@ inline bool looks_ioctl(std::uint64_t value)
     const std::uint64_t function = (value >> 2) & 0xFFFULL;
     const std::uint64_t device = (value >> 16) & 0xFFFFULL;
     return value > 0x1000 && function != 0 && device != 0 && value <= 0xFFFFFFFFULL;
+}
+
+inline bool text_has_any_offset(const std::string& text, std::initializer_list<const char*> offsets)
+{
+    for (const char* off : offsets) {
+        if (text.find(off) != std::string::npos)
+            return true;
+    }
+    return false;
+}
+
+inline std::string ioctl_stack_role_from_instruction(const AsmInstr& ins)
+{
+    const std::string text = lower_ascii(std::string(ins.mnem) + " " + ins.ops);
+    if (text_has_any_offset(text, {"+0x18", "+18h", "+18"}) || (ins.has_mem_op && ins.mem_op.has_disp && ins.mem_op.disp == 0x18))
+        return "io_control_code";
+    if (text_has_any_offset(text, {"+0x10", "+10h", "+10"}) || (ins.has_mem_op && ins.mem_op.has_disp && ins.mem_op.disp == 0x10))
+        return "input_buffer_length";
+    if (text_has_any_offset(text, {"+0x8", "+08h", "+8"}) || (ins.has_mem_op && ins.mem_op.has_disp && ins.mem_op.disp == 0x8))
+        return "output_buffer_length";
+    if (text_has_any_offset(text, {"+0x20", "+20h", "+20"}) || (ins.has_mem_op && ins.mem_op.has_disp && ins.mem_op.disp == 0x20))
+        return "type3_input_buffer";
+    return {};
+}
+
+inline void propagate_ioctl_register_roles(const AsmInstr& ins, const std::string& m, const std::vector<std::string>& ops, std::map<std::string, std::string>& roles, json& evidence)
+{
+    if (ops.empty() || operand_is_memory(ops[0]))
+        return;
+    const std::string dst = reg_from_operand(ops[0]);
+    if (dst.empty())
+        return;
+    if (m == "mov" || m == "movzx" || m == "movsxd" || m == "lea") {
+        std::string role;
+        if (ops.size() > 1 && operand_is_memory(ops[1]))
+            role = ioctl_stack_role_from_instruction(ins);
+        if (role.empty() && ops.size() > 1) {
+            const std::string src = reg_from_operand(ops[1]);
+            auto it = roles.find(src);
+            if (it != roles.end())
+                role = it->second;
+        }
+        if (!role.empty()) {
+            roles[dst] = role;
+            if (evidence.size() < 64)
+                evidence.push_back(json{{"va", sa_format_address(ins.addr)}, {"register", dst}, {"role", role}, {"instruction", instruction_to_json(ins)}});
+        } else {
+            roles.erase(dst);
+        }
+        return;
+    }
+    if ((m == "shr" || m == "sar") && roles[dst] == "io_control_code")
+        roles[dst] = "ioctl_function_selector";
+    else if ((m == "and" || m == "sub") && roles[dst] == "io_control_code")
+        roles[dst] = "ioctl_normalized_selector";
+    else if (m == "xor" && ops.size() > 1 && lower_ascii(ops[0]) == lower_ascii(ops[1]))
+        roles.erase(dst);
+    else if (m == "add" || m == "imul" || m == "mul" || m == "div" || m == "idiv" || m == "rol" || m == "ror")
+        roles.erase(dst);
+}
+
+inline std::string comparison_role_for_operands(const AsmInstr& ins, const std::vector<std::string>& ops, const std::map<std::string, std::string>& roles)
+{
+    const std::string direct = ioctl_stack_role_from_instruction(ins);
+    if (!direct.empty())
+        return direct;
+    for (const auto& op : ops) {
+        const std::string reg = reg_from_operand(op);
+        auto it = roles.find(reg);
+        if (it != roles.end())
+            return it->second;
+    }
+    return {};
+}
+
+inline std::uint64_t rip_relative_memory_target(const AsmInstr& ins)
+{
+    if (!ins.has_mem_op || !ins.mem_op.has_disp || ins.mem_op.base_reg != static_cast<std::uint16_t>(ZYDIS_REGISTER_RIP))
+        return 0;
+    std::uint64_t out = 0;
+    if (!drv_add_signed_offset(ins.addr + static_cast<std::uint64_t>(std::max(ins.len, 1)), ins.mem_op.disp, out))
+        return 0;
+    return out;
+}
+
+inline json decode_ioctl_code(std::uint64_t code);
+
+inline json drv_analyze_ioctl_dispatch(std::uint32_t pid, std::uint64_t handler)
+{
+    auto insns = disassemble_target(pid, handler, 0x10000, 8192);
+    json handlers = json::array();
+    json comparisons = json::array();
+    json role_evidence = json::array();
+    json jump_tables = json::array();
+    std::map<std::string, std::string> roles;
+    std::string type = "if_chain";
+    std::uint64_t last_switch_bound = 0;
+    std::string last_selector_reg;
+    for (std::size_t i = 0; i < insns.size(); ++i) {
+        const auto& ins = insns[i];
+        const std::string m = mnemonic_of(ins);
+        auto ops = split_operands(ins.ops);
+        propagate_ioctl_register_roles(ins, m, ops, roles, role_evidence);
+        if (m == "cmp" || m == "sub") {
+            const std::string role = comparison_role_for_operands(ins, ops, roles);
+            const bool role_is_ioctl = role == "io_control_code" || role == "ioctl_normalized_selector" || role == "ioctl_function_selector";
+            const std::uint64_t imm = ins.has_imm ? ins.imm_unsigned : 0;
+            if (role == "ioctl_function_selector" && imm != 0)
+                last_switch_bound = std::max<std::uint64_t>(last_switch_bound, imm);
+            if (role_is_ioctl && !ops.empty())
+                last_selector_reg = reg_from_operand(ops[0]);
+            if (!looks_ioctl(imm) && !(role == "io_control_code" && imm != 0 && imm <= 0xFFFFFFFFULL))
+                continue;
+            std::uint64_t target = 0;
+            std::string branch_kind = "none";
+            std::string target_source = "comparison_va";
+            for (std::size_t j = i + 1; j < insns.size() && j < i + 6; ++j) {
+                if (!insns[j].is_branch)
+                    continue;
+                const std::string bm = mnemonic_of(insns[j]);
+                branch_kind = bm;
+                if ((bm == "jne" || bm == "jnz") && j + 1 < insns.size()) {
+                    target = insns[j].addr + static_cast<std::uint64_t>(std::max(insns[j].len, 1));
+                    target_source = "fallthrough_after_not_equal_branch";
+                } else if (insns[j].branch_target) {
+                    target = insns[j].branch_target;
+                    target_source = "conditional_branch_target";
+                }
+                break;
+            }
+            json cmp = json{{"compare_va", sa_format_address(ins.addr)},
+                            {"ioctl_code", sa_format_address(imm)},
+                            {"comparison_role", role.empty() ? "immediate_ioctl_constant" : role},
+                            {"instruction", instruction_to_json(ins)},
+                            {"branch_kind", branch_kind},
+                            {"handler_target", target ? json(sa_format_address(target)) : json(nullptr)},
+                            {"target_source", target_source}};
+            if (looks_ioctl(imm))
+                cmp["decoded_ioctl"] = decode_ioctl_code(imm);
+            else if (role == "ioctl_function_selector")
+                cmp["ioctl_selector"] = imm;
+            comparisons.push_back(cmp);
+            json handler_entry{{"ioctl_code", sa_format_address(imm)},
+                               {"handler_va", target ? sa_format_address(target) : sa_format_address(ins.addr)},
+                               {"compare_va", sa_format_address(ins.addr)},
+                               {"dispatch_evidence", cmp},
+                               {"confidence", target ? 0.86 : 0.62}};
+            if (cmp.contains("decoded_ioctl"))
+                handler_entry["decoded_ioctl"] = cmp["decoded_ioctl"];
+            if (cmp.contains("ioctl_selector"))
+                handler_entry["ioctl_selector"] = cmp["ioctl_selector"];
+            handlers.push_back(std::move(handler_entry));
+        }
+        if (m == "jmp" && ins.has_mem_op) {
+            type = "jump_table";
+            const std::uint64_t table_va = rip_relative_memory_target(ins);
+            json jt{{"jmp_va", sa_format_address(ins.addr)},
+                    {"instruction", instruction_to_json(ins)},
+                    {"selector_register", last_selector_reg.empty() ? "unknown" : last_selector_reg},
+                    {"selector_bound", last_switch_bound},
+                    {"table_va", table_va ? json(sa_format_address(table_va)) : json(nullptr)},
+                    {"entries", json::array()}};
+            if (table_va && last_switch_bound != 0 && last_switch_bound <= 256) {
+                for (std::uint64_t n = 0; n <= last_switch_bound && n < 256; ++n) {
+                    std::uint64_t entry = 0;
+                    if (!read_target_value(pid, table_va + n * sizeof(std::uint64_t), entry))
+                        break;
+                    if (entry)
+                        jt["entries"].push_back(json{{"selector", n}, {"handler_va", sa_format_address(entry)}});
+                }
+            }
+            jump_tables.push_back(std::move(jt));
+        }
+    }
+    if (handlers.size() > 3 && type != "jump_table")
+        type = "switch";
+    return json{{"dispatch_type", type},
+                {"dispatch_va", sa_format_address(handler)},
+                {"ioctl_handlers", handlers},
+                {"comparison_evidence", comparisons},
+                {"register_role_evidence", role_evidence},
+                {"jump_tables", jump_tables},
+                {"instructions_scanned", insns.size()},
+                {"confidence", handlers.empty() ? 0.2 : std::min(0.93, 0.5 + handlers.size() * 0.08 + (jump_tables.empty() ? 0.0 : 0.08))}};
 }
 
 inline tool_result_t drv_find_ioctl_dispatch(const json& params)
@@ -3835,35 +5557,7 @@ inline tool_result_t drv_find_ioctl_dispatch(const json& params)
         handler = parse_param_u64(params, "handler_va");
     if (!handler)
         return tool_result_t::error("device_control_handler_va is required");
-    auto insns = disassemble_target(0, *handler, 0x10000, 8192);
-    json handlers = json::array();
-    std::string type = "if_chain";
-    for (std::size_t i = 0; i < insns.size(); ++i) {
-        const auto& ins = insns[i];
-        const std::string m = mnemonic_of(ins);
-        if (m == "jmp" && ins.has_mem_op)
-            type = "jump_table";
-        if (m != "cmp" && m != "sub")
-            continue;
-        std::uint64_t ioctl = ins.has_imm ? ins.imm_unsigned : 0;
-        if (!looks_ioctl(ioctl))
-            continue;
-        std::uint64_t target = 0;
-        for (std::size_t j = i + 1; j < insns.size() && j < i + 5; ++j) {
-            if (insns[j].branch_target) {
-                target = insns[j].branch_target;
-                break;
-            }
-        }
-        handlers.push_back(json{{"ioctl_code", sa_format_address(ioctl)}, {"handler_va", target ? sa_format_address(target) : sa_format_address(ins.addr)}, {"compare_va", sa_format_address(ins.addr)}, {"confidence", target ? 0.78 : 0.55}});
-    }
-    if (handlers.size() > 3)
-        type = "switch";
-    json out;
-    out["dispatch_type"] = type;
-    out["dispatch_va"] = sa_format_address(*handler);
-    out["ioctl_handlers"] = handlers;
-    out["confidence"] = handlers.empty() ? 0.2 : std::min(0.9, 0.45 + handlers.size() * 0.08);
+    json out = drv_analyze_ioctl_dispatch(0, *handler);
     return tool_result_t::ok("IOCTL dispatch scan completed", out);
 }
 
@@ -3880,6 +5574,112 @@ inline json decode_ioctl_code(std::uint64_t code)
     return j;
 }
 
+inline json drv_buffer_usage_analysis(std::uint32_t pid, std::uint64_t handler, const std::string& method)
+{
+    auto insns = disassemble_target(pid, handler, 0x8000, 2048);
+    json events = json::array();
+    bool input_length = false;
+    bool output_length = false;
+    bool system_buffer = false;
+    bool type3_input = false;
+    bool user_buffer = false;
+    bool mdl_buffer = false;
+    bool probe_read = false;
+    bool probe_write = false;
+    bool length_compare = false;
+    bool output_length_check = false;
+    bool integer_overflow_guard = false;
+    std::size_t first_pointer_event = static_cast<std::size_t>(-1);
+    std::size_t first_length_event = static_cast<std::size_t>(-1);
+    std::size_t first_probe_event = static_cast<std::size_t>(-1);
+    auto record = [&](std::size_t index, const char* role, const AsmInstr& ins) {
+        if (events.size() < 128)
+            events.push_back(json{{"order", index}, {"role", role}, {"va", sa_format_address(ins.addr)}, {"instruction", instruction_to_json(ins)}});
+    };
+    for (std::size_t i = 0; i < insns.size(); ++i) {
+        const auto& ins = insns[i];
+        const std::string m = mnemonic_of(ins);
+        const std::string text = lower_ascii(std::string(ins.mnem) + " " + ins.ops);
+        const std::string stack_role = ioctl_stack_role_from_instruction(ins);
+        if (stack_role == "input_buffer_length") {
+            input_length = true;
+            first_length_event = std::min(first_length_event, i);
+            record(i, "input_buffer_length", ins);
+        } else if (stack_role == "output_buffer_length") {
+            output_length = true;
+            output_length_check = output_length_check || m == "cmp" || m == "test";
+            first_length_event = std::min(first_length_event, i);
+            record(i, "output_buffer_length", ins);
+        } else if (stack_role == "type3_input_buffer") {
+            type3_input = true;
+            first_pointer_event = std::min(first_pointer_event, i);
+            record(i, "type3_input_buffer", ins);
+        }
+        if (text.find("systembuffer") != std::string::npos || text.find("associatedirp.systembuffer") != std::string::npos) {
+            system_buffer = true;
+            first_pointer_event = std::min(first_pointer_event, i);
+            record(i, "system_buffer", ins);
+        }
+        if (text.find("userbuffer") != std::string::npos || text.find("user buffer") != std::string::npos) {
+            user_buffer = true;
+            first_pointer_event = std::min(first_pointer_event, i);
+            record(i, "user_buffer", ins);
+        }
+        if (text.find("mdladdress") != std::string::npos || text.find("mmbuildmdl") != std::string::npos || text.find("mmgetsystemaddressformdlsafe") != std::string::npos) {
+            mdl_buffer = true;
+            first_pointer_event = std::min(first_pointer_event, i);
+            record(i, "mdl_buffer", ins);
+        }
+        if (text.find("probeforread") != std::string::npos || text.find("probe for read") != std::string::npos) {
+            probe_read = true;
+            first_probe_event = std::min(first_probe_event, i);
+            record(i, "probe_for_read", ins);
+        }
+        if (text.find("probeforwrite") != std::string::npos || text.find("probe for write") != std::string::npos) {
+            probe_write = true;
+            first_probe_event = std::min(first_probe_event, i);
+            record(i, "probe_for_write", ins);
+        }
+        if (m == "cmp" || m == "test") {
+            if (stack_role == "input_buffer_length" || stack_role == "output_buffer_length" || ins.has_imm) {
+                length_compare = true;
+                first_length_event = std::min(first_length_event, i);
+                if (stack_role == "output_buffer_length")
+                    output_length_check = true;
+                record(i, "length_compare", ins);
+            }
+        }
+        if (m == "jo" || m == "jno" || m == "jb" || m == "jbe" || m == "jc" || m == "jae" || text.find("safeint") != std::string::npos) {
+            integer_overflow_guard = true;
+            record(i, "integer_overflow_guard", ins);
+        }
+    }
+    const bool method_buffered = method == "BUFFERED";
+    const bool method_direct = method == "IN_DIRECT" || method == "OUT_DIRECT";
+    const bool method_neither = method == "NEITHER";
+    const bool input_used = input_length || system_buffer || type3_input || method_buffered || method_direct || method_neither;
+    const bool output_used = output_length || user_buffer || system_buffer || mdl_buffer || method_buffered || method_direct || method_neither;
+    json out;
+    out["input_buffer_used"] = input_used;
+    out["output_buffer_used"] = output_used;
+    out["input_length_observed"] = input_length;
+    out["output_length_observed"] = output_length;
+    out["system_buffer_observed"] = system_buffer;
+    out["type3_input_buffer_observed"] = type3_input;
+    out["user_buffer_observed"] = user_buffer;
+    out["mdl_buffer_observed"] = mdl_buffer;
+    out["probe_for_read_observed"] = probe_read;
+    out["probe_for_write_observed"] = probe_write;
+    out["length_compare_observed"] = length_compare;
+    out["output_length_check_observed"] = output_length_check;
+    out["integer_overflow_guard_observed"] = integer_overflow_guard;
+    out["pointer_before_length"] = first_pointer_event != static_cast<std::size_t>(-1) && (first_length_event == static_cast<std::size_t>(-1) || first_pointer_event < first_length_event);
+    out["probe_after_pointer"] = first_probe_event != static_cast<std::size_t>(-1) && first_pointer_event != static_cast<std::size_t>(-1) && first_probe_event > first_pointer_event;
+    out["events"] = events;
+    out["instructions_scanned"] = insns.size();
+    return out;
+}
+
 inline tool_result_t drv_enumerate_ioctls(const json& params)
 {
     if (!params.contains("ioctl_handlers") || !params["ioctl_handlers"].is_array())
@@ -3892,8 +5692,13 @@ inline tool_result_t drv_enumerate_ioctls(const json& params)
         json e = decode_ioctl_code(*code);
         e["handler_va"] = h.value("handler_va", std::string("unknown"));
         const std::string method = e.value("method", std::string());
-        e["input_buffer_used"] = true;
-        e["output_buffer_used"] = method == "BUFFERED" || method == "OUT_DIRECT" || method == "NEITHER";
+        auto handler = parse_u64_json(h.value("handler_va", json()));
+        json usage = handler ? drv_buffer_usage_analysis(0, *handler, method) : json::object();
+        e["input_buffer_used"] = usage.value("input_buffer_used", true);
+        e["output_buffer_used"] = usage.value("output_buffer_used", method == "BUFFERED" || method == "OUT_DIRECT" || method == "NEITHER");
+        e["buffer_usage"] = usage;
+        if (h.contains("dispatch_evidence"))
+            e["dispatch_evidence"] = h["dispatch_evidence"];
         e["risk"] = method == "NEITHER" ? "high" : (method == "BUFFERED" ? "medium" : "medium");
         out.push_back(std::move(e));
     }
@@ -3954,6 +5759,85 @@ inline std::string read_utf16_ascii(const std::vector<std::uint8_t>& data, std::
     return out;
 }
 
+inline std::vector<AsmInstr> disassemble_loaded_bytes_window(std::uint64_t va, const std::vector<std::uint8_t>& bytes, std::uint32_t max_insns)
+{
+    std::vector<AsmInstr> out;
+    std::size_t off = 0;
+    while (off < bytes.size() && out.size() < max_insns) {
+        const int avail = static_cast<int>(std::min<std::size_t>(15, bytes.size() - off));
+        AsmInstr ins = zydis_decode_one(bytes.data() + off, avail, va + off);
+        if (ins.len <= 0)
+            ins.len = 1;
+        out.push_back(ins);
+        off += static_cast<std::size_t>(ins.len);
+    }
+    return out;
+}
+
+inline json drv_device_name_call_sites(const target_module_t& mod,
+                                       const pe_layout_t& pe,
+                                       const std::vector<std::uint8_t>& image,
+                                       std::uint64_t string_va,
+                                       const std::string& type)
+{
+    json sites = json::array();
+    for (const auto& sec : pe.sections) {
+        if (!executable_characteristics(sec.characteristics))
+            continue;
+        if (sec.va < mod.base)
+            continue;
+        const std::uint64_t off64 = sec.va - mod.base;
+        if (off64 >= image.size())
+            continue;
+        const std::size_t off = static_cast<std::size_t>(off64);
+        const std::size_t avail = std::min<std::size_t>(image.size() - off, static_cast<std::size_t>(std::min<std::uint32_t>(sec.virtual_size ? sec.virtual_size : sec.raw_size, 0x100000)));
+        if (avail == 0)
+            continue;
+        std::vector<std::uint8_t> sec_bytes(image.begin() + static_cast<std::ptrdiff_t>(off), image.begin() + static_cast<std::ptrdiff_t>(off + avail));
+        auto insns = disassemble_loaded_bytes_window(sec.va, sec_bytes, 65536);
+        for (std::size_t i = 0; i < insns.size(); ++i) {
+            const auto& ins = insns[i];
+            bool references_string = false;
+            std::string reference_source;
+            if (ins.has_imm && ins.imm_unsigned == string_va) {
+                references_string = true;
+                reference_source = "immediate";
+            }
+            const std::uint64_t rip_target = rip_relative_memory_target(ins);
+            if (!references_string && rip_target == string_va) {
+                references_string = true;
+                reference_source = "rip_relative_memory";
+            }
+            if (!references_string)
+                continue;
+            json calls = json::array();
+            for (std::size_t j = i + 1; j < insns.size() && j <= i + 24; ++j) {
+                if (!insns[j].is_call)
+                    continue;
+                const std::size_t call_order = calls.size();
+                const std::string inferred = call_order == 0 ? "RtlInitUnicodeString_or_inline_string_helper" : (type == "device" ? "IoCreateDevice_or_IoCreateDeviceSecure" : "IoCreateSymbolicLink");
+                calls.push_back(json{{"call_va", sa_format_address(insns[j].addr)},
+                                     {"target_va", insns[j].branch_target ? json(sa_format_address(insns[j].branch_target)) : json(nullptr)},
+                                     {"call_order_after_reference", call_order},
+                                     {"api_inferred", inferred},
+                                     {"confidence", call_order == 0 ? 0.5 : 0.72},
+                                     {"instruction", instruction_to_json(insns[j])}});
+                if (calls.size() >= 3)
+                    break;
+            }
+            sites.push_back(json{{"reference_va", sa_format_address(ins.addr)},
+                                 {"reference_source", reference_source},
+                                 {"reference_instruction", instruction_to_json(ins)},
+                                 {"section", sec.name},
+                                 {"calls_after_reference", calls},
+                                 {"api_evidence_state", calls.empty() ? "string_reference_only" : "string_reference_with_nearby_calls"}});
+            if (sites.size() >= 32)
+                return sites;
+        }
+    }
+    return sites;
+}
+
 inline tool_result_t drv_find_device_names(const json& params)
 {
     auto chk = require_driver();
@@ -3974,12 +5858,15 @@ inline tool_result_t drv_find_device_names(const json& params)
     }
     const std::uint32_t max_modules = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(parse_param_u64(params, "max_modules").value_or(32)), 1, 128);
     json found = json::array();
+    std::set<std::string> seen;
     for (std::size_t mi = 0; mi < mods.size() && mi < max_modules; ++mi) {
         const auto& mod = mods[mi];
         const std::uint64_t scan_size = std::min<std::uint64_t>(mod.size ? mod.size : 0x200000, 16ull * 1024ull * 1024ull);
         std::vector<std::uint8_t> bytes;
         if (!read_target_memory(0, mod.base, static_cast<std::size_t>(scan_size), bytes) || bytes.size() < 16)
             continue;
+        pe_layout_t pe;
+        const bool pe_ok = read_pe_layout(0, mod.base, pe);
         for (std::size_t i = 0; i + 16 < bytes.size(); i += 2) {
             const char* type = nullptr;
             if (utf16_at(bytes, i, L"\\Device\\"))
@@ -3991,7 +5878,35 @@ inline tool_result_t drv_find_device_names(const json& params)
             std::string name = read_utf16_ascii(bytes, i, 260);
             if (name.size() < 4)
                 continue;
-            found.push_back(json{{"call_va", "unknown"}, {"string_va", sa_format_address(mod.base + i)}, {"type", type}, {"name", name}, {"module", mod.name}});
+            const std::uint64_t string_va = mod.base + i;
+            const std::string seen_key = mod.name + "|" + sa_format_address(string_va) + "|" + type;
+            if (!seen.insert(seen_key).second)
+                continue;
+            json call_sites = pe_ok ? drv_device_name_call_sites(mod, pe, bytes, string_va, type) : json::array();
+            json first_call = nullptr;
+            for (const auto& site : call_sites) {
+                if (!site.contains("calls_after_reference") || !site["calls_after_reference"].is_array())
+                    continue;
+                for (const auto& call : site["calls_after_reference"]) {
+                    const std::string inferred = call.value("api_inferred", std::string());
+                    if ((std::string(type) == "device" && inferred.find("IoCreateDevice") != std::string::npos) ||
+                        (std::string(type) == "symlink" && inferred.find("IoCreateSymbolicLink") != std::string::npos)) {
+                        first_call = call;
+                        break;
+                    }
+                }
+                if (!first_call.is_null())
+                    break;
+            }
+            found.push_back(json{{"call_va", first_call.is_object() ? first_call.value("call_va", std::string("unknown")) : std::string("unknown")},
+                                 {"string_va", sa_format_address(string_va)},
+                                 {"type", type},
+                                 {"name", name},
+                                 {"module", mod.name},
+                                 {"call_sites", call_sites},
+                                 {"call_site_count", call_sites.size()},
+                                 {"api_evidence_state", call_sites.empty() ? "string_only_no_code_reference_found" : "string_reference_with_callsite_candidates"},
+                                 {"confidence", call_sites.empty() ? 0.55 : 0.82}});
             if (found.size() >= 256)
                 break;
         }
@@ -4001,7 +5916,8 @@ inline tool_result_t drv_find_device_names(const json& params)
     json out;
     out["names"] = found;
     out["count"] = found.size();
-    out["confidence"] = found.empty() ? 0.0 : 0.75;
+    out["confidence"] = found.empty() ? 0.0 : 0.82;
+    out["call_site_policy"] = "Unicode device-name strings are correlated with nearby code references and call instructions; unresolved call targets are marked as inferred.";
     return tool_result_t::ok("Driver device-name scan completed", out);
 }
 
@@ -4010,6 +5926,7 @@ inline tool_result_t drv_check_buffer_safety(const json& params)
     if (!params.contains("ioctl_handlers") || !params["ioctl_handlers"].is_array())
         return tool_result_t::error("ioctl_handlers array is required");
     json issues = json::array();
+    json analyses = json::array();
     for (const auto& h : params["ioctl_handlers"]) {
         auto code = parse_u64_json(h.value("ioctl_code", json()));
         auto handler = parse_u64_json(h.value("handler_va", json()));
@@ -4017,27 +5934,29 @@ inline tool_result_t drv_check_buffer_safety(const json& params)
             continue;
         json dec = decode_ioctl_code(*code);
         const std::string method = dec.value("method", std::string());
-        auto insns = disassemble_target(0, *handler, 4096, 512);
-        bool saw_probe = false;
-        bool saw_length_cmp = false;
-        bool saw_pool = false;
-        for (const auto& ins : insns) {
-            const std::string text = lower_ascii(std::string(ins.mnem) + " " + ins.ops);
-            if (text.find("probe") != std::string::npos)
-                saw_probe = true;
-            if (mnemonic_of(ins) == "cmp" && (text.find("input") != std::string::npos || text.find("output") != std::string::npos || ins.has_imm))
-                saw_length_cmp = true;
-            if (text.find("exallocatepool") != std::string::npos || text.find("pool") != std::string::npos)
-                saw_pool = true;
-        }
-        if (method == "NEITHER" && !saw_probe)
-            issues.push_back(json{{"ioctl_code", sa_format_address(*code)}, {"handler_va", sa_format_address(*handler)}, {"issue_type", "method_neither_without_obvious_probe"}, {"va", sa_format_address(*handler)}, {"description", "METHOD_NEITHER exposes raw user pointers and no ProbeForRead/ProbeForWrite evidence was found in the bounded handler scan."}, {"severity", "critical"}, {"confidence", 0.72}});
-        if (!saw_length_cmp)
-            issues.push_back(json{{"ioctl_code", sa_format_address(*code)}, {"handler_va", sa_format_address(*handler)}, {"issue_type", "missing_obvious_length_validation"}, {"va", sa_format_address(*handler)}, {"description", "No obvious length comparison was found before buffer use in the bounded handler scan."}, {"severity", method == "NEITHER" ? "high" : "medium"}, {"confidence", 0.55}});
-        if (saw_pool && !saw_length_cmp)
-            issues.push_back(json{{"ioctl_code", sa_format_address(*code)}, {"handler_va", sa_format_address(*handler)}, {"issue_type", "allocation_without_obvious_size_guard"}, {"va", sa_format_address(*handler)}, {"description", "Pool allocation evidence exists but no bounded size guard was recognized."}, {"severity", "high"}, {"confidence", 0.5}});
+        json usage = drv_buffer_usage_analysis(0, *handler, method);
+        analyses.push_back(json{{"ioctl_code", sa_format_address(*code)}, {"handler_va", sa_format_address(*handler)}, {"method", method}, {"buffer_usage", usage}});
+        const bool probe_read = usage.value("probe_for_read_observed", false);
+        const bool probe_write = usage.value("probe_for_write_observed", false);
+        const bool length_cmp = usage.value("length_compare_observed", false);
+        const bool output_len = usage.value("output_length_check_observed", false);
+        const bool pointer_before_length = usage.value("pointer_before_length", false);
+        const bool probe_after_pointer = usage.value("probe_after_pointer", false);
+        const bool overflow_guard = usage.value("integer_overflow_guard_observed", false);
+        if (method == "NEITHER" && (!probe_read || !probe_write))
+            issues.push_back(json{{"ioctl_code", sa_format_address(*code)}, {"handler_va", sa_format_address(*handler)}, {"issue_type", "method_neither_without_obvious_probe"}, {"va", sa_format_address(*handler)}, {"description", "METHOD_NEITHER exposes raw user pointers and bounded ordered dataflow did not prove both ProbeForRead and ProbeForWrite before use."}, {"severity", "critical"}, {"confidence", 0.8}, {"ordered_evidence", usage.value("events", json::array())}});
+        if (method == "NEITHER" && probe_after_pointer)
+            issues.push_back(json{{"ioctl_code", sa_format_address(*code)}, {"handler_va", sa_format_address(*handler)}, {"issue_type", "method_neither_probe_after_pointer_use"}, {"va", sa_format_address(*handler)}, {"description", "Probe evidence appears after a raw pointer reference in the bounded instruction order."}, {"severity", "critical"}, {"confidence", 0.76}, {"ordered_evidence", usage.value("events", json::array())}});
+        if (pointer_before_length)
+            issues.push_back(json{{"ioctl_code", sa_format_address(*code)}, {"handler_va", sa_format_address(*handler)}, {"issue_type", "pointer_before_length_validation"}, {"va", sa_format_address(*handler)}, {"description", "A buffer pointer reference appears before any recognized input/output length validation in the bounded scan."}, {"severity", method == "NEITHER" ? "high" : "medium"}, {"confidence", 0.68}, {"ordered_evidence", usage.value("events", json::array())}});
+        if (!length_cmp)
+            issues.push_back(json{{"ioctl_code", sa_format_address(*code)}, {"handler_va", sa_format_address(*handler)}, {"issue_type", "missing_obvious_length_validation"}, {"va", sa_format_address(*handler)}, {"description", "No ordered input/output length comparison was recognized before buffer use in the bounded handler scan."}, {"severity", method == "NEITHER" ? "high" : "medium"}, {"confidence", 0.62}, {"ordered_evidence", usage.value("events", json::array())}});
+        if (usage.value("output_buffer_used", false) && !output_len)
+            issues.push_back(json{{"ioctl_code", sa_format_address(*code)}, {"handler_va", sa_format_address(*handler)}, {"issue_type", "missing_output_length_check"}, {"va", sa_format_address(*handler)}, {"description", "Output buffer use is likely, but no ordered output length check was recognized."}, {"severity", "high"}, {"confidence", 0.64}, {"ordered_evidence", usage.value("events", json::array())}});
+        if ((usage.value("input_length_observed", false) || usage.value("output_length_observed", false)) && !overflow_guard)
+            issues.push_back(json{{"ioctl_code", sa_format_address(*code)}, {"handler_va", sa_format_address(*handler)}, {"issue_type", "integer_overflow_guard_not_proven"}, {"va", sa_format_address(*handler)}, {"description", "Length dataflow was observed, but no carry/overflow guard was recognized in the bounded scan."}, {"severity", "medium"}, {"confidence", 0.5}, {"ordered_evidence", usage.value("events", json::array())}});
     }
-    return tool_result_t::ok(json(issues));
+    return tool_result_t::ok(json{{"issues", issues}, {"issue_count", issues.size()}, {"analyses", analyses}});
 }
 
 struct drv_hook_state_t {
@@ -4072,7 +5991,9 @@ inline json drv_hook_fail_closed_contract(const std::string& reason)
                 {"security_guard_pass", true},
                 {"count", 0},
                 {"reason", reason},
-                {"security_contract", "fail_closed_no_kernel_dispatch_mutation"}};
+                {"security_contract", "fail_closed_no_kernel_dispatch_mutation"},
+                {"supported_actions", json::array({"status", "list", "stop", "remove"})},
+                {"unsupported_actions", json::array({"install", "start"})}};
 }
 
 inline tool_result_t drv_hook_manage(const json& params)
@@ -4200,6 +6121,61 @@ inline json disasm_preview_for_bytes(std::uint64_t va, const std::vector<std::ui
     return arr;
 }
 
+inline std::uint64_t estimate_function_start_near(std::uint32_t pid, std::uint64_t va)
+{
+    if (va == 0)
+        return 0;
+    const std::uint64_t scan_back = std::min<std::uint64_t>(va, 0x200);
+    const std::uint64_t base = va - scan_back;
+    std::vector<std::uint8_t> raw;
+    if (!read_target_memory(pid, base, static_cast<std::size_t>(scan_back + 0x40), raw) || raw.empty())
+        return va;
+    auto insns = disassemble_loaded_bytes_window(base, raw, 256);
+    std::uint64_t candidate = va;
+    for (const auto& ins : insns) {
+        if (ins.addr > va)
+            break;
+        const std::string m = mnemonic_of(ins);
+        const std::string text = lower_ascii(std::string(ins.mnem) + " " + ins.ops);
+        if (ins.is_ret)
+            candidate = ins.addr + static_cast<std::uint64_t>(std::max(ins.len, 1));
+        if ((m == "push" && text.find("rbp") != std::string::npos) ||
+            (m == "sub" && text.find("rsp") != std::string::npos) ||
+            (m == "endbr64"))
+            candidate = ins.addr;
+    }
+    return candidate;
+}
+
+inline json smc_enriched_capture_json(const page_guard_engine::pg_capture_record_t& c, std::uint32_t pid, std::uint64_t watch_va, std::uint64_t watch_size)
+{
+    json out = page_guard_capture_json(c);
+    const auto& m = c.metadata;
+    std::vector<std::uint8_t> rip_bytes;
+    if (m.rip != 0 && read_target_memory(pid, m.rip, 64, rip_bytes))
+        out["rip_disasm_preview"] = disasm_preview_for_bytes(m.rip, rip_bytes, 8);
+    else
+        out["rip_disasm_preview"] = json::array();
+    std::vector<std::uint8_t> fault_bytes;
+    if (m.fault_addr != 0 && read_target_memory(pid, m.fault_addr, 64, fault_bytes))
+        out["fault_bytes_hex"] = bytes_to_hex(fault_bytes, 64);
+    else
+        out["fault_bytes_hex"] = "";
+    const std::uint64_t function_start = estimate_function_start_near(pid, m.rip);
+    out["decryptor_candidate_va"] = function_start ? json(sa_format_address(function_start)) : json(nullptr);
+    out["function_start_va"] = function_start ? json(sa_format_address(function_start)) : json(nullptr);
+    out["fault_region"] = memory_protection_evidence(pid, m.fault_addr);
+    out["rip_region"] = memory_protection_evidence(pid, m.rip);
+    out["inside_watch_range"] = watch_size != 0 && m.fault_addr >= watch_va && (m.fault_addr - watch_va) < watch_size;
+    out["watch_range"] = json{{"base", sa_format_address(watch_va)}, {"size", watch_size}, {"end", sa_format_address(watch_va + watch_size)}};
+    out["write_event"] = m.access_type == 1;
+    out["execute_event"] = m.access_type == 8;
+    out["callstack_available"] = false;
+    out["callstack"] = json::array();
+    out["callstack_unavailable_reason"] = "page_guard_capture_record_does_not_include_rsp_or_stack_snapshot";
+    return out;
+}
+
 inline tool_result_t smc_manage(const json& params)
 {
     auto chk = require_driver();
@@ -4218,7 +6194,9 @@ inline tool_result_t smc_manage(const json& params)
         if (pid == 0)
             return tool_result_t::error("An attached process or process_id is required");
         const std::uint64_t bounded_size = std::min<std::uint64_t>(*size, 1024ull * 1024ull);
-        const bool capture_payloads = p.value("capture_on_write", true) || p.value("capture_on_execute", true);
+        const bool capture_on_write = p.value("capture_on_write", true);
+        const bool capture_on_execute = p.value("capture_on_execute", true);
+        const bool capture_payloads = capture_on_write || capture_on_execute;
         const std::uint32_t max_records = static_cast<std::uint32_t>(
             std::min<std::uint64_t>(parse_param_u64(p, "max_records_per_drain").value_or(64), 4096));
         const std::uint32_t sid = page_guard_engine::g_pg_engine.install(pid, *va, bounded_size, capture_payloads, max_records, true);
@@ -4227,18 +6205,36 @@ inline tool_result_t smc_manage(const json& params)
                 json{{"pid", pid}, {"watch_va", sa_format_address(*va)}, {"watch_size", bounded_size}, {"capture_payloads", capture_payloads}, {"failure", page_guard_install_failure_json()}});
         }
         return tool_result_t::ok("SMC PAGE_GUARD capture session started",
-            json{{"session_id", sid}, {"page_guard_session_id", sid}, {"pid", pid}, {"watch_va", sa_format_address(*va)}, {"watch_size", bounded_size}, {"capture_payloads", capture_payloads}, {"max_records_per_drain", max_records}, {"backend", "whoswho_driver_page_guard"}});
+            json{{"session_id", sid}, {"page_guard_session_id", sid}, {"pid", pid}, {"watch_va", sa_format_address(*va)}, {"watch_size", bounded_size}, {"capture_payloads", capture_payloads}, {"capture_on_write", capture_on_write}, {"capture_on_execute", capture_on_execute}, {"max_records_per_drain", max_records}, {"backend", "whoswho_driver_page_guard"}});
     }
     if (action == "captures") {
         const auto id = parse_param_u64(p, "session_id");
         if (!id || *id == 0 || *id > 0xFFFFFFFFULL)
             return tool_result_t::error("session_id is required for captures");
+        std::uint32_t pid = requested_pid(p);
+        std::uint64_t watch_va = 0;
+        std::uint64_t watch_size = 0;
+        for (const auto& s : page_guard_engine::g_pg_engine.list_sessions()) {
+            if (s.session_id == static_cast<std::uint32_t>(*id)) {
+                pid = s.pid;
+                watch_va = s.target_addr;
+                watch_size = s.region_size;
+                break;
+            }
+        }
         auto records = page_guard_engine::g_pg_engine.get_capture_records(static_cast<std::uint32_t>(*id));
         json captures = json::array();
-        for (const auto& c : records)
-            captures.push_back(page_guard_capture_json(c));
+        std::uint64_t write_count = 0;
+        std::uint64_t execute_count = 0;
+        for (const auto& c : records) {
+            if (c.metadata.access_type == 1)
+                ++write_count;
+            if (c.metadata.access_type == 8)
+                ++execute_count;
+            captures.push_back(smc_enriched_capture_json(c, pid, watch_va, watch_size));
+        }
         return tool_result_t::ok("SMC PAGE_GUARD captures drained",
-            json{{"session_id", *id}, {"capture_count", captures.size()}, {"captures", captures}, {"backend", "whoswho_driver_page_guard"}});
+            json{{"session_id", *id}, {"pid", pid}, {"watch_va", watch_va ? json(sa_format_address(watch_va)) : json(nullptr)}, {"watch_size", watch_size}, {"capture_count", captures.size()}, {"write_event_count", write_count}, {"execute_event_count", execute_count}, {"captures", captures}, {"backend", "whoswho_driver_page_guard"}});
     }
     if (action == "stop") {
         const auto id = parse_param_u64(p, "session_id");
@@ -4254,6 +6250,66 @@ inline tool_result_t smc_manage(const json& params)
         return tool_result_t::ok("SMC PAGE_GUARD sessions listed", json{{"sessions", sessions}, {"count", sessions.size()}, {"backend", "whoswho_driver_page_guard"}});
     }
     return compat_unknown_action("smc_manage", action);
+}
+
+inline bool read_file_bytes_win32(const std::string& path, std::vector<std::uint8_t>& out)
+{
+    out.clear();
+    if (path.empty() || path.rfind("static://", 0) == 0)
+        return false;
+    HANDLE hf = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hf == INVALID_HANDLE_VALUE)
+        return false;
+    LARGE_INTEGER sz{};
+    if (!GetFileSizeEx(hf, &sz) || sz.QuadPart <= 0 || sz.QuadPart > 128ll * 1024ll * 1024ll) {
+        CloseHandle(hf);
+        return false;
+    }
+    out.resize(static_cast<std::size_t>(sz.QuadPart));
+    DWORD got = 0;
+    const BOOL ok = ReadFile(hf, out.data(), static_cast<DWORD>(out.size()), &got, nullptr);
+    CloseHandle(hf);
+    if (!ok || static_cast<std::size_t>(got) != out.size()) {
+        out.clear();
+        return false;
+    }
+    return true;
+}
+
+inline json compare_section_to_disk(const mapped_section_t& sec, const std::vector<std::uint8_t>& mapped, const std::vector<std::uint8_t>& file_bytes)
+{
+    json out;
+    out["available"] = false;
+    if (file_bytes.empty() || sec.raw_pointer == 0 || sec.raw_pointer >= file_bytes.size()) {
+        out["reason"] = file_bytes.empty() ? "module_file_unavailable" : "section_raw_pointer_unavailable";
+        return out;
+    }
+    const std::size_t raw_avail = file_bytes.size() - static_cast<std::size_t>(sec.raw_pointer);
+    const std::size_t cmp_size = std::min<std::size_t>(mapped.size(), std::min<std::size_t>(raw_avail, sec.raw_size ? sec.raw_size : mapped.size()));
+    if (cmp_size == 0) {
+        out["reason"] = "zero_comparable_bytes";
+        return out;
+    }
+    std::uint64_t mismatch_count = 0;
+    json first_mismatches = json::array();
+    for (std::size_t i = 0; i < cmp_size; ++i) {
+        const std::uint8_t disk = file_bytes[static_cast<std::size_t>(sec.raw_pointer) + i];
+        const std::uint8_t mem = mapped[i];
+        if (disk == mem)
+            continue;
+        if (first_mismatches.size() < 16)
+            first_mismatches.push_back(json{{"offset", i}, {"disk", sa_format_address(disk)}, {"memory", sa_format_address(mem)}});
+        ++mismatch_count;
+    }
+    std::vector<std::uint8_t> disk_slice(file_bytes.begin() + static_cast<std::ptrdiff_t>(sec.raw_pointer), file_bytes.begin() + static_cast<std::ptrdiff_t>(sec.raw_pointer + cmp_size));
+    out["available"] = true;
+    out["compared_bytes"] = cmp_size;
+    out["mismatch_count"] = mismatch_count;
+    out["equal"] = mismatch_count == 0;
+    out["mismatch_ratio"] = cmp_size ? static_cast<double>(mismatch_count) / static_cast<double>(cmp_size) : 0.0;
+    out["disk_entropy"] = entropy_of(disk_slice);
+    out["first_mismatches"] = first_mismatches;
+    return out;
 }
 
 inline tool_result_t smc_scan_encrypted_regions(const json& params)
@@ -4277,6 +6333,8 @@ inline tool_result_t smc_scan_encrypted_regions(const json& params)
         pe_layout_t pe;
         if (!read_pe_layout(pid, m.base, pe))
             continue;
+        std::vector<std::uint8_t> file_bytes;
+        const bool file_ok = read_file_bytes_win32(m.path, file_bytes);
         for (auto sec : pe.sections) {
             const std::uint32_t size = sec.virtual_size ? sec.virtual_size : sec.raw_size;
             if (size == 0)
@@ -4286,11 +6344,29 @@ inline tool_result_t smc_scan_encrypted_regions(const json& params)
             if (!read_target_memory(pid, sec.va, read_size, bytes) || bytes.empty())
                 continue;
             sec.entropy = entropy_of(bytes);
+            driver_bridge::memory_region_t region{};
+            const bool region_ok = driver_bridge::query_memory_for(pid, sec.va, region);
+            const bool mem_exec = region_ok ? executable_protect(region.protect) : executable_characteristics(sec.characteristics);
+            const bool mem_write = region_ok && ((region.protect & 0xFFu) == PAGE_EXECUTE_READWRITE || (region.protect & 0xFFu) == PAGE_EXECUTE_WRITECOPY || (region.protect & 0xFFu) == PAGE_READWRITE || (region.protect & 0xFFu) == PAGE_WRITECOPY);
+            json disk_compare = compare_section_to_disk(sec, bytes, file_bytes);
             bool decrypt_candidate = sec.entropy > 7.0 && executable_characteristics(sec.characteristics);
             if (!decrypt_candidate && sec.entropy < 1.0 && executable_characteristics(sec.characteristics))
                 decrypt_candidate = true;
+            if (!decrypt_candidate && disk_compare.value("available", false) && !disk_compare.value("equal", true) && mem_exec)
+                decrypt_candidate = true;
             if (decrypt_candidate || params.value("include_all", false)) {
-                regions.push_back(json{{"va", sa_format_address(sec.va)}, {"size", size}, {"entropy", sec.entropy}, {"section", sec.name}, {"module", m.name}, {"classification", sec.entropy > 7.0 ? "high_entropy_executable" : "low_entropy_or_mutated_executable"}, {"decrypt_candidate", decrypt_candidate}});
+                regions.push_back(json{{"va", sa_format_address(sec.va)},
+                                       {"size", size},
+                                       {"entropy", sec.entropy},
+                                       {"section", sec.name},
+                                       {"module", m.name},
+                                       {"module_path", m.path},
+                                       {"classification", sec.entropy > 7.0 ? "high_entropy_executable" : (disk_compare.value("available", false) && !disk_compare.value("equal", true) ? "mapped_bytes_differ_from_file" : "low_entropy_or_mutated_executable")},
+                                       {"decrypt_candidate", decrypt_candidate},
+                                       {"disk_compare", disk_compare},
+                                       {"file_compare_available", file_ok && disk_compare.value("available", false)},
+                                       {"memory_protection", region_ok ? json{{"base", sa_format_address(region.base)}, {"size", region.size}, {"protect", protection_name(region.protect)}, {"protect_raw", sa_format_address(region.protect)}, {"state", sa_format_address(region.state)}, {"type", sa_format_address(region.type)}, {"executable", mem_exec}, {"writable", mem_write}, {"guard", (region.protect & PAGE_GUARD) != 0}} : json{{"queried", false}}},
+                                       {"rx_transition", json{{"section_executable", executable_characteristics(sec.characteristics)}, {"memory_executable", mem_exec}, {"memory_writable", mem_write}, {"guarded", region_ok ? ((region.protect & PAGE_GUARD) != 0) : false}, {"transition_hint", mem_exec && !executable_characteristics(sec.characteristics) ? "non_exec_section_mapped_executable" : (mem_exec && disk_compare.value("available", false) && !disk_compare.value("equal", true) ? "mapped_executable_bytes_differ_from_file" : "none")}}}});
             }
         }
     }
@@ -4623,6 +6699,37 @@ inline std::string bytes_window_hex(const std::vector<std::uint8_t>& bytes, std:
     return bytes_to_hex(window, window.size());
 }
 
+inline std::uint64_t estimate_function_start_from_instruction_window(const std::vector<AsmInstr>& insns, std::size_t index, std::uint64_t fallback)
+{
+    if (insns.empty() || index >= insns.size())
+        return fallback;
+    std::uint64_t candidate = insns[index].addr;
+    const std::size_t begin = index > 64 ? index - 64 : 0;
+    for (std::size_t i = begin; i <= index; ++i) {
+        const auto& ins = insns[i];
+        const std::string m = mnemonic_of(ins);
+        const std::string text = lower_ascii(std::string(ins.mnem) + " " + ins.ops);
+        if (i < index && ins.is_ret)
+            candidate = ins.addr + static_cast<std::uint64_t>(std::max(ins.len, 1));
+        if ((m == "push" && text.find("rbp") != std::string::npos) ||
+            (m == "sub" && text.find("rsp") != std::string::npos) ||
+            m == "endbr64")
+            candidate = ins.addr;
+    }
+    return candidate ? candidate : fallback;
+}
+
+inline json backtrace_window_json(const std::vector<AsmInstr>& insns, std::size_t index, std::size_t before)
+{
+    json arr = json::array();
+    if (insns.empty() || index >= insns.size())
+        return arr;
+    const std::size_t begin = index > before ? index - before : 0;
+    for (std::size_t i = begin; i <= index; ++i)
+        arr.push_back(instruction_to_json(insns[i]));
+    return arr;
+}
+
 inline tool_result_t smc_find_decryptor(const json& params)
 {
     auto chk = require_driver();
@@ -4736,7 +6843,10 @@ inline tool_result_t smc_find_decryptor(const json& params)
                 continue;
             const std::size_t raw_offset = (ins.addr >= scan_base && ins.addr - scan_base < raw.size()) ? static_cast<std::size_t>(ins.addr - scan_base) : 0;
             const std::string marker_bytes = bytes_window_hex(raw, raw_offset, 16, 24);
-            candidates.push_back(json{{"decryptor_va", sa_format_address(ins.addr)},
+            const std::uint64_t function_start = estimate_function_start_from_instruction_window(insns, ii, ins.addr);
+            json backtrace = backtrace_window_json(insns, ii, 12);
+            candidates.push_back(json{{"decryptor_va", sa_format_address(function_start)},
+                                      {"function_start_va", sa_format_address(function_start)},
                                       {"write_instruction_va", sa_format_address(ins.addr)},
                                       {"memory_reference_va", chosen_ref ? sa_format_address(chosen_ref) : sa_format_address(ins.imm_unsigned)},
                                       {"memory_reference_source", chosen_source.empty() ? "unknown" : chosen_source},
@@ -4744,6 +6854,7 @@ inline tool_result_t smc_find_decryptor(const json& params)
                                       {"key_operand", ops.size() > 1 ? ops.back() : std::string()},
                                       {"estimated_algo", estimate_algo_from_mnemonic(mnem)},
                                       {"evidence", instruction_to_json(ins)},
+                                      {"reference_evidence", json{{"function_start_va", sa_format_address(function_start)}, {"backtrace_window", backtrace}, {"backtrace_instruction_count", backtrace.size()}}},
                                       {"decision", decision},
                                       {"source", source},
                                       {"tracked_register_count", reg_values.size()},
@@ -4833,6 +6944,62 @@ inline bool parse_import_names(std::uint32_t pid, const pe_layout_t& pe, std::ve
     return true;
 }
 
+inline json parse_import_summary(std::uint32_t pid, const pe_layout_t& pe, std::size_t max_functions)
+{
+    json modules = json::array();
+    json functions = json::array();
+    if (pe.import_rva == 0)
+        return json{{"modules", modules}, {"functions", functions}, {"module_count", 0}, {"function_count", 0}, {"directory_present", false}};
+    const std::uint64_t dir = pe.base + pe.import_rva;
+    for (std::uint32_t desc = 0; desc < 256 && functions.size() < max_functions; ++desc) {
+        IMAGE_IMPORT_DESCRIPTOR d{};
+        if (!read_target_value(pid, dir + static_cast<std::uint64_t>(desc) * sizeof(d), d))
+            break;
+        if (d.OriginalFirstThunk == 0 && d.FirstThunk == 0)
+            break;
+        std::string mod_name;
+        std::vector<std::uint8_t> name_bytes;
+        if (d.Name && read_target_memory(pid, pe.base + d.Name, 256, name_bytes)) {
+            for (std::uint8_t b : name_bytes) {
+                if (b == 0)
+                    break;
+                mod_name.push_back(static_cast<char>(b));
+            }
+        }
+        modules.push_back(mod_name.empty() ? "unknown" : mod_name);
+        const std::uint32_t lookup_rva = d.OriginalFirstThunk ? d.OriginalFirstThunk : d.FirstThunk;
+        for (std::uint32_t i = 0; i < 4096 && functions.size() < max_functions; ++i) {
+            std::uint64_t thunk = 0;
+            const std::uint64_t lookup_va = pe.base + lookup_rva + static_cast<std::uint64_t>(i) * (pe.is_64 ? 8 : 4);
+            if (pe.is_64) {
+                if (!read_target_value(pid, lookup_va, thunk) || thunk == 0)
+                    break;
+            } else {
+                std::uint32_t t32 = 0;
+                if (!read_target_value(pid, lookup_va, t32) || t32 == 0)
+                    break;
+                thunk = t32;
+            }
+            const bool ordinal = pe.is_64 ? ((thunk & 0x8000000000000000ULL) != 0) : ((thunk & 0x80000000ULL) != 0);
+            std::string function_name = "ordinal";
+            if (!ordinal) {
+                const std::uint32_t hint_name = static_cast<std::uint32_t>(thunk & 0x7FFFFFFFULL);
+                std::vector<std::uint8_t> fn_bytes;
+                if (read_target_memory(pid, pe.base + hint_name + 2, 256, fn_bytes)) {
+                    function_name.clear();
+                    for (std::uint8_t b : fn_bytes) {
+                        if (b == 0)
+                            break;
+                        function_name.push_back(static_cast<char>(b));
+                    }
+                }
+            }
+            functions.push_back(json{{"module_name", mod_name.empty() ? "unknown" : mod_name}, {"function_name", function_name}, {"ordinal", ordinal}});
+        }
+    }
+    return json{{"modules", modules}, {"functions", functions}, {"module_count", modules.size()}, {"function_count", functions.size()}, {"directory_present", true}, {"truncated", functions.size() >= max_functions}};
+}
+
 inline tool_result_t pack_detect(const json& params)
 {
     auto chk = require_driver();
@@ -4865,10 +7032,25 @@ inline tool_result_t pack_detect(const json& params)
     }
     std::vector<std::string> import_modules;
     parse_import_names(pid, pe, import_modules, 64);
-    bool minimal_iat = import_modules.size() <= 3;
+    json import_summary = parse_import_summary(pid, pe, 256);
+    const std::uint64_t import_function_count = import_summary.value("function_count", 0ull);
+    const bool no_import_directory = !import_summary.value("directory_present", false);
+    bool loader_only_imports = import_function_count > 0 && import_function_count <= 8;
+    if (loader_only_imports) {
+        for (const auto& fn : import_summary.value("functions", json::array())) {
+            const std::string name = lower_ascii(fn.value("function_name", std::string()));
+            if (name == "loadlibrarya" || name == "loadlibraryw" || name == "loadlibraryexa" || name == "loadlibraryexw" ||
+                name == "getprocaddress" || name == "virtualprotect" || name == "virtualalloc" || name == "virtualfree" ||
+                name == "exitprocess" || name == "getmodulehandlea" || name == "getmodulehandlew")
+                continue;
+            loader_only_imports = false;
+            break;
+        }
+    }
+    bool minimal_iat = no_import_directory || import_modules.size() <= 2 || import_function_count <= 8 || loader_only_imports;
     if (hint == "unknown" && (high_entropy_exec > 0 || minimal_iat))
         hint = "custom";
-    double confidence = 0.1 + high_entropy_exec * 0.35 + (minimal_iat ? 0.2 : 0.0);
+    double confidence = 0.1 + high_entropy_exec * 0.35 + (minimal_iat ? 0.2 : 0.0) + (loader_only_imports ? 0.08 : 0.0);
     confidence = std::min(0.95, confidence);
     json out;
     out["likely_packed"] = confidence >= 0.55;
@@ -4878,7 +7060,10 @@ inline tool_result_t pack_detect(const json& params)
     out["module"] = mod->name;
     out["module_base"] = sa_format_address(mod->base);
     out["minimal_iat"] = minimal_iat;
+    out["minimal_iat_reason"] = no_import_directory ? "no_import_directory" : (loader_only_imports ? "loader_api_only_imports" : (import_function_count <= 8 ? "low_import_function_count" : "low_import_module_count"));
     out["import_module_count"] = import_modules.size();
+    out["import_function_count"] = import_function_count;
+    out["import_summary"] = import_summary;
     return tool_result_t::ok("Packer detection completed", out);
 }
 

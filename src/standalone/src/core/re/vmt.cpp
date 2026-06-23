@@ -3,6 +3,7 @@
 #include "artifact_store.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 
 namespace re::vmt
@@ -95,6 +96,131 @@ bool parse_required_slot(const json& params, std::uint64_t& slot)
     if (!parse_u64_value(params["slot"], slot))
         return false;
     return slot <= 4095;
+}
+
+std::string normalize_disasm_match_text(std::string value)
+{
+    value = lower_ascii(std::move(value));
+    std::string out;
+    bool pending_space = false;
+    for (char ch : value)
+    {
+        const unsigned char uch = static_cast<unsigned char>(ch);
+        if (std::isspace(uch))
+        {
+            pending_space = true;
+            continue;
+        }
+        if (ch == ',' || ch == '[' || ch == ']' || ch == '+' || ch == '-' || ch == ':' || ch == '(' || ch == ')')
+        {
+            if (!out.empty() && out.back() == ' ')
+                out.pop_back();
+            out.push_back(ch);
+            pending_space = false;
+            continue;
+        }
+        if (pending_space && !out.empty())
+            out.push_back(' ');
+        out.push_back(ch);
+        pending_space = false;
+    }
+    if (!out.empty() && out.back() == ' ')
+        out.pop_back();
+    return out;
+}
+
+std::vector<std::string> parse_disasm_pattern(const std::string& text)
+{
+    std::vector<std::string> out;
+    std::string current;
+    auto flush = [&]() {
+        std::string normalized = normalize_disasm_match_text(trim_ascii(current));
+        if (!normalized.empty())
+            out.push_back(std::move(normalized));
+        current.clear();
+    };
+    for (char ch : text)
+    {
+        if (ch == ';' || ch == '\n' || ch == '\r')
+            flush();
+        else
+            current.push_back(ch);
+    }
+    flush();
+    return out;
+}
+
+bool glob_match_normalized(const std::string& pattern, const std::string& text)
+{
+    std::size_t p = 0;
+    std::size_t t = 0;
+    std::size_t star = std::string::npos;
+    std::size_t star_text = 0;
+    while (t < text.size())
+    {
+        if (p < pattern.size() && (pattern[p] == '?' || pattern[p] == text[t]))
+        {
+            ++p;
+            ++t;
+            continue;
+        }
+        if (p < pattern.size() && pattern[p] == '*')
+        {
+            star = p++;
+            star_text = t;
+            continue;
+        }
+        if (star != std::string::npos)
+        {
+            p = star + 1;
+            t = ++star_text;
+            continue;
+        }
+        return false;
+    }
+    while (p < pattern.size() && pattern[p] == '*')
+        ++p;
+    return p == pattern.size();
+}
+
+bool disasm_instruction_matches(const std::string& pattern, const AsmInstr& ins, const std::string& normalized_text)
+{
+    const std::string mnemonic = normalize_disasm_match_text(ins.mnem);
+    return (!mnemonic.empty() && glob_match_normalized(pattern, mnemonic)) ||
+        glob_match_normalized(pattern, normalized_text);
+}
+
+bool disasm_pattern_matches(std::uint32_t pid,
+                            std::uint64_t fn,
+                            const std::vector<std::string>& pattern,
+                            json* preview)
+{
+    std::uint64_t cursor = fn;
+    json rows = json::array();
+    for (std::size_t i = 0; i < pattern.size(); ++i)
+    {
+        AsmInstr ins = decode_one(pid, cursor);
+        const std::string text = disasm_text(ins);
+        const std::string normalized = normalize_disasm_match_text(text);
+        const bool matched = disasm_instruction_matches(pattern[i], ins, normalized);
+        json row;
+        row["address"] = sa_format_address(cursor);
+        row["text"] = text;
+        row["mnemonic"] = normalize_disasm_match_text(ins.mnem);
+        row["pattern"] = pattern[i];
+        row["matched"] = matched;
+        rows.push_back(std::move(row));
+        if (ins.len <= 0 || ins.mnem[0] == '\0' || !matched)
+        {
+            if (preview)
+                *preview = std::move(rows);
+            return false;
+        }
+        cursor += static_cast<std::uint64_t>(std::max(ins.len, 1));
+    }
+    if (preview)
+        *preview = std::move(rows);
+    return true;
 }
 
 bool executable_pointer(std::uint32_t pid, std::uint64_t value)
@@ -384,9 +510,24 @@ tool_result_t find_slot_by_signature(const json& params)
     if (!parse_address_param(params, "vtable_va", vtable_va) || vtable_va == 0)
         return tool_result_t::error("'vtable_va' is required.");
     const std::string pattern_text = string_param(params, "pattern");
-    std::vector<parsed_pattern_byte_t> pattern;
+    if (trim_ascii(pattern_text).empty())
+        return tool_result_t::error("'pattern' is required.");
+    const std::string pattern_kind = lower_ascii(trim_ascii(string_param(params, "pattern_kind", "auto")));
+    std::vector<parsed_pattern_byte_t> byte_pattern;
     std::string pattern_error;
-    if (!parse_pattern(pattern_text, pattern, &pattern_error))
+    const bool byte_mode = pattern_kind != "disasm" && parse_pattern(pattern_text, byte_pattern, &pattern_error);
+    std::vector<std::string> disasm_pattern;
+    if (!byte_mode)
+    {
+        if (pattern_kind == "bytes")
+            return tool_result_t::error("Invalid byte pattern: " + pattern_error);
+        disasm_pattern = parse_disasm_pattern(pattern_text);
+        if (disasm_pattern.empty())
+            return tool_result_t::error("Invalid disassembly pattern.");
+    }
+    if (pattern_kind != "auto" && pattern_kind != "bytes" && pattern_kind != "disasm")
+        return tool_result_t::error("'pattern_kind' must be auto, bytes, or disasm.");
+    if (byte_mode && byte_pattern.empty())
         return tool_result_t::error("Invalid pattern: " + pattern_error);
     const std::size_t max_slots = static_cast<std::size_t>(numeric_param(params, "max_slots", 256, 1, 1024));
     for (std::size_t i = 0; i < max_slots; ++i)
@@ -394,21 +535,35 @@ tool_result_t find_slot_by_signature(const json& params)
         std::uint64_t fn = 0;
         if (!read_u64(scope.pid(), vtable_va + i * 8, fn) || fn == 0)
             break;
-        std::vector<std::uint8_t> bytes;
-        if (!read_bytes(scope.pid(), fn, std::max<std::size_t>(pattern.size(), 16), bytes) || bytes.size() < pattern.size())
-            continue;
-        if (pattern_matches(bytes.data(), bytes.size(), pattern))
+        json disasm_match_preview;
+        bool matched = false;
+        if (byte_mode)
+        {
+            std::vector<std::uint8_t> bytes;
+            if (!read_bytes(scope.pid(), fn, std::max<std::size_t>(byte_pattern.size(), 16), bytes) || bytes.size() < byte_pattern.size())
+                continue;
+            matched = pattern_matches(bytes.data(), bytes.size(), byte_pattern);
+        }
+        else
+        {
+            matched = disasm_pattern_matches(scope.pid(), fn, disasm_pattern, &disasm_match_preview);
+        }
+        if (matched)
         {
             json result;
             result["slot"] = i;
             result["address"] = sa_format_address(fn);
+            result["match_mode"] = byte_mode ? "bytes" : "disasm";
             result["hint"] = classify_function_hint(scope.pid(), fn);
+            if (!byte_mode)
+                result["disasm_match"] = std::move(disasm_match_preview);
             return tool_result_t::ok(result);
         }
     }
     json result;
     result["slot"] = nullptr;
     result["address"] = nullptr;
+    result["match_mode"] = byte_mode ? "bytes" : "disasm";
     return tool_result_t::ok("No matching VMT slot found.", result);
 }
 

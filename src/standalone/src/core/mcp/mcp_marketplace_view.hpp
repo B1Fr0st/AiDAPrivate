@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -72,6 +73,9 @@ namespace aida::mcp_marketplace_view {
 		std::string installing_pkg;
 		bool show_install_log = false;
 		float install_log_anim = 0.f;
+		::mcp_marketplace::package_info_t pending_install;
+		bool install_confirm_open = false;
+		bool install_confirm_armed = false;
 
 		double last_search_time = 0.0;
 		std::string last_query_committed;
@@ -156,12 +160,75 @@ namespace aida::mcp_marketplace_view {
 	}
 
 
+	inline void append_meta_piece(std::string& out, const std::string& piece)
+	{
+		if (piece.empty()) return;
+		if (!out.empty()) out += "  ";
+		out += piece;
+	}
+
+
+	inline void draw_clipped_text(ImDrawList* dl, ImFont* font, float fs,
+		ImVec2 pos, ImU32 color, const std::string& text, float right)
+	{
+		if (!dl || !font || text.empty() || right <= pos.x + 2.f) return;
+		ImVec4 clip(pos.x, pos.y - 2.f, right, pos.y + fs + 5.f);
+		dl->AddText(font, fs, pos, color, text.c_str(), nullptr, 0.f, &clip);
+	}
+
+
 	inline bool is_pkg_installed(const std::string& name)
 	{
 		auto installed = ::mcp_marketplace::get_installed();
 		for (const auto& s : installed)
 			if (s.package_name == name) return true;
 		return false;
+	}
+
+
+	inline bool get_installed_server(const std::string& name,
+		::mcp_marketplace::installed_server_t& out)
+	{
+		auto installed = ::mcp_marketplace::get_installed();
+		for (const auto& srv : installed) {
+			if (srv.package_name == name) {
+				out = srv;
+				return true;
+			}
+		}
+		return false;
+	}
+
+
+	inline std::string package_source_label(const ::mcp_marketplace::package_info_t& p)
+	{
+		if (!p.repository.empty()) return p.repository;
+		if (!p.homepage.empty()) return p.homepage;
+		return "No repository metadata from registry";
+	}
+
+
+	inline void request_install_confirmation(const ::mcp_marketplace::package_info_t& p)
+	{
+		auto& s = state();
+		s.pending_install = p;
+		s.install_confirm_open = true;
+		s.install_confirm_armed = true;
+	}
+
+
+	inline void start_confirmed_install(const ::mcp_marketplace::package_info_t& p)
+	{
+		auto& s = state();
+		s.installing_pkg = p.name;
+		s.show_install_log = true;
+		{
+			std::lock_guard<std::mutex> lk(s.mtx);
+			s.install_log.clear();
+			s.install_log.push_back("Installing " + p.name + "...");
+			s.install_log.push_back("Server will remain disabled after install.");
+		}
+		::mcp_marketplace::install_async(p);
 	}
 
 
@@ -211,31 +278,35 @@ namespace aida::mcp_marketplace_view {
 	}
 
 
-	inline void render_install_button(const ::mcp_marketplace::package_info_t& p, float bx, float by)
+	inline void render_install_button(const ::mcp_marketplace::package_info_t& p,
+		float bx, float by, float bw = 104.f)
 	{
 		auto& s = state();
-		bool installed = is_pkg_installed(p.name);
+		::mcp_marketplace::installed_server_t installed_srv;
+		bool installed = get_installed_server(p.name, installed_srv);
 		bool installing = (s.installing_pkg == p.name) &&
 			(::mcp_marketplace::get_install_state() == ::mcp_marketplace::install_state_t::installing);
 
 		ImGui::SetCursorScreenPos(ImVec2(bx, by));
 		if (installed) {
-			aida::ui::button("Configured",
+			const char* label = installed_srv.enabled
+				? (installed_srv.auto_connect ? "Auto" : "Enabled")
+				: "Installed";
+			if (aida::ui::button(label,
 				aida::ui::button_kind_t::secondary,
 				aida::ui::size_t_::sm,
-				ImVec2(90.f, 26.f), true);
+				ImVec2(bw, 26.f))) {
+				s.selected_pkg = p.name;
+				s.detail_view_open = true;
+			}
 		} else {
-			if (aida::ui::button(installing ? "Installing" : "Install",
+			if (aida::ui::button(installing ? "Installing" : "Review",
 					aida::ui::button_kind_t::primary,
 					aida::ui::size_t_::sm,
-					ImVec2(90.f, 26.f),
+					ImVec2(bw, 26.f),
 					false, nullptr, installing)) {
 				if (!installing) {
-					s.installing_pkg = p.name;
-					s.show_install_log = true;
-					s.install_log.clear();
-					s.install_log.push_back("Installing " + p.name + "...");
-					::mcp_marketplace::install_async(p);
+					request_install_confirmation(p);
 				}
 			}
 		}
@@ -274,13 +345,25 @@ namespace aida::mcp_marketplace_view {
 		const float row_pad_x = 14.f;
 		const float row_pad_y = 10.f;
 		const float text_x = ox + row_pad_x + icon_size + 12.f;
-		const float btn_w = 90.f;
-		const float right_margin = btn_w + 24.f;
-		const float desc_wrap = w - (text_x - ox) - right_margin;
+		const float row_right = ox + w;
+		const bool stack_action = w < 410.f;
+		const float btn_w = (std::min)(104.f, (std::max)(64.f, w - row_pad_x * 2.f));
+		const float text_right_raw = stack_action
+			? row_right - row_pad_x
+			: row_right - row_pad_x - btn_w - 10.f;
+		const float text_right = (std::max)(text_x + 8.f, text_right_raw);
+		const float desc_wrap = (std::max)(48.f, text_right - text_x);
 
 		const std::string& display = p.display_name.empty() ? p.name : p.display_name;
 		const float name_h = 16.f;
-		const float author_h = 14.f;
+		const float meta_h = 14.f;
+
+		std::string meta_line;
+		append_meta_piece(meta_line, p.author);
+		append_meta_piece(meta_line, ::mcp_marketplace::registry_label(p.registry));
+		if (p.weekly_downloads > 0)
+			append_meta_piece(meta_line, format_count(p.weekly_downloads) + " installs");
+		const bool has_meta = !meta_line.empty();
 
 		// Compute wrapped description height.
 		float desc_h = 0.f;
@@ -291,8 +374,10 @@ namespace aida::mcp_marketplace_view {
 			desc_h = desc_sz.y;
 		}
 
-		const float row_h = row_pad_y * 2.f + name_h + 4.f + desc_h +
-			(p.author.empty() ? 0.f : author_h + 2.f);
+		const float row_h = row_pad_y * 2.f + name_h +
+			(has_meta ? meta_h + 2.f : 0.f) +
+			(p.description.empty() ? 0.f : desc_h + 4.f) +
+			(stack_action ? 34.f : 0.f);
 		const float min_h = icon_size + row_pad_y * 2.f;
 		const float h = std::max(row_h, min_h);
 
@@ -341,53 +426,46 @@ namespace aida::mcp_marketplace_view {
 		float ty = a.y + row_pad_y;
 
 		// Package name (bold).
-		dl->AddText(aida::ui::fonts::body_strong(), 14.f,
-			ImVec2(text_x, ty), th.text_primary, display.c_str());
+		draw_clipped_text(dl, aida::ui::fonts::body_strong(), 14.f,
+			ImVec2(text_x, ty), th.text_primary, display, text_right);
+		ty += name_h + 2.f;
 
-		// Author + downloads inline after name.
-		{
-			ImFont* name_font = aida::ui::fonts::body_strong();
-			float name_w = name_font->CalcTextSizeA(14.f, FLT_MAX, 0.f, display.c_str()).x;
-			float meta_x = text_x + name_w + 10.f;
-
-			if (!p.author.empty()) {
-				dl->AddText(aida::ui::fonts::caption(), 12.f,
-					ImVec2(meta_x, ty + 2.f),
-					aida::ui::with_alpha(th.text_dim, 0.85f),
-					p.author.c_str());
-				float author_w = aida::ui::fonts::caption()->CalcTextSizeA(
-					12.f, FLT_MAX, 0.f, p.author.c_str()).x;
-				meta_x += author_w + 10.f;
-			}
-
-			if (p.weekly_downloads > 0) {
-				std::string dl_str = format_count(p.weekly_downloads) + " installs";
-				dl->AddText(aida::ui::fonts::caption(), 12.f,
-					ImVec2(meta_x, ty + 2.f),
-					aida::ui::with_alpha(th.text_dim, 0.6f),
-					dl_str.c_str());
-			}
+		if (has_meta) {
+			draw_clipped_text(dl, aida::ui::fonts::caption(), 12.f,
+				ImVec2(text_x, ty),
+				aida::ui::with_alpha(th.text_dim, 0.85f),
+				meta_line, text_right);
+			ty += meta_h;
 		}
-
-		ty += name_h + 4.f;
 
 		// Description (full text, wrapped).
 		if (!p.description.empty()) {
+			ty += 4.f;
+			dl->PushClipRect(ImVec2(text_x, ty - 1.f),
+				ImVec2(text_right, ty + desc_h + 3.f), true);
 			dl->AddText(aida::ui::fonts::body(), 13.f,
 				ImVec2(text_x, ty),
 				aida::ui::with_alpha(th.text_secondary, 0.9f),
 				p.description.c_str(), nullptr, desc_wrap);
+			dl->PopClipRect();
+			ty += desc_h;
 		}
 
 		// --- install button (right-aligned, vertically centered) ---
-		float btn_x = b.x - btn_w - row_pad_x;
-		float btn_y = a.y + (h - 26.f) * 0.5f;
-		render_install_button(p, btn_x, btn_y);
+		float btn_x = stack_action ? text_x : b.x - btn_w - row_pad_x;
+		float btn_y = stack_action ? ty + 8.f : a.y + (h - 26.f) * 0.5f;
+		if (btn_x + btn_w > b.x - row_pad_x)
+			btn_x = b.x - row_pad_x - btn_w;
+		if (btn_x < a.x + row_pad_x)
+			btn_x = a.x + row_pad_x;
+		render_install_button(p, btn_x, btn_y, btn_w);
 
 		// --- click to open detail ---
 		if (clicked) {
 			ImVec2 mp = ImGui::GetIO().MousePos;
-			if (mp.x < btn_x - 4.f) {
+			const bool hit_action = mp.x >= btn_x - 4.f && mp.x <= btn_x + btn_w + 4.f &&
+				mp.y >= btn_y - 4.f && mp.y <= btn_y + 30.f;
+			if (!hit_action) {
 				s.selected_pkg = p.name;
 				s.detail_view_open = true;
 			}
@@ -467,8 +545,45 @@ namespace aida::mcp_marketplace_view {
 				aida::ui::with_alpha(th.success, 0.85f), 4.f);
 		}
 
+		float prov_y = info_y + 36.f;
+		::mcp_marketplace::installed_server_t installed_srv;
+		bool installed = get_installed_server(p.name, installed_srv);
+		::mcp_marketplace::installed_server_t preview_srv =
+			installed ? installed_srv : ::mcp_marketplace::preview_install(p);
+		auto draw_fact = [&](const char* label, const std::string& value, float& y) {
+			dl->AddText(aida::ui::fonts::caption(), 12.f,
+				ImVec2(a.x + pad, y),
+				aida::ui::with_alpha(th.text_dim, 0.95f), label);
+			dl->AddText(aida::ui::fonts::caption(), 12.f,
+				ImVec2(a.x + pad + 92.f, y),
+				aida::ui::with_alpha(th.text_secondary, 0.95f),
+				truncate_text(value, 48).c_str());
+			y += 18.f;
+		};
+
+		dl->AddText(aida::ui::fonts::body_em(), 14.f,
+			ImVec2(a.x + pad, prov_y),
+			aida::ui::with_alpha(th.text_secondary, 1.f), "Provenance");
+		prov_y += 22.f;
+		draw_fact("Registry", ::mcp_marketplace::registry_label(p.registry), prov_y);
+		draw_fact("Source", package_source_label(p), prov_y);
+		draw_fact("Install root", preview_srv.install_path, prov_y);
+		draw_fact("Transport", preview_srv.transport, prov_y);
+		draw_fact("Launch", ::mcp_marketplace::launch_command_preview(preview_srv), prov_y);
+
+		ImU32 risk_col = installed && installed_srv.enabled ? th.warning : th.error;
+		dl->AddText(aida::ui::fonts::caption(), 12.f,
+			ImVec2(a.x + pad, prov_y),
+			aida::ui::with_alpha(risk_col, 0.95f),
+			installed
+				? (installed_srv.enabled
+					? "Installed server is enabled; review exposed tools before use."
+					: "Installed but disabled. Enable and connect from MCP Servers.")
+				: "Unverified third-party code. Install does not enable or connect it.");
+		prov_y += 28.f;
+
 		if (!p.keywords_str.empty()) {
-			float kw_y = info_y + 36.f;
+			float kw_y = prov_y + 4.f;
 			dl->AddText(aida::ui::fonts::body_em(), 14.f,
 				ImVec2(a.x + pad, kw_y),
 				aida::ui::with_alpha(th.text_secondary, 1.f), "Tags");
@@ -535,6 +650,121 @@ namespace aida::mcp_marketplace_view {
 	}
 
 
+	inline void render_install_confirmation_modal()
+	{
+		auto& s = state();
+		if (s.install_confirm_armed) {
+			ImGui::OpenPopup("Review MCP Install##mcp_market_install_confirm");
+			s.install_confirm_armed = false;
+		}
+		if (!s.install_confirm_open)
+			return;
+
+		const auto& th = aida::ui::resolved();
+		bool open = true;
+		const ImGuiViewport* vp = ImGui::GetMainViewport();
+		const ImVec2 work_pos = vp ? vp->WorkPos : ImVec2(0.f, 0.f);
+		const ImVec2 work_size = vp ? vp->WorkSize : ImGui::GetIO().DisplaySize;
+		float modal_w = (std::min)(560.f, (std::max)(280.f, work_size.x - 32.f));
+		float modal_h = (std::min)(520.f, (std::max)(360.f, work_size.y - 48.f));
+		modal_w = (std::min)(modal_w, (std::max)(180.f, work_size.x - 16.f));
+		modal_h = (std::min)(modal_h, (std::max)(260.f, work_size.y - 16.f));
+		ImGui::SetNextWindowSize(ImVec2(modal_w, modal_h), ImGuiCond_Always);
+		ImGui::SetNextWindowPos(ImVec2(work_pos.x + work_size.x * 0.5f,
+			work_pos.y + work_size.y * 0.5f), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+		if (ImGui::BeginPopupModal("Review MCP Install##mcp_market_install_confirm",
+				&open,
+				ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings)) {
+			const auto& p = s.pending_install;
+			::mcp_marketplace::installed_server_t preview =
+				::mcp_marketplace::preview_install(p);
+			const float content_w = (std::max)(120.f, ImGui::GetContentRegionAvail().x);
+			ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + content_w - 4.f);
+			ImGui::PushFont(aida::ui::fonts::h2());
+			ImGui::TextWrapped("%s", p.display_name.empty() ? p.name.c_str() : p.display_name.c_str());
+			ImGui::PopFont();
+			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary),
+				"%s", p.name.c_str());
+			ImGui::Dummy(ImVec2(0.f, 8.f));
+			aida::ui::components::badge(::mcp_marketplace::registry_label(p.registry).c_str(),
+				aida::ui::with_alpha(th.info, 0.9f), 4.f);
+			if (ImGui::GetContentRegionAvail().x > 140.f)
+				ImGui::SameLine(0.f, 8.f);
+			else
+				ImGui::Dummy(ImVec2(0.f, 3.f));
+			aida::ui::components::badge(p.version.empty() ? "latest" : p.version.c_str(),
+				aida::ui::with_alpha(th.text_secondary, 0.9f), 4.f);
+			ImGui::Dummy(ImVec2(0.f, 10.f));
+
+			auto row = [&](const char* label, const std::string& value) {
+				const float avail = (std::max)(96.f, ImGui::GetContentRegionAvail().x);
+				const float label_w = (std::min)(128.f, (std::max)(88.f, avail * 0.32f));
+				const std::string display_value = value.empty() ? "-" : value;
+				ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_dim), "%s", label);
+				if (avail >= 360.f) {
+					ImGui::SameLine(label_w);
+					ImGui::PushTextWrapPos(ImGui::GetCursorPosX() +
+						(std::max)(112.f, avail - label_w - 8.f));
+					ImGui::TextWrapped("%s", display_value.c_str());
+					ImGui::PopTextWrapPos();
+				} else {
+					ImGui::Indent(10.f);
+					ImGui::PushTextWrapPos(ImGui::GetCursorPosX() +
+						(std::max)(96.f, ImGui::GetContentRegionAvail().x - 4.f));
+					ImGui::TextWrapped("%s", display_value.c_str());
+					ImGui::PopTextWrapPos();
+					ImGui::Unindent(10.f);
+				}
+			};
+			row("Install path", preview.install_path);
+			row("Transport", preview.transport);
+			row("Launch command", ::mcp_marketplace::launch_command_preview(preview));
+			row("Source", package_source_label(p));
+			if (p.weekly_downloads > 0)
+				row("Weekly downloads", format_count(p.weekly_downloads));
+
+			ImGui::Dummy(ImVec2(0.f, 8.f));
+			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.warning),
+				"Marketplace packages are unverified third-party code.");
+			ImGui::TextWrapped("%s",
+				"MCP servers may expose tools that mutate files, process memory, browser state, proxy state, sandbox state, or analysis sessions. Install only stages the package. It will remain disabled with auto-connect off until you enable and connect it from MCP Servers.");
+			ImGui::PopTextWrapPos();
+			ImGui::Dummy(ImVec2(0.f, 14.f));
+
+			const bool installing =
+				::mcp_marketplace::get_install_state() == ::mcp_marketplace::install_state_t::installing;
+			const float action_avail = (std::max)(96.f, ImGui::GetContentRegionAvail().x);
+			const float install_w = (std::min)(154.f, (std::max)(118.f, action_avail));
+			if (aida::ui::button(installing ? "Installing" : "Install Disabled",
+					aida::ui::button_kind_t::primary,
+					aida::ui::size_t_::md,
+					ImVec2(install_w, 36.f),
+					false, nullptr, installing)) {
+				if (!installing) {
+					start_confirmed_install(p);
+					s.install_confirm_open = false;
+					ImGui::CloseCurrentPopup();
+				}
+			}
+			if (action_avail >= install_w + 104.f)
+				ImGui::SameLine(0.f, 8.f);
+			else
+				ImGui::Dummy(ImVec2(0.f, 4.f));
+			if (aida::ui::button("Cancel",
+					aida::ui::button_kind_t::secondary,
+					aida::ui::size_t_::md,
+					ImVec2(96.f, 36.f))) {
+				s.install_confirm_open = false;
+				ImGui::CloseCurrentPopup();
+			}
+			ImGui::EndPopup();
+		}
+
+		if (!open)
+			s.install_confirm_open = false;
+	}
+
+
 	inline void render_modal_if_open()
 	{
 		auto& s = state();
@@ -569,11 +799,11 @@ namespace aida::mcp_marketplace_view {
 		auto inst_state_now = ::mcp_marketplace::get_install_state();
 		if (inst_state_now == ::mcp_marketplace::install_state_t::done &&
 			!s.installing_pkg.empty()) {
-			toast_notification::push("Installed: " + s.installing_pkg,
+			toast_notification::push("Installed disabled: " + s.installing_pkg,
 				toast_notification::toast_type_t::info, 3.5f);
 			{
 				std::lock_guard<std::mutex> lk(s.mtx);
-				s.install_log.push_back("Done.");
+				s.install_log.push_back("Done. Enable from MCP Servers.");
 			}
 			s.installing_pkg.clear();
 		} else if (inst_state_now == ::mcp_marketplace::install_state_t::error_state &&
@@ -766,6 +996,8 @@ namespace aida::mcp_marketplace_view {
 				s.detail_anim = aida::motion::spring_step(s.detail_anim, 0.f,
 					s.detail_velocity, aida::motion::spring::balanced, dt);
 			}
+
+			render_install_confirmation_modal();
 		}
 		ImGui::End();
 		ImGui::PopStyleColor();

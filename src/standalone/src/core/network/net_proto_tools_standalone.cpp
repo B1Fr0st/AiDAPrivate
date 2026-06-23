@@ -233,7 +233,7 @@ void register_net_proto_tools(mcp_standalone::server_t& srv)
 
     register_compat(srv, {
         OBFSTR("net_proto_find_sendrecv"), OBFSTR("net_proto"),
-        OBFSTR("Locate probable send/recv handlers by scanning application modules for direct and IAT-indirect calls into Winsock APIs, returning confidence and serializer/deserializer evidence."),
+        OBFSTR("Locate probable send/recv handlers by scanning application modules for direct, thunked, IAT-indirect, and register-loaded Winsock API calls, returning ranked serializer/deserializer evidence."),
         {{OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Target process ID. Defaults to attached process."), false},
          {OBFSTR("max_results"), OBFSTR("number"), OBFSTR("Maximum findings, default 64, max 128."), false},
          {OBFSTR("max_modules"), OBFSTR("number"), OBFSTR("Maximum non-system modules to scan."), false},
@@ -247,19 +247,19 @@ void register_net_proto_tools(mcp_standalone::server_t& srv)
 
     register_compat(srv, {
         OBFSTR("net_proto_trace_serializer"), OBFSTR("net_proto"),
-        OBFSTR("Sample a serializer function through bounded pre-encryption hooks or network-buffer sniffing and infer output fields from captured bytes and variance evidence."),
+        OBFSTR("Sample a serializer function through bounded register-derived hooks or network-buffer sniffing and infer output fields with explicit output-byte provenance."),
         {{OBFSTR("serializer_va"), OBFSTR("string"), OBFSTR("Serializer function VA."), true},
          {OBFSTR("buffer_reg"), OBFSTR("string"), OBFSTR("Buffer pointer register, default rdx."), true},
          {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Target process ID. Defaults to attached process."), false},
          {OBFSTR("size_reg"), OBFSTR("string"), OBFSTR("Size register, default r8."), false},
-         {OBFSTR("tid"), OBFSTR("number"), OBFSTR("Optional thread ID filter for driver sniff fallback."), false},
+         {OBFSTR("tid"), OBFSTR("number"), OBFSTR("Optional thread ID filter for kernel driver buffer sniffing."), false},
          {OBFSTR("sample_ms"), OBFSTR("number"), OBFSTR("Bounded sampling window, default 2000, max 10000."), false},
          {OBFSTR("max_captures"), OBFSTR("number"), OBFSTR("Capture cap, default 16, max 32."), false}},
         handle_trace_serializer, false});
 
     register_compat(srv, {
         OBFSTR("net_udp_session_reassemble"), OBFSTR("net_proto"),
-        OBFSTR("Capture bounded UDP traffic and group datagrams into logical sessions with sequence, length-prefix, and ENet-like evidence for later analysis or guarded mutation."),
+        OBFSTR("Capture bounded UDP traffic and group datagrams into logical sessions with endpoint fields, length-prefix framing, and multi-datagram fragment reassembly evidence for later analysis or guarded mutation."),
         {{OBFSTR("pid"), OBFSTR("number"), OBFSTR("Optional PID filter."), false},
          {OBFSTR("capture_sec"), OBFSTR("number"), OBFSTR("Capture duration in seconds, default 10, max 15."), false},
          {OBFSTR("max_packets"), OBFSTR("number"), OBFSTR("Packet cap, default 256, max 512."), false},
@@ -274,9 +274,11 @@ void register_net_proto_tools(mcp_standalone::server_t& srv)
         {{OBFSTR("session_id"), OBFSTR("string"), OBFSTR("Session ID returned by net_udp_session_reassemble."), true},
          {OBFSTR("target_ip"), OBFSTR("string"), OBFSTR("IPv4 mutation target. Non-loopback requires allow_non_loopback."), true},
          {OBFSTR("target_port"), OBFSTR("number"), OBFSTR("UDP target port."), true},
+         {OBFSTR("source_port"), OBFSTR("number"), OBFSTR("Optional UDP source port. Defaults to the recorded session local port."), false},
          {OBFSTR("mutation_strategy"), OBFSTR("string"), OBFSTR("boundary|random|bitflip, default boundary."), false},
          {OBFSTR("max_mutations"), OBFSTR("number"), OBFSTR("Mutation cap, default 64, max 256."), false},
          {OBFSTR("payload_cap"), OBFSTR("number"), OBFSTR("Payload cap, default 1024, max 4096."), false},
+         {OBFSTR("response_wait_ms"), OBFSTR("number"), OBFSTR("Bounded response capture wait, default 500, max 5000."), false},
          {OBFSTR("allow_unsafe"), OBFSTR("boolean"), OBFSTR("Required true."), false},
          {OBFSTR("confirm_unsafe"), OBFSTR("boolean"), OBFSTR("Required true."), false},
          {OBFSTR("allow_non_loopback"), OBFSTR("boolean"), OBFSTR("Allow non-loopback target."), false}},

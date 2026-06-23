@@ -3,6 +3,7 @@
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
 #include "theme.hpp"
+#include "metrics.hpp"
 #include "motion.hpp"
 #include "transition.hpp"
 #include "clock.hpp"
@@ -37,6 +38,34 @@ namespace aida::ui::components {
 		hover_state_t hover;
 		press_state_t press;
 		flash_t       flash;
+	};
+
+	struct control_frame_t {
+		ImGuiID id = 0;
+		ImVec2 min = ImVec2(0.f, 0.f);
+		ImVec2 max = ImVec2(0.f, 0.f);
+		ImVec2 size = ImVec2(0.f, 0.f);
+		bool hovered = false;
+		bool held = false;
+		bool clicked = false;
+		bool focused = false;
+		float hover = 0.f;
+		float press = 0.f;
+		float flash = 0.f;
+	};
+
+	enum class status_kind_t {
+		success,
+		warning,
+		error,
+		info,
+		neutral,
+		accent
+	};
+
+	struct action_chip_result_t {
+		bool clicked = false;
+		bool removed = false;
 	};
 
 	namespace detail {
@@ -75,11 +104,11 @@ namespace aida::ui::components {
 		}
 		inline ImVec2 sz_pad(size_t_ s) {
 			switch (s) {
-				case size_t_::sm: return ImVec2(13.f, 7.f);
-				case size_t_::md: return ImVec2(17.f, 10.f);
-				case size_t_::lg: return ImVec2(22.f, 14.f);
+				case size_t_::sm: return aida::ui::metrics::pad_sm();
+				case size_t_::md: return aida::ui::metrics::pad_md();
+				case size_t_::lg: return aida::ui::metrics::pad_lg();
 			}
-			return ImVec2(17.f, 10.f);
+			return aida::ui::metrics::pad_md();
 		}
 		inline float sz_font(size_t_ s) {
 			float fs = ui_fs();
@@ -93,11 +122,151 @@ namespace aida::ui::components {
 		inline float sz_height(size_t_ s) {
 			float fs = ui_fs();
 			switch (s) {
-				case size_t_::sm: return (std::max)(30.f, fs + 14.f);
-				case size_t_::md: return (std::max)(36.f, fs + 18.f);
-				case size_t_::lg: return (std::max)(44.f, fs + 24.f);
+				case size_t_::sm: return (std::max)(aida::ui::metrics::control::height_sm, fs + 14.f);
+				case size_t_::md: return (std::max)(aida::ui::metrics::control::height_md, fs + 18.f);
+				case size_t_::lg: return (std::max)(aida::ui::metrics::control::height_lg, fs + 24.f);
 			}
-			return (std::max)(36.f, fs + 18.f);
+			return (std::max)(aida::ui::metrics::control::height_md, fs + 18.f);
+		}
+	}
+
+	inline button_state_t& control_state(ImGuiID id) { return detail::bstate(id); }
+	inline hover_state_t& hover_state(ImGuiID id) { return detail::hstate(id); }
+	inline transition_t& transition_state(ImGuiID id) { return detail::tstate(id); }
+	inline ImVec2 control_padding(size_t_ s) { return detail::sz_pad(s); }
+	inline float control_font_size(size_t_ s) { return detail::sz_font(s); }
+	inline float control_height(size_t_ s) { return detail::sz_height(s); }
+	inline float display_text_width(ImFont* font, float fs, const char* label) {
+		return detail::calc_display_text_width(font, fs, label);
+	}
+
+	inline ImU32 status_color(status_kind_t kind) {
+		const auto& t = aida::ui::resolved();
+		switch (kind) {
+			case status_kind_t::success: return t.success;
+			case status_kind_t::warning: return t.warning;
+			case status_kind_t::error: return t.error;
+			case status_kind_t::info: return t.info;
+			case status_kind_t::accent: return t.accent_u32;
+			case status_kind_t::neutral: return t.text_secondary;
+		}
+		return t.text_secondary;
+	}
+
+	inline control_frame_t control_frame(const char* id, ImVec2 size,
+		bool disabled = false, bool flash_on_click = true) {
+		control_frame_t frame;
+		if (size.x < 1.f) size.x = 1.f;
+		if (size.y < 1.f) size.y = 1.f;
+		frame.size = size;
+		const char* stable_id = (id && *id) ? id : "control";
+		ImGui::PushID(stable_id);
+		frame.id = ImGui::GetID("##frame");
+		frame.min = ImGui::GetCursorScreenPos();
+		frame.max = ImVec2(frame.min.x + size.x, frame.min.y + size.y);
+		ImGui::InvisibleButton("##frame_btn", size);
+		frame.hovered = ImGui::IsItemHovered() && !disabled;
+		frame.held = ImGui::IsItemActive() && !disabled;
+		frame.clicked = ImGui::IsItemClicked() && !disabled;
+		frame.focused = ImGui::IsItemFocused();
+		auto& st = control_state(frame.id);
+		frame.hover = st.hover.tick(frame.hovered, aida::ui::clock::dt());
+		frame.press = st.press.tick(frame.held, aida::ui::clock::dt());
+		frame.flash = st.flash.tick(aida::ui::clock::dt(), 2.5f);
+		if (frame.clicked && flash_on_click) st.flash.trigger();
+		ImGui::PopID();
+		return frame;
+	}
+
+	inline void tooltip_for_last_item(const char* text, float delay = 0.35f) {
+		if (!text || !*text) return;
+		if (!ImGui::IsItemHovered()) return;
+		float hov_time = ImGui::GetCurrentContext()->HoveredIdTimer;
+		if (hov_time < delay) return;
+		const auto& t = aida::ui::resolved();
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.f, 6.f));
+		ImGui::PushStyleColor(ImGuiCol_PopupBg, ImGui::ColorConvertU32ToFloat4(t.bg_overlay));
+		if (ImGui::BeginTooltip()) {
+			ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(t.text_primary));
+			ImGui::TextUnformatted(text);
+			ImGui::PopStyleColor();
+			ImGui::EndTooltip();
+		}
+		ImGui::PopStyleColor();
+		ImGui::PopStyleVar();
+	}
+
+	namespace detail {
+		inline ImU32 control_fill(button_kind_t kind, float hover, bool active, bool disabled) {
+			const auto& t = aida::ui::resolved();
+			float alpha = (disabled ? t.disabled_alpha : 1.f) * ImGui::GetStyle().Alpha;
+			if (active) {
+				return aida::ui::with_alpha(aida::ui::mix(t.panel_header, t.accent_dim, 0.55f + hover * 0.25f), alpha);
+			}
+			switch (kind) {
+				case button_kind_t::primary:
+				case button_kind_t::accent_gradient:
+					return aida::ui::with_alpha(aida::ui::mix(t.accent_dim, t.accent_u32, 0.45f + hover * 0.35f), alpha);
+				case button_kind_t::destructive:
+					return aida::ui::with_alpha(aida::ui::mix(t.panel_header, t.error, 0.24f + hover * 0.18f), alpha);
+				case button_kind_t::ghost:
+					return aida::ui::with_alpha(aida::ui::mix(t.panel_header, t.accent_grad_top, hover * 0.28f), alpha * 0.78f);
+				case button_kind_t::secondary:
+					return aida::ui::with_alpha(aida::ui::mix(t.panel_header, t.accent_grad_top, hover * 0.38f), alpha);
+			}
+			return aida::ui::with_alpha(t.panel_header, alpha);
+		}
+
+		inline ImU32 control_border(button_kind_t kind, float hover, bool active, bool disabled) {
+			const auto& t = aida::ui::resolved();
+			float alpha = (disabled ? t.disabled_alpha : 1.f) * ImGui::GetStyle().Alpha;
+			if (active) return aida::ui::with_alpha(t.accent_u32, alpha * (0.78f + hover * 0.18f));
+			switch (kind) {
+				case button_kind_t::primary:
+				case button_kind_t::accent_gradient:
+					return aida::ui::with_alpha(aida::ui::mix(t.accent_dim, t.accent_hover, hover), alpha);
+				case button_kind_t::destructive:
+					return aida::ui::with_alpha(aida::ui::mix(t.error, t.accent_hover, hover * 0.25f), alpha * 0.80f);
+				case button_kind_t::ghost:
+					return aida::ui::with_alpha(aida::ui::mix(t.border_subtle, t.accent_hover, hover), alpha * 0.85f);
+				case button_kind_t::secondary:
+					return aida::ui::with_alpha(aida::ui::mix(t.border_subtle, t.accent_hover, hover), alpha);
+			}
+			return aida::ui::with_alpha(t.border_subtle, alpha);
+		}
+
+		inline ImU32 control_text(button_kind_t kind, float hover, bool active, bool disabled) {
+			const auto& t = aida::ui::resolved();
+			float alpha = (disabled ? t.disabled_alpha : 1.f) * ImGui::GetStyle().Alpha;
+			if (kind == button_kind_t::destructive) {
+				return aida::ui::with_alpha(aida::ui::mix(t.error, t.text_primary, hover * 0.25f), alpha);
+			}
+			return aida::ui::with_alpha(aida::ui::mix(active ? t.accent_u32 : t.text_secondary, t.text_primary, hover), alpha);
+		}
+
+		inline void draw_control_shell(const control_frame_t& frame, button_kind_t kind,
+			bool active, bool disabled, float radius) {
+			ImDrawList* dl = ImGui::GetWindowDrawList();
+			float scale = 1.f - (1.f - 0.98f) * frame.press;
+			float w = frame.max.x - frame.min.x;
+			float h = frame.max.y - frame.min.y;
+			ImVec2 a = ImVec2(frame.min.x + (1.f - scale) * w * 0.5f,
+				frame.min.y + (1.f - scale) * h * 0.5f);
+			ImVec2 b = ImVec2(frame.max.x - (1.f - scale) * w * 0.5f,
+				frame.max.y - (1.f - scale) * h * 0.5f);
+			dl->AddRectFilled(a, b, control_fill(kind, frame.hover, active, disabled), radius);
+			dl->AddRect(a, b, control_border(kind, frame.hover, active, disabled), radius, 0, active ? 1.4f : 1.f);
+			if (frame.flash > 0.001f) {
+				dl->AddRectFilled(a, b,
+					aida::ui::with_alpha(IM_COL32(255, 255, 255, 255), frame.flash * 0.18f),
+					radius);
+			}
+			if (frame.focused && !disabled) {
+				const auto& t = aida::ui::resolved();
+				dl->AddRect(ImVec2(a.x - 2.f, a.y - 2.f),
+					ImVec2(b.x + 2.f, b.y + 2.f),
+					aida::ui::with_alpha(t.border_focus, 0.82f), radius + 2.f, 0, 1.5f);
+			}
 		}
 	}
 
@@ -139,8 +308,8 @@ namespace aida::ui::components {
 		ImVec2 cb = ImVec2(b.x - (1.f - scale) * w * 0.5f, b.y - (1.f - scale) * h * 0.5f - lift);
 
 		ImDrawList* dl = ImGui::GetWindowDrawList();
-		float radius = 8.f;
-		float alpha = disabled ? t.disabled_alpha : 1.f;
+		float radius = aida::ui::metrics::radius::md;
+		float alpha = (disabled ? t.disabled_alpha : 1.f) * ImGui::GetStyle().Alpha;
 
 		ImU32 fill = t.panel_header;
 		ImU32 border = t.border_subtle;
@@ -154,7 +323,7 @@ namespace aida::ui::components {
 		switch (kind) {
 			case button_kind_t::primary:
 			case button_kind_t::accent_gradient: {
-				radius = 6.f;
+				radius = aida::ui::metrics::radius::sm;
 				ImU32 idle_top = aida::ui::with_alpha(t.accent_dim, 0.55f);
 				ImU32 idle_bot = aida::ui::with_alpha(t.accent_dim, 0.30f);
 				ImU32 hov_top  = aida::ui::with_alpha(t.accent_grad_top, 0.95f);
@@ -239,6 +408,109 @@ namespace aida::ui::components {
 		return clicked;
 	}
 
+	inline bool icon_button(const char* id, const char* glyph,
+		float size_px = aida::ui::metrics::control::icon_button,
+		button_kind_t kind = button_kind_t::ghost,
+		bool disabled = false, const char* tooltip = nullptr) {
+		const char* text = glyph ? glyph : "";
+		float side = size_px > 0.f ? size_px : aida::ui::metrics::control::icon_button;
+		control_frame_t frame = control_frame(id, ImVec2(side, side), disabled);
+		detail::draw_control_shell(frame, kind, false, disabled, aida::ui::metrics::radius::sm);
+		ImFont* font = ImGui::GetFont();
+		float fs = (std::min)(aida::ui::metrics::control::icon_glyph, side - 8.f);
+		if (fs < 8.f) fs = 8.f;
+		ImVec2 ts = font->CalcTextSizeA(fs, FLT_MAX, 0.f, text);
+		ImDrawList* dl = ImGui::GetWindowDrawList();
+		dl->AddText(font, fs,
+			ImVec2(frame.min.x + (side - ts.x) * 0.5f, frame.min.y + (side - fs) * 0.5f),
+			detail::control_text(kind, frame.hover, false, disabled), text);
+		tooltip_for_last_item(tooltip);
+		return frame.clicked;
+	}
+
+	inline bool toolbar_button(const char* id, const char* label_or_icon,
+		bool active = false, bool disabled = false, const char* tooltip = nullptr,
+		float width = 0.f) {
+		const char* text = label_or_icon ? label_or_icon : "";
+		ImFont* font = ImGui::GetFont();
+		float fs = detail::sz_font(size_t_::sm);
+		float h = (std::max)(aida::ui::metrics::control::toolbar_h, fs + 12.f);
+		float text_w = detail::calc_display_text_width(font, fs, text);
+		float w = width > 0.f ? width : (std::max)(aida::ui::metrics::control::icon_button, text_w + 18.f);
+		control_frame_t frame = control_frame(id, ImVec2(w, h), disabled);
+		button_kind_t kind = active ? button_kind_t::secondary : button_kind_t::ghost;
+		detail::draw_control_shell(frame, kind, active, disabled, aida::ui::metrics::radius::sm);
+		ImDrawList* dl = ImGui::GetWindowDrawList();
+		ImU32 col = detail::control_text(kind, frame.hover, active, disabled);
+		ImVec2 text_pos = ImVec2(frame.min.x + (w - text_w) * 0.5f, frame.min.y + (h - fs) * 0.5f);
+		dl->PushClipRect(ImVec2(frame.min.x + 4.f, frame.min.y), ImVec2(frame.max.x - 4.f, frame.max.y), true);
+		detail::add_display_text(dl, font, fs, text_pos, col, text);
+		dl->PopClipRect();
+		tooltip_for_last_item(tooltip);
+		return frame.clicked;
+	}
+
+	inline bool copy_button(const char* id, flash_t* copied_flash_state = nullptr,
+		const char* tooltip = "Copy", bool disabled = false) {
+		const char* glyph = "\xEE\xA4\xAC";
+		float side = aida::ui::metrics::control::icon_button;
+		control_frame_t frame = control_frame(id, ImVec2(side, side), disabled, copied_flash_state == nullptr);
+		if (frame.clicked && copied_flash_state) copied_flash_state->trigger();
+		float copied_v = copied_flash_state ? copied_flash_state->tick(aida::ui::clock::dt(), 2.5f) : frame.flash;
+		if (frame.clicked && copied_flash_state) copied_v = 1.f;
+		detail::draw_control_shell(frame, button_kind_t::ghost, false, disabled, aida::ui::metrics::radius::sm);
+		ImDrawList* dl = ImGui::GetWindowDrawList();
+		ImFont* font = ImGui::GetFont();
+		float fs = aida::ui::metrics::control::icon_glyph;
+		ImVec2 ts = font->CalcTextSizeA(fs, FLT_MAX, 0.f, glyph);
+		ImU32 col = detail::control_text(button_kind_t::ghost, frame.hover, false, disabled);
+		dl->AddText(font, fs,
+			ImVec2(frame.min.x + (side - ts.x) * 0.5f, frame.min.y + (side - fs) * 0.5f),
+			col, glyph);
+		if (copied_v > 0.001f) {
+			const auto& t = aida::ui::resolved();
+			aida::ui::brand::render_check_drawn(dl,
+				ImVec2(frame.min.x + side * 0.5f, frame.min.y + side * 0.5f),
+				10.f, 1.f - copied_v,
+				aida::ui::with_alpha(t.success, disabled ? t.disabled_alpha : 1.f), 1.8f);
+		}
+		tooltip_for_last_item(tooltip);
+		return frame.clicked;
+	}
+
+	inline action_chip_result_t action_chip(const char* id, const char* label,
+		button_kind_t kind = button_kind_t::secondary, bool selected = false,
+		bool removable = false, bool disabled = false, const char* tooltip = nullptr) {
+		action_chip_result_t result;
+		const char* text = label ? label : "";
+		ImFont* font = ImGui::GetFont();
+		float fs = detail::sz_font(size_t_::sm);
+		float pad_x = 10.f;
+		float remove_w = removable ? 16.f : 0.f;
+		float text_w = detail::calc_display_text_width(font, fs, text);
+		float h = (std::max)(26.f, fs + 11.f);
+		float w = text_w + remove_w + pad_x * 2.f;
+		control_frame_t frame = control_frame(id, ImVec2(w, h), disabled);
+		ImDrawList* dl = ImGui::GetWindowDrawList();
+		float radius = h * 0.5f;
+		detail::draw_control_shell(frame, kind, selected, disabled, radius);
+		ImU32 col = detail::control_text(kind, frame.hover, selected, disabled);
+		detail::add_display_text(dl, font, fs,
+			ImVec2(frame.min.x + pad_x, frame.min.y + (h - fs) * 0.5f), col, text);
+		if (removable) {
+			float xx = frame.max.x - 9.f;
+			float xy = frame.min.y + h * 0.5f;
+			float xs = 4.f;
+			dl->AddLine(ImVec2(xx - xs, xy - xs), ImVec2(xx + xs, xy + xs), col, 1.5f);
+			dl->AddLine(ImVec2(xx - xs, xy + xs), ImVec2(xx + xs, xy - xs), col, 1.5f);
+			ImVec2 mp = ImGui::GetMousePos();
+			result.removed = frame.clicked && mp.x >= frame.max.x - 20.f && !disabled;
+		}
+		result.clicked = frame.clicked && !result.removed;
+		tooltip_for_last_item(tooltip);
+		return result;
+	}
+
 	inline void pill(const char* label, ImU32 color, size_t_ size = size_t_::sm,
 	                  bool leading_dot = true) {
 		ImFont* font = ImGui::GetFont();
@@ -296,7 +568,12 @@ namespace aida::ui::components {
 		pill(label, col, size, leading_dot);
 	}
 
-	inline void badge(const char* label, ImU32 color, float radius = 4.f) {
+	inline void status_badge(const char* label, status_kind_t kind,
+		bool compact = true, bool leading_dot = true) {
+		pill(label, status_color(kind), compact ? size_t_::sm : size_t_::md, leading_dot);
+	}
+
+	inline void badge(const char* label, ImU32 color, float radius = aida::ui::metrics::radius::xs) {
 		ImFont* font = ImGui::GetFont();
 		float fs = detail::sz_font(size_t_::sm) * 0.86f;
 		float pad_x = 8.f;
@@ -687,20 +964,7 @@ namespace aida::ui::components {
 	}
 
 	inline void tooltip_blur(const char* text, float delay = 0.5f) {
-		if (!ImGui::IsItemHovered()) return;
-		float hov_time = ImGui::GetCurrentContext()->HoveredIdTimer;
-		if (hov_time < delay) return;
-		const auto& t = aida::ui::resolved();
-		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.f, 6.f));
-		ImGui::PushStyleColor(ImGuiCol_PopupBg, ImGui::ColorConvertU32ToFloat4(t.bg_overlay));
-		if (ImGui::BeginTooltip()) {
-			ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(t.text_primary));
-			ImGui::TextUnformatted(text);
-			ImGui::PopStyleColor();
-			ImGui::EndTooltip();
-		}
-		ImGui::PopStyleColor();
-		ImGui::PopStyleVar();
+		tooltip_for_last_item(text, delay);
 	}
 
 	inline void kbd_chip(const char* label) {
@@ -793,8 +1057,13 @@ namespace aida::ui::components {
 
 namespace aida::ui {
 	using components::button;
+	using components::icon_button;
+	using components::toolbar_button;
+	using components::copy_button;
+	using components::action_chip;
 	using components::pill;
 	using components::pill_kind;
+	using components::status_badge;
 	using components::badge;
 	using components::chip;
 	using components::input_text;
@@ -809,8 +1078,21 @@ namespace aida::ui {
 	using components::render_progress_bar;
 	using components::render_progress_ring;
 	using components::tooltip_blur;
+	using components::tooltip_for_last_item;
 	using components::kbd_chip;
+	using components::control_state;
+	using components::hover_state;
+	using components::transition_state;
+	using components::control_frame;
+	using components::control_padding;
+	using components::control_font_size;
+	using components::control_height;
+	using components::display_text_width;
+	using components::status_color;
 	using components::button_kind_t;
 	using components::pill_kind_t;
+	using components::status_kind_t;
 	using components::size_t_;
+	using components::control_frame_t;
+	using components::action_chip_result_t;
 }

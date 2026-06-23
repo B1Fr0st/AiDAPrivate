@@ -68,6 +68,8 @@ json offset_to_json(const offset_record_t& record)
     out["aob_pattern"] = record.aob_pattern;
     out["rtti_path"] = record.rtti_path;
     out["xref_context"] = record.xref_context;
+    if (!record.fingerprint.is_null() && !record.fingerprint.empty())
+        out["fingerprint"] = record.fingerprint;
     out["status"] = record.status;
     out["last_found_va"] = sa_format_address(record.last_found_va);
     out["created_ms"] = record.created_ms;
@@ -89,6 +91,8 @@ offset_record_t offset_from_json(const json& value)
     record.aob_pattern = value.value("aob_pattern", std::string());
     record.rtti_path = value.value("rtti_path", std::string());
     record.xref_context = value.value("xref_context", std::string());
+    if (value.contains("fingerprint") && value["fingerprint"].is_object())
+        record.fingerprint = value["fingerprint"];
     record.status = value.value("status", std::string());
     if (value.contains("last_found_va")) parse_u64_value(value["last_found_va"], record.last_found_va);
     record.created_ms = value.value("created_ms", 0ull);
