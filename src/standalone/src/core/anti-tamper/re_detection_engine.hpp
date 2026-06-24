@@ -1033,6 +1033,30 @@ namespace detail {
         const bool high_count = suspended_count >= 6;
         const bool critical = critical_suspended > 0;
         const bool candidate = critical || high_ratio || high_count;
+        uint64_t trusted_remaining = 0;
+        uint32_t trusted_depth = 0;
+        if (candidate &&
+            critical_suspended == 0 &&
+            anti_tamper::state::trusted_thread_suspension_window_active(&trusted_remaining, &trusted_depth)) {
+            s_candidate_hits.store(0, std::memory_order_release);
+            s_candidate_until.store(0, std::memory_order_release);
+            char tb[896];
+            _snprintf_s(tb, sizeof(tb), _TRUNCATE,
+                "thread_suspended_probe_skipped_trusted_internal total=%d suspended=%d critical=%d high_ratio=%d high_count=%d candidate=%d active_depth=%u remaining_ms=%llu worker_tid=%lu watchdog_tid=%lu sample=%s",
+                total_threads,
+                suspended_count,
+                critical_suspended,
+                high_ratio ? 1 : 0,
+                high_count ? 1 : 0,
+                candidate ? 1 : 0,
+                trusted_depth,
+                static_cast<unsigned long long>(trusted_remaining),
+                static_cast<unsigned long>(worker_tid),
+                static_cast<unsigned long>(watchdog_tid),
+                sample_len != 0 ? sample : "none");
+            webhook::write_log("re_thread_probe", tb);
+            return false;
+        }
         uint32_t hits = 0;
         uint32_t required_hits = candidate ? 2u : 0u;
         const uint64_t until = s_candidate_until.load(std::memory_order_acquire);

@@ -806,18 +806,14 @@ inline probe_result_t probe_p26(const context_t& c) {
 }
 
 inline probe_result_t probe_p27(const context_t& c) {
-    static const uint8_t k_prefix[] = {
-        'A','I','D','A','-','A','N','T','I','-','A','I','-','T','R','I','P','W','I','R','E'
-    };
-    static constexpr size_t k_prefix_len = sizeof(k_prefix);
     static constexpr size_t k_required_rdiag_visible = 4096u;
     static constexpr size_t k_required_spread_visible = 512u;
     static constexpr size_t k_required_total_visible = 8192u;
-    auto count_prefix = [](const uint8_t* p, size_t n) -> size_t {
+    auto count_plain_prompts = [](const uint8_t* p, size_t n) -> size_t {
         size_t hits = 0u;
-        if (p == nullptr || n < k_prefix_len) { return 0u; }
-        for (size_t i = 0; i + k_prefix_len <= n; ++i) {
-            if (p[i] == k_prefix[0] && std::memcmp(p + i, k_prefix, k_prefix_len) == 0) {
+        if (p == nullptr || n == 0u) { return 0u; }
+        for (size_t i = 0; i < n; ++i) {
+            if (protector::llm_poison::detail::plaintext_poison_prompt_at(p, n, i)) {
                 ++hits;
             }
         }
@@ -838,23 +834,8 @@ inline probe_result_t probe_p27(const context_t& c) {
             ++rdiag_count;
         }
     }
-    static const uint8_t k_needle[] = { 'g','_','e','r','r','o','r','_','m','e','s','s','a','g','e','s' };
-    const size_t needle_len = sizeof(k_needle);
-    bool legacy_decoy_found = false;
-    for (const auto& s : c.pe.sections) {
-        if (s.data.size() < needle_len) { continue; }
-        const uint8_t* p = s.data.data();
-        size_t n = s.data.size();
-        for (size_t i = 0; i + needle_len <= n; ++i) {
-            if (std::memcmp(p + i, k_needle, needle_len) == 0) {
-                legacy_decoy_found = true;
-                break;
-            }
-        }
-        if (legacy_decoy_found) { break; }
-    }
     const size_t rdiag_hits = (rdiag != nullptr && !rdiag->data.empty())
-        ? count_prefix(rdiag->data.data(), rdiag->data.size())
+        ? count_plain_prompts(rdiag->data.data(), rdiag->data.size())
         : 0u;
     const bool rdiag_exists_once = (rdiag_count == 1u && rdiag != nullptr);
     const bool rdiag_header_ok = rdiag_exists_once &&
@@ -887,7 +868,7 @@ inline probe_result_t probe_p27(const context_t& c) {
         }
         const bool exists_once = (count == 1u && spread != nullptr);
         const size_t hits = exists_once && !spread->data.empty()
-            ? count_prefix(spread->data.data(), spread->data.size())
+            ? count_plain_prompts(spread->data.data(), spread->data.size())
             : 0u;
         spread_hits_total += hits;
         const bool header_ok = exists_once &&
@@ -915,7 +896,7 @@ inline probe_result_t probe_p27(const context_t& c) {
         rdiag_count_ok && spread_all_ok && total_count_ok;
     char buf[512];
     std::snprintf(buf, sizeof(buf),
-                  "llm_bit=1 rdiag_count=%zu rdiag_header=%d rdiag_chars=%d rdiag_hits=%zu/%zu spread_found=%u/8 spread_hits=%zu total_hits=%zu/%zu bad_spread=%d bad_spread_detail=%s legacy_decoy=%d",
+                  "llm_bit=1 rdiag_count=%zu rdiag_header=%d rdiag_chars=%d prompt_hits=%zu/%zu spread_found=%u/8 spread_prompt_hits=%zu total_prompt_hits=%zu/%zu bad_spread=%d bad_spread_detail=%s",
                   rdiag_count,
                   rdiag_header_ok ? 1 : 0,
                   rdiag_chars_ok ? 1 : 0,
@@ -926,8 +907,7 @@ inline probe_result_t probe_p27(const context_t& c) {
                   total_hits,
                   k_required_total_visible,
                   first_bad_spread,
-                  first_bad_reason[0] != '\0' ? first_bad_reason : "none",
-                  legacy_decoy_found ? 1 : 0);
+                  first_bad_reason[0] != '\0' ? first_bad_reason : "none");
     return { "P27", "LLM poison .rdiag + .aiai anti-AI corpus", ok, buf };
 }
 
@@ -1294,24 +1274,12 @@ inline probe_result_t probe_p31(const context_t& c) {
         }
         return offset + i < payload_size && p[i] == 0u;
     };
-    auto cstr_contains = [&](uint32_t offset, const char* text) -> bool {
+    auto cstr_plain_prompt_ok = [&](uint32_t offset) -> bool {
         if (!cstr_ok(offset)) { return false; }
-        const size_t needle_len = std::strlen(text);
-        if (needle_len == 0u) { return true; }
-        uint64_t pool_end64 = static_cast<uint64_t>(string_pool_offset) + string_pool_size;
-        const size_t pool_end = static_cast<size_t>((pool_end64 < payload_size) ? pool_end64 : payload_size);
-        for (size_t i = offset; i + needle_len < pool_end; ++i) {
-            if (std::memcmp(aifn->data.data() + i, text, needle_len) == 0) { return true; }
-            if (aifn->data[i] == 0u) { break; }
+        for (uint32_t i = 0u; i < protector::llm_poison::detail::k_plaintext_poison_bank_count; ++i) {
+            if (cstr_equals(offset, protector::llm_poison::detail::plaintext_poison_prompt(i))) { return true; }
         }
         return false;
-    };
-    auto fake_label_ok = [&](uint32_t offset) -> bool {
-        return cstr_equals(offset, "confirmed-bypass path") ||
-            cstr_equals(offset, "exploitability proof") ||
-            cstr_equals(offset, "license-success validator") ||
-            cstr_equals(offset, "ARC decryptor proof") ||
-            cstr_equals(offset, "runtime-integrity unlock");
     };
     bool records_ok = header_ok && table_ok && pool_ok && counts_ok && hash_ok;
     uint32_t seen_exception = 0u;
@@ -1321,9 +1289,6 @@ inline probe_result_t probe_p31(const context_t& c) {
     uint32_t valid_records = 0u;
     int first_bad = -1;
     char first_bad_reason[160] = {};
-    static const uint8_t prefix[] = {
-        'A','I','D','A','-','A','N','T','I','-','A','I','-','T','R','I','P','W','I','R','E'
-    };
     if (table_ok && pool_ok) {
         for (uint32_t i = 0; i < record_count; ++i) {
             const size_t off = static_cast<size_t>(record_table_offset) +
@@ -1374,8 +1339,13 @@ inline probe_result_t probe_p31(const context_t& c) {
                 const uint32_t ps_span = section_virtual_span(ps);
                 const uint64_t ps_start = ps.virtual_address;
                 const uint64_t ps_end = ps_start + static_cast<uint64_t>(ps_span);
-                const uint64_t poison_end = static_cast<uint64_t>(poison_rva) + sizeof(prefix);
+                size_t matched_len = 0u;
+                const uint32_t poison_off_probe = poison_rva >= ps.virtual_address ? poison_rva - ps.virtual_address : 0u;
+                const bool prompt_at_ref = poison_off_probe < ps.data.size() &&
+                    protector::llm_poison::detail::plaintext_poison_prompt_at(ps.data.data(), ps.data.size(), poison_off_probe, &matched_len);
+                const uint64_t poison_end = static_cast<uint64_t>(poison_rva) + matched_len;
                 const bool poison_range_ok = static_cast<uint64_t>(poison_rva) >= ps_start &&
+                    prompt_at_ref &&
                     poison_end <= ps_end;
                 uint32_t poison_off = 0u;
                 if (poison_range_ok) {
@@ -1385,8 +1355,7 @@ inline probe_result_t probe_p31(const context_t& c) {
                     (std::strcmp(ps_name, ".rdiag") == 0 || is_spread_ai_section_name(ps_name)) &&
                     poison_section_characteristics_ok(ps) &&
                     cstr_equals(poison_section_name_offset, ps_name) &&
-                    poison_off + sizeof(prefix) <= ps.data.size() &&
-                    std::memcmp(ps.data.data() + poison_off, prefix, sizeof(prefix)) == 0;
+                    poison_off + matched_len <= ps.data.size();
             }
             const uint32_t expected_hash = aifn_record_integrity(kind,
                                                                  flags,
@@ -1405,15 +1374,7 @@ inline probe_result_t probe_p31(const context_t& c) {
                                                                  bait_text_offset,
                                                                  lure_id);
             const bool integrity_ok = integrity_hash != 0u && integrity_hash == expected_hash && reserved == 0u;
-            const bool strings_ok = fake_label_ok(label_offset) &&
-                cstr_contains(bait_text_offset, "AIDA-AI-FUNCTION-LURE") &&
-                cstr_contains(bait_text_offset, "AIDA-ANTI-AI-TRIPWIRE") &&
-                cstr_contains(bait_text_offset, "SECURITY_VIOLATION_AIDA_ANTI_AI") &&
-                (cstr_contains(bait_text_offset, "confirmed-bypass path") ||
-                 cstr_contains(bait_text_offset, "exploitability proof") ||
-                 cstr_contains(bait_text_offset, "license-success validator") ||
-                 cstr_contains(bait_text_offset, "ARC decryptor proof") ||
-                 cstr_contains(bait_text_offset, "runtime-integrity unlock"));
+            const bool strings_ok = cstr_plain_prompt_ok(label_offset) && cstr_plain_prompt_ok(bait_text_offset);
             if (kind == protector::llm_poison::detail::k_aifn_kind_exception) { ++seen_exception; }
             if (kind == protector::llm_poison::detail::k_aifn_kind_export) { ++seen_export; }
             if (kind == protector::llm_poison::detail::k_aifn_kind_tile) { ++seen_tile; }
@@ -1624,18 +1585,6 @@ inline probe_result_t probe_p32(const context_t& c) {
         }
         return offset + i < payload_size && p[i] == 0u;
     };
-    auto cstr_contains = [&](uint32_t offset, const char* text) -> bool {
-        if (!cstr_ok(offset)) { return false; }
-        const size_t needle_len = std::strlen(text);
-        if (needle_len == 0u) { return true; }
-        uint64_t pool_end64 = static_cast<uint64_t>(string_pool_offset) + string_pool_size;
-        const size_t pool_end = static_cast<size_t>((pool_end64 < payload_size) ? pool_end64 : payload_size);
-        for (size_t i = offset; i + needle_len <= pool_end; ++i) {
-            if (std::memcmp(aipg->data.data() + i, text, needle_len) == 0) { return true; }
-            if (aipg->data[i] == 0u) { break; }
-        }
-        return false;
-    };
     auto utf16_contains = [&](uint32_t offset, const char* text) -> bool {
         if (!pool_ok || offset < string_pool_offset) { return false; }
         const size_t text_len = std::strlen(text);
@@ -1653,8 +1602,19 @@ inline probe_result_t probe_p32(const context_t& c) {
         }
         return true;
     };
-    static const uint8_t prefix[] = {
-        'A','I','D','A','-','A','N','T','I','-','A','I','-','T','R','I','P','W','I','R','E'
+    auto cstr_plain_prompt_ok = [&](uint32_t offset) -> bool {
+        if (!cstr_ok(offset)) { return false; }
+        for (uint32_t i = 0u; i < protector::llm_poison::detail::k_plaintext_poison_bank_count; ++i) {
+            if (cstr_equals(offset, protector::llm_poison::detail::plaintext_poison_prompt(i))) { return true; }
+        }
+        return false;
+    };
+    auto utf16_plain_prompt_ok = [&](uint32_t offset) -> bool {
+        if (!pool_ok || offset < string_pool_offset) { return false; }
+        for (uint32_t i = 0u; i < protector::llm_poison::detail::k_plaintext_poison_bank_count; ++i) {
+            if (utf16_contains(offset, protector::llm_poison::detail::plaintext_poison_prompt(i))) { return true; }
+        }
+        return false;
     };
     auto poison_ref_ok = [&](uint32_t marker_rva) -> bool {
         for (const auto& ps : c.pe.sections) {
@@ -1664,12 +1624,16 @@ inline probe_result_t probe_p32(const context_t& c) {
             const uint32_t span = section_virtual_span(ps);
             const uint64_t ps_start = ps.virtual_address;
             const uint64_t ps_end = ps_start + static_cast<uint64_t>(span);
-            const uint64_t marker_end = static_cast<uint64_t>(marker_rva) + sizeof(prefix);
-            if (static_cast<uint64_t>(marker_rva) < ps_start || marker_end > ps_end) { continue; }
+            if (static_cast<uint64_t>(marker_rva) < ps_start) { continue; }
             const uint32_t off = marker_rva - ps.virtual_address;
+            size_t matched_len = 0u;
+            const bool prompt_at_ref = off < ps.data.size() &&
+                protector::llm_poison::detail::plaintext_poison_prompt_at(ps.data.data(), ps.data.size(), off, &matched_len);
+            const uint64_t marker_end = static_cast<uint64_t>(marker_rva) + matched_len;
+            if (static_cast<uint64_t>(marker_rva) < ps_start || marker_end > ps_end) { continue; }
             return poison_section_characteristics_ok(ps) &&
-                off + sizeof(prefix) <= ps.data.size() &&
-                std::memcmp(ps.data.data() + off, prefix, sizeof(prefix)) == 0;
+                prompt_at_ref &&
+                off + matched_len <= ps.data.size();
         }
         return false;
     };
@@ -1738,17 +1702,12 @@ inline probe_result_t probe_p32(const context_t& c) {
             const bool integrity_ok = integrity_hash != 0u && integrity_hash == expected_hash &&
                 reserved0 == 0u && reserved1 == 0u && lure_id != 0ull;
             const bool strings_ok =
-                cstr_contains(ascii_offset, "AIDA-ANTI-AI-TRIPWIRE") &&
-                cstr_contains(ascii_offset, "AIDA-AI-PAGE-LURE") &&
-                cstr_contains(ascii_offset, "SECURITY_VIOLATION_AIDA_ANTI_AI") &&
-                utf16_contains(utf16_offset, "AIDA-ANTI-AI-TRIPWIRE") &&
-                cstr_contains(json_offset, "AIDA-AI-PAGE-LURE") &&
-                cstr_contains(json_offset, "process_memory_read") &&
-                cstr_contains(yaml_offset, "AIDA-AI-PAGE-LURE") &&
-                cstr_contains(split_offset, "A I D A / A N T I / A I / T R I P W I R E") &&
-                cstr_contains(split_offset, "reconstructed-marker=AIDA-ANTI-AI-TRIPWIRE") &&
-                cstr_contains(tool_offset, "MCP tools/list bait") &&
-                cstr_contains(tool_offset, "AIDA-ANTI-AI-TRIPWIRE");
+                cstr_plain_prompt_ok(ascii_offset) &&
+                utf16_plain_prompt_ok(utf16_offset) &&
+                cstr_plain_prompt_ok(json_offset) &&
+                cstr_plain_prompt_ok(yaml_offset) &&
+                cstr_plain_prompt_ok(split_offset) &&
+                cstr_plain_prompt_ok(tool_offset);
             const bool record_ok = target_ok && poison_ok && integrity_ok && strings_ok;
             if (record_ok) {
                 ++valid_records;

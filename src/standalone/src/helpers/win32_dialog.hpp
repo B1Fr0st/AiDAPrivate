@@ -571,19 +571,6 @@ inline bool show_folder_dialog_wide(HWND owner,
 	return true;
 }
 
-inline std::wstring ps_quote(const std::wstring& value)
-{
-	std::wstring out = L"'";
-	for (wchar_t ch : value) {
-		if (ch == L'\'')
-			out += L"''";
-		else
-			out.push_back(ch);
-	}
-	out += L"'";
-	return out;
-}
-
 inline std::wstring cmd_quote(const std::wstring& value)
 {
 	std::wstring out = L"\"";
@@ -657,23 +644,6 @@ inline std::wstring temp_dialog_path(const wchar_t* suffix)
 		std::to_wstring(GetCurrentThreadId()) + L"_" + std::to_wstring(GetTickCount64()) + suffix;
 }
 
-inline bool write_utf16_script(const std::wstring& path, const std::wstring& script)
-{
-	HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-		FILE_ATTRIBUTE_TEMPORARY | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED, nullptr);
-	if (h == INVALID_HANDLE_VALUE)
-		return false;
-	const wchar_t bom = 0xFEFF;
-	DWORD written = 0;
-	BOOL ok = WriteFile(h, &bom, sizeof(bom), &written, nullptr);
-	if (ok && !script.empty()) {
-		ok = WriteFile(h, script.data(), static_cast<DWORD>(script.size() * sizeof(wchar_t)),
-			&written, nullptr);
-	}
-	CloseHandle(h);
-	return ok == TRUE;
-}
-
 inline bool read_utf8_file(const std::wstring& path, std::string& out)
 {
 	out.clear();
@@ -694,101 +664,6 @@ inline bool read_utf8_file(const std::wstring& path, std::string& out)
 		return false;
 	out.resize(read);
 	return true;
-}
-
-inline bool run_dialog_script(const std::wstring& script,
-	std::string& selected_path,
-	const char* caller_name,
-	const char* action)
-{
-	selected_path.clear();
-	std::wstring script_path = temp_dialog_path(L".ps1");
-	std::wstring output_path = temp_dialog_path(L".txt");
-	std::wstring full_script = std::wstring(L"$ErrorActionPreference = 'Stop'\r\n") +
-		L"$out = " + ps_quote(output_path) + L"\r\n" + script;
-
-	if (!write_utf16_script(script_path, full_script)) {
-		diag::log_tagged_fmt("dialog",
-			"%s %s broker write_script failed gle=%lu",
-			caller_name ? caller_name : "win32_dialog",
-			action ? action : "open_broker",
-			static_cast<unsigned long>(GetLastError()));
-		DeleteFileW(script_path.c_str());
-		DeleteFileW(output_path.c_str());
-		return false;
-	}
-
-	std::wstring exe = L"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
-	std::wstring cmd = cmd_quote(exe) +
-		L" -NoLogo -NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File " +
-		cmd_quote(script_path);
-	std::vector<wchar_t> cmdline(cmd.begin(), cmd.end());
-	cmdline.push_back(L'\0');
-
-	STARTUPINFOW si = {};
-	si.cb = sizeof(si);
-	si.dwFlags = STARTF_USESHOWWINDOW;
-	si.wShowWindow = SW_HIDE;
-	PROCESS_INFORMATION pi = {};
-	ULONGLONG t0 = GetTickCount64();
-	BOOL created = CreateProcessW(nullptr, cmdline.data(), nullptr, nullptr, FALSE,
-		CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
-	if (!created) {
-		diag::log_tagged_fmt("dialog",
-			"%s %s broker CreateProcess failed gle=%lu",
-			caller_name ? caller_name : "win32_dialog",
-			action ? action : "open_broker",
-			static_cast<unsigned long>(GetLastError()));
-		DeleteFileW(script_path.c_str());
-		DeleteFileW(output_path.c_str());
-		return false;
-	}
-
-	DWORD wait_rc = WaitForSingleObject(pi.hProcess, kBrokerTimeoutMs);
-	if (wait_rc == WAIT_TIMEOUT) {
-		TerminateProcess(pi.hProcess, 124);
-		WaitForSingleObject(pi.hProcess, 5000);
-		CloseHandle(pi.hThread);
-		CloseHandle(pi.hProcess);
-		DeleteFileW(script_path.c_str());
-		DeleteFileW(output_path.c_str());
-		diag::log_tagged_fmt("dialog",
-			"%s %s broker timeout elapsed_ms=%llu",
-			caller_name ? caller_name : "win32_dialog",
-			action ? action : "open_broker",
-			static_cast<unsigned long long>(GetTickCount64() - t0));
-		return false;
-	}
-	DWORD exit_code = 1;
-	GetExitCodeProcess(pi.hProcess, &exit_code);
-	CloseHandle(pi.hThread);
-	CloseHandle(pi.hProcess);
-	ULONGLONG elapsed = GetTickCount64() - t0;
-
-	bool got_path = exit_code == 0 && read_utf8_file(output_path, selected_path);
-	DeleteFileW(script_path.c_str());
-	DeleteFileW(output_path.c_str());
-	if (!got_path) {
-		diag::log_tagged_fmt("dialog",
-			"%s %s broker end ok=0 exit=%lu elapsed_ms=%llu",
-			caller_name ? caller_name : "win32_dialog",
-			action ? action : "open_broker",
-			static_cast<unsigned long>(exit_code),
-			static_cast<unsigned long long>(elapsed));
-		return false;
-	}
-
-	while (!selected_path.empty() &&
-		(selected_path.back() == '\0' || selected_path.back() == '\r' || selected_path.back() == '\n')) {
-		selected_path.pop_back();
-	}
-	diag::log_tagged_fmt("dialog",
-		"%s %s broker end ok=1 elapsed_ms=%llu path='%.260s'",
-		caller_name ? caller_name : "win32_dialog",
-		action ? action : "open_broker",
-		static_cast<unsigned long long>(elapsed),
-		selected_path.c_str());
-	return !selected_path.empty();
 }
 
 inline bool show_open_file_dialog_broker(const wchar_t* title,
@@ -871,27 +746,24 @@ inline bool show_open_file_dialog_broker(const wchar_t* title,
 				static_cast<unsigned long>(GetLastError()));
 			DeleteFileW(output_path.c_str());
 		}
+		else {
+			const std::string broker_preview = utf8_from_utf16(broker_path.c_str());
+			diag::log_tagged_fmt("dialog",
+				"%s %s native_broker missing path='%.260s'",
+				caller_name ? caller_name : "win32_dialog",
+				action ? action : "open_broker",
+				broker_preview.c_str());
+		}
 	}
-
-	std::wstring script =
-		L"Add-Type -AssemblyName System.Windows.Forms\r\n"
-		L"[System.Windows.Forms.Application]::EnableVisualStyles()\r\n"
-		L"$dlg = New-Object System.Windows.Forms.OpenFileDialog\r\n"
-		L"$dlg.Title = " + ps_quote(title && title[0] ? std::wstring(title) : L"Open File") + L"\r\n"
-		L"$dlg.Filter = " + ps_quote(filter.empty() ? std::wstring(L"All files (*.*)|*.*") : filter) + L"\r\n"
-		L"$dlg.CheckFileExists = $true\r\n"
-		L"$dlg.CheckPathExists = $true\r\n"
-		L"$dlg.Multiselect = $false\r\n"
-		L"$dlg.RestoreDirectory = $true\r\n";
-	if (initial_dir && initial_dir[0])
-		script += L"$dlg.InitialDirectory = " + ps_quote(initial_dir) + L"\r\n";
-	script +=
-		L"if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {\r\n"
-		L"  [System.IO.File]::WriteAllText($out, $dlg.FileName, [System.Text.UTF8Encoding]::new($false))\r\n"
-		L"  exit 0\r\n"
-		L"}\r\n"
-		L"exit 1\r\n";
-	return run_dialog_script(script, selected_path, caller_name, action);
+	else {
+		diag::log_tagged_fmt("dialog",
+			"%s %s native_broker module_path failed len=%lu gle=%lu",
+			caller_name ? caller_name : "win32_dialog",
+			action ? action : "open_broker",
+			static_cast<unsigned long>(module_len),
+			static_cast<unsigned long>(GetLastError()));
+	}
+	return false;
 }
 
 inline bool show_open_folder_dialog_broker(const wchar_t* title,
@@ -972,23 +844,24 @@ inline bool show_open_folder_dialog_broker(const wchar_t* title,
 				static_cast<unsigned long>(GetLastError()));
 			DeleteFileW(output_path.c_str());
 		}
+		else {
+			const std::string broker_preview = utf8_from_utf16(broker_path.c_str());
+			diag::log_tagged_fmt("dialog",
+				"%s %s native_broker missing path='%.260s'",
+				caller_name ? caller_name : "win32_dialog",
+				action ? action : "folder_broker",
+				broker_preview.c_str());
+		}
 	}
-
-	std::wstring script =
-		L"Add-Type -AssemblyName System.Windows.Forms\r\n"
-		L"[System.Windows.Forms.Application]::EnableVisualStyles()\r\n"
-		L"$dlg = New-Object System.Windows.Forms.FolderBrowserDialog\r\n"
-		L"$dlg.Description = " + ps_quote(title && title[0] ? std::wstring(title) : L"Open Folder") + L"\r\n"
-		L"$dlg.ShowNewFolderButton = $true\r\n";
-	if (initial_dir && initial_dir[0])
-		script += L"$dlg.SelectedPath = " + ps_quote(initial_dir) + L"\r\n";
-	script +=
-		L"if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {\r\n"
-		L"  [System.IO.File]::WriteAllText($out, $dlg.SelectedPath, [System.Text.UTF8Encoding]::new($false))\r\n"
-		L"  exit 0\r\n"
-		L"}\r\n"
-		L"exit 1\r\n";
-	return run_dialog_script(script, selected_path, caller_name, action);
+	else {
+		diag::log_tagged_fmt("dialog",
+			"%s %s native_broker module_path failed len=%lu gle=%lu",
+			caller_name ? caller_name : "win32_dialog",
+			action ? action : "folder_broker",
+			static_cast<unsigned long>(module_len),
+			static_cast<unsigned long>(GetLastError()));
+	}
+	return false;
 }
 
 }

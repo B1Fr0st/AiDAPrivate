@@ -60,6 +60,8 @@ struct runtime_t
     std::atomic<bool> monitors_running{false};
     std::atomic<bool> full_test_running{false};
     std::atomic<uint64_t> full_test_suppression_until_ms{0};
+    std::atomic<uint32_t> trusted_thread_suspension_depth{0};
+    std::atomic<uint64_t> trusted_thread_suspension_until_ms{0};
 
     code_snapshot_t code_snap{};
     std::vector<block_hash_t> block_chain;
@@ -147,6 +149,69 @@ inline bool full_test_suppression_active(uint64_t* remaining_ms = nullptr)
         *remaining_ms = until - now;
     return true;
 }
+
+inline void arm_trusted_thread_suspension_window(uint64_t duration_ms)
+{
+    if (duration_ms == 0)
+        return;
+    const uint64_t now = monotonic_ms();
+    const uint64_t max_u64 = ~uint64_t{0};
+    const uint64_t until = duration_ms > max_u64 - now ? max_u64 : now + duration_ms;
+    auto& slot = get().trusted_thread_suspension_until_ms;
+    uint64_t cur = slot.load(std::memory_order_acquire);
+    while (cur < until &&
+           !slot.compare_exchange_weak(cur, until, std::memory_order_acq_rel, std::memory_order_acquire)) {
+    }
+}
+
+inline bool trusted_thread_suspension_window_active(uint64_t* remaining_ms = nullptr, uint32_t* depth_out = nullptr)
+{
+    auto& rt = get();
+    const uint64_t until = rt.trusted_thread_suspension_until_ms.load(std::memory_order_acquire);
+    const uint64_t now = monotonic_ms();
+    const uint32_t depth = rt.trusted_thread_suspension_depth.load(std::memory_order_acquire);
+    if (depth_out)
+        *depth_out = depth;
+    if (until == 0 || now >= until) {
+        if (remaining_ms)
+            *remaining_ms = 0;
+        return false;
+    }
+    if (remaining_ms)
+        *remaining_ms = until - now;
+    return true;
+}
+
+class trusted_thread_suspension_scope_t
+{
+public:
+    explicit trusted_thread_suspension_scope_t(uint64_t duration_ms) noexcept
+    {
+        if (duration_ms == 0)
+            return;
+        get().trusted_thread_suspension_depth.fetch_add(1, std::memory_order_acq_rel);
+        arm_trusted_thread_suspension_window(duration_ms);
+        armed_ = true;
+    }
+
+    trusted_thread_suspension_scope_t(const trusted_thread_suspension_scope_t&) = delete;
+    trusted_thread_suspension_scope_t& operator=(const trusted_thread_suspension_scope_t&) = delete;
+
+    ~trusted_thread_suspension_scope_t() noexcept
+    {
+        if (!armed_)
+            return;
+        auto& depth = get().trusted_thread_suspension_depth;
+        uint32_t cur = depth.load(std::memory_order_acquire);
+        while (cur != 0 &&
+               !depth.compare_exchange_weak(cur, cur - 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        }
+        arm_trusted_thread_suspension_window(2500);
+    }
+
+private:
+    bool armed_ = false;
+};
 
 namespace detail_master_key {
 

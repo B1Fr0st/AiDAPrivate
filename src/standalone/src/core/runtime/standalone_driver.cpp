@@ -6432,7 +6432,7 @@ namespace driver_bridge
         }
         const uint64_t dtb_entry = device ? device->get_dtb() : 0;
         const bridge_region_snapshot_t region_before = capture_bridge_region_snapshot(address);
-        DWORD local_old = 0;
+        uint32_t local_old = 0;
         bool ok = protect_memory(address, size, new_protect, old_protect ? old_protect : &local_old);
         const bridge_region_snapshot_t region_after = capture_bridge_region_snapshot(address);
         diag::log_tagged_fmt("driver_bridge",

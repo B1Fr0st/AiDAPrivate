@@ -11,6 +11,7 @@
 #include "standalone_driver.hpp"
 #include "standalone_license.hpp"
 #include "../anti-tamper/mcp_posture.hpp"
+#include "../anti-tamper/state.hpp"
 #include "arc/arc.h"
 #include "zydis_disasm.hpp"
 #include "sandbox.hpp"
@@ -2939,6 +2940,7 @@ static tool_result_t invoke_tool_handler_guarded(
     const std::function<tool_result_t(const json&)>& handler,
     tool_invocation_metrics_t* metrics,
     const char* lane,
+    bool trusted_thread_suspension_window,
     active_session_owner_guard_t* owner_guard = nullptr)
 {
     const std::uint64_t start = mcp_now_ms();
@@ -2946,7 +2948,26 @@ static tool_result_t invoke_tool_handler_guarded(
     bool completed = false;
     if (owner_guard)
         owner_guard->set_phase("handler_enter");
+    const std::uint64_t now = mcp_now_ms();
+    const std::uint64_t deadline = current_call_deadline_ms();
+    std::uint64_t trusted_window_ms = 0;
+    if (trusted_thread_suspension_window) {
+        trusted_window_ms = kMcpDefaultToolTimeoutMs;
+        if (deadline != 0 && deadline > now)
+            trusted_window_ms = deadline - now;
+        trusted_window_ms = std::min<std::uint64_t>(trusted_window_ms + 5000, kMcpMaxToolTimeoutMs + 10000);
+        if (trusted_window_ms < 5000)
+            trusted_window_ms = 5000;
+        diag::log_tagged_fmt("mcp_srv",
+            "tool_thread_suspension_guard_begin tool='%s' lane=%s diag_id=%s duration_ms=%llu deadline_ms=%llu",
+            tool_name.c_str(),
+            lane ? lane : "",
+            current_call_diag_id(),
+            static_cast<unsigned long long>(trusted_window_ms),
+            static_cast<unsigned long long>(deadline));
+    }
     std::function<void()> guarded = [&]() {
+        anti_tamper::state::trusted_thread_suspension_scope_t trusted_scope(trusted_window_ms);
         result = invoke_tool_handler_unlocked(tool_name, arguments, handler, metrics);
         completed = true;
     };
@@ -3011,6 +3032,8 @@ static tool_result_t invoke_tool_with_concurrency_policy(
     const json& target_arguments = target_resolution_args_for_tool(tool, arguments, target_arguments_storage, true);
     const bool explicit_target = tool_args_select_session_target(target_arguments);
     const std::string domain = infer_tool_domain(tool.name);
+    const bool driver_bridge_tool = is_driver_bridge_dependent_tool(tool);
+    const bool trusted_thread_suspension_tool = driver_bridge_tool || (!session_manager && !session_independent);
 
     if (session_independent && tool.read_only && !session_manager) {
         set_tool_metrics_lane(metrics, "independent_unlocked", 0);
@@ -3018,7 +3041,7 @@ static tool_result_t invoke_tool_with_concurrency_policy(
             "tool_policy_lane tool='%s' lane=independent_unlocked read_only=1 explicit_target=%d lock_wait_ms=0",
             tool.name.c_str(),
             explicit_target ? 1 : 0);
-        return invoke_tool_handler_guarded(tool.name, arguments, handler, metrics, "independent_unlocked");
+        return invoke_tool_handler_guarded(tool.name, arguments, handler, metrics, "independent_unlocked", trusted_thread_suspension_tool);
     }
 
     if (session_independent && !tool.read_only && !session_manager) {
@@ -3033,7 +3056,7 @@ static tool_result_t invoke_tool_with_concurrency_policy(
             lane.c_str(),
             explicit_target ? 1 : 0,
             static_cast<unsigned long long>(wait_ms));
-        return invoke_tool_handler_guarded(tool.name, arguments, handler, metrics, lane.c_str());
+        return invoke_tool_handler_guarded(tool.name, arguments, handler, metrics, lane.c_str(), trusted_thread_suspension_tool);
     }
 
     if (session_manager || !tool.read_only) {
@@ -3065,9 +3088,9 @@ static tool_result_t invoke_tool_with_concurrency_policy(
             }
             if (metrics)
                 metrics->resolved_target = true;
-            return invoke_tool_handler_guarded(tool.name, arguments, handler, metrics, lane, &owner_guard);
+            return invoke_tool_handler_guarded(tool.name, arguments, handler, metrics, lane, trusted_thread_suspension_tool, &owner_guard);
         }
-        return invoke_tool_handler_guarded(tool.name, arguments, handler, metrics, lane, &owner_guard);
+        return invoke_tool_handler_guarded(tool.name, arguments, handler, metrics, lane, trusted_thread_suspension_tool, &owner_guard);
     }
 
     if (!explicit_target) {
@@ -3093,7 +3116,7 @@ static tool_result_t invoke_tool_with_concurrency_policy(
         }
         if (metrics)
             metrics->resolved_target = true;
-        return invoke_tool_handler_guarded(tool.name, arguments, handler, metrics, "shared_active", &owner_guard);
+        return invoke_tool_handler_guarded(tool.name, arguments, handler, metrics, "shared_active", trusted_thread_suspension_tool, &owner_guard);
     }
 
     target_probe_t probe;
@@ -3154,6 +3177,7 @@ static tool_result_t invoke_tool_with_concurrency_policy(
                 handler,
                 metrics,
                 "shared_explicit_no_switch",
+                trusted_thread_suspension_tool,
                 &owner_guard);
         }
     }
@@ -3183,7 +3207,7 @@ static tool_result_t invoke_tool_with_concurrency_policy(
     }
     if (metrics)
         metrics->resolved_target = true;
-    return invoke_tool_handler_guarded(tool.name, arguments, handler, metrics, "exclusive_target_switch", &owner_guard);
+    return invoke_tool_handler_guarded(tool.name, arguments, handler, metrics, "exclusive_target_switch", trusted_thread_suspension_tool, &owner_guard);
 }
 
 bool server_t::register_tool(tool_def_t tool)

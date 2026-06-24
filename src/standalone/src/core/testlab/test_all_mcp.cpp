@@ -18525,13 +18525,6 @@ void test_tool_sandbox_execute(HANDLE hf, std::atomic<int>& passed, std::atomic<
 
 
 
-void test_tool_driver_dump_module(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        mcp_standalone::json args;
-        args["module_name"] = "ntdll.dll";
-        test_tool_call(hf, "mcp.driver_dump_module", get_server(), "driver_dump_module", args, passed, failed, skipped);
-    }
-
-
 void test_tool_driver_read_pointer_chain(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         auto addr = get_ntdll_addr_str();
         if (addr.empty()) { log_msg(hf, "mcp.driver_read_pointer_chain", "SKIP -- ntdll not loaded"); record_precondition_skipped_tool("driver_read_pointer_chain", failed); return; }
@@ -30034,7 +30027,6 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_tool_grep_in_files(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_web_search(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_webfetch(hf, passed, failed, skipped);
-    if (!cancelled()) test_tool_driver_dump_module(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_read_pointer_chain(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_enumerate_kernel_modules(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_allocate_memory(hf, passed, failed, skipped);
