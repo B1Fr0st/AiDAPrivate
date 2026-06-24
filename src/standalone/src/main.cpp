@@ -5906,6 +5906,35 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         return finish(accepted ? "hotkey_full_test_accepted" : "hotkey_full_test_rejected", 0);
     }
 
+    if (msg == WM_CLOSE ||
+        (msg == WM_SYSCOMMAND && ((wParam & 0xfff0) == SC_CLOSE))) {
+        const bool sys_close = (msg == WM_SYSCOMMAND);
+        aida_shutdown_diag::mark(sys_close ? "wndproc_syscommand_close_destroy" : "wndproc_wm_close_destroy");
+        ::SetLastError(0);
+        BOOL destroyed = ::DestroyWindow(hWnd);
+        DWORD gle = ::GetLastError();
+        diag::log_tagged_critical_fmt("wndproc",
+            "close_destroy source=%s hwnd=0x%llX destroyed=%d gle=%lu tid=%lu",
+            sys_close ? "WM_SYSCOMMAND_SC_CLOSE" : "WM_CLOSE",
+            (unsigned long long)reinterpret_cast<UINT_PTR>(hWnd),
+            destroyed ? 1 : 0,
+            static_cast<unsigned long>(gle),
+            GetCurrentThreadId());
+        if (!destroyed)
+            ::PostQuitMessage(0);
+        return finish(sys_close ? "syscommand_close_destroy" : "close_destroy", 0);
+    }
+
+    if (msg == WM_DESTROY) {
+        aida_shutdown_diag::mark("wndproc_destroy_post_quit");
+        diag::log_tagged_critical_fmt("wndproc",
+            "destroy_post_quit hwnd=0x%llX tid=%lu",
+            (unsigned long long)reinterpret_cast<UINT_PTR>(hWnd),
+            GetCurrentThreadId());
+        ::PostQuitMessage(0);
+        return finish("destroy", 0);
+    }
+
     if (trace_input_msg) {
         POINT cursor{};
         GetCursorPos(&cursor);
@@ -6112,13 +6141,6 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         }
         return finish("dropfiles", 0);
     }
-    case WM_DESTROY:
-        diag::log_tagged_critical_fmt("wndproc",
-            "destroy_post_quit hwnd=0x%llX tid=%lu",
-            (unsigned long long)reinterpret_cast<UINT_PTR>(hWnd),
-            GetCurrentThreadId());
-        ::PostQuitMessage(0);
-        return finish("destroy", 0);
     }
     aida_tracer::set_wndproc_state("defwindowproc_enter", hWnd, msg, wParam, lParam);
     LRESULT def_result = ::DefWindowProcW(hWnd, msg, wParam, lParam);

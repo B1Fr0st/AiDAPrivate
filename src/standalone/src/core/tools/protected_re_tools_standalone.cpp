@@ -25,6 +25,7 @@ void register_protected_re_tools(mcp_standalone::server_t& srv)
          {"handler_count", "number", "Optional handler table count", false},
          {"opcode_map", "object", "Optional vm_build_opcode_map output", false},
          {"tid", "number", "Thread id to snapshot", false},
+         {"timeout_us", "number", "Snapshot emulation timeout in microseconds", false},
          {"process_id", "number", "Optional target process id", false}},
         protected_re::vm_trace_bytecode, true});
 
@@ -184,6 +185,7 @@ void register_protected_re_tools(mcp_standalone::server_t& srv)
         {{"driver_name", "string", "Optional kernel driver name or path filter", false},
          {"module_base", "string", "Optional kernel module base", false},
          {"max_modules", "number", "Maximum modules scanned when no filter is supplied", false},
+         {"timeout_ms", "number", "Bounded device-name scan deadline", false},
          {"process_id", "number", "Reserved for compatibility", false}},
         protected_re::drv_find_device_names, true});
 
@@ -227,6 +229,7 @@ void register_protected_re_tools(mcp_standalone::server_t& srv)
          {"watch_size", "number", "Region size for start", false},
          {"capture_on_write", "boolean", "Capture write events", false},
          {"capture_on_execute", "boolean", "Capture execute events", false},
+         {"max_records_per_drain", "number", "Maximum PAGE_GUARD records retained per drain", false},
          {"confirm_unsafe", "boolean", "Required for start", false},
          {"allow_unsafe", "boolean", "Alternative unsafe confirmation", false},
          {"process_id", "number", "Optional target process id", false}},
@@ -249,6 +252,10 @@ void register_protected_re_tools(mcp_standalone::server_t& srv)
          {"watch_size", "number", "Optional direct watch range size", false},
          {"marker_va", "string", "Optional marker address inside direct range", false},
          {"marker_size", "number", "Optional marker byte length", false},
+         {"marker_bytes_hex", "string", "Optional marker bytes to prove inside direct range", false},
+         {"marker_hex", "string", "Optional marker bytes alias", false},
+         {"marker", "string", "Optional ASCII marker to prove inside direct range", false},
+         {"timeout_ms", "number", "Bounded broad scan deadline", false},
          {"include_all", "boolean", "Return all scanned sections", false}},
         protected_re::smc_scan_encrypted_regions, true});
 
@@ -269,6 +276,10 @@ void register_protected_re_tools(mcp_standalone::server_t& srv)
          {"watch_size", "number", "Optional direct watch range size", false},
          {"marker_va", "string", "Optional marker address inside direct range", false},
          {"marker_size", "number", "Optional marker byte length", false},
+         {"marker_bytes_hex", "string", "Optional marker bytes to prove inside direct range", false},
+         {"marker_hex", "string", "Optional marker bytes alias", false},
+         {"marker", "string", "Optional ASCII marker to prove inside direct range", false},
+         {"timeout_ms", "number", "Bounded broad scan deadline", false},
          {"include_all", "boolean", "Return all scanned sections", false}},
         protected_re::smc_detect_selfmod, true});
 
@@ -315,6 +326,7 @@ void register_protected_re_tools(mcp_standalone::server_t& srv)
          {"strategy", "string", "esp_trick, page_guard, tail_jump, or all", false},
          {"timeout_ms", "number", "Observation timeout", false},
          {"tid", "number", "Optional watched thread", false},
+         {"page_guard_section_limit", "number", "Maximum packed candidate sections guarded during page_guard strategy", false},
          {"confirm_unsafe", "boolean", "Required to observe target execution", false},
          {"allow_unsafe", "boolean", "Alternative unsafe confirmation", false}},
         protected_re::pack_find_oep, false});

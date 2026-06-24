@@ -1002,6 +1002,17 @@ std::size_t voyager::device_t::transfer_physical_read(
     SPOOF_FUNC;
 
     if (!buffer || size == 0 || !is_connected() || dtb == 0) {
+        diag::log_tagged_fmt("comm",
+            "phys_transfer_read_reject pid=%u attached_pid=%u tid=%lu va=0x%llX size=%zu dtb=0x%llX buffer=%p connected=%d reason=invalid_args gle=%lu",
+            pid,
+            process_id_,
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            static_cast<unsigned long long>(address),
+            size,
+            static_cast<unsigned long long>(dtb),
+            buffer,
+            is_connected() ? 1 : 0,
+            static_cast<unsigned long>(GetLastError()));
         return 0;
     }
 
@@ -1010,11 +1021,32 @@ std::size_t voyager::device_t::transfer_physical_read(
         : k_staged_physical_chunk_size;
     virtual_alloc_buffer_t staging(staging_size);
     if (!staging) {
+        diag::log_tagged_fmt("comm",
+            "phys_transfer_read_reject pid=%u attached_pid=%u tid=%lu va=0x%llX size=%zu dtb=0x%llX staging_size=%zu reason=staging_alloc_failed gle=%lu",
+            pid,
+            process_id_,
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            static_cast<unsigned long long>(address),
+            size,
+            static_cast<unsigned long long>(dtb),
+            staging_size,
+            static_cast<unsigned long>(GetLastError()));
         return 0;
     }
 
     auto* destination = static_cast<std::uint8_t*>(buffer);
     std::size_t total_read = 0;
+    const ULONGLONG start_ms = GetTickCount64();
+    diag::log_tagged_fmt("comm",
+        "phys_transfer_read_begin pid=%u attached_pid=%u tid=%lu va=0x%llX size=%zu dtb=0x%llX staging_size=%zu ioctl=0x%08X",
+        pid,
+        process_id_,
+        static_cast<unsigned long>(GetCurrentThreadId()),
+        static_cast<unsigned long long>(address),
+        size,
+        static_cast<unsigned long long>(dtb),
+        staging_size,
+        static_cast<unsigned int>(ioctl_codes::PHYS()));
 
     while (total_read < size) {
         const std::size_t chunk_size = (size - total_read < k_staged_physical_chunk_size)
@@ -1033,11 +1065,40 @@ std::size_t voyager::device_t::transfer_physical_read(
         req.should_write = 0;
         std::memset(req.padding_2, 0, sizeof(req.padding_2));
 
-        if (!send_request(ioctl_codes::PHYS(), &req, sizeof(req))) {
+        SetLastError(ERROR_SUCCESS);
+        const bool sent = send_request(ioctl_codes::PHYS(), &req, sizeof(req));
+        const DWORD gle = sent ? ERROR_SUCCESS : GetLastError();
+        if (!sent) {
+            diag::log_tagged_fmt("comm",
+                "phys_transfer_read_chunk pid=%u attached_pid=%u tid=%lu va=0x%llX chunk=%zu offset=%zu sent=0 gle=%lu ret_size=%zu total=%zu dtb=0x%llX elapsed_ms=%llu",
+                pid,
+                process_id_,
+                static_cast<unsigned long>(GetCurrentThreadId()),
+                static_cast<unsigned long long>(address + total_read),
+                chunk_size,
+                total_read,
+                static_cast<unsigned long>(gle),
+                req.ret_size,
+                total_read,
+                static_cast<unsigned long long>(dtb),
+                static_cast<unsigned long long>(GetTickCount64() - start_ms));
             break;
         }
 
         const std::size_t bytes_read = (req.ret_size <= chunk_size) ? req.ret_size : chunk_size;
+        diag::log_tagged_fmt("comm",
+            "phys_transfer_read_chunk pid=%u attached_pid=%u tid=%lu va=0x%llX chunk=%zu offset=%zu sent=1 gle=0 ret_size=%zu bytes=%zu total_before=%zu dtb=0x%llX elapsed_ms=%llu",
+            pid,
+            process_id_,
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            static_cast<unsigned long long>(address + total_read),
+            chunk_size,
+            total_read,
+            req.ret_size,
+            bytes_read,
+            total_read,
+            static_cast<unsigned long long>(dtb),
+            static_cast<unsigned long long>(GetTickCount64() - start_ms));
         if (bytes_read == 0) {
             break;
         }
@@ -1050,6 +1111,17 @@ std::size_t voyager::device_t::transfer_physical_read(
         }
     }
 
+    diag::log_tagged_fmt("comm",
+        "phys_transfer_read_done pid=%u attached_pid=%u tid=%lu va=0x%llX size=%zu dtb=0x%llX bytes=%zu complete=%d elapsed_ms=%llu",
+        pid,
+        process_id_,
+        static_cast<unsigned long>(GetCurrentThreadId()),
+        static_cast<unsigned long long>(address),
+        size,
+        static_cast<unsigned long long>(dtb),
+        total_read,
+        total_read == size ? 1 : 0,
+        static_cast<unsigned long long>(GetTickCount64() - start_ms));
     return total_read;
 }
 
@@ -1062,6 +1134,17 @@ std::size_t voyager::device_t::transfer_physical_write(
     SPOOF_FUNC;
 
     if (!buffer || size == 0 || !is_connected() || dtb == 0) {
+        diag::log_tagged_fmt("comm",
+            "phys_transfer_write_reject pid=%u attached_pid=%u tid=%lu va=0x%llX size=%zu dtb=0x%llX buffer=%p connected=%d reason=invalid_args gle=%lu",
+            pid,
+            process_id_,
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            static_cast<unsigned long long>(address),
+            size,
+            static_cast<unsigned long long>(dtb),
+            buffer,
+            is_connected() ? 1 : 0,
+            static_cast<unsigned long>(GetLastError()));
         return 0;
     }
 
@@ -1070,11 +1153,32 @@ std::size_t voyager::device_t::transfer_physical_write(
         : k_staged_physical_chunk_size;
     virtual_alloc_buffer_t staging(staging_size);
     if (!staging) {
+        diag::log_tagged_fmt("comm",
+            "phys_transfer_write_reject pid=%u attached_pid=%u tid=%lu va=0x%llX size=%zu dtb=0x%llX staging_size=%zu reason=staging_alloc_failed gle=%lu",
+            pid,
+            process_id_,
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            static_cast<unsigned long long>(address),
+            size,
+            static_cast<unsigned long long>(dtb),
+            staging_size,
+            static_cast<unsigned long>(GetLastError()));
         return 0;
     }
 
     const auto* source = static_cast<const std::uint8_t*>(buffer);
     std::size_t total_written = 0;
+    const ULONGLONG start_ms = GetTickCount64();
+    diag::log_tagged_fmt("comm",
+        "phys_transfer_write_begin pid=%u attached_pid=%u tid=%lu va=0x%llX size=%zu dtb=0x%llX staging_size=%zu ioctl=0x%08X",
+        pid,
+        process_id_,
+        static_cast<unsigned long>(GetCurrentThreadId()),
+        static_cast<unsigned long long>(address),
+        size,
+        static_cast<unsigned long long>(dtb),
+        staging_size,
+        static_cast<unsigned int>(ioctl_codes::PHYS()));
 
     while (total_written < size) {
         const std::size_t chunk_size = (size - total_written < k_staged_physical_chunk_size)
@@ -1093,11 +1197,40 @@ std::size_t voyager::device_t::transfer_physical_write(
         req.should_write = 1;
         std::memset(req.padding_2, 0, sizeof(req.padding_2));
 
-        if (!send_request(ioctl_codes::PHYS(), &req, sizeof(req))) {
+        SetLastError(ERROR_SUCCESS);
+        const bool sent = send_request(ioctl_codes::PHYS(), &req, sizeof(req));
+        const DWORD gle = sent ? ERROR_SUCCESS : GetLastError();
+        if (!sent) {
+            diag::log_tagged_fmt("comm",
+                "phys_transfer_write_chunk pid=%u attached_pid=%u tid=%lu va=0x%llX chunk=%zu offset=%zu sent=0 gle=%lu ret_size=%zu total=%zu dtb=0x%llX elapsed_ms=%llu",
+                pid,
+                process_id_,
+                static_cast<unsigned long>(GetCurrentThreadId()),
+                static_cast<unsigned long long>(address + total_written),
+                chunk_size,
+                total_written,
+                static_cast<unsigned long>(gle),
+                req.ret_size,
+                total_written,
+                static_cast<unsigned long long>(dtb),
+                static_cast<unsigned long long>(GetTickCount64() - start_ms));
             break;
         }
 
         const std::size_t bytes_written = (req.ret_size <= chunk_size) ? req.ret_size : chunk_size;
+        diag::log_tagged_fmt("comm",
+            "phys_transfer_write_chunk pid=%u attached_pid=%u tid=%lu va=0x%llX chunk=%zu offset=%zu sent=1 gle=0 ret_size=%zu bytes=%zu total_before=%zu dtb=0x%llX elapsed_ms=%llu",
+            pid,
+            process_id_,
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            static_cast<unsigned long long>(address + total_written),
+            chunk_size,
+            total_written,
+            req.ret_size,
+            bytes_written,
+            total_written,
+            static_cast<unsigned long long>(dtb),
+            static_cast<unsigned long long>(GetTickCount64() - start_ms));
         if (bytes_written == 0) {
             break;
         }
@@ -1108,6 +1241,17 @@ std::size_t voyager::device_t::transfer_physical_write(
         }
     }
 
+    diag::log_tagged_fmt("comm",
+        "phys_transfer_write_done pid=%u attached_pid=%u tid=%lu va=0x%llX size=%zu dtb=0x%llX bytes=%zu complete=%d elapsed_ms=%llu",
+        pid,
+        process_id_,
+        static_cast<unsigned long>(GetCurrentThreadId()),
+        static_cast<unsigned long long>(address),
+        size,
+        static_cast<unsigned long long>(dtb),
+        total_written,
+        total_written == size ? 1 : 0,
+        static_cast<unsigned long long>(GetTickCount64() - start_ms));
     return total_written;
 }
 

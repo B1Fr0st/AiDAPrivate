@@ -266,6 +266,7 @@ void register_re_tools(mcp_standalone::server_t& srv)
         {{"chain", "object", "Chain object", true},
          {"samples", "number", "Sample count", false},
          {"interval_ms", "number", "Interval between samples", false},
+         {"timeout_ms", "number", "Local bounded sampling deadline", false},
          {"process_id", "number", "Target process id", false}},
         re::encptr::verify_stable, true});
 

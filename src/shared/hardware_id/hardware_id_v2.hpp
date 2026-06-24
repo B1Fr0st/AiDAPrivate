@@ -12,7 +12,6 @@ namespace aida::hardware_id::v2
     constexpr std::uint8_t kFactorIdBaseboardSerial  = 2;
     constexpr std::uint8_t kFactorIdChassisSerial    = 3;
     constexpr std::uint8_t kFactorIdDiskSerial       = 4;
-    constexpr std::uint8_t kFactorIdNicPermanentMac  = 5;
     constexpr std::uint8_t kFactorIdCpuidBrand       = 6;
     constexpr std::uint8_t kFactorIdMachineGuid      = 7;
     constexpr std::uint8_t kFactorIdInstallationGuid = 8;

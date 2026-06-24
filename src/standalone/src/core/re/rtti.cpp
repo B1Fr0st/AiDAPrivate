@@ -996,6 +996,49 @@ bool type_from_vtable(std::uint32_t pid,
     return true;
 }
 
+bool type_from_col(std::uint32_t pid,
+                   const driver_bridge::module_info_t& module,
+                   std::uint64_t col_va,
+                   type_info_t& out)
+{
+    module_layout_t layout;
+    if (!load_module_layout(pid, module, layout) || layout.pointer_size == 0)
+        return false;
+    col_info_t col{};
+    std::string decorated;
+    if (!read_col_info(pid, layout, col_va, col, &decorated))
+        return false;
+    out = {};
+    out.decorated_name = decorated;
+    out.name = undecorate_rtti_name(decorated);
+    out.type_descriptor_va = col.type_descriptor_va;
+    out.col_va = col_va;
+    out.hierarchy_descriptor_va = col.hierarchy_descriptor_va;
+    out.module_name = module.name;
+    add_col_record(out, col);
+    apply_base_classes(out, read_base_classes(pid, layout, col, 64));
+    return true;
+}
+
+bool type_from_type_descriptor(std::uint32_t pid,
+                               const driver_bridge::module_info_t& module,
+                               std::uint64_t type_descriptor_va,
+                               type_info_t& out)
+{
+    module_layout_t layout;
+    if (!load_module_layout(pid, module, layout) || layout.pointer_size == 0)
+        return false;
+    std::string decorated;
+    if (!read_type_descriptor_name(pid, layout, type_descriptor_va, decorated))
+        return false;
+    out = {};
+    out.decorated_name = decorated;
+    out.name = undecorate_rtti_name(decorated);
+    out.type_descriptor_va = type_descriptor_va;
+    out.module_name = module.name;
+    return true;
+}
+
 std::vector<type_info_t> scan_module(rtti_scan_context_t& ctx,
                                      const driver_bridge::module_info_t& module,
                                      bool deep_scan,
@@ -1040,6 +1083,8 @@ std::vector<type_info_t> scan_module(rtti_scan_context_t& ctx,
             return nullptr;
         std::vector<std::uint8_t> bytes;
         if (!read_bytes(ctx.pid, section.va, static_cast<std::size_t>(section.size), bytes))
+            return nullptr;
+        if (ctx.stop("rtti_section_read_complete"))
             return nullptr;
         ctx.bytes_scanned += bytes.size();
         module_bytes_scanned += bytes.size();
@@ -1218,6 +1263,8 @@ std::vector<type_info_t> scan_module(rtti_scan_context_t& ctx,
                 if (td_it != by_td.end())
                     add_vtable_record(td_it->second, record);
             }
+            if (ctx.stop("rtti_vtable_sections"))
+                break;
         }
     }
 
@@ -1382,7 +1429,7 @@ scan_result_t scan_types(const json& params)
         scan_mode = "fast";
     const bool deep_scan = scan_mode == "deep";
     const std::size_t max_results = static_cast<std::size_t>(numeric_param(params, "max_results", 2000, 1, 20000));
-    const std::uint64_t timeout_ms = numeric_param(params, "timeout_ms", 30000, 500, 120000);
+    const std::uint64_t timeout_ms = numeric_param(params, "timeout_ms", deep_scan ? 30000 : 5500, 500, 120000);
     const std::uint64_t module_limit = numeric_param(params, "module_limit", 0, 0, 4096);
     auto fail_scan = [&](const std::string& message, json details = json::object()) -> scan_result_t {
         result.ok = false;
@@ -1455,7 +1502,7 @@ scan_result_t scan_types(const json& params)
     const bool has_exact_type_descriptor = exact_type_descriptor_provided;
     const bool has_exact_col = exact_col_provided;
     const bool has_vtable_hint = vtable_hint_provided && vtable_hint_va != 0;
-    const bool exact_selector_fast_path = has_vtable_hint && !has_exact_type_descriptor && !has_exact_col && !deep_scan && filter_text.empty();
+    const bool exact_selector_fast_path = (has_vtable_hint || has_exact_type_descriptor || has_exact_col) && !deep_scan;
     std::vector<driver_bridge::module_info_t> available_modules;
     bool available_modules_loaded = false;
     auto load_available_modules = [&]() -> const std::vector<driver_bridge::module_info_t>& {
@@ -1643,6 +1690,7 @@ scan_result_t scan_types(const json& params)
         else
             merge_type_info(found->second, type);
     };
+    bool exact_selector_direct_hit = false;
     if (has_vtable_hint)
     {
         if (auto module = find_module_for_address(scope.pid(), vtable_hint_va))
@@ -1651,6 +1699,7 @@ scan_result_t scan_types(const json& params)
             if (type_from_vtable(scope.pid(), *module, vtable_hint_va, hinted))
             {
                 merge_found(hinted);
+                exact_selector_direct_hit = true;
             }
             else
             {
@@ -1671,7 +1720,87 @@ scan_result_t scan_types(const json& params)
             return fail_module_selector("RTTI vtable_va selector did not resolve a loaded module.", "vtable_hint", vtable_hint_key, vtable_hint_value);
         }
     }
-    if (!exact_selector_fast_path || all_by_td.empty())
+    if (has_exact_col)
+    {
+        if (ctx.stop("rtti_exact_col_selector"))
+        {
+            result.ok = false;
+            result.deadline_hit = ctx.deadline_hit;
+            result.cancelled = ctx.cancelled;
+            result.partial = true;
+            result.timeout_ms = timeout_ms;
+            result.elapsed_ms = GetTickCount64() - started_ms;
+            result.error = ctx.cancelled ? "RTTI exact COL selector cancelled." : "RTTI exact COL selector deadline reached.";
+            return result;
+        }
+        if (auto module = find_module_for_address(scope.pid(), exact_col_va))
+        {
+            type_info_t exact;
+            if (type_from_col(scope.pid(), *module, exact_col_va, exact))
+            {
+                merge_found(exact);
+                exact_selector_direct_hit = true;
+            }
+            else
+            {
+                return fail_scan("RTTI complete_object_locator_va selector did not resolve a valid RTTI COL.",
+                    selector_failure_details(scope.pid(),
+                                             "complete_object_locator_hint",
+                                             exact_col_key,
+                                             exact_col_value,
+                                             module_name,
+                                             module_filter,
+                                             include_system_modules,
+                                             module_limit,
+                                             load_available_modules()));
+            }
+        }
+        else
+        {
+            return fail_module_selector("RTTI complete_object_locator_va selector did not resolve a loaded module.", "complete_object_locator_hint", exact_col_key, exact_col_value);
+        }
+    }
+    if (has_exact_type_descriptor)
+    {
+        if (ctx.stop("rtti_exact_type_descriptor_selector"))
+        {
+            result.ok = false;
+            result.deadline_hit = ctx.deadline_hit;
+            result.cancelled = ctx.cancelled;
+            result.partial = true;
+            result.timeout_ms = timeout_ms;
+            result.elapsed_ms = GetTickCount64() - started_ms;
+            result.error = ctx.cancelled ? "RTTI exact TypeDescriptor selector cancelled." : "RTTI exact TypeDescriptor selector deadline reached.";
+            return result;
+        }
+        if (auto module = find_module_for_address(scope.pid(), exact_type_descriptor_va))
+        {
+            type_info_t exact;
+            if (type_from_type_descriptor(scope.pid(), *module, exact_type_descriptor_va, exact))
+            {
+                merge_found(exact);
+                exact_selector_direct_hit = true;
+            }
+            else
+            {
+                return fail_scan("RTTI type_descriptor_va selector did not resolve a valid RTTI TypeDescriptor.",
+                    selector_failure_details(scope.pid(),
+                                             "type_descriptor_hint",
+                                             exact_type_descriptor_key,
+                                             exact_type_descriptor_value,
+                                             module_name,
+                                             module_filter,
+                                             include_system_modules,
+                                             module_limit,
+                                             load_available_modules()));
+            }
+        }
+        else
+        {
+            return fail_module_selector("RTTI type_descriptor_va selector did not resolve a loaded module.", "type_descriptor_hint", exact_type_descriptor_key, exact_type_descriptor_value);
+        }
+    }
+    if (!(exact_selector_fast_path && exact_selector_direct_hit) || all_by_td.empty())
     {
     for (const auto& module : modules)
     {
@@ -1698,8 +1827,11 @@ scan_result_t scan_types(const json& params)
     }
     std::vector<type_info_t> unfiltered;
     unfiltered.reserve(all_by_td.size());
+    std::size_t unfiltered_build_count = 0;
     for (auto& [td, type] : all_by_td)
     {
+        if ((unfiltered_build_count++ & 0xFFu) == 0 && ctx.stop("rtti_unfiltered_build"))
+            break;
         (void)td;
         unfiltered.push_back(std::move(type));
     }
@@ -1708,8 +1840,11 @@ scan_result_t scan_types(const json& params)
     });
     result.type_index = build_type_index(unfiltered);
     result.unfiltered_type_count = unfiltered.size();
+    std::size_t result_filter_count = 0;
     for (const auto& type : unfiltered)
     {
+        if ((result_filter_count++ & 0xFFu) == 0 && ctx.stop("rtti_result_filter"))
+            break;
         if (has_exact_type_descriptor && type.type_descriptor_va != exact_type_descriptor_va)
             continue;
         if (has_exact_col && !type_has_col(type, exact_col_va))
@@ -1778,7 +1913,8 @@ scan_result_t scan_types(const json& params)
         {"vtable_hint_key", vtable_hint_key},
         {"vtable_va", has_vtable_hint ? json(sa_format_address(vtable_hint_va)) : json(nullptr)},
         {"vtable_hint_hit", has_vtable_hint ? vtable_hint_hit : false},
-        {"exact_selector_fast_path", exact_selector_fast_path}
+        {"exact_selector_fast_path", exact_selector_fast_path},
+        {"exact_selector_direct_hit", exact_selector_direct_hit}
     };
     if ((has_exact_type_descriptor || has_exact_col) && result.types.empty())
     {
@@ -2228,10 +2364,21 @@ tool_result_t list_hierarchy(const json& params)
                     attach_hierarchy(result, resolved, index, max_vtables_per_type);
                     result["resolution"] = "vtable_hint_col";
                     if (hierarchy_scan.ok)
+                    {
                         add_scan_diagnostics(result, hierarchy_scan, include_diagnostics);
+                        result["focused_scan_ok"] = true;
+                    }
                     else
-                        return tool_result_t::error(hierarchy_scan.error.empty() ? "Focused RTTI hierarchy scan failed." : hierarchy_scan.error,
-                            scan_error_payload(hierarchy_scan, include_diagnostics));
+                    {
+                        result["focused_scan_ok"] = false;
+                        result["focused_scan_error"] = hierarchy_scan.error;
+                        result["focused_scan_details"] = scan_error_payload(hierarchy_scan, include_diagnostics);
+                        result["deadline_hit"] = hierarchy_scan.deadline_hit;
+                        result["cancelled"] = hierarchy_scan.cancelled;
+                        result["partial"] = true;
+                        result["timeout_ms"] = hierarchy_scan.timeout_ms;
+                        result["elapsed_ms"] = GetTickCount64() - started_ms;
+                    }
                     return tool_result_t::ok(result);
                 }
             }
@@ -2541,6 +2688,8 @@ tool_result_t find_constructor(const json& params)
             needle.resize(4);
         for (std::size_t i = 0; i < bytes.size(); ++i)
         {
+            if ((i & 0xFFFu) == 0 && timed_out())
+                break;
             if (i + needle.size() <= bytes.size() && std::memcmp(bytes.data() + i, needle.data(), needle.size()) == 0)
                 references.push_back(i);
             if (i + 7 <= bytes.size() && (bytes[i] & 0xF0u) == 0x40u && (bytes[i + 1] == 0x8D || bytes[i + 1] == 0x8B) && (bytes[i + 2] & 0xC7u) == 0x05u)
@@ -2567,6 +2716,8 @@ tool_result_t find_constructor(const json& params)
                     references.push_back(i);
             }
         }
+        if (deadline_hit || cancelled)
+            break;
         std::sort(references.begin(), references.end());
         references.erase(std::unique(references.begin(), references.end()), references.end());
         total_reference_hits += references.size();

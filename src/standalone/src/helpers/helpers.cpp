@@ -511,15 +511,15 @@ namespace {
 			return "Suspicious process handle to AiDA detected. Close that process, then restart AiDAStandalone.exe.";
 		if (text_has_token(joined, "TARGET_AIDA") || text_has_token(joined, "targeting_aida"))
 			return "External tooling is targeting AiDA. Close the tool targeting AiDA, then restart AiDAStandalone.exe.";
-		if (text_has_token(joined, "MCP_OFFENSIVE_TOOL") || text_has_token(joined, "offensive_mcp_tool_detected") ||
-			text_has_token(joined, "ai_tool_posture_mcp_offensive_tools") || text_has_token(joined, "anti_mcp_offensive"))
+        if (text_has_token(joined, "MCP_OFFENSIVE_TOOL") || text_has_token(joined, "offensive_mcp_tool_detected") ||
+			text_has_token(joined, "anti_mcp_offensive"))
 			return "Offensive MCP tooling detected. Close that MCP tool, then restart AiDAStandalone.exe.";
 		if (text_has_token(joined, "DBG_TOOL") || text_has_token(joined, "debugger_tool_detected") ||
 			text_has_token(joined, "debugger_tool_scan") || text_has_token(joined, "kernel_debugger") ||
 			text_has_positive_field(joined, "first_owner_debugger"))
 			return "Debugger activity detected. Close the debugger, then restart AiDAStandalone.exe.";
 		if (text_has_token(joined, "RE_TOOL") || text_has_token(joined, "reverse_engineering") ||
-			text_has_token(joined, "ai_tool_posture_re_tool") || text_has_positive_field(joined, "first_owner_re"))
+			text_has_positive_field(joined, "first_owner_re"))
 			return "Reverse-engineering tool activity detected. Close that tool, then restart AiDAStandalone.exe.";
 		if (text_has_token(joined, "DUMP_TOOL") || text_has_token(joined, "dump_tool_detected") ||
 			text_has_token(joined, "dump_tool_scan") || text_has_positive_field(joined, "first_owner_dump"))

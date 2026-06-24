@@ -448,6 +448,50 @@ uint64_t audit_runtime_elapsed_ms(const active_scanner::audit_status_t& st)
     return end > st.started_ms ? end - st.started_ms : 0;
 }
 
+json load_snapshot_json(const active_scanner::scanner_load_t& load)
+{
+    return json{
+        {"active_audits", load.active_audits},
+        {"running_audits", load.running_audits},
+        {"active_workers", load.active_workers},
+        {"queue_depth", load.queue_depth},
+        {"in_flight_requests", load.in_flight_requests},
+        {"max_active_audits", load.max_active_audits},
+        {"shutting_down", load.shutting_down}
+    };
+}
+
+std::string probe_evidence_state(const active_scanner::audit_status_t& st, size_t reported_issues)
+{
+    if (reported_issues > 0)
+        return "issue_evidence_observed";
+    if (st.responses_received > 0)
+        return "response_evidence_observed";
+    if (st.transport_failures > 0)
+        return "transport_failures_present";
+    if (st.completed_probes > 0)
+        return "probes_completed_no_response";
+    if (st.running || st.cancel_requested)
+        return "pending";
+    return "not_started_or_drained";
+}
+
+void attach_scanner_evidence_fields(json& data,
+                                    const active_scanner::audit_status_t& st,
+                                    size_t stored_issues,
+                                    size_t reported_issues,
+                                    const active_scanner::scanner_load_t& load)
+{
+    data["status_source"] = "active_scanner::get_status";
+    data["stored_issue_count"] = stored_issues;
+    data["runtime_issue_count"] = st.issues_found;
+    data["reported_issue_count"] = reported_issues;
+    data["proof_ready"] = reported_issues > 0 || st.responses_received > 0;
+    data["proof_pending"] = st.running && st.completed_probes < st.total_probes;
+    data["probe_evidence_state"] = probe_evidence_state(st, reported_issues);
+    data["load_snapshot"] = load_snapshot_json(load);
+}
+
 tool_result_t tool_start_audit(const json& p)
 {
     const uint64_t started = GetTickCount64();
@@ -547,6 +591,11 @@ tool_result_t tool_start_audit(const json& p)
         data["max_active_audits"] = after.max_active_audits;
         data["elapsed_ms"] = static_cast<unsigned long long>(GetTickCount64() - started);
         data["thread_id"] = static_cast<unsigned long>(tid);
+        data["status_source"] = "active_scanner::enqueue_target";
+        data["engine_acceptance"] = "enqueue_rejected";
+        data["proof_pending"] = false;
+        data["load_snapshot_before"] = load_snapshot_json(before);
+        data["load_snapshot_after"] = load_snapshot_json(after);
         diag::log_tagged_fmt("mcp_burp", "tool_start_audit enqueue_failed err=%s code=%s req_len=%zu active_audits=%zu running_audits=%zu queue_depth=%zu in_flight=%zu elapsed_ms=%llu tid=%lu",
             last.c_str(), code.c_str(), raw.size(), after.active_audits, after.running_audits, after.queue_depth, after.in_flight_requests,
             static_cast<unsigned long long>(GetTickCount64() - started), static_cast<unsigned long>(tid));
@@ -566,6 +615,13 @@ tool_result_t tool_start_audit(const json& p)
     data["running_audits"] = after.running_audits;
     data["queue_depth"] = after.queue_depth;
     data["in_flight_requests"] = after.in_flight_requests;
+    data["status_source"] = "active_scanner::enqueue_target";
+    data["engine_acceptance"] = "audit_id_allocated";
+    data["proof_pending"] = true;
+    data["proof_ready"] = false;
+    data["probe_evidence_state"] = "pending";
+    data["load_snapshot_before"] = load_snapshot_json(before);
+    data["load_snapshot_after"] = load_snapshot_json(after);
     return tool_result_t::ok(std::string("Audit started: ") + std::to_string(id), data);
 }
 
@@ -644,6 +700,7 @@ tool_result_t tool_audit_status(const json& p)
     data["audit_in_flight_requests"] = st.in_flight_requests;
     data["elapsed_ms"] = audit_elapsed_ms;
     data["thread_id"] = static_cast<unsigned long>(tid);
+    attach_scanner_evidence_fields(data, st, stored_issues, issues_found, load);
     diag::log_tagged_fmt("mcp_burp", "tool_audit_status ok id=%llu running=%d cancelled=%d cancel_requested=%d drained=%d runtime_issues=%zu stored_issues=%zu reported_issues=%zu responses=%zu no_response=%zu transport_failures=%zu transport_error_code=%u transport_error_class=%s circuit_open=%d circuit_hits=%zu circuit_threshold=%zu last_transport_error=%s req_len=%zu active_audits=%zu running_audits=%zu queue_depth=%zu in_flight=%zu effective_concurrency=%zu effective_throttle_ms=%zu audit_elapsed_ms=%llu handler_elapsed_ms=%llu tid=%lu",
         static_cast<unsigned long long>(id),
         (int)st.running,
@@ -723,6 +780,7 @@ tool_result_t tool_list_audits(const json&)
         e["active_workers"] = st.active_workers;
         e["queued_workers"] = st.queued_workers;
         e["audit_in_flight_requests"] = st.in_flight_requests;
+        attach_scanner_evidence_fields(e, st, stored_issues, issues_found, load);
         arr.push_back(std::move(e));
     }
     json data;
@@ -733,6 +791,8 @@ tool_result_t tool_list_audits(const json&)
     data["queue_depth"] = load.queue_depth;
     data["in_flight_requests"] = load.in_flight_requests;
     data["max_active_audits"] = load.max_active_audits;
+    data["load_snapshot"] = load_snapshot_json(load);
+    data["status_source"] = "active_scanner::list_audits";
     data["elapsed_ms"] = static_cast<unsigned long long>(GetTickCount64() - started);
     data["thread_id"] = static_cast<unsigned long>(tid);
     diag::log_tagged_fmt("mcp_burp", "tool_list_audits ok count=%zu active_audits=%zu running_audits=%zu queue_depth=%zu in_flight=%zu elapsed_ms=%llu tid=%lu",

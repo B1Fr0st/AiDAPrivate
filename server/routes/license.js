@@ -582,6 +582,7 @@ const NON_ENFORCING_BAN_REASONS = new Set([
     'anomaly_auto_kill',
     'cross_session_anomaly_ban',
 ]);
+const IGNORED_HWID_V2_FACTOR_KEYS = new Set(['5']);
 
 
 function todayStr() {
@@ -1466,6 +1467,7 @@ function normalizeHwidV2Factors(body) {
     for (const [rawKey, rawValue] of Object.entries(source)) {
         const id = Number(rawKey);
         if (!Number.isInteger(id) || id < 1 || id > 9 || !isSha256Hex(rawValue)) continue;
+        if (IGNORED_HWID_V2_FACTOR_KEYS.has(String(id))) continue;
         factors[String(id)] = String(rawValue).toLowerCase();
         count += 1;
     }
@@ -1473,7 +1475,12 @@ function normalizeHwidV2Factors(body) {
     factors._schema = 'hwid_v2_factor_hashes_v1';
     factors._count = count;
     const maskRaw = Number(body && (body.hwid_v2_factor_mask ?? body.hwid_factor_present_mask));
-    factors._mask = Number.isFinite(maskRaw) ? (maskRaw >>> 0) : 0;
+    let mask = Number.isFinite(maskRaw) ? (maskRaw >>> 0) : 0;
+    for (const key of IGNORED_HWID_V2_FACTOR_KEYS) {
+        const idx = Number(key) - 1;
+        if (idx >= 0) mask &= ~(1 << idx);
+    }
+    factors._mask = mask >>> 0;
     factors._tpm_present = !!(body && body.hwid_v2_tpm_present);
     return factors;
 }
@@ -1482,6 +1489,7 @@ function hwidFactorKeys(factors) {
     if (!factors || typeof factors !== 'object') return [];
     return Object.keys(factors)
         .filter(k => /^[1-9]$/.test(k) && isSha256Hex(factors[k]))
+        .filter(k => !IGNORED_HWID_V2_FACTOR_KEYS.has(k))
         .sort((a, b) => Number(a) - Number(b));
 }
 
@@ -1593,6 +1601,19 @@ async function verifyOrBindHwid(licenseKey, hwid, existingHwid, options) {
             const graceUsedAt = Number(options.licenseRow.hwid_grace_used_at || 0);
             const now = Math.floor(Date.now() / 1000);
             const withinCooldown = graceUsedAt > 0 && (now - graceUsedAt) < HWID_GRACE_WINDOW_SECONDS;
+            if (comparison.changed === 0 && isRichHwidV2Factors(prevFactors) && isRichHwidV2Factors(options.factors)) {
+                try {
+                    await pool.query(
+                        'UPDATE licenses SET hwid = $1, hwid_factors = $2::jsonb WHERE key = $3',
+                        [hwid, JSON.stringify(options.factors), licenseKey]
+                    );
+                } catch (_) { }
+                auditLog.logServerEvent('license.hwid_ignored_factor_accepted', licenseKey, {
+                    previous_hwid_prefix: typeof existingHwid === 'string' ? existingHwid.slice(0, 16) : '',
+                    new_hwid_prefix: hwid.slice(0, 16),
+                }).catch(() => {});
+                return { ok: true, reason: 'ignored_factor_accepted' };
+            }
             if (comparison.changed === 1 && !withinCooldown) {
                 try {
                     await pool.query(

@@ -4706,12 +4706,15 @@ struct kernel_module_query_diagnostics_t
     DWORD fallback_win32_error = 0;
     std::size_t fallback_bytes_returned = 0;
     std::size_t fallback_raw_count = 0;
+    std::size_t fallback_named_count = 0;
     std::size_t fallback_accepted_count = 0;
     std::size_t fallback_rejected_count = 0;
     std::size_t fallback_name_query_failed_count = 0;
     std::size_t fallback_duplicate_name_count = 0;
     std::size_t fallback_match_count = 0;
     std::size_t fallback_missing_count = 0;
+    std::size_t fallback_unmatched_primary_count = 0;
+    std::size_t fallback_unmatched_psapi_count = 0;
     std::vector<std::string> samples;
     std::vector<std::string> fallback_samples;
     json token;
@@ -4812,11 +4815,14 @@ struct readonly_kernel_module_base_snapshot_t
     DWORD win32_error = 0;
     DWORD bytes_returned = 0;
     DWORD raw_count = 0;
+    std::size_t named_count = 0;
     std::size_t accepted_count = 0;
     std::size_t rejected_count = 0;
     std::size_t name_query_failed_count = 0;
     std::size_t duplicate_name_count = 0;
+    std::size_t noncanonical_base_count = 0;
     bool ok = false;
+    bool truncated = false;
     std::string reason;
     std::unordered_map<std::string, std::uint64_t> bases_by_name;
     std::vector<std::string> samples;
@@ -4849,7 +4855,10 @@ static readonly_kernel_module_base_snapshot_t enumerate_readonly_kernel_module_b
     out.bytes_returned = cb_needed;
     out.raw_count = cb_needed / static_cast<DWORD>(sizeof(LPVOID));
     if (cb_needed > driver_buffer_bytes)
+    {
+        out.truncated = true;
         out.raw_count = static_cast<DWORD>(_countof(drivers));
+    }
     out.samples.reserve((std::min)(static_cast<DWORD>(8), out.raw_count));
 
     for (DWORD i = 0; i < out.raw_count; ++i)
@@ -4893,8 +4902,10 @@ static readonly_kernel_module_base_snapshot_t enumerate_readonly_kernel_module_b
             ++out.rejected_count;
             continue;
         }
+        ++out.named_count;
         if (!is_page_aligned_kernel_base(base))
         {
+            ++out.noncanonical_base_count;
             ++out.rejected_count;
             continue;
         }
@@ -4906,16 +4917,16 @@ static readonly_kernel_module_base_snapshot_t enumerate_readonly_kernel_module_b
         ++out.accepted_count;
     }
 
-    if (cb_needed > driver_buffer_bytes)
+    if (out.truncated)
         out.reason = "EnumDeviceDrivers_truncated";
     else if (out.raw_count == 0)
         out.reason = "EnumDeviceDrivers_empty";
-    else if (out.name_query_failed_count != 0)
-        out.reason = "EnumDeviceDrivers_name_query_failed";
-    else if (out.rejected_count != 0)
-        out.reason = "EnumDeviceDrivers_rejected_noncanonical_base";
     else if (out.duplicate_name_count != 0)
         out.reason = "EnumDeviceDrivers_duplicate_module_name";
+    else if (out.name_query_failed_count != 0)
+        out.reason = "EnumDeviceDrivers_name_query_failed";
+    else if (out.noncanonical_base_count != 0)
+        out.reason = "EnumDeviceDrivers_rejected_noncanonical_base";
     else if (out.bases_by_name.empty())
         out.reason = "EnumDeviceDrivers_no_usable_bases";
     else
@@ -4926,15 +4937,17 @@ static readonly_kernel_module_base_snapshot_t enumerate_readonly_kernel_module_b
 
     const std::string samples = module_sample_text(out.samples);
     diag::log_tagged_fmt("drv_tools",
-        "kernel_module_base_fallback %s caller_reason=%s bytes_returned=%lu raw_count=%lu accepted=%zu rejected=%zu name_query_failed=%zu duplicate_names=%zu samples=%s",
+        "kernel_module_base_fallback %s caller_reason=%s bytes_returned=%lu raw_count=%lu named=%zu accepted=%zu rejected=%zu name_query_failed=%zu duplicate_names=%zu noncanonical=%zu samples=%s",
         out.ok ? "accepted" : "rejected",
         reason ? reason : "<null>",
         static_cast<unsigned long>(out.bytes_returned),
         static_cast<unsigned long>(out.raw_count),
+        out.named_count,
         out.accepted_count,
         out.rejected_count,
         out.name_query_failed_count,
         out.duplicate_name_count,
+        out.noncanonical_base_count,
         samples.empty() ? "<none>" : samples.c_str());
 
     return out;
@@ -4947,10 +4960,12 @@ static void copy_readonly_fallback_diagnostics(
     diag_ref.fallback_win32_error = fallback.win32_error;
     diag_ref.fallback_bytes_returned = fallback.bytes_returned;
     diag_ref.fallback_raw_count = fallback.raw_count;
+    diag_ref.fallback_named_count = fallback.named_count;
     diag_ref.fallback_accepted_count = fallback.accepted_count;
     diag_ref.fallback_rejected_count = fallback.rejected_count;
     diag_ref.fallback_name_query_failed_count = fallback.name_query_failed_count;
     diag_ref.fallback_duplicate_name_count = fallback.duplicate_name_count;
+    diag_ref.fallback_unmatched_psapi_count = fallback.rejected_count;
     diag_ref.fallback_samples = fallback.samples;
 }
 
@@ -4983,9 +4998,14 @@ static bool apply_readonly_kernel_module_base_fallback(
             OBFSTR(" strict_fallback=") + diag_ref.strict_fallback +
             OBFSTR(" fallback_reason=") + diag_ref.fallback_reason;
         diag::log_tagged_fmt("drv_tools",
-            "query_kernel_modules dependency_blocked reason=all_image_bases_zero fallback_status=rejected fallback_reason=%s count=%lu token=%s driver=%s strict_fallback=%s",
+            "query_kernel_modules dependency_blocked reason=all_image_bases_zero fallback_status=rejected fallback_reason=%s primary_count=%lu fallback_raw=%lu fallback_named=%zu fallback_name_query_failed=%zu fallback_duplicate=%zu fallback_unmatched_psapi=%zu token=%s driver=%s strict_fallback=%s",
             diag_ref.fallback_reason.c_str(),
             static_cast<unsigned long>(diag_ref.count),
+            static_cast<unsigned long>(diag_ref.fallback_raw_count),
+            diag_ref.fallback_named_count,
+            diag_ref.fallback_name_query_failed_count,
+            diag_ref.fallback_duplicate_name_count,
+            diag_ref.fallback_unmatched_psapi_count,
             token_json.c_str(),
             driver_json.c_str(),
             diag_ref.strict_fallback.c_str());
@@ -4995,14 +5015,21 @@ static bool apply_readonly_kernel_module_base_fallback(
     std::vector<std::uint64_t> resolved_bases(diag_ref.count, 0);
     std::vector<std::string> missing_samples;
     missing_samples.reserve(8);
+    std::unordered_map<std::string, ULONG> primary_name_counts;
+    primary_name_counts.reserve(diag_ref.count);
     for (ULONG i = 0; i < diag_ref.count; ++i)
     {
         const std::string name = bounded_kernel_module_name(info->Modules[i]);
         const std::string key = to_lower_ascii_copy(name);
+        if (!key.empty())
+            ++primary_name_counts[key];
+        else
+            ++diag_ref.fallback_missing_count;
         const auto it = fallback.bases_by_name.find(key);
         if (it == fallback.bases_by_name.end() || !is_page_aligned_kernel_base(it->second))
         {
-            ++diag_ref.fallback_missing_count;
+            if (!key.empty())
+                ++diag_ref.fallback_missing_count;
             if (missing_samples.size() < 8)
                 missing_samples.push_back(name.empty() ? std::string("<empty>") : name);
             continue;
@@ -5011,12 +5038,25 @@ static bool apply_readonly_kernel_module_base_fallback(
         ++diag_ref.fallback_match_count;
     }
 
-    if (diag_ref.fallback_match_count != diag_ref.count || diag_ref.fallback_missing_count != 0)
+    std::size_t ambiguous_primary_count = 0;
+    for (const auto& kv : primary_name_counts)
+    {
+        if (kv.second > 1)
+            ambiguous_primary_count += kv.second;
+    }
+    diag_ref.fallback_unmatched_primary_count = diag_ref.fallback_missing_count;
+    diag_ref.fallback_unmatched_psapi_count = fallback.rejected_count;
+
+    if (diag_ref.fallback_match_count != diag_ref.count ||
+        diag_ref.fallback_missing_count != 0 ||
+        ambiguous_primary_count != 0)
     {
         diag_ref.dependency_blocked = true;
         diag_ref.token = current_process_token_diagnostics();
         diag_ref.fallback_status = "rejected";
-        diag_ref.fallback_reason = "EnumDeviceDrivers_did_not_match_every_SystemModuleInformation_entry";
+        diag_ref.fallback_reason = ambiguous_primary_count != 0
+            ? "EnumDeviceDrivers_ambiguous_primary_module_names"
+            : "EnumDeviceDrivers_did_not_match_every_SystemModuleInformation_entry";
         const std::string missing = module_sample_text(missing_samples);
         const std::string token_json = diag_ref.token.dump();
         const std::string driver_json = diag_ref.driver.dump();
@@ -5026,15 +5066,24 @@ static bool apply_readonly_kernel_module_base_fallback(
             (missing.empty() ? std::string("<none>") : missing) +
             OBFSTR(" strict_fallback=") + diag_ref.strict_fallback;
         diag::log_tagged_fmt("drv_tools",
-            "query_kernel_modules dependency_blocked reason=all_image_bases_zero fallback_status=rejected fallback_reason=%s count=%lu match_count=%zu missing_count=%zu missing=%s token=%s driver=%s strict_fallback=%s",
+            "query_kernel_modules dependency_blocked reason=all_image_bases_zero fallback_status=rejected fallback_reason=%s primary_count=%lu primary_zero=%zu primary_nonzero=%zu fallback_raw=%lu fallback_named=%zu fallback_name_query_failed=%zu fallback_duplicate=%zu match_count=%zu unmatched_primary=%zu unmatched_psapi=%zu ambiguous_primary=%zu missing=%s token=%s driver=%s strict_fallback=%s base_source=%s",
             diag_ref.fallback_reason.c_str(),
             static_cast<unsigned long>(diag_ref.count),
+            diag_ref.zero_base_count,
+            diag_ref.nonzero_base_count,
+            static_cast<unsigned long>(diag_ref.fallback_raw_count),
+            diag_ref.fallback_named_count,
+            diag_ref.fallback_name_query_failed_count,
+            diag_ref.fallback_duplicate_name_count,
             diag_ref.fallback_match_count,
-            diag_ref.fallback_missing_count,
+            diag_ref.fallback_unmatched_primary_count,
+            diag_ref.fallback_unmatched_psapi_count,
+            ambiguous_primary_count,
             missing.empty() ? "<none>" : missing.c_str(),
             token_json.c_str(),
             driver_json.c_str(),
-            diag_ref.strict_fallback.c_str());
+            diag_ref.strict_fallback.c_str(),
+            diag_ref.base_source.c_str());
         return false;
     }
 
@@ -5057,11 +5106,21 @@ static bool apply_readonly_kernel_module_base_fallback(
     diag_ref.base_source = "EnumDeviceDrivers";
     const std::string fallback_samples = module_sample_text(diag_ref.fallback_samples);
     diag::log_tagged_fmt("drv_tools",
-        "query_kernel_modules fallback_selected source=EnumDeviceDrivers count=%lu match_count=%zu resolved_zero=%zu resolved_nonzero=%zu primary_samples=%s fallback_samples=%s",
+        "query_kernel_modules fallback_selected source=EnumDeviceDrivers primary_count=%lu primary_zero=%zu primary_nonzero=%zu fallback_raw=%lu fallback_named=%zu fallback_name_query_failed=%zu fallback_duplicate=%zu match_count=%zu unmatched_primary=%zu unmatched_psapi=%zu resolved_zero=%zu resolved_nonzero=%zu fallback_status=%s fallback_reason=%s primary_samples=%s fallback_samples=%s",
         static_cast<unsigned long>(diag_ref.count),
+        diag_ref.zero_base_count,
+        diag_ref.nonzero_base_count,
+        static_cast<unsigned long>(diag_ref.fallback_raw_count),
+        diag_ref.fallback_named_count,
+        diag_ref.fallback_name_query_failed_count,
+        diag_ref.fallback_duplicate_name_count,
         diag_ref.fallback_match_count,
+        diag_ref.fallback_unmatched_primary_count,
+        diag_ref.fallback_unmatched_psapi_count,
         diag_ref.resolved_zero_base_count,
         diag_ref.resolved_nonzero_base_count,
+        diag_ref.fallback_status.c_str(),
+        diag_ref.fallback_reason.c_str(),
         primary_samples.empty() ? "<none>" : primary_samples.c_str(),
         fallback_samples.empty() ? "<none>" : fallback_samples.c_str());
     return true;
@@ -5079,6 +5138,9 @@ static json kernel_module_query_diagnostics_json(const kernel_module_query_diagn
     out["abi_min_size"] = diag.abi_min_size;
     out["zero_base_count"] = diag.zero_base_count;
     out["nonzero_base_count"] = diag.nonzero_base_count;
+    out["primary_count"] = diag.count;
+    out["primary_zero_bases"] = diag.zero_base_count;
+    out["primary_nonzero_bases"] = diag.nonzero_base_count;
     out["resolved_zero_base_count"] = diag.resolved_zero_base_count;
     out["resolved_nonzero_base_count"] = diag.resolved_nonzero_base_count;
     out["all_image_bases_zero"] = diag.all_image_bases_zero;
@@ -5095,12 +5157,16 @@ static json kernel_module_query_diagnostics_json(const kernel_module_query_diagn
     out["fallback_win32_error"] = static_cast<unsigned long>(diag.fallback_win32_error);
     out["fallback_bytes_returned"] = diag.fallback_bytes_returned;
     out["fallback_raw_count"] = diag.fallback_raw_count;
+    out["fallback_named_count"] = diag.fallback_named_count;
     out["fallback_accepted_count"] = diag.fallback_accepted_count;
     out["fallback_rejected_count"] = diag.fallback_rejected_count;
     out["fallback_name_query_failed_count"] = diag.fallback_name_query_failed_count;
+    out["fallback_name_query_failed"] = diag.fallback_name_query_failed_count;
     out["fallback_duplicate_name_count"] = diag.fallback_duplicate_name_count;
     out["fallback_match_count"] = diag.fallback_match_count;
     out["fallback_missing_count"] = diag.fallback_missing_count;
+    out["fallback_unmatched_primary_count"] = diag.fallback_unmatched_primary_count;
+    out["fallback_unmatched_psapi_count"] = diag.fallback_unmatched_psapi_count;
     out["fallback_sample_modules"] = diag.fallback_samples;
     out["token"] = diag.token;
     out["driver"] = diag.driver;

@@ -34,6 +34,8 @@ For serious crash, hang, Test Lab, MCP startup, Runtime Integrity Lock, anti-tam
 
 **YOU MUST IMPLEMENT THE 100% working, production-grade, state-of-the-art, and ready for direct implementations. Implementations must not cause build errors or warnings. DO NOT ADD STUBS, PLACEHOLDERS, TODOs, or code comments. Everything must be functional and follow best practices. Explain why the change is recommended and justify it with information from the provided source code.**
 
+**COMPLETELY REMOVE DEAD CODE FROM THE SOURCE CODE ENTIRELY.** Do not leave unused functions, constants, includes, libraries, branches, compatibility shims, retired-path labels, or stale tests after a replacement or removal. If code must remain for live migration, ABI, protocol, security, or backward compatibility, it must be actively exercised and named as current behavior rather than treated as dead or retired code.
+
 **ALWAYS BUILD THE PROJECT AFTER APPLYING CODE CHANGES.** After code edits, run the build to confirm zero errors and zero new warnings before reporting the task complete.
 
 **ALWAYS PERFORM A VERIFICATION LOOP: Plan -> Execute -> Verify -> Report.**

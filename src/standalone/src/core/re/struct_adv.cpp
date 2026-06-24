@@ -20,6 +20,61 @@ namespace re::struct_adv
 {
 namespace
 {
+std::uint64_t deadline_remaining_ms()
+{
+    const std::uint64_t deadline = mcp_standalone::current_call_deadline_ms();
+    if (deadline == 0)
+        return 0;
+    const std::uint64_t now = GetTickCount64();
+    return deadline > now ? deadline - now : 0;
+}
+
+bool struct_call_cancelled(const char* phase, std::uint32_t pid, std::uint64_t started_ms, bool& deadline_hit, bool& cancelled)
+{
+    if (mcp_standalone::current_call_cancelled())
+    {
+        cancelled = true;
+        diag::log_tagged_fmt("struct_adv", "cancelled phase=%s pid=%u elapsed_ms=%llu diag_id=%s",
+                             phase ? phase : "",
+                             pid,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms),
+                             mcp_standalone::current_call_diag_id());
+        return true;
+    }
+    const std::uint64_t deadline = mcp_standalone::current_call_deadline_ms();
+    if (deadline != 0 && GetTickCount64() >= deadline)
+    {
+        deadline_hit = true;
+        diag::log_tagged_fmt("struct_adv", "deadline_reached phase=%s pid=%u elapsed_ms=%llu diag_id=%s",
+                             phase ? phase : "",
+                             pid,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms),
+                             mcp_standalone::current_call_diag_id());
+        return true;
+    }
+    return false;
+}
+
+json struct_fail_closed_payload(const char* tool, const char* action, std::uint32_t pid, std::uint64_t started_ms, const char* validation_code)
+{
+    return json{{"tool", tool ? tool : ""},
+                {"action", action ? action : ""},
+                {"process_id", pid},
+                {"mutation", "none"},
+                {"fail_closed", true},
+                {"dependency_blocked", true},
+                {"functional_success", false},
+                {"kernel_only_policy", true},
+                {"snapshot_polling_fallback_allowed", false},
+                {"snapshot_saved", false},
+                {"monitor_backend_required", "struct_recon_hwbp_or_page_guard"},
+                {"safe_contract", "fail_closed_without_completed_struct_monitor"},
+                {"validation_code", validation_code ? validation_code : ""},
+                {"elapsed_ms", GetTickCount64() - started_ms},
+                {"deadline_remaining_ms", deadline_remaining_ms()},
+                {"diag_id", mcp_standalone::current_call_diag_id()}};
+}
+
 json field_json(const struct_recon::struct_field_t& field)
 {
     json out;
@@ -276,7 +331,12 @@ tool_result_t observe(const json& params)
 {
     const std::uint64_t started_ms = GetTickCount64();
     if (!unsafe_confirmed(params))
-        return unsafe_required("struct_observe");
+    {
+        json guard = struct_fail_closed_payload("struct_observe", "observe", 0, started_ms, "confirm_unsafe_required");
+        guard["confirm_unsafe_required"] = true;
+        guard["confirm_unsafe_received"] = unsafe_confirmed(params);
+        return tool_result_t::error("struct_observe requires confirm_unsafe=true or allow_unsafe=true.", guard);
+    }
     active_process_scope_t scope(params);
     if (!scope.ok())
         return tool_result_t::error(scope.error());
@@ -310,8 +370,26 @@ tool_result_t observe(const json& params)
                          static_cast<unsigned long long>(GetTickCount64() - started_ms));
     struct_recon::monitor_with_hwbp(base, size, "observed_struct");
     const auto wait_start = GetTickCount64();
+    bool deadline_hit = false;
+    bool cancelled = false;
+    std::string stop_phase;
     while (struct_recon::g_state.monitoring.load() && GetTickCount64() - wait_start < wait_budget_ms)
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    {
+        if (struct_call_cancelled("observe_wait_monitor", scope.pid(), started_ms, deadline_hit, cancelled))
+        {
+            stop_phase = cancelled ? "cancelled" : "deadline";
+            break;
+        }
+        const std::uint64_t remaining = deadline_remaining_ms();
+        const std::uint64_t sleep_ms = remaining == 0 ? 50 : std::min<std::uint64_t>(50, remaining);
+        if (sleep_ms == 0)
+        {
+            deadline_hit = true;
+            stop_phase = "deadline";
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+    }
     const bool monitor_complete = !struct_recon::g_state.monitoring.load();
     if (!monitor_complete)
     {
@@ -323,6 +401,30 @@ tool_result_t observe(const json& params)
                              static_cast<unsigned long long>(GetTickCount64() - wait_start),
                              static_cast<unsigned long long>(wait_budget_ms),
                              static_cast<double>(struct_recon::g_state.progress.load()));
+        json out = struct_fail_closed_payload("struct_observe", "observe", scope.pid(), started_ms,
+            cancelled ? "monitor_cancelled" : (deadline_hit ? "monitor_deadline_reached" : "monitor_timeout_reached"));
+        out["base_va"] = sa_format_address(base);
+        out["size"] = size;
+        out["duration_sec"] = duration_sec;
+        out["wait_budget_ms"] = wait_budget_ms;
+        out["wait_elapsed_ms"] = GetTickCount64() - wait_start;
+        out["deadline_hit"] = deadline_hit || (!cancelled && GetTickCount64() - wait_start >= wait_budget_ms);
+        out["cancelled"] = cancelled;
+        out["partial"] = true;
+        out["phase"] = stop_phase.empty() ? "monitor_wait_timeout" : stop_phase;
+        out["monitor_session"] = {
+            {"base_va", sa_format_address(base)},
+            {"size", size},
+            {"duration_sec", duration_sec},
+            {"sample_count", std::max(1, duration_sec * 20)},
+            {"wait_budget_ms", wait_budget_ms},
+            {"monitor_complete", false},
+            {"progress", static_cast<double>(struct_recon::g_state.progress.load())},
+            {"cancelled", true},
+            {"monitor_active_after", struct_recon::g_state.monitoring.load()},
+            {"cleanup_requested", true}
+        };
+        return tool_result_t::error("Struct observation monitor did not complete; no snapshot fallback was used.", out);
     }
     else
     {
@@ -392,6 +494,15 @@ tool_result_t observe(const json& params)
     result["wait_budget_ms"] = wait_budget_ms;
     result["elapsed_ms"] = GetTickCount64() - started_ms;
     result["monitor_complete"] = monitor_complete;
+    result["deadline_hit"] = deadline_hit;
+    result["cancelled"] = cancelled;
+    result["partial"] = false;
+    result["kernel_only_policy"] = true;
+    result["snapshot_polling_fallback_allowed"] = false;
+    result["monitor_backend"] = "struct_recon_hwbp_or_page_guard";
+    result["snapshot_role"] = "post_observation_artifact_not_polling_fallback";
+    result["fail_closed"] = false;
+    result["dependency_blocked"] = false;
     result["inferred_fields"] = std::move(fields);
     result["field_count"] = result["inferred_fields"].size();
     result["access_evidence_count"] = access_count;
@@ -931,13 +1042,24 @@ tool_result_t array_detect(const json& params)
 tool_result_t compare_snapshots(const json& params)
 {
     const auto started = std::chrono::steady_clock::now();
+    const std::uint64_t started_ms = GetTickCount64();
     const std::string a_id = string_param(params, "snapshot_a_id");
     const std::string b_id = string_param(params, "snapshot_b_id");
     if (a_id.empty() || b_id.empty())
-        return tool_result_t::error("'snapshot_a_id' and 'snapshot_b_id' are required.");
+    {
+        json out = struct_fail_closed_payload("struct_compare_snapshots", "compare", 0, started_ms, "snapshot_ids_required");
+        out["snapshot_a_id"] = a_id;
+        out["snapshot_b_id"] = b_id;
+        return tool_result_t::error("'snapshot_a_id' and 'snapshot_b_id' are required.", out);
+    }
     std::uint64_t base = 0;
     if (!parse_address_param(params, "base_va", base) || base == 0)
-        return tool_result_t::error("'base_va' is required.");
+    {
+        json out = struct_fail_closed_payload("struct_compare_snapshots", "compare", 0, started_ms, "base_va_required");
+        out["snapshot_a_id"] = a_id;
+        out["snapshot_b_id"] = b_id;
+        return tool_result_t::error("'base_va' is required.", out);
+    }
     const std::uint64_t struct_size = numeric_param(params, "struct_size", 512, 1, 65536);
 
     std::vector<std::uint8_t> a_bytes;
@@ -973,7 +1095,18 @@ tool_result_t compare_snapshots(const json& params)
         }
     }
     if (!found)
-        return tool_result_t::error("Snapshots not found in RE artifact snapshots or scanner snapshot_diff store.");
+    {
+        json out = struct_fail_closed_payload("struct_compare_snapshots", "compare", 0, started_ms, "snapshot_pair_not_found");
+        out["snapshot_a_id"] = a_id;
+        out["snapshot_b_id"] = b_id;
+        out["base_va"] = sa_format_address(base);
+        out["struct_size"] = struct_size;
+        out["artifact_snapshot_a_found"] = store::find_memory_snapshot(a_id, a_mem);
+        out["artifact_snapshot_b_found"] = store::find_memory_snapshot(b_id, b_mem);
+        out["scanner_snapshot_fallback_checked"] = true;
+        out["comparison_backend"] = "artifact_snapshot_compare_or_existing_scanner_snapshot_compare";
+        return tool_result_t::error("Snapshots not found in RE artifact snapshots or scanner snapshot_diff store.", out);
+    }
 
     json changes = json::array();
     std::size_t total_changed_bytes = 0;
@@ -1090,6 +1223,10 @@ tool_result_t compare_snapshots(const json& params)
     result["struct_size"] = struct_size;
     result["bytes_compared"] = std::min(a_bytes.size(), b_bytes.size());
     result["snapshot_source"] = snapshot_source;
+    result["comparison_backend"] = snapshot_source == "artifact_store" ? "artifact_snapshot_compare" : "existing_scanner_snapshot_compare";
+    result["snapshot_polling_fallback_allowed"] = false;
+    result["fail_closed"] = false;
+    result["dependency_blocked"] = false;
     result["changes"] = std::move(changes);
     result["change_count"] = result["changes"].size();
     result["change_rows_truncated"] = change_rows_truncated;

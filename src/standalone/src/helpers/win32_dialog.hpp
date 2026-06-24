@@ -1001,6 +1001,7 @@ inline bool show_open_file_dialog_ex(HWND owner,
 	size_t out_path_capacity,
 	const char* caller_name)
 {
+	(void)owner;
 	if (!out_path || out_path_capacity < 2) {
 		diag::log_tagged_fmt("dialog",
 			"%s open invalid out_path buf=%p cap=%zu",
@@ -1018,42 +1019,33 @@ inline bool show_open_file_dialog_ex(HWND owner,
 	}
 
 	diag::log_tagged_fmt("dialog",
-		"%s open_direct begin tid=%lu gui=%d",
+		"%s open_broker begin tid=%lu gui=%d",
 		caller_name ? caller_name : "win32_dialog",
 		static_cast<unsigned long>(GetCurrentThreadId()),
 		IsGUIThread(FALSE) ? 1 : 0);
 	std::wstring title_w = detail::utf16_from_utf8(title);
 	std::wstring initial_dir_w = detail::utf16_from_utf8(initial_dir);
-	detail::filter_spec_storage filters;
-	if (!detail::build_filter_specs_from_a(filter_pairs, filters, caller_name, "open_direct")) {
-		diag::log_tagged_fmt("dialog",
-			"%s open_direct filter build failed",
-			caller_name ? caller_name : "win32_dialog");
-		return false;
-	}
-	std::wstring result_w;
-	if (!detail::show_file_open_dialog_wide(
-			owner,
+	std::string selected_path;
+	if (!detail::show_open_file_dialog_broker(
 			title_w.empty() ? L"Open File" : title_w.c_str(),
+			detail::filter_pairs_to_winforms(filter_pairs),
 			initial_dir_w.empty() ? nullptr : initial_dir_w.c_str(),
-			filters,
-			result_w,
+			selected_path,
 			caller_name,
-			"open_direct")) {
+			"open_broker")) {
 		return false;
 	}
-	std::string result = detail::utf8_from_utf16(result_w.c_str());
-	if (result.size() >= out_path_capacity) {
+	if (selected_path.size() >= out_path_capacity) {
 		diag::log_tagged_fmt("dialog",
-			"%s open_direct path too long len=%zu cap=%zu",
+			"%s open_broker path too long len=%zu cap=%zu",
 			caller_name ? caller_name : "win32_dialog",
-			result.size(), out_path_capacity);
+			selected_path.size(), out_path_capacity);
 		return false;
 	}
-	std::memcpy(out_path, result.c_str(), result.size() + 1);
+	std::memcpy(out_path, selected_path.c_str(), selected_path.size() + 1);
 
 	diag::log_tagged_fmt("dialog",
-		"%s open_direct copied path='%.260s'",
+		"%s open_broker copied path='%.260s'",
 		caller_name ? caller_name : "win32_dialog",
 		out_path);
 	return true;
@@ -1146,6 +1138,7 @@ inline bool show_open_file_dialog_w(HWND owner,
 	size_t out_path_capacity_w_chars,
 	const char* caller_name)
 {
+	(void)owner;
 	if (!out_path_w || out_path_capacity_w_chars < 2 || !filter_pairs_w) {
 		diag::log_tagged_fmt("dialog",
 			"%s open_w invalid args buf=%p cap=%zu filter=%p",
@@ -1157,31 +1150,24 @@ inline bool show_open_file_dialog_w(HWND owner,
 	out_path_w[0] = L'\0';
 
 	diag::log_tagged_fmt("dialog",
-		"%s open_w_direct begin tid=%lu gui=%d",
+		"%s open_w_broker begin tid=%lu gui=%d",
 		caller_name ? caller_name : "win32_dialog",
 		static_cast<unsigned long>(GetCurrentThreadId()),
 		IsGUIThread(FALSE) ? 1 : 0);
-	detail::filter_spec_storage filters;
-	if (!detail::build_filter_specs_from_w(filter_pairs_w, filters, caller_name, "open_w_direct")) {
-		diag::log_tagged_fmt("dialog",
-			"%s open_w_direct filter build failed",
-			caller_name ? caller_name : "win32_dialog");
-		return false;
-	}
-	std::wstring result_w;
-	if (!detail::show_file_open_dialog_wide(
-			owner,
+	std::string selected_path;
+	if (!detail::show_open_file_dialog_broker(
 			title && title[0] ? title : L"Open File",
+			detail::filter_pairs_to_winforms(filter_pairs_w),
 			nullptr,
-			filters,
-			result_w,
+			selected_path,
 			caller_name,
-			"open_w_direct")) {
+			"open_w_broker")) {
 		return false;
 	}
+	std::wstring result_w = detail::utf16_from_utf8(selected_path.c_str());
 	if (result_w.empty() || result_w.size() >= out_path_capacity_w_chars) {
 		diag::log_tagged_fmt("dialog",
-			"%s open_w_direct path invalid len=%zu cap=%zu",
+			"%s open_w_broker path invalid len=%zu cap=%zu",
 			caller_name ? caller_name : "win32_dialog",
 			result_w.size(), out_path_capacity_w_chars);
 		return false;
@@ -1189,7 +1175,7 @@ inline bool show_open_file_dialog_w(HWND owner,
 	std::memcpy(out_path_w, result_w.c_str(), (result_w.size() + 1) * sizeof(wchar_t));
 
 	diag::log_tagged_fmt("dialog",
-		"%s open_w_direct copied",
+		"%s open_w_broker copied",
 		caller_name ? caller_name : "win32_dialog");
 	return true;
 }
@@ -1200,23 +1186,23 @@ inline bool show_open_folder_dialog_ex(HWND owner,
 	std::string& out_path,
 	const char* caller_name)
 {
+	(void)owner;
 	out_path.clear();
 
 	diag::log_tagged_fmt("dialog",
-		"%s folder_direct begin tid=%lu gui=%d",
+		"%s folder_broker begin tid=%lu gui=%d",
 		caller_name ? caller_name : "win32_dialog",
 		static_cast<unsigned long>(GetCurrentThreadId()),
 		IsGUIThread(FALSE) ? 1 : 0);
-	std::wstring result_w;
-	bool ok = detail::show_folder_dialog_wide(
-		owner,
+	std::string selected_path;
+	bool ok = detail::show_open_folder_dialog_broker(
 		title && title[0] ? title : L"Open Folder",
 		initial_folder_w,
-		result_w,
+		selected_path,
 		caller_name,
-		"folder_direct");
+		"folder_broker");
 	if (ok)
-		out_path = detail::utf8_from_utf16(result_w.c_str());
+		out_path = selected_path;
 	return ok && !out_path.empty();
 }
 

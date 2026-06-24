@@ -7,26 +7,18 @@
 #define NOMINMAX
 #endif
 
-#include <winsock2.h>
-#include <ws2tcpip.h>
 #include <windows.h>
 #include <wincrypt.h>
-#include <iphlpapi.h>
-#include <ntddndis.h>
 #include <winioctl.h>
 #include <intrin.h>
 #include <tbs.h>
 
-#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <cstdio>
-#include <utility>
 #include <vector>
 
 #pragma comment(lib, "advapi32.lib")
-#pragma comment(lib, "iphlpapi.lib")
-#pragma comment(lib, "ws2_32.lib")
 
 namespace aida::hardware_id::v2
 {
@@ -152,18 +144,6 @@ namespace aida::hardware_id::v2
                 reordered[8], reordered[9], reordered[10], reordered[11],
                 reordered[12], reordered[13], reordered[14], reordered[15]);
             return std::string(buf);
-        }
-
-        std::string normalize_mac(const std::uint8_t mac[6]) noexcept
-        {
-            static const char* digits = "0123456789ABCDEF";
-            char buf[13];
-            for (int i = 0; i < 6; ++i) {
-                buf[i * 2]     = digits[(mac[i] >> 4) & 0xF];
-                buf[i * 2 + 1] = digits[mac[i] & 0xF];
-            }
-            buf[12] = 0;
-            return std::string(buf, 12);
         }
 
         std::vector<std::uint8_t> read_smbios_table() noexcept
@@ -327,101 +307,6 @@ namespace aida::hardware_id::v2
             std::string normalized = normalize_serial_factor(serial);
             if (normalized.empty()) return false;
             out.assign(normalized.begin(), normalized.end());
-            return true;
-        }
-
-        struct mac_candidate_t
-        {
-            std::string value;
-            bool permanent = false;
-        };
-
-        bool usable_mac(const std::uint8_t mac[6]) noexcept
-        {
-            bool all_zero = true;
-            bool all_ff = true;
-            for (int i = 0; i < 6; ++i) {
-                if (mac[i] != 0x00) all_zero = false;
-                if (mac[i] != 0xFF) all_ff = false;
-            }
-            return !all_zero && !all_ff;
-        }
-
-        void add_mac_candidate(std::vector<mac_candidate_t>& candidates,
-                               const std::uint8_t mac[6],
-                               bool permanent)
-        {
-            if (!usable_mac(mac)) return;
-            mac_candidate_t c;
-            c.value = normalize_mac(mac);
-            c.permanent = permanent;
-            candidates.push_back(std::move(c));
-        }
-
-        bool collect_permanent_mac(std::vector<std::uint8_t>& out) noexcept
-        {
-            ULONG sz = 0;
-            GetAdaptersAddresses(AF_UNSPEC,
-                                 GAA_FLAG_SKIP_ANYCAST |
-                                 GAA_FLAG_SKIP_MULTICAST |
-                                 GAA_FLAG_SKIP_DNS_SERVER,
-                                 nullptr, nullptr, &sz);
-            if (sz == 0) return false;
-            std::vector<std::uint8_t> buf(sz);
-            auto* adapters = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data());
-            ULONG got_sz = sz;
-            if (GetAdaptersAddresses(AF_UNSPEC,
-                                     GAA_FLAG_SKIP_ANYCAST |
-                                     GAA_FLAG_SKIP_MULTICAST |
-                                     GAA_FLAG_SKIP_DNS_SERVER,
-                                     nullptr, adapters, &got_sz) != NO_ERROR) {
-                return false;
-            }
-            std::vector<mac_candidate_t> candidates;
-            for (auto* a = adapters; a; a = a->Next) {
-                if (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
-                if (a->IfType == IF_TYPE_TUNNEL) continue;
-                if (a->OperStatus != IfOperStatusUp &&
-                    a->OperStatus != IfOperStatusDormant &&
-                    a->OperStatus != IfOperStatusDown) continue;
-                if (a->PhysicalAddressLength < 6) continue;
-                if (a->AdapterName == nullptr) continue;
-                std::string device_name = std::string("\\\\.\\") + a->AdapterName;
-                HANDLE h = CreateFileA(device_name.c_str(),
-                                       0,
-                                       FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                       nullptr, OPEN_EXISTING, 0, nullptr);
-                if (h != INVALID_HANDLE_VALUE) {
-                    NDIS_OID oid = OID_802_3_PERMANENT_ADDRESS;
-                    std::uint8_t mac[8]{};
-                    DWORD returned = 0;
-                    BOOL ok = DeviceIoControl(h,
-                                              IOCTL_NDIS_QUERY_GLOBAL_STATS,
-                                              &oid, sizeof(oid),
-                                              mac, sizeof(mac),
-                                              &returned, nullptr);
-                    CloseHandle(h);
-                    if (ok && returned >= 6) {
-                        add_mac_candidate(candidates, mac, true);
-                    }
-                }
-                std::uint8_t mac2[6];
-                std::memcpy(mac2, a->PhysicalAddress, 6);
-                add_mac_candidate(candidates, mac2, false);
-            }
-            if (candidates.empty()) return false;
-            std::sort(candidates.begin(), candidates.end(),
-                      [](const mac_candidate_t& a, const mac_candidate_t& b) {
-                          if (a.permanent != b.permanent) return a.permanent && !b.permanent;
-                          return a.value < b.value;
-                      });
-            auto last = std::unique(candidates.begin(), candidates.end(),
-                                    [](const mac_candidate_t& a, const mac_candidate_t& b) {
-                                        return a.permanent == b.permanent && a.value == b.value;
-                                    });
-            candidates.erase(last, candidates.end());
-            const std::string& selected = candidates.front().value;
-            out.assign(selected.begin(), selected.end());
             return true;
         }
 
@@ -765,7 +650,6 @@ namespace aida::hardware_id::v2
         bool ok2 = collect_smbios_string_factor(2, 0x07, out.factors[1].bytes);
         bool ok3 = collect_smbios_string_factor(3, 0x07, out.factors[2].bytes);
         bool ok4 = collect_disk_serial(out.factors[3].bytes);
-        bool ok5 = collect_permanent_mac(out.factors[4].bytes);
         bool ok6 = collect_cpuid_brand(out.factors[5].bytes);
         bool ok7 = collect_machine_guid(out.factors[6].bytes);
         bool ok8 = collect_installation_guid(out.factors[7].bytes);
@@ -789,7 +673,6 @@ namespace aida::hardware_id::v2
         if (ok2) ++collected_count;
         if (ok3) ++collected_count;
         if (ok4) ++collected_count;
-        if (ok5) ++collected_count;
         if (ok6) ++collected_count;
         if (ok7) ++collected_count;
         if (ok8) ++collected_count;

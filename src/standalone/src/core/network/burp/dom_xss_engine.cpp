@@ -41,6 +41,7 @@ namespace {
 
 std::mutex&   err_mtx()   { static std::mutex m; return m; }
 std::string&  err_slot()  { static std::string s; return s; }
+nlohmann::json& new_page_diag_slot() { static nlohmann::json j = nlohmann::json::object(); return j; }
 
 void set_err(const std::string& msg)
 {
@@ -53,6 +54,7 @@ void clear_err()
 {
     std::lock_guard<std::mutex> lk(err_mtx());
     err_slot().clear();
+    new_page_diag_slot() = nlohmann::json::object();
 }
 
 std::string current_err()
@@ -81,6 +83,7 @@ std::recursive_mutex&  browser_global_mtx() { static std::recursive_mutex m; ret
 constexpr uint64_t kVisibleBrowserRelaunchBudgetMs = 70000;
 
 std::string json_shape_local(const nlohmann::json& j);
+std::string trim_payload(const std::string& s, size_t max_chars);
 constexpr const char* kConsoleCanaryPrefix = "AIDA_DOM_XSS_CANARY:";
 
 std::string bytes_to_hex(const uint8_t* b, size_t n)
@@ -146,10 +149,63 @@ std::string make_dom_page_id(const char* phase, const sentinel_t& s)
     return out;
 }
 
+nlohmann::json bridge_status_diag_json(const camoufox::bridge_status_t& st)
+{
+    nlohmann::json out = {
+        {"session_id", st.session_id},
+        {"active_session_id", st.active_session_id},
+        {"state", static_cast<int>(st.state)},
+        {"generation", st.generation},
+        {"child_pid", st.child_pid},
+        {"child_alive", st.child_alive},
+        {"browser_open", st.browser_open},
+        {"page_verified", st.page_verified},
+        {"page_count", st.page_count},
+        {"active_page_id", st.active_page_id},
+        {"cleanup_pending", st.cleanup_pending},
+        {"cleanup_generation", st.cleanup_generation},
+        {"cleanup_child_pid", st.cleanup_child_pid},
+        {"cleanup_reason", st.cleanup_reason},
+        {"last_error", st.last_error}
+    };
+    if (st.last_launch_diagnostics.is_object())
+        out["last_launch_diagnostics"] = st.last_launch_diagnostics;
+    if (st.cleanup_diagnostics.is_object())
+        out["cleanup_diagnostics"] = st.cleanup_diagnostics;
+    return out;
+}
+
+nlohmann::json last_debug_event_from_status(const camoufox::bridge_status_t& st)
+{
+    if (!st.last_launch_diagnostics.is_object())
+        return nlohmann::json::object();
+    auto it = st.last_launch_diagnostics.find("last_debug_event");
+    if (it != st.last_launch_diagnostics.end() && it->is_object())
+        return *it;
+    return nlohmann::json::object();
+}
+
+std::string json_string_or_local(const nlohmann::json& j, const char* key)
+{
+    if (!j.is_object() || !key)
+        return {};
+    auto it = j.find(key);
+    return it != j.end() && it->is_string() ? it->get<std::string>() : std::string();
+}
+
+void set_new_page_diag(const nlohmann::json& diag)
+{
+    std::lock_guard<std::mutex> lk(err_mtx());
+    new_page_diag_slot() = diag.is_object() ? diag : nlohmann::json::object();
+}
+
 struct browser_page_scope_t
 {
     std::string page_id;
     std::string previous_page_id;
+    std::string requested_page_id;
+    std::string failure_error;
+    nlohmann::json failure_diag = nlohmann::json::object();
     bool created = false;
 
     browser_page_scope_t(const char* phase, const sentinel_t& s)
@@ -164,7 +220,9 @@ struct browser_page_scope_t
             previous_page_id.clear();
         }
         const std::string requested = make_dom_page_id(phase, s);
+        requested_page_id = requested;
         camoufox::call_result_t r;
+        const uint64_t new_page_start_ms = now_ms_steady();
         try {
             r = camoufox::new_page("default", requested, "about:blank", false);
         } catch (...) {
@@ -187,10 +245,47 @@ struct browser_page_scope_t
                 after_status_ok ? 1 : 0, after_status.active_page_id.c_str(), static_cast<unsigned>(after_status.page_count),
                 json_shape_local(r.data).c_str());
         } else {
-            diag::log_tagged_fmt("dom_xss", "page_scope_create_failed phase=%s requested_page_id=%s make_active=0 previous_page_id=%s before_ok=%d before_active=%s before_pages=%u err=%s data_shape=%s",
+            camoufox::bridge_status_t after_status;
+            bool after_status_ok = false;
+            try {
+                after_status = camoufox::get_status();
+                after_status_ok = true;
+            } catch (...) {
+            }
+            const std::string data_tail = r.data.is_discarded() ? std::string() : trim_payload(r.data.dump(), 1600);
+            const std::string text_tail = trim_payload(r.text, 1600);
+            const nlohmann::json last_event = after_status_ok ? last_debug_event_from_status(after_status) : nlohmann::json::object();
+            failure_diag = {
+                {"phase", phase ? phase : ""},
+                {"target_url", "about:blank"},
+                {"requested_page_id", requested},
+                {"make_active", false},
+                {"elapsed_ms", now_ms_steady() - new_page_start_ms},
+                {"bridge_status_before_ok", before_status_ok},
+                {"bridge_status_before", before_status_ok ? bridge_status_diag_json(before_status) : nlohmann::json::object()},
+                {"bridge_status_after_ok", after_status_ok},
+                {"bridge_status_after", after_status_ok ? bridge_status_diag_json(after_status) : nlohmann::json::object()},
+                {"call_result_ok", r.ok},
+                {"call_result_error", r.error},
+                {"call_result_text_tail", text_tail},
+                {"call_result_data_shape", json_shape_local(r.data)},
+                {"call_result_data_tail", data_tail},
+                {"call_result_data", r.data.is_object() ? r.data : nlohmann::json::object()},
+                {"last_camoufox_debug_event", last_event},
+                {"last_camoufox_debug_event_name", json_string_or_local(last_event, "event")}
+            };
+            failure_error = std::string("new_page failed requested_page_id=") + requested +
+                            " call_error=" + trim_payload(r.error, 600) +
+                            " call_text_tail=" + trim_payload(r.text, 600);
+            set_new_page_diag(failure_diag);
+            set_err(failure_error);
+            diag::log_tagged_fmt("dom_xss", "page_scope_create_failed phase=%s requested_page_id=%s make_active=0 previous_page_id=%s before_ok=%d before_active=%s before_pages=%u after_ok=%d after_active=%s after_pages=%u err=%s data_shape=%s text_tail=%s last_debug_event=%s elapsed_ms=%llu",
                 phase ? phase : "", requested.c_str(), previous_page_id.c_str(),
                 before_status_ok ? 1 : 0, before_status.active_page_id.c_str(), static_cast<unsigned>(before_status.page_count),
-                r.error.c_str(), json_shape_local(r.data).c_str());
+                after_status_ok ? 1 : 0, after_status.active_page_id.c_str(), static_cast<unsigned>(after_status.page_count),
+                r.error.c_str(), json_shape_local(r.data).c_str(), text_tail.c_str(),
+                json_string_or_local(last_event, "event").c_str(),
+                static_cast<unsigned long long>(now_ms_steady() - new_page_start_ms));
         }
     }
 
@@ -275,6 +370,8 @@ bool is_browser_transport_error(const std::string& msg)
            s.find("page has been closed") != std::string::npos ||
            s.find("target closed") != std::string::npos ||
            s.find("page crashed") != std::string::npos ||
+           s.find("new_page failed") != std::string::npos ||
+           s.find("page_creation_timeout") != std::string::npos ||
            s.find("deadline exceeded") != std::string::npos ||
            s.find("add_init_script failed") != std::string::npos ||
            s.find("navigate failed") != std::string::npos ||
@@ -1832,7 +1929,9 @@ fire_result_t fire_payload(const insertion_point_t& ip,
         deadline_ms = absolute_deadline_ms;
     browser_page_scope_t page_scope("fire", s);
     if (!page_scope.ok()) {
-        out.error = "new_page failed";
+        out.error = page_scope.failure_error.empty() ? current_err() : page_scope.failure_error;
+        if (out.error.empty())
+            out.error = "new_page failed";
         set_err(out.error);
         return out;
     }
@@ -2057,8 +2156,15 @@ bool confirm_reflected_in_browser(const std::string&        url,
     const uint64_t deadline_ms = payload_deadline_ms(per_payload_timeout_ms);
     browser_page_scope_t page_scope("confirm", s);
     if (!page_scope.ok()) {
-        set_err("new_page failed");
-        diag::log_tagged_fmt("dom_xss", "confirm_reflected_in_browser new_page_failed url=%s", url.c_str());
+        std::string err = page_scope.failure_error.empty() ? current_err() : page_scope.failure_error;
+        if (err.empty())
+            err = "new_page failed";
+        nlohmann::json diag_payload = page_scope.failure_diag.is_object() ? page_scope.failure_diag : nlohmann::json::object();
+        diag_payload["target_url"] = url;
+        set_new_page_diag(diag_payload);
+        set_err(err);
+        diag::log_tagged_fmt("dom_xss", "confirm_reflected_in_browser new_page_failed url=%s requested_page_id=%s err=%s",
+            url.c_str(), page_scope.requested_page_id.c_str(), err.c_str());
         return false;
     }
     if (!navigate_with_init_script(url, s, per_payload_timeout_ms, deadline_ms, page_scope.page_id)) {
@@ -2100,6 +2206,12 @@ std::string last_error()
     std::string e = err_slot();
     diag::log_tagged_fmt("dom_xss", "last_error queried val=%s", e.c_str());
     return e;
+}
+
+nlohmann::json last_new_page_diagnostics()
+{
+    std::lock_guard<std::mutex> lk(err_mtx());
+    return new_page_diag_slot().is_object() ? new_page_diag_slot() : nlohmann::json::object();
 }
 
 }

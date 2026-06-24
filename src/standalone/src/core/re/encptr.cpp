@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <limits>
 #include <set>
 #include <sstream>
 #include <thread>
@@ -902,11 +903,16 @@ tool_result_t verify_stable(const json& params)
 
     const std::size_t samples = static_cast<std::size_t>(numeric_param(params, "samples", 10, 1, 100));
     const std::uint64_t interval_ms = numeric_param(params, "interval_ms", 500, 0, 10000);
+    const std::uint64_t timeout_ms = numeric_param(params, "timeout_ms", 2500, 100, 30000);
+    const std::uint64_t local_deadline = started_ms > std::numeric_limits<std::uint64_t>::max() - timeout_ms ? std::numeric_limits<std::uint64_t>::max() : started_ms + timeout_ms;
+    const std::uint64_t call_deadline = mcp_standalone::current_call_deadline_ms();
+    const std::uint64_t effective_deadline = call_deadline != 0 ? std::min(call_deadline, local_deadline) : local_deadline;
     diag::log_tagged_fmt("encptr",
-                         "verify_stable enter pid=%u samples=%zu interval_ms=%llu deadline_remaining_ms=%llu diag_id=%s",
+                         "verify_stable enter pid=%u samples=%zu interval_ms=%llu timeout_ms=%llu deadline_remaining_ms=%llu diag_id=%s",
                          scope.pid(),
                          samples,
                          static_cast<unsigned long long>(interval_ms),
+                         static_cast<unsigned long long>(timeout_ms),
                          static_cast<unsigned long long>(deadline_remaining_ms()),
                          mcp_standalone::current_call_diag_id());
     json values = json::array();
@@ -915,14 +921,32 @@ tool_result_t verify_stable(const json& params)
     std::size_t failures = 0;
     bool deadline_hit = false;
     bool cancelled = false;
-    for (std::size_t i = 0; i < samples; ++i)
-    {
-        if (encptr_call_cancelled("verify_stable_sample", scope.pid(), started_ms))
+    std::string stop_phase;
+    auto effective_remaining_ms = [&]() -> std::uint64_t {
+        const std::uint64_t now = GetTickCount64();
+        return effective_deadline > now ? effective_deadline - now : 0;
+    };
+    auto stop_requested = [&](const char* phase) -> bool {
+        if (mcp_standalone::current_call_cancelled())
+        {
+            cancelled = true;
+            stop_phase = phase ? phase : "";
+            encptr_call_cancelled(phase, scope.pid(), started_ms);
+            return true;
+        }
+        if (GetTickCount64() >= effective_deadline)
         {
             deadline_hit = true;
-            cancelled = mcp_standalone::current_call_cancelled();
-            break;
+            stop_phase = phase ? phase : "";
+            encptr_call_cancelled(phase, scope.pid(), started_ms);
+            return true;
         }
+        return false;
+    };
+    for (std::size_t i = 0; i < samples; ++i)
+    {
+        if (stop_requested("verify_stable_sample"))
+            break;
         const auto sample_started = GetTickCount64();
         std::uint64_t value = 0;
         const bool ok = resolve_chain_once(scope.pid(), params["chain"], value);
@@ -953,25 +977,26 @@ tool_result_t verify_stable(const json& params)
                              static_cast<unsigned long long>(deadline_remaining_ms()));
         if (i + 1 < samples && interval_ms != 0)
         {
-            const std::uint64_t remaining = deadline_remaining_ms();
-            if (mcp_standalone::current_call_deadline_ms() != 0 && remaining == 0)
+            if (stop_requested("verify_stable_interval_begin"))
             {
-                deadline_hit = true;
-                cancelled = mcp_standalone::current_call_cancelled();
                 break;
             }
-            const std::uint64_t sleep_ms = mcp_standalone::current_call_deadline_ms() == 0 ? interval_ms : std::min<std::uint64_t>(interval_ms, remaining);
-            if (sleep_ms == 0)
+            const std::uint64_t remaining = effective_remaining_ms();
+            if (remaining <= 25)
             {
                 deadline_hit = true;
-                cancelled = mcp_standalone::current_call_cancelled();
+                stop_phase = "verify_stable_interval_deadline_guard";
                 break;
             }
+            const std::uint64_t sleep_ms = std::min<std::uint64_t>(interval_ms, remaining - 25);
             std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
-            if (sleep_ms < interval_ms)
+            const bool stopped_after_sleep = stop_requested("verify_stable_interval_after_sleep");
+            if (sleep_ms < interval_ms || stopped_after_sleep)
             {
-                deadline_hit = true;
-                cancelled = mcp_standalone::current_call_cancelled();
+                if (!cancelled)
+                    deadline_hit = true;
+                if (stop_phase.empty())
+                    stop_phase = "verify_stable_interval_bounded";
                 break;
             }
         }
@@ -985,12 +1010,19 @@ tool_result_t verify_stable(const json& params)
     json result;
     result["process_id"] = scope.pid();
     result["samples_requested"] = samples;
+    result["samples_attempted"] = values.size();
     result["samples_ok"] = ok_count;
     result["sample_failures"] = failures;
     result["unique_values"] = unique.size();
     result["stability"] = stability;
     result["deadline_hit"] = deadline_hit;
     result["cancelled"] = cancelled;
+    result["partial"] = deadline_hit || cancelled || values.size() < samples;
+    result["bounded_sampling"] = true;
+    result["timeout_ms"] = timeout_ms;
+    result["effective_deadline_ms"] = effective_deadline;
+    result["deadline_remaining_ms"] = effective_remaining_ms();
+    result["stop_phase"] = stop_phase;
     result["elapsed_ms"] = GetTickCount64() - started_ms;
     result["samples"] = std::move(values);
     diag::log_tagged_fmt("encptr",
@@ -1002,7 +1034,7 @@ tool_result_t verify_stable(const json& params)
                          stability.c_str(),
                          deadline_hit ? 1 : 0,
                          static_cast<unsigned long long>(GetTickCount64() - started_ms));
-    if (deadline_hit)
+    if (deadline_hit || cancelled)
         return tool_result_t::error(cancelled ? "Encrypted pointer stability verification cancelled." : "Encrypted pointer stability verification deadline reached before all samples completed.", result);
     return tool_result_t::ok(result);
 }

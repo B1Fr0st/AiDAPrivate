@@ -115,14 +115,30 @@ def patch_browser_pending_activation(text: str) -> str:
         if pid:
             cid = context_id or "default"
             queue = self._pending_page_ids_by_context.setdefault(cid, [])
-            queue.append({"page_id": pid, "make_active": bool(make_active)})
+            queued_ms = int(time.time() * 1000)
+            queue.append({"page_id": pid, "make_active": bool(make_active), "queued_ms": queued_ms})
+            ctx = self.contexts.get(cid)
+            pending_page_ids = [
+                str(entry.get("page_id") if isinstance(entry, dict) else entry)
+                for entry in queue
+            ]
             _camoufox_debug(
                 "pending_page_queued",
                 session_id=self.session_id,
                 context_id=cid,
                 page_id=pid,
                 make_active=bool(make_active),
+                queued_ms=queued_ms,
                 queue_len=len(queue),
+                pending_queue_len=len(queue),
+                pending_page_ids=pending_page_ids,
+                context_page_count=_context_page_count(ctx),
+                registered_pages=len(self.pages),
+                registered_contexts=len(self.contexts),
+                listener_page_ids=len(self._listener_page_ids),
+                browser_open=self.browser is not None,
+                browser_connected=self._browser_connected(),
+                process_tree=_process_tree_snapshot(),
             )
 
     def _pop_pending_page_id(self, context_id: str) -> dict[str, Any]:
@@ -190,6 +206,216 @@ def patch_browser_pending_activation(text: str) -> str:
             fail(f"browser pending activation validation missing {marker}")
     if "self._pop_pending_page_id(cid), True, \"context_page\"" in text:
         fail("browser pending activation validation found forced active context page")
+    return text
+
+
+def patch_browser_new_page_diagnostics(text: str) -> str:
+    block = '''    async def new_page(self, url: str | None = None, page_id: str | None = None, make_active: bool = True, context_id: str | None = None) -> dict[str, Any]:
+        started = time.perf_counter()
+        await self._ensure_browser()
+        requested_context_id = context_id or "default"
+        ctx = self.contexts.get(requested_context_id) or await self.get_active_context()
+        requested_context_id = context_id or self.context_ids.get(id(ctx), "default")
+        requested_page_id = self._slug(page_id) if page_id else ""
+        page_create_timeout_s = 25.0
+
+        def _pending_snapshot() -> list[dict[str, Any]]:
+            queue = self._pending_page_ids_by_context.get(requested_context_id, [])
+            out: list[dict[str, Any]] = []
+            for entry in queue:
+                if isinstance(entry, dict):
+                    out.append(dict(entry))
+                else:
+                    out.append({"page_id": str(entry), "make_active": True})
+            return out
+
+        def _page_creation_snapshot(extra: dict[str, Any] | None = None) -> dict[str, Any]:
+            pending = _pending_snapshot()
+            snapshot: dict[str, Any] = {
+                "session_id": self.session_id,
+                "context_id": requested_context_id,
+                "requested_page_id": requested_page_id,
+                "make_active": bool(make_active),
+                "url_len": len(url or ""),
+                "elapsed_ms": int((time.perf_counter() - started) * 1000),
+                "pending_queue_len": len(pending),
+                "pending_page_ids": [str(item.get("page_id") or "") for item in pending],
+                "context_page_count": _context_page_count(ctx),
+                "registered_pages": len(self.pages),
+                "registered_contexts": len(self.contexts),
+                "active_page_id": self.active_page_id or "",
+                "browser_open": self.browser is not None,
+                "browser_connected": self._browser_connected(),
+                "event_listener_state": {
+                    "context_registered": requested_context_id in self.contexts,
+                    "listener_page_ids": len(self._listener_page_ids),
+                    "page_event_listener_expected": ctx is not None,
+                    "close_event_handler": hasattr(self, "_handle_context_close_event"),
+                    "page_terminal_ids": len(getattr(self, "_page_terminal_ids", set())),
+                },
+                "process_tree": _process_tree_snapshot(),
+            }
+            if extra:
+                snapshot.update(extra)
+            return snapshot
+
+        async def _finalize_page(page: Page, source: str) -> dict[str, Any]:
+            privacy_info = await _verify_page_privacy(page, self._context_plan)
+            privacy_page_id = self.page_id_for(page) or (page_id or "")
+            _camoufox_debug("page_privacy_verified", session_id=self.session_id, page_id=privacy_page_id, source=source, **privacy_info)
+            if not privacy_info.get("webrtc_blocked") or not privacy_info.get("ice_probe_ok") or privacy_info.get("ice_candidate_leak_detected"):
+                with contextlib.suppress(Exception):
+                    await page.close()
+                raise RuntimeError("Camoufox privacy verification failed")
+            pid = self._register_page(page, page_id, make_active, source, requested_context_id)
+            self._discard_pending_page_id(requested_context_id, page_id)
+            if url:
+                await page.goto(url, wait_until="load", timeout=30000)
+            summary = await self.page_summary(page, pid)
+            diagnostics = _page_creation_snapshot({"page_id": pid, "source": source})
+            _camoufox_debug("page_created", session_id=self.session_id, page_id=pid, active_page_id=self.active_page_id or "", url_len=len(summary.get("url", "")), page_count=len(self.pages), source=source, diagnostics=diagnostics)
+            return {"status": "created", "page": summary, "page_id": pid, "active_page_id": self.active_page_id, "page_count": len(self.pages), "diagnostics": diagnostics}
+
+        self._queue_pending_page_id(requested_context_id, page_id, make_active)
+        page_task = asyncio.create_task(ctx.new_page())
+        page_task_id = id(page_task)
+        begin_diag = _page_creation_snapshot({"page_task_id": page_task_id, "timeout_ms": int(page_create_timeout_s * 1000)})
+        _camoufox_debug("new_page_begin", **begin_diag)
+        try:
+            _camoufox_debug("new_page_await_begin", **_page_creation_snapshot({"page_task_id": page_task_id, "timeout_ms": int(page_create_timeout_s * 1000)}))
+            page = await asyncio.wait_for(asyncio.shield(page_task), timeout=page_create_timeout_s)
+            return await _finalize_page(page, "new_page")
+        except asyncio.TimeoutError:
+            timeout_diag = _page_creation_snapshot({
+                "page_task_id": page_task_id,
+                "pending_page_task": not page_task.done(),
+                "page_task_done": page_task.done(),
+                "page_task_cancelled": page_task.cancelled(),
+                "timeout_ms": int(page_create_timeout_s * 1000),
+                "phase": "page_creation_timeout",
+            })
+            _camoufox_debug("new_page_timeout", **timeout_diag)
+            late_result: dict[str, Any] | None = None
+            late_page_status: dict[str, Any] = {"polls": 0, "task_completed": False, "candidate_seen": False, "registered": False}
+            for poll_index in range(8):
+                late_page_status["polls"] = poll_index + 1
+                if page_task.done():
+                    late_page_status["task_completed"] = True
+                    if page_task.cancelled():
+                        late_page_status["task_cancelled"] = True
+                        late_page_status["error_type"] = "CancelledError"
+                        late_page_status["error"] = "page creation task cancelled"
+                        _camoufox_debug("new_page_late_task_cancelled", **_page_creation_snapshot({"page_task_id": page_task_id, "error_type": "CancelledError", "error_summary": "page creation task cancelled"}))
+                        break
+                    try:
+                        late_page = page_task.result()
+                        late_result = await _finalize_page(late_page, "new_page_late_task")
+                        late_page_status["registered"] = True
+                        late_page_status["page_id"] = late_result.get("page_id", "")
+                        break
+                    except asyncio.CancelledError:
+                        late_page_status["task_cancelled"] = True
+                        late_page_status["error_type"] = "CancelledError"
+                        late_page_status["error"] = "page creation task cancelled"
+                        _camoufox_debug("new_page_late_task_cancelled", **_page_creation_snapshot({"page_task_id": page_task_id, "error_type": "CancelledError", "error_summary": "page creation task cancelled"}))
+                        break
+                    except Exception as exc:
+                        late_page_status["error_type"] = type(exc).__name__
+                        late_page_status["error"] = _safe_text(exc, 700)
+                        _camoufox_debug("new_page_late_task_exception", **_page_creation_snapshot({"page_task_id": page_task_id, "error_type": type(exc).__name__, "error_summary": _safe_text(exc, 700)}))
+                        break
+                for candidate in list(getattr(ctx, "pages", []) or []):
+                    if candidate in self.pages.values():
+                        continue
+                    if self._page_closed(candidate):
+                        continue
+                    late_page_status["candidate_seen"] = True
+                    try:
+                        late_result = await _finalize_page(candidate, "new_page_late_context_scan")
+                        late_page_status["registered"] = True
+                        late_page_status["page_id"] = late_result.get("page_id", "")
+                        break
+                    except Exception as exc:
+                        late_page_status["error_type"] = type(exc).__name__
+                        late_page_status["error"] = _safe_text(exc, 700)
+                        _camoufox_debug("new_page_late_candidate_exception", **_page_creation_snapshot({"page_task_id": page_task_id, "error_type": type(exc).__name__, "error_summary": _safe_text(exc, 700)}))
+                        break
+                if late_result is not None or late_page_status.get("error"):
+                    break
+                await asyncio.sleep(0.25)
+            if late_result is not None:
+                late_result.setdefault("diagnostics", {})["late_page_status"] = late_page_status
+                _camoufox_debug("new_page_late_page_registered", **_page_creation_snapshot({"page_task_id": page_task_id, "late_page_status": late_page_status}))
+                return late_result
+            page_task.cancel()
+            cleanup_cancelled = page_task.cancelled()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await page_task
+            self._discard_pending_page_id(requested_context_id, page_id)
+            cleanup_diag = _page_creation_snapshot({
+                "page_task_id": page_task_id,
+                "pending_page_task": not page_task.done(),
+                "page_task_done": page_task.done(),
+                "page_task_cancelled": page_task.cancelled() or cleanup_cancelled,
+                "late_page_status": late_page_status,
+                "cleanup_cancel_requested": True,
+                "phase": "page_creation_timeout",
+            })
+            _camoufox_debug("new_page_cleanup_done", **cleanup_diag)
+            return {
+                "error": "new_page timed out waiting for Camoufox page creation",
+                "status": "timeout",
+                "phase": "page_creation_timeout",
+                "timeout_phase": "page_creation_timeout",
+                "sidecar_timeout_phase": "page_creation_timeout",
+                "page_id": requested_page_id,
+                "requested_page_id": requested_page_id,
+                "context_id": requested_context_id,
+                "pending_page_task": cleanup_diag.get("pending_page_task"),
+                "pending_queue_len": cleanup_diag.get("pending_queue_len"),
+                "context_page_count": cleanup_diag.get("context_page_count"),
+                "registered_pages": cleanup_diag.get("registered_pages"),
+                "page_task_id": page_task_id,
+                "late_page_status": late_page_status,
+                "cleanup_results": cleanup_diag,
+                "diagnostics": cleanup_diag,
+            }
+        except Exception as exc:
+            self._discard_pending_page_id(requested_context_id, page_id)
+            exc_diag = _page_creation_snapshot({
+                "page_task_id": page_task_id,
+                "pending_page_task": not page_task.done(),
+                "page_task_done": page_task.done(),
+                "page_task_cancelled": page_task.cancelled(),
+                "phase": "page_creation",
+                "error_type": type(exc).__name__,
+                "error": _safe_text(exc, 1000),
+            })
+            _camoufox_debug("new_page_exception", **exc_diag)
+            return {
+                "error": _safe_text(exc, 1000),
+                "status": "error",
+                "phase": "page_creation",
+                "page_id": requested_page_id,
+                "requested_page_id": requested_page_id,
+                "context_id": requested_context_id,
+                "error_type": type(exc).__name__,
+                "pending_page_task": exc_diag.get("pending_page_task"),
+                "pending_queue_len": exc_diag.get("pending_queue_len"),
+                "context_page_count": exc_diag.get("context_page_count"),
+                "registered_pages": exc_diag.get("registered_pages"),
+                "page_task_id": page_task_id,
+                "diagnostics": exc_diag,
+            }
+
+'''
+    pattern = r"    async def new_page\(self, url: str \| None = None, page_id: str \| None = None, make_active: bool = True, context_id: str \| None = None\) -> dict\[str, Any\]:\n.*?(?=    async def select_page)"
+    text, count = re.subn(pattern, block, text, count=1, flags=re.S)
+    if count != 1:
+        fail("browser new_page diagnostics anchor missing")
+    for marker in ("new_page_timeout", "page_task_id", "page_creation_timeout", "new_page_cleanup_done", "new_page_late_page_registered", "new_page_late_task_cancelled"):
+        if marker not in text:
+            fail(f"browser new_page diagnostics validation missing {marker}")
     return text
 
 
@@ -1542,6 +1768,7 @@ def patch_browser(path: pathlib.Path) -> None:
         updated = patch_browser_launch_deadline_diagnostics(updated)
         updated = patch_browser_camoufox_stability(updated)
         updated = patch_browser_pending_activation(updated)
+        updated = patch_browser_new_page_diagnostics(updated)
         updated = patch_browser_debug_helper(updated)
         if updated != text:
             write_text(path, updated)
@@ -1594,6 +1821,7 @@ def patch_browser(path: pathlib.Path) -> None:
         updated = patch_browser_launch_deadline_diagnostics(updated)
         updated = patch_browser_camoufox_stability(updated)
         updated = patch_browser_pending_activation(updated)
+        updated = patch_browser_new_page_diagnostics(updated)
         updated = patch_browser_debug_helper(updated)
         if updated != text:
             write_text(path, updated)
@@ -1666,6 +1894,7 @@ def patch_browser(path: pathlib.Path) -> None:
         updated = patch_browser_launch_deadline_diagnostics(updated)
         updated = patch_browser_camoufox_stability(updated)
         updated = patch_browser_pending_activation(updated)
+        updated = patch_browser_new_page_diagnostics(updated)
         updated = patch_browser_debug_helper(updated)
         write_text(path, updated)
         return
@@ -2185,6 +2414,7 @@ def patch_browser(path: pathlib.Path) -> None:
     )
     text = patch_browser_camoufox_stability(text)
     text = patch_browser_pending_activation(text)
+    text = patch_browser_new_page_diagnostics(text)
     text = patch_browser_debug_helper(text)
     for marker in ("self._aida_multipage_patch = 4", "async def list_pages", "async def resolve_page", "page_id", "active_page_id", "_pending_page_ids_by_context", "page_privacy_verified", "def _mark_page_terminal", "AIDA_CAMOUFOX_FAST_VISIBLE_FALLBACK", "aida_camoufox_bridge_20260620_crash_diag_1", "aida_bridge_patch_active", "aida_launch_policy_resolved", "context_close_event", "cmdline_sha256", "subprocess_diagnostics_installed", "stdout_capture", "stderr_capture", "exit_ts_ms", "diagnostic_original_style_bundled", "_registered_page_records"):
         if marker not in text:

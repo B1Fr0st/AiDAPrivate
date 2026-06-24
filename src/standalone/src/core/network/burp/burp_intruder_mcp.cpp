@@ -483,8 +483,38 @@ bool h2_parse_raw_frames(const json& params, h2_editor::request_t& req, bool& ra
     return true;
 }
 
+uint64_t unix_ms_now()
+{
+    using namespace std::chrono;
+    return static_cast<uint64_t>(duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count());
+}
+
+uint64_t intruder_elapsed_ms(const intruder::status_t& s)
+{
+    if (s.started_unix_ms == 0)
+        return 0;
+    const uint64_t end = s.finished_unix_ms != 0 ? s.finished_unix_ms : unix_ms_now();
+    return end > s.started_unix_ms ? end - s.started_unix_ms : 0;
+}
+
+std::string intruder_completion_state(const intruder::status_t& s, size_t results)
+{
+    if (s.job_id == 0)
+        return "not_found";
+    if (s.running)
+        return "running";
+    if (s.total > 0 && s.sent >= s.total)
+        return s.errors > 0 && results == 0 ? "completed_errors_only" : "completed";
+    if (s.sent > 0 || results > 0)
+        return "stopped_partial";
+    return "created_no_requests";
+}
+
+size_t result_count(uint64_t job_id);
+
 json status_to_json(const intruder::status_t& s)
 {
+    const size_t results = s.job_id == 0 ? 0 : result_count(s.job_id);
     json r;
     r["job_id"] = s.job_id;
     r["total"] = s.total;
@@ -494,6 +524,13 @@ json status_to_json(const intruder::status_t& s)
     r["current_rps"] = s.current_rps;
     r["started_unix_ms"] = s.started_unix_ms;
     r["finished_unix_ms"] = s.finished_unix_ms;
+    r["elapsed_ms"] = intruder_elapsed_ms(s);
+    r["result_count"] = static_cast<uint64_t>(results);
+    r["completion_state"] = intruder_completion_state(s, results);
+    r["progress_fraction"] = s.total == 0 ? 0.0 : static_cast<double>(s.sent) / static_cast<double>(s.total);
+    r["proof_ready"] = results > 0;
+    r["proof_pending"] = s.running && (s.total == 0 || s.sent < s.total);
+    r["status_source"] = "intruder::status";
     return r;
 }
 
@@ -626,6 +663,11 @@ static tool_result_t burp_intruder_start(const json& params)
     diag::log_tagged_fmt("mcp_burp", "intruder_start ok job_id=%llu", static_cast<unsigned long long>(id));
     json r;
     r["job_id"] = id;
+    r["status"] = status_to_json(intruder::status(id));
+    r["result_count"] = static_cast<uint64_t>(result_count(id));
+    r["engine_acceptance"] = "job_id_allocated";
+    r["proof_pending"] = true;
+    r["proof_ready"] = false;
     return tool_result_t::ok("intruder job started", r);
 }
 
@@ -636,15 +678,7 @@ static tool_result_t burp_intruder_status(const json& params)
     uint64_t id = params["job_id"].get<uint64_t>();
     intruder::status_t s = intruder::status(id);
     if (s.job_id == 0) { diag::log_tagged_fmt("mcp_burp", "intruder_status not_found id=%llu", static_cast<unsigned long long>(id)); return tool_result_t::error("job not found"); }
-    json r;
-    r["job_id"] = s.job_id;
-    r["total"] = s.total;
-    r["sent"] = s.sent;
-    r["errors"] = s.errors;
-    r["running"] = s.running;
-    r["current_rps"] = s.current_rps;
-    r["started_unix_ms"] = s.started_unix_ms;
-    r["finished_unix_ms"] = s.finished_unix_ms;
+    json r = status_to_json(s);
     diag::log_tagged_fmt("mcp_burp", "intruder_status ok id=%llu sent=%zu running=%d", static_cast<unsigned long long>(id), s.sent, (int)s.running);
     return tool_result_t::ok(r);
 }
@@ -682,6 +716,19 @@ static tool_result_t burp_intruder_results(const json& params)
     out["count"] = rows.size();
     out["error_count"] = static_cast<uint64_t>(error_count);
     out["successful_count"] = static_cast<uint64_t>(successful_count);
+    out["window_start"] = static_cast<uint64_t>(start_idx);
+    out["window_max"] = static_cast<uint64_t>(max_count);
+    out["result_count"] = static_cast<uint64_t>(result_count(id));
+    out["status"] = status_to_json(intruder::status(id));
+    if (!rows.empty())
+    {
+        const auto& first = rows.front();
+        out["first_result_index"] = static_cast<uint64_t>(first.index);
+        out["first_result_status_code"] = first.status_code;
+        out["first_result_error"] = first.error;
+        out["first_result_latency_ms"] = first.latency_ms;
+        out["first_result_response_size"] = static_cast<uint64_t>(first.response_size);
+    }
     out["results"] = std::move(arr);
     diag::log_tagged_fmt("mcp_burp", "intruder_results ok id=%llu count=%zu errors=%zu successful=%zu",
         static_cast<unsigned long long>(id), rows.size(), error_count, successful_count);
@@ -717,13 +764,7 @@ static tool_result_t burp_intruder_list_jobs(const json& params)
     auto jobs = intruder::list_jobs();
     json arr = json::array();
     for (auto& s : jobs) {
-        json e;
-        e["job_id"] = s.job_id;
-        e["total"] = s.total;
-        e["sent"] = s.sent;
-        e["errors"] = s.errors;
-        e["running"] = s.running;
-        e["current_rps"] = s.current_rps;
+        json e = status_to_json(s);
         arr.push_back(e);
     }
     json out;

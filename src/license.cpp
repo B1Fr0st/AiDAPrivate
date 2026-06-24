@@ -7,9 +7,7 @@
 #ifdef __NT__
 #include <windows.h>
 #include <intrin.h>
-#include <iphlpapi.h>
 #include <wincrypt.h>
-#pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "Crypt32.lib")
 #pragma comment(lib, "winhttp.lib")
 #else
@@ -698,21 +696,6 @@ std::string license_manager_t::generate_hwid() const
     for (DWORD i = 0; i < name_size; ++i)
         fnv_mix(static_cast<uint64_t>(computer_name[i]));
 
-
-    {
-        ULONG buf_len = 0;
-        GetAdaptersInfo(nullptr, &buf_len);
-        if (buf_len > 0)
-        {
-            std::vector<BYTE> buf(buf_len);
-            PIP_ADAPTER_INFO adapter = reinterpret_cast<PIP_ADAPTER_INFO>(buf.data());
-            if (GetAdaptersInfo(adapter, &buf_len) == NO_ERROR && adapter)
-            {
-                for (UINT i = 0; i < adapter->AddressLength; ++i)
-                    fnv_mix(static_cast<uint64_t>(adapter->Address[i]));
-            }
-        }
-    }
 #else
     char hostname[256] = {};
     gethostname(hostname, sizeof(hostname));

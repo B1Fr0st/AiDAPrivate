@@ -309,6 +309,55 @@ inline bool specs_dir_has_required_files(const std::string& dir)
 	return true;
 }
 
+inline size_t count_required_specs_files(const std::string& dir)
+{
+	if (dir.empty())
+		return 0;
+	DWORD attr = GetFileAttributesA(dir.c_str());
+	if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY))
+		return 0;
+	std::string prefix = dir;
+	if (!prefix.empty() && prefix.back() != '\\' && prefix.back() != '/')
+		prefix += "\\";
+	const char* names[] = {
+		"x86-64.sla",
+		"x86-64.pspec",
+		"x86-64-win.cspec",
+		"x86.ldefs"
+	};
+	size_t count = 0;
+	for (const char* name : names) {
+		const std::string file = prefix + name;
+		attr = GetFileAttributesA(file.c_str());
+		if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY))
+			++count;
+	}
+	return count;
+}
+
+inline size_t ghidra_spec_resource_count(size_t& total_bytes)
+{
+	total_bytes = 0;
+	const int ids[] = {
+		IDR_GHIDRA_SLA,
+		IDR_GHIDRA_PSPEC,
+		IDR_GHIDRA_CSPEC,
+		IDR_GHIDRA_LDEFS
+	};
+	size_t count = 0;
+	for (int id : ids) {
+		HRSRC res = FindResourceW(nullptr, MAKEINTRESOURCEW(id), RT_RCDATA);
+		if (!res)
+			continue;
+		DWORD size = SizeofResource(nullptr, res);
+		if (size == 0)
+			continue;
+		++count;
+		total_bytes += static_cast<size_t>(size);
+	}
+	return count;
+}
+
 inline void append_specs_root_candidates(std::vector<std::pair<std::string, std::string>>& out,
                                          const std::string& label,
                                          const std::string& root)
@@ -358,8 +407,10 @@ inline void append_specs_probe_candidate(std::ostringstream& out,
 	if (attr == INVALID_FILE_ATTRIBUTES) {
 		out << ":missing_gle=" << static_cast<unsigned long>(GetLastError());
 	} else {
+		const size_t file_count = count_required_specs_files(path);
 		out << ":attr=0x" << std::hex << std::uppercase << attr << std::dec
 		    << ":dir=" << ((attr & FILE_ATTRIBUTE_DIRECTORY) ? 1 : 0)
+		    << ":files=" << file_count << "/4"
 		    << ":ready=" << (specs_dir_has_required_files(path) ? 1 : 0);
 	}
 	out << " ";
@@ -868,11 +919,24 @@ inline bool init(const std::string& specs_dir = "") {
 	diag::log_tagged_critical_fmt("dec", "ghidra_init_find_specs_dir result=%s",
 		dir.empty() ? "<empty>" : dir.c_str());
 
+	size_t embedded_resource_bytes = 0;
+	size_t embedded_resource_count = 0;
 	if (dir.empty()) {
-		diag::log_tagged_critical("dec", "ghidra_init_pre_extract_specs");
+		embedded_resource_count = detail::ghidra_spec_resource_count(embedded_resource_bytes);
+		diag::log_tagged_critical_fmt("dec",
+			"ghidra_init_pre_extract_specs target=temp embedded_resources=%zu/4 embedded_resource_bytes=%zu",
+			embedded_resource_count,
+			embedded_resource_bytes);
 		dir = embedded_resources::extract_ghidra_specs();
-		diag::log_tagged_critical_fmt("dec", "ghidra_init_post_extract_specs result=%s",
-			dir.empty() ? "<empty>" : dir.c_str());
+		const size_t extracted_file_count = detail::count_required_specs_files(dir);
+		diag::log_tagged_critical_fmt("dec",
+			"ghidra_init_post_extract_specs result=%s target=%s files=%zu/4 ready=%d embedded_resources=%zu/4 embedded_resource_bytes=%zu",
+			dir.empty() ? "<empty>" : dir.c_str(),
+			dir.empty() ? "<empty>" : dir.c_str(),
+			extracted_file_count,
+			detail::specs_dir_has_required_files(dir) ? 1 : 0,
+			embedded_resource_count,
+			embedded_resource_bytes);
 		if (!dir.empty()) {
 			static std::string s_temp_specs_dir;
 			s_temp_specs_dir = dir;
@@ -884,7 +948,9 @@ inline bool init(const std::string& specs_dir = "") {
 
 	if (dir.empty()) {
 		g_state.last_init_reason = "dependency_blocked_no_specs_dir";
-		g_state.init_detail = "dependency_blocked=1 reason=no_ghidra_specs_dir " + g_state.last_specs_probe;
+		g_state.init_detail = "dependency_blocked=1 reason=no_ghidra_specs_dir embedded_resources=" +
+			std::to_string(embedded_resource_count) + "/4 embedded_resource_bytes=" +
+			std::to_string(embedded_resource_bytes) + " " + g_state.last_specs_probe;
 		g_state.err_stream << g_state.init_detail << "\n";
 		diag::log_tagged_critical_fmt("dec", "ghidra_init_exit reason=no_specs_dir detail=%s",
 			g_state.init_detail.c_str());

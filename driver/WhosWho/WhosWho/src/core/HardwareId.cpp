@@ -3,7 +3,6 @@
 #include <ntifs.h>
 #include <ntddk.h>
 #include <ntddstor.h>
-#include <ntddndis.h>
 #include <intrin.h>
 
 #include "../imports/Defs.h"
@@ -120,17 +119,6 @@ namespace hardware_id_kernel
             out[w++] = hex[b[i] & 0xF];
         }
         return w;
-    }
-
-    static SIZE_T format_mac_uppercase(const UCHAR mac[6], UCHAR* out, SIZE_T out_cap)
-    {
-        if (out_cap < 12) return 0;
-        static const char hex[] = "0123456789ABCDEF";
-        for (int i = 0; i < 6; ++i) {
-            out[i * 2]     = hex[(mac[i] >> 4) & 0xF];
-            out[i * 2 + 1] = hex[mac[i] & 0xF];
-        }
-        return 12;
     }
 
     static NTSTATUS read_smbios_table(PUCHAR* out_buf, ULONG* out_len)
@@ -389,132 +377,6 @@ namespace hardware_id_kernel
         RtlCopyMemory(out_buf, tmp, n);
         *out_len = static_cast<ULONG>(n);
         return STATUS_SUCCESS;
-    }
-
-    static NTSTATUS read_ndis_permanent_address(const wchar_t* binding_name,
-                                                UCHAR mac_out[6])
-    {
-        PFILE_OBJECT fileobj = nullptr;
-        PDEVICE_OBJECT devobj = nullptr;
-        UNICODE_STRING dev_name;
-        RtlInitUnicodeString(&dev_name, binding_name);
-        NTSTATUS status = IoGetDeviceObjectPointer(&dev_name, FILE_READ_DATA, &fileobj, &devobj);
-        if (!NT_SUCCESS(status)) return status;
-        NDIS_OID oid = OID_802_3_PERMANENT_ADDRESS;
-        UCHAR raw[8] = { 0 };
-        ULONG returned = 0;
-        status = forward_ioctl_buffered(devobj, IOCTL_NDIS_QUERY_GLOBAL_STATS,
-                                        &oid, sizeof(oid),
-                                        raw, sizeof(raw), &returned);
-        ObDereferenceObject(fileobj);
-        if (!NT_SUCCESS(status) || returned < 6) return STATUS_NOT_FOUND;
-        BOOLEAN all_zero = TRUE;
-        for (int i = 0; i < 6; ++i) {
-            mac_out[i] = raw[i];
-            if (raw[i] != 0) all_zero = FALSE;
-        }
-        if (all_zero) return STATUS_NOT_FOUND;
-        return STATUS_SUCCESS;
-    }
-
-    static NTSTATUS enumerate_ndis_bindings(UNICODE_STRING* out_list, ULONG max_entries,
-                                            PULONG out_count)
-    {
-        *out_count = 0;
-        UNICODE_STRING reg_key;
-        RtlInitUnicodeString(&reg_key,
-            L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Linkage");
-        OBJECT_ATTRIBUTES oa;
-        InitializeObjectAttributes(&oa, &reg_key, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
-                                   nullptr, nullptr);
-        HANDLE key = nullptr;
-        NTSTATUS status = ZwOpenKey(&key, KEY_READ, &oa);
-        if (!NT_SUCCESS(status)) return status;
-        UNICODE_STRING value_name;
-        RtlInitUnicodeString(&value_name, L"Bind");
-        ULONG req_size = 0;
-        status = ZwQueryValueKey(key, &value_name, KeyValuePartialInformation,
-                                 nullptr, 0, &req_size);
-        if (status != STATUS_BUFFER_TOO_SMALL &&
-            status != STATUS_BUFFER_OVERFLOW &&
-            !NT_SUCCESS(status)) {
-            ZwClose(key);
-            return status;
-        }
-        if (req_size == 0) {
-            ZwClose(key);
-            return STATUS_NOT_FOUND;
-        }
-        PKEY_VALUE_PARTIAL_INFORMATION info =
-            reinterpret_cast<PKEY_VALUE_PARTIAL_INFORMATION>(
-                ExAllocatePool2(POOL_FLAG_NON_PAGED, req_size, kPoolTag));
-        if (!info) {
-            ZwClose(key);
-            return STATUS_INSUFFICIENT_RESOURCES;
-        }
-        ULONG got = 0;
-        status = ZwQueryValueKey(key, &value_name, KeyValuePartialInformation,
-                                 info, req_size, &got);
-        ZwClose(key);
-        if (!NT_SUCCESS(status)) {
-            ExFreePoolWithTag(info, kPoolTag);
-            return status;
-        }
-        const wchar_t* multi = reinterpret_cast<const wchar_t*>(info->Data);
-        ULONG count = 0;
-        ULONG chars = info->DataLength / sizeof(wchar_t);
-        ULONG i = 0;
-        while (i < chars && count < max_entries) {
-            const wchar_t* start = multi + i;
-            ULONG l = 0;
-            while ((i + l) < chars && start[l] != L'\0') ++l;
-            if (l == 0) {
-                ++i;
-                continue;
-            }
-            USHORT byte_len = static_cast<USHORT>(l * sizeof(wchar_t));
-            UNICODE_STRING us;
-            us.Length = byte_len;
-            us.MaximumLength = byte_len;
-            us.Buffer = const_cast<PWCH>(start);
-            if (count < max_entries) {
-                out_list[count].Length = us.Length;
-                out_list[count].MaximumLength = us.MaximumLength;
-                out_list[count].Buffer = const_cast<PWCH>(start);
-                ++count;
-            }
-            i += (l + 1);
-        }
-        *out_count = count;
-        return STATUS_SUCCESS;
-    }
-
-    static NTSTATUS collect_permanent_mac(PUCHAR out_buf, ULONG out_cap, PULONG out_len)
-    {
-        *out_len = 0;
-        UNICODE_STRING bindings[16];
-        RtlZeroMemory(bindings, sizeof(bindings));
-        ULONG count = 0;
-        NTSTATUS status = enumerate_ndis_bindings(bindings, 16, &count);
-        if (!NT_SUCCESS(status) || count == 0) return STATUS_NOT_FOUND;
-        for (ULONG i = 0; i < count; ++i) {
-            UCHAR mac[6] = { 0 };
-            wchar_t scratch[256];
-            if (bindings[i].Length == 0) continue;
-            ULONG copy_chars = bindings[i].Length / sizeof(wchar_t);
-            if (copy_chars >= 255) continue;
-            RtlCopyMemory(scratch, bindings[i].Buffer, copy_chars * sizeof(wchar_t));
-            scratch[copy_chars] = 0;
-            NTSTATUS s = read_ndis_permanent_address(scratch, mac);
-            if (NT_SUCCESS(s)) {
-                SIZE_T w = format_mac_uppercase(mac, out_buf, out_cap);
-                if (w == 12) {
-                    *out_len = 12;
-                    return STATUS_SUCCESS;
-                }
-            }
-        }
-        return STATUS_NOT_FOUND;
     }
 
     static NTSTATUS collect_cpuid_brand(PUCHAR out_buf, ULONG out_cap, PULONG out_len)
@@ -838,8 +700,6 @@ NTSTATUS HardwareIdHandleIoctl(_In_ PIRP Irp, _In_ PIO_STACK_LOCATION IoStack)
         mask |= (1u << 2);
     if (NT_SUCCESS(hardware_id_kernel::collect_disk_serial(factor_bufs[3], kPerFactorCap, &factor_lens[3])))
         mask |= (1u << 3);
-    if (NT_SUCCESS(hardware_id_kernel::collect_permanent_mac(factor_bufs[4], kPerFactorCap, &factor_lens[4])))
-        mask |= (1u << 4);
     if (NT_SUCCESS(hardware_id_kernel::collect_cpuid_brand(factor_bufs[5], kPerFactorCap, &factor_lens[5])))
         mask |= (1u << 5);
     if (NT_SUCCESS(hardware_id_kernel::collect_machine_guid(factor_bufs[6], kPerFactorCap, &factor_lens[6])))

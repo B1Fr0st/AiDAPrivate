@@ -132,7 +132,7 @@ test('rich hwid v2 evidence accepts exactly one factor drift', async () => {
     resetQueryHandler();
     capturedQueries.length = 0;
     const previous = richFactors('old');
-    const current = { ...previous, 5: hexFactor('new:nic:factor') };
+    const current = { ...previous, 4: hexFactor('new:disk:factor') };
 
     const result = await licenseRouter._internal.verifyOrBindHwid(
         'AIDA-TEST-0000-0000-0000',
@@ -149,8 +149,41 @@ test('rich hwid v2 evidence accepts exactly one factor drift', async () => {
 
     assert.equal(result.ok, true);
     assert.equal(result.reason, 'grace_accepted');
-    assert.deepEqual(licenseRouter._internal.compareHwidFactors(previous, current).changed_keys, ['5']);
+    assert.deepEqual(licenseRouter._internal.compareHwidFactors(previous, current).changed_keys, ['4']);
     assert.ok(capturedQueries.some(q => String(q.sql).includes('UPDATE licenses SET hwid = $1, hwid_factors = $2::jsonb')));
+});
+
+test('ignored factor 5 drift is accepted without consuming hwid grace', async () => {
+    resetQueryHandler();
+    capturedQueries.length = 0;
+    const previous = richFactors('old');
+    const rawCurrent = { ...previous, 5: hexFactor('new:nic:factor') };
+    const current = licenseRouter._internal.deriveHwidFactors({
+        hwid_v2_factors: rawCurrent,
+        hwid_v2_factor_mask: 0x17f,
+        hwid_v2_tpm_present: false,
+        hwid: 'b'.repeat(64),
+    });
+
+    const result = await licenseRouter._internal.verifyOrBindHwid(
+        'AIDA-TEST-0000-0000-0000',
+        'b'.repeat(64),
+        'a'.repeat(64),
+        {
+            factors: current,
+            licenseRow: {
+                hwid_factors: previous,
+                hwid_grace_used_at: Math.floor(Date.now() / 1000),
+            },
+        }
+    );
+
+    assert.equal(result.ok, true);
+    assert.equal(result.reason, 'ignored_factor_accepted');
+    assert.equal(current['5'], undefined);
+    assert.equal((current._mask & (1 << 4)), 0);
+    assert.deepEqual(licenseRouter._internal.compareHwidFactors(previous, current).changed_keys, []);
+    assert.ok(capturedQueries.some(q => String(q.sql).includes('UPDATE licenses SET hwid = $1, hwid_factors = $2::jsonb WHERE key = $3')));
 });
 
 test('legacy aggregate hwid factor does not unlock mismatch without continuity', async () => {

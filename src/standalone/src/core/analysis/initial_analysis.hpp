@@ -218,7 +218,7 @@ inline bool apply_full_test_pdb_decline(const char* source,
 		g_state.local_pdb_path.clear();
 	}
 
-	push_log_fmt("fulltest_pdb_prompt_auto_decline choice=do_not_load_pdb prompt_created=%d prompt_suppressed=1 source=%s module=%s base=0x%llX size=0x%llX pdb=%s guid=%s age=%u reason=%s remote_pending=%d local_pending=%d opt_load_types=0 opt_load_names=0 failed=0 declined=1",
+	push_log_fmt("fulltest_pdb_prompt_auto_decline choice=do_not_load_pdb decision=do_not_load_pdb prompt_created=%d prompt_suppressed=1 source=%s module=%s base=0x%llX size=0x%llX pdb=%s guid=%s age=%u reason=%s remote_pending=%d local_pending=%d opt_load_types=0 opt_load_names=0 failed=0 declined=1",
 		prompt_created ? 1 : 0,
 		source && *source ? source : "<unknown>",
 		log_value(module_log),
@@ -375,6 +375,53 @@ inline full_test_pdb_policy_t resolve_full_test_pdb_policy(const std::string& bi
 	policy.reason = hint ? "no_deterministic_local_pdb_decline_remote_symbol_download"
 	                     : "no_codeview_or_deterministic_local_pdb";
 	return policy;
+}
+
+inline std::string target_path_for_prompt_policy(const std::string& module_name)
+{
+	std::lock_guard<std::mutex> lk(g_state.path_mtx);
+	if (!g_state.target_path.empty()) return g_state.target_path;
+	return module_name;
+}
+
+inline bool accept_local_pdb_before_prompt_for_full_test(const char* source,
+                                                        const std::string& module_name,
+                                                        uint64_t image_base,
+                                                        uint64_t image_size,
+                                                        const std::string& reason)
+{
+	if (!full_test_active()) return false;
+	const std::string binary_path = target_path_for_prompt_policy(module_name);
+	full_test_pdb_policy_t policy = resolve_full_test_pdb_policy(binary_path, module_name, nullptr);
+	if (!policy.local_available) return false;
+
+	g_state.needs_pdb_prompt.store(false, std::memory_order_release);
+	g_state.needs_local_pdb_prompt.store(false, std::memory_order_release);
+	g_state.opt_load_types.store(true, std::memory_order_release);
+	g_state.opt_load_names.store(true, std::memory_order_release);
+	g_state.pdb_decision.store(pdb_decision_t::declined, std::memory_order_release);
+	g_state.local_pdb_decision.store(pdb_decision_t::accepted, std::memory_order_release);
+	{
+		std::lock_guard<std::mutex> lk(g_state.local_pdb_mtx);
+		g_state.local_pdb_module_name = module_name;
+		g_state.local_pdb_image_base = image_base;
+		g_state.local_pdb_image_size = image_size;
+		g_state.local_pdb_reason = reason.empty() ? policy.reason : reason;
+		g_state.local_pdb_path = policy.local_candidate;
+	}
+
+	push_log_fmt("fulltest_pdb_prompt_auto_accept_local decision=load_local prompt_created=0 prompt_suppressed=1 source=%s module=%s base=0x%llX size=0x%llX pdb=%s guid=%s age=%u local_candidate=%s cache_path=%s reason=%s failed=0 declined=0",
+		source && *source ? source : "<unknown>",
+		log_value(module_name),
+		static_cast<unsigned long long>(image_base),
+		static_cast<unsigned long long>(image_size),
+		log_value(policy.pdb_name),
+		log_value(policy.pdb_guid),
+		static_cast<unsigned>(policy.pdb_age),
+		log_value(policy.local_candidate),
+		log_value(policy.cache_path),
+		log_value(policy.reason));
+	return true;
 }
 
 inline pdb_load_snapshot_t snapshot_pdb_load(const std::string& module_key)
@@ -797,6 +844,10 @@ inline void request_local_pdb_prompt(const std::string& module_name,
                                      uint64_t image_base, uint64_t image_size,
                                      const std::string& reason)
 {
+	if (accept_local_pdb_before_prompt_for_full_test("request_local_pdb_prompt",
+		module_name, image_base, image_size, reason)) {
+		return;
+	}
 	if (decline_pdb_before_prompt_for_full_test("request_local_pdb_prompt",
 		module_name, image_base, image_size, fallback_pdb_name_for_module(module_name),
 		{}, 0, reason)) {
@@ -1566,6 +1617,7 @@ inline void accept_pdb_prompt(bool load_types, bool load_names)
 {
 	g_state.opt_load_types.store(load_types, std::memory_order_release);
 	g_state.opt_load_names.store(load_names, std::memory_order_release);
+	g_state.needs_pdb_prompt.store(false, std::memory_order_release);
 	g_state.pdb_decision.store(pdb_decision_t::accepted, std::memory_order_release);
 }
 
@@ -1573,6 +1625,7 @@ inline void decline_pdb_prompt()
 {
 	g_state.opt_load_types.store(false, std::memory_order_release);
 	g_state.opt_load_names.store(false, std::memory_order_release);
+	g_state.needs_pdb_prompt.store(false, std::memory_order_release);
 	g_state.pdb_decision.store(pdb_decision_t::declined, std::memory_order_release);
 }
 

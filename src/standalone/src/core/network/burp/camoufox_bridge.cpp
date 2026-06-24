@@ -2844,6 +2844,12 @@ bool is_bridge_relaunchable_error(const std::string& msg)
 
 void disconnect_client_sync(std::shared_ptr<mcp_client::client_t> cli, const std::string& reason);
 std::string camoufox_debug_log_path();
+nlohmann::json last_camoufox_debug_event_json_from_tail(const std::string& tail);
+std::string sidecar_timeout_phase_from_event(const nlohmann::json& event, const std::string& fallback);
+void attach_debug_log_snapshot_locked(nlohmann::json& out,
+                                      uint32_t child_pid,
+                                      const std::string& debug_log,
+                                      const std::string& debug_tail);
 
 void disconnect_client_async(std::shared_ptr<mcp_client::client_t> cli, const std::string& reason)
 {
@@ -4445,6 +4451,10 @@ call_result_t call_with_deadline(const std::string& tool_name, const nlohmann::j
                 static_cast<unsigned long long>(timed_out_generation), static_cast<unsigned long>(timed_out_child_pid));
         const process_exit_snapshot_t timeout_exit = query_process_exit_snapshot(timed_out_child_pid);
         const std::vector<process_tree_entry_t> timeout_tree_after = timed_out_child_pid == 0 ? std::vector<process_tree_entry_t>() : enumerate_process_tree(timed_out_child_pid);
+        const std::string call_debug_log = camoufox_debug_log_path();
+        const std::string call_debug_tail = read_file_tail_for_log(call_debug_log, 6000);
+        const nlohmann::json call_debug_event = last_camoufox_debug_event_json_from_tail(call_debug_tail);
+        const std::string sidecar_timeout_phase = sidecar_timeout_phase_from_event(call_debug_event, "mcp_response_wait");
         diag::log_tagged_fmt("camoufox", "call_with_deadline timeout_breadcrumb request_id=%llu tool=%s generation=%llu child_pid=%lu timeout_ms=%d retained_client=%d cancelled_by_stop=%d exit_valid=%d exit_code=%lu exit_gle=%lu child_processes=%zu browser_processes=%u process_tree=%s",
             static_cast<unsigned long long>(request_id),
             tool_name.c_str(),
@@ -4485,7 +4495,9 @@ call_result_t call_with_deadline(const std::string& tool_name, const nlohmann::j
         fail.data = {
             {"status", cancelled_by_stop ? "cancelled" : "timeout"},
             {"phase", "mcp_response_wait"},
-            {"timeout_phase", cancelled_by_stop ? nlohmann::json(nullptr) : nlohmann::json("mcp_response_wait")},
+            {"transport_phase", "mcp_response_wait"},
+            {"sidecar_timeout_phase", sidecar_timeout_phase},
+            {"timeout_phase", cancelled_by_stop ? nlohmann::json(nullptr) : nlohmann::json(sidecar_timeout_phase)},
             {"tool", tool_name},
             {"request_id", request_id},
             {"timeout_ms", timeout_ms},
@@ -4501,6 +4513,17 @@ call_result_t call_with_deadline(const std::string& tool_name, const nlohmann::j
             {"process_tree", compact_process_tree(timeout_tree_after)},
             {"error", fail.error}
         };
+        {
+            std::lock_guard<std::recursive_mutex> diag_lk(sg().mtx);
+            attach_debug_log_snapshot_locked(fail.data, timed_out_child_pid, call_debug_log, call_debug_tail);
+            if (tool_name == "new_page")
+            {
+                sg().last_launch_diagnostics = fail.data;
+                sg().last_launch_diagnostics["caller"] = "new_page";
+                sg().last_launch_diagnostics["readiness_sub_step"] = sidecar_timeout_phase;
+                sg().last_launch_diagnostics["cleanup_pending_after_timeout"] = sg().cleanup_pending;
+            }
+        }
         attach_bridge_call_metadata(
             fail,
             "default",
@@ -5356,6 +5379,86 @@ std::string last_camoufox_debug_event_from_tail(const std::string& tail)
     return {};
 }
 
+nlohmann::json last_camoufox_debug_event_json_from_tail(const std::string& tail)
+{
+    if (tail.empty()) return nlohmann::json::object();
+    const std::string prefix = "AIDA_CAMOUFOX ";
+    std::size_t search_end = tail.size();
+    while (search_end > 0)
+    {
+        std::size_t pos = tail.rfind(prefix, search_end - 1);
+        if (pos != std::string::npos)
+        {
+            std::string json_text;
+            if (extract_json_object_at(tail, pos + prefix.size(), json_text))
+            {
+                nlohmann::json parsed = nlohmann::json::parse(json_text, nullptr, false);
+                if (parsed.is_object() && !json_string_or(parsed, "event", std::string()).empty())
+                    return parsed;
+            }
+            search_end = pos;
+            continue;
+        }
+        break;
+    }
+    return nlohmann::json::object();
+}
+
+std::string sidecar_timeout_phase_from_event(const nlohmann::json& event, const std::string& fallback)
+{
+    const std::string name = json_string_or(event, "event", std::string());
+    const std::string phase = json_string_or(event, "phase", std::string());
+    if (name.find("new_page_timeout") != std::string::npos || phase == "new_page" || phase == "page_creation_timeout")
+        return "page_creation_timeout";
+    if (name.find("launch_phase_timeout") != std::string::npos && !phase.empty())
+        return phase == "new_page" ? "page_creation_timeout" : phase;
+    return fallback;
+}
+
+void attach_debug_log_snapshot_locked(nlohmann::json& out,
+                                      uint32_t child_pid,
+                                      const std::string& debug_log,
+                                      const std::string& debug_tail)
+{
+    if (!out.is_object())
+        out = nlohmann::json::object();
+    const nlohmann::json last_event = last_camoufox_debug_event_json_from_tail(debug_tail);
+    const std::string last_event_name = json_string_or(last_event, "event", std::string());
+    out["child_debug_log"] = debug_log;
+    out["debug_log_size"] = file_size_for_log(debug_log);
+    out["debug_tail_len"] = debug_tail.size();
+    out["last_debug_event_name"] = last_event_name;
+    out["last_debug_event"] = last_event.is_object() ? last_event : nlohmann::json::object();
+    out["last_debug_event_summary"] = last_camoufox_debug_event_from_tail(debug_tail);
+    out["active_operations"] = sg().active_activities.load(std::memory_order_acquire);
+    out["stop_requested"] = sg().stop_requested.load(std::memory_order_acquire);
+    out["stop_epoch"] = sg().stop_epoch.load(std::memory_order_acquire);
+    out["cleanup_pending"] = sg().cleanup_pending;
+    out["cleanup_generation"] = sg().cleanup_generation;
+    out["cleanup_child_pid"] = sg().cleanup_child_pid;
+    out["cleanup_reason"] = sg().cleanup_reason;
+    if (sg().cleanup_diagnostics.is_object() && out.find("cleanup_diagnostics") == out.end())
+        out["cleanup_diagnostics"] = sg().cleanup_diagnostics;
+    if (child_pid != 0 && out.find("process_tree") == out.end())
+    {
+        const std::vector<process_tree_entry_t> tree = enumerate_process_tree(child_pid);
+        out["process_tree"] = compact_process_tree(tree);
+        out["process_tree_count"] = tree.size();
+        out["browser_process_count"] = browser_process_count_from_tree(tree);
+    }
+    const char* copy_keys[] = {
+        "selected_launch_path", "context_id", "page_id", "requested_page_id", "queue_len",
+        "pending_queue_len", "pending_page_task", "context_page_count", "registered_pages",
+        "page_event_count", "browser_context_count", "browser_connected", "browser_open"
+    };
+    for (const char* key : copy_keys)
+    {
+        auto it = last_event.find(key);
+        if (it != last_event.end() && out.find(key) == out.end())
+            out[key] = *it;
+    }
+}
+
 std::string launch_profile_dir_from_response(const nlohmann::json& parsed)
 {
     if (!parsed.is_object())
@@ -5495,6 +5598,9 @@ nlohmann::json launch_failure_diagnostics_snapshot(
     out["error_tail"] = compact_child_output_tail(error_text, 900);
     out["response_len"] = response_text.size();
     out["response_tail"] = compact_child_output_tail(response_text, 900);
+    const std::string debug_log = camoufox_debug_log_path();
+    const std::string debug_tail = read_file_tail_for_log(debug_log, 6000);
+    attach_debug_log_snapshot_locked(out, child_pid, debug_log, debug_tail);
     return out;
 }
 
@@ -5547,6 +5653,16 @@ nlohmann::json managed_launch_failure_diagnostics_snapshot(
     out["error_tail"] = compact_child_output_tail(error_text, 900);
     out["response_len"] = response_text.size();
     out["response_tail"] = compact_child_output_tail(response_text, 900);
+    const std::string debug_log = camoufox_debug_log_path();
+    const std::string debug_tail = read_file_tail_for_log(debug_log, 6000);
+    const nlohmann::json last_event = last_camoufox_debug_event_json_from_tail(debug_tail);
+    out["child_debug_log"] = debug_log;
+    out["debug_log_size"] = file_size_for_log(debug_log);
+    out["debug_tail_len"] = debug_tail.size();
+    out["last_debug_event_name"] = json_string_or(last_event, "event", std::string());
+    out["last_debug_event"] = last_event.is_object() ? last_event : nlohmann::json::object();
+    out["last_debug_event_summary"] = last_camoufox_debug_event_from_tail(debug_tail);
+    out["selected_launch_path"] = json_string_or(last_event, "selected_launch_path", json_string_or(out, "selected_launch_path", std::string()));
     return out;
 }
 
@@ -7180,14 +7296,18 @@ bool start_bridge(const launch_config_t& cfg)
             const std::vector<process_tree_entry_t> timeout_tree_entries = timed_out_pid == 0 ? std::vector<process_tree_entry_t>() : enumerate_process_tree(timed_out_pid);
             const std::string timeout_tree = compact_process_tree(timeout_tree_entries);
             const std::string debug_tail = read_file_tail_for_log(child_debug_log, 6000);
+            const nlohmann::json debug_event = last_camoufox_debug_event_json_from_tail(debug_tail);
             const std::string debug_phase = last_camoufox_debug_event_from_tail(debug_tail);
+            const std::string sidecar_timeout_phase = sidecar_timeout_phase_from_event(debug_event, "mcp_response_wait");
             sg().last_launch_diagnostics = {
                 {"status", launch_cancelled_by_stop ? "cancelled" : "timeout"},
                 {"phase", "mcp_response_wait"},
+                {"transport_phase", "mcp_response_wait"},
+                {"sidecar_timeout_phase", sidecar_timeout_phase},
                 {"caller", "start_bridge"},
                 {"cancellation_source", launch_cancelled_by_stop ? "stop_requested" : "launch_deadline"},
-                {"readiness_sub_step", "mcp_response_wait"},
-                {"timeout_phase", launch_cancelled_by_stop ? nlohmann::json(nullptr) : nlohmann::json("mcp_response_wait")},
+                {"readiness_sub_step", sidecar_timeout_phase},
+                {"timeout_phase", launch_cancelled_by_stop ? nlohmann::json(nullptr) : nlohmann::json(sidecar_timeout_phase)},
                 {"generation", start_generation},
                 {"attempt_id", args.value("bridge_attempt_id", std::string())},
                 {"session_id", effective_cfg.session_id.empty() ? std::string("default") : effective_cfg.session_id},
@@ -7221,6 +7341,7 @@ bool start_bridge(const launch_config_t& cfg)
                 {"stderr_last_frame", debug_tail},
                 {"stderr_last_frame_len", debug_tail.size()}
             };
+            attach_debug_log_snapshot_locked(sg().last_launch_diagnostics, timed_out_pid, child_debug_log, debug_tail);
             diag::log_tagged_fmt("camoufox", "launch_browser_debug_tail_read reason=%s generation=%llu child_pid=%lu debug_phase=%s debug_tail_len=%zu",
                 launch_cancelled_by_stop ? "cancelled" : "timeout",
                 static_cast<unsigned long long>(start_generation),
@@ -10263,6 +10384,128 @@ call_result_t list_pages(const std::string& session_id)
     return call_tool("list_pages", nlohmann::json::object(), 15000, session_id);
 }
 
+nlohmann::json new_page_bridge_status_diagnostics(const bridge_status_t& st)
+{
+    const bridge_health_snapshot_t health = sample_bridge_health(st.child_pid, true);
+    nlohmann::json out = {
+        {"session_id", st.session_id},
+        {"active_session_id", st.active_session_id},
+        {"state", bridge_state_name(st.state)},
+        {"generation", st.generation},
+        {"child_pid", st.child_pid},
+        {"child_alive", health.child_alive},
+        {"browser_open", st.browser_open},
+        {"page_verified", st.page_verified},
+        {"page_count", st.page_count},
+        {"active_page_id", st.active_page_id},
+        {"cleanup_pending", st.cleanup_pending},
+        {"cleanup_generation", st.cleanup_generation},
+        {"cleanup_child_pid", st.cleanup_child_pid},
+        {"cleanup_reason", st.cleanup_reason},
+        {"child_process_count", health.child_process_count},
+        {"browser_process_count", health.browser_process_count},
+        {"process_tree", health.process_tree},
+        {"last_error", st.last_error}
+    };
+    if (st.last_launch_diagnostics.is_object())
+        out["last_launch_diagnostics"] = st.last_launch_diagnostics;
+    if (st.cleanup_diagnostics.is_object())
+        out["cleanup_diagnostics"] = st.cleanup_diagnostics;
+    return out;
+}
+
+bool call_result_reports_new_page_timeout(const call_result_t& r)
+{
+    std::string evidence = ascii_lower_copy(r.error);
+    if (!r.text.empty())
+    {
+        const size_t n = std::min<size_t>(r.text.size(), 4000);
+        evidence += "\n";
+        evidence += ascii_lower_copy(r.text.substr(0, n));
+    }
+    if (r.data.is_object())
+    {
+        const char* keys[] = {
+            "status", "phase", "timeout_phase", "sidecar_timeout_phase", "transport_phase",
+            "tool", "last_debug_event_name", "readiness_sub_step", "error"
+        };
+        for (const char* key : keys)
+        {
+            const std::string value = json_string_or(r.data, key, std::string());
+            if (!value.empty())
+            {
+                evidence += "\n";
+                evidence += ascii_lower_copy(value);
+            }
+        }
+        auto event_it = r.data.find("last_debug_event");
+        if (event_it != r.data.end() && event_it->is_object())
+        {
+            const std::string event_name = json_string_or(*event_it, "event", std::string());
+            const std::string event_phase = json_string_or(*event_it, "phase", std::string());
+            if (!event_name.empty())
+            {
+                evidence += "\n";
+                evidence += ascii_lower_copy(event_name);
+            }
+            if (!event_phase.empty())
+            {
+                evidence += "\n";
+                evidence += ascii_lower_copy(event_phase);
+            }
+        }
+    }
+    const bool timeout_like = evidence.find("timeout") != std::string::npos ||
+                              evidence.find("timed out") != std::string::npos;
+    const bool page_like = evidence.find("new_page") != std::string::npos ||
+                           evidence.find("page_creation") != std::string::npos ||
+                           evidence.find("pending_page") != std::string::npos;
+    return timeout_like && page_like;
+}
+
+bool call_result_reports_pending_page_stuck(const call_result_t& r)
+{
+    if (!r.data.is_object())
+        return false;
+    const int pending_queue_len = json_int_or(r.data, "pending_queue_len", json_int_or(r.data, "queue_len", -1));
+    if (pending_queue_len > 0 || json_bool_or(r.data, "pending_page_task", false))
+        return true;
+    const std::string sidecar_phase = ascii_lower_copy(json_string_or(r.data, "sidecar_timeout_phase", std::string()));
+    const std::string timeout_phase = ascii_lower_copy(json_string_or(r.data, "timeout_phase", std::string()));
+    const std::string event_name = ascii_lower_copy(json_string_or(r.data, "last_debug_event_name", std::string()));
+    if (sidecar_phase.find("page_creation") != std::string::npos || timeout_phase.find("page_creation") != std::string::npos)
+        return true;
+    if (event_name.find("pending_page_queued") != std::string::npos || event_name.find("new_page_timeout") != std::string::npos)
+        return true;
+    auto event_it = r.data.find("last_debug_event");
+    if (event_it != r.data.end() && event_it->is_object())
+    {
+        const std::string nested_event = ascii_lower_copy(json_string_or(*event_it, "event", std::string()));
+        if (nested_event.find("pending_page_queued") != std::string::npos || nested_event.find("new_page_timeout") != std::string::npos)
+            return true;
+        const int nested_pending = json_int_or(*event_it, "pending_queue_len", json_int_or(*event_it, "queue_len", -1));
+        if (nested_pending > 0 || json_bool_or(*event_it, "pending_page_task", false))
+            return true;
+    }
+    return false;
+}
+
+bool new_page_requires_clean_relaunch(const call_result_t& r, const bridge_status_t& status_after)
+{
+    return !r.ok &&
+           status_after.browser_open &&
+           status_after.page_count == 0 &&
+           call_result_reports_new_page_timeout(r) &&
+           call_result_reports_pending_page_stuck(r);
+}
+
+void attach_new_page_recovery(call_result_t& r, const nlohmann::json& recovery)
+{
+    if (!r.data.is_object())
+        r.data = nlohmann::json::object();
+    r.data["new_page_clean_relaunch"] = recovery;
+}
+
 call_result_t new_page(const std::string& session_id, const std::string& page_id, const std::string& url, bool make_active)
 {
     nlohmann::json args;
@@ -10270,7 +10513,74 @@ call_result_t new_page(const std::string& session_id, const std::string& page_id
     if (!url.empty()) args["url"] = url;
     args["make_active"] = make_active;
     call_result_t r = call_tool("new_page", args, 30000, session_id);
-    if (!r.ok && is_default_session_id(session_id) && is_bridge_relaunchable_error(r.error))
+    bool clean_relaunch_attempted = false;
+    if (!r.ok && is_default_session_id(session_id))
+    {
+        const bridge_status_t timeout_status = get_status(session_id);
+        if (new_page_requires_clean_relaunch(r, timeout_status))
+        {
+            clean_relaunch_attempted = true;
+            const nlohmann::json original_data = r.data.is_object() ? r.data : nlohmann::json::object();
+            nlohmann::json recovery = {
+                {"trigger", "browser_open_zero_pages_pending_new_page_timeout"},
+                {"session_id", normalize_session_id(session_id)},
+                {"requested_page_id", page_id},
+                {"requested_url", url},
+                {"make_active", make_active},
+                {"original_error", r.error},
+                {"original_data", original_data},
+                {"bridge_before_teardown", new_page_bridge_status_diagnostics(timeout_status)}
+            };
+            diag::log_tagged_fmt("camoufox", "new_page clean_relaunch_begin session_id=%s page_id=%s browser_open=%d page_count=%u generation=%llu child_pid=%lu err=%s",
+                normalize_session_id(session_id).c_str(),
+                page_id.c_str(),
+                timeout_status.browser_open ? 1 : 0,
+                static_cast<unsigned>(timeout_status.page_count),
+                static_cast<unsigned long long>(timeout_status.generation),
+                static_cast<unsigned long>(timeout_status.child_pid),
+                r.error.c_str());
+            bool stopped = stop_bridge("new_page_page_creation_timeout_clean_relaunch");
+            bool force_cleanup_ok = true;
+            if (!stopped)
+            {
+                force_cleanup_ok = force_cleanup("new_page_page_creation_timeout_clean_relaunch_stop_failed");
+                stopped = force_cleanup_ok;
+            }
+            const bridge_status_t after_stop = get_status(session_id);
+            recovery["teardown_ok"] = stopped;
+            recovery["force_cleanup_ok"] = force_cleanup_ok;
+            recovery["bridge_after_teardown"] = new_page_bridge_status_diagnostics(after_stop);
+            bool ready = false;
+            if (stopped)
+                ready = ensure_ready();
+            const bridge_status_t after_ready = get_status(session_id);
+            recovery["relaunch_ready"] = ready;
+            recovery["bridge_after_relaunch"] = new_page_bridge_status_diagnostics(after_ready);
+            if (ready)
+            {
+                r = call_tool("new_page", args, 30000, session_id);
+                recovery["retry_ok"] = r.ok;
+                recovery["retry_error"] = r.error;
+                recovery["bridge_after_retry"] = new_page_bridge_status_diagnostics(get_status(session_id));
+            }
+            else
+            {
+                recovery["retry_ok"] = false;
+                recovery["retry_error"] = after_ready.last_error;
+            }
+            attach_new_page_recovery(r, recovery);
+            diag::log_tagged_fmt("camoufox", "new_page clean_relaunch_result session_id=%s page_id=%s stopped=%d ready=%d retry_ok=%d generation=%llu child_pid=%lu err=%s",
+                normalize_session_id(session_id).c_str(),
+                page_id.c_str(),
+                stopped ? 1 : 0,
+                ready ? 1 : 0,
+                r.ok ? 1 : 0,
+                static_cast<unsigned long long>(get_status(session_id).generation),
+                static_cast<unsigned long>(get_status(session_id).child_pid),
+                r.error.c_str());
+        }
+    }
+    if (!r.ok && !clean_relaunch_attempted && is_default_session_id(session_id) && is_bridge_relaunchable_error(r.error))
     {
         const bridge_status_t before = get_status(session_id);
         const bridge_health_snapshot_t before_health = sample_bridge_health(before.child_pid, true);

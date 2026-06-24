@@ -148,6 +148,39 @@ inline bool unsafe_confirmed(const json& params)
            params.value("unsafe", false);
 }
 
+inline json destructive_safe_contract_payload(const char* tool,
+                                              const char* action,
+                                              const json& params,
+                                              const char* validation_code,
+                                              const char* required_capability)
+{
+    json out;
+    out["tool"] = tool ? tool : "";
+    out["action"] = action ? action : "";
+    out["validation_code"] = validation_code ? validation_code : "";
+    out["required_capability"] = required_capability ? required_capability : "";
+    out["safe_contract"] = "fail_closed_until_explicit_unsafe_confirmation_and_validated_inputs";
+    out["mutation"] = "none";
+    out["side_effects"] = "none";
+    out["fail_closed"] = true;
+    out["functional_success"] = false;
+    out["confirm_unsafe_required"] = true;
+    out["allow_unsafe_alias_accepted"] = true;
+    out["allow_unsafe_required"] = false;
+    out["confirm_unsafe_received"] = params.value("confirm_unsafe", false);
+    out["allow_unsafe_received"] = params.value("allow_unsafe", false);
+    out["unsafe_received"] = params.value("unsafe", false);
+    out["unsafe_confirmed"] = unsafe_confirmed(params);
+    out["security_guard_pass"] = true;
+    out["device_open_attempted"] = false;
+    out["process_id"] = requested_pid(params);
+    out["driver_connected"] = driver_bridge::using_kernel_driver() && device && device->is_connected();
+    out["diag_id"] = mcp_standalone::current_call_diag_id();
+    out["deadline_ms"] = mcp_standalone::current_call_deadline_ms();
+    out["cancelled"] = mcp_standalone::current_call_cancelled();
+    return out;
+}
+
 inline tool_result_t require_driver()
 {
     if (!driver_bridge::using_kernel_driver() || !device || !device->is_connected())
@@ -3989,9 +4022,14 @@ inline tool_result_t opaque_predicate_patch(const json& params)
     if (!chk.success)
         return chk;
     if (!unsafe_confirmed(params))
-        return tool_result_t::error("opaque_predicate_patch mutates target code. Re-run with confirm_unsafe=true or allow_unsafe=true.");
+        return tool_result_t::error("opaque_predicate_patch mutates target code. Re-run with confirm_unsafe=true or allow_unsafe=true.",
+            destructive_safe_contract_payload("opaque_predicate_patch", "patch", params, "confirm_unsafe_required", "code_patch_revalidation_and_explicit_user_confirmation"));
     if (!params.contains("predicates") || !params["predicates"].is_array())
-        return tool_result_t::error("predicates array is required");
+    {
+        json out = destructive_safe_contract_payload("opaque_predicate_patch", "patch", params, "predicates_array_required", "code_patch_revalidation_and_explicit_user_confirmation");
+        out["confirm_unsafe_received"] = unsafe_confirmed(params);
+        return tool_result_t::error("predicates array is required", out);
+    }
     const std::uint32_t pid = requested_pid(params);
     active_pid_scope_t scope(pid);
     if (!scope.ok)
@@ -5855,9 +5893,57 @@ inline json drv_device_name_call_sites(const target_module_t& mod,
 
 inline tool_result_t drv_find_device_names(const json& params)
 {
+    const std::uint64_t started_ms = GetTickCount64();
     auto chk = require_driver();
     if (!chk.success)
         return chk;
+    const std::uint64_t timeout_ms = std::clamp<std::uint64_t>(parse_param_u64(params, "timeout_ms").value_or(5500), 500, 30000);
+    const std::uint64_t local_deadline = started_ms > std::numeric_limits<std::uint64_t>::max() - timeout_ms ? std::numeric_limits<std::uint64_t>::max() : started_ms + timeout_ms;
+    bool deadline_hit = false;
+    bool cancelled = false;
+    std::string stop_phase;
+    std::size_t modules_scanned = 0;
+    std::uint64_t bytes_scanned = 0;
+    std::uint64_t string_candidates_inspected = 0;
+    json module_diagnostics = json::array();
+    auto stop_requested = [&](const char* phase) -> bool {
+        if (cancelled || deadline_hit)
+            return true;
+        if (mcp_standalone::current_call_cancelled())
+        {
+            cancelled = true;
+            stop_phase = phase ? phase : "";
+            return true;
+        }
+        const std::uint64_t call_deadline = mcp_standalone::current_call_deadline_ms();
+        const std::uint64_t now = GetTickCount64();
+        if ((call_deadline != 0 && now >= call_deadline) || now >= local_deadline)
+        {
+            deadline_hit = true;
+            stop_phase = phase ? phase : "";
+            return true;
+        }
+        return false;
+    };
+    auto partial_payload = [&]() {
+        json out;
+        out["names"] = json::array();
+        out["count"] = 0;
+        out["partial"] = true;
+        out["deadline_hit"] = deadline_hit;
+        out["cancelled"] = cancelled;
+        out["phase"] = stop_phase;
+        out["timeout_ms"] = timeout_ms;
+        out["elapsed_ms"] = GetTickCount64() - started_ms;
+        out["modules_scanned"] = modules_scanned;
+        out["bytes_scanned"] = bytes_scanned;
+        out["string_candidates_inspected"] = string_candidates_inspected;
+        out["module_diagnostics"] = module_diagnostics;
+        out["mutation"] = "none";
+        out["diag_id"] = mcp_standalone::current_call_diag_id();
+        out["call_site_policy"] = "Unicode device-name strings are correlated with nearby code references and call instructions; unresolved call targets are marked as inferred.";
+        return out;
+    };
     std::vector<target_module_t> mods;
     if (params.contains("driver_name") || params.contains("module_name") || params.contains("module_base") || params.contains("module")) {
         std::string err;
@@ -5873,16 +5959,43 @@ inline tool_result_t drv_find_device_names(const json& params)
     }
     const std::uint32_t max_modules = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(parse_param_u64(params, "max_modules").value_or(32)), 1, 128);
     json found = json::array();
+    auto partial_with_found = [&]() {
+        json out = partial_payload();
+        out["names"] = found;
+        out["count"] = found.size();
+        return out;
+    };
     std::set<std::string> seen;
     for (std::size_t mi = 0; mi < mods.size() && mi < max_modules; ++mi) {
+        if (stop_requested("module_loop"))
+            return tool_result_t::error(cancelled ? "Driver device-name scan cancelled." : "Driver device-name scan deadline reached.", partial_with_found());
         const auto& mod = mods[mi];
+        json mod_diag{{"module", mod.name}, {"base", sa_format_address(mod.base)}, {"size", mod.size}};
+        const std::uint64_t module_started_ms = GetTickCount64();
         const std::uint64_t scan_size = std::min<std::uint64_t>(mod.size ? mod.size : 0x200000, 16ull * 1024ull * 1024ull);
         std::vector<std::uint8_t> bytes;
         if (!read_target_memory(0, mod.base, static_cast<std::size_t>(scan_size), bytes) || bytes.size() < 16)
+        {
+            mod_diag["read_ok"] = false;
+            mod_diag["elapsed_ms"] = GetTickCount64() - module_started_ms;
+            module_diagnostics.push_back(std::move(mod_diag));
             continue;
+        }
+        bytes_scanned += bytes.size();
+        ++modules_scanned;
+        mod_diag["read_ok"] = true;
+        mod_diag["bytes_read"] = bytes.size();
         pe_layout_t pe;
         const bool pe_ok = read_pe_layout(0, mod.base, pe);
         for (std::size_t i = 0; i + 16 < bytes.size(); i += 2) {
+            if ((i & 0x3FFFu) == 0 && stop_requested("string_scan"))
+            {
+                mod_diag["partial"] = true;
+                mod_diag["last_rva"] = i;
+                mod_diag["elapsed_ms"] = GetTickCount64() - module_started_ms;
+                module_diagnostics.push_back(std::move(mod_diag));
+                return tool_result_t::error(cancelled ? "Driver device-name scan cancelled." : "Driver device-name scan deadline reached.", partial_with_found());
+            }
             const char* type = nullptr;
             if (utf16_at(bytes, i, L"\\Device\\"))
                 type = "device";
@@ -5893,6 +6006,7 @@ inline tool_result_t drv_find_device_names(const json& params)
             std::string name = read_utf16_ascii(bytes, i, 260);
             if (name.size() < 4)
                 continue;
+            ++string_candidates_inspected;
             const std::uint64_t string_va = mod.base + i;
             const std::string seen_key = mod.name + "|" + sa_format_address(string_va) + "|" + type;
             if (!seen.insert(seen_key).second)
@@ -5925,6 +6039,9 @@ inline tool_result_t drv_find_device_names(const json& params)
             if (found.size() >= 256)
                 break;
         }
+        mod_diag["elapsed_ms"] = GetTickCount64() - module_started_ms;
+        mod_diag["pe_parsed"] = pe_ok;
+        module_diagnostics.push_back(std::move(mod_diag));
         if (found.size() >= 256)
             break;
     }
@@ -5933,6 +6050,15 @@ inline tool_result_t drv_find_device_names(const json& params)
     out["count"] = found.size();
     out["confidence"] = found.empty() ? 0.0 : 0.82;
     out["call_site_policy"] = "Unicode device-name strings are correlated with nearby code references and call instructions; unresolved call targets are marked as inferred.";
+    out["partial"] = false;
+    out["deadline_hit"] = false;
+    out["cancelled"] = false;
+    out["timeout_ms"] = timeout_ms;
+    out["elapsed_ms"] = GetTickCount64() - started_ms;
+    out["modules_scanned"] = modules_scanned;
+    out["bytes_scanned"] = bytes_scanned;
+    out["string_candidates_inspected"] = string_candidates_inspected;
+    out["module_diagnostics"] = module_diagnostics;
     return tool_result_t::ok("Driver device-name scan completed", out);
 }
 
@@ -6076,26 +6202,52 @@ inline std::wstring utf8_to_wide(const std::string& s)
 inline tool_result_t drv_send_ioctl(const json& params)
 {
     if (!unsafe_confirmed(params))
-        return tool_result_t::error("drv_send_ioctl can change device or kernel state. Re-run with confirm_unsafe=true or allow_unsafe=true.");
+        return tool_result_t::error("drv_send_ioctl can change device or kernel state. Re-run with confirm_unsafe=true or allow_unsafe=true.",
+            destructive_safe_contract_payload("drv_send_ioctl", "send_ioctl", params, "confirm_unsafe_required", "explicit_device_ioctl_dispatch_confirmation"));
     const std::string symlink = params.value("device_symlink", std::string());
     auto code = parse_param_u64(params, "ioctl_code");
     if (symlink.empty() || !code)
-        return tool_result_t::error("device_symlink and ioctl_code are required");
+    {
+        json out = destructive_safe_contract_payload("drv_send_ioctl", "send_ioctl", params, "device_symlink_or_ioctl_code_required", "explicit_device_ioctl_dispatch_confirmation");
+        out["device_symlink_present"] = !symlink.empty();
+        out["ioctl_code_present"] = code.has_value();
+        out["confirm_unsafe_received"] = unsafe_confirmed(params);
+        return tool_result_t::error("device_symlink and ioctl_code are required", out);
+    }
     std::vector<std::uint8_t> in;
     if (params.contains("input_buffer_hex") && params["input_buffer_hex"].is_string()) {
         std::string hex_error;
         if (!hex_to_bytes_strict(params["input_buffer_hex"].get<std::string>(), in, hex_error))
-            return tool_result_t::error(hex_error, json{{"input_buffer_hex_valid", false}});
+        {
+            json out = destructive_safe_contract_payload("drv_send_ioctl", "send_ioctl", params, "input_buffer_hex_invalid", "explicit_device_ioctl_dispatch_confirmation");
+            out["input_buffer_hex_valid"] = false;
+            out["validation_error"] = hex_error;
+            out["input_buffer_hex_length"] = params["input_buffer_hex"].get<std::string>().size();
+            out["confirm_unsafe_received"] = unsafe_confirmed(params);
+            return tool_result_t::error(hex_error, out);
+        }
     }
     if (in.size() > 1024u * 1024u)
-        return tool_result_t::error("input_buffer_hex is too large; max 1MB");
+    {
+        json out = destructive_safe_contract_payload("drv_send_ioctl", "send_ioctl", params, "input_buffer_too_large", "explicit_device_ioctl_dispatch_confirmation");
+        out["input_buffer_size"] = in.size();
+        out["max_input_buffer_size"] = 1024u * 1024u;
+        out["confirm_unsafe_received"] = unsafe_confirmed(params);
+        return tool_result_t::error("input_buffer_hex is too large; max 1MB", out);
+    }
     std::uint32_t out_size = static_cast<std::uint32_t>(parse_param_u64(params, "output_buffer_size").value_or(4096));
     out_size = std::clamp<std::uint32_t>(out_size, 0, 1024u * 1024u);
     std::vector<std::uint8_t> out_buf(out_size);
     HANDLE h = CreateFileW(utf8_to_wide(symlink).c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) {
         const DWORD gle = GetLastError();
-        return tool_result_t::error("CreateFileW failed for device symlink", json{{"device_symlink", symlink}, {"gle", gle}});
+        json out = destructive_safe_contract_payload("drv_send_ioctl", "send_ioctl", params, "device_open_failed", "explicit_device_ioctl_dispatch_confirmation");
+        out["device_symlink"] = symlink;
+        out["ioctl_code"] = sa_format_address(*code);
+        out["gle"] = gle;
+        out["device_open_attempted"] = true;
+        out["confirm_unsafe_received"] = unsafe_confirmed(params);
+        return tool_result_t::error("CreateFileW failed for device symlink", out);
     }
     DWORD returned = 0;
     SetLastError(0);
@@ -6110,6 +6262,9 @@ inline tool_result_t drv_send_ioctl(const json& params)
     out["ioctl_code"] = sa_format_address(*code);
     out["bytes_returned"] = returned;
     out["output_buffer_hex"] = bytes_to_hex(out_buf, 4096);
+    out["mutation"] = ok ? "ioctl_dispatched" : "none";
+    out["device_symlink"] = symlink;
+    out["confirm_unsafe_received"] = unsafe_confirmed(params);
     return ok ? tool_result_t::ok("DeviceIoControl completed", out) : tool_result_t::error("DeviceIoControl failed", out);
 }
 
@@ -6206,12 +6361,21 @@ inline json smc_safe_contract_payload(const char* action, const json& p, const c
     out["backend"] = "whoswho_driver_page_guard";
     out["required_capability"] = "whoswho_driver_page_guard_confirmed_session";
     out["mutation"] = "none";
+    out["side_effects"] = "none";
+    out["fail_closed"] = true;
+    out["functional_success"] = false;
     out["safe_contract"] = contract ? contract : "fail_closed";
     out["validation_code"] = validation_code ? validation_code : "";
     out["active_session_ids"] = smc_active_session_ids_json();
     out["active_session_count"] = out["active_session_ids"].size();
     out["confirm_unsafe_required"] = std::string(action ? action : "") == "start";
+    out["allow_unsafe_alias_accepted"] = true;
+    out["allow_unsafe_required"] = false;
     out["confirm_unsafe_received"] = unsafe_confirmed(p);
+    out["device_open_attempted"] = false;
+    out["security_guard_pass"] = true;
+    out["driver_connected"] = driver_bridge::using_kernel_driver() && device && device->is_connected();
+    out["diag_id"] = mcp_standalone::current_call_diag_id();
     if (auto id = parse_param_u64(p, "session_id"))
         out["session_id"] = *id;
     if (auto va = parse_param_u64(p, "watch_va"))
@@ -6236,10 +6400,12 @@ inline tool_result_t smc_manage(const json& params)
         auto va = parse_param_u64(p, "watch_va");
         auto size = parse_param_u64(p, "watch_size");
         if (!va || !size || *size == 0)
-            return tool_result_t::error("watch_va and watch_size are required for start");
+            return tool_result_t::error("watch_va and watch_size are required for start",
+                smc_safe_contract_payload("start", p, "fail_closed_invalid_start_params", "watch_va_watch_size_required"));
         const std::uint32_t pid = requested_pid(p);
         if (pid == 0)
-            return tool_result_t::error("An attached process or process_id is required");
+            return tool_result_t::error("An attached process or process_id is required",
+                smc_safe_contract_payload("start", p, "fail_closed_invalid_start_params", "process_id_required"));
         const std::uint64_t bounded_size = std::min<std::uint64_t>(*size, 1024ull * 1024ull);
         const bool capture_on_write = p.value("capture_on_write", true);
         const bool capture_on_execute = p.value("capture_on_execute", true);
@@ -6248,8 +6414,14 @@ inline tool_result_t smc_manage(const json& params)
             std::min<std::uint64_t>(parse_param_u64(p, "max_records_per_drain").value_or(64), 4096));
         const std::uint32_t sid = page_guard_engine::g_pg_engine.install(pid, *va, bounded_size, capture_payloads, max_records, true);
         if (sid == 0) {
-            return tool_result_t::error("Failed to install WhosWho driver-backed PAGE_GUARD capture session.",
-                json{{"pid", pid}, {"watch_va", sa_format_address(*va)}, {"watch_size", bounded_size}, {"capture_payloads", capture_payloads}, {"failure", page_guard_install_failure_json()}});
+            json out = smc_safe_contract_payload("start", p, "fail_closed_page_guard_install_failed", "page_guard_install_failed");
+            out["pid"] = pid;
+            out["watch_va"] = sa_format_address(*va);
+            out["watch_size"] = bounded_size;
+            out["capture_payloads"] = capture_payloads;
+            out["dependency_blocked"] = true;
+            out["failure"] = page_guard_install_failure_json();
+            return tool_result_t::error("Failed to install WhosWho driver-backed PAGE_GUARD capture session.", out);
         }
         return tool_result_t::ok("SMC PAGE_GUARD capture session started",
             json{{"session_id", sid}, {"page_guard_session_id", sid}, {"pid", pid}, {"watch_va", sa_format_address(*va)}, {"watch_size", bounded_size}, {"capture_payloads", capture_payloads}, {"capture_on_write", capture_on_write}, {"capture_on_execute", capture_on_execute}, {"max_records_per_drain", max_records}, {"backend", "whoswho_driver_page_guard"}});
@@ -6365,10 +6537,35 @@ inline json compare_section_to_disk(const mapped_section_t& sec, const std::vect
 
 inline tool_result_t smc_scan_encrypted_regions(const json& params)
 {
+    const std::uint64_t started_ms = GetTickCount64();
     auto chk = require_driver();
     if (!chk.success)
         return chk;
     const std::uint32_t pid = requested_pid(params);
+    const std::uint64_t timeout_ms = std::clamp<std::uint64_t>(parse_param_u64(params, "timeout_ms").value_or(5500), 500, 30000);
+    const std::uint64_t local_deadline = started_ms > std::numeric_limits<std::uint64_t>::max() - timeout_ms ? std::numeric_limits<std::uint64_t>::max() : started_ms + timeout_ms;
+    bool deadline_hit = false;
+    bool cancelled = false;
+    std::string stop_phase;
+    auto stop_requested = [&](const char* phase) -> bool {
+        if (cancelled || deadline_hit)
+            return true;
+        if (mcp_standalone::current_call_cancelled())
+        {
+            cancelled = true;
+            stop_phase = phase ? phase : "";
+            return true;
+        }
+        const std::uint64_t call_deadline = mcp_standalone::current_call_deadline_ms();
+        const std::uint64_t now = GetTickCount64();
+        if ((call_deadline != 0 && now >= call_deadline) || now >= local_deadline)
+        {
+            deadline_hit = true;
+            stop_phase = phase ? phase : "";
+            return true;
+        }
+        return false;
+    };
     auto direct_base = parse_param_u64(params, "range_base");
     if (!direct_base)
         direct_base = parse_param_u64(params, "scan_base");
@@ -6392,16 +6589,56 @@ inline tool_result_t smc_scan_encrypted_regions(const json& params)
         const bool region_ok = driver_bridge::query_memory_for(pid, *direct_base, region);
         const bool mem_exec = region_ok ? executable_protect(region.protect) : false;
         const bool mem_write = region_ok && ((region.protect & 0xFFu) == PAGE_EXECUTE_READWRITE || (region.protect & 0xFFu) == PAGE_EXECUTE_WRITECOPY || (region.protect & 0xFFu) == PAGE_READWRITE || (region.protect & 0xFFu) == PAGE_WRITECOPY);
+        std::vector<std::uint8_t> provided_marker;
+        std::string marker_source;
+        std::string marker_hex_error;
+        auto load_marker_hex = [&](const char* key) -> bool {
+            if (!params.contains(key) || !params[key].is_string())
+                return true;
+            marker_source = key;
+            return hex_to_bytes_strict(params[key].get<std::string>(), provided_marker, marker_hex_error);
+        };
+        if (!load_marker_hex("marker_bytes_hex") || !load_marker_hex("marker_hex"))
+        {
+            json out = destructive_safe_contract_payload("smc_scan_encrypted_regions", "scan", params, "marker_hex_invalid", "bounded_range_marker_or_entropy_evidence");
+            out["pid"] = pid;
+            out["range_base"] = sa_format_address(*direct_base);
+            out["range_size"] = bounded_size;
+            out["marker_source"] = marker_source;
+            out["marker_hex_valid"] = false;
+            out["validation_error"] = marker_hex_error;
+            return tool_result_t::error("SMC marker hex is invalid.", out);
+        }
+        if (provided_marker.empty() && params.contains("marker") && params["marker"].is_string())
+        {
+            const std::string marker_text = params["marker"].get<std::string>();
+            if (!marker_text.empty() && marker_text.size() <= 256)
+            {
+                marker_source = "marker";
+                provided_marker.assign(marker_text.begin(), marker_text.end());
+            }
+        }
         auto marker_va = parse_param_u64(params, "marker_va");
         auto marker_size = parse_param_u64(params, "marker_size");
         std::uint64_t marker_hits = 0;
         bool marker_read = false;
         bool range_contains_marker = false;
-        if (marker_va && marker_size && *marker_size != 0 && *marker_size <= 256 && *marker_va >= *direct_base && (*marker_va - *direct_base) + *marker_size <= bytes.size()) {
+        if (!provided_marker.empty())
+        {
+            marker_read = true;
+            range_contains_marker = true;
+            auto it = bytes.begin();
+            while ((it = std::search(it, bytes.end(), provided_marker.begin(), provided_marker.end())) != bytes.end()) {
+                ++marker_hits;
+                ++it;
+            }
+        }
+        if (provided_marker.empty() && marker_va && marker_size && *marker_size != 0 && *marker_size <= 256 && *marker_va >= *direct_base && (*marker_va - *direct_base) + *marker_size <= bytes.size()) {
             range_contains_marker = true;
             std::vector<std::uint8_t> marker;
             marker_read = read_target_memory(pid, *marker_va, static_cast<std::size_t>(*marker_size), marker) && marker.size() == *marker_size;
             if (marker_read && !marker.empty()) {
+                marker_source = "marker_va";
                 auto it = bytes.begin();
                 while ((it = std::search(it, bytes.end(), marker.begin(), marker.end())) != bytes.end()) {
                     ++marker_hits;
@@ -6424,9 +6661,14 @@ inline tool_result_t smc_scan_encrypted_regions(const json& params)
                  {"marker_size", marker_size ? json(*marker_size) : json(nullptr)},
                  {"range_contains_marker", range_contains_marker},
                  {"marker_read", marker_read},
+                 {"marker_source", marker_source.empty() ? json(nullptr) : json(marker_source)},
+                 {"marker_bytes_provided", !provided_marker.empty()},
+                 {"marker_evidence_state", marker_hits != 0 ? "marker_hits_proven" : (marker_read ? "marker_read_no_hits" : "marker_not_provided")},
+                 {"entropy_evidence_state", ent > 7.0 ? "high_entropy_proven" : "entropy_below_high_threshold"},
                  {"marker_hits", marker_hits},
+                 {"descriptor_marker_evidence", json{{"marker_source", marker_source.empty() ? json(nullptr) : json(marker_source)}, {"marker_read", marker_read}, {"marker_hits", marker_hits}, {"semantic_marker_proven", marker_hits != 0}}},
                  {"memory_protection", region_ok ? json{{"base", sa_format_address(region.base)}, {"size", region.size}, {"protect", protection_name(region.protect)}, {"protect_raw", sa_format_address(region.protect)}, {"state", sa_format_address(region.state)}, {"type", sa_format_address(region.type)}, {"executable", mem_exec}, {"writable", mem_write}, {"guard", (region.protect & PAGE_GUARD) != 0}} : json{{"queried", false}}}};
-        return tool_result_t::ok(json{{"regions", json::array({row})}, {"count", 1}, {"direct_range", true}, {"bytes_scanned", bytes.size()}, {"marker_hits", marker_hits}, {"pid", pid}});
+        return tool_result_t::ok(json{{"regions", json::array({row})}, {"count", 1}, {"direct_range", true}, {"bytes_scanned", bytes.size()}, {"marker_hits", marker_hits}, {"semantic_marker_proven", marker_hits != 0}, {"marker_evidence_state", row["marker_evidence_state"]}, {"entropy_evidence_state", row["entropy_evidence_state"]}, {"functional_success", decrypt_candidate}, {"partial", false}, {"deadline_hit", false}, {"cancelled", false}, {"timeout_ms", timeout_ms}, {"elapsed_ms", GetTickCount64() - started_ms}, {"pid", pid}});
     }
     std::vector<target_module_t> mods;
     if (params.contains("module_base") || params.contains("module_name") || params.contains("module")) {
@@ -6441,13 +6683,32 @@ inline tool_result_t smc_scan_encrypted_regions(const json& params)
     json regions = json::array();
     std::uint64_t bytes_scanned = 0;
     std::size_t sections_scanned = 0;
+    auto partial_payload = [&]() {
+        return json{{"regions", regions},
+                    {"count", regions.size()},
+                    {"direct_range", false},
+                    {"bytes_scanned", bytes_scanned},
+                    {"sections_scanned", sections_scanned},
+                    {"module_count", mods.size()},
+                    {"pid", pid},
+                    {"partial", true},
+                    {"deadline_hit", deadline_hit},
+                    {"cancelled", cancelled},
+                    {"phase", stop_phase},
+                    {"timeout_ms", timeout_ms},
+                    {"elapsed_ms", GetTickCount64() - started_ms}};
+    };
     for (const auto& m : mods) {
+        if (stop_requested("module_loop"))
+            return tool_result_t::error(cancelled ? "SMC encrypted-region scan cancelled." : "SMC encrypted-region scan deadline reached.", partial_payload());
         pe_layout_t pe;
         if (!read_pe_layout(pid, m.base, pe))
             continue;
         std::vector<std::uint8_t> file_bytes;
         const bool file_ok = read_file_bytes_win32(m.path, file_bytes);
         for (auto sec : pe.sections) {
+            if (stop_requested("section_loop"))
+                return tool_result_t::error(cancelled ? "SMC encrypted-region scan cancelled." : "SMC encrypted-region scan deadline reached.", partial_payload());
             const std::uint32_t size = sec.virtual_size ? sec.virtual_size : sec.raw_size;
             if (size == 0)
                 continue;
@@ -6484,7 +6745,7 @@ inline tool_result_t smc_scan_encrypted_regions(const json& params)
             }
         }
     }
-    return tool_result_t::ok(json{{"regions", regions}, {"count", regions.size()}, {"direct_range", false}, {"bytes_scanned", bytes_scanned}, {"sections_scanned", sections_scanned}, {"module_count", mods.size()}, {"pid", pid}});
+    return tool_result_t::ok(json{{"regions", regions}, {"count", regions.size()}, {"direct_range", false}, {"bytes_scanned", bytes_scanned}, {"sections_scanned", sections_scanned}, {"module_count", mods.size()}, {"pid", pid}, {"partial", false}, {"deadline_hit", false}, {"cancelled", false}, {"timeout_ms", timeout_ms}, {"elapsed_ms", GetTickCount64() - started_ms}});
 }
 
 inline tool_result_t smc_detect_selfmod(const json& params)
@@ -7324,19 +7585,41 @@ inline tool_result_t pack_find_oep(const json& params)
     if (!chk.success)
         return chk;
     if (!unsafe_confirmed(params))
-        return tool_result_t::error("pack_find_oep installs temporary PAGE_GUARD or hardware-breakpoint observation. Re-run with confirm_unsafe=true or allow_unsafe=true.");
+        return tool_result_t::error("pack_find_oep installs temporary PAGE_GUARD or hardware-breakpoint observation. Re-run with confirm_unsafe=true or allow_unsafe=true.",
+            destructive_safe_contract_payload("pack_find_oep", "find_oep", params, "confirm_unsafe_required", "temporary_page_guard_or_hardware_breakpoint_observation"));
     const std::uint32_t pid = requested_pid(params);
     if (pid == 0)
-        return tool_result_t::error("An attached process or process_id is required");
+        return tool_result_t::error("An attached process or process_id is required",
+            destructive_safe_contract_payload("pack_find_oep", "find_oep", params, "process_id_required", "temporary_page_guard_or_hardware_breakpoint_observation"));
     std::string err;
     auto mod = select_user_main_module(params, &err);
     if (!mod)
         return tool_result_t::error(err.empty() ? "No target module found" : err);
     const std::string strategy = lower_ascii(params.value("strategy", std::string("all")));
     if (strategy != "all" && strategy != "page_guard" && strategy != "tail_jump" && strategy != "esp_trick")
-        return tool_result_t::error("strategy must be one of all, page_guard, tail_jump, or esp_trick");
+        return tool_result_t::error("strategy must be one of all, page_guard, tail_jump, or esp_trick",
+            destructive_safe_contract_payload("pack_find_oep", "find_oep", params, "invalid_strategy", "temporary_page_guard_or_hardware_breakpoint_observation"));
     std::uint32_t timeout_ms = static_cast<std::uint32_t>(parse_param_u64(params, "timeout_ms").value_or(30000));
     timeout_ms = std::clamp<std::uint32_t>(timeout_ms, 100, 120000);
+    bool deadline_hit = false;
+    bool cancelled = false;
+    std::string stop_phase;
+    auto stop_requested = [&](const char* phase) -> bool {
+        if (mcp_standalone::current_call_cancelled())
+        {
+            cancelled = true;
+            stop_phase = phase ? phase : "";
+            return true;
+        }
+        const std::uint64_t call_deadline = mcp_standalone::current_call_deadline_ms();
+        if (call_deadline != 0 && GetTickCount64() >= call_deadline)
+        {
+            deadline_hit = true;
+            stop_phase = phase ? phase : "";
+            return true;
+        }
+        return false;
+    };
     std::uint32_t tid = 0;
     if (auto t = parse_param_u64(params, "tid"))
         tid = static_cast<std::uint32_t>(*t);
@@ -7380,8 +7663,12 @@ inline tool_result_t pack_find_oep(const json& params)
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
         std::set<std::uint64_t> seen_candidates;
         while (!sessions.empty() && std::chrono::steady_clock::now() < deadline) {
+            if (stop_requested("page_guard_wait"))
+                break;
             bool any = false;
             for (const auto& session : sessions) {
+                if (stop_requested("page_guard_drain"))
+                    break;
                 auto records = page_guard_engine::g_pg_engine.get_capture_records(session.first);
                 if (!records.empty())
                     any = true;
@@ -7402,8 +7689,15 @@ inline tool_result_t pack_find_oep(const json& params)
             }
             if (seen_candidates.size() >= 8)
                 break;
+            if (deadline_hit || cancelled)
+                break;
             if (!any)
                 std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+        if (!cancelled && !deadline_hit && std::chrono::steady_clock::now() >= deadline)
+        {
+            deadline_hit = true;
+            stop_phase = "page_guard_timeout";
         }
         json uninstalled = json::array();
         for (const auto& session : sessions)
@@ -7412,11 +7706,14 @@ inline tool_result_t pack_find_oep(const json& params)
         ev["install_failures"] = failures;
         ev["captures"] = capture_evidence;
         ev["capture_count"] = capture_evidence.size();
+        ev["deadline_hit"] = deadline_hit;
+        ev["cancelled"] = cancelled;
+        ev["stop_phase"] = stop_phase;
         ev["uninstalled"] = uninstalled;
         ev["result"] = seen_candidates.empty() ? (installed.empty() ? "install_failed" : "no_page_guard_hits") : "candidate_found";
         evidence.push_back(std::move(ev));
     }
-    if (strategy == "tail_jump" || strategy == "all") {
+    if (!deadline_hit && !cancelled && (strategy == "tail_jump" || strategy == "all")) {
         json ev;
         ev["strategy"] = "tail_jump";
         auto insns = disassemble_target(pid, pe.entry, 0x4000, 1024);
@@ -7436,7 +7733,7 @@ inline tool_result_t pack_find_oep(const json& params)
             ev["result"] = "no_module_tail_transfer";
         evidence.push_back(std::move(ev));
     }
-    if (strategy == "esp_trick" || strategy == "all") {
+    if (!deadline_hit && !cancelled && (strategy == "esp_trick" || strategy == "all")) {
         run_stack_restore_oep_heuristic(pid, tid, *mod, pe, candidates, evidence);
     }
     json out;
@@ -7449,6 +7746,12 @@ inline tool_result_t pack_find_oep(const json& params)
     out["module"] = mod->name;
     out["module_base"] = sa_format_address(mod->base);
     out["timeout_ms"] = timeout_ms;
+    out["deadline_hit"] = deadline_hit;
+    out["cancelled"] = cancelled;
+    out["partial"] = deadline_hit || cancelled;
+    out["stop_phase"] = stop_phase;
+    if (deadline_hit || cancelled)
+        return tool_result_t::error(cancelled ? "OEP scan cancelled before all requested strategies completed." : "OEP scan deadline reached before all requested strategies completed.", out);
     if (strategy == "page_guard" && candidates.empty())
         return tool_result_t::error("PAGE_GUARD OEP scan completed without live OEP hits.", out);
     return tool_result_t::ok("OEP scan completed", out);
@@ -7578,10 +7881,12 @@ inline tool_result_t pack_iat_manage(const json& params)
     const json p = compat_action_payload(params);
     if (action == "start") {
         if (!unsafe_confirmed(params) && !unsafe_confirmed(p))
-            return tool_result_t::error("pack_iat_manage start writes hardware breakpoint registers in target threads. Re-run with confirm_unsafe=true or allow_unsafe=true.");
+            return tool_result_t::error("pack_iat_manage start writes hardware breakpoint registers in target threads. Re-run with confirm_unsafe=true or allow_unsafe=true.",
+                destructive_safe_contract_payload("pack_iat_manage", "start", p, "confirm_unsafe_required", "temporary_hardware_breakpoint_import_resolution_observation"));
         const std::uint32_t pid = requested_pid(p);
         if (pid == 0)
-            return tool_result_t::error("An attached process or process_id is required");
+            return tool_result_t::error("An attached process or process_id is required",
+                destructive_safe_contract_payload("pack_iat_manage", "start", p, "process_id_required", "temporary_hardware_breakpoint_import_resolution_observation"));
         const std::vector<std::pair<const char*, const char*>> exports = {
             {"kernel32.dll", "GetProcAddress"},
             {"kernel32.dll", "LoadLibraryExA"},
@@ -7656,7 +7961,11 @@ inline tool_result_t pack_iat_manage(const json& params)
             std::lock_guard<std::mutex> lk(iat_mutex());
             auto it = iat_sessions().find(id);
             if (it == iat_sessions().end())
-                return tool_result_t::error("session_id not found");
+            {
+                json out = destructive_safe_contract_payload("pack_iat_manage", "results", p, "session_id_not_found", "existing_iat_observation_session");
+                out["session_id"] = id;
+                return tool_result_t::error("session_id not found", out);
+            }
             s = it->second;
         }
         std::string err;
@@ -7681,7 +7990,11 @@ inline tool_result_t pack_iat_manage(const json& params)
             std::lock_guard<std::mutex> lk(iat_mutex());
             auto it = iat_sessions().find(id);
             if (it == iat_sessions().end())
-                return tool_result_t::error("session_id not found");
+            {
+                json out = destructive_safe_contract_payload("pack_iat_manage", "stop", p, "session_id_not_found", "existing_iat_observation_session");
+                out["session_id"] = id;
+                return tool_result_t::error("session_id not found", out);
+            }
             s = it->second;
             iat_sessions().erase(it);
         }

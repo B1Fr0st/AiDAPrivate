@@ -6,7 +6,9 @@
 #include "toast_notification.hpp"
 #include "arc/arc.h"
 #include "comm.h"
+#include "critical_work_queue.hpp"
 #include "event_bus.hpp"
+#include "win_thread.hpp"
 #include "work_queue.hpp"
 #include "../mcp/mcp_standalone.hpp"
 #include "../helpers/diag_log.hpp"
@@ -20,9 +22,11 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cerrno>
 #include <cstdarg>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <functional>
@@ -158,6 +162,74 @@ namespace
     unsigned long long fn_bits(Fn fn)
     {
         return static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(fn));
+    }
+
+    struct bridge_region_snapshot_t
+    {
+        bool ok = false;
+        DWORD gle = ERROR_SUCCESS;
+        uint64_t base = 0;
+        uint64_t allocation_base = 0;
+        uint64_t size = 0;
+        DWORD state = 0;
+        DWORD protect = 0;
+        DWORD type = 0;
+        DWORD allocation_protect = 0;
+    };
+
+    bridge_region_snapshot_t capture_bridge_region_snapshot(uint64_t address)
+    {
+        bridge_region_snapshot_t snap{};
+        HANDLE process = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            process = g_process;
+        }
+        if (!process) {
+            snap.gle = ERROR_INVALID_HANDLE;
+            return snap;
+        }
+        MEMORY_BASIC_INFORMATION mbi{};
+        SetLastError(ERROR_SUCCESS);
+        if (VirtualQueryEx(process, reinterpret_cast<LPCVOID>(static_cast<uintptr_t>(address)), &mbi, sizeof(mbi)) == sizeof(mbi)) {
+            snap.ok = true;
+            snap.base = reinterpret_cast<uint64_t>(mbi.BaseAddress);
+            snap.allocation_base = reinterpret_cast<uint64_t>(mbi.AllocationBase);
+            snap.size = static_cast<uint64_t>(mbi.RegionSize);
+            snap.state = mbi.State;
+            snap.protect = mbi.Protect;
+            snap.type = mbi.Type;
+            snap.allocation_protect = mbi.AllocationProtect;
+        } else {
+            snap.gle = GetLastError();
+        }
+        return snap;
+    }
+
+    std::string format_byte_prefix(const uint8_t* data, size_t size)
+    {
+        if (!data || size == 0)
+            return "<empty>";
+        char tmp[4] = {};
+        std::string out;
+        const size_t n = (std::min)(size, static_cast<size_t>(16));
+        out.reserve(n * 2);
+        for (size_t i = 0; i < n; ++i) {
+            _snprintf_s(tmp, sizeof(tmp), _TRUNCATE, "%02X", static_cast<unsigned>(data[i]));
+            out += tmp;
+        }
+        return out;
+    }
+
+    bool bytes_all_zero(const uint8_t* data, size_t size)
+    {
+        if (!data || size == 0)
+            return false;
+        for (size_t i = 0; i < size; ++i) {
+            if (data[i] != 0)
+                return false;
+        }
+        return true;
     }
 
     struct arc_attach_resolution_t
@@ -671,14 +743,91 @@ namespace
         char abandoned_reason[32] = {};
     };
 
+    struct lower_executor_pe_stack_t
+    {
+        bool ok = false;
+        DWORD gle = ERROR_SUCCESS;
+        uint64_t reserve = 0;
+        uint64_t commit = 0;
+    };
+
+    struct lower_executor_job_snapshot_t
+    {
+        bool is_process_in_job_ok = false;
+        bool in_job = false;
+        bool limits_ok = false;
+        DWORD is_process_in_job_gle = ERROR_SUCCESS;
+        DWORD limits_gle = ERROR_SUCCESS;
+        DWORD limit_flags = 0;
+        DWORD active_process_limit = 0;
+        SIZE_T process_memory_limit = 0;
+        SIZE_T job_memory_limit = 0;
+        SIZE_T peak_process_memory_used = 0;
+        SIZE_T peak_job_memory_used = 0;
+    };
+
+    struct lower_executor_pool_snapshot_t
+    {
+        bool alive = false;
+        bool shutting_down = false;
+        int pool_size = 0;
+        size_t workers = 0;
+        size_t pending = 0;
+        uint32_t active = 0;
+        uint64_t post_attempts = 0;
+        uint64_t posted = 0;
+        uint64_t rejected = 0;
+        uint64_t started = 0;
+        uint64_t finished = 0;
+        uint64_t oldest_active_ms = 0;
+        uint32_t active_label_count = 0;
+        std::string active_labels;
+    };
+
+    struct lower_executor_thread_inventory_t
+    {
+        lower_executor_pool_snapshot_t work_queue;
+        lower_executor_pool_snapshot_t service_queue;
+        lower_executor_pool_snapshot_t critical_queue;
+    };
+
     struct lower_executor_process_stats_t
     {
         DWORD handle_count = 0;
         DWORD thread_count = 0;
         SIZE_T private_bytes = 0;
         SIZE_T working_set = 0;
+        SIZE_T pagefile_usage = 0;
+        SIZE_T peak_working_set = 0;
+        SIZE_T quota_paged_pool = 0;
+        SIZE_T quota_nonpaged_pool = 0;
+        SIZE_T min_working_set = 0;
+        SIZE_T max_working_set = 0;
+        DWORD working_set_flags = 0;
+        DWORD memory_load = 0;
+        DWORDLONG total_phys = 0;
+        DWORDLONG avail_phys = 0;
+        DWORDLONG total_page_file = 0;
+        DWORDLONG avail_page_file = 0;
+        DWORDLONG total_virtual = 0;
+        DWORDLONG avail_virtual = 0;
+        SIZE_T commit_total = 0;
+        SIZE_T commit_limit = 0;
+        SIZE_T commit_peak = 0;
+        SIZE_T physical_total = 0;
+        SIZE_T physical_available = 0;
+        SIZE_T system_cache = 0;
+        SIZE_T kernel_total = 0;
+        SIZE_T kernel_paged = 0;
+        SIZE_T kernel_nonpaged = 0;
         bool handle_count_ok = false;
         bool memory_ok = false;
+        bool working_set_limits_ok = false;
+        bool global_memory_ok = false;
+        bool performance_ok = false;
+        lower_executor_pe_stack_t pe_stack;
+        lower_executor_job_snapshot_t job;
+        lower_executor_thread_inventory_t pools;
     };
 
     struct lower_remote_call_work_item_t
@@ -705,10 +854,49 @@ namespace
 
     std::mutex g_remote_call_lower_executor_mutex;
     std::condition_variable g_remote_call_lower_executor_cv;
+    std::condition_variable g_remote_call_lower_start_cv;
     std::deque<std::shared_ptr<lower_remote_call_work_item_t>> g_remote_call_lower_queue;
-    std::thread g_remote_call_lower_worker;
+    HANDLE g_remote_call_lower_worker_handle = nullptr;
+    unsigned g_remote_call_lower_worker_begin_tid = 0;
     std::atomic_bool g_remote_call_lower_executor_stop{false};
+    std::atomic_bool g_remote_call_lower_worker_loop_ready{false};
     static constexpr std::uint32_t kLowerRemoteCallMaxQueueDepth = 32;
+    static constexpr DWORD kLowerRemoteCallWorkerReadyWaitMs = 1000;
+    static constexpr DWORD kLowerRemoteCallStartBackoffInitialMs = 500;
+    static constexpr DWORD kLowerRemoteCallStartBackoffMaxMs = 10000;
+
+    struct lower_executor_start_failure_cache_t
+    {
+        bool valid = false;
+        uint64_t first_call_id = 0;
+        uint64_t last_call_id = 0;
+        uint64_t generation_at_failure = 0;
+        ULONGLONG first_failure_ms = 0;
+        ULONGLONG last_failure_ms = 0;
+        ULONGLONG next_retry_ms = 0;
+        ULONGLONG last_suppressed_log_ms = 0;
+        uint32_t failure_count = 0;
+        uint32_t suppressed_count = 0;
+        DWORD gle = ERROR_SUCCESS;
+        DWORD win32_error = ERROR_SUCCESS;
+        int crt_errno = 0;
+        unsigned long crt_doserrno = 0;
+        int system_error_value = 0;
+        uint32_t active_pid_at_failure = 0;
+        uint32_t queue_depth = 0;
+        uint32_t inflight = 0;
+        uint32_t worker_alive = 0;
+        DWORD worker_tid = 0;
+        DWORD backoff_ms = 0;
+        uint64_t resource_signature = 0;
+        std::string api;
+        std::string system_error_category;
+        std::string system_error_message;
+        std::string what;
+        lower_executor_process_stats_t stats;
+    };
+
+    lower_executor_start_failure_cache_t g_remote_call_lower_start_failure;
 
     DWORD current_process_thread_count() noexcept
     {
@@ -730,6 +918,92 @@ namespace
         return count;
     }
 
+    uint64_t lower_executor_mix_u64(uint64_t h, uint64_t v) noexcept
+    {
+        h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+        return h;
+    }
+
+    lower_executor_pe_stack_t capture_lower_executor_pe_stack() noexcept
+    {
+        lower_executor_pe_stack_t stack{};
+        HMODULE module = GetModuleHandleW(nullptr);
+        if (!module) {
+            stack.gle = GetLastError();
+            return stack;
+        }
+        __try {
+            const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(module);
+            if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+                stack.gle = ERROR_BAD_EXE_FORMAT;
+                return stack;
+            }
+            const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(
+                reinterpret_cast<const uint8_t*>(module) + dos->e_lfanew);
+            if (nt->Signature != IMAGE_NT_SIGNATURE) {
+                stack.gle = ERROR_BAD_EXE_FORMAT;
+                return stack;
+            }
+            stack.reserve = static_cast<uint64_t>(nt->OptionalHeader.SizeOfStackReserve);
+            stack.commit = static_cast<uint64_t>(nt->OptionalHeader.SizeOfStackCommit);
+            stack.ok = true;
+            stack.gle = ERROR_SUCCESS;
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            stack.ok = false;
+            stack.gle = GetExceptionCode();
+        }
+        return stack;
+    }
+
+    lower_executor_pool_snapshot_t lower_executor_pool_from_work_stats(const work_queue::stats_t& in)
+    {
+        lower_executor_pool_snapshot_t out{};
+        out.alive = in.alive;
+        out.shutting_down = in.shutting_down;
+        out.pool_size = in.pool_size;
+        out.workers = in.workers;
+        out.pending = in.pending;
+        out.active = in.active;
+        out.post_attempts = in.post_attempts;
+        out.posted = in.posted;
+        out.rejected = in.rejected;
+        out.started = in.started;
+        out.finished = in.finished;
+        out.oldest_active_ms = in.oldest_active_ms;
+        out.active_label_count = in.active_label_count;
+        out.active_labels = in.active_labels;
+        return out;
+    }
+
+    lower_executor_pool_snapshot_t lower_executor_pool_from_critical_stats(const critical_work_queue::stats_t& in)
+    {
+        lower_executor_pool_snapshot_t out{};
+        out.alive = in.alive;
+        out.shutting_down = in.shutting_down;
+        out.pool_size = in.pool_size;
+        out.workers = in.workers;
+        out.pending = in.pending;
+        out.active = in.active;
+        out.post_attempts = in.post_attempts;
+        out.posted = in.posted;
+        out.rejected = in.rejected;
+        out.started = in.started;
+        out.finished = in.finished;
+        out.oldest_active_ms = in.oldest_active_ms;
+        out.active_label_count = in.active_label_count;
+        out.active_labels = in.active_labels;
+        return out;
+    }
+
+    lower_executor_thread_inventory_t capture_lower_executor_thread_inventory()
+    {
+        lower_executor_thread_inventory_t inv{};
+        inv.work_queue = lower_executor_pool_from_work_stats(work_queue::stats());
+        inv.service_queue = lower_executor_pool_from_work_stats(work_queue::service_stats());
+        inv.critical_queue = lower_executor_pool_from_critical_stats(critical_work_queue::stats());
+        return inv;
+    }
+
     lower_executor_process_stats_t capture_lower_executor_process_stats() noexcept
     {
         lower_executor_process_stats_t stats{};
@@ -744,9 +1018,382 @@ namespace
             stats.memory_ok = true;
             stats.private_bytes = counters.PrivateUsage;
             stats.working_set = counters.WorkingSetSize;
+            stats.pagefile_usage = counters.PagefileUsage;
+            stats.peak_working_set = counters.PeakWorkingSetSize;
+            stats.quota_paged_pool = counters.QuotaPagedPoolUsage;
+            stats.quota_nonpaged_pool = counters.QuotaNonPagedPoolUsage;
+        }
+        SIZE_T min_ws = 0;
+        SIZE_T max_ws = 0;
+        DWORD ws_flags = 0;
+        if (GetProcessWorkingSetSizeEx(GetCurrentProcess(), &min_ws, &max_ws, &ws_flags)) {
+            stats.working_set_limits_ok = true;
+            stats.min_working_set = min_ws;
+            stats.max_working_set = max_ws;
+            stats.working_set_flags = ws_flags;
+        }
+        MEMORYSTATUSEX memory_status{};
+        memory_status.dwLength = sizeof(memory_status);
+        if (GlobalMemoryStatusEx(&memory_status)) {
+            stats.global_memory_ok = true;
+            stats.memory_load = memory_status.dwMemoryLoad;
+            stats.total_phys = memory_status.ullTotalPhys;
+            stats.avail_phys = memory_status.ullAvailPhys;
+            stats.total_page_file = memory_status.ullTotalPageFile;
+            stats.avail_page_file = memory_status.ullAvailPageFile;
+            stats.total_virtual = memory_status.ullTotalVirtual;
+            stats.avail_virtual = memory_status.ullAvailVirtual;
+        }
+        PERFORMANCE_INFORMATION perf{};
+        perf.cb = sizeof(perf);
+        if (GetPerformanceInfo(&perf, sizeof(perf))) {
+            stats.performance_ok = true;
+            stats.commit_total = perf.CommitTotal * perf.PageSize;
+            stats.commit_limit = perf.CommitLimit * perf.PageSize;
+            stats.commit_peak = perf.CommitPeak * perf.PageSize;
+            stats.physical_total = perf.PhysicalTotal * perf.PageSize;
+            stats.physical_available = perf.PhysicalAvailable * perf.PageSize;
+            stats.system_cache = perf.SystemCache * perf.PageSize;
+            stats.kernel_total = perf.KernelTotal * perf.PageSize;
+            stats.kernel_paged = perf.KernelPaged * perf.PageSize;
+            stats.kernel_nonpaged = perf.KernelNonpaged * perf.PageSize;
+        }
+        stats.pe_stack = capture_lower_executor_pe_stack();
+        BOOL in_job = FALSE;
+        if (IsProcessInJob(GetCurrentProcess(), nullptr, &in_job)) {
+            stats.job.is_process_in_job_ok = true;
+            stats.job.in_job = in_job ? true : false;
+            stats.job.is_process_in_job_gle = ERROR_SUCCESS;
+            if (in_job) {
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+                if (QueryInformationJobObject(nullptr,
+                        JobObjectExtendedLimitInformation,
+                        &limits,
+                        sizeof(limits),
+                        nullptr)) {
+                    stats.job.limits_ok = true;
+                    stats.job.limits_gle = ERROR_SUCCESS;
+                    stats.job.limit_flags = limits.BasicLimitInformation.LimitFlags;
+                    stats.job.active_process_limit = limits.BasicLimitInformation.ActiveProcessLimit;
+                    stats.job.process_memory_limit = limits.ProcessMemoryLimit;
+                    stats.job.job_memory_limit = limits.JobMemoryLimit;
+                    stats.job.peak_process_memory_used = limits.PeakProcessMemoryUsed;
+                    stats.job.peak_job_memory_used = limits.PeakJobMemoryUsed;
+                } else {
+                    stats.job.limits_gle = GetLastError();
+                }
+            }
+        } else {
+            stats.job.is_process_in_job_gle = GetLastError();
+        }
+        try {
+            stats.pools = capture_lower_executor_thread_inventory();
+        } catch (...) {
+            stats.pools = {};
         }
         stats.thread_count = current_process_thread_count();
         return stats;
+    }
+
+    uint64_t lower_executor_resource_signature(const lower_executor_process_stats_t& stats) noexcept
+    {
+        uint64_t h = 0xCBF29CE484222325ull;
+        h = lower_executor_mix_u64(h, stats.handle_count);
+        h = lower_executor_mix_u64(h, stats.thread_count);
+        h = lower_executor_mix_u64(h, static_cast<uint64_t>(stats.private_bytes >> 20));
+        h = lower_executor_mix_u64(h, static_cast<uint64_t>(stats.working_set >> 20));
+        h = lower_executor_mix_u64(h, static_cast<uint64_t>(stats.commit_total >> 20));
+        h = lower_executor_mix_u64(h, static_cast<uint64_t>(stats.commit_limit >> 20));
+        h = lower_executor_mix_u64(h, static_cast<uint64_t>(stats.avail_phys >> 20));
+        h = lower_executor_mix_u64(h, stats.pools.work_queue.pending);
+        h = lower_executor_mix_u64(h, stats.pools.service_queue.pending);
+        h = lower_executor_mix_u64(h, stats.pools.critical_queue.pending);
+        h = lower_executor_mix_u64(h, stats.pools.work_queue.active);
+        h = lower_executor_mix_u64(h, stats.pools.service_queue.active);
+        h = lower_executor_mix_u64(h, stats.pools.critical_queue.active);
+        return h;
+    }
+
+    void log_lower_executor_pool_snapshot(const char* marker,
+                                          const char* name,
+                                          const lower_executor_pool_snapshot_t& pool)
+    {
+        diag::log_tagged_fmt("driver",
+            "%s pool=%s alive=%d shutting_down=%d pool_size=%d workers=%llu pending=%llu active=%u attempts=%llu posted=%llu rejected=%llu started=%llu finished=%llu oldest_active_ms=%llu active_label_count=%u labels=%s",
+            marker ? marker : "lower_executor_pool_snapshot",
+            name ? name : "",
+            pool.alive ? 1 : 0,
+            pool.shutting_down ? 1 : 0,
+            pool.pool_size,
+            static_cast<unsigned long long>(pool.workers),
+            static_cast<unsigned long long>(pool.pending),
+            pool.active,
+            static_cast<unsigned long long>(pool.post_attempts),
+            static_cast<unsigned long long>(pool.posted),
+            static_cast<unsigned long long>(pool.rejected),
+            static_cast<unsigned long long>(pool.started),
+            static_cast<unsigned long long>(pool.finished),
+            static_cast<unsigned long long>(pool.oldest_active_ms),
+            pool.active_label_count,
+            pool.active_labels.empty() ? "" : pool.active_labels.c_str());
+    }
+
+    void log_lower_executor_resource_snapshot(const char* marker,
+                                              uint64_t call_id,
+                                              const char* phase,
+                                              const remote_call_snapshot_t& call_ctx,
+                                              uint32_t expected_pid,
+                                              uint32_t active_pid_at_entry,
+                                              uint64_t generation_at_entry,
+                                              uint64_t function_address,
+                                              const lower_executor_process_stats_t& stats,
+                                              uint64_t resource_signature,
+                                              ULONGLONG elapsed_ms)
+    {
+        const char* name = marker && marker[0] ? marker : "lower_executor_resource_snapshot";
+        diag::log_tagged_fmt("driver",
+            "%s core call_id=%llu phase=%s label=%s tool=%s diag_id=%s pid=%u active_pid=%u generation=%llu fn=0x%llX caller_pid=%lu caller_tid=%lu queue_depth=%u inflight=%u worker_started=%d worker_alive=%d worker_loop_ready=%d worker_tid=%lu begin_tid=%u stop=%d resource_sig=0x%016llX elapsed_ms=%llu",
+            name,
+            static_cast<unsigned long long>(call_id),
+            phase ? phase : "",
+            call_ctx.label,
+            call_ctx.tool,
+            call_ctx.diag_id,
+            expected_pid,
+            active_pid_at_entry,
+            static_cast<unsigned long long>(generation_at_entry),
+            static_cast<unsigned long long>(function_address),
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            g_remote_call_lower_queue_depth.load(std::memory_order_acquire),
+            g_remote_call_lower_inflight.load(std::memory_order_acquire),
+            g_remote_call_lower_worker_started.load(std::memory_order_acquire) ? 1 : 0,
+            g_remote_call_lower_worker_alive.load(std::memory_order_acquire) ? 1 : 0,
+            g_remote_call_lower_worker_loop_ready.load(std::memory_order_acquire) ? 1 : 0,
+            static_cast<unsigned long>(g_remote_call_lower_worker_tid.load(std::memory_order_acquire)),
+            g_remote_call_lower_worker_begin_tid,
+            g_remote_call_lower_executor_stop.load(std::memory_order_acquire) ? 1 : 0,
+            static_cast<unsigned long long>(resource_signature),
+            static_cast<unsigned long long>(elapsed_ms));
+        diag::log_tagged_fmt("driver",
+            "%s memory handle_ok=%d handle_count=%lu thread_count=%lu memory_ok=%d private_bytes=%llu working_set=%llu pagefile_usage=%llu peak_working_set=%llu paged_pool=%llu nonpaged_pool=%llu ws_limits_ok=%d min_ws=%llu max_ws=%llu ws_flags=0x%08lX",
+            name,
+            stats.handle_count_ok ? 1 : 0,
+            static_cast<unsigned long>(stats.handle_count),
+            static_cast<unsigned long>(stats.thread_count),
+            stats.memory_ok ? 1 : 0,
+            static_cast<unsigned long long>(stats.private_bytes),
+            static_cast<unsigned long long>(stats.working_set),
+            static_cast<unsigned long long>(stats.pagefile_usage),
+            static_cast<unsigned long long>(stats.peak_working_set),
+            static_cast<unsigned long long>(stats.quota_paged_pool),
+            static_cast<unsigned long long>(stats.quota_nonpaged_pool),
+            stats.working_set_limits_ok ? 1 : 0,
+            static_cast<unsigned long long>(stats.min_working_set),
+            static_cast<unsigned long long>(stats.max_working_set),
+            static_cast<unsigned long>(stats.working_set_flags));
+        diag::log_tagged_fmt("driver",
+            "%s system global_ok=%d memory_load=%lu total_phys=%llu avail_phys=%llu total_page_file=%llu avail_page_file=%llu total_virtual=%llu avail_virtual=%llu perf_ok=%d commit_total=%llu commit_limit=%llu commit_peak=%llu physical_total=%llu physical_available=%llu system_cache=%llu kernel_total=%llu kernel_paged=%llu kernel_nonpaged=%llu",
+            name,
+            stats.global_memory_ok ? 1 : 0,
+            static_cast<unsigned long>(stats.memory_load),
+            static_cast<unsigned long long>(stats.total_phys),
+            static_cast<unsigned long long>(stats.avail_phys),
+            static_cast<unsigned long long>(stats.total_page_file),
+            static_cast<unsigned long long>(stats.avail_page_file),
+            static_cast<unsigned long long>(stats.total_virtual),
+            static_cast<unsigned long long>(stats.avail_virtual),
+            stats.performance_ok ? 1 : 0,
+            static_cast<unsigned long long>(stats.commit_total),
+            static_cast<unsigned long long>(stats.commit_limit),
+            static_cast<unsigned long long>(stats.commit_peak),
+            static_cast<unsigned long long>(stats.physical_total),
+            static_cast<unsigned long long>(stats.physical_available),
+            static_cast<unsigned long long>(stats.system_cache),
+            static_cast<unsigned long long>(stats.kernel_total),
+            static_cast<unsigned long long>(stats.kernel_paged),
+            static_cast<unsigned long long>(stats.kernel_nonpaged));
+        diag::log_tagged_fmt("driver",
+            "%s stack_job pe_stack_ok=%d pe_stack_gle=%lu pe_stack_reserve=%llu pe_stack_commit=%llu in_job_ok=%d in_job=%d in_job_gle=%lu job_limits_ok=%d job_limits_gle=%lu job_limit_flags=0x%08lX active_process_limit=%lu process_memory_limit=%llu job_memory_limit=%llu peak_process_memory=%llu peak_job_memory=%llu",
+            name,
+            stats.pe_stack.ok ? 1 : 0,
+            static_cast<unsigned long>(stats.pe_stack.gle),
+            static_cast<unsigned long long>(stats.pe_stack.reserve),
+            static_cast<unsigned long long>(stats.pe_stack.commit),
+            stats.job.is_process_in_job_ok ? 1 : 0,
+            stats.job.in_job ? 1 : 0,
+            static_cast<unsigned long>(stats.job.is_process_in_job_gle),
+            stats.job.limits_ok ? 1 : 0,
+            static_cast<unsigned long>(stats.job.limits_gle),
+            static_cast<unsigned long>(stats.job.limit_flags),
+            static_cast<unsigned long>(stats.job.active_process_limit),
+            static_cast<unsigned long long>(stats.job.process_memory_limit),
+            static_cast<unsigned long long>(stats.job.job_memory_limit),
+            static_cast<unsigned long long>(stats.job.peak_process_memory_used),
+            static_cast<unsigned long long>(stats.job.peak_job_memory_used));
+        log_lower_executor_pool_snapshot(name, "work_queue", stats.pools.work_queue);
+        log_lower_executor_pool_snapshot(name, "service_queue", stats.pools.service_queue);
+        log_lower_executor_pool_snapshot(name, "critical_queue", stats.pools.critical_queue);
+    }
+
+    uint64_t lower_executor_abs_diff(uint64_t a, uint64_t b) noexcept
+    {
+        return a >= b ? a - b : b - a;
+    }
+
+    bool lower_executor_resource_materially_changed(const lower_executor_start_failure_cache_t& cache,
+                                                    const lower_executor_process_stats_t& stats,
+                                                    uint64_t resource_signature,
+                                                    uint64_t generation,
+                                                    const char** reason) noexcept
+    {
+        if (!cache.valid) {
+            if (reason)
+                *reason = "no_cached_failure";
+            return true;
+        }
+        if (generation != cache.generation_at_failure) {
+            if (reason)
+                *reason = "generation_changed";
+            return true;
+        }
+        if (resource_signature != cache.resource_signature) {
+            const uint64_t thread_delta = lower_executor_abs_diff(stats.thread_count, cache.stats.thread_count);
+            const uint64_t handle_delta = lower_executor_abs_diff(stats.handle_count, cache.stats.handle_count);
+            const uint64_t private_delta = lower_executor_abs_diff(static_cast<uint64_t>(stats.private_bytes), static_cast<uint64_t>(cache.stats.private_bytes));
+            const uint64_t commit_delta = lower_executor_abs_diff(static_cast<uint64_t>(stats.commit_total), static_cast<uint64_t>(cache.stats.commit_total));
+            if (thread_delta >= 2 || handle_delta >= 16 || private_delta >= (16ull * 1024ull * 1024ull) || commit_delta >= (16ull * 1024ull * 1024ull)) {
+                if (reason)
+                    *reason = "resource_changed";
+                return true;
+            }
+        }
+        if (reason)
+            *reason = "cached_backoff";
+        return false;
+    }
+
+    bool lower_executor_should_log_cached_suppression(lower_executor_start_failure_cache_t& cache, ULONGLONG now) noexcept
+    {
+        if (cache.suppressed_count <= 3)
+            return true;
+        if ((cache.suppressed_count & (cache.suppressed_count - 1u)) == 0)
+            return true;
+        if (cache.last_suppressed_log_ms == 0 || now - cache.last_suppressed_log_ms >= 2000)
+            return true;
+        return false;
+    }
+
+    void populate_lower_executor_start_failure_outcome(lower_remote_call_outcome_t& outcome,
+                                                       const lower_executor_start_failure_cache_t& cache,
+                                                       ULONGLONG call_start,
+                                                       const lower_executor_process_stats_t& stats,
+                                                       const char* reason)
+    {
+        outcome.completed = false;
+        outcome.lower_ok = false;
+        outcome.worker_exception = true;
+        outcome.worker_creation_failed = true;
+        outcome.gle = cache.gle != ERROR_SUCCESS ? cache.gle : ERROR_NOT_ENOUGH_MEMORY;
+        outcome.active_pid_after = driver_bridge::attached_pid();
+        outcome.generation_after = g_active_pid_generation.load(std::memory_order_acquire);
+        outcome.elapsed_ms = GetTickCount64() - call_start;
+        outcome.worker_error_value = cache.crt_errno;
+        outcome.worker_error_category = cache.api.empty() ? "_beginthreadex" : cache.api;
+        char message[512];
+        _snprintf_s(message, sizeof(message), _TRUNCATE,
+            "cached=%d reason=%s first_call_id=%llu last_call_id=%llu failures=%u suppressed=%u backoff_ms=%lu next_retry_in_ms=%llu win32=%lu errno=%d doserrno=%lu system_value=%d system_category=%s system_message=%s what=%s current_threads=%lu current_handles=%lu",
+            cache.valid ? 1 : 0,
+            reason ? reason : "",
+            static_cast<unsigned long long>(cache.first_call_id),
+            static_cast<unsigned long long>(cache.last_call_id),
+            cache.failure_count,
+            cache.suppressed_count,
+            static_cast<unsigned long>(cache.backoff_ms),
+            cache.next_retry_ms > GetTickCount64() ? static_cast<unsigned long long>(cache.next_retry_ms - GetTickCount64()) : 0ull,
+            static_cast<unsigned long>(cache.win32_error),
+            cache.crt_errno,
+            cache.crt_doserrno,
+            cache.system_error_value,
+            cache.system_error_category.empty() ? "" : cache.system_error_category.c_str(),
+            cache.system_error_message.empty() ? "" : cache.system_error_message.c_str(),
+            cache.what.empty() ? "" : cache.what.c_str(),
+            static_cast<unsigned long>(stats.thread_count),
+            static_cast<unsigned long>(stats.handle_count));
+        outcome.worker_error_message = message;
+        outcome.worker_alive = g_remote_call_lower_worker_alive.load(std::memory_order_acquire) ? 1u : 0u;
+        outcome.worker_tid = g_remote_call_lower_worker_tid.load(std::memory_order_acquire);
+        outcome.queue_depth_at_submit = g_remote_call_lower_queue_depth.load(std::memory_order_acquire);
+        outcome.inflight_at_submit = g_remote_call_lower_inflight.load(std::memory_order_acquire);
+        outcome.inflight_after = outcome.inflight_at_submit;
+        outcome.completion_reason = "worker_create_failed";
+    }
+
+    void record_lower_executor_start_failure(uint64_t call_id,
+                                             uint32_t active_pid_at_entry,
+                                             uint64_t generation_at_entry,
+                                             const lower_executor_process_stats_t& stats,
+                                             uint64_t resource_signature,
+                                             DWORD gle,
+                                             DWORD win32_error,
+                                             int crt_errno,
+                                             unsigned long crt_doserrno,
+                                             int system_error_value,
+                                             const char* api,
+                                             const char* system_category,
+                                             const char* system_message,
+                                             const char* what)
+    {
+        lower_executor_start_failure_cache_t& cache = g_remote_call_lower_start_failure;
+        const ULONGLONG now = GetTickCount64();
+        if (!cache.valid) {
+            cache.first_call_id = call_id;
+            cache.first_failure_ms = now;
+            cache.failure_count = 0;
+            cache.suppressed_count = 0;
+            cache.backoff_ms = kLowerRemoteCallStartBackoffInitialMs;
+        } else {
+            const DWORD next_backoff = cache.backoff_ms == 0 ? kLowerRemoteCallStartBackoffInitialMs : std::min<DWORD>(cache.backoff_ms * 2u, kLowerRemoteCallStartBackoffMaxMs);
+            cache.backoff_ms = next_backoff;
+        }
+        cache.valid = true;
+        cache.last_call_id = call_id;
+        cache.generation_at_failure = generation_at_entry;
+        cache.last_failure_ms = now;
+        cache.next_retry_ms = now + cache.backoff_ms;
+        cache.failure_count += 1u;
+        cache.gle = gle != ERROR_SUCCESS ? gle : ERROR_NOT_ENOUGH_MEMORY;
+        cache.win32_error = win32_error;
+        cache.crt_errno = crt_errno;
+        cache.crt_doserrno = crt_doserrno;
+        cache.system_error_value = system_error_value;
+        cache.active_pid_at_failure = active_pid_at_entry;
+        cache.queue_depth = g_remote_call_lower_queue_depth.load(std::memory_order_acquire);
+        cache.inflight = g_remote_call_lower_inflight.load(std::memory_order_acquire);
+        cache.worker_alive = g_remote_call_lower_worker_alive.load(std::memory_order_acquire) ? 1u : 0u;
+        cache.worker_tid = g_remote_call_lower_worker_tid.load(std::memory_order_acquire);
+        cache.resource_signature = resource_signature;
+        cache.api = api && api[0] ? api : "_beginthreadex";
+        cache.system_error_category = system_category && system_category[0] ? system_category : "none";
+        cache.system_error_message = system_message && system_message[0] ? system_message : "not_applicable";
+        cache.what = what && what[0] ? what : "not_applicable";
+        cache.stats = stats;
+    }
+
+    void reset_lower_executor_start_failure_cache(const char* reason)
+    {
+        if (!g_remote_call_lower_start_failure.valid)
+            return;
+        diag::log_tagged_fmt("driver",
+            "lower_executor_start_failure_cache_reset reason=%s first_call_id=%llu last_call_id=%llu failures=%u suppressed=%u backoff_ms=%lu generation=%llu",
+            reason && reason[0] ? reason : "",
+            static_cast<unsigned long long>(g_remote_call_lower_start_failure.first_call_id),
+            static_cast<unsigned long long>(g_remote_call_lower_start_failure.last_call_id),
+            g_remote_call_lower_start_failure.failure_count,
+            g_remote_call_lower_start_failure.suppressed_count,
+            static_cast<unsigned long>(g_remote_call_lower_start_failure.backoff_ms),
+            static_cast<unsigned long long>(g_remote_call_lower_start_failure.generation_at_failure));
+        g_remote_call_lower_start_failure = {};
     }
 
     void store_lower_remote_call_diag(const char* phase,
@@ -1072,10 +1719,13 @@ namespace
         const DWORD worker_tid = GetCurrentThreadId();
         g_remote_call_lower_worker_tid.store(worker_tid, std::memory_order_release);
         g_remote_call_lower_worker_alive.store(true, std::memory_order_release);
+        g_remote_call_lower_worker_loop_ready.store(true, std::memory_order_release);
+        g_remote_call_lower_start_cv.notify_all();
         const lower_executor_process_stats_t stats = capture_lower_executor_process_stats();
         diag::log_tagged_fmt("driver",
-            "call_function_lower_worker_started worker_tid=%lu queue_depth=%u inflight=%u handle_count_ok=%d handle_count=%lu thread_count=%lu memory_ok=%d private_bytes=%llu working_set=%llu",
+            "call_function_lower_worker_started worker_tid=%lu begin_tid=%u queue_depth=%u inflight=%u handle_count_ok=%d handle_count=%lu thread_count=%lu memory_ok=%d private_bytes=%llu working_set=%llu commit_total=%llu commit_limit=%llu loop_ready=%d",
             static_cast<unsigned long>(worker_tid),
+            g_remote_call_lower_worker_begin_tid,
             g_remote_call_lower_queue_depth.load(std::memory_order_acquire),
             g_remote_call_lower_inflight.load(std::memory_order_acquire),
             stats.handle_count_ok ? 1 : 0,
@@ -1083,7 +1733,10 @@ namespace
             static_cast<unsigned long>(stats.thread_count),
             stats.memory_ok ? 1 : 0,
             static_cast<unsigned long long>(stats.private_bytes),
-            static_cast<unsigned long long>(stats.working_set));
+            static_cast<unsigned long long>(stats.working_set),
+            static_cast<unsigned long long>(stats.commit_total),
+            static_cast<unsigned long long>(stats.commit_limit),
+            g_remote_call_lower_worker_loop_ready.load(std::memory_order_acquire) ? 1 : 0);
         for (;;) {
             std::shared_ptr<lower_remote_call_work_item_t> item;
             {
@@ -1162,13 +1815,360 @@ namespace
         }
         g_remote_call_lower_worker_alive.store(false, std::memory_order_release);
         g_remote_call_lower_worker_started.store(false, std::memory_order_release);
+        g_remote_call_lower_worker_loop_ready.store(false, std::memory_order_release);
         g_remote_call_lower_worker_tid.store(0, std::memory_order_release);
+        g_remote_call_lower_start_cv.notify_all();
         diag::log_tagged_fmt("driver",
-            "call_function_lower_worker_stopped worker_tid=%lu queue_depth=%u inflight=%u stop=%d",
+            "call_function_lower_worker_stopped worker_tid=%lu begin_tid=%u queue_depth=%u inflight=%u stop=%d loop_ready=%d",
             static_cast<unsigned long>(worker_tid),
+            g_remote_call_lower_worker_begin_tid,
             g_remote_call_lower_queue_depth.load(std::memory_order_acquire),
             g_remote_call_lower_inflight.load(std::memory_order_acquire),
-            g_remote_call_lower_executor_stop.load(std::memory_order_acquire) ? 1 : 0);
+            g_remote_call_lower_executor_stop.load(std::memory_order_acquire) ? 1 : 0,
+            g_remote_call_lower_worker_loop_ready.load(std::memory_order_acquire) ? 1 : 0);
+    }
+
+    unsigned __stdcall lower_remote_call_worker_entry(void*) noexcept
+    {
+        lower_remote_call_worker_main();
+        return 0;
+    }
+
+    bool start_lower_remote_call_executor_locked(std::unique_lock<std::mutex>& lk,
+                                                 const char* trigger,
+                                                 const char* phase,
+                                                 uint64_t call_id,
+                                                 const remote_call_snapshot_t& call_ctx,
+                                                 uint32_t expected_pid,
+                                                 uint32_t active_pid_at_entry,
+                                                 uint64_t generation_at_entry,
+                                                 uint64_t function_address,
+                                                 ULONGLONG call_start,
+                                                 lower_remote_call_outcome_t* failure_outcome)
+    {
+        g_remote_call_lower_executor_stop.store(false, std::memory_order_release);
+        g_remote_call_lower_worker_loop_ready.store(false, std::memory_order_release);
+        g_remote_call_lower_worker_tid.store(0, std::memory_order_release);
+        g_remote_call_lower_worker_begin_tid = 0;
+
+        const lower_executor_process_stats_t stats = capture_lower_executor_process_stats();
+        const uint64_t resource_signature = lower_executor_resource_signature(stats);
+        const ULONGLONG elapsed_before = GetTickCount64() - call_start;
+        log_lower_executor_resource_snapshot("lower_executor_start_begin",
+                                             call_id,
+                                             phase,
+                                             call_ctx,
+                                             expected_pid,
+                                             active_pid_at_entry,
+                                             generation_at_entry,
+                                             function_address,
+                                             stats,
+                                             resource_signature,
+                                             elapsed_before);
+        diag::log_tagged_fmt("driver",
+            "call_function_lower_worker_create_begin call_id=%llu trigger=%s phase=%s label=%s tool=%s diag_id=%s pid=%u active_pid=%u generation=%llu fn=0x%llX queue_depth=%u inflight=%u handle_count_ok=%d handle_count=%lu thread_count=%lu memory_ok=%d private_bytes=%llu working_set=%llu commit_total=%llu commit_limit=%llu elapsed_ms=%llu",
+            static_cast<unsigned long long>(call_id),
+            trigger && trigger[0] ? trigger : "",
+            phase ? phase : "",
+            call_ctx.label,
+            call_ctx.tool,
+            call_ctx.diag_id,
+            expected_pid,
+            active_pid_at_entry,
+            static_cast<unsigned long long>(generation_at_entry),
+            static_cast<unsigned long long>(function_address),
+            g_remote_call_lower_queue_depth.load(std::memory_order_acquire),
+            g_remote_call_lower_inflight.load(std::memory_order_acquire),
+            stats.handle_count_ok ? 1 : 0,
+            static_cast<unsigned long>(stats.handle_count),
+            static_cast<unsigned long>(stats.thread_count),
+            stats.memory_ok ? 1 : 0,
+            static_cast<unsigned long long>(stats.private_bytes),
+            static_cast<unsigned long long>(stats.working_set),
+            static_cast<unsigned long long>(stats.commit_total),
+            static_cast<unsigned long long>(stats.commit_limit),
+            static_cast<unsigned long long>(elapsed_before));
+
+        const ULONGLONG now = GetTickCount64();
+        const char* retry_reason = "no_cached_failure";
+        const bool material_change = lower_executor_resource_materially_changed(g_remote_call_lower_start_failure,
+                                                                                stats,
+                                                                                resource_signature,
+                                                                                generation_at_entry,
+                                                                                &retry_reason);
+        const bool backoff_elapsed = g_remote_call_lower_start_failure.valid && now >= g_remote_call_lower_start_failure.next_retry_ms;
+        if (g_remote_call_lower_start_failure.valid && !material_change && !backoff_elapsed) {
+            g_remote_call_lower_start_failure.suppressed_count += 1u;
+            if (failure_outcome)
+                populate_lower_executor_start_failure_outcome(*failure_outcome,
+                                                              g_remote_call_lower_start_failure,
+                                                              call_start,
+                                                              stats,
+                                                              retry_reason);
+            if (lower_executor_should_log_cached_suppression(g_remote_call_lower_start_failure, now)) {
+                g_remote_call_lower_start_failure.last_suppressed_log_ms = now;
+                diag::log_tagged_fmt("driver",
+                    "lower_executor_start_cached_failure call_id=%llu trigger=%s phase=%s label=%s tool=%s diag_id=%s pid=%u active_pid=%u generation=%llu fn=0x%llX reason=%s first_call_id=%llu last_call_id=%llu failures=%u suppressed=%u backoff_ms=%lu next_retry_in_ms=%llu queue_depth=%u inflight=%u worker_tid=%lu worker_alive=%u resource_sig=0x%016llX current_sig=0x%016llX elapsed_ms=%llu",
+                    static_cast<unsigned long long>(call_id),
+                    trigger && trigger[0] ? trigger : "",
+                    phase ? phase : "",
+                    call_ctx.label,
+                    call_ctx.tool,
+                    call_ctx.diag_id,
+                    expected_pid,
+                    active_pid_at_entry,
+                    static_cast<unsigned long long>(generation_at_entry),
+                    static_cast<unsigned long long>(function_address),
+                    retry_reason,
+                    static_cast<unsigned long long>(g_remote_call_lower_start_failure.first_call_id),
+                    static_cast<unsigned long long>(g_remote_call_lower_start_failure.last_call_id),
+                    g_remote_call_lower_start_failure.failure_count,
+                    g_remote_call_lower_start_failure.suppressed_count,
+                    static_cast<unsigned long>(g_remote_call_lower_start_failure.backoff_ms),
+                    g_remote_call_lower_start_failure.next_retry_ms > now ? static_cast<unsigned long long>(g_remote_call_lower_start_failure.next_retry_ms - now) : 0ull,
+                    g_remote_call_lower_queue_depth.load(std::memory_order_acquire),
+                    g_remote_call_lower_inflight.load(std::memory_order_acquire),
+                    static_cast<unsigned long>(g_remote_call_lower_worker_tid.load(std::memory_order_acquire)),
+                    g_remote_call_lower_worker_alive.load(std::memory_order_acquire) ? 1u : 0u,
+                    static_cast<unsigned long long>(g_remote_call_lower_start_failure.resource_signature),
+                    static_cast<unsigned long long>(resource_signature),
+                    static_cast<unsigned long long>(GetTickCount64() - call_start));
+            }
+            return false;
+        }
+        if (g_remote_call_lower_start_failure.valid) {
+            diag::log_tagged_fmt("driver",
+                "lower_executor_start_retry_allowed call_id=%llu trigger=%s phase=%s label=%s tool=%s diag_id=%s reason=%s backoff_elapsed=%d first_call_id=%llu last_call_id=%llu failures=%u suppressed=%u backoff_ms=%lu resource_sig=0x%016llX cached_sig=0x%016llX",
+                static_cast<unsigned long long>(call_id),
+                trigger && trigger[0] ? trigger : "",
+                phase ? phase : "",
+                call_ctx.label,
+                call_ctx.tool,
+                call_ctx.diag_id,
+                material_change ? retry_reason : "backoff_elapsed",
+                backoff_elapsed ? 1 : 0,
+                static_cast<unsigned long long>(g_remote_call_lower_start_failure.first_call_id),
+                static_cast<unsigned long long>(g_remote_call_lower_start_failure.last_call_id),
+                g_remote_call_lower_start_failure.failure_count,
+                g_remote_call_lower_start_failure.suppressed_count,
+                static_cast<unsigned long>(g_remote_call_lower_start_failure.backoff_ms),
+                static_cast<unsigned long long>(resource_signature),
+                static_cast<unsigned long long>(g_remote_call_lower_start_failure.resource_signature));
+        }
+
+        constexpr unsigned requested_stack_bytes = aida::infra::win_thread::default_stack_reserve;
+        errno = 0;
+        _set_doserrno(0);
+        SetLastError(ERROR_SUCCESS);
+        const ULONGLONG create_start = GetTickCount64();
+        unsigned begin_tid = 0;
+        uintptr_t raw = _beginthreadex(nullptr,
+                                       requested_stack_bytes,
+                                       &lower_remote_call_worker_entry,
+                                       nullptr,
+                                       0,
+                                       &begin_tid);
+        const DWORD create_gle = GetLastError();
+        const int create_errno = errno;
+        unsigned long create_doserrno = 0;
+        _get_doserrno(&create_doserrno);
+        const ULONGLONG create_elapsed = GetTickCount64() - create_start;
+        HANDLE worker_handle = reinterpret_cast<HANDLE>(raw);
+        diag::log_tagged_fmt("driver",
+            "lower_executor_thread_create_result call_id=%llu trigger=%s api=_beginthreadex requested_stack_bytes=%u pe_stack_reserve=%llu pe_stack_commit=%llu handle=%p begin_tid=%u gle=%lu errno=%d doserrno=%lu system_value=%d system_category=%s system_message=%s what=%s elapsed_ms=%llu",
+            static_cast<unsigned long long>(call_id),
+            trigger && trigger[0] ? trigger : "",
+            requested_stack_bytes,
+            static_cast<unsigned long long>(stats.pe_stack.reserve),
+            static_cast<unsigned long long>(stats.pe_stack.commit),
+            worker_handle,
+            begin_tid,
+            static_cast<unsigned long>(create_gle),
+            create_errno,
+            create_doserrno,
+            0,
+            "none",
+            "not_applicable",
+            "not_applicable",
+            static_cast<unsigned long long>(create_elapsed));
+        if (raw == 0) {
+            const DWORD failure_gle = create_gle != ERROR_SUCCESS ? create_gle : ERROR_NOT_ENOUGH_MEMORY;
+            record_lower_executor_start_failure(call_id,
+                                                active_pid_at_entry,
+                                                generation_at_entry,
+                                                stats,
+                                                resource_signature,
+                                                failure_gle,
+                                                create_gle,
+                                                create_errno,
+                                                create_doserrno,
+                                                0,
+                                                "_beginthreadex",
+                                                "none",
+                                                "not_applicable",
+                                                "not_applicable");
+            if (failure_outcome)
+                populate_lower_executor_start_failure_outcome(*failure_outcome,
+                                                              g_remote_call_lower_start_failure,
+                                                              call_start,
+                                                              stats,
+                                                              "create_failed");
+            log_lower_executor_resource_snapshot("lower_executor_start_failure",
+                                                 call_id,
+                                                 phase,
+                                                 call_ctx,
+                                                 expected_pid,
+                                                 active_pid_at_entry,
+                                                 generation_at_entry,
+                                                 function_address,
+                                                 stats,
+                                                 resource_signature,
+                                                 GetTickCount64() - call_start);
+            diag::log_tagged_fmt("driver",
+                "call_function_lower_thread_create_failed call_id=%llu trigger=%s phase=%s label=%s tool=%s diag_id=%s pid=%u active_pid=%u generation=%llu fn=0x%llX api=_beginthreadex requested_stack_bytes=%u returned_handle=%p returned_tid=%u gle=%lu win32_gle=%lu errno=%d doserrno=%lu system_value=%d system_category=%s system_message=%s what=%s queue_depth=%u inflight=%u worker_tid=%lu worker_alive=%u first_call_id=%llu last_call_id=%llu failure_count=%u suppressed_count=%u backoff_ms=%lu next_retry_in_ms=%llu handle_count_ok=%d handle_count=%lu thread_count=%lu memory_ok=%d private_bytes=%llu working_set=%llu commit_total=%llu commit_limit=%llu elapsed_ms=%llu",
+                static_cast<unsigned long long>(call_id),
+                trigger && trigger[0] ? trigger : "",
+                phase ? phase : "",
+                call_ctx.label,
+                call_ctx.tool,
+                call_ctx.diag_id,
+                expected_pid,
+                active_pid_at_entry,
+                static_cast<unsigned long long>(generation_at_entry),
+                static_cast<unsigned long long>(function_address),
+                requested_stack_bytes,
+                worker_handle,
+                begin_tid,
+                static_cast<unsigned long>(failure_gle),
+                static_cast<unsigned long>(create_gle),
+                create_errno,
+                create_doserrno,
+                0,
+                "none",
+                "not_applicable",
+                "not_applicable",
+                g_remote_call_lower_start_failure.queue_depth,
+                g_remote_call_lower_start_failure.inflight,
+                static_cast<unsigned long>(g_remote_call_lower_start_failure.worker_tid),
+                g_remote_call_lower_start_failure.worker_alive,
+                static_cast<unsigned long long>(g_remote_call_lower_start_failure.first_call_id),
+                static_cast<unsigned long long>(g_remote_call_lower_start_failure.last_call_id),
+                g_remote_call_lower_start_failure.failure_count,
+                g_remote_call_lower_start_failure.suppressed_count,
+                static_cast<unsigned long>(g_remote_call_lower_start_failure.backoff_ms),
+                g_remote_call_lower_start_failure.next_retry_ms > GetTickCount64() ? static_cast<unsigned long long>(g_remote_call_lower_start_failure.next_retry_ms - GetTickCount64()) : 0ull,
+                stats.handle_count_ok ? 1 : 0,
+                static_cast<unsigned long>(stats.handle_count),
+                static_cast<unsigned long>(stats.thread_count),
+                stats.memory_ok ? 1 : 0,
+                static_cast<unsigned long long>(stats.private_bytes),
+                static_cast<unsigned long long>(stats.working_set),
+                static_cast<unsigned long long>(stats.commit_total),
+                static_cast<unsigned long long>(stats.commit_limit),
+                static_cast<unsigned long long>(GetTickCount64() - call_start));
+            return false;
+        }
+
+        g_remote_call_lower_worker_handle = worker_handle;
+        g_remote_call_lower_worker_begin_tid = begin_tid;
+        g_remote_call_lower_worker_started.store(true, std::memory_order_release);
+        const ULONGLONG ready_wait_start = GetTickCount64();
+        g_remote_call_lower_start_cv.wait_for(lk,
+            std::chrono::milliseconds(kLowerRemoteCallWorkerReadyWaitMs),
+            []() {
+                return g_remote_call_lower_worker_loop_ready.load(std::memory_order_acquire) ||
+                       g_remote_call_lower_executor_stop.load(std::memory_order_acquire) ||
+                       !g_remote_call_lower_worker_started.load(std::memory_order_acquire);
+            });
+        const DWORD wait_rc = WaitForSingleObject(g_remote_call_lower_worker_handle, 0);
+        const bool ready = g_remote_call_lower_worker_loop_ready.load(std::memory_order_acquire) ||
+                           g_remote_call_lower_worker_alive.load(std::memory_order_acquire);
+        if (!ready && wait_rc == WAIT_OBJECT_0) {
+            CloseHandle(g_remote_call_lower_worker_handle);
+            g_remote_call_lower_worker_handle = nullptr;
+            g_remote_call_lower_worker_begin_tid = 0;
+            g_remote_call_lower_worker_started.store(false, std::memory_order_release);
+            record_lower_executor_start_failure(call_id,
+                                                active_pid_at_entry,
+                                                generation_at_entry,
+                                                stats,
+                                                resource_signature,
+                                                ERROR_GEN_FAILURE,
+                                                ERROR_GEN_FAILURE,
+                                                0,
+                                                0,
+                                                ERROR_GEN_FAILURE,
+                                                "_beginthreadex",
+                                                "runtime",
+                                                "worker_exited_before_ready",
+                                                "worker_exited_before_ready");
+            if (failure_outcome)
+                populate_lower_executor_start_failure_outcome(*failure_outcome,
+                                                              g_remote_call_lower_start_failure,
+                                                              call_start,
+                                                              stats,
+                                                              "worker_exited_before_ready");
+            diag::log_tagged_fmt("driver",
+                "call_function_lower_thread_create_failed call_id=%llu trigger=%s phase=%s label=%s tool=%s diag_id=%s pid=%u active_pid=%u generation=%llu fn=0x%llX api=_beginthreadex requested_stack_bytes=%u returned_handle=%p returned_tid=%u gle=%lu win32_gle=%lu errno=%d doserrno=%lu system_value=%d system_category=%s system_message=%s what=%s queue_depth=%u inflight=%u worker_tid=%lu worker_alive=%u first_call_id=%llu last_call_id=%llu failure_count=%u suppressed_count=%u backoff_ms=%lu next_retry_in_ms=%llu elapsed_ms=%llu",
+                static_cast<unsigned long long>(call_id),
+                trigger && trigger[0] ? trigger : "",
+                phase ? phase : "",
+                call_ctx.label,
+                call_ctx.tool,
+                call_ctx.diag_id,
+                expected_pid,
+                active_pid_at_entry,
+                static_cast<unsigned long long>(generation_at_entry),
+                static_cast<unsigned long long>(function_address),
+                requested_stack_bytes,
+                worker_handle,
+                begin_tid,
+                static_cast<unsigned long>(ERROR_GEN_FAILURE),
+                static_cast<unsigned long>(ERROR_GEN_FAILURE),
+                0,
+                0ul,
+                ERROR_GEN_FAILURE,
+                "runtime",
+                "worker_exited_before_ready",
+                "worker_exited_before_ready",
+                g_remote_call_lower_start_failure.queue_depth,
+                g_remote_call_lower_start_failure.inflight,
+                static_cast<unsigned long>(g_remote_call_lower_start_failure.worker_tid),
+                g_remote_call_lower_start_failure.worker_alive,
+                static_cast<unsigned long long>(g_remote_call_lower_start_failure.first_call_id),
+                static_cast<unsigned long long>(g_remote_call_lower_start_failure.last_call_id),
+                g_remote_call_lower_start_failure.failure_count,
+                g_remote_call_lower_start_failure.suppressed_count,
+                static_cast<unsigned long>(g_remote_call_lower_start_failure.backoff_ms),
+                g_remote_call_lower_start_failure.next_retry_ms > GetTickCount64() ? static_cast<unsigned long long>(g_remote_call_lower_start_failure.next_retry_ms - GetTickCount64()) : 0ull,
+                static_cast<unsigned long long>(GetTickCount64() - call_start));
+            return false;
+        }
+        reset_lower_executor_start_failure_cache("start_success");
+        diag::log_tagged_fmt("driver",
+            "call_function_lower_worker_create_ok call_id=%llu trigger=%s phase=%s label=%s tool=%s diag_id=%s pid=%u active_pid=%u generation=%llu fn=0x%llX api=_beginthreadex requested_stack_bytes=%u handle=%p begin_tid=%u worker_tid=%lu worker_alive=%d loop_ready=%d ready_wait_ms=%llu wait_rc=%lu queue_depth=%u inflight=%u elapsed_ms=%llu",
+            static_cast<unsigned long long>(call_id),
+            trigger && trigger[0] ? trigger : "",
+            phase ? phase : "",
+            call_ctx.label,
+            call_ctx.tool,
+            call_ctx.diag_id,
+            expected_pid,
+            active_pid_at_entry,
+            static_cast<unsigned long long>(generation_at_entry),
+            static_cast<unsigned long long>(function_address),
+            requested_stack_bytes,
+            worker_handle,
+            begin_tid,
+            static_cast<unsigned long>(g_remote_call_lower_worker_tid.load(std::memory_order_acquire)),
+            g_remote_call_lower_worker_alive.load(std::memory_order_acquire) ? 1 : 0,
+            g_remote_call_lower_worker_loop_ready.load(std::memory_order_acquire) ? 1 : 0,
+            static_cast<unsigned long long>(GetTickCount64() - ready_wait_start),
+            static_cast<unsigned long>(wait_rc),
+            g_remote_call_lower_queue_depth.load(std::memory_order_acquire),
+            g_remote_call_lower_inflight.load(std::memory_order_acquire),
+            static_cast<unsigned long long>(GetTickCount64() - call_start));
+        return true;
     }
 
     void stop_lower_remote_call_executor(const char* reason, DWORD wait_ms) noexcept
@@ -1181,7 +2181,7 @@ namespace
             std::lock_guard<std::mutex> lk(g_remote_call_lower_executor_mutex);
             had_worker = g_remote_call_lower_worker_started.load(std::memory_order_acquire) ||
                          g_remote_call_lower_worker_alive.load(std::memory_order_acquire) ||
-                         g_remote_call_lower_worker.joinable();
+                         g_remote_call_lower_worker_handle != nullptr;
             g_remote_call_lower_executor_stop.store(true, std::memory_order_release);
             while (!g_remote_call_lower_queue.empty()) {
                 cancelled.push_back(g_remote_call_lower_queue.front());
@@ -1194,14 +2194,20 @@ namespace
             complete_lower_remote_call_cancelled(item, "executor_shutdown", cancel_time);
         g_remote_call_lower_executor_cv.notify_all();
         diag::log_tagged_fmt("driver",
-            "call_function_lower_executor_stop_begin reason=%s had_worker=%d cancelled_queued=%zu worker_tid=%lu worker_alive=%d inflight=%u wait_ms=%lu elapsed_ms=%llu",
+            "call_function_lower_executor_stop_begin reason=%s had_worker=%d cancelled_queued=%zu worker_tid=%lu begin_tid=%u worker_alive=%d loop_ready=%d inflight=%u wait_ms=%lu cached_failure=%d cached_failures=%u cached_suppressed=%u cached_backoff_ms=%lu elapsed_ms=%llu",
             reason_text,
             had_worker ? 1 : 0,
             cancelled.size(),
             static_cast<unsigned long>(g_remote_call_lower_worker_tid.load(std::memory_order_acquire)),
+            g_remote_call_lower_worker_begin_tid,
             g_remote_call_lower_worker_alive.load(std::memory_order_acquire) ? 1 : 0,
+            g_remote_call_lower_worker_loop_ready.load(std::memory_order_acquire) ? 1 : 0,
             g_remote_call_lower_inflight.load(std::memory_order_acquire),
             static_cast<unsigned long>(wait_ms),
+            g_remote_call_lower_start_failure.valid ? 1 : 0,
+            g_remote_call_lower_start_failure.failure_count,
+            g_remote_call_lower_start_failure.suppressed_count,
+            static_cast<unsigned long>(g_remote_call_lower_start_failure.backoff_ms),
             static_cast<unsigned long long>(GetTickCount64() - stop_start));
         if (!had_worker)
             return;
@@ -1210,31 +2216,45 @@ namespace
             Sleep(10);
         bool joined = false;
         bool detached = false;
-        std::thread worker_to_join;
+        HANDLE worker_to_join = nullptr;
         {
             std::lock_guard<std::mutex> lk(g_remote_call_lower_executor_mutex);
-            if (g_remote_call_lower_worker.joinable()) {
+            if (g_remote_call_lower_worker_handle) {
                 if (!g_remote_call_lower_worker_alive.load(std::memory_order_acquire)) {
-                    worker_to_join = std::move(g_remote_call_lower_worker);
+                    worker_to_join = g_remote_call_lower_worker_handle;
+                    g_remote_call_lower_worker_handle = nullptr;
+                    g_remote_call_lower_worker_begin_tid = 0;
                 } else {
-                    g_remote_call_lower_worker.detach();
+                    CloseHandle(g_remote_call_lower_worker_handle);
+                    g_remote_call_lower_worker_handle = nullptr;
+                    g_remote_call_lower_worker_begin_tid = 0;
                     detached = true;
                 }
             }
         }
-        if (worker_to_join.joinable()) {
-            worker_to_join.join();
+        if (worker_to_join) {
+            WaitForSingleObject(worker_to_join, INFINITE);
+            CloseHandle(worker_to_join);
             joined = true;
         }
+        if (!g_remote_call_lower_worker_handle &&
+            !g_remote_call_lower_worker_alive.load(std::memory_order_acquire) &&
+            !g_remote_call_lower_worker_started.load(std::memory_order_acquire))
+            reset_lower_executor_start_failure_cache("executor_stopped");
         diag::log_tagged_fmt("driver",
-            "call_function_lower_executor_stop_done reason=%s joined=%d detached=%d worker_alive=%d worker_tid=%lu queue_depth=%u inflight=%u elapsed_ms=%llu",
+            "call_function_lower_executor_stop_done reason=%s joined=%d detached=%d worker_alive=%d loop_ready=%d worker_tid=%lu begin_tid=%u queue_depth=%u inflight=%u cached_failure=%d cached_failures=%u cached_suppressed=%u elapsed_ms=%llu",
             reason_text,
             joined ? 1 : 0,
             detached ? 1 : 0,
             g_remote_call_lower_worker_alive.load(std::memory_order_acquire) ? 1 : 0,
+            g_remote_call_lower_worker_loop_ready.load(std::memory_order_acquire) ? 1 : 0,
             static_cast<unsigned long>(g_remote_call_lower_worker_tid.load(std::memory_order_acquire)),
+            g_remote_call_lower_worker_begin_tid,
             g_remote_call_lower_queue_depth.load(std::memory_order_acquire),
             g_remote_call_lower_inflight.load(std::memory_order_acquire),
+            g_remote_call_lower_start_failure.valid ? 1 : 0,
+            g_remote_call_lower_start_failure.failure_count,
+            g_remote_call_lower_start_failure.suppressed_count,
             static_cast<unsigned long long>(GetTickCount64() - stop_start));
     }
 
@@ -1249,13 +2269,15 @@ namespace
                                            lower_remote_call_outcome_t& failure_outcome)
     {
         if (!g_remote_call_lower_executor_stop.load(std::memory_order_acquire) &&
-            (g_remote_call_lower_worker_started.load(std::memory_order_acquire) ||
+            g_remote_call_lower_worker_started.load(std::memory_order_acquire) &&
+            (g_remote_call_lower_worker_loop_ready.load(std::memory_order_acquire) ||
              g_remote_call_lower_worker_alive.load(std::memory_order_acquire)))
             return true;
 
         std::unique_lock<std::mutex> lk(g_remote_call_lower_executor_mutex);
         if (!g_remote_call_lower_executor_stop.load(std::memory_order_acquire) &&
-            (g_remote_call_lower_worker_started.load(std::memory_order_acquire) ||
+            g_remote_call_lower_worker_started.load(std::memory_order_acquire) &&
+            (g_remote_call_lower_worker_loop_ready.load(std::memory_order_acquire) ||
              g_remote_call_lower_worker_alive.load(std::memory_order_acquire)))
             return true;
         if (g_remote_call_lower_executor_stop.load(std::memory_order_acquire)) {
@@ -1272,7 +2294,7 @@ namespace
             failure_outcome.inflight_after = failure_outcome.inflight_at_submit;
             failure_outcome.completion_reason = "executor_stopping";
             diag::log_tagged_fmt("driver",
-                "call_function_lower_executor_reject call_id=%llu phase=%s label=%s tool=%s diag_id=%s pid=%u active_pid=%u generation=%llu fn=0x%llX reason=executor_stopping queue_depth=%u inflight=%u worker_tid=%lu elapsed_ms=%llu",
+                "call_function_lower_executor_reject call_id=%llu phase=%s label=%s tool=%s diag_id=%s pid=%u active_pid=%u generation=%llu fn=0x%llX reason=executor_stopping queue_depth=%u inflight=%u worker_tid=%lu begin_tid=%u worker_alive=%u loop_ready=%d elapsed_ms=%llu",
                 static_cast<unsigned long long>(call_id),
                 phase ? phase : "",
                 call_ctx.label,
@@ -1285,16 +2307,23 @@ namespace
                 failure_outcome.queue_depth_at_submit,
                 failure_outcome.inflight_at_submit,
                 static_cast<unsigned long>(failure_outcome.worker_tid),
+                g_remote_call_lower_worker_begin_tid,
+                failure_outcome.worker_alive,
+                g_remote_call_lower_worker_loop_ready.load(std::memory_order_acquire) ? 1 : 0,
                 static_cast<unsigned long long>(failure_outcome.elapsed_ms));
             return false;
         }
-        if (g_remote_call_lower_worker.joinable()) {
-            std::thread previous_worker = std::move(g_remote_call_lower_worker);
+        if (g_remote_call_lower_worker_handle) {
+            HANDLE previous_worker = g_remote_call_lower_worker_handle;
+            g_remote_call_lower_worker_handle = nullptr;
+            g_remote_call_lower_worker_begin_tid = 0;
             lk.unlock();
-            previous_worker.join();
+            WaitForSingleObject(previous_worker, INFINITE);
+            CloseHandle(previous_worker);
             lk.lock();
             if (!g_remote_call_lower_executor_stop.load(std::memory_order_acquire) &&
-                (g_remote_call_lower_worker_started.load(std::memory_order_acquire) ||
+                g_remote_call_lower_worker_started.load(std::memory_order_acquire) &&
+                (g_remote_call_lower_worker_loop_ready.load(std::memory_order_acquire) ||
                  g_remote_call_lower_worker_alive.load(std::memory_order_acquire)))
                 return true;
             if (g_remote_call_lower_executor_stop.load(std::memory_order_acquire)) {
@@ -1313,174 +2342,113 @@ namespace
                 return false;
             }
         }
-        g_remote_call_lower_executor_stop.store(false, std::memory_order_release);
+        return start_lower_remote_call_executor_locked(lk,
+                                                       "demand",
+                                                       phase,
+                                                       call_id,
+                                                       call_ctx,
+                                                       expected_pid,
+                                                       active_pid_at_entry,
+                                                       generation_at_entry,
+                                                       function_address,
+                                                       call_start,
+                                                       &failure_outcome);
+    }
 
-        const lower_executor_process_stats_t stats = capture_lower_executor_process_stats();
-        diag::log_tagged_fmt("driver",
-            "call_function_lower_worker_create_begin call_id=%llu phase=%s label=%s tool=%s diag_id=%s pid=%u active_pid=%u generation=%llu fn=0x%llX queue_depth=%u inflight=%u handle_count_ok=%d handle_count=%lu thread_count=%lu memory_ok=%d private_bytes=%llu working_set=%llu elapsed_ms=%llu",
-            static_cast<unsigned long long>(call_id),
-            phase ? phase : "",
-            call_ctx.label,
-            call_ctx.tool,
-            call_ctx.diag_id,
-            expected_pid,
-            active_pid_at_entry,
-            static_cast<unsigned long long>(generation_at_entry),
-            static_cast<unsigned long long>(function_address),
-            g_remote_call_lower_queue_depth.load(std::memory_order_acquire),
-            g_remote_call_lower_inflight.load(std::memory_order_acquire),
-            stats.handle_count_ok ? 1 : 0,
-            static_cast<unsigned long>(stats.handle_count),
-            static_cast<unsigned long>(stats.thread_count),
-            stats.memory_ok ? 1 : 0,
-            static_cast<unsigned long long>(stats.private_bytes),
-            static_cast<unsigned long long>(stats.working_set),
-            static_cast<unsigned long long>(GetTickCount64() - call_start));
+    void prestart_lower_remote_call_executor_state_known(const char* reason,
+                                                         ULONGLONG call_start,
+                                                         uint32_t active_pid,
+                                                         uint64_t generation,
+                                                         bool state_mutex_held) noexcept
+    {
         try {
-            std::thread worker(lower_remote_call_worker_main);
-            const auto worker_id_hash = static_cast<unsigned long long>(std::hash<std::thread::id>{}(worker.get_id()));
-            g_remote_call_lower_worker = std::move(worker);
-            g_remote_call_lower_worker_started.store(true, std::memory_order_release);
+            remote_call_snapshot_t call_ctx{};
+            call_ctx.label = "lower_executor_prestart";
+            call_ctx.tool = "";
+            call_ctx.diag_id = "";
+            call_ctx.pid = active_pid;
+            call_ctx.timeout_ms = 0;
+            call_ctx.deadline_ms = 0;
+            call_ctx.cancelled = false;
+            call_ctx.require_deadline = false;
+            call_ctx.context_active = false;
+            std::unique_lock<std::mutex> lk(g_remote_call_lower_executor_mutex);
+            if (!g_remote_call_lower_executor_stop.load(std::memory_order_acquire) &&
+                g_remote_call_lower_worker_started.load(std::memory_order_acquire) &&
+                (g_remote_call_lower_worker_loop_ready.load(std::memory_order_acquire) ||
+                 g_remote_call_lower_worker_alive.load(std::memory_order_acquire))) {
+                diag::log_tagged_fmt("driver",
+                    "lower_executor_prestart_skip reason=%s already_started=1 active_pid=%u generation=%llu state_mutex_held=%d worker_tid=%lu begin_tid=%u loop_ready=%d elapsed_ms=%llu",
+                    reason && reason[0] ? reason : "",
+                    active_pid,
+                    static_cast<unsigned long long>(generation),
+                    state_mutex_held ? 1 : 0,
+                    static_cast<unsigned long>(g_remote_call_lower_worker_tid.load(std::memory_order_acquire)),
+                    g_remote_call_lower_worker_begin_tid,
+                    g_remote_call_lower_worker_loop_ready.load(std::memory_order_acquire) ? 1 : 0,
+                    static_cast<unsigned long long>(GetTickCount64() - call_start));
+                return;
+            }
+            if (g_remote_call_lower_worker_handle &&
+                !g_remote_call_lower_worker_alive.load(std::memory_order_acquire)) {
+                HANDLE previous = g_remote_call_lower_worker_handle;
+                g_remote_call_lower_worker_handle = nullptr;
+                g_remote_call_lower_worker_begin_tid = 0;
+                lk.unlock();
+                WaitForSingleObject(previous, INFINITE);
+                CloseHandle(previous);
+                lk.lock();
+            }
+            const bool ok = start_lower_remote_call_executor_locked(lk,
+                                                                    reason && reason[0] ? reason : "prestart",
+                                                                    "prestart",
+                                                                    0,
+                                                                    call_ctx,
+                                                                    active_pid,
+                                                                    active_pid,
+                                                                    generation,
+                                                                    0,
+                                                                    call_start,
+                                                                    nullptr);
             diag::log_tagged_fmt("driver",
-                "call_function_lower_worker_create_ok call_id=%llu phase=%s label=%s tool=%s diag_id=%s pid=%u active_pid=%u generation=%llu fn=0x%llX std_thread_hash=%llu worker_tid=%lu worker_alive=%d queue_depth=%u inflight=%u elapsed_ms=%llu",
-                static_cast<unsigned long long>(call_id),
-                phase ? phase : "",
-                call_ctx.label,
-                call_ctx.tool,
-                call_ctx.diag_id,
-                expected_pid,
-                active_pid_at_entry,
-                static_cast<unsigned long long>(generation_at_entry),
-                static_cast<unsigned long long>(function_address),
-                worker_id_hash,
+                "lower_executor_prestart_done reason=%s ok=%d active_pid=%u generation=%llu state_mutex_held=%d cached_failure=%d cached_failures=%u cached_suppressed=%u cached_backoff_ms=%lu worker_tid=%lu begin_tid=%u worker_alive=%u loop_ready=%d queue_depth=%u inflight=%u elapsed_ms=%llu",
+                reason && reason[0] ? reason : "",
+                ok ? 1 : 0,
+                active_pid,
+                static_cast<unsigned long long>(generation),
+                state_mutex_held ? 1 : 0,
+                g_remote_call_lower_start_failure.valid ? 1 : 0,
+                g_remote_call_lower_start_failure.failure_count,
+                g_remote_call_lower_start_failure.suppressed_count,
+                static_cast<unsigned long>(g_remote_call_lower_start_failure.backoff_ms),
                 static_cast<unsigned long>(g_remote_call_lower_worker_tid.load(std::memory_order_acquire)),
-                g_remote_call_lower_worker_alive.load(std::memory_order_acquire) ? 1 : 0,
+                g_remote_call_lower_worker_begin_tid,
+                g_remote_call_lower_worker_alive.load(std::memory_order_acquire) ? 1u : 0u,
+                g_remote_call_lower_worker_loop_ready.load(std::memory_order_acquire) ? 1 : 0,
                 g_remote_call_lower_queue_depth.load(std::memory_order_acquire),
                 g_remote_call_lower_inflight.load(std::memory_order_acquire),
                 static_cast<unsigned long long>(GetTickCount64() - call_start));
-            return true;
-        } catch (const std::system_error& ex) {
-            failure_outcome.gle = ERROR_NOT_ENOUGH_MEMORY;
-            failure_outcome.worker_exception = true;
-            failure_outcome.worker_creation_failed = true;
-            failure_outcome.active_pid_after = driver_bridge::attached_pid();
-            failure_outcome.generation_after = g_active_pid_generation.load(std::memory_order_acquire);
-            failure_outcome.elapsed_ms = GetTickCount64() - call_start;
-            failure_outcome.worker_error_value = ex.code().value();
-            failure_outcome.worker_error_category = ex.code().category().name();
-            failure_outcome.worker_error_message = ex.what();
-            failure_outcome.worker_alive = g_remote_call_lower_worker_alive.load(std::memory_order_acquire) ? 1u : 0u;
-            failure_outcome.worker_tid = g_remote_call_lower_worker_tid.load(std::memory_order_acquire);
-            failure_outcome.queue_depth_at_submit = g_remote_call_lower_queue_depth.load(std::memory_order_acquire);
-            failure_outcome.inflight_at_submit = g_remote_call_lower_inflight.load(std::memory_order_acquire);
-            failure_outcome.inflight_after = failure_outcome.inflight_at_submit;
-            failure_outcome.completion_reason = "worker_create_failed";
-            diag::log_tagged_fmt("driver",
-                "call_function_lower_thread_create_failed call_id=%llu phase=%s label=%s tool=%s diag_id=%s pid=%u active_pid=%u generation=%llu fn=0x%llX gle=%lu system_value=%d system_category=%s system_message=%s what=%s queue_depth=%u inflight=%u worker_tid=%lu worker_alive=%u handle_count_ok=%d handle_count=%lu thread_count=%lu memory_ok=%d private_bytes=%llu working_set=%llu elapsed_ms=%llu",
-                static_cast<unsigned long long>(call_id),
-                phase ? phase : "",
-                call_ctx.label,
-                call_ctx.tool,
-                call_ctx.diag_id,
-                expected_pid,
-                active_pid_at_entry,
-                static_cast<unsigned long long>(generation_at_entry),
-                static_cast<unsigned long long>(function_address),
-                static_cast<unsigned long>(failure_outcome.gle),
-                failure_outcome.worker_error_value,
-                failure_outcome.worker_error_category.c_str(),
-                ex.code().message().c_str(),
-                failure_outcome.worker_error_message.c_str(),
-                failure_outcome.queue_depth_at_submit,
-                failure_outcome.inflight_at_submit,
-                static_cast<unsigned long>(failure_outcome.worker_tid),
-                failure_outcome.worker_alive,
-                stats.handle_count_ok ? 1 : 0,
-                static_cast<unsigned long>(stats.handle_count),
-                static_cast<unsigned long>(stats.thread_count),
-                stats.memory_ok ? 1 : 0,
-                static_cast<unsigned long long>(stats.private_bytes),
-                static_cast<unsigned long long>(stats.working_set),
-                static_cast<unsigned long long>(failure_outcome.elapsed_ms));
-            return false;
         } catch (const std::exception& ex) {
-            failure_outcome.gle = ERROR_NOT_ENOUGH_MEMORY;
-            failure_outcome.worker_exception = true;
-            failure_outcome.worker_creation_failed = true;
-            failure_outcome.active_pid_after = driver_bridge::attached_pid();
-            failure_outcome.generation_after = g_active_pid_generation.load(std::memory_order_acquire);
-            failure_outcome.elapsed_ms = GetTickCount64() - call_start;
-            failure_outcome.worker_error_message = ex.what();
-            failure_outcome.worker_alive = g_remote_call_lower_worker_alive.load(std::memory_order_acquire) ? 1u : 0u;
-            failure_outcome.worker_tid = g_remote_call_lower_worker_tid.load(std::memory_order_acquire);
-            failure_outcome.queue_depth_at_submit = g_remote_call_lower_queue_depth.load(std::memory_order_acquire);
-            failure_outcome.inflight_at_submit = g_remote_call_lower_inflight.load(std::memory_order_acquire);
-            failure_outcome.inflight_after = failure_outcome.inflight_at_submit;
-            failure_outcome.completion_reason = "worker_create_failed";
             diag::log_tagged_fmt("driver",
-                "call_function_lower_thread_create_failed call_id=%llu phase=%s label=%s tool=%s diag_id=%s pid=%u active_pid=%u generation=%llu fn=0x%llX gle=%lu what=%s queue_depth=%u inflight=%u worker_tid=%lu worker_alive=%u handle_count_ok=%d handle_count=%lu thread_count=%lu memory_ok=%d private_bytes=%llu working_set=%llu elapsed_ms=%llu",
-                static_cast<unsigned long long>(call_id),
-                phase ? phase : "",
-                call_ctx.label,
-                call_ctx.tool,
-                call_ctx.diag_id,
-                expected_pid,
-                active_pid_at_entry,
-                static_cast<unsigned long long>(generation_at_entry),
-                static_cast<unsigned long long>(function_address),
-                static_cast<unsigned long>(failure_outcome.gle),
-                failure_outcome.worker_error_message.c_str(),
-                failure_outcome.queue_depth_at_submit,
-                failure_outcome.inflight_at_submit,
-                static_cast<unsigned long>(failure_outcome.worker_tid),
-                failure_outcome.worker_alive,
-                stats.handle_count_ok ? 1 : 0,
-                static_cast<unsigned long>(stats.handle_count),
-                static_cast<unsigned long>(stats.thread_count),
-                stats.memory_ok ? 1 : 0,
-                static_cast<unsigned long long>(stats.private_bytes),
-                static_cast<unsigned long long>(stats.working_set),
-                static_cast<unsigned long long>(failure_outcome.elapsed_ms));
-            return false;
+                "lower_executor_prestart_exception reason=%s err=%s elapsed_ms=%llu",
+                reason && reason[0] ? reason : "",
+                ex.what(),
+                static_cast<unsigned long long>(GetTickCount64() - call_start));
         } catch (...) {
-            failure_outcome.gle = ERROR_NOT_ENOUGH_MEMORY;
-            failure_outcome.worker_exception = true;
-            failure_outcome.worker_creation_failed = true;
-            failure_outcome.active_pid_after = driver_bridge::attached_pid();
-            failure_outcome.generation_after = g_active_pid_generation.load(std::memory_order_acquire);
-            failure_outcome.elapsed_ms = GetTickCount64() - call_start;
-            failure_outcome.worker_error_message = "<unknown>";
-            failure_outcome.worker_alive = g_remote_call_lower_worker_alive.load(std::memory_order_acquire) ? 1u : 0u;
-            failure_outcome.worker_tid = g_remote_call_lower_worker_tid.load(std::memory_order_acquire);
-            failure_outcome.queue_depth_at_submit = g_remote_call_lower_queue_depth.load(std::memory_order_acquire);
-            failure_outcome.inflight_at_submit = g_remote_call_lower_inflight.load(std::memory_order_acquire);
-            failure_outcome.inflight_after = failure_outcome.inflight_at_submit;
-            failure_outcome.completion_reason = "worker_create_failed";
             diag::log_tagged_fmt("driver",
-                "call_function_lower_thread_create_failed call_id=%llu phase=%s label=%s tool=%s diag_id=%s pid=%u active_pid=%u generation=%llu fn=0x%llX gle=%lu what=<unknown> queue_depth=%u inflight=%u worker_tid=%lu worker_alive=%u handle_count_ok=%d handle_count=%lu thread_count=%lu memory_ok=%d private_bytes=%llu working_set=%llu elapsed_ms=%llu",
-                static_cast<unsigned long long>(call_id),
-                phase ? phase : "",
-                call_ctx.label,
-                call_ctx.tool,
-                call_ctx.diag_id,
-                expected_pid,
-                active_pid_at_entry,
-                static_cast<unsigned long long>(generation_at_entry),
-                static_cast<unsigned long long>(function_address),
-                static_cast<unsigned long>(failure_outcome.gle),
-                failure_outcome.queue_depth_at_submit,
-                failure_outcome.inflight_at_submit,
-                static_cast<unsigned long>(failure_outcome.worker_tid),
-                failure_outcome.worker_alive,
-                stats.handle_count_ok ? 1 : 0,
-                static_cast<unsigned long>(stats.handle_count),
-                static_cast<unsigned long>(stats.thread_count),
-                stats.memory_ok ? 1 : 0,
-                static_cast<unsigned long long>(stats.private_bytes),
-                static_cast<unsigned long long>(stats.working_set),
-                static_cast<unsigned long long>(failure_outcome.elapsed_ms));
-            return false;
+                "lower_executor_prestart_exception reason=%s err=<unknown> elapsed_ms=%llu",
+                reason && reason[0] ? reason : "",
+                static_cast<unsigned long long>(GetTickCount64() - call_start));
         }
+    }
+
+    void prestart_lower_remote_call_executor(const char* reason, ULONGLONG call_start) noexcept
+    {
+        prestart_lower_remote_call_executor_state_known(reason,
+                                                        call_start,
+                                                        driver_bridge::attached_pid(),
+                                                        g_active_pid_generation.load(std::memory_order_acquire),
+                                                        false);
     }
 
     template <typename Fn>
@@ -1741,12 +2709,15 @@ namespace
             outcome.deadline_expired = outcome.deadline_expired || deadline_after_wait;
             outcome.cancelled = outcome.cancelled || cancelled_after_wait;
             outcome.stale_generation = outcome.stale_generation || stale_after_wait;
+            outcome.lower_lock_timeout = true;
+            outcome.completed = false;
             outcome.active_pid_after = active_after_wait;
             outcome.generation_after = generation_after_wait;
             outcome.deadline_remaining_at_finish_ms = deadline_remaining_ms(call_ctx.deadline_ms, after_wait);
-            if (outcome.lower_ok)
-                outcome.gle = stale_after_wait ? ERROR_OPERATION_ABORTED : (cancelled_after_wait ? ERROR_CANCELLED : ERROR_TIMEOUT);
-            if (outcome.completion_reason == "completed")
+            outcome.gle = stale_after_wait ? ERROR_OPERATION_ABORTED : (cancelled_after_wait ? ERROR_CANCELLED : ERROR_TIMEOUT);
+            if (outcome.completion_reason.empty() ||
+                outcome.completion_reason == "completed" ||
+                outcome.completion_reason == "lower_failed")
                 outcome.completion_reason = stale_after_wait ? "stale_after_wait" : (cancelled_after_wait ? "cancelled_after_wait" : "deadline_after_wait");
             diag::log_tagged_fmt("driver",
                 "call_function_lower_late_reject call_id=%llu phase=%s label=%s tool=%s diag_id=%s pid=%u active_pid=%u active_after=%u generation=%llu generation_after=%llu fn=0x%llX deadline_expired=%d cancelled=%d stale_generation=%d result=0x%llX gle=%lu elapsed_ms=%llu",
@@ -3203,6 +4174,11 @@ namespace driver_bridge
                 after_kernel);
             driver_critical_fmt("initialize_exit reason=existing_driver ok=1 kernel=1 elapsed_ms=%llu",
                 static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
+            prestart_lower_remote_call_executor_state_known("initialize_existing_driver",
+                                                            started,
+                                                            g_pid,
+                                                            g_active_pid_generation.load(std::memory_order_acquire),
+                                                            true);
             return true;
         }
         DWORD existing_connect_err = device ? device->get_last_connect_error() : GetLastError();
@@ -3256,6 +4232,11 @@ namespace driver_bridge
                         after_kernel);
                     driver_critical_fmt("initialize_exit reason=existing_driver_retry ok=1 kernel=1 elapsed_ms=%llu",
                         static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
+                    prestart_lower_remote_call_executor_state_known("initialize_existing_driver_retry",
+                                                                    started,
+                                                                    g_pid,
+                                                                    g_active_pid_generation.load(std::memory_order_acquire),
+                                                                    true);
                     return true;
                 }
                 driver_critical_fmt("initialize_existing_driver_retry_post attempt=%d ok=0 err=%lu hb_ioctl=%d hb_err=%lu hb_bytes=%lu elapsed_ms=%llu",
@@ -3316,6 +4297,11 @@ namespace driver_bridge
                     after_kernel);
                 driver_critical_fmt("initialize_exit reason=loader_failed_but_connect_ok ok=1 kernel=1 elapsed_ms=%llu",
                     static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
+                prestart_lower_remote_call_executor_state_known("initialize_loader_failed_connect_retry",
+                                                                started,
+                                                                g_pid,
+                                                                g_active_pid_generation.load(std::memory_order_acquire),
+                                                                true);
                 return true;
             }
             driver_critical_fmt("initialize_loader_failed_connect_retry_post ok=0 err=%lu elapsed_ms=%llu",
@@ -3349,6 +4335,11 @@ namespace driver_bridge
                 after_kernel);
             driver_critical_fmt("initialize_exit reason=loaded_connect_ok ok=1 kernel=1 elapsed_ms=%llu",
                 static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
+            prestart_lower_remote_call_executor_state_known("initialize_connect_after_loader",
+                                                            started,
+                                                            g_pid,
+                                                            g_active_pid_generation.load(std::memory_order_acquire),
+                                                            true);
             return true;
         }
 
@@ -4717,13 +5708,37 @@ namespace driver_bridge
             return false;
         }
 
+        const uint32_t diag_pid = attached_pid();
+        const DWORD diag_tid = GetCurrentThreadId();
+        const uint64_t dtb_entry = device ? device->get_dtb() : 0;
+        const bridge_region_snapshot_t region_before = capture_bridge_region_snapshot(address);
+        diag::log_tagged_fmt("driver",
+            "read_memory_kernel_begin pid=%u tid=%lu addr=0x%llX size=%llu kernel=%d attached=%d dtb=0x%llX region_ok=%d region_gle=%lu region_base=0x%llX region_size=0x%llX state=0x%lX protect=0x%lX type=0x%lX",
+            diag_pid,
+            static_cast<unsigned long>(diag_tid),
+            static_cast<unsigned long long>(address),
+            static_cast<unsigned long long>(size),
+            kernel_mode ? 1 : 0,
+            kernel_attached ? 1 : 0,
+            static_cast<unsigned long long>(dtb_entry),
+            region_before.ok ? 1 : 0,
+            static_cast<unsigned long>(region_before.gle),
+            static_cast<unsigned long long>(region_before.base),
+            static_cast<unsigned long long>(region_before.size),
+            static_cast<unsigned long>(region_before.state),
+            static_cast<unsigned long>(region_before.protect),
+            static_cast<unsigned long>(region_before.type));
+
         out.resize(size);
         size_t bytes_read = 0;
         bool arc_read_invoked = false;
-        bytes_read = arc_bridge_read_raw(address, out.data(), size, &arc_read_invoked);
+        const size_t arc_bytes = arc_bridge_read_raw(address, out.data(), size, &arc_read_invoked);
+        bytes_read = arc_bytes;
+        size_t direct_bytes = 0;
 
         if (bytes_read == 0 && device && device->get_dtb() != 0) {
-            bytes_read = device->read_raw(address, out.data(), size);
+            direct_bytes = device->read_raw(address, out.data(), size);
+            bytes_read = direct_bytes;
         }
 
         {
@@ -4741,39 +5756,100 @@ namespace driver_bridge
 
         if (bytes_read == 0) {
             bool re_resolved = false;
+            bool refresh_attempted = true;
+            uint64_t dtb_before_refresh = device ? device->get_dtb() : 0;
+            uint64_t dtb_after_refresh = 0;
             {
                 std::lock_guard<std::mutex> lk(g_state_mtx);
                 if (device) {
                     device->solve_dtb();
                     re_resolved = (device->get_dtb() != 0);
+                    dtb_after_refresh = device->get_dtb();
                 }
                 if (!re_resolved) {
                     uint64_t new_dtb = arc_bridge_solve_dtb(true);
                     re_resolved = (new_dtb != 0);
+                    dtb_after_refresh = new_dtb;
                 }
             }
 
+            size_t retry_arc_bytes = 0;
+            size_t retry_direct_bytes = 0;
             if (re_resolved) {
                 std::memset(out.data(), 0, size);
-                bytes_read = arc_bridge_read_raw(address, out.data(), size);
+                retry_arc_bytes = arc_bridge_read_raw(address, out.data(), size);
+                bytes_read = retry_arc_bytes;
                 if (bytes_read == 0 && device) {
-                    bytes_read = device->read_raw(address, out.data(), size);
+                    retry_direct_bytes = device->read_raw(address, out.data(), size);
+                    bytes_read = retry_direct_bytes;
                 }
             }
+            diag::log_tagged_fmt("driver",
+                "read_memory_kernel_retry pid=%u tid=%lu addr=0x%llX size=%llu refresh_attempted=%d re_resolved=%d dtb_before=0x%llX dtb_after=0x%llX arc_first=%llu direct_first=%llu retry_arc=%llu retry_direct=%llu final_bytes=%llu gle=%lu",
+                diag_pid,
+                static_cast<unsigned long>(diag_tid),
+                static_cast<unsigned long long>(address),
+                static_cast<unsigned long long>(size),
+                refresh_attempted ? 1 : 0,
+                re_resolved ? 1 : 0,
+                static_cast<unsigned long long>(dtb_before_refresh),
+                static_cast<unsigned long long>(dtb_after_refresh),
+                static_cast<unsigned long long>(arc_bytes),
+                static_cast<unsigned long long>(direct_bytes),
+                static_cast<unsigned long long>(retry_arc_bytes),
+                static_cast<unsigned long long>(retry_direct_bytes),
+                static_cast<unsigned long long>(bytes_read),
+                static_cast<unsigned long>(GetLastError()));
         }
 
         if (bytes_read > 0) {
             out.resize(bytes_read);
+            const bridge_region_snapshot_t region_after = capture_bridge_region_snapshot(address);
+            diag::log_tagged_fmt("driver",
+                "read_memory_kernel_done pid=%u tid=%lu addr=0x%llX size=%llu ok=1 bytes=%llu arc_invoked=%d arc_bytes=%llu direct_bytes=%llu dtb_entry=0x%llX dtb_exit=0x%llX all_zero=%d first16=%s region_before_ok=%d region_after_ok=%d state_before=0x%lX protect_before=0x%lX state_after=0x%lX protect_after=0x%lX",
+                diag_pid,
+                static_cast<unsigned long>(diag_tid),
+                static_cast<unsigned long long>(address),
+                static_cast<unsigned long long>(size),
+                static_cast<unsigned long long>(bytes_read),
+                arc_read_invoked ? 1 : 0,
+                static_cast<unsigned long long>(arc_bytes),
+                static_cast<unsigned long long>(direct_bytes),
+                static_cast<unsigned long long>(dtb_entry),
+                static_cast<unsigned long long>(device ? device->get_dtb() : 0),
+                bytes_all_zero(out.data(), out.size()) ? 1 : 0,
+                format_byte_prefix(out.data(), out.size()).c_str(),
+                region_before.ok ? 1 : 0,
+                region_after.ok ? 1 : 0,
+                static_cast<unsigned long>(region_before.state),
+                static_cast<unsigned long>(region_before.protect),
+                static_cast<unsigned long>(region_after.state),
+                static_cast<unsigned long>(region_after.protect));
             clear_last_error_after_success("read_memory_kernel");
             return true;
         }
 
         out.clear();
+        const bridge_region_snapshot_t region_after = capture_bridge_region_snapshot(address);
         diag::log_tagged_fmt("driver",
-            "read_memory_kernel_failed addr=0x%llX sz=%llu dtb=0x%llX",
+            "read_memory_kernel_failed pid=%u tid=%lu addr=0x%llX sz=%llu dtb_entry=0x%llX dtb_exit=0x%llX arc_invoked=%d arc_bytes=%llu direct_bytes=%llu gle=%lu driver_last_error=%s region_before_ok=%d region_after_ok=%d state_before=0x%lX protect_before=0x%lX state_after=0x%lX protect_after=0x%lX",
+            diag_pid,
+            static_cast<unsigned long>(diag_tid),
             static_cast<unsigned long long>(address),
             static_cast<unsigned long long>(size),
-            static_cast<unsigned long long>(device ? device->get_dtb() : 0));
+            static_cast<unsigned long long>(dtb_entry),
+            static_cast<unsigned long long>(device ? device->get_dtb() : 0),
+            arc_read_invoked ? 1 : 0,
+            static_cast<unsigned long long>(arc_bytes),
+            static_cast<unsigned long long>(direct_bytes),
+            static_cast<unsigned long>(GetLastError()),
+            last_error().empty() ? "<empty>" : last_error().c_str(),
+            region_before.ok ? 1 : 0,
+            region_after.ok ? 1 : 0,
+            static_cast<unsigned long>(region_before.state),
+            static_cast<unsigned long>(region_before.protect),
+            static_cast<unsigned long>(region_after.state),
+            static_cast<unsigned long>(region_after.protect));
         return false;
     }
 
@@ -4811,6 +5887,28 @@ namespace driver_bridge
             return false;
         }
 
+        const uint32_t diag_pid = attached_pid();
+        const DWORD diag_tid = GetCurrentThreadId();
+        const uint64_t dtb_entry = device ? device->get_dtb() : 0;
+        const bridge_region_snapshot_t region_before = capture_bridge_region_snapshot(address);
+        diag::log_tagged_fmt("driver",
+            "write_memory_kernel_begin pid=%u tid=%lu addr=0x%llX size=%llu kernel=%d attached=%d dtb=0x%llX expected_first16=%s region_ok=%d region_gle=%lu region_base=0x%llX region_size=0x%llX state=0x%lX protect=0x%lX type=0x%lX",
+            diag_pid,
+            static_cast<unsigned long>(diag_tid),
+            static_cast<unsigned long long>(address),
+            static_cast<unsigned long long>(data.size()),
+            kernel_mode ? 1 : 0,
+            kernel_attached ? 1 : 0,
+            static_cast<unsigned long long>(dtb_entry),
+            format_byte_prefix(data.data(), data.size()).c_str(),
+            region_before.ok ? 1 : 0,
+            static_cast<unsigned long>(region_before.gle),
+            static_cast<unsigned long long>(region_before.base),
+            static_cast<unsigned long long>(region_before.size),
+            static_cast<unsigned long>(region_before.state),
+            static_cast<unsigned long>(region_before.protect),
+            static_cast<unsigned long>(region_before.type));
+
         auto first_mismatch = [](const std::vector<uint8_t>& expected, const std::vector<uint8_t>& actual) -> size_t {
             const size_t n = std::min(expected.size(), actual.size());
             for (size_t i = 0; i < n; ++i) {
@@ -4820,42 +5918,88 @@ namespace driver_bridge
             return n;
         };
 
-        size_t bytes_written = arc_bridge_write_raw(address, data.data(), data.size());
+        const size_t arc_written = arc_bridge_write_raw(address, data.data(), data.size());
+        size_t bytes_written = arc_written;
+        size_t direct_written = 0;
+        size_t retry_arc_written = 0;
+        size_t retry_direct_written = 0;
+        bool refresh_attempted = false;
+        bool re_resolved = false;
+        uint64_t dtb_before_refresh = dtb_entry;
+        uint64_t dtb_after_refresh = dtb_entry;
 
         if (bytes_written != data.size() && device && device->get_dtb() != 0) {
-            const size_t direct_written = device->write_raw(address, data.data(), data.size());
+            direct_written = device->write_raw(address, data.data(), data.size());
             if (direct_written > bytes_written)
                 bytes_written = direct_written;
         }
 
         if (bytes_written != data.size()) {
-            bool re_resolved = false;
+            refresh_attempted = true;
+            dtb_before_refresh = device ? device->get_dtb() : 0;
             {
                 std::lock_guard<std::mutex> lk(g_state_mtx);
                 if (device) {
                     device->solve_dtb();
                     re_resolved = (device->get_dtb() != 0);
+                    dtb_after_refresh = device->get_dtb();
                 }
                 if (!re_resolved) {
                     uint64_t new_dtb = arc_bridge_solve_dtb(true);
                     re_resolved = (new_dtb != 0);
+                    dtb_after_refresh = new_dtb;
                 }
             }
 
             if (re_resolved) {
-                const size_t retry_written = arc_bridge_write_raw(address, data.data(), data.size());
-                if (retry_written > bytes_written)
-                    bytes_written = retry_written;
+                retry_arc_written = arc_bridge_write_raw(address, data.data(), data.size());
+                if (retry_arc_written > bytes_written)
+                    bytes_written = retry_arc_written;
                 if (bytes_written != data.size() && device) {
-                    const size_t retry_direct_written = device->write_raw(address, data.data(), data.size());
+                    retry_direct_written = device->write_raw(address, data.data(), data.size());
                     if (retry_direct_written > bytes_written)
                         bytes_written = retry_direct_written;
                 }
             }
+            diag::log_tagged_fmt("driver",
+                "write_memory_kernel_retry pid=%u tid=%lu addr=0x%llX size=%llu refresh_attempted=%d re_resolved=%d dtb_before=0x%llX dtb_after=0x%llX arc_first=%llu direct_first=%llu retry_arc=%llu retry_direct=%llu final_bytes=%llu gle=%lu",
+                diag_pid,
+                static_cast<unsigned long>(diag_tid),
+                static_cast<unsigned long long>(address),
+                static_cast<unsigned long long>(data.size()),
+                refresh_attempted ? 1 : 0,
+                re_resolved ? 1 : 0,
+                static_cast<unsigned long long>(dtb_before_refresh),
+                static_cast<unsigned long long>(dtb_after_refresh),
+                static_cast<unsigned long long>(arc_written),
+                static_cast<unsigned long long>(direct_written),
+                static_cast<unsigned long long>(retry_arc_written),
+                static_cast<unsigned long long>(retry_direct_written),
+                static_cast<unsigned long long>(bytes_written),
+                static_cast<unsigned long>(GetLastError()));
         }
 
         if (bytes_written == data.size()) {
             if (data.size() > kVerifyLimit) {
+                const bridge_region_snapshot_t region_after = capture_bridge_region_snapshot(address);
+                diag::log_tagged_fmt("driver",
+                    "write_memory_kernel_done pid=%u tid=%lu addr=0x%llX size=%llu ok=1 verify_skipped=1 reason=size_limit arc_bytes=%llu direct_bytes=%llu retry_arc=%llu retry_direct=%llu dtb_entry=0x%llX dtb_exit=0x%llX region_before_ok=%d region_after_ok=%d state_before=0x%lX protect_before=0x%lX state_after=0x%lX protect_after=0x%lX",
+                    diag_pid,
+                    static_cast<unsigned long>(diag_tid),
+                    static_cast<unsigned long long>(address),
+                    static_cast<unsigned long long>(data.size()),
+                    static_cast<unsigned long long>(arc_written),
+                    static_cast<unsigned long long>(direct_written),
+                    static_cast<unsigned long long>(retry_arc_written),
+                    static_cast<unsigned long long>(retry_direct_written),
+                    static_cast<unsigned long long>(dtb_entry),
+                    static_cast<unsigned long long>(device ? device->get_dtb() : 0),
+                    region_before.ok ? 1 : 0,
+                    region_after.ok ? 1 : 0,
+                    static_cast<unsigned long>(region_before.state),
+                    static_cast<unsigned long>(region_before.protect),
+                    static_cast<unsigned long>(region_after.state),
+                    static_cast<unsigned long>(region_after.protect));
                 clear_last_error_after_success("write_memory_kernel");
                 return true;
             }
@@ -4865,36 +6009,112 @@ namespace driver_bridge
                 bridge_verify.size() == data.size() &&
                 std::equal(data.begin(), data.end(), bridge_verify.begin());
             if (bridge_match) {
+                const bridge_region_snapshot_t region_after = capture_bridge_region_snapshot(address);
+                diag::log_tagged_fmt("driver",
+                    "write_memory_kernel_done pid=%u tid=%lu addr=0x%llX size=%llu ok=1 verify_skipped=0 bridge_read=1 bridge_bytes=%llu arc_bytes=%llu direct_bytes=%llu retry_arc=%llu retry_direct=%llu dtb_entry=0x%llX dtb_exit=0x%llX expected_first16=%s actual_first16=%s all_zero_readback=0 region_before_ok=%d region_after_ok=%d state_before=0x%lX protect_before=0x%lX state_after=0x%lX protect_after=0x%lX",
+                    diag_pid,
+                    static_cast<unsigned long>(diag_tid),
+                    static_cast<unsigned long long>(address),
+                    static_cast<unsigned long long>(data.size()),
+                    static_cast<unsigned long long>(bridge_verify.size()),
+                    static_cast<unsigned long long>(arc_written),
+                    static_cast<unsigned long long>(direct_written),
+                    static_cast<unsigned long long>(retry_arc_written),
+                    static_cast<unsigned long long>(retry_direct_written),
+                    static_cast<unsigned long long>(dtb_entry),
+                    static_cast<unsigned long long>(device ? device->get_dtb() : 0),
+                    format_byte_prefix(data.data(), data.size()).c_str(),
+                    format_byte_prefix(bridge_verify.data(), bridge_verify.size()).c_str(),
+                    region_before.ok ? 1 : 0,
+                    region_after.ok ? 1 : 0,
+                    static_cast<unsigned long>(region_before.state),
+                    static_cast<unsigned long>(region_before.protect),
+                    static_cast<unsigned long>(region_after.state),
+                    static_cast<unsigned long>(region_after.protect));
                 clear_last_error_after_success("write_memory_kernel_verified");
                 return true;
             }
             const size_t mismatch = first_mismatch(data, bridge_verify);
             const uint8_t expected = mismatch < data.size() ? data[mismatch] : 0;
             const uint8_t actual = mismatch < bridge_verify.size() ? bridge_verify[mismatch] : 0;
+            const bridge_region_snapshot_t region_after = capture_bridge_region_snapshot(address);
             diag::log_tagged_fmt("driver",
-                "write_memory kernel verify_mismatch addr=0x%llX sz=%llu bridge_read=%d bridge_bytes=%llu mismatch=%llu expected=0x%02X actual=0x%02X",
+                "write_memory kernel verify_mismatch pid=%u tid=%lu addr=0x%llX sz=%llu bridge_read=%d bridge_bytes=%llu mismatch=%llu expected=0x%02X actual=0x%02X expected_first16=%s actual_first16=%s all_zero_readback=%d arc_bytes=%llu direct_bytes=%llu retry_arc=%llu retry_direct=%llu dtb_entry=0x%llX dtb_exit=0x%llX gle=%lu driver_last_error=%s region_before_ok=%d region_after_ok=%d state_before=0x%lX protect_before=0x%lX state_after=0x%lX protect_after=0x%lX",
+                diag_pid,
+                static_cast<unsigned long>(diag_tid),
                 static_cast<unsigned long long>(address),
                 static_cast<unsigned long long>(data.size()),
                 bridge_read_ok ? 1 : 0,
                 static_cast<unsigned long long>(bridge_verify.size()),
                 static_cast<unsigned long long>(mismatch),
                 static_cast<unsigned>(expected),
-                static_cast<unsigned>(actual));
+                static_cast<unsigned>(actual),
+                format_byte_prefix(data.data(), data.size()).c_str(),
+                format_byte_prefix(bridge_verify.data(), bridge_verify.size()).c_str(),
+                bytes_all_zero(bridge_verify.data(), bridge_verify.size()) ? 1 : 0,
+                static_cast<unsigned long long>(arc_written),
+                static_cast<unsigned long long>(direct_written),
+                static_cast<unsigned long long>(retry_arc_written),
+                static_cast<unsigned long long>(retry_direct_written),
+                static_cast<unsigned long long>(dtb_entry),
+                static_cast<unsigned long long>(device ? device->get_dtb() : 0),
+                static_cast<unsigned long>(GetLastError()),
+                last_error().empty() ? "<empty>" : last_error().c_str(),
+                region_before.ok ? 1 : 0,
+                region_after.ok ? 1 : 0,
+                static_cast<unsigned long>(region_before.state),
+                static_cast<unsigned long>(region_before.protect),
+                static_cast<unsigned long>(region_after.state),
+                static_cast<unsigned long>(region_after.protect));
             return false;
         }
 
+        const bridge_region_snapshot_t region_after = capture_bridge_region_snapshot(address);
         if (bytes_written > 0) {
             diag::log_tagged_fmt("driver",
-                "write_memory kernel partial addr=0x%llX sz=%llu bytes=%llu",
+                "write_memory kernel partial pid=%u tid=%lu addr=0x%llX sz=%llu bytes=%llu arc_bytes=%llu direct_bytes=%llu retry_arc=%llu retry_direct=%llu dtb_entry=0x%llX dtb_exit=0x%llX gle=%lu driver_last_error=%s region_before_ok=%d region_after_ok=%d state_before=0x%lX protect_before=0x%lX state_after=0x%lX protect_after=0x%lX",
+                diag_pid,
+                static_cast<unsigned long>(diag_tid),
                 static_cast<unsigned long long>(address),
                 static_cast<unsigned long long>(data.size()),
-                static_cast<unsigned long long>(bytes_written));
+                static_cast<unsigned long long>(bytes_written),
+                static_cast<unsigned long long>(arc_written),
+                static_cast<unsigned long long>(direct_written),
+                static_cast<unsigned long long>(retry_arc_written),
+                static_cast<unsigned long long>(retry_direct_written),
+                static_cast<unsigned long long>(dtb_entry),
+                static_cast<unsigned long long>(device ? device->get_dtb() : 0),
+                static_cast<unsigned long>(GetLastError()),
+                last_error().empty() ? "<empty>" : last_error().c_str(),
+                region_before.ok ? 1 : 0,
+                region_after.ok ? 1 : 0,
+                static_cast<unsigned long>(region_before.state),
+                static_cast<unsigned long>(region_before.protect),
+                static_cast<unsigned long>(region_after.state),
+                static_cast<unsigned long>(region_after.protect));
         } else {
             diag::log_tagged_fmt("driver",
-                "write_memory kernel failed addr=0x%llX sz=%llu dtb=0x%llX",
+                "write_memory kernel failed pid=%u tid=%lu addr=0x%llX sz=%llu dtb_entry=0x%llX dtb_exit=0x%llX arc_bytes=%llu direct_bytes=%llu retry_arc=%llu retry_direct=%llu refresh_attempted=%d re_resolved=%d gle=%lu driver_last_error=%s region_before_ok=%d region_after_ok=%d state_before=0x%lX protect_before=0x%lX state_after=0x%lX protect_after=0x%lX",
+                diag_pid,
+                static_cast<unsigned long>(diag_tid),
                 static_cast<unsigned long long>(address),
                 static_cast<unsigned long long>(data.size()),
-                static_cast<unsigned long long>(device ? device->get_dtb() : 0));
+                static_cast<unsigned long long>(dtb_entry),
+                static_cast<unsigned long long>(device ? device->get_dtb() : 0),
+                static_cast<unsigned long long>(arc_written),
+                static_cast<unsigned long long>(direct_written),
+                static_cast<unsigned long long>(retry_arc_written),
+                static_cast<unsigned long long>(retry_direct_written),
+                refresh_attempted ? 1 : 0,
+                re_resolved ? 1 : 0,
+                static_cast<unsigned long>(GetLastError()),
+                last_error().empty() ? "<empty>" : last_error().c_str(),
+                region_before.ok ? 1 : 0,
+                region_after.ok ? 1 : 0,
+                static_cast<unsigned long>(region_before.state),
+                static_cast<unsigned long>(region_before.protect),
+                static_cast<unsigned long>(region_after.state),
+                static_cast<unsigned long>(region_after.protect));
         }
 
         return false;
@@ -5094,26 +6314,92 @@ namespace driver_bridge
                 static_cast<unsigned long>(GetLastError()));
             return false;
         }
+        const uint64_t dtb_entry = device ? device->get_dtb() : 0;
+        const bridge_region_snapshot_t region_before = capture_bridge_region_snapshot(address);
         bool ok = read_memory(address, size, out);
+        const bridge_region_snapshot_t region_after = capture_bridge_region_snapshot(address);
         diag::log_tagged_fmt("driver_bridge",
-            "read_memory_for pid=%u addr=0x%llX size=%zu ok=%d bytes=%zu",
-            pid, static_cast<unsigned long long>(address), size, ok ? 1 : 0, out.size());
+            "read_memory_for pid=%u active_pid=%u tid=%lu addr=0x%llX size=%zu ok=%d bytes=%zu dtb_entry=0x%llX dtb_exit=0x%llX gle=%lu driver_last_error=%s all_zero=%d first16=%s region_before_ok=%d region_after_ok=%d state_before=0x%lX protect_before=0x%lX state_after=0x%lX protect_after=0x%lX",
+            pid,
+            attached_pid(),
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            static_cast<unsigned long long>(address),
+            size,
+            ok ? 1 : 0,
+            out.size(),
+            static_cast<unsigned long long>(dtb_entry),
+            static_cast<unsigned long long>(device ? device->get_dtb() : 0),
+            static_cast<unsigned long>(GetLastError()),
+            last_error().empty() ? "<empty>" : last_error().c_str(),
+            bytes_all_zero(out.data(), out.size()) ? 1 : 0,
+            format_byte_prefix(out.data(), out.size()).c_str(),
+            region_before.ok ? 1 : 0,
+            region_after.ok ? 1 : 0,
+            static_cast<unsigned long>(region_before.state),
+            static_cast<unsigned long>(region_before.protect),
+            static_cast<unsigned long>(region_after.state),
+            static_cast<unsigned long>(region_after.protect));
         return ok;
     }
 
     bool write_memory_for(uint32_t pid, uint64_t address, const std::vector<uint8_t>& data)
     {
+        const ULONGLONG t0 = GetTickCount64();
+        const uint32_t active_before = attached_pid();
+        const uint64_t generation_before = g_active_pid_generation.load(std::memory_order_acquire);
         driver_bridge_pid_call::pid_scope_t scope;
         if (!driver_bridge_pid_call::enter(scope, pid)) {
+            const DWORD gle = GetLastError();
+            const std::string err = last_error();
             diag::log_tagged_fmt("driver_bridge",
-                "write_memory_for pid=%u addr=0x%llX size=%zu enter_failed",
-                pid, static_cast<unsigned long long>(address), data.size());
+                "write_memory_for_enter_failed pid=%u active_pid_before=%u active_pid_after=%u generation_before=%llu generation_after=%llu addr=0x%llX size=%zu status=%s last_error=%s gle=%lu elapsed_ms=%llu",
+                pid,
+                active_before,
+                attached_pid(),
+                static_cast<unsigned long long>(generation_before),
+                static_cast<unsigned long long>(g_active_pid_generation.load(std::memory_order_acquire)),
+                static_cast<unsigned long long>(address),
+                data.size(),
+                status().c_str(),
+                err.empty() ? "<empty>" : err.c_str(),
+                static_cast<unsigned long>(gle),
+                static_cast<unsigned long long>(GetTickCount64() - t0));
             return false;
         }
+        const uint32_t active_after_enter = attached_pid();
+        const uint64_t generation_after_enter = g_active_pid_generation.load(std::memory_order_acquire);
+        const uint64_t dtb_entry = device ? device->get_dtb() : 0;
+        const bridge_region_snapshot_t region_before = capture_bridge_region_snapshot(address);
+        SetLastError(ERROR_SUCCESS);
         bool ok = write_memory(address, data);
+        const DWORD gle = GetLastError();
+        const std::string err = last_error();
+        const bridge_region_snapshot_t region_after = capture_bridge_region_snapshot(address);
         diag::log_tagged_fmt("driver_bridge",
-            "write_memory_for pid=%u addr=0x%llX size=%zu ok=%d",
-            pid, static_cast<unsigned long long>(address), data.size(), ok ? 1 : 0);
+            "write_memory_for_result pid=%u active_pid_before=%u active_pid_after_enter=%u active_pid_after=%u generation_before=%llu generation_after_enter=%llu generation_after=%llu tid=%lu addr=0x%llX size=%zu ok=%d backend=kernel_driver dtb_entry=0x%llX dtb_exit=0x%llX gle=%lu driver_last_error=%s expected_first16=%s region_before_ok=%d region_after_ok=%d state_before=0x%lX protect_before=0x%lX state_after=0x%lX protect_after=0x%lX elapsed_ms=%llu",
+            pid,
+            active_before,
+            active_after_enter,
+            attached_pid(),
+            static_cast<unsigned long long>(generation_before),
+            static_cast<unsigned long long>(generation_after_enter),
+            static_cast<unsigned long long>(g_active_pid_generation.load(std::memory_order_acquire)),
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            static_cast<unsigned long long>(address),
+            data.size(),
+            ok ? 1 : 0,
+            static_cast<unsigned long long>(dtb_entry),
+            static_cast<unsigned long long>(device ? device->get_dtb() : 0),
+            static_cast<unsigned long>(gle),
+            err.empty() ? "<empty>" : err.c_str(),
+            format_byte_prefix(data.data(), data.size()).c_str(),
+            region_before.ok ? 1 : 0,
+            region_after.ok ? 1 : 0,
+            static_cast<unsigned long>(region_before.state),
+            static_cast<unsigned long>(region_before.protect),
+            static_cast<unsigned long>(region_after.state),
+            static_cast<unsigned long>(region_after.protect),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
         return ok;
     }
 
@@ -5128,10 +6414,49 @@ namespace driver_bridge
     bool protect_memory_for(uint32_t pid, uint64_t address, uint64_t size,
                             uint32_t new_protect, uint32_t* old_protect)
     {
+        const ULONGLONG t0 = GetTickCount64();
         driver_bridge_pid_call::pid_scope_t scope;
-        if (!driver_bridge_pid_call::enter(scope, pid))
+        if (!driver_bridge_pid_call::enter(scope, pid)) {
+            diag::log_tagged_fmt("driver_bridge",
+                "protect_memory_for_enter_failed pid=%u active_pid=%u addr=0x%llX size=0x%llX new=0x%08X status=%s last_error=%s gle=%lu elapsed_ms=%llu",
+                pid,
+                attached_pid(),
+                static_cast<unsigned long long>(address),
+                static_cast<unsigned long long>(size),
+                static_cast<unsigned int>(new_protect),
+                status().c_str(),
+                last_error().empty() ? "<empty>" : last_error().c_str(),
+                static_cast<unsigned long>(GetLastError()),
+                static_cast<unsigned long long>(GetTickCount64() - t0));
             return false;
-        return protect_memory(address, size, new_protect, old_protect);
+        }
+        const uint64_t dtb_entry = device ? device->get_dtb() : 0;
+        const bridge_region_snapshot_t region_before = capture_bridge_region_snapshot(address);
+        DWORD local_old = 0;
+        bool ok = protect_memory(address, size, new_protect, old_protect ? old_protect : &local_old);
+        const bridge_region_snapshot_t region_after = capture_bridge_region_snapshot(address);
+        diag::log_tagged_fmt("driver_bridge",
+            "protect_memory_for pid=%u active_pid=%u tid=%lu addr=0x%llX size=0x%llX new=0x%08X old=0x%08X ok=%d dtb_entry=0x%llX dtb_exit=0x%llX gle=%lu driver_last_error=%s region_before_ok=%d region_after_ok=%d state_before=0x%lX protect_before=0x%lX state_after=0x%lX protect_after=0x%lX elapsed_ms=%llu",
+            pid,
+            attached_pid(),
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            static_cast<unsigned long long>(address),
+            static_cast<unsigned long long>(size),
+            static_cast<unsigned int>(new_protect),
+            static_cast<unsigned int>(old_protect ? *old_protect : local_old),
+            ok ? 1 : 0,
+            static_cast<unsigned long long>(dtb_entry),
+            static_cast<unsigned long long>(device ? device->get_dtb() : 0),
+            static_cast<unsigned long>(GetLastError()),
+            last_error().empty() ? "<empty>" : last_error().c_str(),
+            region_before.ok ? 1 : 0,
+            region_after.ok ? 1 : 0,
+            static_cast<unsigned long>(region_before.state),
+            static_cast<unsigned long>(region_before.protect),
+            static_cast<unsigned long>(region_after.state),
+            static_cast<unsigned long>(region_after.protect),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+        return ok;
     }
 
     std::vector<module_info_t> enumerate_modules_for(uint32_t pid)
@@ -5288,34 +6613,77 @@ namespace driver_bridge
     uint64_t allocate_memory_for(uint32_t pid, size_t size)
     {
         const ULONGLONG t0 = GetTickCount64();
+        const uint32_t active_before = attached_pid();
+        const uint64_t generation_before = g_active_pid_generation.load(std::memory_order_acquire);
         if (size == 0) {
             diag::log_tagged_fmt("driver_bridge",
-                "allocate_memory_for_reject pid=%u size=%zu reason=zero elapsed_ms=%llu",
+                "allocate_memory_for_reject pid=%u active_pid=%u generation=%llu size=%zu protection=unspecified reason=zero elapsed_ms=%llu",
                 pid,
+                active_before,
+                static_cast<unsigned long long>(generation_before),
                 size,
                 static_cast<unsigned long long>(GetTickCount64() - t0));
             return 0;
         }
         driver_bridge_pid_call::pid_scope_t scope;
         if (!driver_bridge_pid_call::enter(scope, pid)) {
+            const DWORD gle = GetLastError();
+            const std::string err = last_error();
             diag::log_tagged_fmt("driver_bridge",
-                "allocate_memory_for_enter_failed pid=%u active_pid=%u size=%zu status=%s last_error=%s elapsed_ms=%llu",
+                "allocate_memory_for_enter_failed pid=%u active_pid_before=%u active_pid_after=%u generation_before=%llu generation_after=%llu size=%zu protection=unspecified status=%s last_error=%s gle=%lu elapsed_ms=%llu",
                 pid,
+                active_before,
                 attached_pid(),
+                static_cast<unsigned long long>(generation_before),
+                static_cast<unsigned long long>(g_active_pid_generation.load(std::memory_order_acquire)),
                 size,
                 status().c_str(),
-                last_error().c_str(),
+                err.empty() ? "<empty>" : err.c_str(),
+                static_cast<unsigned long>(gle),
                 static_cast<unsigned long long>(GetTickCount64() - t0));
             return 0;
         }
         const uint32_t active = attached_pid();
-        const uint64_t remote = allocate_memory(size);
+        const uint64_t generation_after_enter = g_active_pid_generation.load(std::memory_order_acquire);
+        const uint64_t dtb_entry = device ? device->get_dtb() : 0;
         diag::log_tagged_fmt("driver_bridge",
-            "allocate_memory_for pid=%u active_pid=%u size=%zu result=0x%llX elapsed_ms=%llu",
+            "allocate_memory_for_begin pid=%u active_pid_before=%u active_pid_after_enter=%u generation_before=%llu generation_after_enter=%llu size=%zu protection=unspecified backend=kernel_driver dtb_entry=0x%llX elapsed_ms=%llu",
             pid,
+            active_before,
             active,
+            static_cast<unsigned long long>(generation_before),
+            static_cast<unsigned long long>(generation_after_enter),
+            size,
+            static_cast<unsigned long long>(dtb_entry),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+        SetLastError(ERROR_SUCCESS);
+        const uint64_t remote = allocate_memory(size);
+        const DWORD gle = GetLastError();
+        const std::string err = last_error();
+        const bridge_region_snapshot_t region_after = remote != 0 ? capture_bridge_region_snapshot(remote) : bridge_region_snapshot_t{};
+        diag::log_tagged_fmt("driver_bridge",
+            "allocate_memory_for_result pid=%u active_pid_before=%u active_pid_after_enter=%u active_pid_after=%u generation_before=%llu generation_after_enter=%llu generation_after=%llu tid=%lu size=%zu protection=unspecified backend=kernel_driver result=0x%llX ok=%d dtb_entry=0x%llX dtb_exit=0x%llX gle=%lu driver_last_error=%s region_ok=%d region_base=0x%llX region_size=0x%llX state=0x%lX protect=0x%lX type=0x%lX elapsed_ms=%llu",
+            pid,
+            active_before,
+            active,
+            attached_pid(),
+            static_cast<unsigned long long>(generation_before),
+            static_cast<unsigned long long>(generation_after_enter),
+            static_cast<unsigned long long>(g_active_pid_generation.load(std::memory_order_acquire)),
+            static_cast<unsigned long>(GetCurrentThreadId()),
             size,
             static_cast<unsigned long long>(remote),
+            remote != 0 ? 1 : 0,
+            static_cast<unsigned long long>(dtb_entry),
+            static_cast<unsigned long long>(device ? device->get_dtb() : 0),
+            static_cast<unsigned long>(gle),
+            err.empty() ? "<empty>" : err.c_str(),
+            region_after.ok ? 1 : 0,
+            static_cast<unsigned long long>(region_after.base),
+            static_cast<unsigned long long>(region_after.size),
+            static_cast<unsigned long>(region_after.state),
+            static_cast<unsigned long>(region_after.protect),
+            static_cast<unsigned long>(region_after.type),
             static_cast<unsigned long long>(GetTickCount64() - t0));
         return remote;
     }
@@ -5345,13 +6713,27 @@ namespace driver_bridge
             return false;
         }
         const uint32_t active = attached_pid();
+        const uint64_t dtb_entry = device ? device->get_dtb() : 0;
+        const bridge_region_snapshot_t region_before = capture_bridge_region_snapshot(address);
         const bool ok = free_memory(address);
+        const bridge_region_snapshot_t region_after = capture_bridge_region_snapshot(address);
         diag::log_tagged_fmt("driver_bridge",
-            "free_memory_for pid=%u active_pid=%u addr=0x%llX ok=%d elapsed_ms=%llu",
+            "free_memory_for pid=%u active_pid=%u tid=%lu addr=0x%llX ok=%d dtb_entry=0x%llX dtb_exit=0x%llX gle=%lu driver_last_error=%s region_before_ok=%d region_after_ok=%d state_before=0x%lX protect_before=0x%lX state_after=0x%lX protect_after=0x%lX elapsed_ms=%llu",
             pid,
             active,
+            static_cast<unsigned long>(GetCurrentThreadId()),
             static_cast<unsigned long long>(address),
             ok ? 1 : 0,
+            static_cast<unsigned long long>(dtb_entry),
+            static_cast<unsigned long long>(device ? device->get_dtb() : 0),
+            static_cast<unsigned long>(GetLastError()),
+            last_error().empty() ? "<empty>" : last_error().c_str(),
+            region_before.ok ? 1 : 0,
+            region_after.ok ? 1 : 0,
+            static_cast<unsigned long>(region_before.state),
+            static_cast<unsigned long>(region_before.protect),
+            static_cast<unsigned long>(region_after.state),
+            static_cast<unsigned long>(region_after.protect),
             static_cast<unsigned long long>(GetTickCount64() - t0));
         return ok;
     }
@@ -5426,32 +6808,48 @@ namespace driver_bridge
 
     uint64_t allocate_memory(size_t size)
     {
+        const ULONGLONG t0 = GetTickCount64();
         if (size == 0)
             return 0;
 
         bool kernel_mode = false;
         bool kernel_attached = false;
+        uint32_t active_pid_snapshot = 0;
+        uint64_t dtb_snapshot = 0;
         {
             std::lock_guard<std::mutex> lk(g_state_mtx);
             kernel_mode = g_kernel_mode && device && device->is_connected();
             kernel_attached = g_kernel_attached;
+            active_pid_snapshot = g_pid;
+            dtb_snapshot = device ? device->get_dtb() : 0;
         }
 
         if (!kernel_mode || !kernel_attached) {
             diag::log_tagged_fmt("driver",
-                "allocate_memory_kernel_required sz=%llu kernel=%d attached=%d",
+                "allocate_memory_kernel_required pid=%u sz=%llu kernel=%d attached=%d dtb=0x%llX elapsed_ms=%llu",
+                active_pid_snapshot,
                 static_cast<unsigned long long>(size),
                 kernel_mode ? 1 : 0,
-                kernel_attached ? 1 : 0);
+                kernel_attached ? 1 : 0,
+                static_cast<unsigned long long>(dtb_snapshot),
+                static_cast<unsigned long long>(GetTickCount64() - t0));
             require_kernel_fail("allocate_memory");
             return 0;
         }
 
+        SetLastError(ERROR_SUCCESS);
         const uint64_t remote = device->allocate_memory(size);
+        const DWORD gle = GetLastError();
         diag::log_tagged_fmt("driver",
-            "allocate_memory kernel sz=%llu addr=0x%llX",
+            "allocate_memory_kernel pid=%u sz=%llu addr=0x%llX ok=%d gle=%lu dtb_entry=0x%llX dtb_exit=0x%llX elapsed_ms=%llu",
+            active_pid_snapshot,
             static_cast<unsigned long long>(size),
-            static_cast<unsigned long long>(remote));
+            static_cast<unsigned long long>(remote),
+            remote != 0 ? 1 : 0,
+            static_cast<unsigned long>(gle),
+            static_cast<unsigned long long>(dtb_snapshot),
+            static_cast<unsigned long long>(device ? device->get_dtb() : 0),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
         if (remote != 0)
             clear_last_error_after_success("allocate_memory_kernel");
         return remote;
@@ -6567,19 +7965,19 @@ namespace driver_bridge
                 static_cast<unsigned long long>(arc_outcome.generation_after),
                 static_cast<unsigned long long>(function_address),
                 static_cast<unsigned long long>(arc_outcome.result),
-                static_cast<unsigned long>(arc_outcome.stale_generation ? ERROR_OPERATION_ABORTED : (arc_outcome.deadline_expired ? ERROR_TIMEOUT : ERROR_SUCCESS)),
+                static_cast<unsigned long>(arc_outcome.stale_generation ? ERROR_OPERATION_ABORTED : (arc_outcome.cancelled ? ERROR_CANCELLED : (arc_outcome.deadline_expired ? ERROR_TIMEOUT : ERROR_SUCCESS))),
                 arc_outcome.cancelled ? 1 : 0,
                 call_ctx.timeout_ms,
                 static_cast<unsigned long long>(call_ctx.deadline_ms),
                 arc_outcome.deadline_expired ? 1 : 0,
-                (arc_outcome.deadline_expired || arc_outcome.stale_generation) ? 1 : 0,
-                arc_outcome.deadline_expired ? 1 : 0,
+                (arc_outcome.deadline_expired || arc_outcome.stale_generation || arc_outcome.cancelled) ? 1 : 0,
+                (arc_outcome.deadline_expired || arc_outcome.stale_generation || arc_outcome.cancelled) ? 1 : 0,
                 arc_outcome.stale_generation ? 1 : 0,
                 static_cast<unsigned long long>(arc_outcome.elapsed_ms),
                 status().c_str(),
                 last_error().c_str());
-            if (arc_outcome.stale_generation || arc_outcome.deadline_expired) {
-                SetLastError(arc_outcome.stale_generation ? ERROR_OPERATION_ABORTED : ERROR_TIMEOUT);
+            if (arc_outcome.stale_generation || arc_outcome.cancelled || arc_outcome.deadline_expired) {
+                SetLastError(arc_outcome.stale_generation ? ERROR_OPERATION_ABORTED : (arc_outcome.cancelled ? ERROR_CANCELLED : ERROR_TIMEOUT));
                 return 0;
             }
             return arc_outcome.result;
@@ -6725,19 +8123,19 @@ namespace driver_bridge
             static_cast<unsigned long long>(function_address),
             static_cast<unsigned long long>(result),
             result != 0 ? 1 : 0,
-            static_cast<unsigned long>(device_outcome.stale_generation ? ERROR_OPERATION_ABORTED : (device_outcome.deadline_expired ? ERROR_TIMEOUT : gle)),
+            static_cast<unsigned long>(device_outcome.stale_generation ? ERROR_OPERATION_ABORTED : (device_outcome.cancelled ? ERROR_CANCELLED : (device_outcome.deadline_expired ? ERROR_TIMEOUT : gle))),
             device_outcome.cancelled ? 1 : 0,
             call_ctx.timeout_ms,
             static_cast<unsigned long long>(call_ctx.deadline_ms),
             device_outcome.deadline_expired ? 1 : 0,
-            (device_outcome.deadline_expired || device_outcome.stale_generation) ? 1 : 0,
-            device_outcome.deadline_expired ? 1 : 0,
+            (device_outcome.deadline_expired || device_outcome.stale_generation || device_outcome.cancelled) ? 1 : 0,
+            (device_outcome.deadline_expired || device_outcome.stale_generation || device_outcome.cancelled) ? 1 : 0,
             device_outcome.stale_generation ? 1 : 0,
             static_cast<unsigned long long>(device_outcome.elapsed_ms),
             status().c_str(),
             last_error().c_str());
-        if (device_outcome.stale_generation || device_outcome.deadline_expired) {
-            SetLastError(device_outcome.stale_generation ? ERROR_OPERATION_ABORTED : ERROR_TIMEOUT);
+        if (device_outcome.stale_generation || device_outcome.cancelled || device_outcome.deadline_expired) {
+            SetLastError(device_outcome.stale_generation ? ERROR_OPERATION_ABORTED : (device_outcome.cancelled ? ERROR_CANCELLED : ERROR_TIMEOUT));
             if (device_outcome.stale_generation) {
                 diag::log_tagged_fmt("driver",
                     "call_function_stale_reject call_id=%llu phase=device label=%s tool=%s diag_id=%s pid=%u active_pid=%u active_after=%u generation=%llu generation_after=%llu fn=0x%llX elapsed_ms=%llu",

@@ -815,10 +815,19 @@ json heap_backend_policy_json(std::uint32_t pid, const std::string& backend, std
     out["polling_disabled"] = true;
     out["kernel_only_policy"] = true;
     out["user_mode_fallback_allowed"] = false;
+    out["snapshot_polling_fallback_allowed"] = false;
     out["capture_backend_required"] = kHeapEventBackend;
     out["snapshot_backend_kind"] = kHeapSnapshotBackend;
     out["policy_state"] = "fail_closed_kernel_event_only";
     out["mutation"] = "none";
+    out["fail_closed"] = true;
+    out["dependency_blocked"] = true;
+    out["functional_success"] = false;
+    out["safe_contract"] = "fail_closed_kernel_event_only";
+    out["validation_code"] = failure.empty() ? "kernel_event_backend_unavailable" : failure;
+    out["driver_connected"] = driver_bridge::using_kernel_driver();
+    out["diag_id"] = mcp_standalone::current_call_diag_id();
+    out["deadline_remaining_ms"] = deadline_remaining_ms();
     out["rtl_allocate_heap"] = rtl_allocate_heap ? json(sa_format_address(rtl_allocate_heap)) : json(nullptr);
     out["event_backend_available"] = rtl_allocate_heap != 0;
     if (!failure.empty())
@@ -831,7 +840,14 @@ tool_result_t start_session(const json& params)
 {
     const std::uint64_t started_ms = GetTickCount64();
     if (!unsafe_confirmed(params))
-        return unsafe_required("heap_track_manage start");
+    {
+        json guard = heap_backend_policy_json(0, backend_param(params), started_ms, 0, "confirm_unsafe_required");
+        guard["tool"] = "heap_track_manage";
+        guard["action"] = "start";
+        guard["confirm_unsafe_required"] = true;
+        guard["confirm_unsafe_received"] = unsafe_confirmed(params);
+        return tool_result_t::error("heap_track_manage start requires confirm_unsafe=true or allow_unsafe=true.", guard);
+    }
     active_process_scope_t scope(params);
     if (!scope.ok())
         return tool_result_t::error(scope.error());
@@ -958,6 +974,10 @@ tool_result_t start_session(const json& params)
     result["event_backend_attempted"] = session.rtl_allocate_heap != 0;
     result["event_backend_required"] = require_event;
     result["snapshot_diff_selected"] = false;
+    result["snapshot_polling_fallback_allowed"] = false;
+    result["kernel_only_policy"] = true;
+    result["dependency_blocked"] = false;
+    result["fail_closed"] = false;
     result["stimulus_required"] = false;
     result["pre_stimulus"] = session.captures.empty();
     result["observation_state"] = session.captures.empty() ? "awaiting_stimulus_or_results_poll" : "captures_observed";
@@ -976,6 +996,9 @@ tool_result_t start_session(const json& params)
         {"capture_callstack", session.capture_callstack},
         {"snapshot_baseline_count", session.baseline.size()},
         {"snapshot_baseline_skipped", skip_initial_snapshot},
+        {"snapshot_baseline_is_capture_backend", false},
+        {"snapshot_baseline_role", "filter_only_not_functional_capture"},
+        {"snapshot_polling_fallback_allowed", false},
         {"zero_capture_expected_on_start", session.captures.empty()}
     };
     result["elapsed_ms"] = GetTickCount64() - started_ms;

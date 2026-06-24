@@ -354,6 +354,19 @@ json reverify_one(std::uint32_t pid, store::offset_record_t& record, std::size_t
     json out = store::offset_to_json(record);
     out["previous_va"] = sa_format_address(record.va);
     out["phase"] = "candidate_seed";
+    out["partial"] = false;
+    out["deadline_remaining_ms"] = deadline_remaining_ms();
+    out["diag_id"] = mcp_standalone::current_call_diag_id();
+    auto mark_partial = [&](const char* phase) -> json& {
+        out["verification_status"] = "partial";
+        out["partial"] = true;
+        out["deadline_hit"] = !mcp_standalone::current_call_cancelled();
+        out["cancelled"] = mcp_standalone::current_call_cancelled();
+        out["phase"] = phase ? phase : "";
+        out["deadline_remaining_ms"] = deadline_remaining_ms();
+        out["elapsed_ms"] = GetTickCount64() - started_ms;
+        return out;
+    };
     std::vector<parsed_pattern_byte_t> pattern;
     std::string pattern_error;
     const bool has_aob = !record.aob_pattern.empty();
@@ -399,14 +412,7 @@ json reverify_one(std::uint32_t pid, store::offset_record_t& record, std::size_t
     out["aob_matches_considered"] = 0;
     out["aob_scan_skipped_fast_path"] = false;
     if (offsets_call_cancelled("reverify_one_after_fast_candidates", pid, started_ms))
-    {
-        out["verification_status"] = "partial";
-        out["partial"] = true;
-        out["deadline_hit"] = !mcp_standalone::current_call_cancelled();
-        out["cancelled"] = mcp_standalone::current_call_cancelled();
-        out["phase"] = "fast_candidate_evaluation";
-        return out;
-    }
+        return mark_partial("fast_candidate_evaluation");
     if (!pattern.empty())
     {
         if (fast_path_hit)
@@ -417,14 +423,25 @@ json reverify_one(std::uint32_t pid, store::offset_record_t& record, std::size_t
         }
         else
         {
+            const std::uint64_t remaining = deadline_remaining_ms();
+            if ((mcp_standalone::current_call_deadline_ms() != 0 && remaining <= 200) ||
+                offsets_call_cancelled("reverify_one_before_saved_aob_scan", pid, started_ms))
+            {
+                out["aob_scan_skipped_deadline"] = true;
+                return mark_partial("before_saved_aob_scan");
+            }
             out["phase"] = "saved_aob_scan";
             auto matches = scan_pattern(pid, pattern, record.module_name, false, max_aob_matches);
             for (auto found : matches)
                 add_candidate(candidates, found, "saved_aob_scan", 120);
             out["aob_match_count"] = matches.size();
             out["aob_matches_considered"] = matches.size();
+            if (offsets_call_cancelled("reverify_one_after_saved_aob_scan", pid, started_ms))
+                return mark_partial("saved_aob_scan");
         }
     }
+    if (offsets_call_cancelled("reverify_one_before_context_candidates", pid, started_ms))
+        return mark_partial("before_context_candidates");
     const auto rtti_addresses = addresses_from_context(record.rtti_path);
     const auto xref_addresses = addresses_from_context(record.xref_context);
     for (auto va : rtti_addresses)
@@ -433,12 +450,16 @@ json reverify_one(std::uint32_t pid, store::offset_record_t& record, std::size_t
         add_candidate(candidates, va, "xref_context_address", 45);
     if (record.fingerprint.is_object())
     {
+        if (offsets_call_cancelled("reverify_one_before_fingerprint_candidates", pid, started_ms))
+            return mark_partial("before_fingerprint_candidates");
         std::vector<std::uint64_t> fingerprint_addresses;
         collect_json_addresses(record.fingerprint, {}, fingerprint_addresses);
         for (auto va : fingerprint_addresses)
             add_candidate(candidates, va, "fingerprint_address", 25);
     }
 
+    if (offsets_call_cancelled("reverify_one_before_candidate_evaluation", pid, started_ms))
+        return mark_partial("before_candidate_evaluation");
     for (auto& candidate : candidates)
         evaluate_candidate(pid, record, pattern, candidate);
     std::stable_sort(candidates.begin(), candidates.end(), [](const offset_candidate_t& a, const offset_candidate_t& b) {
@@ -457,6 +478,7 @@ json reverify_one(std::uint32_t pid, store::offset_record_t& record, std::size_t
     out["rtti_context_addresses"] = address_array_json(rtti_addresses);
     out["xref_context_addresses"] = address_array_json(xref_addresses);
     out["candidate_count"] = candidates.size();
+    out["elapsed_ms"] = GetTickCount64() - started_ms;
 
     auto accepted_end = std::find_if(candidates.begin(), candidates.end(), [](const offset_candidate_t& candidate) {
         return !candidate.accepted;

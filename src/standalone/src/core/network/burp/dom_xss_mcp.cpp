@@ -33,6 +33,10 @@
 namespace aida {
 namespace burp {
 
+namespace dom_xss {
+nlohmann::json last_new_page_diagnostics();
+}
+
 namespace {
 
 using json          = nlohmann::json;
@@ -127,10 +131,83 @@ bool is_browser_infrastructure_error(const std::string& msg)
            s.find("target closed") != std::string::npos ||
            s.find("page crashed") != std::string::npos ||
            s.find("deadline exceeded") != std::string::npos ||
+           s.find("new_page failed") != std::string::npos ||
+           s.find("page_creation_timeout") != std::string::npos ||
            s.find("harness navigate") != std::string::npos ||
            s.find("navigate failed") != std::string::npos ||
            s.find("evaluate_js failed") != std::string::npos ||
            s.find("add_init_script") != std::string::npos;
+}
+
+std::string json_string_or(const json& j, const char* key)
+{
+    if (!j.is_object() || !key)
+        return {};
+    auto it = j.find(key);
+    return it != j.end() && it->is_string() ? it->get<std::string>() : std::string();
+}
+
+json bridge_status_payload(const camoufox::bridge_status_t& st)
+{
+    json out = {
+        {"session_id", st.session_id},
+        {"active_session_id", st.active_session_id},
+        {"state", static_cast<int>(st.state)},
+        {"generation", st.generation},
+        {"child_pid", st.child_pid},
+        {"child_alive", st.child_alive},
+        {"browser_open", st.browser_open},
+        {"page_verified", st.page_verified},
+        {"page_count", st.page_count},
+        {"active_page_id", st.active_page_id},
+        {"cleanup_pending", st.cleanup_pending},
+        {"cleanup_generation", st.cleanup_generation},
+        {"cleanup_child_pid", st.cleanup_child_pid},
+        {"cleanup_reason", st.cleanup_reason},
+        {"last_error", st.last_error},
+        {"total_calls", st.total_calls},
+        {"total_errors", st.total_errors}
+    };
+    if (st.last_launch_diagnostics.is_object())
+        out["last_launch_diagnostics"] = st.last_launch_diagnostics;
+    if (st.cleanup_diagnostics.is_object())
+        out["cleanup_diagnostics"] = st.cleanup_diagnostics;
+    return out;
+}
+
+json dom_xss_new_page_failure_payload(const std::string& target_url, const json& phase_timings, uint64_t handler_start_ms)
+{
+    const json engine_diag = dom_xss::last_new_page_diagnostics();
+    const auto bridge_after = camoufox::get_status();
+    json last_event = json::object();
+    if (engine_diag.is_object())
+    {
+        auto it = engine_diag.find("last_camoufox_debug_event");
+        if (it != engine_diag.end() && it->is_object())
+            last_event = *it;
+    }
+    if (last_event.empty() && bridge_after.last_launch_diagnostics.is_object())
+    {
+        auto it = bridge_after.last_launch_diagnostics.find("last_debug_event");
+        if (it != bridge_after.last_launch_diagnostics.end() && it->is_object())
+            last_event = *it;
+    }
+    json out = {
+        {"target_url", target_url},
+        {"requested_page_id", json_string_or(engine_diag, "requested_page_id")},
+        {"bridge_status_after", bridge_status_payload(bridge_after)},
+        {"call_result_error", json_string_or(engine_diag, "call_result_error")},
+        {"call_result_text_tail", json_string_or(engine_diag, "call_result_text_tail")},
+        {"call_result_data_tail", json_string_or(engine_diag, "call_result_data_tail")},
+        {"last_camoufox_debug_event", last_event},
+        {"last_camoufox_debug_event_name", json_string_or(engine_diag, "last_camoufox_debug_event_name")},
+        {"elapsed_ms", now_ms_steady() - handler_start_ms},
+        {"elapsed_timings", phase_timings},
+        {"engine_diagnostics", engine_diag}
+    };
+    if (out["last_camoufox_debug_event_name"].get<std::string>().empty() && last_event.is_object())
+        out["last_camoufox_debug_event_name"] = json_string_or(last_event, "event");
+    return out;
 }
 
 std::string path_without_query(std::string path)
@@ -433,7 +510,10 @@ tool_result_t tool_test_payload(const json& params)
         static_cast<unsigned long long>(data["elapsed_ms"].get<uint64_t>()),
         phase_timings.dump().c_str());
     if (!r.ok && is_browser_infrastructure_error(r.error))
-        return tool_result_t::error(r.error.empty() ? std::string("DOM-XSS browser execution failed") : r.error);
+    {
+        data["new_page_failure"] = dom_xss_new_page_failure_payload(target_url, phase_timings, handler_start_ms);
+        return tool_result_t::error(r.error.empty() ? std::string("DOM-XSS browser execution failed") : r.error, data);
+    }
     return tool_result_t::ok(data);
 }
 
@@ -698,7 +778,10 @@ tool_result_t tool_scan(const json& params)
         requested_name.empty() ? "<none>" : requested_name.c_str(),
         engine_error.size(), json_shape(data).c_str(), phase_timings.dump().c_str());
     if (!engine_error.empty() && is_browser_infrastructure_error(engine_error))
-        return tool_result_t::error(engine_error);
+    {
+        data["new_page_failure"] = dom_xss_new_page_failure_payload(target_url, phase_timings, handler_start_ms);
+        return tool_result_t::error(engine_error, data);
+    }
     return tool_result_t::ok(data);
 }
 
