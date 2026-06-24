@@ -38,6 +38,9 @@ typedef struct list_entry_s {
 
 static int resolve_apiset_host(const char* name, size_t name_len,
                                char* out, size_t out_cap, size_t* out_len);
+static int env_is_apiset_name(const char* name, size_t name_len);
+static void payload_log_event(uint32_t event_id, uint64_t a, uint64_t b, uint64_t c);
+static void payload_log_event_force(uint32_t event_id, uint64_t a, uint64_t b, uint64_t c);
 
 typedef struct ldr_entry_s {
     list_entry_t InLoadOrderLinks;
@@ -137,6 +140,12 @@ typedef struct import_entry_s {
     uint16_t flags;
 } import_entry_t;
 
+#define APL_IMPORT_TABLE_VERSION     ((uint32_t)0xA1DA3001u)
+#define APL_IMPORT_TABLE_HEADER_SIZE ((uint32_t)64u)
+#define APL_IMPORT_TABLE_BODY_OFFSET ((uint32_t)64u)
+#define APL_IMPORT_FLAG_BY_ORDINAL   ((uint16_t)0x1u)
+#define APL_IMPORT_FLAG_MASK         ((uint16_t)APL_IMPORT_FLAG_BY_ORDINAL)
+
 typedef struct string_fixup_s {
     uint32_t rva;
     uint32_t length;
@@ -152,6 +161,27 @@ typedef struct resource_fixup_s {
     uint64_t rolling_key;
 } resource_fixup_t;
 #pragma pack(pop)
+
+#define APL_STATIC_ASSERT(name, expr) typedef char aida_static_assert_##name[(expr) ? 1 : -1]
+
+APL_STATIC_ASSERT(packed_header_size, sizeof(packed_header_t) == 96u);
+APL_STATIC_ASSERT(packed_header_section_table_offset, offsetof(packed_header_t, section_table_offset) == 24u);
+APL_STATIC_ASSERT(packed_header_import_table_offset, offsetof(packed_header_t, import_table_offset) == 28u);
+APL_STATIC_ASSERT(packed_header_aux_offset, offsetof(packed_header_t, aux_offset) == 60u);
+APL_STATIC_ASSERT(packed_header_bind_salt, offsetof(packed_header_t, bind_salt) == 68u);
+APL_STATIC_ASSERT(section_descriptor_size, sizeof(section_descriptor_t) == 72u);
+APL_STATIC_ASSERT(section_descriptor_crc, offsetof(section_descriptor_t, original_crc32) == 24u);
+APL_STATIC_ASSERT(section_descriptor_section_index, offsetof(section_descriptor_t, section_index) == 28u);
+APL_STATIC_ASSERT(section_descriptor_layer1, offsetof(section_descriptor_t, layer1_iv) == 32u);
+APL_STATIC_ASSERT(section_descriptor_layers, offsetof(section_descriptor_t, layers_applied) == 68u);
+APL_STATIC_ASSERT(import_entry_size, sizeof(import_entry_t) == 24u);
+APL_STATIC_ASSERT(import_entry_iat, offsetof(import_entry_t, iat_rva) == 16u);
+APL_STATIC_ASSERT(import_entry_flags, offsetof(import_entry_t, flags) == 22u);
+APL_STATIC_ASSERT(string_fixup_size, sizeof(string_fixup_t) == 12u);
+APL_STATIC_ASSERT(string_fixup_xor, offsetof(string_fixup_t, xor_key) == 8u);
+APL_STATIC_ASSERT(string_fixup_reserved, offsetof(string_fixup_t, reserved) == 10u);
+APL_STATIC_ASSERT(resource_fixup_size, sizeof(resource_fixup_t) == 16u);
+APL_STATIC_ASSERT(resource_fixup_key, offsetof(resource_fixup_t, rolling_key) == 8u);
 
 #define HASH_NTDLL          0x9b1856bd6172a2bbULL
 #define HASH_KERNEL32       0x7d52b10b2b6fca23ULL
@@ -227,6 +257,7 @@ typedef struct resource_fixup_s {
 #define APL_EVENT_SECTIONS_ALLOC_FAIL   0x2002u
 #define APL_EVENT_SECTION_ENTER         0x2003u
 #define APL_EVENT_SECTION_EXIT          0x2004u
+#define APL_EVENT_SECTION_FAIL          0x2005u
 #define APL_EVENT_IMPORT_START          0x3001u
 #define APL_EVENT_IMPORT_ALLOC_FAIL     0x3002u
 #define APL_EVENT_IMPORT_LOAD_ENTER     0x3003u
@@ -235,6 +266,24 @@ typedef struct resource_fixup_s {
 #define APL_EVENT_IMPORT_MISSING_MOD    0x3006u
 #define APL_EVENT_IMPORT_MISSING_FUNC   0x3007u
 #define APL_EVENT_IMPORT_DONE           0x3008u
+#define APL_EVENT_IMPORT_FAIL           0x3009u
+#define APL_EVENT_IMPORT_APISET_RESULT  0x300Bu
+#define APL_EVENT_IMPORT_FORWARDER_ENTER 0x300Cu
+#define APL_EVENT_IMPORT_FORWARDER_EXIT 0x300Du
+#define APL_EVENT_IMPORT_FORWARDER_FAIL 0x300Eu
+#define APL_EVENT_IMPORT_SLOT_PROTECT   0x300Fu
+#define APL_EVENT_IMPORT_SLOT_WRITE     0x3010u
+#define APL_EVENT_IMPORT_SLOT_RESTORE   0x3011u
+
+#define APL_FASTFAIL_IMPORT_REBUILD     0xA1DA0003u
+#define APL_FASTFAIL_SECTION_UNPACK     0xA1DA0004u
+
+#define APL_SECTION_PHASE_VALIDATE       0x01u
+#define APL_SECTION_PHASE_PROTECT_RW     0x02u
+#define APL_SECTION_PHASE_DECOMPRESS     0x03u
+#define APL_SECTION_PHASE_CRC            0x04u
+#define APL_SECTION_PHASE_RESTORE        0x05u
+#define APL_SECTION_PHASE_DONE           0x06u
 
 #define IMG_SCN_EXEC        0x20000000u
 #define IMG_SCN_READ        0x40000000u
@@ -264,6 +313,16 @@ static int mem_eq(const void* a, const void* b, size_t n) {
         }
     }
     return 1;
+}
+
+static int mem_eq_ct(const void* a, const void* b, size_t n) {
+    const uint8_t* aa = (const uint8_t*)a;
+    const uint8_t* bb = (const uint8_t*)b;
+    uint8_t diff = 0;
+    for (size_t i = 0; i < n; ++i) {
+        diff = (uint8_t)(diff | (uint8_t)(aa[i] ^ bb[i]));
+    }
+    return diff == 0;
 }
 
 static int range_u32_ok(uint32_t off, uint64_t len, uint32_t limit) {
@@ -347,37 +406,39 @@ static int validate_counted_table(uint8_t* packed_base, uint32_t packed_size,
 static int validate_import_table(uint8_t* packed_base, uint32_t packed_size,
                                  uint32_t offset, uint32_t expected_count,
                                  uint32_t image_size) {
+    (void)image_size;
     if (expected_count == 0u && offset == 0u) {
         return 1;
     }
     if (offset == 0u || expected_count > IMG_MAX_IMPORTS) {
         return 0;
     }
-    if (!range_u32_ok(offset, 8u, packed_size)) {
+    if (!range_u32_ok(offset, APL_IMPORT_TABLE_HEADER_SIZE, packed_size)) {
         return 0;
     }
     uint32_t stored_count = 0;
     mem_copy(&stored_count, packed_base + offset, 4);
+    uint32_t pool_size = 0;
+    mem_copy(&pool_size, packed_base + offset + 4u, 4);
+    uint32_t body_size = 0;
+    mem_copy(&body_size, packed_base + offset + 8u, 4);
+    uint32_t version = 0;
+    mem_copy(&version, packed_base + offset + 12u, 4);
     if (stored_count != expected_count || stored_count > IMG_MAX_IMPORTS) {
         return 0;
     }
-    uint64_t pool_field = (uint64_t)offset + 4ull + (uint64_t)stored_count * (uint64_t)sizeof(import_entry_t);
-    if (pool_field + 4ull > (uint64_t)packed_size) {
+    if (version != APL_IMPORT_TABLE_VERSION) {
         return 0;
     }
-    uint32_t pool_size = 0;
-    mem_copy(&pool_size, packed_base + (uint32_t)pool_field, 4);
-    uint64_t bytes = 4ull + (uint64_t)stored_count * (uint64_t)sizeof(import_entry_t) + 4ull + (uint64_t)pool_size;
-    if (!range_u32_ok(offset, bytes, packed_size)) {
+    uint64_t entry_bytes = (uint64_t)stored_count * (uint64_t)sizeof(import_entry_t);
+    if (entry_bytes + (uint64_t)pool_size != (uint64_t)body_size) {
         return 0;
     }
-    if (image_size != 0u && stored_count != 0u) {
-        import_entry_t* entries = (import_entry_t*)(packed_base + offset + 4u);
-        for (uint32_t i = 0; i < stored_count; ++i) {
-            if (!range_u32_ok(entries[i].iat_rva, 8u, image_size)) {
-                return 0;
-            }
-        }
+    if (stored_count != 0u && (pool_size == 0u || body_size == 0u)) {
+        return 0;
+    }
+    if (!range_u32_ok(offset, (uint64_t)APL_IMPORT_TABLE_BODY_OFFSET + (uint64_t)body_size, packed_size)) {
+        return 0;
     }
     return 1;
 }
@@ -472,6 +533,20 @@ static size_t a_strlen(const char* s) {
         ++n;
     }
     return n;
+}
+
+static int a_strnlen_checked(const char* s, size_t max_len, size_t* out_len) {
+    if (s == 0 || out_len == 0) {
+        return 0;
+    }
+    for (size_t i = 0; i < max_len; ++i) {
+        if (s[i] == 0) {
+            *out_len = i;
+            return 1;
+        }
+    }
+    *out_len = 0;
+    return 0;
 }
 
 static uint8_t to_upper_a(uint8_t c) {
@@ -973,18 +1048,91 @@ static void sha256_compute(const uint8_t* data, size_t len, uint8_t out[32]) {
     }
 }
 
-static void hmac_sha256_compute(const uint8_t* key, size_t key_len,
-                                const uint8_t* data, size_t data_len,
-                                uint8_t out[32]) {
+typedef struct sha256_ctx_s {
+    uint32_t h[8];
+    uint64_t total_len;
+    uint8_t block[64];
+    size_t block_len;
+} sha256_ctx_t;
+
+static void sha256_ctx_init(sha256_ctx_t* ctx) {
+    ctx->h[0] = 0x6a09e667u;
+    ctx->h[1] = 0xbb67ae85u;
+    ctx->h[2] = 0x3c6ef372u;
+    ctx->h[3] = 0xa54ff53au;
+    ctx->h[4] = 0x510e527fu;
+    ctx->h[5] = 0x9b05688cu;
+    ctx->h[6] = 0x1f83d9abu;
+    ctx->h[7] = 0x5be0cd19u;
+    ctx->total_len = 0;
+    ctx->block_len = 0;
+}
+
+static void sha256_ctx_update(sha256_ctx_t* ctx, const uint8_t* data, size_t len) {
+    if (len == 0u) {
+        return;
+    }
+    ctx->total_len += (uint64_t)len;
+    size_t off = 0;
+    if (ctx->block_len != 0u) {
+        size_t take = 64u - ctx->block_len;
+        if (take > len) {
+            take = len;
+        }
+        mem_copy(ctx->block + ctx->block_len, data, take);
+        ctx->block_len += take;
+        off += take;
+        if (ctx->block_len == 64u) {
+            sha256_compress_pl(ctx->h, ctx->block);
+            ctx->block_len = 0;
+        }
+    }
+    while (len - off >= 64u) {
+        sha256_compress_pl(ctx->h, data + off);
+        off += 64u;
+    }
+    if (off < len) {
+        ctx->block_len = len - off;
+        mem_copy(ctx->block, data + off, ctx->block_len);
+    }
+}
+
+static void sha256_ctx_final(sha256_ctx_t* ctx, uint8_t out[32]) {
+    uint64_t bitlen = ctx->total_len * 8ull;
+    ctx->block[ctx->block_len++] = 0x80u;
+    if (ctx->block_len > 56u) {
+        mem_set(ctx->block + ctx->block_len, 0, 64u - ctx->block_len);
+        sha256_compress_pl(ctx->h, ctx->block);
+        ctx->block_len = 0;
+    }
+    mem_set(ctx->block + ctx->block_len, 0, 56u - ctx->block_len);
+    for (int i = 0; i < 8; ++i) {
+        ctx->block[56 + i] = (uint8_t)((bitlen >> (56 - 8 * i)) & 0xFFull);
+    }
+    sha256_compress_pl(ctx->h, ctx->block);
+    for (int i = 0; i < 8; ++i) {
+        out[4 * i + 0] = (uint8_t)((ctx->h[i] >> 24) & 0xFFu);
+        out[4 * i + 1] = (uint8_t)((ctx->h[i] >> 16) & 0xFFu);
+        out[4 * i + 2] = (uint8_t)((ctx->h[i] >> 8) & 0xFFu);
+        out[4 * i + 3] = (uint8_t)(ctx->h[i] & 0xFFu);
+    }
+    mem_set(ctx, 0, sizeof(*ctx));
+}
+
+static int hmac_sha256_compute(const uint8_t* key, size_t key_len,
+                               const uint8_t* data, size_t data_len,
+                               uint8_t out[32]) {
+    if (out == 0 || (key_len != 0u && key == 0) || (data_len != 0u && data == 0)) {
+        return 0;
+    }
     uint8_t k[64];
+    mem_set(k, 0, sizeof(k));
     if (key_len > 64) {
         sha256_compute(key, key_len, k);
-        mem_set(k + 32, 0, 32);
     } else {
         if (key_len > 0) {
             mem_copy(k, key, key_len);
         }
-        mem_set(k + key_len, 0, 64 - key_len);
     }
     uint8_t ipad[64];
     uint8_t opad[64];
@@ -992,37 +1140,44 @@ static void hmac_sha256_compute(const uint8_t* key, size_t key_len,
         ipad[i] = (uint8_t)(k[i] ^ 0x36u);
         opad[i] = (uint8_t)(k[i] ^ 0x5Cu);
     }
-    uint8_t inner[256];
-    if (64u + data_len > sizeof(inner)) {
-        return;
-    }
-    mem_copy(inner, ipad, 64);
-    if (data_len > 0) {
-        mem_copy(inner + 64, data, data_len);
-    }
     uint8_t inner_hash[32];
-    sha256_compute(inner, 64u + data_len, inner_hash);
-    uint8_t outer[96];
-    mem_copy(outer, opad, 64);
-    mem_copy(outer + 64, inner_hash, 32);
-    sha256_compute(outer, 96, out);
+    sha256_ctx_t ctx;
+    sha256_ctx_init(&ctx);
+    sha256_ctx_update(&ctx, ipad, 64u);
+    sha256_ctx_update(&ctx, data, data_len);
+    sha256_ctx_final(&ctx, inner_hash);
+    sha256_ctx_init(&ctx);
+    sha256_ctx_update(&ctx, opad, 64u);
+    sha256_ctx_update(&ctx, inner_hash, 32u);
+    sha256_ctx_final(&ctx, out);
+    mem_set(k, 0, sizeof(k));
+    mem_set(ipad, 0, sizeof(ipad));
+    mem_set(opad, 0, sizeof(opad));
+    mem_set(inner_hash, 0, sizeof(inner_hash));
+    return 1;
 }
 
-static void hkdf_extract_pl(const uint8_t* salt, size_t salt_len,
-                            const uint8_t* ikm, size_t ikm_len,
-                            uint8_t prk[32]) {
+static int hkdf_extract_pl(const uint8_t* salt, size_t salt_len,
+                           const uint8_t* ikm, size_t ikm_len,
+                           uint8_t prk[32]) {
+    if (prk == 0 || (ikm_len != 0u && ikm == 0) || (salt_len != 0u && salt == 0)) {
+        return 0;
+    }
     if (salt_len == 0) {
         uint8_t zero_salt[32];
         mem_set(zero_salt, 0, 32);
-        hmac_sha256_compute(zero_salt, 32, ikm, ikm_len, prk);
+        return hmac_sha256_compute(zero_salt, 32, ikm, ikm_len, prk);
     } else {
-        hmac_sha256_compute(salt, salt_len, ikm, ikm_len, prk);
+        return hmac_sha256_compute(salt, salt_len, ikm, ikm_len, prk);
     }
 }
 
-static void hkdf_expand_pl(const uint8_t prk[32],
-                           const uint8_t* info, size_t info_len,
-                           uint8_t* out, size_t out_len) {
+static int hkdf_expand_pl(const uint8_t prk[32],
+                          const uint8_t* info, size_t info_len,
+                          uint8_t* out, size_t out_len) {
+    if (prk == 0 || (info_len != 0u && info == 0) || (out_len != 0u && out == 0)) {
+        return 0;
+    }
     uint8_t t[32];
     size_t t_len = 0;
     size_t produced = 0;
@@ -1030,7 +1185,8 @@ static void hkdf_expand_pl(const uint8_t prk[32],
     while (produced < out_len) {
         uint8_t buf[256];
         if (t_len + info_len + 1u > sizeof(buf)) {
-            return;
+            mem_set(t, 0, sizeof(t));
+            return 0;
         }
         size_t pos = 0;
         if (t_len > 0) {
@@ -1043,22 +1199,39 @@ static void hkdf_expand_pl(const uint8_t prk[32],
         }
         buf[pos] = counter;
         pos += 1u;
-        hmac_sha256_compute(prk, 32, buf, pos, t);
+        if (!hmac_sha256_compute(prk, 32, buf, pos, t)) {
+            mem_set(t, 0, sizeof(t));
+            mem_set(buf, 0, sizeof(buf));
+            return 0;
+        }
         t_len = 32;
         size_t copy = (out_len - produced < 32u) ? (out_len - produced) : 32u;
         mem_copy(out + produced, t, copy);
         produced += copy;
         ++counter;
+        mem_set(buf, 0, sizeof(buf));
     }
+    mem_set(t, 0, sizeof(t));
+    return 1;
 }
 
-static void hkdf_sha256_pl(const uint8_t* ikm, size_t ikm_len,
-                           const uint8_t* salt, size_t salt_len,
-                           const uint8_t* info, size_t info_len,
-                           uint8_t* out, size_t out_len) {
+static int hkdf_sha256_pl(const uint8_t* ikm, size_t ikm_len,
+                          const uint8_t* salt, size_t salt_len,
+                          const uint8_t* info, size_t info_len,
+                          uint8_t* out, size_t out_len) {
     uint8_t prk[32];
-    hkdf_extract_pl(salt, salt_len, ikm, ikm_len, prk);
-    hkdf_expand_pl(prk, info, info_len, out, out_len);
+    if (!hkdf_extract_pl(salt, salt_len, ikm, ikm_len, prk)) {
+        if (out != 0 && out_len != 0u) {
+            mem_set(out, 0, out_len);
+        }
+        return 0;
+    }
+    int ok = hkdf_expand_pl(prk, info, info_len, out, out_len);
+    mem_set(prk, 0, sizeof(prk));
+    if (!ok && out != 0 && out_len != 0u) {
+        mem_set(out, 0, out_len);
+    }
+    return ok;
 }
 
 static void compute_hwid_anchor(uint8_t out[32]) {
@@ -1102,6 +1275,26 @@ static void derive_build_seed_from_master(const uint8_t master[32], uint8_t out[
     info[20]='d'; info[21]='-'; info[22]='s'; info[23]='e'; info[24]='e';
     info[25]='d'; info[26]='-'; info[27]='v'; info[28]='1';
     hkdf_sha256_pl(master, 32, 0, 0, info, 29, out, 32);
+}
+
+static int derive_import_table_key_pl(const uint8_t master[32], uint8_t out[32]) {
+    uint8_t info[24];
+    info[ 0]='a'; info[ 1]='i'; info[ 2]='d'; info[ 3]='a'; info[ 4]='-';
+    info[ 5]='i'; info[ 6]='m'; info[ 7]='p'; info[ 8]='o'; info[ 9]='r';
+    info[10]='t'; info[11]='-'; info[12]='t'; info[13]='a'; info[14]='b';
+    info[15]='l'; info[16]='e'; info[17]='-'; info[18]='e'; info[19]='n';
+    info[20]='c'; info[21]='-'; info[22]='v'; info[23]='3';
+    return hkdf_sha256_pl(master, 32, 0, 0, info, sizeof(info), out, 32);
+}
+
+static int derive_import_table_mac_key_pl(const uint8_t master[32], uint8_t out[32]) {
+    uint8_t info[24];
+    info[ 0]='a'; info[ 1]='i'; info[ 2]='d'; info[ 3]='a'; info[ 4]='-';
+    info[ 5]='i'; info[ 6]='m'; info[ 7]='p'; info[ 8]='o'; info[ 9]='r';
+    info[10]='t'; info[11]='-'; info[12]='t'; info[13]='a'; info[14]='b';
+    info[15]='l'; info[16]='e'; info[17]='-'; info[18]='m'; info[19]='a';
+    info[20]='c'; info[21]='-'; info[22]='v'; info[23]='3';
+    return hkdf_sha256_pl(master, 32, 0, 0, info, sizeof(info), out, 32);
 }
 
 static void mat_append_section_bytes(uint8_t* out, size_t* pos,
@@ -1284,32 +1477,94 @@ static int aes128_wbaes_decrypt_ctr(const uint8_t* tbl_blob, uint32_t tbl_size,
     return 1;
 }
 
-static void lz_decompress(const uint8_t* src, size_t src_len, uint8_t* dst, size_t dst_len) {
+static uint32_t crc32c_update_byte_pl(uint32_t c, uint8_t v) {
+    c ^= (uint32_t)v;
+    for (int bit = 0; bit < 8; ++bit) {
+        uint32_t mask = 0u - (c & 1u);
+        c = (c >> 1) ^ (0x82F63B78u & mask);
+    }
+    return c;
+}
+
+static void lz_emit_byte(uint8_t v, uint8_t* dst, size_t dst_len,
+                         size_t* produced, uint8_t* window, uint32_t* crc_state) {
+    size_t pos = *produced;
+    if (pos < dst_len) {
+        dst[pos] = v;
+    }
+    window[pos & 4095u] = v;
+    *crc_state = crc32c_update_byte_pl(*crc_state, v);
+    *produced = pos + 1u;
+}
+
+static int lz_decompress(const uint8_t* src, size_t src_len, uint8_t* dst, size_t dst_len,
+                         uint8_t* window,
+                         uint32_t* out_crc32, size_t* out_decoded_len) {
+    if ((src_len != 0u && src == 0) || (dst_len != 0u && dst == 0) || window == 0) {
+        return 0;
+    }
     size_t s = 0;
     size_t d = 0;
-    while (d < dst_len && s < src_len) {
+    uint32_t crc_state = 0xFFFFFFFFu;
+    int ok = 0;
+    mem_set(window, 0, 4096u);
+    while (s < src_len) {
+        if (s >= src_len) {
+            goto done;
+        }
         uint8_t flags = src[s++];
-        for (int bit = 7; bit >= 0 && d < dst_len && s < src_len; --bit) {
+        for (int bit = 7; bit >= 0; --bit) {
+            if (s >= src_len) {
+                uint32_t unused_mask = (bit >= 7) ? 0xFFu : ((1u << (bit + 1)) - 1u);
+                if (((uint32_t)flags & unused_mask) != 0u) {
+                    goto done;
+                }
+                break;
+            }
             if (flags & (1u << bit)) {
                 if (s + 1 >= src_len) {
-                    return;
+                    goto done;
                 }
                 uint8_t b0 = src[s++];
                 uint8_t b1 = src[s++];
                 size_t mlen = ((b0 >> 4) & 0x0Fu) + 3u;
                 size_t moff = ((size_t)(b0 & 0x0Fu) << 8) | b1;
-                if (moff == 0 || moff > d) {
-                    return;
+                if (moff == 0 || moff > d || moff > 4095u) {
+                    goto done;
                 }
-                for (size_t k = 0; k < mlen && d < dst_len; ++k) {
-                    dst[d] = dst[d - moff];
-                    ++d;
+                for (size_t k = 0; k < mlen; ++k) {
+                    uint8_t v = window[(d - moff) & 4095u];
+                    lz_emit_byte(v, dst, dst_len, &d, window, &crc_state);
                 }
             } else {
-                dst[d++] = src[s++];
+                if (s >= src_len) {
+                    goto done;
+                }
+                lz_emit_byte(src[s++], dst, dst_len, &d, window, &crc_state);
             }
         }
     }
+    if (d < dst_len) {
+        goto done;
+    }
+    if (out_crc32 != 0) {
+        *out_crc32 = ~crc_state;
+    }
+    if (out_decoded_len != 0) {
+        *out_decoded_len = d;
+    }
+    ok = 1;
+done:
+    if (!ok) {
+        if (out_crc32 != 0) {
+            *out_crc32 = 0;
+        }
+        if (out_decoded_len != 0) {
+            *out_decoded_len = 0;
+        }
+    }
+    mem_set(window, 0, 4096u);
+    return ok;
 }
 
 static peb_t* get_peb(void) {
@@ -1339,10 +1594,54 @@ static int rva_in_range(uint32_t rva, uint32_t base, uint32_t size) {
     return rva >= base && rva < base + size;
 }
 
+static void* resolve_export_ex(void* module_base, uint64_t target_hash, uint16_t target_ord_arg, int by_ord, int depth,
+                               int log_forwarder, uint32_t import_index, uint32_t iat_rva, uint16_t import_flags,
+                               ll_t load_library);
 static void* resolve_export(void* module_base, uint64_t target_hash, uint16_t target_ord_arg, int by_ord, int depth);
 
-static void* follow_forwarder(const char* fwd, int depth) {
+static int set_kernelbase_name(char* out, size_t out_cap, size_t* out_len) {
+    if (out == 0 || out_cap < 15u) {
+        return 0;
+    }
+    out[0] = 'K';
+    out[1] = 'E';
+    out[2] = 'R';
+    out[3] = 'N';
+    out[4] = 'E';
+    out[5] = 'L';
+    out[6] = 'B';
+    out[7] = 'A';
+    out[8] = 'S';
+    out[9] = 'E';
+    out[10] = '.';
+    out[11] = 'D';
+    out[12] = 'L';
+    out[13] = 'L';
+    out[14] = 0;
+    if (out_len != 0) {
+        *out_len = 14u;
+    }
+    return 1;
+}
+
+static void* follow_forwarder_ex(const char* fwd, int depth, int log_forwarder,
+                                 uint32_t import_index, uint32_t iat_rva, uint16_t import_flags,
+                                 ll_t load_library) {
+    size_t fwd_len = a_strlen(fwd);
+    uint64_t fwd_hash = fnv1a64_bytes((const uint8_t*)fwd, fwd_len);
+    if (log_forwarder) {
+        payload_log_event(APL_EVENT_IMPORT_FORWARDER_ENTER,
+                          import_index,
+                          ((uint64_t)iat_rva << 16) | (uint64_t)import_flags,
+                          fwd_hash);
+    }
     if (depth > 3) {
+        if (log_forwarder) {
+            payload_log_event_force(APL_EVENT_IMPORT_FORWARDER_FAIL,
+                                    import_index,
+                                    ((uint64_t)iat_rva << 16) | (uint64_t)import_flags,
+                                    ((uint64_t)1u << 32) | (uint64_t)depth);
+        }
         return 0;
     }
     size_t dot = 0;
@@ -1350,10 +1649,22 @@ static void* follow_forwarder(const char* fwd, int depth) {
         ++dot;
     }
     if (fwd[dot] != '.') {
+        if (log_forwarder) {
+            payload_log_event_force(APL_EVENT_IMPORT_FORWARDER_FAIL,
+                                    import_index,
+                                    ((uint64_t)iat_rva << 16) | (uint64_t)import_flags,
+                                    ((uint64_t)2u << 32) | fwd_hash);
+        }
         return 0;
     }
     char dllname[64];
     if (dot + 4 >= sizeof(dllname)) {
+        if (log_forwarder) {
+            payload_log_event_force(APL_EVENT_IMPORT_FORWARDER_FAIL,
+                                    import_index,
+                                    ((uint64_t)iat_rva << 16) | (uint64_t)import_flags,
+                                    ((uint64_t)3u << 32) | (uint64_t)dot);
+        }
         return 0;
     }
     for (size_t i = 0; i < dot; ++i) {
@@ -1365,11 +1676,54 @@ static void* follow_forwarder(const char* fwd, int depth) {
     dllname[dot + 3] = 'L';
     dllname[dot + 4] = 0;
     uint64_t dh = fnv1a64_a_upper(dllname, dot + 4);
-    void* m = find_module(dh);
+    uint64_t lookup_hash = dh;
+    const char* lookup_name = dllname;
+    char host_name[96];
+    size_t host_len = 0;
+    if ((dot + 4) >= 31u && fnv1a64_a_upper(dllname, 31u) == 0xC61ACFCABC4DA7AFULL &&
+        set_kernelbase_name(host_name, sizeof(host_name), &host_len)) {
+        lookup_hash = HASH_KERNELBASE;
+        lookup_name = host_name;
+        if (log_forwarder) {
+            payload_log_event(APL_EVENT_IMPORT_APISET_RESULT, import_index, dh, lookup_hash);
+        }
+    } else if (resolve_apiset_host(dllname, dot + 4, host_name, sizeof(host_name), &host_len)) {
+        lookup_hash = fnv1a64_a_upper(host_name, host_len);
+        lookup_name = host_name;
+        if (log_forwarder) {
+            payload_log_event(APL_EVENT_IMPORT_APISET_RESULT, import_index, dh, lookup_hash);
+        }
+    } else if (env_is_apiset_name(dllname, dot + 4) &&
+               set_kernelbase_name(host_name, sizeof(host_name), &host_len)) {
+        lookup_hash = HASH_KERNELBASE;
+        lookup_name = host_name;
+        if (log_forwarder) {
+            payload_log_event(APL_EVENT_IMPORT_APISET_RESULT, import_index, dh, lookup_hash);
+        }
+    } else if (log_forwarder && env_is_apiset_name(dllname, dot + 4)) {
+        payload_log_event_force(APL_EVENT_IMPORT_APISET_RESULT, import_index, dh, 0u);
+    }
+    void* m = find_module(lookup_hash);
+    if (m == 0 && load_library != 0) {
+        if (log_forwarder) {
+            payload_log_event(APL_EVENT_IMPORT_LOAD_ENTER, import_index, dh, lookup_hash);
+        }
+        m = load_library(lookup_name);
+        if (log_forwarder) {
+            payload_log_event(APL_EVENT_IMPORT_LOAD_EXIT, import_index, lookup_hash, (uint64_t)(uintptr_t)m);
+        }
+    }
     if (m == 0) {
+        if (log_forwarder) {
+            payload_log_event_force(APL_EVENT_IMPORT_FORWARDER_FAIL,
+                                    import_index,
+                                    lookup_hash,
+                                    ((uint64_t)4u << 32) | fwd_hash);
+        }
         return 0;
     }
     const char* fname = fwd + dot + 1;
+    void* out = 0;
     if (fname[0] == '#') {
         uint32_t ord = 0;
         size_t i = 1;
@@ -1377,37 +1731,114 @@ static void* follow_forwarder(const char* fwd, int depth) {
             ord = ord * 10u + (uint32_t)(fname[i] - '0');
             ++i;
         }
-        return resolve_export(m, 0, (uint16_t)ord, 1, depth + 1);
+        out = resolve_export_ex(m, 0, (uint16_t)ord, 1, depth + 1,
+                                log_forwarder, import_index, iat_rva, import_flags, load_library);
+    } else {
+        size_t fl = a_strlen(fname);
+        uint64_t fh = fnv1a64_bytes((const uint8_t*)fname, fl);
+        out = resolve_export_ex(m, fh, 0, 0, depth + 1,
+                                log_forwarder, import_index, iat_rva, import_flags, load_library);
     }
-    size_t fl = a_strlen(fname);
-    uint64_t fh = fnv1a64_bytes((const uint8_t*)fname, fl);
-    return resolve_export(m, fh, 0, 0, depth + 1);
+    if (log_forwarder) {
+        if (out == 0) {
+            payload_log_event_force(APL_EVENT_IMPORT_FORWARDER_FAIL,
+                                    import_index,
+                                    lookup_hash,
+                                    ((uint64_t)5u << 32) | fwd_hash);
+        }
+        payload_log_event(APL_EVENT_IMPORT_FORWARDER_EXIT,
+                          import_index,
+                          (uint64_t)(uintptr_t)m,
+                          (uint64_t)(uintptr_t)out);
+    }
+    return out;
 }
 
-static void* resolve_export(void* module_base, uint64_t target_hash, uint16_t target_ord_arg, int by_ord, int depth) {
+static void* resolve_export_ex(void* module_base, uint64_t target_hash, uint16_t target_ord_arg, int by_ord, int depth,
+                               int log_forwarder, uint32_t import_index, uint32_t iat_rva, uint16_t import_flags,
+                               ll_t load_library) {
     if (module_base == 0) {
         return 0;
     }
     uint8_t* base = (uint8_t*)module_base;
-    uint32_t e_lfanew = *(uint32_t*)(base + 0x3C);
+    uint32_t module_size = image_size_from_headers(base);
+    if (module_size == 0u) {
+        if (log_forwarder) {
+            payload_log_event_force(APL_EVENT_IMPORT_FORWARDER_FAIL,
+                                    import_index,
+                                    ((uint64_t)iat_rva << 16) | (uint64_t)import_flags,
+                                    ((uint64_t)6u << 32) | (uint64_t)(uintptr_t)module_base);
+        }
+        return 0;
+    }
+    uint32_t e_lfanew = 0;
+    mem_copy(&e_lfanew, base + 0x3C, 4);
+    if (!range_u32_ok(e_lfanew, 0x90u, module_size)) {
+        if (log_forwarder) {
+            payload_log_event_force(APL_EVENT_IMPORT_FORWARDER_FAIL,
+                                    import_index,
+                                    ((uint64_t)iat_rva << 16) | (uint64_t)import_flags,
+                                    ((uint64_t)7u << 32) | (uint64_t)e_lfanew);
+        }
+        return 0;
+    }
     uint8_t* nt = base + e_lfanew;
-    uint32_t exp_rva = *(uint32_t*)(nt + 0x88);
-    uint32_t exp_size = *(uint32_t*)(nt + 0x8C);
+    uint32_t exp_rva = 0;
+    uint32_t exp_size = 0;
+    mem_copy(&exp_rva, nt + 0x88, 4);
+    mem_copy(&exp_size, nt + 0x8C, 4);
     if (exp_rva == 0 || exp_size == 0) {
         return 0;
     }
+    if (exp_size < 40u || !range_u32_ok(exp_rva, exp_size, module_size)) {
+        if (log_forwarder) {
+            payload_log_event_force(APL_EVENT_IMPORT_FORWARDER_FAIL,
+                                    import_index,
+                                    ((uint64_t)iat_rva << 16) | (uint64_t)import_flags,
+                                    ((uint64_t)8u << 32) | (uint64_t)exp_rva);
+        }
+        return 0;
+    }
     uint8_t* ed = base + exp_rva;
-    uint32_t ord_base = *(uint32_t*)(ed + 0x10);
-    uint32_t n_funcs = *(uint32_t*)(ed + 0x14);
-    uint32_t n_names = *(uint32_t*)(ed + 0x18);
-    uint32_t funcs_rva = *(uint32_t*)(ed + 0x1C);
-    uint32_t names_rva = *(uint32_t*)(ed + 0x20);
-    uint32_t ords_rva = *(uint32_t*)(ed + 0x24);
+    uint32_t ord_base = 0;
+    uint32_t n_funcs = 0;
+    uint32_t n_names = 0;
+    uint32_t funcs_rva = 0;
+    uint32_t names_rva = 0;
+    uint32_t ords_rva = 0;
+    mem_copy(&ord_base, ed + 0x10, 4);
+    mem_copy(&n_funcs, ed + 0x14, 4);
+    mem_copy(&n_names, ed + 0x18, 4);
+    mem_copy(&funcs_rva, ed + 0x1C, 4);
+    mem_copy(&names_rva, ed + 0x20, 4);
+    mem_copy(&ords_rva, ed + 0x24, 4);
+    if (n_funcs == 0u ||
+        !range_u32_ok(funcs_rva, (uint64_t)n_funcs * 4u, module_size) ||
+        (!by_ord && (n_names == 0u ||
+                     !range_u32_ok(names_rva, (uint64_t)n_names * 4u, module_size) ||
+                     !range_u32_ok(ords_rva, (uint64_t)n_names * 2u, module_size)))) {
+        if (log_forwarder) {
+            payload_log_event_force(APL_EVENT_IMPORT_FORWARDER_FAIL,
+                                    import_index,
+                                    ((uint64_t)iat_rva << 16) | (uint64_t)import_flags,
+                                    ((uint64_t)9u << 32) | (uint64_t)n_funcs);
+        }
+        return 0;
+    }
     uint32_t* funcs = (uint32_t*)(base + funcs_rva);
     uint32_t* names = (uint32_t*)(base + names_rva);
     uint16_t* ords = (uint16_t*)(base + ords_rva);
     uint32_t func_rva = 0;
     if (by_ord) {
+        if ((uint32_t)target_ord_arg < ord_base) {
+            if (log_forwarder) {
+                payload_log_event_force(APL_EVENT_IMPORT_FORWARDER_FAIL,
+                                        import_index,
+                                        ((uint64_t)iat_rva << 16) | (uint64_t)import_flags,
+                                        ((uint64_t)10u << 32) | (uint64_t)target_ord_arg);
+            }
+            return 0;
+        }
         uint32_t idx = (uint32_t)target_ord_arg - ord_base;
         if (idx >= n_funcs) {
             return 0;
@@ -1415,8 +1846,27 @@ static void* resolve_export(void* module_base, uint64_t target_hash, uint16_t ta
         func_rva = funcs[idx];
     } else {
         for (uint32_t i = 0; i < n_names; ++i) {
-            const char* nm = (const char*)(base + names[i]);
-            size_t nl = a_strlen(nm);
+            uint32_t name_rva = names[i];
+            if (!range_u32_ok(name_rva, 1u, module_size)) {
+                if (log_forwarder) {
+                    payload_log_event_force(APL_EVENT_IMPORT_FORWARDER_FAIL,
+                                            import_index,
+                                            ((uint64_t)iat_rva << 16) | (uint64_t)import_flags,
+                                            ((uint64_t)11u << 32) | (uint64_t)name_rva);
+                }
+                continue;
+            }
+            const char* nm = (const char*)(base + name_rva);
+            size_t nl = 0;
+            if (!a_strnlen_checked(nm, (size_t)module_size - (size_t)name_rva, &nl)) {
+                if (log_forwarder) {
+                    payload_log_event_force(APL_EVENT_IMPORT_FORWARDER_FAIL,
+                                            import_index,
+                                            ((uint64_t)iat_rva << 16) | (uint64_t)import_flags,
+                                            ((uint64_t)12u << 32) | (uint64_t)name_rva);
+                }
+                continue;
+            }
             uint64_t h = fnv1a64_bytes((const uint8_t*)nm, nl);
             if (h == target_hash) {
                 uint16_t o = ords[i];
@@ -1431,10 +1881,43 @@ static void* resolve_export(void* module_base, uint64_t target_hash, uint16_t ta
     if (func_rva == 0) {
         return 0;
     }
+    if (!range_u32_ok(func_rva, 1u, module_size)) {
+        if (log_forwarder) {
+            payload_log_event_force(APL_EVENT_IMPORT_FORWARDER_FAIL,
+                                    import_index,
+                                    ((uint64_t)iat_rva << 16) | (uint64_t)import_flags,
+                                    ((uint64_t)13u << 32) | (uint64_t)func_rva);
+        }
+        return 0;
+    }
     if (rva_in_range(func_rva, exp_rva, exp_size)) {
-        return follow_forwarder((const char*)(base + func_rva), depth);
+        uint32_t fwd_max = exp_size - (func_rva - exp_rva);
+        size_t fwd_len = 0;
+        if (fwd_max == 0u || !a_strnlen_checked((const char*)(base + func_rva), fwd_max, &fwd_len) ||
+            fwd_len == 0u || fwd_len > 255u) {
+            if (log_forwarder) {
+                payload_log_event_force(APL_EVENT_IMPORT_FORWARDER_FAIL,
+                                        import_index,
+                                        ((uint64_t)iat_rva << 16) | (uint64_t)import_flags,
+                                        ((uint64_t)14u << 32) | (uint64_t)func_rva);
+            }
+            return 0;
+        }
+        return follow_forwarder_ex((const char*)(base + func_rva), depth,
+                                   log_forwarder, import_index, iat_rva, import_flags, load_library);
     }
     return base + func_rva;
+}
+
+static void* resolve_export(void* module_base, uint64_t target_hash, uint16_t target_ord_arg, int by_ord, int depth) {
+    return resolve_export_ex(module_base, target_hash, target_ord_arg, by_ord, depth, 0, 0u, 0u, 0u, 0);
+}
+
+static void* resolve_import_export(void* module_base, uint64_t target_hash, uint16_t target_ord_arg, int by_ord,
+                                   uint32_t import_index, uint32_t iat_rva, uint16_t import_flags,
+                                   ll_t load_library) {
+    return resolve_export_ex(module_base, target_hash, target_ord_arg, by_ord, 0, 1,
+                             import_index, iat_rva, import_flags, load_library);
 }
 
 static int resolve_all(resolved_t* r) {
@@ -1797,14 +2280,21 @@ static uint32_t chars_to_protect(uint32_t c) {
     return PAGE_NA;
 }
 
-static void protect_region(const resolved_t* r, void* addr, size_t size, uint32_t prot, uint32_t* old) {
+static long protect_region(const resolved_t* r, void* addr, size_t size, uint32_t prot, uint32_t* old) {
+    if (r == 0 || r->NtProtectVirtualMemory == 0 || addr == 0 || size == 0u) {
+        if (old != 0) {
+            *old = 0;
+        }
+        return (long)0xC000000DL;
+    }
     void* base = addr;
     size_t sz = size;
     uint32_t o = 0;
-    r->NtProtectVirtualMemory((void*)(intptr_t)-1, &base, &sz, prot, &o);
+    long st = r->NtProtectVirtualMemory((void*)(intptr_t)-1, &base, &sz, prot, &o);
     if (old != 0) {
         *old = o;
     }
+    return st;
 }
 
 static void* alloc_scratch(const resolved_t* r, size_t size) {
@@ -1823,12 +2313,12 @@ static void free_scratch(const resolved_t* r, void* p) {
     r->NtFreeVirtualMemory((void*)(intptr_t)-1, &base, &sz, MEM_RELEASE);
 }
 
-static void unpack_sections(uint8_t* image_base, const uint8_t master[32],
-                            uint8_t* packed_base, const packed_header_t* hdr,
-                            const resolved_t* r) {
+static int unpack_sections(uint8_t* image_base, const uint8_t master[32],
+                           uint8_t* packed_base, const packed_header_t* hdr,
+                           const resolved_t* r) {
     if (hdr->section_count == 0) {
-        payload_log_event(APL_EVENT_SECTIONS_START, 0u, 0u, 0u);
-        return;
+        payload_log_event_force(APL_EVENT_SECTIONS_START, 0u, 0u, 0u);
+        return 1;
     }
     section_descriptor_t* descs = (section_descriptor_t*)(packed_base + hdr->section_table_offset);
     size_t max_enc = 0;
@@ -1838,15 +2328,21 @@ static void unpack_sections(uint8_t* image_base, const uint8_t master[32],
         }
     }
     if (max_enc == 0) {
-        payload_log_event(APL_EVENT_SECTIONS_START, hdr->section_count, 0u, 0u);
-        return;
+        payload_log_event_force(APL_EVENT_SECTIONS_START, hdr->section_count, 0u, 0u);
+        return 1;
     }
-    payload_log_event(APL_EVENT_SECTIONS_START, hdr->section_count, (uint64_t)max_enc, 0u);
-    uint8_t* scratch = (uint8_t*)alloc_scratch(r, max_enc);
+    payload_log_event_force(APL_EVENT_SECTIONS_START, hdr->section_count, (uint64_t)max_enc, 0u);
+    if (max_enc > ((size_t)-1) - 4096u) {
+        payload_log_event_force(APL_EVENT_SECTIONS_ALLOC_FAIL, hdr->section_count, (uint64_t)max_enc, 4096u);
+        return 0;
+    }
+    size_t scratch_size = max_enc + 4096u;
+    uint8_t* scratch = (uint8_t*)alloc_scratch(r, scratch_size);
     if (scratch == 0) {
-        payload_log_event(APL_EVENT_SECTIONS_ALLOC_FAIL, hdr->section_count, (uint64_t)max_enc, 0u);
-        return;
+        payload_log_event_force(APL_EVENT_SECTIONS_ALLOC_FAIL, hdr->section_count, (uint64_t)scratch_size, 0u);
+        return 0;
     }
+    uint8_t* lz_window = scratch + max_enc;
     uint8_t hwid_anchor[32];
     uint8_t tpm_anchor[32];
     uint8_t srv_anchor[32];
@@ -1855,15 +2351,22 @@ static void unpack_sections(uint8_t* image_base, const uint8_t master[32],
     compute_tpm_anchor(tpm_anchor);
     compute_server_anchor(srv_anchor);
     derive_build_seed_from_master(master, build_seed);
+    int ok = 0;
     for (uint32_t i = 0; i < hdr->section_count; ++i) {
         section_descriptor_t* d = &descs[i];
-        if (d->encrypted_size == 0 || d->original_virtual_size == 0) {
-            continue;
+        uint64_t section_size_word = ((uint64_t)d->original_rva << 32) | (uint64_t)d->original_virtual_size;
+        if (d->encrypted_size == 0 || d->original_virtual_size == 0 || d->compressed_size == 0 ||
+            d->compressed_size > d->encrypted_size) {
+            payload_log_event_force(APL_EVENT_SECTION_FAIL,
+                                    i,
+                                    section_size_word,
+                                    ((uint64_t)APL_SECTION_PHASE_VALIDATE << 32) | d->encrypted_size);
+            goto cleanup;
         }
-        payload_log_event(APL_EVENT_SECTION_ENTER,
-                          i,
-                          d->original_rva,
-                          ((uint64_t)d->original_virtual_size << 32) | (uint64_t)d->encrypted_size);
+        payload_log_event_force(APL_EVENT_SECTION_ENTER,
+                                i,
+                                d->original_rva,
+                                ((uint64_t)d->original_virtual_size << 32) | (uint64_t)d->encrypted_size);
         mem_copy(scratch, packed_base + d->blob_offset, d->encrypted_size);
         if (d->layers_applied >= MATRYOSHKA_LAYERS_FULL) {
             uint8_t l3_key[16];
@@ -1875,45 +2378,289 @@ static void unpack_sections(uint8_t* image_base, const uint8_t master[32],
             uint8_t l1_key[16];
             derive_layer1_key(hwid_anchor, build_seed, d->original_rva, d->section_index, l1_key);
             aes128_ctr_xor(l1_key, d->layer1_iv, scratch, d->encrypted_size);
+            mem_set(l1_key, 0, sizeof(l1_key));
+            mem_set(l2_key, 0, sizeof(l2_key));
+            mem_set(l3_key, 0, sizeof(l3_key));
         } else {
             uint8_t skey[32];
             uint8_t siv[16];
             derive_section_key(master, d->original_rva, d->section_index, skey, siv);
             aes256_ctr_xor(skey, siv, scratch, d->encrypted_size);
+            mem_set(skey, 0, sizeof(skey));
+            mem_set(siv, 0, sizeof(siv));
         }
         uint32_t old = 0;
-        protect_region(r, image_base + d->original_rva, d->original_virtual_size, PAGE_RW, &old);
-        lz_decompress(scratch, d->compressed_size, image_base + d->original_rva, d->original_virtual_size);
+        long st = protect_region(r, image_base + d->original_rva, d->original_virtual_size, PAGE_RW, &old);
+        if (st < 0) {
+            payload_log_event_force(APL_EVENT_SECTION_FAIL,
+                                    i,
+                                    section_size_word,
+                                    ((uint64_t)APL_SECTION_PHASE_PROTECT_RW << 32) | (uint32_t)st);
+            goto cleanup;
+        }
+        uint32_t actual_crc = 0;
+        size_t decoded_size = 0;
+        if (!lz_decompress(scratch, d->compressed_size, image_base + d->original_rva, d->original_virtual_size,
+                           lz_window, &actual_crc, &decoded_size)) {
+            uint32_t old2 = 0;
+            (void)protect_region(r, image_base + d->original_rva, d->original_virtual_size, old, &old2);
+            payload_log_event_force(APL_EVENT_SECTION_FAIL,
+                                    i,
+                                    section_size_word,
+                                    ((uint64_t)APL_SECTION_PHASE_DECOMPRESS << 32) | d->compressed_size);
+            goto cleanup;
+        }
+        if (actual_crc != d->original_crc32) {
+            uint32_t old2 = 0;
+            (void)protect_region(r, image_base + d->original_rva, d->original_virtual_size, old, &old2);
+            payload_log_event_force(APL_EVENT_SECTION_FAIL,
+                                    i,
+                                    section_size_word,
+                                    ((uint64_t)APL_SECTION_PHASE_CRC << 32) | actual_crc);
+            payload_log_event_force(APL_EVENT_SECTION_FAIL,
+                                    i,
+                                    d->original_crc32,
+                                    ((uint64_t)APL_SECTION_PHASE_CRC << 32) | (uint32_t)decoded_size);
+            goto cleanup;
+        }
         uint32_t pp = chars_to_protect(d->original_characteristics);
-        protect_region(r, image_base + d->original_rva, d->original_virtual_size, pp, &old);
-        payload_log_event(APL_EVENT_SECTION_EXIT, i, d->original_rva, pp);
+        st = protect_region(r, image_base + d->original_rva, d->original_virtual_size, pp, &old);
+        if (st < 0) {
+            payload_log_event_force(APL_EVENT_SECTION_FAIL,
+                                    i,
+                                    section_size_word,
+                                    ((uint64_t)APL_SECTION_PHASE_RESTORE << 32) | (uint32_t)st);
+            goto cleanup;
+        }
+        payload_log_event_force(APL_EVENT_SECTION_EXIT,
+                                i,
+                                section_size_word,
+                                ((uint64_t)APL_SECTION_PHASE_DONE << 32) | (uint64_t)pp);
     }
+    ok = 1;
+cleanup:
+    mem_set(hwid_anchor, 0, sizeof(hwid_anchor));
+    mem_set(tpm_anchor, 0, sizeof(tpm_anchor));
+    mem_set(srv_anchor, 0, sizeof(srv_anchor));
+    mem_set(build_seed, 0, sizeof(build_seed));
+    mem_set(scratch, 0, scratch_size);
     free_scratch(r, scratch);
+    return ok;
 }
 
-static void rebuild_iat(uint8_t* image_base, const uint8_t master[32],
-                        uint8_t* packed_base, const packed_header_t* hdr,
-                        const resolved_t* r) {
+static int rebuild_iat(uint8_t* image_base, const uint8_t master[32],
+                       uint8_t* packed_base, const packed_header_t* hdr,
+                       const resolved_t* r) {
     if (hdr->import_count == 0 || hdr->import_table_offset == 0) {
         payload_log_event(APL_EVENT_IMPORT_START, 0u, 0u, 0u);
-        return;
+        payload_log_event_force(APL_EVENT_IMPORT_DONE, 0u, 0u, 0u);
+        return 1;
     }
     uint8_t* tbl = packed_base + hdr->import_table_offset;
-    uint32_t count = *(uint32_t*)tbl;
-    import_entry_t* entries = (import_entry_t*)(tbl + 4);
-    uint32_t pool_size = *(uint32_t*)(tbl + 4 + count * 24u);
-    payload_log_event(APL_EVENT_IMPORT_START, count, pool_size, hdr->import_count);
-    uint8_t* pool_enc = tbl + 4 + count * 24u + 4;
-    uint64_t k64 = siphash_2_4(master, 32, 0x494D504F5254434EULL, 0x494D504F5254434EULL);
-    uint8_t kb[8];
-    mem_copy(kb, &k64, 8);
-    uint8_t* pool_local = (uint8_t*)alloc_scratch(r, pool_size > 0 ? pool_size : 16);
-    if (pool_local == 0) {
-        payload_log_event(APL_EVENT_IMPORT_ALLOC_FAIL, count, pool_size, 0u);
-        return;
+    uint32_t count = 0;
+    uint32_t pool_size = 0;
+    uint32_t body_size = 0;
+    uint32_t version = 0;
+    mem_copy(&count, tbl + 0u, 4);
+    mem_copy(&pool_size, tbl + 4u, 4);
+    mem_copy(&body_size, tbl + 8u, 4);
+    mem_copy(&version, tbl + 12u, 4);
+    payload_log_event(APL_EVENT_IMPORT_START, count, pool_size, body_size);
+    uint64_t entry_bytes64 = (uint64_t)count * (uint64_t)sizeof(import_entry_t);
+    if (version != APL_IMPORT_TABLE_VERSION ||
+        count != hdr->import_count ||
+        count > IMG_MAX_IMPORTS ||
+        body_size == 0u ||
+        body_size > 0x01000000u ||
+        pool_size == 0u ||
+        entry_bytes64 + (uint64_t)pool_size != (uint64_t)body_size ||
+        entry_bytes64 > 0xFFFFFFFFull) {
+        payload_log_event_force(APL_EVENT_IMPORT_FAIL,
+                                ((uint64_t)version << 32) | (uint64_t)count,
+                                pool_size,
+                                body_size);
+        return 0;
     }
-    for (uint32_t i = 0; i < pool_size; ++i) {
-        pool_local[i] = (uint8_t)(pool_enc[i] ^ kb[i & 7u]);
+    uint32_t entry_bytes = (uint32_t)entry_bytes64;
+    uint32_t work_size = body_size;
+    uint8_t* work = (uint8_t*)alloc_scratch(r, work_size);
+    if (work == 0) {
+        payload_log_event_force(APL_EVENT_IMPORT_ALLOC_FAIL, count, pool_size, 0u);
+        payload_log_event_force(APL_EVENT_IMPORT_FAIL, count, pool_size, 0u);
+        return 0;
+    }
+    mem_copy(work, tbl + APL_IMPORT_TABLE_BODY_OFFSET, body_size);
+    uint8_t mac_key[32];
+    uint8_t enc_key[32];
+    uint8_t tag[32];
+    uint8_t mac_digest[32];
+    if (!derive_import_table_mac_key_pl(master, mac_key)) {
+        payload_log_event_force(APL_EVENT_IMPORT_FAIL,
+                                ((uint64_t)1u << 48) | (uint64_t)count,
+                                pool_size,
+                                body_size);
+        mem_set(mac_key, 0, sizeof(mac_key));
+        mem_set(work, 0, work_size);
+        free_scratch(r, work);
+        return 0;
+    }
+    sha256_ctx_t mac_ctx;
+    sha256_ctx_init(&mac_ctx);
+    sha256_ctx_update(&mac_ctx, tbl, 32u);
+    sha256_ctx_update(&mac_ctx, tbl + APL_IMPORT_TABLE_BODY_OFFSET, body_size);
+    sha256_ctx_final(&mac_ctx, mac_digest);
+    if (!hmac_sha256_compute(mac_key, 32, mac_digest, sizeof(mac_digest), tag)) {
+        payload_log_event_force(APL_EVENT_IMPORT_FAIL,
+                                ((uint64_t)2u << 48) | (uint64_t)count,
+                                pool_size,
+                                body_size);
+        mem_set(tag, 0, sizeof(tag));
+        mem_set(mac_digest, 0, sizeof(mac_digest));
+        mem_set(mac_key, 0, sizeof(mac_key));
+        mem_set(work, 0, work_size);
+        free_scratch(r, work);
+        return 0;
+    }
+    if (!mem_eq_ct(tag, tbl + 32u, 32u)) {
+        payload_log_event_force(APL_EVENT_IMPORT_FAIL,
+                                ((uint64_t)3u << 48) | (uint64_t)count,
+                                pool_size,
+                                body_size);
+        mem_set(tag, 0, sizeof(tag));
+        mem_set(mac_digest, 0, sizeof(mac_digest));
+        mem_set(mac_key, 0, sizeof(mac_key));
+        mem_set(work, 0, work_size);
+        free_scratch(r, work);
+        return 0;
+    }
+    mem_set(tag, 0, sizeof(tag));
+    mem_set(mac_digest, 0, sizeof(mac_digest));
+    mem_set(mac_key, 0, sizeof(mac_key));
+    if (!derive_import_table_key_pl(master, enc_key)) {
+        payload_log_event_force(APL_EVENT_IMPORT_FAIL,
+                                ((uint64_t)9u << 48) | (uint64_t)count,
+                                pool_size,
+                                body_size);
+        mem_set(enc_key, 0, sizeof(enc_key));
+        mem_set(work, 0, work_size);
+        free_scratch(r, work);
+        return 0;
+    }
+    aes256_ctr_xor(enc_key, tbl + 16u, work, body_size);
+    mem_set(enc_key, 0, sizeof(enc_key));
+    import_entry_t* entries = (import_entry_t*)work;
+    uint8_t* pool_local = work + entry_bytes;
+    if (pool_local[pool_size - 1u] != 0u) {
+        payload_log_event_force(APL_EVENT_IMPORT_FAIL,
+                                ((uint64_t)4u << 48) | (uint64_t)count,
+                                pool_size,
+                                pool_local[pool_size - 1u]);
+        mem_set(work, 0, work_size);
+        free_scratch(r, work);
+        return 0;
+    }
+    uint32_t pool_off = 0;
+    uint32_t pool_names = 0;
+    while (pool_off < pool_size) {
+        size_t nl = 0;
+        while (pool_off + nl < pool_size && pool_local[pool_off + nl] != 0u) {
+            uint8_t c = pool_local[pool_off + nl];
+            int ok_ch = (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                        c == '.' || c == '-' || c == '_';
+            if (!ok_ch) {
+                payload_log_event_force(APL_EVENT_IMPORT_FAIL,
+                                        ((uint64_t)6u << 48) | (uint64_t)pool_names,
+                                        pool_off + (uint32_t)nl,
+                                        c);
+                mem_set(work, 0, work_size);
+                free_scratch(r, work);
+                return 0;
+            }
+            ++nl;
+        }
+        if (pool_off + nl >= pool_size || nl == 0u) {
+            payload_log_event_force(APL_EVENT_IMPORT_FAIL,
+                                    ((uint64_t)7u << 48) | (uint64_t)pool_names,
+                                    pool_off,
+                                    pool_size);
+            mem_set(work, 0, work_size);
+            free_scratch(r, work);
+            return 0;
+        }
+        ++pool_names;
+        pool_off += (uint32_t)(nl + 1u);
+    }
+    if (pool_names == 0u) {
+        payload_log_event_force(APL_EVENT_IMPORT_FAIL,
+                                ((uint64_t)7u << 48) | (uint64_t)count,
+                                pool_size,
+                                0u);
+        mem_set(work, 0, work_size);
+        free_scratch(r, work);
+        return 0;
+    }
+    uint32_t image_size = image_size_from_headers(image_base);
+    for (uint32_t i = 0; i < count; ++i) {
+        import_entry_t* e = &entries[i];
+        if ((e->flags & (uint16_t)~APL_IMPORT_FLAG_MASK) != 0u ||
+            e->dll_hash == 0u ||
+            e->iat_rva == 0u ||
+            (e->iat_rva & 7u) != 0u ||
+            image_size == 0u ||
+            !range_u32_ok(e->iat_rva, 8u, image_size) ||
+            (((e->flags & APL_IMPORT_FLAG_BY_ORDINAL) != 0u && e->ordinal == 0u) ||
+             ((e->flags & APL_IMPORT_FLAG_BY_ORDINAL) == 0u && e->func_hash == 0u))) {
+            payload_log_event_force(APL_EVENT_IMPORT_FAIL,
+                                    ((uint64_t)5u << 48) | (uint64_t)i,
+                                    e->iat_rva,
+                                    ((uint64_t)e->flags << 48) | e->dll_hash);
+            mem_set(work, 0, work_size);
+            free_scratch(r, work);
+            return 0;
+        }
+        uint32_t off = 0;
+        int found_pool_name = 0;
+        while (off < pool_size) {
+            size_t nl = 0;
+            while (off + nl < pool_size && pool_local[off + nl] != 0u) {
+                uint8_t c = pool_local[off + nl];
+                int ok_ch = (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                            c == '.' || c == '-' || c == '_';
+                if (!ok_ch) {
+                    payload_log_event_force(APL_EVENT_IMPORT_FAIL,
+                                            ((uint64_t)6u << 48) | (uint64_t)i,
+                                            off + (uint32_t)nl,
+                                            c);
+                    mem_set(work, 0, work_size);
+                    free_scratch(r, work);
+                    return 0;
+                }
+                ++nl;
+            }
+            if (off + nl >= pool_size) {
+                payload_log_event_force(APL_EVENT_IMPORT_FAIL,
+                                        ((uint64_t)7u << 48) | (uint64_t)i,
+                                        off,
+                                        pool_size);
+                mem_set(work, 0, work_size);
+                free_scratch(r, work);
+                return 0;
+            }
+            if (nl > 0u && fnv1a64_a_upper((const char*)(pool_local + off), nl) == e->dll_hash) {
+                found_pool_name = 1;
+                break;
+            }
+            off += (uint32_t)(nl + 1u);
+        }
+        if (!found_pool_name) {
+            payload_log_event_force(APL_EVENT_IMPORT_FAIL,
+                                    ((uint64_t)8u << 48) | (uint64_t)i,
+                                    e->iat_rva,
+                                    e->dll_hash);
+            mem_set(work, 0, work_size);
+            free_scratch(r, work);
+            return 0;
+        }
     }
     void* loaded[64];
     uint64_t loaded_h[64];
@@ -1921,6 +2668,7 @@ static void rebuild_iat(uint8_t* image_base, const uint8_t master[32],
     uint32_t resolved_count = 0;
     uint32_t missing_mod = 0;
     uint32_t missing_func = 0;
+    uint32_t write_fail = 0;
     for (uint32_t i = 0; i < count; ++i) {
         import_entry_t* e = &entries[i];
         void* mod = 0;
@@ -1935,7 +2683,6 @@ static void rebuild_iat(uint8_t* image_base, const uint8_t master[32],
         }
         if (mod == 0) {
             uint32_t off = 0;
-            int found = 0;
             while (off + 1 < pool_size) {
                 size_t nl = 0;
                 while (off + nl < pool_size && pool_local[off + nl] != 0) {
@@ -1947,30 +2694,40 @@ static void rebuild_iat(uint8_t* image_base, const uint8_t master[32],
                         const char* dll_name = (const char*)(pool_local + off);
                         char host_name[96];
                         size_t host_len = 0;
+                        const char* load_name = dll_name;
+                        uint64_t load_hash = e->dll_hash;
                         if (resolve_apiset_host(dll_name, nl, host_name, sizeof(host_name), &host_len)) {
                             uint64_t host_hash = fnv1a64_a_upper(host_name, host_len);
+                            payload_log_event(APL_EVENT_IMPORT_APISET_RESULT, i, e->dll_hash, host_hash);
                             mod = find_module(host_hash);
-                            if (mod == 0) {
-                                payload_log_event(APL_EVENT_IMPORT_LOAD_ENTER, i, e->dll_hash, host_hash);
-                                mod = r->LoadLibraryA(host_name);
-                                payload_log_event(APL_EVENT_IMPORT_LOAD_EXIT, i, e->dll_hash, (uint64_t)(uintptr_t)mod);
-                            }
-                        } else {
-                            payload_log_event(APL_EVENT_IMPORT_LOAD_ENTER, i, e->dll_hash, (uint64_t)nl);
-                            mod = r->LoadLibraryA(dll_name);
+                            load_name = host_name;
+                            load_hash = host_hash;
+                        } else if (env_is_apiset_name(dll_name, nl) &&
+                                   set_kernelbase_name(host_name, sizeof(host_name), &host_len)) {
+                            payload_log_event(APL_EVENT_IMPORT_APISET_RESULT, i, e->dll_hash, HASH_KERNELBASE);
+                            mod = find_module(HASH_KERNELBASE);
+                            load_name = host_name;
+                            load_hash = HASH_KERNELBASE;
+                        } else if (env_is_apiset_name(dll_name, nl)) {
+                            payload_log_event_force(APL_EVENT_IMPORT_APISET_RESULT, i, e->dll_hash, 0u);
+                        }
+                        if (mod == 0 && r->LoadLibraryA != 0) {
+                            payload_log_event(APL_EVENT_IMPORT_LOAD_ENTER, i, e->dll_hash, load_hash);
+                            mod = r->LoadLibraryA(load_name);
                             payload_log_event(APL_EVENT_IMPORT_LOAD_EXIT, i, e->dll_hash, (uint64_t)(uintptr_t)mod);
                         }
-                        found = 1;
                         break;
                     }
                 }
                 off += (uint32_t)(nl + 1u);
             }
-            (void)found;
         }
         if (mod == 0) {
             ++missing_mod;
-            payload_log_event(APL_EVENT_IMPORT_MISSING_MOD, i, e->dll_hash, 0u);
+            payload_log_event_force(APL_EVENT_IMPORT_MISSING_MOD,
+                                    i,
+                                    e->dll_hash,
+                                    ((uint64_t)e->iat_rva << 16) | (uint64_t)e->flags);
             continue;
         }
         if (n_loaded < 64) {
@@ -1991,30 +2748,84 @@ static void rebuild_iat(uint8_t* image_base, const uint8_t master[32],
         payload_log_event(APL_EVENT_IMPORT_RESOLVE_ENTER,
                           i,
                           e->iat_rva,
-                          (e->flags & 0x1u) ? ((uint64_t)0x8000000000000000ULL | (uint64_t)e->ordinal) : e->func_hash);
-        if (e->flags & 0x1u) {
-            fp = resolve_export(mod, 0, e->ordinal, 1, 0);
+                          (e->flags & APL_IMPORT_FLAG_BY_ORDINAL) ? ((uint64_t)0x8000000000000000ULL | (uint64_t)e->ordinal) : e->func_hash);
+        if (e->flags & APL_IMPORT_FLAG_BY_ORDINAL) {
+            fp = resolve_import_export(mod, 0, e->ordinal, 1, i, e->iat_rva, e->flags,
+                                       r->LoadLibraryA);
         } else {
-            fp = resolve_export(mod, e->func_hash, 0, 0, 0);
+            fp = resolve_import_export(mod, e->func_hash, 0, 0, i, e->iat_rva, e->flags,
+                                       r->LoadLibraryA);
         }
         if (fp == 0) {
             ++missing_func;
-            payload_log_event(APL_EVENT_IMPORT_MISSING_FUNC, i, e->func_hash, e->flags);
+            payload_log_event_force(APL_EVENT_IMPORT_MISSING_FUNC,
+                                    i,
+                                    e->func_hash,
+                                    ((uint64_t)e->iat_rva << 16) | (uint64_t)e->flags);
             continue;
         }
         uint64_t* slot = (uint64_t*)(image_base + e->iat_rva);
+        uint64_t before = 0;
+        uint64_t target = (uint64_t)(uintptr_t)fp;
+        uint64_t after = 0;
+        mem_copy(&before, slot, 8);
         uint32_t old = 0;
-        protect_region(r, slot, 8, PAGE_RW, &old);
-        *slot = (uint64_t)(uintptr_t)fp;
+        void* protect_base = slot;
+        size_t protect_size = 8;
+        long protect_status = r->NtProtectVirtualMemory((void*)(intptr_t)-1, &protect_base, &protect_size, PAGE_RW, &old);
+        if (protect_status < 0) {
+            payload_log_event_force(APL_EVENT_IMPORT_SLOT_PROTECT,
+                                    e->iat_rva,
+                                    ((uint64_t)(uint32_t)protect_status << 32) | (uint64_t)old,
+                                    (uint64_t)(uintptr_t)slot);
+            ++write_fail;
+            continue;
+        }
+        payload_log_event(APL_EVENT_IMPORT_SLOT_PROTECT,
+                          e->iat_rva,
+                          ((uint64_t)(uint32_t)protect_status << 32) | (uint64_t)old,
+                          (uint64_t)(uintptr_t)slot);
+        mem_copy(slot, &target, 8);
+        mem_copy(&after, slot, 8);
+        if (after != target) {
+            payload_log_event_force(APL_EVENT_IMPORT_SLOT_WRITE, e->iat_rva, before, after);
+        } else {
+            payload_log_event(APL_EVENT_IMPORT_SLOT_WRITE, e->iat_rva, before, after);
+        }
         uint32_t old2 = 0;
-        protect_region(r, slot, 8, old, &old2);
+        protect_base = slot;
+        protect_size = 8;
+        long restore_status = r->NtProtectVirtualMemory((void*)(intptr_t)-1, &protect_base, &protect_size, old, &old2);
+        if (restore_status < 0) {
+            payload_log_event_force(APL_EVENT_IMPORT_SLOT_RESTORE,
+                                    e->iat_rva,
+                                    ((uint64_t)(uint32_t)restore_status << 32) | (uint64_t)old2,
+                                    (uint64_t)old);
+        } else {
+            payload_log_event(APL_EVENT_IMPORT_SLOT_RESTORE,
+                              e->iat_rva,
+                              ((uint64_t)(uint32_t)restore_status << 32) | (uint64_t)old2,
+                              (uint64_t)old);
+        }
+        if (after != target || restore_status < 0) {
+            ++write_fail;
+            continue;
+        }
         ++resolved_count;
     }
-    payload_log_event(APL_EVENT_IMPORT_DONE,
-                      resolved_count,
-                      ((uint64_t)missing_mod << 32) | (uint64_t)missing_func,
-                      n_loaded);
-    free_scratch(r, pool_local);
+    if (missing_mod != 0u || missing_func != 0u || write_fail != 0u) {
+        payload_log_event_force(APL_EVENT_IMPORT_FAIL,
+                                ((uint64_t)missing_mod << 32) | (uint64_t)missing_func,
+                                write_fail,
+                                hdr->import_count);
+    }
+    payload_log_event_force(APL_EVENT_IMPORT_DONE,
+                            resolved_count,
+                            ((uint64_t)missing_mod << 32) | (uint64_t)missing_func,
+                            (uint64_t)n_loaded);
+    mem_set(work, 0, work_size);
+    free_scratch(r, work);
+    return missing_mod == 0u && missing_func == 0u && write_fail == 0u;
 }
 
 static void decrypt_strings(uint8_t* image_base, const uint8_t master[32],
@@ -2367,7 +3178,10 @@ static int resolve_apiset_host(const char* name, size_t name_len,
     }
     uint8_t* base = (uint8_t*)api_set_map_ptr;
     apiset_namespace_t* ns = (apiset_namespace_t*)base;
-    if (ns->Version != 6u || ns->Count == 0u || ns->EntryOffset == 0u) {
+    if (ns->Version != 6u || ns->Count == 0u || ns->EntryOffset == 0u ||
+        ns->Size < sizeof(apiset_namespace_t) || ns->Size > 0x01000000u ||
+        ns->Count > 0x00010000u ||
+        !range_u32_ok(ns->EntryOffset, (uint64_t)ns->Count * sizeof(apiset_entry_t), ns->Size)) {
         return 0;
     }
     size_t basename_len = env_strip_dll_suffix(name, name_len);
@@ -2377,7 +3191,10 @@ static int resolve_apiset_host(const char* name, size_t name_len,
     apiset_entry_t* entries = (apiset_entry_t*)(base + ns->EntryOffset);
     for (uint32_t i = 0; i < ns->Count; ++i) {
         apiset_entry_t* e = &entries[i];
-        if (e->NameOffset == 0u || e->NameLength == 0u) {
+        if (e->NameOffset == 0u || e->NameLength == 0u ||
+            e->HashedLength == 0u || e->HashedLength > e->NameLength ||
+            (e->NameLength & 1u) != 0u || (e->HashedLength & 1u) != 0u ||
+            !range_u32_ok(e->NameOffset, e->NameLength, ns->Size)) {
             continue;
         }
         uint16_t* name_w = (uint16_t*)(base + e->NameOffset);
@@ -2404,6 +3221,10 @@ static int resolve_apiset_host(const char* name, size_t name_len,
         if (e->ValueCount == 0u || e->ValueOffset == 0u) {
             return 0;
         }
+        if (e->ValueCount > 0x00001000u ||
+            !range_u32_ok(e->ValueOffset, (uint64_t)e->ValueCount * sizeof(apiset_value_t), ns->Size)) {
+            return 0;
+        }
         apiset_value_t* values = (apiset_value_t*)(base + e->ValueOffset);
         apiset_value_t* default_value = &values[0];
         for (uint32_t j = 0; j < e->ValueCount; ++j) {
@@ -2412,7 +3233,9 @@ static int resolve_apiset_host(const char* name, size_t name_len,
                 break;
             }
         }
-        if (default_value->ValueLength == 0u || default_value->ValueOffset == 0u) {
+        if (default_value->ValueLength == 0u || default_value->ValueOffset == 0u ||
+            (default_value->ValueLength & 1u) != 0u ||
+            !range_u32_ok(default_value->ValueOffset, default_value->ValueLength, ns->Size)) {
             return 0;
         }
         uint16_t* host_w = (uint16_t*)(base + default_value->ValueOffset);
@@ -2421,7 +3244,11 @@ static int resolve_apiset_host(const char* name, size_t name_len,
             return 0;
         }
         for (size_t k = 0; k < host_chars; ++k) {
-            out_host[k] = (char)(host_w[k] & 0xFFu);
+            uint16_t wc = host_w[k];
+            if ((wc & 0xFF00u) != 0u || (wc & 0x00FFu) == 0u) {
+                return 0;
+            }
+            out_host[k] = (char)(wc & 0xFFu);
         }
         out_host[host_chars] = 0;
         *out_len = host_chars;
@@ -3186,10 +4013,19 @@ void __cdecl aida_unpack(void* image_base_arg) {
                       hdr->master_key_pe_timestamp,
                       hdr->master_key_pe_size_of_code);
     payload_log_event(APL_EVENT_PHASE_ENTER, 1u, 0u, 0u);
-    unpack_sections(image_base, master, packed_base, hdr, &r);
+    if (!unpack_sections(image_base, master, packed_base, hdr, &r)) {
+        payload_log_event_force(APL_EVENT_SECTION_FAIL,
+                                hdr->section_count,
+                                (uint64_t)(uintptr_t)image_base,
+                                (uint64_t)(uintptr_t)packed_base);
+        __fastfail(APL_FASTFAIL_SECTION_UNPACK);
+    }
     payload_log_event(APL_EVENT_PHASE_EXIT, 1u, 0u, 0u);
     payload_log_event(APL_EVENT_PHASE_ENTER, 2u, 0u, 0u);
-    rebuild_iat(image_base, master, packed_base, hdr, &r);
+    if (!rebuild_iat(image_base, master, packed_base, hdr, &r)) {
+        payload_log_event_force(APL_EVENT_IMPORT_FAIL, 2u, hdr->import_count, (uint64_t)(uintptr_t)image_base);
+        __fastfail(APL_FASTFAIL_IMPORT_REBUILD);
+    }
     payload_log_event(APL_EVENT_PHASE_EXIT, 2u, 0u, 0u);
     payload_log_event(APL_EVENT_PHASE_ENTER, 3u, hdr->string_fixup_count, 0u);
     decrypt_strings(image_base, master, packed_base, hdr, &r);

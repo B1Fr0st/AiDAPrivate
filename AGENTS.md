@@ -85,6 +85,7 @@ The rules from `RULES.MD` apply to AiDA's real architecture: C++ clients, Node/E
 ## Confirmed Diagnostics Lessons
 
 - `aida_debug.log` is the canonical app/runtime log; `C:\Users\Public\Desktop\aida_kernel.log` is the kernel-side companion; `C:\Users\Public\Desktop\aida_full_test.log` is the Test Lab full-run evidence source. Read all relevant logs before code diagnosis.
+- `AiDAStandalone.exe` crashes now generate WER dump files under `C:\CrashDumps\`, for example `C:\CrashDumps\AiDAStandalone.exe.<pid>.dmp`. For standalone crash work, inspect the newest matching dump in that directory along with `%TEMP%\aida_bootstrap.log` and Event Log before changing code.
 - Test Lab failures can cascade from a single bad target launch. If full-test logs show `target_unavailable=1`, `target_pid=0`, invalid PID/DTB, failed memory allocation, or driver attach mismatch, verify `AiDA_TestTarget.exe` launch and attach first before chasing downstream feature failures.
 - A confirmed full-test launch failure was `CreateProcessW` with `gle=267` because `cwd='AiDA_TestTarget.exe'`. When launch fails, log requested/effective executable path, requested/effective working directory, command line, PID/TID, elapsed time, Win32 error, and driver attach state.
 - TCP/network tests can appear stuck when tracker shutdown is not bounded. TCP tracker tests must log before/after start, before/after stop, worker enter/exit, cancellation state, timeout length, elapsed time, and whether `driver_bridge::get_captured_packets` returned.

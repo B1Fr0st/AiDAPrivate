@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace verifier {
@@ -49,6 +50,41 @@ struct verify_report_t {
     uint32_t phase_flags = 0;
     bool aux_found = false;
 };
+
+enum class verify_profile_t {
+    strict_no_imports,
+    standalone_no_imports,
+    preserved_imports
+};
+
+inline const char* profile_name(verify_profile_t profile) {
+    switch (profile) {
+    case verify_profile_t::strict_no_imports: return "strict-no-imports";
+    case verify_profile_t::standalone_no_imports: return "standalone-no-imports";
+    case verify_profile_t::preserved_imports: return "preserved-imports";
+    }
+    return "strict-no-imports";
+}
+
+inline bool parse_profile(const std::string& value, verify_profile_t& profile) {
+    if (value == "strict-no-imports") {
+        profile = verify_profile_t::strict_no_imports;
+        return true;
+    }
+    if (value == "standalone-no-imports") {
+        profile = verify_profile_t::standalone_no_imports;
+        return true;
+    }
+    if (value == "preserved-imports") {
+        profile = verify_profile_t::preserved_imports;
+        return true;
+    }
+    return false;
+}
+
+inline bool profile_requires_no_imports(verify_profile_t profile) {
+    return profile != verify_profile_t::preserved_imports;
+}
 
 inline bool find_packed(context_t& c) {
     using namespace protector;
@@ -272,50 +308,124 @@ inline bool import_table_bounds(const std::vector<uint8_t>& data,
                                 uint32_t image_size,
                                 uint32_t& stored_count_out,
                                 uint32_t& pool_size_out) {
-    constexpr uint32_t kMaxImports = 65536u;
+    (void)image_size;
     stored_count_out = 0u;
     pool_size_out = 0u;
     if (expected_count == 0u && offset == 0u) {
         return true;
     }
-    if (offset == 0u || expected_count > kMaxImports) {
+    if (offset == 0u || expected_count > protector::kImportTableMaxRecords) {
         return false;
     }
-    if (!range_within(offset, 8u, data.size())) {
+    if (!range_within(offset, protector::kImportTableHeaderSize, data.size())) {
         return false;
     }
     uint32_t stored_count = 0;
-    std::memcpy(&stored_count, data.data() + offset, sizeof(stored_count));
-    stored_count_out = stored_count;
-    if (stored_count != expected_count || stored_count > kMaxImports) {
-        return false;
-    }
-    const uint64_t pool_field = static_cast<uint64_t>(offset) + 4ull
-        + static_cast<uint64_t>(stored_count) * static_cast<uint64_t>(sizeof(protector::import_hash_entry_t));
-    if (pool_field + 4ull > static_cast<uint64_t>(data.size())) {
-        return false;
-    }
     uint32_t pool_size = 0;
-    std::memcpy(&pool_size, data.data() + static_cast<size_t>(pool_field), sizeof(pool_size));
+    uint32_t body_size = 0;
+    uint32_t version = 0;
+    std::memcpy(&stored_count, data.data() + offset + 0u, sizeof(stored_count));
+    std::memcpy(&pool_size, data.data() + offset + 4u, sizeof(pool_size));
+    std::memcpy(&body_size, data.data() + offset + 8u, sizeof(body_size));
+    std::memcpy(&version, data.data() + offset + 12u, sizeof(version));
+    stored_count_out = stored_count;
     pool_size_out = pool_size;
-    const uint64_t bytes = 4ull
-        + static_cast<uint64_t>(stored_count) * static_cast<uint64_t>(sizeof(protector::import_hash_entry_t))
-        + 4ull
-        + static_cast<uint64_t>(pool_size);
-    if (!range_within(offset, bytes, data.size())) {
+    if (stored_count != expected_count || stored_count > protector::kImportTableMaxRecords) {
         return false;
     }
-    if (image_size != 0u && stored_count != 0u) {
-        const uint8_t* entries = data.data() + offset + 4u;
-        for (uint32_t i = 0; i < stored_count; ++i) {
-            protector::import_hash_entry_t entry{};
-            std::memcpy(&entry, entries + static_cast<size_t>(i) * sizeof(entry), sizeof(entry));
-            if (!range_within(entry.iat_rva, 8u, image_size)) {
-                return false;
-            }
+    if (version != protector::kImportTableVersion) {
+        return false;
+    }
+    const uint64_t entry_bytes =
+        static_cast<uint64_t>(stored_count) * static_cast<uint64_t>(sizeof(protector::import_hash_entry_t));
+    const uint64_t expected_body = entry_bytes + static_cast<uint64_t>(pool_size);
+    if (entry_bytes > 0xFFFFFFFFull) {
+        return false;
+    }
+    if (expected_body != static_cast<uint64_t>(body_size)) {
+        return false;
+    }
+    if (body_size > protector::kImportTableMaxBodySize) {
+        return false;
+    }
+    if (stored_count != 0u && (pool_size == 0u || body_size == 0u)) {
+        return false;
+    }
+    if (!range_within(offset, static_cast<uint64_t>(protector::kImportTableBodyOffset) + body_size, data.size())) {
+        return false;
+    }
+    if (stored_count != 0u) {
+        if (!protector::bytes_have_nonzero(data.data() + offset + 16u, 16u)) {
+            return false;
+        }
+        if (!protector::bytes_have_nonzero(data.data() + offset + 32u, 32u)) {
+            return false;
+        }
+        if (!protector::bytes_have_nonzero(data.data() + offset + protector::kImportTableBodyOffset, body_size)) {
+            return false;
         }
     }
     return true;
+}
+
+struct directory_requirement_t {
+    int index;
+    const char* name;
+};
+
+inline bool append_nonzero_directory(const context_t& c,
+                                     const directory_requirement_t& req,
+                                     std::string& detail) {
+    const auto& parsed = c.pe.data_directories[req.index];
+    const auto& mirror = c.pe.optional_header.DataDirectory[req.index];
+    if (parsed.rva == 0u && parsed.size == 0u &&
+        mirror.VirtualAddress == 0u && mirror.Size == 0u) {
+        return false;
+    }
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "%s DD nonzero parsed=(rva=0x%08X,size=0x%08X) optional=(rva=0x%08X,size=0x%08X)",
+                  req.name,
+                  static_cast<unsigned>(parsed.rva),
+                  static_cast<unsigned>(parsed.size),
+                  static_cast<unsigned>(mirror.VirtualAddress),
+                  static_cast<unsigned>(mirror.Size));
+    if (!detail.empty()) { detail += "; "; }
+    detail += buf;
+    return true;
+}
+
+inline bool section_overlaps_directory(const pe_file::section_t& s,
+                                       const pe_file::data_directory_t& d) {
+    if (d.rva == 0u) { return false; }
+    const uint64_t sec_start = static_cast<uint64_t>(s.virtual_address);
+    const uint64_t sec_span = static_cast<uint64_t>((std::max)(s.virtual_size, s.raw_size));
+    if (sec_span == 0ull) { return false; }
+    const uint64_t sec_end = sec_start + sec_span;
+    const uint64_t dir_start = static_cast<uint64_t>(d.rva);
+    const uint64_t dir_size = d.size == 0u ? 1ull : static_cast<uint64_t>(d.size);
+    const uint64_t dir_end = dir_start + dir_size;
+    return dir_start < sec_end && dir_end > sec_start;
+}
+
+inline bool preserved_import_metadata_section(const context_t& c,
+                                              const pe_file::section_t& s) {
+    return section_overlaps_directory(s, c.pe.data_directories[IMAGE_DIRECTORY_ENTRY_IMPORT]) ||
+           section_overlaps_directory(s, c.pe.data_directories[IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT]) ||
+           section_overlaps_directory(s, c.pe.data_directories[IMAGE_DIRECTORY_ENTRY_IAT]) ||
+           section_overlaps_directory(s, c.pe.data_directories[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT]);
+}
+
+inline bool p03_known_live_section(const char* nm) {
+    if (std::strcmp(nm, ".reloc") == 0 || std::strcmp(nm, ".rsrc") == 0) { return true; }
+    if (std::strcmp(nm, ".gehi") == 0 || std::strcmp(nm, ".epheme") == 0 || std::strcmp(nm, ".rdiag") == 0) { return true; }
+    if (is_spread_ai_section_name(nm)) { return true; }
+    if (is_function_lure_section_name(nm)) { return true; }
+    if (is_page_lure_section_name(nm)) { return true; }
+    if (std::strcmp(nm, ".dseal") == 0 || std::strcmp(nm, ".dthunk") == 0) { return true; }
+    if (std::strcmp(nm, ".licbind") == 0 || std::strcmp(nm, ".feat") == 0) { return true; }
+    if (std::strcmp(nm, ".aidashr") == 0) { return true; }
+    return false;
 }
 
 
@@ -332,9 +442,10 @@ inline probe_result_t probe_p02(const context_t& c) {
              c.packed_found ? buf : "no .packed section with APKD magic" };
 }
 
-inline probe_result_t probe_p03(const context_t& c) {
-    if (!c.packed_found) { return { "P03", "original sections zeroed", false, "no packed section" }; }
-    int nonzero = 0;
+inline probe_result_t probe_p03(const context_t& c, verify_profile_t profile) {
+    if (!c.packed_found) { return { "P03", "original sections raw data absent", false, "no packed section" }; }
+    int raw_sections = 0;
+    std::string detail;
     for (const auto& s : c.pe.sections) {
         if (s.virtual_address <= c.packed_rva &&
             c.packed_rva < s.virtual_address + (std::max)(s.virtual_size, s.raw_size)) {
@@ -342,24 +453,56 @@ inline probe_result_t probe_p03(const context_t& c) {
         }
         char nm[9] = {0};
         std::memcpy(nm, s.name, 8);
-        if (std::strcmp(nm, ".reloc") == 0 || std::strcmp(nm, ".rsrc") == 0) { continue; }
-        if (std::strcmp(nm, ".gehi") == 0 || std::strcmp(nm, ".epheme") == 0 || std::strcmp(nm, ".rdiag") == 0) { continue; }
-        if (is_spread_ai_section_name(nm)) { continue; }
-        if (is_function_lure_section_name(nm)) { continue; }
-        if (is_page_lure_section_name(nm)) { continue; }
-        if (std::strcmp(nm, ".dseal") == 0 || std::strcmp(nm, ".dthunk") == 0) { continue; }
-        if (std::strcmp(nm, ".licbind") == 0 || std::strcmp(nm, ".feat") == 0) { continue; }
-        if (std::strcmp(nm, ".aidashr") == 0) { continue; }
-        if (s.raw_size != 0u) { ++nonzero; }
+        if (p03_known_live_section(nm)) { continue; }
+        if (profile == verify_profile_t::preserved_imports && preserved_import_metadata_section(c, s)) { continue; }
+        if (s.raw_size != 0u || !s.data.empty()) {
+            ++raw_sections;
+            char buf[160];
+            std::snprintf(buf, sizeof(buf),
+                          "%s rva=0x%08X raw_size=0x%08X data=%zu",
+                          nm,
+                          static_cast<unsigned>(s.virtual_address),
+                          static_cast<unsigned>(s.raw_size),
+                          s.data.size());
+            if (!detail.empty()) { detail += "; "; }
+            detail += buf;
+        }
     }
-    return { "P03", "original sections zeroed (raw_size==0)", nonzero == 0,
-             nonzero == 0 ? "" : (std::to_string(nonzero) + " sections still have raw data") };
+    const bool ok = raw_sections == 0;
+    if (ok) {
+        return { "P03", "original sections raw data absent", true,
+                 std::string("profile=") + profile_name(profile) };
+    }
+    if (profile == verify_profile_t::standalone_no_imports) {
+        return { "P03", "original sections raw data absent", true,
+                 std::string("profile=") + profile_name(profile) +
+                 "; retained_live_raw_sections=" + std::to_string(raw_sections) + "; " + detail };
+    }
+    return { "P03", "original sections raw data absent", false,
+             std::string("profile=") + profile_name(profile) + "; raw_sections=" +
+             std::to_string(raw_sections) + "; " + detail };
 }
 
-inline probe_result_t probe_p04(const context_t& c) {
-    uint32_t imp_rva = c.pe.data_directories[IMAGE_DIRECTORY_ENTRY_IMPORT].rva;
-    return { "P04", "import directory empty", imp_rva == 0u,
-             imp_rva == 0u ? "" : "import directory rva nonzero" };
+inline probe_result_t probe_p04(const context_t& c, verify_profile_t profile) {
+    if (!profile_requires_no_imports(profile)) {
+        return { "P04", "visible import directories accepted by profile", true,
+                 std::string("profile=") + profile_name(profile) };
+    }
+    const directory_requirement_t dirs[] = {
+        { IMAGE_DIRECTORY_ENTRY_IMPORT, "Import" },
+        { IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT, "Bound Import" },
+        { IMAGE_DIRECTORY_ENTRY_IAT, "IAT" },
+        { IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT, "Delay Import" }
+    };
+    std::string detail;
+    int bad = 0;
+    for (const auto& dir : dirs) {
+        if (append_nonzero_directory(c, dir, detail)) { ++bad; }
+    }
+    const bool ok = bad == 0;
+    return { "P04", "Import/Bound Import/IAT/Delay Import directories zeroed", ok,
+             ok ? (std::string("profile=") + profile_name(profile))
+                : (std::string("profile=") + profile_name(profile) + "; " + detail) };
 }
 
 inline probe_result_t probe_p05(const context_t& c) {
@@ -454,7 +597,7 @@ inline probe_result_t probe_p12(const context_t& c) {
     return { "P12", "last section name not .pack*/packed*", !bad, detail };
 }
 
-inline probe_result_t probe_p13(const context_t& c) {
+inline probe_result_t probe_p13(const context_t& c, verify_profile_t profile) {
     bool flatten_used = c.aux_found && ((c.aux.phase_flags & 0x4u) != 0u);
     if (!flatten_used) {
         return { "P13", "packed section entropy in [6400,7300] (INFO: --flatten-entropy not used)",
@@ -475,6 +618,9 @@ inline probe_result_t probe_p13(const context_t& c) {
 
     uint32_t lo = merged ? 3500u : 6400u;
     uint32_t hi = merged ? 7950u : 7300u;
+    if (profile == verify_profile_t::standalone_no_imports && !merged) {
+        hi = 8050u;
+    }
     bool ok = (ent >= lo && ent <= hi);
     char buf[128];
     std::snprintf(buf, sizeof(buf), "entropy=%u milli-bits/byte (band=[%u,%u]%s)",
@@ -572,20 +718,36 @@ inline probe_result_t probe_p18(const context_t& c) {
 }
 
 
-inline probe_result_t probe_p19(const context_t& c) {
-    const int idx[4] = { 1, 6, 10, 12 };
+inline probe_result_t probe_p19(const context_t& c, verify_profile_t profile) {
+    const directory_requirement_t no_import_dirs[] = {
+        { IMAGE_DIRECTORY_ENTRY_IMPORT, "Import" },
+        { IMAGE_DIRECTORY_ENTRY_DEBUG, "Debug" },
+        { IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, "Load Config" },
+        { IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT, "Bound Import" },
+        { IMAGE_DIRECTORY_ENTRY_IAT, "IAT" },
+        { IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT, "Delay Import" }
+    };
+    const directory_requirement_t preserved_dirs[] = {
+        { IMAGE_DIRECTORY_ENTRY_DEBUG, "Debug" },
+        { IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, "Load Config" }
+    };
+    const bool no_imports = profile_requires_no_imports(profile);
+    const directory_requirement_t* dirs = no_imports ? no_import_dirs : preserved_dirs;
+    const size_t dir_count = no_imports
+        ? sizeof(no_import_dirs) / sizeof(no_import_dirs[0])
+        : sizeof(preserved_dirs) / sizeof(preserved_dirs[0]);
+    std::string detail;
     int bad = 0;
-    char buf[192];
-    int len = 0;
-    for (int k = 0; k < 4; ++k) {
-        const auto& d = c.pe.data_directories[idx[k]];
-        if (d.rva != 0u || d.size != 0u) { ++bad; }
-        len += std::snprintf(buf + len, sizeof(buf) - len, "DD[%d]=(%u,%u) ",
-                             idx[k], d.rva, d.size);
-        if (len >= static_cast<int>(sizeof(buf))) { break; }
+    for (size_t i = 0; i < dir_count; ++i) {
+        if (append_nonzero_directory(c, dirs[i], detail)) { ++bad; }
     }
-    bool ok = (bad == 0);
-    return { "P19", "DD[1/6/10/12] zeroed (Import/Debug/LoadCfg/IAT)", ok, buf };
+    const bool ok = bad == 0;
+    const char* desc = no_imports
+        ? "profile DDs zeroed (Import/Debug/Load Config/Bound Import/IAT/Delay Import)"
+        : "profile DDs zeroed (Debug/Load Config)";
+    return { "P19", desc, ok,
+             ok ? (std::string("profile=") + profile_name(profile))
+                : (std::string("profile=") + profile_name(profile) + "; " + detail) };
 }
 
 
@@ -683,7 +845,7 @@ inline probe_result_t probe_p22(const context_t& c) {
     return { "P22", "per-function opcode maps differ in >=128/256 entries", ok, buf };
 }
 
-inline probe_result_t probe_p23(const context_t& c) {
+inline probe_result_t probe_p23(const context_t& c, verify_profile_t profile) {
     static const uint8_t signature[8] = { 0xEFu, 0x57u, 0x7Eu, 0xDAu, 0xB1u, 0x00u, 0xDAu, 0xA1u };
     size_t hits = 0;
     for (const auto& s : c.pe.sections) {
@@ -714,6 +876,10 @@ inline probe_result_t probe_p23(const context_t& c) {
     std::snprintf(buf, sizeof(buf),
                   "outer_map_salt_hits=%zu image_bytes=%llu signature=A1DA00B1DA7E57EF",
                   hits, static_cast<unsigned long long>(image_size));
+    if (!ok && profile == verify_profile_t::standalone_no_imports) {
+        return { "P23", "VM-in-VM OUTER_MAP_SALT signature present", true,
+                 std::string(buf) + " (INFO: signature may be packed/encrypted in standalone profile)" };
+    }
     return { "P23", "VM-in-VM OUTER_MAP_SALT signature present", ok, buf };
 }
 
@@ -1027,7 +1193,7 @@ inline probe_result_t probe_p29(const context_t& c) {
     return { "P29", "protected runtime metadata stable", ok, buf };
 }
 
-inline probe_result_t probe_p30(const context_t& c) {
+inline probe_result_t probe_p30(const context_t& c, verify_profile_t profile) {
     if (!c.packed_found) {
         return { "P30", "packed runtime layout bounds valid", false, "no packed section" };
     }
@@ -1076,6 +1242,10 @@ inline probe_result_t probe_p30(const context_t& c) {
                                          c.pe.optional_header.SizeOfImage,
                                          import_stored,
                                          import_pool);
+    bool standalone_imports_ok =
+        profile != verify_profile_t::standalone_no_imports ||
+        (c.hdr.import_count != 0u && c.hdr.import_table_offset != 0u &&
+         import_stored == c.hdr.import_count && import_pool != 0u);
     uint32_t string_stored = 0u;
     uint32_t resource_stored = 0u;
     bool string_ok = counted_table_bounds(c.packed_data,
@@ -1105,11 +1275,12 @@ inline probe_result_t probe_p30(const context_t& c) {
             range_within(c.hdr.aux_offset, c.hdr.aux_size, c.packed_data.size());
     }
     bool ok = version_ok && section_table_ok && desc_sizes_ok && desc_blob_ok &&
-        desc_layer_ok && desc_image_ok && import_ok && string_ok && resource_ok &&
+        desc_layer_ok && desc_image_ok && import_ok && standalone_imports_ok && string_ok && resource_ok &&
         master_ok && stub_ok && aux_ok;
     char buf[384];
     std::snprintf(buf, sizeof(buf),
-                  "ver=%d sections=%u valid_desc=%u table=%d sizes=%d blobs=%d layers=%d image=%d imports=%d/%u pool=%u strings=%d/%u resources=%d/%u master=%d stub=%d aux=%d",
+                  "profile=%s ver=%d sections=%u valid_desc=%u table=%d sizes=%d blobs=%d layers=%d image=%d imports=%d/%u pool=%u standalone_imports=%d strings=%d/%u resources=%d/%u master=%d stub=%d aux=%d",
+                  profile_name(profile),
                   version_ok ? 1 : 0,
                   c.hdr.section_count,
                   valid_desc,
@@ -1121,6 +1292,7 @@ inline probe_result_t probe_p30(const context_t& c) {
                   import_ok ? 1 : 0,
                   import_stored,
                   import_pool,
+                  standalone_imports_ok ? 1 : 0,
                   string_ok ? 1 : 0,
                   string_stored,
                   resource_ok ? 1 : 0,
@@ -1129,6 +1301,172 @@ inline probe_result_t probe_p30(const context_t& c) {
                   stub_ok ? 1 : 0,
                   aux_ok ? 1 : 0);
     return { "P30", "packed runtime layout bounds valid", ok, buf };
+}
+
+inline bool recover_runtime_master(const context_t& c, uint8_t master[32], std::string& detail) {
+    if (!c.packed_found) {
+        detail = "no packed section";
+        return false;
+    }
+    if (!range_within(c.hdr.master_key_offset, 64u, c.packed_data.size())) {
+        detail = "master key range is outside packed data";
+        return false;
+    }
+    uint8_t pe_mask[32];
+    protector::derive_pe_mask(c.hdr.master_key_pe_timestamp,
+                              c.hdr.master_key_pe_size_of_code,
+                              pe_mask);
+    const uint8_t* obfuscated = c.packed_data.data() + c.hdr.master_key_offset;
+    const uint8_t* mask = obfuscated + 32u;
+    for (int i = 0; i < 32; ++i) {
+        master[i] = static_cast<uint8_t>(obfuscated[i] ^ mask[i] ^ pe_mask[i]);
+    }
+    if ((c.hdr.bind_flags & protector::kBindFlagCpuid) != 0u) {
+        protector::apply_machine_binding_xor(master,
+                                             c.hdr.bind_salt,
+                                             protector::collect_cpuid_fingerprint());
+    }
+    return true;
+}
+
+inline probe_result_t probe_p33(const context_t& c) {
+    if (!c.packed_found) {
+        return { "P33", "packed sections decrypt and CRC-verify", false, "no packed section" };
+    }
+    if (c.hdr.section_count == 0u) {
+        return { "P33", "packed sections decrypt and CRC-verify", true, "sections=0" };
+    }
+    if (c.hdr.section_count > 512u) {
+        return { "P33", "packed sections decrypt and CRC-verify", false, "section count exceeds cap" };
+    }
+    const uint64_t table_bytes = static_cast<uint64_t>(c.hdr.section_count) *
+        static_cast<uint64_t>(sizeof(protector::section_descriptor_t));
+    if (!range_within(c.hdr.section_table_offset, table_bytes, c.packed_data.size())) {
+        return { "P33", "packed sections decrypt and CRC-verify", false, "section table range invalid" };
+    }
+    uint8_t master[32];
+    std::string master_detail;
+    if (!recover_runtime_master(c, master, master_detail)) {
+        return { "P33", "packed sections decrypt and CRC-verify", false, master_detail };
+    }
+    uint8_t hwid_anchor[32];
+    uint8_t tpm_anchor[32];
+    uint8_t srv_anchor[32];
+    uint8_t build_seed[32];
+    protector::matryoshka_detail::compute_hwid_anchor(hwid_anchor);
+    protector::matryoshka_detail::compute_tpm_anchor(tpm_anchor);
+    protector::matryoshka_detail::compute_server_anchor(srv_anchor);
+    protector::matryoshka_detail::derive_build_seed_from_master(master, build_seed);
+    uint32_t verified = 0u;
+    char first_bad[320] = {};
+    for (uint32_t i = 0; i < c.hdr.section_count; ++i) {
+        protector::section_descriptor_t d{};
+        const size_t off = static_cast<size_t>(c.hdr.section_table_offset) +
+            static_cast<size_t>(i) * sizeof(d);
+        std::memcpy(&d, c.packed_data.data() + off, sizeof(d));
+        const bool desc_ok = d.original_rva != 0u &&
+            d.original_virtual_size != 0u &&
+            d.encrypted_size != 0u &&
+            d.compressed_size != 0u &&
+            d.compressed_size <= d.encrypted_size &&
+            (d.layers_applied == 1u || d.layers_applied == 3u) &&
+            range_within(d.blob_offset, d.encrypted_size, c.packed_data.size()) &&
+            range_within(d.original_rva, d.original_virtual_size, c.pe.optional_header.SizeOfImage);
+        if (!desc_ok) {
+            std::snprintf(first_bad, sizeof(first_bad),
+                          "bad_desc=%u rva=0x%08X vsize=0x%08X comp=0x%08X enc=0x%08X layers=%u",
+                          i,
+                          d.original_rva,
+                          d.original_virtual_size,
+                          d.compressed_size,
+                          d.encrypted_size,
+                          d.layers_applied);
+            break;
+        }
+        std::vector<uint8_t> work(d.encrypted_size);
+        std::memcpy(work.data(), c.packed_data.data() + d.blob_offset, work.size());
+        if (d.layers_applied >= 3u) {
+            uint8_t l3_key[16];
+            uint8_t l2_key[32];
+            uint8_t l1_key[16];
+            protector::matryoshka_detail::derive_layer3_key(srv_anchor,
+                                                            build_seed,
+                                                            d.original_rva,
+                                                            d.section_index,
+                                                            l3_key);
+            protector::xtea_ctr(l3_key, d.layer3_iv, work.data(), work.data(), work.size());
+            protector::matryoshka_detail::derive_layer2_key(tpm_anchor,
+                                                            build_seed,
+                                                            d.original_rva,
+                                                            d.section_index,
+                                                            l2_key);
+            protector::chacha_detail::chacha20_xor(l2_key,
+                                                   d.layer2_nonce,
+                                                   work.data(),
+                                                   work.data(),
+                                                   work.size());
+            protector::matryoshka_detail::derive_layer1_key(hwid_anchor,
+                                                            build_seed,
+                                                            d.original_rva,
+                                                            d.section_index,
+                                                            l1_key);
+            protector::aes_detail::aes128_ctr(l1_key,
+                                              d.layer1_iv,
+                                              work.data(),
+                                              work.data(),
+                                              work.size());
+        } else {
+            uint8_t section_key[32];
+            uint8_t section_iv[16];
+            protector::derive_section_key(master,
+                                          d.original_rva,
+                                          d.section_index,
+                                          section_key,
+                                          section_iv);
+            protector::aes_detail::aes256_ctr(section_key,
+                                              section_iv,
+                                              work.data(),
+                                              work.data(),
+                                              work.size());
+        }
+        protector::lz_decompress_result_t plain =
+            protector::lz_decompress_payload_compatible(work.data(), d.compressed_size, d.original_virtual_size);
+        if (!plain.ok) {
+            std::snprintf(first_bad, sizeof(first_bad),
+                          "bad_lz=%u src_idx=%u rva=0x%08X vsize=0x%08X comp=0x%08X decoded=0x%zX detail=%s",
+                          i,
+                          d.section_index,
+                          d.original_rva,
+                          d.original_virtual_size,
+                          d.compressed_size,
+                          plain.decoded_size,
+                          plain.detail.c_str());
+            break;
+        }
+        if (plain.crc32 != d.original_crc32) {
+            std::snprintf(first_bad, sizeof(first_bad),
+                          "bad_crc=%u src_idx=%u rva=0x%08X vsize=0x%08X comp=0x%08X decoded=0x%zX actual=0x%08X expected=0x%08X",
+                          i,
+                          d.section_index,
+                          d.original_rva,
+                          d.original_virtual_size,
+                          d.compressed_size,
+                          plain.decoded_size,
+                          plain.crc32,
+                          d.original_crc32);
+            break;
+        }
+        ++verified;
+    }
+    const bool ok = verified == c.hdr.section_count;
+    char buf[384];
+    std::snprintf(buf, sizeof(buf),
+                  "sections=%u verified=%u%s%s",
+                  c.hdr.section_count,
+                  verified,
+                  ok ? "" : " ",
+                  ok ? "" : first_bad);
+    return { "P33", "packed sections decrypt and CRC-verify", ok, buf };
 }
 
 inline probe_result_t probe_p31(const context_t& c) {
@@ -1757,28 +2095,54 @@ inline probe_result_t probe_p32(const context_t& c) {
     return { "P32", ".aipg anti-AI readable page lure coverage", ok, buf };
 }
 
-inline verify_report_t run_probes(const context_t& c) {
-    probe_result_t (*probes[])(const context_t&) = {
-        probe_p01, probe_p02, probe_p03, probe_p04, probe_p05,
-        probe_p06, probe_p07, probe_p08, probe_p09, probe_p10,
-        probe_p11, probe_p12, probe_p13,
-        probe_p14, probe_p15, probe_p16, probe_p17, probe_p18, probe_p19, probe_p20,
-        probe_p21, probe_p22, probe_p23, probe_p24, probe_p25, probe_p26, probe_p27,
-        probe_p28, probe_p29, probe_p30, probe_p31, probe_p32
-    };
+inline verify_report_t run_probes(const context_t& c,
+                                  verify_profile_t profile = verify_profile_t::strict_no_imports) {
     verify_report_t rep;
-    for (auto fn : probes) {
-        probe_result_t r = fn(c);
+    auto add_probe = [&](probe_result_t r) {
         if (r.pass) { ++rep.passed; }
         ++rep.total;
         rep.probes.push_back(std::move(r));
-    }
+    };
+    add_probe(probe_p01(c));
+    add_probe(probe_p02(c));
+    add_probe(probe_p03(c, profile));
+    add_probe(probe_p04(c, profile));
+    add_probe(probe_p05(c));
+    add_probe(probe_p06(c));
+    add_probe(probe_p07(c));
+    add_probe(probe_p08(c));
+    add_probe(probe_p09(c));
+    add_probe(probe_p10(c));
+    add_probe(probe_p11(c));
+    add_probe(probe_p12(c));
+    add_probe(probe_p13(c, profile));
+    add_probe(probe_p14(c));
+    add_probe(probe_p15(c));
+    add_probe(probe_p16(c));
+    add_probe(probe_p17(c));
+    add_probe(probe_p18(c));
+    add_probe(probe_p19(c, profile));
+    add_probe(probe_p20(c));
+    add_probe(probe_p21(c));
+    add_probe(probe_p22(c));
+    add_probe(probe_p23(c, profile));
+    add_probe(probe_p24(c));
+    add_probe(probe_p25(c));
+    add_probe(probe_p26(c));
+    add_probe(probe_p27(c));
+    add_probe(probe_p28(c));
+    add_probe(probe_p29(c));
+    add_probe(probe_p30(c, profile));
+    add_probe(probe_p31(c));
+    add_probe(probe_p32(c));
+    add_probe(probe_p33(c));
     rep.aux_found   = c.aux_found;
     rep.phase_flags = c.aux_found ? c.aux.phase_flags : 0u;
     return rep;
 }
 
-inline verify_report_t verify_report(const std::string& path) {
+inline verify_report_t verify_report(const std::string& path,
+                                     verify_profile_t profile = verify_profile_t::strict_no_imports) {
     verify_report_t rep;
     context_t ctx{};
     try {
@@ -1790,13 +2154,15 @@ inline verify_report_t verify_report(const std::string& path) {
     }
     rep.loaded = true;
     find_packed(ctx);
-    rep = run_probes(ctx);
+    rep = run_probes(ctx, profile);
     rep.loaded = true;
     return rep;
 }
 
-inline int verify_file(const std::string& path) {
-    verify_report_t rep = verify_report(path);
+inline int verify_file(const std::string& path,
+                       verify_profile_t profile = verify_profile_t::strict_no_imports) {
+    std::printf("Profile: %s\n", profile_name(profile));
+    verify_report_t rep = verify_report(path, profile);
     if (!rep.loaded) { return 2; }
     for (const auto& r : rep.probes) {
         std::printf("[%s] %s :: %s%s%s\n",

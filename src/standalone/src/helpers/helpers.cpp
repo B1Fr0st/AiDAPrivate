@@ -5220,7 +5220,7 @@ void helpers::render_title()
 		ImGui::BeginChild("##fb_scroll", ImVec2(fw, fb_scroll_h), false, ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoSavedSettings);
 		{
 			ImDrawList* scl = ImGui::GetWindowDrawList();
-			if (file_browser::needs_refresh || file_browser::entries.empty()) {
+			if (file_browser::needs_refresh) {
 				g_render_section = "left_panel_explorer_refresh";
 				file_browser::refresh();
 			}

@@ -54,6 +54,8 @@ struct config_t {
     bool seed_provided = false;
     bool watermark_provided = false;
     bool target_arc = false;
+    bool target_standalone = false;
+    bool no_encrypt_imports_explicit = false;
     bool preserve_loader_relocations = false;
     uint64_t seed = 0;
     uint32_t tamper_response_level = 0;
@@ -111,6 +113,7 @@ static void print_usage(std::FILE* out) {
         "Targets:\n"
         "  --target-arc                ARC mode (aida_core.dll): forces the hardened ARC profile,\n"
         "                              tighter flatten band, tamper-level 4. Validates input is aida_core.dll.\n"
+        "  --target-standalone         Standalone EXE mode (AiDAStandalone.exe): forces no visible Import/Bound/IAT/Delay directories.\n"
         "  --preserve-loader-relocations\n"
         "                              Preserve loader relocation metadata for DLLs hosted by another process.\n"
         "\n"
@@ -253,6 +256,7 @@ inline config_t parse_args(int argc, char** argv) {
             cfg.encrypt_imports = true;
         } else if (arg == "--no-encrypt-imports") {
             cfg.encrypt_imports = false;
+            cfg.no_encrypt_imports_explicit = true;
         } else if (arg == "--encrypt-strings") {
             cfg.encrypt_strings = true;
         } else if (arg == "--encrypt-resources") {
@@ -328,6 +332,8 @@ inline config_t parse_args(int argc, char** argv) {
             cfg.bind_machine = true;
         } else if (arg == "--target-arc") {
             cfg.target_arc = true;
+        } else if (arg == "--target-standalone") {
+            cfg.target_standalone = true;
         } else if (arg == "--preserve-loader-relocations") {
             cfg.preserve_loader_relocations = true;
         } else if (arg == "--tamper-level") {
@@ -400,6 +406,14 @@ inline config_t parse_args(int argc, char** argv) {
     }
     if (cfg.no_jit_explicit) { cfg.jit = false; }
     if (cfg.no_llm_poison_explicit) { cfg.llm_poison = false; }
+    if (cfg.target_arc && cfg.target_standalone) {
+        std::fprintf(stderr, "Error: --target-arc and --target-standalone are mutually exclusive\n");
+        std::exit(1);
+    }
+    if (cfg.target_standalone && cfg.no_encrypt_imports_explicit) {
+        std::fprintf(stderr, "Error: --target-standalone cannot be combined with --no-encrypt-imports\n");
+        std::exit(1);
+    }
     if (cfg.target_arc) {
         cfg.strip_rich = true;
         cfg.strip_debug = true;
@@ -420,6 +434,11 @@ inline config_t parse_args(int argc, char** argv) {
         if (!cfg.no_llm_poison_explicit) { cfg.llm_poison = true; }
         if (!cfg.no_jit_explicit) { cfg.jit = true; }
         cfg.tamper_response_level = 4u;
+    }
+    if (cfg.target_standalone) {
+        cfg.encrypt_imports = true;
+        cfg.pack_sections = true;
+        cfg.preserve_loader_relocations = false;
     }
     if (cfg.input_path.empty() || cfg.output_path.empty()) {
         std::fprintf(stderr, "Error: --input and --output are required\n");
@@ -452,6 +471,64 @@ static unsigned count_zero_bytes(const uint8_t* bytes, size_t len) {
         }
     }
     return n;
+}
+
+static std::string path_filename_string(const std::string& path) {
+    try {
+        return std::filesystem::path(path).filename().string();
+    } catch (const std::exception&) {
+        return {};
+    }
+}
+
+static std::string ascii_lower_copy(std::string value) {
+    for (auto& ch : value) {
+        if (ch >= 'A' && ch <= 'Z') {
+            ch = static_cast<char>(ch - 'A' + 'a');
+        }
+    }
+    return value;
+}
+
+static bool import_directory_clear(const pe_file::pe_image_t& pe,
+                                   uint32_t index,
+                                   const char* name,
+                                   std::string& detail_out) {
+    const uint32_t parsed_rva = pe.data_directories[index].rva;
+    const uint32_t parsed_size = pe.data_directories[index].size;
+    const uint32_t mirror_rva = pe.optional_header.DataDirectory[index].VirtualAddress;
+    const uint32_t mirror_size = pe.optional_header.DataDirectory[index].Size;
+    if (parsed_rva == 0u && parsed_size == 0u && mirror_rva == 0u && mirror_size == 0u) {
+        return true;
+    }
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "%s directory still visible parsed=(rva=0x%08X,size=0x%08X) optional=(rva=0x%08X,size=0x%08X)",
+                  name,
+                  static_cast<unsigned>(parsed_rva),
+                  static_cast<unsigned>(parsed_size),
+                  static_cast<unsigned>(mirror_rva),
+                  static_cast<unsigned>(mirror_size));
+    detail_out = buf;
+    return false;
+}
+
+static bool visible_import_directories_cleared(const pe_file::pe_image_t& pe,
+                                               std::string& detail_out) {
+    if (!import_directory_clear(pe, IMAGE_DIRECTORY_ENTRY_IMPORT, "Import", detail_out)) {
+        return false;
+    }
+    if (!import_directory_clear(pe, IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT, "Bound Import", detail_out)) {
+        return false;
+    }
+    if (!import_directory_clear(pe, IMAGE_DIRECTORY_ENTRY_IAT, "IAT", detail_out)) {
+        return false;
+    }
+    if (!import_directory_clear(pe, IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT, "Delay Import", detail_out)) {
+        return false;
+    }
+    detail_out.clear();
+    return true;
 }
 
 static bool packed_range_within(uint32_t offset, uint64_t size, size_t limit) {
@@ -530,7 +607,7 @@ static bool validate_import_table_range(const uint8_t* base,
                                         uint32_t expected_count,
                                         uint32_t image_size,
                                         std::string& detail_out) {
-    constexpr uint32_t kMaxImports = 65536u;
+    (void)image_size;
     if (expected_count == 0u && offset == 0u) {
         return true;
     }
@@ -538,49 +615,69 @@ static bool validate_import_table_range(const uint8_t* base,
         detail_out = "import table missing for nonzero count";
         return false;
     }
-    if (expected_count > kMaxImports) {
-        detail_out = "import table count exceeds verifier cap";
+    if (expected_count > protector::kImportTableMaxRecords) {
+        detail_out = "import table count exceeds payload cap";
         return false;
     }
-    if (!packed_range_within(offset, 8u, limit)) {
+    if (!packed_range_within(offset, protector::kImportTableHeaderSize, limit)) {
         detail_out = "import table header is outside packed data";
         return false;
     }
     uint32_t stored_count = 0;
-    std::memcpy(&stored_count, base + offset, sizeof(stored_count));
+    uint32_t pool_size = 0;
+    uint32_t body_size = 0;
+    uint32_t version = 0;
+    std::memcpy(&stored_count, base + offset + 0u, sizeof(stored_count));
+    std::memcpy(&pool_size, base + offset + 4u, sizeof(pool_size));
+    std::memcpy(&body_size, base + offset + 8u, sizeof(body_size));
+    std::memcpy(&version, base + offset + 12u, sizeof(version));
     if (stored_count != expected_count) {
         detail_out = "import table stored count does not match header";
         return false;
     }
-    if (stored_count > kMaxImports) {
-        detail_out = "import table stored count exceeds verifier cap";
+    if (stored_count > protector::kImportTableMaxRecords) {
+        detail_out = "import table stored count exceeds payload cap";
         return false;
     }
-    const uint64_t pool_field = static_cast<uint64_t>(offset) + 4ull
-        + static_cast<uint64_t>(stored_count) * static_cast<uint64_t>(sizeof(protector::import_hash_entry_t));
-    if (pool_field + 4ull > static_cast<uint64_t>(limit)) {
-        detail_out = "import name-pool size field exceeds packed data";
+    if (version != protector::kImportTableVersion) {
+        detail_out = "import table version mismatch";
         return false;
     }
-    uint32_t pool_size = 0;
-    std::memcpy(&pool_size, base + static_cast<size_t>(pool_field), sizeof(pool_size));
-    const uint64_t bytes = 4ull
-        + static_cast<uint64_t>(stored_count) * static_cast<uint64_t>(sizeof(protector::import_hash_entry_t))
-        + 4ull
-        + static_cast<uint64_t>(pool_size);
-    if (!packed_range_within(offset, bytes, limit)) {
-        detail_out = "import table/name-pool exceeds packed data";
+    const uint64_t entry_bytes =
+        static_cast<uint64_t>(stored_count) * static_cast<uint64_t>(sizeof(protector::import_hash_entry_t));
+    const uint64_t expected_body = entry_bytes + static_cast<uint64_t>(pool_size);
+    if (entry_bytes > 0xFFFFFFFFull) {
+        detail_out = "import table entry array exceeds payload bounds";
         return false;
     }
-    if (image_size != 0u && stored_count != 0u) {
-        const uint8_t* entries = base + offset + 4u;
-        for (uint32_t i = 0; i < stored_count; ++i) {
-            protector::import_hash_entry_t entry{};
-            std::memcpy(&entry, entries + static_cast<size_t>(i) * sizeof(entry), sizeof(entry));
-            if (!packed_range_within(entry.iat_rva, 8u, image_size)) {
-                detail_out = "import table IAT target range exceeds image size";
-                return false;
-            }
+    if (expected_body != static_cast<uint64_t>(body_size)) {
+        detail_out = "import table encrypted body size mismatch";
+        return false;
+    }
+    if (body_size > protector::kImportTableMaxBodySize) {
+        detail_out = "import table encrypted body exceeds payload cap";
+        return false;
+    }
+    if (stored_count != 0u && (pool_size == 0u || body_size == 0u)) {
+        detail_out = "import table has entries but no encrypted name/body payload";
+        return false;
+    }
+    if (!packed_range_within(offset, protector::kImportTableBodyOffset + static_cast<uint64_t>(body_size), limit)) {
+        detail_out = "import table encrypted body exceeds packed data";
+        return false;
+    }
+    if (stored_count != 0u) {
+        if (!protector::bytes_have_nonzero(base + offset + 16u, 16u)) {
+            detail_out = "import table IV is all zero";
+            return false;
+        }
+        if (!protector::bytes_have_nonzero(base + offset + 32u, 32u)) {
+            detail_out = "import table authentication tag is all zero";
+            return false;
+        }
+        if (!protector::bytes_have_nonzero(base + offset + protector::kImportTableBodyOffset, body_size)) {
+            detail_out = "import table ciphertext is all zero";
+            return false;
         }
     }
     return true;
@@ -760,8 +857,52 @@ inline bool validate_existing_packed_candidate(const pe_file::pe_image_t& pe,
     return true;
 }
 
-inline bool detect_already_protected(const pe_file::pe_image_t& pe, std::string& detail_out) {
+enum class existing_protection_state_t {
+    none,
+    valid,
+    invalid_candidate
+};
+
+inline existing_protection_state_t detect_already_protected(const pe_file::pe_image_t& pe, std::string& detail_out) {
     std::string rejected_detail;
+    for (const auto& sec : pe.sections) {
+        const bool plausible_packed_section = protector::section_skip_list::name_equals(sec.name, ".packed");
+        const size_t scan_limit = (std::min<size_t>)(sec.data.size(), sec.virtual_size);
+        if (scan_limit < sizeof(protector::packed_header_t)) continue;
+        for (size_t off = 0; off + sizeof(protector::packed_header_t) <= scan_limit; off += 8) {
+            protector::packed_header_t hdr{};
+            std::memcpy(&hdr, sec.data.data() + off, sizeof(hdr));
+            if (hdr.magic != protector::kPackedMagic) {
+                continue;
+            }
+            if (hdr.version != protector::kPackedVersion &&
+                hdr.version != protector::kPackedVersionLegacy) {
+                char buf[128];
+                std::snprintf(buf, sizeof(buf),
+                              "packed candidate has unsupported version 0x%08X",
+                              static_cast<unsigned>(hdr.version));
+                if (plausible_packed_section && rejected_detail.empty()) {
+                    rejected_detail = buf;
+                }
+                continue;
+            }
+            std::string candidate_detail;
+            if (validate_existing_packed_candidate(pe, sec, off, candidate_detail)) {
+                detail_out = candidate_detail;
+                return existing_protection_state_t::valid;
+            }
+            if (plausible_packed_section && rejected_detail.empty())
+                rejected_detail = candidate_detail;
+        }
+    }
+    if (!rejected_detail.empty()) {
+        detail_out = rejected_detail;
+        return existing_protection_state_t::invalid_candidate;
+    }
+    return existing_protection_state_t::none;
+}
+
+inline bool protected_candidate_import_table_present(const pe_file::pe_image_t& pe, std::string& detail_out) {
     for (const auto& sec : pe.sections) {
         const size_t scan_limit = (std::min<size_t>)(sec.data.size(), sec.virtual_size);
         if (scan_limit < sizeof(protector::packed_header_t)) continue;
@@ -774,16 +915,28 @@ inline bool detect_already_protected(const pe_file::pe_image_t& pe, std::string&
                 continue;
             }
             std::string candidate_detail;
-            if (validate_existing_packed_candidate(pe, sec, off, candidate_detail)) {
-                detail_out = candidate_detail;
-                return true;
+            if (!validate_existing_packed_candidate(pe, sec, off, candidate_detail)) {
+                continue;
             }
-            if (rejected_detail.empty())
-                rejected_detail = candidate_detail;
+            if (hdr.import_count == 0u || hdr.import_table_offset == 0u) {
+                detail_out = "packed header has no encrypted import table";
+                return false;
+            }
+            const size_t packed_payload_size = sec.data.size() - off;
+            std::string import_detail;
+            if (!validate_import_table_range(sec.data.data() + off,
+                                             packed_payload_size,
+                                             hdr.import_table_offset,
+                                             hdr.import_count,
+                                             pe.optional_header.SizeOfImage,
+                                             import_detail)) {
+                detail_out = import_detail;
+                return false;
+            }
+            return true;
         }
     }
-    if (!rejected_detail.empty())
-        detail_out = rejected_detail;
+    detail_out = "no valid packed import table candidate found";
     return false;
 }
 
@@ -1001,17 +1154,8 @@ inline int run(const config_t& cfg) {
     }
 
     if (cfg.target_arc) {
-        std::string input_basename;
-        try {
-            std::filesystem::path p(cfg.input_path);
-            input_basename = p.filename().string();
-        } catch (const std::exception&) {
-            input_basename.clear();
-        }
-        std::string lower = input_basename;
-        for (auto& ch : lower) {
-            if (ch >= 'A' && ch <= 'Z') { ch = static_cast<char>(ch - 'A' + 'a'); }
-        }
+        const std::string input_basename = path_filename_string(cfg.input_path);
+        const std::string lower = ascii_lower_copy(input_basename);
         bool name_ok = (lower == "aida_core.dll");
         bool is_dll_flag = (pe.file_header.Characteristics & IMAGE_FILE_DLL) != 0;
         if (!name_ok || !is_dll_flag) {
@@ -1023,9 +1167,53 @@ inline int run(const config_t& cfg) {
         }
     }
 
+    if (cfg.target_standalone) {
+        const std::string input_basename = path_filename_string(cfg.input_path);
+        const std::string output_basename = path_filename_string(cfg.output_path);
+        const bool input_name_ok = (ascii_lower_copy(input_basename) == "aidastandalone.exe");
+        const bool output_name_ok = (ascii_lower_copy(output_basename) == "aidastandalone.exe");
+        const bool is_dll_flag = (pe.file_header.Characteristics & IMAGE_FILE_DLL) != 0;
+        if (!input_name_ok || !output_name_ok || is_dll_flag) {
+            std::fprintf(stderr,
+                "[!] --target-standalone rejected: input and output must be AiDAStandalone.exe and the image must be an EXE (input='%s', output='%s', is_dll=%d).\n"
+                "    The standalone protection profile forbids visible Import, Bound Import, IAT, and Delay Import metadata.\n",
+                input_basename.c_str(), output_basename.c_str(), is_dll_flag ? 1 : 0);
+            return 2;
+        }
+    }
+
     {
         std::string protect_detail;
-        if (detect_already_protected(pe, protect_detail)) {
+        const existing_protection_state_t protection_state = detect_already_protected(pe, protect_detail);
+        if (protection_state == existing_protection_state_t::invalid_candidate && cfg.target_standalone) {
+            std::string import_detail;
+            (void)visible_import_directories_cleared(pe, import_detail);
+            std::fprintf(stderr,
+                "[!] --target-standalone rejected invalid already-protected candidate: %s%s%s.\n"
+                "    AiDAStandalone.exe candidates with packed markers must be cleanly protected and must not expose Import, Bound Import, IAT, or Delay Import directories.\n",
+                protect_detail.c_str(),
+                import_detail.empty() ? "" : "; ",
+                import_detail.c_str());
+            return 2;
+        }
+        if (protection_state == existing_protection_state_t::valid) {
+            if (cfg.target_standalone) {
+                std::string import_detail;
+                if (!visible_import_directories_cleared(pe, import_detail)) {
+                    std::fprintf(stderr,
+                        "[!] --target-standalone rejected already-protected input: %s.\n"
+                        "    Existing AiDAStandalone.exe candidates must not expose Import, Bound Import, IAT, or Delay Import directories.\n",
+                        import_detail.c_str());
+                    return 2;
+                }
+                if (!protected_candidate_import_table_present(pe, import_detail)) {
+                    std::fprintf(stderr,
+                        "[!] --target-standalone rejected already-protected input: %s.\n"
+                        "    Existing AiDAStandalone.exe candidates must carry a nonzero encrypted import table.\n",
+                        import_detail.c_str());
+                    return 2;
+                }
+            }
             std::fprintf(stdout,
                 "[!] %s is already protected (%s) — skipping to preserve binary integrity.\n"
                 "    Re-protection on top of a protected PE would corrupt section blobs, double-encrypt strings,\n"
@@ -1110,6 +1298,11 @@ inline int run(const config_t& cfg) {
         }
         opt.tamper_response_level = 4u;
     }
+    if (cfg.target_standalone) {
+        opt.encrypt_imports = true;
+        opt.pack_sections = true;
+        opt.preserve_loader_relocations = false;
+    }
 
     if (cfg.verbose) {
         std::fprintf(stdout, "[+] Loaded PE: %s (%llu bytes, %s)\n",
@@ -1119,6 +1312,9 @@ inline int run(const config_t& cfg) {
         if (cfg.target_arc) {
             std::fprintf(stdout, "[+] Target profile: ARC (packed strings/resources, header hardening, section randomization, deep_steal, anti-analysis phases forced; tamper_level=%u; flatten band 7000..7100)\n",
                          cfg.tamper_response_level);
+        }
+        if (cfg.target_standalone) {
+            std::fprintf(stdout, "[+] Target profile: standalone (encrypt_imports, pack_sections, no loader relocation preservation; visible Import/Bound/IAT/Delay directories forbidden)\n");
         }
         std::fprintf(stdout, "[+] Sections: %zu\n", pe.sections.size());
         std::fprintf(stdout, "[+] Transforms enabled:%s%s%s%s%s%s%s%s\n",
@@ -1353,6 +1549,21 @@ inline int run(const config_t& cfg) {
         }
     }
 
+    if (cfg.target_standalone) {
+        if (result.imports.entry_count == 0u) {
+            std::fprintf(stderr,
+                         "[!] --target-standalone invariant failed: encrypted import entry count is zero.\n");
+            return 3;
+        }
+        std::string import_detail;
+        if (!visible_import_directories_cleared(pe, import_detail)) {
+            std::fprintf(stderr,
+                         "[!] --target-standalone invariant failed: %s.\n",
+                         import_detail.c_str());
+            return 3;
+        }
+    }
+
     try {
         pe_file::write(pe, cfg.output_path);
     } catch (const std::bad_alloc&) {
@@ -1377,8 +1588,14 @@ inline int run(const config_t& cfg) {
         std::fprintf(stdout, "[+] Master key material: obfuscated_len=32 zero_bytes=%u fingerprint=0x%016llX\n",
                      key_zeroes,
                      static_cast<unsigned long long>(key_fingerprint));
-        std::fprintf(stdout, "[+] destroy_imports: %u entries\n",
-                     result.imports.entry_count);
+        if (opt.encrypt_imports) {
+            std::string import_detail;
+            const bool import_dirs_cleared = visible_import_directories_cleared(pe, import_detail);
+            std::fprintf(stdout, "[+] encrypt_imports: entries=%u dll_pool=%zu visible_dirs_cleared=%s\n",
+                         result.imports.entry_count,
+                         result.imports.dll_name_pool.size(),
+                         import_dirs_cleared ? "yes" : "no");
+        }
         std::fprintf(stdout, "[+] encrypt_strings: %u strings\n",
                      result.strings.entry_count);
         std::fprintf(stdout, "[+] encrypt_resources: %u RT_RCDATA entries\n",

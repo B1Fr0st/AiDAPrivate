@@ -158,8 +158,11 @@ int main() {
     cfg_default.seed = 0xCAFEF00DDEADBEEFull;
 
     stub::generated_stub_t gs = stub::generate(cfg_default);
-    if (gs.main_stub.empty() || gs.main_stub.size() >= 65536u) {
-        std::fprintf(stderr, "stub main size out of range: %zu\n", gs.main_stub.size());
+    if (gs.main_stub.empty() || gs.main_stub.size() > protector::kReservedMainStubSize) {
+        std::fprintf(stderr,
+                     "stub main size out of range: %zu reserved=%u\n",
+                     gs.main_stub.size(),
+                     protector::kReservedMainStubSize);
         return 1;
     }
 

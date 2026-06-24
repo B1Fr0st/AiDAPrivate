@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <array>
 #include <algorithm>
+#include <stdexcept>
 
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -1030,35 +1031,91 @@ inline std::vector<uint8_t> lz_compress(const uint8_t* data, size_t len) {
     return output;
 }
 
-inline std::vector<uint8_t> lz_decompress(const uint8_t* data, size_t compressed_len, size_t original_len) {
-    std::vector<uint8_t> output(original_len);
+struct lz_decompress_result_t {
+    bool ok = false;
+    uint32_t crc32 = 0;
+    size_t decoded_size = 0;
+    std::vector<uint8_t> output;
+    std::string detail;
+};
+
+inline uint32_t lz_crc32c_update_byte(uint32_t c, uint8_t v) {
+    c ^= static_cast<uint32_t>(v);
+    for (int bit = 0; bit < 8; ++bit) {
+        uint32_t mask = 0u - (c & 1u);
+        c = (c >> 1) ^ (0x82F63B78u & mask);
+    }
+    return c;
+}
+
+inline lz_decompress_result_t lz_decompress_payload_compatible(const uint8_t* data,
+                                                               size_t compressed_len,
+                                                               size_t original_len) {
+    lz_decompress_result_t result{};
+    result.output.assign(original_len, 0u);
+    if ((compressed_len != 0u && data == nullptr)) {
+        result.detail = "null compressed input";
+        return result;
+    }
+    std::array<uint8_t, 4096> window{};
     size_t src = 0;
     size_t dst = 0;
-
-    while (dst < original_len && src < compressed_len) {
+    uint32_t crc_state = 0xFFFFFFFFu;
+    auto emit_byte = [&](uint8_t v) {
+        if (dst < result.output.size()) {
+            result.output[dst] = v;
+        }
+        window[dst & 4095u] = v;
+        crc_state = lz_crc32c_update_byte(crc_state, v);
+        ++dst;
+    };
+    while (src < compressed_len) {
         uint8_t flags = data[src++];
-        for (int bit = 7; bit >= 0 && dst < original_len && src < compressed_len; --bit) {
-            if (flags & (1u << bit)) {
-                if (src + 1 >= compressed_len) {
-                    break;
+        for (int bit = 7; bit >= 0; --bit) {
+            if (src >= compressed_len) {
+                uint32_t unused_mask = (bit >= 7) ? 0xFFu : ((1u << (bit + 1)) - 1u);
+                if ((static_cast<uint32_t>(flags) & unused_mask) != 0u) {
+                    result.detail = "unused flag bits set";
+                    result.decoded_size = dst;
+                    return result;
                 }
-                uint8_t b0 = data[src++];
-                uint8_t b1 = data[src++];
-                size_t match_len = ((b0 >> 4) & 0x0Fu) + lzss_detail::kMinMatch;
-                size_t match_off = (static_cast<size_t>(b0 & 0x0Fu) << 8) | b1;
-                if (match_off == 0 || match_off > dst) {
-                    break;
+                break;
+            }
+            if ((flags & (1u << bit)) != 0u) {
+                if (src + 1u >= compressed_len) {
+                    result.detail = "truncated match token";
+                    result.decoded_size = dst;
+                    return result;
                 }
-                for (size_t k = 0; k < match_len && dst < original_len; ++k) {
-                    output[dst] = output[dst - match_off];
-                    ++dst;
+                const uint8_t b0 = data[src++];
+                const uint8_t b1 = data[src++];
+                const size_t match_len = ((b0 >> 4) & 0x0Fu) + lzss_detail::kMinMatch;
+                const size_t match_off = (static_cast<size_t>(b0 & 0x0Fu) << 8) | b1;
+                if (match_off == 0u || match_off > dst || match_off > 4095u) {
+                    result.detail = "invalid match offset";
+                    result.decoded_size = dst;
+                    return result;
+                }
+                for (size_t k = 0; k < match_len; ++k) {
+                    emit_byte(window[(dst - match_off) & 4095u]);
                 }
             } else {
-                output[dst++] = data[src++];
+                emit_byte(data[src++]);
             }
         }
     }
-    return output;
+    result.decoded_size = dst;
+    if (dst < original_len) {
+        result.detail = "decoded stream shorter than target";
+        return result;
+    }
+    result.crc32 = ~crc_state;
+    result.ok = true;
+    return result;
+}
+
+inline std::vector<uint8_t> lz_decompress(const uint8_t* data, size_t compressed_len, size_t original_len) {
+    return lz_decompress_payload_compatible(data, compressed_len, original_len).output;
 }
 
 namespace siphash_detail {
@@ -1285,7 +1342,7 @@ struct section_descriptor_t {
     uint32_t compressed_size;
     uint32_t encrypted_size;
     uint32_t original_crc32;
-    uint32_t reserved;
+    uint32_t section_index;
     uint8_t  layer1_iv[16];
     uint8_t  layer2_nonce[12];
     uint8_t  layer3_iv[8];
@@ -1299,7 +1356,20 @@ constexpr uint32_t kPackedVersion  = 0x00030000u;
 constexpr uint32_t kPackedVersionLegacy = 0x00020000u;
 
 constexpr uint16_t kImportFlagByOrdinal   = 0x1u;
-constexpr uint16_t kImportFlagDelayLoaded = 0x2u;
+constexpr uint32_t kImportTableVersion    = 0xA1DA3001u;
+constexpr uint32_t kImportTableHeaderSize = 64u;
+constexpr uint32_t kImportTableBodyOffset = kImportTableHeaderSize;
+constexpr uint32_t kImportTableMaxRecords = 65536u;
+constexpr uint32_t kImportTableMaxBodySize = 0x01000000u;
+
+inline bool bytes_have_nonzero(const uint8_t* data, size_t size) {
+    for (size_t i = 0; i < size; ++i) {
+        if (data[i] != 0u) {
+            return true;
+        }
+    }
+    return false;
+}
 
 struct import_hash_entry_t {
     uint64_t dll_hash;
@@ -1406,8 +1476,8 @@ struct transform_result_t {
     resource_fixup_table_t resources;
 };
 
-constexpr uint32_t kReservedMainStubSize = 0x10000u;
-constexpr uint32_t kReservedTlsStubSize = 0x10000u;
+constexpr uint32_t kReservedMainStubSize = 0x18000u;
+constexpr uint32_t kReservedTlsStubSize = 0x18000u;
 
 struct protect_options_t {
     uint64_t seed = 0;
@@ -1485,10 +1555,22 @@ struct section_skip_list {
     }
 };
 
-struct import_build_result_t {};
-
 inline uint64_t derive_import_key(const uint8_t master[32]) {
     return siphash_2_4(master, 32, 0x494D504F5254434Eull, 0x494D504F5254434Eull);
+}
+
+inline void derive_import_table_key(const uint8_t master[32], uint8_t out[32]) {
+    static const uint8_t info[] = {
+        'a','i','d','a','-','i','m','p','o','r','t','-','t','a','b','l','e','-','e','n','c','-','v','3'
+    };
+    sha256_detail::hkdf_sha256(master, 32, nullptr, 0, info, sizeof(info), out, 32);
+}
+
+inline void derive_import_table_mac_key(const uint8_t master[32], uint8_t out[32]) {
+    static const uint8_t info[] = {
+        'a','i','d','a','-','i','m','p','o','r','t','-','t','a','b','l','e','-','m','a','c','-','v','3'
+    };
+    sha256_detail::hkdf_sha256(master, 32, nullptr, 0, info, sizeof(info), out, 32);
 }
 
 inline uint64_t derive_string_key(const uint8_t master[32]) {
@@ -1497,6 +1579,23 @@ inline uint64_t derive_string_key(const uint8_t master[32]) {
 
 inline uint64_t derive_resource_key(const uint8_t master[32]) {
     return siphash_2_4(master, 32, 0x5253525F4B455931ull, 0x5253525F4B455931ull);
+}
+
+inline void clear_visible_import_metadata(pe_file::pe_image_t& pe) {
+    const uint32_t dirs[] = {
+        IMAGE_DIRECTORY_ENTRY_IMPORT,
+        IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT,
+        IMAGE_DIRECTORY_ENTRY_IAT,
+        IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT
+    };
+    for (uint32_t d : dirs) {
+        pe.data_directories[d].rva = 0;
+        pe.data_directories[d].size = 0;
+        pe.optional_header.DataDirectory[d].VirtualAddress = 0;
+        pe.optional_header.DataDirectory[d].Size = 0;
+    }
+    pe.imports.clear();
+    pe.delay_imports.clear();
 }
 
 namespace phase2_detail {
@@ -1520,12 +1619,72 @@ inline import_hash_table_t destroy_imports(pe_file::pe_image_t& pe, const uint8_
     std::vector<uint32_t> dll_offsets;
     std::vector<uint8_t> pool;
 
+    auto contract_error = [](const char* what) {
+        throw std::runtime_error(std::string("encrypted import table contract violation: ") + what);
+    };
+
+    auto valid_pool_char = [](char c) -> bool {
+        return (c >= 'A' && c <= 'Z') ||
+               (c >= '0' && c <= '9') ||
+               c == '.' || c == '-' || c == '_';
+    };
+
+    auto scrub_c_string = [&](uint32_t rva) {
+        if (uint8_t* p = pe.rva_ptr(rva)) {
+            while (*p != 0u) {
+                *p = 0u;
+                ++p;
+            }
+        }
+    };
+
+    auto scrub_hint_name = [&](uint32_t hint_rva) {
+        if (uint8_t* hp = pe.rva_ptr(hint_rva)) {
+            hp[0] = 0;
+            hp[1] = 0;
+            uint8_t* q = hp + 2;
+            while (*q != 0u) {
+                *q = 0u;
+                ++q;
+            }
+        }
+    };
+
+    auto scrub_thunk_table = [&](uint32_t rva) {
+        if (rva == 0u) {
+            return;
+        }
+        for (uint32_t idx = 0; ; ++idx) {
+            uint8_t* tp = pe.rva_ptr(rva + idx * 8u);
+            if (!tp) {
+                contract_error("import thunk table terminator is outside the image");
+            }
+            uint64_t tv = 0;
+            std::memcpy(&tv, tp, 8);
+            std::memset(tp, 0, 8);
+            if (tv == 0ull) {
+                break;
+            }
+        }
+    };
+
     auto ensure_dll = [&](const std::string& dll) -> uint32_t {
         std::string u = phase2_detail::to_upper(dll);
+        if (u.empty()) {
+            contract_error("import descriptor has an empty DLL name");
+        }
+        for (char c : u) {
+            if (!valid_pool_char(c)) {
+                contract_error("import DLL name contains a character rejected by the payload");
+            }
+        }
         for (size_t i = 0; i < dll_upper.size(); ++i) {
             if (dll_upper[i] == u) {
                 return dll_offsets[i];
             }
+        }
+        if (static_cast<uint64_t>(pool.size()) + static_cast<uint64_t>(u.size()) + 1ull > 0xFFFFFFFFull) {
+            contract_error("import DLL pool exceeds 32-bit payload bounds");
         }
         uint32_t off = static_cast<uint32_t>(pool.size());
         for (char c : u) {
@@ -1547,7 +1706,7 @@ inline import_hash_table_t destroy_imports(pe_file::pe_image_t& pe, const uint8_
         for (;;) {
             uint8_t* dp = pe.rva_ptr(desc_rva);
             if (!dp) {
-                break;
+                contract_error("import descriptor table terminator is outside the image");
             }
             IMAGE_IMPORT_DESCRIPTOR desc{};
             std::memcpy(&desc, dp, sizeof(desc));
@@ -1555,19 +1714,27 @@ inline import_hash_table_t destroy_imports(pe_file::pe_image_t& pe, const uint8_
                 std::memset(dp, 0, sizeof(desc));
                 break;
             }
+            if (desc.Name == 0u || desc.FirstThunk == 0u) {
+                contract_error("import descriptor is missing DLL name or IAT RVA");
+            }
             std::string dllname;
             if (uint8_t* np = pe.rva_ptr(desc.Name)) {
                 dllname = reinterpret_cast<const char*>(np);
+            } else {
+                contract_error("import descriptor DLL name is outside the image");
+            }
+            uint64_t dh = hash_dll(dllname);
+            if (dh == 0ull) {
+                contract_error("import descriptor DLL hash is zero");
             }
             (void)ensure_dll(dllname);
-            uint64_t dh = hash_dll(dllname);
             uint32_t ilt = (desc.OriginalFirstThunk != 0u) ? desc.OriginalFirstThunk : desc.FirstThunk;
             uint32_t iat = desc.FirstThunk;
 
             for (uint32_t idx = 0; ; ++idx) {
                 uint8_t* tp = pe.rva_ptr(ilt + idx * 8u);
                 if (!tp) {
-                    break;
+                    contract_error("import thunk table terminator is outside the image");
                 }
                 uint64_t tv = 0;
                 std::memcpy(&tv, tp, 8);
@@ -1594,26 +1761,31 @@ inline import_hash_table_t destroy_imports(pe_file::pe_image_t& pe, const uint8_
                         ent.func_hash = flen > 0
                             ? fnv1a64(reinterpret_cast<const uint8_t*>(fn), flen)
                             : 0ULL;
-                        hp[0] = 0;
-                        hp[1] = 0;
-                        uint8_t* q = hp + 2;
-                        while (*q != 0u) {
-                            *q = 0u;
-                            ++q;
+                        if (ent.func_hash == 0ull) {
+                            contract_error("import thunk has an empty function name");
                         }
+                        scrub_hint_name(hint_rva);
+                    } else {
+                        contract_error("import thunk hint/name is outside the image");
                     }
+                }
+                if (ent.iat_rva == 0u || (ent.iat_rva & 7u) != 0u || ent.dll_hash == 0ull ||
+                    ((ent.flags & kImportFlagByOrdinal) != 0u ? ent.ordinal == 0u : ent.func_hash == 0ull)) {
+                    contract_error("import entry violates payload import-entry invariants");
                 }
                 entries.push_back(ent);
                 std::memset(tp, 0, 8);
                 if (uint8_t* itp = pe.rva_ptr(iat + idx * 8u); itp != nullptr && iat != ilt) {
                     std::memset(itp, 0, 8);
+                } else if (iat != ilt) {
+                    contract_error("import IAT entry is outside the image");
                 }
             }
             if (iat != ilt) {
                 for (uint32_t idx = 0; ; ++idx) {
                     uint8_t* tp = pe.rva_ptr(iat + idx * 8u);
                     if (!tp) {
-                        break;
+                        contract_error("import IAT terminator is outside the image");
                     }
                     uint64_t tv = 0;
                     std::memcpy(&tv, tp, 8);
@@ -1626,7 +1798,7 @@ inline import_hash_table_t destroy_imports(pe_file::pe_image_t& pe, const uint8_
                 for (uint32_t idx = 0; ; ++idx) {
                     uint8_t* tp = pe.rva_ptr(iat + idx * 8u);
                     if (!tp) {
-                        break;
+                        contract_error("import IAT terminator is outside the image");
                     }
                     uint64_t tv = 0;
                     std::memcpy(&tv, tp, 8);
@@ -1641,6 +1813,8 @@ inline import_hash_table_t destroy_imports(pe_file::pe_image_t& pe, const uint8_
                     *np = 0u;
                     ++np;
                 }
+            } else {
+                contract_error("import DLL name disappeared before scrub");
             }
             std::memset(dp, 0, sizeof(desc));
             desc_rva += sizeof(IMAGE_IMPORT_DESCRIPTOR);
@@ -1650,28 +1824,51 @@ inline import_hash_table_t destroy_imports(pe_file::pe_image_t& pe, const uint8_
     if (pe.data_directories[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT].rva != 0u) {
         uint32_t desc_rva = pe.data_directories[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT].rva;
         for (;;) {
-            const uint8_t* dp = pe.rva_ptr(desc_rva);
+            uint8_t* dp = pe.rva_ptr(desc_rva);
             if (!dp) {
-                break;
+                contract_error("delay import descriptor table terminator is outside the image");
             }
-            uint32_t name_rva = 0, iat = 0, int_rva = 0;
+            uint32_t attrs = 0, name_rva = 0, module_handle = 0, iat = 0, int_rva = 0, bound_iat = 0, unload_iat = 0, timestamp = 0;
+            std::memcpy(&attrs, dp + 0, 4);
             std::memcpy(&name_rva, dp + 4, 4);
+            std::memcpy(&module_handle, dp + 8, 4);
             std::memcpy(&iat, dp + 12, 4);
             std::memcpy(&int_rva, dp + 16, 4);
+            std::memcpy(&bound_iat, dp + 20, 4);
+            std::memcpy(&unload_iat, dp + 24, 4);
+            std::memcpy(&timestamp, dp + 28, 4);
             if (name_rva == 0u && iat == 0u) {
+                if ((attrs | module_handle | int_rva | bound_iat | unload_iat | timestamp) != 0u) {
+                    contract_error("delay import descriptor terminator is not fully zero");
+                }
+                std::memset(dp, 0, 32u);
                 break;
             }
+            if (name_rva == 0u || iat == 0u) {
+                contract_error("delay import descriptor is missing DLL name or IAT RVA");
+            }
+            if ((attrs & 1u) == 0u) {
+                contract_error("delay import descriptor does not use RVA-form fields");
+            }
             std::string dllname;
-            if (const uint8_t* np = pe.rva_ptr(name_rva)) {
+            if (uint8_t* np = pe.rva_ptr(name_rva)) {
                 dllname = reinterpret_cast<const char*>(np);
+            } else {
+                contract_error("delay import DLL name is outside the image");
+            }
+            uint64_t dh = hash_dll(dllname);
+            if (dh == 0ull) {
+                contract_error("delay import DLL hash is zero");
             }
             (void)ensure_dll(dllname);
-            uint64_t dh = hash_dll(dllname);
             uint32_t walk_rva = (int_rva != 0u) ? int_rva : iat;
+            if (walk_rva == 0u) {
+                contract_error("delay import thunk table is missing");
+            }
             for (uint32_t idx = 0; ; ++idx) {
-                const uint8_t* tp = pe.rva_ptr(walk_rva + idx * 8u);
+                uint8_t* tp = pe.rva_ptr(walk_rva + idx * 8u);
                 if (!tp) {
-                    break;
+                    contract_error("delay import thunk table terminator is outside the image");
                 }
                 uint64_t tv = 0;
                 std::memcpy(&tv, tp, 8);
@@ -1681,7 +1878,7 @@ inline import_hash_table_t destroy_imports(pe_file::pe_image_t& pe, const uint8_
                 import_hash_entry_t ent{};
                 ent.dll_hash = dh;
                 ent.iat_rva = iat + idx * 8u;
-                ent.flags = kImportFlagDelayLoaded;
+                ent.flags = 0u;
                 if (tv & (1ull << 63)) {
                     ent.ordinal = static_cast<uint16_t>(tv & 0xFFFFu);
                     uint16_t ord_le = ent.ordinal;
@@ -1689,7 +1886,7 @@ inline import_hash_table_t destroy_imports(pe_file::pe_image_t& pe, const uint8_
                     ent.flags |= kImportFlagByOrdinal;
                 } else {
                     uint32_t hint_rva = static_cast<uint32_t>(tv & 0x7FFFFFFFull);
-                    if (const uint8_t* hp = pe.rva_ptr(hint_rva)) {
+                    if (uint8_t* hp = pe.rva_ptr(hint_rva)) {
                         uint16_t hint = 0;
                         std::memcpy(&hint, hp, 2);
                         ent.ordinal = hint;
@@ -1698,23 +1895,36 @@ inline import_hash_table_t destroy_imports(pe_file::pe_image_t& pe, const uint8_
                         ent.func_hash = flen > 0
                             ? fnv1a64(reinterpret_cast<const uint8_t*>(fn), flen)
                             : 0ULL;
+                        if (ent.func_hash == 0ull) {
+                            contract_error("delay import thunk has an empty function name");
+                        }
+                        scrub_hint_name(hint_rva);
+                    } else {
+                        contract_error("delay import thunk hint/name is outside the image");
                     }
+                }
+                if (ent.iat_rva == 0u || (ent.iat_rva & 7u) != 0u || ent.dll_hash == 0ull ||
+                    ((ent.flags & kImportFlagByOrdinal) != 0u ? ent.ordinal == 0u : ent.func_hash == 0ull)) {
+                    contract_error("delay import entry violates payload import-entry invariants");
                 }
                 entries.push_back(ent);
             }
+            scrub_thunk_table(walk_rva);
+            scrub_thunk_table(iat);
+            scrub_thunk_table(bound_iat);
+            scrub_thunk_table(unload_iat);
+            if (module_handle != 0u) {
+                if (uint8_t* hp = pe.rva_ptr(module_handle)) {
+                    std::memset(hp, 0, sizeof(uintptr_t));
+                }
+            }
+            scrub_c_string(name_rva);
+            std::memset(dp, 0, 32u);
             desc_rva += 32u;
         }
     }
 
     uint32_t pool_crc = pool.empty() ? 0u : crc32c(pool.data(), pool.size());
-
-    uint64_t key64 = derive_import_key(master);
-    uint8_t kb[8];
-    std::memcpy(kb, &key64, 8);
-    std::vector<uint8_t> scrambled(pool.size());
-    for (size_t i = 0; i < pool.size(); ++i) {
-        scrambled[i] = static_cast<uint8_t>(pool[i] ^ kb[i & 7u]);
-    }
 
     std::sort(entries.begin(), entries.end(),
               [](const import_hash_entry_t& a, const import_hash_entry_t& b) {
@@ -1724,40 +1934,102 @@ inline import_hash_table_t destroy_imports(pe_file::pe_image_t& pe, const uint8_
         return a.func_hash < b.func_hash;
     });
 
+    if (entries.size() > kImportTableMaxRecords) {
+        contract_error("import count exceeds payload cap");
+    }
+    if (pool.size() > 0xFFFFFFFFull) {
+        contract_error("import DLL pool exceeds 32-bit payload bounds");
+    }
     uint32_t count = static_cast<uint32_t>(entries.size());
-    uint32_t pool_size = static_cast<uint32_t>(scrambled.size());
-    uint32_t total = 4u + count * 24u + 4u + pool_size;
+    uint32_t pool_size = static_cast<uint32_t>(pool.size());
+    uint64_t entry_bytes64 = static_cast<uint64_t>(count) * static_cast<uint64_t>(sizeof(import_hash_entry_t));
+    if (entry_bytes64 > 0xFFFFFFFFull) {
+        contract_error("import entry array exceeds 32-bit payload bounds");
+    }
+    uint64_t body_size64 = entry_bytes64 + static_cast<uint64_t>(pool_size);
+    if (count != 0u && (pool_size == 0u || body_size64 == 0u)) {
+        contract_error("import entries require a nonzero encrypted name/body payload");
+    }
+    if (body_size64 > static_cast<uint64_t>(kImportTableMaxBodySize) || body_size64 > 0xFFFFFFFFull) {
+        contract_error("import encrypted body exceeds payload cap");
+    }
+    uint32_t entry_bytes = static_cast<uint32_t>(entry_bytes64);
+    uint32_t body_size = static_cast<uint32_t>(body_size64);
+    uint32_t total = kImportTableHeaderSize + body_size;
+
+    std::vector<uint8_t> body(body_size, 0);
+    if (count > 0) {
+        std::memcpy(body.data(), entries.data(), entry_bytes);
+    }
+    if (pool_size > 0) {
+        std::memcpy(body.data() + entry_bytes, pool.data(), pool_size);
+    }
 
     std::vector<uint8_t> ser(total, 0);
-    uint32_t cursor = 0;
-    std::memcpy(ser.data() + cursor, &count, 4);
-    cursor += 4u;
-    if (count > 0) {
-        std::memcpy(ser.data() + cursor, entries.data(), count * 24u);
-        cursor += count * 24u;
+    std::memcpy(ser.data() + 0u, &count, 4);
+    std::memcpy(ser.data() + 4u, &pool_size, 4);
+    std::memcpy(ser.data() + 8u, &body_size, 4);
+    uint32_t version = kImportTableVersion;
+    std::memcpy(ser.data() + 12u, &version, 4);
+    uint8_t iv[16] = {};
+    if (BCryptGenRandom(nullptr, iv, sizeof(iv), BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
+        uint8_t iv_seed[40] = {};
+        std::memcpy(iv_seed, master, 32);
+        std::memcpy(iv_seed + 32, &count, 4);
+        std::memcpy(iv_seed + 36, &pool_crc, 4);
+        uint8_t iv_hash[32];
+        sha256_detail::sha256(iv_seed, sizeof(iv_seed), iv_hash);
+        std::memcpy(iv, iv_hash, sizeof(iv));
+        SecureZeroMemory(iv_hash, sizeof(iv_hash));
+        SecureZeroMemory(iv_seed, sizeof(iv_seed));
     }
-    std::memcpy(ser.data() + cursor, &pool_size, 4);
-    cursor += 4u;
-    if (pool_size > 0) {
-        std::memcpy(ser.data() + cursor, scrambled.data(), pool_size);
+    if (!bytes_have_nonzero(iv, sizeof(iv))) {
+        contract_error("import table IV is all zero");
     }
+    std::memcpy(ser.data() + 16u, iv, sizeof(iv));
+    if (body_size > 0u) {
+        uint8_t enc_key[32];
+        uint8_t mac_key[32];
+        derive_import_table_key(master, enc_key);
+        derive_import_table_mac_key(master, mac_key);
+        std::memcpy(ser.data() + kImportTableBodyOffset, body.data(), body.size());
+        aes_detail::aes256_ctr(enc_key, iv,
+                               body.data(),
+                               ser.data() + kImportTableBodyOffset,
+                               body.size());
+        std::vector<uint8_t> mac_input;
+        mac_input.reserve(32u + body.size());
+        mac_input.insert(mac_input.end(), ser.begin(), ser.begin() + 32u);
+        mac_input.insert(mac_input.end(),
+                         ser.begin() + kImportTableBodyOffset,
+                         ser.end());
+        uint8_t mac_digest[32];
+        sha256_detail::sha256(mac_input.data(), mac_input.size(), mac_digest);
+        uint8_t tag[32];
+        sha256_detail::hmac_sha256(mac_key, 32, mac_digest, sizeof(mac_digest), tag);
+        if (!bytes_have_nonzero(ser.data() + kImportTableBodyOffset, body_size)) {
+            contract_error("import table ciphertext is all zero");
+        }
+        if (!bytes_have_nonzero(tag, sizeof(tag))) {
+            contract_error("import table authentication tag is all zero");
+        }
+        std::memcpy(ser.data() + 32u, tag, sizeof(tag));
+        SecureZeroMemory(tag, sizeof(tag));
+        SecureZeroMemory(mac_digest, sizeof(mac_digest));
+        SecureZeroMemory(enc_key, sizeof(enc_key));
+        SecureZeroMemory(mac_key, sizeof(mac_key));
+        SecureZeroMemory(mac_input.data(), mac_input.size());
+    }
+    SecureZeroMemory(body.data(), body.size());
 
     out.present = (count > 0) || (pool_size > 0);
     out.entry_count = count;
     out.dll_pool_crc = pool_crc;
     out.entries = std::move(entries);
-    out.dll_name_pool = std::move(scrambled);
+    out.dll_name_pool = std::move(pool);
     out.serialized = std::move(ser);
 
-    pe.data_directories[IMAGE_DIRECTORY_ENTRY_IMPORT].rva = 0;
-    pe.data_directories[IMAGE_DIRECTORY_ENTRY_IMPORT].size = 0;
-    pe.optional_header.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress = 0;
-    pe.optional_header.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size = 0;
-    pe.data_directories[IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT].rva = 0;
-    pe.data_directories[IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT].size = 0;
-    pe.optional_header.DataDirectory[IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT].VirtualAddress = 0;
-    pe.optional_header.DataDirectory[IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT].Size = 0;
-    pe.imports.clear();
+    clear_visible_import_metadata(pe);
 
     return out;
 }
@@ -2351,11 +2623,25 @@ inline std::vector<packed_section_blob_t> pack_sections(pe_file::pe_image_t& pe,
             }
         }
 
-        uint32_t plain_crc = crc32c(sec.data.data(), sec.data.size());
+        if (sec.virtual_size == 0u) {
+            continue;
+        }
+        std::vector<uint8_t> plain(sec.virtual_size, 0u);
+        const size_t copy_size = (std::min)(plain.size(), sec.data.size());
+        if (copy_size != 0u) {
+            std::memcpy(plain.data(), sec.data.data(), copy_size);
+        }
 
-        std::vector<uint8_t> compressed = lz_compress(sec.data.data(), sec.data.size());
+        uint32_t plain_crc = crc32c(plain.data(), plain.size());
+
+        std::vector<uint8_t> compressed = lz_compress(plain.data(), plain.size());
         if (compressed.empty()) {
             continue;
+        }
+        lz_decompress_result_t payload_check =
+            lz_decompress_payload_compatible(compressed.data(), compressed.size(), plain.size());
+        if (!payload_check.ok || payload_check.decoded_size != plain.size() || payload_check.crc32 != plain_crc) {
+            throw std::runtime_error("packed section stream violates payload decompressor contract");
         }
 
         packed_section_blob_t pb{};
@@ -2515,7 +2801,7 @@ inline packed_section_layout_t build_packed_section(pe_file::pe_image_t& pe,
         d.compressed_size = blobs[i].compressed_size;
         d.encrypted_size = blobs[i].encrypted_size;
         d.original_crc32 = blobs[i].original_crc32;
-        d.reserved = blobs[i].section_index;
+        d.section_index = blobs[i].section_index;
         std::memcpy(d.layer1_iv, blobs[i].layer1_iv, 16);
         std::memcpy(d.layer2_nonce, blobs[i].layer2_nonce, 12);
         std::memcpy(d.layer3_iv, blobs[i].layer3_iv, 8);
@@ -3970,14 +4256,7 @@ inline transform_result_t protect_pe(pe_file::pe_image_t& pe, const protect_opti
             pe.optional_header.DllCharacteristics &= static_cast<uint16_t>(~0x4160u);
         }
         if (opt.encrypt_imports) {
-            pe.data_directories[1].rva = 0;
-            pe.data_directories[1].size = 0;
-            pe.optional_header.DataDirectory[1].VirtualAddress = 0;
-            pe.optional_header.DataDirectory[1].Size = 0;
-            pe.data_directories[12].rva = 0;
-            pe.data_directories[12].size = 0;
-            pe.optional_header.DataDirectory[12].VirtualAddress = 0;
-            pe.optional_header.DataDirectory[12].Size = 0;
+            clear_visible_import_metadata(pe);
         }
         pe.data_directories[10].rva = 0;
         pe.data_directories[10].size = 0;
@@ -3994,6 +4273,10 @@ inline transform_result_t protect_pe(pe_file::pe_image_t& pe, const protect_opti
             pe.optional_header.DataDirectory[5].Size = 0;
             pe.file_header.Characteristics |= 0x0001u;
         }
+    }
+
+    if (opt.encrypt_imports) {
+        clear_visible_import_metadata(pe);
     }
 
     result.imports = std::move(imports);

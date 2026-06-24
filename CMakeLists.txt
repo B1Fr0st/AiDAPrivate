@@ -680,6 +680,7 @@ set(Z3_INCLUDE_DIRS "${Z3_INSTALL_DIR}/include" CACHE PATH "Z3 include directory
 set(Z3_LIBRARIES "${Z3_INSTALL_DIR}/bin/libz3.lib" CACHE FILEPATH "Z3 library" FORCE)
 set(Z3_FOUND TRUE CACHE BOOL "" FORCE)
 set(AIDA_Z3_RUNTIME_DLL_NAMES
+    libz3.dll
     msvcp140.dll
     msvcp140_1.dll
     msvcp140_2.dll
@@ -1901,7 +1902,7 @@ if(WIN32)
             COMPILE_PDB_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_BINARY_DIR}/RelWithDebInfo"
         )
 
-        option(AIDA_STANDALONE_STAGE_APPLOCAL_RUNTIME_DLLS "Stage app-local runtime DLLs beside AiDAStandalone.exe" OFF)
+        option(AIDA_STANDALONE_STAGE_APPLOCAL_RUNTIME_DLLS "Stage app-local runtime DLLs beside AiDAStandalone.exe" ON)
         if(AIDA_STANDALONE_STAGE_APPLOCAL_RUNTIME_DLLS)
             aida_collect_windows_runtime_dlls(_aida_standalone_runtime_candidates)
             foreach(_aida_z3_runtime_name IN LISTS AIDA_Z3_RUNTIME_DLL_NAMES)
@@ -3048,9 +3049,9 @@ if(BUILD_PROTECTOR)
     add_custom_command(TARGET AiDAProtectorDiag POST_BUILD
         COMMAND ${CMAKE_COMMAND}
             "-DRETRY_LABEL=aida_protector_diag.exe-protect"
-            "-DRETRY_CMD=$<TARGET_FILE:AiDAProtector>;--input;$<TARGET_FILE:AiDAProtectorDiag>;--output;$<TARGET_FILE:AiDAProtectorDiag>;--all;--no-encrypt-imports;--tamper-level;3;--jit;--verbose"
+            "-DRETRY_CMD=$<TARGET_FILE:AiDAProtector>;--input;$<TARGET_FILE:AiDAProtectorDiag>;--output;$<TARGET_FILE:AiDAProtectorDiag>;--all;--tamper-level;3;--jit;--verbose"
             -P "${CMAKE_SOURCE_DIR}/cmake/run_with_retry.cmake"
-        COMMENT "Protecting aida_protector_diag.exe with the AiDAStandalone protector profile..."
+        COMMENT "Protecting aida_protector_diag.exe with the diagnostic protector profile..."
         VERBATIM
     )
 
@@ -3131,26 +3132,37 @@ if(BUILD_PROTECTOR)
             )
             add_dependencies(AiDAStandalone aida_share_fingerprint_baker)
         endif()
-        add_custom_command(TARGET AiDAStandalone POST_BUILD
-            COMMAND ${CMAKE_COMMAND}
-                "-DRETRY_LABEL=AiDAStandalone.exe-protect"
-                "-DRETRY_CMD=$<TARGET_FILE:AiDAProtector>;--input;$<TARGET_FILE:AiDAStandalone>;--output;$<TARGET_FILE:AiDAStandalone>;--all;--no-encrypt-imports;--tamper-level;3;--jit;--verbose"
-                -P "${CMAKE_SOURCE_DIR}/cmake/run_with_retry.cmake"
-            COMMENT "Protecting AiDAStandalone.exe (with AV/indexer retry)..."
-            VERBATIM
-        )
         if(TARGET aida_pdb_scrubber)
             add_custom_command(TARGET AiDAStandalone POST_BUILD
                 COMMAND ${CMAKE_COMMAND}
-                    "-DRETRY_LABEL=AiDAStandalone.exe-scrub"
+                    "-DRETRY_LABEL=AiDAStandalone.exe-pre-protect-scrub"
                     "-DRETRY_CMD=$<TARGET_FILE:aida_pdb_scrubber>;$<TARGET_FILE:AiDAStandalone>"
                     -P "${CMAKE_SOURCE_DIR}/cmake/run_with_retry.cmake"
-                COMMENT "Scrubbing Rich header and PDB paths from AiDAStandalone.exe..."
+                COMMENT "Scrubbing Rich header and PDB paths from AiDAStandalone.exe before protection..."
                 VERBATIM
             )
             add_dependencies(AiDAStandalone aida_pdb_scrubber)
         endif()
+        add_custom_command(TARGET AiDAStandalone POST_BUILD
+            COMMAND ${CMAKE_COMMAND}
+                "-DRETRY_LABEL=AiDAStandalone.exe-protect"
+                "-DRETRY_CMD=$<TARGET_FILE:AiDAProtector>;--input;$<TARGET_FILE:AiDAStandalone>;--output;$<TARGET_FILE:AiDAStandalone>;--all;--target-standalone;--tamper-level;3;--jit;--verbose"
+            -P "${CMAKE_SOURCE_DIR}/cmake/run_with_retry.cmake"
+            COMMENT "Protecting AiDAStandalone.exe (with AV/indexer retry)..."
+            VERBATIM
+        )
         add_dependencies(AiDAStandalone AiDAProtector)
+        if(TARGET AiDAProtectorVerify)
+            add_custom_target(AiDAStandaloneNoIATVerify ALL
+                COMMAND ${CMAKE_COMMAND}
+                    "-DRETRY_LABEL=AiDAStandalone.exe-standalone-no-imports-verify"
+                    "-DRETRY_CMD=$<TARGET_FILE:AiDAProtectorVerify>;--profile;standalone-no-imports;$<TARGET_FILE:AiDAStandalone>"
+                    -P "${CMAKE_SOURCE_DIR}/cmake/run_with_retry.cmake"
+                DEPENDS AiDAStandalone AiDAProtectorVerify
+                COMMENT "Verifying AiDAStandalone.exe standalone no-imports profile..."
+                VERBATIM
+            )
+        endif()
     endif()
 
     if(TARGET AiDA_ARC)

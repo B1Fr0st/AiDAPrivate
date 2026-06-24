@@ -918,6 +918,26 @@ bool voyager::device_t::send_heartbeat() noexcept {
         return true;
 
     if (effective_error == ERROR_INVALID_FUNCTION && had_dynamic_seed) {
+        sync_dynamic_security_state();
+        const DWORD current_seeded_ioctl = make_ioctl_snapshot(8);
+        if (current_seeded_ioctl != ioctl_code) {
+            log_security_snapshot("send_heartbeat_seed_rotated_retry_detected", ioctl_code, current_seeded_ioctl, effective_error);
+            DWORD rotated_error = ERROR_SUCCESS;
+            DWORD rotated_ioctl_code = 0;
+            if (send_once("send_heartbeat_seed_rotated_retry_pre",
+                          "send_heartbeat_seed_rotated_retry_ok",
+                          "send_heartbeat_seed_rotated_retry_failed",
+                          rotated_error,
+                          rotated_ioctl_code)) {
+                return true;
+            }
+            effective_error = rotated_error;
+            ioctl_code = rotated_ioctl_code;
+            if (effective_error != ERROR_INVALID_FUNCTION) {
+                SetLastError(effective_error);
+                return false;
+            }
+        }
         if (g_server_token_relay_inflight.load(std::memory_order_acquire) != 0) {
             log_security_snapshot("send_heartbeat_seed_desync_deferred_relay_inflight", ioctl_code, ioctl_code, effective_error);
             SetLastError(effective_error);
@@ -2627,11 +2647,11 @@ bool voyager::device_t::send_request(DWORD control_code, void* input, DWORD inpu
     bool dynamic_offset_valid = decode_ioctl_offset_snapshot(control_code, dynamic_offset);
 
     sync_dynamic_security_state();
-    const std::uint32_t base_after_sync = compute_ioctl_base_snapshot();
-    const std::uint32_t key_hash_after_sync = hash_build_key(compute_dynamic_key_snapshot());
-    const std::uint32_t ioctl_seed_hash_after_sync = server_ioctl_seed_ != 0 ? hash_build_key(server_ioctl_seed_) : 0;
-    const std::uint32_t global_server_seed_after_sync = dynamic_key::g_server_seed != 0 ? 1u : 0u;
-    const std::uint32_t global_ioctl_seed_after_sync = ioctl_codes::g_server_ioctl_seed != 0 ? 1u : 0u;
+    std::uint32_t base_after_sync = compute_ioctl_base_snapshot();
+    std::uint32_t key_hash_after_sync = hash_build_key(compute_dynamic_key_snapshot());
+    std::uint32_t ioctl_seed_hash_after_sync = server_ioctl_seed_ != 0 ? hash_build_key(server_ioctl_seed_) : 0;
+    std::uint32_t global_server_seed_after_sync = dynamic_key::g_server_seed != 0 ? 1u : 0u;
+    std::uint32_t global_ioctl_seed_after_sync = ioctl_codes::g_server_ioctl_seed != 0 ? 1u : 0u;
 
     if (dynamic_offset_valid) {
         effective_control_code = make_ioctl_snapshot(dynamic_offset);
@@ -2640,11 +2660,11 @@ bool voyager::device_t::send_request(DWORD control_code, void* input, DWORD inpu
     const bool hvdt_request = (dynamic_offset_valid && dynamic_offset == k_hvdt_offset) || hvdt_shape;
     const bool startup_request = dynamic_offset_valid && startup_ioctl_offset(dynamic_offset);
     const char* startup_name = dynamic_offset_valid ? startup_ioctl_name(dynamic_offset) : "UNKNOWN";
-    const DWORD hvdt_expected_code = make_ioctl_snapshot(k_hvdt_offset);
+    DWORD hvdt_expected_code = make_ioctl_snapshot(k_hvdt_offset);
     const std::uint64_t hvdt_first8_pre = read_first_u64_noexcept(input, input_size);
     const std::uint64_t hvdt_flags_pre = hvdt_shape ? hvdt_first8_pre : 0;
-    const DWORD remote_rc_expected = make_ioctl_snapshot(4);
-    const DWORD remote_cr_expected = make_ioctl_snapshot(5);
+    DWORD remote_rc_expected = make_ioctl_snapshot(4);
+    DWORD remote_cr_expected = make_ioctl_snapshot(5);
     const bool remote_rc_request = input && input_size >= sizeof(detail::remote_call_request) &&
         ((dynamic_offset_valid && dynamic_offset == 4) || control_code == remote_rc_expected || effective_control_code == remote_rc_expected);
     const bool remote_cr_request = input && input_size >= sizeof(detail::call_result_request) &&
@@ -2802,66 +2822,125 @@ bool voyager::device_t::send_request(DWORD control_code, void* input, DWORD inpu
     if (effective_control_code != make_ioctl_snapshot(8)) {
         std::uint64_t current_tsc = __rdtsc();
         if (last_heartbeat_tsc_ == 0 || (current_tsc - last_heartbeat_tsc_) > detail::HEARTBEAT_REFRESH_INTERVAL) {
-            detail::heartbeat_request hb{};
-            hb.magic = heartbeat_magic_snapshot();
-            hb.session_key = session_key_;
-            hb.timestamp = current_tsc;
-            hb.response = 0;
-            const DWORD hb_ioctl = make_ioctl_snapshot(8);
-            capture_heartbeat_security_snapshot(8, hb_ioctl, hb.magic);
-            log_security_snapshot("send_request_embedded_hb_pre", hb_ioctl, hb_ioctl, 0);
-            if (hvdt_request || control_code == hvdt_expected_code || effective_control_code == hvdt_expected_code) {
-                diag::log_tagged_critical_fmt("comm",
-                    "send_request_hvdt_embedded_hb_pre hb_ioctl=0x%08X last_hb_tsc=%llu current_tsc=%llu local_pid=%lu local_tid=%lu",
+            auto send_embedded_heartbeat_once = [&](const char* pre_label,
+                                                     const char* ok_label,
+                                                     const char* fail_label,
+                                                     DWORD& out_error,
+                                                     DWORD& out_ioctl,
+                                                     DWORD& out_bytes,
+                                                     std::uint64_t& out_response,
+                                                     std::uint64_t& out_whoswho_tsc,
+                                                     std::uint64_t& out_sentinel_tsc,
+                                                     BOOL& out_result) noexcept -> bool {
+                sync_dynamic_security_state();
+
+                detail::heartbeat_request hb{};
+                hb.magic = heartbeat_magic_snapshot();
+                hb.session_key = session_key_;
+                hb.timestamp = __rdtsc();
+                hb.response = 0;
+
+                const DWORD hb_ioctl = make_ioctl_snapshot(8);
+                out_ioctl = hb_ioctl;
+                capture_heartbeat_security_snapshot(8, hb_ioctl, hb.magic);
+                log_security_snapshot(pre_label, hb_ioctl, hb_ioctl, 0);
+                if (hvdt_request || control_code == hvdt_expected_code || effective_control_code == hvdt_expected_code) {
+                    diag::log_tagged_critical_fmt("comm",
+                        "send_request_hvdt_embedded_hb_pre hb_ioctl=0x%08X last_hb_tsc=%llu current_tsc=%llu local_pid=%lu local_tid=%lu",
+                        hb_ioctl,
+                        static_cast<unsigned long long>(last_heartbeat_tsc_),
+                        static_cast<unsigned long long>(current_tsc),
+                        static_cast<unsigned long>(GetCurrentProcessId()),
+                        static_cast<unsigned long>(GetCurrentThreadId()));
+                }
+
+                DWORD hb_bytes = 0;
+                SetLastError(0);
+                BOOL hb_result = DeviceIoControl(
+                    driver_handle_,
                     hb_ioctl,
-                    static_cast<unsigned long long>(last_heartbeat_tsc_),
-                    static_cast<unsigned long long>(current_tsc),
-                    static_cast<unsigned long>(GetCurrentProcessId()),
-                    static_cast<unsigned long>(GetCurrentThreadId()));
-            }
+                    &hb,
+                    sizeof(hb),
+                    &hb,
+                    sizeof(hb),
+                    &hb_bytes,
+                    nullptr
+                );
+                const DWORD hb_err = hb_result ? ERROR_SUCCESS : GetLastError();
+                out_result = hb_result;
+                out_bytes = hb_bytes;
+                out_response = hb.response;
+                out_whoswho_tsc = hb.whoswho_tsc;
+                out_sentinel_tsc = hb.sentinel_tsc;
+                last_heartbeat_dioctl_result_ = hb_result;
+                last_heartbeat_bytes_ = hb_bytes;
+                last_heartbeat_response_ = hb.response;
+                last_heartbeat_error_ = hb_result ? 0 : hb_err;
+                capture_heartbeat_security_snapshot(8, hb_ioctl, hb.magic);
+
+                bool hb_ok = hb_result && hb_bytes >= sizeof(hb) && hb.response != 0;
+                DWORD effective_hb_err = hb_result ? ERROR_SUCCESS : hb_err;
+                if (!hb_ok) {
+                    if (effective_hb_err == ERROR_SUCCESS) {
+                        if (hb_result && hb_bytes < sizeof(hb))
+                            effective_hb_err = ERROR_MORE_DATA;
+                        else if (hb_result && hb.response == 0)
+                            effective_hb_err = ERROR_ACCESS_DENIED;
+                        else
+                            effective_hb_err = ERROR_GEN_FAILURE;
+                    }
+                    last_heartbeat_error_ = effective_hb_err;
+                }
+
+                if (hb_ok) {
+                    last_heartbeat_tsc_ = __rdtsc();
+                    last_bridge_whoswho_tsc_ = hb.whoswho_tsc;
+                    last_bridge_sentinel_tsc_ = hb.sentinel_tsc;
+                    if (hb.sentinel_tsc != 0 && first_sentinel_ready_tsc_ == 0)
+                        first_sentinel_ready_tsc_ = hb.sentinel_tsc;
+                    out_error = ERROR_SUCCESS;
+                    log_security_snapshot(ok_label, hb_ioctl, hb_ioctl, 0);
+                    return true;
+                }
+
+                out_error = effective_hb_err;
+                log_security_snapshot(fail_label, hb_ioctl, hb_ioctl, effective_hb_err);
+                return false;
+            };
 
             DWORD hb_bytes = 0;
-            SetLastError(0);
-            BOOL hb_result = DeviceIoControl(
-                driver_handle_,
-                hb_ioctl,
-                &hb,
-                sizeof(hb),
-                &hb,
-                sizeof(hb),
-                &hb_bytes,
-                nullptr
-            );
-            const DWORD hb_err = hb_result ? ERROR_SUCCESS : GetLastError();
-            last_heartbeat_dioctl_result_ = hb_result;
-            last_heartbeat_bytes_ = hb_bytes;
-            last_heartbeat_response_ = hb.response;
-            last_heartbeat_error_ = hb_result ? 0 : hb_err;
-            capture_heartbeat_security_snapshot(8, hb_ioctl, hb.magic);
-
-            bool hb_ok = hb_result && hb_bytes >= sizeof(hb) && hb.response != 0;
-            DWORD effective_hb_err = hb_result ? ERROR_SUCCESS : hb_err;
-            if (!hb_ok) {
-                if (effective_hb_err == ERROR_SUCCESS) {
-                    if (hb_result && hb_bytes < sizeof(hb))
-                        effective_hb_err = ERROR_MORE_DATA;
-                    else if (hb_result && hb.response == 0)
-                        effective_hb_err = ERROR_ACCESS_DENIED;
-                    else
-                        effective_hb_err = ERROR_GEN_FAILURE;
+            DWORD effective_hb_err = ERROR_SUCCESS;
+            DWORD hb_ioctl = 0;
+            std::uint64_t hb_response = 0;
+            std::uint64_t hb_whoswho_tsc = 0;
+            std::uint64_t hb_sentinel_tsc = 0;
+            BOOL hb_result = FALSE;
+            bool hb_ok = send_embedded_heartbeat_once("send_request_embedded_hb_pre",
+                                                       "send_request_embedded_hb_ok",
+                                                       "send_request_embedded_hb_failed",
+                                                       effective_hb_err,
+                                                       hb_ioctl,
+                                                       hb_bytes,
+                                                       hb_response,
+                                                       hb_whoswho_tsc,
+                                                       hb_sentinel_tsc,
+                                                       hb_result);
+            if (!hb_ok && effective_hb_err == ERROR_INVALID_FUNCTION) {
+                sync_dynamic_security_state();
+                const DWORD current_hb_ioctl = make_ioctl_snapshot(8);
+                if (current_hb_ioctl != hb_ioctl) {
+                    log_security_snapshot("send_request_embedded_hb_seed_rotated_retry_detected", hb_ioctl, current_hb_ioctl, effective_hb_err);
+                    hb_ok = send_embedded_heartbeat_once("send_request_embedded_hb_seed_rotated_retry_pre",
+                                                         "send_request_embedded_hb_seed_rotated_retry_ok",
+                                                         "send_request_embedded_hb_seed_rotated_retry_failed",
+                                                         effective_hb_err,
+                                                         hb_ioctl,
+                                                         hb_bytes,
+                                                         hb_response,
+                                                         hb_whoswho_tsc,
+                                                         hb_sentinel_tsc,
+                                                         hb_result);
                 }
-                last_heartbeat_error_ = effective_hb_err;
-            }
-
-            if (hb_ok) {
-                last_heartbeat_tsc_ = __rdtsc();
-                last_bridge_whoswho_tsc_ = hb.whoswho_tsc;
-                last_bridge_sentinel_tsc_ = hb.sentinel_tsc;
-                if (hb.sentinel_tsc != 0 && first_sentinel_ready_tsc_ == 0)
-                    first_sentinel_ready_tsc_ = hb.sentinel_tsc;
-                log_security_snapshot("send_request_embedded_hb_ok", hb_ioctl, hb_ioctl, 0);
-            } else {
-                log_security_snapshot("send_request_embedded_hb_failed", hb_ioctl, hb_ioctl, effective_hb_err);
             }
             if (hvdt_request || control_code == hvdt_expected_code || effective_control_code == hvdt_expected_code) {
                 diag::log_tagged_critical_fmt("comm",
@@ -2869,10 +2948,10 @@ bool voyager::device_t::send_request(DWORD control_code, void* input, DWORD inpu
                     hb_result ? 1 : 0,
                     hb_ioctl,
                     static_cast<unsigned long>(hb_bytes),
-                    hb_err,
-                    static_cast<unsigned long long>(hb.response),
-                    static_cast<unsigned long long>(hb.whoswho_tsc),
-                    static_cast<unsigned long long>(hb.sentinel_tsc),
+                    effective_hb_err,
+                    static_cast<unsigned long long>(hb_response),
+                    static_cast<unsigned long long>(hb_whoswho_tsc),
+                    static_cast<unsigned long long>(hb_sentinel_tsc),
                     static_cast<unsigned long>(GetCurrentProcessId()),
                     static_cast<unsigned long>(GetCurrentThreadId()));
             }
@@ -2882,6 +2961,23 @@ bool voyager::device_t::send_request(DWORD control_code, void* input, DWORD inpu
             }
         }
     }
+
+    sync_dynamic_security_state();
+    if (dynamic_offset_valid) {
+        const DWORD recomputed_control_code = make_ioctl_snapshot(dynamic_offset);
+        if (recomputed_control_code != effective_control_code) {
+            log_security_snapshot("send_request_seed_rotated_recomputed", control_code, recomputed_control_code, 0);
+            effective_control_code = recomputed_control_code;
+        }
+    }
+    base_after_sync = compute_ioctl_base_snapshot();
+    key_hash_after_sync = hash_build_key(compute_dynamic_key_snapshot());
+    ioctl_seed_hash_after_sync = server_ioctl_seed_ != 0 ? hash_build_key(server_ioctl_seed_) : 0;
+    global_server_seed_after_sync = dynamic_key::g_server_seed != 0 ? 1u : 0u;
+    global_ioctl_seed_after_sync = ioctl_codes::g_server_ioctl_seed != 0 ? 1u : 0u;
+    hvdt_expected_code = make_ioctl_snapshot(k_hvdt_offset);
+    remote_rc_expected = make_ioctl_snapshot(4);
+    remote_cr_expected = make_ioctl_snapshot(5);
 
     if (hvdt_request || control_code == hvdt_expected_code || effective_control_code == hvdt_expected_code) {
         diag::log_tagged_critical_fmt("comm",
