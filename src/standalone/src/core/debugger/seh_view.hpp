@@ -36,8 +36,38 @@ struct seh_entry_t {
 	int         index = 0;
 };
 
+struct seh_diagnostics_t {
+	uint32_t target_pid = 0;
+	uint32_t active_tid = 0;
+	uint32_t teb_query_returned = 0;
+	uint32_t stack_scan_candidates = 0;
+	uint32_t chain_entries = 0;
+	uint64_t teb_va = 0;
+	uint64_t raw_exception_list = 0;
+	uint64_t rsp = 0;
+	uint64_t stack_scan_start = 0;
+	uint64_t stack_scan_size = 0;
+	uint64_t stack_scan_bytes = 0;
+	uint64_t stack_scan_candidate_frame = 0;
+	uint64_t stack_scan_candidate_handler = 0;
+	bool teb_query_attempted = false;
+	bool teb_query_ok = false;
+	bool teb_read_ok = false;
+	bool teb_read_succeeded = false;
+	bool exception_list_read_ok = false;
+	bool sentinel_reached = false;
+	bool x64_empty_chain_proven = false;
+	bool stack_scan_attempted = false;
+	bool stack_scan_read_ok = false;
+	bool stack_scan_candidate_found = false;
+	std::string empty_reason;
+	std::string stack_scan_reason;
+	std::string chain_stop_reason;
+};
+
 struct ui_state_t {
 	std::vector<seh_entry_t> entries;
+	seh_diagnostics_t        diagnostics;
 	int                      selected = -1;
 	float                    scroll_y = 0.f;
 	float                    target_scroll_y = 0.f;
@@ -95,39 +125,79 @@ inline void refresh()
 		if (!work_queue::post([]() {
 		try {
 		std::vector<seh_entry_t> entries;
+		seh_diagnostics_t diag_state{};
+		diag_state.target_pid = driver_bridge::attached_pid();
+		diag_state.active_tid = debugger_engine::g_state.active_tid;
 
 		auto modules = driver_bridge::enumerate_modules();
 		auto regs = debugger_engine::get_registers();
+		diag_state.rsp = regs.rsp;
 
-		uint64_t teb_addr = resolve_thread_teb(debugger_engine::g_state.active_tid);
+		diag_state.teb_query_attempted = diag_state.active_tid != 0;
+		uint64_t teb_addr = 0;
+		if (diag_state.active_tid != 0) {
+			struct teb_basic_t {
+				long      exit_status;
+				void*     teb_base;
+				void*     unique_process;
+				void*     unique_thread;
+				uintptr_t affinity_mask;
+				long      priority;
+				long      base_priority;
+			};
+			teb_basic_t tbi{};
+			uint32_t returned = 0;
+			const bool query_ok = driver_bridge::query_thread_information(diag_state.active_tid, 0, &tbi, sizeof(tbi), &returned);
+			diag_state.teb_query_ok = query_ok;
+			diag_state.teb_query_returned = returned;
+			if (query_ok)
+				teb_addr = reinterpret_cast<uint64_t>(tbi.teb_base);
+		}
+		diag_state.teb_va = teb_addr;
 		uint64_t nt_tib_seh = 0;
 		bool found_seh = false;
 
 		if (teb_addr != 0) {
 			std::vector<uint8_t> teb_buf;
-			if (driver_bridge::read_memory(teb_addr, 8, teb_buf) && teb_buf.size() >= 8) {
+			diag_state.teb_read_ok = driver_bridge::read_memory(teb_addr, 8, teb_buf);
+			diag_state.teb_read_succeeded = diag_state.teb_read_ok && teb_buf.size() >= 8;
+			diag_state.exception_list_read_ok = diag_state.teb_read_succeeded;
+			if (diag_state.teb_read_succeeded) {
 				std::memcpy(&nt_tib_seh, teb_buf.data(), 8);
+				diag_state.raw_exception_list = nt_tib_seh;
+				diag_state.sentinel_reached = nt_tib_seh == 0xFFFFFFFFFFFFFFFFULL;
 				found_seh = (nt_tib_seh != 0 && nt_tib_seh != 0xFFFFFFFFFFFFFFFFULL);
 			}
 		}
 
 		if (!found_seh) {
-			uint64_t rsp = regs.rsp;
-			if (rsp != 0) {
+			diag_state.stack_scan_attempted = regs.rsp != 0;
+			if (regs.rsp != 0) {
 				std::vector<uint8_t> stack_buf;
 				size_t scan_size = 4096;
-				if (driver_bridge::read_memory(rsp, scan_size, stack_buf) && stack_buf.size() >= 16) {
+				diag_state.stack_scan_start = regs.rsp;
+				diag_state.stack_scan_size = scan_size;
+				diag_state.stack_scan_read_ok = driver_bridge::read_memory(regs.rsp, scan_size, stack_buf);
+				diag_state.stack_scan_bytes = stack_buf.size();
+				if (diag_state.stack_scan_read_ok && stack_buf.size() >= 16) {
 					for (size_t i = 8; i + 8 <= stack_buf.size(); i += 8) {
 						uint64_t candidate = 0;
 						std::memcpy(&candidate, stack_buf.data() + i, 8);
 						if (candidate > 0x10000 && candidate < 0x7FFFFFFFFFFF) {
+							++diag_state.stack_scan_candidates;
 							for (auto& m : modules) {
 								if (candidate >= m.base && candidate < m.base + m.size) {
 									uint64_t potential_next = 0;
 									std::memcpy(&potential_next, stack_buf.data() + i - 8, 8);
-									if (potential_next > rsp && potential_next < rsp + 0x100000) {
-										nt_tib_seh = rsp + i - 8;
+									if (potential_next > regs.rsp && potential_next < regs.rsp + 0x100000) {
+										nt_tib_seh = regs.rsp + i - 8;
 										found_seh = true;
+										diag_state.stack_scan_candidate_found = true;
+										diag_state.stack_scan_candidate_frame = nt_tib_seh;
+										diag_state.stack_scan_candidate_handler = candidate;
+										diag_state.stack_scan_reason = "candidate_frame_selected";
+									} else {
+										diag_state.stack_scan_reason = "candidate_next_out_of_stack_window";
 									}
 									break;
 								}
@@ -135,7 +205,13 @@ inline void refresh()
 						}
 						if (found_seh) break;
 					}
+					if (!found_seh && diag_state.stack_scan_reason.empty())
+						diag_state.stack_scan_reason = diag_state.stack_scan_candidates != 0 ? "no_valid_stack_frame_candidate" : "no_module_handler_candidate";
+				} else {
+					diag_state.stack_scan_reason = diag_state.stack_scan_read_ok ? "stack_read_too_short" : "stack_read_failed";
 				}
+			} else {
+				diag_state.stack_scan_reason = "rsp_zero";
 			}
 		}
 
@@ -147,8 +223,10 @@ inline void refresh()
 			while (current != 0 && current != 0xFFFFFFFFFFFFFFFFULL && idx < max_chain) {
 				std::vector<uint8_t> rec_buf;
 				bool read_ok = driver_bridge::read_memory(current, 16, rec_buf);
-				if (!read_ok || rec_buf.size() < 16)
+				if (!read_ok || rec_buf.size() < 16) {
+					diag_state.chain_stop_reason = read_ok ? "record_read_too_short" : "record_read_failed";
 					break;
+				}
 
 				seh_entry_t entry;
 				entry.frame_addr = current;
@@ -170,20 +248,69 @@ inline void refresh()
 				}
 
 				entries.push_back(std::move(entry));
-				if (next == current || next == 0 || next == 0xFFFFFFFFFFFFFFFFULL)
+				if (next == current) {
+					diag_state.chain_stop_reason = "self_link";
 					break;
+				}
+				if (next == 0) {
+					diag_state.chain_stop_reason = "null_next";
+					break;
+				}
+				if (next == 0xFFFFFFFFFFFFFFFFULL) {
+					diag_state.chain_stop_reason = "sentinel_next";
+					diag_state.sentinel_reached = true;
+					break;
+				}
 				current = next;
 				++idx;
 			}
+			if (idx >= max_chain && diag_state.chain_stop_reason.empty())
+				diag_state.chain_stop_reason = "max_chain_reached";
+		}
+
+		diag_state.chain_entries = static_cast<uint32_t>(entries.size());
+		if (entries.empty()) {
+			if (diag_state.teb_read_succeeded && diag_state.sentinel_reached)
+				diag_state.empty_reason = "teb_exception_list_sentinel";
+			else if (diag_state.teb_read_succeeded && diag_state.raw_exception_list == 0)
+				diag_state.empty_reason = "teb_exception_list_null";
+			else if (diag_state.teb_va == 0)
+				diag_state.empty_reason = "teb_unresolved";
+			else if (!diag_state.teb_read_succeeded)
+				diag_state.empty_reason = "teb_exception_list_read_failed";
+			else
+				diag_state.empty_reason = "no_valid_chain_after_stack_scan";
+			diag_state.x64_empty_chain_proven = diag_state.teb_read_succeeded &&
+				(diag_state.sentinel_reached || diag_state.raw_exception_list == 0) &&
+				!diag_state.stack_scan_candidate_found;
+		} else if (diag_state.chain_stop_reason.empty()) {
+			diag_state.chain_stop_reason = "chain_entries_collected";
 		}
 
 		size_t n = entries.size();
 		{
 			std::lock_guard<std::mutex> lk(g_ui.mutex);
 			g_ui.entries = std::move(entries);
+			g_ui.diagnostics = diag_state;
 		}
 		diag::log_tagged_fmt("seh",
-			"seh_refresh_done chain_depth=%zu", n);
+			"seh_refresh_done pid=%u tid=%u chain_depth=%zu teb_query_ok=%d teb_va=0x%llX teb_read_ok=%d raw_exception_list=0x%llX sentinel=%d x64_empty_chain_proven=%d empty_reason=%s stack_attempted=%d stack_read_ok=%d stack_candidates=%u stack_found=%d stack_reason=%s chain_stop=%s",
+			diag_state.target_pid,
+			diag_state.active_tid,
+			n,
+			diag_state.teb_query_ok ? 1 : 0,
+			static_cast<unsigned long long>(diag_state.teb_va),
+			diag_state.teb_read_succeeded ? 1 : 0,
+			static_cast<unsigned long long>(diag_state.raw_exception_list),
+			diag_state.sentinel_reached ? 1 : 0,
+			diag_state.x64_empty_chain_proven ? 1 : 0,
+			diag_state.empty_reason.c_str(),
+			diag_state.stack_scan_attempted ? 1 : 0,
+			diag_state.stack_scan_read_ok ? 1 : 0,
+			diag_state.stack_scan_candidates,
+			diag_state.stack_scan_candidate_found ? 1 : 0,
+			diag_state.stack_scan_reason.c_str(),
+			diag_state.chain_stop_reason.c_str());
 		g_ui.refreshing.store(false);
 		} catch (const std::exception& ex) {
 			diag::log_tagged_fmt("seh", "seh_refresh_worker_exception err='%s'", ex.what());

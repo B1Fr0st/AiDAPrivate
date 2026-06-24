@@ -653,9 +653,9 @@ namespace
                 }
 
                 tls_executor_task_meta = task.meta.get();
+                DWORD task_seh = 0;
                 try {
-                    if (task.fn)
-                        task.fn();
+                    task_seh = aida::infra::win_thread::run_function_seh_guarded(task.fn);
                 } catch (const std::exception& ex) {
                     diag::log_tagged_fmt("mcp_srv",
                         "mcp_executor_task_exception name=%s worker_index=%zu seq=%llu err='%s'",
@@ -669,6 +669,36 @@ namespace
                         _name.c_str(),
                         worker_index,
                         static_cast<unsigned long long>(seq));
+                }
+                if (task_seh != 0) {
+                    const std::uint64_t task_now = mcp_now_ms();
+                    std::uint64_t active_age_ms = 0;
+                    std::uint64_t deadline_snapshot = 0;
+                    {
+                        std::lock_guard<std::mutex> meta_lk(task.meta->mtx);
+                        active_age_ms = task.meta->active_at != 0 && task_now >= task.meta->active_at ? task_now - task.meta->active_at : 0;
+                        deadline_snapshot = task.meta->deadline_ms;
+                        method = task.meta->method;
+                        tool = task.meta->tool;
+                        lane = task.meta->lane;
+                    }
+                    diag::log_tagged_fmt("mcp_srv",
+                        "mcp_executor_task_seh name=%s worker_index=%zu seq=%llu tid=%lu code=0x%08lX active_age_ms=%llu queued_after_pop=%zu active=%u started=%llu finished=%llu method='%s' tool='%s' lane='%s' deadline_ms=%llu shutdown=%d",
+                        _name.c_str(),
+                        worker_index,
+                        static_cast<unsigned long long>(seq),
+                        static_cast<unsigned long>(GetCurrentThreadId()),
+                        static_cast<unsigned long>(task_seh),
+                        static_cast<unsigned long long>(active_age_ms),
+                        queued_after_pop,
+                        static_cast<unsigned>(_active.load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(_started.load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(_finished.load(std::memory_order_acquire)),
+                        method.c_str(),
+                        tool.c_str(),
+                        lane.c_str(),
+                        static_cast<unsigned long long>(deadline_snapshot),
+                        _shutdown.load(std::memory_order_acquire) ? 1 : 0);
                 }
                 tls_executor_task_meta = nullptr;
                 {
@@ -1730,7 +1760,7 @@ __declspec(noinline) static DWORD seh_sse_provider_step(
     __try {
         *out_continue = sse_provider_step_impl(session, sink, offset, stop_requested, stream_state, connection_closed);
         return 0;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    } __except (aida::infra::win_thread::non_cpp_seh_filter(GetExceptionCode())) {
         return GetExceptionCode();
     }
 }
@@ -2041,6 +2071,399 @@ static std::shared_mutex& active_session_tool_mutex()
     return m;
 }
 
+static std::string sanitize_owner_field(const std::string& value, std::size_t max_len = 160)
+{
+    std::string clean = sanitize_utf8(value);
+    std::string out;
+    out.reserve(std::min(clean.size(), max_len));
+    for (char ch : clean) {
+        unsigned char c = static_cast<unsigned char>(ch);
+        out.push_back((c < 0x20 || c == 0x7f) ? '_' : ch);
+        if (out.size() >= max_len)
+            break;
+    }
+    return out;
+}
+
+static std::string hex32_string(DWORD code)
+{
+    char buf[16];
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE, "0x%08lX", static_cast<unsigned long>(code));
+    return buf;
+}
+
+struct active_session_owner_record_t
+{
+    bool active = false;
+    bool exclusive = false;
+    bool read_only = false;
+    bool explicit_target = false;
+    bool cancelled = false;
+    std::uint64_t token = 0;
+    std::uint64_t acquired_ms = 0;
+    std::uint64_t deadline_ms = 0;
+    DWORD pid = 0;
+    DWORD tid = 0;
+    std::string tool;
+    std::string lane;
+    std::string diag_id;
+    std::string phase;
+};
+
+struct active_session_owner_snapshot_t
+{
+    bool present = false;
+    bool exclusive = false;
+    bool cancelled = false;
+    bool read_only = false;
+    bool explicit_target = false;
+    std::size_t shared_owner_count = 0;
+    std::uint64_t token = 0;
+    std::uint64_t acquired_ms = 0;
+    std::uint64_t owner_age_ms = 0;
+    std::uint64_t deadline_ms = 0;
+    DWORD pid = 0;
+    DWORD tid = 0;
+    std::string tool;
+    std::string lane;
+    std::string diag_id;
+    std::string phase;
+};
+
+static std::mutex& active_session_owner_mutex()
+{
+    static std::mutex m;
+    return m;
+}
+
+static active_session_owner_record_t& active_session_exclusive_owner()
+{
+    static active_session_owner_record_t owner;
+    return owner;
+}
+
+static std::vector<active_session_owner_record_t>& active_session_shared_owners()
+{
+    static std::vector<active_session_owner_record_t> owners;
+    return owners;
+}
+
+static std::atomic<std::uint64_t>& active_session_owner_token_source()
+{
+    static std::atomic<std::uint64_t> source{0};
+    return source;
+}
+
+static active_session_owner_snapshot_t active_session_owner_snapshot_from_record(const active_session_owner_record_t& record, std::size_t shared_count, std::uint64_t now)
+{
+    active_session_owner_snapshot_t snap;
+    snap.present = record.active;
+    snap.exclusive = record.exclusive;
+    snap.cancelled = record.cancelled;
+    snap.read_only = record.read_only;
+    snap.explicit_target = record.explicit_target;
+    snap.shared_owner_count = shared_count;
+    snap.token = record.token;
+    snap.acquired_ms = record.acquired_ms;
+    snap.owner_age_ms = record.acquired_ms != 0 && now >= record.acquired_ms ? now - record.acquired_ms : 0;
+    snap.deadline_ms = record.deadline_ms;
+    snap.pid = record.pid;
+    snap.tid = record.tid;
+    snap.tool = sanitize_owner_field(record.tool);
+    snap.lane = sanitize_owner_field(record.lane);
+    snap.diag_id = sanitize_owner_field(record.diag_id);
+    snap.phase = sanitize_owner_field(record.phase);
+    return snap;
+}
+
+static active_session_owner_snapshot_t active_session_owner_snapshot()
+{
+    const std::uint64_t now = mcp_now_ms();
+    std::lock_guard<std::mutex> lk(active_session_owner_mutex());
+    auto& exclusive_owner = active_session_exclusive_owner();
+    auto& shared_owners = active_session_shared_owners();
+    if (exclusive_owner.active)
+        return active_session_owner_snapshot_from_record(exclusive_owner, shared_owners.size(), now);
+    const active_session_owner_record_t* oldest = nullptr;
+    for (const auto& owner : shared_owners) {
+        if (!owner.active)
+            continue;
+        if (!oldest || owner.acquired_ms < oldest->acquired_ms)
+            oldest = &owner;
+    }
+    if (oldest)
+        return active_session_owner_snapshot_from_record(*oldest, shared_owners.size(), now);
+    active_session_owner_snapshot_t snap;
+    snap.shared_owner_count = shared_owners.size();
+    return snap;
+}
+
+static void append_active_session_owner_fields(json& details, const active_session_owner_snapshot_t& owner)
+{
+    details["owner_present"] = owner.present;
+    details["owner_mode"] = owner.present ? (owner.exclusive ? "exclusive" : "shared") : "";
+    details["owner_tool"] = owner.present ? owner.tool : "";
+    details["owner_diag_id"] = owner.present ? owner.diag_id : "";
+    details["owner_lane"] = owner.present ? owner.lane : "";
+    details["owner_pid"] = owner.present ? owner.pid : 0;
+    details["owner_tid"] = owner.present ? owner.tid : 0;
+    details["owner_age_ms"] = owner.present ? owner.owner_age_ms : 0;
+    details["owner_deadline_ms"] = owner.present ? owner.deadline_ms : 0;
+    details["owner_cancelled"] = owner.present ? owner.cancelled : false;
+    details["owner_phase"] = owner.present ? owner.phase : "";
+    details["owner_read_only"] = owner.present ? owner.read_only : false;
+    details["owner_explicit_target"] = owner.present ? owner.explicit_target : false;
+    details["shared_owner_count"] = owner.shared_owner_count;
+    details["exclusive_owner"] = owner.present && owner.exclusive;
+}
+
+static void log_active_session_owner_stale_if_needed(const active_session_owner_snapshot_t& owner,
+                                                     const char* reason,
+                                                     const std::string& waiter_tool,
+                                                     const char* waiter_lane,
+                                                     std::uint64_t waiter_wait_ms,
+                                                     std::uint64_t waiter_budget_ms)
+{
+    if (!owner.present)
+        return;
+    const std::uint64_t now = mcp_now_ms();
+    const bool deadline_expired = owner.deadline_ms != 0 && now >= owner.deadline_ms;
+    const bool budget_exceeded = waiter_budget_ms != 0 && waiter_wait_ms >= waiter_budget_ms;
+    if (!deadline_expired && !budget_exceeded)
+        return;
+    diag::log_tagged_fmt("mcp_srv",
+        "tool_policy_lock_owner_stale reason=%s waiter_tool='%s' waiter_lane=%s waiter_wait_ms=%llu waiter_budget_ms=%llu owner_tool='%s' owner_lane=%s owner_diag_id=%s owner_mode=%s owner_pid=%lu owner_tid=%lu owner_age_ms=%llu owner_deadline_ms=%llu owner_cancelled=%d owner_phase=%s shared_owner_count=%zu",
+        reason ? reason : "",
+        waiter_tool.c_str(),
+        waiter_lane ? waiter_lane : "",
+        static_cast<unsigned long long>(waiter_wait_ms),
+        static_cast<unsigned long long>(waiter_budget_ms),
+        owner.tool.c_str(),
+        owner.lane.c_str(),
+        owner.diag_id.c_str(),
+        owner.exclusive ? "exclusive" : "shared",
+        static_cast<unsigned long>(owner.pid),
+        static_cast<unsigned long>(owner.tid),
+        static_cast<unsigned long long>(owner.owner_age_ms),
+        static_cast<unsigned long long>(owner.deadline_ms),
+        owner.cancelled ? 1 : 0,
+        owner.phase.c_str(),
+        owner.shared_owner_count);
+}
+
+class active_session_owner_guard_t
+{
+public:
+    active_session_owner_guard_t(const std::string& tool_name,
+                                 const char* lane,
+                                 bool exclusive,
+                                 bool read_only,
+                                 bool explicit_target)
+        : tool_(sanitize_owner_field(tool_name))
+        , lane_(sanitize_owner_field(lane ? lane : ""))
+        , diag_id_(sanitize_owner_field(current_call_diag_id() ? current_call_diag_id() : ""))
+        , exclusive_(exclusive)
+        , read_only_(read_only)
+        , explicit_target_(explicit_target)
+        , token_(active_session_owner_token_source().fetch_add(1u, std::memory_order_acq_rel) + 1u)
+        , acquired_ms_(mcp_now_ms())
+        , deadline_ms_(current_call_deadline_ms())
+        , pid_(GetCurrentProcessId())
+        , tid_(GetCurrentThreadId())
+    {
+        record("acquired");
+        diag::log_tagged_fmt("mcp_srv",
+            "tool_policy_lock_hold_begin tool='%s' lane=%s mode=%s diag_id=%s pid=%lu tid=%lu deadline_ms=%llu cancelled=%d shared_owner_count=%zu token=%llu",
+            tool_.c_str(),
+            lane_.c_str(),
+            exclusive_ ? "exclusive" : "shared",
+            diag_id_.c_str(),
+            static_cast<unsigned long>(pid_),
+            static_cast<unsigned long>(tid_),
+            static_cast<unsigned long long>(deadline_ms_),
+            current_call_cancelled() ? 1 : 0,
+            active_session_owner_snapshot().shared_owner_count,
+            static_cast<unsigned long long>(token_));
+    }
+
+    active_session_owner_guard_t(const active_session_owner_guard_t&) = delete;
+    active_session_owner_guard_t& operator=(const active_session_owner_guard_t&) = delete;
+
+    ~active_session_owner_guard_t()
+    {
+        release("scope_exit");
+    }
+
+    void set_phase(const char* phase)
+    {
+        if (!active_)
+            return;
+        phase_ = sanitize_owner_field(phase ? phase : "");
+        std::lock_guard<std::mutex> lk(active_session_owner_mutex());
+        if (exclusive_) {
+            auto& owner = active_session_exclusive_owner();
+            if (owner.active && owner.token == token_) {
+                owner.phase = phase_;
+                owner.cancelled = current_call_cancelled();
+            }
+            return;
+        }
+        auto& shared_owners = active_session_shared_owners();
+        for (auto& owner : shared_owners) {
+            if (owner.active && owner.token == token_) {
+                owner.phase = phase_;
+                owner.cancelled = current_call_cancelled();
+                return;
+            }
+        }
+    }
+
+    void set_lane(const char* lane)
+    {
+        if (!active_)
+            return;
+        lane_ = sanitize_owner_field(lane ? lane : "");
+        std::lock_guard<std::mutex> lk(active_session_owner_mutex());
+        if (exclusive_) {
+            auto& owner = active_session_exclusive_owner();
+            if (owner.active && owner.token == token_)
+                owner.lane = lane_;
+            return;
+        }
+        auto& shared_owners = active_session_shared_owners();
+        for (auto& owner : shared_owners) {
+            if (owner.active && owner.token == token_) {
+                owner.lane = lane_;
+                return;
+            }
+        }
+    }
+
+    void note_seh(DWORD code, std::uint64_t elapsed_ms)
+    {
+        if (!active_)
+            return;
+        set_phase("handler_seh");
+        const active_session_owner_snapshot_t owner = active_session_owner_snapshot();
+        diag::log_tagged_fmt("mcp_srv",
+            "tool_policy_lock_hold_seh tool='%s' lane=%s mode=%s diag_id=%s code=0x%08lX elapsed_ms=%llu pid=%lu tid=%lu deadline_ms=%llu cancelled=%d owner_tool='%s' owner_lane=%s owner_diag_id=%s owner_pid=%lu owner_tid=%lu owner_age_ms=%llu owner_phase=%s shared_owner_count=%zu token=%llu",
+            tool_.c_str(),
+            lane_.c_str(),
+            exclusive_ ? "exclusive" : "shared",
+            diag_id_.c_str(),
+            static_cast<unsigned long>(code),
+            static_cast<unsigned long long>(elapsed_ms),
+            static_cast<unsigned long>(pid_),
+            static_cast<unsigned long>(tid_),
+            static_cast<unsigned long long>(deadline_ms_),
+            current_call_cancelled() ? 1 : 0,
+            owner.tool.c_str(),
+            owner.lane.c_str(),
+            owner.diag_id.c_str(),
+            static_cast<unsigned long>(owner.pid),
+            static_cast<unsigned long>(owner.tid),
+            static_cast<unsigned long long>(owner.owner_age_ms),
+            owner.phase.c_str(),
+            owner.shared_owner_count,
+            static_cast<unsigned long long>(token_));
+    }
+
+    void release(const char* reason)
+    {
+        if (!active_)
+            return;
+        const std::uint64_t elapsed_ms = mcp_now_ms() >= acquired_ms_ ? mcp_now_ms() - acquired_ms_ : 0;
+        std::size_t shared_count = 0;
+        bool exclusive_active = false;
+        {
+            std::lock_guard<std::mutex> lk(active_session_owner_mutex());
+            if (exclusive_) {
+                auto& owner = active_session_exclusive_owner();
+                if (owner.active && owner.token == token_)
+                    owner = {};
+            } else {
+                auto& shared_owners = active_session_shared_owners();
+                shared_owners.erase(std::remove_if(shared_owners.begin(), shared_owners.end(),
+                    [this](const active_session_owner_record_t& owner) {
+                        return owner.token == token_;
+                    }), shared_owners.end());
+            }
+            shared_count = active_session_shared_owners().size();
+            exclusive_active = active_session_exclusive_owner().active;
+        }
+        diag::log_tagged_fmt("mcp_srv",
+            "tool_policy_lock_hold_end tool='%s' lane=%s mode=%s diag_id=%s reason=%s elapsed_ms=%llu pid=%lu tid=%lu deadline_ms=%llu cancelled=%d phase=%s shared_owner_count=%zu exclusive_owner=%d token=%llu",
+            tool_.c_str(),
+            lane_.c_str(),
+            exclusive_ ? "exclusive" : "shared",
+            diag_id_.c_str(),
+            reason ? reason : "",
+            static_cast<unsigned long long>(elapsed_ms),
+            static_cast<unsigned long>(pid_),
+            static_cast<unsigned long>(tid_),
+            static_cast<unsigned long long>(deadline_ms_),
+            current_call_cancelled() ? 1 : 0,
+            phase_.c_str(),
+            shared_count,
+            exclusive_active ? 1 : 0,
+            static_cast<unsigned long long>(token_));
+        active_ = false;
+    }
+
+private:
+    void record(const char* phase)
+    {
+        phase_ = sanitize_owner_field(phase ? phase : "");
+        active_session_owner_record_t record;
+        record.active = true;
+        record.exclusive = exclusive_;
+        record.read_only = read_only_;
+        record.explicit_target = explicit_target_;
+        record.cancelled = current_call_cancelled();
+        record.token = token_;
+        record.acquired_ms = acquired_ms_;
+        record.deadline_ms = deadline_ms_;
+        record.pid = pid_;
+        record.tid = tid_;
+        record.tool = tool_;
+        record.lane = lane_;
+        record.diag_id = diag_id_;
+        record.phase = phase_;
+        std::lock_guard<std::mutex> lk(active_session_owner_mutex());
+        if (exclusive_) {
+            active_session_exclusive_owner() = std::move(record);
+        } else {
+            auto& shared_owners = active_session_shared_owners();
+            if (shared_owners.size() < 64u) {
+                shared_owners.push_back(std::move(record));
+            } else {
+                diag::log_tagged_fmt("mcp_srv",
+                    "tool_policy_lock_owner_shared_overflow tool='%s' lane=%s diag_id=%s tid=%lu shared_owner_count=%zu",
+                    tool_.c_str(),
+                    lane_.c_str(),
+                    diag_id_.c_str(),
+                    static_cast<unsigned long>(tid_),
+                    shared_owners.size());
+            }
+        }
+        active_ = true;
+    }
+
+    std::string tool_;
+    std::string lane_;
+    std::string diag_id_;
+    std::string phase_;
+    bool exclusive_ = false;
+    bool read_only_ = false;
+    bool explicit_target_ = false;
+    bool active_ = false;
+    std::uint64_t token_ = 0;
+    std::uint64_t acquired_ms_ = 0;
+    std::uint64_t deadline_ms_ = 0;
+    DWORD pid_ = 0;
+    DWORD tid_ = 0;
+};
+
 static std::mutex& domain_lane_mutex(const std::string& domain)
 {
     static std::mutex map_mutex;
@@ -2137,41 +2560,77 @@ static policy_lock_wait_t wait_policy_lock(Lock& lock,
         const std::uint64_t waited = now >= started ? now - started : 0;
         if (current_call_cancelled())
         {
+            const active_session_owner_snapshot_t owner = active_session_owner_snapshot();
             diag::log_tagged_fmt("mcp_srv",
-                "tool_policy_lock_wait_cancelled tool='%s' lane=%s mode=%s wait_ms=%llu diag_id=%s",
+                "tool_policy_lock_wait_cancelled tool='%s' lane=%s mode=%s wait_ms=%llu diag_id=%s owner_tool='%s' owner_lane=%s owner_diag_id=%s owner_mode=%s owner_pid=%lu owner_tid=%lu owner_age_ms=%llu owner_phase=%s shared_owner_count=%zu",
                 tool_name.c_str(),
                 lane ? lane : "",
                 mode ? mode : "",
                 static_cast<unsigned long long>(waited),
-                current_call_diag_id());
+                current_call_diag_id(),
+                owner.tool.c_str(),
+                owner.lane.c_str(),
+                owner.diag_id.c_str(),
+                owner.present ? (owner.exclusive ? "exclusive" : "shared") : "",
+                static_cast<unsigned long>(owner.pid),
+                static_cast<unsigned long>(owner.tid),
+                static_cast<unsigned long long>(owner.owner_age_ms),
+                owner.phase.c_str(),
+                owner.shared_owner_count);
             return {policy_lock_status_t::cancelled, waited};
         }
 
         const std::uint64_t deadline = current_call_deadline_ms();
         if ((budget == 0 || waited >= budget) || (deadline != 0 && now >= deadline))
         {
+            const active_session_owner_snapshot_t owner = active_session_owner_snapshot();
             diag::log_tagged_fmt("mcp_srv",
-                "tool_policy_lock_wait_busy tool='%s' lane=%s mode=%s wait_ms=%llu budget_ms=%llu diag_id=%s",
+                "tool_policy_lock_wait_busy tool='%s' lane=%s mode=%s wait_ms=%llu budget_ms=%llu diag_id=%s owner_tool='%s' owner_lane=%s owner_diag_id=%s owner_mode=%s owner_pid=%lu owner_tid=%lu owner_age_ms=%llu owner_deadline_ms=%llu owner_cancelled=%d owner_phase=%s shared_owner_count=%zu",
                 tool_name.c_str(),
                 lane ? lane : "",
                 mode ? mode : "",
                 static_cast<unsigned long long>(waited),
                 static_cast<unsigned long long>(budget),
-                current_call_diag_id());
+                current_call_diag_id(),
+                owner.tool.c_str(),
+                owner.lane.c_str(),
+                owner.diag_id.c_str(),
+                owner.present ? (owner.exclusive ? "exclusive" : "shared") : "",
+                static_cast<unsigned long>(owner.pid),
+                static_cast<unsigned long>(owner.tid),
+                static_cast<unsigned long long>(owner.owner_age_ms),
+                static_cast<unsigned long long>(owner.deadline_ms),
+                owner.cancelled ? 1 : 0,
+                owner.phase.c_str(),
+                owner.shared_owner_count);
+            log_active_session_owner_stale_if_needed(owner, "wait_busy", tool_name, lane, waited, budget);
             return {policy_lock_status_t::busy, waited};
         }
 
         if (now - last_log >= kMcpPolicyLockLogEveryMs)
         {
             last_log = now;
+            const active_session_owner_snapshot_t owner = active_session_owner_snapshot();
             diag::log_tagged_fmt("mcp_srv",
-                "tool_policy_lock_wait_state tool='%s' lane=%s mode=%s wait_ms=%llu cancelled=%d diag_id=%s",
+                "tool_policy_lock_wait_state tool='%s' lane=%s mode=%s wait_ms=%llu cancelled=%d diag_id=%s owner_tool='%s' owner_lane=%s owner_diag_id=%s owner_mode=%s owner_pid=%lu owner_tid=%lu owner_age_ms=%llu owner_deadline_ms=%llu owner_cancelled=%d owner_phase=%s shared_owner_count=%zu",
                 tool_name.c_str(),
                 lane ? lane : "",
                 mode ? mode : "",
                 static_cast<unsigned long long>(waited),
                 current_call_cancelled() ? 1 : 0,
-                current_call_diag_id());
+                current_call_diag_id(),
+                owner.tool.c_str(),
+                owner.lane.c_str(),
+                owner.diag_id.c_str(),
+                owner.present ? (owner.exclusive ? "exclusive" : "shared") : "",
+                static_cast<unsigned long>(owner.pid),
+                static_cast<unsigned long>(owner.tid),
+                static_cast<unsigned long long>(owner.owner_age_ms),
+                static_cast<unsigned long long>(owner.deadline_ms),
+                owner.cancelled ? 1 : 0,
+                owner.phase.c_str(),
+                owner.shared_owner_count);
+            log_active_session_owner_stale_if_needed(owner, "wait_state", tool_name, lane, waited, budget);
         }
         Sleep(static_cast<DWORD>(kMcpPolicyLockPollMs));
     }
@@ -2218,6 +2677,7 @@ static tool_result_t policy_lock_error_result(const std::string& tool_name,
         {"cancelled", wait.status == policy_lock_status_t::cancelled},
         {"busy", wait.status == policy_lock_status_t::busy}
     };
+    append_active_session_owner_fields(details, active_session_owner_snapshot());
     if (wait.status == policy_lock_status_t::cancelled)
         return tool_result_t::error("MCP tool call cancelled while waiting for active-session policy lock.", "cancelled", details);
     return tool_result_t::error("MCP active-session policy lock is busy; a prior tool is still draining.", "busy", details);
@@ -2473,6 +2933,72 @@ static tool_result_t invoke_tool_handler_unlocked(
     }
 }
 
+static tool_result_t invoke_tool_handler_guarded(
+    const std::string& tool_name,
+    const json& arguments,
+    const std::function<tool_result_t(const json&)>& handler,
+    tool_invocation_metrics_t* metrics,
+    const char* lane,
+    active_session_owner_guard_t* owner_guard = nullptr)
+{
+    const std::uint64_t start = mcp_now_ms();
+    tool_result_t result;
+    bool completed = false;
+    if (owner_guard)
+        owner_guard->set_phase("handler_enter");
+    std::function<void()> guarded = [&]() {
+        result = invoke_tool_handler_unlocked(tool_name, arguments, handler, metrics);
+        completed = true;
+    };
+    const DWORD seh_code = aida::infra::win_thread::run_function_seh_guarded(guarded);
+    if (seh_code != 0) {
+        const std::uint64_t elapsed_ms = mcp_now_ms() >= start ? mcp_now_ms() - start : 0;
+        if (metrics)
+            metrics->handler_elapsed_ms += elapsed_ms;
+        if (owner_guard)
+            owner_guard->note_seh(seh_code, elapsed_ms);
+        json details = {
+            {"tool", tool_name},
+            {"lane", lane ? lane : ""},
+            {"diagnostic_id", current_call_diag_id()},
+            {"seh_code", static_cast<std::uint32_t>(seh_code)},
+            {"seh_code_hex", hex32_string(seh_code)},
+            {"pid", GetCurrentProcessId()},
+            {"tid", GetCurrentThreadId()},
+            {"handler_elapsed_ms", elapsed_ms},
+            {"deadline_ms", current_call_deadline_ms()},
+            {"cancelled", current_call_cancelled()},
+            {"completed", completed}
+        };
+        const active_session_owner_snapshot_t owner = active_session_owner_snapshot();
+        append_active_session_owner_fields(details, owner);
+        diag::log_tagged_fmt("mcp_srv",
+            "handle_tools_call_seh tool='%s' lane=%s diag_id=%s code=0x%08lX elapsed_ms=%llu pid=%lu tid=%lu deadline_ms=%llu cancelled=%d owner_tool='%s' owner_lane=%s owner_diag_id=%s owner_pid=%lu owner_tid=%lu owner_age_ms=%llu owner_phase=%s shared_owner_count=%zu completed=%d",
+            tool_name.c_str(),
+            lane ? lane : "",
+            current_call_diag_id(),
+            static_cast<unsigned long>(seh_code),
+            static_cast<unsigned long long>(elapsed_ms),
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            static_cast<unsigned long long>(current_call_deadline_ms()),
+            current_call_cancelled() ? 1 : 0,
+            owner.tool.c_str(),
+            owner.lane.c_str(),
+            owner.diag_id.c_str(),
+            static_cast<unsigned long>(owner.pid),
+            static_cast<unsigned long>(owner.tid),
+            static_cast<unsigned long long>(owner.owner_age_ms),
+            owner.phase.c_str(),
+            owner.shared_owner_count,
+            completed ? 1 : 0);
+        return tool_result_t::error("Tool handler raised a structured exception and was contained fail-closed.", "tool_handler_seh", details);
+    }
+    if (owner_guard)
+        owner_guard->set_phase("handler_exit");
+    return result;
+}
+
 static tool_result_t invoke_tool_with_concurrency_policy(
     const tool_def_t& tool,
     const json& arguments,
@@ -2492,7 +3018,7 @@ static tool_result_t invoke_tool_with_concurrency_policy(
             "tool_policy_lane tool='%s' lane=independent_unlocked read_only=1 explicit_target=%d lock_wait_ms=0",
             tool.name.c_str(),
             explicit_target ? 1 : 0);
-        return invoke_tool_handler_unlocked(tool.name, arguments, handler, metrics);
+        return invoke_tool_handler_guarded(tool.name, arguments, handler, metrics, "independent_unlocked");
     }
 
     if (session_independent && !tool.read_only && !session_manager) {
@@ -2507,7 +3033,7 @@ static tool_result_t invoke_tool_with_concurrency_policy(
             lane.c_str(),
             explicit_target ? 1 : 0,
             static_cast<unsigned long long>(wait_ms));
-        return invoke_tool_handler_unlocked(tool.name, arguments, handler, metrics);
+        return invoke_tool_handler_guarded(tool.name, arguments, handler, metrics, lane.c_str());
     }
 
     if (session_manager || !tool.read_only) {
@@ -2528,16 +3054,20 @@ static tool_result_t invoke_tool_with_concurrency_policy(
             tool.read_only ? 1 : 0,
             explicit_target ? 1 : 0,
             static_cast<unsigned long long>(wait_ms));
+        active_session_owner_guard_t owner_guard(tool.name, lane, true, tool.read_only, explicit_target);
         if (!session_manager && !session_independent) {
+            owner_guard.set_phase("target_resolve");
             std::string scope_err;
             target_scope_t scope = resolve_target(target_arguments, &scope_err);
-            if (!scope.ok)
+            if (!scope.ok) {
+                owner_guard.set_phase("target_resolve_failed");
                 return tool_result_t::error(scope_err.empty() ? std::string("Unable to resolve target session") : scope_err);
+            }
             if (metrics)
                 metrics->resolved_target = true;
-            return invoke_tool_handler_unlocked(tool.name, arguments, handler, metrics);
+            return invoke_tool_handler_guarded(tool.name, arguments, handler, metrics, lane, &owner_guard);
         }
-        return invoke_tool_handler_unlocked(tool.name, arguments, handler, metrics);
+        return invoke_tool_handler_guarded(tool.name, arguments, handler, metrics, lane, &owner_guard);
     }
 
     if (!explicit_target) {
@@ -2553,13 +3083,17 @@ static tool_result_t invoke_tool_with_concurrency_policy(
             "tool_policy_lane tool='%s' lane=shared_active read_only=1 explicit_target=0 lock_wait_ms=%llu",
             tool.name.c_str(),
             static_cast<unsigned long long>(wait_ms));
+        active_session_owner_guard_t owner_guard(tool.name, "shared_active", false, true, false);
+        owner_guard.set_phase("target_resolve");
         std::string scope_err;
         target_scope_t scope = resolve_target(target_arguments, &scope_err);
-        if (!scope.ok)
+        if (!scope.ok) {
+            owner_guard.set_phase("target_resolve_failed");
             return tool_result_t::error(scope_err.empty() ? std::string("Unable to resolve target session") : scope_err);
+        }
         if (metrics)
             metrics->resolved_target = true;
-        return invoke_tool_handler_unlocked(tool.name, arguments, handler, metrics);
+        return invoke_tool_handler_guarded(tool.name, arguments, handler, metrics, "shared_active", &owner_guard);
     }
 
     target_probe_t probe;
@@ -2571,10 +3105,14 @@ static tool_result_t invoke_tool_with_concurrency_policy(
             set_tool_metrics_lane(metrics, "shared_target_probe", wait.wait_ms);
             return policy_lock_error_result(tool.name, "shared_target_probe", wait);
         }
+        active_session_owner_guard_t owner_guard(tool.name, "shared_target_probe", false, true, true);
+        owner_guard.set_phase("target_probe");
         probe_wait_ms = wait.wait_ms;
         probe = probe_target_without_switch(target_arguments);
         if (!probe.ok) {
             set_tool_metrics_lane(metrics, "shared_target_reject", probe_wait_ms);
+            owner_guard.set_lane("shared_target_reject");
+            owner_guard.set_phase("target_probe_failed");
             diag::log_tagged_fmt("mcp_srv",
                 "tool_policy_lane tool='%s' lane=shared_target_reject read_only=1 explicit_target=1 lock_wait_ms=%llu err='%.160s'",
                 tool.name.c_str(),
@@ -2584,6 +3122,7 @@ static tool_result_t invoke_tool_with_concurrency_policy(
         }
         if (!probe.resolved || probe.target_idx == probe.active_idx) {
             set_tool_metrics_lane(metrics, "shared_explicit_no_switch", probe_wait_ms);
+            owner_guard.set_lane("shared_explicit_no_switch");
             diag::log_tagged_fmt("mcp_srv",
                 "tool_policy_lane tool='%s' lane=shared_explicit_no_switch read_only=1 resolved=%d active_idx=%llu target_idx=%llu lock_wait_ms=%llu",
                 tool.name.c_str(),
@@ -2591,29 +3130,31 @@ static tool_result_t invoke_tool_with_concurrency_policy(
                 static_cast<unsigned long long>(probe.active_idx),
                 static_cast<unsigned long long>(probe.target_idx),
                 static_cast<unsigned long long>(probe_wait_ms));
+            owner_guard.set_phase("target_resolve");
             std::string scope_err;
             target_scope_t scope = resolve_target(target_arguments, &scope_err);
-            if (!scope.ok)
+            if (!scope.ok) {
+                owner_guard.set_phase("target_resolve_failed");
                 return tool_result_t::error(scope_err.empty() ? std::string("Unable to resolve target session") : scope_err);
+            }
             if (metrics)
                 metrics->resolved_target = true;
             bool added_pid = false;
             json handler_arguments = add_process_id_for_handler_if_supported(tool, arguments, probe.pid, &added_pid);
-            const bool release_before_handler = probe.resolved &&
-                probe.pid != 0 &&
-                probe.target_idx == probe.active_idx &&
-                !scope.swapped &&
-                (tool_args_have_explicit_pid(arguments) || added_pid);
-            if (release_before_handler) {
-                lk.unlock();
+            if (probe.resolved && probe.pid != 0 && (tool_args_have_explicit_pid(arguments) || added_pid)) {
                 diag::log_tagged_fmt("mcp_srv",
-                    "tool_policy_lock_release_before_handler tool='%s' lane=shared_explicit_no_switch pid=%u added_pid=%d lock_wait_ms=%llu",
+                    "tool_policy_lock_held_for_handler tool='%s' lane=shared_explicit_no_switch pid=%u added_pid=%d lock_wait_ms=%llu",
                     tool.name.c_str(),
                     probe.pid,
                     added_pid ? 1 : 0,
                     static_cast<unsigned long long>(probe_wait_ms));
             }
-            return invoke_tool_handler_unlocked(tool.name, release_before_handler ? handler_arguments : arguments, handler, metrics);
+            return invoke_tool_handler_guarded(tool.name,
+                handler_arguments,
+                handler,
+                metrics,
+                "shared_explicit_no_switch",
+                &owner_guard);
         }
     }
 
@@ -2632,13 +3173,17 @@ static tool_result_t invoke_tool_with_concurrency_policy(
         static_cast<unsigned long long>(probe.target_idx),
         static_cast<unsigned long long>(probe_wait_ms),
         static_cast<unsigned long long>(wait_ms));
+    active_session_owner_guard_t owner_guard(tool.name, "exclusive_target_switch", true, true, true);
+    owner_guard.set_phase("target_resolve");
     std::string scope_err;
     target_scope_t scope = resolve_target(target_arguments, &scope_err);
-    if (!scope.ok)
+    if (!scope.ok) {
+        owner_guard.set_phase("target_resolve_failed");
         return tool_result_t::error(scope_err.empty() ? std::string("Unable to resolve target session") : scope_err);
+    }
     if (metrics)
         metrics->resolved_target = true;
-    return invoke_tool_handler_unlocked(tool.name, arguments, handler, metrics);
+    return invoke_tool_handler_guarded(tool.name, arguments, handler, metrics, "exclusive_target_switch", &owner_guard);
 }
 
 bool server_t::register_tool(tool_def_t tool)
@@ -4789,7 +5334,25 @@ void server_t::server_thread_func(int port)
             "text/event-stream",
             [session, stop_ptr, stream_state, connection_closed](size_t offset, httplib::DataSink& sink) -> bool {
                 bool cont = false;
-                DWORD seh = seh_sse_provider_step(session.get(), &sink, offset, stop_ptr, stream_state.get(), connection_closed, &cont);
+                DWORD seh = 0;
+                try {
+                    seh = seh_sse_provider_step(session.get(), &sink, offset, stop_ptr, stream_state.get(), connection_closed, &cont);
+                } catch (const std::exception& ex) {
+                    diag::log_tagged_fmt("mcp_srv",
+                        "stream_provider_exception id=%llu route=%s err='%s'",
+                        static_cast<unsigned long long>(stream_state->id),
+                        stream_state->route ? stream_state->route : "<unknown>",
+                        ex.what());
+                    session->close();
+                    return false;
+                } catch (...) {
+                    diag::log_tagged_fmt("mcp_srv",
+                        "stream_provider_exception id=%llu route=%s err='<unknown>'",
+                        static_cast<unsigned long long>(stream_state->id),
+                        stream_state->route ? stream_state->route : "<unknown>");
+                    session->close();
+                    return false;
+                }
                 if (seh != 0) {
                     diag::log_tagged_fmt("mcp_srv",
                         "stream_provider_seh id=%llu route=%s code=0x%08lX",

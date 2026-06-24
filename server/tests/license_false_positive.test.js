@@ -2,6 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 const os = require('node:os');
 const path = require('node:path');
 
@@ -9,16 +10,17 @@ process.env.LOCAL_HSM_PATH = process.env.LOCAL_HSM_PATH || path.join(os.tmpdir()
 process.env.LOCAL_HSM_PASSPHRASE = process.env.LOCAL_HSM_PASSPHRASE || 'license-false-positive-test-passphrase';
 
 const capturedQueries = [];
+let queryHandler = async (sql, params) => {
+    capturedQueries.push({ sql, params });
+    return { rows: [], rowCount: 0 };
+};
 const poolPath = require.resolve('../db/pool');
 require.cache[poolPath] = {
     id: poolPath,
     filename: poolPath,
     loaded: true,
     exports: {
-        query: async (sql, params) => {
-            capturedQueries.push({ sql, params });
-            return { rows: [], rowCount: 0 };
-        },
+        query: async (sql, params) => queryHandler(sql, params),
         end: async () => {},
     },
 };
@@ -37,6 +39,31 @@ require.cache[expressPath] = {
 };
 
 const licenseRouter = require('../routes/license.js');
+
+function resetQueryHandler() {
+    queryHandler = async (sql, params) => {
+        capturedQueries.push({ sql, params });
+        return { rows: [], rowCount: 0 };
+    };
+}
+
+function hexFactor(label) {
+    return crypto.createHash('sha256').update(label, 'utf8').digest('hex');
+}
+
+function richFactors(prefix) {
+    const factors = {
+        _schema: 'hwid_v2_factor_hashes_v1',
+        _count: 8,
+        _mask: 0x17f,
+        _tpm_present: false,
+    };
+    for (let i = 1; i <= 9; i += 1) {
+        if (i === 8) continue;
+        factors[String(i)] = hexFactor(`${prefix}:factor:${i}`);
+    }
+    return factors;
+}
 
 test('heartbeat continuity findings are non-enforcing telemetry', () => {
     const result = licenseRouter._internal.evaluateHeartbeatContinuity(
@@ -101,7 +128,102 @@ test('startup ban check accepts unique current and legacy hwids', () => {
     assert.deepEqual(hwids, ['CURRENT-HWID-1234', 'LEGACY-HWID-5678']);
 });
 
+test('rich hwid v2 evidence accepts exactly one factor drift', async () => {
+    resetQueryHandler();
+    capturedQueries.length = 0;
+    const previous = richFactors('old');
+    const current = { ...previous, 5: hexFactor('new:nic:factor') };
+
+    const result = await licenseRouter._internal.verifyOrBindHwid(
+        'AIDA-TEST-0000-0000-0000',
+        'b'.repeat(64),
+        'a'.repeat(64),
+        {
+            factors: current,
+            licenseRow: {
+                hwid_factors: previous,
+                hwid_grace_used_at: 0,
+            },
+        }
+    );
+
+    assert.equal(result.ok, true);
+    assert.equal(result.reason, 'grace_accepted');
+    assert.deepEqual(licenseRouter._internal.compareHwidFactors(previous, current).changed_keys, ['5']);
+    assert.ok(capturedQueries.some(q => String(q.sql).includes('UPDATE licenses SET hwid = $1, hwid_factors = $2::jsonb')));
+});
+
+test('legacy aggregate hwid factor does not unlock mismatch without continuity', async () => {
+    resetQueryHandler();
+    capturedQueries.length = 0;
+    const oldHwid = 'a'.repeat(64);
+    const legacy = { hwid: crypto.createHash('sha256').update(oldHwid, 'utf8').digest('hex') };
+
+    const result = await licenseRouter._internal.verifyOrBindHwid(
+        'AIDA-TEST-0000-0000-0000',
+        'b'.repeat(64),
+        oldHwid,
+        {
+            factors: richFactors('current'),
+            licenseRow: {
+                hwid_factors: legacy,
+                hwid_grace_used_at: 0,
+            },
+        }
+    );
+
+    assert.equal(result.ok, false);
+    assert.equal(result.reason, 'hwid_mismatch');
+});
+
+test('legacy aggregate hwid migration requires live session continuity', async () => {
+    resetQueryHandler();
+    capturedQueries.length = 0;
+    const licenseKey = 'AIDA-TEST-0000-0000-0000';
+    const oldHwid = 'a'.repeat(64);
+    const sessionToken = 'session-token-for-hwid-continuity-0001';
+    const legacy = { hwid: crypto.createHash('sha256').update(oldHwid, 'utf8').digest('hex') };
+
+    queryHandler = async (sql, params) => {
+        capturedQueries.push({ sql, params });
+        if (String(sql).includes('SELECT * FROM sessions WHERE license_key = $1')) {
+            return {
+                rows: [{
+                    license_key: licenseKey,
+                    session_token: sessionToken,
+                    hwid: oldHwid,
+                    issued_at: Math.floor(Date.now() / 1000) - 60,
+                    ttl: 3600,
+                    kill_flag: false,
+                }],
+                rowCount: 1,
+            };
+        }
+        return { rows: [], rowCount: 0 };
+    };
+
+    const result = await licenseRouter._internal.verifyOrBindHwid(
+        licenseKey,
+        'b'.repeat(64),
+        oldHwid,
+        {
+            factors: richFactors('current'),
+            licenseRow: {
+                hwid_factors: legacy,
+                hwid_grace_used_at: 0,
+            },
+            continuitySessionToken: sessionToken,
+        }
+    );
+
+    assert.equal(result.ok, true);
+    assert.equal(result.reason, 'legacy_session_continuity_accepted');
+    assert.ok(capturedQueries.some(q => String(q.sql).includes('SELECT * FROM sessions WHERE license_key = $1')));
+    assert.ok(capturedQueries.some(q => String(q.sql).includes('UPDATE licenses SET hwid = $1, hwid_factors = $2::jsonb')));
+});
+
 test('storeSession upsert resets last_gate_bitmap to prevent cross-session regression false positives', async () => {
+    resetQueryHandler();
     capturedQueries.length = 0;
     await licenseRouter._internal.storeSession('AIDA-TEST-0000-0000-0000', {
         session_token: 'stub_session_token_for_test',

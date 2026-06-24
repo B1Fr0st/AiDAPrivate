@@ -2413,8 +2413,7 @@ namespace {
             log_msg(hf, tag, "PASS -- CSP analyzed, %zu findings detected", result.findings.size());
             passed.fetch_add(1);
         } else if (result.has_csp) {
-            log_msg(hf, tag, "PASS -- CSP analyzed (no findings, which is unexpected but API works)");
-            passed.fetch_add(1);
+            fail_empty_evidence(hf, tag, failed, "CSP analyzer returned zero findings for unsafe-inline fixture");
         } else {
             log_msg(hf, tag, "FAIL -- has_csp=false for valid CSP input");
             failed.fetch_add(1);
@@ -2475,8 +2474,13 @@ namespace {
         const char* tag = "seq_err";
         log_msg(hf, tag, "START -- sequencer::last_error()");
         std::string err = aida::burp::sequencer::last_error();
-        log_msg(hf, tag, "last_error = \"%s\"", err.c_str());
-        log_msg(hf, tag, "PASS -- last_error returned successfully");
+        auto cols = aida::burp::sequencer::list_collections();
+        log_msg(hf, tag, "FIELD -- last_error=\"%s\" len=%zu collection_count=%zu", err.c_str(), err.size(), cols.size());
+        if (cols.empty()) {
+            fail_empty_evidence(hf, tag, failed, "sequencer last_error accessor has no same-run collection evidence");
+            return;
+        }
+        log_msg(hf, tag, "PASS -- sequencer diagnostic accessor paired with same-run collection evidence count=%zu last_error_len=%zu", cols.size(), err.size());
         passed.fetch_add(1);
     }
 
@@ -2870,7 +2874,12 @@ namespace {
             st.dns_alive ? "true" : "false",
             st.smtp_alive ? "true" : "false",
             st.token_count, st.interaction_count);
-        log_msg(hf, tag, "PASS -- status returned successfully");
+        if (!st.running || !st.http_alive || st.token_count == 0) {
+            fail_empty_evidence(hf, tag, failed, "collaborator status lacks same-run running/http/token evidence running=%d http_alive=%d tokens=%zu",
+                st.running ? 1 : 0, st.http_alive ? 1 : 0, st.token_count);
+            return;
+        }
+        log_msg(hf, tag, "PASS -- collaborator status proved running HTTP fixture with %zu token(s)", st.token_count);
         passed.fetch_add(1);
     }
 
@@ -3002,8 +3011,14 @@ namespace {
         const char* tag = "ws_err";
         log_msg(hf, tag, "START -- ws_editor::last_error()");
         std::string err = aida::burp::ws_editor::last_error();
-        log_msg(hf, tag, "last_error = \"%s\"", err.c_str());
-        log_msg(hf, tag, "PASS -- last_error returned successfully");
+        const bool fixture_ok = ensure_ws_fixture(hf, tag);
+        auto conns = aida::burp::ws_editor::list_connections();
+        log_msg(hf, tag, "FIELD -- last_error=\"%s\" len=%zu fixture_ok=%d connection_count=%zu", err.c_str(), err.size(), fixture_ok ? 1 : 0, conns.size());
+        if (!fixture_ok || conns.empty()) {
+            fail_empty_evidence(hf, tag, failed, "ws_editor last_error accessor has no same-run websocket fixture connection evidence");
+            return;
+        }
+        log_msg(hf, tag, "PASS -- ws_editor diagnostic accessor paired with same-run connection evidence count=%zu last_error_len=%zu", conns.size(), err.size());
         passed.fetch_add(1);
     }
 
@@ -3053,8 +3068,20 @@ namespace {
         const char* tag = "h2_err";
         log_msg(hf, tag, "START -- h2_editor::last_error()");
         std::string err = aida::burp::h2_editor::last_error();
-        log_msg(hf, tag, "last_error = \"%s\"", err.c_str());
-        log_msg(hf, tag, "PASS -- last_error returned successfully");
+        aida::burp::h2_editor::frame_t f;
+        f.type = 0;
+        f.flags = 0x01;
+        f.stream_id = 1;
+        f.payload = { 0x41, 0x49, 0x44, 0x41 };
+        auto encoded = aida::burp::h2_editor::encode_frame(f);
+        std::vector<aida::burp::h2_editor::frame_t> decoded;
+        const bool ok = aida::burp::h2_editor::decode_frames(encoded, decoded);
+        log_msg(hf, tag, "FIELD -- last_error=\"%s\" len=%zu encoded=%zu decode_ok=%d frames=%zu", err.c_str(), err.size(), encoded.size(), ok ? 1 : 0, decoded.size());
+        if (encoded.empty() || !ok || decoded.empty()) {
+            fail_empty_evidence(hf, tag, failed, "h2_editor last_error accessor has no same-run frame encode/decode evidence");
+            return;
+        }
+        log_msg(hf, tag, "PASS -- h2_editor diagnostic accessor paired with same-run frame evidence frames=%zu last_error_len=%zu", decoded.size(), err.size());
         passed.fetch_add(1);
     }
 
@@ -3264,11 +3291,24 @@ namespace {
     void test_camoufox_get_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "cfox_status";
         log_msg(hf, tag, "START -- camoufox::get_status()");
+        bool ready_probe = false;
+        try {
+            ready_probe = aida::burp::camoufox::ensure_ready();
+        } catch (...) {
+            ready_probe = false;
+        }
         auto st = aida::burp::camoufox::get_status();
-        log_msg(hf, tag, "state=%d browser_open=%s total_calls=%llu total_errors=%llu",
+        const bool live = st.state == aida::burp::camoufox::bridge_state_t::ready &&
+            st.child_pid != 0 && st.child_alive && st.browser_open && st.page_verified && st.privacy_verified && !st.cleanup_pending;
+        log_msg(hf, tag, "state=%d browser_open=%s total_calls=%llu total_errors=%llu ready_probe=%d child_pid=%u child_alive=%d page_verified=%d privacy_verified=%d cleanup_pending=%d",
             (int)st.state, st.browser_open ? "true" : "false",
-            (unsigned long long)st.total_calls, (unsigned long long)st.total_errors);
-        log_msg(hf, tag, "PASS -- get_status returned successfully");
+            (unsigned long long)st.total_calls, (unsigned long long)st.total_errors,
+            ready_probe ? 1 : 0, st.child_pid, st.child_alive ? 1 : 0, st.page_verified ? 1 : 0, st.privacy_verified ? 1 : 0, st.cleanup_pending ? 1 : 0);
+        if (!ready_probe || !live) {
+            fail_empty_evidence(hf, tag, failed, "Camoufox status has no same-run live bridge evidence");
+            return;
+        }
+        log_msg(hf, tag, "PASS -- get_status paired with same-run live Camoufox bridge evidence child_pid=%u", st.child_pid);
         passed.fetch_add(1);
     }
 
@@ -3353,8 +3393,23 @@ namespace {
         const char* tag = "cfox_err";
         log_msg(hf, tag, "START -- camoufox::last_error()");
         std::string err = aida::burp::camoufox::last_error();
-        log_msg(hf, tag, "last_error = \"%s\"", err.c_str());
-        log_msg(hf, tag, "PASS -- last_error returned successfully");
+        bool ready_probe = false;
+        try {
+            ready_probe = aida::burp::camoufox::ensure_ready();
+        } catch (...) {
+            ready_probe = false;
+        }
+        const auto st = aida::burp::camoufox::get_status();
+        const bool live = st.state == aida::burp::camoufox::bridge_state_t::ready &&
+            st.child_pid != 0 && st.child_alive && st.browser_open && st.page_verified && st.privacy_verified && !st.cleanup_pending;
+        log_msg(hf, tag, "FIELD -- last_error=\"%s\" len=%zu state=%s generation=%llu ready_probe=%d child_pid=%u child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d",
+            err.c_str(), err.size(), camoufox_bridge_state_name(st.state), static_cast<unsigned long long>(st.generation),
+            ready_probe ? 1 : 0, st.child_pid, st.child_alive ? 1 : 0, st.browser_open ? 1 : 0, st.page_verified ? 1 : 0, st.privacy_verified ? 1 : 0);
+        if (!ready_probe || !live) {
+            fail_empty_evidence(hf, tag, failed, "camoufox last_error accessor has no same-run live bridge evidence");
+            return;
+        }
+        log_msg(hf, tag, "PASS -- camoufox diagnostic accessor paired with same-run live bridge evidence child_pid=%u last_error_len=%zu", st.child_pid, err.size());
         passed.fetch_add(1);
     }
 
@@ -3471,9 +3526,12 @@ namespace {
         if (!mini.empty() && mini.size() <= expanded.size()) {
             log_msg(hf, tag, "PASS -- minified query (%zu -> %zu chars)", expanded.size(), mini.size());
             passed.fetch_add(1);
+        } else if (!mini.empty()) {
+            log_msg(hf, tag, "FAIL -- minify_query expanded query unexpectedly (%zu -> %zu chars)", expanded.size(), mini.size());
+            failed.fetch_add(1);
         } else {
-            log_msg(hf, tag, "PASS -- minify_query returned (%zu chars)", mini.size());
-            passed.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- minify_query returned empty");
+            failed.fetch_add(1);
         }
     }
 
@@ -3496,9 +3554,21 @@ namespace {
         const char* tag = "gql_err";
         log_msg(hf, tag, "START -- graphql::last_error()");
         std::string err = aida::burp::graphql::last_error();
-        log_msg(hf, tag, "last_error = \"%s\"", err.c_str());
-        log_msg(hf, tag, "PASS -- last_error returned successfully");
-        passed.fetch_add(1);
+        const bool cache_miss = !aida::burp::graphql::has_cached_schema("https://nonexistent.test/graphql");
+        log_msg(hf, tag, "FIELD -- last_error=\"%s\" len=%zu cache_miss=%d", err.c_str(), err.size(), cache_miss ? 1 : 0);
+        if (cache_miss) {
+            std::string batched = aida::burp::graphql::build_batched_query("{ __typename }", 2);
+            if (batched.empty()) {
+                log_msg(hf, tag, "FAIL -- graphql last_error accessor has no same-run query builder evidence last_error_len=%zu", err.size());
+                failed.fetch_add(1);
+                return;
+            }
+            log_msg(hf, tag, "PASS -- graphql diagnostic accessor paired with same-run query builder evidence batch_len=%zu last_error_len=%zu", batched.size(), err.size());
+            passed.fetch_add(1);
+        } else {
+            log_msg(hf, tag, "FAIL -- graphql cache unexpectedly contains nonce endpoint last_error_len=%zu", err.size());
+            failed.fetch_add(1);
+        }
     }
 
     void test_graphql_cache_miss(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -3510,8 +3580,8 @@ namespace {
             log_msg(hf, tag, "PASS -- correctly reports no cached schema");
             passed.fetch_add(1);
         } else {
-            log_msg(hf, tag, "PASS -- has_cached_schema returned (unexpected true)");
-            passed.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- has_cached_schema returned unexpected true for nonce endpoint");
+            failed.fetch_add(1);
         }
     }
 
@@ -3931,6 +4001,10 @@ namespace {
                 i, techs[i].name.c_str(), techs[i].category.c_str(),
                 techs[i].version.c_str(), techs[i].confidence_label.c_str());
         }
+        if (techs.empty()) {
+            fail_empty_evidence(hf, tag, failed, "technology fingerprint returned zero detections for nginx/PHP/WordPress fixture");
+            return;
+        }
         log_msg(hf, tag, "PASS -- fingerprint returned %zu technologies", techs.size());
         passed.fetch_add(1);
     }
@@ -3993,9 +4067,9 @@ namespace {
             log_msg(hf, tag, "PASS -- API spec imported with id=%llu", (unsigned long long)id);
             passed.fetch_add(1);
         } else {
-            log_msg(hf, tag, "PASS -- import_from_text returned 0 (parse may have failed): %s",
+            log_msg(hf, tag, "FAIL -- import_from_text returned 0 for valid OpenAPI fixture: %s",
                 aida::burp::api_definition::last_error().c_str());
-            passed.fetch_add(1);
+            failed.fetch_add(1);
         }
     }
 
@@ -4132,8 +4206,7 @@ namespace {
             log_msg(hf, tag, "PASS -- %zu payload sets available", ids.size());
             passed.fetch_add(1);
         } else {
-            log_msg(hf, tag, "PASS -- list_ids returned empty (no built-in sets loaded)");
-            passed.fetch_add(1);
+            fail_empty_evidence(hf, tag, failed, "payload library list_ids returned zero built-in sets");
         }
     }
 
@@ -4545,8 +4618,7 @@ namespace {
             log_msg(hf, tag, "PASS -- found %zu insertion points", points.size());
             passed.fetch_add(1);
         } else {
-            log_msg(hf, tag, "PASS -- analyze returned (0 points for this request)");
-            passed.fetch_add(1);
+            fail_empty_evidence(hf, tag, failed, "insertion point analyzer returned zero points for query and cookie fixture");
         }
     }
 
@@ -4559,8 +4631,7 @@ namespace {
             log_msg(hf, tag, "PASS -- %zu scanner modules registered", cnt);
             passed.fetch_add(1);
         } else {
-            log_msg(hf, tag, "PASS -- scanner::count returned 0 (modules may not be loaded yet)");
-            passed.fetch_add(1);
+            fail_empty_evidence(hf, tag, failed, "scanner module registry count is zero");
         }
     }
 
@@ -4631,8 +4702,16 @@ namespace {
         const char* tag = "ahttp_err";
         log_msg(hf, tag, "START -- audit_http::last_error()");
         std::string err = aida::burp::audit_http::last_error();
-        log_msg(hf, tag, "last_error = \"%s\"", err.c_str());
-        log_msg(hf, tag, "PASS -- last_error returned successfully");
+        std::string scheme, host, path;
+        uint16_t port = 0;
+        const bool parsed = aida::burp::audit_http::parse_url("https://www.example.com:8443/api/v2/users", scheme, host, port, path);
+        log_msg(hf, tag, "FIELD -- last_error=\"%s\" len=%zu parsed=%d scheme=%s host=%s port=%u path=%s",
+            err.c_str(), err.size(), parsed ? 1 : 0, scheme.c_str(), host.c_str(), static_cast<unsigned>(port), path.c_str());
+        if (!parsed || scheme != "https" || host != "www.example.com" || port != 8443 || path.empty()) {
+            fail_empty_evidence(hf, tag, failed, "audit_http last_error accessor has no same-run URL parse evidence");
+            return;
+        }
+        log_msg(hf, tag, "PASS -- audit_http diagnostic accessor paired with same-run URL parse evidence last_error_len=%zu", err.size());
         passed.fetch_add(1);
     }
 
@@ -4702,8 +4781,14 @@ namespace {
         const char* tag = "ascan_err";
         log_msg(hf, tag, "START -- active_scanner::last_error()");
         std::string err = aida::burp::active_scanner::last_error();
-        log_msg(hf, tag, "last_error = \"%s\"", err.c_str());
-        log_msg(hf, tag, "PASS -- last_error returned successfully");
+        const bool fixture_ok = ensure_active_scanner_fixture(hf, tag);
+        auto audits = aida::burp::active_scanner::list_audits();
+        log_msg(hf, tag, "FIELD -- last_error=\"%s\" len=%zu fixture_ok=%d audit_count=%zu", err.c_str(), err.size(), fixture_ok ? 1 : 0, audits.size());
+        if (!fixture_ok || audits.empty()) {
+            fail_empty_evidence(hf, tag, failed, "active_scanner last_error accessor has no same-run audit evidence");
+            return;
+        }
+        log_msg(hf, tag, "PASS -- active_scanner diagnostic accessor paired with same-run audit evidence count=%zu last_error_len=%zu", audits.size(), err.size());
         passed.fetch_add(1);
     }
 
@@ -4713,7 +4798,11 @@ namespace {
         size_t total = aida::burp::sitemap::total_exchanges();
         auto hosts = aida::burp::sitemap::list_hosts(true);
         log_msg(hf, tag, "total_exchanges=%zu hosts_in_scope=%zu", total, hosts.size());
-        log_msg(hf, tag, "PASS -- sitemap state verified");
+        if (total == 0 || hosts.empty()) {
+            fail_empty_evidence(hf, tag, failed, "sitemap state has zero exchange or host evidence after fixture actions total=%zu hosts=%zu", total, hosts.size());
+            return;
+        }
+        log_msg(hf, tag, "PASS -- sitemap state verified with total_exchanges=%zu hosts=%zu", total, hosts.size());
         passed.fetch_add(1);
     }
 
@@ -4726,16 +4815,25 @@ namespace {
         std::string err = aida::burp::headless_view::last_error();
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
         log_msg(hf, tag, "initialize returned=%d last_error=\"%s\" elapsed=%lld ms", (int)ok, err.c_str(), (long long)ms);
-        log_msg(hf, tag, "PASS -- headless_view::initialize() returned without crash");
-        passed.fetch_add(1);
+        if (ok) {
+            log_msg(hf, tag, "PASS -- headless_view::initialize() returned true");
+            passed.fetch_add(1);
+        } else {
+            fail_empty_evidence(hf, tag, failed, "headless_view initialize returned false last_error_len=%zu", err.size());
+        }
     }
 
     static void test_headless_view_last_error(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "headless_last_error";
         log_msg(hf, tag, "START -- headless_view::last_error()");
         std::string err = aida::burp::headless_view::last_error();
-        log_msg(hf, tag, "last_error=\"%s\" len=%zu", err.c_str(), err.size());
-        log_msg(hf, tag, "PASS -- headless_view::last_error() returned without crash");
+        const bool ok = aida::burp::headless_view::initialize();
+        log_msg(hf, tag, "FIELD -- last_error=\"%s\" len=%zu initialize_ok=%d", err.c_str(), err.size(), ok ? 1 : 0);
+        if (!ok) {
+            fail_empty_evidence(hf, tag, failed, "headless_view last_error accessor has no same-run initialize evidence");
+            return;
+        }
+        log_msg(hf, tag, "PASS -- headless_view diagnostic accessor paired with same-run initialize evidence last_error_len=%zu", err.size());
         passed.fetch_add(1);
     }
 
@@ -4743,11 +4841,30 @@ namespace {
         const char* tag = "headless_shutdown";
         log_msg(hf, tag, "START -- headless_view::shutdown()");
         auto t0 = std::chrono::steady_clock::now();
+        const bool initialized_before = aida::burp::headless_view::initialize();
+        const std::string before_err = aida::burp::headless_view::last_error();
+        if (!initialized_before) {
+            fail_empty_evidence(hf, tag, failed, "headless_view shutdown has no initialized instance evidence last_error_len=%zu", before_err.size());
+            return;
+        }
         aida::burp::headless_view::shutdown();
+        const bool reinitialized = aida::burp::headless_view::initialize();
+        const std::string after_err = aida::burp::headless_view::last_error();
+        if (reinitialized)
+            aida::burp::headless_view::shutdown();
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-        log_msg(hf, tag, "shutdown completed elapsed=%lld ms", (long long)ms);
-        log_msg(hf, tag, "PASS -- headless_view::shutdown() returned without crash");
-        passed.fetch_add(1);
+        log_msg(hf, tag, "shutdown evidence initialized_before=%d reinitialized_after=%d before_last_error_len=%zu after_last_error_len=%zu elapsed=%lld ms",
+            initialized_before ? 1 : 0,
+            reinitialized ? 1 : 0,
+            before_err.size(),
+            after_err.size(),
+            (long long)ms);
+        if (reinitialized) {
+            log_msg(hf, tag, "PASS -- headless_view shutdown paired with same-run initialize and reinitialize evidence");
+            passed.fetch_add(1);
+        } else {
+            fail_empty_evidence(hf, tag, failed, "headless_view did not reinitialize after shutdown last_error_len=%zu", after_err.size());
+        }
     }
 
     static void select_network_tab(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed,

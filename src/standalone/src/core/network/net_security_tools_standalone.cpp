@@ -550,6 +550,69 @@ static json ns_keylog_probe_to_json(const ns_keylog_probe_t& probe) {
     return j;
 }
 
+struct ns_tls_keylog_session_state_t {
+    std::mutex mutex;
+    std::uint64_t next_session_id = 1;
+    bool active = false;
+    std::uint64_t session_id = 0;
+    std::uint32_t pid = 0;
+    std::uint32_t poll_interval_ms = 0;
+    bool append = true;
+    std::string output_file;
+    std::uint64_t started_ms = 0;
+    std::uint64_t stopped_ms = 0;
+    std::uint64_t starts = 0;
+    std::uint64_t stops = 0;
+    std::size_t key_count_start = 0;
+    std::string last_error;
+};
+
+static ns_tls_keylog_session_state_t& ns_tls_keylog_session_state() {
+    static ns_tls_keylog_session_state_t s;
+    return s;
+}
+
+static std::uint64_t ns_now_ms() {
+    return static_cast<std::uint64_t>(GetTickCount64());
+}
+
+static std::uint64_t ns_json_u64_param(const json& params, const char* key, std::uint64_t fallback = 0) {
+    if (!params.is_object() || !params.contains(key))
+        return fallback;
+    const json& v = params[key];
+    if (v.is_number_unsigned())
+        return v.get<std::uint64_t>();
+    if (v.is_number_integer()) {
+        const auto signed_value = v.get<std::int64_t>();
+        return signed_value > 0 ? static_cast<std::uint64_t>(signed_value) : fallback;
+    }
+    if (v.is_string()) {
+        try {
+            return std::stoull(v.get<std::string>(), nullptr, 0);
+        } catch (...) {
+            return fallback;
+        }
+    }
+    return fallback;
+}
+
+static json ns_tls_keylog_ledger_json(const ns_tls_keylog_session_state_t& s) {
+    json j;
+    j["active"] = s.active;
+    j["session_id"] = s.session_id;
+    j["pid"] = s.pid;
+    j["output_file"] = s.output_file;
+    j["poll_interval_ms"] = s.poll_interval_ms;
+    j["append"] = s.append;
+    j["started_ms"] = s.started_ms;
+    j["stopped_ms"] = s.stopped_ms;
+    j["starts"] = s.starts;
+    j["stops"] = s.stops;
+    j["key_count_start"] = static_cast<std::uint64_t>(s.key_count_start);
+    j["last_error"] = s.last_error;
+    return j;
+}
+
 static bool ns_hex_to_bytes_strict(const std::string& hex, std::vector<std::uint8_t>& out) {
     out.clear();
     std::string clean;
@@ -861,28 +924,251 @@ tool_result_t tls_start_keylog(const json& params) {
         diag::log_tagged_fmt("net_sec", "tls_start_keylog using default output_file=%s", config.output_file.c_str());
     }
 
-    bool started = net_security::TlsKeyExtractor::instance().start_keylog(config);
-    diag::log_tagged_fmt("net_sec", "tls_start_keylog started=%d output_file=%s", (int)started, config.output_file.c_str());
+    auto& extractor = net_security::TlsKeyExtractor::instance();
+    auto& ledger_state = ns_tls_keylog_session_state();
+    const std::uint64_t call_start_ms = ns_now_ms();
+    const bool extractor_active_before = extractor.is_keylogging();
+    const auto seen_before = extractor.get_seen_keys();
+    const auto file_before = ns_probe_keylog_file(config.output_file);
+    json ledger_before;
+    bool ledger_active_before = false;
+    std::uint64_t ledger_session_before = 0;
+    {
+        std::lock_guard<std::mutex> lock(ledger_state.mutex);
+        ledger_before = ns_tls_keylog_ledger_json(ledger_state);
+        ledger_active_before = ledger_state.active;
+        ledger_session_before = ledger_state.session_id;
+    }
+
+    bool started = extractor.start_keylog(config);
+    const DWORD gle = GetLastError();
+    const std::uint64_t elapsed_ms = ns_now_ms() - call_start_ms;
+    const bool extractor_active_after = extractor.is_keylogging();
+    const auto seen_after = extractor.get_seen_keys();
+    const auto file_after = ns_probe_keylog_file(config.output_file);
+
+    json r;
+    r["status"] = started ? "started" : "not_started";
+    r["session_id"] = 0;
+    r["session_owner"] = "mcp_tls_manage";
+    r["pid"] = config.pid;
+    r["output_file"] = config.output_file;
+    r["poll_interval_ms"] = config.poll_interval_ms;
+    r["append"] = config.append;
+    r["active_before"] = extractor_active_before || ledger_active_before;
+    r["active_after"] = extractor_active_after;
+    r["extractor_active_before"] = extractor_active_before;
+    r["extractor_active_after"] = extractor_active_after;
+    r["ledger_active_before"] = ledger_active_before;
+    r["ledger_session_before"] = ledger_session_before;
+    r["key_count_start"] = static_cast<std::uint64_t>(seen_before.size());
+    r["key_count_after"] = static_cast<std::uint64_t>(seen_after.size());
+    r["file_before"] = ns_keylog_probe_to_json(file_before);
+    r["file_after"] = ns_keylog_probe_to_json(file_after);
+    r["worker_enter_reason"] = started ? "work_queue_service_posted" : "not_posted";
+    r["worker_exit_reason"] = started ? "worker_running" : "start_rejected";
+    r["win32_last_error"] = static_cast<unsigned long>(gle);
+    r["elapsed_ms"] = elapsed_ms;
+
+    std::uint64_t session_id = 0;
     if (started) {
-        json r;
-        r["status"] = "started";
-        r["output_file"] = config.output_file;
-        r["poll_interval_ms"] = config.poll_interval_ms;
+        {
+            std::lock_guard<std::mutex> lock(ledger_state.mutex);
+            session_id = ledger_state.next_session_id++;
+            ledger_state.active = true;
+            ledger_state.session_id = session_id;
+            ledger_state.pid = config.pid;
+            ledger_state.poll_interval_ms = config.poll_interval_ms;
+            ledger_state.append = config.append;
+            ledger_state.output_file = config.output_file;
+            ledger_state.started_ms = call_start_ms;
+            ledger_state.stopped_ms = 0;
+            ledger_state.key_count_start = seen_before.size();
+            ledger_state.last_error.clear();
+            ++ledger_state.starts;
+            r["ledger_after"] = ns_tls_keylog_ledger_json(ledger_state);
+        }
+        r["session_id"] = session_id;
+        r["ledger_active_after"] = true;
+        diag::log_tagged_fmt("net_sec", "tls_start_keylog started=1 session_id=%llu active_before=%d active_after=%d pid=%u output_file=%s elapsed_ms=%llu keys_before=%zu keys_after=%zu",
+            static_cast<unsigned long long>(session_id),
+            (extractor_active_before || ledger_active_before) ? 1 : 0,
+            extractor_active_after ? 1 : 0,
+            config.pid,
+            config.output_file.c_str(),
+            static_cast<unsigned long long>(elapsed_ms),
+            seen_before.size(),
+            seen_after.size());
         return tool_result_t::ok(OBFSTR("TLS keylogging started -> ") + config.output_file, r);
     }
-    return tool_result_t::error(OBFSTR("Keylogging already active or failed to start"));
+
+    const std::string early_reason = ledger_active_before ? "mcp_session_already_active" :
+        (extractor_active_before ? "extractor_already_active" : "extractor_start_failed");
+    r["early_exit_reason"] = early_reason;
+    {
+        std::lock_guard<std::mutex> lock(ledger_state.mutex);
+        ledger_state.last_error = early_reason;
+        r["ledger_after"] = ns_tls_keylog_ledger_json(ledger_state);
+        r["ledger_active_after"] = ledger_state.active;
+        r["session_id"] = ledger_state.active ? ledger_state.session_id : 0;
+    }
+    diag::log_tagged_fmt("net_sec", "tls_start_keylog started=0 reason=%s ledger_active_before=%d extractor_active_before=%d active_after=%d gle=%lu output_file=%s elapsed_ms=%llu",
+        early_reason.c_str(),
+        ledger_active_before ? 1 : 0,
+        extractor_active_before ? 1 : 0,
+        extractor_active_after ? 1 : 0,
+        static_cast<unsigned long>(gle),
+        config.output_file.c_str(),
+        static_cast<unsigned long long>(elapsed_ms));
+    return tool_result_t::error(OBFSTR("Keylogging already active or failed to start"), r);
 }
 
-tool_result_t tls_stop_keylog(const json&) {
-    diag::log_tagged("net_sec", "tls_stop_keylog entry");
-    bool stopped = net_security::TlsKeyExtractor::instance().stop_keylog();
-    diag::log_tagged_fmt("net_sec", "tls_stop_keylog stopped=%d", (int)stopped);
-    if (stopped) {
-        json r;
-        r["status"] = "stopped";
-        return tool_result_t::ok(OBFSTR("TLS keylogging stopped"), r);
+tool_result_t tls_stop_keylog(const json& params) {
+    const std::uint64_t requested_session_id = ns_json_u64_param(params, "session_id", 0);
+    diag::log_tagged_fmt("net_sec", "tls_stop_keylog entry requested_session_id=%llu",
+        static_cast<unsigned long long>(requested_session_id));
+    auto& extractor = net_security::TlsKeyExtractor::instance();
+    auto& ledger_state = ns_tls_keylog_session_state();
+    const std::uint64_t call_start_ms = ns_now_ms();
+    const bool extractor_active_before = extractor.is_keylogging();
+    const auto seen_before = extractor.get_seen_keys();
+
+    json ledger_before;
+    bool ledger_active_before = false;
+    std::uint64_t ledger_session_before = 0;
+    std::string ledger_output_file;
+    std::uint64_t ledger_started_ms = 0;
+    std::size_t ledger_key_count_start = 0;
+    {
+        std::lock_guard<std::mutex> lock(ledger_state.mutex);
+        ledger_before = ns_tls_keylog_ledger_json(ledger_state);
+        ledger_active_before = ledger_state.active;
+        ledger_session_before = ledger_state.session_id;
+        ledger_output_file = ledger_state.output_file;
+        ledger_started_ms = ledger_state.started_ms;
+        ledger_key_count_start = ledger_state.key_count_start;
     }
-    return tool_result_t::error(OBFSTR("No active keylogging session"));
+
+    json r;
+    r["requested_session_id"] = requested_session_id;
+    r["session_id"] = ledger_session_before;
+    r["session_owner"] = ledger_active_before ? "mcp_tls_manage" : "unknown_or_external";
+    r["active_before"] = extractor_active_before || ledger_active_before;
+    r["extractor_active_before"] = extractor_active_before;
+    r["ledger_active_before"] = ledger_active_before;
+    r["ledger_before"] = ledger_before;
+    r["output_file"] = ledger_output_file;
+    r["key_count_start"] = static_cast<std::uint64_t>(ledger_key_count_start);
+    r["key_count_before"] = static_cast<std::uint64_t>(seen_before.size());
+    r["worker_enter_reason"] = "tls_stop_keylog_requested";
+
+    auto finish_error = [&](const std::string& reason, const std::string& message) -> tool_result_t {
+        const bool extractor_active_after = extractor.is_keylogging();
+        const auto seen_after = extractor.get_seen_keys();
+        const auto file_after = ns_probe_keylog_file(ledger_output_file);
+        r["status"] = "not_stopped";
+        r["early_exit_reason"] = reason;
+        r["stop_attempted"] = false;
+        r["stop_succeeded"] = false;
+        r["active_after"] = extractor_active_after;
+        r["extractor_active_after"] = extractor_active_after;
+        r["key_count_after"] = static_cast<std::uint64_t>(seen_after.size());
+        r["file_after"] = ns_keylog_probe_to_json(file_after);
+        r["elapsed_ms"] = ns_now_ms() - call_start_ms;
+        r["worker_exit_reason"] = reason;
+        {
+            std::lock_guard<std::mutex> lock(ledger_state.mutex);
+            const bool same_session = ledger_state.session_id == ledger_session_before;
+            if (same_session)
+                ledger_state.last_error = reason;
+            else
+                r["ledger_update_skipped_newer_session"] = true;
+            r["ledger_active_after"] = ledger_state.active;
+            r["ledger_after"] = ns_tls_keylog_ledger_json(ledger_state);
+        }
+        diag::log_tagged_fmt("net_sec", "tls_stop_keylog early_exit reason=%s requested_session_id=%llu ledger_session=%llu ledger_active=%d extractor_active=%d elapsed_ms=%llu",
+            reason.c_str(),
+            static_cast<unsigned long long>(requested_session_id),
+            static_cast<unsigned long long>(ledger_session_before),
+            ledger_active_before ? 1 : 0,
+            extractor_active_before ? 1 : 0,
+            static_cast<unsigned long long>(r["elapsed_ms"].get<std::uint64_t>()));
+        return tool_result_t::error(message, r);
+    };
+
+    if (requested_session_id != 0 && (!ledger_active_before || requested_session_id != ledger_session_before))
+        return finish_error("session_id_mismatch", OBFSTR("Requested TLS keylog session is not active"));
+
+    if (!extractor_active_before && !ledger_active_before)
+        return finish_error("no_active_keylog_session", OBFSTR("No active keylogging session"));
+
+    if (!extractor_active_before && ledger_active_before) {
+        {
+            std::lock_guard<std::mutex> lock(ledger_state.mutex);
+            if (ledger_state.session_id == ledger_session_before) {
+                ledger_state.active = false;
+                ledger_state.stopped_ms = call_start_ms;
+                ledger_state.last_error = "mcp_session_stale_inactive_extractor";
+            } else {
+                r["ledger_stale_clear_skipped_newer_session"] = true;
+            }
+        }
+        return finish_error("mcp_session_stale_inactive_extractor", OBFSTR("TLS keylog session was stale; extractor was inactive"));
+    }
+
+    const auto file_before = ns_probe_keylog_file(ledger_output_file);
+    bool stopped = extractor.stop_keylog();
+    const DWORD gle = GetLastError();
+    const std::uint64_t elapsed_ms = ns_now_ms() - call_start_ms;
+    const bool extractor_active_after = extractor.is_keylogging();
+    const auto seen_after = extractor.get_seen_keys();
+    const auto file_after = ns_probe_keylog_file(ledger_output_file);
+    r["status"] = stopped ? "stopped" : "stop_failed";
+    r["stop_attempted"] = true;
+    r["stop_succeeded"] = stopped;
+    r["active_after"] = extractor_active_after;
+    r["extractor_active_after"] = extractor_active_after;
+    r["key_count_after"] = static_cast<std::uint64_t>(seen_after.size());
+    r["keys_added_during_session"] = static_cast<std::uint64_t>(seen_after.size() >= ledger_key_count_start ? seen_after.size() - ledger_key_count_start : 0);
+    r["file_before"] = ns_keylog_probe_to_json(file_before);
+    r["file_after"] = ns_keylog_probe_to_json(file_after);
+    r["win32_last_error"] = static_cast<unsigned long>(gle);
+    r["elapsed_ms"] = elapsed_ms;
+    r["lifetime_ms"] = ledger_started_ms != 0 && call_start_ms >= ledger_started_ms ? call_start_ms - ledger_started_ms : 0;
+    r["worker_exit_reason"] = stopped ? "extractor_worker_done" : "extractor_stop_failed_or_timeout";
+
+    {
+        std::lock_guard<std::mutex> lock(ledger_state.mutex);
+        const bool same_session = ledger_state.session_id == ledger_session_before;
+        if (stopped && same_session) {
+            ledger_state.active = false;
+            ledger_state.stopped_ms = call_start_ms;
+            ledger_state.last_error.clear();
+            ++ledger_state.stops;
+        } else if (same_session) {
+            ledger_state.last_error = "extractor_stop_failed_or_timeout";
+        } else {
+            r["ledger_stop_update_skipped_newer_session"] = true;
+        }
+        r["ledger_active_after"] = ledger_state.active;
+        r["ledger_after"] = ns_tls_keylog_ledger_json(ledger_state);
+    }
+
+    diag::log_tagged_fmt("net_sec", "tls_stop_keylog stopped=%d session_id=%llu requested_session_id=%llu active_before=%d active_after=%d elapsed_ms=%llu lifetime_ms=%llu keys_before=%zu keys_after=%zu output_file=%s gle=%lu",
+        stopped ? 1 : 0,
+        static_cast<unsigned long long>(ledger_session_before),
+        static_cast<unsigned long long>(requested_session_id),
+        (extractor_active_before || ledger_active_before) ? 1 : 0,
+        extractor_active_after ? 1 : 0,
+        static_cast<unsigned long long>(elapsed_ms),
+        static_cast<unsigned long long>(r["lifetime_ms"].get<std::uint64_t>()),
+        seen_before.size(),
+        seen_after.size(),
+        ledger_output_file.c_str(),
+        static_cast<unsigned long>(gle));
+    if (stopped)
+        return tool_result_t::ok(OBFSTR("TLS keylogging stopped"), r);
+    return tool_result_t::error(OBFSTR("TLS keylogging stop failed"), r);
 }
 
 tool_result_t tls_get_extracted_keys(const json&) {

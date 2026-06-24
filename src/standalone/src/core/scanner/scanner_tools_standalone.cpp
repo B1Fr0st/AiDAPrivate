@@ -285,6 +285,80 @@ static json captured_register_json(const page_guard_engine::pg_capture_t& meta) 
 	return regs;
 }
 
+static json page_guard_install_failure_json() {
+	const auto f = page_guard_engine::g_pg_engine.last_install_failure();
+	json result;
+	result["reason"] = f.reason;
+	result["detail"] = f.detail;
+	result["driver_status"] = f.driver_status;
+	result["driver_last_error"] = f.driver_last_error;
+	result["remote_call_driver_status"] = f.remote_call_driver_status;
+	result["remote_call_driver_last_error"] = f.remote_call_driver_last_error;
+	result["pid"] = f.pid;
+	result["active_pid"] = f.active_pid;
+	result["win32_error"] = f.win32_error;
+	result["requested_addr"] = sa_format_address(f.requested_addr);
+	result["requested_size"] = f.requested_size;
+	result["guard_addr"] = sa_format_address(f.guard_addr);
+	result["guard_size"] = f.guard_size;
+	result["region_base"] = sa_format_address(f.region_base);
+	result["region_size"] = f.region_size;
+	result["region_state"] = f.region_state;
+	result["region_protect"] = f.region_protect;
+	result["region_type"] = f.region_type;
+	result["attempted_protect"] = f.attempted_protect;
+	result["original_protect"] = f.original_protect;
+	result["proposed_protect"] = f.proposed_protect;
+	result["ring_addr"] = sa_format_address(f.ring_addr);
+	result["shellcode_addr"] = sa_format_address(f.shellcode_addr);
+	result["context_addr"] = sa_format_address(f.context_addr);
+	result["ntdll_base"] = sa_format_address(f.ntdll_base);
+	result["ntdll_size"] = f.ntdll_size;
+	result["rtl_add_veh"] = sa_format_address(f.rtl_add_veh);
+	result["rtl_remove_veh"] = sa_format_address(f.rtl_remove_veh);
+	result["veh_result"] = sa_format_address(f.veh_result);
+	result["cleanup_shellcode_ok"] = f.cleanup_shellcode_ok != 0;
+	result["cleanup_ring_ok"] = f.cleanup_ring_ok != 0;
+	result["install_elapsed_ms"] = f.install_elapsed_ms;
+	result["install_generation"] = f.install_generation;
+	result["current_generation"] = f.current_generation;
+	result["mitigation_open_ok"] = f.mitigation_open_ok != 0;
+	result["mitigation_open_error"] = f.mitigation_open_error;
+	result["mitigation_dynamic_ok"] = f.mitigation_dynamic_ok != 0;
+	result["mitigation_dynamic_error"] = f.mitigation_dynamic_error;
+	result["mitigation_dynamic_flags"] = f.mitigation_dynamic_flags;
+	result["mitigation_cfg_ok"] = f.mitigation_cfg_ok != 0;
+	result["mitigation_cfg_error"] = f.mitigation_cfg_error;
+	result["mitigation_cfg_flags"] = f.mitigation_cfg_flags;
+	result["remote_call"] = json{
+		{"id", f.remote_call_id},
+		{"function", sa_format_address(f.remote_call_function)},
+		{"result", sa_format_address(f.remote_call_result)},
+		{"gle", f.remote_call_gle},
+		{"active_pid_entry", f.remote_call_active_pid_entry},
+		{"active_pid_after", f.remote_call_active_pid_after},
+		{"timeout_ms", f.remote_call_timeout_ms},
+		{"deadline_ms", f.remote_call_deadline_ms},
+		{"deadline_remaining_ms", f.remote_call_deadline_remaining_ms},
+		{"elapsed_ms", f.remote_call_elapsed_ms},
+		{"completed", f.remote_call_completed != 0},
+		{"ok", f.remote_call_ok != 0},
+		{"cancelled_before", f.remote_call_cancelled_before != 0},
+		{"cancelled_after", f.remote_call_cancelled_after != 0},
+		{"deadline_expired_before", f.remote_call_deadline_expired_before != 0},
+		{"deadline_expired_after", f.remote_call_deadline_expired_after != 0},
+		{"stale_pid", f.remote_call_stale_pid != 0},
+		{"late_completion", f.remote_call_late_completion != 0}
+	};
+	result["remote_call_id"] = f.remote_call_id;
+	result["remote_call_gle"] = f.remote_call_gle;
+	result["remote_call_stale_pid"] = f.remote_call_stale_pid != 0;
+	result["remote_call_deadline_expired_after"] = f.remote_call_deadline_expired_after != 0;
+	result["remote_call_cancelled_after"] = f.remote_call_cancelled_after != 0;
+	result["remote_call_late_completion"] = f.remote_call_late_completion != 0;
+	return result;
+}
+
 template <typename T>
 static bool read_scalar_le(const std::vector<uint8_t>& bytes, T& out) {
 	if (bytes.size() < sizeof(T))
@@ -1309,12 +1383,32 @@ static tool_result_t handle_find_what_accesses(const json& params) {
 	}
 	uint32_t sid = page_guard_engine::g_pg_engine.install(pid, page_base, guard_size, true, max_records_per_drain);
 	if (sid == 0) {
+		json failure = page_guard_install_failure_json();
 		diag::log_tagged_fmt("scanner",
-			"find_what_accesses install_failed pid=%u elapsed_ms=%llu last_error=%s",
+			"find_what_accesses install_failed pid=%u active_pid=%u reason=%s remote_call_id=%llu remote_gle=%lu stale_pid=%d deadline_expired=%d cancelled=%d late_completion=%d elapsed_ms=%llu last_error=%s",
 			pid,
+			driver_bridge::attached_pid(),
+			failure.value("reason", std::string()).c_str(),
+			static_cast<unsigned long long>(failure.value("remote_call_id", 0ull)),
+			static_cast<unsigned long>(failure.value("remote_call_gle", 0u)),
+			failure.value("remote_call_stale_pid", false) ? 1 : 0,
+			failure.value("remote_call_deadline_expired_after", false) ? 1 : 0,
+			failure.value("remote_call_cancelled_after", false) ? 1 : 0,
+			failure.value("remote_call_late_completion", false) ? 1 : 0,
 			static_cast<unsigned long long>(GetTickCount64() - started_tick),
 			driver_bridge::last_error().c_str());
-		return tool_result_t::error(OBFSTR("Failed to install page-guard access monitor."));
+		json result;
+		result["address"] = sa_format_address(*address);
+		result["size"] = size;
+		result["type"] = type;
+		result["pid"] = pid;
+		result["active_pid"] = driver_bridge::attached_pid();
+		result["guard_base"] = sa_format_address(page_base);
+		result["guard_size"] = guard_size;
+		result["wait_ms"] = wait_ms;
+		result["elapsed_ms"] = static_cast<unsigned long long>(GetTickCount64() - started_tick);
+		result["failure"] = std::move(failure);
+		return tool_result_t::error(OBFSTR("Failed to install page-guard access monitor."), "page_guard_install_failed", result);
 	}
 	diag::log_tagged_fmt("scanner",
 		"find_what_accesses install_done sid=%u pid=%u payloads=1 max_drain=%u elapsed_ms=%llu",

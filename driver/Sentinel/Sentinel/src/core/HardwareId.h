@@ -17,11 +17,62 @@ namespace hardware_id
         UINT8  mac_addr[6];
         UINT64 cpu_topology;
         ULONG  volume_serial;
+        ULONG  anchor_status;
+        ULONG  anchor_build;
         UINT8  composite_sha256[32];
     };
 
     inline hw_anchors_t g_anchors = {};
     inline BOOLEAN g_anchors_valid = FALSE;
+
+    enum : ULONG
+    {
+        ANCHOR_SMBIOS_OK = 0x00000001u,
+        ANCHOR_DISK_OK = 0x00000002u,
+        ANCHOR_DISK_SKIPPED = 0x00000004u,
+        ANCHOR_MACHINE_GUID_OK = 0x00000008u,
+        ANCHOR_VOLUME_OK = 0x00000010u,
+        ANCHOR_VOLUME_SKIPPED = 0x00000020u,
+        ANCHOR_STORAGE_OPEN_GATED = 0x00000040u
+    };
+
+    __forceinline ULONG kernel_build_number()
+    {
+        ULONG value = 0;
+        __try {
+            volatile ULONG* ptr = reinterpret_cast<volatile ULONG*>(0xFFFFF78000000000ULL + 0x260);
+            value = *ptr;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            value = 0;
+        }
+        return value & 0xFFFFu;
+    }
+
+    __forceinline BOOLEAN skip_storage_device_open()
+    {
+        return kernel_build_number() >= 26100;
+    }
+
+    __forceinline ULONG build_anchor_status(NTSTATUS smbios_status, NTSTATUS disk_status, NTSTATUS machine_guid_status, NTSTATUS volume_status)
+    {
+        ULONG status = 0;
+        BOOLEAN storage_gate = skip_storage_device_open();
+        if (NT_SUCCESS(smbios_status))
+            status |= ANCHOR_SMBIOS_OK;
+        if (NT_SUCCESS(disk_status))
+            status |= ANCHOR_DISK_OK;
+        else if (storage_gate && disk_status == STATUS_NOT_SUPPORTED)
+            status |= ANCHOR_DISK_SKIPPED;
+        if (NT_SUCCESS(machine_guid_status))
+            status |= ANCHOR_MACHINE_GUID_OK;
+        if (NT_SUCCESS(volume_status))
+            status |= ANCHOR_VOLUME_OK;
+        else if (storage_gate && volume_status == STATUS_NOT_SUPPORTED)
+            status |= ANCHOR_VOLUME_SKIPPED;
+        if (storage_gate)
+            status |= ANCHOR_STORAGE_OPEN_GATED;
+        return status;
+    }
 
     __forceinline UINT64 collect_cpu_topology()
     {
@@ -133,6 +184,12 @@ namespace hardware_id
 
     __forceinline NTSTATUS collect_disk_serial(CHAR* serial_out, SIZE_T max_len)
     {
+        ULONG build = kernel_build_number();
+        if (skip_storage_device_open()) {
+            SN_LOG("hardware_id: disk_serial_skipped_build_gate build=%lu device=\\\\Device\\\\Harddisk0\\\\DR0", build);
+            return STATUS_NOT_SUPPORTED;
+        }
+
         UNICODE_STRING dev_name;
         RtlInitUnicodeString(&dev_name, L"\\Device\\Harddisk0\\DR0");
 
@@ -235,6 +292,12 @@ namespace hardware_id
 
     __forceinline NTSTATUS collect_volume_serial(ULONG* serial_out)
     {
+        ULONG build = kernel_build_number();
+        if (skip_storage_device_open()) {
+            SN_LOG("hardware_id: volume_serial_skipped_build_gate build=%lu device=\\\\DosDevices\\\\C:", build);
+            return STATUS_NOT_SUPPORTED;
+        }
+
         UNICODE_STRING vol_name;
         RtlInitUnicodeString(&vol_name, L"\\DosDevices\\C:");
 
@@ -299,13 +362,24 @@ namespace hardware_id
     {
         RtlZeroMemory(&g_anchors, sizeof(g_anchors));
 
-        collect_smbios(g_anchors.smbios_uuid, g_anchors.baseboard_serial, sizeof(g_anchors.baseboard_serial));
-        collect_disk_serial(g_anchors.disk_serial, sizeof(g_anchors.disk_serial));
-        collect_machine_guid(g_anchors.machine_guid, sizeof(g_anchors.machine_guid));
-        collect_volume_serial(&g_anchors.volume_serial);
+        NTSTATUS smbios_status = collect_smbios(g_anchors.smbios_uuid, g_anchors.baseboard_serial, sizeof(g_anchors.baseboard_serial));
+        NTSTATUS disk_status = collect_disk_serial(g_anchors.disk_serial, sizeof(g_anchors.disk_serial));
+        NTSTATUS machine_guid_status = collect_machine_guid(g_anchors.machine_guid, sizeof(g_anchors.machine_guid));
+        NTSTATUS volume_status = collect_volume_serial(&g_anchors.volume_serial);
         g_anchors.cpu_topology = collect_cpu_topology();
+        g_anchors.anchor_build = kernel_build_number();
+        g_anchors.anchor_status = build_anchor_status(smbios_status, disk_status, machine_guid_status, volume_status);
+        SN_LOG("hardware_id::collect_all statuses build=%lu smbios=0x%08lx disk=0x%08lx machine_guid=0x%08lx volume=0x%08lx cpu_topology=0x%llx storage_gate=%u",
+            g_anchors.anchor_build,
+            smbios_status,
+            disk_status,
+            machine_guid_status,
+            volume_status,
+            static_cast<unsigned long long>(g_anchors.cpu_topology),
+            skip_storage_device_open() ? 1u : 0u);
+        SN_LOG("hardware_id::collect_all anchor_status=0x%08lx anchor_build=%lu", g_anchors.anchor_status, g_anchors.anchor_build);
 
-        UINT8 concat[16 + 64 + 64 + 64 + 6 + 8 + 4];
+        UINT8 concat[16 + 64 + 64 + 64 + 6 + 8 + 4 + 4 + 4];
         ULONG offset = 0;
 
         RtlCopyMemory(concat + offset, g_anchors.smbios_uuid, 16); offset += 16;
@@ -315,6 +389,8 @@ namespace hardware_id
         RtlCopyMemory(concat + offset, g_anchors.mac_addr, 6); offset += 6;
         RtlCopyMemory(concat + offset, &g_anchors.cpu_topology, 8); offset += 8;
         RtlCopyMemory(concat + offset, &g_anchors.volume_serial, 4); offset += 4;
+        RtlCopyMemory(concat + offset, &g_anchors.anchor_status, 4); offset += 4;
+        RtlCopyMemory(concat + offset, &g_anchors.anchor_build, 4); offset += 4;
 
         sha256_simple(concat, offset, g_anchors.composite_sha256);
         g_anchors_valid = TRUE;

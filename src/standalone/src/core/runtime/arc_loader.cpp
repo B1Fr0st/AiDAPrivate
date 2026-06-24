@@ -223,6 +223,24 @@ namespace
         arc_breadcrumb(buf);
     }
 
+    void arc_log_region_state(const char* phase, const void* addr)
+    {
+        MEMORY_BASIC_INFORMATION mbi{};
+        SIZE_T got = VirtualQuery(addr, &mbi, sizeof(mbi));
+        DWORD gle = got ? 0 : GetLastError();
+        arc_breadcrumb_fmt("unload_region_state phase=%s addr=0x%llX ok=%d gle=%lu base=0x%llX alloc=0x%llX size=0x%llX state=0x%lX protect=0x%lX type=0x%lX",
+            phase && *phase ? phase : "<unknown>",
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(addr)),
+            got ? 1 : 0,
+            static_cast<unsigned long>(gle),
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(got ? mbi.BaseAddress : nullptr)),
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(got ? mbi.AllocationBase : nullptr)),
+            static_cast<unsigned long long>(got ? mbi.RegionSize : 0),
+            static_cast<unsigned long>(got ? mbi.State : 0),
+            static_cast<unsigned long>(got ? mbi.Protect : 0),
+            static_cast<unsigned long>(got ? mbi.Type : 0));
+    }
+
     DWORD WINAPI arc_diag_canary_thread_proc(LPVOID p)
     {
         volatile LONG* done = reinterpret_cast<volatile LONG*>(p);
@@ -2087,11 +2105,32 @@ namespace arc_loader
             return;
 
         auto* image_base = static_cast<uint8_t*>(mod.base);
+        const uintptr_t image_base_value = reinterpret_cast<uintptr_t>(mod.base);
+        const uintptr_t image_end_value = image_base_value + static_cast<uintptr_t>(mod.image_size);
+        arc_breadcrumb_fmt("unload_impl_begin call_entry_detach=%d base=0x%llX end=0x%llX size=0x%llX entry=0x%llX initialized=%d sealed=%d function_table=0x%llX function_count=%u timer=0x%llX pid=%lu tid=%lu",
+            call_entry_detach ? 1 : 0,
+            static_cast<unsigned long long>(image_base_value),
+            static_cast<unsigned long long>(image_end_value),
+            static_cast<unsigned long long>(mod.image_size),
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(mod.entry_point)),
+            mod.initialized ? 1 : 0,
+            mod.sealed ? 1 : 0,
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(mod.function_table)),
+            static_cast<unsigned>(mod.function_table_count),
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(mod.auto_seal_timer)),
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long>(GetCurrentThreadId()));
+        arc_log_region_state("unload_begin_base", mod.base);
 
         if (mod.auto_seal_timer != nullptr) {
-            DeleteTimerQueueTimer(NULL,
+            BOOL timer_deleted = DeleteTimerQueueTimer(NULL,
                                   reinterpret_cast<HANDLE>(mod.auto_seal_timer),
                                   NULL);
+            DWORD timer_gle = timer_deleted ? 0 : GetLastError();
+            arc_breadcrumb_fmt("unload_timer_delete_result ok=%d gle=%lu timer=0x%llX",
+                timer_deleted ? 1 : 0,
+                static_cast<unsigned long>(timer_gle),
+                static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(mod.auto_seal_timer)));
             mod.auto_seal_timer = nullptr;
         }
 
@@ -2120,7 +2159,11 @@ namespace arc_loader
 
 
         if (mod.function_table != nullptr) {
-            RtlDeleteFunctionTable(static_cast<PRUNTIME_FUNCTION>(mod.function_table));
+            BOOLEAN deleted = RtlDeleteFunctionTable(static_cast<PRUNTIME_FUNCTION>(mod.function_table));
+            arc_breadcrumb_fmt("unload_function_table_delete_result ok=%d table=0x%llX count=%u",
+                deleted ? 1 : 0,
+                static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(mod.function_table)),
+                static_cast<unsigned>(mod.function_table_count));
             mod.function_table = nullptr;
             mod.function_table_count = 0;
         }
@@ -2128,17 +2171,46 @@ namespace arc_loader
         DWORD image_old_protect = 0;
         const BOOL image_writable_for_zero = VirtualProtect(
             mod.base, mod.image_size, PAGE_READWRITE, &image_old_protect);
+        DWORD protect_gle = image_writable_for_zero ? 0 : GetLastError();
+        arc_breadcrumb_fmt("unload_image_protect_rw_result ok=%d gle=%lu old=0x%lX base=0x%llX size=0x%llX",
+            image_writable_for_zero ? 1 : 0,
+            static_cast<unsigned long>(protect_gle),
+            static_cast<unsigned long>(image_old_protect),
+            static_cast<unsigned long long>(image_base_value),
+            static_cast<unsigned long long>(mod.image_size));
         __try {
             SecureZeroMemory(mod.base, mod.image_size);
+            arc_breadcrumb_fmt("unload_image_zero_done base=0x%llX size=0x%llX",
+                static_cast<unsigned long long>(image_base_value),
+                static_cast<unsigned long long>(mod.image_size));
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
-
+            arc_breadcrumb_fmt("unload_image_zero_exception code=0x%08lX base=0x%llX size=0x%llX",
+                static_cast<unsigned long>(GetExceptionCode()),
+                static_cast<unsigned long long>(image_base_value),
+                static_cast<unsigned long long>(mod.image_size));
         }
         if (image_writable_for_zero) {
             DWORD discard = 0;
-            VirtualProtect(mod.base, mod.image_size, image_old_protect, &discard);
+            BOOL restore_ok = VirtualProtect(mod.base, mod.image_size, image_old_protect, &discard);
+            DWORD restore_gle = restore_ok ? 0 : GetLastError();
+            arc_breadcrumb_fmt("unload_image_protect_restore_result ok=%d gle=%lu restored=0x%lX discard=0x%lX base=0x%llX size=0x%llX",
+                restore_ok ? 1 : 0,
+                static_cast<unsigned long>(restore_gle),
+                static_cast<unsigned long>(image_old_protect),
+                static_cast<unsigned long>(discard),
+                static_cast<unsigned long long>(image_base_value),
+                static_cast<unsigned long long>(mod.image_size));
         }
-        VirtualFree(mod.base, 0, MEM_RELEASE);
+        arc_log_region_state("unload_before_release", mod.base);
+        BOOL release_ok = VirtualFree(mod.base, 0, MEM_RELEASE);
+        DWORD release_gle = release_ok ? 0 : GetLastError();
+        arc_breadcrumb_fmt("unload_image_release_result ok=%d gle=%lu base=0x%llX size=0x%llX",
+            release_ok ? 1 : 0,
+            static_cast<unsigned long>(release_gle),
+            static_cast<unsigned long long>(image_base_value),
+            static_cast<unsigned long long>(mod.image_size));
+        arc_log_region_state("unload_after_release", reinterpret_cast<const void*>(image_base_value));
         arc_breadcrumb("unload_image_released");
 
         mod.base                 = nullptr;
@@ -2157,6 +2229,11 @@ namespace arc_loader
         mod.ldr_unlinked         = false;
         mod.ldr_unlink_count     = 0;
         mod.unwind_isolated      = false;
+        arc_breadcrumb_fmt("unload_impl_done release_ok=%d gle=%lu base=0x%llX end=0x%llX",
+            release_ok ? 1 : 0,
+            static_cast<unsigned long>(release_gle),
+            static_cast<unsigned long long>(image_base_value),
+            static_cast<unsigned long long>(image_end_value));
     }
 
     void unload(loaded_module_t& mod)

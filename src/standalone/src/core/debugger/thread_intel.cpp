@@ -4,6 +4,7 @@
 #include "thread_intel.hpp"
 
 #include "../analysis/symbol_store.hpp"
+#include "../helpers/diag_log.hpp"
 #include "standalone_driver.hpp"
 
 #include <algorithm>
@@ -462,11 +463,16 @@ bool classify_threads(const classify_options_t& input,
 
     const std::uint32_t sample_count = (std::max)(1u, options.sample_ms / options.interval_ms);
     const auto sample_started = std::chrono::steady_clock::now();
+    std::uint32_t context_sample_attempts = 0;
+    std::uint32_t context_sample_successes = 0;
     for (std::uint32_t i = 0; i < sample_count; ++i) {
         for (auto& st : states) {
             rip_sample_t sample;
-            if (sample_thread_rip(st.info.tid, modules, sample))
+            ++context_sample_attempts;
+            if (sample_thread_rip(st.info.tid, modules, sample)) {
                 st.samples.push_back(std::move(sample));
+                ++context_sample_successes;
+            }
         }
         if (i + 1 < sample_count)
             std::this_thread::sleep_for(std::chrono::milliseconds(options.interval_ms));
@@ -485,14 +491,40 @@ bool classify_threads(const classify_options_t& input,
     }
 
     nlohmann::json arr = nlohmann::json::array();
+    std::uint32_t sampled_threads = 0;
+    std::uint32_t cpu_time_threads = 0;
+    std::uint32_t cycle_time_threads = 0;
+    std::uint32_t kernel_only_threads = 0;
     for (const auto& st : states) {
         const bool cpu_time_available = st.cpu_start_available && st.cpu_end_available;
+        const bool cycle_time_available = st.cycle_start_available && st.cycle_end_available;
         const std::uint64_t cpu_delta = st.cpu_end_100ns > st.cpu_start_100ns ? st.cpu_end_100ns - st.cpu_start_100ns : 0;
         const double cpu_percent = cpu_time_available ? (static_cast<double>(cpu_delta) / (static_cast<double>(sample_elapsed_ms) * 10000.0)) * 100.0 : 0.0;
         nlohmann::json row = classify_one(st, lowest_tid, cpu_percent, sample_count);
+        if (!st.samples.empty())
+            ++sampled_threads;
+        if (cpu_time_available)
+            ++cpu_time_threads;
+        if (cycle_time_available)
+            ++cycle_time_threads;
+        if (!cpu_time_available && !cycle_time_available)
+            ++kernel_only_threads;
         row["cpu_percent_available"] = cpu_time_available;
-        row["cpu_percent_source"] = cpu_time_available ? "GetThreadTimes" : "unavailable";
-        row["kernel_only_capture"] = !cpu_time_available && !(st.cycle_start_available && st.cycle_end_available);
+        row["cpu_percent_source"] = cpu_time_available ? "GetThreadTimes" : "kernel_context_only";
+        row["kernel_only_capture"] = !cpu_time_available && !cycle_time_available;
+        row["timing_enrichment"] = {
+            {"cpu_time_status", cpu_time_available ? "captured" : "not_collected"},
+            {"cpu_time_source", "GetThreadTimes"},
+            {"thread_cycle_status", cycle_time_available ? "captured" : "not_collected"},
+            {"thread_cycle_source", "QueryThreadCycleTime"},
+            {"optional_user_mode_timing", true}
+        };
+        row["kernel_evidence"] = {
+            {"thread_enumerated_by_driver", true},
+            {"initial_rip_from_driver", st.info.rip != 0},
+            {"context_sample_count", st.samples.size()},
+            {"authoritative", true}
+        };
         arr.push_back(std::move(row));
     }
 
@@ -504,18 +536,75 @@ bool classify_threads(const classify_options_t& input,
         return ca > cb;
     });
 
+    std::map<std::string, std::uint32_t> role_counts;
+    std::uint32_t confidence_ge_070 = 0;
+    std::uint32_t confidence_ge_050 = 0;
+    for (const auto& row : arr) {
+        ++role_counts[row.value("role", std::string("worker_or_unknown"))];
+        const double confidence = row.value("confidence", 0.0);
+        if (confidence >= 0.70)
+            ++confidence_ge_070;
+        if (confidence >= 0.50)
+            ++confidence_ge_050;
+    }
+    std::ostringstream role_summary;
+    bool first_role = true;
+    for (const auto& [role, count] : role_counts) {
+        if (!first_role)
+            role_summary << ",";
+        first_role = false;
+        role_summary << role << "=" << count;
+    }
+
     out["process_id"] = pid;
     out["sample_ms"] = options.sample_ms;
     out["sample_elapsed_ms"] = sample_elapsed_ms;
     out["interval_ms"] = options.interval_ms;
     out["thread_count"] = threads.size();
+    out["kernel_evidence"] = {
+        {"authority", "kernel_driver_thread_enumeration_and_context"},
+        {"thread_count", threads.size()},
+        {"module_count", modules.size()},
+        {"context_sample_attempts", context_sample_attempts},
+        {"context_sample_successes", context_sample_successes},
+        {"context_sample_misses", context_sample_attempts >= context_sample_successes ? context_sample_attempts - context_sample_successes : 0},
+        {"sampled_threads", sampled_threads}
+    };
+    out["timing_enrichment"] = {
+        {"optional", true},
+        {"cpu_time_source", "GetThreadTimes"},
+        {"cycle_time_source", "QueryThreadCycleTime"},
+        {"cpu_time_threads", cpu_time_threads},
+        {"cycle_time_threads", cycle_time_threads},
+        {"kernel_only_threads", kernel_only_threads}
+    };
+    out["classification_summary"] = {
+        {"role_histogram", role_counts},
+        {"confidence_ge_070", confidence_ge_070},
+        {"confidence_ge_050", confidence_ge_050}
+    };
     out["threads"] = std::move(arr);
     out["limitations"] = nlohmann::json::array({
-        "roles are heuristic and based on kernel-driver thread enumeration, bounded RIP samples, module names, thread state, priority, CPU time, and thread cycle deltas when available",
-        "user-mode OpenThread/GetThreadTimes/QueryThreadCycleTime timing may be unavailable for protected or inaccessible threads",
+        "roles are heuristic and based on kernel-driver thread enumeration, bounded RIP samples, module names, thread state, priority, and optional timing enrichment",
+        "user-mode OpenThread/GetThreadTimes/QueryThreadCycleTime timing is enrichment only and kernel driver evidence remains authoritative",
         "threads blocked in waits may hide their eventual application callback role",
         "render and network confidence improves when sampling catches API module frames"
     });
+    diag::log_tagged_fmt("thread_intel",
+        "thread_classify_summary pid=%u enumerated=%zu modules=%zu sampled_threads=%u context_attempts=%u context_successes=%u context_misses=%u cpu_time_threads=%u cycle_time_threads=%u kernel_only_threads=%u confidence_ge_070=%u confidence_ge_050=%u roles=%s",
+        pid,
+        threads.size(),
+        modules.size(),
+        sampled_threads,
+        context_sample_attempts,
+        context_sample_successes,
+        context_sample_attempts >= context_sample_successes ? context_sample_attempts - context_sample_successes : 0,
+        cpu_time_threads,
+        cycle_time_threads,
+        kernel_only_threads,
+        confidence_ge_070,
+        confidence_ge_050,
+        role_summary.str().c_str());
     return true;
 }
 

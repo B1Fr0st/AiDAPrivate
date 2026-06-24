@@ -245,6 +245,38 @@ namespace dispatcher {
         return static_cast<UINT64>(((now.QuadPart - start.QuadPart) * 1000000ULL) / static_cast<UINT64>(freq.QuadPart));
     }
 
+    __forceinline UINT64 remote_call_diag_mix(UINT64 value, UINT64 input) {
+        value ^= input + 0x9E3779B97F4A7C15ULL + (value << 6) + (value >> 2);
+        return value;
+    }
+
+    __forceinline UINT64 remote_call_diag_fingerprint(p_remote_call request) {
+        if (!request)
+            return 0;
+        UINT64 value = 0xA1DA778100000001ULL;
+        value = remote_call_diag_mix(value, request->dtb);
+        value = remote_call_diag_mix(value, request->target_function);
+        value = remote_call_diag_mix(value, request->shellcode_address);
+        value = remote_call_diag_mix(value, request->spoof_return);
+        value = remote_call_diag_mix(value, request->arg1);
+        value = remote_call_diag_mix(value, request->arg2);
+        value = remote_call_diag_mix(value, request->arg3);
+        value = remote_call_diag_mix(value, request->arg4);
+        value = remote_call_diag_mix(value, request->original_rip);
+        return value;
+    }
+
+    __forceinline UINT64 call_result_diag_fingerprint(p_call_result request) {
+        if (!request)
+            return 0;
+        UINT64 value = 0xA1DA778200000001ULL;
+        value = remote_call_diag_mix(value, request->dtb);
+        value = remote_call_diag_mix(value, request->result_address);
+        value = remote_call_diag_mix(value, request->result);
+        value = remote_call_diag_mix(value, request->completed);
+        return value;
+    }
+
     struct hvdt_ioctl_decode_snapshot_t {
         ULONG encoded;
         ULONG base;
@@ -1415,23 +1447,122 @@ namespace dispatcher {
         }
         else if (code == ioctl_codes::RC()) {
             if (input_size >= sizeof(_RC) && output_size >= sizeof(_RC)) {
-                status = functions::handle7781((p_remote_call)buffer);
+                p_remote_call rc_req = (p_remote_call)buffer;
+                const UINT64 rc_fp_before = remote_call_diag_fingerprint(rc_req);
+                WW_LOG("DISPATCH_RC_ENTER trace=%lld raw_code=0x%08lx input_size=%lu output_size=%lu requestor=%u requestor_pid=%llu current_pid=%llu current_tid=%llu irql=%lu dtb=0x%llx fn=0x%llx shellcode=0x%llx spoof=0x%llx original_rip=0x%llx fingerprint=0x%llx elapsed_us=%llu",
+                    hvdt_trace_id,
+                    code,
+                    input_size,
+                    output_size,
+                    static_cast<ULONG>(irp->RequestorMode),
+                    requestor_pid_to_u64(irp),
+                    static_cast<UINT64>(reinterpret_cast<ULONG_PTR>(PsGetCurrentProcessId())),
+                    static_cast<UINT64>(reinterpret_cast<ULONG_PTR>(PsGetCurrentThreadId())),
+                    static_cast<ULONG>(KeGetCurrentIrql()),
+                    rc_req->dtb,
+                    rc_req->target_function,
+                    rc_req->shellcode_address,
+                    rc_req->spoof_return,
+                    rc_req->original_rip,
+                    rc_fp_before,
+                    elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq));
+                status = functions::handle7781(rc_req);
                 bytes = sizeof(_RC);
+                WW_LOG("DISPATCH_RC_EXIT trace=%lld status=0x%08lx bytes=%lu dtb=0x%llx fn=0x%llx entry=0x%llx trampoline=0x%llx completed=%llu result=0x%llx fingerprint_before=0x%llx fingerprint_after=0x%llx elapsed_us=%llu",
+                    hvdt_trace_id,
+                    static_cast<ULONG>(status),
+                    bytes,
+                    rc_req->dtb,
+                    rc_req->target_function,
+                    rc_req->shellcode_address,
+                    rc_req->trampoline_addr,
+                    rc_req->completed,
+                    rc_req->result,
+                    rc_fp_before,
+                    remote_call_diag_fingerprint(rc_req),
+                    elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq));
             }
             else {
+                WW_LOG("DISPATCH_RC_SIZE_MISMATCH trace=%lld input_size=%lu output_size=%lu required=%llu requestor_pid=%llu elapsed_us=%llu",
+                    hvdt_trace_id,
+                    input_size,
+                    output_size,
+                    static_cast<UINT64>(sizeof(_RC)),
+                    requestor_pid_to_u64(irp),
+                    elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq));
                 status = STATUS_INFO_LENGTH_MISMATCH;
             }
         }
         else if (code == ioctl_codes::CR()) {
             if (input_size >= sizeof(_CR) && output_size >= sizeof(_CR)) {
-                status = functions::handle7782((p_call_result)buffer);
+                p_call_result cr_req = (p_call_result)buffer;
+                const UINT64 cr_fp_before = call_result_diag_fingerprint(cr_req);
+                WW_LOG("DISPATCH_CR_ENTER trace=%lld raw_code=0x%08lx input_size=%lu output_size=%lu requestor=%u requestor_pid=%llu current_pid=%llu current_tid=%llu irql=%lu dtb=0x%llx result_addr=0x%llx completed=%llu result=0x%llx fingerprint=0x%llx elapsed_us=%llu",
+                    hvdt_trace_id,
+                    code,
+                    input_size,
+                    output_size,
+                    static_cast<ULONG>(irp->RequestorMode),
+                    requestor_pid_to_u64(irp),
+                    static_cast<UINT64>(reinterpret_cast<ULONG_PTR>(PsGetCurrentProcessId())),
+                    static_cast<UINT64>(reinterpret_cast<ULONG_PTR>(PsGetCurrentThreadId())),
+                    static_cast<ULONG>(KeGetCurrentIrql()),
+                    cr_req->dtb,
+                    cr_req->result_address,
+                    cr_req->completed,
+                    cr_req->result,
+                    cr_fp_before,
+                    elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq));
+                status = functions::handle7782(cr_req);
                 bytes = sizeof(_CR);
+                WW_LOG("DISPATCH_CR_EXIT trace=%lld status=0x%08lx bytes=%lu dtb=0x%llx result_addr=0x%llx completed=%llu result=0x%llx fingerprint_before=0x%llx fingerprint_after=0x%llx elapsed_us=%llu",
+                    hvdt_trace_id,
+                    static_cast<ULONG>(status),
+                    bytes,
+                    cr_req->dtb,
+                    cr_req->result_address,
+                    cr_req->completed,
+                    cr_req->result,
+                    cr_fp_before,
+                    call_result_diag_fingerprint(cr_req),
+                    elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq));
             }
             else if (input_size >= (sizeof(_CR) - sizeof(UINT64)) && output_size >= (sizeof(_CR) - sizeof(UINT64))) {
-                status = functions::handle7782_legacy((p_call_result)buffer);
+                p_call_result cr_req = (p_call_result)buffer;
+                const UINT64 cr_fp_before = call_result_diag_fingerprint(cr_req);
+                WW_LOG("DISPATCH_CR_LEGACY_ENTER trace=%lld raw_code=0x%08lx input_size=%lu output_size=%lu requestor_pid=%llu dtb=0x%llx result_addr=0x%llx fingerprint=0x%llx elapsed_us=%llu",
+                    hvdt_trace_id,
+                    code,
+                    input_size,
+                    output_size,
+                    requestor_pid_to_u64(irp),
+                    cr_req->dtb,
+                    cr_req->result_address,
+                    cr_fp_before,
+                    elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq));
+                status = functions::handle7782_legacy(cr_req);
                 bytes = sizeof(_CR) - sizeof(UINT64);
+                WW_LOG("DISPATCH_CR_LEGACY_EXIT trace=%lld status=0x%08lx bytes=%lu dtb=0x%llx result_addr=0x%llx completed=%llu result=0x%llx fingerprint_before=0x%llx fingerprint_after=0x%llx elapsed_us=%llu",
+                    hvdt_trace_id,
+                    static_cast<ULONG>(status),
+                    bytes,
+                    cr_req->dtb,
+                    cr_req->result_address,
+                    cr_req->completed,
+                    cr_req->result,
+                    cr_fp_before,
+                    call_result_diag_fingerprint(cr_req),
+                    elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq));
             }
             else {
+                WW_LOG("DISPATCH_CR_SIZE_MISMATCH trace=%lld input_size=%lu output_size=%lu required=%llu legacy_required=%llu requestor_pid=%llu elapsed_us=%llu",
+                    hvdt_trace_id,
+                    input_size,
+                    output_size,
+                    static_cast<UINT64>(sizeof(_CR)),
+                    static_cast<UINT64>(sizeof(_CR) - sizeof(UINT64)),
+                    requestor_pid_to_u64(irp),
+                    elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq));
                 status = STATUS_INFO_LENGTH_MISMATCH;
             }
         }

@@ -61,6 +61,45 @@ static_assert(offsetof(CALL_CONTEXT, original_rip) == 0x40, "original_rip must b
 static_assert(offsetof(CALL_CONTEXT, exec_done) == 0x50, "exec_done must be at offset 0x50");
 static_assert(offsetof(CALL_CONTEXT, trampoline_addr) == 0x58, "trampoline_addr must be at offset 0x58");
 
+static __forceinline UINT64 rc_diag_mix(UINT64 value, UINT64 input) {
+    value ^= input + 0x9E3779B97F4A7C15ULL + (value << 6) + (value >> 2);
+    return value;
+}
+
+static __forceinline UINT64 rc_diag_fingerprint_remote(p_remote_call request) {
+    if (!request)
+        return 0;
+    UINT64 value = 0xA1DA778100000001ULL;
+    value = rc_diag_mix(value, request->dtb);
+    value = rc_diag_mix(value, request->target_function);
+    value = rc_diag_mix(value, request->shellcode_address);
+    value = rc_diag_mix(value, request->spoof_return);
+    value = rc_diag_mix(value, request->arg1);
+    value = rc_diag_mix(value, request->arg2);
+    value = rc_diag_mix(value, request->arg3);
+    value = rc_diag_mix(value, request->arg4);
+    value = rc_diag_mix(value, request->original_rip);
+    return value;
+}
+
+static __forceinline UINT64 rc_diag_fingerprint_result(p_call_result request) {
+    if (!request)
+        return 0;
+    UINT64 value = 0xA1DA778200000001ULL;
+    value = rc_diag_mix(value, request->dtb);
+    value = rc_diag_mix(value, request->result_address);
+    value = rc_diag_mix(value, request->result);
+    value = rc_diag_mix(value, request->completed);
+    return value;
+}
+
+static __forceinline UINT64 rc_diag_elapsed_us(const LARGE_INTEGER& start, const LARGE_INTEGER& freq) {
+    LARGE_INTEGER now = KeQueryPerformanceCounter(nullptr);
+    if (freq.QuadPart <= 0 || now.QuadPart < start.QuadPart)
+        return 0;
+    return static_cast<UINT64>(((now.QuadPart - start.QuadPart) * 1000000ULL) / static_cast<UINT64>(freq.QuadPart));
+}
+
 namespace poly_engine {
     inline volatile ULONG g_poly_seed = 0xCAFEBABEu;
 
@@ -368,8 +407,31 @@ namespace shellcode_builder {
 NTSTATUS functions::handle7781(p_remote_call request) {
     if (!request) {
         RC_ERR("handle7781: null request");
+        WW_LOG("RC7781_REJECT phase=null_request status=0x%08lx pid=%llu tid=%llu irql=%lu",
+            static_cast<ULONG>(STATUS_INVALID_PARAMETER),
+            static_cast<UINT64>(reinterpret_cast<ULONG_PTR>(PsGetCurrentProcessId())),
+            static_cast<UINT64>(reinterpret_cast<ULONG_PTR>(PsGetCurrentThreadId())),
+            static_cast<ULONG>(KeGetCurrentIrql()));
         return STATUS_INVALID_PARAMETER;
     }
+
+    LARGE_INTEGER rc_freq{};
+    LARGE_INTEGER rc_start = KeQueryPerformanceCounter(&rc_freq);
+    const UINT64 rc_fp = rc_diag_fingerprint_remote(request);
+    WW_LOG("RC7781_ENTRY fp=0x%llx pid=%llu tid=%llu irql=%lu dtb=0x%llx target=0x%llx shellcode=0x%llx spoof=0x%llx original_rip=0x%llx args=0x%llx,0x%llx,0x%llx,0x%llx",
+        rc_fp,
+        static_cast<UINT64>(reinterpret_cast<ULONG_PTR>(PsGetCurrentProcessId())),
+        static_cast<UINT64>(reinterpret_cast<ULONG_PTR>(PsGetCurrentThreadId())),
+        static_cast<ULONG>(KeGetCurrentIrql()),
+        request->dtb,
+        request->target_function,
+        request->shellcode_address,
+        request->spoof_return,
+        request->original_rip,
+        request->arg1,
+        request->arg2,
+        request->arg3,
+        request->arg4);
 
     RC_DBG("handle7781: target_func=0x%llX shellcode_addr=0x%llX dtb=0x%llX spoof=0x%llX",
         request->target_function, request->shellcode_address, request->dtb, request->spoof_return);
@@ -379,21 +441,40 @@ NTSTATUS functions::handle7781(p_remote_call request) {
 
     if (!call_guard::is_valid_code_ptr(request->target_function)) {
         RC_ERR("handle7781: invalid target_function 0x%llX", request->target_function);
+        WW_LOG("RC7781_REJECT fp=0x%llx phase=target_function status=0x%08lx target=0x%llx elapsed_us=%llu",
+            rc_fp,
+            static_cast<ULONG>(STATUS_INVALID_ADDRESS),
+            request->target_function,
+            rc_diag_elapsed_us(rc_start, rc_freq));
         return STATUS_INVALID_ADDRESS;
     }
 
     if (!call_guard::is_valid_dtb(request->dtb)) {
         RC_ERR("handle7781: invalid dtb 0x%llX", request->dtb);
+        WW_LOG("RC7781_REJECT fp=0x%llx phase=dtb status=0x%08lx dtb=0x%llx elapsed_us=%llu",
+            rc_fp,
+            static_cast<ULONG>(STATUS_INVALID_PARAMETER),
+            request->dtb,
+            rc_diag_elapsed_us(rc_start, rc_freq));
         return STATUS_INVALID_PARAMETER;
     }
 
     if (request->shellcode_address == 0) {
         RC_ERR("handle7781: shellcode_address is 0");
+        WW_LOG("RC7781_REJECT fp=0x%llx phase=shellcode_zero status=0x%08lx elapsed_us=%llu",
+            rc_fp,
+            static_cast<ULONG>(STATUS_INVALID_PARAMETER),
+            rc_diag_elapsed_us(rc_start, rc_freq));
         return STATUS_INVALID_PARAMETER;
     }
 
     if (!call_guard::is_valid_user_range(request->shellcode_address)) {
         RC_ERR("handle7781: shellcode_address 0x%llX out of user range", request->shellcode_address);
+        WW_LOG("RC7781_REJECT fp=0x%llx phase=shellcode_range status=0x%08lx shellcode=0x%llx elapsed_us=%llu",
+            rc_fp,
+            static_cast<ULONG>(STATUS_INVALID_ADDRESS),
+            request->shellcode_address,
+            rc_diag_elapsed_us(rc_start, rc_freq));
         return STATUS_INVALID_ADDRESS;
     }
 
@@ -433,6 +514,12 @@ NTSTATUS functions::handle7781(p_remote_call request) {
 
     if (sc_size == 0 || sc_size > sizeof(shellcode)) {
         RC_ERR("handle7781: shellcode build failed, sc_size=%llu", (UINT64)sc_size);
+        WW_LOG("RC7781_REJECT fp=0x%llx phase=shellcode_build status=0x%08lx sc_size=%llu max=%llu elapsed_us=%llu",
+            rc_fp,
+            static_cast<ULONG>(STATUS_UNSUCCESSFUL),
+            static_cast<UINT64>(sc_size),
+            static_cast<UINT64>(sizeof(shellcode)),
+            rc_diag_elapsed_us(rc_start, rc_freq));
         return STATUS_UNSUCCESSFUL;
     }
 
@@ -443,12 +530,29 @@ NTSTATUS functions::handle7781(p_remote_call request) {
 
     if (ep_size == 0 || ep_size > sizeof(epilogue)) {
         RC_ERR("handle7781: epilogue build failed, ep_size=%llu", (UINT64)ep_size);
+        WW_LOG("RC7781_REJECT fp=0x%llx phase=epilogue_build status=0x%08lx ep_size=%llu max=%llu elapsed_us=%llu",
+            rc_fp,
+            static_cast<ULONG>(STATUS_UNSUCCESSFUL),
+            static_cast<UINT64>(ep_size),
+            static_cast<UINT64>(sizeof(epilogue)),
+            rc_diag_elapsed_us(rc_start, rc_freq));
         return STATUS_UNSUCCESSFUL;
     }
 
     RC_DBG("handle7781: epilogue built, size=%llu bytes", (UINT64)ep_size);
     RC_DBG("handle7781: layout base=0x%llX ctx=0x%llX code=0x%llX epi=0x%llX",
         base_addr, context_addr, code_addr, epilogue_addr);
+    WW_LOG("RC7781_LAYOUT fp=0x%llx dtb_clean=0x%llx base=0x%llx ctx=0x%llx code=0x%llx epi=0x%llx sc_size=%llu ep_size=%llu spoof_valid=%u elapsed_us=%llu",
+        rc_fp,
+        dtb_clean,
+        base_addr,
+        context_addr,
+        code_addr,
+        epilogue_addr,
+        static_cast<UINT64>(sc_size),
+        static_cast<UINT64>(ep_size),
+        (request->spoof_return != 0 && call_guard::is_valid_code_ptr(request->spoof_return)) ? 1u : 0u,
+        rc_diag_elapsed_us(rc_start, rc_freq));
 
     SIZE_T bytes_written = 0;
     NTSTATUS status = STATUS_UNSUCCESSFUL;
@@ -456,17 +560,42 @@ NTSTATUS functions::handle7781(p_remote_call request) {
     UINT64 phys_ctx = strong::translate_virtual_address(dtb_clean, context_addr);
     if (!phys_ctx) {
         RC_ERR("handle7781: translate context_addr 0x%llX failed", context_addr);
+        WW_LOG("RC7781_REJECT fp=0x%llx phase=translate_context status=0x%08lx ctx=0x%llx elapsed_us=%llu",
+            rc_fp,
+            static_cast<ULONG>(STATUS_INVALID_ADDRESS),
+            context_addr,
+            rc_diag_elapsed_us(rc_start, rc_freq));
         return STATUS_INVALID_ADDRESS;
     }
 
+    WW_LOG("RC7781_WRITE_CONTEXT_BEGIN fp=0x%llx ctx=0x%llx phys=0x%llx bytes=%llu elapsed_us=%llu",
+        rc_fp,
+        context_addr,
+        phys_ctx,
+        static_cast<UINT64>(sizeof(ctx)),
+        rc_diag_elapsed_us(rc_start, rc_freq));
     status = strong::write_physical((PVOID)phys_ctx, &ctx, sizeof(ctx), &bytes_written);
     if (!NT_SUCCESS(status) || bytes_written != sizeof(ctx)) {
         RC_ERR("handle7781: write context failed st=0x%08X written=%llu/%llu",
             status, (UINT64)bytes_written, (UINT64)sizeof(ctx));
+        WW_LOG("RC7781_REJECT fp=0x%llx phase=write_context status=0x%08lx ctx=0x%llx phys=0x%llx written=%llu expected=%llu elapsed_us=%llu",
+            rc_fp,
+            static_cast<ULONG>(status),
+            context_addr,
+            phys_ctx,
+            static_cast<UINT64>(bytes_written),
+            static_cast<UINT64>(sizeof(ctx)),
+            rc_diag_elapsed_us(rc_start, rc_freq));
         return STATUS_UNSUCCESSFUL;
     }
 
     RC_DBG("handle7781: context written to phys=0x%llX (%llu bytes)", phys_ctx, (UINT64)bytes_written);
+    WW_LOG("RC7781_WRITE_CONTEXT_DONE fp=0x%llx ctx=0x%llx phys=0x%llx written=%llu elapsed_us=%llu",
+        rc_fp,
+        context_addr,
+        phys_ctx,
+        static_cast<UINT64>(bytes_written),
+        rc_diag_elapsed_us(rc_start, rc_freq));
 
     SIZE_T remaining = sc_size;
     SIZE_T offset = 0;
@@ -477,6 +606,13 @@ NTSTATUS functions::handle7781(p_remote_call request) {
 
         if (!physical_addr) {
             RC_ERR("handle7781: translate shellcode VA 0x%llX failed at offset=%llu", current_va, (UINT64)offset);
+            WW_LOG("RC7781_REJECT fp=0x%llx phase=translate_shellcode status=0x%08lx va=0x%llx offset=%llu remaining=%llu elapsed_us=%llu",
+                rc_fp,
+                static_cast<ULONG>(STATUS_INVALID_ADDRESS),
+                current_va,
+                static_cast<UINT64>(offset),
+                static_cast<UINT64>(remaining),
+                rc_diag_elapsed_us(rc_start, rc_freq));
             return STATUS_INVALID_ADDRESS;
         }
 
@@ -494,6 +630,15 @@ NTSTATUS functions::handle7781(p_remote_call request) {
 
         if (!NT_SUCCESS(status)) {
             RC_ERR("handle7781: write shellcode failed st=0x%08X at VA=0x%llX phys=0x%llX", status, current_va, physical_addr);
+            WW_LOG("RC7781_REJECT fp=0x%llx phase=write_shellcode status=0x%08lx va=0x%llx phys=0x%llx offset=%llu write_size=%llu written=%llu elapsed_us=%llu",
+                rc_fp,
+                static_cast<ULONG>(status),
+                current_va,
+                physical_addr,
+                static_cast<UINT64>(offset),
+                static_cast<UINT64>(write_size),
+                static_cast<UINT64>(written),
+                rc_diag_elapsed_us(rc_start, rc_freq));
             return status;
         }
 
@@ -502,6 +647,11 @@ NTSTATUS functions::handle7781(p_remote_call request) {
     }
 
     RC_DBG("handle7781: shellcode written to code_addr=0x%llX (%llu bytes)", code_addr, (UINT64)sc_size);
+    WW_LOG("RC7781_WRITE_SHELLCODE_DONE fp=0x%llx code=0x%llx bytes=%llu elapsed_us=%llu",
+        rc_fp,
+        code_addr,
+        static_cast<UINT64>(sc_size),
+        rc_diag_elapsed_us(rc_start, rc_freq));
 
     remaining = ep_size;
     offset = 0;
@@ -512,6 +662,13 @@ NTSTATUS functions::handle7781(p_remote_call request) {
 
         if (!physical_addr) {
             RC_ERR("handle7781: translate epilogue VA 0x%llX failed at offset=%llu", current_va, (UINT64)offset);
+            WW_LOG("RC7781_REJECT fp=0x%llx phase=translate_epilogue status=0x%08lx va=0x%llx offset=%llu remaining=%llu elapsed_us=%llu",
+                rc_fp,
+                static_cast<ULONG>(STATUS_INVALID_ADDRESS),
+                current_va,
+                static_cast<UINT64>(offset),
+                static_cast<UINT64>(remaining),
+                rc_diag_elapsed_us(rc_start, rc_freq));
             return STATUS_INVALID_ADDRESS;
         }
 
@@ -529,6 +686,15 @@ NTSTATUS functions::handle7781(p_remote_call request) {
 
         if (!NT_SUCCESS(status)) {
             RC_ERR("handle7781: write epilogue failed st=0x%08X at VA=0x%llX phys=0x%llX", status, current_va, physical_addr);
+            WW_LOG("RC7781_REJECT fp=0x%llx phase=write_epilogue status=0x%08lx va=0x%llx phys=0x%llx offset=%llu write_size=%llu written=%llu elapsed_us=%llu",
+                rc_fp,
+                static_cast<ULONG>(status),
+                current_va,
+                physical_addr,
+                static_cast<UINT64>(offset),
+                static_cast<UINT64>(write_size),
+                static_cast<UINT64>(written),
+                rc_diag_elapsed_us(rc_start, rc_freq));
             return status;
         }
 
@@ -537,6 +703,11 @@ NTSTATUS functions::handle7781(p_remote_call request) {
     }
 
     RC_DBG("handle7781: epilogue written to epilogue_addr=0x%llX (%llu bytes)", epilogue_addr, (UINT64)ep_size);
+    WW_LOG("RC7781_WRITE_EPILOGUE_DONE fp=0x%llx epilogue=0x%llx bytes=%llu elapsed_us=%llu",
+        rc_fp,
+        epilogue_addr,
+        static_cast<UINT64>(ep_size),
+        rc_diag_elapsed_us(rc_start, rc_freq));
 
     KeMemoryBarrier();
     _mm_mfence();
@@ -573,6 +744,15 @@ NTSTATUS functions::handle7781(p_remote_call request) {
 
     RC_DBG("handle7781: SUCCESS -- entry=0x%llX ctx=0x%llX epi=0x%llX target=0x%llX",
         code_addr, context_addr, epilogue_addr, request->target_function);
+    WW_LOG("RC7781_SUCCESS fp=0x%llx entry=0x%llx ctx=0x%llx epilogue=0x%llx target=0x%llx result=0x%llx completed=%llu elapsed_us=%llu",
+        rc_fp,
+        code_addr,
+        context_addr,
+        epilogue_addr,
+        request->target_function,
+        request->result,
+        request->completed,
+        rc_diag_elapsed_us(rc_start, rc_freq));
 
     return STATUS_SUCCESS;
 }
@@ -580,21 +760,53 @@ NTSTATUS functions::handle7781(p_remote_call request) {
 NTSTATUS functions::handle7782(p_call_result request) {
     if (!request) {
         RC_ERR("handle7782: null request");
+        WW_LOG("RC7782_REJECT phase=null_request status=0x%08lx pid=%llu tid=%llu irql=%lu",
+            static_cast<ULONG>(STATUS_INVALID_PARAMETER),
+            static_cast<UINT64>(reinterpret_cast<ULONG_PTR>(PsGetCurrentProcessId())),
+            static_cast<UINT64>(reinterpret_cast<ULONG_PTR>(PsGetCurrentThreadId())),
+            static_cast<ULONG>(KeGetCurrentIrql()));
         return STATUS_INVALID_PARAMETER;
     }
 
+    LARGE_INTEGER cr_freq{};
+    LARGE_INTEGER cr_start = KeQueryPerformanceCounter(&cr_freq);
+    const UINT64 cr_fp = rc_diag_fingerprint_result(request);
+    WW_LOG("RC7782_ENTRY fp=0x%llx pid=%llu tid=%llu irql=%lu dtb=0x%llx result_addr=0x%llx completed_in=%llu result_in=0x%llx",
+        cr_fp,
+        static_cast<UINT64>(reinterpret_cast<ULONG_PTR>(PsGetCurrentProcessId())),
+        static_cast<UINT64>(reinterpret_cast<ULONG_PTR>(PsGetCurrentThreadId())),
+        static_cast<ULONG>(KeGetCurrentIrql()),
+        request->dtb,
+        request->result_address,
+        request->completed,
+        request->result);
+
     if (!call_guard::is_valid_dtb(request->dtb)) {
         RC_ERR("handle7782: invalid dtb 0x%llX", request->dtb);
+        WW_LOG("RC7782_REJECT fp=0x%llx phase=dtb status=0x%08lx dtb=0x%llx elapsed_us=%llu",
+            cr_fp,
+            static_cast<ULONG>(STATUS_INVALID_PARAMETER),
+            request->dtb,
+            rc_diag_elapsed_us(cr_start, cr_freq));
         return STATUS_INVALID_PARAMETER;
     }
 
     if (request->result_address == 0) {
         RC_ERR("handle7782: result_address is 0");
+        WW_LOG("RC7782_REJECT fp=0x%llx phase=result_zero status=0x%08lx elapsed_us=%llu",
+            cr_fp,
+            static_cast<ULONG>(STATUS_INVALID_PARAMETER),
+            rc_diag_elapsed_us(cr_start, cr_freq));
         return STATUS_INVALID_PARAMETER;
     }
 
     if (!call_guard::is_valid_user_range(request->result_address)) {
         RC_ERR("handle7782: result_address 0x%llX out of user range", request->result_address);
+        WW_LOG("RC7782_REJECT fp=0x%llx phase=result_range status=0x%08lx result_addr=0x%llx elapsed_us=%llu",
+            cr_fp,
+            static_cast<ULONG>(STATUS_INVALID_ADDRESS),
+            request->result_address,
+            rc_diag_elapsed_us(cr_start, cr_freq));
         return STATUS_INVALID_ADDRESS;
     }
 
@@ -603,6 +815,11 @@ NTSTATUS functions::handle7782(p_call_result request) {
 
     if (!physical_addr) {
         RC_ERR("handle7782: translate result_address 0x%llX failed", request->result_address);
+        WW_LOG("RC7782_REJECT fp=0x%llx phase=translate_result status=0x%08lx result_addr=0x%llx elapsed_us=%llu",
+            cr_fp,
+            static_cast<ULONG>(STATUS_INVALID_ADDRESS),
+            request->result_address,
+            rc_diag_elapsed_us(cr_start, cr_freq));
         return STATUS_INVALID_ADDRESS;
     }
 
@@ -621,6 +838,14 @@ NTSTATUS functions::handle7782(p_call_result request) {
     if (!NT_SUCCESS(status) || bytes_read != sizeof(ctx)) {
         RC_ERR("handle7782: read_physical failed st=0x%08X read=%llu/%llu",
             status, (UINT64)bytes_read, (UINT64)sizeof(ctx));
+        WW_LOG("RC7782_REJECT fp=0x%llx phase=read_context status=0x%08lx result_addr=0x%llx phys=0x%llx read=%llu expected=%llu elapsed_us=%llu",
+            cr_fp,
+            static_cast<ULONG>(status),
+            request->result_address,
+            physical_addr,
+            static_cast<UINT64>(bytes_read),
+            static_cast<UINT64>(sizeof(ctx)),
+            rc_diag_elapsed_us(cr_start, cr_freq));
         return STATUS_UNSUCCESSFUL;
     }
 
@@ -637,6 +862,18 @@ NTSTATUS functions::handle7782(p_call_result request) {
     } else {
 
     }
+
+    WW_LOG("RC7782_DONE fp=0x%llx result_addr=0x%llx phys=0x%llx read=%llu exec_done=0x%llx completed=%llu result=0x%llx saved_rsp=0x%llx original_rip=0x%llx elapsed_us=%llu",
+        cr_fp,
+        request->result_address,
+        physical_addr,
+        static_cast<UINT64>(bytes_read),
+        static_cast<UINT64>(done_flag),
+        request->completed,
+        request->result,
+        ctx.saved_rsp,
+        ctx.original_rip,
+        rc_diag_elapsed_us(cr_start, cr_freq));
 
     return STATUS_SUCCESS;
 }

@@ -1078,6 +1078,12 @@ namespace xref_index {
 		auto deadline_expired = [&]() {
 			return deadline_enabled && std::chrono::steady_clock::now() >= deadline;
 		};
+		auto deadline_remaining_ms = [&]() -> uint64_t {
+			if (!deadline_enabled) return 0;
+			const auto now = std::chrono::steady_clock::now();
+			if (now >= deadline) return 0;
+			return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
+		};
 		auto& reg = detail::registry();
 		result.table_built_before = reg.table_built.load(std::memory_order_acquire);
 		result.rebuild_in_flight_before = reg.rebuild_in_flight.load(std::memory_order_acquire);
@@ -1127,37 +1133,91 @@ namespace xref_index {
 			return finish("no_attached_pid", false);
 
 		if (!reg.table_built.load(std::memory_order_acquire)) {
+			diag::log_tagged_critical_fmt("xref",
+				"bounded_live_range_module_ready_begin table_built=0 rebuild_in_flight=%d deadline_remaining_ms=%llu pid=%u tid=%lu elapsed_us=%llu",
+				reg.rebuild_in_flight.load(std::memory_order_acquire) ? 1 : 0,
+				static_cast<unsigned long long>(deadline_remaining_ms()),
+				result.pid,
+				detail::current_worker_tid(),
+				static_cast<unsigned long long>(detail::elapsed_us_since(started)));
 			bool expected = false;
 			if (reg.rebuild_in_flight.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+				if (deadline_enabled) {
+					reg.rebuild_in_flight.store(false, std::memory_order_release);
+					return finish("deadline_before_module_table_rebuild", false);
+				}
+				const auto rebuild_started = std::chrono::steady_clock::now();
 				detail::rebuild_module_table_offlock(reg);
 				reg.rebuild_in_flight.store(false, std::memory_order_release);
+				diag::log_tagged_critical_fmt("xref",
+					"bounded_live_range_module_ready_rebuild_end table_built=%d elapsed_us=%llu total_elapsed_us=%llu",
+					reg.table_built.load(std::memory_order_acquire) ? 1 : 0,
+					static_cast<unsigned long long>(detail::elapsed_us_since(rebuild_started)),
+					static_cast<unsigned long long>(detail::elapsed_us_since(started)));
 			} else {
 				const auto wait_limit = started + std::chrono::milliseconds(timeout_ms > 250 ? 250 : timeout_ms);
 				while (!reg.table_built.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < wait_limit) {
+					if (deadline_expired())
+						return finish("deadline_waiting_module_table_rebuild", false);
 					std::this_thread::sleep_for(std::chrono::milliseconds(10));
 				}
-				if (!reg.table_built.load(std::memory_order_acquire))
+				if (!reg.table_built.load(std::memory_order_acquire)) {
+					if (deadline_enabled)
+						return finish("deadline_waiting_module_table_rebuild", false);
 					detail::rebuild_module_table_offlock(reg);
+				}
 			}
+			diag::log_tagged_critical_fmt("xref",
+				"bounded_live_range_module_ready_end table_built=%d rebuild_in_flight=%d deadline_remaining_ms=%llu pid=%u tid=%lu elapsed_us=%llu",
+				reg.table_built.load(std::memory_order_acquire) ? 1 : 0,
+				reg.rebuild_in_flight.load(std::memory_order_acquire) ? 1 : 0,
+				static_cast<unsigned long long>(deadline_remaining_ms()),
+				result.pid,
+				detail::current_worker_tid(),
+				static_cast<unsigned long long>(detail::elapsed_us_since(started)));
 		}
 
 		if (!reg.table_built.load(std::memory_order_acquire))
 			return finish("module_table_not_built", false);
 
-		{
-			std::shared_lock<std::shared_mutex> lk(reg.rw);
-			for (const auto& r : reg.table) {
-				if (r.end_va <= lo_addr || r.start_va >= hi_addr) continue;
-				if (!r.index) continue;
-				mod = r.index;
-				result.module = r.name;
-				result.module_base = r.start_va;
-				uint64_t size64 = r.end_va > r.start_va ? (r.end_va - r.start_va) : 0;
-				if (size64 > 0xFFFFFFFFull)
-					size64 = 0xFFFFFFFFull;
-				result.module_size = static_cast<uint32_t>(size64);
+		diag::log_tagged_critical_fmt("xref",
+			"bounded_live_range_module_lookup_begin table_size_unknown=1 deadline_remaining_ms=%llu pid=%u tid=%lu elapsed_us=%llu",
+			static_cast<unsigned long long>(deadline_remaining_ms()),
+			result.pid,
+			detail::current_worker_tid(),
+			static_cast<unsigned long long>(detail::elapsed_us_since(started)));
+		bool lookup_lock_busy = false;
+		for (;;) {
+			std::shared_lock<std::shared_mutex> lk(reg.rw, std::try_to_lock);
+			if (lk.owns_lock()) {
+				const size_t table_size = reg.table.size();
+				for (const auto& r : reg.table) {
+					if (r.end_va <= lo_addr || r.start_va >= hi_addr) continue;
+					if (!r.index) continue;
+					mod = r.index;
+					result.module = r.name;
+					result.module_base = r.start_va;
+					uint64_t size64 = r.end_va > r.start_va ? (r.end_va - r.start_va) : 0;
+					if (size64 > 0xFFFFFFFFull)
+						size64 = 0xFFFFFFFFull;
+					result.module_size = static_cast<uint32_t>(size64);
+					break;
+				}
+				diag::log_tagged_critical_fmt("xref",
+					"bounded_live_range_module_lookup_end found=%d table_size=%zu lock_busy=%d deadline_remaining_ms=%llu pid=%u tid=%lu elapsed_us=%llu",
+					mod ? 1 : 0,
+					table_size,
+					lookup_lock_busy ? 1 : 0,
+					static_cast<unsigned long long>(deadline_remaining_ms()),
+					result.pid,
+					detail::current_worker_tid(),
+					static_cast<unsigned long long>(detail::elapsed_us_since(started)));
 				break;
 			}
+			lookup_lock_busy = true;
+			if (deadline_expired())
+				return finish("deadline_waiting_module_table_lookup_lock", false);
+			std::this_thread::sleep_for(std::chrono::milliseconds(2));
 		}
 
 		if (!mod)
@@ -1177,10 +1237,33 @@ namespace xref_index {
 		if (result.clipped_hi <= result.clipped_lo)
 			return finish("range_outside_module", false);
 
+		if (deadline_expired())
+			return finish("deadline_before_pe_parse", false);
 		pe_parser::pe_info_t pe;
 		std::vector<pe_parser::section_info_t> sections;
+		const auto pe_started = std::chrono::steady_clock::now();
+		diag::log_tagged_critical_fmt("xref",
+			"bounded_live_range_pe_parse_begin module=%s base=0x%llX deadline_remaining_ms=%llu pid=%u tid=%lu elapsed_us=%llu",
+			result.module.c_str(),
+			static_cast<unsigned long long>(result.module_base),
+			static_cast<unsigned long long>(deadline_remaining_ms()),
+			result.pid,
+			detail::current_worker_tid(),
+			static_cast<unsigned long long>(detail::elapsed_us_since(started)));
 		if (pe_parser::parse(result.module_base, pe))
 			sections = pe.sections;
+		diag::log_tagged_critical_fmt("xref",
+			"bounded_live_range_pe_parse_end module=%s ok=%d sections=%zu parse_elapsed_us=%llu deadline_remaining_ms=%llu pid=%u tid=%lu elapsed_us=%llu",
+			result.module.c_str(),
+			sections.empty() ? 0 : 1,
+			sections.size(),
+			static_cast<unsigned long long>(detail::elapsed_us_since(pe_started)),
+			static_cast<unsigned long long>(deadline_remaining_ms()),
+			result.pid,
+			detail::current_worker_tid(),
+			static_cast<unsigned long long>(detail::elapsed_us_since(started)));
+		if (deadline_expired())
+			return finish("deadline_after_pe_parse", false);
 		if (sections.empty())
 			return finish("pe_sections_unavailable", false);
 		diag::log_tagged_critical_fmt("xref",
@@ -1195,11 +1278,97 @@ namespace xref_index {
 			detail::current_worker_tid(),
 			static_cast<unsigned long long>(detail::elapsed_us_since(started)));
 
-		auto fns = detail::snapshot_functions(result.module_base, result.module_size);
+		if (deadline_expired())
+			return finish("deadline_before_function_snapshot", false);
+		const auto function_snapshot_started = std::chrono::steady_clock::now();
+		diag::log_tagged_critical_fmt("xref",
+			"bounded_live_range_function_snapshot_begin module=%s base=0x%llX size=0x%X deadline_remaining_ms=%llu pid=%u tid=%lu elapsed_us=%llu",
+			result.module.c_str(),
+			static_cast<unsigned long long>(result.module_base),
+			result.module_size,
+			static_cast<unsigned long long>(deadline_remaining_ms()),
+			result.pid,
+			detail::current_worker_tid(),
+			static_cast<unsigned long long>(detail::elapsed_us_since(started)));
+		std::vector<functions_panel::function_entry_t> fns;
+		bool function_snapshot_lock_busy = false;
+		{
+			auto& fs = functions_panel::state();
+			if (fs.ready.load(std::memory_order_acquire)) {
+				std::unique_lock<std::mutex> lk(fs.mtx, std::try_to_lock);
+				if (lk.owns_lock()) {
+					fns.reserve(fs.entries.size());
+					for (const auto& e : fs.entries) {
+						if (e.address >= result.module_base && e.address < result.module_base + result.module_size)
+							fns.push_back(e);
+					}
+				} else {
+					function_snapshot_lock_busy = true;
+				}
+			}
+		}
+		if (fns.empty() && !deadline_expired()) {
+			auto& fc = function_index::detail::cache();
+			std::shared_lock<std::shared_mutex> lk(fc.mutex, std::try_to_lock);
+			if (lk.owns_lock()) {
+				fns.reserve(fc.sorted_starts.size());
+				for (uint64_t start : fc.sorted_starts) {
+					if (start < result.module_base) continue;
+					if (start >= result.module_base + result.module_size) continue;
+					functions_panel::function_entry_t fe;
+					fe.address = start;
+					auto bit = fc.by_start.find(start);
+					if (bit != fc.by_start.end()) {
+						uint64_t end = bit->second.end;
+						if (end > start && (end - start) <= 0xFFFFFFFFull)
+							fe.size = static_cast<uint32_t>(end - start);
+						fe.name = bit->second.display_name;
+						fe.section = bit->second.section;
+					}
+					if (fe.name.empty()) {
+						auto sit = fc.synthetic_names.find(start);
+						if (sit != fc.synthetic_names.end() && !sit->second.empty())
+							fe.name = sit->second;
+						else
+							fe.name = function_index::detail::make_synthetic_sub(start);
+					}
+					fns.push_back(std::move(fe));
+				}
+			} else {
+				function_snapshot_lock_busy = true;
+			}
+		}
+		std::sort(fns.begin(), fns.end(),
+			[](const functions_panel::function_entry_t& a, const functions_panel::function_entry_t& b) {
+				return a.address < b.address;
+			});
+		diag::log_tagged_critical_fmt("xref",
+			"bounded_live_range_function_snapshot_end module=%s count=%zu lock_busy=%d snapshot_elapsed_us=%llu deadline_remaining_ms=%llu pid=%u tid=%lu elapsed_us=%llu",
+			result.module.c_str(),
+			fns.size(),
+			function_snapshot_lock_busy ? 1 : 0,
+			static_cast<unsigned long long>(detail::elapsed_us_since(function_snapshot_started)),
+			static_cast<unsigned long long>(deadline_remaining_ms()),
+			result.pid,
+			detail::current_worker_tid(),
+			static_cast<unsigned long long>(detail::elapsed_us_since(started)));
+		if (deadline_expired())
+			return finish("deadline_after_function_snapshot", false);
+		if (function_snapshot_lock_busy && fns.empty())
+			return finish("function_snapshot_lock_busy", false);
 		std::unordered_map<uint64_t, std::vector<annotation_t>> map;
 		map.reserve(1024);
 
 		const size_t page_size = 4096;
+		diag::log_tagged_critical_fmt("xref",
+			"bounded_live_range_page_loop_ready module=%s sections=%zu functions=%zu deadline_remaining_ms=%llu pid=%u tid=%lu elapsed_us=%llu",
+			result.module.c_str(),
+			sections.size(),
+			fns.size(),
+			static_cast<unsigned long long>(deadline_remaining_ms()),
+			result.pid,
+			detail::current_worker_tid(),
+			static_cast<unsigned long long>(detail::elapsed_us_since(started)));
 		for (const auto& s : sections) {
 			if (!detail::section_is_code(s.characteristics))
 				continue;

@@ -1,5 +1,7 @@
 #include "encptr.hpp"
 
+#include "../../helpers/diag_log.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <set>
@@ -10,6 +12,51 @@ namespace re::encptr
 {
 namespace
 {
+std::uint64_t deadline_remaining_ms()
+{
+    const std::uint64_t deadline = mcp_standalone::current_call_deadline_ms();
+    if (deadline == 0)
+        return 0;
+    const std::uint64_t now = GetTickCount64();
+    return deadline > now ? deadline - now : 0;
+}
+
+bool encptr_call_cancelled(const char* phase, std::uint32_t pid, std::uint64_t started_ms)
+{
+    if (mcp_standalone::current_call_cancelled())
+    {
+        diag::log_tagged_fmt("encptr", "cancelled phase=%s pid=%u elapsed_ms=%llu diag_id=%s",
+                             phase ? phase : "",
+                             pid,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms),
+                             mcp_standalone::current_call_diag_id());
+        return true;
+    }
+    const std::uint64_t deadline = mcp_standalone::current_call_deadline_ms();
+    if (deadline != 0 && GetTickCount64() >= deadline)
+    {
+        diag::log_tagged_fmt("encptr", "deadline_reached phase=%s pid=%u elapsed_ms=%llu diag_id=%s",
+                             phase ? phase : "",
+                             pid,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms),
+                             mcp_standalone::current_call_diag_id());
+        return true;
+    }
+    return false;
+}
+
+json encptr_cancel_detail(const char* action, std::uint32_t pid, std::uint64_t started_ms)
+{
+    return json{
+        {"action", action ? action : ""},
+        {"process_id", pid},
+        {"elapsed_ms", GetTickCount64() - started_ms},
+        {"deadline_remaining_ms", deadline_remaining_ms()},
+        {"cancelled", mcp_standalone::current_call_cancelled()},
+        {"diag_id", mcp_standalone::current_call_diag_id()}
+    };
+}
+
 std::uint64_t rotl64(std::uint64_t value, unsigned bits)
 {
     bits &= 63u;
@@ -472,14 +519,32 @@ tool_result_t detect_transform(const json& params)
     if (!parse_address_param(params, "expected_next", expected))
         return tool_result_t::error("'expected_next' is required.");
     const bool has_address = parse_address_param(params, "address_va", address) || parse_address_param(params, "slot_va", address);
-    const auto transforms = detect_transforms(raw, expected, address, has_address, true, true, true, true);
+    const bool test_xor = bool_param(params, "test_xor", true);
+    const bool test_add = bool_param(params, "test_add", true);
+    const bool test_rol = bool_param(params, "test_rol", true);
+    const bool allow_derived_keys = bool_param(params, "allow_derived_keys", bool_param(params, "auto_derive", true));
+    const auto transforms = detect_transforms(raw, expected, address, has_address, test_xor, test_rol, test_add, allow_derived_keys);
     json result;
+    result["raw_value"] = sa_format_address(raw);
+    result["expected_next"] = sa_format_address(expected);
+    result["address_va"] = has_address ? json(sa_format_address(address)) : json(nullptr);
+    result["candidate_family_controls"] = {
+        {"test_xor", test_xor},
+        {"test_add", test_add},
+        {"test_rol", test_rol},
+        {"allow_derived_keys", allow_derived_keys}
+    };
     if (transforms.empty())
     {
         result["transform_type"] = nullptr;
+        result["candidates"] = json::array();
+        result["candidate_count"] = 0;
         return tool_result_t::ok("No transform detected.", result);
     }
-    result = transforms.front();
+    json selected = transforms.front();
+    for (auto it = result.begin(); it != result.end(); ++it)
+        selected[it.key()] = it.value();
+    result = std::move(selected);
     result["candidates"] = transforms;
     result["candidate_count"] = transforms.size();
     result["ambiguity"] = {
@@ -493,6 +558,7 @@ tool_result_t detect_transform(const json& params)
 
 tool_result_t scan_chain(const json& params)
 {
+    const std::uint64_t started_ms = GetTickCount64();
     active_process_scope_t scope(params);
     if (!scope.ok())
         return tool_result_t::error(scope.error());
@@ -512,6 +578,17 @@ tool_result_t scan_chain(const json& params)
     const std::int64_t max_offset = static_cast<std::int64_t>(numeric_param(params, "max_offset", 0x400, 0, 0x4000));
     const std::size_t max_paths = static_cast<std::size_t>(numeric_param(params, "max_results", 64, 1, 512));
     const std::size_t max_candidates_per_slot = static_cast<std::size_t>(numeric_param(params, "max_candidates_per_slot", 96, 8, 512));
+    diag::log_tagged_fmt("encptr",
+                         "scan_chain enter pid=%u source=%s target=%s max_hops=%zu max_offset=%lld max_paths=%zu max_candidates_per_slot=%zu deadline_remaining_ms=%llu diag_id=%s",
+                         scope.pid(),
+                         sa_format_address(source).c_str(),
+                         sa_format_address(target).c_str(),
+                         max_hops,
+                         static_cast<long long>(max_offset),
+                         max_paths,
+                         max_candidates_per_slot,
+                         static_cast<unsigned long long>(deadline_remaining_ms()),
+                         mcp_standalone::current_call_diag_id());
     std::vector<std::uint64_t> xor_keys = numeric_array_param(params, "xor_keys");
     std::vector<std::uint64_t> add_keys = numeric_array_param(params, "add_keys");
     std::vector<std::uint64_t> sub_keys = numeric_array_param(params, "sub_keys");
@@ -533,7 +610,15 @@ tool_result_t scan_chain(const json& params)
         if (parse_u64_value(params["sub_key"], key))
             sub_keys.push_back(key);
     }
-    if (!valid_address(scope.pid(), target))
+    const auto target_check_started = GetTickCount64();
+    const bool target_valid = valid_address(scope.pid(), target);
+    diag::log_tagged_fmt("encptr",
+                         "scan_chain target_check pid=%u target=%s valid=%d elapsed_ms=%llu",
+                         scope.pid(),
+                         sa_format_address(target).c_str(),
+                         target_valid ? 1 : 0,
+                         static_cast<unsigned long long>(GetTickCount64() - target_check_started));
+    if (!target_valid)
         return tool_result_t::error("'target_va' does not currently resolve to readable memory.");
 
     struct node_t
@@ -546,20 +631,45 @@ tool_result_t scan_chain(const json& params)
     frontier.push_back({source, json::array()});
     std::set<std::pair<std::uint64_t, std::size_t>> visited;
     json paths = json::array();
+    std::size_t slots_scanned_total = 0;
+    std::size_t read_failures_total = 0;
+    std::size_t candidates_total = 0;
+    std::size_t matches_total = 0;
+    std::size_t valid_pointer_probes_total = 0;
+    std::size_t valid_pointer_hits_total = 0;
+    std::size_t pruned_seen_total = 0;
 
     for (std::size_t depth = 0; depth < max_hops && !frontier.empty() && paths.size() < max_paths; ++depth)
     {
+        if (encptr_call_cancelled("scan_chain_depth_begin", scope.pid(), started_ms))
+            return tool_result_t::error("Encrypted pointer chain scan cancelled.", encptr_cancel_detail("scan_chain", scope.pid(), started_ms));
+        const std::size_t depth_frontier = frontier.size();
+        std::size_t depth_slots = 0;
+        std::size_t depth_read_failures = 0;
+        std::size_t depth_candidates = 0;
+        std::size_t depth_matches = 0;
+        std::size_t depth_valid_probes = 0;
+        std::size_t depth_valid_hits = 0;
+        std::size_t depth_pruned_seen = 0;
         std::vector<node_t> next;
         for (const auto& node : frontier)
         {
             for (std::int64_t offset = -max_offset; offset <= max_offset; offset += 8)
             {
+                ++depth_slots;
+                ++slots_scanned_total;
+                if ((slots_scanned_total & 0x7Fu) == 0 && encptr_call_cancelled("scan_chain_slots", scope.pid(), started_ms))
+                    return tool_result_t::error("Encrypted pointer chain scan cancelled.", encptr_cancel_detail("scan_chain", scope.pid(), started_ms));
                 std::uint64_t slot_va = 0;
                 if (!add_signed(node.address, offset, slot_va))
                     continue;
                 std::uint64_t raw = 0;
                 if (!read_u64(scope.pid(), slot_va, raw))
+                {
+                    ++depth_read_failures;
+                    ++read_failures_total;
                     continue;
+                }
                 auto candidates = build_candidates(raw,
                                                    slot_va,
                                                    target,
@@ -571,10 +681,14 @@ tool_result_t scan_chain(const json& params)
                                                    test_add,
                                                    auto_derive,
                                                    max_candidates_per_slot);
+                depth_candidates += candidates.size();
+                candidates_total += candidates.size();
                 for (const auto& candidate : candidates)
                 {
                     if (candidate.result != target)
                         continue;
+                    ++depth_matches;
+                    ++matches_total;
                     json hops = node.hops;
                     hops.push_back(hop_json(candidate, offset, raw, slot_va));
                     json chain;
@@ -597,8 +711,13 @@ tool_result_t scan_chain(const json& params)
 
                 for (const auto& candidate : candidates)
                 {
-                    if (!valid_pointer(scope.pid(), candidate.result))
+                    ++depth_valid_probes;
+                    ++valid_pointer_probes_total;
+                    const bool pointer_ok = valid_pointer(scope.pid(), candidate.result);
+                    if (!pointer_ok)
                         continue;
+                    ++depth_valid_hits;
+                    ++valid_pointer_hits_total;
                     auto key = std::make_pair(candidate.result, depth + 1);
                     if (visited.insert(key).second)
                     {
@@ -606,14 +725,43 @@ tool_result_t scan_chain(const json& params)
                         hops.push_back(hop_json(candidate, offset, raw, slot_va));
                         next.push_back({candidate.result, std::move(hops)});
                     }
+                    else
+                    {
+                        ++depth_pruned_seen;
+                        ++pruned_seen_total;
+                    }
                 }
             }
             if (paths.size() >= max_paths)
                 break;
         }
+        diag::log_tagged_fmt("encptr",
+                             "scan_chain depth_summary pid=%u depth=%zu frontier=%zu next=%zu paths=%zu slots=%zu read_failures=%zu candidates=%zu matches=%zu valid_probes=%zu valid_hits=%zu pruned_seen=%zu deadline_remaining_ms=%llu elapsed_ms=%llu",
+                             scope.pid(),
+                             depth,
+                             depth_frontier,
+                             next.size(),
+                             paths.size(),
+                             depth_slots,
+                             depth_read_failures,
+                             depth_candidates,
+                             depth_matches,
+                             depth_valid_probes,
+                             depth_valid_hits,
+                             depth_pruned_seen,
+                             static_cast<unsigned long long>(deadline_remaining_ms()),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
         frontier = std::move(next);
         if (frontier.size() > 4096)
+        {
+            diag::log_tagged_fmt("encptr",
+                                 "scan_chain frontier_truncate pid=%u depth=%zu before=%zu after=4096 elapsed_ms=%llu",
+                                 scope.pid(),
+                                 depth,
+                                 frontier.size(),
+                                 static_cast<unsigned long long>(GetTickCount64() - started_ms));
             frontier.resize(4096);
+        }
     }
 
     json result;
@@ -622,6 +770,14 @@ tool_result_t scan_chain(const json& params)
     result["target_va"] = sa_format_address(target);
     result["auto_derive"] = auto_derive;
     result["max_candidates_per_slot"] = max_candidates_per_slot;
+    result["slots_scanned"] = slots_scanned_total;
+    result["read_failures"] = read_failures_total;
+    result["candidates_built"] = candidates_total;
+    result["candidate_matches"] = matches_total;
+    result["valid_pointer_probes"] = valid_pointer_probes_total;
+    result["valid_pointer_hits"] = valid_pointer_hits_total;
+    result["pruned_seen"] = pruned_seen_total;
+    result["visited_count"] = visited.size();
     if (auto module = find_module_for_address(scope.pid(), source))
     {
         result["source_module_name"] = module->name;
@@ -631,11 +787,30 @@ tool_result_t scan_chain(const json& params)
     result["paths"] = std::move(paths);
     result["count"] = result["paths"].size();
     result["exhausted"] = result["count"].get<std::size_t>() >= max_paths;
+    result["elapsed_ms"] = GetTickCount64() - started_ms;
+    diag::log_tagged_fmt("encptr",
+                         "scan_chain exit pid=%u count=%zu exhausted=%d slots=%zu read_failures=%zu candidates=%zu matches=%zu valid_probes=%zu valid_hits=%zu visited=%zu elapsed_ms=%llu",
+                         scope.pid(),
+                         result["count"].get<std::size_t>(),
+                         result["exhausted"].get<bool>() ? 1 : 0,
+                         slots_scanned_total,
+                         read_failures_total,
+                         candidates_total,
+                         matches_total,
+                         valid_pointer_probes_total,
+                         valid_pointer_hits_total,
+                         visited.size(),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     return tool_result_t::ok(result);
 }
 
 tool_result_t emit_resolver(const json& params)
 {
+    const std::uint64_t started_ms = GetTickCount64();
+    diag::log_tagged_fmt("encptr",
+                         "emit_resolver enter deadline_remaining_ms=%llu diag_id=%s",
+                         static_cast<unsigned long long>(deadline_remaining_ms()),
+                         mcp_standalone::current_call_diag_id());
     json selected_chain;
     std::string chain_error;
     if (!select_chain_input(params, selected_chain, chain_error))
@@ -706,11 +881,19 @@ tool_result_t emit_resolver(const json& params)
 
     json result;
     result["cpp_source"] = os.str();
+    result["elapsed_ms"] = GetTickCount64() - started_ms;
+    diag::log_tagged_fmt("encptr",
+                         "emit_resolver exit function=%s hops=%zu bytes=%zu elapsed_ms=%llu",
+                         fn.c_str(),
+                         hops_array.size(),
+                         os.str().size(),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     return tool_result_t::ok(result);
 }
 
 tool_result_t verify_stable(const json& params)
 {
+    const std::uint64_t started_ms = GetTickCount64();
     active_process_scope_t scope(params);
     if (!scope.ok())
         return tool_result_t::error(scope.error());
@@ -719,25 +902,79 @@ tool_result_t verify_stable(const json& params)
 
     const std::size_t samples = static_cast<std::size_t>(numeric_param(params, "samples", 10, 1, 100));
     const std::uint64_t interval_ms = numeric_param(params, "interval_ms", 500, 0, 10000);
+    diag::log_tagged_fmt("encptr",
+                         "verify_stable enter pid=%u samples=%zu interval_ms=%llu deadline_remaining_ms=%llu diag_id=%s",
+                         scope.pid(),
+                         samples,
+                         static_cast<unsigned long long>(interval_ms),
+                         static_cast<unsigned long long>(deadline_remaining_ms()),
+                         mcp_standalone::current_call_diag_id());
     json values = json::array();
     std::set<std::uint64_t> unique;
     std::size_t ok_count = 0;
+    std::size_t failures = 0;
+    bool deadline_hit = false;
+    bool cancelled = false;
     for (std::size_t i = 0; i < samples; ++i)
     {
+        if (encptr_call_cancelled("verify_stable_sample", scope.pid(), started_ms))
+        {
+            deadline_hit = true;
+            cancelled = mcp_standalone::current_call_cancelled();
+            break;
+        }
+        const auto sample_started = GetTickCount64();
         std::uint64_t value = 0;
         const bool ok = resolve_chain_once(scope.pid(), params["chain"], value);
         json row;
         row["sample"] = i;
         row["ok"] = ok;
+        row["elapsed_ms"] = GetTickCount64() - sample_started;
         if (ok)
         {
             row["value"] = sa_format_address(value);
             unique.insert(value);
             ++ok_count;
         }
+        else
+        {
+            ++failures;
+        }
         values.push_back(std::move(row));
+        diag::log_tagged_fmt("encptr",
+                             "verify_stable sample pid=%u index=%zu ok=%d unique=%zu failures=%zu sample_elapsed_ms=%llu total_elapsed_ms=%llu deadline_remaining_ms=%llu",
+                             scope.pid(),
+                             i,
+                             ok ? 1 : 0,
+                             unique.size(),
+                             failures,
+                             static_cast<unsigned long long>(GetTickCount64() - sample_started),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms),
+                             static_cast<unsigned long long>(deadline_remaining_ms()));
         if (i + 1 < samples && interval_ms != 0)
-            std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
+        {
+            const std::uint64_t remaining = deadline_remaining_ms();
+            if (mcp_standalone::current_call_deadline_ms() != 0 && remaining == 0)
+            {
+                deadline_hit = true;
+                cancelled = mcp_standalone::current_call_cancelled();
+                break;
+            }
+            const std::uint64_t sleep_ms = mcp_standalone::current_call_deadline_ms() == 0 ? interval_ms : std::min<std::uint64_t>(interval_ms, remaining);
+            if (sleep_ms == 0)
+            {
+                deadline_hit = true;
+                cancelled = mcp_standalone::current_call_cancelled();
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+            if (sleep_ms < interval_ms)
+            {
+                deadline_hit = true;
+                cancelled = mcp_standalone::current_call_cancelled();
+                break;
+            }
+        }
     }
     std::string stability = "never_same";
     if (ok_count == samples && unique.size() == 1)
@@ -749,9 +986,24 @@ tool_result_t verify_stable(const json& params)
     result["process_id"] = scope.pid();
     result["samples_requested"] = samples;
     result["samples_ok"] = ok_count;
+    result["sample_failures"] = failures;
     result["unique_values"] = unique.size();
     result["stability"] = stability;
+    result["deadline_hit"] = deadline_hit;
+    result["cancelled"] = cancelled;
+    result["elapsed_ms"] = GetTickCount64() - started_ms;
     result["samples"] = std::move(values);
+    diag::log_tagged_fmt("encptr",
+                         "verify_stable exit pid=%u ok_samples=%zu failures=%zu unique=%zu stability=%s deadline_hit=%d elapsed_ms=%llu",
+                         scope.pid(),
+                         ok_count,
+                         failures,
+                         unique.size(),
+                         stability.c_str(),
+                         deadline_hit ? 1 : 0,
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
+    if (deadline_hit)
+        return tool_result_t::error(cancelled ? "Encrypted pointer stability verification cancelled." : "Encrypted pointer stability verification deadline reached before all samples completed.", result);
     return tool_result_t::ok(result);
 }
 }

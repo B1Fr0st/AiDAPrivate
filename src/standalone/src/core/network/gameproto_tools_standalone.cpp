@@ -5,18 +5,236 @@
 #include "game_protocol.hpp"
 #include "obfuscation.hpp"
 #include "helpers/diag_log.hpp"
+#include "../infra/work_queue.hpp"
+#include "../infra/critical_work_queue.hpp"
+#include "../runtime/standalone_driver.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <cctype>
 #include <cstdint>
+#include <cstdlib>
 #include <optional>
+#include <sstream>
 #include <string>
+#include <vector>
 
 using json = nlohmann::json;
 using tool_result_t = mcp_standalone::tool_result_t;
 
 namespace gameproto_tools {
 namespace {
+
+template <typename StatsT>
+json work_queue_stats_to_json(const StatsT& s)
+{
+    json j;
+    j["alive"] = s.alive;
+    j["shutting_down"] = s.shutting_down;
+    j["pool_size"] = s.pool_size;
+    j["workers"] = static_cast<std::uint64_t>(s.workers);
+    j["pending"] = static_cast<std::uint64_t>(s.pending);
+    j["active"] = s.active;
+    j["post_attempts"] = s.post_attempts;
+    j["posted"] = s.posted;
+    j["rejected"] = s.rejected;
+    j["started"] = s.started;
+    j["finished"] = s.finished;
+    j["oldest_active_ms"] = s.oldest_active_ms;
+    j["active_label_count"] = s.active_label_count;
+    j["active_labels"] = s.active_labels;
+    return j;
+}
+
+int current_wsa_last_error()
+{
+    HMODULE ws2 = GetModuleHandleW(L"Ws2_32.dll");
+    if (!ws2)
+        return 0;
+    using wsa_get_last_error_fn = int(__stdcall*)();
+    auto fn = reinterpret_cast<wsa_get_last_error_fn>(GetProcAddress(ws2, "WSAGetLastError"));
+    return fn ? fn() : 0;
+}
+
+bool process_alive_for_protocol_status(std::uint32_t pid)
+{
+    if (pid == 0)
+        return false;
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid);
+    if (!h)
+        return false;
+    const DWORD wait = WaitForSingleObject(h, 0);
+    CloseHandle(h);
+    return wait == WAIT_TIMEOUT;
+}
+
+std::optional<std::uint64_t> u64_from_protocol_params(const json& params, const char* name)
+{
+    if (!name || !params.contains(name))
+        return std::nullopt;
+    const auto& v = params[name];
+    if (v.is_number_unsigned())
+        return v.get<std::uint64_t>();
+    if (v.is_number_integer()) {
+        const auto n = v.get<std::int64_t>();
+        if (n >= 0)
+            return static_cast<std::uint64_t>(n);
+    }
+    if (v.is_string()) {
+        std::string s = v.get<std::string>();
+        char* end = nullptr;
+        errno = 0;
+        const unsigned long long raw = std::strtoull(s.c_str(), &end, 0);
+        if (errno == 0 && end != s.c_str() && *end == '\0')
+            return static_cast<std::uint64_t>(raw);
+    }
+    return std::nullopt;
+}
+
+std::string hex_protocol_address(std::uint64_t value)
+{
+    std::ostringstream os;
+    os << "0x" << std::hex << std::uppercase << value;
+    return os.str();
+}
+
+json protocol_va_contract(const json& params, std::initializer_list<const char*> names)
+{
+    json out;
+    out["present"] = false;
+    out["field"] = nullptr;
+    out["value"] = nullptr;
+    out["normalized"] = nullptr;
+    for (const char* name : names) {
+        if (!name || !params.contains(name))
+            continue;
+        out["present"] = true;
+        out["field"] = name;
+        out["value"] = params[name];
+        if (auto v = u64_from_protocol_params(params, name))
+            out["normalized"] = hex_protocol_address(*v);
+        return out;
+    }
+    return out;
+}
+
+void attach_protocol_reemit_contract(json& result, const json& params, const game_protocol::capture_options_t& options, const char* operation)
+{
+    if (!result.is_object())
+        result = json::object();
+    json c;
+    c["operation"] = operation ? operation : "";
+    c["descriptor_va"] = protocol_va_contract(params, {"descriptor_va", "descriptor", "protocol_descriptor_va"});
+    c["emitter_va"] = protocol_va_contract(params, {"emitter_va", "emit_fn_va", "deterministic_emit_fn_va", "replay_emitter_va"});
+    c["serializer_va"] = protocol_va_contract(params, {"serializer_va", "serializer_fn_va", "serialize_va"});
+    c["target_pid"] = options.pid;
+    c["protocol"] = options.protocol;
+    c["capture_ms"] = options.capture_ms;
+    c["max_packets"] = options.max_packets;
+    const bool packet_count_known = result.contains("packet_count") || result.contains("observed_packet_count");
+    const std::uint64_t packet_count = result.value("packet_count", result.value("observed_packet_count", 0u));
+    const bool replay_output_known = result.contains("sent_packet_count");
+    const bool invocation_count_known = result.contains("attempted_packet_count") || result.contains("attempted_or_sent");
+    const bool replay_attempted = replay_output_known || invocation_count_known;
+    const bool replay_sent_packets = replay_output_known && result.value("sent_packet_count", 0u) > 0;
+    c["packet_count"] = packet_count_known ? json(packet_count) : json(nullptr);
+    c["observed_capture_count"] = packet_count_known ? json(packet_count) : json(nullptr);
+    c["invocation_count_known"] = result.contains("attempted_packet_count") || result.contains("attempted_or_sent");
+    c["invocation_count"] = result.contains("attempted_packet_count") ? result["attempted_packet_count"] : (result.contains("attempted_or_sent") ? result["attempted_or_sent"] : json(nullptr));
+    c["replay_output_count_known"] = replay_output_known;
+    c["replay_output_count"] = result.contains("sent_packet_count") ? result["sent_packet_count"] : json(nullptr);
+    c["packets_sent"] = result.contains("sent_packet_count") ? result["sent_packet_count"] : json(nullptr);
+    c["serializer_invocation_count_known"] = result.contains("serializer_invocation_count");
+    c["serializer_invocation_count"] = result.contains("serializer_invocation_count") ? result["serializer_invocation_count"] : json(nullptr);
+    c["serializer_output_count_known"] = result.contains("serializer_output_count");
+    c["serializer_output_count"] = result.contains("serializer_output_count") ? result["serializer_output_count"] : json(nullptr);
+    c["dropped_count_known"] = result.contains("dropped_count") || result.contains("dropped_packet_count");
+    c["dropped_count"] = result.contains("dropped_count") ? result["dropped_count"] : (result.contains("dropped_packet_count") ? result["dropped_packet_count"] : json(nullptr));
+    c["last_error"] = result.contains("last_error") ? result["last_error"] : (result.contains("error") ? result["error"] : json(nullptr));
+    c["done"] = replay_attempted ? json(true) : json(nullptr);
+    c["posted"] = replay_attempted ? json(replay_sent_packets) : json(nullptr);
+    c["attempts"] = invocation_count_known ? c["invocation_count"] : json(nullptr);
+    c["stimulus_observed"] = result.value("stimulus_observed", false) || packet_count > 0;
+    c["stimulus_source"] = replay_attempted ? "gameproto_replay" : (packet_count > 0 ? "capture_observed" : "unproven");
+    c["re_emit_attempted"] = replay_attempted;
+    result["protocol_re_emit_stimulus"] = c;
+    diag::log_tagged_fmt("gameproto",
+        "protocol_re_emit_contract operation=%s pid=%u proto=%u packet_count=%llu packet_count_known=%d re_emit_attempted=%d invocation_known=%d output_known=%d dropped_known=%d last_error_present=%d",
+        operation ? operation : "",
+        options.pid,
+        options.protocol,
+        static_cast<unsigned long long>(packet_count),
+        packet_count_known ? 1 : 0,
+        replay_attempted ? 1 : 0,
+        c.value("invocation_count_known", false) ? 1 : 0,
+        c.value("replay_output_count_known", false) ? 1 : 0,
+        c.value("dropped_count_known", false) ? 1 : 0,
+        c["last_error"].is_null() ? 0 : 1);
+}
+
+json protocol_runtime_status(const json& params, const game_protocol::capture_options_t& options, const char* operation)
+{
+    json j;
+    DWORD handle_count = 0;
+    const bool handle_count_ok = GetProcessHandleCount(GetCurrentProcess(), &handle_count) != FALSE;
+    const std::vector<std::uint32_t> attached = driver_bridge::attached_pids();
+    j["operation"] = operation ? operation : "";
+    j["target_pid"] = options.pid;
+    j["target_pid_alive"] = process_alive_for_protocol_status(options.pid);
+    j["driver_loaded"] = driver_bridge::is_loaded();
+    j["driver_status"] = driver_bridge::status();
+    j["driver_last_error"] = driver_bridge::last_error();
+    j["driver_attached_pid"] = driver_bridge::attached_pid();
+    j["driver_attached_pids"] = attached;
+    j["driver_attached_pid_count"] = static_cast<std::uint64_t>(attached.size());
+    j["gle"] = static_cast<std::uint32_t>(GetLastError());
+    j["wsa_error"] = current_wsa_last_error();
+    j["handle_count_ok"] = handle_count_ok;
+    j["process_handle_count"] = handle_count_ok ? static_cast<std::uint32_t>(handle_count) : 0u;
+    j["work_queue"] = work_queue_stats_to_json(work_queue::stats());
+    j["service_work_queue"] = work_queue_stats_to_json(work_queue::service_stats());
+    j["critical_work_queue"] = work_queue_stats_to_json(critical_work_queue::stats());
+    j["selected_protocol"] = options.protocol;
+    j["selected_capture_ms"] = options.capture_ms;
+    j["selected_max_packets"] = options.max_packets;
+    j["selected_max_payload"] = options.max_payload;
+    j["selected_local_port"] = params.value("local_port", params.value("source_port", 0u));
+    j["selected_remote_port"] = params.value("remote_port", params.value("target_port", 0u));
+    return j;
+}
+
+void attach_protocol_stimulus_status(json& result, const json& params, const game_protocol::capture_options_t& options, const char* operation)
+{
+    const std::uint64_t packet_count = result.value("packet_count", result.value("observed_packet_count", 0u));
+    const bool stimulus_observed = result.value("stimulus_observed", false) || packet_count > 0;
+    result["stimulus_start_required"] = true;
+    result["stimulus_start_operation"] = params.value("stimulus_operation", std::string("external_udp_stimulus"));
+    result["stimulus_start_observed"] = stimulus_observed;
+    result["zero_capture_due_to_no_stimulus"] = packet_count == 0 && !stimulus_observed;
+    result["no_stimulus"] = !stimulus_observed;
+    result["protocol_runtime_status"] = protocol_runtime_status(params, options, operation);
+    attach_protocol_reemit_contract(result, params, options, operation);
+    result["diagnostic_contract"] = "zero_capture_without_stimulus_is_not_functional_capture_evidence";
+    diag::log_tagged_fmt("gameproto",
+        "protocol_udp_stimulus_status operation=%s target_pid=%u target_pid_alive=%d driver_attached_pid=%u protocol=%u capture_ms=%u packets=%llu stimulus_observed=%d zero_due_to_no_stimulus=%d gle=%lu wsa=%d local_port=%u remote_port=%u work_pending=%llu work_active=%u critical_pending=%llu critical_active=%u",
+        operation ? operation : "",
+        options.pid,
+        process_alive_for_protocol_status(options.pid) ? 1 : 0,
+        driver_bridge::attached_pid(),
+        options.protocol,
+        options.capture_ms,
+        static_cast<unsigned long long>(packet_count),
+        stimulus_observed ? 1 : 0,
+        (packet_count == 0 && !stimulus_observed) ? 1 : 0,
+        static_cast<unsigned long>(GetLastError()),
+        current_wsa_last_error(),
+        params.value("local_port", params.value("source_port", 0u)),
+        params.value("remote_port", params.value("target_port", 0u)),
+        static_cast<unsigned long long>(work_queue::stats().pending),
+        work_queue::stats().active,
+        static_cast<unsigned long long>(critical_work_queue::stats().pending),
+        critical_work_queue::stats().active);
+}
 
 std::uint32_t protocol_from_param(const json& params)
 {
@@ -74,9 +292,21 @@ tool_result_t handle_gameproto_detect(const json& raw_params)
         const std::string hex = params.contains("payload_hex") && params["payload_hex"].is_string()
             ? params["payload_hex"].get<std::string>()
             : params["packet_hex"].get<std::string>();
+        if (hex.empty()) {
+            json result;
+            result["backend"] = "provided_payload";
+            result["capture_performed"] = false;
+            result["deterministic_input"] = false;
+            result["packet_count"] = 0;
+            result["payload_bytes"] = 0;
+            result["stimulus_observed"] = false;
+            result["no_stimulus"] = true;
+            result["diagnostic_contract"] = "empty_provided_payload_is_not_functional_protocol_evidence";
+            return tool_result_t::error(OBFSTR("payload_hex must contain at least one byte."), result);
+        }
         std::string error;
         auto bytes = game_protocol::hex_to_bytes(hex, &error, options.max_payload);
-        if (bytes.empty() && !hex.empty())
+        if (bytes.empty())
             return tool_result_t::error(error.empty() ? OBFSTR("invalid payload_hex") : error);
         driver_bridge::captured_packet_t pkt{};
         pkt.pid = options.pid;
@@ -97,6 +327,8 @@ tool_result_t handle_gameproto_detect(const json& raw_params)
         result["backend"] = "provided_payload";
         result["capture_performed"] = false;
         result["deterministic_input"] = true;
+        result["stimulus_observed"] = true;
+        result["no_stimulus"] = false;
         result["filter_pid"] = options.pid;
         result["filter_protocol"] = options.protocol == 0 ? "any" : (options.protocol == 17 ? "udp" : (options.protocol == 6 ? "tcp" : std::to_string(options.protocol)));
         result["payload_bytes"] = packets.front().payload.size();
@@ -121,8 +353,11 @@ tool_result_t handle_gameproto_detect(const json& raw_params)
     result["filter_protocol"] = options.protocol == 0 ? "any" : (options.protocol == 17 ? "udp" : (options.protocol == 6 ? "tcp" : std::to_string(options.protocol)));
     result["max_packets"] = options.max_packets;
     result["max_payload"] = options.max_payload;
+    attach_protocol_stimulus_status(result, params, options, "gameproto_detect");
     diag::log_tagged_fmt("gameproto", "detect live pid=%u protocol=%u packets=%zu confidence=%.3f",
         options.pid, options.protocol, packets.size(), result.value("confidence", 0.0));
+    if (packets.empty())
+        return tool_result_t::error(OBFSTR("Game protocol detection completed with zero captured packets."), result);
     return tool_result_t::ok(OBFSTR("Game protocol detection completed."), result);
 }
 
@@ -174,9 +409,20 @@ tool_result_t handle_gameproto_replay(const json& raw_params)
         if (options.protocol == 0)
             options.protocol = 17;
         std::string error;
+        diag::log_tagged_fmt("gameproto", "protocol_udp_stimulus_start operation=record target_pid=%u target_pid_alive=%d driver_attached_pid=%u protocol=%u capture_ms=%u gle=%lu wsa=%d local_port=%u remote_port=%u",
+            options.pid,
+            process_alive_for_protocol_status(options.pid) ? 1 : 0,
+            driver_bridge::attached_pid(),
+            options.protocol,
+            options.capture_ms,
+            static_cast<unsigned long>(GetLastError()),
+            current_wsa_last_error(),
+            params.value("local_port", params.value("source_port", 0u)),
+            params.value("remote_port", params.value("target_port", 0u)));
         json result = game_protocol::record_replay_session(options, error);
+        attach_protocol_stimulus_status(result, params, options, "gameproto_replay.record");
         if (!error.empty())
-            return tool_result_t::error(error);
+            return tool_result_t::error(error, result);
         if (result.value("packet_count", 0u) == 0)
             return tool_result_t::error(OBFSTR("Game protocol replay record completed with zero captured packets."), result);
         return tool_result_t::ok(OBFSTR("Game protocol replay session recorded."), result);
@@ -188,8 +434,14 @@ tool_result_t handle_gameproto_replay(const json& raw_params)
             params.value("session_id", std::string()),
             params.value("max_packets", 128u),
             error);
+        game_protocol::capture_options_t options;
+        options.pid = params.value("filter_pid", params.value("pid", 0u));
+        options.protocol = protocol_from_param(params);
+        if (options.protocol == 0)
+            options.protocol = 17;
+        attach_protocol_stimulus_status(result, params, options, "gameproto_replay.stop");
         if (!error.empty())
-            return tool_result_t::error(error);
+            return tool_result_t::error(error, result);
         if (result.value("packet_count", 0u) == 0)
             return tool_result_t::error(OBFSTR("Game protocol replay recording stopped with zero captured packets."), result);
         return tool_result_t::ok(OBFSTR("Game protocol replay recording stopped."), result);
@@ -221,8 +473,17 @@ tool_result_t handle_gameproto_replay(const json& raw_params)
 
         json result;
         std::string error;
-        if (!game_protocol::replay_session(options, result, error))
-            return tool_result_t::error(error.empty() ? OBFSTR("replay failed") : error);
+        game_protocol::capture_options_t contract_options;
+        contract_options.pid = params.value("filter_pid", params.value("pid", 0u));
+        contract_options.protocol = protocol_from_param(params);
+        if (contract_options.protocol == 0)
+            contract_options.protocol = 17;
+        contract_options.max_packets = options.max_packets;
+        if (!game_protocol::replay_session(options, result, error)) {
+            attach_protocol_reemit_contract(result, params, contract_options, "gameproto_replay.replay");
+            return tool_result_t::error(error.empty() ? OBFSTR("replay failed") : error, result);
+        }
+        attach_protocol_reemit_contract(result, params, contract_options, "gameproto_replay.replay");
         if (result.value("sent_packet_count", 0u) == 0)
             return tool_result_t::error(OBFSTR("Game protocol replay completed without sending a packet."), result);
         return tool_result_t::ok(OBFSTR("Game protocol replay attempted with bounded packet caps."), result);

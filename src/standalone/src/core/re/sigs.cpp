@@ -1,6 +1,7 @@
 #include "sigs.hpp"
 
 #include "artifact_store.hpp"
+#include "../../helpers/diag_log.hpp"
 
 #include <algorithm>
 #include <fstream>
@@ -10,6 +11,87 @@ namespace re::sigs
 {
 namespace
 {
+std::uint64_t deadline_remaining_ms()
+{
+    const std::uint64_t deadline = mcp_standalone::current_call_deadline_ms();
+    if (deadline == 0)
+        return 0;
+    const std::uint64_t now = GetTickCount64();
+    return deadline > now ? deadline - now : 0;
+}
+
+bool sigs_call_cancelled(const char* phase, std::uint32_t pid, std::uint64_t started_ms)
+{
+    if (mcp_standalone::current_call_cancelled())
+    {
+        diag::log_tagged_fmt("sigs", "cancelled phase=%s pid=%u elapsed_ms=%llu diag_id=%s",
+                             phase ? phase : "",
+                             pid,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms),
+                             mcp_standalone::current_call_diag_id());
+        return true;
+    }
+    const std::uint64_t deadline = mcp_standalone::current_call_deadline_ms();
+    if (deadline != 0 && GetTickCount64() >= deadline)
+    {
+        diag::log_tagged_fmt("sigs", "deadline_reached phase=%s pid=%u elapsed_ms=%llu diag_id=%s",
+                             phase ? phase : "",
+                             pid,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms),
+                             mcp_standalone::current_call_diag_id());
+        return true;
+    }
+    return false;
+}
+
+json sigs_cancel_detail(const char* action, std::uint32_t pid, std::uint64_t started_ms)
+{
+    return json{
+        {"action", action ? action : ""},
+        {"process_id", pid},
+        {"elapsed_ms", GetTickCount64() - started_ms},
+        {"deadline_remaining_ms", deadline_remaining_ms()},
+        {"cancelled", mcp_standalone::current_call_cancelled()},
+        {"diag_id", mcp_standalone::current_call_diag_id()}
+    };
+}
+
+json sigs_guard_payload(const char* action, const json& params, std::uint64_t started_ms)
+{
+    json out;
+    out["tool"] = "sigs_manage";
+    out["action"] = action ? action : "";
+    out["confirm_unsafe_required"] = true;
+    out["confirm_unsafe_received"] = unsafe_confirmed(params);
+    out["mutation"] = "none";
+    out["persistence_mutation"] = false;
+    out["file_write"] = false;
+    out["security_guard_pass"] = true;
+    out["safe_contract"] = "fail_closed_until_explicit_unsafe_confirmation";
+    out["elapsed_ms"] = GetTickCount64() - started_ms;
+    if (params.contains("name"))
+        out["name"] = params["name"];
+    if (params.contains("source"))
+        out["source_present"] = true;
+    if (params.contains("output_path"))
+        out["output_path_present"] = true;
+    return out;
+}
+
+tool_result_t sigs_guard_required(const char* action, const json& params, std::uint64_t started_ms)
+{
+    return tool_result_t::error(std::string(action ? action : "sigs_manage") + " requires confirm_unsafe=true or allow_unsafe=true.", sigs_guard_payload(action, params, started_ms));
+}
+
+struct sig_scan_stats_t
+{
+    std::uint64_t bytes_read = 0;
+    std::uint64_t scan_bytes_requested = 0;
+    std::size_t regions_scanned = 0;
+    bool cancelled = false;
+    bool deadline_hit = false;
+};
+
 std::int64_t signed_param(const json& params, const char* key, std::int64_t fallback, std::int64_t min_value, std::int64_t max_value)
 {
     std::int64_t value = fallback;
@@ -109,9 +191,13 @@ std::vector<std::uint64_t> scan_pattern_range(std::uint32_t pid,
                                               const std::vector<parsed_pattern_byte_t>& pattern,
                                               std::uint64_t start,
                                               std::uint64_t size,
-                                              std::size_t max_results)
+                                              std::size_t max_results,
+                                              std::uint64_t started_ms,
+                                              sig_scan_stats_t* stats)
 {
     std::vector<std::uint64_t> results;
+    if (stats)
+        stats->scan_bytes_requested = size;
     if (pattern.empty() || start == 0 || size < pattern.size() || max_results == 0)
         return results;
     driver_bridge::memory_region_t region{};
@@ -126,8 +212,22 @@ std::vector<std::uint64_t> scan_pattern_range(std::uint32_t pid,
     std::vector<std::uint8_t> bytes;
     if (!read_bytes(pid, start, static_cast<std::size_t>(read_size64), bytes) || bytes.size() < pattern.size())
         return results;
+    if (stats)
+    {
+        stats->bytes_read = bytes.size();
+        stats->regions_scanned = 1;
+    }
     for (std::size_t i = 0; i + pattern.size() <= bytes.size(); ++i)
     {
+        if ((i & 0xFFFu) == 0 && sigs_call_cancelled("scan_pattern_range", pid, started_ms))
+        {
+            if (stats)
+            {
+                stats->cancelled = mcp_standalone::current_call_cancelled();
+                stats->deadline_hit = !stats->cancelled;
+            }
+            break;
+        }
         if (!pattern_matches(bytes.data() + i, bytes.size() - i, pattern))
             continue;
         results.push_back(start + i);
@@ -201,6 +301,7 @@ bool parse_text_pattern_line(const std::string& line,
 
 json scan_signature(std::uint32_t pid, store::signature_record_t& sig, const json* params = nullptr)
 {
+    const std::uint64_t started_ms = GetTickCount64();
     json out = store::signature_to_json(sig);
     std::vector<parsed_pattern_byte_t> pattern;
     std::string err;
@@ -210,6 +311,13 @@ json scan_signature(std::uint32_t pid, store::signature_record_t& sig, const jso
         sig.last_match_count = 0;
         out["status"] = "invalid";
         out["error"] = err;
+        out["elapsed_ms"] = GetTickCount64() - started_ms;
+        diag::log_tagged_fmt("sigs",
+                             "scan_signature pid=%u id=%s status=invalid error=%s elapsed_ms=%llu",
+                             pid,
+                             sig.id.c_str(),
+                             err.c_str(),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
         return out;
     }
     std::uint64_t scan_start = 0;
@@ -223,8 +331,9 @@ json scan_signature(std::uint32_t pid, store::signature_record_t& sig, const jso
                 scan_size = scan_end > scan_start ? scan_end - scan_start : 0;
         }
     }
+    sig_scan_stats_t scan_stats;
     auto matches = scan_start != 0 && scan_size != 0
-        ? scan_pattern_range(pid, pattern, scan_start, scan_size, 128)
+        ? scan_pattern_range(pid, pattern, scan_start, scan_size, 128, started_ms, &scan_stats)
         : scan_pattern(pid, pattern, sig.module_hint, false, 128);
     sig.last_match_count = static_cast<std::uint32_t>(matches.size());
     if (matches.empty())
@@ -270,19 +379,46 @@ json scan_signature(std::uint32_t pid, store::signature_record_t& sig, const jso
             {"bounded", true}
         };
     }
+    out["pattern_bytes"] = pattern.size();
+    out["bounded_scan"] = scan_start != 0 && scan_size != 0;
+    out["scan_bytes_requested"] = scan_stats.scan_bytes_requested;
+    out["scan_bytes"] = scan_stats.bytes_read;
+    out["regions_scanned"] = scan_stats.regions_scanned;
+    out["deadline_hit"] = scan_stats.deadline_hit;
+    out["cancelled"] = scan_stats.cancelled;
+    out["elapsed_ms"] = GetTickCount64() - started_ms;
+    diag::log_tagged_fmt("sigs",
+                         "scan_signature pid=%u id=%s name=%s module_hint=%s pattern_bytes=%zu matches=%zu status=%s bounded=%d elapsed_ms=%llu",
+                         pid,
+                         sig.id.c_str(),
+                         sig.name.c_str(),
+                         sig.module_hint.c_str(),
+                         pattern.size(),
+                         matches.size(),
+                         sig.last_status.c_str(),
+                         scan_start != 0 && scan_size != 0 ? 1 : 0,
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     return out;
 }
 
 tool_result_t save_signature(const json& params)
 {
+    const std::uint64_t started_ms = GetTickCount64();
     if (!unsafe_confirmed(params))
-        return unsafe_required("sigs_manage save");
+        return sigs_guard_required("save", params, started_ms);
     const std::string name = string_param(params, "name");
     const std::string pattern = string_param(params, "pattern");
     if (name.empty())
         return tool_result_t::error("'name' is required for save.");
     if (pattern.empty())
         return tool_result_t::error("'pattern' is required for save.");
+    diag::log_tagged_fmt("sigs",
+                         "save enter name=%s pattern_len=%zu module_hint=%s deadline_remaining_ms=%llu diag_id=%s",
+                         name.c_str(),
+                         pattern.size(),
+                         string_param(params, "module_hint").c_str(),
+                         static_cast<unsigned long long>(deadline_remaining_ms()),
+                         mcp_standalone::current_call_diag_id());
     std::vector<parsed_pattern_byte_t> parsed;
     std::string err;
     if (!parse_pattern(pattern, parsed, &err))
@@ -300,19 +436,33 @@ tool_result_t save_signature(const json& params)
     sig.updated_ms = sig.created_ms;
     sig.last_status = "new";
     auto records = store::load_signatures();
+    const std::size_t before_count = records.size();
     records.push_back(sig);
-    if (!store::save_signatures(records))
+    const bool save_ok = store::save_signatures(records);
+    diag::log_tagged_fmt("sigs",
+                         "save store id=%s before=%zu after=%zu save_ok=%d elapsed_ms=%llu",
+                         sig.id.c_str(),
+                         before_count,
+                         records.size(),
+                         save_ok ? 1 : 0,
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
+    if (!save_ok)
         return tool_result_t::error("Failed to save signature database.");
     json result = store::signature_to_json(sig);
+    result["source_count_before"] = before_count;
+    result["source_count_after"] = records.size();
+    result["elapsed_ms"] = GetTickCount64() - started_ms;
     return tool_result_t::ok("Signature saved.", result);
 }
 
 tool_result_t list_signatures(const json& params)
 {
+    const std::uint64_t started_ms = GetTickCount64();
     const std::string category = lower_ascii(string_param(params, "category"));
     const std::string module_hint = lower_ascii(string_param(params, "module_hint"));
     json arr = json::array();
-    for (const auto& sig : store::load_signatures())
+    const auto records = store::load_signatures();
+    for (const auto& sig : records)
     {
         if (!category.empty() && lower_ascii(sig.category) != category)
             continue;
@@ -323,25 +473,88 @@ tool_result_t list_signatures(const json& params)
     json result;
     result["signatures"] = std::move(arr);
     result["count"] = result["signatures"].size();
+    result["source_count"] = records.size();
+    result["elapsed_ms"] = GetTickCount64() - started_ms;
+    diag::log_tagged_fmt("sigs",
+                         "list exit source_count=%zu returned=%zu category=%s module_hint=%s elapsed_ms=%llu",
+                         records.size(),
+                         result["count"].get<std::size_t>(),
+                         category.c_str(),
+                         module_hint.c_str(),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     return tool_result_t::ok(result);
 }
 
 tool_result_t scan_all(const json& params)
 {
+    const std::uint64_t started_ms = GetTickCount64();
     if (!unsafe_confirmed(params))
-        return unsafe_required("sigs_manage scan_all");
+        return sigs_guard_required("scan_all", params, started_ms);
     active_process_scope_t scope(params);
     if (!scope.ok())
         return tool_result_t::error(scope.error());
     auto records = store::load_signatures();
+    diag::log_tagged_fmt("sigs",
+                         "scan_all enter pid=%u records=%zu deadline_remaining_ms=%llu diag_id=%s",
+                         scope.pid(),
+                         records.size(),
+                         static_cast<unsigned long long>(deadline_remaining_ms()),
+                         mcp_standalone::current_call_diag_id());
     json arr = json::array();
+    std::size_t scanned = 0;
     for (auto& sig : records)
+    {
+        if ((scanned & 0x03u) == 0 && sigs_call_cancelled("scan_all_loop", scope.pid(), started_ms))
+            return tool_result_t::error("Signature scan cancelled.", sigs_cancel_detail("scan_all", scope.pid(), started_ms));
         arr.push_back(scan_signature(scope.pid(), sig, &params));
-    store::save_signatures(records);
+        ++scanned;
+        if (sigs_call_cancelled("scan_all_after_signature", scope.pid(), started_ms))
+        {
+            json partial;
+            partial["process_id"] = scope.pid();
+            partial["results"] = arr;
+            partial["count"] = arr.size();
+            partial["source_count"] = records.size();
+            partial["scanned"] = scanned;
+            partial["elapsed_ms"] = GetTickCount64() - started_ms;
+            const bool cancelled = mcp_standalone::current_call_cancelled();
+            partial["cancelled"] = cancelled;
+            partial["deadline_hit"] = !cancelled;
+            partial["partial"] = true;
+            return tool_result_t::error(cancelled ? "Signature scan cancelled." : "Signature scan deadline reached before all signatures completed.", partial);
+        }
+    }
+    if (sigs_call_cancelled("scan_all_before_save", scope.pid(), started_ms))
+    {
+        json partial;
+        partial["process_id"] = scope.pid();
+        partial["results"] = arr;
+        partial["count"] = arr.size();
+        partial["source_count"] = records.size();
+        partial["scanned"] = scanned;
+        partial["elapsed_ms"] = GetTickCount64() - started_ms;
+        const bool cancelled = mcp_standalone::current_call_cancelled();
+        partial["cancelled"] = cancelled;
+        partial["deadline_hit"] = !cancelled;
+        partial["partial"] = true;
+        return tool_result_t::error(cancelled ? "Signature scan cancelled before results were saved." : "Signature scan deadline reached before results were saved.", partial);
+    }
+    const bool save_ok = store::save_signatures(records);
+    diag::log_tagged_fmt("sigs",
+                         "scan_all store pid=%u scanned=%zu save_ok=%d elapsed_ms=%llu",
+                         scope.pid(),
+                         scanned,
+                         save_ok ? 1 : 0,
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     json result;
     result["process_id"] = scope.pid();
     result["results"] = std::move(arr);
     result["count"] = result["results"].size();
+    result["source_count"] = records.size();
+    result["save_ok"] = save_ok;
+    result["elapsed_ms"] = GetTickCount64() - started_ms;
+    if (!save_ok)
+        return tool_result_t::error("Failed to save signature scan results.", result);
     return tool_result_t::ok(result);
 }
 
@@ -368,24 +581,36 @@ void import_json_array(const json& arr, std::vector<store::signature_record_t>& 
 
 tool_result_t import_signatures(const json& params)
 {
+    const std::uint64_t started_ms = GetTickCount64();
     if (!unsafe_confirmed(params))
-        return unsafe_required("sigs_manage import");
+        return sigs_guard_required("import", params, started_ms);
     const std::string source = string_param(params, "source");
     if (source.empty())
         return tool_result_t::error("'source' is required for import.");
     std::string content = source;
     std::ifstream file(source, std::ios::binary);
+    bool source_was_file = false;
     if (file.is_open())
     {
         std::ostringstream ss;
         ss << file.rdbuf();
         content = ss.str();
+        source_was_file = true;
     }
     const std::string format = normalize_format(string_param(params, "format", "json"));
     if (!supported_format(format))
         return tool_result_t::error("Unsupported signature import format. Supported formats: json, ida, x64dbg, ce.");
     auto records = store::load_signatures();
     const std::size_t before = records.size();
+    diag::log_tagged_fmt("sigs",
+                         "import enter source_is_file=%d source_len=%zu content_len=%zu format=%s before=%zu deadline_remaining_ms=%llu diag_id=%s",
+                         source_was_file ? 1 : 0,
+                         source.size(),
+                         content.size(),
+                         format.c_str(),
+                         before,
+                         static_cast<unsigned long long>(deadline_remaining_ms()),
+                         mcp_standalone::current_call_diag_id());
     if (format == "json")
     {
         try
@@ -407,8 +632,11 @@ tool_result_t import_signatures(const json& params)
     {
         std::istringstream input(content);
         std::string line;
+        std::size_t parsed_lines = 0;
         while (std::getline(input, line))
         {
+            if ((parsed_lines & 0xFFu) == 0 && sigs_call_cancelled("import_parse_loop", 0, started_ms))
+                return tool_result_t::error("Signature import cancelled.", sigs_cancel_detail("import", 0, started_ms));
             line = strip_line(line);
             if (line.empty())
                 continue;
@@ -416,22 +644,43 @@ tool_result_t import_signatures(const json& params)
                 parse_ce_line(line, records, params);
             else
                 parse_text_pattern_line(line, format, records, params);
+            ++parsed_lines;
         }
+        diag::log_tagged_fmt("sigs",
+                             "import parsed_text format=%s lines=%zu added=%zu elapsed_ms=%llu",
+                             format.c_str(),
+                             parsed_lines,
+                             records.size() - before,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
     }
     if (records.size() == before)
         return tool_result_t::error("No valid signatures were imported for the selected format.");
-    if (!store::save_signatures(records))
+    const bool save_ok = store::save_signatures(records);
+    diag::log_tagged_fmt("sigs",
+                         "import store format=%s before=%zu after=%zu imported=%zu save_ok=%d elapsed_ms=%llu",
+                         format.c_str(),
+                         before,
+                         records.size(),
+                         records.size() - before,
+                         save_ok ? 1 : 0,
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
+    if (!save_ok)
         return tool_result_t::error("Failed to save imported signatures.");
     json result;
     result["imported"] = records.size() - before;
     result["total"] = records.size();
+    result["format"] = format;
+    result["source_was_file"] = source_was_file;
+    result["content_bytes"] = content.size();
+    result["elapsed_ms"] = GetTickCount64() - started_ms;
     return tool_result_t::ok("Signatures imported.", result);
 }
 
 tool_result_t export_signatures(const json& params)
 {
+    const std::uint64_t started_ms = GetTickCount64();
     if (!unsafe_confirmed(params))
-        return unsafe_required("sigs_manage export");
+        return sigs_guard_required("export", params, started_ms);
     const std::string output_path = string_param(params, "output_path");
     if (output_path.empty())
         return tool_result_t::error("'output_path' is required for export.");
@@ -447,6 +696,15 @@ tool_result_t export_signatures(const json& params)
             continue;
         filtered.push_back(sig);
     }
+    diag::log_tagged_fmt("sigs",
+                         "export enter output_path=%s format=%s source_count=%zu filtered=%zu category=%s deadline_remaining_ms=%llu diag_id=%s",
+                         output_path.c_str(),
+                         format.c_str(),
+                         records.size(),
+                         filtered.size(),
+                         category.c_str(),
+                         static_cast<unsigned long long>(deadline_remaining_ms()),
+                         mcp_standalone::current_call_diag_id());
     ensure_parent_dir_exists(output_path);
     std::ofstream f(output_path, std::ios::binary | std::ios::trunc);
     if (!f.is_open())
@@ -480,23 +738,45 @@ tool_result_t export_signatures(const json& params)
                 f << "aobscan(" << sig.name << "," << sig.pattern << ")\n";
         }
     }
+    f.flush();
+    const std::streamoff bytes_written = f.tellp();
     json result;
     result["output_path"] = output_path;
     result["format"] = format;
     result["count"] = filtered.size();
+    result["source_count"] = records.size();
+    result["bytes_written"] = bytes_written >= 0 ? static_cast<std::uint64_t>(bytes_written) : 0;
+    result["elapsed_ms"] = GetTickCount64() - started_ms;
+    diag::log_tagged_fmt("sigs",
+                         "export exit output_path=%s format=%s count=%zu bytes=%llu elapsed_ms=%llu",
+                         output_path.c_str(),
+                         format.c_str(),
+                         filtered.size(),
+                         static_cast<unsigned long long>(result["bytes_written"].get<std::uint64_t>()),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     return tool_result_t::ok("Signatures exported.", result);
 }
 }
 
 tool_result_t manage(const json& params)
 {
+    const std::uint64_t started_ms = GetTickCount64();
     const std::string action = compat_action_name(params);
     const json p = compat_action_payload(params);
+    diag::log_tagged_fmt("sigs",
+                         "manage enter action=%s deadline_remaining_ms=%llu diag_id=%s",
+                         action.c_str(),
+                         static_cast<unsigned long long>(deadline_remaining_ms()),
+                         mcp_standalone::current_call_diag_id());
     if (action == "save") return save_signature(p);
     if (action == "list") return list_signatures(p);
     if (action == "scan_all") return scan_all(p);
     if (action == "import") return import_signatures(p);
     if (action == "export") return export_signatures(p);
+    diag::log_tagged_fmt("sigs",
+                         "manage exit action=%s unknown=1 elapsed_ms=%llu",
+                         action.c_str(),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     return compat_unknown_action("sigs_manage", action);
 }
 }

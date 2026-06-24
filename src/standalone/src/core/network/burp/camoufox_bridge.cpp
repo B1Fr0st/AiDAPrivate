@@ -1022,6 +1022,17 @@ bool is_bundled_browser_dir(const std::wstring& dir)
         directory_exists_w(join_path_w(dir, L"browser"));
 }
 
+bool is_camoufox_browser_executable_path(const std::wstring& candidate)
+{
+    if (candidate.empty())
+        return false;
+    const size_t pos = candidate.find_last_of(L"\\/");
+    const std::wstring file = pos == std::wstring::npos ? candidate : candidate.substr(pos + 1);
+    if (_wcsicmp(file.c_str(), L"camoufox.exe") != 0)
+        return false;
+    return is_bundled_browser_dir(parent_dir_w(candidate));
+}
+
 bool find_bundled_camoufox_executable(std::string& out_path)
 {
     const std::wstring name = L"camoufox-135.0.1-beta.24-win.x86_64";
@@ -2392,6 +2403,43 @@ action_snapshot_t action_snapshot()
     s.exit_code = exit.exit_code;
     s.exit_query_gle = exit.gle;
     return s;
+}
+
+void attach_bridge_call_metadata(call_result_t& r,
+                                 const std::string& session_id,
+                                 const std::string& tool_name,
+                                 uint64_t request_id,
+                                 int timeout_ms,
+                                 uint64_t elapsed_ms,
+                                 uint64_t generation,
+                                 uint32_t child_pid,
+                                 const std::string& page_id,
+                                 const char* phase,
+                                 bool late_result,
+                                 bool child_alive,
+                                 bool browser_open,
+                                 bool page_verified,
+                                 bool cleanup_pending)
+{
+    if (!r.data.is_object())
+        return;
+    r.data["bridge_call"] = {
+        {"session_id", session_id.empty() ? std::string("default") : session_id},
+        {"tool", tool_name},
+        {"request_id", request_id},
+        {"aida_operation_id", request_id},
+        {"page_id", page_id},
+        {"timeout_ms", timeout_ms},
+        {"elapsed_ms", elapsed_ms},
+        {"generation", generation},
+        {"child_pid", child_pid},
+        {"child_alive", child_alive},
+        {"browser_open", browser_open},
+        {"page_verified", page_verified},
+        {"cleanup_pending", cleanup_pending},
+        {"phase", phase ? phase : ""},
+        {"late_result", late_result}
+    };
 }
 
 std::string selector_for_log(const std::string& selector)
@@ -4453,6 +4501,22 @@ call_result_t call_with_deadline(const std::string& tool_name, const nlohmann::j
             {"process_tree", compact_process_tree(timeout_tree_after)},
             {"error", fail.error}
         };
+        attach_bridge_call_metadata(
+            fail,
+            "default",
+            tool_name,
+            request_id,
+            timeout_ms,
+            now_ms() - t0,
+            timed_out_generation,
+            timed_out_child_pid,
+            navigation_call ? navigation_page_id : json_string_or(call_args, "page_id", std::string()),
+            cancelled_by_stop ? "cancelled" : "timeout",
+            true,
+            timeout_exit.alive,
+            false,
+            false,
+            !retained_timed_out_client);
         if (navigation_call)
         {
             fail.data["page_id"] = navigation_page_id;
@@ -4625,6 +4689,33 @@ call_result_t call_with_deadline(const std::string& tool_name, const nlohmann::j
     }
     bridge_call_completed_t ev{tool_name, out.ok, now_ms() - t0};
     aida::events::publish(kBridgeCallCompleted, ev);
+    {
+        bool browser_open = false;
+        bool page_verified = false;
+        bool cleanup_pending = false;
+        {
+            std::lock_guard<std::recursive_mutex> g(sg().mtx);
+            browser_open = sg().browser_open;
+            page_verified = sg().page_verified;
+            cleanup_pending = sg().cleanup_pending;
+        }
+        attach_bridge_call_metadata(
+            out,
+            "default",
+            tool_name,
+            request_id,
+            timeout_ms,
+            ev.duration_ms,
+            state->generation,
+            state->child_pid,
+            navigation_call ? navigation_page_id : json_string_or(call_args, "page_id", std::string()),
+            "complete",
+            false,
+            process_alive(state->child_pid),
+            browser_open,
+            page_verified,
+            cleanup_pending);
+    }
     if (navigation_call)
     {
         const int response_status = json_int_or(out.data, "final_status", json_int_or(out.data, "initial_status", json_int_or(out.data, "status", json_int_or(out.data, "response_status", -1))));
@@ -6642,6 +6733,15 @@ bool start_bridge(const launch_config_t& cfg)
         publish_state(bridge_state_t::error, sg().last_error);
         return false;
     }
+    if (!is_camoufox_browser_executable_path(utf8_to_wide(effective_cfg.browser_executable)))
+    {
+        sg().last_error = "Configured browser executable is not a Camoufox browser bundle";
+        sg().state = bridge_state_t::error;
+        diag::log_tagged_fmt("camoufox", "start_bridge browser_rejected_non_camoufox path=%s",
+            effective_cfg.browser_executable.c_str());
+        publish_state(bridge_state_t::error, sg().last_error);
+        return false;
+    }
     {
         const bool bundled_visible_launch = !effective_cfg.headless && !effective_cfg.browser_executable.empty();
         diag::log_tagged_fmt("camoufox", "start_bridge persistent_context_policy generation=%llu bundled_visible=%d explicit_persistent=%d cfg_persistent=%d profile_dir=%d user_data_dir=%d default_nonpersistent=1",
@@ -7972,12 +8072,23 @@ bool is_ready()
 bool ensure_ready()
 {
     const uint64_t t0 = now_ms();
+    uint64_t is_ready_ms = 0;
+    uint64_t probe_ms = 0;
+    uint64_t setup_ms = 0;
+    uint64_t start_bridge_ms = 0;
     diag::log_tagged_fmt("camoufox", "ensure_ready entry");
+    const uint64_t is_ready_start_ms = now_ms();
     if (is_ready()) {
-        diag::log_tagged_fmt("camoufox", "ensure_ready already_ready elapsed_ms=%llu",
+        is_ready_ms = now_ms() - is_ready_start_ms;
+        diag::log_tagged_fmt("camoufox", "ensure_ready already_ready elapsed_ms=%llu is_ready_ms=%llu",
+            static_cast<unsigned long long>(now_ms() - t0),
+            static_cast<unsigned long long>(is_ready_ms));
+        diag::log_tagged_fmt("camoufox", "ensure_ready stage_timing ok=1 already_ready=1 is_ready_ms=%llu probe_ms=0 setup_ms=0 start_bridge_ms=0 total_ms=%llu",
+            static_cast<unsigned long long>(is_ready_ms),
             static_cast<unsigned long long>(now_ms() - t0));
         return true;
     }
+    is_ready_ms = now_ms() - is_ready_start_ms;
     bool publish_reused_ready = false;
     {
         std::lock_guard<std::recursive_mutex> lk(sg().mtx);
@@ -8069,6 +8180,12 @@ bool ensure_ready()
                     sg().privacy_verified ? 1 : 0,
                     sg().cleanup_pending ? 1 : 0,
                     health.process_tree.empty() ? "<empty>" : health.process_tree.c_str());
+                diag::log_tagged_fmt("camoufox", "ensure_ready stage_timing ok=0 blocked=1 is_ready_ms=%llu probe_ms=%llu setup_ms=%llu start_bridge_ms=%llu total_ms=%llu",
+                    static_cast<unsigned long long>(is_ready_ms),
+                    static_cast<unsigned long long>(probe_ms),
+                    static_cast<unsigned long long>(setup_ms),
+                    static_cast<unsigned long long>(start_bridge_ms),
+                    static_cast<unsigned long long>(now_ms() - t0));
                 return false;
             }
         }
@@ -8076,7 +8193,11 @@ bool ensure_ready()
     if (publish_reused_ready)
     {
         publish_state(bridge_state_t::ready, std::string());
-        diag::log_tagged_fmt("camoufox", "ensure_ready reused_ready elapsed_ms=%llu",
+        diag::log_tagged_fmt("camoufox", "ensure_ready reused_ready elapsed_ms=%llu is_ready_ms=%llu",
+            static_cast<unsigned long long>(now_ms() - t0),
+            static_cast<unsigned long long>(is_ready_ms));
+        diag::log_tagged_fmt("camoufox", "ensure_ready stage_timing ok=1 reused_ready=1 is_ready_ms=%llu probe_ms=0 setup_ms=0 start_bridge_ms=0 total_ms=%llu",
+            static_cast<unsigned long long>(is_ready_ms),
             static_cast<unsigned long long>(now_ms() - t0));
         return true;
     }
@@ -8084,9 +8205,11 @@ bool ensure_ready()
     if (st.state == install::install_state_t::unknown ||
         st.state == install::install_state_t::checking)
     {
+        const uint64_t probe_start_ms = now_ms();
         diag::log_tagged_fmt("camoufox", "ensure_ready probe_begin state=%d elapsed_ms=%llu",
             static_cast<int>(st.state), static_cast<unsigned long long>(now_ms() - t0));
         st = install::probe();
+        probe_ms = now_ms() - probe_start_ms;
         diag::log_tagged_fmt("camoufox", "ensure_ready probe_end state=%d python=%s message=%s elapsed_ms=%llu",
             static_cast<int>(st.state), st.python_path.empty() ? "<empty>" : st.python_path.c_str(),
             st.last_message.empty() ? "<empty>" : st.last_message.c_str(),
@@ -8106,6 +8229,7 @@ bool ensure_ready()
             st.python_path.empty() ? "<empty>" : st.python_path.c_str(),
             static_cast<unsigned long long>(now_ms() - setup_start_ms), setup_log.size(),
             install::last_error().c_str());
+        setup_ms = now_ms() - setup_start_ms;
         if (!setup_ready || st.state != install::install_state_t::ok)
         {
             std::lock_guard<std::recursive_mutex> lk(sg().mtx);
@@ -8114,6 +8238,11 @@ bool ensure_ready()
             if (sg().last_error.empty()) sg().last_error = "camoufox dependency setup did not reach ready state";
             diag::log_tagged_fmt("camoufox", "ensure_ready install_not_ready state=%d err=%s",
                 static_cast<int>(st.state), sg().last_error.c_str());
+            diag::log_tagged_fmt("camoufox", "ensure_ready stage_timing ok=0 install_not_ready=1 is_ready_ms=%llu probe_ms=%llu setup_ms=%llu start_bridge_ms=0 total_ms=%llu",
+                static_cast<unsigned long long>(is_ready_ms),
+                static_cast<unsigned long long>(probe_ms),
+                static_cast<unsigned long long>(setup_ms),
+                static_cast<unsigned long long>(now_ms() - t0));
             return false;
         }
     }
@@ -8137,6 +8266,11 @@ bool ensure_ready()
             : st.last_message;
         diag::log_tagged_fmt("camoufox", "ensure_ready missing_python_after_setup state=%d err=%s",
             static_cast<int>(st.state), sg().last_error.c_str());
+        diag::log_tagged_fmt("camoufox", "ensure_ready stage_timing ok=0 missing_python=1 is_ready_ms=%llu probe_ms=%llu setup_ms=%llu start_bridge_ms=0 total_ms=%llu",
+            static_cast<unsigned long long>(is_ready_ms),
+            static_cast<unsigned long long>(probe_ms),
+            static_cast<unsigned long long>(setup_ms),
+            static_cast<unsigned long long>(now_ms() - t0));
         return false;
     }
     diag::log_tagged_fmt("camoufox", "ensure_ready starting_bridge mode=%s command=%s module=%s has_proxy=%d",
@@ -8151,11 +8285,25 @@ bool ensure_ready()
         diag::log_tagged_fmt("camoufox", "ensure_ready prewarm_cancelled_before_start_bridge elapsed_ms=%llu stop_epoch=%llu",
             static_cast<unsigned long long>(now_ms() - t0),
             static_cast<unsigned long long>(sg().stop_epoch.load(std::memory_order_acquire)));
+        diag::log_tagged_fmt("camoufox", "ensure_ready stage_timing ok=0 prewarm_cancelled=1 is_ready_ms=%llu probe_ms=%llu setup_ms=%llu start_bridge_ms=0 total_ms=%llu",
+            static_cast<unsigned long long>(is_ready_ms),
+            static_cast<unsigned long long>(probe_ms),
+            static_cast<unsigned long long>(setup_ms),
+            static_cast<unsigned long long>(now_ms() - t0));
         return false;
     }
+    const uint64_t start_bridge_start_ms = now_ms();
     bool ok = start_bridge(cfg);
+    start_bridge_ms = now_ms() - start_bridge_start_ms;
     diag::log_tagged_fmt("camoufox", "ensure_ready exit ok=%d elapsed_ms=%llu err_len=%zu",
         static_cast<int>(ok), static_cast<unsigned long long>(now_ms() - t0), last_error().size());
+    diag::log_tagged_fmt("camoufox", "ensure_ready stage_timing ok=%d is_ready_ms=%llu probe_ms=%llu setup_ms=%llu start_bridge_ms=%llu total_ms=%llu",
+        static_cast<int>(ok),
+        static_cast<unsigned long long>(is_ready_ms),
+        static_cast<unsigned long long>(probe_ms),
+        static_cast<unsigned long long>(setup_ms),
+        static_cast<unsigned long long>(start_bridge_ms),
+        static_cast<unsigned long long>(now_ms() - t0));
     return ok;
 }
 
@@ -8415,6 +8563,22 @@ call_result_t managed_call_with_deadline(const std::shared_ptr<managed_session_t
             {"process_tree", timeout_tree},
             {"error", fail.error}
         };
+        attach_bridge_call_metadata(
+            fail,
+            session->session_id,
+            tool_name,
+            request_id,
+            timeout_ms,
+            now_ms() - t0,
+            generation,
+            timed_out_pid,
+            json_string_or(call_args, "page_id", std::string()),
+            "timeout",
+            true,
+            timeout_exit.alive,
+            false,
+            false,
+            true);
         return fail;
     }
     mcp_client::call_result_t result = std::move(state->result);
@@ -8436,6 +8600,33 @@ call_result_t managed_call_with_deadline(const std::shared_ptr<managed_session_t
         }
     }
     const bridge_health_snapshot_t managed_exit_health = sample_bridge_health(child_pid, true);
+    bridge_state_t exit_state = bridge_state_t::stopped;
+    bool exit_browser_open = false;
+    bool exit_page_verified = false;
+    bool exit_cleanup_pending = false;
+    {
+        std::lock_guard<std::recursive_mutex> slk(session->mtx);
+        exit_state = session->state;
+        exit_browser_open = session->browser_open;
+        exit_page_verified = session->page_verified;
+        exit_cleanup_pending = session->cleanup_pending;
+    }
+    attach_bridge_call_metadata(
+        out,
+        session->session_id,
+        tool_name,
+        request_id,
+        timeout_ms,
+        now_ms() - t0,
+        generation,
+        child_pid,
+        json_string_or(call_args, "page_id", std::string()),
+        exit_state == bridge_state_t::error ? "complete_error" : "complete",
+        false,
+        managed_exit_health.child_alive,
+        exit_browser_open,
+        exit_page_verified,
+        exit_cleanup_pending);
     diag::log_tagged_fmt("camoufox", "managed_call complete session_id=%s request_id=%llu tool=%s ok=%d elapsed_ms=%llu child_pid=%lu child_alive=%d exit_valid=%d exit_code=%lu exit_gle=%lu child_processes=%u browser_processes=%u data_shape=%s err_len=%zu process_tree=%s",
         session->session_id.c_str(), static_cast<unsigned long long>(request_id), tool_name.c_str(), static_cast<int>(out.ok),
         static_cast<unsigned long long>(now_ms() - t0),
@@ -8526,6 +8717,12 @@ bridge_status_t managed_status(const std::shared_ptr<managed_session_t>& session
 bool start_managed_bridge(const launch_config_t& cfg, const std::string& session_id)
 {
     const uint64_t t0 = now_ms();
+    uint64_t preflight_ms = 0;
+    uint64_t connect_ms = 0;
+    uint64_t tools_ms = 0;
+    uint64_t launch_rpc_ms = 0;
+    uint64_t readiness_probe_ms = 0;
+    uint64_t visible_window_ms = 0;
     const std::string sid = normalize_session_id(session_id);
     auto session = get_managed_session(sid, true);
     if (!session) return start_bridge(cfg);
@@ -8794,6 +8991,15 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
             sid.c_str(), session->last_error.c_str());
         return false;
     }
+    if (!is_camoufox_browser_executable_path(utf8_to_wide(effective_cfg.browser_executable)))
+    {
+        std::lock_guard<std::recursive_mutex> lk(session->mtx);
+        session->state = bridge_state_t::error;
+        session->last_error = "Configured browser executable is not a Camoufox browser bundle";
+        diag::log_tagged_fmt("camoufox", "managed_start browser_rejected_non_camoufox session_id=%s path=%s",
+            sid.c_str(), effective_cfg.browser_executable.c_str());
+        return false;
+    }
     {
         const bool bundled_visible_launch = !effective_cfg.headless && !effective_cfg.browser_executable.empty();
         diag::log_tagged_fmt("camoufox", "managed_start persistent_context_policy session_id=%s bundled_visible=%d explicit_persistent=%d cfg_persistent=%d profile_dir=%d user_data_dir=%d default_nonpersistent=1",
@@ -8818,16 +9024,27 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
             preflight_ok = prepare_install_for_launch_locked(python_path) && probe_module_installed_locked(python_path) && preflight_server_entry_locked(python_path, effective_cfg);
         if (!preflight_ok)
         {
+            preflight_ms = now_ms() - preflight_start_ms;
             std::lock_guard<std::recursive_mutex> slk(session->mtx);
             session->state = bridge_state_t::error;
             session->last_error = sg().last_error.empty() ? std::string("camoufox managed session preflight failed") : sg().last_error;
             diag::log_tagged_fmt("camoufox", "managed_start preflight_failed session_id=%s preflight_elapsed_ms=%llu elapsed_ms=%llu err=%s",
                 sid.c_str(), static_cast<unsigned long long>(now_ms() - preflight_start_ms),
                 static_cast<unsigned long long>(now_ms() - t0), session->last_error.c_str());
+            diag::log_tagged_fmt("camoufox", "managed_start stage_timing ok=0 phase=preflight session_id=%s preflight_ms=%llu connect_ms=%llu tools_ms=%llu launch_rpc_ms=%llu readiness_probe_ms=%llu visible_window_ms=%llu total_ms=%llu",
+                sid.c_str(),
+                static_cast<unsigned long long>(preflight_ms),
+                static_cast<unsigned long long>(connect_ms),
+                static_cast<unsigned long long>(tools_ms),
+                static_cast<unsigned long long>(launch_rpc_ms),
+                static_cast<unsigned long long>(readiness_probe_ms),
+                static_cast<unsigned long long>(visible_window_ms),
+                static_cast<unsigned long long>(now_ms() - t0));
             return false;
         }
         if (use_server_executable && effective_cfg.server_executable.empty())
             effective_cfg.server_executable = server_executable;
+        preflight_ms = now_ms() - preflight_start_ms;
         diag::log_tagged_fmt("camoufox", "managed_start preflight_end session_id=%s preflight_elapsed_ms=%llu elapsed_ms=%llu",
             sid.c_str(), static_cast<unsigned long long>(now_ms() - preflight_start_ms),
             static_cast<unsigned long long>(now_ms() - t0));
@@ -8970,10 +9187,12 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
         static_cast<unsigned long>(GetErrorMode()),
         static_cast<unsigned long>(GetErrorMode() | kBridgeChildErrorMode));
     bool managed_connect_ok = false;
+    const uint64_t connect_start_ms = now_ms();
     {
         scoped_child_error_mode_t mcp_child_error_mode("managed_start_mcp_connect", mcp_create_flags, scfg.command.c_str());
         managed_connect_ok = cli->connect(scfg);
     }
+    connect_ms = now_ms() - connect_start_ms;
     if (!managed_connect_ok)
     {
         const std::string connect_error = cli->last_error();
@@ -9003,6 +9222,15 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
             static_cast<unsigned long long>(managed_generation),
             process_init_failure ? 1 : 0,
             session->last_error.c_str());
+        diag::log_tagged_fmt("camoufox", "managed_start stage_timing ok=0 phase=connect session_id=%s preflight_ms=%llu connect_ms=%llu tools_ms=%llu launch_rpc_ms=%llu readiness_probe_ms=%llu visible_window_ms=%llu total_ms=%llu",
+            sid.c_str(),
+            static_cast<unsigned long long>(preflight_ms),
+            static_cast<unsigned long long>(connect_ms),
+            static_cast<unsigned long long>(tools_ms),
+            static_cast<unsigned long long>(launch_rpc_ms),
+            static_cast<unsigned long long>(readiness_probe_ms),
+            static_cast<unsigned long long>(visible_window_ms),
+            static_cast<unsigned long long>(now_ms() - t0));
         return false;
     }
     {
@@ -9047,6 +9275,7 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
     }
     std::string managed_missing_tools;
     std::string managed_tool_inventory;
+    const uint64_t tools_start_ms = now_ms();
     if (!wait_for_required_reverse_tools(
             cli.get(),
             tool_wait_ms,
@@ -9058,6 +9287,7 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
             managed_missing_tools,
             managed_tool_inventory))
     {
+        tools_ms = now_ms() - tools_start_ms;
         const uint32_t pid = cli->child_process_id();
         const std::string managed_inner = cli->last_error();
         log_required_reverse_tools_missing_launch_skip(
@@ -9081,8 +9311,18 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
             (managed_missing_tools.empty() ? std::string("<unknown>") : managed_missing_tools) +
             "; inventory=" + (managed_tool_inventory.empty() ? std::string("<empty>") : managed_tool_inventory) +
             "; mcp last_error=" + managed_inner;
+        diag::log_tagged_fmt("camoufox", "managed_start stage_timing ok=0 phase=required_tools session_id=%s preflight_ms=%llu connect_ms=%llu tools_ms=%llu launch_rpc_ms=%llu readiness_probe_ms=%llu visible_window_ms=%llu total_ms=%llu",
+            sid.c_str(),
+            static_cast<unsigned long long>(preflight_ms),
+            static_cast<unsigned long long>(connect_ms),
+            static_cast<unsigned long long>(tools_ms),
+            static_cast<unsigned long long>(launch_rpc_ms),
+            static_cast<unsigned long long>(readiness_probe_ms),
+            static_cast<unsigned long long>(visible_window_ms),
+            static_cast<unsigned long long>(now_ms() - t0));
         return false;
     }
+    tools_ms = now_ms() - tools_start_ms;
     effective_cfg.launch_timeout_ms = launch_wait_ms;
     nlohmann::json args = build_launch_args(effective_cfg);
     const uint64_t managed_launch_attempt_ms = now_ms();
@@ -9104,7 +9344,9 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
         managed_launch_service_workers.c_str(),
         args.value("aida_fast_visible_launch", false) ? 1 : 0,
         managed_launch_policy_marker.c_str());
+    const uint64_t launch_rpc_start_ms = now_ms();
     call_result_t launch = managed_call_with_deadline(session, "launch_browser", args, launch_wait_ms, true);
+    launch_rpc_ms = now_ms() - launch_rpc_start_ms;
     if (!launch.ok)
     {
         const uint32_t pid = cli->child_process_id();
@@ -9178,6 +9420,15 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
         session->child_pid = 0;
         session->state = bridge_state_t::error;
         session->last_error = launch.error.empty() ? std::string("camoufox managed launch_browser failed") : launch.error;
+        diag::log_tagged_fmt("camoufox", "managed_start stage_timing ok=0 phase=launch_rpc session_id=%s preflight_ms=%llu connect_ms=%llu tools_ms=%llu launch_rpc_ms=%llu readiness_probe_ms=%llu visible_window_ms=%llu total_ms=%llu",
+            sid.c_str(),
+            static_cast<unsigned long long>(preflight_ms),
+            static_cast<unsigned long long>(connect_ms),
+            static_cast<unsigned long long>(tools_ms),
+            static_cast<unsigned long long>(launch_rpc_ms),
+            static_cast<unsigned long long>(readiness_probe_ms),
+            static_cast<unsigned long long>(visible_window_ms),
+            static_cast<unsigned long long>(now_ms() - t0));
         return false;
     }
     nlohmann::json launch_payload = launch.data;
@@ -9241,6 +9492,15 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
         session->child_pid = 0;
         session->state = bridge_state_t::error;
         session->last_error = std::string("camoufox managed launch_browser returned error: ") + failure_text;
+        diag::log_tagged_fmt("camoufox", "managed_start stage_timing ok=0 phase=launch_returned_error session_id=%s preflight_ms=%llu connect_ms=%llu tools_ms=%llu launch_rpc_ms=%llu readiness_probe_ms=%llu visible_window_ms=%llu total_ms=%llu",
+            sid.c_str(),
+            static_cast<unsigned long long>(preflight_ms),
+            static_cast<unsigned long long>(connect_ms),
+            static_cast<unsigned long long>(tools_ms),
+            static_cast<unsigned long long>(launch_rpc_ms),
+            static_cast<unsigned long long>(readiness_probe_ms),
+            static_cast<unsigned long long>(visible_window_ms),
+            static_cast<unsigned long long>(now_ms() - t0));
         return false;
     }
     bool managed_privacy_failed = false;
@@ -9302,9 +9562,20 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
         log_managed_failure_diagnostics("launch_privacy_not_verified", managed_privacy_failed_pid, "privacy verification failed", launch.text);
         cleanup_managed_process("launch_privacy_not_verified", managed_privacy_failed_pid, std::string("managed_launch_privacy_not_verified_") + sid);
         cli->disconnect();
+        diag::log_tagged_fmt("camoufox", "managed_start stage_timing ok=0 phase=privacy session_id=%s preflight_ms=%llu connect_ms=%llu tools_ms=%llu launch_rpc_ms=%llu readiness_probe_ms=%llu visible_window_ms=%llu total_ms=%llu",
+            sid.c_str(),
+            static_cast<unsigned long long>(preflight_ms),
+            static_cast<unsigned long long>(connect_ms),
+            static_cast<unsigned long long>(tools_ms),
+            static_cast<unsigned long long>(launch_rpc_ms),
+            static_cast<unsigned long long>(readiness_probe_ms),
+            static_cast<unsigned long long>(visible_window_ms),
+            static_cast<unsigned long long>(now_ms() - t0));
         return false;
     }
+    const uint64_t readiness_probe_start_ms = now_ms();
     call_result_t page = managed_call_with_deadline(session, "get_page_info", nlohmann::json::object(), kReadinessProbeTimeoutMs, true);
+    readiness_probe_ms = now_ms() - readiness_probe_start_ms;
     if (!page.ok || !page.data.is_object() || !page.data.contains("url") || !page.data["url"].is_string())
     {
         const uint32_t pid = cli->child_process_id();
@@ -9316,6 +9587,15 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
         session->child_pid = 0;
         session->state = bridge_state_t::error;
         session->last_error = page.error.empty() ? std::string("camoufox managed readiness probe failed") : page.error;
+        diag::log_tagged_fmt("camoufox", "managed_start stage_timing ok=0 phase=readiness_probe session_id=%s preflight_ms=%llu connect_ms=%llu tools_ms=%llu launch_rpc_ms=%llu readiness_probe_ms=%llu visible_window_ms=%llu total_ms=%llu",
+            sid.c_str(),
+            static_cast<unsigned long long>(preflight_ms),
+            static_cast<unsigned long long>(connect_ms),
+            static_cast<unsigned long long>(tools_ms),
+            static_cast<unsigned long long>(launch_rpc_ms),
+            static_cast<unsigned long long>(readiness_probe_ms),
+            static_cast<unsigned long long>(visible_window_ms),
+            static_cast<unsigned long long>(now_ms() - t0));
         return false;
     }
     {
@@ -9327,8 +9607,19 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
         session->page_verified = true;
         session->last_verified_ms = now_ms();
         session->last_launch_ms = now_ms() - t0;
+        const uint64_t visible_window_start_ms = now_ms();
         const visible_window_snapshot_t ready_visible = sample_visible_window_proof(session->child_pid);
+        visible_window_ms = now_ms() - visible_window_start_ms;
         session->last_launch_diagnostics["visible_window_proof"] = visible_window_proof_json(ready_visible, session->child_pid, managed_generation, "managed_launch_ready");
+        session->last_launch_diagnostics["cpp_stage_timings"] = {
+            {"preflight_ms", preflight_ms},
+            {"connect_ms", connect_ms},
+            {"required_tools_ms", tools_ms},
+            {"launch_rpc_ms", launch_rpc_ms},
+            {"readiness_probe_ms", readiness_probe_ms},
+            {"visible_window_ms", visible_window_ms},
+            {"total_ms", now_ms() - t0}
+        };
         log_visible_window_proof("managed_launch_ready", managed_generation, session->child_pid, ready_visible);
         if (!effective_cfg.headless && ready_visible.visible_window_count == 0)
         {
@@ -9355,6 +9646,15 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
             log_managed_failure_diagnostics("visible_window_missing", failed_pid, "visible window proof missing after readiness", launch.text);
             cleanup_managed_process("visible_window_missing", failed_pid, std::string("managed_visible_window_missing_") + sid);
             cli->disconnect();
+            diag::log_tagged_fmt("camoufox", "managed_start stage_timing ok=0 phase=visible_window session_id=%s preflight_ms=%llu connect_ms=%llu tools_ms=%llu launch_rpc_ms=%llu readiness_probe_ms=%llu visible_window_ms=%llu total_ms=%llu",
+                sid.c_str(),
+                static_cast<unsigned long long>(preflight_ms),
+                static_cast<unsigned long long>(connect_ms),
+                static_cast<unsigned long long>(tools_ms),
+                static_cast<unsigned long long>(launch_rpc_ms),
+                static_cast<unsigned long long>(readiness_probe_ms),
+                static_cast<unsigned long long>(visible_window_ms),
+                static_cast<unsigned long long>(now_ms() - t0));
             return false;
         }
         session->state = bridge_state_t::ready;
@@ -9362,6 +9662,16 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
     }
     diag::log_tagged_fmt("camoufox", "managed_start ready session_id=%s child_pid=%lu elapsed_ms=%llu",
         sid.c_str(), static_cast<unsigned long>(cli->child_process_id()), static_cast<unsigned long long>(now_ms() - t0));
+    diag::log_tagged_fmt("camoufox", "managed_start stage_timing ok=1 phase=ready session_id=%s preflight_ms=%llu connect_ms=%llu tools_ms=%llu launch_rpc_ms=%llu readiness_probe_ms=%llu visible_window_ms=%llu total_ms=%llu child_pid=%lu",
+        sid.c_str(),
+        static_cast<unsigned long long>(preflight_ms),
+        static_cast<unsigned long long>(connect_ms),
+        static_cast<unsigned long long>(tools_ms),
+        static_cast<unsigned long long>(launch_rpc_ms),
+        static_cast<unsigned long long>(readiness_probe_ms),
+        static_cast<unsigned long long>(visible_window_ms),
+        static_cast<unsigned long long>(now_ms() - t0),
+        static_cast<unsigned long>(cli->child_process_id()));
     return true;
 }
 
@@ -9836,6 +10146,22 @@ call_result_t call_tool(const std::string& tool_name, const nlohmann::json& args
     }
     const action_snapshot_t exit = action_snapshot();
     const bridge_health_snapshot_t exit_health = sample_bridge_health(exit.child_pid, true);
+    attach_bridge_call_metadata(
+        r,
+        "default",
+        tool_name,
+        request_id,
+        timeout_ms,
+        now_ms() - call_start_ms,
+        exit.generation,
+        exit.child_pid,
+        requested_page_id,
+        exit.state == bridge_state_t::error ? "call_tool_error" : "call_tool_exit",
+        false,
+        exit.child_alive,
+        exit.browser_open,
+        exit.page_verified,
+        exit.cleanup_pending);
     diag::log_tagged_fmt("camoufox", "call_tool health_exit request_id=%llu tool=%s session_id=default page_id=%s caller_pid=%lu caller_tid=%lu ok=%d elapsed_ms=%llu generation=%llu child_pid=%lu child_alive=%d exit_valid=%d exit_code=%lu exit_gle=%lu child_processes=%u browser_processes=%u process_tree=%s",
         static_cast<unsigned long long>(request_id),
         tool_name.c_str(),

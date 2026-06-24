@@ -15,6 +15,10 @@
 #include <cstdint>
 #include <mutex>
 #include <cstdlib>
+#include <deque>
+#include <string>
+#include <utility>
+#include <process.h>
 
 #include "../core/runtime/manual_map_tls.hpp"
 
@@ -247,22 +251,35 @@ inline void coalesced_flush_log(HANDLE hf, DWORD bytes_written, bool force)
     }
 }
 
-inline DWORD write_tagged_line(HANDLE hf, const char* tag, const char* msg)
+inline bool format_tagged_line(char* line, size_t line_size, DWORD* len_out, const char* tag, const char* msg)
 {
-    if (hf == INVALID_HANDLE_VALUE) return 0;
+    if (!line || line_size == 0)
+        return false;
+    if (len_out)
+        *len_out = 0;
     SYSTEMTIME st{};
     GetLocalTime(&st);
-    char line[4096];
-    int len = _snprintf_s(line, sizeof(line), _TRUNCATE,
+    int len = _snprintf_s(line, line_size, _TRUNCATE,
         "[%02d:%02d:%02d.%03d] [%s] %s\r\n",
         st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
         tag ? tag : "diag", msg ? msg : "");
-    if (len > 0) {
-        DWORD written = 0;
-        WriteFile(hf, line, static_cast<DWORD>(len), &written, nullptr);
-        return written;
-    }
-    return 0;
+    if (len <= 0)
+        return false;
+    if (len_out)
+        *len_out = static_cast<DWORD>(len);
+    return true;
+}
+
+inline DWORD write_tagged_line(HANDLE hf, const char* tag, const char* msg)
+{
+    if (hf == INVALID_HANDLE_VALUE) return 0;
+    char line[4096];
+    DWORD len = 0;
+    if (!format_tagged_line(line, sizeof(line), &len, tag, msg))
+        return 0;
+    DWORD written = 0;
+    WriteFile(hf, line, len, &written, nullptr);
+    return written;
 }
 
 inline void write_log_path_decision_once(HANDLE hf)
@@ -320,7 +337,140 @@ inline void write_log_path_decision_once(HANDLE hf)
     coalesced_flush_log(hf, bytes, true);
 }
 
-inline void log_tagged(const char* tag, const char* msg)
+struct async_log_item_t
+{
+    std::string line;
+    bool force;
+};
+
+inline std::mutex& async_log_mutex()
+{
+    static std::mutex m;
+    return m;
+}
+
+inline std::deque<async_log_item_t>& async_log_queue()
+{
+    static std::deque<async_log_item_t> q;
+    return q;
+}
+
+inline HANDLE& async_log_event()
+{
+    static HANDLE h = nullptr;
+    return h;
+}
+
+inline HANDLE& async_log_thread()
+{
+    static HANDLE h = nullptr;
+    return h;
+}
+
+inline std::atomic<bool>& async_log_started()
+{
+    static std::atomic<bool> v{ false };
+    return v;
+}
+
+inline std::atomic<bool>& async_log_start_failed()
+{
+    static std::atomic<bool> v{ false };
+    return v;
+}
+
+inline std::atomic<bool>& async_log_shutdown_requested()
+{
+    static std::atomic<bool> v{ false };
+    return v;
+}
+
+inline unsigned __stdcall async_log_thread_main(void*)
+{
+    aida::manual_map_tls::ensure_current_thread();
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    for (;;) {
+        HANDLE ev = async_log_event();
+        if (ev)
+            WaitForSingleObject(ev, 250);
+
+        std::deque<async_log_item_t> batch;
+        {
+            std::lock_guard<std::mutex> lk(async_log_mutex());
+            batch.swap(async_log_queue());
+        }
+
+        if (!batch.empty()) {
+            std::lock_guard<std::mutex> lk(log_file_mutex());
+            HANDLE hf = get_cached_log_handle();
+            if (hf != INVALID_HANDLE_VALUE) {
+                write_log_path_decision_once(hf);
+                DWORD batch_bytes = 0;
+                bool force_flush = false;
+                for (const auto& item : batch) {
+                    DWORD written = 0;
+                    if (!item.line.empty())
+                        WriteFile(hf, item.line.data(), static_cast<DWORD>(item.line.size()), &written, nullptr);
+                    batch_bytes += written;
+                    force_flush = force_flush || item.force;
+                }
+                coalesced_flush_log(hf, batch_bytes, force_flush);
+            }
+        }
+
+        if (async_log_shutdown_requested().load(std::memory_order_acquire)) {
+            std::lock_guard<std::mutex> lk(async_log_mutex());
+            if (async_log_queue().empty())
+                break;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(log_file_mutex());
+        HANDLE hf = cached_log_handle();
+        if (hf != INVALID_HANDLE_VALUE)
+            FlushFileBuffers(hf);
+    }
+    return 0;
+}
+
+inline bool ensure_async_log_thread()
+{
+    if (async_log_started().load(std::memory_order_acquire))
+        return true;
+    if (async_log_start_failed().load(std::memory_order_acquire))
+        return false;
+    static std::mutex start_mutex;
+    std::lock_guard<std::mutex> lk(start_mutex);
+    if (async_log_started().load(std::memory_order_acquire))
+        return true;
+    if (async_log_start_failed().load(std::memory_order_acquire))
+        return false;
+    HANDLE ev = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+    if (!ev) {
+        async_log_start_failed().store(true, std::memory_order_release);
+        return false;
+    }
+    unsigned tid = 0;
+    uintptr_t th = _beginthreadex(nullptr, 0, async_log_thread_main, nullptr, 0, &tid);
+    if (!th) {
+        CloseHandle(ev);
+        async_log_start_failed().store(true, std::memory_order_release);
+        return false;
+    }
+    async_log_event() = ev;
+    async_log_thread() = reinterpret_cast<HANDLE>(th);
+    async_log_started().store(true, std::memory_order_release);
+    return true;
+}
+
+inline bool sync_critical_tag(const char* tag)
+{
+    return tag &&
+        (std::strcmp(tag, "veh_crash") == 0 ||
+         std::strcmp(tag, "exception") == 0);
+}
+
+inline void log_tagged_direct(const char* tag, const char* msg, bool force)
 {
     aida::manual_map_tls::ensure_current_thread();
     std::lock_guard<std::mutex> lk(log_file_mutex());
@@ -328,7 +478,49 @@ inline void log_tagged(const char* tag, const char* msg)
     if (hf == INVALID_HANDLE_VALUE) return;
     write_log_path_decision_once(hf);
     DWORD written = write_tagged_line(hf, tag, msg);
-    coalesced_flush_log(hf, written, false);
+    coalesced_flush_log(hf, written, force);
+}
+
+inline void log_tagged_async_or_direct(const char* tag, const char* msg, bool force)
+{
+    aida::manual_map_tls::ensure_current_thread();
+    if (force && sync_critical_tag(tag)) {
+        log_tagged_direct(tag, msg, true);
+        return;
+    }
+    char line[4096];
+    DWORD len = 0;
+    if (!format_tagged_line(line, sizeof(line), &len, tag, msg))
+        return;
+    if (!ensure_async_log_thread()) {
+        log_tagged_direct(tag, msg, force);
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(async_log_mutex());
+        async_log_queue().push_back(async_log_item_t{ std::string(line, line + len), force });
+    }
+    HANDLE ev = async_log_event();
+    if (ev)
+        SetEvent(ev);
+}
+
+inline void flush_async_logs(DWORD timeout_ms = 5000)
+{
+    if (!async_log_started().load(std::memory_order_acquire))
+        return;
+    async_log_shutdown_requested().store(true, std::memory_order_release);
+    HANDLE ev = async_log_event();
+    if (ev)
+        SetEvent(ev);
+    HANDLE th = async_log_thread();
+    if (th)
+        WaitForSingleObject(th, timeout_ms);
+}
+
+inline void log_tagged(const char* tag, const char* msg)
+{
+    log_tagged_async_or_direct(tag, msg, false);
 }
 
 inline void log_tagged_fmt(const char* tag, const char* fmt, ...)
@@ -343,13 +535,7 @@ inline void log_tagged_fmt(const char* tag, const char* fmt, ...)
 
 inline void log_tagged_critical(const char* tag, const char* msg)
 {
-    aida::manual_map_tls::ensure_current_thread();
-    std::lock_guard<std::mutex> lk(log_file_mutex());
-    HANDLE hf = get_cached_log_handle();
-    if (hf == INVALID_HANDLE_VALUE) return;
-    write_log_path_decision_once(hf);
-    DWORD written = write_tagged_line(hf, tag, msg);
-    coalesced_flush_log(hf, written, true);
+    log_tagged_async_or_direct(tag, msg, true);
 }
 
 inline void log_tagged_critical_fmt(const char* tag, const char* fmt, ...)

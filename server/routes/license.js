@@ -1454,7 +1454,56 @@ function parseHwidFactors(value) {
     }
 }
 
+function isSha256Hex(value) {
+    return typeof value === 'string' && /^[a-fA-F0-9]{64}$/.test(value);
+}
+
+function normalizeHwidV2Factors(body) {
+    const source = body && (body.hwid_v2_factors || body.hwid_factors_v2 || body.hwid_factor_hashes);
+    if (!source || typeof source !== 'object' || Buffer.isBuffer(source)) return null;
+    const factors = {};
+    let count = 0;
+    for (const [rawKey, rawValue] of Object.entries(source)) {
+        const id = Number(rawKey);
+        if (!Number.isInteger(id) || id < 1 || id > 9 || !isSha256Hex(rawValue)) continue;
+        factors[String(id)] = String(rawValue).toLowerCase();
+        count += 1;
+    }
+    if (count < 5) return null;
+    factors._schema = 'hwid_v2_factor_hashes_v1';
+    factors._count = count;
+    const maskRaw = Number(body && (body.hwid_v2_factor_mask ?? body.hwid_factor_present_mask));
+    factors._mask = Number.isFinite(maskRaw) ? (maskRaw >>> 0) : 0;
+    factors._tpm_present = !!(body && body.hwid_v2_tpm_present);
+    return factors;
+}
+
+function hwidFactorKeys(factors) {
+    if (!factors || typeof factors !== 'object') return [];
+    return Object.keys(factors)
+        .filter(k => /^[1-9]$/.test(k) && isSha256Hex(factors[k]))
+        .sort((a, b) => Number(a) - Number(b));
+}
+
+function isRichHwidV2Factors(factors) {
+    if (!factors || typeof factors !== 'object') return false;
+    if (factors._schema !== 'hwid_v2_factor_hashes_v1') return false;
+    return hwidFactorKeys(factors).length >= 5;
+}
+
+function isLegacyAggregateHwidOnlyFactors(factors, existingHwid) {
+    if (!factors || typeof factors !== 'object') return true;
+    const keys = Object.keys(factors);
+    if (keys.length === 0) return true;
+    if (keys.length !== 1 || !isSha256Hex(factors.hwid)) return false;
+    if (typeof existingHwid !== 'string' || existingHwid.length === 0) return true;
+    const expected = crypto.createHash('sha256').update(existingHwid, 'utf8').digest('hex');
+    return compareHexConstantTime(String(factors.hwid).toLowerCase(), expected);
+}
+
 function deriveHwidFactors(body) {
+    const rich = normalizeHwidV2Factors(body);
+    if (rich) return rich;
     const factors = {};
     const append = (label, raw) => {
         if (typeof raw !== 'string' || raw.length === 0) return;
@@ -1466,17 +1515,14 @@ function deriveHwidFactors(body) {
     append('machine_guid', body && body.machine_guid_hash);
     append('hardware_id', body && body.hardware_id_sha256);
     append('hwid', body && body.hwid);
-    if (Object.keys(factors).length === 0 && body && typeof body.hwid === 'string' && body.hwid.length > 0) {
-        factors.hwid = crypto.createHash('sha256').update(body.hwid, 'utf8').digest('hex');
-    }
     return factors;
 }
 
 function compareHwidFactors(prev, current) {
-    if (!prev || !current) {
+    if (!isRichHwidV2Factors(prev) || !isRichHwidV2Factors(current)) {
         return { changed: 99, changed_keys: [], total: 0 };
     }
-    const keys = new Set([...Object.keys(prev), ...Object.keys(current)]);
+    const keys = new Set([...hwidFactorKeys(prev), ...hwidFactorKeys(current)]);
     const changedKeys = [];
     for (const k of keys) {
         if (prev[k] && current[k] && prev[k] !== current[k]) changedKeys.push(k);
@@ -1493,6 +1539,34 @@ async function persistHwidFactors(licenseKey, factors) {
             [JSON.stringify(factors || {}), licenseKey]
         );
     } catch (_) { }
+}
+
+function sessionTokenMatches(a, b) {
+    if (typeof a !== 'string' || typeof b !== 'string') return false;
+    if (a.length === 0 || a.length !== b.length) return false;
+    return crypto.timingSafeEqual(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8'));
+}
+
+async function validateLegacyHwidContinuity(licenseKey, existingHwid, sessionToken) {
+    if (typeof sessionToken !== 'string' || sessionToken.length < 16 || sessionToken.length > 4096) {
+        return { ok: false, reason: 'missing_session_token' };
+    }
+    const session = await getSession(licenseKey);
+    if (!session) return { ok: false, reason: 'session_absent' };
+    if (session.kill_flag) return { ok: false, reason: 'session_killed' };
+    if (!sessionTokenMatches(session.session_token || '', sessionToken)) {
+        return { ok: false, reason: 'session_token_mismatch' };
+    }
+    if (session.hwid && existingHwid && session.hwid !== existingHwid) {
+        return { ok: false, reason: 'session_hwid_mismatch' };
+    }
+    const now = Math.floor(Date.now() / 1000);
+    const issuedAt = Number(session.issued_at || 0);
+    const ttl = Number(session.ttl || 0);
+    if (issuedAt > 0 && ttl > 0 && now > issuedAt + Math.floor(ttl * SESSION_TTL_GRACE_FACTOR)) {
+        return { ok: false, reason: 'session_expired' };
+    }
+    return { ok: true, reason: 'session_continuity' };
 }
 
 async function verifyOrBindHwid(licenseKey, hwid, existingHwid, options) {
@@ -1533,13 +1607,37 @@ async function verifyOrBindHwid(licenseKey, hwid, existingHwid, options) {
                 }).catch(() => {});
                 return { ok: true, reason: 'grace_accepted' };
             }
+            if (isRichHwidV2Factors(options.factors)
+                && isLegacyAggregateHwidOnlyFactors(prevFactors, existingHwid)
+                && !withinCooldown) {
+                const continuity = await validateLegacyHwidContinuity(
+                    licenseKey,
+                    existingHwid,
+                    options.continuitySessionToken || ''
+                );
+                if (continuity.ok) {
+                    try {
+                        await pool.query(
+                            'UPDATE licenses SET hwid = $1, hwid_factors = $2::jsonb, hwid_grace_used_at = $3 WHERE key = $4',
+                            [hwid, JSON.stringify(options.factors), now, licenseKey]
+                        );
+                    } catch (_) { }
+                    auditLog.logServerEvent('license.hwid_legacy_session_continuity_accepted', licenseKey, {
+                        previous_hwid_prefix: typeof existingHwid === 'string' ? existingHwid.slice(0, 16) : '',
+                        new_hwid_prefix: hwid.slice(0, 16),
+                        factor_count: hwidFactorKeys(options.factors).length,
+                    }).catch(() => {});
+                    return { ok: true, reason: 'legacy_session_continuity_accepted' };
+                }
+            }
         }
         return { ok: false, reason: 'hwid_mismatch' };
     }
 
     if (options && options.factors) {
         const prevFactors = parseHwidFactors(options.licenseRow && options.licenseRow.hwid_factors);
-        if (Object.keys(prevFactors).length === 0) {
+        if (Object.keys(prevFactors).length === 0
+            || (isRichHwidV2Factors(options.factors) && !isRichHwidV2Factors(prevFactors))) {
             await persistHwidFactors(licenseKey, options.factors);
         }
     }
@@ -1907,6 +2005,7 @@ async function handleValidate(body, clientIp) {
     const hwidResult = await verifyOrBindHwid(normalizedLicenseKey, effectiveHwid, lookup.data.hwid || '', {
         factors: hwidFactors,
         licenseRow: lookup.data,
+        continuitySessionToken: typeof body.session_token === 'string' ? body.session_token : '',
     });
     if (!hwidResult.ok) {
         return collapseInvalid('hwid:' + (hwidResult.reason || 'unknown'), normalizedLicenseKey, hwid, clientIp);
@@ -3986,6 +4085,11 @@ router._internal = {
     enforceStandaloneCapsuleProof,
     verifyStandaloneCapsuleProof,
     sendSlackAlert,
+    deriveHwidFactors,
+    compareHwidFactors,
+    isRichHwidV2Factors,
+    isLegacyAggregateHwidOnlyFactors,
+    verifyOrBindHwid,
     storeSession,
 };
 

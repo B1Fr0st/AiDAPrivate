@@ -113,6 +113,91 @@ std::string  s_chat_session_id;
 std::string  s_chat_last_assistant_message_id;
 int64_t      s_chat_used_tokens = 0;
 
+ULONGLONG shutdown_phase_begin(const char* phase)
+{
+    const ULONGLONG start = GetTickCount64();
+    diag::log_tagged_critical_fmt("chat",
+        "shutdown_phase_begin phase=%s pid=%lu tid=%lu",
+        phase && *phase ? phase : "<unknown>",
+        static_cast<unsigned long>(GetCurrentProcessId()),
+        static_cast<unsigned long>(GetCurrentThreadId()));
+    return start;
+}
+
+void shutdown_phase_done(const char* phase, ULONGLONG start)
+{
+    const ULONGLONG elapsed = GetTickCount64() - start;
+    diag::log_tagged_critical_fmt("chat",
+        "shutdown_phase_done phase=%s elapsed_ms=%llu pid=%lu tid=%lu",
+        phase && *phase ? phase : "<unknown>",
+        static_cast<unsigned long long>(elapsed),
+        static_cast<unsigned long>(GetCurrentProcessId()),
+        static_cast<unsigned long>(GetCurrentThreadId()));
+}
+
+void log_shutdown_queue_snapshot(const char* phase)
+{
+    auto wq = work_queue::stats();
+    auto svc = work_queue::service_stats();
+    auto cq = critical_work_queue::stats();
+    diag::log_tagged_critical_fmt("chat",
+        "shutdown_queue_snapshot phase=%s cq_alive=%d cq_shutdown=%d cq_workers=%zu cq_pending=%zu cq_active=%u cq_oldest_ms=%llu cq_started=%llu cq_finished=%llu cq_labels=%.420s wq_alive=%d wq_shutdown=%d wq_workers=%zu wq_pending=%zu wq_active=%u wq_oldest_ms=%llu wq_started=%llu wq_finished=%llu wq_labels=%.420s svc_alive=%d svc_shutdown=%d svc_workers=%zu svc_pending=%zu svc_active=%u svc_oldest_ms=%llu svc_started=%llu svc_finished=%llu svc_labels=%.420s",
+        phase && *phase ? phase : "<unknown>",
+        cq.alive ? 1 : 0,
+        cq.shutting_down ? 1 : 0,
+        cq.workers,
+        cq.pending,
+        static_cast<unsigned>(cq.active),
+        static_cast<unsigned long long>(cq.oldest_active_ms),
+        static_cast<unsigned long long>(cq.started),
+        static_cast<unsigned long long>(cq.finished),
+        cq.active_labels.empty() ? "<none>" : cq.active_labels.c_str(),
+        wq.alive ? 1 : 0,
+        wq.shutting_down ? 1 : 0,
+        wq.workers,
+        wq.pending,
+        static_cast<unsigned>(wq.active),
+        static_cast<unsigned long long>(wq.oldest_active_ms),
+        static_cast<unsigned long long>(wq.started),
+        static_cast<unsigned long long>(wq.finished),
+        wq.active_labels.empty() ? "<none>" : wq.active_labels.c_str(),
+        svc.alive ? 1 : 0,
+        svc.shutting_down ? 1 : 0,
+        svc.workers,
+        svc.pending,
+        static_cast<unsigned>(svc.active),
+        static_cast<unsigned long long>(svc.oldest_active_ms),
+        static_cast<unsigned long long>(svc.started),
+        static_cast<unsigned long long>(svc.finished),
+        svc.active_labels.empty() ? "<none>" : svc.active_labels.c_str());
+}
+
+bool shutdown_queues_quiescent(const char* phase)
+{
+    auto wq = work_queue::stats();
+    auto svc = work_queue::service_stats();
+    auto cq = critical_work_queue::stats();
+    const bool quiescent =
+        cq.pending == 0 && cq.active == 0 &&
+        wq.pending == 0 && wq.active == 0 &&
+        svc.pending == 0 && svc.active == 0;
+    if (!quiescent) {
+        diag::log_tagged_critical_fmt("chat",
+            "shutdown_queue_drain_incomplete phase=%s cq_pending=%zu cq_active=%u cq_labels=%.420s wq_pending=%zu wq_active=%u wq_labels=%.420s svc_pending=%zu svc_active=%u svc_labels=%.420s",
+            phase && *phase ? phase : "<unknown>",
+            cq.pending,
+            static_cast<unsigned>(cq.active),
+            cq.active_labels.empty() ? "<none>" : cq.active_labels.c_str(),
+            wq.pending,
+            static_cast<unsigned>(wq.active),
+            wq.active_labels.empty() ? "<none>" : wq.active_labels.c_str(),
+            svc.pending,
+            static_cast<unsigned>(svc.active),
+            svc.active_labels.empty() ? "<none>" : svc.active_labels.c_str());
+    }
+    return quiescent;
+}
+
 std::string get_chat_session_id_locked()
 {
     std::lock_guard<std::mutex> lk(s_chat_session_mtx);
@@ -2543,9 +2628,12 @@ void mark_ide_ready_for_mcp_services()
 
 void shutdown_standalone_chat()
 {
-    diag::log_tagged("chat", "shutdown_standalone_chat enter");
+    ULONGLONG shutdown_start = shutdown_phase_begin("shutdown_standalone_chat");
+    diag::log_tagged_critical("chat", "shutdown_standalone_chat enter");
+    log_shutdown_queue_snapshot("shutdown_enter");
     s_cancel = true;
     {
+        ULONGLONG phase_start = shutdown_phase_begin("ai_task_cancel");
         std::lock_guard<std::mutex> lk(s_ai_thread_mtx);
         s_cancel = true;
         if (g_sa_ai_client) g_sa_ai_client->cancel();
@@ -2553,7 +2641,9 @@ void shutdown_standalone_chat()
             std::unique_lock<std::mutex> lk2(s_ai_task_done_mtx);
             s_ai_task_done_cv.wait(lk2, []() { return s_ai_task_done.load(); });
         }
+        shutdown_phase_done("ai_task_cancel", phase_start);
     }
+    ULONGLONG producer_start = shutdown_phase_begin("producer_stop");
     s_mcp_server.stop();
     s_server_started = false;
     mcp_standalone::set_ide_lifecycle_ready(false);
@@ -2568,7 +2658,9 @@ void shutdown_standalone_chat()
 
     g_sa_settings.marketplace_installed_json = mcp_marketplace::save_installed();
     mcp_marketplace::shutdown();
+    shutdown_phase_done("producer_stop", producer_start);
 
+    ULONGLONG ui_start = shutdown_phase_begin("ui_services_shutdown");
     aida::settings_overlay::shutdown();
     aida::command_palette::shutdown();
     aida::binary_map_view::shutdown();
@@ -2577,21 +2669,48 @@ void shutdown_standalone_chat()
     aida::agent_picker::shutdown();
     aida::provider_view::shutdown();
     aida::auth_view::shutdown();
+    shutdown_phase_done("ui_services_shutdown", ui_start);
 
+    ULONGLONG session_start = shutdown_phase_begin("session_shutdown");
     (void)aida::session::shutdown();
-    standalone_license::stop_background_workers("chat.shutdown_pre_driver", 5000);
-    driver_bridge::shutdown("chat.shutdown_pre_queues");
-    aida::events::shutdown();
-    standalone_license::shutdown();
-    critical_work_queue::shutdown();
-    work_queue::shutdown();
+    shutdown_phase_done("session_shutdown", session_start);
 
+    ULONGLONG license_bg_start = shutdown_phase_begin("license_background_stop");
+    standalone_license::stop_background_workers("chat.shutdown_pre_queues", 5000);
+    shutdown_phase_done("license_background_stop", license_bg_start);
+
+    ULONGLONG queue_start = shutdown_phase_begin("queue_drain");
+    log_shutdown_queue_snapshot("queue_drain_before");
+    critical_work_queue::shutdown(15000);
+    log_shutdown_queue_snapshot("queue_drain_after_critical");
+    work_queue::shutdown(15000);
+    log_shutdown_queue_snapshot("queue_drain_after_work");
+    const bool queues_quiescent = shutdown_queues_quiescent("queue_drain_after_work");
+    shutdown_phase_done("queue_drain", queue_start);
+
+    if (queues_quiescent) {
+        ULONGLONG dependency_start = shutdown_phase_begin("driver_event_shutdown");
+        driver_bridge::shutdown("chat.shutdown_after_queues");
+        aida::events::shutdown();
+        shutdown_phase_done("driver_event_shutdown", dependency_start);
+    } else {
+        diag::log_tagged_critical("chat", "driver_event_shutdown_deferred reason=queue_drain_incomplete");
+    }
+
+    ULONGLONG arc_start = shutdown_phase_begin("license_arc_unload_late");
+    standalone_license::shutdown_after_worker_quiesce("chat.shutdown_after_queues");
+    shutdown_phase_done("license_arc_unload_late", arc_start);
+
+    ULONGLONG persist_start = shutdown_phase_begin("persist_state");
     persist_workspace_state();
     g_sa_settings.save();
     g_sa_ai_client.reset();
+    shutdown_phase_done("persist_state", persist_start);
 
     s_initialized = false;
-    diag::log_tagged("chat", "shutdown_standalone_chat done");
+    log_shutdown_queue_snapshot("shutdown_done");
+    shutdown_phase_done("shutdown_standalone_chat", shutdown_start);
+    diag::log_tagged_critical("chat", "shutdown_standalone_chat done");
 }
 
 

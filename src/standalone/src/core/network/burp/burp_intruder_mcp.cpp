@@ -841,9 +841,31 @@ static tool_result_t burp_param_miner_stop(const json& params)
     diag::log_tagged_fmt("mcp_burp", "param_miner_stop id=%llu", params.contains("id") ? static_cast<unsigned long long>(params["id"].get<uint64_t>()) : 0ULL);
     if (!params.contains("id")) return tool_result_t::error("id required");
     uint64_t id = params["id"].get<uint64_t>();
-    if (!aida::burp::param_miner::stop(id)) { diag::log_tagged_fmt("mcp_burp", "param_miner_stop not_found id=%llu", static_cast<unsigned long long>(id)); return tool_result_t::error("job not found"); }
-    diag::log_tagged_fmt("mcp_burp", "param_miner_stop ok id=%llu", static_cast<unsigned long long>(id));
-    return tool_result_t::ok("param miner stopped");
+    const auto before = aida::burp::param_miner::status(id);
+    if (before.job_id == 0) { diag::log_tagged_fmt("mcp_burp", "param_miner_stop not_found id=%llu", static_cast<unsigned long long>(id)); return tool_result_t::error("job not found"); }
+    const auto hits_before = aida::burp::param_miner::results(id);
+    if (!aida::burp::param_miner::stop(id)) { diag::log_tagged_fmt("mcp_burp", "param_miner_stop failed id=%llu", static_cast<unsigned long long>(id)); return tool_result_t::error("job not found"); }
+    const auto after = aida::burp::param_miner::status(id);
+    const auto hits_after = aida::burp::param_miner::results(id);
+    json out;
+    out["job_id"] = id;
+    out["cleanup"] = {
+        {"stop_requested", true},
+        {"stop_succeeded", true},
+        {"job_existed_before", before.job_id != 0},
+        {"job_exists_after", after.job_id != 0},
+        {"running_before", before.running},
+        {"running_after", after.running},
+        {"total_before", static_cast<uint64_t>(before.total)},
+        {"tried_before", static_cast<uint64_t>(before.tried)},
+        {"tried_after", static_cast<uint64_t>(after.tried)},
+        {"hits_before", static_cast<uint64_t>(hits_before.size())},
+        {"hits_after", static_cast<uint64_t>(hits_after.size())}
+    };
+    diag::log_tagged_fmt("mcp_burp", "param_miner_stop ok id=%llu running_before=%d running_after=%d tried_before=%zu tried_after=%zu hits_before=%zu hits_after=%zu",
+        static_cast<unsigned long long>(id), before.running ? 1 : 0, after.running ? 1 : 0,
+        before.tried, after.tried, hits_before.size(), hits_after.size());
+    return tool_result_t::ok("param miner stopped", out);
 }
 
 static tool_result_t burp_h2_send(const json& params)

@@ -25,23 +25,33 @@ namespace attestation
 
     __forceinline NTSTATUS collect_hardware_anchors()
     {
-        NTSTATUS st = hardware_id::collect_smbios(
+        NTSTATUS smbios_status = hardware_id::collect_smbios(
             hardware_id::g_anchors.smbios_uuid,
             hardware_id::g_anchors.baseboard_serial,
             sizeof(hardware_id::g_anchors.baseboard_serial));
 
-        hardware_id::collect_disk_serial(
+        NTSTATUS disk_status = hardware_id::collect_disk_serial(
             hardware_id::g_anchors.disk_serial,
             sizeof(hardware_id::g_anchors.disk_serial));
 
-        hardware_id::collect_machine_guid(
+        NTSTATUS machine_guid_status = hardware_id::collect_machine_guid(
             hardware_id::g_anchors.machine_guid,
             sizeof(hardware_id::g_anchors.machine_guid));
 
-        hardware_id::collect_volume_serial(
+        NTSTATUS volume_status = hardware_id::collect_volume_serial(
             &hardware_id::g_anchors.volume_serial);
 
         hardware_id::g_anchors.cpu_topology = hardware_id::collect_cpu_topology();
+        hardware_id::g_anchors.anchor_build = hardware_id::kernel_build_number();
+        hardware_id::g_anchors.anchor_status = hardware_id::build_anchor_status(smbios_status, disk_status, machine_guid_status, volume_status);
+        SN_LOG("attestation::collect_hardware_anchors statuses build=%lu smbios=0x%08lx disk=0x%08lx machine_guid=0x%08lx volume=0x%08lx anchor_status=0x%08lx storage_gate=%u",
+            hardware_id::g_anchors.anchor_build,
+            smbios_status,
+            disk_status,
+            machine_guid_status,
+            volume_status,
+            hardware_id::g_anchors.anchor_status,
+            hardware_id::skip_storage_device_open() ? 1u : 0u);
 
         UNICODE_STRING adapter_path;
         RtlInitUnicodeString(&adapter_path,
@@ -51,7 +61,7 @@ namespace attestation
             OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, nullptr, nullptr);
 
         HANDLE net_key = nullptr;
-        st = ZwOpenKey(&net_key, KEY_READ, &oa);
+        NTSTATUS st = ZwOpenKey(&net_key, KEY_READ, &oa);
         if (NT_SUCCESS(st))
         {
             UCHAR enum_buf[256] = {};
@@ -171,7 +181,7 @@ namespace attestation
 
     __forceinline NTSTATUS compute_hardware_id()
     {
-        UINT8 concat[16 + 64 + 64 + 64 + 6 + 8 + 4 + 32];
+        UINT8 concat[16 + 64 + 64 + 64 + 6 + 8 + 4 + 4 + 4 + 32];
         ULONG offset = 0;
 
         RtlCopyMemory(concat + offset, hardware_id::g_anchors.smbios_uuid, 16); offset += 16;
@@ -181,6 +191,8 @@ namespace attestation
         RtlCopyMemory(concat + offset, hardware_id::g_anchors.mac_addr, 6); offset += 6;
         RtlCopyMemory(concat + offset, &hardware_id::g_anchors.cpu_topology, 8); offset += 8;
         RtlCopyMemory(concat + offset, &hardware_id::g_anchors.volume_serial, 4); offset += 4;
+        RtlCopyMemory(concat + offset, &hardware_id::g_anchors.anchor_status, 4); offset += 4;
+        RtlCopyMemory(concat + offset, &hardware_id::g_anchors.anchor_build, 4); offset += 4;
         RtlCopyMemory(concat + offset, g_attest.boot_nonce, 32); offset += 32;
 
         return kernel_crypto::sha256(concat, offset, g_attest.hardware_id);

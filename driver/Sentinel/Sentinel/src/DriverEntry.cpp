@@ -13,13 +13,16 @@
 #include <core/EvidenceRing.h>
 #include <core/DriverLoadAudit.h>
 #include <core/KernelDebugCapture.h>
+#include "../../../sentinel_handoff.h"
 
 
 #pragma data_seg(".sntl")
+volatile aida_sentinel_handoff_block g_sentinel_handoff = {};
+#pragma data_seg()
+
 volatile PVOID  g_target_driver_base   = nullptr;
 volatile PVOID  g_target_driver_object = nullptr;
 volatile ULONG  g_target_driver_size   = 0;
-#pragma data_seg()
 
 
 #pragma comment(linker, "/SECTION:.sntl,RW")
@@ -72,9 +75,19 @@ static ULONG init_read_kuser_u32(ULONG offset)
     return value;
 }
 
+static ULONG init_kernel_build_number()
+{
+    return init_read_kuser_u32(0x260) & 0xFFFFu;
+}
+
+static BOOLEAN init_should_skip_target_device_open()
+{
+    return init_kernel_build_number() >= 26100;
+}
+
 static void init_log_driverentry_phase(const char* phase, const LARGE_INTEGER& start, const LARGE_INTEGER& freq)
 {
-    ULONG build = init_read_kuser_u32(0x260) & 0xFFFFu;
+    ULONG build = init_kernel_build_number();
     ULONG ci_options = init_read_kuser_u32(0x3A8);
     SN_LOG("DriverEntryPhase phase=%s elapsed_us=%lu pid=%llu tid=%llu irql=%lu cpu=%lu build=%lu ci_options=0x%08lx hvci=%u ci_enabled=%u target_base=%p target_size=0x%lx target_object=%p bridge=%p",
         phase ? phase : "unknown",
@@ -149,6 +162,62 @@ static BOOLEAN init_target_handoff_ready(PVOID base, ULONG size)
         return FALSE;
     if (size > 50 * 1024 * 1024)
         return FALSE;
+    return TRUE;
+}
+
+static BOOLEAN init_apply_preseed_handoff(const char* phase, const LARGE_INTEGER& start, const LARGE_INTEGER& freq)
+{
+    aida_sentinel_handoff_block snapshot = {};
+    snapshot.magic = g_sentinel_handoff.magic;
+    snapshot.version = g_sentinel_handoff.version;
+    snapshot.size = g_sentinel_handoff.size;
+    snapshot.target_base = g_sentinel_handoff.target_base;
+    snapshot.target_object = g_sentinel_handoff.target_object;
+    snapshot.target_size = g_sentinel_handoff.target_size;
+    snapshot.checksum = g_sentinel_handoff.checksum;
+
+    BOOLEAN valid = aida_sentinel_handoff_valid(&snapshot);
+    PVOID handoff_base = reinterpret_cast<PVOID>(static_cast<ULONG_PTR>(snapshot.target_base));
+    PVOID handoff_object = reinterpret_cast<PVOID>(static_cast<ULONG_PTR>(snapshot.target_object));
+    BOOLEAN ready = valid ? init_target_handoff_ready(handoff_base, snapshot.target_size) : FALSE;
+
+    dbg_capture::write_immediate_formatted("[SN-EARLY] handoff_block phase=%s magic=0x%08lx version=%u block_size=0x%x checksum=0x%08lx valid=%u ready=%u base=%p size=0x%lx object=%p elapsed_us=%lu\n",
+        phase ? phase : "unknown",
+        snapshot.magic,
+        snapshot.version,
+        snapshot.size,
+        snapshot.checksum,
+        valid ? 1u : 0u,
+        ready ? 1u : 0u,
+        handoff_base,
+        snapshot.target_size,
+        handoff_object,
+        init_elapsed_us(start, freq));
+    SN_LOG("DriverEntryHandoff phase=%s magic=0x%08lx version=%u block_size=0x%x checksum=0x%08lx valid=%u ready=%u base=%p size=0x%lx object=%p elapsed_us=%lu",
+        phase ? phase : "unknown",
+        snapshot.magic,
+        snapshot.version,
+        snapshot.size,
+        snapshot.checksum,
+        valid ? 1u : 0u,
+        ready ? 1u : 0u,
+        handoff_base,
+        snapshot.target_size,
+        handoff_object,
+        init_elapsed_us(start, freq));
+
+    if (!ready)
+        return FALSE;
+
+    g_target_driver_base = handoff_base;
+    g_target_driver_object = handoff_object;
+    g_target_driver_size = snapshot.target_size;
+    SN_LOG("DriverEntryHandoff applied phase=%s base=%p size=0x%lx object=%p elapsed_us=%lu",
+        phase ? phase : "unknown",
+        handoff_base,
+        snapshot.target_size,
+        handoff_object,
+        init_elapsed_us(start, freq));
     return TRUE;
 }
 
@@ -536,6 +605,17 @@ static PDRIVER_OBJECT resolve_target_driver_object_from_device(PVOID target_base
         return nullptr;
     }
 
+    ULONG build_number = init_kernel_build_number();
+    if (init_should_skip_target_device_open()) {
+        SN_LOG("find_target_driver_object: device_resolve_skipped_build_gate build=%lu target_base=%p handoff_ready=%u preseeded_object=%u elapsed_us=%lu",
+            build_number,
+            target_base,
+            init_target_handoff_ready((PVOID)g_target_driver_base, g_target_driver_size) ? 1u : 0u,
+            g_target_driver_object != nullptr ? 1u : 0u,
+            init_elapsed_us(start, freq));
+        return nullptr;
+    }
+
     WCHAR device_name_buffer[80] = {};
     if (!build_target_device_name(device_name_buffer, sizeof(device_name_buffer) / sizeof(device_name_buffer[0]))) {
         SN_LOG("find_target_driver_object: device_name_build_failed target_base=%p elapsed_us=%lu",
@@ -594,6 +674,18 @@ static BOOLEAN discover_target_driver_from_device() {
     if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
         SN_LOG("init_thread: device_discovery_skipped irql=%lu elapsed_us=%lu",
             static_cast<unsigned long>(KeGetCurrentIrql()),
+            init_elapsed_us(start, freq));
+        return FALSE;
+    }
+
+    ULONG build_number = init_kernel_build_number();
+    if (init_should_skip_target_device_open()) {
+        SN_LOG("init_thread: device_discovery_skipped_build_gate build=%lu handoff_ready=%u base=%p size=0x%lx object=%p elapsed_us=%lu",
+            build_number,
+            init_target_handoff_ready((PVOID)g_target_driver_base, g_target_driver_size) ? 1u : 0u,
+            (PVOID)g_target_driver_base,
+            g_target_driver_size,
+            (PVOID)g_target_driver_object,
             init_elapsed_us(start, freq));
         return FALSE;
     }
@@ -1131,6 +1223,11 @@ static void NTAPI init_thread_routine(PVOID ) {
         init_elapsed_us(init_start, init_freq));
 
     if (!init_target_handoff_ready((PVOID)g_target_driver_base, g_target_driver_size)) {
+        if (init_apply_preseed_handoff("pre_settle", init_start, init_freq)) {
+            SN_LOG("init_thread: pre_settle block handoff applied");
+            goto discovery_done;
+        }
+
         if (refresh_target_handoff_from_partial_state("pre_settle")) {
             SN_LOG("init_thread: pre_settle partial handoff refresh succeeded");
             goto discovery_done;
@@ -1146,6 +1243,15 @@ static void NTAPI init_thread_routine(PVOID ) {
         if (_InterlockedCompareExchange(&g_shutdown_flag, 0, 0)) {
             SN_LOG("init_thread: shutdown flag set at settle %lu", i);
             goto exit_thread;
+        }
+
+        if (init_apply_preseed_handoff("settle_probe", init_start, init_freq)) {
+            SN_LOG("init_thread: block handoff applied during settle poll=%lu base=%p size=0x%lx object=%p",
+                i,
+                (PVOID)g_target_driver_base,
+                g_target_driver_size,
+                (PVOID)g_target_driver_object);
+            break;
         }
 
         PVOID handoff_base = nullptr;
@@ -1655,6 +1761,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
 
     LARGE_INTEGER entry_freq = {};
     LARGE_INTEGER entry_start = KeQueryPerformanceCounter(&entry_freq);
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[SN-EARLY] DriverEntry pre_configure driver=%p registry=%p\n", DriverObject, RegistryPath);
     dbg_capture::configure_log_path(RegistryPath);
     ULONG early_build = init_read_kuser_u32(0x260) & 0xFFFFu;
     ULONG early_ci_options = init_read_kuser_u32(0x3A8);
@@ -1702,6 +1809,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
         reinterpret_cast<PVOID>(&DriverEntry),
         DriverObject,
         RegistryPath != nullptr ? 1u : 0u);
+    init_apply_preseed_handoff("post_setup", entry_start, entry_freq);
     init_log_driverentry_phase("post_setup", entry_start, entry_freq);
 
     g_sentinel_driver_object = DriverObject;

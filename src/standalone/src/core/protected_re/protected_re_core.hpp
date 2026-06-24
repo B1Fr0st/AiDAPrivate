@@ -3641,7 +3641,13 @@ inline tool_result_t mba_simplify(const json& params)
 
 inline tool_result_t obf_detect_mba(const json& params)
 {
-    return mba_simplify(params);
+    auto result = mba_simplify(params);
+    if (result.data.is_object()) {
+        result.data["alias_tool"] = "obf_detect_mba";
+        result.data["canonical_tool"] = "mba_simplify";
+        result.data["detection_kind"] = "mixed_boolean_arithmetic";
+    }
+    return result;
 }
 
 inline bool expression_text_valid(const std::string& expr)
@@ -3810,8 +3816,11 @@ inline tool_result_t obf_simplify_expr(const json& params)
     out["simplified_expr"] = simplified;
     out["changed"] = changed;
     out["verified"] = verified;
+    out["identity_match"] = verified;
     out["proof_method"] = proof;
     out["confidence"] = verified ? 1.0 : 0.35;
+    out["tool"] = "obf_simplify_expr";
+    out["input_bytes"] = expr.size();
     return tool_result_t::ok("Expression simplification completed", out);
 }
 
@@ -3870,7 +3879,7 @@ inline std::string rename_prefix_for_symbol(const json& sym)
 inline tool_result_t obf_rename_symbols(const json& params)
 {
     if (params.value("apply", false) || unsafe_confirmed(params))
-        return tool_result_t::error("obf_rename_symbols is read-only in standalone protected RE mode; no symbol database mutation backend is exposed.", json{{"applied", false}, {"mutation", "none"}, {"security_contract", "fail_closed_no_symbol_mutation"}});
+        return tool_result_t::error("obf_rename_symbols is read-only in standalone protected RE mode; no symbol database mutation backend is exposed.", json{{"applied", false}, {"requested_apply", params.value("apply", false)}, {"mutation", "none"}, {"symbol_count", params.contains("symbols") && params["symbols"].is_array() ? params["symbols"].size() : 0}, {"security_contract", "fail_closed_no_symbol_mutation"}, {"safe_contract", "fail_closed_no_symbol_mutation"}});
     if (!params.contains("symbols") || !params["symbols"].is_array())
         return tool_result_t::error("symbols array is required");
     json renames = json::array();
@@ -3888,7 +3897,8 @@ inline tool_result_t obf_rename_symbols(const json& params)
         if (renames.size() >= 256)
             break;
     }
-    return tool_result_t::ok("Symbol rename plan generated without mutation", json{{"renames", renames}, {"count", renames.size()}, {"applied", false}, {"mutation", "none"}});
+    const std::size_t symbol_count = params["symbols"].is_array() ? params["symbols"].size() : 0;
+    return tool_result_t::ok("Symbol rename plan generated without mutation", json{{"renames", renames}, {"count", renames.size()}, {"symbol_count", symbol_count}, {"renames_truncated", symbol_count > renames.size()}, {"applied", false}, {"mutation", "none"}, {"safe_contract", "read_only_rename_plan"}});
 }
 
 inline tool_result_t opaque_predicate_detect(const json& params)
@@ -5725,6 +5735,11 @@ inline tool_result_t drv_map_ioctls(const json& params)
     out["ioctl_handlers"] = handlers;
     out["ioctls"] = decoded.data;
     out["ioctl_count"] = decoded.data.is_array() ? decoded.data.size() : 0;
+    out["handler_count"] = handlers.is_array() ? handlers.size() : 0;
+    out["provided_handler_count"] = params.contains("ioctl_handlers") && params["ioctl_handlers"].is_array() ? params["ioctl_handlers"].size() : 0;
+    out["decoded_count"] = out["ioctl_count"];
+    out["mapped_dispatch_used"] = !dispatch.empty();
+    out["analysis_backend"] = "bounded_static_ioctl_decode";
     out["source"] = dispatch.empty() ? "provided_ioctl_handlers" : "mapped_device_control_handler";
     return tool_result_t::ok("IOCTL map completed", out);
 }
@@ -5956,7 +5971,7 @@ inline tool_result_t drv_check_buffer_safety(const json& params)
         if ((usage.value("input_length_observed", false) || usage.value("output_length_observed", false)) && !overflow_guard)
             issues.push_back(json{{"ioctl_code", sa_format_address(*code)}, {"handler_va", sa_format_address(*handler)}, {"issue_type", "integer_overflow_guard_not_proven"}, {"va", sa_format_address(*handler)}, {"description", "Length dataflow was observed, but no carry/overflow guard was recognized in the bounded scan."}, {"severity", "medium"}, {"confidence", 0.5}, {"ordered_evidence", usage.value("events", json::array())}});
     }
-    return tool_result_t::ok(json{{"issues", issues}, {"issue_count", issues.size()}, {"analyses", analyses}});
+    return tool_result_t::ok(json{{"issues", issues}, {"issue_count", issues.size()}, {"issues_shape", "array"}, {"issue_schema", json{{"ioctl_code", "hex_string"}, {"handler_va", "hex_string"}, {"issue_type", "string"}, {"va", "hex_string"}, {"description", "string"}, {"severity", "string"}, {"confidence", "number"}, {"ordered_evidence", "array"}}}, {"analyses", analyses}, {"analysis_count", analyses.size()}, {"analysis_backend", "bounded_static_ioctl_buffer_safety"}});
 }
 
 struct drv_hook_state_t {
@@ -6176,6 +6191,38 @@ inline json smc_enriched_capture_json(const page_guard_engine::pg_capture_record
     return out;
 }
 
+inline json smc_active_session_ids_json()
+{
+    json ids = json::array();
+    for (const auto& s : page_guard_engine::g_pg_engine.list_sessions())
+        ids.push_back(s.session_id);
+    return ids;
+}
+
+inline json smc_safe_contract_payload(const char* action, const json& p, const char* contract, const char* validation_code)
+{
+    json out;
+    out["action"] = action ? action : "";
+    out["backend"] = "whoswho_driver_page_guard";
+    out["required_capability"] = "whoswho_driver_page_guard_confirmed_session";
+    out["mutation"] = "none";
+    out["safe_contract"] = contract ? contract : "fail_closed";
+    out["validation_code"] = validation_code ? validation_code : "";
+    out["active_session_ids"] = smc_active_session_ids_json();
+    out["active_session_count"] = out["active_session_ids"].size();
+    out["confirm_unsafe_required"] = std::string(action ? action : "") == "start";
+    out["confirm_unsafe_received"] = unsafe_confirmed(p);
+    if (auto id = parse_param_u64(p, "session_id"))
+        out["session_id"] = *id;
+    if (auto va = parse_param_u64(p, "watch_va"))
+        out["watch_va"] = sa_format_address(*va);
+    if (auto size = parse_param_u64(p, "watch_size"))
+        out["watch_size"] = *size;
+    out["capture_on_write"] = p.value("capture_on_write", true);
+    out["capture_on_execute"] = p.value("capture_on_execute", true);
+    return out;
+}
+
 inline tool_result_t smc_manage(const json& params)
 {
     auto chk = require_driver();
@@ -6185,7 +6232,7 @@ inline tool_result_t smc_manage(const json& params)
     const json p = compat_action_payload(params);
     if (action == "start") {
         if (!unsafe_confirmed(params) && !unsafe_confirmed(p))
-            return tool_result_t::error("smc_manage start installs a target PAGE_GUARD/VEH capture session. Re-run with confirm_unsafe=true or allow_unsafe=true.");
+            return tool_result_t::error("smc_manage start installs a target PAGE_GUARD/VEH capture session. Re-run with confirm_unsafe=true or allow_unsafe=true.", smc_safe_contract_payload("start", p, "fail_closed_no_page_guard_install", "confirm_unsafe_required"));
         auto va = parse_param_u64(p, "watch_va");
         auto size = parse_param_u64(p, "watch_size");
         if (!va || !size || *size == 0)
@@ -6210,18 +6257,22 @@ inline tool_result_t smc_manage(const json& params)
     if (action == "captures") {
         const auto id = parse_param_u64(p, "session_id");
         if (!id || *id == 0 || *id > 0xFFFFFFFFULL)
-            return tool_result_t::error("session_id is required for captures");
+            return tool_result_t::error("session_id is required for captures", smc_safe_contract_payload("captures", p, "fail_closed_invalid_session_id", "session_id_required_or_invalid"));
         std::uint32_t pid = requested_pid(p);
         std::uint64_t watch_va = 0;
         std::uint64_t watch_size = 0;
+        bool found_session = false;
         for (const auto& s : page_guard_engine::g_pg_engine.list_sessions()) {
             if (s.session_id == static_cast<std::uint32_t>(*id)) {
                 pid = s.pid;
                 watch_va = s.target_addr;
                 watch_size = s.region_size;
+                found_session = true;
                 break;
             }
         }
+        if (!found_session)
+            return tool_result_t::error("session_id not found", smc_safe_contract_payload("captures", p, "fail_closed_missing_session", "session_not_found"));
         auto records = page_guard_engine::g_pg_engine.get_capture_records(static_cast<std::uint32_t>(*id));
         json captures = json::array();
         std::uint64_t write_count = 0;
@@ -6239,15 +6290,15 @@ inline tool_result_t smc_manage(const json& params)
     if (action == "stop") {
         const auto id = parse_param_u64(p, "session_id");
         if (!id || *id == 0 || *id > 0xFFFFFFFFULL)
-            return tool_result_t::error("session_id is required for stop");
+            return tool_result_t::error("session_id is required for stop", smc_safe_contract_payload("stop", p, "fail_closed_invalid_session_id", "session_id_required_or_invalid"));
         const bool stopped = page_guard_engine::g_pg_engine.uninstall(static_cast<std::uint32_t>(*id));
         return stopped
             ? tool_result_t::ok("SMC PAGE_GUARD capture session stopped", json{{"session_id", *id}, {"backend", "whoswho_driver_page_guard"}})
-            : tool_result_t::error("session_id not found", json{{"session_id", *id}, {"backend", "whoswho_driver_page_guard"}});
+            : tool_result_t::error("session_id not found", smc_safe_contract_payload("stop", p, "fail_closed_missing_session", "session_not_found"));
     }
     if (action == "list_sessions") {
         json sessions = page_guard_sessions_json();
-        return tool_result_t::ok("SMC PAGE_GUARD sessions listed", json{{"sessions", sessions}, {"count", sessions.size()}, {"backend", "whoswho_driver_page_guard"}});
+        return tool_result_t::ok("SMC PAGE_GUARD sessions listed", json{{"sessions", sessions}, {"count", sessions.size()}, {"active_session_ids", smc_active_session_ids_json()}, {"backend", "whoswho_driver_page_guard"}});
     }
     return compat_unknown_action("smc_manage", action);
 }
@@ -6318,6 +6369,65 @@ inline tool_result_t smc_scan_encrypted_regions(const json& params)
     if (!chk.success)
         return chk;
     const std::uint32_t pid = requested_pid(params);
+    auto direct_base = parse_param_u64(params, "range_base");
+    if (!direct_base)
+        direct_base = parse_param_u64(params, "scan_base");
+    if (!direct_base)
+        direct_base = parse_param_u64(params, "target_va");
+    if (!direct_base)
+        direct_base = parse_param_u64(params, "watch_va");
+    auto direct_size = parse_param_u64(params, "range_size");
+    if (!direct_size)
+        direct_size = parse_param_u64(params, "scan_size");
+    if (!direct_size)
+        direct_size = parse_param_u64(params, "target_size");
+    if (!direct_size)
+        direct_size = parse_param_u64(params, "watch_size");
+    if (direct_base && direct_size && *direct_base != 0 && *direct_size != 0) {
+        const std::uint64_t bounded_size = std::min<std::uint64_t>(*direct_size, 1024ull * 1024ull);
+        std::vector<std::uint8_t> bytes;
+        if (!read_target_memory(pid, *direct_base, static_cast<std::size_t>(bounded_size), bytes) || bytes.empty())
+            return tool_result_t::error("Could not read bounded SMC scan range", json{{"pid", pid}, {"range_base", sa_format_address(*direct_base)}, {"range_size", bounded_size}, {"direct_range", true}});
+        driver_bridge::memory_region_t region{};
+        const bool region_ok = driver_bridge::query_memory_for(pid, *direct_base, region);
+        const bool mem_exec = region_ok ? executable_protect(region.protect) : false;
+        const bool mem_write = region_ok && ((region.protect & 0xFFu) == PAGE_EXECUTE_READWRITE || (region.protect & 0xFFu) == PAGE_EXECUTE_WRITECOPY || (region.protect & 0xFFu) == PAGE_READWRITE || (region.protect & 0xFFu) == PAGE_WRITECOPY);
+        auto marker_va = parse_param_u64(params, "marker_va");
+        auto marker_size = parse_param_u64(params, "marker_size");
+        std::uint64_t marker_hits = 0;
+        bool marker_read = false;
+        bool range_contains_marker = false;
+        if (marker_va && marker_size && *marker_size != 0 && *marker_size <= 256 && *marker_va >= *direct_base && (*marker_va - *direct_base) + *marker_size <= bytes.size()) {
+            range_contains_marker = true;
+            std::vector<std::uint8_t> marker;
+            marker_read = read_target_memory(pid, *marker_va, static_cast<std::size_t>(*marker_size), marker) && marker.size() == *marker_size;
+            if (marker_read && !marker.empty()) {
+                auto it = bytes.begin();
+                while ((it = std::search(it, bytes.end(), marker.begin(), marker.end())) != bytes.end()) {
+                    ++marker_hits;
+                    ++it;
+                }
+            }
+        }
+        const double ent = entropy_of(bytes);
+        const bool decrypt_candidate = ent > 7.0 || (mem_exec && mem_write) || marker_hits != 0;
+        json row{{"va", sa_format_address(*direct_base)},
+                 {"size", bytes.size()},
+                 {"requested_size", *direct_size},
+                 {"entropy", ent},
+                 {"section", nullptr},
+                 {"module", nullptr},
+                 {"direct_range", true},
+                 {"classification", ent > 7.0 ? "high_entropy_bounded_range" : (marker_hits != 0 ? "marker_backed_bounded_range" : (mem_exec && mem_write ? "writable_executable_bounded_range" : "bounded_range"))},
+                 {"decrypt_candidate", decrypt_candidate},
+                 {"marker_va", marker_va ? json(sa_format_address(*marker_va)) : json(nullptr)},
+                 {"marker_size", marker_size ? json(*marker_size) : json(nullptr)},
+                 {"range_contains_marker", range_contains_marker},
+                 {"marker_read", marker_read},
+                 {"marker_hits", marker_hits},
+                 {"memory_protection", region_ok ? json{{"base", sa_format_address(region.base)}, {"size", region.size}, {"protect", protection_name(region.protect)}, {"protect_raw", sa_format_address(region.protect)}, {"state", sa_format_address(region.state)}, {"type", sa_format_address(region.type)}, {"executable", mem_exec}, {"writable", mem_write}, {"guard", (region.protect & PAGE_GUARD) != 0}} : json{{"queried", false}}}};
+        return tool_result_t::ok(json{{"regions", json::array({row})}, {"count", 1}, {"direct_range", true}, {"bytes_scanned", bytes.size()}, {"marker_hits", marker_hits}, {"pid", pid}});
+    }
     std::vector<target_module_t> mods;
     if (params.contains("module_base") || params.contains("module_name") || params.contains("module")) {
         std::string err;
@@ -6329,6 +6439,8 @@ inline tool_result_t smc_scan_encrypted_regions(const json& params)
         mods = user_modules(pid);
     }
     json regions = json::array();
+    std::uint64_t bytes_scanned = 0;
+    std::size_t sections_scanned = 0;
     for (const auto& m : mods) {
         pe_layout_t pe;
         if (!read_pe_layout(pid, m.base, pe))
@@ -6343,6 +6455,8 @@ inline tool_result_t smc_scan_encrypted_regions(const json& params)
             std::vector<std::uint8_t> bytes;
             if (!read_target_memory(pid, sec.va, read_size, bytes) || bytes.empty())
                 continue;
+            bytes_scanned += bytes.size();
+            ++sections_scanned;
             sec.entropy = entropy_of(bytes);
             driver_bridge::memory_region_t region{};
             const bool region_ok = driver_bridge::query_memory_for(pid, sec.va, region);
@@ -6370,12 +6484,17 @@ inline tool_result_t smc_scan_encrypted_regions(const json& params)
             }
         }
     }
-    return tool_result_t::ok(json{{"regions", regions}, {"count", regions.size()}});
+    return tool_result_t::ok(json{{"regions", regions}, {"count", regions.size()}, {"direct_range", false}, {"bytes_scanned", bytes_scanned}, {"sections_scanned", sections_scanned}, {"module_count", mods.size()}, {"pid", pid}});
 }
 
 inline tool_result_t smc_detect_selfmod(const json& params)
 {
-    return smc_scan_encrypted_regions(params);
+    auto result = smc_scan_encrypted_regions(params);
+    if (result.data.is_object()) {
+        result.data["alias_tool"] = "smc_detect_selfmod";
+        result.data["selfmod_detection"] = true;
+    }
+    return result;
 }
 
 inline tool_result_t smc_snapshot_pages(const json& params)
@@ -6412,9 +6531,9 @@ inline tool_result_t smc_snapshot_pages(const json& params)
         std::memcpy(page.data(), bytes.data() + off, n);
         driver_bridge::memory_region_t region{};
         const bool region_ok = driver_bridge::query_memory_for(pid, *base + off, region);
-        pages.push_back(json{{"page_va", sa_format_address(*base + off)}, {"size", n}, {"entropy", entropy_of(page)}, {"protect", region_ok ? protection_name(region.protect) : "unknown"}, {"executable", region_ok ? executable_protect(region.protect) : false}, {"bytes_hex", bytes_to_hex(page, 128)}, {"disasm_preview", disasm_preview_for_bytes(*base + off, page, 8)}});
+        pages.push_back(json{{"page_va", sa_format_address(*base + off)}, {"size", n}, {"entropy", entropy_of(page)}, {"protect", region_ok ? protection_name(region.protect) : "unknown"}, {"protect_raw", region_ok ? json(sa_format_address(region.protect)) : json(nullptr)}, {"executable", region_ok ? executable_protect(region.protect) : false}, {"capture_backend", "driver_read_target_memory"}, {"bytes_hex", bytes_to_hex(page, 128)}, {"disasm_preview", disasm_preview_for_bytes(*base + off, page, 8)}});
     }
-    return tool_result_t::ok("SMC page snapshot completed", json{{"target_va", sa_format_address(*base)}, {"target_size_requested", *size}, {"target_size_snapshotted", bytes.size()}, {"bounded", *size > bounded_size}, {"pid", pid}, {"pages", pages}, {"page_count", pages.size()}});
+    return tool_result_t::ok("SMC page snapshot completed", json{{"target_va", sa_format_address(*base)}, {"target_size_requested", *size}, {"target_size_snapshotted", bytes.size()}, {"bounded", *size > bounded_size}, {"bounded_read", true}, {"capture_backend", "driver_read_target_memory"}, {"driver_backed", true}, {"bytes_read", bytes.size()}, {"range", json{{"base_va", sa_format_address(*base)}, {"size", bytes.size()}, {"end_va", sa_format_address(*base + bytes.size())}}}, {"pid", pid}, {"pages", pages}, {"page_count", pages.size()}});
 }
 
 inline std::uint64_t memory_reference_target(const AsmInstr& ins)
@@ -7061,6 +7180,12 @@ inline tool_result_t pack_detect(const json& params)
     out["module_base"] = sa_format_address(mod->base);
     out["minimal_iat"] = minimal_iat;
     out["minimal_iat_reason"] = no_import_directory ? "no_import_directory" : (loader_only_imports ? "loader_api_only_imports" : (import_function_count <= 8 ? "low_import_function_count" : "low_import_module_count"));
+    out["fixture_kind"] = no_import_directory ? "synthetic_no_import_pe_or_minimal_import_directory" : "pe_import_directory";
+    out["empty_imports_expected"] = no_import_directory;
+    out["import_summary_zero_is_expected"] = no_import_directory;
+    out["pe_parsed"] = true;
+    out["section_count"] = pe.sections.size();
+    out["high_entropy_executable_section_count"] = high_entropy_exec;
     out["import_module_count"] = import_modules.size();
     out["import_function_count"] = import_function_count;
     out["import_summary"] = import_summary;
@@ -7439,7 +7564,9 @@ inline tool_result_t pack_iat_recover(const json& params)
         return tool_result_t::error(err.empty() ? "No module available for IAT reconstruction" : err);
     const std::size_t max_entries = static_cast<std::size_t>(std::min<std::uint64_t>(parse_param_u64(params, "max_entries").value_or(1024), 16384));
     json entries = current_import_table(pid, *mod, max_entries);
-    return tool_result_t::ok("IAT recovery completed", json{{"entries", entries}, {"count", entries.size()}, {"module", mod->name}, {"module_base", sa_format_address(mod->base)}, {"pid", pid}, {"capture_backend", "read_only_current_import_table"}, {"live_hit_collection", "not_requested"}});
+    pe_layout_t pe;
+    const bool pe_ok = read_pe_layout(pid, mod->base, pe);
+    return tool_result_t::ok("IAT recovery completed", json{{"entries", entries}, {"count", entries.size()}, {"entry_count", entries.size()}, {"max_entries", max_entries}, {"bounded", true}, {"module", mod->name}, {"module_base", sa_format_address(mod->base)}, {"pid", pid}, {"pe_parsed", pe_ok}, {"import_directory_present", pe_ok && pe.import_rva != 0}, {"import_directory_rva", pe_ok ? json(sa_format_address(pe.import_rva)) : json(nullptr)}, {"import_directory_size", pe_ok ? json(pe.import_size) : json(nullptr)}, {"capture_backend", "read_only_current_import_table"}, {"live_hit_collection", "not_requested"}});
 }
 
 inline tool_result_t pack_iat_manage(const json& params)

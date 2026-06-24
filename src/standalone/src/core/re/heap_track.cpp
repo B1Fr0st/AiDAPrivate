@@ -2,6 +2,7 @@
 
 #include "artifact_store.hpp"
 #include "../infra/work_queue.hpp"
+#include "../../helpers/diag_log.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -18,6 +19,52 @@ namespace
 {
 constexpr const char* kHeapEventBackend = "kernel_context_hwbp_rtlallocateheap_return_poll";
 constexpr const char* kHeapSnapshotBackend = "snapshot_diff";
+constexpr const char* kHeapUnavailableBackend = "kernel_context_unavailable";
+
+std::uint64_t deadline_remaining_ms()
+{
+    const std::uint64_t deadline = mcp_standalone::current_call_deadline_ms();
+    if (deadline == 0)
+        return 0;
+    const std::uint64_t now = GetTickCount64();
+    return deadline > now ? deadline - now : 0;
+}
+
+bool heap_call_cancelled(const char* phase, std::uint32_t pid, std::uint64_t started_ms)
+{
+    if (mcp_standalone::current_call_cancelled())
+    {
+        diag::log_tagged_fmt("heap_track", "cancelled phase=%s pid=%u elapsed_ms=%llu diag_id=%s",
+                             phase ? phase : "",
+                             pid,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms),
+                             mcp_standalone::current_call_diag_id());
+        return true;
+    }
+    const std::uint64_t deadline = mcp_standalone::current_call_deadline_ms();
+    if (deadline != 0 && GetTickCount64() >= deadline)
+    {
+        diag::log_tagged_fmt("heap_track", "deadline_reached phase=%s pid=%u elapsed_ms=%llu diag_id=%s",
+                             phase ? phase : "",
+                             pid,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms),
+                             mcp_standalone::current_call_diag_id());
+        return true;
+    }
+    return false;
+}
+
+json heap_cancel_detail(const char* action, std::uint32_t pid, std::uint64_t started_ms)
+{
+    return json{
+        {"action", action ? action : ""},
+        {"process_id", pid},
+        {"elapsed_ms", GetTickCount64() - started_ms},
+        {"deadline_remaining_ms", deadline_remaining_ms()},
+        {"cancelled", mcp_standalone::current_call_cancelled()},
+        {"diag_id", mcp_standalone::current_call_diag_id()}
+    };
+}
 
 bool session_event_active(const store::heap_session_t& session)
 {
@@ -26,7 +73,7 @@ bool session_event_active(const store::heap_session_t& session)
 
 const char* effective_backend(const store::heap_session_t& session)
 {
-    return session_event_active(session) ? kHeapEventBackend : kHeapSnapshotBackend;
+    return session_event_active(session) ? kHeapEventBackend : kHeapUnavailableBackend;
 }
 
 bool capture_matches(const store::heap_session_t& session, const store::heap_capture_t& cap)
@@ -225,13 +272,13 @@ json session_json(const store::heap_session_t& session)
     out["baseline_count"] = session.baseline.size();
     out["capture_count"] = session.captures.size();
     out["positive_capture_count"] = session.captures.size();
-    out["snapshot_capture_count"] = session_event_active(session) ? 0 : session.captures.size();
+    out["snapshot_capture_count"] = 0;
     out["event_capture_count"] = session_event_active(session) ? session.captures.size() : 0;
     out["saw_allocation_event"] = session_event_active(session) && !session.captures.empty();
     out["mutation_observed"] = !session.captures.empty();
     out["functional_success"] = !session.captures.empty();
     if (session.captures.empty())
-        out["zero_capture_reason"] = session.active ? "heap tracking session is active but no allocation or snapshot-diff captures have been observed yet" : "heap tracking session stopped with zero allocation or snapshot-diff captures";
+        out["zero_capture_reason"] = session.active ? "heap tracking session is active but no kernel allocation captures have been observed yet" : "heap tracking session stopped with zero kernel allocation captures";
     out["backend"] = effective_backend(session);
     out["event_capture_active"] = session_event_active(session);
     out["event_backend_kind"] = kHeapEventBackend;
@@ -240,7 +287,7 @@ json session_json(const store::heap_session_t& session)
     out["rtlallocateheap_inline_hook"] = false;
     out["kernel_context_polling"] = session_event_active(session);
     out["alignment_filter_active"] = session.alignment != 0;
-    out["snapshot_diff_available"] = true;
+    out["snapshot_diff_available"] = false;
     return out;
 }
 
@@ -276,13 +323,25 @@ std::uint64_t resolve_rtl_allocate_heap(std::uint32_t pid)
     return driver_bridge::resolve_export(ntdll->base, "RtlAllocateHeap");
 }
 
-void clear_session_breakpoints(const store::heap_session_t& session)
+std::size_t clear_session_breakpoints(const store::heap_session_t& session)
 {
     if (session.hw_slot < 0 || session.hw_slot > 3)
-        return;
+        return 0;
     std::set<std::uint32_t> tids(session.tids.begin(), session.tids.end());
+    std::size_t cleared = 0;
     for (auto tid : tids)
-        driver_bridge::clear_hardware_breakpoint(tid, session.hw_slot);
+    {
+        if (driver_bridge::clear_hardware_breakpoint(tid, session.hw_slot))
+            ++cleared;
+    }
+    diag::log_tagged_fmt("heap_track",
+        "breakpoint_clear session_id=%s pid=%u slot=%d tids=%zu cleared=%zu",
+        session.id.c_str(),
+        session.pid,
+        session.hw_slot,
+        tids.size(),
+        cleared);
+    return cleared;
 }
 
 std::optional<store::heap_session_t> event_session_for_pid(std::uint32_t pid)
@@ -390,10 +449,10 @@ void append_event_capture(store::heap_session_t session, const pending_alloc_t& 
     store::update_heap_session(session);
 }
 
-void arm_heap_session_for_thread(const store::heap_session_t& source_session, std::uint32_t tid)
+bool arm_heap_session_for_thread(const store::heap_session_t& source_session, std::uint32_t tid)
 {
     if (tid == 0 || source_session.hw_slot < 0 || source_session.hw_slot > 3 || source_session.rtl_allocate_heap == 0)
-        return;
+        return false;
     auto session = source_session;
     if (driver_bridge::set_hardware_breakpoint(tid, session.hw_slot, session.rtl_allocate_heap, 0, 0))
     {
@@ -402,16 +461,32 @@ void arm_heap_session_for_thread(const store::heap_session_t& source_session, st
             session.tids.push_back(tid);
             store::update_heap_session(session);
         }
+        return true;
     }
+    return false;
 }
 
-void arm_heap_existing_threads(std::uint32_t pid)
+std::size_t arm_heap_existing_threads(std::uint32_t pid)
 {
     auto session = event_session_for_pid(pid);
     if (!session)
-        return;
-    for (const auto& th : threads_for(pid))
-        arm_heap_session_for_thread(*session, th.tid);
+        return 0;
+    const auto threads = threads_for(pid);
+    std::size_t armed = 0;
+    for (const auto& th : threads)
+    {
+        if (arm_heap_session_for_thread(*session, th.tid))
+            ++armed;
+    }
+    diag::log_tagged_fmt("heap_track",
+        "breakpoint_arm_existing pid=%u session_id=%s thread_count=%zu armed=%zu slot=%d target=%s",
+        pid,
+        session->id.c_str(),
+        threads.size(),
+        armed,
+        session->hw_slot,
+        sa_format_address(session->rtl_allocate_heap).c_str());
+    return armed;
 }
 
 std::uint64_t context_dr_address(const driver_bridge::thread_context_t& ctx, int slot)
@@ -606,15 +681,33 @@ void heap_debug_loop()
 
 bool start_heap_debug_loop(std::uint32_t pid, std::string& error)
 {
+    const std::uint64_t started_ms = GetTickCount64();
     auto& state = heap_debug_state();
+    diag::log_tagged_fmt("heap_track",
+        "kernel_context_start_loop enter pid=%u running=%d active_pid=%u deadline_remaining_ms=%llu diag_id=%s",
+        pid,
+        state.running.load(std::memory_order_acquire) ? 1 : 0,
+        state.pid.load(std::memory_order_acquire),
+        static_cast<unsigned long long>(deadline_remaining_ms()),
+        mcp_standalone::current_call_diag_id());
     if (state.running.load(std::memory_order_acquire))
     {
         if (state.pid.load(std::memory_order_acquire) == pid && state.attached.load(std::memory_order_acquire))
         {
-            arm_heap_existing_threads(pid);
+            const std::size_t armed = arm_heap_existing_threads(pid);
+            diag::log_tagged_fmt("heap_track",
+                "kernel_context_start_loop reuse pid=%u armed=%zu elapsed_ms=%llu",
+                pid,
+                armed,
+                static_cast<unsigned long long>(GetTickCount64() - started_ms));
             return true;
         }
         error = "another heap kernel context consumer is already active";
+        diag::log_tagged_fmt("heap_track",
+            "kernel_context_start_loop busy pid=%u active_pid=%u elapsed_ms=%llu",
+            pid,
+            state.pid.load(std::memory_order_acquire),
+            static_cast<unsigned long long>(GetTickCount64() - started_ms));
         return false;
     }
     state.pid.store(pid, std::memory_order_release);
@@ -627,29 +720,70 @@ bool start_heap_debug_loop(std::uint32_t pid, std::string& error)
         state.polling.store(false, std::memory_order_release);
         state.running.store(false, std::memory_order_release);
         error = "failed to schedule heap kernel context consumer";
+        diag::log_tagged_fmt("heap_track",
+            "kernel_context_start_loop post_failed pid=%u elapsed_ms=%llu",
+            pid,
+            static_cast<unsigned long long>(GetTickCount64() - started_ms));
         return false;
     }
     for (int i = 0; i < 80; ++i)
     {
         if (state.attached.load(std::memory_order_acquire))
+        {
+            diag::log_tagged_fmt("heap_track",
+                "kernel_context_start_loop attached pid=%u waits=%d elapsed_ms=%llu",
+                pid,
+                i,
+                static_cast<unsigned long long>(GetTickCount64() - started_ms));
             return true;
+        }
         if (!state.running.load(std::memory_order_acquire))
             break;
+        if (heap_call_cancelled("kernel_context_start_wait", pid, started_ms))
+        {
+            state.polling.store(false, std::memory_order_release);
+            break;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(25));
     }
     const DWORD gle = state.error.load(std::memory_order_acquire);
     error = "heap kernel context consumer failed or timed out, error=" + std::to_string(static_cast<unsigned long>(gle));
+    diag::log_tagged_fmt("heap_track",
+        "kernel_context_start_loop failed pid=%u error=%lu running=%d attached=%d elapsed_ms=%llu",
+        pid,
+        static_cast<unsigned long>(gle),
+        state.running.load(std::memory_order_acquire) ? 1 : 0,
+        state.attached.load(std::memory_order_acquire) ? 1 : 0,
+        static_cast<unsigned long long>(GetTickCount64() - started_ms));
     return false;
 }
 
 void stop_heap_debug_loop(std::uint32_t pid)
 {
+    const std::uint64_t started_ms = GetTickCount64();
     auto& state = heap_debug_state();
     if (state.pid.load(std::memory_order_acquire) != pid)
+    {
+        diag::log_tagged_fmt("heap_track",
+            "kernel_context_stop_loop skip pid=%u active_pid=%u elapsed_ms=%llu",
+            pid,
+            state.pid.load(std::memory_order_acquire),
+            static_cast<unsigned long long>(GetTickCount64() - started_ms));
         return;
+    }
     state.polling.store(false, std::memory_order_release);
     for (int i = 0; i < 80 && state.running.load(std::memory_order_acquire); ++i)
+    {
+        if (heap_call_cancelled("kernel_context_stop_wait", pid, started_ms))
+            break;
         std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    diag::log_tagged_fmt("heap_track",
+        "kernel_context_stop_loop exit pid=%u running=%d attached=%d elapsed_ms=%llu",
+        pid,
+        state.running.load(std::memory_order_acquire) ? 1 : 0,
+        state.attached.load(std::memory_order_acquire) ? 1 : 0,
+        static_cast<unsigned long long>(GetTickCount64() - started_ms));
 }
 
 std::string backend_param(const json& params)
@@ -670,28 +804,32 @@ bool snapshot_backend_requested(const std::string& backend)
     return backend == "snapshot" || backend == "snapshot_diff" || backend == "diff" || backend == "polling";
 }
 
-void append_snapshot_diff(store::heap_session_t& session)
+json heap_backend_policy_json(std::uint32_t pid, const std::string& backend, std::uint64_t started_ms, std::uint64_t rtl_allocate_heap = 0, const std::string& failure = {})
 {
-    auto now = sample_heap(session.pid, session, session.max_captures);
-    std::map<std::uint64_t, std::uint64_t> baseline;
-    for (const auto& cap : session.baseline)
-        baseline[cap.va] = cap.size;
-    std::set<std::uint64_t> existing;
-    for (const auto& cap : session.captures)
-        existing.insert(cap.va);
-    for (const auto& cap : now)
-    {
-        if (session.captures.size() >= session.max_captures)
-            break;
-        const auto it = baseline.find(cap.va);
-        if ((it == baseline.end() || it->second != cap.size) && existing.insert(cap.va).second)
-            session.captures.push_back(cap);
-    }
-    store::update_heap_session(session);
+    json out;
+    out["process_id"] = pid;
+    out["requested_backend"] = backend;
+    out["allowed_backends"] = json::array({"auto", "event", "events", "hwbp", "hw_bp", "hardware_breakpoint", "debug_events"});
+    out["disabled_backends"] = json::array({"snapshot", "snapshot_diff", "diff", "polling"});
+    out["snapshot_diff_disabled"] = true;
+    out["polling_disabled"] = true;
+    out["kernel_only_policy"] = true;
+    out["user_mode_fallback_allowed"] = false;
+    out["capture_backend_required"] = kHeapEventBackend;
+    out["snapshot_backend_kind"] = kHeapSnapshotBackend;
+    out["policy_state"] = "fail_closed_kernel_event_only";
+    out["mutation"] = "none";
+    out["rtl_allocate_heap"] = rtl_allocate_heap ? json(sa_format_address(rtl_allocate_heap)) : json(nullptr);
+    out["event_backend_available"] = rtl_allocate_heap != 0;
+    if (!failure.empty())
+        out["failure"] = failure;
+    out["elapsed_ms"] = GetTickCount64() - started_ms;
+    return out;
 }
 
 tool_result_t start_session(const json& params)
 {
+    const std::uint64_t started_ms = GetTickCount64();
     if (!unsafe_confirmed(params))
         return unsafe_required("heap_track_manage start");
     active_process_scope_t scope(params);
@@ -699,10 +837,24 @@ tool_result_t start_session(const json& params)
         return tool_result_t::error(scope.error());
 
     const std::string backend = backend_param(params);
+    diag::log_tagged_fmt("heap_track",
+        "start enter pid=%u requested_backend=%s deadline_remaining_ms=%llu diag_id=%s",
+        scope.pid(),
+        backend.c_str(),
+        static_cast<unsigned long long>(deadline_remaining_ms()),
+        mcp_standalone::current_call_diag_id());
     if (snapshot_backend_requested(backend))
-        return tool_result_t::error("snapshot_diff/polling heap tracking is disabled by kernel-only stealth policy.");
+    {
+        const std::uint64_t rtl = resolve_rtl_allocate_heap(scope.pid());
+        diag::log_tagged_fmt("heap_track",
+            "start backend_policy pid=%u requested_backend=%s allowed=0 reason=snapshot_diff_disabled elapsed_ms=%llu",
+            scope.pid(),
+            backend.c_str(),
+            static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        return tool_result_t::error("snapshot_diff/polling heap tracking is disabled by kernel-only stealth policy.", heap_backend_policy_json(scope.pid(), backend, started_ms, rtl, "requested_backend_disabled"));
+    }
     if (backend != "auto" && !event_backend_required(backend))
-        return tool_result_t::error("'backend' must be auto, event, hwbp, hardware_breakpoint, or debug_events.");
+        return tool_result_t::error("'backend' must be auto, event, hwbp, hardware_breakpoint, or debug_events.", heap_backend_policy_json(scope.pid(), backend, started_ms, 0, "unsupported_backend"));
 
     store::heap_session_t session;
     session.id = store::next_id("heap");
@@ -713,16 +865,31 @@ tool_result_t start_session(const json& params)
     session.capture_callstack = bool_param(params, "capture_callstack", true);
     session.max_captures = static_cast<std::uint32_t>(numeric_param(params, "max_captures", 256, 1, 10000));
     session.started_ms = unix_time_ms();
+    const std::uint64_t resolve_started_ms = GetTickCount64();
     session.rtl_allocate_heap = resolve_rtl_allocate_heap(scope.pid());
+    diag::log_tagged_fmt("heap_track",
+        "start resolve_rtlallocateheap pid=%u va=%s elapsed_ms=%llu",
+        scope.pid(),
+        session.rtl_allocate_heap ? sa_format_address(session.rtl_allocate_heap).c_str() : "0x0",
+        static_cast<unsigned long long>(GetTickCount64() - resolve_started_ms));
     session.hw_slot = snapshot_backend_requested(backend) ? -1 : static_cast<int>(numeric_param(params, "hw_slot", 2, 0, 3));
     const bool skip_initial_snapshot = bool_param(params, "skip_initial_snapshot", false) || bool_param(params, "empty_baseline", false);
+    const std::uint64_t baseline_started_ms = GetTickCount64();
     if (!skip_initial_snapshot)
         session.baseline = sample_heap(scope.pid(), session, session.max_captures);
+    diag::log_tagged_fmt("heap_track",
+        "start baseline pid=%u skipped=%d baseline_count=%zu elapsed_ms=%llu",
+        scope.pid(),
+        skip_initial_snapshot ? 1 : 0,
+        session.baseline.size(),
+        static_cast<unsigned long long>(GetTickCount64() - baseline_started_ms));
+    if (heap_call_cancelled("start_after_baseline", scope.pid(), started_ms))
+        return tool_result_t::error("Heap tracking start cancelled.", heap_cancel_detail("start", scope.pid(), started_ms));
 
     const bool require_event = event_backend_required(backend);
     if (!snapshot_backend_requested(backend) && session.rtl_allocate_heap == 0)
     {
-        return tool_result_t::error("RtlAllocateHeap could not be resolved; heap tracking is fail-closed under kernel-only stealth policy.");
+        return tool_result_t::error("RtlAllocateHeap could not be resolved; heap tracking is fail-closed under kernel-only stealth policy.", heap_backend_policy_json(scope.pid(), backend, started_ms, session.rtl_allocate_heap, "rtlallocateheap_unresolved"));
     }
     if (session.hw_slot >= 0 && has_other_event_session(scope.pid(), session.id))
     {
@@ -730,15 +897,37 @@ tool_result_t start_session(const json& params)
     }
 
     store::add_heap_session(session);
+    diag::log_tagged_fmt("heap_track",
+        "start store_add pid=%u session_id=%s hw_slot=%d baseline=%zu elapsed_ms=%llu",
+        scope.pid(),
+        session.id.c_str(),
+        session.hw_slot,
+        session.baseline.size(),
+        static_cast<unsigned long long>(GetTickCount64() - started_ms));
     bool event_started = false;
     std::string event_error;
     if (session.hw_slot >= 0)
         event_started = start_heap_debug_loop(scope.pid(), event_error);
+    diag::log_tagged_fmt("heap_track",
+        "start event_backend pid=%u session_id=%s attempted=%d started=%d error=%s elapsed_ms=%llu",
+        scope.pid(),
+        session.id.c_str(),
+        session.hw_slot >= 0 ? 1 : 0,
+        event_started ? 1 : 0,
+        event_error.empty() ? "" : event_error.c_str(),
+        static_cast<unsigned long long>(GetTickCount64() - started_ms));
     if (session.hw_slot >= 0 && !event_started)
     {
-        clear_session_breakpoints(session);
-        store::remove_heap_session(session.id, nullptr);
-        return tool_result_t::error("Heap event backend failed under kernel-only stealth policy: " + event_error);
+        const std::size_t cleared = clear_session_breakpoints(session);
+        const bool removed = store::remove_heap_session(session.id, nullptr);
+        diag::log_tagged_fmt("heap_track",
+            "start cleanup_event_failed pid=%u session_id=%s breakpoints_cleared=%zu removed=%d elapsed_ms=%llu",
+            scope.pid(),
+            session.id.c_str(),
+            cleared,
+            removed ? 1 : 0,
+            static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        return tool_result_t::error("Heap event backend failed under kernel-only stealth policy: " + event_error, heap_backend_policy_json(scope.pid(), backend, started_ms, session.rtl_allocate_heap, event_error));
     }
     for (const auto& updated : store::list_heap_sessions(scope.pid()))
     {
@@ -752,8 +941,14 @@ tool_result_t start_session(const json& params)
     {
         event_error = "RtlAllocateHeap breakpoint could not be armed on any target thread";
         stop_heap_debug_loop(scope.pid());
-        store::remove_heap_session(session.id, nullptr);
-        return tool_result_t::error("Heap event backend failed under kernel-only stealth policy: " + event_error);
+        const bool removed = store::remove_heap_session(session.id, nullptr);
+        diag::log_tagged_fmt("heap_track",
+            "start cleanup_no_threads pid=%u session_id=%s removed=%d elapsed_ms=%llu",
+            scope.pid(),
+            session.id.c_str(),
+            removed ? 1 : 0,
+            static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        return tool_result_t::error("Heap event backend failed under kernel-only stealth policy: " + event_error, heap_backend_policy_json(scope.pid(), backend, started_ms, session.rtl_allocate_heap, event_error));
     }
     json result = session_json(session);
     result["session_id"] = session.id;
@@ -783,11 +978,22 @@ tool_result_t start_session(const json& params)
         {"snapshot_baseline_skipped", skip_initial_snapshot},
         {"zero_capture_expected_on_start", session.captures.empty()}
     };
+    result["elapsed_ms"] = GetTickCount64() - started_ms;
+    diag::log_tagged_fmt("heap_track",
+        "start exit pid=%u session_id=%s started=%d thread_count=%zu captures=%zu baseline=%zu elapsed_ms=%llu",
+        scope.pid(),
+        session.id.c_str(),
+        event_started ? 1 : 0,
+        session.tids.size(),
+        session.captures.size(),
+        session.baseline.size(),
+        static_cast<unsigned long long>(GetTickCount64() - started_ms));
     return tool_result_t::ok("Heap tracking session started with kernel-context RtlAllocateHeap return polling.", result);
 }
 
 tool_result_t results_session(const json& params)
 {
+    const std::uint64_t started_ms = GetTickCount64();
     const std::string id = string_param(params, "session_id");
     if (id.empty())
         return tool_result_t::error("'session_id' is required for results.",
@@ -795,18 +1001,42 @@ tool_result_t results_session(const json& params)
     store::heap_session_t session;
     if (!store::find_heap_session(id, session))
         return tool_result_t::error("Unknown heap tracking session.", heap_session_lookup_error("results", id));
+    diag::log_tagged_fmt("heap_track",
+        "results enter session_id=%s pid=%u hw_slot=%d tids=%zu captures=%zu deadline_remaining_ms=%llu diag_id=%s",
+        id.c_str(),
+        session.pid,
+        session.hw_slot,
+        session.tids.size(),
+        session.captures.size(),
+        static_cast<unsigned long long>(deadline_remaining_ms()),
+        mcp_standalone::current_call_diag_id());
     active_process_scope_t scope(session.pid);
     if (!scope.ok())
         return tool_result_t::error(scope.error());
 
     const bool focus_only = bool_param(params, "focus_only", false) || bool_param(params, "bounded_only", false);
+    const std::uint64_t focus_started_ms = GetTickCount64();
     const bool focused = append_focus_captures(session, params);
+    diag::log_tagged_fmt("heap_track",
+        "results focus_capture session_id=%s focused=%d focus_only=%d elapsed_ms=%llu total_elapsed_ms=%llu",
+        id.c_str(),
+        focused ? 1 : 0,
+        focus_only ? 1 : 0,
+        static_cast<unsigned long long>(GetTickCount64() - focus_started_ms),
+        static_cast<unsigned long long>(GetTickCount64() - started_ms));
     if (session.hw_slot < 0 || session.tids.empty())
     {
         json result = session_json(session);
         result["kernel_only_capture"] = true;
         result["snapshot_diff_checked"] = false;
         result["reason"] = "heap session has no active kernel HWBP/context backend";
+        result["elapsed_ms"] = GetTickCount64() - started_ms;
+        diag::log_tagged_fmt("heap_track",
+            "results exit session_id=%s ok=0 reason=no_kernel_context hw_slot=%d tids=%zu elapsed_ms=%llu",
+            id.c_str(),
+            session.hw_slot,
+            session.tids.size(),
+            static_cast<unsigned long long>(GetTickCount64() - started_ms));
         return tool_result_t::error("Heap tracking session is not kernel-event-backed; snapshot_diff fallback is disabled.", result);
     }
     else
@@ -838,6 +1068,15 @@ tool_result_t results_session(const json& params)
         {"bounded_focus_capture", focused},
         {"bounded_focus_only", focus_only}
     };
+    result["elapsed_ms"] = GetTickCount64() - started_ms;
+    diag::log_tagged_fmt("heap_track",
+        "results exit session_id=%s ok=%d returned=%zu captures=%zu focused=%d elapsed_ms=%llu",
+        id.c_str(),
+        session.captures.empty() ? 0 : 1,
+        result["returned"].get<std::size_t>(),
+        session.captures.size(),
+        focused ? 1 : 0,
+        static_cast<unsigned long long>(GetTickCount64() - started_ms));
     if (session.captures.empty())
         return tool_result_t::error("Heap tracking produced zero captures; no allocation or snapshot-diff mutation evidence was observed.", result);
     return tool_result_t::ok(result);
@@ -845,6 +1084,7 @@ tool_result_t results_session(const json& params)
 
 tool_result_t stop_session(const json& params)
 {
+    const std::uint64_t started_ms = GetTickCount64();
     if (!unsafe_confirmed(params))
         return unsafe_required("heap_track_manage stop");
     const std::string id = string_param(params, "session_id");
@@ -854,6 +1094,15 @@ tool_result_t stop_session(const json& params)
     store::heap_session_t session;
     if (!store::find_heap_session(id, session))
         return tool_result_t::error("Unknown heap tracking session.", heap_session_lookup_error("stop", id));
+    diag::log_tagged_fmt("heap_track",
+        "stop enter session_id=%s pid=%u hw_slot=%d tids=%zu captures=%zu deadline_remaining_ms=%llu diag_id=%s",
+        id.c_str(),
+        session.pid,
+        session.hw_slot,
+        session.tids.size(),
+        session.captures.size(),
+        static_cast<unsigned long long>(deadline_remaining_ms()),
+        mcp_standalone::current_call_diag_id());
     active_process_scope_t scope(session.pid);
     const bool focus_only = bool_param(params, "focus_only", false) || bool_param(params, "bounded_only", false);
     const bool focused = scope.ok() ? append_focus_captures(session, params) : false;
@@ -861,8 +1110,9 @@ tool_result_t stop_session(const json& params)
         store::find_heap_session(id, session);
     if (!store::remove_heap_session(id, &session))
         return tool_result_t::error("Unknown heap tracking session.", heap_session_lookup_error("stop_remove", id));
+    std::size_t cleared = 0;
     if (scope.ok())
-        clear_session_breakpoints(session);
+        cleared = clear_session_breakpoints(session);
     if (session.hw_slot >= 0)
         stop_heap_debug_loop(session.pid);
     session.active = false;
@@ -883,6 +1133,17 @@ tool_result_t stop_session(const json& params)
         {"bounded_focus_capture", focused},
         {"bounded_focus_only", focus_only}
     };
+    result["breakpoints_cleared_count"] = cleared;
+    result["elapsed_ms"] = GetTickCount64() - started_ms;
+    diag::log_tagged_fmt("heap_track",
+        "stop exit session_id=%s ok=%d captures=%zu focused=%d cleared=%zu scope_ok=%d elapsed_ms=%llu",
+        id.c_str(),
+        session.captures.empty() ? 0 : 1,
+        session.captures.size(),
+        focused ? 1 : 0,
+        cleared,
+        scope.ok() ? 1 : 0,
+        static_cast<unsigned long long>(GetTickCount64() - started_ms));
     if (session.captures.empty())
         return tool_result_t::error("Heap tracking stopped with zero captures; no allocation or snapshot-diff mutation evidence was observed.", result);
     return tool_result_t::ok("Heap tracking session stopped.", result);
@@ -891,11 +1152,21 @@ tool_result_t stop_session(const json& params)
 
 tool_result_t manage(const json& params)
 {
+    const std::uint64_t started_ms = GetTickCount64();
     const std::string action = compat_action_name(params);
     const json p = compat_action_payload(params);
+    diag::log_tagged_fmt("heap_track",
+        "manage enter action=%s deadline_remaining_ms=%llu diag_id=%s",
+        action.c_str(),
+        static_cast<unsigned long long>(deadline_remaining_ms()),
+        mcp_standalone::current_call_diag_id());
     if (action == "start") return start_session(p);
     if (action == "results") return results_session(p);
     if (action == "stop") return stop_session(p);
+    diag::log_tagged_fmt("heap_track",
+        "manage exit action=%s unknown=1 elapsed_ms=%llu",
+        action.c_str(),
+        static_cast<unsigned long long>(GetTickCount64() - started_ms));
     return compat_unknown_action("heap_track_manage", action);
 }
 }

@@ -170,6 +170,42 @@ bool bridge_ready(const camoufox::bridge_status_t& s)
     return s.state == camoufox::bridge_state_t::ready && s.browser_open && s.page_verified && s.privacy_verified && s.child_alive && bridge_process_tree_ready(s) && bridge_visible_window_ready(s) && !s.cleanup_pending;
 }
 
+bool browser_is_loopback_fixture_url(const std::string& url)
+{
+    std::string lower = url;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    const size_t scheme = lower.find("://");
+    if (scheme == std::string::npos)
+        return false;
+    const size_t host_start = scheme + 3;
+    if (host_start >= lower.size())
+        return false;
+    std::string host;
+    if (lower[host_start] == '[')
+    {
+        const size_t host_end = lower.find(']', host_start + 1);
+        if (host_end == std::string::npos)
+            return false;
+        host = lower.substr(host_start, host_end - host_start + 1);
+    }
+    else
+    {
+        const size_t host_end = lower.find_first_of("/:?#", host_start);
+        host = lower.substr(host_start, host_end == std::string::npos ? std::string::npos : host_end - host_start);
+    }
+    return host == "localhost" || host == "[::1]" || host == "::1" || host.rfind("127.", 0) == 0;
+}
+
+bool json_bool_param(const json& params, const char* name, bool fallback);
+
+bool browser_diagnostic_mode(const json& params)
+{
+    return json_bool_param(params, "diagnostic", false) ||
+        json_bool_param(params, "diagnostics", false) ||
+        json_bool_param(params, "include_diagnostics", false);
+}
+
 void attach_privacy_status(tool_result_t& out, const camoufox::bridge_status_t& s)
 {
     if (!out.data.is_object())
@@ -1362,6 +1398,233 @@ void attach_burp_bridge_summary(tool_result_t& out, const burp_publish_summary_t
     out.text = out.data.dump(2);
 }
 
+void attach_bridge_rpc_timing(tool_result_t& out, const std::string& tool_name, int timeout_ms, long long rpc_elapsed_ms, long long total_elapsed_ms)
+{
+    const bool success = out.success;
+    if (!out.data.is_object())
+    {
+        json original = out.data;
+        out.data = json::object();
+        out.data["result"] = std::move(original);
+    }
+    out.data["bridge_rpc_timing"] = {
+        {"tool", tool_name},
+        {"rpc_elapsed_ms", rpc_elapsed_ms},
+        {"rpc_timeout_ms", timeout_ms},
+        {"wrapper_elapsed_ms", total_elapsed_ms}
+    };
+    if (success)
+        out.text = out.data.dump(2);
+}
+
+json page_ids_json(const camoufox::bridge_status_t& status)
+{
+    json out = json::array();
+    for (const auto& page : status.pages)
+        out.push_back(page.page_id);
+    return out;
+}
+
+bool bridge_status_has_page(const camoufox::bridge_status_t& status, const std::string& page_id)
+{
+    if (page_id.empty())
+        return false;
+    for (const auto& page : status.pages)
+        if (page.page_id == page_id && !page.closed)
+            return true;
+    return false;
+}
+
+json browser_file_probe_json(const std::string& path, long long elapsed_ms)
+{
+    json out;
+    out["path"] = path;
+    out["path_provided"] = !path.empty();
+    out["checked"] = !path.empty();
+    out["elapsed_ms"] = elapsed_ms;
+    if (path.empty())
+    {
+        out["exists"] = false;
+        out["size"] = 0;
+        out["error"] = "path_not_available";
+        return out;
+    }
+    std::error_code ec;
+    const std::filesystem::path fs_path = std::filesystem::u8path(path);
+    const bool exists = std::filesystem::exists(fs_path, ec);
+    out["exists"] = exists && !ec;
+    if (ec)
+    {
+        out["size"] = 0;
+        out["error"] = ec.message();
+        return out;
+    }
+    if (exists)
+    {
+        const auto size = std::filesystem::file_size(fs_path, ec);
+        out["size"] = ec ? 0 : static_cast<uint64_t>(size);
+        if (ec)
+            out["error"] = ec.message();
+    }
+    else
+    {
+        out["size"] = 0;
+        out["error"] = "file_not_found";
+    }
+    return out;
+}
+
+std::string first_path_field(const json& params, const json& data, std::initializer_list<const char*> keys)
+{
+    for (const char* key : keys)
+    {
+        const std::string from_params = json_string_param(params, key, std::string());
+        if (!from_params.empty())
+            return from_params;
+    }
+    if (data.is_object())
+    {
+        for (const char* key : keys)
+        {
+            auto it = data.find(key);
+            if (it != data.end() && it->is_string())
+                return it->get<std::string>();
+        }
+    }
+    return {};
+}
+
+uint64_t first_u64_field(const json& data, std::initializer_list<const char*> keys)
+{
+    if (!data.is_object())
+        return 0;
+    for (const char* key : keys)
+    {
+        auto it = data.find(key);
+        if (it == data.end())
+            continue;
+        if (it->is_number_unsigned())
+            return it->get<uint64_t>();
+        if (it->is_number_integer())
+            return static_cast<uint64_t>((std::max<int64_t>)(it->get<int64_t>(), 0));
+        if (it->is_string())
+        {
+            try { return static_cast<uint64_t>(std::stoull(it->get<std::string>())); } catch (...) {}
+        }
+    }
+    return 0;
+}
+
+void attach_browser_handle_contract(tool_result_t& out,
+                                    const std::string& tool_name,
+                                    const json& params,
+                                    const std::string& session_id,
+                                    const camoufox::bridge_status_t& before,
+                                    const camoufox::bridge_status_t& after,
+                                    long long total_elapsed_ms)
+{
+    if (tool_name != "export_state" && tool_name != "import_state" && tool_name != "network_capture")
+        return;
+    if (!out.data.is_object())
+    {
+        json original = out.data;
+        out.data = json::object();
+        if (!original.is_null())
+            out.data["result"] = std::move(original);
+    }
+    const std::string requested_page_id = json_string_param(params, "page_id", std::string());
+    const std::string effective_page_id = requested_page_id.empty() ? after.active_page_id : requested_page_id;
+    json handles;
+    handles["session_id"] = session_id.empty() ? std::string("default") : session_id;
+    handles["tool"] = tool_name;
+    handles["action"] = json_string_param(params, "action", json_string_param(params, "operation", std::string()));
+    handles["requested_page_id"] = requested_page_id;
+    handles["effective_page_id"] = effective_page_id;
+    handles["page_exists_before"] = bridge_status_has_page(before, effective_page_id);
+    handles["page_exists_after"] = bridge_status_has_page(after, effective_page_id);
+    handles["active_page_id_before"] = before.active_page_id;
+    handles["active_page_id_after"] = after.active_page_id;
+    handles["known_page_ids_before"] = page_ids_json(before);
+    handles["known_page_ids_after"] = page_ids_json(after);
+    handles["page_count_before"] = before.page_count;
+    handles["page_count_after"] = after.page_count;
+    handles["bridge_generation_before"] = before.generation;
+    handles["bridge_generation_after"] = after.generation;
+    handles["child_pid_before"] = before.child_pid;
+    handles["child_pid_after"] = after.child_pid;
+    handles["child_alive_before"] = before.child_alive;
+    handles["child_alive_after"] = after.child_alive;
+    handles["browser_open_before"] = before.browser_open;
+    handles["browser_open_after"] = after.browser_open;
+    handles["page_verified_before"] = before.page_verified;
+    handles["page_verified_after"] = after.page_verified;
+    handles["cleanup_pending_before"] = before.cleanup_pending;
+    handles["cleanup_pending_after"] = after.cleanup_pending;
+    handles["elapsed_ms"] = total_elapsed_ms;
+    if (tool_name == "network_capture")
+    {
+        const uint64_t capture_id = first_u64_field(out.data, {"capture_id", "capture_session_id", "session_id", "id"});
+        handles["capture_id"] = capture_id;
+        handles["capture_id_present"] = capture_id != 0;
+        handles["capture_stop_target_valid"] = effective_page_id.empty() || bridge_status_has_page(after, effective_page_id) || capture_id != 0;
+    }
+    if (tool_name == "export_state")
+    {
+        const std::string path = first_path_field(params, out.data, {"save_path", "state_path", "path", "output_path", "artifact_path"});
+        handles["file"] = browser_file_probe_json(path, total_elapsed_ms);
+        handles["export_file_exists"] = handles["file"].value("exists", false);
+        handles["export_file_size"] = handles["file"].value("size", 0ull);
+    }
+    if (tool_name == "import_state")
+    {
+        const std::string path = first_path_field(params, out.data, {"state_path", "save_path", "path", "input_path", "artifact_path"});
+        handles["file"] = browser_file_probe_json(path, total_elapsed_ms);
+        handles["import_file_exists"] = handles["file"].value("exists", false);
+        handles["import_file_size"] = handles["file"].value("size", 0ull);
+    }
+    out.data["browser_handle_contract"] = std::move(handles);
+    if (out.success)
+        out.text = out.data.dump(2);
+}
+
+void compact_local_fixture_navigation_success(tool_result_t& out, const std::string& session_id, long long elapsed_ms)
+{
+    if (!out.success || !out.data.is_object())
+        return;
+    const size_t before_len = out.text.size();
+    size_t response_chain_count = 0;
+    if (out.data.contains("response_chain") && out.data["response_chain"].is_array())
+    {
+        response_chain_count = out.data["response_chain"].size();
+        out.data.erase("response_chain");
+        out.data["response_chain_count"] = static_cast<uint64_t>(response_chain_count);
+    }
+    size_t network_request_count = 0;
+    if (out.data.contains("network_capture") && out.data["network_capture"].is_object())
+    {
+        json& capture = out.data["network_capture"];
+        if (capture.contains("requests") && capture["requests"].is_array())
+        {
+            network_request_count = capture["requests"].size();
+            capture.erase("requests");
+            capture["request_count"] = static_cast<uint64_t>(network_request_count);
+            capture["requests_compacted"] = true;
+        }
+    }
+    out.data["local_fixture"] = true;
+    out.data["diagnostics_compact"] = true;
+    out.data["compact_success_reason"] = "loopback_fixture_navigation";
+    out.text = out.data.dump(2);
+    diag::log_tagged_fmt("mcp_burp",
+        "browser_navigation compact_success session_id=%s elapsed_ms=%lld response_chain_count=%zu network_request_count=%zu before_text_len=%zu after_text_len=%zu",
+        session_id.c_str(),
+        elapsed_ms,
+        response_chain_count,
+        network_request_count,
+        before_len,
+        out.text.size());
+}
+
 bool is_burp_publish_tool(const std::string& tool_name)
 {
     return tool_name == "navigate" ||
@@ -2105,6 +2368,9 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
     bool navigation_capture_body = false;
     bool navigation_capture_from_start = false;
     bool navigation_publish_to_burp = false;
+    bool navigation_publish_explicit = false;
+    bool navigation_local_fixture = false;
+    bool navigation_diagnostic = false;
     std::string navigation_capture_pattern;
     if (tool_name == "take_screenshot")
     {
@@ -2114,7 +2380,12 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
     }
     if (tool_name == "navigate")
     {
-        const bool publish_to_burp = json_bool_param(params, "publish_to_burp", true);
+        const std::string request_url = json_string_param(args, "url", json_string_param(params, "url", std::string()));
+        navigation_local_fixture = browser_is_loopback_fixture_url(request_url);
+        navigation_diagnostic = browser_diagnostic_mode(params);
+        navigation_publish_explicit = json_bool_param_present(params, "publish_to_burp");
+        const bool default_publish_to_burp = !(navigation_local_fixture && !navigation_diagnostic);
+        const bool publish_to_burp = json_bool_param(params, "publish_to_burp", default_publish_to_burp);
         const bool requested_capture_from_start = json_bool_param(params, "capture_from_start", false);
         const bool capture_from_start = requested_capture_from_start || publish_to_burp;
         const bool capture_body = json_bool_param(params, "capture_body", publish_to_burp);
@@ -2138,6 +2409,14 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
             capture_info["delegated_to_navigate"] = true;
             capture_info["cpp_pre_capture_rpc"] = false;
         }
+        else if (navigation_local_fixture && !navigation_diagnostic && !navigation_publish_explicit)
+        {
+            capture_info["requested"] = false;
+            capture_info["auto_compact_local_fixture"] = true;
+            capture_info["publish_to_burp_default_suppressed"] = true;
+            capture_info["delegated_to_navigate"] = false;
+            capture_info["cpp_pre_capture_rpc"] = false;
+        }
     }
     if (tool_name == "navigate")
     {
@@ -2146,7 +2425,7 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
         const std::string request_url = json_string_param(args, "url", json_string_param(params, "url", std::string()));
         const url_log_t request_url_log = summarize_url_for_log(request_url);
         const url_log_t active_url = summarize_url_for_log(before.active_page_url);
-        diag::log_tagged_fmt("mcp_burp", "browser_navigation phase=before_call_tool session_id=%s page_id=%s active_page_id=%s request_host=%s request_path=%s request_query=%d request_url_len=%zu active_host=%s active_path=%s wait_until=%s timeout_ms=%d capture_from_start=%d capture_body=%d publish_to_burp=%d capture_pattern=%s args_shape=%s bridge_state=%s child_pid=%lu child_alive=%d page_verified=%d",
+        diag::log_tagged_fmt("mcp_burp", "browser_navigation phase=before_call_tool session_id=%s page_id=%s active_page_id=%s request_host=%s request_path=%s request_query=%d request_url_len=%zu active_host=%s active_path=%s wait_until=%s timeout_ms=%d capture_from_start=%d capture_body=%d publish_to_burp=%d publish_explicit=%d local_fixture=%d diagnostic=%d capture_pattern=%s args_shape=%s bridge_state=%s child_pid=%lu child_alive=%d page_verified=%d",
             session_id.c_str(),
             page_id.empty() ? "<empty>" : page_id.c_str(),
             before.active_page_id.empty() ? "<empty>" : before.active_page_id.c_str(),
@@ -2161,6 +2440,9 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
             navigation_capture_from_start ? 1 : 0,
             navigation_capture_body ? 1 : 0,
             navigation_publish_to_burp ? 1 : 0,
+            navigation_publish_explicit ? 1 : 0,
+            navigation_local_fixture ? 1 : 0,
+            navigation_diagnostic ? 1 : 0,
             navigation_capture_pattern.empty() ? "<empty>" : navigation_capture_pattern.c_str(),
             json_shape(args).c_str(),
             state_label(before.state),
@@ -2168,7 +2450,10 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
             before.child_alive ? 1 : 0,
             before.page_verified ? 1 : 0);
     }
+    const auto rpc_start = std::chrono::steady_clock::now();
     camoufox::call_result_t bridge_result = camoufox::call_tool(tool_name, args, timeout_ms, session_id);
+    const auto rpc_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - rpc_start).count();
     if (tool_name == "navigate")
     {
         const std::string page_id = json_string_param(args, "page_id", json_string_param(params, "page_id", std::string()));
@@ -2179,11 +2464,12 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
         const std::string response_url = json_first_string_field(bridge_result.data, {"url", "final_url", "active_url", "page_url"});
         const url_log_t response_url_log = summarize_url_for_log(response_url);
         const auto mid = camoufox::get_status(session_id);
-        diag::log_tagged_fmt("mcp_burp", "browser_navigation phase=after_call_tool session_id=%s page_id=%s wait_until=%s ok=%d response_status=%d navigation_timed_out=%d response_host=%s response_path=%s response_query=%d response_url_len=%zu data_shape=%s error_len=%zu bridge_state=%s child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d",
+        diag::log_tagged_fmt("mcp_burp", "browser_navigation phase=after_call_tool session_id=%s page_id=%s wait_until=%s ok=%d rpc_elapsed_ms=%lld response_status=%d navigation_timed_out=%d response_host=%s response_path=%s response_query=%d response_url_len=%zu data_shape=%s error_len=%zu bridge_state=%s child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d",
             session_id.c_str(),
             page_id.empty() ? "<empty>" : page_id.c_str(),
             wait_until.empty() ? "<empty>" : wait_until.c_str(),
             bridge_result.ok ? 1 : 0,
+            static_cast<long long>(rpc_elapsed_ms),
             response_status,
             navigation_timed_out ? 1 : 0,
             response_url_log.host.c_str(),
@@ -2262,6 +2548,13 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
         compact_screenshot_response(out, params);
     if (tool_name == "evaluate_js")
         enrich_evaluate_js_response(out);
+    if (tool_name == "navigate" && !capture_info.empty() && !capture_info.value("requested", false) && out.success)
+    {
+        if (out.data.is_null() || !out.data.is_object())
+            out.data = json::object();
+        out.data["network_capture"] = capture_info;
+        out.text = out.data.dump(2);
+    }
     if (tool_name == "navigate" && !capture_info.empty() && capture_info.value("requested", false))
     {
         if (out.data.is_null() || !out.data.is_object())
@@ -2316,9 +2609,13 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
     }
     const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start).count();
+    attach_bridge_rpc_timing(out, tool_name, timeout_ms, static_cast<long long>(rpc_elapsed_ms), static_cast<long long>(elapsed_ms));
+    if (tool_name == "navigate" && out.success && navigation_local_fixture && !navigation_diagnostic && !navigation_publish_to_burp)
+        compact_local_fixture_navigation_success(out, session_id, static_cast<long long>(elapsed_ms));
     if (instrumentation_probe)
         annotate_instrumentation_response(tool_name, out, timeout_ms, static_cast<long long>(elapsed_ms));
     auto after = camoufox::get_status(session_id);
+    attach_browser_handle_contract(out, tool_name, params, session_id, before, after, static_cast<long long>(elapsed_ms));
     if (tool_name == "scripts")
         normalize_scripts_response(out, params, session_id, after);
     if (tool_name == "compare_env" || tool_name == "check_environment")
@@ -2326,7 +2623,15 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
     preserve_semantic_failure(out);
     if (out.success && is_burp_publish_tool(tool_name))
     {
-        burp_publish_summary_t burp_summary = publish_browser_exchanges(tool_name, params, out.data);
+        json publish_params = params.is_object() ? params : json::object();
+        if (tool_name == "navigate")
+        {
+            if (!json_bool_param_present(publish_params, "publish_to_burp"))
+                publish_params["publish_to_burp"] = navigation_publish_to_burp;
+            if (!json_bool_param_present(publish_params, "capture_body"))
+                publish_params["capture_body"] = navigation_capture_body;
+        }
+        burp_publish_summary_t burp_summary = publish_browser_exchanges(tool_name, publish_params, out.data);
         if (tool_name == "list_network_requests" && out.data.is_object() && !json_string_field(out.data, "fallback").empty())
             burp_summary.fallback_used = true;
         attach_burp_bridge_summary(out, burp_summary);

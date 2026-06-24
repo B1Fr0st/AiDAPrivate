@@ -1,6 +1,7 @@
 #include "vmt.hpp"
 
 #include "artifact_store.hpp"
+#include "../../helpers/diag_log.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -10,21 +11,83 @@ namespace re::vmt
 {
 namespace
 {
+std::uint64_t deadline_remaining_ms()
+{
+    const std::uint64_t deadline = mcp_standalone::current_call_deadline_ms();
+    if (deadline == 0)
+        return 0;
+    const std::uint64_t now = GetTickCount64();
+    return deadline > now ? deadline - now : 0;
+}
+
+bool vmt_call_cancelled(const char* phase, std::uint32_t pid, std::uint64_t started_ms)
+{
+    if (mcp_standalone::current_call_cancelled())
+    {
+        diag::log_tagged_fmt("vmt", "cancelled phase=%s pid=%u elapsed_ms=%llu diag_id=%s",
+                             phase ? phase : "",
+                             pid,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms),
+                             mcp_standalone::current_call_diag_id());
+        return true;
+    }
+    const std::uint64_t deadline = mcp_standalone::current_call_deadline_ms();
+    if (deadline != 0 && GetTickCount64() >= deadline)
+    {
+        diag::log_tagged_fmt("vmt", "deadline_reached phase=%s pid=%u elapsed_ms=%llu diag_id=%s",
+                             phase ? phase : "",
+                             pid,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms),
+                             mcp_standalone::current_call_diag_id());
+        return true;
+    }
+    return false;
+}
+
+json vmt_cancel_detail(const char* action, std::uint32_t pid, std::uint64_t started_ms)
+{
+    return json{
+        {"action", action ? action : ""},
+        {"process_id", pid},
+        {"elapsed_ms", GetTickCount64() - started_ms},
+        {"deadline_remaining_ms", deadline_remaining_ms()},
+        {"cancelled", mcp_standalone::current_call_cancelled()},
+        {"diag_id", mcp_standalone::current_call_diag_id()}
+    };
+}
+
 bool read_vtable_pointer(std::uint32_t pid, std::uint64_t address, std::uint64_t& vtable)
 {
     return read_u64(pid, address, vtable) && vtable != 0;
 }
 
-std::size_t bounded_slot_count(std::uint32_t pid, std::uint64_t vtable_va, std::size_t requested)
+std::size_t bounded_slot_count(std::uint32_t pid,
+                               std::uint64_t vtable_va,
+                               std::size_t requested,
+                               const char* phase = nullptr,
+                               std::uint64_t started_ms = 0,
+                               bool* cancelled = nullptr,
+                               std::size_t* reads = nullptr,
+                               std::size_t* queries = nullptr)
 {
     requested = std::clamp<std::size_t>(requested, 1, 1024);
     std::size_t valid = 0;
     for (std::size_t i = 0; i < requested; ++i)
     {
+        if (started_ms != 0 && (i & 0x0Fu) == 0 && vmt_call_cancelled(phase, pid, started_ms))
+        {
+            if (cancelled)
+                *cancelled = true;
+            break;
+        }
         std::uint64_t fn = 0;
+        if (reads)
+            ++*reads;
         if (!read_u64(pid, vtable_va + i * 8, fn) || fn == 0)
             break;
         driver_bridge::memory_region_t region{};
+        if (queries)
+            ++*queries;
         if (!query_region(pid, fn, region) || !is_executable(region))
             break;
         ++valid;
@@ -232,6 +295,7 @@ bool executable_pointer(std::uint32_t pid, std::uint64_t value)
 
 tool_result_t read(const json& params)
 {
+    const std::uint64_t started_ms = GetTickCount64();
     active_process_scope_t scope(params);
     if (!scope.ok())
         return tool_result_t::error(scope.error());
@@ -239,20 +303,43 @@ tool_result_t read(const json& params)
     std::uint64_t address = 0;
     if (!parse_address_param(params, "address", address) || address == 0)
         return tool_result_t::error("'address' is required.");
+    const std::size_t max_slots = static_cast<std::size_t>(numeric_param(params, "max_slots", 128, 1, 1024));
+    diag::log_tagged_fmt("vmt",
+                         "read enter pid=%u address=%s max_slots=%zu deadline_remaining_ms=%llu diag_id=%s",
+                         scope.pid(),
+                         sa_format_address(address).c_str(),
+                         max_slots,
+                         static_cast<unsigned long long>(deadline_remaining_ms()),
+                         mcp_standalone::current_call_diag_id());
 
     std::uint64_t vtable_va = 0;
     if (!read_vtable_pointer(scope.pid(), address, vtable_va))
+    {
+        diag::log_tagged_fmt("vmt",
+                             "read exit pid=%u ok=0 phase=object_vtable_read address=%s elapsed_ms=%llu",
+                             scope.pid(),
+                             sa_format_address(address).c_str(),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
         return tool_result_t::error("Failed to read vtable pointer at address.");
+    }
 
-    const std::size_t max_slots = static_cast<std::size_t>(numeric_param(params, "max_slots", 128, 1, 1024));
     json slots = json::array();
+    std::size_t slot_reads = 0;
+    std::size_t region_queries = 0;
+    std::size_t executable_slots = 0;
     for (std::size_t i = 0; i < max_slots; ++i)
     {
+        if ((i & 0x0Fu) == 0 && vmt_call_cancelled("read_slots", scope.pid(), started_ms))
+            return tool_result_t::error("VMT read cancelled.", vmt_cancel_detail("read", scope.pid(), started_ms));
         std::uint64_t fn = 0;
+        ++slot_reads;
         if (!read_u64(scope.pid(), vtable_va + i * 8, fn) || fn == 0)
             break;
         driver_bridge::memory_region_t region{};
+        ++region_queries;
         const bool executable = query_region(scope.pid(), fn, region) && is_executable(region);
+        if (executable)
+            ++executable_slots;
         json row;
         row["slot"] = i;
         row["address"] = sa_format_address(fn);
@@ -269,14 +356,32 @@ tool_result_t read(const json& params)
     result["object_or_pointer_va"] = sa_format_address(address);
     result["vtable_va"] = sa_format_address(vtable_va);
     result["returned"] = slots.size();
+    result["slot_reads"] = slot_reads;
+    result["region_queries"] = region_queries;
+    result["executable_slots"] = executable_slots;
     result["slots"] = std::move(slots);
+    diag::log_tagged_fmt("vmt",
+                         "read exit pid=%u ok=1 vtable=%s returned=%zu slot_reads=%zu region_queries=%zu executable=%zu elapsed_ms=%llu",
+                         scope.pid(),
+                         sa_format_address(vtable_va).c_str(),
+                         result["returned"].get<std::size_t>(),
+                         slot_reads,
+                         region_queries,
+                         executable_slots,
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     return tool_result_t::ok(result);
 }
 
 tool_result_t hook_manage(const json& params)
 {
+    const std::uint64_t started_ms = GetTickCount64();
     const std::string action = compat_action_name(params);
     const json p = compat_action_payload(params);
+    diag::log_tagged_fmt("vmt",
+                         "hook_manage enter action=%s deadline_remaining_ms=%llu diag_id=%s",
+                         action.c_str(),
+                         static_cast<unsigned long long>(deadline_remaining_ms()),
+                         mcp_standalone::current_call_diag_id());
 
     if (action == "list")
     {
@@ -288,6 +393,11 @@ tool_result_t hook_manage(const json& params)
         json result;
         result["hooks"] = std::move(arr);
         result["count"] = result["hooks"].size();
+        diag::log_tagged_fmt("vmt",
+                             "hook_manage exit action=list pid=%u count=%zu elapsed_ms=%llu",
+                             pid,
+                             result["count"].get<std::size_t>(),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
         return tool_result_t::ok(result);
     }
 
@@ -305,6 +415,18 @@ tool_result_t hook_manage(const json& params)
         if (!scope.ok())
             return tool_result_t::error(scope.error());
         json result = hook_record_json(record);
+        diag::log_tagged_fmt("vmt",
+                             "hook_manage remove_begin pid=%u hook_id=%s method=%s slot=%u object=%s slot_va=%s copied_vtable=%s trampoline=%s",
+                             scope.pid(),
+                             hook_id.c_str(),
+                             record.method.c_str(),
+                             record.slot,
+                             sa_format_address(record.object_va).c_str(),
+                             sa_format_address(record.slot_va).c_str(),
+                             sa_format_address(record.copied_vtable_va).c_str(),
+                             sa_format_address(record.trampoline_va).c_str());
+        if (vmt_call_cancelled("hook_remove_before_restore", scope.pid(), started_ms))
+            return tool_result_t::error("VMT hook removal cancelled.", vmt_cancel_detail("remove", scope.pid(), started_ms));
         bool restored = false;
         if (record.method == "patch_vtable")
             restored = record.slot_va != 0 && record.original_fn_va != 0 && write_pointer_patch(scope.pid(), record.slot_va, record.original_fn_va);
@@ -319,6 +441,14 @@ tool_result_t hook_manage(const json& params)
         const bool copy_freed = record.copied_vtable_va == 0 || free_remote(scope.pid(), record.copied_vtable_va);
         result["trampoline_freed"] = trampoline_freed;
         result["copied_vtable_freed"] = copy_freed;
+        diag::log_tagged_fmt("vmt",
+                             "hook_manage remove_cleanup pid=%u hook_id=%s restored=%d trampoline_freed=%d copied_vtable_freed=%d elapsed_ms=%llu",
+                             scope.pid(),
+                             hook_id.c_str(),
+                             restored ? 1 : 0,
+                             trampoline_freed ? 1 : 0,
+                             copy_freed ? 1 : 0,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
         if (!trampoline_freed || !copy_freed)
             return tool_result_t::error("VMT hook restored, but remote allocation cleanup failed; record was retained.", result);
         store::vmt_hook_record_t removed;
@@ -357,6 +487,16 @@ tool_result_t hook_manage(const json& params)
     std::uint64_t effective_vtable = vtable_va;
     std::uint64_t original_object_vtable = vtable_va;
     std::uint64_t copied_vtable = 0;
+    diag::log_tagged_fmt("vmt",
+                         "hook_manage install_begin pid=%u method=%s slot=%u vtable=%s callback=%s object=%s",
+                         scope.pid(),
+                         method.c_str(),
+                         slot,
+                         sa_format_address(vtable_va).c_str(),
+                         sa_format_address(callback_va).c_str(),
+                         sa_format_address(object_va).c_str());
+    if (vmt_call_cancelled("hook_install_before_copy", scope.pid(), started_ms))
+        return tool_result_t::error("VMT hook install cancelled.", vmt_cancel_detail("install", scope.pid(), started_ms));
     if (method == "patch_object")
     {
         if (!parse_address_param(p, "object_va", object_va) || object_va == 0)
@@ -367,21 +507,62 @@ tool_result_t hook_manage(const json& params)
         original_object_vtable = object_vtable;
         if (vtable_va != object_vtable)
             effective_vtable = object_vtable;
-        const std::size_t slots_to_copy = bounded_slot_count(scope.pid(), effective_vtable, static_cast<std::size_t>(numeric_param(p, "copy_slots", 256, slot + 1, 1024)));
+        bool slot_count_cancelled = false;
+        std::size_t count_reads = 0;
+        std::size_t count_queries = 0;
+        const std::size_t slots_to_copy = bounded_slot_count(scope.pid(),
+                                                             effective_vtable,
+                                                             static_cast<std::size_t>(numeric_param(p, "copy_slots", 256, slot + 1, 1024)),
+                                                             "hook_install_bounded_slot_count",
+                                                             started_ms,
+                                                             &slot_count_cancelled,
+                                                             &count_reads,
+                                                             &count_queries);
+        diag::log_tagged_fmt("vmt",
+                             "hook_manage install_slot_count pid=%u effective_vtable=%s requested_slot=%u slots_to_copy=%zu reads=%zu queries=%zu cancelled=%d elapsed_ms=%llu",
+                             scope.pid(),
+                             sa_format_address(effective_vtable).c_str(),
+                             slot,
+                             slots_to_copy,
+                             count_reads,
+                             count_queries,
+                             slot_count_cancelled ? 1 : 0,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        if (slot_count_cancelled)
+            return tool_result_t::error("VMT hook install cancelled.", vmt_cancel_detail("install", scope.pid(), started_ms));
         std::vector<std::uint8_t> table_bytes;
         if (!read_bytes(scope.pid(), effective_vtable, slots_to_copy * 8, table_bytes) || table_bytes.size() < (slot + 1ull) * 8ull)
             return tool_result_t::error("Failed to read source vtable for object copy.");
         copied_vtable = allocate_remote(scope.pid(), std::max<std::size_t>(static_cast<std::size_t>(0x1000), table_bytes.size()));
+        diag::log_tagged_fmt("vmt",
+                             "hook_manage install_copy_alloc pid=%u bytes=%zu copied_vtable=%s elapsed_ms=%llu",
+                             scope.pid(),
+                             table_bytes.size(),
+                             sa_format_address(copied_vtable).c_str(),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
         if (copied_vtable == 0)
             return tool_result_t::error("Failed to allocate copied vtable.");
         if (!write_bytes(scope.pid(), copied_vtable, table_bytes))
         {
-            free_remote(scope.pid(), copied_vtable);
+            const bool freed = free_remote(scope.pid(), copied_vtable);
+            diag::log_tagged_fmt("vmt",
+                                 "hook_manage install_copy_write_failed pid=%u copied_vtable=%s cleanup_freed=%d elapsed_ms=%llu",
+                                 scope.pid(),
+                                 sa_format_address(copied_vtable).c_str(),
+                                 freed ? 1 : 0,
+                                 static_cast<unsigned long long>(GetTickCount64() - started_ms));
             return tool_result_t::error("Failed to write copied vtable.");
         }
         if (!write_pointer_patch(scope.pid(), object_va, copied_vtable))
         {
-            free_remote(scope.pid(), copied_vtable);
+            const bool freed = free_remote(scope.pid(), copied_vtable);
+            diag::log_tagged_fmt("vmt",
+                                 "hook_manage install_object_patch_failed pid=%u object=%s copied_vtable=%s cleanup_freed=%d elapsed_ms=%llu",
+                                 scope.pid(),
+                                 sa_format_address(object_va).c_str(),
+                                 sa_format_address(copied_vtable).c_str(),
+                                 freed ? 1 : 0,
+                                 static_cast<unsigned long long>(GetTickCount64() - started_ms));
             return tool_result_t::error("Failed to patch object vtable pointer.");
         }
         effective_vtable = copied_vtable;
@@ -395,36 +576,62 @@ tool_result_t hook_manage(const json& params)
     std::uint64_t original = 0;
     if (!read_u64(scope.pid(), slot_va, original) || original == 0)
     {
-        if (copied_vtable != 0 && object_va != 0)
-            write_pointer_patch(scope.pid(), object_va, original_object_vtable);
-        if (copied_vtable != 0)
-            free_remote(scope.pid(), copied_vtable);
+        const bool restored = copied_vtable != 0 && object_va != 0 ? write_pointer_patch(scope.pid(), object_va, original_object_vtable) : true;
+        const bool freed = copied_vtable != 0 ? free_remote(scope.pid(), copied_vtable) : true;
+        diag::log_tagged_fmt("vmt",
+                             "hook_manage install_original_read_failed pid=%u slot_va=%s restored=%d copied_freed=%d elapsed_ms=%llu",
+                             scope.pid(),
+                             sa_format_address(slot_va).c_str(),
+                             restored ? 1 : 0,
+                             freed ? 1 : 0,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
         return tool_result_t::error("Failed to read original vtable slot.");
     }
     if (!executable_pointer(scope.pid(), original))
     {
-        if (copied_vtable != 0 && object_va != 0)
-            write_pointer_patch(scope.pid(), object_va, original_object_vtable);
-        if (copied_vtable != 0)
-            free_remote(scope.pid(), copied_vtable);
+        const bool restored = copied_vtable != 0 && object_va != 0 ? write_pointer_patch(scope.pid(), object_va, original_object_vtable) : true;
+        const bool freed = copied_vtable != 0 ? free_remote(scope.pid(), copied_vtable) : true;
+        diag::log_tagged_fmt("vmt",
+                             "hook_manage install_original_not_executable pid=%u original=%s restored=%d copied_freed=%d elapsed_ms=%llu",
+                             scope.pid(),
+                             sa_format_address(original).c_str(),
+                             restored ? 1 : 0,
+                             freed ? 1 : 0,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
         return tool_result_t::error("Requested VMT slot does not contain an executable function pointer.");
     }
     const std::uint64_t trampoline = make_trampoline(scope.pid(), original);
+    diag::log_tagged_fmt("vmt",
+                         "hook_manage install_trampoline pid=%u original=%s trampoline=%s elapsed_ms=%llu",
+                         scope.pid(),
+                         sa_format_address(original).c_str(),
+                         sa_format_address(trampoline).c_str(),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     if (trampoline == 0)
     {
-        if (copied_vtable != 0 && object_va != 0)
-            write_pointer_patch(scope.pid(), object_va, original_object_vtable);
-        if (copied_vtable != 0)
-            free_remote(scope.pid(), copied_vtable);
+        const bool restored = copied_vtable != 0 && object_va != 0 ? write_pointer_patch(scope.pid(), object_va, original_object_vtable) : true;
+        const bool freed = copied_vtable != 0 ? free_remote(scope.pid(), copied_vtable) : true;
+        diag::log_tagged_fmt("vmt",
+                             "hook_manage install_trampoline_failed pid=%u restored=%d copied_freed=%d elapsed_ms=%llu",
+                             scope.pid(),
+                             restored ? 1 : 0,
+                             freed ? 1 : 0,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
         return tool_result_t::error("Failed to allocate original-call trampoline.");
     }
     if (!write_pointer_patch(scope.pid(), slot_va, callback_va))
     {
-        if (copied_vtable != 0 && object_va != 0)
-            write_pointer_patch(scope.pid(), object_va, original_object_vtable);
-        free_remote(scope.pid(), trampoline);
-        if (copied_vtable != 0)
-            free_remote(scope.pid(), copied_vtable);
+        const bool restored = copied_vtable != 0 && object_va != 0 ? write_pointer_patch(scope.pid(), object_va, original_object_vtable) : true;
+        const bool trampoline_freed = free_remote(scope.pid(), trampoline);
+        const bool copied_freed = copied_vtable != 0 ? free_remote(scope.pid(), copied_vtable) : true;
+        diag::log_tagged_fmt("vmt",
+                             "hook_manage install_slot_patch_failed pid=%u slot_va=%s restored=%d trampoline_freed=%d copied_freed=%d elapsed_ms=%llu",
+                             scope.pid(),
+                             sa_format_address(slot_va).c_str(),
+                             restored ? 1 : 0,
+                             trampoline_freed ? 1 : 0,
+                             copied_freed ? 1 : 0,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
         return tool_result_t::error("Failed to patch vtable slot.");
     }
 
@@ -442,11 +649,22 @@ tool_result_t hook_manage(const json& params)
     record.method = method;
     record.created_ms = unix_time_ms();
     store::add_vmt_hook(record);
+    diag::log_tagged_fmt("vmt",
+                         "hook_manage exit action=install pid=%u hook_id=%s method=%s slot=%u slot_va=%s copied_vtable=%s trampoline=%s elapsed_ms=%llu",
+                         scope.pid(),
+                         record.id.c_str(),
+                         record.method.c_str(),
+                         record.slot,
+                         sa_format_address(record.slot_va).c_str(),
+                         sa_format_address(record.copied_vtable_va).c_str(),
+                         sa_format_address(record.trampoline_va).c_str(),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     return tool_result_t::ok("VMT hook installed.", hook_record_json(record));
 }
 
 tool_result_t copy(const json& params)
 {
+    const std::uint64_t started_ms = GetTickCount64();
     if (!unsafe_confirmed(params))
         return unsafe_required("vmt_copy");
 
@@ -457,26 +675,81 @@ tool_result_t copy(const json& params)
     std::uint64_t object_va = 0;
     if (!parse_address_param(params, "object_va", object_va) || object_va == 0)
         return tool_result_t::error("'object_va' is required.");
+    diag::log_tagged_fmt("vmt",
+                         "copy enter pid=%u object=%s deadline_remaining_ms=%llu diag_id=%s",
+                         scope.pid(),
+                         sa_format_address(object_va).c_str(),
+                         static_cast<unsigned long long>(deadline_remaining_ms()),
+                         mcp_standalone::current_call_diag_id());
     std::uint64_t original_vtable = 0;
     if (!read_u64(scope.pid(), object_va, original_vtable) || original_vtable == 0)
+    {
+        diag::log_tagged_fmt("vmt",
+                             "copy exit pid=%u ok=0 phase=object_vtable_read object=%s elapsed_ms=%llu",
+                             scope.pid(),
+                             sa_format_address(object_va).c_str(),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
         return tool_result_t::error("Failed to read object vtable pointer.");
+    }
 
-    const std::size_t slots = bounded_slot_count(scope.pid(), original_vtable, static_cast<std::size_t>(numeric_param(params, "max_slots", 256, 1, 1024)));
+    bool slot_count_cancelled = false;
+    std::size_t count_reads = 0;
+    std::size_t count_queries = 0;
+    const std::size_t slots = bounded_slot_count(scope.pid(),
+                                                 original_vtable,
+                                                 static_cast<std::size_t>(numeric_param(params, "max_slots", 256, 1, 1024)),
+                                                 "copy_bounded_slot_count",
+                                                 started_ms,
+                                                 &slot_count_cancelled,
+                                                 &count_reads,
+                                                 &count_queries);
+    diag::log_tagged_fmt("vmt",
+                         "copy slot_count pid=%u original_vtable=%s slots=%zu reads=%zu queries=%zu cancelled=%d elapsed_ms=%llu",
+                         scope.pid(),
+                         sa_format_address(original_vtable).c_str(),
+                         slots,
+                         count_reads,
+                         count_queries,
+                         slot_count_cancelled ? 1 : 0,
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
+    if (slot_count_cancelled)
+        return tool_result_t::error("VMT copy cancelled.", vmt_cancel_detail("copy", scope.pid(), started_ms));
     std::vector<std::uint8_t> table;
     if (!read_bytes(scope.pid(), original_vtable, slots * 8, table) || table.empty())
         return tool_result_t::error("Failed to read vtable bytes.");
     const std::size_t alloc_size = std::max<std::size_t>(static_cast<std::size_t>(0x1000), static_cast<std::size_t>((table.size() + 0xFFF) & ~static_cast<std::size_t>(0xFFF)));
     const std::uint64_t copy_va = allocate_remote(scope.pid(), alloc_size);
+    diag::log_tagged_fmt("vmt",
+                         "copy alloc pid=%u original_vtable=%s table_bytes=%zu alloc_size=%zu copy_va=%s elapsed_ms=%llu",
+                         scope.pid(),
+                         sa_format_address(original_vtable).c_str(),
+                         table.size(),
+                         alloc_size,
+                         sa_format_address(copy_va).c_str(),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     if (copy_va == 0)
         return tool_result_t::error("Failed to allocate vtable copy.");
     if (!write_bytes(scope.pid(), copy_va, table))
     {
-        free_remote(scope.pid(), copy_va);
+        const bool freed = free_remote(scope.pid(), copy_va);
+        diag::log_tagged_fmt("vmt",
+                             "copy write_failed pid=%u copy_va=%s cleanup_freed=%d elapsed_ms=%llu",
+                             scope.pid(),
+                             sa_format_address(copy_va).c_str(),
+                             freed ? 1 : 0,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
         return tool_result_t::error("Failed to write vtable copy.");
     }
     if (!write_pointer_patch(scope.pid(), object_va, copy_va))
     {
-        free_remote(scope.pid(), copy_va);
+        const bool freed = free_remote(scope.pid(), copy_va);
+        diag::log_tagged_fmt("vmt",
+                             "copy patch_failed pid=%u object=%s copy_va=%s cleanup_freed=%d elapsed_ms=%llu",
+                             scope.pid(),
+                             sa_format_address(object_va).c_str(),
+                             sa_format_address(copy_va).c_str(),
+                             freed ? 1 : 0,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
         return tool_result_t::error("Failed to patch object vtable pointer.");
     }
 
@@ -497,11 +770,22 @@ tool_result_t copy(const json& params)
     store::add_vmt_hook(record);
     result["hook_id"] = record.id;
     result["managed_restore"] = true;
+    diag::log_tagged_fmt("vmt",
+                         "copy exit pid=%u ok=1 object=%s original=%s copy=%s slots=%zu table_bytes=%zu hook_id=%s elapsed_ms=%llu",
+                         scope.pid(),
+                         sa_format_address(object_va).c_str(),
+                         sa_format_address(original_vtable).c_str(),
+                         sa_format_address(copy_va).c_str(),
+                         slots,
+                         table.size(),
+                         record.id.c_str(),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     return tool_result_t::ok("VMT copied and object patched.", result);
 }
 
 tool_result_t find_slot_by_signature(const json& params)
 {
+    const std::uint64_t started_ms = GetTickCount64();
     active_process_scope_t scope(params);
     if (!scope.ok())
         return tool_result_t::error(scope.error());
@@ -530,9 +814,23 @@ tool_result_t find_slot_by_signature(const json& params)
     if (byte_mode && byte_pattern.empty())
         return tool_result_t::error("Invalid pattern: " + pattern_error);
     const std::size_t max_slots = static_cast<std::size_t>(numeric_param(params, "max_slots", 256, 1, 1024));
+    diag::log_tagged_fmt("vmt",
+                         "find_slot enter pid=%u vtable=%s max_slots=%zu mode=%s deadline_remaining_ms=%llu diag_id=%s",
+                         scope.pid(),
+                         sa_format_address(vtable_va).c_str(),
+                         max_slots,
+                         byte_mode ? "bytes" : "disasm",
+                         static_cast<unsigned long long>(deadline_remaining_ms()),
+                         mcp_standalone::current_call_diag_id());
+    std::size_t slot_reads = 0;
+    std::size_t pattern_reads = 0;
+    std::size_t disasm_checks = 0;
     for (std::size_t i = 0; i < max_slots; ++i)
     {
+        if ((i & 0x0Fu) == 0 && vmt_call_cancelled("find_slot_scan", scope.pid(), started_ms))
+            return tool_result_t::error("VMT slot signature search cancelled.", vmt_cancel_detail("find_slot_by_signature", scope.pid(), started_ms));
         std::uint64_t fn = 0;
+        ++slot_reads;
         if (!read_u64(scope.pid(), vtable_va + i * 8, fn) || fn == 0)
             break;
         json disasm_match_preview;
@@ -540,12 +838,14 @@ tool_result_t find_slot_by_signature(const json& params)
         if (byte_mode)
         {
             std::vector<std::uint8_t> bytes;
+            ++pattern_reads;
             if (!read_bytes(scope.pid(), fn, std::max<std::size_t>(byte_pattern.size(), 16), bytes) || bytes.size() < byte_pattern.size())
                 continue;
             matched = pattern_matches(bytes.data(), bytes.size(), byte_pattern);
         }
         else
         {
+            ++disasm_checks;
             matched = disasm_pattern_matches(scope.pid(), fn, disasm_pattern, &disasm_match_preview);
         }
         if (matched)
@@ -557,6 +857,18 @@ tool_result_t find_slot_by_signature(const json& params)
             result["hint"] = classify_function_hint(scope.pid(), fn);
             if (!byte_mode)
                 result["disasm_match"] = std::move(disasm_match_preview);
+            result["slot_reads"] = slot_reads;
+            result["pattern_reads"] = pattern_reads;
+            result["disasm_checks"] = disasm_checks;
+            diag::log_tagged_fmt("vmt",
+                                 "find_slot exit pid=%u matched=1 slot=%zu address=%s slot_reads=%zu pattern_reads=%zu disasm_checks=%zu elapsed_ms=%llu",
+                                 scope.pid(),
+                                 i,
+                                 sa_format_address(fn).c_str(),
+                                 slot_reads,
+                                 pattern_reads,
+                                 disasm_checks,
+                                 static_cast<unsigned long long>(GetTickCount64() - started_ms));
             return tool_result_t::ok(result);
         }
     }
@@ -564,11 +876,22 @@ tool_result_t find_slot_by_signature(const json& params)
     result["slot"] = nullptr;
     result["address"] = nullptr;
     result["match_mode"] = byte_mode ? "bytes" : "disasm";
+    result["slot_reads"] = slot_reads;
+    result["pattern_reads"] = pattern_reads;
+    result["disasm_checks"] = disasm_checks;
+    diag::log_tagged_fmt("vmt",
+                         "find_slot exit pid=%u matched=0 slot_reads=%zu pattern_reads=%zu disasm_checks=%zu elapsed_ms=%llu",
+                         scope.pid(),
+                         slot_reads,
+                         pattern_reads,
+                         disasm_checks,
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     return tool_result_t::ok("No matching VMT slot found.", result);
 }
 
 tool_result_t scan_objects(const json& params)
 {
+    const std::uint64_t started_ms = GetTickCount64();
     active_process_scope_t scope(params);
     if (!scope.ok())
         return tool_result_t::error(scope.error());
@@ -579,6 +902,17 @@ tool_result_t scan_objects(const json& params)
     const std::size_t max_results = static_cast<std::size_t>(numeric_param(params, "max_results", 512, 1, 10000));
     const auto needle = make_u64_pattern(vtable_va);
     json arr = json::array();
+    std::size_t regions_considered = 0;
+    std::size_t regions_read = 0;
+    std::size_t read_failures = 0;
+    std::size_t qwords_scanned = 0;
+    diag::log_tagged_fmt("vmt",
+                         "scan_objects enter pid=%u vtable=%s max_results=%zu deadline_remaining_ms=%llu diag_id=%s",
+                         scope.pid(),
+                         sa_format_address(vtable_va).c_str(),
+                         max_results,
+                         static_cast<unsigned long long>(deadline_remaining_ms()),
+                         mcp_standalone::current_call_diag_id());
     std::uint64_t object_va = 0;
     if (parse_address_param(params, "object_va", object_va) && object_va != 0)
     {
@@ -618,13 +952,23 @@ tool_result_t scan_objects(const json& params)
     {
         if (arr.size() >= max_results)
             break;
+        if (vmt_call_cancelled("scan_objects_regions", scope.pid(), started_ms))
+            return tool_result_t::error("VMT object scan cancelled.", vmt_cancel_detail("scan_objects", scope.pid(), started_ms));
+        ++regions_considered;
         if (!is_readable(region) || !is_writable(region) || region.size < 8 || region.size > 64ull * 1024ull * 1024ull)
             continue;
         std::vector<std::uint8_t> bytes;
         if (!read_bytes(scope.pid(), region.base, static_cast<std::size_t>(region.size), bytes) || bytes.size() < 8)
+        {
+            ++read_failures;
             continue;
+        }
+        ++regions_read;
         for (std::size_t i = 0; i + 8 <= bytes.size(); i += 8)
         {
+            ++qwords_scanned;
+            if ((qwords_scanned & 0x3FFFu) == 0 && vmt_call_cancelled("scan_objects_qwords", scope.pid(), started_ms))
+                return tool_result_t::error("VMT object scan cancelled.", vmt_cancel_detail("scan_objects", scope.pid(), started_ms));
             if (std::memcmp(bytes.data() + i, needle.data(), 8) != 0)
                 continue;
             json obj;
@@ -639,7 +983,20 @@ tool_result_t scan_objects(const json& params)
     result["process_id"] = scope.pid();
     result["vtable_va"] = sa_format_address(vtable_va);
     result["returned"] = arr.size();
+    result["regions_considered"] = regions_considered;
+    result["regions_read"] = regions_read;
+    result["read_failures"] = read_failures;
+    result["qwords_scanned"] = qwords_scanned;
     result["objects"] = std::move(arr);
+    diag::log_tagged_fmt("vmt",
+                         "scan_objects exit pid=%u returned=%zu regions_considered=%zu regions_read=%zu read_failures=%zu qwords=%zu elapsed_ms=%llu",
+                         scope.pid(),
+                         result["returned"].get<std::size_t>(),
+                         regions_considered,
+                         regions_read,
+                         read_failures,
+                         qwords_scanned,
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     return tool_result_t::ok(result);
 }
 }

@@ -1,6 +1,7 @@
 #include "offsets.hpp"
 
 #include "artifact_store.hpp"
+#include "../../helpers/diag_log.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -14,6 +15,73 @@ namespace re::offsets
 {
 namespace
 {
+std::uint64_t deadline_remaining_ms()
+{
+    const std::uint64_t deadline = mcp_standalone::current_call_deadline_ms();
+    if (deadline == 0)
+        return 0;
+    const std::uint64_t now = GetTickCount64();
+    return deadline > now ? deadline - now : 0;
+}
+
+bool offsets_call_cancelled(const char* phase, std::uint32_t pid, std::uint64_t started_ms)
+{
+    if (mcp_standalone::current_call_cancelled())
+    {
+        diag::log_tagged_fmt("offsets", "cancelled phase=%s pid=%u elapsed_ms=%llu diag_id=%s",
+                             phase ? phase : "",
+                             pid,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms),
+                             mcp_standalone::current_call_diag_id());
+        return true;
+    }
+    const std::uint64_t deadline = mcp_standalone::current_call_deadline_ms();
+    if (deadline != 0 && GetTickCount64() >= deadline)
+    {
+        diag::log_tagged_fmt("offsets", "deadline_reached phase=%s pid=%u elapsed_ms=%llu diag_id=%s",
+                             phase ? phase : "",
+                             pid,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms),
+                             mcp_standalone::current_call_diag_id());
+        return true;
+    }
+    return false;
+}
+
+json offsets_cancel_detail(const char* action, std::uint32_t pid, std::uint64_t started_ms)
+{
+    return json{
+        {"action", action ? action : ""},
+        {"process_id", pid},
+        {"elapsed_ms", GetTickCount64() - started_ms},
+        {"deadline_remaining_ms", deadline_remaining_ms()},
+        {"cancelled", mcp_standalone::current_call_cancelled()},
+        {"diag_id", mcp_standalone::current_call_diag_id()}
+    };
+}
+
+tool_result_t offsets_guard_required(const char* action, const json& params, std::uint64_t started_ms)
+{
+    json out;
+    out["tool"] = "offsets_manage";
+    out["action"] = action ? action : "";
+    out["confirm_unsafe_required"] = true;
+    out["confirm_unsafe_received"] = unsafe_confirmed(params);
+    out["mutation"] = "none";
+    out["persistence_mutation"] = false;
+    out["file_write"] = false;
+    out["security_guard_pass"] = true;
+    out["safe_contract"] = "fail_closed_until_explicit_unsafe_confirmation";
+    out["elapsed_ms"] = GetTickCount64() - started_ms;
+    if (params.contains("name"))
+        out["name"] = params["name"];
+    if (params.contains("offset_id"))
+        out["offset_id"] = params["offset_id"];
+    if (params.contains("output_path"))
+        out["output_path_present"] = true;
+    return tool_result_t::error(std::string(action ? action : "offsets_manage") + " requires confirm_unsafe=true or allow_unsafe=true.", out);
+}
+
 std::string make_aob_for_address(std::uint32_t pid, std::uint64_t va)
 {
     std::vector<std::uint8_t> bytes;
@@ -281,10 +349,11 @@ json fingerprint_for_record(std::uint32_t pid, const store::offset_record_t& rec
     return fingerprint;
 }
 
-json reverify_one(std::uint32_t pid, store::offset_record_t& record, std::size_t max_aob_matches)
+json reverify_one(std::uint32_t pid, store::offset_record_t& record, std::size_t max_aob_matches, std::uint64_t started_ms)
 {
     json out = store::offset_to_json(record);
     out["previous_va"] = sa_format_address(record.va);
+    out["phase"] = "candidate_seed";
     std::vector<parsed_pattern_byte_t> pattern;
     std::string pattern_error;
     const bool has_aob = !record.aob_pattern.empty();
@@ -310,12 +379,51 @@ json reverify_one(std::uint32_t pid, store::offset_record_t& record, std::size_t
                 add_candidate(candidates, module->base + record.module_rva, "module_rva_rebase", 110);
         }
     }
+    std::size_t initial_candidate_count = candidates.size();
+    auto fast_candidates = candidates;
+    for (auto& candidate : fast_candidates)
+        evaluate_candidate(pid, record, pattern, candidate);
+    auto accepted_initial = std::find_if(fast_candidates.begin(), fast_candidates.end(), [](const offset_candidate_t& candidate) {
+        return candidate.accepted;
+    });
+    const bool fast_path_hit = accepted_initial != fast_candidates.end();
+    out["persisted_va_checked"] = record.va != 0;
+    out["last_found_va_checked"] = record.last_found_va != 0;
+    out["fast_path_checked"] = true;
+    out["fast_path_hit"] = fast_path_hit;
+    out["initial_candidate_count"] = initial_candidate_count;
+    out["deadline_hit"] = false;
+    out["cancelled"] = false;
+    out["scan_bytes"] = nullptr;
+    out["scan_bytes_available"] = false;
+    out["aob_matches_considered"] = 0;
+    out["aob_scan_skipped_fast_path"] = false;
+    if (offsets_call_cancelled("reverify_one_after_fast_candidates", pid, started_ms))
+    {
+        out["verification_status"] = "partial";
+        out["partial"] = true;
+        out["deadline_hit"] = !mcp_standalone::current_call_cancelled();
+        out["cancelled"] = mcp_standalone::current_call_cancelled();
+        out["phase"] = "fast_candidate_evaluation";
+        return out;
+    }
     if (!pattern.empty())
     {
-        auto matches = scan_pattern(pid, pattern, record.module_name, false, max_aob_matches);
-        for (auto found : matches)
-            add_candidate(candidates, found, "saved_aob_scan", 120);
-        out["aob_match_count"] = matches.size();
+        if (fast_path_hit)
+        {
+            out["aob_match_count"] = 0;
+            out["aob_scan_skipped_fast_path"] = true;
+            out["phase"] = "fast_path_accepted";
+        }
+        else
+        {
+            out["phase"] = "saved_aob_scan";
+            auto matches = scan_pattern(pid, pattern, record.module_name, false, max_aob_matches);
+            for (auto found : matches)
+                add_candidate(candidates, found, "saved_aob_scan", 120);
+            out["aob_match_count"] = matches.size();
+            out["aob_matches_considered"] = matches.size();
+        }
     }
     const auto rtti_addresses = addresses_from_context(record.rtti_path);
     const auto xref_addresses = addresses_from_context(record.xref_context);
@@ -348,6 +456,7 @@ json reverify_one(std::uint32_t pid, store::offset_record_t& record, std::size_t
     out["rediscovery_candidates"] = std::move(candidate_rows);
     out["rtti_context_addresses"] = address_array_json(rtti_addresses);
     out["xref_context_addresses"] = address_array_json(xref_addresses);
+    out["candidate_count"] = candidates.size();
 
     auto accepted_end = std::find_if(candidates.begin(), candidates.end(), [](const offset_candidate_t& candidate) {
         return !candidate.accepted;
@@ -358,6 +467,7 @@ json reverify_one(std::uint32_t pid, store::offset_record_t& record, std::size_t
         record.updated_ms = unix_time_ms();
         out["verification_status"] = "broken";
         out["rediscovery_method"] = "none";
+        out["phase"] = "no_accepted_candidate";
         return out;
     }
     const offset_candidate_t& best = candidates.front();
@@ -374,6 +484,7 @@ json reverify_one(std::uint32_t pid, store::offset_record_t& record, std::size_t
         out["verification_status"] = "ambiguous";
         out["match_count"] = static_cast<std::uint64_t>(std::distance(candidates.begin(), accepted_end));
         out["top_score"] = best.score;
+        out["phase"] = "ambiguous_candidate";
         return out;
     }
 
@@ -385,6 +496,8 @@ json reverify_one(std::uint32_t pid, store::offset_record_t& record, std::size_t
     out["found_va"] = sa_format_address(best.va);
     out["confidence_score"] = best.score;
     out["rediscovery_method"] = candidate_sources_json(best);
+    out["module_match"] = best.module_match;
+    out["phase"] = fast_path_hit ? "fast_path_accepted" : "rediscovery_complete";
     return out;
 }
 
@@ -399,8 +512,9 @@ void refresh_record_module(std::uint32_t pid, store::offset_record_t& record)
 
 tool_result_t record_offset(const json& params)
 {
+    const std::uint64_t started_ms = GetTickCount64();
     if (!unsafe_confirmed(params))
-        return unsafe_required("offsets_manage record");
+        return offsets_guard_required("record", params, started_ms);
     active_process_scope_t scope(params);
     if (!scope.ok())
         return tool_result_t::error(scope.error());
@@ -410,6 +524,13 @@ tool_result_t record_offset(const json& params)
     std::uint64_t va = 0;
     if (!parse_address_param(params, "va", va) || va == 0)
         return tool_result_t::error("'va' is required for record.");
+    diag::log_tagged_fmt("offsets",
+                         "record enter pid=%u name=%s va=%s deadline_remaining_ms=%llu diag_id=%s",
+                         scope.pid(),
+                         name.c_str(),
+                         sa_format_address(va).c_str(),
+                         static_cast<unsigned long long>(deadline_remaining_ms()),
+                         mcp_standalone::current_call_diag_id());
 
     store::offset_record_t record;
     record.id = store::next_id("off");
@@ -431,19 +552,48 @@ tool_result_t record_offset(const json& params)
         record.module_name = module->name;
         record.module_rva = va - module->base;
     }
+    diag::log_tagged_fmt("offsets",
+                         "record fingerprint_begin pid=%u id=%s module=%s module_rva=%s aob_bytes=%zu elapsed_ms=%llu",
+                         scope.pid(),
+                         record.id.c_str(),
+                         record.module_name.empty() ? "" : record.module_name.c_str(),
+                         record.module_rva ? sa_format_address(record.module_rva).c_str() : "0x0",
+                         record.aob_pattern.size(),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
+    if (offsets_call_cancelled("record_before_fingerprint", scope.pid(), started_ms))
+        return tool_result_t::error("Offset record cancelled.", offsets_cancel_detail("record", scope.pid(), started_ms));
     record.fingerprint = fingerprint_for_record(scope.pid(), record);
 
     auto records = store::load_offsets();
+    const std::size_t before_count = records.size();
     records.push_back(record);
-    if (!store::save_offsets(records))
+    const bool save_ok = store::save_offsets(records);
+    diag::log_tagged_fmt("offsets",
+                         "record store pid=%u id=%s before=%zu after=%zu save_ok=%d elapsed_ms=%llu",
+                         scope.pid(),
+                         record.id.c_str(),
+                         before_count,
+                         records.size(),
+                         save_ok ? 1 : 0,
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
+    if (!save_ok)
         return tool_result_t::error("Failed to save offsets database.");
     json result = store::offset_to_json(record);
     result["offset_id"] = record.id;
+    result["source_count_before"] = before_count;
+    result["source_count_after"] = records.size();
+    result["elapsed_ms"] = GetTickCount64() - started_ms;
+    diag::log_tagged_fmt("offsets",
+                         "record exit pid=%u id=%s ok=1 elapsed_ms=%llu",
+                         scope.pid(),
+                         record.id.c_str(),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     return tool_result_t::ok("Offset recorded.", result);
 }
 
 tool_result_t list_offsets(const json& params)
 {
+    const std::uint64_t started_ms = GetTickCount64();
     const bool verified_only = bool_param(params, "verified_only", false);
     const std::string category = lower_ascii(string_param(params, "category"));
     const auto records = store::load_offsets();
@@ -459,13 +609,23 @@ tool_result_t list_offsets(const json& params)
     json result;
     result["offsets"] = std::move(arr);
     result["count"] = result["offsets"].size();
+    result["source_count"] = records.size();
+    result["elapsed_ms"] = GetTickCount64() - started_ms;
+    diag::log_tagged_fmt("offsets",
+                         "list exit source_count=%zu returned=%zu verified_only=%d category=%s elapsed_ms=%llu",
+                         records.size(),
+                         result["count"].get<std::size_t>(),
+                         verified_only ? 1 : 0,
+                         category.c_str(),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     return tool_result_t::ok(result);
 }
 
 tool_result_t reverify_offsets(const json& params, bool rebase)
 {
+    const std::uint64_t started_ms = GetTickCount64();
     if (!unsafe_confirmed(params))
-        return unsafe_required(rebase ? "offsets_manage rebase" : "offsets_manage reverify");
+        return offsets_guard_required(rebase ? "rebase" : "reverify", params, started_ms);
     active_process_scope_t scope(params);
     if (!scope.ok())
         return tool_result_t::error(scope.error());
@@ -474,13 +634,43 @@ tool_result_t reverify_offsets(const json& params, bool rebase)
     const std::set<std::string> selected_ids = selected_offset_ids(params);
     const std::string module_filter = string_param(params, "module_name");
     const std::size_t max_aob_matches = static_cast<std::size_t>(numeric_param(params, "max_aob_matches", 64, 2, 512));
+    diag::log_tagged_fmt("offsets",
+                         "reverify enter pid=%u rebase=%d records=%zu selected=%zu module_filter=%s max_aob_matches=%zu deadline_remaining_ms=%llu diag_id=%s",
+                         scope.pid(),
+                         rebase ? 1 : 0,
+                         records.size(),
+                         selected_ids.size(),
+                         module_filter.c_str(),
+                         max_aob_matches,
+                         static_cast<unsigned long long>(deadline_remaining_ms()),
+                         mcp_standalone::current_call_diag_id());
     json valid = json::array();
     json broken = json::array();
     json shifted = json::array();
     json ambiguous = json::array();
     json skipped = json::array();
+    std::size_t records_scanned = 0;
+    std::size_t selected_count = 0;
+    auto partial_payload = [&](const char* phase, json partial_row = json(nullptr)) {
+        json detail = offsets_cancel_detail(rebase ? "rebase" : "reverify", scope.pid(), started_ms);
+        detail["phase"] = phase ? phase : "";
+        detail["valid"] = valid;
+        detail["broken"] = broken;
+        detail["shifted"] = shifted;
+        detail["ambiguous"] = ambiguous;
+        detail["skipped"] = skipped;
+        detail["selected_count"] = selected_count;
+        detail["record_count"] = records.size();
+        detail["records_scanned"] = records_scanned;
+        detail["partial"] = true;
+        if (!partial_row.is_null())
+            detail["partial_record"] = std::move(partial_row);
+        return detail;
+    };
     for (auto& record : records)
     {
+        if (offsets_call_cancelled(rebase ? "rebase_loop" : "reverify_loop", scope.pid(), started_ms))
+            return tool_result_t::error(rebase ? "Offset rebase cancelled." : "Offset reverify cancelled.", partial_payload("loop_entry"));
         std::string skip_reason;
         if (!record_in_scope(record, scope.pid(), selected_ids, module_filter, skip_reason))
         {
@@ -489,8 +679,12 @@ tool_result_t reverify_offsets(const json& params, bool rebase)
             skipped.push_back(std::move(row));
             continue;
         }
-        json row = reverify_one(scope.pid(), record, max_aob_matches);
+        ++selected_count;
+        json row = reverify_one(scope.pid(), record, max_aob_matches, started_ms);
+        ++records_scanned;
         const std::string status = row.value("verification_status", std::string());
+        if (status == "partial")
+            return tool_result_t::error(rebase ? "Offset rebase cancelled during record verification." : "Offset reverify cancelled during record verification.", partial_payload("record_verification", std::move(row)));
         if (status == "valid")
             valid.push_back(row);
         else if (status == "shifted")
@@ -529,15 +723,33 @@ tool_result_t reverify_offsets(const json& params, bool rebase)
     result["skipped"] = std::move(skipped);
     result["rebased"] = rebase;
     result["process_id"] = scope.pid();
+    result["source_count"] = records.size();
+    result["record_count"] = records.size();
+    result["selected_count"] = selected_count;
+    result["records_scanned"] = records_scanned;
+    result["deadline_hit"] = false;
+    result["cancelled"] = false;
+    result["elapsed_ms"] = GetTickCount64() - started_ms;
     if (!module_filter.empty())
         result["module_name"] = module_filter;
+    diag::log_tagged_fmt("offsets",
+                         "reverify exit pid=%u rebase=%d valid=%zu broken=%zu shifted=%zu ambiguous=%zu skipped=%zu elapsed_ms=%llu",
+                         scope.pid(),
+                         rebase ? 1 : 0,
+                         result["valid"].size(),
+                         result["broken"].size(),
+                         result["shifted"].size(),
+                         result["ambiguous"].size(),
+                         result["skipped"].size(),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     return tool_result_t::ok(result);
 }
 
 tool_result_t export_offsets(const json& params)
 {
+    const std::uint64_t started_ms = GetTickCount64();
     if (!unsafe_confirmed(params))
-        return unsafe_required("offsets_manage export");
+        return offsets_guard_required("export", params, started_ms);
     const std::string output_path = string_param(params, "output_path");
     if (output_path.empty())
         return tool_result_t::error("'output_path' is required for export.");
@@ -550,6 +762,18 @@ tool_result_t export_offsets(const json& params)
     std::uint32_t pid = 0;
     parse_pid_param(params, pid);
     const auto records = store::load_offsets();
+    diag::log_tagged_fmt("offsets",
+                         "export enter pid=%u output_path=%s namespace=%s records=%zu use_rva=%d verified_only=%d category=%s module_filter=%s deadline_remaining_ms=%llu diag_id=%s",
+                         pid,
+                         output_path.c_str(),
+                         ns.c_str(),
+                         records.size(),
+                         use_rva ? 1 : 0,
+                         verified_only ? 1 : 0,
+                         category.c_str(),
+                         module_filter.c_str(),
+                         static_cast<unsigned long long>(deadline_remaining_ms()),
+                         mcp_standalone::current_call_diag_id());
     ensure_parent_dir_exists(output_path);
     std::ofstream f(output_path, std::ios::binary | std::ios::trunc);
     if (!f.is_open())
@@ -563,6 +787,8 @@ tool_result_t export_offsets(const json& params)
     json skipped = json::array();
     for (const auto& record : records)
     {
+        if (((exported.size() + skipped.size()) & 0x1Fu) == 0 && offsets_call_cancelled("export_loop", pid, started_ms))
+            return tool_result_t::error("Offset export cancelled.", offsets_cancel_detail("export", pid, started_ms));
         std::string skip_reason;
         if (!record_in_scope(record, pid, selected_ids, module_filter, skip_reason))
         {
@@ -606,27 +832,49 @@ tool_result_t export_offsets(const json& params)
         exported.push_back(std::move(row));
     }
     f << "}\n";
+    f.flush();
+    const std::streamoff bytes_written = f.tellp();
     json result;
     result["output_path"] = output_path;
     result["count"] = exported.size();
     result["source_count"] = records.size();
     result["skipped_count"] = skipped.size();
     result["use_rva"] = use_rva;
+    result["bytes_written"] = bytes_written >= 0 ? static_cast<std::uint64_t>(bytes_written) : 0;
+    result["elapsed_ms"] = GetTickCount64() - started_ms;
     result["exported"] = std::move(exported);
     result["skipped"] = std::move(skipped);
+    diag::log_tagged_fmt("offsets",
+                         "export exit pid=%u output_path=%s count=%zu skipped=%zu bytes=%llu elapsed_ms=%llu",
+                         pid,
+                         output_path.c_str(),
+                         result["count"].get<std::size_t>(),
+                         result["skipped_count"].get<std::size_t>(),
+                         static_cast<unsigned long long>(result["bytes_written"].get<std::uint64_t>()),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     return tool_result_t::ok("Offsets exported.", result);
 }
 }
 
 tool_result_t manage(const json& params)
 {
+    const std::uint64_t started_ms = GetTickCount64();
     const std::string action = compat_action_name(params);
     const json p = compat_action_payload(params);
+    diag::log_tagged_fmt("offsets",
+                         "manage enter action=%s deadline_remaining_ms=%llu diag_id=%s",
+                         action.c_str(),
+                         static_cast<unsigned long long>(deadline_remaining_ms()),
+                         mcp_standalone::current_call_diag_id());
     if (action == "record") return record_offset(p);
     if (action == "list") return list_offsets(p);
     if (action == "reverify") return reverify_offsets(p, false);
     if (action == "rebase") return reverify_offsets(p, true);
     if (action == "export") return export_offsets(p);
+    diag::log_tagged_fmt("offsets",
+                         "manage exit action=%s unknown=1 elapsed_ms=%llu",
+                         action.c_str(),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     return compat_unknown_action("offsets_manage", action);
 }
 }

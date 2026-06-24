@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cctype>
 #include <cstdio>
+#include <cstdint>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -62,6 +63,41 @@ static void log_msg(HANDLE hf, const char* tag, const char* fmt, ...) {
 static long long elapsed_us_since(std::chrono::steady_clock::time_point t0) {
     return static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - t0).count());
+}
+
+static bool hwbp_dr7_has_enabled_slot(uint64_t dr7) {
+    return (dr7 & 0xFFULL) != 0;
+}
+
+static bool hwbp_dr7_slot_enabled(uint64_t dr7, int slot) {
+    if (slot < 0 || slot > 3)
+        return true;
+    const uint64_t mask = (1ULL << (slot * 2)) | (1ULL << ((slot * 2) + 1));
+    return (dr7 & mask) != 0;
+}
+
+static uint64_t hwbp_slot_address_for_scrub(const driver_bridge::thread_context_t& ctx, int slot) {
+    switch (slot) {
+        case 0: return ctx.dr0;
+        case 1: return ctx.dr1;
+        case 2: return ctx.dr2;
+        case 3: return ctx.dr3;
+        default: return UINT64_MAX;
+    }
+}
+
+static bool hwbp_debug_registers_clear_for_scrub(const driver_bridge::thread_context_t& ctx) {
+    return ctx.dr0 == 0 &&
+        ctx.dr1 == 0 &&
+        ctx.dr2 == 0 &&
+        ctx.dr3 == 0 &&
+        ctx.dr6 == 0 &&
+        ctx.dr7 == 0 &&
+        !hwbp_dr7_has_enabled_slot(ctx.dr7);
+}
+
+static bool hwbp_slot_clear_for_scrub(const driver_bridge::thread_context_t& ctx, int slot) {
+    return !hwbp_dr7_slot_enabled(ctx.dr7, slot) && hwbp_slot_address_for_scrub(ctx, slot) == 0;
 }
 
 static size_t first_byte_mismatch(const std::vector<uint8_t>& expected, const std::vector<uint8_t>& actual) {
@@ -772,6 +808,13 @@ static bool scrub_target_hardware_breakpoints(HANDLE hf, const char* reason) {
     int target_threads = 0;
     int clear_ok = 0;
     int clear_fail = 0;
+    int already_clear_ok = 0;
+    int cleared_proof_ok = 0;
+    int proof_fail = 0;
+    bool final_context_ok = false;
+    bool final_all_clear = false;
+    DWORD final_gle = ERROR_SUCCESS;
+    driver_bridge::thread_context_t final_ctx{};
     hwbp_fixture_descriptor_t desc{};
     std::string fixture_reason;
 
@@ -790,18 +833,35 @@ static bool scrub_target_hardware_breakpoints(HANDLE hf, const char* reason) {
             DWORD after_gle = after_ok ? ERROR_SUCCESS : GetLastError();
             uint32_t exit_code = 0;
             const bool alive = driver_bridge::attached_process_alive(&exit_code);
-            if (clear)
+            const bool before_all_clear = before_ok && hwbp_debug_registers_clear_for_scrub(before);
+            const bool after_all_clear = after_ok && hwbp_debug_registers_clear_for_scrub(after);
+            const bool after_slot_clear = after_ok && hwbp_slot_clear_for_scrub(after, slot);
+            const bool cleared_proof = clear && alive && after_slot_clear;
+            const bool already_clear_proof = !clear && alive && before_all_clear && after_all_clear;
+            const bool scrubbed = cleared_proof || already_clear_proof;
+            const char* proof = cleared_proof ? "cleared" : (already_clear_proof ? "already_clear" : "failed");
+            if (scrubbed) {
                 ++clear_ok;
-            else
+                if (already_clear_proof)
+                    ++already_clear_ok;
+                if (cleared_proof)
+                    ++cleared_proof_ok;
+            } else {
                 ++clear_fail;
+                ++proof_fail;
+            }
             diag::log_tagged_fmt("test_dbg_detail",
-                "dbg_hwclr slot_clear reason=%s role=hwbp_fixture pid=%u tid=%u slot=%d before_ok=%d before_gle=%lu before_rip=0x%llX before_rsp=0x%llX before_dr0=0x%llX before_dr1=0x%llX before_dr2=0x%llX before_dr3=0x%llX before_dr6=0x%llX before_dr7=0x%llX clear=%d clear_gle=%lu after_ok=%d after_gle=%lu after_rip=0x%llX after_rsp=0x%llX after_dr0=0x%llX after_dr1=0x%llX after_dr2=0x%llX after_dr3=0x%llX after_dr6=0x%llX after_dr7=0x%llX alive=%d exit_code_or_error=0x%08X",
+                "dbg_hwclr slot_clear reason=%s role=hwbp_fixture pid=%u tid=%u slot=%d proof=%s before_ok=%d before_gle=%lu before_all_clear=%d before_dr7_enabled=%d before_slot_addr=0x%llX before_rip=0x%llX before_rsp=0x%llX before_dr0=0x%llX before_dr1=0x%llX before_dr2=0x%llX before_dr3=0x%llX before_dr6=0x%llX before_dr7=0x%llX clear=%d clear_gle=%lu after_ok=%d after_gle=%lu after_all_clear=%d after_slot_clear=%d after_dr7_enabled=%d after_slot_addr=0x%llX after_rip=0x%llX after_rsp=0x%llX after_dr0=0x%llX after_dr1=0x%llX after_dr2=0x%llX after_dr3=0x%llX after_dr6=0x%llX after_dr7=0x%llX alive=%d exit_code_or_error=0x%08X",
                 reason ? reason : "unspecified",
                 static_cast<unsigned>(pid),
                 desc.thread_id,
                 slot,
+                proof,
                 before_ok ? 1 : 0,
                 static_cast<unsigned long>(before_gle),
+                before_all_clear ? 1 : 0,
+                before_ok && hwbp_dr7_has_enabled_slot(before.dr7) ? 1 : 0,
+                static_cast<unsigned long long>(hwbp_slot_address_for_scrub(before, slot)),
                 static_cast<unsigned long long>(before.rip),
                 static_cast<unsigned long long>(before.rsp),
                 static_cast<unsigned long long>(before.dr0),
@@ -814,6 +874,10 @@ static bool scrub_target_hardware_breakpoints(HANDLE hf, const char* reason) {
                 static_cast<unsigned long>(clear_gle),
                 after_ok ? 1 : 0,
                 static_cast<unsigned long>(after_gle),
+                after_all_clear ? 1 : 0,
+                after_slot_clear ? 1 : 0,
+                after_ok && hwbp_dr7_has_enabled_slot(after.dr7) ? 1 : 0,
+                static_cast<unsigned long long>(hwbp_slot_address_for_scrub(after, slot)),
                 static_cast<unsigned long long>(after.rip),
                 static_cast<unsigned long long>(after.rsp),
                 static_cast<unsigned long long>(after.dr0),
@@ -825,6 +889,9 @@ static bool scrub_target_hardware_breakpoints(HANDLE hf, const char* reason) {
                 alive ? 1 : 0,
                 static_cast<unsigned>(exit_code));
         }
+        final_context_ok = driver_bridge::get_thread_context(desc.thread_id, final_ctx);
+        final_gle = final_context_ok ? ERROR_SUCCESS : GetLastError();
+        final_all_clear = final_context_ok && hwbp_debug_registers_clear_for_scrub(final_ctx);
     } else {
         log_msg(hf, "dbg_hwclr",
             "FAIL -- scrub skipped because controlled HWBP fixture is unavailable: %s",
@@ -833,13 +900,25 @@ static bool scrub_target_hardware_breakpoints(HANDLE hf, const char* reason) {
 
     Sleep(10);
     log_msg(hf, "dbg_hwclr",
-        "scrub reason=%s pid=%u role=hwbp_fixture target_threads=%d clear_ok=%d clear_fail=%d",
+        "scrub reason=%s pid=%u role=hwbp_fixture target_threads=%d clear_ok=%d clear_fail=%d cleared_proof_ok=%d already_clear_ok=%d proof_fail=%d final_context_ok=%d final_gle=%lu final_all_clear=%d final_dr0=0x%llX final_dr1=0x%llX final_dr2=0x%llX final_dr3=0x%llX final_dr6=0x%llX final_dr7=0x%llX",
         reason ? reason : "unspecified",
         static_cast<unsigned>(pid),
         target_threads,
         clear_ok,
-        clear_fail);
-    return target_threads > 0 && clear_fail == 0;
+        clear_fail,
+        cleared_proof_ok,
+        already_clear_ok,
+        proof_fail,
+        final_context_ok ? 1 : 0,
+        static_cast<unsigned long>(final_gle),
+        final_all_clear ? 1 : 0,
+        static_cast<unsigned long long>(final_ctx.dr0),
+        static_cast<unsigned long long>(final_ctx.dr1),
+        static_cast<unsigned long long>(final_ctx.dr2),
+        static_cast<unsigned long long>(final_ctx.dr3),
+        static_cast<unsigned long long>(final_ctx.dr6),
+        static_cast<unsigned long long>(final_ctx.dr7));
+    return target_threads > 0 && clear_fail == 0 && final_context_ok && final_all_clear;
 }
 
 static bool verify_target_hardware_breakpoints_cleared(HANDLE hf, const char* reason) {
@@ -847,7 +926,7 @@ static bool verify_target_hardware_breakpoints_cleared(HANDLE hf, const char* re
     int target_threads = 0;
     int context_ok = 0;
     int context_fail = 0;
-    int enabled_residual = 0;
+    int uncleared_residual = 0;
     hwbp_fixture_descriptor_t desc{};
     std::string fixture_reason;
 
@@ -864,8 +943,8 @@ static bool verify_target_hardware_breakpoints_cleared(HANDLE hf, const char* re
         ++context_fail;
     } else {
         ++context_ok;
-        if ((ctx.dr7 & 0xFFULL) != 0) {
-            ++enabled_residual;
+        if (!hwbp_debug_registers_clear_for_scrub(ctx)) {
+            ++uncleared_residual;
             log_msg(hf, "dbg_hwclr",
                 "RESIDUAL -- reason=%s role=hwbp_fixture tid=%u dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX",
                 reason ? reason : "unspecified",
@@ -880,14 +959,14 @@ static bool verify_target_hardware_breakpoints_cleared(HANDLE hf, const char* re
     }
 
     log_msg(hf, "dbg_hwclr",
-        "verify reason=%s pid=%u role=hwbp_fixture target_threads=%d context_ok=%d context_fail=%d enabled_residual=%d",
+        "verify reason=%s pid=%u role=hwbp_fixture target_threads=%d context_ok=%d context_fail=%d uncleared_residual=%d",
         reason ? reason : "unspecified",
         static_cast<unsigned>(pid),
         target_threads,
         context_ok,
         context_fail,
-        enabled_residual);
-    return target_threads > 0 && context_ok > 0 && context_fail == 0 && enabled_residual == 0;
+        uncleared_residual);
+    return target_threads > 0 && context_ok > 0 && context_fail == 0 && uncleared_residual == 0;
 }
 
 static uint64_t hwbp_slot_address_from_context(const driver_bridge::thread_context_t& ctx, int slot) {
@@ -1039,7 +1118,7 @@ static void test_add_remove_hw_bp_common(HANDLE hf,
     DWORD clear_ctx_gle = clear_ctx_ok ? ERROR_SUCCESS : GetLastError();
     uint32_t exit_after_remove = 0;
     const bool alive_after_remove = driver_bridge::attached_process_alive(&exit_after_remove);
-    bool clear_direct_verified = clear_ctx_ok && hwbp_slot_valid && (clear_ctx.dr7 & (1ULL << (hw_slot * 2))) == 0;
+    bool clear_direct_verified = clear_ctx_ok && hwbp_slot_valid && hwbp_debug_registers_clear_for_scrub(clear_ctx);
     bool clear_scrub_ok = false;
     bool clear_verify_ok = false;
     bool regs_clear = clear_direct_verified;
@@ -1049,7 +1128,7 @@ static void test_add_remove_hw_bp_common(HANDLE hf,
         clear_ctx = {};
         clear_ctx_ok = selected_tid != 0 && driver_bridge::get_thread_context(selected_tid, clear_ctx);
         clear_ctx_gle = clear_ctx_ok ? ERROR_SUCCESS : GetLastError();
-        clear_direct_verified = clear_ctx_ok && hwbp_slot_valid && (clear_ctx.dr7 & (1ULL << (hw_slot * 2))) == 0;
+        clear_direct_verified = clear_ctx_ok && hwbp_slot_valid && hwbp_debug_registers_clear_for_scrub(clear_ctx);
         regs_clear = clear_scrub_ok && clear_verify_ok && clear_direct_verified;
     }
     uint32_t exit_after_clear = 0;
@@ -2033,20 +2112,27 @@ static void test_last_error(HANDLE hf, std::atomic<int>& passed, std::atomic<int
         (int)driver_bridge::is_loaded(), (unsigned)driver_bridge::attached_pid());
 
     const std::string& err = debugger_engine::last_error();
-    diag::log_tagged_fmt("test_dbg_detail", "dbg_err result: last_error='%s'", err.empty() ? "(empty)" : err.c_str());
+    const bool driver_loaded = driver_bridge::is_loaded();
+    const uint32_t attached_pid = driver_bridge::attached_pid();
+    auto regs = debugger_engine::get_registers();
+    const bool register_evidence = regs.rip != 0 && regs.rsp != 0;
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_err field: last_error='%s' driver_loaded=%d attached_pid=%u rip=0x%llX rsp=0x%llX register_evidence=%d",
+        err.empty() ? "(empty)" : err.c_str(), driver_loaded ? 1 : 0, attached_pid,
+        (unsigned long long)regs.rip, (unsigned long long)regs.rsp, register_evidence ? 1 : 0);
 
     bool has_fatal = (err.find("not attached") != std::string::npos)
                   || (err.find("must be non-zero") != std::string::npos)
                   || (err.find("<read error>") != std::string::npos);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    if (!has_fatal) {
-        log_msg(hf, "dbg_err", "PASS -- last_error=\"%s\" (no fatal engine error pending) (elapsed %lld ms)",
-            err.empty() ? "(empty)" : err.c_str(), (long long)ms);
+    if (!has_fatal && driver_loaded && attached_pid != 0 && register_evidence) {
+        log_msg(hf, "dbg_err", "PASS -- debugger accessor paired with same-run register evidence driver_loaded=1 attached_pid=%u rip=0x%llX rsp=0x%llX last_error_len=%zu (elapsed %lld ms)",
+            attached_pid, (unsigned long long)regs.rip, (unsigned long long)regs.rsp, err.size(), (long long)ms);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "dbg_err", "FAIL -- engine has fatal error pending: last_error=\"%s\" (elapsed %lld ms)",
-            err.c_str(), (long long)ms);
+        log_msg(hf, "dbg_err", "FAIL -- debugger accessor state invalid driver_loaded=%d attached_pid=%u has_fatal=%d register_evidence=%d rip=0x%llX rsp=0x%llX last_error=\"%s\" (elapsed %lld ms)",
+            driver_loaded ? 1 : 0, attached_pid, has_fatal ? 1 : 0, register_evidence ? 1 : 0,
+            (unsigned long long)regs.rip, (unsigned long long)regs.rsp, err.c_str(), (long long)ms);
         failed.fetch_add(1);
     }
 }
@@ -3288,15 +3374,40 @@ static void test_dbg_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int
         case debugger_engine::dbg_status_t::paused: status_str = "paused"; break;
         case debugger_engine::dbg_status_t::stepping: status_str = "stepping"; break;
         case debugger_engine::dbg_status_t::terminated: status_str = "terminated"; valid = false; break;
+        default: status_str = "unknown"; valid = false; break;
     }
-    diag::log_tagged_fmt("test_dbg_detail", "dbg_stat result: status=%s(%d)", status_str, (int)status);
+    const bool driver_loaded = driver_bridge::is_loaded();
+    const uint32_t attached_pid = driver_bridge::attached_pid();
+    auto regs = debugger_engine::get_registers();
+    const bool register_evidence = regs.rip != 0 && regs.rsp != 0;
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_stat result: status=%s(%d) driver_loaded=%d attached_pid=%u rip=0x%llX rsp=0x%llX register_evidence=%d",
+        status_str,
+        (int)status,
+        driver_loaded ? 1 : 0,
+        attached_pid,
+        (unsigned long long)regs.rip,
+        (unsigned long long)regs.rsp,
+        register_evidence ? 1 : 0);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    if (valid) {
-        log_msg(hf, "dbg_stat", "PASS -- debugger status=%s (elapsed %lld ms)", status_str, (long long)ms);
+    if (valid && driver_loaded && attached_pid != 0 && register_evidence) {
+        log_msg(hf, "dbg_stat", "PASS -- debugger status paired with live register evidence status=%s attached_pid=%u rip=0x%llX rsp=0x%llX (elapsed %lld ms)",
+            status_str,
+            attached_pid,
+            (unsigned long long)regs.rip,
+            (unsigned long long)regs.rsp,
+            (long long)ms);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "dbg_stat", "FAIL -- debugger status=terminated; the attached target is dead (elapsed %lld ms)", (long long)ms);
+        log_msg(hf, "dbg_stat", "FAIL -- debugger status lacks live evidence status=%s valid=%d driver_loaded=%d attached_pid=%u rip=0x%llX rsp=0x%llX register_evidence=%d (elapsed %lld ms)",
+            status_str,
+            valid ? 1 : 0,
+            driver_loaded ? 1 : 0,
+            attached_pid,
+            (unsigned long long)regs.rip,
+            (unsigned long long)regs.rsp,
+            register_evidence ? 1 : 0,
+            (long long)ms);
         failed.fetch_add(1);
     }
 }
@@ -3718,8 +3829,8 @@ void phase_debugger_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>&
     for (int i = 0; i < total; ++i) {
         if (cancelled && cancelled()) {
             int remaining = total - i;
-            skipped.fetch_add(remaining);
-            log_msg(hf, "debugger", "cancelled -- skipping %d remaining tests", remaining);
+            failed.fetch_add(remaining);
+            log_msg(hf, "debugger", "FAIL -- cancelled before %d remaining tests could produce evidence", remaining);
             break;
         }
 

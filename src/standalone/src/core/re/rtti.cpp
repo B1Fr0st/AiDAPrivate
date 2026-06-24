@@ -108,6 +108,7 @@ struct rtti_scan_context_t
     std::size_t type_descriptor_count = 0;
     std::size_t complete_object_locator_count = 0;
     std::size_t vtable_count = 0;
+    std::uint64_t bytes_scanned = 0;
     std::vector<json> scanned_modules;
 
     bool stop(const char* stage)
@@ -117,6 +118,13 @@ struct rtti_scan_context_t
         if (mcp_standalone::current_call_cancelled())
         {
             cancelled = true;
+            stop_stage = stage ? stage : "";
+            return true;
+        }
+        const std::uint64_t call_deadline = mcp_standalone::current_call_deadline_ms();
+        if (call_deadline != 0 && GetTickCount64() >= call_deadline)
+        {
+            deadline_hit = true;
             stop_stage = stage ? stage : "";
             return true;
         }
@@ -151,11 +159,13 @@ struct scan_result_t
     std::size_t type_descriptor_count = 0;
     std::size_t complete_object_locator_count = 0;
     std::size_t vtable_count = 0;
+    std::uint64_t bytes_scanned = 0;
     std::size_t unfiltered_type_count = 0;
     std::vector<json> scanned_modules;
     std::string filter;
     std::string module_filter;
     std::string scan_mode;
+    json exact_selector_flags = json::object();
     std::vector<std::string> sample_type_names;
     std::vector<type_resolution_record_t> type_index;
     json error_details = json::object();
@@ -1019,6 +1029,7 @@ std::vector<type_info_t> scan_module(rtti_scan_context_t& ctx,
     module_diag["candidate_section_count"] = sections.size();
     std::map<std::uint64_t, type_info_t> by_td;
     std::map<std::uint64_t, std::vector<std::uint8_t>> section_bytes;
+    std::uint64_t module_bytes_scanned = 0;
     auto bytes_for_section = [&](const module_section_t& section) -> const std::vector<std::uint8_t>* {
         if (ctx.stop("rtti_section_read"))
             return nullptr;
@@ -1030,6 +1041,8 @@ std::vector<type_info_t> scan_module(rtti_scan_context_t& ctx,
         std::vector<std::uint8_t> bytes;
         if (!read_bytes(ctx.pid, section.va, static_cast<std::size_t>(section.size), bytes))
             return nullptr;
+        ctx.bytes_scanned += bytes.size();
+        module_bytes_scanned += bytes.size();
         auto inserted = section_bytes.emplace(section.va, std::move(bytes));
         return &inserted.first->second;
     };
@@ -1226,6 +1239,7 @@ std::vector<type_info_t> scan_module(rtti_scan_context_t& ctx,
     module_diag["type_descriptor_count"] = by_td.size();
     module_diag["complete_object_locator_count"] = module_col_count;
     module_diag["vtable_count"] = module_vtable_count;
+    module_diag["bytes_scanned"] = module_bytes_scanned;
     module_diag["deadline_hit"] = ctx.deadline_hit;
     module_diag["cancelled"] = ctx.cancelled;
     module_diag["stop_stage"] = ctx.stop_stage;
@@ -1422,17 +1436,26 @@ scan_result_t scan_types(const json& params)
     std::string address_error;
     if (!parse_address_selector(params, "module_base_va", "module_base", module_base, module_base_provided, module_base_key, module_base_value, address_error))
         return fail_scan(address_error, json{{"selector_key", module_base_key}, {"selector_value", module_base_value}});
+    if (!module_base_provided && !parse_address_selector(params, "rtti_module_base_va", nullptr, module_base, module_base_provided, module_base_key, module_base_value, address_error))
+        return fail_scan(address_error, json{{"selector_key", module_base_key}, {"selector_value", module_base_value}});
     if (!parse_address_selector(params, "type_descriptor_va", "type_va", exact_type_descriptor_va, exact_type_descriptor_provided, exact_type_descriptor_key, exact_type_descriptor_value, address_error))
+        return fail_scan(address_error, json{{"selector_key", exact_type_descriptor_key}, {"selector_value", exact_type_descriptor_value}});
+    if (!exact_type_descriptor_provided && !parse_address_selector(params, "rtti_type_descriptor_va", nullptr, exact_type_descriptor_va, exact_type_descriptor_provided, exact_type_descriptor_key, exact_type_descriptor_value, address_error))
         return fail_scan(address_error, json{{"selector_key", exact_type_descriptor_key}, {"selector_value", exact_type_descriptor_value}});
     if (!parse_address_selector(params, "complete_object_locator_va", "col_va", exact_col_va, exact_col_provided, exact_col_key, exact_col_value, address_error))
         return fail_scan(address_error, json{{"selector_key", exact_col_key}, {"selector_value", exact_col_value}});
+    if (!exact_col_provided && !parse_address_selector(params, "rtti_complete_object_locator_va", nullptr, exact_col_va, exact_col_provided, exact_col_key, exact_col_value, address_error))
+        return fail_scan(address_error, json{{"selector_key", exact_col_key}, {"selector_value", exact_col_value}});
     if (!parse_address_selector(params, "vtable_va", nullptr, vtable_hint_va, vtable_hint_provided, vtable_hint_key, vtable_hint_value, address_error))
+        return fail_scan(address_error, json{{"selector_key", vtable_hint_key}, {"selector_value", vtable_hint_value}});
+    if (!vtable_hint_provided && !parse_address_selector(params, "rtti_vtable_va", nullptr, vtable_hint_va, vtable_hint_provided, vtable_hint_key, vtable_hint_value, address_error))
         return fail_scan(address_error, json{{"selector_key", vtable_hint_key}, {"selector_value", vtable_hint_value}});
     if (!parse_address_selector(params, "hint_va", nullptr, hint_va, hint_provided, hint_key, hint_value, address_error))
         return fail_scan(address_error, json{{"selector_key", hint_key}, {"selector_value", hint_value}});
     const bool has_exact_type_descriptor = exact_type_descriptor_provided;
     const bool has_exact_col = exact_col_provided;
     const bool has_vtable_hint = vtable_hint_provided && vtable_hint_va != 0;
+    const bool exact_selector_fast_path = has_vtable_hint && !has_exact_type_descriptor && !has_exact_col && !deep_scan && filter_text.empty();
     std::vector<driver_bridge::module_info_t> available_modules;
     bool available_modules_loaded = false;
     auto load_available_modules = [&]() -> const std::vector<driver_bridge::module_info_t>& {
@@ -1648,6 +1671,8 @@ scan_result_t scan_types(const json& params)
             return fail_module_selector("RTTI vtable_va selector did not resolve a loaded module.", "vtable_hint", vtable_hint_key, vtable_hint_value);
         }
     }
+    if (!exact_selector_fast_path || all_by_td.empty())
+    {
     for (const auto& module : modules)
     {
         if (ctx.stop("rtti_module_loop"))
@@ -1669,6 +1694,7 @@ scan_result_t scan_types(const json& params)
             merge_found(type);
         if (all_by_td.size() >= max_unfiltered)
             break;
+    }
     }
     std::vector<type_info_t> unfiltered;
     unfiltered.reserve(all_by_td.size());
@@ -1713,10 +1739,47 @@ scan_result_t scan_types(const json& params)
     result.type_descriptor_count = ctx.type_descriptor_count;
     result.complete_object_locator_count = ctx.complete_object_locator_count;
     result.vtable_count = ctx.vtable_count;
+    result.bytes_scanned = ctx.bytes_scanned;
     result.scanned_modules = std::move(ctx.scanned_modules);
     result.filter = filter_text;
     result.module_filter = module_filter;
     result.scan_mode = scan_mode;
+    bool exact_type_descriptor_hit = false;
+    bool exact_col_hit = false;
+    bool vtable_hint_hit = false;
+    for (const auto& type : result.types)
+    {
+        if (has_exact_type_descriptor && type.type_descriptor_va == exact_type_descriptor_va)
+            exact_type_descriptor_hit = true;
+        if (has_exact_col && type_has_col(type, exact_col_va))
+            exact_col_hit = true;
+        if (has_vtable_hint)
+        {
+            if (type.vtable_va == vtable_hint_va)
+                vtable_hint_hit = true;
+            for (const auto& vt : type.vtables)
+                if (vt.vtable_va == vtable_hint_va)
+                    vtable_hint_hit = true;
+        }
+    }
+    result.exact_selector_flags = {
+        {"module_base_provided", module_base_provided},
+        {"module_base_key", module_base_key},
+        {"module_base_va", module_base_provided ? json(sa_format_address(module_base)) : json(nullptr)},
+        {"type_descriptor_provided", has_exact_type_descriptor},
+        {"type_descriptor_key", exact_type_descriptor_key},
+        {"type_descriptor_va", has_exact_type_descriptor ? json(sa_format_address(exact_type_descriptor_va)) : json(nullptr)},
+        {"type_descriptor_hit", has_exact_type_descriptor ? exact_type_descriptor_hit : false},
+        {"complete_object_locator_provided", has_exact_col},
+        {"complete_object_locator_key", exact_col_key},
+        {"complete_object_locator_va", has_exact_col ? json(sa_format_address(exact_col_va)) : json(nullptr)},
+        {"complete_object_locator_hit", has_exact_col ? exact_col_hit : false},
+        {"vtable_hint_provided", has_vtable_hint},
+        {"vtable_hint_key", vtable_hint_key},
+        {"vtable_va", has_vtable_hint ? json(sa_format_address(vtable_hint_va)) : json(nullptr)},
+        {"vtable_hint_hit", has_vtable_hint ? vtable_hint_hit : false},
+        {"exact_selector_fast_path", exact_selector_fast_path}
+    };
     if ((has_exact_type_descriptor || has_exact_col) && result.types.empty())
     {
         result.ok = false;
@@ -1825,9 +1888,11 @@ void add_scan_diagnostics(json& out, const scan_result_t& scan, bool include_dia
     out["type_descriptor_count"] = scan.type_descriptor_count;
     out["complete_object_locator_count"] = scan.complete_object_locator_count;
     out["vtable_count"] = scan.vtable_count;
+    out["bytes_scanned"] = scan.bytes_scanned;
     out["filter"] = scan.filter;
     out["module_filter"] = scan.module_filter;
     out["scan_mode"] = scan.scan_mode;
+    out["exact_selector_flags"] = scan.exact_selector_flags;
     out["unfiltered_type_count"] = scan.unfiltered_type_count;
     out["sample_type_names"] = scan.sample_type_names;
     out["scanned_modules"] = include_diagnostics ? json(scan.scanned_modules) : json::array();
@@ -2048,10 +2113,18 @@ tool_result_t scan(const json& params)
 tool_result_t find_type(const json& params)
 {
     const std::string pattern = string_param(params, "pattern");
-    if (pattern.empty())
+    const bool exact_selector_present =
+        params.contains("vtable_va") ||
+        params.contains("rtti_vtable_va") ||
+        params.contains("type_descriptor_va") ||
+        params.contains("rtti_type_descriptor_va") ||
+        params.contains("complete_object_locator_va") ||
+        params.contains("rtti_complete_object_locator_va");
+    if (pattern.empty() && !exact_selector_present)
         return tool_result_t::error("'pattern' is required.");
     json scan_params = params;
-    scan_params["filter"] = pattern;
+    if (!pattern.empty())
+        scan_params["filter"] = pattern;
     auto scan = scan_types(scan_params);
     const bool include_diagnostics = bool_param(params, "include_diagnostics", true);
     if (!scan.ok)
@@ -2085,7 +2158,14 @@ tool_result_t list_hierarchy(const json& params)
     if (!scope.ok())
         return tool_result_t::error(scope.error());
     const std::string query = string_param(params, "type_name_or_va");
-    if (query.empty())
+    const bool exact_selector_present =
+        params.contains("vtable_va") ||
+        params.contains("rtti_vtable_va") ||
+        params.contains("type_descriptor_va") ||
+        params.contains("rtti_type_descriptor_va") ||
+        params.contains("complete_object_locator_va") ||
+        params.contains("rtti_complete_object_locator_va");
+    if (query.empty() && !exact_selector_present)
         return tool_result_t::error("'type_name_or_va' is required.");
     const bool include_diagnostics = bool_param(params, "include_diagnostics", true);
     std::uint64_t va = 0;
@@ -2094,7 +2174,10 @@ tool_result_t list_hierarchy(const json& params)
     if (parsed_va)
         va = *parsed_va;
     std::uint64_t vtable_hint = 0;
-    if (parse_address_param(params, "vtable_va", vtable_hint) && vtable_hint != 0)
+    const bool has_vtable_hint =
+        (parse_address_param(params, "vtable_va", vtable_hint) ||
+         parse_address_param(params, "rtti_vtable_va", vtable_hint)) && vtable_hint != 0;
+    if (has_vtable_hint)
     {
         if (auto module = find_module_for_address(scope.pid(), vtable_hint))
         {
@@ -2102,9 +2185,9 @@ tool_result_t list_hierarchy(const json& params)
             if (type_from_vtable(scope.pid(), *module, vtable_hint, hinted))
             {
                 const std::string query_lower = lower_ascii(query);
-                const bool match = query_is_va ? (hinted.vtable_va == va || hinted.type_descriptor_va == va) :
+                const bool match = query.empty() ? true : (query_is_va ? (hinted.vtable_va == va || hinted.type_descriptor_va == va) :
                     (lower_ascii(hinted.name).find(query_lower) != std::string::npos ||
-                     lower_ascii(hinted.decorated_name).find(query_lower) != std::string::npos);
+                     lower_ascii(hinted.decorated_name).find(query_lower) != std::string::npos));
                 diag::log_tagged_fmt("rtti",
                                      "list_hierarchy vtable_hint pid=%u query=%s match=%d type=%s bases=%zu elapsed_ms=%llu",
                                      scope.pid(),
@@ -2172,9 +2255,9 @@ tool_result_t list_hierarchy(const json& params)
                          static_cast<unsigned long long>(GetTickCount64() - started_ms));
     for (const auto& type : types)
     {
-        const bool match = query_is_va ? (type.vtable_va == va || type.type_descriptor_va == va) :
+        const bool match = query.empty() ? true : (query_is_va ? (type.vtable_va == va || type.type_descriptor_va == va) :
             (lower_ascii(type.name).find(lower_ascii(query)) != std::string::npos ||
-             lower_ascii(type.decorated_name).find(lower_ascii(query)) != std::string::npos);
+             lower_ascii(type.decorated_name).find(lower_ascii(query)) != std::string::npos));
         if (!match)
             continue;
         const std::size_t max_vtables_per_type = static_cast<std::size_t>(numeric_param(params, "max_vtables_per_type", 64, 1, 512));
@@ -2208,8 +2291,38 @@ tool_result_t find_constructor(const json& params)
     if (!scope.ok())
         return tool_result_t::error(scope.error());
     std::uint64_t vtable_va = 0;
-    if (!parse_address_param(params, "vtable_va", vtable_va) || vtable_va == 0)
+    if ((!parse_address_param(params, "vtable_va", vtable_va) && !parse_address_param(params, "rtti_vtable_va", vtable_va)) || vtable_va == 0)
         return tool_result_t::error("'vtable_va' is required.");
+    std::uint64_t constructor_fn_va = 0;
+    const bool constructor_selector_provided =
+        parse_address_param(params, "constructor_fn_va", constructor_fn_va) ||
+        parse_address_param(params, "rtti_constructor_fn_va", constructor_fn_va);
+    std::uint64_t scan_start_va = 0;
+    std::uint64_t scan_size = 0;
+    std::uint64_t scan_end_va = 0;
+    const bool scan_start_provided =
+        parse_address_param(params, "scan_start_va", scan_start_va) ||
+        parse_address_param(params, "scan_base", scan_start_va) ||
+        parse_address_param(params, "range_base", scan_start_va);
+    if (scan_start_provided)
+    {
+        if (!parse_address_param(params, "scan_size", scan_size) &&
+            !parse_address_param(params, "range_size", scan_size) &&
+            !parse_address_param(params, "size", scan_size))
+        {
+            if (parse_address_param(params, "scan_end_va", scan_end_va) ||
+                parse_address_param(params, "range_end_va", scan_end_va) ||
+                parse_address_param(params, "end_va", scan_end_va))
+                scan_size = scan_end_va > scan_start_va ? scan_end_va - scan_start_va : 0;
+        }
+    }
+    if (scan_start_va != 0 && scan_size != 0 && scan_start_va > std::numeric_limits<std::uint64_t>::max() - scan_size)
+    {
+        return tool_result_t::error("Bounded constructor scan range overflows.",
+            json{{"scan_start_va", sa_format_address(scan_start_va)}, {"scan_size", scan_size}});
+    }
+    const bool bounded_scan = scan_start_va != 0 && scan_size != 0;
+    const std::uint64_t scan_end_checked = bounded_scan ? scan_start_va + scan_size : 0;
     const std::size_t max_scan_bytes = static_cast<std::size_t>(numeric_param(params, "max_scan_bytes", 64ull * 1024ull * 1024ull, 4096, 64ull * 1024ull * 1024ull));
     const std::uint64_t timeout_ms = numeric_param(params, "timeout_ms", 5500, 500, 60000);
     const std::size_t max_candidates = static_cast<std::size_t>(numeric_param(params, "max_candidates", 64, 1, 512));
@@ -2237,6 +2350,8 @@ tool_result_t find_constructor(const json& params)
     std::size_t total_reference_hits = 0;
     std::size_t total_windows = 0;
     std::size_t total_decoded = 0;
+    std::size_t sections_scanned = 0;
+    std::uint64_t bytes_scanned = 0;
     auto timed_out = [&]() -> bool {
         if (cancelled || deadline_hit)
             return true;
@@ -2245,11 +2360,76 @@ tool_result_t find_constructor(const json& params)
             cancelled = true;
             return true;
         }
+        const std::uint64_t call_deadline = mcp_standalone::current_call_deadline_ms();
+        if (call_deadline != 0 && GetTickCount64() >= call_deadline)
+        {
+            deadline_hit = true;
+            return true;
+        }
         if (GetTickCount64() - started_ms < timeout_ms)
             return false;
         deadline_hit = true;
         return true;
     };
+    auto build_constructor_result = [&](const char* phase) {
+        json result;
+        result["process_id"] = scope.pid();
+        result["vtable_va"] = sa_format_address(vtable_va);
+        result["module_name"] = !module->name.empty() ? module->name : module->path;
+        result["module_base_va"] = sa_format_address(module->base);
+        result["timeout_ms"] = timeout_ms;
+        result["max_candidates"] = max_candidates;
+        result["deadline_hit"] = deadline_hit;
+        result["cancelled"] = cancelled;
+        result["partial"] = deadline_hit || cancelled;
+        result["phase"] = phase ? phase : "";
+        result["reference_hits"] = total_reference_hits;
+        result["decode_windows"] = total_windows;
+        result["decoded_instructions"] = total_decoded;
+        result["sections_scanned"] = sections_scanned;
+        result["bytes_scanned"] = bytes_scanned;
+        result["bounded_scan"] = bounded_scan;
+        result["scan_range"] = bounded_scan ?
+            json{{"base_va", sa_format_address(scan_start_va)}, {"size", scan_size}, {"end_va", sa_format_address(scan_end_checked)}} :
+            json{{"base_va", nullptr}, {"size", 0}, {"end_va", nullptr}};
+        result["exact_selector_flags"] = {
+            {"vtable_provided", true},
+            {"vtable_va", sa_format_address(vtable_va)},
+            {"constructor_fn_provided", constructor_selector_provided},
+            {"constructor_fn_va", constructor_selector_provided ? json(sa_format_address(constructor_fn_va)) : json(nullptr)},
+            {"constructor_fn_hit", constructor_selector_provided && !candidates.empty()}
+        };
+        if (has_hinted_type)
+            result["type"] = type_to_json(hinted_type);
+        result["candidates"] = candidates;
+        result["count"] = result["candidates"].size();
+        return result;
+    };
+    if (constructor_selector_provided)
+    {
+        const std::uint64_t module_end = module->base + static_cast<std::uint64_t>(module->size);
+        if (constructor_fn_va < module->base || constructor_fn_va >= module_end)
+        {
+            json details = build_constructor_result("exact_constructor_selector");
+            details["validation_code"] = "constructor_selector_outside_vtable_module";
+            details["constructor_module_match"] = false;
+            return tool_result_t::error("constructor_fn_va does not belong to the vtable module.", details);
+        }
+        if (seen.insert(constructor_fn_va).second)
+        {
+            json row;
+            row["constructor_candidate_va"] = sa_format_address(constructor_fn_va);
+            row["write_va"] = nullptr;
+            row["object_offset"] = nullptr;
+            row["confidence"] = "exact";
+            row["phase"] = "exact_constructor_selector";
+            row["selector_direct"] = true;
+            row["module_match"] = true;
+            row["preview"] = disasm_preview(scope.pid(), constructor_fn_va, 12);
+            candidates.push_back(std::move(row));
+        }
+        return tool_result_t::ok(build_constructor_result("exact_constructor_selector"));
+    }
     auto append_candidate = [&](const AsmInstr& ins,
                                 std::uint64_t fn_start,
                                 const char* confidence,
@@ -2317,24 +2497,44 @@ tool_result_t find_constructor(const json& params)
     {
         if ((section.characteristics & IMAGE_SCN_MEM_EXECUTE) == 0 || section.size == 0 || section.size > 64ull * 1024ull * 1024ull)
             continue;
+        std::uint64_t read_base = section.va;
+        std::uint64_t read_size64 = std::min<std::uint64_t>(section.size, max_scan_bytes);
+        if (bounded_scan)
+        {
+            if (section.va > std::numeric_limits<std::uint64_t>::max() - section.size)
+                continue;
+            const std::uint64_t section_end = section.va + section.size;
+            const std::uint64_t requested_end = scan_end_checked;
+            const std::uint64_t overlap_begin = std::max<std::uint64_t>(section.va, scan_start_va);
+            const std::uint64_t overlap_end = std::min<std::uint64_t>(section_end, requested_end);
+            if (overlap_begin >= overlap_end)
+                continue;
+            read_base = overlap_begin;
+            read_size64 = std::min<std::uint64_t>(overlap_end - overlap_begin, max_scan_bytes);
+        }
         if (timed_out())
             break;
         const std::uint64_t section_started_ms = GetTickCount64();
         const std::size_t candidates_before = candidates.size();
         std::size_t decoded_count = 0;
-        const std::size_t read_size = static_cast<std::size_t>(std::min<std::uint64_t>(section.size, max_scan_bytes));
+        const std::size_t read_size = static_cast<std::size_t>(read_size64);
         std::vector<std::uint8_t> bytes;
-        if (!read_bytes(scope.pid(), section.va, read_size, bytes) || bytes.empty())
+        if (!read_bytes(scope.pid(), read_base, read_size, bytes) || bytes.empty())
         {
             diag::log_tagged_fmt("rtti",
                                  "find_constructor section_read_failed pid=%u section=%s va=%s read_size=%zu elapsed_ms=%llu",
                                  scope.pid(),
                                  section.name.c_str(),
-                                 sa_format_address(section.va).c_str(),
+                                 sa_format_address(read_base).c_str(),
                                  read_size,
                                  static_cast<unsigned long long>(GetTickCount64() - section_started_ms));
             continue;
         }
+        ++sections_scanned;
+        bytes_scanned += bytes.size();
+        module_section_t scan_section = section;
+        scan_section.va = read_base;
+        scan_section.size = bytes.size();
         std::vector<std::size_t> references;
         auto needle = u64_to_le(vtable_va);
         if (layout.pointer_size == 4 && needle.size() > 4)
@@ -2347,7 +2547,7 @@ tool_result_t find_constructor(const json& params)
             {
                 std::int32_t disp = 0;
                 std::memcpy(&disp, bytes.data() + i + 3, sizeof(disp));
-                const std::uint64_t target = static_cast<std::uint64_t>(static_cast<std::int64_t>(section.va + i + 7) + disp);
+                const std::uint64_t target = static_cast<std::uint64_t>(static_cast<std::int64_t>(scan_section.va + i + 7) + disp);
                 if (target == vtable_va)
                     references.push_back(i);
             }
@@ -2355,7 +2555,7 @@ tool_result_t find_constructor(const json& params)
             {
                 std::int32_t disp = 0;
                 std::memcpy(&disp, bytes.data() + i + 2, sizeof(disp));
-                const std::uint64_t target = static_cast<std::uint64_t>(static_cast<std::int64_t>(section.va + i + 6) + disp);
+                const std::uint64_t target = static_cast<std::uint64_t>(static_cast<std::int64_t>(scan_section.va + i + 6) + disp);
                 if (target == vtable_va)
                     references.push_back(i);
             }
@@ -2386,7 +2586,7 @@ tool_result_t find_constructor(const json& params)
                              "find_constructor section_prefilter pid=%u section=%s va=%s bytes=%zu refs=%zu windows=%zu elapsed_ms=%llu total_elapsed_ms=%llu",
                              scope.pid(),
                              section.name.c_str(),
-                             sa_format_address(section.va).c_str(),
+                             sa_format_address(scan_section.va).c_str(),
                              bytes.size(),
                              references.size(),
                              windows.size(),
@@ -2401,7 +2601,7 @@ tool_result_t find_constructor(const json& params)
             {
                 if (timed_out())
                     break;
-                decoded_count += decode_range(section, bytes, window.first + shift, window.second, references.empty() ? "bounded_fallback_window" : "vtable_reference_window");
+                decoded_count += decode_range(scan_section, bytes, window.first + shift, window.second, references.empty() ? "bounded_fallback_window" : "vtable_reference_window");
             }
         }
         total_decoded += decoded_count;
@@ -2409,7 +2609,7 @@ tool_result_t find_constructor(const json& params)
                              "find_constructor section_done pid=%u section=%s va=%s bytes=%zu decoded=%zu refs=%zu windows=%zu new_candidates=%zu total_candidates=%zu deadline=%d elapsed_ms=%llu total_elapsed_ms=%llu",
                              scope.pid(),
                              section.name.c_str(),
-                             sa_format_address(section.va).c_str(),
+                             sa_format_address(scan_section.va).c_str(),
                              bytes.size(),
                              decoded_count,
                              references.size(),
@@ -2422,20 +2622,7 @@ tool_result_t find_constructor(const json& params)
         if (candidates.size() >= max_candidates || deadline_hit || cancelled)
             break;
     }
-    json result;
-    result["process_id"] = scope.pid();
-    result["vtable_va"] = sa_format_address(vtable_va);
-    result["module_name"] = !module->name.empty() ? module->name : module->path;
-    result["timeout_ms"] = timeout_ms;
-    result["max_candidates"] = max_candidates;
-    result["deadline_hit"] = deadline_hit;
-    result["cancelled"] = cancelled;
-    result["reference_hits"] = total_reference_hits;
-    result["decode_windows"] = total_windows;
-    result["decoded_instructions"] = total_decoded;
-    if (has_hinted_type)
-        result["type"] = type_to_json(hinted_type);
-    result["candidates"] = std::move(candidates);
+    json result = build_constructor_result("complete");
     const std::size_t candidate_count = result["candidates"].size();
     result["count"] = candidate_count;
     diag::log_tagged_fmt("rtti",

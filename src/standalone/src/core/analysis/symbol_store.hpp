@@ -558,7 +558,7 @@ inline bool suppress_full_test_pdb_load(const char* source,
                                         const char* reason,
                                         bool update_module_state = true)
 {
-	if (!test_all_features::is_running()) return false;
+	if (!test_all_features::is_unattended_full_test_active()) return false;
 	const uint64_t generation = next_load_generation();
 	bool module_present = false;
 	bool already_loaded = false;
@@ -627,7 +627,7 @@ inline bool suppress_full_test_pdb_load(const char* source,
 
 inline void load_pdb_for_module(const std::string& module_name, uint64_t base, uint64_t size)
 {
-	if (test_all_features::is_running()) {
+	if (test_all_features::is_unattended_full_test_active()) {
 		const std::string pdb_name = fallback_pdb_name_for_module(module_name);
 		const std::string local_candidate = safe_find_local_pdb_for_suppression(module_name, "load_pdb_for_module");
 		suppress_full_test_pdb_load("load_pdb_for_module", module_name, base, size,
@@ -792,7 +792,7 @@ inline void load_pdb_with_hint(const std::string& module_name, uint64_t base, ui
                                const std::string& pdb_name, const std::string& pdb_guid,
                                uint32_t pdb_age, const std::string& symbol_server_base)
 {
-	if (test_all_features::is_running()) {
+	if (test_all_features::is_unattended_full_test_active()) {
 		std::string cache_path;
 		try {
 			cache_path = expected_cache_path_for_hint(pdb_name, pdb_guid, pdb_age);
@@ -1580,7 +1580,7 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 
 inline void auto_load_attached_modules()
 {
-	if (test_all_features::is_running()) {
+	if (test_all_features::is_unattended_full_test_active()) {
 		suppress_full_test_pdb_load("auto_load_attached_modules", "<attached_modules>",
 			0, 0, "<auto>", {}, 0, {}, {}, {},
 			"full_test_declined_attached_module_auto_load", false);

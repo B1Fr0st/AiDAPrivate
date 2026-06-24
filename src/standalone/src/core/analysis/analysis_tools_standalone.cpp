@@ -21,6 +21,7 @@
 #include "xref_db.hpp"
 #include "binary_map.hpp"
 #include "standalone_driver.hpp"
+#include "../debugger/page_guard_engine.hpp"
 #include "../disasm/function_index.hpp"
 #include "../helpers/globals.h"
 #include "../../helpers/diag_log.hpp"
@@ -90,6 +91,88 @@ static std::string lower_ascii(std::string value)
 		return static_cast<char>(std::tolower(c));
 	});
 	return value;
+}
+
+static std::string analysis_hex_u64(uint64_t value)
+{
+	char buf[32] = {};
+	_snprintf_s(buf, sizeof(buf), _TRUNCATE, "0x%llX", static_cast<unsigned long long>(value));
+	return std::string(buf);
+}
+
+static json page_guard_install_failure_json()
+{
+	const auto f = page_guard_engine::g_pg_engine.last_install_failure();
+	json result;
+	result["reason"] = f.reason;
+	result["detail"] = f.detail;
+	result["driver_status"] = f.driver_status;
+	result["driver_last_error"] = f.driver_last_error;
+	result["remote_call_driver_status"] = f.remote_call_driver_status;
+	result["remote_call_driver_last_error"] = f.remote_call_driver_last_error;
+	result["pid"] = f.pid;
+	result["active_pid"] = f.active_pid;
+	result["win32_error"] = f.win32_error;
+	result["requested_addr"] = analysis_hex_u64(f.requested_addr);
+	result["requested_size"] = f.requested_size;
+	result["guard_addr"] = analysis_hex_u64(f.guard_addr);
+	result["guard_size"] = f.guard_size;
+	result["region_base"] = analysis_hex_u64(f.region_base);
+	result["region_size"] = f.region_size;
+	result["region_state"] = f.region_state;
+	result["region_protect"] = f.region_protect;
+	result["region_type"] = f.region_type;
+	result["attempted_protect"] = f.attempted_protect;
+	result["original_protect"] = f.original_protect;
+	result["proposed_protect"] = f.proposed_protect;
+	result["ring_addr"] = analysis_hex_u64(f.ring_addr);
+	result["shellcode_addr"] = analysis_hex_u64(f.shellcode_addr);
+	result["context_addr"] = analysis_hex_u64(f.context_addr);
+	result["ntdll_base"] = analysis_hex_u64(f.ntdll_base);
+	result["ntdll_size"] = f.ntdll_size;
+	result["rtl_add_veh"] = analysis_hex_u64(f.rtl_add_veh);
+	result["rtl_remove_veh"] = analysis_hex_u64(f.rtl_remove_veh);
+	result["veh_result"] = analysis_hex_u64(f.veh_result);
+	result["cleanup_shellcode_ok"] = f.cleanup_shellcode_ok != 0;
+	result["cleanup_ring_ok"] = f.cleanup_ring_ok != 0;
+	result["install_elapsed_ms"] = f.install_elapsed_ms;
+	result["install_generation"] = f.install_generation;
+	result["current_generation"] = f.current_generation;
+	result["mitigation_open_ok"] = f.mitigation_open_ok != 0;
+	result["mitigation_open_error"] = f.mitigation_open_error;
+	result["mitigation_dynamic_ok"] = f.mitigation_dynamic_ok != 0;
+	result["mitigation_dynamic_error"] = f.mitigation_dynamic_error;
+	result["mitigation_dynamic_flags"] = f.mitigation_dynamic_flags;
+	result["mitigation_cfg_ok"] = f.mitigation_cfg_ok != 0;
+	result["mitigation_cfg_error"] = f.mitigation_cfg_error;
+	result["mitigation_cfg_flags"] = f.mitigation_cfg_flags;
+	result["remote_call"] = json{
+		{"id", f.remote_call_id},
+		{"function", analysis_hex_u64(f.remote_call_function)},
+		{"result", analysis_hex_u64(f.remote_call_result)},
+		{"gle", f.remote_call_gle},
+		{"active_pid_entry", f.remote_call_active_pid_entry},
+		{"active_pid_after", f.remote_call_active_pid_after},
+		{"timeout_ms", f.remote_call_timeout_ms},
+		{"deadline_ms", f.remote_call_deadline_ms},
+		{"deadline_remaining_ms", f.remote_call_deadline_remaining_ms},
+		{"elapsed_ms", f.remote_call_elapsed_ms},
+		{"completed", f.remote_call_completed != 0},
+		{"ok", f.remote_call_ok != 0},
+		{"cancelled_before", f.remote_call_cancelled_before != 0},
+		{"cancelled_after", f.remote_call_cancelled_after != 0},
+		{"deadline_expired_before", f.remote_call_deadline_expired_before != 0},
+		{"deadline_expired_after", f.remote_call_deadline_expired_after != 0},
+		{"stale_pid", f.remote_call_stale_pid != 0},
+		{"late_completion", f.remote_call_late_completion != 0}
+	};
+	result["remote_call_id"] = f.remote_call_id;
+	result["remote_call_gle"] = f.remote_call_gle;
+	result["remote_call_stale_pid"] = f.remote_call_stale_pid != 0;
+	result["remote_call_deadline_expired_after"] = f.remote_call_deadline_expired_after != 0;
+	result["remote_call_cancelled_after"] = f.remote_call_cancelled_after != 0;
+	result["remote_call_late_completion"] = f.remote_call_late_completion != 0;
+	return result;
 }
 
 static const driver_bridge::module_info_t* select_module_by_name(const std::vector<driver_bridge::module_info_t>& modules, const std::string& requested)
@@ -1814,6 +1897,7 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 				result["cleanup_elapsed_ms"] = idle_state.elapsed_ms;
 				result["status_text"] = idle_state.status_text;
 				result["last_error"] = driver_bridge::last_error();
+				result["page_guard_failure"] = page_guard_install_failure_json();
 				return result;
 			};
 
@@ -1844,8 +1928,9 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 					auto result = make_failure_payload(idle_state.idle ? "page_guard_install_timeout" : "page_guard_install_timeout_cleanup_exceeded", generation, idle_state);
 					const std::string status = result.value("status", std::string());
 					const long long elapsed_ms = result.value("elapsed_ms", 0LL);
+					const json& failure = result["page_guard_failure"];
 					diag::log_tagged_fmt("integrity_hunter",
-						"mcp_hunt_install_timeout_idle gen=%llu idle=%d pid=%u active_pid=%u install_complete=%d install_success=%d nodes=%zu events=%zu reads=%llu elapsed_ms=%lld cleanup_elapsed_ms=%lld status=%s last_error=%s",
+						"mcp_hunt_install_timeout_idle gen=%llu idle=%d pid=%u active_pid=%u install_complete=%d install_success=%d nodes=%zu events=%zu reads=%llu elapsed_ms=%lld cleanup_elapsed_ms=%lld status=%s pg_reason=%s remote_call_id=%llu remote_gle=%lu stale_pid=%d deadline_expired=%d cancelled=%d late_completion=%d last_error=%s",
 						static_cast<unsigned long long>(generation),
 						idle_state.idle ? 1 : 0,
 						idle_state.target_pid,
@@ -1858,6 +1943,13 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 						elapsed_ms,
 						static_cast<long long>(idle_state.elapsed_ms),
 						status.c_str(),
+						failure.value("reason", std::string()).c_str(),
+						static_cast<unsigned long long>(failure.value("remote_call_id", 0ull)),
+						static_cast<unsigned long>(failure.value("remote_call_gle", 0u)),
+						failure.value("remote_call_stale_pid", false) ? 1 : 0,
+						failure.value("remote_call_deadline_expired_after", false) ? 1 : 0,
+						failure.value("remote_call_cancelled_after", false) ? 1 : 0,
+						failure.value("remote_call_late_completion", false) ? 1 : 0,
 						driver_bridge::last_error().c_str());
 					return tool_result_t::error(idle_state.idle ? "integrity hunter page guard install timed out" : "integrity hunter worker did not stop after install timeout", result);
 				}
@@ -1879,8 +1971,9 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 				auto result = make_failure_payload(idle_state.idle ? "page_guard_install_failed" : "page_guard_install_failed_cleanup_exceeded", generation, idle_state);
 				const std::string status = result.value("status", std::string());
 				const long long elapsed_ms = result.value("elapsed_ms", 0LL);
+				const json& failure = result["page_guard_failure"];
 				diag::log_tagged_fmt("integrity_hunter",
-					"mcp_hunt_install_failed_idle gen=%llu idle=%d pid=%u active_pid=%u address=0x%llX size=%llu install_complete=%d install_success=%d nodes=%zu events=%zu reads=%llu elapsed_ms=%lld cleanup_elapsed_ms=%lld status=%s last_error=%s",
+					"mcp_hunt_install_failed_idle gen=%llu idle=%d pid=%u active_pid=%u address=0x%llX size=%llu install_complete=%d install_success=%d nodes=%zu events=%zu reads=%llu elapsed_ms=%lld cleanup_elapsed_ms=%lld status=%s pg_reason=%s remote_call_id=%llu remote_gle=%lu stale_pid=%d deadline_expired=%d cancelled=%d late_completion=%d last_error=%s",
 					static_cast<unsigned long long>(generation),
 					idle_state.idle ? 1 : 0,
 					idle_state.target_pid,
@@ -1895,6 +1988,13 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 					elapsed_ms,
 					static_cast<long long>(idle_state.elapsed_ms),
 					status.c_str(),
+					failure.value("reason", std::string()).c_str(),
+					static_cast<unsigned long long>(failure.value("remote_call_id", 0ull)),
+					static_cast<unsigned long>(failure.value("remote_call_gle", 0u)),
+					failure.value("remote_call_stale_pid", false) ? 1 : 0,
+					failure.value("remote_call_deadline_expired_after", false) ? 1 : 0,
+					failure.value("remote_call_cancelled_after", false) ? 1 : 0,
+					failure.value("remote_call_late_completion", false) ? 1 : 0,
 					driver_bridge::last_error().c_str());
 				return tool_result_t::error(idle_state.idle ? "integrity hunter page guard install failed" : "integrity hunter worker did not stop after install failure", result);
 			}

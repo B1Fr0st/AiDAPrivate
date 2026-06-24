@@ -328,7 +328,27 @@ bool browser_transport_retry_allowed(const char* phase, int attempt, int max_att
     return true;
 }
 
-void recover_browser_transport(const char* phase, int attempt, const std::string& err)
+bool sleep_before_deadline(int requested_ms, uint64_t deadline_ms)
+{
+    if (requested_ms <= 0)
+        return deadline_ms == 0 || remaining_until_deadline_ms(deadline_ms) > 0;
+    int sleep_ms = requested_ms;
+    if (deadline_ms != 0) {
+        const long long remaining_ms = remaining_until_deadline_ms(deadline_ms);
+        if (remaining_ms <= 0)
+            return false;
+        if (remaining_ms <= 10)
+            return true;
+        const long long max_sleep_ms = remaining_ms - 10;
+        if (sleep_ms > max_sleep_ms)
+            sleep_ms = static_cast<int>(max_sleep_ms);
+    }
+    if (sleep_ms > 0)
+        std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+    return deadline_ms == 0 || remaining_until_deadline_ms(deadline_ms) > 0;
+}
+
+void recover_browser_transport(const char* phase, int attempt, const std::string& err, uint64_t deadline_ms)
 {
     const auto before = camoufox::get_status();
     const uint64_t t0 = now_ms_steady();
@@ -349,7 +369,8 @@ void recover_browser_transport(const char* phase, int attempt, const std::string
         after.child_alive ? 1 : 0, after.browser_open ? 1 : 0, after.page_verified ? 1 : 0,
         after.cleanup_pending ? 1 : 0, static_cast<unsigned long long>(after.total_errors), sleep_ms,
         err.c_str());
-    std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+    if (!sleep_before_deadline(sleep_ms, deadline_ms))
+        set_err("DOM-XSS scan deadline exceeded");
 }
 
 struct bridge_activity_scope_t
@@ -633,11 +654,113 @@ std::string build_active_dom_replay_js(const sentinel_t& s)
 
 int result_read_timeout_ms(uint64_t deadline_ms)
 {
+    if (deadline_ms == 0)
+        return 30000;
     const long long remaining_ms = remaining_until_deadline_ms(deadline_ms);
     if (remaining_ms <= 0)
-        return 1000;
-    const long long bounded = std::min<long long>(std::max<long long>(remaining_ms, 1000), 5000);
+        return 0;
+    const long long bounded = std::min<long long>(remaining_ms, 30000);
     return static_cast<int>(bounded);
+}
+
+camoufox::call_result_t deadline_failure_result(const char* tool_name, uint64_t deadline_ms, const std::string& page_id)
+{
+    camoufox::call_result_t r;
+    r.ok = false;
+    r.error = "DOM-XSS scan deadline exceeded";
+    r.data = nlohmann::json{
+        {"status", "deadline_exceeded"},
+        {"tool", tool_name ? tool_name : ""},
+        {"page_id", page_id},
+        {"deadline_ms", deadline_ms},
+        {"remaining_ms", remaining_until_deadline_ms(deadline_ms)}
+    };
+    return r;
+}
+
+camoufox::call_result_t call_evaluate_js_deadline(const std::string& expression,
+                                                  bool await_promise,
+                                                  const std::string& page_id,
+                                                  uint64_t deadline_ms)
+{
+    const int timeout_ms = result_read_timeout_ms(deadline_ms);
+    if (deadline_ms != 0 && timeout_ms <= 0)
+        return deadline_failure_result("evaluate_js", deadline_ms, page_id);
+    nlohmann::json args;
+    args["expression"] = expression;
+    args["await_promise"] = await_promise;
+    if (!page_id.empty())
+        args["page_id"] = page_id;
+    return camoufox::call_tool("evaluate_js", args, timeout_ms);
+}
+
+camoufox::call_result_t call_console_logs_deadline(size_t max_records,
+                                                   const std::string& page_id,
+                                                   uint64_t deadline_ms)
+{
+    const int timeout_ms = result_read_timeout_ms(deadline_ms);
+    if (deadline_ms != 0 && timeout_ms <= 0)
+        return deadline_failure_result("get_console_logs", deadline_ms, page_id);
+    nlohmann::json args;
+    if (max_records != 0)
+        args["max_records"] = static_cast<uint64_t>(max_records);
+    if (!page_id.empty())
+        args["page_id"] = page_id;
+    return camoufox::call_tool("get_console_logs", args, timeout_ms);
+}
+
+camoufox::call_result_t reset_browser_state_deadline(uint64_t deadline_ms)
+{
+    const int timeout_ms = result_read_timeout_ms(deadline_ms);
+    if (deadline_ms != 0 && timeout_ms <= 0)
+        return deadline_failure_result("reset_browser_state", deadline_ms, std::string());
+    const auto st = camoufox::get_status();
+    nlohmann::json args;
+    args["clear_persistent_hooks"] = true;
+    args["clear_network_capture"] = true;
+    args["clear_active_routes"] = true;
+    args["clear_cookies"] = false;
+    args["clear_storage"] = false;
+    args["close_page_prefix"] = "dom_xss_";
+    args["close_empty_contexts"] = true;
+    if (!st.active_page_id.empty())
+        args["restore_page_id"] = st.active_page_id;
+    return camoufox::call_tool("reset_browser_state", args, timeout_ms);
+}
+
+camoufox::call_result_t add_init_script_deadline(const std::string& script, uint64_t deadline_ms)
+{
+    const int timeout_ms = result_read_timeout_ms(deadline_ms);
+    if (deadline_ms != 0 && timeout_ms <= 0)
+        return deadline_failure_result("add_init_script", deadline_ms, std::string());
+    nlohmann::json args;
+    args["script"] = script;
+    return camoufox::call_tool("add_init_script", args, timeout_ms);
+}
+
+int browser_navigation_timeout_for_deadline(int requested_ms, uint64_t deadline_ms, const char* phase)
+{
+    int effective_ms = bounded_payload_timeout_ms(requested_ms);
+    if (deadline_ms == 0)
+        return effective_ms;
+    const long long remaining_ms = remaining_until_deadline_ms(deadline_ms);
+    if (remaining_ms <= 5000)
+    {
+        std::string e = "DOM-XSS scan deadline exceeded";
+        if (phase && *phase)
+            e += std::string(" before ") + phase;
+        set_err(e);
+        return 0;
+    }
+    const long long max_requested_ms = remaining_ms - 5000;
+    if (effective_ms > max_requested_ms)
+        effective_ms = static_cast<int>(max_requested_ms);
+    if (effective_ms <= 0)
+    {
+        set_err("DOM-XSS scan deadline exceeded");
+        return 0;
+    }
+    return effective_ms;
 }
 
 std::string json_shape_local(const nlohmann::json& j)
@@ -657,6 +780,49 @@ std::string json_shape_local(const nlohmann::json& j)
     if (j.size() > n) out += ",...";
     out += "}";
     return out;
+}
+
+const nlohmann::json* bridge_call_meta(const nlohmann::json& data)
+{
+    if (!data.is_object())
+        return nullptr;
+    auto it = data.find("bridge_call");
+    if (it != data.end() && it->is_object())
+        return &(*it);
+    return nullptr;
+}
+
+uint64_t bridge_meta_u64(const nlohmann::json& data, const char* key)
+{
+    const nlohmann::json* meta = bridge_call_meta(data);
+    if (!meta || !key)
+        return 0;
+    auto it = meta->find(key);
+    if (it == meta->end())
+        return 0;
+    if (it->is_number_unsigned())
+        return it->get<uint64_t>();
+    if (it->is_number_integer())
+        return static_cast<uint64_t>(std::max<int64_t>(it->get<int64_t>(), 0));
+    return 0;
+}
+
+bool bridge_meta_bool(const nlohmann::json& data, const char* key)
+{
+    const nlohmann::json* meta = bridge_call_meta(data);
+    if (!meta || !key)
+        return false;
+    auto it = meta->find(key);
+    return it != meta->end() && it->is_boolean() && it->get<bool>();
+}
+
+std::string bridge_meta_string(const nlohmann::json& data, const char* key)
+{
+    const nlohmann::json* meta = bridge_call_meta(data);
+    if (!meta || !key)
+        return {};
+    auto it = meta->find(key);
+    return it != meta->end() && it->is_string() ? it->get<std::string>() : std::string();
 }
 
 std::string trim_payload(const std::string& s, size_t max_chars)
@@ -801,11 +967,18 @@ nlohmann::json console_log_array_from_result(const camoufox::call_result_t& r)
     return console_log_array_from_json(r.data);
 }
 
-std::vector<std::string> read_results_from_console(const sentinel_t& s, const char* phase, size_t max_records, const std::string& page_id)
+std::vector<std::string> read_results_from_console(const sentinel_t& s, const char* phase, size_t max_records, const std::string& page_id, uint64_t deadline_ms)
 {
     std::vector<std::string> out;
-    camoufox::call_result_t r = camoufox::get_console_logs(max_records, "default", page_id);
+    camoufox::call_result_t r = call_console_logs_deadline(max_records, page_id, deadline_ms);
     nlohmann::json logs = console_log_array_from_result(r);
+    if (r.ok && max_records != 0 && logs.is_array() && logs.size() > max_records)
+    {
+        nlohmann::json trimmed = nlohmann::json::array();
+        for (size_t i = logs.size() - max_records; i < logs.size(); ++i)
+            trimmed.push_back(logs[i]);
+        logs = std::move(trimmed);
+    }
     size_t inspected = 0;
     size_t prefix_hits = 0;
     size_t parse_errors = 0;
@@ -834,8 +1007,10 @@ std::vector<std::string> read_results_from_console(const sentinel_t& s, const ch
             }
         }
     }
-    diag::log_tagged_fmt("dom_xss", "results_console_read token=%s page_id=%s phase=%s ok=%d logs_shape=%s inspected=%zu prefix_hits=%zu matches=%zu parse_errors=%zu err_len=%zu",
-        s.token.c_str(), page_id.c_str(), phase ? phase : "", r.ok ? 1 : 0, json_shape_local(logs).c_str(),
+    diag::log_tagged_fmt("dom_xss", "results_console_read token=%s page_id=%s phase=%s ok=%d deadline_ms=%llu remaining_ms=%lld logs_shape=%s inspected=%zu prefix_hits=%zu matches=%zu parse_errors=%zu err_len=%zu",
+        s.token.c_str(), page_id.c_str(), phase ? phase : "", r.ok ? 1 : 0,
+        static_cast<unsigned long long>(deadline_ms), remaining_until_deadline_ms(deadline_ms),
+        json_shape_local(logs).c_str(),
         inspected, prefix_hits, out.size(), parse_errors, r.error.size());
     return out;
 }
@@ -910,24 +1085,28 @@ bool navigate_with_init_script(const std::string& abs_url,
                     set_err(e.empty() ? std::string("camoufox bridge not ready") : e);
                 return false;
             }
-            recover_browser_transport("ensure_ready", attempt, e);
+            recover_browser_transport("ensure_ready", attempt, e, deadline_ms);
             continue;
         }
-        if (!camoufox::add_init_script(pre)) {
-            std::string e = camoufox::last_error();
+        camoufox::call_result_t add_result = add_init_script_deadline(pre, deadline_ms);
+        if (!add_result.ok) {
+            std::string e = add_result.error;
             diag::log_tagged_fmt("dom_xss", "add_init_script failed attempt=%d err=%s", attempt, e.c_str());
             if (!browser_transport_retry_allowed("add_init_script", attempt, kMaxAttempts, deadline_ms, e)) {
                 if (current_err().empty())
                     set_err(std::string("add_init_script failed: ") + e);
                 return false;
             }
-            recover_browser_transport("add_init_script", attempt, e);
+            recover_browser_transport("add_init_script", attempt, e, deadline_ms);
             continue;
         }
         diag::log_tagged_fmt("dom_xss", "add_init_script ok attempt=%d token=%s page_id=%s pre_len=%zu remaining_ms=%lld",
             attempt, s.token.c_str(), page_id.c_str(), pre.size(), remaining_until_deadline_ms(deadline_ms));
-        if (camoufox::navigate(abs_url, "load", timeout_ms, "default", page_id)) {
-            camoufox::call_result_t probe = camoufox::evaluate_js(build_canary_probe_js(s), true, "default", page_id);
+        const int nav_timeout_ms = browser_navigation_timeout_for_deadline(timeout_ms, deadline_ms, "navigate");
+        if (nav_timeout_ms <= 0)
+            return false;
+        if (camoufox::navigate(abs_url, "load", nav_timeout_ms, "default", page_id)) {
+            camoufox::call_result_t probe = call_evaluate_js_deadline(build_canary_probe_js(s), true, page_id, deadline_ms);
             std::string data_tail = probe.data.is_discarded() ? std::string() : trim_payload(probe.data.dump(), 1400);
             std::string text_tail = trim_payload(probe.text, 1400);
             diag::log_tagged_fmt("dom_xss", "navigate_with_init_script post_nav_probe attempt=%d token=%s page_id=%s ok=%d data_shape=%s text_len=%zu data_tail=%s text_tail=%s",
@@ -942,7 +1121,7 @@ bool navigate_with_init_script(const std::string& abs_url,
                 set_err(std::string("navigate failed: ") + e);
             return false;
         }
-        recover_browser_transport("navigate", attempt, e);
+        recover_browser_transport("navigate", attempt, e, deadline_ms);
     }
     set_err("navigate failed: exhausted browser transport retries");
     return false;
@@ -973,21 +1152,25 @@ bool drive_fetch_harness(const std::string& abs_url,
                     set_err(e.empty() ? std::string("camoufox bridge not ready") : e);
                 return false;
             }
-            recover_browser_transport("harness_ensure_ready", attempt, e);
+            recover_browser_transport("harness_ensure_ready", attempt, e, deadline_ms);
             continue;
         }
-        if (!camoufox::add_init_script(pre)) {
-            std::string e = camoufox::last_error();
+        camoufox::call_result_t add_result = add_init_script_deadline(pre, deadline_ms);
+        if (!add_result.ok) {
+            std::string e = add_result.error;
             diag::log_tagged_fmt("dom_xss", "add_init_script(harness) failed attempt=%d err=%s", attempt, e.c_str());
             if (!browser_transport_retry_allowed("harness_add_init_script", attempt, kMaxAttempts, deadline_ms, e)) {
                 if (current_err().empty())
                     set_err(std::string("add_init_script(harness) failed: ") + e);
                 return false;
             }
-            recover_browser_transport("harness_add_init_script", attempt, e);
+            recover_browser_transport("harness_add_init_script", attempt, e, deadline_ms);
             continue;
         }
-        if (!camoufox::navigate("about:blank", "load", timeout_ms, "default", page_id)) {
+        const int nav_timeout_ms = browser_navigation_timeout_for_deadline(timeout_ms, deadline_ms, "harness_navigate");
+        if (nav_timeout_ms <= 0)
+            return false;
+        if (!camoufox::navigate("about:blank", "load", nav_timeout_ms, "default", page_id)) {
             std::string e = camoufox::last_error();
             diag::log_tagged_fmt("dom_xss", "harness navigate(about:blank) failed attempt=%d err=%s", attempt, e.c_str());
             if (!browser_transport_retry_allowed("harness_navigate", attempt, kMaxAttempts, deadline_ms, e)) {
@@ -995,11 +1178,11 @@ bool drive_fetch_harness(const std::string& abs_url,
                     set_err(std::string("harness navigate(about:blank) failed: ") + e);
                 return false;
             }
-            recover_browser_transport("harness_navigate", attempt, e);
+            recover_browser_transport("harness_navigate", attempt, e, deadline_ms);
             continue;
         }
         std::string js = build_fetch_harness_js(method, abs_url, headers, body);
-        auto r = camoufox::evaluate_js(js, true, "default", page_id);
+        auto r = call_evaluate_js_deadline(js, true, page_id, deadline_ms);
         if (r.ok) {
             return true;
         }
@@ -1009,7 +1192,7 @@ bool drive_fetch_harness(const std::string& abs_url,
                 set_err(std::string("harness evaluate_js failed: ") + e);
             return false;
         }
-        recover_browser_transport("harness_evaluate_js", attempt, e);
+        recover_browser_transport("harness_evaluate_js", attempt, e, deadline_ms);
     }
     set_err("harness failed: exhausted browser transport retries");
     return false;
@@ -1060,15 +1243,17 @@ std::vector<std::string> read_results(const sentinel_t& s, uint64_t deadline_ms,
     std::vector<std::string> out;
     std::string js = build_results_read_js(s);
     const auto before = camoufox::get_status();
-    const int eval_timeout_ms = result_read_timeout_ms(deadline_ms);
-    diag::log_tagged_fmt("dom_xss", "results_read_begin token=%s page_id=%s expr_len=%zu remaining_ms=%lld eval_timeout_ms=%d state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d calls=%llu errors=%llu last_error_len=%zu",
-        s.token.c_str(), page_id.c_str(), js.size(), remaining_until_deadline_ms(deadline_ms), eval_timeout_ms,
+    const uint64_t read_start_ms = now_ms_steady();
+    const int initial_eval_timeout_ms = result_read_timeout_ms(deadline_ms);
+    diag::log_tagged_fmt("dom_xss", "results_read_begin token=%s session_id=default page_id=%s expr_len=%zu deadline_ms=%llu remaining_ms=%lld eval_timeout_ms=%d state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d calls=%llu errors=%llu last_error_len=%zu",
+        s.token.c_str(), page_id.c_str(), js.size(), static_cast<unsigned long long>(deadline_ms),
+        remaining_until_deadline_ms(deadline_ms), initial_eval_timeout_ms,
         static_cast<int>(before.state), static_cast<unsigned long long>(before.generation),
         static_cast<unsigned long>(before.child_pid), before.child_alive ? 1 : 0,
         before.browser_open ? 1 : 0, before.page_verified ? 1 : 0,
         before.cleanup_pending ? 1 : 0, static_cast<unsigned long long>(before.total_calls),
         static_cast<unsigned long long>(before.total_errors), before.last_error.size());
-    out = read_results_from_console(s, "pre_evaluate", 200, page_id);
+    out = read_results_from_console(s, "pre_evaluate", 200, page_id, deadline_ms);
     if (!out.empty()) {
         const auto console_after = camoufox::get_status();
         diag::log_tagged_fmt("dom_xss", "results_read_done token=%s sinks=%zu source=console_pre state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d calls=%llu errors=%llu last_error_len=%zu",
@@ -1084,27 +1269,69 @@ std::vector<std::string> read_results(const sentinel_t& s, uint64_t deadline_ms,
     args["await_promise"] = true;
     if (!page_id.empty()) args["page_id"] = page_id;
     const uint64_t now = now_ms_steady();
-    uint64_t poll_until = now + 2000ULL;
-    if (deadline_ms != 0 && deadline_ms < poll_until)
-        poll_until = deadline_ms;
+    uint64_t poll_until = deadline_ms != 0 ? deadline_ms : now + 15000ULL;
     camoufox::call_result_t r;
     for (int attempt = 1; attempt <= 12; ++attempt) {
+        const int eval_timeout_ms = result_read_timeout_ms(deadline_ms);
+        if (deadline_ms != 0 && eval_timeout_ms <= 0)
+        {
+            set_err("DOM-XSS scan deadline exceeded");
+            break;
+        }
+        const auto dispatch_status = camoufox::get_status();
+        const uint64_t attempt_start_ms = now_ms_steady();
+        diag::log_tagged_fmt("dom_xss", "results_read_eval_dispatch token=%s session_id=default page_id=%s attempt=%d deadline_ms=%llu remaining_ms=%lld eval_timeout_ms=%d state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d",
+            s.token.c_str(), page_id.c_str(), attempt,
+            static_cast<unsigned long long>(deadline_ms),
+            remaining_until_deadline_ms(deadline_ms),
+            eval_timeout_ms,
+            static_cast<int>(dispatch_status.state),
+            static_cast<unsigned long long>(dispatch_status.generation),
+            static_cast<unsigned long>(dispatch_status.child_pid),
+            dispatch_status.child_alive ? 1 : 0,
+            dispatch_status.browser_open ? 1 : 0,
+            dispatch_status.page_verified ? 1 : 0,
+            dispatch_status.cleanup_pending ? 1 : 0);
         r = camoufox::call_tool("evaluate_js", args, eval_timeout_ms);
+        const uint64_t request_id = bridge_meta_u64(r.data, "request_id");
+        const uint64_t bridge_generation = bridge_meta_u64(r.data, "generation");
+        const uint64_t bridge_child_pid = bridge_meta_u64(r.data, "child_pid");
+        const bool bridge_late_result = bridge_meta_bool(r.data, "late_result");
+        const std::string bridge_phase = bridge_meta_string(r.data, "phase");
+        diag::log_tagged_fmt("dom_xss", "results_read_eval_result token=%s session_id=default page_id=%s attempt=%d request_id=%llu ok=%d deadline_ms=%llu remaining_ms=%lld eval_timeout_ms=%d elapsed_ms=%llu bridge_generation=%llu bridge_child_pid=%llu bridge_phase=%s late_result=%d data_shape=%s text_len=%zu err_len=%zu",
+            s.token.c_str(), page_id.c_str(), attempt,
+            static_cast<unsigned long long>(request_id),
+            r.ok ? 1 : 0,
+            static_cast<unsigned long long>(deadline_ms),
+            remaining_until_deadline_ms(deadline_ms),
+            eval_timeout_ms,
+            static_cast<unsigned long long>(now_ms_steady() - attempt_start_ms),
+            static_cast<unsigned long long>(bridge_generation),
+            static_cast<unsigned long long>(bridge_child_pid),
+            bridge_phase.empty() ? "<empty>" : bridge_phase.c_str(),
+            bridge_late_result ? 1 : 0,
+            json_shape_local(r.data).c_str(),
+            r.text.size(),
+            r.error.size());
         if (r.ok) {
             nlohmann::json arr;
             const bool parsed = extract_results_array(r, arr);
             if (!parsed) {
-                diag::log_tagged_fmt("dom_xss", "results_read_unparsed token=%s attempt=%d data_shape=%s text_len=%zu",
-                    s.token.c_str(), attempt, json_shape_local(r.data).c_str(), r.text.size());
+                diag::log_tagged_fmt("dom_xss", "results_read_unparsed token=%s page_id=%s attempt=%d request_id=%llu data_shape=%s text_len=%zu",
+                    s.token.c_str(), page_id.c_str(), attempt, static_cast<unsigned long long>(request_id),
+                    json_shape_local(r.data).c_str(), r.text.size());
             } else if (!arr.is_array()) {
-                diag::log_tagged_fmt("dom_xss", "results_read_not_array token=%s attempt=%d parsed_shape=%s",
-                    s.token.c_str(), attempt, json_shape_local(arr).c_str());
+                diag::log_tagged_fmt("dom_xss", "results_read_not_array token=%s page_id=%s attempt=%d request_id=%llu parsed_shape=%s",
+                    s.token.c_str(), page_id.c_str(), attempt, static_cast<unsigned long long>(request_id),
+                    json_shape_local(arr).c_str());
             } else {
                 out = normalize_results_array(arr);
                 if (!out.empty()) {
                     const auto after = camoufox::get_status();
-                    diag::log_tagged_fmt("dom_xss", "results_read_done token=%s sinks=%zu source=evaluate attempt=%d state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d calls=%llu errors=%llu last_error_len=%zu",
-                        s.token.c_str(), out.size(), attempt, static_cast<int>(after.state),
+                    diag::log_tagged_fmt("dom_xss", "results_read_done token=%s session_id=default page_id=%s request_id=%llu sinks=%zu source=evaluate attempt=%d elapsed_ms=%llu state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d calls=%llu errors=%llu last_error_len=%zu",
+                        s.token.c_str(), page_id.c_str(), static_cast<unsigned long long>(request_id),
+                        out.size(), attempt, static_cast<unsigned long long>(now_ms_steady() - read_start_ms),
+                        static_cast<int>(after.state),
                         static_cast<unsigned long long>(after.generation), static_cast<unsigned long>(after.child_pid),
                         after.child_alive ? 1 : 0, after.browser_open ? 1 : 0, after.page_verified ? 1 : 0,
                         after.cleanup_pending ? 1 : 0, static_cast<unsigned long long>(after.total_calls),
@@ -1112,7 +1339,7 @@ std::vector<std::string> read_results(const sentinel_t& s, uint64_t deadline_ms,
                     return out;
                 }
             }
-            std::vector<std::string> console_out = read_results_from_console(s, "evaluate_empty", 300, page_id);
+            std::vector<std::string> console_out = read_results_from_console(s, "evaluate_empty", 300, page_id, deadline_ms);
             if (!console_out.empty()) {
                 const auto console_after = camoufox::get_status();
                 diag::log_tagged_fmt("dom_xss", "results_read_done token=%s sinks=%zu source=console_after_empty attempt=%d state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d calls=%llu errors=%llu last_error_len=%zu",
@@ -1123,14 +1350,21 @@ std::vector<std::string> read_results(const sentinel_t& s, uint64_t deadline_ms,
                     static_cast<unsigned long long>(console_after.total_errors), console_after.last_error.size());
                 return console_out;
             }
-            camoufox::call_result_t replay = camoufox::evaluate_js(build_active_dom_replay_js(s), true, "default", page_id);
+            camoufox::call_result_t replay = call_evaluate_js_deadline(build_active_dom_replay_js(s), true, page_id, deadline_ms);
             std::string replay_data = replay.data.is_discarded() ? std::string() : trim_payload(replay.data.dump(), 1400);
             std::string replay_text = trim_payload(replay.text, 1400);
             diag::log_tagged_fmt("dom_xss", "results_read_dom_replay token=%s attempt=%d ok=%d data_shape=%s text_len=%zu data=%s text=%s",
                 s.token.c_str(), attempt, replay.ok ? 1 : 0, json_shape_local(replay.data).c_str(), replay.text.size(),
                 replay_data.c_str(), replay_text.c_str());
             if (replay.ok) {
-                camoufox::call_result_t replay_read = camoufox::call_tool("evaluate_js", args, eval_timeout_ms);
+                const int replay_timeout_ms = result_read_timeout_ms(deadline_ms);
+                if (deadline_ms != 0 && replay_timeout_ms <= 0)
+                {
+                    set_err("DOM-XSS scan deadline exceeded");
+                    break;
+                }
+                camoufox::call_result_t replay_read = camoufox::call_tool("evaluate_js", args, replay_timeout_ms);
+                const uint64_t replay_request_id = bridge_meta_u64(replay_read.data, "request_id");
                 if (replay_read.ok) {
                     nlohmann::json replay_arr;
                     const bool replay_parsed = extract_results_array(replay_read, replay_arr);
@@ -1138,8 +1372,10 @@ std::vector<std::string> read_results(const sentinel_t& s, uint64_t deadline_ms,
                         out = normalize_results_array(replay_arr);
                         if (!out.empty()) {
                             const auto replay_after = camoufox::get_status();
-                            diag::log_tagged_fmt("dom_xss", "results_read_done token=%s sinks=%zu source=dom_replay attempt=%d state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d calls=%llu errors=%llu last_error_len=%zu",
-                                s.token.c_str(), out.size(), attempt, static_cast<int>(replay_after.state),
+                            diag::log_tagged_fmt("dom_xss", "results_read_done token=%s session_id=default page_id=%s request_id=%llu sinks=%zu source=dom_replay attempt=%d elapsed_ms=%llu state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d calls=%llu errors=%llu last_error_len=%zu",
+                                s.token.c_str(), page_id.c_str(), static_cast<unsigned long long>(replay_request_id),
+                                out.size(), attempt, static_cast<unsigned long long>(now_ms_steady() - read_start_ms),
+                                static_cast<int>(replay_after.state),
                                 static_cast<unsigned long long>(replay_after.generation), static_cast<unsigned long>(replay_after.child_pid),
                                 replay_after.child_alive ? 1 : 0, replay_after.browser_open ? 1 : 0, replay_after.page_verified ? 1 : 0,
                                 replay_after.cleanup_pending ? 1 : 0, static_cast<unsigned long long>(replay_after.total_calls),
@@ -1147,15 +1383,16 @@ std::vector<std::string> read_results(const sentinel_t& s, uint64_t deadline_ms,
                             return out;
                         }
                     }
-                    diag::log_tagged_fmt("dom_xss", "results_read_dom_replay_empty token=%s attempt=%d parsed=%d shape=%s text_len=%zu",
-                        s.token.c_str(), attempt, replay_parsed ? 1 : 0, json_shape_local(replay_read.data).c_str(),
-                        replay_read.text.size());
+                    diag::log_tagged_fmt("dom_xss", "results_read_dom_replay_empty token=%s page_id=%s attempt=%d request_id=%llu parsed=%d shape=%s text_len=%zu",
+                        s.token.c_str(), page_id.c_str(), attempt, static_cast<unsigned long long>(replay_request_id),
+                        replay_parsed ? 1 : 0, json_shape_local(replay_read.data).c_str(), replay_read.text.size());
                 } else {
-                    diag::log_tagged_fmt("dom_xss", "results_read_dom_replay_read_failed token=%s attempt=%d err=%s data_shape=%s text_len=%zu",
-                        s.token.c_str(), attempt, replay_read.error.c_str(), json_shape_local(replay_read.data).c_str(),
-                        replay_read.text.size());
+                    diag::log_tagged_fmt("dom_xss", "results_read_dom_replay_read_failed token=%s page_id=%s attempt=%d request_id=%llu err=%s data_shape=%s text_len=%zu timeout_ms=%d",
+                        s.token.c_str(), page_id.c_str(), attempt, static_cast<unsigned long long>(replay_request_id),
+                        replay_read.error.c_str(), json_shape_local(replay_read.data).c_str(), replay_read.text.size(),
+                        replay_timeout_ms);
                 }
-                std::vector<std::string> replay_console_out = read_results_from_console(s, "dom_replay", 300, page_id);
+                std::vector<std::string> replay_console_out = read_results_from_console(s, "dom_replay", 300, page_id, deadline_ms);
                 if (!replay_console_out.empty()) {
                     const auto replay_console_after = camoufox::get_status();
                     diag::log_tagged_fmt("dom_xss", "results_read_done token=%s sinks=%zu source=console_after_dom_replay attempt=%d state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d calls=%llu errors=%llu last_error_len=%zu",
@@ -1167,7 +1404,7 @@ std::vector<std::string> read_results(const sentinel_t& s, uint64_t deadline_ms,
                     return replay_console_out;
                 }
             }
-            camoufox::call_result_t probe = camoufox::evaluate_js(build_canary_probe_js(s), true, "default", page_id);
+            camoufox::call_result_t probe = call_evaluate_js_deadline(build_canary_probe_js(s), true, page_id, deadline_ms);
             std::string data_tail = probe.data.is_discarded() ? std::string() : trim_payload(probe.data.dump(), 1400);
             std::string text_tail = trim_payload(probe.text, 1400);
             diag::log_tagged_fmt("dom_xss", "results_read_zero_sinks token=%s attempt=%d probe_ok=%d probe_shape=%s probe_text_len=%zu probe_data=%s probe_text=%s",
@@ -1175,8 +1412,12 @@ std::vector<std::string> read_results(const sentinel_t& s, uint64_t deadline_ms,
                 data_tail.c_str(), text_tail.c_str());
         } else {
             const auto after = camoufox::get_status();
-            diag::log_tagged_fmt("dom_xss", "results_read_failed token=%s attempt=%d timeout_ms=%d err=%s data_shape=%s text_len=%zu state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d calls=%llu errors=%llu last_error_len=%zu",
-                s.token.c_str(), attempt, eval_timeout_ms, r.error.c_str(), json_shape_local(r.data).c_str(), r.text.size(),
+            diag::log_tagged_fmt("dom_xss", "results_read_failed token=%s session_id=default page_id=%s attempt=%d request_id=%llu timeout_ms=%d deadline_ms=%llu remaining_ms=%lld elapsed_ms=%llu err=%s data_shape=%s text_len=%zu bridge_phase=%s late_result=%d state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d calls=%llu errors=%llu last_error_len=%zu",
+                s.token.c_str(), page_id.c_str(), attempt, static_cast<unsigned long long>(request_id),
+                eval_timeout_ms, static_cast<unsigned long long>(deadline_ms), remaining_until_deadline_ms(deadline_ms),
+                static_cast<unsigned long long>(now_ms_steady() - read_start_ms),
+                r.error.c_str(), json_shape_local(r.data).c_str(), r.text.size(),
+                bridge_phase.empty() ? "<empty>" : bridge_phase.c_str(), bridge_late_result ? 1 : 0,
                 static_cast<int>(after.state), static_cast<unsigned long long>(after.generation),
                 static_cast<unsigned long>(after.child_pid), after.child_alive ? 1 : 0,
                 after.browser_open ? 1 : 0, after.page_verified ? 1 : 0,
@@ -1184,7 +1425,7 @@ std::vector<std::string> read_results(const sentinel_t& s, uint64_t deadline_ms,
                 static_cast<unsigned long long>(after.total_errors), after.last_error.size());
         }
         if (!r.ok && is_browser_transport_error(r.error)) {
-            out = read_results_from_console(s, attempt == 1 ? "evaluate_transport_failure_1" : "evaluate_transport_failure_n", 300, page_id);
+            out = read_results_from_console(s, attempt == 1 ? "evaluate_transport_failure_1" : "evaluate_transport_failure_n", 300, page_id, deadline_ms);
             if (!out.empty()) {
                 const auto console_after = camoufox::get_status();
                 diag::log_tagged_fmt("dom_xss", "results_read_done token=%s sinks=%zu source=console_after_transport_failure attempt=%d state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d calls=%llu errors=%llu last_error_len=%zu",
@@ -1200,13 +1441,14 @@ std::vector<std::string> read_results(const sentinel_t& s, uint64_t deadline_ms,
         }
         if (remaining_until_deadline_ms(deadline_ms) <= 250 || now_ms_steady() >= poll_until)
             break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        if (!sleep_before_deadline(150, deadline_ms))
+            break;
     }
     if (!r.ok && !r.error.empty())
         set_err(std::string("results read failed: ") + r.error);
     if (out.empty())
     {
-        camoufox::call_result_t probe = camoufox::evaluate_js(build_canary_probe_js(s), true, "default", page_id);
+        camoufox::call_result_t probe = call_evaluate_js_deadline(build_canary_probe_js(s), true, page_id, deadline_ms);
         std::string data_tail = probe.data.is_discarded() ? std::string() : trim_payload(probe.data.dump(), 1400);
         std::string text_tail = trim_payload(probe.text, 1400);
         diag::log_tagged_fmt("dom_xss", "results_read_final_empty token=%s probe_ok=%d probe_shape=%s probe_text_len=%zu probe_data=%s probe_text=%s",
@@ -1214,8 +1456,12 @@ std::vector<std::string> read_results(const sentinel_t& s, uint64_t deadline_ms,
             data_tail.c_str(), text_tail.c_str());
     }
     const auto after = camoufox::get_status();
-    diag::log_tagged_fmt("dom_xss", "results_read_done token=%s sinks=%zu source=empty state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d calls=%llu errors=%llu last_error_len=%zu",
-        s.token.c_str(), out.size(), static_cast<int>(after.state),
+    diag::log_tagged_fmt("dom_xss", "results_read_done token=%s session_id=default page_id=%s sinks=%zu source=empty elapsed_ms=%llu deadline_ms=%llu remaining_ms=%lld state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d calls=%llu errors=%llu last_error_len=%zu",
+        s.token.c_str(), page_id.c_str(), out.size(),
+        static_cast<unsigned long long>(now_ms_steady() - read_start_ms),
+        static_cast<unsigned long long>(deadline_ms),
+        remaining_until_deadline_ms(deadline_ms),
+        static_cast<int>(after.state),
         static_cast<unsigned long long>(after.generation), static_cast<unsigned long>(after.child_pid),
         after.child_alive ? 1 : 0, after.browser_open ? 1 : 0, after.page_verified ? 1 : 0,
         after.cleanup_pending ? 1 : 0, static_cast<unsigned long long>(after.total_calls),
@@ -1433,7 +1679,8 @@ fire_result_t fire_payload(const insertion_point_t& ip,
                            bool                     capture_screenshot,
                            int                      per_payload_timeout_ms,
                            const std::string&       scheme_hint,
-                           uint16_t                 port_hint)
+                           uint16_t                 port_hint,
+                           uint64_t                 absolute_deadline_ms)
 {
     std::lock_guard<std::recursive_mutex> global_lk(browser_global_mtx());
     bridge_activity_scope_t bridge_activity("dom_xss.fire_payload");
@@ -1532,35 +1779,76 @@ fire_result_t fire_payload(const insertion_point_t& ip,
         return out;
     }
 
-    if (!camoufox::reset_browser_state()) {
-        out.error = camoufox::last_error();
+    if (absolute_deadline_ms != 0 && remaining_until_deadline_ms(absolute_deadline_ms) <= 0)
+    {
+        out.error = "DOM-XSS scan deadline exceeded";
+        set_err(out.error);
+        diag::log_tagged_fmt("dom_xss", "fire_payload deadline_before_reset kind=%s param=%s remaining_ms=%lld",
+            ip.kind.c_str(), ip.name.c_str(), remaining_until_deadline_ms(absolute_deadline_ms));
+        return out;
+    }
+
+    camoufox::call_result_t reset_result = absolute_deadline_ms == 0
+        ? camoufox::call_result_t{}
+        : reset_browser_state_deadline(absolute_deadline_ms);
+    const bool reset_ok = absolute_deadline_ms == 0 ? camoufox::reset_browser_state() : reset_result.ok;
+    if (!reset_ok) {
+        out.error = absolute_deadline_ms == 0 ? camoufox::last_error() : reset_result.error;
         if (out.error.empty())
             out.error = "reset_browser_state failed";
         set_err(out.error);
-        diag::log_tagged_fmt("dom_xss", "fire_payload reset_failed kind=%s param=%s err=%s",
-            ip.kind.c_str(), ip.name.c_str(), out.error.c_str());
+        diag::log_tagged_fmt("dom_xss", "fire_payload reset_failed kind=%s param=%s err=%s data_shape=%s",
+            ip.kind.c_str(), ip.name.c_str(), out.error.c_str(), json_shape_local(reset_result.data).c_str());
         return out;
     }
 
     uint64_t t0 = now_ms_steady();
-    const uint64_t deadline_ms = t0 + static_cast<uint64_t>(bounded_payload_timeout_ms(per_payload_timeout_ms)) + 5000ULL;
+    int effective_payload_timeout_ms = bounded_payload_timeout_ms(per_payload_timeout_ms);
+    if (absolute_deadline_ms != 0)
+    {
+        const long long remaining_ms = remaining_until_deadline_ms(absolute_deadline_ms);
+        if (remaining_ms <= 6000)
+        {
+            out.error = "DOM-XSS scan deadline exceeded";
+            set_err(out.error);
+            diag::log_tagged_fmt("dom_xss", "fire_payload deadline_before_dispatch kind=%s param=%s remaining_ms=%lld",
+                ip.kind.c_str(), ip.name.c_str(), remaining_ms);
+            return out;
+        }
+        const long long max_payload_ms = remaining_ms - 5000;
+        if (effective_payload_timeout_ms > max_payload_ms)
+            effective_payload_timeout_ms = static_cast<int>(max_payload_ms);
+        if (effective_payload_timeout_ms < 1000)
+        {
+            out.error = "DOM-XSS scan deadline exceeded";
+            set_err(out.error);
+            diag::log_tagged_fmt("dom_xss", "fire_payload deadline_insufficient kind=%s param=%s remaining_ms=%lld effective_timeout_ms=%d",
+                ip.kind.c_str(), ip.name.c_str(), remaining_ms, effective_payload_timeout_ms);
+            return out;
+        }
+    }
+    uint64_t deadline_ms = t0 + static_cast<uint64_t>(effective_payload_timeout_ms) + 5000ULL;
+    if (absolute_deadline_ms != 0 && absolute_deadline_ms < deadline_ms)
+        deadline_ms = absolute_deadline_ms;
     browser_page_scope_t page_scope("fire", s);
     if (!page_scope.ok()) {
         out.error = "new_page failed";
         set_err(out.error);
         return out;
     }
-    diag::log_tagged_fmt("dom_xss", "fire_payload browser_start kind=%s param=%s page_id=%s mode=%s url_len=%zu timeout_ms=%d bounded_timeout_ms=%d deadline_remaining_ms=%lld",
+    diag::log_tagged_fmt("dom_xss", "fire_payload browser_start kind=%s param=%s page_id=%s mode=%s url_len=%zu timeout_ms=%d bounded_timeout_ms=%d effective_timeout_ms=%d absolute_deadline_ms=%llu deadline_remaining_ms=%lld",
         ip.kind.c_str(), ip.name.c_str(),
         page_scope.page_id.c_str(),
         (ip.kind == "query" || ip.kind == "path") ? "navigate" : "fetch_harness",
         abs_url.size(), per_payload_timeout_ms, bounded_payload_timeout_ms(per_payload_timeout_ms),
+        effective_payload_timeout_ms,
+        static_cast<unsigned long long>(absolute_deadline_ms),
         remaining_until_deadline_ms(deadline_ms));
     bool ok = false;
     if (ip.kind == "query" || ip.kind == "path") {
-        ok = navigate_with_init_script(abs_url, s, per_payload_timeout_ms, deadline_ms, page_scope.page_id);
+        ok = navigate_with_init_script(abs_url, s, effective_payload_timeout_ms, deadline_ms, page_scope.page_id);
     } else {
-        ok = drive_fetch_harness(abs_url, built, s, per_payload_timeout_ms, deadline_ms, page_scope.page_id);
+        ok = drive_fetch_harness(abs_url, built, s, effective_payload_timeout_ms, deadline_ms, page_scope.page_id);
     }
     if (!ok) {
         out.error = current_err();
@@ -1568,7 +1856,7 @@ fire_result_t fire_payload(const insertion_point_t& ip,
     }
 
     {
-        camoufox::call_result_t probe = camoufox::evaluate_js(build_canary_probe_js(s), true, "default", page_scope.page_id);
+        camoufox::call_result_t probe = call_evaluate_js_deadline(build_canary_probe_js(s), true, page_scope.page_id, deadline_ms);
         std::string data_tail = probe.data.is_discarded() ? std::string() : trim_payload(probe.data.dump(), 1200);
         std::string text_tail = trim_payload(probe.text, 1200);
         const auto st = camoufox::get_status();
@@ -1580,7 +1868,13 @@ fire_result_t fire_payload(const insertion_point_t& ip,
             st.cleanup_pending ? 1 : 0, static_cast<unsigned long long>(st.total_errors));
     }
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    if (!sleep_before_deadline(300, deadline_ms)) {
+        out.error = "DOM-XSS scan deadline exceeded";
+        set_err(out.error);
+        diag::log_tagged_fmt("dom_xss", "fire_payload deadline_before_result_read kind=%s param=%s remaining_ms=%lld",
+            ip.kind.c_str(), ip.name.c_str(), remaining_until_deadline_ms(deadline_ms));
+        return out;
+    }
 
     out.sink_log = read_results(s, deadline_ms, page_scope.page_id);
     if (out.sink_log.empty()) {
@@ -1685,7 +1979,7 @@ size_t scan_insertion_point(const insertion_point_t& ip, const scan_options_t& o
                 ip.kind.c_str(), ip.name.c_str(), set->name.c_str(), set_index, fired, budget,
                 tpl.size(), stable_hash64(tpl).c_str());
             auto r = fire_payload(ip, tpl, s, opts.capture_screenshots, opts.per_payload_timeout_ms,
-                                  opts.scheme, opts.port);
+                                  opts.scheme, opts.port, opts.deadline_ms);
             if (!r.ok) {
                 std::string e = r.error.empty() ? current_err() : r.error;
                 diag::log_tagged_fmt("dom_xss", "scan_insertion_point payload_failed kind=%s param=%s set=%s set_index=%zu global_index=%zu error_len=%zu error=%s",
@@ -1771,7 +2065,10 @@ bool confirm_reflected_in_browser(const std::string&        url,
         diag::log_tagged_fmt("dom_xss", "confirm_reflected_in_browser navigate_failed url=%s", url.c_str());
         return false;
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    if (!sleep_before_deadline(250, deadline_ms)) {
+        set_err("DOM-XSS scan deadline exceeded");
+        return false;
+    }
     out_sink_log = read_results(s, deadline_ms, page_scope.page_id);
     diag::log_tagged_fmt("dom_xss", "confirm_reflected_in_browser done url=%s fired=%d sinks=%zu",
         url.c_str(), !out_sink_log.empty() ? 1 : 0, out_sink_log.size());

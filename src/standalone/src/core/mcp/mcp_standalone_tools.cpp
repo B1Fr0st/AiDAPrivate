@@ -2244,8 +2244,73 @@ tool_result_t ensure_attached()
         });
     }
 
+    long long web_tool_elapsed_ms_since(const std::chrono::steady_clock::time_point& start)
+    {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start).count();
+    }
+
+    bool web_tool_is_loopback_fixture_url(const std::string& url)
+    {
+        std::string lower = url;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        const size_t scheme = lower.find("://");
+        if (scheme == std::string::npos)
+            return false;
+        const size_t host_start = scheme + 3;
+        if (host_start >= lower.size())
+            return false;
+        std::string host;
+        if (lower[host_start] == '[') {
+            const size_t host_end = lower.find(']', host_start + 1);
+            if (host_end == std::string::npos)
+                return false;
+            host = lower.substr(host_start, host_end - host_start + 1);
+        } else {
+            const size_t host_end = lower.find_first_of("/:?#", host_start);
+            host = lower.substr(host_start, host_end == std::string::npos ? std::string::npos : host_end - host_start);
+        }
+        return host == "localhost" || host == "[::1]" || host == "::1" || host.rfind("127.", 0) == 0;
+    }
+
+    bool web_tool_diagnostic_mode(const json& params)
+    {
+        return json_bool_param(params, "diagnostic", false)
+            || json_bool_param(params, "diagnostics", false)
+            || json_bool_param(params, "include_diagnostics", false);
+    }
+
+    json web_tool_navigation_summary(const aida::burp::camoufox::call_result_t& nav)
+    {
+        json summary;
+        summary["ok"] = nav.ok;
+        summary["error_length"] = nav.error.size();
+        summary["text_length"] = nav.text.size();
+        json payload = camoufox_value_json(nav);
+        summary["payload_object"] = payload.is_object();
+        if (payload.is_object()) {
+            if (payload.contains("final_status"))
+                summary["final_status"] = payload["final_status"];
+            else if (payload.contains("status"))
+                summary["final_status"] = payload["status"];
+            if (payload.contains("navigation_timed_out"))
+                summary["navigation_timed_out"] = payload["navigation_timed_out"];
+            const std::string final_url = json_string_field(payload, "final_url");
+            const std::string title = json_string_field(payload, "title");
+            if (!final_url.empty())
+                summary["final_url_length"] = final_url.size();
+            if (!title.empty())
+                summary["title_length"] = title.size();
+            if (payload.contains("response_chain") && payload["response_chain"].is_array())
+                summary["response_chain_count"] = payload["response_chain"].size();
+        }
+        return summary;
+    }
+
     tool_result_t handle_web_search(const json& params)
     {
+        const auto handler_start = std::chrono::steady_clock::now();
         diag::log_tagged_fmt("mcp_tools", "handle_web_search entry transport=camoufox");
         if (!params.contains("query") || !params["query"].is_string())
             return error("Provide a search query.");
@@ -2258,14 +2323,19 @@ tool_result_t ensure_attached()
         const int timeout_ms = std::clamp(timeout_seconds * 1000 + 10000, 15000, 90000);
         const std::string encoded_query = web_tool_url_encode(query);
 
+        const auto ready_start = std::chrono::steady_clock::now();
         if (!aida::burp::camoufox::ensure_ready()) {
             std::string msg = aida::burp::camoufox::last_error();
             if (msg.empty())
                 msg = "Camoufox browser is not ready for web_search.";
-            diag::log_tagged_fmt("mcp_tools", "handle_web_search camoufox_not_ready err=%s", msg.c_str());
+            diag::log_tagged_fmt("mcp_tools", "handle_web_search camoufox_not_ready err=%s ready_ms=%lld total_ms=%lld",
+                msg.c_str(),
+                web_tool_elapsed_ms_since(ready_start),
+                web_tool_elapsed_ms_since(handler_start));
             set_last_web_error(msg);
             return tool_result_t::error(msg);
         }
+        const long long ready_ms = web_tool_elapsed_ms_since(ready_start);
 
         const std::string extract_js = R"JS((() => {
 const maxResults = )JS" + std::to_string(max_results) + R"JS(;
@@ -2329,6 +2399,7 @@ return { browser: 'camoufox', engine_url: location.href, page_title: document.ti
 
         std::string failures;
         for (const auto& provider : providers) {
+            const auto provider_start = std::chrono::steady_clock::now();
             if (mcp_standalone::current_call_cancelled())
                 return tool_result_t::error("web_search cancelled by client request.");
             diag::log_tagged_fmt("mcp_tools", "handle_web_search camoufox_provider_begin provider=%s timeout_ms=%d query_len=%zu", provider.name, timeout_ms, query.size());
@@ -2338,20 +2409,24 @@ return { browser: 'camoufox', engine_url: location.href, page_title: document.ti
             nav_args["collect_response_chain"] = true;
             nav_args["clear_network_capture"] = true;
             nav_args["include_title"] = true;
+            const auto nav_start = std::chrono::steady_clock::now();
             auto nav = aida::burp::camoufox::call_tool("navigate", nav_args, timeout_ms);
+            const long long nav_ms = web_tool_elapsed_ms_since(nav_start);
             if (!nav.ok) {
                 std::string err = nav.error.empty() ? nav.text : nav.error;
                 if (err.empty()) err = "navigate failed";
-                diag::log_tagged_fmt("mcp_tools", "handle_web_search camoufox_provider_nav_failed provider=%s err=%s", provider.name, err.c_str());
+                diag::log_tagged_fmt("mcp_tools", "handle_web_search camoufox_provider_nav_failed provider=%s nav_ms=%lld err=%s", provider.name, nav_ms, err.c_str());
                 if (!failures.empty()) failures += "; ";
                 failures += std::string(provider.name) + ": " + err;
                 continue;
             }
+            const auto eval_start = std::chrono::steady_clock::now();
             auto eval = aida::burp::camoufox::evaluate_js(extract_js, true);
+            const long long eval_ms = web_tool_elapsed_ms_since(eval_start);
             if (!eval.ok) {
                 std::string err = eval.error.empty() ? eval.text : eval.error;
                 if (err.empty()) err = "evaluate_js failed";
-                diag::log_tagged_fmt("mcp_tools", "handle_web_search camoufox_provider_eval_failed provider=%s err=%s", provider.name, err.c_str());
+                diag::log_tagged_fmt("mcp_tools", "handle_web_search camoufox_provider_eval_failed provider=%s nav_ms=%lld eval_ms=%lld err=%s", provider.name, nav_ms, eval_ms, err.c_str());
                 if (!failures.empty()) failures += "; ";
                 failures += std::string(provider.name) + ": " + err;
                 continue;
@@ -2383,6 +2458,24 @@ return { browser: 'camoufox', engine_url: location.href, page_title: document.ti
             data["final_url"] = json_string_field(payload, "engine_url");
             data["page_title"] = json_string_field(payload, "page_title");
             data["candidate_links"] = payload.is_object() && payload.contains("candidates") ? payload["candidates"] : json(0);
+            data["navigation_summary"] = web_tool_navigation_summary(nav);
+            data["diagnostics_compact"] = true;
+            data["timing_ms"] = {
+                {"ready", ready_ms},
+                {"navigation", nav_ms},
+                {"evaluate", eval_ms},
+                {"provider_total", web_tool_elapsed_ms_since(provider_start)},
+                {"total", web_tool_elapsed_ms_since(handler_start)}
+            };
+            diag::log_tagged_fmt("mcp_tools",
+                "handle_web_search camoufox_provider_timing provider=%s ready_ms=%lld nav_ms=%lld eval_ms=%lld provider_total_ms=%lld total_ms=%lld results=%zu",
+                provider.name,
+                ready_ms,
+                nav_ms,
+                eval_ms,
+                web_tool_elapsed_ms_since(provider_start),
+                web_tool_elapsed_ms_since(handler_start),
+                count);
             return tool_result_t::ok("Found " + std::to_string(data["results"].size()) + " Camoufox browser result(s) for: " + query, data);
         }
 
@@ -2640,7 +2733,26 @@ return { browser: 'camoufox', engine_url: location.href, page_title: document.ti
 
     tool_result_t handle_webfetch(const json& params)
     {
-        diag::log_tagged_fmt("mcp_tools", "handle_webfetch entry transport=camoufox");
+        const auto handler_start = std::chrono::steady_clock::now();
+        char trace_id[64] = {};
+        _snprintf_s(trace_id, sizeof(trace_id), _TRUNCATE,
+            "webfetch-%lu-%llu",
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            static_cast<unsigned long long>(GetTickCount64()));
+        const auto status_entry = aida::burp::camoufox::get_status();
+        diag::log_tagged_fmt("mcp_tools",
+            "handle_webfetch entry transport=camoufox trace_id=%s bridge_state=%d child_pid=%u child_alive=%d browser_open=%d page_verified=%d page_count=%u active_page_len=%zu total_calls=%llu total_errors=%llu cleanup_pending=%d",
+            trace_id,
+            static_cast<int>(status_entry.state),
+            status_entry.child_pid,
+            status_entry.child_alive ? 1 : 0,
+            status_entry.browser_open ? 1 : 0,
+            status_entry.page_verified ? 1 : 0,
+            status_entry.page_count,
+            status_entry.active_page_url.size(),
+            static_cast<unsigned long long>(status_entry.total_calls),
+            static_cast<unsigned long long>(status_entry.total_errors),
+            status_entry.cleanup_pending ? 1 : 0);
         if (!params.contains("url") || !params["url"].is_string())
             return error("Missing required parameter: url");
 
@@ -2669,29 +2781,133 @@ return { browser: 'camoufox', engine_url: location.href, page_title: document.ti
         }
         timeout_sec = std::clamp(timeout_sec, 1, 120);
         const int timeout_ms = std::clamp(timeout_sec * 1000 + 10000, 15000, 130000);
+        const bool local_fixture = web_tool_is_loopback_fixture_url(url);
+        const bool diagnostic_mode = web_tool_diagnostic_mode(params);
 
+        const auto ready_start = std::chrono::steady_clock::now();
         if (!aida::burp::camoufox::ensure_ready()) {
             std::string msg = aida::burp::camoufox::last_error();
             if (msg.empty())
                 msg = "Camoufox browser is not ready for webfetch.";
-            diag::log_tagged_fmt("mcp_tools", "handle_webfetch camoufox_not_ready err=%s", msg.c_str());
+            const auto status_failed = aida::burp::camoufox::get_status();
+            diag::log_tagged_fmt("mcp_tools", "handle_webfetch camoufox_not_ready err=%s ready_ms=%lld total_ms=%lld",
+                msg.c_str(),
+                web_tool_elapsed_ms_since(ready_start),
+                web_tool_elapsed_ms_since(handler_start));
+            diag::log_tagged_fmt("mcp_tools",
+                "handle_webfetch camoufox_not_ready_status trace_id=%s bridge_state=%d child_pid=%u child_alive=%d browser_open=%d page_verified=%d page_count=%u active_page_len=%zu total_calls=%llu total_errors=%llu cleanup_pending=%d last_error_len=%zu",
+                trace_id,
+                static_cast<int>(status_failed.state),
+                status_failed.child_pid,
+                status_failed.child_alive ? 1 : 0,
+                status_failed.browser_open ? 1 : 0,
+                status_failed.page_verified ? 1 : 0,
+                status_failed.page_count,
+                status_failed.active_page_url.size(),
+                static_cast<unsigned long long>(status_failed.total_calls),
+                static_cast<unsigned long long>(status_failed.total_errors),
+                status_failed.cleanup_pending ? 1 : 0,
+                status_failed.last_error.size());
             return tool_result_t::error(msg);
         }
+        const long long ready_ms = web_tool_elapsed_ms_since(ready_start);
+        const auto status_ready = aida::burp::camoufox::get_status();
 
-        diag::log_tagged_fmt("mcp_tools", "handle_webfetch camoufox_navigate_begin url_len=%zu format=%s timeout_ms=%d", url.size(), format.c_str(), timeout_ms);
+        const int nav_timeout_ms = local_fixture ? std::min(timeout_ms, 8000) : timeout_ms;
+        diag::log_tagged_fmt("mcp_tools",
+            "handle_webfetch camoufox_ready trace_id=%s ready_ms=%lld bridge_state=%d child_pid=%u child_alive=%d browser_open=%d page_verified=%d page_count=%u active_page_len=%zu active_title_len=%zu total_calls=%llu total_errors=%llu last_call_ms=%llu last_nav_ms=%llu cleanup_pending=%d",
+            trace_id,
+            ready_ms,
+            static_cast<int>(status_ready.state),
+            status_ready.child_pid,
+            status_ready.child_alive ? 1 : 0,
+            status_ready.browser_open ? 1 : 0,
+            status_ready.page_verified ? 1 : 0,
+            status_ready.page_count,
+            status_ready.active_page_url.size(),
+            status_ready.active_page_title.size(),
+            static_cast<unsigned long long>(status_ready.total_calls),
+            static_cast<unsigned long long>(status_ready.total_errors),
+            static_cast<unsigned long long>(status_ready.last_call_ms),
+            static_cast<unsigned long long>(status_ready.last_nav_ms),
+            status_ready.cleanup_pending ? 1 : 0);
+        diag::log_tagged_fmt("mcp_tools",
+            "handle_webfetch camoufox_navigate_begin trace_id=%s url_len=%zu format=%s timeout_ms=%d nav_timeout_ms=%d local_fixture=%d diagnostic=%d wait_until=domcontentloaded collect_response_chain=%d clear_network_capture=%d fast_ready=%d",
+            trace_id,
+            url.size(),
+            format.c_str(),
+            timeout_ms,
+            nav_timeout_ms,
+            local_fixture ? 1 : 0,
+            diagnostic_mode ? 1 : 0,
+            (!local_fixture || diagnostic_mode) ? 1 : 0,
+            (!local_fixture || diagnostic_mode) ? 1 : 0,
+            (local_fixture && !diagnostic_mode) ? 1 : 0);
         json nav_args;
         nav_args["url"] = url;
         nav_args["wait_until"] = "domcontentloaded";
-        nav_args["collect_response_chain"] = true;
-        nav_args["clear_network_capture"] = true;
+        nav_args["collect_response_chain"] = !local_fixture || diagnostic_mode;
+        nav_args["clear_network_capture"] = !local_fixture || diagnostic_mode;
         nav_args["include_title"] = true;
-        auto nav = aida::burp::camoufox::call_tool("navigate", nav_args, timeout_ms);
+        nav_args["diagnostic"] = diagnostic_mode;
+        nav_args["aida_local_fixture_fast_ready"] = local_fixture && !diagnostic_mode;
+        nav_args["aida_trace_id"] = trace_id;
+        const auto nav_start = std::chrono::steady_clock::now();
+        auto nav = aida::burp::camoufox::call_tool("navigate", nav_args, nav_timeout_ms);
+        const long long nav_ms = web_tool_elapsed_ms_since(nav_start);
+        const auto status_after_nav = aida::burp::camoufox::get_status();
+        json nav_status_payload = camoufox_value_json(nav);
         if (!nav.ok) {
             std::string msg = nav.error.empty() ? nav.text : nav.error;
             if (msg.empty()) msg = "Camoufox navigation failed for webfetch.";
-            diag::log_tagged_fmt("mcp_tools", "handle_webfetch camoufox_navigate_failed err=%s", msg.c_str());
+            diag::log_tagged_fmt("mcp_tools",
+                "handle_webfetch camoufox_navigate_failed trace_id=%s err=%s ready_ms=%lld nav_ms=%lld total_ms=%lld local_fixture=%d bridge_state=%d child_pid=%u child_alive=%d browser_open=%d page_verified=%d page_count=%u active_page_len=%zu active_title_len=%zu total_calls=%llu total_errors=%llu last_call_ms=%llu last_nav_ms=%llu payload_object=%d final_status_present=%d response_chain_count=%zu last_error_len=%zu",
+                trace_id,
+                msg.c_str(),
+                ready_ms,
+                nav_ms,
+                web_tool_elapsed_ms_since(handler_start),
+                local_fixture ? 1 : 0,
+                static_cast<int>(status_after_nav.state),
+                status_after_nav.child_pid,
+                status_after_nav.child_alive ? 1 : 0,
+                status_after_nav.browser_open ? 1 : 0,
+                status_after_nav.page_verified ? 1 : 0,
+                status_after_nav.page_count,
+                status_after_nav.active_page_url.size(),
+                status_after_nav.active_page_title.size(),
+                static_cast<unsigned long long>(status_after_nav.total_calls),
+                static_cast<unsigned long long>(status_after_nav.total_errors),
+                static_cast<unsigned long long>(status_after_nav.last_call_ms),
+                static_cast<unsigned long long>(status_after_nav.last_nav_ms),
+                nav_status_payload.is_object() ? 1 : 0,
+                nav_status_payload.is_object() && (nav_status_payload.contains("final_status") || nav_status_payload.contains("status")) ? 1 : 0,
+                nav_status_payload.is_object() && nav_status_payload.contains("response_chain") && nav_status_payload["response_chain"].is_array() ? nav_status_payload["response_chain"].size() : 0,
+                status_after_nav.last_error.size());
             return tool_result_t::error(msg);
         }
+        diag::log_tagged_fmt("mcp_tools",
+            "handle_webfetch camoufox_navigate_ok trace_id=%s ready_ms=%lld nav_ms=%lld total_ms=%lld local_fixture=%d bridge_state=%d child_pid=%u child_alive=%d browser_open=%d page_verified=%d page_count=%u active_page_len=%zu active_title_len=%zu total_calls=%llu total_errors=%llu last_call_ms=%llu last_nav_ms=%llu payload_object=%d final_status_present=%d response_chain_count=%zu",
+            trace_id,
+            ready_ms,
+            nav_ms,
+            web_tool_elapsed_ms_since(handler_start),
+            local_fixture ? 1 : 0,
+            static_cast<int>(status_after_nav.state),
+            status_after_nav.child_pid,
+            status_after_nav.child_alive ? 1 : 0,
+            status_after_nav.browser_open ? 1 : 0,
+            status_after_nav.page_verified ? 1 : 0,
+            status_after_nav.page_count,
+            status_after_nav.active_page_url.size(),
+            status_after_nav.active_page_title.size(),
+            static_cast<unsigned long long>(status_after_nav.total_calls),
+            static_cast<unsigned long long>(status_after_nav.total_errors),
+            static_cast<unsigned long long>(status_after_nav.last_call_ms),
+            static_cast<unsigned long long>(status_after_nav.last_nav_ms),
+            nav_status_payload.is_object() ? 1 : 0,
+            nav_status_payload.is_object() && (nav_status_payload.contains("final_status") || nav_status_payload.contains("status")) ? 1 : 0,
+            nav_status_payload.is_object() && nav_status_payload.contains("response_chain") && nav_status_payload["response_chain"].is_array() ? nav_status_payload["response_chain"].size() : 0);
 
         const size_t max_browser_chars = 5u * 1024u * 1024u;
         const std::string extract_js = R"JS((() => {
@@ -2704,6 +2920,9 @@ let htmlTruncated = false;
 let textTruncated = false;
 if (html.length > maxChars) { html = html.slice(0, maxChars); htmlTruncated = true; }
 if (text.length > maxChars) { text = text.slice(0, maxChars); textTruncated = true; }
+const fixtureMarker = !!document.querySelector('[data-aida-fixture], [data-aida-fixture-ready], #aida-mcp-fixture, #aida-webfetch-fixture, [data-testid="aida-webfetch-fixture"]')
+  || /AIDA_MCP_FIXTURE|AIDA_WEBFETCH_FIXTURE|aida-webfetch-fixture/i.test(text || '')
+  || /AIDA_MCP_FIXTURE|AIDA_WEBFETCH_FIXTURE|aida-webfetch-fixture/i.test(html || '');
 return {
   browser: 'camoufox',
   url: location.href,
@@ -2713,25 +2932,57 @@ return {
   ready_state: document.readyState || '',
   html,
   text,
+  body_length: text.length,
+  html_length: html.length,
+  fixture_marker: fixtureMarker,
   html_truncated: htmlTruncated,
   text_truncated: textTruncated
 };
 })())JS";
 
+        const auto extract_start = std::chrono::steady_clock::now();
         auto extracted = aida::burp::camoufox::evaluate_js(extract_js, true);
+        const long long extract_ms = web_tool_elapsed_ms_since(extract_start);
+        const auto status_after_extract = aida::burp::camoufox::get_status();
         if (!extracted.ok) {
             std::string msg = extracted.error.empty() ? extracted.text : extracted.error;
             if (msg.empty()) msg = "Camoufox page extraction failed for webfetch.";
-            diag::log_tagged_fmt("mcp_tools", "handle_webfetch camoufox_extract_failed err=%s", msg.c_str());
+            diag::log_tagged_fmt("mcp_tools",
+                "handle_webfetch camoufox_extract_failed trace_id=%s err=%s ready_ms=%lld nav_ms=%lld extract_ms=%lld total_ms=%lld local_fixture=%d bridge_state=%d child_pid=%u child_alive=%d browser_open=%d page_verified=%d page_count=%u active_page_len=%zu active_title_len=%zu total_calls=%llu total_errors=%llu last_call_ms=%llu last_nav_ms=%llu",
+                trace_id,
+                msg.c_str(),
+                ready_ms,
+                nav_ms,
+                extract_ms,
+                web_tool_elapsed_ms_since(handler_start),
+                local_fixture ? 1 : 0,
+                static_cast<int>(status_after_extract.state),
+                status_after_extract.child_pid,
+                status_after_extract.child_alive ? 1 : 0,
+                status_after_extract.browser_open ? 1 : 0,
+                status_after_extract.page_verified ? 1 : 0,
+                status_after_extract.page_count,
+                status_after_extract.active_page_url.size(),
+                status_after_extract.active_page_title.size(),
+                static_cast<unsigned long long>(status_after_extract.total_calls),
+                static_cast<unsigned long long>(status_after_extract.total_errors),
+                static_cast<unsigned long long>(status_after_extract.last_call_ms),
+                static_cast<unsigned long long>(status_after_extract.last_nav_ms));
             return tool_result_t::error(msg);
         }
 
         json payload = camoufox_value_json(extracted);
         if (!payload.is_object()) {
-            diag::log_tagged_fmt("mcp_tools", "handle_webfetch camoufox_extract_unexpected payload_object=0");
+            diag::log_tagged_fmt("mcp_tools",
+                "handle_webfetch camoufox_extract_unexpected payload_object=0 ready_ms=%lld nav_ms=%lld extract_ms=%lld total_ms=%lld",
+                ready_ms,
+                nav_ms,
+                extract_ms,
+                web_tool_elapsed_ms_since(handler_start));
             return tool_result_t::error("Camoufox page extraction returned an unexpected payload.");
         }
 
+        const auto convert_start = std::chrono::steady_clock::now();
         std::string html = json_string_field(payload, "html");
         std::string page_text = json_string_field(payload, "text");
         const std::string final_url = json_string_field(payload, "url");
@@ -2755,9 +3006,11 @@ return {
             output.resize(MAX_OUTPUT_BYTES);
             truncated = true;
         }
+        const long long convert_ms = web_tool_elapsed_ms_since(convert_start);
 
-        json nav_payload = camoufox_value_json(nav);
+        json nav_payload = nav_status_payload;
         json data;
+        data["trace_id"] = trace_id;
         data["url"] = final_url.empty() ? url : final_url;
         data["requested_url"] = url;
         data["title"] = title;
@@ -2778,22 +3031,68 @@ return {
                 data["status"] = nav_payload["status"];
             else
                 data["status_source"] = "not_reported";
-            if (nav_payload.contains("response_chain"))
+            if ((diagnostic_mode || !local_fixture) && nav_payload.contains("response_chain"))
                 data["response_chain"] = nav_payload["response_chain"];
+            else if (nav_payload.contains("response_chain") && nav_payload["response_chain"].is_array())
+                data["response_chain_count"] = nav_payload["response_chain"].size();
         } else {
             data["status_source"] = "not_reported";
         }
+        data["local_fixture"] = local_fixture;
+        data["fixture_marker"] = payload.contains("fixture_marker") && payload["fixture_marker"].is_boolean() ? payload["fixture_marker"] : json(false);
+        data["diagnostics_compact"] = local_fixture && !diagnostic_mode;
+        data["navigation_summary"] = web_tool_navigation_summary(nav);
+        data["timing_ms"] = {
+            {"ready", ready_ms},
+            {"navigation", nav_ms},
+            {"extract", extract_ms},
+            {"convert", convert_ms},
+            {"total", web_tool_elapsed_ms_since(handler_start)}
+        };
+        data["camoufox_status"] = {
+            {"bridge_state", static_cast<int>(status_after_extract.state)},
+            {"child_pid", status_after_extract.child_pid},
+            {"child_alive", status_after_extract.child_alive},
+            {"browser_open", status_after_extract.browser_open},
+            {"page_verified", status_after_extract.page_verified},
+            {"page_count", status_after_extract.page_count},
+            {"active_page_url_len", status_after_extract.active_page_url.size()},
+            {"active_page_title_len", status_after_extract.active_page_title.size()},
+            {"total_calls", status_after_extract.total_calls},
+            {"total_errors", status_after_extract.total_errors},
+            {"last_call_ms", status_after_extract.last_call_ms},
+            {"last_nav_ms", status_after_extract.last_nav_ms},
+            {"cleanup_pending", status_after_extract.cleanup_pending}
+        };
         data["html_truncated_in_browser"] = payload.contains("html_truncated") && payload["html_truncated"].is_boolean() ? payload["html_truncated"] : json(false);
         data["text_truncated_in_browser"] = payload.contains("text_truncated") && payload["text_truncated"].is_boolean() ? payload["text_truncated"] : json(false);
 
-        diag::log_tagged_fmt("mcp_tools", "handle_webfetch camoufox_ok final_url_len=%zu title_len=%zu format=%s bytes=%zu status=%lld status_source=%s truncated=%d",
+        diag::log_tagged_fmt("mcp_tools",
+            "handle_webfetch camoufox_ok trace_id=%s final_url_len=%zu title_len=%zu format=%s bytes=%zu status=%lld status_source=%s truncated=%d local_fixture=%d fixture_marker=%d ready_ms=%lld nav_ms=%lld extract_ms=%lld convert_ms=%lld total_ms=%lld bridge_state=%d child_pid=%u child_alive=%d page_count=%u active_page_len=%zu total_calls=%llu total_errors=%llu last_call_ms=%llu last_nav_ms=%llu",
+            trace_id,
             data["url"].is_string() ? data["url"].get<std::string>().size() : 0,
             title.size(),
             format.c_str(),
             output.size(),
             data["status"].is_number_integer() ? static_cast<long long>(data["status"].get<int64_t>()) : 0LL,
             json_string_field(data, "status_source").c_str(),
-            truncated ? 1 : 0);
+            truncated ? 1 : 0,
+            local_fixture ? 1 : 0,
+            data["fixture_marker"].is_boolean() && data["fixture_marker"].get<bool>() ? 1 : 0,
+            ready_ms,
+            nav_ms,
+            extract_ms,
+            convert_ms,
+            web_tool_elapsed_ms_since(handler_start),
+            static_cast<int>(status_after_extract.state),
+            status_after_extract.child_pid,
+            status_after_extract.child_alive ? 1 : 0,
+            status_after_extract.page_count,
+            status_after_extract.active_page_url.size(),
+            static_cast<unsigned long long>(status_after_extract.total_calls),
+            static_cast<unsigned long long>(status_after_extract.total_errors),
+            static_cast<unsigned long long>(status_after_extract.last_call_ms),
+            static_cast<unsigned long long>(status_after_extract.last_nav_ms));
 
         std::string text;
         text.reserve(output.size() + 160);
@@ -2897,7 +3196,7 @@ namespace mcp_standalone
             {{"root", "string", "Workspace-relative root directory", true}, {"pattern", "string", "Regex pattern", true}, {"file_pattern", "string", "Case-insensitive file glob using * and ?", false}, {"limit", "number", "Maximum matches", false}, {"max_visited", "number", "Maximum entries to visit", false}, {"max_file_size", "number", "Maximum file size to read", false}, {"timeout_ms", "number", "Traversal deadline in milliseconds", false}},
             true, handle_grep_in_files, mcp_standalone::tool_visibility_t::internal_only});
         srv.register_tool({"web_search", "Search the web through the bundled Camoufox browser and extract visible result links from rendered search pages.",
-            {{"query", "string", "Search query text", true}, {"max_results", "number", "Maximum results to return (default 5)", false}, {"timeout", "number", "Browser navigation timeout in seconds (1-60, default 8)", false}},
+            {{"query", "string", "Search query text", true}, {"max_results", "number", "Maximum results to return (default 5)", false}, {"timeout", "number", "Browser navigation timeout in seconds (1-60, default 8)", false}, {"diagnostic", "boolean", "Preserve expanded browser diagnostics when available", false}},
             true, handle_web_search, mcp_standalone::tool_visibility_t::internal_only});
         srv.register_tool({"webfetch",
             "Open a URL in the bundled Camoufox browser and return rendered markdown, plain text, or raw HTML. "
@@ -2905,7 +3204,8 @@ namespace mcp_standalone
             "Output capped at ~200 KB; max timeout 120 seconds.",
             {{"url", "string", "Absolute http:// or https:// URL", true},
              {"format", "string", "Output format: markdown (default), text, or html", false},
-             {"timeout", "number", "Browser navigation timeout in seconds (1-120, default 30)", false}},
+             {"timeout", "number", "Browser navigation timeout in seconds (1-120, default 30)", false},
+             {"diagnostic", "boolean", "Preserve expanded browser diagnostics instead of compact local-fixture success summaries", false}},
             true, handle_webfetch, mcp_standalone::tool_visibility_t::internal_only});
 
 

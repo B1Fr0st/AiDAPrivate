@@ -142,6 +142,8 @@ constexpr uint64_t k_call_stack_symbol_max_delta = 0x10000ull;
 constexpr uint32_t k_call_stack_export_max_names = 65536u;
 constexpr uint32_t k_call_stack_export_max_functions = 65536u;
 constexpr uint64_t k_call_stack_export_max_array_bytes = 1024ull * 1024ull;
+constexpr uint64_t k_call_stack_total_symbol_budget_us = 150000ull;
+constexpr uint64_t k_call_stack_frame_symbol_budget_us = 25000ull;
 
 std::mutex& call_stack_resolver_mutex() {
 	static std::mutex m;
@@ -156,6 +158,10 @@ std::unordered_map<uint64_t, call_stack_symbol_resolution_t>& call_stack_resolut
 uint64_t resolver_elapsed_us(std::chrono::steady_clock::time_point t0) {
 	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
 		std::chrono::steady_clock::now() - t0).count());
+}
+
+bool resolver_budget_expired(std::chrono::steady_clock::time_point deadline) {
+	return std::chrono::steady_clock::now() >= deadline;
 }
 
 std::string lower_ascii_copy(std::string s) {
@@ -201,6 +207,31 @@ std::string combine_resolver_status(const std::string& pdb_status, const std::st
 	if (export_status.empty())
 		return pdb_status;
 	return pdb_status + ";" + export_status;
+}
+
+call_stack_symbol_resolution_t module_rva_resolution(
+	uint64_t address,
+	const driver_bridge::module_info_t* module,
+	const char* status,
+	std::chrono::steady_clock::time_point t0)
+{
+	call_stack_symbol_resolution_t result;
+	result.address = address;
+	if (module != nullptr) {
+		result.module_name = module->name;
+		result.module_base = module->base;
+		result.module_size = module->size;
+		result.module_offset = address - module->base;
+		result.function_name = module_rva_fallback_name(*module, address);
+	} else {
+		result.function_name.clear();
+	}
+	result.source = module != nullptr ? "module_rva" : "none";
+	result.status = status ? status : "module_rva_fallback";
+	result.symbol_address = address;
+	result.symbol_offset = 0;
+	result.elapsed_us = resolver_elapsed_us(t0);
+	return result;
 }
 
 bool read_target_exact(uint64_t address, void* out, size_t size) {
@@ -273,13 +304,26 @@ std::string read_module_export_name(const driver_bridge::module_info_t& module, 
 bool resolve_stack_symbol_from_pdb(const driver_bridge::module_info_t& module,
 	uint64_t address,
 	call_stack_symbol_resolution_t& out,
-	std::string& status)
+	std::string& status,
+	std::chrono::steady_clock::time_point budget_deadline)
 {
 	status.clear();
 	const std::string module_name_l = lower_ascii_copy(module.name);
 	const auto t0 = std::chrono::steady_clock::now();
-	std::lock_guard<std::mutex> lk(symbol_store::g_state.mutex);
+	if (resolver_budget_expired(budget_deadline)) {
+		status = "pdb_budget_exhausted_before_lock";
+		return false;
+	}
+	std::unique_lock<std::mutex> lk(symbol_store::g_state.mutex, std::try_to_lock);
+	if (!lk.owns_lock()) {
+		status = "pdb_lock_busy";
+		return false;
+	}
 	for (const auto& kv : symbol_store::g_state.modules) {
+		if (resolver_budget_expired(budget_deadline)) {
+			status = "pdb_budget_exhausted";
+			return false;
+		}
 		const auto& ms = kv.second;
 		const bool range_match = ms.base != 0 && ms.size != 0 && address >= ms.base && (address - ms.base) < ms.size;
 		const std::string store_module_name = ms.module_name.empty() ? kv.first : ms.module_name;
@@ -319,7 +363,7 @@ bool resolve_stack_symbol_from_pdb(const driver_bridge::module_info_t& module,
 		size_t scanned = 0;
 		bool budget_hit = false;
 		for (const auto& sym : ms.pdb.symbols) {
-			if ((++scanned & 0x7FFu) == 0 && resolver_elapsed_us(t0) > 3000) {
+			if ((++scanned & 0x7FFu) == 0 && (resolver_elapsed_us(t0) > 3000 || resolver_budget_expired(budget_deadline))) {
 				budget_hit = true;
 				break;
 			}
@@ -355,9 +399,14 @@ bool resolve_stack_symbol_from_pdb(const driver_bridge::module_info_t& module,
 bool resolve_stack_symbol_from_exports(const driver_bridge::module_info_t& module,
 	uint64_t address,
 	call_stack_symbol_resolution_t& out,
-	std::string& status)
+	std::string& status,
+	std::chrono::steady_clock::time_point budget_deadline)
 {
 	status.clear();
+	if (resolver_budget_expired(budget_deadline)) {
+		status = "export_budget_exhausted_before_parse";
+		return false;
+	}
 	if (!module_contains_address(module, address)) {
 		status = "export_module_mismatch";
 		return false;
@@ -460,6 +509,10 @@ bool resolve_stack_symbol_from_exports(const driver_bridge::module_info_t& modul
 	std::vector<DWORD> name_rvas;
 	std::vector<WORD> ordinals;
 	std::vector<DWORD> function_rvas;
+	if (resolver_budget_expired(budget_deadline)) {
+		status = "export_budget_exhausted_before_tables";
+		return false;
+	}
 	if (!read_module_rva_array(module, exp.AddressOfNames, name_count, name_rvas)) {
 		status = "export_names_unreadable";
 		return false;
@@ -480,7 +533,7 @@ bool resolve_stack_symbol_from_exports(const driver_bridge::module_info_t& modul
 	std::string best_name;
 	bool budget_hit = false;
 	for (uint32_t i = 0; i < name_count; ++i) {
-		if ((i & 0xFFu) == 0 && i != 0 && resolver_elapsed_us(t0) > 8000) {
+		if ((i & 0xFFu) == 0 && i != 0 && (resolver_elapsed_us(t0) > 8000 || resolver_budget_expired(budget_deadline))) {
 			budget_hit = true;
 			break;
 		}
@@ -497,6 +550,10 @@ bool resolve_stack_symbol_from_exports(const driver_bridge::module_info_t& modul
 		const uint64_t delta = static_cast<uint64_t>(target_rva - fn_rva);
 		if (delta >= best_delta || delta >= k_call_stack_symbol_max_delta)
 			continue;
+		if (resolver_budget_expired(budget_deadline)) {
+			budget_hit = true;
+			break;
+		}
 		const std::string candidate_name = read_module_export_name(module, name_rvas[i]);
 		if (candidate_name.empty())
 			continue;
@@ -537,7 +594,8 @@ void log_call_stack_symbol_resolution(const call_stack_symbol_resolution_t& r) {
 
 call_stack_symbol_resolution_t resolve_call_stack_symbol(
 	uint64_t address,
-	const std::vector<driver_bridge::module_info_t>& modules)
+	const std::vector<driver_bridge::module_info_t>& modules,
+	std::chrono::steady_clock::time_point budget_deadline)
 {
 	const auto t0 = std::chrono::steady_clock::now();
 	call_stack_symbol_resolution_t result;
@@ -553,16 +611,26 @@ call_stack_symbol_resolution_t resolve_call_stack_symbol(
 	result.module_base = module->base;
 	result.module_size = module->size;
 	result.module_offset = address - module->base;
+	if (resolver_budget_expired(budget_deadline)) {
+		result = module_rva_resolution(address, module, "symbol_budget_exhausted_before_resolution", t0);
+		log_call_stack_symbol_resolution(result);
+		return result;
+	}
 
 	std::string pdb_status;
-	if (resolve_stack_symbol_from_pdb(*module, address, result, pdb_status)) {
+	if (resolve_stack_symbol_from_pdb(*module, address, result, pdb_status, budget_deadline)) {
 		result.elapsed_us = resolver_elapsed_us(t0);
+		log_call_stack_symbol_resolution(result);
+		return result;
+	}
+	if (resolver_budget_expired(budget_deadline)) {
+		result = module_rva_resolution(address, module, ("symbol_budget_exhausted_after_pdb;" + pdb_status).c_str(), t0);
 		log_call_stack_symbol_resolution(result);
 		return result;
 	}
 
 	std::string export_status;
-	if (resolve_stack_symbol_from_exports(*module, address, result, export_status)) {
+	if (resolve_stack_symbol_from_exports(*module, address, result, export_status, budget_deadline)) {
 		result.elapsed_us = resolver_elapsed_us(t0);
 		log_call_stack_symbol_resolution(result);
 		return result;
@@ -2566,24 +2634,60 @@ bool set_register(const std::string& name, uint64_t value) {
 
 std::vector<stack_frame_t> get_call_stack() {
 	auto& st = g_state;
+	const auto started = std::chrono::steady_clock::now();
 	diag::log_tagged_fmt("dbg_engine", "get_call_stack: entry pid=%u tid=%u", st.target_pid, st.active_tid);
 	std::vector<stack_frame_t> frames;
 
+	const auto regs_started = std::chrono::steady_clock::now();
 	auto regs = get_registers();
+	const uint64_t regs_elapsed_us = resolver_elapsed_us(regs_started);
+	diag::log_tagged_fmt("dbg_engine",
+		"get_call_stack: registers rip=0x%llX rsp=0x%llX rbp=0x%llX elapsed_us=%llu",
+		static_cast<unsigned long long>(regs.rip),
+		static_cast<unsigned long long>(regs.rsp),
+		static_cast<unsigned long long>(regs.rbp),
+		static_cast<unsigned long long>(regs_elapsed_us));
 	if (regs.rip == 0 || regs.rsp == 0) {
-		diag::log_tagged_fmt("dbg_engine", "get_call_stack: empty regs (RIP=0 or RSP=0), returning empty");
+		diag::log_tagged_fmt("dbg_engine", "get_call_stack: empty regs (RIP=0 or RSP=0), returning empty elapsed_us=%llu",
+			static_cast<unsigned long long>(resolver_elapsed_us(started)));
 		publish_call_stack_resolutions({});
 		return frames;
 	}
 
+	const auto modules_started = std::chrono::steady_clock::now();
 	auto modules = driver_bridge::enumerate_modules();
+	diag::log_tagged_fmt("dbg_engine",
+		"get_call_stack: modules count=%zu elapsed_us=%llu",
+		modules.size(),
+		static_cast<unsigned long long>(resolver_elapsed_us(modules_started)));
 	std::vector<call_stack_symbol_resolution_t> resolution_records;
 	resolution_records.reserve(65);
+	std::unordered_map<uint64_t, call_stack_symbol_resolution_t> local_resolution_cache;
+	local_resolution_cache.reserve(65);
+	const auto symbol_budget_deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(k_call_stack_total_symbol_budget_us);
+	std::size_t cache_hits = 0;
+	std::size_t cache_misses = 0;
+	std::size_t budget_degraded = 0;
 
-	auto resolve = [&](uint64_t addr) -> stack_frame_t {
+	auto resolve = [&](uint64_t addr, std::size_t frame_index) -> stack_frame_t {
 		stack_frame_t f;
 		f.address = addr;
-		auto symbol = resolve_call_stack_symbol(addr, modules);
+		const auto frame_started = std::chrono::steady_clock::now();
+		call_stack_symbol_resolution_t symbol;
+		auto cache_it = local_resolution_cache.find(addr);
+		if (cache_it != local_resolution_cache.end()) {
+			symbol = cache_it->second;
+			++cache_hits;
+			symbol.elapsed_us = 0;
+			symbol.status += ";cache_hit";
+		} else {
+			++cache_misses;
+			const auto per_frame_deadline = std::min(symbol_budget_deadline, std::chrono::steady_clock::now() + std::chrono::microseconds(k_call_stack_frame_symbol_budget_us));
+			symbol = resolve_call_stack_symbol(addr, modules, per_frame_deadline);
+			local_resolution_cache.emplace(addr, symbol);
+		}
+		if (symbol.source == "module_rva" && symbol.status.find("budget") != std::string::npos)
+			++budget_degraded;
 		if (symbol.function_name.empty()) {
 			diag::log_tagged_fmt("dbg_engine",
 				"get_call_stack_unresolved_frame addr=0x%llX module=%s offset=0x%llX source=%s status=%s elapsed_us=%llu",
@@ -2594,6 +2698,18 @@ std::vector<stack_frame_t> get_call_stack() {
 				symbol.status.c_str(),
 				static_cast<unsigned long long>(symbol.elapsed_us));
 		}
+		diag::log_tagged_fmt("dbg_engine",
+			"get_call_stack_frame_symbol index=%zu addr=0x%llX module=%s offset=0x%llX function=%s source=%s status=%s resolver_elapsed_us=%llu frame_elapsed_us=%llu budget_remaining_us=%lld",
+			frame_index,
+			static_cast<unsigned long long>(symbol.address),
+			symbol.module_name.empty() ? "(none)" : symbol.module_name.c_str(),
+			static_cast<unsigned long long>(symbol.module_offset),
+			symbol.function_name.empty() ? "(empty)" : symbol.function_name.c_str(),
+			symbol.source.c_str(),
+			symbol.status.c_str(),
+			static_cast<unsigned long long>(symbol.elapsed_us),
+			static_cast<unsigned long long>(resolver_elapsed_us(frame_started)),
+			static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(symbol_budget_deadline - std::chrono::steady_clock::now()).count()));
 		f.module_name = symbol.module_name;
 		f.module_offset = symbol.module_offset;
 		f.function_name = symbol.function_name;
@@ -2602,19 +2718,46 @@ std::vector<stack_frame_t> get_call_stack() {
 	};
 
 
-	auto first = resolve(regs.rip);
+	auto first = resolve(regs.rip, 0);
 	frames.push_back(std::move(first));
 
 
 	uint64_t sp = regs.rsp;
-	for (int i = 0; i < 64; ++i) {
-		std::vector<uint8_t> buf;
-		if (!driver_bridge::read_memory(sp, 8, buf) || buf.size() < 8) break;
-
-		uint64_t ret;
-		std::memcpy(&ret, buf.data(), 8);
-
-
+	std::vector<uint8_t> stack_bytes;
+	const auto stack_read_started = std::chrono::steady_clock::now();
+	const bool stack_read_ok = driver_bridge::read_memory(sp, 64u * sizeof(uint64_t), stack_bytes);
+	bool stack_read_fallback = false;
+	std::size_t stack_read_failures = stack_read_ok ? 0 : 1;
+	std::size_t stack_qwords = stack_read_ok ? stack_bytes.size() / sizeof(uint64_t) : 0;
+	if (stack_qwords > 64)
+		stack_qwords = 64;
+	if (stack_qwords == 0) {
+		stack_read_fallback = true;
+		stack_bytes.clear();
+		for (std::size_t i = 0; i < 64; ++i) {
+			std::vector<uint8_t> word;
+			if (!driver_bridge::read_memory(sp + i * sizeof(uint64_t), sizeof(uint64_t), word) || word.size() < sizeof(uint64_t)) {
+				++stack_read_failures;
+				break;
+			}
+			stack_bytes.insert(stack_bytes.end(), word.begin(), word.begin() + sizeof(uint64_t));
+			++stack_qwords;
+		}
+	}
+	const uint64_t stack_read_elapsed_us = resolver_elapsed_us(stack_read_started);
+	std::size_t invalid_stack_words = 0;
+	diag::log_tagged_fmt("dbg_engine",
+		"get_call_stack: stack_read rsp=0x%llX ok=%d fallback=%d bytes=%zu qwords=%zu failures=%zu elapsed_us=%llu",
+		static_cast<unsigned long long>(sp),
+		stack_read_ok ? 1 : 0,
+		stack_read_fallback ? 1 : 0,
+		stack_bytes.size(),
+		stack_qwords,
+		stack_read_failures,
+		static_cast<unsigned long long>(stack_read_elapsed_us));
+	for (std::size_t i = 0; i < stack_qwords; ++i) {
+		uint64_t ret = 0;
+		std::memcpy(&ret, stack_bytes.data() + i * sizeof(uint64_t), sizeof(ret));
 		bool valid = false;
 		for (const auto& m : modules) {
 			if (module_contains_address(m, ret)) {
@@ -2624,11 +2767,13 @@ std::vector<stack_frame_t> get_call_stack() {
 		}
 
 		if (valid && ret > 0x10000) {
-			auto frame = resolve(ret);
+			auto frame = resolve(ret, frames.size());
 			frame.return_addr = ret;
 			frames.push_back(std::move(frame));
 		}
-		sp += 8;
+		else {
+			++invalid_stack_words;
+		}
 	}
 
 	{
@@ -2637,7 +2782,17 @@ std::vector<stack_frame_t> get_call_stack() {
 	}
 	publish_call_stack_resolutions(resolution_records);
 
-	diag::log_tagged_fmt("dbg_engine", "get_call_stack: result frames=%zu", frames.size());
+	diag::log_tagged_fmt("dbg_engine",
+		"get_call_stack: result frames=%zu modules=%zu stack_qwords=%zu stack_read_failures=%zu invalid_stack_words=%zu cache_hits=%zu cache_misses=%zu budget_degraded=%zu elapsed_us=%llu",
+		frames.size(),
+		modules.size(),
+		stack_qwords,
+		stack_read_failures,
+		invalid_stack_words,
+		cache_hits,
+		cache_misses,
+		budget_degraded,
+		static_cast<unsigned long long>(resolver_elapsed_us(started)));
 	return frames;
 }
 

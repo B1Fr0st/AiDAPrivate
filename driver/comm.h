@@ -2040,7 +2040,7 @@ namespace voyager {
         std::uint64_t ntdll_size_ = 0;
 
         bool send_request(DWORD control_code, void* input, DWORD input_size) const noexcept;
-        bool send_poll_request(void* input, DWORD input_size) const noexcept;
+        bool send_poll_request(void* input, DWORD input_size, std::uint64_t call_id, int iteration) const noexcept;
         bool force_heartbeat() const noexcept;
         std::size_t transfer_physical_read(std::uint32_t pid, std::uint64_t dtb, std::uint64_t address,
                                            void* buffer, std::size_t size) const noexcept;
@@ -2048,7 +2048,7 @@ namespace voyager {
                                             const void* buffer, std::size_t size) const noexcept;
         bool ensure_shellcode_allocated() noexcept;
         bool find_spoof_gadget() noexcept;
-        std::uint64_t call_function_attempt(std::uint64_t function_address, std::uint64_t arg1, std::uint64_t arg2, std::uint64_t arg3, std::uint64_t arg4, const DWORD* blacklist, int blacklist_count, bool& out_completed) noexcept;
+        std::uint64_t call_function_attempt(std::uint64_t call_id, int attempt_index, std::uint64_t function_address, std::uint64_t arg1, std::uint64_t arg2, std::uint64_t arg3, std::uint64_t arg4, const DWORD* blacklist, int blacklist_count, bool& out_completed) noexcept;
     };
 
     template<typename T>

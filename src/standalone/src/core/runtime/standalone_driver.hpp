@@ -347,6 +347,7 @@ namespace driver_bridge
     std::vector<memory_region_t> enumerate_memory_regions_for(uint32_t pid, size_t max_regions = 512);
     bool read_peb_for(uint32_t pid, peb_info_t& out);
     uint64_t resolve_export_for(uint32_t pid, uint64_t module_base, const char* export_name);
+    uint64_t resolve_export_for_kernel_strict(uint32_t pid, uint64_t module_base, const char* export_name);
     uint64_t allocate_memory_for(uint32_t pid, size_t size);
     bool free_memory_for(uint32_t pid, uint64_t address);
 
@@ -415,6 +416,47 @@ namespace driver_bridge
         bool require_deadline = false;
     };
 
+    struct remote_call_execution_diag_t {
+        std::string phase;
+        std::string completion_reason;
+        std::string worker_error_category;
+        std::string worker_error_message;
+        uint64_t call_id = 0;
+        uint64_t function_address = 0;
+        uint64_t result = 0;
+        uint64_t generation_at_entry = 0;
+        uint64_t generation_after = 0;
+        uint64_t queue_wait_ms = 0;
+        uint64_t elapsed_ms = 0;
+        uint64_t lower_elapsed_ms = 0;
+        uint64_t deadline_remaining_at_queue_ms = 0;
+        uint64_t deadline_remaining_at_start_ms = 0;
+        uint64_t deadline_remaining_at_finish_ms = 0;
+        uint32_t pid = 0;
+        uint32_t active_pid_entry = 0;
+        uint32_t active_pid_after = 0;
+        uint32_t timeout_ms = 0;
+        uint32_t gle = 0;
+        uint32_t worker_tid = 0;
+        uint32_t worker_alive = 0;
+        uint32_t queue_depth_at_submit = 0;
+        uint32_t queue_depth_at_start = 0;
+        uint32_t queue_depth_after_pop = 0;
+        uint32_t inflight_at_submit = 0;
+        uint32_t inflight_at_start = 0;
+        uint32_t inflight_after = 0;
+        int worker_error_value = 0;
+        bool completed = false;
+        bool lower_ok = false;
+        bool stale_generation = false;
+        bool cancelled = false;
+        bool deadline_expired = false;
+        bool lower_lock_timeout = false;
+        bool worker_exception = false;
+        bool worker_creation_failed = false;
+        bool late_completion = false;
+    };
+
     class scoped_remote_call_context_t {
     public:
         explicit scoped_remote_call_context_t(const remote_call_context_t& context);
@@ -435,6 +477,7 @@ namespace driver_bridge
     uint32_t current_remote_call_timeout_ms() noexcept;
     uint64_t current_remote_call_deadline_ms() noexcept;
     bool current_remote_call_cancelled() noexcept;
+    remote_call_execution_diag_t last_remote_call_execution_diag();
 
     bool set_hardware_breakpoint(uint32_t tid, int index, uint64_t address, int type = 0, int size = 0);
     bool clear_hardware_breakpoint(uint32_t tid, int index);

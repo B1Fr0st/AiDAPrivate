@@ -113,6 +113,21 @@ namespace ve {
 #define LBR_FORMAT_INFO2           0x7
 #define LBR_PERF_UNSSUPORTED       0x3F
 
+    inline uint32_t get_cpu_vendor(char vendor[13]) {
+        int regs[4] = {};
+        __cpuid(regs, 0);
+        RtlCopyMemory(vendor + 0, &regs[1], sizeof(regs[1]));
+        RtlCopyMemory(vendor + 4, &regs[3], sizeof(regs[3]));
+        RtlCopyMemory(vendor + 8, &regs[2], sizeof(regs[2]));
+        vendor[12] = 0;
+        return static_cast<uint32_t>(regs[0]);
+    }
+
+    inline bool is_genuine_intel_cpu(const char vendor[13]) {
+        constexpr SIZE_T vendor_length = sizeof("GenuineIntel") - 1;
+        return RtlCompareMemory(vendor, "GenuineIntel", vendor_length) == vendor_length;
+    }
+
 
     inline legacy_lbr_caps_t get_legacy_lbr_caps() {
         legacy_lbr_caps_t caps{};
@@ -236,25 +251,114 @@ namespace ve {
 
     inline bool detection_2(void) {
 
-        cpuid_eax_01 cpuid_1;
+        char cpu_vendor[13] = {};
+        const uint32_t max_basic_leaf = get_cpu_vendor(cpu_vendor);
+
+        cpuid_eax_01 cpuid_1{};
         __cpuid((int*)&cpuid_1, 1);
-        if (!cpuid_1.cpuid_feature_information_ecx.perfmon_and_debug_capability) {
+        cpuid_eax_07 cpuid_7{};
+        if (max_basic_leaf >= CPUID_STRUCTURED_EXTENDED_FEATURE_FLAGS) {
+            __cpuidex((int*)&cpuid_7, CPUID_STRUCTURED_EXTENDED_FEATURE_FLAGS, 0);
+        }
+
+        uint32_t family = cpuid_1.cpuid_version_information.family_id;
+        if (family == 0x0F) {
+            family += cpuid_1.cpuid_version_information.extended_family_id;
+        }
+        uint32_t model = cpuid_1.cpuid_version_information.model;
+        if (cpuid_1.cpuid_version_information.family_id == 0x06 ||
+            cpuid_1.cpuid_version_information.family_id == 0x0F) {
+            model |= cpuid_1.cpuid_version_information.extended_model_id << 4;
+        }
+        const uint32_t stepping = cpuid_1.cpuid_version_information.stepping_id;
+
+        if (!is_genuine_intel_cpu(cpu_vendor)) {
+            HVD_LOG_IMMEDIATE("ve_lbr_stack_skip reason=non_intel vendor=%.12s family=0x%x model=0x%x stepping=0x%x cpuid0_eax=0x%08x cpuid1_ecx=0x%08x cpuid7_edx=0x%08x cpu=%lu irql=%lu",
+                cpu_vendor,
+                family,
+                model,
+                stepping,
+                max_basic_leaf,
+                cpuid_1.cpuid_feature_information_ecx.flags,
+                cpuid_7.edx.flags,
+                KeGetCurrentProcessorNumber(),
+                static_cast<ULONG>(KeGetCurrentIrql()));
             return false;
         }
 
-        ia32_perf_capabilities_register cap;
-        cap.flags = __readmsr(IA32_PERF_CAPABILITIES);
+        if (!cpuid_1.cpuid_feature_information_ecx.perfmon_and_debug_capability) {
+            HVD_LOG_IMMEDIATE("ve_lbr_stack_skip reason=no_perfmon vendor=%.12s family=0x%x model=0x%x stepping=0x%x cpuid0_eax=0x%08x cpuid1_ecx=0x%08x cpuid7_edx=0x%08x cpu=%lu irql=%lu",
+                cpu_vendor,
+                family,
+                model,
+                stepping,
+                max_basic_leaf,
+                cpuid_1.cpuid_feature_information_ecx.flags,
+                cpuid_7.edx.flags,
+                KeGetCurrentProcessorNumber(),
+                static_cast<ULONG>(KeGetCurrentIrql()));
+            return false;
+        }
+
+        ia32_perf_capabilities_register cap{};
+        HVD_LOG_IMMEDIATE("ve_lbr_stack_perf_cap_pre vendor=%.12s family=0x%x model=0x%x stepping=0x%x cpuid0_eax=0x%08x cpuid1_ecx=0x%08x cpuid7_edx=0x%08x msr=0x%lx cpu=%lu irql=%lu",
+            cpu_vendor,
+            family,
+            model,
+            stepping,
+            max_basic_leaf,
+            cpuid_1.cpuid_feature_information_ecx.flags,
+            cpuid_7.edx.flags,
+            static_cast<ULONG>(IA32_PERF_CAPABILITIES),
+            KeGetCurrentProcessorNumber(),
+            static_cast<ULONG>(KeGetCurrentIrql()));
+        ULONG perf_cap_exception = 0;
+        __try {
+            cap.flags = __readmsr(IA32_PERF_CAPABILITIES);
+        }
+        __except ((perf_cap_exception = GetExceptionCode()), EXCEPTION_EXECUTE_HANDLER) {
+            HVD_LOG_IMMEDIATE("ve_lbr_stack_perf_cap_exception vendor=%.12s family=0x%x model=0x%x stepping=0x%x cpuid0_eax=0x%08x cpuid1_ecx=0x%08x cpuid7_edx=0x%08x msr=0x%lx exception_code=0x%08lx cpu=%lu irql=%lu",
+                cpu_vendor,
+                family,
+                model,
+                stepping,
+                max_basic_leaf,
+                cpuid_1.cpuid_feature_information_ecx.flags,
+                cpuid_7.edx.flags,
+                static_cast<ULONG>(IA32_PERF_CAPABILITIES),
+                perf_cap_exception,
+                KeGetCurrentProcessorNumber(),
+                static_cast<ULONG>(KeGetCurrentIrql()));
+            return false;
+        }
+        HVD_LOG_IMMEDIATE("ve_lbr_stack_perf_cap_post vendor=%.12s family=0x%x model=0x%x stepping=0x%x cap=0x%llx lbr_format=0x%x arch_lbr=%u cpu=%lu irql=%lu",
+            cpu_vendor,
+            family,
+            model,
+            stepping,
+            cap.flags,
+            static_cast<UINT32>(cap.lbr_format),
+            cpuid_7.edx.arch_lbr ? 1u : 0u,
+            KeGetCurrentProcessorNumber(),
+            static_cast<ULONG>(KeGetCurrentIrql()));
 
         bool lbr_supported = (cap.lbr_format != LBR_PERF_UNSSUPORTED);
 
         lbr_config_t config;
 
-        cpuid_eax_07 cpuid_7;
-        __cpuid((int*)&cpuid_7, CPUID_STRUCTURED_EXTENDED_FEATURE_FLAGS);
         if (cpuid_7.edx.arch_lbr) {
             config.mode = lbr_mode_t::LBR_MODE_ARCH;
 
             if (!lbr_supported) {
+                HVD_LOG_IMMEDIATE("ve_lbr_stack_arch_mismatch vendor=%.12s family=0x%x model=0x%x stepping=0x%x cap=0x%llx cpuid7_edx=0x%08x cpu=%lu irql=%lu",
+                    cpu_vendor,
+                    family,
+                    model,
+                    stepping,
+                    cap.flags,
+                    cpuid_7.edx.flags,
+                    KeGetCurrentProcessorNumber(),
+                    static_cast<ULONG>(KeGetCurrentIrql()));
                 return true;
             }
         }
@@ -516,6 +620,16 @@ namespace ve {
 
 
     inline bool detection_cr4_vmxe(void) {
+        char cpu_vendor[13] = {};
+        get_cpu_vendor(cpu_vendor);
+        if (!is_genuine_intel_cpu(cpu_vendor)) {
+            HVD_LOG_IMMEDIATE("ve_vmx_vmread_skip reason=non_intel vendor=%.12s cpu=%lu irql=%lu",
+                cpu_vendor,
+                KeGetCurrentProcessorNumber(),
+                static_cast<ULONG>(KeGetCurrentIrql()));
+            return false;
+        }
+
         uint64_t cr4 = __readcr4();
         bool vmxe_visible = (cr4 & (1ULL << 13)) != 0;
 

@@ -45,7 +45,8 @@ fire_result_t fire_payload(const insertion_point_t& ip,
                            bool                     capture_screenshot,
                            int                      per_payload_timeout_ms,
                            const std::string&       scheme_hint = std::string(),
-                           uint16_t                 port_hint   = 0);
+                           uint16_t                 port_hint   = 0,
+                           uint64_t                 absolute_deadline_ms = 0);
 
 struct scan_options_t
 {

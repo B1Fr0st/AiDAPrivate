@@ -28,12 +28,28 @@ namespace aida::infra::win_thread {
 
 inline constexpr unsigned default_stack_reserve = 512u * 1024u;
 inline constexpr unsigned fixture_stack_reserve = 256u * 1024u;
+inline constexpr DWORD msvc_cpp_exception_code = 0xE06D7363u;
 
 namespace detail {
 
 struct thread_state_t {
     std::function<void()> fn;
 };
+
+struct guarded_function_call_t {
+    const std::function<void()>* fn = nullptr;
+};
+
+inline int non_cpp_seh_filter(DWORD code)
+{
+    return code == msvc_cpp_exception_code ? EXCEPTION_CONTINUE_SEARCH : EXCEPTION_EXECUTE_HANDLER;
+}
+
+inline void run_guarded_function_call(guarded_function_call_t* call)
+{
+    if (call && call->fn && *call->fn)
+        (*call->fn)();
+}
 
 inline void run_state_fn(thread_state_t* state, void* raw_state)
 {
@@ -53,7 +69,7 @@ inline DWORD run_state_fn_guarded(thread_state_t* state, void* raw_state)
     DWORD seh_code = 0;
     __try {
         run_state_fn(state, raw_state);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    } __except (non_cpp_seh_filter(GetExceptionCode())) {
         seh_code = GetExceptionCode();
     }
     return seh_code;
@@ -64,11 +80,32 @@ inline DWORD destroy_state_guarded(thread_state_t* state)
     DWORD seh_code = 0;
     __try {
         delete state;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    } __except (non_cpp_seh_filter(GetExceptionCode())) {
         seh_code = GetExceptionCode();
     }
     return seh_code;
 }
+
+}
+
+inline DWORD run_function_seh_guarded(const std::function<void()>& fn)
+{
+    detail::guarded_function_call_t call{&fn};
+    DWORD seh_code = 0;
+    __try {
+        detail::run_guarded_function_call(&call);
+    } __except (detail::non_cpp_seh_filter(GetExceptionCode())) {
+        seh_code = GetExceptionCode();
+    }
+    return seh_code;
+}
+
+inline int non_cpp_seh_filter(DWORD code)
+{
+    return detail::non_cpp_seh_filter(code);
+}
+
+namespace detail {
 
 inline DWORD WINAPI entry(void* arg)
 {

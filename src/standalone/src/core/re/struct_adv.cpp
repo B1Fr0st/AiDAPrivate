@@ -400,6 +400,32 @@ tool_result_t observe(const json& params)
     result["access_value_evidence_available"] = value_capture_count != 0;
     result["access_sources"] = std::move(source_counts);
     result["snapshot_id"] = mem_snap.id;
+    const bool stimulus_present = params.contains("stimulus_id") || params.contains("stimulus_kind") || params.contains("stimulus_evidence");
+    result["monitor_session"] = {
+        {"base_va", sa_format_address(base)},
+        {"size", size},
+        {"duration_sec", duration_sec},
+        {"sample_count", std::max(1, duration_sec * 20)},
+        {"wait_budget_ms", wait_budget_ms},
+        {"monitor_complete", monitor_complete},
+        {"progress", static_cast<double>(struct_recon::g_state.progress.load())},
+        {"cancelled", !monitor_complete},
+        {"monitor_active_after", struct_recon::g_state.monitoring.load()},
+        {"cleanup_requested", !monitor_complete}
+    };
+    const bool functional_inference = stimulus_present && monitor_complete && access_count != 0;
+    result["stimulus"] = {
+        {"provided", stimulus_present},
+        {"stimulus_id", params.contains("stimulus_id") ? params["stimulus_id"] : json(nullptr)},
+        {"stimulus_kind", params.contains("stimulus_kind") ? params["stimulus_kind"] : json(nullptr)},
+        {"evidence_present", params.contains("stimulus_evidence")},
+        {"observed_access_evidence", access_count != 0},
+        {"observed_value_evidence", value_capture_count != 0},
+        {"functional_inference", functional_inference}
+    };
+    result["stimulus_evidence_present"] = params.contains("stimulus_evidence");
+    result["functional_inference"] = functional_inference;
+    result["functional_success"] = functional_inference;
     diag::log_tagged_fmt("struct_adv",
                          "observe exit pid=%u base=%s snapshot_id=%s fields=%zu monitor_complete=%d elapsed_ms=%llu",
                          scope.pid(),
@@ -614,7 +640,30 @@ tool_result_t array_detect(const json& params)
     const std::size_t max_elements = static_cast<std::size_t>(numeric_param(params, "max_elements", 256, 2, 4096));
     const std::uint64_t timeout_ms = numeric_param(params, "timeout_ms", 2500, 100, 60000);
     bool deadline_hit = false;
+    bool cancelled = false;
     auto timed_out = [&]() -> bool {
+        if (mcp_standalone::current_call_cancelled())
+        {
+            cancelled = true;
+            deadline_hit = true;
+            diag::log_tagged_fmt("struct_adv",
+                                 "array_detect cancelled pid=%u elapsed_ms=%llu diag_id=%s",
+                                 scope.pid(),
+                                 static_cast<unsigned long long>(GetTickCount64() - started_ms),
+                                 mcp_standalone::current_call_diag_id());
+            return true;
+        }
+        const std::uint64_t call_deadline = mcp_standalone::current_call_deadline_ms();
+        if (call_deadline != 0 && GetTickCount64() >= call_deadline)
+        {
+            deadline_hit = true;
+            diag::log_tagged_fmt("struct_adv",
+                                 "array_detect mcp_deadline pid=%u elapsed_ms=%llu diag_id=%s",
+                                 scope.pid(),
+                                 static_cast<unsigned long long>(GetTickCount64() - started_ms),
+                                 mcp_standalone::current_call_diag_id());
+            return true;
+        }
         if (GetTickCount64() - started_ms < timeout_ms)
             return false;
         deadline_hit = true;
@@ -633,6 +682,9 @@ tool_result_t array_detect(const json& params)
     bool bulk_ok = false;
     if (total_size64 != 0 && total_size64 <= 4ull * 1024ull * 1024ull)
     {
+        if (timed_out())
+            return tool_result_t::error("Struct array detection cancelled before bulk read.",
+                json{{"process_id", scope.pid()}, {"base_va", sa_format_address(base)}, {"elapsed_ms", GetTickCount64() - started_ms}, {"deadline_hit", deadline_hit}, {"cancelled", cancelled}});
         diag::log_tagged_fmt("struct_adv",
                              "array_detect bulk_read_begin pid=%u base=%s bytes=%llu",
                              scope.pid(),
@@ -648,6 +700,8 @@ tool_result_t array_detect(const json& params)
     }
     auto read_element = [&](std::size_t index, std::vector<std::uint8_t>& out) -> bool {
         out.clear();
+        if (timed_out())
+            return false;
         const std::uint64_t offset64 = static_cast<std::uint64_t>(index) * suspected_size;
         if (bulk_ok && offset64 + suspected_size <= bulk.size())
         {
@@ -740,6 +794,15 @@ tool_result_t array_detect(const json& params)
     {
         struct_recon::reconstructed_struct_t observed;
         std::vector<struct_recon::access_record_t> access_log;
+        const bool skip_access_snapshot = timed_out();
+        if (skip_access_snapshot)
+        {
+            diag::log_tagged_fmt("struct_adv",
+                                 "array_detect access_snapshot_skipped pid=%u elapsed_ms=%llu",
+                                 scope.pid(),
+                                 static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        }
+        else
         {
             std::lock_guard<std::mutex> lk(struct_recon::g_state.mutex);
             observed = struct_recon::g_state.current;
@@ -785,6 +848,8 @@ tool_result_t array_detect(const json& params)
                 {
                     if (element_patterns[i].empty())
                         continue;
+                    if ((access_pattern_elements & 0x1Fu) == 0 && timed_out())
+                        break;
                     ++access_pattern_elements;
                     std::size_t intersection = 0;
                     for (auto off : element_patterns[i])
@@ -846,6 +911,7 @@ tool_result_t array_detect(const json& params)
     result["matching_prefix_bytes"] = matching_prefix_bytes;
     result["timeout_ms"] = timeout_ms;
     result["deadline_hit"] = deadline_hit;
+    result["cancelled"] = cancelled;
     result["bulk_read"] = bulk_ok;
     result["elapsed_ms"] = GetTickCount64() - started_ms;
     diag::log_tagged_fmt("struct_adv",
@@ -857,6 +923,8 @@ tool_result_t array_detect(const json& params)
                          deadline_hit ? 1 : 0,
                          bulk_ok ? 1 : 0,
                          static_cast<unsigned long long>(GetTickCount64() - started_ms));
+    if (deadline_hit)
+        return tool_result_t::error(cancelled ? "Struct array detection cancelled." : "Struct array detection deadline reached before analysis completed.", result);
     return tool_result_t::ok(result);
 }
 
@@ -1029,16 +1097,37 @@ tool_result_t compare_snapshots(const json& params)
     result["field_summaries"] = std::move(field_summaries);
     result["field_summary_count"] = result["field_summaries"].size();
     result["field_summary_source"] = field_summary_source;
-    result["saw_mutation"] = result["change_count"].get<std::size_t>() > 0;
+    const bool mutation_observed = result["change_count"].get<std::size_t>() > 0;
+    const bool compare_stimulus_present = params.contains("stimulus_id") || params.contains("stimulus_kind") || params.contains("stimulus_evidence");
+    const bool compare_functional_inference = compare_stimulus_present && mutation_observed;
+    result["saw_mutation"] = mutation_observed;
     result["snapshots_equal"] = result["change_count"].get<std::size_t>() == 0;
-    result["functional_success"] = result["change_count"].get<std::size_t>() > 0;
+    result["functional_success"] = compare_functional_inference;
     result["elapsed_ms"] = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count());
+    result["monitor_session"] = {
+        {"snapshot_a_id", a_id},
+        {"snapshot_b_id", b_id},
+        {"snapshot_source", snapshot_source},
+        {"base_va", sa_format_address(base)},
+        {"struct_size", struct_size},
+        {"bytes_compared", result["bytes_compared"]}
+    };
+    result["stimulus"] = {
+        {"provided", compare_stimulus_present},
+        {"stimulus_id", params.contains("stimulus_id") ? params["stimulus_id"] : json(nullptr)},
+        {"stimulus_kind", params.contains("stimulus_kind") ? params["stimulus_kind"] : json(nullptr)},
+        {"evidence_present", params.contains("stimulus_evidence")},
+        {"mutation_observed", mutation_observed},
+        {"changed_byte_count", result["changed_byte_count"]},
+        {"functional_inference", compare_functional_inference}
+    };
+    result["stimulus_evidence_present"] = params.contains("stimulus_evidence");
     result["evidence"] = {
         {"snapshot_a_id", a_id},
         {"snapshot_b_id", b_id},
         {"snapshot_source", snapshot_source},
         {"bytes_compared", result["bytes_compared"]},
-        {"mutation_observed", result["functional_success"]},
+        {"mutation_observed", mutation_observed},
         {"changed_byte_count", result["changed_byte_count"]},
         {"field_summary_source", field_summary_source}
     };

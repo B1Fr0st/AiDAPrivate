@@ -515,7 +515,8 @@ static constexpr UINT kAidaSendOnlyPeekFlags = PM_REMOVE | PM_QS_SENDMESSAGE;
 static constexpr DWORD kAidaNonSendQueueBits = QS_INPUT | QS_POSTMESSAGE | QS_TIMER | QS_PAINT | QS_HOTKEY | QS_ALLPOSTMESSAGE;
 static constexpr DWORD kAidaPumpQueueBits = kAidaNonSendQueueBits | QS_SENDMESSAGE;
 static constexpr DWORD kAidaInteractiveQueueBits = QS_INPUT | QS_POSTMESSAGE | QS_HOTKEY | QS_ALLPOSTMESSAGE;
-static constexpr DWORD kAidaFrameLatencyWaitMs = 16;
+static constexpr UINT kAidaPresentSyncInterval = 0;
+static constexpr UINT kAidaPresentFlags = 0;
 bool CreateDeviceD3D(HWND hWnd);
 void CleanupDeviceD3D();
 void CreateRenderTarget();
@@ -2611,7 +2612,7 @@ __declspec(noinline) static DWORD seh_swapchain_present(IDXGISwapChain* sc, HRES
     }
     __try {
         aida_tracer::set_present_state("present_call", frame_number, sc, hr_out ? *hr_out : E_POINTER);
-        *hr_out = sc->Present(1, 0);
+        *hr_out = sc->Present(kAidaPresentSyncInterval, kAidaPresentFlags);
         aida_tracer::set_present_state("present_returned", frame_number, sc, *hr_out);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         aida_tracer::set_present_state("present_seh", frame_number, sc, hr_out ? *hr_out : E_POINTER);
@@ -2619,8 +2620,6 @@ __declspec(noinline) static DWORD seh_swapchain_present(IDXGISwapChain* sc, HRES
     }
     return 0;
 }
-
-static bool aida_cursor_over_window(HWND hwnd);
 
 static void configure_frame_latency_waitable()
 {
@@ -2651,80 +2650,6 @@ static void configure_frame_latency_waitable()
             g_SwapChainResizeFlags);
     }
     sc2->Release();
-}
-
-static void wait_for_frame_latency_object()
-{
-    HANDLE waitable = g_FrameLatencyWaitableObject;
-    if (!waitable)
-        return;
-    DWORD qs = ::GetQueueStatus(kAidaInteractiveQueueBits);
-    const DWORD current = HIWORD(qs);
-    if ((current & kAidaInteractiveQueueBits) != 0)
-    {
-        static std::atomic<unsigned long long> s_last_input_skip_log_ms{0};
-        static std::atomic<unsigned long long> s_input_skip_count{0};
-        const unsigned long long skips = s_input_skip_count.fetch_add(1, std::memory_order_acq_rel) + 1;
-        const unsigned long long now = GetTickCount64();
-        unsigned long long last = s_last_input_skip_log_ms.load(std::memory_order_acquire);
-        if ((skips <= 8 || now - last >= 5000ULL) &&
-            s_last_input_skip_log_ms.compare_exchange_strong(last, now, std::memory_order_acq_rel))
-        {
-            diag::log_tagged_fmt("render",
-                "frame_latency_wait_skipped_input skips=%llu qs=0x%08lX current=0x%04lX changed=0x%04lX cursor_over=%d focused=%d hwnd=0x%llX fg=0x%llX active=0x%llX focus=0x%llX tid=%lu",
-                skips,
-                static_cast<unsigned long>(qs),
-                static_cast<unsigned long>(current),
-                static_cast<unsigned long>(LOWORD(qs)),
-                aida_cursor_over_window(g_hwnd) ? 1 : 0,
-                aida_focus_monitor::focused() ? 1 : 0,
-                static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(g_hwnd)),
-                static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(::GetForegroundWindow())),
-                static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(::GetActiveWindow())),
-                static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(::GetFocus())),
-                ::GetCurrentThreadId());
-        }
-        return;
-    }
-    const unsigned long long wait_start = GetTickCount64();
-    DWORD wait_result = MsgWaitForMultipleObjectsEx(1, &waitable, kAidaFrameLatencyWaitMs, kAidaInteractiveQueueBits, MWMO_INPUTAVAILABLE);
-    const unsigned long long wait_elapsed = GetTickCount64() - wait_start;
-    static std::atomic<unsigned long long> s_last_wait_sample_ms{0};
-    static std::atomic<unsigned long long> s_wait_count{0};
-    static std::atomic<unsigned long long> s_wait_elapsed_total_ms{0};
-    const unsigned long long waits = s_wait_count.fetch_add(1, std::memory_order_acq_rel) + 1;
-    const unsigned long long total_wait = s_wait_elapsed_total_ms.fetch_add(wait_elapsed, std::memory_order_acq_rel) + wait_elapsed;
-    const unsigned long long now = GetTickCount64();
-    unsigned long long last_sample = s_last_wait_sample_ms.load(std::memory_order_acquire);
-    if ((wait_elapsed >= 16ULL || waits <= 8 || now - last_sample >= 15000ULL) &&
-        s_last_wait_sample_ms.compare_exchange_strong(last_sample, now, std::memory_order_acq_rel))
-    {
-        DWORD qs_after = ::GetQueueStatus(kAidaInteractiveQueueBits);
-        diag::log_tagged_fmt("render",
-            "frame_latency_wait_sample waits=%llu timeout_ms=%lu elapsed_ms=%llu avg_ms=%llu result=0x%08lX qs_before=0x%08lX qs_after=0x%08lX cursor_over=%d focused=%d hwnd=0x%llX fg=0x%llX active=0x%llX focus=0x%llX tid=%lu",
-            waits,
-            static_cast<unsigned long>(kAidaFrameLatencyWaitMs),
-            wait_elapsed,
-            waits ? (total_wait / waits) : 0ULL,
-            static_cast<unsigned long>(wait_result),
-            static_cast<unsigned long>(qs),
-            static_cast<unsigned long>(qs_after),
-            aida_cursor_over_window(g_hwnd) ? 1 : 0,
-            aida_focus_monitor::focused() ? 1 : 0,
-            static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(g_hwnd)),
-            static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(::GetForegroundWindow())),
-            static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(::GetActiveWindow())),
-            static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(::GetFocus())),
-            ::GetCurrentThreadId());
-    }
-    if (wait_result == WAIT_FAILED) {
-        DWORD gle = GetLastError();
-        static std::atomic<unsigned long long> s_last_fail_log_ms{0};
-        const unsigned long long now = GetTickCount64();
-        unsigned long long last = s_last_fail_log_ms.load(std::memory_order_acquire);
-        if (now - last >= 30000ULL && s_last_fail_log_ms.compare_exchange_strong(last, now, std::memory_order_acq_rel))
-            diag::log_tagged_fmt("render", "frame_latency_wait_failed gle=%lu handle=0x%llX", gle, static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(waitable)));
-    }
 }
 
 static bool aida_cursor_over_window(HWND hwnd)
@@ -4789,6 +4714,7 @@ int main(int, char**)
     const bool fileless_customer_launch = fileless_launch_active();
     while (!done)
     {
+        const uint64_t frame_start_tick_ms = static_cast<uint64_t>(GetTickCount64());
         aida_tracer::render_pulse(frame_number);
         aida_tracer::mark_render_phase("frame_top");
         if (frame_number < 5)
@@ -5347,8 +5273,6 @@ int main(int, char**)
             activate_fileless_window(hwnd, "fileless_ide_region_ready", frame_number);
         }
 
-        wait_for_frame_latency_object();
-
         if (frame_number < 5)
             crash_log_write("dx11_new_frame");
         if ((frame_number >= 270ULL && frame_number <= 320ULL))
@@ -5494,7 +5418,9 @@ int main(int, char**)
             diag::log_tagged_critical_fmt("render", "phase=pre_present frame=%llu", (unsigned long long)frame_number);
         aida_tracer::mark_render_phase("present");
         HRESULT hr = S_OK;
+        const uint64_t present_start_tick_ms = static_cast<uint64_t>(GetTickCount64());
         DWORD seh_present = seh_swapchain_present(g_pSwapChain, &hr, frame_number);
+        const uint64_t present_elapsed_ms = static_cast<uint64_t>(GetTickCount64()) - present_start_tick_ms;
         if (seh_present != 0)
             diag::log_tagged_critical_fmt("render", "SEH_in_present code=0x%08X frame=%llu",
                 seh_present, (unsigned long long)frame_number);
@@ -5511,6 +5437,31 @@ int main(int, char**)
 
         if (frame_number < 5)
             crash_log_fmt("frame_end #%llu", frame_number);
+        {
+            static uint64_t s_last_frame_timing_log_ms = 0;
+            const uint64_t timing_now_ms = static_cast<uint64_t>(GetTickCount64());
+            const uint64_t frame_elapsed_ms = timing_now_ms - frame_start_tick_ms;
+            const bool timing_due = (timing_now_ms - s_last_frame_timing_log_ms) >= 15000ULL;
+            const bool frame_slow = frame_elapsed_ms >= 20ULL || present_elapsed_ms >= 8ULL;
+            if (timing_due || (frame_slow && (timing_now_ms - s_last_frame_timing_log_ms) >= 500ULL)) {
+                s_last_frame_timing_log_ms = timing_now_ms;
+                const DWORD timing_qs = ::GetQueueStatus(kAidaInteractiveQueueBits);
+                diag::log_tagged_fmt("render",
+                    "frame_timing_sample frame=%llu frame_ms=%llu present_ms=%llu sync=%u flags=0x%08X hr=0x%08X cursor_over=%d foreground=%d interactive_pending=%d qs=0x%08lX threads_active=%lu tid=%lu",
+                    static_cast<unsigned long long>(frame_number),
+                    static_cast<unsigned long long>(frame_elapsed_ms),
+                    static_cast<unsigned long long>(present_elapsed_ms),
+                    static_cast<unsigned>(kAidaPresentSyncInterval),
+                    static_cast<unsigned>(kAidaPresentFlags),
+                    static_cast<unsigned>(hr),
+                    aida_cursor_over_window(hwnd) ? 1 : 0,
+                    aida_focus_monitor::focused() ? 1 : 0,
+                    (HIWORD(timing_qs) & kAidaInteractiveQueueBits) != 0 ? 1 : 0,
+                    static_cast<unsigned long>(timing_qs),
+                    static_cast<unsigned long>(count_current_process_threads(nullptr)),
+                    ::GetCurrentThreadId());
+            }
+        }
         frame_number++;
 
         {
@@ -5545,6 +5496,7 @@ int main(int, char**)
             const uint64_t since_interaction_ms = (now_ms > s_last_interaction_ms)
                 ? (now_ms - s_last_interaction_ms) : 0ull;
             const bool foreground = aida_focus_monitor::focused();
+            const bool foreground_like = true;
             const bool cursor_over_aida = aida_cursor_over_window(hwnd);
             const DWORD idle_qs = ::GetQueueStatus(kAidaInteractiveQueueBits);
             const bool interactive_pending = (HIWORD(idle_qs) & kAidaInteractiveQueueBits) != 0;
@@ -5568,11 +5520,12 @@ int main(int, char**)
                 const auto svc = work_queue::service_stats();
                 const auto cq = critical_work_queue::stats();
                 diag::log_tagged_fmt("render",
-                    "idle_pacing_sample frame=%llu post_frame_idle_wait_ms=%lu block_mask=0x%08X foreground=%d cursor_over=%d interactive_pending=%d qs=0x%08lX since_interaction_ms=%llu bulk_busy=%d full_test=%d threads=%lu thread_err=%lu wq_active=%u wq_pending=%zu wq_oldest_ms=%llu svc_active=%u svc_pending=%zu svc_oldest_ms=%llu cq_active=%u cq_pending=%zu cq_oldest_ms=%llu",
+                    "idle_pacing_sample frame=%llu post_frame_idle_wait_ms=%lu block_mask=0x%08X foreground=%d foreground_like=%d cursor_over=%d interactive_pending=%d qs=0x%08lX since_interaction_ms=%llu bulk_busy=%d full_test=%d threads=%lu thread_err=%lu wq_active=%u wq_pending=%zu wq_oldest_ms=%llu svc_active=%u svc_pending=%zu svc_oldest_ms=%llu cq_active=%u cq_pending=%zu cq_oldest_ms=%llu",
                     static_cast<unsigned long long>(frame_number),
                     0UL,
                     static_cast<unsigned>(idle_block_mask),
                     foreground ? 1 : 0,
+                    foreground_like ? 1 : 0,
                     cursor_over_aida ? 1 : 0,
                     interactive_pending ? 1 : 0,
                     static_cast<unsigned long>(idle_qs),
@@ -5637,13 +5590,8 @@ int main(int, char**)
     } catch (...) {
         diag::log_tagged_critical("main", "shutdown_license_workers_exception");
     }
-    try {
-        aida_shutdown_diag::mark("shutdown_driver_bridge");
-        driver_bridge::shutdown("main.shutdown_prelude");
-        diag::log_tagged_critical("main", "shutdown_driver_bridge_done");
-    } catch (...) {
-        diag::log_tagged_critical("main", "shutdown_driver_bridge_exception");
-    }
+    aida_shutdown_diag::mark("shutdown_driver_bridge_deferred");
+    diag::log_tagged_critical("main", "shutdown_driver_bridge_deferred reason=queue_drain_required");
     aida_shutdown_diag::mark("shutdown_prelude_done");
     diag::log_tagged_critical("main", "shutdown_prelude_done");
     aida_shutdown_diag::mark("shutdown_anti_tamper");
@@ -5701,6 +5649,7 @@ int main(int, char**)
     aida_shutdown_diag::mark("shutdown_exit_process");
     diag::log_tagged_critical("main", "shutdown_exit_process_pre");
     release_single_instance_gate();
+    diag::flush_async_logs(5000);
     ExitProcess(0);
     return 0;
 }

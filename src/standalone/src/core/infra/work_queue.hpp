@@ -10,6 +10,7 @@
 #include <mutex>
 #include <queue>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "../runtime/manual_map_tls.hpp"
@@ -184,12 +185,13 @@ inline void initialize_pool(detail::pool_t& p, int pool_size) {
                             if (!p.alive.load() && p.tasks.empty()) return;
                             task = std::move(p.tasks.front());
                             p.tasks.pop();
+                            const std::uint64_t task_started_ms = static_cast<std::uint64_t>(GetTickCount64());
                             if (worker_index < p.active_snapshots.size()) {
                                 auto& active = p.active_snapshots[worker_index];
                                 active.label = task.label;
                                 active.id = task.id;
                                 active.queued_ms = task.queued_ms;
-                                active.started_ms = static_cast<std::uint64_t>(GetTickCount64());
+                                active.started_ms = task_started_ms;
                                 active.tid = GetCurrentThreadId();
                             }
                         }
@@ -203,10 +205,41 @@ inline void initialize_pool(detail::pool_t& p, int pool_size) {
                                 static_cast<unsigned long long>(p.started_tasks.load(std::memory_order_acquire)),
                                 static_cast<unsigned long long>(p.finished_tasks.load(std::memory_order_acquire)));
                         }
+                        DWORD task_seh = 0;
                         try {
-                            if (task.fn)
-                                task.fn();
-                        } catch (...) {}
+                            task_seh = aida::infra::win_thread::run_function_seh_guarded(task.fn);
+                        } catch (const std::exception& ex) {
+                            diag::log_tagged_fmt("work_queue",
+                                "worker_task_exception id=%llu label=%s worker_index=%zu tid=%lu err=%s",
+                                static_cast<unsigned long long>(task.id),
+                                task.label.empty() ? "<unnamed>" : task.label.c_str(),
+                                worker_index,
+                                static_cast<unsigned long>(GetCurrentThreadId()),
+                                ex.what());
+                        } catch (...) {
+                            diag::log_tagged_fmt("work_queue",
+                                "worker_task_exception id=%llu label=%s worker_index=%zu tid=%lu err=unknown",
+                                static_cast<unsigned long long>(task.id),
+                                task.label.empty() ? "<unnamed>" : task.label.c_str(),
+                                worker_index,
+                                static_cast<unsigned long>(GetCurrentThreadId()));
+                        }
+                        if (task_seh != 0) {
+                            const std::uint64_t now_ms = static_cast<std::uint64_t>(GetTickCount64());
+                            const std::uint64_t age_ms = task.queued_ms != 0 && now_ms >= task.queued_ms ? now_ms - task.queued_ms : 0;
+                            diag::log_tagged_fmt("work_queue",
+                                "worker_task_seh id=%llu label=%s worker_index=%zu tid=%lu code=0x%08lX age_ms=%llu active=%u started=%llu finished=%llu shutting_down=%d",
+                                static_cast<unsigned long long>(task.id),
+                                task.label.empty() ? "<unnamed>" : task.label.c_str(),
+                                worker_index,
+                                static_cast<unsigned long>(GetCurrentThreadId()),
+                                static_cast<unsigned long>(task_seh),
+                                static_cast<unsigned long long>(age_ms),
+                                static_cast<unsigned>(p.active_tasks.load(std::memory_order_acquire)),
+                                static_cast<unsigned long long>(p.started_tasks.load(std::memory_order_acquire)),
+                                static_cast<unsigned long long>(p.finished_tasks.load(std::memory_order_acquire)),
+                                p.shutting_down.load(std::memory_order_acquire) ? 1 : 0);
+                        }
                         {
                             std::lock_guard<std::mutex> lk(p.mtx);
                             if (worker_index < p.active_snapshots.size())

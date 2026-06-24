@@ -3810,9 +3810,20 @@ tool_result_t find_device_vtable(const json& params)
     if (api == "auto")
     {
         json apis = json::array();
+        bool auto_cancelled = false;
+        auto push_cancelled_api = [&](const char* api_name) {
+            json cancelled = slots_to_result(scope.pid(), api_name, {});
+            cancelled["discovery_status"] = "cancelled";
+            cancelled["cancelled"] = true;
+            apis.push_back(std::move(cancelled));
+        };
         auto push_auto_api = [&](const char* api_name, const char* module_name) {
             if (dx_call_cancelled("find_device_vtable_auto", scope.pid(), started_ms))
+            {
+                auto_cancelled = true;
+                push_cancelled_api(api_name);
                 return;
+            }
             if (!target_module_loaded(scope.pid(), module_name))
             {
                 json skipped = slots_to_result(scope.pid(), api_name, {});
@@ -3827,30 +3838,48 @@ tool_result_t find_device_vtable(const json& params)
                 return;
             }
             apis.push_back(slots_to_result(scope.pid(), api_name, discover_api(scope.pid(), api_name, true)));
+            if (dx_call_cancelled("find_device_vtable_auto_after_api", scope.pid(), started_ms))
+                auto_cancelled = true;
         };
         if (!dx_call_cancelled("find_device_vtable_auto_d3d11", scope.pid(), started_ms))
             push_auto_api("d3d11", "d3d11.dll");
         else
-            apis.push_back(slots_to_result(scope.pid(), "d3d11", {}));
+        {
+            auto_cancelled = true;
+            push_cancelled_api("d3d11");
+        }
         if (!dx_call_cancelled("find_device_vtable_auto_d3d12", scope.pid(), started_ms))
             push_auto_api("d3d12", "d3d12.dll");
         else
-            apis.push_back(slots_to_result(scope.pid(), "d3d12", {}));
+        {
+            auto_cancelled = true;
+            push_cancelled_api("d3d12");
+        }
         if (!dx_call_cancelled("find_device_vtable_auto_dxgi", scope.pid(), started_ms))
             push_auto_api("dxgi", "dxgi.dll");
         else
-            apis.push_back(slots_to_result(scope.pid(), "dxgi", {}));
+        {
+            auto_cancelled = true;
+            push_cancelled_api("dxgi");
+        }
         if (!dx_call_cancelled("find_device_vtable_auto_vulkan", scope.pid(), started_ms))
             push_auto_api("vulkan", "vulkan-1.dll");
         else
-            apis.push_back(slots_to_result(scope.pid(), "vulkan", {}));
+        {
+            auto_cancelled = true;
+            push_cancelled_api("vulkan");
+        }
         json result;
         result["process_id"] = scope.pid();
         result["api"] = "auto";
         result["apis"] = std::move(apis);
+        result["cancelled"] = auto_cancelled;
+        result["elapsed_ms"] = GetTickCount64() - started_ms;
         diag::log_tagged_fmt("dx_hook", "find_device_vtable exit pid=%u api=auto elapsed_ms=%llu",
                              scope.pid(),
                              static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        if (auto_cancelled)
+            return tool_result_t::error("DX vtable discovery cancelled.", result);
         return tool_result_t::ok(result);
     }
     if (dx_call_cancelled("find_device_vtable_before_explicit", scope.pid(), started_ms))
@@ -3868,7 +3897,14 @@ tool_result_t find_device_vtable(const json& params)
                          slots.size(),
                          resolved,
                          static_cast<unsigned long long>(GetTickCount64() - started_ms));
-    return tool_result_t::ok(slots_to_result(scope.pid(), api, slots));
+    json result = slots_to_result(scope.pid(), api, slots);
+    result["elapsed_ms"] = GetTickCount64() - started_ms;
+    if (dx_call_cancelled("find_device_vtable_after_explicit", scope.pid(), started_ms))
+    {
+        result["cancelled"] = true;
+        return tool_result_t::error("DX vtable discovery cancelled.", result);
+    }
+    return tool_result_t::ok(result);
 }
 
 tool_result_t hook_manage(const json& params)
@@ -4740,6 +4776,14 @@ tool_result_t identify_bone_buffer(const json& params)
 
 tool_result_t map_resource_to_va(const json& params)
 {
+    const std::uint64_t started_ms = GetTickCount64();
+    auto deadline_remaining = []() -> std::uint64_t {
+        const std::uint64_t deadline = mcp_standalone::current_call_deadline_ms();
+        if (deadline == 0)
+            return 0;
+        const std::uint64_t now = GetTickCount64();
+        return deadline > now ? deadline - now : 0;
+    };
     active_process_scope_t scope(params);
     if (!scope.ok())
         return tool_result_t::error(scope.error());
@@ -4752,12 +4796,43 @@ tool_result_t map_resource_to_va(const json& params)
     if (handle == 0)
         return tool_result_t::error("'resource_handle' is required.");
     const std::size_t max_candidates = static_cast<std::size_t>(numeric_param(params, "max_candidates", 64, 1, 256));
+    diag::log_tagged_fmt("dx_hook",
+                         "map_resource_to_va enter pid=%u handle=%s max_candidates=%zu deadline_remaining_ms=%llu diag_id=%s",
+                         scope.pid(),
+                         sa_format_address(handle).c_str(),
+                         max_candidates,
+                         static_cast<unsigned long long>(deadline_remaining()),
+                         mcp_standalone::current_call_diag_id());
+    std::size_t query_count = 0;
+    std::size_t query_failures = 0;
+    std::size_t read_count = 0;
+    std::size_t read_failures = 0;
+    std::size_t preview_reads = 0;
+    std::size_t pointer_slots = 0;
+    std::size_t nested_slots = 0;
+    std::size_t gpu_candidates = 0;
+    std::size_t pointer_candidates = 0;
     std::vector<std::uint8_t> bytes;
     driver_bridge::memory_region_t handle_region{};
+    ++query_count;
     const bool handle_region_ok = query_region(scope.pid(), handle, handle_region);
+    if (!handle_region_ok)
+        ++query_failures;
     const bool handle_readable = handle_region_ok && is_readable(handle_region) && !is_guarded(handle_region);
+    diag::log_tagged_fmt("dx_hook",
+                         "map_resource_to_va handle_region pid=%u ok=%d readable=%d guarded=%d base=%s size=%llu protect=%s elapsed_ms=%llu",
+                         scope.pid(),
+                         handle_region_ok ? 1 : 0,
+                         handle_readable ? 1 : 0,
+                         handle_region_ok && is_guarded(handle_region) ? 1 : 0,
+                         handle_region_ok ? sa_format_address(handle_region.base).c_str() : "0x0",
+                         static_cast<unsigned long long>(handle_region_ok ? handle_region.size : 0),
+                         handle_region_ok ? sa_format_address(handle_region.protect).c_str() : "0x0",
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
+    ++read_count;
     if (!read_bytes(scope.pid(), handle, 0x400, bytes))
     {
+        ++read_failures;
         json result;
         result["process_id"] = scope.pid();
         result["resource_handle"] = sa_format_address(handle);
@@ -4770,8 +4845,38 @@ tool_result_t map_resource_to_va(const json& params)
             {"gpu_virtual_address_possible", !handle_readable},
             {"mapping_proof", "resource_handle_not_readable_as_process_va"}
         };
+        result["query_count"] = query_count;
+        result["query_failures"] = query_failures;
+        result["read_count"] = read_count;
+        result["read_failures"] = read_failures;
+        result["preview_reads"] = preview_reads;
+        result["pointer_slots"] = pointer_slots;
+        result["nested_slots"] = nested_slots;
+        result["pointer_candidates"] = pointer_candidates;
+        result["gpu_candidates"] = gpu_candidates;
+        result["phase"] = "initial_read";
+        result["partial"] = false;
+        result["found"] = false;
+        result["deadline_hit"] = false;
+        result["cancelled"] = false;
+        result["elapsed_ms"] = GetTickCount64() - started_ms;
+        diag::log_tagged_fmt("dx_hook",
+                             "map_resource_to_va exit pid=%u ok=0 phase=initial_read handle=%s bytes=0 query_count=%zu query_failures=%zu read_count=%zu read_failures=%zu elapsed_ms=%llu",
+                             scope.pid(),
+                             sa_format_address(handle).c_str(),
+                             query_count,
+                             query_failures,
+                             read_count,
+                             read_failures,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
         return tool_result_t::error("Failed to read resource object or descriptor as target-process memory.", result);
     }
+    diag::log_tagged_fmt("dx_hook",
+                         "map_resource_to_va initial_read pid=%u handle=%s ok=1 bytes=%zu elapsed_ms=%llu",
+                         scope.pid(),
+                         sa_format_address(handle).c_str(),
+                         bytes.size(),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     json candidates = json::array();
     std::set<std::uint64_t> seen;
     auto append_candidate = [&](json row) {
@@ -4792,8 +4897,12 @@ tool_result_t map_resource_to_va(const json& params)
                                 const std::string& chain,
                                 double confidence) -> std::optional<json> {
         driver_bridge::memory_region_t region{};
+        ++query_count;
         if (ptr == 0 || !query_region(scope.pid(), ptr, region))
+        {
+            ++query_failures;
             return std::nullopt;
+        }
         json row;
         row["field_offset"] = sa_format_address(offset);
         row["owner_va"] = sa_format_address(owner);
@@ -4809,6 +4918,8 @@ tool_result_t map_resource_to_va(const json& params)
         row["confidence"] = confidence;
         row["mapping_proof"] = is_readable(region) && !is_executable(region) && !is_guarded(region) ? "cpu_readable_process_va" : (is_executable(region) ? "executable_pointer_not_resource_backing" : "nonreadable_pointer");
         std::vector<std::uint8_t> preview;
+        ++preview_reads;
+        ++read_count;
         if (is_readable(region) && !is_guarded(region) && read_bytes(scope.pid(), ptr, 128, preview) && !preview.empty())
         {
             row["preview_floats"] = preview_floats(preview);
@@ -4819,11 +4930,17 @@ tool_result_t map_resource_to_va(const json& params)
             if (!is_executable(region) && std::max(run64, run48) != 0)
                 row["confidence"] = std::min(0.98, confidence + 0.20);
         }
+        else
+        {
+            ++read_failures;
+        }
+        ++pointer_candidates;
         return row;
     };
     auto append_gpu_candidate = [&](std::uint64_t gpu_va, std::uint64_t size, std::uint64_t owner, std::uint64_t offset, const std::string& source) {
         if (gpu_va == 0 || candidates.size() >= max_candidates)
             return;
+        ++gpu_candidates;
         json row = make_gpu_va_candidate(-1, gpu_va, size, source, 0.44);
         row["candidate_va"] = sa_format_address(gpu_va);
         row["owner_va"] = sa_format_address(owner);
@@ -4846,10 +4963,19 @@ tool_result_t map_resource_to_va(const json& params)
         direct["confidence"] = 0.40;
         direct["mapping_proof"] = "caller_supplied_cpu_readable_process_va";
         append_candidate(std::move(direct));
+        diag::log_tagged_fmt("dx_hook",
+                             "map_resource_to_va direct_candidate pid=%u handle=%s candidates=%zu elapsed_ms=%llu",
+                             scope.pid(),
+                             sa_format_address(handle).c_str(),
+                             candidates.size(),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
     }
 
     std::uint64_t vtable_va = 0;
-    read_u64(scope.pid(), handle, vtable_va);
+    ++read_count;
+    const bool vtable_ptr_ok = read_u64(scope.pid(), handle, vtable_va);
+    if (!vtable_ptr_ok)
+        ++read_failures;
     json vtable_evidence;
     vtable_evidence["vtable_va"] = vtable_va ? json(sa_format_address(vtable_va)) : json(nullptr);
     vtable_evidence["method_count_sampled"] = 0;
@@ -4857,6 +4983,7 @@ tool_result_t map_resource_to_va(const json& params)
     if (vtable_va != 0)
     {
         std::vector<std::uint8_t> vtable_bytes;
+        ++read_count;
         if (read_bytes(scope.pid(), vtable_va, 16 * sizeof(std::uint64_t), vtable_bytes) && vtable_bytes.size() >= sizeof(std::uint64_t))
         {
             json methods = json::array();
@@ -4867,7 +4994,10 @@ tool_result_t map_resource_to_va(const json& params)
                 std::uint64_t fn = 0;
                 std::memcpy(&fn, vtable_bytes.data() + i * sizeof(std::uint64_t), sizeof(fn));
                 driver_bridge::memory_region_t fn_region{};
+                ++query_count;
                 const bool executable = fn != 0 && query_region(scope.pid(), fn, fn_region) && is_executable(fn_region) && !is_guarded(fn_region);
+                if (fn == 0 || !executable)
+                    ++query_failures;
                 if (executable)
                     ++executable_methods;
                 methods.push_back({{"slot", i}, {"va", fn ? json(sa_format_address(fn)) : json(nullptr)}, {"executable", executable}, {"owner", fn ? module_owner_for_address(scope.pid(), fn) : json(nullptr)}});
@@ -4876,14 +5006,100 @@ tool_result_t map_resource_to_va(const json& params)
             vtable_evidence["executable_method_count"] = executable_methods;
             vtable_evidence["methods"] = std::move(methods);
         }
+        else
+        {
+            ++read_failures;
+        }
     }
+    diag::log_tagged_fmt("dx_hook",
+                         "map_resource_to_va vtable pid=%u vtable=%s ptr_ok=%d method_count=%zu executable=%zu read_count=%zu read_failures=%zu query_count=%zu query_failures=%zu elapsed_ms=%llu",
+                         scope.pid(),
+                         sa_format_address(vtable_va).c_str(),
+                         vtable_ptr_ok ? 1 : 0,
+                         vtable_evidence["method_count_sampled"].get<std::size_t>(),
+                         vtable_evidence["executable_method_count"].get<std::size_t>(),
+                         read_count,
+                         read_failures,
+                          query_count,
+                          query_failures,
+                          static_cast<unsigned long long>(GetTickCount64() - started_ms));
+
+    auto sorted_candidate_copy = [&]() {
+        json rows = candidates;
+        std::sort(rows.begin(), rows.end(), [](const json& a, const json& b) {
+            const double ca = a.contains("confidence") && a["confidence"].is_number() ? a["confidence"].get<double>() : 0.0;
+            const double cb = b.contains("confidence") && b["confidence"].is_number() ? b["confidence"].get<double>() : 0.0;
+            if (ca != cb)
+                return ca > cb;
+            const bool ae = a.contains("executable") && a["executable"].is_boolean() && a["executable"].get<bool>();
+            const bool be = b.contains("executable") && b["executable"].is_boolean() && b["executable"].get<bool>();
+            return !ae && be;
+        });
+        return rows;
+    };
+    auto build_result = [&](const char* phase, bool partial, bool deadline_hit, bool cancelled) {
+        json rows = sorted_candidate_copy();
+        json result;
+        result["process_id"] = scope.pid();
+        result["resource_handle"] = sa_format_address(handle);
+        result["handle_region"] = handle_region_ok ? json(region_json(handle_region)) : json(nullptr);
+        result["com_vtable_evidence"] = vtable_evidence;
+        result["candidates"] = std::move(rows);
+        result["count"] = result["candidates"].size();
+        result["candidate_count"] = result["candidates"].size();
+        result["found"] = !result["candidates"].empty();
+        result["va"] = result["candidates"].empty() ? json(nullptr) : result["candidates"][0]["candidate_va"];
+        result["phase"] = phase ? phase : "";
+        result["partial"] = partial;
+        result["deadline_hit"] = deadline_hit;
+        result["cancelled"] = cancelled;
+        result["deadline_remaining_ms"] = deadline_remaining();
+        result["capability"] = {
+            {"cpu_pointer_walk", true},
+            {"max_candidates", max_candidates},
+            {"gpu_virtual_address_mapping_proven", !result["candidates"].empty() && result["candidates"][0].contains("cpu_va_mapped") && result["candidates"][0]["cpu_va_mapped"].is_boolean() && result["candidates"][0]["cpu_va_mapped"].get<bool>()},
+            {"descriptor_gpu_va_reported_as_cpu_va", false}
+        };
+        result["query_count"] = query_count;
+        result["query_failures"] = query_failures;
+        result["read_count"] = read_count;
+        result["read_failures"] = read_failures;
+        result["preview_reads"] = preview_reads;
+        result["pointer_slots"] = pointer_slots;
+        result["nested_slots"] = nested_slots;
+        result["pointer_candidates"] = pointer_candidates;
+        result["gpu_candidates"] = gpu_candidates;
+        result["elapsed_ms"] = GetTickCount64() - started_ms;
+        return result;
+    };
+    auto is_high_confidence_backing = [](const json& row) {
+        const bool readable = row.contains("readable") && row["readable"].is_boolean() && row["readable"].get<bool>();
+        const bool executable = row.contains("executable") && row["executable"].is_boolean() && row["executable"].get<bool>();
+        const bool guarded = row.contains("guarded") && row["guarded"].is_boolean() && row["guarded"].get<bool>();
+        const double confidence = row.contains("confidence") && row["confidence"].is_number() ? row["confidence"].get<double>() : 0.0;
+        const std::string proof = row.value("mapping_proof", std::string());
+        const std::string source = row.value("source", std::string());
+        const std::uint64_t matrix_count = row.contains("matrix_count") && row["matrix_count"].is_number_unsigned() ? row["matrix_count"].get<std::uint64_t>() : 0;
+        return readable && !executable && !guarded && proof == "cpu_readable_process_va" &&
+            (confidence >= 0.72 || source == "d3d12_cbv_descriptor_buffer_location_cpu_mapped" || matrix_count != 0);
+    };
 
     for (std::size_t off = 0; off + 8 <= bytes.size(); off += 8)
     {
+        ++pointer_slots;
+        if (dx_call_cancelled("map_resource_to_va_pointer_walk", scope.pid(), started_ms))
+        {
+            const bool cancelled = mcp_standalone::current_call_cancelled();
+            return tool_result_t::error(cancelled ? "Resource VA mapping cancelled." : "Resource VA mapping deadline reached.", build_result("pointer_walk", true, !cancelled, cancelled));
+        }
         std::uint64_t ptr = 0;
         std::memcpy(&ptr, bytes.data() + off, sizeof(ptr));
         if (auto row = make_pointer_row(ptr, handle, static_cast<std::uint64_t>(off), "resource_object_qword_pointer", "resource_handle+" + sa_format_address(off), 0.35))
+        {
             append_candidate(*row);
+            if (is_high_confidence_backing(*row))
+                return tool_result_t::ok(build_result("pointer_walk_high_confidence", false, false, false));
+        }
         if (off + 12 <= bytes.size())
         {
             std::uint32_t size32 = 0;
@@ -4891,6 +5107,7 @@ tool_result_t map_resource_to_va(const json& params)
             if (ptr != 0 && size32 != 0 && size32 <= 512u * 1024u * 1024u && (ptr & 0xFu) == 0)
             {
                 driver_bridge::memory_region_t ptr_region{};
+                ++query_count;
                 if (query_region(scope.pid(), ptr, ptr_region) && is_readable(ptr_region) && !is_guarded(ptr_region))
                 {
                     if (auto row = make_pointer_row(ptr, handle, static_cast<std::uint64_t>(off), "d3d12_cbv_descriptor_buffer_location_cpu_mapped", "descriptor.BufferLocation", 0.72))
@@ -4899,10 +5116,13 @@ tool_result_t map_resource_to_va(const json& params)
                         (*row)["gpu_va"] = sa_format_address(ptr);
                         (*row)["cpu_va_mapped"] = true;
                         append_candidate(*row);
+                        if (is_high_confidence_backing(*row))
+                            return tool_result_t::ok(build_result("descriptor_high_confidence", false, false, false));
                     }
                 }
                 else
                 {
+                    ++query_failures;
                     append_gpu_candidate(ptr, size32, handle, static_cast<std::uint64_t>(off), "d3d12_cbv_descriptor_gpu_va");
                 }
             }
@@ -4910,51 +5130,106 @@ tool_result_t map_resource_to_va(const json& params)
         if (candidates.size() >= max_candidates)
             break;
     }
+    diag::log_tagged_fmt("dx_hook",
+                         "map_resource_to_va pointer_walk pid=%u slots=%zu candidates=%zu pointer_candidates=%zu gpu_candidates=%zu query_count=%zu query_failures=%zu read_count=%zu read_failures=%zu elapsed_ms=%llu",
+                         scope.pid(),
+                         pointer_slots,
+                         candidates.size(),
+                         pointer_candidates,
+                         gpu_candidates,
+                         query_count,
+                         query_failures,
+                         read_count,
+                         read_failures,
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
 
     json first_level = candidates;
     for (const auto& row : first_level)
     {
         if (candidates.size() >= max_candidates)
             break;
+        if (dx_call_cancelled("map_resource_to_va_nested_walk", scope.pid(), started_ms))
+        {
+            const bool cancelled = mcp_standalone::current_call_cancelled();
+            return tool_result_t::error(cancelled ? "Resource VA mapping cancelled." : "Resource VA mapping deadline reached.", build_result("nested_walk", true, !cancelled, cancelled));
+        }
         std::uint64_t base = 0;
         if (!row.contains("candidate_va") || !parse_u64_value(row["candidate_va"], base) || base == 0)
             continue;
         if (row.contains("executable") && row["executable"].is_boolean() && row["executable"].get<bool>())
             continue;
         std::vector<std::uint8_t> nested;
+        ++read_count;
         if (!read_bytes(scope.pid(), base, 0x180, nested) || nested.size() < sizeof(std::uint64_t))
+        {
+            ++read_failures;
             continue;
+        }
         for (std::size_t off = 0; off + sizeof(std::uint64_t) <= nested.size() && candidates.size() < max_candidates; off += sizeof(std::uint64_t))
         {
+            ++nested_slots;
+            if (dx_call_cancelled("map_resource_to_va_nested_slots", scope.pid(), started_ms))
+            {
+                const bool cancelled = mcp_standalone::current_call_cancelled();
+                return tool_result_t::error(cancelled ? "Resource VA mapping cancelled." : "Resource VA mapping deadline reached.", build_result("nested_slots", true, !cancelled, cancelled));
+            }
             std::uint64_t ptr = 0;
             std::memcpy(&ptr, nested.data() + off, sizeof(ptr));
             if (auto nested_row = make_pointer_row(ptr, base, static_cast<std::uint64_t>(off), "resource_nested_qword_pointer", row.value("chain", std::string("resource")) + "->" + sa_format_address(off), 0.28))
+            {
                 append_candidate(*nested_row);
+                if (is_high_confidence_backing(*nested_row))
+                    return tool_result_t::ok(build_result("nested_high_confidence", false, false, false));
+            }
         }
     }
-    std::sort(candidates.begin(), candidates.end(), [](const json& a, const json& b) {
-        const double ca = a.contains("confidence") && a["confidence"].is_number() ? a["confidence"].get<double>() : 0.0;
-        const double cb = b.contains("confidence") && b["confidence"].is_number() ? b["confidence"].get<double>() : 0.0;
-        if (ca != cb)
-            return ca > cb;
-        const bool ae = a.contains("executable") && a["executable"].is_boolean() && a["executable"].get<bool>();
-        const bool be = b.contains("executable") && b["executable"].is_boolean() && b["executable"].get<bool>();
-        return !ae && be;
-    });
-    json result;
-    result["process_id"] = scope.pid();
-    result["resource_handle"] = sa_format_address(handle);
-    result["handle_region"] = handle_region_ok ? json(region_json(handle_region)) : json(nullptr);
-    result["com_vtable_evidence"] = std::move(vtable_evidence);
-    result["candidates"] = std::move(candidates);
-    result["count"] = result["candidates"].size();
-    result["va"] = result["candidates"].empty() ? json(nullptr) : result["candidates"][0]["candidate_va"];
-    result["capability"] = {
-        {"cpu_pointer_walk", true},
-        {"max_candidates", max_candidates},
-        {"gpu_virtual_address_mapping_proven", !result["candidates"].empty() && result["candidates"][0].contains("cpu_va_mapped") && result["candidates"][0]["cpu_va_mapped"].is_boolean() && result["candidates"][0]["cpu_va_mapped"].get<bool>()},
-        {"descriptor_gpu_va_reported_as_cpu_va", false}
-    };
+    diag::log_tagged_fmt("dx_hook",
+                         "map_resource_to_va nested_walk pid=%u nested_slots=%zu candidates=%zu pointer_candidates=%zu gpu_candidates=%zu query_count=%zu query_failures=%zu read_count=%zu read_failures=%zu preview_reads=%zu elapsed_ms=%llu",
+                         scope.pid(),
+                         nested_slots,
+                         candidates.size(),
+                         pointer_candidates,
+                         gpu_candidates,
+                         query_count,
+                         query_failures,
+                         read_count,
+                         read_failures,
+                         preview_reads,
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
+    json result = build_result("complete", false, false, false);
+    if (result["count"].get<std::size_t>() == 0)
+    {
+        diag::log_tagged_fmt("dx_hook",
+                             "map_resource_to_va exit pid=%u ok=0 handle=%s count=0 query_count=%zu query_failures=%zu read_count=%zu read_failures=%zu pointer_slots=%zu nested_slots=%zu pointer_candidates=%zu gpu_candidates=%zu elapsed_ms=%llu",
+                             scope.pid(),
+                             sa_format_address(handle).c_str(),
+                             query_count,
+                             query_failures,
+                             read_count,
+                             read_failures,
+                             pointer_slots,
+                             nested_slots,
+                             pointer_candidates,
+                             gpu_candidates,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        result["failure_reason"] = "no_cpu_readable_resource_backing_candidate";
+        return tool_result_t::error("No CPU-readable resource backing candidate was recovered.", result);
+    }
+    diag::log_tagged_fmt("dx_hook",
+                         "map_resource_to_va exit pid=%u ok=1 handle=%s count=%zu va=%s query_count=%zu query_failures=%zu read_count=%zu read_failures=%zu pointer_slots=%zu nested_slots=%zu pointer_candidates=%zu gpu_candidates=%zu elapsed_ms=%llu",
+                         scope.pid(),
+                         sa_format_address(handle).c_str(),
+                         result["count"].get<std::size_t>(),
+                         result["va"].is_string() ? result["va"].get<std::string>().c_str() : "null",
+                         query_count,
+                         query_failures,
+                         read_count,
+                         read_failures,
+                         pointer_slots,
+                         nested_slots,
+                         pointer_candidates,
+                         gpu_candidates,
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     return tool_result_t::ok(result);
 }
 

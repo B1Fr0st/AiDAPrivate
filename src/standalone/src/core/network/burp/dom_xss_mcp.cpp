@@ -54,6 +54,15 @@ uint64_t now_ms_steady()
     return static_cast<uint64_t>(duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count());
 }
 
+void append_phase_timing(json& phases, const char* phase, uint64_t start_ms, const char* status)
+{
+    phases.push_back({
+        {"phase", phase},
+        {"elapsed_ms", now_ms_steady() - start_ms},
+        {"status", status ? status : ""}
+    });
+}
+
 const char* json_type_name(const json& j)
 {
     if (j.is_object()) return "object";
@@ -231,6 +240,8 @@ tool_result_t tool_status(const json& params)
 
 tool_result_t tool_test_payload(const json& params)
 {
+    const uint64_t handler_start_ms = now_ms_steady();
+    json phase_timings = json::array();
     diag::log_tagged_fmt("mcp_burp", "dom_xss_test_payload entry params_shape=%s", json_shape(params).c_str());
     if (!params.is_object())
     {
@@ -261,31 +272,44 @@ tool_result_t tool_test_payload(const json& params)
     if (per_timeout < 1000)  per_timeout = 1000;
     if (per_timeout > 30000) per_timeout = 30000;
 
+    const uint64_t ensure_start_ms = now_ms_steady();
     if (!camoufox::ensure_ready())
     {
+        append_phase_timing(phase_timings, "ensure_ready", ensure_start_ms, "error");
         auto st = camoufox::get_status();
         std::string err = st.last_error.empty() ? camoufox::last_error() : st.last_error;
-        diag::log_tagged_fmt("mcp_burp", "dom_xss_test_payload bridge_not_ready state=%d errors=%llu last_error_len=%zu",
-            static_cast<int>(st.state), static_cast<unsigned long long>(st.total_errors), st.last_error.size());
+        diag::log_tagged_fmt("mcp_burp", "dom_xss_test_payload bridge_not_ready state=%d errors=%llu last_error_len=%zu elapsed_ms=%llu phase_timings=%s",
+            static_cast<int>(st.state), static_cast<unsigned long long>(st.total_errors), st.last_error.size(),
+            static_cast<unsigned long long>(now_ms_steady() - handler_start_ms), phase_timings.dump().c_str());
         return tool_result_t::error(err.empty() ? std::string("camoufox bridge not ready") : err);
     }
+    append_phase_timing(phase_timings, "ensure_ready", ensure_start_ms, "ok");
+    const uint64_t scope_start_ms = now_ms_steady();
     if (!scope::in_scope(target_url))
     {
-        diag::log_tagged_fmt("mcp_burp", "dom_xss_test_payload out_of_scope url_len=%zu", target_url.size());
+        append_phase_timing(phase_timings, "scope_check", scope_start_ms, "error");
+        diag::log_tagged_fmt("mcp_burp", "dom_xss_test_payload out_of_scope url_len=%zu elapsed_ms=%llu phase_timings=%s",
+            target_url.size(), static_cast<unsigned long long>(now_ms_steady() - handler_start_ms), phase_timings.dump().c_str());
         return tool_result_t::error("target out of scope");
     }
+    append_phase_timing(phase_timings, "scope_check", scope_start_ms, "ok");
 
     std::string scheme, host, path;
     uint16_t port = 0;
+    const uint64_t parse_start_ms = now_ms_steady();
     if (!audit_http::parse_url(target_url, scheme, host, port, path))
     {
-        diag::log_tagged_fmt("mcp_burp", "dom_xss_test_payload invalid_url url_len=%zu", target_url.size());
+        append_phase_timing(phase_timings, "parse_url", parse_start_ms, "error");
+        diag::log_tagged_fmt("mcp_burp", "dom_xss_test_payload invalid_url url_len=%zu elapsed_ms=%llu phase_timings=%s",
+            target_url.size(), static_cast<unsigned long long>(now_ms_steady() - handler_start_ms), phase_timings.dump().c_str());
         return tool_result_t::error("invalid target_url");
     }
+    append_phase_timing(phase_timings, "parse_url", parse_start_ms, "ok");
     const std::string safe_path = path_without_query(path);
     diag::log_tagged_fmt("mcp_burp", "dom_xss_test_payload parsed scheme=%s host=%s port=%u path=%s query=%d timeout_ms=%d capture=%d",
         scheme.c_str(), host.c_str(), static_cast<unsigned>(port), safe_path.c_str(), (int)(path.find('?') != std::string::npos), per_timeout, (int)capture);
 
+    const uint64_t point_start_ms = now_ms_steady();
     auto raw = synthesize_get_request(path, host);
     auto points = insertion_points::analyze(raw, target_url);
     const insertion_point_t* chosen = nullptr;
@@ -299,10 +323,12 @@ tool_result_t tool_test_payload(const json& params)
     }
     if (!chosen)
     {
+        append_phase_timing(phase_timings, "insertion_points", point_start_ms, "error");
         diag::log_tagged_fmt("mcp_burp", "dom_xss_test_payload no_insertion_point host=%s path=%s points=%zu",
             host.c_str(), safe_path.c_str(), points.size());
         return tool_result_t::error("no query or path insertion point available for the target");
     }
+    append_phase_timing(phase_timings, "insertion_points", point_start_ms, "ok");
 
     auto s = dom_xss::make_sentinel();
     const uint64_t fire_start_ms = GetTickCount64();
@@ -314,6 +340,7 @@ tool_result_t tool_test_payload(const json& params)
         attempts_used = attempt;
         const auto bridge_before = camoufox::get_status();
         const uint64_t attempt_start_ms = GetTickCount64();
+        const uint64_t attempt_phase_start_ms = now_ms_steady();
         diag::log_tagged_fmt("mcp_burp", "dom_xss_test_payload fire_begin attempt=%d host=%s path=%s chosen_kind=%s chosen_name=%s state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d calls=%llu errors=%llu last_error_len=%zu timeout_ms=%d capture=%d",
             attempt, host.c_str(), safe_path.c_str(), chosen->kind.c_str(), chosen->name.c_str(),
             static_cast<int>(bridge_before.state), static_cast<unsigned long long>(bridge_before.generation),
@@ -324,7 +351,9 @@ tool_result_t tool_test_payload(const json& params)
             per_timeout, capture ? 1 : 0);
         try {
             r = dom_xss::fire_payload(*chosen, payload_tpl, s, capture, per_timeout, scheme, port);
+            append_phase_timing(phase_timings, "fire_payload", attempt_phase_start_ms, r.ok ? "ok" : "error");
         } catch (const std::exception& ex) {
+            append_phase_timing(phase_timings, "fire_payload", attempt_phase_start_ms, "exception");
             const auto bridge_after = camoufox::get_status();
             diag::log_tagged_critical_fmt("mcp_burp", "dom_xss_test_payload exception attempt=%d host=%s path=%s chosen_kind=%s elapsed_ms=%llu state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d calls=%llu errors=%llu last_error_len=%zu err=%s",
                 attempt, host.c_str(), safe_path.c_str(), chosen->kind.c_str(),
@@ -336,6 +365,7 @@ tool_result_t tool_test_payload(const json& params)
                 static_cast<unsigned long long>(bridge_after.total_errors), bridge_after.last_error.size(), ex.what());
             return tool_result_t::error(std::string("DOM-XSS payload exception: ") + ex.what());
         } catch (...) {
+            append_phase_timing(phase_timings, "fire_payload", attempt_phase_start_ms, "exception");
             const auto bridge_after = camoufox::get_status();
             diag::log_tagged_critical_fmt("mcp_burp", "dom_xss_test_payload exception attempt=%d host=%s path=%s chosen_kind=%s elapsed_ms=%llu state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d calls=%llu errors=%llu last_error_len=%zu err=unknown",
                 attempt, host.c_str(), safe_path.c_str(), chosen->kind.c_str(),
@@ -391,6 +421,17 @@ tool_result_t tool_test_payload(const json& params)
     data["sentinel_token"] = s.token;
     data["canary_fn"] = s.canary_fn;
     data["attempts"] = attempts_used;
+    data["per_payload_timeout_ms"] = per_timeout;
+    data["elapsed_ms"] = now_ms_steady() - handler_start_ms;
+    data["early_exit_on_proof"] = r.ok && r.canary_fired;
+    data["phase_timings"] = phase_timings;
+    diag::log_tagged_fmt("mcp_burp", "dom_xss_test_payload phase_timing ok=%d canary_fired=%d early_exit_on_proof=%d attempts=%d elapsed_ms=%llu phase_timings=%s",
+        r.ok ? 1 : 0,
+        r.canary_fired ? 1 : 0,
+        (r.ok && r.canary_fired) ? 1 : 0,
+        attempts_used,
+        static_cast<unsigned long long>(data["elapsed_ms"].get<uint64_t>()),
+        phase_timings.dump().c_str());
     if (!r.ok && is_browser_infrastructure_error(r.error))
         return tool_result_t::error(r.error.empty() ? std::string("DOM-XSS browser execution failed") : r.error);
     return tool_result_t::ok(data);
@@ -398,6 +439,8 @@ tool_result_t tool_test_payload(const json& params)
 
 tool_result_t tool_scan(const json& params)
 {
+    const uint64_t handler_start_ms = now_ms_steady();
+    json phase_timings = json::array();
     diag::log_tagged_fmt("mcp_burp", "dom_xss_scan entry params_shape=%s", json_shape(params).c_str());
     if (!params.is_object()) {
         diag::log_tagged_fmt("mcp_burp", "dom_xss_scan invalid_params");
@@ -411,29 +454,42 @@ tool_result_t tool_scan(const json& params)
     const std::string target_url = params["target_url"].get<std::string>();
     diag::log_tagged_fmt("mcp_burp", "dom_xss_scan request url_len=%zu has_raw=%d has_raw_b64=%d",
         target_url.size(), (int)params.contains("raw_request"), (int)params.contains("raw_request_b64"));
+    const uint64_t ensure_start_ms = now_ms_steady();
     if (!camoufox::ensure_ready()) {
+        append_phase_timing(phase_timings, "ensure_ready", ensure_start_ms, "error");
         auto st = camoufox::get_status();
         std::string err = st.last_error.empty() ? camoufox::last_error() : st.last_error;
-        diag::log_tagged_fmt("mcp_burp", "dom_xss_scan bridge_not_ready state=%d errors=%llu last_error_len=%zu",
-            static_cast<int>(st.state), static_cast<unsigned long long>(st.total_errors), st.last_error.size());
+        diag::log_tagged_fmt("mcp_burp", "dom_xss_scan bridge_not_ready state=%d errors=%llu last_error_len=%zu elapsed_ms=%llu phase_timings=%s",
+            static_cast<int>(st.state), static_cast<unsigned long long>(st.total_errors), st.last_error.size(),
+            static_cast<unsigned long long>(now_ms_steady() - handler_start_ms), phase_timings.dump().c_str());
         return tool_result_t::error(err.empty() ? std::string("camoufox bridge not ready") : err);
     }
+    append_phase_timing(phase_timings, "ensure_ready", ensure_start_ms, "ok");
+    const uint64_t scope_start_ms = now_ms_steady();
     if (!scope::in_scope(target_url)) {
-        diag::log_tagged_fmt("mcp_burp", "dom_xss_scan out_of_scope url_len=%zu", target_url.size());
+        append_phase_timing(phase_timings, "scope_check", scope_start_ms, "error");
+        diag::log_tagged_fmt("mcp_burp", "dom_xss_scan out_of_scope url_len=%zu elapsed_ms=%llu phase_timings=%s",
+            target_url.size(), static_cast<unsigned long long>(now_ms_steady() - handler_start_ms), phase_timings.dump().c_str());
         return tool_result_t::error("target out of scope");
     }
+    append_phase_timing(phase_timings, "scope_check", scope_start_ms, "ok");
 
     std::string scheme, host, path;
     uint16_t port = 0;
+    const uint64_t parse_start_ms = now_ms_steady();
     if (!audit_http::parse_url(target_url, scheme, host, port, path))
     {
-        diag::log_tagged_fmt("mcp_burp", "dom_xss_scan invalid_url url_len=%zu", target_url.size());
+        append_phase_timing(phase_timings, "parse_url", parse_start_ms, "error");
+        diag::log_tagged_fmt("mcp_burp", "dom_xss_scan invalid_url url_len=%zu elapsed_ms=%llu phase_timings=%s",
+            target_url.size(), static_cast<unsigned long long>(now_ms_steady() - handler_start_ms), phase_timings.dump().c_str());
         return tool_result_t::error("invalid target_url");
     }
+    append_phase_timing(phase_timings, "parse_url", parse_start_ms, "ok");
     const std::string safe_path = path_without_query(path);
     diag::log_tagged_fmt("mcp_burp", "dom_xss_scan parsed scheme=%s host=%s port=%u path=%s query=%d",
         scheme.c_str(), host.c_str(), static_cast<unsigned>(port), safe_path.c_str(), (int)(path.find('?') != std::string::npos));
 
+    const uint64_t raw_start_ms = now_ms_steady();
     std::vector<uint8_t> raw_request;
     if (params.contains("raw_request_b64") && params["raw_request_b64"].is_string()) {
         const std::string& raw_b64 = params["raw_request_b64"].get_ref<const std::string&>();
@@ -453,7 +509,9 @@ tool_result_t tool_scan(const json& params)
         raw_request = synthesize_get_request(path, host);
         diag::log_tagged_fmt("mcp_burp", "dom_xss_scan synthesized_get raw_len=%zu", raw_request.size());
     }
+    append_phase_timing(phase_timings, "raw_request", raw_start_ms, "ok");
 
+    const uint64_t options_start_ms = now_ms_steady();
     dom_xss::scan_options_t opts;
     if (params.contains("include_polyglot") && params["include_polyglot"].is_boolean())
         opts.include_polyglot = params["include_polyglot"].get<bool>();
@@ -495,6 +553,11 @@ tool_result_t tool_scan(const json& params)
     opts.scheme = scheme;
     opts.host   = host;
     opts.port   = port;
+    opts.cancelled = []() {
+        const auto st = camoufox::get_status();
+        return st.cleanup_pending || !st.child_alive;
+    };
+    append_phase_timing(phase_timings, "options", options_start_ms, "ok");
 
     std::string requested_kind;
     std::string requested_name;
@@ -520,12 +583,15 @@ tool_result_t tool_scan(const json& params)
         requested_kind.empty() ? "<none>" : requested_kind.c_str(),
         requested_name.empty() ? "<none>" : requested_name.c_str());
 
+    const uint64_t analyze_start_ms = now_ms_steady();
     auto points = insertion_points::analyze(raw_request, target_url);
+    append_phase_timing(phase_timings, "insertion_points", analyze_start_ms, "ok");
     diag::log_tagged_fmt("mcp_burp", "dom_xss_scan insertion_points total=%zu host=%s path=%s", points.size(), host.c_str(), safe_path.c_str());
     size_t total_emitted = 0;
     json per_point = json::array();
     size_t points_candidate = 0;
     size_t points_filtered = 0;
+    bool early_exit_on_proof = false;
     for (const auto& ip : points) {
         if (ip.kind != "query" && ip.kind != "path" &&
             ip.kind != "body_form" && ip.kind != "body_json" &&
@@ -540,21 +606,25 @@ tool_result_t tool_scan(const json& params)
             continue;
         }
         size_t emitted = 0;
+        const uint64_t point_scan_start_ms = now_ms_steady();
         try {
             emitted = dom_xss::scan_insertion_point(ip, opts);
         } catch (const std::exception& ex) {
+            append_phase_timing(phase_timings, "scan_point", point_scan_start_ms, "exception");
             last_scan_ms_slot().store(now_ms_wall());
             total_scans_slot().fetch_add(1);
             diag::log_tagged_critical_fmt("mcp_burp", "dom_xss_scan exception host=%s path=%s kind=%s param=%s err=%s",
                 host.c_str(), safe_path.c_str(), ip.kind.c_str(), ip.name.c_str(), ex.what());
             return tool_result_t::error(std::string("DOM-XSS scan exception: ") + ex.what());
         } catch (...) {
+            append_phase_timing(phase_timings, "scan_point", point_scan_start_ms, "exception");
             last_scan_ms_slot().store(now_ms_wall());
             total_scans_slot().fetch_add(1);
             diag::log_tagged_critical_fmt("mcp_burp", "dom_xss_scan exception host=%s path=%s kind=%s param=%s err=unknown",
                 host.c_str(), safe_path.c_str(), ip.kind.c_str(), ip.name.c_str());
             return tool_result_t::error("DOM-XSS scan exception: unknown");
         }
+        append_phase_timing(phase_timings, "scan_point", point_scan_start_ms, emitted > 0 ? "proof" : "ok");
         total_emitted += emitted;
         total_payloads_slot().fetch_add(opts.max_payloads_per_point);
         std::string point_error = dom_xss::last_error();
@@ -563,6 +633,7 @@ tool_result_t tool_scan(const json& params)
         e["name"] = ip.name;
         e["emitted"] = emitted;
         e["error"] = point_error;
+        e["elapsed_ms"] = now_ms_steady() - point_scan_start_ms;
         per_point.push_back(std::move(e));
         if (!point_error.empty() && is_browser_infrastructure_error(point_error)) {
             last_scan_ms_slot().store(now_ms_wall());
@@ -570,6 +641,15 @@ tool_result_t tool_scan(const json& params)
             diag::log_tagged_fmt("mcp_burp", "dom_xss_scan abort host=%s path=%s points_scanned=%zu issues_emitted=%zu error=%s",
                 host.c_str(), safe_path.c_str(), per_point.size(), total_emitted, point_error.c_str());
             return tool_result_t::error(point_error);
+        }
+        if (emitted > 0)
+        {
+            early_exit_on_proof = true;
+            diag::log_tagged_fmt("mcp_burp", "dom_xss_scan early_exit_on_proof host=%s path=%s kind=%s param=%s points_scanned=%zu issues_emitted=%zu elapsed_ms=%llu",
+                host.c_str(), safe_path.c_str(), ip.kind.c_str(), ip.name.c_str(),
+                per_point.size(), total_emitted,
+                static_cast<unsigned long long>(now_ms_steady() - handler_start_ms));
+            break;
         }
     }
     if ((!requested_kind.empty() || !requested_name.empty()) && per_point.empty()) {
@@ -583,6 +663,8 @@ tool_result_t tool_scan(const json& params)
         diag["filter_kind"] = requested_kind;
         diag["filter_name"] = requested_name;
         diag["per_point"] = per_point;
+        diag["phase_timings"] = phase_timings;
+        diag["elapsed_ms"] = now_ms_steady() - handler_start_ms;
         diag::log_tagged_fmt("mcp_burp", "dom_xss_scan filter_no_match host=%s path=%s points_total=%zu points_candidate=%zu points_filtered=%zu filter_kind=%s filter_name=%s",
             host.c_str(), safe_path.c_str(), points.size(), points_candidate, points_filtered,
             requested_kind.empty() ? "<none>" : requested_kind.c_str(),
@@ -602,13 +684,19 @@ tool_result_t tool_scan(const json& params)
     data["issues_emitted"] = total_emitted;
     data["filter_kind"] = requested_kind;
     data["filter_name"] = requested_name;
+    data["early_exit_on_proof"] = early_exit_on_proof;
+    data["per_payload_timeout_ms"] = opts.per_payload_timeout_ms;
+    data["elapsed_ms"] = now_ms_steady() - handler_start_ms;
+    data["phase_timings"] = phase_timings;
     std::string engine_error = dom_xss::last_error();
     data["last_engine_error"] = engine_error;
-    diag::log_tagged_fmt("mcp_burp", "dom_xss_scan ok host=%s path=%s points_total=%zu points_candidate=%zu points_filtered=%zu points_scanned=%zu issues_emitted=%zu filter_kind=%s filter_name=%s engine_error_len=%zu response_shape=%s",
+    diag::log_tagged_fmt("mcp_burp", "dom_xss_scan ok host=%s path=%s points_total=%zu points_candidate=%zu points_filtered=%zu points_scanned=%zu issues_emitted=%zu early_exit_on_proof=%d elapsed_ms=%llu filter_kind=%s filter_name=%s engine_error_len=%zu response_shape=%s phase_timings=%s",
         host.c_str(), safe_path.c_str(), points.size(), points_candidate, points_filtered, per_point.size(), total_emitted,
+        early_exit_on_proof ? 1 : 0,
+        static_cast<unsigned long long>(data["elapsed_ms"].get<uint64_t>()),
         requested_kind.empty() ? "<none>" : requested_kind.c_str(),
         requested_name.empty() ? "<none>" : requested_name.c_str(),
-        engine_error.size(), json_shape(data).c_str());
+        engine_error.size(), json_shape(data).c_str(), phase_timings.dump().c_str());
     if (!engine_error.empty() && is_browser_infrastructure_error(engine_error))
         return tool_result_t::error(engine_error);
     return tool_result_t::ok(data);

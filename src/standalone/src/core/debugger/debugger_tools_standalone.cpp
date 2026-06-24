@@ -3052,10 +3052,48 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 if (!e.handler_name.empty()) o["handler_name"] = e.handler_name;
                 arr.push_back(std::move(o));
             }
-            diag::log_tagged_fmt("dbg_tools", "debugger_get_seh_chain: returning %zu SEH entries", arr.size());
+            const auto seh_diag = seh_view::g_ui.diagnostics;
+            diag::log_tagged_fmt("dbg_tools",
+                "debugger_get_seh_chain: returning %zu SEH entries teb_ok=%d exception_list_ok=%d sentinel=%d empty_proven=%d reason=%s stack_attempted=%d stack_read_ok=%d stack_candidates=%u",
+                arr.size(),
+                seh_diag.teb_read_succeeded ? 1 : 0,
+                seh_diag.exception_list_read_ok ? 1 : 0,
+                seh_diag.sentinel_reached ? 1 : 0,
+                seh_diag.x64_empty_chain_proven ? 1 : 0,
+                seh_diag.empty_reason.c_str(),
+                seh_diag.stack_scan_attempted ? 1 : 0,
+                seh_diag.stack_scan_read_ok ? 1 : 0,
+                seh_diag.stack_scan_candidates);
             json result;
             result["count"]   = arr.size();
             result["entries"] = std::move(arr);
+            result["target_pid"] = seh_diag.target_pid;
+            result["active_tid"] = seh_diag.active_tid;
+            result["teb_va"] = sa_format_address(seh_diag.teb_va);
+            result["raw_exception_list"] = sa_format_address(seh_diag.raw_exception_list);
+            result["teb_query_attempted"] = seh_diag.teb_query_attempted;
+            result["teb_query_ok"] = seh_diag.teb_query_ok;
+            result["teb_query_returned"] = seh_diag.teb_query_returned;
+            result["teb_read_ok"] = seh_diag.teb_read_ok;
+            result["teb_read_succeeded"] = seh_diag.teb_read_succeeded;
+            result["exception_list_read_ok"] = seh_diag.exception_list_read_ok;
+            result["sentinel_reached"] = seh_diag.sentinel_reached;
+            result["x64_empty_chain_proven"] = seh_diag.x64_empty_chain_proven;
+            result["empty_reason"] = seh_diag.empty_reason;
+            result["chain_stop_reason"] = seh_diag.chain_stop_reason;
+            result["stack_scan"] = json{
+                {"attempted", seh_diag.stack_scan_attempted},
+                {"read_ok", seh_diag.stack_scan_read_ok},
+                {"start", sa_format_address(seh_diag.stack_scan_start)},
+                {"rsp", sa_format_address(seh_diag.rsp)},
+                {"size", seh_diag.stack_scan_size},
+                {"bytes", seh_diag.stack_scan_bytes},
+                {"candidate_count", seh_diag.stack_scan_candidates},
+                {"candidate_found", seh_diag.stack_scan_candidate_found},
+                {"candidate_frame", sa_format_address(seh_diag.stack_scan_candidate_frame)},
+                {"candidate_handler", sa_format_address(seh_diag.stack_scan_candidate_handler)},
+                {"reason", seh_diag.stack_scan_reason}
+            };
             return tool_result_t::ok(result);
         }
     });

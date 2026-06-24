@@ -26,6 +26,7 @@
 #include "customer_capsule.hpp"
 #include "hardware_id/hardware_id_v2.hpp"
 #include "plaintext_window.hpp"
+#include "../infra/critical_work_queue.hpp"
 #include "../testlab/test_all_features.hpp"
 #include "../../../../../src/shared/telemetry/telemetry_client.hpp"
 
@@ -3097,7 +3098,8 @@ namespace
                                   const std::string& session_token,
                                   const std::string& nonce,
                                   std::string& error_out,
-                                  json& response_out);
+                                  json& response_out,
+                                  const json* hwid_evidence = nullptr);
     bool is_authoritative_stop_response(const json& response);
     std::string license_response_reason(const json& response, const std::string& default_reason);
 
@@ -4353,8 +4355,47 @@ namespace
             static_cast<unsigned>(aida::hardware_id::v2::kFactorIdTpmEkSha256));
     }
 
-    std::string generate_hwid()
+    struct hwid_material_t
     {
+        std::string hwid;
+        json evidence = json::object();
+    };
+
+    json build_hwid_v2_evidence(const aida::hardware_id::v2::collection_t& c)
+    {
+        json factors = json::object();
+        uint32_t collected = 0;
+        for (std::size_t i = 0; i < aida::hardware_id::v2::kFactorCount; ++i)
+        {
+            const auto& f = c.factors[i];
+            if (!f.collected) continue;
+            ++collected;
+            factors[std::to_string(static_cast<unsigned>(f.id))] =
+                aida::hardware_id::v2::hash_to_hex(f.factor_hash);
+        }
+        return json::object({
+            {"hwid_version", static_cast<int>(aida::hardware_id::v2::kHwidVersion)},
+            {"hwid_v2_version", static_cast<int>(aida::hardware_id::v2::kHwidVersion)},
+            {"hwid_v2_factor_mask", c.factor_present_mask},
+            {"hwid_v2_factor_count", collected},
+            {"hwid_v2_tpm_present", c.tpm_present},
+            {"hwid_v2_factors", std::move(factors)}
+        });
+    }
+
+    void wipe_hwid_collection(aida::hardware_id::v2::collection_t& collection)
+    {
+        SecureZeroMemory(collection.hwid_hash.data(), collection.hwid_hash.size());
+        for (auto& f : collection.factors)
+        {
+            SecureZeroMemory(f.factor_hash.data(), f.factor_hash.size());
+            if (!f.bytes.empty()) SecureZeroMemory(f.bytes.data(), f.bytes.size());
+        }
+    }
+
+    bool collect_hwid_material(const char* phase, hwid_material_t& out)
+    {
+        out = hwid_material_t{};
         aida::hardware_id::v2::collection_t collection{};
         std::string err;
         if (!aida::hardware_id::v2::collect(collection, err))
@@ -4363,23 +4404,23 @@ namespace
             _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
                 "generate_hwid_v2_failed err=%.96s", err.c_str());
             lic_log(dbg);
-            SecureZeroMemory(collection.hwid_hash.data(), collection.hwid_hash.size());
-            for (auto& f : collection.factors)
-            {
-                SecureZeroMemory(f.factor_hash.data(), f.factor_hash.size());
-                if (!f.bytes.empty()) SecureZeroMemory(f.bytes.data(), f.bytes.size());
-            }
+            wipe_hwid_collection(collection);
+            out.hwid = "unavailable";
+            return false;
+        }
+        log_hwid_v2_collection(phase ? phase : "generate", collection);
+        out.hwid = aida::hardware_id::v2::hash_to_hex(collection.hwid_hash);
+        out.evidence = build_hwid_v2_evidence(collection);
+        wipe_hwid_collection(collection);
+        return true;
+    }
+
+    std::string generate_hwid()
+    {
+        hwid_material_t material;
+        if (!collect_hwid_material("generate", material))
             return "unavailable";
-        }
-        log_hwid_v2_collection("generate", collection);
-        std::string out = aida::hardware_id::v2::hash_to_hex(collection.hwid_hash);
-        SecureZeroMemory(collection.hwid_hash.data(), collection.hwid_hash.size());
-        for (auto& f : collection.factors)
-        {
-            SecureZeroMemory(f.factor_hash.data(), f.factor_hash.size());
-            if (!f.bytes.empty()) SecureZeroMemory(f.bytes.data(), f.bytes.size());
-        }
-        return out;
+        return material.hwid;
     }
 
     std::string generate_legacy_hwid_for_migration_only()
@@ -5132,10 +5173,18 @@ namespace
                                                    std::string& error_out,
                                                    json& response_out)
     {
-        selected_hwid = generate_hwid();
+        hwid_material_t material;
+        if (!collect_hwid_material("generate", material))
+        {
+            selected_hwid = "unavailable";
+            error_out = "HWID collection failed.";
+            response_out = json::object({{"ok", false}, {"reason", "hwid_collect_failed"}});
+            return false;
+        }
+        selected_hwid = material.hwid;
         lic_log((std::string("validate_hwid=") + selected_hwid + " action=" + action).c_str());
         return call_validation_endpoint(settings, action, key, selected_hwid, session_token,
-                                        nonce, error_out, response_out);
+                                        nonce, error_out, response_out, &material.evidence);
     }
 
     bool run_startup_ban_check(settings_sa_t& settings, std::string& reason_out, std::string& message_out)
@@ -5644,7 +5693,8 @@ namespace
                                   const std::string& session_token,
                                   const std::string& nonce,
                                   std::string& error_out,
-                                  json& response_out)
+                                  json& response_out,
+                                  const json* hwid_evidence)
     {
         try {
             lic_log("call_validation_enter");
@@ -5665,10 +5715,17 @@ namespace
             const int64_t req_ts_ms = license_unix_ms();
             body["req_ts_ms"] = req_ts_ms;
             body["public_ip"] = "";
+            if (hwid_evidence && hwid_evidence->is_object())
+            {
+                for (auto it = hwid_evidence->begin(); it != hwid_evidence->end(); ++it)
+                    body[it.key()] = it.value();
+            }
             lic_log("call_validation_public_ip_skipped");
             if (action == "validate") {
                 body["client_nonce"] = nonce;
                 body["plugin_version"] = "aida-standalone";
+                if (!session_token.empty())
+                    body["session_token"] = session_token;
                 {
                     wchar_t comp_name[MAX_COMPUTERNAME_LENGTH + 1] = {};
                     DWORD comp_size = MAX_COMPUTERNAME_LENGTH + 1;
@@ -8516,15 +8573,70 @@ namespace
         }
     }
 
-    void unload_arc()
+    bool arc_worker_queues_quiescent_for_unload(const char* reason)
     {
+        auto wq = work_queue::stats();
+        auto svc = work_queue::service_stats();
+        auto cq = critical_work_queue::stats();
+        const bool quiescent =
+            wq.pending == 0 && wq.active == 0 &&
+            svc.pending == 0 && svc.active == 0 &&
+            cq.pending == 0 && cq.active == 0;
+        const uintptr_t arc_base = reinterpret_cast<uintptr_t>(s_arc_module.base);
+        const uintptr_t arc_end = arc_base + static_cast<uintptr_t>(s_arc_module.image_size);
+        lic_log_fmt("arc_unload_worker_gate reason=%.128s quiescent=%d loaded=%d unloading=%d inflight=%lld base=0x%llX end=0x%llX size=0x%llX wq_alive=%d wq_shutdown=%d wq_pending=%zu wq_active=%u wq_oldest_ms=%llu wq_labels=%.360s svc_alive=%d svc_shutdown=%d svc_pending=%zu svc_active=%u svc_oldest_ms=%llu svc_labels=%.360s cq_alive=%d cq_shutdown=%d cq_pending=%zu cq_active=%u cq_oldest_ms=%llu cq_labels=%.360s",
+            reason && *reason ? reason : "unload_arc",
+            quiescent ? 1 : 0,
+            s_arc_loaded.load(std::memory_order_acquire) ? 1 : 0,
+            s_arc_unloading.load(std::memory_order_acquire) ? 1 : 0,
+            static_cast<long long>(s_arc_call_inflight.load(std::memory_order_acquire)),
+            static_cast<unsigned long long>(arc_base),
+            static_cast<unsigned long long>(arc_end),
+            static_cast<unsigned long long>(s_arc_module.image_size),
+            wq.alive ? 1 : 0,
+            wq.shutting_down ? 1 : 0,
+            wq.pending,
+            static_cast<unsigned>(wq.active),
+            static_cast<unsigned long long>(wq.oldest_active_ms),
+            wq.active_labels.empty() ? "<none>" : wq.active_labels.c_str(),
+            svc.alive ? 1 : 0,
+            svc.shutting_down ? 1 : 0,
+            svc.pending,
+            static_cast<unsigned>(svc.active),
+            static_cast<unsigned long long>(svc.oldest_active_ms),
+            svc.active_labels.empty() ? "<none>" : svc.active_labels.c_str(),
+            cq.alive ? 1 : 0,
+            cq.shutting_down ? 1 : 0,
+            cq.pending,
+            static_cast<unsigned>(cq.active),
+            static_cast<unsigned long long>(cq.oldest_active_ms),
+            cq.active_labels.empty() ? "<none>" : cq.active_labels.c_str());
+        return quiescent;
+    }
+
+    bool unload_arc(const char* reason, bool require_worker_quiescence)
+    {
+        const char* reason_text = (reason && *reason) ? reason : "unload_arc";
+        if (require_worker_quiescence && s_arc_module.base && !arc_worker_queues_quiescent_for_unload(reason_text))
+        {
+            lic_log_fmt("unload_arc_release_suppressed reason=%.128s loaded=%d unloading=%d inflight=%lld base=0x%llX size=0x%llX",
+                reason_text,
+                s_arc_loaded.load(std::memory_order_acquire) ? 1 : 0,
+                s_arc_unloading.load(std::memory_order_acquire) ? 1 : 0,
+                static_cast<long long>(s_arc_call_inflight.load(std::memory_order_acquire)),
+                static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(s_arc_module.base)),
+                static_cast<unsigned long long>(s_arc_module.image_size));
+            return false;
+        }
+
         const bool was_unloading = s_arc_unloading.exchange(true, std::memory_order_acq_rel);
 
         {
             char dbg[160];
             int64_t inflight_pre = s_arc_call_inflight.load(std::memory_order_acquire);
             _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                "unload_arc_drain_begin was_unloading=%d inflight=%lld",
+                "unload_arc_drain_begin reason=%.80s was_unloading=%d inflight=%lld",
+                reason_text,
                 was_unloading ? 1 : 0,
                 static_cast<long long>(inflight_pre));
             lic_log(dbg);
@@ -8536,7 +8648,8 @@ namespace
             char dbg[160];
             int64_t inflight_post = s_arc_call_inflight.load(std::memory_order_acquire);
             _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                "unload_arc_drain_done inflight=%lld",
+                "unload_arc_drain_done reason=%.80s inflight=%lld",
+                reason_text,
                 static_cast<long long>(inflight_post));
             lic_log(dbg);
         }
@@ -8544,11 +8657,21 @@ namespace
         std::unique_lock<std::timed_mutex> lk(s_arc_mtx, std::defer_lock);
         if (!lk.try_lock_for(std::chrono::seconds(5)))
         {
-            lic_log("unload_arc_lock_timeout");
+            lic_log_fmt("unload_arc_lock_timeout reason=%.128s", reason_text);
             if (!was_unloading)
                 s_arc_unloading.store(false, std::memory_order_release);
-            return;
+            return false;
         }
+        lic_log_fmt("unload_arc_release_begin reason=%.128s loaded=%d base=0x%llX end=0x%llX size=0x%llX entry=0x%llX function_table=0x%llX function_count=%u inflight=%lld",
+            reason_text,
+            s_arc_loaded.load(std::memory_order_acquire) ? 1 : 0,
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(s_arc_module.base)),
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(s_arc_module.base) + static_cast<uintptr_t>(s_arc_module.image_size)),
+            static_cast<unsigned long long>(s_arc_module.image_size),
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(s_arc_module.entry_point)),
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(s_arc_module.function_table)),
+            static_cast<unsigned>(s_arc_module.function_table_count),
+            static_cast<long long>(s_arc_call_inflight.load(std::memory_order_acquire)));
         if (s_arc_loaded.load(std::memory_order_acquire) && s_fn_arc_cleanup) {
             DWORD cleanup_seh = arc_call_cleanup_seh(s_fn_arc_cleanup);
             if (cleanup_seh != ERROR_SUCCESS)
@@ -8580,6 +8703,14 @@ namespace
 
         drain.unlock();
         s_arc_unloading.store(false, std::memory_order_release);
+        lic_log_fmt("unload_arc_release_done reason=%.128s loaded=%d unloading=%d inflight=%lld base=0x%llX size=0x%llX",
+            reason_text,
+            s_arc_loaded.load(std::memory_order_acquire) ? 1 : 0,
+            s_arc_unloading.load(std::memory_order_acquire) ? 1 : 0,
+            static_cast<long long>(s_arc_call_inflight.load(std::memory_order_acquire)),
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(s_arc_module.base)),
+            static_cast<unsigned long long>(s_arc_module.image_size));
+        return true;
     }
 
     bool try_validate_cached(settings_sa_t& settings, std::string& error_out)
@@ -8607,7 +8738,7 @@ namespace
         std::string reval_err;
         std::string hwid;
         if (!call_validation_endpoint_for_current_hwid(settings, "validate", settings.license_key,
-                                                       {}, nonce, hwid, reval_err, response)) {
+                                                       settings.license_session_token, nonce, hwid, reval_err, response)) {
             error_out = reval_err.empty() ? "Online license validation required." : reval_err;
             return false;
         }
@@ -8715,7 +8846,7 @@ namespace
         }
 
         if (!call_validation_endpoint_for_current_hwid(settings, "validate",
-                                                       settings.license_key, {},
+                                                       settings.license_key, settings.license_session_token,
                                                        reval_nonce, reval_hwid,
                                                        reval_error, reval_response))
         {
@@ -8823,7 +8954,7 @@ namespace
         const std::string effective_reason = reason.empty() ? std::string("License reactivation required.") : reason;
         lic_log((std::string("enter_pending_activation: ") + effective_reason).c_str());
         anti_tamper::state::get().license_pending_activation.store(true, std::memory_order_release);
-        unload_arc();
+        unload_arc("enter_pending_activation", false);
         reset_arc_fetch_state();
         reset_activation_completed_at();
         settings.license_plan.clear();
@@ -9548,7 +9679,8 @@ namespace standalone_license
 
         lic_log("activate_calling_endpoint");
         if (!call_validation_endpoint_for_current_hwid(settings, "validate", key,
-                                                       {}, nonce, hwid, error_out, response)) {
+                                                       (settings.license_key == key) ? settings.license_session_token : std::string{},
+                                                       nonce, hwid, error_out, response)) {
             lic_log(("activate_endpoint_failed: " + error_out).c_str());
             const std::string display_error = user_facing_license_error(error_out);
             anti_tamper::state::get().license_pending_activation.store(true, std::memory_order_release);
@@ -9702,13 +9834,19 @@ namespace standalone_license
             static_cast<unsigned long long>(s_worker_epoch.load(std::memory_order_acquire)));
     }
 
-    void shutdown()
+    void shutdown_after_worker_quiesce(const char* reason)
     {
-        stop_background_workers("license_shutdown", 5000);
+        const char* reason_text = (reason && *reason) ? reason : "license_shutdown";
+        lic_log_fmt("license_shutdown_after_worker_quiesce_begin reason=%.128s loaded=%d unloading=%d inflight=%lld",
+            reason_text,
+            s_arc_loaded.load(std::memory_order_acquire) ? 1 : 0,
+            s_arc_unloading.load(std::memory_order_acquire) ? 1 : 0,
+            static_cast<long long>(s_arc_call_inflight.load(std::memory_order_acquire)));
+        stop_background_workers(reason_text, 5000);
         reset_arc_fetch_state();
         reset_activation_completed_at();
         reset_license_clients();
-        unload_arc();
+        const bool arc_released = unload_arc(reason_text, true);
         {
             std::lock_guard<std::mutex> lk(s_state_mtx);
             s_cached_hwid.clear();
@@ -9718,6 +9856,17 @@ namespace standalone_license
             s_cached_server_sig_b64.clear();
             s_cached_server_kid = 0;
         }
+        lic_log_fmt("license_shutdown_after_worker_quiesce_done reason=%.128s arc_released=%d loaded=%d unloading=%d inflight=%lld",
+            reason_text,
+            arc_released ? 1 : 0,
+            s_arc_loaded.load(std::memory_order_acquire) ? 1 : 0,
+            s_arc_unloading.load(std::memory_order_acquire) ? 1 : 0,
+            static_cast<long long>(s_arc_call_inflight.load(std::memory_order_acquire)));
+    }
+
+    void shutdown()
+    {
+        shutdown_after_worker_quiesce("license_shutdown");
     }
 
 

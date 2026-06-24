@@ -239,6 +239,16 @@ void register_protected_re_tools(mcp_standalone::server_t& srv)
          {"module_name", "string", "Optional module filter", false},
          {"module_base", "string", "Optional module base", false},
          {"module_size", "number", "Optional synthetic module image size", false},
+         {"range_base", "string", "Optional direct bounded range base", false},
+         {"range_size", "number", "Optional direct bounded range size", false},
+         {"scan_base", "string", "Optional direct bounded range base alias", false},
+         {"scan_size", "number", "Optional direct bounded range size alias", false},
+         {"target_va", "string", "Optional direct bounded target address", false},
+         {"target_size", "number", "Optional direct bounded target size", false},
+         {"watch_va", "string", "Optional direct watch range address", false},
+         {"watch_size", "number", "Optional direct watch range size", false},
+         {"marker_va", "string", "Optional marker address inside direct range", false},
+         {"marker_size", "number", "Optional marker byte length", false},
          {"include_all", "boolean", "Return all scanned sections", false}},
         protected_re::smc_scan_encrypted_regions, true});
 
@@ -248,6 +258,17 @@ void register_protected_re_tools(mcp_standalone::server_t& srv)
         {{"process_id", "number", "Optional target process id", false},
          {"module_name", "string", "Optional module filter", false},
          {"module_base", "string", "Optional module base", false},
+         {"module_size", "number", "Optional synthetic module image size", false},
+         {"range_base", "string", "Optional direct bounded range base", false},
+         {"range_size", "number", "Optional direct bounded range size", false},
+         {"scan_base", "string", "Optional direct bounded range base alias", false},
+         {"scan_size", "number", "Optional direct bounded range size alias", false},
+         {"target_va", "string", "Optional direct bounded target address", false},
+         {"target_size", "number", "Optional direct bounded target size", false},
+         {"watch_va", "string", "Optional direct watch range address", false},
+         {"watch_size", "number", "Optional direct watch range size", false},
+         {"marker_va", "string", "Optional marker address inside direct range", false},
+         {"marker_size", "number", "Optional marker byte length", false},
          {"include_all", "boolean", "Return all scanned sections", false}},
         protected_re::smc_detect_selfmod, true});
 
@@ -256,8 +277,12 @@ void register_protected_re_tools(mcp_standalone::server_t& srv)
         "Snapshot bounded target pages with entropy, bytes, protection, and disassembly previews.",
         {{"target_va", "string", "Range start address", false},
          {"address", "string", "Alternative range start address", false},
+         {"range_base", "string", "Alternative range start address", false},
+         {"watch_va", "string", "Alternative range start address", false},
          {"target_size", "number", "Range size", false},
          {"size", "number", "Alternative range size", false},
+         {"range_size", "number", "Alternative range size", false},
+         {"watch_size", "number", "Alternative range size", false},
          {"process_id", "number", "Optional target process id", false}},
         protected_re::smc_snapshot_pages, true});
 
