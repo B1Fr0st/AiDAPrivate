@@ -44,6 +44,7 @@
 #include <atomic>
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -183,6 +184,32 @@ namespace test_all_features {
 		std::atomic<std::uint64_t> g_run_start_tick{ 0 };
 		std::atomic<std::uint64_t> g_phase_start_tick{ 0 };
 		std::atomic<std::uint64_t> g_step_start_tick{ 0 };
+		std::atomic<int> g_active_phase_index{ 0 };
+		std::atomic<int> g_active_phase_planned{ 0 };
+		std::atomic<int> g_active_phase_completed{ 0 };
+		std::atomic<bool> g_hung_marker_emitted{ false };
+
+		struct phase_ledger_entry_t {
+			std::string name;
+			int planned = 0;
+			int completed = 0;
+			int pass_delta = 0;
+			int fail_delta = 0;
+			int skip_delta = 0;
+			int start_passed = 0;
+			int start_failed = 0;
+			int start_skipped = 0;
+			bool entered = false;
+			bool done = false;
+			bool hung_logged = false;
+			std::uint64_t start_ms = 0;
+			std::uint64_t end_ms = 0;
+			std::string status;
+		};
+
+		std::mutex g_phase_ledger_mtx;
+		std::vector<phase_ledger_entry_t> g_phase_ledger;
+		constexpr std::uint64_t kFullTestHungStepMs = 120000;
 
 
 		const char* log_path() {
@@ -330,6 +357,116 @@ namespace test_all_features {
 			return current ? *current : std::string();
 		}
 
+		int current_completed_count() {
+			return g_passed.load(std::memory_order_acquire) +
+				g_failed.load(std::memory_order_acquire) +
+				g_skipped.load(std::memory_order_acquire);
+		}
+
+		int phase_ledger_index_locked(const char* phase) {
+			const char* safe_phase = phase ? phase : "";
+			for (std::size_t i = 0; i < g_phase_ledger.size(); ++i) {
+				if (g_phase_ledger[i].name == safe_phase)
+					return static_cast<int>(i);
+			}
+			return -1;
+		}
+
+		void refresh_phase_entry_from_counters(phase_ledger_entry_t& entry) {
+			entry.pass_delta = g_passed.load(std::memory_order_acquire) - entry.start_passed;
+			entry.fail_delta = g_failed.load(std::memory_order_acquire) - entry.start_failed;
+			entry.skip_delta = g_skipped.load(std::memory_order_acquire) - entry.start_skipped;
+			entry.completed = entry.pass_delta + entry.fail_delta + entry.skip_delta;
+			if (entry.completed < 0)
+				entry.completed = 0;
+		}
+
+		void publish_active_phase_snapshot_locked(int index) {
+			if (index >= 0 && index < static_cast<int>(g_phase_ledger.size())) {
+				const auto& entry = g_phase_ledger[static_cast<std::size_t>(index)];
+				g_active_phase_index.store(index + 1, std::memory_order_release);
+				g_active_phase_planned.store(entry.planned, std::memory_order_release);
+				g_active_phase_completed.store(entry.completed, std::memory_order_release);
+			} else {
+				g_active_phase_index.store(0, std::memory_order_release);
+				g_active_phase_planned.store(0, std::memory_order_release);
+				g_active_phase_completed.store(0, std::memory_order_release);
+			}
+			g_current.store(current_completed_count(), std::memory_order_release);
+		}
+
+		void reset_phase_ledger(int testlab_count, int total_estimate) {
+			std::lock_guard<std::mutex> lk(g_phase_ledger_mtx);
+			g_phase_ledger.clear();
+			auto add = [](const char* name, int planned) {
+				phase_ledger_entry_t entry;
+				entry.name = name ? name : "";
+				entry.planned = planned;
+				entry.status = "PENDING";
+				g_phase_ledger.push_back(std::move(entry));
+			};
+			add("launch target", kLaunchFeatureTests);
+			add("standalone UI tests", kUiFeatureTests);
+			add("testlab features", testlab_count);
+			add("extended features", kExtendedFeatureTests);
+			add("debugger feature tests", kDebuggerFeatureTests);
+			add("scanner feature tests", kScannerFeatureTests);
+			add("analysis feature tests", kAnalysisFeatureTests);
+			add("network feature tests", kNetworkFeatureTests);
+			add("burp suite feature tests", kBurpFeatureTests);
+			add("disassembly & decompiler tests", kDisasmFeatureTests);
+			add("MCP tool tests", kMcpFeatureTests);
+			g_total.store(total_estimate, std::memory_order_release);
+			g_current.store(0, std::memory_order_release);
+			publish_active_phase_snapshot_locked(-1);
+		}
+
+		std::string phase_ledger_snapshot() {
+			std::lock_guard<std::mutex> lk(g_phase_ledger_mtx);
+			for (auto& entry : g_phase_ledger) {
+				if (entry.entered && !entry.done)
+					refresh_phase_entry_from_counters(entry);
+			}
+			publish_active_phase_snapshot_locked(g_active_phase_index.load(std::memory_order_acquire) - 1);
+			std::string out;
+			for (std::size_t i = 0; i < g_phase_ledger.size(); ++i) {
+				const auto& e = g_phase_ledger[i];
+				char part[320];
+				_snprintf_s(part, sizeof(part), _TRUNCATE,
+					"%zu:%s planned=%d completed=%d status=%s entered=%d done=%d pass=%d fail=%d skip=%d",
+					i + 1,
+					e.name.c_str(),
+					e.planned,
+					e.completed,
+					e.status.empty() ? "PENDING" : e.status.c_str(),
+					e.entered ? 1 : 0,
+					e.done ? 1 : 0,
+					e.pass_delta,
+					e.fail_delta,
+					e.skip_delta);
+				if (!out.empty())
+					out += "; ";
+				out += part;
+				if (out.size() > 760) {
+					out += "; ...";
+					break;
+				}
+			}
+			return out;
+		}
+
+		bool phase_entered_snapshot(const char* phase) {
+			std::lock_guard<std::mutex> lk(g_phase_ledger_mtx);
+			const int index = phase_ledger_index_locked(phase);
+			return index >= 0 && g_phase_ledger[static_cast<std::size_t>(index)].entered;
+		}
+
+		bool phase_done_snapshot(const char* phase) {
+			std::lock_guard<std::mutex> lk(g_phase_ledger_mtx);
+			const int index = phase_ledger_index_locked(phase);
+			return index >= 0 && g_phase_ledger[static_cast<std::size_t>(index)].done;
+		}
+
 		void copy_label_snapshot(const std::shared_ptr<const std::string>& slot, char* out, std::size_t cap) {
 			if (cap == 0) return;
 			out[0] = '\0';
@@ -357,11 +494,18 @@ namespace test_all_features {
 			const auto sq = work_queue::service_stats();
 			char ui_phase[900] = {};
 			format_ui_phase_snapshot(ui_phase, sizeof(ui_phase));
+			const int global_completed = current_completed_count();
+			g_current.store(global_completed, std::memory_order_release);
+			const int active_phase_index = g_active_phase_index.load(std::memory_order_acquire);
+			const int active_phase_planned = g_active_phase_planned.load(std::memory_order_acquire);
+			const int active_phase_completed = g_active_phase_completed.load(std::memory_order_acquire);
+			std::string ledger = phase_ledger_snapshot();
 
 			_snprintf_s(out, cap, _TRUNCATE,
 				"run_id=%llu host_pid=%lu host_tid=%lu running=%d cancel=%d target_unavailable=%d phase=\"%.160s\" phase_age_ms=%llu "
-				"step=\"%.220s\" step_age_ms=%llu run_age_ms=%llu total=%d current=%d "
+				"step=\"%.220s\" step_age_ms=%llu run_age_ms=%llu total=%d current=%d global_planned=%d global_completed=%d phase_index=%d phase_planned=%d phase_completed=%d "
 				"pass=%d fail=%d skip=%d suspect=%d ui={%.620s} "
+				"ledger={%.780s} "
 				"cq_alive=%d cq_shutdown=%d cq_workers=%zu cq_pending=%zu cq_active=%u cq_active_labels=%u cq_oldest_active_ms=%llu cq_started=%llu cq_finished=%llu cq_labels=%.220s "
 				"wq_alive=%d wq_shutdown=%d wq_workers=%zu wq_pending=%zu wq_active=%u wq_active_labels=%u wq_oldest_active_ms=%llu wq_started=%llu wq_finished=%llu wq_labels=%.220s "
 				"svc_alive=%d svc_shutdown=%d svc_workers=%zu svc_pending=%zu svc_active=%u svc_active_labels=%u svc_oldest_active_ms=%llu svc_started=%llu svc_finished=%llu svc_labels=%.220s "
@@ -379,12 +523,18 @@ namespace test_all_features {
 				static_cast<unsigned long long>(step_age),
 				static_cast<unsigned long long>(run_age),
 				g_total.load(std::memory_order_acquire),
-				g_current.load(std::memory_order_acquire),
+				global_completed,
+				g_total.load(std::memory_order_acquire),
+				global_completed,
+				active_phase_index,
+				active_phase_planned,
+				active_phase_completed,
 				g_passed.load(std::memory_order_acquire),
 				g_failed.load(std::memory_order_acquire),
 				g_skipped.load(std::memory_order_acquire),
 				g_suspect.load(std::memory_order_acquire),
 				ui_phase[0] ? ui_phase : "<empty>",
+				ledger.empty() ? "<empty>" : ledger.c_str(),
 				cq.alive ? 1 : 0,
 				cq.shutting_down ? 1 : 0,
 				cq.workers,
@@ -691,6 +841,7 @@ namespace test_all_features {
 		void set_step(const char* label) {
 			store_label_snapshot(g_step_label, label);
 			g_step_start_tick.store(now_ms_tick(), std::memory_order_release);
+			g_hung_marker_emitted.store(false, std::memory_order_release);
 		}
 
 		void set_stepf(const char* fmt, ...) {
@@ -793,7 +944,7 @@ namespace test_all_features {
 		}
 
 		int running_done() {
-			return g_passed.load() + g_failed.load() + g_skipped.load();
+			return current_completed_count();
 		}
 
 		bool memory_scanner_scan_idle() {
@@ -883,15 +1034,233 @@ namespace test_all_features {
 		}
 
 		void log_phase_begin(HANDLE hf, const char* phase) {
-			log_msg(hf, "phase", "BEGIN %s | running totals pass=%d fail=%d skip=%d done=%d",
-				phase, g_passed.load(), g_failed.load(), g_skipped.load(), running_done());
+			const std::uint64_t now = now_ms_tick();
+			int phase_index = 0;
+			int phase_planned = 0;
+			{
+				std::lock_guard<std::mutex> lk(g_phase_ledger_mtx);
+				int index = phase_ledger_index_locked(phase);
+				if (index < 0) {
+					phase_ledger_entry_t entry;
+					entry.name = phase ? phase : "";
+					entry.status = "PENDING";
+					g_phase_ledger.push_back(std::move(entry));
+					index = static_cast<int>(g_phase_ledger.size()) - 1;
+				}
+				auto& entry = g_phase_ledger[static_cast<std::size_t>(index)];
+				entry.entered = true;
+				entry.done = false;
+				entry.start_ms = now;
+				entry.end_ms = 0;
+				entry.start_passed = g_passed.load(std::memory_order_acquire);
+				entry.start_failed = g_failed.load(std::memory_order_acquire);
+				entry.start_skipped = g_skipped.load(std::memory_order_acquire);
+				entry.pass_delta = 0;
+				entry.fail_delta = 0;
+				entry.skip_delta = 0;
+				entry.completed = 0;
+				entry.status = "ACTIVE";
+				phase_index = index + 1;
+				phase_planned = entry.planned;
+				publish_active_phase_snapshot_locked(index);
+			}
+			log_msg(hf, "phase", "BEGIN %s | phase_index=%d phase_planned=%d phase_completed=0 global_planned=%d global_completed=%d running totals pass=%d fail=%d skip=%d done=%d",
+				phase,
+				phase_index,
+				phase_planned,
+				g_total.load(std::memory_order_acquire),
+				running_done(),
+				g_passed.load(),
+				g_failed.load(),
+				g_skipped.load(),
+				running_done());
 			log_debug_snapshot(hf, "phase", "BEGIN snapshot");
 		}
 
 		void log_phase_end(HANDLE hf, const char* phase) {
-			log_msg(hf, "phase", "END %s | running totals pass=%d fail=%d skip=%d done=%d",
-				phase, g_passed.load(), g_failed.load(), g_skipped.load(), running_done());
+			const std::uint64_t now = now_ms_tick();
+			int phase_index = 0;
+			int phase_planned = 0;
+			int phase_completed = 0;
+			int pass_delta = 0;
+			int fail_delta = 0;
+			int skip_delta = 0;
+			std::string status = "DONE";
+			{
+				std::lock_guard<std::mutex> lk(g_phase_ledger_mtx);
+				int index = phase_ledger_index_locked(phase);
+				if (index < 0) {
+					phase_ledger_entry_t entry;
+					entry.name = phase ? phase : "";
+					entry.status = "DONE_UNPLANNED";
+					entry.entered = true;
+					entry.done = true;
+					entry.start_ms = now;
+					entry.end_ms = now;
+					g_phase_ledger.push_back(std::move(entry));
+					index = static_cast<int>(g_phase_ledger.size()) - 1;
+				}
+				auto& entry = g_phase_ledger[static_cast<std::size_t>(index)];
+				refresh_phase_entry_from_counters(entry);
+				entry.done = true;
+				entry.end_ms = now;
+				entry.status = entry.hung_logged ? "DONE_AFTER_HUNG" : "DONE";
+				phase_index = index + 1;
+				phase_planned = entry.planned;
+				phase_completed = entry.completed;
+				pass_delta = entry.pass_delta;
+				fail_delta = entry.fail_delta;
+				skip_delta = entry.skip_delta;
+				status = entry.status;
+				publish_active_phase_snapshot_locked(-1);
+			}
+			log_msg(hf, "phase", "END %s | phase_index=%d phase_status=%s phase_planned=%d phase_completed=%d phase_pass=%d phase_fail=%d phase_skip=%d global_planned=%d global_completed=%d running totals pass=%d fail=%d skip=%d done=%d",
+				phase,
+				phase_index,
+				status.empty() ? "DONE" : status.c_str(),
+				phase_planned,
+				phase_completed,
+				pass_delta,
+				fail_delta,
+				skip_delta,
+				g_total.load(std::memory_order_acquire),
+				running_done(),
+				g_passed.load(),
+				g_failed.load(),
+				g_skipped.load(),
+				running_done());
 			log_debug_snapshot(hf, "phase", "END snapshot");
+		}
+
+		void log_hung_heartbeat_if_needed(HANDLE hf) {
+			if (!g_running.load(std::memory_order_acquire))
+				return;
+			const std::uint64_t step_start = g_step_start_tick.load(std::memory_order_acquire);
+			const std::uint64_t now = now_ms_tick();
+			if (step_start == 0 || now < step_start || now - step_start < kFullTestHungStepMs)
+				return;
+			bool expected = false;
+			if (!g_hung_marker_emitted.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+				return;
+			const std::string phase = load_label_snapshot(g_phase_label);
+			const std::string step = load_label_snapshot(g_step_label);
+			int phase_index = 0;
+			int phase_planned = 0;
+			int phase_completed = 0;
+			int mcp_entered = 0;
+			int mcp_done = 0;
+			{
+				std::lock_guard<std::mutex> lk(g_phase_ledger_mtx);
+				int index = phase_ledger_index_locked(phase.c_str());
+				if (index >= 0) {
+					auto& entry = g_phase_ledger[static_cast<std::size_t>(index)];
+					refresh_phase_entry_from_counters(entry);
+					entry.hung_logged = true;
+					entry.status = "HUNG";
+					phase_index = index + 1;
+					phase_planned = entry.planned;
+					phase_completed = entry.completed;
+					publish_active_phase_snapshot_locked(index);
+				}
+				const int mcp_index = phase_ledger_index_locked("MCP tool tests");
+				if (mcp_index >= 0) {
+					const auto& mcp = g_phase_ledger[static_cast<std::size_t>(mcp_index)];
+					mcp_entered = mcp.entered ? 1 : 0;
+					mcp_done = mcp.done ? 1 : 0;
+				}
+			}
+			log_msg(hf, "heartbeat", "HUNG -- step exceeded heartbeat threshold phase_index=%d phase=\"%s\" step=\"%s\" step_age_ms=%llu threshold_ms=%llu phase_planned=%d phase_completed=%d global_planned=%d global_completed=%d mcp_planned=%d mcp_entered=%d mcp_done=%d",
+				phase_index,
+				phase.empty() ? "<none>" : phase.c_str(),
+				step.empty() ? "<none>" : step.c_str(),
+				static_cast<unsigned long long>(now - step_start),
+				static_cast<unsigned long long>(kFullTestHungStepMs),
+				phase_planned,
+				phase_completed,
+				g_total.load(std::memory_order_acquire),
+				running_done(),
+				kMcpFeatureTests,
+				mcp_entered,
+				mcp_done);
+		}
+
+		int finalize_phase_ledger(HANDLE hf) {
+			int errors = 0;
+			std::vector<phase_ledger_entry_t> snapshot;
+			{
+				std::lock_guard<std::mutex> lk(g_phase_ledger_mtx);
+				for (auto& entry : g_phase_ledger) {
+					if (entry.entered && !entry.done)
+						refresh_phase_entry_from_counters(entry);
+				}
+				snapshot = g_phase_ledger;
+				publish_active_phase_snapshot_locked(-1);
+			}
+			for (std::size_t i = 0; i < snapshot.size(); ++i) {
+				const auto& entry = snapshot[i];
+				const int remaining = entry.planned > entry.completed ? entry.planned - entry.completed : 0;
+				log_msg(hf, "summary", "PHASE-LEDGER -- phase_index=%zu phase=\"%s\" planned=%d completed=%d pass=%d fail=%d skip=%d entered=%d done=%d hung=%d status=%s remaining=%d",
+					i + 1,
+					entry.name.c_str(),
+					entry.planned,
+					entry.completed,
+					entry.pass_delta,
+					entry.fail_delta,
+					entry.skip_delta,
+					entry.entered ? 1 : 0,
+					entry.done ? 1 : 0,
+					entry.hung_logged ? 1 : 0,
+					entry.status.empty() ? "PENDING" : entry.status.c_str(),
+					remaining);
+				if (!entry.entered) {
+					++errors;
+					log_msg(hf, "summary", "INCOMPLETE -- planned phase was not entered phase_index=%zu phase=\"%s\" planned=%d global_completed=%d global_planned=%d",
+						i + 1,
+						entry.name.c_str(),
+						entry.planned,
+						running_done(),
+						g_total.load(std::memory_order_acquire));
+				} else if (!entry.done) {
+					++errors;
+					log_msg(hf, "summary", "INCOMPLETE -- phase entered but did not complete phase_index=%zu phase=\"%s\" planned=%d completed=%d remaining=%d",
+						i + 1,
+						entry.name.c_str(),
+						entry.planned,
+						entry.completed,
+						remaining);
+				} else if (remaining > 0) {
+					++errors;
+					log_msg(hf, "summary", "INCOMPLETE -- phase completed fewer tests than planned phase_index=%zu phase=\"%s\" planned=%d completed=%d remaining=%d",
+						i + 1,
+						entry.name.c_str(),
+						entry.planned,
+						entry.completed,
+						remaining);
+				}
+				if (entry.hung_logged) {
+					++errors;
+					log_msg(hf, "summary", "HUNG -- phase exceeded heartbeat threshold phase_index=%zu phase=\"%s\" status=%s planned=%d completed=%d",
+						i + 1,
+						entry.name.c_str(),
+						entry.status.empty() ? "HUNG" : entry.status.c_str(),
+						entry.planned,
+						entry.completed);
+				}
+			}
+			if (kMcpFeatureTests > 0) {
+				if (!phase_entered_snapshot("MCP tool tests")) {
+					log_msg(hf, "summary", "INCOMPLETE -- MCP phase planned but not entered planned=%d global_completed=%d global_planned=%d",
+						kMcpFeatureTests,
+						running_done(),
+						g_total.load(std::memory_order_acquire));
+				} else if (!phase_done_snapshot("MCP tool tests")) {
+					log_msg(hf, "summary", "INCOMPLETE -- MCP phase entered but did not reach phase end planned=%d global_completed=%d global_planned=%d",
+						kMcpFeatureTests,
+						running_done(),
+						g_total.load(std::memory_order_acquire));
+				}
+			}
+			return errors;
 		}
 
 		bool target_unavailable() {
@@ -1116,6 +1485,19 @@ namespace test_all_features {
 			return value != nullptr && parsed_truthy(*value);
 		}
 
+		bool parsed_label_falsey(const test_lab::result_t& r, const char* label) {
+			const std::string* value = parsed_value(r, label);
+			if (value == nullptr)
+				return false;
+			std::string v = *value;
+			while (!v.empty() && (v.front() == ' ' || v.front() == '\t'))
+				v.erase(v.begin());
+			while (!v.empty() && (v.back() == ' ' || v.back() == '\t' || v.back() == '\r' || v.back() == '\n'))
+				v.pop_back();
+			std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+			return v == "0" || v == "false" || v == "no" || v == "off";
+		}
+
 		bool feature_evidence_failure_reason(const char* category, const char* name, const test_lab::result_t& r, std::string& reason) {
 			reason.clear();
 			const char* cat = category ? category : "";
@@ -1167,6 +1549,14 @@ namespace test_all_features {
 				reason = "NCAP packets_captured=0_or_missing";
 				return true;
 			}
+			if (std::strcmp(cat, "network-query") == 0 &&
+				(name_starts_with(feature, "NCON") || name_starts_with(feature, "DTCP"))) {
+				std::uint64_t unknown = 0;
+				if (parsed_u64(r, "unknown_tcp_state_count", unknown) && unknown != 0) {
+					reason = std::string(feature) + " unknown_tcp_state_count_nonzero";
+					return true;
+				}
+			}
 			if (std::strcmp(cat, "network-query") == 0 && name_starts_with(feature, "NCPG") && !parsed_nonzero(r, "packet_count")) {
 				reason = "NCPG packet_count=0_or_missing";
 				return true;
@@ -1204,6 +1594,48 @@ namespace test_all_features {
 				reason = "NFPR result_count=0_or_missing";
 				return true;
 			}
+			if (std::strcmp(cat, "network-action") == 0 && name_starts_with(feature, "BWMN")) {
+				if (!parsed_nonzero(r, "Bytes/sec out") && !parsed_nonzero(r, "Bytes/sec in")) {
+					reason = "BWMN throughput_rate_zero_or_missing";
+					return true;
+				}
+			}
+			if (std::strcmp(cat, "dll") == 0 && name_starts_with(feature, "DPRT")) {
+				if (!parsed_label_truthy(r, "expected_hash_supplied") ||
+					!parsed_value_contains(r, "expected_hash_source", "provided_verified") ||
+					!parsed_label_truthy(r, "dprt_functional_pass_eligible") ||
+					!parsed_value_contains(r, "dprt_functional_proof", "provided_hash_register_query_unregister")) {
+					reason = "DPRT functional proof requires provided_verified expected_hash";
+					return true;
+				}
+			}
+			if (std::strcmp(cat, "dma-canary") == 0 && name_starts_with(feature, "CANQ")) {
+				std::uint64_t baseline = 0;
+				std::uint64_t after = 0;
+				if (!parsed_label_truthy(r, "baseline_query_ok") ||
+					!parsed_label_truthy(r, "controlled_register_ok") ||
+					!parsed_label_truthy(r, "after_query_ok") ||
+					!parsed_u64(r, "baseline_count", baseline) ||
+					!parsed_u64(r, "after_count", after) ||
+					after < baseline ||
+					!parsed_nonzero(r, "raw_struct_size") ||
+					!parsed_nonzero(r, "target_pid")) {
+					reason = "CANQ controlled pre/post canary evidence missing";
+					return true;
+				}
+			}
+			if (std::strcmp(cat, "target-latch") == 0 && name_starts_with(feature, "TIRA")) {
+				if (parsed_label_truthy(r, "positive_detection_coverage") && !parsed_label_truthy(r, "present")) {
+					reason = "TIRA positive detection coverage cannot pass with present=false";
+					return true;
+				}
+				if (!parsed_value_contains(r, "coverage_kind", "health_absence") ||
+					!parsed_label_truthy(r, "health_check_pass") ||
+					!parsed_label_falsey(r, "positive_detection_coverage")) {
+					reason = "TIRA health/positive coverage labels missing";
+					return true;
+				}
+			}
 			if (std::strcmp(cat, "tamper") == 0 && name_starts_with(feature, "SRVT")) {
 				if (!parsed_value_contains(r, "result", "accepted") ||
 					!parsed_nonzero(r, "server_nonce") ||
@@ -1235,9 +1667,15 @@ namespace test_all_features {
 				}
 			}
 			if (std::strcmp(cat, "sentinel") == 0 && name_starts_with(feature, "Sentinel Tier-A")) {
-				if (!parsed_nonzero(r, "hostile_driver_absent") &&
-					!parsed_nonzero(r, "absence_expected_healthy")) {
-					reason = "sentinel_tier_a_healthy_absence_marker_missing";
+				if (parsed_label_truthy(r, "positive_detection_coverage") && !parsed_label_truthy(r, "present_flag")) {
+					reason = "sentinel_tier_a_positive_detection_cannot_pass_with_present_flag=0";
+					return true;
+				}
+				if (!parsed_value_contains(r, "coverage_kind", "health_absence") ||
+					!parsed_label_truthy(r, "health_check_pass") ||
+					!parsed_label_falsey(r, "positive_detection_coverage") ||
+					(!parsed_nonzero(r, "hostile_driver_absent") && !parsed_nonzero(r, "absence_expected_healthy"))) {
+					reason = "sentinel_tier_a_health_absence_labels_missing";
 					return true;
 				}
 			}
@@ -2149,7 +2587,7 @@ namespace test_all_features {
 				}
 
 				const auto& f = features[static_cast<std::size_t>(i)];
-				g_current.store(i + 1);
+				g_current.store(running_done(), std::memory_order_release);
 
 				const char* name = (f.name != nullptr) ? f.name : "?";
 				const char* cat  = (f.category != nullptr) ? f.category : "?";
@@ -3123,6 +3561,7 @@ namespace test_all_features {
 							}
 							HANDLE hh = open_log_file();
 							log_debug_snapshot(hh, "heartbeat", "FULL-TEST live heartbeat");
+							log_hung_heartbeat_if_needed(hh);
 							if (hh != INVALID_HANDLE_VALUE) CloseHandle(hh);
 						}
 					});
@@ -3187,8 +3626,6 @@ namespace test_all_features {
 				static_cast<unsigned long>(GetCurrentThreadId()),
 				log_path());
 			log_msg(hf, "run", "test_target_log_path=%s", target_log_path());
-			log_debug_snapshot(hf, "run", "initial snapshot");
-
 			const auto& features = test_lab::all_features();
 			int testlab_count = static_cast<int>(features.size());
 			int total_estimate =
@@ -3203,7 +3640,8 @@ namespace test_all_features {
 				kDisasmFeatureTests +
 				kMcpFeatureTests +
 				kUiFeatureTests;
-			g_total.store(total_estimate);
+			reset_phase_ledger(testlab_count, total_estimate);
+			log_debug_snapshot(hf, "run", "initial snapshot");
 			log_msg(hf, "run", "progress total estimate=%d launch=%d testlab=%d extended=%d debugger=%d scanner=%d analysis=%d network=%d burp=%d disasm=%d mcp=%d ui=%d",
 				total_estimate,
 				kLaunchFeatureTests,
@@ -3375,6 +3813,11 @@ namespace test_all_features {
 					kExpectedDestructiveSkipCount,
 					raw_skips,
 					skip_accounting_errors);
+			}
+			const int phase_ledger_errors = finalize_phase_ledger(hf);
+			if (phase_ledger_errors != 0) {
+				g_failed.fetch_add(phase_ledger_errors, std::memory_order_acq_rel);
+				log_msg(hf, "summary", "FAIL -- phase ledger found %d incomplete, hung, or unentered planned phase condition(s)", phase_ledger_errors);
 			}
 			int p = g_passed.load();
 			int f = g_failed.load();
@@ -3564,6 +4007,11 @@ namespace test_all_features {
 			g_driver_attached.store(false);
 			g_saved_dtb.store(0, std::memory_order_release);
 			reset_destructive_skip_accounting();
+			{
+				std::lock_guard<std::mutex> lk(g_phase_ledger_mtx);
+				g_phase_ledger.clear();
+				publish_active_phase_snapshot_locked(-1);
+			}
 
 			{
 				std::lock_guard<std::mutex> lk(g_log_mtx);

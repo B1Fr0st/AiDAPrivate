@@ -1332,7 +1332,6 @@ function buildBootstrapScript() {
         '        }',
         '    }',
         '    Write-AidaStatus "[PE-DBG] step7 imports resolved"',
-        '    Write-AidaStatus "[PE-DBG] step7b Z3 bootstrap preload skipped; native runtime extracts embedded protected resources after entry"',
         '    $pdataRVA=Read-AidaU32 $pe ($optOff+112+3*8); $pdataSize=Read-AidaU32 $pe ($optOff+112+3*8+4)',
         '    if($pdataRVA -ne 0 -and $pdataSize -gt 0){',
         '        $pRtlAFT=Get-AidaWinApiProc $hN "RtlAddFunctionTable"',

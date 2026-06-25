@@ -563,18 +563,33 @@ namespace
             uint64_t arg3;
             uint64_t arg4;
             uint64_t result;
-        } ctx{function_address, arg1, arg2, arg3, arg4, 0};
+            DWORD gle;
+            bool invoked;
+        } ctx{function_address, arg1, arg2, arg3, arg4, 0, ERROR_SUCCESS, false};
+        SetLastError(ERROR_SUCCESS);
         bool ok = standalone_license::with_arc_comm_bridge(
             [](const arc_comm_vtable_t* table, void* user) -> bool {
                 auto* c = static_cast<ctx_t*>(user);
-                if (!table->remote_call)
+                if (!table->remote_call) {
+                    c->gle = ERROR_PROC_NOT_FOUND;
                     return false;
+                }
+                SetLastError(ERROR_SUCCESS);
+                c->invoked = true;
                 c->result = table->remote_call(c->function_address, c->arg1, c->arg2, c->arg3, c->arg4);
-                return true;
+                c->gle = GetLastError();
+                return c->result != 0 || c->gle == ERROR_SUCCESS;
             },
             &ctx);
-        if (ok)
+        if (ok) {
             result = ctx.result;
+            SetLastError(ERROR_SUCCESS);
+        } else {
+            DWORD gle = ctx.gle != ERROR_SUCCESS ? ctx.gle : GetLastError();
+            if (gle == ERROR_SUCCESS)
+                gle = ctx.invoked ? ERROR_GEN_FAILURE : ERROR_NOT_READY;
+            SetLastError(gle);
+        }
         return ok;
     }
 
@@ -742,6 +757,12 @@ namespace
         bool abandoned = false;
         char abandoned_reason[32] = {};
     };
+
+    bool lower_remote_call_uninterruptible(const lower_remote_call_outcome_t& outcome) noexcept
+    {
+        return !outcome.completed &&
+               (outcome.completion_reason == "cancelled" || outcome.completion_reason == "deadline");
+    }
 
     struct lower_executor_pe_stack_t
     {
@@ -2449,6 +2470,58 @@ namespace
                                                         driver_bridge::attached_pid(),
                                                         g_active_pid_generation.load(std::memory_order_acquire),
                                                         false);
+    }
+
+    struct lower_remote_call_drain_result_t {
+        bool drained = false;
+        uint32_t queue_depth = 0;
+        uint32_t inflight = 0;
+        uint32_t worker_alive = 0;
+        DWORD elapsed_ms = 0;
+    };
+
+    lower_remote_call_drain_result_t wait_lower_remote_call_drain_for_pid_switch(uint32_t from_pid,
+                                                                                 uint32_t to_pid,
+                                                                                 const char* phase,
+                                                                                 DWORD timeout_ms) noexcept
+    {
+        const ULONGLONG started = GetTickCount64();
+        lower_remote_call_drain_result_t result{};
+        for (;;) {
+            result.queue_depth = g_remote_call_lower_queue_depth.load(std::memory_order_acquire);
+            result.inflight = g_remote_call_lower_inflight.load(std::memory_order_acquire);
+            result.worker_alive = g_remote_call_lower_worker_alive.load(std::memory_order_acquire) ? 1u : 0u;
+            result.elapsed_ms = static_cast<DWORD>(GetTickCount64() - started);
+            if (result.queue_depth == 0 && result.inflight == 0) {
+                result.drained = true;
+                diag::log_tagged_fmt("driver",
+                    "lower_remote_call_drain_before_pid_switch phase=%s from_pid=%u to_pid=%u drained=1 queue_depth=%u inflight=%u worker_alive=%u worker_tid=%lu elapsed_ms=%lu",
+                    phase ? phase : "",
+                    from_pid,
+                    to_pid,
+                    result.queue_depth,
+                    result.inflight,
+                    result.worker_alive,
+                    static_cast<unsigned long>(g_remote_call_lower_worker_tid.load(std::memory_order_acquire)),
+                    static_cast<unsigned long>(result.elapsed_ms));
+                return result;
+            }
+            if (result.elapsed_ms >= timeout_ms) {
+                diag::log_tagged_fmt("driver",
+                    "lower_remote_call_drain_before_pid_switch phase=%s from_pid=%u to_pid=%u drained=0 queue_depth=%u inflight=%u worker_alive=%u worker_tid=%lu timeout_ms=%lu elapsed_ms=%lu",
+                    phase ? phase : "",
+                    from_pid,
+                    to_pid,
+                    result.queue_depth,
+                    result.inflight,
+                    result.worker_alive,
+                    static_cast<unsigned long>(g_remote_call_lower_worker_tid.load(std::memory_order_acquire)),
+                    static_cast<unsigned long>(timeout_ms),
+                    static_cast<unsigned long>(result.elapsed_ms));
+                return result;
+            }
+            Sleep(25);
+        }
     }
 
     template <typename Fn>
@@ -4904,7 +4977,7 @@ namespace driver_bridge
         if (pid == 0)
             return false;
 
-        std::lock_guard<std::mutex> lk(g_state_mtx);
+        std::unique_lock<std::mutex> lk(g_state_mtx);
         if (g_pid == pid) {
             auto it = g_processes.find(pid);
             process_ctx_t transient;
@@ -4926,6 +4999,53 @@ namespace driver_bridge
         auto it = g_processes.find(pid);
         if (it == g_processes.end()) {
             set_last_error_locked("set_active_pid: pid " + std::to_string(pid) + " not in attached set");
+            return false;
+        }
+        const uint32_t switching_from_pid = g_pid;
+        lk.unlock();
+        lower_remote_call_drain_result_t drain{};
+        if (switching_from_pid != 0 && switching_from_pid != pid)
+            drain = wait_lower_remote_call_drain_for_pid_switch(switching_from_pid, pid, "set_active_pid", 2500);
+        else
+            drain.drained = true;
+        lk.lock();
+        if (!drain.drained) {
+            set_last_error_locked("set_active_pid: lower remote call drain failed from pid " +
+                std::to_string(switching_from_pid) + " to pid " + std::to_string(pid) +
+                " queue_depth=" + std::to_string(drain.queue_depth) +
+                " inflight=" + std::to_string(drain.inflight));
+            diag::log_tagged_fmt("driver",
+                "set_active_pid_reject pid=%u current_pid=%u reason=lower_remote_call_drain_failed queue_depth=%u inflight=%u worker_alive=%u elapsed_ms=%lu last_error=%s",
+                pid,
+                g_pid,
+                drain.queue_depth,
+                drain.inflight,
+                drain.worker_alive,
+                static_cast<unsigned long>(drain.elapsed_ms),
+                g_last_error.c_str());
+            return false;
+        }
+        if (g_pid == pid) {
+            auto same_it = g_processes.find(pid);
+            process_ctx_t transient;
+            process_ctx_t& ctx = (same_it != g_processes.end()) ? same_it->second : transient;
+            if (g_kernel_mode && device && device->is_connected()) {
+                g_kernel_attached = refresh_kernel_context_locked(pid, ctx);
+            }
+            const std::uint64_t active_generation = g_active_pid_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+            diag::log_tagged_fmt("driver", "set_active_pid_same_after_drain pid=%u kernel_attached=%d dtb=0x%llX cached_dtb=0x%llX active_generation=%llu drain_elapsed_ms=%lu",
+                pid,
+                g_kernel_attached ? 1 : 0,
+                static_cast<unsigned long long>((device && device->is_connected()) ? device->get_dtb() : 0),
+                static_cast<unsigned long long>(ctx.cached_dtb),
+                static_cast<unsigned long long>(active_generation),
+                static_cast<unsigned long>(drain.elapsed_ms));
+            clear_last_error_locked_after_success("set_active_pid_same_after_drain");
+            return true;
+        }
+        it = g_processes.find(pid);
+        if (it == g_processes.end()) {
+            set_last_error_locked("set_active_pid: pid " + std::to_string(pid) + " not in attached set after drain");
             return false;
         }
         process_ctx_t& target = it->second;
@@ -7922,12 +8042,14 @@ namespace driver_bridge
                 SetLastError(ERROR_SUCCESS);
                 const bool ok = arc_bridge_remote_call(function_address, arg1, arg2, arg3, arg4, result);
                 gle = ok ? ERROR_SUCCESS : GetLastError();
+                if (!ok && gle == ERROR_SUCCESS)
+                    gle = ERROR_GEN_FAILURE;
                 return ok;
             });
         if (!arc_outcome.completed) {
             SetLastError(arc_outcome.gle);
             diag::log_tagged_fmt("driver",
-                "call_function_arc_done call_id=%llu label=%s tool=%s diag_id=%s pid=%u active_pid=%u active_after=%u generation=%llu generation_after=%llu fn=0x%llX ok=0 gle=%lu cancelled=%d timeout_ms=%u deadline_ms=%llu deadline_expired_after=%d late_completion=%d lower_uninterruptible=%d stale_generation=%d elapsed_ms=%llu status=%s last_error=%s",
+                "call_function_arc_done call_id=%llu label=%s tool=%s diag_id=%s pid=%u active_pid=%u active_after=%u generation=%llu generation_after=%llu fn=0x%llX ok=0 lower_completed=%d lower_ok=%d lower_reason=%s gle=%lu cancelled=%d timeout_ms=%u deadline_ms=%llu deadline_expired_after=%d late_completion=%d lower_uninterruptible=%d stale_generation=%d elapsed_ms=%llu status=%s last_error=%s",
                 static_cast<unsigned long long>(call_id),
                 call_ctx.label,
                 call_ctx.tool,
@@ -7938,13 +8060,16 @@ namespace driver_bridge
                 static_cast<unsigned long long>(generation_at_entry),
                 static_cast<unsigned long long>(arc_outcome.generation_after),
                 static_cast<unsigned long long>(function_address),
+                arc_outcome.completed ? 1 : 0,
+                arc_outcome.lower_ok ? 1 : 0,
+                arc_outcome.completion_reason.c_str(),
                 static_cast<unsigned long>(arc_outcome.gle),
                 arc_outcome.cancelled ? 1 : 0,
                 call_ctx.timeout_ms,
                 static_cast<unsigned long long>(call_ctx.deadline_ms),
                 arc_outcome.deadline_expired ? 1 : 0,
                 1,
-                1,
+                lower_remote_call_uninterruptible(arc_outcome) ? 1 : 0,
                 arc_outcome.stale_generation ? 1 : 0,
                 static_cast<unsigned long long>(arc_outcome.elapsed_ms),
                 status().c_str(),
@@ -7952,8 +8077,9 @@ namespace driver_bridge
             return 0;
         }
         if (arc_outcome.lower_ok) {
+            const bool arc_success = !arc_outcome.stale_generation && !arc_outcome.cancelled && !arc_outcome.deadline_expired;
             diag::log_tagged_fmt("driver",
-                "call_function_arc_done call_id=%llu label=%s tool=%s diag_id=%s pid=%u active_pid=%u active_after=%u generation=%llu generation_after=%llu fn=0x%llX result=0x%llX ok=1 gle=%lu cancelled=%d timeout_ms=%u deadline_ms=%llu deadline_expired_after=%d late_completion=%d lower_uninterruptible=%d stale_generation=%d elapsed_ms=%llu status=%s last_error=%s",
+                "call_function_arc_done call_id=%llu label=%s tool=%s diag_id=%s pid=%u active_pid=%u active_after=%u generation=%llu generation_after=%llu fn=0x%llX result=0x%llX ok=%d lower_completed=%d lower_ok=%d lower_reason=%s gle=%lu cancelled=%d timeout_ms=%u deadline_ms=%llu deadline_expired_after=%d late_completion=%d lower_uninterruptible=%d stale_generation=%d elapsed_ms=%llu status=%s last_error=%s",
                 static_cast<unsigned long long>(call_id),
                 call_ctx.label,
                 call_ctx.tool,
@@ -7965,13 +8091,17 @@ namespace driver_bridge
                 static_cast<unsigned long long>(arc_outcome.generation_after),
                 static_cast<unsigned long long>(function_address),
                 static_cast<unsigned long long>(arc_outcome.result),
+                arc_success ? 1 : 0,
+                arc_outcome.completed ? 1 : 0,
+                arc_outcome.lower_ok ? 1 : 0,
+                arc_outcome.completion_reason.c_str(),
                 static_cast<unsigned long>(arc_outcome.stale_generation ? ERROR_OPERATION_ABORTED : (arc_outcome.cancelled ? ERROR_CANCELLED : (arc_outcome.deadline_expired ? ERROR_TIMEOUT : ERROR_SUCCESS))),
                 arc_outcome.cancelled ? 1 : 0,
                 call_ctx.timeout_ms,
                 static_cast<unsigned long long>(call_ctx.deadline_ms),
                 arc_outcome.deadline_expired ? 1 : 0,
                 (arc_outcome.deadline_expired || arc_outcome.stale_generation || arc_outcome.cancelled) ? 1 : 0,
-                (arc_outcome.deadline_expired || arc_outcome.stale_generation || arc_outcome.cancelled) ? 1 : 0,
+                lower_remote_call_uninterruptible(arc_outcome) ? 1 : 0,
                 arc_outcome.stale_generation ? 1 : 0,
                 static_cast<unsigned long long>(arc_outcome.elapsed_ms),
                 status().c_str(),
@@ -7980,11 +8110,12 @@ namespace driver_bridge
                 SetLastError(arc_outcome.stale_generation ? ERROR_OPERATION_ABORTED : (arc_outcome.cancelled ? ERROR_CANCELLED : ERROR_TIMEOUT));
                 return 0;
             }
+            SetLastError(ERROR_SUCCESS);
             return arc_outcome.result;
         }
         const DWORD arc_gle = arc_outcome.gle;
         diag::log_tagged_fmt("driver",
-            "call_function_arc_done call_id=%llu label=%s tool=%s diag_id=%s pid=%u active_pid=%u active_after=%u generation=%llu generation_after=%llu fn=0x%llX ok=0 gle=%lu cancelled=%d timeout_ms=%u deadline_ms=%llu deadline_remaining_ms=%llu deadline_expired_after=%d stale_generation=%d elapsed_ms=%llu status=%s last_error=%s",
+            "call_function_arc_done call_id=%llu label=%s tool=%s diag_id=%s pid=%u active_pid=%u active_after=%u generation=%llu generation_after=%llu fn=0x%llX ok=0 lower_completed=%d lower_ok=%d lower_reason=%s gle=%lu cancelled=%d timeout_ms=%u deadline_ms=%llu deadline_remaining_ms=%llu deadline_expired_after=%d stale_generation=%d elapsed_ms=%llu status=%s last_error=%s",
             static_cast<unsigned long long>(call_id),
             call_ctx.label,
             call_ctx.tool,
@@ -7995,6 +8126,9 @@ namespace driver_bridge
             static_cast<unsigned long long>(generation_at_entry),
             static_cast<unsigned long long>(arc_outcome.generation_after),
             static_cast<unsigned long long>(function_address),
+            arc_outcome.completed ? 1 : 0,
+            arc_outcome.lower_ok ? 1 : 0,
+            arc_outcome.completion_reason.c_str(),
             static_cast<unsigned long>(arc_gle),
             current_remote_call_cancelled() ? 1 : 0,
             call_ctx.timeout_ms,
@@ -8076,13 +8210,15 @@ namespace driver_bridge
                 }
                 SetLastError(ERROR_SUCCESS);
                 result = device_snapshot->call_function(function_address, arg1, arg2, arg3, arg4);
-                gle = result != 0 ? ERROR_SUCCESS : GetLastError();
-                return result != 0;
+                gle = GetLastError();
+                if (result != 0)
+                    gle = ERROR_SUCCESS;
+                return result != 0 || gle == ERROR_SUCCESS;
             });
         if (!device_outcome.completed) {
             SetLastError(device_outcome.gle);
             diag::log_tagged_fmt("driver",
-                "call_function_device_wait_done call_id=%llu label=%s tool=%s diag_id=%s pid=%u active_pid=%u active_after=%u generation=%llu generation_after=%llu fn=0x%llX result=0x%llX ok=0 gle=%lu cancelled=%d timeout_ms=%u deadline_ms=%llu deadline_expired_after=%d late_completion=%d lower_uninterruptible=%d stale_generation=%d elapsed_ms=%llu status=%s last_error=%s",
+                "call_function_device_wait_done call_id=%llu label=%s tool=%s diag_id=%s pid=%u active_pid=%u active_after=%u generation=%llu generation_after=%llu fn=0x%llX result=0x%llX ok=0 lower_completed=%d lower_ok=%d lower_reason=%s gle=%lu cancelled=%d timeout_ms=%u deadline_ms=%llu deadline_expired_after=%d late_completion=%d lower_uninterruptible=%d stale_generation=%d elapsed_ms=%llu status=%s last_error=%s",
                 static_cast<unsigned long long>(call_id),
                 call_ctx.label,
                 call_ctx.tool,
@@ -8094,13 +8230,16 @@ namespace driver_bridge
                 static_cast<unsigned long long>(device_outcome.generation_after),
                 static_cast<unsigned long long>(function_address),
                 0ull,
+                device_outcome.completed ? 1 : 0,
+                device_outcome.lower_ok ? 1 : 0,
+                device_outcome.completion_reason.c_str(),
                 static_cast<unsigned long>(device_outcome.gle),
                 device_outcome.cancelled ? 1 : 0,
                 call_ctx.timeout_ms,
                 static_cast<unsigned long long>(call_ctx.deadline_ms),
                 device_outcome.deadline_expired ? 1 : 0,
                 1,
-                1,
+                lower_remote_call_uninterruptible(device_outcome) ? 1 : 0,
                 device_outcome.stale_generation ? 1 : 0,
                 static_cast<unsigned long long>(device_outcome.elapsed_ms),
                 status().c_str(),
@@ -8108,9 +8247,10 @@ namespace driver_bridge
             return 0;
         }
         const uint64_t result = device_outcome.result;
-        const DWORD gle = result != 0 ? ERROR_SUCCESS : device_outcome.gle;
+        const bool device_success = device_outcome.lower_ok && !device_outcome.stale_generation && !device_outcome.cancelled && !device_outcome.deadline_expired;
+        const DWORD gle = device_success ? ERROR_SUCCESS : device_outcome.gle;
         diag::log_tagged_fmt("driver",
-            "call_function_device_wait_done call_id=%llu label=%s tool=%s diag_id=%s pid=%u active_pid=%u active_after=%u generation=%llu generation_after=%llu fn=0x%llX result=0x%llX ok=%d gle=%lu cancelled=%d timeout_ms=%u deadline_ms=%llu deadline_expired_after=%d late_completion=%d lower_uninterruptible=%d stale_generation=%d elapsed_ms=%llu status=%s last_error=%s",
+            "call_function_device_wait_done call_id=%llu label=%s tool=%s diag_id=%s pid=%u active_pid=%u active_after=%u generation=%llu generation_after=%llu fn=0x%llX result=0x%llX ok=%d lower_completed=%d lower_ok=%d lower_reason=%s gle=%lu cancelled=%d timeout_ms=%u deadline_ms=%llu deadline_expired_after=%d late_completion=%d lower_uninterruptible=%d stale_generation=%d elapsed_ms=%llu status=%s last_error=%s",
             static_cast<unsigned long long>(call_id),
             call_ctx.label,
             call_ctx.tool,
@@ -8122,14 +8262,17 @@ namespace driver_bridge
             static_cast<unsigned long long>(device_outcome.generation_after),
             static_cast<unsigned long long>(function_address),
             static_cast<unsigned long long>(result),
-            result != 0 ? 1 : 0,
+            device_success ? 1 : 0,
+            device_outcome.completed ? 1 : 0,
+            device_outcome.lower_ok ? 1 : 0,
+            device_outcome.completion_reason.c_str(),
             static_cast<unsigned long>(device_outcome.stale_generation ? ERROR_OPERATION_ABORTED : (device_outcome.cancelled ? ERROR_CANCELLED : (device_outcome.deadline_expired ? ERROR_TIMEOUT : gle))),
             device_outcome.cancelled ? 1 : 0,
             call_ctx.timeout_ms,
             static_cast<unsigned long long>(call_ctx.deadline_ms),
             device_outcome.deadline_expired ? 1 : 0,
             (device_outcome.deadline_expired || device_outcome.stale_generation || device_outcome.cancelled) ? 1 : 0,
-            (device_outcome.deadline_expired || device_outcome.stale_generation || device_outcome.cancelled) ? 1 : 0,
+            lower_remote_call_uninterruptible(device_outcome) ? 1 : 0,
             device_outcome.stale_generation ? 1 : 0,
             static_cast<unsigned long long>(device_outcome.elapsed_ms),
             status().c_str(),
@@ -8153,8 +8296,11 @@ namespace driver_bridge
             }
             return 0;
         }
-        if (result == 0)
+        if (!device_success) {
             SetLastError(gle);
+            return 0;
+        }
+        SetLastError(ERROR_SUCCESS);
         return result;
     }
 

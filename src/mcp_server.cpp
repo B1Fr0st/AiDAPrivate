@@ -2730,7 +2730,7 @@ bool mcp_server_t::start(int port)
 
     try
     {
-        _server_thread = std::thread([this, port]() { server_thread_func(port); });
+        _server_thread = std::thread([this, port]() { server_thread_entry(port); });
     }
     catch (const std::exception& e)
     {
@@ -2795,6 +2795,12 @@ void mcp_server_t::stop()
     if (!_running.load() && !_server_thread.joinable() && !_registry)
         return;
 
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("ida_mcp_stop_enter running=%d joinable=%d port=%d",
+                               _running.load() ? 1 : 0,
+                               _server_thread.joinable() ? 1 : 0,
+                               _port);
+#endif
     _stop_requested = true;
 
     {
@@ -2807,6 +2813,9 @@ void mcp_server_t::stop()
 
     if (_server_thread.joinable())
         _server_thread.join();
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("ida_mcp_stop_thread_joined port=%d", _port);
+#endif
 
     if (_registry)
     {
@@ -2816,6 +2825,52 @@ void mcp_server_t::stop()
     }
 
     msg(OBFSTR_C("AiDA MCP: Server stopped.\n"));
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("ida_mcp_stop_exit");
+#endif
+}
+
+void mcp_server_t::server_thread_entry(int port)
+{
+    unsigned long seh = 0;
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("ida_mcp_server_thread_enter requested_port=%d", port);
+    __try
+    {
+        server_thread_func(port);
+    }
+    __except ((seh = GetExceptionCode()), EXCEPTION_EXECUTE_HANDLER)
+    {
+    }
+#else
+    server_thread_func(port);
+#endif
+    server_thread_finish(seh, port);
+}
+
+void mcp_server_t::server_thread_finish(unsigned long seh, int port)
+{
+    if (seh != 0)
+    {
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("ida_mcp_server_thread_seh code=0x%08lX requested_port=%d bound_port=%d",
+                                   seh,
+                                   port,
+                                   _port);
+#endif
+        _bind_failed.store(true, std::memory_order_release);
+    }
+    _running.store(false, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(_server_mutex);
+        _active_server = nullptr;
+    }
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("ida_mcp_server_thread_exit seh=0x%08lX requested_port=%d bound_port=%d",
+                               seh,
+                               port,
+                               _port);
+#endif
 }
 
 void mcp_server_t::server_thread_func(int port)

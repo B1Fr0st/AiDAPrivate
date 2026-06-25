@@ -603,7 +603,22 @@ inline bool suppress_full_test_pdb_load(const char* source,
 	}
 
 	diag::log_tagged_fmt("symbol_store",
-		"fulltest_symbol_store_pdb_suppressed decision=do_not_load_pdb source=%s module=%s base=0x%llX size=0x%llX pdb=%s guid=%s age=%u local_candidate=%s cache_path=%s explicit_path=%s reason=%s generation=%llu prompt_created=0 prompt_suppressed=1 module_present=%d loaded=%d loading=%d failed=%d declined=%d state_updated=%d",
+		"fulltest_pdb_final_decision source=%s module=%s base=0x%llX size=0x%llX pdb=%s guid=%s age=%u decision=do_not_load_pdb reason=%s local_candidate=%s cache_path=%s explicit_path=%s prompt_suppressed=1 is_running=%d unattended_active=%d",
+		source && *source ? source : "<unknown>",
+		log_value(module_name),
+		static_cast<unsigned long long>(base),
+		static_cast<unsigned long long>(size),
+		log_value(pdb_name),
+		log_value(pdb_guid),
+		static_cast<unsigned>(pdb_age),
+		reason && *reason ? reason : "full_test_declined_pdb_load",
+		log_value(local_candidate),
+		log_value(cache_path),
+		log_value(explicit_path),
+		test_all_features::is_running() ? 1 : 0,
+		test_all_features::is_unattended_full_test_active() ? 1 : 0);
+	diag::log_tagged_fmt("symbol_store",
+		"fulltest_symbol_store_pdb_suppressed decision=do_not_load_pdb source=%s module=%s base=0x%llX size=0x%llX pdb=%s guid=%s age=%u local_candidate=%s cache_path=%s explicit_path=%s reason=%s generation=%llu prompt_created=0 prompt_suppressed=1 module_present=%d loaded=%d loading=%d failed=%d declined=%d state_updated=%d is_running=%d unattended_active=%d",
 		source && *source ? source : "<unknown>",
 		log_value(module_name),
 		static_cast<unsigned long long>(base),
@@ -621,7 +636,9 @@ inline bool suppress_full_test_pdb_load(const char* source,
 		already_loading ? 1 : 0,
 		final_failed ? 1 : 0,
 		final_declined ? 1 : 0,
-		state_updated ? 1 : 0);
+		state_updated ? 1 : 0,
+		test_all_features::is_running() ? 1 : 0,
+		test_all_features::is_unattended_full_test_active() ? 1 : 0);
 	return true;
 }
 

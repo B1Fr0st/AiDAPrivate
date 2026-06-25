@@ -162,6 +162,9 @@ namespace {
     std::atomic<uint64_t> g_mcp_phase_instance_counter{0};
     std::atomic<int> g_mcp_phase_enter_count{0};
     std::atomic<bool> g_mcp_phase_active{false};
+    std::atomic<bool> g_mcp_coverage_audit_started{false};
+    std::atomic<bool> g_mcp_coverage_audit_completed{false};
+    constexpr int k_mcp_planned_tool_tests = 514;
     constexpr DWORD k_camoufox_testlab_launch_timeout_ms = 75000;
     constexpr DWORD k_camoufox_dependency_probe_timeout_ms = 9000;
     constexpr long long k_camoufox_reverse_tool_sidecar_timeout_ms = 65000;
@@ -1815,6 +1818,45 @@ namespace {
             case mcp_standalone::tool_visibility_t::ide_chat_only: return "ide_chat_only";
             default: return "unknown";
         }
+    }
+
+    struct mcp_inventory_snapshot_t {
+        std::size_t total = 0;
+        std::size_t external_visible = 0;
+        std::size_t internal_only = 0;
+        std::size_t ide_chat_only = 0;
+        std::uint64_t hash = 1469598103934665603ULL;
+    };
+
+    void hash_inventory_byte(std::uint64_t& hash, unsigned char value) {
+        hash ^= static_cast<std::uint64_t>(value);
+        hash *= 1099511628211ULL;
+    }
+
+    void hash_inventory_text(std::uint64_t& hash, const std::string& value) {
+        for (unsigned char c : value)
+            hash_inventory_byte(hash, c);
+        hash_inventory_byte(hash, 0);
+    }
+
+    mcp_inventory_snapshot_t mcp_inventory_snapshot(mcp_standalone::server_t* srv) {
+        mcp_inventory_snapshot_t snapshot{};
+        if (!srv)
+            return snapshot;
+        for (const auto& tool : srv->get_tools()) {
+            ++snapshot.total;
+            if (tool.visibility == mcp_standalone::tool_visibility_t::external_visible)
+                ++snapshot.external_visible;
+            else if (tool.visibility == mcp_standalone::tool_visibility_t::internal_only)
+                ++snapshot.internal_only;
+            else if (tool.visibility == mcp_standalone::tool_visibility_t::ide_chat_only)
+                ++snapshot.ide_chat_only;
+            hash_inventory_text(snapshot.hash, tool.name);
+            hash_inventory_text(snapshot.hash, tool_visibility_name(tool.visibility));
+            hash_inventory_byte(snapshot.hash, tool.read_only ? 1u : 0u);
+            hash_inventory_byte(snapshot.hash, static_cast<unsigned char>(tool.params.size() & 0xFFu));
+        }
+        return snapshot;
     }
 
     bool json_payload_empty(const mcp_standalone::json& data) {
@@ -29925,6 +29967,8 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
         g_timed_out_invocations.clear();
     }
     g_mcp_tool_sequence.store(0, std::memory_order_release);
+    g_mcp_coverage_audit_started.store(false, std::memory_order_release);
+    g_mcp_coverage_audit_completed.store(false, std::memory_order_release);
     g_mcp_target_pid = driver_bridge::attached_pid();
     g_mcp_target_unavailable = (g_mcp_target_pid == 0);
     g_mcp_dbg_sw_addr = 0;
@@ -29995,6 +30039,23 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
         driver_bridge::last_error().c_str(),
         static_cast<unsigned long>(GetCurrentProcessId()),
         static_cast<unsigned long>(GetCurrentThreadId()));
+    {
+        auto* srv = get_server();
+        const auto inventory = mcp_inventory_snapshot(srv);
+        log_msg(hf, "mcp_phase", "MCP_PHASE_ENTER -- planned=%d instance=%llu server_present=%d server_running=%d port=%d registered_total=%zu registered_external=%zu registered_internal=%zu registered_ide_chat=%zu inventory_hash=0x%016llX target_pid=%u target_unavailable=%d",
+            k_mcp_planned_tool_tests,
+            static_cast<unsigned long long>(phase_instance),
+            srv ? 1 : 0,
+            srv && srv->is_running() ? 1 : 0,
+            srv ? srv->get_port() : 0,
+            inventory.total,
+            inventory.external_visible,
+            inventory.internal_only,
+            inventory.ide_chat_only,
+            static_cast<unsigned long long>(inventory.hash),
+            g_mcp_target_pid,
+            g_mcp_target_unavailable ? 1 : 0);
+    }
 
     if (!cancelled()) test_mcp_server_accessible(hf, passed, failed, skipped);
     if (!cancelled()) test_mcp_server_running(hf, passed, failed, skipped);
@@ -30421,12 +30482,14 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) {
         const auto cq_before_coverage = critical_work_queue::stats();
         set_progress_step("mcp finalization: coverage audit");
+        g_mcp_coverage_audit_started.store(true, std::memory_order_release);
         log_msg(hf, "mcp.cleanup", "coverage_audit_begin cq_pending=%zu cq_active=%u cq_started=%llu cq_finished=%llu",
             cq_before_coverage.pending,
             static_cast<unsigned>(cq_before_coverage.active),
             static_cast<unsigned long long>(cq_before_coverage.started),
             static_cast<unsigned long long>(cq_before_coverage.finished));
         test_mcp_coverage_audit(hf, passed, failed, skipped);
+        g_mcp_coverage_audit_completed.store(true, std::memory_order_release);
         const auto cq_after_coverage = critical_work_queue::stats();
         log_msg(hf, "mcp.cleanup", "coverage_audit_end cq_pending=%zu cq_active=%u cq_started=%llu cq_finished=%llu",
             cq_after_coverage.pending,
@@ -30573,11 +30636,33 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     auto t1 = std::chrono::steady_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
     const int delta_passed = passed.load(std::memory_order_acquire) - start_passed;
-    const int delta_failed = failed.load(std::memory_order_acquire) - start_failed;
+    int delta_failed = failed.load(std::memory_order_acquire) - start_failed;
     const int delta_skipped = global_skipped.load(std::memory_order_acquire) - start_skipped;
+    if (!g_mcp_coverage_audit_started.load(std::memory_order_acquire) ||
+        !g_mcp_coverage_audit_completed.load(std::memory_order_acquire)) {
+        failed.fetch_add(1, std::memory_order_acq_rel);
+        log_msg(hf, "mcp_phase", "FAIL -- MCP coverage audit did not complete planned=%d audit_started=%d audit_completed=%d cancel=%d registered_tool_records=%zu explicit_invocations=%zu",
+            k_mcp_planned_tool_tests,
+            g_mcp_coverage_audit_started.load(std::memory_order_acquire) ? 1 : 0,
+            g_mcp_coverage_audit_completed.load(std::memory_order_acquire) ? 1 : 0,
+            cancelled() ? 1 : 0,
+            g_tool_attempt_stats.size(),
+            g_invoked_tools.size());
+    }
+    delta_failed = failed.load(std::memory_order_acquire) - start_failed;
     log_msg(hf, "mcp.phase_accounting", "registered_tool_records=%zu explicit_invocations=%zu pass_delta=%d fail_delta=%d skip_delta=%d",
         g_tool_attempt_stats.size(), g_invoked_tools.size(), delta_passed, delta_failed, delta_skipped);
     set_progress_step("mcp complete");
+    log_msg(hf, "mcp_phase", "MCP_PHASE_DONE -- planned=%d instance=%llu coverage_audit_started=%d coverage_audit_completed=%d registered_tool_records=%zu explicit_invocations=%zu pass_delta=%d fail_delta=%d skip_delta=%d",
+        k_mcp_planned_tool_tests,
+        static_cast<unsigned long long>(phase_instance),
+        g_mcp_coverage_audit_started.load(std::memory_order_acquire) ? 1 : 0,
+        g_mcp_coverage_audit_completed.load(std::memory_order_acquire) ? 1 : 0,
+        g_tool_attempt_stats.size(),
+        g_invoked_tools.size(),
+        passed.load(std::memory_order_acquire) - start_passed,
+        failed.load(std::memory_order_acquire) - start_failed,
+        delta_skipped);
     log_msg(hf, "mcp_phase", "=== MCP TOOL TESTS DONE (elapsed %lld ms) ===", (long long)ms);
 }
 

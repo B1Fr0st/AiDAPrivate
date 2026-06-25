@@ -156,6 +156,11 @@ json status_to_json(const camoufox::bridge_status_t& s)
     j["page_verified"]    = s.page_verified;
     j["child_alive"]      = s.child_alive;
     j["cleanup_pending"]  = s.cleanup_pending;
+    j["cleanup_generation"] = s.cleanup_generation;
+    j["cleanup_started_ms"] = s.cleanup_started_ms;
+    j["cleanup_child_pid"] = s.cleanup_child_pid;
+    j["cleanup_reason"] = s.cleanup_reason;
+    j["cleanup_diagnostics"] = s.cleanup_diagnostics.is_object() ? s.cleanup_diagnostics : json::object();
     j["generation"]       = s.generation;
     j["last_launch_ms"]   = s.last_launch_ms;
     j["last_nav_ms"]      = s.last_nav_ms;

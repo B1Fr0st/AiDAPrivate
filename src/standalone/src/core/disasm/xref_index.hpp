@@ -466,7 +466,7 @@ namespace xref_index {
 			const uint32_t start_pid = driver_bridge::attached_pid();
 			pe_parser::pe_info_t pe;
 			std::vector<pe_parser::section_info_t> sections;
-			if (pe_parser::parse(mod->base, pe))
+			if (pe_parser::parse(mod->base, pe, false))
 				sections = pe.sections;
 
 			auto fns = snapshot_functions(mod->base, mod->size);
@@ -1243,19 +1243,27 @@ namespace xref_index {
 		std::vector<pe_parser::section_info_t> sections;
 		const auto pe_started = std::chrono::steady_clock::now();
 		diag::log_tagged_critical_fmt("xref",
-			"bounded_live_range_pe_parse_begin module=%s base=0x%llX deadline_remaining_ms=%llu pid=%u tid=%lu elapsed_us=%llu",
+			"bounded_live_range_pe_parse_begin module=%s base=0x%llX include_imports_exports=0 deadline_remaining_ms=%llu pid=%u tid=%lu elapsed_us=%llu",
 			result.module.c_str(),
 			static_cast<unsigned long long>(result.module_base),
 			static_cast<unsigned long long>(deadline_remaining_ms()),
 			result.pid,
 			detail::current_worker_tid(),
 			static_cast<unsigned long long>(detail::elapsed_us_since(started)));
-		if (pe_parser::parse(result.module_base, pe))
+		pe_parser::parse_options_t pe_options;
+		pe_options.include_imports_exports = false;
+		pe_options.deadline = deadline_enabled ? &deadline : nullptr;
+		pe_options.emit_diagnostics = true;
+		bool pe_truncated = false;
+		pe_options.truncated = &pe_truncated;
+		const bool pe_ok = pe_parser::parse_bounded(result.module_base, pe, pe_options);
+		if (pe_ok)
 			sections = pe.sections;
 		diag::log_tagged_critical_fmt("xref",
-			"bounded_live_range_pe_parse_end module=%s ok=%d sections=%zu parse_elapsed_us=%llu deadline_remaining_ms=%llu pid=%u tid=%lu elapsed_us=%llu",
+			"bounded_live_range_pe_parse_end module=%s ok=%d include_imports_exports=0 truncated=%d sections=%zu parse_elapsed_us=%llu deadline_remaining_ms=%llu pid=%u tid=%lu elapsed_us=%llu",
 			result.module.c_str(),
-			sections.empty() ? 0 : 1,
+			pe_ok ? 1 : 0,
+			pe_truncated ? 1 : 0,
 			sections.size(),
 			static_cast<unsigned long long>(detail::elapsed_us_since(pe_started)),
 			static_cast<unsigned long long>(deadline_remaining_ms()),

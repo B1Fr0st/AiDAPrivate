@@ -11,7 +11,9 @@
 
 #include <windows.h>
 #include <bcrypt.h>
+#include <Psapi.h>
 #pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "Psapi.lib")
 
 #include <algorithm>
 #include <atomic>
@@ -53,6 +55,8 @@ namespace
     HANDLE            g_watchdog_stop_event = nullptr;
     PVOID             g_exception_handler = nullptr;
     std::string       g_last_failure;
+    std::atomic<uintptr_t> g_self_module_base{0};
+    std::atomic<uintptr_t> g_self_module_end{0};
 
     bool diag_log_path(char* out, size_t cap)
     {
@@ -132,13 +136,58 @@ namespace
         va_end(args);
     }
 
-    bool is_aida_module_path(const char* path)
+    void refresh_self_module_range()
     {
-        if (!path || !*path)
-            return false;
-        const char* base = std::strrchr(path, '\\');
-        base = base ? base + 1 : path;
-        return _stricmp(base, "AiDA.dll") == 0;
+        HMODULE module = nullptr;
+        if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                reinterpret_cast<LPCSTR>(&refresh_self_module_range),
+                                &module) || module == nullptr)
+            return;
+
+        MODULEINFO mi{};
+        if (GetModuleInformation(GetCurrentProcess(), module, &mi, sizeof(mi)) && mi.lpBaseOfDll && mi.SizeOfImage != 0)
+        {
+            const auto base = reinterpret_cast<uintptr_t>(mi.lpBaseOfDll);
+            g_self_module_base.store(base, std::memory_order_release);
+            g_self_module_end.store(base + mi.SizeOfImage, std::memory_order_release);
+            return;
+        }
+
+        const auto base = reinterpret_cast<uintptr_t>(module);
+        DWORD seh = 0;
+        DWORD size_of_image = 0;
+        __try
+        {
+            auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+            if (dos->e_magic == IMAGE_DOS_SIGNATURE && dos->e_lfanew > 0)
+            {
+                auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + static_cast<uintptr_t>(dos->e_lfanew));
+                if (nt->Signature == IMAGE_NT_SIGNATURE)
+                    size_of_image = nt->OptionalHeader.SizeOfImage;
+            }
+        }
+        __except ((seh = GetExceptionCode()), EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
+        if (size_of_image != 0)
+        {
+            g_self_module_base.store(base, std::memory_order_release);
+            g_self_module_end.store(base + size_of_image, std::memory_order_release);
+            return;
+        }
+
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(module, &mbi, sizeof(mbi)) == sizeof(mbi) && mbi.AllocationBase && mbi.RegionSize != 0)
+        {
+            const auto fallback_base = reinterpret_cast<uintptr_t>(mbi.AllocationBase);
+            g_self_module_base.store(fallback_base, std::memory_order_release);
+            g_self_module_end.store(fallback_base + mbi.RegionSize, std::memory_order_release);
+            diag_log_fmt("self_module_range_fallback seh=0x%08lX base=0x%llX end=0x%llX region=0x%llX",
+                         seh,
+                         static_cast<unsigned long long>(fallback_base),
+                         static_cast<unsigned long long>(fallback_base + mbi.RegionSize),
+                         static_cast<unsigned long long>(mbi.RegionSize));
+        }
     }
 
     LONG CALLBACK plugin_exception_veh(PEXCEPTION_POINTERS ep)
@@ -153,22 +202,23 @@ namespace
 
         in_handler = true;
         PVOID addr = ep->ExceptionRecord->ExceptionAddress;
-        HMODULE mod = nullptr;
-        char mod_path[MAX_PATH] = "<unknown>";
-        uintptr_t mod_base = 0;
+        const uintptr_t a = reinterpret_cast<uintptr_t>(addr);
+        uintptr_t mod_base = g_self_module_base.load(std::memory_order_acquire);
+        const uintptr_t mod_end = g_self_module_end.load(std::memory_order_acquire);
         uintptr_t mod_off = 0;
-        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                               reinterpret_cast<LPCSTR>(addr),
-                               &mod) && mod)
+        bool in_aida = false;
+        if (mod_base != 0 && mod_end > mod_base && a >= mod_base && a < mod_end)
         {
-            GetModuleFileNameA(mod, mod_path, MAX_PATH);
-            mod_base = reinterpret_cast<uintptr_t>(mod);
-            const uintptr_t a = reinterpret_cast<uintptr_t>(addr);
-            if (a >= mod_base)
-                mod_off = a - mod_base;
+            in_aida = true;
+            mod_off = a - mod_base;
+        }
+        else
+        {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (VirtualQuery(addr, &mbi, sizeof(mbi)) == sizeof(mbi))
+                mod_base = reinterpret_cast<uintptr_t>(mbi.AllocationBase);
         }
 
-        const bool in_aida = is_aida_module_path(mod_path);
         const ULONG_PTR info0 = ep->ExceptionRecord->NumberParameters > 0 ? ep->ExceptionRecord->ExceptionInformation[0] : 0;
         const ULONG_PTR info1 = ep->ExceptionRecord->NumberParameters > 1 ? ep->ExceptionRecord->ExceptionInformation[1] : 0;
         const ULONG_PTR info2 = ep->ExceptionRecord->NumberParameters > 2 ? ep->ExceptionRecord->ExceptionInformation[2] : 0;
@@ -187,13 +237,14 @@ namespace
         const unsigned long long rcx = 0;
         const unsigned long long rdx = 0;
 #endif
-        diag_log_fmt("veh_exception code=0x%08lX flags=0x%08lX addr=%p module=%s module_base=0x%llX module_off=0x%llX in_aida=%d params=%lu info0=0x%llX info1=0x%llX info2=0x%llX rip=0x%llX rsp=0x%llX rbp=0x%llX rax=0x%llX rcx=0x%llX rdx=0x%llX watchdog_running=%d watchdog_started=%d standalone_auth=%d verified_port=%d",
+        diag_log_fmt("veh_exception code=0x%08lX flags=0x%08lX addr=%p module_base=0x%llX module_off=0x%llX self_base=0x%llX self_end=0x%llX in_aida=%d params=%lu info0=0x%llX info1=0x%llX info2=0x%llX rip=0x%llX rsp=0x%llX rbp=0x%llX rax=0x%llX rcx=0x%llX rdx=0x%llX watchdog_running=%d watchdog_started=%d standalone_auth=%d verified_port=%d",
                      code,
                      ep->ExceptionRecord->ExceptionFlags,
                      addr,
-                     mod_path,
                      static_cast<unsigned long long>(mod_base),
                      static_cast<unsigned long long>(mod_off),
+                     static_cast<unsigned long long>(g_self_module_base.load(std::memory_order_acquire)),
+                     static_cast<unsigned long long>(g_self_module_end.load(std::memory_order_acquire)),
                      in_aida ? 1 : 0,
                      ep->ExceptionRecord->NumberParameters,
                      static_cast<unsigned long long>(info0),
@@ -818,7 +869,12 @@ namespace
                          elapsed_ms());
             if (health_res->status != 200)
                 return fail("health_status", "health returned HTTP " + std::to_string(health_res->status));
+            diag_log_fmt("verify_port_health_parse_begin port=%d elapsed_ms=%llu", port, elapsed_ms());
             nlohmann::json health = nlohmann::json::parse(health_res->body, nullptr, false);
+            diag_log_fmt("verify_port_health_parse_done port=%d discarded=%d elapsed_ms=%llu",
+                         port,
+                         health.is_discarded() ? 1 : 0,
+                         elapsed_ms());
             if (!verify_health_payload(health, failure))
                 return fail("health_payload", failure);
 
@@ -856,7 +912,13 @@ namespace
                          elapsed_ms());
             if (auth_res->status != 200)
                 return fail("auth_status", "standalone auth proof returned HTTP " + std::to_string(auth_res->status));
+            diag_log_fmt("verify_port_auth_parse_begin port=%d elapsed_ms=%llu", port, elapsed_ms());
             nlohmann::json auth_json = nlohmann::json::parse(auth_res->body, nullptr, false);
+            diag_log_fmt("verify_port_auth_parse_done port=%d discarded=%d elapsed_ms=%llu",
+                         port,
+                         auth_json.is_discarded() ? 1 : 0,
+                         elapsed_ms());
+            diag_log_fmt("verify_port_auth_verify_begin port=%d elapsed_ms=%llu", port, elapsed_ms());
             if (!verify_ida_plugin_auth_proof(auth_json, challenge, port, failure))
                 return fail("auth_payload", failure);
             diag_log_fmt("verify_port_auth_verified port=%d elapsed_ms=%llu", port, elapsed_ms());
@@ -891,7 +953,13 @@ namespace
                          elapsed_ms());
             if (init_res->status < 200 || init_res->status >= 300)
                 return fail("initialize_status", "initialize returned HTTP " + std::to_string(init_res->status));
+            diag_log_fmt("verify_port_initialize_parse_begin port=%d elapsed_ms=%llu", port, elapsed_ms());
             nlohmann::json init_json = nlohmann::json::parse(init_res->body, nullptr, false);
+            diag_log_fmt("verify_port_initialize_parse_done port=%d discarded=%d elapsed_ms=%llu",
+                         port,
+                         init_json.is_discarded() ? 1 : 0,
+                         elapsed_ms());
+            diag_log_fmt("verify_port_initialize_verify_begin port=%d elapsed_ms=%llu", port, elapsed_ms());
             if (!verify_initialize_payload(init_json, failure))
                 return fail("initialize_payload", failure);
             diag_log_fmt("verify_port_success port=%d elapsed_ms=%llu", port, elapsed_ms());
@@ -944,7 +1012,7 @@ namespace
         return false;
     }
 
-    void watchdog_thread(HANDLE stop_event)
+    void watchdog_thread_body(HANDLE stop_event)
     {
         diag_log_fmt("watchdog_thread_enter stop_event=%p", stop_event);
         int consecutive_failures = 0;
@@ -999,9 +1067,29 @@ namespace
                 __fastfail(kStandaloneAuthFastFailCode);
             }
         }
+    }
+
+    void watchdog_thread(HANDLE stop_event)
+    {
+        DWORD seh = 0;
+        __try
+        {
+            watchdog_thread_body(stop_event);
+        }
+        __except ((seh = GetExceptionCode()), EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
+        if (seh != 0)
+        {
+            diag_log_fmt("watchdog_thread_seh code=0x%08lX stop_event=%p port=%d",
+                         seh,
+                         stop_event,
+                         g_verified_port.load(std::memory_order_acquire));
+        }
         g_standalone_authenticated.store(false, std::memory_order_release);
+        g_watchdog_running.store(false, std::memory_order_release);
         g_watchdog_started.store(false, std::memory_order_release);
-        diag_log_fmt("watchdog_thread_exit");
+        diag_log_fmt("watchdog_thread_exit seh=0x%08lX", seh);
     }
 }
 
@@ -1069,14 +1157,14 @@ namespace aida_ipc
         HANDLE stop_event = nullptr;
         {
             std::lock_guard<std::mutex> lock(g_watchdog_mutex);
+            g_watchdog_running.store(false, std::memory_order_release);
+            g_standalone_authenticated.store(false, std::memory_order_release);
             stop_event = g_watchdog_stop_event;
             if (stop_event)
                 SetEvent(stop_event);
             if (g_watchdog_thread.joinable())
                 worker = std::move(g_watchdog_thread);
         }
-        g_watchdog_running.store(false, std::memory_order_release);
-        g_standalone_authenticated.store(false, std::memory_order_release);
         if (worker.joinable())
         {
             diag_log_fmt("shutdown_join_begin stop_event=%p", stop_event);
@@ -1105,10 +1193,15 @@ namespace aida_ipc
     void install_crash_breadcrumbs()
     {
         std::lock_guard<std::mutex> lock(g_exception_mutex);
+        refresh_self_module_range();
         if (g_exception_handler)
             return;
         g_exception_handler = AddVectoredExceptionHandler(1, plugin_exception_veh);
-        diag_log_fmt("crash_breadcrumbs_install handler=%p gle=%lu", g_exception_handler, GetLastError());
+        diag_log_fmt("crash_breadcrumbs_install handler=%p gle=%lu self_base=0x%llX self_end=0x%llX",
+                     g_exception_handler,
+                     GetLastError(),
+                     static_cast<unsigned long long>(g_self_module_base.load(std::memory_order_acquire)),
+                     static_cast<unsigned long long>(g_self_module_end.load(std::memory_order_acquire)));
     }
 
     void uninstall_crash_breadcrumbs()

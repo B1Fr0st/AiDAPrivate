@@ -764,44 +764,50 @@ namespace functions_panel {
 				}
 			}
 			if (already_loaded_or_loading) {
-				if (test_all_features::is_running()) {
+				if (test_all_features::is_unattended_full_test_active()) {
 					const std::string pdb_name = disk_pdb_name_for_module(display_name);
 					diag::log_tagged_fmt("functions_panel",
-						"fulltest_disk_pdb_policy module=%s base=0x%llX size=0x%X pdb=%s local_candidate=<none> cache_path=<none> decision=do_not_load_pdb reason=module_loaded_loading_failed_or_declined prompt_created=0 prompt_suppressed=1 failed=%d declined=%d",
+						"fulltest_disk_pdb_policy module=%s base=0x%llX size=0x%X pdb=%s local_candidate=<none> cache_path=<none> decision=do_not_load_pdb reason=module_loaded_loading_failed_or_declined prompt_created=0 prompt_suppressed=1 failed=%d declined=%d is_running=%d unattended_active=%d",
 						display_name.c_str(),
 						static_cast<unsigned long long>(image_base),
 						static_cast<unsigned>(size_of_image),
 						pdb_name.c_str(),
 						already_failed ? 1 : 0,
-						already_declined ? 1 : 0);
+						already_declined ? 1 : 0,
+						test_all_features::is_running() ? 1 : 0,
+						test_all_features::is_unattended_full_test_active() ? 1 : 0);
 				}
 				return;
 			}
-			if (test_all_features::is_running()) {
+			if (test_all_features::is_unattended_full_test_active()) {
 				std::string local_candidate;
 				const bool have_local = resolve_full_test_disk_pdb(binary_path, display_name, local_candidate);
 				const std::string pdb_name = disk_pdb_name_for_module(display_name);
 				if (have_local) {
 					diag::log_tagged_fmt("functions_panel",
-						"fulltest_disk_pdb_policy module=%s base=0x%llX size=0x%X pdb=%s local_candidate=%s cache_path=<none> decision=load_local reason=direct_local_pdb_present prompt_created=0 prompt_suppressed=1 failed=0 declined=0",
+						"fulltest_disk_pdb_policy module=%s base=0x%llX size=0x%X pdb=%s local_candidate=%s cache_path=<none> decision=load_local reason=direct_local_pdb_present prompt_created=0 prompt_suppressed=1 failed=0 declined=0 is_running=%d unattended_active=%d",
 						display_name.c_str(),
 						static_cast<unsigned long long>(image_base),
 						static_cast<unsigned>(size_of_image),
 						pdb_name.c_str(),
-						local_candidate.c_str());
+						local_candidate.c_str(),
+						test_all_features::is_running() ? 1 : 0,
+						test_all_features::is_unattended_full_test_active() ? 1 : 0);
 					symbol_store::load_pdb_from_explicit_path(display_name, image_base,
 						static_cast<uint64_t>(size_of_image), local_candidate);
 					return;
 				}
 				const char* reason = "no_deterministic_local_pdb_decline_remote_symbol_download";
 				diag::log_tagged_fmt("functions_panel",
-					"fulltest_disk_pdb_policy module=%s base=0x%llX size=0x%X pdb=%s local_candidate=%s cache_path=<none> decision=do_not_load_pdb reason=%s prompt_created=0 prompt_suppressed=1 failed=0 declined=1",
+					"fulltest_disk_pdb_policy module=%s base=0x%llX size=0x%X pdb=%s local_candidate=%s cache_path=<none> decision=do_not_load_pdb reason=%s prompt_created=0 prompt_suppressed=1 failed=0 declined=1 is_running=%d unattended_active=%d",
 					display_name.c_str(),
 					static_cast<unsigned long long>(image_base),
 					static_cast<unsigned>(size_of_image),
 					pdb_name.c_str(),
 					"<none>",
-					reason);
+					reason,
+					test_all_features::is_running() ? 1 : 0,
+					test_all_features::is_unattended_full_test_active() ? 1 : 0);
 				symbol_store::suppress_full_test_pdb_load("functions_panel.trigger_disk_pdb_auto_load",
 					display_name, image_base, static_cast<uint64_t>(size_of_image),
 					pdb_name, {}, 0, local_candidate, {}, {},

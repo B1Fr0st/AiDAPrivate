@@ -529,6 +529,13 @@ function Get-CamoufoxSidecarInputs([string]$ReleaseDir) {
         (Join-Path $RepoRoot "build-ninja\Release\deps\test_binaries\target_protocol"),
         (Join-Path $RepoRoot "test_binaries\target_protocol")
     ) -Directory
+    $z3Runtime = Find-FirstExistingPath @(
+        (Join-Path $ReleaseDir "deps\z3"),
+        (Join-Path $releaseOutput "deps\z3"),
+        (Join-Path $RepoRoot "build-ninja\deps\z3"),
+        (Join-Path $RepoRoot "build-ninja\Release\deps\z3"),
+        (Join-Path $RepoRoot ".deps\z3\z3-4.13.4-x64-win\bin")
+    ) -Directory
     return [pscustomobject]@{
         BrowserName = $browserName
         BrowserDir = $browser
@@ -536,9 +543,25 @@ function Get-CamoufoxSidecarInputs([string]$ReleaseDir) {
         McpExe = $mcp
         GhidraSpecsDir = $ghidraSpecs
         TargetProtocolDir = $targetProtocol
+        Z3RuntimeDir = $z3Runtime
         ExeRel = "deps/$browserName/camoufox.exe"
         PythonRel = ""
     }
+}
+
+function Get-Z3RuntimeDllNames {
+    return @(
+        "libz3.dll",
+        "msvcp140.dll",
+        "msvcp140_1.dll",
+        "msvcp140_2.dll",
+        "msvcp140_atomic_wait.dll",
+        "msvcp140_codecvt_ids.dll",
+        "vcomp140.dll",
+        "vcruntime140.dll",
+        "vcruntime140_1.dll",
+        "vcruntime140_threads.dll"
+    )
 }
 
 function Assert-GhidraSpecsInput([string]$Dir) {
@@ -561,6 +584,18 @@ function Assert-TargetProtocolInput([string]$Dir) {
         $path = Join-Path $Dir $name
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
             Stop-Deploy "target_protocol fixture directory is incomplete: $path is missing."
+        }
+    }
+}
+
+function Assert-Z3RuntimeInput([string]$Dir) {
+    if (-not $Dir -or -not (Test-Path -LiteralPath $Dir -PathType Container)) {
+        Stop-Deploy "Z3 runtime directory is missing. Build AiDAStandalone so deps\z3 is staged before customer deployment."
+    }
+    foreach ($name in Get-Z3RuntimeDllNames) {
+        $path = Join-Path $Dir $name
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            Stop-Deploy "Z3 runtime directory is incomplete: $path is missing."
         }
     }
 }
@@ -594,6 +629,7 @@ function Assert-CamoufoxSidecarInputs([pscustomobject]$Inputs) {
     }
     Assert-GhidraSpecsInput $Inputs.GhidraSpecsDir
     Assert-TargetProtocolInput $Inputs.TargetProtocolDir
+    Assert-Z3RuntimeInput $Inputs.Z3RuntimeDir
 }
 
 function Assert-NoReverseMcpSourceLeak([string]$StageRoot) {
@@ -618,6 +654,19 @@ function New-CamoufoxSidecarPackage([pscustomobject]$Inputs, [string]$DeployId) 
         Copy-Item -LiteralPath $Inputs.BrowserDir -Destination (Join-Path $depsRoot $Inputs.BrowserName) -Recurse -Force
         Copy-Item -LiteralPath $Inputs.McpExe -Destination (Join-Path $depsRoot "AiDA_CamoufoxReverseMcp.exe") -Force
         Copy-Item -LiteralPath $Inputs.GhidraSpecsDir -Destination (Join-Path $depsRoot "ghidra_specs") -Recurse -Force
+        $z3Dest = Join-Path $depsRoot "z3"
+        New-Item -ItemType Directory -Force -Path $z3Dest | Out-Null
+        $z3DllNames = Get-Z3RuntimeDllNames
+        $stagedZ3Dlls = Get-ChildItem -LiteralPath $Inputs.Z3RuntimeDir -File -Filter "*.dll" -ErrorAction Stop | Sort-Object Name
+        foreach ($dll in $stagedZ3Dlls) {
+            Copy-Item -LiteralPath $dll.FullName -Destination (Join-Path $z3Dest $dll.Name) -Force
+        }
+        foreach ($name in $z3DllNames) {
+            $dest = Join-Path $z3Dest $name
+            if (-not (Test-Path -LiteralPath $dest -PathType Leaf)) {
+                Stop-Deploy "Z3 runtime package staging failed: $dest is missing."
+            }
+        }
         $targetProtocolDest = Join-Path $depsRoot "test_binaries\target_protocol"
         New-Item -ItemType Directory -Force -Path $targetProtocolDest | Out-Null
         Copy-Item -LiteralPath (Join-Path $Inputs.TargetProtocolDir "target_protocol.exe") -Destination (Join-Path $targetProtocolDest "target_protocol.exe") -Force

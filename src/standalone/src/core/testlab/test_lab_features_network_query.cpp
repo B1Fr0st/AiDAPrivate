@@ -104,6 +104,63 @@ namespace {
 		return s >= 1u && s <= 12u;
 	}
 
+	bool memory_all_zero(const void* data, std::size_t size) {
+		const auto* bytes = static_cast<const std::uint8_t*>(data);
+		for (std::size_t i = 0; i < size; ++i) {
+			if (bytes[i] != 0u)
+				return false;
+		}
+		return true;
+	}
+
+	bool net_conn_endpoint_empty(const voyager::detail::net_conn_entry& e) {
+		return e.pid == 0u &&
+			e.local_port == 0u &&
+			e.remote_port == 0u &&
+			e.address_family == 0u &&
+			memory_all_zero(e.local_addr, sizeof(e.local_addr)) &&
+			memory_all_zero(e.remote_addr, sizeof(e.remote_addr)) &&
+			memory_all_zero(e.process_path, sizeof(e.process_path));
+	}
+
+	bool net_conn_zero_slot(const voyager::detail::net_conn_entry& e) {
+		return e.state == 0u && (e.protocol == 0u || e.protocol == 6u) && net_conn_endpoint_empty(e);
+	}
+
+	bool net_conn_populated(const voyager::detail::net_conn_entry& e) {
+		return !net_conn_zero_slot(e) &&
+			(e.protocol != 0u || e.state != 0u || !net_conn_endpoint_empty(e));
+	}
+
+	bool tcpip_conn_endpoint_empty(const voyager::detail::tcpip_conn_entry& e) {
+		return e.pid == 0u &&
+			e.local_port == 0u &&
+			e.remote_port == 0u &&
+			e.address_family == 0u &&
+			e.create_time == 0u &&
+			e.bytes_in == 0u &&
+			e.bytes_out == 0u &&
+			memory_all_zero(e.local_addr, sizeof(e.local_addr)) &&
+			memory_all_zero(e.remote_addr, sizeof(e.remote_addr));
+	}
+
+	bool tcpip_conn_zero_slot(const voyager::detail::tcpip_conn_entry& e) {
+		return e.tcb_address == 0u &&
+			e.owning_module_base == 0u &&
+			e.state == 0u &&
+			(e.protocol == 0u || e.protocol == 6u) &&
+			tcpip_conn_endpoint_empty(e);
+	}
+
+	bool tcpip_conn_populated(const voyager::detail::tcpip_conn_entry& e) {
+		return !tcpip_conn_zero_slot(e) &&
+			(e.tcb_address != 0u ||
+			 e.owning_module_base != 0u ||
+			 e.protocol != 0u ||
+			 e.state != 0u ||
+			 !tcpip_conn_endpoint_empty(e));
+	}
+
 	std::string format_ip(const std::uint8_t* addr, std::uint32_t family) {
 		char buf[64];
 		if (family == 23u) {
@@ -611,29 +668,47 @@ namespace {
 			return;
 		}
 		r.parsed.push_back({ "connection_count", format_dec_u32(req->connection_count) });
-		std::uint32_t unknown_state_count = 0u;
+		std::uint32_t empty_state_count = 0u;
+		std::uint32_t zero_state_count = 0u;
+		std::uint32_t populated_zero_state_count = 0u;
 		std::uint32_t unknown_nonzero_state_count = 0u;
+		std::uint32_t unknown_actionable_state_count = 0u;
 		const std::uint32_t scan_count = req->connection_count > voyager::detail::MAX_NET_CONNECTIONS
 			? static_cast<std::uint32_t>(voyager::detail::MAX_NET_CONNECTIONS)
 			: req->connection_count;
 		for (std::uint32_t i = 0; i < scan_count; ++i) {
 			const auto& e = req->entries[i];
-			if (e.protocol == 6u && !tcp_state_known(e.state)) {
-				++unknown_state_count;
+			const bool zero_slot = net_conn_zero_slot(e);
+			const bool populated = net_conn_populated(e);
+			if (zero_slot)
+				++empty_state_count;
+			if (e.protocol == 6u && e.state == 0u) {
+				++zero_state_count;
+				if (populated)
+					++populated_zero_state_count;
+			}
+			if (e.protocol == 6u && e.state != 0u && !tcp_state_known(e.state)) {
+				if (populated)
+					++unknown_actionable_state_count;
 				if (e.state != 0u)
 					++unknown_nonzero_state_count;
 			}
 		}
-		r.parsed.push_back({ "unknown_tcp_state_count", format_dec_u32(unknown_state_count) });
+		r.parsed.push_back({ "empty_tcp_state_count", format_dec_u32(empty_state_count) });
+		r.parsed.push_back({ "zero_tcp_state_count", format_dec_u32(zero_state_count) });
+		r.parsed.push_back({ "populated_zero_tcp_state_count", format_dec_u32(populated_zero_state_count) });
+		r.parsed.push_back({ "unknown_tcp_state_count", format_dec_u32(unknown_actionable_state_count) });
 		r.parsed.push_back({ "unknown_nonzero_tcp_state_count", format_dec_u32(unknown_nonzero_state_count) });
+		r.parsed.push_back({ "unknown_actionable_tcp_state_count", format_dec_u32(unknown_actionable_state_count) });
 		const std::uint32_t cap = (req->connection_count > 50u) ? 50u : req->connection_count;
 		for (std::uint32_t i = 0; i < cap; ++i) {
 			const auto& e = req->entries[i];
+			const bool state_unknown_actionable = e.protocol == 6u && e.state != 0u && !tcp_state_known(e.state) && net_conn_populated(e);
 			char label[24];
 			std::snprintf(label, sizeof(label), "Conn[%u]", i);
 			char val[512];
 			std::snprintf(val, sizeof(val),
-				"%s %s:%u -> %s:%u state=%s state_raw=%u state_unknown=%u pid=%u",
+				"%s %s:%u -> %s:%u state=%s state_raw=%u state_unknown=%u state_zero=%u empty_slot=%u pid=%u",
 				proto_name(e.protocol),
 				format_ip(e.local_addr, e.address_family).c_str(),
 				e.local_port,
@@ -641,12 +716,20 @@ namespace {
 				e.remote_port,
 				tcp_state_name(e.state),
 				e.state,
-				(e.protocol == 6u && !tcp_state_known(e.state)) ? 1u : 0u,
+				state_unknown_actionable ? 1u : 0u,
+				(e.protocol == 6u && e.state == 0u) ? 1u : 0u,
+				net_conn_zero_slot(e) ? 1u : 0u,
 				e.pid);
 			r.parsed.push_back({ std::string(label), std::string(val) });
 		}
-		r.ntstatus = 0;
-		r.ok = true;
+		if (unknown_actionable_state_count != 0u) {
+			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
+			r.ok = false;
+			r.error = "NCON returned populated TCP rows with unknown nonzero states";
+		} else {
+			r.ntstatus = 0;
+			r.ok = true;
+		}
 		std::free(req);
 	}
 
@@ -1576,35 +1659,79 @@ namespace {
 			return;
 		}
 		r.parsed.push_back({ "connection_count", format_dec_u32(req->connection_count) });
-		std::uint32_t unknown_state_count = 0u;
+		std::uint32_t empty_state_count = 0u;
+		std::uint32_t zero_state_count = 0u;
+		std::uint32_t populated_zero_state_count = 0u;
 		std::uint32_t unknown_nonzero_state_count = 0u;
+		std::uint32_t unknown_actionable_state_count = 0u;
+		std::uint32_t populated_row_count = 0u;
+		std::uint32_t zero_tcb_count = 0u;
+		std::uint32_t zero_module_base_count = 0u;
+		std::uint32_t zero_byte_counter_count = 0u;
 		const std::uint32_t scan_count = req->connection_count > voyager::detail::MAX_TCPIP_CONNECTIONS
 			? static_cast<std::uint32_t>(voyager::detail::MAX_TCPIP_CONNECTIONS)
 			: req->connection_count;
 		for (std::uint32_t i = 0; i < scan_count; ++i) {
 			const auto& e = req->entries[i];
-			if (e.protocol == 6u && !tcp_state_known(e.state)) {
-				++unknown_state_count;
+			const bool zero_slot = tcpip_conn_zero_slot(e);
+			const bool populated = tcpip_conn_populated(e);
+			if (zero_slot)
+				++empty_state_count;
+			if (populated) {
+				++populated_row_count;
+				if (e.tcb_address == 0u)
+					++zero_tcb_count;
+				if (e.owning_module_base == 0u)
+					++zero_module_base_count;
+				if (e.bytes_in == 0u && e.bytes_out == 0u)
+					++zero_byte_counter_count;
+			}
+			if (e.protocol == 6u && e.state == 0u) {
+				++zero_state_count;
+				if (populated)
+					++populated_zero_state_count;
+			}
+			if (e.protocol == 6u && e.state != 0u && !tcp_state_known(e.state)) {
+				if (populated)
+					++unknown_actionable_state_count;
 				if (e.state != 0u)
 					++unknown_nonzero_state_count;
 			}
 		}
-		r.parsed.push_back({ "unknown_tcp_state_count", format_dec_u32(unknown_state_count) });
+		r.parsed.push_back({ "empty_tcp_state_count", format_dec_u32(empty_state_count) });
+		r.parsed.push_back({ "zero_tcp_state_count", format_dec_u32(zero_state_count) });
+		r.parsed.push_back({ "populated_zero_tcp_state_count", format_dec_u32(populated_zero_state_count) });
+		r.parsed.push_back({ "unknown_tcp_state_count", format_dec_u32(unknown_actionable_state_count) });
 		r.parsed.push_back({ "unknown_nonzero_tcp_state_count", format_dec_u32(unknown_nonzero_state_count) });
+		r.parsed.push_back({ "unknown_actionable_tcp_state_count", format_dec_u32(unknown_actionable_state_count) });
+		r.parsed.push_back({ "dtcp_populated_row_count", format_dec_u32(populated_row_count) });
+		r.parsed.push_back({ "dtcp_zero_tcb_count", format_dec_u32(zero_tcb_count) });
+		r.parsed.push_back({ "dtcp_zero_module_base_count", format_dec_u32(zero_module_base_count) });
+		r.parsed.push_back({ "dtcp_zero_byte_counter_count", format_dec_u32(zero_byte_counter_count) });
+		r.parsed.push_back({ "dtcp_kernel_walk_mode", "not_exposed_by_ioctl" });
+		r.parsed.push_back({ "dtcp_driver_fallback_snapshot", "not_exposed_by_ioctl" });
+		const bool degraded_evidence = populated_row_count != 0u &&
+			(zero_tcb_count == populated_row_count ||
+			 zero_module_base_count == populated_row_count ||
+			 zero_byte_counter_count == populated_row_count);
+		r.parsed.push_back({ "dtcp_degraded_evidence", degraded_evidence ? "1" : "0" });
 		const std::uint32_t cap = (req->connection_count > 50u) ? 50u : req->connection_count;
 		for (std::uint32_t i = 0; i < cap; ++i) {
 			const auto& e = req->entries[i];
+			const bool state_unknown_actionable = e.protocol == 6u && e.state != 0u && !tcp_state_known(e.state) && tcpip_conn_populated(e);
 			char label[24];
 			std::snprintf(label, sizeof(label), "TCB[%u]", i);
 			char val[640];
 			std::snprintf(val, sizeof(val),
-				"tcb=%s pid=%u %s state=%s state_raw=%u state_unknown=%u %s:%u -> %s:%u in=%llu out=%llu mod=%s",
+				"tcb=%s pid=%u %s state=%s state_raw=%u state_unknown=%u state_zero=%u empty_slot=%u %s:%u -> %s:%u in=%llu out=%llu mod=%s",
 				format_hex_u64(e.tcb_address).c_str(),
 				e.pid,
 				proto_name(e.protocol),
 				tcp_state_name(e.state),
 				e.state,
-				(e.protocol == 6u && !tcp_state_known(e.state)) ? 1u : 0u,
+				state_unknown_actionable ? 1u : 0u,
+				(e.protocol == 6u && e.state == 0u) ? 1u : 0u,
+				tcpip_conn_zero_slot(e) ? 1u : 0u,
 				format_ip(e.local_addr, e.address_family).c_str(),
 				e.local_port,
 				format_ip(e.remote_addr, e.address_family).c_str(),
@@ -1614,8 +1741,14 @@ namespace {
 				format_hex_u64(e.owning_module_base).c_str());
 			r.parsed.push_back({ std::string(label), std::string(val) });
 		}
-		r.ntstatus = 0;
-		r.ok = true;
+		if (unknown_actionable_state_count != 0u) {
+			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
+			r.ok = false;
+			r.error = "DTCP returned populated TCP rows with unknown nonzero states";
+		} else {
+			r.ntstatus = 0;
+			r.ok = true;
+		}
 		std::free(req);
 	}
 

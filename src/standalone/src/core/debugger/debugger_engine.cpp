@@ -174,6 +174,12 @@ bool module_contains_address(const driver_bridge::module_info_t& m, uint64_t add
 	return m.base != 0 && m.size != 0 && address >= m.base && (address - m.base) < m.size;
 }
 
+std::string call_stack_module_cache_key(const driver_bridge::module_info_t& module) {
+	std::ostringstream oss;
+	oss << std::hex << std::uppercase << module.base << ':' << module.size << ':' << lower_ascii_copy(module.name);
+	return oss.str();
+}
+
 const driver_bridge::module_info_t* find_module_for_stack_address(
 	const std::vector<driver_bridge::module_info_t>& modules,
 	uint64_t address)
@@ -620,6 +626,12 @@ call_stack_symbol_resolution_t resolve_call_stack_symbol(
 	std::string pdb_status;
 	if (resolve_stack_symbol_from_pdb(*module, address, result, pdb_status, budget_deadline)) {
 		result.elapsed_us = resolver_elapsed_us(t0);
+		log_call_stack_symbol_resolution(result);
+		return result;
+	}
+	const uint64_t after_pdb_us = resolver_elapsed_us(t0);
+	if (after_pdb_us >= (k_call_stack_frame_symbol_budget_us / 2)) {
+		result = module_rva_resolution(address, module, ("symbol_frame_budget_reserved_after_pdb;" + pdb_status).c_str(), t0);
 		log_call_stack_symbol_resolution(result);
 		return result;
 	}
@@ -2664,9 +2676,12 @@ std::vector<stack_frame_t> get_call_stack() {
 	resolution_records.reserve(65);
 	std::unordered_map<uint64_t, call_stack_symbol_resolution_t> local_resolution_cache;
 	local_resolution_cache.reserve(65);
+	std::unordered_map<std::string, std::string> module_degraded_resolution_cache;
+	module_degraded_resolution_cache.reserve(16);
 	const auto symbol_budget_deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(k_call_stack_total_symbol_budget_us);
 	std::size_t cache_hits = 0;
 	std::size_t cache_misses = 0;
+	std::size_t module_degraded_cache_hits = 0;
 	std::size_t budget_degraded = 0;
 
 	auto resolve = [&](uint64_t addr, std::size_t frame_index) -> stack_frame_t {
@@ -2682,8 +2697,29 @@ std::vector<stack_frame_t> get_call_stack() {
 			symbol.status += ";cache_hit";
 		} else {
 			++cache_misses;
-			const auto per_frame_deadline = std::min(symbol_budget_deadline, std::chrono::steady_clock::now() + std::chrono::microseconds(k_call_stack_frame_symbol_budget_us));
-			symbol = resolve_call_stack_symbol(addr, modules, per_frame_deadline);
+			const auto* module = find_module_for_stack_address(modules, addr);
+			if (module != nullptr) {
+				const std::string module_key = call_stack_module_cache_key(*module);
+				auto module_cache_it = module_degraded_resolution_cache.find(module_key);
+				if (module_cache_it != module_degraded_resolution_cache.end()) {
+					++module_degraded_cache_hits;
+					const std::string cached_status = module_cache_it->second + ";module_degraded_cache";
+					symbol = module_rva_resolution(addr, module, cached_status.c_str(), frame_started);
+				} else {
+					const auto per_frame_deadline = std::min(symbol_budget_deadline, std::chrono::steady_clock::now() + std::chrono::microseconds(k_call_stack_frame_symbol_budget_us));
+					symbol = resolve_call_stack_symbol(addr, modules, per_frame_deadline);
+					if (symbol.source == "module_rva" &&
+						(symbol.status.find("budget") != std::string::npos ||
+						 symbol.status.find("pdb_module_missing") != std::string::npos ||
+						 symbol.status.find("pdb_not_loaded") != std::string::npos ||
+						 symbol.status.find("pdb_failed") != std::string::npos)) {
+						module_degraded_resolution_cache.emplace(module_key, symbol.status);
+					}
+				}
+			} else {
+				const auto per_frame_deadline = std::min(symbol_budget_deadline, std::chrono::steady_clock::now() + std::chrono::microseconds(k_call_stack_frame_symbol_budget_us));
+				symbol = resolve_call_stack_symbol(addr, modules, per_frame_deadline);
+			}
 			local_resolution_cache.emplace(addr, symbol);
 		}
 		if (symbol.source == "module_rva" && symbol.status.find("budget") != std::string::npos)
@@ -2783,7 +2819,7 @@ std::vector<stack_frame_t> get_call_stack() {
 	publish_call_stack_resolutions(resolution_records);
 
 	diag::log_tagged_fmt("dbg_engine",
-		"get_call_stack: result frames=%zu modules=%zu stack_qwords=%zu stack_read_failures=%zu invalid_stack_words=%zu cache_hits=%zu cache_misses=%zu budget_degraded=%zu elapsed_us=%llu",
+		"get_call_stack: result frames=%zu modules=%zu stack_qwords=%zu stack_read_failures=%zu invalid_stack_words=%zu cache_hits=%zu cache_misses=%zu module_degraded_cache_hits=%zu budget_degraded=%zu elapsed_us=%llu",
 		frames.size(),
 		modules.size(),
 		stack_qwords,
@@ -2791,6 +2827,7 @@ std::vector<stack_frame_t> get_call_stack() {
 		invalid_stack_words,
 		cache_hits,
 		cache_misses,
+		module_degraded_cache_hits,
 		budget_degraded,
 		static_cast<unsigned long long>(resolver_elapsed_us(started)));
 	return frames;

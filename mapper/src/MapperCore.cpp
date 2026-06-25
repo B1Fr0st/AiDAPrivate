@@ -815,6 +815,8 @@ namespace MapperCore {
         bool sentinelGlobalsWritten = false;
         bool sentinelFilePreseeded = false;
         bool deferSentinelLiveQueries = false;
+        const ULONG mapperBuild = MapperBuildNumber();
+        const bool requireSentinelFilePreseed = mapperBuild >= 26100;
 
         HANDLE deviceHandle = nullptr;
         const ULONGLONG openStartTick = GetTickCount64();
@@ -965,7 +967,7 @@ namespace MapperCore {
                             LOG("Deferring target driver file hide until after CI restore: %ls", targetDriverFullPath);
                         }
 
-                        if (NT_SUCCESS(status) && sentinelDriverFullPath && sentinelDriverFullPath[0] &&
+                        if (NT_SUCCESS(status) && requireSentinelFilePreseed && sentinelDriverFullPath && sentinelDriverFullPath[0] &&
                             cachedTargetBase && cachedTargetImageSize) {
                             const ULONGLONG filePreseedStartTick = GetTickCount64();
                             sentinelFilePreseeded = PreseedSentinelFileHandoff(
@@ -979,17 +981,23 @@ namespace MapperCore {
                                 cachedTargetImageSize,
                                 MapperElapsedMs(filePreseedStartTick),
                                 MapperElapsedMs(exploitStartTick));
-                            if (!sentinelFilePreseeded && MapperBuildNumber() >= 26100) {
-                                LOG("FATAL: Sentinel file preseed required on build=%lu before Sentinel load", MapperBuildNumber());
+                            if (!sentinelFilePreseeded) {
+                                LOG("FATAL: Sentinel file preseed required on build=%lu before Sentinel load", mapperBuild);
                                 status = STATUS_UNSUCCESSFUL;
                             }
+                        } else if (NT_SUCCESS(status) && !requireSentinelFilePreseed && sentinelDriverFileName && g_SentinelServicePath[0]) {
+                            LOG("PreseedSentinelFileHandoff skipped build=%lu reason=live_kernel_handoff_preferred sentinel_path=%ls whoswho_base=%p whoswho_size=0x%X",
+                                mapperBuild,
+                                sentinelDriverFullPath ? sentinelDriverFullPath : L"(null)",
+                                cachedTargetBase,
+                                cachedTargetImageSize);
                         } else if (NT_SUCCESS(status) && sentinelDriverFileName && g_SentinelServicePath[0]) {
                             LOG("PreseedSentinelFileHandoff skipped reason=missing_input sentinel_path=%ls whoswho_base=%p whoswho_size=0x%X",
                                 sentinelDriverFullPath ? sentinelDriverFullPath : L"(null)",
                                 cachedTargetBase,
                                 cachedTargetImageSize);
-                            if (MapperBuildNumber() >= 26100) {
-                                LOG("FATAL: Sentinel file preseed inputs missing on build=%lu before Sentinel load", MapperBuildNumber());
+                            if (requireSentinelFilePreseed) {
+                                LOG("FATAL: Sentinel file preseed inputs missing on build=%lu before Sentinel load", mapperBuild);
                                 status = STATUS_UNSUCCESSFUL;
                             }
                         }
@@ -1005,18 +1013,18 @@ namespace MapperCore {
                                 g_SentinelServicePath,
                                 MapperElapsedMs(sentinelLoadStartTick),
                                 MapperElapsedMs(exploitStartTick));
-                            if (sentStatus == STATUS_IMAGE_ALREADY_LOADED && sentinelFilePreseeded && MapperBuildNumber() >= 26100) {
+                            if (sentStatus == STATUS_IMAGE_ALREADY_LOADED && sentinelFilePreseeded && requireSentinelFilePreseed) {
                                 LOG("FATAL: Sentinel already loaded on build=%lu after verified file preseed; refusing live discovery without init proof status=0x%08X",
-                                    MapperBuildNumber(),
+                                    mapperBuild,
                                     static_cast<DWORD>(sentStatus));
                                 status = sentStatus;
                             }
-                            if (NT_SUCCESS(status) && NT_SUCCESS(sentStatus) && sentinelFilePreseeded && MapperBuildNumber() >= 26100) {
+                            if (NT_SUCCESS(status) && NT_SUCCESS(sentStatus) && sentinelFilePreseeded && requireSentinelFilePreseed) {
                                 deferSentinelLiveQueries = true;
                                 g_LastTriggerDeferredSentinelLiveQueries = true;
                                 sentinelGlobalsWritten = true;
                                 LOG("Post-load Sentinel live module queries deferred build=%lu reason=verified_file_preseed whoswho_base=%p whoswho_size=0x%X elapsed_ms=%llu",
-                                    MapperBuildNumber(),
+                                    mapperBuild,
                                     cachedTargetBase,
                                     cachedTargetImageSize,
                                     MapperElapsedMs(exploitStartTick));
@@ -1306,9 +1314,9 @@ namespace MapperCore {
                                 sentImageSize,
                                 whoswhoBase,
                                 whoswhoImageSize);
-                        } else if (MapperBuildNumber() >= 26100) {
+                        } else if (requireSentinelFilePreseed) {
                             LOG("WriteSentinelGlobals post_ci_restore skipped build=%lu reason=win11_requires_pre_ci_preseed sent_base=%p sent_size=0x%X whoswho_base=%p whoswho_size=0x%X",
-                                MapperBuildNumber(),
+                                mapperBuild,
                                 sentBase,
                                 sentImageSize,
                                 whoswhoBase,

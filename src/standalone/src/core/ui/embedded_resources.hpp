@@ -9,24 +9,11 @@
 #endif
 #include <windows.h>
 
-#include <cstdio>
-#include <cstring>
-#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
 
 
-#define IDR_LIBZ3_DLL       101
-#define IDR_Z3_MSVCP140_DLL 102
-#define IDR_Z3_MSVCP140_1_DLL 103
-#define IDR_Z3_MSVCP140_2_DLL 104
-#define IDR_Z3_MSVCP140_ATOMIC_WAIT_DLL 105
-#define IDR_Z3_MSVCP140_CODECVT_IDS_DLL 106
-#define IDR_Z3_VCOMP140_DLL 107
-#define IDR_Z3_VCRUNTIME140_DLL 108
-#define IDR_Z3_VCRUNTIME140_1_DLL 109
-#define IDR_Z3_VCRUNTIME140_THREADS_DLL 110
 #define IDR_GHIDRA_SLA      201
 #define IDR_GHIDRA_PSPEC    202
 #define IDR_GHIDRA_CSPEC    203
@@ -100,128 +87,6 @@ inline std::wstring make_temp_dir()
 }
 
 }
-
-
-inline std::wstring g_z3_temp_path;
-inline std::wstring g_z3_temp_dir;
-inline std::vector<std::wstring> g_z3_written_paths;
-inline HMODULE      g_z3_module = nullptr;
-
-namespace detail {
-    inline std::mutex& z3_mutex() { static std::mutex m; return m; }
-}
-
-
-inline bool extract_and_load_z3()
-{
-    std::lock_guard<std::mutex> lk(detail::z3_mutex());
-
-    struct z3_file {
-        int resource_id;
-        const wchar_t* filename;
-    };
-
-    static const z3_file files[] = {
-        { IDR_Z3_MSVCP140_DLL, L"msvcp140.dll" },
-        { IDR_Z3_MSVCP140_1_DLL, L"msvcp140_1.dll" },
-        { IDR_Z3_MSVCP140_2_DLL, L"msvcp140_2.dll" },
-        { IDR_Z3_MSVCP140_ATOMIC_WAIT_DLL, L"msvcp140_atomic_wait.dll" },
-        { IDR_Z3_MSVCP140_CODECVT_IDS_DLL, L"msvcp140_codecvt_ids.dll" },
-        { IDR_Z3_VCOMP140_DLL, L"vcomp140.dll" },
-        { IDR_Z3_VCRUNTIME140_DLL, L"vcruntime140.dll" },
-        { IDR_Z3_VCRUNTIME140_1_DLL, L"vcruntime140_1.dll" },
-        { IDR_Z3_VCRUNTIME140_THREADS_DLL, L"vcruntime140_threads.dll" },
-        { IDR_LIBZ3_DLL, L"libz3.dll" },
-    };
-
-    if (g_z3_module)
-        return true;
-
-    if (HMODULE existing = GetModuleHandleW(L"libz3.dll")) {
-        g_z3_module = existing;
-        wchar_t preload_dir[32768]{};
-        constexpr DWORD preload_dir_count = static_cast<DWORD>(sizeof(preload_dir) / sizeof(preload_dir[0]));
-        DWORD n = GetEnvironmentVariableW(L"AIDA_Z3_PRELOAD_DIR", preload_dir, preload_dir_count);
-        if (n > 0 && n < preload_dir_count) {
-            g_z3_temp_dir = preload_dir;
-            g_z3_temp_path = g_z3_temp_dir + L"\\libz3.dll";
-            g_z3_written_paths.clear();
-            g_z3_written_paths.reserve(sizeof(files) / sizeof(files[0]));
-            for (const auto& f : files)
-                g_z3_written_paths.push_back(g_z3_temp_dir + L"\\" + f.filename);
-        }
-        return true;
-    }
-
-    std::wstring tmp_dir = detail::make_temp_dir();
-    if (tmp_dir.empty())
-        return false;
-
-    std::vector<std::wstring> written;
-    written.reserve(sizeof(files) / sizeof(files[0]));
-
-    auto cleanup_on_failure = [&]() {
-        for (auto it = written.rbegin(); it != written.rend(); ++it)
-            DeleteFileW(it->c_str());
-        RemoveDirectoryW(tmp_dir.c_str());
-    };
-
-    for (const auto& f : files) {
-        const void* data = nullptr;
-        size_t size = 0;
-        if (!detail::load_resource(f.resource_id, data, size)) {
-            OutputDebugStringA("embedded_resources: z3 resource not found\n");
-            cleanup_on_failure();
-            return false;
-        }
-
-        std::wstring path = tmp_dir + L"\\" + f.filename;
-        if (!detail::write_resource_to_file(data, size, path)) {
-            OutputDebugStringA("embedded_resources: failed to write z3 resource to temp\n");
-            cleanup_on_failure();
-            return false;
-        }
-        written.push_back(std::move(path));
-    }
-
-    std::wstring tmp_path = tmp_dir + L"\\libz3.dll";
-
-    HMODULE mod = LoadLibraryExW(tmp_path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
-    if (!mod) {
-        cleanup_on_failure();
-        OutputDebugStringA("embedded_resources: LoadLibrary failed for temp libz3.dll\n");
-        return false;
-    }
-
-    g_z3_temp_path = std::move(tmp_path);
-    g_z3_temp_dir  = std::move(tmp_dir);
-    g_z3_written_paths = std::move(written);
-    g_z3_module    = mod;
-
-    for (const auto& path : g_z3_written_paths)
-        MoveFileExW(path.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
-    MoveFileExW(g_z3_temp_dir.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
-
-    return true;
-}
-
-
-inline void cleanup_z3()
-{
-    std::lock_guard<std::mutex> lk(detail::z3_mutex());
-    if (g_z3_module) {
-        FreeLibrary(g_z3_module);
-        g_z3_module = nullptr;
-    }
-    for (auto it = g_z3_written_paths.rbegin(); it != g_z3_written_paths.rend(); ++it)
-        DeleteFileW(it->c_str());
-    g_z3_written_paths.clear();
-    if (!g_z3_temp_dir.empty())
-        RemoveDirectoryW(g_z3_temp_dir.c_str());
-    g_z3_temp_path.clear();
-    g_z3_temp_dir.clear();
-}
-
 
 inline std::string extract_ghidra_specs()
 {

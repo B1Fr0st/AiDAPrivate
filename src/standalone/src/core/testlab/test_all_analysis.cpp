@@ -602,6 +602,8 @@ struct integrity_sidecar_probe_t {
     bool ok = false;
     const char* module = "";
     system_export_resolution_t resolved;
+    page_guard_engine::remote_call_diag_snapshot_t remote_diag;
+    driver_bridge::remote_call_execution_diag_t lower_diag;
     uint64_t result = 0;
     DWORD gle = 0;
     long long elapsed_ms = 0;
@@ -620,15 +622,19 @@ static integrity_sidecar_probe_t probe_integrity_sidecar_remote_call(HANDLE hf, 
         }
         SetLastError(ERROR_SUCCESS);
         const uint64_t result = page_guard_engine::remote_thread_call(pid, resolved.address, 0, 0, 0, 0, 2500, "testlab_integrity_sidecar_GetCurrentProcessId");
+        const auto remote_diag = page_guard_engine::last_driver_remote_call_diag();
+        const auto lower_diag = driver_bridge::last_remote_call_execution_diag();
         const DWORD gle = result == static_cast<uint64_t>(pid) ? ERROR_SUCCESS : GetLastError();
         out.module = module_name;
         out.resolved = resolved;
+        out.remote_diag = remote_diag;
+        out.lower_diag = lower_diag;
         out.result = result;
         out.gle = gle;
         out.elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
         out.ok = result == static_cast<uint64_t>(pid);
         diag::log_tagged_fmt("test_analysis_detail",
-            "%s sidecar_remote_probe pid=%u active_pid=%u module=%s fn=GetCurrentProcessId va=0x%llX method=%s result=0x%llX expected=0x%llX ok=%d gle=%lu elapsed_ms=%lld status='%s' last_error='%s'",
+            "%s sidecar_remote_probe pid=%u active_pid=%u module=%s fn=GetCurrentProcessId va=0x%llX method=%s result=0x%llX expected=0x%llX ok=%d gle=%lu remote_call_id=%llu remote_ok=%d remote_execution_completed=%d remote_gle=%lu lower_call_id=%llu lower_phase=%s lower_reason=%s lower_completed=%d lower_ok=%d lower_gle=%lu lower_generation_entry=%llu lower_generation_after=%llu lower_queue_depth_submit=%u lower_queue_depth_start=%u lower_queue_depth_after_pop=%u lower_inflight_submit=%u lower_inflight_start=%u lower_inflight_after=%u lower_queue_wait_ms=%llu lower_elapsed_ms=%llu elapsed_ms=%lld status='%s' last_error='%s'",
             tag ? tag : "analysis",
             (unsigned)pid,
             (unsigned)driver_bridge::attached_pid(),
@@ -639,6 +645,26 @@ static integrity_sidecar_probe_t probe_integrity_sidecar_remote_call(HANDLE hf, 
             (unsigned long long)pid,
             out.ok ? 1 : 0,
             static_cast<unsigned long>(gle),
+            (unsigned long long)remote_diag.call_id,
+            remote_diag.ok ? 1 : 0,
+            remote_diag.lower_completed && remote_diag.lower_ok ? 1 : 0,
+            static_cast<unsigned long>(remote_diag.gle),
+            (unsigned long long)lower_diag.call_id,
+            lower_diag.phase.c_str(),
+            lower_diag.completion_reason.c_str(),
+            lower_diag.completed ? 1 : 0,
+            lower_diag.lower_ok ? 1 : 0,
+            static_cast<unsigned long>(lower_diag.gle),
+            (unsigned long long)lower_diag.generation_at_entry,
+            (unsigned long long)lower_diag.generation_after,
+            lower_diag.queue_depth_at_submit,
+            lower_diag.queue_depth_at_start,
+            lower_diag.queue_depth_after_pop,
+            lower_diag.inflight_at_submit,
+            lower_diag.inflight_at_start,
+            lower_diag.inflight_after,
+            (unsigned long long)lower_diag.queue_wait_ms,
+            (unsigned long long)lower_diag.lower_elapsed_ms,
             out.elapsed_ms,
             driver_bridge::status().c_str(),
             driver_bridge::last_error().c_str());
@@ -761,6 +787,23 @@ static bool launch_integrity_hunter_sidecar(HANDLE hf, const char* tag, integrit
 static bool select_integrity_hunter_sidecar_pid(HANDLE hf, const char* tag, uint32_t pid) {
     if (pid == 0)
         return false;
+    const auto lower_before = driver_bridge::last_remote_call_execution_diag();
+    log_msg(hf, tag, "SIDE-FIXTURE-SELECT-PRE -- pid=%u active_before=%u lower_call_id=%llu lower_phase=%s lower_reason=%s lower_completed=%d lower_ok=%d lower_gle=%lu lower_generation_entry=%llu lower_generation_after=%llu lower_queue_depth_submit=%u lower_queue_depth_after_pop=%u lower_inflight_after=%u lower_queue_wait_ms=%llu lower_elapsed_ms=%llu",
+        (unsigned)pid,
+        (unsigned)driver_bridge::attached_pid(),
+        (unsigned long long)lower_before.call_id,
+        lower_before.phase.c_str(),
+        lower_before.completion_reason.c_str(),
+        lower_before.completed ? 1 : 0,
+        lower_before.lower_ok ? 1 : 0,
+        static_cast<unsigned long>(lower_before.gle),
+        (unsigned long long)lower_before.generation_at_entry,
+        (unsigned long long)lower_before.generation_after,
+        lower_before.queue_depth_at_submit,
+        lower_before.queue_depth_after_pop,
+        lower_before.inflight_after,
+        (unsigned long long)lower_before.queue_wait_ms,
+        (unsigned long long)lower_before.lower_elapsed_ms);
     bool known = false;
     for (uint32_t attached_pid : driver_bridge::attached_pids()) {
         if (attached_pid == pid) {
@@ -776,12 +819,34 @@ static bool select_integrity_hunter_sidecar_pid(HANDLE hf, const char* tag, uint
         return false;
     }
     if (!driver_bridge::set_active_pid(pid)) {
-        log_msg(hf, tag, "FAIL -- integrity sidecar set_active_pid failed pid=%u status=\"%s\" last_error=\"%s\"",
+        const auto lower_after = driver_bridge::last_remote_call_execution_diag();
+        log_msg(hf, tag, "FAIL -- integrity sidecar set_active_pid failed pid=%u active_now=%u lower_call_id=%llu lower_phase=%s lower_reason=%s lower_completed=%d lower_ok=%d lower_gle=%lu lower_queue_depth_after_pop=%u lower_inflight_after=%u status=\"%s\" last_error=\"%s\"",
             (unsigned)pid,
+            (unsigned)driver_bridge::attached_pid(),
+            (unsigned long long)lower_after.call_id,
+            lower_after.phase.c_str(),
+            lower_after.completion_reason.c_str(),
+            lower_after.completed ? 1 : 0,
+            lower_after.lower_ok ? 1 : 0,
+            static_cast<unsigned long>(lower_after.gle),
+            lower_after.queue_depth_after_pop,
+            lower_after.inflight_after,
             driver_bridge::status().c_str(),
             driver_bridge::last_error().c_str());
         return false;
     }
+    const auto lower_after = driver_bridge::last_remote_call_execution_diag();
+    log_msg(hf, tag, "SIDE-FIXTURE-SELECT-OK -- pid=%u active_now=%u lower_call_id=%llu lower_phase=%s lower_reason=%s lower_completed=%d lower_ok=%d lower_gle=%lu lower_queue_depth_after_pop=%u lower_inflight_after=%u",
+        (unsigned)pid,
+        (unsigned)driver_bridge::attached_pid(),
+        (unsigned long long)lower_after.call_id,
+        lower_after.phase.c_str(),
+        lower_after.completion_reason.c_str(),
+        lower_after.completed ? 1 : 0,
+        lower_after.lower_ok ? 1 : 0,
+        static_cast<unsigned long>(lower_after.gle),
+        lower_after.queue_depth_after_pop,
+        lower_after.inflight_after);
     return true;
 }
 
@@ -811,7 +876,7 @@ static bool wait_integrity_hunter_sidecar_ready(HANDLE hf, const char* tag, cons
         if (selected && bridge_alive && ntdll_base != 0 && kernel32_base != 0) {
             integrity_sidecar_probe_t probe = probe_integrity_sidecar_remote_call(hf, tag, sidecar.pid);
             if (probe.ok) {
-                log_msg(hf, tag, "SIDE-FIXTURE-READY -- pid=%lu attempts=%d active=%u ntdll=0x%016llX kernel32=0x%016llX kernelbase=0x%016llX probe_module=%s probe_fn=0x%016llX probe_result=0x%016llX bridge_code=0x%08X elapsed_ms=%lu probe_elapsed_ms=%lld",
+                log_msg(hf, tag, "SIDE-FIXTURE-READY -- pid=%lu attempts=%d active=%u ntdll=0x%016llX kernel32=0x%016llX kernelbase=0x%016llX probe_module=%s probe_fn=0x%016llX probe_result=0x%016llX remote_call_id=%llu remote_execution_completed=%d lower_phase=%s lower_reason=%s lower_completed=%d lower_ok=%d lower_gle=%lu lower_queue_depth_submit=%u lower_inflight_after=%u bridge_code=0x%08X elapsed_ms=%lu probe_elapsed_ms=%lld",
                     static_cast<unsigned long>(sidecar.pid),
                     attempts,
                     active,
@@ -821,12 +886,21 @@ static bool wait_integrity_hunter_sidecar_ready(HANDLE hf, const char* tag, cons
                     probe.module ? probe.module : "",
                     static_cast<unsigned long long>(probe.resolved.address),
                     static_cast<unsigned long long>(probe.result),
+                    (unsigned long long)probe.remote_diag.call_id,
+                    probe.remote_diag.lower_completed && probe.remote_diag.lower_ok ? 1 : 0,
+                    probe.lower_diag.phase.c_str(),
+                    probe.lower_diag.completion_reason.c_str(),
+                    probe.lower_diag.completed ? 1 : 0,
+                    probe.lower_diag.lower_ok ? 1 : 0,
+                    static_cast<unsigned long>(probe.lower_diag.gle),
+                    probe.lower_diag.queue_depth_at_submit,
+                    probe.lower_diag.inflight_after,
                     bridge_code,
                     static_cast<unsigned long>(elapsed),
                     probe.elapsed_ms);
                 return true;
             }
-            log_msg(hf, tag, "SIDE-FIXTURE-PROBE-WAIT -- pid=%lu attempts=%d active=%u ntdll=0x%016llX kernel32=0x%016llX kernelbase=0x%016llX module=%s fn=0x%016llX method=%s result=0x%016llX expected=0x%016llX ok=0 gle=%lu text=%s elapsed_ms=%lu probe_elapsed_ms=%lld status=\"%s\" last_error=\"%s\"",
+            log_msg(hf, tag, "SIDE-FIXTURE-PROBE-WAIT -- pid=%lu attempts=%d active=%u ntdll=0x%016llX kernel32=0x%016llX kernelbase=0x%016llX module=%s fn=0x%016llX method=%s result=0x%016llX expected=0x%016llX ok=0 gle=%lu text=%s remote_call_id=%llu remote_ok=%d remote_execution_completed=%d remote_gle=%lu lower_call_id=%llu lower_phase=%s lower_reason=%s lower_completed=%d lower_ok=%d lower_gle=%lu lower_generation_entry=%llu lower_generation_after=%llu lower_queue_depth_submit=%u lower_queue_depth_start=%u lower_queue_depth_after_pop=%u lower_inflight_submit=%u lower_inflight_start=%u lower_inflight_after=%u lower_queue_wait_ms=%llu lower_elapsed_ms=%llu elapsed_ms=%lu probe_elapsed_ms=%lld status=\"%s\" last_error=\"%s\"",
                 static_cast<unsigned long>(sidecar.pid),
                 attempts,
                 active,
@@ -840,6 +914,26 @@ static bool wait_integrity_hunter_sidecar_ready(HANDLE hf, const char* tag, cons
                 static_cast<unsigned long long>(sidecar.pid),
                 static_cast<unsigned long>(probe.gle),
                 format_win32_error_text(probe.gle).c_str(),
+                (unsigned long long)probe.remote_diag.call_id,
+                probe.remote_diag.ok ? 1 : 0,
+                probe.remote_diag.lower_completed && probe.remote_diag.lower_ok ? 1 : 0,
+                static_cast<unsigned long>(probe.remote_diag.gle),
+                (unsigned long long)probe.lower_diag.call_id,
+                probe.lower_diag.phase.c_str(),
+                probe.lower_diag.completion_reason.c_str(),
+                probe.lower_diag.completed ? 1 : 0,
+                probe.lower_diag.lower_ok ? 1 : 0,
+                static_cast<unsigned long>(probe.lower_diag.gle),
+                (unsigned long long)probe.lower_diag.generation_at_entry,
+                (unsigned long long)probe.lower_diag.generation_after,
+                probe.lower_diag.queue_depth_at_submit,
+                probe.lower_diag.queue_depth_at_start,
+                probe.lower_diag.queue_depth_after_pop,
+                probe.lower_diag.inflight_at_submit,
+                probe.lower_diag.inflight_at_start,
+                probe.lower_diag.inflight_after,
+                (unsigned long long)probe.lower_diag.queue_wait_ms,
+                (unsigned long long)probe.lower_diag.lower_elapsed_ms,
                 static_cast<unsigned long>(elapsed),
                 probe.elapsed_ms,
                 driver_bridge::status().c_str(),
@@ -983,6 +1077,59 @@ static void close_integrity_hunter_sidecar(HANDLE hf, const char* tag, integrity
     sidecar.pid = 0;
 }
 
+static bool fence_integrity_hunter_cleanup_before_sidecar_switch(HANDLE hf, const char* tag, uint32_t primary_pid, DWORD timeout_ms) {
+    const DWORD started = GetTickCount();
+    integrity_hunter::stop_hunt();
+    const auto idle = integrity_hunter::wait_until_idle_result(timeout_ms);
+    const auto lower = driver_bridge::last_remote_call_execution_diag();
+    const bool hunting = integrity_hunter::g_state.hunting.load(std::memory_order_acquire);
+    const bool worker = integrity_hunter::g_state.worker_active.load(std::memory_order_acquire);
+    const bool ok = idle.idle && !hunting && !worker;
+    log_msg(hf, tag, "SIDE-FIXTURE-CLEANUP-FENCE -- primary_pid=%u active_pid=%u ok=%d idle=%d hunting=%d worker=%d cleanup_elapsed_ms=%lld generation=%llu install_generation=%llu session=%u lower_call_id=%llu lower_phase=%s lower_reason=%s lower_completed=%d lower_ok=%d lower_gle=%lu lower_generation_entry=%llu lower_generation_after=%llu lower_queue_depth_submit=%u lower_queue_depth_after_pop=%u lower_inflight_after=%u lower_queue_wait_ms=%llu lower_elapsed_ms=%llu elapsed_ms=%lu status=\"%s\" last_error=\"%s\"",
+        (unsigned)primary_pid,
+        (unsigned)driver_bridge::attached_pid(),
+        ok ? 1 : 0,
+        idle.idle ? 1 : 0,
+        hunting ? 1 : 0,
+        worker ? 1 : 0,
+        (long long)idle.elapsed_ms,
+        (unsigned long long)idle.generation,
+        (unsigned long long)idle.install_generation,
+        idle.session_id,
+        (unsigned long long)lower.call_id,
+        lower.phase.c_str(),
+        lower.completion_reason.c_str(),
+        lower.completed ? 1 : 0,
+        lower.lower_ok ? 1 : 0,
+        static_cast<unsigned long>(lower.gle),
+        (unsigned long long)lower.generation_at_entry,
+        (unsigned long long)lower.generation_after,
+        lower.queue_depth_at_submit,
+        lower.queue_depth_after_pop,
+        lower.inflight_after,
+        (unsigned long long)lower.queue_wait_ms,
+        (unsigned long long)lower.lower_elapsed_ms,
+        static_cast<unsigned long>(GetTickCount() - started),
+        driver_bridge::status().c_str(),
+        driver_bridge::last_error().c_str());
+    if (!ok) {
+        log_msg(hf, tag, "FAIL -- integrity sidecar cleanup fence did not drain before PID switch: primary_pid=%u active_pid=%u idle=%d hunting=%d worker=%d cleanup_elapsed_ms=%lld lower_reason=%s lower_completed=%d lower_ok=%d lower_inflight_after=%u status=\"%s\" last_error=\"%s\"",
+            (unsigned)primary_pid,
+            (unsigned)driver_bridge::attached_pid(),
+            idle.idle ? 1 : 0,
+            hunting ? 1 : 0,
+            worker ? 1 : 0,
+            (long long)idle.elapsed_ms,
+            lower.completion_reason.c_str(),
+            lower.completed ? 1 : 0,
+            lower.lower_ok ? 1 : 0,
+            lower.inflight_after,
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str());
+    }
+    return ok;
+}
+
 struct integrity_hunter_sidecar_scope_t {
     HANDLE hf = nullptr;
     const char* tag = nullptr;
@@ -1000,6 +1147,8 @@ struct integrity_hunter_sidecar_scope_t {
     }
 
     bool start(DWORD timeout_ms) {
+        if (!fence_integrity_hunter_cleanup_before_sidecar_switch(hf, tag, primary_pid, 12000))
+            return false;
         if (!launch_integrity_hunter_sidecar(hf, tag, sidecar))
             return false;
         active = true;
@@ -2505,11 +2654,17 @@ static void test_integrity_hunter_start_stop(HANDLE hf, std::atomic<int>& passed
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (started && idle && !hunting && !worker) {
-        log_msg(hf, "integ_ss", "PASS -- target_pid=%u driver_attached=%d target=0x%016llX generation=%llu install_generation=%llu started=%d idle=%d cleanup_elapsed_ms=%lld hunting_after_stop=%d worker=%d install_complete=%d install_success=%d nodes=%zu events=%zu total_reads=%llu (elapsed %lld ms)",
+        log_msg(hf, "integ_ss", "PASS -- target_pid=%u driver_attached=%d target=0x%016llX generation=%llu install_generation=%llu started=%d idle=%d cleanup_elapsed_ms=%lld stop_to_cancel_ms=%llu stop_to_uninstall_begin_ms=%llu uninstall_ms=%llu stop_to_worker_exit_ms=%llu last_uninstall_elapsed_ms=%llu hunting_after_stop=%d worker=%d install_complete=%d install_success=%d nodes=%zu events=%zu total_reads=%llu (elapsed %lld ms)",
             (unsigned)target_pid, driver_attached_flag(target_pid), (unsigned long long)addr,
             (unsigned long long)generation,
             (unsigned long long)idle_result.install_generation,
-            started ? 1 : 0, idle ? 1 : 0, (long long)idle_result.elapsed_ms, hunting ? 1 : 0, worker ? 1 : 0,
+            started ? 1 : 0, idle ? 1 : 0, (long long)idle_result.elapsed_ms,
+            (unsigned long long)idle_result.stop_to_cancel_ms,
+            (unsigned long long)idle_result.stop_to_uninstall_begin_ms,
+            (unsigned long long)idle_result.uninstall_ms,
+            (unsigned long long)idle_result.stop_to_worker_exit_ms,
+            (unsigned long long)idle_result.last_uninstall_elapsed_ms,
+            hunting ? 1 : 0, worker ? 1 : 0,
             install_complete ? 1 : 0, install_success ? 1 : 0,
             idle_result.nodes,
             idle_result.events,
@@ -2517,14 +2672,20 @@ static void test_integrity_hunter_start_stop(HANDLE hf, std::atomic<int>& passed
             (long long)ms);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "integ_ss", "FAIL -- target_pid=%u active_pid=%u driver_attached=%d target=0x%016llX generation=%llu install_generation=%llu started=%d idle=%d cleanup_elapsed_ms=%lld hunting_after_stop=%d worker=%d install_complete=%d install_success=%d raw_install_complete=%d raw_install_success=%d nodes=%zu events=%zu total_reads=%llu status=\"%s\" last_error=\"%s\" (elapsed %lld ms)",
+        log_msg(hf, "integ_ss", "FAIL -- target_pid=%u active_pid=%u driver_attached=%d target=0x%016llX generation=%llu install_generation=%llu started=%d idle=%d cleanup_elapsed_ms=%lld stop_to_cancel_ms=%llu stop_to_uninstall_begin_ms=%llu uninstall_ms=%llu stop_to_worker_exit_ms=%llu last_uninstall_elapsed_ms=%llu hunting_after_stop=%d worker=%d install_complete=%d install_success=%d raw_install_complete=%d raw_install_success=%d nodes=%zu events=%zu total_reads=%llu status=\"%s\" last_error=\"%s\" (elapsed %lld ms)",
             (unsigned)target_pid,
             (unsigned)driver_bridge::attached_pid(),
             driver_attached_flag(target_pid),
             (unsigned long long)addr,
             (unsigned long long)generation,
             (unsigned long long)idle_result.install_generation,
-            started ? 1 : 0, idle ? 1 : 0, (long long)idle_result.elapsed_ms, hunting ? 1 : 0, worker ? 1 : 0,
+            started ? 1 : 0, idle ? 1 : 0, (long long)idle_result.elapsed_ms,
+            (unsigned long long)idle_result.stop_to_cancel_ms,
+            (unsigned long long)idle_result.stop_to_uninstall_begin_ms,
+            (unsigned long long)idle_result.uninstall_ms,
+            (unsigned long long)idle_result.stop_to_worker_exit_ms,
+            (unsigned long long)idle_result.last_uninstall_elapsed_ms,
+            hunting ? 1 : 0, worker ? 1 : 0,
             install_complete ? 1 : 0, install_success ? 1 : 0,
             idle_result.install_complete ? 1 : 0,
             idle_result.install_success ? 1 : 0,

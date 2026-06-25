@@ -192,9 +192,12 @@ namespace {
 			push_bool(r, "expected_hash_supplied", supplied_hash);
 			push_u64_hex(r, "live_baseline_hash", live_hash);
 			if (!supplied_hash || expected_hash == 0) {
-				expected_hash = live_hash;
-				req.expected_hash = expected_hash;
-				r.parsed.push_back({ "expected_hash_source", "computed_live_baseline" });
+				r.parsed.push_back({ "expected_hash_source", "computed_live_baseline_diagnostic" });
+				push_bool(r, "dprt_functional_pass_eligible", false);
+				r.ok = false;
+				r.error = "DPRT functional registration requires a supplied known-good expected_hash; live baseline is diagnostic only";
+				r.ntstatus = static_cast<std::int32_t>(0xC0000022u);
+				return;
 			} else if (expected_hash != live_hash) {
 				r.ok = false;
 				r.error = "provided expected_hash does not match live target bytes; refusing to arm bugcheckable DPRT slot";
@@ -202,6 +205,7 @@ namespace {
 				return;
 			} else {
 				r.parsed.push_back({ "expected_hash_source", "provided_verified" });
+				push_bool(r, "dprt_functional_pass_eligible", true);
 			}
 			if (req.check_interval == 0)
 				req.check_interval = 30000u;
@@ -283,6 +287,7 @@ namespace {
 				r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
 				return;
 			}
+			r.parsed.push_back({ "dprt_functional_proof", "provided_hash_register_query_unregister" });
 		}
 
 		r.parsed.push_back({ "operation", dprt_op_label(req.operation) });

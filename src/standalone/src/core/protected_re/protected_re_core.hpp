@@ -3378,23 +3378,217 @@ inline tool_result_t cff_recover_cfg(const json& params)
     return tool_result_t::ok("Recovered CFG from flattened control flow evidence", out);
 }
 
+inline bool z3_is_separator(wchar_t ch)
+{
+    return ch == L'\\' || ch == L'/';
+}
+
+inline constexpr DWORD kZ3PathChars = 32768;
+
+inline bool z3_is_ascii_alpha(wchar_t ch)
+{
+    return (ch >= L'A' && ch <= L'Z') || (ch >= L'a' && ch <= L'z');
+}
+
+inline bool z3_is_drive_absolute(const std::wstring& path, std::size_t offset = 0)
+{
+    return path.size() >= offset + 3 && z3_is_ascii_alpha(path[offset]) && path[offset + 1] == L':' && z3_is_separator(path[offset + 2]);
+}
+
+inline bool z3_is_absolute_path(const std::wstring& path)
+{
+    if (z3_is_drive_absolute(path))
+        return true;
+    if (path.size() >= 8 && z3_is_separator(path[0]) && z3_is_separator(path[1]) && path[2] == L'?' && z3_is_separator(path[3])) {
+        if (z3_is_drive_absolute(path, 4))
+            return true;
+        return path.size() >= 10 && path[4] == L'U' && path[5] == L'N' && path[6] == L'C' && z3_is_separator(path[7]) && !z3_is_separator(path[8]);
+    }
+    return path.size() >= 3 && z3_is_separator(path[0]) && z3_is_separator(path[1]) && !z3_is_separator(path[2]) && path[2] != L'?';
+}
+
+inline std::wstring z3_trim_trailing_separators(std::wstring path)
+{
+    while (path.size() > 1 && z3_is_separator(path.back())) {
+        if (path.size() == 3 && z3_is_drive_absolute(path))
+            break;
+        if (path.size() == 7 && z3_is_separator(path[0]) && z3_is_separator(path[1]) && path[2] == L'?' && z3_is_separator(path[3]) && z3_is_drive_absolute(path, 4))
+            break;
+        path.pop_back();
+    }
+    return path;
+}
+
+inline std::wstring z3_normalize_absolute_dir(const std::wstring& raw)
+{
+    if (raw.empty() || !z3_is_absolute_path(raw))
+        return {};
+    const DWORD needed = GetFullPathNameW(raw.c_str(), 0, nullptr, nullptr);
+    if (needed == 0 || needed > kZ3PathChars)
+        return {};
+    std::wstring full(needed, L'\0');
+    const DWORD written = GetFullPathNameW(raw.c_str(), needed, full.data(), nullptr);
+    if (written == 0 || written >= needed)
+        return {};
+    full.resize(written);
+    if (!z3_is_absolute_path(full))
+        return {};
+    return z3_trim_trailing_separators(std::move(full));
+}
+
+inline std::wstring z3_join_path(std::wstring dir, const wchar_t* filename)
+{
+    dir = z3_trim_trailing_separators(std::move(dir));
+    if (dir.empty())
+        return {};
+    if (!z3_is_separator(dir.back()))
+        dir.push_back(L'\\');
+    dir += filename;
+    return dir;
+}
+
+inline bool z3_regular_file_exists(const std::wstring& path)
+{
+    if (path.empty())
+        return false;
+    const DWORD attrs = GetFileAttributesW(path.c_str());
+    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+inline std::wstring z3_executable_dir()
+{
+    std::array<wchar_t, kZ3PathChars> path{};
+    const DWORD len = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
+    if (len == 0 || len >= static_cast<DWORD>(path.size()))
+        return {};
+    std::wstring exe(path.data(), path.data() + len);
+    const std::size_t slash = exe.find_last_of(L"\\/");
+    if (slash == std::wstring::npos)
+        return {};
+    return z3_trim_trailing_separators(exe.substr(0, slash));
+}
+
+inline std::wstring z3_module_path_w(HMODULE mod)
+{
+    std::array<wchar_t, kZ3PathChars> path{};
+    const DWORD len = GetModuleFileNameW(mod, path.data(), static_cast<DWORD>(path.size()));
+    if (len == 0 || len >= static_cast<DWORD>(path.size()))
+        return {};
+    return std::wstring(path.data(), path.data() + len);
+}
+
+inline std::string z3_wide_to_utf8(const std::wstring& value)
+{
+    if (value.empty())
+        return {};
+    const int needed = WideCharToMultiByte(CP_UTF8, 0, value.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (needed <= 1)
+        return {};
+    std::string out(static_cast<std::size_t>(needed - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, value.c_str(), -1, out.data(), needed, nullptr, nullptr);
+    return out;
+}
+
+struct z3_load_candidate_t {
+    const char* source = "";
+    std::wstring path;
+    bool eligible = false;
+    bool exists = false;
+    std::string reason;
+};
+
+inline z3_load_candidate_t z3_make_candidate(const char* source, const std::wstring& dir, const char* unavailable_reason)
+{
+    z3_load_candidate_t candidate;
+    candidate.source = source;
+    if (dir.empty()) {
+        candidate.reason = unavailable_reason;
+        return candidate;
+    }
+    candidate.path = z3_join_path(dir, L"libz3.dll");
+    candidate.exists = z3_regular_file_exists(candidate.path);
+    candidate.eligible = candidate.exists;
+    candidate.reason = candidate.exists ? "ready" : "file_missing";
+    return candidate;
+}
+
+inline std::vector<z3_load_candidate_t> z3_load_candidates()
+{
+    std::vector<z3_load_candidate_t> candidates;
+    candidates.reserve(3);
+
+    z3_load_candidate_t env_candidate;
+    env_candidate.source = "AIDA_Z3_PRELOAD_DIR";
+    std::array<wchar_t, kZ3PathChars> preload_dir{};
+    const DWORD preload_cap = static_cast<DWORD>(preload_dir.size());
+    const DWORD preload_len = GetEnvironmentVariableW(L"AIDA_Z3_PRELOAD_DIR", preload_dir.data(), preload_cap);
+    if (preload_len == 0) {
+        env_candidate.reason = "env_absent_or_empty";
+    } else if (preload_len >= preload_cap) {
+        env_candidate.reason = "env_too_long";
+    } else {
+        const std::wstring normalized = z3_normalize_absolute_dir(std::wstring(preload_dir.data(), preload_dir.data() + preload_len));
+        if (normalized.empty()) {
+            env_candidate.reason = "env_not_absolute_normalized_dir";
+        } else {
+            env_candidate = z3_make_candidate("AIDA_Z3_PRELOAD_DIR", normalized, "env_not_absolute_normalized_dir");
+        }
+    }
+    candidates.push_back(std::move(env_candidate));
+
+    const std::wstring exe_dir = z3_executable_dir();
+    candidates.push_back(z3_make_candidate("exe_deps_z3", z3_join_path(z3_join_path(exe_dir, L"deps"), L"z3"), "exe_dir_unavailable"));
+    candidates.push_back(z3_make_candidate("exe_dir_developer", exe_dir, "exe_dir_unavailable"));
+    return candidates;
+}
+
+inline HMODULE z3_load_library_scoped(const std::wstring& path)
+{
+    return LoadLibraryExW(path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+}
+
 inline HMODULE z3_module_handle(bool allow_load)
 {
     HMODULE mod = GetModuleHandleW(L"libz3.dll");
     if (mod || !allow_load)
         return mod;
-    wchar_t preload_dir[MAX_PATH] = {};
-    const DWORD preload_len = GetEnvironmentVariableW(L"AIDA_Z3_PRELOAD_DIR", preload_dir, MAX_PATH);
-    if (preload_len > 0 && preload_len < MAX_PATH) {
-        std::wstring path(preload_dir, preload_dir + preload_len);
-        if (!path.empty() && path.back() != L'\\' && path.back() != L'/')
-            path.push_back(L'\\');
-        path += L"libz3.dll";
-        mod = LoadLibraryW(path.c_str());
+    for (const auto& candidate : z3_load_candidates()) {
+        if (!candidate.eligible || !candidate.exists)
+            continue;
+        mod = z3_load_library_scoped(candidate.path);
+        if (mod)
+            return mod;
     }
-    if (!mod)
-        mod = LoadLibraryW(L"libz3.dll");
-    return mod;
+    return nullptr;
+}
+
+inline const std::array<const char*, 22>& z3_required_exports()
+{
+    static const std::array<const char*, 22> names = {
+        "Z3_mk_config",
+        "Z3_del_config",
+        "Z3_mk_context",
+        "Z3_del_context",
+        "Z3_mk_solver",
+        "Z3_solver_inc_ref",
+        "Z3_solver_dec_ref",
+        "Z3_solver_assert",
+        "Z3_solver_check",
+        "Z3_mk_bv_sort",
+        "Z3_mk_string_symbol",
+        "Z3_mk_const",
+        "Z3_mk_numeral",
+        "Z3_mk_eq",
+        "Z3_mk_not",
+        "Z3_mk_bvadd",
+        "Z3_mk_bvsub",
+        "Z3_mk_bvmul",
+        "Z3_mk_bvand",
+        "Z3_mk_bvor",
+        "Z3_mk_bvxor",
+        "Z3_mk_bvshl"
+    };
+    return names;
 }
 
 struct z3_dynamic_api_t {
@@ -3437,14 +3631,15 @@ struct z3_dynamic_api_t {
     mk_binary_ast_fn mk_bvor = nullptr;
     mk_binary_ast_fn mk_bvxor = nullptr;
     mk_binary_ast_fn mk_bvshl = nullptr;
+    std::vector<std::string> missing_exports;
 
     bool load(bool allow_load)
     {
+        missing_exports.clear();
         module = z3_module_handle(allow_load);
         if (!module)
             return false;
-        bool ok = true;
-#define AIDA_Z3_LOAD(field, name) field = reinterpret_cast<decltype(field)>(GetProcAddress(module, name)); ok = ok && field != nullptr
+#define AIDA_Z3_LOAD(field, name) field = reinterpret_cast<decltype(field)>(GetProcAddress(module, name)); if (!field) missing_exports.emplace_back(name)
         AIDA_Z3_LOAD(mk_config, "Z3_mk_config");
         AIDA_Z3_LOAD(del_config, "Z3_del_config");
         AIDA_Z3_LOAD(mk_context, "Z3_mk_context");
@@ -3468,7 +3663,7 @@ struct z3_dynamic_api_t {
         AIDA_Z3_LOAD(mk_bvxor, "Z3_mk_bvxor");
         AIDA_Z3_LOAD(mk_bvshl, "Z3_mk_bvshl");
 #undef AIDA_Z3_LOAD
-        return ok;
+        return missing_exports.empty();
     }
 };
 
@@ -3478,6 +3673,8 @@ inline bool z3_prove_bv_add_xor_and_identity(json& proof)
     z3_dynamic_api_t api;
     if (!api.load(true)) {
         proof["reason"] = "z3_backend_unavailable";
+        proof["module_handle"] = api.module ? sa_format_address(static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(api.module))) : "0x0";
+        proof["missing_exports"] = api.missing_exports;
         return false;
     }
     proof["module_handle"] = sa_format_address(static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(api.module)));
@@ -3535,28 +3732,54 @@ inline bool z3_prove_bv_add_xor_and_identity(json& proof)
 inline json z3_backend_state()
 {
     json state;
+    json candidate_checks = json::array();
+    bool preload_env_present = false;
+    bool preload_env_accepted = false;
+    for (const auto& candidate : z3_load_candidates()) {
+        if (std::strcmp(candidate.source, "AIDA_Z3_PRELOAD_DIR") == 0) {
+            preload_env_present = candidate.reason != "env_absent_or_empty";
+            preload_env_accepted = candidate.eligible;
+        }
+        candidate_checks.push_back(json{
+            {"source", candidate.source},
+            {"path", z3_wide_to_utf8(candidate.path)},
+            {"eligible", candidate.eligible},
+            {"exists", candidate.exists},
+            {"reason", candidate.reason}
+        });
+    }
+    state["load_candidates"] = candidate_checks;
+    state["preload_env_present"] = preload_env_present;
+    state["preload_env_accepted"] = preload_env_accepted;
     HMODULE mod = z3_module_handle(false);
     state["module_loaded"] = mod != nullptr;
     state["module_handle"] = mod ? sa_format_address(static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(mod))) : "0x0";
     if (mod) {
-        char path[MAX_PATH] = {};
-        DWORD len = GetModuleFileNameA(mod, path, MAX_PATH);
-        state["module_path"] = len ? std::string(path, path + len) : std::string();
-        const bool has_cfg = GetProcAddress(mod, "Z3_mk_config") != nullptr;
-        const bool has_ctx = GetProcAddress(mod, "Z3_mk_context") != nullptr;
-        const bool has_solver = GetProcAddress(mod, "Z3_mk_solver") != nullptr;
-        const bool has_check = GetProcAddress(mod, "Z3_solver_check") != nullptr;
-        state["api_mk_config"] = has_cfg;
-        state["api_mk_context"] = has_ctx;
-        state["api_mk_solver"] = has_solver;
-        state["api_solver_check"] = has_check;
-        state["api_available"] = has_cfg && has_ctx && has_solver && has_check;
+        state["module_path"] = z3_wide_to_utf8(z3_module_path_w(mod));
+        json exports = json::object();
+        json missing = json::array();
+        for (const auto* name : z3_required_exports()) {
+            const bool present = GetProcAddress(mod, name) != nullptr;
+            exports[name] = present;
+            if (!present)
+                missing.push_back(name);
+        }
+        state["api_exports"] = exports;
+        state["api_missing_exports"] = missing;
+        state["api_missing_export_count"] = missing.size();
+        state["api_required_export_count"] = z3_required_exports().size();
+        state["api_available"] = missing.empty();
+        state["api_mk_config"] = exports.value("Z3_mk_config", false);
+        state["api_mk_context"] = exports.value("Z3_mk_context", false);
+        state["api_mk_solver"] = exports.value("Z3_mk_solver", false);
+        state["api_solver_check"] = exports.value("Z3_solver_check", false);
     } else {
-        wchar_t preload_dir[MAX_PATH] = {};
-        DWORD preload_len = GetEnvironmentVariableW(L"AIDA_Z3_PRELOAD_DIR", preload_dir, MAX_PATH);
         state["module_path"] = "";
+        state["api_exports"] = json::object();
+        state["api_missing_exports"] = json::array();
+        state["api_missing_export_count"] = z3_required_exports().size();
+        state["api_required_export_count"] = z3_required_exports().size();
         state["api_available"] = false;
-        state["preload_env_present"] = preload_len > 0 && preload_len < MAX_PATH;
     }
     return state;
 }
@@ -3618,7 +3841,7 @@ inline tool_result_t mba_simplify(const json& params)
             }
         }
     }
-    if (z3_used_any)
+    if (use_z3 && solver_required)
         z3_state = z3_backend_state();
     const bool z3_api_available = z3_state.value("api_available", false);
     std::string selection_reason;

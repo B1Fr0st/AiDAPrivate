@@ -45,7 +45,6 @@ namespace camoufox {
 namespace {
 
 constexpr uint32_t kMinReadyBrowserProcessCount = 2;
-constexpr uint64_t kLaunchLateSuccessGraceMs = 8000;
 constexpr uint64_t kPostNavigationStabilityMs = 4500;
 constexpr uint64_t kPostNavigationStabilityPollMs = 250;
 constexpr uint64_t kCleanupDrainWaitMs = 15000;
@@ -5093,14 +5092,28 @@ bool wait_for_existing_start_bridge_result(const launch_config_t& cfg, uint64_t 
                 cleanup_pending = sg().cleanup_pending;
                 err = sg().last_error;
                 child_alive = process_alive(child_pid);
-                const bool ready = state == bridge_state_t::ready && has_client && browser_open && page_verified && privacy_verified && child_alive &&
+                const bool ready_candidate = state == bridge_state_t::ready && has_client && browser_open && page_verified && privacy_verified && child_alive &&
                     !cleanup_pending && !is_driver_closed_error(err);
-                if (ready)
+                if (ready_candidate)
                 {
-                    diag::log_tagged_fmt("camoufox", "start_bridge operation_busy_reuse_ready generation=%llu child_pid=%lu elapsed_ms=%llu",
+                    const bridge_health_snapshot_t ready_health = sample_bridge_health(child_pid, true);
+                    const bool ready_process_tree = usable_browser_process_count(ready_health.browser_process_count);
+                    if (ready_health.child_alive && ready_process_tree)
+                    {
+                        diag::log_tagged_fmt("camoufox", "start_bridge operation_busy_reuse_ready generation=%llu child_pid=%lu child_processes=%u browser_processes=%u elapsed_ms=%llu process_tree=%s",
+                            static_cast<unsigned long long>(generation), static_cast<unsigned long>(child_pid),
+                            static_cast<unsigned>(ready_health.child_process_count),
+                            static_cast<unsigned>(ready_health.browser_process_count),
+                            static_cast<unsigned long long>(now_ms() - wait_start_ms),
+                            ready_health.process_tree.empty() ? "<empty>" : ready_health.process_tree.c_str());
+                        return true;
+                    }
+                    diag::log_tagged_fmt("camoufox", "start_bridge operation_busy_reuse_rejected generation=%llu child_pid=%lu health_alive=%d child_processes=%u browser_processes=%u process_tree=%s",
                         static_cast<unsigned long long>(generation), static_cast<unsigned long>(child_pid),
-                        static_cast<unsigned long long>(now_ms() - wait_start_ms));
-                    return true;
+                        ready_health.child_alive ? 1 : 0,
+                        static_cast<unsigned>(ready_health.child_process_count),
+                        static_cast<unsigned>(ready_health.browser_process_count),
+                        ready_health.process_tree.empty() ? "<empty>" : ready_health.process_tree.c_str());
                 }
                 if (state != bridge_state_t::starting && !cleanup_pending)
                 {
@@ -5410,7 +5423,15 @@ std::string sidecar_timeout_phase_from_event(const nlohmann::json& event, const 
     const std::string phase = json_string_or(event, "phase", std::string());
     if (name.find("new_page_timeout") != std::string::npos || phase == "new_page" || phase == "page_creation_timeout")
         return "page_creation_timeout";
+    if (name.find("page_closed_during_launch") != std::string::npos)
+        return "page_closed_during_launch";
+    if (name.find("privacy_verify") != std::string::npos || phase == "privacy_verify")
+        return "privacy_verify";
+    if (name.find("browser_disconnected") != std::string::npos)
+        return "browser_disconnected";
     if (name.find("launch_phase_timeout") != std::string::npos && !phase.empty())
+        return phase == "new_page" ? "page_creation_timeout" : phase;
+    if (!phase.empty())
         return phase == "new_page" ? "page_creation_timeout" : phase;
     return fallback;
 }
@@ -5449,7 +5470,10 @@ void attach_debug_log_snapshot_locked(nlohmann::json& out,
     const char* copy_keys[] = {
         "selected_launch_path", "context_id", "page_id", "requested_page_id", "queue_len",
         "pending_queue_len", "pending_page_task", "context_page_count", "registered_pages",
-        "page_event_count", "browser_context_count", "browser_connected", "browser_open"
+        "page_event_count", "browser_context_count", "browser_connected", "browser_open",
+        "error_type", "error_kind", "error_summary", "phase", "elapsed_ms", "remaining_ms",
+        "launch_attempt_id", "attempt_id", "active_launch_phase", "last_debug_event_name",
+        "recent_page_events", "active_page_id"
     };
     for (const char* key : copy_keys)
     {
@@ -5535,7 +5559,12 @@ nlohmann::json launch_diagnostics_from_response(const nlohmann::json& parsed)
         out = *diagnostics_it;
     const char* copy_keys[] = {
         "status", "phase", "timeout_phase", "exception_type", "exception_repr",
-        "elapsed_ms", "remaining_ms", "session_id", "generation", "attempt_id"
+        "elapsed_ms", "remaining_ms", "session_id", "generation", "attempt_id",
+        "launch_attempt_id", "error_type", "error_kind", "error_summary",
+        "browser_open", "browser_connected", "context_count", "page_count",
+        "registered_pages", "active_page_id", "active_launch_phase",
+        "last_debug_event_name", "last_debug_event", "recent_page_events",
+        "cleanup_summary", "cleanup_stderr_tail_len"
     };
     for (const char* key : copy_keys)
     {
@@ -5546,6 +5575,46 @@ nlohmann::json launch_diagnostics_from_response(const nlohmann::json& parsed)
     auto err = parsed.find("error");
     if (err != parsed.end() && out.find("error") == out.end())
         out["error"] = *err;
+    return out;
+}
+
+std::string sidecar_failure_text(const nlohmann::json& parsed, const nlohmann::json& diagnostics, const std::string& fallback)
+{
+    std::string error = json_string_or(parsed, "error", std::string());
+    if (error.empty())
+        error = json_string_or(diagnostics, "error", std::string());
+    if (!error.empty())
+        return error;
+    std::string error_summary = json_string_or(parsed, "error_summary", json_string_or(diagnostics, "error_summary", std::string()));
+    std::string error_type = json_string_or(parsed, "error_type", json_string_or(diagnostics, "error_type", std::string()));
+    std::string error_kind = json_string_or(parsed, "error_kind", json_string_or(diagnostics, "error_kind", std::string()));
+    std::string phase = json_string_or(parsed, "phase", json_string_or(diagnostics, "phase", std::string()));
+    std::string last_event_name = json_string_or(parsed, "last_debug_event_name", json_string_or(diagnostics, "last_debug_event_name", std::string()));
+    nlohmann::json event = nlohmann::json::object();
+    auto event_it = diagnostics.find("last_debug_event");
+    if (event_it != diagnostics.end() && event_it->is_object())
+        event = *event_it;
+    else
+    {
+        auto parsed_event_it = parsed.find("last_debug_event");
+        if (parsed_event_it != parsed.end() && parsed_event_it->is_object())
+            event = *parsed_event_it;
+    }
+    if (last_event_name.empty())
+        last_event_name = json_string_or(event, "event", std::string());
+    if (phase.empty())
+        phase = json_string_or(event, "phase", std::string());
+    if (!error_summary.empty())
+        return error_summary;
+    std::string out = error_type.empty() ? std::string("sidecar launch failure") : error_type;
+    if (!error_kind.empty() && error_kind != error_type)
+        out += " kind=" + error_kind;
+    if (!phase.empty())
+        out += " phase=" + phase;
+    if (!last_event_name.empty())
+        out += " last_event=" + last_event_name;
+    if (out == "sidecar launch failure" && !fallback.empty())
+        return fallback;
     return out;
 }
 
@@ -7198,7 +7267,6 @@ bool start_bridge(const launch_config_t& cfg)
         publish_state(bridge_state_t::error, sg().last_error);
         return false;
     }
-    bool launch_late_success_recovered = false;
     mcp_client::call_result_t launch;
     {
         std::unique_lock<std::mutex> launch_lk(launch_state->mtx);
@@ -7225,7 +7293,11 @@ bool start_bridge(const launch_config_t& cfg)
                     tree_text = compact_process_tree(enumerate_process_tree(launch_child_pid));
                     last_launch_tree_log_ms = now_wait_log;
                 }
-                diag::log_tagged_fmt("camoufox", "launch_browser wait generation=%llu child_pid=%lu elapsed_ms=%llu remaining_ms=%llu stop_requested=%d worker_done=%d active=%lu cleanup_pending=%d cleanup_generation=%llu cleanup_child_pid=%lu cleanup_reason=%s debug_tail_len=%zu process_tree=%s",
+                const std::string wait_debug_tail = read_file_tail_for_log(child_debug_log, 2000);
+                const nlohmann::json wait_debug_event = last_camoufox_debug_event_json_from_tail(wait_debug_tail);
+                const std::string wait_debug_event_name = json_string_or(wait_debug_event, "event", std::string());
+                const std::string wait_sidecar_phase = sidecar_timeout_phase_from_event(wait_debug_event, std::string());
+                diag::log_tagged_fmt("camoufox", "launch_browser wait generation=%llu child_pid=%lu elapsed_ms=%llu remaining_ms=%llu stop_requested=%d worker_done=%d active=%lu cleanup_pending=%d cleanup_generation=%llu cleanup_child_pid=%lu cleanup_reason=%s debug_tail_len=%zu sidecar_event=%s sidecar_phase=%s sidecar_elapsed_ms=%d sidecar_remaining_ms=%d sidecar_browser_open=%d sidecar_browser_connected=%d sidecar_page_count=%d sidecar_registered_pages=%d sidecar_active_page=%s process_tree=%s",
                     static_cast<unsigned long long>(start_generation), static_cast<unsigned long>(launch_child_pid),
                     static_cast<unsigned long long>(wall_elapsed), static_cast<unsigned long long>(remaining_ms),
                     sg().stop_requested.load(std::memory_order_acquire) ? 1 : 0,
@@ -7233,7 +7305,16 @@ bool start_bridge(const launch_config_t& cfg)
                     static_cast<unsigned long>(sg().active_activities.load(std::memory_order_acquire)),
                     sg().cleanup_pending ? 1 : 0, static_cast<unsigned long long>(sg().cleanup_generation),
                     static_cast<unsigned long>(sg().cleanup_child_pid), sg().cleanup_reason.c_str(),
-                    read_file_tail_for_log(child_debug_log, 2000).size(),
+                    wait_debug_tail.size(),
+                    wait_debug_event_name.empty() ? "<none>" : wait_debug_event_name.c_str(),
+                    wait_sidecar_phase.empty() ? "<none>" : wait_sidecar_phase.c_str(),
+                    json_int_or(wait_debug_event, "elapsed_ms", -1),
+                    json_int_or(wait_debug_event, "remaining_ms", json_int_or(wait_debug_event, "remaining_budget_ms", -1)),
+                    json_bool_or(wait_debug_event, "browser_open", false) ? 1 : 0,
+                    json_bool_or(wait_debug_event, "browser_connected", false) ? 1 : 0,
+                    json_int_or(wait_debug_event, "page_count", -1),
+                    json_int_or(wait_debug_event, "registered_pages", -1),
+                    json_string_or(wait_debug_event, "active_page_id", std::string()).empty() ? "<empty>" : json_string_or(wait_debug_event, "active_page_id", std::string()).c_str(),
                     tree_text.empty() ? "<not-sampled>" : tree_text.c_str());
                 last_launch_wait_log_ms = now_wait_log;
             }
@@ -7244,38 +7325,6 @@ bool start_bridge(const launch_config_t& cfg)
                 [&launch_state]() { return launch_state->done; });
         }
         bool launch_done = launch_state->done;
-        if (!launch_done && !launch_cancelled_by_stop)
-        {
-            const uint32_t grace_pid = sg().child_pid;
-            const std::vector<process_tree_entry_t> grace_tree = grace_pid == 0 ? std::vector<process_tree_entry_t>() : enumerate_process_tree(grace_pid);
-            const uint32_t grace_browser_processes = browser_process_count_from_tree(grace_tree);
-            if (grace_pid != 0 && process_alive(grace_pid) && grace_browser_processes > 0)
-            {
-                const uint64_t grace_start_ms = now_ms();
-                diag::log_tagged_fmt("camoufox", "launch_browser late_success_grace_begin generation=%llu child_pid=%lu grace_ms=%llu child_processes=%u browser_processes=%u process_tree=%s",
-                    static_cast<unsigned long long>(start_generation),
-                    static_cast<unsigned long>(grace_pid),
-                    static_cast<unsigned long long>(kLaunchLateSuccessGraceMs),
-                    static_cast<unsigned>(grace_tree.size()),
-                    static_cast<unsigned>(grace_browser_processes),
-                    grace_tree.empty() ? "<empty>" : compact_process_tree(grace_tree).c_str());
-                while (!launch_state->done && !sg().stop_requested.load(std::memory_order_acquire) && now_ms() - grace_start_ms < kLaunchLateSuccessGraceMs)
-                {
-                    const uint64_t elapsed_grace = now_ms() - grace_start_ms;
-                    const uint64_t remaining_grace = elapsed_grace >= kLaunchLateSuccessGraceMs ? 0 : kLaunchLateSuccessGraceMs - elapsed_grace;
-                    launch_state->cv.wait_for(launch_lk, std::chrono::milliseconds(static_cast<int>(std::min<uint64_t>(remaining_grace, 250))),
-                        [&launch_state]() { return launch_state->done; });
-                }
-                launch_done = launch_state->done;
-                diag::log_tagged_fmt("camoufox", "launch_browser late_success_grace_end generation=%llu child_pid=%lu recovered=%d stop_requested=%d elapsed_ms=%llu",
-                    static_cast<unsigned long long>(start_generation),
-                    static_cast<unsigned long>(grace_pid),
-                    launch_done ? 1 : 0,
-                    sg().stop_requested.load(std::memory_order_acquire) ? 1 : 0,
-                    static_cast<unsigned long long>(now_ms() - grace_start_ms));
-                launch_late_success_recovered = launch_done;
-            }
-        }
         if (!launch_done)
         {
             launch_state->cancelled = true;
@@ -7391,12 +7440,14 @@ bool start_bridge(const launch_config_t& cfg)
     if (!launch.success)
     {
         const bool native_exception = result_has_native_exception(launch);
-        const std::string failure_text = launch.text.empty() ? std::string("launch_browser failed with empty MCP error") : launch.text;
-        sg().last_error = std::string("launch_browser failed: ") + failure_text;
         nlohmann::json launch_payload = launch.data;
         if (!launch_payload.is_object())
             parse_text_to_json(launch.text, launch_payload);
         const nlohmann::json response_diag = launch_payload.is_object() ? launch_diagnostics_from_response(launch_payload) : nlohmann::json::object();
+        const std::string failure_text = launch_payload.is_object()
+            ? sidecar_failure_text(launch_payload, response_diag, launch.text.empty() ? std::string("launch_browser failed with empty MCP error") : launch.text)
+            : (launch.text.empty() ? std::string("launch_browser failed with empty MCP error") : launch.text);
+        sg().last_error = std::string("launch_browser failed: ") + failure_text;
         sg().last_launch_diagnostics = launch_failure_diagnostics_snapshot(
             response_diag,
             "error",
@@ -7408,8 +7459,11 @@ bool start_bridge(const launch_config_t& cfg)
             cfg.launch_timeout_ms,
             launch_wait_ms,
             launch_elapsed_ms,
-            launch.text,
+            failure_text,
             launch.text);
+        sg().last_launch_diagnostics["sidecar_error_type"] = json_string_or(response_diag, "error_type", std::string());
+        sg().last_launch_diagnostics["sidecar_error_kind"] = json_string_or(response_diag, "error_kind", std::string());
+        sg().last_launch_diagnostics["sidecar_error_summary"] = json_string_or(response_diag, "error_summary", failure_text);
         diag::log_tagged_fmt("camoufox", "launch_browser failed generation=%llu attempt_id=%s child_pid=%lu child_alive=%d bridge_state=%s browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d process_tree_count=%zu error_len=%zu response_tail=%.900s last_launch_diag=%s",
             static_cast<unsigned long long>(start_generation),
             args.value("bridge_attempt_id", std::string()).c_str(),
@@ -7465,7 +7519,7 @@ bool start_bridge(const launch_config_t& cfg)
         if (parsed.contains("error") && parsed["error"].is_string())
         {
             const std::string parsed_error = parsed["error"].get<std::string>();
-            const std::string failure_text = parsed_error.empty() ? std::string("launch_browser returned empty error field") : parsed_error;
+            const std::string failure_text = sidecar_failure_text(parsed, sg().last_launch_diagnostics, "launch_browser returned empty error field");
             sg().last_error = std::string("launch_browser returned error: ") + failure_text;
             sg().last_launch_diagnostics = launch_failure_diagnostics_snapshot(
                 sg().last_launch_diagnostics,
@@ -7478,22 +7532,28 @@ bool start_bridge(const launch_config_t& cfg)
                 cfg.launch_timeout_ms,
                 launch_wait_ms,
                 launch_elapsed_ms,
-                parsed_error,
+                failure_text,
                 launch.text);
             sg().last_launch_diagnostics["sidecar_error_empty"] = parsed_error.empty();
+            sg().last_launch_diagnostics["sidecar_error_type"] = json_string_or(parsed, "error_type", json_string_or(sg().last_launch_diagnostics, "error_type", std::string()));
+            sg().last_launch_diagnostics["sidecar_error_kind"] = json_string_or(parsed, "error_kind", json_string_or(sg().last_launch_diagnostics, "error_kind", std::string()));
+            sg().last_launch_diagnostics["sidecar_error_summary"] = json_string_or(parsed, "error_summary", json_string_or(sg().last_launch_diagnostics, "error_summary", failure_text));
             const nlohmann::json launch_diag = sg().last_launch_diagnostics.is_object() ? sg().last_launch_diagnostics : nlohmann::json::object();
-            diag::log_tagged_fmt("camoufox", "launch_browser returned_error generation=%llu attempt_id=%s child_pid=%lu child_alive=%d phase=%s timeout_phase=%s diag_generation=%s session_id=%s remaining_ms=%d err_len=%zu err_tail=%.900s response_tail=%.900s process_tree_count=%zu bridge_state=%s browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d last_launch_diag=%s",
+            diag::log_tagged_fmt("camoufox", "launch_browser returned_error generation=%llu attempt_id=%s child_pid=%lu child_alive=%d phase=%s timeout_phase=%s sidecar_error_type=%s sidecar_error_kind=%s last_event=%s diag_generation=%s session_id=%s remaining_ms=%d err_len=%zu err_tail=%.900s response_tail=%.900s process_tree_count=%zu bridge_state=%s browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d last_launch_diag=%s",
                 static_cast<unsigned long long>(start_generation),
                 args.value("bridge_attempt_id", std::string()).c_str(),
                 static_cast<unsigned long>(sg().child_pid),
                 launch_diag.value("child_alive", false) ? 1 : 0,
                 json_string_or(launch_diag, "phase", std::string()).c_str(),
                 json_string_or(launch_diag, "timeout_phase", std::string()).c_str(),
+                json_string_or(launch_diag, "sidecar_error_type", std::string()).c_str(),
+                json_string_or(launch_diag, "sidecar_error_kind", std::string()).c_str(),
+                json_string_or(launch_diag, "last_debug_event_name", std::string()).c_str(),
                 json_string_or(launch_diag, "generation", std::string()).c_str(),
                 json_string_or(launch_diag, "session_id", std::string()).c_str(),
                 json_int_or(launch_diag, "remaining_ms", -1),
-                parsed_error.size(),
-                compact_child_output_tail(parsed_error, 900).c_str(),
+                failure_text.size(),
+                compact_child_output_tail(failure_text, 900).c_str(),
                 compact_child_output_tail(launch.text, 900).c_str(),
                 static_cast<size_t>(launch_diag.value("process_tree_count", 0)),
                 bridge_state_name(sg().state),
@@ -7602,17 +7662,13 @@ bool start_bridge(const launch_config_t& cfg)
                 {"diag_elapsed_ms", diag_elapsed_ms},
                 {"browser_ready_ms_effective", browser_ready_ms},
                 {"camoufox_launch_ms_effective", camoufox_launch_ms},
-                {"old_budget_ms", launch_timing_budget_ms},
-                {"late_success_grace_ms", kLaunchLateSuccessGraceMs},
-                {"late_success_grace_recovered", launch_late_success_recovered}
+                {"old_budget_ms", launch_timing_budget_ms}
             };
-            diag::log_tagged_fmt("camoufox", "launch_browser timing_budget_slow_pending generation=%llu child_pid=%lu reason=%s browser_ready_raw=%d camoufox_launch_raw=%d browser_ready_ms=%d camoufox_launch_ms=%d old_budget_ms=%d diag_elapsed_ms=%d late_success_grace_ms=%llu late_success_grace_recovered=%d privacy_verified=%d page_verified=%d browser_open=%d data_shape=%s response_tail=%.900s",
+            diag::log_tagged_fmt("camoufox", "launch_browser timing_budget_slow_pending generation=%llu child_pid=%lu reason=%s browser_ready_raw=%d camoufox_launch_raw=%d browser_ready_ms=%d camoufox_launch_ms=%d old_budget_ms=%d diag_elapsed_ms=%d privacy_verified=%d page_verified=%d browser_open=%d data_shape=%s response_tail=%.900s",
                 static_cast<unsigned long long>(start_generation), static_cast<unsigned long>(sg().child_pid),
                 launch_timing_budget_reason.c_str(),
                 browser_ready_ms_raw, camoufox_launch_ms_raw, browser_ready_ms, camoufox_launch_ms,
                 launch_timing_budget_ms, diag_elapsed_ms,
-                static_cast<unsigned long long>(kLaunchLateSuccessGraceMs),
-                launch_late_success_recovered ? 1 : 0,
                 sg().privacy_verified ? 1 : 0,
                 sg().page_verified ? 1 : 0,
                 sg().browser_open ? 1 : 0,
@@ -7749,8 +7805,6 @@ bool start_bridge(const launch_config_t& cfg)
             {"browser_ready_ms_effective", browser_ready_ms},
             {"camoufox_launch_ms_effective", camoufox_launch_ms},
             {"old_budget_ms", launch_timing_budget_ms},
-            {"late_success_grace_ms", kLaunchLateSuccessGraceMs},
-            {"late_success_grace_recovered", launch_late_success_recovered},
             {"child_alive", timing_health.child_alive},
             {"child_processes", timing_health.child_process_count},
             {"browser_processes", timing_health.browser_process_count},
@@ -7762,7 +7816,7 @@ bool start_bridge(const launch_config_t& cfg)
             {"cleanup_pending", sg().cleanup_pending},
             {"process_tree", timing_health.process_tree}
         };
-        diag::log_tagged_fmt("camoufox", "launch_browser timing_budget_slow_accepted generation=%llu child_pid=%lu reason=%s browser_ready_raw=%d camoufox_launch_raw=%d browser_ready_ms=%d camoufox_launch_ms=%d diag_elapsed_ms=%d old_budget_ms=%d late_success_grace_ms=%llu late_success_grace_recovered=%d child_alive=%d child_processes=%u browser_processes=%u min_browser_processes=%u browser_open=%d page_verified=%d privacy_verified=%d visible_windows=%u cleanup_pending=%d process_tree=%s",
+        diag::log_tagged_fmt("camoufox", "launch_browser timing_budget_slow_accepted generation=%llu child_pid=%lu reason=%s browser_ready_raw=%d camoufox_launch_raw=%d browser_ready_ms=%d camoufox_launch_ms=%d diag_elapsed_ms=%d old_budget_ms=%d child_alive=%d child_processes=%u browser_processes=%u min_browser_processes=%u browser_open=%d page_verified=%d privacy_verified=%d visible_windows=%u cleanup_pending=%d process_tree=%s",
             static_cast<unsigned long long>(start_generation),
             static_cast<unsigned long>(sg().child_pid),
             launch_timing_budget_reason.c_str(),
@@ -7772,8 +7826,6 @@ bool start_bridge(const launch_config_t& cfg)
             camoufox_launch_ms,
             diag_elapsed_ms,
             launch_timing_budget_ms,
-            static_cast<unsigned long long>(kLaunchLateSuccessGraceMs),
-            launch_late_success_recovered ? 1 : 0,
             timing_health.child_alive ? 1 : 0,
             static_cast<unsigned>(timing_health.child_process_count),
             static_cast<unsigned>(timing_health.browser_process_count),
@@ -8128,6 +8180,7 @@ bool is_ready()
         sg().privacy_verified &&
         health.child_alive &&
         process_tree_ready &&
+        !sg().cleanup_pending &&
         !is_driver_closed_error(sg().last_error);
     std::shared_ptr<mcp_client::client_t> cleanup_client;
     uint32_t cleanup_child_pid = 0;
@@ -8151,6 +8204,8 @@ bool is_ready()
             reason = "page is not verified";
         else if (!sg().privacy_verified)
             reason = "privacy is not verified";
+        else if (sg().cleanup_pending)
+            reason = "cleanup is pending";
         else
             reason = "readiness verification failed";
         invalidate_default_ready_bridge_locked(
@@ -8445,14 +8500,21 @@ bool prewarm_default_async(const char* reason)
     const bool ready = before.state == bridge_state_t::ready &&
                        before.child_alive &&
                        before.browser_open &&
-                       before.page_verified;
+                       before.page_verified &&
+                       before.privacy_verified &&
+                       !before.cleanup_pending &&
+                       usable_browser_process_count(before.browser_process_count);
     if (ready)
     {
         prewarm_default_requested().store(true, std::memory_order_release);
-        diag::log_tagged_fmt("camoufox", "prewarm_default_already_ready reason=%s generation=%llu child_pid=%lu last_launch_ms=%llu last_nav_ms=%llu",
+        diag::log_tagged_fmt("camoufox", "prewarm_default_already_ready reason=%s generation=%llu child_pid=%lu child_processes=%u browser_processes=%u privacy_verified=%d cleanup_pending=%d last_launch_ms=%llu last_nav_ms=%llu",
             owner,
             static_cast<unsigned long long>(before.generation),
             static_cast<unsigned long>(before.child_pid),
+            static_cast<unsigned>(before.child_process_count),
+            static_cast<unsigned>(before.browser_process_count),
+            before.privacy_verified ? 1 : 0,
+            before.cleanup_pending ? 1 : 0,
             static_cast<unsigned long long>(before.last_launch_ms),
             static_cast<unsigned long long>(before.last_nav_ms));
         return true;
@@ -9471,12 +9533,15 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
     if (!launch.ok)
     {
         const uint32_t pid = cli->child_process_id();
+        std::string managed_launch_error_text = launch.error.empty() ? launch.text : launch.error;
         nlohmann::json failed_launch_payload = launch.data;
         if (!failed_launch_payload.is_object())
             parse_text_to_json(launch.text, failed_launch_payload);
         if (failed_launch_payload.is_object())
         {
             const nlohmann::json failed_launch_diag = launch_diagnostics_from_response(failed_launch_payload);
+            const std::string managed_failure_text = sidecar_failure_text(failed_launch_payload, failed_launch_diag, launch.error.empty() ? launch.text : launch.error);
+            managed_launch_error_text = managed_failure_text;
             nlohmann::json managed_failed_diag;
             {
                 std::lock_guard<std::recursive_mutex> lk(session->mtx);
@@ -9491,11 +9556,14 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
                     cfg.launch_timeout_ms,
                     launch_wait_ms,
                     now_ms() - managed_launch_attempt_ms,
-                    launch.error,
+                    managed_failure_text,
                     launch.text);
+                session->last_launch_diagnostics["sidecar_error_type"] = json_string_or(failed_launch_diag, "error_type", std::string());
+                session->last_launch_diagnostics["sidecar_error_kind"] = json_string_or(failed_launch_diag, "error_kind", std::string());
+                session->last_launch_diagnostics["sidecar_error_summary"] = json_string_or(failed_launch_diag, "error_summary", managed_failure_text);
                 managed_failed_diag = session->last_launch_diagnostics;
             }
-            diag::log_tagged_fmt("camoufox", "managed_launch failed_payload session_id=%s generation=%llu attempt_id=%s child_pid=%lu child_alive=%d phase=%s timeout_phase=%s diag_generation=%s remaining_ms=%d error_len=%zu error_tail=%.900s response_tail=%.900s process_tree_count=%zu bridge_state=%s browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d last_launch_diag=%s",
+            diag::log_tagged_fmt("camoufox", "managed_launch failed_payload session_id=%s generation=%llu attempt_id=%s child_pid=%lu child_alive=%d phase=%s timeout_phase=%s sidecar_error_type=%s sidecar_error_kind=%s last_event=%s diag_generation=%s remaining_ms=%d error_len=%zu error_tail=%.900s response_tail=%.900s process_tree_count=%zu bridge_state=%s browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d last_launch_diag=%s",
                 sid.c_str(),
                 static_cast<unsigned long long>(managed_generation),
                 args.value("bridge_attempt_id", std::string()).c_str(),
@@ -9503,10 +9571,13 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
                 managed_failed_diag.value("child_alive", false) ? 1 : 0,
                 json_string_or(managed_failed_diag, "phase", std::string()).c_str(),
                 json_string_or(managed_failed_diag, "timeout_phase", std::string()).c_str(),
+                json_string_or(managed_failed_diag, "sidecar_error_type", std::string()).c_str(),
+                json_string_or(managed_failed_diag, "sidecar_error_kind", std::string()).c_str(),
+                json_string_or(managed_failed_diag, "last_debug_event_name", std::string()).c_str(),
                 json_string_or(managed_failed_diag, "generation", std::string()).c_str(),
                 json_int_or(managed_failed_diag, "remaining_ms", -1),
-                launch.error.size(),
-                compact_child_output_tail(launch.error, 900).c_str(),
+                managed_failure_text.size(),
+                compact_child_output_tail(managed_failure_text, 900).c_str(),
                 compact_child_output_tail(launch.text, 900).c_str(),
                 static_cast<size_t>(managed_failed_diag.value("process_tree_count", 0)),
                 bridge_state_name(session->state),
@@ -9530,17 +9601,17 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
                 cfg.launch_timeout_ms,
                 launch_wait_ms,
                 now_ms() - managed_launch_attempt_ms,
-                launch.error,
+                managed_launch_error_text,
                 launch.text);
         }
-        log_managed_failure_diagnostics("launch_browser_failed", pid, launch.error, launch.text);
+        log_managed_failure_diagnostics("launch_browser_failed", pid, managed_launch_error_text, launch.text);
         cleanup_managed_process("launch_browser_failed", pid, std::string("managed_launch_failed_") + sid);
         cli->disconnect();
         std::lock_guard<std::recursive_mutex> lk(session->mtx);
         session->client.reset();
         session->child_pid = 0;
         session->state = bridge_state_t::error;
-        session->last_error = launch.error.empty() ? std::string("camoufox managed launch_browser failed") : launch.error;
+        session->last_error = managed_launch_error_text.empty() ? std::string("camoufox managed launch_browser failed") : managed_launch_error_text;
         diag::log_tagged_fmt("camoufox", "managed_start stage_timing ok=0 phase=launch_rpc session_id=%s preflight_ms=%llu connect_ms=%llu tools_ms=%llu launch_rpc_ms=%llu readiness_probe_ms=%llu visible_window_ms=%llu total_ms=%llu",
             sid.c_str(),
             static_cast<unsigned long long>(preflight_ms),
@@ -9564,8 +9635,8 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
     {
         const uint32_t pid = cli->child_process_id();
         const std::string err = launch_payload["error"].get<std::string>();
-        const std::string failure_text = err.empty() ? std::string("launch_browser returned empty error field") : err;
         const nlohmann::json launch_diag = launch_diagnostics_from_response(launch_payload);
+        const std::string failure_text = sidecar_failure_text(launch_payload, launch_diag, "launch_browser returned empty error field");
         nlohmann::json managed_error_diag;
         {
             std::lock_guard<std::recursive_mutex> lk(session->mtx);
@@ -9580,12 +9651,15 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
                 cfg.launch_timeout_ms,
                 launch_wait_ms,
                 now_ms() - managed_launch_attempt_ms,
-                err,
+                failure_text,
                 launch.text);
             session->last_launch_diagnostics["sidecar_error_empty"] = err.empty();
+            session->last_launch_diagnostics["sidecar_error_type"] = json_string_or(launch_diag, "error_type", std::string());
+            session->last_launch_diagnostics["sidecar_error_kind"] = json_string_or(launch_diag, "error_kind", std::string());
+            session->last_launch_diagnostics["sidecar_error_summary"] = json_string_or(launch_diag, "error_summary", failure_text);
             managed_error_diag = session->last_launch_diagnostics;
         }
-        diag::log_tagged_fmt("camoufox", "managed_launch returned_error session_id=%s generation=%llu attempt_id=%s child_pid=%lu child_alive=%d phase=%s timeout_phase=%s diag_generation=%s remaining_ms=%d err_len=%zu err_tail=%.900s response_tail=%.900s process_tree_count=%zu bridge_state=%s browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d last_launch_diag=%s",
+        diag::log_tagged_fmt("camoufox", "managed_launch returned_error session_id=%s generation=%llu attempt_id=%s child_pid=%lu child_alive=%d phase=%s timeout_phase=%s sidecar_error_type=%s sidecar_error_kind=%s last_event=%s diag_generation=%s remaining_ms=%d err_len=%zu err_tail=%.900s response_tail=%.900s process_tree_count=%zu bridge_state=%s browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d last_launch_diag=%s",
             sid.c_str(),
             static_cast<unsigned long long>(managed_generation),
             args.value("bridge_attempt_id", std::string()).c_str(),
@@ -9593,10 +9667,13 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
             managed_error_diag.value("child_alive", false) ? 1 : 0,
             json_string_or(managed_error_diag, "phase", std::string()).c_str(),
             json_string_or(managed_error_diag, "timeout_phase", std::string()).c_str(),
+            json_string_or(managed_error_diag, "sidecar_error_type", std::string()).c_str(),
+            json_string_or(managed_error_diag, "sidecar_error_kind", std::string()).c_str(),
+            json_string_or(managed_error_diag, "last_debug_event_name", std::string()).c_str(),
             json_string_or(managed_error_diag, "generation", std::string()).c_str(),
             json_int_or(managed_error_diag, "remaining_ms", -1),
-            err.size(),
-            compact_child_output_tail(err, 900).c_str(),
+            failure_text.size(),
+            compact_child_output_tail(failure_text, 900).c_str(),
             compact_child_output_tail(launch.text, 900).c_str(),
             static_cast<size_t>(managed_error_diag.value("process_tree_count", 0)),
             bridge_state_name(session->state),

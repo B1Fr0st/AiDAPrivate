@@ -62,6 +62,12 @@ namespace {
 		r.parsed.push_back({ "present", present ? "true" : "false" });
 		r.parsed.push_back({ "tier_mask", hex_u32(tier_mask) });
 		r.parsed.push_back({ "first_driver_base", hex_u64(first_driver_base) });
+		r.parsed.push_back({ "coverage_kind", present ? "health_present_review_required" : "health_absence" });
+		r.parsed.push_back({ "health_check_pass", ok && !present ? "true" : "false" });
+		r.parsed.push_back({ "positive_detection_coverage", "false" });
+		r.parsed.push_back({ "positive_fixture_available", "false" });
+		r.parsed.push_back({ "positive_detection_result", present ? "live_presence_not_controlled_fixture" : "not_exercised_absent" });
+		r.parsed.push_back({ "absence_expected_healthy", present ? "false" : "true" });
 	}
 
 }

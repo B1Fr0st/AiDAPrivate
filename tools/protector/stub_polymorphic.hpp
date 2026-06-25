@@ -16,7 +16,6 @@
 #include <random>
 #include <asmjit/x86.h>
 #include "stub.hpp"
-#include "payload_blob.hpp"
 
 namespace stub_poly {
 
@@ -335,6 +334,7 @@ inline void emit_opaque_predicate(asmjit::x86::Assembler& a,
 
 inline generated_stub_t generate(const stub_config_t& cfg) {
     using namespace asmjit;
+    stub::validate_payload(cfg);
 
     generated_stub_t out{};
     out.main_stub_entry_offset = 0u;
@@ -356,9 +356,9 @@ inline generated_stub_t generate(const stub_config_t& cfg) {
         }
     }
 
-    std::vector<uint8_t> masked_blob(aida_payload::kBlobSize);
-    for (size_t i = 0; i < aida_payload::kBlobSize; ++i) {
-        masked_blob[i] = aida_payload::kAidaUnpackBlob[i] ^ key[i & 0xFFu];
+    std::vector<uint8_t> masked_blob(cfg.payload.size);
+    for (size_t i = 0; i < cfg.payload.size; ++i) {
+        masked_blob[i] = cfg.payload.data[i] ^ key[i & 0xFFu];
     }
 
     static const uint32_t kBaseCandidates[] = { 3, 1, 2, 6, 7, 8, 12, 13, 14 };
@@ -435,7 +435,7 @@ inline generated_stub_t generate(const stub_config_t& cfg) {
 
     a.lea(rKey, x86::ptr(lKey));
     a.lea(rPay, x86::ptr(lPayload));
-    a.mov(rCount, static_cast<int64_t>(aida_payload::kBlobSize));
+    a.mov(rCount, static_cast<int64_t>(cfg.payload.size));
 
     emit_opaque_predicate(a, rIdx, rng);
 
@@ -455,12 +455,12 @@ inline generated_stub_t generate(const stub_config_t& cfg) {
 
     a.mov(x86::rcx, x86::qword_ptr(x86::rsp, 0x20));
     a.lea(x86::rax, x86::ptr(lPayload));
-    a.add(x86::rax, static_cast<int32_t>(aida_payload::kEntryOffset));
+    a.add(x86::rax, static_cast<int32_t>(cfg.payload.entry_offset));
     a.call(x86::rax);
 
     a.lea(rKey, x86::ptr(lKey));
     a.lea(rPay, x86::ptr(lPayload));
-    a.mov(rCount, static_cast<int64_t>(aida_payload::kBlobSize));
+    a.mov(rCount, static_cast<int64_t>(cfg.payload.size));
 
     Label lMaskLoop = a.new_label();
     a.bind(lMaskLoop);
@@ -540,7 +540,7 @@ inline generated_stub_t generate(const stub_config_t& cfg) {
         x86::Gp rCount2 = x86::r10;
         ta.lea(rKey2, x86::ptr(lTlsKey));
         ta.lea(rPay2, x86::ptr(lTlsPayload));
-        ta.mov(rCount2, static_cast<int64_t>(aida_payload::kBlobSize));
+        ta.mov(rCount2, static_cast<int64_t>(cfg.payload.size));
 
         Label lTlsLoop = ta.new_label();
         ta.bind(lTlsLoop);
@@ -554,7 +554,7 @@ inline generated_stub_t generate(const stub_config_t& cfg) {
 
         ta.mov(x86::rcx, x86::r11);
         ta.lea(x86::rax, x86::ptr(lTlsPayload));
-        ta.add(x86::rax, static_cast<int32_t>(aida_payload::kEntryOffset));
+        ta.add(x86::rax, static_cast<int32_t>(cfg.payload.entry_offset));
         ta.call(x86::rax);
         ta.jmp(lTlsDone);
 

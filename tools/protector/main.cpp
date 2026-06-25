@@ -9,6 +9,7 @@
 #include "pe_file.hpp"
 #include "transforms.hpp"
 #include "stub.hpp"
+#include "payload_blob_base.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -70,6 +71,15 @@ struct config_t {
     bool     primary_host_provided   = false;
     bool     secondary_host_provided = false;
 };
+
+inline stub::payload_blob_view_t select_payload_blob() {
+    return stub::payload_blob_view_t{
+        aida_payload_base::kAidaUnpackBlob,
+        aida_payload_base::kBlobSize,
+        aida_payload_base::kEntryOffset,
+        "base"
+    };
+}
 
 static void print_usage(std::FILE* out) {
     std::fprintf(out,
@@ -1234,6 +1244,7 @@ inline int run(const config_t& cfg) {
     }
 
     const bool is_dll = (pe.file_header.Characteristics & IMAGE_FILE_DLL) != 0;
+    const stub::payload_blob_view_t payload_view = select_payload_blob();
 
     protector::protect_options_t opt{};
     opt.strip_rich = cfg.strip_rich;
@@ -1342,6 +1353,10 @@ inline int run(const config_t& cfg) {
         std::fprintf(stdout, "[+] Matryoshka pack layers: %u (%s)\n",
                      cfg.matryoshka_layers,
                      cfg.matryoshka_layers >= 3u ? "full triple stack" : "legacy single AES");
+        std::fprintf(stdout, "[+] Payload: payload_profile=%s blob_size=%zu entry_offset=0x%X\n",
+                     payload_view.profile,
+                     payload_view.size,
+                     payload_view.entry_offset);
     }
 
     const uint32_t reloc_rva = pe.data_directories[IMAGE_DIRECTORY_ENTRY_BASERELOC].rva;
@@ -1393,6 +1408,7 @@ inline int run(const config_t& cfg) {
     stub_cfg.stub_code_offset = result.layout.stub_offset;
     stub_cfg.seed = result.seed_used;
     stub_cfg.polymorphic = cfg.polymorphic_stub;
+    stub_cfg.payload = payload_view;
 
     stub::generated_stub_t gen;
     try {

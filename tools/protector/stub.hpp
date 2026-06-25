@@ -9,10 +9,10 @@
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
+#include <stdexcept>
 #include <vector>
 #include <array>
 #include <algorithm>
-#include "payload_blob.hpp"
 
 namespace stub {
 
@@ -29,6 +29,13 @@ struct rng_t {
     }
     uint32_t next32() { return static_cast<uint32_t>(next()); }
     uint8_t  next8()  { return static_cast<uint8_t>(next() & 0xFFu); }
+};
+
+struct payload_blob_view_t {
+    const std::uint8_t* data = nullptr;
+    std::size_t size = 0;
+    std::uint32_t entry_offset = 0;
+    const char* profile = "";
 };
 
 struct stub_config_t {
@@ -57,6 +64,7 @@ struct stub_config_t {
     uint32_t stub_code_offset;
     uint64_t seed;
     bool     polymorphic = false;
+    payload_blob_view_t payload;
 };
 
 struct generated_stub_t {
@@ -67,6 +75,12 @@ struct generated_stub_t {
     uint64_t build_nonce = 0;
     uint32_t stub_signature_tag = 0;
 };
+
+inline void validate_payload(const stub_config_t& cfg) {
+    if (cfg.payload.data == nullptr || cfg.payload.size == 0u || cfg.payload.entry_offset >= cfg.payload.size) {
+        throw std::runtime_error("invalid payload blob");
+    }
+}
 
 namespace reg {
     constexpr uint8_t RAX = 0;
@@ -341,6 +355,8 @@ inline void emit_tls_body(std::vector<uint8_t>& buf) {
 }
 
 inline generated_stub_t generate_legacy(const stub_config_t& cfg) {
+    validate_payload(cfg);
+
     generated_stub_t out{};
     out.main_stub_entry_offset = 0u;
     out.tls_stub_entry_offset = 0u;
@@ -348,7 +364,7 @@ inline generated_stub_t generate_legacy(const stub_config_t& cfg) {
     rng_t rng(cfg.seed ? cfg.seed : 0xA5A5A5A5A5A5A5A5ULL);
 
     std::vector<uint8_t>& m = out.main_stub;
-    m.reserve(8192u + aida_payload::kBlobSize);
+    m.reserve(8192u + cfg.payload.size);
 
     emit_prologue(m);
     emit::opaque_jz_jnz(m, rng);
@@ -364,7 +380,7 @@ inline generated_stub_t generate_legacy(const stub_config_t& cfg) {
     emit::lea_rip_relative(m, reg::RAX, 0);
     static constexpr uint8_t kAddRaxImm32[] = { 0x48, 0x05 };
     emit::raw(m, kAddRaxImm32, 2);
-    emit::put_u32(m, aida_payload::kEntryOffset);
+    emit::put_u32(m, cfg.payload.entry_offset);
     emit::call_reg(m, reg::RAX);
 
     size_t jmp_pos = m.size();
@@ -378,7 +394,7 @@ inline generated_stub_t generate_legacy(const stub_config_t& cfg) {
     int32_t lea_disp = static_cast<int32_t>(payload_start - (lea_pos + 7));
     std::memcpy(m.data() + lea_pos + 3, &lea_disp, 4);
 
-    emit::raw(m, aida_payload::kAidaUnpackBlob, aida_payload::kBlobSize);
+    emit::raw(m, cfg.payload.data, cfg.payload.size);
 
     size_t after_blob = m.size();
     int32_t jmp_disp = static_cast<int32_t>(after_blob - (jmp_pos + 5));
@@ -442,6 +458,7 @@ inline generated_stub_t generate_legacy(const stub_config_t& cfg) {
 namespace stub {
 
 inline generated_stub_t generate(const stub_config_t& cfg) {
+    validate_payload(cfg);
 #ifndef AIDA_PROTECTOR_LEGACY_STUB
     if (cfg.polymorphic) {
         return stub_poly::generate(cfg);

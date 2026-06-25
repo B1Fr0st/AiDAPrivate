@@ -56,6 +56,12 @@ struct state_t {
 	std::atomic<uint64_t> total_reads{0};
 	std::atomic<uint64_t> generation{0};
 	std::atomic<uint64_t> install_generation{0};
+	std::atomic<uint64_t> stop_request_tick_ms{0};
+	std::atomic<uint64_t> worker_cancel_tick_ms{0};
+	std::atomic<uint64_t> uninstall_begin_tick_ms{0};
+	std::atomic<uint64_t> uninstall_end_tick_ms{0};
+	std::atomic<uint64_t> worker_exit_tick_ms{0};
+	std::atomic<uint64_t> last_uninstall_elapsed_ms{0};
 	std::atomic<uint32_t> pg_session_id{0};
 	std::atomic<uint32_t> target_pid{0};
 	uint64_t target_address = 0;
@@ -80,9 +86,24 @@ struct idle_result_t {
 	size_t nodes = 0;
 	size_t events = 0;
 	uint64_t total_reads = 0;
+	uint64_t stop_request_tick_ms = 0;
+	uint64_t worker_cancel_tick_ms = 0;
+	uint64_t uninstall_begin_tick_ms = 0;
+	uint64_t uninstall_end_tick_ms = 0;
+	uint64_t worker_exit_tick_ms = 0;
+	uint64_t last_uninstall_elapsed_ms = 0;
+	uint64_t stop_to_cancel_ms = 0;
+	uint64_t stop_to_uninstall_begin_ms = 0;
+	uint64_t uninstall_ms = 0;
+	uint64_t stop_to_worker_exit_ms = 0;
 	int64_t elapsed_ms = 0;
 	std::string status_text;
 };
+
+inline uint64_t tick_delta_ms(uint64_t earlier, uint64_t later)
+{
+	return earlier != 0 && later >= earlier ? later - earlier : 0;
+}
 
 inline bool install_complete_for_generation(uint64_t generation)
 {
@@ -109,6 +130,16 @@ inline idle_result_t snapshot_idle_state(int64_t elapsed_ms = 0)
 	result.install_complete = g_state.install_complete.load(std::memory_order_acquire);
 	result.install_success = g_state.install_success.load(std::memory_order_acquire);
 	result.total_reads = g_state.total_reads.load(std::memory_order_acquire);
+	result.stop_request_tick_ms = g_state.stop_request_tick_ms.load(std::memory_order_acquire);
+	result.worker_cancel_tick_ms = g_state.worker_cancel_tick_ms.load(std::memory_order_acquire);
+	result.uninstall_begin_tick_ms = g_state.uninstall_begin_tick_ms.load(std::memory_order_acquire);
+	result.uninstall_end_tick_ms = g_state.uninstall_end_tick_ms.load(std::memory_order_acquire);
+	result.worker_exit_tick_ms = g_state.worker_exit_tick_ms.load(std::memory_order_acquire);
+	result.last_uninstall_elapsed_ms = g_state.last_uninstall_elapsed_ms.load(std::memory_order_acquire);
+	result.stop_to_cancel_ms = tick_delta_ms(result.stop_request_tick_ms, result.worker_cancel_tick_ms);
+	result.stop_to_uninstall_begin_ms = tick_delta_ms(result.stop_request_tick_ms, result.uninstall_begin_tick_ms);
+	result.uninstall_ms = tick_delta_ms(result.uninstall_begin_tick_ms, result.uninstall_end_tick_ms);
+	result.stop_to_worker_exit_ms = tick_delta_ms(result.stop_request_tick_ms, result.worker_exit_tick_ms);
 	result.idle = !result.hunting && !result.worker_active;
 	result.elapsed_ms = elapsed_ms;
 	{
@@ -439,6 +470,12 @@ inline bool start_hunt(uint64_t target_address, uint64_t target_size)
 	g_state.install_complete.store(false);
 	g_state.install_success.store(false);
 	g_state.total_reads.store(0);
+	g_state.stop_request_tick_ms.store(0, std::memory_order_release);
+	g_state.worker_cancel_tick_ms.store(0, std::memory_order_release);
+	g_state.uninstall_begin_tick_ms.store(0, std::memory_order_release);
+	g_state.uninstall_end_tick_ms.store(0, std::memory_order_release);
+	g_state.worker_exit_tick_ms.store(0, std::memory_order_release);
+	g_state.last_uninstall_elapsed_ms.store(0, std::memory_order_release);
 	g_state.target_address = target_address;
 	g_state.target_size = target_size;
 	g_state.target_pid.store(pid);
@@ -476,6 +513,7 @@ inline bool start_hunt(uint64_t target_address, uint64_t target_size)
 			g_state.install_complete.store(true);
 			g_state.worker_active.store(false);
 			g_state.hunting.store(false);
+			g_state.worker_exit_tick_ms.store(GetTickCount64(), std::memory_order_release);
 			return;
 		}
 
@@ -501,6 +539,7 @@ inline bool start_hunt(uint64_t target_address, uint64_t target_size)
 			g_state.install_complete.store(true);
 			g_state.worker_active.store(false);
 			g_state.hunting.store(false);
+			g_state.worker_exit_tick_ms.store(GetTickCount64(), std::memory_order_release);
 			return;
 		}
 
@@ -554,6 +593,8 @@ inline bool start_hunt(uint64_t target_address, uint64_t target_size)
 				static_cast<unsigned long long>(capture_total_before));
 			const bool cancel_seen = g_state.cancel.load(std::memory_order_acquire);
 			if (cancel_seen) {
+				uint64_t expected_tick = 0;
+				g_state.worker_cancel_tick_ms.compare_exchange_strong(expected_tick, GetTickCount64(), std::memory_order_acq_rel);
 				diag::log_tagged_fmt("integrity_hunter",
 					"worker_cancel_seen gen=%llu session=%u pending_captures=%zu total_before=%llu",
 					static_cast<unsigned long long>(generation),
@@ -626,6 +667,7 @@ inline bool start_hunt(uint64_t target_address, uint64_t target_size)
 			events_before_uninstall = g_state.event_log.size();
 		}
 		const auto uninstall_t0 = std::chrono::steady_clock::now();
+		g_state.uninstall_begin_tick_ms.store(GetTickCount64(), std::memory_order_release);
 		diag::log_tagged_fmt("integrity_hunter",
 			"uninstall_begin gen=%llu session=%u hunting=%d worker_active=%d cancel=%d install_complete=%d install_success=%d nodes=%zu events=%zu total_reads=%llu",
 			static_cast<unsigned long long>(generation),
@@ -641,6 +683,8 @@ inline bool start_hunt(uint64_t target_address, uint64_t target_size)
 		const bool uninstall_ok = page_guard_engine::g_pg_engine.uninstall(pg_session);
 		const auto uninstall_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
 			std::chrono::steady_clock::now() - uninstall_t0).count();
+		g_state.uninstall_end_tick_ms.store(GetTickCount64(), std::memory_order_release);
+		g_state.last_uninstall_elapsed_ms.store(static_cast<uint64_t>(uninstall_elapsed < 0 ? 0 : uninstall_elapsed), std::memory_order_release);
 		diag::log_tagged_fmt("integrity_hunter",
 			"uninstall_done gen=%llu session=%u ok=%d elapsed_ms=%lld hunting=%d worker_active=%d cancel=%d install_complete=%d install_success=%d",
 			static_cast<unsigned long long>(generation),
@@ -670,6 +714,7 @@ inline bool start_hunt(uint64_t target_address, uint64_t target_size)
 
 		g_state.worker_active.store(false);
 		g_state.hunting.store(false);
+		g_state.worker_exit_tick_ms.store(GetTickCount64(), std::memory_order_release);
 		diag::log_tagged_fmt("integrity_hunter",
 			"worker_state_cleared gen=%llu session=%u hunting=%d worker_active=%d cancel=%d install_complete=%d install_success=%d uninstall_ok=%d",
 			static_cast<unsigned long long>(generation),
@@ -735,13 +780,14 @@ inline void stop_hunt()
 {
 	size_t nodes = 0;
 	size_t events = 0;
+	const uint64_t stop_tick = GetTickCount64();
 	{
 		std::lock_guard<std::mutex> lk(g_state.mutex);
 		nodes = g_state.nodes.size();
 		events = g_state.event_log.size();
 	}
 	diag::log_tagged_fmt("integrity_hunter",
-		"stop_hunt_requested hunting=%d worker_active=%d install_complete=%d install_success=%d session=%u nodes=%zu events=%zu total_reads=%llu",
+		"stop_hunt_requested hunting=%d worker_active=%d install_complete=%d install_success=%d session=%u nodes=%zu events=%zu total_reads=%llu stop_tick_ms=%llu previous_worker_cancel_tick_ms=%llu previous_uninstall_begin_tick_ms=%llu previous_uninstall_end_tick_ms=%llu previous_worker_exit_tick_ms=%llu previous_uninstall_elapsed_ms=%llu",
 		g_state.hunting.load(std::memory_order_acquire) ? 1 : 0,
 		g_state.worker_active.load(std::memory_order_acquire) ? 1 : 0,
 		g_state.install_complete.load(std::memory_order_acquire) ? 1 : 0,
@@ -749,7 +795,14 @@ inline void stop_hunt()
 		g_state.pg_session_id.load(std::memory_order_acquire),
 		nodes,
 		events,
-		static_cast<unsigned long long>(g_state.total_reads.load(std::memory_order_acquire)));
+		static_cast<unsigned long long>(g_state.total_reads.load(std::memory_order_acquire)),
+		static_cast<unsigned long long>(stop_tick),
+		static_cast<unsigned long long>(g_state.worker_cancel_tick_ms.load(std::memory_order_acquire)),
+		static_cast<unsigned long long>(g_state.uninstall_begin_tick_ms.load(std::memory_order_acquire)),
+		static_cast<unsigned long long>(g_state.uninstall_end_tick_ms.load(std::memory_order_acquire)),
+		static_cast<unsigned long long>(g_state.worker_exit_tick_ms.load(std::memory_order_acquire)),
+		static_cast<unsigned long long>(g_state.last_uninstall_elapsed_ms.load(std::memory_order_acquire)));
+	g_state.stop_request_tick_ms.store(stop_tick, std::memory_order_release);
 	g_state.cancel.store(true);
 }
 
@@ -761,16 +814,22 @@ inline idle_result_t wait_until_idle_result(uint32_t timeout_ms)
 			const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
 				std::chrono::steady_clock::now() - start).count();
 			if (elapsed >= timeout_ms) {
+				auto result = snapshot_idle_state(static_cast<int64_t>(elapsed));
 				diag::log_tagged_fmt("integrity_hunter",
-					"wait_idle_timeout timeout_ms=%u elapsed_ms=%lld hunting=%d worker_active=%d install_complete=%d install_success=%d session=%u",
+					"wait_idle_timeout timeout_ms=%u elapsed_ms=%lld hunting=%d worker_active=%d install_complete=%d install_success=%d session=%u stop_to_cancel_ms=%llu stop_to_uninstall_begin_ms=%llu uninstall_ms=%llu stop_to_worker_exit_ms=%llu last_uninstall_elapsed_ms=%llu",
 					timeout_ms,
 					static_cast<long long>(elapsed),
-					g_state.hunting.load() ? 1 : 0,
-					g_state.worker_active.load() ? 1 : 0,
-					g_state.install_complete.load() ? 1 : 0,
-					g_state.install_success.load() ? 1 : 0,
-					g_state.pg_session_id.load());
-				return snapshot_idle_state(static_cast<int64_t>(elapsed));
+					result.hunting ? 1 : 0,
+					result.worker_active ? 1 : 0,
+					result.install_complete ? 1 : 0,
+					result.install_success ? 1 : 0,
+					result.session_id,
+					static_cast<unsigned long long>(result.stop_to_cancel_ms),
+					static_cast<unsigned long long>(result.stop_to_uninstall_begin_ms),
+					static_cast<unsigned long long>(result.uninstall_ms),
+					static_cast<unsigned long long>(result.stop_to_worker_exit_ms),
+					static_cast<unsigned long long>(result.last_uninstall_elapsed_ms));
+				return result;
 			}
 		}
 		std::this_thread::sleep_for(std::chrono::milliseconds(25));
@@ -779,7 +838,7 @@ inline idle_result_t wait_until_idle_result(uint32_t timeout_ms)
 		std::chrono::steady_clock::now() - start).count();
 	auto result = snapshot_idle_state(static_cast<int64_t>(elapsed));
 	diag::log_tagged_fmt("integrity_hunter",
-		"wait_idle_success timeout_ms=%u elapsed_ms=%lld hunting=%d worker_active=%d install_complete=%d install_success=%d session=%u nodes=%zu events=%zu total_reads=%llu",
+		"wait_idle_success timeout_ms=%u elapsed_ms=%lld hunting=%d worker_active=%d install_complete=%d install_success=%d session=%u nodes=%zu events=%zu total_reads=%llu stop_to_cancel_ms=%llu stop_to_uninstall_begin_ms=%llu uninstall_ms=%llu stop_to_worker_exit_ms=%llu last_uninstall_elapsed_ms=%llu",
 		timeout_ms,
 		static_cast<long long>(elapsed),
 		result.hunting ? 1 : 0,
@@ -789,7 +848,12 @@ inline idle_result_t wait_until_idle_result(uint32_t timeout_ms)
 		result.session_id,
 		result.nodes,
 		result.events,
-		static_cast<unsigned long long>(result.total_reads));
+		static_cast<unsigned long long>(result.total_reads),
+		static_cast<unsigned long long>(result.stop_to_cancel_ms),
+		static_cast<unsigned long long>(result.stop_to_uninstall_begin_ms),
+		static_cast<unsigned long long>(result.uninstall_ms),
+		static_cast<unsigned long long>(result.stop_to_worker_exit_ms),
+		static_cast<unsigned long long>(result.last_uninstall_elapsed_ms));
 	return result;
 }
 

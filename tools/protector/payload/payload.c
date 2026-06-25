@@ -208,6 +208,7 @@ APL_STATIC_ASSERT(resource_fixup_key, offsetof(resource_fixup_t, rolling_key) ==
 #define HASH_GETTICK64      0x228a6fe4178f3b37ULL
 #define HASH_OPENPROCESS    0x050d20e18d7fd1b6ULL
 #define HASH_QUERYFULLPROCESSIMAGENAMEW 0xb8858b47bc6d29e4ULL
+#define HASH_LIBZ3_DLL      0x0D92950913CC7E73ULL
 
 #define IMG_MAGIC           0x41504B44u
 #define IMG_VERSION_LEGACY  0x00020000u
@@ -2681,7 +2682,7 @@ static int rebuild_iat(uint8_t* image_base, const uint8_t master[32],
         if (mod == 0) {
             mod = find_module(e->dll_hash);
         }
-        if (mod == 0) {
+        if (mod == 0 && e->dll_hash != HASH_LIBZ3_DLL) {
             uint32_t off = 0;
             while (off + 1 < pool_size) {
                 size_t nl = 0;

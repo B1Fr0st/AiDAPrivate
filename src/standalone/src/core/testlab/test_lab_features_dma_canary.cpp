@@ -154,30 +154,74 @@ namespace {
 			return;
 		}
 
-		std::uint32_t canary_count = 0;
-		bool ok = device->canary_query_count(canary_count);
+		const std::uint32_t current_pid = static_cast<std::uint32_t>(GetCurrentProcessId());
+		bool heartbeat_ok = device->send_heartbeat();
+		std::uint32_t baseline_count = 0;
+		bool baseline_ok = device->canary_query_count(baseline_count);
+		void* page = canary_fixture_page();
+		const std::uint64_t register_va = reinterpret_cast<std::uint64_t>(page);
+		const std::uint64_t register_size = page ? 0x1000ULL : 0ULL;
+		bool register_ok = heartbeat_ok && page && device->canary_register_for_pid(register_va, register_size, current_pid);
+		std::uint32_t after_count = 0;
+		bool after_ok = device->canary_query_count(after_count);
+		const std::uint32_t delta = after_ok && baseline_ok && after_count >= baseline_count ? after_count - baseline_count : 0u;
 
 		voyager::detail::canary_register_request synthetic{};
-		synthetic.va = 0;
-		synthetic.size = 0;
-		synthetic.pid = static_cast<std::uint32_t>(GetCurrentProcessId());
-		synthetic.result = ok ? canary_count : 0u;
+		synthetic.va = register_va;
+		synthetic.size = register_size;
+		synthetic.pid = current_pid;
+		synthetic.result = after_ok ? after_count : 0u;
 		r.raw.resize(sizeof(synthetic));
 		std::memcpy(r.raw.data(), &synthetic, sizeof(synthetic));
 		r.bytes_returned = static_cast<std::uint32_t>(sizeof(synthetic));
 
-		if (!ok) {
-			r.ntstatus = static_cast<std::int32_t>(0xC0000022u);
-			r.error = "canary_query_count wrapper returned false (driver rejected query)";
+		r.parsed.push_back({ "via", "device->canary_query_count()+controlled canary_register_for_pid() (public wrappers)" });
+		r.parsed.push_back({ "heartbeat_before_register", heartbeat_ok ? "true" : "false" });
+		r.parsed.push_back({ "baseline_query_ok", baseline_ok ? "true" : "false" });
+		r.parsed.push_back({ "controlled_register_ok", register_ok ? "true" : "false" });
+		r.parsed.push_back({ "after_query_ok", after_ok ? "true" : "false" });
+		r.parsed.push_back({ "baseline_count", std::to_string(baseline_count) });
+		r.parsed.push_back({ "after_count", std::to_string(after_count) });
+		r.parsed.push_back({ "delta_count", std::to_string(delta) });
+		r.parsed.push_back({ "target_pid", std::to_string(current_pid) });
+		r.parsed.push_back({ "controlled_va", hex_u64(register_va) });
+		r.parsed.push_back({ "controlled_size", std::to_string(register_size) });
+		r.parsed.push_back({ "raw_struct_size", std::to_string(sizeof(synthetic)) });
+		r.parsed.push_back({ "canary_count", std::to_string(after_count) });
+
+		if (!heartbeat_ok) {
+			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
+			r.error = "send_heartbeat failed before controlled CANQ registration";
 			r.ok = false;
-			r.parsed.push_back({ "via", "device->canary_query_count()" });
+			return;
+		}
+		if (!baseline_ok) {
+			r.ntstatus = static_cast<std::int32_t>(0xC0000022u);
+			r.error = "baseline canary_query_count wrapper returned false";
+			r.ok = false;
+			return;
+		}
+		if (!page || !register_ok) {
+			r.ntstatus = static_cast<std::int32_t>(0xC0000022u);
+			r.error = page ? "controlled canary_register_for_pid wrapper returned false" : "failed to allocate controlled canary fixture page";
+			r.ok = false;
+			return;
+		}
+		if (!after_ok) {
+			r.ntstatus = static_cast<std::int32_t>(0xC0000022u);
+			r.error = "post-register canary_query_count wrapper returned false";
+			r.ok = false;
+			return;
+		}
+		if (after_count < baseline_count) {
+			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
+			r.error = "post-register canary count regressed below baseline";
+			r.ok = false;
 			return;
 		}
 
 		r.ntstatus = 0;
 		r.ok = true;
-		r.parsed.push_back({ "via", "device->canary_query_count() (public wrapper)" });
-		r.parsed.push_back({ "canary_count", std::to_string(canary_count) });
 	}
 
 }

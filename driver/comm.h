@@ -220,45 +220,193 @@ namespace hwid_kernel_proto {
 namespace voyager {
     namespace detail {
 
+        struct raw_ioctl_telemetry {
+            std::uint32_t requested_code = 0;
+            std::uint32_t effective_code = 0;
+            std::uint32_t decoded_offset = 0;
+            std::uint32_t decoded_offset_valid = 0;
+            std::uint32_t buffer_size = 0;
+            std::uint32_t bytes_returned = 0;
+            std::uint32_t gle = 0;
+            std::uint32_t initial_bytes_returned = 0;
+            std::uint32_t initial_gle = 0;
+            std::uint32_t retry_bytes_returned = 0;
+            std::uint32_t retry_gle = 0;
+            std::uint32_t pre_base = 0;
+            std::uint32_t pre_global_base = 0;
+            std::uint32_t pre_key_hash = 0;
+            std::uint32_t pre_global_key_hash = 0;
+            std::uint32_t pre_ioctl_seed_hash = 0;
+            std::uint32_t pre_global_ioctl_seed_hash = 0;
+            std::uint32_t post_base = 0;
+            std::uint32_t post_global_base = 0;
+            std::uint32_t post_key_hash = 0;
+            std::uint32_t post_global_key_hash = 0;
+            std::uint32_t post_ioctl_seed_hash = 0;
+            std::uint32_t post_global_ioctl_seed_hash = 0;
+            std::uint32_t retry_base = 0;
+            std::uint32_t retry_global_base = 0;
+            std::uint32_t retry_key_hash = 0;
+            std::uint32_t retry_global_key_hash = 0;
+            std::uint32_t retry_ioctl_seed_hash = 0;
+            std::uint32_t retry_global_ioctl_seed_hash = 0;
+            std::uint32_t retry_effective_code = 0;
+            std::uint32_t retry_attempted = 0;
+            std::uint32_t retry_recomputed_changed = 0;
+            std::uint32_t retry_reason = 0;
+            std::uint32_t retry_ok = 0;
+            std::uint32_t heartbeat_attempted = 0;
+            std::uint32_t heartbeat_ok = 0;
+            std::uint32_t heartbeat_ioctl = 0;
+            std::uint32_t heartbeat_bytes = 0;
+            std::uint32_t heartbeat_gle = 0;
+            std::uint64_t heartbeat_response = 0;
+            std::uint64_t elapsed_ms = 0;
+            std::uint64_t initial_elapsed_ms = 0;
+            std::uint64_t retry_elapsed_ms = 0;
+            std::uint64_t heartbeat_tsc = 0;
+            std::uint64_t whoswho_tsc = 0;
+            std::uint64_t sentinel_tsc = 0;
+            std::uint32_t local_pid = 0;
+            std::uint32_t local_tid = 0;
+            std::uint32_t attached_pid = 0;
+            std::uint32_t req_pid = 0;
+            std::uint32_t req_tid = 0;
+            std::uint32_t connected = 0;
+            std::uint32_t server_seed_present = 0;
+            std::uint32_t ioctl_seed_present = 0;
+            std::uint32_t global_server_seed_present_pre = 0;
+            std::uint32_t global_ioctl_seed_present_pre = 0;
+            std::uint32_t global_server_seed_present_post = 0;
+            std::uint32_t global_ioctl_seed_present_post = 0;
+            std::uint64_t handle_value = 0;
+        };
+
+        __forceinline bool decode_ioctl_offset_from_base(DWORD control_code,
+                                                         std::uint32_t base,
+                                                         std::uint32_t& offset) noexcept {
+            if ((control_code & 0xFFFF0000u) != 0x00220000u)
+                return false;
+            const std::uint32_t encoded = (control_code & 0x0000FFFFu) >> 2;
+            if (encoded < base)
+                return false;
+            const std::uint32_t candidate = encoded - base;
+            if (candidate > 62u)
+                return false;
+            offset = candidate;
+            return true;
+        }
+
+        __forceinline void append_ioctl_raw_debug_log(const char* msg) noexcept {
+            if (msg == nullptr || msg[0] == '\0')
+                return;
+            char module[MAX_PATH] = {};
+            const DWORD module_len = GetModuleFileNameA(nullptr, module, static_cast<DWORD>(sizeof(module)));
+            if (module_len == 0 || module_len >= sizeof(module))
+                return;
+            char* slash = std::strrchr(module, '\\');
+            if (slash == nullptr)
+                return;
+            *(slash + 1) = '\0';
+            char path[MAX_PATH] = {};
+            _snprintf_s(path, sizeof(path), _TRUNCATE, "%saida_debug.log", module);
+            HANDLE file = CreateFileA(path,
+                FILE_APPEND_DATA,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                nullptr,
+                OPEN_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL,
+                nullptr);
+            if (file == INVALID_HANDLE_VALUE)
+                return;
+            SYSTEMTIME st{};
+            GetLocalTime(&st);
+            char line[4352];
+            const int len = _snprintf_s(line, sizeof(line), _TRUNCATE,
+                "[%02u:%02u:%02u.%03u] [comm-raw] %s\r\n",
+                static_cast<unsigned>(st.wHour),
+                static_cast<unsigned>(st.wMinute),
+                static_cast<unsigned>(st.wSecond),
+                static_cast<unsigned>(st.wMilliseconds),
+                msg);
+            if (len > 0) {
+                DWORD written = 0;
+                WriteFile(file, line, static_cast<DWORD>(len), &written, nullptr);
+            }
+            CloseHandle(file);
+        }
+
         __forceinline std::uint32_t get_heartbeat_magic() {
             return 0xDEADBEEFu ^ dynamic_key::get();
         }
         __forceinline void debug_ioctl_raw_log(const char* phase,
-                                               std::uint32_t ioctl_code,
-                                               std::uint32_t effective_ioctl_code,
-                                               std::uint32_t decoded_offset,
-                                               std::uint32_t decoded_offset_valid,
-                                               std::uint32_t buffer_size,
-                                               DWORD bytes_returned,
-                                               DWORD gle,
-                                               HANDLE handle,
-                                               std::uint32_t pid,
-                                               std::uint32_t req_pid,
-                                               std::uint32_t req_tid,
-                                               std::uint32_t server_seed_present,
-                                               std::uint32_t ioctl_seed_present,
-                                               std::uint32_t ioctl_seed_hash,
-                                               DWORD elapsed_ms) noexcept {
-            char buf[1024];
+                                               const raw_ioctl_telemetry& t) noexcept {
+            char buf[4096];
             _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-                "[AIDA-IOCTL-RAW] %s requested=0x%08X effective=0x%08X offset=%u offset_valid=%u size=%u bytes=%lu gle=%lu handle=0x%llX attached_pid=%u req_pid=%u req_tid=%u server_seed=%u ioctl_seed=%u ioctl_seed_hash=0x%08X elapsed_ms=%lu\n",
+                "[AIDA-IOCTL-RAW] %s requested=0x%08X effective=0x%08X offset=%u offset_valid=%u size=%u bytes=%u gle=%u initial_bytes=%u initial_gle=%u retry_attempted=%u retry_changed=%u retry_reason=%u retry_ok=%u retry_effective=0x%08X retry_bytes=%u retry_gle=%u pre_base=0x%04X pre_global_base=0x%04X post_base=0x%04X post_global_base=0x%04X retry_base=0x%04X retry_global_base=0x%04X pre_key_hash=0x%08X pre_global_key_hash=0x%08X post_key_hash=0x%08X post_global_key_hash=0x%08X retry_key_hash=0x%08X retry_global_key_hash=0x%08X pre_ioctl_seed_hash=0x%08X pre_global_ioctl_seed_hash=0x%08X post_ioctl_seed_hash=0x%08X post_global_ioctl_seed_hash=0x%08X retry_ioctl_seed_hash=0x%08X retry_global_ioctl_seed_hash=0x%08X connected=%u handle=0x%llX attached_pid=%u req_pid=%u req_tid=%u local_pid=%u local_tid=%u server_seed=%u ioctl_seed=%u glob_seed_pre=%u/%u glob_seed_post=%u/%u hb_attempted=%u hb_ok=%u hb_ioctl=0x%08X hb_bytes=%u hb_gle=%u hb_response=0x%llX hb_tsc=%llu whoswho_tsc=%llu sentinel_tsc=%llu elapsed_ms=%llu initial_elapsed_ms=%llu retry_elapsed_ms=%llu",
                 phase ? phase : "?",
-                ioctl_code,
-                effective_ioctl_code,
-                decoded_offset,
-                decoded_offset_valid,
-                buffer_size,
-                static_cast<unsigned long>(bytes_returned),
-                static_cast<unsigned long>(gle),
-                reinterpret_cast<unsigned long long>(handle),
-                pid,
-                req_pid,
-                req_tid,
-                server_seed_present,
-                ioctl_seed_present,
-                ioctl_seed_hash,
-                static_cast<unsigned long>(elapsed_ms));
+                t.requested_code,
+                t.effective_code,
+                t.decoded_offset,
+                t.decoded_offset_valid,
+                t.buffer_size,
+                t.bytes_returned,
+                t.gle,
+                t.initial_bytes_returned,
+                t.initial_gle,
+                t.retry_attempted,
+                t.retry_recomputed_changed,
+                t.retry_reason,
+                t.retry_ok,
+                t.retry_effective_code,
+                t.retry_bytes_returned,
+                t.retry_gle,
+                t.pre_base,
+                t.pre_global_base,
+                t.post_base,
+                t.post_global_base,
+                t.retry_base,
+                t.retry_global_base,
+                t.pre_key_hash,
+                t.pre_global_key_hash,
+                t.post_key_hash,
+                t.post_global_key_hash,
+                t.retry_key_hash,
+                t.retry_global_key_hash,
+                t.pre_ioctl_seed_hash,
+                t.pre_global_ioctl_seed_hash,
+                t.post_ioctl_seed_hash,
+                t.post_global_ioctl_seed_hash,
+                t.retry_ioctl_seed_hash,
+                t.retry_global_ioctl_seed_hash,
+                t.connected,
+                static_cast<unsigned long long>(t.handle_value),
+                t.attached_pid,
+                t.req_pid,
+                t.req_tid,
+                t.local_pid,
+                t.local_tid,
+                t.server_seed_present,
+                t.ioctl_seed_present,
+                t.global_server_seed_present_pre,
+                t.global_ioctl_seed_present_pre,
+                t.global_server_seed_present_post,
+                t.global_ioctl_seed_present_post,
+                t.heartbeat_attempted,
+                t.heartbeat_ok,
+                t.heartbeat_ioctl,
+                t.heartbeat_bytes,
+                t.heartbeat_gle,
+                static_cast<unsigned long long>(t.heartbeat_response),
+                static_cast<unsigned long long>(t.heartbeat_tsc),
+                static_cast<unsigned long long>(t.whoswho_tsc),
+                static_cast<unsigned long long>(t.sentinel_tsc),
+                static_cast<unsigned long long>(t.elapsed_ms),
+                static_cast<unsigned long long>(t.initial_elapsed_ms),
+                static_cast<unsigned long long>(t.retry_elapsed_ms));
             OutputDebugStringA(buf);
+            OutputDebugStringA("\n");
+            append_ioctl_raw_debug_log(buf);
         }
         constexpr std::uint64_t HEARTBEAT_REFRESH_INTERVAL = 200000000ULL;
 
@@ -1891,72 +2039,195 @@ namespace voyager {
                             std::uint32_t buffer_size,
                             std::uint32_t& bytes_returned) const noexcept {
             bytes_returned = 0;
-            std::uint32_t req_pid = 0;
-            std::uint32_t req_tid = 0;
+            detail::raw_ioctl_telemetry trace{};
+            trace.requested_code = ioctl_code;
+            trace.buffer_size = buffer_size;
+            trace.local_pid = static_cast<std::uint32_t>(GetCurrentProcessId());
+            trace.local_tid = static_cast<std::uint32_t>(GetCurrentThreadId());
+            trace.attached_pid = process_id_;
+            trace.connected = is_connected() ? 1u : 0u;
+            trace.handle_value = reinterpret_cast<std::uint64_t>(driver_handle_);
+            trace.server_seed_present = server_seed_ != 0 ? 1u : 0u;
+            trace.ioctl_seed_present = server_ioctl_seed_ != 0 ? 1u : 0u;
+            trace.global_server_seed_present_pre = dynamic_key::g_server_seed != 0 ? 1u : 0u;
+            trace.global_ioctl_seed_present_pre = ioctl_codes::g_server_ioctl_seed != 0 ? 1u : 0u;
+            trace.pre_base = compute_ioctl_base_snapshot();
+            trace.pre_global_base = ioctl_codes::get_base();
+            trace.pre_key_hash = hash_build_key(compute_dynamic_key_snapshot());
+            trace.pre_global_key_hash = hash_build_key(dynamic_key::get());
+            trace.pre_ioctl_seed_hash = server_ioctl_seed_ != 0 ? hash_build_key(server_ioctl_seed_) : 0u;
+            trace.pre_global_ioctl_seed_hash = ioctl_codes::g_server_ioctl_seed != 0 ? hash_build_key(ioctl_codes::g_server_ioctl_seed) : 0u;
+            trace.heartbeat_tsc = last_heartbeat_tsc_;
+            trace.whoswho_tsc = last_bridge_whoswho_tsc_;
+            trace.sentinel_tsc = last_bridge_sentinel_tsc_;
             if (in_out_buffer != nullptr && buffer_size >= sizeof(std::uint32_t)) {
-                std::memcpy(&req_pid, in_out_buffer, sizeof(req_pid));
+                std::memcpy(&trace.req_pid, in_out_buffer, sizeof(trace.req_pid));
             }
             if (in_out_buffer != nullptr && buffer_size >= sizeof(std::uint32_t) * 2u) {
-                std::memcpy(&req_tid, static_cast<const std::uint8_t*>(in_out_buffer) + sizeof(std::uint32_t), sizeof(req_tid));
+                std::memcpy(&trace.req_tid, static_cast<const std::uint8_t*>(in_out_buffer) + sizeof(std::uint32_t), sizeof(trace.req_tid));
             }
-            sync_dynamic_security_state();
             std::uint32_t decoded_offset = 0;
-            const bool decoded_offset_valid = decode_ioctl_offset_snapshot(static_cast<DWORD>(ioctl_code), decoded_offset);
-            const DWORD effective_ioctl_code = decoded_offset_valid
+            bool decoded_offset_valid = detail::decode_ioctl_offset_from_base(static_cast<DWORD>(ioctl_code), trace.pre_global_base, decoded_offset);
+            if (!decoded_offset_valid)
+                decoded_offset_valid = detail::decode_ioctl_offset_from_base(static_cast<DWORD>(ioctl_code), trace.pre_base, decoded_offset);
+            trace.decoded_offset = decoded_offset;
+            trace.decoded_offset_valid = decoded_offset_valid ? 1u : 0u;
+            detail::debug_ioctl_raw_log("ENTRY", trace);
+
+            sync_dynamic_security_state();
+            trace.post_base = compute_ioctl_base_snapshot();
+            trace.post_global_base = ioctl_codes::get_base();
+            trace.post_key_hash = hash_build_key(compute_dynamic_key_snapshot());
+            trace.post_global_key_hash = hash_build_key(dynamic_key::get());
+            trace.post_ioctl_seed_hash = server_ioctl_seed_ != 0 ? hash_build_key(server_ioctl_seed_) : 0u;
+            trace.post_global_ioctl_seed_hash = ioctl_codes::g_server_ioctl_seed != 0 ? hash_build_key(ioctl_codes::g_server_ioctl_seed) : 0u;
+            trace.global_server_seed_present_post = dynamic_key::g_server_seed != 0 ? 1u : 0u;
+            trace.global_ioctl_seed_present_post = ioctl_codes::g_server_ioctl_seed != 0 ? 1u : 0u;
+            DWORD effective_ioctl_code = decoded_offset_valid
                 ? make_ioctl_snapshot(decoded_offset)
                 : static_cast<DWORD>(ioctl_code);
+            trace.effective_code = effective_ioctl_code;
+            detail::debug_ioctl_raw_log("POST_SYNC", trace);
+
             if (!is_connected() || in_out_buffer == nullptr || buffer_size == 0) {
-                detail::debug_ioctl_raw_log("REJECT",
-                    ioctl_code,
-                    effective_ioctl_code,
-                    decoded_offset,
-                    decoded_offset_valid ? 1u : 0u,
-                    buffer_size,
-                    0,
-                    GetLastError(),
-                    driver_handle_,
-                    process_id_,
-                    req_pid,
-                    req_tid,
-                    server_seed_ != 0 ? 1u : 0u,
-                    server_ioctl_seed_ != 0 ? 1u : 0u,
-                    server_ioctl_seed_ != 0 ? hash_build_key(server_ioctl_seed_) : 0u,
-                    0);
+                const DWORD reject_error = !is_connected() ? ERROR_INVALID_HANDLE : ERROR_INVALID_PARAMETER;
+                trace.gle = reject_error;
+                trace.connected = is_connected() ? 1u : 0u;
+                last_raw_ioctl_ = trace;
+                SetLastError(reject_error);
+                detail::debug_ioctl_raw_log("REJECT", trace);
                 return false;
             }
-            DWORD br = 0;
-            const DWORD start_tick = GetTickCount();
-            BOOL ok = DeviceIoControl(
-                driver_handle_,
-                effective_ioctl_code,
-                in_out_buffer,
-                static_cast<DWORD>(buffer_size),
-                in_out_buffer,
-                static_cast<DWORD>(buffer_size),
-                &br,
-                nullptr
-            );
-            bytes_returned = static_cast<std::uint32_t>(br);
-            DWORD gle = ok ? 0 : GetLastError();
-            DWORD elapsed = GetTickCount() - start_tick;
-            if (!ok || br == 0 || elapsed > 250) {
-                detail::debug_ioctl_raw_log(ok ? "OK_SUSPICIOUS" : "FAILED",
-                    ioctl_code,
-                    effective_ioctl_code,
-                    decoded_offset,
-                    decoded_offset_valid ? 1u : 0u,
-                    buffer_size,
-                    br,
-                    gle,
+
+            auto send_raw_once = [&](DWORD code, DWORD& out_bytes, DWORD& out_error, std::uint64_t& out_elapsed) noexcept -> BOOL {
+                out_bytes = 0;
+                out_error = ERROR_SUCCESS;
+                const ULONGLONG start_tick = GetTickCount64();
+                SetLastError(ERROR_SUCCESS);
+                BOOL result = DeviceIoControl(
                     driver_handle_,
-                    process_id_,
-                    req_pid,
-                    req_tid,
-                    server_seed_ != 0 ? 1u : 0u,
-                    server_ioctl_seed_ != 0 ? 1u : 0u,
-                    server_ioctl_seed_ != 0 ? hash_build_key(server_ioctl_seed_) : 0u,
-                    elapsed);
+                    code,
+                    in_out_buffer,
+                    static_cast<DWORD>(buffer_size),
+                    in_out_buffer,
+                    static_cast<DWORD>(buffer_size),
+                    &out_bytes,
+                    nullptr
+                );
+                out_error = result ? ERROR_SUCCESS : GetLastError();
+                out_elapsed = static_cast<std::uint64_t>(GetTickCount64() - start_tick);
+                return result;
+            };
+
+            auto refresh_current_seed_heartbeat = [&]() noexcept -> bool {
+                trace.heartbeat_attempted = 1u;
+                sync_dynamic_security_state();
+                detail::heartbeat_request hb{};
+                hb.magic = heartbeat_magic_snapshot();
+                hb.session_key = session_key_;
+                hb.timestamp = __rdtsc();
+                hb.response = 0;
+                const DWORD hb_ioctl = make_ioctl_snapshot(8);
+                trace.heartbeat_ioctl = hb_ioctl;
+                capture_heartbeat_security_snapshot(8, hb_ioctl, hb.magic);
+                DWORD hb_bytes = 0;
+                SetLastError(ERROR_SUCCESS);
+                BOOL hb_result = DeviceIoControl(
+                    driver_handle_,
+                    hb_ioctl,
+                    &hb,
+                    sizeof(hb),
+                    &hb,
+                    sizeof(hb),
+                    &hb_bytes,
+                    nullptr
+                );
+                DWORD hb_error = hb_result ? ERROR_SUCCESS : GetLastError();
+                const bool hb_ok = hb_result && hb_bytes >= sizeof(hb) && hb.response != 0;
+                if (!hb_ok && hb_error == ERROR_SUCCESS) {
+                    if (hb_result && hb_bytes < sizeof(hb))
+                        hb_error = ERROR_MORE_DATA;
+                    else if (hb_result && hb.response == 0)
+                        hb_error = ERROR_ACCESS_DENIED;
+                    else
+                        hb_error = ERROR_GEN_FAILURE;
+                }
+                last_heartbeat_dioctl_result_ = hb_result;
+                last_heartbeat_bytes_ = hb_bytes;
+                last_heartbeat_response_ = hb.response;
+                last_heartbeat_error_ = hb_ok ? 0 : hb_error;
+                capture_heartbeat_security_snapshot(8, hb_ioctl, hb.magic);
+                if (hb_ok) {
+                    last_heartbeat_tsc_ = __rdtsc();
+                    last_bridge_whoswho_tsc_ = hb.whoswho_tsc;
+                    last_bridge_sentinel_tsc_ = hb.sentinel_tsc;
+                    if (hb.sentinel_tsc != 0 && first_sentinel_ready_tsc_ == 0)
+                        first_sentinel_ready_tsc_ = hb.sentinel_tsc;
+                }
+                trace.heartbeat_ok = hb_ok ? 1u : 0u;
+                trace.heartbeat_bytes = static_cast<std::uint32_t>(hb_bytes);
+                trace.heartbeat_gle = hb_error;
+                trace.heartbeat_response = hb.response;
+                trace.heartbeat_tsc = last_heartbeat_tsc_;
+                trace.whoswho_tsc = last_bridge_whoswho_tsc_;
+                trace.sentinel_tsc = last_bridge_sentinel_tsc_;
+                return hb_ok;
+            };
+
+            DWORD br = 0;
+            DWORD gle = ERROR_SUCCESS;
+            std::uint64_t elapsed = 0;
+            BOOL ok = send_raw_once(effective_ioctl_code, br, gle, elapsed);
+            trace.initial_bytes_returned = static_cast<std::uint32_t>(br);
+            trace.initial_gle = gle;
+            trace.initial_elapsed_ms = elapsed;
+            trace.bytes_returned = static_cast<std::uint32_t>(br);
+            trace.gle = gle;
+            trace.elapsed_ms = elapsed;
+            bytes_returned = static_cast<std::uint32_t>(br);
+
+            const bool invalid_function = !ok && gle == ERROR_INVALID_FUNCTION;
+            const bool zero_byte_dynamic = ok && br == 0 && decoded_offset_valid;
+            if (decoded_offset_valid && (invalid_function || zero_byte_dynamic)) {
+                trace.retry_reason = invalid_function ? ERROR_INVALID_FUNCTION : ERROR_MORE_DATA;
+                refresh_current_seed_heartbeat();
+                sync_dynamic_security_state();
+                trace.retry_base = compute_ioctl_base_snapshot();
+                trace.retry_global_base = ioctl_codes::get_base();
+                trace.retry_key_hash = hash_build_key(compute_dynamic_key_snapshot());
+                trace.retry_global_key_hash = hash_build_key(dynamic_key::get());
+                trace.retry_ioctl_seed_hash = server_ioctl_seed_ != 0 ? hash_build_key(server_ioctl_seed_) : 0u;
+                trace.retry_global_ioctl_seed_hash = ioctl_codes::g_server_ioctl_seed != 0 ? hash_build_key(ioctl_codes::g_server_ioctl_seed) : 0u;
+                const DWORD retry_ioctl_code = make_ioctl_snapshot(decoded_offset);
+                trace.retry_effective_code = retry_ioctl_code;
+                trace.retry_recomputed_changed = retry_ioctl_code != effective_ioctl_code ? 1u : 0u;
+                if (retry_ioctl_code != effective_ioctl_code) {
+                    trace.retry_attempted = 1u;
+                    DWORD retry_br = 0;
+                    DWORD retry_gle = ERROR_SUCCESS;
+                    std::uint64_t retry_elapsed = 0;
+                    BOOL retry_ok = send_raw_once(retry_ioctl_code, retry_br, retry_gle, retry_elapsed);
+                    trace.retry_ok = retry_ok ? 1u : 0u;
+                    trace.retry_bytes_returned = static_cast<std::uint32_t>(retry_br);
+                    trace.retry_gle = retry_gle;
+                    trace.retry_elapsed_ms = retry_elapsed;
+                    ok = retry_ok;
+                    br = retry_br;
+                    gle = retry_gle;
+                    elapsed += retry_elapsed;
+                    effective_ioctl_code = retry_ioctl_code;
+                    trace.effective_code = effective_ioctl_code;
+                    trace.bytes_returned = static_cast<std::uint32_t>(br);
+                    trace.gle = gle;
+                    trace.elapsed_ms = elapsed;
+                    bytes_returned = static_cast<std::uint32_t>(br);
+                }
+                detail::debug_ioctl_raw_log(trace.retry_attempted ? "RETRY" : "RETRY_SKIPPED", trace);
             }
+            last_raw_ioctl_ = trace;
+            detail::debug_ioctl_raw_log((ok && br != 0 && elapsed <= 250) ? "OK" : (ok ? "OK_SUSPICIOUS" : "FAILED"), trace);
+            if (!ok)
+                SetLastError(gle);
             return ok != FALSE;
         }
 
@@ -1979,6 +2250,7 @@ namespace voyager {
         [[nodiscard]] std::uint32_t get_last_heartbeat_global_server_seed_present() const noexcept { return last_heartbeat_global_server_seed_present_; }
         [[nodiscard]] std::uint32_t get_last_heartbeat_global_ioctl_seed_present() const noexcept { return last_heartbeat_global_ioctl_seed_present_; }
         [[nodiscard]] std::uint32_t get_last_heartbeat_offset() const noexcept { return last_heartbeat_offset_; }
+        [[nodiscard]] detail::raw_ioctl_telemetry get_last_raw_ioctl_telemetry() const noexcept { return last_raw_ioctl_; }
         [[nodiscard]] bool has_server_seed() const noexcept { return server_seed_ != 0; }
         [[nodiscard]] bool has_server_ioctl_seed() const noexcept { return server_ioctl_seed_ != 0; }
         [[nodiscard]] std::uint32_t get_server_ioctl_seed_hash() const noexcept { return server_ioctl_seed_ != 0 ? hash_build_key(server_ioctl_seed_) : 0; }
@@ -2034,6 +2306,7 @@ namespace voyager {
         mutable std::uint32_t last_heartbeat_global_server_seed_present_ = 0;
         mutable std::uint32_t last_heartbeat_global_ioctl_seed_present_ = 0;
         mutable std::uint32_t last_heartbeat_offset_ = 0;
+        mutable detail::raw_ioctl_telemetry last_raw_ioctl_{};
 
 
         std::uint64_t ntdll_base_ = 0;

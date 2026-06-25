@@ -737,7 +737,7 @@ set(CAPSTONE_LIBRARIES "capstone" CACHE STRING "" FORCE)
 # --- Triton (symbolic execution engine) ---
 set(BUILD_SHARED_LIBS_SAVED_TRITON "${BUILD_SHARED_LIBS}")
 set(BUILD_SHARED_LIBS OFF)
-set(Z3_INTERFACE ON CACHE BOOL "" FORCE)
+set(Z3_INTERFACE OFF CACHE BOOL "" FORCE)
 set(BITWUZLA_INTERFACE OFF CACHE BOOL "" FORCE)
 set(LLVM_INTERFACE OFF CACHE BOOL "" FORCE)
 set(BOOST_INTERFACE OFF CACHE BOOL "" FORCE)
@@ -1608,9 +1608,6 @@ if(WIN32)
         set_source_files_properties(${STANDALONE_ASM} PROPERTIES LANGUAGE ASM_MASM)
         add_library(AiDAStandalone_asm OBJECT ${STANDALONE_ASM})
 
-        # --- Embedded resources (libz3.dll + ghidra specs) ---
-        set(Z3_DLL_PATH "${Z3_INSTALL_DIR}/bin/libz3.dll")
-
         configure_file(
             "${STANDALONE_ROOT}/resources/aida_embedded.rc.in"
             "${CMAKE_BINARY_DIR}/aida_embedded.rc"
@@ -1734,7 +1731,6 @@ if(WIN32)
             "${CMAKE_CURRENT_SOURCE_DIR}/mapper/src"
             "${TRITON_SOURCE_DIR}/src/libtriton/includes"
             "${CMAKE_BINARY_DIR}/.deps/triton/src/libtriton/includes"
-            "${Z3_INCLUDE_DIRS}"
             "${GHIDRA_DECOMP_DIR}"
             "${DEPS_DIR}/sqlite-amalgamation-3530000"
         )
@@ -1750,7 +1746,6 @@ if(WIN32)
             UNICODE
             _UNICODE
             SOL_ALL_SAFETIES_ON=1
-            TRITON_Z3_INTERFACE
             GHIDRA_SPECS_DIR=${GHIDRA_SPECS_OUTPUT_DIR}
             AIDA_DEEP_STEAL=1
             AIDA_STANDALONE
@@ -1876,12 +1871,10 @@ if(WIN32)
             /NODEFAULTLIB:d3dcompiler
             /IGNORE:4099
             "/MANIFESTUAC:level='requireAdministrator' uiAccess='false'"
-            /DELAYLOAD:libz3.dll
             /PDBALTPATH:none
             /EMITTOOLVERSIONINFO:NO
         )
 
-        target_link_libraries(AiDAStandalone PRIVATE delayimp)
         if(TARGET aida_hardening)
             target_link_libraries(AiDAStandalone PRIVATE aida_hardening)
         endif()
@@ -1905,9 +1898,6 @@ if(WIN32)
         option(AIDA_STANDALONE_STAGE_APPLOCAL_RUNTIME_DLLS "Stage app-local runtime DLLs beside AiDAStandalone.exe" ON)
         if(AIDA_STANDALONE_STAGE_APPLOCAL_RUNTIME_DLLS)
             aida_collect_windows_runtime_dlls(_aida_standalone_runtime_candidates)
-            foreach(_aida_z3_runtime_name IN LISTS AIDA_Z3_RUNTIME_DLL_NAMES)
-                list(APPEND _aida_standalone_runtime_candidates "${Z3_INSTALL_DIR}/bin/${_aida_z3_runtime_name}")
-            endforeach()
             aida_dedupe_runtime_dlls_by_filename(AIDA_STANDALONE_APPLOCAL_RUNTIME_DLLS ${_aida_standalone_runtime_candidates})
             if(AIDA_STANDALONE_APPLOCAL_RUNTIME_DLLS)
                 add_custom_command(TARGET AiDAStandalone POST_BUILD
@@ -1920,6 +1910,21 @@ if(WIN32)
                 )
             endif()
         endif()
+
+        set(AIDA_STANDALONE_Z3_RUNTIME_DLLS)
+        foreach(_aida_z3_runtime_name IN LISTS AIDA_Z3_RUNTIME_DLL_NAMES)
+            list(APPEND AIDA_STANDALONE_Z3_RUNTIME_DLLS "${Z3_INSTALL_DIR}/bin/${_aida_z3_runtime_name}")
+        endforeach()
+        add_custom_command(TARGET AiDAStandalone POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                "$<TARGET_FILE_DIR:AiDAStandalone>/deps/z3"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${AIDA_STANDALONE_Z3_RUNTIME_DLLS}
+                "$<TARGET_FILE_DIR:AiDAStandalone>/deps/z3"
+            COMMAND_EXPAND_LISTS
+            COMMENT "Staging Z3 runtime DLLs for AiDAStandalone..."
+            VERBATIM
+        )
 
         add_dependencies(AiDAStandalone AiDAGuestAgent)
         add_custom_command(TARGET AiDAStandalone POST_BUILD
@@ -2647,7 +2652,6 @@ target_compile_definitions(AiDA PRIVATE
     CPPHTTPLIB_OPENSSL_SUPPORT
     NOMINMAX
     ATP_JIT_DISABLED=1
-    TRITON_Z3_INTERFACE
 )
 if(NOT AIDA_DISABLE_LEGACY_DRIVER_MAPPER)
     target_compile_definitions(AiDA PRIVATE AIDA_LEGACY_DRIVER_MAPPER_AVAILABLE)
@@ -2674,6 +2678,7 @@ endif()
 target_link_libraries(AiDA PRIVATE "${IDA_LINK_LIB}")
 
 target_link_libraries(AiDA PRIVATE Zydis unicorn triton)
+target_link_libraries(AiDA PRIVATE "${Z3_LIBRARIES}")
 target_include_directories(AiDA PRIVATE
     "${zydis_SOURCE_DIR}/include"
     "${zydis_SOURCE_DIR}/dependencies/zycore/include"
@@ -2929,35 +2934,36 @@ if(BUILD_PROTECTOR)
     target_compile_options(AiDAExtractPayload PRIVATE /W4 /WX /EHsc $<IF:$<CONFIG:Debug>,/Od,/O2> /Zc:__cplusplus /std:c++17)
     target_compile_definitions(AiDAExtractPayload PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
 
-    set(AIDA_PAYLOAD_OBJ "${CMAKE_BINARY_DIR}/aida_payload.obj")
-    set(AIDA_PAYLOAD_HDR "${CMAKE_BINARY_DIR}/generated/payload_blob.hpp")
+    set(AIDA_PAYLOAD_BASE_OBJ "${CMAKE_BINARY_DIR}/aida_payload_base.obj")
+    set(AIDA_PAYLOAD_BASE_HDR "${CMAKE_BINARY_DIR}/generated/payload_blob_base.hpp")
     file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/generated")
 
     find_program(AIDA_MSVC_CL cl.exe REQUIRED)
 
     add_custom_command(
-        OUTPUT "${AIDA_PAYLOAD_OBJ}"
+        OUTPUT "${AIDA_PAYLOAD_BASE_OBJ}"
         COMMAND "${AIDA_MSVC_CL}" /nologo /c /GS- /GR- /Od /Oi /Ob0 /Zl /EHs- /Gw /W3
                 /D_NO_CRT_STDIO_INLINE /D_CRT_SECURE_NO_WARNINGS /DNOMINMAX
-                /Fo${AIDA_PAYLOAD_OBJ}
+                /Fo${AIDA_PAYLOAD_BASE_OBJ}
                 ${CMAKE_SOURCE_DIR}/tools/protector/payload/payload.c
         DEPENDS "${CMAKE_SOURCE_DIR}/tools/protector/payload/payload.c"
-        COMMENT "Compiling AiDA PIC payload..."
+        COMMENT "Compiling AiDA base PIC payload..."
         VERBATIM
     )
 
     add_custom_command(
-        OUTPUT "${AIDA_PAYLOAD_HDR}"
+        OUTPUT "${AIDA_PAYLOAD_BASE_HDR}"
         COMMAND "$<TARGET_FILE:AiDAExtractPayload>"
-                "${AIDA_PAYLOAD_OBJ}"
-                "${AIDA_PAYLOAD_HDR}"
+                "${AIDA_PAYLOAD_BASE_OBJ}"
+                "${AIDA_PAYLOAD_BASE_HDR}"
                 kAidaUnpackBlob
-        DEPENDS "${AIDA_PAYLOAD_OBJ}" AiDAExtractPayload
-        COMMENT "Extracting AiDA PIC payload blob..."
+                aida_payload_base
+        DEPENDS "${AIDA_PAYLOAD_BASE_OBJ}" AiDAExtractPayload
+        COMMENT "Extracting AiDA base PIC payload blob..."
         VERBATIM
     )
 
-    add_custom_target(AiDAPayloadBlob DEPENDS "${AIDA_PAYLOAD_HDR}")
+    add_custom_target(AiDAPayloadBlob DEPENDS "${AIDA_PAYLOAD_BASE_HDR}")
     add_dependencies(AiDAProtector AiDAPayloadBlob)
     target_include_directories(AiDAProtector PRIVATE "${CMAKE_BINARY_DIR}/generated")
 
@@ -3168,6 +3174,17 @@ if(BUILD_PROTECTOR)
     if(TARGET AiDA_ARC)
         string(SUBSTRING "${AIDA_BUILD_SEED}" 0 32 AIDA_ARC_WATERMARK)
         string(TOLOWER "${AIDA_ARC_WATERMARK}" AIDA_ARC_WATERMARK)
+        if(TARGET aida_pdb_scrubber)
+            add_custom_command(TARGET AiDA_ARC POST_BUILD
+                COMMAND ${CMAKE_COMMAND}
+                    "-DRETRY_LABEL=aida_core.dll-pre-protect-scrub"
+                    "-DRETRY_CMD=$<TARGET_FILE:aida_pdb_scrubber>;$<TARGET_FILE:AiDA_ARC>"
+                    -P "${CMAKE_SOURCE_DIR}/cmake/run_with_retry.cmake"
+                COMMENT "Scrubbing Rich header and PDB paths from aida_core.dll before protection..."
+                VERBATIM
+            )
+            add_dependencies(AiDA_ARC aida_pdb_scrubber)
+        endif()
         if(AIDA_ARC_ENCRYPT_IMPORTS)
             add_custom_command(TARGET AiDA_ARC POST_BUILD
                 COMMAND ${CMAKE_COMMAND}
@@ -3187,21 +3204,21 @@ if(BUILD_PROTECTOR)
                 VERBATIM
             )
         endif()
-        if(TARGET aida_pdb_scrubber)
-            add_custom_command(TARGET AiDA_ARC POST_BUILD
-                COMMAND ${CMAKE_COMMAND}
-                    "-DRETRY_LABEL=aida_core.dll-scrub"
-                    "-DRETRY_CMD=$<TARGET_FILE:aida_pdb_scrubber>;$<TARGET_FILE:AiDA_ARC>"
-                    -P "${CMAKE_SOURCE_DIR}/cmake/run_with_retry.cmake"
-                COMMENT "Scrubbing Rich header and PDB paths from aida_core.dll..."
-                VERBATIM
-            )
-            add_dependencies(AiDA_ARC aida_pdb_scrubber)
-        endif()
         add_dependencies(AiDA_ARC AiDAProtector)
     endif()
 
     if(TARGET AiDA)
+        if(TARGET aida_pdb_scrubber)
+            add_custom_command(TARGET AiDA POST_BUILD
+                COMMAND ${CMAKE_COMMAND}
+                    "-DRETRY_LABEL=AiDA.dll-pre-protect-scrub"
+                    "-DRETRY_CMD=$<TARGET_FILE:aida_pdb_scrubber>;$<TARGET_FILE:AiDA>"
+                    -P "${CMAKE_SOURCE_DIR}/cmake/run_with_retry.cmake"
+                COMMENT "Scrubbing Rich header and PDB paths from AiDA.dll before protection..."
+                VERBATIM
+            )
+            add_dependencies(AiDA aida_pdb_scrubber)
+        endif()
         add_custom_command(TARGET AiDA POST_BUILD
             COMMAND ${CMAKE_COMMAND}
                 "-DRETRY_LABEL=AiDA.dll-protect"
@@ -3210,17 +3227,6 @@ if(BUILD_PROTECTOR)
             COMMENT "Protecting AiDA.dll (with AV/indexer retry)..."
             VERBATIM
         )
-        if(TARGET aida_pdb_scrubber)
-            add_custom_command(TARGET AiDA POST_BUILD
-                COMMAND ${CMAKE_COMMAND}
-                    "-DRETRY_LABEL=AiDA.dll-scrub"
-                    "-DRETRY_CMD=$<TARGET_FILE:aida_pdb_scrubber>;$<TARGET_FILE:AiDA>"
-                    -P "${CMAKE_SOURCE_DIR}/cmake/run_with_retry.cmake"
-                COMMENT "Scrubbing Rich header and PDB paths from AiDA.dll..."
-                VERBATIM
-            )
-            add_dependencies(AiDA aida_pdb_scrubber)
-        endif()
         add_dependencies(AiDA AiDAProtector)
     endif()
 endif()

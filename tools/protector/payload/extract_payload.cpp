@@ -77,13 +77,18 @@ static std::string symbol_name(const coff_symbol_t& sym, const uint8_t* string_t
 }
 
 int main(int argc, char** argv) {
-    if (argc != 4) {
-        std::fprintf(stderr, "usage: %s input.obj output.hpp array_name\n", argv[0]);
+    if (argc != 4 && argc != 5) {
+        std::fprintf(stderr, "usage: %s input.obj output.hpp array_name [namespace_name]\n", argv[0]);
         return 1;
     }
     const char* input = argv[1];
     const char* output = argv[2];
     const char* array_name = argv[3];
+    const char* namespace_name = argc == 5 ? argv[4] : "aida_payload";
+    if (namespace_name == nullptr || namespace_name[0] == '\0') {
+        std::fprintf(stderr, "namespace_name must not be empty\n");
+        return 1;
+    }
     const char* entry_symbol = "aida_unpack";
 
     auto data = read_file(input);
@@ -198,7 +203,7 @@ int main(int argc, char** argv) {
     out << "#pragma once\n";
     out << "#include <cstdint>\n";
     out << "#include <cstddef>\n";
-    out << "namespace aida_payload {\n";
+    out << "namespace " << namespace_name << " {\n";
     out << "constexpr std::size_t kBlobSize = " << payload.size() << ";\n";
     out << "constexpr std::uint32_t kEntryOffset = " << entry_offset << "u;\n";
     out << "alignas(16) constexpr std::uint8_t " << array_name << "[kBlobSize] = {\n";
@@ -222,8 +227,8 @@ int main(int argc, char** argv) {
     out << "}\n";
     out.close();
 
-    std::fprintf(stdout, "extracted %zu bytes, entry=0x%X, patched=%u relocs\n",
-                 payload.size(), entry_offset, patched);
+    std::fprintf(stdout, "extracted %zu bytes, entry=0x%X, patched=%u relocs, namespace=%s\n",
+                 payload.size(), entry_offset, patched, namespace_name);
     (void)input;
     return 0;
 }

@@ -218,6 +218,29 @@ inline bool apply_full_test_pdb_decline(const char* source,
 		g_state.local_pdb_path.clear();
 	}
 
+	push_log_fmt("pdb_prompt_creation_attempt source=%s kind=unattended prompt_created=%d prompt_suppressed=1 module=%s base=0x%llX size=0x%llX pdb=%s guid=%s age=%u reason=%s is_running=%d unattended_active=%d decision=do_not_load_pdb",
+		source && *source ? source : "<unknown>",
+		prompt_created ? 1 : 0,
+		log_value(module_log),
+		static_cast<unsigned long long>(base_log),
+		static_cast<unsigned long long>(size_log),
+		log_value(pdb_log),
+		log_value(guid_log),
+		static_cast<unsigned>(age_log),
+		log_value(reason_log),
+		test_all_features::is_running() ? 1 : 0,
+		test_all_features::is_unattended_full_test_active() ? 1 : 0);
+	push_log_fmt("fulltest_pdb_final_decision source=%s module=%s base=0x%llX size=0x%llX pdb=%s guid=%s age=%u decision=do_not_load_pdb reason=%s local_candidate=<none> cache_path=<none> prompt_suppressed=1 is_running=%d unattended_active=%d",
+		source && *source ? source : "<unknown>",
+		log_value(module_log),
+		static_cast<unsigned long long>(base_log),
+		static_cast<unsigned long long>(size_log),
+		log_value(pdb_log),
+		log_value(guid_log),
+		static_cast<unsigned>(age_log),
+		log_value(reason_log),
+		test_all_features::is_running() ? 1 : 0,
+		test_all_features::is_unattended_full_test_active() ? 1 : 0);
 	push_log_fmt("fulltest_pdb_prompt_auto_decline choice=do_not_load_pdb decision=do_not_load_pdb prompt_created=%d prompt_suppressed=1 source=%s module=%s base=0x%llX size=0x%llX pdb=%s guid=%s age=%u reason=%s remote_pending=%d local_pending=%d opt_load_types=0 opt_load_names=0 failed=0 declined=1",
 		prompt_created ? 1 : 0,
 		source && *source ? source : "<unknown>",
@@ -384,16 +407,77 @@ inline std::string target_path_for_prompt_policy(const std::string& module_name)
 	return module_name;
 }
 
+enum class unattended_pdb_decision_t : int {
+	allow_interactive = 0,
+	decline,
+	load_deterministic_local
+};
+
+inline const char* unattended_pdb_decision_name(unattended_pdb_decision_t decision)
+{
+	switch (decision) {
+	case unattended_pdb_decision_t::decline: return "do_not_load_pdb";
+	case unattended_pdb_decision_t::load_deterministic_local: return "load_local";
+	default: return "allow_interactive";
+	}
+}
+
+struct unattended_pdb_decision_result_t {
+	bool active = false;
+	unattended_pdb_decision_t decision = unattended_pdb_decision_t::allow_interactive;
+	full_test_pdb_policy_t policy;
+};
+
+inline unattended_pdb_decision_result_t decide_unattended_pdb_policy(const char* source,
+                                                                    const std::string& module_name,
+                                                                    uint64_t image_base,
+                                                                    uint64_t image_size,
+                                                                    const pdb_hint_t* hint,
+                                                                    const std::string& fallback_reason)
+{
+	unattended_pdb_decision_result_t result;
+	result.active = full_test_active();
+	const bool full_running = test_all_features::is_running();
+	const bool unattended_active = test_all_features::is_unattended_full_test_active();
+	if (!result.active) {
+		result.decision = unattended_pdb_decision_t::allow_interactive;
+		return result;
+	}
+	const std::string binary_path = target_path_for_prompt_policy(module_name);
+	result.policy = resolve_full_test_pdb_policy(binary_path, module_name, hint);
+	if (!fallback_reason.empty() && result.policy.reason.empty())
+		result.policy.reason = fallback_reason;
+	result.decision = result.policy.local_available
+		? unattended_pdb_decision_t::load_deterministic_local
+		: unattended_pdb_decision_t::decline;
+	push_log_fmt("fulltest_pdb_final_decision source=%s module=%s base=0x%llX size=0x%llX pdb=%s guid=%s age=%u decision=%s reason=%s local_candidate=%s cache_path=%s prompt_suppressed=1 is_running=%d unattended_active=%d",
+		source && *source ? source : "<unknown>",
+		log_value(module_name),
+		static_cast<unsigned long long>(image_base),
+		static_cast<unsigned long long>(image_size),
+		log_value(result.policy.pdb_name),
+		log_value(result.policy.pdb_guid),
+		static_cast<unsigned>(result.policy.pdb_age),
+		unattended_pdb_decision_name(result.decision),
+		log_value(result.policy.reason),
+		log_value(result.policy.local_candidate),
+		log_value(result.policy.cache_path),
+		full_running ? 1 : 0,
+		unattended_active ? 1 : 0);
+	return result;
+}
+
 inline bool accept_local_pdb_before_prompt_for_full_test(const char* source,
                                                         const std::string& module_name,
                                                         uint64_t image_base,
                                                         uint64_t image_size,
                                                         const std::string& reason)
 {
-	if (!full_test_active()) return false;
-	const std::string binary_path = target_path_for_prompt_policy(module_name);
-	full_test_pdb_policy_t policy = resolve_full_test_pdb_policy(binary_path, module_name, nullptr);
-	if (!policy.local_available) return false;
+	unattended_pdb_decision_result_t decision = decide_unattended_pdb_policy(source,
+		module_name, image_base, image_size, nullptr, reason);
+	if (!decision.active) return false;
+	if (decision.decision != unattended_pdb_decision_t::load_deterministic_local) return false;
+	const full_test_pdb_policy_t& policy = decision.policy;
 
 	g_state.needs_pdb_prompt.store(false, std::memory_order_release);
 	g_state.needs_local_pdb_prompt.store(false, std::memory_order_release);
@@ -420,7 +504,7 @@ inline bool accept_local_pdb_before_prompt_for_full_test(const char* source,
 		static_cast<unsigned>(policy.pdb_age),
 		log_value(policy.local_candidate),
 		log_value(policy.cache_path),
-		log_value(policy.reason));
+		log_value(reason.empty() ? policy.reason : reason));
 	return true;
 }
 
@@ -853,6 +937,16 @@ inline void request_local_pdb_prompt(const std::string& module_name,
 		{}, 0, reason)) {
 		return;
 	}
+	push_log_fmt("pdb_prompt_creation_attempt source=request_local_pdb_prompt kind=local prompt_created=1 prompt_suppressed=0 module=%s base=0x%llX size=0x%llX pdb=%s guid=%s age=%u reason=%s is_running=%d unattended_active=%d decision=allow_interactive",
+		log_value(module_name),
+		static_cast<unsigned long long>(image_base),
+		static_cast<unsigned long long>(image_size),
+		log_value(fallback_pdb_name_for_module(module_name)),
+		"<none>",
+		0u,
+		log_value(reason),
+		test_all_features::is_running() ? 1 : 0,
+		test_all_features::is_unattended_full_test_active() ? 1 : 0);
 	{
 		std::lock_guard<std::mutex> lk(g_state.local_pdb_mtx);
 		g_state.local_pdb_module_name = module_name;
@@ -871,11 +965,25 @@ inline bool request_remote_pdb_prompt(const std::string& module_name,
                                       const pdb_hint_t& hint,
                                       const char* source)
 {
+	if (full_test_active()) {
+		decide_unattended_pdb_policy(source, module_name, image_base, image_size,
+			&hint, "remote_pdb_prompt_declined_by_full_test");
+	}
 	if (decline_pdb_before_prompt_for_full_test(source, module_name, image_base,
 		image_size, hint.pdb_name, hint.pdb_guid, hint.pdb_age,
 		"remote_pdb_prompt_declined_by_full_test")) {
 		return false;
 	}
+	push_log_fmt("pdb_prompt_creation_attempt source=%s kind=remote prompt_created=1 prompt_suppressed=0 module=%s base=0x%llX size=0x%llX pdb=%s guid=%s age=%u reason=interactive_remote_prompt is_running=%d unattended_active=%d decision=allow_interactive",
+		source && *source ? source : "<unknown>",
+		log_value(module_name),
+		static_cast<unsigned long long>(image_base),
+		static_cast<unsigned long long>(image_size),
+		log_value(hint.pdb_name),
+		log_value(hint.pdb_guid),
+		static_cast<unsigned>(hint.pdb_age),
+		test_all_features::is_running() ? 1 : 0,
+		test_all_features::is_unattended_full_test_active() ? 1 : 0);
 	g_state.needs_pdb_prompt.store(true, std::memory_order_release);
 	return true;
 }

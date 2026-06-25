@@ -772,11 +772,22 @@ inline solve_result_t solve_for_path(
 	uint64_t pc = start_addr;
 	uint32_t count = 0;
 	bool reached = false;
+	bool solver_unavailable = false;
 	auto solve_predicate = [&](const triton::ast::SharedAbstractNode& pred) -> bool {
 		if (!pred)
 			return false;
-		triton::engines::solver::status_e status;
+		triton::engines::solver::status_e status = triton::engines::solver::UNKNOWN;
 		uint32_t solve_time = 0;
+		if (!ctx.isSolverValid()) {
+			solver_unavailable = true;
+			result.error = "triton_solver_unavailable_no_static_z3";
+			result.satisfiable = false;
+			result.success = false;
+			result.solving_time_ms = 0;
+			diag::log_tagged_fmt("symbolic",
+				"solve_for_path_solver_unavailable phase=branch_predicate reason=triton_solver_unavailable_no_static_z3");
+			return false;
+		}
 		auto model = ctx.getModel(pred, &status, 1000, &solve_time);
 		result.solving_time_ms = solve_time;
 		if (status != triton::engines::solver::SAT)
@@ -878,6 +889,8 @@ inline solve_result_t solve_for_path(
 			if (solve_predicate(pred_ast))
 				return result;
 		}
+		if (solver_unavailable)
+			return result;
 
 		result.satisfiable = false;
 		result.success = true;
@@ -890,8 +903,17 @@ inline solve_result_t solve_for_path(
 		count,
 		reached ? 1 : 0,
 		static_cast<unsigned long long>(target_addr));
-	triton::engines::solver::status_e status;
+	triton::engines::solver::status_e status = triton::engines::solver::UNKNOWN;
 	uint32_t solve_time = 0;
+	if (!ctx.isSolverValid()) {
+		result.error = "triton_solver_unavailable_no_static_z3";
+		result.satisfiable = false;
+		result.success = false;
+		result.solving_time_ms = 0;
+		diag::log_tagged_fmt("symbolic",
+			"solve_for_path_solver_unavailable phase=path_predicate reason=triton_solver_unavailable_no_static_z3");
+		return result;
+	}
 	auto model = ctx.getModel(path_pred, &status, 1000, &solve_time);
 
 	result.solving_time_ms = solve_time;

@@ -20,6 +20,7 @@
 #include "../ui/fonts.hpp"
 #include "../ui/clock.hpp"
 #include "../ui/blur_layer.hpp"
+#include "../testlab/test_all_features.hpp"
 #include "../../helpers/diag_log.hpp"
 #include "../../helpers/win32_dialog.hpp"
 
@@ -74,6 +75,21 @@ inline const char* step_glyph(const initial_analysis::step_t& s)
 inline void render_modal()
 {
 	auto& st = initial_analysis::g_state;
+	bool pending_before_decline = st.needs_pdb_prompt.load(std::memory_order_acquire);
+	if (pending_before_decline && test_all_features::is_unattended_full_test_active()) {
+		initial_analysis::pdb_hint_t hint;
+		{
+			std::lock_guard<std::mutex> lk(st.pdb_hint_mtx);
+			hint = st.pdb_hint;
+		}
+		diag::log_tagged_critical_fmt("initial_analysis",
+			"pdb_modal_visible_attempt source=render_modal kind=remote prompt_pending=1 prompt_suppressed=1 decision=do_not_load_pdb pdb=%s guid=%s age=%u is_running=%d unattended_active=%d",
+			hint.pdb_name.c_str(),
+			hint.pdb_guid.c_str(),
+			static_cast<unsigned>(hint.pdb_age),
+			test_all_features::is_running() ? 1 : 0,
+			test_all_features::is_unattended_full_test_active() ? 1 : 0);
+	}
 	initial_analysis::detail::auto_decline_pdb_prompts_for_full_test("render_modal");
 	bool wants_prompt = st.needs_pdb_prompt.load(std::memory_order_acquire);
 
@@ -503,6 +519,15 @@ inline std::array<char, 1024>& local_pdb_typed_buf()
 
 inline std::string browse_for_pdb_dialog(HWND owner, const std::string& initial_name)
 {
+	if (test_all_features::is_unattended_full_test_active()) {
+		diag::log_tagged_critical_fmt("initial_analysis",
+			"pdb_native_dialog_attempt source=initial_analysis_view::browse_for_pdb title=\"Select PDB file\" suppressed=1 decision=do_not_load_pdb initial_name=%s is_running=%d unattended_active=%d",
+			initial_name.empty() ? "<empty>" : initial_name.c_str(),
+			test_all_features::is_running() ? 1 : 0,
+			test_all_features::is_unattended_full_test_active() ? 1 : 0);
+		initial_analysis::detail::auto_decline_pdb_prompts_for_full_test("initial_analysis_view.browse_for_pdb_dialog");
+		return std::string();
+	}
 	char file_buf[1024] = {};
 	if (!initial_name.empty()) {
 		std::strncpy(file_buf, initial_name.c_str(),
@@ -527,6 +552,28 @@ inline std::string browse_for_pdb_dialog(HWND owner, const std::string& initial_
 inline void render_local_pdb_modal()
 {
 	auto& st = initial_analysis::g_state;
+	bool pending_before_decline = st.needs_local_pdb_prompt.load(std::memory_order_acquire);
+	if (pending_before_decline && test_all_features::is_unattended_full_test_active()) {
+		std::string module_name;
+		std::string reason;
+		uint64_t image_base = 0;
+		uint64_t image_size = 0;
+		{
+			std::lock_guard<std::mutex> lk(st.local_pdb_mtx);
+			module_name = st.local_pdb_module_name;
+			reason = st.local_pdb_reason;
+			image_base = st.local_pdb_image_base;
+			image_size = st.local_pdb_image_size;
+		}
+		diag::log_tagged_critical_fmt("initial_analysis",
+			"pdb_modal_visible_attempt source=render_local_pdb_modal kind=local prompt_pending=1 prompt_suppressed=1 decision=do_not_load_pdb module=%s base=0x%llX size=0x%llX reason=%s is_running=%d unattended_active=%d",
+			module_name.empty() ? "<unknown>" : module_name.c_str(),
+			static_cast<unsigned long long>(image_base),
+			static_cast<unsigned long long>(image_size),
+			reason.empty() ? "<none>" : reason.c_str(),
+			test_all_features::is_running() ? 1 : 0,
+			test_all_features::is_unattended_full_test_active() ? 1 : 0);
+	}
 	initial_analysis::detail::auto_decline_pdb_prompts_for_full_test("render_local_pdb_modal");
 	bool wants_prompt = st.needs_local_pdb_prompt.load(std::memory_order_acquire);
 

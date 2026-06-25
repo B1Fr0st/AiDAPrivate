@@ -26,6 +26,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -1987,11 +1988,17 @@ namespace {
         const char* tag = "xref.live_after_warm";
         remote_module_lookup_t module = select_live_xref_module();
         if (module.pid == 0) {
+            log_msg(hf, tag, "OUTPUT -- ok=0 error=\"no_attached_pid\" pid=0 module_count=%zu", module.module_count);
             log_msg(hf, tag, "FAIL -- no_attached_pid; live xref proof requires a verified target");
             failed.fetch_add(1);
             return;
         }
         if (module.base == 0 || module.size == 0) {
+            log_msg(hf, tag, "OUTPUT -- ok=0 error=\"no_live_module_for_bounded_xref\" pid=%u module_count=%zu status=\"%s\" last_error=\"%s\"",
+                module.pid,
+                module.module_count,
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
             log_msg(hf, tag, "FAIL -- no_live_module_for_bounded_xref pid=%u module_count=%zu status=\"%s\" last_error=\"%s\"",
                 module.pid,
                 module.module_count,
@@ -2005,7 +2012,61 @@ namespace {
         const uint64_t span = std::min<uint64_t>(module.size, max_span);
         const uint64_t range_lo = module.base;
         const uint64_t range_hi = module.base + span;
-        log_msg(hf, tag, "INPUT -- pid=%u module=\"%s\" module_base=0x%016llX module_size=0x%08X module_count=%zu requested_range=[0x%016llX,0x%016llX) span=0x%016llX",
+        constexpr uint32_t proof_timeout_ms = 2500;
+        constexpr uint32_t watchdog_timeout_ms = 4000;
+        std::atomic<bool> finished{ false };
+        std::atomic<bool> hung_logged{ false };
+        std::atomic<int> stage{ 0 };
+        auto stage_name = [](int value) -> const char* {
+            switch (value) {
+            case 1: return "before_warm_range";
+            case 2: return "inside_warm_range";
+            case 3: return "after_warm_range";
+            case 4: return "inside_bounded_live_range";
+            case 5: return "after_bounded_live_range";
+            case 6: return "finished";
+            default: return "selected_input";
+            }
+        };
+        std::thread watchdog([&, t0]() {
+            const auto deadline = t0 + std::chrono::milliseconds(watchdog_timeout_ms);
+            while (!finished.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            if (!finished.load(std::memory_order_acquire)) {
+                const int active_stage = stage.load(std::memory_order_acquire);
+                hung_logged.store(true, std::memory_order_release);
+                log_msg(hf, tag, "HUNG -- stage=%s pid=%u module=\"%s\" module_base=0x%016llX module_size=0x%08X requested=[0x%016llX,0x%016llX) proof_timeout_ms=%u watchdog_timeout_ms=%u elapsed_us=%lld",
+                    stage_name(active_stage),
+                    module.pid,
+                    module.name.empty() ? "<unknown>" : module.name.c_str(),
+                    (unsigned long long)module.base,
+                    module.size,
+                    (unsigned long long)range_lo,
+                    (unsigned long long)range_hi,
+                    proof_timeout_ms,
+                    watchdog_timeout_ms,
+                    elapsed_us_since(t0));
+                diag::log_tagged_critical_fmt("testlab",
+                    "xref_live_after_warm_hung stage=%s pid=%u module=%s base=0x%llX size=0x%X range_lo=0x%llX range_hi=0x%llX proof_timeout_ms=%u watchdog_timeout_ms=%u elapsed_us=%lld",
+                    stage_name(active_stage),
+                    module.pid,
+                    module.name.empty() ? "<unknown>" : module.name.c_str(),
+                    (unsigned long long)module.base,
+                    module.size,
+                    (unsigned long long)range_lo,
+                    (unsigned long long)range_hi,
+                    proof_timeout_ms,
+                    watchdog_timeout_ms,
+                    elapsed_us_since(t0));
+            }
+        });
+        auto finish_watchdog = [&]() {
+            stage.store(6, std::memory_order_release);
+            finished.store(true, std::memory_order_release);
+            if (watchdog.joinable())
+                watchdog.join();
+        };
+        log_msg(hf, tag, "INPUT -- pid=%u module=\"%s\" module_base=0x%016llX module_size=0x%08X module_count=%zu requested_range=[0x%016llX,0x%016llX) span=0x%016llX proof_timeout_ms=%u watchdog_timeout_ms=%u",
             module.pid,
             module.name.empty() ? "<unknown>" : module.name.c_str(),
             (unsigned long long)module.base,
@@ -2013,14 +2074,86 @@ namespace {
             module.module_count,
             (unsigned long long)range_lo,
             (unsigned long long)range_hi,
-            (unsigned long long)span);
+            (unsigned long long)span,
+            proof_timeout_ms,
+            watchdog_timeout_ms);
+        bool counted = false;
         try {
+            stage.store(1, std::memory_order_release);
+            log_msg(hf, tag, "WARM_RANGE_BEGIN -- pid=%u module=\"%s\" range=[0x%016llX,0x%016llX) elapsed_us=%lld",
+                module.pid,
+                module.name.empty() ? "<unknown>" : module.name.c_str(),
+                (unsigned long long)range_lo,
+                (unsigned long long)range_hi,
+                elapsed_us_since(t0));
+            diag::log_tagged_critical_fmt("testlab",
+                "xref_live_after_warm_range_begin pid=%u module=%s base=0x%llX size=0x%X range_lo=0x%llX range_hi=0x%llX elapsed_us=%lld",
+                module.pid,
+                module.name.empty() ? "<unknown>" : module.name.c_str(),
+                (unsigned long long)module.base,
+                module.size,
+                (unsigned long long)range_lo,
+                (unsigned long long)range_hi,
+                elapsed_us_since(t0));
+            stage.store(2, std::memory_order_release);
+            const auto warm_started = std::chrono::steady_clock::now();
             xref_index::warm_range(range_lo, range_hi);
-            xref_index::bounded_live_range_result_t proof = xref_index::build_bounded_live_range(range_lo, range_hi, 2500);
+            stage.store(3, std::memory_order_release);
+            log_msg(hf, tag, "WARM_RANGE_END -- pid=%u module=\"%s\" elapsed_us=%lld outer_elapsed_us=%lld",
+                module.pid,
+                module.name.empty() ? "<unknown>" : module.name.c_str(),
+                elapsed_us_since(warm_started),
+                elapsed_us_since(t0));
+            diag::log_tagged_critical_fmt("testlab",
+                "xref_live_after_warm_range_end pid=%u module=%s elapsed_us=%lld outer_elapsed_us=%lld",
+                module.pid,
+                module.name.empty() ? "<unknown>" : module.name.c_str(),
+                elapsed_us_since(warm_started),
+                elapsed_us_since(t0));
+            log_msg(hf, tag, "BOUNDED_LIVE_RANGE_BEGIN -- pid=%u module=\"%s\" range=[0x%016llX,0x%016llX) timeout_ms=%u elapsed_us=%lld",
+                module.pid,
+                module.name.empty() ? "<unknown>" : module.name.c_str(),
+                (unsigned long long)range_lo,
+                (unsigned long long)range_hi,
+                proof_timeout_ms,
+                elapsed_us_since(t0));
+            diag::log_tagged_critical_fmt("testlab",
+                "xref_live_after_bounded_live_range_begin pid=%u module=%s range_lo=0x%llX range_hi=0x%llX timeout_ms=%u elapsed_us=%lld",
+                module.pid,
+                module.name.empty() ? "<unknown>" : module.name.c_str(),
+                (unsigned long long)range_lo,
+                (unsigned long long)range_hi,
+                proof_timeout_ms,
+                elapsed_us_since(t0));
+            stage.store(4, std::memory_order_release);
+            const auto proof_started = std::chrono::steady_clock::now();
+            xref_index::bounded_live_range_result_t proof = xref_index::build_bounded_live_range(range_lo, range_hi, proof_timeout_ms);
+            stage.store(5, std::memory_order_release);
             const bool proof_source_in_range = proof.proof_source >= proof.clipped_lo && proof.proof_source < proof.clipped_hi;
-            log_msg(hf, tag, "OUTPUT -- ok=%d error=\"%s\" pid=%u module=\"%s\" module_base=0x%016llX module_size=0x%08X requested=[0x%016llX,0x%016llX) clipped=[0x%016llX,0x%016llX) pages_read=%zu pages_failed=%zu bytes_read=%zu targets=%zu xrefs=%zu proof_target=0x%016llX proof_source=0x%016llX proof_source_in_range=%d proof_label=\"%s\" state_before=%s(%u) state_after=%s(%u) table_before=%d table_after=%d rebuild_before=%d rebuild_after=%d elapsed_us=%llu outer_elapsed_us=%lld",
+            const long long proof_elapsed_us = elapsed_us_since(proof_started);
+            log_msg(hf, tag, "BOUNDED_LIVE_RANGE_END -- ok=%d error=\"%s\" pid=%u module=\"%s\" timeout_ms=%u proof_elapsed_us=%lld result_elapsed_us=%llu outer_elapsed_us=%lld",
                 proof.ok ? 1 : 0,
                 proof.error.empty() ? "<none>" : proof.error.c_str(),
+                proof.pid,
+                proof.module.empty() ? "<unknown>" : proof.module.c_str(),
+                proof_timeout_ms,
+                proof_elapsed_us,
+                (unsigned long long)proof.elapsed_us,
+                elapsed_us_since(t0));
+            diag::log_tagged_critical_fmt("testlab",
+                "xref_live_after_bounded_live_range_end ok=%d error=%s pid=%u module=%s timeout_ms=%u proof_elapsed_us=%lld result_elapsed_us=%llu outer_elapsed_us=%lld",
+                proof.ok ? 1 : 0,
+                proof.error.empty() ? "<none>" : proof.error.c_str(),
+                proof.pid,
+                proof.module.empty() ? "<unknown>" : proof.module.c_str(),
+                proof_timeout_ms,
+                proof_elapsed_us,
+                (unsigned long long)proof.elapsed_us,
+                elapsed_us_since(t0));
+            log_msg(hf, tag, "OUTPUT -- ok=%d error=\"%s\" hung_logged=%d pid=%u module=\"%s\" module_base=0x%016llX module_size=0x%08X requested=[0x%016llX,0x%016llX) clipped=[0x%016llX,0x%016llX) pages_read=%zu pages_failed=%zu bytes_read=%zu targets=%zu xrefs=%zu proof_target=0x%016llX proof_source=0x%016llX proof_source_in_range=%d proof_label=\"%s\" state_before=%s(%u) state_after=%s(%u) table_before=%d table_after=%d rebuild_before=%d rebuild_after=%d elapsed_us=%llu proof_call_elapsed_us=%lld outer_elapsed_us=%lld",
+                proof.ok ? 1 : 0,
+                proof.error.empty() ? "<none>" : proof.error.c_str(),
+                hung_logged.load(std::memory_order_acquire) ? 1 : 0,
                 proof.pid,
                 proof.module.empty() ? "<unknown>" : proof.module.c_str(),
                 (unsigned long long)proof.module_base,
@@ -2047,30 +2180,59 @@ namespace {
                 proof.rebuild_in_flight_before ? 1 : 0,
                 proof.rebuild_in_flight_after ? 1 : 0,
                 (unsigned long long)proof.elapsed_us,
+                proof_elapsed_us,
                 elapsed_us_since(t0));
-            if (proof.ok && proof.xrefs_found > 0 && proof.proof_target != 0 && proof.proof_source != 0 && proof_source_in_range) {
+            if (hung_logged.load(std::memory_order_acquire)) {
+                log_msg(hf, tag, "FAIL -- bounded live range exceeded watchdog before returning pid=%u module=\"%s\" proof_elapsed_us=%lld outer_elapsed_us=%lld",
+                    proof.pid,
+                    proof.module.empty() ? "<unknown>" : proof.module.c_str(),
+                    proof_elapsed_us,
+                    elapsed_us_since(t0));
+                failed.fetch_add(1);
+                counted = true;
+            } else if (proof.ok && proof.xrefs_found > 0 && proof.proof_target != 0 && proof.proof_source != 0 && proof_source_in_range) {
                 log_msg(hf, tag, "PASS -- deterministic bounded live range produced xref proof target=0x%016llX source=0x%016llX bytes_read=%zu elapsed_us=%llu",
                     (unsigned long long)proof.proof_target,
                     (unsigned long long)proof.proof_source,
                     proof.bytes_read,
                     (unsigned long long)proof.elapsed_us);
                 passed.fetch_add(1);
-                return;
+                counted = true;
+            } else {
+                log_msg(hf, tag, "FAIL -- bounded live range did not produce a valid xref proof error=\"%s\" pid=%u module=\"%s\" pages_read=%zu bytes_read=%zu xrefs=%zu state_before=%s(%u) state_after=%s(%u)",
+                    proof.error.empty() ? "<none>" : proof.error.c_str(),
+                    proof.pid,
+                    proof.module.empty() ? "<unknown>" : proof.module.c_str(),
+                    proof.pages_read,
+                    proof.bytes_read,
+                    proof.xrefs_found,
+                    xref_build_state_name(proof.state_before),
+                    proof.state_before,
+                    xref_build_state_name(proof.state_after),
+                    proof.state_after);
+                failed.fetch_add(1);
+                counted = true;
             }
-            log_msg(hf, tag, "FAIL -- bounded live range did not produce a valid xref proof error=\"%s\" pid=%u module=\"%s\" pages_read=%zu bytes_read=%zu xrefs=%zu state_before=%s(%u) state_after=%s(%u)",
-                proof.error.empty() ? "<none>" : proof.error.c_str(),
-                proof.pid,
-                proof.module.empty() ? "<unknown>" : proof.module.c_str(),
-                proof.pages_read,
-                proof.bytes_read,
-                proof.xrefs_found,
-                xref_build_state_name(proof.state_before),
-                proof.state_before,
-                xref_build_state_name(proof.state_after),
-                proof.state_after);
-            failed.fetch_add(1);
         } catch (...) {
+            log_msg(hf, tag, "OUTPUT -- ok=0 error=\"exception\" stage=%s pid=%u module=\"%s\" elapsed_us=%lld",
+                stage_name(stage.load(std::memory_order_acquire)),
+                module.pid,
+                module.name.empty() ? "<unknown>" : module.name.c_str(),
+                elapsed_us_since(t0));
             log_msg(hf, tag, "FAIL -- exception during bounded live xref proof pid=%u module=\"%s\" elapsed_us=%lld",
+                module.pid,
+                module.name.empty() ? "<unknown>" : module.name.c_str(),
+                elapsed_us_since(t0));
+            failed.fetch_add(1);
+            counted = true;
+        }
+        finish_watchdog();
+        if (!counted) {
+            log_msg(hf, tag, "OUTPUT -- ok=0 error=\"unaccounted_completion\" pid=%u module=\"%s\" elapsed_us=%lld",
+                module.pid,
+                module.name.empty() ? "<unknown>" : module.name.c_str(),
+                elapsed_us_since(t0));
+            log_msg(hf, tag, "FAIL -- unaccounted bounded live xref completion pid=%u module=\"%s\" elapsed_us=%lld",
                 module.pid,
                 module.name.empty() ? "<unknown>" : module.name.c_str(),
                 elapsed_us_since(t0));

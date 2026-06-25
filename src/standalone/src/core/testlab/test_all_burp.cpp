@@ -163,6 +163,9 @@ namespace {
         log_msg(hf, tag, "%s cleanup_diag=%s",
             label,
             compact_burp_json(st.cleanup_diagnostics, 900).c_str());
+        log_msg(hf, tag, "%s privacy_diag=%s",
+            label,
+            compact_burp_json(st.privacy_diagnostics, 900).c_str());
     }
 
     bool camoufox_install_status_ready(const aida::burp::camoufox::install::status_t& st) {
@@ -173,6 +176,24 @@ namespace {
         if (st.module_version == "frozen-executable")
             return true;
         return !st.python_path.empty();
+    }
+
+    std::string camoufox_launcher_kind(const aida::burp::camoufox::install::status_t& st) {
+        if (st.module_version == "frozen-executable")
+            return "frozen_executable";
+        if (!st.python_path.empty())
+            return "python_module";
+        return "unresolved";
+    }
+
+    std::string camoufox_mcp_executable_label(const aida::burp::camoufox::install::status_t& st, const aida::burp::camoufox::bridge_status_t* bridge = nullptr) {
+        if (bridge && !bridge->server_command.empty())
+            return bridge->server_command;
+        if (st.module_version == "frozen-executable")
+            return "<frozen-executable>";
+        if (!st.python_path.empty())
+            return st.python_path + " -m camoufox_reverse_mcp";
+        return "<empty>";
     }
 
     aida::burp::camoufox::install::status_t bounded_burp_camoufox_probe(HANDLE hf, const char* tag, DWORD timeout_ms, bool& completed) {
@@ -186,10 +207,14 @@ namespace {
         const uint64_t elapsed = GetTickCount64() - t0;
         completed = result.status == test_lab::bounded_run_status_t::completed;
         if (completed) {
-            log_msg(hf, tag, "CAMOUFOX-PROBE -- completed elapsed_ms=%llu state=%s python=%s module=%s browser=%s message=%s",
+            const std::string launcher_kind = camoufox_launcher_kind(*state);
+            const std::string mcp_executable = camoufox_mcp_executable_label(*state);
+            log_msg(hf, tag, "CAMOUFOX-PROBE -- completed elapsed_ms=%llu state=%s launcher_kind=%s mcp_executable=%s python_path=%s module=%s browser=%s message=%s",
                 static_cast<unsigned long long>(elapsed),
                 camoufox_install_state_name(state->state),
-                state->python_path.empty() ? "<empty>" : state->python_path.c_str(),
+                launcher_kind.c_str(),
+                mcp_executable.c_str(),
+                state->python_path.empty() ? "<none>" : state->python_path.c_str(),
                 state->module_version.empty() ? "<empty>" : state->module_version.c_str(),
                 state->browser_path.empty() ? "<empty>" : state->browser_path.c_str(),
                 state->last_message.empty() ? "<empty>" : compact_burp_text(state->last_message, 600).c_str());
@@ -206,10 +231,14 @@ namespace {
         bool probe_completed = false;
         constexpr DWORD probe_timeout_ms = 9000;
         auto st = bounded_burp_camoufox_probe(hf, tag, probe_timeout_ms, probe_completed);
-        log_msg(hf, tag, "CAMOUFOX-SNAPSHOT -- probe_completed=%d state=%s python=%s module=%s browser=%s message=%s",
+        const std::string launcher_kind = camoufox_launcher_kind(st);
+        const std::string mcp_executable = camoufox_mcp_executable_label(st);
+        log_msg(hf, tag, "CAMOUFOX-SNAPSHOT -- probe_completed=%d state=%s launcher_kind=%s mcp_executable=%s python_path=%s module=%s browser=%s message=%s",
             probe_completed ? 1 : 0,
             camoufox_install_state_name(st.state),
-            st.python_path.empty() ? "<empty>" : st.python_path.c_str(),
+            launcher_kind.c_str(),
+            mcp_executable.c_str(),
+            st.python_path.empty() ? "<none>" : st.python_path.c_str(),
             st.module_version.empty() ? "<empty>" : st.module_version.c_str(),
             st.browser_path.empty() ? "<empty>" : st.browser_path.c_str(),
             st.last_message.empty() ? "<empty>" : compact_burp_text(st.last_message, 600).c_str());
@@ -3304,8 +3333,20 @@ namespace {
             (int)st.state, st.browser_open ? "true" : "false",
             (unsigned long long)st.total_calls, (unsigned long long)st.total_errors,
             ready_probe ? 1 : 0, st.child_pid, st.child_alive ? 1 : 0, st.page_verified ? 1 : 0, st.privacy_verified ? 1 : 0, st.cleanup_pending ? 1 : 0);
+        log_camoufox_bridge_snapshot(hf, tag, "status_bridge", st);
         if (!ready_probe || !live) {
-            fail_empty_evidence(hf, tag, failed, "Camoufox status has no same-run live bridge evidence");
+            fail_empty_evidence(hf, tag, failed,
+                "Camoufox status has no same-run live bridge evidence state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d launch_diag=%s cleanup_diag=%s privacy_diag=%s",
+                camoufox_bridge_state_name(st.state),
+                st.child_pid,
+                st.child_alive ? 1 : 0,
+                st.browser_open ? 1 : 0,
+                st.page_verified ? 1 : 0,
+                st.privacy_verified ? 1 : 0,
+                st.cleanup_pending ? 1 : 0,
+                compact_burp_json(st.last_launch_diagnostics, 300).c_str(),
+                compact_burp_json(st.cleanup_diagnostics, 300).c_str(),
+                compact_burp_json(st.privacy_diagnostics, 300).c_str());
             return;
         }
         log_msg(hf, tag, "PASS -- get_status paired with same-run live Camoufox bridge evidence child_pid=%u", st.child_pid);
@@ -3405,8 +3446,20 @@ namespace {
         log_msg(hf, tag, "FIELD -- last_error=\"%s\" len=%zu state=%s generation=%llu ready_probe=%d child_pid=%u child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d",
             err.c_str(), err.size(), camoufox_bridge_state_name(st.state), static_cast<unsigned long long>(st.generation),
             ready_probe ? 1 : 0, st.child_pid, st.child_alive ? 1 : 0, st.browser_open ? 1 : 0, st.page_verified ? 1 : 0, st.privacy_verified ? 1 : 0);
+        log_camoufox_bridge_snapshot(hf, tag, "last_error_bridge", st);
         if (!ready_probe || !live) {
-            fail_empty_evidence(hf, tag, failed, "camoufox last_error accessor has no same-run live bridge evidence");
+            fail_empty_evidence(hf, tag, failed,
+                "camoufox last_error accessor has no same-run live bridge evidence state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d launch_diag=%s cleanup_diag=%s privacy_diag=%s",
+                camoufox_bridge_state_name(st.state),
+                st.child_pid,
+                st.child_alive ? 1 : 0,
+                st.browser_open ? 1 : 0,
+                st.page_verified ? 1 : 0,
+                st.privacy_verified ? 1 : 0,
+                st.cleanup_pending ? 1 : 0,
+                compact_burp_json(st.last_launch_diagnostics, 300).c_str(),
+                compact_burp_json(st.cleanup_diagnostics, 300).c_str(),
+                compact_burp_json(st.privacy_diagnostics, 300).c_str());
             return;
         }
         log_msg(hf, tag, "PASS -- camoufox diagnostic accessor paired with same-run live bridge evidence child_pid=%u last_error_len=%zu", st.child_pid, err.size());
@@ -3419,9 +3472,13 @@ namespace {
         aida::burp::camoufox::install::status_t st;
         std::string reason;
         const bool ready = ensure_burp_camoufox_dependencies(hf, tag, reason, &st);
-        log_msg(hf, tag, "state=%s python=%s module_ver=%s browser=%s message=%s",
+        const std::string launcher_kind = camoufox_launcher_kind(st);
+        const std::string mcp_executable = camoufox_mcp_executable_label(st);
+        log_msg(hf, tag, "state=%s launcher_kind=%s mcp_executable=%s python_path=%s module_ver=%s browser=%s message=%s",
             camoufox_install_state_name(st.state),
-            st.python_path.empty() ? "<empty>" : st.python_path.c_str(),
+            launcher_kind.c_str(),
+            mcp_executable.c_str(),
+            st.python_path.empty() ? "<none>" : st.python_path.c_str(),
             st.module_version.empty() ? "<empty>" : st.module_version.c_str(),
             st.browser_path.empty() ? "<empty>" : st.browser_path.c_str(),
             st.last_message.empty() ? "<empty>" : st.last_message.c_str());
@@ -3430,9 +3487,11 @@ namespace {
             passed.fetch_add(1);
         } else {
             fail_empty_evidence(hf, tag, failed,
-                "Camoufox dependency setup failed-closed state=%s python=%s module=%s browser=%s message=%s reason=%s",
+                "Camoufox dependency setup failed-closed state=%s launcher_kind=%s mcp_executable=%s python_path=%s module=%s browser=%s message=%s reason=%s",
                 camoufox_install_state_name(st.state),
-                st.python_path.empty() ? "<empty>" : st.python_path.c_str(),
+                launcher_kind.c_str(),
+                mcp_executable.c_str(),
+                st.python_path.empty() ? "<none>" : st.python_path.c_str(),
                 st.module_version.empty() ? "<empty>" : st.module_version.c_str(),
                 st.browser_path.empty() ? "<empty>" : st.browser_path.c_str(),
                 st.last_message.empty() ? "<empty>" : st.last_message.c_str(),
@@ -4487,10 +4546,14 @@ namespace {
         std::string dependency_reason;
         if (!ensure_burp_camoufox_dependencies(hf, tag, dependency_reason, &install_before)) {
             auto bridge_before = aida::burp::camoufox::get_status();
-            log_msg(hf, tag, "dependency_fail install_state=%s message=%s python=%s module=%s browser=%s bridge_state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d reason=%s elapsed_ms=%llu",
+            const std::string launcher_kind = camoufox_launcher_kind(install_before);
+            const std::string mcp_executable = camoufox_mcp_executable_label(install_before, &bridge_before);
+            log_msg(hf, tag, "dependency_fail install_state=%s message=%s launcher_kind=%s mcp_executable=%s python_path=%s module=%s browser=%s bridge_state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d reason=%s elapsed_ms=%llu",
                 camoufox_install_state_name(install_before.state),
                 install_before.last_message.empty() ? "<empty>" : install_before.last_message.c_str(),
-                install_before.python_path.empty() ? "<empty>" : install_before.python_path.c_str(),
+                launcher_kind.c_str(),
+                mcp_executable.c_str(),
+                install_before.python_path.empty() ? "<none>" : install_before.python_path.c_str(),
                 install_before.module_version.empty() ? "<empty>" : install_before.module_version.c_str(),
                 install_before.browser_path.empty() ? "<empty>" : install_before.browser_path.c_str(),
                 camoufox_bridge_state_name(bridge_before.state),
@@ -4498,8 +4561,11 @@ namespace {
                 bridge_before.child_alive ? 1 : 0,
                 bridge_before.browser_open ? 1 : 0,
                 bridge_before.page_verified ? 1 : 0,
+                bridge_before.privacy_verified ? 1 : 0,
+                bridge_before.cleanup_pending ? 1 : 0,
                 dependency_reason.empty() ? "<empty>" : compact_burp_text(dependency_reason, 700).c_str(),
                 static_cast<unsigned long long>(GetTickCount64() - t0));
+            log_camoufox_bridge_snapshot(hf, tag, "dependency_fail_bridge", bridge_before);
             fail_empty_evidence(hf, tag, failed, "Camoufox bundled runtime is not ready; refusing launch to avoid Test Lab setup/download");
             return;
         }
@@ -4509,18 +4575,28 @@ namespace {
             bridge_before.child_alive &&
             bridge_before.browser_open &&
             bridge_before.page_verified &&
+            bridge_before.privacy_verified &&
             !bridge_before.cleanup_pending;
-        log_msg(hf, tag, "before install_state=%s message=%s python=%s module=%s browser=%s bridge_state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d",
+        const std::string before_launcher_kind = camoufox_launcher_kind(install_before);
+        const std::string before_mcp_executable = camoufox_mcp_executable_label(install_before, &bridge_before);
+        log_msg(hf, tag, "before install_state=%s message=%s launcher_kind=%s mcp_executable=%s python_path=%s module=%s browser=%s bridge_state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d child_processes=%u browser_processes=%u",
             camoufox_install_state_name(install_before.state),
             install_before.last_message.empty() ? "<empty>" : install_before.last_message.c_str(),
-            install_before.python_path.empty() ? "<empty>" : install_before.python_path.c_str(),
+            before_launcher_kind.c_str(),
+            before_mcp_executable.c_str(),
+            install_before.python_path.empty() ? "<none>" : install_before.python_path.c_str(),
             install_before.module_version.empty() ? "<empty>" : install_before.module_version.c_str(),
             install_before.browser_path.empty() ? "<empty>" : install_before.browser_path.c_str(),
             camoufox_bridge_state_name(bridge_before.state),
             bridge_before.child_pid,
             bridge_before.child_alive ? 1 : 0,
             bridge_before.browser_open ? 1 : 0,
-            bridge_before.page_verified ? 1 : 0);
+            bridge_before.page_verified ? 1 : 0,
+            bridge_before.privacy_verified ? 1 : 0,
+            bridge_before.cleanup_pending ? 1 : 0,
+            bridge_before.child_process_count,
+            bridge_before.browser_process_count);
+        log_camoufox_bridge_snapshot(hf, tag, "before_bridge", bridge_before);
         if (ready_before) {
             log_msg(hf, tag, "PASS -- reused pre-existing live Camoufox bridge child_pid=%u without forcing a cold launch",
                 bridge_before.child_pid);
@@ -4541,8 +4617,10 @@ namespace {
             bridge_after.child_alive &&
             bridge_after.browser_open &&
             bridge_after.page_verified &&
+            bridge_after.privacy_verified &&
             !bridge_after.cleanup_pending;
-        log_msg(hf, tag, "after launched=%d ready=%d bridge_state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d launched_ms=%llu last_error=%s elapsed_ms=%llu",
+        const std::string after_mcp_executable = camoufox_mcp_executable_label(install_before, &bridge_after);
+        log_msg(hf, tag, "after launched=%d ready=%d bridge_state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d child_processes=%u browser_processes=%u mcp_executable=%s launched_ms=%llu last_error=%s elapsed_ms=%llu",
             launched ? 1 : 0,
             ready ? 1 : 0,
             camoufox_bridge_state_name(bridge_after.state),
@@ -4550,12 +4628,31 @@ namespace {
             bridge_after.child_alive ? 1 : 0,
             bridge_after.browser_open ? 1 : 0,
             bridge_after.page_verified ? 1 : 0,
+            bridge_after.privacy_verified ? 1 : 0,
             bridge_after.cleanup_pending ? 1 : 0,
+            bridge_after.child_process_count,
+            bridge_after.browser_process_count,
+            after_mcp_executable.c_str(),
             static_cast<unsigned long long>(bridge_after.launched_ms),
             bridge_after.last_error.empty() ? "<empty>" : bridge_after.last_error.c_str(),
             static_cast<unsigned long long>(GetTickCount64() - t0));
+        log_camoufox_bridge_snapshot(hf, tag, "after_bridge", bridge_after);
         if (!ready) {
-            fail_empty_evidence(hf, tag, failed, "Camoufox browser did not launch into a ready live state");
+            fail_empty_evidence(hf, tag, failed,
+                "Camoufox browser did not launch into a ready live state state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d child_processes=%u browser_processes=%u last_error=%s launch_diag=%s cleanup_diag=%s privacy_diag=%s",
+                camoufox_bridge_state_name(bridge_after.state),
+                bridge_after.child_pid,
+                bridge_after.child_alive ? 1 : 0,
+                bridge_after.browser_open ? 1 : 0,
+                bridge_after.page_verified ? 1 : 0,
+                bridge_after.privacy_verified ? 1 : 0,
+                bridge_after.cleanup_pending ? 1 : 0,
+                bridge_after.child_process_count,
+                bridge_after.browser_process_count,
+                bridge_after.last_error.empty() ? "<empty>" : compact_burp_text(bridge_after.last_error, 360).c_str(),
+                compact_burp_json(bridge_after.last_launch_diagnostics, 360).c_str(),
+                compact_burp_json(bridge_after.cleanup_diagnostics, 360).c_str(),
+                compact_burp_json(bridge_after.privacy_diagnostics, 360).c_str());
             aida::burp::camoufox::close_browser("testlab.browser_running.launch_failed");
             return;
         }

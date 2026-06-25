@@ -4,8 +4,13 @@
 #include <string>
 #include <vector>
 
+#ifdef __NT__
+#include <thread>
+#endif
+
 #include <ida.hpp>
 #include <idp.hpp>
+#include <kernwin.hpp>
 #include <loader.hpp>
 
 #ifdef __NT__
@@ -45,5 +50,10 @@ private:
     bool features_initialized = false;
     bool ui_listener_hooked = false;
     bool actions_registered = false;
+    qtimer_t self_watchdog_timer = nullptr;
     std::string disabled_detail;
+#ifdef __NT__
+    std::thread public_ip_thread;
+    std::thread graphrag_load_thread;
+#endif
 };

@@ -23,6 +23,8 @@ public:
     instance_registry_t* registry() const { return _registry.get(); }
 
 private:
+    void server_thread_entry(int port);
+    void server_thread_finish(unsigned long seh, int port);
     void server_thread_func(int port);
 
     std::thread _server_thread;

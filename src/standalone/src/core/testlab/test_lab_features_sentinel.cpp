@@ -512,6 +512,11 @@ namespace {
 		r.parsed.push_back({ "reason", present ? "tier_a_driver_present" : "no_tier_a_hostile_driver_present" });
 		r.parsed.push_back({ "hostile_driver_absent", present ? "0" : "1" });
 		r.parsed.push_back({ "absence_expected_healthy", present ? "0" : "1" });
+		r.parsed.push_back({ "coverage_kind", present ? "health_present_review_required" : "health_absence" });
+		r.parsed.push_back({ "health_check_pass", (!present && ok) ? "1" : "0" });
+		r.parsed.push_back({ "positive_detection_coverage", "0" });
+		r.parsed.push_back({ "positive_fixture_available", "0" });
+		r.parsed.push_back({ "positive_detection_result", present ? "live_presence_not_controlled_fixture" : "not_exercised_absent" });
 		r.parsed.push_back({ "security_interpretation", present ? "tier_a_driver_present_review_required" : "healthy_no_tier_a_driver_present" });
 		if (present) {
 			r.ok = false;

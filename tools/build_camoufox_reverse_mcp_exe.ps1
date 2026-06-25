@@ -1152,13 +1152,20 @@ def _run_import_smoke():
         launch_code = getattr(browser_module.BrowserManager.launch, "__code__", None)
         launch_consts = repr(getattr(launch_code, "co_consts", ()))
         launch_names = repr(getattr(launch_code, "co_names", ()))
+        privacy_verify_code = getattr(getattr(browser_module, "_verify_page_privacy", None), "__code__", None)
+        privacy_verify_consts = repr(getattr(privacy_verify_code, "co_consts", ()))
         browser_recovery_consts = (
             repr(getattr(getattr(browser_module.BrowserManager.new_page, "__code__", None), "co_consts", ())) +
             repr(getattr(getattr(browser_module.BrowserManager.resolve_page, "__code__", None), "co_consts", ())) +
             repr(getattr(getattr(browser_module.BrowserManager._requested_page_id_blocker, "__code__", None), "co_consts", ())) +
-            repr(getattr(getattr(browser_module.BrowserManager._attach_listeners, "__code__", None), "co_consts", ()))
+            repr(getattr(getattr(browser_module.BrowserManager._attach_listeners, "__code__", None), "co_consts", ())) +
+            repr(getattr(getattr(browser_module.BrowserManager._mark_page_terminal, "__code__", None), "co_consts", ()))
         )
         navigation_consts = repr(getattr(getattr(navigation_module.navigate, "__code__", None), "co_consts", ()))
+        launch_browser_consts = (
+            repr(getattr(getattr(navigation_module.launch_browser, "__code__", None), "co_consts", ())) +
+            repr(getattr(getattr(navigation_module.launch_browser, "__code__", None), "co_names", ()))
+        )
         network_consts = repr(getattr(getattr(network_module.list_network_requests, "__code__", None), "co_consts", ()))
         if pageerror_patch_marker != "aida_playwright_pageerror_location_patch_20260620_1":
             raise RuntimeError(f"frozen Playwright pageError patch marker mismatch: {pageerror_patch_marker!r}")
@@ -1168,9 +1175,20 @@ def _run_import_smoke():
             raise RuntimeError("frozen browser launch diagnostics missing")
         if "AIDA_CAMOUFOX_BRIDGE_PATCH_ID" not in launch_names:
             raise RuntimeError("frozen browser launch patch marker missing")
-        for marker in ("browser_page_id_unavailable", "resolve_page_default_recovery_begin", "requestfinished", "websocket"):
+        for marker in ("launch_new_page_task_result",):
+            if marker not in launch_consts:
+                raise RuntimeError(f"frozen browser launch marker missing: {marker}")
+        for marker in ("privacy_verify_begin", "privacy_verify_probe_begin", "privacy_verify_exception"):
+            if marker not in privacy_verify_consts:
+                raise RuntimeError(f"frozen browser privacy marker missing: {marker}")
+        if not hasattr(browser_module.BrowserManager, "last_launch_failure_payload"):
+            raise RuntimeError("frozen browser launch failure payload marker missing")
+        for marker in ("browser_page_id_unavailable", "resolve_page_default_recovery_begin", "page_closed_during_launch", "requestfinished", "websocket"):
             if marker not in browser_recovery_consts:
                 raise RuntimeError(f"frozen browser recovery marker missing: {marker}")
+        for marker in ("launch_browser_tool_exception", "last_launch_failure_payload"):
+            if marker not in launch_browser_consts:
+                raise RuntimeError(f"frozen launch_browser diagnostic marker missing: {marker}")
         for marker in ("bloxflip_navigation_state", "diagnostic_navigation_goto_exception", "network_capture"):
             if marker not in navigation_consts:
                 raise RuntimeError(f"frozen navigation diagnostic marker missing: {marker}")

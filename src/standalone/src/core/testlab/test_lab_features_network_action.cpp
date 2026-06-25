@@ -39,6 +39,12 @@ namespace {
 		r.parsed.push_back({ std::string(label), std::string(buf) });
 	}
 
+	void push_u64(test_lab::result_t& r, const char* label, std::uint64_t value) {
+		char buf[32];
+		std::snprintf(buf, sizeof(buf), "%llu", static_cast<unsigned long long>(value));
+		r.parsed.push_back({ std::string(label), std::string(buf) });
+	}
+
 	void push_text(test_lab::result_t& r, const char* label, const std::string& value) {
 		r.parsed.push_back({ std::string(label), value });
 	}
@@ -709,6 +715,97 @@ namespace {
 				++matches;
 		}
 		return matches;
+	}
+
+	struct bw_process_evidence_t {
+		std::uint32_t matching_entries = 0u;
+		std::uint32_t nonzero_matching_entries = 0u;
+		std::uint64_t bytes_sent = 0u;
+		std::uint64_t bytes_recv = 0u;
+		std::uint64_t packets_sent = 0u;
+		std::uint64_t packets_recv = 0u;
+		std::uint64_t first_activity_time = 0u;
+		std::uint64_t last_activity_time = 0u;
+	};
+
+	bw_process_evidence_t collect_bw_process_evidence(const voyager::detail::bw_monitor_request& req,
+		std::uint32_t expected_pid)
+	{
+		bw_process_evidence_t evidence{};
+		std::uint32_t cap = req.process_count;
+		if (cap > voyager::detail::BW_MAX_PROCESSES)
+			cap = voyager::detail::BW_MAX_PROCESSES;
+		for (std::uint32_t i = 0; i < cap; ++i) {
+			const auto& p = req.processes[i];
+			if (expected_pid != 0u && p.pid != expected_pid)
+				continue;
+			++evidence.matching_entries;
+			evidence.bytes_sent += p.bytes_sent;
+			evidence.bytes_recv += p.bytes_recv;
+			evidence.packets_sent += p.packets_sent;
+			evidence.packets_recv += p.packets_recv;
+			if (bw_process_entry_nonzero(p))
+				++evidence.nonzero_matching_entries;
+			if (p.last_activity_time != 0u) {
+				if (evidence.first_activity_time == 0u || p.last_activity_time < evidence.first_activity_time)
+					evidence.first_activity_time = p.last_activity_time;
+				if (p.last_activity_time > evidence.last_activity_time)
+					evidence.last_activity_time = p.last_activity_time;
+			}
+		}
+		return evidence;
+	}
+
+	std::uint64_t current_system_time_100ns() {
+		FILETIME ft{};
+		GetSystemTimeAsFileTime(&ft);
+		ULARGE_INTEGER value{};
+		value.LowPart = ft.dwLowDateTime;
+		value.HighPart = ft.dwHighDateTime;
+		return value.QuadPart;
+	}
+
+	void push_bw_rate_evidence(test_lab::result_t& r,
+		const voyager::detail::bw_monitor_request& aggregate,
+		const bw_process_evidence_t& process_evidence,
+		std::uint64_t rate_window_ms,
+		bool fixture_ok,
+		std::uint32_t fixture_packets)
+	{
+		const bool cumulative_activity =
+			bw_totals_nonzero(aggregate) ||
+			process_evidence.bytes_sent != 0u ||
+			process_evidence.bytes_recv != 0u ||
+			process_evidence.packets_sent != 0u ||
+			process_evidence.packets_recv != 0u ||
+			(fixture_ok && fixture_packets != 0u);
+		const bool rate_sample_valid = rate_window_ms >= 1000u;
+		const bool rate_nonzero = aggregate.bytes_per_second_out != 0u || aggregate.bytes_per_second_in != 0u;
+		const std::uint64_t now_100ns = current_system_time_100ns();
+		const std::uint64_t last_activity_age_ms =
+			(process_evidence.last_activity_time != 0u && now_100ns >= process_evidence.last_activity_time)
+			? ((now_100ns - process_evidence.last_activity_time) / 10000u)
+			: 0u;
+		push_u64(r, "Rate window elapsed ms", rate_window_ms);
+		push_hex64(r, "Rate numerator bytes sent", aggregate.total_bytes_sent);
+		push_hex64(r, "Rate numerator bytes recv", aggregate.total_bytes_recv);
+		push_u64(r, "Rate divisor ms", rate_window_ms);
+		push_u32(r, "Rate sample valid", rate_sample_valid ? 1u : 0u);
+		push_text(r, "Rate sample invalid reason", rate_sample_valid ? "none" : "subsecond_monitoring_window");
+		push_u32(r, "Rate throughput proof", (rate_sample_valid && rate_nonzero) ? 1u : 0u);
+		push_u32(r, "Cumulative counter proof", cumulative_activity ? 1u : 0u);
+		push_hex64(r, "First process activity time", process_evidence.first_activity_time);
+		push_hex64(r, "Last process activity time", process_evidence.last_activity_time);
+		push_u64(r, "Last activity age ms", last_activity_age_ms);
+		push_hex64(r, "Matching process bytes sent", process_evidence.bytes_sent);
+		push_hex64(r, "Matching process bytes recv", process_evidence.bytes_recv);
+		push_hex64(r, "Matching process packets sent", process_evidence.packets_sent);
+		push_hex64(r, "Matching process packets recv", process_evidence.packets_recv);
+		push_u32(r, "Nonzero matching process entries", process_evidence.nonzero_matching_entries);
+		const bool aggregate_receive_without_process_receive = aggregate.total_bytes_recv != 0u && process_evidence.bytes_recv == 0u;
+		push_u32(r, "Aggregate receive without process receive", aggregate_receive_without_process_receive ? 1u : 0u);
+		push_text(r, "Per-process receive attribution",
+			aggregate_receive_without_process_receive ? "aggregate_receive_without_matching_process_receive_observed" : "matching_process_receive_consistent_or_no_aggregate_receive");
 	}
 
 	void append_bw_process_entries(test_lab::result_t& r, const voyager::detail::bw_monitor_request& req) {
@@ -1535,6 +1632,7 @@ namespace {
 			(void)bwmn_send("lifecycle_reset_before", reset, bytes_returned);
 			voyager::detail::bw_monitor_request start{};
 			start.operation = 0u;
+			const std::uint64_t monitor_start_tick = static_cast<std::uint64_t>(GetTickCount64());
 			if (!bwmn_send("lifecycle_start", start, bytes_returned)) {
 				r.bytes_returned = bytes_returned;
 				r.raw.resize(sizeof(start));
@@ -1557,6 +1655,7 @@ namespace {
 			aggregate.filter_pid = 0u;
 			std::uint32_t aggregate_bytes_returned = 0u;
 			const bool aggregate_ok = bwmn_send("lifecycle_query_aggregate", aggregate, aggregate_bytes_returned);
+			const std::uint64_t aggregate_query_tick = static_cast<std::uint64_t>(GetTickCount64());
 			voyager::detail::bw_monitor_request per_process{};
 			per_process.operation = 4u;
 			per_process.filter_pid = self_pid;
@@ -1575,6 +1674,12 @@ namespace {
 			std::memcpy(r.raw.data(), &per_process, sizeof(per_process));
 			std::uint32_t nonzero_process_entries = 0u;
 			const std::uint32_t matching_self_pid = count_matching_bw_processes(per_process, self_pid, nonzero_process_entries);
+			const bw_process_evidence_t process_evidence = collect_bw_process_evidence(per_process, self_pid);
+			const std::uint64_t rate_window_elapsed_ms = aggregate_query_tick >= monitor_start_tick
+				? aggregate_query_tick - monitor_start_tick
+				: 0u;
+			const bool rate_sample_valid = rate_window_elapsed_ms >= 1000u;
+			const bool rate_nonzero = aggregate.bytes_per_second_out != 0u || aggregate.bytes_per_second_in != 0u;
 			push_text(r, "Operation", "Lifecycle reset/start/traffic/aggregate/per-process/stop/reset");
 			push_text(r, "Coverage", "aggregate_and_per_process");
 			push_u32(r, "Stimulus PID", self_pid);
@@ -1593,6 +1698,7 @@ namespace {
 			push_hex64(r, "Bytes/sec in", aggregate.bytes_per_second_in);
 			push_u32(r, "Matching stimulus PID entries", matching_self_pid);
 			push_u32(r, "Nonzero process entries", nonzero_process_entries);
+			push_bw_rate_evidence(r, aggregate, process_evidence, rate_window_elapsed_ms, fixture_ok, fixture_packets);
 			append_bw_process_entries(r, per_process);
 			if (!aggregate_ok) {
 				fail_result(r, "BWMN lifecycle aggregate query send_ioctl_raw returned false");
@@ -1617,6 +1723,10 @@ namespace {
 			}
 			if (!bw_totals_nonzero(aggregate)) {
 				fail_result(r, "BWMN lifecycle aggregate query returned zero counters after UDP fixture traffic");
+				return;
+			}
+			if (rate_sample_valid && !rate_nonzero) {
+				fail_result(r, "BWMN lifecycle returned zero throughput rates after a valid monitoring window with fixture traffic");
 				return;
 			}
 			if (per_process.process_count == 0u) {

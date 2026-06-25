@@ -46,6 +46,91 @@ namespace {
     std::atomic<std::uint32_t> g_server_token_relay_inflight{0};
     std::atomic<std::uint64_t> g_remote_call_um_sequence{1};
 
+    struct remote_call_um_attempt_diag_t {
+        const char* failure_class = "none";
+        DWORD gle = ERROR_SUCCESS;
+        DWORD tid = 0;
+        DWORD scanned = 0;
+        LONG ntstatus = 0;
+        int poll_failures = 0;
+        bool selected = false;
+        bool request_sent = false;
+        bool hijack_set = false;
+    };
+
+    struct remote_call_um_failure_counts_t {
+        int no_suitable_thread = 0;
+        int request_send_failed = 0;
+        int poll_timeout = 0;
+        int poll_ioctl_failed = 0;
+        int context_restore_failed = 0;
+        int hijack_set_failed = 0;
+        int thread_snapshot_failed = 0;
+        int thread_blacklisted = 0;
+        int unknown = 0;
+    };
+
+    thread_local remote_call_um_attempt_diag_t g_remote_call_um_attempt_diag{};
+
+    void remote_call_um_set_failure(const char* failure_class,
+                                    DWORD gle,
+                                    DWORD tid,
+                                    DWORD scanned,
+                                    LONG ntstatus = 0,
+                                    int poll_failures = 0) noexcept
+    {
+        g_remote_call_um_attempt_diag.failure_class = failure_class && failure_class[0] ? failure_class : "unknown";
+        g_remote_call_um_attempt_diag.gle = gle;
+        g_remote_call_um_attempt_diag.tid = tid;
+        g_remote_call_um_attempt_diag.scanned = scanned;
+        g_remote_call_um_attempt_diag.ntstatus = ntstatus;
+        g_remote_call_um_attempt_diag.poll_failures = poll_failures;
+    }
+
+    void remote_call_um_note_failure(remote_call_um_failure_counts_t& counts, const char* failure_class) noexcept
+    {
+        if (!failure_class || !failure_class[0] || std::strcmp(failure_class, "none") == 0) {
+            ++counts.unknown;
+        } else if (std::strcmp(failure_class, "no_suitable_thread") == 0) {
+            ++counts.no_suitable_thread;
+        } else if (std::strcmp(failure_class, "request_send_failed") == 0) {
+            ++counts.request_send_failed;
+        } else if (std::strcmp(failure_class, "poll_timeout") == 0) {
+            ++counts.poll_timeout;
+        } else if (std::strcmp(failure_class, "poll_ioctl_failed") == 0) {
+            ++counts.poll_ioctl_failed;
+        } else if (std::strcmp(failure_class, "context_restore_failed") == 0) {
+            ++counts.context_restore_failed;
+        } else if (std::strcmp(failure_class, "hijack_set_failed") == 0) {
+            ++counts.hijack_set_failed;
+        } else if (std::strcmp(failure_class, "thread_snapshot_failed") == 0) {
+            ++counts.thread_snapshot_failed;
+        } else if (std::strcmp(failure_class, "thread_blacklisted") == 0) {
+            ++counts.thread_blacklisted;
+        } else {
+            ++counts.unknown;
+        }
+    }
+
+    DWORD remote_call_um_failure_gle(const remote_call_um_attempt_diag_t& diag) noexcept
+    {
+        if (diag.gle != ERROR_SUCCESS)
+            return diag.gle;
+        if (std::strcmp(diag.failure_class, "no_suitable_thread") == 0)
+            return ERROR_NOT_FOUND;
+        if (std::strcmp(diag.failure_class, "thread_snapshot_failed") == 0)
+            return ERROR_GEN_FAILURE;
+        if (std::strcmp(diag.failure_class, "request_send_failed") == 0)
+            return ERROR_IO_DEVICE;
+        if (std::strcmp(diag.failure_class, "poll_ioctl_failed") == 0)
+            return ERROR_IO_DEVICE;
+        if (std::strcmp(diag.failure_class, "hijack_set_failed") == 0)
+            return ERROR_ACCESS_DENIED;
+        if (std::strcmp(diag.failure_class, "context_restore_failed") == 0)
+            return ERROR_ACCESS_DENIED;
+        return ERROR_TIMEOUT;
+    }
+
     struct server_token_relay_scope_t {
         server_token_relay_scope_t() noexcept
         {
@@ -470,7 +555,7 @@ bool voyager::device_t::decode_ioctl_offset_snapshot(DWORD control_code, std::ui
     const std::uint32_t instance_base = compute_ioctl_base_snapshot();
     if (encoded >= instance_base) {
         const std::uint32_t candidate = encoded - instance_base;
-        if (candidate <= 59u) {
+        if (candidate <= 62u) {
             offset = candidate;
             return true;
         }
@@ -480,7 +565,7 @@ bool voyager::device_t::decode_ioctl_offset_snapshot(DWORD control_code, std::ui
     const std::uint32_t synced_base = ioctl_codes::get_base();
     if (encoded >= synced_base) {
         const std::uint32_t candidate = encoded - synced_base;
-        if (candidate <= 59u) {
+        if (candidate <= 62u) {
             offset = candidate;
             return true;
         }
@@ -498,7 +583,7 @@ bool voyager::device_t::decode_ioctl_offset_snapshot(DWORD control_code, std::ui
     ioctl_codes::g_server_ioctl_seed = saved_ioctl_seed;
     if (encoded >= base_unseeded) {
         const std::uint32_t candidate = encoded - base_unseeded;
-        if (candidate <= 59u) {
+        if (candidate <= 62u) {
             offset = candidate;
             return true;
         }
@@ -1845,6 +1930,8 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
 
     const std::uint64_t call_id = g_remote_call_um_sequence.fetch_add(1, std::memory_order_acq_rel);
     const ULONGLONG call_start = GetTickCount64();
+    remote_call_um_failure_counts_t failure_counts{};
+    SetLastError(ERROR_SUCCESS);
     RC_UM_DBG("call_function: ENTER target=0x%llX args=(0x%llX, 0x%llX, 0x%llX, 0x%llX)",
         function_address, arg1, arg2, arg3, arg4);
     diag::log_tagged_fmt("comm",
@@ -1865,20 +1952,27 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
         static_cast<unsigned long>(GetCurrentThreadId()));
 
     if (!is_connected() || dtb_ == 0 || function_address == 0) {
+        const DWORD reject_gle = function_address == 0 ? ERROR_INVALID_PARAMETER : ERROR_INVALID_HANDLE;
+        SetLastError(reject_gle);
         RC_UM_DBG("call_function: ABORT connected=%d dtb=0x%llX func=0x%llX",
             is_connected() ? 1 : 0, dtb_, function_address);
         diag::log_tagged_fmt("comm",
-            "remote_call_um_reject call_id=%llu reason=invalid_state connected=%d pid=%u dtb=0x%llX fn=0x%llX elapsed_ms=%llu",
+            "remote_call_um_reject call_id=%llu reason=invalid_state connected=%d pid=%u dtb=0x%llX fn=0x%llX elapsed_ms=%llu gle=%lu",
             static_cast<unsigned long long>(call_id),
             is_connected() ? 1 : 0,
             process_id_,
             static_cast<unsigned long long>(dtb_),
             static_cast<unsigned long long>(function_address),
-            static_cast<unsigned long long>(GetTickCount64() - call_start));
+            static_cast<unsigned long long>(GetTickCount64() - call_start),
+            static_cast<unsigned long>(reject_gle));
         return 0;
     }
 
     if (!ensure_shellcode_allocated()) {
+        DWORD err = GetLastError();
+        if (err == ERROR_SUCCESS)
+            err = ERROR_OUTOFMEMORY;
+        SetLastError(err);
         RC_UM_DBG("call_function: ensure_shellcode_allocated FAILED");
         diag::log_tagged_fmt("comm",
             "remote_call_um_reject call_id=%llu reason=shellcode_alloc_failed pid=%u dtb=0x%llX fn=0x%llX elapsed_ms=%llu gle=%lu",
@@ -1887,10 +1981,14 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
             static_cast<unsigned long long>(dtb_),
             static_cast<unsigned long long>(function_address),
             static_cast<unsigned long long>(GetTickCount64() - call_start),
-            static_cast<unsigned long>(GetLastError()));
+            static_cast<unsigned long>(err));
         return 0;
     }
     if (!find_spoof_gadget()) {
+        DWORD err = GetLastError();
+        if (err == ERROR_SUCCESS)
+            err = ERROR_NOT_FOUND;
+        SetLastError(err);
         RC_UM_DBG("call_function: find_spoof_gadget FAILED");
         diag::log_tagged_fmt("comm",
             "remote_call_um_reject call_id=%llu reason=spoof_gadget_missing pid=%u dtb=0x%llX shellcode=0x%llX fn=0x%llX elapsed_ms=%llu gle=%lu",
@@ -1900,10 +1998,14 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
             static_cast<unsigned long long>(shellcode_address_),
             static_cast<unsigned long long>(function_address),
             static_cast<unsigned long long>(GetTickCount64() - call_start),
-            static_cast<unsigned long>(GetLastError()));
+            static_cast<unsigned long>(err));
         return 0;
     }
     if (!thread_hijack::initialize()) {
+        DWORD err = GetLastError();
+        if (err == ERROR_SUCCESS)
+            err = ERROR_NOT_READY;
+        SetLastError(err);
         RC_UM_DBG("call_function: thread_hijack::initialize FAILED");
         diag::log_tagged_fmt("comm",
             "remote_call_um_reject call_id=%llu reason=thread_hijack_init_failed pid=%u dtb=0x%llX shellcode=0x%llX spoof=0x%llX fn=0x%llX elapsed_ms=%llu gle=%lu",
@@ -1914,7 +2016,7 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
             static_cast<unsigned long long>(spoof_gadget_),
             static_cast<unsigned long long>(function_address),
             static_cast<unsigned long long>(GetTickCount64() - call_start),
-            static_cast<unsigned long>(GetLastError()));
+            static_cast<unsigned long>(err));
         return 0;
     }
 
@@ -1939,6 +2041,7 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
         }
 
         bool attempt_completed = false;
+        g_remote_call_um_attempt_diag = {};
         diag::log_tagged_fmt("comm",
             "remote_call_um_attempt_begin call_id=%llu attempt=%d max_attempts=%d pid=%u dtb=0x%llX shellcode=0x%llX spoof=0x%llX fn=0x%llX blacklist_count=%d elapsed_ms=%llu",
             static_cast<unsigned long long>(call_id),
@@ -1955,24 +2058,43 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
             call_id, attempt + 1, function_address, arg1, arg2, arg3, arg4,
             blacklist, blacklist_count, attempt_completed);
         diag::log_tagged_fmt("comm",
-            "remote_call_um_attempt_done call_id=%llu attempt=%d completed=%d result=0x%llX last_failed_tid=%u blacklist_count=%d elapsed_ms=%llu",
+            "remote_call_um_attempt_done call_id=%llu attempt=%d completed=%d result=0x%llX failure_class=%s failure_gle=%lu selected_tid=%u scanned=%u ntstatus=0x%08lX poll_failures=%d request_sent=%d hijack_set=%d last_failed_tid=%u blacklist_count=%d elapsed_ms=%llu",
             static_cast<unsigned long long>(call_id),
             attempt + 1,
             attempt_completed ? 1 : 0,
             static_cast<unsigned long long>(result),
+            g_remote_call_um_attempt_diag.failure_class,
+            static_cast<unsigned long>(remote_call_um_failure_gle(g_remote_call_um_attempt_diag)),
+            g_remote_call_um_attempt_diag.tid,
+            g_remote_call_um_attempt_diag.scanned,
+            static_cast<unsigned long>(g_remote_call_um_attempt_diag.ntstatus),
+            g_remote_call_um_attempt_diag.poll_failures,
+            g_remote_call_um_attempt_diag.request_sent ? 1 : 0,
+            g_remote_call_um_attempt_diag.hijack_set ? 1 : 0,
             last_failed_tid_,
             blacklist_count,
             static_cast<unsigned long long>(GetTickCount64() - call_start));
 
         if (attempt_completed) {
+            SetLastError(ERROR_SUCCESS);
             diag::log_tagged_fmt("comm",
-                "remote_call_um_exit call_id=%llu completed=1 result=0x%llX attempts=%d elapsed_ms=%llu",
+                "remote_call_um_exit call_id=%llu completed=1 reason=executed result=0x%llX attempts=%d no_suitable_thread=%d request_send_failed=%d poll_timeout=%d poll_ioctl_failed=%d hijack_set_failed=%d context_restore_failed=%d thread_snapshot_failed=%d unknown=%d elapsed_ms=%llu",
                 static_cast<unsigned long long>(call_id),
                 static_cast<unsigned long long>(result),
                 attempt + 1,
+                failure_counts.no_suitable_thread,
+                failure_counts.request_send_failed,
+                failure_counts.poll_timeout,
+                failure_counts.poll_ioctl_failed,
+                failure_counts.hijack_set_failed,
+                failure_counts.context_restore_failed,
+                failure_counts.thread_snapshot_failed,
+                failure_counts.unknown,
                 static_cast<unsigned long long>(GetTickCount64() - call_start));
             return result;
         }
+
+        remote_call_um_note_failure(failure_counts, g_remote_call_um_attempt_diag.failure_class);
 
 
         if (last_failed_tid_ != 0 && blacklist_count < MAX_ATTEMPTS) {
@@ -1982,24 +2104,48 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
 
         if (shellcode_address_ == 0) {
             if (!ensure_shellcode_allocated()) {
+                DWORD err = GetLastError();
+                if (err == ERROR_SUCCESS)
+                    err = ERROR_OUTOFMEMORY;
+                SetLastError(err);
                 RC_UM_DBG("call_function: re-alloc FAILED on attempt %d", attempt + 1);
                 diag::log_tagged_fmt("comm",
-                    "remote_call_um_exit call_id=%llu completed=0 reason=realloc_failed attempts=%d elapsed_ms=%llu gle=%lu",
+                    "remote_call_um_exit call_id=%llu completed=0 reason=realloc_failed attempts=%d no_suitable_thread=%d request_send_failed=%d poll_timeout=%d poll_ioctl_failed=%d hijack_set_failed=%d context_restore_failed=%d thread_snapshot_failed=%d unknown=%d elapsed_ms=%llu gle=%lu",
                     static_cast<unsigned long long>(call_id),
                     attempt + 1,
+                    failure_counts.no_suitable_thread,
+                    failure_counts.request_send_failed,
+                    failure_counts.poll_timeout,
+                    failure_counts.poll_ioctl_failed,
+                    failure_counts.hijack_set_failed,
+                    failure_counts.context_restore_failed,
+                    failure_counts.thread_snapshot_failed,
+                    failure_counts.unknown,
                     static_cast<unsigned long long>(GetTickCount64() - call_start),
-                    static_cast<unsigned long>(GetLastError()));
+                    static_cast<unsigned long>(err));
                 return 0;
             }
         }
     }
 
     RC_UM_DBG("call_function: ALL %d attempts FAILED for target=0x%llX", MAX_ATTEMPTS, function_address);
+    const DWORD final_gle = remote_call_um_failure_gle(g_remote_call_um_attempt_diag);
+    SetLastError(final_gle);
     diag::log_tagged_fmt("comm",
-        "remote_call_um_exit call_id=%llu completed=0 reason=attempts_exhausted attempts=%d last_failed_tid=%u elapsed_ms=%llu",
+        "remote_call_um_exit call_id=%llu completed=0 reason=attempts_exhausted attempts=%d final_failure_class=%s final_gle=%lu last_failed_tid=%u no_suitable_thread=%d request_send_failed=%d poll_timeout=%d poll_ioctl_failed=%d hijack_set_failed=%d context_restore_failed=%d thread_snapshot_failed=%d unknown=%d elapsed_ms=%llu",
         static_cast<unsigned long long>(call_id),
         MAX_ATTEMPTS,
+        g_remote_call_um_attempt_diag.failure_class,
+        static_cast<unsigned long>(final_gle),
         last_failed_tid_,
+        failure_counts.no_suitable_thread,
+        failure_counts.request_send_failed,
+        failure_counts.poll_timeout,
+        failure_counts.poll_ioctl_failed,
+        failure_counts.hijack_set_failed,
+        failure_counts.context_restore_failed,
+        failure_counts.thread_snapshot_failed,
+        failure_counts.unknown,
         static_cast<unsigned long long>(GetTickCount64() - call_start));
     return 0;
 }
@@ -2172,12 +2318,15 @@ std::uint64_t voyager::device_t::call_function_attempt(
 
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if (snapshot == INVALID_HANDLE_VALUE) {
+        DWORD err = GetLastError();
+        remote_call_um_set_failure("thread_snapshot_failed", err, 0, 0);
         diag::log_tagged_fmt("comm",
             "remote_call_um_attempt_abort call_id=%llu attempt=%d reason=thread_snapshot_failed gle=%lu elapsed_ms=%llu",
             static_cast<unsigned long long>(call_id),
             attempt_index,
-            static_cast<unsigned long>(GetLastError()),
+            static_cast<unsigned long>(err),
             static_cast<unsigned long long>(GetTickCount64() - attempt_start));
+        SetLastError(err);
         return 0;
     }
 
@@ -2194,6 +2343,7 @@ std::uint64_t voyager::device_t::call_function_attempt(
     std::int32_t best_priority = -999;
     HANDLE best_thread = nullptr;
     DWORD best_tid = 0;
+    ULONG best_prev_count = 0;
     CONTEXT best_ctx{};
 
     if (Thread32First(snapshot, &te)) {
@@ -2283,6 +2433,7 @@ std::uint64_t voyager::device_t::call_function_attempt(
                                     best_priority = priority;
                                     best_thread = th;
                                     best_tid = te.th32ThreadID;
+                                    best_prev_count = prev_count;
                                     best_ctx = ctx;
                                     continue;
                                 }
@@ -2303,15 +2454,18 @@ std::uint64_t voyager::device_t::call_function_attempt(
     CloseHandle(snapshot);
 
     if (!best_thread || best_tid == 0) {
+        remote_call_um_set_failure("no_suitable_thread", ERROR_NOT_FOUND, 0, thread_scan_count);
+        SetLastError(ERROR_NOT_FOUND);
         RC_UM_DBG("call_function: NO suitable thread found (scanned %u)", thread_scan_count);
         diag::log_tagged_fmt("comm",
-            "remote_call_um_attempt_abort call_id=%llu attempt=%d reason=no_suitable_thread scanned=%u blacklist_count=%d last_failed_tid=%u elapsed_ms=%llu",
+            "remote_call_um_attempt_abort call_id=%llu attempt=%d reason=no_suitable_thread scanned=%u blacklist_count=%d last_failed_tid=%u elapsed_ms=%llu gle=%lu",
             static_cast<unsigned long long>(call_id),
             attempt_index,
             thread_scan_count,
             blacklist_count,
             last_failed_tid_,
-            static_cast<unsigned long long>(GetTickCount64() - attempt_start));
+            static_cast<unsigned long long>(GetTickCount64() - attempt_start),
+            static_cast<unsigned long>(ERROR_NOT_FOUND));
         return 0;
     }
 
@@ -2323,7 +2477,7 @@ std::uint64_t voyager::device_t::call_function_attempt(
     RC_UM_DBG("call_function: SELECTED tid=%u rip=0x%llX rsp=0x%llX priority=%d in_ntdll=%d in_target=%d scanned=%u",
         target_tid, best_ctx.Rip, best_ctx.Rsp, best_priority, is_in_ntdll ? 1 : 0, is_in_target ? 1 : 0, thread_scan_count);
     diag::log_tagged_fmt("comm",
-        "remote_call_um_selected_thread call_id=%llu attempt=%d pid=%u tid=%u scanned=%u priority=%d in_ntdll=%d in_target=%d rip=0x%llX rsp=0x%llX prev_last_hijacked=%u elapsed_ms=%llu",
+        "remote_call_um_selected_thread call_id=%llu attempt=%d pid=%u tid=%u scanned=%u priority=%d in_ntdll=%d in_target=%d rip=0x%llX rsp=0x%llX suspend_count=%lu thread_state=unknown wait_reason=unknown role=unknown prev_last_hijacked=%u elapsed_ms=%llu",
         static_cast<unsigned long long>(call_id),
         attempt_index,
         process_id_,
@@ -2334,8 +2488,12 @@ std::uint64_t voyager::device_t::call_function_attempt(
         is_in_target ? 1 : 0,
         static_cast<unsigned long long>(best_ctx.Rip),
         static_cast<unsigned long long>(best_ctx.Rsp),
+        static_cast<unsigned long>(best_prev_count),
         last_hijacked_tid_,
         static_cast<unsigned long long>(GetTickCount64() - attempt_start));
+    g_remote_call_um_attempt_diag.selected = true;
+    g_remote_call_um_attempt_diag.tid = target_tid;
+    g_remote_call_um_attempt_diag.scanned = thread_scan_count;
 
     thread_hijack::scatter_timing();
 
@@ -2343,7 +2501,31 @@ std::uint64_t voyager::device_t::call_function_attempt(
 
 
     constexpr std::uint64_t EXEC_DONE_OFFSET = 0x50;
-    write<std::uint64_t>(context_base + EXEC_DONE_OFFSET, 0);
+    constexpr std::uint64_t RESULT_VALUE_OFFSET = 0x30;
+    constexpr std::uint64_t SAVED_RSP_OFFSET = 0x38;
+    std::uint64_t zero_done = 0;
+    const std::size_t done_write_bytes = write_raw(context_base + EXEC_DONE_OFFSET, &zero_done, sizeof(zero_done));
+    const bool done_write_ok = done_write_bytes == sizeof(zero_done);
+    diag::log_tagged_fmt("comm",
+        "remote_call_um_context_slots call_id=%llu attempt=%d pid=%u tid=%u shellcode=0x%llX result_addr=0x%llX saved_rsp_addr=0x%llX completed_addr=0x%llX completed_zero_write=%d completed_zero_bytes=%zu elapsed_ms=%llu",
+        static_cast<unsigned long long>(call_id),
+        attempt_index,
+        process_id_,
+        target_tid,
+        static_cast<unsigned long long>(context_base),
+        static_cast<unsigned long long>(context_base + RESULT_VALUE_OFFSET),
+        static_cast<unsigned long long>(context_base + SAVED_RSP_OFFSET),
+        static_cast<unsigned long long>(context_base + EXEC_DONE_OFFSET),
+        done_write_ok ? 1 : 0,
+        done_write_bytes,
+        static_cast<unsigned long long>(GetTickCount64() - attempt_start));
+    if (!done_write_ok) {
+        remote_call_um_set_failure("request_send_failed", ERROR_WRITE_FAULT, target_tid, thread_scan_count);
+        thread_hijack::indirect_NtResumeThread(target_thread, nullptr);
+        thread_hijack::indirect_NtClose(target_thread);
+        SetLastError(ERROR_WRITE_FAULT);
+        return 0;
+    }
 
     detail::remote_call_request req{};
     req.dtb = dtb_;
@@ -2377,7 +2559,10 @@ std::uint64_t voyager::device_t::call_function_attempt(
         static_cast<unsigned long long>(request_fp),
         static_cast<unsigned long long>(GetTickCount64() - attempt_start));
     if (!send_request(ioctl_codes::RC(), &req, sizeof(req))) {
-        const DWORD send_gle = GetLastError();
+        DWORD send_gle = GetLastError();
+        if (send_gle == ERROR_SUCCESS)
+            send_gle = ERROR_IO_DEVICE;
+        remote_call_um_set_failure("request_send_failed", send_gle, target_tid, thread_scan_count);
         diag::log_tagged_fmt("comm",
             "remote_call_um_request_send_done call_id=%llu attempt=%d ok=0 gle=%lu pid=%u tid=%u fingerprint=0x%llX elapsed_ms=%llu",
             static_cast<unsigned long long>(call_id),
@@ -2392,6 +2577,7 @@ std::uint64_t voyager::device_t::call_function_attempt(
         SetLastError(send_gle);
         return 0;
     }
+    g_remote_call_um_attempt_diag.request_sent = true;
     diag::log_tagged_fmt("comm",
         "remote_call_um_request_send_done call_id=%llu attempt=%d ok=1 gle=0 pid=%u tid=%u code_entry=0x%llX trampoline=0x%llX fingerprint_before=0x%llX fingerprint_after=0x%llX elapsed_ms=%llu",
         static_cast<unsigned long long>(call_id),
@@ -2420,6 +2606,7 @@ std::uint64_t voyager::device_t::call_function_attempt(
 
     NTSTATUS set_status = thread_hijack::indirect_NtSetContextThread(target_thread, &hijack_ctx);
     if (set_status < 0) {
+        remote_call_um_set_failure("hijack_set_failed", ERROR_ACCESS_DENIED, target_tid, thread_scan_count, static_cast<LONG>(set_status));
         RC_UM_DBG("call_function: NtSetContextThread FAILED status=0x%08X", (unsigned)set_status);
         diag::log_tagged_fmt("comm",
             "remote_call_um_hijack_set_failed call_id=%llu attempt=%d tid=%u status=0x%08X original_rip=0x%llX code_entry=0x%llX elapsed_ms=%llu",
@@ -2432,8 +2619,10 @@ std::uint64_t voyager::device_t::call_function_attempt(
             static_cast<unsigned long long>(GetTickCount64() - attempt_start));
         thread_hijack::indirect_NtResumeThread(target_thread, nullptr);
         thread_hijack::indirect_NtClose(target_thread);
+        SetLastError(ERROR_ACCESS_DENIED);
         return 0;
     }
+    g_remote_call_um_attempt_diag.hijack_set = true;
     RC_UM_DBG("call_function: NtSetContextThread OK, resuming tid=%u", target_tid);
     last_hijacked_tid_ = target_tid;
 
@@ -2532,14 +2721,16 @@ std::uint64_t voyager::device_t::call_function_attempt(
 
             ++consecutive_poll_failures;
             if (consecutive_poll_failures >= 16) {
+                remote_call_um_set_failure("poll_ioctl_failed", GetLastError() != ERROR_SUCCESS ? GetLastError() : ERROR_IO_DEVICE, target_tid, thread_scan_count, 0, consecutive_poll_failures);
                 RC_UM_DBG("call_function: POLL FAILED 16x consecutively, iter=%d", i);
                 diag::log_tagged_fmt("comm",
-                    "remote_call_um_poll_failed call_id=%llu attempt=%d tid=%u iter=%d consecutive_failures=%d elapsed_ms=%llu",
+                    "remote_call_um_poll_failed call_id=%llu attempt=%d tid=%u iter=%d consecutive_failures=%d gle=%lu elapsed_ms=%llu",
                     static_cast<unsigned long long>(call_id),
                     attempt_index,
                     target_tid,
                     i,
                     consecutive_poll_failures,
+                    static_cast<unsigned long>(remote_call_um_failure_gle(g_remote_call_um_attempt_diag)),
                     static_cast<unsigned long long>(GetTickCount64() - attempt_start));
                 break;
             }
@@ -2566,6 +2757,8 @@ std::uint64_t voyager::device_t::call_function_attempt(
     thread_hijack::scatter_timing();
 
     if (!completed) {
+        if (std::strcmp(g_remote_call_um_attempt_diag.failure_class, "none") == 0)
+            remote_call_um_set_failure("poll_timeout", ERROR_TIMEOUT, target_tid, thread_scan_count, 0, consecutive_poll_failures);
         RC_UM_DBG("call_function: TIMEOUT after %d iterations, tid=%u rip_was=0x%llX target=0x%llX",
             MAX_WAIT_ITERATIONS, target_tid, original_ctx.Rip, function_address);
 
@@ -2606,16 +2799,42 @@ std::uint64_t voyager::device_t::call_function_attempt(
                 static_cast<unsigned long long>(GetTickCount64() - attempt_start));
         }
 
-        thread_hijack::indirect_NtSetContextThread(target_thread, &original_ctx);
+        NTSTATUS restore_status = thread_hijack::indirect_NtSetContextThread(target_thread, &original_ctx);
+        if (restore_status < 0) {
+            remote_call_um_set_failure("context_restore_failed", ERROR_ACCESS_DENIED, target_tid, thread_scan_count, static_cast<LONG>(restore_status), consecutive_poll_failures);
+            diag::log_tagged_fmt("comm",
+                "remote_call_um_restore_failed call_id=%llu attempt=%d tid=%u status=0x%08X elapsed_ms=%llu",
+                static_cast<unsigned long long>(call_id),
+                attempt_index,
+                target_tid,
+                static_cast<unsigned>(restore_status),
+                static_cast<unsigned long long>(GetTickCount64() - attempt_start));
+        }
         last_failed_tid_ = target_tid;
 
 
     } else {
         RC_UM_DBG("call_function: SUCCESS result=0x%llX tid=%u target=0x%llX",
             result, target_tid, function_address);
-        thread_hijack::indirect_NtSetContextThread(target_thread, &original_ctx);
-        last_failed_tid_ = 0;
-        last_hijacked_tid_ = 0;
+        NTSTATUS restore_status = thread_hijack::indirect_NtSetContextThread(target_thread, &original_ctx);
+        if (restore_status < 0) {
+            remote_call_um_set_failure("context_restore_failed", ERROR_ACCESS_DENIED, target_tid, thread_scan_count, static_cast<LONG>(restore_status), consecutive_poll_failures);
+            completed = false;
+            result = 0;
+            diag::log_tagged_fmt("comm",
+                "remote_call_um_restore_failed call_id=%llu attempt=%d tid=%u status=0x%08X after_completed=1 elapsed_ms=%llu",
+                static_cast<unsigned long long>(call_id),
+                attempt_index,
+                target_tid,
+                static_cast<unsigned>(restore_status),
+                static_cast<unsigned long long>(GetTickCount64() - attempt_start));
+        }
+        if (completed) {
+            last_failed_tid_ = 0;
+            last_hijacked_tid_ = 0;
+        } else {
+            last_failed_tid_ = target_tid;
+        }
     }
 
     thread_hijack::indirect_NtResumeThread(target_thread, nullptr);
@@ -2623,14 +2842,21 @@ std::uint64_t voyager::device_t::call_function_attempt(
 
     out_completed = completed;
     diag::log_tagged_fmt("comm",
-        "remote_call_um_attempt_exit call_id=%llu attempt=%d completed=%d result=0x%llX tid=%u last_failed_tid=%u elapsed_ms=%llu",
+        "remote_call_um_attempt_exit call_id=%llu attempt=%d completed=%d result=0x%llX tid=%u failure_class=%s failure_gle=%lu scanned=%u poll_failures=%d request_sent=%d hijack_set=%d last_failed_tid=%u elapsed_ms=%llu",
         static_cast<unsigned long long>(call_id),
         attempt_index,
         completed ? 1 : 0,
         static_cast<unsigned long long>(result),
         target_tid,
+        completed ? "none" : g_remote_call_um_attempt_diag.failure_class,
+        static_cast<unsigned long>(completed ? ERROR_SUCCESS : remote_call_um_failure_gle(g_remote_call_um_attempt_diag)),
+        thread_scan_count,
+        consecutive_poll_failures,
+        g_remote_call_um_attempt_diag.request_sent ? 1 : 0,
+        g_remote_call_um_attempt_diag.hijack_set ? 1 : 0,
         last_failed_tid_,
         static_cast<unsigned long long>(GetTickCount64() - attempt_start));
+    SetLastError(completed ? ERROR_SUCCESS : remote_call_um_failure_gle(g_remote_call_um_attempt_diag));
     return result;
 }
 
@@ -3049,7 +3275,9 @@ bool voyager::device_t::send_request(DWORD control_code, void* input, DWORD inpu
         &bytes_returned,
         nullptr
     );
-    const DWORD hvdt_post_err = result ? ERROR_SUCCESS : GetLastError();
+    DWORD hvdt_post_err = result ? ERROR_SUCCESS : GetLastError();
+    if (!result && hvdt_post_err == ERROR_SUCCESS)
+        hvdt_post_err = ERROR_GEN_FAILURE;
     if (remote_rc_request || remote_cr_request) {
         const auto* remote_rc_post = remote_rc_request ? static_cast<const detail::remote_call_request*>(input) : nullptr;
         const auto* remote_cr_post = remote_cr_request ? static_cast<const detail::call_result_request*>(input) : nullptr;
@@ -3110,6 +3338,8 @@ bool voyager::device_t::send_request(DWORD control_code, void* input, DWORD inpu
 
     if (!result) {
         DWORD err = GetLastError();
+        if (err == ERROR_SUCCESS)
+            err = hvdt_post_err != ERROR_SUCCESS ? hvdt_post_err : ERROR_GEN_FAILURE;
         RC_UM_DBG("send_request FAILED ioctl=0x%08X input_size=%u err=%lu handle=0x%llX",
             effective_control_code, input_size, err, reinterpret_cast<unsigned long long>(driver_handle_));
         log_security_snapshot("send_request_failed", control_code, effective_control_code, err);

@@ -131,6 +131,7 @@ struct remote_call_diag_snapshot_t {
     bool lower_stale_generation = false;
     bool lower_cancelled = false;
     bool lower_deadline_expired = false;
+    bool lower_uninterruptible = false;
     bool lower_lock_timeout = false;
     bool lower_worker_exception = false;
     bool lower_worker_creation_failed = false;
@@ -438,14 +439,17 @@ static inline uint64_t driver_remote_call_impl(uint32_t pid,
         static_cast<unsigned long long>(GetTickCount64() - call_start));
     const uint64_t result = driver_bridge::call_function(function_address, arg1, arg2, arg3, arg4);
     const driver_bridge::remote_call_execution_diag_t lower_diag = driver_bridge::last_remote_call_execution_diag();
-    const DWORD gle = result != 0 ? ERROR_SUCCESS : GetLastError();
+    const bool lower_execution_completed = lower_diag.completed && lower_diag.lower_ok;
+    DWORD gle = lower_execution_completed ? ERROR_SUCCESS : GetLastError();
+    if (!lower_execution_completed && gle == ERROR_SUCCESS)
+        gle = lower_diag.gle != ERROR_SUCCESS ? lower_diag.gle : ERROR_GEN_FAILURE;
     const ULONGLONG call_end = GetTickCount64();
     const bool deadline_expired_after = call_deadline != 0 && call_end >= call_deadline;
     const bool cancelled_after = driver_bridge::current_remote_call_cancelled();
     const uint32_t active_after = driver_bridge::attached_pid();
     const bool stale_pid = active_after != pid;
     call_diag.completed = true;
-    call_diag.ok = result != 0 && !deadline_expired_after && !cancelled_after && !stale_pid;
+    call_diag.ok = lower_execution_completed && !deadline_expired_after && !cancelled_after && !stale_pid;
     call_diag.result = result;
     call_diag.gle = stale_pid ? ERROR_OPERATION_ABORTED : (deadline_expired_after ? ERROR_TIMEOUT : (cancelled_after ? ERROR_CANCELLED : gle));
     call_diag.active_pid_after = active_after;
@@ -480,13 +484,16 @@ static inline uint64_t driver_remote_call_impl(uint32_t pid,
     call_diag.lower_stale_generation = lower_diag.stale_generation;
     call_diag.lower_cancelled = lower_diag.cancelled;
     call_diag.lower_deadline_expired = lower_diag.deadline_expired;
+    call_diag.lower_uninterruptible =
+        !lower_diag.completed &&
+        (lower_diag.completion_reason == "cancelled" || lower_diag.completion_reason == "deadline");
     call_diag.lower_lock_timeout = lower_diag.lower_lock_timeout;
     call_diag.lower_worker_exception = lower_diag.worker_exception;
     call_diag.lower_worker_creation_failed = lower_diag.worker_creation_failed;
     call_diag.lower_late_completion = lower_diag.late_completion;
     g_last_driver_remote_call_diag = call_diag;
     diag::log_tagged_fmt("pg_sniff",
-        "driver_remote_call_done call_id=%llu label=%s tool=%s diag_id=%s pid=%u active_pid=%u active_after=%u method=driver_bridge::call_function fn=0x%llX result=0x%llX ok=%d gle=%lu status=%s last_error=%s cancelled=%d timeout_ms=%u deadline_ms=%llu deadline_expired_after=%d stale_pid=%d late_completion=%d lower_uninterruptible=%d lower_phase=%s lower_reason=%s lower_completed=%d lower_ok=%d lower_gle=%lu lower_worker_tid=%lu lower_worker_alive=%u lower_queue_depth_submit=%u lower_queue_depth_start=%u lower_queue_depth_after_pop=%u lower_inflight_submit=%u lower_inflight_start=%u lower_inflight_after=%u lower_queue_wait_ms=%llu lower_elapsed_ms=%llu lower_deadline_remaining_queue_ms=%llu lower_deadline_remaining_start_ms=%llu lower_deadline_remaining_finish_ms=%llu lower_worker_exception=%d lower_worker_creation_failed=%d lower_error_value=%d lower_error_category=%s lower_error_message=%s elapsed_ms=%llu",
+        "driver_remote_call_done call_id=%llu label=%s tool=%s diag_id=%s pid=%u active_pid=%u active_after=%u method=driver_bridge::call_function fn=0x%llX result=0x%llX ok=%d execution_completed=%d result_nonzero=%d gle=%lu status=%s last_error=%s cancelled=%d timeout_ms=%u deadline_ms=%llu deadline_expired_after=%d stale_pid=%d late_completion=%d lower_uninterruptible=%d lower_phase=%s lower_reason=%s lower_completed=%d lower_ok=%d lower_gle=%lu lower_worker_tid=%lu lower_worker_alive=%u lower_queue_depth_submit=%u lower_queue_depth_start=%u lower_queue_depth_after_pop=%u lower_inflight_submit=%u lower_inflight_start=%u lower_inflight_after=%u lower_queue_wait_ms=%llu lower_elapsed_ms=%llu lower_deadline_remaining_queue_ms=%llu lower_deadline_remaining_start_ms=%llu lower_deadline_remaining_finish_ms=%llu lower_worker_exception=%d lower_worker_creation_failed=%d lower_error_value=%d lower_error_category=%s lower_error_message=%s elapsed_ms=%llu",
         static_cast<unsigned long long>(call_id),
         label ? label : "",
         driver_bridge::current_remote_call_tool_name(),
@@ -497,6 +504,8 @@ static inline uint64_t driver_remote_call_impl(uint32_t pid,
         static_cast<unsigned long long>(function_address),
         static_cast<unsigned long long>(result),
         call_diag.ok ? 1 : 0,
+        lower_execution_completed ? 1 : 0,
+        result != 0 ? 1 : 0,
         static_cast<unsigned long>(call_diag.gle),
         driver_bridge::status().c_str(),
         driver_bridge::last_error().c_str(),
@@ -506,7 +515,7 @@ static inline uint64_t driver_remote_call_impl(uint32_t pid,
         deadline_expired_after ? 1 : 0,
         stale_pid ? 1 : 0,
         call_diag.late_completion ? 1 : 0,
-        (deadline_expired_after || stale_pid) ? 1 : 0,
+        call_diag.lower_uninterruptible ? 1 : 0,
         call_diag.lower_phase.c_str(),
         call_diag.lower_completion_reason.c_str(),
         call_diag.lower_completed ? 1 : 0,
@@ -535,8 +544,12 @@ static inline uint64_t driver_remote_call_impl(uint32_t pid,
         SetLastError(stale_pid ? ERROR_OPERATION_ABORTED : (cancelled_after ? ERROR_CANCELLED : ERROR_TIMEOUT));
         return 0;
     }
-    if (result == 0)
+    if (!lower_execution_completed) {
         SetLastError(gle);
+        return 0;
+    }
+    if (result == 0)
+        SetLastError(ERROR_SUCCESS);
     return result;
 }
 
@@ -661,12 +674,15 @@ static inline uint64_t remote_thread_call(uint32_t pid,
         return 0;
     }
     const uint64_t result = driver_remote_call(pid, function_address, arg1, arg2, arg3, arg4, label);
-    const DWORD gle = result != 0 ? ERROR_SUCCESS : GetLastError();
+    const remote_call_diag_snapshot_t remote_diag = last_driver_remote_call_diag();
+    DWORD gle = remote_diag.ok ? ERROR_SUCCESS : GetLastError();
+    if (!remote_diag.ok && gle == ERROR_SUCCESS)
+        gle = remote_diag.gle != ERROR_SUCCESS ? remote_diag.gle : ERROR_GEN_FAILURE;
     const ULONGLONG call_end = GetTickCount64();
     const bool late_completion = deadline != 0 && call_end >= deadline;
     const bool cancelled_after = driver_bridge::current_remote_call_cancelled();
     diag::log_tagged_fmt("pg_sniff",
-        "remote_thread_call_done label=%s tool=%s diag_id=%s pid=%u active_pid=%u fn=0x%llX result=0x%llX ok=%d gle=%lu requested_timeout_ms=%u effective_timeout_ms=%u deadline_ms=%llu deadline_expired_after=%d late_completion=%d lower_uninterruptible=%d cancelled=%d elapsed_ms=%llu status=%s last_error=%s",
+        "remote_thread_call_done label=%s tool=%s diag_id=%s pid=%u active_pid=%u fn=0x%llX result=0x%llX ok=%d execution_completed=%d result_nonzero=%d gle=%lu requested_timeout_ms=%u effective_timeout_ms=%u deadline_ms=%llu deadline_expired_after=%d late_completion=%d lower_uninterruptible=%d cancelled=%d lower_phase=%s lower_reason=%s lower_completed=%d lower_ok=%d lower_gle=%lu lower_queue_depth_submit=%u lower_inflight_after=%u lower_queue_wait_ms=%llu lower_elapsed_ms=%llu elapsed_ms=%llu status=%s last_error=%s",
         label ? label : "",
         tool ? tool : "",
         diag_id ? diag_id : "",
@@ -674,6 +690,8 @@ static inline uint64_t remote_thread_call(uint32_t pid,
         driver_bridge::attached_pid(),
         static_cast<unsigned long long>(function_address),
         static_cast<unsigned long long>(result),
+        remote_diag.ok ? 1 : 0,
+        remote_diag.lower_completed && remote_diag.lower_ok ? 1 : 0,
         result != 0 ? 1 : 0,
         static_cast<unsigned long>(late_completion ? ERROR_TIMEOUT : (cancelled_after ? ERROR_CANCELLED : gle)),
         timeout_ms,
@@ -681,8 +699,17 @@ static inline uint64_t remote_thread_call(uint32_t pid,
         static_cast<unsigned long long>(deadline),
         late_completion ? 1 : 0,
         late_completion ? 1 : 0,
-        late_completion ? 1 : 0,
+        remote_diag.lower_uninterruptible ? 1 : 0,
         cancelled_after ? 1 : 0,
+        remote_diag.lower_phase.c_str(),
+        remote_diag.lower_completion_reason.c_str(),
+        remote_diag.lower_completed ? 1 : 0,
+        remote_diag.lower_ok ? 1 : 0,
+        static_cast<unsigned long>(remote_diag.lower_gle),
+        remote_diag.lower_queue_depth_at_submit,
+        remote_diag.lower_inflight_after,
+        static_cast<unsigned long long>(remote_diag.lower_queue_wait_ms),
+        static_cast<unsigned long long>(remote_diag.lower_elapsed_ms),
         static_cast<unsigned long long>(call_end - call_start),
         driver_bridge::status().c_str(),
         driver_bridge::last_error().c_str());
@@ -2422,7 +2449,16 @@ public:
             static_cast<unsigned long long>(sess->region_size),
             sess->exited.load() ? 1 : 0);
 
+        ULONGLONG poller_elapsed_ms = 0;
+        ULONGLONG active_elapsed_ms = 0;
+        ULONGLONG query_before_elapsed_ms = 0;
+        ULONGLONG restore_elapsed_ms = 0;
+        ULONGLONG query_after_elapsed_ms = 0;
+        ULONGLONG veh_elapsed_ms = 0;
+        ULONGLONG free_elapsed_ms = 0;
+        const ULONGLONG poller_t0 = GetTickCount64();
         bool poller_exited = stop_session_poller(sess, 1000, "uninstall");
+        poller_elapsed_ms = GetTickCount64() - poller_t0;
         diag::log_tagged_fmt("pg_sniff", "uninstall_poller_state sid=%u exited=%d elapsed_ms=%llu",
             session_id,
             poller_exited ? 1 : 0,
@@ -2431,7 +2467,9 @@ public:
         bool cleanup_complete = false;
         if (driver_bridge::using_kernel_driver()) {
             active_pid_scope_t active;
+            const ULONGLONG active_t0 = GetTickCount64();
             const bool active_ok = active.enter(sess->pid);
+            active_elapsed_ms = GetTickCount64() - active_t0;
             diag::log_tagged_fmt("pg_sniff", "uninstall_active_pid sid=%u active_ok=%d attached=%u elapsed_ms=%llu",
                 session_id,
                 active_ok ? 1 : 0,
@@ -2439,7 +2477,9 @@ public:
                 static_cast<unsigned long long>(GetTickCount64() - cleanup_start));
 
             driver_bridge::memory_region_t before_restore{};
+            const ULONGLONG query_before_t0 = GetTickCount64();
             const bool before_query_ok = active_ok && driver_bridge::query_memory_for(sess->pid, sess->target_addr, before_restore);
+            query_before_elapsed_ms = GetTickCount64() - query_before_t0;
             diag::log_tagged_fmt("pg_sniff", "uninstall_region_before_restore sid=%u query_ok=%d base=0x%llX size=0x%llX state=0x%08X protect=0x%08X type=0x%08X elapsed_ms=%llu",
                 session_id,
                 before_query_ok ? 1 : 0,
@@ -2453,6 +2493,7 @@ public:
             bool restore_ok = false;
             uint32_t old_restore_protect = 0;
             if (active_ok) {
+                const ULONGLONG restore_t0 = GetTickCount64();
                 diag::log_tagged_fmt("pg_sniff", "uninstall_restore_protect_begin sid=%u target=0x%llX size=0x%llX orig=0x%08X elapsed_ms=%llu",
                     session_id,
                     static_cast<unsigned long long>(sess->target_addr),
@@ -2461,6 +2502,7 @@ public:
                     static_cast<unsigned long long>(GetTickCount64() - cleanup_start));
                 restore_ok = driver_bridge::protect_memory_for(sess->pid, sess->target_addr, sess->region_size,
                                                                sess->orig_protect, &old_restore_protect);
+                restore_elapsed_ms = GetTickCount64() - restore_t0;
                 sess->protection_restored.store(restore_ok, std::memory_order_release);
                 diag::log_tagged_fmt("pg_sniff", "uninstall_restore_protect_done sid=%u ok=%d old=0x%08X elapsed_ms=%llu last_error=%s",
                     session_id,
@@ -2471,7 +2513,9 @@ public:
             }
 
             driver_bridge::memory_region_t after_restore{};
+            const ULONGLONG query_after_t0 = GetTickCount64();
             const bool after_query_ok = active_ok && driver_bridge::query_memory_for(sess->pid, sess->target_addr, after_restore);
+            query_after_elapsed_ms = GetTickCount64() - query_after_t0;
             diag::log_tagged_fmt("pg_sniff", "uninstall_region_after_restore sid=%u query_ok=%d base=0x%llX size=0x%llX state=0x%08X protect=0x%08X type=0x%08X elapsed_ms=%llu",
                 session_id,
                 after_query_ok ? 1 : 0,
@@ -2488,6 +2532,7 @@ public:
 
             bool veh_removed = sess->veh_handle == 0;
             if (active_ok && sess->veh_handle && guard_cleared) {
+                const ULONGLONG veh_t0 = GetTickCount64();
                 uint64_t ntdll_base = sess->ntdll_base;
                 uint64_t ntdll_size = sess->ntdll_size;
                 if (ntdll_base == 0) {
@@ -2536,6 +2581,7 @@ public:
                         static_cast<unsigned long long>(rtl_rm),
                         static_cast<unsigned long long>(GetTickCount64() - cleanup_start));
                 }
+                veh_elapsed_ms = GetTickCount64() - veh_t0;
             } else if (active_ok && sess->veh_handle) {
                 diag::log_tagged_fmt("pg_sniff", "uninstall_remove_veh_skipped sid=%u handle=0x%llX guard_cleared=%d restore_ok=%d after_query_ok=%d after_protect=0x%08X elapsed_ms=%llu",
                     session_id,
@@ -2550,6 +2596,7 @@ public:
             poller_exited = sess->exited.load(std::memory_order_acquire);
             cleanup_complete = active_ok && poller_exited && veh_removed && guard_cleared;
             if (cleanup_complete) {
+                const ULONGLONG free_t0 = GetTickCount64();
                 diag::log_tagged_fmt("pg_sniff", "uninstall_free_begin sid=%u sc=0x%llX ring=0x%llX elapsed_ms=%llu",
                     session_id,
                     static_cast<unsigned long long>(sess->sc_addr),
@@ -2564,6 +2611,7 @@ public:
                 if (free_ring_ok)
                     sess->ring_addr = 0;
                 cleanup_complete = free_sc_ok && free_ring_ok;
+                free_elapsed_ms = GetTickCount64() - free_t0;
                 diag::log_tagged_fmt("pg_sniff", "uninstall_free_done sid=%u sc_ok=%d sc_error=%s ring_ok=%d ring_error=%s cleanup_complete=%d elapsed_ms=%llu",
                     session_id,
                     free_sc_ok ? 1 : 0,
@@ -2605,6 +2653,17 @@ public:
             std::lock_guard<std::mutex> lk(sessions_mutex_);
             retired_sessions_.push_back(std::move(sess));
         }
+        diag::log_tagged_fmt("pg_sniff", "uninstall_phase_timing sid=%u cleanup_complete=%d poller_ms=%llu active_pid_ms=%llu query_before_ms=%llu restore_ms=%llu query_after_ms=%llu veh_ms=%llu free_ms=%llu total_ms=%llu",
+            session_id,
+            cleanup_complete ? 1 : 0,
+            static_cast<unsigned long long>(poller_elapsed_ms),
+            static_cast<unsigned long long>(active_elapsed_ms),
+            static_cast<unsigned long long>(query_before_elapsed_ms),
+            static_cast<unsigned long long>(restore_elapsed_ms),
+            static_cast<unsigned long long>(query_after_elapsed_ms),
+            static_cast<unsigned long long>(veh_elapsed_ms),
+            static_cast<unsigned long long>(free_elapsed_ms),
+            static_cast<unsigned long long>(GetTickCount64() - cleanup_start));
         diag::log_tagged_fmt("pg_sniff", "uninstall_done sid=%u cleanup_complete=%d elapsed_ms=%llu",
             session_id,
             cleanup_complete ? 1 : 0,

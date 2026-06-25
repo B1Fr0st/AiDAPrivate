@@ -24,6 +24,7 @@
 #include "../infra/event_bus.hpp"
 #include "../analysis/initial_analysis.hpp"
 #include "../analysis/symbol_store.hpp"
+#include "../testlab/test_all_features.hpp"
 #include "../anti-tamper/webhook.hpp"
 
 #include <algorithm>
@@ -108,6 +109,45 @@ inline const char* phase_name(phase_t p)
 	case phase_t::complete: return "complete";
 	default: return "unknown";
 	}
+}
+
+inline void log_pdb_visible_attempt(const char* source)
+{
+	const bool remote_pending = initial_analysis::g_state.needs_pdb_prompt.load(std::memory_order_acquire);
+	const bool local_pending = initial_analysis::g_state.needs_local_pdb_prompt.load(std::memory_order_acquire);
+	if (!test_all_features::is_unattended_full_test_active() || (!remote_pending && !local_pending))
+		return;
+	initial_analysis::pdb_hint_t hint;
+	{
+		std::lock_guard<std::mutex> lk(initial_analysis::g_state.pdb_hint_mtx);
+		hint = initial_analysis::g_state.pdb_hint;
+	}
+	std::string module_name;
+	std::string reason;
+	uint64_t image_base = 0;
+	uint64_t image_size = 0;
+	{
+		std::lock_guard<std::mutex> lk(initial_analysis::g_state.local_pdb_mtx);
+		module_name = initial_analysis::g_state.local_pdb_module_name;
+		reason = initial_analysis::g_state.local_pdb_reason;
+		image_base = initial_analysis::g_state.local_pdb_image_base;
+		image_size = initial_analysis::g_state.local_pdb_image_size;
+	}
+	diag::log_tagged_critical_fmt("loading_binary_overlay",
+		"pdb_modal_visible_attempt source=%s phase=%s remote_pending=%d local_pending=%d prompt_suppressed=1 decision=do_not_load_pdb module=%s base=0x%llX size=0x%llX pdb=%s guid=%s age=%u reason=%s is_running=%d unattended_active=%d",
+		source && *source ? source : "<unknown>",
+		phase_name(get_phase()),
+		remote_pending ? 1 : 0,
+		local_pending ? 1 : 0,
+		module_name.empty() ? "<unknown>" : module_name.c_str(),
+		static_cast<unsigned long long>(image_base),
+		static_cast<unsigned long long>(image_size),
+		hint.pdb_name.empty() ? "<none>" : hint.pdb_name.c_str(),
+		hint.pdb_guid.empty() ? "<none>" : hint.pdb_guid.c_str(),
+		static_cast<unsigned>(hint.pdb_age),
+		reason.empty() ? "<none>" : reason.c_str(),
+		test_all_features::is_running() ? 1 : 0,
+		test_all_features::is_unattended_full_test_active() ? 1 : 0);
 }
 
 inline void set_milestone(float pct, const char* label, unsigned int id)
@@ -392,6 +432,7 @@ inline std::string compose_dynamic_label(phase_t ph)
 		return s.milestone_label;
 	}
 	if (ph == phase_t::awaiting_pdb_decision) {
+		log_pdb_visible_attempt("loading_binary_overlay.compose_dynamic_label");
 		initial_analysis::detail::auto_decline_pdb_prompts_for_full_test("loading_binary_overlay.compose_dynamic_label");
 		bool has_remote = initial_analysis::g_state.needs_pdb_prompt.load(std::memory_order_acquire);
 		bool has_local = initial_analysis::g_state.needs_local_pdb_prompt.load(std::memory_order_acquire);
@@ -743,6 +784,7 @@ inline void poll_completion()
 		return;
 	}
 
+	detail::log_pdb_visible_attempt("loading_binary_overlay.poll_completion");
 	initial_analysis::detail::auto_decline_pdb_prompts_for_full_test("loading_binary_overlay.poll_completion");
 	bool needs_remote = initial_analysis::g_state.needs_pdb_prompt.load(std::memory_order_acquire);
 	bool needs_local = initial_analysis::g_state.needs_local_pdb_prompt.load(std::memory_order_acquire);
@@ -797,6 +839,7 @@ inline void render()
 	phase_t ph = detail::get_phase();
 	bool keep_open = (ph != phase_t::idle) && (ph != phase_t::complete);
 
+	detail::log_pdb_visible_attempt("loading_binary_overlay.render");
 	initial_analysis::detail::auto_decline_pdb_prompts_for_full_test("loading_binary_overlay.render");
 	bool modal_open = initial_analysis::g_state.needs_pdb_prompt.load(std::memory_order_acquire) ||
 	                  initial_analysis::g_state.needs_local_pdb_prompt.load(std::memory_order_acquire);

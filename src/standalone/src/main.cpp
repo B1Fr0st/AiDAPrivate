@@ -73,7 +73,6 @@ namespace test_all_features {
     void format_ui_phase_snapshot(char* out, std::size_t cap);
 }
 
-#include <delayimp.h>
 #include <thread>
 #include <cstdarg>
 #include <set>
@@ -91,20 +90,6 @@ namespace test_all_features {
 
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "Shcore.lib")
-
-
-static FARPROC WINAPI delay_load_hook(unsigned dliNotify, PDelayLoadInfo pdli)
-{
-    if (dliNotify == dliNotePreLoadLibrary) {
-        if (pdli && pdli->szDll && _stricmp(pdli->szDll, "libz3.dll") == 0) {
-            if (embedded_resources::g_z3_module)
-                return reinterpret_cast<FARPROC>(embedded_resources::g_z3_module);
-        }
-    }
-    return nullptr;
-}
-
-extern "C" const PfnDliHook __pfnDliNotifyHook2 = delay_load_hook;
 
 namespace aida_early_startup {
 
@@ -4047,18 +4032,6 @@ int main(int, char**)
             static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - settings_tick));
         crash_log_write("startup_ban_check_passed");
     }
-
-    startup_log_critical_fmt("z3_extract_load_pre pid=%lu tid=%lu tick=%llu",
-        GetCurrentProcessId(),
-        GetCurrentThreadId(),
-        static_cast<unsigned long long>(GetTickCount64()));
-    crash_log_write("extracting_z3");
-    embedded_resources::extract_and_load_z3();
-    startup_log_critical_fmt("z3_extract_load_post module=0x%llX last_err=%lu",
-        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(embedded_resources::g_z3_module)),
-        static_cast<unsigned long>(GetLastError()));
-    crash_log_fmt("z3_loaded module=%p", embedded_resources::g_z3_module);
-    std::atexit(embedded_resources::cleanup_z3);
 
     startup_log_critical_fmt("dpi_awareness_pre pid=%lu tid=%lu tick=%llu",
         GetCurrentProcessId(),

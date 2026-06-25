@@ -142,6 +142,11 @@ static bool dbg_stack_module_requires_function(const std::string& module_name) {
         dbg_stack_ends_with(lower, ".exe");
 }
 
+static bool dbg_stack_target_module_frame(const std::string& module_name) {
+    const std::string lower = dbg_stack_lower_ascii(module_name);
+    return lower.find("aida_testtarget") != std::string::npos;
+}
+
 static uint64_t get_ntdll_fn(const char* name) {
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
     if (!ntdll) return 0;
@@ -889,9 +894,55 @@ static bool scrub_target_hardware_breakpoints(HANDLE hf, const char* reason) {
                 alive ? 1 : 0,
                 static_cast<unsigned>(exit_code));
         }
-        final_context_ok = driver_bridge::get_thread_context(desc.thread_id, final_ctx);
-        final_gle = final_context_ok ? ERROR_SUCCESS : GetLastError();
-        final_all_clear = final_context_ok && hwbp_debug_registers_clear_for_scrub(final_ctx);
+        constexpr int kFinalProofAttempts = 4;
+        for (int attempt = 1; attempt <= kFinalProofAttempts; ++attempt) {
+            driver_bridge::thread_context_t attempt_ctx{};
+            const ULONGLONG proof_start = GetTickCount64();
+            SetLastError(ERROR_SUCCESS);
+            const bool attempt_ok = driver_bridge::get_thread_context(desc.thread_id, attempt_ctx);
+            const DWORD attempt_gle = attempt_ok ? ERROR_SUCCESS : GetLastError();
+            uint32_t exit_code = 0;
+            const bool alive = driver_bridge::attached_process_alive(&exit_code);
+            const bool attempt_clear = attempt_ok && hwbp_debug_registers_clear_for_scrub(attempt_ctx);
+            const bool dr7_enabled = attempt_ok && hwbp_dr7_has_enabled_slot(attempt_ctx.dr7);
+            diag::log_tagged_fmt("test_dbg_detail",
+                "dbg_hwclr final_proof reason=%s pid=%u active_pid=%u tid=%u active_tid=%u attempt=%d max_attempts=%d context_ok=%d gle=%lu all_clear=%d dr7_enabled=%d rip=0x%llX rsp=0x%llX dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX alive=%d exit_code_or_error=0x%08X status=\"%s\" last_error=\"%s\" elapsed_ms=%llu",
+                reason ? reason : "unspecified",
+                static_cast<unsigned>(pid),
+                static_cast<unsigned>(driver_bridge::attached_pid()),
+                desc.thread_id,
+                debugger_engine::g_state.active_tid,
+                attempt,
+                kFinalProofAttempts,
+                attempt_ok ? 1 : 0,
+                static_cast<unsigned long>(attempt_gle),
+                attempt_clear ? 1 : 0,
+                dr7_enabled ? 1 : 0,
+                attempt_ok ? static_cast<unsigned long long>(attempt_ctx.rip) : 0ull,
+                attempt_ok ? static_cast<unsigned long long>(attempt_ctx.rsp) : 0ull,
+                attempt_ok ? static_cast<unsigned long long>(attempt_ctx.dr0) : 0ull,
+                attempt_ok ? static_cast<unsigned long long>(attempt_ctx.dr1) : 0ull,
+                attempt_ok ? static_cast<unsigned long long>(attempt_ctx.dr2) : 0ull,
+                attempt_ok ? static_cast<unsigned long long>(attempt_ctx.dr3) : 0ull,
+                attempt_ok ? static_cast<unsigned long long>(attempt_ctx.dr6) : 0ull,
+                attempt_ok ? static_cast<unsigned long long>(attempt_ctx.dr7) : 0ull,
+                alive ? 1 : 0,
+                static_cast<unsigned>(exit_code),
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str(),
+                static_cast<unsigned long long>(GetTickCount64() - proof_start));
+            final_gle = attempt_gle;
+            if (attempt_ok) {
+                final_context_ok = true;
+                final_ctx = attempt_ctx;
+                final_all_clear = attempt_clear;
+                if (final_all_clear)
+                    break;
+            }
+            if (!alive)
+                break;
+            Sleep(20);
+        }
     } else {
         log_msg(hf, "dbg_hwclr",
             "FAIL -- scrub skipped because controlled HWBP fixture is unavailable: %s",
@@ -1563,17 +1614,38 @@ static void test_get_call_stack(HANDLE hf, std::atomic<int>& passed, std::atomic
     diag::log_tagged_fmt("test_dbg_detail", "dbg_stk result: frame_count=%zu top_addr=0x%llX",
         frames.size(), (unsigned long long)top_addr);
     size_t known_module_blank_functions = 0;
+    size_t resolved_count = 0;
+    size_t module_rva_fallback_count = 0;
+    size_t budget_exhausted_count = 0;
+    size_t target_module_frame_count = 0;
     std::string first_blank_evidence;
+    std::string first_budget_evidence;
     for (size_t i = 0; i < frames.size(); ++i) {
         const std::string resolver = debugger_engine::call_stack_frame_resolver_evidence(frames[i].address);
         const bool known_module = dbg_stack_module_requires_function(frames[i].module_name);
+        const bool target_module = dbg_stack_target_module_frame(frames[i].module_name);
         const bool empty_function = frames[i].function_name.empty();
+        const bool resolved_symbol = resolver.find("source=pdb") != std::string::npos ||
+            resolver.find("source=export") != std::string::npos;
+        const bool module_rva_fallback = resolver.find("source=module_rva") != std::string::npos;
+        const bool budget_exhausted = resolver.find("budget") != std::string::npos;
+        if (resolved_symbol)
+            ++resolved_count;
+        if (module_rva_fallback)
+            ++module_rva_fallback_count;
+        if (budget_exhausted) {
+            ++budget_exhausted_count;
+            if (first_budget_evidence.empty())
+                first_budget_evidence = resolver;
+        }
+        if (target_module)
+            ++target_module_frame_count;
         log_msg(hf, "dbg_stk", "  frame[%zu]: addr=0x%llX ret=0x%llX module=%s func=%s offset=0x%llX resolver=%s",
             i, (unsigned long long)frames[i].address, (unsigned long long)frames[i].return_addr,
             frames[i].module_name.c_str(), empty_function ? "(empty)" : frames[i].function_name.c_str(),
             (unsigned long long)frames[i].module_offset, resolver.c_str());
         diag::log_tagged_fmt("test_dbg_detail",
-            "dbg_stk frame index=%zu addr=0x%llX ret=0x%llX module=%s function=%s offset=0x%llX known_module=%d empty_function=%d resolver=%s",
+            "dbg_stk frame index=%zu addr=0x%llX ret=0x%llX module=%s function=%s offset=0x%llX known_module=%d target_module=%d empty_function=%d resolved_symbol=%d module_rva_fallback=%d budget_exhausted=%d resolver=%s",
             i,
             (unsigned long long)frames[i].address,
             (unsigned long long)frames[i].return_addr,
@@ -1581,7 +1653,11 @@ static void test_get_call_stack(HANDLE hf, std::atomic<int>& passed, std::atomic
             empty_function ? "(empty)" : frames[i].function_name.c_str(),
             (unsigned long long)frames[i].module_offset,
             known_module ? 1 : 0,
+            target_module ? 1 : 0,
             empty_function ? 1 : 0,
+            resolved_symbol ? 1 : 0,
+            module_rva_fallback ? 1 : 0,
+            budget_exhausted ? 1 : 0,
             resolver.c_str());
         if (known_module && empty_function) {
             ++known_module_blank_functions;
@@ -1589,14 +1665,26 @@ static void test_get_call_stack(HANDLE hf, std::atomic<int>& passed, std::atomic
                 first_blank_evidence = resolver;
         }
     }
+    const bool structural_ok = !frames.empty() && top_addr != 0;
+    const bool budget_majority = structural_ok && budget_exhausted_count * 2 >= frames.size() && frames.size() > 1;
+    diag::log_tagged_fmt("test_dbg_detail",
+        "dbg_stk quality frame_count=%zu resolved=%zu module_rva_fallback=%zu budget_exhausted=%zu target_module_frames=%zu known_module_blank_functions=%zu structural_ok=%d budget_majority=%d",
+        frames.size(),
+        resolved_count,
+        module_rva_fallback_count,
+        budget_exhausted_count,
+        target_module_frame_count,
+        known_module_blank_functions,
+        structural_ok ? 1 : 0,
+        budget_majority ? 1 : 0);
 
-    if (!frames.empty() && top_addr != 0 && known_module_blank_functions == 0) {
-        log_msg(hf, "dbg_stk", "PASS -- %zu stack frames, top addr=0x%llX (elapsed %lld ms)",
-            frames.size(), (unsigned long long)top_addr, (long long)ms);
+    if (structural_ok && known_module_blank_functions == 0 && !budget_majority && target_module_frame_count > 0) {
+        log_msg(hf, "dbg_stk", "PASS -- structural frames=%zu top_addr=0x%llX resolved=%zu module_rva_fallback=%zu budget_exhausted=%zu target_module_frames=%zu (elapsed %lld ms)",
+            frames.size(), (unsigned long long)top_addr, resolved_count, module_rva_fallback_count, budget_exhausted_count, target_module_frame_count, (long long)ms);
         passed.fetch_add(1);
-    } else if (!frames.empty() && top_addr != 0) {
-        log_msg(hf, "dbg_stk", "FAIL -- call stack symbol resolution degraded: known_module_blank_functions=%zu first_blank_resolver=\"%s\" frames=%zu top_addr=0x%llX (elapsed %lld ms)",
-            known_module_blank_functions, first_blank_evidence.c_str(), frames.size(), (unsigned long long)top_addr, (long long)ms);
+    } else if (structural_ok) {
+        log_msg(hf, "dbg_stk", "FAIL -- stack structural capture succeeded but symbol quality degraded: frames=%zu top_addr=0x%llX resolved=%zu module_rva_fallback=%zu budget_exhausted=%zu budget_majority=%d target_module_frames=%zu known_module_blank_functions=%zu first_blank_resolver=\"%s\" first_budget_resolver=\"%s\" (elapsed %lld ms)",
+            frames.size(), (unsigned long long)top_addr, resolved_count, module_rva_fallback_count, budget_exhausted_count, budget_majority ? 1 : 0, target_module_frame_count, known_module_blank_functions, first_blank_evidence.c_str(), first_budget_evidence.c_str(), (long long)ms);
         failed.fetch_add(1);
     } else {
         log_msg(hf, "dbg_stk", "FAIL -- call stack empty (frames=%zu top_addr=0x%llX); a live thread always yields >=1 frame at RIP (elapsed %lld ms)",
@@ -3532,13 +3620,39 @@ static void test_seh_view_entries(HANDLE hf, std::atomic<int>& passed, std::atom
         return;
 
     std::vector<seh_view::seh_entry_t> snapshot;
+    seh_view::seh_diagnostics_t seh_diag{};
     {
         std::lock_guard<std::mutex> lk(seh_view::g_ui.mutex);
         snapshot = seh_view::g_ui.entries;
+        seh_diag = seh_view::g_ui.diagnostics;
     }
 
-    log_msg(hf, "seh_ent", "chain_depth=%zu", snapshot.size());
-    diag::log_tagged_fmt("test_dbg_detail", "seh_ent inputs: inspect seh_view::g_ui.entries chain_depth=%zu", snapshot.size());
+    const bool x64_target = sizeof(void*) == 8;
+    log_msg(hf, "seh_ent", "chain_depth=%zu arch=%s teb=0x%016llX exception_list=0x%016llX x64_empty_chain_proven=%d",
+        snapshot.size(),
+        x64_target ? "x64" : "x86",
+        (unsigned long long)seh_diag.teb_va,
+        (unsigned long long)seh_diag.raw_exception_list,
+        seh_diag.x64_empty_chain_proven ? 1 : 0);
+    diag::log_tagged_fmt("test_dbg_detail",
+        "seh_ent inputs: chain_depth=%zu arch=%s teb_query_attempted=%d teb_query_ok=%d teb=0x%llX teb_read_ok=%d exception_list_read_ok=%d raw_exception_list=0x%llX sentinel=%d x64_empty_chain_proven=%d empty_reason=%s stack_attempted=%d stack_read_ok=%d stack_candidates=%u stack_found=%d stack_reason=%s chain_stop=%s",
+        snapshot.size(),
+        x64_target ? "x64" : "x86",
+        seh_diag.teb_query_attempted ? 1 : 0,
+        seh_diag.teb_query_ok ? 1 : 0,
+        (unsigned long long)seh_diag.teb_va,
+        seh_diag.teb_read_ok ? 1 : 0,
+        seh_diag.exception_list_read_ok ? 1 : 0,
+        (unsigned long long)seh_diag.raw_exception_list,
+        seh_diag.sentinel_reached ? 1 : 0,
+        seh_diag.x64_empty_chain_proven ? 1 : 0,
+        seh_diag.empty_reason.c_str(),
+        seh_diag.stack_scan_attempted ? 1 : 0,
+        seh_diag.stack_scan_read_ok ? 1 : 0,
+        seh_diag.stack_scan_candidates,
+        seh_diag.stack_scan_candidate_found ? 1 : 0,
+        seh_diag.stack_scan_reason.c_str(),
+        seh_diag.chain_stop_reason.c_str());
 
     size_t valid_entries = 0;
     for (size_t i = 0; i < snapshot.size() && i < 16; ++i) {
@@ -3553,16 +3667,43 @@ static void test_seh_view_entries(HANDLE hf, std::atomic<int>& passed, std::atom
     for (const auto& e : snapshot) {
         if (e.frame_addr != 0 && e.handler_addr != 0) valid_entries++;
     }
-    diag::log_tagged_fmt("test_dbg_detail", "seh_ent result: chain_depth=%zu valid_entries=%zu", snapshot.size(), valid_entries);
+    const size_t malformed_tail = snapshot.size() >= valid_entries ? snapshot.size() - valid_entries : 0;
+    diag::log_tagged_fmt("test_dbg_detail",
+        "seh_ent result: chain_depth=%zu valid_entries=%zu malformed_tail=%zu x64_empty_chain_proven=%d empty_reason=%s chain_stop=%s",
+        snapshot.size(),
+        valid_entries,
+        malformed_tail,
+        seh_diag.x64_empty_chain_proven ? 1 : 0,
+        seh_diag.empty_reason.c_str(),
+        seh_diag.chain_stop_reason.c_str());
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    if (snapshot.empty() || valid_entries > 0) {
-        log_msg(hf, "seh_ent", "PASS -- SEH chain readable: depth=%zu valid_entries=%zu malformed_tail=%zu (empty/tail-truncated chain acceptable on x64) (elapsed %lld ms)",
-            snapshot.size(), valid_entries, snapshot.size() - valid_entries, (long long)ms);
+    if ((snapshot.empty() && x64_target && seh_diag.x64_empty_chain_proven) || valid_entries > 0) {
+        log_msg(hf, "seh_ent", "PASS -- linked SEH state classified: arch=%s depth=%zu valid_entries=%zu malformed_tail=%zu teb=0x%016llX exception_list=0x%016llX sentinel=%d x64_empty_chain_proven=%d empty_reason=%s (elapsed %lld ms)",
+            x64_target ? "x64" : "x86",
+            snapshot.size(),
+            valid_entries,
+            malformed_tail,
+            (unsigned long long)seh_diag.teb_va,
+            (unsigned long long)seh_diag.raw_exception_list,
+            seh_diag.sentinel_reached ? 1 : 0,
+            seh_diag.x64_empty_chain_proven ? 1 : 0,
+            seh_diag.empty_reason.c_str(),
+            (long long)ms);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "seh_ent", "FAIL -- SEH chain has no valid entries out of %zu (elapsed %lld ms)",
-            snapshot.size(), (long long)ms);
+        log_msg(hf, "seh_ent", "FAIL -- linked SEH chain has no valid decoded entries and no x64 empty-chain proof: arch=%s depth=%zu valid_entries=%zu malformed_tail=%zu teb=0x%016llX exception_list=0x%016llX exception_list_read_ok=%d sentinel=%d empty_reason=%s chain_stop=%s (elapsed %lld ms)",
+            x64_target ? "x64" : "x86",
+            snapshot.size(),
+            valid_entries,
+            malformed_tail,
+            (unsigned long long)seh_diag.teb_va,
+            (unsigned long long)seh_diag.raw_exception_list,
+            seh_diag.exception_list_read_ok ? 1 : 0,
+            seh_diag.sentinel_reached ? 1 : 0,
+            seh_diag.empty_reason.c_str(),
+            seh_diag.chain_stop_reason.c_str(),
+            (long long)ms);
         failed.fetch_add(1);
     }
 }

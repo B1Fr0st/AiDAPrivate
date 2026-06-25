@@ -10,6 +10,8 @@
 
 namespace {
 
+constexpr uint8_t kHarnessPayload[] = { 0xC3u };
+
 pe_file::pe_image_t make_synthetic() {
     pe_file::pe_image_t pe{};
     pe.optional_header.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
@@ -156,6 +158,12 @@ int main() {
     cfg_default.resource_table_offset = 0x300u;
     cfg_default.master_key_offset = 0x400u;
     cfg_default.seed = 0xCAFEF00DDEADBEEFull;
+    cfg_default.payload = stub::payload_blob_view_t{
+        kHarnessPayload,
+        sizeof(kHarnessPayload),
+        0u,
+        "harness"
+    };
 
     stub::generated_stub_t gs = stub::generate(cfg_default);
     if (gs.main_stub.empty() || gs.main_stub.size() > protector::kReservedMainStubSize) {

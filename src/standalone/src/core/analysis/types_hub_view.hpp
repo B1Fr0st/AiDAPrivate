@@ -20,6 +20,7 @@
 #include "../disasm/zydis_disasm.hpp"
 #include "../disasm/function_index.hpp"
 #include "../disasm/pseudocode_view.hpp"
+#include "../testlab/test_all_features.hpp"
 #include "../anti-tamper/webhook.hpp"
 #include "../../helpers/globals.h"
 #include "../../helpers/diag_log.hpp"
@@ -855,6 +856,13 @@ inline stats_t snapshot_active_pdb(const merged_types_t& merged)
 
 inline std::string browse_for_pdb()
 {
+	if (test_all_features::is_unattended_full_test_active()) {
+		diag::log_tagged_critical_fmt("pdb",
+			"pdb_native_dialog_attempt source=types_hub_view::browse_for_pdb title=\"Load PDB\" suppressed=1 decision=do_not_load_pdb is_running=%d unattended_active=%d",
+			test_all_features::is_running() ? 1 : 0,
+			test_all_features::is_unattended_full_test_active() ? 1 : 0);
+		return {};
+	}
 	char buf[MAX_PATH] = {};
 	static const char k_pdb_filter[] =
 		"PDB Symbol Files (*.pdb)\0*.pdb\0"

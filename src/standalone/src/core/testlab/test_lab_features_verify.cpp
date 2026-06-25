@@ -199,6 +199,12 @@ namespace {
 		return std::string(b);
 	}
 
+	std::string fmt_hex_u32(std::uint32_t v) {
+		char b[16];
+		std::snprintf(b, sizeof(b), "0x%08X", v);
+		return std::string(b);
+	}
+
 	struct tcp_resource_snapshot_t {
 		bool handle_count_ok = false;
 		DWORD handle_count = 0;
@@ -277,6 +283,70 @@ namespace {
 			label.push_back('_');
 		label.append(suffix ? suffix : "");
 		r.parsed.push_back({ label, value });
+	}
+
+	void push_raw_ioctl_telemetry(test_lab::result_t& r, const char* prefix) {
+		if (!device)
+			return;
+		const voyager::detail::raw_ioctl_telemetry t = device->get_last_raw_ioctl_telemetry();
+		push_prefixed_field(r, prefix, "raw_requested_code", fmt_hex_u32(t.requested_code));
+		push_prefixed_field(r, prefix, "raw_effective_code", fmt_hex_u32(t.effective_code));
+		push_prefixed_field(r, prefix, "raw_decoded_offset", fmt_u32(t.decoded_offset));
+		push_prefixed_field(r, prefix, "raw_decoded_offset_valid", fmt_u32(t.decoded_offset_valid));
+		push_prefixed_field(r, prefix, "raw_pre_base", fmt_hex_u32(t.pre_base));
+		push_prefixed_field(r, prefix, "raw_pre_global_base", fmt_hex_u32(t.pre_global_base));
+		push_prefixed_field(r, prefix, "raw_post_base", fmt_hex_u32(t.post_base));
+		push_prefixed_field(r, prefix, "raw_post_global_base", fmt_hex_u32(t.post_global_base));
+		push_prefixed_field(r, prefix, "raw_retry_base", fmt_hex_u32(t.retry_base));
+		push_prefixed_field(r, prefix, "raw_retry_global_base", fmt_hex_u32(t.retry_global_base));
+		push_prefixed_field(r, prefix, "raw_pre_key_hash", fmt_hex_u32(t.pre_key_hash));
+		push_prefixed_field(r, prefix, "raw_pre_global_key_hash", fmt_hex_u32(t.pre_global_key_hash));
+		push_prefixed_field(r, prefix, "raw_post_key_hash", fmt_hex_u32(t.post_key_hash));
+		push_prefixed_field(r, prefix, "raw_post_global_key_hash", fmt_hex_u32(t.post_global_key_hash));
+		push_prefixed_field(r, prefix, "raw_retry_key_hash", fmt_hex_u32(t.retry_key_hash));
+		push_prefixed_field(r, prefix, "raw_retry_global_key_hash", fmt_hex_u32(t.retry_global_key_hash));
+		push_prefixed_field(r, prefix, "raw_pre_ioctl_seed_hash", fmt_hex_u32(t.pre_ioctl_seed_hash));
+		push_prefixed_field(r, prefix, "raw_pre_global_ioctl_seed_hash", fmt_hex_u32(t.pre_global_ioctl_seed_hash));
+		push_prefixed_field(r, prefix, "raw_post_ioctl_seed_hash", fmt_hex_u32(t.post_ioctl_seed_hash));
+		push_prefixed_field(r, prefix, "raw_post_global_ioctl_seed_hash", fmt_hex_u32(t.post_global_ioctl_seed_hash));
+		push_prefixed_field(r, prefix, "raw_retry_ioctl_seed_hash", fmt_hex_u32(t.retry_ioctl_seed_hash));
+		push_prefixed_field(r, prefix, "raw_retry_global_ioctl_seed_hash", fmt_hex_u32(t.retry_global_ioctl_seed_hash));
+		push_prefixed_field(r, prefix, "raw_initial_last_error", fmt_u32(t.initial_gle));
+		push_prefixed_field(r, prefix, "raw_initial_bytes", fmt_u32(t.initial_bytes_returned));
+		push_prefixed_field(r, prefix, "raw_initial_elapsed_ms", fmt_u64(t.initial_elapsed_ms));
+		push_prefixed_field(r, prefix, "raw_final_last_error", fmt_u32(t.gle));
+		push_prefixed_field(r, prefix, "raw_final_bytes", fmt_u32(t.bytes_returned));
+		push_prefixed_field(r, prefix, "raw_elapsed_ms", fmt_u64(t.elapsed_ms));
+		push_prefixed_field(r, prefix, "raw_retry_attempted", fmt_u32(t.retry_attempted));
+		push_prefixed_field(r, prefix, "raw_retry_recomputed_changed", fmt_u32(t.retry_recomputed_changed));
+		push_prefixed_field(r, prefix, "raw_retry_reason", fmt_u32(t.retry_reason));
+		push_prefixed_field(r, prefix, "raw_retry_ok", fmt_u32(t.retry_ok));
+		push_prefixed_field(r, prefix, "raw_retry_effective_code", fmt_hex_u32(t.retry_effective_code));
+		push_prefixed_field(r, prefix, "raw_retry_last_error", fmt_u32(t.retry_gle));
+		push_prefixed_field(r, prefix, "raw_retry_bytes", fmt_u32(t.retry_bytes_returned));
+		push_prefixed_field(r, prefix, "raw_retry_elapsed_ms", fmt_u64(t.retry_elapsed_ms));
+		push_prefixed_field(r, prefix, "raw_heartbeat_attempted", fmt_u32(t.heartbeat_attempted));
+		push_prefixed_field(r, prefix, "raw_heartbeat_ok", fmt_u32(t.heartbeat_ok));
+		push_prefixed_field(r, prefix, "raw_heartbeat_ioctl", fmt_hex_u32(t.heartbeat_ioctl));
+		push_prefixed_field(r, prefix, "raw_heartbeat_last_error", fmt_u32(t.heartbeat_gle));
+		push_prefixed_field(r, prefix, "raw_heartbeat_bytes", fmt_u32(t.heartbeat_bytes));
+		push_prefixed_field(r, prefix, "raw_heartbeat_response", fmt_hex_u64(t.heartbeat_response));
+		push_prefixed_field(r, prefix, "raw_heartbeat_tsc", fmt_u64(t.heartbeat_tsc));
+		push_prefixed_field(r, prefix, "raw_whoswho_tsc", fmt_u64(t.whoswho_tsc));
+		push_prefixed_field(r, prefix, "raw_sentinel_tsc", fmt_u64(t.sentinel_tsc));
+		push_prefixed_field(r, prefix, "raw_connected", fmt_u32(t.connected));
+		push_prefixed_field(r, prefix, "raw_handle", fmt_hex_u64(t.handle_value));
+		push_prefixed_field(r, prefix, "raw_attached_pid", fmt_u32(t.attached_pid));
+		push_prefixed_field(r, prefix, "raw_local_pid", fmt_u32(t.local_pid));
+		push_prefixed_field(r, prefix, "raw_local_tid", fmt_u32(t.local_tid));
+		push_prefixed_field(r, prefix, "raw_req_pid", fmt_u32(t.req_pid));
+		push_prefixed_field(r, prefix, "raw_req_tid", fmt_u32(t.req_tid));
+		push_prefixed_field(r, prefix, "raw_server_seed_present", fmt_u32(t.server_seed_present));
+		push_prefixed_field(r, prefix, "raw_ioctl_seed_present", fmt_u32(t.ioctl_seed_present));
+		push_prefixed_field(r, prefix, "raw_global_seed_present_pre", fmt_u32(t.global_server_seed_present_pre));
+		push_prefixed_field(r, prefix, "raw_global_ioctl_seed_present_pre", fmt_u32(t.global_ioctl_seed_present_pre));
+		push_prefixed_field(r, prefix, "raw_global_seed_present_post", fmt_u32(t.global_server_seed_present_post));
+		push_prefixed_field(r, prefix, "raw_global_ioctl_seed_present_post", fmt_u32(t.global_ioctl_seed_present_post));
 	}
 
 	std::string fmt_ip_v4(const std::uint8_t* a) {
@@ -1441,6 +1511,7 @@ namespace {
 		push_prefixed_field(r, prefix, "nsts_elapsed_ms", fmt_u64(sample.elapsed_ms));
 		push_prefixed_field(r, prefix, "nsts_last_error", fmt_u32(sample.last_error));
 		push_prefixed_field(r, prefix, "nsts_bytes", fmt_u32(sample.bytes));
+		push_raw_ioctl_telemetry(r, prefix);
 		push_prefixed_field(r, prefix, "total_dns_logged", fmt_u32(sample.total_dns_logged));
 		push_prefixed_field(r, prefix, "capture_active", fmt_u32(sample.capture_active));
 		push_prefixed_field(r, prefix, "total_captured", fmt_u32(sample.total_captured));
@@ -1570,6 +1641,7 @@ namespace {
 		r.parsed.push_back({ "baseline_dns_ioctl_last_error", fmt_u32(baseline_gle) });
 		r.parsed.push_back({ "baseline_dns_ioctl_bytes", fmt_u32(br_base) });
 		r.parsed.push_back({ "baseline_dns_entry_count", fmt_u32(baseline_total) });
+		push_raw_ioctl_telemetry(r, "baseline_dns_ioctl");
 		std::free(baseline);
 
 		dns_mark_stage(ctx, dns_log_stage_e::start_ncap);
@@ -1593,6 +1665,7 @@ namespace {
 		r.parsed.push_back({ "dns_capture_filter_pid", "0" });
 		r.parsed.push_back({ "dns_capture_filter_protocol", "0" });
 		r.parsed.push_back({ "dns_probe_owner_pid", fmt_u32(self_pid) });
+		push_raw_ioctl_telemetry(r, "dns_capture_start");
 		if (!cap_started) {
 			r.ok = false;
 			r.error = "NCAP start failed before DNS probe";
@@ -1618,6 +1691,7 @@ namespace {
 			r.parsed.push_back({ "dns_capture_stop_elapsed_ms", fmt_u64(stop_elapsed) });
 			r.parsed.push_back({ "dns_capture_stop_last_error", fmt_u32(stop_gle) });
 			r.parsed.push_back({ "dns_capture_stop_bytes", fmt_u32(br_stop) });
+			push_raw_ioctl_telemetry(r, "dns_capture_stop");
 			return stop_ok;
 		};
 
@@ -2151,9 +2225,17 @@ namespace {
 		start_req.filter_protocol = 0u;
 		start_req.max_packet_bytes = 1500u;
 		std::uint32_t br_start = 0;
+		const std::uint64_t cap_start_tick = static_cast<std::uint64_t>(GetTickCount64());
+		SetLastError(ERROR_SUCCESS);
 		bool cap_started = device->send_ioctl_raw(ioctl_codes::NCAP(), &start_req, sizeof(start_req), br_start);
+		const DWORD cap_start_gle = cap_started ? ERROR_SUCCESS : GetLastError();
+		const std::uint64_t cap_start_elapsed = static_cast<std::uint64_t>(GetTickCount64()) - cap_start_tick;
 		r.parsed.push_back({ "stats_capture_start_ok", cap_started ? "1" : "0" });
+		r.parsed.push_back({ "stats_capture_start_last_error", fmt_u32(cap_start_gle) });
+		r.parsed.push_back({ "stats_capture_start_bytes", fmt_u32(br_start) });
+		r.parsed.push_back({ "stats_capture_start_elapsed_ms", fmt_u64(cap_start_elapsed) });
 		r.parsed.push_back({ "stats_capture_filter_pid", fmt_u32(self_pid) });
+		push_raw_ioctl_telemetry(r, "stats_capture_start");
 		if (!cap_started) {
 			r.ok = false;
 			r.error = "NCAP start failed before NSTS probe";
@@ -2163,12 +2245,23 @@ namespace {
 
 		voyager::detail::net_stats_request base_req{};
 		std::uint32_t br1 = 0;
+		const std::uint64_t base_tick = static_cast<std::uint64_t>(GetTickCount64());
+		SetLastError(ERROR_SUCCESS);
 		bool ok1 = device->send_ioctl_raw(ioctl_codes::NSTS(), &base_req, sizeof(base_req), br1);
+		const DWORD base_gle = ok1 ? ERROR_SUCCESS : GetLastError();
+		const std::uint64_t base_elapsed = static_cast<std::uint64_t>(GetTickCount64()) - base_tick;
+		r.parsed.push_back({ "baseline_nsts_ok", ok1 ? "1" : "0" });
+		r.parsed.push_back({ "baseline_nsts_last_error", fmt_u32(base_gle) });
+		r.parsed.push_back({ "baseline_nsts_bytes", fmt_u32(br1) });
+		r.parsed.push_back({ "baseline_nsts_elapsed_ms", fmt_u64(base_elapsed) });
+		push_raw_ioctl_telemetry(r, "baseline_nsts");
 		if (!ok1) {
 			voyager::detail::net_cap_ctrl_request stop_req{};
 			stop_req.operation = 1u;
 			std::uint32_t br_stop = 0;
+			SetLastError(ERROR_SUCCESS);
 			device->send_ioctl_raw(ioctl_codes::NCAP(), &stop_req, sizeof(stop_req), br_stop);
+			push_raw_ioctl_telemetry(r, "baseline_failure_capture_stop");
 			r.ok = false;
 			r.error = "NSTS baseline ioctl failed";
 			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
@@ -2206,13 +2299,24 @@ namespace {
 
 		voyager::detail::net_stats_request after_req{};
 		std::uint32_t br2 = 0;
+		const std::uint64_t after_tick = static_cast<std::uint64_t>(GetTickCount64());
+		SetLastError(ERROR_SUCCESS);
 		bool ok2 = device->send_ioctl_raw(ioctl_codes::NSTS(), &after_req, sizeof(after_req), br2);
+		const DWORD after_gle = ok2 ? ERROR_SUCCESS : GetLastError();
+		const std::uint64_t after_elapsed = static_cast<std::uint64_t>(GetTickCount64()) - after_tick;
 		r.bytes_returned = br2;
+		r.parsed.push_back({ "after_nsts_ok", ok2 ? "1" : "0" });
+		r.parsed.push_back({ "after_nsts_last_error", fmt_u32(after_gle) });
+		r.parsed.push_back({ "after_nsts_bytes", fmt_u32(br2) });
+		r.parsed.push_back({ "after_nsts_elapsed_ms", fmt_u64(after_elapsed) });
+		push_raw_ioctl_telemetry(r, "after_nsts");
 		if (!ok2) {
 			voyager::detail::net_cap_ctrl_request stop_req{};
 			stop_req.operation = 1u;
 			std::uint32_t br_stop = 0;
+			SetLastError(ERROR_SUCCESS);
 			device->send_ioctl_raw(ioctl_codes::NCAP(), &stop_req, sizeof(stop_req), br_stop);
+			push_raw_ioctl_telemetry(r, "after_failure_capture_stop");
 			r.ok = false;
 			r.error = "NSTS post-traffic ioctl failed";
 			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
@@ -2221,8 +2325,16 @@ namespace {
 		voyager::detail::net_cap_ctrl_request stop_req{};
 		stop_req.operation = 1u;
 		std::uint32_t br_stop = 0;
-		device->send_ioctl_raw(ioctl_codes::NCAP(), &stop_req, sizeof(stop_req), br_stop);
-		r.parsed.push_back({ "stats_capture_stop_ok", "1" });
+		const std::uint64_t stop_tick = static_cast<std::uint64_t>(GetTickCount64());
+		SetLastError(ERROR_SUCCESS);
+		const bool stop_ok = device->send_ioctl_raw(ioctl_codes::NCAP(), &stop_req, sizeof(stop_req), br_stop);
+		const DWORD stop_gle = stop_ok ? ERROR_SUCCESS : GetLastError();
+		const std::uint64_t stop_elapsed = static_cast<std::uint64_t>(GetTickCount64()) - stop_tick;
+		r.parsed.push_back({ "stats_capture_stop_ok", stop_ok ? "1" : "0" });
+		r.parsed.push_back({ "stats_capture_stop_last_error", fmt_u32(stop_gle) });
+		r.parsed.push_back({ "stats_capture_stop_bytes", fmt_u32(br_stop) });
+		r.parsed.push_back({ "stats_capture_stop_elapsed_ms", fmt_u64(stop_elapsed) });
+		push_raw_ioctl_telemetry(r, "stats_capture_stop");
 		r.parsed.push_back({ "after_bytes_sent", fmt_u64(after_req.bytes_sent) });
 		r.parsed.push_back({ "after_bytes_received", fmt_u64(after_req.bytes_received) });
 		r.parsed.push_back({ "after_packets_sent", fmt_u64(after_req.packets_sent) });
