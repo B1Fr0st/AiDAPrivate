@@ -178,6 +178,7 @@ namespace {
         contract_pass,
         cleanup_contract_pass,
         state_contract_pass,
+        accepted_pending,
         guard_pass,
         security_guard_pass,
         negative_pass,
@@ -195,6 +196,7 @@ namespace {
         int contract_passed = 0;
         int cleanup_contract_passed = 0;
         int state_contract_passed = 0;
+        int accepted_pending = 0;
         int guard_passed = 0;
         int security_guard_passed = 0;
         int negative_passed = 0;
@@ -2192,6 +2194,7 @@ namespace {
             case mcp_tool_call_status_t::contract_pass: ++stats.contract_passed; break;
             case mcp_tool_call_status_t::cleanup_contract_pass: ++stats.cleanup_contract_passed; break;
             case mcp_tool_call_status_t::state_contract_pass: ++stats.state_contract_passed; break;
+            case mcp_tool_call_status_t::accepted_pending: ++stats.accepted_pending; break;
             case mcp_tool_call_status_t::guard_pass: ++stats.guard_passed; break;
             case mcp_tool_call_status_t::security_guard_pass: ++stats.security_guard_passed; break;
             case mcp_tool_call_status_t::negative_pass: ++stats.negative_passed; break;
@@ -2204,15 +2207,16 @@ namespace {
     }
 
     std::string mcp_tool_attempt_stats_summary(const mcp_tool_attempt_stats_t& st) {
-        char buf[640];
+        char buf[768];
         _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-            "attempted=%d functional_pass=%d schema_pass=%d contract_pass=%d cleanup_contract_pass=%d state_contract_pass=%d guard_pass=%d security_guard_pass=%d negative_pass=%d failed=%d dependency_blocked=%d cascade_blocked=%d skipped=%d timed_out=%d",
+            "attempted=%d functional_pass=%d schema_pass=%d contract_pass=%d cleanup_contract_pass=%d state_contract_pass=%d accepted_pending=%d guard_pass=%d security_guard_pass=%d negative_pass=%d failed=%d dependency_blocked=%d cascade_blocked=%d skipped=%d timed_out=%d",
             st.attempted,
             st.passed,
             st.schema_passed,
             st.contract_passed,
             st.cleanup_contract_passed,
             st.state_contract_passed,
+            st.accepted_pending,
             st.guard_passed,
             st.security_guard_passed,
             st.negative_passed,
@@ -2240,6 +2244,28 @@ namespace {
         if (stats.failed > 0)
             --stats.failed;
         ++stats.passed;
+    }
+
+    bool convert_tool_accepted_pending_to_pass(const std::string& name) {
+        if (name.empty())
+            return false;
+        auto& stats = g_tool_attempt_stats[name];
+        if (stats.accepted_pending == 0)
+            return false;
+        --stats.accepted_pending;
+        ++stats.passed;
+        return true;
+    }
+
+    bool convert_tool_accepted_pending_to_fail(const std::string& name) {
+        if (name.empty())
+            return false;
+        auto& stats = g_tool_attempt_stats[name];
+        if (stats.accepted_pending == 0)
+            return false;
+        --stats.accepted_pending;
+        ++stats.failed;
+        return true;
     }
 
     void convert_tool_pass_to_cascade_blocked(const std::string& name) {
@@ -2391,6 +2417,22 @@ namespace {
         while (current > 0 && !failed.compare_exchange_weak(current, current - 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
         }
         passed.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    void convert_last_accepted_pending_to_fixture_pass(const char* tool_name, std::atomic<int>& passed) {
+        const std::string tool_name_s = tool_name ? std::string(tool_name) : std::string();
+        const bool converted = convert_tool_accepted_pending_to_pass(tool_name_s);
+        if (!converted && !tool_name_s.empty())
+            record_tool_status(tool_name_s, mcp_tool_call_status_t::functional_pass);
+        passed.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    void convert_last_accepted_pending_to_fixture_failure(const char* tool_name, std::atomic<int>& failed) {
+        const std::string tool_name_s = tool_name ? std::string(tool_name) : std::string();
+        const bool converted = convert_tool_accepted_pending_to_fail(tool_name_s);
+        if (!converted && !tool_name_s.empty())
+            record_tool_status(tool_name_s, mcp_tool_call_status_t::failed);
+        failed.fetch_add(1, std::memory_order_acq_rel);
     }
 
     void convert_last_pass_to_cascade_blocked(HANDLE hf, const char* tag, const char* tool_name, const std::string& reason, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -4382,13 +4424,41 @@ namespace {
             }
             return false;
         }
+        if (tool_lc == "burp_intruder_manage" && action_lc == "start") {
+            uint64_t job_id = 0;
+            uint64_t result_count = 0;
+            bool proof_pending = false;
+            const bool has_job_id = payload_u64_field(ir.data, "job_id", job_id) && job_id != 0;
+            payload_u64_field(ir.data, "result_count", result_count);
+            payload_bool_field(ir.data, "proof_pending", proof_pending);
+            if (has_job_id && proof_pending && result_count == 0) {
+                status = mcp_tool_call_status_t::accepted_pending;
+                proof = "burp_intruder start accepted_pending job_id=" +
+                    std::to_string(static_cast<unsigned long long>(job_id)) +
+                    " result_count=0 request_result_proof_required=1 zero_reason=" + zero_reason;
+                return true;
+            }
+        }
+        if (tool_lc == "burp_scanner_manage" && (action_lc == "start_audit" || action_lc == "start")) {
+            uint64_t audit_id = 0;
+            bool proof_pending = false;
+            bool proof_ready = false;
+            const bool has_audit_id = payload_u64_field(ir.data, "audit_id", audit_id) && audit_id != 0;
+            payload_bool_field(ir.data, "proof_pending", proof_pending);
+            payload_bool_field(ir.data, "proof_ready", proof_ready);
+            if (has_audit_id && proof_pending && !proof_ready) {
+                status = mcp_tool_call_status_t::accepted_pending;
+                proof = "burp_scanner start accepted_pending audit_id=" +
+                    std::to_string(static_cast<unsigned long long>(audit_id)) +
+                    " probe_response_proof_required=1 zero_reason=" + zero_reason;
+                return true;
+            }
+        }
         if (tool_lc == "network_pre_encrypt_hook" &&
             action_lc == "status" &&
             (zero_reason.find("capture_count=0") != std::string::npos ||
              zero_reason.find("captures=[]") != std::string::npos ||
              zero_reason.find("capture") != std::string::npos)) {
-            if (!g_network_pre_encrypt_sidecar_page_guard_proven)
-                return false;
             bool active = false;
             bool has_active = payload_bool_field(ir.data, "active", active);
             uint64_t hook_count = 0;
@@ -6028,7 +6098,16 @@ namespace {
             if ((payload_u64_field(ir.data, "count", count) && count == 0) ||
                 (payload_array_count(ir.data, "events", events) && events == 0) ||
                 payload_text_contains(ir, "0 api monitor event")) {
-                reason = "api_monitor_events=0";
+                std::string zero_reason;
+                bool setup_failure = false;
+                bool stimulus_failure = false;
+                payload_string_field(ir.data, "zero_event_reason", zero_reason);
+                payload_bool_field(ir.data, "setup_failure", setup_failure);
+                payload_bool_field(ir.data, "stimulus_failure", stimulus_failure);
+                reason = "api_monitor_events=0 zero_event_reason=" +
+                    (zero_reason.empty() ? std::string("unreported") : zero_reason) +
+                    " setup_failure=" + std::to_string(setup_failure ? 1 : 0) +
+                    " stimulus_failure=" + std::to_string(stimulus_failure ? 1 : 0);
                 return true;
             }
         }
@@ -7070,6 +7149,7 @@ namespace {
             case mcp_tool_call_status_t::contract_pass: return "CONTRACT-PASS";
             case mcp_tool_call_status_t::cleanup_contract_pass: return "CLEANUP-CONTRACT-PASS";
             case mcp_tool_call_status_t::state_contract_pass: return "STATE-CONTRACT-PASS";
+            case mcp_tool_call_status_t::accepted_pending: return "ACCEPTED-PENDING";
             case mcp_tool_call_status_t::guard_pass: return "GUARD-PASS";
             case mcp_tool_call_status_t::security_guard_pass: return "SECURITY-GUARD-PASS";
             case mcp_tool_call_status_t::negative_pass: return "NEGATIVE-PASS";
@@ -7089,6 +7169,7 @@ namespace {
             case mcp_tool_call_status_t::contract_pass: return "contract_pass";
             case mcp_tool_call_status_t::cleanup_contract_pass: return "cleanup_contract_pass";
             case mcp_tool_call_status_t::state_contract_pass: return "state_contract_pass";
+            case mcp_tool_call_status_t::accepted_pending: return "accepted_pending";
             case mcp_tool_call_status_t::guard_pass: return "guard_pass";
             case mcp_tool_call_status_t::security_guard_pass: return "security_guard_pass";
             case mcp_tool_call_status_t::negative_pass: return "negative_pass";
@@ -7495,7 +7576,25 @@ namespace {
                 return mcp_tool_call_status_t::functional_pass;
             }
             if (effective_action_lc == "start") {
-                evidence = "burp_intruder_start_contract_waiting_for_request_stimulus";
+                uint64_t job_id = 0;
+                bool proof_pending = false;
+                bool terminal_no_request_evidence = false;
+                bool terminal_without_functional_proof = false;
+                payload_u64_field(ir.data, "job_id", job_id);
+                payload_bool_field(ir.data, "proof_pending", proof_pending);
+                payload_bool_field(ir.data, "terminal_no_request_evidence", terminal_no_request_evidence);
+                payload_bool_field(ir.data, "terminal_without_functional_proof", terminal_without_functional_proof);
+                if (proof_pending) {
+                    evidence = "burp_intruder_start_accepted_pending job_id=" +
+                        std::to_string(static_cast<unsigned long long>(job_id)) +
+                        " proof_pending=1 request_result_proof_required=1";
+                    return mcp_tool_call_status_t::accepted_pending;
+                }
+                evidence = "burp_intruder_start_no_functional_proof_yet job_id=" +
+                    std::to_string(static_cast<unsigned long long>(job_id)) +
+                    " proof_pending=0 terminal_no_request_evidence=" + std::to_string(terminal_no_request_evidence ? 1 : 0) +
+                    " terminal_without_functional_proof=" + std::to_string(terminal_without_functional_proof ? 1 : 0) +
+                    " request_result_proof_required=1";
                 return mcp_tool_call_status_t::contract_pass;
             }
             if (effective_action_lc == "status") {
@@ -7510,12 +7609,30 @@ namespace {
         if (tool_lc == "burp_scanner_manage") {
             std::string capture_reason;
             if (payload_capture_or_result_evidence(ir.data, capture_reason) ||
-                payload_positive_u64_any(ir.data, { "completed_probes", "responses_received", "issues_found", "issue_count", "exchanges_scanned" })) {
+                payload_positive_u64_any(ir.data, { "responses_received", "issues_found", "issue_count", "exchanges_scanned" })) {
                 evidence = "burp_scanner_positive_probe_or_issue_evidence " + capture_reason;
                 return mcp_tool_call_status_t::functional_pass;
             }
             if (effective_action_lc == "start_audit" || effective_action_lc == "start") {
-                evidence = "burp_scanner_start_contract_waiting_for_probe_completion";
+                uint64_t audit_id = 0;
+                bool proof_pending = false;
+                bool terminal_no_probe_evidence = false;
+                bool terminal_without_functional_proof = false;
+                payload_u64_field(ir.data, "audit_id", audit_id);
+                payload_bool_field(ir.data, "proof_pending", proof_pending);
+                payload_bool_field(ir.data, "terminal_no_probe_evidence", terminal_no_probe_evidence);
+                payload_bool_field(ir.data, "terminal_without_functional_proof", terminal_without_functional_proof);
+                if (proof_pending) {
+                    evidence = "burp_scanner_start_accepted_pending audit_id=" +
+                        std::to_string(static_cast<unsigned long long>(audit_id)) +
+                        " proof_pending=1 response_or_issue_proof_required=1";
+                    return mcp_tool_call_status_t::accepted_pending;
+                }
+                evidence = "burp_scanner_start_no_functional_proof_yet audit_id=" +
+                    std::to_string(static_cast<unsigned long long>(audit_id)) +
+                    " proof_pending=0 terminal_no_probe_evidence=" + std::to_string(terminal_no_probe_evidence ? 1 : 0) +
+                    " terminal_without_functional_proof=" + std::to_string(terminal_without_functional_proof ? 1 : 0) +
+                    " response_or_issue_proof_required=1";
                 return mcp_tool_call_status_t::contract_pass;
             }
             if (effective_action_lc == "audit_status" || effective_action_lc == "status") {
@@ -7642,12 +7759,27 @@ namespace {
         }
         if (tool_lc == "network_pre_encrypt_hook") {
             std::string capture_reason;
-            if (payload_capture_or_result_evidence(ir.data, capture_reason)) {
-                evidence = "network_pre_encrypt_hook_capture_evidence " + capture_reason;
+            if (effective_action_lc == "status") {
+                bool active = false;
+                uint64_t hook_count = 0;
+                uint64_t capture_count = 0;
+                payload_bool_field(ir.data, "active", active);
+                payload_u64_field(ir.data, "hook_count", hook_count);
+                payload_u64_field(ir.data, "capture_count", capture_count);
+                evidence = "network_pre_encrypt_hook_status_nonfunctional active=" +
+                    std::to_string(active ? 1 : 0) +
+                    " hook_count=" + std::to_string(static_cast<unsigned long long>(hook_count)) +
+                    " capture_count=" + std::to_string(static_cast<unsigned long long>(capture_count)) +
+                    " sidecar_marker_capture_required=1";
+                return mcp_tool_call_status_t::state_contract_pass;
+            }
+            if (payload_capture_or_result_evidence(ir.data, capture_reason) &&
+                g_network_pre_encrypt_sidecar_page_guard_proven) {
+                evidence = "network_pre_encrypt_hook_sidecar_marker_capture_evidence " + capture_reason;
                 return mcp_tool_call_status_t::functional_pass;
             }
-            if (effective_action_lc == "status") {
-                evidence = "network_pre_encrypt_hook_status_contract_no_capture";
+            if (payload_capture_or_result_evidence(ir.data, capture_reason)) {
+                evidence = "network_pre_encrypt_hook_capture_without_sidecar_marker_proof " + capture_reason;
                 return mcp_tool_call_status_t::state_contract_pass;
             }
             if (effective_action_lc == "auto_hook" || effective_action_lc == "hook_address") {
@@ -17611,6 +17743,7 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         int contract_pass_tools = 0;
         int cleanup_contract_pass_tools = 0;
         int state_contract_pass_tools = 0;
+        int accepted_pending_tools = 0;
         int guard_pass_tools = 0;
         int security_guard_pass_tools = 0;
         int security_guard_covered = 0;
@@ -17661,6 +17794,8 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
                     ++cleanup_contract_pass_tools;
                 if (st.state_contract_passed > 0)
                     ++state_contract_pass_tools;
+                if (st.accepted_pending > 0)
+                    ++accepted_pending_tools;
                 if (st.guard_passed > 0)
                     ++guard_pass_tools;
                 if (st.security_guard_passed > 0)
@@ -17674,6 +17809,7 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
                     st.contract_passed > 0 ||
                     st.cleanup_contract_passed > 0 ||
                     st.state_contract_passed > 0 ||
+                    st.accepted_pending > 0 ||
                     st.guard_passed > 0 ||
                     st.security_guard_passed > 0 ||
                     st.negative_passed > 0;
@@ -17772,6 +17908,10 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
                 } else if (st.state_contract_passed > 0 && st.failed == 0 && st.timed_out == 0) {
                     ++no_pass;
                     log_msg(hf, tag, "STATE-CONTRACT-NONFUNCTIONAL -- registered tool \"%s\" state contract observed without functional evidence %s",
+                        t.name.c_str(), stats_summary.c_str());
+                } else if (st.accepted_pending > 0 && st.failed == 0 && st.timed_out == 0) {
+                    ++no_pass;
+                    log_msg(hf, tag, "ACCEPTED-PENDING-NONFUNCTIONAL -- registered tool \"%s\" accepted work but did not produce functional proof %s",
                         t.name.c_str(), stats_summary.c_str());
                 } else if (safe_external_guard_exempt && st.guard_passed > 0 && st.failed == 0 && st.timed_out == 0) {
                     ++no_pass;
@@ -17919,7 +18059,7 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             }
         }
 
-        log_msg(hf, tag, "DIAG -- registry total=%d external=%d internal=%d ide_chat_only=%d ai_excluded=%d non_ai_audited=%d destructive_tools=%d destructive_schema_exemptions=%d destructive_safe_contract_covered=%d security_guard_covered=%d schema_pass_tools=%d contract_pass_tools=%d cleanup_contract_pass_tools=%d state_contract_pass_tools=%d guard_pass_tools=%d security_guard_pass_tools=%d negative_pass_tools=%d dependency_blocked_tools=%d cascade_blocked_tools=%d expected_empty_nonfunctional_tools=%d empty_result_suspect_tools=%d unexpected_zero_pass_tools=%d outstanding_timed_out_workers=%zu timed_out_drain_complete=%d explicit_invocations=%zu strict_safe_contract_proof=1",
+        log_msg(hf, tag, "DIAG -- registry total=%d external=%d internal=%d ide_chat_only=%d ai_excluded=%d non_ai_audited=%d destructive_tools=%d destructive_schema_exemptions=%d destructive_safe_contract_covered=%d security_guard_covered=%d schema_pass_tools=%d contract_pass_tools=%d cleanup_contract_pass_tools=%d state_contract_pass_tools=%d accepted_pending_tools=%d guard_pass_tools=%d security_guard_pass_tools=%d negative_pass_tools=%d dependency_blocked_tools=%d cascade_blocked_tools=%d expected_empty_nonfunctional_tools=%d empty_result_suspect_tools=%d unexpected_zero_pass_tools=%d outstanding_timed_out_workers=%zu timed_out_drain_complete=%d explicit_invocations=%zu strict_safe_contract_proof=1",
             registered_total,
             registered_external,
             registered_internal,
@@ -17934,6 +18074,7 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             contract_pass_tools,
             cleanup_contract_pass_tools,
             state_contract_pass_tools,
+            accepted_pending_tools,
             guard_pass_tools,
             security_guard_pass_tools,
             negative_pass_tools,
@@ -17947,18 +18088,18 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             g_invoked_tools.size());
 
         if (missing == 0 && stale == 0 && no_pass == 0 && failed_tools == 0 && mixed_fail_tools == 0 && skipped_tools == 0 && timed_out_tools == 0 && dependency_blocked_tools == 0 && cascade_blocked_tools == 0 && expected_empty_nonfunctional_tools == 0 && empty_result_suspect_tools == 0 && unexpected_zero_pass_tools == 0 && outstanding_timed_out_workers == 0 && timed_out_drain_complete) {
-            log_msg(hf, tag, "PASS -- attempted=%d functional_passed_tools=%d destructive_safe_contract_covered=%d security_guard_covered=%d covered_total=%d no_functional_pass=%d failed_tools=%d mixed_fail_tools=%d skipped_tools=%d timed_out_tools=%d dependency_blocked_tools=%d cascade_blocked_tools=%d empty_result_suspect_tools=%d unexpected_zero_pass_tools=%d expected_empty_nonfunctional_tools=%d outstanding_timed_out_workers=%zu registered_total=%d external=%d internal=%d ide_chat_only=%d ai_excluded=%d non_ai_audited=%d destructive_schema_exemptions=%d strict_safe_contract_proof=1",
-                attempted, passed_tools, destructive_schema_exempt_covered, security_guard_covered, covered, no_pass, failed_tools, mixed_fail_tools, skipped_tools, timed_out_tools, dependency_blocked_tools, cascade_blocked_tools, empty_result_suspect_tools, unexpected_zero_pass_tools, expected_empty_nonfunctional_tools, outstanding_timed_out_workers,
+            log_msg(hf, tag, "PASS -- attempted=%d functional_passed_tools=%d destructive_safe_contract_covered=%d security_guard_covered=%d covered_total=%d no_functional_pass=%d failed_tools=%d mixed_fail_tools=%d skipped_tools=%d timed_out_tools=%d dependency_blocked_tools=%d cascade_blocked_tools=%d accepted_pending_tools=%d empty_result_suspect_tools=%d unexpected_zero_pass_tools=%d expected_empty_nonfunctional_tools=%d outstanding_timed_out_workers=%zu registered_total=%d external=%d internal=%d ide_chat_only=%d ai_excluded=%d non_ai_audited=%d destructive_schema_exemptions=%d strict_safe_contract_proof=1",
+                attempted, passed_tools, destructive_schema_exempt_covered, security_guard_covered, covered, no_pass, failed_tools, mixed_fail_tools, skipped_tools, timed_out_tools, dependency_blocked_tools, cascade_blocked_tools, accepted_pending_tools, empty_result_suspect_tools, unexpected_zero_pass_tools, expected_empty_nonfunctional_tools, outstanding_timed_out_workers,
                 registered_total, registered_external, registered_internal, registered_ide_chat, skipped_ai, non_ai_audited, destructive_schema_exemptions);
             passed.fetch_add(1);
         } else {
-            log_msg(hf, tag, "FAIL -- missing=%d stale=%d attempted=%d functional_passed_tools=%d destructive_safe_contract_covered=%d security_guard_covered=%d covered_total=%d no_functional_pass=%d failed_tools=%d mixed_fail_tools=%d skipped_tools=%d timed_out_tools=%d dependency_blocked_tools=%d cascade_blocked_tools=%d empty_result_suspect_tools=%d unexpected_zero_pass_tools=%d expected_empty_nonfunctional_tools=%d outstanding_timed_out_workers=%zu timed_out_drain_complete=%d registered_total=%d external=%d internal=%d ide_chat_only=%d ai_excluded=%d non_ai_audited=%d destructive_schema_exemptions=%d strict_functional_coverage=1 strict_safe_contract_proof=1",
-                missing, stale, attempted, passed_tools, destructive_schema_exempt_covered, security_guard_covered, covered, no_pass, failed_tools, mixed_fail_tools, skipped_tools, timed_out_tools, dependency_blocked_tools, cascade_blocked_tools, empty_result_suspect_tools, unexpected_zero_pass_tools, expected_empty_nonfunctional_tools, outstanding_timed_out_workers, timed_out_drain_complete ? 1 : 0,
+            log_msg(hf, tag, "FAIL -- missing=%d stale=%d attempted=%d functional_passed_tools=%d destructive_safe_contract_covered=%d security_guard_covered=%d covered_total=%d no_functional_pass=%d failed_tools=%d mixed_fail_tools=%d skipped_tools=%d timed_out_tools=%d dependency_blocked_tools=%d cascade_blocked_tools=%d accepted_pending_tools=%d empty_result_suspect_tools=%d unexpected_zero_pass_tools=%d expected_empty_nonfunctional_tools=%d outstanding_timed_out_workers=%zu timed_out_drain_complete=%d registered_total=%d external=%d internal=%d ide_chat_only=%d ai_excluded=%d non_ai_audited=%d destructive_schema_exemptions=%d strict_functional_coverage=1 strict_safe_contract_proof=1",
+                missing, stale, attempted, passed_tools, destructive_schema_exempt_covered, security_guard_covered, covered, no_pass, failed_tools, mixed_fail_tools, skipped_tools, timed_out_tools, dependency_blocked_tools, cascade_blocked_tools, accepted_pending_tools, empty_result_suspect_tools, unexpected_zero_pass_tools, expected_empty_nonfunctional_tools, outstanding_timed_out_workers, timed_out_drain_complete ? 1 : 0,
                 registered_total, registered_external, registered_internal, registered_ide_chat, skipped_ai, non_ai_audited, destructive_schema_exemptions);
             failed.fetch_add(1);
         }
         const auto cq_end = critical_work_queue::stats();
-        log_msg(hf, tag, "END -- missing=%d stale=%d no_functional_pass=%d functional_passed_tools=%d destructive_safe_contract_covered=%d security_guard_covered=%d failed_tools=%d mixed_fail_tools=%d dependency_blocked_tools=%d cascade_blocked_tools=%d empty_result_suspect_tools=%d unexpected_zero_pass_tools=%d expected_empty_nonfunctional_tools=%d timed_out_tools=%d outstanding_timed_out_workers=%zu schema_pass_tools=%d contract_pass_tools=%d cleanup_contract_pass_tools=%d state_contract_pass_tools=%d guard_pass_tools=%d security_guard_pass_tools=%d negative_pass_tools=%d strict_safe_contract_proof=1 pass=%d fail=%d skip=%d cq_pending=%zu cq_active=%u cq_started=%llu cq_finished=%llu",
+        log_msg(hf, tag, "END -- missing=%d stale=%d no_functional_pass=%d functional_passed_tools=%d destructive_safe_contract_covered=%d security_guard_covered=%d failed_tools=%d mixed_fail_tools=%d dependency_blocked_tools=%d cascade_blocked_tools=%d empty_result_suspect_tools=%d unexpected_zero_pass_tools=%d expected_empty_nonfunctional_tools=%d timed_out_tools=%d outstanding_timed_out_workers=%zu schema_pass_tools=%d contract_pass_tools=%d cleanup_contract_pass_tools=%d state_contract_pass_tools=%d accepted_pending_tools=%d guard_pass_tools=%d security_guard_pass_tools=%d negative_pass_tools=%d strict_safe_contract_proof=1 pass=%d fail=%d skip=%d cq_pending=%zu cq_active=%u cq_started=%llu cq_finished=%llu",
             missing,
             stale,
             no_pass,
@@ -17978,6 +18119,7 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             contract_pass_tools,
             cleanup_contract_pass_tools,
             state_contract_pass_tools,
+            accepted_pending_tools,
             guard_pass_tools,
             security_guard_pass_tools,
             negative_pass_tools,
@@ -22548,8 +22690,17 @@ void test_tool_sessions_manage_open_file(HANDLE hf, std::atomic<int>& passed, st
                 " events=" + std::to_string(static_cast<unsigned long long>(events));
             return true;
         }
+        std::string zero_reason;
+        bool setup_failure = false;
+        bool stimulus_failure = false;
+        payload_string_field(data, "zero_event_reason", zero_reason);
+        payload_bool_field(data, "setup_failure", setup_failure);
+        payload_bool_field(data, "stimulus_failure", stimulus_failure);
         reason = "count=" + std::to_string(static_cast<unsigned long long>(count)) +
-            " events=" + std::to_string(static_cast<unsigned long long>(events));
+            " events=" + std::to_string(static_cast<unsigned long long>(events)) +
+            " zero_event_reason=" + (zero_reason.empty() ? "unreported" : zero_reason) +
+            " setup_failure=" + std::to_string(setup_failure ? 1 : 0) +
+            " stimulus_failure=" + std::to_string(stimulus_failure ? 1 : 0);
         return false;
     }
 
@@ -25495,7 +25646,11 @@ void test_tool_sessions_manage_open_file(HANDLE hf, std::atomic<int>& passed, st
             auto timed = invoke_tool_action_bounded(get_server(), "burp_scanner_manage", "audit_status", status_args, 1500, hf, tag, poll + 1);
             const auto& ir = timed.result;
             bool running = true;
+            bool proof_ready = false;
+            bool proof_pending = false;
             bool transport_degraded = false;
+            bool terminal_transport_failure = false;
+            bool terminal_no_probe_evidence = false;
             uint64_t completed = 0;
             uint64_t total = 0;
             uint64_t responses = 0;
@@ -25504,7 +25659,11 @@ void test_tool_sessions_manage_open_file(HANDLE hf, std::atomic<int>& passed, st
             uint64_t transport_failures = 0;
             if (!timed.timed_out && ir.found && !ir.threw && ir.success) {
                 payload_bool_field(ir.data, "running", running);
+                payload_bool_field(ir.data, "proof_ready", proof_ready);
+                payload_bool_field(ir.data, "proof_pending", proof_pending);
                 payload_bool_field(ir.data, "transport_degraded", transport_degraded);
+                payload_bool_field(ir.data, "terminal_transport_failure", terminal_transport_failure);
+                payload_bool_field(ir.data, "terminal_no_probe_evidence", terminal_no_probe_evidence);
                 payload_u64_field(ir.data, "completed_probes", completed);
                 payload_u64_field(ir.data, "total_probes", total);
                 payload_u64_field(ir.data, "responses_received", responses);
@@ -25514,10 +25673,12 @@ void test_tool_sessions_manage_open_file(HANDLE hf, std::atomic<int>& passed, st
                 if (final_data)
                     *final_data = ir.data;
             }
-            const bool evidence = completed > 0 || responses > 0 || issues > 0;
+            const bool evidence = proof_ready || responses > 0 || issues > 0;
             const bool completed_any = completed > 0 || (!running && total > 0);
-            const bool fatal_no_response = !running && completed_any && !evidence && (transport_degraded || no_response > 0 || transport_failures > 0);
-            log_msg(hf, tag, "SCANNER-POLL -- audit_id=%llu poll=%d timed_out=%d found=%d threw=%d success=%d running=%d completed=%llu total=%llu responses=%llu issues=%llu no_response=%llu transport_failures=%llu transport_degraded=%d evidence=%d fatal_no_response=%d elapsed_ms=%llu data=%s",
+            const bool terminal_without_evidence = !running && completed_any && !evidence;
+            const bool fatal_no_response = terminal_transport_failure || terminal_no_probe_evidence ||
+                (terminal_without_evidence && (transport_degraded || no_response > 0 || transport_failures > 0 || completed == 0));
+            log_msg(hf, tag, "SCANNER-POLL -- audit_id=%llu poll=%d timed_out=%d found=%d threw=%d success=%d running=%d proof_ready=%d proof_pending=%d completed=%llu total=%llu responses=%llu issues=%llu no_response=%llu transport_failures=%llu transport_degraded=%d terminal_transport_failure=%d terminal_no_probe_evidence=%d evidence=%d fatal_no_response=%d elapsed_ms=%llu data=%s",
                 static_cast<unsigned long long>(audit_id),
                 poll,
                 timed.timed_out ? 1 : 0,
@@ -25525,6 +25686,8 @@ void test_tool_sessions_manage_open_file(HANDLE hf, std::atomic<int>& passed, st
                 ir.threw ? 1 : 0,
                 ir.success ? 1 : 0,
                 running ? 1 : 0,
+                proof_ready ? 1 : 0,
+                proof_pending ? 1 : 0,
                 static_cast<unsigned long long>(completed),
                 static_cast<unsigned long long>(total),
                 static_cast<unsigned long long>(responses),
@@ -25532,6 +25695,8 @@ void test_tool_sessions_manage_open_file(HANDLE hf, std::atomic<int>& passed, st
                 static_cast<unsigned long long>(no_response),
                 static_cast<unsigned long long>(transport_failures),
                 transport_degraded ? 1 : 0,
+                terminal_transport_failure ? 1 : 0,
+                terminal_no_probe_evidence ? 1 : 0,
                 evidence ? 1 : 0,
                 fatal_no_response ? 1 : 0,
                 static_cast<unsigned long long>(GetTickCount64() - start),
@@ -25540,7 +25705,7 @@ void test_tool_sessions_manage_open_file(HANDLE hf, std::atomic<int>& passed, st
                 return true;
             if (fatal_no_response)
                 return false;
-            if (!running && completed_any)
+            if (terminal_without_evidence)
                 return false;
             ++poll;
             Sleep(150);
@@ -25555,7 +25720,9 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
         mcp_standalone::json args; args["url"] = url; args["raw_request"] = std::string("GET /?q=test HTTP/1.1\r\nHost: ") + host_header + "\r\nUser-Agent: AiDA-Scanner-Fixture\r\nConnection: close\r\n\r\n"; args["modules"] = mcp_standalone::json::array({"host-header"}); args["per_module_cap"] = 1; args["timeout_ms"] = 3000; args["max_concurrent"] = 1;
         mcp_standalone::tool_result_t result;
         auto status = test_tool_action_call(hf, "mcp.burp_scanner_manage.start_audit", "burp_scanner_manage", "start_audit", args, passed, failed, skipped, true, &result);
-        if (status == mcp_tool_call_status_t::passed || status == mcp_tool_call_status_t::contract_pass) {
+        if (status == mcp_tool_call_status_t::passed ||
+            status == mcp_tool_call_status_t::contract_pass ||
+            status == mcp_tool_call_status_t::accepted_pending) {
             const bool audit_id_present = json_u64_field(result.data, "audit_id", g_burp_scanner_audit_id) && g_burp_scanner_audit_id != 0;
             log_msg(hf, "mcp.burp_scanner_manage.start_audit", "SCANNER-ID -- status=%s audit_id=%llu id_present=%d functional_start=%d data=%s",
                 mcp_status_classification_name(status),
@@ -25575,13 +25742,38 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
                 return;
             }
         }
-        if (status == mcp_tool_call_status_t::passed) {
+        if (status == mcp_tool_call_status_t::passed ||
+            status == mcp_tool_call_status_t::contract_pass ||
+            status == mcp_tool_call_status_t::accepted_pending) {
             mcp_standalone::json final_status;
             if (!poll_burp_scanner_audit_evidence(hf, "mcp.burp_scanner_manage.start_audit", g_burp_scanner_audit_id, 6000, &final_status)) {
-                log_msg(hf, "mcp.burp_scanner_manage.start_audit", "FAIL -- scanner audit produced no bounded response/issue/completion evidence audit_id=%llu final=%s",
+                log_msg(hf, "mcp.burp_scanner_manage.start_audit", "FAIL -- scanner audit produced no bounded response/issue proof audit_id=%llu final=%s",
                     static_cast<unsigned long long>(g_burp_scanner_audit_id),
                     compact_json(final_status, 1200).c_str());
-                convert_last_pass_to_fixture_failure("burp_scanner_manage", passed, failed);
+                if (status == mcp_tool_call_status_t::passed)
+                    convert_last_pass_to_fixture_failure("burp_scanner_manage", passed, failed);
+                else if (status == mcp_tool_call_status_t::accepted_pending)
+                    convert_last_accepted_pending_to_fixture_failure("burp_scanner_manage", failed);
+                else {
+                    record_tool_status("burp_scanner_manage", mcp_tool_call_status_t::failed);
+                    failed.fetch_add(1);
+                }
+                return;
+            }
+            std::string proof = "scanner audit response/issue proof audit_id=" +
+                std::to_string(static_cast<unsigned long long>(g_burp_scanner_audit_id)) +
+                " final=" + compact_json(final_status, 900);
+            record_mcp_functional_capture_evidence("burp_scanner_manage", proof);
+            if (status != mcp_tool_call_status_t::passed) {
+                log_msg(hf, "mcp.burp_scanner_manage.start_audit", "PASS -- scanner audit produced bounded functional proof after accepted start audit_id=%llu proof=%s",
+                    static_cast<unsigned long long>(g_burp_scanner_audit_id),
+                    compact_text(proof, 900).c_str());
+                if (status == mcp_tool_call_status_t::accepted_pending)
+                    convert_last_accepted_pending_to_fixture_pass("burp_scanner_manage", passed);
+                else {
+                    record_tool_status("burp_scanner_manage", mcp_tool_call_status_t::functional_pass);
+                    passed.fetch_add(1);
+                }
             }
         }
     }
@@ -25589,9 +25781,23 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
         if (g_burp_scanner_audit_id == 0 && skip_dependent_missing_id(hf, "mcp.burp_scanner_manage.audit_status", "audit_id", failed))
             return;
         mcp_standalone::json args; args["audit_id"] = g_burp_scanner_audit_id;
+        mcp_standalone::json final_status;
+        if (!poll_burp_scanner_audit_evidence(hf, "mcp.burp_scanner_manage.audit_status", g_burp_scanner_audit_id, 3500, &final_status)) {
+            log_msg(hf, "mcp.burp_scanner_manage.audit_status", "SCANNER-PROOF-PENDING-OR-FAILED -- audit_id=%llu status/list will not be counted as functional proof final=%s",
+                static_cast<unsigned long long>(g_burp_scanner_audit_id),
+                compact_json(final_status, 1200).c_str());
+        }
         test_tool_action_call(hf, "mcp.burp_scanner_manage.audit_status", "burp_scanner_manage", "audit_status", args, passed, failed, skipped);
     }
     void test_tool_burp_scanner_manage_list_audits(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        if (g_burp_scanner_audit_id != 0) {
+            mcp_standalone::json final_status;
+            if (!poll_burp_scanner_audit_evidence(hf, "mcp.burp_scanner_manage.list_audits", g_burp_scanner_audit_id, 3500, &final_status)) {
+                log_msg(hf, "mcp.burp_scanner_manage.list_audits", "SCANNER-PROOF-PENDING-OR-FAILED -- audit_id=%llu list will not be counted as functional proof final=%s",
+                    static_cast<unsigned long long>(g_burp_scanner_audit_id),
+                    compact_json(final_status, 1200).c_str());
+            }
+        }
         test_tool_action_call(hf, "mcp.burp_scanner_manage.list_audits", "burp_scanner_manage", "list_audits", {}, passed, failed, skipped);
     }
     void test_tool_burp_scanner_manage_cancel(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -26061,6 +26267,50 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
         mcp_standalone::json args; args["set_id"] = "custom/aida_mcp_test"; args["label"] = "AiDA MCP Test"; args["entries"] = mcp_standalone::json::array({"test"});
         test_tool_call(hf, "mcp.burp_payloads_add_custom", get_server(), "burp_payloads_add_custom", args, passed, failed, skipped);
     }
+    bool poll_burp_intruder_request_evidence(HANDLE hf, const char* tag, uint64_t job_id, DWORD timeout_ms, mcp_standalone::json* final_data = nullptr) {
+        const uint64_t start = GetTickCount64();
+        const uint64_t deadline = start + timeout_ms;
+        int poll = 0;
+        while (GetTickCount64() < deadline) {
+            auto st = aida::burp::intruder::status(job_id);
+            const auto rows = aida::burp::intruder::results(job_id, 0, 4);
+            const bool proof = st.sent > 0 || !rows.empty();
+            const bool terminal = st.job_id != 0 && !st.running && (st.total == 0 || st.sent >= st.total || st.errors > 0);
+            mcp_standalone::json data;
+            data["job_id"] = job_id;
+            data["known"] = st.job_id != 0;
+            data["total"] = static_cast<uint64_t>(st.total);
+            data["sent"] = static_cast<uint64_t>(st.sent);
+            data["errors"] = static_cast<uint64_t>(st.errors);
+            data["running"] = st.running;
+            data["result_count_sample"] = static_cast<uint64_t>(rows.size());
+            data["proof_ready"] = proof;
+            data["proof_pending"] = st.running && !proof;
+            data["terminal_without_proof"] = terminal && !proof;
+            if (final_data)
+                *final_data = data;
+            log_msg(hf, tag, "INTRUDER-POLL -- job_id=%llu poll=%d known=%d total=%llu sent=%llu errors=%llu running=%d result_sample=%zu proof=%d terminal=%d elapsed_ms=%llu",
+                static_cast<unsigned long long>(job_id),
+                poll,
+                st.job_id != 0 ? 1 : 0,
+                static_cast<unsigned long long>(st.total),
+                static_cast<unsigned long long>(st.sent),
+                static_cast<unsigned long long>(st.errors),
+                st.running ? 1 : 0,
+                rows.size(),
+                proof ? 1 : 0,
+                terminal ? 1 : 0,
+                static_cast<unsigned long long>(GetTickCount64() - start));
+            if (proof)
+                return true;
+            if (terminal)
+                return false;
+            ++poll;
+            Sleep(150);
+        }
+        return false;
+    }
+
     void test_tool_burp_intruder_manage_start(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         if (!ensure_burp_http_fixture(hf, "mcp.burp_intruder_manage.start") ||
             !probe_burp_fixture_connect(hf, "mcp.burp_intruder_manage.start")) {
@@ -26075,8 +26325,11 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
         mcp_standalone::json args; args["host"] = "127.0.0.1"; args["port"] = port; args["scheme"] = "http"; args["base_request"] = base_request; args["positions"] = mcp_standalone::json::array({mcp_standalone::json::array({8, 4})}); args["payload_sets"] = mcp_standalone::json::array({mcp_standalone::json::array({"aida"})}); args["total_cap"] = 1; args["concurrency"] = 1; args["timeout_ms"] = 1500;
         mcp_standalone::tool_result_t result;
         auto status = test_tool_action_call(hf, "mcp.burp_intruder_manage.start", "burp_intruder_manage", "start", args, passed, failed, skipped, true, &result);
-        if (status == mcp_tool_call_status_t::passed || status == mcp_tool_call_status_t::contract_pass) {
-            const bool job_id_present = json_u64_field(result.data, "job_id", g_burp_intruder_job_id) && g_burp_intruder_job_id != 0;
+        const bool job_id_present = json_u64_field(result.data, "job_id", g_burp_intruder_job_id) && g_burp_intruder_job_id != 0;
+        if (status == mcp_tool_call_status_t::passed ||
+            status == mcp_tool_call_status_t::contract_pass ||
+            status == mcp_tool_call_status_t::accepted_pending ||
+            (status == mcp_tool_call_status_t::failed && job_id_present)) {
             log_msg(hf, "mcp.burp_intruder_manage.start", "INTRUDER-ID -- status=%s job_id=%llu id_present=%d functional_start=%d data=%s",
                 mcp_status_classification_name(status),
                 static_cast<unsigned long long>(g_burp_intruder_job_id),
@@ -26094,6 +26347,44 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
                 }
             }
         }
+        if (g_burp_intruder_job_id == 0)
+            return;
+        mcp_standalone::json final_status;
+        if (!poll_burp_intruder_request_evidence(hf, "mcp.burp_intruder_manage.start", g_burp_intruder_job_id, 6000, &final_status)) {
+            log_msg(hf, "mcp.burp_intruder_manage.start", "FAIL -- intruder job produced no bounded request/result proof job_id=%llu start_status=%s final=%s",
+                static_cast<unsigned long long>(g_burp_intruder_job_id),
+                mcp_status_classification_name(status),
+                compact_json(final_status, 1200).c_str());
+            if (status == mcp_tool_call_status_t::passed)
+                convert_last_pass_to_fixture_failure("burp_intruder_manage", passed, failed);
+            else if (status == mcp_tool_call_status_t::accepted_pending)
+                convert_last_accepted_pending_to_fixture_failure("burp_intruder_manage", failed);
+            else if (status != mcp_tool_call_status_t::failed) {
+                record_tool_status("burp_intruder_manage", mcp_tool_call_status_t::failed);
+                failed.fetch_add(1);
+            }
+            return;
+        }
+        const std::string proof = "intruder request/result proof job_id=" +
+            std::to_string(static_cast<unsigned long long>(g_burp_intruder_job_id)) +
+            " final=" + compact_json(final_status, 900);
+        record_mcp_functional_capture_evidence("burp_intruder_manage", proof);
+        if (status == mcp_tool_call_status_t::failed) {
+            log_msg(hf, "mcp.burp_intruder_manage.start", "PASS -- intruder job produced bounded functional proof after semantic start failure job_id=%llu proof=%s",
+                static_cast<unsigned long long>(g_burp_intruder_job_id),
+                compact_text(proof, 900).c_str());
+            convert_last_failure_to_fixture_pass("burp_intruder_manage", passed, failed);
+        } else if (status != mcp_tool_call_status_t::passed) {
+            log_msg(hf, "mcp.burp_intruder_manage.start", "PASS -- intruder job produced bounded functional proof after accepted start job_id=%llu proof=%s",
+                static_cast<unsigned long long>(g_burp_intruder_job_id),
+                compact_text(proof, 900).c_str());
+            if (status == mcp_tool_call_status_t::accepted_pending)
+                convert_last_accepted_pending_to_fixture_pass("burp_intruder_manage", passed);
+            else {
+                record_tool_status("burp_intruder_manage", mcp_tool_call_status_t::functional_pass);
+                passed.fetch_add(1);
+            }
+        }
     }
     void test_tool_burp_intruder_manage_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         if (g_burp_intruder_job_id == 0 && skip_dependent_missing_id(hf, "mcp.burp_intruder_manage.status", "job_id", failed))
@@ -26104,12 +26395,11 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
     void test_tool_burp_intruder_manage_results(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         if (g_burp_intruder_job_id == 0 && skip_dependent_missing_id(hf, "mcp.burp_intruder_manage.results", "job_id", failed))
             return;
-        for (int i = 0; i < 20 && g_burp_intruder_job_id != 0; ++i) {
-            auto st = aida::burp::intruder::status(g_burp_intruder_job_id);
-            log_msg(hf, "mcp.burp_intruder_manage.results", "WAIT -- job_id=%llu poll=%d total=%zu sent=%zu errors=%zu running=%d",
-                static_cast<unsigned long long>(g_burp_intruder_job_id), i, st.total, st.sent, st.errors, st.running ? 1 : 0);
-            if ((st.sent > 0 && !st.running) || st.errors > 0) break;
-            Sleep(100);
+        mcp_standalone::json final_status;
+        if (!poll_burp_intruder_request_evidence(hf, "mcp.burp_intruder_manage.results", g_burp_intruder_job_id, 4000, &final_status)) {
+            log_msg(hf, "mcp.burp_intruder_manage.results", "INTRUDER-PROOF-PENDING-OR-FAILED -- job_id=%llu results will expose terminal diagnostics final=%s",
+                static_cast<unsigned long long>(g_burp_intruder_job_id),
+                compact_json(final_status, 1200).c_str());
         }
         mcp_standalone::json args; args["job_id"] = g_burp_intruder_job_id;
         test_tool_action_call(hf, "mcp.burp_intruder_manage.results", "burp_intruder_manage", "results", args, passed, failed, skipped);
@@ -26130,7 +26420,11 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
             return;
         mcp_standalone::json args; args["job_id"] = g_burp_intruder_job_id;
         auto status = test_tool_action_call(hf, "mcp.burp_intruder_manage.clear", "burp_intruder_manage", "clear", args, passed, failed, skipped);
-        if (status == mcp_tool_call_status_t::passed)
+        if (status != mcp_tool_call_status_t::failed &&
+            status != mcp_tool_call_status_t::timed_out &&
+            status != mcp_tool_call_status_t::dependency_blocked &&
+            status != mcp_tool_call_status_t::cascade_blocked &&
+            status != mcp_tool_call_status_t::skipped)
             g_burp_intruder_job_id = 0;
     }
     void test_tool_burp_param_miner_manage_start(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {

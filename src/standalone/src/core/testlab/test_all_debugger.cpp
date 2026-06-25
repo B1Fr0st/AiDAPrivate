@@ -147,6 +147,14 @@ static bool dbg_stack_target_module_frame(const std::string& module_name) {
     return lower.find("aida_testtarget") != std::string::npos;
 }
 
+static bool dbg_stack_expected_structural_module(const std::string& module_name) {
+    const std::string lower = dbg_stack_lower_ascii(module_name);
+    return lower == "ntdll.dll" ||
+        lower == "kernelbase.dll" ||
+        lower == "kernel32.dll" ||
+        lower.find("aida_testtarget") != std::string::npos;
+}
+
 static uint64_t get_ntdll_fn(const char* name) {
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
     if (!ntdll) return 0;
@@ -1618,17 +1626,26 @@ static void test_get_call_stack(HANDLE hf, std::atomic<int>& passed, std::atomic
     size_t module_rva_fallback_count = 0;
     size_t budget_exhausted_count = 0;
     size_t target_module_frame_count = 0;
+    size_t expected_structural_module_count = 0;
+    size_t blank_module_count = 0;
+    size_t zero_address_count = 0;
     std::string first_blank_evidence;
     std::string first_budget_evidence;
     for (size_t i = 0; i < frames.size(); ++i) {
         const std::string resolver = debugger_engine::call_stack_frame_resolver_evidence(frames[i].address);
         const bool known_module = dbg_stack_module_requires_function(frames[i].module_name);
         const bool target_module = dbg_stack_target_module_frame(frames[i].module_name);
+        const bool expected_structural_module = dbg_stack_expected_structural_module(frames[i].module_name);
+        const bool blank_module = frames[i].module_name.empty();
         const bool empty_function = frames[i].function_name.empty();
         const bool resolved_symbol = resolver.find("source=pdb") != std::string::npos ||
             resolver.find("source=export") != std::string::npos;
         const bool module_rva_fallback = resolver.find("source=module_rva") != std::string::npos;
         const bool budget_exhausted = resolver.find("budget") != std::string::npos;
+        if (frames[i].address == 0)
+            ++zero_address_count;
+        if (blank_module)
+            ++blank_module_count;
         if (resolved_symbol)
             ++resolved_count;
         if (module_rva_fallback)
@@ -1640,12 +1657,14 @@ static void test_get_call_stack(HANDLE hf, std::atomic<int>& passed, std::atomic
         }
         if (target_module)
             ++target_module_frame_count;
+        if (expected_structural_module)
+            ++expected_structural_module_count;
         log_msg(hf, "dbg_stk", "  frame[%zu]: addr=0x%llX ret=0x%llX module=%s func=%s offset=0x%llX resolver=%s",
             i, (unsigned long long)frames[i].address, (unsigned long long)frames[i].return_addr,
             frames[i].module_name.c_str(), empty_function ? "(empty)" : frames[i].function_name.c_str(),
             (unsigned long long)frames[i].module_offset, resolver.c_str());
         diag::log_tagged_fmt("test_dbg_detail",
-            "dbg_stk frame index=%zu addr=0x%llX ret=0x%llX module=%s function=%s offset=0x%llX known_module=%d target_module=%d empty_function=%d resolved_symbol=%d module_rva_fallback=%d budget_exhausted=%d resolver=%s",
+            "dbg_stk frame index=%zu addr=0x%llX ret=0x%llX module=%s function=%s offset=0x%llX known_module=%d target_module=%d expected_structural_module=%d blank_module=%d empty_function=%d resolved_symbol=%d module_rva_fallback=%d budget_exhausted=%d resolver=%s",
             i,
             (unsigned long long)frames[i].address,
             (unsigned long long)frames[i].return_addr,
@@ -1654,6 +1673,8 @@ static void test_get_call_stack(HANDLE hf, std::atomic<int>& passed, std::atomic
             (unsigned long long)frames[i].module_offset,
             known_module ? 1 : 0,
             target_module ? 1 : 0,
+            expected_structural_module ? 1 : 0,
+            blank_module ? 1 : 0,
             empty_function ? 1 : 0,
             resolved_symbol ? 1 : 0,
             module_rva_fallback ? 1 : 0,
@@ -1667,24 +1688,35 @@ static void test_get_call_stack(HANDLE hf, std::atomic<int>& passed, std::atomic
     }
     const bool structural_ok = !frames.empty() && top_addr != 0;
     const bool budget_majority = structural_ok && budget_exhausted_count * 2 >= frames.size() && frames.size() > 1;
+    const bool module_rva_structural_contract = structural_ok &&
+        module_rva_fallback_count == frames.size() &&
+        known_module_blank_functions == 0 &&
+        blank_module_count == 0 &&
+        zero_address_count == 0 &&
+        target_module_frame_count > 0 &&
+        expected_structural_module_count == frames.size();
     diag::log_tagged_fmt("test_dbg_detail",
-        "dbg_stk quality frame_count=%zu resolved=%zu module_rva_fallback=%zu budget_exhausted=%zu target_module_frames=%zu known_module_blank_functions=%zu structural_ok=%d budget_majority=%d",
+        "dbg_stk quality frame_count=%zu resolved=%zu module_rva_fallback=%zu budget_exhausted=%zu target_module_frames=%zu expected_structural_modules=%zu blank_modules=%zu zero_address_frames=%zu known_module_blank_functions=%zu structural_ok=%d budget_majority=%d module_rva_structural_contract=%d",
         frames.size(),
         resolved_count,
         module_rva_fallback_count,
         budget_exhausted_count,
         target_module_frame_count,
+        expected_structural_module_count,
+        blank_module_count,
+        zero_address_count,
         known_module_blank_functions,
         structural_ok ? 1 : 0,
-        budget_majority ? 1 : 0);
+        budget_majority ? 1 : 0,
+        module_rva_structural_contract ? 1 : 0);
 
-    if (structural_ok && known_module_blank_functions == 0 && !budget_majority && target_module_frame_count > 0) {
-        log_msg(hf, "dbg_stk", "PASS -- structural frames=%zu top_addr=0x%llX resolved=%zu module_rva_fallback=%zu budget_exhausted=%zu target_module_frames=%zu (elapsed %lld ms)",
-            frames.size(), (unsigned long long)top_addr, resolved_count, module_rva_fallback_count, budget_exhausted_count, target_module_frame_count, (long long)ms);
+    if (structural_ok && zero_address_count == 0 && blank_module_count == 0 && known_module_blank_functions == 0 && target_module_frame_count > 0 && (!budget_majority || module_rva_structural_contract)) {
+        log_msg(hf, "dbg_stk", "PASS -- structural frames=%zu top_addr=0x%llX resolved=%zu module_rva_fallback=%zu budget_exhausted=%zu budget_majority=%d module_rva_structural_contract=%d target_module_frames=%zu expected_structural_modules=%zu blank_modules=%zu zero_address_frames=%zu (elapsed %lld ms)",
+            frames.size(), (unsigned long long)top_addr, resolved_count, module_rva_fallback_count, budget_exhausted_count, budget_majority ? 1 : 0, module_rva_structural_contract ? 1 : 0, target_module_frame_count, expected_structural_module_count, blank_module_count, zero_address_count, (long long)ms);
         passed.fetch_add(1);
     } else if (structural_ok) {
-        log_msg(hf, "dbg_stk", "FAIL -- stack structural capture succeeded but symbol quality degraded: frames=%zu top_addr=0x%llX resolved=%zu module_rva_fallback=%zu budget_exhausted=%zu budget_majority=%d target_module_frames=%zu known_module_blank_functions=%zu first_blank_resolver=\"%s\" first_budget_resolver=\"%s\" (elapsed %lld ms)",
-            frames.size(), (unsigned long long)top_addr, resolved_count, module_rva_fallback_count, budget_exhausted_count, budget_majority ? 1 : 0, target_module_frame_count, known_module_blank_functions, first_blank_evidence.c_str(), first_budget_evidence.c_str(), (long long)ms);
+        log_msg(hf, "dbg_stk", "FAIL -- stack structural capture succeeded but symbol/addressability evidence is incomplete: frames=%zu top_addr=0x%llX resolved=%zu module_rva_fallback=%zu budget_exhausted=%zu budget_majority=%d module_rva_structural_contract=%d target_module_frames=%zu expected_structural_modules=%zu blank_modules=%zu zero_address_frames=%zu known_module_blank_functions=%zu first_blank_resolver=\"%s\" first_budget_resolver=\"%s\" (elapsed %lld ms)",
+            frames.size(), (unsigned long long)top_addr, resolved_count, module_rva_fallback_count, budget_exhausted_count, budget_majority ? 1 : 0, module_rva_structural_contract ? 1 : 0, target_module_frame_count, expected_structural_module_count, blank_module_count, zero_address_count, known_module_blank_functions, first_blank_evidence.c_str(), first_budget_evidence.c_str(), (long long)ms);
         failed.fetch_add(1);
     } else {
         log_msg(hf, "dbg_stk", "FAIL -- call stack empty (frames=%zu top_addr=0x%llX); a live thread always yields >=1 frame at RIP (elapsed %lld ms)",

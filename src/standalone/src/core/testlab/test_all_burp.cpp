@@ -5024,6 +5024,12 @@ namespace {
     static void test_burp_tab_reports(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         select_network_tab(hf, passed, failed, "burp_tab.reports", network_view::sub_tab_t::reports);
     }
+    static void test_burp_tab_browser(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        select_network_tab(hf, passed, failed, "burp_tab.browser", network_view::sub_tab_t::browser);
+    }
+    static void test_burp_tab_headless(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+        select_network_tab(hf, passed, failed, "burp_tab.headless", network_view::sub_tab_t::headless);
+    }
 
     struct burp_phase_cleanup_guard_t {
         HANDLE hf = INVALID_HANDLE_VALUE;
@@ -5051,7 +5057,7 @@ namespace {
 
 void phase_burp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped, bool(*cancelled)()) {
     (void)skipped;
-    log_msg(hf, "burp_phase", "========== Burp Suite Tests START (183 tests) ==========");
+    log_msg(hf, "burp_phase", "========== Burp Suite Tests START (184 tests) ==========");
     burp_phase_cleanup_guard_t cleanup_guard{hf};
 
     if (cancelled && cancelled()) return;
@@ -5453,6 +5459,10 @@ void phase_burp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fai
     call_test(test_burp_tab_api, hf, passed, failed);
     if (cancelled && cancelled()) return;
     call_test(test_burp_tab_reports, hf, passed, failed);
+    if (cancelled && cancelled()) return;
+    call_test(test_burp_tab_browser, hf, passed, failed);
+    if (cancelled && cancelled()) return;
+    call_test(test_burp_tab_headless, hf, passed, failed);
 
     cleanup_burp_async_fixture_jobs(hf);
     cleanup_guard.disarm();

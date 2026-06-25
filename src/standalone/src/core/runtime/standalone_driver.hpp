@@ -414,6 +414,7 @@ namespace driver_bridge
         uint64_t deadline_ms = 0;
         std::atomic<bool>* cancel_token = nullptr;
         bool require_deadline = false;
+        bool allow_zero_result = false;
     };
 
     struct remote_call_execution_diag_t {
@@ -455,6 +456,20 @@ namespace driver_bridge
         bool worker_exception = false;
         bool worker_creation_failed = false;
         bool late_completion = false;
+        bool allow_zero_result = false;
+        bool zero_result_rejected = false;
+        bool caller_abandoned = false;
+        bool removed_from_queue = false;
+        bool popped_from_queue = false;
+        bool execution_started = false;
+        bool executing_abandoned = false;
+        bool seh_exception = false;
+        uint32_t seh_exception_code = 0;
+        uint64_t seh_exception_address = 0;
+        uint64_t seh_fault_address = 0;
+        uint64_t seh_rip = 0;
+        uint64_t seh_rsp = 0;
+        uint64_t seh_rbp = 0;
     };
 
     class scoped_remote_call_context_t {

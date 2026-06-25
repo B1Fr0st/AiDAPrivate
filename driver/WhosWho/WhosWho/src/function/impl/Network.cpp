@@ -237,7 +237,24 @@ static const GUID GUID_LAYER_ALE_RECV_V4 =
 
 
 namespace net_bw {
-    void record_traffic(UINT32 pid, UINT32 direction, UINT32 bytes);
+    enum : UINT32 {
+        PID_SOURCE_NONE = 0,
+        PID_SOURCE_METADATA = 1,
+        PID_SOURCE_ENDPOINT = 2,
+        PID_SOURCE_PORT_CACHE = 3,
+        PID_SOURCE_UDP_CACHE = 4
+    };
+
+    enum : UINT32 {
+        LAYER_INBOUND_TRANSPORT = 1,
+        LAYER_OUTBOUND_TRANSPORT = 2,
+        LAYER_DATAGRAM = 3
+    };
+
+    void record_traffic(UINT32 pid, UINT32 direction, UINT32 bytes,
+                        UINT32 attribution_source, UINT32 layer,
+                        UINT32 protocol, UINT32 local_port, UINT32 remote_port);
+    void init_lock();
 }
 namespace net_mod {
     BOOLEAN apply_modifications(UINT8* data, UINT32* data_len, UINT32 max_len,
@@ -379,6 +396,7 @@ namespace net_dns_spoof {
     void cleanup();
 }
 namespace net_bw {
+    void init_lock();
     BOOLEAN is_active();
     void cleanup();
 }
@@ -1188,6 +1206,7 @@ namespace net_capture {
             UINT8 local_ip[16] = {};
             UINT8 remote_ip[16] = {};
             UINT32 pid = 0;
+            UINT32 pid_source = net_bw::PID_SOURCE_NONE;
 
             if (inFixedValues->valueCount > FWPS_FIELD_IN_TRANS_V4_PROTOCOL) {
                 protocol = inFixedValues->incomingValue[FWPS_FIELD_IN_TRANS_V4_PROTOCOL].value.uint8;
@@ -1209,6 +1228,7 @@ namespace net_capture {
 
             if ((inMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_PROCESS_ID_) != 0) {
                 pid = (UINT32)inMetaValues->processId;
+                if (pid != 0) pid_source = net_bw::PID_SOURCE_METADATA;
             }
             if (pid != 0 && inMetaValues->transportEndpointHandle != 0) {
                 aida_store_cached_endpoint_pid(inMetaValues->transportEndpointHandle,
@@ -1217,9 +1237,11 @@ namespace net_capture {
             if (pid == 0) {
                 pid = aida_resolve_packet_pid(inMetaValues->transportEndpointHandle,
                     protocol, local_port, remote_port);
+                if (pid != 0) pid_source = net_bw::PID_SOURCE_ENDPOINT;
             }
             if (pid == 0) {
                 pid = aida_lookup_cached_port_pid(protocol, local_port, remote_port);
+                if (pid != 0) pid_source = net_bw::PID_SOURCE_PORT_CACHE;
             }
             if (pid == 0 && protocol == 17) {
                 UINT32 lip = ((UINT32)local_ip[0] << 24) | ((UINT32)local_ip[1] << 16) |
@@ -1227,6 +1249,7 @@ namespace net_capture {
                 UINT32 rip = ((UINT32)remote_ip[0] << 24) | ((UINT32)remote_ip[1] << 16) |
                              ((UINT32)remote_ip[2] << 8) | remote_ip[3];
                 pid = net_udp_cache::lookup(rip, lip, (UINT16)remote_port, (UINT16)local_port);
+                if (pid != 0) pid_source = net_bw::PID_SOURCE_UDP_CACHE;
             }
             if (pid != 0) {
                 aida_store_cached_port_pid(protocol, local_port, pid);
@@ -1268,7 +1291,8 @@ namespace net_capture {
             {
                 UINT32 data_length = get_transport_data_length(layerData);
                 _InterlockedExchangeAdd64(&g_global_bytes_recv, static_cast<LONG64>(data_length));
-                net_bw::record_traffic(pid, 0, data_length);
+                net_bw::record_traffic(pid, 0, data_length, pid_source,
+                    net_bw::LAYER_INBOUND_TRANSPORT, protocol, local_port, remote_port);
 
                 BOOLEAN need_full_pipeline = FALSE;
                 if (g_active_rule_count != 0) need_full_pipeline = TRUE;
@@ -1716,6 +1740,7 @@ namespace net_capture {
             UINT8 local_ip[16] = {};
             UINT8 remote_ip[16] = {};
             UINT32 pid = 0;
+            UINT32 pid_source = net_bw::PID_SOURCE_NONE;
 
             if (inFixedValues->valueCount > FWPS_FIELD_OUT_TRANS_V4_PROTOCOL) {
                 protocol = inFixedValues->incomingValue[FWPS_FIELD_OUT_TRANS_V4_PROTOCOL].value.uint8;
@@ -1737,6 +1762,7 @@ namespace net_capture {
 
             if ((inMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_PROCESS_ID_) != 0) {
                 pid = (UINT32)inMetaValues->processId;
+                if (pid != 0) pid_source = net_bw::PID_SOURCE_METADATA;
             }
             if (pid != 0 && inMetaValues->transportEndpointHandle != 0) {
                 aida_store_cached_endpoint_pid(inMetaValues->transportEndpointHandle,
@@ -1745,9 +1771,11 @@ namespace net_capture {
             if (pid == 0) {
                 pid = aida_resolve_packet_pid(inMetaValues->transportEndpointHandle,
                     protocol, local_port, remote_port);
+                if (pid != 0) pid_source = net_bw::PID_SOURCE_ENDPOINT;
             }
             if (pid == 0) {
                 pid = aida_lookup_cached_port_pid(protocol, local_port, remote_port);
+                if (pid != 0) pid_source = net_bw::PID_SOURCE_PORT_CACHE;
             }
             if (pid == 0 && protocol == 17) {
                 UINT32 lip = ((UINT32)local_ip[0] << 24) | ((UINT32)local_ip[1] << 16) |
@@ -1755,6 +1783,7 @@ namespace net_capture {
                 UINT32 rip = ((UINT32)remote_ip[0] << 24) | ((UINT32)remote_ip[1] << 16) |
                              ((UINT32)remote_ip[2] << 8) | remote_ip[3];
                 pid = net_udp_cache::lookup(lip, rip, (UINT16)local_port, (UINT16)remote_port);
+                if (pid != 0) pid_source = net_bw::PID_SOURCE_UDP_CACHE;
             }
             if (pid != 0) {
                 aida_store_cached_port_pid(protocol, local_port, pid);
@@ -1796,7 +1825,8 @@ namespace net_capture {
             {
                 UINT32 data_length = get_transport_data_length(layerData);
                 _InterlockedExchangeAdd64(&g_global_bytes_sent, static_cast<LONG64>(data_length));
-                net_bw::record_traffic(pid, 1, data_length);
+                net_bw::record_traffic(pid, 1, data_length, pid_source,
+                    net_bw::LAYER_OUTBOUND_TRANSPORT, protocol, local_port, remote_port);
 
                 BOOLEAN need_full_pipeline = FALSE;
                 if (g_active_rule_count != 0) need_full_pipeline = TRUE;
@@ -2129,6 +2159,7 @@ namespace net_capture {
             UINT8 local_ip[16] = {};
             UINT8 remote_ip[16] = {};
             UINT32 pid = 0;
+            UINT32 pid_source = net_bw::PID_SOURCE_NONE;
 
             if (inFixedValues->valueCount > FWPS_FIELD_DATAGRAM_V4_PROTOCOL) {
                 protocol = inFixedValues->incomingValue[FWPS_FIELD_DATAGRAM_V4_PROTOCOL].value.uint8;
@@ -2156,6 +2187,7 @@ namespace net_capture {
 
             if ((inMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_PROCESS_ID_) != 0) {
                 pid = (UINT32)inMetaValues->processId;
+                if (pid != 0) pid_source = net_bw::PID_SOURCE_METADATA;
             }
             if (pid != 0 && inMetaValues->transportEndpointHandle != 0) {
                 aida_store_cached_endpoint_pid(inMetaValues->transportEndpointHandle,
@@ -2164,9 +2196,11 @@ namespace net_capture {
             if (pid == 0) {
                 pid = aida_resolve_packet_pid(inMetaValues->transportEndpointHandle,
                     protocol, local_port, remote_port);
+                if (pid != 0) pid_source = net_bw::PID_SOURCE_ENDPOINT;
             }
             if (pid == 0) {
                 pid = aida_lookup_cached_port_pid(protocol, local_port, remote_port);
+                if (pid != 0) pid_source = net_bw::PID_SOURCE_PORT_CACHE;
             }
             if (pid == 0) {
                 UINT32 lip = ((UINT32)local_ip[0] << 24) | ((UINT32)local_ip[1] << 16) |
@@ -2178,6 +2212,7 @@ namespace net_capture {
                 } else {
                     pid = net_udp_cache::lookup(lip, rip, (UINT16)local_port, (UINT16)remote_port);
                 }
+                if (pid != 0) pid_source = net_bw::PID_SOURCE_UDP_CACHE;
             }
             if (pid != 0) {
                 aida_store_cached_port_pid(protocol, local_port, pid);
@@ -2203,11 +2238,13 @@ namespace net_capture {
             if (direction == 0) {
                 _InterlockedIncrement64(&g_global_pkts_recv);
                 _InterlockedExchangeAdd64(&g_global_bytes_recv, static_cast<LONG64>(data_length));
-                net_bw::record_traffic(pid, 0, data_length);
+                net_bw::record_traffic(pid, 0, data_length, pid_source,
+                    net_bw::LAYER_DATAGRAM, protocol, local_port, remote_port);
             } else {
                 _InterlockedIncrement64(&g_global_pkts_sent);
                 _InterlockedExchangeAdd64(&g_global_bytes_sent, static_cast<LONG64>(data_length));
-                net_bw::record_traffic(pid, 1, data_length);
+                net_bw::record_traffic(pid, 1, data_length, pid_source,
+                    net_bw::LAYER_DATAGRAM, protocol, local_port, remote_port);
             }
 
             BOOLEAN malsafe_log = FALSE;
@@ -3962,6 +3999,7 @@ namespace net_capture {
         KeInitializeSpinLock(&g_udp_flow_lock);
         KeInitializeSpinLock(&g_pid_path_lock);
         KeInitializeSpinLock(&net_fingerprint::g_fp_lock);
+        net_bw::init_lock();
 
 
         SIZE_T ring_size = (SIZE_T)RING_BUFFER_SIZE * sizeof(NET_PACKET_ENTRY);
@@ -11179,75 +11217,375 @@ namespace net_bw {
     inline volatile LONG64 g_bw_total_pkts_recv = 0;
     inline volatile LONG64 g_bw_last_sample_sent = 0;
     inline volatile LONG64 g_bw_last_sample_recv = 0;
-    inline UINT64 g_bw_last_sample_time = 0;
+    inline volatile LONG64 g_bw_last_sample_pkts_sent = 0;
+    inline volatile LONG64 g_bw_last_sample_pkts_recv = 0;
+    inline volatile LONG64 g_bw_last_sample_time = 0;
+    inline volatile LONG64 g_bw_generation = 0;
+    inline volatile LONG64 g_bw_unattributed_events = 0;
+    inline volatile LONG64 g_bw_no_slot_events = 0;
+    inline volatile LONG64 g_bw_slot_race_events = 0;
+    inline volatile LONG64 g_bw_duplicate_race_events = 0;
+    inline KSPIN_LOCK g_bw_lock;
+    inline volatile LONG g_bw_lock_state = 0;
+
+    static constexpr UINT64 BW_TICKS_PER_SECOND = 10000000ULL;
+    static constexpr UINT64 BW_TICKS_PER_MILLISECOND = 10000ULL;
+    static constexpr LONG64 BW_COUNTER_MAX = 0x7fffffffffffffffLL;
+
+    void init_lock() {
+        LONG state = _InterlockedCompareExchange(&g_bw_lock_state, 1, 0);
+        if (state == 0) {
+            KeInitializeSpinLock(&g_bw_lock);
+            KeMemoryBarrier();
+            _InterlockedExchange(&g_bw_lock_state, 2);
+            return;
+        }
+        for (UINT32 spin = 0; spin < 100000; spin++) {
+            if (_InterlockedCompareExchange(&g_bw_lock_state, 2, 2) == 2) return;
+            YieldProcessor();
+        }
+    }
+
+    static BOOLEAN ensure_lock_ready() {
+        init_lock();
+        return _InterlockedCompareExchange(&g_bw_lock_state, 2, 2) == 2;
+    }
 
     BOOLEAN is_active() {
         return (g_bw_active != 0);
     }
 
+    static LONG64 read_i64(volatile LONG64* value) {
+        return _InterlockedCompareExchange64(value, 0, 0);
+    }
 
-    void record_traffic(UINT32 pid, UINT32 direction, UINT32 bytes) {
-        if (!g_bw_active) return;
+    static UINT64 counter_to_u64(LONG64 value) {
+        return value > 0 ? static_cast<UINT64>(value) : 0;
+    }
 
-        if (direction == 0) {
-            _InterlockedExchangeAdd64(&g_bw_total_recv, bytes);
-            _InterlockedIncrement64(&g_bw_total_pkts_recv);
-        } else {
-            _InterlockedExchangeAdd64(&g_bw_total_sent, bytes);
-            _InterlockedIncrement64(&g_bw_total_pkts_sent);
+    static LONG64 counter_add_saturated_value(LONG64 current, UINT64 delta) {
+        if (current < 0) return BW_COUNTER_MAX;
+        UINT64 current_u = static_cast<UINT64>(current);
+        UINT64 max_u = static_cast<UINT64>(BW_COUNTER_MAX);
+        if (delta >= max_u - current_u) return BW_COUNTER_MAX;
+        return static_cast<LONG64>(current_u + delta);
+    }
+
+    static LONG64 add_counter_saturated(volatile LONG64* value, UINT64 delta, LONG64* previous) {
+        for (UINT32 attempt = 0; attempt < 64; attempt++) {
+            LONG64 current = read_i64(value);
+            LONG64 next = counter_add_saturated_value(current, delta);
+            LONG64 observed = _InterlockedCompareExchange64(value, next, current);
+            if (observed == current) {
+                if (previous) *previous = current;
+                return next;
+            }
+            YieldProcessor();
+        }
+        LONG64 current = read_i64(value);
+        if (previous) *previous = current;
+        return current;
+    }
+
+    static LONG64 add_counter_locked(volatile LONG64* value, UINT64 delta, LONG64* previous) {
+        LONG64 current = *value;
+        LONG64 next = counter_add_saturated_value(current, delta);
+        *value = next;
+        if (previous) *previous = current;
+        return next;
+    }
+
+    static UINT64 counter_delta(LONG64 current, LONG64 previous, BOOLEAN* regressed) {
+        if (current < 0 || previous < 0 || current < previous) {
+            if (regressed) *regressed = TRUE;
+            return 0;
+        }
+        if (regressed) *regressed = FALSE;
+        return static_cast<UINT64>(current) - static_cast<UINT64>(previous);
+    }
+
+    static UINT64 divide_u128_by_u64(UINT64 high, UINT64 low, UINT64 divisor) {
+        UINT64 quotient = 0;
+        UINT64 remainder = high;
+        for (int bit = 63; bit >= 0; --bit) {
+            const UINT64 carry = remainder >> 63;
+            remainder = (remainder << 1) | ((low >> bit) & 1ULL);
+            if (carry != 0 || remainder >= divisor) {
+                remainder -= divisor;
+                quotient |= (1ULL << bit);
+            }
+        }
+        return quotient;
+    }
+
+    static UINT64 bytes_per_second(UINT64 byte_delta, UINT64 elapsed_ticks, BOOLEAN* clamped) {
+        if (clamped) *clamped = FALSE;
+        if (byte_delta == 0 || elapsed_ticks == 0) return 0;
+        UINT64 high = 0;
+        UINT64 low = _umul128(byte_delta, BW_TICKS_PER_SECOND, &high);
+        if (high >= elapsed_ticks) {
+            if (clamped) *clamped = TRUE;
+            return ~0ULL;
+        }
+        return divide_u128_by_u64(high, low, elapsed_ticks);
+    }
+
+    static const char* direction_name(UINT32 direction) {
+        return direction == 0 ? "in" : "out";
+    }
+
+    static const char* attribution_name(UINT32 source) {
+        switch (source) {
+        case PID_SOURCE_METADATA: return "metadata";
+        case PID_SOURCE_ENDPOINT: return "endpoint";
+        case PID_SOURCE_PORT_CACHE: return "port_cache";
+        case PID_SOURCE_UDP_CACHE: return "udp_cache";
+        default: return "none";
+        }
+    }
+
+    static const char* layer_name(UINT32 layer) {
+        switch (layer) {
+        case LAYER_INBOUND_TRANSPORT: return "inbound_transport";
+        case LAYER_OUTBOUND_TRANSPORT: return "outbound_transport";
+        case LAYER_DATAGRAM: return "datagram";
+        default: return "unknown";
+        }
+    }
+
+    static const char* rate_reason(UINT64 delta, UINT64 rate,
+                                   BOOLEAN regressed, BOOLEAN clamped, BOOLEAN has_previous,
+                                   BOOLEAN elapsed_valid, UINT32 direction) {
+        if (!has_previous) return direction == 0 ? "in_no_previous_sample" : "out_no_previous_sample";
+        if (!elapsed_valid) return direction == 0 ? "in_elapsed_zero_or_reversed" : "out_elapsed_zero_or_reversed";
+        if (regressed) return direction == 0 ? "in_counter_regressed" : "out_counter_regressed";
+        if (delta == 0) return direction == 0 ? "in_no_delta" : "out_no_delta";
+        if (clamped) return direction == 0 ? "in_clamped" : "out_clamped";
+        if (rate == 0) return direction == 0 ? "in_below_one_bps" : "out_below_one_bps";
+        return direction == 0 ? "in_nonzero" : "out_nonzero";
+    }
+
+    static void log_traffic_update(const char* branch, UINT32 pid, UINT32 direction, UINT32 bytes,
+                                   UINT32 attribution_source, UINT32 layer, UINT32 protocol,
+                                   UINT32 local_port, UINT32 remote_port, LONG slot,
+                                   LONG64 row_bytes_before, LONG64 row_bytes_after,
+                                   LONG64 row_packets_after, LONG64 aggregate_bytes_before,
+                                   LONG64 aggregate_bytes_after, LONG64 aggregate_packets_after) {
+        WW_LOG("netaction::BWMN traffic branch=%s pid=%u direction=%s direction_id=%u attribution=%s attribution_id=%u layer=%s layer_id=%u protocol=%u local_port=%u remote_port=%u bytes=%u slot=%ld row_bytes_before=%lld row_bytes_after=%lld row_packets_after=%lld aggregate_bytes_before=%lld aggregate_bytes_after=%lld aggregate_packets_after=%lld no_pid=%lld no_slot=%lld slot_race=%lld duplicate_race=%lld capture_dropped=%ld active=%ld irql=%u cpu=%lu",
+            branch,
+            pid,
+            direction_name(direction),
+            direction,
+            attribution_name(attribution_source),
+            attribution_source,
+            layer_name(layer),
+            layer,
+            protocol,
+            local_port,
+            remote_port,
+            bytes,
+            slot,
+            row_bytes_before,
+            row_bytes_after,
+            row_packets_after,
+            aggregate_bytes_before,
+            aggregate_bytes_after,
+            aggregate_packets_after,
+            read_i64(&g_bw_unattributed_events),
+            read_i64(&g_bw_no_slot_events),
+            read_i64(&g_bw_slot_race_events),
+            read_i64(&g_bw_duplicate_race_events),
+            net_capture::g_total_dropped,
+            g_bw_active,
+            (UINT32)KeGetCurrentIrql(),
+            KeGetCurrentProcessorNumber());
+    }
+
+    static void clear_process_entries_unlocked() {
+        for (UINT32 i = 0; i < BW_MAX_PROCESSES; i++) {
+            g_bw_entries[i].active = 0;
+            g_bw_entries[i].pid = 0;
+            g_bw_entries[i].bytes_sent = 0;
+            g_bw_entries[i].bytes_recv = 0;
+            g_bw_entries[i].packets_sent = 0;
+            g_bw_entries[i].packets_recv = 0;
+            g_bw_entries[i].last_activity = 0;
+        }
+    }
+
+    static void update_rate_sample(p_bw_monitor_request request, UINT32 operation, UINT64 now_100ns,
+                                   LONG64 total_sent, LONG64 total_recv,
+                                   LONG64 packets_sent, LONG64 packets_recv) {
+        request->bytes_per_second_out = 0;
+        request->bytes_per_second_in = 0;
+
+        LONG64 last_time_i64 = read_i64(&g_bw_last_sample_time);
+        LONG64 last_sent = read_i64(&g_bw_last_sample_sent);
+        LONG64 last_recv = read_i64(&g_bw_last_sample_recv);
+        LONG64 last_pkts_sent = read_i64(&g_bw_last_sample_pkts_sent);
+        LONG64 last_pkts_recv = read_i64(&g_bw_last_sample_pkts_recv);
+        BOOLEAN has_previous = last_time_i64 > 0;
+        BOOLEAN elapsed_valid = FALSE;
+        BOOLEAN sent_regressed = FALSE;
+        BOOLEAN recv_regressed = FALSE;
+        BOOLEAN pkts_sent_regressed = FALSE;
+        BOOLEAN pkts_recv_regressed = FALSE;
+        BOOLEAN out_clamped = FALSE;
+        BOOLEAN in_clamped = FALSE;
+        UINT64 elapsed_ticks = 0;
+        UINT64 delta_sent = 0;
+        UINT64 delta_recv = 0;
+        UINT64 delta_pkts_sent = 0;
+        UINT64 delta_pkts_recv = 0;
+        UINT64 rate_out = 0;
+        UINT64 rate_in = 0;
+
+        if (has_previous && now_100ns > static_cast<UINT64>(last_time_i64)) {
+            elapsed_valid = TRUE;
+            elapsed_ticks = now_100ns - static_cast<UINT64>(last_time_i64);
+            delta_sent = counter_delta(total_sent, last_sent, &sent_regressed);
+            delta_recv = counter_delta(total_recv, last_recv, &recv_regressed);
+            delta_pkts_sent = counter_delta(packets_sent, last_pkts_sent, &pkts_sent_regressed);
+            delta_pkts_recv = counter_delta(packets_recv, last_pkts_recv, &pkts_recv_regressed);
+            rate_out = bytes_per_second(delta_sent, elapsed_ticks, &out_clamped);
+            rate_in = bytes_per_second(delta_recv, elapsed_ticks, &in_clamped);
+            request->bytes_per_second_out = rate_out;
+            request->bytes_per_second_in = rate_in;
         }
 
-        if (pid == 0) return;
+        WW_LOG("netaction::BWMN rate op=%u generation=%lld active=%ld now_100ns=%llu last_100ns=%lld elapsed_ticks=%llu elapsed_ms=%llu total_sent=%lld total_recv=%lld total_pkts_sent=%lld total_pkts_recv=%lld last_sent=%lld last_recv=%lld delta_sent=%llu delta_recv=%llu delta_pkts_sent=%llu delta_pkts_recv=%llu rate_out=%llu rate_in=%llu out_reason=%s in_reason=%s out_clamped=%u in_clamped=%u pkts_sent_regressed=%u pkts_recv_regressed=%u no_pid=%lld no_slot=%lld slot_race=%lld duplicate_race=%lld capture_dropped=%ld irql=%u cpu=%lu",
+            operation,
+            read_i64(&g_bw_generation),
+            g_bw_active,
+            now_100ns,
+            last_time_i64,
+            elapsed_ticks,
+            elapsed_ticks / BW_TICKS_PER_MILLISECOND,
+            total_sent,
+            total_recv,
+            packets_sent,
+            packets_recv,
+            last_sent,
+            last_recv,
+            delta_sent,
+            delta_recv,
+            delta_pkts_sent,
+            delta_pkts_recv,
+            rate_out,
+            rate_in,
+            rate_reason(delta_sent, rate_out, sent_regressed, out_clamped, has_previous, elapsed_valid, 1),
+            rate_reason(delta_recv, rate_in, recv_regressed, in_clamped, has_previous, elapsed_valid, 0),
+            out_clamped ? 1u : 0u,
+            in_clamped ? 1u : 0u,
+            pkts_sent_regressed ? 1u : 0u,
+            pkts_recv_regressed ? 1u : 0u,
+            read_i64(&g_bw_unattributed_events),
+            read_i64(&g_bw_no_slot_events),
+            read_i64(&g_bw_slot_race_events),
+            read_i64(&g_bw_duplicate_race_events),
+            net_capture::g_total_dropped,
+            (UINT32)KeGetCurrentIrql(),
+            KeGetCurrentProcessorNumber());
 
+        _InterlockedExchange64(&g_bw_last_sample_sent, total_sent);
+        _InterlockedExchange64(&g_bw_last_sample_recv, total_recv);
+        _InterlockedExchange64(&g_bw_last_sample_pkts_sent, packets_sent);
+        _InterlockedExchange64(&g_bw_last_sample_pkts_recv, packets_recv);
+        _InterlockedExchange64(&g_bw_last_sample_time, static_cast<LONG64>(now_100ns));
+    }
 
+    void record_traffic(UINT32 pid, UINT32 direction, UINT32 bytes,
+                        UINT32 attribution_source, UINT32 layer,
+                        UINT32 protocol, UINT32 local_port, UINT32 remote_port) {
+        if (!g_bw_active) return;
+
+        LONG64 aggregate_bytes_before = 0;
+        LONG64 aggregate_bytes_after = 0;
+        LONG64 aggregate_packets_after = 0;
+        if (direction == 0) {
+            aggregate_bytes_after = add_counter_saturated(&g_bw_total_recv, bytes, &aggregate_bytes_before);
+            aggregate_packets_after = add_counter_saturated(&g_bw_total_pkts_recv, 1, nullptr);
+        } else {
+            aggregate_bytes_after = add_counter_saturated(&g_bw_total_sent, bytes, &aggregate_bytes_before);
+            aggregate_packets_after = add_counter_saturated(&g_bw_total_pkts_sent, 1, nullptr);
+        }
+
+        if (pid == 0) {
+            _InterlockedIncrement64(&g_bw_unattributed_events);
+            log_traffic_update("unattributed", pid, direction, bytes, attribution_source, layer,
+                protocol, local_port, remote_port, -1, 0, 0, 0,
+                aggregate_bytes_before, aggregate_bytes_after, aggregate_packets_after);
+            return;
+        }
+
+        if (!ensure_lock_ready()) {
+            _InterlockedIncrement64(&g_bw_slot_race_events);
+            log_traffic_update("lock_unavailable", pid, direction, bytes, attribution_source, layer,
+                protocol, local_port, remote_port, -1, 0, 0, 0,
+                aggregate_bytes_before, aggregate_bytes_after, aggregate_packets_after);
+            return;
+        }
+
+        const char* branch = "no_slot";
+        LONG slot = -1;
+        LONG64 row_bytes_before = 0;
+        LONG64 row_bytes_after = 0;
+        LONG64 row_packets_after = 0;
+        LARGE_INTEGER ts;
+        KeQuerySystemTime(&ts);
+
+        KIRQL old_irql;
+        KeAcquireSpinLock(&g_bw_lock, &old_irql);
         INT32 free_slot = -1;
         for (UINT32 i = 0; i < BW_MAX_PROCESSES; i++) {
             if (g_bw_entries[i].active == 1 && g_bw_entries[i].pid == pid) {
                 if (direction == 0) {
-                    _InterlockedExchangeAdd64(&g_bw_entries[i].bytes_recv, bytes);
-                    _InterlockedIncrement64(&g_bw_entries[i].packets_recv);
+                    row_bytes_after = add_counter_locked(&g_bw_entries[i].bytes_recv, bytes, &row_bytes_before);
+                    row_packets_after = add_counter_locked(&g_bw_entries[i].packets_recv, 1, nullptr);
                 } else {
-                    _InterlockedExchangeAdd64(&g_bw_entries[i].bytes_sent, bytes);
-                    _InterlockedIncrement64(&g_bw_entries[i].packets_sent);
+                    row_bytes_after = add_counter_locked(&g_bw_entries[i].bytes_sent, bytes, &row_bytes_before);
+                    row_packets_after = add_counter_locked(&g_bw_entries[i].packets_sent, 1, nullptr);
                 }
-                LARGE_INTEGER ts;
-                KeQuerySystemTime(&ts);
                 g_bw_entries[i].last_activity = ts.QuadPart;
+                branch = "existing";
+                slot = static_cast<LONG>(i);
+                KeReleaseSpinLock(&g_bw_lock, old_irql);
+                log_traffic_update(branch, pid, direction, bytes, attribution_source, layer,
+                    protocol, local_port, remote_port, slot, row_bytes_before, row_bytes_after,
+                    row_packets_after, aggregate_bytes_before, aggregate_bytes_after,
+                    aggregate_packets_after);
                 return;
             }
             if (!g_bw_entries[i].active && free_slot == -1) free_slot = i;
         }
         if (free_slot >= 0) {
-            if (_InterlockedCompareExchange(&g_bw_entries[free_slot].active, 2, 0) == 0) {
-                for (UINT32 j = 0; j < BW_MAX_PROCESSES; j++) {
-                    if (g_bw_entries[j].active == 1 && g_bw_entries[j].pid == pid) {
-                        _InterlockedExchange(&g_bw_entries[free_slot].active, 0);
-                        if (direction == 0) {
-                            _InterlockedExchangeAdd64(&g_bw_entries[j].bytes_recv, bytes);
-                            _InterlockedIncrement64(&g_bw_entries[j].packets_recv);
-                        } else {
-                            _InterlockedExchangeAdd64(&g_bw_entries[j].bytes_sent, bytes);
-                            _InterlockedIncrement64(&g_bw_entries[j].packets_sent);
-                        }
-                        return;
-                    }
-                }
-                g_bw_entries[free_slot].pid = pid;
-                g_bw_entries[free_slot].bytes_sent = 0;
-                g_bw_entries[free_slot].bytes_recv = 0;
-                g_bw_entries[free_slot].packets_sent = 0;
-                g_bw_entries[free_slot].packets_recv = 0;
-                if (direction == 0)
-                    g_bw_entries[free_slot].bytes_recv = bytes;
-                else
-                    g_bw_entries[free_slot].bytes_sent = bytes;
-                LARGE_INTEGER ts;
-                KeQuerySystemTime(&ts);
-                g_bw_entries[free_slot].last_activity = ts.QuadPart;
-                KeMemoryBarrier();
-                _InterlockedExchange(&g_bw_entries[free_slot].active, 1);
+            g_bw_entries[free_slot].pid = pid;
+            g_bw_entries[free_slot].bytes_sent = 0;
+            g_bw_entries[free_slot].bytes_recv = 0;
+            g_bw_entries[free_slot].packets_sent = 0;
+            g_bw_entries[free_slot].packets_recv = 0;
+            row_bytes_after = static_cast<LONG64>(bytes);
+            row_packets_after = 1;
+            if (direction == 0) {
+                g_bw_entries[free_slot].bytes_recv = row_bytes_after;
+                g_bw_entries[free_slot].packets_recv = row_packets_after;
+            } else {
+                g_bw_entries[free_slot].bytes_sent = row_bytes_after;
+                g_bw_entries[free_slot].packets_sent = row_packets_after;
             }
+            g_bw_entries[free_slot].last_activity = ts.QuadPart;
+            KeMemoryBarrier();
+            g_bw_entries[free_slot].active = 1;
+            branch = "new_slot";
+            slot = static_cast<LONG>(free_slot);
+        } else {
+            _InterlockedIncrement64(&g_bw_no_slot_events);
         }
+        KeReleaseSpinLock(&g_bw_lock, old_irql);
+        log_traffic_update(branch, pid, direction, bytes, attribution_source, layer,
+            protocol, local_port, remote_port, slot, row_bytes_before, row_bytes_after,
+            row_packets_after, aggregate_bytes_before, aggregate_bytes_after,
+            aggregate_packets_after);
     }
 
     NTSTATUS handle_bw(p_bw_monitor_request request) {
@@ -11257,91 +11595,181 @@ namespace net_bw {
                 request->operation, request->filter_pid, (int)g_bw_active);
 
         switch (request->operation) {
-        case 0:
+        case 0: {
+            LONG64 generation = _InterlockedIncrement64(&g_bw_generation);
             _InterlockedExchange(&g_bw_active, 1);
             request->monitoring_active = 1;
-            request->total_bytes_sent = g_bw_total_sent;
-            request->total_bytes_recv = g_bw_total_recv;
-            request->total_packets_sent = g_bw_total_pkts_sent;
-            request->total_packets_recv = g_bw_total_pkts_recv;
-            {
-                LARGE_INTEGER now;
-                KeQuerySystemTime(&now);
-                UINT64 elapsed = now.QuadPart - g_bw_last_sample_time;
-                if (elapsed > 0 && g_bw_last_sample_time != 0) {
-                    LONG64 delta_sent = g_bw_total_sent - g_bw_last_sample_sent;
-                    LONG64 delta_recv = g_bw_total_recv - g_bw_last_sample_recv;
-                    UINT64 seconds = elapsed / 10000000ULL;
-                    if (seconds > 0) {
-                        request->bytes_per_second_out = delta_sent / seconds;
-                        request->bytes_per_second_in = delta_recv / seconds;
-                    }
-                }
-                g_bw_last_sample_sent = g_bw_total_sent;
-                g_bw_last_sample_recv = g_bw_total_recv;
-                g_bw_last_sample_time = now.QuadPart;
-            }
+            LONG64 total_sent = read_i64(&g_bw_total_sent);
+            LONG64 total_recv = read_i64(&g_bw_total_recv);
+            LONG64 packets_sent = read_i64(&g_bw_total_pkts_sent);
+            LONG64 packets_recv = read_i64(&g_bw_total_pkts_recv);
+            request->total_bytes_sent = counter_to_u64(total_sent);
+            request->total_bytes_recv = counter_to_u64(total_recv);
+            request->total_packets_sent = counter_to_u64(packets_sent);
+            request->total_packets_recv = counter_to_u64(packets_recv);
+            LARGE_INTEGER now;
+            KeQuerySystemTime(&now);
+            update_rate_sample(request, request->operation, static_cast<UINT64>(now.QuadPart),
+                total_sent, total_recv, packets_sent, packets_recv);
+            WW_LOG("netaction::BWMN start op=0 generation=%lld filter_pid=%u active=1 total_sent=%lld total_recv=%lld packets_sent=%lld packets_recv=%lld irql=%u cpu=%lu",
+                generation,
+                request->filter_pid,
+                total_sent,
+                total_recv,
+                packets_sent,
+                packets_recv,
+                (UINT32)KeGetCurrentIrql(),
+                KeGetCurrentProcessorNumber());
             return STATUS_SUCCESS;
-        case 1:
-            _InterlockedExchange(&g_bw_active, 0);
+        }
+        case 1: {
+            LONG active_before = _InterlockedExchange(&g_bw_active, 0);
+            LONG64 generation = _InterlockedIncrement64(&g_bw_generation);
             request->monitoring_active = 0;
+            WW_LOG("netaction::BWMN stop op=1 generation=%lld filter_pid=%u active_before=%ld total_sent=%lld total_recv=%lld packets_sent=%lld packets_recv=%lld no_pid=%lld no_slot=%lld slot_race=%lld duplicate_race=%lld capture_dropped=%ld irql=%u cpu=%lu",
+                generation,
+                request->filter_pid,
+                active_before,
+                read_i64(&g_bw_total_sent),
+                read_i64(&g_bw_total_recv),
+                read_i64(&g_bw_total_pkts_sent),
+                read_i64(&g_bw_total_pkts_recv),
+                read_i64(&g_bw_unattributed_events),
+                read_i64(&g_bw_no_slot_events),
+                read_i64(&g_bw_slot_race_events),
+                read_i64(&g_bw_duplicate_race_events),
+                net_capture::g_total_dropped,
+                (UINT32)KeGetCurrentIrql(),
+                KeGetCurrentProcessorNumber());
             return STATUS_SUCCESS;
+        }
         case 2: {
-            request->total_bytes_sent = g_bw_total_sent;
-            request->total_bytes_recv = g_bw_total_recv;
-            request->total_packets_sent = g_bw_total_pkts_sent;
-            request->total_packets_recv = g_bw_total_pkts_recv;
+            LONG64 total_sent = read_i64(&g_bw_total_sent);
+            LONG64 total_recv = read_i64(&g_bw_total_recv);
+            LONG64 packets_sent = read_i64(&g_bw_total_pkts_sent);
+            LONG64 packets_recv = read_i64(&g_bw_total_pkts_recv);
+            request->total_bytes_sent = counter_to_u64(total_sent);
+            request->total_bytes_recv = counter_to_u64(total_recv);
+            request->total_packets_sent = counter_to_u64(packets_sent);
+            request->total_packets_recv = counter_to_u64(packets_recv);
             request->monitoring_active = g_bw_active;
 
             NET_DBG("handle_bw[get]: total_sent=%lld total_recv=%lld pkts_s=%lld pkts_r=%lld active=%d",
-                    (LONG64)g_bw_total_sent, (LONG64)g_bw_total_recv,
-                    (LONG64)g_bw_total_pkts_sent, (LONG64)g_bw_total_pkts_recv, (int)g_bw_active);
+                    total_sent, total_recv, packets_sent, packets_recv, (int)g_bw_active);
 
 
             LARGE_INTEGER now;
             KeQuerySystemTime(&now);
-            UINT64 elapsed = now.QuadPart - g_bw_last_sample_time;
-            if (elapsed > 0 && g_bw_last_sample_time != 0) {
-                LONG64 delta_sent = g_bw_total_sent - g_bw_last_sample_sent;
-                LONG64 delta_recv = g_bw_total_recv - g_bw_last_sample_recv;
-
-                UINT64 seconds = elapsed / 10000000ULL;
-                if (seconds > 0) {
-                    request->bytes_per_second_out = delta_sent / seconds;
-                    request->bytes_per_second_in = delta_recv / seconds;
-                }
-            }
-            g_bw_last_sample_sent = g_bw_total_sent;
-            g_bw_last_sample_recv = g_bw_total_recv;
-            g_bw_last_sample_time = now.QuadPart;
+            update_rate_sample(request, request->operation, static_cast<UINT64>(now.QuadPart),
+                total_sent, total_recv, packets_sent, packets_recv);
             return STATUS_SUCCESS;
         }
         case 3: {
-            g_bw_total_sent = 0;
-            g_bw_total_recv = 0;
-            g_bw_total_pkts_sent = 0;
-            g_bw_total_pkts_recv = 0;
-            for (UINT32 i = 0; i < BW_MAX_PROCESSES; i++) {
-                _InterlockedExchange(&g_bw_entries[i].active, 0);
+            LONG64 generation = _InterlockedIncrement64(&g_bw_generation);
+            LONG64 sent_before = _InterlockedExchange64(&g_bw_total_sent, 0);
+            LONG64 recv_before = _InterlockedExchange64(&g_bw_total_recv, 0);
+            LONG64 pkts_sent_before = _InterlockedExchange64(&g_bw_total_pkts_sent, 0);
+            LONG64 pkts_recv_before = _InterlockedExchange64(&g_bw_total_pkts_recv, 0);
+            LONG64 no_pid_before = _InterlockedExchange64(&g_bw_unattributed_events, 0);
+            LONG64 no_slot_before = _InterlockedExchange64(&g_bw_no_slot_events, 0);
+            LONG64 slot_race_before = _InterlockedExchange64(&g_bw_slot_race_events, 0);
+            LONG64 duplicate_race_before = _InterlockedExchange64(&g_bw_duplicate_race_events, 0);
+            _InterlockedExchange64(&g_bw_last_sample_sent, 0);
+            _InterlockedExchange64(&g_bw_last_sample_recv, 0);
+            _InterlockedExchange64(&g_bw_last_sample_pkts_sent, 0);
+            _InterlockedExchange64(&g_bw_last_sample_pkts_recv, 0);
+            _InterlockedExchange64(&g_bw_last_sample_time, 0);
+            if (ensure_lock_ready()) {
+                KIRQL old_irql;
+                KeAcquireSpinLock(&g_bw_lock, &old_irql);
+                clear_process_entries_unlocked();
+                KeReleaseSpinLock(&g_bw_lock, old_irql);
+            } else {
+                clear_process_entries_unlocked();
             }
+            request->total_bytes_sent = 0;
+            request->total_bytes_recv = 0;
+            request->total_packets_sent = 0;
+            request->total_packets_recv = 0;
+            request->bytes_per_second_out = 0;
+            request->bytes_per_second_in = 0;
+            request->process_count = 0;
+            request->monitoring_active = g_bw_active;
+            WW_LOG("netaction::BWMN reset op=3 generation=%lld filter_pid=%u active=%ld sent_before=%lld recv_before=%lld pkts_sent_before=%lld pkts_recv_before=%lld no_pid_before=%lld no_slot_before=%lld slot_race_before=%lld duplicate_race_before=%lld capture_dropped=%ld irql=%u cpu=%lu",
+                generation,
+                request->filter_pid,
+                g_bw_active,
+                sent_before,
+                recv_before,
+                pkts_sent_before,
+                pkts_recv_before,
+                no_pid_before,
+                no_slot_before,
+                slot_race_before,
+                duplicate_race_before,
+                net_capture::g_total_dropped,
+                (UINT32)KeGetCurrentIrql(),
+                KeGetCurrentProcessorNumber());
             return STATUS_SUCCESS;
         }
         case 4: {
             request->process_count = 0;
-            for (UINT32 i = 0; i < BW_MAX_PROCESSES && request->process_count < BW_MAX_PROCESSES; i++) {
-                if (g_bw_entries[i].active == 1) {
+            UINT32 row_slots[BW_MAX_PROCESSES] = {};
+            if (ensure_lock_ready()) {
+                KIRQL old_irql;
+                KeAcquireSpinLock(&g_bw_lock, &old_irql);
+                for (UINT32 i = 0; i < BW_MAX_PROCESSES && request->process_count < BW_MAX_PROCESSES; i++) {
+                    if (g_bw_entries[i].active != 1) continue;
                     if (request->filter_pid != 0 && g_bw_entries[i].pid != request->filter_pid) continue;
-                    BW_PROCESS_ENTRY* out = &request->processes[request->process_count];
+                    UINT32 out_index = request->process_count;
+                    for (UINT32 row = 0; row < out_index; row++) {
+                        if (request->processes[row].pid == g_bw_entries[i].pid) {
+                            _InterlockedIncrement64(&g_bw_duplicate_race_events);
+                            break;
+                        }
+                    }
+                    BW_PROCESS_ENTRY* out = &request->processes[out_index];
                     out->pid = g_bw_entries[i].pid;
-                    out->bytes_sent = g_bw_entries[i].bytes_sent;
-                    out->bytes_recv = g_bw_entries[i].bytes_recv;
-                    out->packets_sent = g_bw_entries[i].packets_sent;
-                    out->packets_recv = g_bw_entries[i].packets_recv;
+                    out->bytes_sent = counter_to_u64(g_bw_entries[i].bytes_sent);
+                    out->bytes_recv = counter_to_u64(g_bw_entries[i].bytes_recv);
+                    out->packets_sent = counter_to_u64(g_bw_entries[i].packets_sent);
+                    out->packets_recv = counter_to_u64(g_bw_entries[i].packets_recv);
                     out->last_activity_time = g_bw_entries[i].last_activity;
+                    row_slots[out_index] = i;
                     request->process_count++;
                 }
+                KeReleaseSpinLock(&g_bw_lock, old_irql);
+            } else {
+                _InterlockedIncrement64(&g_bw_slot_race_events);
+            }
+            for (UINT32 row = 0; row < request->process_count; row++) {
+                BW_PROCESS_ENTRY* out = &request->processes[row];
+                WW_LOG("netaction::BWMN process row slot=%u out_index=%u filter_pid=%u pid=%u bytes_sent=%llu bytes_recv=%llu packets_sent=%llu packets_recv=%llu last_activity=%llu active=%ld generation=%lld",
+                    row_slots[row],
+                    row,
+                    request->filter_pid,
+                    out->pid,
+                    out->bytes_sent,
+                    out->bytes_recv,
+                    out->packets_sent,
+                    out->packets_recv,
+                    out->last_activity_time,
+                    g_bw_active,
+                    read_i64(&g_bw_generation));
             }
             request->monitoring_active = g_bw_active;
+            WW_LOG("netaction::BWMN process_list op=4 filter_pid=%u returned=%u active=%ld generation=%lld no_pid=%lld no_slot=%lld slot_race=%lld duplicate_race=%lld capture_dropped=%ld irql=%u cpu=%lu",
+                request->filter_pid,
+                request->process_count,
+                g_bw_active,
+                read_i64(&g_bw_generation),
+                read_i64(&g_bw_unattributed_events),
+                read_i64(&g_bw_no_slot_events),
+                read_i64(&g_bw_slot_race_events),
+                read_i64(&g_bw_duplicate_race_events),
+                net_capture::g_total_dropped,
+                (UINT32)KeGetCurrentIrql(),
+                KeGetCurrentProcessorNumber());
             return STATUS_SUCCESS;
         }
         default:
@@ -11357,15 +11785,20 @@ namespace net_bw {
         _InterlockedExchange64(&g_bw_total_pkts_recv, 0);
         _InterlockedExchange64(&g_bw_last_sample_sent, 0);
         _InterlockedExchange64(&g_bw_last_sample_recv, 0);
-        g_bw_last_sample_time = 0;
-        for (UINT32 i = 0; i < BW_MAX_PROCESSES; i++) {
-            _InterlockedExchange(&g_bw_entries[i].active, 0);
-            g_bw_entries[i].pid = 0;
-            _InterlockedExchange64(&g_bw_entries[i].bytes_sent, 0);
-            _InterlockedExchange64(&g_bw_entries[i].bytes_recv, 0);
-            _InterlockedExchange64(&g_bw_entries[i].packets_sent, 0);
-            _InterlockedExchange64(&g_bw_entries[i].packets_recv, 0);
-            g_bw_entries[i].last_activity = 0;
+        _InterlockedExchange64(&g_bw_last_sample_pkts_sent, 0);
+        _InterlockedExchange64(&g_bw_last_sample_pkts_recv, 0);
+        _InterlockedExchange64(&g_bw_last_sample_time, 0);
+        _InterlockedExchange64(&g_bw_unattributed_events, 0);
+        _InterlockedExchange64(&g_bw_no_slot_events, 0);
+        _InterlockedExchange64(&g_bw_slot_race_events, 0);
+        _InterlockedExchange64(&g_bw_duplicate_race_events, 0);
+        if (ensure_lock_ready()) {
+            KIRQL old_irql;
+            KeAcquireSpinLock(&g_bw_lock, &old_irql);
+            clear_process_entries_unlocked();
+            KeReleaseSpinLock(&g_bw_lock, old_irql);
+        } else {
+            clear_process_entries_unlocked();
         }
     }
 }

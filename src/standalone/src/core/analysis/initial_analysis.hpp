@@ -32,7 +32,6 @@
 #include "function_index.hpp"
 #include "xref_index.hpp"
 #include "work_queue.hpp"
-#include "../testlab/test_all_features.hpp"
 #include "../../helpers/diag_log.hpp"
 #include "../../helpers/globals.h"
 #include "../anti-tamper/webhook.hpp"
@@ -144,7 +143,7 @@ inline void push_log(const std::string& line)
 
 inline void push_log_fmt(const char* fmt, ...)
 {
-	char buf[1024];
+	char buf[2048];
 	va_list ap;
 	va_start(ap, fmt);
 	_vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, ap);
@@ -154,7 +153,7 @@ inline void push_log_fmt(const char* fmt, ...)
 
 inline bool full_test_active()
 {
-	return test_all_features::is_unattended_full_test_active();
+	return symbol_store::pdb_automation_active();
 }
 
 inline const char* log_value(const std::string& s);
@@ -170,7 +169,8 @@ inline bool apply_full_test_pdb_decline(const char* source,
                                         bool prompt_created,
                                         bool log_without_pending)
 {
-	if (!full_test_active()) return false;
+	const auto automation = symbol_store::pdb_automation_context();
+	if (!automation.pdb_automation_active) return false;
 
 	const bool remote_pending = g_state.needs_pdb_prompt.load(std::memory_order_acquire);
 	const bool local_pending = g_state.needs_local_pdb_prompt.load(std::memory_order_acquire);
@@ -218,7 +218,7 @@ inline bool apply_full_test_pdb_decline(const char* source,
 		g_state.local_pdb_path.clear();
 	}
 
-	push_log_fmt("pdb_prompt_creation_attempt source=%s kind=unattended prompt_created=%d prompt_suppressed=1 module=%s base=0x%llX size=0x%llX pdb=%s guid=%s age=%u reason=%s is_running=%d unattended_active=%d decision=do_not_load_pdb",
+	push_log_fmt("pdb_prompt_creation_attempt source=%s kind=unattended prompt_created=%d prompt_suppressed=1 module=%s base=0x%llX size=0x%llX pdb=%s guid=%s age=%u reason=%s is_running=%d anti_tamper_full_test_running=%d full_test_env_active=%d unattended_active=%d post_suppression_active=%d post_suppression_remaining_ms=%llu pdb_automation_active=%d decision=do_not_load_pdb",
 		source && *source ? source : "<unknown>",
 		prompt_created ? 1 : 0,
 		log_value(module_log),
@@ -228,9 +228,14 @@ inline bool apply_full_test_pdb_decline(const char* source,
 		log_value(guid_log),
 		static_cast<unsigned>(age_log),
 		log_value(reason_log),
-		test_all_features::is_running() ? 1 : 0,
-		test_all_features::is_unattended_full_test_active() ? 1 : 0);
-	push_log_fmt("fulltest_pdb_final_decision source=%s module=%s base=0x%llX size=0x%llX pdb=%s guid=%s age=%u decision=do_not_load_pdb reason=%s local_candidate=<none> cache_path=<none> prompt_suppressed=1 is_running=%d unattended_active=%d",
+		automation.is_running ? 1 : 0,
+		automation.anti_tamper_full_test_running ? 1 : 0,
+		automation.full_test_env_active ? 1 : 0,
+		automation.unattended_active ? 1 : 0,
+		automation.post_suppression_active ? 1 : 0,
+		static_cast<unsigned long long>(automation.post_suppression_remaining_ms),
+		automation.pdb_automation_active ? 1 : 0);
+	push_log_fmt("fulltest_pdb_final_decision source=%s module=%s base=0x%llX size=0x%llX pdb=%s guid=%s age=%u decision=do_not_load_pdb reason=%s local_candidate=<none> cache_path=<none> prompt_suppressed=1 is_running=%d anti_tamper_full_test_running=%d full_test_env_active=%d unattended_active=%d post_suppression_active=%d post_suppression_remaining_ms=%llu pdb_automation_active=%d",
 		source && *source ? source : "<unknown>",
 		log_value(module_log),
 		static_cast<unsigned long long>(base_log),
@@ -239,9 +244,14 @@ inline bool apply_full_test_pdb_decline(const char* source,
 		log_value(guid_log),
 		static_cast<unsigned>(age_log),
 		log_value(reason_log),
-		test_all_features::is_running() ? 1 : 0,
-		test_all_features::is_unattended_full_test_active() ? 1 : 0);
-	push_log_fmt("fulltest_pdb_prompt_auto_decline choice=do_not_load_pdb decision=do_not_load_pdb prompt_created=%d prompt_suppressed=1 source=%s module=%s base=0x%llX size=0x%llX pdb=%s guid=%s age=%u reason=%s remote_pending=%d local_pending=%d opt_load_types=0 opt_load_names=0 failed=0 declined=1",
+		automation.is_running ? 1 : 0,
+		automation.anti_tamper_full_test_running ? 1 : 0,
+		automation.full_test_env_active ? 1 : 0,
+		automation.unattended_active ? 1 : 0,
+		automation.post_suppression_active ? 1 : 0,
+		static_cast<unsigned long long>(automation.post_suppression_remaining_ms),
+		automation.pdb_automation_active ? 1 : 0);
+	push_log_fmt("fulltest_pdb_prompt_auto_decline choice=do_not_load_pdb decision=do_not_load_pdb prompt_created=%d prompt_suppressed=1 source=%s module=%s base=0x%llX size=0x%llX pdb=%s guid=%s age=%u reason=%s remote_pending=%d local_pending=%d remote_pending_after=%d local_pending_after=%d opt_load_types=0 opt_load_names=0 failed=0 declined=1 is_running=%d anti_tamper_full_test_running=%d full_test_env_active=%d unattended_active=%d post_suppression_active=%d post_suppression_remaining_ms=%llu pdb_automation_active=%d",
 		prompt_created ? 1 : 0,
 		source && *source ? source : "<unknown>",
 		log_value(module_log),
@@ -252,7 +262,16 @@ inline bool apply_full_test_pdb_decline(const char* source,
 		static_cast<unsigned>(age_log),
 		log_value(reason_log),
 		remote_pending ? 1 : 0,
-		local_pending ? 1 : 0);
+		local_pending ? 1 : 0,
+		g_state.needs_pdb_prompt.load(std::memory_order_acquire) ? 1 : 0,
+		g_state.needs_local_pdb_prompt.load(std::memory_order_acquire) ? 1 : 0,
+		automation.is_running ? 1 : 0,
+		automation.anti_tamper_full_test_running ? 1 : 0,
+		automation.full_test_env_active ? 1 : 0,
+		automation.unattended_active ? 1 : 0,
+		automation.post_suppression_active ? 1 : 0,
+		static_cast<unsigned long long>(automation.post_suppression_remaining_ms),
+		automation.pdb_automation_active ? 1 : 0);
 	return true;
 }
 
@@ -437,8 +456,7 @@ inline unattended_pdb_decision_result_t decide_unattended_pdb_policy(const char*
 {
 	unattended_pdb_decision_result_t result;
 	result.active = full_test_active();
-	const bool full_running = test_all_features::is_running();
-	const bool unattended_active = test_all_features::is_unattended_full_test_active();
+	const auto automation = symbol_store::pdb_automation_context();
 	if (!result.active) {
 		result.decision = unattended_pdb_decision_t::allow_interactive;
 		return result;
@@ -450,7 +468,7 @@ inline unattended_pdb_decision_result_t decide_unattended_pdb_policy(const char*
 	result.decision = result.policy.local_available
 		? unattended_pdb_decision_t::load_deterministic_local
 		: unattended_pdb_decision_t::decline;
-	push_log_fmt("fulltest_pdb_final_decision source=%s module=%s base=0x%llX size=0x%llX pdb=%s guid=%s age=%u decision=%s reason=%s local_candidate=%s cache_path=%s prompt_suppressed=1 is_running=%d unattended_active=%d",
+	push_log_fmt("fulltest_pdb_final_decision source=%s module=%s base=0x%llX size=0x%llX pdb=%s guid=%s age=%u decision=%s reason=%s local_candidate=%s cache_path=%s prompt_suppressed=1 is_running=%d anti_tamper_full_test_running=%d full_test_env_active=%d unattended_active=%d post_suppression_active=%d post_suppression_remaining_ms=%llu pdb_automation_active=%d",
 		source && *source ? source : "<unknown>",
 		log_value(module_name),
 		static_cast<unsigned long long>(image_base),
@@ -462,8 +480,13 @@ inline unattended_pdb_decision_result_t decide_unattended_pdb_policy(const char*
 		log_value(result.policy.reason),
 		log_value(result.policy.local_candidate),
 		log_value(result.policy.cache_path),
-		full_running ? 1 : 0,
-		unattended_active ? 1 : 0);
+		automation.is_running ? 1 : 0,
+		automation.anti_tamper_full_test_running ? 1 : 0,
+		automation.full_test_env_active ? 1 : 0,
+		automation.unattended_active ? 1 : 0,
+		automation.post_suppression_active ? 1 : 0,
+		static_cast<unsigned long long>(automation.post_suppression_remaining_ms),
+		automation.pdb_automation_active ? 1 : 0);
 	return result;
 }
 
@@ -494,7 +517,8 @@ inline bool accept_local_pdb_before_prompt_for_full_test(const char* source,
 		g_state.local_pdb_path = policy.local_candidate;
 	}
 
-	push_log_fmt("fulltest_pdb_prompt_auto_accept_local decision=load_local prompt_created=0 prompt_suppressed=1 source=%s module=%s base=0x%llX size=0x%llX pdb=%s guid=%s age=%u local_candidate=%s cache_path=%s reason=%s failed=0 declined=0",
+	const auto automation = symbol_store::pdb_automation_context();
+	push_log_fmt("fulltest_pdb_prompt_auto_accept_local decision=load_local prompt_created=0 prompt_suppressed=1 source=%s module=%s base=0x%llX size=0x%llX pdb=%s guid=%s age=%u local_candidate=%s cache_path=%s reason=%s failed=0 declined=0 is_running=%d anti_tamper_full_test_running=%d full_test_env_active=%d unattended_active=%d post_suppression_active=%d post_suppression_remaining_ms=%llu pdb_automation_active=%d",
 		source && *source ? source : "<unknown>",
 		log_value(module_name),
 		static_cast<unsigned long long>(image_base),
@@ -504,7 +528,14 @@ inline bool accept_local_pdb_before_prompt_for_full_test(const char* source,
 		static_cast<unsigned>(policy.pdb_age),
 		log_value(policy.local_candidate),
 		log_value(policy.cache_path),
-		log_value(reason.empty() ? policy.reason : reason));
+		log_value(reason.empty() ? policy.reason : reason),
+		automation.is_running ? 1 : 0,
+		automation.anti_tamper_full_test_running ? 1 : 0,
+		automation.full_test_env_active ? 1 : 0,
+		automation.unattended_active ? 1 : 0,
+		automation.post_suppression_active ? 1 : 0,
+		static_cast<unsigned long long>(automation.post_suppression_remaining_ms),
+		automation.pdb_automation_active ? 1 : 0);
 	return true;
 }
 
@@ -533,7 +564,8 @@ inline void log_full_test_pdb_policy(const std::string& filename,
                                      const full_test_pdb_policy_t& policy)
 {
 	const bool declined = policy.decision == "do_not_load_pdb";
-	push_log_fmt("fulltest_pdb_policy module=%s base=0x%llX size=0x%llX pdb=%s guid=%s age=%u local_candidate=%s cache_path=%s decision=%s reason=%s prompt_created=0 prompt_suppressed=%d failed=0 declined=%d",
+	const auto automation = symbol_store::pdb_automation_context();
+	push_log_fmt("fulltest_pdb_policy module=%s base=0x%llX size=0x%llX pdb=%s guid=%s age=%u local_candidate=%s cache_path=%s decision=%s reason=%s prompt_created=0 prompt_suppressed=%d failed=0 declined=%d is_running=%d anti_tamper_full_test_running=%d full_test_env_active=%d unattended_active=%d post_suppression_active=%d post_suppression_remaining_ms=%llu pdb_automation_active=%d",
 		filename.c_str(),
 		static_cast<unsigned long long>(image_base),
 		static_cast<unsigned long long>(image_size),
@@ -545,7 +577,14 @@ inline void log_full_test_pdb_policy(const std::string& filename,
 		log_value(policy.decision),
 		log_value(policy.reason),
 		policy.prompt_suppressed ? 1 : 0,
-		declined ? 1 : 0);
+		declined ? 1 : 0,
+		automation.is_running ? 1 : 0,
+		automation.anti_tamper_full_test_running ? 1 : 0,
+		automation.full_test_env_active ? 1 : 0,
+		automation.unattended_active ? 1 : 0,
+		automation.post_suppression_active ? 1 : 0,
+		static_cast<unsigned long long>(automation.post_suppression_remaining_ms),
+		automation.pdb_automation_active ? 1 : 0);
 }
 
 inline void log_full_test_pdb_final(const std::string& filename,
@@ -937,7 +976,8 @@ inline void request_local_pdb_prompt(const std::string& module_name,
 		{}, 0, reason)) {
 		return;
 	}
-	push_log_fmt("pdb_prompt_creation_attempt source=request_local_pdb_prompt kind=local prompt_created=1 prompt_suppressed=0 module=%s base=0x%llX size=0x%llX pdb=%s guid=%s age=%u reason=%s is_running=%d unattended_active=%d decision=allow_interactive",
+	const auto automation = symbol_store::pdb_automation_context();
+	push_log_fmt("pdb_prompt_creation_attempt source=request_local_pdb_prompt kind=local prompt_created=1 prompt_suppressed=0 module=%s base=0x%llX size=0x%llX pdb=%s guid=%s age=%u reason=%s is_running=%d anti_tamper_full_test_running=%d full_test_env_active=%d unattended_active=%d post_suppression_active=%d post_suppression_remaining_ms=%llu pdb_automation_active=%d decision=allow_interactive",
 		log_value(module_name),
 		static_cast<unsigned long long>(image_base),
 		static_cast<unsigned long long>(image_size),
@@ -945,8 +985,13 @@ inline void request_local_pdb_prompt(const std::string& module_name,
 		"<none>",
 		0u,
 		log_value(reason),
-		test_all_features::is_running() ? 1 : 0,
-		test_all_features::is_unattended_full_test_active() ? 1 : 0);
+		automation.is_running ? 1 : 0,
+		automation.anti_tamper_full_test_running ? 1 : 0,
+		automation.full_test_env_active ? 1 : 0,
+		automation.unattended_active ? 1 : 0,
+		automation.post_suppression_active ? 1 : 0,
+		static_cast<unsigned long long>(automation.post_suppression_remaining_ms),
+		automation.pdb_automation_active ? 1 : 0);
 	{
 		std::lock_guard<std::mutex> lk(g_state.local_pdb_mtx);
 		g_state.local_pdb_module_name = module_name;
@@ -974,7 +1019,8 @@ inline bool request_remote_pdb_prompt(const std::string& module_name,
 		"remote_pdb_prompt_declined_by_full_test")) {
 		return false;
 	}
-	push_log_fmt("pdb_prompt_creation_attempt source=%s kind=remote prompt_created=1 prompt_suppressed=0 module=%s base=0x%llX size=0x%llX pdb=%s guid=%s age=%u reason=interactive_remote_prompt is_running=%d unattended_active=%d decision=allow_interactive",
+	const auto automation = symbol_store::pdb_automation_context();
+	push_log_fmt("pdb_prompt_creation_attempt source=%s kind=remote prompt_created=1 prompt_suppressed=0 module=%s base=0x%llX size=0x%llX pdb=%s guid=%s age=%u reason=interactive_remote_prompt is_running=%d anti_tamper_full_test_running=%d full_test_env_active=%d unattended_active=%d post_suppression_active=%d post_suppression_remaining_ms=%llu pdb_automation_active=%d decision=allow_interactive",
 		source && *source ? source : "<unknown>",
 		log_value(module_name),
 		static_cast<unsigned long long>(image_base),
@@ -982,8 +1028,13 @@ inline bool request_remote_pdb_prompt(const std::string& module_name,
 		log_value(hint.pdb_name),
 		log_value(hint.pdb_guid),
 		static_cast<unsigned>(hint.pdb_age),
-		test_all_features::is_running() ? 1 : 0,
-		test_all_features::is_unattended_full_test_active() ? 1 : 0);
+		automation.is_running ? 1 : 0,
+		automation.anti_tamper_full_test_running ? 1 : 0,
+		automation.full_test_env_active ? 1 : 0,
+		automation.unattended_active ? 1 : 0,
+		automation.post_suppression_active ? 1 : 0,
+		static_cast<unsigned long long>(automation.post_suppression_remaining_ms),
+		automation.pdb_automation_active ? 1 : 0);
 	g_state.needs_pdb_prompt.store(true, std::memory_order_release);
 	return true;
 }

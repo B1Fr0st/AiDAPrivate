@@ -515,11 +515,15 @@ size_t result_count(uint64_t job_id);
 json status_to_json(const intruder::status_t& s)
 {
     const size_t results = s.job_id == 0 ? 0 : result_count(s.job_id);
+    const bool request_proof_ready = s.sent > 0 || results > 0;
+    const bool terminal = s.job_id != 0 && !s.running;
     json r;
     r["job_id"] = s.job_id;
     r["total"] = s.total;
     r["sent"] = s.sent;
     r["errors"] = s.errors;
+    r["requests_sent"] = s.sent;
+    r["request_errors"] = s.errors;
     r["running"] = s.running;
     r["current_rps"] = s.current_rps;
     r["started_unix_ms"] = s.started_unix_ms;
@@ -528,8 +532,16 @@ json status_to_json(const intruder::status_t& s)
     r["result_count"] = static_cast<uint64_t>(results);
     r["completion_state"] = intruder_completion_state(s, results);
     r["progress_fraction"] = s.total == 0 ? 0.0 : static_cast<double>(s.sent) / static_cast<double>(s.total);
-    r["proof_ready"] = results > 0;
-    r["proof_pending"] = s.running && (s.total == 0 || s.sent < s.total);
+    r["request_proof_ready"] = request_proof_ready;
+    r["result_proof_ready"] = results > 0;
+    r["functional_proof"] = request_proof_ready;
+    r["proof_ready"] = request_proof_ready;
+    r["proof_pending"] = s.job_id != 0 && !request_proof_ready && s.running;
+    r["accepted_pending"] = s.job_id != 0 && !request_proof_ready && s.running;
+    r["worker_terminal"] = terminal;
+    r["terminal_no_request_evidence"] = terminal && !request_proof_ready;
+    r["terminal_without_functional_proof"] = terminal && !request_proof_ready;
+    r["proof_requirement"] = "request_sent_or_result_row";
     r["status_source"] = "intruder::status";
     return r;
 }
@@ -661,14 +673,31 @@ static tool_result_t burp_intruder_start(const json& params)
         return tool_result_t::error(std::string("intruder::start failed: ") + intruder::last_error());
     }
     diag::log_tagged_fmt("mcp_burp", "intruder_start ok job_id=%llu", static_cast<unsigned long long>(id));
+    const intruder::status_t start_status = intruder::status(id);
+    const json start_status_json = status_to_json(start_status);
+    const bool request_proof_ready = start_status_json.value("request_proof_ready", false);
     json r;
     r["job_id"] = id;
-    r["status"] = status_to_json(intruder::status(id));
+    r["status"] = start_status_json;
     r["result_count"] = static_cast<uint64_t>(result_count(id));
+    r["requests_sent"] = static_cast<uint64_t>(start_status.sent);
+    r["request_errors"] = static_cast<uint64_t>(start_status.errors);
     r["engine_acceptance"] = "job_id_allocated";
-    r["proof_pending"] = true;
-    r["proof_ready"] = false;
-    return tool_result_t::ok("intruder job started", r);
+    r["accepted_pending"] = !request_proof_ready && start_status.running;
+    r["proof_pending"] = !request_proof_ready && start_status.running;
+    r["proof_ready"] = request_proof_ready;
+    r["request_proof_ready"] = request_proof_ready;
+    r["result_proof_ready"] = r["result_count"].get<uint64_t>() > 0;
+    r["functional_proof"] = request_proof_ready;
+    r["worker_terminal"] = start_status.job_id != 0 && !start_status.running;
+    r["terminal_no_request_evidence"] = start_status.job_id != 0 && !start_status.running && !request_proof_ready;
+    r["terminal_without_functional_proof"] = start_status.job_id != 0 && !start_status.running && !request_proof_ready;
+    r["proof_requirement"] = "request_sent_or_result_row";
+    r["proof_kind"] = request_proof_ready ? "request_or_result" :
+        (start_status.running ? "accepted_pending" : "terminal_no_request_evidence");
+    const std::string message = request_proof_ready ? "intruder job started with request proof" :
+        (start_status.running ? "intruder job accepted; request proof pending" : "intruder job accepted but worker is terminal without request proof");
+    return tool_result_t::ok(message, r);
 }
 
 static tool_result_t burp_intruder_status(const json& params)
@@ -691,6 +720,8 @@ static tool_result_t burp_intruder_results(const json& params)
     size_t start_idx = params.value("start", static_cast<size_t>(0));
     size_t max_count = params.value("max", static_cast<size_t>(100));
     auto rows = intruder::results(id, start_idx, max_count);
+    const intruder::status_t status = intruder::status(id);
+    const bool request_proof_ready = status.sent > 0 || !rows.empty();
     json arr = json::array();
     size_t error_count = 0;
     size_t successful_count = 0;
@@ -719,7 +750,17 @@ static tool_result_t burp_intruder_results(const json& params)
     out["window_start"] = static_cast<uint64_t>(start_idx);
     out["window_max"] = static_cast<uint64_t>(max_count);
     out["result_count"] = static_cast<uint64_t>(result_count(id));
-    out["status"] = status_to_json(intruder::status(id));
+    out["requests_sent"] = static_cast<uint64_t>(status.sent);
+    out["request_errors"] = static_cast<uint64_t>(status.errors);
+    out["request_proof_ready"] = request_proof_ready;
+    out["result_proof_ready"] = !rows.empty();
+    out["functional_proof"] = request_proof_ready;
+    out["proof_ready"] = request_proof_ready;
+    out["proof_pending"] = status.running && !request_proof_ready;
+    out["accepted_pending"] = status.running && !request_proof_ready;
+    out["terminal_no_request_evidence"] = status.job_id != 0 && !status.running && !request_proof_ready;
+    out["proof_requirement"] = "request_sent_or_result_row";
+    out["status"] = status_to_json(status);
     if (!rows.empty())
     {
         const auto& first = rows.front();

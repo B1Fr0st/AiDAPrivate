@@ -60,6 +60,7 @@ static constexpr uint32_t RING_TOTAL_SIZE = sizeof(pg_ring_header_t) +
 static constexpr uint32_t PAYLOAD_PREVIEW_MAX = 128;
 static constexpr uint32_t REMOTE_CALL_DEFAULT_TIMEOUT_MS = 5000;
 static constexpr uint32_t REMOTE_CALL_MAX_TIMEOUT_MS = 30000;
+static constexpr size_t INSTALL_QUARANTINE_MAX_ACTIVE = 8;
 static inline std::atomic<std::uint64_t> g_driver_remote_call_sequence{1};
 
 
@@ -136,6 +137,20 @@ struct remote_call_diag_snapshot_t {
     bool lower_worker_exception = false;
     bool lower_worker_creation_failed = false;
     bool lower_late_completion = false;
+    bool allow_zero_result = false;
+    bool zero_result_rejected = false;
+    bool caller_abandoned = false;
+    bool removed_from_queue = false;
+    bool popped_from_queue = false;
+    bool execution_started = false;
+    bool executing_abandoned = false;
+    bool seh_exception = false;
+    uint32_t seh_exception_code = 0;
+    uint64_t seh_exception_address = 0;
+    uint64_t seh_fault_address = 0;
+    uint64_t seh_rip = 0;
+    uint64_t seh_rsp = 0;
+    uint64_t seh_rbp = 0;
 };
 
 static thread_local remote_call_diag_snapshot_t g_last_driver_remote_call_diag{};
@@ -485,15 +500,30 @@ static inline uint64_t driver_remote_call_impl(uint32_t pid,
     call_diag.lower_cancelled = lower_diag.cancelled;
     call_diag.lower_deadline_expired = lower_diag.deadline_expired;
     call_diag.lower_uninterruptible =
-        !lower_diag.completed &&
-        (lower_diag.completion_reason == "cancelled" || lower_diag.completion_reason == "deadline");
+        lower_diag.executing_abandoned ||
+        (!lower_diag.completed &&
+         (lower_diag.completion_reason == "cancelled" || lower_diag.completion_reason == "deadline"));
     call_diag.lower_lock_timeout = lower_diag.lower_lock_timeout;
     call_diag.lower_worker_exception = lower_diag.worker_exception;
     call_diag.lower_worker_creation_failed = lower_diag.worker_creation_failed;
     call_diag.lower_late_completion = lower_diag.late_completion;
+    call_diag.allow_zero_result = lower_diag.allow_zero_result;
+    call_diag.zero_result_rejected = lower_diag.zero_result_rejected;
+    call_diag.caller_abandoned = lower_diag.caller_abandoned;
+    call_diag.removed_from_queue = lower_diag.removed_from_queue;
+    call_diag.popped_from_queue = lower_diag.popped_from_queue;
+    call_diag.execution_started = lower_diag.execution_started;
+    call_diag.executing_abandoned = lower_diag.executing_abandoned;
+    call_diag.seh_exception = lower_diag.seh_exception;
+    call_diag.seh_exception_code = lower_diag.seh_exception_code;
+    call_diag.seh_exception_address = lower_diag.seh_exception_address;
+    call_diag.seh_fault_address = lower_diag.seh_fault_address;
+    call_diag.seh_rip = lower_diag.seh_rip;
+    call_diag.seh_rsp = lower_diag.seh_rsp;
+    call_diag.seh_rbp = lower_diag.seh_rbp;
     g_last_driver_remote_call_diag = call_diag;
     diag::log_tagged_fmt("pg_sniff",
-        "driver_remote_call_done call_id=%llu label=%s tool=%s diag_id=%s pid=%u active_pid=%u active_after=%u method=driver_bridge::call_function fn=0x%llX result=0x%llX ok=%d execution_completed=%d result_nonzero=%d gle=%lu status=%s last_error=%s cancelled=%d timeout_ms=%u deadline_ms=%llu deadline_expired_after=%d stale_pid=%d late_completion=%d lower_uninterruptible=%d lower_phase=%s lower_reason=%s lower_completed=%d lower_ok=%d lower_gle=%lu lower_worker_tid=%lu lower_worker_alive=%u lower_queue_depth_submit=%u lower_queue_depth_start=%u lower_queue_depth_after_pop=%u lower_inflight_submit=%u lower_inflight_start=%u lower_inflight_after=%u lower_queue_wait_ms=%llu lower_elapsed_ms=%llu lower_deadline_remaining_queue_ms=%llu lower_deadline_remaining_start_ms=%llu lower_deadline_remaining_finish_ms=%llu lower_worker_exception=%d lower_worker_creation_failed=%d lower_error_value=%d lower_error_category=%s lower_error_message=%s elapsed_ms=%llu",
+        "driver_remote_call_done call_id=%llu label=%s tool=%s diag_id=%s pid=%u active_pid=%u active_after=%u method=driver_bridge::call_function fn=0x%llX result=0x%llX ok=%d execution_completed=%d result_nonzero=%d gle=%lu status=%s last_error=%s cancelled=%d timeout_ms=%u deadline_ms=%llu deadline_expired_after=%d stale_pid=%d late_completion=%d lower_uninterruptible=%d lower_phase=%s lower_reason=%s lower_completed=%d lower_ok=%d lower_gle=%lu lower_worker_tid=%lu lower_worker_alive=%u lower_queue_depth_submit=%u lower_queue_depth_start=%u lower_queue_depth_after_pop=%u lower_inflight_submit=%u lower_inflight_start=%u lower_inflight_after=%u lower_queue_wait_ms=%llu lower_elapsed_ms=%llu lower_deadline_remaining_queue_ms=%llu lower_deadline_remaining_start_ms=%llu lower_deadline_remaining_finish_ms=%llu lower_worker_exception=%d lower_worker_creation_failed=%d zero_result_rejected=%d removed_from_queue=%d popped=%d execution_started=%d executing_abandoned=%d seh_exception=%d seh_code=0x%08lX lower_error_value=%d lower_error_category=%s lower_error_message=%s elapsed_ms=%llu",
         static_cast<unsigned long long>(call_id),
         label ? label : "",
         driver_bridge::current_remote_call_tool_name(),
@@ -536,6 +566,13 @@ static inline uint64_t driver_remote_call_impl(uint32_t pid,
         static_cast<unsigned long long>(call_diag.lower_deadline_remaining_at_finish_ms),
         call_diag.lower_worker_exception ? 1 : 0,
         call_diag.lower_worker_creation_failed ? 1 : 0,
+        call_diag.zero_result_rejected ? 1 : 0,
+        call_diag.removed_from_queue ? 1 : 0,
+        call_diag.popped_from_queue ? 1 : 0,
+        call_diag.execution_started ? 1 : 0,
+        call_diag.executing_abandoned ? 1 : 0,
+        call_diag.seh_exception ? 1 : 0,
+        static_cast<unsigned long>(call_diag.seh_exception_code),
         call_diag.lower_worker_error_value,
         call_diag.lower_worker_error_category.c_str(),
         call_diag.lower_worker_error_message.c_str(),
@@ -1188,6 +1225,24 @@ class pg_engine_t {
         }
     };
 
+    struct install_quarantine_t {
+        uint64_t quarantine_id = 0;
+        uint64_t call_id = 0;
+        uint64_t shellcode_addr = 0;
+        uint64_t ring_addr = 0;
+        uint64_t context_addr = 0;
+        uint64_t rtl_add_fn = 0;
+        uint64_t rtl_remove_fn = 0;
+        uint64_t veh_result = 0;
+        uint64_t install_generation = 0;
+        uint64_t created_ms = 0;
+        uint32_t pid = 0;
+        uint32_t active_pid = 0;
+        uint32_t remote_gle = 0;
+        bool active = false;
+        bool reserved = false;
+    };
+
 public:
     pg_engine_t() = default;
     ~pg_engine_t() {
@@ -1301,6 +1356,51 @@ public:
                 static_cast<unsigned long long>(target_addr),
                 static_cast<unsigned long long>(region_size));
             return fail_install("invalid_args", "pid, address, and size must be nonzero", nullptr, 0, 0, 0);
+        }
+        install_quarantine_t active_quarantine{};
+        if (find_active_quarantine(pid, active_quarantine)) {
+            diag::log_tagged_fmt("pg_sniff",
+                "install_failed reason=lower_executor_busy_or_quarantined pid=%u active_pid=%u quarantine_id=%llu reserved=%d call_id=%llu sc=0x%llX ring=0x%llX context=0x%llX rtl_add=0x%llX rtl_remove=0x%llX veh_result=0x%llX remote_gle=%lu install_generation=%llu quarantine_age_ms=%llu",
+                pid,
+                active_quarantine.active_pid,
+                static_cast<unsigned long long>(active_quarantine.quarantine_id),
+                active_quarantine.reserved ? 1 : 0,
+                static_cast<unsigned long long>(active_quarantine.call_id),
+                static_cast<unsigned long long>(active_quarantine.shellcode_addr),
+                static_cast<unsigned long long>(active_quarantine.ring_addr),
+                static_cast<unsigned long long>(active_quarantine.context_addr),
+                static_cast<unsigned long long>(active_quarantine.rtl_add_fn),
+                static_cast<unsigned long long>(active_quarantine.rtl_remove_fn),
+                static_cast<unsigned long long>(active_quarantine.veh_result),
+                static_cast<unsigned long>(active_quarantine.remote_gle),
+                static_cast<unsigned long long>(active_quarantine.install_generation),
+                static_cast<unsigned long long>(GetTickCount64() >= active_quarantine.created_ms ? GetTickCount64() - active_quarantine.created_ms : 0));
+            record_install_failure("lower_executor_busy_or_quarantined",
+                                   "page-guard install blocked by retained uncertain lower remote-call transaction",
+                                   pid,
+                                   requested_addr,
+                                   requested_size,
+                                   0,
+                                   0,
+                                   nullptr,
+                                   0,
+                                   ERROR_BUSY);
+            {
+                std::lock_guard<std::mutex> lk(failure_mutex_);
+                last_install_failure_.quarantined = 1;
+                last_install_failure_.quarantine_id = active_quarantine.quarantine_id;
+                last_install_failure_.remote_call_id = active_quarantine.call_id;
+                last_install_failure_.shellcode_addr = active_quarantine.shellcode_addr;
+                last_install_failure_.ring_addr = active_quarantine.ring_addr;
+                last_install_failure_.context_addr = active_quarantine.context_addr;
+                last_install_failure_.rtl_add_veh = active_quarantine.rtl_add_fn;
+                last_install_failure_.rtl_remove_veh = active_quarantine.rtl_remove_fn;
+                last_install_failure_.veh_result = active_quarantine.veh_result;
+                last_install_failure_.remote_call_gle = active_quarantine.remote_gle;
+                last_install_failure_.install_generation = active_quarantine.install_generation;
+            }
+            SetLastError(ERROR_BUSY);
+            return 0;
         }
 
         active_pid_scope_t active;
@@ -1790,6 +1890,30 @@ public:
                 static_cast<unsigned long long>(GetTickCount64() - install_start));
             return fail_install(reason, "page-guard install cancelled before VEH registration", &mri, target_addr, region_size, 0);
         }
+        const uint64_t quarantine_reservation_id = reserve_install_quarantine_slot(pid,
+                                                                                   driver_bridge::attached_pid(),
+                                                                                   install_generation,
+                                                                                   install_start);
+        if (quarantine_reservation_id == 0) {
+            const bool cleanup_sc_ok = driver_bridge::free_memory_for(pid, sc_addr);
+            const std::string cleanup_sc_error = cleanup_sc_ok ? std::string() : driver_bridge::last_error();
+            const bool cleanup_ring_ok = driver_bridge::free_memory_for(pid, ring_addr);
+            const std::string cleanup_ring_error = cleanup_ring_ok ? std::string() : driver_bridge::last_error();
+            diag::log_tagged_fmt("pg_sniff",
+                "install_failed reason=lower_executor_quarantine_capacity pid=%u active_pid=%u sc=0x%llX ring=0x%llX cleanup_sc_ok=%d cleanup_sc_error=%s cleanup_ring_ok=%d cleanup_ring_error=%s generation=%llu elapsed_ms=%llu",
+                pid,
+                driver_bridge::attached_pid(),
+                static_cast<unsigned long long>(sc_addr),
+                static_cast<unsigned long long>(ring_addr),
+                cleanup_sc_ok ? 1 : 0,
+                cleanup_sc_error.c_str(),
+                cleanup_ring_ok ? 1 : 0,
+                cleanup_ring_error.c_str(),
+                static_cast<unsigned long long>(install_generation),
+                static_cast<unsigned long long>(GetTickCount64() - install_start));
+            SetLastError(ERROR_BUSY);
+            return fail_install("lower_executor_quarantine_capacity", "page-guard install could not reserve bounded quarantine tracking before remote VEH registration", &mri, target_addr, region_size, 0);
+        }
         SetLastError(ERROR_SUCCESS);
         const uint64_t veh_expected_call_id = g_driver_remote_call_sequence.load(std::memory_order_acquire);
         diag::log_tagged_fmt("pg_sniff",
@@ -1813,7 +1937,7 @@ public:
         const std::string veh_call_status = driver_bridge::status();
         const std::string veh_call_last_error = driver_bridge::last_error();
         diag::log_tagged_fmt("pg_sniff",
-            "veh_register_remote_call_result call_id=%llu expected_call_id=%llu pid=%u active_pid_entry=%u active_pid_after=%u function=RtlAddVectoredExceptionHandler va=0x%llX handler=0x%llX result=0x%llX ok=%d completed=%d gle=%lu timeout_ms=%u deadline_ms=%llu deadline_remaining_ms=%llu cancelled_before=%d cancelled_after=%d deadline_expired_before=%d deadline_expired_after=%d stale_pid=%d late_completion=%d lower_phase=%s lower_reason=%s lower_completed=%d lower_ok=%d lower_gle=%lu lower_worker_tid=%lu lower_worker_alive=%u lower_queue_depth_submit=%u lower_queue_depth_after_pop=%u lower_inflight_after=%u lower_queue_wait_ms=%llu lower_elapsed_ms=%llu lower_deadline_remaining_finish_ms=%llu lower_worker_exception=%d lower_worker_creation_failed=%d lower_error_value=%d lower_error_category=%s lower_error_message=%s remote_elapsed_ms=%llu measured_elapsed_ms=%llu generation=%llu current_generation=%llu status=%s last_error=%s",
+            "veh_register_remote_call_result call_id=%llu expected_call_id=%llu pid=%u active_pid_entry=%u active_pid_after=%u function=RtlAddVectoredExceptionHandler va=0x%llX handler=0x%llX result=0x%llX ok=%d completed=%d gle=%lu timeout_ms=%u deadline_ms=%llu deadline_remaining_ms=%llu cancelled_before=%d cancelled_after=%d deadline_expired_before=%d deadline_expired_after=%d stale_pid=%d late_completion=%d lower_phase=%s lower_reason=%s lower_completed=%d lower_ok=%d lower_gle=%lu lower_worker_tid=%lu lower_worker_alive=%u lower_queue_depth_submit=%u lower_queue_depth_after_pop=%u lower_inflight_after=%u lower_queue_wait_ms=%llu lower_elapsed_ms=%llu lower_deadline_remaining_finish_ms=%llu lower_worker_exception=%d lower_worker_creation_failed=%d zero_result_rejected=%d removed_from_queue=%d popped=%d execution_started=%d executing_abandoned=%d seh_exception=%d seh_code=0x%08lX seh_addr=0x%llX seh_fault=0x%llX seh_rip=0x%llX lower_error_value=%d lower_error_category=%s lower_error_message=%s remote_elapsed_ms=%llu measured_elapsed_ms=%llu generation=%llu current_generation=%llu status=%s last_error=%s",
             static_cast<unsigned long long>(veh_remote_diag.call_id),
             static_cast<unsigned long long>(veh_expected_call_id),
             pid,
@@ -1849,6 +1973,16 @@ public:
             static_cast<unsigned long long>(veh_remote_diag.lower_deadline_remaining_at_finish_ms),
             veh_remote_diag.lower_worker_exception ? 1 : 0,
             veh_remote_diag.lower_worker_creation_failed ? 1 : 0,
+            veh_remote_diag.zero_result_rejected ? 1 : 0,
+            veh_remote_diag.removed_from_queue ? 1 : 0,
+            veh_remote_diag.popped_from_queue ? 1 : 0,
+            veh_remote_diag.execution_started ? 1 : 0,
+            veh_remote_diag.executing_abandoned ? 1 : 0,
+            veh_remote_diag.seh_exception ? 1 : 0,
+            static_cast<unsigned long>(veh_remote_diag.seh_exception_code),
+            static_cast<unsigned long long>(veh_remote_diag.seh_exception_address),
+            static_cast<unsigned long long>(veh_remote_diag.seh_fault_address),
+            static_cast<unsigned long long>(veh_remote_diag.seh_rip),
             veh_remote_diag.lower_worker_error_value,
             veh_remote_diag.lower_worker_error_category.c_str(),
             veh_remote_diag.lower_worker_error_message.c_str(),
@@ -1868,10 +2002,122 @@ public:
         const bool veh_ring_after_ok = driver_bridge::query_memory_for(pid, ring_addr, veh_ring_after);
         const std::string veh_ring_after_error = veh_ring_after_ok ? std::string() : driver_bridge::last_error();
         if (veh_handle == 0) {
-            const bool cleanup_sc_ok = driver_bridge::free_memory_for(pid, sc_addr);
-            const std::string cleanup_sc_error = cleanup_sc_ok ? std::string() : driver_bridge::last_error();
-            const bool cleanup_ring_ok = driver_bridge::free_memory_for(pid, ring_addr);
-            const std::string cleanup_ring_error = cleanup_ring_ok ? std::string() : driver_bridge::last_error();
+            const bool lower_started = veh_remote_diag.executing_abandoned ||
+                                       veh_remote_diag.execution_started;
+            const bool lower_uncertain = lower_started &&
+                (veh_remote_diag.executing_abandoned ||
+                 veh_remote_diag.lower_uninterruptible ||
+                 veh_remote_diag.lower_worker_exception ||
+                 veh_remote_diag.seh_exception ||
+                 veh_remote_diag.lower_late_completion ||
+                 veh_remote_diag.late_completion ||
+                 veh_remote_diag.cancelled_after ||
+                 veh_remote_diag.deadline_expired_after ||
+                 veh_remote_diag.stale_pid ||
+                 veh_remote_diag.lower_cancelled ||
+                 veh_remote_diag.lower_deadline_expired ||
+                 veh_remote_diag.lower_stale_generation ||
+                 !veh_remote_diag.lower_completed);
+            const bool known_late_handle = veh_remote_diag.result != 0 &&
+                                           veh_remote_diag.lower_completed &&
+                                           !veh_remote_diag.seh_exception;
+            bool cleanup_veh_remove_attempted = false;
+            bool cleanup_veh_remove_ok = false;
+            bool cleanup_sc_ok = false;
+            bool cleanup_ring_ok = false;
+            bool retained_sc = false;
+            bool retained_ring = false;
+            uint64_t cleanup_removed = 0;
+            uint64_t quarantine_id = 0;
+            const char* cleanup_decision = "definite_no_handler_free";
+            std::string cleanup_sc_error;
+            std::string cleanup_ring_error;
+            if (lower_uncertain) {
+                cleanup_decision = known_late_handle ? "known_late_handle_remove_then_free" : "retain_uncertain_handler_resources";
+                if (known_late_handle && driver_bridge::attached_pid() == pid) {
+                    cleanup_veh_remove_attempted = true;
+                    cleanup_removed = remove_vectored_exception_handler_remote(pid,
+                                                                               ntdll_mod_install.base,
+                                                                               rtl_remove_fn,
+                                                                               veh_remote_diag.result,
+                                                                               "install_uncertain_veh_register_cleanup",
+                                                                               install_start);
+                    cleanup_veh_remove_ok = cleanup_removed != 0;
+                    if (cleanup_veh_remove_ok) {
+                        cleanup_sc_ok = driver_bridge::free_memory_for(pid, sc_addr);
+                        cleanup_sc_error = cleanup_sc_ok ? std::string() : driver_bridge::last_error();
+                        cleanup_ring_ok = driver_bridge::free_memory_for(pid, ring_addr);
+                        cleanup_ring_error = cleanup_ring_ok ? std::string() : driver_bridge::last_error();
+                        retained_sc = !cleanup_sc_ok;
+                        retained_ring = !cleanup_ring_ok;
+                    } else {
+                        cleanup_sc_error = "veh_remove_failed";
+                        cleanup_ring_error = "veh_remove_failed";
+                        retained_sc = true;
+                        retained_ring = true;
+                    }
+                } else {
+                    cleanup_sc_error = "retained_uncertain_remote_handler";
+                    cleanup_ring_error = "retained_uncertain_remote_handler";
+                    retained_sc = true;
+                    retained_ring = true;
+                }
+                if (retained_sc || retained_ring) {
+                    quarantine_id = add_install_quarantine(quarantine_reservation_id,
+                                                           pid,
+                                                           driver_bridge::attached_pid(),
+                                                           veh_remote_diag.call_id,
+                                                           sc_addr,
+                                                           ring_addr,
+                                                           veh_context_addr,
+                                                           rtl_add_fn,
+                                                           rtl_remove_fn,
+                                                           veh_remote_diag.result,
+                                                           veh_call_gle,
+                                                           install_generation);
+                } else {
+                    release_install_quarantine_reservation(quarantine_reservation_id,
+                                                           cleanup_veh_remove_attempted ? "veh_register_cleanup_completed" : "veh_register_definite_failure");
+                }
+            } else {
+                cleanup_sc_ok = driver_bridge::free_memory_for(pid, sc_addr);
+                cleanup_sc_error = cleanup_sc_ok ? std::string() : driver_bridge::last_error();
+                cleanup_ring_ok = driver_bridge::free_memory_for(pid, ring_addr);
+                cleanup_ring_error = cleanup_ring_ok ? std::string() : driver_bridge::last_error();
+                release_install_quarantine_reservation(quarantine_reservation_id, "veh_register_definite_failure");
+            }
+            diag::log_tagged_fmt("pg_sniff",
+                "veh_register_cleanup_decision pid=%u active_pid=%u call_id=%llu expected_call_id=%llu decision=%s lower_uncertain=%d lower_started=%d known_late_handle=%d known_handle=0x%llX quarantine_id=%llu retained_sc=%d retained_ring=%d remove_attempted=%d remove_ok=%d removed=0x%llX sc=0x%llX ring=0x%llX context=0x%llX zero_result_rejected=%d removed_from_queue=%d popped=%d execution_started=%d executing_abandoned=%d seh_exception=%d seh_code=0x%08lX deadline_expired_after=%d stale_pid=%d lower_phase=%s lower_reason=%s elapsed_ms=%llu",
+                pid,
+                driver_bridge::attached_pid(),
+                static_cast<unsigned long long>(veh_remote_diag.call_id),
+                static_cast<unsigned long long>(veh_expected_call_id),
+                cleanup_decision,
+                lower_uncertain ? 1 : 0,
+                lower_started ? 1 : 0,
+                known_late_handle ? 1 : 0,
+                static_cast<unsigned long long>(veh_remote_diag.result),
+                static_cast<unsigned long long>(quarantine_id),
+                retained_sc ? 1 : 0,
+                retained_ring ? 1 : 0,
+                cleanup_veh_remove_attempted ? 1 : 0,
+                cleanup_veh_remove_ok ? 1 : 0,
+                static_cast<unsigned long long>(cleanup_removed),
+                static_cast<unsigned long long>(sc_addr),
+                static_cast<unsigned long long>(ring_addr),
+                static_cast<unsigned long long>(veh_context_addr),
+                veh_remote_diag.zero_result_rejected ? 1 : 0,
+                veh_remote_diag.removed_from_queue ? 1 : 0,
+                veh_remote_diag.popped_from_queue ? 1 : 0,
+                veh_remote_diag.execution_started ? 1 : 0,
+                veh_remote_diag.executing_abandoned ? 1 : 0,
+                veh_remote_diag.seh_exception ? 1 : 0,
+                static_cast<unsigned long>(veh_remote_diag.seh_exception_code),
+                veh_remote_diag.deadline_expired_after ? 1 : 0,
+                veh_remote_diag.stale_pid ? 1 : 0,
+                veh_remote_diag.lower_phase.c_str(),
+                veh_remote_diag.lower_completion_reason.c_str(),
+                static_cast<unsigned long long>(GetTickCount64() - install_start));
             diag::log_tagged_fmt("pg_sniff",
                 "veh_register_failed pid=%u active_pid=%u caller_tid=%lu generation=%llu current_generation=%llu module=ntdll.dll ntdll_base=0x%llX ntdll_size=0x%llX function=RtlAddVectoredExceptionHandler va=0x%llX remove_va=0x%llX handler=0x%llX ring=0x%llX context=0x%llX method=driver_bridge::call_function result=0x%llX gle=%lu remote_elapsed_ms=%llu remote_status=%s remote_last_error=%s original_protect=0x%08X proposed_protect=0x%08X target_before_base=0x%llX target_before_size=0x%llX target_before_state=0x%08X target_before_protect=0x%08X target_before_type=0x%08X target_after_query=%d target_after_base=0x%llX target_after_size=0x%llX target_after_state=0x%08X target_after_protect=0x%08X target_after_type=0x%08X target_after_error=%s handler_before_query=%d handler_before_base=0x%llX handler_before_size=0x%llX handler_before_state=0x%08X handler_before_protect=0x%08X handler_before_type=0x%08X handler_after_query=%d handler_after_base=0x%llX handler_after_size=0x%llX handler_after_state=0x%08X handler_after_protect=0x%08X handler_after_type=0x%08X handler_after_error=%s ring_before_query=%d ring_before_base=0x%llX ring_before_size=0x%llX ring_before_state=0x%08X ring_before_protect=0x%08X ring_before_type=0x%08X ring_after_query=%d ring_after_base=0x%llX ring_after_size=0x%llX ring_after_state=0x%08X ring_after_protect=0x%08X ring_after_type=0x%08X ring_after_error=%s mitigation_open=%d mitigation_open_error=%lu dyn_ok=%d dyn_error=%lu dyn_flags=0x%08lX cfg_ok=%d cfg_error=%lu cfg_flags=0x%08lX cleanup_sc_ok=%d cleanup_sc_error=%s cleanup_ring_ok=%d cleanup_ring_error=%s elapsed_ms=%llu",
                 pid,
@@ -1945,7 +2191,7 @@ public:
                 cleanup_ring_error.c_str(),
                 static_cast<unsigned long long>(GetTickCount64() - install_start));
             diag::log_tagged_fmt("pg_sniff",
-                "veh_register_failed_remote_diag call_id=%llu expected_call_id=%llu pid=%u active_pid_entry=%u active_pid_after=%u completed=%d ok=%d gle=%lu timeout_ms=%u deadline_ms=%llu deadline_remaining_ms=%llu cancelled_before=%d cancelled_after=%d deadline_expired_before=%d deadline_expired_after=%d stale_pid=%d late_completion=%d lower_phase=%s lower_reason=%s lower_completed=%d lower_ok=%d lower_gle=%lu lower_worker_tid=%lu lower_worker_alive=%u lower_queue_depth_submit=%u lower_queue_depth_after_pop=%u lower_inflight_after=%u lower_queue_wait_ms=%llu lower_elapsed_ms=%llu lower_deadline_remaining_finish_ms=%llu lower_worker_exception=%d lower_worker_creation_failed=%d lower_error_value=%d lower_error_category=%s lower_error_message=%s remote_elapsed_ms=%llu measured_elapsed_ms=%llu status=%s last_error=%s",
+                "veh_register_failed_remote_diag call_id=%llu expected_call_id=%llu pid=%u active_pid_entry=%u active_pid_after=%u completed=%d ok=%d gle=%lu timeout_ms=%u deadline_ms=%llu deadline_remaining_ms=%llu cancelled_before=%d cancelled_after=%d deadline_expired_before=%d deadline_expired_after=%d stale_pid=%d late_completion=%d lower_phase=%s lower_reason=%s lower_completed=%d lower_ok=%d lower_gle=%lu lower_worker_tid=%lu lower_worker_alive=%u lower_queue_depth_submit=%u lower_queue_depth_after_pop=%u lower_inflight_after=%u lower_queue_wait_ms=%llu lower_elapsed_ms=%llu lower_deadline_remaining_finish_ms=%llu lower_worker_exception=%d lower_worker_creation_failed=%d zero_result_rejected=%d removed_from_queue=%d popped=%d execution_started=%d executing_abandoned=%d seh_exception=%d seh_code=0x%08lX seh_addr=0x%llX seh_fault=0x%llX seh_rip=0x%llX lower_error_value=%d lower_error_category=%s lower_error_message=%s remote_elapsed_ms=%llu measured_elapsed_ms=%llu status=%s last_error=%s",
                 static_cast<unsigned long long>(veh_remote_diag.call_id),
                 static_cast<unsigned long long>(veh_expected_call_id),
                 pid,
@@ -1978,6 +2224,16 @@ public:
                 static_cast<unsigned long long>(veh_remote_diag.lower_deadline_remaining_at_finish_ms),
                 veh_remote_diag.lower_worker_exception ? 1 : 0,
                 veh_remote_diag.lower_worker_creation_failed ? 1 : 0,
+                veh_remote_diag.zero_result_rejected ? 1 : 0,
+                veh_remote_diag.removed_from_queue ? 1 : 0,
+                veh_remote_diag.popped_from_queue ? 1 : 0,
+                veh_remote_diag.execution_started ? 1 : 0,
+                veh_remote_diag.executing_abandoned ? 1 : 0,
+                veh_remote_diag.seh_exception ? 1 : 0,
+                static_cast<unsigned long>(veh_remote_diag.seh_exception_code),
+                static_cast<unsigned long long>(veh_remote_diag.seh_exception_address),
+                static_cast<unsigned long long>(veh_remote_diag.seh_fault_address),
+                static_cast<unsigned long long>(veh_remote_diag.seh_rip),
                 veh_remote_diag.lower_worker_error_value,
                 veh_remote_diag.lower_worker_error_category.c_str(),
                 veh_remote_diag.lower_worker_error_message.c_str(),
@@ -1985,8 +2241,8 @@ public:
                 static_cast<unsigned long long>(veh_call_elapsed),
                 veh_call_status.c_str(),
                 veh_call_last_error.c_str());
-            record_install_failure("veh_register_failed",
-                                   "remote RtlAddVectoredExceptionHandler call returned NULL",
+            record_install_failure(lower_uncertain ? "veh_register_quarantined" : "veh_register_failed",
+                                   lower_uncertain ? "remote RtlAddVectoredExceptionHandler result is uncertain; page-guard resources quarantined or removed only after proven handle cleanup" : "remote RtlAddVectoredExceptionHandler call returned NULL",
                                    pid,
                                    requested_addr,
                                    requested_size,
@@ -2000,11 +2256,11 @@ public:
                                               sc_addr,
                                               veh_context_addr,
                                               ntdll_mod_install.base,
-                                              ntdll_mod_install.size,
-                                              rtl_add_fn,
-                                              rtl_remove_fn,
-                                              veh_handle,
-                                              veh_call_gle,
+                                               ntdll_mod_install.size,
+                                               rtl_add_fn,
+                                               rtl_remove_fn,
+                                               known_late_handle ? veh_remote_diag.result : veh_handle,
+                                               veh_call_gle,
                                               veh_call_elapsed,
                                               orig_protect,
                                               proposed_guard_protect,
@@ -2015,11 +2271,30 @@ public:
                                               install_stop_generation_.load(std::memory_order_acquire),
                                               veh_mitigation,
                                               veh_remote_diag,
-                                              veh_call_status,
-                                              veh_call_last_error);
+                                               veh_call_status,
+                                               veh_call_last_error);
+            if (lower_uncertain || quarantine_id != 0 || cleanup_veh_remove_attempted) {
+                std::lock_guard<std::mutex> lk(failure_mutex_);
+                last_install_failure_.quarantined = (quarantine_id != 0 || retained_sc || retained_ring) ? 1u : 0u;
+                last_install_failure_.quarantine_id = quarantine_id;
+                last_install_failure_.quarantine_cleanup_attempted = cleanup_veh_remove_attempted || cleanup_sc_ok || cleanup_ring_ok ? 1u : 0u;
+                last_install_failure_.quarantine_veh_remove_attempted = cleanup_veh_remove_attempted ? 1u : 0u;
+                last_install_failure_.quarantine_veh_remove_ok = cleanup_veh_remove_ok ? 1u : 0u;
+                last_install_failure_.quarantine_retained_shellcode = retained_sc ? 1u : 0u;
+                last_install_failure_.quarantine_retained_ring = retained_ring ? 1u : 0u;
+                if (!last_install_failure_.detail.empty())
+                    last_install_failure_.detail += " ";
+                last_install_failure_.detail += std::string("cleanup_decision=") + cleanup_decision +
+                    " quarantine_id=" + std::to_string(quarantine_id) +
+                    " retained_sc=" + std::to_string(retained_sc ? 1 : 0) +
+                    " retained_ring=" + std::to_string(retained_ring ? 1 : 0) +
+                    " veh_remove_attempted=" + std::to_string(cleanup_veh_remove_attempted ? 1 : 0) +
+                    " veh_remove_ok=" + std::to_string(cleanup_veh_remove_ok ? 1 : 0);
+            }
             SetLastError(veh_call_gle);
             return 0;
         }
+        release_install_quarantine_reservation(quarantine_reservation_id, "veh_register_success");
         if (const char* reason = check_install_cancelled("after_veh_register")) {
             uint64_t removed = remove_vectored_exception_handler_remote(pid,
                                                                          ntdll_mod_install.base,
@@ -2766,6 +3041,21 @@ public:
         uint32_t remote_call_lower_worker_exception = 0;
         uint32_t remote_call_lower_worker_creation_failed = 0;
         uint32_t remote_call_lower_late_completion = 0;
+        uint32_t remote_call_allow_zero_result = 0;
+        uint32_t remote_call_zero_result_rejected = 0;
+        uint32_t remote_call_caller_abandoned = 0;
+        uint32_t remote_call_removed_from_queue = 0;
+        uint32_t remote_call_popped_from_queue = 0;
+        uint32_t remote_call_execution_started = 0;
+        uint32_t remote_call_executing_abandoned = 0;
+        uint32_t remote_call_seh_exception = 0;
+        uint32_t remote_call_seh_exception_code = 0;
+        uint32_t quarantined = 0;
+        uint32_t quarantine_cleanup_attempted = 0;
+        uint32_t quarantine_veh_remove_attempted = 0;
+        uint32_t quarantine_veh_remove_ok = 0;
+        uint32_t quarantine_retained_shellcode = 0;
+        uint32_t quarantine_retained_ring = 0;
         uint32_t region_state = 0;
         uint32_t region_protect = 0;
         uint32_t region_type = 0;
@@ -2809,6 +3099,12 @@ public:
         uint64_t remote_call_lower_deadline_remaining_at_queue_ms = 0;
         uint64_t remote_call_lower_deadline_remaining_at_start_ms = 0;
         uint64_t remote_call_lower_deadline_remaining_at_finish_ms = 0;
+        uint64_t remote_call_seh_exception_address = 0;
+        uint64_t remote_call_seh_fault_address = 0;
+        uint64_t remote_call_seh_rip = 0;
+        uint64_t remote_call_seh_rsp = 0;
+        uint64_t remote_call_seh_rbp = 0;
+        uint64_t quarantine_id = 0;
         uint64_t install_elapsed_ms = 0;
         uint64_t install_generation = 0;
         uint64_t current_generation = 0;
@@ -2856,7 +3152,211 @@ public:
 
 private:
     std::vector<std::shared_ptr<pg_session_t>> retired_sessions_;
+    mutable std::mutex quarantine_mutex_;
+    std::vector<install_quarantine_t> quarantines_;
+    std::atomic<std::uint64_t> quarantine_sequence_{1};
     std::atomic<std::uint64_t> install_stop_generation_{0};
+
+    void prune_install_quarantines(const char* phase) {
+        std::vector<install_quarantine_t> retired;
+        const ULONGLONG now = GetTickCount64();
+        {
+            std::lock_guard<std::mutex> lk(quarantine_mutex_);
+            auto it = quarantines_.begin();
+            while (it != quarantines_.end()) {
+                bool retire = !it->active;
+                uint32_t exit_code = 0;
+                if (!retire && !it->reserved && it->pid != 0 && !active_pid_scope_t::pid_alive(it->pid, &exit_code))
+                    retire = true;
+                if (retire) {
+                    retired.push_back(*it);
+                    it = quarantines_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        for (const auto& quarantine : retired) {
+            diag::log_tagged_fmt("pg_sniff",
+                "install_quarantine_retired phase=%s pid=%u active_pid=%u quarantine_id=%llu call_id=%llu reserved=%d sc=0x%llX ring=0x%llX context=0x%llX rtl_add=0x%llX rtl_remove=0x%llX veh_result=0x%llX remote_gle=%lu age_ms=%llu",
+                phase ? phase : "",
+                quarantine.pid,
+                quarantine.active_pid,
+                static_cast<unsigned long long>(quarantine.quarantine_id),
+                static_cast<unsigned long long>(quarantine.call_id),
+                quarantine.reserved ? 1 : 0,
+                static_cast<unsigned long long>(quarantine.shellcode_addr),
+                static_cast<unsigned long long>(quarantine.ring_addr),
+                static_cast<unsigned long long>(quarantine.context_addr),
+                static_cast<unsigned long long>(quarantine.rtl_add_fn),
+                static_cast<unsigned long long>(quarantine.rtl_remove_fn),
+                static_cast<unsigned long long>(quarantine.veh_result),
+                static_cast<unsigned long>(quarantine.remote_gle),
+                static_cast<unsigned long long>(now >= quarantine.created_ms ? now - quarantine.created_ms : 0));
+        }
+    }
+
+    bool find_active_quarantine(uint32_t pid, install_quarantine_t& out) {
+        prune_install_quarantines("find_active");
+        std::lock_guard<std::mutex> lk(quarantine_mutex_);
+        for (const auto& quarantine : quarantines_) {
+            if (quarantine.active && quarantine.pid == pid) {
+                out = quarantine;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    uint64_t reserve_install_quarantine_slot(uint32_t pid,
+                                             uint32_t active_pid,
+                                             uint64_t install_generation,
+                                             ULONGLONG install_start) {
+        prune_install_quarantines("reserve");
+        install_quarantine_t reservation{};
+        size_t active_count = 0;
+        {
+            std::lock_guard<std::mutex> lk(quarantine_mutex_);
+            for (const auto& quarantine : quarantines_) {
+                if (!quarantine.active)
+                    continue;
+                ++active_count;
+                if (quarantine.pid == pid) {
+                    diag::log_tagged_fmt("pg_sniff",
+                        "install_quarantine_reserve_blocked reason=pid_already_quarantined pid=%u active_pid=%u existing_quarantine_id=%llu existing_reserved=%d active_count=%zu max_active=%zu generation=%llu elapsed_ms=%llu",
+                        pid,
+                        active_pid,
+                        static_cast<unsigned long long>(quarantine.quarantine_id),
+                        quarantine.reserved ? 1 : 0,
+                        active_count,
+                        INSTALL_QUARANTINE_MAX_ACTIVE,
+                        static_cast<unsigned long long>(install_generation),
+                        static_cast<unsigned long long>(GetTickCount64() - install_start));
+                    return 0;
+                }
+            }
+            if (active_count >= INSTALL_QUARANTINE_MAX_ACTIVE) {
+                diag::log_tagged_fmt("pg_sniff",
+                    "install_quarantine_reserve_blocked reason=capacity pid=%u active_pid=%u active_count=%zu max_active=%zu generation=%llu elapsed_ms=%llu",
+                    pid,
+                    active_pid,
+                    active_count,
+                    INSTALL_QUARANTINE_MAX_ACTIVE,
+                    static_cast<unsigned long long>(install_generation),
+                    static_cast<unsigned long long>(GetTickCount64() - install_start));
+                return 0;
+            }
+            reservation.quarantine_id = quarantine_sequence_.fetch_add(1, std::memory_order_acq_rel);
+            reservation.install_generation = install_generation;
+            reservation.created_ms = GetTickCount64();
+            reservation.pid = pid;
+            reservation.active_pid = active_pid;
+            reservation.active = true;
+            reservation.reserved = true;
+            quarantines_.push_back(reservation);
+        }
+        diag::log_tagged_fmt("pg_sniff",
+            "install_quarantine_reserved pid=%u active_pid=%u quarantine_id=%llu active_count=%zu max_active=%zu generation=%llu elapsed_ms=%llu",
+            pid,
+            active_pid,
+            static_cast<unsigned long long>(reservation.quarantine_id),
+            active_count + 1,
+            INSTALL_QUARANTINE_MAX_ACTIVE,
+            static_cast<unsigned long long>(install_generation),
+            static_cast<unsigned long long>(GetTickCount64() - install_start));
+        return reservation.quarantine_id;
+    }
+
+    void release_install_quarantine_reservation(uint64_t quarantine_id, const char* reason) {
+        if (quarantine_id == 0)
+            return;
+        install_quarantine_t released{};
+        bool found = false;
+        {
+            std::lock_guard<std::mutex> lk(quarantine_mutex_);
+            auto it = std::find_if(quarantines_.begin(), quarantines_.end(), [&](const install_quarantine_t& quarantine) {
+                return quarantine.quarantine_id == quarantine_id && quarantine.reserved;
+            });
+            if (it != quarantines_.end()) {
+                released = *it;
+                quarantines_.erase(it);
+                found = true;
+            }
+        }
+        diag::log_tagged_fmt("pg_sniff",
+            "install_quarantine_reservation_release quarantine_id=%llu found=%d reason=%s pid=%u active_pid=%u generation=%llu age_ms=%llu",
+            static_cast<unsigned long long>(quarantine_id),
+            found ? 1 : 0,
+            reason ? reason : "",
+            released.pid,
+            released.active_pid,
+            static_cast<unsigned long long>(released.install_generation),
+            static_cast<unsigned long long>(found && GetTickCount64() >= released.created_ms ? GetTickCount64() - released.created_ms : 0));
+    }
+
+    uint64_t add_install_quarantine(uint64_t reservation_id,
+                                    uint32_t pid,
+                                    uint32_t active_pid,
+                                    uint64_t call_id,
+                                    uint64_t shellcode_addr,
+                                    uint64_t ring_addr,
+                                    uint64_t context_addr,
+                                    uint64_t rtl_add_fn,
+                                    uint64_t rtl_remove_fn,
+                                    uint64_t veh_result,
+                                    uint32_t remote_gle,
+                                    uint64_t install_generation) {
+        prune_install_quarantines("commit");
+        install_quarantine_t committed{};
+        bool used_reservation = false;
+        {
+            std::lock_guard<std::mutex> lk(quarantine_mutex_);
+            auto it = std::find_if(quarantines_.begin(), quarantines_.end(), [&](const install_quarantine_t& quarantine) {
+                return quarantine.quarantine_id == reservation_id && quarantine.reserved;
+            });
+            if (it != quarantines_.end()) {
+                committed = *it;
+                used_reservation = true;
+            } else {
+                committed.quarantine_id = quarantine_sequence_.fetch_add(1, std::memory_order_acq_rel);
+                committed.created_ms = GetTickCount64();
+            }
+            committed.call_id = call_id;
+            committed.shellcode_addr = shellcode_addr;
+            committed.ring_addr = ring_addr;
+            committed.context_addr = context_addr;
+            committed.rtl_add_fn = rtl_add_fn;
+            committed.rtl_remove_fn = rtl_remove_fn;
+            committed.veh_result = veh_result;
+            committed.install_generation = install_generation;
+            committed.pid = pid;
+            committed.active_pid = active_pid;
+            committed.remote_gle = remote_gle;
+            committed.active = true;
+            committed.reserved = false;
+            if (used_reservation)
+                *it = committed;
+            else
+                quarantines_.push_back(committed);
+        }
+        diag::log_tagged_fmt("pg_sniff",
+            "install_quarantine_committed pid=%u active_pid=%u quarantine_id=%llu reservation_id=%llu used_reservation=%d call_id=%llu sc=0x%llX ring=0x%llX context=0x%llX rtl_add=0x%llX rtl_remove=0x%llX veh_result=0x%llX remote_gle=%lu generation=%llu",
+            pid,
+            active_pid,
+            static_cast<unsigned long long>(committed.quarantine_id),
+            static_cast<unsigned long long>(reservation_id),
+            used_reservation ? 1 : 0,
+            static_cast<unsigned long long>(call_id),
+            static_cast<unsigned long long>(shellcode_addr),
+            static_cast<unsigned long long>(ring_addr),
+            static_cast<unsigned long long>(context_addr),
+            static_cast<unsigned long long>(rtl_add_fn),
+            static_cast<unsigned long long>(rtl_remove_fn),
+            static_cast<unsigned long long>(veh_result),
+            static_cast<unsigned long>(remote_gle),
+            static_cast<unsigned long long>(install_generation));
+        return committed.quarantine_id;
+    }
 
     void clear_install_failure(uint32_t pid, uint64_t requested_addr, uint64_t requested_size) {
         std::lock_guard<std::mutex> lk(failure_mutex_);
@@ -2987,6 +3487,15 @@ private:
         last_install_failure_.remote_call_lower_worker_exception = remote_diag.lower_worker_exception ? 1u : 0u;
         last_install_failure_.remote_call_lower_worker_creation_failed = remote_diag.lower_worker_creation_failed ? 1u : 0u;
         last_install_failure_.remote_call_lower_late_completion = remote_diag.lower_late_completion ? 1u : 0u;
+        last_install_failure_.remote_call_allow_zero_result = remote_diag.allow_zero_result ? 1u : 0u;
+        last_install_failure_.remote_call_zero_result_rejected = remote_diag.zero_result_rejected ? 1u : 0u;
+        last_install_failure_.remote_call_caller_abandoned = remote_diag.caller_abandoned ? 1u : 0u;
+        last_install_failure_.remote_call_removed_from_queue = remote_diag.removed_from_queue ? 1u : 0u;
+        last_install_failure_.remote_call_popped_from_queue = remote_diag.popped_from_queue ? 1u : 0u;
+        last_install_failure_.remote_call_execution_started = remote_diag.execution_started ? 1u : 0u;
+        last_install_failure_.remote_call_executing_abandoned = remote_diag.executing_abandoned ? 1u : 0u;
+        last_install_failure_.remote_call_seh_exception = remote_diag.seh_exception ? 1u : 0u;
+        last_install_failure_.remote_call_seh_exception_code = remote_diag.seh_exception_code;
         last_install_failure_.remote_call_lower_generation_at_entry = remote_diag.lower_generation_at_entry;
         last_install_failure_.remote_call_lower_generation_after = remote_diag.lower_generation_after;
         last_install_failure_.remote_call_lower_queue_wait_ms = remote_diag.lower_queue_wait_ms;
@@ -2994,6 +3503,11 @@ private:
         last_install_failure_.remote_call_lower_deadline_remaining_at_queue_ms = remote_diag.lower_deadline_remaining_at_queue_ms;
         last_install_failure_.remote_call_lower_deadline_remaining_at_start_ms = remote_diag.lower_deadline_remaining_at_start_ms;
         last_install_failure_.remote_call_lower_deadline_remaining_at_finish_ms = remote_diag.lower_deadline_remaining_at_finish_ms;
+        last_install_failure_.remote_call_seh_exception_address = remote_diag.seh_exception_address;
+        last_install_failure_.remote_call_seh_fault_address = remote_diag.seh_fault_address;
+        last_install_failure_.remote_call_seh_rip = remote_diag.seh_rip;
+        last_install_failure_.remote_call_seh_rsp = remote_diag.seh_rsp;
+        last_install_failure_.remote_call_seh_rbp = remote_diag.seh_rbp;
         std::string lower_summary = "lower_phase=" + remote_diag.lower_phase +
             " lower_reason=" + remote_diag.lower_completion_reason +
             " lower_gle=" + std::to_string(remote_diag.lower_gle) +
@@ -3003,7 +3517,14 @@ private:
             " lower_inflight_after=" + std::to_string(remote_diag.lower_inflight_after) +
             " lower_queue_wait_ms=" + std::to_string(remote_diag.lower_queue_wait_ms) +
             " lower_elapsed_ms=" + std::to_string(remote_diag.lower_elapsed_ms) +
-            " lower_worker_creation_failed=" + std::to_string(remote_diag.lower_worker_creation_failed ? 1 : 0);
+            " lower_worker_creation_failed=" + std::to_string(remote_diag.lower_worker_creation_failed ? 1 : 0) +
+            " zero_result_rejected=" + std::to_string(remote_diag.zero_result_rejected ? 1 : 0) +
+            " removed_from_queue=" + std::to_string(remote_diag.removed_from_queue ? 1 : 0) +
+            " popped=" + std::to_string(remote_diag.popped_from_queue ? 1 : 0) +
+            " execution_started=" + std::to_string(remote_diag.execution_started ? 1 : 0) +
+            " executing_abandoned=" + std::to_string(remote_diag.executing_abandoned ? 1 : 0) +
+            " seh_exception=" + std::to_string(remote_diag.seh_exception ? 1 : 0) +
+            " seh_code=" + std::to_string(remote_diag.seh_exception_code);
         if (!remote_diag.lower_worker_error_message.empty())
             lower_summary += " lower_worker_error=" + remote_diag.lower_worker_error_message;
         if (!last_install_failure_.detail.empty())

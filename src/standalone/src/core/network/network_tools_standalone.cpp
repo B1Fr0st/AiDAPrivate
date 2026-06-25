@@ -484,6 +484,27 @@ static json pre_encrypt_status_payload(std::uint32_t pid = 0) {
     return r;
 }
 
+static void add_pre_encrypt_truth_fields(json& r, const char* operation) {
+    const std::uint64_t capture_count = r.value("capture_count", 0ull);
+    const std::uint64_t hook_count = r.value("hook_count", 0ull);
+    const bool active = r.value("active", false);
+    if (operation && *operation)
+        r["operation"] = operation;
+    else if (!r.contains("operation"))
+        r["operation"] = "";
+    r["status_contract"] = true;
+    r["functional_proof"] = false;
+    r["capture_evidence_observed"] = capture_count > 0;
+    r["functional_capture_required"] = true;
+    r["functional_capture_requirement"] = "sidecar_marker_capture";
+    r["sidecar_marker_capture_required"] = true;
+    r["sidecar_marker_capture_verified"] = false;
+    r["nonfunctional_status"] = capture_count == 0;
+    r["status_kind"] = active ? "active" : "inactive";
+    r["proof_state"] = capture_count > 0 ? "capture_observed_marker_unverified" :
+        (hook_count > 0 ? "hook_installed_waiting_for_sidecar_marker_capture" : "inactive_no_capture");
+}
+
 static void add_page_guard_prerequisites(json& r, const char* backend) {
     r["backend"] = backend && *backend ? backend : "whoswho_driver_page_guard";
     r["fail_closed"] = true;
@@ -3425,6 +3446,18 @@ tool_result_t api_monitor_start(const json& params)
         apis.push_back(std::move(request));
     }
 
+    json requested_apis = json::array();
+    for (const auto& api : apis) {
+        json item;
+        item["original"] = api.original;
+        item["module"] = api.module_name;
+        item["function"] = api.function_name;
+        item["kind"] = api_monitor::kind_name(api.kind);
+        item["buffer_reg"] = api.buffer_reg;
+        item["size_reg"] = api.size_reg;
+        requested_apis.push_back(std::move(item));
+    }
+
     uint32_t pid = 0;
     if (params.contains("pid")) {
         if (params["pid"].is_number_unsigned()) {
@@ -3459,6 +3492,20 @@ tool_result_t api_monitor_start(const json& params)
             summary = json::object();
         summary["success"] = false;
         summary["error"] = error;
+        summary["requested_pid"] = pid;
+        summary["requested_api_count"] = static_cast<uint64_t>(apis.size());
+        summary["requested_apis"] = requested_apis;
+        summary["requested_log_callstack"] = log_callstack;
+        summary["requested_capture_buffer"] = capture_buffer;
+        summary["requested_max_capture_bytes"] = max_capture_bytes;
+        summary["requested_max_events"] = static_cast<uint64_t>(max_events);
+        summary["install_result"] = "failed";
+        summary["hook_install_success"] = false;
+        summary["resolved_count"] = summary.contains("resolved") && summary["resolved"].is_array()
+            ? static_cast<uint64_t>(summary["resolved"].size()) : 0ull;
+        if (summary.contains("resolved"))
+            summary["hook_targets"] = summary["resolved"];
+        summary["trigger_attempts_required"] = true;
         summary["handler_elapsed_ms"] = handler_elapsed_ms;
         if (summary.contains("failed_phase") && !summary.contains("phase"))
             summary["phase"] = summary["failed_phase"];
@@ -3473,6 +3520,28 @@ tool_result_t api_monitor_start(const json& params)
 
     const int resolved_count = summary.contains("resolved") && summary["resolved"].is_array()
         ? static_cast<int>(summary["resolved"].size()) : 0;
+    const json status_after_start = api_monitor::status_json();
+    summary["success"] = true;
+    summary["requested_pid"] = pid;
+    summary["requested_api_count"] = static_cast<uint64_t>(apis.size());
+    summary["requested_apis"] = requested_apis;
+    summary["requested_log_callstack"] = log_callstack;
+    summary["requested_capture_buffer"] = capture_buffer;
+    summary["requested_max_capture_bytes"] = max_capture_bytes;
+    summary["requested_max_events"] = static_cast<uint64_t>(max_events);
+    summary["install_result"] = "started";
+    summary["hook_install_success"] = resolved_count > 0;
+    summary["hook_target_count"] = resolved_count;
+    summary["resolved_count"] = resolved_count;
+    if (summary.contains("resolved"))
+        summary["hook_targets"] = summary["resolved"];
+    summary["event_queue_count"] = status_after_start.value("event_count", 0);
+    summary["total_hits"] = status_after_start.value("total_hits", 0ull);
+    summary["trigger_attempts_required"] = true;
+    summary["functional_proof"] = false;
+    summary["functional_proof_requirement"] = "api_call_stimulus_event";
+    summary["status_after_start"] = status_after_start;
+    summary["handler_elapsed_ms"] = GetTickCount64() - handler_start_ms;
     diag::log_tagged_fmt("net_tools", "api_monitor_start active resolved=%d", resolved_count);
     return tool_result_t::ok(OBFSTR("API monitor started with ") + std::to_string(resolved_count) + OBFSTR(" resolved API target(s)"), summary);
 }
@@ -3489,13 +3558,81 @@ tool_result_t api_monitor_results(const json& params)
     diag::log_tagged_fmt("net_tools", "api_monitor_results limit=%zu filter=%s clear=%d stop=%d",
         limit, filter_api.c_str(), clear_after ? 1 : 0, stop_after ? 1 : 0);
 
+    const json status_before = api_monitor::status_json();
+    const std::uint64_t event_queue_count_before = status_before.value("event_count", 0ull);
+    const std::uint64_t total_hits_before = status_before.value("total_hits", 0ull);
     json result = api_monitor::results(limit, filter_api, clear_after, stop_after);
     const int count = result.value("count", 0);
+    const json status_after = result.contains("status") && result["status"].is_object()
+        ? result["status"]
+        : api_monitor::status_json();
+    const std::uint64_t event_queue_count_after = status_after.value("event_count", 0ull);
+    const std::uint64_t total_hits_after = status_after.value("total_hits", total_hits_before);
+    const std::uint64_t armed_after = status_after.value("armed_thread_breakpoints", 0ull);
+    const std::uint64_t target_count_after = status_after.value("target_count", 0ull);
+    const bool active_after = status_after.value("active", false);
+    const bool polling_after = status_after.value("polling", false);
+    const bool debug_attached_after = status_after.value("debug_attached", false);
+    const bool debug_loop_after = status_after.value("debug_loop_running", false);
+    result["status_before_read"] = status_before;
+    result["status_after_read"] = status_after;
+    result["requested_limit"] = static_cast<uint64_t>(limit);
+    result["filter_api"] = filter_api;
+    result["clear_requested"] = clear_after;
+    result["stop_requested"] = stop_after;
+    result["read_requested"] = true;
+    result["event_queue_count_before"] = event_queue_count_before;
+    result["event_queue_count_after"] = event_queue_count_after;
+    result["events_returned"] = count;
+    result["read_count"] = count;
+    result["total_hits_before"] = total_hits_before;
+    result["total_hits_after"] = total_hits_after;
+    result["armed_thread_breakpoints"] = armed_after;
+    result["target_count"] = target_count_after;
+    result["active"] = active_after;
+    result["polling"] = polling_after;
+    result["debug_attached"] = debug_attached_after;
+    result["debug_loop_running"] = debug_loop_after;
+    result["functional_proof"] = count > 0;
+    result["functional_proof_requirement"] = "api_call_stimulus_event";
     if (count == 0) {
-        diag::log_tagged_fmt("net_tools", "api_monitor_results empty stop=%d clear=%d", stop_after ? 1 : 0, clear_after ? 1 : 0);
+        std::string zero_reason;
+        if (target_count_after == 0)
+            zero_reason = "monitor_not_armed_or_stopped";
+        else if (armed_after == 0)
+            zero_reason = "no_thread_hardware_breakpoints_armed";
+        else if (!active_after || !polling_after || !debug_loop_after)
+            zero_reason = "monitor_inactive_before_matching_stimulus";
+        else if (!filter_api.empty() && total_hits_after > 0)
+            zero_reason = "filter_matched_no_events";
+        else
+            zero_reason = "monitor_armed_no_matching_api_stimulus_observed";
+        result["zero_event_reason"] = zero_reason;
+        result["zero_event_precise_failure"] = !stop_after;
+        result["setup_failure"] = target_count_after == 0 || armed_after == 0 || !active_after || !polling_after || !debug_loop_after;
+        result["stimulus_failure"] = !result["setup_failure"].get<bool>();
+        result["read_flags"] = {
+            {"clear", clear_after},
+            {"stop", stop_after},
+            {"filter_api", filter_api}
+        };
+        diag::log_tagged_fmt("net_tools", "api_monitor_results empty stop=%d clear=%d reason=%s queue_before=%llu queue_after=%llu targets=%llu armed=%llu active=%d polling=%d debug_attached=%d debug_loop=%d hits_before=%llu hits_after=%llu",
+            stop_after ? 1 : 0,
+            clear_after ? 1 : 0,
+            zero_reason.c_str(),
+            static_cast<unsigned long long>(event_queue_count_before),
+            static_cast<unsigned long long>(event_queue_count_after),
+            static_cast<unsigned long long>(target_count_after),
+            static_cast<unsigned long long>(armed_after),
+            active_after ? 1 : 0,
+            polling_after ? 1 : 0,
+            debug_attached_after ? 1 : 0,
+            debug_loop_after ? 1 : 0,
+            static_cast<unsigned long long>(total_hits_before),
+            static_cast<unsigned long long>(total_hits_after));
         if (stop_after)
             return tool_result_t::ok(OBFSTR("API monitor stopped with no captured events."), result);
-        return tool_result_t::error(OBFSTR("No API monitor events captured."), result);
+        return tool_result_t::error(OBFSTR("No API monitor events captured after setup/stimulus check."), result);
     }
     return tool_result_t::ok(std::to_string(count) + OBFSTR(" API monitor event(s)"), result);
 }
@@ -4528,18 +4665,20 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                     r["operation"] = "auto_hook";
                     r["requested_pid"] = pid;
                     r["hooked"] = false;
+                    add_pre_encrypt_truth_fields(r, "auto_hook");
                     return tool_result_t::error("Failed to auto-hook encryption functions in PID " + std::to_string(pid), r);
                 }
                 const bool started_polling = pre_encrypt_hook::start_polling();
                 if (!started_polling) {
                     DWORD err = pre_encrypt_hook::g_state.debugger_error.load();
-                json r = pre_encrypt_status_payload(pid);
-                r["operation"] = "auto_hook";
-                r["requested_pid"] = pid;
-                r["started_polling"] = false;
-                r["hooked"] = false;
-                r["start_error"] = static_cast<unsigned long>(err);
-                pre_encrypt_hook::unhook_all();
+                    json r = pre_encrypt_status_payload(pid);
+                    r["operation"] = "auto_hook";
+                    r["requested_pid"] = pid;
+                    r["started_polling"] = false;
+                    r["hooked"] = false;
+                    r["start_error"] = static_cast<unsigned long>(err);
+                    add_pre_encrypt_truth_fields(r, "auto_hook");
+                    pre_encrypt_hook::unhook_all();
                     return tool_result_t::error("Failed to start authorized debug capture for PID " + std::to_string(pid) +
                                                 ", error=" + std::to_string(static_cast<unsigned long>(err)), r);
                 }
@@ -4549,6 +4688,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 r["started_polling"] = started_polling;
                 r["hooked"] = r.value("hook_count", 0) > 0;
                 r["hooks_installed"] = r["hook_count"];
+                add_pre_encrypt_truth_fields(r, "auto_hook");
                 diag::log_tagged_fmt("net_tools", "network_pre_encrypt_hook auto_hook hooks=%d armed=%u captures=%d",
                     r.value("hook_count", 0),
                     r.value("armed_thread_count", 0u),
@@ -4583,7 +4723,15 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 uint32_t buf_reg = args.value("buffer_reg", static_cast<uint32_t>(1));
                 uint32_t sz_reg = args.value("size_reg", static_cast<uint32_t>(2));
                 if (!pre_encrypt_hook::hook_address(addr, name, buf_reg, sz_reg))
-                    return tool_result_t::error("Failed to hook address " + addr_str);
+                {
+                    json r = pid == 0 ? pre_encrypt_status_payload() : pre_encrypt_status_payload(pid);
+                    r["operation"] = "hook_address";
+                    r["address"] = hex_u64(addr);
+                    r["name"] = name;
+                    r["hooked"] = false;
+                    add_pre_encrypt_truth_fields(r, "hook_address");
+                    return tool_result_t::error("Failed to hook address " + addr_str, r);
+                }
                 const bool started_polling = pre_encrypt_hook::start_polling();
                 if (!started_polling) {
                     DWORD err = pre_encrypt_hook::g_state.debugger_error.load();
@@ -4594,6 +4742,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                     r["started_polling"] = false;
                     r["hooked"] = false;
                     r["start_error"] = static_cast<unsigned long>(err);
+                    add_pre_encrypt_truth_fields(r, "hook_address");
                     pre_encrypt_hook::unhook_all();
                     return tool_result_t::error("Failed to start authorized debug capture for address " + addr_str +
                                                 ", error=" + std::to_string(static_cast<unsigned long>(err)), r);
@@ -4609,6 +4758,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 r["started_polling"] = started_polling;
                 if (found)
                     r["hook"] = std::move(hook);
+                add_pre_encrypt_truth_fields(r, "hook_address");
                 return tool_result_t::ok("Hooked " + name + " at " + addr_str, r);
             }
             if (op == "unhook_all") {
@@ -4621,6 +4771,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 r["hook_count_before"] = before.value("hook_count", 0);
                 r["capture_count_before"] = before.value("capture_count", 0);
                 r["hooked"] = false;
+                add_pre_encrypt_truth_fields(r, "unhook_all");
                 return tool_result_t::ok("All pre-encryption hooks removed", r);
             }
             if (op == "get_captures") {
@@ -4661,6 +4812,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 r["max_count"] = static_cast<uint64_t>(max_count);
                 r["captures"] = std::move(arr);
                 r["drained"] = false;
+                add_pre_encrypt_truth_fields(r, "get_captures");
                 return tool_result_t::ok(r);
             }
             if (op == "clear") {
@@ -4670,12 +4822,14 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 r["cleared_count"] = cleared;
                 r["clear_count"] = cleared;
                 r["hooked"] = r.value("hook_count", 0) > 0;
+                add_pre_encrypt_truth_fields(r, "clear");
                 return tool_result_t::ok("Pre-encryption captures cleared", r);
             }
             if (op == "status") {
                 json r = pre_encrypt_status_payload();
                 r["operation"] = "status";
                 r["hooked"] = r.value("hook_count", 0) > 0;
+                add_pre_encrypt_truth_fields(r, "status");
                 return tool_result_t::ok(pre_encrypt_hook::is_active() ? "Active" : "Inactive", r);
             }
             return tool_result_t::error("Unknown operation '" + op + "'. Use auto_hook|hook_address|unhook_all|get_captures|clear|status");

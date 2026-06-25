@@ -34,6 +34,28 @@ namespace test_all_features {
 
 namespace {
 
+    std::atomic<int> g_xref_live_after_warm_stage{0};
+
+    const char* xref_live_after_warm_stage_name(int value) {
+        switch (value) {
+        case 1: return "select_module_begin";
+        case 2: return "select_module_done";
+        case 3: return "validate_module";
+        case 4: return "construct_range";
+        case 5: return "watchdog_start";
+        case 6: return "before_warm_range";
+        case 7: return "inside_warm_range";
+        case 8: return "after_warm_range";
+        case 9: return "before_bounded_live_range";
+        case 10: return "inside_bounded_live_range";
+        case 11: return "after_bounded_live_range";
+        case 12: return "materialize_result";
+        case 13: return "finished";
+        case 14: return "exception";
+        default: return "entry";
+        }
+    }
+
     void format_timestamp(char* out, std::size_t cap) {
         SYSTEMTIME st; GetLocalTime(&st);
         std::snprintf(out, cap, "%04u-%02u-%02u %02u:%02u:%02u.%03u",
@@ -1986,7 +2008,44 @@ namespace {
     void test_xref_live_after_warm_range(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         (void)skipped;
         const char* tag = "xref.live_after_warm";
-        remote_module_lookup_t module = select_live_xref_module();
+        auto t0 = std::chrono::steady_clock::now();
+        g_xref_live_after_warm_stage.store(1, std::memory_order_release);
+        log_msg(hf, tag, "SELECT_MODULE_BEGIN -- attached_pid=%u status=\"%s\" last_error=\"%s\" elapsed_us=%lld",
+            driver_bridge::attached_pid(),
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str(),
+            elapsed_us_since(t0));
+        remote_module_lookup_t module{};
+        try {
+            module = select_live_xref_module();
+        } catch (const std::exception& ex) {
+            g_xref_live_after_warm_stage.store(14, std::memory_order_release);
+            log_msg(hf, tag, "OUTPUT -- ok=0 error=\"select_module_exception\" type=\"%s\" what=\"%s\" stage=%s elapsed_us=%lld",
+                "std::exception",
+                ex.what(),
+                xref_live_after_warm_stage_name(g_xref_live_after_warm_stage.load(std::memory_order_acquire)),
+                elapsed_us_since(t0));
+            failed.fetch_add(1);
+            return;
+        } catch (...) {
+            g_xref_live_after_warm_stage.store(14, std::memory_order_release);
+            log_msg(hf, tag, "OUTPUT -- ok=0 error=\"select_module_exception_unknown\" stage=%s elapsed_us=%lld",
+                xref_live_after_warm_stage_name(g_xref_live_after_warm_stage.load(std::memory_order_acquire)),
+                elapsed_us_since(t0));
+            failed.fetch_add(1);
+            return;
+        }
+        g_xref_live_after_warm_stage.store(2, std::memory_order_release);
+        log_msg(hf, tag, "SELECT_MODULE_END -- pid=%u module=\"%s\" module_base=0x%016llX module_size=0x%08X module_count=%zu status=\"%s\" last_error=\"%s\" elapsed_us=%lld",
+            module.pid,
+            module.name.empty() ? "<unknown>" : module.name.c_str(),
+            (unsigned long long)module.base,
+            module.size,
+            module.module_count,
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str(),
+            elapsed_us_since(t0));
+        g_xref_live_after_warm_stage.store(3, std::memory_order_release);
         if (module.pid == 0) {
             log_msg(hf, tag, "OUTPUT -- ok=0 error=\"no_attached_pid\" pid=0 module_count=%zu", module.module_count);
             log_msg(hf, tag, "FAIL -- no_attached_pid; live xref proof requires a verified target");
@@ -2007,28 +2066,47 @@ namespace {
             failed.fetch_add(1);
             return;
         }
-        auto t0 = std::chrono::steady_clock::now();
+        g_xref_live_after_warm_stage.store(4, std::memory_order_release);
         const uint64_t max_span = 0x100000ull;
         const uint64_t span = std::min<uint64_t>(module.size, max_span);
         const uint64_t range_lo = module.base;
         const uint64_t range_hi = module.base + span;
+        log_msg(hf, tag, "RANGE_CONSTRUCTED -- pid=%u module=\"%s\" module_base=0x%016llX module_size=0x%08X span=0x%016llX range=[0x%016llX,0x%016llX) overflow=%d elapsed_us=%lld",
+            module.pid,
+            module.name.empty() ? "<unknown>" : module.name.c_str(),
+            (unsigned long long)module.base,
+            module.size,
+            (unsigned long long)span,
+            (unsigned long long)range_lo,
+            (unsigned long long)range_hi,
+            range_hi <= range_lo ? 1 : 0,
+            elapsed_us_since(t0));
+        if (range_hi <= range_lo) {
+            log_msg(hf, tag, "OUTPUT -- ok=0 error=\"range_overflow\" pid=%u module=\"%s\" module_base=0x%016llX span=0x%016llX elapsed_us=%lld",
+                module.pid,
+                module.name.empty() ? "<unknown>" : module.name.c_str(),
+                (unsigned long long)module.base,
+                (unsigned long long)span,
+                elapsed_us_since(t0));
+            failed.fetch_add(1);
+            return;
+        }
         constexpr uint32_t proof_timeout_ms = 2500;
         constexpr uint32_t watchdog_timeout_ms = 4000;
         std::atomic<bool> finished{ false };
         std::atomic<bool> hung_logged{ false };
         std::atomic<int> stage{ 0 };
-        auto stage_name = [](int value) -> const char* {
-            switch (value) {
-            case 1: return "before_warm_range";
-            case 2: return "inside_warm_range";
-            case 3: return "after_warm_range";
-            case 4: return "inside_bounded_live_range";
-            case 5: return "after_bounded_live_range";
-            case 6: return "finished";
-            default: return "selected_input";
-            }
+        auto set_stage = [&](int value) {
+            stage.store(value, std::memory_order_release);
+            g_xref_live_after_warm_stage.store(value, std::memory_order_release);
         };
-        std::thread watchdog([&, t0]() {
+        auto stage_name = [](int value) -> const char* {
+            return xref_live_after_warm_stage_name(value);
+        };
+        set_stage(5);
+        std::thread watchdog;
+        try {
+            watchdog = std::thread([&, t0]() {
             const auto deadline = t0 + std::chrono::milliseconds(watchdog_timeout_ms);
             while (!finished.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline)
                 std::this_thread::sleep_for(std::chrono::milliseconds(25));
@@ -2059,9 +2137,28 @@ namespace {
                     watchdog_timeout_ms,
                     elapsed_us_since(t0));
             }
-        });
+            });
+        } catch (const std::exception& ex) {
+            g_xref_live_after_warm_stage.store(14, std::memory_order_release);
+            log_msg(hf, tag, "OUTPUT -- ok=0 error=\"watchdog_start_exception\" type=\"%s\" what=\"%s\" pid=%u module=\"%s\" elapsed_us=%lld",
+                "std::exception",
+                ex.what(),
+                module.pid,
+                module.name.empty() ? "<unknown>" : module.name.c_str(),
+                elapsed_us_since(t0));
+            failed.fetch_add(1);
+            return;
+        } catch (...) {
+            g_xref_live_after_warm_stage.store(14, std::memory_order_release);
+            log_msg(hf, tag, "OUTPUT -- ok=0 error=\"watchdog_start_exception_unknown\" pid=%u module=\"%s\" elapsed_us=%lld",
+                module.pid,
+                module.name.empty() ? "<unknown>" : module.name.c_str(),
+                elapsed_us_since(t0));
+            failed.fetch_add(1);
+            return;
+        }
         auto finish_watchdog = [&]() {
-            stage.store(6, std::memory_order_release);
+            set_stage(13);
             finished.store(true, std::memory_order_release);
             if (watchdog.joinable())
                 watchdog.join();
@@ -2079,7 +2176,7 @@ namespace {
             watchdog_timeout_ms);
         bool counted = false;
         try {
-            stage.store(1, std::memory_order_release);
+            set_stage(6);
             log_msg(hf, tag, "WARM_RANGE_BEGIN -- pid=%u module=\"%s\" range=[0x%016llX,0x%016llX) elapsed_us=%lld",
                 module.pid,
                 module.name.empty() ? "<unknown>" : module.name.c_str(),
@@ -2095,10 +2192,10 @@ namespace {
                 (unsigned long long)range_lo,
                 (unsigned long long)range_hi,
                 elapsed_us_since(t0));
-            stage.store(2, std::memory_order_release);
+            set_stage(7);
             const auto warm_started = std::chrono::steady_clock::now();
             xref_index::warm_range(range_lo, range_hi);
-            stage.store(3, std::memory_order_release);
+            set_stage(8);
             log_msg(hf, tag, "WARM_RANGE_END -- pid=%u module=\"%s\" elapsed_us=%lld outer_elapsed_us=%lld",
                 module.pid,
                 module.name.empty() ? "<unknown>" : module.name.c_str(),
@@ -2110,6 +2207,7 @@ namespace {
                 module.name.empty() ? "<unknown>" : module.name.c_str(),
                 elapsed_us_since(warm_started),
                 elapsed_us_since(t0));
+            set_stage(9);
             log_msg(hf, tag, "BOUNDED_LIVE_RANGE_BEGIN -- pid=%u module=\"%s\" range=[0x%016llX,0x%016llX) timeout_ms=%u elapsed_us=%lld",
                 module.pid,
                 module.name.empty() ? "<unknown>" : module.name.c_str(),
@@ -2125,10 +2223,10 @@ namespace {
                 (unsigned long long)range_hi,
                 proof_timeout_ms,
                 elapsed_us_since(t0));
-            stage.store(4, std::memory_order_release);
+            set_stage(10);
             const auto proof_started = std::chrono::steady_clock::now();
             xref_index::bounded_live_range_result_t proof = xref_index::build_bounded_live_range(range_lo, range_hi, proof_timeout_ms);
-            stage.store(5, std::memory_order_release);
+            set_stage(11);
             const bool proof_source_in_range = proof.proof_source >= proof.clipped_lo && proof.proof_source < proof.clipped_hi;
             const long long proof_elapsed_us = elapsed_us_since(proof_started);
             log_msg(hf, tag, "BOUNDED_LIVE_RANGE_END -- ok=%d error=\"%s\" pid=%u module=\"%s\" timeout_ms=%u proof_elapsed_us=%lld result_elapsed_us=%llu outer_elapsed_us=%lld",
@@ -2150,6 +2248,7 @@ namespace {
                 proof_elapsed_us,
                 (unsigned long long)proof.elapsed_us,
                 elapsed_us_since(t0));
+            set_stage(12);
             log_msg(hf, tag, "OUTPUT -- ok=%d error=\"%s\" hung_logged=%d pid=%u module=\"%s\" module_base=0x%016llX module_size=0x%08X requested=[0x%016llX,0x%016llX) clipped=[0x%016llX,0x%016llX) pages_read=%zu pages_failed=%zu bytes_read=%zu targets=%zu xrefs=%zu proof_target=0x%016llX proof_source=0x%016llX proof_source_in_range=%d proof_label=\"%s\" state_before=%s(%u) state_after=%s(%u) table_before=%d table_after=%d rebuild_before=%d rebuild_after=%d elapsed_us=%llu proof_call_elapsed_us=%lld outer_elapsed_us=%lld",
                 proof.ok ? 1 : 0,
                 proof.error.empty() ? "<none>" : proof.error.c_str(),
@@ -2213,7 +2312,29 @@ namespace {
                 failed.fetch_add(1);
                 counted = true;
             }
+        } catch (const std::exception& ex) {
+            g_xref_live_after_warm_stage.store(14, std::memory_order_release);
+            log_msg(hf, tag, "OUTPUT -- ok=0 error=\"exception\" type=\"%s\" what=\"%s\" stage=%s pid=%u module=\"%s\" module_base=0x%016llX range=[0x%016llX,0x%016llX) elapsed_us=%lld",
+                "std::exception",
+                ex.what(),
+                stage_name(stage.load(std::memory_order_acquire)),
+                module.pid,
+                module.name.empty() ? "<unknown>" : module.name.c_str(),
+                (unsigned long long)module.base,
+                (unsigned long long)range_lo,
+                (unsigned long long)range_hi,
+                elapsed_us_since(t0));
+            log_msg(hf, tag, "FAIL -- exception during bounded live xref proof stage=%s type=\"%s\" what=\"%s\" pid=%u module=\"%s\" elapsed_us=%lld",
+                stage_name(stage.load(std::memory_order_acquire)),
+                "std::exception",
+                ex.what(),
+                module.pid,
+                module.name.empty() ? "<unknown>" : module.name.c_str(),
+                elapsed_us_since(t0));
+            failed.fetch_add(1);
+            counted = true;
         } catch (...) {
+            g_xref_live_after_warm_stage.store(14, std::memory_order_release);
             log_msg(hf, tag, "OUTPUT -- ok=0 error=\"exception\" stage=%s pid=%u module=\"%s\" elapsed_us=%lld",
                 stage_name(stage.load(std::memory_order_acquire)),
                 module.pid,
@@ -3768,8 +3889,22 @@ void phase_disasm_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& f
             tests[i].fn(hf, passed, failed, skipped);
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
+            const DWORD code = GetExceptionCode();
+            if (std::strcmp(tests[i].name, "xref_live_after_warm_range") == 0) {
+                const int xref_stage = g_xref_live_after_warm_stage.load(std::memory_order_acquire);
+                log_msg(hf, "disasm_phase", "SEH-DETAIL -- %s stage=%s(%d) exception=0x%08X",
+                    tests[i].name,
+                    xref_live_after_warm_stage_name(xref_stage),
+                    xref_stage,
+                    code);
+                diag::log_tagged_critical_fmt("testlab",
+                    "xref_live_after_warm_seh stage=%s stage_id=%d exception=0x%08lX",
+                    xref_live_after_warm_stage_name(xref_stage),
+                    xref_stage,
+                    static_cast<unsigned long>(code));
+            }
             log_msg(hf, "disasm_phase", "FAIL -- %s threw SEH exception 0x%08X",
-                tests[i].name, GetExceptionCode());
+                tests[i].name, code);
             failed.fetch_add(1);
         }
         auto test_ms = std::chrono::duration_cast<std::chrono::milliseconds>(

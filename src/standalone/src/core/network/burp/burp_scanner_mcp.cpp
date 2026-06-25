@@ -482,12 +482,33 @@ void attach_scanner_evidence_fields(json& data,
                                     size_t reported_issues,
                                     const active_scanner::scanner_load_t& load)
 {
+    const bool functional_probe_evidence = reported_issues > 0 || st.responses_received > 0;
+    const bool worker_activity = st.active_workers > 0 || st.queued_workers > 0 ||
+        st.in_flight_requests > 0 || load.active_workers > 0 ||
+        load.queue_depth > 0 || load.in_flight_requests > 0;
+    const bool completed_all_known = st.total_probes > 0 && st.completed_probes >= st.total_probes;
+    const bool terminal_state = !st.running && !st.cancel_requested &&
+        (st.ended_ms != 0 || st.drained || completed_all_known ||
+         st.transport_circuit_breaker_open || st.transport_failures > 0 || st.no_response_count > 0);
+    const bool terminal_without_probe_evidence = terminal_state && !functional_probe_evidence;
     data["status_source"] = "active_scanner::get_status";
     data["stored_issue_count"] = stored_issues;
     data["runtime_issue_count"] = st.issues_found;
     data["reported_issue_count"] = reported_issues;
-    data["proof_ready"] = reported_issues > 0 || st.responses_received > 0;
-    data["proof_pending"] = st.running && st.completed_probes < st.total_probes;
+    data["functional_probe_evidence"] = functional_probe_evidence;
+    data["proof_ready"] = functional_probe_evidence;
+    data["proof_pending"] = !functional_probe_evidence && !terminal_without_probe_evidence &&
+        (st.running || worker_activity || (st.total_probes > 0 && st.completed_probes < st.total_probes));
+    data["accepted_pending"] = data["proof_pending"];
+    data["terminal_transport_failure"] = terminal_without_probe_evidence &&
+        (st.transport_failures > 0 || st.no_response_count > 0 ||
+         st.transport_circuit_breaker_open || !st.last_transport_error.empty());
+    data["terminal_no_probe_evidence"] = terminal_without_probe_evidence;
+    data["terminal_without_functional_proof"] = terminal_without_probe_evidence;
+    data["worker_active"] = worker_activity;
+    data["load_active_workers"] = load.active_workers;
+    data["load_queue_depth"] = load.queue_depth;
+    data["load_in_flight_requests"] = load.in_flight_requests;
     data["probe_evidence_state"] = probe_evidence_state(st, reported_issues);
     data["load_snapshot"] = load_snapshot_json(load);
 }
@@ -594,6 +615,12 @@ tool_result_t tool_start_audit(const json& p)
         data["status_source"] = "active_scanner::enqueue_target";
         data["engine_acceptance"] = "enqueue_rejected";
         data["proof_pending"] = false;
+        data["proof_ready"] = false;
+        data["accepted_pending"] = false;
+        data["functional_probe_evidence"] = false;
+        data["terminal_transport_failure"] = false;
+        data["terminal_no_probe_evidence"] = true;
+        data["terminal_without_functional_proof"] = true;
         data["load_snapshot_before"] = load_snapshot_json(before);
         data["load_snapshot_after"] = load_snapshot_json(after);
         diag::log_tagged_fmt("mcp_burp", "tool_start_audit enqueue_failed err=%s code=%s req_len=%zu active_audits=%zu running_audits=%zu queue_depth=%zu in_flight=%zu elapsed_ms=%llu tid=%lu",
@@ -617,8 +644,22 @@ tool_result_t tool_start_audit(const json& p)
     data["in_flight_requests"] = after.in_flight_requests;
     data["status_source"] = "active_scanner::enqueue_target";
     data["engine_acceptance"] = "audit_id_allocated";
+    data["accepted_pending"] = true;
     data["proof_pending"] = true;
     data["proof_ready"] = false;
+    data["functional_probe_evidence"] = false;
+    data["terminal_transport_failure"] = false;
+    data["terminal_no_probe_evidence"] = false;
+    data["terminal_without_functional_proof"] = false;
+    data["completed_probes"] = 0;
+    data["total_probes"] = 0;
+    data["responses_received"] = 0;
+    data["issues_found"] = 0;
+    data["active_workers"] = after.active_workers;
+    data["queued_workers"] = after.queue_depth;
+    data["load_active_workers"] = after.active_workers;
+    data["load_queue_depth"] = after.queue_depth;
+    data["load_in_flight_requests"] = after.in_flight_requests;
     data["probe_evidence_state"] = "pending";
     data["load_snapshot_before"] = load_snapshot_json(before);
     data["load_snapshot_after"] = load_snapshot_json(after);
