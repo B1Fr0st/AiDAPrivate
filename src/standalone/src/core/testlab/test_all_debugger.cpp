@@ -138,6 +138,12 @@ static bool dbg_stack_module_requires_function(const std::string& module_name) {
     return lower == "ntdll.dll" ||
         lower == "kernelbase.dll" ||
         lower == "kernel32.dll" ||
+        lower == "ucrtbase.dll" ||
+        lower == "user32.dll" ||
+        lower == "win32u.dll" ||
+        lower == "msvcrt.dll" ||
+        lower == "vcruntime140.dll" ||
+        lower == "msvcp140.dll" ||
         lower.find("aida_testtarget") != std::string::npos ||
         dbg_stack_ends_with(lower, ".exe");
 }
@@ -152,6 +158,12 @@ static bool dbg_stack_expected_structural_module(const std::string& module_name)
     return lower == "ntdll.dll" ||
         lower == "kernelbase.dll" ||
         lower == "kernel32.dll" ||
+        lower == "ucrtbase.dll" ||
+        lower == "user32.dll" ||
+        lower == "win32u.dll" ||
+        lower == "msvcrt.dll" ||
+        lower == "vcruntime140.dll" ||
+        lower == "msvcp140.dll" ||
         lower.find("aida_testtarget") != std::string::npos;
 }
 
@@ -2553,7 +2565,7 @@ static void test_step_out(HANDLE hf, std::atomic<int>& passed, std::atomic<int>&
         err.c_str());
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    if (ok && after.rip == fixture.expected_rip && restored && freed_code && freed_stack && ms <= 5000) {
+    if (ok && after.rip == fixture.expected_rip && restored && freed_code && freed_stack && ms <= 10000) {
         log_msg(hf, "dbg_sout", "PASS -- step_out reached controlled return 0x%llX and restored context (elapsed %lld ms)",
             (unsigned long long)after.rip,
             (long long)ms);

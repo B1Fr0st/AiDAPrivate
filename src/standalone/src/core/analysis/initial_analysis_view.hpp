@@ -77,14 +77,14 @@ inline void render_modal()
 	bool pending_before_decline = st.needs_pdb_prompt.load(std::memory_order_acquire);
 	bool local_pending_before_decline = st.needs_local_pdb_prompt.load(std::memory_order_acquire);
 	const auto automation = symbol_store::pdb_automation_context();
-	if (pending_before_decline && automation.pdb_automation_active) {
+	if (pending_before_decline && automation.pdb_skip_active) {
 		initial_analysis::pdb_hint_t hint;
 		{
 			std::lock_guard<std::mutex> lk(st.pdb_hint_mtx);
 			hint = st.pdb_hint;
 		}
 		diag::log_tagged_critical_fmt("initial_analysis",
-			"pdb_modal_visible_attempt source=render_modal kind=remote prompt_pending=1 prompt_suppressed=1 decision=do_not_load_pdb pdb=%s guid=%s age=%u is_running=%d anti_tamper_full_test_running=%d full_test_env_active=%d unattended_active=%d post_suppression_active=%d post_suppression_remaining_ms=%llu pdb_automation_active=%d",
+			"pdb_modal_visible_attempt source=render_modal kind=remote prompt_pending=1 prompt_suppressed=1 decision=do_not_load_pdb pdb=%s guid=%s age=%u is_running=%d anti_tamper_full_test_running=%d full_test_env_active=%d unattended_active=%d post_suppression_active=%d post_suppression_remaining_ms=%llu pdb_automation_active=%d user_default_skip_active=%d pdb_skip_active=%d",
 			hint.pdb_name.c_str(),
 			hint.pdb_guid.c_str(),
 			static_cast<unsigned>(hint.pdb_age),
@@ -94,51 +94,61 @@ inline void render_modal()
 			automation.unattended_active ? 1 : 0,
 			automation.post_suppression_active ? 1 : 0,
 			static_cast<unsigned long long>(automation.post_suppression_remaining_ms),
-			automation.pdb_automation_active ? 1 : 0);
+			automation.pdb_automation_active ? 1 : 0,
+			automation.user_default_skip_active ? 1 : 0,
+			automation.pdb_skip_active ? 1 : 0);
 	}
-	initial_analysis::detail::auto_decline_pdb_prompts_for_full_test("render_modal");
-	bool wants_prompt = st.needs_pdb_prompt.load(std::memory_order_acquire);
-	bool local_pending_after_decline = st.needs_local_pdb_prompt.load(std::memory_order_acquire);
-
 	float& anim     = detail::modal_anim();
 	bool&  closing  = detail::modal_closing();
 	int&   open_fr  = detail::modal_open_frame();
 	bool&  pending  = detail::pending_close();
 
-	if (automation.pdb_automation_active && !wants_prompt &&
-	    (pending_before_decline || local_pending_before_decline || anim > 0.f || open_fr >= 0 || closing || pending)) {
-		initial_analysis::pdb_hint_t hint;
-		{
-			std::lock_guard<std::mutex> lk(st.pdb_hint_mtx);
-			hint = st.pdb_hint;
+	if (automation.pdb_skip_active) {
+		st.needs_pdb_prompt.store(false, std::memory_order_release);
+		st.needs_local_pdb_prompt.store(false, std::memory_order_release);
+		st.pdb_decision.store(initial_analysis::pdb_decision_t::declined, std::memory_order_release);
+		st.local_pdb_decision.store(initial_analysis::pdb_decision_t::declined, std::memory_order_release);
+		const bool log_close = pending_before_decline || local_pending_before_decline ||
+			anim > 0.f || open_fr >= 0 || closing || pending;
+		if (log_close) {
+			initial_analysis::pdb_hint_t hint;
+			{
+				std::lock_guard<std::mutex> lk(st.pdb_hint_mtx);
+				hint = st.pdb_hint;
+			}
+			diag::log_tagged_critical_fmt("initial_analysis",
+				"pdb_modal_forbidden_render_suppressed source=render_modal kind=remote remote_pending_before=%d local_pending_before=%d remote_pending_after=0 local_pending_after=0 decision=do_not_load_pdb frame=%d animation=%.3f closing=%d pending_close=%d open_frame=%d pdb=%s guid=%s age=%u is_running=%d anti_tamper_full_test_running=%d full_test_env_active=%d unattended_active=%d post_suppression_active=%d post_suppression_remaining_ms=%llu pdb_automation_active=%d user_default_skip_active=%d pdb_skip_active=%d",
+				pending_before_decline ? 1 : 0,
+				local_pending_before_decline ? 1 : 0,
+				ImGui::GetFrameCount(),
+				static_cast<double>(anim),
+				closing ? 1 : 0,
+				pending ? 1 : 0,
+				open_fr,
+				hint.pdb_name.empty() ? "<none>" : hint.pdb_name.c_str(),
+				hint.pdb_guid.empty() ? "<none>" : hint.pdb_guid.c_str(),
+				static_cast<unsigned>(hint.pdb_age),
+				automation.is_running ? 1 : 0,
+				automation.anti_tamper_full_test_running ? 1 : 0,
+				automation.full_test_env_active ? 1 : 0,
+				automation.unattended_active ? 1 : 0,
+				automation.post_suppression_active ? 1 : 0,
+				static_cast<unsigned long long>(automation.post_suppression_remaining_ms),
+				automation.pdb_automation_active ? 1 : 0,
+				automation.user_default_skip_active ? 1 : 0,
+				automation.pdb_skip_active ? 1 : 0);
 		}
-		diag::log_tagged_critical_fmt("initial_analysis",
-			"pdb_modal_forbidden_render_suppressed source=render_modal kind=remote remote_pending_before=%d local_pending_before=%d remote_pending_after=%d local_pending_after=%d decision=do_not_load_pdb frame=%d animation=%.3f closing=%d pending_close=%d open_frame=%d pdb=%s guid=%s age=%u is_running=%d anti_tamper_full_test_running=%d full_test_env_active=%d unattended_active=%d post_suppression_active=%d post_suppression_remaining_ms=%llu pdb_automation_active=%d",
-			pending_before_decline ? 1 : 0,
-			local_pending_before_decline ? 1 : 0,
-			wants_prompt ? 1 : 0,
-			local_pending_after_decline ? 1 : 0,
-			ImGui::GetFrameCount(),
-			static_cast<double>(anim),
-			closing ? 1 : 0,
-			pending ? 1 : 0,
-			open_fr,
-			hint.pdb_name.empty() ? "<none>" : hint.pdb_name.c_str(),
-			hint.pdb_guid.empty() ? "<none>" : hint.pdb_guid.c_str(),
-			static_cast<unsigned>(hint.pdb_age),
-			automation.is_running ? 1 : 0,
-			automation.anti_tamper_full_test_running ? 1 : 0,
-			automation.full_test_env_active ? 1 : 0,
-			automation.unattended_active ? 1 : 0,
-			automation.post_suppression_active ? 1 : 0,
-			static_cast<unsigned long long>(automation.post_suppression_remaining_ms),
-			automation.pdb_automation_active ? 1 : 0);
 		anim = 0.f;
 		closing = false;
 		open_fr = -1;
 		pending = false;
 		return;
 	}
+
+	initial_analysis::detail::auto_decline_pdb_prompts_for_full_test("render_modal");
+	bool wants_prompt = st.needs_pdb_prompt.load(std::memory_order_acquire);
+	bool local_pending_after_decline = st.needs_local_pdb_prompt.load(std::memory_order_acquire);
+	(void)local_pending_after_decline;
 
 	float dt = ImGui::GetIO().DeltaTime;
 	float target = (wants_prompt && !closing) ? 1.f : 0.f;
@@ -188,6 +198,28 @@ inline void render_modal()
 	ImGui::PushStyleColor(ImGuiCol_Border, aida::ui::with_alpha(th.border_strong, anim));
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10.f);
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(20, 16));
+
+	if (wants_prompt) {
+		initial_analysis::pdb_hint_t modal_hint;
+		{
+			std::lock_guard<std::mutex> lk(st.pdb_hint_mtx);
+			modal_hint = st.pdb_hint;
+		}
+		diag::log_tagged_critical_fmt("initial_analysis",
+			"pdb_modal_render kind=remote frame=%d anim=%.3f open_frame=%d wants_prompt=%d skip_active=%d pdb_automation_active=%d unattended_active=%d post_suppression_active=%d user_default_skip_active=%d pdb=%s guid=%s age=%u",
+			frame,
+			static_cast<double>(anim),
+			open_fr,
+			wants_prompt ? 1 : 0,
+			automation.pdb_skip_active ? 1 : 0,
+			automation.pdb_automation_active ? 1 : 0,
+			automation.unattended_active ? 1 : 0,
+			automation.post_suppression_active ? 1 : 0,
+			automation.user_default_skip_active ? 1 : 0,
+			modal_hint.pdb_name.empty() ? "<none>" : modal_hint.pdb_name.c_str(),
+			modal_hint.pdb_guid.empty() ? "<none>" : modal_hint.pdb_guid.c_str(),
+			static_cast<unsigned>(modal_hint.pdb_age));
+	}
 
 	ImGui::Begin("Debug information available##ia_pdb_dlg", nullptr,
 		ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
@@ -562,14 +594,14 @@ inline std::array<char, 1024>& local_pdb_typed_buf()
 inline std::string browse_for_pdb_dialog(HWND owner, const std::string& initial_name)
 {
 	const auto automation = symbol_store::pdb_automation_context();
-	if (automation.pdb_automation_active) {
+	if (automation.pdb_skip_active) {
 		const bool remote_pending_before = initial_analysis::g_state.needs_pdb_prompt.load(std::memory_order_acquire);
 		const bool local_pending_before = initial_analysis::g_state.needs_local_pdb_prompt.load(std::memory_order_acquire);
 		initial_analysis::detail::auto_decline_pdb_prompts_for_full_test("initial_analysis_view.browse_for_pdb_dialog");
 		const bool remote_pending_after = initial_analysis::g_state.needs_pdb_prompt.load(std::memory_order_acquire);
 		const bool local_pending_after = initial_analysis::g_state.needs_local_pdb_prompt.load(std::memory_order_acquire);
 		diag::log_tagged_critical_fmt("initial_analysis",
-			"pdb_native_dialog_attempt source=initial_analysis_view::browse_for_pdb title=\"Select PDB file\" suppressed=1 decision=do_not_load_pdb initial_name=%s remote_pending_before=%d local_pending_before=%d remote_pending_after=%d local_pending_after=%d is_running=%d anti_tamper_full_test_running=%d full_test_env_active=%d unattended_active=%d post_suppression_active=%d post_suppression_remaining_ms=%llu pdb_automation_active=%d",
+			"pdb_native_dialog_attempt source=initial_analysis_view::browse_for_pdb title=\"Select PDB file\" suppressed=1 decision=do_not_load_pdb initial_name=%s remote_pending_before=%d local_pending_before=%d remote_pending_after=%d local_pending_after=%d is_running=%d anti_tamper_full_test_running=%d full_test_env_active=%d unattended_active=%d post_suppression_active=%d post_suppression_remaining_ms=%llu pdb_automation_active=%d user_default_skip_active=%d pdb_skip_active=%d",
 			initial_name.empty() ? "<empty>" : initial_name.c_str(),
 			remote_pending_before ? 1 : 0,
 			local_pending_before ? 1 : 0,
@@ -581,7 +613,9 @@ inline std::string browse_for_pdb_dialog(HWND owner, const std::string& initial_
 			automation.unattended_active ? 1 : 0,
 			automation.post_suppression_active ? 1 : 0,
 			static_cast<unsigned long long>(automation.post_suppression_remaining_ms),
-			automation.pdb_automation_active ? 1 : 0);
+			automation.pdb_automation_active ? 1 : 0,
+			automation.user_default_skip_active ? 1 : 0,
+			automation.pdb_skip_active ? 1 : 0);
 		return std::string();
 	}
 	char file_buf[1024] = {};
@@ -611,7 +645,7 @@ inline void render_local_pdb_modal()
 	bool pending_before_decline = st.needs_local_pdb_prompt.load(std::memory_order_acquire);
 	bool remote_pending_before_decline = st.needs_pdb_prompt.load(std::memory_order_acquire);
 	const auto automation = symbol_store::pdb_automation_context();
-	if (pending_before_decline && automation.pdb_automation_active) {
+	if (pending_before_decline && automation.pdb_skip_active) {
 		std::string module_name;
 		std::string reason;
 		uint64_t image_base = 0;
@@ -624,7 +658,7 @@ inline void render_local_pdb_modal()
 			image_size = st.local_pdb_image_size;
 		}
 		diag::log_tagged_critical_fmt("initial_analysis",
-			"pdb_modal_visible_attempt source=render_local_pdb_modal kind=local prompt_pending=1 prompt_suppressed=1 decision=do_not_load_pdb module=%s base=0x%llX size=0x%llX reason=%s is_running=%d anti_tamper_full_test_running=%d full_test_env_active=%d unattended_active=%d post_suppression_active=%d post_suppression_remaining_ms=%llu pdb_automation_active=%d",
+			"pdb_modal_visible_attempt source=render_local_pdb_modal kind=local prompt_pending=1 prompt_suppressed=1 decision=do_not_load_pdb module=%s base=0x%llX size=0x%llX reason=%s is_running=%d anti_tamper_full_test_running=%d full_test_env_active=%d unattended_active=%d post_suppression_active=%d post_suppression_remaining_ms=%llu pdb_automation_active=%d user_default_skip_active=%d pdb_skip_active=%d",
 			module_name.empty() ? "<unknown>" : module_name.c_str(),
 			static_cast<unsigned long long>(image_base),
 			static_cast<unsigned long long>(image_size),
@@ -635,58 +669,68 @@ inline void render_local_pdb_modal()
 			automation.unattended_active ? 1 : 0,
 			automation.post_suppression_active ? 1 : 0,
 			static_cast<unsigned long long>(automation.post_suppression_remaining_ms),
-			automation.pdb_automation_active ? 1 : 0);
+			automation.pdb_automation_active ? 1 : 0,
+			automation.user_default_skip_active ? 1 : 0,
+			automation.pdb_skip_active ? 1 : 0);
 	}
-	initial_analysis::detail::auto_decline_pdb_prompts_for_full_test("render_local_pdb_modal");
-	bool wants_prompt = st.needs_local_pdb_prompt.load(std::memory_order_acquire);
-	bool remote_pending_after_decline = st.needs_pdb_prompt.load(std::memory_order_acquire);
-
 	float& anim    = detail::local_pdb_anim();
 	bool&  closing = detail::local_pdb_closing();
 	int&   open_fr = detail::local_pdb_open_frame();
 	bool&  pending = detail::local_pdb_pending();
 
-	if (automation.pdb_automation_active && !wants_prompt &&
-	    (pending_before_decline || remote_pending_before_decline || anim > 0.f || open_fr >= 0 || closing || pending)) {
-		std::string module_name;
-		std::string reason;
-		uint64_t image_base = 0;
-		uint64_t image_size = 0;
-		{
-			std::lock_guard<std::mutex> lk(st.local_pdb_mtx);
-			module_name = st.local_pdb_module_name;
-			reason = st.local_pdb_reason;
-			image_base = st.local_pdb_image_base;
-			image_size = st.local_pdb_image_size;
+	if (automation.pdb_skip_active) {
+		st.needs_local_pdb_prompt.store(false, std::memory_order_release);
+		st.needs_pdb_prompt.store(false, std::memory_order_release);
+		st.local_pdb_decision.store(initial_analysis::pdb_decision_t::declined, std::memory_order_release);
+		st.pdb_decision.store(initial_analysis::pdb_decision_t::declined, std::memory_order_release);
+		const bool log_close = pending_before_decline || remote_pending_before_decline ||
+			anim > 0.f || open_fr >= 0 || closing || pending;
+		if (log_close) {
+			std::string module_name;
+			std::string reason;
+			uint64_t image_base = 0;
+			uint64_t image_size = 0;
+			{
+				std::lock_guard<std::mutex> lk(st.local_pdb_mtx);
+				module_name = st.local_pdb_module_name;
+				reason = st.local_pdb_reason;
+				image_base = st.local_pdb_image_base;
+				image_size = st.local_pdb_image_size;
+			}
+			diag::log_tagged_critical_fmt("initial_analysis",
+				"pdb_modal_forbidden_render_suppressed source=render_local_pdb_modal kind=local remote_pending_before=%d local_pending_before=%d remote_pending_after=0 local_pending_after=0 decision=do_not_load_pdb frame=%d animation=%.3f closing=%d pending_close=%d open_frame=%d module=%s base=0x%llX size=0x%llX reason=%s is_running=%d anti_tamper_full_test_running=%d full_test_env_active=%d unattended_active=%d post_suppression_active=%d post_suppression_remaining_ms=%llu pdb_automation_active=%d user_default_skip_active=%d pdb_skip_active=%d",
+				remote_pending_before_decline ? 1 : 0,
+				pending_before_decline ? 1 : 0,
+				ImGui::GetFrameCount(),
+				static_cast<double>(anim),
+				closing ? 1 : 0,
+				pending ? 1 : 0,
+				open_fr,
+				module_name.empty() ? "<unknown>" : module_name.c_str(),
+				static_cast<unsigned long long>(image_base),
+				static_cast<unsigned long long>(image_size),
+				reason.empty() ? "<none>" : reason.c_str(),
+				automation.is_running ? 1 : 0,
+				automation.anti_tamper_full_test_running ? 1 : 0,
+				automation.full_test_env_active ? 1 : 0,
+				automation.unattended_active ? 1 : 0,
+				automation.post_suppression_active ? 1 : 0,
+				static_cast<unsigned long long>(automation.post_suppression_remaining_ms),
+				automation.pdb_automation_active ? 1 : 0,
+				automation.user_default_skip_active ? 1 : 0,
+				automation.pdb_skip_active ? 1 : 0);
 		}
-		diag::log_tagged_critical_fmt("initial_analysis",
-			"pdb_modal_forbidden_render_suppressed source=render_local_pdb_modal kind=local remote_pending_before=%d local_pending_before=%d remote_pending_after=%d local_pending_after=%d decision=do_not_load_pdb frame=%d animation=%.3f closing=%d pending_close=%d open_frame=%d module=%s base=0x%llX size=0x%llX reason=%s is_running=%d anti_tamper_full_test_running=%d full_test_env_active=%d unattended_active=%d post_suppression_active=%d post_suppression_remaining_ms=%llu pdb_automation_active=%d",
-			remote_pending_before_decline ? 1 : 0,
-			pending_before_decline ? 1 : 0,
-			remote_pending_after_decline ? 1 : 0,
-			wants_prompt ? 1 : 0,
-			ImGui::GetFrameCount(),
-			static_cast<double>(anim),
-			closing ? 1 : 0,
-			pending ? 1 : 0,
-			open_fr,
-			module_name.empty() ? "<unknown>" : module_name.c_str(),
-			static_cast<unsigned long long>(image_base),
-			static_cast<unsigned long long>(image_size),
-			reason.empty() ? "<none>" : reason.c_str(),
-			automation.is_running ? 1 : 0,
-			automation.anti_tamper_full_test_running ? 1 : 0,
-			automation.full_test_env_active ? 1 : 0,
-			automation.unattended_active ? 1 : 0,
-			automation.post_suppression_active ? 1 : 0,
-			static_cast<unsigned long long>(automation.post_suppression_remaining_ms),
-			automation.pdb_automation_active ? 1 : 0);
 		anim = 0.f;
 		closing = false;
 		open_fr = -1;
 		pending = false;
 		return;
 	}
+
+	initial_analysis::detail::auto_decline_pdb_prompts_for_full_test("render_local_pdb_modal");
+	bool wants_prompt = st.needs_local_pdb_prompt.load(std::memory_order_acquire);
+	bool remote_pending_after_decline = st.needs_pdb_prompt.load(std::memory_order_acquire);
+	(void)remote_pending_after_decline;
 
 	float dt = ImGui::GetIO().DeltaTime;
 	float target = (wants_prompt && !closing) ? 1.f : 0.f;
@@ -751,6 +795,32 @@ inline void render_local_pdb_modal()
 	ImGui::PushStyleColor(ImGuiCol_Border, aida::ui::with_alpha(th.border_strong, anim));
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10.f);
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(22, 18));
+
+	if (wants_prompt) {
+		std::string modal_module_name;
+		uint64_t modal_image_base = 0;
+		uint64_t modal_image_size = 0;
+		{
+			std::lock_guard<std::mutex> lk(st.local_pdb_mtx);
+			modal_module_name = st.local_pdb_module_name;
+			modal_image_base = st.local_pdb_image_base;
+			modal_image_size = st.local_pdb_image_size;
+		}
+		diag::log_tagged_critical_fmt("initial_analysis",
+			"pdb_modal_render kind=local frame=%d anim=%.3f open_frame=%d wants_prompt=%d skip_active=%d pdb_automation_active=%d unattended_active=%d post_suppression_active=%d user_default_skip_active=%d module=%s base=0x%llX size=0x%llX",
+			frame,
+			static_cast<double>(anim),
+			open_fr,
+			wants_prompt ? 1 : 0,
+			automation.pdb_skip_active ? 1 : 0,
+			automation.pdb_automation_active ? 1 : 0,
+			automation.unattended_active ? 1 : 0,
+			automation.post_suppression_active ? 1 : 0,
+			automation.user_default_skip_active ? 1 : 0,
+			modal_module_name.empty() ? "<unknown>" : modal_module_name.c_str(),
+			static_cast<unsigned long long>(modal_image_base),
+			static_cast<unsigned long long>(modal_image_size));
+	}
 
 	ImGui::Begin("Local PDB needed##ia_local_pdb_dlg", nullptr,
 		ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |

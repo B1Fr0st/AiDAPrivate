@@ -21,6 +21,7 @@
 #include <nlohmann/json.hpp>
 
 #include "../auth/auth_store.hpp"
+#include "../analysis/pdb_default_skip.hpp"
 
 #pragma comment(lib, "Crypt32.lib")
 #pragma comment(lib, "Shell32.lib")
@@ -515,6 +516,7 @@ struct settings_sa_t
     std::string symbol_cache_dir;
     bool        symbol_auto_download = false;
     std::string symbol_server_url = "https://msdl.microsoft.com/download/symbols";
+    bool        pdb_default_skip_load = false;
 
     static std::filesystem::path config_path()
     {
@@ -1256,6 +1258,7 @@ struct settings_sa_t
 
         if (!sa_settings_detail::read_json_file(source, root)) {
             ensure_default_profiles();
+            pdb_default_skip::set(pdb_default_skip_load);
             sa_settings_detail::last_error_ref() = "no settings file present; using defaults";
             return false;
         }
@@ -1307,6 +1310,8 @@ struct settings_sa_t
         str("symbol_cache_dir", symbol_cache_dir);
         boolean("symbol_auto_download", symbol_auto_download);
         str("symbol_server_url", symbol_server_url);
+        boolean("pdb_default_skip_load", pdb_default_skip_load);
+        pdb_default_skip::set(pdb_default_skip_load);
         if (root.contains("temperature") && root["temperature"].is_number())
             temperature = root["temperature"].get<double>();
         integer("mcp_port", mcp_port);
@@ -1590,6 +1595,8 @@ struct settings_sa_t
         root["symbol_cache_dir"] = symbol_cache_dir;
         root["symbol_auto_download"] = symbol_auto_download;
         root["symbol_server_url"] = symbol_server_url;
+        root["pdb_default_skip_load"] = pdb_default_skip_load;
+        pdb_default_skip::set(pdb_default_skip_load);
         root["temperature"] = temperature;
         root["mcp_port"] = mcp_port;
         root["mcp_enabled"] = mcp_enabled;

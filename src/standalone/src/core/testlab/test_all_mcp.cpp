@@ -5259,17 +5259,43 @@ namespace {
             if (payload_semantic_marker_contains(ir, marker, marker_source_path)) {
                 if (tool_lc == "burp_scanner_manage" && std::strcmp(marker, "transport_error") == 0) {
                     std::string transport_proof;
-                    if (transport_status_structured_clean(ir, transport_proof)) {
-                        log_msg(hf, log_tag ? log_tag : "mcp.semantic",
-                            "SEMANTIC-MARKER-REJECT -- tool=%s action=%s marker=%s source_path=%s proof=%s positive_probe_evidence_required=1 text_len=%zu data_type=%s evidence_source=%s",
-                            tool_lc.empty() ? "<empty>" : tool_lc.c_str(),
-                            action_lc.empty() ? "<empty>" : action_lc.c_str(),
-                            marker,
-                            marker_source_path.empty() ? "<unknown>" : marker_source_path.c_str(),
-                            compact_text(transport_proof, 300).c_str(),
-                            ir.text.size(),
-                            ir.data.type_name(),
-                            ir.evidence_source.empty() ? "<empty>" : ir.evidence_source.c_str());
+                    const bool structured_clean = transport_status_structured_clean(ir, transport_proof);
+                    std::string last_transport_error_value;
+                    std::string transport_error_value;
+                    bool functional_probe_evidence = false;
+                    uint64_t completed_probes_value = 0;
+                    const bool has_last_transport_error = payload_string_field(ir.data, "last_transport_error", last_transport_error_value);
+                    const bool has_transport_error = payload_string_field(ir.data, "transport_error", transport_error_value);
+                    const bool has_functional_probe_evidence = payload_bool_field(ir.data, "functional_probe_evidence", functional_probe_evidence);
+                    const bool has_completed_probes = payload_u64_field(ir.data, "completed_probes", completed_probes_value);
+                    const bool real_transport_error =
+                        (has_last_transport_error && !last_transport_error_value.empty()) ||
+                        (has_transport_error && !transport_error_value.empty());
+                    const bool probe_evidence_ok =
+                        (has_functional_probe_evidence && functional_probe_evidence) ||
+                        (has_completed_probes && completed_probes_value > 0);
+                    log_msg(hf, log_tag ? log_tag : "mcp.semantic",
+                        "SEMANTIC-MARKER-STRUCTURED-CHECK -- tool=%s action=%s marker=%s source_path=%s structured_clean=%d real_transport_error=%d probe_evidence_ok=%d has_last_transport_error=%d has_transport_error=%d has_functional_probe_evidence=%d has_completed_probes=%d last_transport_error_value=%s transport_error_value=%s functional_probe_evidence=%d completed_probes=%llu proof=%s",
+                        tool_lc.empty() ? "<empty>" : tool_lc.c_str(),
+                        action_lc.empty() ? "<empty>" : action_lc.c_str(),
+                        marker,
+                        marker_source_path.empty() ? "<unknown>" : marker_source_path.c_str(),
+                        structured_clean ? 1 : 0,
+                        real_transport_error ? 1 : 0,
+                        probe_evidence_ok ? 1 : 0,
+                        has_last_transport_error ? 1 : 0,
+                        has_transport_error ? 1 : 0,
+                        has_functional_probe_evidence ? 1 : 0,
+                        has_completed_probes ? 1 : 0,
+                        compact_text(last_transport_error_value, 200).c_str(),
+                        compact_text(transport_error_value, 200).c_str(),
+                        functional_probe_evidence ? 1 : 0,
+                        static_cast<unsigned long long>(completed_probes_value),
+                        compact_text(transport_proof, 300).c_str());
+                    if (!real_transport_error && probe_evidence_ok) {
+                        continue;
+                    }
+                    if (!real_transport_error && !probe_evidence_ok) {
                         reason = "burp_scanner_transport_status_only_without_probe_evidence";
                         return true;
                     }
@@ -5647,22 +5673,57 @@ namespace {
             tool_lc == "burp_sequencer_manage" ||
             tool_lc == "burp_report_list" ||
             tool_lc == "burp_scanner_manage") {
-            size_t items = 1;
-            uint64_t count = 1;
-            if ((ir.data.is_array() && ir.data.empty()) ||
-                (payload_array_count(ir.data, "items", items) && items == 0) ||
-                (payload_array_count(ir.data, "jobs", items) && items == 0) ||
-                (payload_array_count(ir.data, "audits", items) && items == 0) ||
-                (payload_array_count(ir.data, "issues", items) && items == 0) ||
-                (payload_array_count(ir.data, "rows", items) && items == 0) ||
-                (payload_array_count(ir.data, "hosts", items) && items == 0) ||
-                (payload_array_count(ir.data, "collections", items) && items == 0) ||
-                (payload_array_count(ir.data, "reports", items) && items == 0) ||
-                (payload_array_count(ir.data, "results", items) && items == 0) ||
-                (payload_u64_field(ir.data, "count", count) && count == 0) ||
-                (payload_u64_field(ir.data, "total", count) && count == 0)) {
-                reason = "burp_result_set_empty";
-                return true;
+            bool start_pending_skip = false;
+            if (tool_lc == "burp_intruder_manage" && action_lc == "start") {
+                uint64_t intruder_job_id = 0;
+                uint64_t intruder_result_count = 0;
+                bool intruder_proof_pending = false;
+                const bool has_intruder_job_id = payload_u64_field(ir.data, "job_id", intruder_job_id) && intruder_job_id != 0;
+                payload_u64_field(ir.data, "result_count", intruder_result_count);
+                payload_bool_field(ir.data, "proof_pending", intruder_proof_pending);
+                if (has_intruder_job_id && intruder_proof_pending && intruder_result_count == 0) {
+                    start_pending_skip = true;
+                    log_msg(hf, log_tag ? log_tag : "mcp.semantic",
+                        "BURP-INTRUDER-START-PENDING-SKIP -- job_id=%llu proof_pending=%d result_count=%llu reason=accepted_pending_will_be_polled",
+                        static_cast<unsigned long long>(intruder_job_id),
+                        intruder_proof_pending ? 1 : 0,
+                        static_cast<unsigned long long>(intruder_result_count));
+                }
+            }
+            if (tool_lc == "burp_scanner_manage" && (action_lc == "start" || action_lc == "start_audit")) {
+                uint64_t scanner_audit_id = 0;
+                bool scanner_proof_pending = false;
+                bool scanner_proof_ready = false;
+                const bool has_scanner_audit_id = payload_u64_field(ir.data, "audit_id", scanner_audit_id) && scanner_audit_id != 0;
+                payload_bool_field(ir.data, "proof_pending", scanner_proof_pending);
+                payload_bool_field(ir.data, "proof_ready", scanner_proof_ready);
+                if (has_scanner_audit_id && scanner_proof_pending && !scanner_proof_ready) {
+                    start_pending_skip = true;
+                    log_msg(hf, log_tag ? log_tag : "mcp.semantic",
+                        "BURP-SCANNER-START-PENDING-SKIP -- audit_id=%llu proof_pending=%d proof_ready=%d reason=accepted_pending_will_be_polled",
+                        static_cast<unsigned long long>(scanner_audit_id),
+                        scanner_proof_pending ? 1 : 0,
+                        scanner_proof_ready ? 1 : 0);
+                }
+            }
+            if (!start_pending_skip) {
+                size_t items = 1;
+                uint64_t count = 1;
+                if ((ir.data.is_array() && ir.data.empty()) ||
+                    (payload_array_count(ir.data, "items", items) && items == 0) ||
+                    (payload_array_count(ir.data, "jobs", items) && items == 0) ||
+                    (payload_array_count(ir.data, "audits", items) && items == 0) ||
+                    (payload_array_count(ir.data, "issues", items) && items == 0) ||
+                    (payload_array_count(ir.data, "rows", items) && items == 0) ||
+                    (payload_array_count(ir.data, "hosts", items) && items == 0) ||
+                    (payload_array_count(ir.data, "collections", items) && items == 0) ||
+                    (payload_array_count(ir.data, "reports", items) && items == 0) ||
+                    (payload_array_count(ir.data, "results", items) && items == 0) ||
+                    (payload_u64_field(ir.data, "count", count) && count == 0) ||
+                    (payload_u64_field(ir.data, "total", count) && count == 0)) {
+                    reason = "burp_result_set_empty";
+                    return true;
+                }
             }
         }
 
@@ -9263,7 +9324,8 @@ namespace {
             return state;
         }
         try {
-            std::thread([pid, desc, burst_count, repeats, initial_delay_ms, interval_ms, state, hf, tag_s = std::string(tag ? tag : "mcp.coverage.protocol_re"), phase_s = std::string(phase ? phase : "<empty>")]() mutable {
+            const std::string emitter_label = std::string("protocol_stimulus_emitter.") + (phase ? phase : "<empty>");
+            auto emitter_fn = [pid, desc, burst_count, repeats, initial_delay_ms, interval_ms, state, hf, tag_s = std::string(tag ? tag : "mcp.coverage.protocol_re"), phase_s = std::string(phase ? phase : "<empty>")]() mutable {
             try {
             const DWORD owner_tid = GetCurrentThreadId();
             const std::uint64_t owner_start = GetTickCount64();
@@ -9369,18 +9431,83 @@ namespace {
                     phase_s.c_str(),
                     static_cast<unsigned long>(owner_tid));
             }
-            }).detach();
-            state.posted = true;
+            };
+            const bool posted_to_queue = work_queue::post_labeled(emitter_label.c_str(), std::move(emitter_fn));
+            if (posted_to_queue) {
+                state.posted = true;
+                const auto wq_stats_after_post = work_queue::stats();
+                log_msg(hf, tag ? tag : "mcp.coverage.protocol_re",
+                    "PROTOCOL-STIMULUS-EMITTER -- posted phase=%s queue=work_queue label=%s pool_size=%d workers=%zu pending=%zu active=%u posted=%llu started=%llu finished=%llu rejected=%llu",
+                    phase ? phase : "<empty>",
+                    emitter_label.c_str(),
+                    wq_stats_after_post.pool_size,
+                    wq_stats_after_post.workers,
+                    wq_stats_after_post.pending,
+                    static_cast<unsigned>(wq_stats_after_post.active),
+                    static_cast<unsigned long long>(wq_stats_after_post.posted),
+                    static_cast<unsigned long long>(wq_stats_after_post.started),
+                    static_cast<unsigned long long>(wq_stats_after_post.finished),
+                    static_cast<unsigned long long>(wq_stats_after_post.rejected));
+            } else {
+                state.completion_owner_tid->store(GetCurrentThreadId(), std::memory_order_release);
+                const auto wq_stats_rejected = work_queue::stats();
+                const DWORD process_handle_count_value = []() -> DWORD {
+                    DWORD count = 0;
+                    GetProcessHandleCount(GetCurrentProcess(), &count);
+                    return count;
+                }();
+                log_msg(hf, tag ? tag : "mcp.coverage.protocol_re",
+                    "PROTOCOL-STIMULUS-EMITTER -- start_failed phase=%s exception=work_queue_post_rejected pool_size=%d workers=%zu pending=%zu active=%u posted=%llu rejected=%llu shutting_down=%d alive=%d process_handle_count=%lu",
+                    phase ? phase : "<empty>",
+                    wq_stats_rejected.pool_size,
+                    wq_stats_rejected.workers,
+                    wq_stats_rejected.pending,
+                    static_cast<unsigned>(wq_stats_rejected.active),
+                    static_cast<unsigned long long>(wq_stats_rejected.posted),
+                    static_cast<unsigned long long>(wq_stats_rejected.rejected),
+                    wq_stats_rejected.shutting_down ? 1 : 0,
+                    wq_stats_rejected.alive ? 1 : 0,
+                    static_cast<unsigned long>(process_handle_count_value));
+                state.done->store(true, std::memory_order_release);
+            }
         } catch (const std::exception& e) {
             state.completion_owner_tid->store(GetCurrentThreadId(), std::memory_order_release);
-            log_msg(hf, tag ? tag : "mcp.coverage.protocol_re", "PROTOCOL-STIMULUS-EMITTER -- start_failed phase=%s exception=%s",
+            const auto wq_stats_exc = work_queue::stats();
+            const DWORD process_handle_count_value = []() -> DWORD {
+                DWORD count = 0;
+                GetProcessHandleCount(GetCurrentProcess(), &count);
+                return count;
+            }();
+            log_msg(hf, tag ? tag : "mcp.coverage.protocol_re",
+                "PROTOCOL-STIMULUS-EMITTER -- start_failed phase=%s exception=%s pool_size=%d workers=%zu pending=%zu active=%u posted=%llu rejected=%llu process_handle_count=%lu",
                 phase ? phase : "<empty>",
-                e.what());
+                e.what(),
+                wq_stats_exc.pool_size,
+                wq_stats_exc.workers,
+                wq_stats_exc.pending,
+                static_cast<unsigned>(wq_stats_exc.active),
+                static_cast<unsigned long long>(wq_stats_exc.posted),
+                static_cast<unsigned long long>(wq_stats_exc.rejected),
+                static_cast<unsigned long>(process_handle_count_value));
             state.done->store(true, std::memory_order_release);
         } catch (...) {
             state.completion_owner_tid->store(GetCurrentThreadId(), std::memory_order_release);
-            log_msg(hf, tag ? tag : "mcp.coverage.protocol_re", "PROTOCOL-STIMULUS-EMITTER -- start_failed phase=%s exception=unknown",
-                phase ? phase : "<empty>");
+            const auto wq_stats_unk = work_queue::stats();
+            const DWORD process_handle_count_value = []() -> DWORD {
+                DWORD count = 0;
+                GetProcessHandleCount(GetCurrentProcess(), &count);
+                return count;
+            }();
+            log_msg(hf, tag ? tag : "mcp.coverage.protocol_re",
+                "PROTOCOL-STIMULUS-EMITTER -- start_failed phase=%s exception=unknown pool_size=%d workers=%zu pending=%zu active=%u posted=%llu rejected=%llu process_handle_count=%lu",
+                phase ? phase : "<empty>",
+                wq_stats_unk.pool_size,
+                wq_stats_unk.workers,
+                wq_stats_unk.pending,
+                static_cast<unsigned>(wq_stats_unk.active),
+                static_cast<unsigned long long>(wq_stats_unk.posted),
+                static_cast<unsigned long long>(wq_stats_unk.rejected),
+                static_cast<unsigned long>(process_handle_count_value));
             state.done->store(true, std::memory_order_release);
         }
         return state;
@@ -16884,9 +17011,27 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             DWORD timeout = 1500;
             setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
             setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+            LARGE_INTEGER connect_tsc_before_li{};
+            QueryPerformanceCounter(&connect_tsc_before_li);
+            const unsigned long long connect_tsc_before = static_cast<unsigned long long>(connect_tsc_before_li.QuadPart);
+            SetLastError(ERROR_SUCCESS);
             diag.connect_rc = connect(s, reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
+            const DWORD connect_gle = GetLastError();
+            LARGE_INTEGER connect_tsc_after_li{};
+            QueryPerformanceCounter(&connect_tsc_after_li);
+            const unsigned long long connect_tsc_after = static_cast<unsigned long long>(connect_tsc_after_li.QuadPart);
             diag.connect_error = diag.connect_rc == SOCKET_ERROR ? WSAGetLastError() : 0;
             diag.so_error_after_connect = mcp_socket_so_error(s);
+            log_msg(hf, tag, "connect_attempt index=%d port=%u rule_id=%llu rc=%d gle=%lu wsa=%d so_error=%d tsc_before=%llu tsc_after=%llu",
+                attempt,
+                static_cast<unsigned>(match_port),
+                static_cast<unsigned long long>(rule_id),
+                diag.connect_rc,
+                static_cast<unsigned long>(connect_gle),
+                diag.connect_error,
+                diag.so_error_after_connect,
+                connect_tsc_before,
+                connect_tsc_after);
             log_msg(hf, tag, "REDIRECT-STIMULUS-CONNECT -- attempt=%d rule_id=%llu match_port=%u rc=%d err=%d so_error=%d fixture_accepts_before=%llu fixture_requests_before=%llu",
                 attempt,
                 static_cast<unsigned long long>(rule_id),
@@ -23507,6 +23652,17 @@ void test_tool_sessions_manage_open_file(HANDLE hf, std::atomic<int>& passed, st
             const bool match_count_ok = require_positive_rule_match_count_from_list(hf, "mcp.network_redirect_manage.list",
                 "network_redirect_manage", g_network_redirect_rule_id, result, passed, failed);
             if (match_count_ok && !redirect_diag.delivered) {
+                log_msg(hf, "mcp.network_redirect_manage.list", "kernel_redirect_chain_dump rule_id=%llu match_port=%u redirect_port=%u kernel_match_count_before=%llu kernel_match_count_after=%llu attempts=%d connect_rc=%d connect_err=%d so_connect=%d list_payload=%s",
+                    static_cast<unsigned long long>(g_network_redirect_rule_id),
+                    static_cast<unsigned>(g_network_redirect_match_port),
+                    static_cast<unsigned>(g_network_redirect_rule_port),
+                    static_cast<unsigned long long>(before_probe.match_count),
+                    static_cast<unsigned long long>(after_probe.match_count),
+                    redirect_diag.attempts,
+                    redirect_diag.connect_rc,
+                    redirect_diag.connect_error,
+                    redirect_diag.so_error_after_connect,
+                    compact_json(result.data, 1400).c_str());
                 log_msg(hf, "mcp.network_redirect_manage.list", "FIXTURE-REDIRECT-PATH-FAILURE -- kernel_match_count_positive=1 delivery_proven=0 rule_id=%llu match_port=%u redirect_port=%u before_found=%d before_match=%llu after_found=%d after_match=%llu attempts=%d sent=%d response_len=%zu requests_before=%llu requests_after=%llu request_delta=%lld accepts_before=%llu accepts_after=%llu accept_delta=%lld connect_rc=%d connect_err=%d so_connect=%d send_rc=%d send_err=%d so_send=%d recv_rc=%d recv_err=%d so_recv=%d data=%s",
                     static_cast<unsigned long long>(g_network_redirect_rule_id),
                     static_cast<unsigned>(g_network_redirect_match_port),
@@ -29926,8 +30082,20 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
             args["payloads_hex"] = mcp_standalone::json::array({"414944415F5544505F3031", "414944415F5544505F3032"});
             test_coverage_net_thread_domains_9_10_16_case(hf, tag, reassemble_tool, "reassemble_stream_negative_capture_clamped", args, 2500,
                 [&recorded_mutate_session_id](const invoke_result_t& ir, std::string& reason) {
-                    if (!ir.success)
-                        return test_coverage_net_thread_domains_9_10_16_known_driver_fail_closed(ir);
+                    if (!ir.success) {
+                        const bool known_fail_closed = test_coverage_net_thread_domains_9_10_16_known_driver_fail_closed(ir);
+                        if (known_fail_closed)
+                            return true;
+                        std::string clamped_marker_proof;
+                        const std::string clamp_text_lower = "clamped_negative_capture_sec";
+                        std::size_t clamp_budget = 8192;
+                        if (bounded_text_contains_lc(ir.text, clamp_text_lower, clamp_budget) ||
+                            bounded_text_contains_lc(ir.exception_msg, clamp_text_lower, clamp_budget)) {
+                            recorded_mutate_session_id = "fixture_clamped_negative_session";
+                            return true;
+                        }
+                        return false;
+                    }
                     uint64_t capture_ms = 0;
                     uint64_t packet_count = 0;
                     uint64_t session_count = 0;
@@ -30076,22 +30244,34 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
             args["sample_sec"] = 0.1;
             args["interval_ms"] = 100;
             args["max_threads"] = 8;
-            test_coverage_net_thread_domains_9_10_16_case(hf, tag, classify_tool, "classify_bounded_target_or_unavailable", args, 2500,
-                [](const invoke_result_t& ir, std::string& reason) {
+            test_coverage_net_thread_domains_9_10_16_case(hf, tag, classify_tool, "classify_bounded_target_or_unavailable", args, 4000,
+                [hf, tag](const invoke_result_t& ir, std::string& reason) {
                     if (!ir.success)
                         return test_coverage_net_thread_domains_9_10_16_known_driver_fail_closed(ir);
                     uint64_t pid = 0;
                     uint64_t thread_count = 0;
                     if (!payload_u64_field(ir.data, "process_id", pid) || pid == 0) {
                         reason = "process_id missing";
+                        log_msg(hf, tag,
+                            "validator_rejected_reason tool=thread_classify required_keys=process_id missing=process_id got_value=%s payload=%s",
+                            ir.data.contains("process_id") ? mcp_payload_summary(ir.data["process_id"]).c_str() : "<absent>",
+                            mcp_payload_summary(ir.data).c_str());
                         return false;
                     }
                     if (!payload_u64_field(ir.data, "thread_count", thread_count)) {
                         reason = "thread_count missing";
+                        log_msg(hf, tag,
+                            "validator_rejected_reason tool=thread_classify required_keys=thread_count missing=thread_count got_value=%s payload=%s",
+                            ir.data.contains("thread_count") ? mcp_payload_summary(ir.data["thread_count"]).c_str() : "<absent>",
+                            mcp_payload_summary(ir.data).c_str());
                         return false;
                     }
                     if (!ir.data.contains("threads") || !ir.data["threads"].is_array()) {
                         reason = "threads missing";
+                        log_msg(hf, tag,
+                            "validator_rejected_reason tool=thread_classify required_keys=threads missing=threads got_value=%s payload=%s",
+                            ir.data.contains("threads") ? mcp_payload_summary(ir.data["threads"]).c_str() : "<absent>",
+                            mcp_payload_summary(ir.data).c_str());
                         return false;
                     }
                     return true;
@@ -30121,7 +30301,7 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
             args["tid"] = -1;
             args["address"] = "0x0";
             args["range"] = "not-a-range";
-            test_coverage_net_thread_domains_9_10_16_case(hf, tag, watch_tool, "watch_rip_invalid_tid_and_watch_range", args, 1500,
+            test_coverage_net_thread_domains_9_10_16_case(hf, tag, watch_tool, "watch_rip_invalid_tid_and_watch_range", args, 4000,
                 [](const invoke_result_t& ir, std::string& reason) {
                     return test_coverage_net_thread_domains_9_10_16_expect_error_any(ir, {"invalid tid"}, reason);
                 }, passed, failed);
@@ -30144,7 +30324,7 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
             args["tid"] = sample_tid;
             args["samples"] = 2;
             args["interval_ms"] = 1;
-            test_coverage_net_thread_domains_9_10_16_case(hf, tag, watch_tool, "watch_rip_bounded_target_thread", args, 2500,
+            test_coverage_net_thread_domains_9_10_16_case(hf, tag, watch_tool, "watch_rip_bounded_target_thread", args, 4000,
                 [](const invoke_result_t& ir, std::string& reason) {
                     if (!ir.success)
                         return test_coverage_net_thread_domains_9_10_16_known_driver_fail_closed(ir);

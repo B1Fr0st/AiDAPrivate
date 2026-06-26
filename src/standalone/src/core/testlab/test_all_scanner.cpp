@@ -3620,8 +3620,11 @@ void phase_scanner_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& 
     for (int i = 0; i < total; ++i) {
         if (cancelled && cancelled()) {
             int remaining = total - i;
-            skipped.fetch_add(remaining);
-            log_msg(hf, "scanner", "cancelled -- skipping %d remaining tests", remaining);
+            failed.fetch_add(remaining);
+            log_msg(hf, "scanner", "FAIL -- cancellation requested mid-scanner-phase with %d test(s) remaining; cancellation is a defect in the sanctioned full-test run pid=%lu tid=%lu",
+                remaining,
+                static_cast<unsigned long>(GetCurrentProcessId()),
+                static_cast<unsigned long>(GetCurrentThreadId()));
             break;
         }
 

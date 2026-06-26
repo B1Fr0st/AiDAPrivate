@@ -3032,13 +3032,74 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         {},
         true,
         [](const json& params) -> tool_result_t {
-            diag::log_tagged_fmt("dbg_tools", "debugger_get_seh_chain: entry");
+            const DWORD entry_tid = GetCurrentThreadId();
+            const std::uint64_t entry_tick = GetTickCount64();
+            diag::log_tagged_fmt("dbg_tools", "debugger_get_seh_chain: entry tid=%lu tick=%llu",
+                static_cast<unsigned long>(entry_tid),
+                static_cast<unsigned long long>(entry_tick));
             if (auto err = ensure_attached(params)) return *err;
+            auto refresh_and_wait = [&](const char* phase) {
+                const std::uint64_t phase_start = GetTickCount64();
+                seh_view::refresh();
+                for (int i = 0; i < 100; ++i) {
+                    if (!seh_view::g_ui.refreshing.load()) break;
+                    Sleep(20);
+                }
+                diag::log_tagged_fmt("dbg_tools",
+                    "seh_refresh_wait phase=%s tid=%lu elapsed_ms=%llu",
+                    phase ? phase : "<empty>",
+                    static_cast<unsigned long>(GetCurrentThreadId()),
+                    static_cast<unsigned long long>(GetTickCount64() - phase_start));
+            };
             diag::log_tagged_fmt("dbg_tools", "debugger_get_seh_chain: calling seh_view::refresh");
-            seh_view::refresh();
-            for (int i = 0; i < 100; ++i) {
-                if (!seh_view::g_ui.refreshing.load()) break;
-                Sleep(20);
+            refresh_and_wait("primary");
+            {
+                std::lock_guard<std::mutex> probe_lk(seh_view::g_ui.mutex);
+                const auto probe_diag = seh_view::g_ui.diagnostics;
+                const bool teb_zero = !probe_diag.teb_query_ok || probe_diag.teb_query_returned == 0;
+                if (teb_zero) {
+                    const DWORD gle_before_retry = GetLastError();
+                    diag::log_tagged_fmt("dbg_tools",
+                        "seh_teb_query_retry attempt=1 ok=%d teb=0x%llX gle=%lu reason=%s active_tid=%lu target_pid=%u caller_pid=%lu caller_tid=%lu elapsed_ms=%llu",
+                        probe_diag.teb_query_ok ? 1 : 0,
+                        static_cast<unsigned long long>(probe_diag.teb_query_returned),
+                        static_cast<unsigned long>(gle_before_retry),
+                        probe_diag.empty_reason.c_str(),
+                        static_cast<unsigned long>(probe_diag.active_tid),
+                        static_cast<unsigned>(probe_diag.target_pid),
+                        static_cast<unsigned long>(GetCurrentProcessId()),
+                        static_cast<unsigned long>(entry_tid),
+                        static_cast<unsigned long long>(GetTickCount64() - entry_tick));
+                }
+            }
+            {
+                std::lock_guard<std::mutex> probe_lk(seh_view::g_ui.mutex);
+                const auto probe_diag = seh_view::g_ui.diagnostics;
+                const bool teb_zero = !probe_diag.teb_query_ok || probe_diag.teb_query_returned == 0;
+                if (teb_zero) {
+                    Sleep(5);
+                }
+            }
+            {
+                std::lock_guard<std::mutex> probe_lk(seh_view::g_ui.mutex);
+                const auto probe_diag = seh_view::g_ui.diagnostics;
+                const bool teb_zero = !probe_diag.teb_query_ok || probe_diag.teb_query_returned == 0;
+                if (teb_zero) {
+                    refresh_and_wait("retry_1");
+                    std::lock_guard<std::mutex> after_lk(seh_view::g_ui.mutex);
+                    const auto after_diag = seh_view::g_ui.diagnostics;
+                    diag::log_tagged_fmt("dbg_tools",
+                        "seh_teb_query_retry attempt=2 ok=%d teb=0x%llX gle=%lu reason=%s active_tid=%lu target_pid=%u caller_pid=%lu caller_tid=%lu elapsed_ms=%llu",
+                        after_diag.teb_query_ok ? 1 : 0,
+                        static_cast<unsigned long long>(after_diag.teb_query_returned),
+                        static_cast<unsigned long>(GetLastError()),
+                        after_diag.empty_reason.c_str(),
+                        static_cast<unsigned long>(after_diag.active_tid),
+                        static_cast<unsigned>(after_diag.target_pid),
+                        static_cast<unsigned long>(GetCurrentProcessId()),
+                        static_cast<unsigned long>(entry_tid),
+                        static_cast<unsigned long long>(GetTickCount64() - entry_tick));
+                }
             }
             std::lock_guard<std::mutex> lk(seh_view::g_ui.mutex);
             json arr = json::array();

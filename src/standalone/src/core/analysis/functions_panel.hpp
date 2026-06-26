@@ -764,10 +764,10 @@ namespace functions_panel {
 			}
 			if (already_loaded_or_loading) {
 				const auto automation = symbol_store::pdb_automation_context();
-				if (automation.pdb_automation_active) {
+				if (automation.pdb_skip_active) {
 					const std::string pdb_name = disk_pdb_name_for_module(display_name);
 					diag::log_tagged_fmt("functions_panel",
-						"fulltest_disk_pdb_policy module=%s base=0x%llX size=0x%X pdb=%s local_candidate=<none> cache_path=<none> decision=do_not_load_pdb reason=module_loaded_loading_failed_or_declined prompt_created=0 prompt_suppressed=1 failed=%d declined=%d is_running=%d anti_tamper_full_test_running=%d full_test_env_active=%d unattended_active=%d post_suppression_active=%d post_suppression_remaining_ms=%llu pdb_automation_active=%d",
+						"fulltest_disk_pdb_policy module=%s base=0x%llX size=0x%X pdb=%s local_candidate=<none> cache_path=<none> decision=do_not_load_pdb reason=module_loaded_loading_failed_or_declined prompt_created=0 prompt_suppressed=1 failed=%d declined=%d is_running=%d anti_tamper_full_test_running=%d full_test_env_active=%d unattended_active=%d post_suppression_active=%d post_suppression_remaining_ms=%llu pdb_automation_active=%d user_default_skip_active=%d pdb_skip_active=%d",
 						display_name.c_str(),
 						static_cast<unsigned long long>(image_base),
 						static_cast<unsigned>(size_of_image),
@@ -780,18 +780,20 @@ namespace functions_panel {
 						automation.unattended_active ? 1 : 0,
 						automation.post_suppression_active ? 1 : 0,
 						static_cast<unsigned long long>(automation.post_suppression_remaining_ms),
-						automation.pdb_automation_active ? 1 : 0);
+						automation.pdb_automation_active ? 1 : 0,
+						automation.user_default_skip_active ? 1 : 0,
+						automation.pdb_skip_active ? 1 : 0);
 				}
 				return;
 			}
-			if (symbol_store::pdb_automation_active()) {
+			if (symbol_store::pdb_skip_active()) {
 				const auto automation = symbol_store::pdb_automation_context();
 				std::string local_candidate;
 				const bool have_local = resolve_full_test_disk_pdb(binary_path, display_name, local_candidate);
 				const std::string pdb_name = disk_pdb_name_for_module(display_name);
 				if (have_local) {
 					diag::log_tagged_fmt("functions_panel",
-						"fulltest_disk_pdb_policy module=%s base=0x%llX size=0x%X pdb=%s local_candidate=%s cache_path=<none> decision=load_local reason=direct_local_pdb_present prompt_created=0 prompt_suppressed=1 failed=0 declined=0 is_running=%d anti_tamper_full_test_running=%d full_test_env_active=%d unattended_active=%d post_suppression_active=%d post_suppression_remaining_ms=%llu pdb_automation_active=%d",
+						"fulltest_disk_pdb_policy module=%s base=0x%llX size=0x%X pdb=%s local_candidate=%s cache_path=<none> decision=load_local reason=direct_local_pdb_present prompt_created=0 prompt_suppressed=1 failed=0 declined=0 is_running=%d anti_tamper_full_test_running=%d full_test_env_active=%d unattended_active=%d post_suppression_active=%d post_suppression_remaining_ms=%llu pdb_automation_active=%d user_default_skip_active=%d pdb_skip_active=%d",
 						display_name.c_str(),
 						static_cast<unsigned long long>(image_base),
 						static_cast<unsigned>(size_of_image),
@@ -803,14 +805,16 @@ namespace functions_panel {
 						automation.unattended_active ? 1 : 0,
 						automation.post_suppression_active ? 1 : 0,
 						static_cast<unsigned long long>(automation.post_suppression_remaining_ms),
-						automation.pdb_automation_active ? 1 : 0);
+						automation.pdb_automation_active ? 1 : 0,
+						automation.user_default_skip_active ? 1 : 0,
+						automation.pdb_skip_active ? 1 : 0);
 					symbol_store::load_pdb_from_explicit_path(display_name, image_base,
 						static_cast<uint64_t>(size_of_image), local_candidate);
 					return;
 				}
 				const char* reason = "no_deterministic_local_pdb_decline_remote_symbol_download";
 				diag::log_tagged_fmt("functions_panel",
-					"fulltest_disk_pdb_policy module=%s base=0x%llX size=0x%X pdb=%s local_candidate=%s cache_path=<none> decision=do_not_load_pdb reason=%s prompt_created=0 prompt_suppressed=1 failed=0 declined=1 is_running=%d anti_tamper_full_test_running=%d full_test_env_active=%d unattended_active=%d post_suppression_active=%d post_suppression_remaining_ms=%llu pdb_automation_active=%d",
+					"fulltest_disk_pdb_policy module=%s base=0x%llX size=0x%X pdb=%s local_candidate=%s cache_path=<none> decision=do_not_load_pdb reason=%s prompt_created=0 prompt_suppressed=1 failed=0 declined=1 is_running=%d anti_tamper_full_test_running=%d full_test_env_active=%d unattended_active=%d post_suppression_active=%d post_suppression_remaining_ms=%llu pdb_automation_active=%d user_default_skip_active=%d pdb_skip_active=%d",
 					display_name.c_str(),
 					static_cast<unsigned long long>(image_base),
 					static_cast<unsigned>(size_of_image),
@@ -823,7 +827,9 @@ namespace functions_panel {
 					automation.unattended_active ? 1 : 0,
 					automation.post_suppression_active ? 1 : 0,
 					static_cast<unsigned long long>(automation.post_suppression_remaining_ms),
-					automation.pdb_automation_active ? 1 : 0);
+					automation.pdb_automation_active ? 1 : 0,
+					automation.user_default_skip_active ? 1 : 0,
+					automation.pdb_skip_active ? 1 : 0);
 				symbol_store::suppress_full_test_pdb_load("functions_panel.trigger_disk_pdb_auto_load",
 					display_name, image_base, static_cast<uint64_t>(size_of_image),
 					pdb_name, {}, 0, local_candidate, {}, {},

@@ -1612,10 +1612,21 @@ namespace
         uint64_t rip = 0;
         uint64_t rsp = 0;
         uint64_t rbp = 0;
+        DWORD last_error_after_seh = ERROR_SUCCESS;
+        DWORD caller_pid = 0;
+        DWORD worker_tid = 0;
+        ULONGLONG captured_tick = 0;
     };
 
     int capture_lower_remote_call_seh(EXCEPTION_POINTERS* info, lower_remote_call_seh_record_t* record) noexcept
     {
+        const DWORD last_error_at_entry = GetLastError();
+        if (record) {
+            record->last_error_after_seh = last_error_at_entry;
+            record->caller_pid = GetCurrentProcessId();
+            record->worker_tid = GetCurrentThreadId();
+            record->captured_tick = GetTickCount64();
+        }
         if (record && info && info->ExceptionRecord) {
             record->code = info->ExceptionRecord->ExceptionCode;
             record->exception_address = reinterpret_cast<uint64_t>(info->ExceptionRecord->ExceptionAddress);
@@ -1634,7 +1645,22 @@ namespace
                 record->rbp = static_cast<uint64_t>(info->ContextRecord->Ebp);
             }
 #endif
+            if (record->code == static_cast<uint32_t>(EXCEPTION_ACCESS_VIOLATION)) {
+                diag::log_tagged_critical_fmt("driver",
+                    "call_function_lower_seh_handler caller_pid=%lu worker_tid=%lu code=0x%08lX exception_address=0x%llX fault_address=0x%llX rip=0x%llX rsp=0x%llX rbp=0x%llX last_error=%lu tick=%llu",
+                    static_cast<unsigned long>(record->caller_pid),
+                    static_cast<unsigned long>(record->worker_tid),
+                    static_cast<unsigned long>(record->code),
+                    static_cast<unsigned long long>(record->exception_address),
+                    static_cast<unsigned long long>(record->fault_address),
+                    static_cast<unsigned long long>(record->rip),
+                    static_cast<unsigned long long>(record->rsp),
+                    static_cast<unsigned long long>(record->rbp),
+                    static_cast<unsigned long>(record->last_error_after_seh),
+                    static_cast<unsigned long long>(record->captured_tick));
+            }
         }
+        SetLastError(last_error_at_entry);
         return EXCEPTION_EXECUTE_HANDLER;
     }
 
@@ -1889,6 +1915,7 @@ namespace
             abandoned ? 1 : 0,
             item->allow_zero_result ? 1 : 0);
         lower_remote_call_seh_record_t seh_record{};
+        const DWORD last_error_before_call = GetLastError();
         const bool seh_ok = execute_lower_remote_call_body_guarded(item.get(), &outcome, &seh_record);
         if (!seh_ok) {
             outcome.lower_ok = false;
@@ -1903,13 +1930,14 @@ namespace
             outcome.seh_rbp = seh_record.rbp;
             outcome.worker_error_message = "seh_exception";
             const ULONGLONG seh_now = GetTickCount64();
-            diag::log_tagged_fmt("driver",
-                "call_function_lower_seh_exception call_id=%llu phase=%s label=%s tool=%s diag_id=%s pid=%u active_pid_entry=%u active_pid_now=%u generation=%llu generation_now=%llu fn=0x%llX exception_code=0x%08lX exception_address=0x%llX fault_address=0x%llX rip=0x%llX rsp=0x%llX rbp=0x%llX worker_tid=%lu deadline_ms=%llu deadline_remaining_ms=%llu queue_depth_submit=%u queue_depth_after_pop=%u inflight=%u queue_wait_ms=%llu lower_elapsed_ms=%llu elapsed_ms=%llu abandoned=%d allow_zero=%d status=%s last_error=%s",
+            diag::log_tagged_critical_fmt("driver",
+                "call_function_lower_seh_exception call_id=%llu phase=%s label=%s tool=%s diag_id=%s caller_pid=%lu expected_pid=%u active_pid_entry=%u active_pid_now=%u generation=%llu generation_now=%llu fn=0x%llX exception_code=0x%08lX exception_address=0x%llX fault_address=0x%llX rip=0x%llX rsp=0x%llX rbp=0x%llX worker_tid=%lu seh_caller_pid=%lu seh_worker_tid=%lu deadline_ms=%llu deadline_remaining_ms=%llu queue_depth_submit=%u queue_depth_after_pop=%u inflight=%u queue_wait_ms=%llu lower_elapsed_ms=%llu elapsed_ms=%llu abandoned=%d allow_zero=%d last_error_before_call=%lu last_error_after_seh=%lu status=%s last_error=%s",
                 static_cast<unsigned long long>(item->call_id),
                 item->phase.c_str(),
                 item->label.c_str(),
                 item->tool.c_str(),
                 item->diag_id.c_str(),
+                static_cast<unsigned long>(GetCurrentProcessId()),
                 item->expected_pid,
                 item->active_pid_at_entry,
                 driver_bridge::attached_pid(),
@@ -1923,6 +1951,8 @@ namespace
                 static_cast<unsigned long long>(seh_record.rsp),
                 static_cast<unsigned long long>(seh_record.rbp),
                 static_cast<unsigned long>(worker_tid),
+                static_cast<unsigned long>(seh_record.caller_pid),
+                static_cast<unsigned long>(seh_record.worker_tid),
                 static_cast<unsigned long long>(item->deadline_ms),
                 static_cast<unsigned long long>(deadline_remaining_ms(item->deadline_ms, seh_now)),
                 outcome.queue_depth_at_submit,
@@ -1933,6 +1963,8 @@ namespace
                 static_cast<unsigned long long>(seh_now - item->call_start),
                 abandoned ? 1 : 0,
                 item->allow_zero_result ? 1 : 0,
+                static_cast<unsigned long>(last_error_before_call),
+                static_cast<unsigned long>(seh_record.last_error_after_seh),
                 driver_bridge::status().c_str(),
                 driver_bridge::last_error().c_str());
         }
@@ -2784,6 +2816,9 @@ namespace
         uint32_t worker_alive = 0;
         DWORD elapsed_ms = 0;
     };
+
+    constexpr DWORD kSetActivePidDrainTimeoutMs = 2500;
+    constexpr DWORD kAttachAdditionalDrainTimeoutMs = 9000;
 
     lower_remote_call_drain_result_t wait_lower_remote_call_drain_for_pid_switch(uint32_t from_pid,
                                                                                  uint32_t to_pid,
@@ -4230,7 +4265,7 @@ namespace
 
 namespace driver_bridge
 {
-    bool refresh_kernel_context_locked(uint32_t pid, process_ctx_t& ctx);
+    bool refresh_kernel_context_locked(uint32_t pid, process_ctx_t& ctx, const char* op = "refresh");
 
     scoped_remote_call_context_t::scoped_remote_call_context_t(const remote_call_context_t& context)
         : previous_(g_remote_call_context_tls)
@@ -5219,9 +5254,18 @@ namespace driver_bridge
         if (pid == static_cast<uint32_t>(GetCurrentProcessId()))
             return false;
 
-        std::lock_guard<std::mutex> lk(g_state_mtx);
+        const DWORD caller_tid = GetCurrentThreadId();
+        const ULONGLONG attach_additional_entry_tick = GetTickCount64();
+
+        std::unique_lock<std::mutex> lk(g_state_mtx);
         if (g_processes.find(pid) != g_processes.end()) {
             clear_last_error_locked_after_success("attach_additional_existing");
+            diag::log_tagged_fmt("driver",
+                "attach_additional_existing pid=%u current_g_pid=%u caller_tid=%lu entry_tick=%llu",
+                pid,
+                g_pid,
+                static_cast<unsigned long>(caller_tid),
+                static_cast<unsigned long long>(attach_additional_entry_tick));
             return true;
         }
 
@@ -5229,6 +5273,55 @@ namespace driver_bridge
             require_kernel_fail("attach_additional");
             set_last_error_locked("attach_additional requires WhosWho kernel driver for PID " + std::to_string(pid));
             return false;
+        }
+
+        const uint32_t bind_before_pid = g_pid;
+        const uint32_t inflight_before = g_remote_call_lower_inflight.load(std::memory_order_acquire);
+        const uint32_t queue_depth_before = g_remote_call_lower_queue_depth.load(std::memory_order_acquire);
+        const DWORD worker_tid_before = g_remote_call_lower_worker_tid.load(std::memory_order_acquire);
+        diag::log_tagged_fmt("driver",
+            "attach_additional_enter pid=%u from_pid=%u inflight=%u queue_depth=%u worker_tid=%lu caller_tid=%lu entry_tick=%llu",
+            pid,
+            bind_before_pid,
+            inflight_before,
+            queue_depth_before,
+            static_cast<unsigned long>(worker_tid_before),
+            static_cast<unsigned long>(caller_tid),
+            static_cast<unsigned long long>(attach_additional_entry_tick));
+
+        if (bind_before_pid != 0 && bind_before_pid != pid &&
+            (inflight_before != 0 || queue_depth_before != 0)) {
+            lk.unlock();
+            lower_remote_call_drain_result_t drain =
+                wait_lower_remote_call_drain_for_pid_switch(bind_before_pid, pid, "attach_additional", kAttachAdditionalDrainTimeoutMs);
+            lk.lock();
+            if (!drain.drained) {
+                set_last_error_locked("attach_additional: lower remote call drain failed from pid " +
+                    std::to_string(bind_before_pid) + " to pid " + std::to_string(pid) +
+                    " queue_depth=" + std::to_string(drain.queue_depth) +
+                    " inflight=" + std::to_string(drain.inflight));
+                diag::log_tagged_fmt("driver",
+                    "attach_additional_drain_reject pid=%u from_pid=%u queue_depth=%u inflight=%u worker_alive=%u worker_tid=%lu caller_tid=%lu elapsed_ms=%lu last_error=%s",
+                    pid,
+                    bind_before_pid,
+                    drain.queue_depth,
+                    drain.inflight,
+                    drain.worker_alive,
+                    static_cast<unsigned long>(g_remote_call_lower_worker_tid.load(std::memory_order_acquire)),
+                    static_cast<unsigned long>(caller_tid),
+                    static_cast<unsigned long>(drain.elapsed_ms),
+                    g_last_error.c_str());
+                return false;
+            }
+            if (g_processes.find(pid) != g_processes.end()) {
+                clear_last_error_locked_after_success("attach_additional_existing_after_drain");
+                diag::log_tagged_fmt("driver",
+                    "attach_additional_existing_after_drain pid=%u current_g_pid=%u drain_elapsed_ms=%lu",
+                    pid,
+                    g_pid,
+                    static_cast<unsigned long>(drain.elapsed_ms));
+                return true;
+            }
         }
 
         constexpr DWORD access = PROCESS_QUERY_LIMITED_INFORMATION;
@@ -5247,23 +5340,61 @@ namespace driver_bridge
         ctx.cached_image_base = 0;
         ctx.cached_dtb = 0;
         ctx.cached_kernel_dtb = 0;
-        if (!refresh_kernel_context_locked(pid, ctx)) {
+        if (!refresh_kernel_context_locked(pid, ctx, "attach_additional")) {
             release_ctx_handle(ctx);
             set_last_error_locked("WhosWho failed to attach additional PID " + std::to_string(pid));
+            diag::log_tagged_fmt("driver",
+                "attach_additional_reject pid=%u reason=dtb_unresolved current_g_pid=%u inflight=%u caller_tid=%lu elapsed_ms=%llu",
+                pid,
+                g_pid,
+                g_remote_call_lower_inflight.load(std::memory_order_acquire),
+                static_cast<unsigned long>(caller_tid),
+                static_cast<unsigned long long>(GetTickCount64() - attach_additional_entry_tick));
             return false;
         }
         g_processes[pid] = std::move(ctx);
 
-        diag::log_tagged_fmt("driver", "attach_additional_ok pid=%u kernel_attached=1 has_vm_read=0", pid);
+        diag::log_tagged_fmt("driver",
+            "attach_additional_ok pid=%u kernel_attached=1 has_vm_read=0 current_g_pid=%u caller_tid=%lu elapsed_ms=%llu",
+            pid,
+            g_pid,
+            static_cast<unsigned long>(caller_tid),
+            static_cast<unsigned long long>(GetTickCount64() - attach_additional_entry_tick));
         clear_last_error_locked_after_success("attach_additional");
         return true;
     }
 
-    bool refresh_kernel_context_locked(uint32_t pid, process_ctx_t& ctx)
+    bool refresh_kernel_context_locked(uint32_t pid, process_ctx_t& ctx, const char* op)
     {
         if (!g_kernel_mode || !device || !device->is_connected()) {
             ctx.kernel_attached = false;
             return false;
+        }
+
+        const char* op_label = (op && op[0]) ? op : "refresh";
+        const DWORD caller_tid = GetCurrentThreadId();
+        const uint64_t dtb_before = device->get_dtb();
+        const uint64_t kernel_dtb_before = device->get_kernel_dtb();
+        const uint64_t base_before = device->get_base_address();
+        const std::uint32_t device_pid_before = device->get_process_id();
+        const uint32_t inflight_pre = g_remote_call_lower_inflight.load(std::memory_order_acquire);
+        diag::log_tagged_fmt("driver",
+            "refresh_kernel_context_pre op=%s pid=%u current_g_pid=%u device_pid_before=%u dtb_before=0x%llX kernel_dtb_before=0x%llX base_before=0x%llX inflight=%u worker_tid=%lu caller_tid=%lu",
+            op_label,
+            pid,
+            g_pid,
+            device_pid_before,
+            static_cast<unsigned long long>(dtb_before),
+            static_cast<unsigned long long>(kernel_dtb_before),
+            static_cast<unsigned long long>(base_before),
+            inflight_pre,
+            static_cast<unsigned long>(g_remote_call_lower_worker_tid.load(std::memory_order_acquire)),
+            static_cast<unsigned long>(caller_tid));
+
+        if (device_pid_before != pid) {
+            device->set_dtb(0);
+            device->set_kernel_dtb(0);
+            device->set_base_address(0);
         }
 
         arc_bridge_set_process_id(pid);
@@ -5278,6 +5409,17 @@ namespace driver_bridge
             device->set_dtb(ctx.cached_dtb);
         if (device->get_dtb() == 0) {
             ctx.kernel_attached = false;
+            device->set_process_id(0);
+            arc_bridge_set_process_id(0);
+            diag::log_tagged_fmt("driver",
+                "refresh_kernel_context_post op=%s pid=%u dtb_before=0x%llX dtb_after=0x0 kernel_dtb_after=0x0 base_after=0x0 kernel_attached=0 arc_dtb=0x%llX cached_dtb=0x%llX inflight_after=%u caller_tid=%lu",
+                op_label,
+                pid,
+                static_cast<unsigned long long>(dtb_before),
+                static_cast<unsigned long long>(arc_dtb),
+                static_cast<unsigned long long>(ctx.cached_dtb),
+                g_remote_call_lower_inflight.load(std::memory_order_acquire),
+                static_cast<unsigned long>(caller_tid));
             return false;
         }
 
@@ -5301,6 +5443,20 @@ namespace driver_bridge
             device->solve_kernel_dtb();
             ctx.cached_kernel_dtb = device->get_kernel_dtb();
         }
+        diag::log_tagged_fmt("driver",
+            "refresh_kernel_context_post op=%s pid=%u dtb_before=0x%llX dtb_after=0x%llX kernel_dtb_after=0x%llX base_after=0x%llX kernel_attached=1 arc_dtb=0x%llX cached_dtb=0x%llX cached_kernel_dtb=0x%llX cached_image_base=0x%llX inflight_after=%u caller_tid=%lu",
+            op_label,
+            pid,
+            static_cast<unsigned long long>(dtb_before),
+            static_cast<unsigned long long>(device->get_dtb()),
+            static_cast<unsigned long long>(device->get_kernel_dtb()),
+            static_cast<unsigned long long>(device->get_base_address()),
+            static_cast<unsigned long long>(arc_dtb),
+            static_cast<unsigned long long>(ctx.cached_dtb),
+            static_cast<unsigned long long>(ctx.cached_kernel_dtb),
+            static_cast<unsigned long long>(ctx.cached_image_base),
+            g_remote_call_lower_inflight.load(std::memory_order_acquire),
+            static_cast<unsigned long>(caller_tid));
         return true;
     }
 
@@ -5315,7 +5471,7 @@ namespace driver_bridge
             process_ctx_t transient;
             process_ctx_t& ctx = (it != g_processes.end()) ? it->second : transient;
             if (g_kernel_mode && device && device->is_connected()) {
-                g_kernel_attached = refresh_kernel_context_locked(pid, ctx);
+                g_kernel_attached = refresh_kernel_context_locked(pid, ctx, "set_active_pid_same");
             }
             const std::uint64_t active_generation = g_active_pid_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
             diag::log_tagged_fmt("driver", "set_active_pid_same pid=%u kernel_attached=%d dtb=0x%llX cached_dtb=0x%llX active_generation=%llu",
@@ -5337,7 +5493,7 @@ namespace driver_bridge
         lk.unlock();
         lower_remote_call_drain_result_t drain{};
         if (switching_from_pid != 0 && switching_from_pid != pid)
-            drain = wait_lower_remote_call_drain_for_pid_switch(switching_from_pid, pid, "set_active_pid", 2500);
+            drain = wait_lower_remote_call_drain_for_pid_switch(switching_from_pid, pid, "set_active_pid", kSetActivePidDrainTimeoutMs);
         else
             drain.drained = true;
         lk.lock();
@@ -5357,12 +5513,22 @@ namespace driver_bridge
                 g_last_error.c_str());
             return false;
         }
+        diag::log_tagged_fmt("driver",
+            "set_active_pid_drain_ok pid=%u current_pid=%u from_pid=%u inflight_after=%u queue_depth_after=%u worker_alive=%u worker_tid=%lu drain_elapsed_ms=%lu",
+            pid,
+            g_pid,
+            switching_from_pid,
+            drain.inflight,
+            drain.queue_depth,
+            drain.worker_alive,
+            static_cast<unsigned long>(g_remote_call_lower_worker_tid.load(std::memory_order_acquire)),
+            static_cast<unsigned long>(drain.elapsed_ms));
         if (g_pid == pid) {
             auto same_it = g_processes.find(pid);
             process_ctx_t transient;
             process_ctx_t& ctx = (same_it != g_processes.end()) ? same_it->second : transient;
             if (g_kernel_mode && device && device->is_connected()) {
-                g_kernel_attached = refresh_kernel_context_locked(pid, ctx);
+                g_kernel_attached = refresh_kernel_context_locked(pid, ctx, "set_active_pid_same_after_drain");
             }
             const std::uint64_t active_generation = g_active_pid_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
             diag::log_tagged_fmt("driver", "set_active_pid_same_after_drain pid=%u kernel_attached=%d dtb=0x%llX cached_dtb=0x%llX active_generation=%llu drain_elapsed_ms=%lu",
@@ -5411,7 +5577,7 @@ namespace driver_bridge
 
         bool kernel_mode = g_kernel_mode && device && device->is_connected();
         if (kernel_mode) {
-            g_kernel_attached = refresh_kernel_context_locked(pid, target);
+            g_kernel_attached = refresh_kernel_context_locked(pid, target, "set_active_pid_switch");
         }
         diag::log_tagged_fmt("driver", "set_active_pid_ok pid=%u kernel_attached=%d dtb=0x%llX cached_dtb=0x%llX active_generation=%llu",
             pid,
@@ -6752,26 +6918,50 @@ namespace driver_bridge
 {
     bool read_memory_for(uint32_t pid, uint64_t address, size_t size, std::vector<uint8_t>& out)
     {
+        const ULONGLONG t0 = GetTickCount64();
+        diag::log_tagged_fmt("driver_bridge",
+            "read_memory_for_enter pid=%u tid=%lu addr=0x%llX size=%zu attached_pid=%u",
+            pid,
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            static_cast<unsigned long long>(address),
+            size,
+            attached_pid());
+        const ULONGLONG t_arc_start = GetTickCount64();
         driver_bridge_pid_call::pid_scope_t scope;
-        if (!driver_bridge_pid_call::enter(scope, pid)) {
+        const bool enter_ok = driver_bridge_pid_call::enter(scope, pid);
+        const ULONGLONG arc_lookup_elapsed_ms = GetTickCount64() - t_arc_start;
+        if (!enter_ok) {
             const std::string err = last_error();
             diag::log_tagged_fmt("driver_bridge",
-                "read_memory_for pid=%u addr=0x%llX size=%zu enter_failed active_pid=%u status=%s last_error=%s gle=%lu",
+                "read_memory_for pid=%u addr=0x%llX size=%zu enter_failed active_pid=%u status=%s last_error=%s gle=%lu arc_lookup_elapsed_ms=%llu outer_elapsed_ms=%llu",
                 pid,
                 static_cast<unsigned long long>(address),
                 size,
                 attached_pid(),
                 status().c_str(),
                 err.empty() ? "(empty)" : err.c_str(),
-                static_cast<unsigned long>(GetLastError()));
+                static_cast<unsigned long>(GetLastError()),
+                static_cast<unsigned long long>(arc_lookup_elapsed_ms),
+                static_cast<unsigned long long>(GetTickCount64() - t0));
+            diag::log_tagged_fmt("driver_bridge",
+                "read_memory_for_exit pid=%u tid=%lu addr=0x%llX size=%zu ok=0 outer_elapsed_ms=%llu arc_lookup_elapsed_ms=%llu kernel_call_elapsed_ms=0 reason=enter_failed",
+                pid,
+                static_cast<unsigned long>(GetCurrentThreadId()),
+                static_cast<unsigned long long>(address),
+                size,
+                static_cast<unsigned long long>(GetTickCount64() - t0),
+                static_cast<unsigned long long>(arc_lookup_elapsed_ms));
             return false;
         }
         const uint64_t dtb_entry = device ? device->get_dtb() : 0;
         const bridge_region_snapshot_t region_before = capture_bridge_region_snapshot(address);
+        const ULONGLONG t_kernel_start = GetTickCount64();
         bool ok = read_memory(address, size, out);
+        const ULONGLONG kernel_call_elapsed_ms = GetTickCount64() - t_kernel_start;
         const bridge_region_snapshot_t region_after = capture_bridge_region_snapshot(address);
+        const ULONGLONG outer_elapsed_ms = GetTickCount64() - t0;
         diag::log_tagged_fmt("driver_bridge",
-            "read_memory_for pid=%u active_pid=%u tid=%lu addr=0x%llX size=%zu ok=%d bytes=%zu dtb_entry=0x%llX dtb_exit=0x%llX gle=%lu driver_last_error=%s all_zero=%d first16=%s region_before_ok=%d region_after_ok=%d state_before=0x%lX protect_before=0x%lX state_after=0x%lX protect_after=0x%lX",
+            "read_memory_for pid=%u active_pid=%u tid=%lu addr=0x%llX size=%zu ok=%d bytes=%zu dtb_entry=0x%llX dtb_exit=0x%llX gle=%lu driver_last_error=%s all_zero=%d first16=%s region_before_ok=%d region_after_ok=%d state_before=0x%lX protect_before=0x%lX state_after=0x%lX protect_after=0x%lX arc_lookup_elapsed_ms=%llu kernel_call_elapsed_ms=%llu outer_elapsed_ms=%llu",
             pid,
             attached_pid(),
             static_cast<unsigned long>(GetCurrentThreadId()),
@@ -6790,7 +6980,20 @@ namespace driver_bridge
             static_cast<unsigned long>(region_before.state),
             static_cast<unsigned long>(region_before.protect),
             static_cast<unsigned long>(region_after.state),
-            static_cast<unsigned long>(region_after.protect));
+            static_cast<unsigned long>(region_after.protect),
+            static_cast<unsigned long long>(arc_lookup_elapsed_ms),
+            static_cast<unsigned long long>(kernel_call_elapsed_ms),
+            static_cast<unsigned long long>(outer_elapsed_ms));
+        diag::log_tagged_fmt("driver_bridge",
+            "read_memory_for_exit pid=%u tid=%lu addr=0x%llX size=%zu ok=%d outer_elapsed_ms=%llu arc_lookup_elapsed_ms=%llu kernel_call_elapsed_ms=%llu",
+            pid,
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            static_cast<unsigned long long>(address),
+            size,
+            ok ? 1 : 0,
+            static_cast<unsigned long long>(outer_elapsed_ms),
+            static_cast<unsigned long long>(arc_lookup_elapsed_ms),
+            static_cast<unsigned long long>(kernel_call_elapsed_ms));
         return ok;
     }
 
@@ -7814,7 +8017,27 @@ namespace driver_bridge
             return 0;
 
         const DWORD name_count = (std::min<DWORD>)(exp.NumberOfNames, 65536u);
+        const ULONGLONG export_walk_started_ms = GetTickCount64();
         for (DWORD i = 0; i < name_count; ++i) {
+            if ((i & 0x0F) == 0) {
+                const bool cancelled = mcp_standalone::current_call_cancelled();
+                const uint64_t deadline_ms = mcp_standalone::current_call_deadline_ms();
+                const ULONGLONG now_tick = GetTickCount64();
+                if (cancelled || (deadline_ms != 0 && now_tick >= deadline_ms)) {
+                    diag::log_tagged_fmt("driver_bridge",
+                        "resolve_export_user_fallback_cancelled module=0x%llX export=%s names_scanned=%u name_count=%u elapsed_ms=%llu cancelled=%d deadline_ms=%llu diag_id=%s",
+                        static_cast<unsigned long long>(module_base),
+                        export_name,
+                        static_cast<unsigned int>(i),
+                        static_cast<unsigned int>(name_count),
+                        static_cast<unsigned long long>(now_tick - export_walk_started_ms),
+                        cancelled ? 1 : 0,
+                        static_cast<unsigned long long>(deadline_ms),
+                        mcp_standalone::current_call_diag_id());
+                    SetLastError(ERROR_CANCELLED);
+                    return 0;
+                }
+            }
             DWORD name_rva = 0;
             WORD ordinal_index = 0;
             if (!read_process_exact(module_base + exp.AddressOfNames + static_cast<uint64_t>(i) * sizeof(DWORD),

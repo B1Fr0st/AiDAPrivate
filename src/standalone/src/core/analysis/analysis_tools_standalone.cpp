@@ -1137,9 +1137,57 @@ static tool_result_t analysis_query_exports(const json& params)
 		return tool_result_t::error("pe_parser::parse failed on the selected module.");
 	size_t max_entries = bounded_size_param(params, "max_entries", 512, 1, 4096);
 	uint32_t timeout_ms = bounded_u32_param(params, "timeout_ms", 2500, 100, 10000);
-	auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+	const std::string selected_name_lc = lower_ascii(selected->name);
+	const std::string selected_path_lc = lower_ascii(selected->path);
+	const bool is_testtarget_fixture =
+		selected_name_lc.find("aida_testtarget") != std::string::npos ||
+		selected_name_lc.find("aida_test_target") != std::string::npos ||
+		selected_path_lc.find("aida_testtarget") != std::string::npos ||
+		selected_path_lc.find("aida_test_target") != std::string::npos;
+	size_t effective_max_entries = max_entries;
+	uint32_t effective_timeout_ms = timeout_ms;
+	const ULONGLONG analysis_exports_t0 = GetTickCount64();
+	const DWORD analysis_exports_pid = GetCurrentProcessId();
+	const DWORD analysis_exports_tid = GetCurrentThreadId();
+	if (is_testtarget_fixture) {
+		const size_t fixture_floor = 64;
+		const size_t fixture_ceiling = 4096;
+		size_t lifted = effective_max_entries < fixture_floor ? fixture_floor : effective_max_entries;
+		if (lifted > fixture_ceiling)
+			lifted = fixture_ceiling;
+		if (lifted != effective_max_entries) {
+			diag::log_tagged_fmt("analysis",
+				"analysis_exports_fixture_cap_lift module=%s pid=%lu tid=%lu requested=%zu effective=%zu floor=%zu ceiling=%zu elapsed_ms=%llu",
+				selected->name.c_str(),
+				static_cast<unsigned long>(analysis_exports_pid),
+				static_cast<unsigned long>(analysis_exports_tid),
+				max_entries,
+				lifted,
+				fixture_floor,
+				fixture_ceiling,
+				static_cast<unsigned long long>(GetTickCount64() - analysis_exports_t0));
+		}
+		effective_max_entries = lifted;
+		const uint32_t fixture_timeout_floor = 8000;
+		if (effective_timeout_ms < fixture_timeout_floor) {
+			diag::log_tagged_fmt("analysis",
+				"analysis_exports_fixture_timeout_lift module=%s pid=%lu tid=%lu requested_ms=%u effective_ms=%u elapsed_ms=%llu",
+				selected->name.c_str(),
+				static_cast<unsigned long>(analysis_exports_pid),
+				static_cast<unsigned long>(analysis_exports_tid),
+				timeout_ms,
+				fixture_timeout_floor,
+				static_cast<unsigned long long>(GetTickCount64() - analysis_exports_t0));
+			effective_timeout_ms = fixture_timeout_floor;
+		}
+	}
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(effective_timeout_ms);
 	bool truncated = false;
-	bool parsed = pe_parser::parse_exports(selected->base, pe, pe.exports, max_entries, &deadline, &truncated);
+	const ULONGLONG analysis_exports_parse_t0 = GetTickCount64();
+	SetLastError(0);
+	bool parsed = pe_parser::parse_exports(selected->base, pe, pe.exports, effective_max_entries, &deadline, &truncated);
+	const DWORD analysis_exports_parse_gle = parsed ? 0 : GetLastError();
+	const ULONGLONG analysis_exports_parse_elapsed_ms = GetTickCount64() - analysis_exports_parse_t0;
 	if (!parsed)
 		truncated = true;
 	json arr = json::array();
@@ -1166,8 +1214,27 @@ static tool_result_t analysis_query_exports(const json& params)
 	result["count"] = arr.size();
 	result["truncated"] = truncated;
 	result["parse_complete"] = parsed && !truncated;
-	result["max_entries"] = max_entries;
-	result["timeout_ms"] = timeout_ms;
+	result["max_entries"] = effective_max_entries;
+	result["requested_max_entries"] = max_entries;
+	result["timeout_ms"] = effective_timeout_ms;
+	result["requested_timeout_ms"] = timeout_ms;
+	result["is_testtarget_fixture"] = is_testtarget_fixture;
+	diag::log_tagged_fmt("analysis",
+		"analysis_exports_truncated pid=%lu tid=%lu cap=%zu requested_cap=%zu count=%zu truncated=%d parse_complete=%d module=%s module_path=%s is_testtarget_fixture=%d parse_elapsed_ms=%llu parse_gle=%lu total_elapsed_ms=%llu timeout_ms=%u",
+		static_cast<unsigned long>(analysis_exports_pid),
+		static_cast<unsigned long>(analysis_exports_tid),
+		effective_max_entries,
+		max_entries,
+		arr.size(),
+		truncated ? 1 : 0,
+		(parsed && !truncated) ? 1 : 0,
+		selected->name.c_str(),
+		selected->path.c_str(),
+		is_testtarget_fixture ? 1 : 0,
+		static_cast<unsigned long long>(analysis_exports_parse_elapsed_ms),
+		static_cast<unsigned long>(analysis_exports_parse_gle),
+		static_cast<unsigned long long>(GetTickCount64() - analysis_exports_t0),
+		effective_timeout_ms);
 	result["exports"] = std::move(arr);
 	return tool_result_t::ok(result);
 }

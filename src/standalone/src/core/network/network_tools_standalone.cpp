@@ -3548,6 +3548,7 @@ tool_result_t api_monitor_start(const json& params)
 
 tool_result_t api_monitor_results(const json& params)
 {
+    const ULONGLONG api_monitor_cleanup_t0 = GetTickCount64();
     size_t limit = params.value("limit", static_cast<size_t>(64));
     std::string filter_api;
     if (params.contains("filter_api") && params["filter_api"].is_string())
@@ -3557,11 +3558,26 @@ tool_result_t api_monitor_results(const json& params)
 
     diag::log_tagged_fmt("net_tools", "api_monitor_results limit=%zu filter=%s clear=%d stop=%d",
         limit, filter_api.c_str(), clear_after ? 1 : 0, stop_after ? 1 : 0);
+    diag::log_tagged_fmt("net_tools",
+        "api_monitor_cleanup_enter caller_pid=%lu caller_tid=%lu deadline_ms=%lu clear=%d stop=%d filter=%s",
+        static_cast<unsigned long>(GetCurrentProcessId()),
+        static_cast<unsigned long>(GetCurrentThreadId()),
+        static_cast<unsigned long>(3000),
+        clear_after ? 1 : 0,
+        stop_after ? 1 : 0,
+        filter_api.empty() ? "<empty>" : filter_api.c_str());
 
     const json status_before = api_monitor::status_json();
     const std::uint64_t event_queue_count_before = status_before.value("event_count", 0ull);
     const std::uint64_t total_hits_before = status_before.value("total_hits", 0ull);
     json result = api_monitor::results(limit, filter_api, clear_after, stop_after);
+    diag::log_tagged_fmt("net_tools",
+        "api_monitor_cleanup_exit caller_pid=%lu caller_tid=%lu ok=%d elapsed_ms=%llu reason=results_returned events=%llu",
+        static_cast<unsigned long>(GetCurrentProcessId()),
+        static_cast<unsigned long>(GetCurrentThreadId()),
+        1,
+        static_cast<unsigned long long>(GetTickCount64() - api_monitor_cleanup_t0),
+        static_cast<unsigned long long>(result.value("count", 0)));
     const int count = result.value("count", 0);
     const json status_after = result.contains("status") && result["status"].is_object()
         ? result["status"]

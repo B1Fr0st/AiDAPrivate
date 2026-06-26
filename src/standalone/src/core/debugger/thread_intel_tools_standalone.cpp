@@ -32,6 +32,9 @@ std::uint32_t process_id_from_params(const json& params)
 
 tool_result_t handle_thread_classify(const json& raw_params)
 {
+    const ULONGLONG classify_handler_t0 = GetTickCount64();
+    const DWORD classify_caller_pid = GetCurrentProcessId();
+    const DWORD classify_caller_tid = GetCurrentThreadId();
     const json params = compat_action_payload(raw_params);
     thread_intel::classify_options_t options;
     options.process_id = process_id_from_params(params);
@@ -44,9 +47,33 @@ tool_result_t handle_thread_classify(const json& raw_params)
     options.interval_ms = params.value("interval_ms", 100u);
     options.max_threads = params.value("max_threads", 128u);
 
+    diag::log_tagged_fmt("thread_intel",
+        "thread_classify_phase phase=handler_enter pid=%u caller_pid=%lu caller_tid=%lu sample_ms=%u interval_ms=%u max_threads=%u elapsed_ms=0",
+        options.process_id,
+        static_cast<unsigned long>(classify_caller_pid),
+        static_cast<unsigned long>(classify_caller_tid),
+        options.sample_ms,
+        options.interval_ms,
+        options.max_threads);
+
     json result;
     std::string error;
-    if (!thread_intel::classify_threads(options, result, error))
+    const ULONGLONG classify_call_t0 = GetTickCount64();
+    SetLastError(0);
+    const bool classify_ok = thread_intel::classify_threads(options, result, error);
+    const DWORD classify_gle = classify_ok ? 0 : GetLastError();
+    const ULONGLONG classify_call_elapsed_ms = GetTickCount64() - classify_call_t0;
+    diag::log_tagged_fmt("thread_intel",
+        "thread_classify_phase phase=handler_exit pid=%u caller_pid=%lu caller_tid=%lu ok=%d gle=%lu classify_elapsed_ms=%llu total_elapsed_ms=%llu error=%s",
+        options.process_id,
+        static_cast<unsigned long>(classify_caller_pid),
+        static_cast<unsigned long>(classify_caller_tid),
+        classify_ok ? 1 : 0,
+        static_cast<unsigned long>(classify_gle),
+        static_cast<unsigned long long>(classify_call_elapsed_ms),
+        static_cast<unsigned long long>(GetTickCount64() - classify_handler_t0),
+        error.empty() ? "<empty>" : error.c_str());
+    if (!classify_ok)
         return tool_result_t::error(error.empty() ? OBFSTR("thread classification failed") : error);
     if (options.process_id)
         result["process_id_hex"] = sa_format_address(options.process_id);
@@ -55,6 +82,7 @@ tool_result_t handle_thread_classify(const json& raw_params)
 
 tool_result_t handle_thread_watch_rip(const json& raw_params)
 {
+    const ULONGLONG handler_started_ms = GetTickCount64();
     const json params = compat_action_payload(raw_params);
     if (!params.contains("tid") || !params["tid"].is_number())
         return tool_result_t::error(OBFSTR("'tid' is required."));
@@ -68,9 +96,36 @@ tool_result_t handle_thread_watch_rip(const json& raw_params)
     options.samples = params.value("samples", 50u);
     options.interval_ms = params.value("interval_ms", 20u);
 
+    diag::log_tagged_fmt("thread_intel",
+        "watch_rip_phase phase=handler_enter tid=%u pid=%u samples=%u interval_ms=%u caller_pid=%lu caller_tid=%lu elapsed_ms=0",
+        options.tid,
+        options.process_id,
+        options.samples,
+        options.interval_ms,
+        static_cast<unsigned long>(GetCurrentProcessId()),
+        static_cast<unsigned long>(GetCurrentThreadId()));
+
     json result;
     std::string error;
-    if (!thread_intel::watch_rip(options, result, error))
+    const ULONGLONG watch_started_ms = GetTickCount64();
+    SetLastError(0);
+    const bool watch_ok = thread_intel::watch_rip(options, result, error);
+    const DWORD watch_gle = watch_ok ? 0 : GetLastError();
+    const ULONGLONG watch_elapsed_ms = GetTickCount64() - watch_started_ms;
+    diag::log_tagged_fmt("thread_intel",
+        "watch_rip_phase phase=handler_exit tid=%u pid=%u samples=%u interval_ms=%u ok=%d gle=%lu caller_pid=%lu caller_tid=%lu watch_elapsed_ms=%llu total_elapsed_ms=%llu error=%s",
+        options.tid,
+        options.process_id,
+        options.samples,
+        options.interval_ms,
+        watch_ok ? 1 : 0,
+        static_cast<unsigned long>(watch_gle),
+        static_cast<unsigned long>(GetCurrentProcessId()),
+        static_cast<unsigned long>(GetCurrentThreadId()),
+        static_cast<unsigned long long>(watch_elapsed_ms),
+        static_cast<unsigned long long>(GetTickCount64() - handler_started_ms),
+        error.empty() ? "<empty>" : error.c_str());
+    if (!watch_ok)
         return tool_result_t::error(error.empty() ? OBFSTR("thread RIP watch failed") : error);
     result["tid_hex"] = sa_format_address(options.tid);
     return tool_result_t::ok(OBFSTR("Thread RIP hot-path profile sampled."), result);

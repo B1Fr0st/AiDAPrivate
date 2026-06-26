@@ -2252,6 +2252,89 @@ static void log_active_session_owner_stale_if_needed(const active_session_owner_
         owner.shared_owner_count);
 }
 
+static std::mutex& active_session_owner_cancel_token_mutex()
+{
+    static std::mutex m;
+    return m;
+}
+
+static std::map<std::uint64_t, std::atomic<bool>*>& active_session_owner_cancel_tokens()
+{
+    static std::map<std::uint64_t, std::atomic<bool>*> tokens;
+    return tokens;
+}
+
+static void register_owner_cancel_token(std::uint64_t token, std::atomic<bool>* cancel_ptr)
+{
+    if (token == 0 || cancel_ptr == nullptr)
+        return;
+    std::lock_guard<std::mutex> lk(active_session_owner_cancel_token_mutex());
+    active_session_owner_cancel_tokens()[token] = cancel_ptr;
+}
+
+static bool signal_owner_cancel_token_locked(std::uint64_t token, bool& out_was_cancelled, bool& out_present)
+{
+    out_was_cancelled = false;
+    out_present = false;
+    if (token == 0)
+        return false;
+    std::lock_guard<std::mutex> lk(active_session_owner_cancel_token_mutex());
+    auto& tokens = active_session_owner_cancel_tokens();
+    auto it = tokens.find(token);
+    if (it == tokens.end() || it->second == nullptr)
+        return false;
+    out_present = true;
+    out_was_cancelled = it->second->load(std::memory_order_acquire);
+    it->second->store(true, std::memory_order_release);
+    return !out_was_cancelled;
+}
+
+static void unregister_owner_cancel_token(std::uint64_t token)
+{
+    if (token == 0)
+        return;
+    std::lock_guard<std::mutex> lk(active_session_owner_cancel_token_mutex());
+    active_session_owner_cancel_tokens().erase(token);
+}
+
+static bool active_session_owner_request_eviction(const active_session_owner_snapshot_t& owner, const char* reason)
+{
+    if (!owner.present || owner.token == 0)
+        return false;
+    bool was_cancelled = false;
+    bool cancel_ptr_present = false;
+    const bool signalled = signal_owner_cancel_token_locked(owner.token, was_cancelled, cancel_ptr_present);
+    {
+        std::lock_guard<std::mutex> lk(active_session_owner_mutex());
+        auto& exclusive_owner = active_session_exclusive_owner();
+        if (exclusive_owner.active && exclusive_owner.token == owner.token)
+            exclusive_owner.cancelled = true;
+        auto& shared_owners = active_session_shared_owners();
+        for (auto& record : shared_owners) {
+            if (record.active && record.token == owner.token)
+                record.cancelled = true;
+        }
+    }
+    diag::log_tagged_fmt("mcp_srv",
+        "tool_policy_lock_eviction_requested reason=%s owner_tool='%s' owner_lane=%s owner_diag_id=%s owner_mode=%s owner_pid=%lu owner_tid=%lu owner_age_ms=%llu owner_deadline_ms=%llu owner_phase=%s token=%llu cancel_token_present=%d signalled_now=%d already_cancelled=%d shared_owner_count=%zu",
+        reason ? reason : "",
+        owner.tool.c_str(),
+        owner.lane.c_str(),
+        owner.diag_id.c_str(),
+        owner.exclusive ? "exclusive" : "shared",
+        static_cast<unsigned long>(owner.pid),
+        static_cast<unsigned long>(owner.tid),
+        static_cast<unsigned long long>(owner.owner_age_ms),
+        static_cast<unsigned long long>(owner.deadline_ms),
+        owner.phase.c_str(),
+        static_cast<unsigned long long>(owner.token),
+        cancel_ptr_present ? 1 : 0,
+        signalled ? 1 : 0,
+        owner.cancelled || was_cancelled ? 1 : 0,
+        owner.shared_owner_count);
+    return signalled;
+}
+
 class active_session_owner_guard_t
 {
 public:
@@ -2271,10 +2354,12 @@ public:
         , deadline_ms_(current_call_deadline_ms())
         , pid_(GetCurrentProcessId())
         , tid_(GetCurrentThreadId())
+        , cancel_token_at_acquire_(current_cancel_token())
     {
+        register_owner_cancel_token(token_, cancel_token_at_acquire_);
         record("acquired");
         diag::log_tagged_fmt("mcp_srv",
-            "tool_policy_lock_hold_begin tool='%s' lane=%s mode=%s diag_id=%s pid=%lu tid=%lu deadline_ms=%llu cancelled=%d shared_owner_count=%zu token=%llu",
+            "tool_policy_lock_hold_begin tool='%s' lane=%s mode=%s diag_id=%s pid=%lu tid=%lu deadline_ms=%llu cancelled=%d shared_owner_count=%zu token=%llu cancel_token_bound=%d",
             tool_.c_str(),
             lane_.c_str(),
             exclusive_ ? "exclusive" : "shared",
@@ -2284,7 +2369,8 @@ public:
             static_cast<unsigned long long>(deadline_ms_),
             current_call_cancelled() ? 1 : 0,
             active_session_owner_snapshot().shared_owner_count,
-            static_cast<unsigned long long>(token_));
+            static_cast<unsigned long long>(token_),
+            cancel_token_at_acquire_ ? 1 : 0);
     }
 
     active_session_owner_guard_t(const active_session_owner_guard_t&) = delete;
@@ -2300,23 +2386,43 @@ public:
         if (!active_)
             return;
         phase_ = sanitize_owner_field(phase ? phase : "");
-        std::lock_guard<std::mutex> lk(active_session_owner_mutex());
-        if (exclusive_) {
-            auto& owner = active_session_exclusive_owner();
-            if (owner.active && owner.token == token_) {
-                owner.phase = phase_;
-                owner.cancelled = current_call_cancelled();
+        const std::uint64_t now_ms = mcp_now_ms();
+        const std::uint64_t elapsed_ms = now_ms >= acquired_ms_ ? now_ms - acquired_ms_ : 0;
+        const std::int64_t deadline_remaining_ms = deadline_ms_ == 0
+            ? std::int64_t(0)
+            : (static_cast<std::int64_t>(deadline_ms_) - static_cast<std::int64_t>(now_ms));
+        {
+            std::lock_guard<std::mutex> lk(active_session_owner_mutex());
+            if (exclusive_) {
+                auto& owner = active_session_exclusive_owner();
+                if (owner.active && owner.token == token_) {
+                    owner.phase = phase_;
+                    owner.cancelled = current_call_cancelled();
+                }
+            } else {
+                auto& shared_owners = active_session_shared_owners();
+                for (auto& owner : shared_owners) {
+                    if (owner.active && owner.token == token_) {
+                        owner.phase = phase_;
+                        owner.cancelled = current_call_cancelled();
+                        break;
+                    }
+                }
             }
-            return;
         }
-        auto& shared_owners = active_session_shared_owners();
-        for (auto& owner : shared_owners) {
-            if (owner.active && owner.token == token_) {
-                owner.phase = phase_;
-                owner.cancelled = current_call_cancelled();
-                return;
-            }
-        }
+        diag::log_tagged_fmt("mcp_srv",
+            "tool_policy_lock_owner_phase token=%llu tool='%s' lane=%s mode=%s phase=%s elapsed_ms=%llu cancelled=%d deadline_remaining_ms=%lld diag_id=%s pid=%lu tid=%lu",
+            static_cast<unsigned long long>(token_),
+            tool_.c_str(),
+            lane_.c_str(),
+            exclusive_ ? "exclusive" : "shared",
+            phase_.c_str(),
+            static_cast<unsigned long long>(elapsed_ms),
+            current_call_cancelled() ? 1 : 0,
+            static_cast<long long>(deadline_remaining_ms),
+            diag_id_.c_str(),
+            static_cast<unsigned long>(pid_),
+            static_cast<unsigned long>(tid_));
     }
 
     void set_lane(const char* lane)
@@ -2376,14 +2482,23 @@ public:
         const std::uint64_t elapsed_ms = mcp_now_ms() >= acquired_ms_ ? mcp_now_ms() - acquired_ms_ : 0;
         std::size_t shared_count = 0;
         bool exclusive_active = false;
+        bool was_cancelled_record = false;
         {
             std::lock_guard<std::mutex> lk(active_session_owner_mutex());
             if (exclusive_) {
                 auto& owner = active_session_exclusive_owner();
-                if (owner.active && owner.token == token_)
+                if (owner.active && owner.token == token_) {
+                    was_cancelled_record = owner.cancelled;
                     owner = {};
+                }
             } else {
                 auto& shared_owners = active_session_shared_owners();
+                for (const auto& owner : shared_owners) {
+                    if (owner.token == token_ && owner.cancelled) {
+                        was_cancelled_record = true;
+                        break;
+                    }
+                }
                 shared_owners.erase(std::remove_if(shared_owners.begin(), shared_owners.end(),
                     [this](const active_session_owner_record_t& owner) {
                         return owner.token == token_;
@@ -2392,6 +2507,8 @@ public:
             shared_count = active_session_shared_owners().size();
             exclusive_active = active_session_exclusive_owner().active;
         }
+        unregister_owner_cancel_token(token_);
+        const bool current_cancelled_flag = current_call_cancelled();
         diag::log_tagged_fmt("mcp_srv",
             "tool_policy_lock_hold_end tool='%s' lane=%s mode=%s diag_id=%s reason=%s elapsed_ms=%llu pid=%lu tid=%lu deadline_ms=%llu cancelled=%d phase=%s shared_owner_count=%zu exclusive_owner=%d token=%llu",
             tool_.c_str(),
@@ -2403,11 +2520,28 @@ public:
             static_cast<unsigned long>(pid_),
             static_cast<unsigned long>(tid_),
             static_cast<unsigned long long>(deadline_ms_),
-            current_call_cancelled() ? 1 : 0,
+            current_cancelled_flag ? 1 : 0,
             phase_.c_str(),
             shared_count,
             exclusive_active ? 1 : 0,
             static_cast<unsigned long long>(token_));
+        if (was_cancelled_record || current_cancelled_flag) {
+            diag::log_tagged_fmt("mcp_srv",
+                "tool_policy_lock_hold_end_evicted tool='%s' lane=%s mode=%s diag_id=%s reason=%s elapsed_ms=%llu phase=%s pid=%lu tid=%lu deadline_ms=%llu owner_cancelled_record=%d current_cancelled=%d token=%llu",
+                tool_.c_str(),
+                lane_.c_str(),
+                exclusive_ ? "exclusive" : "shared",
+                diag_id_.c_str(),
+                reason ? reason : "",
+                static_cast<unsigned long long>(elapsed_ms),
+                phase_.c_str(),
+                static_cast<unsigned long>(pid_),
+                static_cast<unsigned long>(tid_),
+                static_cast<unsigned long long>(deadline_ms_),
+                was_cancelled_record ? 1 : 0,
+                current_cancelled_flag ? 1 : 0,
+                static_cast<unsigned long long>(token_));
+        }
         active_ = false;
     }
 
@@ -2463,6 +2597,7 @@ private:
     std::uint64_t deadline_ms_ = 0;
     DWORD pid_ = 0;
     DWORD tid_ = 0;
+    std::atomic<bool>* cancel_token_at_acquire_ = nullptr;
 };
 
 static std::mutex& domain_lane_mutex(const std::string& domain)
@@ -2507,6 +2642,10 @@ struct policy_lock_wait_t
 {
     policy_lock_status_t status = policy_lock_status_t::busy;
     std::uint64_t wait_ms = 0;
+    bool eviction_requested = false;
+    bool owner_deadline_expired = false;
+    std::uint64_t owner_age_over_deadline_ms = 0;
+    active_session_owner_snapshot_t owner;
 };
 
 static std::uint64_t policy_lock_wait_budget_ms()
@@ -2532,6 +2671,7 @@ static policy_lock_wait_t wait_policy_lock(Lock& lock,
     const std::uint64_t started = mcp_now_ms();
     const std::uint64_t budget = policy_lock_wait_budget_ms();
     std::uint64_t last_log = started;
+    bool eviction_requested = false;
     diag::log_tagged_fmt("mcp_srv",
         "tool_policy_lock_wait_begin tool='%s' lane=%s mode=%s read_only=%d explicit_target=%d budget_ms=%llu diag_id=%s",
         tool_name.c_str(),
@@ -2548,22 +2688,37 @@ static policy_lock_wait_t wait_policy_lock(Lock& lock,
         {
             const std::uint64_t waited = mcp_now_ms() - started;
             diag::log_tagged_fmt("mcp_srv",
-                "tool_policy_lock_wait_acquired tool='%s' lane=%s mode=%s wait_ms=%llu diag_id=%s",
+                "tool_policy_lock_wait_acquired tool='%s' lane=%s mode=%s wait_ms=%llu diag_id=%s eviction_requested=%d",
                 tool_name.c_str(),
                 lane ? lane : "",
                 mode ? mode : "",
                 static_cast<unsigned long long>(waited),
-                current_call_diag_id());
-            return {policy_lock_status_t::acquired, waited};
+                current_call_diag_id(),
+                eviction_requested ? 1 : 0);
+            policy_lock_wait_t result;
+            result.status = policy_lock_status_t::acquired;
+            result.wait_ms = waited;
+            result.eviction_requested = eviction_requested;
+            return result;
         }
 
         const std::uint64_t now = mcp_now_ms();
         const std::uint64_t waited = now >= started ? now - started : 0;
+
+        if (!eviction_requested) {
+            const active_session_owner_snapshot_t owner_for_evict = active_session_owner_snapshot();
+            if (owner_for_evict.present && owner_for_evict.deadline_ms != 0 &&
+                now >= owner_for_evict.deadline_ms && !owner_for_evict.cancelled) {
+                active_session_owner_request_eviction(owner_for_evict, "owner_deadline_expired");
+                eviction_requested = true;
+            }
+        }
+
         if (current_call_cancelled())
         {
             const active_session_owner_snapshot_t owner = active_session_owner_snapshot();
             diag::log_tagged_fmt("mcp_srv",
-                "tool_policy_lock_wait_cancelled tool='%s' lane=%s mode=%s wait_ms=%llu diag_id=%s owner_tool='%s' owner_lane=%s owner_diag_id=%s owner_mode=%s owner_pid=%lu owner_tid=%lu owner_age_ms=%llu owner_phase=%s shared_owner_count=%zu",
+                "tool_policy_lock_wait_cancelled tool='%s' lane=%s mode=%s wait_ms=%llu diag_id=%s owner_tool='%s' owner_lane=%s owner_diag_id=%s owner_mode=%s owner_pid=%lu owner_tid=%lu owner_age_ms=%llu owner_phase=%s shared_owner_count=%zu eviction_requested=%d",
                 tool_name.c_str(),
                 lane ? lane : "",
                 mode ? mode : "",
@@ -2577,16 +2732,35 @@ static policy_lock_wait_t wait_policy_lock(Lock& lock,
                 static_cast<unsigned long>(owner.tid),
                 static_cast<unsigned long long>(owner.owner_age_ms),
                 owner.phase.c_str(),
-                owner.shared_owner_count);
-            return {policy_lock_status_t::cancelled, waited};
+                owner.shared_owner_count,
+                eviction_requested ? 1 : 0);
+            policy_lock_wait_t result;
+            result.status = policy_lock_status_t::cancelled;
+            result.wait_ms = waited;
+            result.eviction_requested = eviction_requested;
+            result.owner = owner;
+            result.owner_deadline_expired = owner.present && owner.deadline_ms != 0 && now >= owner.deadline_ms;
+            if (owner.present && owner.deadline_ms != 0 && owner.acquired_ms != 0 && owner.deadline_ms >= owner.acquired_ms) {
+                const std::uint64_t owner_budget = owner.deadline_ms - owner.acquired_ms;
+                if (owner.owner_age_ms > owner_budget)
+                    result.owner_age_over_deadline_ms = owner.owner_age_ms - owner_budget;
+            }
+            return result;
         }
 
         const std::uint64_t deadline = current_call_deadline_ms();
         if ((budget == 0 || waited >= budget) || (deadline != 0 && now >= deadline))
         {
             const active_session_owner_snapshot_t owner = active_session_owner_snapshot();
+            const bool owner_deadline_expired_now = owner.present && owner.deadline_ms != 0 && now >= owner.deadline_ms;
+            std::uint64_t owner_age_over_deadline = 0;
+            if (owner.present && owner.deadline_ms != 0 && owner.acquired_ms != 0 && owner.deadline_ms >= owner.acquired_ms) {
+                const std::uint64_t owner_budget = owner.deadline_ms - owner.acquired_ms;
+                if (owner.owner_age_ms > owner_budget)
+                    owner_age_over_deadline = owner.owner_age_ms - owner_budget;
+            }
             diag::log_tagged_fmt("mcp_srv",
-                "tool_policy_lock_wait_busy tool='%s' lane=%s mode=%s wait_ms=%llu budget_ms=%llu diag_id=%s owner_tool='%s' owner_lane=%s owner_diag_id=%s owner_mode=%s owner_pid=%lu owner_tid=%lu owner_age_ms=%llu owner_deadline_ms=%llu owner_cancelled=%d owner_phase=%s shared_owner_count=%zu",
+                "tool_policy_lock_wait_busy tool='%s' lane=%s mode=%s wait_ms=%llu budget_ms=%llu diag_id=%s owner_tool='%s' owner_lane=%s owner_diag_id=%s owner_mode=%s owner_pid=%lu owner_tid=%lu owner_age_ms=%llu owner_deadline_ms=%llu owner_cancelled=%d owner_phase=%s shared_owner_count=%zu eviction_requested=%d owner_deadline_expired=%d owner_age_over_deadline_ms=%llu",
                 tool_name.c_str(),
                 lane ? lane : "",
                 mode ? mode : "",
@@ -2603,9 +2777,19 @@ static policy_lock_wait_t wait_policy_lock(Lock& lock,
                 static_cast<unsigned long long>(owner.deadline_ms),
                 owner.cancelled ? 1 : 0,
                 owner.phase.c_str(),
-                owner.shared_owner_count);
+                owner.shared_owner_count,
+                eviction_requested ? 1 : 0,
+                owner_deadline_expired_now ? 1 : 0,
+                static_cast<unsigned long long>(owner_age_over_deadline));
             log_active_session_owner_stale_if_needed(owner, "wait_busy", tool_name, lane, waited, budget);
-            return {policy_lock_status_t::busy, waited};
+            policy_lock_wait_t result;
+            result.status = policy_lock_status_t::busy;
+            result.wait_ms = waited;
+            result.eviction_requested = eviction_requested;
+            result.owner = owner;
+            result.owner_deadline_expired = owner_deadline_expired_now;
+            result.owner_age_over_deadline_ms = owner_age_over_deadline;
+            return result;
         }
 
         if (now - last_log >= kMcpPolicyLockLogEveryMs)
@@ -2676,7 +2860,10 @@ static tool_result_t policy_lock_error_result(const std::string& tool_name,
         {"lock_wait_ms", wait.wait_ms},
         {"diagnostic_id", current_call_diag_id()},
         {"cancelled", wait.status == policy_lock_status_t::cancelled},
-        {"busy", wait.status == policy_lock_status_t::busy}
+        {"busy", wait.status == policy_lock_status_t::busy},
+        {"owner_eviction_requested", wait.eviction_requested},
+        {"owner_deadline_expired", wait.owner_deadline_expired},
+        {"owner_age_over_deadline_ms", wait.owner_age_over_deadline_ms}
     };
     append_active_session_owner_fields(details, active_session_owner_snapshot());
     if (wait.status == policy_lock_status_t::cancelled)

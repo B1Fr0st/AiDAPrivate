@@ -680,12 +680,25 @@ namespace {
             tracker.is_running() ? "true" : "false");
         const bool stopped = tracker.stop(timeout_ms);
         const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        const bool cancel_after = is_cancelled(cancelled);
         log_msg(hf, tag, "after stop stopped=%d elapsed_ms=%lld cancel_before=%d cancel_after=%d is_running=%s",
             stopped ? 1 : 0,
             static_cast<long long>(elapsed),
             cancel_before ? 1 : 0,
-            is_cancelled(cancelled) ? 1 : 0,
+            cancel_after ? 1 : 0,
             tracker.is_running() ? "true" : "false");
+        if (!stopped) {
+            log_msg(hf, tag,
+                "TIMEOUT-DETAIL pid=%lu tid=%lu timeout_ms=%u elapsed_ms=%lld cancel_before=%d cancel_after=%d is_running=%s gle=%lu",
+                static_cast<unsigned long>(GetCurrentProcessId()),
+                static_cast<unsigned long>(GetCurrentThreadId()),
+                static_cast<unsigned>(timeout_ms),
+                static_cast<long long>(elapsed),
+                cancel_before ? 1 : 0,
+                cancel_after ? 1 : 0,
+                tracker.is_running() ? "true" : "false",
+                static_cast<unsigned long>(GetLastError()));
+        }
         return stopped;
     }
 
@@ -1107,10 +1120,12 @@ namespace {
 
     void test_tcp_stream_tracker(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped, bool(*cancelled)()) {
         const char* tag = "tcp_tracker";
+        (void)skipped;
         log_msg(hf, tag, "START -- tcp_stream_tracker create/start/stop");
         if (is_cancelled(cancelled)) {
-            log_msg(hf, tag, "SKIP -- cancelled before tracker start");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- cancelled before tracker start (cancellation in sanctioned full-test is a defect) pid=%lu tid=%lu",
+                static_cast<unsigned long>(GetCurrentProcessId()), static_cast<unsigned long>(GetCurrentThreadId()));
+            failed.fetch_add(1);
             return;
         }
         network_view::tcp_stream_tracker_t tracker;
@@ -1138,8 +1153,8 @@ namespace {
             log_msg(hf, tag, "PASS -- tracker start/stop lifecycle correct");
             passed.fetch_add(1);
         } else if (!stop_ok && is_cancelled(cancelled)) {
-            log_msg(hf, tag, "SKIP -- tracker stop timed out while cancellation was requested");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- tracker stop timed out while cancellation was requested (cancellation in sanctioned full-test is a defect)");
+            failed.fetch_add(1);
         } else {
             log_msg(hf, tag, "FAIL -- start=%s stop=%s", started ? "true" : "false", stopped ? "true" : "false");
             failed.fetch_add(1);
@@ -1148,10 +1163,12 @@ namespace {
 
     void test_tcp_tracker_evict(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped, bool(*cancelled)()) {
         const char* tag = "tcp_trk_evict";
+        (void)skipped;
         log_msg(hf, tag, "START -- tcp_stream_tracker::evict_stale()");
         if (is_cancelled(cancelled)) {
-            log_msg(hf, tag, "SKIP -- cancelled before tracker start");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- cancelled before tracker start (cancellation in sanctioned full-test is a defect) pid=%lu tid=%lu",
+                static_cast<unsigned long>(GetCurrentProcessId()), static_cast<unsigned long>(GetCurrentThreadId()));
+            failed.fetch_add(1);
             return;
         }
         network_view::tcp_stream_tracker_t tracker;
@@ -1162,8 +1179,8 @@ namespace {
         size_t count = tracker.stream_count();
         const bool stop_ok = stop_tracker_logged(tracker, hf, tag, cancelled);
         if (!stop_ok && is_cancelled(cancelled)) {
-            log_msg(hf, tag, "SKIP -- evict_stale completed but tracker stop timed out during cancellation");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- evict_stale completed but tracker stop timed out during cancellation (cancellation in sanctioned full-test is a defect)");
+            failed.fetch_add(1);
             return;
         }
         if (!stop_ok) {
@@ -1177,10 +1194,12 @@ namespace {
 
     void test_tcp_tracker_get_stream(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped, bool(*cancelled)()) {
         const char* tag = "tcp_trk_get";
+        (void)skipped;
         log_msg(hf, tag, "START -- tcp_stream_tracker::get_stream() for nonexistent key");
         if (is_cancelled(cancelled)) {
-            log_msg(hf, tag, "SKIP -- cancelled before tracker start");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- cancelled before tracker start (cancellation in sanctioned full-test is a defect) pid=%lu tid=%lu",
+                static_cast<unsigned long>(GetCurrentProcessId()), static_cast<unsigned long>(GetCurrentThreadId()));
+            failed.fetch_add(1);
             return;
         }
         network_view::tcp_stream_tracker_t tracker;
@@ -1196,8 +1215,8 @@ namespace {
         auto snap = tracker.get_stream(key);
         const bool stop_ok = stop_tracker_logged(tracker, hf, tag, cancelled);
         if (!stop_ok && is_cancelled(cancelled)) {
-            log_msg(hf, tag, "SKIP -- get_stream completed but tracker stop timed out during cancellation");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- get_stream completed but tracker stop timed out during cancellation (cancellation in sanctioned full-test is a defect)");
+            failed.fetch_add(1);
             return;
         }
         if (!stop_ok) {
@@ -1215,10 +1234,12 @@ namespace {
 
     void test_tcp_tracker_filtered(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped, bool(*cancelled)()) {
         const char* tag = "tcp_trk_filt";
+        (void)skipped;
         log_msg(hf, tag, "START -- tcp_stream_tracker with PID filter");
         if (is_cancelled(cancelled)) {
-            log_msg(hf, tag, "SKIP -- cancelled before tracker start");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- cancelled before tracker start (cancellation in sanctioned full-test is a defect) pid=%lu tid=%lu",
+                static_cast<unsigned long>(GetCurrentProcessId()), static_cast<unsigned long>(GetCurrentThreadId()));
+            failed.fetch_add(1);
             return;
         }
         network_view::tcp_stream_tracker_t tracker;
@@ -1228,8 +1249,8 @@ namespace {
         log_msg(hf, tag, "after start is_running=%s cancel=%d", started ? "true" : "false", is_cancelled(cancelled) ? 1 : 0);
         const bool stop_ok = stop_tracker_logged(tracker, hf, tag, cancelled);
         if (!stop_ok && is_cancelled(cancelled)) {
-            log_msg(hf, tag, "SKIP -- filtered tracker stop timed out during cancellation");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- filtered tracker stop timed out during cancellation (cancellation in sanctioned full-test is a defect)");
+            failed.fetch_add(1);
             return;
         }
         if (started && stop_ok) {
@@ -2293,8 +2314,10 @@ namespace {
         const char* tag = "drv_enum_conn";
         log_msg(hf, tag, "START -- driver_bridge::enumerate_connections()");
         if (!driver_bridge::using_kernel_driver()) {
-            log_msg(hf, tag, "SKIP -- kernel driver not loaded");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+            failed.fetch_add(1);
             return;
         }
         auto conns = driver_bridge::enumerate_connections(0, 0);
@@ -2306,8 +2329,10 @@ namespace {
         const char* tag = "drv_cap_cycle";
         log_msg(hf, tag, "START -- driver_bridge start_capture/traffic/stop cycle");
         if (!driver_bridge::using_kernel_driver()) {
-            log_msg(hf, tag, "SKIP -- kernel driver not loaded");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+            failed.fetch_add(1);
             return;
         }
         std::vector<driver_bridge::captured_packet_t> packets;
@@ -2323,8 +2348,10 @@ namespace {
         const char* tag = "drv_get_pkts";
         log_msg(hf, tag, "START -- driver_bridge::get_captured_packets()");
         if (!driver_bridge::using_kernel_driver()) {
-            log_msg(hf, tag, "SKIP -- kernel driver not loaded");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+            failed.fetch_add(1);
             return;
         }
         std::vector<driver_bridge::captured_packet_t> pkts;
@@ -2344,8 +2371,10 @@ namespace {
         const char* tag = "drv_dns_query";
         log_msg(hf, tag, "START -- driver_bridge::get_dns_queries()");
         if (!driver_bridge::using_kernel_driver()) {
-            log_msg(hf, tag, "SKIP -- kernel driver not loaded");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+            failed.fetch_add(1);
             return;
         }
         auto dns = driver_bridge::get_dns_queries(0);
@@ -2361,8 +2390,10 @@ namespace {
         const char* tag = "drv_flt_rules";
         log_msg(hf, tag, "START -- driver_bridge filter rule add/remove");
         if (!driver_bridge::using_kernel_driver()) {
-            log_msg(hf, tag, "SKIP -- kernel driver not loaded");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+            failed.fetch_add(1);
             return;
         }
         uint32_t rule_id = 0;
@@ -2389,8 +2420,10 @@ namespace {
         const char* tag = "drv_flt_clear";
         log_msg(hf, tag, "START -- driver_bridge::clear_filter_rules()");
         if (!driver_bridge::using_kernel_driver()) {
-            log_msg(hf, tag, "SKIP -- kernel driver not loaded");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+            failed.fetch_add(1);
             return;
         }
         bool ok = driver_bridge::clear_filter_rules();
@@ -2402,8 +2435,10 @@ namespace {
         const char* tag = "drv_net_stats";
         log_msg(hf, tag, "START -- driver_bridge::get_network_stats()");
         if (!driver_bridge::using_kernel_driver()) {
-            log_msg(hf, tag, "SKIP -- kernel driver not loaded");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+            failed.fetch_add(1);
             return;
         }
         driver_bridge::network_stats_t stats;
@@ -2424,8 +2459,10 @@ namespace {
         const char* tag = "drv_bw_mon";
         log_msg(hf, tag, "START -- driver_bridge bandwidth monitor reset/start/traffic/query/stop");
         if (!driver_bridge::using_kernel_driver()) {
-            log_msg(hf, tag, "SKIP -- kernel driver not loaded");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+            failed.fetch_add(1);
             return;
         }
         winsock_scope_t wsa;
@@ -2476,8 +2513,10 @@ namespace {
         const char* tag = "drv_bw_proc";
         log_msg(hf, tag, "START -- driver_bridge::get_bw_per_process()");
         if (!driver_bridge::using_kernel_driver()) {
-            log_msg(hf, tag, "SKIP -- kernel driver not loaded");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+            failed.fetch_add(1);
             return;
         }
         winsock_scope_t wsa;
@@ -2524,8 +2563,10 @@ namespace {
         const char* tag = "drv_dpi";
         log_msg(hf, tag, "START -- driver_bridge::get_dpi_results()");
         if (!driver_bridge::using_kernel_driver()) {
-            log_msg(hf, tag, "SKIP -- kernel driver not loaded");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+            failed.fetch_add(1);
             return;
         }
         std::vector<driver_bridge::captured_packet_t> fixture_packets;
@@ -2549,8 +2590,10 @@ namespace {
         const char* tag = "drv_wfp";
         log_msg(hf, tag, "START -- driver_bridge::enumerate_wfp_callouts()");
         if (!driver_bridge::using_kernel_driver()) {
-            log_msg(hf, tag, "SKIP -- kernel driver not loaded");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+            failed.fetch_add(1);
             return;
         }
         auto callouts = driver_bridge::enumerate_wfp_callouts("");
@@ -2568,8 +2611,10 @@ namespace {
         const char* tag = "drv_sock_hdl";
         log_msg(hf, tag, "START -- driver_bridge::get_socket_handles()");
         if (!driver_bridge::using_kernel_driver()) {
-            log_msg(hf, tag, "SKIP -- kernel driver not loaded");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+            failed.fetch_add(1);
             return;
         }
         auto sockets = driver_bridge::get_socket_handles(0);
@@ -2581,8 +2626,10 @@ namespace {
         const char* tag = "drv_tcpip";
         log_msg(hf, tag, "START -- driver_bridge::dump_tcpip_connections()");
         if (!driver_bridge::using_kernel_driver()) {
-            log_msg(hf, tag, "SKIP -- kernel driver not loaded");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+            failed.fetch_add(1);
             return;
         }
         auto conns = driver_bridge::dump_tcpip_connections(0, 0);
@@ -2600,8 +2647,10 @@ namespace {
         const char* tag = "drv_ifaces";
         log_msg(hf, tag, "START -- driver_bridge::enumerate_interfaces()");
         if (!driver_bridge::using_kernel_driver()) {
-            log_msg(hf, tag, "SKIP -- kernel driver not loaded");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+            failed.fetch_add(1);
             return;
         }
         auto ifaces = driver_bridge::enumerate_interfaces();
@@ -2618,8 +2667,10 @@ namespace {
         const char* tag = "drv_pcap";
         log_msg(hf, tag, "START -- driver_bridge::export_pcap()");
         if (!driver_bridge::using_kernel_driver()) {
-            log_msg(hf, tag, "SKIP -- kernel driver not loaded");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+            failed.fetch_add(1);
             return;
         }
         driver_bridge::pcap_export_result_t result{};
@@ -2641,8 +2692,10 @@ namespace {
         const char* tag = "drv_held_pkts";
         log_msg(hf, tag, "START -- driver_bridge intercept fixture/get_held_packets()");
         if (!driver_bridge::using_kernel_driver()) {
-            log_msg(hf, tag, "SKIP -- kernel driver not loaded");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+            failed.fetch_add(1);
             return;
         }
         winsock_scope_t wsa;
@@ -2731,8 +2784,10 @@ namespace {
         const char* tag = "drv_mod_rules";
         log_msg(hf, tag, "START -- driver_bridge::list_packet_mod_rules()");
         if (!driver_bridge::using_kernel_driver()) {
-            log_msg(hf, tag, "SKIP -- kernel driver not loaded");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+            failed.fetch_add(1);
             return;
         }
         const uint8_t pattern[] = { 'A', 'I', 'D', 'A' };
@@ -2773,8 +2828,10 @@ namespace {
         const char* tag = "drv_redir_rul";
         log_msg(hf, tag, "START -- driver_bridge::list_redirect_rules()");
         if (!driver_bridge::using_kernel_driver()) {
-            log_msg(hf, tag, "SKIP -- kernel driver not loaded");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+            failed.fetch_add(1);
             return;
         }
         uint32_t rule_id = 0;
@@ -2813,8 +2870,10 @@ namespace {
         const char* tag = "drv_dns_spoof";
         log_msg(hf, tag, "START -- driver_bridge::list_dns_spoof_rules()");
         if (!driver_bridge::using_kernel_driver()) {
-            log_msg(hf, tag, "SKIP -- kernel driver not loaded");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+            failed.fetch_add(1);
             return;
         }
         uint8_t spoof_addr[4] = { 127, 0, 0, 2 };
@@ -2853,8 +2912,10 @@ namespace {
         const char* tag = "drv_dns_sp_ar";
         log_msg(hf, tag, "START -- driver_bridge dns_spoof_op add/remove");
         if (!driver_bridge::using_kernel_driver()) {
-            log_msg(hf, tag, "SKIP -- kernel driver not loaded");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+            failed.fetch_add(1);
             return;
         }
         uint8_t spoof_addr[4] = { 127, 0, 0, 1 };
@@ -2876,8 +2937,10 @@ namespace {
         const char* tag = "drv_traf_rdr";
         log_msg(hf, tag, "START -- driver_bridge traffic_redirect_op add/remove");
         if (!driver_bridge::using_kernel_driver()) {
-            log_msg(hf, tag, "SKIP -- kernel driver not loaded");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+            failed.fetch_add(1);
             return;
         }
         uint32_t rule_id = 0;
@@ -2907,8 +2970,10 @@ namespace {
         const char* tag = "drv_strm_reas";
         log_msg(hf, tag, "START -- driver_bridge::stream_reassemble_op() loopback TCP fixture");
         if (!driver_bridge::using_kernel_driver()) {
-            log_msg(hf, tag, "SKIP -- kernel driver not loaded");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+            failed.fetch_add(1);
             return;
         }
         winsock_scope_t wsa;
@@ -2974,8 +3039,10 @@ namespace {
         const char* tag = "drv_fprint";
         log_msg(hf, tag, "START -- driver_bridge fingerprint_op/get_fingerprints");
         if (!driver_bridge::using_kernel_driver()) {
-            log_msg(hf, tag, "SKIP -- kernel driver not loaded");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+            failed.fetch_add(1);
             return;
         }
         winsock_scope_t wsa;
@@ -3024,8 +3091,10 @@ namespace {
         const char* tag = "drv_intercept";
         log_msg(hf, tag, "START -- driver_bridge intercept_op query");
         if (!driver_bridge::using_kernel_driver()) {
-            log_msg(hf, tag, "SKIP -- kernel driver not loaded");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+            failed.fetch_add(1);
             return;
         }
         uint32_t held_count = 0;
@@ -3046,8 +3115,10 @@ namespace {
         const char* tag = "drv_inject_lb";
         log_msg(hf, tag, "START -- driver_bridge::inject_packet() loopback UDP");
         if (!driver_bridge::using_kernel_driver()) {
-            log_msg(hf, tag, "SKIP -- kernel driver not loaded");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+            failed.fetch_add(1);
             return;
         }
         uint8_t src_addr[4] = { 127, 0, 0, 1 };

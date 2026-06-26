@@ -1932,15 +1932,22 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
     const ULONGLONG call_start = GetTickCount64();
     remote_call_um_failure_counts_t failure_counts{};
     SetLastError(ERROR_SUCCESS);
+
+    const std::uint32_t bound_pid = process_id_;
+    const std::uint64_t bound_dtb = dtb_;
+    const std::uint64_t bound_kernel_dtb = kernel_dtb_;
+    const std::uint64_t bound_base = base_address_;
+    std::uint64_t bound_shellcode = shellcode_address_;
+    std::uint64_t bound_spoof = spoof_gadget_;
     RC_UM_DBG("call_function: ENTER target=0x%llX args=(0x%llX, 0x%llX, 0x%llX, 0x%llX)",
         function_address, arg1, arg2, arg3, arg4);
     diag::log_tagged_fmt("comm",
         "remote_call_um_entry call_id=%llu pid=%u dtb=0x%llX shellcode=0x%llX spoof=0x%llX fn=0x%llX arg1=0x%llX arg2=0x%llX arg3=0x%llX arg4=0x%llX connected=%d session=%d local_pid=%lu local_tid=%lu",
         static_cast<unsigned long long>(call_id),
-        process_id_,
-        static_cast<unsigned long long>(dtb_),
-        static_cast<unsigned long long>(shellcode_address_),
-        static_cast<unsigned long long>(spoof_gadget_),
+        bound_pid,
+        static_cast<unsigned long long>(bound_dtb),
+        static_cast<unsigned long long>(bound_shellcode),
+        static_cast<unsigned long long>(bound_spoof),
         static_cast<unsigned long long>(function_address),
         static_cast<unsigned long long>(arg1),
         static_cast<unsigned long long>(arg2),
@@ -1950,18 +1957,28 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
         session_key_ != 0 ? 1 : 0,
         static_cast<unsigned long>(GetCurrentProcessId()),
         static_cast<unsigned long>(GetCurrentThreadId()));
+    diag::log_tagged_fmt("comm",
+        "remote_call_um_bind_snapshot call_id=%llu bound_pid=%u bound_dtb=0x%llX bound_kernel_dtb=0x%llX bound_base=0x%llX bound_shellcode=0x%llX bound_spoof=0x%llX tid=%lu",
+        static_cast<unsigned long long>(call_id),
+        bound_pid,
+        static_cast<unsigned long long>(bound_dtb),
+        static_cast<unsigned long long>(bound_kernel_dtb),
+        static_cast<unsigned long long>(bound_base),
+        static_cast<unsigned long long>(bound_shellcode),
+        static_cast<unsigned long long>(bound_spoof),
+        static_cast<unsigned long>(GetCurrentThreadId()));
 
-    if (!is_connected() || dtb_ == 0 || function_address == 0) {
+    if (!is_connected() || bound_dtb == 0 || function_address == 0) {
         const DWORD reject_gle = function_address == 0 ? ERROR_INVALID_PARAMETER : ERROR_INVALID_HANDLE;
         SetLastError(reject_gle);
         RC_UM_DBG("call_function: ABORT connected=%d dtb=0x%llX func=0x%llX",
-            is_connected() ? 1 : 0, dtb_, function_address);
+            is_connected() ? 1 : 0, bound_dtb, function_address);
         diag::log_tagged_fmt("comm",
             "remote_call_um_reject call_id=%llu reason=invalid_state connected=%d pid=%u dtb=0x%llX fn=0x%llX elapsed_ms=%llu gle=%lu",
             static_cast<unsigned long long>(call_id),
             is_connected() ? 1 : 0,
-            process_id_,
-            static_cast<unsigned long long>(dtb_),
+            bound_pid,
+            static_cast<unsigned long long>(bound_dtb),
             static_cast<unsigned long long>(function_address),
             static_cast<unsigned long long>(GetTickCount64() - call_start),
             static_cast<unsigned long>(reject_gle));
@@ -1977,8 +1994,8 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
         diag::log_tagged_fmt("comm",
             "remote_call_um_reject call_id=%llu reason=shellcode_alloc_failed pid=%u dtb=0x%llX fn=0x%llX elapsed_ms=%llu gle=%lu",
             static_cast<unsigned long long>(call_id),
-            process_id_,
-            static_cast<unsigned long long>(dtb_),
+            bound_pid,
+            static_cast<unsigned long long>(bound_dtb),
             static_cast<unsigned long long>(function_address),
             static_cast<unsigned long long>(GetTickCount64() - call_start),
             static_cast<unsigned long>(err));
@@ -1993,8 +2010,8 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
         diag::log_tagged_fmt("comm",
             "remote_call_um_reject call_id=%llu reason=spoof_gadget_missing pid=%u dtb=0x%llX shellcode=0x%llX fn=0x%llX elapsed_ms=%llu gle=%lu",
             static_cast<unsigned long long>(call_id),
-            process_id_,
-            static_cast<unsigned long long>(dtb_),
+            bound_pid,
+            static_cast<unsigned long long>(bound_dtb),
             static_cast<unsigned long long>(shellcode_address_),
             static_cast<unsigned long long>(function_address),
             static_cast<unsigned long long>(GetTickCount64() - call_start),
@@ -2010,8 +2027,8 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
         diag::log_tagged_fmt("comm",
             "remote_call_um_reject call_id=%llu reason=thread_hijack_init_failed pid=%u dtb=0x%llX shellcode=0x%llX spoof=0x%llX fn=0x%llX elapsed_ms=%llu gle=%lu",
             static_cast<unsigned long long>(call_id),
-            process_id_,
-            static_cast<unsigned long long>(dtb_),
+            bound_pid,
+            static_cast<unsigned long long>(bound_dtb),
             static_cast<unsigned long long>(shellcode_address_),
             static_cast<unsigned long long>(spoof_gadget_),
             static_cast<unsigned long long>(function_address),
@@ -2020,6 +2037,9 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
         return 0;
     }
 
+
+    bound_shellcode = shellcode_address_;
+    bound_spoof = spoof_gadget_;
 
     ntdll_base_ = thread_hijack::g_ntdll_base;
     ntdll_size_ = thread_hijack::g_ntdll_size;
@@ -2040,6 +2060,51 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
             thread_hijack::delay_us(5000);
         }
 
+        const std::uint32_t current_pid_for_check = process_id_;
+        const std::uint64_t current_dtb_for_check = dtb_;
+        const std::uint64_t current_base_for_check = base_address_;
+        const bool bind_delta_pid = current_pid_for_check != bound_pid;
+        const bool bind_delta_dtb = current_dtb_for_check != bound_dtb;
+        const bool bind_delta_base = current_base_for_check != bound_base;
+        diag::log_tagged_fmt("comm",
+            "remote_call_um_bind_check call_id=%llu attempt=%d bound_pid=%u current_pid=%u bound_dtb=0x%llX current_dtb=0x%llX bound_base=0x%llX current_base=0x%llX delta_pid=%d delta_dtb=%d delta_base=%d tid=%lu elapsed_ms=%llu",
+            static_cast<unsigned long long>(call_id),
+            attempt + 1,
+            bound_pid,
+            current_pid_for_check,
+            static_cast<unsigned long long>(bound_dtb),
+            static_cast<unsigned long long>(current_dtb_for_check),
+            static_cast<unsigned long long>(bound_base),
+            static_cast<unsigned long long>(current_base_for_check),
+            bind_delta_pid ? 1 : 0,
+            bind_delta_dtb ? 1 : 0,
+            bind_delta_base ? 1 : 0,
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            static_cast<unsigned long long>(GetTickCount64() - call_start));
+        if (bind_delta_pid || bind_delta_dtb) {
+            remote_call_um_set_failure("session_bind_changed_under_call", ERROR_OPERATION_ABORTED, 0, 0);
+            SetLastError(ERROR_OPERATION_ABORTED);
+            diag::log_tagged_fmt("comm",
+                "remote_call_um_exit call_id=%llu completed=0 reason=session_bind_changed_under_call attempts=%d bound_pid=%u current_pid=%u bound_dtb=0x%llX current_dtb=0x%llX no_suitable_thread=%d request_send_failed=%d poll_timeout=%d poll_ioctl_failed=%d hijack_set_failed=%d context_restore_failed=%d thread_snapshot_failed=%d unknown=%d elapsed_ms=%llu gle=%lu",
+                static_cast<unsigned long long>(call_id),
+                attempt + 1,
+                bound_pid,
+                current_pid_for_check,
+                static_cast<unsigned long long>(bound_dtb),
+                static_cast<unsigned long long>(current_dtb_for_check),
+                failure_counts.no_suitable_thread,
+                failure_counts.request_send_failed,
+                failure_counts.poll_timeout,
+                failure_counts.poll_ioctl_failed,
+                failure_counts.hijack_set_failed,
+                failure_counts.context_restore_failed,
+                failure_counts.thread_snapshot_failed,
+                failure_counts.unknown,
+                static_cast<unsigned long long>(GetTickCount64() - call_start),
+                static_cast<unsigned long>(ERROR_OPERATION_ABORTED));
+            return 0;
+        }
+
         bool attempt_completed = false;
         g_remote_call_um_attempt_diag = {};
         diag::log_tagged_fmt("comm",
@@ -2047,16 +2112,18 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
             static_cast<unsigned long long>(call_id),
             attempt + 1,
             MAX_ATTEMPTS,
-            process_id_,
-            static_cast<unsigned long long>(dtb_),
-            static_cast<unsigned long long>(shellcode_address_),
-            static_cast<unsigned long long>(spoof_gadget_),
+            bound_pid,
+            static_cast<unsigned long long>(bound_dtb),
+            static_cast<unsigned long long>(bound_shellcode),
+            static_cast<unsigned long long>(bound_spoof),
             static_cast<unsigned long long>(function_address),
             blacklist_count,
             static_cast<unsigned long long>(GetTickCount64() - call_start));
         std::uint64_t result = call_function_attempt(
             call_id, attempt + 1, function_address, arg1, arg2, arg3, arg4,
-            blacklist, blacklist_count, attempt_completed);
+            blacklist, blacklist_count,
+            bound_pid, bound_dtb, bound_base, bound_shellcode, bound_spoof,
+            attempt_completed);
         diag::log_tagged_fmt("comm",
             "remote_call_um_attempt_done call_id=%llu attempt=%d completed=%d result=0x%llX failure_class=%s failure_gle=%lu selected_tid=%u scanned=%u ntstatus=0x%08lX poll_failures=%d request_sent=%d hijack_set=%d last_failed_tid=%u blacklist_count=%d elapsed_ms=%llu",
             static_cast<unsigned long long>(call_id),
@@ -2125,6 +2192,7 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
                     static_cast<unsigned long>(err));
                 return 0;
             }
+            bound_shellcode = shellcode_address_;
         }
     }
 
@@ -2289,6 +2357,11 @@ std::uint64_t voyager::device_t::call_function_attempt(
     std::uint64_t function_address,
     std::uint64_t arg1, std::uint64_t arg2, std::uint64_t arg3, std::uint64_t arg4,
     const DWORD* blacklist, int blacklist_count,
+    std::uint32_t bound_pid,
+    std::uint64_t bound_dtb,
+    std::uint64_t bound_base,
+    std::uint64_t bound_shellcode,
+    std::uint64_t bound_spoof,
     bool& out_completed) noexcept
 {
     SPOOF_FUNC;
@@ -2297,21 +2370,21 @@ std::uint64_t voyager::device_t::call_function_attempt(
     const ULONGLONG attempt_start = GetTickCount64();
 
     RC_UM_DBG("call_function: shellcode_addr=0x%llX spoof_gadget=0x%llX dtb=0x%llX",
-        shellcode_address_, spoof_gadget_, dtb_);
+        bound_shellcode, bound_spoof, bound_dtb);
     diag::log_tagged_fmt("comm",
         "remote_call_um_attempt_entry call_id=%llu attempt=%d pid=%u dtb=0x%llX shellcode=0x%llX spoof=0x%llX fn=0x%llX blacklist_count=%d",
         static_cast<unsigned long long>(call_id),
         attempt_index,
-        process_id_,
-        static_cast<unsigned long long>(dtb_),
-        static_cast<unsigned long long>(shellcode_address_),
-        static_cast<unsigned long long>(spoof_gadget_),
+        bound_pid,
+        static_cast<unsigned long long>(bound_dtb),
+        static_cast<unsigned long long>(bound_shellcode),
+        static_cast<unsigned long long>(bound_spoof),
         static_cast<unsigned long long>(function_address),
         blacklist_count);
 
     thread_hijack::scatter_timing();
 
-    std::uint64_t context_base = shellcode_address_;
+    std::uint64_t context_base = bound_shellcode;
 
     thread_hijack::scatter_timing();
 
@@ -2350,7 +2423,7 @@ std::uint64_t voyager::device_t::call_function_attempt(
         do {
             if (thread_scan_count >= MAX_TARGET_THREAD_SCANS) break;
 
-            if (te.th32OwnerProcessID == process_id_ && te.th32ThreadID != current_tid) {
+            if (te.th32OwnerProcessID == bound_pid && te.th32ThreadID != current_tid) {
 
                 if (last_failed_tid_ != 0 && te.th32ThreadID == last_failed_tid_) {
                     continue;
@@ -2410,9 +2483,9 @@ std::uint64_t voyager::device_t::call_function_attempt(
                                 bool in_ntdll = thread_hijack::is_rip_in_ntdll(ctx.Rip);
 
 
-                                bool in_target = (base_address_ != 0 &&
-                                                  ctx.Rip >= base_address_ &&
-                                                  ctx.Rip < base_address_ + 0x100000);
+                                bool in_target = (bound_base != 0 &&
+                                                  ctx.Rip >= bound_base &&
+                                                  ctx.Rip < bound_base + 0x100000);
 
                                 if (in_target) {
                                     priority += 20;
@@ -2473,14 +2546,14 @@ std::uint64_t voyager::device_t::call_function_attempt(
     target_tid = best_tid;
 
     bool is_in_ntdll = thread_hijack::is_rip_in_ntdll(best_ctx.Rip);
-    bool is_in_target = (base_address_ != 0 && best_ctx.Rip >= base_address_ && best_ctx.Rip < base_address_ + 0x100000);
+    bool is_in_target = (bound_base != 0 && best_ctx.Rip >= bound_base && best_ctx.Rip < bound_base + 0x100000);
     RC_UM_DBG("call_function: SELECTED tid=%u rip=0x%llX rsp=0x%llX priority=%d in_ntdll=%d in_target=%d scanned=%u",
         target_tid, best_ctx.Rip, best_ctx.Rsp, best_priority, is_in_ntdll ? 1 : 0, is_in_target ? 1 : 0, thread_scan_count);
     diag::log_tagged_fmt("comm",
         "remote_call_um_selected_thread call_id=%llu attempt=%d pid=%u tid=%u scanned=%u priority=%d in_ntdll=%d in_target=%d rip=0x%llX rsp=0x%llX suspend_count=%lu thread_state=unknown wait_reason=unknown role=unknown prev_last_hijacked=%u elapsed_ms=%llu",
         static_cast<unsigned long long>(call_id),
         attempt_index,
-        process_id_,
+        bound_pid,
         target_tid,
         thread_scan_count,
         best_priority,
@@ -2510,7 +2583,7 @@ std::uint64_t voyager::device_t::call_function_attempt(
         "remote_call_um_context_slots call_id=%llu attempt=%d pid=%u tid=%u shellcode=0x%llX result_addr=0x%llX saved_rsp_addr=0x%llX completed_addr=0x%llX completed_zero_write=%d completed_zero_bytes=%zu elapsed_ms=%llu",
         static_cast<unsigned long long>(call_id),
         attempt_index,
-        process_id_,
+        bound_pid,
         target_tid,
         static_cast<unsigned long long>(context_base),
         static_cast<unsigned long long>(context_base + RESULT_VALUE_OFFSET),
@@ -2528,10 +2601,10 @@ std::uint64_t voyager::device_t::call_function_attempt(
     }
 
     detail::remote_call_request req{};
-    req.dtb = dtb_;
+    req.dtb = bound_dtb;
     req.target_function = function_address;
     req.shellcode_address = context_base;
-    req.spoof_return = spoof_gadget_;
+    req.spoof_return = bound_spoof;
     req.arg1 = arg1;
     req.arg2 = arg2;
     req.arg3 = arg3;
@@ -2548,7 +2621,7 @@ std::uint64_t voyager::device_t::call_function_attempt(
         "remote_call_um_request_send_begin call_id=%llu attempt=%d pid=%u tid=%u ioctl=0x%08X dtb=0x%llX fn=0x%llX shellcode=0x%llX spoof=0x%llX original_rip=0x%llX fingerprint=0x%llX elapsed_ms=%llu",
         static_cast<unsigned long long>(call_id),
         attempt_index,
-        process_id_,
+        bound_pid,
         target_tid,
         ioctl_codes::RC(),
         static_cast<unsigned long long>(req.dtb),
@@ -2568,7 +2641,7 @@ std::uint64_t voyager::device_t::call_function_attempt(
             static_cast<unsigned long long>(call_id),
             attempt_index,
             static_cast<unsigned long>(send_gle),
-            process_id_,
+            bound_pid,
             target_tid,
             static_cast<unsigned long long>(request_fp),
             static_cast<unsigned long long>(GetTickCount64() - attempt_start));
@@ -2582,7 +2655,7 @@ std::uint64_t voyager::device_t::call_function_attempt(
         "remote_call_um_request_send_done call_id=%llu attempt=%d ok=1 gle=0 pid=%u tid=%u code_entry=0x%llX trampoline=0x%llX fingerprint_before=0x%llX fingerprint_after=0x%llX elapsed_ms=%llu",
         static_cast<unsigned long long>(call_id),
         attempt_index,
-        process_id_,
+        bound_pid,
         target_tid,
         static_cast<unsigned long long>(req.shellcode_address),
         static_cast<unsigned long long>(req.trampoline_addr),
@@ -2681,7 +2754,7 @@ std::uint64_t voyager::device_t::call_function_attempt(
 
 
         detail::call_result_request result_req{};
-        result_req.dtb = dtb_;
+        result_req.dtb = bound_dtb;
         result_req.result_address = context_base;
         result_req.result = 0;
         result_req.completed = 0;
@@ -2861,6 +2934,11 @@ std::uint64_t voyager::device_t::call_function_attempt(
 }
 
 bool voyager::device_t::send_request(DWORD control_code, void* input, DWORD input_size) const noexcept {
+    std::shared_lock<std::shared_mutex> rotation_guard(seed_rotation_mtx_);
+    return send_request_in_lock(control_code, input, input_size);
+}
+
+bool voyager::device_t::send_request_in_lock(DWORD control_code, void* input, DWORD input_size) const noexcept {
     const DWORD local_pid = GetCurrentProcessId();
     const DWORD local_tid = GetCurrentThreadId();
     const std::uint32_t base_before_sync = compute_ioctl_base_snapshot();
@@ -3387,7 +3465,80 @@ bool voyager::device_t::send_request(DWORD control_code, void* input, DWORD inpu
                 session_key_ != 0 ? 1 : 0,
                 static_cast<unsigned long long>(GetTickCount64() - ioctl_start));
         }
-        SetLastError(err);
+        if (err == ERROR_INVALID_FUNCTION) {
+            std::uint32_t saved_server_seed_g = dynamic_key::g_server_seed;
+            std::uint32_t saved_ioctl_seed_g = ioctl_codes::g_server_ioctl_seed;
+            std::uint32_t saved_cached_key_g = dynamic_key::g_cached_key;
+            dynamic_key::g_server_seed = 0;
+            dynamic_key::g_cached_key = 0;
+            ioctl_codes::g_server_ioctl_seed = 0;
+            const std::uint32_t base_unseeded = ioctl_codes::get_base();
+            dynamic_key::g_server_seed = saved_server_seed_g;
+            dynamic_key::g_cached_key = saved_cached_key_g;
+            ioctl_codes::g_server_ioctl_seed = saved_ioctl_seed_g;
+            diag::log_tagged_critical_fmt("comm",
+                "send_request_invalid_function_diagnostic raw=0x%08X effective=0x%08X dyn_offset_valid=%d dyn_offset=%u base_seeded=0x%04X base_unseeded=0x%04X key_hash=0x%08X ioctl_seed_hash=0x%08X inst_seed=%u/%u glob_seed=%u/%u pid=%lu tid=%lu target_pid=%u session=%d lock_held=shared elapsed_ms=%llu",
+                control_code,
+                effective_control_code,
+                dynamic_offset_valid ? 1 : 0,
+                dynamic_offset,
+                compute_ioctl_base_snapshot(),
+                base_unseeded,
+                hash_build_key(compute_dynamic_key_snapshot()),
+                server_ioctl_seed_ != 0 ? hash_build_key(server_ioctl_seed_) : 0,
+                server_seed_ != 0 ? 1u : 0u,
+                server_ioctl_seed_ != 0 ? 1u : 0u,
+                dynamic_key::g_server_seed != 0 ? 1u : 0u,
+                ioctl_codes::g_server_ioctl_seed != 0 ? 1u : 0u,
+                static_cast<unsigned long>(local_pid),
+                static_cast<unsigned long>(local_tid),
+                process_id_,
+                session_key_ != 0 ? 1 : 0,
+                static_cast<unsigned long long>(GetTickCount64() - ioctl_start));
+            if (dynamic_offset_valid) {
+                const std::uint32_t seed_before_resync = server_ioctl_seed_;
+                const std::uint64_t hb_tsc_before_resync = last_heartbeat_tsc_;
+                sync_dynamic_security_state();
+                const std::uint32_t seed_after_resync = server_ioctl_seed_;
+                if (seed_after_resync != seed_before_resync) {
+                    const DWORD recomputed_code = make_ioctl_snapshot(dynamic_offset);
+                    if (recomputed_code != effective_control_code) {
+                        diag::log_tagged_critical_fmt("comm-sec",
+                            "send_request_reseeded requested_before=0x%08X requested_after=0x%08X seed_before=0x%08X seed_after=0x%08X seed_hash_before=0x%08X seed_hash_after=0x%08X hb_tsc_before=%llu hb_tsc_after=%llu attempt=1 pid=%lu tid=%lu elapsed_ms=%llu",
+                            effective_control_code,
+                            recomputed_code,
+                            seed_before_resync,
+                            seed_after_resync,
+                            seed_before_resync != 0 ? hash_build_key(seed_before_resync) : 0,
+                            seed_after_resync != 0 ? hash_build_key(seed_after_resync) : 0,
+                            static_cast<unsigned long long>(hb_tsc_before_resync),
+                            static_cast<unsigned long long>(last_heartbeat_tsc_),
+                            static_cast<unsigned long>(local_pid),
+                            static_cast<unsigned long>(local_tid),
+                            static_cast<unsigned long long>(GetTickCount64() - ioctl_start));
+                        DWORD reseed_bytes = 0;
+                        SetLastError(ERROR_SUCCESS);
+                        BOOL reseed_result = DeviceIoControl(driver_handle_, recomputed_code, input, input_size, input, input_size, &reseed_bytes, nullptr);
+                        DWORD reseed_err = reseed_result ? ERROR_SUCCESS : GetLastError();
+                        diag::log_tagged_critical_fmt("comm-sec",
+                            "send_request_reseeded_result ok=%d code=0x%08X bytes=%lu err=%lu attempt=1 elapsed_ms=%llu",
+                            reseed_result ? 1 : 0,
+                            recomputed_code,
+                            static_cast<unsigned long>(reseed_bytes),
+                            reseed_err,
+                            static_cast<unsigned long long>(GetTickCount64() - ioctl_start));
+                        if (reseed_result) {
+                            effective_control_code = recomputed_code;
+                            bytes_returned = reseed_bytes;
+                            result = reseed_result;
+                            err = ERROR_SUCCESS;
+                        }
+                    }
+                }
+            }
+        }
+        if (!result)
+            SetLastError(err);
     } else if (bytes_returned == 0 || (GetTickCount64() - ioctl_start) > 250) {
         diag::log_tagged_fmt("comm",
             "send_request OK_SUSPICIOUS ioctl=0x%08X input_size=%u bytes=%lu handle=0x%llX pid=%u session=%d elapsed_ms=%llu",
@@ -5982,6 +6133,7 @@ bool voyager::device_t::trigger_kernel_bsod(std::uint32_t reason_code, std::uint
         return false;
     }
 
+    std::shared_lock<std::shared_mutex> rotation_guard(seed_rotation_mtx_);
     detail::abort_request req{};
     req.magic = session_key_ ^ dynamic_key::get() ^ 0xABCD1234u;
     req.reason_code = reason_code;
@@ -5989,7 +6141,7 @@ bool voyager::device_t::trigger_kernel_bsod(std::uint32_t reason_code, std::uint
     req.timestamp = __rdtsc();
 
 
-    send_request(ioctl_codes::ABRT(), &req, static_cast<DWORD>(sizeof(req)));
+    send_request_in_lock(ioctl_codes::ABRT(), &req, static_cast<DWORD>(sizeof(req)));
 
 
     return false;
@@ -5997,21 +6149,173 @@ bool voyager::device_t::trigger_kernel_bsod(std::uint32_t reason_code, std::uint
 
 bool voyager::device_t::latch_targeting_from_usermode(std::uint32_t reason) noexcept
 {
-    if (!is_connected())
+    const DWORD entry_pid = GetCurrentProcessId();
+    const DWORD entry_tid = GetCurrentThreadId();
+    const ULONGLONG entry_tick = GetTickCount64();
+    diag::log_tagged_critical_fmt("comm-rela",
+        "latch_targeting_from_usermode_enter pid=%lu tid=%lu reason=0x%08X connected=%d session=%d inst_seed=%u/%u glob_seed=%u/%u base=0x%04X key_hash=0x%08X ioctl_seed_hash=0x%08X expected_rela=0x%08X handle=0x%llX hb_tsc=%llu",
+        static_cast<unsigned long>(entry_pid),
+        static_cast<unsigned long>(entry_tid),
+        reason,
+        is_connected() ? 1 : 0,
+        session_key_ != 0 ? 1 : 0,
+        server_seed_ != 0 ? 1u : 0u,
+        server_ioctl_seed_ != 0 ? 1u : 0u,
+        dynamic_key::g_server_seed != 0 ? 1u : 0u,
+        ioctl_codes::g_server_ioctl_seed != 0 ? 1u : 0u,
+        compute_ioctl_base_snapshot(),
+        hash_build_key(compute_dynamic_key_snapshot()),
+        server_ioctl_seed_ != 0 ? hash_build_key(server_ioctl_seed_) : 0,
+        make_ioctl_snapshot(53),
+        reinterpret_cast<unsigned long long>(driver_handle_),
+        static_cast<unsigned long long>(last_heartbeat_tsc_));
+
+    if (!is_connected()) {
+        diag::log_tagged_critical_fmt("comm-rela",
+            "latch_targeting_from_usermode_exit ok=0 reason=not_connected pid=%lu tid=%lu input_reason=0x%08X elapsed_us=%llu",
+            static_cast<unsigned long>(entry_pid),
+            static_cast<unsigned long>(entry_tid),
+            reason,
+            static_cast<unsigned long long>((GetTickCount64() - entry_tick) * 1000ull));
         return false;
+    }
 
-    detail::latch_targeting_request req{};
-    req.magic        = session_key_ ^ dynamic_key::get() ^ 0x1A7C4B2Eu;
-    req.session_key  = session_key_;
-    req.reason       = reason;
-    req.reserved     = 0;
+    bool ok = false;
+    DWORD first_err = ERROR_SUCCESS;
+    DWORD first_ioctl = 0;
+    std::uint32_t first_base = 0;
+    {
+        std::shared_lock<std::shared_mutex> rotation_guard(seed_rotation_mtx_);
+        detail::latch_targeting_request req{};
+        req.magic        = session_key_ ^ dynamic_key::get() ^ 0x1A7C4B2Eu;
+        req.session_key  = session_key_;
+        req.reason       = reason;
+        req.reserved     = 0;
 
-    return send_request(ioctl_codes::RELA(), &req, static_cast<DWORD>(sizeof(req)));
+        first_ioctl = ioctl_codes::RELA();
+        first_base = compute_ioctl_base_snapshot();
+        diag::log_tagged_critical_fmt("comm-rela",
+            "latch_targeting_from_usermode_send_pre attempt=1 pid=%lu tid=%lu ioctl=0x%08X base=0x%04X key_hash=0x%08X ioctl_seed_hash=0x%08X magic_set=%d session_match=%d",
+            static_cast<unsigned long>(entry_pid),
+            static_cast<unsigned long>(entry_tid),
+            first_ioctl,
+            first_base,
+            hash_build_key(compute_dynamic_key_snapshot()),
+            server_ioctl_seed_ != 0 ? hash_build_key(server_ioctl_seed_) : 0,
+            req.magic != 0 ? 1 : 0,
+            req.session_key == session_key_ ? 1 : 0);
+
+        SetLastError(ERROR_SUCCESS);
+        ok = send_request_in_lock(first_ioctl, &req, static_cast<DWORD>(sizeof(req)));
+        first_err = ok ? ERROR_SUCCESS : GetLastError();
+    }
+
+    if (ok) {
+        diag::log_tagged_critical_fmt("comm-rela",
+            "latch_targeting_from_usermode_exit ok=1 pid=%lu tid=%lu attempt=1 ioctl=0x%08X base=0x%04X elapsed_us=%llu",
+            static_cast<unsigned long>(entry_pid),
+            static_cast<unsigned long>(entry_tid),
+            first_ioctl,
+            first_base,
+            static_cast<unsigned long long>((GetTickCount64() - entry_tick) * 1000ull));
+        return true;
+    }
+
+    diag::log_tagged_critical_fmt("comm-rela",
+        "latch_targeting_from_usermode_first_failed pid=%lu tid=%lu ioctl=0x%08X base=0x%04X err=%lu invalid_function=%d",
+        static_cast<unsigned long>(entry_pid),
+        static_cast<unsigned long>(entry_tid),
+        first_ioctl,
+        first_base,
+        static_cast<unsigned long>(first_err),
+        first_err == ERROR_INVALID_FUNCTION ? 1 : 0);
+
+    if (first_err != ERROR_INVALID_FUNCTION) {
+        diag::log_tagged_critical_fmt("comm-rela",
+            "latch_targeting_from_usermode_exit ok=0 reason=non_invalid_function pid=%lu tid=%lu err=%lu elapsed_us=%llu",
+            static_cast<unsigned long>(entry_pid),
+            static_cast<unsigned long>(entry_tid),
+            static_cast<unsigned long>(first_err),
+            static_cast<unsigned long long>((GetTickCount64() - entry_tick) * 1000ull));
+        SetLastError(first_err);
+        return false;
+    }
+
+    const ULONGLONG hb_start = GetTickCount64();
+    const bool hb_ok = send_heartbeat();
+    const DWORD hb_err = hb_ok ? ERROR_SUCCESS : GetLastError();
+    diag::log_tagged_critical_fmt("comm-rela",
+        "latch_targeting_from_usermode_recover_hb pid=%lu tid=%lu hb_ok=%d hb_err=%lu base_after_hb=0x%04X ioctl_seed_hash_after_hb=0x%08X expected_rela_after_hb=0x%08X elapsed_us=%llu",
+        static_cast<unsigned long>(entry_pid),
+        static_cast<unsigned long>(entry_tid),
+        hb_ok ? 1 : 0,
+        static_cast<unsigned long>(hb_err),
+        compute_ioctl_base_snapshot(),
+        server_ioctl_seed_ != 0 ? hash_build_key(server_ioctl_seed_) : 0,
+        make_ioctl_snapshot(53),
+        static_cast<unsigned long long>((GetTickCount64() - hb_start) * 1000ull));
+
+    if (!hb_ok) {
+        diag::log_tagged_critical_fmt("comm-rela",
+            "latch_targeting_from_usermode_exit ok=0 reason=hb_failed pid=%lu tid=%lu first_err=%lu hb_err=%lu elapsed_us=%llu",
+            static_cast<unsigned long>(entry_pid),
+            static_cast<unsigned long>(entry_tid),
+            static_cast<unsigned long>(first_err),
+            static_cast<unsigned long>(hb_err),
+            static_cast<unsigned long long>((GetTickCount64() - entry_tick) * 1000ull));
+        SetLastError(first_err);
+        return false;
+    }
+
+    bool retry_ok = false;
+    DWORD retry_err = ERROR_SUCCESS;
+    DWORD retry_ioctl = 0;
+    std::uint32_t retry_base = 0;
+    {
+        std::shared_lock<std::shared_mutex> rotation_guard(seed_rotation_mtx_);
+        detail::latch_targeting_request retry_req{};
+        retry_req.magic       = session_key_ ^ dynamic_key::get() ^ 0x1A7C4B2Eu;
+        retry_req.session_key = session_key_;
+        retry_req.reason      = reason;
+        retry_req.reserved    = 0;
+
+        retry_ioctl = ioctl_codes::RELA();
+        retry_base = compute_ioctl_base_snapshot();
+        diag::log_tagged_critical_fmt("comm-rela",
+            "latch_targeting_from_usermode_send_pre attempt=2 pid=%lu tid=%lu ioctl=0x%08X base=0x%04X key_hash=0x%08X ioctl_seed_hash=0x%08X magic_set=%d session_match=%d",
+            static_cast<unsigned long>(entry_pid),
+            static_cast<unsigned long>(entry_tid),
+            retry_ioctl,
+            retry_base,
+            hash_build_key(compute_dynamic_key_snapshot()),
+            server_ioctl_seed_ != 0 ? hash_build_key(server_ioctl_seed_) : 0,
+            retry_req.magic != 0 ? 1 : 0,
+            retry_req.session_key == session_key_ ? 1 : 0);
+
+        SetLastError(ERROR_SUCCESS);
+        retry_ok = send_request_in_lock(retry_ioctl, &retry_req, static_cast<DWORD>(sizeof(retry_req)));
+        retry_err = retry_ok ? ERROR_SUCCESS : GetLastError();
+    }
+
+    diag::log_tagged_critical_fmt("comm-rela",
+        "latch_targeting_from_usermode_exit ok=%d pid=%lu tid=%lu attempt=2 ioctl=0x%08X base=0x%04X err=%lu first_err=%lu elapsed_us=%llu",
+        retry_ok ? 1 : 0,
+        static_cast<unsigned long>(entry_pid),
+        static_cast<unsigned long>(entry_tid),
+        retry_ioctl,
+        retry_base,
+        static_cast<unsigned long>(retry_err),
+        static_cast<unsigned long>(first_err),
+        static_cast<unsigned long long>((GetTickCount64() - entry_tick) * 1000ull));
+
+    if (!retry_ok) SetLastError(retry_err);
+    return retry_ok;
 }
 
 bool voyager::device_t::tier_a_driver_present_query(bool& out_present, std::uint32_t* out_mask,
                                                     std::uint64_t* out_first_base) noexcept
 {
+    std::shared_lock<std::shared_mutex> rotation_guard(seed_rotation_mtx_);
     sync_dynamic_security_state();
     log_security_snapshot("tier_a_query_entry", 0, 0, 0);
 
@@ -6027,7 +6331,7 @@ bool voyager::device_t::tier_a_driver_present_query(bool& out_present, std::uint
 
     const DWORD ioctl_code = make_ioctl_snapshot(48);
     log_security_snapshot("tier_a_query_pre", ioctl_code, ioctl_code, 0);
-    if (!send_request(ioctl_code, &req, static_cast<DWORD>(sizeof(req)))) {
+    if (!send_request_in_lock(ioctl_code, &req, static_cast<DWORD>(sizeof(req)))) {
         DWORD err = GetLastError();
         diag::log_tagged_fmt("comm",
             "tier_a_driver_present_query FAILED ioctl=0x%08X err=%lu instance_seed=%d module_seed=%d session=%d base=0x%04X key_hash=0x%08X ioctl_seed_hash=0x%08X",
@@ -6063,6 +6367,7 @@ bool voyager::device_t::canary_register_for_pid(std::uint64_t va, std::uint64_t 
         return false;
     }
 
+    std::shared_lock<std::shared_mutex> rotation_guard(seed_rotation_mtx_);
     detail::canary_register_request req{};
     req.magic = session_key_ ^ dynamic_key::get() ^ 0xCA110013u;
     req.session_key = session_key_;
@@ -6076,7 +6381,7 @@ bool voyager::device_t::canary_register_for_pid(std::uint64_t va, std::uint64_t 
         req.pid,
         ioctl_codes::CANR());
 
-    if (!send_request(ioctl_codes::CANR(), &req, static_cast<DWORD>(sizeof(req)))) {
+    if (!send_request_in_lock(ioctl_codes::CANR(), &req, static_cast<DWORD>(sizeof(req)))) {
         RC_UM_DBG("CANR send_failed va=0x%llX size=0x%llX pid=%u last_error=%lu",
             va,
             size,
@@ -6102,6 +6407,7 @@ bool voyager::device_t::canary_query_count(std::uint32_t& out_count) noexcept
         return false;
     }
 
+    std::shared_lock<std::shared_mutex> rotation_guard(seed_rotation_mtx_);
     detail::canary_register_request req{};
     req.magic = session_key_ ^ dynamic_key::get() ^ 0xCA110013u;
     req.session_key = session_key_;
@@ -6109,7 +6415,7 @@ bool voyager::device_t::canary_query_count(std::uint32_t& out_count) noexcept
 
     RC_UM_DBG("CANQ request pid=%u ioctl=0x%08X", req.pid, ioctl_codes::CANQ());
 
-    if (!send_request(ioctl_codes::CANQ(), &req, static_cast<DWORD>(sizeof(req)))) {
+    if (!send_request_in_lock(ioctl_codes::CANQ(), &req, static_cast<DWORD>(sizeof(req)))) {
         RC_UM_DBG("CANQ send_failed pid=%u last_error=%lu", req.pid, GetLastError());
         return false;
     }
@@ -6123,12 +6429,13 @@ bool voyager::device_t::re_confirmed_usermode_bsod(const detail::re_evidence_blo
 {
     if (!is_connected()) return false;
 
+    std::shared_lock<std::shared_mutex> rotation_guard(seed_rotation_mtx_);
     detail::re_confirmed_usermode_request req{};
     req.magic = session_key_ ^ dynamic_key::get() ^ 0xDEAD0010u;
     req.session_key = session_key_;
     req.evidence = evidence;
 
-    send_request(ioctl_codes::RECU(), &req, static_cast<DWORD>(sizeof(req)));
+    send_request_in_lock(ioctl_codes::RECU(), &req, static_cast<DWORD>(sizeof(req)));
     return false;
 }
 
@@ -6146,6 +6453,7 @@ bool voyager::device_t::protect_sandbox_pid(std::uint32_t pid, std::uint32_t fla
         return false;
     }
 
+    std::shared_lock<std::shared_mutex> rotation_guard(seed_rotation_mtx_);
     detail::protect_sandbox_request req{};
     req.magic = session_key_ ^ dynamic_key::get() ^ 0x5A4E0B01u;
     req.session_key = session_key_;
@@ -6155,7 +6463,7 @@ bool voyager::device_t::protect_sandbox_pid(std::uint32_t pid, std::uint32_t fla
     diag::log_tagged_fmt("ww:malsafe-um", "protect_sandbox_pid SEND ioctl=0x%08X pid=%u flags_effective=0x%08X magic_set=%d session_present=%d size=%u",
         ioctl_codes::PSBX(), req.pid, req.flags, req.magic != 0 ? 1 : 0, req.session_key != 0 ? 1 : 0, static_cast<unsigned>(sizeof(req)));
 
-    if (!send_request(ioctl_codes::PSBX(), &req, static_cast<DWORD>(sizeof(req)))) {
+    if (!send_request_in_lock(ioctl_codes::PSBX(), &req, static_cast<DWORD>(sizeof(req)))) {
         DWORD err = GetLastError();
         diag::log_tagged_fmt("ww:malsafe-um", "protect_sandbox_pid send_request FAILED pid=%u err=%lu", pid, err);
         return false;
@@ -6181,6 +6489,7 @@ bool voyager::device_t::unprotect_sandbox_pid(std::uint32_t pid, std::uint64_t* 
         return false;
     }
 
+    std::shared_lock<std::shared_mutex> rotation_guard(seed_rotation_mtx_);
     detail::protect_sandbox_request req{};
     req.magic = session_key_ ^ dynamic_key::get() ^ 0x5A4E0B02u;
     req.session_key = session_key_;
@@ -6190,7 +6499,7 @@ bool voyager::device_t::unprotect_sandbox_pid(std::uint32_t pid, std::uint64_t* 
     diag::log_tagged_fmt("ww:malsafe-um", "unprotect_sandbox_pid SEND ioctl=0x%08X pid=%u magic_set=%d session_present=%d size=%u",
         ioctl_codes::USBX(), req.pid, req.magic != 0 ? 1 : 0, req.session_key != 0 ? 1 : 0, static_cast<unsigned>(sizeof(req)));
 
-    if (!send_request(ioctl_codes::USBX(), &req, static_cast<DWORD>(sizeof(req)))) {
+    if (!send_request_in_lock(ioctl_codes::USBX(), &req, static_cast<DWORD>(sizeof(req)))) {
         DWORD err = GetLastError();
         diag::log_tagged_fmt("ww:malsafe-um", "unprotect_sandbox_pid send_request FAILED pid=%u err=%lu", pid, err);
         return false;
@@ -6216,6 +6525,7 @@ bool voyager::device_t::net_log_register_pid(std::uint32_t pid, bool enable) noe
         return false;
     }
 
+    std::shared_lock<std::shared_mutex> rotation_guard(seed_rotation_mtx_);
     detail::net_log_register_request req{};
     req.magic = session_key_ ^ dynamic_key::get() ^ 0x5A4E0B03u;
     req.session_key = session_key_;
@@ -6225,7 +6535,7 @@ bool voyager::device_t::net_log_register_pid(std::uint32_t pid, bool enable) noe
     diag::log_tagged_fmt("ww:malsafe-um", "net_log_register_pid SEND ioctl=0x%08X pid=%u op=%u magic_set=%d session_present=%d size=%u",
         ioctl_codes::NLOG(), req.pid, req.operation, req.magic != 0 ? 1 : 0, req.session_key != 0 ? 1 : 0, static_cast<unsigned>(sizeof(req)));
 
-    if (!send_request(ioctl_codes::NLOG(), &req, static_cast<DWORD>(sizeof(req)))) {
+    if (!send_request_in_lock(ioctl_codes::NLOG(), &req, static_cast<DWORD>(sizeof(req)))) {
         DWORD err = GetLastError();
         diag::log_tagged_fmt("ww:malsafe-um", "net_log_register_pid send_request FAILED pid=%u err=%lu", pid, err);
         return false;
@@ -6258,6 +6568,7 @@ bool voyager::device_t::malware_safe_pull_packets(std::uint32_t pid,
     if (!buf) return false;
     std::memset(buf.get(), 0, total_size);
 
+    std::shared_lock<std::shared_mutex> rotation_guard(seed_rotation_mtx_);
     auto* req = reinterpret_cast<detail::net_packet_pull_request*>(buf.get());
     req->magic = session_key_ ^ dynamic_key::get() ^ 0x5A4E0B04u;
     req->session_key = session_key_;
@@ -6267,7 +6578,7 @@ bool voyager::device_t::malware_safe_pull_packets(std::uint32_t pid,
     req->padding = 0;
 
     DWORD dw_size = static_cast<DWORD>(total_size);
-    if (!send_request(ioctl_codes::NPKT(), buf.get(), dw_size)) {
+    if (!send_request_in_lock(ioctl_codes::NPKT(), buf.get(), dw_size)) {
         return false;
     }
 
@@ -6532,6 +6843,7 @@ bool voyager::device_t::kernel_anti_dump_start_continuous(std::uint32_t pid) noe
 bool voyager::device_t::relay_server_token(std::uint32_t token_hash, std::uint64_t server_nonce) noexcept
 {
     server_token_relay_scope_t relay_scope;
+    std::unique_lock<std::shared_mutex> rotation_guard(seed_rotation_mtx_);
     sync_dynamic_security_state();
     log_security_snapshot("relay_server_token_entry", 0, 0, 0);
 
@@ -6545,7 +6857,7 @@ bool voyager::device_t::relay_server_token(std::uint32_t token_hash, std::uint64
 
     const DWORD ioctl_code = make_ioctl_snapshot(44);
     log_security_snapshot("relay_server_token_pre", ioctl_code, ioctl_code, 0);
-    if (!send_request(ioctl_code, &req, static_cast<DWORD>(sizeof(req))))
+    if (!send_request_in_lock(ioctl_code, &req, static_cast<DWORD>(sizeof(req))))
         return false;
 
     if (req.result == 1) {
@@ -6554,6 +6866,21 @@ bool voyager::device_t::relay_server_token(std::uint32_t token_hash, std::uint64
         dynamic_key::set_server_seed(server_nonce, token_hash, session_key_);
         ioctl_codes::set_server_ioctl_seed(server_nonce, token_hash, session_key_);
         log_security_snapshot("relay_server_token_seeded", ioctl_code, make_ioctl_snapshot(44), 0);
+        diag::log_tagged_critical_fmt("comm-startup",
+            "relay_server_token_rotation_committed pid=%lu tid=%lu token_hash=0x%08X nonce_fold=0x%llX session=%d base_after=0x%04X key_hash_after=0x%08X ioctl_seed_hash_after=0x%08X seeded_ioctl=0x%08X inst_seed=%u/%u glob_seed=%u/%u",
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            token_hash,
+            static_cast<unsigned long long>(fold64_no_secret(server_nonce)),
+            session_key_ != 0 ? 1 : 0,
+            compute_ioctl_base_snapshot(),
+            hash_build_key(compute_dynamic_key_snapshot()),
+            server_ioctl_seed_ != 0 ? hash_build_key(server_ioctl_seed_) : 0,
+            make_ioctl_snapshot(44),
+            server_seed_ != 0 ? 1u : 0u,
+            server_ioctl_seed_ != 0 ? 1u : 0u,
+            dynamic_key::g_server_seed != 0 ? 1u : 0u,
+            ioctl_codes::g_server_ioctl_seed != 0 ? 1u : 0u);
         return true;
     }
     log_security_snapshot("relay_server_token_rejected", ioctl_code, ioctl_code, ERROR_ACCESS_DENIED);
@@ -6563,6 +6890,7 @@ bool voyager::device_t::relay_server_token(std::uint32_t token_hash, std::uint64
 bool voyager::device_t::relay_server_token_v2(std::uint32_t token_hash, std::uint64_t server_nonce, std::uint64_t* out_driver_proof) noexcept
 {
     server_token_relay_scope_t relay_scope;
+    std::unique_lock<std::shared_mutex> rotation_guard(seed_rotation_mtx_);
     sync_dynamic_security_state();
     log_security_snapshot("relay_server_token_v2_entry", 0, 0, 0);
     diag::log_tagged_critical_fmt("comm-startup",
@@ -6595,7 +6923,7 @@ bool voyager::device_t::relay_server_token_v2(std::uint32_t token_hash, std::uin
         token_hash,
         static_cast<unsigned long long>(fold64_no_secret(server_nonce)),
         session_key_ != 0 ? 1 : 0);
-    if (!send_request(ioctl_code, &req, static_cast<DWORD>(sizeof(req)))) {
+    if (!send_request_in_lock(ioctl_code, &req, static_cast<DWORD>(sizeof(req)))) {
         DWORD first_err = GetLastError();
         log_security_snapshot("relay_server_token_v2_first_failed", ioctl_code, ioctl_code, first_err);
         diag::log_tagged_critical_fmt("comm-startup",
@@ -6651,7 +6979,7 @@ bool voyager::device_t::relay_server_token_v2(std::uint32_t token_hash, std::uin
         retry.timestamp = __rdtsc();
         retry.server_nonce = server_nonce;
         log_security_snapshot("relay_server_token_v2_retry_pre", retry_ioctl_code, retry_ioctl_code, 0);
-        if (!send_request(retry_ioctl_code, &retry, static_cast<DWORD>(sizeof(retry)))) {
+        if (!send_request_in_lock(retry_ioctl_code, &retry, static_cast<DWORD>(sizeof(retry)))) {
             DWORD retry_err = GetLastError();
             log_security_snapshot("relay_server_token_v2_retry_failed", retry_ioctl_code, retry_ioctl_code, retry_err);
             diag::log_tagged_critical_fmt("comm-startup",
@@ -6672,6 +7000,24 @@ bool voyager::device_t::relay_server_token_v2(std::uint32_t token_hash, std::uin
         server_ioctl_seed_ = ioctl_codes::derive_server_ioctl_seed(server_nonce, token_hash, session_key_);
         dynamic_key::set_server_seed(server_nonce, token_hash, session_key_);
         ioctl_codes::set_server_ioctl_seed(server_nonce, token_hash, session_key_);
+        diag::log_tagged_critical_fmt("comm-startup",
+            "relay_server_token_v2_rotation_committed pid=%lu tid=%lu token_hash=0x%08X nonce_fold=0x%llX session=%d base_after=0x%04X key_hash_after=0x%08X ioctl_seed_hash_after=0x%08X seeded_ioctl=0x%08X inst_seed=%u/%u glob_seed=%u/%u hb_tsc=%llu bridge_whoswho=%llu bridge_sentinel=%llu",
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            token_hash,
+            static_cast<unsigned long long>(fold64_no_secret(server_nonce)),
+            session_key_ != 0 ? 1 : 0,
+            compute_ioctl_base_snapshot(),
+            hash_build_key(compute_dynamic_key_snapshot()),
+            server_ioctl_seed_ != 0 ? hash_build_key(server_ioctl_seed_) : 0,
+            make_ioctl_snapshot(46),
+            server_seed_ != 0 ? 1u : 0u,
+            server_ioctl_seed_ != 0 ? 1u : 0u,
+            dynamic_key::g_server_seed != 0 ? 1u : 0u,
+            ioctl_codes::g_server_ioctl_seed != 0 ? 1u : 0u,
+            static_cast<unsigned long long>(last_heartbeat_tsc_),
+            static_cast<unsigned long long>(last_bridge_whoswho_tsc_),
+            static_cast<unsigned long long>(last_bridge_sentinel_tsc_));
         log_security_snapshot("relay_server_token_v2_seeded", ioctl_code, make_ioctl_snapshot(46), 0);
         diag::log_tagged_critical_fmt("comm-startup",
             "relay_server_token_v2_seeded result=%u proof_fold=0x%llX token_hash=0x%08X nonce_fold=0x%llX inst_seed=%u/%u glob_seed=%u/%u seeded_ioctl=0x%08X",

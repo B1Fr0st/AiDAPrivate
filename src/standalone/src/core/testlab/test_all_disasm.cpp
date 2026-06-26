@@ -373,8 +373,173 @@ namespace {
         return 0;
     }
 
+    std::atomic<uint64_t> g_disasm_ntclose_va_cache{0};
+    std::atomic<int>      g_disasm_ntclose_strategy{0};
+
+    const char* ntclose_strategy_name(int code) {
+        switch (code) {
+        case 1: return "kernel_remote_ntdll";
+        case 2: return "host_process_ntdll";
+        case 3: return "kernel_host_pid_ntdll";
+        default: return "uninitialized";
+        }
+    }
+
     uint64_t resolve_ntclose() {
+        const uint64_t cached = g_disasm_ntclose_va_cache.load(std::memory_order_acquire);
+        if (cached != 0) return cached;
         return resolve_ntdll_export("NtClose");
+    }
+
+    bool ensure_disasm_ntclose_va(HANDLE hf) {
+        const char* tag = "disasm.ntclose_prologue";
+        const auto t0 = std::chrono::steady_clock::now();
+        const DWORD host_pid = GetCurrentProcessId();
+        const DWORD host_tid = GetCurrentThreadId();
+        const uint32_t attached_pid = driver_bridge::attached_pid();
+        const uint64_t cache_before = g_disasm_ntclose_va_cache.load(std::memory_order_acquire);
+        log_msg(hf, tag,
+            "ENTER pid=%lu tid=%lu attached_pid=%u driver_status=\"%s\" cache_before=0x%016llX strategy_before=%s(%d)",
+            (unsigned long)host_pid,
+            (unsigned long)host_tid,
+            attached_pid,
+            driver_bridge::status().c_str(),
+            (unsigned long long)cache_before,
+            ntclose_strategy_name(g_disasm_ntclose_strategy.load(std::memory_order_acquire)),
+            g_disasm_ntclose_strategy.load(std::memory_order_acquire));
+        if (cache_before != 0) {
+            log_msg(hf, tag,
+                "EXIT pid=%lu tid=%lu strategy=cache_hit final_va=0x%016llX elapsed_us=%lld",
+                (unsigned long)host_pid,
+                (unsigned long)host_tid,
+                (unsigned long long)cache_before,
+                elapsed_us_since(t0));
+            return true;
+        }
+
+        const auto t_kernel = std::chrono::steady_clock::now();
+        remote_module_lookup_t remote = resolve_remote_module_info("ntdll.dll");
+        const long long kernel_us = elapsed_us_since(t_kernel);
+        log_msg(hf, tag,
+            "phase=kernel_remote_ntdll pid=%lu attached_pid=%u remote_pid=%u module_count=%zu ntdll_base=0x%016llX ntdll_size=0x%08X elapsed_us=%lld driver_status=\"%s\" last_error=\"%s\"",
+            (unsigned long)host_pid,
+            attached_pid,
+            remote.pid,
+            remote.module_count,
+            (unsigned long long)remote.base,
+            remote.size,
+            kernel_us,
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str());
+
+        uint64_t local_rva = 0;
+        uint64_t local_va = 0;
+        const bool local_ok = local_ntdll_export_rva("NtClose", local_rva, local_va);
+        const DWORD local_gle = local_ok ? 0 : GetLastError();
+        log_msg(hf, tag,
+            "phase=host_process_ntdll local_ok=%d local_rva=0x%016llX local_va=0x%016llX gle=%lu",
+            local_ok ? 1 : 0,
+            (unsigned long long)local_rva,
+            (unsigned long long)local_va,
+            (unsigned long)local_gle);
+
+        if (remote.base != 0 && local_ok) {
+            const uint64_t final_va = remote.base + local_rva;
+            g_disasm_ntclose_va_cache.store(final_va, std::memory_order_release);
+            g_disasm_ntclose_strategy.store(1, std::memory_order_release);
+            log_msg(hf, tag,
+                "EXIT pid=%lu tid=%lu strategy=kernel_remote_ntdll final_va=0x%016llX remote_base=0x%016llX rva=0x%016llX elapsed_us=%lld",
+                (unsigned long)host_pid,
+                (unsigned long)host_tid,
+                (unsigned long long)final_va,
+                (unsigned long long)remote.base,
+                (unsigned long long)local_rva,
+                elapsed_us_since(t0));
+            return true;
+        }
+
+        if (remote.base != 0) {
+            const auto t_drv = std::chrono::steady_clock::now();
+            const uint64_t drv_va = driver_bridge::resolve_export_for(remote.pid, remote.base, "NtClose");
+            log_msg(hf, tag,
+                "phase=kernel_driver_resolve_export pid=%u remote_base=0x%016llX result=0x%016llX elapsed_us=%lld driver_status=\"%s\" last_error=\"%s\"",
+                remote.pid,
+                (unsigned long long)remote.base,
+                (unsigned long long)drv_va,
+                elapsed_us_since(t_drv),
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+            if (drv_va != 0) {
+                g_disasm_ntclose_va_cache.store(drv_va, std::memory_order_release);
+                g_disasm_ntclose_strategy.store(1, std::memory_order_release);
+                log_msg(hf, tag,
+                    "EXIT pid=%lu tid=%lu strategy=kernel_remote_ntdll(driver_resolve) final_va=0x%016llX elapsed_us=%lld",
+                    (unsigned long)host_pid,
+                    (unsigned long)host_tid,
+                    (unsigned long long)drv_va,
+                    elapsed_us_since(t0));
+                return true;
+            }
+        }
+
+        if (attached_pid != 0 && attached_pid != host_pid) {
+            const auto t_hostpid = std::chrono::steady_clock::now();
+            auto modules = driver_bridge::enumerate_modules_for(host_pid);
+            uint64_t host_ntdll_base = 0;
+            uint32_t host_ntdll_size = 0;
+            for (const auto& mod : modules) {
+                if (_stricmp(mod.name.c_str(), "ntdll.dll") == 0) {
+                    host_ntdll_base = mod.base;
+                    host_ntdll_size = mod.size;
+                    break;
+                }
+            }
+            log_msg(hf, tag,
+                "phase=kernel_host_pid_ntdll host_pid=%lu module_count=%zu host_ntdll_base=0x%016llX host_ntdll_size=0x%08X elapsed_us=%lld driver_status=\"%s\" last_error=\"%s\"",
+                (unsigned long)host_pid,
+                modules.size(),
+                (unsigned long long)host_ntdll_base,
+                host_ntdll_size,
+                elapsed_us_since(t_hostpid),
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+            if (host_ntdll_base != 0 && local_ok) {
+                const uint64_t final_va = host_ntdll_base + local_rva;
+                g_disasm_ntclose_va_cache.store(final_va, std::memory_order_release);
+                g_disasm_ntclose_strategy.store(3, std::memory_order_release);
+                log_msg(hf, tag,
+                    "EXIT pid=%lu tid=%lu strategy=kernel_host_pid_ntdll final_va=0x%016llX host_base=0x%016llX rva=0x%016llX elapsed_us=%lld",
+                    (unsigned long)host_pid,
+                    (unsigned long)host_tid,
+                    (unsigned long long)final_va,
+                    (unsigned long long)host_ntdll_base,
+                    (unsigned long long)local_rva,
+                    elapsed_us_since(t0));
+                return true;
+            }
+        }
+
+        if (local_ok && local_va != 0) {
+            g_disasm_ntclose_va_cache.store(local_va, std::memory_order_release);
+            g_disasm_ntclose_strategy.store(2, std::memory_order_release);
+            log_msg(hf, tag,
+                "EXIT pid=%lu tid=%lu strategy=host_process_ntdll final_va=0x%016llX elapsed_us=%lld",
+                (unsigned long)host_pid,
+                (unsigned long)host_tid,
+                (unsigned long long)local_va,
+                elapsed_us_since(t0));
+            return true;
+        }
+
+        log_msg(hf, tag,
+            "EXIT pid=%lu tid=%lu strategy=unresolved final_va=0x0000000000000000 elapsed_us=%lld driver_status=\"%s\" last_error=\"%s\" gle=%lu",
+            (unsigned long)host_pid,
+            (unsigned long)host_tid,
+            elapsed_us_since(t0),
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str(),
+            (unsigned long)local_gle);
+        return false;
     }
 
     bool string_signals_error(const std::string& s) {
@@ -786,10 +951,18 @@ namespace {
 
     void test_goto_address(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "disasm.goto_address";
-        uint64_t addr = resolve_ntdll_export("NtClose", hf, tag);
+        (void)skipped;
+        uint64_t addr = resolve_ntclose();
+        if (addr == 0)
+            addr = resolve_ntdll_export("NtClose", hf, tag);
         if (addr == 0) {
-            log_msg(hf, tag, "SKIP -- NtClose not resolved");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- NtClose precondition unresolved at test entry (phase prologue should have populated cache) strategy=%s(%d) cache=0x%016llX driver_status=\"%s\" last_error=\"%s\"",
+                ntclose_strategy_name(g_disasm_ntclose_strategy.load(std::memory_order_acquire)),
+                g_disasm_ntclose_strategy.load(std::memory_order_acquire),
+                (unsigned long long)g_disasm_ntclose_va_cache.load(std::memory_order_acquire),
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+            failed.fetch_add(1);
             return;
         }
         refresh_and_validate_disasm(hf, tag, addr, passed, failed);
@@ -797,10 +970,16 @@ namespace {
 
     void test_get_disasm_window_bytes(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "disasm.window_bytes";
+        (void)skipped;
         uint64_t addr = resolve_ntclose();
         if (addr == 0) {
-            log_msg(hf, tag, "SKIP -- NtClose not resolved");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- NtClose precondition unresolved at test entry strategy=%s(%d) cache=0x%016llX driver_status=\"%s\" last_error=\"%s\"",
+                ntclose_strategy_name(g_disasm_ntclose_strategy.load(std::memory_order_acquire)),
+                g_disasm_ntclose_strategy.load(std::memory_order_acquire),
+                (unsigned long long)g_disasm_ntclose_va_cache.load(std::memory_order_acquire),
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+            failed.fetch_add(1);
             return;
         }
         refresh_and_validate_disasm(hf, tag, addr, passed, failed);
@@ -1266,10 +1445,14 @@ namespace {
 
     void test_pseudocode_request_decompile(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "pseudo.request_decompile";
+        (void)skipped;
         uint64_t addr = resolve_ntclose();
         if (addr == 0) {
-            log_msg(hf, tag, "SKIP -- NtClose not resolved");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- NtClose precondition unresolved at test entry strategy=%s(%d) cache=0x%016llX",
+                ntclose_strategy_name(g_disasm_ntclose_strategy.load(std::memory_order_acquire)),
+                g_disasm_ntclose_strategy.load(std::memory_order_acquire),
+                (unsigned long long)g_disasm_ntclose_va_cache.load(std::memory_order_acquire));
+            failed.fetch_add(1);
             return;
         }
         validate_decompile(hf, tag, "NtClose", addr, true, passed, failed);
@@ -1277,10 +1460,14 @@ namespace {
 
     void test_pseudocode_has_tab_for(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "pseudo.has_tab_for";
+        (void)skipped;
         uint64_t addr = resolve_ntclose();
         if (addr == 0) {
-            log_msg(hf, tag, "SKIP -- NtClose not resolved");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- NtClose precondition unresolved at test entry strategy=%s(%d) cache=0x%016llX",
+                ntclose_strategy_name(g_disasm_ntclose_strategy.load(std::memory_order_acquire)),
+                g_disasm_ntclose_strategy.load(std::memory_order_acquire),
+                (unsigned long long)g_disasm_ntclose_va_cache.load(std::memory_order_acquire));
+            failed.fetch_add(1);
             return;
         }
         try {
@@ -1307,10 +1494,14 @@ namespace {
 
     void test_pseudocode_tab_count(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "pseudo.tab_count";
+        (void)skipped;
         uint64_t addr = resolve_ntclose();
         if (addr == 0) {
-            log_msg(hf, tag, "SKIP -- NtClose not resolved");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- NtClose precondition unresolved at test entry strategy=%s(%d) cache=0x%016llX",
+                ntclose_strategy_name(g_disasm_ntclose_strategy.load(std::memory_order_acquire)),
+                g_disasm_ntclose_strategy.load(std::memory_order_acquire),
+                (unsigned long long)g_disasm_ntclose_va_cache.load(std::memory_order_acquire));
+            failed.fetch_add(1);
             return;
         }
         try {
@@ -1340,10 +1531,14 @@ namespace {
 
     void test_pseudocode_snapshot_tabs(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "pseudo.snapshot_tabs";
+        (void)skipped;
         uint64_t addr = resolve_ntclose();
         if (addr == 0) {
-            log_msg(hf, tag, "SKIP -- NtClose not resolved");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- NtClose precondition unresolved at test entry strategy=%s(%d) cache=0x%016llX",
+                ntclose_strategy_name(g_disasm_ntclose_strategy.load(std::memory_order_acquire)),
+                g_disasm_ntclose_strategy.load(std::memory_order_acquire),
+                (unsigned long long)g_disasm_ntclose_va_cache.load(std::memory_order_acquire));
+            failed.fetch_add(1);
             return;
         }
         try {
@@ -1556,11 +1751,12 @@ namespace {
 
     void test_hexview_read_from_process(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "hexview.read_process";
+        (void)skipped;
         try {
             HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
             if (!ntdll) {
-                log_msg(hf, tag, "SKIP -- ntdll not loaded");
-                skipped.fetch_add(1);
+                log_msg(hf, tag, "FAIL -- ntdll.dll handle is null in host process gle=%lu", (unsigned long)GetLastError());
+                failed.fetch_add(1);
                 return;
             }
             uint64_t addr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(ntdll));
@@ -1988,10 +2184,14 @@ namespace {
 
     void test_xref_warm_range(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "xref.warm_range";
+        (void)skipped;
         uint64_t addr = resolve_ntclose();
         if (addr == 0) {
-            log_msg(hf, tag, "SKIP -- NtClose not resolved");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- NtClose precondition unresolved at test entry strategy=%s(%d) cache=0x%016llX",
+                ntclose_strategy_name(g_disasm_ntclose_strategy.load(std::memory_order_acquire)),
+                g_disasm_ntclose_strategy.load(std::memory_order_acquire),
+                (unsigned long long)g_disasm_ntclose_va_cache.load(std::memory_order_acquire));
+            failed.fetch_add(1);
             return;
         }
         try {
@@ -2363,10 +2563,13 @@ namespace {
 
     void test_pseudocode_request_decompile_ntcreatefile(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "pseudo.decompile_ntcf";
+        (void)skipped;
         uint64_t addr = resolve_ntdll_fn("NtCreateFile");
         if (addr == 0) {
-            log_msg(hf, tag, "SKIP -- NtCreateFile not resolved");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- NtCreateFile precondition unresolved driver_status=\"%s\" last_error=\"%s\"",
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+            failed.fetch_add(1);
             return;
         }
         validate_decompile(hf, tag, "NtCreateFile", addr, true, passed, failed);
@@ -2374,10 +2577,14 @@ namespace {
 
     void test_pseudocode_request_decompile_force(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "pseudo.decompile_force";
+        (void)skipped;
         uint64_t addr = resolve_ntclose();
         if (addr == 0) {
-            log_msg(hf, tag, "SKIP -- NtClose not resolved");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- NtClose precondition unresolved at test entry strategy=%s(%d) cache=0x%016llX",
+                ntclose_strategy_name(g_disasm_ntclose_strategy.load(std::memory_order_acquire)),
+                g_disasm_ntclose_strategy.load(std::memory_order_acquire),
+                (unsigned long long)g_disasm_ntclose_va_cache.load(std::memory_order_acquire));
+            failed.fetch_add(1);
             return;
         }
         validate_decompile(hf, tag, "NtClose(force)", addr, true, passed, failed);
@@ -2385,10 +2592,14 @@ namespace {
 
     void test_pseudocode_close_tab_by_addr(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "pseudo.close_by_addr";
+        (void)skipped;
         uint64_t addr = resolve_ntclose();
         if (addr == 0) {
-            log_msg(hf, tag, "SKIP -- NtClose not resolved");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- NtClose precondition unresolved at test entry strategy=%s(%d) cache=0x%016llX",
+                ntclose_strategy_name(g_disasm_ntclose_strategy.load(std::memory_order_acquire)),
+                g_disasm_ntclose_strategy.load(std::memory_order_acquire),
+                (unsigned long long)g_disasm_ntclose_va_cache.load(std::memory_order_acquire));
+            failed.fetch_add(1);
             return;
         }
         try {
@@ -2417,10 +2628,14 @@ namespace {
 
     void test_pseudocode_activate_tab_by_addr(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "pseudo.activate_tab";
+        (void)skipped;
         uint64_t addr = resolve_ntclose();
         if (addr == 0) {
-            log_msg(hf, tag, "SKIP -- NtClose not resolved");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- NtClose precondition unresolved at test entry strategy=%s(%d) cache=0x%016llX",
+                ntclose_strategy_name(g_disasm_ntclose_strategy.load(std::memory_order_acquire)),
+                g_disasm_ntclose_strategy.load(std::memory_order_acquire),
+                (unsigned long long)g_disasm_ntclose_va_cache.load(std::memory_order_acquire));
+            failed.fetch_add(1);
             return;
         }
         try {
@@ -2449,10 +2664,14 @@ namespace {
 
     void test_pseudocode_has_active_tab(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "pseudo.has_active";
+        (void)skipped;
         uint64_t addr = resolve_ntclose();
         if (addr == 0) {
-            log_msg(hf, tag, "SKIP -- NtClose not resolved");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- NtClose precondition unresolved at test entry strategy=%s(%d) cache=0x%016llX",
+                ntclose_strategy_name(g_disasm_ntclose_strategy.load(std::memory_order_acquire)),
+                g_disasm_ntclose_strategy.load(std::memory_order_acquire),
+                (unsigned long long)g_disasm_ntclose_va_cache.load(std::memory_order_acquire));
+            failed.fetch_add(1);
             return;
         }
         try {
@@ -2481,10 +2700,14 @@ namespace {
 
     void test_pseudocode_active_tab_address(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "pseudo.active_addr";
+        (void)skipped;
         uint64_t addr = resolve_ntclose();
         if (addr == 0) {
-            log_msg(hf, tag, "SKIP -- NtClose not resolved");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- NtClose precondition unresolved at test entry strategy=%s(%d) cache=0x%016llX",
+                ntclose_strategy_name(g_disasm_ntclose_strategy.load(std::memory_order_acquire)),
+                g_disasm_ntclose_strategy.load(std::memory_order_acquire),
+                (unsigned long long)g_disasm_ntclose_va_cache.load(std::memory_order_acquire));
+            failed.fetch_add(1);
             return;
         }
         try {
@@ -2511,10 +2734,14 @@ namespace {
 
     void test_pseudocode_refresh_active_tab(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "pseudo.refresh_active";
-        uint64_t addr = resolve_ntdll_export("NtClose");
+        (void)skipped;
+        uint64_t addr = resolve_ntclose();
         if (addr == 0) {
-            log_msg(hf, tag, "SKIP -- NtClose not resolved");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- NtClose precondition unresolved at test entry strategy=%s(%d) cache=0x%016llX",
+                ntclose_strategy_name(g_disasm_ntclose_strategy.load(std::memory_order_acquire)),
+                g_disasm_ntclose_strategy.load(std::memory_order_acquire),
+                (unsigned long long)g_disasm_ntclose_va_cache.load(std::memory_order_acquire));
+            failed.fetch_add(1);
             return;
         }
         try {
@@ -2595,16 +2822,20 @@ namespace {
 
     void test_pseudocode_refresh_all_tabs(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "pseudo.refresh_all";
-        uint64_t addr1 = resolve_ntdll_export("NtClose");
+        (void)skipped;
+        uint64_t addr1 = resolve_ntclose();
+        if (addr1 == 0) addr1 = resolve_ntdll_export("NtClose");
         uint64_t addr2 = resolve_ntdll_export("NtCreateFile");
         if (addr2 == 0 || addr2 == addr1)
             addr2 = resolve_ntdll_export("NtReadFile");
         if (addr2 == 0 || addr2 == addr1)
             addr2 = resolve_ntdll_export("NtOpenFile");
         if (addr1 == 0 || addr2 == 0 || addr1 == addr2) {
-            log_msg(hf, tag, "SKIP -- could not resolve two distinct ntdll exports addr1=0x%016llX addr2=0x%016llX",
-                (unsigned long long)addr1, (unsigned long long)addr2);
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- could not resolve two distinct ntdll exports addr1=0x%016llX addr2=0x%016llX driver_status=\"%s\" last_error=\"%s\"",
+                (unsigned long long)addr1, (unsigned long long)addr2,
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+            failed.fetch_add(1);
             return;
         }
         try {
@@ -2703,10 +2934,14 @@ namespace {
 
     void test_pseudocode_close_active_tab(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "pseudo.close_active";
+        (void)skipped;
         uint64_t addr = resolve_ntclose();
         if (addr == 0) {
-            log_msg(hf, tag, "SKIP -- NtClose not resolved");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- NtClose precondition unresolved at test entry strategy=%s(%d) cache=0x%016llX",
+                ntclose_strategy_name(g_disasm_ntclose_strategy.load(std::memory_order_acquire)),
+                g_disasm_ntclose_strategy.load(std::memory_order_acquire),
+                (unsigned long long)g_disasm_ntclose_va_cache.load(std::memory_order_acquire));
+            failed.fetch_add(1);
             return;
         }
         try {
@@ -2792,11 +3027,12 @@ namespace {
 
     void test_hexview_read_process_ntdll_header(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "hexview.read_ntdll_hdr";
+        (void)skipped;
         try {
             HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
             if (!ntdll) {
-                log_msg(hf, tag, "SKIP -- ntdll not loaded");
-                skipped.fetch_add(1);
+                log_msg(hf, tag, "FAIL -- ntdll.dll handle is null in host process gle=%lu", (unsigned long)GetLastError());
+                failed.fetch_add(1);
                 return;
             }
             uint64_t addr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(ntdll));
@@ -2827,11 +3063,12 @@ namespace {
 
     void test_hexview_read_process_kernel32(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "hexview.read_k32";
+        (void)skipped;
         try {
             HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
             if (!k32) {
-                log_msg(hf, tag, "SKIP -- kernel32 not loaded");
-                skipped.fetch_add(1);
+                log_msg(hf, tag, "FAIL -- kernel32.dll handle is null in host process gle=%lu", (unsigned long)GetLastError());
+                failed.fetch_add(1);
                 return;
             }
             uint64_t addr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(k32));
@@ -3529,10 +3766,13 @@ namespace {
 
     void test_disasm_goto_ntcreatefile(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "disasm.goto_ntcf";
+        (void)skipped;
         uint64_t addr = resolve_ntdll_fn("NtCreateFile");
         if (addr == 0) {
-            log_msg(hf, tag, "SKIP -- NtCreateFile not resolved");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- NtCreateFile precondition unresolved driver_status=\"%s\" last_error=\"%s\"",
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+            failed.fetch_add(1);
             return;
         }
         auto t0 = std::chrono::steady_clock::now();
@@ -3546,10 +3786,13 @@ namespace {
 
     void test_disasm_goto_ntreadfile(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "disasm.goto_ntrf";
+        (void)skipped;
         uint64_t addr = resolve_ntdll_fn("NtReadFile");
         if (addr == 0) {
-            log_msg(hf, tag, "SKIP -- NtReadFile not resolved");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- NtReadFile precondition unresolved driver_status=\"%s\" last_error=\"%s\"",
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+            failed.fetch_add(1);
             return;
         }
         debugger_engine::request_disasm_refresh(addr, 0);
@@ -3561,10 +3804,13 @@ namespace {
 
     void test_disasm_goto_ntwritefile(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "disasm.goto_ntwf";
+        (void)skipped;
         uint64_t addr = resolve_ntdll_fn("NtWriteFile");
         if (addr == 0) {
-            log_msg(hf, tag, "SKIP -- NtWriteFile not resolved");
-            skipped.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- NtWriteFile precondition unresolved driver_status=\"%s\" last_error=\"%s\"",
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+            failed.fetch_add(1);
             return;
         }
         debugger_engine::request_disasm_refresh(addr, 0);
@@ -3858,11 +4104,35 @@ void phase_disasm_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& f
 
     int total = static_cast<int>(sizeof(tests) / sizeof(tests[0]));
     log_msg(hf, "disasm_phase", "=== DISASM TESTS START (%d tests) ===", total);
+
+    const bool ntclose_ready = ensure_disasm_ntclose_va(hf);
+    if (!ntclose_ready) {
+        log_msg(hf, "disasm_phase",
+            "FAIL -- disasm phase prologue failed to resolve NtClose precondition; per-test arms will FAIL individually with diagnostics pid=%lu tid=%lu attached_pid=%u driver_status=\"%s\" last_error=\"%s\" gle=%lu strategy=%s(%d) cache=0x%016llX",
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            driver_bridge::attached_pid(),
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str(),
+            static_cast<unsigned long>(GetLastError()),
+            ntclose_strategy_name(g_disasm_ntclose_strategy.load(std::memory_order_acquire)),
+            g_disasm_ntclose_strategy.load(std::memory_order_acquire),
+            static_cast<unsigned long long>(g_disasm_ntclose_va_cache.load(std::memory_order_acquire)));
+        failed.fetch_add(1);
+    }
+
     for (int i = 0; i < total; ++i) {
         if (cancelled && cancelled()) {
             int remaining = total - i;
-            skipped.fetch_add(remaining);
-            log_msg(hf, "disasm_phase", "cancelled -- skipping %d remaining tests", remaining);
+            failed.fetch_add(remaining);
+            log_msg(hf, "disasm_phase",
+                "FAIL -- cancellation requested mid-disasm-phase with %d test(s) remaining; cancellation is a defect in the sanctioned full-test run pid=%lu tid=%lu attempted_test=%s index=%d total=%d",
+                remaining,
+                static_cast<unsigned long>(GetCurrentProcessId()),
+                static_cast<unsigned long>(GetCurrentThreadId()),
+                tests[i].name,
+                i,
+                total);
             break;
         }
         const uint32_t attached_pid = driver_bridge::attached_pid();
@@ -3870,9 +4140,8 @@ void phase_disasm_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& f
             uint32_t exit_code = 0;
             if (!driver_bridge::attached_process_alive(&exit_code)) {
                 int remaining = total - i;
-                failed.fetch_add(1);
-                skipped.fetch_add(remaining);
-                log_msg(hf, "disasm_phase", "FAIL -- attached target pid=%u is dead before %s exit_code_or_err=0x%08X; skipping %d remaining disasm tests",
+                failed.fetch_add(1 + remaining);
+                log_msg(hf, "disasm_phase", "FAIL -- attached target pid=%u is dead before %s exit_code_or_err=0x%08X; failing %d remaining disasm tests",
                     attached_pid, tests[i].name, exit_code, remaining);
                 break;
             }

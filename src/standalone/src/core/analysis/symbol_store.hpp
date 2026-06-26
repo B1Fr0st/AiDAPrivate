@@ -20,6 +20,7 @@
 #include "pdb_events.hpp"
 #include "pdb_parser.hpp"
 #include "pdb_downloader.hpp"
+#include "pdb_default_skip.hpp"
 #include "standalone_driver.hpp"
 #include "standalone_settings.hpp"
 #include "../testlab/test_all_features.hpp"
@@ -78,6 +79,8 @@ struct pdb_automation_context_t {
 	bool post_suppression_active = false;
 	uint64_t post_suppression_remaining_ms = 0;
 	bool pdb_automation_active = false;
+	bool user_default_skip_active = false;
+	bool pdb_skip_active = false;
 };
 
 inline bool full_test_env_active_for_pdb()
@@ -89,6 +92,16 @@ inline bool full_test_env_active_for_pdb()
 	return value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
 }
 
+inline bool pdb_skip_setting_enabled()
+{
+	return pdb_default_skip::get();
+}
+
+inline bool pdb_user_default_skip_active()
+{
+	return pdb_skip_setting_enabled();
+}
+
 inline pdb_automation_context_t pdb_automation_context()
 {
 	pdb_automation_context_t ctx;
@@ -98,12 +111,19 @@ inline pdb_automation_context_t pdb_automation_context()
 	ctx.unattended_active = test_all_features::is_unattended_full_test_active();
 	ctx.post_suppression_active = anti_tamper::state::full_test_suppression_active(&ctx.post_suppression_remaining_ms);
 	ctx.pdb_automation_active = ctx.unattended_active || ctx.post_suppression_active;
+	ctx.user_default_skip_active = pdb_user_default_skip_active();
+	ctx.pdb_skip_active = ctx.pdb_automation_active || ctx.user_default_skip_active;
 	return ctx;
 }
 
 inline bool pdb_automation_active()
 {
 	return pdb_automation_context().pdb_automation_active;
+}
+
+inline bool pdb_skip_active()
+{
+	return pdb_automation_context().pdb_skip_active;
 }
 
 inline uint64_t next_load_generation()
@@ -596,7 +616,7 @@ inline bool suppress_full_test_pdb_load(const char* source,
                                         bool update_module_state = true)
 {
 	const auto automation = pdb_automation_context();
-	if (!automation.pdb_automation_active) return false;
+	if (!automation.pdb_skip_active) return false;
 	const uint64_t generation = next_load_generation();
 	bool module_present = false;
 	bool already_loaded = false;
@@ -641,7 +661,7 @@ inline bool suppress_full_test_pdb_load(const char* source,
 	}
 
 	diag::log_tagged_fmt("symbol_store",
-		"fulltest_pdb_final_decision source=%s module=%s base=0x%llX size=0x%llX pdb=%s guid=%s age=%u decision=do_not_load_pdb reason=%s local_candidate=%s cache_path=%s explicit_path=%s prompt_suppressed=1 is_running=%d anti_tamper_full_test_running=%d full_test_env_active=%d unattended_active=%d post_suppression_active=%d post_suppression_remaining_ms=%llu pdb_automation_active=%d",
+		"fulltest_pdb_final_decision source=%s module=%s base=0x%llX size=0x%llX pdb=%s guid=%s age=%u decision=do_not_load_pdb reason=%s local_candidate=%s cache_path=%s explicit_path=%s prompt_suppressed=1 is_running=%d anti_tamper_full_test_running=%d full_test_env_active=%d unattended_active=%d post_suppression_active=%d post_suppression_remaining_ms=%llu pdb_automation_active=%d user_default_skip_active=%d pdb_skip_active=%d",
 		source && *source ? source : "<unknown>",
 		log_value(module_name),
 		static_cast<unsigned long long>(base),
@@ -659,9 +679,11 @@ inline bool suppress_full_test_pdb_load(const char* source,
 		automation.unattended_active ? 1 : 0,
 		automation.post_suppression_active ? 1 : 0,
 		static_cast<unsigned long long>(automation.post_suppression_remaining_ms),
-		automation.pdb_automation_active ? 1 : 0);
+		automation.pdb_automation_active ? 1 : 0,
+		automation.user_default_skip_active ? 1 : 0,
+		automation.pdb_skip_active ? 1 : 0);
 	diag::log_tagged_fmt("symbol_store",
-		"fulltest_symbol_store_pdb_suppressed decision=do_not_load_pdb source=%s module=%s base=0x%llX size=0x%llX pdb=%s guid=%s age=%u local_candidate=%s cache_path=%s explicit_path=%s reason=%s generation=%llu prompt_created=0 prompt_suppressed=1 module_present=%d loaded=%d loading=%d failed=%d declined=%d state_updated=%d is_running=%d anti_tamper_full_test_running=%d full_test_env_active=%d unattended_active=%d post_suppression_active=%d post_suppression_remaining_ms=%llu pdb_automation_active=%d",
+		"fulltest_symbol_store_pdb_suppressed decision=do_not_load_pdb source=%s module=%s base=0x%llX size=0x%llX pdb=%s guid=%s age=%u local_candidate=%s cache_path=%s explicit_path=%s reason=%s generation=%llu prompt_created=0 prompt_suppressed=1 module_present=%d loaded=%d loading=%d failed=%d declined=%d state_updated=%d is_running=%d anti_tamper_full_test_running=%d full_test_env_active=%d unattended_active=%d post_suppression_active=%d post_suppression_remaining_ms=%llu pdb_automation_active=%d user_default_skip_active=%d pdb_skip_active=%d",
 		source && *source ? source : "<unknown>",
 		log_value(module_name),
 		static_cast<unsigned long long>(base),
@@ -686,13 +708,15 @@ inline bool suppress_full_test_pdb_load(const char* source,
 		automation.unattended_active ? 1 : 0,
 		automation.post_suppression_active ? 1 : 0,
 		static_cast<unsigned long long>(automation.post_suppression_remaining_ms),
-		automation.pdb_automation_active ? 1 : 0);
+		automation.pdb_automation_active ? 1 : 0,
+		automation.user_default_skip_active ? 1 : 0,
+		automation.pdb_skip_active ? 1 : 0);
 	return true;
 }
 
 inline void load_pdb_for_module(const std::string& module_name, uint64_t base, uint64_t size)
 {
-	if (pdb_automation_active()) {
+	if (pdb_skip_active()) {
 		const std::string pdb_name = fallback_pdb_name_for_module(module_name);
 		const std::string local_candidate = safe_find_local_pdb_for_suppression(module_name, "load_pdb_for_module");
 		suppress_full_test_pdb_load("load_pdb_for_module", module_name, base, size,
@@ -857,7 +881,7 @@ inline void load_pdb_with_hint(const std::string& module_name, uint64_t base, ui
                                const std::string& pdb_name, const std::string& pdb_guid,
                                uint32_t pdb_age, const std::string& symbol_server_base)
 {
-	if (pdb_automation_active()) {
+	if (pdb_skip_active()) {
 		std::string cache_path;
 		try {
 			cache_path = expected_cache_path_for_hint(pdb_name, pdb_guid, pdb_age);
@@ -1645,7 +1669,7 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 
 inline void auto_load_attached_modules()
 {
-	if (pdb_automation_active()) {
+	if (pdb_skip_active()) {
 		suppress_full_test_pdb_load("auto_load_attached_modules", "<attached_modules>",
 			0, 0, "<auto>", {}, 0, {}, {}, {},
 			"full_test_declined_attached_module_auto_load", false);

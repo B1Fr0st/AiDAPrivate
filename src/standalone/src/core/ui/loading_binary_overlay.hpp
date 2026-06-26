@@ -128,12 +128,12 @@ inline void advance_pdb_phase_after_automation(const char* source)
 	const bool remote_pending = initial_analysis::g_state.needs_pdb_prompt.load(std::memory_order_acquire);
 	const bool local_pending = initial_analysis::g_state.needs_local_pdb_prompt.load(std::memory_order_acquire);
 	const auto automation = symbol_store::pdb_automation_context();
-	if (!automation.pdb_automation_active || remote_pending || local_pending)
+	if (!automation.pdb_skip_active || remote_pending || local_pending)
 		return;
 	const phase_t next = next_phase_after_pdb_prompt_clear();
 	set_phase(next);
 	diag::log_tagged_fmt("loading_binary_overlay",
-		"pdb_overlay_phase_auto_advanced source=%s prev=%s next=%s reason=automation_do_not_load_pdb remote_pending=0 local_pending=0 active_step_index=%d is_running=%d anti_tamper_full_test_running=%d full_test_env_active=%d unattended_active=%d post_suppression_active=%d post_suppression_remaining_ms=%llu pdb_automation_active=%d",
+		"pdb_overlay_phase_auto_advanced source=%s prev=%s next=%s reason=automation_do_not_load_pdb remote_pending=0 local_pending=0 active_step_index=%d is_running=%d anti_tamper_full_test_running=%d full_test_env_active=%d unattended_active=%d post_suppression_active=%d post_suppression_remaining_ms=%llu pdb_automation_active=%d user_default_skip_active=%d pdb_skip_active=%d",
 		source && *source ? source : "<unknown>",
 		phase_name(prev),
 		phase_name(next),
@@ -144,7 +144,9 @@ inline void advance_pdb_phase_after_automation(const char* source)
 		automation.unattended_active ? 1 : 0,
 		automation.post_suppression_active ? 1 : 0,
 		static_cast<unsigned long long>(automation.post_suppression_remaining_ms),
-		automation.pdb_automation_active ? 1 : 0);
+		automation.pdb_automation_active ? 1 : 0,
+		automation.user_default_skip_active ? 1 : 0,
+		automation.pdb_skip_active ? 1 : 0);
 }
 
 inline void log_pdb_visible_attempt(const char* source)
@@ -152,7 +154,7 @@ inline void log_pdb_visible_attempt(const char* source)
 	const bool remote_pending = initial_analysis::g_state.needs_pdb_prompt.load(std::memory_order_acquire);
 	const bool local_pending = initial_analysis::g_state.needs_local_pdb_prompt.load(std::memory_order_acquire);
 	const auto automation = symbol_store::pdb_automation_context();
-	if (!automation.pdb_automation_active || (!remote_pending && !local_pending))
+	if (!automation.pdb_skip_active || (!remote_pending && !local_pending))
 		return;
 	initial_analysis::pdb_hint_t hint;
 	{
@@ -171,7 +173,7 @@ inline void log_pdb_visible_attempt(const char* source)
 		image_size = initial_analysis::g_state.local_pdb_image_size;
 	}
 	diag::log_tagged_critical_fmt("loading_binary_overlay",
-		"pdb_modal_visible_attempt source=%s phase=%s remote_pending=%d local_pending=%d prompt_suppressed=1 decision=do_not_load_pdb module=%s base=0x%llX size=0x%llX pdb=%s guid=%s age=%u reason=%s is_running=%d anti_tamper_full_test_running=%d full_test_env_active=%d unattended_active=%d post_suppression_active=%d post_suppression_remaining_ms=%llu pdb_automation_active=%d",
+		"pdb_modal_visible_attempt source=%s phase=%s remote_pending=%d local_pending=%d prompt_suppressed=1 decision=do_not_load_pdb module=%s base=0x%llX size=0x%llX pdb=%s guid=%s age=%u reason=%s is_running=%d anti_tamper_full_test_running=%d full_test_env_active=%d unattended_active=%d post_suppression_active=%d post_suppression_remaining_ms=%llu pdb_automation_active=%d user_default_skip_active=%d pdb_skip_active=%d",
 		source && *source ? source : "<unknown>",
 		phase_name(get_phase()),
 		remote_pending ? 1 : 0,
@@ -189,7 +191,9 @@ inline void log_pdb_visible_attempt(const char* source)
 		automation.unattended_active ? 1 : 0,
 		automation.post_suppression_active ? 1 : 0,
 		static_cast<unsigned long long>(automation.post_suppression_remaining_ms),
-		automation.pdb_automation_active ? 1 : 0);
+		automation.pdb_automation_active ? 1 : 0,
+		automation.user_default_skip_active ? 1 : 0,
+		automation.pdb_skip_active ? 1 : 0);
 }
 
 inline void set_milestone(float pct, const char* label, unsigned int id)
@@ -479,7 +483,7 @@ inline std::string compose_dynamic_label(phase_t ph)
 		advance_pdb_phase_after_automation("loading_binary_overlay.compose_dynamic_label");
 		bool has_remote = initial_analysis::g_state.needs_pdb_prompt.load(std::memory_order_acquire);
 		bool has_local = initial_analysis::g_state.needs_local_pdb_prompt.load(std::memory_order_acquire);
-		if (!has_remote && !has_local && symbol_store::pdb_automation_active())
+		if (!has_remote && !has_local && symbol_store::pdb_skip_active())
 			return compose_dynamic_label(get_phase());
 		if (has_remote) return std::string("Waiting for PDB download confirmation...");
 		if (has_local) return std::string("Waiting for local PDB selection...");

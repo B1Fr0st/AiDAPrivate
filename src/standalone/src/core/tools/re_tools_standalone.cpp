@@ -164,7 +164,7 @@ void register_re_tools(mcp_standalone::server_t& srv)
 
     register_compat(srv, {"rtti_find_type", "re.rtti",
         "Find RTTI types matching a regex pattern.",
-        {{"pattern", "string", "Name regex; optional when exact RTTI selectors are supplied", false},
+        {{"pattern", "string", "Name regex; optional when exact RTTI selectors are supplied", true},
          {"module_name", "string", "Optional module name", false},
          {"module_base_va", "string", "Optional module base address", false},
          {"rtti_module_base_va", "string", "Optional module base address alias", false},
@@ -187,7 +187,7 @@ void register_re_tools(mcp_standalone::server_t& srv)
 
     register_compat(srv, {"rtti_list_hierarchy", "re.rtti",
         "List inheritance hierarchy for an RTTI type name or vtable/type descriptor VA.",
-        {{"type_name_or_va", "string", "Type substring or address; optional when exact RTTI selectors are supplied", false},
+        {{"type_name_or_va", "string", "Type substring or address; optional when exact RTTI selectors are supplied", true},
          {"vtable_va", "string", "Optional vtable hint address", false},
          {"rtti_vtable_va", "string", "Optional vtable hint address alias", false},
          {"type_descriptor_va", "string", "Optional exact TypeDescriptor address", false},
@@ -209,7 +209,7 @@ void register_re_tools(mcp_standalone::server_t& srv)
 
     register_compat(srv, {"rtti_find_constructor", "re.rtti",
         "Find constructor candidates that reference a given vtable.",
-        {{"vtable_va", "string", "Vtable address", false},
+        {{"vtable_va", "string", "Vtable address", true},
          {"rtti_vtable_va", "string", "Vtable address alias", false},
          {"constructor_fn_va", "string", "Optional exact constructor function selector", false},
          {"rtti_constructor_fn_va", "string", "Optional exact constructor function selector alias", false},

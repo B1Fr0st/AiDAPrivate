@@ -1745,9 +1745,30 @@ tool_result_t driver_enumerate_kernel_modules(const json& params)
 
 tool_result_t driver_allocate_memory(const json& params)
 {
-    diag::log_tagged_fmt("drv_tools", "driver_allocate_memory entry");
+    const DWORD host_pid = GetCurrentProcessId();
+    const DWORD host_tid = GetCurrentThreadId();
+    const auto t_entry = std::chrono::steady_clock::now();
+    const std::uint32_t bridge_pid_before = driver_bridge::attached_pid();
+    const bool bridge_alive_before = driver_bridge::using_kernel_driver();
+    diag::log_tagged_fmt("drv_tools",
+        "driver_allocate_memory ENTER host_pid=%lu host_tid=%lu bridge_pid=%u bridge_alive=%d driver_status=\"%s\" last_error=\"%s\"",
+        static_cast<unsigned long>(host_pid),
+        static_cast<unsigned long>(host_tid),
+        bridge_pid_before,
+        bridge_alive_before ? 1 : 0,
+        driver_bridge::status().c_str(),
+        driver_bridge::last_error().c_str());
     if (auto ctx_err = ensure_attached_process_context(params))
+    {
+        diag::log_tagged_fmt("drv_tools",
+            "driver_allocate_memory EXIT host_pid=%lu host_tid=%lu reason=ensure_attached_context_error elapsed_us=%lld driver_status=\"%s\" last_error=\"%s\"",
+            static_cast<unsigned long>(host_pid),
+            static_cast<unsigned long>(host_tid),
+            static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t_entry).count()),
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str());
         return *ctx_err;
+    }
 
     std::size_t size = 0;
     if (params.contains("size"))
@@ -1761,17 +1782,80 @@ tool_result_t driver_allocate_memory(const json& params)
         }
     }
     if (size == 0 || size > 0x1000000)
+    {
+        diag::log_tagged_fmt("drv_tools",
+            "driver_allocate_memory EXIT host_pid=%lu host_tid=%lu reason=invalid_size requested=%zu elapsed_us=%lld",
+            static_cast<unsigned long>(host_pid),
+            static_cast<unsigned long>(host_tid),
+            size,
+            static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t_entry).count()));
         return tool_result_t::error(OBFSTR("Invalid size. Must be 1 to 16777216 (16MB)."));
+    }
 
+    const std::uint32_t bridge_pid_after_ctx = driver_bridge::attached_pid();
+    const bool bridge_alive_after_ctx = driver_bridge::using_kernel_driver();
+    const std::uint64_t dtb_after_ctx = device ? device->get_dtb() : 0;
+    diag::log_tagged_fmt("drv_tools",
+        "driver_allocate_memory KERNEL-CALL ENTER host_pid=%lu host_tid=%lu bridge_pid=%u bridge_alive=%d dtb=0x%016llX requested_size=%zu driver_status=\"%s\" last_error=\"%s\"",
+        static_cast<unsigned long>(host_pid),
+        static_cast<unsigned long>(host_tid),
+        bridge_pid_after_ctx,
+        bridge_alive_after_ctx ? 1 : 0,
+        static_cast<unsigned long long>(dtb_after_ctx),
+        size,
+        driver_bridge::status().c_str(),
+        driver_bridge::last_error().c_str());
+
+    SetLastError(0);
+    const auto t_kernel = std::chrono::steady_clock::now();
     std::uint64_t allocated = device->allocate_memory(size);
+    const DWORD kernel_gle = GetLastError();
+    const long long kernel_us = static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t_kernel).count());
+    const std::uint32_t bridge_pid_after_call = driver_bridge::attached_pid();
+    const bool bridge_alive_after_call = driver_bridge::using_kernel_driver();
+    diag::log_tagged_fmt("drv_tools",
+        "driver_allocate_memory KERNEL-CALL EXIT host_pid=%lu host_tid=%lu va=0x%016llX requested_size=%zu kernel_us=%lld gle=%lu bridge_pid_after=%u bridge_alive_after=%d driver_status=\"%s\" last_error=\"%s\"",
+        static_cast<unsigned long>(host_pid),
+        static_cast<unsigned long>(host_tid),
+        static_cast<unsigned long long>(allocated),
+        size,
+        kernel_us,
+        static_cast<unsigned long>(kernel_gle),
+        bridge_pid_after_call,
+        bridge_alive_after_call ? 1 : 0,
+        driver_bridge::status().c_str(),
+        driver_bridge::last_error().c_str());
+
     if (allocated == 0)
+    {
+        diag::log_tagged_fmt("drv_tools",
+            "driver_allocate_memory EXIT host_pid=%lu host_tid=%lu reason=allocate_returned_zero requested_size=%zu kernel_us=%lld gle=%lu elapsed_us=%lld bridge_pid=%u bridge_alive=%d driver_status=\"%s\" last_error=\"%s\"",
+            static_cast<unsigned long>(host_pid),
+            static_cast<unsigned long>(host_tid),
+            size,
+            kernel_us,
+            static_cast<unsigned long>(kernel_gle),
+            static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t_entry).count()),
+            bridge_pid_after_call,
+            bridge_alive_after_call ? 1 : 0,
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str());
         return tool_result_t::error(OBFSTR("Failed to allocate memory in target process."));
+    }
 
     json result;
     result["address"]    = sa_format_address(static_cast<uint64_t>(allocated));
     result["size"]       = size;
     result["protection"] = "PAGE_EXECUTE_READWRITE";
     result["process_id"] = device->get_process_id();
+    diag::log_tagged_fmt("drv_tools",
+        "driver_allocate_memory EXIT host_pid=%lu host_tid=%lu reason=success va=0x%016llX size=%zu kernel_us=%lld elapsed_us=%lld",
+        static_cast<unsigned long>(host_pid),
+        static_cast<unsigned long>(host_tid),
+        static_cast<unsigned long long>(allocated),
+        size,
+        kernel_us,
+        static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t_entry).count()));
     return tool_result_t::ok(
         OBFSTR("Allocated ") + std::to_string(size) + OBFSTR(" bytes at ") +
         sa_format_address(static_cast<uint64_t>(allocated)), result);

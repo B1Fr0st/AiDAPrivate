@@ -15,12 +15,15 @@
 #include "../../helpers/diag_log.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
+#include <cwctype>
 #include <exception>
 #include <memory>
 #include <mutex>
@@ -142,8 +145,18 @@ constexpr uint64_t k_call_stack_symbol_max_delta = 0x10000ull;
 constexpr uint32_t k_call_stack_export_max_names = 65536u;
 constexpr uint32_t k_call_stack_export_max_functions = 65536u;
 constexpr uint64_t k_call_stack_export_max_array_bytes = 1024ull * 1024ull;
-constexpr uint64_t k_call_stack_total_symbol_budget_us = 150000ull;
-constexpr uint64_t k_call_stack_frame_symbol_budget_us = 25000ull;
+constexpr uint64_t k_call_stack_total_symbol_budget_us = 1500000ull;
+constexpr uint64_t k_call_stack_frame_symbol_budget_us = 400000ull;
+constexpr uint64_t k_call_stack_local_image_max_module_size = 0x10000000ull;
+
+constexpr std::array<const wchar_t*, 6> k_system_export_local_modules = {
+	L"ntdll.dll",
+	L"kernel32.dll",
+	L"kernelbase.dll",
+	L"ucrtbase.dll",
+	L"user32.dll",
+	L"win32u.dll"
+};
 
 std::mutex& call_stack_resolver_mutex() {
 	static std::mutex m;
@@ -402,6 +415,325 @@ bool resolve_stack_symbol_from_pdb(const driver_bridge::module_info_t& module,
 	return false;
 }
 
+std::wstring widen_module_name_lower(const std::string& name) {
+	std::wstring wide;
+	wide.reserve(name.size());
+	for (char c : name) {
+		const unsigned char uc = static_cast<unsigned char>(c);
+		wide.push_back(static_cast<wchar_t>(std::tolower(uc)));
+	}
+	return wide;
+}
+
+bool module_name_in_local_allowlist(const std::string& module_name) {
+	const std::wstring lowered = widen_module_name_lower(module_name);
+	if (lowered.empty())
+		return false;
+	for (const wchar_t* allowed : k_system_export_local_modules) {
+		if (allowed == nullptr)
+			continue;
+		size_t len = 0;
+		while (allowed[len] != L'\0')
+			++len;
+		std::wstring allowed_lower;
+		allowed_lower.reserve(len);
+		for (size_t i = 0; i < len; ++i)
+			allowed_lower.push_back(static_cast<wchar_t>(std::towlower(allowed[i])));
+		if (lowered == allowed_lower)
+			return true;
+	}
+	return false;
+}
+
+bool resolve_stack_symbol_from_local_image(const driver_bridge::module_info_t& module,
+	uint64_t address,
+	call_stack_symbol_resolution_t& out,
+	std::string& status,
+	std::chrono::steady_clock::time_point t0)
+{
+	status.clear();
+	const DWORD pid = GetCurrentProcessId();
+	const DWORD tid = GetCurrentThreadId();
+	const auto local_t0 = std::chrono::steady_clock::now();
+	diag::log_tagged_fmt("dbg_stack_symbol",
+		"local_image_enter module=%s target_base=0x%llX target_addr=0x%llX target_size=0x%llX pid=%lu tid=%lu",
+		module.name.empty() ? "(none)" : module.name.c_str(),
+		static_cast<unsigned long long>(module.base),
+		static_cast<unsigned long long>(address),
+		static_cast<unsigned long long>(module.size),
+		static_cast<unsigned long>(pid),
+		static_cast<unsigned long>(tid));
+
+	if (!module_contains_address(module, address)) {
+		status = "local_image_module_mismatch";
+		diag::log_tagged_fmt("dbg_stack_symbol",
+			"local_image_module_mismatch module=%s base=0x%llX size=0x%llX address=0x%llX elapsed_us=%llu",
+			module.name.empty() ? "(none)" : module.name.c_str(),
+			static_cast<unsigned long long>(module.base),
+			static_cast<unsigned long long>(module.size),
+			static_cast<unsigned long long>(address),
+			static_cast<unsigned long long>(resolver_elapsed_us(local_t0)));
+		return false;
+	}
+	if (module.size == 0 || module.size > k_call_stack_local_image_max_module_size) {
+		status = "local_image_module_size_invalid";
+		diag::log_tagged_fmt("dbg_stack_symbol",
+			"local_image_module_size_invalid module=%s base=0x%llX size=0x%llX elapsed_us=%llu",
+			module.name.empty() ? "(none)" : module.name.c_str(),
+			static_cast<unsigned long long>(module.base),
+			static_cast<unsigned long long>(module.size),
+			static_cast<unsigned long long>(resolver_elapsed_us(local_t0)));
+		return false;
+	}
+	if (!module_name_in_local_allowlist(module.name)) {
+		status = "local_image_module_not_in_allowlist";
+		diag::log_tagged_fmt("dbg_stack_symbol",
+			"local_image_module_not_in_allowlist module=%s elapsed_us=%llu",
+			module.name.empty() ? "(none)" : module.name.c_str(),
+			static_cast<unsigned long long>(resolver_elapsed_us(local_t0)));
+		return false;
+	}
+
+	const std::wstring wide_name(module.name.begin(), module.name.end());
+	SetLastError(0);
+	HMODULE local_handle = GetModuleHandleW(wide_name.c_str());
+	const DWORD handle_gle = GetLastError();
+	if (local_handle == nullptr) {
+		status = "local_image_handle_missing";
+		diag::log_tagged_fmt("dbg_stack_symbol",
+			"local_image_handle_missing module=%s gle=%lu elapsed_us=%llu",
+			module.name.empty() ? "(none)" : module.name.c_str(),
+			static_cast<unsigned long>(handle_gle),
+			static_cast<unsigned long long>(resolver_elapsed_us(local_t0)));
+		return false;
+	}
+
+	const uint64_t target_rva64 = address - module.base;
+	if (target_rva64 > 0xFFFFFFFFull) {
+		status = "local_image_target_rva_out_of_range";
+		diag::log_tagged_fmt("dbg_stack_symbol",
+			"local_image_target_rva_out_of_range module=%s target_rva=0x%llX elapsed_us=%llu",
+			module.name.empty() ? "(none)" : module.name.c_str(),
+			static_cast<unsigned long long>(target_rva64),
+			static_cast<unsigned long long>(resolver_elapsed_us(local_t0)));
+		return false;
+	}
+	const uint32_t target_rva = static_cast<uint32_t>(target_rva64);
+
+	const uint8_t* base_bytes = reinterpret_cast<const uint8_t*>(local_handle);
+	const IMAGE_DOS_HEADER* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base_bytes);
+	if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+		status = "local_image_header_invalid_dos";
+		diag::log_tagged_fmt("dbg_stack_symbol",
+			"local_image_header_invalid_dos module=%s local_base=0x%p dos_magic=0x%04X elapsed_us=%llu",
+			module.name.empty() ? "(none)" : module.name.c_str(),
+			static_cast<void*>(local_handle),
+			static_cast<unsigned>(dos->e_magic),
+			static_cast<unsigned long long>(resolver_elapsed_us(local_t0)));
+		return false;
+	}
+	if (dos->e_lfanew <= 0 || static_cast<uint64_t>(dos->e_lfanew) + sizeof(IMAGE_NT_HEADERS64) > module.size) {
+		status = "local_image_header_invalid_lfanew";
+		diag::log_tagged_fmt("dbg_stack_symbol",
+			"local_image_header_invalid_lfanew module=%s local_base=0x%p lfanew=0x%X module_size=0x%llX elapsed_us=%llu",
+			module.name.empty() ? "(none)" : module.name.c_str(),
+			static_cast<void*>(local_handle),
+			static_cast<unsigned>(dos->e_lfanew),
+			static_cast<unsigned long long>(module.size),
+			static_cast<unsigned long long>(resolver_elapsed_us(local_t0)));
+		return false;
+	}
+	const IMAGE_NT_HEADERS64* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base_bytes + dos->e_lfanew);
+	if (nt->Signature != IMAGE_NT_SIGNATURE) {
+		status = "local_image_header_invalid_nt_sig";
+		diag::log_tagged_fmt("dbg_stack_symbol",
+			"local_image_header_invalid_nt_sig module=%s local_base=0x%p signature=0x%08X elapsed_us=%llu",
+			module.name.empty() ? "(none)" : module.name.c_str(),
+			static_cast<void*>(local_handle),
+			static_cast<unsigned>(nt->Signature),
+			static_cast<unsigned long long>(resolver_elapsed_us(local_t0)));
+		return false;
+	}
+	if (nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+		status = "local_image_header_invalid_opt_magic";
+		diag::log_tagged_fmt("dbg_stack_symbol",
+			"local_image_header_invalid_opt_magic module=%s local_base=0x%p magic=0x%04X elapsed_us=%llu",
+			module.name.empty() ? "(none)" : module.name.c_str(),
+			static_cast<void*>(local_handle),
+			static_cast<unsigned>(nt->OptionalHeader.Magic),
+			static_cast<unsigned long long>(resolver_elapsed_us(local_t0)));
+		return false;
+	}
+	if (nt->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_EXPORT) {
+		status = "local_image_export_directory_absent";
+		diag::log_tagged_fmt("dbg_stack_symbol",
+			"local_image_export_directory_absent module=%s local_base=0x%p num_rva=%u elapsed_us=%llu",
+			module.name.empty() ? "(none)" : module.name.c_str(),
+			static_cast<void*>(local_handle),
+			static_cast<unsigned>(nt->OptionalHeader.NumberOfRvaAndSizes),
+			static_cast<unsigned long long>(resolver_elapsed_us(local_t0)));
+		return false;
+	}
+	const uint64_t local_image_size = static_cast<uint64_t>(nt->OptionalHeader.SizeOfImage);
+	if (local_image_size == 0 || local_image_size > k_call_stack_local_image_max_module_size) {
+		status = "local_image_size_invalid";
+		diag::log_tagged_fmt("dbg_stack_symbol",
+			"local_image_size_invalid module=%s local_base=0x%p size_of_image=0x%llX elapsed_us=%llu",
+			module.name.empty() ? "(none)" : module.name.c_str(),
+			static_cast<void*>(local_handle),
+			static_cast<unsigned long long>(local_image_size),
+			static_cast<unsigned long long>(resolver_elapsed_us(local_t0)));
+		return false;
+	}
+	const uint64_t bound_size = (std::min<uint64_t>)(local_image_size, module.size);
+	if (target_rva >= bound_size) {
+		status = "local_image_target_rva_beyond_bound";
+		diag::log_tagged_fmt("dbg_stack_symbol",
+			"local_image_target_rva_beyond_bound module=%s target_rva=0x%X local_size=0x%llX target_size=0x%llX bound=0x%llX elapsed_us=%llu",
+			module.name.empty() ? "(none)" : module.name.c_str(),
+			static_cast<unsigned>(target_rva),
+			static_cast<unsigned long long>(local_image_size),
+			static_cast<unsigned long long>(module.size),
+			static_cast<unsigned long long>(bound_size),
+			static_cast<unsigned long long>(resolver_elapsed_us(local_t0)));
+		return false;
+	}
+	const DWORD export_rva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+	const DWORD export_size = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+	if (export_rva == 0 || export_size < sizeof(IMAGE_EXPORT_DIRECTORY) ||
+		static_cast<uint64_t>(export_rva) + export_size > bound_size) {
+		status = "local_image_export_directory_absent";
+		diag::log_tagged_fmt("dbg_stack_symbol",
+			"local_image_export_directory_absent module=%s local_base=0x%p export_rva=0x%X export_size=0x%X bound_size=0x%llX elapsed_us=%llu",
+			module.name.empty() ? "(none)" : module.name.c_str(),
+			static_cast<void*>(local_handle),
+			static_cast<unsigned>(export_rva),
+			static_cast<unsigned>(export_size),
+			static_cast<unsigned long long>(bound_size),
+			static_cast<unsigned long long>(resolver_elapsed_us(local_t0)));
+		return false;
+	}
+	const IMAGE_EXPORT_DIRECTORY* exp = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY*>(base_bytes + export_rva);
+	if (exp->NumberOfNames == 0 || exp->NumberOfFunctions == 0 ||
+		exp->AddressOfNames == 0 || exp->AddressOfNameOrdinals == 0 || exp->AddressOfFunctions == 0) {
+		status = "local_image_export_tables_absent";
+		diag::log_tagged_fmt("dbg_stack_symbol",
+			"local_image_export_tables_absent module=%s local_base=0x%p names=%u functions=%u addr_names=0x%X addr_ord=0x%X addr_fn=0x%X elapsed_us=%llu",
+			module.name.empty() ? "(none)" : module.name.c_str(),
+			static_cast<void*>(local_handle),
+			static_cast<unsigned>(exp->NumberOfNames),
+			static_cast<unsigned>(exp->NumberOfFunctions),
+			static_cast<unsigned>(exp->AddressOfNames),
+			static_cast<unsigned>(exp->AddressOfNameOrdinals),
+			static_cast<unsigned>(exp->AddressOfFunctions),
+			static_cast<unsigned long long>(resolver_elapsed_us(local_t0)));
+		return false;
+	}
+	uint32_t name_count = exp->NumberOfNames;
+	if (name_count > k_call_stack_export_max_names)
+		name_count = k_call_stack_export_max_names;
+	uint32_t function_count = exp->NumberOfFunctions;
+	if (function_count > k_call_stack_export_max_functions)
+		function_count = k_call_stack_export_max_functions;
+	const uint64_t names_end = static_cast<uint64_t>(exp->AddressOfNames) + static_cast<uint64_t>(name_count) * sizeof(DWORD);
+	const uint64_t ord_end = static_cast<uint64_t>(exp->AddressOfNameOrdinals) + static_cast<uint64_t>(name_count) * sizeof(WORD);
+	const uint64_t fn_end = static_cast<uint64_t>(exp->AddressOfFunctions) + static_cast<uint64_t>(function_count) * sizeof(DWORD);
+	if (names_end > bound_size || ord_end > bound_size || fn_end > bound_size) {
+		status = "local_image_export_tables_out_of_range";
+		diag::log_tagged_fmt("dbg_stack_symbol",
+			"local_image_export_tables_out_of_range module=%s names_end=0x%llX ord_end=0x%llX fn_end=0x%llX bound_size=0x%llX elapsed_us=%llu",
+			module.name.empty() ? "(none)" : module.name.c_str(),
+			static_cast<unsigned long long>(names_end),
+			static_cast<unsigned long long>(ord_end),
+			static_cast<unsigned long long>(fn_end),
+			static_cast<unsigned long long>(bound_size),
+			static_cast<unsigned long long>(resolver_elapsed_us(local_t0)));
+		return false;
+	}
+	const DWORD* name_rvas = reinterpret_cast<const DWORD*>(base_bytes + exp->AddressOfNames);
+	const WORD* ordinals = reinterpret_cast<const WORD*>(base_bytes + exp->AddressOfNameOrdinals);
+	const DWORD* function_rvas = reinterpret_cast<const DWORD*>(base_bytes + exp->AddressOfFunctions);
+	const uint64_t export_end = static_cast<uint64_t>(export_rva) + static_cast<uint64_t>(export_size);
+
+	uint64_t best_delta = k_call_stack_symbol_max_delta;
+	uint32_t best_rva = 0;
+	std::string best_name;
+	for (uint32_t i = 0; i < name_count; ++i) {
+		const uint16_t ordinal_index = ordinals[i];
+		if (ordinal_index >= function_count)
+			continue;
+		const uint32_t fn_rva = function_rvas[ordinal_index];
+		if (fn_rva == 0 || fn_rva > target_rva)
+			continue;
+		if (static_cast<uint64_t>(fn_rva) >= export_rva && static_cast<uint64_t>(fn_rva) < export_end)
+			continue;
+		if (fn_rva >= bound_size)
+			continue;
+		const uint64_t delta = static_cast<uint64_t>(target_rva - fn_rva);
+		if (delta >= best_delta || delta >= k_call_stack_symbol_max_delta)
+			continue;
+		const uint32_t name_rva = name_rvas[i];
+		if (name_rva == 0 || name_rva >= bound_size)
+			continue;
+		const char* candidate_ptr = reinterpret_cast<const char*>(base_bytes + name_rva);
+		const uint64_t max_len = (std::min<uint64_t>)(512ull, static_cast<uint64_t>(bound_size - name_rva));
+		std::string candidate;
+		candidate.reserve(64);
+		bool printable = true;
+		for (uint64_t j = 0; j < max_len; ++j) {
+			const uint8_t b = static_cast<uint8_t>(candidate_ptr[j]);
+			if (b == 0)
+				break;
+			if (b < 0x20 || b > 0x7E) {
+				printable = false;
+				break;
+			}
+			candidate.push_back(static_cast<char>(b));
+		}
+		if (!printable || candidate.empty())
+			continue;
+		best_delta = delta;
+		best_rva = fn_rva;
+		best_name = std::move(candidate);
+		if (delta == 0)
+			break;
+	}
+
+	if (best_name.empty() || best_rva >= bound_size) {
+		status = "local_image_no_near_export";
+		diag::log_tagged_fmt("dbg_stack_symbol",
+			"local_image_no_near_export module=%s target_rva=0x%X best_delta=0x%llX elapsed_us=%llu",
+			module.name.empty() ? "(none)" : module.name.c_str(),
+			static_cast<unsigned>(target_rva),
+			static_cast<unsigned long long>(best_delta),
+			static_cast<unsigned long long>(resolver_elapsed_us(local_t0)));
+		return false;
+	}
+
+	out.function_name = symbol_name_with_offset(best_name, best_delta);
+	out.source = best_delta == 0 ? "local_image_exact" : "local_image_nearest";
+	out.status = "resolved";
+	out.symbol_address = module.base + best_rva;
+	out.symbol_offset = best_delta;
+	status = out.status;
+	const uint64_t resolved_elapsed = resolver_elapsed_us(local_t0);
+	diag::log_tagged_fmt("dbg_stack_symbol",
+		"local_image_resolve module=%s base=0x%llX local_base=0x%p target_rva=0x%X best_rva=0x%X delta=0x%llX function=%s source=%s elapsed_us=%llu total_elapsed_us=%llu pid=%lu tid=%lu",
+		module.name.empty() ? "(none)" : module.name.c_str(),
+		static_cast<unsigned long long>(module.base),
+		static_cast<void*>(local_handle),
+		static_cast<unsigned>(target_rva),
+		static_cast<unsigned>(best_rva),
+		static_cast<unsigned long long>(best_delta),
+		out.function_name.c_str(),
+		out.source.c_str(),
+		static_cast<unsigned long long>(resolved_elapsed),
+		static_cast<unsigned long long>(resolver_elapsed_us(t0)),
+		static_cast<unsigned long>(pid),
+		static_cast<unsigned long>(tid));
+	return true;
+}
+
 bool resolve_stack_symbol_from_exports(const driver_bridge::module_info_t& module,
 	uint64_t address,
 	call_stack_symbol_resolution_t& out,
@@ -424,6 +756,10 @@ bool resolve_stack_symbol_from_exports(const driver_bridge::module_info_t& modul
 	}
 	const uint32_t target_rva = static_cast<uint32_t>(target_rva64);
 	IMAGE_DOS_HEADER dos{};
+	if (resolver_budget_expired(budget_deadline)) {
+		status = "export_budget_exhausted_at_dos";
+		return false;
+	}
 	if (!read_module_rva_exact(module, 0, &dos, sizeof(dos)) || dos.e_magic != IMAGE_DOS_SIGNATURE) {
 		status = "export_bad_dos_header";
 		return false;
@@ -434,6 +770,10 @@ bool resolve_stack_symbol_from_exports(const driver_bridge::module_info_t& modul
 	}
 	const uint32_t nt_rva = static_cast<uint32_t>(dos.e_lfanew);
 	DWORD signature = 0;
+	if (resolver_budget_expired(budget_deadline)) {
+		status = "export_budget_exhausted_at_nt_sig";
+		return false;
+	}
 	if (!read_module_rva_exact(module, nt_rva, &signature, sizeof(signature)) || signature != IMAGE_NT_SIGNATURE) {
 		status = "export_bad_nt_signature";
 		return false;
@@ -445,6 +785,10 @@ bool resolve_stack_symbol_from_exports(const driver_bridge::module_info_t& modul
 	const uint32_t file_header_rva = nt_rva + static_cast<uint32_t>(sizeof(DWORD));
 	const uint32_t optional_rva = file_header_rva + static_cast<uint32_t>(sizeof(IMAGE_FILE_HEADER));
 	IMAGE_FILE_HEADER file_header{};
+	if (resolver_budget_expired(budget_deadline)) {
+		status = "export_budget_exhausted_at_file_header";
+		return false;
+	}
 	if (!read_module_rva_exact(module, file_header_rva, &file_header, sizeof(file_header))) {
 		status = "export_file_header_unreadable";
 		return false;
@@ -454,6 +798,10 @@ bool resolve_stack_symbol_from_exports(const driver_bridge::module_info_t& modul
 		return false;
 	}
 	WORD magic = 0;
+	if (resolver_budget_expired(budget_deadline)) {
+		status = "export_budget_exhausted_at_opt_magic";
+		return false;
+	}
 	if (!read_module_rva_exact(module, optional_rva, &magic, sizeof(magic))) {
 		status = "export_optional_header_unreadable";
 		return false;
@@ -462,6 +810,10 @@ bool resolve_stack_symbol_from_exports(const driver_bridge::module_info_t& modul
 	DWORD export_size = 0;
 	if (magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
 		IMAGE_OPTIONAL_HEADER64 opt{};
+		if (resolver_budget_expired(budget_deadline)) {
+			status = "export_budget_exhausted_at_opt64";
+			return false;
+		}
 		if (!read_module_rva_exact(module, optional_rva, &opt, sizeof(opt))) {
 			status = "export_optional64_unreadable";
 			return false;
@@ -474,6 +826,10 @@ bool resolve_stack_symbol_from_exports(const driver_bridge::module_info_t& modul
 		export_size = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
 	} else if (magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
 		IMAGE_OPTIONAL_HEADER32 opt{};
+		if (resolver_budget_expired(budget_deadline)) {
+			status = "export_budget_exhausted_at_opt32";
+			return false;
+		}
 		if (!read_module_rva_exact(module, optional_rva, &opt, sizeof(opt))) {
 			status = "export_optional32_unreadable";
 			return false;
@@ -493,6 +849,10 @@ bool resolve_stack_symbol_from_exports(const driver_bridge::module_info_t& modul
 		return false;
 	}
 	IMAGE_EXPORT_DIRECTORY exp{};
+	if (resolver_budget_expired(budget_deadline)) {
+		status = "export_budget_exhausted_at_export_dir";
+		return false;
+	}
 	if (!read_module_rva_exact(module, export_rva, &exp, sizeof(exp))) {
 		status = "export_directory_unreadable";
 		return false;
@@ -641,26 +1001,59 @@ call_stack_symbol_resolution_t resolve_call_stack_symbol(
 		return result;
 	}
 
-	std::string export_status;
-	if (resolve_stack_symbol_from_exports(*module, address, result, export_status, budget_deadline)) {
+	std::string local_image_status;
+	const bool local_image_attempted = module_name_in_local_allowlist(module->name);
+	if (resolve_stack_symbol_from_local_image(*module, address, result, local_image_status, t0)) {
+		result.address = address;
+		result.module_name = module->name;
+		result.module_base = module->base;
+		result.module_size = module->size;
+		result.module_offset = address - module->base;
 		result.elapsed_us = resolver_elapsed_us(t0);
+		diag::log_tagged_fmt("dbg_stack_symbol",
+			"local_image_attempted=%d local_image_status=%s pdb_status=%s",
+			local_image_attempted ? 1 : 0,
+			local_image_status.c_str(),
+			pdb_status.empty() ? "(empty)" : pdb_status.c_str());
+		log_call_stack_symbol_resolution(result);
+		return result;
+	}
+	if (resolver_budget_expired(budget_deadline)) {
+		const std::string combined = combine_resolver_status(pdb_status, local_image_status);
+		result = module_rva_resolution(address, module, ("symbol_budget_exhausted_after_local_image;" + combined).c_str(), t0);
 		log_call_stack_symbol_resolution(result);
 		return result;
 	}
 
+	std::string export_status;
+	if (resolve_stack_symbol_from_exports(*module, address, result, export_status, budget_deadline)) {
+		result.elapsed_us = resolver_elapsed_us(t0);
+		diag::log_tagged_fmt("dbg_stack_symbol",
+			"local_image_attempted=%d local_image_status=%s pdb_status=%s export_status=%s",
+			local_image_attempted ? 1 : 0,
+			local_image_status.empty() ? "(empty)" : local_image_status.c_str(),
+			pdb_status.empty() ? "(empty)" : pdb_status.c_str(),
+			export_status.c_str());
+		log_call_stack_symbol_resolution(result);
+		return result;
+	}
+
+	const std::string combined_pre_export = combine_resolver_status(pdb_status, local_image_status);
 	result.source = "module_rva";
-	result.status = combine_resolver_status(pdb_status, export_status) + ";module_rva_fallback";
+	result.status = combine_resolver_status(combined_pre_export, export_status) + ";module_rva_fallback";
 	result.function_name = module_rva_fallback_name(*module, address);
 	result.symbol_address = address;
 	result.symbol_offset = 0;
 	result.elapsed_us = resolver_elapsed_us(t0);
 	diag::log_tagged_fmt("dbg_stack_symbol",
-		"module_rva_fallback addr=0x%llX module=%s base=0x%llX offset=0x%llX pdb_status=%s export_status=%s function=%s",
+		"module_rva_fallback addr=0x%llX module=%s base=0x%llX offset=0x%llX pdb_status=%s local_image_attempted=%d local_image_status=%s export_status=%s function=%s",
 		static_cast<unsigned long long>(address),
 		module->name.empty() ? "(none)" : module->name.c_str(),
 		static_cast<unsigned long long>(module->base),
 		static_cast<unsigned long long>(result.module_offset),
 		pdb_status.empty() ? "(empty)" : pdb_status.c_str(),
+		local_image_attempted ? 1 : 0,
+		local_image_status.empty() ? "(empty)" : local_image_status.c_str(),
 		export_status.empty() ? "(empty)" : export_status.c_str(),
 		result.function_name.c_str());
 	log_call_stack_symbol_resolution(result);

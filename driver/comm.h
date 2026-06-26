@@ -7,6 +7,7 @@
 #include <cstring>
 #include <string_view>
 #include <memory>
+#include <shared_mutex>
 #include <type_traits>
 #include <string>
 #include <vector>
@@ -2307,12 +2308,14 @@ namespace voyager {
         mutable std::uint32_t last_heartbeat_global_ioctl_seed_present_ = 0;
         mutable std::uint32_t last_heartbeat_offset_ = 0;
         mutable detail::raw_ioctl_telemetry last_raw_ioctl_{};
+        mutable std::shared_mutex seed_rotation_mtx_;
 
 
         std::uint64_t ntdll_base_ = 0;
         std::uint64_t ntdll_size_ = 0;
 
         bool send_request(DWORD control_code, void* input, DWORD input_size) const noexcept;
+        bool send_request_in_lock(DWORD control_code, void* input, DWORD input_size) const noexcept;
         bool send_poll_request(void* input, DWORD input_size, std::uint64_t call_id, int iteration) const noexcept;
         bool force_heartbeat() const noexcept;
         std::size_t transfer_physical_read(std::uint32_t pid, std::uint64_t dtb, std::uint64_t address,
@@ -2321,7 +2324,7 @@ namespace voyager {
                                             const void* buffer, std::size_t size) const noexcept;
         bool ensure_shellcode_allocated() noexcept;
         bool find_spoof_gadget() noexcept;
-        std::uint64_t call_function_attempt(std::uint64_t call_id, int attempt_index, std::uint64_t function_address, std::uint64_t arg1, std::uint64_t arg2, std::uint64_t arg3, std::uint64_t arg4, const DWORD* blacklist, int blacklist_count, bool& out_completed) noexcept;
+        std::uint64_t call_function_attempt(std::uint64_t call_id, int attempt_index, std::uint64_t function_address, std::uint64_t arg1, std::uint64_t arg2, std::uint64_t arg3, std::uint64_t arg4, const DWORD* blacklist, int blacklist_count, std::uint32_t bound_pid, std::uint64_t bound_dtb, std::uint64_t bound_base, std::uint64_t bound_shellcode, std::uint64_t bound_spoof, bool& out_completed) noexcept;
     };
 
     template<typename T>

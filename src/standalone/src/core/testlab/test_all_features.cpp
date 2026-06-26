@@ -28,6 +28,7 @@
 #include "../disasm/zydis_disasm.hpp"
 #include "../infra/critical_work_queue.hpp"
 #include "../infra/work_queue.hpp"
+#include "../analysis/pdb_default_skip.hpp"
 #include "../../helpers/diag_log.hpp"
 #include "../../helpers/globals.h"
 
@@ -814,10 +815,13 @@ namespace test_all_features {
 
 		void begin_test_guard_impl(const char* source, HANDLE hf = INVALID_HANDLE_VALUE) {
 			anti_tamper::state::get().full_test_running.store(true, std::memory_order_release);
-			log_msg(hf, "env", "full_test_guard_enter source=%s pid=%lu tid=%lu",
+			log_msg(hf, "env", "full_test_guard_enter source=%s pid=%lu tid=%lu post_suppression_configured_ms=%llu tick64=%llu user_default_skip_load=%d",
 				source ? source : "unspecified",
 				static_cast<unsigned long>(GetCurrentProcessId()),
-				static_cast<unsigned long>(GetCurrentThreadId()));
+				static_cast<unsigned long>(GetCurrentThreadId()),
+				static_cast<unsigned long long>(kPostFullTestSuppressionMs),
+				static_cast<unsigned long long>(GetTickCount64()),
+				pdb_default_skip::get() ? 1 : 0);
 			set_full_test_env(hf, true, source ? source : "full_test_guard_enter");
 		}
 
@@ -827,13 +831,15 @@ namespace test_all_features {
 				anti_tamper::state::arm_full_test_suppression(kPostFullTestSuppressionMs);
 				anti_tamper::state::full_test_suppression_active(&remaining);
 			}
-			log_msg(hf, "env", "full_test_guard_exit source=%s arm_post=%d configured_ms=%llu remaining_ms=%llu pid=%lu tid=%lu",
+			log_msg(hf, "env", "full_test_guard_exit source=%s arm_post=%d configured_ms=%llu remaining_ms=%llu pid=%lu tid=%lu tick64=%llu user_default_skip_load=%d",
 				source ? source : "unspecified",
 				arm_post_suppression ? 1 : 0,
 				static_cast<unsigned long long>(arm_post_suppression ? kPostFullTestSuppressionMs : 0),
 				static_cast<unsigned long long>(remaining),
 				static_cast<unsigned long>(GetCurrentProcessId()),
-				static_cast<unsigned long>(GetCurrentThreadId()));
+				static_cast<unsigned long>(GetCurrentThreadId()),
+				static_cast<unsigned long long>(GetTickCount64()),
+				pdb_default_skip::get() ? 1 : 0);
 			set_full_test_env(hf, false, source ? source : "full_test_guard_exit");
 			anti_tamper::state::get().full_test_running.store(false, std::memory_order_release);
 		}
@@ -1129,6 +1135,20 @@ namespace test_all_features {
 				g_failed.load(),
 				g_skipped.load(),
 				running_done());
+			if (skip_delta != 0 && phase != nullptr && std::strcmp(phase, "testlab features") != 0) {
+				log_msg(hf, "phase",
+					"FAIL -- phase '%s' produced %d non-destructive SKIP(s); only 'testlab features' may emit SKIPs - converting to FAIL immediately pid=%lu tid=%lu now_ms=%llu passed=%d failed=%d skipped_before_convert=%d",
+					phase,
+					skip_delta,
+					static_cast<unsigned long>(GetCurrentProcessId()),
+					static_cast<unsigned long>(GetCurrentThreadId()),
+					static_cast<unsigned long long>(GetTickCount64()),
+					g_passed.load(std::memory_order_acquire),
+					g_failed.load(std::memory_order_acquire),
+					g_skipped.load(std::memory_order_acquire));
+				g_skipped.fetch_sub(skip_delta, std::memory_order_acq_rel);
+				g_failed.fetch_add(skip_delta, std::memory_order_acq_rel);
+			}
 			log_debug_snapshot(hf, "phase", "END snapshot");
 		}
 

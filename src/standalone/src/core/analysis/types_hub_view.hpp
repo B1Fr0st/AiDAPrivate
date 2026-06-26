@@ -856,11 +856,19 @@ inline stats_t snapshot_active_pdb(const merged_types_t& merged)
 
 inline std::string browse_for_pdb()
 {
-	if (test_all_features::is_unattended_full_test_active()) {
+	const auto automation = symbol_store::pdb_automation_context();
+	if (automation.pdb_skip_active) {
 		diag::log_tagged_critical_fmt("pdb",
-			"pdb_native_dialog_attempt source=types_hub_view::browse_for_pdb title=\"Load PDB\" suppressed=1 decision=do_not_load_pdb is_running=%d unattended_active=%d",
-			test_all_features::is_running() ? 1 : 0,
-			test_all_features::is_unattended_full_test_active() ? 1 : 0);
+			"pdb_native_dialog_attempt source=types_hub_view::browse_for_pdb title=\"Load PDB\" suppressed=1 decision=do_not_load_pdb is_running=%d anti_tamper_full_test_running=%d full_test_env_active=%d unattended_active=%d post_suppression_active=%d post_suppression_remaining_ms=%llu pdb_automation_active=%d user_default_skip_active=%d pdb_skip_active=%d",
+			automation.is_running ? 1 : 0,
+			automation.anti_tamper_full_test_running ? 1 : 0,
+			automation.full_test_env_active ? 1 : 0,
+			automation.unattended_active ? 1 : 0,
+			automation.post_suppression_active ? 1 : 0,
+			static_cast<unsigned long long>(automation.post_suppression_remaining_ms),
+			automation.pdb_automation_active ? 1 : 0,
+			automation.user_default_skip_active ? 1 : 0,
+			automation.pdb_skip_active ? 1 : 0);
 		return {};
 	}
 	char buf[MAX_PATH] = {};

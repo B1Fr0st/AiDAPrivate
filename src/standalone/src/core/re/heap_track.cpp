@@ -141,7 +141,37 @@ bool append_focus_captures(store::heap_session_t& session, const json& params)
 
 std::vector<store::heap_capture_t> sample_heap(std::uint32_t pid, const store::heap_session_t& session, std::size_t max_entries)
 {
+    const std::uint64_t sample_started_ms = GetTickCount64();
     std::vector<store::heap_capture_t> out;
+    std::uint64_t sample_checks = 0;
+    auto sample_cancelled = [&](const char* phase) -> bool {
+        if (mcp_standalone::current_call_cancelled())
+        {
+            diag::log_tagged_fmt("heap_track",
+                "sample_heap cancelled phase=%s pid=%u captured=%zu max=%zu elapsed_ms=%llu diag_id=%s",
+                phase ? phase : "",
+                pid,
+                out.size(),
+                max_entries,
+                static_cast<unsigned long long>(GetTickCount64() - sample_started_ms),
+                mcp_standalone::current_call_diag_id());
+            return true;
+        }
+        const std::uint64_t deadline = mcp_standalone::current_call_deadline_ms();
+        if (deadline != 0 && GetTickCount64() >= deadline)
+        {
+            diag::log_tagged_fmt("heap_track",
+                "sample_heap deadline phase=%s pid=%u captured=%zu max=%zu elapsed_ms=%llu diag_id=%s",
+                phase ? phase : "",
+                pid,
+                out.size(),
+                max_entries,
+                static_cast<unsigned long long>(GetTickCount64() - sample_started_ms),
+                mcp_standalone::current_call_diag_id());
+            return true;
+        }
+        return false;
+    };
     driver_bridge::peb_info_t peb{};
     if (driver_bridge::read_peb_for(pid, peb) && peb.peb_address != 0)
     {
@@ -153,6 +183,8 @@ std::vector<store::heap_capture_t> sample_heap(std::uint32_t pid, const store::h
         {
             for (std::uint32_t h = 0; h < num_heaps && out.size() < max_entries; ++h)
             {
+                if (sample_cancelled("heap_iter"))
+                    return out;
                 std::uint64_t heap_base = 0;
                 if (!read_u64(pid, heaps_ptr + h * 8ull, heap_base) || heap_base == 0)
                     continue;
@@ -162,6 +194,8 @@ std::vector<store::heap_capture_t> sample_heap(std::uint32_t pid, const store::h
                     continue;
                 for (int seg_iter = 0; seg_flink != 0 && seg_flink != seg_list_head && seg_iter < 64 && out.size() < max_entries; ++seg_iter)
                 {
+                    if (sample_cancelled("segment_iter"))
+                        return out;
                     const std::uint64_t segment_base = seg_flink - 0x18;
                     std::uint64_t first_entry = 0;
                     std::uint64_t last_entry = 0;
@@ -175,6 +209,8 @@ std::vector<store::heap_capture_t> sample_heap(std::uint32_t pid, const store::h
                     std::uint64_t entry_addr = first_entry;
                     for (int entry_iter = 0; entry_addr != 0 && entry_addr < last_entry && entry_iter < 4096 && out.size() < max_entries; ++entry_iter)
                     {
+                        if (((++sample_checks) & 0x3F) == 0 && sample_cancelled("entry_iter"))
+                            return out;
                         std::uint16_t raw_size = 0;
                         std::vector<std::uint8_t> header;
                         if (!read_bytes(pid, entry_addr, 8, header) || header.size() < 8)
@@ -200,10 +236,13 @@ std::vector<store::heap_capture_t> sample_heap(std::uint32_t pid, const store::h
 
     if (out.empty())
     {
+        std::size_t region_idx = 0;
         for (const auto& region : regions_for(pid, 8192))
         {
             if (out.size() >= max_entries)
                 break;
+            if (((region_idx++) & 0x3F) == 0 && sample_cancelled("region_iter"))
+                return out;
             if (!is_readable(region) || region.type != MEM_PRIVATE || region.size < 16)
                 continue;
             add_capture(out, session, region.base, region.size);
@@ -314,13 +353,52 @@ json heap_session_lookup_error(const char* action, const std::string& id)
 
 std::uint64_t resolve_rtl_allocate_heap(std::uint32_t pid)
 {
+    const std::uint64_t started_ms = GetTickCount64();
+    const DWORD tid_at_entry = GetCurrentThreadId();
+    diag::log_tagged_fmt("heap_track",
+        "resolve_rtl_allocate_heap_enter pid=%u tid=%lu deadline_remaining_ms=%llu cancelled=%d diag_id=%s",
+        pid,
+        static_cast<unsigned long>(tid_at_entry),
+        static_cast<unsigned long long>(deadline_remaining_ms()),
+        mcp_standalone::current_call_cancelled() ? 1 : 0,
+        mcp_standalone::current_call_diag_id());
+    if (heap_call_cancelled("resolve_rtl_allocate_heap_enter", pid, started_ms))
+        return 0;
     auto ntdll = find_module_by_name(pid, "ntdll.dll");
     if (!ntdll)
+    {
+        diag::log_tagged_fmt("heap_track",
+            "resolve_rtl_allocate_heap_exit pid=%u tid=%lu va=0x0 elapsed_ms=%llu kernel_strict=0 gle=%lu reason=ntdll_not_found",
+            pid,
+            static_cast<unsigned long>(tid_at_entry),
+            static_cast<unsigned long long>(GetTickCount64() - started_ms),
+            static_cast<unsigned long>(GetLastError()));
         return 0;
-    active_process_scope_t scope(pid);
-    if (!scope.ok())
+    }
+    if (heap_call_cancelled("resolve_rtl_allocate_heap_post_module", pid, started_ms))
         return 0;
-    return driver_bridge::resolve_export(ntdll->base, "RtlAllocateHeap");
+    SetLastError(ERROR_SUCCESS);
+    const std::uint64_t kernel_strict_started_ms = GetTickCount64();
+    const std::uint64_t va = driver_bridge::resolve_export_for_kernel_strict(pid, ntdll->base, "RtlAllocateHeap");
+    const DWORD gle = va != 0 ? ERROR_SUCCESS : GetLastError();
+    diag::log_tagged_fmt("heap_track",
+        "resolve_rtl_allocate_heap kernel_strict_result pid=%u tid=%lu va=0x%llX gle=%lu elapsed_ms=%llu module_base=0x%llX",
+        pid,
+        static_cast<unsigned long>(tid_at_entry),
+        static_cast<unsigned long long>(va),
+        static_cast<unsigned long>(gle),
+        static_cast<unsigned long long>(GetTickCount64() - kernel_strict_started_ms),
+        static_cast<unsigned long long>(ntdll->base));
+    diag::log_tagged_fmt("heap_track",
+        "resolve_rtl_allocate_heap_exit pid=%u tid=%lu va=0x%llX elapsed_ms=%llu kernel_strict=1 gle=%lu cancelled=%d deadline_remaining_ms=%llu",
+        pid,
+        static_cast<unsigned long>(tid_at_entry),
+        static_cast<unsigned long long>(va),
+        static_cast<unsigned long long>(GetTickCount64() - started_ms),
+        static_cast<unsigned long>(gle),
+        mcp_standalone::current_call_cancelled() ? 1 : 0,
+        static_cast<unsigned long long>(deadline_remaining_ms()));
+    return va;
 }
 
 std::size_t clear_session_breakpoints(const store::heap_session_t& session)
@@ -854,8 +932,10 @@ tool_result_t start_session(const json& params)
 
     const std::string backend = backend_param(params);
     diag::log_tagged_fmt("heap_track",
-        "start enter pid=%u requested_backend=%s deadline_remaining_ms=%llu diag_id=%s",
+        "start enter pid=%u caller_pid=%lu caller_tid=%lu requested_backend=%s deadline_remaining_ms=%llu diag_id=%s",
         scope.pid(),
+        static_cast<unsigned long>(GetCurrentProcessId()),
+        static_cast<unsigned long>(GetCurrentThreadId()),
         backend.c_str(),
         static_cast<unsigned long long>(deadline_remaining_ms()),
         mcp_standalone::current_call_diag_id());
@@ -881,24 +961,38 @@ tool_result_t start_session(const json& params)
     session.capture_callstack = bool_param(params, "capture_callstack", true);
     session.max_captures = static_cast<std::uint32_t>(numeric_param(params, "max_captures", 256, 1, 10000));
     session.started_ms = unix_time_ms();
+    diag::log_tagged_fmt("heap_track",
+        "start resolve_pre pid=%u kernel_mode=%d driver_connected=%d deadline_remaining_ms=%llu diag_id=%s",
+        scope.pid(),
+        driver_bridge::using_kernel_driver() ? 1 : 0,
+        driver_bridge::using_kernel_driver() ? 1 : 0,
+        static_cast<unsigned long long>(deadline_remaining_ms()),
+        mcp_standalone::current_call_diag_id());
+    if (heap_call_cancelled("start_pre_resolve", scope.pid(), started_ms))
+        return tool_result_t::error("Heap tracking start cancelled.", heap_cancel_detail("start", scope.pid(), started_ms));
     const std::uint64_t resolve_started_ms = GetTickCount64();
     session.rtl_allocate_heap = resolve_rtl_allocate_heap(scope.pid());
     diag::log_tagged_fmt("heap_track",
-        "start resolve_rtlallocateheap pid=%u va=%s elapsed_ms=%llu",
+        "start resolve_rtlallocateheap pid=%u va=%s elapsed_ms=%llu cancelled=%d deadline_remaining_ms=%llu",
         scope.pid(),
         session.rtl_allocate_heap ? sa_format_address(session.rtl_allocate_heap).c_str() : "0x0",
-        static_cast<unsigned long long>(GetTickCount64() - resolve_started_ms));
+        static_cast<unsigned long long>(GetTickCount64() - resolve_started_ms),
+        mcp_standalone::current_call_cancelled() ? 1 : 0,
+        static_cast<unsigned long long>(deadline_remaining_ms()));
     session.hw_slot = snapshot_backend_requested(backend) ? -1 : static_cast<int>(numeric_param(params, "hw_slot", 2, 0, 3));
     const bool skip_initial_snapshot = bool_param(params, "skip_initial_snapshot", false) || bool_param(params, "empty_baseline", false);
+    if (heap_call_cancelled("start_pre_baseline", scope.pid(), started_ms))
+        return tool_result_t::error("Heap tracking start cancelled.", heap_cancel_detail("start", scope.pid(), started_ms));
     const std::uint64_t baseline_started_ms = GetTickCount64();
     if (!skip_initial_snapshot)
         session.baseline = sample_heap(scope.pid(), session, session.max_captures);
     diag::log_tagged_fmt("heap_track",
-        "start baseline pid=%u skipped=%d baseline_count=%zu elapsed_ms=%llu",
+        "start baseline pid=%u skipped=%d baseline_count=%zu elapsed_ms=%llu cancelled=%d",
         scope.pid(),
         skip_initial_snapshot ? 1 : 0,
         session.baseline.size(),
-        static_cast<unsigned long long>(GetTickCount64() - baseline_started_ms));
+        static_cast<unsigned long long>(GetTickCount64() - baseline_started_ms),
+        mcp_standalone::current_call_cancelled() ? 1 : 0);
     if (heap_call_cancelled("start_after_baseline", scope.pid(), started_ms))
         return tool_result_t::error("Heap tracking start cancelled.", heap_cancel_detail("start", scope.pid(), started_ms));
 
@@ -1025,9 +1119,11 @@ tool_result_t results_session(const json& params)
     if (!store::find_heap_session(id, session))
         return tool_result_t::error("Unknown heap tracking session.", heap_session_lookup_error("results", id));
     diag::log_tagged_fmt("heap_track",
-        "results enter session_id=%s pid=%u hw_slot=%d tids=%zu captures=%zu deadline_remaining_ms=%llu diag_id=%s",
+        "results enter session_id=%s pid=%u caller_pid=%lu caller_tid=%lu hw_slot=%d tids=%zu captures=%zu deadline_remaining_ms=%llu diag_id=%s",
         id.c_str(),
         session.pid,
+        static_cast<unsigned long>(GetCurrentProcessId()),
+        static_cast<unsigned long>(GetCurrentThreadId()),
         session.hw_slot,
         session.tids.size(),
         session.captures.size(),
@@ -1118,9 +1214,11 @@ tool_result_t stop_session(const json& params)
     if (!store::find_heap_session(id, session))
         return tool_result_t::error("Unknown heap tracking session.", heap_session_lookup_error("stop", id));
     diag::log_tagged_fmt("heap_track",
-        "stop enter session_id=%s pid=%u hw_slot=%d tids=%zu captures=%zu deadline_remaining_ms=%llu diag_id=%s",
+        "stop enter session_id=%s pid=%u caller_pid=%lu caller_tid=%lu hw_slot=%d tids=%zu captures=%zu deadline_remaining_ms=%llu diag_id=%s",
         id.c_str(),
         session.pid,
+        static_cast<unsigned long>(GetCurrentProcessId()),
+        static_cast<unsigned long>(GetCurrentThreadId()),
         session.hw_slot,
         session.tids.size(),
         session.captures.size(),
@@ -1179,16 +1277,20 @@ tool_result_t manage(const json& params)
     const std::string action = compat_action_name(params);
     const json p = compat_action_payload(params);
     diag::log_tagged_fmt("heap_track",
-        "manage enter action=%s deadline_remaining_ms=%llu diag_id=%s",
+        "manage enter action=%s pid=%lu tid=%lu deadline_remaining_ms=%llu diag_id=%s",
         action.c_str(),
+        static_cast<unsigned long>(GetCurrentProcessId()),
+        static_cast<unsigned long>(GetCurrentThreadId()),
         static_cast<unsigned long long>(deadline_remaining_ms()),
         mcp_standalone::current_call_diag_id());
     if (action == "start") return start_session(p);
     if (action == "results") return results_session(p);
     if (action == "stop") return stop_session(p);
     diag::log_tagged_fmt("heap_track",
-        "manage exit action=%s unknown=1 elapsed_ms=%llu",
+        "manage exit action=%s pid=%lu tid=%lu unknown=1 elapsed_ms=%llu",
         action.c_str(),
+        static_cast<unsigned long>(GetCurrentProcessId()),
+        static_cast<unsigned long>(GetCurrentThreadId()),
         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     return compat_unknown_action("heap_track_manage", action);
 }

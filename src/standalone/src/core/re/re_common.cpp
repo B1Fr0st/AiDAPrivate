@@ -88,22 +88,47 @@ const std::string& active_process_scope_t::error() const noexcept
 
 void active_process_scope_t::enter(std::uint32_t requested_pid)
 {
+    const std::uint64_t enter_started_ms = GetTickCount64();
     previous_pid_ = driver_bridge::attached_pid();
     if (!driver_bridge::is_loaded())
     {
         error_ = "Driver bridge is not connected. Attach with sessions_manage action=attach_pid first.";
+        diag::log_tagged_fmt("re",
+                             "active_scope_enter pid=0 requested=%u previous=%u attached_count=%zu switched=0 ok=0 elapsed_ms=%llu reason=driver_not_loaded",
+                             requested_pid,
+                             previous_pid_,
+                             driver_bridge::attached_pids().size(),
+                             static_cast<unsigned long long>(GetTickCount64() - enter_started_ms));
         return;
     }
 
     if (requested_pid != 0 && is_self_pid(requested_pid))
     {
         error_ = "Cannot target AiDA's own process.";
+        diag::log_tagged_fmt("re",
+                             "active_scope_enter pid=0 requested=%u previous=%u caller_pid=%lu caller_tid=%lu attached_count=%zu switched=0 ok=0 elapsed_ms=%llu reason=self_pid_rejected",
+                             requested_pid,
+                             previous_pid_,
+                             static_cast<unsigned long>(GetCurrentProcessId()),
+                             static_cast<unsigned long>(GetCurrentThreadId()),
+                             driver_bridge::attached_pids().size(),
+                             static_cast<unsigned long long>(GetTickCount64() - enter_started_ms));
         return;
     }
 
     if (requested_pid != 0 && !process_alive(requested_pid))
     {
+        const DWORD process_alive_gle = GetLastError();
         error_ = "target_pid " + std::to_string(requested_pid) + " is not alive.";
+        diag::log_tagged_fmt("re",
+                             "active_scope_enter pid=0 requested=%u previous=%u caller_pid=%lu caller_tid=%lu attached_count=%zu switched=0 ok=0 elapsed_ms=%llu gle=%lu reason=target_not_alive",
+                             requested_pid,
+                             previous_pid_,
+                             static_cast<unsigned long>(GetCurrentProcessId()),
+                             static_cast<unsigned long>(GetCurrentThreadId()),
+                             driver_bridge::attached_pids().size(),
+                             static_cast<unsigned long long>(GetTickCount64() - enter_started_ms),
+                             static_cast<unsigned long>(process_alive_gle));
         return;
     }
 
@@ -121,12 +146,36 @@ void active_process_scope_t::enter(std::uint32_t requested_pid)
         }
         if (!already_attached && !driver_bridge::attach_additional(requested_pid))
         {
+            const DWORD attach_gle = GetLastError();
             error_ = "attach_additional failed for target_pid " + std::to_string(requested_pid) + ": " + driver_bridge::last_error();
+            diag::log_tagged_fmt("re",
+                                 "active_scope_enter pid=0 requested=%u previous=%u caller_pid=%lu caller_tid=%lu attached_count=%zu already_attached=%d switched=0 ok=0 elapsed_ms=%llu gle=%lu last_error=%s reason=attach_additional_failed",
+                                 requested_pid,
+                                 previous_pid_,
+                                 static_cast<unsigned long>(GetCurrentProcessId()),
+                                 static_cast<unsigned long>(GetCurrentThreadId()),
+                                 attached.size(),
+                                 already_attached ? 1 : 0,
+                                 static_cast<unsigned long long>(GetTickCount64() - enter_started_ms),
+                                 static_cast<unsigned long>(attach_gle),
+                                 driver_bridge::last_error().c_str());
             return;
         }
         if (!driver_bridge::set_active_pid(requested_pid))
         {
+            const DWORD set_active_gle = GetLastError();
             error_ = "set_active_pid failed for target_pid " + std::to_string(requested_pid) + ": " + driver_bridge::last_error();
+            diag::log_tagged_fmt("re",
+                                 "active_scope_enter pid=0 requested=%u previous=%u caller_pid=%lu caller_tid=%lu attached_count=%zu already_attached=%d switched=0 ok=0 elapsed_ms=%llu gle=%lu last_error=%s reason=set_active_pid_failed",
+                                 requested_pid,
+                                 previous_pid_,
+                                 static_cast<unsigned long>(GetCurrentProcessId()),
+                                 static_cast<unsigned long>(GetCurrentThreadId()),
+                                 attached.size(),
+                                 already_attached ? 1 : 0,
+                                 static_cast<unsigned long long>(GetTickCount64() - enter_started_ms),
+                                 static_cast<unsigned long>(set_active_gle),
+                                 driver_bridge::last_error().c_str());
             return;
         }
         switched_ = true;
@@ -136,14 +185,39 @@ void active_process_scope_t::enter(std::uint32_t requested_pid)
     if (active_pid_ == 0)
     {
         error_ = "Not attached. Use sessions_manage action=attach_pid or pass process_id.";
+        diag::log_tagged_fmt("re",
+                             "active_scope_enter pid=0 requested=%u previous=%u caller_pid=%lu caller_tid=%lu attached_count=%zu switched=%d ok=0 elapsed_ms=%llu reason=not_attached",
+                             requested_pid,
+                             previous_pid_,
+                             static_cast<unsigned long>(GetCurrentProcessId()),
+                             static_cast<unsigned long>(GetCurrentThreadId()),
+                             driver_bridge::attached_pids().size(),
+                             switched_ ? 1 : 0,
+                             static_cast<unsigned long long>(GetTickCount64() - enter_started_ms));
         return;
     }
     if (!process_alive(active_pid_))
     {
         error_ = "Attached process PID " + std::to_string(active_pid_) + " is no longer alive.";
+        diag::log_tagged_fmt("re",
+                             "active_scope_enter pid=%u requested=%u previous=%u attached_count=%zu switched=%d ok=0 elapsed_ms=%llu reason=process_not_alive",
+                             active_pid_,
+                             requested_pid,
+                             previous_pid_,
+                             driver_bridge::attached_pids().size(),
+                             switched_ ? 1 : 0,
+                             static_cast<unsigned long long>(GetTickCount64() - enter_started_ms));
         return;
     }
     ok_ = true;
+    diag::log_tagged_fmt("re",
+                         "active_scope_enter pid=%u requested=%u previous=%u attached_count=%zu switched=%d ok=1 elapsed_ms=%llu",
+                         active_pid_,
+                         requested_pid,
+                         previous_pid_,
+                         driver_bridge::attached_pids().size(),
+                         switched_ ? 1 : 0,
+                         static_cast<unsigned long long>(GetTickCount64() - enter_started_ms));
 }
 
 std::string lower_ascii(std::string value)

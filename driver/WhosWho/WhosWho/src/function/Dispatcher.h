@@ -38,11 +38,12 @@ __forceinline ULONG secondary_hash(ULONG key) {
 
 namespace ioctl_codes {
     inline volatile ULONG g_server_ioctl_seed = 0;
+    inline volatile ULONG g_server_ioctl_seed_previous = 0;
+    inline volatile LONG64 g_server_ioctl_seed_rotated_qpc = 0;
 
-    __forceinline ULONG get_base() {
+    __forceinline ULONG compute_base_from_seed(ULONG seed) {
         ULONG key = dynamic_key::get();
         ULONG base = ((hash_build_key(key) ^ secondary_hash(key >> 3)) & 0x7FF) | 0x800;
-        ULONG seed = g_server_ioctl_seed;
         if (seed != 0) {
             base ^= hash_build_key(seed) & 0x7FF;
             base |= 0x800;
@@ -50,8 +51,23 @@ namespace ioctl_codes {
         return base;
     }
 
+    __forceinline ULONG get_base() {
+        return compute_base_from_seed(g_server_ioctl_seed);
+    }
+
+    __forceinline ULONG get_base_previous() {
+        ULONG prev = g_server_ioctl_seed_previous;
+        if (prev == 0)
+            return 0;
+        return compute_base_from_seed(prev);
+    }
+
     __forceinline ULONG make(ULONG offset) {
         return 0x00220000u | ((get_base() + offset) << 2);
+    }
+
+    __forceinline ULONG make_for_seed(ULONG seed, ULONG offset) {
+        return 0x00220000u | ((compute_base_from_seed(seed) + offset) << 2);
     }
 
     __forceinline ULONG DB()  { return make(0); }
@@ -280,29 +296,64 @@ namespace dispatcher {
     struct hvdt_ioctl_decode_snapshot_t {
         ULONG encoded;
         ULONG base;
+        ULONG base_previous;
         ULONG offset;
+        ULONG offset_via_previous;
         ULONG expected_hvdt_code;
         ULONG key_hash;
         ULONG ioctl_seed_hash;
+        ULONG ioctl_seed_hash_previous;
         BOOLEAN valid;
+        BOOLEAN accepted_via_previous;
     };
 
     __forceinline hvdt_ioctl_decode_snapshot_t decode_ioctl_snapshot(ULONG code) {
         hvdt_ioctl_decode_snapshot_t out{};
         out.offset = 0xffffffffu;
+        out.offset_via_previous = 0xffffffffu;
         ULONG key = dynamic_key::get();
         out.base = ioctl_codes::get_base();
+        out.base_previous = ioctl_codes::get_base_previous();
         out.expected_hvdt_code = ioctl_codes::HVDT();
         out.key_hash = hash_build_key(key);
         out.ioctl_seed_hash = ioctl_codes::g_server_ioctl_seed != 0 ? hash_build_key(ioctl_codes::g_server_ioctl_seed) : 0;
+        out.ioctl_seed_hash_previous = ioctl_codes::g_server_ioctl_seed_previous != 0 ? hash_build_key(ioctl_codes::g_server_ioctl_seed_previous) : 0;
         if ((code & 0xFFFF0000u) != 0x00220000u)
             return out;
         out.encoded = (code & 0x0000FFFFu) >> 2;
+        if (out.base_previous != 0 && out.encoded >= out.base_previous) {
+            ULONG prev_candidate = out.encoded - out.base_previous;
+            if (prev_candidate <= 62u)
+                out.offset_via_previous = prev_candidate;
+        }
         if (out.encoded >= out.base) {
             ULONG candidate = out.encoded - out.base;
             if (candidate <= 62u) {
                 out.offset = candidate;
                 out.valid = TRUE;
+            }
+        }
+        if (!out.valid && out.offset_via_previous != 0xffffffffu) {
+            LARGE_INTEGER qpc_freq;
+            qpc_freq.QuadPart = 0;
+            LARGE_INTEGER now_qpc = KeQueryPerformanceCounter(&qpc_freq);
+            LONG64 rotated_qpc = _InterlockedCompareExchange64(&ioctl_codes::g_server_ioctl_seed_rotated_qpc, 0, 0);
+            LONG64 elapsed_qpc = rotated_qpc == 0 ? 0 : (now_qpc.QuadPart - rotated_qpc);
+            const LONG64 grace_ticks = qpc_freq.QuadPart;
+            if (rotated_qpc != 0 && elapsed_qpc >= 0 && elapsed_qpc <= grace_ticks) {
+                out.offset = out.offset_via_previous;
+                out.valid = TRUE;
+                out.accepted_via_previous = TRUE;
+                WW_LOG("dispatch_ioctl_seed_check effective=0x%08X expected_current=0x%08X expected_previous_offset=%lu accepted_via=previous elapsed_qpc=%lld grace_qpc=%lld base_current=0x%lX base_previous=0x%lX seed_hash_current=0x%08X seed_hash_previous=0x%08X",
+                    static_cast<ULONG>((code & 0x0000FFFFu)),
+                    static_cast<ULONG>(0x00220000u | ((out.base + out.offset_via_previous) << 2)),
+                    out.offset_via_previous,
+                    elapsed_qpc,
+                    grace_ticks,
+                    out.base,
+                    out.base_previous,
+                    out.ioctl_seed_hash,
+                    out.ioctl_seed_hash_previous);
             }
         }
         return out;
@@ -560,7 +611,20 @@ namespace dispatcher {
         UINT32 ioctl_seed = hash_build_key(nonce_lo ^ _rotl(nonce_hi, 7) ^ token_hash ^ _rotl(session_key, 13));
         ioctl_seed ^= secondary_hash(token_hash ^ session_key ^ 0xA17A5EEDu);
         if (ioctl_seed == 0) ioctl_seed = 1;
-        _InterlockedExchange(reinterpret_cast<volatile LONG*>(&ioctl_codes::g_server_ioctl_seed), static_cast<LONG>(ioctl_seed));
+        ULONG prior_seed = static_cast<ULONG>(_InterlockedExchange(reinterpret_cast<volatile LONG*>(&ioctl_codes::g_server_ioctl_seed), static_cast<LONG>(ioctl_seed)));
+        if (prior_seed != 0 && prior_seed != ioctl_seed) {
+            _InterlockedExchange(reinterpret_cast<volatile LONG*>(&ioctl_codes::g_server_ioctl_seed_previous), static_cast<LONG>(prior_seed));
+            LARGE_INTEGER rotation_freq;
+            rotation_freq.QuadPart = 0;
+            LARGE_INTEGER rotation_qpc = KeQueryPerformanceCounter(&rotation_freq);
+            _InterlockedExchange64(&ioctl_codes::g_server_ioctl_seed_rotated_qpc, rotation_qpc.QuadPart);
+            WW_LOG("ioctl_seed_rotation prior=0x%08X current=0x%08X prior_hash=0x%08X current_hash=0x%08X qpc=%lld",
+                prior_seed,
+                ioctl_seed,
+                hash_build_key(prior_seed),
+                hash_build_key(ioctl_seed),
+                rotation_qpc.QuadPart);
+        }
     }
 
     __forceinline void reset_dynamic_session_state(const char* reason, HANDLE prev_client, ULONG cleared_canaries, BOOLEAN cleanup_client) {
@@ -603,6 +667,8 @@ namespace dispatcher {
         _InterlockedExchange(reinterpret_cast<volatile LONG*>(&dynamic_key::g_server_seed), 0);
         _InterlockedExchange(reinterpret_cast<volatile LONG*>(&dynamic_key::g_cached_key), 0);
         _InterlockedExchange(reinterpret_cast<volatile LONG*>(&ioctl_codes::g_server_ioctl_seed), 0);
+        _InterlockedExchange(reinterpret_cast<volatile LONG*>(&ioctl_codes::g_server_ioctl_seed_previous), 0);
+        _InterlockedExchange64(&ioctl_codes::g_server_ioctl_seed_rotated_qpc, 0);
         _InterlockedExchange(reinterpret_cast<volatile LONG*>(&g_session_key), 0);
         _InterlockedExchange(reinterpret_cast<volatile LONG*>(&g_heartbeat_counter), 0);
         _InterlockedExchange(&g_driver_activated, 0);
@@ -2811,6 +2877,34 @@ namespace dispatcher {
             }
         }
         else if (code == ioctl_codes::RELA()) {
+            {
+                ULONG probe_expected_magic = g_session_key ^ dynamic_key::get() ^ 0x1A7C4B2Eu;
+                UINT64 probe_caller_pid = handle_to_u64(PsGetCurrentProcessId());
+                UINT64 probe_registered_pid = handle_to_u64(caller_validation::g_registered_client_pid);
+                ULONG probe_req_magic = 0;
+                ULONG probe_req_session_key = 0;
+                ULONG probe_req_reason = 0;
+                if (input_size >= sizeof(phase3_msg::latch_targeting_request_k) && buffer != nullptr) {
+                    auto* probe_req = reinterpret_cast<phase3_msg::latch_targeting_request_k*>(buffer);
+                    probe_req_magic = probe_req->magic;
+                    probe_req_session_key = probe_req->session_key;
+                    probe_req_reason = probe_req->reason;
+                }
+                WW_LOG("RELA_DISPATCH_PROBE code=0x%08X input_size=%lu output_size=%lu expected_size=%llu caller_pid=%llu registered_pid=%llu expected_magic_match=%u session_present_g=%u req_magic_set=%u req_session_set=%u req_session_match=%u req_reason=0x%08X dyn_base=0x%04X",
+                    code,
+                    input_size,
+                    output_size,
+                    static_cast<UINT64>(sizeof(phase3_msg::latch_targeting_request_k)),
+                    probe_caller_pid,
+                    probe_registered_pid,
+                    probe_req_magic == probe_expected_magic ? 1u : 0u,
+                    g_session_key != 0 ? 1u : 0u,
+                    probe_req_magic != 0 ? 1u : 0u,
+                    probe_req_session_key != 0 ? 1u : 0u,
+                    probe_req_session_key == g_session_key ? 1u : 0u,
+                    probe_req_reason,
+                    ioctl_codes::get_base());
+            }
             if (input_size >= sizeof(phase3_msg::latch_targeting_request_k)) {
                 auto* req = reinterpret_cast<phase3_msg::latch_targeting_request_k*>(buffer);
                 ULONG expected_magic = g_session_key ^ dynamic_key::get() ^ 0x1A7C4B2Eu;

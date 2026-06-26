@@ -1663,8 +1663,9 @@ scan_result_t scan_types(const json& params)
     }
     result.ok = true;
     diag::log_tagged_fmt("rtti",
-                         "scan_types enter pid=%u module_name=%s module_count=%zu explicit=%d filter=%s module_filter=%s include_system=%d scan_mode=%s max_results=%zu timeout_ms=%llu hint_va=%s elapsed_ms=%llu",
+                         "scan_types enter pid=%u tid=%lu module_name=%s module_count=%zu explicit=%d filter=%s module_filter=%s include_system=%d scan_mode=%s max_results=%zu timeout_ms=%llu hint_va=%s elapsed_ms=%llu total_elapsed_ms=%llu",
                          scope.pid(),
+                         static_cast<unsigned long>(GetCurrentThreadId()),
                          module_name.c_str(),
                          modules.size(),
                          explicit_module ? 1 : 0,
@@ -1675,6 +1676,7 @@ scan_result_t scan_types(const json& params)
                          max_results,
                          static_cast<unsigned long long>(timeout_ms),
                          hint_va ? sa_format_address(hint_va).c_str() : "0x0",
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms),
                          static_cast<unsigned long long>(GetTickCount64() - started_ms));
     rtti_scan_context_t ctx;
     ctx.pid = scope.pid();
@@ -1807,7 +1809,29 @@ scan_result_t scan_types(const json& params)
         if (ctx.stop("rtti_module_loop"))
             break;
         const std::uint64_t module_started_ms = GetTickCount64();
+        diag::log_tagged_fmt("rtti",
+                             "scan_module enter pid=%u tid=%lu module=%s base=%s size=%llu deep=%d elapsed_ms_in_call=%llu total_ms_since_handler_enter=%llu",
+                             scope.pid(),
+                             static_cast<unsigned long>(GetCurrentThreadId()),
+                             (!module.name.empty() ? module.name : module.path).c_str(),
+                             sa_format_address(module.base).c_str(),
+                             static_cast<unsigned long long>(module.size),
+                             (deep_scan || has_exact_col) ? 1 : 0,
+                             0ULL,
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
         auto partial = scan_module(ctx, module, deep_scan || has_exact_col, max_unfiltered);
+        const std::uint64_t module_elapsed_ms = GetTickCount64() - module_started_ms;
+        diag::log_tagged_fmt("rtti",
+                             "scan_module exit pid=%u tid=%lu module=%s base=%s size=%llu deep=%d types_found=%zu elapsed_ms_in_call=%llu total_ms_since_handler_enter=%llu",
+                             scope.pid(),
+                             static_cast<unsigned long>(GetCurrentThreadId()),
+                             (!module.name.empty() ? module.name : module.path).c_str(),
+                             sa_format_address(module.base).c_str(),
+                             static_cast<unsigned long long>(module.size),
+                             (deep_scan || has_exact_col) ? 1 : 0,
+                             partial.size(),
+                             static_cast<unsigned long long>(module_elapsed_ms),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
         diag::log_tagged_fmt("rtti",
                              "scan_types module pid=%u name=%s base=%s size=%llu priority=%d system=%d count=%zu elapsed_ms=%llu total_elapsed_ms=%llu",
                              scope.pid(),
@@ -1817,7 +1841,7 @@ scan_result_t scan_types(const json& params)
                              module_scan_priority(module),
                              is_system_module_path(module) ? 1 : 0,
                              partial.size(),
-                             static_cast<unsigned long long>(GetTickCount64() - module_started_ms),
+                             static_cast<unsigned long long>(module_elapsed_ms),
                              static_cast<unsigned long long>(GetTickCount64() - started_ms));
         for (const auto& type : partial)
             merge_found(type);

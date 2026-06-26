@@ -4903,12 +4903,16 @@ void phase_analysis_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>&
     };
 
     int total = static_cast<int>(sizeof(tests) / sizeof(tests[0]));
+    (void)skipped;
     log_msg(hf, "analysis", "=== BEGIN analysis tests (%d tests) ===", total);
     for (int i = 0; i < total; ++i) {
         if (cancelled && cancelled()) {
             int remaining = total - i;
-            skipped.fetch_add(remaining);
-            log_msg(hf, "analysis", "cancelled -- skipping %d remaining tests", remaining);
+            failed.fetch_add(remaining);
+            log_msg(hf, "analysis", "FAIL -- cancellation requested mid-analysis-phase with %d test(s) remaining; cancellation is a defect in the sanctioned full-test run pid=%lu tid=%lu",
+                remaining,
+                static_cast<unsigned long>(GetCurrentProcessId()),
+                static_cast<unsigned long>(GetCurrentThreadId()));
             break;
         }
 
