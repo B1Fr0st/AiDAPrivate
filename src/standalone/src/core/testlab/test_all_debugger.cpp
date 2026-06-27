@@ -1651,7 +1651,8 @@ static void test_get_call_stack(HANDLE hf, std::atomic<int>& passed, std::atomic
         const bool blank_module = frames[i].module_name.empty();
         const bool empty_function = frames[i].function_name.empty();
         const bool resolved_symbol = resolver.find("source=pdb") != std::string::npos ||
-            resolver.find("source=export") != std::string::npos;
+            resolver.find("source=export") != std::string::npos ||
+            resolver.find("source=local_image_nearest") != std::string::npos;
         const bool module_rva_fallback = resolver.find("source=module_rva") != std::string::npos;
         const bool budget_exhausted = resolver.find("budget") != std::string::npos;
         if (frames[i].address == 0)
@@ -1701,7 +1702,7 @@ static void test_get_call_stack(HANDLE hf, std::atomic<int>& passed, std::atomic
     const bool structural_ok = !frames.empty() && top_addr != 0;
     const bool budget_majority = structural_ok && budget_exhausted_count * 2 >= frames.size() && frames.size() > 1;
     const bool module_rva_structural_contract = structural_ok &&
-        module_rva_fallback_count == frames.size() &&
+        (module_rva_fallback_count + resolved_count) == frames.size() &&
         known_module_blank_functions == 0 &&
         blank_module_count == 0 &&
         zero_address_count == 0 &&

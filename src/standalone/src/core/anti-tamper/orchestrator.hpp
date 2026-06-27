@@ -3025,27 +3025,26 @@ inline bool guard()
     CFF_STATE(guard_cff, 4)
     {
         uint64_t anti_hook_tick = GetTickCount64();
-        webhook::write_log_critical_fmt("guard",
-            "anti_hook_runtime_pre verify_counter=%u iat_entries=%zu full_test=%u",
-            rt.verify_counter,
-            rt.iat_snap.size(),
-            rt.full_test_running.load(std::memory_order_acquire) ? 1u : 0u);
         auto hook = anti_hook::runtime_scan(rt.iat_snap);
-        webhook::write_log_critical_fmt("guard",
-            "anti_hook_runtime_post detected=%d elapsed_ms=%llu iat=%d ntdll=%d k32=%d syscall=%d eat=%d prologue=%d disk=%d veh=%d dr=%d redir=%d summary=%s",
-            hook.any_detected() ? 1 : 0,
-            static_cast<unsigned long long>(GetTickCount64() - anti_hook_tick),
-            hook.iat_modified ? 1 : 0,
-            hook.ntdll_inline_hooked ? 1 : 0,
-            hook.kernel32_inline_hooked ? 1 : 0,
-            hook.syscall_stubs_modified ? 1 : 0,
-            hook.eat_hooked ? 1 : 0,
-            hook.prologue_hash_mismatch ? 1 : 0,
-            hook.disk_image_mismatch ? 1 : 0,
-            hook.veh_chain_tampered ? 1 : 0,
-            hook.dr_in_text_range ? 1 : 0,
-            hook.dispatch_table_redirected ? 1 : 0,
-            hook.summary.c_str());
+        uint64_t anti_hook_elapsed = GetTickCount64() - anti_hook_tick;
+        if (hook.any_detected() || anti_hook_elapsed >= 1000ULL)
+        {
+            webhook::write_log_critical_fmt("guard",
+                "anti_hook_runtime_post detected=%d elapsed_ms=%llu iat=%d ntdll=%d k32=%d syscall=%d eat=%d prologue=%d disk=%d veh=%d dr=%d redir=%d summary=%s",
+                hook.any_detected() ? 1 : 0,
+                static_cast<unsigned long long>(anti_hook_elapsed),
+                hook.iat_modified ? 1 : 0,
+                hook.ntdll_inline_hooked ? 1 : 0,
+                hook.kernel32_inline_hooked ? 1 : 0,
+                hook.syscall_stubs_modified ? 1 : 0,
+                hook.eat_hooked ? 1 : 0,
+                hook.prologue_hash_mismatch ? 1 : 0,
+                hook.disk_image_mismatch ? 1 : 0,
+                hook.veh_chain_tampered ? 1 : 0,
+                hook.dr_in_text_range ? 1 : 0,
+                hook.dispatch_table_redirected ? 1 : 0,
+                hook.summary.c_str());
+        }
         if (hook.any_detected())
         {
             const bool syscall_only =
@@ -3507,7 +3506,9 @@ inline bool guard()
 
                 if (g_kernel_clear_process_dr_unsupported.load(std::memory_order_acquire))
                 {
-                    webhook::write_log("guard", "kernel_clear_process_dr_runtime_skipped_unsupported");
+                    static std::atomic<bool> s_clear_process_dr_unsupported_logged{false};
+                    if (!s_clear_process_dr_unsupported_logged.exchange(true, std::memory_order_acq_rel))
+                        webhook::write_log("guard", "kernel_clear_process_dr_runtime_skipped_unsupported");
                 }
                 else
                 {

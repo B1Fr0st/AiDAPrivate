@@ -297,16 +297,29 @@ bool prewarm_default_disabled()
 {
     char value[32] = {};
     DWORD n = GetEnvironmentVariableA("AIDA_CAMOUFOX_PREWARM", value, static_cast<DWORD>(sizeof(value)));
-    if (n == 0) return true;
+    if (n == 0 || n >= static_cast<DWORD>(sizeof(value))) return false;
     value[sizeof(value) - 1] = '\0';
-    if (_stricmp(value, "1") == 0 ||
-        _stricmp(value, "true") == 0 ||
-        _stricmp(value, "yes") == 0 ||
-        _stricmp(value, "on") == 0 ||
-        _stricmp(value, "enabled") == 0 ||
-        _stricmp(value, "eager") == 0)
-        return false;
-    return true;
+    if (_stricmp(value, "0") == 0 ||
+        _stricmp(value, "false") == 0 ||
+        _stricmp(value, "no") == 0 ||
+        _stricmp(value, "off") == 0 ||
+        _stricmp(value, "disabled") == 0)
+        return true;
+    return false;
+}
+
+void log_prewarm_policy_resolved(const char* reason)
+{
+    char value[32] = {};
+    DWORD n = GetEnvironmentVariableA("AIDA_CAMOUFOX_PREWARM", value, static_cast<DWORD>(sizeof(value)));
+    const bool env_unset = (n == 0 || n >= static_cast<DWORD>(sizeof(value)));
+    if (!env_unset)
+        value[sizeof(value) - 1] = '\0';
+    const bool disabled = prewarm_default_disabled();
+    diag::log_tagged_fmt("camoufox", "prewarm_policy default=enabled env=%s resolved=%s reason=%s",
+        env_unset ? "<unset>" : value,
+        disabled ? "disabled" : "enabled",
+        reason && reason[0] ? reason : "unspecified");
 }
 
 bool env_flag_enabled_a(const char* name);
@@ -1163,6 +1176,199 @@ bool should_prefer_developer_python_runtime(const launch_config_t& cfg)
     if (env_flag_enabled_a("AIDA_CAMOUFOX_FORCE_PYTHON") || env_flag_enabled_a("AIDA_CAMOUFOX_USE_PYTHON"))
         return true;
     return false;
+}
+
+std::wstring local_appdata_aida_root();
+
+bool ensure_directory_recursive_w_bridge(const std::wstring& dir)
+{
+    if (dir.empty()) return false;
+    if (directory_exists_w(dir)) return true;
+    std::wstring parent = parent_dir_w(dir);
+    if (!parent.empty() && parent != dir && !directory_exists_w(parent))
+    {
+        if (!ensure_directory_recursive_w_bridge(parent)) return false;
+    }
+    if (CreateDirectoryW(dir.c_str(), nullptr)) return true;
+    return GetLastError() == ERROR_ALREADY_EXISTS;
+}
+
+std::wstring frozen_mcp_cache_root_w_bridge()
+{
+    std::wstring root = local_appdata_aida_root();
+    if (root.empty()) return {};
+    return join_path_w(join_path_w(join_path_w(root, L"Standalone"), L"camoufox"), L"frozen-mcp-cache");
+}
+
+std::wstring frozen_mcp_contract_cache_path_bridge()
+{
+    std::wstring root = local_appdata_aida_root();
+    if (root.empty()) return {};
+    return join_path_w(join_path_w(join_path_w(root, L"Standalone"), L"camoufox"), L"frozen-mcp-contract.json");
+}
+
+bool extract_cached_string_value(const std::string& json, const std::string& key, std::string& out_value)
+{
+    out_value.clear();
+    const std::string pattern = "\"" + key + "\"";
+    size_t pos = json.find(pattern);
+    if (pos == std::string::npos) return false;
+    pos = json.find(':', pos + pattern.size());
+    if (pos == std::string::npos) return false;
+    ++pos;
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) ++pos;
+    if (pos >= json.size() || json[pos] != '"') return false;
+    ++pos;
+    std::string value;
+    while (pos < json.size())
+    {
+        char c = json[pos++];
+        if (c == '\\' && pos < json.size())
+        {
+            char n = json[pos++];
+            switch (n)
+            {
+                case '"':  value.push_back('"'); break;
+                case '\\': value.push_back('\\'); break;
+                case '/':  value.push_back('/'); break;
+                case 'b':  value.push_back('\b'); break;
+                case 'f':  value.push_back('\f'); break;
+                case 'n':  value.push_back('\n'); break;
+                case 'r':  value.push_back('\r'); break;
+                case 't':  value.push_back('\t'); break;
+                default:   value.push_back(n); break;
+            }
+            continue;
+        }
+        if (c == '"') break;
+        value.push_back(c);
+    }
+    out_value = value;
+    return true;
+}
+
+bool extract_cached_number_value(const std::string& json, const std::string& key, uint64_t& out_value)
+{
+    out_value = 0;
+    const std::string pattern = "\"" + key + "\"";
+    size_t pos = json.find(pattern);
+    if (pos == std::string::npos) return false;
+    pos = json.find(':', pos + pattern.size());
+    if (pos == std::string::npos) return false;
+    ++pos;
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) ++pos;
+    std::string digits;
+    while (pos < json.size() && std::isdigit(static_cast<unsigned char>(json[pos])))
+        digits.push_back(json[pos++]);
+    if (digits.empty()) return false;
+    char* end = nullptr;
+    out_value = std::strtoull(digits.c_str(), &end, 10);
+    return end != digits.c_str();
+}
+
+bool load_frozen_mcp_contract_cache_for_bridge(std::string& out_exe_path, std::string& out_sha256, uint64_t& out_size, uint64_t& out_mtime, std::string& out_contract_id, std::string& out_meipass_dir)
+{
+    out_exe_path.clear();
+    out_sha256.clear();
+    out_size = 0;
+    out_mtime = 0;
+    out_contract_id.clear();
+    out_meipass_dir.clear();
+    const std::wstring cache_path = frozen_mcp_contract_cache_path_bridge();
+    if (cache_path.empty() || !path_exists_w(cache_path)) return false;
+    HANDLE h = CreateFileW(cache_path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER sz{};
+    if (!GetFileSizeEx(h, &sz) || sz.QuadPart <= 0 || sz.QuadPart > 1024 * 1024)
+    {
+        CloseHandle(h);
+        return false;
+    }
+    std::string body;
+    body.resize(static_cast<size_t>(sz.QuadPart));
+    DWORD read = 0;
+    BOOL rok = ReadFile(h, body.data(), static_cast<DWORD>(body.size()), &read, nullptr);
+    CloseHandle(h);
+    if (!rok || read != body.size()) return false;
+    extract_cached_string_value(body, "exe_path", out_exe_path);
+    extract_cached_string_value(body, "exe_sha256", out_sha256);
+    extract_cached_number_value(body, "exe_file_size", out_size);
+    extract_cached_number_value(body, "exe_mtime", out_mtime);
+    extract_cached_string_value(body, "contract_id", out_contract_id);
+    extract_cached_string_value(body, "meipass_dir", out_meipass_dir);
+    return !out_sha256.empty() && !out_contract_id.empty();
+}
+
+bool resolve_pyinstaller_meipass_dir_for_bridge(const std::string& exe_path_utf8, std::wstring& out_dir, std::string& out_reason)
+{
+    out_dir.clear();
+    out_reason.clear();
+    if (exe_path_utf8.empty())
+    {
+        out_reason = "empty_exe_path";
+        return false;
+    }
+    const std::wstring exe_w = utf8_to_wide(exe_path_utf8);
+    if (!path_exists_w(exe_w))
+    {
+        out_reason = "exe_missing";
+        return false;
+    }
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    uint64_t live_size = 0;
+    uint64_t live_mtime = 0;
+    if (GetFileAttributesExW(exe_w.c_str(), GetFileExInfoStandard, &fad))
+    {
+        live_size = (static_cast<uint64_t>(fad.nFileSizeHigh) << 32) | static_cast<uint64_t>(fad.nFileSizeLow);
+        live_mtime = (static_cast<uint64_t>(fad.ftLastWriteTime.dwHighDateTime) << 32) | static_cast<uint64_t>(fad.ftLastWriteTime.dwLowDateTime);
+    }
+    std::string cached_exe;
+    std::string cached_sha256;
+    uint64_t    cached_size = 0;
+    uint64_t    cached_mtime = 0;
+    std::string cached_contract_id;
+    std::string cached_meipass;
+    const bool cache_loaded = load_frozen_mcp_contract_cache_for_bridge(cached_exe, cached_sha256, cached_size, cached_mtime, cached_contract_id, cached_meipass);
+    std::string sha256_hex;
+    if (cache_loaded &&
+        cached_exe == exe_path_utf8 &&
+        cached_size == live_size &&
+        cached_mtime == live_mtime &&
+        !cached_sha256.empty())
+    {
+        sha256_hex = cached_sha256;
+        out_reason = "contract_cache_reuse";
+    }
+    else
+    {
+        std::string hash_status;
+        if (!sha256_file_hex_w(exe_w, sha256_hex, hash_status))
+        {
+            out_reason = "sha256_failed:" + hash_status;
+            return false;
+        }
+        out_reason = cache_loaded ? "contract_cache_stale_recompute" : "contract_cache_missing_recompute";
+    }
+    if (sha256_hex.size() < 16)
+    {
+        out_reason = "sha256_too_short";
+        return false;
+    }
+    const std::wstring cache_root = frozen_mcp_cache_root_w_bridge();
+    if (cache_root.empty())
+    {
+        out_reason = "no_localappdata";
+        return false;
+    }
+    const std::wstring meipass_dir = join_path_w(cache_root, utf8_to_wide(sha256_hex));
+    if (!ensure_directory_recursive_w_bridge(meipass_dir))
+    {
+        const DWORD gle = GetLastError();
+        out_reason = "create_dir_gle=" + std::to_string(gle);
+        return false;
+    }
+    out_dir = meipass_dir;
+    return true;
 }
 
 const char* runtime_mode_name(bool use_server_executable)
@@ -6596,6 +6802,31 @@ bool start_bridge(const launch_config_t& cfg)
     if (!is_default_session_id(cfg.session_id))
         return start_bridge(cfg, cfg.session_id);
     const uint64_t bridge_start_ms = now_ms();
+    uint64_t sb_drain_start_ms = 0;
+    uint64_t sb_drain_ms = 0;
+    uint64_t sb_resolve_ms = 0;
+    uint64_t sb_spawn_ms = 0;
+    uint64_t sb_connect_ms = 0;
+    uint64_t sb_tools_ms = 0;
+    uint64_t sb_launch_rpc_ms = 0;
+    uint64_t sb_readiness_probe_ms = 0;
+    uint64_t sb_visible_window_ms = 0;
+    auto emit_stage_timing = [&](bool ok, const char* phase, uint32_t child_pid) {
+        diag::log_tagged_fmt("camoufox", "start_bridge stage_timing ok=%d phase=%s session_id=%s drain_ms=%llu resolve_ms=%llu spawn_ms=%llu connect_ms=%llu tools_ms=%llu launch_rpc_ms=%llu readiness_probe_ms=%llu visible_window_ms=%llu total_ms=%llu child_pid=%lu",
+            ok ? 1 : 0,
+            phase && phase[0] ? phase : "unspecified",
+            cfg.session_id.empty() ? "default" : cfg.session_id.c_str(),
+            static_cast<unsigned long long>(sb_drain_ms),
+            static_cast<unsigned long long>(sb_resolve_ms),
+            static_cast<unsigned long long>(sb_spawn_ms),
+            static_cast<unsigned long long>(sb_connect_ms),
+            static_cast<unsigned long long>(sb_tools_ms),
+            static_cast<unsigned long long>(sb_launch_rpc_ms),
+            static_cast<unsigned long long>(sb_readiness_probe_ms),
+            static_cast<unsigned long long>(sb_visible_window_ms),
+            static_cast<unsigned long long>(now_ms() - bridge_start_ms),
+            static_cast<unsigned long>(child_pid));
+    };
     std::unique_lock<std::recursive_mutex> op_lk(sg().operation_mtx, std::try_to_lock);
     if (!op_lk.owns_lock())
         return wait_for_existing_start_bridge_result(cfg, bridge_start_ms);
@@ -6622,8 +6853,14 @@ bool start_bridge(const launch_config_t& cfg)
         static_cast<int>(sg().page_verified), static_cast<unsigned long>(sg().child_pid),
         static_cast<int>(sg().cleanup_pending));
     clear_auto_restart_block_locked("start_bridge");
+    sb_drain_start_ms = now_ms();
     if (!drain_pending_cleanup_before_launch_locked(lk, "start_bridge", bridge_start_ms))
+    {
+        sb_drain_ms = now_ms() - sb_drain_start_ms;
+        emit_stage_timing(false, "drain", sg().child_pid);
         return false;
+    }
+    sb_drain_ms = now_ms() - sb_drain_start_ms;
 
     bool ready_config_mismatch_handled = false;
     if (sg().state == bridge_state_t::ready && sg().client)
@@ -6684,6 +6921,7 @@ bool start_bridge(const launch_config_t& cfg)
                 preserve_resolved_launch_paths(effective_cfg, sg().active_cfg);
                 sg().active_cfg = effective_cfg;
                 sg().last_launch_ms = now_ms() - bridge_start_ms;
+                emit_stage_timing(true, "ready_reuse", sg().child_pid);
                 return true;
             }
         }
@@ -6779,6 +7017,7 @@ bool start_bridge(const launch_config_t& cfg)
     const bool force_python_env = env_flag_enabled_a("AIDA_CAMOUFOX_FORCE_PYTHON") || env_flag_enabled_a("AIDA_CAMOUFOX_USE_PYTHON");
     const bool explicit_server_cfg = !effective_cfg.server_executable.empty();
     const bool explicit_server_env = env_path_configured_a("AIDA_CAMOUFOX_MCP_EXECUTABLE");
+    const uint64_t sb_resolve_start_ms = now_ms();
     std::string bundled_server_executable;
     const bool bundled_server_available = find_bundled_reverse_mcp_executable(bundled_server_executable);
     const bool prefer_developer_python = should_prefer_developer_python_runtime(effective_cfg);
@@ -7009,6 +7248,30 @@ bool start_bridge(const launch_config_t& cfg)
         scfg.env["AIDA_CAMOUFOX_ALLOW_SYSTEM_PYTHON"] = "1";
     const std::string child_debug_log = camoufox_debug_log_path();
     populate_internal_camoufox_env(scfg, effective_cfg.session_id, effective_cfg.browser_executable, child_debug_log);
+    if (use_server_executable)
+    {
+        const uint64_t meipass_resolve_start_ms = now_ms();
+        std::wstring meipass_dir_w;
+        std::string  meipass_reason;
+        const bool meipass_ok = resolve_pyinstaller_meipass_dir_for_bridge(server_executable, meipass_dir_w, meipass_reason);
+        if (meipass_ok && !meipass_dir_w.empty())
+        {
+            const std::string meipass_dir_utf8 = wide_to_utf8(meipass_dir_w);
+            scfg.env["_MEIPASS2"] = meipass_dir_utf8;
+            scfg.env["PYINSTALLER_RESET_ENVIRONMENT"] = "0";
+            diag::log_tagged_fmt("camoufox", "spawn_capture meipass label=start_bridge dir=%s exists=%d reason=%s elapsed_ms=%llu",
+                meipass_dir_utf8.c_str(),
+                static_cast<int>(directory_exists_w(meipass_dir_w)),
+                meipass_reason.c_str(),
+                static_cast<unsigned long long>(now_ms() - meipass_resolve_start_ms));
+        }
+        else
+        {
+            diag::log_tagged_fmt("camoufox", "spawn_capture meipass label=start_bridge dir=<unresolved> exists=0 reason=%s elapsed_ms=%llu",
+                meipass_reason.empty() ? "<empty>" : meipass_reason.c_str(),
+                static_cast<unsigned long long>(now_ms() - meipass_resolve_start_ms));
+        }
+    }
     scfg.enabled                 = true;
     scfg.auto_connect            = false;
     scfg.oauth_enabled           = false;
@@ -7073,11 +7336,15 @@ bool start_bridge(const launch_config_t& cfg)
         (mcp_create_flags & CREATE_DEFAULT_ERROR_MODE) == 0 ? 1 : 0,
         static_cast<unsigned long>(GetErrorMode()),
         static_cast<unsigned long>(GetErrorMode() | kBridgeChildErrorMode));
+    sb_resolve_ms = now_ms() - sb_resolve_start_ms;
+    const uint64_t sb_spawn_start_ms = now_ms();
     bool connect_ok = false;
     {
         scoped_child_error_mode_t mcp_child_error_mode("start_bridge_mcp_connect", mcp_create_flags, scfg.command.c_str());
         connect_ok = sg().client->connect(scfg);
     }
+    sb_spawn_ms = now_ms() - sb_spawn_start_ms;
+    sb_connect_ms = sb_spawn_ms;
     if (!connect_ok)
     {
         std::string inner = sg().client->last_error();
@@ -7103,6 +7370,7 @@ bool start_bridge(const launch_config_t& cfg)
             process_init_failure ? 1 : 0,
             sg().last_error.c_str());
         publish_state(bridge_state_t::error, sg().last_error);
+        emit_stage_timing(false, "connect", sg().child_pid);
         return false;
     }
     reset_launch_init_failure_block_locked("start_bridge_mcp_connect_success");
@@ -7143,7 +7411,8 @@ bool start_bridge(const launch_config_t& cfg)
         runtime_mode_name(use_server_executable));
     std::string missing_tools;
     std::string tool_inventory;
-    if (!wait_for_required_reverse_tools(
+    const uint64_t sb_tools_start_ms = now_ms();
+    const bool tools_ready = wait_for_required_reverse_tools(
             sg().client.get(),
             wait_ms,
             "start_bridge",
@@ -7152,7 +7421,9 @@ bool start_bridge(const launch_config_t& cfg)
             effective_cfg.session_id,
             start_generation,
             missing_tools,
-            tool_inventory))
+            tool_inventory);
+    sb_tools_ms = now_ms() - sb_tools_start_ms;
+    if (!tools_ready)
     {
         std::string inner = sg().client->last_error();
         const uint32_t failed_pid = sg().child_pid;
@@ -7179,10 +7450,12 @@ bool start_bridge(const launch_config_t& cfg)
         diag::log_tagged("camoufox", sg().last_error.c_str());
         terminate_process_id_async(failed_pid, "required_reverse_tools_missing");
         publish_state(bridge_state_t::error, sg().last_error);
+        emit_stage_timing(false, "tools", failed_pid);
         return false;
     }
 
     sg().active_cfg     = effective_cfg;
+    const uint64_t sb_launch_rpc_start_ms = now_ms();
 
     nlohmann::json args = build_launch_args(effective_cfg);
     const uint64_t launch_attempt_ms = now_ms();
@@ -7539,11 +7812,14 @@ bool start_bridge(const launch_config_t& cfg)
                 sg().last_launch_diagnostics["last_error_after_reap"] = sg().last_error;
             }
             publish_state(bridge_state_t::error, sg().last_error.empty() ? state_error : sg().last_error);
+            sb_launch_rpc_ms = now_ms() - sb_launch_rpc_start_ms;
+            emit_stage_timing(false, "launch_rpc_timeout", timed_out_pid);
             return false;
         }
         launch = std::move(launch_state->result);
     }
     const uint64_t launch_elapsed_ms = now_ms() - launch_call_start_ms;
+    sb_launch_rpc_ms = now_ms() - sb_launch_rpc_start_ms;
     diag::log_tagged_fmt("camoufox", "launch_browser response success=%d generation=%llu child_pid=%lu elapsed_ms=%llu text_len=%zu data_shape=%s error_len=%zu",
         static_cast<int>(launch.success), static_cast<unsigned long long>(start_generation),
         static_cast<unsigned long>(launch_child_pid), static_cast<unsigned long long>(launch_elapsed_ms),
@@ -7609,6 +7885,7 @@ bool start_bridge(const launch_config_t& cfg)
             finish_start_bridge_failure_cleanup_locked(lk, failed_client, failed_pid, "launch_browser_failed", start_generation, state_error);
         }
         publish_state(bridge_state_t::error, sg().last_error);
+        emit_stage_timing(false, "launch_rpc", failed_pid);
         return false;
     }
     int browser_ready_ms_raw = -1;
@@ -7848,8 +8125,10 @@ bool start_bridge(const launch_config_t& cfg)
     sg().browser_open = true;
     sg().state = bridge_state_t::ready;
     sg().page_verified = false;
+    const uint64_t sb_readiness_probe_start_ms = now_ms();
     nlohmann::json page_args;
     call_result_t page = call_with_deadline("get_page_info", page_args, kReadinessProbeTimeoutMs);
+    sb_readiness_probe_ms = now_ms() - sb_readiness_probe_start_ms;
     if (!page.ok || !page.data.is_object() || !page.data.contains("url") || !page.data["url"].is_string())
     {
         std::string err = page.error.empty() ? std::string("launch readiness probe did not return page URL") : page.error;
@@ -7868,6 +8147,7 @@ bool start_bridge(const launch_config_t& cfg)
         const std::string state_error = sg().last_error;
         finish_start_bridge_failure_cleanup_locked(lk, failed_client, failed_pid, "launch_browser_readiness_failed", start_generation, state_error);
         publish_state(bridge_state_t::error, sg().last_error);
+        emit_stage_timing(false, "readiness_probe", failed_pid);
         return false;
     }
     update_page_cache_from_json_locked(page.data, "launch_readiness");
@@ -7877,7 +8157,9 @@ bool start_bridge(const launch_config_t& cfg)
         sg().active_page_title = json_string_or(page.data, "title", std::string());
     sg().page_verified = true;
     sg().last_verified_ms = now_ms();
+    const uint64_t sb_visible_window_start_ms = now_ms();
     const visible_window_snapshot_t ready_visible = sample_visible_window_proof(sg().child_pid);
+    sb_visible_window_ms = now_ms() - sb_visible_window_start_ms;
     sg().last_launch_diagnostics["visible_window_proof"] = visible_window_proof_json(ready_visible, sg().child_pid, start_generation, "launch_ready");
     log_visible_window_proof("launch_ready", start_generation, sg().child_pid, ready_visible);
     if (!effective_cfg.headless && ready_visible.visible_window_count == 0)
@@ -7901,6 +8183,7 @@ bool start_bridge(const launch_config_t& cfg)
         const std::string state_error = sg().last_error;
         finish_start_bridge_failure_cleanup_locked(lk, failed_client, failed_pid, "launch_browser_visible_window_missing", start_generation, state_error);
         publish_state(bridge_state_t::error, sg().last_error);
+        emit_stage_timing(false, "visible_window", failed_pid);
         return false;
     }
     if (launch_timing_budget_slow)
@@ -7958,6 +8241,7 @@ bool start_bridge(const launch_config_t& cfg)
         ready_url.host.c_str(), ready_url.path.c_str(), static_cast<int>(ready_url.has_query),
         ready_url.length, sg().active_page_title.size(), static_cast<unsigned long long>(sg().last_launch_ms));
     publish_state(bridge_state_t::ready, std::string());
+    emit_stage_timing(true, "ready", sg().child_pid);
     return true;
 }
 
@@ -8597,16 +8881,28 @@ bool ensure_ready()
 bool prewarm_default_async(const char* reason)
 {
     const char* owner = safe_reason(reason);
+    const bool prev_requested = prewarm_default_requested().load(std::memory_order_acquire);
+    log_prewarm_policy_resolved(owner);
     if (full_test_running_env())
     {
+        diag::log_tagged_fmt("camoufox", "prewarm_default_policy_resolved env=%s resolved=disabled reason=%s previously_posted=%d full_test_active=1",
+            "<unset_or_present>",
+            owner,
+            prev_requested ? 1 : 0);
         diag::log_tagged_fmt("camoufox", "prewarm_default_deferred_full_test reason=%s", owner);
         return true;
     }
     if (prewarm_default_disabled())
     {
+        diag::log_tagged_fmt("camoufox", "prewarm_default_policy_resolved env=disable_value resolved=disabled reason=%s previously_posted=%d full_test_active=0",
+            owner,
+            prev_requested ? 1 : 0);
         diag::log_tagged_fmt("camoufox", "prewarm_default_disabled reason=%s", owner);
         return true;
     }
+    diag::log_tagged_fmt("camoufox", "prewarm_default_policy_resolved resolved=enabled reason=%s previously_posted=%d full_test_active=0",
+        owner,
+        prev_requested ? 1 : 0);
     bridge_status_t before = get_status();
     const bool ready = before.state == bridge_state_t::ready &&
                        before.child_alive &&
@@ -9363,6 +9659,32 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
     uint64_t managed_generation = 0;
     const std::string child_debug_log = camoufox_debug_log_path();
     populate_internal_camoufox_env(scfg, sid, effective_cfg.browser_executable, child_debug_log);
+    if (use_server_executable)
+    {
+        const uint64_t meipass_resolve_start_ms = now_ms();
+        std::wstring meipass_dir_w;
+        std::string  meipass_reason;
+        const bool meipass_ok = resolve_pyinstaller_meipass_dir_for_bridge(server_executable, meipass_dir_w, meipass_reason);
+        if (meipass_ok && !meipass_dir_w.empty())
+        {
+            const std::string meipass_dir_utf8 = wide_to_utf8(meipass_dir_w);
+            scfg.env["_MEIPASS2"] = meipass_dir_utf8;
+            scfg.env["PYINSTALLER_RESET_ENVIRONMENT"] = "0";
+            diag::log_tagged_fmt("camoufox", "spawn_capture meipass label=managed_start session_id=%s dir=%s exists=%d reason=%s elapsed_ms=%llu",
+                sid.c_str(),
+                meipass_dir_utf8.c_str(),
+                static_cast<int>(directory_exists_w(meipass_dir_w)),
+                meipass_reason.c_str(),
+                static_cast<unsigned long long>(now_ms() - meipass_resolve_start_ms));
+        }
+        else
+        {
+            diag::log_tagged_fmt("camoufox", "spawn_capture meipass label=managed_start session_id=%s dir=<unresolved> exists=0 reason=%s elapsed_ms=%llu",
+                sid.c_str(),
+                meipass_reason.empty() ? "<empty>" : meipass_reason.c_str(),
+                static_cast<unsigned long long>(now_ms() - meipass_resolve_start_ms));
+        }
+    }
     auto log_managed_failure_diagnostics = [&](const char* phase, uint32_t pid, const std::string& error, const std::string& response_tail = std::string()) {
         const std::string tree = pid == 0 ? std::string() : compact_process_tree(enumerate_process_tree(pid));
         const std::string debug_tail = read_file_tail_for_log(child_debug_log, 6000);

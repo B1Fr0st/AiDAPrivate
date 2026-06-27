@@ -3970,15 +3970,46 @@ namespace {
 
 }
 
+struct disasm_test_entry_t {
+    const char* name;
+    void (*fn)(HANDLE, std::atomic<int>&, std::atomic<int>&, std::atomic<int>&);
+};
+
+__declspec(noinline) void run_disasm_test_entry_seh(
+    HANDLE hf,
+    const disasm_test_entry_t& test,
+    std::atomic<int>& passed,
+    std::atomic<int>& failed,
+    std::atomic<int>& skipped)
+{
+    __try {
+        test.fn(hf, passed, failed, skipped);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        const DWORD code = GetExceptionCode();
+        if (std::strcmp(test.name, "xref_live_after_warm_range") == 0) {
+            const int xref_stage = g_xref_live_after_warm_stage.load(std::memory_order_acquire);
+            log_msg(hf, "disasm_phase", "SEH-DETAIL -- %s stage=%s(%d) exception=0x%08X",
+                test.name,
+                xref_live_after_warm_stage_name(xref_stage),
+                xref_stage,
+                code);
+            diag::log_tagged_critical_fmt("testlab",
+                "xref_live_after_warm_seh stage=%s stage_id=%d exception=0x%08lX",
+                xref_live_after_warm_stage_name(xref_stage),
+                xref_stage,
+                static_cast<unsigned long>(code));
+        }
+        log_msg(hf, "disasm_phase", "FAIL -- %s threw SEH exception 0x%08X",
+            test.name, code);
+        failed.fetch_add(1);
+    }
+}
+
 void phase_disasm_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped, bool(*cancelled)()) {
     auto t0 = std::chrono::steady_clock::now();
 
-    struct test_entry_t {
-        const char* name;
-        void (*fn)(HANDLE, std::atomic<int>&, std::atomic<int>&, std::atomic<int>&);
-    };
-
-    static const test_entry_t tests[] = {
+    static const disasm_test_entry_t tests[] = {
         { "goto_address",                            test_goto_address                            },
         { "get_disasm_window_bytes",                 test_get_disasm_window_bytes                 },
         { "navigate_back_forward",                   test_navigate_back_forward                   },
@@ -4154,28 +4185,7 @@ void phase_disasm_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& f
 
         log_msg(hf, "disasm_phase", "[%d/%d] START %s", i + 1, total, tests[i].name);
         auto test_t0 = std::chrono::steady_clock::now();
-        __try {
-            tests[i].fn(hf, passed, failed, skipped);
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
-            const DWORD code = GetExceptionCode();
-            if (std::strcmp(tests[i].name, "xref_live_after_warm_range") == 0) {
-                const int xref_stage = g_xref_live_after_warm_stage.load(std::memory_order_acquire);
-                log_msg(hf, "disasm_phase", "SEH-DETAIL -- %s stage=%s(%d) exception=0x%08X",
-                    tests[i].name,
-                    xref_live_after_warm_stage_name(xref_stage),
-                    xref_stage,
-                    code);
-                diag::log_tagged_critical_fmt("testlab",
-                    "xref_live_after_warm_seh stage=%s stage_id=%d exception=0x%08lX",
-                    xref_live_after_warm_stage_name(xref_stage),
-                    xref_stage,
-                    static_cast<unsigned long>(code));
-            }
-            log_msg(hf, "disasm_phase", "FAIL -- %s threw SEH exception 0x%08X",
-                tests[i].name, code);
-            failed.fetch_add(1);
-        }
+        run_disasm_test_entry_seh(hf, tests[i], passed, failed, skipped);
         auto test_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - test_t0).count();
         log_msg(hf, "disasm_phase", "[%d/%d] END %s elapsed=%lld ms totals pass=%d fail=%d skip=%d",

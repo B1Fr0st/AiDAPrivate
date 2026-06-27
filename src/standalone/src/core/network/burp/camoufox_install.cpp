@@ -21,12 +21,14 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdint>
 #include <cwctype>
 #include <cstring>
 #include <filesystem>
+#include <map>
 #include <mutex>
 #include <string>
 #include <system_error>
@@ -52,6 +54,11 @@ struct singleton_t
     std::atomic<bool>   initialized{false};
     std::atomic<uint64_t> probe_sequence{0};
     uint64_t             last_ok_tick_ms = 0;
+    std::wstring        resolved_reverse_mcp_exe;
+    std::wstring        resolved_reverse_mcp_meipass_dir;
+    std::string         resolved_reverse_mcp_sha256;
+    uint64_t            resolved_reverse_mcp_size = 0;
+    uint64_t            resolved_reverse_mcp_mtime = 0;
 };
 
 inline singleton_t& sg()
@@ -114,11 +121,18 @@ std::string quote_arg(const std::string& s)
 }
 
 bool spawn_capture_streaming(const std::string& cmdline, DWORD timeout_ms, DWORD& out_exit_code, std::string& out_log);
+bool spawn_capture_streaming_env(const std::string& cmdline, DWORD timeout_ms, const std::map<std::wstring, std::wstring>& extra_env, DWORD& out_exit_code, std::string& out_log, ULONGLONG* out_create_elapsed_ms);
 std::string trim_view(const std::string& s);
 std::string compact_log(std::string s, size_t limit = 1200);
 std::string compact_log_tail(std::string s, size_t limit = 1200);
 void set_status_locked(install_state_t st, const std::string& msg);
 bool get_cached_ready_status(status_t& out, const char* caller);
+bool sha256_file_w(const std::wstring& path, std::string& out_hex, std::string& log);
+bool get_file_size_mtime_w(const std::wstring& path, uint64_t& out_size, uint64_t& out_mtime);
+bool compute_pyinstaller_meipass_dir(const std::wstring& exe, const std::string& sha256_hex, std::wstring& out_dir);
+std::wstring frozen_mcp_contract_cache_path();
+bool load_frozen_mcp_contract_cache(std::string& out_exe_path, std::string& out_sha256, uint64_t& out_size, uint64_t& out_mtime, std::string& out_contract_id, std::string& out_meipass_dir);
+bool save_frozen_mcp_contract_cache(const std::string& exe_path, const std::string& sha256, uint64_t size, uint64_t mtime, const std::string& contract_id, const std::string& meipass_dir);
 
 constexpr wchar_t kPythonInstallerHost[] = L"www.python.org";
 constexpr wchar_t kPythonInstallerPath[] = L"/ftp/python/3.12.10/python-3.12.10-amd64.exe";
@@ -559,10 +573,42 @@ bool discover_bundled_reverse_mcp_executable(std::wstring& out_path)
     return false;
 }
 
-bool discover_reverse_mcp_executable(std::wstring& out_path)
+bool discover_reverse_mcp_executable_uncached(std::wstring& out_path)
 {
     return discover_configured_reverse_mcp_executable(out_path) ||
         discover_bundled_reverse_mcp_executable(out_path);
+}
+
+bool discover_reverse_mcp_executable(std::wstring& out_path)
+{
+    out_path.clear();
+    {
+        std::lock_guard<std::mutex> lk(sg().mtx);
+        if (!sg().resolved_reverse_mcp_exe.empty() && file_exists_w(sg().resolved_reverse_mcp_exe))
+        {
+            out_path = sg().resolved_reverse_mcp_exe;
+            diag::log_tagged_fmt("camoufox_install", "reverse_mcp_executable cache_hit path=%s",
+                wide_to_utf8(out_path).c_str());
+            return true;
+        }
+    }
+    std::wstring resolved;
+    const bool ok = discover_reverse_mcp_executable_uncached(resolved);
+    if (ok)
+    {
+        std::lock_guard<std::mutex> lk(sg().mtx);
+        sg().resolved_reverse_mcp_exe = resolved;
+        out_path = resolved;
+        diag::log_tagged_fmt("camoufox_install", "reverse_mcp_executable cache_miss_resolved path=%s",
+            wide_to_utf8(out_path).c_str());
+    }
+    else
+    {
+        std::lock_guard<std::mutex> lk(sg().mtx);
+        sg().resolved_reverse_mcp_exe.clear();
+        diag::log_tagged_fmt("camoufox_install", "reverse_mcp_executable cache_miss_unresolved");
+    }
+    return ok;
 }
 
 bool discover_configured_browser_executable(std::wstring& out_path)
@@ -1858,12 +1904,68 @@ bool find_executable(const wchar_t* exe_name, std::string& out_path)
     return !out_path.empty();
 }
 
-bool spawn_capture_streaming(const std::string& cmdline, DWORD timeout_ms, DWORD& out_exit_code, std::string& out_log)
+std::vector<wchar_t> build_child_env_block_with_overrides(const std::map<std::wstring, std::wstring>& extra_env, size_t& out_override_count)
+{
+    out_override_count = 0;
+    std::map<std::wstring, std::wstring> merged;
+    LPWCH parent_block = GetEnvironmentStringsW();
+    if (parent_block != nullptr)
+    {
+        const wchar_t* cursor = parent_block;
+        while (*cursor != L'\0')
+        {
+            const std::wstring entry(cursor);
+            cursor += entry.size() + 1;
+            if (entry.empty()) continue;
+            const size_t eq = entry.find(L'=');
+            if (eq == std::wstring::npos || eq == 0) continue;
+            std::wstring key = entry.substr(0, eq);
+            std::wstring value = entry.substr(eq + 1);
+            std::wstring key_upper;
+            key_upper.reserve(key.size());
+            for (wchar_t c : key)
+                key_upper.push_back(static_cast<wchar_t>(std::towupper(c)));
+            merged[key_upper] = key + L"=" + value;
+        }
+        FreeEnvironmentStringsW(parent_block);
+    }
+    for (const auto& kv : extra_env)
+    {
+        if (kv.first.empty()) continue;
+        std::wstring key_upper;
+        key_upper.reserve(kv.first.size());
+        for (wchar_t c : kv.first)
+            key_upper.push_back(static_cast<wchar_t>(std::towupper(c)));
+        merged[key_upper] = kv.first + L"=" + kv.second;
+        ++out_override_count;
+    }
+    std::vector<wchar_t> block;
+    block.reserve(8192);
+    for (const auto& kv : merged)
+    {
+        block.insert(block.end(), kv.second.begin(), kv.second.end());
+        block.push_back(L'\0');
+    }
+    block.push_back(L'\0');
+    return block;
+}
+
+bool spawn_capture_streaming_env(const std::string& cmdline, DWORD timeout_ms, const std::map<std::wstring, std::wstring>& extra_env, DWORD& out_exit_code, std::string& out_log, ULONGLONG* out_create_elapsed_ms)
 {
     out_exit_code = 0;
+    if (out_create_elapsed_ms) *out_create_elapsed_ms = 0;
     const ULONGLONG start_ms = GetTickCount64();
-    diag::log_tagged_fmt("camoufox_install", "spawn_capture_streaming start cmd_len=%zu timeout_ms=%lu",
-        cmdline.size(), static_cast<unsigned long>(timeout_ms));
+    const bool has_env_overrides = !extra_env.empty();
+    if (has_env_overrides)
+    {
+        for (const auto& kv : extra_env)
+        {
+            diag::log_tagged_fmt("camoufox_install", "spawn_capture_streaming env_override key=%s value=%s",
+                wide_to_utf8(kv.first).c_str(), wide_to_utf8(kv.second).c_str());
+        }
+    }
+    diag::log_tagged_fmt("camoufox_install", "spawn_capture_streaming start cmd_len=%zu timeout_ms=%lu env_overrides=%zu",
+        cmdline.size(), static_cast<unsigned long>(timeout_ms), extra_env.size());
 
     SECURITY_ATTRIBUTES sa{};
     sa.nLength        = sizeof(sa);
@@ -1888,25 +1990,48 @@ bool spawn_capture_streaming(const std::string& cmdline, DWORD timeout_ms, DWORD
     si.hStdInput  = GetStdHandle(STD_INPUT_HANDLE);
     si.wShowWindow = SW_HIDE;
 
+    std::vector<wchar_t> env_block;
+    LPVOID env_ptr = nullptr;
+    DWORD create_flags = CREATE_NO_WINDOW;
+    size_t override_count = 0;
+    if (has_env_overrides)
+    {
+        env_block = build_child_env_block_with_overrides(extra_env, override_count);
+        if (!env_block.empty())
+        {
+            env_ptr = env_block.data();
+            create_flags |= CREATE_UNICODE_ENVIRONMENT;
+        }
+    }
+
     PROCESS_INFORMATION pi{};
     std::wstring wcmdline = utf8_to_wide(cmdline);
-    BOOL ok = CreateProcessW(nullptr, wcmdline.empty() ? nullptr : wcmdline.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    const ULONGLONG create_t0 = GetTickCount64();
+    BOOL ok = CreateProcessW(nullptr, wcmdline.empty() ? nullptr : wcmdline.data(), nullptr, nullptr, TRUE, create_flags, env_ptr, nullptr, &si, &pi);
+    const ULONGLONG create_elapsed = GetTickCount64() - create_t0;
+    if (out_create_elapsed_ms) *out_create_elapsed_ms = create_elapsed;
     CloseHandle(wr);
     if (!ok)
     {
         const DWORD gle = GetLastError();
         out_log += "spawn create failed gle=" + std::to_string(gle) + "\n";
-        diag::log_tagged_fmt("camoufox_install", "spawn_capture_streaming create_failed gle=%lu cmd_len=%zu elapsed_ms=%llu",
-            gle, cmdline.size(), static_cast<unsigned long long>(GetTickCount64() - start_ms));
+        diag::log_tagged_fmt("camoufox_install", "spawn_capture_streaming create_failed gle=%lu cmd_len=%zu elapsed_ms=%llu create_elapsed_ms=%llu env_overrides=%zu",
+            gle, cmdline.size(),
+            static_cast<unsigned long long>(GetTickCount64() - start_ms),
+            static_cast<unsigned long long>(create_elapsed),
+            extra_env.size());
         CloseHandle(rd);
         return false;
     }
-    diag::log_tagged_fmt("camoufox_install", "spawn_capture_streaming process_started pid=%lu cmd_len=%zu",
-        static_cast<unsigned long>(pi.dwProcessId), cmdline.size());
+    diag::log_tagged_fmt("camoufox_install", "spawn_capture_streaming process_started pid=%lu cmd_len=%zu create_elapsed_ms=%llu env_overrides=%zu",
+        static_cast<unsigned long>(pi.dwProcessId), cmdline.size(),
+        static_cast<unsigned long long>(create_elapsed),
+        extra_env.size());
     CloseHandle(pi.hThread);
 
     char buf[4096];
     DWORD elapsed = 0;
+    DWORD next_progress_log_ms = 5000;
     const DWORD step = 100;
     while (true)
     {
@@ -1920,6 +2045,15 @@ bool spawn_capture_streaming(const std::string& cmdline, DWORD timeout_ms, DWORD
         DWORD w = WaitForSingleObject(pi.hProcess, step);
         if (w == WAIT_OBJECT_0) break;
         elapsed += step;
+        if (elapsed >= next_progress_log_ms)
+        {
+            diag::log_tagged_fmt("camoufox_install", "spawn_capture_streaming progress pid=%lu elapsed_ms=%lu captured_len=%zu env_overrides=%zu",
+                static_cast<unsigned long>(pi.dwProcessId),
+                static_cast<unsigned long>(elapsed),
+                out_log.size(),
+                extra_env.size());
+            next_progress_log_ms += 5000;
+        }
         if (timeout_ms != INFINITE && elapsed >= timeout_ms)
         {
             TerminateProcess(pi.hProcess, 1);
@@ -1946,15 +2080,23 @@ bool spawn_capture_streaming(const std::string& cmdline, DWORD timeout_ms, DWORD
     }
     GetExitCodeProcess(pi.hProcess, &out_exit_code);
     std::string tail = compact_log_tail(out_log, 600);
-    diag::log_tagged_fmt("camoufox_install", "spawn_capture_streaming exit pid=%lu code=%lu elapsed_ms=%llu captured_len=%zu tail=%.600s",
+    diag::log_tagged_fmt("camoufox_install", "spawn_capture_streaming exit pid=%lu code=%lu elapsed_ms=%llu create_elapsed_ms=%llu captured_len=%zu env_overrides=%zu tail=%.600s",
         static_cast<unsigned long>(pi.dwProcessId),
         static_cast<unsigned long>(out_exit_code),
         static_cast<unsigned long long>(GetTickCount64() - start_ms),
+        static_cast<unsigned long long>(create_elapsed),
         out_log.size(),
+        extra_env.size(),
         tail.c_str());
     CloseHandle(pi.hProcess);
     CloseHandle(rd);
     return true;
+}
+
+bool spawn_capture_streaming(const std::string& cmdline, DWORD timeout_ms, DWORD& out_exit_code, std::string& out_log)
+{
+    static const std::map<std::wstring, std::wstring> kNoExtraEnv;
+    return spawn_capture_streaming_env(cmdline, timeout_ms, kNoExtraEnv, out_exit_code, out_log, nullptr);
 }
 
 std::string trim_view(const std::string& s)
@@ -1991,6 +2133,238 @@ std::string compact_log_tail(std::string s, size_t limit)
     return s;
 }
 
+bool get_file_size_mtime_w(const std::wstring& path, uint64_t& out_size, uint64_t& out_mtime)
+{
+    out_size = 0;
+    out_mtime = 0;
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad))
+        return false;
+    out_size = (static_cast<uint64_t>(fad.nFileSizeHigh) << 32) | static_cast<uint64_t>(fad.nFileSizeLow);
+    out_mtime = (static_cast<uint64_t>(fad.ftLastWriteTime.dwHighDateTime) << 32) | static_cast<uint64_t>(fad.ftLastWriteTime.dwLowDateTime);
+    return true;
+}
+
+bool ensure_directory_recursive_w(const std::wstring& dir)
+{
+    if (dir.empty()) return false;
+    if (directory_exists_w(dir)) return true;
+    std::wstring parent = parent_dir_w(dir);
+    if (!parent.empty() && parent != dir && !directory_exists_w(parent))
+    {
+        if (!ensure_directory_recursive_w(parent)) return false;
+    }
+    if (CreateDirectoryW(dir.c_str(), nullptr)) return true;
+    return GetLastError() == ERROR_ALREADY_EXISTS;
+}
+
+std::wstring frozen_mcp_cache_root_w()
+{
+    std::wstring root = local_appdata_aida_root();
+    if (root.empty()) return {};
+    return join_path_w(join_path_w(join_path_w(root, L"Standalone"), L"camoufox"), L"frozen-mcp-cache");
+}
+
+bool compute_pyinstaller_meipass_dir(const std::wstring& exe, const std::string& sha256_hex, std::wstring& out_dir)
+{
+    out_dir.clear();
+    if (exe.empty() || sha256_hex.size() < 16) return false;
+    const std::wstring cache_root = frozen_mcp_cache_root_w();
+    if (cache_root.empty()) return false;
+    const std::wstring sha_wide = utf8_to_wide(sha256_hex);
+    out_dir = join_path_w(cache_root, sha_wide);
+    if (!ensure_directory_recursive_w(out_dir))
+    {
+        const DWORD gle = GetLastError();
+        diag::log_tagged_fmt("camoufox_install", "compute_pyinstaller_meipass_dir create_failed dir=%s gle=%lu",
+            wide_to_utf8(out_dir).c_str(), gle);
+        return false;
+    }
+    return true;
+}
+
+std::wstring frozen_mcp_contract_cache_path()
+{
+    std::wstring root = local_appdata_aida_root();
+    if (root.empty()) return {};
+    const std::wstring dir = join_path_w(join_path_w(root, L"Standalone"), L"camoufox");
+    ensure_directory_recursive_w(dir);
+    return join_path_w(dir, L"frozen-mcp-contract.json");
+}
+
+std::string json_escape(const std::string& s)
+{
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (char c : s)
+    {
+        switch (c)
+        {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b"; break;
+            case '\f': out += "\\f"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20)
+                {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned>(static_cast<unsigned char>(c)));
+                    out += buf;
+                }
+                else
+                {
+                    out.push_back(c);
+                }
+                break;
+        }
+    }
+    return out;
+}
+
+bool extract_json_string_value(const std::string& json, const std::string& key, std::string& out_value)
+{
+    out_value.clear();
+    const std::string pattern = "\"" + key + "\"";
+    size_t pos = json.find(pattern);
+    if (pos == std::string::npos) return false;
+    pos = json.find(':', pos + pattern.size());
+    if (pos == std::string::npos) return false;
+    ++pos;
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) ++pos;
+    if (pos >= json.size() || json[pos] != '"') return false;
+    ++pos;
+    std::string value;
+    while (pos < json.size())
+    {
+        char c = json[pos++];
+        if (c == '\\' && pos < json.size())
+        {
+            char n = json[pos++];
+            switch (n)
+            {
+                case '"':  value.push_back('"'); break;
+                case '\\': value.push_back('\\'); break;
+                case '/':  value.push_back('/'); break;
+                case 'b':  value.push_back('\b'); break;
+                case 'f':  value.push_back('\f'); break;
+                case 'n':  value.push_back('\n'); break;
+                case 'r':  value.push_back('\r'); break;
+                case 't':  value.push_back('\t'); break;
+                case 'u':
+                    if (pos + 4 <= json.size())
+                    {
+                        const std::string hex = json.substr(pos, 4);
+                        pos += 4;
+                        unsigned u = 0;
+                        if (std::sscanf(hex.c_str(), "%4x", &u) == 1 && u < 0x80)
+                            value.push_back(static_cast<char>(u));
+                    }
+                    break;
+                default:
+                    value.push_back(n);
+                    break;
+            }
+            continue;
+        }
+        if (c == '"') break;
+        value.push_back(c);
+    }
+    out_value = value;
+    return true;
+}
+
+bool extract_json_number_value(const std::string& json, const std::string& key, uint64_t& out_value)
+{
+    out_value = 0;
+    const std::string pattern = "\"" + key + "\"";
+    size_t pos = json.find(pattern);
+    if (pos == std::string::npos) return false;
+    pos = json.find(':', pos + pattern.size());
+    if (pos == std::string::npos) return false;
+    ++pos;
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) ++pos;
+    std::string digits;
+    while (pos < json.size() && (std::isdigit(static_cast<unsigned char>(json[pos])) != 0))
+    {
+        digits.push_back(json[pos++]);
+    }
+    if (digits.empty()) return false;
+    char* end = nullptr;
+    out_value = std::strtoull(digits.c_str(), &end, 10);
+    return end != digits.c_str();
+}
+
+bool load_frozen_mcp_contract_cache(std::string& out_exe_path, std::string& out_sha256, uint64_t& out_size, uint64_t& out_mtime, std::string& out_contract_id, std::string& out_meipass_dir)
+{
+    out_exe_path.clear();
+    out_sha256.clear();
+    out_size = 0;
+    out_mtime = 0;
+    out_contract_id.clear();
+    out_meipass_dir.clear();
+    const std::wstring path = frozen_mcp_contract_cache_path();
+    if (path.empty()) return false;
+    if (!file_exists_w(path)) return false;
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER sz{};
+    if (!GetFileSizeEx(h, &sz) || sz.QuadPart <= 0 || sz.QuadPart > 1024 * 1024)
+    {
+        CloseHandle(h);
+        return false;
+    }
+    std::string body;
+    body.resize(static_cast<size_t>(sz.QuadPart));
+    DWORD read = 0;
+    BOOL rok = ReadFile(h, body.data(), static_cast<DWORD>(body.size()), &read, nullptr);
+    CloseHandle(h);
+    if (!rok || read != body.size()) return false;
+    extract_json_string_value(body, "exe_path", out_exe_path);
+    extract_json_string_value(body, "exe_sha256", out_sha256);
+    extract_json_number_value(body, "exe_file_size", out_size);
+    extract_json_number_value(body, "exe_mtime", out_mtime);
+    extract_json_string_value(body, "contract_id", out_contract_id);
+    extract_json_string_value(body, "meipass_dir", out_meipass_dir);
+    return !out_sha256.empty() && !out_contract_id.empty();
+}
+
+bool save_frozen_mcp_contract_cache(const std::string& exe_path, const std::string& sha256, uint64_t size, uint64_t mtime, const std::string& contract_id, const std::string& meipass_dir)
+{
+    const std::wstring path = frozen_mcp_contract_cache_path();
+    if (path.empty()) return false;
+    const std::wstring tmp_path = path + L".tmp";
+    std::string body;
+    body.reserve(512);
+    body += "{\n";
+    body += "  \"exe_path\": \""    + json_escape(exe_path)   + "\",\n";
+    body += "  \"exe_sha256\": \""  + json_escape(sha256)     + "\",\n";
+    body += "  \"exe_file_size\": " + std::to_string(size)    + ",\n";
+    body += "  \"exe_mtime\": "     + std::to_string(mtime)   + ",\n";
+    body += "  \"contract_id\": \"" + json_escape(contract_id) + "\",\n";
+    body += "  \"meipass_dir\": \"" + json_escape(meipass_dir) + "\"\n";
+    body += "}\n";
+    HANDLE h = CreateFileW(tmp_path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD written = 0;
+    BOOL wok = WriteFile(h, body.data(), static_cast<DWORD>(body.size()), &written, nullptr);
+    FlushFileBuffers(h);
+    CloseHandle(h);
+    if (!wok || written != body.size())
+    {
+        DeleteFileW(tmp_path.c_str());
+        return false;
+    }
+    if (!MoveFileExW(tmp_path.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+    {
+        DeleteFileW(tmp_path.c_str());
+        return false;
+    }
+    return true;
+}
+
 DWORD contract_probe_timeout_ms(DWORD timeout_ms)
 {
     if (timeout_ms == INFINITE) return 30000;
@@ -2021,16 +2395,64 @@ bool validate_contract_probe_output(const std::string& captured, std::string& de
     return false;
 }
 
-bool validate_frozen_reverse_mcp_contract(const std::wstring& exe, DWORD timeout_ms, std::string& detail)
+size_t count_directory_entries_w(const std::wstring& dir)
+{
+    if (dir.empty()) return 0;
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW(join_path_w(dir, L"*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    size_t count = 0;
+    do
+    {
+        const std::wstring name = fd.cFileName;
+        if (name == L"." || name == L"..") continue;
+        ++count;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return count;
+}
+
+bool validate_frozen_reverse_mcp_contract(const std::wstring& exe, DWORD timeout_ms, std::string& detail, std::string& out_sha256, uint64_t& out_size, uint64_t& out_mtime, std::wstring& out_meipass_dir)
 {
     DWORD code = 0;
     std::string captured;
     const DWORD effective_timeout = contract_probe_timeout_ms(timeout_ms);
     const std::string cmd = quote_arg(wide_to_utf8(exe)) + " --aida-contract-check";
     const ULONGLONG start_ms = GetTickCount64();
-    diag::log_tagged_fmt("camoufox_install", "reverse_mcp_contract_probe frozen start exe=%s timeout_ms=%lu",
-        wide_to_utf8(exe).c_str(), static_cast<unsigned long>(effective_timeout));
-    if (!spawn_capture_streaming(cmd, effective_timeout, code, captured))
+
+    out_sha256.clear();
+    out_size = 0;
+    out_mtime = 0;
+    out_meipass_dir.clear();
+    get_file_size_mtime_w(exe, out_size, out_mtime);
+    std::string sha_log;
+    sha256_file_w(exe, out_sha256, sha_log);
+
+    std::map<std::wstring, std::wstring> extra_env;
+    std::wstring meipass_dir;
+    bool meipass_ready = false;
+    if (!out_sha256.empty())
+    {
+        if (compute_pyinstaller_meipass_dir(exe, out_sha256, meipass_dir))
+        {
+            extra_env[L"_MEIPASS2"] = meipass_dir;
+            extra_env[L"PYINSTALLER_RESET_ENVIRONMENT"] = L"0";
+            out_meipass_dir = meipass_dir;
+            meipass_ready = true;
+        }
+    }
+    const size_t meipass_entries_before = count_directory_entries_w(meipass_dir);
+    diag::log_tagged_fmt("camoufox_install", "reverse_mcp_contract_probe meipass dir=%s exists=%d entries=%zu sha256=%s ready=%d",
+        meipass_dir.empty() ? "<empty>" : wide_to_utf8(meipass_dir).c_str(),
+        static_cast<int>(!meipass_dir.empty() && directory_exists_w(meipass_dir)),
+        meipass_entries_before,
+        out_sha256.empty() ? "<none>" : out_sha256.c_str(),
+        meipass_ready ? 1 : 0);
+
+    diag::log_tagged_fmt("camoufox_install", "reverse_mcp_contract_probe frozen start exe=%s timeout_ms=%lu env_overrides=%zu",
+        wide_to_utf8(exe).c_str(), static_cast<unsigned long>(effective_timeout), extra_env.size());
+    ULONGLONG create_elapsed_ms = 0;
+    if (!spawn_capture_streaming_env(cmd, effective_timeout, extra_env, code, captured, &create_elapsed_ms))
     {
         detail = "frozen contract probe spawn/timeout failed: " + compact_log_tail(captured, 1000);
         diag::log_tagged_fmt("camoufox_install", "reverse_mcp_contract_probe frozen spawn_failed exe=%s elapsed_ms=%llu detail=%.800s",
@@ -2039,6 +2461,16 @@ bool validate_frozen_reverse_mcp_contract(const std::wstring& exe, DWORD timeout
             detail.c_str());
         return false;
     }
+    const ULONGLONG total_elapsed = GetTickCount64() - start_ms;
+    const ULONGLONG probe_run_ms = total_elapsed >= create_elapsed_ms ? total_elapsed - create_elapsed_ms : 0;
+    const size_t meipass_entries_after = count_directory_entries_w(meipass_dir);
+    diag::log_tagged_fmt("camoufox_install", "reverse_mcp_contract_probe timing exe=%s bootloader_extract_ms=%llu probe_run_ms=%llu total_ms=%llu meipass_entries_before=%zu meipass_entries_after=%zu",
+        wide_to_utf8(exe).c_str(),
+        static_cast<unsigned long long>(create_elapsed_ms),
+        static_cast<unsigned long long>(probe_run_ms),
+        static_cast<unsigned long long>(total_elapsed),
+        meipass_entries_before,
+        meipass_entries_after);
     if (code != 0)
     {
         detail = "frozen contract probe exit=" + std::to_string(code) + " tail=" + compact_log_tail(captured, 1000);
@@ -2057,11 +2489,22 @@ bool validate_frozen_reverse_mcp_contract(const std::wstring& exe, DWORD timeout
             detail.c_str());
         return false;
     }
-    diag::log_tagged_fmt("camoufox_install", "reverse_mcp_contract_probe frozen ok exe=%s elapsed_ms=%llu detail=%.400s",
+    diag::log_tagged_fmt("camoufox_install", "reverse_mcp_contract_probe frozen ok exe=%s elapsed_ms=%llu meipass_dir=%s meipass_entries=%zu detail=%.400s",
         wide_to_utf8(exe).c_str(),
         static_cast<unsigned long long>(GetTickCount64() - start_ms),
+        meipass_dir.empty() ? "<empty>" : wide_to_utf8(meipass_dir).c_str(),
+        meipass_entries_after,
         detail.c_str());
     return true;
+}
+
+bool validate_frozen_reverse_mcp_contract(const std::wstring& exe, DWORD timeout_ms, std::string& detail)
+{
+    std::string sha256;
+    uint64_t size = 0;
+    uint64_t mtime = 0;
+    std::wstring meipass_dir;
+    return validate_frozen_reverse_mcp_contract(exe, timeout_ms, detail, sha256, size, mtime, meipass_dir);
 }
 
 bool validate_python_reverse_mcp_contract(const std::string& python, DWORD timeout_ms, std::string& detail)
@@ -2445,7 +2888,107 @@ status_t probe_impl(bool allow_when_busy, DWORD timeout_ms)
     if (discover_reverse_mcp_executable(reverse_mcp_exe))
     {
         std::string contract_detail;
-        if (!validate_frozen_reverse_mcp_contract(reverse_mcp_exe, timeout_ms, contract_detail))
+        const std::string exe_utf8 = wide_to_utf8(reverse_mcp_exe);
+        const bool force_recheck = env_flag_enabled(L"AIDA_CAMOUFOX_FORCE_PROBE");
+        const ULONGLONG cache_lookup_start_ms = GetTickCount64();
+        std::string cached_exe_path;
+        std::string cached_sha256;
+        uint64_t    cached_size = 0;
+        uint64_t    cached_mtime = 0;
+        std::string cached_contract_id;
+        std::string cached_meipass_dir;
+        const bool cache_loaded = !force_recheck && load_frozen_mcp_contract_cache(cached_exe_path, cached_sha256, cached_size, cached_mtime, cached_contract_id, cached_meipass_dir);
+        uint64_t live_size = 0;
+        uint64_t live_mtime = 0;
+        get_file_size_mtime_w(reverse_mcp_exe, live_size, live_mtime);
+        std::string live_sha256_for_compare;
+        bool cache_hit = false;
+        std::string cache_miss_reason;
+        if (force_recheck)
+        {
+            cache_miss_reason = "force_recheck_env";
+        }
+        else if (!cache_loaded)
+        {
+            cache_miss_reason = "missing_or_unreadable";
+        }
+        else if (cached_contract_id != kReverseMcpInitiatorContractV2)
+        {
+            cache_miss_reason = "stale_contract_id";
+        }
+        else if (cached_exe_path != exe_utf8)
+        {
+            cache_miss_reason = "exe_path_changed";
+        }
+        else if (cached_size != live_size || cached_mtime != live_mtime)
+        {
+            cache_miss_reason = "size_or_mtime_changed";
+        }
+        else
+        {
+            std::string sha_log;
+            if (!sha256_file_w(reverse_mcp_exe, live_sha256_for_compare, sha_log) || live_sha256_for_compare != cached_sha256)
+            {
+                cache_miss_reason = "sha256_mismatch";
+            }
+            else
+            {
+                cache_hit = true;
+            }
+        }
+        diag::log_tagged_fmt("camoufox_install", "contract_cache load path=%s ok=%d sha256=%s contract_id=%s meipass_dir=%s elapsed_ms=%llu",
+            wide_to_utf8(frozen_mcp_contract_cache_path()).c_str(),
+            cache_loaded ? 1 : 0,
+            cached_sha256.empty() ? "<none>" : cached_sha256.c_str(),
+            cached_contract_id.empty() ? "<none>" : cached_contract_id.c_str(),
+            cached_meipass_dir.empty() ? "<none>" : cached_meipass_dir.c_str(),
+            static_cast<unsigned long long>(GetTickCount64() - cache_lookup_start_ms));
+        if (cache_hit)
+        {
+            std::wstring restored_meipass = utf8_to_wide(cached_meipass_dir);
+            if (!restored_meipass.empty() && !directory_exists_w(restored_meipass))
+                ensure_directory_recursive_w(restored_meipass);
+            const bool meipass_present = !restored_meipass.empty() && directory_exists_w(restored_meipass);
+            diag::log_tagged_fmt("camoufox_install", "contract_cache hit exe=%s sha256=%s contract_id=%s reused=1 meipass_dir=%s meipass_present=%d",
+                exe_utf8.c_str(),
+                cached_sha256.c_str(),
+                cached_contract_id.c_str(),
+                cached_meipass_dir.empty() ? "<empty>" : cached_meipass_dir.c_str(),
+                meipass_present ? 1 : 0);
+            diag::log_tagged_fmt("camoufox_install", "reverse_mcp_contract_probe persistent_cache_hit exe=%s sha256=%s contract_id=%s elapsed_ms=%llu",
+                exe_utf8.c_str(),
+                cached_sha256.c_str(),
+                cached_contract_id.c_str(),
+                static_cast<unsigned long long>(GetTickCount64() - probe_start_ms));
+            {
+                std::lock_guard<std::mutex> lk(sg().mtx);
+                sg().resolved_reverse_mcp_sha256 = cached_sha256;
+                sg().resolved_reverse_mcp_size = cached_size;
+                sg().resolved_reverse_mcp_mtime = cached_mtime;
+                sg().resolved_reverse_mcp_meipass_dir = restored_meipass;
+            }
+        }
+        else
+        {
+            diag::log_tagged_fmt("camoufox_install", "contract_cache miss exe=%s reason=%s persisted_sha256=%s live_sha256=%s persisted_size=%llu live_size=%llu persisted_mtime=%llu live_mtime=%llu",
+                exe_utf8.c_str(),
+                cache_miss_reason.c_str(),
+                cached_sha256.empty() ? "<none>" : cached_sha256.c_str(),
+                live_sha256_for_compare.empty() ? "<none>" : live_sha256_for_compare.c_str(),
+                static_cast<unsigned long long>(cached_size),
+                static_cast<unsigned long long>(live_size),
+                static_cast<unsigned long long>(cached_mtime),
+                static_cast<unsigned long long>(live_mtime));
+        }
+
+        std::string live_sha256;
+        uint64_t    live_size_v = 0;
+        uint64_t    live_mtime_v = 0;
+        std::wstring live_meipass;
+        bool contract_ok = cache_hit;
+        if (!cache_hit)
+            contract_ok = validate_frozen_reverse_mcp_contract(reverse_mcp_exe, timeout_ms, contract_detail, live_sha256, live_size_v, live_mtime_v, live_meipass);
+        if (!contract_ok)
         {
             std::lock_guard<std::mutex> lk(sg().mtx);
             sg().status.python_path.clear();
@@ -2459,6 +3002,24 @@ status_t probe_impl(bool allow_when_busy, DWORD timeout_ms)
                 static_cast<unsigned long long>(GetTickCount64() - probe_start_ms),
                 contract_detail.c_str());
             return sg().status;
+        }
+        if (!cache_hit && !live_sha256.empty() && live_size_v > 0)
+        {
+            const std::string meipass_dir_utf8 = wide_to_utf8(live_meipass);
+            const ULONGLONG save_start_ms = GetTickCount64();
+            const bool saved = save_frozen_mcp_contract_cache(exe_utf8, live_sha256, live_size_v, live_mtime_v, kReverseMcpInitiatorContractV2, meipass_dir_utf8);
+            diag::log_tagged_fmt("camoufox_install", "contract_cache save path=%s ok=%d sha256=%s contract_id=%s meipass_dir=%s elapsed_ms=%llu",
+                wide_to_utf8(frozen_mcp_contract_cache_path()).c_str(),
+                saved ? 1 : 0,
+                live_sha256.c_str(),
+                kReverseMcpInitiatorContractV2,
+                meipass_dir_utf8.empty() ? "<empty>" : meipass_dir_utf8.c_str(),
+                static_cast<unsigned long long>(GetTickCount64() - save_start_ms));
+            std::lock_guard<std::mutex> lk(sg().mtx);
+            sg().resolved_reverse_mcp_sha256 = live_sha256;
+            sg().resolved_reverse_mcp_size = live_size_v;
+            sg().resolved_reverse_mcp_mtime = live_mtime_v;
+            sg().resolved_reverse_mcp_meipass_dir = live_meipass;
         }
         {
             std::lock_guard<std::mutex> lk(sg().mtx);

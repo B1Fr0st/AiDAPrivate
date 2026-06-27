@@ -33,6 +33,7 @@
 #include "headless_view.hpp"
 
 #include "../../../helpers/diag_log.hpp"
+#include "../../infra/work_queue.hpp"
 
 #include <atomic>
 #include <exception>
@@ -126,7 +127,15 @@ bool initialize()
         run_init_phase("tech", []() { (void)tech::initialize(); });
         run_init_phase("upstream", []() { (void)upstream::initialize(); });
 
-        run_init_phase("camoufox_install", []() { (void)camoufox::install::initialize(); });
+        run_init_phase("camoufox_install", []() {
+            const bool posted = work_queue::post([]() {
+                (void)camoufox::install::initialize();
+            });
+            diag::log_tagged_fmt("burp_module", "camoufox_install async_offload posted=%d", posted ? 1 : 0);
+            if (!posted) {
+                (void)camoufox::install::initialize();
+            }
+        });
         run_init_phase("headless_view", []() { (void)headless_view::initialize(); });
 
         diag::log_tagged("burp_module", "initialized");

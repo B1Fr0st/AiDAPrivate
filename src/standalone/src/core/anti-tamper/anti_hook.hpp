@@ -412,27 +412,27 @@ namespace detail {
             owner_ok &&
             owner_system;
 
-        char wrapper_diag[1024] = {};
-        _snprintf_s(wrapper_diag, sizeof(wrapper_diag), _TRUNCATE,
-            "prologue_mismatch_system_wrapper func=%s ok=%d va=0x%llX vq=%llu protect=0x%lX state=0x%lX type=0x%lX type_name=%s mem_writable=%d mem_redirect=%d owner_ok=%d owner=0x%llX owner_system=%d owner_path=%s",
-            name,
-            ok ? 1 : 0,
-            static_cast<unsigned long long>(reinterpret_cast<uint64_t>(addr)),
-            static_cast<unsigned long long>(vq),
-            vq ? static_cast<unsigned long>(mbi.Protect) : 0ul,
-            vq ? static_cast<unsigned long>(mbi.State) : 0ul,
-            vq ? static_cast<unsigned long>(mbi.Type) : 0ul,
-            vq ? anti_tamper::syscall::detail::memory_type_name(mbi.Type) : "none",
-            mem_writable ? 1 : 0,
-            mem_redirect ? 1 : 0,
-            owner_ok ? 1 : 0,
-            static_cast<unsigned long long>(reinterpret_cast<uint64_t>(owner_mod)),
-            owner_system ? 1 : 0,
-            owner_path[0] ? owner_path : "<none>");
-        if (ok)
-            webhook::write_log("prologue_hash", wrapper_diag);
-        else
+        if (!ok)
+        {
+            char wrapper_diag[1024] = {};
+            _snprintf_s(wrapper_diag, sizeof(wrapper_diag), _TRUNCATE,
+                "prologue_mismatch_system_wrapper func=%s ok=%d va=0x%llX vq=%llu protect=0x%lX state=0x%lX type=0x%lX type_name=%s mem_writable=%d mem_redirect=%d owner_ok=%d owner=0x%llX owner_system=%d owner_path=%s",
+                name,
+                ok ? 1 : 0,
+                static_cast<unsigned long long>(reinterpret_cast<uint64_t>(addr)),
+                static_cast<unsigned long long>(vq),
+                vq ? static_cast<unsigned long>(mbi.Protect) : 0ul,
+                vq ? static_cast<unsigned long>(mbi.State) : 0ul,
+                vq ? static_cast<unsigned long>(mbi.Type) : 0ul,
+                vq ? anti_tamper::syscall::detail::memory_type_name(mbi.Type) : "none",
+                mem_writable ? 1 : 0,
+                mem_redirect ? 1 : 0,
+                owner_ok ? 1 : 0,
+                static_cast<unsigned long long>(reinterpret_cast<uint64_t>(owner_mod)),
+                owner_system ? 1 : 0,
+                owner_path[0] ? owner_path : "<none>");
             webhook::write_log_critical("prologue_hash", wrapper_diag);
+        }
 
         return ok;
     }

@@ -163,37 +163,6 @@ namespace sentinel_bridge {
     inline UINT8 g_challenge_hmac_key[kernel_crypto::SHA256_DIGEST_SIZE] = {};
     inline volatile LONG g_challenge_keys_valid = 0;
     inline volatile LONG64 g_last_seen_challenge_counter = 0;
-    constexpr LONGLONG BRIDGE_TICK_LOG_INTERVAL_100NS = 10LL * 1000LL * 10000LL;
-    inline volatile LONG64 g_tick_log_last_time = 0;
-    inline volatile LONG g_tick_log_emitted = 0;
-    inline volatile LONG g_tick_log_suppressed = 0;
-
-    __forceinline BOOLEAN should_log_tick(LONG64 now, ULONG* suppressed_out)
-    {
-        if (suppressed_out)
-            *suppressed_out = 0;
-
-        LONG emitted = _InterlockedIncrement(&g_tick_log_emitted);
-        if (emitted <= 4) {
-            LONG suppressed = _InterlockedExchange(&g_tick_log_suppressed, 0);
-            if (suppressed_out && suppressed > 0)
-                *suppressed_out = static_cast<ULONG>(suppressed);
-            return TRUE;
-        }
-
-        LONG64 previous = _InterlockedCompareExchange64(&g_tick_log_last_time, 0, 0);
-        if (previous == 0 || now - previous >= BRIDGE_TICK_LOG_INTERVAL_100NS) {
-            if (_InterlockedCompareExchange64(&g_tick_log_last_time, now, previous) == previous) {
-                LONG suppressed = _InterlockedExchange(&g_tick_log_suppressed, 0);
-                if (suppressed_out && suppressed > 0)
-                    *suppressed_out = static_cast<ULONG>(suppressed);
-                return TRUE;
-            }
-        }
-
-        _InterlockedIncrement(&g_tick_log_suppressed);
-        return FALSE;
-    }
 
     __forceinline void log_watchdog_bugcheck_intent(const char* path,
                                                     ULONG code,
@@ -567,14 +536,10 @@ namespace sentinel_bridge {
 
         rotate_bridge_nonce();
 
-        LARGE_INTEGER now;
-        KeQuerySystemTime(&now);
-        ULONG suppressed = 0;
-        if (challenge_response_written || challenge_decrypt_failed || should_log_tick(now.QuadPart, &suppressed)) {
-            WW_LOG("tick: wrote whoswho_tsc=%lld sentinel_tsc=%lld suppressed=%lu challenge=%u candidate=%u response=%u decrypt_failed=%u counter=%llu last_seen=%llu bridge=%p keys_valid=%ld hmac_valid=%u",
+        if (challenge_response_written || challenge_decrypt_failed) {
+            WW_LOG("tick: challenge whoswho_tsc=%lld sentinel_tsc=%lld challenge=%u candidate=%u response=%u decrypt_failed=%u counter=%llu last_seen=%llu bridge=%p keys_valid=%ld hmac_valid=%u",
                 tsc,
                 g_bridge.sentinel_tsc,
-                suppressed,
                 challenge_seen ? 1u : 0u,
                 challenge_candidate ? 1u : 0u,
                 challenge_response_written ? 1u : 0u,
@@ -607,9 +572,6 @@ namespace sentinel_bridge {
         LONG64 start    = _InterlockedCompareExchange64(&g_watchdog_start_qpc, 0, 0);
         LONG64 elapsed  = now_tsc - start;
 
-        WW_LOG("watchdog_dpc: now_tsc=%lld start=%lld elapsed=%lld grace_tsc=%lld",
-            now_tsc, start, elapsed, GRACE_TSC);
-
         if (elapsed < GRACE_TSC) {
             ULONG queued_raw_cmd = static_cast<ULONG>(_InterlockedCompareExchange(
                 reinterpret_cast<volatile LONG*>(&g_bridge.sentinel_cmd), 0, 0));
@@ -626,8 +588,6 @@ namespace sentinel_bridge {
                     queued_param,
                     static_cast<unsigned long long>(g_bridge_crypt_key));
             }
-            WW_LOG("watchdog_dpc: still in grace period (%lld < %lld), skipping",
-                elapsed, GRACE_TSC);
             return;
         }
 
@@ -637,14 +597,9 @@ namespace sentinel_bridge {
         LONG64 last = _InterlockedCompareExchange64(
             &g_last_seen_sentinel_tsc, 0, 0);
 
-        WW_LOG("watchdog_dpc: sentinel_tsc=%lld last_seen=%lld bridge_addr=%p",
-            current_sentinel_tsc, last, &g_bridge);
-
         if (current_sentinel_tsc != last) {
             _InterlockedExchange64(&g_last_seen_sentinel_tsc, current_sentinel_tsc);
             _InterlockedExchange(&g_stale_streak, 0);
-            WW_LOG("watchdog_dpc: Sentinel ALIVE, tsc changed from %lld to %lld",
-                last, current_sentinel_tsc);
 
             ULONG raw_cmd = _InterlockedExchange((volatile LONG*)&g_bridge.sentinel_cmd, BRIDGE_CMD_NONE);
             ULONG raw_param = _InterlockedExchange((volatile LONG*)&g_bridge.sentinel_cmd_param, 0);

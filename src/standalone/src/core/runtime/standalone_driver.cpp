@@ -7066,6 +7066,67 @@ namespace driver_bridge
         return query_memory(address, region);
     }
 
+    bool protect_memory_for_bounded(uint32_t pid, uint64_t address, uint64_t size,
+                                    uint32_t new_protect, uint32_t* old_protect,
+                                    uint32_t deadline_ms)
+    {
+        const ULONGLONG t0 = GetTickCount64();
+        driver_bridge_pid_call::pid_scope_t scope;
+        if (!driver_bridge_pid_call::enter(scope, pid)) {
+            diag::log_tagged_fmt("driver_bridge",
+                "protect_memory_for_bounded_enter_failed pid=%u active_pid=%u addr=0x%llX size=0x%llX new=0x%08X deadline_ms=%u status=%s last_error=%s gle=%lu elapsed_ms=%llu",
+                pid,
+                attached_pid(),
+                static_cast<unsigned long long>(address),
+                static_cast<unsigned long long>(size),
+                static_cast<unsigned int>(new_protect),
+                deadline_ms,
+                status().c_str(),
+                last_error().empty() ? "<empty>" : last_error().c_str(),
+                static_cast<unsigned long>(GetLastError()),
+                static_cast<unsigned long long>(GetTickCount64() - t0));
+            return false;
+        }
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            diag::log_tagged_fmt("driver_bridge",
+                "protect_memory_for_bounded_no_kernel pid=%u deadline_ms=%u", pid, deadline_ms);
+            return false;
+        }
+        const uint64_t dtb_entry = device->get_dtb();
+        diag::log_tagged_fmt("driver_bridge",
+            "protect_memory_for_about_to_call pid=%u addr=0x%llX size=0x%llX new=0x%08X deadline_ms=%u diag_id=%s dtb=0x%llX",
+            pid,
+            static_cast<unsigned long long>(address),
+            static_cast<unsigned long long>(size),
+            static_cast<unsigned int>(new_protect),
+            deadline_ms,
+            driver_bridge::current_remote_call_diag_id(),
+            static_cast<unsigned long long>(dtb_entry));
+        uint32_t local_old = 0;
+        bool ok = device->protect_memory_bounded(address, size, new_protect,
+            old_protect ? old_protect : &local_old, deadline_ms);
+        DWORD post_err = ok ? ERROR_SUCCESS : GetLastError();
+        diag::log_tagged_fmt("driver_bridge",
+            "protect_memory_for_bounded_post pid=%u active_pid=%u tid=%lu addr=0x%llX size=0x%llX new=0x%08X old=0x%08X ok=%d gle=%lu deadline_ms=%u elapsed_ms=%llu",
+            pid,
+            attached_pid(),
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            static_cast<unsigned long long>(address),
+            static_cast<unsigned long long>(size),
+            static_cast<unsigned int>(new_protect),
+            static_cast<unsigned int>(old_protect ? *old_protect : local_old),
+            ok ? 1 : 0,
+            static_cast<unsigned long>(post_err),
+            deadline_ms,
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+        return ok;
+    }
+
     bool protect_memory_for(uint32_t pid, uint64_t address, uint64_t size,
                             uint32_t new_protect, uint32_t* old_protect)
     {
@@ -8271,6 +8332,63 @@ namespace driver_bridge
             result.push_back(std::move(pkt));
         }
         return result;
+    }
+
+    std::vector<captured_packet_t> get_captured_packets_bounded(uint32_t max_packets, uint32_t deadline_ms)
+    {
+        const ULONGLONG t0 = GetTickCount64();
+        std::vector<captured_packet_t> result;
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            diag::log_tagged_fmt("driver_bridge_net",
+                "get_captured_packets_bounded SKIP kernel_mode=0 max=%u deadline_ms=%u",
+                max_packets, deadline_ms);
+            return result;
+        }
+        auto raw = device->get_captured_packets_bounded(max_packets, deadline_ms);
+        diag::log_tagged_fmt("driver_bridge_net",
+            "get_captured_packets_bounded EXIT max=%u deadline_ms=%u raw=%zu kernel_mode=1 elapsed_ms=%llu",
+            max_packets,
+            deadline_ms,
+            raw.size(),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+        result.reserve(raw.size());
+        for (auto& src : raw) {
+            captured_packet_t pkt;
+            pkt.timestamp      = src.timestamp;
+            pkt.pid            = src.pid;
+            pkt.protocol       = src.protocol;
+            pkt.direction      = src.direction;
+            pkt.payload_size   = src.payload_size;
+            pkt.local_port     = src.local_port;
+            pkt.remote_port    = src.remote_port;
+            pkt.address_family = src.address_family;
+            std::memcpy(pkt.local_addr,  src.local_addr,  sizeof(pkt.local_addr));
+            std::memcpy(pkt.remote_addr, src.remote_addr, sizeof(pkt.remote_addr));
+            pkt.payload = std::move(src.payload);
+            result.push_back(std::move(pkt));
+        }
+        return result;
+    }
+
+    void cancel_inflight_capture()
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            diag::log_tagged_fmt("driver_bridge_net",
+                "cancel_inflight_capture SKIP kernel_mode=0");
+            return;
+        }
+        device->cancel_inflight_capture();
+        diag::log_tagged_fmt("driver_bridge_net", "cancel_inflight_capture dispatched");
     }
 
 
@@ -9483,14 +9601,11 @@ namespace driver_bridge
             std::lock_guard<std::mutex> lk(g_state_mtx);
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
-        driver_critical_fmt("kernel_anti_debug_query_pre kernel=%d pid=%lu tid=%lu tick=%llu",
-            kernel_mode ? 1 : 0,
-            GetCurrentProcessId(),
-            GetCurrentThreadId(),
-            static_cast<unsigned long long>(started));
         if (!kernel_mode) {
-            driver_critical_fmt("kernel_anti_debug_query_post ok=0 err=%lu reason=no_kernel elapsed_ms=%llu",
+            driver_critical_fmt("kernel_anti_debug_query_post ok=0 err=%lu reason=no_kernel pid=%lu tid=%lu elapsed_ms=%llu",
                 static_cast<unsigned long>(GetLastError()),
+                GetCurrentProcessId(),
+                GetCurrentThreadId(),
                 static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
             return false;
         }
@@ -9509,11 +9624,14 @@ namespace driver_bridge
         out.result_flags = raw.result_flags;
         out.detected_debugger_pid = raw.detected_debugger_pid;
         out.dr_clear_count = raw.dr_clear_count;
-        driver_critical_fmt("kernel_anti_debug_query_post ok=1 flags=0x%08X debugger_pid=%llu dr_clear=%llu elapsed_ms=%llu",
-            out.result_flags,
-            static_cast<unsigned long long>(out.detected_debugger_pid),
-            static_cast<unsigned long long>(out.dr_clear_count),
-            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
+        const uint64_t elapsed = static_cast<uint64_t>(GetTickCount64()) - started;
+        if (out.result_flags != 0 || out.detected_debugger_pid != 0 || elapsed >= 250) {
+            driver_critical_fmt("kernel_anti_debug_query_post ok=1 flags=0x%08X debugger_pid=%llu dr_clear=%llu elapsed_ms=%llu",
+                out.result_flags,
+                static_cast<unsigned long long>(out.detected_debugger_pid),
+                static_cast<unsigned long long>(out.dr_clear_count),
+                static_cast<unsigned long long>(elapsed));
+        }
         return true;
     }
 
@@ -9525,15 +9643,11 @@ namespace driver_bridge
             std::lock_guard<std::mutex> lk(g_state_mtx);
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
-        driver_critical_fmt("kernel_anti_debug_clear_dr_pre kernel=%d pid=%lu tid=%lu out=%d tick=%llu",
-            kernel_mode ? 1 : 0,
-            GetCurrentProcessId(),
-            GetCurrentThreadId(),
-            out_clear_count ? 1 : 0,
-            static_cast<unsigned long long>(started));
         if (!kernel_mode) {
-            driver_critical_fmt("kernel_anti_debug_clear_dr_post ok=0 err=%lu reason=no_kernel elapsed_ms=%llu",
+            driver_critical_fmt("kernel_anti_debug_clear_dr_post ok=0 err=%lu reason=no_kernel pid=%lu tid=%lu elapsed_ms=%llu",
                 static_cast<unsigned long>(GetLastError()),
+                GetCurrentProcessId(),
+                GetCurrentThreadId(),
                 static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
             return false;
         }
@@ -9541,11 +9655,15 @@ namespace driver_bridge
         SetLastError(ERROR_SUCCESS);
         bool ok = device->kernel_anti_debug_clear_dr(out_clear_count);
         DWORD err = ok ? ERROR_SUCCESS : GetLastError();
-        driver_critical_fmt("kernel_anti_debug_clear_dr_post ok=%d err=%lu clear_count=%llu elapsed_ms=%llu",
-            ok ? 1 : 0,
-            static_cast<unsigned long>(err),
-            static_cast<unsigned long long>(out_clear_count ? *out_clear_count : 0),
-            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
+        const uint64_t elapsed = static_cast<uint64_t>(GetTickCount64()) - started;
+        const uint64_t clear_count = out_clear_count ? *out_clear_count : 0;
+        if (!ok || clear_count != 0 || elapsed >= 250) {
+            driver_critical_fmt("kernel_anti_debug_clear_dr_post ok=%d err=%lu clear_count=%llu elapsed_ms=%llu",
+                ok ? 1 : 0,
+                static_cast<unsigned long>(err),
+                static_cast<unsigned long long>(clear_count),
+                static_cast<unsigned long long>(elapsed));
+        }
         if (!ok) SetLastError(err);
         return ok;
     }
@@ -9553,21 +9671,17 @@ namespace driver_bridge
     bool kernel_anti_debug_clear_process_dr(uint32_t pid, uint64_t* out_clear_count)
     {
         const uint64_t started = static_cast<uint64_t>(GetTickCount64());
-        driver_critical_fmt("kernel_anti_debug_clear_process_dr_pre pid=%u caller_pid=%lu tid=%lu out=%d tick=%llu",
-            pid,
-            GetCurrentProcessId(),
-            GetCurrentThreadId(),
-            out_clear_count ? 1 : 0,
-            static_cast<unsigned long long>(started));
-
         bool kernel_mode = false;
         {
             std::lock_guard<std::mutex> lk(g_state_mtx);
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            driver_critical_fmt("kernel_anti_debug_clear_process_dr_post ok=0 err=%lu reason=no_kernel elapsed_ms=%llu",
+            driver_critical_fmt("kernel_anti_debug_clear_process_dr_post ok=0 err=%lu reason=no_kernel pid=%u caller_pid=%lu tid=%lu elapsed_ms=%llu",
                 static_cast<unsigned long>(GetLastError()),
+                pid,
+                GetCurrentProcessId(),
+                GetCurrentThreadId(),
                 static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
             return false;
         }
@@ -9575,11 +9689,16 @@ namespace driver_bridge
         SetLastError(ERROR_SUCCESS);
         bool ok = device->kernel_anti_debug_clear_process_dr(pid, out_clear_count);
         DWORD err = ok ? ERROR_SUCCESS : GetLastError();
-        driver_critical_fmt("kernel_anti_debug_clear_process_dr_post ok=%d err=%lu clear_count=%llu elapsed_ms=%llu",
-            ok ? 1 : 0,
-            static_cast<unsigned long>(err),
-            static_cast<unsigned long long>(out_clear_count ? *out_clear_count : 0),
-            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
+        const uint64_t elapsed = static_cast<uint64_t>(GetTickCount64()) - started;
+        const uint64_t clear_count = out_clear_count ? *out_clear_count : 0;
+        if (!ok || clear_count != 0 || elapsed >= 250) {
+            driver_critical_fmt("kernel_anti_debug_clear_process_dr_post ok=%d err=%lu clear_count=%llu pid=%u elapsed_ms=%llu",
+                ok ? 1 : 0,
+                static_cast<unsigned long>(err),
+                static_cast<unsigned long long>(clear_count),
+                pid,
+                static_cast<unsigned long long>(elapsed));
+        }
         if (!ok) SetLastError(err);
         return ok;
     }
@@ -9592,15 +9711,11 @@ namespace driver_bridge
             std::lock_guard<std::mutex> lk(g_state_mtx);
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
-        driver_critical_fmt("kernel_anti_debug_scan_debuggers_pre kernel=%d pid=%lu tid=%lu out=%d tick=%llu",
-            kernel_mode ? 1 : 0,
-            GetCurrentProcessId(),
-            GetCurrentThreadId(),
-            out_debugger_pid ? 1 : 0,
-            static_cast<unsigned long long>(started));
         if (!kernel_mode) {
-            driver_critical_fmt("kernel_anti_debug_scan_debuggers_post ok=0 err=%lu reason=no_kernel elapsed_ms=%llu",
+            driver_critical_fmt("kernel_anti_debug_scan_debuggers_post ok=0 err=%lu reason=no_kernel pid=%lu tid=%lu elapsed_ms=%llu",
                 static_cast<unsigned long>(GetLastError()),
+                GetCurrentProcessId(),
+                GetCurrentThreadId(),
                 static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
             return false;
         }
@@ -9615,11 +9730,15 @@ namespace driver_bridge
                 static_cast<unsigned long>(err));
             SetLastError(err);
         }
-        driver_critical_fmt("kernel_anti_debug_scan_debuggers_post ok=%d err=%lu debugger_pid=%llu elapsed_ms=%llu",
-            ok ? 1 : 0,
-            static_cast<unsigned long>(err),
-            static_cast<unsigned long long>(out_debugger_pid ? *out_debugger_pid : 0),
-            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
+        const uint64_t elapsed = static_cast<uint64_t>(GetTickCount64()) - started;
+        const uint64_t debugger_pid = out_debugger_pid ? *out_debugger_pid : 0;
+        if (!ok || debugger_pid != 0 || elapsed >= 250) {
+            driver_critical_fmt("kernel_anti_debug_scan_debuggers_post ok=%d err=%lu debugger_pid=%llu elapsed_ms=%llu",
+                ok ? 1 : 0,
+                static_cast<unsigned long>(err),
+                static_cast<unsigned long long>(debugger_pid),
+                static_cast<unsigned long long>(elapsed));
+        }
         if (!ok) SetLastError(err);
         return ok;
     }

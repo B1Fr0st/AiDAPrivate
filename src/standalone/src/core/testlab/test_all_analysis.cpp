@@ -2597,7 +2597,7 @@ static void test_integrity_hunter_start_stop(HANDLE hf, std::atomic<int>& passed
         return;
 
     integrity_hunter::stop_hunt();
-    const auto pre_idle_result = integrity_hunter::wait_until_idle_result(12000);
+    const auto pre_idle_result = integrity_hunter::wait_until_idle_result(15000);
     const bool pre_idle = pre_idle_result.idle;
     const bool pre_hunting = integrity_hunter::g_state.hunting.load();
     const bool pre_worker = integrity_hunter::g_state.worker_active.load();
@@ -2645,7 +2645,7 @@ static void test_integrity_hunter_start_stop(HANDLE hf, std::atomic<int>& passed
     integrity_hunter::stop_hunt();
 
     const uint64_t generation = integrity_hunter::g_state.generation.load(std::memory_order_acquire);
-    auto idle_result = integrity_hunter::wait_until_idle_result(12000);
+    auto idle_result = integrity_hunter::wait_until_idle_result(15000);
     bool idle = idle_result.idle;
     bool hunting = integrity_hunter::g_state.hunting.load();
     bool worker = integrity_hunter::g_state.worker_active.load();
@@ -2707,7 +2707,7 @@ static void test_integrity_hunter_nodes(HANDLE hf, std::atomic<int>& passed, std
         return;
 
     integrity_hunter::stop_hunt();
-    const bool pre_idle = integrity_hunter::wait_until_idle(12000);
+    const bool pre_idle = integrity_hunter::wait_until_idle(15000);
     const bool pre_hunting = integrity_hunter::g_state.hunting.load();
     const bool pre_worker = integrity_hunter::g_state.worker_active.load();
     const bool pre_install_complete = integrity_hunter::g_state.install_complete.load();

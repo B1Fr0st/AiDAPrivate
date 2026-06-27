@@ -10,6 +10,12 @@
 #include "../mcp/mcp_standalone.hpp"
 #include "../../helpers/diag_log.hpp"
 
+namespace driver_bridge {
+bool protect_memory_for_bounded(uint32_t pid, uint64_t address, uint64_t size,
+                                uint32_t new_protect, uint32_t* old_protect,
+                                uint32_t deadline_ms);
+}
+
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -2390,9 +2396,23 @@ public:
             veh_call_last_error.c_str());
 
         uint32_t old_prot = 0;
+        if (const char* reason = check_install_cancelled("before_target_guard_protect")) {
+            uint64_t removed = remove_vectored_exception_handler_remote(pid,
+                                                                         ntdll_mod_install.base,
+                                                                         rtl_remove_fn,
+                                                                         veh_handle,
+                                                                         "install_cancel_before_target_guard_protect",
+                                                                         install_start);
+            if (removed == 0)
+                diag::log_tagged_fmt("pg_sniff", "veh_remove_failed pid=%u handle=0x%llX phase=before_target_guard_protect",
+                    pid, static_cast<unsigned long long>(veh_handle));
+            driver_bridge::free_memory_for(pid, sc_addr);
+            driver_bridge::free_memory_for(pid, ring_addr);
+            return fail_install(reason, "page-guard install cancelled before PAGE_GUARD protection", &mri, target_addr, region_size, 0);
+        }
         log_install_phase("target_guard_protect_begin");
-        if (!driver_bridge::protect_memory_for(pid, target_addr, region_size,
-                                               orig_protect | PAGE_GUARD, &old_prot)) {
+        if (!driver_bridge::protect_memory_for_bounded(pid, target_addr, region_size,
+                                                       orig_protect | PAGE_GUARD, &old_prot, 5000)) {
             diag::log_tagged_fmt("pg_sniff", "install_failed reason=target_guard_protect pid=%u target=0x%llX size=0x%llX orig=0x%08X last_error=%s",
                 pid,
                 static_cast<unsigned long long>(target_addr),

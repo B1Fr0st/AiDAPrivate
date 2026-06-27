@@ -498,8 +498,6 @@ namespace heartbeat {
             InterlockedExchange64(
                 const_cast<volatile LONG64*>(&g_bridge->sentinel_tsc), now_tsc);
 
-            SN_LOG("heartbeat::update_and_check: wrote sentinel_tsc=%lld to bridge %p", now_tsc, g_bridge);
-
             UINT64 current_whoswho_tsc = static_cast<UINT64>(g_bridge->whoswho_tsc);
             UINT64 now_check = __rdtsc();
 
@@ -516,8 +514,6 @@ namespace heartbeat {
             }
 
             if (current_whoswho_tsc != g_last_whoswho_tsc) {
-                SN_LOG("heartbeat::update_and_check: WW alive, tsc changed %llu -> %llu",
-                    g_last_whoswho_tsc, current_whoswho_tsc);
                 g_last_whoswho_tsc = current_whoswho_tsc;
                 g_last_check_tsc = now_check;
                 return true;
@@ -525,10 +521,9 @@ namespace heartbeat {
 
             UINT64 elapsed = now_check - g_last_check_tsc;
 
-            SN_LOG("heartbeat::update_and_check: WW STALE whoswho_tsc=%llu elapsed=%llu timeout=%llu",
-                current_whoswho_tsc, elapsed, HEARTBEAT_TIMEOUT_TSC);
-
             if (elapsed > HEARTBEAT_TIMEOUT_TSC) {
+                SN_LOG("heartbeat::update_and_check: WW STALE whoswho_tsc=%llu elapsed=%llu timeout=%llu",
+                    current_whoswho_tsc, elapsed, HEARTBEAT_TIMEOUT_TSC);
                 SN_LOG("heartbeat::update_and_check: TIMEOUT EXCEEDED - quorum fail STALE");
                 return register_quorum_failure(
                     QUORUM_FAIL_STALE,

@@ -195,13 +195,6 @@ namespace guardian {
         return static_cast<ULONG>((delta * 1000000ULL) / static_cast<ULONGLONG>(mark.freq.QuadPart));
     }
 
-    __forceinline BOOLEAN should_log_idle(LONG count)
-    {
-        if (count <= 4) return TRUE;
-        if (count == 8 || count == 16 || count == 32) return TRUE;
-        return (count % 64) == 0;
-    }
-
     __forceinline session_state_t snapshot_session_state()
     {
         session_state_t state = {};
@@ -256,51 +249,29 @@ namespace guardian {
         session_state_t session = {};
         __try {
         cycle = _InterlockedIncrement(&g_cycle_count);
-        SN_LOG("guardian::dpc: cycle=%ld entry idle_backoff=%ld running=%ld queued=%ld",
-            cycle,
-            _InterlockedCompareExchange(&g_idle_backoff_count, 0, 0),
-            _InterlockedCompareExchange(&g_running, 0, 0),
-            _InterlockedCompareExchange(&g_work_item_queued, 0, 0));
-
 
         perf_stamp_t step = perf_mark();
         bool heartbeat_ok = heartbeat::update_and_check();
         ULONG step_us = perf_elapsed_us(step);
         session = snapshot_session_state();
-        SN_LOG("guardian::step cycle=%ld name=heartbeat elapsed_us=%lu result=%u init=%u bridge_valid=%u first_seen=%u heartbeat_fresh=%u bridge=%p whoswho_tsc=%llu last_whoswho_tsc=%llu last_check_tsc=%llu elapsed_tsc=%llu",
-            cycle,
-            step_us,
-            heartbeat_ok ? 1u : 0u,
-            session.initialized ? 1u : 0u,
-            session.bridge_valid ? 1u : 0u,
-            session.first_heartbeat_seen ? 1u : 0u,
-            session.heartbeat_fresh ? 1u : 0u,
-            heartbeat::g_bridge,
-            static_cast<unsigned long long>(session.whoswho_tsc),
-            static_cast<unsigned long long>(session.last_whoswho_tsc),
-            static_cast<unsigned long long>(session.last_check_tsc),
-            static_cast<unsigned long long>(session.elapsed_tsc));
-        SN_LOG("guardian::session cycle=%ld active=%u object_protected_pid=%llu notify_protected_pid=%llu idle_backoff=%ld",
-            cycle,
-            session.active ? 1u : 0u,
-            static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(session.object_protected_pid)),
-            static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(session.notify_protected_pid)),
-            _InterlockedCompareExchange(&g_idle_backoff_count, 0, 0));
+        if (!heartbeat_ok || !session.bridge_valid || !session.heartbeat_fresh) {
+            SN_LOG("guardian::step cycle=%ld name=heartbeat elapsed_us=%lu result=%u init=%u bridge_valid=%u first_seen=%u heartbeat_fresh=%u bridge=%p whoswho_tsc=%llu last_whoswho_tsc=%llu last_check_tsc=%llu elapsed_tsc=%llu",
+                cycle,
+                step_us,
+                heartbeat_ok ? 1u : 0u,
+                session.initialized ? 1u : 0u,
+                session.bridge_valid ? 1u : 0u,
+                session.first_heartbeat_seen ? 1u : 0u,
+                session.heartbeat_fresh ? 1u : 0u,
+                heartbeat::g_bridge,
+                static_cast<unsigned long long>(session.whoswho_tsc),
+                static_cast<unsigned long long>(session.last_whoswho_tsc),
+                static_cast<unsigned long long>(session.last_check_tsc),
+                static_cast<unsigned long long>(session.elapsed_tsc));
+        }
 
         if (!session.active) {
-            LONG idle = _InterlockedIncrement(&g_idle_backoff_count);
-            if (should_log_idle(idle)) {
-                SN_LOG("guardian::idle_skip cycle=%ld idle_backoff=%ld init=%u bridge_valid=%u heartbeat_fresh=%u object_protected_pid=%llu notify_protected_pid=%llu whoswho_tsc=%llu elapsed_tsc=%llu",
-                    cycle,
-                    idle,
-                    session.initialized ? 1u : 0u,
-                    session.bridge_valid ? 1u : 0u,
-                    session.heartbeat_fresh ? 1u : 0u,
-                    static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(session.object_protected_pid)),
-                    static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(session.notify_protected_pid)),
-                    static_cast<unsigned long long>(session.whoswho_tsc),
-                    static_cast<unsigned long long>(session.elapsed_tsc));
-            }
+            _InterlockedIncrement(&g_idle_backoff_count);
         } else {
         _InterlockedExchange(&g_idle_backoff_count, 0);
 
@@ -478,10 +449,11 @@ namespace guardian {
 
         _InterlockedExchange(&g_running, 0);
         _InterlockedExchange(&g_work_item_queued, 0);
-        if (cycle != 0)
+        ULONG total_us = perf_elapsed_us(cycle_mark);
+        if (cycle != 0 && (session.active || total_us >= 5000))
             SN_LOG("guardian::dpc: cycle=%ld done total_us=%lu active=%u idle_backoff=%ld",
                 cycle,
-                perf_elapsed_us(cycle_mark),
+                total_us,
                 session.active ? 1u : 0u,
                 _InterlockedCompareExchange(&g_idle_backoff_count, 0, 0));
     }

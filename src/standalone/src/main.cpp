@@ -62,8 +62,11 @@
 #include "core/auth/auth_http.hpp"
 #include "core/ui/loading_binary_overlay.hpp"
 #include <shellapi.h>
+#include <shobjidl.h>
+#include <dbghelp.h>
 
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "dbghelp.lib")
 
 extern "C" {
 #include <openssl/applink.c>
@@ -1638,6 +1641,129 @@ namespace aida_tracer {
             static_cast<unsigned long long>(g_dispatch_exit_count.load(std::memory_order_acquire)),
             static_cast<unsigned long long>(g_wndproc_enter_count.load(std::memory_order_acquire)),
             static_cast<unsigned long long>(g_wndproc_exit_count.load(std::memory_order_acquire)));
+
+        HANDLE stack_th = OpenThread(
+            THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION,
+            FALSE,
+            render_tid);
+        const DWORD stack_open_gle = stack_th ? 0 : GetLastError();
+        if (!stack_th) {
+            diag::log_tagged_critical_fmt("tracer",
+                "render_thread_stack_open_fail tid=%lu gle=%lu",
+                render_tid,
+                static_cast<unsigned long>(stack_open_gle));
+            return;
+        }
+
+        DWORD suspend_count = static_cast<DWORD>(-1);
+        unsigned frames_walked = 0;
+        const char* abort_reason = nullptr;
+        const uint64_t suspend_t0 = static_cast<uint64_t>(GetTickCount64());
+        diag::log_tagged_critical_fmt("tracer",
+            "render_thread_stack_begin tid=%lu age_ms=%llu",
+            render_tid,
+            static_cast<unsigned long long>(age_ms));
+
+        __try {
+            suspend_count = SuspendThread(stack_th);
+            if (suspend_count == static_cast<DWORD>(-1)) {
+                abort_reason = "suspend_failed";
+            } else {
+                CONTEXT ctx{};
+                ctx.ContextFlags = CONTEXT_FULL;
+                if (!GetThreadContext(stack_th, &ctx)) {
+                    abort_reason = "get_thread_context_failed";
+                } else {
+                    STACKFRAME64 frame{};
+#if defined(_M_X64)
+                    frame.AddrPC.Offset = ctx.Rip;
+                    frame.AddrPC.Mode = AddrModeFlat;
+                    frame.AddrFrame.Offset = ctx.Rbp;
+                    frame.AddrFrame.Mode = AddrModeFlat;
+                    frame.AddrStack.Offset = ctx.Rsp;
+                    frame.AddrStack.Mode = AddrModeFlat;
+                    const DWORD machine = IMAGE_FILE_MACHINE_AMD64;
+#else
+                    frame.AddrPC.Offset = ctx.Eip;
+                    frame.AddrPC.Mode = AddrModeFlat;
+                    frame.AddrFrame.Offset = ctx.Ebp;
+                    frame.AddrFrame.Mode = AddrModeFlat;
+                    frame.AddrStack.Offset = ctx.Esp;
+                    frame.AddrStack.Mode = AddrModeFlat;
+                    const DWORD machine = IMAGE_FILE_MACHINE_I386;
+#endif
+                    HANDLE proc = GetCurrentProcess();
+                    constexpr unsigned kMaxFrames = 64;
+                    for (unsigned i = 0; i < kMaxFrames; ++i) {
+                        const uint64_t walk_now = static_cast<uint64_t>(GetTickCount64());
+                        if (walk_now - suspend_t0 >= 50ULL) {
+                            abort_reason = "suspend_budget_exceeded";
+                            break;
+                        }
+                        if (!StackWalk64(
+                                machine,
+                                proc,
+                                stack_th,
+                                &frame,
+                                machine == IMAGE_FILE_MACHINE_AMD64 ? &ctx : nullptr,
+                                nullptr,
+                                SymFunctionTableAccess64,
+                                SymGetModuleBase64,
+                                nullptr)) {
+                            abort_reason = "stack_walk_end_or_fail";
+                            break;
+                        }
+                        if (frame.AddrPC.Offset == 0)
+                            break;
+                        char module_path[MAX_PATH] = {};
+                        unsigned long long module_base = 0;
+                        unsigned long long module_off = frame.AddrPC.Offset;
+                        HMODULE mod = nullptr;
+                        if (GetModuleHandleExA(
+                                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                reinterpret_cast<LPCSTR>(static_cast<UINT_PTR>(frame.AddrPC.Offset)),
+                                &mod) &&
+                            mod) {
+                            module_base = static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(mod));
+                            module_off = frame.AddrPC.Offset - module_base;
+                            GetModuleFileNameA(mod, module_path, sizeof(module_path));
+                        }
+                        const char* short_name = module_path;
+                        for (const char* p = module_path; *p; ++p) {
+                            if (*p == '\\' || *p == '/')
+                                short_name = p + 1;
+                        }
+                        diag::log_tagged_critical_fmt("tracer",
+                            "render_thread_stack idx=%u rip=0x%llX module=%s base=0x%llX offset=0x%llX frame_rbp=0x%llX frame_rsp=0x%llX",
+                            i,
+                            static_cast<unsigned long long>(frame.AddrPC.Offset),
+                            short_name[0] ? short_name : "<unknown>",
+                            module_base,
+                            module_off,
+                            static_cast<unsigned long long>(frame.AddrFrame.Offset),
+                            static_cast<unsigned long long>(frame.AddrStack.Offset));
+                        ++frames_walked;
+                    }
+                }
+                ResumeThread(stack_th);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            if (suspend_count != static_cast<DWORD>(-1))
+                ResumeThread(stack_th);
+            abort_reason = "seh_exception";
+        }
+
+        const uint64_t suspend_elapsed = static_cast<uint64_t>(GetTickCount64()) - suspend_t0;
+        diag::log_tagged_critical_fmt("tracer",
+            "render_thread_stack_end tid=%lu frames=%u suspend_count=%lu elapsed_ms=%llu reason=%s",
+            render_tid,
+            frames_walked,
+            static_cast<unsigned long>(suspend_count),
+            static_cast<unsigned long long>(suspend_elapsed),
+            abort_reason ? abort_reason : "ok");
+
+        CloseHandle(stack_th);
     }
 
     inline void mark_render_phase(const char* name) {
@@ -4033,6 +4159,10 @@ int main(int, char**)
         crash_log_write("startup_ban_check_passed");
     }
 
+    HRESULT aumid_hr = ::SetCurrentProcessExplicitAppUserModelID(L"AiDA.Standalone.IDE");
+    startup_log_critical_fmt("appusermodelid hr=0x%08lX",
+        static_cast<unsigned long>(aumid_hr));
+
     startup_log_critical_fmt("dpi_awareness_pre pid=%lu tid=%lu tick=%llu",
         GetCurrentProcessId(),
         GetCurrentThreadId(),
@@ -4060,9 +4190,29 @@ int main(int, char**)
         GetCurrentProcessId(),
         GetCurrentThreadId(),
         static_cast<unsigned long long>(GetTickCount64()));
-    HWND hwnd = ::CreateWindowExW(WS_EX_LAYERED | WS_EX_APPWINDOW, wc.lpszClassName, kAidaWindowTitle, WS_POPUP, (screen_w - 200) / 2, (screen_h - 250) / 2, 200, 250, nullptr, nullptr, wc.hInstance, nullptr);
+    constexpr DWORD kAidaWindowStyle =
+        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_CLIPSIBLINGS;
+    constexpr DWORD kAidaWindowExStyle = WS_EX_APPWINDOW;
+    HWND hwnd = ::CreateWindowExW(kAidaWindowExStyle,
+                                  wc.lpszClassName,
+                                  kAidaWindowTitle,
+                                  kAidaWindowStyle,
+                                  (screen_w - 200) / 2,
+                                  (screen_h - 250) / 2,
+                                  200,
+                                  250,
+                                  nullptr,
+                                  nullptr,
+                                  wc.hInstance,
+                                  nullptr);
     g_hwnd = hwnd;
     startup_log_critical_fmt("create_window_post hwnd=0x%llX last_err=%lu",
+        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
+        static_cast<unsigned long>(GetLastError()));
+    startup_log_critical_fmt(
+        "window_style_post style=0x%08lX exstyle=0x%08lX hwnd=0x%llX last_err=%lu",
+        static_cast<unsigned long>(::GetWindowLongPtrW(hwnd, GWL_STYLE)),
+        static_cast<unsigned long>(::GetWindowLongPtrW(hwnd, GWL_EXSTYLE)),
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
         static_cast<unsigned long>(GetLastError()));
     crash_log_fmt("hwnd=%p", hwnd);
@@ -4121,7 +4271,7 @@ int main(int, char**)
         GetCurrentProcessId(),
         GetCurrentThreadId(),
         static_cast<unsigned long long>(GetTickCount64()));
-    ::ShowWindow(hwnd, SW_SHOWDEFAULT);
+    ::ShowWindow(hwnd, SW_SHOW);
     aida::manual_map_tls::ensure_current_thread();
     const MARGINS margin = { -1 };
     DwmExtendFrameIntoClientArea(hwnd, &margin);
@@ -4133,7 +4283,6 @@ int main(int, char**)
     COLORREF border_color = RGB(33, 35, 39);
     DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &border_color, sizeof(border_color));
     aida::manual_map_tls::ensure_current_thread();
-    SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
     aida::manual_map_tls::ensure_current_thread();
 
     set_acrylic_color(hwnd);
@@ -4692,8 +4841,6 @@ int main(int, char**)
         aida_tracer::mark_render_phase("frame_top");
         if (frame_number < 5)
             crash_log_fmt("frame_begin #%llu", frame_number);
-        else if ((frame_number % 600ULL) == 0ULL)
-            diag::log_tagged_critical_fmt("render", "alive frame=%llu", (unsigned long long)frame_number);
 
         {
             static DWORD s_last_acrylic_applied = 0;
@@ -4719,11 +4866,7 @@ int main(int, char**)
 
         aida_tracer::mark_render_phase("peek_message_begin");
         MSG msg;
-        static uint64_t send_only_last_log_ms = 0;
         static uint64_t sent_with_queued_last_log_ms = 0;
-        static uint64_t empty_queue_last_log_ms = 0;
-        static uint64_t empty_queue_skip_count = 0;
-        static uint64_t send_only_skip_count = 0;
         for (;;)
         {
             aida_tracer::mark_render_phase("peek_message_probe");
@@ -4733,24 +4876,6 @@ int main(int, char**)
             if (queue_current == 0) {
                 aida_tracer::set_peek_state(queue_status_before, 0);
                 aida_tracer::set_peek_call_shape(kAidaQueuedPeekFlags, nullptr);
-                const uint64_t now_ms = static_cast<uint64_t>(GetTickCount64());
-                const uint64_t skips = ++empty_queue_skip_count;
-                if (skips <= 8 || now_ms - empty_queue_last_log_ms >= 30000) {
-                    empty_queue_last_log_ms = now_ms;
-                    diag::log_tagged_critical_fmt("msgpump",
-                        "peek_empty_probe frame=%llu skips=%llu qs=0x%08lX changed=0x%04lX current=0x%04lX flags=0x%08X hwnd=0x%llX fg=0x%llX active=0x%llX focus=0x%llX tid=%lu",
-                        (unsigned long long)frame_number,
-                        (unsigned long long)skips,
-                        static_cast<unsigned long>(queue_status_before),
-                        static_cast<unsigned long>(queue_changed),
-                        static_cast<unsigned long>(queue_current),
-                        kAidaQueuedPeekFlags,
-                        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
-                        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(::GetForegroundWindow())),
-                        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(::GetActiveWindow())),
-                        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(::GetFocus())),
-                        ::GetCurrentThreadId());
-                }
             }
             const bool send_message_pending = (queue_current & QS_SENDMESSAGE) != 0;
             const bool non_send_pending = (queue_current & kAidaNonSendQueueBits) != 0;
@@ -4760,8 +4885,6 @@ int main(int, char**)
                 aida_tracer::set_peek_state(queue_status_before, 0);
                 aida_tracer::set_peek_call_shape(kAidaSendOnlyPeekFlags, nullptr);
                 aida_tracer::mark_render_phase("peek_message_send_only_drain");
-                const uint64_t now_ms = static_cast<uint64_t>(GetTickCount64());
-                const uint64_t skips = ++send_only_skip_count;
                 ::SetLastError(0);
                 MSG sent_probe{};
                 const uint64_t drain_start = static_cast<uint64_t>(GetTickCount64());
@@ -4769,28 +4892,6 @@ int main(int, char**)
                 const DWORD sent_probe_gle = ::GetLastError();
                 const uint64_t drain_elapsed = static_cast<uint64_t>(GetTickCount64()) - drain_start;
                 aida_tracer::set_peek_state(queue_status_before, sent_probe_gle);
-                if (skips <= 8 || now_ms - send_only_last_log_ms >= 1000 || sent_probe_result) {
-                    send_only_last_log_ms = now_ms;
-                    diag::log_tagged_critical_fmt("msgpump",
-                        "send_only_drain frame=%llu drains=%llu elapsed_ms=%llu result=%d gle=%lu qs=0x%08lX current=0x%04lX changed=0x%04lX queued_mask=0x%04lX flags=0x%08X hwnd=0x%llX fg=0x%llX active=0x%llX focus=0x%llX full_test=%d fileless=%d tid=%lu",
-                        (unsigned long long)frame_number,
-                        (unsigned long long)skips,
-                        (unsigned long long)drain_elapsed,
-                        sent_probe_result ? 1 : 0,
-                        static_cast<unsigned long>(sent_probe_gle),
-                        static_cast<unsigned long>(queue_status_before),
-                        static_cast<unsigned long>(queue_current),
-                        static_cast<unsigned long>(queue_changed),
-                        static_cast<unsigned long>(kAidaPumpQueueBits),
-                        kAidaSendOnlyPeekFlags,
-                        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
-                        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(::GetForegroundWindow())),
-                        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(::GetActiveWindow())),
-                        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(::GetFocus())),
-                        test_all_features::is_running() ? 1 : 0,
-                        fileless_customer_launch ? 1 : 0,
-                        ::GetCurrentThreadId());
-                }
                 if (drain_elapsed >= 50) {
                     char stall_context[4600] = {};
                     format_message_pump_stall_context(stall_context, sizeof(stall_context));
@@ -4980,12 +5081,7 @@ int main(int, char**)
                     globals::ui::window_w = (float)resize_w;
                     globals::ui::window_h = (float)resize_h;
                 }
-                if (globals::ui::maximized) {
-                    SetWindowRgn(hwnd, nullptr, TRUE);
-                } else {
-                    HRGN rgn = CreateRoundRectRgn(0, 0, resize_w, resize_h, 16, 16);
-                    SetWindowRgn(hwnd, rgn, TRUE);
-                }
+                ::SetWindowRgn(hwnd, nullptr, TRUE);
                 g_ResizeWidth = g_ResizeHeight = 0;
                 CreateRenderTarget();
                 prev_w = static_cast<int>(resize_w);
@@ -5169,7 +5265,7 @@ int main(int, char**)
                 ide_resize_applied = true;
 
             if (defer_fileless_ide_region) {
-                SetWindowRgn(hwnd, nullptr, TRUE);
+                ::SetWindowRgn(hwnd, nullptr, TRUE);
                 if (!fileless_ide_region_defer_logged) {
                     fileless_ide_region_defer_logged = true;
                     diag::log_tagged_critical_fmt("render",
@@ -5178,14 +5274,9 @@ int main(int, char**)
                         iw,
                         ih);
                 }
-            } else if (globals::ui::maximized) {
-                SetWindowRgn(hwnd, nullptr, TRUE);
-                DWM_WINDOW_CORNER_PREFERENCE cp = DWMWCP_DONOTROUND;
-                DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cp, sizeof(cp));
             } else {
-                HRGN rgn = CreateRoundRectRgn(0, 0, iw, ih, 16, 16);
-                SetWindowRgn(hwnd, rgn, TRUE);
-                DWM_WINDOW_CORNER_PREFERENCE cp = DWMWCP_ROUND;
+                ::SetWindowRgn(hwnd, nullptr, TRUE);
+                DWM_WINDOW_CORNER_PREFERENCE cp = globals::ui::maximized ? DWMWCP_DONOTROUND : DWMWCP_ROUND;
                 DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cp, sizeof(cp));
             }
             if (!defer_fileless_ide_region && fileless_customer_launch && cur_state == 3)
@@ -5218,16 +5309,9 @@ int main(int, char**)
                 ide_resize_applied &&
                 fileless_ide_settled &&
                 !fileless_ide_region_applied) {
-                if (globals::ui::maximized) {
-                    SetWindowRgn(hwnd, nullptr, TRUE);
-                    DWM_WINDOW_CORNER_PREFERENCE cp = DWMWCP_DONOTROUND;
-                    DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cp, sizeof(cp));
-                } else {
-                    HRGN rgn = CreateRoundRectRgn(0, 0, iw, ih, 16, 16);
-                    SetWindowRgn(hwnd, rgn, TRUE);
-                    DWM_WINDOW_CORNER_PREFERENCE cp = DWMWCP_ROUND;
-                    DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cp, sizeof(cp));
-                }
+                ::SetWindowRgn(hwnd, nullptr, TRUE);
+                DWM_WINDOW_CORNER_PREFERENCE cp = globals::ui::maximized ? DWMWCP_DONOTROUND : DWMWCP_ROUND;
+                DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cp, sizeof(cp));
                 fileless_ide_region_applied = true;
                 diag::log_tagged_critical_fmt("render",
                     "fileless_ide_region_late_applied frame=%llu iw=%d ih=%d maximized=%d",
@@ -5248,8 +5332,6 @@ int main(int, char**)
 
         if (frame_number < 5)
             crash_log_write("dx11_new_frame");
-        if ((frame_number >= 270ULL && frame_number <= 320ULL))
-            diag::log_tagged_critical_fmt("render", "phase=pre_dx11_new_frame frame=%llu", (unsigned long long)frame_number);
         aida_tracer::mark_render_phase("dx11_new_frame");
         DWORD seh_dxnf = seh_dx11_new_frame();
         if (seh_dxnf != 0)
@@ -5257,8 +5339,6 @@ int main(int, char**)
                 seh_dxnf, (unsigned long long)frame_number);
         if (frame_number < 5)
             crash_log_write("win32_new_frame");
-        if ((frame_number >= 270ULL && frame_number <= 320ULL))
-            diag::log_tagged_critical_fmt("render", "phase=pre_win32_new_frame frame=%llu", (unsigned long long)frame_number);
         aida_tracer::mark_render_phase("win32_new_frame");
         DWORD seh_w32 = seh_win32_new_frame();
         if (seh_w32 != 0)
@@ -5266,8 +5346,6 @@ int main(int, char**)
                 seh_w32, (unsigned long long)frame_number);
         if (frame_number < 5)
             crash_log_write("imgui_new_frame");
-        if ((frame_number >= 270ULL && frame_number <= 320ULL))
-            diag::log_tagged_critical_fmt("render", "phase=pre_imgui_new_frame frame=%llu", (unsigned long long)frame_number);
         aida_tracer::mark_render_phase("imgui_new_frame");
         DWORD seh_inf = seh_imgui_new_frame();
         if (seh_inf != 0)
@@ -5303,9 +5381,6 @@ int main(int, char**)
         {
             if (frame_number < 5)
                 crash_log_write("render_title_entering");
-            if ((frame_number >= 270ULL && frame_number <= 320ULL))
-                diag::log_tagged_critical_fmt("render", "phase=pre_render_title frame=%llu section=%s",
-                    (unsigned long long)frame_number, g_render_section.c_str());
 
             aida_tracer::mark_render_phase("render_title");
             DWORD seh_rt = seh_render_title(&helper, frame_number);
@@ -5315,9 +5390,6 @@ int main(int, char**)
 
             if (frame_number < 5)
                 crash_log_write("render_title_done");
-            if ((frame_number >= 270ULL && frame_number <= 320ULL))
-                diag::log_tagged_critical_fmt("render", "phase=post_render_title frame=%llu section=%s",
-                    (unsigned long long)frame_number, g_render_section.c_str());
 
             aida_tracer::mark_render_phase("render_command_palette");
             DWORD seh_cp = seh_render_command_palette(frame_number);
@@ -5347,16 +5419,12 @@ int main(int, char**)
 
             if (frame_number < 5)
                 crash_log_write("toast_done");
-            if ((frame_number >= 270ULL && frame_number <= 320ULL))
-                diag::log_tagged_critical_fmt("render", "phase=post_toast frame=%llu", (unsigned long long)frame_number);
         }
 
         const float clear_color_with_alpha[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 
         if (frame_number < 5)
             crash_log_write("render_submit");
-        if ((frame_number >= 270ULL && frame_number <= 320ULL))
-            diag::log_tagged_critical_fmt("render", "phase=pre_omset frame=%llu", (unsigned long long)frame_number);
         HRESULT clear_removed = S_OK;
         DWORD seh_clear = seh_clear_main_render_target(g_pd3dDeviceContext, g_mainRenderTargetView, clear_color_with_alpha, &clear_removed, frame_number);
         if (seh_clear != 0) {
@@ -5371,15 +5439,11 @@ int main(int, char**)
             frame_number++;
             continue;
         }
-        if ((frame_number >= 270ULL && frame_number <= 320ULL))
-            diag::log_tagged_critical_fmt("render", "phase=pre_imgui_render frame=%llu", (unsigned long long)frame_number);
         aida_tracer::mark_render_phase("imgui_render");
         DWORD seh_ir = seh_imgui_render();
         if (seh_ir != 0)
             diag::log_tagged_critical_fmt("render", "SEH_in_imgui_render code=0x%08X frame=%llu",
                 seh_ir, (unsigned long long)frame_number);
-        if ((frame_number >= 270ULL && frame_number <= 320ULL))
-            diag::log_tagged_critical_fmt("render", "phase=pre_imgui_dx11 frame=%llu", (unsigned long long)frame_number);
         aida_tracer::mark_render_phase("imgui_dx11_render");
         DWORD seh_idr = seh_imgui_dx11_render(ImGui::GetDrawData(), frame_number);
         if (seh_idr != 0)
@@ -5387,8 +5451,6 @@ int main(int, char**)
                 seh_idr, (unsigned long long)frame_number);
         g_pd3dDeviceContext->OMSetBlendState(blend_state, nullptr, 0xffffffff);
 
-        if ((frame_number >= 270ULL && frame_number <= 320ULL))
-            diag::log_tagged_critical_fmt("render", "phase=pre_present frame=%llu", (unsigned long long)frame_number);
         aida_tracer::mark_render_phase("present");
         HRESULT hr = S_OK;
         const uint64_t present_start_tick_ms = static_cast<uint64_t>(GetTickCount64());
@@ -5402,10 +5464,6 @@ int main(int, char**)
         else if ((hr & 0x80000000u) || hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET)
             diag::log_tagged_critical_fmt("render", "present_hr_NONZERO=0x%08X frame=%llu",
                 hr, (unsigned long long)frame_number);
-        if ((frame_number >= 270ULL && frame_number <= 320ULL))
-            diag::log_tagged_critical_fmt("render", "phase=frame_end frame=%llu hr=0x%08X",
-                (unsigned long long)frame_number, hr);
-
         g_SwapChainOccluded = (hr == DXGI_STATUS_OCCLUDED);
 
         if (frame_number < 5)
@@ -5414,9 +5472,9 @@ int main(int, char**)
             static uint64_t s_last_frame_timing_log_ms = 0;
             const uint64_t timing_now_ms = static_cast<uint64_t>(GetTickCount64());
             const uint64_t frame_elapsed_ms = timing_now_ms - frame_start_tick_ms;
-            const bool timing_due = (timing_now_ms - s_last_frame_timing_log_ms) >= 15000ULL;
-            const bool frame_slow = frame_elapsed_ms >= 20ULL || present_elapsed_ms >= 8ULL;
-            if (timing_due || (frame_slow && (timing_now_ms - s_last_frame_timing_log_ms) >= 500ULL)) {
+            const bool present_failed = (hr & 0x80000000u) || hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET;
+            const bool frame_slow = frame_elapsed_ms >= 250ULL || present_elapsed_ms >= 100ULL;
+            if ((present_failed || frame_slow) && (timing_now_ms - s_last_frame_timing_log_ms) >= 5000ULL) {
                 s_last_frame_timing_log_ms = timing_now_ms;
                 const DWORD timing_qs = ::GetQueueStatus(kAidaInteractiveQueueBits);
                 diag::log_tagged_fmt("render",
@@ -5484,38 +5542,50 @@ int main(int, char**)
             if (interactive_pending) idle_block_mask |= 0x00000020u;
             if (cursor_over_aida) idle_block_mask |= 0x00000040u;
 
+            static uint64_t s_last_idle_pacing_probe_ms = 0;
             static uint64_t s_last_idle_pacing_log_ms = 0;
-            if (tick_now_ms - s_last_idle_pacing_log_ms >= 5000ULL) {
-                s_last_idle_pacing_log_ms = tick_now_ms;
+            if (tick_now_ms - s_last_idle_pacing_probe_ms >= 5000ULL) {
+                s_last_idle_pacing_probe_ms = tick_now_ms;
                 DWORD thread_err = 0;
                 const DWORD thread_count = count_current_process_threads(&thread_err);
                 const auto wq = work_queue::stats();
                 const auto svc = work_queue::service_stats();
                 const auto cq = critical_work_queue::stats();
-                diag::log_tagged_fmt("render",
-                    "idle_pacing_sample frame=%llu post_frame_idle_wait_ms=%lu block_mask=0x%08X foreground=%d foreground_like=%d cursor_over=%d interactive_pending=%d qs=0x%08lX since_interaction_ms=%llu bulk_busy=%d full_test=%d threads=%lu thread_err=%lu wq_active=%u wq_pending=%zu wq_oldest_ms=%llu svc_active=%u svc_pending=%zu svc_oldest_ms=%llu cq_active=%u cq_pending=%zu cq_oldest_ms=%llu",
-                    static_cast<unsigned long long>(frame_number),
-                    0UL,
-                    static_cast<unsigned>(idle_block_mask),
-                    foreground ? 1 : 0,
-                    foreground_like ? 1 : 0,
-                    cursor_over_aida ? 1 : 0,
-                    interactive_pending ? 1 : 0,
-                    static_cast<unsigned long>(idle_qs),
-                    static_cast<unsigned long long>(since_interaction_ms),
-                    bulk_busy ? 1 : 0,
-                    full_test_running ? 1 : 0,
-                    static_cast<unsigned long>(thread_count),
-                    static_cast<unsigned long>(thread_err),
-                    static_cast<unsigned>(wq.active),
-                    wq.pending,
-                    static_cast<unsigned long long>(wq.oldest_active_ms),
-                    static_cast<unsigned>(svc.active),
-                    svc.pending,
-                    static_cast<unsigned long long>(svc.oldest_active_ms),
-                    static_cast<unsigned>(cq.active),
-                    cq.pending,
-                    static_cast<unsigned long long>(cq.oldest_active_ms));
+                const bool idle_unhealthy =
+                    thread_err != 0 ||
+                    wq.pending != 0 ||
+                    svc.pending != 0 ||
+                    cq.pending != 0 ||
+                    wq.oldest_active_ms >= 30000ULL ||
+                    svc.oldest_active_ms >= 30000ULL ||
+                    cq.oldest_active_ms >= 30000ULL;
+                if (idle_unhealthy && tick_now_ms - s_last_idle_pacing_log_ms >= 30000ULL) {
+                    s_last_idle_pacing_log_ms = tick_now_ms;
+                    diag::log_tagged_fmt("render",
+                        "idle_pacing_anomaly frame=%llu post_frame_idle_wait_ms=%lu block_mask=0x%08X foreground=%d foreground_like=%d cursor_over=%d interactive_pending=%d qs=0x%08lX since_interaction_ms=%llu bulk_busy=%d full_test=%d threads=%lu thread_err=%lu wq_active=%u wq_pending=%zu wq_oldest_ms=%llu svc_active=%u svc_pending=%zu svc_oldest_ms=%llu cq_active=%u cq_pending=%zu cq_oldest_ms=%llu",
+                        static_cast<unsigned long long>(frame_number),
+                        0UL,
+                        static_cast<unsigned>(idle_block_mask),
+                        foreground ? 1 : 0,
+                        foreground_like ? 1 : 0,
+                        cursor_over_aida ? 1 : 0,
+                        interactive_pending ? 1 : 0,
+                        static_cast<unsigned long>(idle_qs),
+                        static_cast<unsigned long long>(since_interaction_ms),
+                        bulk_busy ? 1 : 0,
+                        full_test_running ? 1 : 0,
+                        static_cast<unsigned long>(thread_count),
+                        static_cast<unsigned long>(thread_err),
+                        static_cast<unsigned>(wq.active),
+                        wq.pending,
+                        static_cast<unsigned long long>(wq.oldest_active_ms),
+                        static_cast<unsigned>(svc.active),
+                        svc.pending,
+                        static_cast<unsigned long long>(svc.oldest_active_ms),
+                        static_cast<unsigned>(cq.active),
+                        cq.pending,
+                        static_cast<unsigned long long>(cq.oldest_active_ms));
+                }
             }
         }
     }
@@ -5983,6 +6053,44 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         EndPaint(hWnd, &ps);
         return finish("paint", 0);
     }
+    case WM_NCCALCSIZE:
+    {
+        if (wParam == TRUE)
+        {
+            NCCALCSIZE_PARAMS* params = reinterpret_cast<NCCALCSIZE_PARAMS*>(lParam);
+            RECT* rect = &params->rgrc[0];
+            const bool zoomed = ::IsZoomed(hWnd) != FALSE;
+            diag::log_tagged_fmt("wndproc",
+                "nccalcsize zoomed=%d before=(%ld,%ld,%ld,%ld) dpi=%u",
+                zoomed ? 1 : 0,
+                rect->left, rect->top, rect->right, rect->bottom,
+                static_cast<unsigned>(::GetDpiForWindow(hWnd)));
+            if (zoomed)
+            {
+                const UINT dpi = ::GetDpiForWindow(hWnd);
+                const int frame_x = ::GetSystemMetricsForDpi(SM_CXFRAME, dpi);
+                const int frame_y = ::GetSystemMetricsForDpi(SM_CYFRAME, dpi);
+                const int padding = ::GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+                const int inset = frame_x + padding;
+                const int inset_y = frame_y + padding;
+                rect->left   += inset;
+                rect->right  -= inset;
+                rect->top    += inset_y;
+                rect->bottom -= inset_y;
+                HMONITOR hm = ::MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST);
+                MONITORINFO mi = { sizeof(mi) };
+                if (::GetMonitorInfoW(hm, &mi))
+                {
+                    rect->left   = mi.rcWork.left;
+                    rect->top    = mi.rcWork.top;
+                    rect->right  = mi.rcWork.right;
+                    rect->bottom = mi.rcWork.bottom;
+                }
+            }
+            return finish("nccalcsize_zero_nc", 0);
+        }
+        break;
+    }
     case WM_NCHITTEST:
     {
 
@@ -5998,7 +6106,7 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         if (globals::ui::welcome_done &&
             license::runtime_ready(anti_tamper::state::get().violation_latched.load(std::memory_order_acquire),
                 test_all_features::is_running()) &&
-            !globals::ui::maximized) {
+            !::IsZoomed(hWnd)) {
             if (top    && left)  return finish("nchittest_top_left", HTTOPLEFT);
             if (top    && right) return finish("nchittest_top_right", HTTOPRIGHT);
             if (bottom && left)  return finish("nchittest_bottom_left", HTBOTTOMLEFT);
@@ -6011,11 +6119,32 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         return finish("nchittest_client", HTCLIENT);
     }
     case WM_SIZE:
+    {
         if (wParam == SIZE_MINIMIZED)
+        {
+            diag::log_tagged_critical_fmt("wndproc",
+                "size_minimized hwnd=0x%llX iconic=%d zoomed=%d",
+                static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hWnd)),
+                ::IsIconic(hWnd) ? 1 : 0,
+                ::IsZoomed(hWnd) ? 1 : 0);
             return finish("size_minimized", 0);
+        }
+        const bool now_zoomed = (wParam == SIZE_MAXIMIZED) ||
+                                (wParam == SIZE_RESTORED && ::IsZoomed(hWnd));
+        globals::ui::maximized = now_zoomed;
+        DWM_WINDOW_CORNER_PREFERENCE cp = now_zoomed ? DWMWCP_DONOTROUND : DWMWCP_ROUND;
+        DwmSetWindowAttribute(hWnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cp, sizeof(cp));
         g_ResizeWidth = (UINT)LOWORD(lParam);
         g_ResizeHeight = (UINT)HIWORD(lParam);
+        diag::log_tagged_critical_fmt("wndproc",
+            "size hwnd=0x%llX wp=%llu w=%u h=%u zoomed=%d",
+            static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hWnd)),
+            static_cast<unsigned long long>(static_cast<UINT_PTR>(wParam)),
+            g_ResizeWidth,
+            g_ResizeHeight,
+            now_zoomed ? 1 : 0);
         return finish("size", 0);
+    }
     case WM_GETMINMAXINFO:
     {
 
@@ -6031,9 +6160,19 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         return finish("getminmaxinfo", 0);
     }
     case WM_SYSCOMMAND:
-        if ((wParam & 0xfff0) == SC_KEYMENU)
+    {
+        const UINT cmd = static_cast<UINT>(wParam) & 0xFFF0u;
+        diag::log_tagged_critical_fmt("wndproc",
+            "syscommand cmd=0x%04X wp=0x%llX lp=0x%llX zoomed=%d iconic=%d",
+            cmd,
+            static_cast<unsigned long long>(static_cast<UINT_PTR>(wParam)),
+            static_cast<unsigned long long>(static_cast<LONG_PTR>(lParam)),
+            ::IsZoomed(hWnd) ? 1 : 0,
+            ::IsIconic(hWnd) ? 1 : 0);
+        if (cmd == SC_KEYMENU)
             return finish("syscommand_keymenu", 0);
         break;
+    }
     case WM_SETFOCUS:
         g_SwapChainOccluded = false;
         ::InvalidateRect(hWnd, nullptr, FALSE);

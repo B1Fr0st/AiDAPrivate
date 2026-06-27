@@ -287,18 +287,19 @@ namespace dbg_capture {
 
     static BOOLEAN should_log_empty(UINT64 empty_count)
     {
-        if (empty_count <= 4) return TRUE;
-        if (empty_count == 8 || empty_count == 16 || empty_count == 32) return TRUE;
-        return (empty_count % 64) == 0;
+        UNREFERENCED_PARAMETER(empty_count);
+        return FALSE;
     }
 
     static BOOLEAN should_log_flush(const flush_result_t& flush, UINT64 flush_count)
     {
+        UNREFERENCED_PARAMETER(flush_count);
         if (!NT_SUCCESS(flush.create_status) || !NT_SUCCESS(flush.write_status)) return TRUE;
         if (flush.elapsed_us >= 5000) return TRUE;
-        if (flush_count <= 4) return TRUE;
-        if (flush_count == 8 || flush_count == 16 || flush_count == 32) return TRUE;
-        return (flush_count % 64) == 0;
+        if (flush.ring_drop_events != 0 || flush.ring_drop_bytes != 0) return TRUE;
+        if (flush.flush_lost_events != 0 || flush.flush_lost_bytes != 0) return TRUE;
+        if (flush.immediate_failures != 0 || !NT_SUCCESS(flush.immediate_last_status)) return TRUE;
+        return FALSE;
     }
 
     static const char* wait_reason(NTSTATUS status, BOOLEAN stopping)

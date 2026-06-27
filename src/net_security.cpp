@@ -3,6 +3,7 @@
 #ifdef __NT__
 #include "standalone/src/helpers/diag_log.hpp"
 #include "standalone/src/core/infra/work_queue.hpp"
+#include "standalone/src/core/runtime/standalone_driver.hpp"
 #include "../driver/comm.h"
 #include <nlohmann/json.hpp>
 #include <algorithm>
@@ -3755,54 +3756,134 @@ bool AutoResponder::wait_worker_done(std::uint64_t generation, DWORD timeout_ms)
 
 bool AutoResponder::start() {
     std::lock_guard<std::mutex> lifecycle_lock(_lifecycle_mutex);
-    diag::log_tagged_fmt("net_sec", "AutoResponder::start entry active=%d device=%p connected=%d tid=%lu",
+    const DWORD entry_tid = GetCurrentThreadId();
+    const ULONGLONG entry_tick = GetTickCount64();
+    std::string session_reason;
+    const bool kernel_session_ok = driver_bridge::kernel_session_available(&session_reason);
+    diag::log_tagged_critical_fmt("net_sec",
+        "AutoResponder::start entry active=%d device=%p connected=%d session_valid=%d session_reason=%.96s tid=%lu tick_ms=%llu",
         _active.load() ? 1 : 0,
         device.get(),
         device && device->is_connected() ? 1 : 0,
-        static_cast<unsigned long>(GetCurrentThreadId()));
+        kernel_session_ok ? 1 : 0,
+        session_reason.empty() ? "ok" : session_reason.c_str(),
+        static_cast<unsigned long>(entry_tid),
+        static_cast<unsigned long long>(entry_tick));
     if (_active.load()) {
-        diag::log_tagged("net_sec", "AutoResponder::start already_active");
+        diag::log_tagged_critical("net_sec", "AutoResponder::start already_active");
         return true;
+    }
+
+    if (!kernel_session_ok) {
+        diag::log_tagged_critical_fmt("net_sec",
+            "AutoResponder::start rejected session_invalidated reason=%.96s tid=%lu",
+            session_reason.empty() ? "kernel_session_unavailable" : session_reason.c_str(),
+            static_cast<unsigned long>(entry_tid));
+        return false;
     }
 
     if (!_worker_done.load(std::memory_order_acquire)) {
         const std::uint64_t previous_generation = _worker_generation.load(std::memory_order_acquire);
         const ULONGLONG wait_start = GetTickCount64();
         const bool previous_done = wait_worker_done(previous_generation, 1000);
-        diag::log_tagged_fmt("net_sec", "AutoResponder::start previous_worker_done=%d generation=%llu elapsed_ms=%llu",
+        diag::log_tagged_critical_fmt("net_sec",
+            "AutoResponder::start previous_worker_done=%d generation=%llu elapsed_ms=%llu tid=%lu",
             previous_done ? 1 : 0,
             static_cast<unsigned long long>(previous_generation),
-            static_cast<unsigned long long>(GetTickCount64() - wait_start));
+            static_cast<unsigned long long>(GetTickCount64() - wait_start),
+            static_cast<unsigned long>(entry_tid));
         if (!previous_done)
             return false;
     }
 
     if (!device || !device->is_connected()) {
-        diag::log_tagged("net_sec", "AutoResponder::start rejected driver_unavailable");
+        diag::log_tagged_critical("net_sec", "AutoResponder::start rejected driver_unavailable");
         return false;
     }
 
     bool cap_active = false;
     std::uint32_t cap_count = 0, cap_drop = 0;
-    device->get_capture_status(cap_active, cap_count, cap_drop);
-    diag::log_tagged_fmt("net_sec", "AutoResponder::start capture_status active=%d count=%u drop=%u",
-        cap_active ? 1 : 0, cap_count, cap_drop);
+    {
+        const ULONGLONG t0 = GetTickCount64();
+        ::SetLastError(0);
+        diag::log_tagged_critical_fmt("net_sec",
+            "AutoResponder::start get_capture_status_pre tid=%lu tick_ms=%llu",
+            static_cast<unsigned long>(entry_tid),
+            static_cast<unsigned long long>(t0));
+        device->get_capture_status(cap_active, cap_count, cap_drop);
+        const DWORD gle = ::GetLastError();
+        const ULONGLONG t1 = GetTickCount64();
+        diag::log_tagged_critical_fmt("net_sec",
+            "AutoResponder::start get_capture_status_post elapsed_ms=%llu cap_active=%d cap_count=%u cap_drop=%u gle=%lu tid=%lu tick_ms=%llu",
+            static_cast<unsigned long long>(t1 - t0),
+            cap_active ? 1 : 0,
+            cap_count,
+            cap_drop,
+            static_cast<unsigned long>(gle),
+            static_cast<unsigned long>(entry_tid),
+            static_cast<unsigned long long>(t1));
+    }
     bool started_capture = false;
     if (!cap_active) {
+        const ULONGLONG t0 = GetTickCount64();
+        ::SetLastError(0);
+        diag::log_tagged_critical_fmt("net_sec",
+            "AutoResponder::start start_capture_pre tid=%lu tick_ms=%llu",
+            static_cast<unsigned long>(entry_tid),
+            static_cast<unsigned long long>(t0));
         bool capture_started = device->start_capture(0, 0, 0);
-        diag::log_tagged_fmt("net_sec", "AutoResponder::start start_capture result=%d",
-            capture_started ? 1 : 0);
+        const DWORD gle = ::GetLastError();
+        const ULONGLONG t1 = GetTickCount64();
+        diag::log_tagged_critical_fmt("net_sec",
+            "AutoResponder::start start_capture_post elapsed_ms=%llu ok=%d gle=%lu tid=%lu tick_ms=%llu",
+            static_cast<unsigned long long>(t1 - t0),
+            capture_started ? 1 : 0,
+            static_cast<unsigned long>(gle),
+            static_cast<unsigned long>(entry_tid),
+            static_cast<unsigned long long>(t1));
         if (!capture_started)
             return false;
         started_capture = true;
     }
 
-    bool intercept_started = device->intercept_op(1, 0, 0, 6);
-    diag::log_tagged_fmt("net_sec", "AutoResponder::start intercept_start result=%d",
-        intercept_started ? 1 : 0);
+    bool intercept_started = false;
+    {
+        const ULONGLONG t0 = GetTickCount64();
+        ::SetLastError(0);
+        diag::log_tagged_critical_fmt("net_sec",
+            "AutoResponder::start intercept_pre op=1 tid=%lu tick_ms=%llu",
+            static_cast<unsigned long>(entry_tid),
+            static_cast<unsigned long long>(t0));
+        intercept_started = device->intercept_op(1, 0, 0, 6);
+        const DWORD gle = ::GetLastError();
+        const ULONGLONG t1 = GetTickCount64();
+        diag::log_tagged_critical_fmt("net_sec",
+            "AutoResponder::start intercept_post op=1 elapsed_ms=%llu ok=%d gle=%lu tid=%lu tick_ms=%llu",
+            static_cast<unsigned long long>(t1 - t0),
+            intercept_started ? 1 : 0,
+            static_cast<unsigned long>(gle),
+            static_cast<unsigned long>(entry_tid),
+            static_cast<unsigned long long>(t1));
+    }
     if (!intercept_started) {
-        if (started_capture)
-            device->stop_capture();
+        if (started_capture) {
+            const ULONGLONG t0 = GetTickCount64();
+            ::SetLastError(0);
+            diag::log_tagged_critical_fmt("net_sec",
+                "AutoResponder::start rollback_stop_capture_pre tid=%lu tick_ms=%llu",
+                static_cast<unsigned long>(entry_tid),
+                static_cast<unsigned long long>(t0));
+            bool capture_stopped = device->stop_capture();
+            const DWORD gle = ::GetLastError();
+            const ULONGLONG t1 = GetTickCount64();
+            diag::log_tagged_critical_fmt("net_sec",
+                "AutoResponder::start rollback_stop_capture_post elapsed_ms=%llu ok=%d gle=%lu tid=%lu tick_ms=%llu",
+                static_cast<unsigned long long>(t1 - t0),
+                capture_stopped ? 1 : 0,
+                static_cast<unsigned long>(gle),
+                static_cast<unsigned long>(entry_tid),
+                static_cast<unsigned long long>(t1));
+        }
         return false;
     }
 
@@ -3811,8 +3892,12 @@ bool AutoResponder::start() {
     _worker_done.store(false, std::memory_order_release);
     _worker_tid.store(0, std::memory_order_release);
 
-    diag::log_tagged_fmt("net_sec", "AutoResponder::start worker_post_begin generation=%llu",
-        static_cast<unsigned long long>(generation));
+    const ULONGLONG post_t0 = GetTickCount64();
+    diag::log_tagged_critical_fmt("net_sec",
+        "AutoResponder::start work_queue_post_pre generation=%llu tid=%lu tick_ms=%llu",
+        static_cast<unsigned long long>(generation),
+        static_cast<unsigned long>(entry_tid),
+        static_cast<unsigned long long>(post_t0));
     bool worker_started = false;
     DWORD post_err = ERROR_SUCCESS;
     try {
@@ -3824,7 +3909,8 @@ bool AutoResponder::start() {
         post_err = GetLastError();
         if (post_err == ERROR_SUCCESS)
             post_err = ERROR_NOT_ENOUGH_MEMORY;
-        diag::log_tagged_fmt("net_sec", "AutoResponder::start worker_post_exception generation=%llu gle=%lu err=%s",
+        diag::log_tagged_critical_fmt("net_sec",
+            "AutoResponder::start worker_post_exception generation=%llu gle=%lu err=%s",
             static_cast<unsigned long long>(generation),
             static_cast<unsigned long>(post_err),
             ex.what());
@@ -3832,10 +3918,20 @@ bool AutoResponder::start() {
         post_err = GetLastError();
         if (post_err == ERROR_SUCCESS)
             post_err = ERROR_NOT_ENOUGH_MEMORY;
-        diag::log_tagged_fmt("net_sec", "AutoResponder::start worker_post_exception generation=%llu gle=%lu err=unknown",
+        diag::log_tagged_critical_fmt("net_sec",
+            "AutoResponder::start worker_post_exception generation=%llu gle=%lu err=unknown",
             static_cast<unsigned long long>(generation),
             static_cast<unsigned long>(post_err));
     }
+    const ULONGLONG post_t1 = GetTickCount64();
+    diag::log_tagged_critical_fmt("net_sec",
+        "AutoResponder::start work_queue_post_post elapsed_ms=%llu ok=%d gle=%lu generation=%llu tid=%lu tick_ms=%llu",
+        static_cast<unsigned long long>(post_t1 - post_t0),
+        worker_started ? 1 : 0,
+        static_cast<unsigned long>(post_err),
+        static_cast<unsigned long long>(generation),
+        static_cast<unsigned long>(entry_tid),
+        static_cast<unsigned long long>(post_t1));
     if (!worker_started) {
         if (post_err == ERROR_SUCCESS)
             post_err = ERROR_NOT_READY;
@@ -3843,20 +3939,63 @@ bool AutoResponder::start() {
         _worker_done.store(true, std::memory_order_release);
         _worker_cv.notify_all();
         if (device && device->is_connected()) {
+            const ULONGLONG rb_t0 = GetTickCount64();
+            ::SetLastError(0);
+            diag::log_tagged_critical_fmt("net_sec",
+                "AutoResponder::start rollback_intercept_pre op=2 generation=%llu tid=%lu tick_ms=%llu",
+                static_cast<unsigned long long>(generation),
+                static_cast<unsigned long>(entry_tid),
+                static_cast<unsigned long long>(rb_t0));
             bool stopped = device->intercept_op(2, 0, 0, 0);
-            bool capture_stopped = !started_capture || device->stop_capture();
-            diag::log_tagged_fmt("net_sec", "AutoResponder::start rollback intercept_stop=%d capture_stop=%d",
-                stopped ? 1 : 0, capture_stopped ? 1 : 0);
+            const DWORD stopped_gle = ::GetLastError();
+            const ULONGLONG rb_t1 = GetTickCount64();
+            diag::log_tagged_critical_fmt("net_sec",
+                "AutoResponder::start rollback_intercept_post op=2 elapsed_ms=%llu ok=%d gle=%lu generation=%llu tid=%lu tick_ms=%llu",
+                static_cast<unsigned long long>(rb_t1 - rb_t0),
+                stopped ? 1 : 0,
+                static_cast<unsigned long>(stopped_gle),
+                static_cast<unsigned long long>(generation),
+                static_cast<unsigned long>(entry_tid),
+                static_cast<unsigned long long>(rb_t1));
+            bool capture_stopped = true;
+            if (started_capture) {
+                const ULONGLONG cap_t0 = GetTickCount64();
+                ::SetLastError(0);
+                diag::log_tagged_critical_fmt("net_sec",
+                    "AutoResponder::start rollback_stop_capture_pre generation=%llu tid=%lu tick_ms=%llu",
+                    static_cast<unsigned long long>(generation),
+                    static_cast<unsigned long>(entry_tid),
+                    static_cast<unsigned long long>(cap_t0));
+                capture_stopped = device->stop_capture();
+                const DWORD cap_gle = ::GetLastError();
+                const ULONGLONG cap_t1 = GetTickCount64();
+                diag::log_tagged_critical_fmt("net_sec",
+                    "AutoResponder::start rollback_stop_capture_post elapsed_ms=%llu ok=%d gle=%lu generation=%llu tid=%lu tick_ms=%llu",
+                    static_cast<unsigned long long>(cap_t1 - cap_t0),
+                    capture_stopped ? 1 : 0,
+                    static_cast<unsigned long>(cap_gle),
+                    static_cast<unsigned long long>(generation),
+                    static_cast<unsigned long>(entry_tid),
+                    static_cast<unsigned long long>(cap_t1));
+            }
+            diag::log_tagged_critical_fmt("net_sec",
+                "AutoResponder::start rollback_summary intercept_stop=%d capture_stop=%d generation=%llu",
+                stopped ? 1 : 0,
+                capture_stopped ? 1 : 0,
+                static_cast<unsigned long long>(generation));
         }
-        diag::log_tagged_fmt("net_sec", "AutoResponder::start worker_post_failed generation=%llu gle=%lu",
+        diag::log_tagged_critical_fmt("net_sec",
+            "AutoResponder::start worker_post_failed generation=%llu gle=%lu",
             static_cast<unsigned long long>(generation),
             static_cast<unsigned long>(post_err));
         return false;
     }
-    diag::log_tagged_fmt("net_sec", "AutoResponder::start worker_posted generation=%llu",
-        static_cast<unsigned long long>(generation));
+    diag::log_tagged_critical_fmt("net_sec",
+        "AutoResponder::start worker_posted generation=%llu tid=%lu",
+        static_cast<unsigned long long>(generation),
+        static_cast<unsigned long>(entry_tid));
 
-    diag::log_tagged("net_sec", "AutoResponder::start ok");
+    diag::log_tagged_critical("net_sec", "AutoResponder::start ok");
     return true;
 }
 

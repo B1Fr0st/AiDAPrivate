@@ -7,6 +7,7 @@
 #include <cstring>
 #include <string_view>
 #include <memory>
+#include <atomic>
 #include <shared_mutex>
 #include <type_traits>
 #include <string>
@@ -1679,6 +1680,7 @@ namespace voyager {
         bool close_process_handle(std::uint32_t pid, std::uint64_t handle_value) noexcept;
         bool query_memory(std::uint64_t address, memory_region_info& info) noexcept;
         bool protect_memory(std::uint64_t address, std::uint64_t size, std::uint32_t new_protect, std::uint32_t* old_protect = nullptr) noexcept;
+        bool protect_memory_bounded(std::uint64_t address, std::uint64_t size, std::uint32_t new_protect, std::uint32_t* old_protect, std::uint32_t deadline_ms) noexcept;
         std::vector<detail::region_entry> enumerate_memory_regions(std::uint64_t start = 0, std::uint64_t end_addr = 0, bool include_all = false) noexcept;
         bool read_peb(peb_info& info) noexcept;
         bool spoof_debug_flags(std::uint32_t* result_flags = nullptr) noexcept;
@@ -1743,6 +1745,8 @@ namespace voyager {
         bool stop_capture() noexcept;
         bool get_capture_status(bool& active, std::uint32_t& captured, std::uint32_t& dropped) noexcept;
         std::vector<captured_packet> get_captured_packets(std::uint32_t max_packets = 32) noexcept;
+        std::vector<captured_packet> get_captured_packets_bounded(std::uint32_t max_packets, std::uint32_t deadline_ms) noexcept;
+        void cancel_inflight_capture() noexcept;
         std::vector<dns_entry> get_dns_queries(std::uint32_t filter_pid = 0) noexcept;
         bool add_filter_rule(std::uint32_t action, std::uint32_t direction, std::uint32_t protocol = 0, std::uint32_t pid = 0, std::uint32_t port = 0, const std::uint8_t* ip_addr = nullptr, const std::uint8_t* ip_mask = nullptr, std::uint32_t* out_rule_id = nullptr) noexcept;
         bool remove_filter_rule(std::uint32_t rule_id) noexcept;
@@ -2309,6 +2313,8 @@ namespace voyager {
         mutable std::uint32_t last_heartbeat_offset_ = 0;
         mutable detail::raw_ioctl_telemetry last_raw_ioctl_{};
         mutable std::shared_mutex seed_rotation_mtx_;
+        mutable std::atomic<void*> inflight_capture_thread_{nullptr};
+        mutable std::atomic<bool> inflight_capture_cancel_pending_{false};
 
 
         std::uint64_t ntdll_base_ = 0;

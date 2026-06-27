@@ -1908,13 +1908,6 @@ static SimpleHttpResponse raw_https_request(
 {
     SimpleHttpResponse out;
     const ULONGLONG request_start_ms = GetTickCount64();
-    {
-        char buf[256];
-        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-            "https_request_begin verb=%.8s url=%.140s body_len=%zu timeout=%d",
-            verb ? verb : "?", url.c_str(), req_body.size(), timeout_sec);
-        lic_log(buf);
-    }
 
     ensure_modules_initialized();
 
@@ -1962,27 +1955,11 @@ static SimpleHttpResponse raw_https_request(
         req.headers.push_back({L"Content-Type", license_utf8_to_utf16(content_type)});
     }
 
-    {
-        char dbg[160];
-        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-            "https_request_dispatching_transport headers=%zu body=%zu",
-            req.headers.size(), req.body.size());
-        lic_log(dbg);
-    }
-
     aida::license::transport::response_t resp;
     std::string transport_err;
     const ULONGLONG transport_start_ms = GetTickCount64();
-    lic_log_fmt("https_request_transport_send_enter host_len=%zu path_len=%zu timeout_ms=%u body_len=%zu",
-        req.host.size(), req.path.size(), req.timeout_ms, req.body.size());
     bool ok = aida::license::transport::send(req, resp, transport_err);
-    lic_log_fmt("https_request_transport_send_exit ok=%d status=%u elapsed_ms=%llu err=%.160s body_len=%zu debug_reason_len=%zu",
-        ok ? 1 : 0,
-        resp.http_status,
-        static_cast<unsigned long long>(GetTickCount64() - transport_start_ms),
-        transport_err.c_str(),
-        resp.body.size(),
-        resp.debug_reason.size());
+    const ULONGLONG transport_elapsed_ms = GetTickCount64() - transport_start_ms;
 
     out.status = static_cast<int>(resp.http_status);
     out.debug_reason = resp.debug_reason;
@@ -1992,16 +1969,15 @@ static SimpleHttpResponse raw_https_request(
     if (ok)
     {
         out.ok = true;
-        char buf[384];
-        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-            "https_request_transport_ok status=%d body_len=%zu debug_reason=%.180s",
-            out.status, out.body.size(), resp.debug_reason.c_str());
-        lic_log(buf);
-        lic_log_fmt("https_request_end ok=1 status=%d elapsed_ms=%llu transport_ms=%llu err= body_len=%zu",
-            out.status,
-            static_cast<unsigned long long>(GetTickCount64() - request_start_ms),
-            static_cast<unsigned long long>(GetTickCount64() - transport_start_ms),
-            out.body.size());
+        const ULONGLONG total_elapsed_ms = GetTickCount64() - request_start_ms;
+        if (out.status >= 400 || total_elapsed_ms >= 5000ULL || !resp.debug_reason.empty()) {
+            lic_log_fmt("https_request_end ok=1 status=%d elapsed_ms=%llu transport_ms=%llu body_len=%zu debug_reason=%.180s",
+                out.status,
+                static_cast<unsigned long long>(total_elapsed_ms),
+                static_cast<unsigned long long>(transport_elapsed_ms),
+                out.body.size(),
+                resp.debug_reason.c_str());
+        }
         return out;
     }
 
@@ -2015,7 +1991,7 @@ static SimpleHttpResponse raw_https_request(
     lic_log_fmt("https_request_end ok=0 status=%d elapsed_ms=%llu transport_ms=%llu err=%.120s body_len=%zu",
         out.status,
         static_cast<unsigned long long>(GetTickCount64() - request_start_ms),
-        static_cast<unsigned long long>(GetTickCount64() - transport_start_ms),
+        static_cast<unsigned long long>(transport_elapsed_ms),
         out.error.c_str(),
         out.body.size());
     return out;
@@ -2326,10 +2302,6 @@ namespace
         {
             if (lk.try_lock())
             {
-                lic_log_fmt("heartbeat_compose_lock_acquired name=%s elapsed_ms=%llu tid=%lu",
-                    name ? name : "<null>",
-                    static_cast<unsigned long long>(GetTickCount64() - start_ms),
-                    static_cast<unsigned long>(GetCurrentThreadId()));
                 out_lock = std::move(lk);
                 return true;
             }
@@ -2671,6 +2643,12 @@ namespace
                                                        bool update_arc_failure)
     {
         driver_bridge::dynamic_ioctl_state_t dyn = driver_bridge::dynamic_ioctl_state();
+        if (relay_ok && driver_proof != 0 && dyn.ready)
+        {
+            SetLastError(ERROR_SUCCESS);
+            return true;
+        }
+
         lic_log_fmt("server_token_relay_dynamic_state phase=%s op=%s relay_ok=%d proof=%d relay_gle=%lu loaded=%d kernel=%d connected=%d dyn_ready=%d inst_seed=%u/%u global_seed=%u/%u ioctl_seed_hash=0x%08X hb_ioctl_seed_hash=0x%08X",
             phase && *phase ? phase : "unknown",
             op && *op ? op : "unknown",
@@ -2687,11 +2665,6 @@ namespace
             dyn.global_ioctl_seed,
             dyn.ioctl_seed_hash,
             dyn.heartbeat_ioctl_seed_hash);
-        if (relay_ok && driver_proof != 0 && dyn.ready)
-        {
-            SetLastError(ERROR_SUCCESS);
-            return true;
-        }
 
         DWORD gle = relay_gle;
         const char* reason = "server_token_relay_failed";
@@ -3392,10 +3365,6 @@ namespace
     bool relay_server_token_v2_if_ready(uint32_t token_hash, uint64_t server_nonce, uint64_t* out_driver_proof)
     {
         const uint64_t start_ms = static_cast<uint64_t>(GetTickCount64());
-        lic_log_fmt("server_token_relay_if_ready_enter token_set=%d nonce_set=%d tid=%lu",
-            token_hash != 0 ? 1 : 0,
-            server_nonce != 0 ? 1 : 0,
-            static_cast<unsigned long>(GetCurrentThreadId()));
         if (!bridge_connected_for_server_token_relay("server_token_relay_if_ready", "server_token_relay", 0, false))
             return false;
 
@@ -3403,15 +3372,17 @@ namespace
         SetLastError(ERROR_SUCCESS);
         bool heartbeat = driver_bridge::refresh_heartbeat();
         DWORD heartbeat_gle = heartbeat ? ERROR_SUCCESS : GetLastError();
-        lic_log_fmt("server_token_relay_if_ready_preflight heartbeat=%d gle=%lu dyn_ready=%d inst_seed=%u/%u global_seed=%u/%u elapsed_ms=%llu",
-            heartbeat ? 1 : 0,
-            static_cast<unsigned long>(heartbeat_gle),
-            pre_dyn.ready ? 1 : 0,
-            pre_dyn.instance_server_seed,
-            pre_dyn.instance_ioctl_seed,
-            pre_dyn.global_server_seed,
-            pre_dyn.global_ioctl_seed,
-            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - start_ms));
+        if (!heartbeat || !pre_dyn.ready) {
+            lic_log_fmt("server_token_relay_if_ready_preflight heartbeat=%d gle=%lu dyn_ready=%d inst_seed=%u/%u global_seed=%u/%u elapsed_ms=%llu",
+                heartbeat ? 1 : 0,
+                static_cast<unsigned long>(heartbeat_gle),
+                pre_dyn.ready ? 1 : 0,
+                pre_dyn.instance_server_seed,
+                pre_dyn.instance_ioctl_seed,
+                pre_dyn.global_server_seed,
+                pre_dyn.global_ioctl_seed,
+                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - start_ms));
+        }
 
         const uint64_t relay_ms = static_cast<uint64_t>(GetTickCount64());
         bool ok = driver_bridge::relay_server_token_v2(token_hash, server_nonce, out_driver_proof);
@@ -3426,13 +3397,17 @@ namespace
             0,
             false);
         DWORD final_gle = seeded ? ERROR_SUCCESS : GetLastError();
-        lic_log_fmt("server_token_relay_if_ready_exit ok=%d seeded=%d gle=%lu proof=%d elapsed_ms=%llu total_ms=%llu",
-            ok ? 1 : 0,
-            seeded ? 1 : 0,
-            static_cast<unsigned long>(final_gle),
-            driver_proof != 0 ? 1 : 0,
-            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - relay_ms),
-            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - start_ms));
+        const uint64_t relay_elapsed_ms = static_cast<uint64_t>(GetTickCount64()) - relay_ms;
+        const uint64_t total_elapsed_ms = static_cast<uint64_t>(GetTickCount64()) - start_ms;
+        if (!ok || !seeded || total_elapsed_ms >= 1000) {
+            lic_log_fmt("server_token_relay_if_ready_exit ok=%d seeded=%d gle=%lu proof=%d elapsed_ms=%llu total_ms=%llu",
+                ok ? 1 : 0,
+                seeded ? 1 : 0,
+                static_cast<unsigned long>(final_gle),
+                driver_proof != 0 ? 1 : 0,
+                static_cast<unsigned long long>(relay_elapsed_ms),
+                static_cast<unsigned long long>(total_elapsed_ms));
+        }
         SetLastError(final_gle);
         return seeded;
     }
@@ -4019,15 +3994,12 @@ namespace
         telemetry.set_auth_hmac_key(std::move(auth_key));
         telemetry.set_session_token(settings.license_session_token);
         telemetry.start_background_flusher();
-        lic_log_fmt(
-            "telemetry_configured phase=%s session_len=%zu auth_len=32",
-            phase_name,
-            settings.license_session_token.size());
         const bool flushed = telemetry.flush_blocking();
-        lic_log_fmt(
-            "telemetry_initial_flush phase=%s ok=%d",
-            phase_name,
-            flushed ? 1 : 0);
+        if (!flushed) {
+            lic_log_fmt(
+                "telemetry_initial_flush phase=%s ok=0",
+                phase_name);
+        }
     }
 
     std::shared_ptr<httplib::Client> get_or_create_license_client()
@@ -5342,7 +5314,6 @@ namespace
 
         out.id = std::move(cid);
         out.nonce = std::move(cnonce);
-        lic_log_fmt("fetch_challenge_ok id_len=%zu nonce_len=%zu", out.id.size(), out.nonce.size());
         return true;
     }
 
@@ -5378,15 +5349,17 @@ namespace
                 key, session_token, hwid, nonce, heartbeat_count, req_seq, proof);
         }
 
-        lic_log_fmt("standalone_capsule action=%.16s present=%d valid=%d attached=%d id=%.16s base=%.16s capsule=%.16s err=%.64s",
-            action.c_str(),
-            info.present ? 1 : 0,
-            info.valid ? 1 : 0,
-            ok ? 1 : 0,
-            info.capsule_id.empty() ? "<none>" : info.capsule_id.c_str(),
-            info.base_sha256.empty() ? "<none>" : info.base_sha256.c_str(),
-            info.capsule_sha256.empty() ? "<none>" : info.capsule_sha256.c_str(),
-            info.error.empty() ? "<none>" : info.error.c_str());
+        if (!ok || !info.present || !info.valid) {
+            lic_log_fmt("standalone_capsule action=%.16s present=%d valid=%d attached=%d id=%.16s base=%.16s capsule=%.16s err=%.64s",
+                action.c_str(),
+                info.present ? 1 : 0,
+                info.valid ? 1 : 0,
+                ok ? 1 : 0,
+                info.capsule_id.empty() ? "<none>" : info.capsule_id.c_str(),
+                info.base_sha256.empty() ? "<none>" : info.base_sha256.c_str(),
+                info.capsule_sha256.empty() ? "<none>" : info.capsule_sha256.c_str(),
+                info.error.empty() ? "<none>" : info.error.c_str());
+        }
 
         if (!ok) return false;
         json capsule{};
@@ -5511,10 +5484,9 @@ namespace
         }
 
         std::string host = get_cloud_function_host();
-        lic_log("endpoint_once_posting");
         auto resp = raw_https_request("POST", host + "/validateLicense",
                                     hdrs, body_str, "application/json");
-        {
+        if (!resp.ok || resp.status != 200) {
             char rl[384];
             _snprintf_s(rl, sizeof(rl), _TRUNCATE,
                 "endpoint_once_response ok=%d status=%d err=%.80s body_len=%zu",
@@ -5600,16 +5572,9 @@ namespace
             signed_payload["_server_sig_b64"] = sig_b64;
             signed_payload["_server_kid"] = kid_raw;
             response_out = std::move(signed_payload);
-            lic_log_fmt("endpoint_once_envelope_sig_ok kid=%d", kid_raw);
         }
 
         const std::string status = response_out.value("status", "");
-        {
-            char sl[128];
-            _snprintf_s(sl, sizeof(sl), _TRUNCATE,
-                "endpoint_once_status=%.80s action=%.30s", status.c_str(), action.c_str());
-            lic_log(sl);
-        }
         if (status != "valid") {
             const std::string rej_reason = response_out.value("reason", "");
             char rej[256];
@@ -5838,7 +5803,6 @@ namespace
                 body["req_seq"] = std::to_string(req_seq);
 
                 {
-                    lic_log("heartbeat_compose_ratchet_lock_pre");
                     std::unique_lock<std::mutex> lk;
                     if (!heartbeat_try_lock_mutex(s_session_ratchet_mtx, "session_ratchet", lk))
                         return heartbeat_lock_timeout_response("session_ratchet", error_out, response_out);
@@ -5847,7 +5811,6 @@ namespace
                         body["ratchet_counter"] = static_cast<int64_t>(
                             s_session_ratchet.request_counter.load(std::memory_order_acquire));
                     }
-                    lic_log("heartbeat_compose_ratchet_lock_post");
                 }
 
 
@@ -5860,7 +5823,6 @@ namespace
                 std::string next_challenge_nonce;
                 std::string next_challenge_signature;
                 {
-                    lic_log("heartbeat_compose_rotation_lock_pre");
                     std::unique_lock<std::mutex> rot_lk;
                     if (!heartbeat_try_lock_mutex(s_rotation_mtx, "rotation", rot_lk))
                         return heartbeat_lock_timeout_response("rotation", error_out, response_out);
@@ -5869,11 +5831,6 @@ namespace
                     next_challenge_id = s_next_challenge_id;
                     next_challenge_nonce = s_next_challenge_nonce;
                     next_challenge_signature = s_next_challenge_signature;
-                    lic_log_fmt("heartbeat_compose_rotation_lock_post nonce_len=%zu bind_len=%zu challenge_id_len=%zu challenge_nonce_len=%zu",
-                        rotated_heartbeat_nonce.size(),
-                        rotated_bind_proof.size(),
-                        next_challenge_id.size(),
-                        next_challenge_nonce.size());
                 }
                 if (!rotated_heartbeat_nonce.empty())
                     body["echoed_server_nonce"] = rotated_heartbeat_nonce;
@@ -5886,7 +5843,6 @@ namespace
 
                 if (!next_challenge_nonce.empty())
                 {
-                    lic_log("heartbeat_compose_challenge_tpm_pre");
                     std::string sealed;
                     std::string sealed_message = std::string("aida-tpm-challenge|")
                         + next_challenge_id + "|"
@@ -5917,14 +5873,12 @@ namespace
                     const bool sealed_added = !sealed.empty();
                     if (sealed_added)
                         body["challenge_tpm_seal"] = std::move(sealed);
-                    lic_log_fmt("heartbeat_compose_challenge_tpm_post sealed=%d", sealed_added ? 1 : 0);
+                    else if (anti_tamper::tpm_attest::is_available())
+                        lic_log("heartbeat_compose_challenge_tpm_unsealed");
                 }
 
-
-                lic_log("heartbeat_compose_tpm_state_pre");
                 if (anti_tamper::tpm_attest::is_available())
                 {
-                    lic_log("heartbeat_compose_tpm_available");
                     if (anti_tamper::tpm_attest::ensure_counter_defined(
                             anti_tamper::tpm_attest::TPM_NV_INDEX_AIDA_COUNTER))
                     {
@@ -5955,27 +5909,21 @@ namespace
                     hw["txt"] = caps.txt_supported;
                     hw["pluton"] = caps.pluton_supported;
                     body["hw_attest_caps"] = std::move(hw);
-                    lic_log("heartbeat_compose_tpm_state_post");
                 }
                 else
                 {
                     body["tpm_unavailable"] = true;
-                    lic_log("heartbeat_compose_tpm_unavailable");
                 }
 
                 {
-                    lic_log("heartbeat_compose_honeypot_lock_pre");
                     std::unique_lock<std::mutex> lk;
                     if (!heartbeat_try_lock_mutex(s_honeypot_names_mtx, "honeypot_names", lk))
                         return heartbeat_lock_timeout_response("honeypot_names", error_out, response_out);
                     body["called_honeypot_names"] = json(s_honeypot_called_names);
-                    lic_log_fmt("heartbeat_compose_honeypot_lock_post count=%zu", s_honeypot_called_names.size());
                 }
 
-                lic_log("heartbeat_compose_driver_version_pre");
                 if (driver_bridge::is_loaded())
                     body["driver_proof_version"] = 3;
-                lic_log("heartbeat_compose_driver_version_post");
 
                 size_t code_hash_region_count = 0;
                 size_t code_hash_drifted_regions = 0;
@@ -5983,12 +5931,10 @@ namespace
                 std::string code_hash_live_value;
                 std::vector<code_section_hash_t> code_hashes_snapshot;
                 {
-                    lic_log("heartbeat_compose_code_hash_lock_pre");
                     std::unique_lock<std::mutex> lk;
                     if (!heartbeat_try_lock_mutex(s_code_hash_mtx, "code_hash", lk))
                         return heartbeat_lock_timeout_response("code_hash", error_out, response_out);
                     code_hashes_snapshot = s_code_hashes;
-                    lic_log_fmt("heartbeat_compose_code_hash_lock_post regions=%zu", code_hashes_snapshot.size());
                 }
                 code_hash_region_count = code_hashes_snapshot.size();
                 if (!code_hashes_snapshot.empty()) {
@@ -6004,17 +5950,18 @@ namespace
                             combined_live *= 1099511628211ULL;
                             const bool drift = (live != entry.hash);
                             if (drift) ++code_hash_drifted_regions;
-                            char dbg_region[256];
-                            _snprintf_s(dbg_region, sizeof(dbg_region), _TRUNCATE,
-                                "heartbeat_region[%zu]=%.8s base=0x%016llX size=0x%zX snapshot=0x%016llX live=0x%016llX drift=%d ch=0x%08X",
-                                ri, entry.name,
-                                static_cast<unsigned long long>(entry.base),
-                                entry.size,
-                                static_cast<unsigned long long>(entry.hash),
-                                static_cast<unsigned long long>(live),
-                                drift ? 1 : 0,
-                                entry.characteristics);
-                            lic_log(dbg_region);
+                            if (drift) {
+                                char dbg_region[256];
+                                _snprintf_s(dbg_region, sizeof(dbg_region), _TRUNCATE,
+                                    "heartbeat_region[%zu]=%.8s base=0x%016llX size=0x%zX snapshot=0x%016llX live=0x%016llX drift=1 ch=0x%08X",
+                                    ri, entry.name,
+                                    static_cast<unsigned long long>(entry.base),
+                                    entry.size,
+                                    static_cast<unsigned long long>(entry.hash),
+                                    static_cast<unsigned long long>(live),
+                                    entry.characteristics);
+                                lic_log(dbg_region);
+                            }
                         }
                         char hash_buf[32];
                         snprintf(hash_buf, sizeof(hash_buf), "%016llX",
@@ -6027,14 +5974,16 @@ namespace
                         code_hash_live_value.assign(live_buf);
                 }
                 {
-                    char dbg_ch[384];
-                    _snprintf_s(dbg_ch, sizeof(dbg_ch), _TRUNCATE,
-                        "heartbeat_compose_code_hash regions=%zu drifted=%zu snapshot=%.20s live=%.20s sent=snapshot",
-                        code_hash_region_count,
-                        code_hash_drifted_regions,
-                        code_hash_value.empty() ? "<absent>" : code_hash_value.c_str(),
-                        code_hash_live_value.empty() ? "<absent>" : code_hash_live_value.c_str());
-                    lic_log(dbg_ch);
+                    if (code_hash_drifted_regions != 0) {
+                        char dbg_ch[384];
+                        _snprintf_s(dbg_ch, sizeof(dbg_ch), _TRUNCATE,
+                            "heartbeat_compose_code_hash regions=%zu drifted=%zu snapshot=%.20s live=%.20s sent=snapshot",
+                            code_hash_region_count,
+                            code_hash_drifted_regions,
+                            code_hash_value.empty() ? "<absent>" : code_hash_value.c_str(),
+                            code_hash_live_value.empty() ? "<absent>" : code_hash_live_value.c_str());
+                        lic_log(dbg_ch);
+                    }
                 }
 
                 bool arc_hb_invoked = false;
@@ -6048,14 +5997,6 @@ namespace
                         arc_required_exports_ready() &&
                         s_fn_arc_heartbeat_ex) {
                         arc_hb_invoked = true;
-                        {
-                            char dbg_msg[256];
-                            _snprintf_s(dbg_msg, sizeof(dbg_msg), _TRUNCATE,
-                                "heartbeat_compose_arc_ex_inputs hb_count=%u code_hash=%.20s",
-                                heartbeat_index,
-                                code_hash_value.empty() ? "<absent>" : code_hash_value.c_str());
-                            lic_log(dbg_msg);
-                        }
                         arc_heartbeat_result_t hb{};
                         DWORD hb_seh = arc_call_heartbeat_ex_seh(
                             s_fn_arc_heartbeat_ex,
@@ -6077,7 +6018,7 @@ namespace
                         SecureZeroMemory(&hb, sizeof(hb));
                     }
                 }
-                {
+                if (arc_hb_invoked && !arc_hb_valid) {
                     char dbg_arc[256];
                     _snprintf_s(dbg_arc, sizeof(dbg_arc), _TRUNCATE,
                         "heartbeat_compose_arc loaded=%d fn_set=%d ex_fn_set=%d invoked=%d valid=%d proof_token_set=%d",
@@ -6160,7 +6101,7 @@ namespace
                         }
                     }
                 }
-                {
+                if (drv_loaded && drv_kernel && (!drv_proof_added || (relay_called && !relay_ok))) {
                     char dbg_drv[448];
                     _snprintf_s(dbg_drv, sizeof(dbg_drv), _TRUNCATE,
                         "heartbeat_compose_driver loaded=%d kernel=%d srv_nonce_present=%d srv_nonce_len=%zu "
@@ -6178,43 +6119,11 @@ namespace
                         static_cast<unsigned long long>(proof_cache_age_ms));
                     lic_log(dbg_drv);
                 }
-
-                {
-                    int64_t now_secs = static_cast<int64_t>(std::time(nullptr));
-                    int64_t issued_at = settings.license_issued_at;
-                    int64_t age = (issued_at > 0) ? (now_secs - issued_at) : -1;
-                    char dbg_sum[512];
-                    _snprintf_s(dbg_sum, sizeof(dbg_sum), _TRUNCATE,
-                        "heartbeat_compose_summary action=%.16s hb_count=%u session_age_s=%lld "
-                        "issued_at=%lld ttl=%lld code_hash_set=%d proof_token_set=%d driver_proof_set=%d "
-                        "honeypot_count=%d gate_bitmap=0x%llX req_seq=%llu req_ts_ms=%lld session_token_len=%zu hwid_len=%zu",
-                        action.c_str(),
-                        heartbeat_index,
-                        static_cast<long long>(age),
-                        static_cast<long long>(issued_at),
-                        static_cast<long long>(settings.license_ttl),
-                        body.contains("code_hash") ? 1 : 0,
-                        body.contains("proof_token") ? 1 : 0,
-                        body.contains("driver_proof") ? 1 : 0,
-                        static_cast<int>(body.contains("called_honeypot_names")
-                            ? body["called_honeypot_names"].size() : 0),
-                        static_cast<unsigned long long>(s_gate_bitmap.load(std::memory_order_acquire) & 0x00FFFFFFu),
-                        static_cast<unsigned long long>(req_seq),
-                        static_cast<long long>(req_ts_ms),
-                        session_token.size(),
-                        hwid.size());
-                    lic_log(dbg_sum);
-                }
             }
 
-            lic_log("call_validation_capsule_proof_pre");
             attach_standalone_capsule_proof(body, action, key, hwid, session_token, nonce);
-            lic_log("call_validation_capsule_proof_post");
-            lic_log("call_validation_body_dump_pre");
             std::string body_str = body.dump();
-            lic_log_fmt("call_validation_body_dump_post len=%zu", body_str.size());
 
-            lic_log("call_validation_endpoint_once_pre");
             if (call_validation_endpoint_once(action, key, hwid, session_token, nonce,
                                               body_str, error_out, response_out)) {
                 return true;
@@ -6604,9 +6513,7 @@ namespace
         const std::string previous_session_token = settings.license_session_token;
 
         settings.license_key = key;
-        lic_log("apply_valid_response_set_key");
         settings.license_plan = response.value("plan", "standard");
-        lic_log("apply_valid_response_set_plan");
 
 
         json cached_payload = json::object();
@@ -6615,23 +6522,17 @@ namespace
             if (existing.is_object())
                 cached_payload = std::move(existing);
         }
-        lic_log("apply_valid_response_cached_payload_built");
         for (auto it = response.begin(); it != response.end(); ++it)
             cached_payload[it.key()] = it.value();
-        lic_log("apply_valid_response_response_merged");
         cached_payload["hwid"] = hwid;
         cached_payload["license_key"] = key;
         if (!cached_payload.contains("issued_at") || !cached_payload["issued_at"].is_number())
             cached_payload["issued_at"] = static_cast<int64_t>(std::time(nullptr));
-        lic_log("apply_valid_response_pre_dump");
         settings.license_sig_payload = cached_payload.dump();
-        lic_log("apply_valid_response_post_dump");
 
         settings.license_server_sig = response.value("signature", "");
-        lic_log("apply_valid_response_set_sig");
         settings.license_session_token = response.contains("session_token")
             ? response["session_token"].get<std::string>() : settings.license_session_token;
-        lic_log("apply_valid_response_set_session_token");
         const bool response_has_server_nonce =
             response.contains("server_nonce") && response["server_nonce"].is_string();
         if (response_has_server_nonce) {
@@ -6646,10 +6547,6 @@ namespace
         } else {
             lic_log("apply_valid_response_server_nonce_absent_empty");
         }
-        lic_log_fmt("apply_valid_response_nonce_state had_field=%d nonce_len=%zu session_len=%zu",
-            response_has_server_nonce ? 1 : 0,
-            settings.license_server_nonce.size(),
-            settings.license_session_token.size());
         settings.license_client_nonce = response.contains("client_nonce")
             ? response["client_nonce"].get<std::string>() : settings.license_client_nonce;
         if (response.contains("auth_hmac_key_b64") && response["auth_hmac_key_b64"].is_string())
@@ -6763,8 +6660,6 @@ namespace
         {
             auto tier = vbs_enforcement::parse_plan_tier(settings.license_plan);
             bool eligible = vbs_enforcement::tier_eligible(tier);
-            lic_log_fmt("DIAG_VBS plan=%s tier=%d eligible=%d",
-                settings.license_plan.c_str(), (int)tier, eligible ? 1 : 0);
             if (eligible)
             {
                 vbs_enforcement::detect_capabilities();
@@ -6837,14 +6732,9 @@ namespace
 
         {
             std::string next_token_hex;
-            if (ratchet_advance(settings.license_server_nonce, next_token_hex) &&
-                !next_token_hex.empty())
-            {
-                lic_log_fmt("session_ratchet_advanced len=%zu", next_token_hex.size());
-            }
+            (void)ratchet_advance(settings.license_server_nonce, next_token_hex);
         }
 
-        lic_log("apply_valid_response_pre_validity_commit");
         {
             std::lock_guard<std::mutex> lk(s_state_mtx);
             s_magic.store(S_MAGIC_INIT ^ nonce_seed, std::memory_order_release);
@@ -6852,13 +6742,10 @@ namespace
             s_error.clear();
             set_obfuscated_valid(true, nonce_seed);
         }
-        lic_log("apply_valid_response_post_validity_commit");
 
-        lic_log("apply_valid_response_pre_save");
         const bool arc_cache_ok = s_arc_loaded.load(std::memory_order_acquire);
         settings.license_arc_load_ok = arc_cache_ok;
         settings.save();
-        lic_log("apply_valid_response_post_save");
 
         return true;
     }
@@ -6882,8 +6769,6 @@ namespace
     bool apply_valid_response(settings_sa_t& settings, const std::string& key,
                               const std::string& hwid, const json& response)
     {
-        lic_log("apply_valid_response_enter");
-
         if (s_apply_response_corrupted.load(std::memory_order_acquire))
         {
             lic_log("apply_valid_response_refused_binary_corrupted");
@@ -9034,19 +8919,13 @@ namespace
             const std::string nonce = generate_nonce();
             std::string error;
             json response;
-            lic_log("heartbeat_calling");
-            if (!full_test_running) {
-                lic_diag::dump_pe_self("pre_heartbeat_call");
-                lic_diag::dump_mitigation("pre_heartbeat_call");
-                lic_diag::thread_canary("pre_heartbeat_call");
-            }
             std::string hb_session_token = select_heartbeat_session_token(*settings);
             const bool hb_ok = call_validation_endpoint(*settings, "heartbeat", settings->license_key,
                                           s_cached_hwid, hb_session_token,
                                           nonce, error, response);
             if (!worker_active(worker_epoch))
                 break;
-            {
+            if (!hb_ok) {
                 char hbr[256];
                 _snprintf_s(hbr, sizeof(hbr), _TRUNCATE,
                     "heartbeat_result ok=%d consecutive_fail=%d err=%.150s",
@@ -9153,22 +9032,11 @@ namespace
 
             consecutive_failures = 0;
             cancel_silent_kill();
-            lic_log("heartbeat_success_applying");
-            if (!full_test_running) {
-                lic_diag::dump_pe_self("post_heartbeat_call");
-                lic_diag::dump_mitigation("post_heartbeat_call");
-                lic_diag::thread_canary("post_heartbeat_call");
-            }
             if (!apply_valid_response(*settings, settings->license_key, s_cached_hwid, response))
             {
                 lic_log("heartbeat_apply_response_failed");
                 enter_pending_activation(*settings, std::string("heartbeat_apply_failed"));
                 break;
-            }
-            if (!full_test_running) {
-                lic_diag::dump_pe_self("post_apply_valid_response");
-                lic_diag::dump_mitigation("post_apply_valid_response");
-                lic_diag::thread_canary("post_apply_valid_response");
             }
             if (s_activation_completed_at_ms.load(std::memory_order_acquire) == 0)
                 mark_activation_completed();
@@ -9178,7 +9046,6 @@ namespace
                 attempt_deferred_arc_fetch(*settings, s_cached_hwid);
                 lic_diag::thread_canary("post_attempt_deferred_arc_fetch");
             }
-            lic_log("heartbeat_apply_done");
         }
         lic_log_fmt("heartbeat_worker_exit epoch=%llu tid=%lu",
             static_cast<unsigned long long>(worker_epoch),
@@ -9205,13 +9072,6 @@ namespace
 
             const bool valid_now = check_obfuscated_valid();
             const size_t session_token_len = settings->license_session_token.size();
-            const size_t server_nonce_len = settings->license_server_nonce.size();
-            lic_log_fmt("srv_refresh_tick epoch=%llu valid=%d session_len=%zu nonce_len=%zu tid=%lu",
-                static_cast<unsigned long long>(worker_epoch),
-                valid_now ? 1 : 0,
-                session_token_len,
-                server_nonce_len,
-                static_cast<unsigned long>(GetCurrentThreadId()));
 
             if (!valid_now || settings->license_session_token.empty()) {
                 lic_log_fmt("srv_refresh_skip reason=invalid_or_missing_session valid=%d session_len=%zu",
@@ -9240,16 +9100,16 @@ namespace
             if (!worker_active(worker_epoch))
                 break;
             const uint64_t relay_start = static_cast<uint64_t>(GetTickCount64());
-            lic_log_fmt("srv_refresh_relay_begin epoch=%llu nonce_len=%zu",
-                static_cast<unsigned long long>(worker_epoch),
-                srv_nonce_str.size());
             bool relay_ok = relay_server_token_v2_if_ready(token_hash, srv_nonce_val, &driver_proof);
             DWORD relay_gle = relay_ok ? ERROR_SUCCESS : GetLastError();
-            lic_log_fmt("srv_refresh_relay_end ok=%d proof=%d gle=%lu elapsed_ms=%llu",
-                relay_ok ? 1 : 0,
-                driver_proof != 0 ? 1 : 0,
-                static_cast<unsigned long>(relay_gle),
-                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - relay_start));
+            const uint64_t relay_elapsed_ms = static_cast<uint64_t>(GetTickCount64()) - relay_start;
+            if (!relay_ok || driver_proof == 0 || relay_elapsed_ms >= 1000) {
+                lic_log_fmt("srv_refresh_relay_end ok=%d proof=%d gle=%lu elapsed_ms=%llu",
+                    relay_ok ? 1 : 0,
+                    driver_proof != 0 ? 1 : 0,
+                    static_cast<unsigned long>(relay_gle),
+                    static_cast<unsigned long long>(relay_elapsed_ms));
+            }
             if (relay_ok && driver_proof != 0)
                 store_driver_proof_cache(driver_proof, srv_nonce_str);
         }

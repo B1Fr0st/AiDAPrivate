@@ -40,6 +40,7 @@ namespace ioctl_codes {
     inline volatile ULONG g_server_ioctl_seed = 0;
     inline volatile ULONG g_server_ioctl_seed_previous = 0;
     inline volatile LONG64 g_server_ioctl_seed_rotated_qpc = 0;
+    inline constexpr LONG64 kPreviousSeedGraceTicks = 10ll * 10000000ll;
 
     __forceinline ULONG compute_base_from_seed(ULONG seed) {
         ULONG key = dynamic_key::get();
@@ -339,21 +340,37 @@ namespace dispatcher {
             LARGE_INTEGER now_qpc = KeQueryPerformanceCounter(&qpc_freq);
             LONG64 rotated_qpc = _InterlockedCompareExchange64(&ioctl_codes::g_server_ioctl_seed_rotated_qpc, 0, 0);
             LONG64 elapsed_qpc = rotated_qpc == 0 ? 0 : (now_qpc.QuadPart - rotated_qpc);
-            const LONG64 grace_ticks = qpc_freq.QuadPart;
-            if (rotated_qpc != 0 && elapsed_qpc >= 0 && elapsed_qpc <= grace_ticks) {
+            LONG64 elapsed_100ns = 0;
+            if (qpc_freq.QuadPart > 0 && elapsed_qpc >= 0) {
+                elapsed_100ns = (elapsed_qpc * 10000000ll) / qpc_freq.QuadPart;
+            }
+            HANDLE current_pid = PsGetCurrentProcessId();
+            HANDLE registered_pid = caller_validation::g_registered_client_pid;
+            const BOOLEAN pid_match = (registered_pid != NULL) && (current_pid == registered_pid);
+            if (rotated_qpc != 0 && qpc_freq.QuadPart > 0 && elapsed_qpc >= 0 &&
+                elapsed_100ns <= ioctl_codes::kPreviousSeedGraceTicks && pid_match) {
                 out.offset = out.offset_via_previous;
                 out.valid = TRUE;
                 out.accepted_via_previous = TRUE;
-                WW_LOG("dispatch_ioctl_seed_check effective=0x%08X expected_current=0x%08X expected_previous_offset=%lu accepted_via=previous elapsed_qpc=%lld grace_qpc=%lld base_current=0x%lX base_previous=0x%lX seed_hash_current=0x%08X seed_hash_previous=0x%08X",
-                    static_cast<ULONG>((code & 0x0000FFFFu)),
-                    static_cast<ULONG>(0x00220000u | ((out.base + out.offset_via_previous) << 2)),
+                WW_LOG("ioctl_seed_previous_accept code=0x%08X offset=%lu prev_seed_hash=0x%08X current_seed_hash=0x%08X elapsed_100ns=%lld grace_100ns=%lld base_current=0x%lX base_previous=0x%lX caller_pid=%llu registered_pid=%llu",
+                    code,
                     out.offset_via_previous,
-                    elapsed_qpc,
-                    grace_ticks,
+                    out.ioctl_seed_hash_previous,
+                    out.ioctl_seed_hash,
+                    elapsed_100ns,
+                    ioctl_codes::kPreviousSeedGraceTicks,
                     out.base,
                     out.base_previous,
-                    out.ioctl_seed_hash,
-                    out.ioctl_seed_hash_previous);
+                    static_cast<UINT64>(reinterpret_cast<ULONG_PTR>(current_pid)),
+                    static_cast<UINT64>(reinterpret_cast<ULONG_PTR>(registered_pid)));
+            } else if (rotated_qpc != 0 && qpc_freq.QuadPart > 0 && elapsed_qpc >= 0 &&
+                elapsed_100ns <= ioctl_codes::kPreviousSeedGraceTicks && !pid_match) {
+                WW_LOG("ioctl_seed_previous_reject_pid code=0x%08X offset=%lu caller_pid=%llu registered_pid=%llu elapsed_100ns=%lld",
+                    code,
+                    out.offset_via_previous,
+                    static_cast<UINT64>(reinterpret_cast<ULONG_PTR>(current_pid)),
+                    static_cast<UINT64>(reinterpret_cast<ULONG_PTR>(registered_pid)),
+                    elapsed_100ns);
             }
         }
         return out;
@@ -515,6 +532,9 @@ namespace dispatcher {
         const LARGE_INTEGER& start,
         const LARGE_INTEGER& freq)
     {
+        if (NT_SUCCESS(status))
+            return;
+
         WW_LOG("STARTUP_IOCTL_COMPLETE trace=%lld phase=%s name=%s raw_code=0x%08lx expected_code=0x%08lx decoded_valid=%u decoded_offset=%lu status=0x%08lx bytes=%lu input_size=%lu output_size=%lu secure_wrapped=%u handler_reached=%u activated=%ld registered_pid=%llu session_key_set=%u heartbeat_counter=%lu last_hb_set=%u server_token_set=%u server_seed_set=%u ioctl_seed_set=%u bridge_whoswho_tsc=%lld bridge_sentinel_tsc=%lld bridge_cmd=0x%08lx io_status=0x%08lx io_info=%llu elapsed_us=%llu cpu=%lu irql=%lu requestor_pid=%llu",
             trace_id,
             phase ? phase : "unknown",
@@ -863,67 +883,6 @@ namespace dispatcher {
         const ULONG startup_expected_code = early_decode.valid ? startup_ioctl_expected_code_from_offset(startup_offset) : 0;
         LARGE_INTEGER hvdt_dispatch_freq{};
         LARGE_INTEGER hvdt_dispatch_start = KeQueryPerformanceCounter(&hvdt_dispatch_freq);
-        if (startup_trace) {
-            WW_LOG("STARTUP_IOCTL_ENTER trace=%lld name=%s raw_code=0x%08lx expected_code=0x%08lx decoded_valid=%u decoded_offset=%lu encoded=0x%lx dyn_base=0x%lx key_hash=0x%08lx ioctl_seed_hash=0x%08lx input_size=%lu output_size=%lu requestor=%u requestor_pid=%llu current_pid=%llu current_tid=%llu cpu=%lu irql=%lu buffer_present=%u device_present=%u activated=%ld registered_pid=%llu session_key_set=%u heartbeat_counter=%lu last_hb_set=%u server_token_set=%u server_seed_set=%u ioctl_seed_set=%u bridge_whoswho_tsc=%lld bridge_sentinel_tsc=%lld bridge_cmd=0x%08lx",
-                startup_trace_id,
-                startup_name,
-                early_code,
-                startup_expected_code,
-                early_decode.valid ? 1u : 0u,
-                startup_offset,
-                early_decode.encoded,
-                early_decode.base,
-                early_decode.key_hash,
-                early_decode.ioctl_seed_hash,
-                early_input_size,
-                early_output_size,
-                irp ? static_cast<ULONG>(irp->RequestorMode) : 0xffffffffu,
-                requestor_pid_to_u64(irp),
-                handle_to_u64(PsGetCurrentProcessId()),
-                handle_to_u64(PsGetCurrentThreadId()),
-                KeGetCurrentProcessorNumber(),
-                static_cast<ULONG>(KeGetCurrentIrql()),
-                (irp && irp->AssociatedIrp.SystemBuffer) ? 1u : 0u,
-                device_object ? 1u : 0u,
-                _InterlockedCompareExchange(&g_driver_activated, 0, 0),
-                handle_to_u64(caller_validation::g_registered_client_pid),
-                _InterlockedCompareExchange(reinterpret_cast<volatile LONG*>(&g_session_key), 0, 0) != 0 ? 1u : 0u,
-                static_cast<ULONG>(_InterlockedCompareExchange(reinterpret_cast<volatile LONG*>(&g_heartbeat_counter), 0, 0)),
-                _InterlockedCompareExchange64(&g_last_heartbeat_time, 0, 0) != 0 ? 1u : 0u,
-                _InterlockedCompareExchange64(&g_server_token_time, 0, 0) != 0 ? 1u : 0u,
-                dynamic_key::g_server_seed != 0 ? 1u : 0u,
-                ioctl_codes::g_server_ioctl_seed != 0 ? 1u : 0u,
-                sentinel_bridge::g_bridge.whoswho_tsc,
-                sentinel_bridge::g_bridge.sentinel_tsc,
-                static_cast<ULONG>(sentinel_bridge::g_bridge.sentinel_cmd));
-        }
-        if (tier_a_trace) {
-            WW_LOG("TIRA_DISPATCH_ENTER trace=%lld raw_code=0x%08lx expected_tira=0x%08lx decoded_valid=%u decoded_offset=%lu encoded=0x%lx dyn_base=0x%lx key_hash=0x%08lx ioctl_seed_hash=0x%08lx input_size=%lu output_size=%lu requestor=%u requestor_pid=%llu current_pid=%llu current_tid=%llu cpu=%lu irql=%lu buffer_present=%u device_present=%u shape=%u activated=%ld registered_pid=%llu server_seed_set=%u ioctl_seed_set=%u",
-                tier_a_trace_id,
-                early_code,
-                early_expected_tira,
-                early_decode.valid ? 1u : 0u,
-                early_decode.offset,
-                early_decode.encoded,
-                early_decode.base,
-                early_decode.key_hash,
-                early_decode.ioctl_seed_hash,
-                early_input_size,
-                early_output_size,
-                irp ? static_cast<ULONG>(irp->RequestorMode) : 0xffffffffu,
-                requestor_pid_to_u64(irp),
-                handle_to_u64(PsGetCurrentProcessId()),
-                handle_to_u64(PsGetCurrentThreadId()),
-                KeGetCurrentProcessorNumber(),
-                static_cast<ULONG>(KeGetCurrentIrql()),
-                (irp && irp->AssociatedIrp.SystemBuffer) ? 1u : 0u,
-                device_object ? 1u : 0u,
-                looks_like_tier_a_buffer_shape(early_input_size, early_output_size) ? 1u : 0u,
-                _InterlockedCompareExchange(&g_driver_activated, 0, 0),
-                handle_to_u64(caller_validation::g_registered_client_pid),
-                dynamic_key::g_server_seed != 0 ? 1u : 0u,
-                ioctl_codes::g_server_ioctl_seed != 0 ? 1u : 0u);
-        }
         if (hvdt_trace) {
             HVD_LOG_IMMEDIATE("dispatch_enter trace=%lld step=%lu irp=%p system_buffer=%p raw_code=0x%08lx expected_hvdt=0x%08lx decoded_valid=%u decoded_offset=%lu encoded=0x%lx dyn_base=0x%lx key_hash=0x%08lx ioctl_seed_hash=0x%08lx input_size=%lu output_size=%lu requestor=%u requestor_pid=%llu current_pid=%llu current_tid=%llu cpu=%lu irql=%lu buffer_present=%u device_present=%u shape=%u io_status=0x%08lx io_info=%llu",
                 hvdt_trace_id,
@@ -1131,7 +1090,22 @@ namespace dispatcher {
 
         PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(irp);
 
-        const ULONG code = stack->Parameters.DeviceIoControl.IoControlCode;
+        ULONG code = stack->Parameters.DeviceIoControl.IoControlCode;
+        if (early_decode.accepted_via_previous && early_decode.valid &&
+            early_decode.offset != 0xffffffffu && early_decode.offset <= 62u) {
+            const ULONG canonical_code = ioctl_codes::make(early_decode.offset);
+            if (canonical_code != code) {
+                WW_LOG("ioctl_seed_previous_canonicalize raw_code=0x%08lx canonical_code=0x%08lx offset=%lu base_current=0x%lx base_previous=0x%lx caller_pid=%llu registered_pid=%llu",
+                    code,
+                    canonical_code,
+                    early_decode.offset,
+                    early_decode.base,
+                    early_decode.base_previous,
+                    handle_to_u64(PsGetCurrentProcessId()),
+                    handle_to_u64(caller_validation::g_registered_client_pid));
+                code = canonical_code;
+            }
+        }
         const ULONG input_size = stack->Parameters.DeviceIoControl.InputBufferLength;
         const ULONG output_size = stack->Parameters.DeviceIoControl.OutputBufferLength;
         PVOID buffer = irp->AssociatedIrp.SystemBuffer;
@@ -1163,27 +1137,6 @@ namespace dispatcher {
                 KeGetCurrentProcessorNumber(),
                 (ULONG)KeGetCurrentIrql());
         }
-        if (startup_trace) {
-            WW_LOG("STARTUP_IOCTL_STACK trace=%lld name=%s code=0x%08lx expected_code=0x%08lx decoded_valid=%u decoded_offset=%lu input_size=%lu output_size=%lu buffer=%p original_buffer=%p requestor=%u requestor_pid=%llu secure_comm_initialized=%ld master_key_valid=%ld elapsed_us=%llu cpu=%lu irql=%lu",
-                startup_trace_id,
-                startup_name,
-                code,
-                startup_expected_code,
-                early_decode.valid ? 1u : 0u,
-                early_decode.offset,
-                input_size,
-                output_size,
-                buffer,
-                original_buffer,
-                static_cast<ULONG>(irp->RequestorMode),
-                requestor_pid_to_u64(irp),
-                _InterlockedCompareExchange(&secure_comm::g_comm_initialized, 0, 0),
-                _InterlockedCompareExchange(&secure_comm::g_master_key_valid, 0, 0),
-                elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
-                KeGetCurrentProcessorNumber(),
-                static_cast<ULONG>(KeGetCurrentIrql()));
-        }
-
         if (!buffer) {
             if (code == ioctl_codes::STRM() || code == ioctl_codes::CKIL()) {
                 WW_LOG("netaction::DISPATCH null_buffer code=0x%08X input_size=%lu output_size=%lu",
@@ -3344,7 +3297,7 @@ namespace dispatcher {
             }
         }
 
-        if (tier_a_trace) {
+        if (tier_a_trace && !NT_SUCCESS(status)) {
             WW_LOG("TIRA_DISPATCH_PRE_COMPLETE trace=%lld raw_code=0x%08lx expected_tira=0x%08lx status=0x%08lx bytes=%lu handler_reached=%u secure_wrapped=%u activated=%ld registered_pid=%llu bridge_whoswho_seen=%u bridge_sentinel_seen=%u elapsed_us=%llu",
                 tier_a_trace_id,
                 code,

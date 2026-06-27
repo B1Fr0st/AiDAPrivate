@@ -17,6 +17,11 @@
 #include <unordered_map>
 #include <vector>
 
+namespace driver_bridge {
+std::vector<captured_packet_t> get_captured_packets_bounded(uint32_t max_packets, uint32_t deadline_ms);
+void cancel_inflight_capture();
+}
+
 namespace network_view {
 
 
@@ -155,6 +160,7 @@ public:
         if (!state)
             return true;
         state->running.store(false, std::memory_order_release);
+        driver_bridge::cancel_inflight_capture();
         const uint64_t t0 = static_cast<uint64_t>(GetTickCount64());
         std::unique_lock<std::mutex> lk(state->worker_mutex);
         const bool stopped = state->worker_cv.wait_for(lk, std::chrono::milliseconds(timeout_ms), [state]() { return !state->worker_active; });
@@ -312,14 +318,34 @@ private:
     }
 
     static void poll_loop(const std::shared_ptr<worker_state_t>& state) {
+        diag::log_tagged_fmt("tcp_tracker", "poll_loop_enter state=%p tid=%lu running=%d",
+            state.get(),
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            state->running.load(std::memory_order_acquire) ? 1 : 0);
         while (state->running.load(std::memory_order_acquire)) {
             if (driver_bridge::using_kernel_driver()) {
-                auto packets = driver_bridge::get_captured_packets(32);
+                diag::log_tagged_fmt("tcp_tracker", "poll_pre tid=%lu state=%p running=%d",
+                    static_cast<unsigned long>(GetCurrentThreadId()),
+                    state.get(),
+                    state->running.load(std::memory_order_acquire) ? 1 : 0);
+                auto packets = driver_bridge::get_captured_packets_bounded(32, 500);
+                diag::log_tagged_fmt("tcp_tracker", "poll_post tid=%lu state=%p running=%d packets=%zu",
+                    static_cast<unsigned long>(GetCurrentThreadId()),
+                    state.get(),
+                    state->running.load(std::memory_order_acquire) ? 1 : 0,
+                    packets.size());
+                if (!state->running.load(std::memory_order_acquire))
+                    break;
                 for (auto& pkt : packets) {
                     if (state->filter_pid == 0 || pkt.pid == state->filter_pid)
                         feed_packet(*state, pkt);
+                    if (!state->running.load(std::memory_order_acquire))
+                        break;
                 }
             }
+
+            if (!state->running.load(std::memory_order_acquire))
+                break;
 
             state->evict_counter++;
             if (state->evict_counter >= 12000) {
@@ -331,6 +357,9 @@ private:
             if (state->running.load(std::memory_order_acquire))
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
+        diag::log_tagged_fmt("tcp_tracker", "poll_loop_exit state=%p tid=%lu",
+            state.get(),
+            static_cast<unsigned long>(GetCurrentThreadId()));
     }
 
     mutable std::mutex state_mutex_;

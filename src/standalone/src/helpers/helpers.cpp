@@ -1871,37 +1871,10 @@ void helpers::render_title()
 		bool shift = ImGui::GetIO().KeyShift;
 
 		if (ImGui::IsKeyPressed(ImGuiKey_F11, false)) {
-			globals::ui::maximized = !globals::ui::maximized;
-			if (globals::ui::maximized) {
-				RECT r; GetWindowRect(g_hwnd, &r);
-				globals::ui::pre_max_x = (float)r.left;
-				globals::ui::pre_max_y = (float)r.top;
-				globals::ui::pre_max_w = (float)(r.right - r.left);
-				globals::ui::pre_max_h = (float)(r.bottom - r.top);
-				MONITORINFO mi = { sizeof(mi) };
-				GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST), &mi);
-				float mw = (float)(mi.rcWork.right - mi.rcWork.left);
-				float mh = (float)(mi.rcWork.bottom - mi.rcWork.top);
-				globals::ui::window_w = mw;
-				globals::ui::window_h = mh;
-				SetWindowPos(g_hwnd, nullptr,
-					mi.rcWork.left, mi.rcWork.top, (int)mw, (int)mh,
-					SWP_NOZORDER);
-				SetWindowRgn(g_hwnd, nullptr, TRUE);
-				DWM_WINDOW_CORNER_PREFERENCE cp = DWMWCP_DONOTROUND;
-				DwmSetWindowAttribute(g_hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cp, sizeof(cp));
-			} else {
-				globals::ui::window_w = globals::ui::pre_max_w;
-				globals::ui::window_h = globals::ui::pre_max_h;
-				SetWindowPos(g_hwnd, nullptr,
-					(int)globals::ui::pre_max_x, (int)globals::ui::pre_max_y,
-					(int)globals::ui::pre_max_w, (int)globals::ui::pre_max_h,
-					SWP_NOZORDER);
-				HRGN rgn = CreateRoundRectRgn(0, 0, (int)globals::ui::pre_max_w, (int)globals::ui::pre_max_h, 16, 16);
-				SetWindowRgn(g_hwnd, rgn, TRUE);
-				DWM_WINDOW_CORNER_PREFERENCE cp = DWMWCP_ROUND;
-				DwmSetWindowAttribute(g_hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cp, sizeof(cp));
-			}
+			if (::IsZoomed(g_hwnd))
+				::PostMessageW(g_hwnd, WM_SYSCOMMAND, SC_RESTORE, 0);
+			else
+				::PostMessageW(g_hwnd, WM_SYSCOMMAND, SC_MAXIMIZE, 0);
 		}
 
 		if (ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_B, false)) {
@@ -2199,12 +2172,24 @@ void helpers::render_title()
 				float normal_h = mh * 0.75f;
 				if (normal_w < 1000.f && mw >= 1000.f) normal_w = (std::min)(mw, 1000.f);
 				if (normal_h < 600.f && mh >= 600.f) normal_h = (std::min)(mh, 600.f);
-				globals::ui::pre_max_x = static_cast<float>(mi2.rcWork.left) + (mw - normal_w) * 0.5f;
-				globals::ui::pre_max_y = static_cast<float>(mi2.rcWork.top) + (mh - normal_h) * 0.5f;
+				int restore_x = static_cast<int>(static_cast<float>(mi2.rcWork.left) + (mw - normal_w) * 0.5f);
+				int restore_y = static_cast<int>(static_cast<float>(mi2.rcWork.top) + (mh - normal_h) * 0.5f);
+				globals::ui::pre_max_x = static_cast<float>(restore_x);
+				globals::ui::pre_max_y = static_cast<float>(restore_y);
 				globals::ui::pre_max_w = normal_w;
 				globals::ui::pre_max_h = normal_h;
-				if (diag::env_flag_enabled("AIDA_FILELESS_LAUNCH")) {
-					globals::ui::maximized = false;
+				const bool fileless_launch = diag::env_flag_enabled("AIDA_FILELESS_LAUNCH");
+				WINDOWPLACEMENT wp = { sizeof(wp) };
+				if (::GetWindowPlacement(g_hwnd, &wp)) {
+					wp.flags = 0;
+					wp.showCmd = fileless_launch ? SW_SHOWNORMAL : SW_SHOWMAXIMIZED;
+					wp.rcNormalPosition.left   = restore_x;
+					wp.rcNormalPosition.top    = restore_y;
+					wp.rcNormalPosition.right  = restore_x + static_cast<int>(normal_w);
+					wp.rcNormalPosition.bottom = restore_y + static_cast<int>(normal_h);
+					::SetWindowPlacement(g_hwnd, &wp);
+				}
+				if (fileless_launch) {
 					globals::ui::window_w = normal_w;
 					globals::ui::window_h = normal_h;
 					if (!fileless_initial_geometry_logged) {
@@ -2216,16 +2201,6 @@ void helpers::render_title()
 							static_cast<int>(mw),
 							static_cast<int>(mh));
 					}
-				} else {
-					globals::ui::maximized = true;
-					globals::ui::window_w = mw;
-					globals::ui::window_h = mh;
-					SetWindowPos(g_hwnd, nullptr,
-						mi2.rcWork.left, mi2.rcWork.top,
-						static_cast<int>(mw), static_cast<int>(mh), SWP_NOZORDER);
-					SetWindowRgn(g_hwnd, nullptr, TRUE);
-					DWM_WINDOW_CORNER_PREFERENCE cp = DWMWCP_DONOTROUND;
-					DwmSetWindowAttribute(g_hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cp, sizeof(cp));
 				}
 			} else {
 				float spd = 12.f;
@@ -3559,38 +3534,10 @@ void helpers::render_title()
 				aida::ui::with_alpha(mcol, a), 1.f, 0, 1.4f);
 		}
 		if (max_hov && !ui_input_gate::chrome_input_blocked() && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-			if (globals::ui::maximized) {
-				globals::ui::maximized = false;
-				globals::ui::window_w = globals::ui::pre_max_w;
-				globals::ui::window_h = globals::ui::pre_max_h;
-				SetWindowPos(g_hwnd, nullptr,
-					(int)globals::ui::pre_max_x, (int)globals::ui::pre_max_y,
-					(int)globals::ui::pre_max_w, (int)globals::ui::pre_max_h,
-					SWP_NOZORDER);
-				HRGN rgn = CreateRoundRectRgn(0, 0, (int)globals::ui::pre_max_w, (int)globals::ui::pre_max_h, 16, 16);
-				SetWindowRgn(g_hwnd, rgn, TRUE);
-				DWM_WINDOW_CORNER_PREFERENCE cp_w = DWMWCP_ROUND;
-				DwmSetWindowAttribute(g_hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cp_w, sizeof(cp_w));
-			} else {
-				RECT wr; GetWindowRect(g_hwnd, &wr);
-				globals::ui::pre_max_x = (float)wr.left;
-				globals::ui::pre_max_y = (float)wr.top;
-				globals::ui::pre_max_w = globals::ui::window_w;
-				globals::ui::pre_max_h = globals::ui::window_h;
-				globals::ui::maximized = true;
-				MONITORINFO mi = { sizeof(mi) };
-				GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST), &mi);
-				float mw = (float)(mi.rcWork.right - mi.rcWork.left);
-				float mh = (float)(mi.rcWork.bottom - mi.rcWork.top);
-				globals::ui::window_w = mw;
-				globals::ui::window_h = mh;
-				SetWindowPos(g_hwnd, nullptr,
-					mi.rcWork.left, mi.rcWork.top, (int)mw, (int)mh,
-					SWP_NOZORDER);
-				SetWindowRgn(g_hwnd, nullptr, TRUE);
-				DWM_WINDOW_CORNER_PREFERENCE cp_w = DWMWCP_DONOTROUND;
-				DwmSetWindowAttribute(g_hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cp_w, sizeof(cp_w));
-			}
+			if (::IsZoomed(g_hwnd))
+				::PostMessageW(g_hwnd, WM_SYSCOMMAND, SC_RESTORE, 0);
+			else
+				::PostMessageW(g_hwnd, WM_SYSCOMMAND, SC_MAXIMIZE, 0);
 		}
 		ctl_off += metrics.title_control + gap * 1.5f;
 
@@ -3608,7 +3555,7 @@ void helpers::render_title()
 		dl->AddLine(ImVec2(minc_x - 5.f, minc_y), ImVec2(minc_x + 5.f, minc_y),
 			aida::ui::with_alpha(mncol, a), 1.7f);
 		if (min_hov && !ui_input_gate::chrome_input_blocked() && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
-			ShowWindow(g_hwnd, SW_MINIMIZE);
+			::PostMessageW(g_hwnd, WM_SYSCOMMAND, SC_MINIMIZE, 0);
 		ctl_off += metrics.title_control + gap * 3.f;
 
 
@@ -5297,6 +5244,7 @@ void helpers::render_title()
 	g_render_section = "left_panel_done";
 	}
 
+	g_render_section = "title_strip_layout";
 	float ab_extra = g_sa_settings.activity_bar_visible ? metrics.activity_bar_w : 0.f;
 	float left_gap = (left_w > 1.f) ? (left_w + gap + ab_extra) : ab_extra;
 	float hx0 = wp_m.x + pad + left_gap, hy0 = wp_m.y + content_top;
@@ -5437,6 +5385,7 @@ void helpers::render_title()
 			bool error = false;
 			float width = 0.f;
 		};
+		g_render_section = "title_strip_entries_build";
 		std::vector<strip_entry_t> strip_entries;
 		strip_entries.reserve(file_tabs::tabs.size() + 8);
 
@@ -5462,7 +5411,18 @@ void helpers::render_title()
 		}
 
 		{
+			g_render_section = "title_strip_psv_snapshot";
+			const unsigned long long psv_snap1_t0 = GetTickCount64();
 			auto psv_tabs_for_strip = pseudocode_view::snapshot_tabs();
+			const unsigned long long psv_snap1_elapsed = GetTickCount64() - psv_snap1_t0;
+			if (psv_snap1_elapsed >= 50ULL) {
+				diag::log_tagged_critical_fmt("helpers",
+					"helpers_psv_snapshot1_slow elapsed_ms=%llu tabs=%zu tid=%lu tick_ms=%llu",
+					psv_snap1_elapsed,
+					psv_tabs_for_strip.size(),
+					static_cast<unsigned long>(GetCurrentThreadId()),
+					static_cast<unsigned long long>(GetTickCount64()));
+			}
 			bool psv_view_active = (globals::ui::active_center_view == center_view_t::pseudocode);
 			uint64_t active_psv_addr = pseudocode_view::active_tab_address();
 			for (auto& pt : psv_tabs_for_strip) {
@@ -5538,6 +5498,7 @@ void helpers::render_title()
 		wdl->PushClipRect(ImVec2(strip_tabs_x0 - 2.f, strip_tab_y0 - 8.f),
 			ImVec2(strip_tabs_x1 + 2.f, strip_tab_y1 + 8.f), true);
 
+		g_render_section = "title_strip_file_tabs_render";
 		if (!file_tabs::tabs.empty()) {
 			const float tab_pad_x = 10.f;
 			const float tab_gap   = 2.f;
@@ -5676,7 +5637,18 @@ void helpers::render_title()
 		}
 
 		{
+			g_render_section = "title_strip_psv_render";
+			const unsigned long long psv_snap2_t0 = GetTickCount64();
 			auto psv_tabs = pseudocode_view::snapshot_tabs();
+			const unsigned long long psv_snap2_elapsed = GetTickCount64() - psv_snap2_t0;
+			if (psv_snap2_elapsed >= 50ULL) {
+				diag::log_tagged_critical_fmt("helpers",
+					"helpers_psv_snapshot2_slow elapsed_ms=%llu tabs=%zu tid=%lu tick_ms=%llu",
+					psv_snap2_elapsed,
+					psv_tabs.size(),
+					static_cast<unsigned long>(GetCurrentThreadId()),
+					static_cast<unsigned long long>(GetTickCount64()));
+			}
 			if (!psv_tabs.empty()) {
 				bool psv_view_active = (globals::ui::active_center_view == center_view_t::pseudocode);
 				uint64_t active_psv_addr = pseudocode_view::active_tab_address();
@@ -5878,6 +5850,7 @@ void helpers::render_title()
 			}
 		};
 
+		g_render_section = "title_strip_nav";
 		if (strip_show_nav) {
 			float chev_y0 = strip_tab_y0 + 2.f;
 			float chev_y1 = strip_tab_y1 - 2.f;
@@ -5973,6 +5946,7 @@ void helpers::render_title()
 				ImGui::OpenPopup("##tab_strip_dropdown");
 			}
 
+			g_render_section = "title_strip_dropdown_popup";
 			ImGui::SetNextWindowPos(ImVec2(strip_drop_x1 - 280.f, strip_tab_y1 + 4.f),
 				ImGuiCond_Always);
 			if (ImGui::BeginPopup("##tab_strip_dropdown",
@@ -6062,6 +6036,7 @@ void helpers::render_title()
 		strip_st->SetFloat(strip_id_scroll_target, strip_scroll_target);
 
 
+		g_render_section = "title_hub_nav";
 		float hub_active_x0 = 0.f;
 		float hub_active_x1 = 0.f;
 		float hub_active_y1 = 0.f;
@@ -6097,6 +6072,7 @@ void helpers::render_title()
 		const float hub_left_limit = hx0 + hdr_pad + aida::ui::scale_px(72.f, metrics.scale);
 
 		{
+			g_render_section = "title_hub_network";
 			bool net_is_active = (globals::ui::active_center_view == center_view_t::network_view);
 			const char* net_label = "Network";
 			ImVec2 nts = ImGui::CalcTextSize(net_label);
@@ -6148,6 +6124,7 @@ void helpers::render_title()
 
 
 		{
+			g_render_section = "title_hub_scan";
 			auto scv = globals::ui::active_center_view;
 			bool scan_is_active = (scv == center_view_t::scan_hub
 				|| scv == center_view_t::memory_scanner
@@ -6675,6 +6652,7 @@ void helpers::render_title()
 		}
 
 		{
+			g_render_section = "title_run_confirm_popup";
 			ImVec2 vp = ImGui::GetIO().DisplaySize;
 			ImGui::SetNextWindowPos(ImVec2(vp.x * 0.5f, vp.y * 0.5f),
 				ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
@@ -6714,6 +6692,7 @@ void helpers::render_title()
 		}
 
 		{
+			g_render_section = "title_run_pick_popup";
 			ImVec2 vp = ImGui::GetIO().DisplaySize;
 			ImGui::SetNextWindowPos(ImVec2(vp.x * 0.5f, vp.y * 0.5f),
 				ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
@@ -6722,6 +6701,7 @@ void helpers::render_title()
 				ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
 				ImGui::TextUnformatted("Which binary do you want to run?");
 				ImGui::Separator();
+				const unsigned long long run_pick_iter_t0 = GetTickCount64();
 				size_t sess_count = analysis_session::session_count();
 				if (s_run_pick_selected >= static_cast<int>(sess_count))
 					s_run_pick_selected = static_cast<int>(sess_count) - 1;
@@ -6754,6 +6734,15 @@ void helpers::render_title()
 					ImGui::PopID();
 				}
 				ImGui::EndChild();
+				const unsigned long long run_pick_iter_elapsed = GetTickCount64() - run_pick_iter_t0;
+				if (run_pick_iter_elapsed >= 50ULL) {
+					diag::log_tagged_critical_fmt("helpers",
+						"helpers_run_pick_session_iter_slow elapsed_ms=%llu count=%zu tid=%lu tick_ms=%llu",
+						run_pick_iter_elapsed,
+						sess_count,
+						static_cast<unsigned long>(GetCurrentThreadId()),
+						static_cast<unsigned long long>(GetTickCount64()));
+				}
 				ImGui::Spacing();
 				bool launch_btn = aida::ui::components::button("Continue",
 					aida::ui::components::button_kind_t::primary,
@@ -6790,7 +6779,18 @@ void helpers::render_title()
 			}
 		}
 
+		g_render_section = "title_spawn_target_dialog";
+		const unsigned long long spawn_target_t0 = GetTickCount64();
 		spawn_target_dialog::render();
+		const unsigned long long spawn_target_elapsed = GetTickCount64() - spawn_target_t0;
+		if (spawn_target_elapsed >= 50ULL) {
+			diag::log_tagged_critical_fmt("helpers",
+				"helpers_spawn_target_render_slow elapsed_ms=%llu tid=%lu tick_ms=%llu",
+				spawn_target_elapsed,
+				static_cast<unsigned long>(GetCurrentThreadId()),
+				static_cast<unsigned long long>(GetTickCount64()));
+		}
+		g_render_section = "title_spawn_target_consume";
 		spawn_target_dialog::result_t spawn_res;
 		if (spawn_target_dialog::consume_result(spawn_res) && spawn_res.accepted) {
 			run_target::launch_options_t opts = spawn_res.launch_options;
@@ -6823,6 +6823,7 @@ void helpers::render_title()
 					+ (exe_log.empty() ? std::string("target") : exe_log),
 				toast_notification::toast_type_t::info, 3.0f);
 
+			g_render_section = "title_spawn_target_post";
 			work_queue::post([opts, exe_log]() {
 				uint32_t new_pid = 0;
 				run_target::launch_result_t lr{};
@@ -6879,6 +6880,7 @@ void helpers::render_title()
 	const float session_tabs_h = 32.f;
 	float center_content_w = (std::max)(center_w - di_pad * 2.f, 1.f);
 	float center_content_h = (std::max)(disasm_child_h - di_pad * 2.f - session_tabs_h, 1.f);
+	g_render_section = "title_session_tabs";
 	{
 		ImVec2 wpos = ImGui::GetWindowPos();
 		float tabs_screen_x = wpos.x + pad + left_gap + di_pad;
@@ -6886,6 +6888,7 @@ void helpers::render_title()
 		float tabs_w = center_content_w;
 		render_session_tabs(tabs_screen_x, tabs_screen_y, tabs_w, session_tabs_h, a);
 	}
+	g_render_section = "title_pre_center_pump";
 	ImGui::SetCursorPos(ImVec2(pad + left_gap + di_pad, disasm_child_y + di_pad + session_tabs_h));
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f,0.f));
 	ImGui::BeginChild("##center_content_scroll",

@@ -4056,6 +4056,133 @@ bool voyager::device_t::query_memory(std::uint64_t address, memory_region_info& 
     return true;
 }
 
+namespace {
+    struct bounded_io_watchdog_ctx_t {
+        HANDLE thread_handle;
+        std::atomic<bool>* fired;
+    };
+
+    VOID CALLBACK bounded_io_watchdog_fire(PVOID arg, BOOLEAN /*timer_or_wait_fired*/) {
+        auto* ctx = static_cast<bounded_io_watchdog_ctx_t*>(arg);
+        if (!ctx) return;
+        if (ctx->fired) ctx->fired->store(true, std::memory_order_release);
+        if (ctx->thread_handle && thread_hijack::pCancelSynchronousIo) {
+            thread_hijack::pCancelSynchronousIo(ctx->thread_handle);
+        }
+    }
+}
+
+bool voyager::device_t::protect_memory_bounded(std::uint64_t address, std::uint64_t size, std::uint32_t new_protect, std::uint32_t* old_protect, std::uint32_t deadline_ms) noexcept {
+    const ULONGLONG t0 = GetTickCount64();
+    HANDLE self_thread = nullptr;
+    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(),
+            &self_thread, THREAD_TERMINATE | THREAD_SET_CONTEXT | SYNCHRONIZE | 0x0001 /*THREAD_QUERY_LIMITED_INFORMATION*/,
+            FALSE, 0)) {
+        self_thread = nullptr;
+    }
+    std::atomic<bool> cancel_fired{false};
+    bounded_io_watchdog_ctx_t ctx{ self_thread, &cancel_fired };
+    HANDLE timer = nullptr;
+    if (deadline_ms > 0 && self_thread != nullptr) {
+        if (!CreateTimerQueueTimer(&timer, nullptr, bounded_io_watchdog_fire, &ctx,
+                deadline_ms, 0, WT_EXECUTEONLYONCE)) {
+            timer = nullptr;
+        }
+    }
+    diag::log_tagged_fmt("comm",
+        "protect_memory_bounded_pre pid=%lu addr=0x%016llX size=0x%llX new=0x%08X deadline_ms=%u timer=%p self_thread=%p",
+        static_cast<unsigned long>(process_id_),
+        static_cast<unsigned long long>(address),
+        static_cast<unsigned long long>(size),
+        static_cast<unsigned int>(new_protect),
+        deadline_ms,
+        timer,
+        self_thread);
+    bool ok = protect_memory(address, size, new_protect, old_protect);
+    DWORD post_err = ok ? ERROR_SUCCESS : GetLastError();
+    if (timer) {
+        DeleteTimerQueueTimer(nullptr, timer, INVALID_HANDLE_VALUE);
+    }
+    bool was_cancelled = cancel_fired.load(std::memory_order_acquire);
+    if (self_thread) {
+        CloseHandle(self_thread);
+    }
+    diag::log_tagged_fmt("comm",
+        "protect_memory_bounded_post pid=%lu addr=0x%016llX size=0x%llX new=0x%08X ok=%d cancelled=%d err=%lu elapsed_ms=%llu deadline_ms=%u",
+        static_cast<unsigned long>(process_id_),
+        static_cast<unsigned long long>(address),
+        static_cast<unsigned long long>(size),
+        static_cast<unsigned int>(new_protect),
+        ok ? 1 : 0,
+        was_cancelled ? 1 : 0,
+        static_cast<unsigned long>(post_err),
+        static_cast<unsigned long long>(GetTickCount64() - t0),
+        deadline_ms);
+    if (!ok) {
+        SetLastError(was_cancelled ? ERROR_OPERATION_ABORTED : post_err);
+    }
+    return ok;
+}
+
+void voyager::device_t::cancel_inflight_capture() noexcept {
+    inflight_capture_cancel_pending_.store(true, std::memory_order_release);
+    void* thread_handle = inflight_capture_thread_.load(std::memory_order_acquire);
+    if (thread_handle && thread_hijack::pCancelSynchronousIo) {
+        thread_hijack::pCancelSynchronousIo(static_cast<HANDLE>(thread_handle));
+        diag::log_tagged_fmt("driver_comm_net",
+            "cancel_inflight_capture fired thread_handle=%p", thread_handle);
+    } else {
+        diag::log_tagged_fmt("driver_comm_net",
+            "cancel_inflight_capture noop thread_handle=%p pCancelSynchronousIo=%p",
+            thread_handle, thread_hijack::pCancelSynchronousIo);
+    }
+}
+
+std::vector<voyager::device_t::captured_packet> voyager::device_t::get_captured_packets_bounded(std::uint32_t max_packets, std::uint32_t deadline_ms) noexcept {
+    const ULONGLONG t0 = GetTickCount64();
+    HANDLE self_thread = nullptr;
+    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(),
+            &self_thread, THREAD_TERMINATE | THREAD_SET_CONTEXT | SYNCHRONIZE | 0x0001,
+            FALSE, 0)) {
+        self_thread = nullptr;
+    }
+    inflight_capture_thread_.store(self_thread, std::memory_order_release);
+    inflight_capture_cancel_pending_.store(false, std::memory_order_release);
+    std::atomic<bool> deadline_fired{false};
+    bounded_io_watchdog_ctx_t ctx{ self_thread, &deadline_fired };
+    HANDLE timer = nullptr;
+    if (deadline_ms > 0 && self_thread != nullptr) {
+        if (!CreateTimerQueueTimer(&timer, nullptr, bounded_io_watchdog_fire, &ctx,
+                deadline_ms, 0, WT_EXECUTEONLYONCE)) {
+            timer = nullptr;
+        }
+    }
+    diag::log_tagged_fmt("driver_comm_net",
+        "get_captured_packets_bounded_pre max=%u deadline_ms=%u timer=%p self_thread=%p",
+        max_packets, deadline_ms, timer, self_thread);
+    std::vector<captured_packet> packets = get_captured_packets(max_packets);
+    DWORD post_err = GetLastError();
+    if (timer) {
+        DeleteTimerQueueTimer(nullptr, timer, INVALID_HANDLE_VALUE);
+    }
+    bool cancelled_by_stop = inflight_capture_cancel_pending_.exchange(false, std::memory_order_acq_rel);
+    bool cancelled_by_deadline = deadline_fired.load(std::memory_order_acquire) && !cancelled_by_stop;
+    inflight_capture_thread_.store(nullptr, std::memory_order_release);
+    if (self_thread) {
+        CloseHandle(self_thread);
+    }
+    diag::log_tagged_fmt("driver_comm_net",
+        "get_captured_packets_bounded_post max=%u deadline_ms=%u packets=%zu cancelled_by_stop=%d cancelled_by_deadline=%d err=%lu elapsed_ms=%llu",
+        max_packets,
+        deadline_ms,
+        packets.size(),
+        cancelled_by_stop ? 1 : 0,
+        cancelled_by_deadline ? 1 : 0,
+        static_cast<unsigned long>(post_err),
+        static_cast<unsigned long long>(GetTickCount64() - t0));
+    return packets;
+}
+
 bool voyager::device_t::protect_memory(std::uint64_t address, std::uint64_t size, std::uint32_t new_protect, std::uint32_t* old_protect) noexcept {
     const DWORD pm_code = ioctl_codes::PM();
     RC_UM_DBG("protect_memory: ENTER pid=%lu addr=0x%016llX size=0x%llX new=0x%08X ioctl=0x%08X connected=%d",
