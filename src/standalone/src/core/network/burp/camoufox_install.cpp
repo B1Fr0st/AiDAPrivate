@@ -2750,9 +2750,9 @@ struct probe_guard_t
     }
 };
 
-constexpr DWORD kInteractiveProbeTimeoutMs = 5000;
+constexpr DWORD kInteractiveProbeTimeoutMs = 30000;
 constexpr DWORD kBackgroundProbeTimeoutMs = 5000;
-constexpr DWORD kSetupProbeTimeoutMs = 5000;
+constexpr DWORD kSetupProbeTimeoutMs = 30000;
 
 status_t probe_impl(bool allow_when_busy, DWORD timeout_ms);
 

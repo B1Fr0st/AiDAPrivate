@@ -2201,6 +2201,30 @@ void helpers::render_title()
 							static_cast<int>(mw),
 							static_cast<int>(mh));
 					}
+				} else {
+					RECT cr{};
+					::GetClientRect(g_hwnd, &cr);
+					float cw = static_cast<float>(cr.right - cr.left);
+					float chh = static_cast<float>(cr.bottom - cr.top);
+					if (cw >= 200.f && chh >= 200.f) {
+						globals::ui::window_w = cw;
+						globals::ui::window_h = chh;
+					} else {
+						globals::ui::window_w = normal_w;
+						globals::ui::window_h = normal_h;
+					}
+					static bool dev_initial_geometry_logged = false;
+					if (!dev_initial_geometry_logged) {
+						dev_initial_geometry_logged = true;
+						diag::log_tagged_critical_fmt("render",
+							"dev_initial_ide_geometry target=%d,%d work=%d,%d cw=%d ch=%d maximized=1",
+							static_cast<int>(normal_w),
+							static_cast<int>(normal_h),
+							static_cast<int>(mw),
+							static_cast<int>(mh),
+							static_cast<int>(cw),
+							static_cast<int>(chh));
+					}
 				}
 			} else {
 				float spd = 12.f;

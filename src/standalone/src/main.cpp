@@ -5080,6 +5080,12 @@ int main(int, char**)
                 if (ide_resize_applied) {
                     globals::ui::window_w = (float)resize_w;
                     globals::ui::window_h = (float)resize_h;
+                    diag::log_tagged_critical_fmt("render",
+                        "wm_size_window_geometry_mirror w=%u h=%u maximized=%d frame=%llu",
+                        resize_w,
+                        resize_h,
+                        globals::ui::maximized ? 1 : 0,
+                        (unsigned long long)frame_number);
                 }
                 ::SetWindowRgn(hwnd, nullptr, TRUE);
                 g_ResizeWidth = g_ResizeHeight = 0;
@@ -5261,7 +5267,7 @@ int main(int, char**)
                     SetWindowPos(hwnd, nullptr, 0, 0, iw, ih, flags);
                 }
             }
-            if (cur_state == 3 && iw >= 1000 && ih >= 600)
+            if (cur_state == 3 && ((iw >= 1000 && ih >= 600) || (globals::ui::welcome_done && license::runtime_ready(anti_tamper::state::get().violation_latched.load(std::memory_order_acquire), test_all_features::is_running()))))
                 ide_resize_applied = true;
 
             if (defer_fileless_ide_region) {

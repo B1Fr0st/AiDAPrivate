@@ -1319,7 +1319,6 @@ bool initialize()
     g_state.sub_state = aida::events::subscribe(
         aida::burp::camoufox::kBridgeStateChanged,
         [](const aida::burp::camoufox::bridge_state_changed_t& ev) { on_bridge_state_changed(ev); });
-    schedule_install_probe(false);
     schedule_status_poll();
     ::diag::log_tagged("headless_v", "headless_view_initialized");
     return true;

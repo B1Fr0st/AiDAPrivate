@@ -3007,6 +3007,10 @@ public:
         return signalled;
     }
 
+    std::uint64_t current_install_stop_generation() const noexcept {
+        return install_stop_generation_.load(std::memory_order_acquire);
+    }
+
 
     struct session_info_t {
         uint32_t session_id;

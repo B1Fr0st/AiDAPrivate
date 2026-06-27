@@ -804,6 +804,19 @@ inline void stop_hunt()
 		static_cast<unsigned long long>(g_state.last_uninstall_elapsed_ms.load(std::memory_order_acquire)));
 	g_state.stop_request_tick_ms.store(stop_tick, std::memory_order_release);
 	g_state.cancel.store(true);
+	const size_t signalled = page_guard_engine::g_pg_engine.signal_stop_all();
+	const std::uint64_t engine_stop_generation =
+		page_guard_engine::g_pg_engine.current_install_stop_generation();
+	const char* remote_call_diag_id = driver_bridge::current_remote_call_diag_id();
+	const bool remote_call_cancelled = driver_bridge::current_remote_call_cancelled();
+	const uint64_t remote_call_deadline_ms = driver_bridge::current_remote_call_deadline_ms();
+	diag::log_tagged_fmt("integrity_hunter",
+		"stop_hunt_propagated engine_stop_generation=%llu signalled_sessions=%zu remote_call_diag_id=%s remote_call_cancelled=%d remote_call_deadline_ms=%llu",
+		static_cast<unsigned long long>(engine_stop_generation),
+		signalled,
+		remote_call_diag_id ? remote_call_diag_id : "",
+		remote_call_cancelled ? 1 : 0,
+		static_cast<unsigned long long>(remote_call_deadline_ms));
 }
 
 inline idle_result_t wait_until_idle_result(uint32_t timeout_ms)
@@ -829,6 +842,16 @@ inline idle_result_t wait_until_idle_result(uint32_t timeout_ms)
 					static_cast<unsigned long long>(result.uninstall_ms),
 					static_cast<unsigned long long>(result.stop_to_worker_exit_ms),
 					static_cast<unsigned long long>(result.last_uninstall_elapsed_ms));
+				const size_t re_signalled = page_guard_engine::g_pg_engine.signal_stop_all();
+				const std::uint64_t engine_stop_generation =
+					page_guard_engine::g_pg_engine.current_install_stop_generation();
+				diag::log_tagged_fmt("integrity_hunter",
+					"wait_idle_timeout_re_signal engine_stop_generation=%llu signalled_sessions=%zu remote_call_diag_id=%s remote_call_cancelled=%d remote_call_deadline_ms=%llu",
+					static_cast<unsigned long long>(engine_stop_generation),
+					re_signalled,
+					driver_bridge::current_remote_call_diag_id() ? driver_bridge::current_remote_call_diag_id() : "",
+					driver_bridge::current_remote_call_cancelled() ? 1 : 0,
+					static_cast<unsigned long long>(driver_bridge::current_remote_call_deadline_ms()));
 				return result;
 			}
 		}

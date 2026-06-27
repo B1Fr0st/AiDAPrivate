@@ -607,6 +607,8 @@ namespace
     }
 
     uint32_t        g_pid = 0;
+    std::atomic<uint32_t> g_pid_snapshot{0};
+    std::atomic_bool g_lower_remote_call_last_abandoned{false};
     std::string     g_process_name;
     std::string     g_last_error;
     std::atomic<bool> g_last_error_present{false};
@@ -1516,6 +1518,10 @@ namespace
         diag.seh_rsp = outcome.seh_rsp;
         diag.seh_rbp = outcome.seh_rbp;
         g_last_remote_call_execution_diag = std::move(diag);
+        if (outcome.executing_abandoned)
+            g_lower_remote_call_last_abandoned.store(true, std::memory_order_release);
+        else if (outcome.completed && outcome.lower_ok && !outcome.lower_lock_timeout)
+            g_lower_remote_call_last_abandoned.store(false, std::memory_order_release);
     }
 
     void complete_lower_remote_call_item(const std::shared_ptr<lower_remote_call_work_item_t>& item,
@@ -4387,6 +4393,7 @@ namespace driver_bridge
             g_has_vm_read = false;
             g_kernel_attached = false;
             g_pid = 0;
+            g_pid_snapshot.store(0, std::memory_order_release);
             const std::uint64_t generation = g_active_pid_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
             g_process_name.clear();
             g_driver_watchdog_stop.store(true, std::memory_order_release);
@@ -4512,6 +4519,7 @@ namespace driver_bridge
                 release_ctx_handle(kv.second);
             g_processes.clear();
             g_pid = 0;
+            g_pid_snapshot.store(0, std::memory_order_release);
             g_process_name.clear();
             g_has_vm_read = false;
             g_kernel_attached = false;
@@ -5002,6 +5010,17 @@ namespace driver_bridge
             return false;
         }
 
+        if (device && device->session_invalidated()) {
+            set_reason("kernel_session_invalidated");
+            driver_critical_fmt("kernel_session_available ok=0 reason=kernel_session_invalidated initialized=%d kernel=%d connected=%d last_hb_err=%lu last_error='%.160s'",
+                initialized ? 1 : 0,
+                kernel_mode ? 1 : 0,
+                connected ? 1 : 0,
+                static_cast<unsigned long>(device->get_last_heartbeat_error()),
+                last_error_copy.c_str());
+            return false;
+        }
+
         auto& rt = anti_tamper::state::get();
         if (rt.violation_latched.load(std::memory_order_acquire)) {
             set_reason("runtime_integrity_violation_latched");
@@ -5091,6 +5110,7 @@ namespace driver_bridge
         close_process_handle_locked();
         g_process = process.release();
         g_pid = pid;
+        g_pid_snapshot.store(pid, std::memory_order_release);
         const std::uint64_t active_generation = g_active_pid_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
         g_has_vm_read = false;
         g_kernel_attached = false;
@@ -5228,6 +5248,7 @@ namespace driver_bridge
         uint32_t prev_pid = g_pid;
         close_process_handle_locked();
         g_pid = 0;
+        g_pid_snapshot.store(0, std::memory_order_release);
         const std::uint64_t active_generation = g_active_pid_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
         g_process_name.clear();
         g_has_vm_read = false;
@@ -5391,6 +5412,18 @@ namespace driver_bridge
             static_cast<unsigned long>(g_remote_call_lower_worker_tid.load(std::memory_order_acquire)),
             static_cast<unsigned long>(caller_tid));
 
+        if (inflight_pre > 0 && g_lower_remote_call_last_abandoned.load(std::memory_order_acquire)) {
+            ctx.kernel_attached = false;
+            diag::log_tagged_critical_fmt("driver",
+                "refresh_kernel_context_reject op=%s pid=%u reason=lower_remote_uninterruptible_abandoned inflight=%u worker_tid=%lu caller_tid=%lu",
+                op_label,
+                pid,
+                inflight_pre,
+                static_cast<unsigned long>(g_remote_call_lower_worker_tid.load(std::memory_order_acquire)),
+                static_cast<unsigned long>(caller_tid));
+            return false;
+        }
+
         if (device_pid_before != pid) {
             device->set_dtb(0);
             device->set_kernel_dtb(0);
@@ -5400,9 +5433,25 @@ namespace driver_bridge
         arc_bridge_set_process_id(pid);
         device->set_process_id(pid);
 
+        const ULONGLONG arc_dtb_start = GetTickCount64();
         uint64_t arc_dtb = arc_bridge_solve_dtb(false);
+        diag::log_tagged_critical_fmt("driver",
+            "refresh_kernel_context_step op=%s pid=%u step_name=arc_bridge_solve_dtb elapsed_ms=%llu inflight_at_step=%u caller_tid=%lu",
+            op_label,
+            pid,
+            static_cast<unsigned long long>(GetTickCount64() - arc_dtb_start),
+            g_remote_call_lower_inflight.load(std::memory_order_acquire),
+            static_cast<unsigned long>(caller_tid));
 
+        const ULONGLONG solve_dtb_start = GetTickCount64();
         device->solve_dtb();
+        diag::log_tagged_critical_fmt("driver",
+            "refresh_kernel_context_step op=%s pid=%u step_name=device_solve_dtb elapsed_ms=%llu inflight_at_step=%u caller_tid=%lu",
+            op_label,
+            pid,
+            static_cast<unsigned long long>(GetTickCount64() - solve_dtb_start),
+            g_remote_call_lower_inflight.load(std::memory_order_acquire),
+            static_cast<unsigned long>(caller_tid));
         if (device->get_dtb() == 0 && arc_dtb != 0)
             device->set_dtb(arc_dtb);
         if (device->get_dtb() == 0 && ctx.cached_dtb != 0)
@@ -5428,8 +5477,17 @@ namespace driver_bridge
 
         if (ctx.cached_image_base == 0) {
             uint64_t image_base = arc_bridge_find_image();
-            if (image_base == 0)
+            if (image_base == 0) {
+                const ULONGLONG find_image_start = GetTickCount64();
                 image_base = device->find_image();
+                diag::log_tagged_critical_fmt("driver",
+                    "refresh_kernel_context_step op=%s pid=%u step_name=device_find_image elapsed_ms=%llu inflight_at_step=%u caller_tid=%lu",
+                    op_label,
+                    pid,
+                    static_cast<unsigned long long>(GetTickCount64() - find_image_start),
+                    g_remote_call_lower_inflight.load(std::memory_order_acquire),
+                    static_cast<unsigned long>(caller_tid));
+            }
             ctx.cached_image_base = image_base;
         }
         if (ctx.cached_image_base != 0) {
@@ -5440,7 +5498,15 @@ namespace driver_bridge
         if (ctx.cached_kernel_dtb != 0) {
             device->set_kernel_dtb(ctx.cached_kernel_dtb);
         } else {
+            const ULONGLONG solve_kernel_dtb_start = GetTickCount64();
             device->solve_kernel_dtb();
+            diag::log_tagged_critical_fmt("driver",
+                "refresh_kernel_context_step op=%s pid=%u step_name=device_solve_kernel_dtb elapsed_ms=%llu inflight_at_step=%u caller_tid=%lu",
+                op_label,
+                pid,
+                static_cast<unsigned long long>(GetTickCount64() - solve_kernel_dtb_start),
+                g_remote_call_lower_inflight.load(std::memory_order_acquire),
+                static_cast<unsigned long>(caller_tid));
             ctx.cached_kernel_dtb = device->get_kernel_dtb();
         }
         diag::log_tagged_fmt("driver",
@@ -5568,6 +5634,7 @@ namespace driver_bridge
 
         close_process_handle_locked();
         g_pid = pid;
+        g_pid_snapshot.store(pid, std::memory_order_release);
         const std::uint64_t active_generation = g_active_pid_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
         g_process_name = target.name;
         g_has_vm_read = target.has_vm_read;
@@ -5602,6 +5669,7 @@ namespace driver_bridge
         if (g_pid == pid) {
             close_process_handle_locked();
             g_pid = 0;
+            g_pid_snapshot.store(0, std::memory_order_release);
             g_process_name.clear();
             g_has_vm_read = false;
             g_kernel_attached = false;
@@ -5641,6 +5709,7 @@ namespace driver_bridge
         }
         close_process_handle_locked();
         g_pid = 0;
+        g_pid_snapshot.store(0, std::memory_order_release);
         const std::uint64_t active_generation = g_active_pid_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
         g_process_name.clear();
         g_has_vm_read = false;
@@ -5691,8 +5760,7 @@ namespace driver_bridge
 
     uint32_t attached_pid()
     {
-        std::lock_guard<std::mutex> lk(g_state_mtx);
-        return g_pid;
+        return g_pid_snapshot.load(std::memory_order_acquire);
     }
 
     bool attached_process_alive(uint32_t* exit_code_out)

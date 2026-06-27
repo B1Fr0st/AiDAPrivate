@@ -2259,8 +2259,9 @@ namespace voyager {
         [[nodiscard]] bool has_server_seed() const noexcept { return server_seed_ != 0; }
         [[nodiscard]] bool has_server_ioctl_seed() const noexcept { return server_ioctl_seed_ != 0; }
         [[nodiscard]] std::uint32_t get_server_ioctl_seed_hash() const noexcept { return server_ioctl_seed_ != 0 ? hash_build_key(server_ioctl_seed_) : 0; }
+        [[nodiscard]] bool session_invalidated() const noexcept;
 
-        void set_process_id(std::uint32_t pid) noexcept { process_id_ = pid; }
+        void set_process_id(std::uint32_t pid) noexcept;
         void set_base_address(std::uint64_t base) noexcept { base_address_ = base; }
         void set_dtb(std::uint64_t dtb) noexcept { dtb_ = dtb; }
         void set_kernel_dtb(std::uint64_t dtb) noexcept { kernel_dtb_ = dtb; }
@@ -2313,6 +2314,7 @@ namespace voyager {
         mutable std::uint32_t last_heartbeat_offset_ = 0;
         mutable detail::raw_ioctl_telemetry last_raw_ioctl_{};
         mutable std::shared_mutex seed_rotation_mtx_;
+        mutable std::atomic<std::uint32_t> seed_rotation_writer_waiters_{0};
         mutable std::atomic<void*> inflight_capture_thread_{nullptr};
         mutable std::atomic<bool> inflight_capture_cancel_pending_{false};
 

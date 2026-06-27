@@ -1,12 +1,14 @@
 ﻿#include "comm.h"
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cwchar>
 #include <cwctype>
 #include "encrypt/crypter.h"
 #include "spoofer/spoof.hpp"
 #include "../src/standalone/src/helpers/diag_log.hpp"
 #include <string>
+#include <thread>
 #include <windows.h>
 #include <winternl.h>
 #include <winioctl.h>
@@ -145,6 +147,30 @@ namespace {
         server_token_relay_scope_t(const server_token_relay_scope_t&) = delete;
         server_token_relay_scope_t& operator=(const server_token_relay_scope_t&) = delete;
     };
+
+    struct writer_waiter_scope_t {
+        std::atomic<std::uint32_t>* counter_;
+        std::uint32_t prior_;
+
+        explicit writer_waiter_scope_t(std::atomic<std::uint32_t>& counter) noexcept
+            : counter_(&counter),
+              prior_(counter.fetch_add(1, std::memory_order_acq_rel))
+        {
+        }
+
+        ~writer_waiter_scope_t()
+        {
+            counter_->fetch_sub(1, std::memory_order_acq_rel);
+        }
+
+        [[nodiscard]] std::uint32_t prior() const noexcept { return prior_; }
+
+        writer_waiter_scope_t(const writer_waiter_scope_t&) = delete;
+        writer_waiter_scope_t& operator=(const writer_waiter_scope_t&) = delete;
+    };
+
+    constexpr std::chrono::milliseconds kSeedRotationLockBudget{1500};
+    constexpr std::chrono::microseconds kSeedRotationLockSpinSlice{200};
 
     static std::uint64_t mix_remote_call_diag(std::uint64_t value, std::uint64_t input) noexcept
     {
@@ -840,6 +866,68 @@ void voyager::device_t::disconnect() noexcept {
     last_bridge_whoswho_tsc_ = 0;
     last_bridge_sentinel_tsc_ = 0;
     first_sentinel_ready_tsc_ = 0;
+}
+
+void voyager::device_t::set_process_id(std::uint32_t pid) noexcept {
+    SPOOF_FUNC;
+
+    const std::uint32_t prev_pid = process_id_;
+    const std::uint64_t prev_shellcode = shellcode_address_;
+    const std::uint64_t prev_spoof_gadget = spoof_gadget_;
+    const std::uint64_t prev_base = base_address_;
+    const std::uint64_t prev_dtb = dtb_;
+    const std::uint64_t prev_kernel_dtb = kernel_dtb_;
+    const DWORD prev_last_failed_tid = last_failed_tid_;
+    const DWORD prev_last_hijacked_tid = last_hijacked_tid_;
+    const bool connected = is_connected();
+    const bool pid_changing = (prev_pid != 0 && prev_pid != pid);
+    int shellcode_freed = 0;
+    int shellcode_free_skipped_disconnected = 0;
+    int shellcode_free_skipped_no_address = 0;
+
+    if (pid_changing) {
+        if (prev_shellcode != 0) {
+            if (connected) {
+                free_memory(prev_shellcode);
+                shellcode_freed = 1;
+            } else {
+                shellcode_free_skipped_disconnected = 1;
+            }
+        } else {
+            shellcode_free_skipped_no_address = 1;
+        }
+        shellcode_address_ = 0;
+        spoof_gadget_ = 0;
+        base_address_ = 0;
+        dtb_ = 0;
+        kernel_dtb_ = 0;
+        last_failed_tid_ = 0;
+        last_hijacked_tid_ = 0;
+    }
+
+    process_id_ = pid;
+
+    if (pid_changing || prev_pid != pid) {
+        diag::log_tagged_critical_fmt("comm",
+            "set_process_id_switch from_pid=%u to_pid=%u pid_changing=%d connected=%d shellcode_freed=%d shellcode_free_skipped_disconnected=%d shellcode_free_skipped_no_address=%d prev_shellcode=0x%llX prev_spoof_gadget=0x%llX prev_base=0x%llX prev_dtb=0x%llX prev_kernel_dtb=0x%llX prev_last_failed_tid=%lu prev_last_hijacked_tid=%lu local_pid=%lu local_tid=%lu handle=0x%llX",
+            prev_pid,
+            pid,
+            pid_changing ? 1 : 0,
+            connected ? 1 : 0,
+            shellcode_freed,
+            shellcode_free_skipped_disconnected,
+            shellcode_free_skipped_no_address,
+            static_cast<unsigned long long>(prev_shellcode),
+            static_cast<unsigned long long>(prev_spoof_gadget),
+            static_cast<unsigned long long>(prev_base),
+            static_cast<unsigned long long>(prev_dtb),
+            static_cast<unsigned long long>(prev_kernel_dtb),
+            static_cast<unsigned long>(prev_last_failed_tid),
+            static_cast<unsigned long>(prev_last_hijacked_tid),
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            reinterpret_cast<unsigned long long>(driver_handle_));
+    }
 }
 
 void voyager::device_t::clear_process_context() noexcept {
@@ -2933,8 +3021,94 @@ std::uint64_t voyager::device_t::call_function_attempt(
     return result;
 }
 
+bool voyager::device_t::session_invalidated() const noexcept {
+    const DWORD err = last_heartbeat_error_;
+    const bool err_matches =
+        err == ERROR_INVALID_FUNCTION ||
+        err == ERROR_GEN_FAILURE ||
+        err == ERROR_ACCESS_DENIED ||
+        err == static_cast<DWORD>(0xC0000010);
+    if (!err_matches)
+        return false;
+    if (last_heartbeat_tsc_ == 0)
+        return true;
+    const std::uint64_t now_tsc = __rdtsc();
+    if (now_tsc <= last_heartbeat_tsc_)
+        return false;
+    const std::uint64_t age = now_tsc - last_heartbeat_tsc_;
+    return age > detail::HEARTBEAT_REFRESH_INTERVAL;
+}
+
 bool voyager::device_t::send_request(DWORD control_code, void* input, DWORD input_size) const noexcept {
-    std::shared_lock<std::shared_mutex> rotation_guard(seed_rotation_mtx_);
+    const DWORD local_pid_for_lock = GetCurrentProcessId();
+    const DWORD local_tid_for_lock = GetCurrentThreadId();
+    if (seed_rotation_writer_waiters_.load(std::memory_order_acquire) != 0) {
+        const std::uint64_t fence_start = __rdtsc();
+        const auto fence_deadline = std::chrono::steady_clock::now() + kSeedRotationLockBudget;
+        bool fence_acquired = false;
+        for (;;) {
+            if (seed_rotation_mtx_.try_lock()) {
+                seed_rotation_mtx_.unlock();
+                fence_acquired = true;
+                break;
+            }
+            if (std::chrono::steady_clock::now() >= fence_deadline)
+                break;
+            std::this_thread::sleep_for(kSeedRotationLockSpinSlice);
+        }
+        const std::uint64_t fence_elapsed = __rdtsc() - fence_start;
+        if (!fence_acquired) {
+            diag::log_tagged_critical_fmt("comm",
+                "send_request_writer_fence_timed_out control_code=0x%08X input_size=%u local_pid=%lu local_tid=%lu waiters_after=%u inflight_relay=%u last_hb_err=%lu fence_tsc=%llu budget_ms=%lld",
+                control_code,
+                input_size,
+                static_cast<unsigned long>(local_pid_for_lock),
+                static_cast<unsigned long>(local_tid_for_lock),
+                seed_rotation_writer_waiters_.load(std::memory_order_acquire),
+                g_server_token_relay_inflight.load(std::memory_order_acquire),
+                static_cast<unsigned long>(last_heartbeat_error_),
+                static_cast<unsigned long long>(fence_elapsed),
+                static_cast<long long>(kSeedRotationLockBudget.count()));
+        } else {
+            diag::log_tagged_critical_fmt("comm",
+                "send_request_writer_fence control_code=0x%08X input_size=%u local_pid=%lu local_tid=%lu waiters_after=%u fence_tsc=%llu",
+                control_code,
+                input_size,
+                static_cast<unsigned long>(local_pid_for_lock),
+                static_cast<unsigned long>(local_tid_for_lock),
+                seed_rotation_writer_waiters_.load(std::memory_order_acquire),
+                static_cast<unsigned long long>(fence_elapsed));
+        }
+    }
+    const std::uint64_t shared_start = __rdtsc();
+    const auto shared_deadline = std::chrono::steady_clock::now() + kSeedRotationLockBudget;
+    bool shared_acquired = false;
+    for (;;) {
+        if (seed_rotation_mtx_.try_lock_shared()) {
+            shared_acquired = true;
+            break;
+        }
+        if (std::chrono::steady_clock::now() >= shared_deadline)
+            break;
+        std::this_thread::sleep_for(kSeedRotationLockSpinSlice);
+    }
+    if (!shared_acquired) {
+        const std::uint64_t shared_elapsed = __rdtsc() - shared_start;
+        diag::log_tagged_critical_fmt("comm",
+            "send_request_shared_lock_timed_out control_code=0x%08X input_size=%u local_pid=%lu local_tid=%lu waiters_after=%u inflight_relay=%u last_hb_err=%lu shared_tsc=%llu budget_ms=%lld",
+            control_code,
+            input_size,
+            static_cast<unsigned long>(local_pid_for_lock),
+            static_cast<unsigned long>(local_tid_for_lock),
+            seed_rotation_writer_waiters_.load(std::memory_order_acquire),
+            g_server_token_relay_inflight.load(std::memory_order_acquire),
+            static_cast<unsigned long>(last_heartbeat_error_),
+            static_cast<unsigned long long>(shared_elapsed),
+            static_cast<long long>(kSeedRotationLockBudget.count()));
+        SetLastError(ERROR_TIMEOUT);
+        return false;
+    }
+    std::shared_lock<std::shared_mutex> rotation_guard(seed_rotation_mtx_, std::adopt_lock);
     return send_request_in_lock(control_code, input, input_size);
 }
 
@@ -6970,7 +7144,34 @@ bool voyager::device_t::kernel_anti_dump_start_continuous(std::uint32_t pid) noe
 bool voyager::device_t::relay_server_token(std::uint32_t token_hash, std::uint64_t server_nonce) noexcept
 {
     server_token_relay_scope_t relay_scope;
+    if (session_invalidated()) {
+        diag::log_tagged_critical_fmt("comm",
+            "relay_server_token_short_circuit_session_invalidated token_hash=0x%08X last_hb_err=%lu local_pid=%lu local_tid=%lu",
+            token_hash,
+            static_cast<unsigned long>(last_heartbeat_error_),
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long>(GetCurrentThreadId()));
+        SetLastError(ERROR_INVALID_FUNCTION);
+        return false;
+    }
+    const std::uint64_t writer_wait_start = __rdtsc();
+    writer_waiter_scope_t writer_waiter(seed_rotation_writer_waiters_);
+    diag::log_tagged_critical_fmt("comm",
+        "relay_server_token_writer_waiter_enter token_hash=0x%08X prior_waiters=%u local_pid=%lu local_tid=%lu",
+        token_hash,
+        writer_waiter.prior(),
+        static_cast<unsigned long>(GetCurrentProcessId()),
+        static_cast<unsigned long>(GetCurrentThreadId()));
     std::unique_lock<std::shared_mutex> rotation_guard(seed_rotation_mtx_);
+    const std::uint32_t waiters_after_v1 = seed_rotation_writer_waiters_.load(std::memory_order_acquire);
+    const std::uint64_t writer_wait_elapsed = __rdtsc() - writer_wait_start;
+    diag::log_tagged_critical_fmt("comm",
+        "relay_server_token_writer_acquired token_hash=0x%08X waiters_after=%u local_pid=%lu local_tid=%lu wait_tsc=%llu",
+        token_hash,
+        waiters_after_v1,
+        static_cast<unsigned long>(GetCurrentProcessId()),
+        static_cast<unsigned long>(GetCurrentThreadId()),
+        static_cast<unsigned long long>(writer_wait_elapsed));
     sync_dynamic_security_state();
     log_security_snapshot("relay_server_token_entry", 0, 0, 0);
 
@@ -7017,7 +7218,35 @@ bool voyager::device_t::relay_server_token(std::uint32_t token_hash, std::uint64
 bool voyager::device_t::relay_server_token_v2(std::uint32_t token_hash, std::uint64_t server_nonce, std::uint64_t* out_driver_proof) noexcept
 {
     server_token_relay_scope_t relay_scope;
+    if (session_invalidated()) {
+        diag::log_tagged_critical_fmt("comm",
+            "relay_server_token_v2_short_circuit_session_invalidated token_hash=0x%08X last_hb_err=%lu local_pid=%lu local_tid=%lu",
+            token_hash,
+            static_cast<unsigned long>(last_heartbeat_error_),
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long>(GetCurrentThreadId()));
+        if (out_driver_proof) *out_driver_proof = 0;
+        SetLastError(ERROR_INVALID_FUNCTION);
+        return false;
+    }
+    const std::uint64_t writer_wait_start_v2 = __rdtsc();
+    writer_waiter_scope_t writer_waiter(seed_rotation_writer_waiters_);
+    diag::log_tagged_critical_fmt("comm",
+        "relay_server_token_v2_writer_waiter_enter token_hash=0x%08X prior_waiters=%u local_pid=%lu local_tid=%lu",
+        token_hash,
+        writer_waiter.prior(),
+        static_cast<unsigned long>(GetCurrentProcessId()),
+        static_cast<unsigned long>(GetCurrentThreadId()));
     std::unique_lock<std::shared_mutex> rotation_guard(seed_rotation_mtx_);
+    const std::uint32_t waiters_after_v2 = seed_rotation_writer_waiters_.load(std::memory_order_acquire);
+    const std::uint64_t writer_wait_elapsed_v2 = __rdtsc() - writer_wait_start_v2;
+    diag::log_tagged_critical_fmt("comm",
+        "relay_server_token_v2_writer_acquired token_hash=0x%08X waiters_after=%u local_pid=%lu local_tid=%lu wait_tsc=%llu",
+        token_hash,
+        waiters_after_v2,
+        static_cast<unsigned long>(GetCurrentProcessId()),
+        static_cast<unsigned long>(GetCurrentThreadId()),
+        static_cast<unsigned long long>(writer_wait_elapsed_v2));
     sync_dynamic_security_state();
     log_security_snapshot("relay_server_token_v2_entry", 0, 0, 0);
     diag::log_tagged_critical_fmt("comm-startup",
