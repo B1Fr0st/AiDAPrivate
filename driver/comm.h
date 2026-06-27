@@ -2324,7 +2324,9 @@ namespace voyager {
         mutable std::atomic<std::uint32_t> seed_rotation_writer_waiters_{0};
 
         bool send_request(DWORD control_code, void* input, DWORD input_size) const noexcept;
-        bool send_request_in_lock(DWORD control_code, void* input, DWORD input_size) const noexcept;
+        bool send_request_in_lock(DWORD control_code, void* input, DWORD input_size,
+                                  bool predecoded_dynamic_offset_valid = false,
+                                  std::uint32_t predecoded_dynamic_offset = 0) const noexcept;
         bool send_poll_request(void* input, DWORD input_size, std::uint64_t call_id, int iteration) const noexcept;
         bool force_heartbeat() const noexcept;
         std::size_t transfer_physical_read(std::uint32_t pid, std::uint64_t dtb, std::uint64_t address,

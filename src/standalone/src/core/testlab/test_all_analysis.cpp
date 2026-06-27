@@ -1000,11 +1000,28 @@ static bool restore_integrity_primary_pid(HANDLE hf, const char* tag, uint32_t p
     const bool primary_alive = analysis_process_alive_by_pid(primary_pid, &primary_code);
     uint32_t sidecar_code = 0;
     const bool sidecar_alive = sidecar_pid != 0 && analysis_process_alive_by_pid(sidecar_pid, &sidecar_code);
-    bool restored = active_before == primary_pid;
-    const char* method = restored ? "already_active" : "none";
+    uint32_t bridge_code = 0;
+    auto primary_bridge_ready = [&]() -> bool {
+        bridge_code = 0;
+        if (driver_bridge::attached_pid() != primary_pid)
+            return false;
+        if (!driver_bridge::can_read_memory())
+            return false;
+        return driver_bridge::attached_process_alive(&bridge_code);
+    };
+    bool restored = primary_bridge_ready();
+    const char* method = restored ? "already_active" : (active_before == primary_pid ? "already_active_unready" : "none");
     if (!restored && known) {
         method = "set_active";
         restored = driver_bridge::set_active_pid(primary_pid);
+        if (restored && !primary_bridge_ready())
+            restored = false;
+    }
+    if (!restored && primary_alive && driver_bridge::attached_pid() == primary_pid) {
+        method = "reattach_active_primary";
+        restored = driver_bridge::attach(primary_pid);
+        if (restored && !primary_bridge_ready())
+            restored = false;
     }
     if (!restored && primary_alive) {
         method = "attach_additional";
@@ -1012,16 +1029,20 @@ static bool restore_integrity_primary_pid(HANDLE hf, const char* tag, uint32_t p
         if (attached) {
             method = "attach_additional_set_active";
             restored = driver_bridge::set_active_pid(primary_pid);
+            if (restored && !primary_bridge_ready())
+                restored = false;
         }
     }
     if (!restored && primary_alive) {
         method = "attach";
         restored = driver_bridge::attach(primary_pid);
+        if (restored && !primary_bridge_ready())
+            restored = false;
     }
     const uint32_t active_now = driver_bridge::attached_pid();
-    uint32_t bridge_code = 0;
-    const bool bridge_alive = active_now == primary_pid && driver_bridge::attached_process_alive(&bridge_code);
-    log_msg(hf, tag, "SIDE-FIXTURE-RESTORE -- phase=%s sidecar_pid=%u primary_pid=%u active_before=%u known=%d method=%s restored=%d active_now=%u primary_alive=%d primary_code=0x%08X sidecar_alive=%d sidecar_code=0x%08X bridge_alive=%d bridge_code=0x%08X status=\"%s\" last_error=\"%s\" elapsed_ms=%lu",
+    const bool kernel_ready = driver_bridge::can_read_memory();
+    const bool bridge_alive = active_now == primary_pid && kernel_ready && driver_bridge::attached_process_alive(&bridge_code);
+    log_msg(hf, tag, "SIDE-FIXTURE-RESTORE -- phase=%s sidecar_pid=%u primary_pid=%u active_before=%u known=%d method=%s restored=%d active_now=%u primary_alive=%d primary_code=0x%08X sidecar_alive=%d sidecar_code=0x%08X kernel_ready=%d bridge_alive=%d bridge_code=0x%08X status=\"%s\" last_error=\"%s\" elapsed_ms=%lu",
         phase ? phase : "restore",
         (unsigned)sidecar_pid,
         (unsigned)primary_pid,
@@ -1034,6 +1055,7 @@ static bool restore_integrity_primary_pid(HANDLE hf, const char* tag, uint32_t p
         primary_code,
         sidecar_alive ? 1 : 0,
         sidecar_code,
+        kernel_ready ? 1 : 0,
         bridge_alive ? 1 : 0,
         bridge_code,
         driver_bridge::status().c_str(),

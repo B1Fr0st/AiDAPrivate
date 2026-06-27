@@ -1723,6 +1723,128 @@ std::string narrow_utf8(const std::wstring& w) {
 	return out;
 }
 
+bool query_process_status(HANDLE process,
+                          DWORD& wait_result,
+                          BOOL& got_exit,
+                          DWORD& exit_code,
+                          DWORD& gle) {
+	wait_result = process ? WaitForSingleObject(process, 0) : WAIT_FAILED;
+	got_exit = FALSE;
+	exit_code = STILL_ACTIVE;
+	gle = 0;
+	if (!process) {
+		gle = ERROR_INVALID_HANDLE;
+		return false;
+	}
+	got_exit = GetExitCodeProcess(process, &exit_code);
+	if (!got_exit)
+		gle = GetLastError();
+	return wait_result == WAIT_TIMEOUT || (got_exit && exit_code == STILL_ACTIVE);
+}
+
+bool resume_initial_thread(const run_target::launch_result_t& lr) {
+	HANDLE process = reinterpret_cast<HANDLE>(lr.process_handle);
+	HANDLE thread = reinterpret_cast<HANDLE>(lr.thread_handle);
+	if (!thread)
+		return true;
+
+	diag::log_tagged_critical_fmt("spawn",
+		"spawn_pre_resume_initial_thread pid=%u tid=%u thread_handle=%p",
+		static_cast<unsigned>(lr.pid),
+		static_cast<unsigned>(lr.thread_id),
+		reinterpret_cast<void*>(thread));
+	DWORD previous_suspend = ResumeThread(thread);
+	DWORD resume_gle = previous_suspend == static_cast<DWORD>(-1) ? GetLastError() : 0;
+	diag::log_tagged_critical_fmt("spawn",
+		"spawn_resume_initial_thread_result pid=%u tid=%u previous_suspend=%lu gle=%lu",
+		static_cast<unsigned>(lr.pid),
+		static_cast<unsigned>(lr.thread_id),
+		static_cast<unsigned long>(previous_suspend),
+		static_cast<unsigned long>(resume_gle));
+	if (previous_suspend == static_cast<DWORD>(-1)) {
+		char err[256];
+		std::snprintf(err, sizeof(err),
+			"ResumeThread failed for initial tid=%u (gle=%lu)",
+			static_cast<unsigned>(lr.thread_id),
+			static_cast<unsigned long>(resume_gle));
+		set_last_error(err);
+		return false;
+	}
+
+	DWORD wait_result = WAIT_FAILED;
+	BOOL got_exit = FALSE;
+	DWORD exit_code = STILL_ACTIVE;
+	DWORD status_gle = 0;
+	query_process_status(process, wait_result, got_exit, exit_code, status_gle);
+	diag::log_tagged_critical_fmt("spawn",
+		"spawn_post_resume_process_status pid=%u wait0=0x%08lX got_exit=%d exit_code=0x%08lX gle=%lu",
+		static_cast<unsigned>(lr.pid),
+		static_cast<unsigned long>(wait_result),
+		got_exit ? 1 : 0,
+		static_cast<unsigned long>(exit_code),
+		static_cast<unsigned long>(status_gle));
+	return true;
+}
+
+bool attach_driver_after_resume_with_retry(std::uint32_t pid,
+                                           HANDLE process,
+                                           DWORD retry_budget_ms,
+                                           DWORD retry_interval_ms) {
+	const ULONGLONG start = GetTickCount64();
+	DWORD attempt = 0;
+	for (;;) {
+		++attempt;
+		DWORD wait_result = WAIT_FAILED;
+		BOOL got_exit = FALSE;
+		DWORD exit_code = STILL_ACTIVE;
+		DWORD status_gle = 0;
+		const bool alive = query_process_status(process, wait_result, got_exit, exit_code, status_gle);
+		const ULONGLONG now = GetTickCount64();
+		const DWORD elapsed = now >= start ? static_cast<DWORD>(now - start) : 0u;
+		const DWORD remaining = elapsed >= retry_budget_ms ? 0u : retry_budget_ms - elapsed;
+		diag::log_tagged_critical_fmt("spawn",
+			"spawn_driver_attach_attempt_pre pid=%u attempt=%lu alive=%d wait0=0x%08lX got_exit=%d exit_code=0x%08lX status_gle=%lu elapsed_ms=%lu remaining_ms=%lu driver_pid=%u driver_status='%s' last_error='%s'",
+			static_cast<unsigned>(pid),
+			static_cast<unsigned long>(attempt),
+			alive ? 1 : 0,
+			static_cast<unsigned long>(wait_result),
+			got_exit ? 1 : 0,
+			static_cast<unsigned long>(exit_code),
+			static_cast<unsigned long>(status_gle),
+			static_cast<unsigned long>(elapsed),
+			static_cast<unsigned long>(remaining),
+			driver_bridge::attached_pid(),
+			driver_bridge::status().c_str(),
+			driver_bridge::last_error().c_str());
+		if (!alive)
+			return false;
+
+		if (driver_bridge::attach(pid)) {
+			diag::log_tagged_critical_fmt("spawn",
+				"spawn_driver_attach_attempt_ok pid=%u attempt=%lu elapsed_ms=%lu driver_pid=%u driver_status='%s'",
+				static_cast<unsigned>(pid),
+				static_cast<unsigned long>(attempt),
+				static_cast<unsigned long>(elapsed),
+				driver_bridge::attached_pid(),
+				driver_bridge::status().c_str());
+			return true;
+		}
+
+		diag::log_tagged_critical_fmt("spawn",
+			"spawn_driver_attach_attempt_failed pid=%u attempt=%lu elapsed_ms=%lu remaining_ms=%lu driver_pid=%u driver_status='%s' last_error='%s'",
+			static_cast<unsigned>(pid),
+			static_cast<unsigned long>(attempt),
+			static_cast<unsigned long>(elapsed),
+			static_cast<unsigned long>(remaining),
+			driver_bridge::attached_pid(),
+			driver_bridge::status().c_str(),
+			driver_bridge::last_error().c_str());
+		if (remaining == 0)
+			return false;
+		Sleep((std::min)(retry_interval_ms, remaining));
+	}
+}
+
 }
 
 bool spawn_and_attach_target(const run_target::launch_options_t& opts,
@@ -1782,7 +1904,19 @@ bool spawn_and_attach_target(const run_target::launch_options_t& opts,
 	bool can_attach = (lr.pid != 0)
 		&& (opts.isolation != run_target::isolation_t::windows_sandbox);
 
+	HANDLE process_handle = reinterpret_cast<HANDLE>(lr.process_handle);
+	HANDLE thread_handle = reinterpret_cast<HANDLE>(lr.thread_handle);
+	if (thread_handle != nullptr) {
+		if (!resume_initial_thread(lr)) {
+			HANDLE p = reinterpret_cast<HANDLE>(lr.process_handle);
+			if (p) TerminateProcess(p, 0xDEADu);
+			run_target::cleanup(lr);
+			return false;
+		}
+	}
+
 	bool driver_ok = true;
+	bool driver_attached = false;
 	if (can_attach && opts.attach_after_resume) {
 		ULONGLONG attach_t0 = GetTickCount64();
 		diag::log_tagged_critical_fmt("spawn",
@@ -1792,12 +1926,13 @@ bool spawn_and_attach_target(const run_target::launch_options_t& opts,
 		const uint32_t previous_pid = driver_bridge::attached_pid();
 		if (previous_pid != 0 && previous_pid != lr.pid)
 			stealth_engine::disable_for_detach(previous_pid, "debugger_engine.spawn_attach.replace");
-		driver_ok = driver_bridge::attach(lr.pid);
+		driver_ok = attach_driver_after_resume_with_retry(lr.pid, process_handle, 5000u, 100u);
 		if (!driver_ok && previous_pid != 0 && driver_bridge::attached_pid() == previous_pid)
 			(void)stealth_engine::ensure_default_enabled(previous_pid, "debugger_engine.spawn_attach.restore_failed_switch");
 		const bool stealth_ok = driver_ok
 			? stealth_engine::ensure_default_enabled(lr.pid, "debugger_engine.spawn_attach")
 			: false;
+		driver_attached = driver_ok;
 		diag::log_tagged_critical_fmt("spawn",
 			"spawn_post_driver_attach pid=%u ok=%d stealth_ok=%d elapsed_ms=%llu driver_pid=%u driver_status='%s' last_error='%s'",
 			static_cast<unsigned>(lr.pid),
@@ -1819,6 +1954,8 @@ bool spawn_and_attach_target(const run_target::launch_options_t& opts,
 				"spawn_driver_attach_FAILED pid=%u err='%s'",
 				static_cast<unsigned>(lr.pid),
 				drv_err.empty() ? "(no detail)" : drv_err.c_str());
+			if (driver_bridge::attached_pid() == lr.pid)
+				(void)driver_bridge::clear_active_pid();
 			HANDLE p = reinterpret_cast<HANDLE>(lr.process_handle);
 			if (p) TerminateProcess(p, 0xDEADu);
 			run_target::cleanup(lr);
@@ -1828,54 +1965,7 @@ bool spawn_and_attach_target(const run_target::launch_options_t& opts,
 			"spawn_driver_attached pid=%u", static_cast<unsigned>(lr.pid));
 	}
 
-	if (lr.thread_handle != 0) {
-		diag::log_tagged_critical_fmt("spawn",
-			"spawn_pre_kernel_resume_thread pid=%u tid=%u thread_handle=%p",
-			static_cast<unsigned>(lr.pid),
-			static_cast<unsigned>(lr.thread_id),
-			reinterpret_cast<void*>(lr.thread_handle));
-		uint32_t prev_count = 0;
-		const bool resumed = lr.thread_id != 0 && driver_bridge::resume_thread(lr.thread_id, &prev_count);
-		if (!resumed) {
-			const DWORD kernel_resume_gle = GetLastError();
-			const std::string kernel_resume_error = driver_bridge::last_error();
-			diag::log_tagged_critical_fmt("spawn",
-				"spawn_kernel_resume_thread_FAILED pid=%u tid=%u driver_status='%s' last_error='%s'",
-				static_cast<unsigned>(lr.pid),
-				static_cast<unsigned>(lr.thread_id),
-				driver_bridge::status().c_str(),
-				driver_bridge::last_error().c_str());
-			char err[320];
-			std::snprintf(err, sizeof(err),
-				"kernel resume_thread failed for tid=%u (gle=%lu: %s)",
-				static_cast<unsigned>(lr.thread_id),
-				static_cast<unsigned long>(kernel_resume_gle),
-				kernel_resume_error.empty() ? "(no detail)" : kernel_resume_error.c_str());
-			set_last_error(err);
-			HANDLE p = reinterpret_cast<HANDLE>(lr.process_handle);
-			if (p) TerminateProcess(p, 0xDEADu);
-			run_target::cleanup(lr);
-			return false;
-		}
-		diag::log_tagged_critical_fmt("spawn",
-			"spawn_resume_thread_ok pid=%u tid=%u prev_suspend_count=%u kernel_path=1",
-			static_cast<unsigned>(lr.pid),
-			static_cast<unsigned>(lr.thread_id),
-			static_cast<unsigned>(prev_count));
-		HANDLE p = reinterpret_cast<HANDLE>(lr.process_handle);
-		DWORD exit_code = STILL_ACTIVE;
-		DWORD wait0 = p ? WaitForSingleObject(p, 0) : WAIT_FAILED;
-		BOOL got_exit = p ? GetExitCodeProcess(p, &exit_code) : FALSE;
-		diag::log_tagged_critical_fmt("spawn",
-			"spawn_post_resume_process_status pid=%u wait0=0x%08lX got_exit=%d exit_code=0x%08lX gle=%lu",
-			static_cast<unsigned>(lr.pid),
-			static_cast<unsigned long>(wait0),
-			got_exit ? 1 : 0,
-			static_cast<unsigned long>(exit_code),
-			got_exit ? 0 : GetLastError());
-	}
-
-	if (can_attach && driver_ok) {
+	if (can_attach && driver_attached) {
 		auto& st = g_state;
 		st.target_pid = lr.pid;
 		st.status.store(dbg_status_t::running);
@@ -1891,9 +1981,13 @@ bool spawn_and_attach_target(const run_target::launch_options_t& opts,
 	}
 
 	char ok_msg[320];
-	if (can_attach && driver_ok) {
+	if (can_attach && driver_attached) {
 		std::snprintf(ok_msg, sizeof(ok_msg),
 			"Spawned and attached PID %u (%s)",
+			static_cast<unsigned>(lr.pid), exe_utf8.c_str());
+	} else if (lr.pid != 0 && can_attach) {
+		std::snprintf(ok_msg, sizeof(ok_msg),
+			"Spawned PID %u without driver attach (%s)",
 			static_cast<unsigned>(lr.pid), exe_utf8.c_str());
 	} else if (lr.pid != 0) {
 		std::snprintf(ok_msg, sizeof(ok_msg),
