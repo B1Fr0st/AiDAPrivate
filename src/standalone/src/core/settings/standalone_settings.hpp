@@ -21,7 +21,6 @@
 #include <nlohmann/json.hpp>
 
 #include "../auth/auth_store.hpp"
-#include "../analysis/pdb_default_skip.hpp"
 #include "../../helpers/diag_log.hpp"
 
 #pragma comment(lib, "Crypt32.lib")
@@ -517,8 +516,6 @@ struct settings_sa_t
     std::string symbol_cache_dir;
     bool        symbol_auto_download = false;
     std::string symbol_server_url = "https://msdl.microsoft.com/download/symbols";
-    bool        pdb_default_skip_load = true;
-    int         pdb_default_skip_load_migration_version = 0;
 
     static std::filesystem::path config_path()
     {
@@ -1260,13 +1257,9 @@ struct settings_sa_t
 
         if (!sa_settings_detail::read_json_file(source, root)) {
             ensure_default_profiles();
-            pdb_default_skip_load_migration_version = 3;
-            pdb_default_skip::set(pdb_default_skip_load);
             sa_settings_detail::last_error_ref() = "no settings file present; using defaults";
             return false;
         }
-
-        bool pdb_migration_pending_save = false;
 
         auto str = [&](const char* key, std::string& dst) {
             if (root.contains(key) && root[key].is_string())
@@ -1315,27 +1308,6 @@ struct settings_sa_t
         str("symbol_cache_dir", symbol_cache_dir);
         boolean("symbol_auto_download", symbol_auto_download);
         str("symbol_server_url", symbol_server_url);
-        bool pdb_skip_field_present = root.contains("pdb_default_skip_load") && root["pdb_default_skip_load"].is_boolean();
-        bool pdb_skip_version_field_present = root.contains("pdb_default_skip_load_migration_version") && root["pdb_default_skip_load_migration_version"].is_number_integer();
-        boolean("pdb_default_skip_load", pdb_default_skip_load);
-        integer("pdb_default_skip_load_migration_version", pdb_default_skip_load_migration_version);
-        const bool needs_v2_migration = pdb_default_skip_load_migration_version < 2;
-        const bool needs_v3_repair = pdb_default_skip_load_migration_version < 3 && pdb_skip_version_field_present && pdb_skip_field_present && !pdb_default_skip_load;
-        if (needs_v2_migration || needs_v3_repair) {
-            const bool previous_value = pdb_default_skip_load;
-            const int previous_version = pdb_default_skip_load_migration_version;
-            pdb_default_skip_load = true;
-            pdb_default_skip_load_migration_version = 3;
-            pdb_migration_pending_save = true;
-            diag::log_tagged_critical_fmt("standalone_settings",
-                "pdb_default_skip_load_migration applied previous_value=%d new_value=1 previous_version=%d new_version=3 field_present_in_json=%d version_field_present_in_json=%d trigger=%s",
-                previous_value ? 1 : 0,
-                previous_version,
-                pdb_skip_field_present ? 1 : 0,
-                pdb_skip_version_field_present ? 1 : 0,
-                needs_v2_migration ? "v2_initial" : "v3_repair");
-        }
-        pdb_default_skip::set(pdb_default_skip_load);
         if (root.contains("temperature") && root["temperature"].is_number())
             temperature = root["temperature"].get<double>();
         integer("mcp_port", mcp_port);
@@ -1567,18 +1539,6 @@ struct settings_sa_t
         migrate_legacy_fields_into_profiles();
         sync_legacy_fields_from_active_profile();
 
-        if (pdb_migration_pending_save) {
-            const bool save_ok = save();
-            const std::string save_err = sa_settings_detail::last_error_ref();
-            sa_settings_detail::last_error_ref().clear();
-            diag::log_tagged_critical_fmt("standalone_settings",
-                "pdb_default_skip_load_migration persisted save_ok=%d migration_version=%d skip_load=%d save_error=\"%s\"",
-                save_ok ? 1 : 0,
-                pdb_default_skip_load_migration_version,
-                pdb_default_skip_load ? 1 : 0,
-                save_err.c_str());
-        }
-
         return true;
     }
 
@@ -1631,9 +1591,6 @@ struct settings_sa_t
         root["symbol_cache_dir"] = symbol_cache_dir;
         root["symbol_auto_download"] = symbol_auto_download;
         root["symbol_server_url"] = symbol_server_url;
-        root["pdb_default_skip_load"] = pdb_default_skip_load;
-        root["pdb_default_skip_load_migration_version"] = pdb_default_skip_load_migration_version;
-        pdb_default_skip::set(pdb_default_skip_load);
         root["temperature"] = temperature;
         root["mcp_port"] = mcp_port;
         root["mcp_enabled"] = mcp_enabled;

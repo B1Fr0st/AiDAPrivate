@@ -26,7 +26,6 @@
 #include "mcp_marketplace.hpp"
 #include "standalone_settings.hpp"
 #include "toast_notification.hpp"
-#include "../analysis/pdb_default_skip.hpp"
 
 #include "mcp_marketplace_view.hpp"
 #include "../ui/avatar.hpp"
@@ -1375,23 +1374,6 @@ namespace settings_overlay {
 			dl->AddText(aida::ui::fonts::h1(), 22.f, ImGui::GetCursorScreenPos(),
 				th.text_primary, "Symbols");
 			ImGui::Dummy(ImVec2(0.f, 32.f));
-
-			bool pdb_skip = g_sa_settings.pdb_default_skip_load;
-			if (content_w < 360.f)
-				ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + (std::max)(120.f, content_w - 24.f));
-			if (ImGui::Checkbox("Always skip PDB load prompts (do not show the Load PDB dialog)##pdb_default_skip_load",
-				&pdb_skip))
-			{
-				g_sa_settings.pdb_default_skip_load = pdb_skip;
-				pdb_default_skip::set(pdb_skip);
-				g_sa_settings.save();
-			}
-			if (content_w < 360.f)
-				ImGui::PopTextWrapPos();
-			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary),
-				g_sa_settings.pdb_default_skip_load
-					? "Current: PDB prompts auto-declined."
-					: "Current: PDB prompts shown interactively.");
 
 			ImGui::Dummy(ImVec2(0.f, 6.f));
 			ImGui::Separator();

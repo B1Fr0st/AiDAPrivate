@@ -1052,16 +1052,70 @@ namespace {
     void test_mitm_forward_all(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "mitm_fwd_all";
         log_msg(hf, tag, "START -- mitm_proxy::forward_all()");
+        size_t held_before = mitm_proxy::get_held_exchanges().size();
+        bool intercept_alive = mitm_proxy::is_intercept_enabled();
+        log_msg(hf, tag, "INPUT held_before=%zu intercept_enabled=%d pid=%lu tid=%lu",
+            held_before,
+            intercept_alive ? 1 : 0,
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long>(GetCurrentThreadId()));
+        auto t0 = std::chrono::steady_clock::now();
         mitm_proxy::forward_all();
-        log_msg(hf, tag, "PASS -- forward_all completed without error");
+        long long us = static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - t0).count());
+        size_t held_after = held_before;
+        const auto poll_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+        for (int attempt = 0; attempt < 20; ++attempt) {
+            held_after = mitm_proxy::get_held_exchanges().size();
+            if (held_after == 0) break;
+            if (std::chrono::steady_clock::now() >= poll_deadline) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        log_msg(hf, tag, "RESULT held_before=%zu held_after=%zu elapsed_us=%lld",
+            held_before, held_after, us);
+        if (held_before > 0 && held_after != 0) {
+            log_msg(hf, tag, "FAIL -- forward_all did not drain held exchanges (held %zu->%zu elapsed_us=%lld)",
+                held_before, held_after, us);
+            failed.fetch_add(1);
+            return;
+        }
+        log_msg(hf, tag, "PASS -- forward_all completed held %zu->%zu (elapsed_us=%lld)",
+            held_before, held_after, us);
         passed.fetch_add(1);
     }
 
     void test_mitm_drop_all(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "mitm_drop_all";
         log_msg(hf, tag, "START -- mitm_proxy::drop_all()");
+        size_t held_before = mitm_proxy::get_held_exchanges().size();
+        bool intercept_alive = mitm_proxy::is_intercept_enabled();
+        log_msg(hf, tag, "INPUT held_before=%zu intercept_enabled=%d pid=%lu tid=%lu",
+            held_before,
+            intercept_alive ? 1 : 0,
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long>(GetCurrentThreadId()));
+        auto t0 = std::chrono::steady_clock::now();
         mitm_proxy::drop_all();
-        log_msg(hf, tag, "PASS -- drop_all completed without error");
+        long long us = static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - t0).count());
+        size_t held_after = held_before;
+        const auto poll_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+        for (int attempt = 0; attempt < 20; ++attempt) {
+            held_after = mitm_proxy::get_held_exchanges().size();
+            if (held_after == 0) break;
+            if (std::chrono::steady_clock::now() >= poll_deadline) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        log_msg(hf, tag, "RESULT held_before=%zu held_after=%zu elapsed_us=%lld",
+            held_before, held_after, us);
+        if (held_before > 0 && held_after != 0) {
+            log_msg(hf, tag, "FAIL -- drop_all did not clear held exchanges (held %zu->%zu elapsed_us=%lld)",
+                held_before, held_after, us);
+            failed.fetch_add(1);
+            return;
+        }
+        log_msg(hf, tag, "PASS -- drop_all completed held %zu->%zu (elapsed_us=%lld)",
+            held_before, held_after, us);
         passed.fetch_add(1);
     }
 
@@ -1069,36 +1123,78 @@ namespace {
         const char* tag = "mitm_ws_cb";
         log_msg(hf, tag, "START -- mitm_proxy::set_ws_frame_callback()");
         std::atomic<int> frame_count{0};
+        auto t_install = std::chrono::steady_clock::now();
         mitm_proxy::set_ws_frame_callback([&frame_count](const mitm_proxy::ws_frame_observed_t&) {
             frame_count.fetch_add(1);
         });
+        long long us_install = static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - t_install).count());
+        log_msg(hf, tag, "RESULT install_ok has_cb=1 elapsed_us=%lld pid=%lu tid=%lu",
+            us_install,
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long>(GetCurrentThreadId()));
         log_msg(hf, tag, "callback set, verifying clear");
+        auto t_clear = std::chrono::steady_clock::now();
         mitm_proxy::set_ws_frame_callback(nullptr);
-        log_msg(hf, tag, "PASS -- ws_frame_callback set and cleared");
+        long long us_clear = static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - t_clear).count());
+        log_msg(hf, tag, "RESULT clear_ok has_cb=0 elapsed_us=%lld", us_clear);
+        log_msg(hf, tag, "PASS -- ws_frame_callback set and cleared (install_us=%lld clear_us=%lld)",
+            us_install, us_clear);
         passed.fetch_add(1);
     }
 
     void test_mitm_intercept_callback(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "mitm_intcpt_cb";
         log_msg(hf, tag, "START -- mitm_proxy::set_intercept_callback()");
+        bool enabled_before = mitm_proxy::is_intercept_enabled();
+        log_msg(hf, tag, "INPUT intercept_enabled_before=%d pid=%lu tid=%lu",
+            enabled_before ? 1 : 0,
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long>(GetCurrentThreadId()));
+        auto t_install = std::chrono::steady_clock::now();
         mitm_proxy::set_intercept_callback([](mitm_proxy::http_exchange&) -> mitm_proxy::intercept_action {
             return mitm_proxy::intercept_action::forward;
         });
+        long long us_install = static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - t_install).count());
+        bool enabled_after_install = mitm_proxy::is_intercept_enabled();
+        log_msg(hf, tag, "RESULT install_ok intercept_enabled=%d elapsed_us=%lld",
+            enabled_after_install ? 1 : 0, us_install);
         log_msg(hf, tag, "callback set, verifying clear");
+        auto t_clear = std::chrono::steady_clock::now();
         mitm_proxy::set_intercept_callback(nullptr);
-        log_msg(hf, tag, "PASS -- intercept_callback set and cleared");
+        long long us_clear = static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - t_clear).count());
+        bool enabled_after_clear = mitm_proxy::is_intercept_enabled();
+        log_msg(hf, tag, "RESULT clear_ok intercept_enabled=%d elapsed_us=%lld",
+            enabled_after_clear ? 1 : 0, us_clear);
+        log_msg(hf, tag, "PASS -- intercept_callback set and cleared (install_us=%lld clear_us=%lld)",
+            us_install, us_clear);
         passed.fetch_add(1);
     }
 
     void test_mitm_find_exchange(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "mitm_find_exch";
         log_msg(hf, tag, "START -- mitm_proxy::find_exchange(0) for nonexistent id");
+        size_t hist_count = mitm_proxy::history_count();
+        size_t held_count = mitm_proxy::get_held_exchanges().size();
+        log_msg(hf, tag, "INPUT id=0 history_count=%zu held_count=%zu pid=%lu tid=%lu",
+            hist_count, held_count,
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long>(GetCurrentThreadId()));
+        auto t0 = std::chrono::steady_clock::now();
         const mitm_proxy::http_exchange* ex = mitm_proxy::find_exchange(0);
+        long long us = static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - t0).count());
+        log_msg(hf, tag, "RESULT returned_ptr=%p history_count=%zu held_count=%zu elapsed_us=%lld",
+            static_cast<const void*>(ex), hist_count, held_count, us);
         if (ex == nullptr) {
-            log_msg(hf, tag, "PASS -- find_exchange returned nullptr for id=0");
+            log_msg(hf, tag, "PASS -- find_exchange returned nullptr for id=0 (elapsed_us=%lld)", us);
             passed.fetch_add(1);
         } else {
-            log_msg(hf, tag, "PASS -- find_exchange returned non-null (unexpected but valid)");
+            log_msg(hf, tag, "PASS -- find_exchange returned non-null %p (unexpected but valid, elapsed_us=%lld)",
+                static_cast<const void*>(ex), us);
             passed.fetch_add(1);
         }
     }
@@ -2312,6 +2408,7 @@ namespace {
 
     void test_driver_enumerate_connections(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "drv_enum_conn";
+        ::test_all_features::set_progress_step(tag);
         log_msg(hf, tag, "START -- driver_bridge::enumerate_connections()");
         if (!driver_bridge::using_kernel_driver()) {
             log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
@@ -2327,6 +2424,7 @@ namespace {
 
     void test_driver_start_stop_capture(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "drv_cap_cycle";
+        ::test_all_features::set_progress_step(tag);
         log_msg(hf, tag, "START -- driver_bridge start_capture/traffic/stop cycle");
         if (!driver_bridge::using_kernel_driver()) {
             log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
@@ -2346,6 +2444,7 @@ namespace {
 
     void test_driver_get_packets(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "drv_get_pkts";
+        ::test_all_features::set_progress_step(tag);
         log_msg(hf, tag, "START -- driver_bridge::get_captured_packets()");
         if (!driver_bridge::using_kernel_driver()) {
             log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
@@ -2369,6 +2468,7 @@ namespace {
 
     void test_driver_dns_queries(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "drv_dns_query";
+        ::test_all_features::set_progress_step(tag);
         log_msg(hf, tag, "START -- driver_bridge::get_dns_queries()");
         if (!driver_bridge::using_kernel_driver()) {
             log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
@@ -2388,6 +2488,7 @@ namespace {
 
     void test_driver_filter_rules(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "drv_flt_rules";
+        ::test_all_features::set_progress_step(tag);
         log_msg(hf, tag, "START -- driver_bridge filter rule add/remove");
         if (!driver_bridge::using_kernel_driver()) {
             log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
@@ -2418,6 +2519,7 @@ namespace {
 
     void test_driver_clear_filters(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "drv_flt_clear";
+        ::test_all_features::set_progress_step(tag);
         log_msg(hf, tag, "START -- driver_bridge::clear_filter_rules()");
         if (!driver_bridge::using_kernel_driver()) {
             log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
@@ -2433,6 +2535,7 @@ namespace {
 
     void test_driver_network_stats(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "drv_net_stats";
+        ::test_all_features::set_progress_step(tag);
         log_msg(hf, tag, "START -- driver_bridge::get_network_stats()");
         if (!driver_bridge::using_kernel_driver()) {
             log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
@@ -2457,6 +2560,7 @@ namespace {
 
     void test_driver_bw_monitor(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "drv_bw_mon";
+        ::test_all_features::set_progress_step(tag);
         log_msg(hf, tag, "START -- driver_bridge bandwidth monitor reset/start/traffic/query/stop");
         if (!driver_bridge::using_kernel_driver()) {
             log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
@@ -2511,6 +2615,7 @@ namespace {
 
     void test_driver_bw_per_process(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "drv_bw_proc";
+        ::test_all_features::set_progress_step(tag);
         log_msg(hf, tag, "START -- driver_bridge::get_bw_per_process()");
         if (!driver_bridge::using_kernel_driver()) {
             log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
@@ -2561,6 +2666,7 @@ namespace {
 
     void test_driver_dpi_results(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "drv_dpi";
+        ::test_all_features::set_progress_step(tag);
         log_msg(hf, tag, "START -- driver_bridge::get_dpi_results()");
         if (!driver_bridge::using_kernel_driver()) {
             log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
@@ -2588,6 +2694,7 @@ namespace {
 
     void test_driver_wfp_callouts(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "drv_wfp";
+        ::test_all_features::set_progress_step(tag);
         log_msg(hf, tag, "START -- driver_bridge::enumerate_wfp_callouts()");
         if (!driver_bridge::using_kernel_driver()) {
             log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
@@ -2609,6 +2716,7 @@ namespace {
 
     void test_driver_socket_handles(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "drv_sock_hdl";
+        ::test_all_features::set_progress_step(tag);
         log_msg(hf, tag, "START -- driver_bridge::get_socket_handles()");
         if (!driver_bridge::using_kernel_driver()) {
             log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
@@ -2624,6 +2732,7 @@ namespace {
 
     void test_driver_tcpip_dump(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "drv_tcpip";
+        ::test_all_features::set_progress_step(tag);
         log_msg(hf, tag, "START -- driver_bridge::dump_tcpip_connections()");
         if (!driver_bridge::using_kernel_driver()) {
             log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
@@ -2645,6 +2754,7 @@ namespace {
 
     void test_driver_interfaces(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "drv_ifaces";
+        ::test_all_features::set_progress_step(tag);
         log_msg(hf, tag, "START -- driver_bridge::enumerate_interfaces()");
         if (!driver_bridge::using_kernel_driver()) {
             log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
@@ -2665,6 +2775,7 @@ namespace {
 
     void test_driver_export_pcap(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "drv_pcap";
+        ::test_all_features::set_progress_step(tag);
         log_msg(hf, tag, "START -- driver_bridge::export_pcap()");
         if (!driver_bridge::using_kernel_driver()) {
             log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
@@ -2690,6 +2801,7 @@ namespace {
 
     void test_driver_held_packets(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "drv_held_pkts";
+        ::test_all_features::set_progress_step(tag);
         log_msg(hf, tag, "START -- driver_bridge intercept fixture/get_held_packets()");
         if (!driver_bridge::using_kernel_driver()) {
             log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
@@ -2782,6 +2894,7 @@ namespace {
 
     void test_driver_packet_mod_rules(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "drv_mod_rules";
+        ::test_all_features::set_progress_step(tag);
         log_msg(hf, tag, "START -- driver_bridge::list_packet_mod_rules()");
         if (!driver_bridge::using_kernel_driver()) {
             log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
@@ -2826,6 +2939,7 @@ namespace {
 
     void test_driver_redirect_rules(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "drv_redir_rul";
+        ::test_all_features::set_progress_step(tag);
         log_msg(hf, tag, "START -- driver_bridge::list_redirect_rules()");
         if (!driver_bridge::using_kernel_driver()) {
             log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
@@ -2868,6 +2982,7 @@ namespace {
 
     void test_driver_dns_spoof_rules(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "drv_dns_spoof";
+        ::test_all_features::set_progress_step(tag);
         log_msg(hf, tag, "START -- driver_bridge::list_dns_spoof_rules()");
         if (!driver_bridge::using_kernel_driver()) {
             log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
@@ -2910,6 +3025,7 @@ namespace {
 
     void test_driver_dns_spoof_add_remove(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "drv_dns_sp_ar";
+        ::test_all_features::set_progress_step(tag);
         log_msg(hf, tag, "START -- driver_bridge dns_spoof_op add/remove");
         if (!driver_bridge::using_kernel_driver()) {
             log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
@@ -2935,6 +3051,7 @@ namespace {
 
     void test_driver_traffic_redirect(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "drv_traf_rdr";
+        ::test_all_features::set_progress_step(tag);
         log_msg(hf, tag, "START -- driver_bridge traffic_redirect_op add/remove");
         if (!driver_bridge::using_kernel_driver()) {
             log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
@@ -2968,6 +3085,7 @@ namespace {
 
     void test_driver_stream_reassemble(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "drv_strm_reas";
+        ::test_all_features::set_progress_step(tag);
         log_msg(hf, tag, "START -- driver_bridge::stream_reassemble_op() loopback TCP fixture");
         if (!driver_bridge::using_kernel_driver()) {
             log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
@@ -3037,6 +3155,7 @@ namespace {
 
     void test_driver_fingerprint(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "drv_fprint";
+        ::test_all_features::set_progress_step(tag);
         log_msg(hf, tag, "START -- driver_bridge fingerprint_op/get_fingerprints");
         if (!driver_bridge::using_kernel_driver()) {
             log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
@@ -3089,6 +3208,7 @@ namespace {
 
     void test_driver_intercept_op(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "drv_intercept";
+        ::test_all_features::set_progress_step(tag);
         log_msg(hf, tag, "START -- driver_bridge intercept_op query");
         if (!driver_bridge::using_kernel_driver()) {
             log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",
@@ -3113,6 +3233,7 @@ namespace {
 
     void test_driver_inject_loopback(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "drv_inject_lb";
+        ::test_all_features::set_progress_step(tag);
         log_msg(hf, tag, "START -- driver_bridge::inject_packet() loopback UDP");
         if (!driver_bridge::using_kernel_driver()) {
             log_msg(hf, tag, "FAIL -- kernel driver not loaded (network kernel features are mandatory; no usermode fallback) driver_status=\"%s\" last_error=\"%s\"",

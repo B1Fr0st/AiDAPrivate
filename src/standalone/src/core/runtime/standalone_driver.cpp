@@ -56,6 +56,9 @@ namespace
 
     std::mutex      g_state_mtx;
     HANDLE          g_process = nullptr;
+    std::mutex      g_last_invalidate_mtx;
+    std::string     g_last_invalidate_reason;
+    std::atomic<uint64_t> g_last_invalidate_tick{0};
 
     using arc_set_process_id_fn = void (*)(uint32_t);
     using arc_solve_dtb_fn = uint64_t (*)();
@@ -4366,6 +4369,11 @@ namespace driver_bridge
 
     void invalidate_kernel_session(const char* reason)
     {
+        {
+            std::lock_guard<std::mutex> lk(g_last_invalidate_mtx);
+            g_last_invalidate_reason = reason ? std::string(reason) : std::string("<null>");
+        }
+        g_last_invalidate_tick.store(static_cast<uint64_t>(GetTickCount64()), std::memory_order_release);
         const runtime_auth_snapshot_t before_auth = capture_runtime_auth_snapshot();
         const bool preserve_activation = authenticated_runtime_preserved_for_kernel_transition(before_auth);
         kernel_session_snapshot_t before_kernel{};
@@ -5039,11 +5047,21 @@ namespace driver_bridge
             !rt.driver_hardening_done.load(std::memory_order_acquire))
         {
             set_reason("driver_hardening_not_finalized");
-            driver_critical_fmt("kernel_session_available ok=0 reason=driver_hardening_not_finalized initialized=%d kernel=%d connected=%d activation_hardening=%d",
+            std::string last_reason;
+            {
+                std::lock_guard<std::mutex> lk(g_last_invalidate_mtx);
+                last_reason = g_last_invalidate_reason;
+            }
+            const uint64_t last_tick = g_last_invalidate_tick.load(std::memory_order_acquire);
+            const uint64_t now_tick = static_cast<uint64_t>(GetTickCount64());
+            const uint64_t elapsed_since_invalidate_ms = last_tick == 0 ? 0 : (now_tick - last_tick);
+            driver_critical_fmt("kernel_session_available ok=0 reason=driver_hardening_not_finalized initialized=%d kernel=%d connected=%d activation_hardening=%d last_invalidate_reason='%.160s' elapsed_since_invalidate_ms=%llu",
                 initialized ? 1 : 0,
                 kernel_mode ? 1 : 0,
                 connected ? 1 : 0,
-                rt.activation_hardening_done.load(std::memory_order_acquire) ? 1 : 0);
+                rt.activation_hardening_done.load(std::memory_order_acquire) ? 1 : 0,
+                last_reason.empty() ? "<never>" : last_reason.c_str(),
+                static_cast<unsigned long long>(elapsed_since_invalidate_ms));
             return false;
         }
 
@@ -8273,7 +8291,9 @@ namespace driver_bridge
         diag::log_tagged_fmt("driver_bridge_net",
             "enumerate_connections ENTER filter_pid=%u filter_protocol=%u",
             filter_pid, filter_protocol);
+        SetLastError(ERROR_SUCCESS);
         auto raw = device->enumerate_connections(filter_pid, filter_protocol);
+        const DWORD ioctl_gle = GetLastError();
         result.reserve(raw.size());
         for (const auto& src : raw) {
             net_connection_info_t c;
@@ -8289,9 +8309,15 @@ namespace driver_bridge
             result.push_back(c);
         }
         diag::log_tagged_fmt("driver_bridge_net",
-            "enumerate_connections EXIT filter_pid=%u filter_protocol=%u raw=%zu mapped=%zu elapsed_ms=%llu",
+            "enumerate_connections EXIT filter_pid=%u filter_protocol=%u raw=%zu mapped=%zu gle=%lu elapsed_ms=%llu",
             filter_pid, filter_protocol, raw.size(), result.size(),
+            static_cast<unsigned long>(ioctl_gle),
             static_cast<unsigned long long>(GetTickCount64() - t0));
+        if (!raw.empty()) {
+            SetLastError(ERROR_SUCCESS);
+        } else {
+            SetLastError(ioctl_gle);
+        }
         return result;
     }
 
@@ -8474,8 +8500,10 @@ namespace driver_bridge
             return result;
         }
 
+        SetLastError(ERROR_SUCCESS);
         auto raw = device->get_dns_queries(filter_pid);
-        logf("get_dns_queries: got %zu raw entries (filter_pid=%u)\n", raw.size(), filter_pid);
+        const DWORD ioctl_gle = GetLastError();
+        logf("get_dns_queries: got %zu raw entries (filter_pid=%u) gle=%lu\n", raw.size(), filter_pid, ioctl_gle);
         result.reserve(raw.size());
         for (auto& src : raw) {
             dns_entry_t entry;
@@ -8487,6 +8515,11 @@ namespace driver_bridge
             entry.response_code = src.response_code;
             entry.ttl           = src.ttl;
             result.push_back(std::move(entry));
+        }
+        if (!raw.empty()) {
+            SetLastError(ERROR_SUCCESS);
+        } else {
+            SetLastError(ioctl_gle);
         }
         return result;
     }
@@ -8534,7 +8567,12 @@ namespace driver_bridge
             return false;
         }
 
-        return device->clear_filter_rules();
+        SetLastError(ERROR_SUCCESS);
+        const bool ok = device->clear_filter_rules();
+        if (ok) {
+            SetLastError(ERROR_SUCCESS);
+        }
+        return ok;
     }
 
 
@@ -8549,6 +8587,7 @@ namespace driver_bridge
             return false;
 
         voyager::device_t::network_stats ks{};
+        SetLastError(ERROR_SUCCESS);
         if (!device->get_network_stats(ks))
             return false;
 
@@ -8562,6 +8601,7 @@ namespace driver_bridge
         stats.total_dropped       = ks.total_dropped;
         stats.total_dns_logged    = ks.total_dns_logged;
         stats.active_filter_rules = ks.active_filter_rules;
+        SetLastError(ERROR_SUCCESS);
         return true;
     }
 
@@ -9386,6 +9426,7 @@ namespace driver_bridge
             ok ? 1 : 0,
             static_cast<unsigned long>(err),
             static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
+        if (!ok) SetLastError(err);
         return ok;
     }
 
@@ -9840,6 +9881,7 @@ namespace driver_bridge
             ok ? 1 : 0,
             static_cast<unsigned long>(err),
             static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
+        if (!ok) SetLastError(err);
         return ok;
     }
 
@@ -10349,6 +10391,7 @@ namespace driver_bridge
             operation, rule_id, domain ? domain : "", af, ttl,
             spoof_addr ? spoof_addr[0] : 0, spoof_addr ? spoof_addr[1] : 0,
             spoof_addr ? spoof_addr[2] : 0, spoof_addr ? spoof_addr[3] : 0);
+        SetLastError(ERROR_SUCCESS);
         bool ok = device->dns_spoof_op(operation, rule_id, domain, spoof_addr, af, ttl, out_rule_id);
         DWORD gle = ok ? 0 : GetLastError();
         diag::log_tagged_fmt("driver_bridge_net",
@@ -10356,6 +10399,7 @@ namespace driver_bridge
             operation, ok ? 1 : 0, out_rule_id ? *out_rule_id : 0,
             static_cast<unsigned long>(gle),
             static_cast<unsigned long long>(GetTickCount64() - t0));
+        SetLastError(ok ? ERROR_SUCCESS : gle);
         return ok;
     }
 
@@ -10543,7 +10587,9 @@ namespace driver_bridge
         }
         if (!kernel_mode) return result;
 
+        SetLastError(ERROR_SUCCESS);
         auto raw = device->enumerate_wfp_callouts(filter_module);
+        const DWORD ioctl_gle = GetLastError();
         result.reserve(raw.size());
         for (const auto& src : raw) {
             wfp_callout_info_t c;
@@ -10565,6 +10611,11 @@ namespace driver_bridge
             c.owning_module        = src.owning_module;
             result.push_back(std::move(c));
         }
+        if (!raw.empty()) {
+            SetLastError(ERROR_SUCCESS);
+        } else {
+            SetLastError(ioctl_gle);
+        }
         return result;
     }
 
@@ -10578,7 +10629,9 @@ namespace driver_bridge
         }
         if (!kernel_mode) return result;
 
+        SetLastError(ERROR_SUCCESS);
         auto raw = device->get_socket_handles(target_pid);
+        const DWORD ioctl_gle = GetLastError();
         result.reserve(raw.size());
         for (const auto& src : raw) {
             socket_info_t s;
@@ -10594,6 +10647,11 @@ namespace driver_bridge
             std::memcpy(s.remote_addr, src.remote_addr, 16);
             result.push_back(s);
         }
+        if (!raw.empty()) {
+            SetLastError(ERROR_SUCCESS);
+        } else {
+            SetLastError(ioctl_gle);
+        }
         return result;
     }
 
@@ -10607,7 +10665,9 @@ namespace driver_bridge
         }
         if (!kernel_mode) return result;
 
+        SetLastError(ERROR_SUCCESS);
         auto raw = device->dump_tcpip_connections(target_pid, filter_protocol);
+        const DWORD ioctl_gle = GetLastError();
         result.reserve(raw.size());
         for (const auto& src : raw) {
             tcpip_connection_t c;
@@ -10626,6 +10686,11 @@ namespace driver_bridge
             c.bytes_out          = src.bytes_out;
             result.push_back(c);
         }
+        if (!raw.empty()) {
+            SetLastError(ERROR_SUCCESS);
+        } else {
+            SetLastError(ioctl_gle);
+        }
         return result;
     }
 
@@ -10639,7 +10704,9 @@ namespace driver_bridge
         }
         if (!kernel_mode) return result;
 
+        SetLastError(ERROR_SUCCESS);
         auto raw = device->enumerate_interfaces();
+        const DWORD ioctl_gle = GetLastError();
         result.reserve(raw.size());
         for (const auto& src : raw) {
             net_iface_info_t ifc;
@@ -10657,6 +10724,11 @@ namespace driver_bridge
             ifc.in_octets   = src.in_octets;
             ifc.out_octets  = src.out_octets;
             result.push_back(std::move(ifc));
+        }
+        if (!raw.empty()) {
+            SetLastError(ERROR_SUCCESS);
+        } else {
+            SetLastError(ioctl_gle);
         }
         return result;
     }

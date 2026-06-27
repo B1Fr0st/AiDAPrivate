@@ -3334,6 +3334,8 @@ namespace
     uint64_t s_driver_proof_cache_ms = 0;
 
     constexpr uint64_t kDriverProofCacheMaxAgeMs = 180000;
+    constexpr uint64_t kKernelSessionRelayKeepaliveMs = 10000;
+    std::atomic<int64_t> s_last_kernel_session_relay_ms{0};
 
     uint64_t fnv1a(const void* data, size_t len);
     uint64_t fnv1a_str(const std::string& s);
@@ -9064,17 +9066,26 @@ namespace
             GetThreadPriority(GetCurrentThread()));
         while (worker_active(worker_epoch))
         {
-            for (int w = 0; w < 10 && worker_active(worker_epoch); ++w)
+            const uint64_t keepalive_slices = (kKernelSessionRelayKeepaliveMs + 999u) / 1000u;
+            for (uint64_t w = 0; w < keepalive_slices && worker_active(worker_epoch); ++w)
                 std::this_thread::sleep_for(std::chrono::seconds(1));
 
             if (!worker_active(worker_epoch))
                 break;
 
+            const int64_t now_ms = static_cast<int64_t>(GetTickCount64());
+            const int64_t last_relay_ms = s_last_kernel_session_relay_ms.load(std::memory_order_acquire);
+            const uint64_t age_since_last_relay_ms = last_relay_ms == 0
+                ? 0
+                : static_cast<uint64_t>(now_ms - last_relay_ms);
+
             const bool valid_now = check_obfuscated_valid();
             const size_t session_token_len = settings->license_session_token.size();
 
             if (!valid_now || settings->license_session_token.empty()) {
-                lic_log_fmt("srv_refresh_skip reason=invalid_or_missing_session valid=%d session_len=%zu",
+                lic_log_fmt("kernel_session_relay_keepalive_tick ok=0 gle=%lu age_since_last_relay_ms=%llu reason=invalid_or_missing_session valid=%d session_len=%zu",
+                    static_cast<unsigned long>(ERROR_NOT_READY),
+                    static_cast<unsigned long long>(age_since_last_relay_ms),
                     valid_now ? 1 : 0,
                     session_token_len);
                 continue;
@@ -9103,12 +9114,23 @@ namespace
             bool relay_ok = relay_server_token_v2_if_ready(token_hash, srv_nonce_val, &driver_proof);
             DWORD relay_gle = relay_ok ? ERROR_SUCCESS : GetLastError();
             const uint64_t relay_elapsed_ms = static_cast<uint64_t>(GetTickCount64()) - relay_start;
+            lic_log_fmt("kernel_session_relay_keepalive_tick ok=%d gle=%lu age_since_last_relay_ms=%llu elapsed_ms=%llu proof=%d budget_ms=%llu",
+                relay_ok ? 1 : 0,
+                static_cast<unsigned long>(relay_gle),
+                static_cast<unsigned long long>(age_since_last_relay_ms),
+                static_cast<unsigned long long>(relay_elapsed_ms),
+                driver_proof != 0 ? 1 : 0,
+                static_cast<unsigned long long>(kKernelSessionRelayKeepaliveMs));
             if (!relay_ok || driver_proof == 0 || relay_elapsed_ms >= 1000) {
                 lic_log_fmt("srv_refresh_relay_end ok=%d proof=%d gle=%lu elapsed_ms=%llu",
                     relay_ok ? 1 : 0,
                     driver_proof != 0 ? 1 : 0,
                     static_cast<unsigned long>(relay_gle),
                     static_cast<unsigned long long>(relay_elapsed_ms));
+            }
+            if (relay_ok) {
+                s_last_kernel_session_relay_ms.store(static_cast<int64_t>(GetTickCount64()),
+                    std::memory_order_release);
             }
             if (relay_ok && driver_proof != 0)
                 store_driver_proof_cache(driver_proof, srv_nonce_str);

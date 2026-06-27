@@ -171,6 +171,48 @@ namespace {
 
     constexpr std::chrono::milliseconds kSeedRotationLockBudget{1500};
     constexpr std::chrono::microseconds kSeedRotationLockSpinSlice{200};
+    constexpr std::uint32_t kSeedRotationWaiterCorruptionThreshold = 64;
+    constexpr std::uint32_t kSeedRotationWaiterSanityCap = 4096;
+    std::atomic<std::uint64_t> g_seed_rotation_waiter_corrupt_observations{0};
+
+    void check_seed_rotation_waiter_tripwire(std::atomic<std::uint32_t>& counter,
+                                             const char* caller) noexcept
+    {
+        std::uint32_t observed = counter.load(std::memory_order_acquire);
+        if (observed <= kSeedRotationWaiterCorruptionThreshold)
+            return;
+        g_seed_rotation_waiter_corrupt_observations.fetch_add(1, std::memory_order_acq_rel);
+        void* stack[16] = {};
+        USHORT frames = CaptureStackBackTrace(0, 16, stack, nullptr);
+        char stack_buf[512] = {};
+        std::size_t cursor = 0;
+        for (USHORT i = 0; i < frames && cursor + 24 < sizeof(stack_buf); ++i) {
+            int written = std::snprintf(stack_buf + cursor,
+                                        sizeof(stack_buf) - cursor,
+                                        "%p ",
+                                        stack[i]);
+            if (written <= 0)
+                break;
+            cursor += static_cast<std::size_t>(written);
+        }
+        if (cursor < sizeof(stack_buf))
+            stack_buf[cursor] = 0;
+        diag::log_tagged_critical_fmt("comm-corrupt",
+            "seed_rotation_waiter_counter_corrupted observed=%u caller=%s tid=%lu pid=%lu frames=%u observations=%llu stack=%s",
+            observed,
+            caller && caller[0] ? caller : "unknown",
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned>(frames),
+            static_cast<unsigned long long>(g_seed_rotation_waiter_corrupt_observations.load(std::memory_order_acquire)),
+            stack_buf);
+        char dbg_line[256] = {};
+        std::snprintf(dbg_line, sizeof(dbg_line),
+                      "[comm-corrupt] seed_rotation_waiter_counter_corrupted observed=%u caller=%s\n",
+                      observed,
+                      caller && caller[0] ? caller : "unknown");
+        OutputDebugStringA(dbg_line);
+    }
 
     static std::uint64_t mix_remote_call_diag(std::uint64_t value, std::uint64_t input) noexcept
     {
@@ -885,9 +927,22 @@ void voyager::device_t::set_process_id(std::uint32_t pid) noexcept {
     int shellcode_free_skipped_disconnected = 0;
     int shellcode_free_skipped_no_address = 0;
 
+    bool prev_pid_alive = true;
+    if (prev_pid != 0) {
+        HANDLE prev_h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(prev_pid));
+        if (prev_h == nullptr) {
+            prev_pid_alive = false;
+        } else {
+            DWORD exit_code = 0;
+            if (GetExitCodeProcess(prev_h, &exit_code) && exit_code != STILL_ACTIVE)
+                prev_pid_alive = false;
+            CloseHandle(prev_h);
+        }
+    }
+
     if (pid_changing) {
         if (prev_shellcode != 0) {
-            if (connected) {
+            if (connected && prev_pid_alive) {
                 free_memory(prev_shellcode);
                 shellcode_freed = 1;
             } else {
@@ -908,25 +963,48 @@ void voyager::device_t::set_process_id(std::uint32_t pid) noexcept {
     process_id_ = pid;
 
     if (pid_changing || prev_pid != pid) {
-        diag::log_tagged_critical_fmt("comm",
-            "set_process_id_switch from_pid=%u to_pid=%u pid_changing=%d connected=%d shellcode_freed=%d shellcode_free_skipped_disconnected=%d shellcode_free_skipped_no_address=%d prev_shellcode=0x%llX prev_spoof_gadget=0x%llX prev_base=0x%llX prev_dtb=0x%llX prev_kernel_dtb=0x%llX prev_last_failed_tid=%lu prev_last_hijacked_tid=%lu local_pid=%lu local_tid=%lu handle=0x%llX",
-            prev_pid,
-            pid,
-            pid_changing ? 1 : 0,
-            connected ? 1 : 0,
-            shellcode_freed,
-            shellcode_free_skipped_disconnected,
-            shellcode_free_skipped_no_address,
-            static_cast<unsigned long long>(prev_shellcode),
-            static_cast<unsigned long long>(prev_spoof_gadget),
-            static_cast<unsigned long long>(prev_base),
-            static_cast<unsigned long long>(prev_dtb),
-            static_cast<unsigned long long>(prev_kernel_dtb),
-            static_cast<unsigned long>(prev_last_failed_tid),
-            static_cast<unsigned long>(prev_last_hijacked_tid),
-            static_cast<unsigned long>(GetCurrentProcessId()),
-            static_cast<unsigned long>(GetCurrentThreadId()),
-            reinterpret_cast<unsigned long long>(driver_handle_));
+        if (prev_pid != 0 && !prev_pid_alive) {
+            diag::log_tagged_fmt("comm",
+                "set_process_id_switch from_pid=%u to_pid=%u pid_changing=%d connected=%d shellcode_freed=%d shellcode_free_skipped_disconnected=%d shellcode_free_skipped_no_address=%d prev_pid_alive=0 prev_shellcode=0x%llX prev_spoof_gadget=0x%llX prev_base=0x%llX prev_dtb=0x%llX prev_kernel_dtb=0x%llX prev_last_failed_tid=%lu prev_last_hijacked_tid=%lu local_pid=%lu local_tid=%lu handle=0x%llX",
+                prev_pid,
+                pid,
+                pid_changing ? 1 : 0,
+                connected ? 1 : 0,
+                shellcode_freed,
+                shellcode_free_skipped_disconnected,
+                shellcode_free_skipped_no_address,
+                static_cast<unsigned long long>(prev_shellcode),
+                static_cast<unsigned long long>(prev_spoof_gadget),
+                static_cast<unsigned long long>(prev_base),
+                static_cast<unsigned long long>(prev_dtb),
+                static_cast<unsigned long long>(prev_kernel_dtb),
+                static_cast<unsigned long>(prev_last_failed_tid),
+                static_cast<unsigned long>(prev_last_hijacked_tid),
+                static_cast<unsigned long>(GetCurrentProcessId()),
+                static_cast<unsigned long>(GetCurrentThreadId()),
+                reinterpret_cast<unsigned long long>(driver_handle_));
+        } else {
+            diag::log_tagged_critical_fmt("comm",
+                "set_process_id_switch from_pid=%u to_pid=%u pid_changing=%d connected=%d shellcode_freed=%d shellcode_free_skipped_disconnected=%d shellcode_free_skipped_no_address=%d prev_pid_alive=%d prev_shellcode=0x%llX prev_spoof_gadget=0x%llX prev_base=0x%llX prev_dtb=0x%llX prev_kernel_dtb=0x%llX prev_last_failed_tid=%lu prev_last_hijacked_tid=%lu local_pid=%lu local_tid=%lu handle=0x%llX",
+                prev_pid,
+                pid,
+                pid_changing ? 1 : 0,
+                connected ? 1 : 0,
+                shellcode_freed,
+                shellcode_free_skipped_disconnected,
+                shellcode_free_skipped_no_address,
+                prev_pid_alive ? 1 : 0,
+                static_cast<unsigned long long>(prev_shellcode),
+                static_cast<unsigned long long>(prev_spoof_gadget),
+                static_cast<unsigned long long>(prev_base),
+                static_cast<unsigned long long>(prev_dtb),
+                static_cast<unsigned long long>(prev_kernel_dtb),
+                static_cast<unsigned long>(prev_last_failed_tid),
+                static_cast<unsigned long>(prev_last_hijacked_tid),
+                static_cast<unsigned long>(GetCurrentProcessId()),
+                static_cast<unsigned long>(GetCurrentThreadId()),
+                reinterpret_cast<unsigned long long>(driver_handle_));
+        }
     }
 }
 
@@ -3026,8 +3104,7 @@ bool voyager::device_t::session_invalidated() const noexcept {
     const bool err_matches =
         err == ERROR_INVALID_FUNCTION ||
         err == ERROR_GEN_FAILURE ||
-        err == ERROR_ACCESS_DENIED ||
-        err == static_cast<DWORD>(0xC0000010);
+        err == ERROR_ACCESS_DENIED;
     if (!err_matches)
         return false;
     if (last_heartbeat_tsc_ == 0)
@@ -3042,7 +3119,27 @@ bool voyager::device_t::session_invalidated() const noexcept {
 bool voyager::device_t::send_request(DWORD control_code, void* input, DWORD input_size) const noexcept {
     const DWORD local_pid_for_lock = GetCurrentProcessId();
     const DWORD local_tid_for_lock = GetCurrentThreadId();
-    if (seed_rotation_writer_waiters_.load(std::memory_order_acquire) != 0) {
+    check_seed_rotation_waiter_tripwire(seed_rotation_writer_waiters_, "voyager::device_t::send_request");
+    const std::uint32_t observed_waiters = seed_rotation_writer_waiters_.load(std::memory_order_acquire);
+    const bool waiters_corrupt_sanity = observed_waiters > kSeedRotationWaiterSanityCap;
+    if (waiters_corrupt_sanity) {
+        static std::atomic<std::int64_t> s_last_corrupt_log_ms{0};
+        auto now_ms = ::GetTickCount64();
+        auto last = s_last_corrupt_log_ms.load(std::memory_order_acquire);
+        if (now_ms - static_cast<std::uint64_t>(last) >= 1000 && s_last_corrupt_log_ms.compare_exchange_strong(last, static_cast<std::int64_t>(now_ms))) {
+            diag::log_tagged_critical_fmt("comm",
+                "send_request_writer_waiters_corrupt control_code=0x%08X input_size=%u observed=%u cap=%u local_pid=%lu local_tid=%lu inflight_capture=%p inflight_relay=%u",
+                control_code,
+                input_size,
+                observed_waiters,
+                kSeedRotationWaiterSanityCap,
+                static_cast<unsigned long>(local_pid_for_lock),
+                static_cast<unsigned long>(local_tid_for_lock),
+                inflight_capture_thread_.load(std::memory_order_acquire),
+                g_server_token_relay_inflight.load(std::memory_order_acquire));
+        }
+    }
+    if (observed_waiters != 0 && !waiters_corrupt_sanity) {
         const std::uint64_t fence_start = __rdtsc();
         const auto fence_deadline = std::chrono::steady_clock::now() + kSeedRotationLockBudget;
         bool fence_acquired = false;
@@ -3070,7 +3167,7 @@ bool voyager::device_t::send_request(DWORD control_code, void* input, DWORD inpu
                 static_cast<unsigned long long>(fence_elapsed),
                 static_cast<long long>(kSeedRotationLockBudget.count()));
         } else {
-            diag::log_tagged_critical_fmt("comm",
+            diag::log_tagged_fmt("comm",
                 "send_request_writer_fence control_code=0x%08X input_size=%u local_pid=%lu local_tid=%lu waiters_after=%u fence_tsc=%llu",
                 control_code,
                 input_size,
@@ -3764,7 +3861,8 @@ bool voyager::device_t::get_thread_context(std::uint32_t tid, thread_context& ct
     req.tid = tid;
     req.should_set = 0;
     req.register_mask = 0;
-    const DWORD tctx_ioctl = ioctl_codes::TCTX();
+    const voyager::detail::thread_ctx_request req_initial_snapshot = req;
+    DWORD tctx_ioctl = ioctl_codes::TCTX();
     diag::log_tagged_fmt("comm",
         "TCTX get begin pid=%u tid=%u ioctl=0x%08X connected=%d local_pid=%lu local_tid=%lu session=%d server_seed=%d ioctl_seed=%d",
         process_id_,
@@ -3781,14 +3879,61 @@ bool voyager::device_t::get_thread_context(std::uint32_t tid, thread_context& ct
         return tctx_user_context_sane(req.rip, req.rsp, req.rflags);
     };
 
+    auto rotated_retry_get = [&](const char* phase, const voyager::detail::thread_ctx_request& snapshot) noexcept {
+        const DWORD prior_ioctl = tctx_ioctl;
+        const DWORD rotated_tctx_ioctl = ioctl_codes::TCTX();
+        if (rotated_tctx_ioctl == prior_ioctl) {
+            diag::log_tagged_fmt("comm",
+                "TCTX get rotated_retry pid=%u tid=%u phase=%s prior_ioctl=0x%08X rotated_ioctl=0x%08X retry_ok=0 retry_gle=%lu base_after=0x%04X key_hash_after=0x%08X reason=ioctl_unchanged",
+                process_id_,
+                tid,
+                phase,
+                prior_ioctl,
+                rotated_tctx_ioctl,
+                static_cast<unsigned long>(ERROR_INVALID_FUNCTION),
+                compute_ioctl_base_snapshot(),
+                hash_build_key(compute_dynamic_key_snapshot()));
+            return false;
+        }
+        tctx_ioctl = rotated_tctx_ioctl;
+        req = snapshot;
+        const bool retry_ok = send_request(tctx_ioctl, &req, sizeof(req));
+        const DWORD retry_gle = retry_ok ? ERROR_SUCCESS : GetLastError();
+        diag::log_tagged_fmt("comm",
+            "TCTX get rotated_retry pid=%u tid=%u phase=%s prior_ioctl=0x%08X rotated_ioctl=0x%08X retry_ok=%d retry_gle=%lu base_after=0x%04X key_hash_after=0x%08X",
+            process_id_,
+            tid,
+            phase,
+            prior_ioctl,
+            tctx_ioctl,
+            retry_ok ? 1 : 0,
+            static_cast<unsigned long>(retry_gle),
+            compute_ioctl_base_snapshot(),
+            hash_build_key(compute_dynamic_key_snapshot()));
+        SetLastError(retry_gle);
+        return retry_ok;
+    };
+
     const ULONGLONG initial_start = GetTickCount64();
     const char* context_provenance = "raw_tctx_ioctl";
     bool ok = send_request(tctx_ioctl, &req, sizeof(req));
     DWORD first_gle = ok ? ERROR_SUCCESS : GetLastError();
+    if (!ok && first_gle == ERROR_INVALID_FUNCTION) {
+        if (rotated_retry_get("initial", req_initial_snapshot)) {
+            ok = true;
+            first_gle = ERROR_SUCCESS;
+            context_provenance = "rotated_tctx_ioctl";
+        } else {
+            first_gle = GetLastError();
+            if (first_gle == ERROR_SUCCESS) {
+                first_gle = ERROR_INVALID_FUNCTION;
+            }
+        }
+    }
     const ULONGLONG initial_elapsed = GetTickCount64() - initial_start;
     bool sane = ok && context_sane();
     diag::log_tagged_fmt("comm",
-        "TCTX get initial pid=%u tid=%u ok=%d gle=%lu sane=%d elapsed_ms=%llu rip=0x%llX rip_class=%s rsp=0x%llX rsp_class=%s rflags=0x%llX dr7=0x%llX provenance=raw_tctx_ioctl",
+        "TCTX get initial pid=%u tid=%u ok=%d gle=%lu sane=%d elapsed_ms=%llu rip=0x%llX rip_class=%s rsp=0x%llX rsp_class=%s rflags=0x%llX dr7=0x%llX provenance=%s",
         process_id_,
         tid,
         ok ? 1 : 0,
@@ -3800,7 +3945,8 @@ bool voyager::device_t::get_thread_context(std::uint32_t tid, thread_context& ct
         static_cast<unsigned long long>(req.rsp),
         tctx_address_class(req.rsp),
         static_cast<unsigned long long>(req.rflags),
-        static_cast<unsigned long long>(req.dr7));
+        static_cast<unsigned long long>(req.dr7),
+        context_provenance);
     if (!ok || !sane) {
         std::uint32_t prev_count = 0;
         const ULONGLONG suspend_start = GetTickCount64();
@@ -3813,10 +3959,23 @@ bool voyager::device_t::get_thread_context(std::uint32_t tid, thread_context& ct
             req.tid = tid;
             req.should_set = 0;
             req.register_mask = 0;
+            const voyager::detail::thread_ctx_request req_suspended_snapshot = req;
             const ULONGLONG retry_start = GetTickCount64();
             ok = send_request(tctx_ioctl, &req, sizeof(req));
             context_provenance = "raw_tctx_ioctl_suspended_retry";
             first_gle = ok ? ERROR_SUCCESS : GetLastError();
+            if (!ok && first_gle == ERROR_INVALID_FUNCTION) {
+                if (rotated_retry_get("suspended_retry", req_suspended_snapshot)) {
+                    ok = true;
+                    first_gle = ERROR_SUCCESS;
+                    context_provenance = "rotated_tctx_ioctl_suspended_retry";
+                } else {
+                    first_gle = GetLastError();
+                    if (first_gle == ERROR_SUCCESS) {
+                        first_gle = ERROR_INVALID_FUNCTION;
+                    }
+                }
+            }
             const ULONGLONG retry_elapsed = GetTickCount64() - retry_start;
             sane = ok && context_sane();
             std::uint32_t ignored = 0;
@@ -3825,7 +3984,7 @@ bool voyager::device_t::get_thread_context(std::uint32_t tid, thread_context& ct
             const DWORD resume_gle = resumed ? ERROR_SUCCESS : GetLastError();
             const ULONGLONG resume_elapsed = GetTickCount64() - resume_start;
             diag::log_tagged_fmt("comm",
-                "TCTX get suspended_retry pid=%u tid=%u suspended=1 suspend_gle=%lu suspend_prev=%u suspend_elapsed_ms=%llu retry_ok=%d retry_gle=%lu retry_sane=%d retry_elapsed_ms=%llu resume_ok=%d resume_gle=%lu resume_prev=%u resume_elapsed_ms=%llu rip=0x%llX rip_class=%s rsp=0x%llX rsp_class=%s rflags=0x%llX dr7=0x%llX provenance=raw_tctx_ioctl_suspended_retry",
+                "TCTX get suspended_retry pid=%u tid=%u suspended=1 suspend_gle=%lu suspend_prev=%u suspend_elapsed_ms=%llu retry_ok=%d retry_gle=%lu retry_sane=%d retry_elapsed_ms=%llu resume_ok=%d resume_gle=%lu resume_prev=%u resume_elapsed_ms=%llu rip=0x%llX rip_class=%s rsp=0x%llX rsp_class=%s rflags=0x%llX dr7=0x%llX provenance=%s",
                 process_id_,
                 tid,
                 static_cast<unsigned long>(suspend_gle),
@@ -3844,7 +4003,8 @@ bool voyager::device_t::get_thread_context(std::uint32_t tid, thread_context& ct
                 static_cast<unsigned long long>(req.rsp),
                 tctx_address_class(req.rsp),
                 static_cast<unsigned long long>(req.rflags),
-                static_cast<unsigned long long>(req.dr7));
+                static_cast<unsigned long long>(req.dr7),
+                context_provenance);
         } else {
             RC_UM_DBG("TCTX get suspend_failed pid=%u tid=%u initial_ok=%d initial_sane=%d rip=0x%llX rsp=0x%llX rflags=0x%llX gle=%lu",
                 process_id_,
@@ -3963,8 +4123,45 @@ bool voyager::device_t::set_thread_context(std::uint32_t tid, const thread_conte
     req.dr0 = ctx.dr0; req.dr1 = ctx.dr1; req.dr2 = ctx.dr2; req.dr3 = ctx.dr3;
     req.dr6 = ctx.dr6; req.dr7 = ctx.dr7;
 
-    const DWORD tctx_ioctl = ioctl_codes::TCTX();
+    DWORD tctx_ioctl = ioctl_codes::TCTX();
+    const voyager::detail::thread_ctx_request req_initial_snapshot = req;
     const bool debug_register_mask = (register_mask & ((1ULL << 18) | (1ULL << 19) | (1ULL << 20) | (1ULL << 21) | (1ULL << 22) | (1ULL << 23))) != 0;
+    auto rotated_retry_set = [&](const char* phase, const voyager::detail::thread_ctx_request& snapshot) noexcept {
+        const DWORD prior_ioctl = tctx_ioctl;
+        const DWORD rotated_tctx_ioctl = ioctl_codes::TCTX();
+        if (rotated_tctx_ioctl == prior_ioctl) {
+            diag::log_tagged_fmt("comm",
+                "TCTX set rotated_retry pid=%u tid=%u phase=%s prior_ioctl=0x%08X rotated_ioctl=0x%08X retry_ok=0 retry_gle=%lu mask=0x%llX base_after=0x%04X key_hash_after=0x%08X reason=ioctl_unchanged",
+                process_id_,
+                tid,
+                phase,
+                prior_ioctl,
+                rotated_tctx_ioctl,
+                static_cast<unsigned long>(ERROR_INVALID_FUNCTION),
+                static_cast<unsigned long long>(register_mask),
+                compute_ioctl_base_snapshot(),
+                hash_build_key(compute_dynamic_key_snapshot()));
+            return false;
+        }
+        tctx_ioctl = rotated_tctx_ioctl;
+        req = snapshot;
+        const bool retry_ok = send_request(tctx_ioctl, &req, sizeof(req));
+        const DWORD retry_gle = retry_ok ? ERROR_SUCCESS : GetLastError();
+        diag::log_tagged_fmt("comm",
+            "TCTX set rotated_retry pid=%u tid=%u phase=%s prior_ioctl=0x%08X rotated_ioctl=0x%08X retry_ok=%d retry_gle=%lu mask=0x%llX base_after=0x%04X key_hash_after=0x%08X",
+            process_id_,
+            tid,
+            phase,
+            prior_ioctl,
+            tctx_ioctl,
+            retry_ok ? 1 : 0,
+            static_cast<unsigned long>(retry_gle),
+            static_cast<unsigned long long>(register_mask),
+            compute_ioctl_base_snapshot(),
+            hash_build_key(compute_dynamic_key_snapshot()));
+        SetLastError(retry_gle);
+        return retry_ok;
+    };
     diag::log_tagged_fmt("comm",
         "TCTX set begin pid=%u tid=%u mask=0x%llX debug_register_mask=%d ioctl=0x%08X local_pid=%lu local_tid=%lu rip=0x%llX rip_class=%s rsp=0x%llX rsp_class=%s rflags=0x%llX dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX",
         process_id_,
@@ -3989,6 +4186,17 @@ bool voyager::device_t::set_thread_context(std::uint32_t tid, const thread_conte
     const ULONGLONG initial_start = GetTickCount64();
     bool ok = send_request(tctx_ioctl, &req, sizeof(req));
     DWORD first_gle = ok ? ERROR_SUCCESS : GetLastError();
+    if (!ok && first_gle == ERROR_INVALID_FUNCTION) {
+        if (rotated_retry_set("initial", req_initial_snapshot)) {
+            ok = true;
+            first_gle = ERROR_SUCCESS;
+        } else {
+            first_gle = GetLastError();
+            if (first_gle == ERROR_SUCCESS) {
+                first_gle = ERROR_INVALID_FUNCTION;
+            }
+        }
+    }
     diag::log_tagged_fmt("comm",
         "TCTX set initial pid=%u tid=%u ok=%d gle=%lu mask=0x%llX debug_register_mask=%d elapsed_ms=%llu ioctl=0x%08X rip=0x%llX rip_class=%s rsp=0x%llX rsp_class=%s rflags=0x%llX dr0=0x%llX dr1=0x%llX dr2=0x%llX dr3=0x%llX dr6=0x%llX dr7=0x%llX",
         process_id_,
@@ -4017,9 +4225,21 @@ bool voyager::device_t::set_thread_context(std::uint32_t tid, const thread_conte
         DWORD suspend_gle = suspended ? ERROR_SUCCESS : GetLastError();
         const ULONGLONG suspend_elapsed = GetTickCount64() - suspend_start;
         if (suspended) {
+            const voyager::detail::thread_ctx_request req_suspended_snapshot = req;
             const ULONGLONG retry_start = GetTickCount64();
             ok = send_request(tctx_ioctl, &req, sizeof(req));
             first_gle = ok ? ERROR_SUCCESS : GetLastError();
+            if (!ok && first_gle == ERROR_INVALID_FUNCTION) {
+                if (rotated_retry_set("suspended_retry", req_suspended_snapshot)) {
+                    ok = true;
+                    first_gle = ERROR_SUCCESS;
+                } else {
+                    first_gle = GetLastError();
+                    if (first_gle == ERROR_SUCCESS) {
+                        first_gle = ERROR_INVALID_FUNCTION;
+                    }
+                }
+            }
             std::uint32_t ignored = 0;
             const ULONGLONG resume_start = GetTickCount64();
             const bool resumed = resume_thread(tid, &ignored);
@@ -4320,7 +4540,29 @@ std::vector<voyager::device_t::captured_packet> voyager::device_t::get_captured_
             FALSE, 0)) {
         self_thread = nullptr;
     }
+    const std::uint32_t pre_waiters_canary = seed_rotation_writer_waiters_.load(std::memory_order_acquire);
     inflight_capture_thread_.store(self_thread, std::memory_order_release);
+    const std::uint32_t post_waiters_canary = seed_rotation_writer_waiters_.load(std::memory_order_acquire);
+    const std::uint64_t self_thread_low32 = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(self_thread)) & 0xFFFFFFFFull;
+    diag::log_tagged_fmt("driver_comm_net",
+        "inflight_capture_handle_store self_thread=%p handle_low32=0x%08llX seed_writers_pre=%u seed_writers_post=%u inflight_thread_addr=%p seed_writers_addr=%p",
+        self_thread,
+        static_cast<unsigned long long>(self_thread_low32),
+        pre_waiters_canary,
+        post_waiters_canary,
+        static_cast<const void*>(&inflight_capture_thread_),
+        static_cast<const void*>(&seed_rotation_writer_waiters_));
+    if (post_waiters_canary > kSeedRotationWaiterSanityCap) {
+        diag::log_tagged_critical_fmt("driver_comm_net",
+            "inflight_capture_handle_layout_drift_suspect self_thread=%p handle_low32=0x%08llX seed_writers_pre=%u seed_writers_post=%u cap=%u inflight_thread_addr=%p seed_writers_addr=%p",
+            self_thread,
+            static_cast<unsigned long long>(self_thread_low32),
+            pre_waiters_canary,
+            post_waiters_canary,
+            kSeedRotationWaiterSanityCap,
+            static_cast<const void*>(&inflight_capture_thread_),
+            static_cast<const void*>(&seed_rotation_writer_waiters_));
+    }
     inflight_capture_cancel_pending_.store(false, std::memory_order_release);
     std::atomic<bool> deadline_fired{false};
     bounded_io_watchdog_ctx_t ctx{ self_thread, &deadline_fired };
@@ -7143,6 +7385,7 @@ bool voyager::device_t::kernel_anti_dump_start_continuous(std::uint32_t pid) noe
 
 bool voyager::device_t::relay_server_token(std::uint32_t token_hash, std::uint64_t server_nonce) noexcept
 {
+    check_seed_rotation_waiter_tripwire(seed_rotation_writer_waiters_, "voyager::device_t::relay_server_token");
     server_token_relay_scope_t relay_scope;
     if (session_invalidated()) {
         diag::log_tagged_critical_fmt("comm",
@@ -7154,6 +7397,7 @@ bool voyager::device_t::relay_server_token(std::uint32_t token_hash, std::uint64
         SetLastError(ERROR_INVALID_FUNCTION);
         return false;
     }
+    if (!is_connected()) return false;
     const std::uint64_t writer_wait_start = __rdtsc();
     writer_waiter_scope_t writer_waiter(seed_rotation_writer_waiters_);
     diag::log_tagged_critical_fmt("comm",
@@ -7174,8 +7418,6 @@ bool voyager::device_t::relay_server_token(std::uint32_t token_hash, std::uint64
         static_cast<unsigned long long>(writer_wait_elapsed));
     sync_dynamic_security_state();
     log_security_snapshot("relay_server_token_entry", 0, 0, 0);
-
-    if (!is_connected()) return false;
 
     detail::server_token_relay req{};
     req.token_hash = token_hash;
@@ -7217,6 +7459,7 @@ bool voyager::device_t::relay_server_token(std::uint32_t token_hash, std::uint64
 
 bool voyager::device_t::relay_server_token_v2(std::uint32_t token_hash, std::uint64_t server_nonce, std::uint64_t* out_driver_proof) noexcept
 {
+    check_seed_rotation_waiter_tripwire(seed_rotation_writer_waiters_, "voyager::device_t::relay_server_token_v2");
     server_token_relay_scope_t relay_scope;
     if (session_invalidated()) {
         diag::log_tagged_critical_fmt("comm",
@@ -7229,6 +7472,7 @@ bool voyager::device_t::relay_server_token_v2(std::uint32_t token_hash, std::uin
         SetLastError(ERROR_INVALID_FUNCTION);
         return false;
     }
+    if (!is_connected()) return false;
     const std::uint64_t writer_wait_start_v2 = __rdtsc();
     writer_waiter_scope_t writer_waiter(seed_rotation_writer_waiters_);
     diag::log_tagged_critical_fmt("comm",
@@ -7262,8 +7506,6 @@ bool voyager::device_t::relay_server_token_v2(std::uint32_t token_hash, std::uin
         ioctl_codes::g_server_ioctl_seed != 0 ? 1u : 0u,
         static_cast<unsigned long long>(last_heartbeat_tsc_),
         static_cast<unsigned long long>(last_bridge_sentinel_tsc_));
-
-    if (!is_connected()) return false;
 
     detail::server_token_relay_v2 req{};
     req.token_hash = token_hash;

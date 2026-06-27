@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -3492,16 +3493,46 @@ static void test_memscan_shutdown(HANDLE hf, std::atomic<int>& passed, std::atom
     }
 }
 
+static_assert(std::size(scan_hub_view::s_tabs) == static_cast<size_t>(scan_hub_view::sub_tab_t::COUNT),
+              "scan_hub s_tabs must cover all sub_tab_t entries");
+
+static const char* scan_hub_sub_tab_label(scan_hub_view::sub_tab_t tab) {
+    int idx = static_cast<int>(tab);
+    const int count = static_cast<int>(scan_hub_view::sub_tab_t::COUNT);
+    if (idx < 0 || idx >= count)
+        return "<oob>";
+    return scan_hub_view::s_tabs[idx].label;
+}
+
 static void select_scan_hub_tab(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed,
                                 const char* tag, scan_hub_view::sub_tab_t value) {
+    auto t0 = std::chrono::steady_clock::now();
+    scan_hub_view::sub_tab_t before = scan_hub_view::active_sub_tab();
+    const char* before_label = scan_hub_sub_tab_label(before);
+    const char* target_label = scan_hub_sub_tab_label(value);
+    log_msg(hf, tag, "STATE -- before=%d label=%s target=%d target_label=%s tid=%lu",
+        static_cast<int>(before),
+        before_label,
+        static_cast<int>(value),
+        target_label,
+        static_cast<unsigned long>(GetCurrentThreadId()));
     scan_hub_view::set_sub_tab(value);
     scan_hub_view::sub_tab_t got = scan_hub_view::active_sub_tab();
+    const char* got_label = scan_hub_sub_tab_label(got);
+    long long us = elapsed_us_since(t0);
+    log_msg(hf, tag, "STATE -- after=%d label=%s changed=%d elapsed_us=%lld",
+        static_cast<int>(got),
+        got_label,
+        (before != got) ? 1 : 0,
+        us);
     if (got == value) {
-        log_msg(hf, tag, "PASS -- scan_hub sub_tab selected and read back (%d)", static_cast<int>(value));
+        log_msg(hf, tag, "PASS -- scan_hub sub_tab selected and read back (%d label=%s elapsed_us=%lld)",
+            static_cast<int>(value), got_label, us);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, tag, "FAIL -- scan_hub sub_tab set %d but read back %d",
-            static_cast<int>(value), static_cast<int>(got));
+        log_msg(hf, tag, "FAIL -- scan_hub sub_tab set %d (%s) but read back %d (%s) elapsed_us=%lld",
+            static_cast<int>(value), target_label,
+            static_cast<int>(got), got_label, us);
         failed.fetch_add(1);
     }
 }

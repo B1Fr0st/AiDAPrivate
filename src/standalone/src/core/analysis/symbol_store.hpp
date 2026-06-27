@@ -20,7 +20,6 @@
 #include "pdb_events.hpp"
 #include "pdb_parser.hpp"
 #include "pdb_downloader.hpp"
-#include "pdb_default_skip.hpp"
 #include "standalone_driver.hpp"
 #include "standalone_settings.hpp"
 #include "../testlab/test_all_features.hpp"
@@ -92,16 +91,6 @@ inline bool full_test_env_active_for_pdb()
 	return value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
 }
 
-inline bool pdb_skip_setting_enabled()
-{
-	return pdb_default_skip::get();
-}
-
-inline bool pdb_user_default_skip_active()
-{
-	return pdb_skip_setting_enabled();
-}
-
 inline pdb_automation_context_t pdb_automation_context()
 {
 	pdb_automation_context_t ctx;
@@ -111,8 +100,7 @@ inline pdb_automation_context_t pdb_automation_context()
 	ctx.unattended_active = test_all_features::is_unattended_full_test_active();
 	ctx.post_suppression_active = anti_tamper::state::full_test_suppression_active(&ctx.post_suppression_remaining_ms);
 	ctx.pdb_automation_active = ctx.unattended_active || ctx.post_suppression_active;
-	ctx.user_default_skip_active = pdb_user_default_skip_active();
-	ctx.pdb_skip_active = ctx.pdb_automation_active || ctx.user_default_skip_active;
+	ctx.pdb_skip_active = ctx.pdb_automation_active;
 	return ctx;
 }
 

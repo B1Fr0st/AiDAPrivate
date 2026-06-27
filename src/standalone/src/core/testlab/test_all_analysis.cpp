@@ -853,6 +853,7 @@ static bool select_integrity_hunter_sidecar_pid(HANDLE hf, const char* tag, uint
 static bool wait_integrity_hunter_sidecar_ready(HANDLE hf, const char* tag, const integrity_hunter_sidecar_t& sidecar, DWORD timeout_ms) {
     const DWORD started = GetTickCount();
     int attempts = 0;
+    DWORD last_probe_wait_logged_ms = 0;
     for (;;) {
         ++attempts;
         DWORD exit_code = 0;
@@ -900,6 +901,10 @@ static bool wait_integrity_hunter_sidecar_ready(HANDLE hf, const char* tag, cons
                     probe.elapsed_ms);
                 return true;
             }
+            const bool probe_wait_should_log = (attempts == 1) ||
+                (elapsed >= last_probe_wait_logged_ms && (elapsed - last_probe_wait_logged_ms) >= 500);
+            if (probe_wait_should_log) {
+                last_probe_wait_logged_ms = elapsed;
             log_msg(hf, tag, "SIDE-FIXTURE-PROBE-WAIT -- pid=%lu attempts=%d active=%u ntdll=0x%016llX kernel32=0x%016llX kernelbase=0x%016llX module=%s fn=0x%016llX method=%s result=0x%016llX expected=0x%016llX ok=0 gle=%lu text=%s remote_call_id=%llu remote_ok=%d remote_execution_completed=%d remote_gle=%lu lower_call_id=%llu lower_phase=%s lower_reason=%s lower_completed=%d lower_ok=%d lower_gle=%lu lower_generation_entry=%llu lower_generation_after=%llu lower_queue_depth_submit=%u lower_queue_depth_start=%u lower_queue_depth_after_pop=%u lower_inflight_submit=%u lower_inflight_start=%u lower_inflight_after=%u lower_queue_wait_ms=%llu lower_elapsed_ms=%llu elapsed_ms=%lu probe_elapsed_ms=%lld status=\"%s\" last_error=\"%s\"",
                 static_cast<unsigned long>(sidecar.pid),
                 attempts,
@@ -938,6 +943,7 @@ static bool wait_integrity_hunter_sidecar_ready(HANDLE hf, const char* tag, cons
                 probe.elapsed_ms,
                 driver_bridge::status().c_str(),
                 driver_bridge::last_error().c_str());
+            }
         }
         if (attempts == 1 || (elapsed % 500) < 100) {
             log_msg(hf, tag, "SIDE-FIXTURE-WAIT -- pid=%lu attempt=%d selected=%d active=%u bridge_alive=%d bridge_code=0x%08X ntdll=0x%016llX kernel32=0x%016llX kernelbase=0x%016llX elapsed_ms=%lu",
@@ -2201,7 +2207,15 @@ static void test_comment_store(HANDLE hf, std::atomic<int>& passed, std::atomic<
     auto t0 = std::chrono::steady_clock::now();
 
     uint64_t test_addr = 0xDEAD0001;
-    comment_store::set(test_addr, "test_comment_analysis");
+    bool before_has = comment_store::has(test_addr);
+    const char* expected_value = "test_comment_analysis";
+    log_msg(hf, "cmt_store", "INPUT addr=0x%llX comment=\"%s\" before_has=%d tid=%lu",
+        static_cast<unsigned long long>(test_addr),
+        expected_value,
+        before_has ? 1 : 0,
+        static_cast<unsigned long>(GetCurrentThreadId()));
+
+    comment_store::set(test_addr, expected_value);
 
     bool has = comment_store::has(test_addr);
     std::string got = comment_store::get(test_addr);
@@ -2210,13 +2224,20 @@ static void test_comment_store(HANDLE hf, std::atomic<int>& passed, std::atomic<
 
     bool has_after = comment_store::has(test_addr);
 
+    long long us = elapsed_us_since(t0);
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    if (has && got == "test_comment_analysis" && !has_after) {
-        log_msg(hf, "cmt_store", "PASS -- set/get/has/clear all correct (elapsed %lld ms)", (long long)ms);
+    log_msg(hf, "cmt_store", "RESULT addr=0x%llX has_after_set=%d got=\"%s\" has_after_clear=%d elapsed_us=%lld",
+        static_cast<unsigned long long>(test_addr),
+        has ? 1 : 0,
+        got.c_str(),
+        has_after ? 1 : 0,
+        us);
+    if (has && got == expected_value && !has_after) {
+        log_msg(hf, "cmt_store", "PASS -- set/get/has/clear all correct (elapsed %lld ms us=%lld)", (long long)ms, us);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "cmt_store", "FAIL -- has=%d got=\"%s\" has_after=%d (elapsed %lld ms)",
-            has, got.c_str(), has_after, (long long)ms);
+        log_msg(hf, "cmt_store", "FAIL -- has=%d got=\"%s\" has_after=%d (elapsed %lld ms us=%lld)",
+            has, got.c_str(), has_after, (long long)ms, us);
         failed.fetch_add(1);
     }
 }
@@ -2226,7 +2247,15 @@ static void test_rename_store(HANDLE hf, std::atomic<int>& passed, std::atomic<i
     auto t0 = std::chrono::steady_clock::now();
 
     uint64_t test_addr = 0xDEAD0002;
-    rename_store::set(test_addr, "test_label_analysis");
+    bool before_has = rename_store::has(test_addr);
+    const char* expected_value = "test_label_analysis";
+    log_msg(hf, "ren_store", "INPUT addr=0x%llX label=\"%s\" before_has=%d tid=%lu",
+        static_cast<unsigned long long>(test_addr),
+        expected_value,
+        before_has ? 1 : 0,
+        static_cast<unsigned long>(GetCurrentThreadId()));
+
+    rename_store::set(test_addr, expected_value);
 
     bool has = rename_store::has(test_addr);
     std::string got = rename_store::get(test_addr);
@@ -2235,13 +2264,20 @@ static void test_rename_store(HANDLE hf, std::atomic<int>& passed, std::atomic<i
 
     bool has_after = rename_store::has(test_addr);
 
+    long long us = elapsed_us_since(t0);
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    if (has && got == "test_label_analysis" && !has_after) {
-        log_msg(hf, "ren_store", "PASS -- set/get/has/clear all correct (elapsed %lld ms)", (long long)ms);
+    log_msg(hf, "ren_store", "RESULT addr=0x%llX has_after_set=%d got=\"%s\" has_after_clear=%d elapsed_us=%lld",
+        static_cast<unsigned long long>(test_addr),
+        has ? 1 : 0,
+        got.c_str(),
+        has_after ? 1 : 0,
+        us);
+    if (has && got == expected_value && !has_after) {
+        log_msg(hf, "ren_store", "PASS -- set/get/has/clear all correct (elapsed %lld ms us=%lld)", (long long)ms, us);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "ren_store", "FAIL -- has=%d got=\"%s\" has_after=%d (elapsed %lld ms)",
-            has, got.c_str(), has_after, (long long)ms);
+        log_msg(hf, "ren_store", "FAIL -- has=%d got=\"%s\" has_after=%d (elapsed %lld ms us=%lld)",
+            has, got.c_str(), has_after, (long long)ms, us);
         failed.fetch_add(1);
     }
 }
@@ -2251,21 +2287,40 @@ static void test_rename_store_resolve_or(HANDLE hf, std::atomic<int>& passed, st
     auto t0 = std::chrono::steady_clock::now();
 
     uint64_t test_addr = 0xDEAD0003;
-    rename_store::set(test_addr, "resolved_name");
+    uint64_t unset_addr = 0xDEAD9999;
+    const char* set_value = "resolved_name";
+    const char* fallback_found = "fallback";
+    const char* fallback_not_found = "fallback_val";
+    log_msg(hf, "ren_reso", "INPUT set_addr=0x%llX set_value=\"%s\" unset_addr=0x%llX fallback_found=\"%s\" fallback_not_found=\"%s\" tid=%lu",
+        static_cast<unsigned long long>(test_addr),
+        set_value,
+        static_cast<unsigned long long>(unset_addr),
+        fallback_found,
+        fallback_not_found,
+        static_cast<unsigned long>(GetCurrentThreadId()));
 
-    std::string found = rename_store::resolve_or(test_addr, "fallback");
-    std::string not_found = rename_store::resolve_or(0xDEAD9999, "fallback_val");
+    rename_store::set(test_addr, set_value);
+
+    std::string found = rename_store::resolve_or(test_addr, fallback_found);
+    std::string not_found = rename_store::resolve_or(unset_addr, fallback_not_found);
 
     rename_store::clear(test_addr);
 
+    long long us = elapsed_us_since(t0);
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    if (found == "resolved_name" && not_found == "fallback_val") {
-        log_msg(hf, "ren_reso", "PASS -- resolve_or correct: found=\"%s\" not_found=\"%s\" (elapsed %lld ms)",
-            found.c_str(), not_found.c_str(), (long long)ms);
+    log_msg(hf, "ren_reso", "RESULT found_addr=0x%llX found=\"%s\" not_found_addr=0x%llX not_found=\"%s\" elapsed_us=%lld",
+        static_cast<unsigned long long>(test_addr),
+        found.c_str(),
+        static_cast<unsigned long long>(unset_addr),
+        not_found.c_str(),
+        us);
+    if (found == set_value && not_found == fallback_not_found) {
+        log_msg(hf, "ren_reso", "PASS -- resolve_or correct: found=\"%s\" not_found=\"%s\" (elapsed %lld ms us=%lld)",
+            found.c_str(), not_found.c_str(), (long long)ms, us);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "ren_reso", "FAIL -- found=\"%s\" not_found=\"%s\" (elapsed %lld ms)",
-            found.c_str(), not_found.c_str(), (long long)ms);
+        log_msg(hf, "ren_reso", "FAIL -- found=\"%s\" not_found=\"%s\" (elapsed %lld ms us=%lld)",
+            found.c_str(), not_found.c_str(), (long long)ms, us);
         failed.fetch_add(1);
     }
 }
@@ -4451,25 +4506,43 @@ static void test_comment_store_multiple(HANDLE hf, std::atomic<int>& passed, std
     log_msg(hf, "cmt_multi", "START -- comment store multiple addresses");
     auto t0 = std::chrono::steady_clock::now();
 
-    comment_store::set(0xBEEF0001, "comment_alpha");
-    comment_store::set(0xBEEF0002, "comment_beta");
-    comment_store::set(0xBEEF0003, "comment_gamma");
+    const uint64_t addr_a = 0xBEEF0001;
+    const uint64_t addr_b = 0xBEEF0002;
+    const uint64_t addr_c = 0xBEEF0003;
+    const char* val_a = "comment_alpha";
+    const char* val_b = "comment_beta";
+    const char* val_c = "comment_gamma";
+    log_msg(hf, "cmt_multi", "INPUT a={addr=0x%llX value=\"%s\"} b={addr=0x%llX value=\"%s\"} c={addr=0x%llX value=\"%s\"} tid=%lu",
+        static_cast<unsigned long long>(addr_a), val_a,
+        static_cast<unsigned long long>(addr_b), val_b,
+        static_cast<unsigned long long>(addr_c), val_c,
+        static_cast<unsigned long>(GetCurrentThreadId()));
 
-    std::string a = comment_store::get(0xBEEF0001);
-    std::string b = comment_store::get(0xBEEF0002);
-    std::string c = comment_store::get(0xBEEF0003);
+    comment_store::set(addr_a, val_a);
+    comment_store::set(addr_b, val_b);
+    comment_store::set(addr_c, val_c);
 
-    comment_store::set(0xBEEF0001, "");
-    comment_store::set(0xBEEF0002, "");
-    comment_store::set(0xBEEF0003, "");
+    std::string a = comment_store::get(addr_a);
+    std::string b = comment_store::get(addr_b);
+    std::string c = comment_store::get(addr_c);
 
+    comment_store::set(addr_a, "");
+    comment_store::set(addr_b, "");
+    comment_store::set(addr_c, "");
+
+    long long us = elapsed_us_since(t0);
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    if (a == "comment_alpha" && b == "comment_beta" && c == "comment_gamma") {
-        log_msg(hf, "cmt_multi", "PASS -- all 3 comments stored/retrieved correctly (elapsed %lld ms)", (long long)ms);
+    log_msg(hf, "cmt_multi", "RESULT a={addr=0x%llX got=\"%s\"} b={addr=0x%llX got=\"%s\"} c={addr=0x%llX got=\"%s\"} elapsed_us=%lld",
+        static_cast<unsigned long long>(addr_a), a.c_str(),
+        static_cast<unsigned long long>(addr_b), b.c_str(),
+        static_cast<unsigned long long>(addr_c), c.c_str(),
+        us);
+    if (a == val_a && b == val_b && c == val_c) {
+        log_msg(hf, "cmt_multi", "PASS -- all 3 comments stored/retrieved correctly (elapsed %lld ms us=%lld)", (long long)ms, us);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "cmt_multi", "FAIL -- a=\"%s\" b=\"%s\" c=\"%s\" (elapsed %lld ms)",
-            a.c_str(), b.c_str(), c.c_str(), (long long)ms);
+        log_msg(hf, "cmt_multi", "FAIL -- a=\"%s\" b=\"%s\" c=\"%s\" (elapsed %lld ms us=%lld)",
+            a.c_str(), b.c_str(), c.c_str(), (long long)ms, us);
         failed.fetch_add(1);
     }
 }
@@ -4479,18 +4552,33 @@ static void test_comment_store_overwrite(HANDLE hf, std::atomic<int>& passed, st
     auto t0 = std::chrono::steady_clock::now();
 
     uint64_t addr = 0xBEEF1234;
-    comment_store::set(addr, "first_value");
-    comment_store::set(addr, "second_value");
+    const char* first_value = "first_value";
+    const char* second_value = "second_value";
+    log_msg(hf, "cmt_over", "INPUT addr=0x%llX first=\"%s\" second=\"%s\" tid=%lu",
+        static_cast<unsigned long long>(addr),
+        first_value,
+        second_value,
+        static_cast<unsigned long>(GetCurrentThreadId()));
+
+    comment_store::set(addr, first_value);
+    std::string after_first = comment_store::get(addr);
+    comment_store::set(addr, second_value);
 
     std::string got = comment_store::get(addr);
     comment_store::set(addr, "");
 
+    long long us = elapsed_us_since(t0);
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    if (got == "second_value") {
-        log_msg(hf, "cmt_over", "PASS -- overwrite correct: \"%s\" (elapsed %lld ms)", got.c_str(), (long long)ms);
+    log_msg(hf, "cmt_over", "RESULT addr=0x%llX after_first=\"%s\" after_second=\"%s\" elapsed_us=%lld",
+        static_cast<unsigned long long>(addr),
+        after_first.c_str(),
+        got.c_str(),
+        us);
+    if (got == second_value) {
+        log_msg(hf, "cmt_over", "PASS -- overwrite correct: \"%s\" (elapsed %lld ms us=%lld)", got.c_str(), (long long)ms, us);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "cmt_over", "FAIL -- got \"%s\" (elapsed %lld ms)", got.c_str(), (long long)ms);
+        log_msg(hf, "cmt_over", "FAIL -- got \"%s\" (elapsed %lld ms us=%lld)", got.c_str(), (long long)ms, us);
         failed.fetch_add(1);
     }
 }

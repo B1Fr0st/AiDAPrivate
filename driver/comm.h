@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <winioctl.h>
 #include <tlhelp32.h>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -2314,13 +2315,13 @@ namespace voyager {
         mutable std::uint32_t last_heartbeat_offset_ = 0;
         mutable detail::raw_ioctl_telemetry last_raw_ioctl_{};
         mutable std::shared_mutex seed_rotation_mtx_;
-        mutable std::atomic<std::uint32_t> seed_rotation_writer_waiters_{0};
         mutable std::atomic<void*> inflight_capture_thread_{nullptr};
         mutable std::atomic<bool> inflight_capture_cancel_pending_{false};
 
 
         std::uint64_t ntdll_base_ = 0;
         std::uint64_t ntdll_size_ = 0;
+        mutable std::atomic<std::uint32_t> seed_rotation_writer_waiters_{0};
 
         bool send_request(DWORD control_code, void* input, DWORD input_size) const noexcept;
         bool send_request_in_lock(DWORD control_code, void* input, DWORD input_size) const noexcept;
@@ -2333,6 +2334,20 @@ namespace voyager {
         bool ensure_shellcode_allocated() noexcept;
         bool find_spoof_gadget() noexcept;
         std::uint64_t call_function_attempt(std::uint64_t call_id, int attempt_index, std::uint64_t function_address, std::uint64_t arg1, std::uint64_t arg2, std::uint64_t arg3, std::uint64_t arg4, const DWORD* blacklist, int blacklist_count, std::uint32_t bound_pid, std::uint64_t bound_dtb, std::uint64_t bound_base, std::uint64_t bound_shellcode, std::uint64_t bound_spoof, bool& out_completed) noexcept;
+
+        friend struct device_t_layout_pin;
+    };
+
+    struct device_t_layout_pin {
+#pragma warning(push)
+#pragma warning(disable: 4485 4647 4623 4624 4625 4626)
+        static_assert(offsetof(device_t, inflight_capture_thread_)
+                      < offsetof(device_t, seed_rotation_writer_waiters_),
+                      "inflight_capture_thread_ must precede seed_rotation_writer_waiters_ to prevent handle/counter aliasing across stale TUs");
+        static_assert(offsetof(device_t, inflight_capture_cancel_pending_)
+                      < offsetof(device_t, seed_rotation_writer_waiters_),
+                      "inflight_capture_cancel_pending_ must precede seed_rotation_writer_waiters_ to prevent layout aliasing across stale TUs");
+#pragma warning(pop)
     };
 
     template<typename T>
