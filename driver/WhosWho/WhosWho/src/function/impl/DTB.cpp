@@ -54,6 +54,7 @@ NTSTATUS functions::handle777d(p_dtb_solve request) {
 
     status = stack_spoof::spoofed_PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)request->pid, &process);
     if (!NT_SUCCESS(status) || !process) {
+        WW_LOG("DTB_RESOLVE_FAIL pid=%u status=0x%08X reason=PsLookupProcessByProcessId_failed", request->pid, static_cast<ULONG>(status));
         return status;
     }
 
@@ -63,6 +64,7 @@ NTSTATUS functions::handle777d(p_dtb_solve request) {
         dir_base = *(UINT64*)((UCHAR*)process + KPROCESS_DIRECTORYTABLEBASE_OFFSET);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
+        WW_LOG("DTB_RESOLVE_FAIL pid=%u status=STATUS_ACCESS_VIOLATION reason=dir_base_read_exception offset=0x%llX", request->pid, static_cast<unsigned long long>(KPROCESS_DIRECTORYTABLEBASE_OFFSET));
         stack_spoof::spoofed_ObfDereferenceObject(process);
         return STATUS_ACCESS_VIOLATION;
     }
@@ -73,9 +75,11 @@ NTSTATUS functions::handle777d(p_dtb_solve request) {
         request->dtb = dir_base & 0x000FFFFFFFFFF000ULL;
 
         InsertDTBCache(request->pid, request->dtb);
+        WW_LOG("DTB_RESOLVE_OK pid=%u dtb=0x%llX raw_dir_base=0x%llX", request->pid, static_cast<unsigned long long>(request->dtb), static_cast<unsigned long long>(dir_base));
         status = STATUS_SUCCESS;
     } else {
         request->dtb = 0;
+        WW_LOG("DTB_RESOLVE_FAIL pid=%u status=STATUS_UNSUCCESSFUL reason=invalid_dtb raw_dir_base=0x%llX", request->pid, static_cast<unsigned long long>(dir_base));
         status = STATUS_UNSUCCESSFUL;
     }
 

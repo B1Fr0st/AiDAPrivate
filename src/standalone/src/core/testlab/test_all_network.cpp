@@ -2084,10 +2084,10 @@ namespace {
             failed.fetch_add(1);
             return;
         }
-        log_msg(hf, tag, "PHASE -- current-user CA trust check begin timeout_ms=5000 ca_valid=%s",
+        log_msg(hf, tag, "PHASE -- current-user CA trust check begin timeout_ms=2000 ca_valid=%s",
             ca.valid ? "true" : "false");
         const auto* ca_ptr = &ca;
-        auto trust_result = run_bounded_bool(hf, tag, "cert_generator::is_root_ca_installed", 5000, [ca_ptr]() {
+        auto trust_result = run_bounded_bool(hf, tag, "cert_generator::is_root_ca_installed", 2000, [ca_ptr]() {
             return cert_generator::is_root_ca_installed(*ca_ptr);
         });
         log_msg(hf, tag, "PHASE -- current-user CA trust check end completed=%d timeout=%d threw=%d trusted=%d gle=%lu elapsed_ms=%llu exception=%s",
@@ -2464,6 +2464,13 @@ namespace {
             return;
         }
         auto conns = driver_bridge::enumerate_connections(0, 0);
+        log_msg(hf, tag, "RESULT count=%zu driver_status=\"%s\" last_error=\"%s\"",
+            conns.size(), driver_bridge::status().c_str(), driver_bridge::last_error().c_str());
+        if (conns.empty()) {
+            fail_empty_evidence(hf, tag, failed,
+                "enumerate_connections returned 0 entries; a Windows host always has at least loopback/IPv4/IPv6 listeners (svchost, lsass, etc.)");
+            return;
+        }
         log_msg(hf, tag, "PASS -- enumerate_connections returned %zu entries", conns.size());
         passed.fetch_add(1);
     }
@@ -2524,11 +2531,16 @@ namespace {
             return;
         }
         auto dns = driver_bridge::get_dns_queries(0);
-        log_msg(hf, tag, "PASS -- get_dns_queries returned %zu entries", dns.size());
-        if (!dns.empty()) {
-            log_msg(hf, tag, "  first: domain=%s pid=%u code=%u",
-                dns[0].domain.c_str(), (unsigned)dns[0].pid, (unsigned)dns[0].response_code);
+        log_msg(hf, tag, "RESULT count=%zu driver_status=\"%s\" last_error=\"%s\"",
+            dns.size(), driver_bridge::status().c_str(), driver_bridge::last_error().c_str());
+        if (dns.empty()) {
+            fail_empty_evidence(hf, tag, failed,
+                "get_dns_queries returned 0 entries; a live system with network activity should have DNS queries cached by the driver");
+            return;
         }
+        log_msg(hf, tag, "  first: domain=%s pid=%u code=%u",
+            dns[0].domain.c_str(), (unsigned)dns[0].pid, (unsigned)dns[0].response_code);
+        log_msg(hf, tag, "PASS -- get_dns_queries returned %zu entries", dns.size());
         passed.fetch_add(1);
     }
 
@@ -2575,7 +2587,13 @@ namespace {
             return;
         }
         bool ok = driver_bridge::clear_filter_rules();
-        log_msg(hf, tag, "PASS -- clear_filter_rules returned %s", ok ? "true" : "false");
+        if (!ok) {
+            fail_empty_evidence(hf, tag, failed,
+                "clear_filter_rules returned false; driver_status=\"%s\" last_error=\"%s\"",
+                driver_bridge::status().c_str(), driver_bridge::last_error().c_str());
+            return;
+        }
+        log_msg(hf, tag, "PASS -- clear_filter_rules returned true");
         passed.fetch_add(1);
     }
 

@@ -3766,6 +3766,7 @@ namespace
     std::atomic<bool> g_event_poller_stop{false};
     std::atomic<uint64_t> g_event_poller_epoch{0};
     std::atomic<bool> g_kernel_reconnect_queued{false};
+    std::atomic<bool> g_post_demote_dtb_resolve_queued{false};
     std::atomic<uint64_t> g_tctx_kernel_bypass_until_ms{0};
     std::atomic<uint32_t> g_tctx_kernel_failures{0};
     constexpr DWORD kKernelReconnectInitialDelayMs = 750;
@@ -4487,6 +4488,27 @@ namespace driver_bridge
             static_cast<unsigned long>(GetCurrentThreadId()));
         if (cb) {
             cb(reason ? reason : "send_request_invalid_function");
+        }
+
+        bool expected_queued = false;
+        if (g_post_demote_dtb_resolve_queued.compare_exchange_strong(expected_queued, true, std::memory_order_acq_rel)) {
+            const std::string reason_copy = reason ? std::string(reason) : std::string("send_request_invalid_function");
+            work_queue::post_service_labeled("driver_post_demote_dtb_resolve", [reason_copy]() {
+                Sleep(500);
+                const bool relay_ok = standalone_license::force_relay_now_blocking(2000);
+                diag::log_tagged_critical_fmt("driver",
+                    "post_demote_dtb_resolve_relay reason=%s relay_ok=%d",
+                    reason_copy.c_str(), relay_ok ? 1 : 0);
+                if (device && device->is_connected() && device->get_dtb() == 0) {
+                    device->solve_dtb();
+                    diag::log_tagged_fmt("driver",
+                        "post_demote_dtb_resolved pid=%u dtb=0x%llX ok=%d",
+                        device->get_process_id(),
+                        static_cast<unsigned long long>(device->get_dtb()),
+                        device->get_dtb() != 0 ? 1 : 0);
+                }
+                g_post_demote_dtb_resolve_queued.store(false, std::memory_order_release);
+            });
         }
     }
 
@@ -5667,6 +5689,66 @@ namespace driver_bridge
         }
 
         if (device_pid_before != pid) {
+            uint64_t pre_validated_dtb = 0;
+            const ULONGLONG pre_validate_start = GetTickCount64();
+
+            for (uint32_t pre_attempt = 0; pre_attempt < 10 && pre_validated_dtb == 0; ++pre_attempt) {
+                if (pre_attempt > 0)
+                    Sleep(25);
+                pre_validated_dtb = device->solve_dtb_for_pid(pid);
+                if (pre_validated_dtb == 0) {
+                    arc_bridge_set_process_id(pid);
+                    pre_validated_dtb = arc_bridge_solve_dtb(false);
+                    arc_bridge_set_process_id(device_pid_before);
+                }
+            }
+
+            const ULONGLONG pre_validate_elapsed = GetTickCount64() - pre_validate_start;
+            const DWORD pre_validate_gle = GetLastError();
+
+            if (pre_validated_dtb == 0) {
+                const ULONGLONG force_relay_pre_start = GetTickCount64();
+                lk.unlock();
+                const bool pre_relay_ok = standalone_license::force_relay_now_blocking(2000);
+                lk.lock();
+                const uint64_t pre_relay_elapsed = GetTickCount64() - force_relay_pre_start;
+                diag::log_tagged_critical_fmt("driver",
+                    "refresh_kernel_context_pre_validate_force_relay op=%s pid=%u relay_ok=%d relay_elapsed_ms=%llu",
+                    op_label, pid, pre_relay_ok ? 1 : 0,
+                    static_cast<unsigned long long>(pre_relay_elapsed));
+                for (uint32_t post_relay_attempt = 0; post_relay_attempt < 5 && pre_validated_dtb == 0; ++post_relay_attempt) {
+                    if (post_relay_attempt > 0)
+                        Sleep(25);
+                    pre_validated_dtb = device->solve_dtb_for_pid(pid);
+                    if (pre_validated_dtb == 0) {
+                        arc_bridge_set_process_id(pid);
+                        pre_validated_dtb = arc_bridge_solve_dtb(false);
+                        arc_bridge_set_process_id(device_pid_before);
+                    }
+                }
+            }
+
+            diag::log_tagged_critical_fmt("driver",
+                "refresh_kernel_context_pre_validate op=%s pid=%u pre_dtb=0x%llX pre_validate_elapsed_ms=%llu pre_validate_gle=%lu device_pid_before=%u device_pid_preserved=1",
+                op_label,
+                pid,
+                static_cast<unsigned long long>(pre_validated_dtb),
+                static_cast<unsigned long long>(pre_validate_elapsed),
+                static_cast<unsigned long>(pre_validate_gle),
+                device_pid_before);
+
+            if (pre_validated_dtb == 0) {
+                ctx.kernel_attached = false;
+                ctx.cached_dtb = 0;
+                diag::log_tagged_critical_fmt("driver",
+                    "refresh_kernel_context_pre_validate_failed op=%s pid=%u device_pid_before=%u device_pid_preserved=1 dtb=0 reason=pre_validation_failed caller_tid=%lu",
+                    op_label,
+                    pid,
+                    device_pid_before,
+                    static_cast<unsigned long>(caller_tid));
+                return false;
+            }
+
             device->set_dtb(0);
             device->set_kernel_dtb(0);
             device->set_base_address(0);
@@ -5749,17 +5831,38 @@ namespace driver_bridge
             device->set_dtb(ctx.cached_dtb);
         if (device->get_dtb() == 0) {
             ctx.kernel_attached = false;
-            device->set_process_id(0);
-            arc_bridge_set_process_id(0);
+            if (device_pid_before != 0 && device_pid_before != pid) {
+                diag::log_tagged_critical_fmt("driver",
+                    "refresh_kernel_context_rollback op=%s pid=%u device_pid_before=%u reason=post_switch_dtb_zero rolling_back_to_previous_pid",
+                    op_label, pid, device_pid_before);
+                device->set_process_id(device_pid_before);
+                arc_bridge_set_process_id(device_pid_before);
+                auto prev_it = g_processes.find(device_pid_before);
+                if (prev_it != g_processes.end()) {
+                    if (prev_it->second.cached_dtb != 0) {
+                        device->set_dtb(prev_it->second.cached_dtb);
+                    }
+                    if (prev_it->second.cached_kernel_dtb != 0) {
+                        device->set_kernel_dtb(prev_it->second.cached_kernel_dtb);
+                    }
+                    if (prev_it->second.cached_image_base != 0) {
+                        device->set_base_address(prev_it->second.cached_image_base);
+                    }
+                }
+            } else {
+                device->set_process_id(0);
+                arc_bridge_set_process_id(0);
+            }
             diag::log_tagged_fmt("driver",
-                "refresh_kernel_context_post op=%s pid=%u dtb_before=0x%llX dtb_after=0x0 kernel_dtb_after=0x0 base_after=0x0 kernel_attached=0 arc_dtb=0x%llX cached_dtb=0x%llX inflight_after=%u caller_tid=%lu",
+                "refresh_kernel_context_post op=%s pid=%u dtb_before=0x%llX dtb_after=0x0 kernel_dtb_after=0x0 base_after=0x0 kernel_attached=0 arc_dtb=0x%llX cached_dtb=0x%llX inflight_after=%u caller_tid=%lu rolled_back_pid=%u",
                 op_label,
                 pid,
                 static_cast<unsigned long long>(dtb_before),
                 static_cast<unsigned long long>(arc_dtb),
                 static_cast<unsigned long long>(ctx.cached_dtb),
                 g_remote_call_lower_inflight.load(std::memory_order_acquire),
-                static_cast<unsigned long>(caller_tid));
+                static_cast<unsigned long>(caller_tid),
+                device_pid_before);
             return false;
         }
 

@@ -37,6 +37,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <set>
 
 namespace aida {
 namespace burp {
@@ -215,10 +216,10 @@ constexpr int kToolListWaitMaxMs = 5000;
 constexpr int kLaunchWaitMinMs = 5000;
 constexpr int kLaunchWaitMaxMs = 120000;
 constexpr int kBundledVisibleLaunchWaitMinMs = 60000;
-constexpr int kBundledVisibleLaunchWaitMaxMs = 75000;
-constexpr int kTestLabLaunchWaitDefaultMs = 75000;
-constexpr int kTestLabLaunchWaitMaxMs = 90000;
-constexpr int kStrictLaunchBudgetMs = 90000;
+constexpr int kBundledVisibleLaunchWaitMaxMs = 120000;
+constexpr int kTestLabLaunchWaitDefaultMs = 120000;
+constexpr int kTestLabLaunchWaitMaxMs = 120000;
+constexpr int kStrictLaunchBudgetMs = 135000;
 constexpr DWORD kDependencyProbeTimeoutMs = 9000;
 constexpr int kReadinessProbeTimeoutMs = 10000;
 constexpr int kNavigationWaitMaxMs = 50000;
@@ -2367,12 +2368,73 @@ const char* bridge_state_name(bridge_state_t state)
     return "unknown";
 }
 
+void terminate_process_id_sync(uint32_t pid, const std::string& reason, uint32_t parent_pid = 0, const std::string& exe = std::string());
+
 bool is_camoufox_browser_process_name(const std::string& exe)
 {
     std::string name = exe;
     for (char& c : name)
         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     return name == "camoufox.exe" || name.find("camoufox") != std::string::npos;
+}
+
+void sweep_stale_camoufox_processes_by_name(uint32_t exclude_pid, const std::string& reason)
+{
+    if (exclude_pid == 0 && sg().child_pid != 0)
+        exclude_pid = sg().child_pid;
+
+    std::set<uint32_t> protected_pids;
+    if (exclude_pid != 0)
+    {
+        std::vector<process_tree_entry_t> tree = enumerate_process_tree(exclude_pid);
+        for (const auto& entry : tree)
+            protected_pids.insert(entry.pid);
+    }
+    protected_pids.insert(static_cast<uint32_t>(GetCurrentProcessId()));
+
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE)
+    {
+        diag::log_tagged_fmt("camoufox", "stale_process_sweep snapshot_failed reason=%s gle=%lu",
+            reason.c_str(), static_cast<unsigned long>(GetLastError()));
+        return;
+    }
+
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+    uint32_t killed = 0;
+    if (Process32FirstW(snapshot, &pe))
+    {
+        do
+        {
+            const std::string exe_name = wide_to_utf8(pe.szExeFile);
+            if (is_camoufox_browser_process_name(exe_name) &&
+                protected_pids.find(static_cast<uint32_t>(pe.th32ProcessID)) == protected_pids.end())
+            {
+                const uint32_t stale_pid = static_cast<uint32_t>(pe.th32ProcessID);
+                diag::log_tagged_critical_fmt("camoufox",
+                    "stale_process_sweep killing orphaned camoufox pid=%lu exe=%s reason=%s parent_pid=%lu",
+                    static_cast<unsigned long>(stale_pid), exe_name.c_str(),
+                    reason.c_str(), static_cast<unsigned long>(pe.th32ParentProcessID));
+                terminate_process_id_sync(stale_pid, reason, static_cast<uint32_t>(pe.th32ParentProcessID), exe_name);
+                ++killed;
+            }
+        } while (Process32NextW(snapshot, &pe));
+    }
+    CloseHandle(snapshot);
+
+    if (killed > 0)
+    {
+        diag::log_tagged_critical_fmt("camoufox",
+            "stale_process_sweep_complete killed=%u reason=%s exclude_pid=%lu",
+            static_cast<unsigned>(killed), reason.c_str(), static_cast<unsigned long>(exclude_pid));
+    }
+    else
+    {
+        diag::log_tagged_fmt("camoufox",
+            "stale_process_sweep_complete killed=0 reason=%s exclude_pid=%lu",
+            reason.c_str(), static_cast<unsigned long>(exclude_pid));
+    }
 }
 
 uint32_t browser_process_count_from_tree(const std::vector<process_tree_entry_t>& tree)
@@ -3093,7 +3155,7 @@ void disconnect_client_sync(std::shared_ptr<mcp_client::client_t> cli, const std
         reason.c_str(), static_cast<unsigned long long>(now_ms() - t0));
 }
 
-void terminate_process_id_sync(uint32_t pid, const std::string& reason, uint32_t parent_pid = 0, const std::string& exe = std::string())
+void terminate_process_id_sync(uint32_t pid, const std::string& reason, uint32_t parent_pid, const std::string& exe)
 {
     if (pid == 0) return;
     const uint64_t t0 = now_ms();
@@ -6873,6 +6935,10 @@ bool start_bridge(const launch_config_t& cfg)
     }
     sb_drain_ms = now_ms() - sb_drain_start_ms;
 
+    lk.unlock();
+    sweep_stale_camoufox_processes_by_name(0, "start_bridge_pre_launch_sweep");
+    lk.lock();
+
     bool ready_config_mismatch_handled = false;
     if (sg().state == bridge_state_t::ready && sg().client)
     {
@@ -8138,7 +8204,19 @@ bool start_bridge(const launch_config_t& cfg)
     sg().page_verified = false;
     const uint64_t sb_readiness_probe_start_ms = now_ms();
     nlohmann::json page_args;
-    call_result_t page = call_with_deadline("get_page_info", page_args, kReadinessProbeTimeoutMs);
+    call_result_t page;
+    const int kReadinessProbeMaxRetries = 3;
+    for (int retry = 0; retry < kReadinessProbeMaxRetries; ++retry)
+    {
+        page = call_with_deadline("get_page_info", page_args, kReadinessProbeTimeoutMs);
+        if (page.ok && page.data.is_object() && page.data.contains("url") && page.data["url"].is_string())
+            break;
+        diag::log_tagged_fmt("camoufox", "launch_browser readiness_probe_retry generation=%llu retry=%d ok=%d err=%s",
+            static_cast<unsigned long long>(start_generation), retry,
+            static_cast<int>(page.ok), page.error.c_str());
+        if (retry < kReadinessProbeMaxRetries - 1)
+            Sleep(2000);
+    }
     sb_readiness_probe_ms = now_ms() - sb_readiness_probe_start_ms;
     if (!page.ok || !page.data.is_object() || !page.data.contains("url") || !page.data["url"].is_string())
     {
@@ -8492,6 +8570,8 @@ bool force_cleanup(const char* reason)
         reap = terminate_process_tree_sync(child_pid, std::string("force_cleanup:") + cleanup_reason);
     else
         diag::log_tagged_critical_fmt("camoufox", "force_cleanup_no_pid epoch=%llu generation=%llu reason=%s", static_cast<unsigned long long>(epoch), static_cast<unsigned long long>(generation), cleanup_reason);
+
+    sweep_stale_camoufox_processes_by_name(0, std::string("force_cleanup_orphan_sweep:") + cleanup_reason);
 
     if (cli)
         disconnect_client_async(cli, std::string("force_cleanup:") + cleanup_reason + ":disconnect");

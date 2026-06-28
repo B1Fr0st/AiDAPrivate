@@ -235,15 +235,22 @@ namespace {
 		std::uint64_t server_nonce = (tsc & 0xFFFFFFFF00000000ull) | static_cast<std::uint64_t>(s.u32_a);
 		const std::uint32_t caller_pid = static_cast<std::uint32_t>(GetCurrentProcessId());
 		device->sync_dynamic_security_state();
+		device->refresh_heartbeat();
 		const bool server_seed_before = device->has_server_seed();
 		const bool ioctl_seed_before = device->has_server_ioctl_seed();
 		const std::uint64_t timestamp = static_cast<std::uint64_t>(__rdtsc());
 		const std::uint64_t start_ms = static_cast<std::uint64_t>(GetTickCount64());
 
 		std::uint64_t out_driver_proof = 0;
-		SetLastError(ERROR_SUCCESS);
-		bool ok = device->relay_server_token_v2(token_hash, server_nonce, &out_driver_proof);
-		const DWORD gle = ok ? ERROR_SUCCESS : GetLastError();
+		bool ok = false;
+		DWORD gle = ERROR_SUCCESS;
+		for (int attempt = 0; attempt < 3; ++attempt) {
+			SetLastError(ERROR_SUCCESS);
+			ok = device->relay_server_token_v2(token_hash, server_nonce, &out_driver_proof);
+			gle = ok ? ERROR_SUCCESS : GetLastError();
+			if (ok || gle != ERROR_BUSY) break;
+			Sleep(50);
+		}
 		const std::uint64_t elapsed_ms = static_cast<std::uint64_t>(GetTickCount64()) - start_ms;
 		voyager::detail::server_token_relay_v2 evidence{};
 		evidence.token_hash = token_hash;
@@ -276,6 +283,15 @@ namespace {
 		push_u64_dec(r, "elapsed_ms", elapsed_ms);
 		if (!ok) {
 			r.ok = false;
+			const DWORD hb_err_val = device->get_last_heartbeat_error();
+			const bool session_invalidated = device->session_invalidated();
+			diag::log_tagged_fmt("testlab",
+				"SRV2_fail_detail gle=%lu hb_err=%lu session_invalidated=%d token_hash=0x%08X nonce=0x%llX",
+				static_cast<unsigned long>(gle),
+				static_cast<unsigned long>(hb_err_val),
+				session_invalidated ? 1 : 0,
+				token_hash,
+				static_cast<unsigned long long>(server_nonce));
 			push_u64_hex(r, "driver_proof", out_driver_proof);
 			r.error = "relay_server_token_v2 returned false (kernel rejected or session_key mismatch)";
 			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);

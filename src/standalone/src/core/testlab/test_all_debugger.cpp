@@ -315,6 +315,18 @@ static bool resolve_hwbp_fixture_descriptor(HANDLE hf,
         reason = "no active attached PID";
         return false;
     }
+    uint32_t pre_exit_code = 0;
+    const bool pre_alive = driver_bridge::attached_process_alive(&pre_exit_code);
+    if (!pre_alive) {
+        reason = "target process not alive before export resolution";
+        if (hf) {
+            log_msg(hf, tag ? tag : "dbg_hwbp",
+                "PRE_CHECK -- target process not alive pid=%u exit_code=0x%08X",
+                static_cast<unsigned>(pid),
+                static_cast<unsigned>(pre_exit_code));
+        }
+        return false;
+    }
     auto modules = driver_bridge::enumerate_modules_for(pid);
     if (modules.empty())
         modules = driver_bridge::enumerate_modules();
@@ -847,73 +859,119 @@ static bool scrub_target_hardware_breakpoints(HANDLE hf, const char* reason) {
         debugger_engine::g_state.active_tid = desc.thread_id;
         debugger_engine::clear_all_breakpoints();
         ++target_threads;
+
+        uint32_t suspend_prev = 0;
+        const bool thread_suspended = driver_bridge::suspend_thread(desc.thread_id, &suspend_prev);
+        DWORD suspend_gle = thread_suspended ? ERROR_SUCCESS : GetLastError();
+        diag::log_tagged_fmt("test_dbg_detail",
+            "dbg_hwclr suspend reason=%s tid=%u suspended=%d prev_count=%u gle=%lu",
+            reason ? reason : "unspecified",
+            desc.thread_id,
+            thread_suspended ? 1 : 0,
+            suspend_prev,
+            static_cast<unsigned long>(suspend_gle));
+
+        driver_bridge::thread_context_t batch_before{};
+        const bool batch_before_ok = driver_bridge::get_thread_context(desc.thread_id, batch_before);
+        DWORD batch_before_gle = batch_before_ok ? ERROR_SUCCESS : GetLastError();
+        const bool batch_before_all_clear = batch_before_ok && hwbp_debug_registers_clear_for_scrub(batch_before);
+
         for (int slot = 0; slot < 4; ++slot) {
-            driver_bridge::thread_context_t before{};
-            const bool before_ok = driver_bridge::get_thread_context(desc.thread_id, before);
-            DWORD before_gle = before_ok ? ERROR_SUCCESS : GetLastError();
-            const bool clear = driver_bridge::clear_hardware_breakpoint(desc.thread_id, slot);
-            DWORD clear_gle = clear ? ERROR_SUCCESS : GetLastError();
-            driver_bridge::thread_context_t after{};
-            const bool after_ok = driver_bridge::get_thread_context(desc.thread_id, after);
-            DWORD after_gle = after_ok ? ERROR_SUCCESS : GetLastError();
-            uint32_t exit_code = 0;
-            const bool alive = driver_bridge::attached_process_alive(&exit_code);
-            const bool before_all_clear = before_ok && hwbp_debug_registers_clear_for_scrub(before);
-            const bool after_all_clear = after_ok && hwbp_debug_registers_clear_for_scrub(after);
-            const bool after_slot_clear = after_ok && hwbp_slot_clear_for_scrub(after, slot);
-            const bool cleared_proof = clear && alive && after_slot_clear;
-            const bool already_clear_proof = !clear && alive && before_all_clear && after_all_clear;
-            const bool scrubbed = cleared_proof || already_clear_proof;
-            const char* proof = cleared_proof ? "cleared" : (already_clear_proof ? "already_clear" : "failed");
-            if (scrubbed) {
+            driver_bridge::clear_hardware_breakpoint(desc.thread_id, slot);
+        }
+
+        driver_bridge::thread_context_t batch_after{};
+        const bool batch_after_ok = driver_bridge::get_thread_context(desc.thread_id, batch_after);
+        DWORD batch_after_gle = batch_after_ok ? ERROR_SUCCESS : GetLastError();
+        uint32_t batch_exit_code = 0;
+        const bool batch_alive = driver_bridge::attached_process_alive(&batch_exit_code);
+        const bool batch_after_all_clear = batch_after_ok && hwbp_debug_registers_clear_for_scrub(batch_after);
+
+        for (int slot = 0; slot < 4; ++slot) {
+            const bool before_slot_clear = batch_before_ok && hwbp_slot_clear_for_scrub(batch_before, slot);
+            const bool after_slot_clear = batch_after_ok && hwbp_slot_clear_for_scrub(batch_after, slot);
+            const bool batch_slot_ok = batch_after_ok && batch_alive && after_slot_clear;
+            const char* batch_proof = batch_slot_ok ? (batch_before_all_clear && before_slot_clear ? "already_clear" : "cleared") : "failed";
+            if (batch_slot_ok) {
                 ++clear_ok;
-                if (already_clear_proof)
+                if (batch_before_all_clear && before_slot_clear)
                     ++already_clear_ok;
-                if (cleared_proof)
+                else
                     ++cleared_proof_ok;
-            } else {
-                ++clear_fail;
-                ++proof_fail;
             }
             diag::log_tagged_fmt("test_dbg_detail",
-                "dbg_hwclr slot_clear reason=%s role=hwbp_fixture pid=%u tid=%u slot=%d proof=%s before_ok=%d before_gle=%lu before_all_clear=%d before_dr7_enabled=%d before_slot_addr=0x%llX before_rip=0x%llX before_rsp=0x%llX before_dr0=0x%llX before_dr1=0x%llX before_dr2=0x%llX before_dr3=0x%llX before_dr6=0x%llX before_dr7=0x%llX clear=%d clear_gle=%lu after_ok=%d after_gle=%lu after_all_clear=%d after_slot_clear=%d after_dr7_enabled=%d after_slot_addr=0x%llX after_rip=0x%llX after_rsp=0x%llX after_dr0=0x%llX after_dr1=0x%llX after_dr2=0x%llX after_dr3=0x%llX after_dr6=0x%llX after_dr7=0x%llX alive=%d exit_code_or_error=0x%08X",
+                "dbg_hwclr batch_slot reason=%s pid=%u tid=%u slot=%d proof=%s before_ok=%d before_gle=%lu before_all_clear=%d before_slot_clear=%d after_ok=%d after_gle=%lu after_all_clear=%d after_slot_clear=%d alive=%d exit_code=0x%08X before_dr0=0x%llX before_dr1=0x%llX before_dr2=0x%llX before_dr3=0x%llX before_dr6=0x%llX before_dr7=0x%llX after_dr0=0x%llX after_dr1=0x%llX after_dr2=0x%llX after_dr3=0x%llX after_dr6=0x%llX after_dr7=0x%llX",
                 reason ? reason : "unspecified",
                 static_cast<unsigned>(pid),
                 desc.thread_id,
                 slot,
-                proof,
-                before_ok ? 1 : 0,
-                static_cast<unsigned long>(before_gle),
-                before_all_clear ? 1 : 0,
-                before_ok && hwbp_dr7_has_enabled_slot(before.dr7) ? 1 : 0,
-                static_cast<unsigned long long>(hwbp_slot_address_for_scrub(before, slot)),
-                static_cast<unsigned long long>(before.rip),
-                static_cast<unsigned long long>(before.rsp),
-                static_cast<unsigned long long>(before.dr0),
-                static_cast<unsigned long long>(before.dr1),
-                static_cast<unsigned long long>(before.dr2),
-                static_cast<unsigned long long>(before.dr3),
-                static_cast<unsigned long long>(before.dr6),
-                static_cast<unsigned long long>(before.dr7),
-                clear ? 1 : 0,
-                static_cast<unsigned long>(clear_gle),
-                after_ok ? 1 : 0,
-                static_cast<unsigned long>(after_gle),
-                after_all_clear ? 1 : 0,
+                batch_proof,
+                batch_before_ok ? 1 : 0,
+                static_cast<unsigned long>(batch_before_gle),
+                batch_before_all_clear ? 1 : 0,
+                before_slot_clear ? 1 : 0,
+                batch_after_ok ? 1 : 0,
+                static_cast<unsigned long>(batch_after_gle),
+                batch_after_all_clear ? 1 : 0,
                 after_slot_clear ? 1 : 0,
-                after_ok && hwbp_dr7_has_enabled_slot(after.dr7) ? 1 : 0,
-                static_cast<unsigned long long>(hwbp_slot_address_for_scrub(after, slot)),
-                static_cast<unsigned long long>(after.rip),
-                static_cast<unsigned long long>(after.rsp),
-                static_cast<unsigned long long>(after.dr0),
-                static_cast<unsigned long long>(after.dr1),
-                static_cast<unsigned long long>(after.dr2),
-                static_cast<unsigned long long>(after.dr3),
-                static_cast<unsigned long long>(after.dr6),
-                static_cast<unsigned long long>(after.dr7),
-                alive ? 1 : 0,
-                static_cast<unsigned>(exit_code));
+                batch_alive ? 1 : 0,
+                static_cast<unsigned>(batch_exit_code),
+                static_cast<unsigned long long>(batch_before.dr0),
+                static_cast<unsigned long long>(batch_before.dr1),
+                static_cast<unsigned long long>(batch_before.dr2),
+                static_cast<unsigned long long>(batch_before.dr3),
+                static_cast<unsigned long long>(batch_before.dr6),
+                static_cast<unsigned long long>(batch_before.dr7),
+                static_cast<unsigned long long>(batch_after.dr0),
+                static_cast<unsigned long long>(batch_after.dr1),
+                static_cast<unsigned long long>(batch_after.dr2),
+                static_cast<unsigned long long>(batch_after.dr3),
+                static_cast<unsigned long long>(batch_after.dr6),
+                static_cast<unsigned long long>(batch_after.dr7));
         }
+
+        if (!(batch_after_ok && batch_after_all_clear && batch_alive)) {
+            for (int slot = 0; slot < 4; ++slot) {
+                const bool after_slot_clear = batch_after_ok && hwbp_slot_clear_for_scrub(batch_after, slot);
+                if (after_slot_clear)
+                    continue;
+                bool slot_scrubbed = false;
+                for (int retry = 1; retry <= 2 && !slot_scrubbed; ++retry) {
+                    Sleep(10);
+                    driver_bridge::thread_context_t retry_before{};
+                    const bool retry_before_ok = driver_bridge::get_thread_context(desc.thread_id, retry_before);
+                    const bool retry_clear = driver_bridge::clear_hardware_breakpoint(desc.thread_id, slot);
+                    driver_bridge::thread_context_t retry_after{};
+                    const bool retry_after_ok = driver_bridge::get_thread_context(desc.thread_id, retry_after);
+                    const bool retry_slot_clear = retry_after_ok && hwbp_slot_clear_for_scrub(retry_after, slot);
+                    const bool retry_cleared_proof = retry_clear && retry_slot_clear;
+                    const bool retry_already_clear = !retry_clear && retry_before_ok && hwbp_debug_registers_clear_for_scrub(retry_before) && retry_after_ok && hwbp_debug_registers_clear_for_scrub(retry_after);
+                    const bool retry_scrubbed = retry_cleared_proof || retry_already_clear;
+                    diag::log_tagged_fmt("test_dbg_detail",
+                        "dbg_hwclr slot_retry reason=%s tid=%u slot=%d retry=%d retry_clear=%d retry_slot_clear=%d retry_scrubbed=%d",
+                        reason ? reason : "unspecified",
+                        desc.thread_id,
+                        slot,
+                        retry,
+                        retry_clear ? 1 : 0,
+                        retry_slot_clear ? 1 : 0,
+                        retry_scrubbed ? 1 : 0);
+                    if (retry_scrubbed) {
+                        slot_scrubbed = true;
+                        ++clear_ok;
+                        if (retry_already_clear)
+                            ++already_clear_ok;
+                        if (retry_cleared_proof)
+                            ++cleared_proof_ok;
+                    }
+                }
+                if (!slot_scrubbed) {
+                    ++clear_fail;
+                    ++proof_fail;
+                }
+            }
+        }
+
         constexpr int kFinalProofAttempts = 4;
         for (int attempt = 1; attempt <= kFinalProofAttempts; ++attempt) {
             driver_bridge::thread_context_t attempt_ctx{};
@@ -962,6 +1020,19 @@ static bool scrub_target_hardware_breakpoints(HANDLE hf, const char* reason) {
             if (!alive)
                 break;
             Sleep(20);
+        }
+
+        if (thread_suspended) {
+            uint32_t resume_prev = 0;
+            const bool resumed = driver_bridge::resume_thread(desc.thread_id, &resume_prev);
+            DWORD resume_gle = resumed ? ERROR_SUCCESS : GetLastError();
+            diag::log_tagged_fmt("test_dbg_detail",
+                "dbg_hwclr resume reason=%s tid=%u resumed=%d prev_count=%u gle=%lu",
+                reason ? reason : "unspecified",
+                desc.thread_id,
+                resumed ? 1 : 0,
+                resume_prev,
+                static_cast<unsigned long>(resume_gle));
         }
     } else {
         log_msg(hf, "dbg_hwclr",
@@ -1112,6 +1183,12 @@ static void test_add_remove_hw_bp_common(HANDLE hf,
 
     if (!scrub_target_hardware_breakpoints(hf, tag)) {
         log_msg(hf, tag, "FAIL -- controlled HWBP fixture scrub did not prove all debug-register slots clear");
+        uint32_t post_scrub_exit = 0;
+        const bool post_scrub_alive = driver_bridge::attached_process_alive(&post_scrub_exit);
+        log_msg(hf, tag, "POST_SCRUB_CHECK -- alive=%d exit_code=0x%08X pid=%u",
+            post_scrub_alive ? 1 : 0,
+            static_cast<unsigned>(post_scrub_exit),
+            static_cast<unsigned>(driver_bridge::attached_pid()));
         failed.fetch_add(1);
         return;
     }
@@ -2300,19 +2377,16 @@ static void test_multiple_breakpoints(HANDLE hf, std::atomic<int>& passed, std::
 
     debugger_engine::clear_all_breakpoints();
 
-    uint64_t a1 = alloc_target_bp_region();
-    uint64_t a2 = alloc_target_bp_region();
-    uint64_t a3 = alloc_target_bp_region();
-    uint64_t a4 = alloc_target_bp_region();
-    if (a1 == 0 || a2 == 0 || a3 == 0 || a4 == 0) {
-        if (a1) driver_bridge::free_memory(a1);
-        if (a2) driver_bridge::free_memory(a2);
-        if (a3) driver_bridge::free_memory(a3);
-        if (a4) driver_bridge::free_memory(a4);
+    uint64_t base = alloc_target_bp_region(256);
+    if (base == 0) {
         log_msg(hf, "dbg_mbp", "FAIL -- alloc_target_bp_region returned 0 (no driver attach?)");
         failed.fetch_add(1);
         return;
     }
+    uint64_t a1 = base;
+    uint64_t a2 = base + 64;
+    uint64_t a3 = base + 128;
+    uint64_t a4 = base + 192;
 
     diag::log_tagged_fmt("test_dbg_detail", "dbg_mbp inputs: a1=0x%llX a2=0x%llX a3=0x%llX a4=0x%llX",
         (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)a3, (unsigned long long)a4);
@@ -2335,10 +2409,7 @@ static void test_multiple_breakpoints(HANDLE hf, std::atomic<int>& passed, std::
 
     debugger_engine::remove_breakpoint(i1);
     debugger_engine::remove_breakpoint(i4);
-    driver_bridge::free_memory(a1);
-    driver_bridge::free_memory(a2);
-    driver_bridge::free_memory(a3);
-    driver_bridge::free_memory(a4);
+    driver_bridge::free_memory(base);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     if (i1 >= 0 && i2 >= 0 && i3 >= 0 && i4 >= 0 && count_before >= 4 && count_after == count_before - 2) {
@@ -3277,7 +3348,14 @@ static void test_pop_log_messages(HANDLE hf, std::atomic<int>& passed, std::atom
     log_msg(hf, "dbg_poplog", "START -- pop_log_messages and log_message_count");
     auto t0 = std::chrono::steady_clock::now();
 
-    diag::log_tagged_fmt("test_dbg_detail", "dbg_poplog inputs: log_message_count() then pop_log_messages() then re-count");
+    {
+        std::lock_guard<std::mutex> lk(debugger_engine::g_state.log_mutex);
+        if (debugger_engine::g_state.log_messages.size() >= debugger_engine::g_state.log_messages_max)
+            debugger_engine::g_state.log_messages.pop_front();
+        debugger_engine::g_state.log_messages.push_back("test_poplog_probe");
+    }
+
+    diag::log_tagged_fmt("test_dbg_detail", "dbg_poplog inputs: injected probe, log_message_count() then pop_log_messages() then re-count");
     size_t before_count = debugger_engine::log_message_count();
     auto msgs = debugger_engine::pop_log_messages();
     size_t after_count = debugger_engine::log_message_count();
@@ -3285,12 +3363,12 @@ static void test_pop_log_messages(HANDLE hf, std::atomic<int>& passed, std::atom
         before_count, msgs.size(), after_count);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    if (msgs.size() == before_count && after_count == 0) {
+    if (before_count > 0 && msgs.size() == before_count && after_count == 0) {
         log_msg(hf, "dbg_poplog", "PASS -- popped %zu of %zu messages, buffer drained to 0 (elapsed %lld ms)",
             msgs.size(), before_count, (long long)ms);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "dbg_poplog", "FAIL -- pop inconsistent: before=%zu popped=%zu after=%zu (pop must drain buffer and return all entries) (elapsed %lld ms)",
+        log_msg(hf, "dbg_poplog", "FAIL -- pop inconsistent: before=%zu popped=%zu after=%zu (pop must drain non-empty buffer and return all entries) (elapsed %lld ms)",
             before_count, msgs.size(), after_count, (long long)ms);
         failed.fetch_add(1);
     }

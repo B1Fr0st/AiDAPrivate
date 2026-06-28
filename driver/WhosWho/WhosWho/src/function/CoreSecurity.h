@@ -195,6 +195,8 @@ namespace caller_validation {
 
     constexpr UINT32 MAX_VALIDATION_FAILURES = 5;
     inline volatile UINT32 g_validation_failures = 0;
+    inline volatile LONG64 g_first_attack_tsc = 0;
+    constexpr UINT64 ATTACK_LOCKOUT_DURATION_TSC = 30000000000ULL;
 
     inline volatile UINT64 g_last_validation_tsc = 0;
 
@@ -304,6 +306,7 @@ namespace caller_validation {
         g_client_base_address = 0;
         g_client_cr3 = 0;
         g_validation_failures = 0;
+        _InterlockedExchange64(&g_first_attack_tsc, 0);
 
         KeMemoryBarrier();
         _InterlockedExchange(&g_validation_enabled, 0);
@@ -313,6 +316,10 @@ namespace caller_validation {
 
     __forceinline BOOLEAN validate_caller() {
         if (_InterlockedCompareExchange(&g_validation_enabled, 0, 0) == 0) {
+            return TRUE;
+        }
+
+        if (PsGetCurrentProcess() == PsInitialSystemProcess) {
             return TRUE;
         }
 
@@ -328,6 +335,8 @@ namespace caller_validation {
         PEPROCESS current_process = PsGetCurrentProcess();
         if (!current_process) {
             _InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_validation_failures));
+            WW_LOG("VALIDATE_CALLER_FAIL reason=null_process failures=%lu pid=%lu",
+                g_validation_failures, (ULONG)(ULONG_PTR)PsGetCurrentProcessId());
             return FALSE;
         }
 
@@ -335,11 +344,15 @@ namespace caller_validation {
 
         if (current_pid != g_registered_client_pid) {
             _InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_validation_failures));
+            WW_LOG("VALIDATE_CALLER_FAIL reason=pid_mismatch current_pid=%lu registered_pid=%lu failures=%lu",
+                (ULONG)(ULONG_PTR)current_pid, (ULONG)(ULONG_PTR)g_registered_client_pid, g_validation_failures);
             return FALSE;
         }
 
         if (reinterpret_cast<UINT64>(current_process) != g_registered_client_eprocess) {
             _InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_validation_failures));
+            WW_LOG("VALIDATE_CALLER_FAIL reason=eprocess_mismatch current_eprocess=0x%llx registered_eprocess=0x%llx failures=%lu",
+                (UINT64)current_process, g_registered_client_eprocess, g_validation_failures);
             return FALSE;
         }
 
@@ -353,6 +366,8 @@ namespace caller_validation {
 
             if (current_base != g_client_base_address) {
                 _InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_validation_failures));
+                WW_LOG("VALIDATE_CALLER_FAIL reason=base_mismatch current_base=0x%llx registered_base=0x%llx failures=%lu",
+                    current_base, g_client_base_address, g_validation_failures);
                 return FALSE;
             }
         }
@@ -366,6 +381,8 @@ namespace caller_validation {
 
                 if ((current_cr3 & ~0xFFFULL) != (g_client_cr3 & ~0xFFFULL)) {
                     _InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_validation_failures));
+                    WW_LOG("VALIDATE_CALLER_FAIL reason=cr3_mismatch current_cr3=0x%llx registered_cr3=0x%llx failures=%lu",
+                        current_cr3, g_client_cr3, g_validation_failures);
                     return FALSE;
                 }
             } __except(EXCEPTION_EXECUTE_HANDLER) {
@@ -376,12 +393,29 @@ namespace caller_validation {
         if (g_validation_failures > 0) {
             _InterlockedExchange(reinterpret_cast<volatile LONG*>(&g_validation_failures), 0);
         }
+        _InterlockedExchange64(&g_first_attack_tsc, 0);
 
         return TRUE;
     }
 
     __forceinline BOOLEAN is_under_attack() {
-        return (g_validation_failures >= MAX_VALIDATION_FAILURES);
+        if (g_validation_failures < MAX_VALIDATION_FAILURES) {
+            return FALSE;
+        }
+        UINT64 now = __rdtsc();
+        LONG64 first_attack = _InterlockedCompareExchange64(&g_first_attack_tsc, 0, 0);
+        if (first_attack == 0) {
+            _InterlockedExchange64(&g_first_attack_tsc, (LONG64)now);
+            return TRUE;
+        }
+        if ((now - (UINT64)first_attack) > ATTACK_LOCKOUT_DURATION_TSC) {
+            _InterlockedExchange(reinterpret_cast<volatile LONG*>(&g_validation_failures), 0);
+            _InterlockedExchange64(&g_first_attack_tsc, 0);
+            WW_LOG("ATTACK_LOCKOUT_EXPIRED failures_reset=1 elapsed_tsc=%llu",
+                (unsigned long long)(now - (UINT64)first_attack));
+            return FALSE;
+        }
+        return TRUE;
     }
 
     __forceinline BOOLEAN validate_irql() {
@@ -396,6 +430,9 @@ namespace caller_validation {
 
     __forceinline BOOLEAN is_valid_request() {
         if (is_under_attack()) {
+            WW_LOG("IS_UNDER_ATTACK failures=%lu threshold=%lu pid=%lu",
+                g_validation_failures, MAX_VALIDATION_FAILURES,
+                (ULONG)(ULONG_PTR)PsGetCurrentProcessId());
             return FALSE;
         }
 

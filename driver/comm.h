@@ -1694,6 +1694,7 @@ namespace voyager {
         std::uint64_t find_image() noexcept;
 
         void solve_dtb() noexcept;
+        std::uint64_t solve_dtb_for_pid(std::uint32_t pid) noexcept;
         void solve_kernel_dtb() noexcept;
 
         template<typename T>
@@ -2190,7 +2191,7 @@ namespace voyager {
             trace.pre_global_key_hash = hash_build_key(dynamic_key::get());
             trace.pre_ioctl_seed_hash = server_ioctl_seed_ != 0 ? hash_build_key(server_ioctl_seed_) : 0u;
             trace.pre_global_ioctl_seed_hash = ioctl_codes::g_server_ioctl_seed != 0 ? hash_build_key(ioctl_codes::g_server_ioctl_seed) : 0u;
-            trace.heartbeat_tsc = last_heartbeat_tsc_;
+            trace.heartbeat_tsc = last_heartbeat_tsc_.load(std::memory_order_acquire);
             trace.whoswho_tsc = last_bridge_whoswho_tsc_;
             trace.sentinel_tsc = last_bridge_sentinel_tsc_;
             if (in_out_buffer != nullptr && buffer_size >= sizeof(std::uint32_t)) {
@@ -2288,10 +2289,10 @@ namespace voyager {
                 last_heartbeat_dioctl_result_ = hb_result;
                 last_heartbeat_bytes_ = hb_bytes;
                 last_heartbeat_response_ = hb.response;
-                last_heartbeat_error_ = hb_ok ? 0 : hb_error;
+                last_heartbeat_error_.store(hb_ok ? 0 : hb_error, std::memory_order_release);
                 capture_heartbeat_security_snapshot(8, hb_ioctl, hb.magic);
                 if (hb_ok) {
-                    last_heartbeat_tsc_ = __rdtsc();
+                    last_heartbeat_tsc_.store(__rdtsc(), std::memory_order_release);
                     last_bridge_whoswho_tsc_ = hb.whoswho_tsc;
                     last_bridge_sentinel_tsc_ = hb.sentinel_tsc;
                     if (hb.sentinel_tsc != 0 && first_sentinel_ready_tsc_ == 0)
@@ -2301,7 +2302,7 @@ namespace voyager {
                 trace.heartbeat_bytes = static_cast<std::uint32_t>(hb_bytes);
                 trace.heartbeat_gle = hb_error;
                 trace.heartbeat_response = hb.response;
-                trace.heartbeat_tsc = last_heartbeat_tsc_;
+                trace.heartbeat_tsc = last_heartbeat_tsc_.load(std::memory_order_acquire);
                 trace.whoswho_tsc = last_bridge_whoswho_tsc_;
                 trace.sentinel_tsc = last_bridge_sentinel_tsc_;
                 return hb_ok;
@@ -2369,7 +2370,7 @@ namespace voyager {
         [[nodiscard]] std::uint64_t get_dtb() const noexcept { return dtb_; }
         [[nodiscard]] std::uint64_t get_kernel_dtb() const noexcept { return kernel_dtb_; }
         [[nodiscard]] DWORD get_last_connect_error() const noexcept { return last_connect_error_; }
-        [[nodiscard]] DWORD get_last_heartbeat_error() const noexcept { return last_heartbeat_error_; }
+        [[nodiscard]] DWORD get_last_heartbeat_error() const noexcept { return last_heartbeat_error_.load(std::memory_order_acquire); }
         [[nodiscard]] DWORD get_last_heartbeat_bytes_returned() const noexcept { return last_heartbeat_bytes_; }
         [[nodiscard]] std::uint64_t get_last_heartbeat_response() const noexcept { return last_heartbeat_response_; }
         [[nodiscard]] std::uint32_t get_last_heartbeat_ioctl_code() const noexcept { return last_heartbeat_ioctl_code_; }
@@ -2451,14 +2452,14 @@ namespace voyager {
         std::uint32_t session_key_ = 0;
         std::uint32_t server_seed_ = 0;
         std::uint32_t server_ioctl_seed_ = 0;
-        mutable std::uint64_t last_heartbeat_tsc_ = 0;
+        mutable std::atomic<std::uint64_t> last_heartbeat_tsc_{0};
         mutable std::uint64_t last_bridge_whoswho_tsc_ = 0;
         mutable std::uint64_t last_bridge_sentinel_tsc_ = 0;
         mutable std::uint64_t first_sentinel_ready_tsc_ = 0;
         DWORD last_failed_tid_ = 0;
         DWORD last_hijacked_tid_ = 0;
         DWORD last_connect_error_ = 0;
-        mutable DWORD last_heartbeat_error_ = 0;
+        mutable std::atomic<DWORD> last_heartbeat_error_{0};
         mutable DWORD last_heartbeat_bytes_ = 0;
         mutable std::uint64_t last_heartbeat_response_ = 0;
         mutable std::uint32_t last_heartbeat_ioctl_code_ = 0;

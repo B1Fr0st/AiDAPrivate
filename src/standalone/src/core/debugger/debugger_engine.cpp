@@ -1540,8 +1540,21 @@ bool remove_breakpoint(int index) {
 
 	if (bp.hw_slot >= 0 && bp.hw_slot < 4 && st.target_pid != 0) {
 		auto threads = hardware_breakpoint_threads(st, "remove_breakpoint");
+		bool any_clear_failed = false;
 		for (const auto& t : threads) {
-			driver_bridge::clear_hardware_breakpoint(t.tid, bp.hw_slot);
+			if (!driver_bridge::clear_hardware_breakpoint(t.tid, bp.hw_slot)) {
+				any_clear_failed = true;
+				diag::log_tagged_fmt("bp",
+					"remove_breakpoint_clear_failed tid=%u slot=%d addr=0x%llX",
+					static_cast<unsigned>(t.tid),
+					bp.hw_slot,
+					static_cast<unsigned long long>(bp.address));
+			}
+		}
+		if (any_clear_failed) {
+			diag::log_tagged_fmt("bp",
+				"remove_breakpoint_partial_clear idx=%d slot=%d threads=%zu",
+				index, bp.hw_slot, threads.size());
 		}
 	}
 
@@ -3015,8 +3028,32 @@ register_set_t get_registers() {
 	auto& st = g_state;
 	diag::log_tagged_fmt("dbg_engine", "get_registers: entry pid=%u tid=%u", st.target_pid, st.active_tid);
 	sync_attached_state();
-	if (st.target_pid == 0 || st.active_tid == 0) {
-		diag::log_tagged_fmt("dbg_engine", "get_registers: not attached (pid=%u tid=%u)", st.target_pid, st.active_tid);
+	if (st.target_pid == 0) {
+		diag::log_tagged_fmt("dbg_engine", "get_registers: not attached (pid=0 tid=%u)", st.active_tid);
+		return {};
+	}
+	if (st.active_tid == 0) {
+		auto threads = driver_bridge::enumerate_threads();
+		for (const auto& th : threads) {
+			if (th.owner_pid == st.target_pid && th.tid != 0) {
+				st.active_tid = th.tid;
+				diag::log_tagged_fmt("dbg_engine",
+					"get_registers_fallback_thread_found pid=%u tid=%u threads=%zu",
+					st.target_pid, st.active_tid, threads.size());
+				break;
+			}
+		}
+		if (!threads.empty() && st.active_tid == 0) {
+			st.active_tid = threads.front().tid;
+			diag::log_tagged_fmt("dbg_engine",
+				"get_registers_fallback_first_thread pid=%u tid=%u threads=%zu",
+				st.target_pid, st.active_tid, threads.size());
+		}
+	}
+	if (st.active_tid == 0) {
+		diag::log_tagged_fmt("dbg_engine",
+			"get_registers_no_thread pid=%u threads_empty=1 last_error=%s",
+			st.target_pid, driver_bridge::last_error().c_str());
 		return {};
 	}
 
@@ -3323,9 +3360,18 @@ std::vector<stack_frame_t> get_call_stack() {
 
 std::vector<memory_region_t> get_memory_map() {
 	auto& st = g_state;
-	diag::log_tagged_fmt("dbg_engine", "get_memory_map: entry pid=%u", st.target_pid);
+	const uint32_t bridge_pid = driver_bridge::attached_pid();
+	diag::log_tagged_fmt("dbg_engine",
+		"get_memory_map: entry engine_pid=%u bridge_pid=%u kernel=%d can_read=%d status=%s",
+		st.target_pid, bridge_pid,
+		driver_bridge::using_kernel_driver() ? 1 : 0,
+		driver_bridge::can_read_memory() ? 1 : 0,
+		driver_bridge::status().c_str());
 	auto regions = driver_bridge::enumerate_memory_regions(4096);
 	auto modules = driver_bridge::enumerate_modules();
+	diag::log_tagged_fmt("dbg_engine",
+		"get_memory_map: enumerate result regions=%zu modules=%zu",
+		regions.size(), modules.size());
 
 	std::vector<memory_region_t> map;
 	map.reserve(regions.size());
@@ -4088,9 +4134,26 @@ std::vector<uint8_t> cached_disasm_window(uint64_t& base_out) {
 void sync_attached_state() {
 	auto& st = g_state;
 	uint32_t live_pid = driver_bridge::attached_pid();
-	if (live_pid != 0 && !kernel_target_operations_ready("sync_attached_state"))
+	if (live_pid != 0 && !driver_bridge::can_read_memory()) {
+		std::string reason;
+		const bool using_kernel = driver_bridge::using_kernel_driver();
+		const bool session_avail = driver_bridge::kernel_session_available(&reason);
+		const bool dyn_ready = driver_bridge::dynamic_ioctls_ready();
+		diag::log_tagged_fmt("dbg_engine",
+			"sync_attached_state_fail pid=%u can_read_memory=0 using_kernel=%d session_avail=%d dyn_ready=%d reason=%s status=%s last_error=%s",
+			live_pid,
+			using_kernel ? 1 : 0,
+			session_avail ? 1 : 0,
+			dyn_ready ? 1 : 0,
+			reason.empty() ? "<empty>" : reason.c_str(),
+			driver_bridge::status().c_str(),
+			driver_bridge::last_error().c_str());
 		live_pid = 0;
+	}
 	if (live_pid != st.target_pid) {
+		diag::log_tagged_fmt("dbg_engine",
+			"sync_attached_state_transition old_pid=%u new_pid=%u old_tid=%u",
+			st.target_pid, live_pid, st.active_tid);
 		st.target_pid = live_pid;
 		st.active_tid = 0;
 		std::lock_guard<std::mutex> lk(st.cache_mtx);
@@ -4106,11 +4169,25 @@ void sync_attached_state() {
 	}
 	if (live_pid != 0 && st.active_tid == 0) {
 		auto threads = driver_bridge::enumerate_threads();
+		diag::log_tagged_fmt("dbg_engine",
+			"sync_attached_state_thread_search pid=%u thread_count=%zu",
+			live_pid, threads.size());
 		for (const auto& th : threads) {
 			if (th.owner_pid == live_pid && th.tid != 0) {
 				st.active_tid = th.tid;
 				break;
 			}
+		}
+		if (st.active_tid == 0 && !threads.empty()) {
+			st.active_tid = threads.front().tid;
+			diag::log_tagged_fmt("dbg_engine",
+				"sync_attached_state_fallback_first_thread pid=%u tid=%u",
+				live_pid, st.active_tid);
+		}
+		if (st.active_tid == 0) {
+			diag::log_tagged_fmt("dbg_engine",
+				"sync_attached_state_no_thread_found pid=%u threads=%zu",
+				live_pid, threads.size());
 		}
 	}
 }

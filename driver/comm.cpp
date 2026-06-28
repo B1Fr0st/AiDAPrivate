@@ -775,7 +775,7 @@ void voyager::device_t::log_security_snapshot(const char* where, DWORD requested
         compute_ioctl_base_snapshot(),
         hash_build_key(compute_dynamic_key_snapshot()),
         server_ioctl_seed_ != 0 ? hash_build_key(server_ioctl_seed_) : 0,
-        static_cast<unsigned long long>(last_heartbeat_tsc_),
+        static_cast<unsigned long long>(last_heartbeat_tsc_.load(std::memory_order_acquire)),
         last_bridge_whoswho_tsc_ != 0 ? 1u : 0u,
         last_bridge_sentinel_tsc_ != 0 ? 1u : 0u);
 }
@@ -789,7 +789,7 @@ bool voyager::device_t::connect() noexcept {
             reinterpret_cast<unsigned long long>(driver_handle_),
             process_id_,
             session_key_ != 0 ? 1 : 0,
-            static_cast<unsigned long long>(last_heartbeat_tsc_),
+            static_cast<unsigned long long>(last_heartbeat_tsc_.load(std::memory_order_acquire)),
             static_cast<unsigned long long>(last_bridge_sentinel_tsc_));
         return true;
     }
@@ -917,9 +917,9 @@ bool voyager::device_t::connect() noexcept {
         server_ioctl_seed_ != 0 ? 1u : 0u,
         dynamic_key::g_server_seed != 0 ? 1u : 0u,
         ioctl_codes::g_server_ioctl_seed != 0 ? 1u : 0u);
-    if (!send_heartbeat()) {
-        DWORD hb_err = last_heartbeat_error_;
-        if (hb_err == 0 && last_heartbeat_dioctl_result_) {
+        if (!send_heartbeat()) {
+            DWORD hb_err = last_heartbeat_error_.load(std::memory_order_acquire);
+            if (hb_err == 0 && last_heartbeat_dioctl_result_) {
             if (last_heartbeat_bytes_ < sizeof(detail::heartbeat_request)) {
                 hb_err = ERROR_MORE_DATA;
             } else if (last_heartbeat_response_ == 0) {
@@ -952,7 +952,7 @@ bool voyager::device_t::connect() noexcept {
     diag::log_tagged_critical_fmt("comm-startup",
         "connect_success handle=0x%llX hb_tsc=%llu bridge_whoswho=%llu bridge_sentinel=%llu first_sentinel=%llu",
         reinterpret_cast<unsigned long long>(driver_handle_),
-        static_cast<unsigned long long>(last_heartbeat_tsc_),
+        static_cast<unsigned long long>(last_heartbeat_tsc_.load(std::memory_order_acquire)),
         static_cast<unsigned long long>(last_bridge_whoswho_tsc_),
         static_cast<unsigned long long>(last_bridge_sentinel_tsc_),
         static_cast<unsigned long long>(first_sentinel_ready_tsc_));
@@ -975,7 +975,7 @@ void voyager::device_t::disconnect() noexcept {
     server_ioctl_seed_ = 0;
     dynamic_key::reset_server_seed();
     ioctl_codes::reset_server_ioctl_seed();
-    last_heartbeat_tsc_ = 0;
+    last_heartbeat_tsc_.store(0, std::memory_order_release);
     last_bridge_whoswho_tsc_ = 0;
     last_bridge_sentinel_tsc_ = 0;
     first_sentinel_ready_tsc_ = 0;
@@ -1172,7 +1172,7 @@ bool voyager::device_t::send_heartbeat() noexcept {
     SPOOF_FUNC;
 
     if (!is_connected()) {
-        last_heartbeat_error_ = ERROR_INVALID_HANDLE;
+        last_heartbeat_error_.store(ERROR_INVALID_HANDLE, std::memory_order_release);
         last_heartbeat_dioctl_result_ = FALSE;
         last_heartbeat_bytes_ = 0;
         last_heartbeat_response_ = 0;
@@ -1233,12 +1233,12 @@ bool voyager::device_t::send_heartbeat() noexcept {
         last_heartbeat_dioctl_result_ = result;
         last_heartbeat_bytes_ = bytes_returned;
         last_heartbeat_response_ = hb.response;
-        last_heartbeat_error_ = hb_ok ? 0 : effective_error;
+        last_heartbeat_error_.store(hb_ok ? 0 : effective_error, std::memory_order_release);
         capture_heartbeat_security_snapshot(8, ioctlCode, hb.magic);
 
-        if (hb_ok) {
-            last_heartbeat_tsc_ = __rdtsc();
-            last_bridge_whoswho_tsc_ = hb.whoswho_tsc;
+                if (hb_ok) {
+                    last_heartbeat_tsc_.store(__rdtsc(), std::memory_order_release);
+                    last_bridge_whoswho_tsc_ = hb.whoswho_tsc;
             last_bridge_sentinel_tsc_ = hb.sentinel_tsc;
             if (hb.sentinel_tsc != 0 && first_sentinel_ready_tsc_ == 0)
                 first_sentinel_ready_tsc_ = hb.sentinel_tsc;
@@ -1377,8 +1377,9 @@ bool voyager::device_t::send_heartbeat() noexcept {
 
 bool voyager::device_t::refresh_heartbeat() noexcept {
     std::uint64_t current_tsc = __rdtsc();
-    std::uint64_t elapsed = (last_heartbeat_tsc_ == 0) ? 0 : (current_tsc - last_heartbeat_tsc_);
-    if (last_heartbeat_tsc_ == 0 || elapsed > detail::HEARTBEAT_REFRESH_INTERVAL) {
+    const std::uint64_t cached_hb_tsc = last_heartbeat_tsc_.load(std::memory_order_acquire);
+    std::uint64_t elapsed = (cached_hb_tsc == 0) ? 0 : (current_tsc - cached_hb_tsc);
+    if (cached_hb_tsc == 0 || elapsed > detail::HEARTBEAT_REFRESH_INTERVAL) {
         return send_heartbeat();
     }
     return true;
@@ -1413,37 +1414,68 @@ void voyager::device_t::solve_dtb() noexcept {
             static_cast<unsigned long long>(prior_dtb));
         return;
     }
-    if (gle == ERROR_INVALID_FUNCTION) {
+    if (!ok) {
         diag::log_tagged_fmt("comm",
-            "solve_dtb_invalid_function_preserve_cached pid=%u prior_dtb=0x%llX req_dtb=0x%llX",
+            "solve_dtb_ioctl_failed_preserve_cached pid=%u prior_dtb=0x%llX gle=%lu req_dtb=0x%llX",
             process_id_,
             static_cast<unsigned long long>(dtb_),
+            static_cast<unsigned long>(gle),
             static_cast<unsigned long long>(req.dtb));
         diag::log_tagged_fmt("comm",
-            "solve_dtb_result pid=%u ok=0 gle=%lu req_dtb=0x%llX result_dtb=0x%llX preserved=1",
+            "solve_dtb_result pid=%u ok=0 gle=%lu req_dtb=0x%llX result_dtb=0x%llX prior_dtb=0x%llX preserved=1",
             process_id_,
             static_cast<unsigned long>(gle),
             static_cast<unsigned long long>(req.dtb),
+            static_cast<unsigned long long>(dtb_),
             static_cast<unsigned long long>(dtb_));
         SetLastError(gle);
         return;
     }
     const std::uint64_t prior_dtb_clear = dtb_;
     diag::log_tagged_fmt("comm",
-        "solve_dtb_failed_clearing pid=%u prior_dtb=0x%llX gle=%lu req_dtb=0x%llX",
+        "solve_dtb_kernel_returned_zero pid=%u prior_dtb=0x%llX gle=%lu req_dtb=0x0",
         process_id_,
         static_cast<unsigned long long>(prior_dtb_clear),
-        static_cast<unsigned long>(gle),
-        static_cast<unsigned long long>(req.dtb));
+        static_cast<unsigned long>(gle));
     dtb_ = 0;
     diag::log_tagged_fmt("comm",
-        "solve_dtb_result pid=%u ok=%d gle=%lu req_dtb=0x%llX result_dtb=0x0 prior_dtb=0x%llX preserved=0",
+        "solve_dtb_result pid=%u ok=1 gle=0 req_dtb=0x0 result_dtb=0x0 prior_dtb=0x%llX preserved=0",
         process_id_,
-        ok ? 1 : 0,
-        static_cast<unsigned long>(gle),
-        static_cast<unsigned long long>(req.dtb),
         static_cast<unsigned long long>(prior_dtb_clear));
+    SetLastError(ERROR_SUCCESS);
+}
+
+std::uint64_t voyager::device_t::solve_dtb_for_pid(std::uint32_t pid) noexcept {
+    SPOOF_FUNC;
+
+    if (pid == 0 || !is_connected()) {
+        diag::log_tagged_fmt("comm",
+            "solve_dtb_for_pid_skip pid=%u connected=%d reason=%s",
+            pid, is_connected() ? 1 : 0,
+            pid == 0 ? "zero_pid" : "not_connected");
+        return 0;
+    }
+
+    detail::dtb_solve req{};
+    req.pid = pid;
+    req.padding = 0;
+    req.dtb = 0;
+
+    SetLastError(ERROR_SUCCESS);
+    const bool ok = send_request(ioctl_codes::DTB(), &req, sizeof(req));
+    const DWORD gle = ok ? ERROR_SUCCESS : GetLastError();
+    if (ok && req.dtb != 0) {
+        diag::log_tagged_fmt("comm",
+            "solve_dtb_for_pid_result pid=%u ok=1 dtb=0x%llX gle=0",
+            pid, static_cast<unsigned long long>(req.dtb));
+        return req.dtb;
+    }
+
+    diag::log_tagged_fmt("comm",
+        "solve_dtb_for_pid_result pid=%u ok=%d dtb=0x0 gle=%lu",
+        pid, ok ? 1 : 0, static_cast<unsigned long>(gle));
     SetLastError(gle);
+    return 0;
 }
 
 void voyager::device_t::solve_kernel_dtb() noexcept {
@@ -2835,11 +2867,11 @@ bool voyager::device_t::force_heartbeat() const noexcept {
     last_heartbeat_dioctl_result_ = hb_result;
     last_heartbeat_bytes_ = hb_bytes;
     last_heartbeat_response_ = hb.response;
-    last_heartbeat_error_ = hb_result ? 0 : hb_err;
+    last_heartbeat_error_.store(hb_result ? 0 : hb_err, std::memory_order_release);
     capture_heartbeat_security_snapshot(8, ioctl_code, hb.magic);
 
     if (hb_result && hb_bytes >= sizeof(hb) && hb.response != 0) {
-        last_heartbeat_tsc_ = __rdtsc();
+        last_heartbeat_tsc_.store(__rdtsc(), std::memory_order_release);
         last_bridge_whoswho_tsc_ = hb.whoswho_tsc;
         last_bridge_sentinel_tsc_ = hb.sentinel_tsc;
         if (hb.sentinel_tsc != 0 && first_sentinel_ready_tsc_ == 0)
@@ -3435,19 +3467,20 @@ std::uint64_t voyager::device_t::call_function_attempt(
 }
 
 bool voyager::device_t::session_invalidated() const noexcept {
-    const DWORD err = last_heartbeat_error_;
+    const DWORD err = last_heartbeat_error_.load(std::memory_order_acquire);
     const bool err_matches =
         err == ERROR_INVALID_FUNCTION ||
         err == ERROR_GEN_FAILURE ||
         err == ERROR_ACCESS_DENIED;
     if (!err_matches)
         return false;
-    if (last_heartbeat_tsc_ == 0)
+    const std::uint64_t cached_hb_tsc = last_heartbeat_tsc_.load(std::memory_order_acquire);
+    if (cached_hb_tsc == 0)
         return true;
     const std::uint64_t now_tsc = __rdtsc();
-    if (now_tsc <= last_heartbeat_tsc_)
+    if (now_tsc <= cached_hb_tsc)
         return false;
-    const std::uint64_t age = now_tsc - last_heartbeat_tsc_;
+    const std::uint64_t age = now_tsc - cached_hb_tsc;
     return age > detail::HEARTBEAT_REFRESH_INTERVAL;
 }
 
@@ -3610,7 +3643,7 @@ bool voyager::device_t::send_request(DWORD control_code, void* input, DWORD inpu
             seed_rotation_mtx_.get_waiting_writers(),
             seed_rotation_mtx_.get_active_readers(),
             g_server_token_relay_inflight.load(std::memory_order_acquire),
-            static_cast<unsigned long>(last_heartbeat_error_),
+            static_cast<unsigned long>(last_heartbeat_error_.load(std::memory_order_acquire)),
             static_cast<unsigned long long>(shared_elapsed),
             static_cast<long long>(kSeedRotationLockBudget.count()));
         SetLastError(ERROR_TIMEOUT);
@@ -3777,7 +3810,7 @@ bool voyager::device_t::send_request_in_lock(DWORD control_code, void* input, DW
             key_hash_after_sync,
             ioctl_seed_hash_before_sync,
             ioctl_seed_hash_after_sync,
-            static_cast<unsigned long long>(last_heartbeat_tsc_),
+            static_cast<unsigned long long>(last_heartbeat_tsc_.load(std::memory_order_acquire)),
             static_cast<unsigned long long>(last_bridge_whoswho_tsc_),
             static_cast<unsigned long long>(last_bridge_sentinel_tsc_),
             static_cast<unsigned long long>(first_sentinel_ready_tsc_));
@@ -3900,7 +3933,8 @@ bool voyager::device_t::send_request_in_lock(DWORD control_code, void* input, DW
 
     if (effective_control_code != make_ioctl_snapshot(8)) {
         std::uint64_t current_tsc = __rdtsc();
-        if (last_heartbeat_tsc_ == 0 || (current_tsc - last_heartbeat_tsc_) > detail::HEARTBEAT_REFRESH_INTERVAL) {
+        const std::uint64_t cached_hb_tsc = last_heartbeat_tsc_.load(std::memory_order_acquire);
+        if (cached_hb_tsc == 0 || (current_tsc - cached_hb_tsc) > detail::HEARTBEAT_REFRESH_INTERVAL) {
             auto send_embedded_heartbeat_once = [&](const char* pre_label,
                                                      const char* ok_label,
                                                      const char* fail_label,
@@ -3927,7 +3961,7 @@ bool voyager::device_t::send_request_in_lock(DWORD control_code, void* input, DW
                     diag::log_tagged_critical_fmt("comm",
                         "send_request_hvdt_embedded_hb_pre hb_ioctl=0x%08X last_hb_tsc=%llu current_tsc=%llu local_pid=%lu local_tid=%lu",
                         hb_ioctl,
-                        static_cast<unsigned long long>(last_heartbeat_tsc_),
+                        static_cast<unsigned long long>(last_heartbeat_tsc_.load(std::memory_order_acquire)),
                         static_cast<unsigned long long>(current_tsc),
                         static_cast<unsigned long>(GetCurrentProcessId()),
                         static_cast<unsigned long>(GetCurrentThreadId()));
@@ -3954,7 +3988,7 @@ bool voyager::device_t::send_request_in_lock(DWORD control_code, void* input, DW
                 last_heartbeat_dioctl_result_ = hb_result;
                 last_heartbeat_bytes_ = hb_bytes;
                 last_heartbeat_response_ = hb.response;
-                last_heartbeat_error_ = hb_result ? 0 : hb_err;
+    last_heartbeat_error_.store(hb_result ? 0 : hb_err, std::memory_order_release);
                 capture_heartbeat_security_snapshot(8, hb_ioctl, hb.magic);
 
                 bool hb_ok = hb_result && hb_bytes >= sizeof(hb) && hb.response != 0;
@@ -3968,11 +4002,11 @@ bool voyager::device_t::send_request_in_lock(DWORD control_code, void* input, DW
                         else
                             effective_hb_err = ERROR_GEN_FAILURE;
                     }
-                    last_heartbeat_error_ = effective_hb_err;
+                    last_heartbeat_error_.store(effective_hb_err, std::memory_order_release);
                 }
 
                 if (hb_ok) {
-                    last_heartbeat_tsc_ = __rdtsc();
+            last_heartbeat_tsc_.store(__rdtsc(), std::memory_order_release);
                     last_bridge_whoswho_tsc_ = hb.whoswho_tsc;
                     last_bridge_sentinel_tsc_ = hb.sentinel_tsc;
                     if (hb.sentinel_tsc != 0 && first_sentinel_ready_tsc_ == 0)
@@ -4212,7 +4246,7 @@ bool voyager::device_t::send_request_in_lock(DWORD control_code, void* input, DW
                 server_ioctl_seed_ != 0 ? 1u : 0u,
                 dynamic_key::g_server_seed != 0 ? 1u : 0u,
                 ioctl_codes::g_server_ioctl_seed != 0 ? 1u : 0u,
-                static_cast<unsigned long long>(last_heartbeat_tsc_),
+                static_cast<unsigned long long>(last_heartbeat_tsc_.load(std::memory_order_acquire)),
                 static_cast<unsigned long long>(last_bridge_whoswho_tsc_),
                 static_cast<unsigned long long>(last_bridge_sentinel_tsc_),
                 static_cast<unsigned long long>(first_sentinel_ready_tsc_));
@@ -4272,7 +4306,7 @@ bool voyager::device_t::send_request_in_lock(DWORD control_code, void* input, DW
                 static_cast<unsigned long long>(GetTickCount64() - ioctl_start));
             if (dynamic_offset_valid) {
                 const std::uint32_t seed_before_resync = server_ioctl_seed_;
-                const std::uint64_t hb_tsc_before_resync = last_heartbeat_tsc_;
+                const std::uint64_t hb_tsc_before_resync = last_heartbeat_tsc_.load(std::memory_order_acquire);
                 sync_dynamic_security_state();
                 const std::uint32_t seed_after_resync = server_ioctl_seed_;
                 if (seed_after_resync != seed_before_resync) {
@@ -4287,7 +4321,7 @@ bool voyager::device_t::send_request_in_lock(DWORD control_code, void* input, DW
                             seed_before_resync != 0 ? hash_build_key(seed_before_resync) : 0,
                             seed_after_resync != 0 ? hash_build_key(seed_after_resync) : 0,
                             static_cast<unsigned long long>(hb_tsc_before_resync),
-                            static_cast<unsigned long long>(last_heartbeat_tsc_),
+                            static_cast<unsigned long long>(last_heartbeat_tsc_.load(std::memory_order_acquire)),
                             static_cast<unsigned long>(local_pid),
                             static_cast<unsigned long>(local_tid),
                             static_cast<unsigned long long>(GetTickCount64() - ioctl_start));
@@ -4341,7 +4375,7 @@ bool voyager::device_t::send_request_in_lock(DWORD control_code, void* input, DW
             server_ioctl_seed_ != 0 ? 1u : 0u,
             dynamic_key::g_server_seed != 0 ? 1u : 0u,
             ioctl_codes::g_server_ioctl_seed != 0 ? 1u : 0u,
-            static_cast<unsigned long long>(last_heartbeat_tsc_),
+            static_cast<unsigned long long>(last_heartbeat_tsc_.load(std::memory_order_acquire)),
             static_cast<unsigned long long>(last_bridge_whoswho_tsc_),
             static_cast<unsigned long long>(last_bridge_sentinel_tsc_),
             static_cast<unsigned long long>(first_sentinel_ready_tsc_));
@@ -4355,17 +4389,18 @@ bool voyager::device_t::send_request_in_lock(DWORD control_code, void* input, DW
         if (final_err == ERROR_INVALID_FUNCTION &&
             dynamic_offset_valid &&
             !is_startup_offset_for_demote_filter(dynamic_offset) &&
-            last_heartbeat_error_ == 0) {
+            last_heartbeat_error_.load(std::memory_order_acquire) == 0) {
             auto cb = g_kernel_demote_detected_cb.load(std::memory_order_acquire);
             const bool kicked = cb != nullptr;
-            const std::uint64_t last_hb_age_tsc = last_heartbeat_tsc_ != 0 && __rdtsc() > last_heartbeat_tsc_
-                ? (__rdtsc() - last_heartbeat_tsc_) : 0;
+            const std::uint64_t current_hb_tsc = last_heartbeat_tsc_.load(std::memory_order_acquire);
+            const std::uint64_t last_hb_age_tsc = current_hb_tsc != 0 && __rdtsc() > current_hb_tsc
+                ? (__rdtsc() - current_hb_tsc) : 0;
             diag::log_tagged_critical_fmt("comm",
                 "send_request_kernel_demote_detected control_code=0x%08X effective=0x%08X dyn_offset=%u last_hb_err=%lu last_hb_age_tsc=%llu kicked_keepalive=%d local_pid=%lu local_tid=%lu target_pid=%u",
                 control_code,
                 effective_control_code,
                 dynamic_offset,
-                static_cast<unsigned long>(last_heartbeat_error_),
+                static_cast<unsigned long>(last_heartbeat_error_.load(std::memory_order_acquire)),
                 static_cast<unsigned long long>(last_hb_age_tsc),
                 kicked ? 1 : 0,
                 static_cast<unsigned long>(local_pid),
@@ -7231,7 +7266,7 @@ bool voyager::device_t::latch_targeting_from_usermode(std::uint32_t reason) noex
         server_ioctl_seed_ != 0 ? hash_build_key(server_ioctl_seed_) : 0,
         make_ioctl_snapshot(53),
         reinterpret_cast<unsigned long long>(driver_handle_),
-        static_cast<unsigned long long>(last_heartbeat_tsc_));
+        static_cast<unsigned long long>(last_heartbeat_tsc_.load(std::memory_order_acquire)));
 
     if (!is_connected()) {
         diag::log_tagged_critical_fmt("comm-rela",
@@ -7911,7 +7946,7 @@ bool voyager::device_t::relay_server_token(std::uint32_t token_hash, std::uint64
             "relay_server_token_singleflight_rejected token_hash=0x%08X prior_inflight=%u last_hb_err=%lu local_pid=%lu local_tid=%lu",
             token_hash,
             relay_scope.prior(),
-            static_cast<unsigned long>(last_heartbeat_error_),
+            static_cast<unsigned long>(last_heartbeat_error_.load(std::memory_order_acquire)),
             static_cast<unsigned long>(GetCurrentProcessId()),
             static_cast<unsigned long>(GetCurrentThreadId()));
         SetLastError(ERROR_BUSY);
@@ -7921,7 +7956,7 @@ bool voyager::device_t::relay_server_token(std::uint32_t token_hash, std::uint64
         diag::log_tagged_critical_fmt("comm",
             "relay_server_token_short_circuit_session_invalidated token_hash=0x%08X last_hb_err=%lu local_pid=%lu local_tid=%lu",
             token_hash,
-            static_cast<unsigned long>(last_heartbeat_error_),
+            static_cast<unsigned long>(last_heartbeat_error_.load(std::memory_order_acquire)),
             static_cast<unsigned long>(GetCurrentProcessId()),
             static_cast<unsigned long>(GetCurrentThreadId()));
         SetLastError(ERROR_INVALID_FUNCTION);
@@ -7939,10 +7974,10 @@ bool voyager::device_t::relay_server_token(std::uint32_t token_hash, std::uint64
         static_cast<unsigned long>(GetCurrentProcessId()),
         static_cast<unsigned long>(GetCurrentThreadId()));
     if (!try_lock_seed_rotation_writer(seed_rotation_mtx_,
-                                       "relay_server_token",
-                                       token_hash,
-                                       writer_wait_start,
-                                       last_heartbeat_error_,
+                                        "relay_server_token",
+                                        token_hash,
+                                        writer_wait_start,
+                                        last_heartbeat_error_.load(std::memory_order_acquire),
                                        last_acquiring_reader_tid_.load(std::memory_order_acquire),
                                        last_acquiring_reader_ioctl_.load(std::memory_order_acquire),
                                        last_acquiring_reader_tsc_.load(std::memory_order_acquire),
@@ -8021,12 +8056,13 @@ bool voyager::device_t::relay_server_token_v2(std::uint32_t token_hash, std::uin
     server_token_relay_scope_t relay_scope;
     if (!relay_scope.owns()) {
         diag::log_tagged_critical_fmt("comm",
-            "relay_server_token_v2_singleflight_rejected token_hash=0x%08X prior_inflight=%u last_hb_err=%lu local_pid=%lu local_tid=%lu",
+            "relay_server_token_v2_singleflight_rejected token_hash=0x%08X prior_inflight=%u last_hb_err=%lu local_pid=%lu local_tid=%lu is_testlab=%d",
             token_hash,
             relay_scope.prior(),
-            static_cast<unsigned long>(last_heartbeat_error_),
+            static_cast<unsigned long>(last_heartbeat_error_.load(std::memory_order_acquire)),
             static_cast<unsigned long>(GetCurrentProcessId()),
-            static_cast<unsigned long>(GetCurrentThreadId()));
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            0);
         if (out_driver_proof) *out_driver_proof = 0;
         SetLastError(ERROR_BUSY);
         return false;
@@ -8035,7 +8071,7 @@ bool voyager::device_t::relay_server_token_v2(std::uint32_t token_hash, std::uin
         diag::log_tagged_critical_fmt("comm",
             "relay_server_token_v2_short_circuit_session_invalidated token_hash=0x%08X last_hb_err=%lu local_pid=%lu local_tid=%lu",
             token_hash,
-            static_cast<unsigned long>(last_heartbeat_error_),
+            static_cast<unsigned long>(last_heartbeat_error_.load(std::memory_order_acquire)),
             static_cast<unsigned long>(GetCurrentProcessId()),
             static_cast<unsigned long>(GetCurrentThreadId()));
         if (out_driver_proof) *out_driver_proof = 0;
@@ -8054,10 +8090,10 @@ bool voyager::device_t::relay_server_token_v2(std::uint32_t token_hash, std::uin
         static_cast<unsigned long>(GetCurrentProcessId()),
         static_cast<unsigned long>(GetCurrentThreadId()));
     if (!try_lock_seed_rotation_writer(seed_rotation_mtx_,
-                                       "relay_server_token_v2",
-                                       token_hash,
-                                       writer_wait_start_v2,
-                                       last_heartbeat_error_,
+                                        "relay_server_token_v2",
+                                        token_hash,
+                                        writer_wait_start_v2,
+                                        last_heartbeat_error_.load(std::memory_order_acquire),
                                        last_acquiring_reader_tid_.load(std::memory_order_acquire),
                                        last_acquiring_reader_ioctl_.load(std::memory_order_acquire),
                                        last_acquiring_reader_tsc_.load(std::memory_order_acquire),
@@ -8105,7 +8141,7 @@ bool voyager::device_t::relay_server_token_v2(std::uint32_t token_hash, std::uin
         server_ioctl_seed_ != 0 ? 1u : 0u,
         dynamic_key::g_server_seed != 0 ? 1u : 0u,
         ioctl_codes::g_server_ioctl_seed != 0 ? 1u : 0u,
-        static_cast<unsigned long long>(last_heartbeat_tsc_),
+        static_cast<unsigned long long>(last_heartbeat_tsc_.load(std::memory_order_acquire)),
         static_cast<unsigned long long>(last_bridge_sentinel_tsc_));
 
     detail::server_token_relay_v2 req{};
@@ -8142,7 +8178,7 @@ bool voyager::device_t::relay_server_token_v2(std::uint32_t token_hash, std::uin
         const DWORD retry_ioctl_code = make_ioctl_snapshot(46);
 
         if (!send_heartbeat()) {
-            DWORD hb_err = last_heartbeat_error_;
+        DWORD hb_err = last_heartbeat_error_.load(std::memory_order_acquire);
             if (hb_err == 0 && last_heartbeat_dioctl_result_) {
                 if (last_heartbeat_bytes_ < sizeof(detail::heartbeat_request)) {
                     hb_err = ERROR_MORE_DATA;
@@ -8168,7 +8204,7 @@ bool voyager::device_t::relay_server_token_v2(std::uint32_t token_hash, std::uin
         diag::log_tagged_critical_fmt("comm-startup",
             "relay_server_token_v2_recover_heartbeat_ok retry_ioctl=0x%08X hb_tsc=%llu bridge_whoswho=%llu bridge_sentinel=%llu hb_dioctl=%d hb_bytes=%lu hb_response_present=%d",
             retry_ioctl_code,
-            static_cast<unsigned long long>(last_heartbeat_tsc_),
+            static_cast<unsigned long long>(last_heartbeat_tsc_.load(std::memory_order_acquire)),
             static_cast<unsigned long long>(last_bridge_whoswho_tsc_),
             static_cast<unsigned long long>(last_bridge_sentinel_tsc_),
             last_heartbeat_dioctl_result_ ? 1 : 0,
@@ -8178,7 +8214,7 @@ bool voyager::device_t::relay_server_token_v2(std::uint32_t token_hash, std::uin
         if (!last_heartbeat_dioctl_result_ ||
             last_heartbeat_bytes_ < sizeof(detail::heartbeat_request) ||
             last_heartbeat_response_ == 0) {
-            DWORD hb_postcheck_err = last_heartbeat_error_;
+            DWORD hb_postcheck_err = last_heartbeat_error_.load(std::memory_order_acquire);
             if (hb_postcheck_err == 0) hb_postcheck_err = ERROR_GEN_FAILURE;
             log_security_snapshot("relay_server_token_v2_recover_heartbeat_postcheck_failed", retry_ioctl_code, retry_ioctl_code, hb_postcheck_err);
             diag::log_tagged_critical_fmt("comm-startup",
@@ -8244,7 +8280,7 @@ bool voyager::device_t::relay_server_token_v2(std::uint32_t token_hash, std::uin
             server_ioctl_seed_ != 0 ? 1u : 0u,
             dynamic_key::g_server_seed != 0 ? 1u : 0u,
             ioctl_codes::g_server_ioctl_seed != 0 ? 1u : 0u,
-            static_cast<unsigned long long>(last_heartbeat_tsc_),
+            static_cast<unsigned long long>(last_heartbeat_tsc_.load(std::memory_order_acquire)),
             static_cast<unsigned long long>(last_bridge_whoswho_tsc_),
             static_cast<unsigned long long>(last_bridge_sentinel_tsc_));
         log_security_snapshot("relay_server_token_v2_seeded", ioctl_code, make_ioctl_snapshot(46), 0);
@@ -8314,7 +8350,7 @@ bool voyager::device_t::force_post_desync_relay_v2_locked(DWORD* out_error) noex
                                        "force_post_desync_relay_v2",
                                        cached_token_hash,
                                        writer_wait_start,
-                                       last_heartbeat_error_,
+                                       last_heartbeat_error_.load(std::memory_order_acquire),
                                        last_acquiring_reader_tid_.load(std::memory_order_acquire),
                                        last_acquiring_reader_ioctl_.load(std::memory_order_acquire),
                                        last_acquiring_reader_tsc_.load(std::memory_order_acquire),

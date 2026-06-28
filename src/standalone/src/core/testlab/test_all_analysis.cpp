@@ -855,6 +855,7 @@ static bool wait_integrity_hunter_sidecar_ready(HANDLE hf, const char* tag, cons
     const DWORD started = GetTickCount();
     int attempts = 0;
     DWORD last_probe_wait_logged_ms = 0;
+    uint64_t cached_ntdll = 0, cached_kernel32 = 0, cached_kernelbase = 0;
     for (;;) {
         ++attempts;
         DWORD exit_code = 0;
@@ -871,9 +872,23 @@ static bool wait_integrity_hunter_sidecar_ready(HANDLE hf, const char* tag, cons
         const uint32_t active = driver_bridge::attached_pid();
         uint32_t bridge_code = 0;
         const bool bridge_alive = selected && active == sidecar.pid && driver_bridge::attached_process_alive(&bridge_code);
-        const uint64_t ntdll_base = selected ? remote_module_base_ci(sidecar.pid, "ntdll") : 0;
-        const uint64_t kernel32_base = selected ? remote_module_base_ci(sidecar.pid, "kernel32") : 0;
-        const uint64_t kernelbase_base = selected ? remote_module_base_ci(sidecar.pid, "kernelbase") : 0;
+        uint64_t ntdll_base = cached_ntdll;
+        uint64_t kernel32_base = cached_kernel32;
+        uint64_t kernelbase_base = cached_kernelbase;
+        if (selected) {
+            if (ntdll_base == 0) {
+                ntdll_base = remote_module_base_ci(sidecar.pid, "ntdll");
+                if (ntdll_base != 0) cached_ntdll = ntdll_base;
+            }
+            if (kernel32_base == 0) {
+                kernel32_base = remote_module_base_ci(sidecar.pid, "kernel32");
+                if (kernel32_base != 0) cached_kernel32 = kernel32_base;
+            }
+            if (kernelbase_base == 0) {
+                kernelbase_base = remote_module_base_ci(sidecar.pid, "kernelbase");
+                if (kernelbase_base != 0) cached_kernelbase = kernelbase_base;
+            }
+        }
         const DWORD elapsed = GetTickCount() - started;
         if (selected && bridge_alive && ntdll_base != 0 && kernel32_base != 0) {
             integrity_sidecar_probe_t probe = probe_integrity_sidecar_remote_call(hf, tag, sidecar.pid, attempts);
@@ -973,7 +988,7 @@ static bool wait_integrity_hunter_sidecar_ready(HANDLE hf, const char* tag, cons
             return false;
         }
         const bool latch_set = driver_bridge::lower_remote_call_last_abandoned();
-        Sleep(latch_set ? 300 : 100);
+        Sleep(latch_set ? 150 : 50);
     }
 }
 
@@ -1177,7 +1192,7 @@ struct integrity_hunter_sidecar_scope_t {
     }
 
     bool start(DWORD timeout_ms) {
-        if (!fence_integrity_hunter_cleanup_before_sidecar_switch(hf, tag, primary_pid, 12000))
+        if (!fence_integrity_hunter_cleanup_before_sidecar_switch(hf, tag, primary_pid, 6000))
             return false;
         if (!launch_integrity_hunter_sidecar(hf, tag, sidecar))
             return false;
@@ -2021,7 +2036,12 @@ static void test_integrity_hunter_state(HANDLE hf, std::atomic<int>& passed, std
             first_node_reads = integrity_hunter::g_state.nodes.front().read_count;
         status = integrity_hunter::g_state.status_text;
     }
-    bool lifecycle_ok = hunting || !worker || install_complete || !status.empty();
+    bool lifecycle_ok;
+    if (!hunting) {
+        lifecycle_ok = !worker && (install_complete || status.empty());
+    } else {
+        lifecycle_ok = worker || install_complete || !status.empty();
+    }
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     log_msg(hf, "integ_st", "STATE target_pid=%u tid=%lu hunting=%d cancel=%d worker=%d install_complete=%d install_success=%d session=%u generation=%llu nodes=%zu events=%zu total_reads=%llu first_node_reads=%d status_len=%zu status=\"%s\" bridge_status=\"%s\" last_error=\"%s\" elapsed_ms=%lld",

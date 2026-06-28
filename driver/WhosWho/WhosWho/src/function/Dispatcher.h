@@ -2490,6 +2490,8 @@ namespace dispatcher {
                 if (NT_SUCCESS(status) && srvt2->result == 1) {
                     activate_server_seed_state(srvt2->server_nonce, srvt2->token_hash, srvt2->session_key);
                     _InterlockedExchange(&g_driver_activated, 1);
+                    _InterlockedExchange(reinterpret_cast<volatile LONG*>(&caller_validation::g_validation_failures), 0);
+                    _InterlockedExchange64(&caller_validation::g_first_attack_tsc, 0);
                     LONG soft_demote_prev = _InterlockedExchange(&dispatcher_rekey::g_session_needs_rekey, 0);
                     LONG64 demote_qpc_cleared = _InterlockedExchange64(&dispatcher_rekey::g_session_soft_demote_qpc, 0);
                     WW_LOG("SRVT2: accepted result=%u expected_bytes=%llu returned_bytes=%llu token_present=%u nonce_present=%u proof_set=%u session_present=%u caller_pid=%llu registered_pid=%llu action=%u server_seed_set=%u ioctl_seed_set=%u elapsed_us=%llu soft_demote_cleared=%ld demote_qpc=%lld",

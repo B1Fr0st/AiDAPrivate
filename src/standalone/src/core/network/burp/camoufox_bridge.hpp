@@ -37,7 +37,7 @@ struct launch_config_t
     std::string              server_executable;
     std::string              server_module      = "camoufox_reverse_mcp";
     std::vector<std::string> extra_args;
-    int                      launch_timeout_ms  = 75000;
+    int                      launch_timeout_ms  = 120000;
     int                      window_width       = 1280;
     int                      window_height      = 900;
     bool                     testlab_fast_probe = false;
