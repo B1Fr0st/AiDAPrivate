@@ -13,6 +13,7 @@
 #include "../editor/expression_eval.hpp"
 #include "../debugger/debugger_engine.hpp"
 #include "../runtime/standalone_driver.hpp"
+#include "../infra/work_queue.hpp"
 #include "../../helpers/diag_log.hpp"
 #include "../../helpers/globals.h"
 
@@ -2293,9 +2294,16 @@ namespace {
         }
         constexpr uint32_t proof_timeout_ms = 2500;
         constexpr uint32_t watchdog_timeout_ms = 4000;
-        std::atomic<bool> finished{ false };
-        std::atomic<bool> hung_logged{ false };
-        std::atomic<int> stage{ 0 };
+        struct watchdog_shared_state_t {
+            std::atomic<bool> finished{ false };
+            std::atomic<bool> hung_logged{ false };
+            std::atomic<int>  stage{ 0 };
+            std::atomic<bool> done{ false };
+        };
+        auto wd_state = std::make_shared<watchdog_shared_state_t>();
+        auto& finished = wd_state->finished;
+        auto& hung_logged = wd_state->hung_logged;
+        auto& stage = wd_state->stage;
         auto set_stage = [&](int value) {
             stage.store(value, std::memory_order_release);
             g_xref_live_after_warm_stage.store(value, std::memory_order_release);
@@ -2304,64 +2312,121 @@ namespace {
             return xref_live_after_warm_stage_name(value);
         };
         set_stage(5);
-        std::thread watchdog;
-        try {
-            watchdog = std::thread([&, t0]() {
-            const auto deadline = t0 + std::chrono::milliseconds(watchdog_timeout_ms);
-            while (!finished.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline)
-                std::this_thread::sleep_for(std::chrono::milliseconds(25));
-            if (!finished.load(std::memory_order_acquire)) {
-                const int active_stage = stage.load(std::memory_order_acquire);
-                hung_logged.store(true, std::memory_order_release);
-                log_msg(hf, tag, "HUNG -- stage=%s pid=%u module=\"%s\" module_base=0x%016llX module_size=0x%08X requested=[0x%016llX,0x%016llX) proof_timeout_ms=%u watchdog_timeout_ms=%u elapsed_us=%lld",
-                    stage_name(active_stage),
-                    module.pid,
-                    module.name.empty() ? "<unknown>" : module.name.c_str(),
-                    (unsigned long long)module.base,
-                    module.size,
-                    (unsigned long long)range_lo,
-                    (unsigned long long)range_hi,
-                    proof_timeout_ms,
-                    watchdog_timeout_ms,
-                    elapsed_us_since(t0));
-                diag::log_tagged_critical_fmt("testlab",
-                    "xref_live_after_warm_hung stage=%s pid=%u module=%s base=0x%llX size=0x%X range_lo=0x%llX range_hi=0x%llX proof_timeout_ms=%u watchdog_timeout_ms=%u elapsed_us=%lld",
-                    stage_name(active_stage),
-                    module.pid,
-                    module.name.empty() ? "<unknown>" : module.name.c_str(),
-                    (unsigned long long)module.base,
-                    module.size,
-                    (unsigned long long)range_lo,
-                    (unsigned long long)range_hi,
-                    proof_timeout_ms,
-                    watchdog_timeout_ms,
-                    elapsed_us_since(t0));
-            }
-            });
-        } catch (const std::exception& ex) {
+        auto watchdog_event_holder = std::shared_ptr<void>(
+            CreateEventW(nullptr, TRUE, FALSE, nullptr),
+            [](HANDLE h) { if (h) CloseHandle(h); });
+        if (!watchdog_event_holder.get()) {
+            const DWORD ev_gle = GetLastError();
             g_xref_live_after_warm_stage.store(14, std::memory_order_release);
-            log_msg(hf, tag, "OUTPUT -- ok=0 error=\"watchdog_start_exception\" type=\"%s\" what=\"%s\" pid=%u module=\"%s\" elapsed_us=%lld",
-                "std::exception",
-                ex.what(),
-                module.pid,
-                module.name.empty() ? "<unknown>" : module.name.c_str(),
-                elapsed_us_since(t0));
-            failed.fetch_add(1);
-            return;
-        } catch (...) {
-            g_xref_live_after_warm_stage.store(14, std::memory_order_release);
-            log_msg(hf, tag, "OUTPUT -- ok=0 error=\"watchdog_start_exception_unknown\" pid=%u module=\"%s\" elapsed_us=%lld",
+            log_msg(hf, tag, "OUTPUT -- ok=0 error=\"watchdog_event_create_failed\" gle=%lu pid=%u module=\"%s\" elapsed_us=%lld",
+                static_cast<unsigned long>(ev_gle),
                 module.pid,
                 module.name.empty() ? "<unknown>" : module.name.c_str(),
                 elapsed_us_since(t0));
             failed.fetch_add(1);
             return;
         }
-        auto finish_watchdog = [&]() {
+        const HANDLE wd_log_file = hf;
+        const uint32_t wd_pid = module.pid;
+        const std::string wd_module_name = module.name;
+        const uint64_t wd_module_base = module.base;
+        const uint32_t wd_module_size = module.size;
+        const uint64_t wd_range_lo = range_lo;
+        const uint64_t wd_range_hi = range_hi;
+        const bool watchdog_posted = work_queue::post_labeled("xref_live_after_warm.watchdog",
+            [wd_state, watchdog_event_holder, t0, tag, wd_log_file, wd_pid, wd_module_name, wd_module_base, wd_module_size, wd_range_lo, wd_range_hi]() {
+                HANDLE watchdog_event = watchdog_event_holder.get();
+                const auto deadline = t0 + std::chrono::milliseconds(watchdog_timeout_ms);
+                while (!wd_state->finished.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) {
+                    const DWORD wait_res = WaitForSingleObject(watchdog_event, 25);
+                    if (wait_res != WAIT_TIMEOUT) break;
+                }
+                if (!wd_state->finished.load(std::memory_order_acquire)) {
+                    const int active_stage = wd_state->stage.load(std::memory_order_acquire);
+                    wd_state->hung_logged.store(true, std::memory_order_release);
+                    const char* wd_module_name_cstr = wd_module_name.empty() ? "<unknown>" : wd_module_name.c_str();
+                    log_msg(wd_log_file, tag, "HUNG -- stage=%s pid=%u module=\"%s\" module_base=0x%016llX module_size=0x%08X requested=[0x%016llX,0x%016llX) proof_timeout_ms=%u watchdog_timeout_ms=%u elapsed_us=%lld",
+                        xref_live_after_warm_stage_name(active_stage),
+                        wd_pid,
+                        wd_module_name_cstr,
+                        (unsigned long long)wd_module_base,
+                        wd_module_size,
+                        (unsigned long long)wd_range_lo,
+                        (unsigned long long)wd_range_hi,
+                        proof_timeout_ms,
+                        watchdog_timeout_ms,
+                        elapsed_us_since(t0));
+                    diag::log_tagged_critical_fmt("testlab",
+                        "xref_live_after_warm_hung stage=%s pid=%u module=%s base=0x%llX size=0x%X range_lo=0x%llX range_hi=0x%llX proof_timeout_ms=%u watchdog_timeout_ms=%u elapsed_us=%lld",
+                        xref_live_after_warm_stage_name(active_stage),
+                        wd_pid,
+                        wd_module_name_cstr,
+                        (unsigned long long)wd_module_base,
+                        wd_module_size,
+                        (unsigned long long)wd_range_lo,
+                        (unsigned long long)wd_range_hi,
+                        proof_timeout_ms,
+                        watchdog_timeout_ms,
+                        elapsed_us_since(t0));
+                }
+                wd_state->done.store(true, std::memory_order_release);
+            });
+        if (!watchdog_posted) {
+            const work_queue::stats_t work_stats = work_queue::stats();
+            const work_queue::stats_t service_stats = work_queue::service_stats();
+            g_xref_live_after_warm_stage.store(14, std::memory_order_release);
+            log_msg(hf, tag,
+                "OUTPUT -- ok=0 error=\"watchdog_post_failed\" reason=work_queue_post_returned_false "
+                "work_alive=%d work_shutting_down=%d work_pool_size=%d work_workers=%zu work_pending=%zu work_active=%u work_posted=%llu work_rejected=%llu work_started=%llu work_finished=%llu work_oldest_active_ms=%llu work_active_label_count=%u "
+                "service_alive=%d service_shutting_down=%d service_pool_size=%d service_workers=%zu service_pending=%zu service_active=%u service_rejected=%llu "
+                "pid=%u module=\"%s\" elapsed_us=%lld",
+                work_stats.alive ? 1 : 0,
+                work_stats.shutting_down ? 1 : 0,
+                work_stats.pool_size,
+                work_stats.workers,
+                work_stats.pending,
+                work_stats.active,
+                static_cast<unsigned long long>(work_stats.posted),
+                static_cast<unsigned long long>(work_stats.rejected),
+                static_cast<unsigned long long>(work_stats.started),
+                static_cast<unsigned long long>(work_stats.finished),
+                static_cast<unsigned long long>(work_stats.oldest_active_ms),
+                work_stats.active_label_count,
+                service_stats.alive ? 1 : 0,
+                service_stats.shutting_down ? 1 : 0,
+                service_stats.pool_size,
+                service_stats.workers,
+                service_stats.pending,
+                service_stats.active,
+                static_cast<unsigned long long>(service_stats.rejected),
+                module.pid,
+                module.name.empty() ? "<unknown>" : module.name.c_str(),
+                elapsed_us_since(t0));
+            diag::log_tagged_critical_fmt("testlab",
+                "xref_live_after_warm_watchdog_post_failed work_alive=%d work_workers=%zu work_pending=%zu work_active=%u work_oldest_active_ms=%llu work_active_labels=\"%s\" service_alive=%d service_active=%u pid=%u module=%s elapsed_us=%lld",
+                work_stats.alive ? 1 : 0,
+                work_stats.workers,
+                work_stats.pending,
+                work_stats.active,
+                static_cast<unsigned long long>(work_stats.oldest_active_ms),
+                work_stats.active_labels.empty() ? "<none>" : work_stats.active_labels.c_str(),
+                service_stats.alive ? 1 : 0,
+                service_stats.active,
+                module.pid,
+                module.name.empty() ? "<unknown>" : module.name.c_str(),
+                elapsed_us_since(t0));
+            failed.fetch_add(1);
+            return;
+        }
+        auto finish_watchdog = [&, wd_state, watchdog_event_holder]() {
             set_stage(13);
             finished.store(true, std::memory_order_release);
-            if (watchdog.joinable())
-                watchdog.join();
+            SetEvent(watchdog_event_holder.get());
+            const auto join_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(watchdog_timeout_ms + 250);
+            while (!wd_state->done.load(std::memory_order_acquire) &&
+                   std::chrono::steady_clock::now() < join_deadline) {
+                Sleep(5);
+            }
         };
         log_msg(hf, tag, "INPUT -- pid=%u module=\"%s\" module_base=0x%016llX module_size=0x%08X module_count=%zu requested_range=[0x%016llX,0x%016llX) span=0x%016llX proof_timeout_ms=%u watchdog_timeout_ms=%u",
             module.pid,

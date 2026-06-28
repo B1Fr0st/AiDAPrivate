@@ -1,5 +1,6 @@
 #include "artifact_store.hpp"
 
+#include <algorithm>
 #include <atomic>
 
 namespace re::store
@@ -35,6 +36,30 @@ std::map<std::string, memory_snapshot_t>& memory_snapshots()
 {
     static std::map<std::string, memory_snapshot_t> snapshots;
     return snapshots;
+}
+
+std::map<std::string, decryption_trace_record_t>& decryption_traces()
+{
+    static std::map<std::string, decryption_trace_record_t> traces;
+    return traces;
+}
+
+std::map<std::uint32_t, std::vector<frame_batch_t>>& frame_batches()
+{
+    static std::map<std::uint32_t, std::vector<frame_batch_t>> batches;
+    return batches;
+}
+
+std::map<std::uint32_t, std::vector<hot_va_entry_t>>& hot_vas()
+{
+    static std::map<std::uint32_t, std::vector<hot_va_entry_t>> vas;
+    return vas;
+}
+
+std::map<std::uint32_t, std::vector<cbuffer_classification_t>>& cbuffer_classifications()
+{
+    static std::map<std::uint32_t, std::vector<cbuffer_classification_t>> classifications;
+    return classifications;
 }
 
 std::filesystem::path offsets_path()
@@ -372,5 +397,183 @@ std::vector<memory_snapshot_t> list_memory_snapshots()
         out.push_back(snapshot);
     }
     return out;
+}
+
+void add_decryption_trace(decryption_trace_record_t record)
+{
+    std::lock_guard<std::mutex> lock(store_mutex());
+    decryption_traces()[record.id] = std::move(record);
+}
+
+bool find_decryption_trace(const std::string& id, decryption_trace_record_t& out)
+{
+    std::lock_guard<std::mutex> lock(store_mutex());
+    auto it = decryption_traces().find(id);
+    if (it == decryption_traces().end())
+        return false;
+    out = it->second;
+    return true;
+}
+
+std::vector<decryption_trace_record_t> list_decryption_traces(std::uint32_t pid)
+{
+    std::lock_guard<std::mutex> lock(store_mutex());
+    std::vector<decryption_trace_record_t> out;
+    for (const auto& [id, trace] : decryption_traces())
+    {
+        (void)id;
+        if (pid == 0 || trace.pid == pid)
+            out.push_back(trace);
+    }
+    return out;
+}
+
+bool remove_decryption_trace(const std::string& id, decryption_trace_record_t* removed)
+{
+    std::lock_guard<std::mutex> lock(store_mutex());
+    auto it = decryption_traces().find(id);
+    if (it == decryption_traces().end())
+        return false;
+    if (removed)
+        *removed = it->second;
+    decryption_traces().erase(it);
+    return true;
+}
+
+std::size_t remove_decryption_traces(std::uint32_t pid)
+{
+    std::lock_guard<std::mutex> lock(store_mutex());
+    std::size_t removed = 0;
+    for (auto it = decryption_traces().begin(); it != decryption_traces().end();)
+    {
+        if (pid == 0 || it->second.pid == pid)
+        {
+            it = decryption_traces().erase(it);
+            ++removed;
+        }
+        else
+            ++it;
+    }
+    return removed;
+}
+
+void add_frame_batch(frame_batch_t batch)
+{
+    std::lock_guard<std::mutex> lock(store_mutex());
+    auto& vec = frame_batches()[batch.pid];
+    vec.push_back(std::move(batch));
+    while (vec.size() > 32)
+        vec.erase(vec.begin());
+}
+
+std::vector<frame_batch_t> list_frame_batches(std::uint32_t pid)
+{
+    std::lock_guard<std::mutex> lock(store_mutex());
+    auto it = frame_batches().find(pid);
+    if (it == frame_batches().end())
+        return {};
+    return it->second;
+}
+
+void clear_frame_batches(std::uint32_t pid)
+{
+    std::lock_guard<std::mutex> lock(store_mutex());
+    frame_batches().erase(pid);
+}
+
+std::optional<frame_batch_t> latest_frame_batch(std::uint32_t pid)
+{
+    std::lock_guard<std::mutex> lock(store_mutex());
+    auto it = frame_batches().find(pid);
+    if (it == frame_batches().end() || it->second.empty())
+        return std::nullopt;
+    return it->second.back();
+}
+
+void add_hot_va(hot_va_entry_t entry)
+{
+    std::lock_guard<std::mutex> lock(store_mutex());
+    auto& vec = hot_vas()[entry.pid];
+    auto it = std::find_if(vec.begin(), vec.end(), [&](const hot_va_entry_t& e) {
+        return e.va == entry.va && e.slot == entry.slot;
+    });
+    if (it != vec.end())
+    {
+        *it = entry;
+        return;
+    }
+    vec.push_back(std::move(entry));
+    if (vec.size() > 256)
+    {
+        auto min_it = std::min_element(vec.begin(), vec.end(), [](const hot_va_entry_t& a, const hot_va_entry_t& b) {
+            return a.hit_count < b.hit_count;
+        });
+        vec.erase(min_it);
+    }
+}
+
+std::vector<hot_va_entry_t> list_hot_vas(std::uint32_t pid)
+{
+    std::lock_guard<std::mutex> lock(store_mutex());
+    auto it = hot_vas().find(pid);
+    if (it == hot_vas().end())
+        return {};
+    return it->second;
+}
+
+void clear_hot_vas(std::uint32_t pid)
+{
+    std::lock_guard<std::mutex> lock(store_mutex());
+    hot_vas().erase(pid);
+}
+
+void update_hot_va(const hot_va_entry_t& entry)
+{
+    std::lock_guard<std::mutex> lock(store_mutex());
+    auto& vec = hot_vas()[entry.pid];
+    auto it = std::find_if(vec.begin(), vec.end(), [&](const hot_va_entry_t& e) {
+        return e.va == entry.va && e.slot == entry.slot;
+    });
+    if (it != vec.end())
+        *it = entry;
+    else
+    {
+        vec.push_back(entry);
+        if (vec.size() > 256)
+        {
+            auto min_it = std::min_element(vec.begin(), vec.end(), [](const hot_va_entry_t& a, const hot_va_entry_t& b) {
+                return a.hit_count < b.hit_count;
+            });
+            vec.erase(min_it);
+        }
+    }
+}
+
+void add_cbuffer_classification(cbuffer_classification_t classification)
+{
+    std::lock_guard<std::mutex> lock(store_mutex());
+    auto& vec = cbuffer_classifications()[classification.pid];
+    auto it = std::find_if(vec.begin(), vec.end(), [&](const cbuffer_classification_t& e) {
+        return e.va == classification.va;
+    });
+    if (it != vec.end())
+        *it = classification;
+    else
+        vec.push_back(std::move(classification));
+}
+
+std::vector<cbuffer_classification_t> list_cbuffer_classifications(std::uint32_t pid)
+{
+    std::lock_guard<std::mutex> lock(store_mutex());
+    auto it = cbuffer_classifications().find(pid);
+    if (it == cbuffer_classifications().end())
+        return {};
+    return it->second;
+}
+
+void clear_cbuffer_classifications(std::uint32_t pid)
+{
+    std::lock_guard<std::mutex> lock(store_mutex());
+    cbuffer_classifications().erase(pid);
 }
 }

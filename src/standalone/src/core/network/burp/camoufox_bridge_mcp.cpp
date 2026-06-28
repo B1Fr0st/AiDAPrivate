@@ -2430,7 +2430,8 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
         const std::string request_url = json_string_param(args, "url", json_string_param(params, "url", std::string()));
         const url_log_t request_url_log = summarize_url_for_log(request_url);
         const url_log_t active_url = summarize_url_for_log(before.active_page_url);
-        diag::log_tagged_fmt("mcp_burp", "browser_navigation phase=before_call_tool session_id=%s page_id=%s active_page_id=%s request_host=%s request_path=%s request_query=%d request_url_len=%zu active_host=%s active_path=%s wait_until=%s timeout_ms=%d capture_from_start=%d capture_body=%d publish_to_burp=%d publish_explicit=%d local_fixture=%d diagnostic=%d capture_pattern=%s args_shape=%s bridge_state=%s child_pid=%lu child_alive=%d page_verified=%d",
+        const int args_timeout = json_int_param(args, "timeout", -1);
+        diag::log_tagged_fmt("mcp_burp", "browser_navigation phase=before_call_tool session_id=%s page_id=%s active_page_id=%s request_host=%s request_path=%s request_query=%d request_url_len=%zu active_host=%s active_path=%s wait_until=%s timeout_ms=%d args_timeout=%d capture_from_start=%d capture_body=%d publish_to_burp=%d publish_explicit=%d local_fixture=%d diagnostic=%d capture_pattern=%s args_shape=%s bridge_state=%s child_pid=%lu child_alive=%d page_verified=%d",
             session_id.c_str(),
             page_id.empty() ? "<empty>" : page_id.c_str(),
             before.active_page_id.empty() ? "<empty>" : before.active_page_id.c_str(),
@@ -2442,6 +2443,7 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
             active_url.path.c_str(),
             wait_until.empty() ? "<empty>" : wait_until.c_str(),
             timeout_ms,
+            args_timeout,
             navigation_capture_from_start ? 1 : 0,
             navigation_capture_body ? 1 : 0,
             navigation_publish_to_burp ? 1 : 0,
@@ -2808,6 +2810,47 @@ tool_result_t dispatch_camoufox_browser_group(
         return tool_launch_browser(forwarded);
     if (std::string(action_spec->internal_tool) == "close_browser")
         return tool_close_browser(forwarded);
+
+    const std::string internal_tool_name = action_spec->internal_tool ? action_spec->internal_tool : "";
+    const bool needs_timeout_propagation =
+        internal_tool_name == "navigate" ||
+        internal_tool_name == "reload" ||
+        internal_tool_name == "wait_for" ||
+        internal_tool_name == "diagnose_navigation" ||
+        internal_tool_name == "diagnose_bloxflip_matrix";
+    if (needs_timeout_propagation)
+    {
+        const bool caller_supplied_params_timeout = params.is_object() && params.contains("timeout") && params["timeout"].is_number();
+        const bool caller_supplied_forwarded_timeout = forwarded.is_object() && forwarded.contains("timeout") && forwarded["timeout"].is_number();
+        if (!caller_supplied_params_timeout && !caller_supplied_forwarded_timeout)
+        {
+            int synthesised_timeout_ms = action_spec->default_timeout_ms - 5000;
+            if (synthesised_timeout_ms < 1000)
+                synthesised_timeout_ms = 1000;
+            forwarded["timeout"] = synthesised_timeout_ms;
+            diag::log_tagged_fmt("mcp_burp",
+                "dispatch_camoufox_browser_group timeout_synthesised group=%s action=%s tool=%s default_timeout_ms=%d synthesised_timeout_ms=%d source=action_default",
+                group_name,
+                action.c_str(),
+                internal_tool_name.c_str(),
+                action_spec->default_timeout_ms,
+                synthesised_timeout_ms);
+        }
+        else
+        {
+            const int caller_timeout = caller_supplied_forwarded_timeout
+                ? json_int_param(forwarded, "timeout", 0)
+                : json_int_param(params, "timeout", 0);
+            diag::log_tagged_fmt("mcp_burp",
+                "dispatch_camoufox_browser_group timeout_caller_supplied group=%s action=%s tool=%s default_timeout_ms=%d caller_timeout_ms=%d source=%s",
+                group_name,
+                action.c_str(),
+                internal_tool_name.c_str(),
+                action_spec->default_timeout_ms,
+                caller_timeout,
+                caller_supplied_forwarded_timeout ? "forwarded" : "params");
+        }
+    }
 
     tool_result_t out = tool_camoufox_passthrough(
         action_spec->internal_tool,

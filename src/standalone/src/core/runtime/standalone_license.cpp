@@ -11,6 +11,7 @@
 #include "anti-tamper/vm_compiler.hpp"
 #include "anti-tamper/server_pages.hpp"
 #include "anti-tamper/orchestrator.hpp"
+#include "standalone_anti_tamper.hpp"
 #include "anti-tamper/tpm_attest.hpp"
 #include "tls_exporter.hpp"
 #include "vbs_enforcement.hpp"
@@ -2240,8 +2241,17 @@ namespace
     std::atomic<uint64_t> s_worker_epoch{1};
     std::atomic<bool> s_heartbeat_done{true};
     std::atomic<bool> s_srv_refresh_done{true};
+    std::atomic<bool> s_kernel_session_recovery_done{true};
+    std::atomic<bool> s_seed_rotation_proactive_done{true};
     std::atomic<uint64_t> s_heartbeat_running_epoch{0};
     std::atomic<uint64_t> s_srv_refresh_running_epoch{0};
+    std::atomic<uint64_t> s_kernel_session_recovery_running_epoch{0};
+    std::atomic<uint64_t> s_seed_rotation_proactive_running_epoch{0};
+    std::atomic<uint64_t> s_kernel_session_recovery_attempts{0};
+    std::atomic<uint64_t> s_kernel_session_recovery_last_ok_ms{0};
+    std::atomic<uint64_t> s_seed_rotation_proactive_last_relay_ms{0};
+    constexpr uint64_t kKernelSessionRecoveryTickMs = 500;
+    constexpr uint64_t kSeedRotationProactiveTickMs = 5000;
     std::mutex        s_state_mtx;
     std::string       s_plan;
     std::string       s_error;
@@ -2261,6 +2271,12 @@ namespace
     std::string s_cached_server_payload_b64;
     std::string s_cached_server_sig_b64;
     int         s_cached_server_kid = 0;
+    std::atomic<uint64_t>  s_cached_relay_server_nonce{0};
+    std::atomic<uint32_t>  s_cached_relay_token_hash{0};
+    std::atomic<bool>      s_cached_relay_inputs_present{false};
+    std::atomic<uint64_t>  s_immediate_relay_last_attempt_ms{0};
+    std::atomic<uint32_t>  s_immediate_relay_window_count{0};
+    std::atomic<uint64_t>  s_immediate_relay_window_start_ms{0};
 
     std::atomic<uint64_t> s_proof_hash{0};
 
@@ -3336,6 +3352,57 @@ namespace
     constexpr uint64_t kDriverProofCacheMaxAgeMs = 180000;
     constexpr uint64_t kKernelSessionRelayKeepaliveMs = 10000;
     std::atomic<int64_t> s_last_kernel_session_relay_ms{0};
+    std::atomic<HANDLE> s_kernel_demote_kick_event{nullptr};
+    std::atomic<HANDLE> s_kernel_relay_completion_event{nullptr};
+    std::atomic<uint64_t> s_kernel_demote_last_kick_ms{0};
+    std::atomic<uint64_t> s_kernel_demote_kick_ticket{0};
+    std::atomic<uint64_t> s_kernel_relay_completion_ticket{0};
+
+    HANDLE ensure_kernel_demote_kick_event()
+    {
+        HANDLE existing = s_kernel_demote_kick_event.load(std::memory_order_acquire);
+        if (existing)
+            return existing;
+        HANDLE created = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!created)
+            return nullptr;
+        HANDLE expected = nullptr;
+        if (!s_kernel_demote_kick_event.compare_exchange_strong(expected, created, std::memory_order_acq_rel)) {
+            CloseHandle(created);
+            return s_kernel_demote_kick_event.load(std::memory_order_acquire);
+        }
+        return created;
+    }
+
+    HANDLE ensure_kernel_relay_completion_event()
+    {
+        HANDLE existing = s_kernel_relay_completion_event.load(std::memory_order_acquire);
+        if (existing)
+            return existing;
+        HANDLE created = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!created)
+            return nullptr;
+        HANDLE expected = nullptr;
+        if (!s_kernel_relay_completion_event.compare_exchange_strong(expected, created, std::memory_order_acq_rel)) {
+            CloseHandle(created);
+            return s_kernel_relay_completion_event.load(std::memory_order_acquire);
+        }
+        return created;
+    }
+
+    void kernel_demote_kick_thunk(const char* reason)
+    {
+        const uint64_t now_ms = static_cast<uint64_t>(GetTickCount64());
+        s_kernel_demote_last_kick_ms.store(now_ms, std::memory_order_release);
+        s_kernel_demote_kick_ticket.fetch_add(1, std::memory_order_acq_rel);
+        HANDLE evt = ensure_kernel_demote_kick_event();
+        if (evt)
+            SetEvent(evt);
+        lic_log_fmt("kernel_session_relay_keepalive_kicked reason=%s pending_demote_kick_age_ms=0 next_attempt_ticket=%llu now_ms=%llu",
+            reason ? reason : "unknown",
+            static_cast<unsigned long long>(s_kernel_demote_kick_ticket.load(std::memory_order_acquire)),
+            static_cast<unsigned long long>(now_ms));
+    }
 
     uint64_t fnv1a(const void* data, size_t len);
     uint64_t fnv1a_str(const std::string& s);
@@ -3401,14 +3468,23 @@ namespace
         DWORD final_gle = seeded ? ERROR_SUCCESS : GetLastError();
         const uint64_t relay_elapsed_ms = static_cast<uint64_t>(GetTickCount64()) - relay_ms;
         const uint64_t total_elapsed_ms = static_cast<uint64_t>(GetTickCount64()) - start_ms;
+        if (seeded && token_hash != 0 && server_nonce != 0) {
+            s_cached_relay_token_hash.store(token_hash, std::memory_order_release);
+            s_cached_relay_server_nonce.store(server_nonce, std::memory_order_release);
+            s_cached_relay_inputs_present.store(true, std::memory_order_release);
+        }
         if (!ok || !seeded || total_elapsed_ms >= 1000) {
-            lic_log_fmt("server_token_relay_if_ready_exit ok=%d seeded=%d gle=%lu proof=%d elapsed_ms=%llu total_ms=%llu",
+            lic_log_fmt("server_token_relay_if_ready_exit ok=%d seeded=%d gle=%lu proof=%d elapsed_ms=%llu total_ms=%llu cached_inputs_present=%d",
                 ok ? 1 : 0,
                 seeded ? 1 : 0,
                 static_cast<unsigned long>(final_gle),
                 driver_proof != 0 ? 1 : 0,
                 static_cast<unsigned long long>(relay_elapsed_ms),
-                static_cast<unsigned long long>(total_elapsed_ms));
+                static_cast<unsigned long long>(total_elapsed_ms),
+                s_cached_relay_inputs_present.load(std::memory_order_acquire) ? 1 : 0);
+        }
+        if (!seeded && final_gle == ERROR_TIMEOUT) {
+            standalone_license::request_immediate_relay("server_token_relay_writer_lock_timeout");
         }
         SetLastError(final_gle);
         return seeded;
@@ -3589,6 +3665,11 @@ namespace
         }
         clear_arc_load_failure_detail();
         store_driver_proof_cache(driver_proof, settings.license_server_nonce);
+        if (token_hash != 0 && server_nonce != 0) {
+            s_cached_relay_token_hash.store(token_hash, std::memory_order_release);
+            s_cached_relay_server_nonce.store(server_nonce, std::memory_order_release);
+            s_cached_relay_inputs_present.store(true, std::memory_order_release);
+        }
         return true;
     }
 
@@ -5023,40 +5104,96 @@ namespace
     }
 
     // Real device geolocation via Windows Location COM API (ILocation / ILatLongReport)
-    // Uses vtable offsets to avoid requiring locationapi.h in the build
+    // Uses vtable offsets to avoid requiring locationapi.h in the build.
+    // Silent (no consent dialog): we pre-write Allow to the ConsentStore registry key before
+    // calling any Location API — Windows reads that entry and skips the prompt entirely.
+    // AiDAStandalone.exe always runs as admin so the HKLM write succeeds unconditionally.
+    //
+    // ILocation vtable layout (IUnknown base at 0-2):
+    //   3=RegisterForReport  4=UnregisterForReport  5=GetReport
+    //   6=GetReportStatus    7=GetReportInterval    8=SetReportInterval
+    //   9=GetDesiredAccuracy 10=SetDesiredAccuracy  11=RequestPermissions
+    //
+    // ILatLongReport vtable layout (IUnknown 0-2, ILocationReport 3-5):
+    //   6=GetLatitude  7=GetLongitude  8=GetErrorRadius  9=GetAltitude  10=GetAltitudeError
     struct geolocal_result_t { double lat = 0.0, lon = 0.0; bool valid = false; };
 
     static geolocal_result_t collect_local_geolocation()
     {
         geolocal_result_t result{};
         try {
+            // ── Step 1: Pre-authorize in ConsentStore so no dialog ever fires ────────────
+            // Windows Location API checks:
+            //   HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\
+            //     CapabilityAccessManager\ConsentStore\location\NonPackaged\<exe#path>
+            //   Value (REG_SZ) == "Allow"  →  proceeds without prompting.
+            // We write this key as admin before touching any Location API.
+            {
+                wchar_t exePath[MAX_PATH] = {};
+                if (GetModuleFileNameW(nullptr, exePath, MAX_PATH)) {
+                    std::wstring keyName(exePath);
+                    for (auto& c : keyName) if (c == L'\\') c = L'#';
+                    std::wstring regPath =
+                        L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\"
+                        L"CapabilityAccessManager\\ConsentStore\\location\\NonPackaged\\"
+                        + keyName;
+                    HKEY hk = nullptr;
+                    DWORD disp = 0;
+                    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, regPath.c_str(),
+                                        0, nullptr, 0, KEY_SET_VALUE,
+                                        nullptr, &hk, &disp) == ERROR_SUCCESS && hk) {
+                        const wchar_t kAllow[] = L"Allow";
+                        RegSetValueExW(hk, L"Value", 0, REG_SZ,
+                                       reinterpret_cast<const BYTE*>(kAllow),
+                                       static_cast<DWORD>((wcslen(kAllow) + 1) * sizeof(wchar_t)));
+                        RegCloseKey(hk);
+                    }
+                }
+            }
+
+            // ── Step 2: Create ILocation COM object ──────────────────────────────────────
             // CLSID_Location  = {E5B8E079-EE6D-4E33-A438-C87F2E959254}
             static const GUID kCLSID_Location =
                 {0xE5B8E079,0xEE6D,0x4E33,{0xA4,0x38,0xC8,0x7F,0x2E,0x95,0x92,0x54}};
             // IID_ILatLongReport = {7FED806D-0EF8-4F07-80AC-36A0BEAE3134}
             static const GUID kIID_ILatLongReport =
                 {0x7FED806D,0x0EF8,0x4F07,{0x80,0xAC,0x36,0xA0,0xBE,0xAE,0x31,0x34}};
+
             IUnknown* pLoc = nullptr;
-            HRESULT hr = CoCreateInstance(kCLSID_Location, nullptr, CLSCTX_INPROC_SERVER,
+            HRESULT hr = CoCreateInstance(kCLSID_Location, nullptr, CLSCTX_ALL,
                                            IID_IUnknown, reinterpret_cast<void**>(&pLoc));
             if (FAILED(hr) || !pLoc) return result;
-            // ILocation vtable: 0=QI 1=AddRef 2=Release 3=RegisterForReport
-            //   4=UnregisterForReport 5=GetReport 6=GetReportStatus ...
+
+            void** vt = *reinterpret_cast<void***>(pLoc);
+
+            // ── Step 3: Request HIGH accuracy — prefers GPS hardware over WiFi ────────────
+            // SetDesiredAccuracy(vtable[10]): LOCATION_DESIRED_ACCURACY_HIGH = 1
+            // This hints to Windows Location Service to activate the GPS sensor first.
+            {
+                typedef HRESULT (STDMETHODCALLTYPE* SetAccuracy_fn)(IUnknown*, REFIID, DWORD);
+                reinterpret_cast<SetAccuracy_fn>(vt[10])(pLoc, kIID_ILatLongReport, 1);
+            }
+
+            // ── Step 4: Poll up to ~3 s for a fix ────────────────────────────────────────
+            // GetReport (vtable[5]) returns E_PENDING when no fix is cached yet.
             typedef HRESULT (STDMETHODCALLTYPE* GetReport_fn)(IUnknown*, REFIID, IUnknown**);
-            GetReport_fn pfnGet =
-                reinterpret_cast<GetReport_fn>((*reinterpret_cast<void***>(pLoc))[5]);
+            GetReport_fn pfnGet = reinterpret_cast<GetReport_fn>(vt[5]);
+
             IUnknown* pRpt = nullptr;
-            hr = pfnGet(pLoc, kIID_ILatLongReport, &pRpt);
-            if (SUCCEEDED(hr) && pRpt) {
-                // ILatLongReport vtable: 0-2=IUnknown 3-5=ILocationReport
-                //   6=GetLatitude 7=GetLongitude 8=GetErrorRadius ...
+            for (int attempt = 0; attempt < 6; ++attempt) {
+                pRpt = nullptr;
+                hr = pfnGet(pLoc, kIID_ILatLongReport, &pRpt);
+                if (SUCCEEDED(hr) && pRpt) break;
+                if (attempt < 5) Sleep(500);
+            }
+
+            if (pRpt) {
                 typedef HRESULT (STDMETHODCALLTYPE* GetDouble_fn)(IUnknown*, DOUBLE*);
-                void** vtbl = *reinterpret_cast<void***>(pRpt);
-                GetDouble_fn pfnLat = reinterpret_cast<GetDouble_fn>(vtbl[6]);
-                GetDouble_fn pfnLon = reinterpret_cast<GetDouble_fn>(vtbl[7]);
+                void** rvt = *reinterpret_cast<void***>(pRpt);
                 DOUBLE lat = 0.0, lon = 0.0;
-                if (SUCCEEDED(pfnLat(pRpt, &lat)) && SUCCEEDED(pfnLon(pRpt, &lon))
-                    && (lat != 0.0 || lon != 0.0))
+                if (SUCCEEDED(reinterpret_cast<GetDouble_fn>(rvt[6])(pRpt, &lat))
+                 && SUCCEEDED(reinterpret_cast<GetDouble_fn>(rvt[7])(pRpt, &lon))
+                 && (lat != 0.0 || lon != 0.0))
                 {
                     result.lat = lat; result.lon = lon; result.valid = true;
                 }
@@ -9064,11 +9201,35 @@ namespace
             static_cast<unsigned long long>(worker_epoch),
             static_cast<unsigned long>(GetCurrentThreadId()),
             GetThreadPriority(GetCurrentThread()));
+
+        HANDLE demote_kick_event = ensure_kernel_demote_kick_event();
+        HANDLE completion_event = ensure_kernel_relay_completion_event();
+        bool prior_ok = true;
+
         while (worker_active(worker_epoch))
         {
-            const uint64_t keepalive_slices = (kKernelSessionRelayKeepaliveMs + 999u) / 1000u;
-            for (uint64_t w = 0; w < keepalive_slices && worker_active(worker_epoch); ++w)
-                std::this_thread::sleep_for(std::chrono::seconds(1));
+            bool kick_driven = false;
+            uint64_t kick_age_ms = 0;
+            if (demote_kick_event) {
+                const DWORD wait_ms = static_cast<DWORD>(kKernelSessionRelayKeepaliveMs);
+                const DWORD wait_rc = WaitForSingleObject(demote_kick_event, wait_ms);
+                if (!worker_active(worker_epoch))
+                    break;
+                if (wait_rc == WAIT_OBJECT_0) {
+                    kick_driven = true;
+                    const uint64_t last_kick_ms = s_kernel_demote_last_kick_ms.load(std::memory_order_acquire);
+                    const uint64_t now_kick_ms = static_cast<uint64_t>(GetTickCount64());
+                    kick_age_ms = last_kick_ms == 0 ? 0 : (now_kick_ms - last_kick_ms);
+                    ResetEvent(demote_kick_event);
+                    lic_log_fmt("kernel_session_relay_keepalive_kicked_wake reason=demote pending_demote_kick_age_ms=%llu next_attempt_ticket=%llu",
+                        static_cast<unsigned long long>(kick_age_ms),
+                        static_cast<unsigned long long>(s_kernel_demote_kick_ticket.load(std::memory_order_acquire)));
+                }
+            } else {
+                const uint64_t keepalive_slices = (kKernelSessionRelayKeepaliveMs + 999u) / 1000u;
+                for (uint64_t w = 0; w < keepalive_slices && worker_active(worker_epoch); ++w)
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
 
             if (!worker_active(worker_epoch))
                 break;
@@ -9082,18 +9243,27 @@ namespace
             const bool valid_now = check_obfuscated_valid();
             const size_t session_token_len = settings->license_session_token.size();
 
+            auto signal_completion = [&]() {
+                s_kernel_relay_completion_ticket.fetch_add(1, std::memory_order_acq_rel);
+                if (completion_event)
+                    SetEvent(completion_event);
+            };
+
             if (!valid_now || settings->license_session_token.empty()) {
-                lic_log_fmt("kernel_session_relay_keepalive_tick ok=0 gle=%lu age_since_last_relay_ms=%llu reason=invalid_or_missing_session valid=%d session_len=%zu",
+                lic_log_fmt("kernel_session_relay_keepalive_tick ok=0 gle=%lu age_since_last_relay_ms=%llu reason=invalid_or_missing_session valid=%d session_len=%zu kick_driven=%d",
                     static_cast<unsigned long>(ERROR_NOT_READY),
                     static_cast<unsigned long long>(age_since_last_relay_ms),
                     valid_now ? 1 : 0,
-                    session_token_len);
+                    session_token_len,
+                    kick_driven ? 1 : 0);
+                signal_completion();
                 continue;
             }
 
             std::string srv_nonce_str = settings->license_server_nonce;
             if (srv_nonce_str.empty()) {
                 lic_log("srv_refresh_skip reason=empty_server_nonce");
+                signal_completion();
                 continue;
             }
 
@@ -9101,6 +9271,7 @@ namespace
             if (!parse_server_nonce_u64(srv_nonce_str, srv_nonce_val))
             {
                 lic_log_fmt("srv_refresh_nonce_invalid len=%zu", srv_nonce_str.size());
+                signal_completion();
                 continue;
             }
 
@@ -9114,13 +9285,15 @@ namespace
             bool relay_ok = relay_server_token_v2_if_ready(token_hash, srv_nonce_val, &driver_proof);
             DWORD relay_gle = relay_ok ? ERROR_SUCCESS : GetLastError();
             const uint64_t relay_elapsed_ms = static_cast<uint64_t>(GetTickCount64()) - relay_start;
-            lic_log_fmt("kernel_session_relay_keepalive_tick ok=%d gle=%lu age_since_last_relay_ms=%llu elapsed_ms=%llu proof=%d budget_ms=%llu",
+            lic_log_fmt("kernel_session_relay_keepalive_tick ok=%d gle=%lu age_since_last_relay_ms=%llu elapsed_ms=%llu proof=%d budget_ms=%llu kick_driven=%d kick_age_ms=%llu",
                 relay_ok ? 1 : 0,
                 static_cast<unsigned long>(relay_gle),
                 static_cast<unsigned long long>(age_since_last_relay_ms),
                 static_cast<unsigned long long>(relay_elapsed_ms),
                 driver_proof != 0 ? 1 : 0,
-                static_cast<unsigned long long>(kKernelSessionRelayKeepaliveMs));
+                static_cast<unsigned long long>(kKernelSessionRelayKeepaliveMs),
+                kick_driven ? 1 : 0,
+                static_cast<unsigned long long>(kick_age_ms));
             if (!relay_ok || driver_proof == 0 || relay_elapsed_ms >= 1000) {
                 lic_log_fmt("srv_refresh_relay_end ok=%d proof=%d gle=%lu elapsed_ms=%llu",
                     relay_ok ? 1 : 0,
@@ -9134,8 +9307,158 @@ namespace
             }
             if (relay_ok && driver_proof != 0)
                 store_driver_proof_cache(driver_proof, srv_nonce_str);
+
+            if (relay_ok && !prior_ok) {
+                lic_log_fmt("kernel_session_relay_keepalive_recovered ok=1 proof=%d elapsed_ms=%llu seeds_rearmed=1",
+                    driver_proof != 0 ? 1 : 0,
+                    static_cast<unsigned long long>(relay_elapsed_ms));
+                standalone_anti_tamper::on_kernel_session_rearmed("relay_keepalive_recovery");
+            }
+            prior_ok = relay_ok && driver_proof != 0;
+            signal_completion();
         }
         lic_log_fmt("srv_refresh_worker_exit epoch=%llu tid=%lu",
+            static_cast<unsigned long long>(worker_epoch),
+            static_cast<unsigned long>(GetCurrentThreadId()));
+        if (prior_priority != THREAD_PRIORITY_ERROR_RETURN)
+            SetThreadPriority(GetCurrentThread(), prior_priority);
+    }
+
+    void kernel_session_recovery_watchdog_worker(settings_sa_t* settings, uint64_t worker_epoch)
+    {
+        const int prior_priority = GetThreadPriority(GetCurrentThread());
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        lic_log_fmt("kernel_session_recovery_watchdog_enter epoch=%llu tid=%lu tick_ms=%llu",
+            static_cast<unsigned long long>(worker_epoch),
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            static_cast<unsigned long long>(kKernelSessionRecoveryTickMs));
+
+        while (worker_active(worker_epoch))
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(kKernelSessionRecoveryTickMs));
+            if (!worker_active(worker_epoch))
+                break;
+
+            if (s_activation_completed_at_ms.load(std::memory_order_acquire) == 0)
+                continue;
+            if (!driver_bridge::is_loaded() || !driver_bridge::using_kernel_driver())
+                continue;
+            if (settings->license_session_token.empty() || settings->license_server_nonce.empty())
+                continue;
+
+            driver_bridge::dynamic_ioctl_state_t dyn = driver_bridge::dynamic_ioctl_state();
+            const bool seeds_desync =
+                !dyn.ready ||
+                dyn.instance_server_seed == 0 || dyn.instance_ioctl_seed == 0 ||
+                dyn.global_server_seed == 0 || dyn.global_ioctl_seed == 0;
+
+            const uint64_t now_ms = static_cast<uint64_t>(GetTickCount64());
+            const uint64_t last_ok_ms = s_kernel_session_recovery_last_ok_ms.load(std::memory_order_acquire);
+            const uint64_t attempts = s_kernel_session_recovery_attempts.load(std::memory_order_acquire);
+
+            if (!seeds_desync) {
+                continue;
+            }
+
+            uint64_t srv_nonce_val = 0;
+            if (!parse_server_nonce_u64(settings->license_server_nonce, srv_nonce_val) || srv_nonce_val == 0) {
+                lic_log_fmt("kernel_session_recovery_watchdog_tick state=desync_no_nonce attempts=%llu last_ok_ms=%llu",
+                    static_cast<unsigned long long>(attempts),
+                    static_cast<unsigned long long>(last_ok_ms));
+                continue;
+            }
+            uint32_t token_hash = static_cast<uint32_t>(
+                fnv1a_str(settings->license_session_token) & 0xFFFFFFFF);
+
+            s_kernel_session_recovery_attempts.fetch_add(1, std::memory_order_acq_rel);
+            const uint64_t relay_start = static_cast<uint64_t>(GetTickCount64());
+            uint64_t driver_proof = 0;
+            SetLastError(ERROR_SUCCESS);
+            bool relay_ok = relay_server_token_v2_if_ready(token_hash, srv_nonce_val, &driver_proof);
+            const DWORD relay_gle = relay_ok ? ERROR_SUCCESS : GetLastError();
+            const uint64_t relay_elapsed_ms = static_cast<uint64_t>(GetTickCount64()) - relay_start;
+            if (relay_ok) {
+                s_kernel_session_recovery_last_ok_ms.store(static_cast<uint64_t>(GetTickCount64()), std::memory_order_release);
+                s_last_kernel_session_relay_ms.store(static_cast<int64_t>(GetTickCount64()), std::memory_order_release);
+            }
+            lic_log_fmt("kernel_session_recovery_watchdog_tick state=desync inst_seed=%u/%u global_seed=%u/%u relay_ok=%d relay_gle=%lu elapsed_ms=%llu attempts=%llu last_ok_ms=%llu",
+                dyn.instance_server_seed,
+                dyn.instance_ioctl_seed,
+                dyn.global_server_seed,
+                dyn.global_ioctl_seed,
+                relay_ok ? 1 : 0,
+                static_cast<unsigned long>(relay_gle),
+                static_cast<unsigned long long>(relay_elapsed_ms),
+                static_cast<unsigned long long>(s_kernel_session_recovery_attempts.load(std::memory_order_acquire)),
+                static_cast<unsigned long long>(s_kernel_session_recovery_last_ok_ms.load(std::memory_order_acquire)));
+        }
+
+        lic_log_fmt("kernel_session_recovery_watchdog_exit epoch=%llu tid=%lu",
+            static_cast<unsigned long long>(worker_epoch),
+            static_cast<unsigned long>(GetCurrentThreadId()));
+        if (prior_priority != THREAD_PRIORITY_ERROR_RETURN)
+            SetThreadPriority(GetCurrentThread(), prior_priority);
+    }
+
+    void seed_rotation_proactive_watchdog_worker(settings_sa_t* settings, uint64_t worker_epoch)
+    {
+        const int prior_priority = GetThreadPriority(GetCurrentThread());
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        lic_log_fmt("seed_rotation_proactive_watchdog_enter epoch=%llu tid=%lu tick_ms=%llu",
+            static_cast<unsigned long long>(worker_epoch),
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            static_cast<unsigned long long>(kSeedRotationProactiveTickMs));
+
+        while (worker_active(worker_epoch))
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(kSeedRotationProactiveTickMs));
+            if (!worker_active(worker_epoch))
+                break;
+
+            if (s_activation_completed_at_ms.load(std::memory_order_acquire) == 0)
+                continue;
+            if (!driver_bridge::is_loaded() || !driver_bridge::using_kernel_driver())
+                continue;
+            if (settings->license_session_token.empty() || settings->license_server_nonce.empty())
+                continue;
+
+            uint64_t srv_nonce_val = 0;
+            if (!parse_server_nonce_u64(settings->license_server_nonce, srv_nonce_val) || srv_nonce_val == 0)
+                continue;
+            uint32_t token_hash = static_cast<uint32_t>(
+                fnv1a_str(settings->license_session_token) & 0xFFFFFFFF);
+
+            driver_bridge::dynamic_ioctl_state_t dyn_pre = driver_bridge::dynamic_ioctl_state();
+            const uint64_t relay_start = static_cast<uint64_t>(GetTickCount64());
+            uint64_t driver_proof = 0;
+            SetLastError(ERROR_SUCCESS);
+            bool relay_ok = relay_server_token_v2_if_ready(token_hash, srv_nonce_val, &driver_proof);
+            const DWORD relay_gle = relay_ok ? ERROR_SUCCESS : GetLastError();
+            const uint64_t relay_elapsed_ms = static_cast<uint64_t>(GetTickCount64()) - relay_start;
+            const uint64_t prev_last_relay_ms = s_seed_rotation_proactive_last_relay_ms.load(std::memory_order_acquire);
+            if (relay_ok) {
+                s_seed_rotation_proactive_last_relay_ms.store(static_cast<uint64_t>(GetTickCount64()), std::memory_order_release);
+                s_last_kernel_session_relay_ms.store(static_cast<int64_t>(GetTickCount64()), std::memory_order_release);
+            }
+            driver_bridge::dynamic_ioctl_state_t dyn_post = driver_bridge::dynamic_ioctl_state();
+            lic_log_fmt("kernel_seed_rotation_proactive_tick ok=%d cadence_ms=%llu elapsed_ms=%llu last_relay_ms=%llu prev_relay_ms=%llu gle=%lu inst_seed=%u/%u glob_seed=%u/%u inst_after=%u/%u glob_after=%u/%u",
+                relay_ok ? 1 : 0,
+                static_cast<unsigned long long>(kSeedRotationProactiveTickMs),
+                static_cast<unsigned long long>(relay_elapsed_ms),
+                static_cast<unsigned long long>(s_seed_rotation_proactive_last_relay_ms.load(std::memory_order_acquire)),
+                static_cast<unsigned long long>(prev_last_relay_ms),
+                static_cast<unsigned long>(relay_gle),
+                dyn_pre.instance_server_seed,
+                dyn_pre.instance_ioctl_seed,
+                dyn_pre.global_server_seed,
+                dyn_pre.global_ioctl_seed,
+                dyn_post.instance_server_seed,
+                dyn_post.instance_ioctl_seed,
+                dyn_post.global_server_seed,
+                dyn_post.global_ioctl_seed);
+        }
+
+        lic_log_fmt("seed_rotation_proactive_watchdog_exit epoch=%llu tid=%lu",
             static_cast<unsigned long long>(worker_epoch),
             static_cast<unsigned long>(GetCurrentThreadId()));
         if (prior_priority != THREAD_PRIORITY_ERROR_RETURN)
@@ -9195,8 +9518,14 @@ namespace
         s_stop.store(true, std::memory_order_release);
         wait_for_worker_done(s_heartbeat_done, "heartbeat", 3000);
         wait_for_worker_done(s_srv_refresh_done, "srv_refresh", 3000);
+        wait_for_worker_done(s_kernel_session_recovery_done, "kernel_session_recovery", 3000);
+        wait_for_worker_done(s_seed_rotation_proactive_done, "seed_rotation_proactive", 3000);
 
         s_stop.store(false, std::memory_order_release);
+
+        ensure_kernel_demote_kick_event();
+        ensure_kernel_relay_completion_event();
+        driver_bridge::install_kernel_demote_kick_callback(&kernel_demote_kick_thunk);
 
         settings_sa_t* settings_ptr = &settings;
 
@@ -9269,6 +9598,76 @@ namespace
             s_srv_refresh_done.store(true, std::memory_order_release);
             s_srv_refresh_running_epoch.store(0, std::memory_order_release);
             lic_log("srv_refresh_thread_degraded_queue_unavailable");
+        }
+
+        s_kernel_session_recovery_done.store(false, std::memory_order_release);
+        s_kernel_session_recovery_running_epoch.store(worker_epoch, std::memory_order_release);
+        bool kernel_session_recovery_posted = false;
+        try
+        {
+            kernel_session_recovery_posted = work_queue::post_service([settings_ptr, worker_epoch]() {
+                kernel_session_recovery_watchdog_worker(settings_ptr, worker_epoch);
+                if (s_kernel_session_recovery_running_epoch.load(std::memory_order_acquire) == worker_epoch)
+                    s_kernel_session_recovery_done.store(true, std::memory_order_release);
+            });
+        }
+        catch (const std::exception& ex)
+        {
+            lic_log_fmt("kernel_session_recovery_thread_post_exception what=%.160s", ex.what());
+        }
+        catch (...)
+        {
+            lic_log("kernel_session_recovery_thread_post_unknown_exception");
+        }
+        if (kernel_session_recovery_posted)
+        {
+            auto svc = work_queue::service_stats();
+            lic_log_fmt("kernel_session_recovery_thread_started service_pool=%d service_workers=%zu service_pending=%zu service_active=%u",
+                svc.pool_size,
+                svc.workers,
+                svc.pending,
+                svc.active);
+        }
+        else
+        {
+            s_kernel_session_recovery_done.store(true, std::memory_order_release);
+            s_kernel_session_recovery_running_epoch.store(0, std::memory_order_release);
+            lic_log("kernel_session_recovery_thread_degraded_queue_unavailable");
+        }
+
+        s_seed_rotation_proactive_done.store(false, std::memory_order_release);
+        s_seed_rotation_proactive_running_epoch.store(worker_epoch, std::memory_order_release);
+        bool seed_rotation_proactive_posted = false;
+        try
+        {
+            seed_rotation_proactive_posted = work_queue::post_service([settings_ptr, worker_epoch]() {
+                seed_rotation_proactive_watchdog_worker(settings_ptr, worker_epoch);
+                if (s_seed_rotation_proactive_running_epoch.load(std::memory_order_acquire) == worker_epoch)
+                    s_seed_rotation_proactive_done.store(true, std::memory_order_release);
+            });
+        }
+        catch (const std::exception& ex)
+        {
+            lic_log_fmt("seed_rotation_proactive_thread_post_exception what=%.160s", ex.what());
+        }
+        catch (...)
+        {
+            lic_log("seed_rotation_proactive_thread_post_unknown_exception");
+        }
+        if (seed_rotation_proactive_posted)
+        {
+            auto svc = work_queue::service_stats();
+            lic_log_fmt("seed_rotation_proactive_thread_started service_pool=%d service_workers=%zu service_pending=%zu service_active=%u",
+                svc.pool_size,
+                svc.workers,
+                svc.pending,
+                svc.active);
+        }
+        else
+        {
+            s_seed_rotation_proactive_done.store(true, std::memory_order_release);
+            s_seed_rotation_proactive_running_epoch.store(0, std::memory_order_release);
+            lic_log("seed_rotation_proactive_thread_degraded_queue_unavailable");
         }
     }
 
@@ -9667,6 +10066,8 @@ namespace standalone_license
         s_stop.store(true, std::memory_order_release);
         wait_for_worker_done(s_heartbeat_done, "heartbeat_enforcement", 2000);
         wait_for_worker_done(s_srv_refresh_done, "srv_refresh_enforcement", 2000);
+        wait_for_worker_done(s_kernel_session_recovery_done, "kernel_session_recovery_enforcement", 2000);
+        wait_for_worker_done(s_seed_rotation_proactive_done, "seed_rotation_proactive_enforcement", 2000);
         cancel_silent_kill();
         reset_arc_fetch_state();
         reset_activation_completed_at();
@@ -9708,6 +10109,8 @@ namespace standalone_license
         s_stop.store(true, std::memory_order_release);
         wait_for_worker_done(s_heartbeat_done, "heartbeat_background_stop", timeout_ms);
         wait_for_worker_done(s_srv_refresh_done, "srv_refresh_background_stop", timeout_ms);
+        wait_for_worker_done(s_kernel_session_recovery_done, "kernel_session_recovery_background_stop", timeout_ms);
+        wait_for_worker_done(s_seed_rotation_proactive_done, "seed_rotation_proactive_background_stop", timeout_ms);
         lic_log_fmt("background_workers_stop_done reason=%.128s heartbeat_done=%d srv_refresh_done=%d stop=%d epoch=%llu",
             reason_text,
             s_heartbeat_done.load(std::memory_order_acquire) ? 1 : 0,
@@ -10526,5 +10929,103 @@ namespace standalone_license
     {
         std::lock_guard<std::mutex> lk(s_state_mtx);
         return s_cached_arc_bind_token;
+    }
+
+    void wake_kernel_session_relay_keepalive(const char* reason)
+    {
+        kernel_demote_kick_thunk(reason ? reason : "external_wake");
+    }
+
+    bool peek_cached_relay_inputs(uint32_t* out_token_hash, uint64_t* out_server_nonce)
+    {
+        if (!s_cached_relay_inputs_present.load(std::memory_order_acquire))
+            return false;
+        const uint32_t token_hash = s_cached_relay_token_hash.load(std::memory_order_acquire);
+        const uint64_t server_nonce = s_cached_relay_server_nonce.load(std::memory_order_acquire);
+        if (token_hash == 0 || server_nonce == 0)
+            return false;
+        if (out_token_hash) *out_token_hash = token_hash;
+        if (out_server_nonce) *out_server_nonce = server_nonce;
+        return true;
+    }
+
+    bool request_immediate_relay(const char* reason)
+    {
+        const uint64_t now_ms = static_cast<uint64_t>(GetTickCount64());
+        const uint64_t window_start = s_immediate_relay_window_start_ms.load(std::memory_order_acquire);
+        if (window_start == 0 || now_ms - window_start >= 1000) {
+            s_immediate_relay_window_start_ms.store(now_ms, std::memory_order_release);
+            s_immediate_relay_window_count.store(0, std::memory_order_release);
+        }
+        const uint32_t window_count = s_immediate_relay_window_count.fetch_add(1, std::memory_order_acq_rel) + 1;
+        constexpr uint32_t kMaxImmediateRelaysPerSecond = 5;
+        if (window_count > kMaxImmediateRelaysPerSecond) {
+            lic_log_fmt("request_immediate_relay_rate_limited reason=%s window_count=%u limit=%u",
+                reason ? reason : "unknown",
+                window_count,
+                kMaxImmediateRelaysPerSecond);
+            return false;
+        }
+        const uint64_t last_attempt = s_immediate_relay_last_attempt_ms.exchange(now_ms, std::memory_order_acq_rel);
+        const uint64_t since_last = last_attempt == 0 ? 0 : (now_ms - last_attempt);
+        lic_log_fmt("request_immediate_relay_scheduled reason=%s window_count=%u since_last_ms=%llu",
+            reason ? reason : "unknown",
+            window_count,
+            static_cast<unsigned long long>(since_last));
+        const std::string reason_copy(reason ? reason : "unknown");
+        bool posted = false;
+        try {
+            posted = work_queue::post_service_labeled("license.request_immediate_relay", [reason_copy]() {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                kernel_demote_kick_thunk(reason_copy.c_str());
+            });
+        }
+        catch (const std::exception& ex) {
+            lic_log_fmt("request_immediate_relay_post_exception what=%.160s reason=%s",
+                ex.what(), reason_copy.c_str());
+        }
+        catch (...) {
+            lic_log_fmt("request_immediate_relay_post_unknown_exception reason=%s", reason_copy.c_str());
+        }
+        if (!posted) {
+            kernel_demote_kick_thunk(reason_copy.c_str());
+        }
+        return true;
+    }
+
+    bool force_relay_now_blocking(uint32_t timeout_ms)
+    {
+        const uint64_t enter_ms = static_cast<uint64_t>(GetTickCount64());
+        HANDLE demote_kick_event = ensure_kernel_demote_kick_event();
+        HANDLE completion_event = ensure_kernel_relay_completion_event();
+        if (!demote_kick_event || !completion_event) {
+            lic_log_fmt("force_relay_now_blocking_no_events demote_kick=%p completion=%p",
+                demote_kick_event, completion_event);
+            return false;
+        }
+        const uint64_t base_ticket = s_kernel_relay_completion_ticket.load(std::memory_order_acquire);
+        const uint64_t prev_relay_ms = static_cast<uint64_t>(
+            s_last_kernel_session_relay_ms.load(std::memory_order_acquire));
+        ResetEvent(completion_event);
+        kernel_demote_kick_thunk("force_relay_now_blocking");
+        const DWORD wait_rc = WaitForSingleObject(completion_event, timeout_ms);
+        const uint64_t exit_ms = static_cast<uint64_t>(GetTickCount64());
+        const uint64_t now_relay_ms = static_cast<uint64_t>(
+            s_last_kernel_session_relay_ms.load(std::memory_order_acquire));
+        const uint64_t new_ticket = s_kernel_relay_completion_ticket.load(std::memory_order_acquire);
+        const bool relay_progressed = now_relay_ms != prev_relay_ms && now_relay_ms != 0;
+        const bool completion_observed = new_ticket > base_ticket;
+        const bool ok = wait_rc == WAIT_OBJECT_0 && relay_progressed;
+        lic_log_fmt("force_relay_now_blocking_result wait_rc=%lu timeout_ms=%lu elapsed_ms=%llu base_ticket=%llu new_ticket=%llu prev_relay_ms=%llu now_relay_ms=%llu ok=%d completion_observed=%d",
+            static_cast<unsigned long>(wait_rc),
+            static_cast<unsigned long>(timeout_ms),
+            static_cast<unsigned long long>(exit_ms - enter_ms),
+            static_cast<unsigned long long>(base_ticket),
+            static_cast<unsigned long long>(new_ticket),
+            static_cast<unsigned long long>(prev_relay_ms),
+            static_cast<unsigned long long>(now_relay_ms),
+            ok ? 1 : 0,
+            completion_observed ? 1 : 0);
+        return ok;
     }
 }

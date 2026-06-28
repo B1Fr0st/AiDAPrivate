@@ -552,6 +552,51 @@ static void add_driver_request_fields(json& r, bool ok, DWORD gle = GetLastError
     r["win32_message"] = win32_error_message(effective_gle);
 }
 
+static std::string format_kernel_session_failure(const char* op, DWORD gle, const std::string& base_message = std::string()) {
+    const driver_bridge::dynamic_ioctl_state_t dyn = driver_bridge::dynamic_ioctl_state();
+    char buf[512];
+    qsnprintf(buf, sizeof(buf),
+        "%s failure: gle=%lu inst_seed=%u/%u glob_seed=%u/%u dyn_ready=%d driver_loaded=%d driver_connected=%d",
+        (op && *op) ? op : "operation",
+        static_cast<unsigned long>(gle),
+        dyn.instance_server_seed,
+        dyn.instance_ioctl_seed,
+        dyn.global_server_seed,
+        dyn.global_ioctl_seed,
+        dyn.ready ? 1 : 0,
+        dyn.loaded ? 1 : 0,
+        dyn.connected ? 1 : 0);
+    std::string s(buf);
+    if (!base_message.empty()) {
+        s += " [";
+        s += base_message;
+        s += "]";
+    }
+    if (gle == ERROR_INVALID_FUNCTION || gle == ERROR_TIMEOUT) {
+        s += " (kernel session likely invalidated; recovery relay in progress)";
+    } else if (gle == ERROR_NO_SYSTEM_RESOURCES) {
+        s += " (rule table may be full)";
+    }
+    return s;
+}
+
+static void log_net_tools_failure(const char* op, DWORD gle) {
+    const driver_bridge::dynamic_ioctl_state_t dyn = driver_bridge::dynamic_ioctl_state();
+    diag::log_tagged_critical_fmt("net_tools",
+        "%s_failure gle=%lu inst_seed=%u/%u glob_seed=%u/%u dyn_ready=%d ioctl_seed_hash=0x%08X heartbeat_ioctl_seed_hash=0x%08X driver_loaded=%d driver_connected=%d",
+        (op && *op) ? op : "operation",
+        static_cast<unsigned long>(gle),
+        dyn.instance_server_seed,
+        dyn.instance_ioctl_seed,
+        dyn.global_server_seed,
+        dyn.global_ioctl_seed,
+        dyn.ready ? 1 : 0,
+        dyn.ioctl_seed_hash,
+        dyn.heartbeat_ioctl_seed_hash,
+        dyn.loaded ? 1 : 0,
+        dyn.connected ? 1 : 0);
+}
+
 template <typename StatsT>
 static json queue_stats_json(const StatsT& s) {
     json j;
@@ -1181,8 +1226,10 @@ tool_result_t network_add_filter(const json& params)
     const DWORD gle = GetLastError();
     diag::log_tagged_fmt("net_tools", "network_add_filter result=%d rule_id=%u", (int)ok, rule_id);
 
-    if (!ok)
-        return tool_result_t::error(OBFSTR("Failed to add filter rule. Rule table may be full."));
+    if (!ok) {
+        log_net_tools_failure("network_add_filter", gle);
+        return tool_result_t::error(format_kernel_session_failure("Failed to add filter rule", gle));
+    }
 
     json result;
     result["rule_id"] = rule_id;
@@ -1212,8 +1259,11 @@ tool_result_t network_remove_filter(const json& params)
     bool ok = driver_bridge::remove_filter_rule(rule_id);
     const DWORD gle = GetLastError();
     diag::log_tagged_fmt("net_tools", "network_remove_filter result=%d", (int)ok);
-    if (!ok)
-        return tool_result_t::error(OBFSTR("Failed to remove filter rule ") + std::to_string(rule_id));
+    if (!ok) {
+        log_net_tools_failure("network_remove_filter", gle);
+        return tool_result_t::error(format_kernel_session_failure("Failed to remove filter rule", gle,
+            std::string("rule_id=") + std::to_string(rule_id)));
+    }
 
     driver_bridge::network_stats_t after{};
     const bool after_ok = driver_bridge::get_network_stats(after);
@@ -1241,8 +1291,10 @@ tool_result_t network_clear_filters(const json&)
     diag::log_tagged_fmt("net_tools", "network_clear_filters result=%d before_ok=%d before_rules=%llu after_ok=%d after_rules=%llu",
         (int)ok, before_ok ? 1 : 0, static_cast<unsigned long long>(before.active_filter_rules),
         after_ok ? 1 : 0, static_cast<unsigned long long>(after.active_filter_rules));
-    if (!ok)
-        return tool_result_t::error(OBFSTR("Failed to clear filter rules."));
+    if (!ok) {
+        log_net_tools_failure("network_clear_filters", gle);
+        return tool_result_t::error(format_kernel_session_failure("Failed to clear filter rules", gle));
+    }
 
     json result;
     result["before_count"] = before_ok ? before.active_filter_rules : 0;
@@ -1390,8 +1442,10 @@ tool_result_t network_block_ip(const json& params)
     bool block_ok = driver_bridge::add_filter_rule(1, direction, 0, 0, 0, ip, mask, &rule_id);
     const DWORD gle = GetLastError();
     diag::log_tagged_fmt("net_tools", "network_block_ip result=%d rule_id=%u", (int)block_ok, rule_id);
-    if (!block_ok)
-        return tool_result_t::error(OBFSTR("Failed to add block rule"));
+    if (!block_ok) {
+        log_net_tools_failure("network_block_ip", gle);
+        return tool_result_t::error(format_kernel_session_failure("Failed to add block rule", gle));
+    }
 
     json result;
     result["rule_id"] = rule_id;
@@ -1424,8 +1478,10 @@ tool_result_t network_block_port(const json& params)
     bool port_ok = driver_bridge::add_filter_rule(1, 2, protocol, 0, port, nullptr, nullptr, &rule_id);
     const DWORD gle = GetLastError();
     diag::log_tagged_fmt("net_tools", "network_block_port result=%d rule_id=%u", (int)port_ok, rule_id);
-    if (!port_ok)
-        return tool_result_t::error(OBFSTR("Failed to add port block rule"));
+    if (!port_ok) {
+        log_net_tools_failure("network_block_port", gle);
+        return tool_result_t::error(format_kernel_session_failure("Failed to add port block rule", gle));
+    }
 
     json result;
     result["rule_id"] = rule_id;
@@ -1456,8 +1512,10 @@ tool_result_t network_block_process(const json& params)
     bool proc_ok = driver_bridge::add_filter_rule(1, 2, 0, pid, 0, nullptr, nullptr, &rule_id);
     const DWORD gle = GetLastError();
     diag::log_tagged_fmt("net_tools", "network_block_process result=%d rule_id=%u", (int)proc_ok, rule_id);
-    if (!proc_ok)
-        return tool_result_t::error(OBFSTR("Failed to add process block rule"));
+    if (!proc_ok) {
+        log_net_tools_failure("network_block_process", gle);
+        return tool_result_t::error(format_kernel_session_failure("Failed to add process block rule", gle));
+    }
 
     json result;
     result["rule_id"] = rule_id;
@@ -2295,7 +2353,11 @@ tool_result_t network_inject_packet(const json& params)
         tcp_flags, tcp_seq, tcp_ack);
     diag::log_tagged_fmt("net_tools", "network_inject_packet result=%d", (int)ok);
 
-    if (!ok) return tool_result_t::error(OBFSTR("Packet injection failed."));
+    if (!ok) {
+        const DWORD gle = GetLastError();
+        log_net_tools_failure("network_inject_packet", gle);
+        return tool_result_t::error(format_kernel_session_failure("Packet injection failed", gle));
+    }
     json r;
     r["direction"] = (direction == 0) ? "inbound" : "outbound";
     r["protocol"] = protocol_name(protocol);
@@ -2352,7 +2414,11 @@ tool_result_t network_modify_packet_rule(const json& params)
             &rule_id);
         const DWORD gle = GetLastError();
         diag::log_tagged_fmt("net_tools", "network_modify_packet_rule add result=%d rule_id=%u", (int)ok, rule_id);
-        if (!ok) return tool_result_t::error(OBFSTR("Failed to add modification rule. Max 32 rules."));
+        if (!ok) {
+            log_net_tools_failure("network_modify_packet_rule_add", gle);
+            return tool_result_t::error(format_kernel_session_failure("Failed to add packet modification rule", gle,
+                std::string("max 32 rules")));
+        }
         auto remaining = driver_bridge::list_packet_mod_rules();
         json r;
         r["operation"] = "add";
@@ -2370,7 +2436,11 @@ tool_result_t network_modify_packet_rule(const json& params)
         std::uint32_t rule_id = params["rule_id"].get<std::uint32_t>();
         bool ok = driver_bridge::packet_mod_rule_op(1, rule_id);
         const DWORD gle = GetLastError();
-        if (!ok) return tool_result_t::error(OBFSTR("Failed to remove modification rule."));
+        if (!ok) {
+            log_net_tools_failure("network_modify_packet_rule_remove", gle);
+            return tool_result_t::error(format_kernel_session_failure("Failed to remove packet modification rule", gle,
+                std::string("rule_id=") + std::to_string(rule_id)));
+        }
         auto remaining = driver_bridge::list_packet_mod_rules();
         json r;
         r["operation"] = "remove";
@@ -2382,7 +2452,10 @@ tool_result_t network_modify_packet_rule(const json& params)
         auto before = driver_bridge::list_packet_mod_rules();
         bool ok = driver_bridge::packet_mod_rule_op(3);
         const DWORD gle = GetLastError();
-        if (!ok) return tool_result_t::error(OBFSTR("Failed to clear modification rules."));
+        if (!ok) {
+            log_net_tools_failure("network_modify_packet_rule_clear", gle);
+            return tool_result_t::error(format_kernel_session_failure("Failed to clear packet modification rules", gle));
+        }
         auto remaining = driver_bridge::list_packet_mod_rules();
         json r;
         r["operation"] = "clear";
@@ -2588,7 +2661,11 @@ tool_result_t network_redirect_traffic(const json& params)
             static_cast<unsigned long long>(redirect_match_total(remaining)),
             static_cast<unsigned long>(gle), WSAGetLastError(),
             static_cast<unsigned long long>(GetTickCount64() - start_ms));
-        if (!ok) return tool_result_t::error(OBFSTR("Failed to add redirect rule. Max 16 rules."), r);
+        if (!ok) {
+            log_net_tools_failure("network_redirect_traffic_add", gle);
+            return tool_result_t::error(format_kernel_session_failure("Failed to add redirect rule", gle,
+                std::string("max 16 rules")), r);
+        }
         return tool_result_t::ok(OBFSTR("Traffic redirect rule added (ID: ") + std::to_string(rule_id) + ")", r);
     } else if (op == "remove") {
         if (!params.contains("rule_id"))
@@ -2619,7 +2696,11 @@ tool_result_t network_redirect_traffic(const json& params)
             static_cast<unsigned long long>(redirect_match_total(remaining)),
             static_cast<unsigned long>(gle), WSAGetLastError(),
             static_cast<unsigned long long>(GetTickCount64() - start_ms));
-        if (!ok) return tool_result_t::error(OBFSTR("Failed to remove redirect rule."), r);
+        if (!ok) {
+            log_net_tools_failure("network_redirect_traffic_remove", gle);
+            return tool_result_t::error(format_kernel_session_failure("Failed to remove redirect rule", gle,
+                std::string("rule_id=") + std::to_string(rule_id)), r);
+        }
         return tool_result_t::ok(OBFSTR("Redirect rule ") + std::to_string(rule_id) + OBFSTR(" removed"), r);
     } else if (op == "clear") {
         auto before = driver_bridge::list_redirect_rules();
@@ -2641,7 +2722,10 @@ tool_result_t network_redirect_traffic(const json& params)
             static_cast<unsigned long long>(redirect_match_total(remaining)),
             static_cast<unsigned long>(gle), WSAGetLastError(),
             static_cast<unsigned long long>(GetTickCount64() - start_ms));
-        if (!ok) return tool_result_t::error(OBFSTR("Failed to clear redirect rules."), r);
+        if (!ok) {
+            log_net_tools_failure("network_redirect_traffic_clear", gle);
+            return tool_result_t::error(format_kernel_session_failure("Failed to clear redirect rules", gle), r);
+        }
         return tool_result_t::ok(OBFSTR("All traffic redirect rules cleared"), r);
     }
     return tool_result_t::error(OBFSTR("Invalid operation. Use 'add', 'remove', or 'clear'."));
@@ -2785,6 +2869,7 @@ tool_result_t network_intercept(const json& params)
             driver_bridge::status().c_str(),
             driver_bridge::last_error().c_str());
         if (!ok || !active) {
+            log_net_tools_failure("network_intercept_enable", gle);
             std::uint32_t cleanup_held_count = 0;
             bool cleanup_active = active;
             SetLastError(ERROR_SUCCESS);
@@ -2862,10 +2947,10 @@ tool_result_t network_intercept(const json& params)
             win32_error_message(gle).c_str(),
             remaining.size());
         if (!ok) {
+            log_net_tools_failure("network_intercept_disable", gle);
             r["failure_phase"] = "driver_intercept_disable_ioctl";
             r["diagnostic"] = "driver rejected packet interception disable request";
-            return tool_result_t::error(OBFSTR("Failed to disable packet interception: Win32 error ") +
-                std::to_string(static_cast<unsigned long>(gle)) + OBFSTR(" (") + win32_error_message(gle) + OBFSTR(")."), r);
+            return tool_result_t::error(OBFSTR("Failed to disable packet interception: ") + format_kernel_session_failure("intercept_disable", gle), r);
         }
         return tool_result_t::ok(OBFSTR("Packet interception disabled. All held packets released."), r);
     }
@@ -2942,7 +3027,11 @@ tool_result_t network_release_packet(const json& params)
         static_cast<std::uint32_t>(modify_payload.size()), nullptr, nullptr);
     const DWORD gle = GetLastError();
     diag::log_tagged_fmt("net_tools", "network_release_packet result=%d operation=%u", (int)ok, operation);
-    if (!ok) return tool_result_t::error(OBFSTR("Failed to release/process held packet."));
+    if (!ok) {
+        log_net_tools_failure("network_release_packet", gle);
+        return tool_result_t::error(format_kernel_session_failure("Failed to release/process held packet", gle,
+            std::string("hold_id=") + std::to_string(hold_id)));
+    }
 
     std::string action_str = (operation == 4) ? "dropped" : (operation == 5) ? "modified and released" : "released";
     auto remaining = driver_bridge::get_held_packets();
@@ -2991,7 +3080,11 @@ tool_result_t network_kill_connection(const json& params)
     bool ok = driver_bridge::kill_connection(protocol, af, src_port, dst_port, src_addr, dst_addr, pid);
     const DWORD gle = GetLastError();
     diag::log_tagged_fmt("net_tools", "network_kill_connection result=%d", (int)ok);
-    if (!ok) return tool_result_t::error(OBFSTR("Failed to kill connection. Tries socket close + RST injection."));
+    if (!ok) {
+        log_net_tools_failure("network_kill_connection", gle);
+        return tool_result_t::error(format_kernel_session_failure("Failed to kill connection", gle,
+            std::string("tries socket close + RST injection")));
+    }
     json r;
     r["action"] = "kill_connection";
     r["pid"] = pid;
@@ -3033,7 +3126,11 @@ tool_result_t network_spoof_dns(const json& params)
         bool ok = driver_bridge::dns_spoof_op(0, 0, domain.c_str(), spoof_addr, 2, ttl, &rule_id);
         const DWORD gle = GetLastError();
         diag::log_tagged_fmt("net_tools", "network_spoof_dns add result=%d rule_id=%u", (int)ok, rule_id);
-        if (!ok) return tool_result_t::error(OBFSTR("Failed to add DNS spoof rule. Max 32 rules."));
+        if (!ok) {
+            log_net_tools_failure("network_spoof_dns_add", gle);
+            return tool_result_t::error(format_kernel_session_failure("Failed to add DNS spoof rule", gle,
+                std::string("max 32 rules")));
+        }
         auto remaining = driver_bridge::list_dns_spoof_rules();
         json r;
         r["operation"] = "add";
@@ -3051,7 +3148,11 @@ tool_result_t network_spoof_dns(const json& params)
         std::uint32_t rule_id = params["rule_id"].get<std::uint32_t>();
         bool ok = driver_bridge::dns_spoof_op(1, rule_id, nullptr, nullptr, 2, 0, nullptr);
         const DWORD gle = GetLastError();
-        if (!ok) return tool_result_t::error(OBFSTR("Failed to remove DNS spoof rule."));
+        if (!ok) {
+            log_net_tools_failure("network_spoof_dns_remove", gle);
+            return tool_result_t::error(format_kernel_session_failure("Failed to remove DNS spoof rule", gle,
+                std::string("rule_id=") + std::to_string(rule_id)));
+        }
         auto remaining = driver_bridge::list_dns_spoof_rules();
         json r;
         r["operation"] = "remove";
@@ -3064,7 +3165,10 @@ tool_result_t network_spoof_dns(const json& params)
         auto before = driver_bridge::list_dns_spoof_rules();
         bool ok = driver_bridge::dns_spoof_op(3, 0, nullptr, nullptr, 2, 0, nullptr);
         const DWORD gle = GetLastError();
-        if (!ok) return tool_result_t::error(OBFSTR("Failed to clear DNS spoof rules."));
+        if (!ok) {
+            log_net_tools_failure("network_spoof_dns_clear", gle);
+            return tool_result_t::error(format_kernel_session_failure("Failed to clear DNS spoof rules", gle));
+        }
         auto remaining = driver_bridge::list_dns_spoof_rules();
         json r;
         r["operation"] = "clear";
@@ -3116,19 +3220,31 @@ tool_result_t network_bandwidth_monitor(const json& params)
 
     if (op == "start") {
         bool ok = driver_bridge::bw_monitor_op(0, filter_pid, nullptr);
+        const DWORD gle = GetLastError();
         diag::log_tagged_fmt("net_tools", "network_bandwidth_monitor start result=%d", (int)ok);
-        if (!ok) return tool_result_t::error(OBFSTR("Failed to start bandwidth monitoring."));
+        if (!ok) {
+            log_net_tools_failure("network_bandwidth_monitor_start", gle);
+            return tool_result_t::error(format_kernel_session_failure("Failed to start bandwidth monitoring", gle));
+        }
         return tool_result_t::ok(OBFSTR("Bandwidth monitoring started"));
     } else if (op == "stop") {
         bool ok = driver_bridge::bw_monitor_op(1, 0, nullptr);
+        const DWORD gle = GetLastError();
         diag::log_tagged_fmt("net_tools", "network_bandwidth_monitor stop result=%d", (int)ok);
-        if (!ok) return tool_result_t::error(OBFSTR("Failed to stop bandwidth monitoring."));
+        if (!ok) {
+            log_net_tools_failure("network_bandwidth_monitor_stop", gle);
+            return tool_result_t::error(format_kernel_session_failure("Failed to stop bandwidth monitoring", gle));
+        }
         return tool_result_t::ok(OBFSTR("Bandwidth monitoring stopped"));
     } else if (op == "get") {
         driver_bridge::bw_stats_t stats{};
         bool ok = driver_bridge::bw_monitor_op(2, filter_pid, &stats);
+        const DWORD gle = GetLastError();
         diag::log_tagged_fmt("net_tools", "network_bandwidth_monitor get result=%d active=%d bps_in=%llu bps_out=%llu", (int)ok, (int)stats.active, static_cast<unsigned long long>(stats.bps_in), static_cast<unsigned long long>(stats.bps_out));
-        if (!ok) return tool_result_t::error(OBFSTR("Failed to get bandwidth stats."));
+        if (!ok) {
+            log_net_tools_failure("network_bandwidth_monitor_get", gle);
+            return tool_result_t::error(format_kernel_session_failure("Failed to get bandwidth stats", gle));
+        }
         json r;
         r["active"] = stats.active;
         r["total_bytes_sent"] = stats.total_bytes_sent;
@@ -3140,7 +3256,11 @@ tool_result_t network_bandwidth_monitor(const json& params)
         return tool_result_t::ok(OBFSTR("Bandwidth statistics"), r);
     } else if (op == "reset") {
         bool ok = driver_bridge::bw_monitor_op(3, 0, nullptr);
-        if (!ok) return tool_result_t::error(OBFSTR("Failed to reset bandwidth counters."));
+        const DWORD gle = GetLastError();
+        if (!ok) {
+            log_net_tools_failure("network_bandwidth_monitor_reset", gle);
+            return tool_result_t::error(format_kernel_session_failure("Failed to reset bandwidth counters", gle));
+        }
         return tool_result_t::ok(OBFSTR("Bandwidth counters reset"));
     }
     return tool_result_t::error(OBFSTR("Invalid operation. Use 'start', 'stop', 'get', or 'reset'."));

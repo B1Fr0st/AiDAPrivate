@@ -307,6 +307,11 @@ namespace driver_bridge
     bool initialize();
     bool load_kernel_driver();
     void invalidate_kernel_session(const char* reason);
+    void notify_send_request_success();
+
+    void notify_kernel_demote_detected(const char* reason);
+    using kernel_demote_kick_callback_t = void(*)(const char*);
+    void install_kernel_demote_kick_callback(kernel_demote_kick_callback_t cb);
     void shutdown(const char* reason = nullptr);
     bool is_loaded();
     bool using_kernel_driver();
@@ -493,6 +498,12 @@ namespace driver_bridge
     uint64_t current_remote_call_deadline_ms() noexcept;
     bool current_remote_call_cancelled() noexcept;
     remote_call_execution_diag_t last_remote_call_execution_diag();
+    bool lower_remote_call_last_abandoned() noexcept;
+
+    namespace detail {
+        uint32_t remote_call_um_inflight_count_global() noexcept;
+        uint32_t remote_call_um_abandoned_count_global() noexcept;
+    }
 
     bool set_hardware_breakpoint(uint32_t tid, int index, uint64_t address, int type = 0, int size = 0);
     bool clear_hardware_breakpoint(uint32_t tid, int index);
@@ -517,6 +528,7 @@ namespace driver_bridge
 
     dynamic_ioctl_state_t dynamic_ioctl_state();
     bool dynamic_ioctls_ready();
+    bool require_dynamic_session_ready(uint32_t timeout_ms);
 
     bool register_dll_protection(uint64_t module_base, uint64_t text_va, uint32_t text_size, uint64_t expected_hash, uint32_t check_interval_ms = 2000);
     bool register_self_dll_protection(uint64_t module_base, uint64_t text_va, uint32_t text_size, uint64_t expected_hash, uint32_t check_interval_ms = 2000);

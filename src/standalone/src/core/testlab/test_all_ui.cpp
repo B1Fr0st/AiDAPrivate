@@ -1041,6 +1041,7 @@ static void test_code_editor_save_find_and_diff(HANDLE hf, std::atomic<int>& pas
 }
 
 static void test_command_palette_and_center_views(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    auto t0 = std::chrono::steady_clock::now();
     ui_state_guard_t guard;
     network_view_state_guard_t network_guard;
     burp_detail_state_guard_t burp_guard;
@@ -1516,11 +1517,21 @@ static void test_command_palette_and_center_views(HANDLE hf, std::atomic<int>& p
     symbolic_view::set_active_tab(symbolic_tab_before);
     stealth_view::set_sub_tab(stealth_tab_before);
 
+    long long us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+    log_msg(hf, "ui_commands_routes", "STATE -- ck_checks=%d ck_ok=%d palette_ok=%d dispatch_state_ok=%d roundtrip_views=%zu network_subtabs=%d failures=\"%s\" elapsed_us=%lld",
+        ck.checked,
+        ck.ok ? 1 : 0,
+        palette_ok ? 1 : 0,
+        dispatch_state_ok ? 1 : 0,
+        std::size(views),
+        static_cast<int>(network_view::sub_tab_t::COUNT),
+        ck.failures.c_str(),
+        us);
     if (palette_ok && ck.ok && dispatch_state_ok) {
-        pass(hf, passed, "ui_palette_views", "command palette, %d center routes, 35 network tabs, hub/debugger/emulation subviews, and backing route state invariants passed (%d checks)",
-            static_cast<int>(std::size(views)), ck.checked);
+        pass(hf, passed, "ui_palette_views", "command palette, %d center routes, 35 network tabs, hub/debugger/emulation subviews, and backing route state invariants passed (%d checks, elapsed_us=%lld)",
+            static_cast<int>(std::size(views)), ck.checked, us);
     } else {
-        fail(hf, failed, "ui_palette_views", "palette_ok=%d checks_ok=%d dispatch_state_ok=%d active_view=%d palette_open=%d query=%s checked=%d failures=%s",
+        fail(hf, failed, "ui_palette_views", "palette_ok=%d checks_ok=%d dispatch_state_ok=%d active_view=%d palette_open=%d query=%s checked=%d failures=%s elapsed_us=%lld",
             palette_ok ? 1 : 0,
             ck.ok ? 1 : 0,
             dispatch_state_ok ? 1 : 0,
@@ -1528,11 +1539,13 @@ static void test_command_palette_and_center_views(HANDLE hf, std::atomic<int>& p
             globals::ui::command_palette_open ? 1 : 0,
             globals::ui::command_palette_buf,
             ck.checked,
-            ck.failures.c_str());
+            ck.failures.c_str(),
+            us);
     }
 }
 
 static void test_settings_sandbox_mcp_roundtrip(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    auto t0 = std::chrono::steady_clock::now();
     const auto workspace_before = g_sa_settings.workspace;
     const auto sandbox_before = g_sa_settings.sandbox;
     const auto mcp_before = g_sa_settings.mcp_client_servers;
@@ -1671,10 +1684,20 @@ static void test_settings_sandbox_mcp_roundtrip(HANDLE hf, std::atomic<int>& pas
         market_view.first_search_done = market_view_first_search_before;
     }
 
+    long long us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+    log_msg(hf, "ui_settings_mcp", "STATE -- workspace_ok=%d sandbox_ok=%d mcp_ok=%d marketplace_ok=%d marketplace_view_ok=%d auth_passive_ok=%d installed=%zu elapsed_us=%lld",
+        workspace_ok ? 1 : 0,
+        sandbox_ok ? 1 : 0,
+        mcp_ok ? 1 : 0,
+        marketplace_ok ? 1 : 0,
+        marketplace_view_ok ? 1 : 0,
+        auth_passive_ok ? 1 : 0,
+        installed.size(),
+        us);
     if (workspace_ok && sandbox_ok && mcp_ok && marketplace_ok && marketplace_view_ok && auth_passive_ok) {
-        pass(hf, passed, "ui_settings_mcp", "workspace, sandbox, MCP client, marketplace storage, marketplace modal state, and passive auth state round-tripped in memory");
+        pass(hf, passed, "ui_settings_mcp", "workspace, sandbox, MCP client, marketplace storage, marketplace modal state, and passive auth state round-tripped in memory (elapsed_us=%lld)", us);
     } else {
-        fail(hf, failed, "ui_settings_mcp", "workspace_ok=%d sandbox_ok=%d mcp_ok=%d marketplace_ok=%d marketplace_view_ok=%d auth_passive_ok=%d installed=%zu serialized=%s",
+        fail(hf, failed, "ui_settings_mcp", "workspace_ok=%d sandbox_ok=%d mcp_ok=%d marketplace_ok=%d marketplace_view_ok=%d auth_passive_ok=%d installed=%zu serialized=%s elapsed_us=%lld",
             workspace_ok ? 1 : 0,
             sandbox_ok ? 1 : 0,
             mcp_ok ? 1 : 0,
@@ -1682,7 +1705,8 @@ static void test_settings_sandbox_mcp_roundtrip(HANDLE hf, std::atomic<int>& pas
             marketplace_view_ok ? 1 : 0,
             auth_passive_ok ? 1 : 0,
             installed.size(),
-            serialized_market.c_str());
+            serialized_market.c_str(),
+            us);
     }
 }
 
@@ -1815,6 +1839,7 @@ static void test_activity_search_recent(HANDLE hf, std::atomic<int>& passed, std
 }
 
 static void test_bottom_log_tabs(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    auto t0 = std::chrono::steady_clock::now();
     ui_state_guard_t guard;
     for (int i = 0; i < static_cast<int>(bottom_tab_t::COUNT); ++i)
         output_log::clear(static_cast<bottom_tab_t>(i));
@@ -1843,10 +1868,21 @@ static void test_bottom_log_tabs(HANDLE hf, std::atomic<int>& passed, std::atomi
     bool clear_ok = !output_log::is_select_all(bottom_tab_t::driver_log);
     bool tab_ok = globals::ui::panel_bottom_visible && globals::ui::active_bottom_tab == bottom_tab_t::driver_log;
 
+    long long us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+    log_msg(hf, "ui_bottom", "STATE -- output=%zu mcp=%zu driver=%zu sandbox=%zu terminal=%zu clear_ok=%d tab_ok=%d lines_ok=%d elapsed_us=%lld",
+        output_count,
+        mcp_count,
+        driver_count,
+        sandbox_count,
+        terminal_count,
+        clear_ok ? 1 : 0,
+        tab_ok ? 1 : 0,
+        lines_ok ? 1 : 0,
+        us);
     if (lines_ok && clear_ok && tab_ok) {
-        pass(hf, passed, "ui_bottom", "bottom log tabs accepted per-tab output, ignored terminal log push, and clear reset selection");
+        pass(hf, passed, "ui_bottom", "bottom log tabs accepted per-tab output, ignored terminal log push, and clear reset selection (elapsed_us=%lld)", us);
     } else {
-        fail(hf, failed, "ui_bottom", "lines_ok=%d clear_ok=%d tab_ok=%d output=%zu mcp=%zu driver=%zu sandbox=%zu terminal=%zu",
+        fail(hf, failed, "ui_bottom", "lines_ok=%d clear_ok=%d tab_ok=%d output=%zu mcp=%zu driver=%zu sandbox=%zu terminal=%zu elapsed_us=%lld",
             lines_ok ? 1 : 0,
             clear_ok ? 1 : 0,
             tab_ok ? 1 : 0,
@@ -1854,11 +1890,13 @@ static void test_bottom_log_tabs(HANDLE hf, std::atomic<int>& passed, std::atomi
             mcp_count,
             driver_count,
             sandbox_count,
-            terminal_count);
+            terminal_count,
+            us);
     }
 }
 
 static void test_terminal_buffer_lifecycle(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    auto t0 = std::chrono::steady_clock::now();
     terminal_view::TerminalSession session;
     session.cols = 32;
     session.rows_vis = 8;
@@ -1884,10 +1922,19 @@ static void test_terminal_buffer_lifecycle(HANDLE hf, std::atomic<int>& passed, 
     mgr.shutdown();
     bool manager_shutdown = mgr.sessions.empty() && mgr.active_tab == -1;
 
+    long long us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+    log_msg(hf, "ui_terminal", "STATE -- parsed=%d cleared=%d manager_empty=%d manager_shutdown=%d lines=%zu cursor_row=%d elapsed_us=%lld",
+        parsed ? 1 : 0,
+        cleared ? 1 : 0,
+        manager_empty ? 1 : 0,
+        manager_shutdown ? 1 : 0,
+        session.lines.size(),
+        session.cursor_row,
+        us);
     if (parsed && cleared && manager_empty && manager_shutdown) {
-        pass(hf, passed, "ui_terminal", "terminal parser, clear_session, and empty manager lifecycle work without spawning a shell");
+        pass(hf, passed, "ui_terminal", "terminal parser, clear_session, and empty manager lifecycle work without spawning a shell (elapsed_us=%lld)", us);
     } else {
-        fail(hf, failed, "ui_terminal", "parsed=%d cleared=%d manager_empty=%d manager_shutdown=%d first=\"%s\" second=\"%s\" lines=%zu cursor_row=%d",
+        fail(hf, failed, "ui_terminal", "parsed=%d cleared=%d manager_empty=%d manager_shutdown=%d first=\"%s\" second=\"%s\" lines=%zu cursor_row=%d elapsed_us=%lld",
             parsed ? 1 : 0,
             cleared ? 1 : 0,
             manager_empty ? 1 : 0,
@@ -1895,11 +1942,13 @@ static void test_terminal_buffer_lifecycle(HANDLE hf, std::atomic<int>& passed, 
             first.c_str(),
             second.c_str(),
             session.lines.size(),
-            session.cursor_row);
+            session.cursor_row,
+            us);
     }
 }
 
 static void test_testlab_view_state(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    auto t0 = std::chrono::steady_clock::now();
     ui_state_guard_t guard;
     globals::ui::active_center_view = center_view_t::test_lab;
     globals::ui::test_all_visible = true;
@@ -1915,14 +1964,21 @@ static void test_testlab_view_state(HANDLE hf, std::atomic<int>& passed, std::at
         && std::strstr(snap, "fail=") != nullptr;
     bool running_ok = is_running() && std::strstr(snap, "running=1") != nullptr;
 
+    long long us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+    log_msg(hf, "ui_testlab", "STATE -- view_ok=%d snapshot_ok=%d running_ok=%d elapsed_us=%lld",
+        view_ok ? 1 : 0,
+        snapshot_ok ? 1 : 0,
+        running_ok ? 1 : 0,
+        us);
     if (view_ok && snapshot_ok && running_ok) {
-        pass(hf, passed, "ui_testlab", "Test Lab center view state, overlay visibility, progress step, running state, and debug snapshot are readable");
+        pass(hf, passed, "ui_testlab", "Test Lab center view state, overlay visibility, progress step, running state, and debug snapshot are readable (elapsed_us=%lld)", us);
     } else {
-        fail(hf, failed, "ui_testlab", "view_ok=%d snapshot_ok=%d running_ok=%d snapshot=%s",
+        fail(hf, failed, "ui_testlab", "view_ok=%d snapshot_ok=%d running_ok=%d snapshot=%s elapsed_us=%lld",
             view_ok ? 1 : 0,
             snapshot_ok ? 1 : 0,
             running_ok ? 1 : 0,
-            snap);
+            snap,
+            us);
     }
 }
 

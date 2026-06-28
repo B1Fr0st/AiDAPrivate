@@ -1004,6 +1004,15 @@ NTSTATUS functions::handle7783(p_alloc_mem request) {
         request->actual_size = 0;
     }
 
+    WW_LOG("ALLOC_MEM_DONE pid=%u requested_size=0x%llx region_size=0x%llx base=0x%llx status=0x%08X caller_pid=%llu caller_tid=%llu",
+        request->pid,
+        (unsigned long long)request->size,
+        (unsigned long long)region_size,
+        (unsigned long long)(UINT_PTR)base_addr,
+        (unsigned int)status,
+        (unsigned long long)(ULONG_PTR)PsGetCurrentProcessId(),
+        (unsigned long long)(ULONG_PTR)PsGetCurrentThreadId());
+
     return status;
 }
 

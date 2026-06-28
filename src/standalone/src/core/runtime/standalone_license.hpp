@@ -105,6 +105,10 @@ namespace standalone_license
 
 
     bool is_arc_loaded();
+    bool force_relay_now_blocking(uint32_t timeout_ms);
+    void wake_kernel_session_relay_keepalive(const char* reason);
+    bool peek_cached_relay_inputs(uint32_t* out_token_hash, uint64_t* out_server_nonce);
+    bool request_immediate_relay(const char* reason);
     bool is_arc_download_in_progress();
     bool is_arc_transfer_in_progress();
     bool validate_arc_required_exports(std::string& missing_out);

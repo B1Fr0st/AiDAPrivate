@@ -732,13 +732,47 @@ static tool_result_t tool_run_command(const json& params)
     if (!wait) want_session = true;
 
     std::string cwd = file_browser::current_dir;
+    bool cwd_from_params = false;
     if (params.contains("cwd") && params["cwd"].is_string()) {
         std::string custom = sanitize_path(params["cwd"].get<std::string>());
         if (!path_within_workspace(custom))
             return tool_result_t::error("cwd is outside the workspace.");
         std::error_code ec;
-        if (fs::is_directory(custom, ec))
+        if (fs::is_directory(custom, ec)) {
             cwd = custom;
+            cwd_from_params = true;
+        }
+    }
+
+    if (!cwd.empty()) {
+        std::error_code cwd_ec;
+        if (!fs::is_directory(cwd, cwd_ec)) {
+            const std::string prior = cwd;
+            diag::log_tagged_fmt("coding",
+                "run_command cwd_invalid cwd='%.260s' err=%d msg='%.160s' cmd='%.120s' from_params=%d",
+                prior.c_str(),
+                cwd_ec.value(),
+                cwd_ec.message().c_str(),
+                command.c_str(),
+                cwd_from_params ? 1 : 0);
+            std::error_code temp_ec;
+            std::string fallback = fs::temp_directory_path(temp_ec).string();
+            if (temp_ec || fallback.empty() || !fs::is_directory(fallback, temp_ec)) {
+                diag::log_tagged_fmt("coding",
+                    "run_command cwd_fallback_failed prior='%.260s' temp_err=%d temp_msg='%.160s'",
+                    prior.c_str(),
+                    temp_ec.value(),
+                    temp_ec.message().c_str());
+                return tool_result_t::error(
+                    "Working directory is invalid and no fallback is available (prior=" + prior +
+                    ", err=" + std::to_string(cwd_ec.value()) + ").");
+            }
+            diag::log_tagged_fmt("coding",
+                "run_command cwd_fallback prior='%.260s' fallback='%.260s'",
+                prior.c_str(),
+                fallback.c_str());
+            cwd = std::move(fallback);
+        }
     }
 
     output_log::push(bottom_tab_t::sandbox_log,
@@ -776,6 +810,7 @@ static tool_result_t tool_run_command(const json& params)
 
     PROCESS_INFORMATION pi{};
 
+    SetLastError(ERROR_SUCCESS);
     BOOL created = CreateProcessA(
         nullptr,
         &cmdline[0],
@@ -784,17 +819,22 @@ static tool_result_t tool_run_command(const json& params)
         nullptr,
         cwd.empty() ? nullptr : cwd.c_str(),
         &si, &pi);
+    const DWORD create_gle = created ? ERROR_SUCCESS : GetLastError();
 
     CloseHandle(h_stdout_wr);
     CloseHandle(h_stderr_wr);
 
     if (!created) {
-        diag::log_tagged_fmt("coding", "run_command create process fail err=%lu cmd='%.120s'",
-            GetLastError(), command.c_str());
+        diag::log_tagged_fmt("coding",
+            "run_command create process fail err=%lu cwd='%.260s' cmd='%.120s'",
+            create_gle,
+            cwd.c_str(),
+            command.c_str());
         CloseHandle(h_stdout_rd);
         CloseHandle(h_stderr_rd);
         return tool_result_t::error("Failed to launch command: " + command +
-                                    " (error " + std::to_string(GetLastError()) + ")");
+                                    " (cwd=" + (cwd.empty() ? std::string("<none>") : cwd) +
+                                    ", error " + std::to_string(create_gle) + ")");
     }
 
     diag::log_tagged_fmt("coding", "run_command process started pid=%lu wait=%d cmd='%.120s'",

@@ -226,14 +226,23 @@ namespace dispatcher {
 
     inline volatile LONG64 g_server_token_time = 0;
     inline volatile ULONG g_server_token_hash = 0;
-    constexpr LONG64 SERVER_TOKEN_TIMEOUT = 300000000LL;
+    inline volatile LONG g_server_token_timeout_pending = 0;
+    inline volatile LONG64 g_last_srv2_caller_pid = 0;
+    constexpr LONG64 SERVER_TOKEN_TIMEOUT = 600000000LL;
+    constexpr LONG SERVER_TOKEN_TIMEOUT_PENDING_THRESHOLD = 2;
 
     inline volatile UINT64 g_integrity_check_tsc = 0;
     inline volatile LONG g_integrity_verified = 0;
     constexpr UINT64 INTEGRITY_CHECK_INTERVAL = 500000000ULL;
 
-    constexpr LONG64 HEARTBEAT_TIMEOUT = 300000000LL;
+    constexpr LONG64 HEARTBEAT_TIMEOUT = 400000000LL;
     constexpr LONG64 HEARTBEAT_LOG_INTERVAL = 10000000LL;
+    constexpr LONG64 REKEY_REQUIRED_LOG_INTERVAL = 10000000LL;
+
+    static_assert(SERVER_TOKEN_TIMEOUT > HEARTBEAT_TIMEOUT,
+        "extended server-token timeout must outlast the heartbeat timeout so heartbeat starvation is the primary liveness signal");
+    static_assert(SERVER_TOKEN_TIMEOUT_PENDING_THRESHOLD >= 2,
+        "pending grace must absorb at least one transient relay race before tearing the session down");
 
     __forceinline UINT64 handle_to_u64(HANDLE value) {
         return static_cast<UINT64>(reinterpret_cast<ULONG_PTR>(value));
@@ -695,6 +704,9 @@ namespace dispatcher {
         _InterlockedExchange64(&g_last_heartbeat_time, 0);
         _InterlockedExchange64(&g_server_token_time, 0);
         _InterlockedExchange(reinterpret_cast<volatile LONG*>(&g_server_token_hash), 0);
+        _InterlockedExchange(&dispatcher_rekey::g_session_needs_rekey, 0);
+        _InterlockedExchange64(&dispatcher_rekey::g_session_soft_demote_qpc, 0);
+        _InterlockedExchange64(&dispatcher_rekey::g_last_rekey_required_log_qpc, 0);
         caller_validation::unregister_client();
         secure_comm::reset();
 
@@ -710,6 +722,35 @@ namespace dispatcher {
                 cleanup_cleared,
                 dprt_cleared);
         }
+    }
+
+    __forceinline void soft_demote_for_relay_required(const char* reason, HANDLE prev_client, LONG64 srv_elapsed, LONG64 hb_elapsed) {
+        LONG activated_before = _InterlockedExchange(&g_driver_activated, 0);
+        LONG64 prior_server_token_time = _InterlockedExchange64(&g_server_token_time, 0);
+        ULONG prior_server_token_hash = static_cast<ULONG>(
+            _InterlockedExchange(reinterpret_cast<volatile LONG*>(&g_server_token_hash), 0));
+        ULONG heartbeat_counter = static_cast<ULONG>(
+            _InterlockedCompareExchange(reinterpret_cast<volatile LONG*>(&g_heartbeat_counter), 0, 0));
+        ULONG server_seed = dynamic_key::g_server_seed;
+        ULONG ioctl_seed = ioctl_codes::g_server_ioctl_seed;
+
+        _InterlockedExchange(&dispatcher_rekey::g_session_needs_rekey, 1);
+        LARGE_INTEGER demote_qpc_freq;
+        demote_qpc_freq.QuadPart = 0;
+        LARGE_INTEGER demote_qpc = KeQueryPerformanceCounter(&demote_qpc_freq);
+        _InterlockedExchange64(&dispatcher_rekey::g_session_soft_demote_qpc, demote_qpc.QuadPart);
+
+        WW_LOG("SESSION_SOFT_DEMOTE: reason=%s prev_client=%lu srv_elapsed_100ns=%lld hb_elapsed_100ns=%lld heartbeat_counter=%lu activated_before=%ld server_seed_set=%u ioctl_seed_set=%u session_needs_rekey_post=1 prior_token_time=%lld prior_token_hash=0x%08lX",
+            reason ? reason : "unknown",
+            static_cast<ULONG>(reinterpret_cast<ULONG_PTR>(prev_client)),
+            srv_elapsed,
+            hb_elapsed,
+            heartbeat_counter,
+            activated_before,
+            server_seed != 0 ? 1u : 0u,
+            ioctl_seed != 0 ? 1u : 0u,
+            prior_server_token_time,
+            prior_server_token_hash);
     }
 
     __forceinline BOOLEAN verify_dispatch_integrity(PDRIVER_OBJECT driver_obj) {
@@ -754,8 +795,8 @@ namespace dispatcher {
         if (last_hb == 0)
             return FALSE;
 
-        LONG64 elapsed = current_time.QuadPart - last_hb;
-        if (elapsed > HEARTBEAT_TIMEOUT) {
+        LONG64 hb_elapsed = current_time.QuadPart - last_hb;
+        if (hb_elapsed > HEARTBEAT_TIMEOUT) {
             reset_dynamic_session_state("is_session_valid_timeout", caller_validation::g_registered_client_pid, 0, TRUE);
             return FALSE;
         }
@@ -764,7 +805,39 @@ namespace dispatcher {
         if (srv_time != 0) {
             LONG64 srv_elapsed = current_time.QuadPart - srv_time;
             if (srv_elapsed > SERVER_TOKEN_TIMEOUT) {
-                reset_dynamic_session_state("server_token_timeout", caller_validation::g_registered_client_pid, 0, TRUE);
+                LONG pending_count = _InterlockedIncrement(&g_server_token_timeout_pending);
+                if (pending_count < SERVER_TOKEN_TIMEOUT_PENDING_THRESHOLD) {
+                    WW_LOG("SERVER_TOKEN_TIMEOUT_PENDING srv_elapsed_100ns=%lld hb_elapsed_100ns=%lld pending_count=%ld threshold=%ld registered_pid=%lu heartbeat_counter=%lu activated=%ld last_srv2_caller_pid=%lld",
+                        srv_elapsed,
+                        hb_elapsed,
+                        pending_count,
+                        static_cast<LONG>(SERVER_TOKEN_TIMEOUT_PENDING_THRESHOLD),
+                        static_cast<ULONG>(reinterpret_cast<ULONG_PTR>(caller_validation::g_registered_client_pid)),
+                        static_cast<ULONG>(_InterlockedCompareExchange(reinterpret_cast<volatile LONG*>(&g_heartbeat_counter), 0, 0)),
+                        _InterlockedCompareExchange(&g_driver_activated, 0, 0),
+                        _InterlockedCompareExchange64(&g_last_srv2_caller_pid, 0, 0));
+                    return TRUE;
+                }
+                _InterlockedExchange(&g_server_token_timeout_pending, 0);
+                ULONG hb_counter_at_timeout = static_cast<ULONG>(_InterlockedCompareExchange(reinterpret_cast<volatile LONG*>(&g_heartbeat_counter), 0, 0));
+                LONG64 last_srv2_caller_pid_at_timeout = _InterlockedCompareExchange64(&g_last_srv2_caller_pid, 0, 0);
+                WW_LOG("SERVER_TOKEN_TIMEOUT_FIRED prev_token_elapsed_100ns=%lld hb_elapsed_100ns=%lld heartbeat_counter=%lu registered_pid=%lu last_srv2_caller_pid=%lld threshold_pending=%ld will_soft_demote=%d will_hard_reset=%d",
+                    srv_elapsed,
+                    hb_elapsed,
+                    hb_counter_at_timeout,
+                    static_cast<ULONG>(reinterpret_cast<ULONG_PTR>(caller_validation::g_registered_client_pid)),
+                    last_srv2_caller_pid_at_timeout,
+                    static_cast<LONG>(SERVER_TOKEN_TIMEOUT_PENDING_THRESHOLD),
+                    hb_elapsed <= HEARTBEAT_TIMEOUT ? 1 : 0,
+                    hb_elapsed <= HEARTBEAT_TIMEOUT ? 0 : 1);
+                if (hb_elapsed <= HEARTBEAT_TIMEOUT) {
+                    soft_demote_for_relay_required("server_token_timeout_soft_demote",
+                        caller_validation::g_registered_client_pid,
+                        srv_elapsed,
+                        hb_elapsed);
+                } else {
+                    reset_dynamic_session_state("server_token_timeout", caller_validation::g_registered_client_pid, 0, TRUE);
+                }
                 return FALSE;
             }
         }
@@ -1379,18 +1452,30 @@ namespace dispatcher {
                     code, _InterlockedCompareExchange(&g_driver_activated, 0, 0));
             }
             if (tier_a_trace) {
-                WW_LOG("TIRA_DISPATCH_REJECT trace=%lld phase=session_invalid status=0x%08lx raw_code=0x%08lx expected_tira=0x%08lx activated=%ld registered_pid=%llu last_hb_set=%u server_seed_set=%u ioctl_seed_set=%u secure_wrapped=%u elapsed_us=%llu",
+                LARGE_INTEGER reject_time;
+                KeQuerySystemTime(&reject_time);
+                LONG64 reject_srv_time_snapshot = _InterlockedCompareExchange64(&g_server_token_time, 0, 0);
+                LONG64 reject_hb_time_snapshot = _InterlockedCompareExchange64(&g_last_heartbeat_time, 0, 0);
+                LONG64 reject_srv_elapsed_100ns = reject_srv_time_snapshot == 0 ? -1 : (reject_time.QuadPart - reject_srv_time_snapshot);
+                LONG64 reject_hb_elapsed_100ns = reject_hb_time_snapshot == 0 ? -1 : (reject_time.QuadPart - reject_hb_time_snapshot);
+                LONG64 reject_srv_elapsed_ms = reject_srv_elapsed_100ns < 0 ? -1 : (reject_srv_elapsed_100ns / 10000);
+                LONG64 reject_hb_elapsed_ms = reject_hb_elapsed_100ns < 0 ? -1 : (reject_hb_elapsed_100ns / 10000);
+                WW_LOG("TIRA_DISPATCH_REJECT trace=%lld phase=session_invalid status=0x%08lx raw_code=0x%08lx expected_tira=0x%08lx activated=%ld registered_pid=%llu last_hb_set=%u server_seed_set=%u ioctl_seed_set=%u secure_wrapped=%u elapsed_us=%llu srv_elapsed_ms=%lld last_hb_elapsed_ms=%lld last_srv2_caller_pid=%lld pending_timeout=%ld",
                     tier_a_trace_id,
                     STATUS_INVALID_DEVICE_REQUEST,
                     code,
                     early_expected_tira,
                     _InterlockedCompareExchange(&g_driver_activated, 0, 0),
                     handle_to_u64(caller_validation::g_registered_client_pid),
-                    _InterlockedCompareExchange64(&g_last_heartbeat_time, 0, 0) != 0 ? 1u : 0u,
+                    reject_hb_time_snapshot != 0 ? 1u : 0u,
                     dynamic_key::g_server_seed != 0 ? 1u : 0u,
                     ioctl_codes::g_server_ioctl_seed != 0 ? 1u : 0u,
                     secure_wrapped ? 1u : 0u,
-                    elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq));
+                    elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                    reject_srv_elapsed_ms,
+                    reject_hb_elapsed_ms,
+                    _InterlockedCompareExchange64(&g_last_srv2_caller_pid, 0, 0),
+                    _InterlockedCompareExchange(&g_server_token_timeout_pending, 0, 0));
             }
             if (secure_work_buffer)
                 ExFreePoolWithTag(secure_work_buffer, 'mocS');
@@ -2219,6 +2304,8 @@ namespace dispatcher {
                     activate_server_seed_state(srvt->server_nonce, srvt->token_hash, srvt->session_key);
                     _InterlockedExchange(&g_driver_activated, 1);
                     _InterlockedExchange64(&g_last_heartbeat_time, current_time.QuadPart);
+                    _InterlockedExchange(&dispatcher_rekey::g_session_needs_rekey, 0);
+                    _InterlockedExchange64(&dispatcher_rekey::g_session_soft_demote_qpc, 0);
 
                     srvt->result = 1;
                     WW_LOG("SRVT: accepted result=%u expected_bytes=%llu returned_bytes=%llu token_present=%u nonce_present=%u session_present=%u caller_pid=%llu registered_pid=%llu server_seed_set=%u ioctl_seed_set=%u elapsed_us=%llu",
@@ -2314,6 +2401,22 @@ namespace dispatcher {
                             _InterlockedExchange64(&g_last_heartbeat_time, current_time.QuadPart);
                             _InterlockedIncrement((volatile LONG*)&g_heartbeat_counter);
                             sentinel_bridge::tick();
+
+                            LONG rekey_pending = _InterlockedCompareExchange(&dispatcher_rekey::g_session_needs_rekey, 0, 0);
+                            if (rekey_pending != 0) {
+                                LONG64 last_rekey_log = _InterlockedCompareExchange64(&dispatcher_rekey::g_last_rekey_required_log_qpc, 0, 0);
+                                LONG64 since_last_log = last_rekey_log == 0 ? REKEY_REQUIRED_LOG_INTERVAL + 1 : current_time.QuadPart - last_rekey_log;
+                                if (since_last_log > REKEY_REQUIRED_LOG_INTERVAL) {
+                                    _InterlockedExchange64(&dispatcher_rekey::g_last_rekey_required_log_qpc, current_time.QuadPart);
+                                    LONG64 demote_qpc = _InterlockedCompareExchange64(&dispatcher_rekey::g_session_soft_demote_qpc, 0, 0);
+                                    LONG64 hb_age_since_demote_100ns = demote_qpc == 0 ? -1 : current_time.QuadPart - demote_qpc;
+                                    WW_LOG("HB: rekey_required_observed activated=%ld session_needs_rekey=%ld counter=%lu hb_age_since_demote_100ns=%lld",
+                                        _InterlockedCompareExchange(&g_driver_activated, 0, 0),
+                                        rekey_pending,
+                                        g_heartbeat_counter,
+                                        hb_age_since_demote_100ns);
+                                }
+                            }
                             hb->whoswho_tsc = (UINT64)sentinel_bridge::g_bridge.whoswho_tsc;
                             hb->sentinel_tsc = (UINT64)sentinel_bridge::g_bridge.sentinel_tsc;
 
@@ -2387,7 +2490,9 @@ namespace dispatcher {
                 if (NT_SUCCESS(status) && srvt2->result == 1) {
                     activate_server_seed_state(srvt2->server_nonce, srvt2->token_hash, srvt2->session_key);
                     _InterlockedExchange(&g_driver_activated, 1);
-                    WW_LOG("SRVT2: accepted result=%u expected_bytes=%llu returned_bytes=%llu token_present=%u nonce_present=%u proof_set=%u session_present=%u caller_pid=%llu registered_pid=%llu action=%u server_seed_set=%u ioctl_seed_set=%u elapsed_us=%llu",
+                    LONG soft_demote_prev = _InterlockedExchange(&dispatcher_rekey::g_session_needs_rekey, 0);
+                    LONG64 demote_qpc_cleared = _InterlockedExchange64(&dispatcher_rekey::g_session_soft_demote_qpc, 0);
+                    WW_LOG("SRVT2: accepted result=%u expected_bytes=%llu returned_bytes=%llu token_present=%u nonce_present=%u proof_set=%u session_present=%u caller_pid=%llu registered_pid=%llu action=%u server_seed_set=%u ioctl_seed_set=%u elapsed_us=%llu soft_demote_cleared=%ld demote_qpc=%lld",
                         srvt2->result,
                         static_cast<UINT64>(sizeof(server_token_relay_v2)),
                         static_cast<UINT64>(sizeof(server_token_relay_v2)),
@@ -2400,7 +2505,9 @@ namespace dispatcher {
                         srvt2->action,
                         dynamic_key::g_server_seed != 0 ? 1u : 0u,
                         ioctl_codes::g_server_ioctl_seed != 0 ? 1u : 0u,
-                        elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq));
+                        elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
+                        soft_demote_prev,
+                        demote_qpc_cleared);
                 } else {
                     WW_LOG("SRVT2: rejected status=0x%08lx result=%u expected_bytes=%llu returned_bytes=%llu token_present=%u nonce_present=%u proof_set=%u session_present=%u caller_pid=%llu registered_pid=%llu action=%u elapsed_us=%llu",
                         status,

@@ -59,6 +59,7 @@
 #include "core/anti-tamper/cff.hpp"
 #include "core/anti-tamper/virtualizer.hpp"
 #include "core/disasm/function_index.hpp"
+#include "core/analysis/pdb_parser.hpp"
 #include "core/auth/auth_http.hpp"
 #include "core/ui/loading_binary_overlay.hpp"
 #include <shellapi.h>
@@ -2091,6 +2092,61 @@ namespace aida_tracer {
                     const bool sustained_hang = age_ms >= 10000ULL && (stall_streak == 32ULL || (stall_streak % 120ULL) == 0ULL);
                     if (render_tid != 0 && sustained_hang && !shutdown_context)
                         capture_render_thread_snapshot(render_tid, age_ms);
+                }
+                static uint64_t s_last_dbghelp_recovery_ms = 0;
+                const bool render_disasm_section = render_section &&
+                    std::strcmp(render_section, "center_view_disassembly") == 0;
+                const bool dbghelp_in_progress = pdb_parser::g_dbghelp_load_state.in_progress;
+                const uint64_t dbghelp_started_ms = pdb_parser::g_dbghelp_load_state.started_ms;
+                const uint64_t dbghelp_owner_age_ms = (dbghelp_in_progress && dbghelp_started_ms != 0 && now >= dbghelp_started_ms)
+                    ? (now - dbghelp_started_ms)
+                    : 0ULL;
+                const bool dbghelp_actually_stuck = dbghelp_in_progress && dbghelp_owner_age_ms > 30000ULL;
+                const bool dbghelp_recovery_eligible = age_ms > 60000ULL && render_disasm_section && dbghelp_actually_stuck &&
+                    !is_shutdown_stall_context(phase_name, dispatch_msg, wndproc_msg);
+                if (dbghelp_recovery_eligible && (s_last_dbghelp_recovery_ms == 0 ||
+                                                  now - s_last_dbghelp_recovery_ms >= 30000ULL)) {
+                    s_last_dbghelp_recovery_ms = now;
+                    const bool quarantined_before = pdb_parser::dbghelp_is_quarantined();
+                    bool quarantine_triggered = false;
+                    if (!quarantined_before) {
+                        pdb_parser::quarantine_dbghelp_and_recycle();
+                        quarantine_triggered = true;
+                    }
+                    HWND rescue_hwnd = g_hwnd;
+                    BOOL nudge_posted = FALSE;
+                    DWORD nudge_gle = 0;
+                    if (rescue_hwnd && ::IsWindow(rescue_hwnd)) {
+                        ::SetLastError(0);
+                        nudge_posted = ::PostMessageW(rescue_hwnd, WM_NULL, 0, 0);
+                        nudge_gle = ::GetLastError();
+                        ::InvalidateRect(rescue_hwnd, nullptr, FALSE);
+                    }
+                    diag::log_tagged_critical_fmt("tracer",
+                        "render_stall_recovery_attempt age_ms=%llu phase=%s section=%s render_tid=%lu dbghelp_in_progress=%d dbghelp_owner_age_ms=%llu quarantine_triggered=%d quarantined_before=%d nudge_posted=%d nudge_gle=%lu",
+                        static_cast<unsigned long long>(age_ms),
+                        phase_name ? phase_name : "<null>",
+                        render_section ? render_section : "<null>",
+                        render_tid,
+                        dbghelp_in_progress ? 1 : 0,
+                        static_cast<unsigned long long>(dbghelp_owner_age_ms),
+                        quarantine_triggered ? 1 : 0,
+                        quarantined_before ? 1 : 0,
+                        nudge_posted ? 1 : 0,
+                        static_cast<unsigned long>(nudge_gle));
+                } else if (age_ms > 60000ULL && render_disasm_section &&
+                           !is_shutdown_stall_context(phase_name, dispatch_msg, wndproc_msg) &&
+                           (s_last_dbghelp_recovery_ms == 0 ||
+                            now - s_last_dbghelp_recovery_ms >= 30000ULL)) {
+                    s_last_dbghelp_recovery_ms = now;
+                    diag::log_tagged_critical_fmt("tracer",
+                        "render_stall_recovery_skipped age_ms=%llu phase=%s section=%s render_tid=%lu reason=dbghelp_not_in_flight dbghelp_in_progress=%d dbghelp_owner_age_ms=%llu",
+                        static_cast<unsigned long long>(age_ms),
+                        phase_name ? phase_name : "<null>",
+                        render_section ? render_section : "<null>",
+                        render_tid,
+                        dbghelp_in_progress ? 1 : 0,
+                        static_cast<unsigned long long>(dbghelp_owner_age_ms));
                 }
             } else {
                 stall_streak = 0;

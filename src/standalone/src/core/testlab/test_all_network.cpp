@@ -76,6 +76,52 @@ namespace {
         failed.fetch_add(1);
     }
 
+    static long long elapsed_us_since(std::chrono::steady_clock::time_point t0) {
+        return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+    }
+
+    static const char* network_sub_tab_label(network_view::sub_tab_t tab) {
+        switch (tab) {
+        case network_view::sub_tab_t::connections: return "connections";
+        case network_view::sub_tab_t::capture: return "capture";
+        case network_view::sub_tab_t::intercept: return "intercept";
+        case network_view::sub_tab_t::proxy: return "proxy";
+        case network_view::sub_tab_t::dns: return "dns";
+        case network_view::sub_tab_t::filters: return "filters";
+        case network_view::sub_tab_t::bandwidth: return "bandwidth";
+        case network_view::sub_tab_t::repeater: return "repeater";
+        case network_view::sub_tab_t::keylog: return "keylog";
+        case network_view::sub_tab_t::pcap_export: return "pcap_export";
+        case network_view::sub_tab_t::fuzzer: return "fuzzer";
+        case network_view::sub_tab_t::websocket: return "websocket";
+        case network_view::sub_tab_t::scripting: return "scripting";
+        case network_view::sub_tab_t::decoder: return "decoder";
+        case network_view::sub_tab_t::sitemap: return "sitemap";
+        case network_view::sub_tab_t::scope: return "scope";
+        case network_view::sub_tab_t::cookies: return "cookies";
+        case network_view::sub_tab_t::scanner: return "scanner";
+        case network_view::sub_tab_t::recon: return "recon";
+        case network_view::sub_tab_t::intruder: return "intruder";
+        case network_view::sub_tab_t::collab: return "collab";
+        case network_view::sub_tab_t::sequencer: return "sequencer";
+        case network_view::sub_tab_t::comparer: return "comparer";
+        case network_view::sub_tab_t::jwt: return "jwt";
+        case network_view::sub_tab_t::mr: return "mr";
+        case network_view::sub_tab_t::session: return "session";
+        case network_view::sub_tab_t::api: return "api";
+        case network_view::sub_tab_t::ws_edit: return "ws_edit";
+        case network_view::sub_tab_t::h2_edit: return "h2_edit";
+        case network_view::sub_tab_t::logger: return "logger";
+        case network_view::sub_tab_t::csp: return "csp";
+        case network_view::sub_tab_t::upstream: return "upstream";
+        case network_view::sub_tab_t::browser: return "browser";
+        case network_view::sub_tab_t::reports: return "reports";
+        case network_view::sub_tab_t::headless: return "headless";
+        case network_view::sub_tab_t::COUNT: break;
+        }
+        return "";
+    }
+
     struct bounded_bool_result_t {
         bool completed = false;
         bool value = false;
@@ -2544,18 +2590,39 @@ namespace {
             failed.fetch_add(1);
             return;
         }
-        driver_bridge::network_stats_t stats;
+        auto t0 = std::chrono::steady_clock::now();
+        driver_bridge::network_stats_t stats{};
         bool ok = driver_bridge::get_network_stats(stats);
-        if (ok) {
-            log_msg(hf, tag, "PASS -- bytes_sent=%llu bytes_recv=%llu pkts_sent=%llu pkts_recv=%llu active_conns=%u captured=%u",
-                (unsigned long long)stats.bytes_sent, (unsigned long long)stats.bytes_received,
-                (unsigned long long)stats.packets_sent, (unsigned long long)stats.packets_received,
-                (unsigned)stats.active_connections, (unsigned)stats.total_captured);
-            passed.fetch_add(1);
-        } else {
-            log_msg(hf, tag, "PASS -- get_network_stats returned false (driver may not support)");
-            passed.fetch_add(1);
+        long long us = elapsed_us_since(t0);
+        log_msg(hf, tag, "RESULT ok=%d bytes_sent=%llu bytes_recv=%llu pkts_sent=%llu pkts_recv=%llu active_conns=%u captured=%u elapsed_us=%lld driver_status=\"%s\" last_error=\"%s\"",
+            ok ? 1 : 0,
+            (unsigned long long)stats.bytes_sent, (unsigned long long)stats.bytes_received,
+            (unsigned long long)stats.packets_sent, (unsigned long long)stats.packets_received,
+            (unsigned)stats.active_connections, (unsigned)stats.total_captured,
+            us,
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str());
+        if (!ok) {
+            fail_empty_evidence(hf, tag, failed,
+                "get_network_stats returned false; kernel network stats are mandatory and have no usermode fallback driver_status=\"%s\" last_error=\"%s\"",
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+            return;
         }
+        const bool all_zero =
+            stats.bytes_sent == 0 && stats.bytes_received == 0 &&
+            stats.packets_sent == 0 && stats.packets_received == 0 &&
+            stats.active_connections == 0 && stats.total_captured == 0;
+        if (all_zero) {
+            fail_empty_evidence(hf, tag, failed,
+                "get_network_stats returned ok=true but every counter is zero; a live attached target always has nonzero aggregate network counters");
+            return;
+        }
+        log_msg(hf, tag, "PASS -- bytes_sent=%llu bytes_recv=%llu pkts_sent=%llu pkts_recv=%llu active_conns=%u captured=%u elapsed_us=%lld",
+            (unsigned long long)stats.bytes_sent, (unsigned long long)stats.bytes_received,
+            (unsigned long long)stats.packets_sent, (unsigned long long)stats.packets_received,
+            (unsigned)stats.active_connections, (unsigned)stats.total_captured, us);
+        passed.fetch_add(1);
     }
 
     void test_driver_bw_monitor(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -2703,14 +2770,24 @@ namespace {
             failed.fetch_add(1);
             return;
         }
+        auto t0 = std::chrono::steady_clock::now();
         auto callouts = driver_bridge::enumerate_wfp_callouts("");
-        log_msg(hf, tag, "PASS -- enumerate_wfp_callouts returned %zu entries", callouts.size());
-        if (!callouts.empty()) {
-            log_msg(hf, tag, "  first: id=%u layer=%u module=%s",
-                (unsigned)callouts[0].callout_id,
-                (unsigned)callouts[0].layer_id,
-                callouts[0].owning_module.c_str());
+        long long us = elapsed_us_since(t0);
+        log_msg(hf, tag, "RESULT count=%zu elapsed_us=%lld driver_status=\"%s\" last_error=\"%s\"",
+            callouts.size(), us,
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str());
+        if (callouts.empty()) {
+            fail_empty_evidence(hf, tag, failed,
+                "enumerate_wfp_callouts returned 0 entries; the Windows base filter engine ships callouts on every supported build (BFE, mpsdrv, etc.). Zero indicates a broken kernel enumeration path");
+            return;
         }
+        log_msg(hf, tag, "  first: id=%u layer=%u module=%s",
+            (unsigned)callouts[0].callout_id,
+            (unsigned)callouts[0].layer_id,
+            callouts[0].owning_module.c_str());
+        log_msg(hf, tag, "PASS -- enumerate_wfp_callouts returned %zu entries elapsed_us=%lld",
+            callouts.size(), us);
         passed.fetch_add(1);
     }
 
@@ -2725,8 +2802,24 @@ namespace {
             failed.fetch_add(1);
             return;
         }
-        auto sockets = driver_bridge::get_socket_handles(0);
-        log_msg(hf, tag, "PASS -- get_socket_handles returned %zu entries", sockets.size());
+        auto t0 = std::chrono::steady_clock::now();
+        auto sockets_global = driver_bridge::get_socket_handles(0);
+        long long us_global = elapsed_us_since(t0);
+        log_msg(hf, tag, "RESULT global pid=0 count=%zu elapsed_us=%lld",
+            sockets_global.size(), us_global);
+        const uint32_t target_pid = driver_bridge::attached_pid();
+        auto t1 = std::chrono::steady_clock::now();
+        auto sockets_target = target_pid ? driver_bridge::get_socket_handles(target_pid) : std::vector<driver_bridge::socket_info_t>{};
+        long long us_target = elapsed_us_since(t1);
+        log_msg(hf, tag, "RESULT target pid=%u count=%zu elapsed_us=%lld",
+            (unsigned)target_pid, sockets_target.size(), us_target);
+        if (sockets_global.empty()) {
+            fail_empty_evidence(hf, tag, failed,
+                "get_socket_handles(pid=0) returned 0 entries; a running Windows host always has open sockets (svchost, lsass, etc.)");
+            return;
+        }
+        log_msg(hf, tag, "PASS -- get_socket_handles global=%zu target_pid=%u target=%zu elapsed_us_global=%lld elapsed_us_target=%lld",
+            sockets_global.size(), (unsigned)target_pid, sockets_target.size(), us_global, us_target);
         passed.fetch_add(1);
     }
 
@@ -2741,14 +2834,24 @@ namespace {
             failed.fetch_add(1);
             return;
         }
+        auto t0 = std::chrono::steady_clock::now();
         auto conns = driver_bridge::dump_tcpip_connections(0, 0);
-        log_msg(hf, tag, "PASS -- dump_tcpip_connections returned %zu entries", conns.size());
-        if (!conns.empty()) {
-            log_msg(hf, tag, "  first: pid=%u proto=%u local_port=%u remote_port=%u state=%u",
-                (unsigned)conns[0].pid, (unsigned)conns[0].protocol,
-                (unsigned)conns[0].local_port, (unsigned)conns[0].remote_port,
-                (unsigned)conns[0].state);
+        long long us = elapsed_us_since(t0);
+        log_msg(hf, tag, "RESULT count=%zu elapsed_us=%lld driver_status=\"%s\" last_error=\"%s\"",
+            conns.size(), us,
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str());
+        if (conns.empty()) {
+            fail_empty_evidence(hf, tag, failed,
+                "dump_tcpip_connections returned 0 entries; a Windows host always has at least loopback/IPv4/IPv6 listeners (svchost, lsass, etc.)");
+            return;
         }
+        log_msg(hf, tag, "  first: pid=%u proto=%u local_port=%u remote_port=%u state=%u",
+            (unsigned)conns[0].pid, (unsigned)conns[0].protocol,
+            (unsigned)conns[0].local_port, (unsigned)conns[0].remote_port,
+            (unsigned)conns[0].state);
+        log_msg(hf, tag, "PASS -- dump_tcpip_connections returned %zu entries elapsed_us=%lld",
+            conns.size(), us);
         passed.fetch_add(1);
     }
 
@@ -2763,13 +2866,25 @@ namespace {
             failed.fetch_add(1);
             return;
         }
+        auto t0 = std::chrono::steady_clock::now();
         auto ifaces = driver_bridge::enumerate_interfaces();
-        log_msg(hf, tag, "PASS -- enumerate_interfaces returned %zu entries", ifaces.size());
+        long long us = elapsed_us_since(t0);
+        log_msg(hf, tag, "RESULT count=%zu elapsed_us=%lld driver_status=\"%s\" last_error=\"%s\"",
+            ifaces.size(), us,
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str());
+        if (ifaces.empty()) {
+            fail_empty_evidence(hf, tag, failed,
+                "enumerate_interfaces returned 0 entries; a Windows host always has at least the loopback adapter");
+            return;
+        }
         for (size_t i = 0; i < ifaces.size() && i < 3; i++) {
             log_msg(hf, tag, "  iface[%zu]: name=%s mtu=%u speed=%llu",
                 i, ifaces[i].name.c_str(), (unsigned)ifaces[i].mtu,
                 (unsigned long long)ifaces[i].speed);
         }
+        log_msg(hf, tag, "PASS -- enumerate_interfaces returned %zu entries elapsed_us=%lld",
+            ifaces.size(), us);
         passed.fetch_add(1);
     }
 
@@ -3036,16 +3151,32 @@ namespace {
         }
         uint8_t spoof_addr[4] = { 127, 0, 0, 1 };
         uint32_t rule_id = 0;
+        auto t0 = std::chrono::steady_clock::now();
         bool added = driver_bridge::dns_spoof_op(0, 0, "aida-test-internal.invalid",
             spoof_addr, 2, 60, &rule_id);
-        if (added && rule_id != 0) {
-            bool removed = driver_bridge::dns_spoof_op(1, rule_id);
-            log_msg(hf, tag, "PASS -- dns_spoof added rule_id=%u, removed=%s",
-                (unsigned)rule_id, removed ? "true" : "false");
-        } else {
-            log_msg(hf, tag, "PASS -- dns_spoof_op add returned %s (driver may not support)",
-                added ? "true" : "false");
+        long long us_add = elapsed_us_since(t0);
+        log_msg(hf, tag, "RESULT add ok=%d rule_id=%u elapsed_us=%lld driver_status=\"%s\" last_error=\"%s\"",
+            added ? 1 : 0, (unsigned)rule_id, us_add,
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str());
+        if (!added || rule_id == 0) {
+            fail_empty_evidence(hf, tag, failed,
+                "dns_spoof_op add returned %s rule_id=%u; kernel DNS spoof is mandatory and has no usermode fallback",
+                added ? "true" : "false", (unsigned)rule_id);
+            return;
         }
+        auto t1 = std::chrono::steady_clock::now();
+        bool removed = driver_bridge::dns_spoof_op(1, rule_id);
+        long long us_rem = elapsed_us_since(t1);
+        log_msg(hf, tag, "RESULT remove ok=%d rule_id=%u elapsed_us=%lld",
+            removed ? 1 : 0, (unsigned)rule_id, us_rem);
+        if (!removed) {
+            fail_empty_evidence(hf, tag, failed,
+                "dns_spoof_op add succeeded rule_id=%u but remove returned false", (unsigned)rule_id);
+            return;
+        }
+        log_msg(hf, tag, "PASS -- dns_spoof added rule_id=%u removed=true elapsed_us_add=%lld elapsed_us_remove=%lld",
+            (unsigned)rule_id, us_add, us_rem);
         passed.fetch_add(1);
     }
 
@@ -3720,12 +3851,33 @@ namespace {
 
     void select_network_tab(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed,
                             const char* tag, network_view::sub_tab_t value) {
+        auto t0 = std::chrono::steady_clock::now();
+        const network_view::sub_tab_t before = network_view::g_state.active_tab;
+        const char* before_label = network_sub_tab_label(before);
+        const char* target_label = network_sub_tab_label(value);
+        log_msg(hf, tag, "STATE -- before=%d label=%s target=%d target_label=%s tid=%lu",
+            static_cast<int>(before),
+            before_label,
+            static_cast<int>(value),
+            target_label,
+            (unsigned long)GetCurrentThreadId());
         network_view::g_state.active_tab = value;
-        if (network_view::g_state.active_tab == value) {
-            log_msg(hf, tag, "PASS -- network active_tab selected (%d)", static_cast<int>(value));
+        const network_view::sub_tab_t got = network_view::g_state.active_tab;
+        const char* got_label = network_sub_tab_label(got);
+        long long us = elapsed_us_since(t0);
+        log_msg(hf, tag, "STATE -- after=%d label=%s changed=%d elapsed_us=%lld",
+            static_cast<int>(got),
+            got_label,
+            (before != got) ? 1 : 0,
+            us);
+        if (got == value && target_label[0] != '\0') {
+            log_msg(hf, tag, "PASS -- network sub_tab selected and read back (%d label=%s elapsed_us=%lld)",
+                static_cast<int>(value), got_label, us);
             passed.fetch_add(1);
         } else {
-            log_msg(hf, tag, "FAIL -- network active_tab not selected (%d)", static_cast<int>(value));
+            log_msg(hf, tag, "FAIL -- network sub_tab set %d (%s) but read back %d (%s) elapsed_us=%lld",
+                static_cast<int>(value), target_label,
+                static_cast<int>(got), got_label, us);
             failed.fetch_add(1);
         }
     }
@@ -4091,80 +4243,103 @@ void phase_network_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& 
     if (cancelled && cancelled()) return;
     call_test(test_network_view_state, hf, passed, failed);
 
-    if (cancelled && cancelled()) return;
-    call_test_s(test_driver_enumerate_connections, hf, passed, failed, skipped);
+    bool drv_phase_barrier_ready = false;
+    if (driver_bridge::using_kernel_driver()) {
+        const ULONGLONG barrier_start = GetTickCount64();
+        drv_phase_barrier_ready = driver_bridge::require_dynamic_session_ready(5000);
+        const ULONGLONG barrier_elapsed = GetTickCount64() - barrier_start;
+        log_msg(hf, "net_phase",
+            "drv_phase_barrier ready=%d elapsed_ms=%llu timeout_ms=5000",
+            drv_phase_barrier_ready ? 1 : 0,
+            static_cast<unsigned long long>(barrier_elapsed));
+    } else {
+        log_msg(hf, "net_phase",
+            "drv_phase_barrier skipped reason=kernel_driver_not_loaded driver_status=\"%s\" last_error=\"%s\"",
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str());
+    }
+    if (driver_bridge::using_kernel_driver() && !drv_phase_barrier_ready) {
+        const int aborted_test_count = 25;
+        log_msg(hf, "net_phase",
+            "FAIL -- network phase aborted: kernel session not seeded after 5000ms; skipping %d drv_* tests as grouped failure",
+            aborted_test_count);
+        failed.fetch_add(1);
+    } else {
+        if (cancelled && cancelled()) return;
+        call_test_s(test_driver_enumerate_connections, hf, passed, failed, skipped);
 
-    if (cancelled && cancelled()) return;
-    call_test_s(test_driver_start_stop_capture, hf, passed, failed, skipped);
+        if (cancelled && cancelled()) return;
+        call_test_s(test_driver_start_stop_capture, hf, passed, failed, skipped);
 
-    if (cancelled && cancelled()) return;
-    call_test_s(test_driver_get_packets, hf, passed, failed, skipped);
+        if (cancelled && cancelled()) return;
+        call_test_s(test_driver_get_packets, hf, passed, failed, skipped);
 
-    if (cancelled && cancelled()) return;
-    call_test_s(test_driver_dns_queries, hf, passed, failed, skipped);
+        if (cancelled && cancelled()) return;
+        call_test_s(test_driver_dns_queries, hf, passed, failed, skipped);
 
-    if (cancelled && cancelled()) return;
-    call_test_s(test_driver_filter_rules, hf, passed, failed, skipped);
+        if (cancelled && cancelled()) return;
+        call_test_s(test_driver_filter_rules, hf, passed, failed, skipped);
 
-    if (cancelled && cancelled()) return;
-    call_test_s(test_driver_clear_filters, hf, passed, failed, skipped);
+        if (cancelled && cancelled()) return;
+        call_test_s(test_driver_clear_filters, hf, passed, failed, skipped);
 
-    if (cancelled && cancelled()) return;
-    call_test_s(test_driver_network_stats, hf, passed, failed, skipped);
+        if (cancelled && cancelled()) return;
+        call_test_s(test_driver_network_stats, hf, passed, failed, skipped);
 
-    if (cancelled && cancelled()) return;
-    call_test_s(test_driver_bw_monitor, hf, passed, failed, skipped);
+        if (cancelled && cancelled()) return;
+        call_test_s(test_driver_bw_monitor, hf, passed, failed, skipped);
 
-    if (cancelled && cancelled()) return;
-    call_test_s(test_driver_bw_per_process, hf, passed, failed, skipped);
+        if (cancelled && cancelled()) return;
+        call_test_s(test_driver_bw_per_process, hf, passed, failed, skipped);
 
-    if (cancelled && cancelled()) return;
-    call_test_s(test_driver_dpi_results, hf, passed, failed, skipped);
+        if (cancelled && cancelled()) return;
+        call_test_s(test_driver_dpi_results, hf, passed, failed, skipped);
 
-    if (cancelled && cancelled()) return;
-    call_test_s(test_driver_wfp_callouts, hf, passed, failed, skipped);
+        if (cancelled && cancelled()) return;
+        call_test_s(test_driver_wfp_callouts, hf, passed, failed, skipped);
 
-    if (cancelled && cancelled()) return;
-    call_test_s(test_driver_socket_handles, hf, passed, failed, skipped);
+        if (cancelled && cancelled()) return;
+        call_test_s(test_driver_socket_handles, hf, passed, failed, skipped);
 
-    if (cancelled && cancelled()) return;
-    call_test_s(test_driver_tcpip_dump, hf, passed, failed, skipped);
+        if (cancelled && cancelled()) return;
+        call_test_s(test_driver_tcpip_dump, hf, passed, failed, skipped);
 
-    if (cancelled && cancelled()) return;
-    call_test_s(test_driver_interfaces, hf, passed, failed, skipped);
+        if (cancelled && cancelled()) return;
+        call_test_s(test_driver_interfaces, hf, passed, failed, skipped);
 
-    if (cancelled && cancelled()) return;
-    call_test_s(test_driver_export_pcap, hf, passed, failed, skipped);
+        if (cancelled && cancelled()) return;
+        call_test_s(test_driver_export_pcap, hf, passed, failed, skipped);
 
-    if (cancelled && cancelled()) return;
-    call_test_s(test_driver_held_packets, hf, passed, failed, skipped);
+        if (cancelled && cancelled()) return;
+        call_test_s(test_driver_held_packets, hf, passed, failed, skipped);
 
-    if (cancelled && cancelled()) return;
-    call_test_s(test_driver_packet_mod_rules, hf, passed, failed, skipped);
+        if (cancelled && cancelled()) return;
+        call_test_s(test_driver_packet_mod_rules, hf, passed, failed, skipped);
 
-    if (cancelled && cancelled()) return;
-    call_test_s(test_driver_redirect_rules, hf, passed, failed, skipped);
+        if (cancelled && cancelled()) return;
+        call_test_s(test_driver_redirect_rules, hf, passed, failed, skipped);
 
-    if (cancelled && cancelled()) return;
-    call_test_s(test_driver_dns_spoof_rules, hf, passed, failed, skipped);
+        if (cancelled && cancelled()) return;
+        call_test_s(test_driver_dns_spoof_rules, hf, passed, failed, skipped);
 
-    if (cancelled && cancelled()) return;
-    call_test_s(test_driver_dns_spoof_add_remove, hf, passed, failed, skipped);
+        if (cancelled && cancelled()) return;
+        call_test_s(test_driver_dns_spoof_add_remove, hf, passed, failed, skipped);
 
-    if (cancelled && cancelled()) return;
-    call_test_s(test_driver_traffic_redirect, hf, passed, failed, skipped);
+        if (cancelled && cancelled()) return;
+        call_test_s(test_driver_traffic_redirect, hf, passed, failed, skipped);
 
-    if (cancelled && cancelled()) return;
-    call_test_s(test_driver_stream_reassemble, hf, passed, failed, skipped);
+        if (cancelled && cancelled()) return;
+        call_test_s(test_driver_stream_reassemble, hf, passed, failed, skipped);
 
-    if (cancelled && cancelled()) return;
-    call_test_s(test_driver_fingerprint, hf, passed, failed, skipped);
+        if (cancelled && cancelled()) return;
+        call_test_s(test_driver_fingerprint, hf, passed, failed, skipped);
 
-    if (cancelled && cancelled()) return;
-    call_test_s(test_driver_intercept_op, hf, passed, failed, skipped);
+        if (cancelled && cancelled()) return;
+        call_test_s(test_driver_intercept_op, hf, passed, failed, skipped);
 
-    if (cancelled && cancelled()) return;
-    call_test_s(test_driver_inject_loopback, hf, passed, failed, skipped);
+        if (cancelled && cancelled()) return;
+        call_test_s(test_driver_inject_loopback, hf, passed, failed, skipped);
+    }
 
     if (cancelled && cancelled()) return;
     call_test(test_net_tab_connections, hf, passed, failed);

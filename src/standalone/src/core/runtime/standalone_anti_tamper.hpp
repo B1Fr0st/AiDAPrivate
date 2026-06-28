@@ -198,7 +198,10 @@ namespace detect
 
     inline bool check_kernel_debugger()
     {
-        SYSTEM_KERNEL_DEBUGGER_INFORMATION kd_info{};
+        struct kernel_debugger_information_t {
+            BOOLEAN KernelDebuggerEnabled;
+            BOOLEAN KernelDebuggerNotPresent;
+        } kd_info{};
         using NtQuerySystemInformation_t = NTSTATUS(NTAPI*)(ULONG, PVOID, ULONG, PULONG);
         auto pQuery = reinterpret_cast<NtQuerySystemInformation_t>(
             GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation"));
@@ -871,6 +874,88 @@ inline void shutdown()
 
     if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver())
         driver_bridge::unregister_dll_protection();
+}
+
+inline bool on_kernel_session_rearmed(const char* reason)
+{
+    auto& rt = anti_tamper::state::get();
+    const uint64_t enter_ms = static_cast<uint64_t>(GetTickCount64());
+    const bool hardening_done_pre = rt.driver_hardening_done.load(std::memory_order_acquire);
+
+    if (!rt.initialized.load(std::memory_order_acquire))
+    {
+        diag::log_tagged_fmt("anti_tamper",
+            "on_kernel_session_rearmed reason=%s rearm_elapsed_ms=0 hardening_done_pre=%d hardening_done_post=%d anti_debug_ok=0 anti_dump_ok=0 dprt_ok=0 capsule_bind_ok=0 skipped=at_not_initialized",
+            reason ? reason : "unknown",
+            hardening_done_pre ? 1 : 0,
+            hardening_done_pre ? 1 : 0);
+        return false;
+    }
+
+    if (rt.violation_latched.load(std::memory_order_acquire))
+    {
+        diag::log_tagged_critical_fmt("anti_tamper",
+            "on_kernel_session_rearmed reason=%s rearm_elapsed_ms=0 hardening_done_pre=%d hardening_done_post=%d skipped=violation_latched",
+            reason ? reason : "unknown",
+            hardening_done_pre ? 1 : 0,
+            hardening_done_pre ? 1 : 0);
+        return false;
+    }
+
+    if (!driver_bridge::is_loaded() || !driver_bridge::using_kernel_driver())
+    {
+        diag::log_tagged_critical_fmt("anti_tamper",
+            "on_kernel_session_rearmed reason=%s rearm_elapsed_ms=0 hardening_done_pre=%d hardening_done_post=%d skipped=driver_unavailable loaded=%d kernel=%d",
+            reason ? reason : "unknown",
+            hardening_done_pre ? 1 : 0,
+            hardening_done_pre ? 1 : 0,
+            driver_bridge::is_loaded() ? 1 : 0,
+            driver_bridge::using_kernel_driver() ? 1 : 0);
+        return false;
+    }
+
+    bool anti_debug_ok = false;
+    uint64_t debugger_pid = 0;
+    bool scan_ok = driver_bridge::kernel_anti_debug_scan_debuggers(&debugger_pid);
+    anti_debug_ok = scan_ok && debugger_pid == 0;
+
+    bool anti_dump_ok = !detect::check_peb_debug_flags()
+        && !detect::check_debug_port()
+        && !detect::check_remote_debugger();
+
+    bool dprt_ok = false;
+    bool capsule_bind_ok = false;
+    if (rt.code_snap.module_base != 0 && rt.code_snap.text_base != 0 && rt.code_snap.text_size != 0
+        && rt.code_snap.text_hash != 0)
+    {
+        const uint64_t current_hash = integrity::hash_memory(
+            reinterpret_cast<const void*>(rt.code_snap.text_base),
+            rt.code_snap.text_size);
+        capsule_bind_ok = current_hash == rt.code_snap.text_hash;
+        dprt_ok = capsule_bind_ok;
+    }
+
+    bool all_ok = anti_debug_ok && anti_dump_ok && dprt_ok && capsule_bind_ok;
+    bool hardening_done_post = hardening_done_pre;
+    if (all_ok)
+    {
+        rt.driver_hardening_done.store(true, std::memory_order_release);
+        hardening_done_post = true;
+    }
+
+    const uint64_t elapsed_ms = static_cast<uint64_t>(GetTickCount64()) - enter_ms;
+    diag::log_tagged_critical_fmt("anti_tamper",
+        "on_kernel_session_rearmed reason=%s rearm_elapsed_ms=%llu hardening_done_pre=%d hardening_done_post=%d anti_debug_ok=%d anti_dump_ok=%d dprt_ok=%d capsule_bind_ok=%d debugger_pid=%llu",
+        reason ? reason : "unknown",
+        static_cast<unsigned long long>(elapsed_ms),
+        hardening_done_pre ? 1 : 0,
+        hardening_done_post ? 1 : 0,
+        anti_debug_ok ? 1 : 0,
+        anti_dump_ok ? 1 : 0,
+        dprt_ok ? 1 : 0,
+        capsule_bind_ok ? 1 : 0,
+        static_cast<unsigned long long>(debugger_pid));
+    return all_ok;
 }
 
 }

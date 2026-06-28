@@ -214,11 +214,11 @@ uint64_t next_request_id()
 constexpr int kToolListWaitMaxMs = 5000;
 constexpr int kLaunchWaitMinMs = 5000;
 constexpr int kLaunchWaitMaxMs = 120000;
-constexpr int kBundledVisibleLaunchWaitMinMs = 55000;
-constexpr int kBundledVisibleLaunchWaitMaxMs = 60000;
+constexpr int kBundledVisibleLaunchWaitMinMs = 60000;
+constexpr int kBundledVisibleLaunchWaitMaxMs = 75000;
 constexpr int kTestLabLaunchWaitDefaultMs = 75000;
 constexpr int kTestLabLaunchWaitMaxMs = 90000;
-constexpr int kStrictLaunchBudgetMs = 60000;
+constexpr int kStrictLaunchBudgetMs = 90000;
 constexpr DWORD kDependencyProbeTimeoutMs = 9000;
 constexpr int kReadinessProbeTimeoutMs = 10000;
 constexpr int kNavigationWaitMaxMs = 50000;
@@ -2911,11 +2911,22 @@ int effective_launch_wait_ms(const launch_config_t& cfg, bool bundled_visible_la
 {
     if (test_lab_launch_fail_fast_enabled(cfg))
         return test_lab_launch_wait_ms(cfg);
-    int wait_ms = clamp_launch_wait_ms(cfg.launch_timeout_ms);
+    const int requested_ms = cfg.launch_timeout_ms;
+    int wait_ms = clamp_launch_wait_ms(requested_ms);
+    const int post_clamp_ms = wait_ms;
     if (bundled_visible_launch && wait_ms < kBundledVisibleLaunchWaitMinMs)
         wait_ms = kBundledVisibleLaunchWaitMinMs;
     if (bundled_visible_launch && wait_ms > kBundledVisibleLaunchWaitMaxMs)
         wait_ms = kBundledVisibleLaunchWaitMaxMs;
+    diag::log_tagged_fmt("camoufox",
+        "effective_launch_wait_ms requested_ms=%d bundled_visible=%d post_clamp_ms=%d bundled_min_ms=%d bundled_max_ms=%d final_wait_ms=%d strict_budget_ms=%d",
+        requested_ms,
+        bundled_visible_launch ? 1 : 0,
+        post_clamp_ms,
+        kBundledVisibleLaunchWaitMinMs,
+        kBundledVisibleLaunchWaitMaxMs,
+        wait_ms,
+        kStrictLaunchBudgetMs);
     return wait_ms;
 }
 

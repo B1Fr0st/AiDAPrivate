@@ -23,8 +23,8 @@ void register_re_tools(mcp_standalone::server_t& srv)
         re::dx_hook::find_device_vtable, true});
 
     register_compat(srv, {"dx_hook_manage", "re.dx_hook",
-        "Manage DirectX/DXGI hooks and only validated Vulkan dispatch targets. HWBP uses kernel thread-context evidence; VMT patch requires a proven COM vtable and callback.",
-        {{"action", "string", "draw|present|remove", true},
+        "Manage DirectX/DXGI hooks and only validated Vulkan dispatch targets. HWBP uses kernel thread-context evidence; VMT patch requires a proven COM vtable and callback. Action 'full_capture' arms Present+Draw+CBufferBind HWBPs simultaneously.",
+        {{"action", "string", "draw|present|full_capture|remove", true},
          {"process_id", "number", "Target process id", true},
          {"api", "string", "auto|d3d11|d3d12|dxgi|vulkan", false},
          {"capture_cbuffers", "boolean", "Capture constant-buffer metadata when bind-call context or explicit fallback evidence is available", false},
@@ -51,7 +51,7 @@ void register_re_tools(mcp_standalone::server_t& srv)
         re::dx_hook::list_bound_cbuffers, true});
 
     register_compat(srv, {"dx_identify_bone_buffer", "re.dx_hook",
-        "Report 4x4/3x4 raw or XOR-float matrix-run candidates that may be bone-palette buffers; this does not prove skeleton hierarchy or model ownership.",
+        "Report bone-palette buffer candidates across multiple formats: 4x4/3x4 matrices, quaternion+position, dual quaternion, SRT (scale-rotation-translation), padded 3x4, and interleaved structures; this does not prove skeleton hierarchy or model ownership.",
         {{"process_id", "number", "Target process id", true},
          {"world_unit_max", "number", "Maximum plausible translation component", false},
          {"min_bones", "number", "Minimum matrix count", false},
@@ -77,7 +77,7 @@ void register_re_tools(mcp_standalone::server_t& srv)
         {{"process_id", "number", "Target process id", true},
          {"format", "string", "rgba|png", false},
          {"output_path", "string", "Optional output path", false},
-         {"allow_window_fallback", "boolean", "Accepted for compatibility but ignored under kernel-only stealth policy", false},
+         {"allow_window_fallback", "boolean", "When true, captures the target window via PrintWindow/BitBlt as a GDI screenshot fallback", false},
          {"confirm_unsafe", "boolean", "Required when writing files or installing capture callbacks", false},
          {"allow_unsafe", "boolean", "Alias of confirm_unsafe", false}},
         re::dx_hook::dump_render_targets, false});
@@ -92,6 +92,83 @@ void register_re_tools(mcp_standalone::server_t& srv)
          {"candidate_va", "string", "Explicit candidate VA", false},
          {"candidates", "array", "Explicit candidate objects", false}},
         re::dx_hook::find_view_matrix, true});
+
+    register_compat(srv, {"dx_verify_view_matrix", "re.dx_hook",
+        "Verify a view/projection/viewproj matrix candidate by projecting test points or unit-cube corners to screen coordinates. Chain after dx_find_view_matrix.",
+        {{"process_id", "number", "Target process id", true},
+         {"matrix_va", "string", "Candidate matrix VA from find_view_matrix results", true},
+         {"view_matrix_va", "string", "Alias for matrix_va", false},
+         {"candidate_va", "string", "Alias for matrix_va", false},
+         {"screen_width", "number", "Screen width override (auto-detected from window if omitted)", false},
+         {"screen_height", "number", "Screen height override (auto-detected from window if omitted)", false},
+         {"world_unit_max", "number", "Maximum plausible translation component", false},
+         {"test_world_points", "array", "Optional array of {x,y,z} or [x,y,z] world points to project"}},
+        re::dx_hook::verify_view_matrix, true});
+
+    register_compat(srv, {"dx_project_bones", "re.dx_hook",
+        "Project bone world positions from a bone buffer to screen coordinates using a view matrix. Chain after dx_identify_bone_buffer and dx_verify_view_matrix. If the projected points form a human silhouette on screen, both the view matrix and bone buffer are confirmed correct.",
+        {{"process_id", "number", "Target process id", true},
+         {"bone_buffer_va", "string", "Bone buffer VA from identify_bone_buffer results", true},
+         {"view_matrix_va", "string", "Verified view matrix VA from verify_view_matrix or find_view_matrix results", true},
+         {"screen_width", "number", "Screen width override (auto-detected from window if omitted)", false},
+         {"screen_height", "number", "Screen height override (auto-detected from window if omitted)", false},
+         {"world_unit_max", "number", "Maximum plausible translation component", false},
+         {"max_bones", "number", "Maximum bones to read and project", false},
+         {"bone_indices", "array", "Optional array of bone indices to project (default: all)"}},
+         re::dx_hook::project_bones, true});
+
+    register_compat(srv, {"dx_trace_decryption", "re.dx_hook",
+        "Trace the decryption pipeline for a staging/cbuffer VA by setting a write hardware breakpoint, capturing the caller context, reading encrypted source vs decrypted staging, and deriving the encryption algorithm + key. Actions: trace, list, detail, stop, remove.",
+        {{"action", "string", "trace|list|detail|stop|remove", false},
+         {"staging_va", "string", "Staging/cbuffer VA to watch (from identify_bone_buffer or list_bound_cbuffers)", false},
+         {"cbuffer_va", "string", "Alias for staging_va", false},
+         {"staging_size", "number", "Size of staging buffer to watch", false},
+         {"hw_slot", "number", "Hardware breakpoint register slot 0-3", false},
+         {"max_frames", "number", "Maximum frames to capture (default 3)", false},
+         {"timeout_ms", "number", "Wait timeout in milliseconds (default 30000)", false},
+         {"pointer_location_va", "string", "VA of a pointer that tracks the staging buffer for reallocation detection", false},
+         {"trace_id", "string", "Trace id for detail/remove", false},
+         {"process_id", "number", "Target process id", true},
+         {"confirm_unsafe", "boolean", "Required for trace/stop/remove", false},
+         {"allow_unsafe", "boolean", "Alias of confirm_unsafe", false}},
+         re::dx_hook::trace_decryption, false});
+
+    register_compat(srv, {"dx_read_gpu_buffer", "re.dx_hook",
+        "Read a D3D11 GPU-only constant buffer via remote COM method invocation. Requires a captured ID3D11Buffer* address (from dx_hook_manage cbuffer_bind capture) and the target's ID3D11DeviceContext* address.",
+        {{"process_id", "number", "Target process id", true},
+         {"buffer_va", "string", "ID3D11Buffer* address from cbuffer capture", true},
+         {"device_context_va", "string", "ID3D11DeviceContext* address (from capture registers rcx); auto-detected from stored captures if absent", false},
+         {"max_size", "number", "Maximum bytes to read (default 65536, max 1048576)", false},
+         {"detect_matrices", "boolean", "Run matrix pattern detection on readback data", false},
+         {"confirm_unsafe", "boolean", "Required - calls D3D11 methods in target process via kernel driver", false},
+         {"allow_unsafe", "boolean", "Alias of confirm_unsafe", false}},
+         re::dx_hook::read_gpu_buffer, false});
+
+    register_compat(srv, {"dx_auto_narrow", "re.dx_hook",
+        "One-shot pipeline: arms parallel Present+Draw+CBufferBind HWBPs, captures N frames, classifies cbuffers, evaluates persistent cbuffers as view matrix candidates and per-draw cbuffers as bone buffer candidates, returns a single ranked report.",
+        {{"process_id", "number", "Target process id", true},
+         {"capture_frames", "number", "Number of frames to capture (default 3)", false},
+         {"api", "string", "auto|d3d11|d3d12|dxgi|vulkan", false},
+         {"world_unit_max", "number", "Maximum plausible translation component", false},
+         {"min_bones", "number", "Minimum matrix count for bone buffers", false},
+         {"max_bones", "number", "Maximum matrix count for bone buffers", false},
+         {"confirm_unsafe", "boolean", "Required for HWBP arming", false},
+         {"allow_unsafe", "boolean", "Alias of confirm_unsafe", false}},
+        re::dx_hook::auto_narrow, false});
+
+    register_compat(srv, {"dx_correlate_results", "re.dx_hook",
+        "Cross-correlate a view matrix VA and bone buffer VA by checking if they appear in the same frame batches and draw call sequences.",
+        {{"process_id", "number", "Target process id", true},
+         {"view_matrix_va", "string", "View matrix candidate VA", false},
+         {"bone_buffer_va", "string", "Bone buffer candidate VA", false}},
+        re::dx_hook::correlate_results, true});
+
+    register_compat(srv, {"dx_get_frame_summary", "re.dx_hook",
+        "Return the latest (or specified) captured frame batch with all cbuffers, draw calls, cbuffer classifications, and hot VA table.",
+        {{"process_id", "number", "Target process id", true},
+         {"frame_index", "number", "Specific frame index (default latest)", false},
+         {"latest", "boolean", "Return latest frame (default true)", false}},
+        re::dx_hook::get_frame_summary, true});
 
     register_compat(srv, {"vmt_read", "re.vmt",
         "Read and classify virtual method table slots from an object or vtable-pointer address.",

@@ -107,6 +107,9 @@ namespace functions {
                                current_time.QuadPart);
         _InterlockedExchange64(&dispatcher::g_last_heartbeat_time,
                                current_time.QuadPart);
+        _InterlockedExchange(&dispatcher::g_server_token_timeout_pending, 0);
+        _InterlockedExchange64(&dispatcher::g_last_srv2_caller_pid,
+                               (LONG64)(LONG_PTR)PsGetCurrentProcessId());
 
         if (request->action == 0xDEAD) {
             WW_LOG("SRVT2: SERVER KILL COMMAND received, BSODing");

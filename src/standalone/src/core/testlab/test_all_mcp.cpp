@@ -767,6 +767,28 @@ namespace {
         return ok && exit_code == STILL_ACTIVE;
     }
 
+    void log_cascade_diag_snapshot(HANDLE hf, const char* tag, const char* phase) {
+        std::string kernel_session_reason;
+        const bool kernel_session_ok = driver_bridge::kernel_session_available(&kernel_session_reason);
+        const auto last_diag = driver_bridge::last_remote_call_execution_diag();
+        const uint32_t inflight_now = driver_bridge::detail::remote_call_um_inflight_count_global();
+        const uint32_t abandoned_now = driver_bridge::detail::remote_call_um_abandoned_count_global();
+        log_msg(hf, tag,
+            "DIAG -- %s kernel_session_available=%d kernel_session_reason=\"%s\" driver_status=\"%s\" driver_last_error=\"%s\" attached_pid=%u remote_call_inflight=%u remote_call_abandoned=%u last_remote_call_phase=\"%s\" last_remote_call_completion=\"%s\" last_remote_call_completed=%d last_remote_call_gle=%u",
+            phase ? phase : "",
+            kernel_session_ok ? 1 : 0,
+            kernel_session_reason.c_str(),
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str(),
+            driver_bridge::attached_pid(),
+            inflight_now,
+            abandoned_now,
+            last_diag.phase.c_str(),
+            last_diag.completion_reason.c_str(),
+            last_diag.completed ? 1 : 0,
+            last_diag.gle);
+    }
+
     bool restore_mcp_target(HANDLE hf, const char* tag) {
         if (g_mcp_target_pid == 0)
             return false;
@@ -831,6 +853,16 @@ namespace {
             }
             Sleep(50);
         }
+        std::string kernel_session_reason;
+        const bool kernel_session_ok = driver_bridge::kernel_session_available(&kernel_session_reason);
+        log_msg(hf, tag,
+            "FAIL -- restore_mcp_target_all_attempts_failed pid=%u kernel_session_available=%d kernel_session_reason=\"%s\" driver_status=\"%s\" driver_last_error=\"%s\" hint=run relay-keepalive recovery via force_relay_now_blocking",
+            target_pid,
+            kernel_session_ok ? 1 : 0,
+            kernel_session_reason.c_str(),
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str());
+        log_cascade_diag_snapshot(hf, tag, "restore_mcp_target_failed");
         return false;
     }
 
@@ -2784,6 +2816,7 @@ namespace {
                 bytes.size(),
                 active_before_alloc,
                 g_mcp_target_pid);
+            log_cascade_diag_snapshot(hf, tag, "ensure_mcp_private_bytes_no_target_pid");
             return false;
         }
         if (addr == 0) {
@@ -2797,6 +2830,7 @@ namespace {
                     driver_bridge::status().c_str(),
                     driver_bridge::last_error().c_str(),
                     static_cast<unsigned long>(GetTickCount() - fixture_start));
+                log_cascade_diag_snapshot(hf, tag, "ensure_mcp_private_bytes_allocate_zero");
                 return false;
             }
             log_msg(hf, tag, "FIXTURE -- allocated addr=0x%016llX size=%zu active_before=%u active_after=%u target_pid=%u fixture_pid=%u elapsed_ms=%lu",
@@ -10319,56 +10353,6 @@ namespace {
             },
             passed, failed);
 
-        test_coverage_protected_re_domains_11_15_expect(hf, tag, "obf_simplify_expr",
-            mcp_standalone::json{{"expr", "x ^ x"}},
-            true, true,
-            [](const invoke_result_t& ir, std::string& reason) {
-                std::string simplified;
-                std::string proof;
-                bool changed = false;
-                bool verified = false;
-                if (!payload_string_field(ir.data, "simplified_expr", simplified) || simplified != "0" ||
-                    !payload_bool_field(ir.data, "changed", changed) || !changed ||
-                    !payload_bool_field(ir.data, "verified", verified) || !verified ||
-                    !payload_string_field(ir.data, "proof_method", proof) || proof != "xor_self_identity") {
-                    reason = "obf_simplify_expr did not prove x^x identity data=" + compact_json(ir.data, 700);
-                    return false;
-                }
-                return true;
-            },
-            passed, failed);
-
-        test_coverage_protected_re_domains_11_15_expect(hf, tag, "obf_rename_symbols",
-            mcp_standalone::json{{"apply", false}, {"symbols", mcp_standalone::json::array({
-                mcp_standalone::json{{"va", hex_u64(handler)}, {"name", "sub_coverage_mba"}, {"role", "mba expression helper"}, {"classification", "mba"}},
-                mcp_standalone::json{{"va", hex_u64(opaque)}, {"name", "sub_coverage_opaque"}, {"role", "opaque predicate"}, {"classification", "opaque"}}
-            })}},
-            true, true,
-            [](const invoke_result_t& ir, std::string& reason) {
-                uint64_t count = 0;
-                const auto* renames = find_payload_key_recursive(ir.data, "renames");
-                std::string mutation;
-                bool applied = true;
-                if (!payload_u64_field(ir.data, "count", count) || count == 0 ||
-                    !renames || !renames->is_array() || renames->empty() ||
-                    !payload_bool_field(ir.data, "applied", applied) || applied ||
-                    !payload_string_field(ir.data, "mutation", mutation) || mutation != "none") {
-                    reason = "obf_rename_symbols missing read-only rename plan data=" + compact_json(ir.data, 700);
-                    return false;
-                }
-                for (const auto& item : *renames) {
-                    bool item_applied = true;
-                    std::string new_name;
-                    if (!payload_bool_field(item, "applied", item_applied) || item_applied ||
-                        !payload_string_field(item, "new_name", new_name) || new_name.empty()) {
-                        reason = "obf_rename_symbols rename entry lacks applied=false/new_name entry=" + compact_json(item, 500);
-                        return false;
-                    }
-                }
-                return true;
-            },
-            passed, failed);
-
         mcp_standalone::json cff_args;
         cff_args["process_id"] = pid;
         cff_args["address"] = hex_u64(vm_addr);
@@ -10606,10 +10590,69 @@ namespace {
             passed, failed);
     }
 
+    void test_coverage_protected_re_domains_11_15_obf_pure_tools(HANDLE hf,
+                                                                 std::atomic<int>& passed,
+                                                                 std::atomic<int>& failed) {
+        const char* tag = "mcp.coverage_protected_re.obf_pure";
+
+        test_coverage_protected_re_domains_11_15_expect(hf, tag, "obf_simplify_expr",
+            mcp_standalone::json{{"expr", "x ^ x"}},
+            true, true,
+            [](const invoke_result_t& ir, std::string& reason) {
+                std::string simplified;
+                std::string proof;
+                bool changed = false;
+                bool verified = false;
+                if (!payload_string_field(ir.data, "simplified_expr", simplified) || simplified != "0" ||
+                    !payload_bool_field(ir.data, "changed", changed) || !changed ||
+                    !payload_bool_field(ir.data, "verified", verified) || !verified ||
+                    !payload_string_field(ir.data, "proof_method", proof) || proof != "xor_self_identity") {
+                    reason = "obf_simplify_expr did not prove x^x identity data=" + compact_json(ir.data, 700);
+                    return false;
+                }
+                return true;
+            },
+            passed, failed);
+
+        const uint64_t synthetic_handler = 0x00007FF7A1000000ULL;
+        const uint64_t synthetic_opaque  = 0x00007FF7A1000020ULL;
+        test_coverage_protected_re_domains_11_15_expect(hf, tag, "obf_rename_symbols",
+            mcp_standalone::json{{"apply", false}, {"symbols", mcp_standalone::json::array({
+                mcp_standalone::json{{"va", hex_u64(synthetic_handler)}, {"name", "sub_coverage_mba"}, {"role", "mba expression helper"}, {"classification", "mba"}},
+                mcp_standalone::json{{"va", hex_u64(synthetic_opaque)},  {"name", "sub_coverage_opaque"}, {"role", "opaque predicate"}, {"classification", "opaque"}}
+            })}},
+            true, true,
+            [](const invoke_result_t& ir, std::string& reason) {
+                uint64_t count = 0;
+                const auto* renames = find_payload_key_recursive(ir.data, "renames");
+                std::string mutation;
+                bool applied = true;
+                if (!payload_u64_field(ir.data, "count", count) || count == 0 ||
+                    !renames || !renames->is_array() || renames->empty() ||
+                    !payload_bool_field(ir.data, "applied", applied) || applied ||
+                    !payload_string_field(ir.data, "mutation", mutation) || mutation != "none") {
+                    reason = "obf_rename_symbols missing read-only rename plan data=" + compact_json(ir.data, 700);
+                    return false;
+                }
+                for (const auto& item : *renames) {
+                    bool item_applied = true;
+                    std::string new_name;
+                    if (!payload_bool_field(item, "applied", item_applied) || item_applied ||
+                        !payload_string_field(item, "new_name", new_name) || new_name.empty()) {
+                        reason = "obf_rename_symbols rename entry lacks applied=false/new_name entry=" + compact_json(item, 500);
+                        return false;
+                    }
+                }
+                return true;
+            },
+            passed, failed);
+    }
+
     void test_coverage_protected_re_domains_11_15_run(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped, bool(*cancelled)()) {
         (void)skipped;
         const char* tag = "mcp.coverage_protected_re.domains_11_15";
         log_msg(hf, tag, "BEGIN -- protected RE Domains 11-15 functional coverage");
+        if (!cancelled()) test_coverage_protected_re_domains_11_15_obf_pure_tools(hf, passed, failed);
         if (!cancelled()) test_coverage_protected_re_domains_11_15_driver_tools(hf, passed, failed);
         if (!cancelled()) test_coverage_protected_re_domains_11_15_smc_tools(hf, passed, failed);
         if (!cancelled()) test_coverage_protected_re_domains_11_15_vm_and_obf_tools(hf, passed, failed);
@@ -15209,6 +15252,7 @@ namespace {
             log_msg(hf, tag, "SKIP -- allocate_memory failed for live-monitor buffers primary=0x%016llX compare=0x%016llX",
                 static_cast<unsigned long long>(primary),
                 static_cast<unsigned long long>(compare));
+            log_cascade_diag_snapshot(hf, tag, "prepare_live_monitor_regions_allocate_zero");
             if (primary != 0)
                 driver_bridge::free_memory(primary);
             if (compare != 0)
@@ -15248,6 +15292,10 @@ namespace {
         std::wstring exe;
         std::wstring command;
         std::wstring workdir;
+        std::wstring run_id;
+        std::wstring ready_event_name;
+        std::wstring done_event_name;
+        HANDLE ready_event = nullptr;
     };
 
     bool hunt_sidecar_exited(const mcp_hunt_sidecar_t& sidecar, DWORD& exit_code) {
@@ -15260,29 +15308,87 @@ namespace {
     }
 
     bool launch_hunt_integrity_sidecar(HANDLE hf, const char* tag, mcp_hunt_sidecar_t& sidecar) {
-        wchar_t sys_dir[MAX_PATH] = {};
-        UINT sys_len = GetSystemDirectoryW(sys_dir, MAX_PATH);
-        if (sys_len == 0 || sys_len >= MAX_PATH) {
-            DWORD err = GetLastError();
-            log_msg(hf, tag, "FAIL -- hunt sidecar GetSystemDirectoryW failed err=%lu text=%s",
-                static_cast<unsigned long>(err), format_win32_error(err).c_str());
+        const std::string exe_narrow = find_sessions_manage_run_binary_target(hf);
+        if (exe_narrow.empty()) {
+            log_msg(hf, tag, "FAIL -- hunt sidecar AiDA_TestTarget.exe not found in candidate paths");
             return false;
         }
 
-        std::filesystem::path cmd_path = std::filesystem::path(sys_dir) / L"cmd.exe";
+        std::filesystem::path exe_path(exe_narrow);
         std::error_code ec;
-        if (!std::filesystem::exists(cmd_path, ec) || ec) {
-            log_msg(hf, tag, "FAIL -- hunt sidecar cmd.exe not found path=%s ec=%d msg=%s",
-                path_to_utf8(cmd_path).c_str(), ec.value(), ec.message().c_str());
+        if (!std::filesystem::exists(exe_path, ec) || ec) {
+            log_msg(hf, tag, "FAIL -- hunt sidecar AiDA_TestTarget.exe missing path=%s ec=%d msg=%s",
+                exe_narrow.c_str(), ec.value(), ec.message().c_str());
             return false;
         }
 
-        sidecar.exe = extended_path_wide(full_path_wide(cmd_path.wstring()));
-        std::filesystem::path workdir_path = cmd_path.parent_path();
+        sidecar.exe = extended_path_wide(full_path_wide(exe_path.wstring()));
+        std::filesystem::path workdir_path = exe_path.parent_path();
         sidecar.workdir = full_path_wide(workdir_path.wstring());
         std::wstring workdir_create = sidecar.workdir.size() >= MAX_PATH ? extended_path_wide(sidecar.workdir) : sidecar.workdir;
-        std::wstring args = L" /d /c ping -n 30 127.0.0.1 > nul";
-        sidecar.command = quote_arg_wide(sidecar.exe) + args;
+
+        const ULONGLONG tick = GetTickCount64();
+        wchar_t run_id_buf[128] = {};
+        _snwprintf_s(run_id_buf, _TRUNCATE, L"hunt_integrity_mcp_%lu_%llu",
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long long>(tick));
+        sidecar.run_id = run_id_buf;
+        sidecar.ready_event_name = L"Local\\AiDAIntegrityHunterReady_" + sidecar.run_id;
+        sidecar.done_event_name = L"Local\\AiDAIntegrityHunterDone_" + sidecar.run_id;
+
+        SetLastError(0);
+        sidecar.ready_event = CreateEventW(nullptr, TRUE, FALSE, sidecar.ready_event_name.c_str());
+        const DWORD ready_err = sidecar.ready_event ? 0u : GetLastError();
+        if (!sidecar.ready_event) {
+            log_msg(hf, tag, "FAIL -- hunt sidecar CreateEventW(ready) failed err=%lu text=%s name=%s",
+                static_cast<unsigned long>(ready_err),
+                format_win32_error(ready_err).c_str(),
+                wide_to_utf8(sidecar.ready_event_name).c_str());
+            return false;
+        }
+
+        std::wstring args_buf;
+        args_buf.reserve(512);
+        args_buf += L" --no-external --skip-network --duration 60 --disable-re-fixtures --disable-proto-re-fixtures --disable-protected-re-fixtures --disable-single-step-absorber";
+        sidecar.command = quote_arg_wide(sidecar.exe) + args_buf;
+
+        std::wstring env_block;
+        const std::vector<std::pair<std::wstring, std::wstring>> env_overrides = {
+            { L"AIDA_INTEGRITY_HUNTER_SIDECAR", L"1" },
+            { L"AIDA_INTEGRITY_HUNTER_SIDECAR_RUN_ID", sidecar.run_id },
+            { L"AIDA_TEST_TARGET_READY_EVENT", sidecar.ready_event_name },
+            { L"AIDA_TEST_TARGET_DONE_EVENT", sidecar.done_event_name }
+        };
+        for (const auto& kv : env_overrides) {
+            env_block += kv.first;
+            env_block += L'=';
+            env_block += kv.second;
+            env_block.push_back(L'\0');
+        }
+        wchar_t* parent_env = GetEnvironmentStringsW();
+        if (parent_env) {
+            for (wchar_t* p = parent_env; *p; ) {
+                std::wstring entry(p);
+                bool overridden = false;
+                size_t eq = entry.find(L'=');
+                if (eq != std::wstring::npos) {
+                    std::wstring name_part = entry.substr(0, eq);
+                    for (const auto& kv : env_overrides) {
+                        if (_wcsicmp(name_part.c_str(), kv.first.c_str()) == 0) {
+                            overridden = true;
+                            break;
+                        }
+                    }
+                }
+                if (!overridden) {
+                    env_block += entry;
+                    env_block.push_back(L'\0');
+                }
+                p += entry.size() + 1;
+            }
+            FreeEnvironmentStringsW(parent_env);
+        }
+        env_block.push_back(L'\0');
 
         STARTUPINFOW si{};
         si.cb = sizeof(si);
@@ -15295,27 +15401,34 @@ namespace {
             nullptr,
             nullptr,
             FALSE,
-            CREATE_NO_WINDOW,
-            nullptr,
+            CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+            env_block.empty() ? nullptr : env_block.data(),
             workdir_create.empty() ? nullptr : workdir_create.c_str(),
             &si,
             &pi);
-        DWORD err = ok ? 0 : GetLastError();
-        log_msg(hf, tag, "SIDE-FIXTURE-LAUNCH -- app=%s cmd=%s cwd=%s ok=%d err=%lu text=%s",
+        const DWORD err = ok ? 0u : GetLastError();
+        log_msg(hf, tag, "SIDE-FIXTURE-LAUNCH -- app=%s cmd=%s cwd=%s run_id=%s ready_event=%s done_event=%s ok=%d err=%lu text=%s",
             wide_to_utf8(sidecar.exe).c_str(),
             compact_text(wide_to_utf8(sidecar.command), 900).c_str(),
             wide_to_utf8(workdir_create).c_str(),
+            wide_to_utf8(sidecar.run_id).c_str(),
+            wide_to_utf8(sidecar.ready_event_name).c_str(),
+            wide_to_utf8(sidecar.done_event_name).c_str(),
             ok ? 1 : 0,
             static_cast<unsigned long>(err),
             ok ? "success" : format_win32_error(err).c_str());
-        if (!ok)
+        if (!ok) {
+            if (sidecar.ready_event) {
+                CloseHandle(sidecar.ready_event);
+                sidecar.ready_event = nullptr;
+            }
             return false;
+        }
 
         sidecar.process = pi.hProcess;
         sidecar.thread = pi.hThread;
         sidecar.pid = pi.dwProcessId;
-        log_msg(hf, tag, "SIDE-FIXTURE-LAUNCHED -- pid=%lu thread=%lu",
-            static_cast<unsigned long>(sidecar.pid),
+        log_msg(hf, tag, "SIDE-FIXTURE-LAUNCHED -- pid=%lu thread=%lu", static_cast<unsigned long>(sidecar.pid),
             static_cast<unsigned long>(pi.dwThreadId));
         return true;
     }
@@ -15323,6 +15436,15 @@ namespace {
     bool wait_hunt_sidecar_attach_ready(HANDLE hf, const char* tag, const mcp_hunt_sidecar_t& sidecar, DWORD timeout_ms) {
         const DWORD started = GetTickCount();
         int attempts = 0;
+        if (sidecar.ready_event) {
+            const DWORD ready_budget = (timeout_ms < 5000u) ? timeout_ms : 5000u;
+            const DWORD ready_wait = WaitForSingleObject(sidecar.ready_event, ready_budget);
+            log_msg(hf, tag, "SIDE-FIXTURE-READY-EVENT -- pid=%lu wait=0x%08lX budget_ms=%lu elapsed_ms=%lu",
+                static_cast<unsigned long>(sidecar.pid),
+                static_cast<unsigned long>(ready_wait),
+                static_cast<unsigned long>(ready_budget),
+                static_cast<unsigned long>(GetTickCount() - started));
+        }
         auto select_sidecar_quiet = [&]() {
             if (driver_bridge::attached_pid() == sidecar.pid)
                 return true;
@@ -15424,6 +15546,10 @@ namespace {
         }
         close_handle_safe(sidecar.thread);
         close_handle_safe(sidecar.process);
+        if (sidecar.ready_event) {
+            CloseHandle(sidecar.ready_event);
+            sidecar.ready_event = nullptr;
+        }
         if (sidecar.pid != 0) {
             const bool detached = driver_bridge::detach_one(sidecar.pid);
             log_msg(hf, tag, "SIDE-FIXTURE-CLOSE -- detached pid=%lu ok=%d active_now=%u",
@@ -21780,7 +21906,11 @@ void test_tool_scanner_struct_manage_define(HANDLE hf, std::atomic<int>& passed,
             "pdb load failed",
             "load failed",
             "timed out after",
-            "rejected"
+            "rejected",
+            "parse_monitor_unavailable",
+            "pre_parser_resource_failure",
+            "pre-parser resource failure",
+            "parse monitor unavailable"
         };
         for (const char* marker : terminal_markers) {
             if (status_lc.find(marker) != std::string::npos)
@@ -21798,7 +21928,11 @@ void test_tool_scanner_struct_manage_define(HANDLE hf, std::atomic<int>& passed,
             "symloadmoduleexw failed",
             "failed to queue",
             "download failed",
-            "pdb not found"
+            "pdb not found",
+            "parse_monitor_unavailable",
+            "pre_parser_resource_failure",
+            "pre-parser resource failure",
+            "parse monitor unavailable"
         };
         for (const char* marker : pre_parser_markers) {
             if (status_lc.find(marker) != std::string::npos)
@@ -28646,6 +28780,7 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
         minimal_nav_args["wait_until"] = "load";
         minimal_nav_args["clear_network_capture"] = false;
         minimal_nav_args["include_title"] = true;
+        minimal_nav_args["timeout"] = 55000;
         test_tool_action_call(hf, "mcp.camoufox.browser_navigation.navigate.minimal", "browser_navigation", "navigate", minimal_nav_args, passed, failed, skipped);
 
         mcp_standalone::json jsvmp_args;

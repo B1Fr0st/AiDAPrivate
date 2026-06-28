@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cfloat>
 #include <cmath>
 #include <cwchar>
 #include <cstring>
@@ -2217,6 +2218,7 @@ json dx_record_json(const store::dx_hook_record_t& record)
     out["api"] = record.api;
     out["action"] = record.action;
     out["target_va"] = sa_format_address(record.target_va);
+    out["target_name"] = record.target_name;
     out["hw_slot"] = record.hw_slot;
     out["capture_cbuffers"] = record.capture_cbuffers;
     out["capture_vertex_buffers"] = record.capture_vertex_buffers;
@@ -2248,6 +2250,43 @@ struct matrix_eval_t
     std::string reason;
     std::string type;
     std::string orientation;
+};
+
+struct quat_eval_t
+{
+    bool plausible = false;
+    double score = 0.0;
+    double quat_norm_error = 1.0;
+    double translation_abs = 0.0;
+    double scale_abs = 0.0;
+    std::string reason;
+    std::string type;
+    matrix_eval_t matrix_eval;
+};
+
+struct dual_quat_eval_t
+{
+    bool plausible = false;
+    double score = 0.0;
+    double real_norm_error = 1.0;
+    double dual_constraint_error = 1.0;
+    double translation_abs = 0.0;
+    std::string reason;
+    std::string type;
+    matrix_eval_t matrix_eval;
+};
+
+struct srt_eval_t
+{
+    bool plausible = false;
+    double score = 0.0;
+    double quat_norm_error = 1.0;
+    double translation_abs = 0.0;
+    double scale_min = 0.0;
+    double scale_max = 0.0;
+    std::string reason;
+    std::string type;
+    matrix_eval_t matrix_eval;
 };
 
 double vec3_norm(float a, float b, float c)
@@ -2311,6 +2350,102 @@ double inverse_residual3x3_rows(const float* f, double det)
         }
     }
     return residual;
+}
+
+float float_from_u32(std::uint32_t value);
+
+double quat_norm(float x, float y, float z, float w)
+{
+    return std::sqrt(static_cast<double>(x) * x +
+                     static_cast<double>(y) * y +
+                     static_cast<double>(z) * z +
+                     static_cast<double>(w) * w);
+}
+
+bool quat_normalized(float x, float y, float z, float w, double tolerance = 0.02)
+{
+    const double n = quat_norm(x, y, z, w);
+    return std::isfinite(n) && n > 0.01 && std::fabs(n - 1.0) <= tolerance;
+}
+
+void quat_to_matrix3x3_row_major(float qx, float qy, float qz, float qw, float out[9])
+{
+    const double xx = qx * qx, yy = qy * qy, zz = qz * qz;
+    const double xy = qx * qy, xz = qx * qz, yz = qy * qz;
+    const double wx = qw * qx, wy = qw * qy, wz = qw * qz;
+    out[0] = static_cast<float>(1.0 - 2.0 * (yy + zz));
+    out[1] = static_cast<float>(2.0 * (xy - wz));
+    out[2] = static_cast<float>(2.0 * (xz + wy));
+    out[3] = static_cast<float>(2.0 * (xy + wz));
+    out[4] = static_cast<float>(1.0 - 2.0 * (xx + zz));
+    out[5] = static_cast<float>(2.0 * (yz - wx));
+    out[6] = static_cast<float>(2.0 * (xz - wy));
+    out[7] = static_cast<float>(2.0 * (yz + wx));
+    out[8] = static_cast<float>(1.0 - 2.0 * (xx + yy));
+}
+
+void quat_to_matrix4x4_row_major(float qx, float qy, float qz, float qw,
+                                 float tx, float ty, float tz, float out[16])
+{
+    std::fill(out, out + 16, 0.0f);
+    float r[9];
+    quat_to_matrix3x3_row_major(qx, qy, qz, qw, r);
+    out[0] = r[0]; out[1] = r[1]; out[2] = r[2];
+    out[4] = r[3]; out[5] = r[4]; out[6] = r[5];
+    out[8] = r[6]; out[9] = r[7]; out[10] = r[8];
+    out[12] = tx; out[13] = ty; out[14] = tz;
+    out[15] = 1.0f;
+}
+
+void quat_to_matrix4x4_column_major(float qx, float qy, float qz, float qw,
+                                    float tx, float ty, float tz, float out[16])
+{
+    std::fill(out, out + 16, 0.0f);
+    float r[9];
+    quat_to_matrix3x3_row_major(qx, qy, qz, qw, r);
+    out[0] = r[0]; out[4] = r[1]; out[8]  = r[2];
+    out[1] = r[3]; out[5] = r[4]; out[9]  = r[5];
+    out[2] = r[6]; out[6] = r[7]; out[10] = r[8];
+    out[3] = tx; out[7] = ty; out[11] = tz;
+    out[15] = 1.0f;
+}
+
+void dual_quat_to_matrix4x4_row_major(float rx, float ry, float rz, float rw,
+                                       float dx, float dy, float dz, float dw,
+                                       float out[16])
+{
+    std::fill(out, out + 16, 0.0f);
+    float r[9];
+    quat_to_matrix3x3_row_major(rx, ry, rz, rw, r);
+    out[0] = r[0]; out[1] = r[1]; out[2] = r[2];
+    out[4] = r[3]; out[5] = r[4]; out[6] = r[5];
+    out[8] = r[6]; out[9] = r[7]; out[10] = r[8];
+    const double tx = 2.0 * (dx * rw - dy * rz + dz * ry - dw * rx);
+    const double ty = 2.0 * (dy * rw + dx * rz - dz * rx - dw * ry);
+    const double tz = 2.0 * (dz * rw - dx * ry + dy * rx - dw * rz);
+    out[12] = static_cast<float>(tx);
+    out[13] = static_cast<float>(ty);
+    out[14] = static_cast<float>(tz);
+    out[15] = 1.0f;
+}
+
+void dual_quat_to_matrix4x4_column_major(float rx, float ry, float rz, float rw,
+                                          float dx, float dy, float dz, float dw,
+                                          float out[16])
+{
+    std::fill(out, out + 16, 0.0f);
+    float r[9];
+    quat_to_matrix3x3_row_major(rx, ry, rz, rw, r);
+    out[0] = r[0]; out[4] = r[1]; out[8]  = r[2];
+    out[1] = r[3]; out[5] = r[4]; out[9]  = r[5];
+    out[2] = r[6]; out[6] = r[7]; out[10] = r[8];
+    const double tx = 2.0 * (dx * rw - dy * rz + dz * ry - dw * rx);
+    const double ty = 2.0 * (dy * rw + dx * rz - dz * rx - dw * ry);
+    const double tz = 2.0 * (dz * rw - dx * ry + dy * rx - dw * rz);
+    out[3]  = static_cast<float>(tx);
+    out[7]  = static_cast<float>(ty);
+    out[11] = static_cast<float>(tz);
+    out[15] = 1.0f;
 }
 
 matrix_eval_t evaluate_matrix4x4(const float* f, double world_max)
@@ -2447,6 +2582,318 @@ bool plausible_matrix4x4(const float* f, double world_max)
     return evaluate_matrix4x4(f, world_max).plausible;
 }
 
+quat_eval_t evaluate_quat_pos(const float* data, double world_max)
+{
+    quat_eval_t eval;
+    for (int i = 0; i < 7; ++i)
+    {
+        if (!std::isfinite(data[i]))
+        {
+            eval.reason = "nonfinite";
+            return eval;
+        }
+    }
+    const float qx = data[0], qy = data[1], qz = data[2], qw = data[3];
+    const float px = data[4], py = data[5], pz = data[6];
+    const double n = quat_norm(qx, qy, qz, qw);
+    eval.quat_norm_error = std::fabs(n - 1.0);
+    if (!quat_normalized(qx, qy, qz, qw))
+    {
+        eval.reason = "quat_not_normalized";
+        return eval;
+    }
+    eval.translation_abs = std::max({std::fabs(static_cast<double>(px)),
+                                      std::fabs(static_cast<double>(py)),
+                                      std::fabs(static_cast<double>(pz))});
+    if (eval.translation_abs > world_max)
+    {
+        eval.reason = "translation_out_of_range";
+        return eval;
+    }
+    float mat_row[16];
+    quat_to_matrix4x4_row_major(qx, qy, qz, qw, px, py, pz, mat_row);
+    matrix_eval_t m_eval = evaluate_matrix4x4(mat_row, world_max);
+    eval.matrix_eval = m_eval;
+    float mat_col[16];
+    quat_to_matrix4x4_column_major(qx, qy, qz, qw, px, py, pz, mat_col);
+    matrix_eval_t m_eval_col = evaluate_matrix4x4(mat_col, world_max);
+    if (!m_eval.plausible && !m_eval_col.plausible)
+    {
+        eval.reason = "converted_matrix_rejected";
+        return eval;
+    }
+    eval.plausible = true;
+    eval.reason = "accepted";
+    eval.type = "quat_pos";
+    eval.score = 0.50;
+    eval.score += std::max(0.0, 0.20 - eval.quat_norm_error * 10.0);
+    if (eval.translation_abs > 0.001)
+        eval.score += 0.10;
+    if (m_eval.plausible)
+        eval.score += m_eval.score * 0.15;
+    else
+        eval.score += m_eval_col.score * 0.15;
+    eval.score = std::min(0.95, eval.score);
+    return eval;
+}
+
+bool plausible_quat_pos(const float* data, double world_max)
+{
+    return evaluate_quat_pos(data, world_max).plausible;
+}
+
+dual_quat_eval_t evaluate_dual_quat(const float* data, double world_max)
+{
+    dual_quat_eval_t eval;
+    for (int i = 0; i < 8; ++i)
+    {
+        if (!std::isfinite(data[i]))
+        {
+            eval.reason = "nonfinite";
+            return eval;
+        }
+    }
+    const float rx = data[0], ry = data[1], rz = data[2], rw = data[3];
+    const float dx = data[4], dy = data[5], dz = data[6], dw = data[7];
+    const double rn = quat_norm(rx, ry, rz, rw);
+    eval.real_norm_error = std::fabs(rn - 1.0);
+    if (!quat_normalized(rx, ry, rz, rw))
+    {
+        eval.reason = "real_quat_not_normalized";
+        return eval;
+    }
+    const double dot_rd = static_cast<double>(rx) * dx +
+                          static_cast<double>(ry) * dy +
+                          static_cast<double>(rz) * dz +
+                          static_cast<double>(rw) * dw;
+    eval.dual_constraint_error = std::fabs(dot_rd);
+    if (eval.dual_constraint_error > 0.05)
+    {
+        eval.reason = "dual_constraint_violated";
+        return eval;
+    }
+    float mat_row[16];
+    dual_quat_to_matrix4x4_row_major(rx, ry, rz, rw, dx, dy, dz, dw, mat_row);
+    matrix_eval_t m_eval = evaluate_matrix4x4(mat_row, world_max);
+    eval.matrix_eval = m_eval;
+    float mat_col[16];
+    dual_quat_to_matrix4x4_column_major(rx, ry, rz, rw, dx, dy, dz, dw, mat_col);
+    matrix_eval_t m_eval_col = evaluate_matrix4x4(mat_col, world_max);
+    if (!m_eval.plausible && !m_eval_col.plausible)
+    {
+        eval.reason = "converted_matrix_rejected";
+        return eval;
+    }
+    eval.translation_abs = std::max({std::fabs(static_cast<double>(mat_row[12])),
+                                      std::fabs(static_cast<double>(mat_row[13])),
+                                      std::fabs(static_cast<double>(mat_row[14]))});
+    if (eval.translation_abs > world_max)
+    {
+        eval.reason = "translation_out_of_range";
+        return eval;
+    }
+    eval.plausible = true;
+    eval.reason = "accepted";
+    eval.type = "dual_quat";
+    eval.score = 0.50;
+    eval.score += std::max(0.0, 0.20 - eval.real_norm_error * 10.0);
+    eval.score += std::max(0.0, 0.15 - eval.dual_constraint_error * 3.0);
+    if (eval.translation_abs > 0.001)
+        eval.score += 0.05;
+    if (m_eval.plausible)
+        eval.score += m_eval.score * 0.10;
+    else
+        eval.score += m_eval_col.score * 0.10;
+    eval.score = std::min(0.95, eval.score);
+    return eval;
+}
+
+bool plausible_dual_quat(const float* data, double world_max)
+{
+    return evaluate_dual_quat(data, world_max).plausible;
+}
+
+srt_eval_t evaluate_srt_quat(const float* data, double world_max)
+{
+    srt_eval_t eval;
+    for (int i = 0; i < 10; ++i)
+    {
+        if (!std::isfinite(data[i]))
+        {
+            eval.reason = "nonfinite";
+            return eval;
+        }
+    }
+    const float sx = data[0], sy = data[1], sz = data[2];
+    const float qx = data[3], qy = data[4], qz = data[5], qw = data[6];
+    const float tx = data[7], ty = data[8], tz = data[9];
+    eval.scale_min = std::min({std::fabs(static_cast<double>(sx)),
+                                std::fabs(static_cast<double>(sy)),
+                                std::fabs(static_cast<double>(sz))});
+    eval.scale_max = std::max({std::fabs(static_cast<double>(sx)),
+                                std::fabs(static_cast<double>(sy)),
+                                std::fabs(static_cast<double>(sz))});
+    if (eval.scale_min < 0.001 || eval.scale_max > 1000.0)
+    {
+        eval.reason = "scale_out_of_range";
+        return eval;
+    }
+    if (!quat_normalized(qx, qy, qz, qw))
+    {
+        eval.reason = "quat_not_normalized";
+        return eval;
+    }
+    eval.quat_norm_error = std::fabs(quat_norm(qx, qy, qz, qw) - 1.0);
+    eval.translation_abs = std::max({std::fabs(static_cast<double>(tx)),
+                                      std::fabs(static_cast<double>(ty)),
+                                      std::fabs(static_cast<double>(tz))});
+    if (eval.translation_abs > world_max)
+    {
+        eval.reason = "translation_out_of_range";
+        return eval;
+    }
+    float r[9];
+    quat_to_matrix3x3_row_major(qx, qy, qz, qw, r);
+    float mat[16] = {};
+    mat[0]  = r[0] * sx; mat[1]  = r[1] * sy; mat[2]  = r[2] * sz;
+    mat[4]  = r[3] * sx; mat[5]  = r[4] * sy; mat[6]  = r[5] * sz;
+    mat[8]  = r[6] * sx; mat[9]  = r[7] * sy; mat[10] = r[8] * sz;
+    mat[12] = tx; mat[13] = ty; mat[14] = tz;
+    mat[15] = 1.0f;
+    matrix_eval_t m_eval = evaluate_matrix4x4(mat, world_max);
+    eval.matrix_eval = m_eval;
+    if (!m_eval.plausible)
+    {
+        eval.reason = "converted_matrix_rejected";
+        return eval;
+    }
+    eval.plausible = true;
+    eval.reason = "accepted";
+    eval.type = "srt_quat";
+    eval.score = 0.50;
+    eval.score += std::max(0.0, 0.15 - eval.quat_norm_error * 10.0);
+    if (eval.scale_min >= 0.1 && eval.scale_max <= 10.0)
+        eval.score += 0.10;
+    if (eval.translation_abs > 0.001)
+        eval.score += 0.05;
+    eval.score += m_eval.score * 0.15;
+    eval.score = std::min(0.95, eval.score);
+    return eval;
+}
+
+bool plausible_srt_quat(const float* data, double world_max)
+{
+    return evaluate_srt_quat(data, world_max).plausible;
+}
+
+srt_eval_t evaluate_srt_mat3x3(const float* data, double world_max)
+{
+    srt_eval_t eval;
+    for (int i = 0; i < 15; ++i)
+    {
+        if (!std::isfinite(data[i]))
+        {
+            eval.reason = "nonfinite";
+            return eval;
+        }
+    }
+    const float sx = data[0], sy = data[1], sz = data[2];
+    const float* rot = data + 3;
+    const float tx = data[12], ty = data[13], tz = data[14];
+    eval.scale_min = std::min({std::fabs(static_cast<double>(sx)),
+                                std::fabs(static_cast<double>(sy)),
+                                std::fabs(static_cast<double>(sz))});
+    eval.scale_max = std::max({std::fabs(static_cast<double>(sx)),
+                                std::fabs(static_cast<double>(sy)),
+                                std::fabs(static_cast<double>(sz))});
+    if (eval.scale_min < 0.001 || eval.scale_max > 1000.0)
+    {
+        eval.reason = "scale_out_of_range";
+        return eval;
+    }
+    const double r0 = vec3_norm(rot[0], rot[1], rot[2]);
+    const double r1 = vec3_norm(rot[3], rot[4], rot[5]);
+    const double r2 = vec3_norm(rot[6], rot[7], rot[8]);
+    if (r0 < 0.01 || r1 < 0.01 || r2 < 0.01)
+    {
+        eval.reason = "rotation_row_zero";
+        return eval;
+    }
+    const double rd01 = std::fabs(vec3_dot(rot[0], rot[1], rot[2], rot[3], rot[4], rot[5]) / std::max(0.000001, r0 * r1));
+    const double rd02 = std::fabs(vec3_dot(rot[0], rot[1], rot[2], rot[6], rot[7], rot[8]) / std::max(0.000001, r0 * r2));
+    const double rd12 = std::fabs(vec3_dot(rot[3], rot[4], rot[5], rot[6], rot[7], rot[8]) / std::max(0.000001, r1 * r2));
+    const double max_orth_err = std::max({rd01, rd02, rd12});
+    if (max_orth_err > 0.35)
+    {
+        eval.reason = "rotation_not_orthogonal";
+        return eval;
+    }
+    eval.translation_abs = std::max({std::fabs(static_cast<double>(tx)),
+                                      std::fabs(static_cast<double>(ty)),
+                                      std::fabs(static_cast<double>(tz))});
+    if (eval.translation_abs > world_max)
+    {
+        eval.reason = "translation_out_of_range";
+        return eval;
+    }
+    float mat[16] = {};
+    mat[0]  = rot[0] * sx; mat[1]  = rot[1] * sy; mat[2]  = rot[2] * sz;
+    mat[4]  = rot[3] * sx; mat[5]  = rot[4] * sy; mat[6]  = rot[5] * sz;
+    mat[8]  = rot[6] * sx; mat[9]  = rot[7] * sy; mat[10] = rot[8] * sz;
+    mat[12] = tx; mat[13] = ty; mat[14] = tz;
+    mat[15] = 1.0f;
+    matrix_eval_t m_eval = evaluate_matrix4x4(mat, world_max);
+    eval.matrix_eval = m_eval;
+    if (!m_eval.plausible)
+    {
+        eval.reason = "converted_matrix_rejected";
+        return eval;
+    }
+    eval.plausible = true;
+    eval.reason = "accepted";
+    eval.type = "srt_mat3x3";
+    eval.score = 0.50;
+    if (max_orth_err <= 0.10)
+        eval.score += 0.15;
+    else
+        eval.score += std::max(0.0, 0.15 - max_orth_err * 0.15);
+    if (eval.scale_min >= 0.1 && eval.scale_max <= 10.0)
+        eval.score += 0.10;
+    if (eval.translation_abs > 0.001)
+        eval.score += 0.05;
+    eval.score += m_eval.score * 0.15;
+    eval.score = std::min(0.95, eval.score);
+    return eval;
+}
+
+bool plausible_srt_mat3x3(const float* data, double world_max)
+{
+    return evaluate_srt_mat3x3(data, world_max).plausible;
+}
+
+bool plausible_matrix3x4_64_pad(const float* f, double world_max)
+{
+    float mat[16] = {};
+    std::memcpy(mat, f, 48);
+    mat[15] = 1.0f;
+    if (!plausible_matrix4x4(mat, world_max))
+        return false;
+    const std::uint32_t* tail = reinterpret_cast<const std::uint32_t*>(f) + 12;
+    bool all_zero = true;
+    bool small_int_meta = true;
+    for (int i = 0; i < 4; ++i)
+    {
+        std::uint32_t word = 0;
+        std::memcpy(&word, tail + i, sizeof(word));
+        if (word != 0)
+            all_zero = false;
+        float fv = float_from_u32(word);
+        if (!std::isfinite(fv) || std::fabs(static_cast<double>(fv)) > 100000.0)
+            small_int_meta = false;
+    }
+    return all_zero || small_int_meta;
+}
+
 json preview_floats(const std::vector<std::uint8_t>& bytes)
 {
     json arr = json::array();
@@ -2490,6 +2937,8 @@ std::uint64_t stack_arg64(std::uint32_t pid, std::uint64_t rsp, std::uint32_t in
     return value;
 }
 
+bool plausible_bone_format(const float* raw, std::size_t stride, double world_max);
+
 std::uint32_t matrix_run_count(const std::vector<std::uint8_t>& bytes, std::size_t off, std::size_t stride, double world_max, std::uint32_t max_count)
 {
     std::uint32_t count = 0;
@@ -2497,16 +2946,65 @@ std::uint32_t matrix_run_count(const std::vector<std::uint8_t>& bytes, std::size
     {
         float f[16] = {};
         if (stride == 64)
-        {
             std::memcpy(f, bytes.data() + cursor, 64);
-        }
-        else
+        else if (stride == 48)
         {
             std::memcpy(f, bytes.data() + cursor, 48);
             f[15] = 1.0f;
         }
-        if (!plausible_matrix4x4(f, world_max))
+        else
+        {
+            float raw[16];
+            std::memcpy(raw, bytes.data() + cursor, std::min(stride, sizeof(raw)));
+            if (!plausible_bone_format(raw, stride, world_max))
+                break;
+            ++count;
+            continue;
+        }
+        if (stride == 64 && !plausible_matrix4x4(f, world_max))
+        {
+            if (!plausible_matrix3x4_64_pad(reinterpret_cast<const float*>(bytes.data() + cursor), world_max))
+                break;
+        }
+        else if (stride == 48 && !plausible_matrix4x4(f, world_max))
             break;
+        ++count;
+    }
+    return count;
+}
+
+std::uint32_t matrix_run_count_interleaved(const std::vector<std::uint8_t>& bytes,
+                                            std::size_t off,
+                                            std::size_t matrix_stride,
+                                            std::size_t entry_stride,
+                                            double world_max,
+                                            std::uint32_t max_count)
+{
+    if (entry_stride < matrix_stride || entry_stride == 0)
+        return 0;
+    std::uint32_t count = 0;
+    for (std::size_t cursor = off; cursor + matrix_stride <= bytes.size() && count < max_count; cursor += entry_stride)
+    {
+        float raw[16] = {};
+        std::memcpy(raw, bytes.data() + cursor, std::min(matrix_stride, sizeof(raw)));
+        if (matrix_stride == 64)
+        {
+            if (!plausible_matrix4x4(raw, world_max) && !plausible_matrix3x4_64_pad(raw, world_max))
+                break;
+        }
+        else if (matrix_stride == 48)
+        {
+            float mat[16] = {};
+            std::memcpy(mat, raw, 48);
+            mat[15] = 1.0f;
+            if (!plausible_matrix4x4(mat, world_max))
+                break;
+        }
+        else
+        {
+            if (!plausible_bone_format(raw, matrix_stride, world_max))
+                break;
+        }
         ++count;
     }
     return count;
@@ -2519,6 +3017,51 @@ float float_from_u32(std::uint32_t value)
     return out;
 }
 
+enum class bone_format_t : std::uint8_t
+{
+    matrix4x4_64      = 0,
+    matrix3x4_48      = 1,
+    matrix3x4_64_pad  = 2,
+    quat_pos_28       = 3,
+    dual_quat_32      = 4,
+    srt_quat_40       = 5,
+    srt_mat3x3_60     = 6,
+    srt_quat_52_pad   = 7,
+    unknown           = 255
+};
+
+inline const char* bone_format_name(bone_format_t fmt)
+{
+    switch (fmt)
+    {
+    case bone_format_t::matrix4x4_64:    return "matrix4x4_64";
+    case bone_format_t::matrix3x4_48:    return "matrix3x4_48";
+    case bone_format_t::matrix3x4_64_pad:return "matrix3x4_64_padded";
+    case bone_format_t::quat_pos_28:     return "quat_pos_28";
+    case bone_format_t::dual_quat_32:    return "dual_quat_32";
+    case bone_format_t::srt_quat_40:     return "srt_quat_40";
+    case bone_format_t::srt_mat3x3_60:   return "srt_mat3x3_60";
+    case bone_format_t::srt_quat_52_pad: return "srt_quat_52_padded";
+    default:                             return "unknown";
+    }
+}
+
+inline std::size_t bone_format_stride(bone_format_t fmt)
+{
+    switch (fmt)
+    {
+    case bone_format_t::matrix4x4_64:    return 64;
+    case bone_format_t::matrix3x4_48:    return 48;
+    case bone_format_t::matrix3x4_64_pad:return 64;
+    case bone_format_t::quat_pos_28:     return 28;
+    case bone_format_t::dual_quat_32:    return 32;
+    case bone_format_t::srt_quat_40:     return 40;
+    case bone_format_t::srt_mat3x3_60:   return 60;
+    case bone_format_t::srt_quat_52_pad: return 52;
+    default:                             return 0;
+    }
+}
+
 struct matrix_decode_result_t
 {
     std::uint32_t count = 0;
@@ -2527,6 +3070,56 @@ struct matrix_decode_result_t
     std::uint32_t xor_key = 0;
     std::string decode = "raw_float32";
     matrix_eval_t first_eval;
+    bone_format_t format = bone_format_t::unknown;
+    std::size_t entry_stride = 0;
+};
+
+enum class decode_algorithm_t : std::uint8_t
+{
+    raw_float32       = 0,
+    xor_uniform       = 1,
+    xor_rolling       = 2,
+    xor_multi_key     = 3,
+    additive_byte     = 4,
+    additive_word     = 5,
+    custom            = 6,
+};
+
+struct multi_decode_result_t
+{
+    decode_algorithm_t algorithm = decode_algorithm_t::raw_float32;
+    std::uint32_t count = 0;
+    std::size_t stride = 0;
+    std::size_t offset = 0;
+    std::vector<std::uint32_t> key_words;
+    std::uint32_t uniform_key = 0;
+    std::uint32_t rolling_seed = 0;
+    std::uint32_t rolling_multiplier = 0;
+    std::uint32_t rolling_increment = 0;
+    std::uint32_t additive_key = 0;
+    std::string algorithm_name;
+    matrix_eval_t first_eval;
+    bone_format_t format = bone_format_t::unknown;
+    std::size_t entry_stride = 0;
+};
+
+struct decryption_analysis_t
+{
+    decode_algorithm_t algorithm = decode_algorithm_t::custom;
+    std::vector<std::uint8_t> derived_key_bytes;
+    std::uint32_t key_length = 0;
+    std::string key_pattern;
+    std::string algorithm_name;
+    std::vector<std::uint32_t> key_words;
+    bool verified = false;
+    std::string verification_detail;
+    std::size_t match_bytes = 0;
+    std::size_t total_bytes = 0;
+    std::uint32_t uniform_key = 0;
+    std::uint32_t rolling_seed = 0;
+    std::uint32_t rolling_multiplier = 0;
+    std::uint32_t rolling_increment = 0;
+    std::uint32_t additive_key = 0;
 };
 
 bool decode_matrix_words(const std::vector<std::uint8_t>& bytes,
@@ -2551,31 +3144,191 @@ bool decode_matrix_words(const std::vector<std::uint8_t>& bytes,
     return true;
 }
 
+bool decode_words_generic(const std::vector<std::uint8_t>& bytes,
+                           std::size_t off, std::size_t stride,
+                           std::uint32_t xor_key, float* out, std::size_t out_count)
+{
+    if (off + stride > bytes.size())
+        return false;
+    const std::size_t words = stride / sizeof(std::uint32_t);
+    if (words > out_count)
+        return false;
+    for (std::size_t i = 0; i < words; ++i)
+    {
+        std::uint32_t word = 0;
+        std::memcpy(&word, bytes.data() + off + i * sizeof(std::uint32_t), sizeof(word));
+        word ^= xor_key;
+        out[i] = float_from_u32(word);
+    }
+    return true;
+}
+
+bool decode_to_matrix4x4(const std::vector<std::uint8_t>& bytes,
+                          std::size_t off, std::size_t stride,
+                          std::uint32_t xor_key, bone_format_t format,
+                          float out[16])
+{
+    std::fill(out, out + 16, 0.0f);
+    if (off + stride > bytes.size())
+        return false;
+    switch (format)
+    {
+    case bone_format_t::matrix4x4_64:
+    case bone_format_t::matrix3x4_64_pad:
+        return decode_matrix_words(bytes, off, 64, xor_key, out);
+    case bone_format_t::matrix3x4_48:
+        return decode_matrix_words(bytes, off, 48, xor_key, out);
+    case bone_format_t::quat_pos_28:
+    {
+        float data[7];
+        if (!decode_words_generic(bytes, off, 28, xor_key, data, 7))
+            return false;
+        quat_to_matrix4x4_row_major(data[0], data[1], data[2], data[3],
+                                     data[4], data[5], data[6], out);
+        return true;
+    }
+    case bone_format_t::dual_quat_32:
+    {
+        float data[8];
+        if (!decode_words_generic(bytes, off, 32, xor_key, data, 8))
+            return false;
+        dual_quat_to_matrix4x4_row_major(data[0], data[1], data[2], data[3],
+                                          data[4], data[5], data[6], data[7], out);
+        return true;
+    }
+    case bone_format_t::srt_quat_40:
+    {
+        float data[10];
+        if (!decode_words_generic(bytes, off, 40, xor_key, data, 10))
+            return false;
+        float r[9];
+        quat_to_matrix3x3_row_major(data[3], data[4], data[5], data[6], r);
+        out[0]  = r[0] * data[0]; out[1]  = r[1] * data[1]; out[2]  = r[2] * data[2];
+        out[4]  = r[3] * data[0]; out[5]  = r[4] * data[1]; out[6]  = r[5] * data[2];
+        out[8]  = r[6] * data[0]; out[9]  = r[7] * data[1]; out[10] = r[8] * data[2];
+        out[12] = data[7]; out[13] = data[8]; out[14] = data[9];
+        out[15] = 1.0f;
+        return true;
+    }
+    case bone_format_t::srt_mat3x3_60:
+    {
+        float data[15];
+        if (!decode_words_generic(bytes, off, 60, xor_key, data, 15))
+            return false;
+        out[0]  = data[3] * data[0]; out[1]  = data[4] * data[1]; out[2]  = data[5] * data[2];
+        out[4]  = data[6] * data[0]; out[5]  = data[7] * data[1]; out[6]  = data[8] * data[2];
+        out[8]  = data[9] * data[0]; out[9]  = data[10] * data[1]; out[10] = data[11] * data[2];
+        out[12] = data[12]; out[13] = data[13]; out[14] = data[14];
+        out[15] = 1.0f;
+        return true;
+    }
+    case bone_format_t::srt_quat_52_pad:
+    {
+        float data[10];
+        if (!decode_words_generic(bytes, off, 40, xor_key, data, 10))
+            return false;
+        float r[9];
+        quat_to_matrix3x3_row_major(data[3], data[4], data[5], data[6], r);
+        out[0]  = r[0] * data[0]; out[1]  = r[1] * data[1]; out[2]  = r[2] * data[2];
+        out[4]  = r[3] * data[0]; out[5]  = r[4] * data[1]; out[6]  = r[5] * data[2];
+        out[8]  = r[6] * data[0]; out[9]  = r[7] * data[1]; out[10] = r[8] * data[2];
+        out[12] = data[7]; out[13] = data[8]; out[14] = data[9];
+        out[15] = 1.0f;
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+bool plausible_bone_format(const float* raw, std::size_t stride, double world_max)
+{
+    switch (stride)
+    {
+    case 64:
+    {
+        float mat[16];
+        std::memcpy(mat, raw, 64);
+        if (plausible_matrix4x4(mat, world_max))
+            return true;
+        return plausible_matrix3x4_64_pad(raw, world_max);
+    }
+    case 48:
+    {
+        float mat[16] = {};
+        std::memcpy(mat, raw, 48);
+        mat[15] = 1.0f;
+        return plausible_matrix4x4(mat, world_max);
+    }
+    case 28:
+        return plausible_quat_pos(raw, world_max);
+    case 32:
+        return plausible_dual_quat(raw, world_max);
+    case 40:
+        return plausible_srt_quat(raw, world_max);
+    case 52:
+        return plausible_srt_quat(raw, world_max);
+    case 60:
+        return plausible_srt_mat3x3(raw, world_max);
+    default:
+        return false;
+    }
+}
+
 std::uint32_t matrix_run_count_decoded(const std::vector<std::uint8_t>& bytes,
-                                       std::size_t off,
-                                       std::size_t stride,
-                                       std::uint32_t xor_key,
-                                       double world_max,
-                                       std::uint32_t max_count,
-                                       matrix_eval_t* first_eval)
+                                        std::size_t off, std::size_t stride,
+                                        std::uint32_t xor_key, double world_max,
+                                        std::uint32_t max_count, matrix_eval_t* first_eval)
 {
     std::uint32_t count = 0;
     for (std::size_t cursor = off; cursor + stride <= bytes.size() && count < max_count; cursor += stride)
     {
-        float f[16] = {};
-        if (!decode_matrix_words(bytes, cursor, stride, xor_key, f))
-            break;
-        matrix_eval_t eval = evaluate_matrix4x4(f, world_max);
-        if (!eval.plausible)
-            break;
-        if (count == 0 && first_eval)
-            *first_eval = eval;
-        ++count;
+        if (stride == 48 || stride == 64)
+        {
+            float f[16] = {};
+            if (!decode_matrix_words(bytes, cursor, stride, xor_key, f))
+                break;
+            if (stride == 64 && !plausible_matrix4x4(f, world_max))
+            {
+                if (!plausible_matrix3x4_64_pad(f, world_max))
+                    break;
+            }
+            else if (stride == 48 && !plausible_matrix4x4(f, world_max))
+                break;
+            matrix_eval_t eval = evaluate_matrix4x4(f, world_max);
+            if (count == 0 && first_eval)
+                *first_eval = eval;
+            ++count;
+        }
+        else
+        {
+            float raw[16];
+            if (!decode_words_generic(bytes, cursor, stride, xor_key, raw, 16))
+                break;
+            if (!plausible_bone_format(raw, stride, world_max))
+                break;
+            float mat[16] = {};
+            bone_format_t fmt = bone_format_t::unknown;
+            switch (stride)
+            {
+            case 28: fmt = bone_format_t::quat_pos_28; break;
+            case 32: fmt = bone_format_t::dual_quat_32; break;
+            case 40: fmt = bone_format_t::srt_quat_40; break;
+            case 52: fmt = bone_format_t::srt_quat_52_pad; break;
+            case 60: fmt = bone_format_t::srt_mat3x3_60; break;
+            }
+            decode_to_matrix4x4(bytes, cursor, stride, xor_key, fmt, mat);
+            matrix_eval_t eval = evaluate_matrix4x4(mat, world_max);
+            if (count == 0 && first_eval)
+                *first_eval = eval;
+            ++count;
+        }
     }
     return count;
 }
 
-std::vector<std::uint32_t> matrix_xor_key_candidates(const std::vector<std::uint8_t>& bytes, std::size_t off, std::size_t stride)
+std::vector<std::uint32_t> format_xor_key_candidates(const std::vector<std::uint8_t>& bytes,
+                                                      std::size_t off, std::size_t stride)
 {
     std::vector<std::uint32_t> keys;
     auto push_key = [&](std::uint32_t key) {
@@ -2588,61 +3341,573 @@ std::vector<std::uint32_t> matrix_xor_key_candidates(const std::vector<std::uint
     const std::uint32_t expected_one = 0x3F800000u;
     const std::uint32_t expected_zero = 0u;
     const std::size_t words = stride / sizeof(std::uint32_t);
-    const std::uint32_t one_indices[] = {0, 5, 10, 15};
-    const std::uint32_t zero_indices[] = {3, 7, 11, 12, 13, 14};
-    for (std::uint32_t idx : one_indices)
-    {
-        if (idx >= words)
-            continue;
+    auto read_word = [&](std::size_t idx) -> std::uint32_t {
         std::uint32_t word = 0;
-        std::memcpy(&word, bytes.data() + off + static_cast<std::size_t>(idx) * sizeof(std::uint32_t), sizeof(word));
-        push_key(word ^ expected_one);
+        std::memcpy(&word, bytes.data() + off + idx * sizeof(std::uint32_t), sizeof(word));
+        return word;
+    };
+    if (stride == 48 || stride == 64)
+    {
+        const std::uint32_t one_indices[] = {0, 5, 10, 15};
+        const std::uint32_t zero_indices[] = {3, 7, 11, 12, 13, 14};
+        for (std::uint32_t idx : one_indices)
+        {
+            if (idx >= words) continue;
+            push_key(read_word(idx) ^ expected_one);
+        }
+        for (std::uint32_t idx : zero_indices)
+        {
+            if (idx >= words) continue;
+            push_key(read_word(idx) ^ expected_zero);
+        }
     }
-    for (std::uint32_t idx : zero_indices)
+    else if (stride == 28)
     {
-        if (idx >= words)
-            continue;
-        std::uint32_t word = 0;
-        std::memcpy(&word, bytes.data() + off + static_cast<std::size_t>(idx) * sizeof(std::uint32_t), sizeof(word));
-        push_key(word ^ expected_zero);
+        push_key(read_word(3) ^ expected_one);
+        push_key(read_word(4) ^ expected_zero);
+        push_key(read_word(5) ^ expected_zero);
+        push_key(read_word(6) ^ expected_zero);
+    }
+    else if (stride == 32)
+    {
+        push_key(read_word(3) ^ expected_one);
+        for (int i = 4; i < 8; ++i)
+            push_key(read_word(i) ^ expected_zero);
+    }
+    else if (stride == 40 || stride == 52)
+    {
+        for (int i = 0; i < 3; ++i)
+            push_key(read_word(i) ^ expected_one);
+        push_key(read_word(6) ^ expected_one);
+        for (int i = 7; i < 10; ++i)
+            push_key(read_word(i) ^ expected_zero);
+    }
+    else if (stride == 60)
+    {
+        for (int i = 0; i < 3; ++i)
+            push_key(read_word(i) ^ expected_one);
+        push_key(read_word(4) ^ expected_one);
+        push_key(read_word(8) ^ expected_one);
+        push_key(read_word(12) ^ expected_one);
+        const std::uint32_t zero_indices_60[] = {5, 6, 7, 9, 10, 11, 13, 14};
+        for (std::uint32_t idx : zero_indices_60)
+        {
+            if (idx >= words) continue;
+            push_key(read_word(idx) ^ expected_zero);
+        }
     }
     return keys;
 }
 
 matrix_decode_result_t best_matrix_decode_run(const std::vector<std::uint8_t>& bytes,
-                                              double world_max,
-                                              std::uint32_t max_count,
-                                              std::size_t max_probe_bytes)
+                                               double world_max,
+                                               std::uint32_t max_count,
+                                               std::size_t max_probe_bytes)
 {
     matrix_decode_result_t best;
     const std::size_t probe_end = std::min<std::size_t>(bytes.size(), max_probe_bytes);
+    struct format_entry_t
+    {
+        std::size_t stride;
+        bone_format_t format;
+    };
+    const format_entry_t formats[] = {
+        {64, bone_format_t::matrix4x4_64},
+        {64, bone_format_t::matrix3x4_64_pad},
+        {48, bone_format_t::matrix3x4_48},
+        {60, bone_format_t::srt_mat3x3_60},
+        {52, bone_format_t::srt_quat_52_pad},
+        {40, bone_format_t::srt_quat_40},
+        {32, bone_format_t::dual_quat_32},
+        {28, bone_format_t::quat_pos_28},
+    };
+    for (std::size_t off = 0; off + 28 <= probe_end; off += 4)
+    {
+        for (const auto& fe : formats)
+        {
+            if (off + fe.stride > bytes.size())
+                continue;
+            for (std::uint32_t key : format_xor_key_candidates(bytes, off, fe.stride))
+            {
+                matrix_eval_t first;
+                const std::uint32_t count = matrix_run_count_decoded(bytes, off, fe.stride, key,
+                                                                       world_max, max_count, &first);
+                if (count == 0)
+                    continue;
+                const bool better = count > best.count ||
+                    (count == best.count && key == 0 && best.xor_key != 0) ||
+                    (count == best.count && key == 0 && best.format == bone_format_t::unknown);
+                if (!better)
+                    continue;
+                best.count = count;
+                best.stride = fe.stride;
+                best.offset = off;
+                best.xor_key = key;
+                best.decode = key == 0 ? "raw_float32" : "xor32_float32";
+                best.first_eval = first;
+                best.format = fe.format;
+                best.entry_stride = fe.stride;
+            }
+        }
+    }
+    return best;
+}
+
+matrix_decode_result_t best_interleaved_decode_run(const std::vector<std::uint8_t>& bytes,
+                                                    double world_max,
+                                                    std::uint32_t max_count,
+                                                    std::size_t max_probe_bytes)
+{
+    matrix_decode_result_t best;
+    const std::size_t probe_end = std::min<std::size_t>(bytes.size(), max_probe_bytes);
+    const std::size_t matrix_strides[] = {48, 64, 28, 32, 40, 52, 60};
+    const std::size_t entry_strides[] = {64, 80, 96, 112, 128, 192, 256};
+    for (std::size_t off = 0; off + 64 <= probe_end; off += 16)
+    {
+        for (std::size_t mstride : matrix_strides)
+        {
+            for (std::size_t estride : entry_strides)
+            {
+                if (estride <= mstride || off + estride > bytes.size())
+                    continue;
+                for (std::uint32_t key : format_xor_key_candidates(bytes, off, mstride))
+                {
+                    std::uint32_t count = 0;
+                    for (std::size_t cursor = off; cursor + mstride <= bytes.size() && count < max_count; cursor += estride)
+                    {
+                        float raw[16];
+                        if (!decode_words_generic(bytes, cursor, mstride, key, raw, 16))
+                            break;
+                        if (!plausible_bone_format(raw, mstride, world_max))
+                            break;
+                        ++count;
+                    }
+                    if (count == 0)
+                        continue;
+                    const bool better = count > best.count ||
+                        (count == best.count && key == 0 && best.xor_key != 0);
+                    if (!better)
+                        continue;
+                    best.count = count;
+                    best.stride = mstride;
+                    best.entry_stride = estride;
+                    best.offset = off;
+                    best.xor_key = key;
+                    best.decode = key == 0 ? "raw_float32_interleaved" : "xor32_float32_interleaved";
+                    best.format = bone_format_t::unknown;
+                }
+            }
+        }
+    }
+    return best;
+}
+
+bool decode_matrix_rolling_xor(const std::vector<std::uint8_t>& bytes,
+                               std::size_t off, std::size_t stride,
+                               std::uint32_t seed, std::uint32_t multiplier,
+                               std::uint32_t increment, float* out)
+{
+    if (off + stride > bytes.size() || (stride != 48 && stride != 64))
+        return false;
+    std::fill(out, out + 16, 0.0f);
+    const std::size_t words = stride / sizeof(std::uint32_t);
+    std::uint32_t key = seed;
+    for (std::size_t i = 0; i < words; ++i)
+    {
+        std::uint32_t word = 0;
+        std::memcpy(&word, bytes.data() + off + i * sizeof(std::uint32_t), sizeof(word));
+        word ^= key;
+        out[i] = float_from_u32(word);
+        key = key * multiplier + increment;
+    }
+    if (stride == 48)
+        out[15] = 1.0f;
+    return true;
+}
+
+bool decode_matrix_multi_key_xor(const std::vector<std::uint8_t>& bytes,
+                                  std::size_t off, std::size_t stride,
+                                  const std::vector<std::uint32_t>& keys, float* out)
+{
+    if (off + stride > bytes.size() || (stride != 48 && stride != 64))
+        return false;
+    if (keys.empty())
+        return false;
+    std::fill(out, out + 16, 0.0f);
+    const std::size_t words = stride / sizeof(std::uint32_t);
+    for (std::size_t i = 0; i < words; ++i)
+    {
+        std::uint32_t word = 0;
+        std::memcpy(&word, bytes.data() + off + i * sizeof(std::uint32_t), sizeof(word));
+        word ^= keys[i % keys.size()];
+        out[i] = float_from_u32(word);
+    }
+    if (stride == 48)
+        out[15] = 1.0f;
+    return true;
+}
+
+bool decode_matrix_additive(const std::vector<std::uint8_t>& bytes,
+                             std::size_t off, std::size_t stride,
+                             std::uint32_t add_key, bool word_mode, float* out)
+{
+    if (off + stride > bytes.size() || (stride != 48 && stride != 64))
+        return false;
+    std::fill(out, out + 16, 0.0f);
+    if (word_mode)
+    {
+        const std::size_t words = stride / sizeof(std::uint32_t);
+        for (std::size_t i = 0; i < words; ++i)
+        {
+            std::uint32_t word = 0;
+            std::memcpy(&word, bytes.data() + off + i * sizeof(std::uint32_t), sizeof(word));
+            word = word - add_key;
+            out[i] = float_from_u32(word);
+        }
+    }
+    else
+    {
+        for (std::size_t i = 0; i + sizeof(std::uint32_t) <= stride; i += sizeof(std::uint32_t))
+        {
+            std::uint32_t word = 0;
+            std::memcpy(&word, bytes.data() + off + i, sizeof(word));
+            const std::uint8_t* p = reinterpret_cast<const std::uint8_t*>(&word);
+            std::uint32_t decoded = 0;
+            for (int b = 0; b < 4; ++b)
+                reinterpret_cast<std::uint8_t*>(&decoded)[b] =
+                    static_cast<std::uint8_t>(p[b] - static_cast<std::uint8_t>(add_key >> (b * 8)));
+            out[i / sizeof(std::uint32_t)] = float_from_u32(decoded);
+        }
+    }
+    if (stride == 48)
+        out[15] = 1.0f;
+    return true;
+}
+
+multi_decode_result_t best_multi_decode_run(const std::vector<std::uint8_t>& bytes,
+                                             double world_max,
+                                             std::uint32_t max_count,
+                                             std::size_t max_probe_bytes)
+{
+    multi_decode_result_t best;
+
+    matrix_decode_result_t baseline = best_matrix_decode_run(bytes, world_max, max_count, max_probe_bytes);
+    if (baseline.count > 0)
+    {
+        best.algorithm = baseline.xor_key == 0 ? decode_algorithm_t::raw_float32 : decode_algorithm_t::xor_uniform;
+        best.algorithm_name = baseline.decode;
+        best.count = baseline.count;
+        best.stride = baseline.stride;
+        best.offset = baseline.offset;
+        best.uniform_key = baseline.xor_key;
+        best.first_eval = baseline.first_eval;
+        best.format = baseline.format;
+        best.entry_stride = baseline.entry_stride;
+    }
+
+    const std::size_t probe_end = std::min<std::size_t>(bytes.size(), max_probe_bytes);
+
+    auto try_rolling = [&](std::size_t off, std::size_t stride,
+                           std::uint32_t seed, std::uint32_t mul, std::uint32_t inc) {
+        std::uint32_t count = 0;
+        matrix_eval_t first{};
+        bool first_eval_set = false;
+        for (std::size_t cursor = off; cursor + stride <= bytes.size() && count < max_count; cursor += stride)
+        {
+            float f[16] = {};
+            if (!decode_matrix_rolling_xor(bytes, cursor, stride, seed, mul, inc, f))
+                break;
+            matrix_eval_t eval = evaluate_matrix4x4(f, world_max);
+            if (!eval.plausible)
+                break;
+            if (count == 0) { first = eval; first_eval_set = true; }
+            ++count;
+        }
+        if (count > 0 && (count > best.count ||
+            (count == best.count && best.algorithm == decode_algorithm_t::raw_float32)))
+        {
+            best.algorithm = decode_algorithm_t::xor_rolling;
+            best.algorithm_name = "xor_rolling";
+            best.count = count;
+            best.stride = stride;
+            best.offset = off;
+            best.rolling_seed = seed;
+            best.rolling_multiplier = mul;
+            best.rolling_increment = inc;
+            best.uniform_key = 0;
+            best.format = bone_format_t::unknown;
+            best.entry_stride = stride;
+            if (first_eval_set) best.first_eval = first;
+        }
+    };
+    auto try_additive = [&](std::size_t off, std::size_t stride, std::uint32_t key, bool word_mode) {
+        std::uint32_t count = 0;
+        matrix_eval_t first{};
+        bool first_eval_set = false;
+        for (std::size_t cursor = off; cursor + stride <= bytes.size() && count < max_count; cursor += stride)
+        {
+            float f[16] = {};
+            if (!decode_matrix_additive(bytes, cursor, stride, key, word_mode, f))
+                break;
+            matrix_eval_t eval = evaluate_matrix4x4(f, world_max);
+            if (!eval.plausible)
+                break;
+            if (count == 0) { first = eval; first_eval_set = true; }
+            ++count;
+        }
+        if (count > 0 && (count > best.count ||
+            (count == best.count && best.algorithm == decode_algorithm_t::raw_float32)))
+        {
+            best.algorithm = word_mode ? decode_algorithm_t::additive_word : decode_algorithm_t::additive_byte;
+            best.algorithm_name = word_mode ? "additive_word32" : "additive_byte";
+            best.count = count;
+            best.stride = stride;
+            best.offset = off;
+            best.additive_key = key;
+            best.uniform_key = 0;
+            best.format = bone_format_t::unknown;
+            best.entry_stride = stride;
+            if (first_eval_set) best.first_eval = first;
+        }
+    };
+
     for (std::size_t off = 0; off + 48 <= probe_end; off += 16)
     {
         for (std::size_t stride : {64ull, 48ull})
         {
             if (off + stride > bytes.size())
                 continue;
-            for (std::uint32_t key : matrix_xor_key_candidates(bytes, off, stride))
+            static const std::uint32_t common_seeds[] = {0x3F800000u, 0x40000000u, 0x00000001u, 0xDEADBEEFu, 0xCAFEBABEu};
+            static const std::uint32_t common_muls[] = {0x00000001u, 0x00000101u, 0x01000193u};
+            static const std::uint32_t common_incs[] = {0u, 0x3F800000u, 0x00000001u};
+            for (std::uint32_t seed : common_seeds)
+                for (std::uint32_t mul : common_muls)
+                    for (std::uint32_t inc : common_incs)
+                        try_rolling(off, stride, seed, mul, inc);
+            for (std::uint32_t key : format_xor_key_candidates(bytes, off, stride))
             {
-                matrix_eval_t first;
-                const std::uint32_t count = matrix_run_count_decoded(bytes, off, stride, key, world_max, max_count, &first);
-                if (count == 0)
-                    continue;
-                const bool better = count > best.count ||
-                                    (count == best.count && key == 0 && best.xor_key != 0) ||
-                                    (count == best.count && stride == 64 && best.stride == 48);
-                if (!better)
-                    continue;
-                best.count = count;
-                best.stride = stride;
-                best.offset = off;
-                best.xor_key = key;
-                best.decode = key == 0 ? "raw_float32" : "xor32_float32";
-                best.first_eval = first;
+                try_additive(off, stride, key, true);
+                try_additive(off, stride, key, false);
             }
         }
     }
     return best;
+}
+
+decryption_analysis_t derive_decryption_from_pair(const std::vector<std::uint8_t>& encrypted,
+                                                   const std::vector<std::uint8_t>& decrypted,
+                                                   std::size_t compare_size)
+{
+    decryption_analysis_t result;
+    const std::size_t n = std::min(compare_size, std::min(encrypted.size(), decrypted.size()));
+    if (n < 16)
+    {
+        result.verification_detail = "insufficient_data";
+        return result;
+    }
+    result.total_bytes = n;
+
+    bool uniform_xor_match = true;
+    std::uint32_t xor_key_candidate = 0;
+    std::memcpy(&xor_key_candidate, encrypted.data(), sizeof(xor_key_candidate));
+    std::uint32_t first_decrypted_word = 0;
+    std::memcpy(&first_decrypted_word, decrypted.data(), sizeof(first_decrypted_word));
+    xor_key_candidate ^= first_decrypted_word;
+    for (std::size_t i = 0; i + 3 < n; i += 4)
+    {
+        std::uint32_t enc_word = 0, dec_word = 0;
+        std::memcpy(&enc_word, encrypted.data() + i, sizeof(enc_word));
+        std::memcpy(&dec_word, decrypted.data() + i, sizeof(dec_word));
+        if ((enc_word ^ xor_key_candidate) != dec_word)
+        {
+            uniform_xor_match = false;
+            break;
+        }
+        ++result.match_bytes;
+    }
+    if (uniform_xor_match)
+    {
+        result.algorithm = decode_algorithm_t::xor_uniform;
+        result.algorithm_name = "xor_uniform";
+        result.uniform_key = xor_key_candidate;
+        result.key_words.push_back(xor_key_candidate);
+        result.derived_key_bytes.resize(4);
+        std::memcpy(result.derived_key_bytes.data(), &xor_key_candidate, 4);
+        result.key_length = 4;
+        result.key_pattern = "uniform_32bit";
+        result.verified = true;
+        result.verification_detail = "verified_uniform_xor_all_words_match";
+        return result;
+    }
+
+    result.match_bytes = 0;
+    std::vector<std::uint32_t> per_word_keys;
+    per_word_keys.reserve(n / 4);
+    for (std::size_t i = 0; i + 3 < n; i += 4)
+    {
+        std::uint32_t enc_word = 0, dec_word = 0;
+        std::memcpy(&enc_word, encrypted.data() + i, sizeof(enc_word));
+        std::memcpy(&dec_word, decrypted.data() + i, sizeof(dec_word));
+        per_word_keys.push_back(enc_word ^ dec_word);
+    }
+    bool all_same = per_word_keys.size() > 1 &&
+        std::all_of(per_word_keys.begin(), per_word_keys.end(),
+                     [&](std::uint32_t k) { return k == per_word_keys[0]; });
+    if (!all_same && per_word_keys.size() >= 4)
+    {
+        bool is_multi_key = true;
+        const std::size_t period = per_word_keys.size() / 4;
+        for (std::size_t i = period; i < per_word_keys.size(); ++i)
+        {
+            if (per_word_keys[i] != per_word_keys[i % period])
+            {
+                is_multi_key = false;
+                break;
+            }
+        }
+        if (is_multi_key)
+        {
+            result.algorithm = decode_algorithm_t::xor_multi_key;
+            result.algorithm_name = "xor_multi_key";
+            result.key_words.assign(per_word_keys.begin(), per_word_keys.begin() + period);
+            result.key_length = static_cast<std::uint32_t>(period * 4);
+            result.derived_key_bytes.resize(period * 4);
+            for (std::size_t i = 0; i < period; ++i)
+                std::memcpy(result.derived_key_bytes.data() + i * 4, &per_word_keys[i], 4);
+            result.key_pattern = "multi_key_period_" + std::to_string(period);
+            result.verified = true;
+            result.verification_detail = "verified_multi_key_xor_periodic_match";
+            result.match_bytes = n;
+            return result;
+        }
+        bool per_element_rolling = true;
+        for (std::size_t i = 4; i < per_word_keys.size(); ++i)
+        {
+            const std::uint32_t expected = per_word_keys[i - 1] * 0x00000101u + 0x3F800000u;
+            if (per_word_keys[i] != expected)
+            {
+                per_element_rolling = false;
+                break;
+            }
+        }
+        if (per_element_rolling && per_word_keys.size() >= 8)
+        {
+            result.algorithm = decode_algorithm_t::xor_rolling;
+            result.algorithm_name = "xor_rolling";
+            result.rolling_seed = per_word_keys[0];
+            result.rolling_multiplier = 0x00000101u;
+            result.rolling_increment = 0x3F800000u;
+            result.key_words = {per_word_keys[0]};
+            result.key_length = 4;
+            result.derived_key_bytes.resize(4);
+            std::memcpy(result.derived_key_bytes.data(), &result.rolling_seed, 4);
+            result.key_pattern = "rolling_lcg";
+            result.verified = true;
+            result.verification_detail = "verified_rolling_xor_lcg_match";
+            result.match_bytes = n;
+            return result;
+        }
+        result.algorithm = decode_algorithm_t::custom;
+        result.algorithm_name = "custom_per_word_xor";
+        result.key_words = per_word_keys;
+        result.key_length = static_cast<std::uint32_t>(per_word_keys.size() * 4);
+        result.derived_key_bytes.resize(per_word_keys.size() * 4);
+        for (std::size_t i = 0; i < per_word_keys.size(); ++i)
+            std::memcpy(result.derived_key_bytes.data() + i * 4, &per_word_keys[i], 4);
+        result.key_pattern = "per_word_key_stream";
+        result.verified = true;
+        result.verification_detail = "verified_per_word_xor_full_key_stream";
+        result.match_bytes = n;
+        return result;
+    }
+
+    result.match_bytes = 0;
+    bool additive_word_match = true;
+    std::uint32_t add_key_candidate = 0;
+    std::memcpy(&add_key_candidate, encrypted.data(), sizeof(add_key_candidate));
+    std::uint32_t first_dec = 0;
+    std::memcpy(&first_dec, decrypted.data(), sizeof(first_dec));
+    add_key_candidate = first_dec - add_key_candidate;
+    for (std::size_t i = 0; i + 3 < n; i += 4)
+    {
+        std::uint32_t enc_word = 0, dec_word = 0;
+        std::memcpy(&enc_word, encrypted.data() + i, sizeof(enc_word));
+        std::memcpy(&dec_word, decrypted.data() + i, sizeof(dec_word));
+        if ((enc_word + add_key_candidate) != dec_word)
+        {
+            additive_word_match = false;
+            break;
+        }
+        ++result.match_bytes;
+    }
+    if (additive_word_match)
+    {
+        result.algorithm = decode_algorithm_t::additive_word;
+        result.algorithm_name = "additive_word32";
+        result.additive_key = add_key_candidate;
+        result.key_words.push_back(add_key_candidate);
+        result.derived_key_bytes.resize(4);
+        std::memcpy(result.derived_key_bytes.data(), &add_key_candidate, 4);
+        result.key_length = 4;
+        result.key_pattern = "uniform_additive_32bit";
+        result.verified = true;
+        result.verification_detail = "verified_additive_word_all_words_match";
+        return result;
+    }
+
+    result.algorithm = decode_algorithm_t::custom;
+    result.algorithm_name = "unknown";
+    result.verification_detail = "no_uniform_additive_xor_pattern_matched";
+    return result;
+}
+
+bool verify_decryption(const std::vector<std::uint8_t>& encrypted,
+                       const std::vector<std::uint8_t>& expected_decrypted,
+                       const decryption_analysis_t& analysis,
+                       std::size_t compare_size)
+{
+    if (!analysis.verified)
+        return false;
+    const std::size_t n = std::min(compare_size, std::min(encrypted.size(), expected_decrypted.size()));
+    std::vector<std::uint8_t> redecrypted(n, 0);
+    for (std::size_t i = 0; i + 4 <= n; i += 4)
+    {
+        std::uint32_t enc_word = 0;
+        std::memcpy(&enc_word, encrypted.data() + i, sizeof(enc_word));
+        std::uint32_t dec_word = 0;
+        switch (analysis.algorithm)
+        {
+        case decode_algorithm_t::xor_uniform:
+            dec_word = enc_word ^ analysis.uniform_key;
+            break;
+        case decode_algorithm_t::xor_multi_key:
+            if (analysis.key_words.empty()) return false;
+            dec_word = enc_word ^ analysis.key_words[(i / 4) % analysis.key_words.size()];
+            break;
+        case decode_algorithm_t::xor_rolling:
+        {
+            std::uint32_t key = analysis.rolling_seed;
+            for (std::size_t j = 0; j < i / 4; ++j)
+                key = key * analysis.rolling_multiplier + analysis.rolling_increment;
+            dec_word = enc_word ^ key;
+            break;
+        }
+        case decode_algorithm_t::additive_word:
+            dec_word = enc_word + analysis.additive_key;
+            break;
+        case decode_algorithm_t::additive_byte:
+        {
+            for (int b = 0; b < 4; ++b)
+                redecrypted[i + b] = static_cast<std::uint8_t>(
+                    encrypted[i + b] + static_cast<std::uint8_t>(analysis.additive_key >> (b * 8)));
+            continue;
+        }
+        default:
+            return false;
+        }
+        std::memcpy(redecrypted.data() + i, &dec_word, sizeof(dec_word));
+    }
+    return std::equal(redecrypted.begin(), redecrypted.begin() + n, expected_decrypted.begin());
 }
 
 std::optional<json> make_cbuffer_candidate(std::uint32_t pid,
@@ -2666,9 +3931,8 @@ std::optional<json> make_cbuffer_candidate(std::uint32_t pid,
     const std::size_t read_size = static_cast<std::size_t>(std::min<std::uint64_t>(available, 4096));
     if (!read_bytes(pid, va, read_size, bytes) || bytes.empty())
         return std::nullopt;
-    const std::uint32_t matrices64 = matrix_run_count(bytes, 0, 64, 1000000.0, 256);
-    const std::uint32_t matrices48 = matrix_run_count(bytes, 0, 48, 1000000.0, 256);
-    const std::uint32_t matrix_count = std::max(matrices64, matrices48);
+    matrix_decode_result_t decoded = best_matrix_decode_run(bytes, 1000000.0, 256, 512);
+    const std::uint32_t matrix_count = decoded.count;
     double confidence = source_confidence;
     if (is_writable(region))
         confidence += 0.10;
@@ -2684,7 +3948,8 @@ std::optional<json> make_cbuffer_candidate(std::uint32_t pid,
     row["object_va"] = object_va ? json(sa_format_address(object_va)) : json(nullptr);
     row["object_field_offset"] = field_offset ? json(sa_format_address(field_offset)) : json(nullptr);
     row["matrix_count"] = matrix_count;
-    row["matrix_size"] = matrices64 >= matrices48 ? 64 : 48;
+    row["matrix_size"] = decoded.stride;
+    row["format"] = bone_format_name(decoded.format);
     row["region"] = region_json(region);
     return row;
 }
@@ -2958,19 +4223,20 @@ json scan_memory_cbuffer_candidates(std::uint32_t pid, std::size_t limit, double
         {
             if ((off & 0xFFFu) == 0 && dx_call_cancelled("scan_memory_cbuffer_candidates_bytes", pid, started_ms))
                 break;
-            const std::uint32_t run64 = matrix_run_count(bytes, off, 64, world_max, 256);
-            const std::uint32_t run48 = matrix_run_count(bytes, off, 48, world_max, 256);
-            const std::uint32_t best = std::max(run64, run48);
-            if (best == 0)
+            matrix_decode_result_t decoded = best_matrix_decode_run(bytes, world_max, 256, static_cast<std::size_t>(bytes.size() - off));
+            const std::uint32_t best_run = decoded.count;
+            if (best_run == 0)
                 continue;
-            auto row = make_cbuffer_candidate(pid, -1, region.base + off, 0, 0, "bounded_private_memory_matrix_scan", 0.35);
+            auto row = make_cbuffer_candidate(pid, -1, region.base + off + decoded.offset, 0, 0,
+                                               "bounded_private_memory_matrix_scan", 0.35);
             if (!row)
                 continue;
-            (*row)["matrix_count"] = best;
-            (*row)["matrix_size"] = run64 >= run48 ? 64 : 48;
-            (*row)["confidence"] = std::min(0.95, 0.38 + static_cast<double>(best) * 0.04);
+            (*row)["matrix_count"] = best_run;
+            (*row)["matrix_size"] = decoded.stride;
+            (*row)["format"] = bone_format_name(decoded.format);
+            (*row)["confidence"] = std::min(0.95, 0.38 + static_cast<double>(best_run) * 0.04);
             append_unique_candidate(out, *row, seen, limit);
-            off += (run64 >= run48 ? 64ull : 48ull) * std::max<std::uint32_t>(best, 1);
+            off += decoded.stride * std::max<std::uint32_t>(best_run, 1);
         }
     }
     diag::log_tagged_fmt("dx_hook", "scan_memory_cbuffer_candidates exit pid=%u regions=%zu max_regions=%zu results=%zu elapsed_ms=%llu",
@@ -3088,6 +4354,447 @@ json dx_args_json(std::uint32_t pid, const driver_bridge::thread_context_t& ctx,
     return args;
 }
 
+std::string classify_mesh_type(std::uint32_t index_count, std::uint32_t vertex_count, const std::string& draw_kind)
+{
+    if (draw_kind.find("Indexed") != std::string::npos)
+    {
+        if (vertex_count >= 1000 && vertex_count <= 50000 && index_count >= 2000 && index_count <= 80000)
+            return "character";
+        if (vertex_count >= 100 && vertex_count <= 2000 && index_count <= 6000)
+            return "weapon";
+        if (vertex_count >= 10000)
+            return "world_or_static";
+    }
+    else
+    {
+        if (vertex_count >= 1000 && vertex_count <= 50000)
+            return "character";
+        if (vertex_count >= 100 && vertex_count <= 2000)
+            return "weapon";
+        if (vertex_count >= 10000)
+            return "world_or_static";
+    }
+    return "unknown";
+}
+
+struct frame_tracking_state_t
+{
+    std::atomic<std::uint32_t> current_frame{0};
+    std::atomic<std::uint32_t> current_draw_ordinal{0};
+    std::atomic<std::uint64_t> frame_start_ms{0};
+    std::atomic<bool> enabled{false};
+};
+
+frame_tracking_state_t& frame_tracking_state()
+{
+    static frame_tracking_state_t state;
+    return state;
+}
+
+std::uint32_t current_frame_index(std::uint32_t /*pid*/)
+{
+    return frame_tracking_state().current_frame.load(std::memory_order_acquire);
+}
+
+std::uint32_t current_draw_ordinal(std::uint32_t /*pid*/)
+{
+    return frame_tracking_state().current_draw_ordinal.load(std::memory_order_acquire);
+}
+
+struct per_frame_bind_state_t
+{
+    std::atomic<std::uint64_t> last_cbuffer_va{0};
+    std::atomic<int> last_cbuffer_slot{-1};
+    std::atomic<std::uint64_t> last_cbuffer_timestamp_ms{0};
+};
+
+per_frame_bind_state_t& per_frame_bind_state()
+{
+    static per_frame_bind_state_t state;
+    return state;
+}
+
+std::string classification_to_string(store::cbuffer_class_t c)
+{
+    switch (c)
+    {
+    case store::cbuffer_class_t::persistent: return "persistent";
+    case store::cbuffer_class_t::per_draw: return "per_draw";
+    case store::cbuffer_class_t::static_bind: return "static";
+    default: return "unknown";
+    }
+}
+
+json draw_call_info_to_json(const store::draw_call_info_t& dc)
+{
+    json j;
+    j["timestamp_ms"] = dc.timestamp_ms;
+    j["index_count"] = dc.index_count;
+    j["vertex_count"] = dc.vertex_count;
+    j["start_index"] = dc.start_index;
+    j["instance_count"] = dc.instance_count;
+    j["start_vertex"] = dc.start_vertex;
+    j["base_vertex"] = dc.base_vertex;
+    j["draw_kind"] = dc.draw_kind;
+    j["likely_mesh_type"] = dc.likely_mesh_type;
+    j["preceding_cbuffer_va"] = dc.preceding_cbuffer_va ? json(sa_format_address(dc.preceding_cbuffer_va)) : json(nullptr);
+    j["preceding_cbuffer_slot"] = dc.preceding_cbuffer_slot;
+    j["preceding_cbuffer_timestamp_ms"] = dc.preceding_cbuffer_timestamp_ms;
+    j["frame_index"] = dc.frame_index;
+    j["draw_ordinal"] = dc.draw_ordinal;
+    return j;
+}
+
+json frame_batch_to_json(const store::frame_batch_t& fb)
+{
+    json j;
+    j["pid"] = fb.pid;
+    j["frame_index"] = fb.frame_index;
+    j["start_timestamp_ms"] = fb.start_timestamp_ms;
+    j["end_timestamp_ms"] = fb.end_timestamp_ms;
+    j["total_draw_count"] = fb.total_draw_count;
+    j["character_draw_count"] = fb.character_draw_count;
+    j["weapon_draw_count"] = fb.weapon_draw_count;
+    j["world_draw_count"] = fb.world_draw_count;
+    json draws = json::array();
+    for (const auto& dc : fb.draw_calls)
+        draws.push_back(draw_call_info_to_json(dc));
+    j["draw_calls"] = std::move(draws);
+    json binds = json::array();
+    for (const auto& [va, slot] : fb.cbuffer_binds)
+    {
+        binds.push_back({
+            {"va", sa_format_address(va)},
+            {"slot", slot >= 0 ? json(slot) : json(nullptr)}
+        });
+    }
+    j["cbuffer_binds"] = std::move(binds);
+    json vbinds = json::array();
+    for (const auto& [va, slot] : fb.vertex_buffer_binds)
+    {
+        vbinds.push_back({
+            {"va", sa_format_address(va)},
+            {"slot", slot >= 0 ? json(slot) : json(nullptr)}
+        });
+    }
+    j["vertex_buffer_binds"] = std::move(vbinds);
+    return j;
+}
+
+json cbuffer_classification_to_json(const store::cbuffer_classification_t& cc)
+{
+    json j;
+    j["va"] = sa_format_address(cc.va);
+    j["slot"] = cc.slot >= 0 ? json(cc.slot) : json(nullptr);
+    j["classification"] = classification_to_string(cc.classification);
+    j["frames_seen"] = cc.frames_seen;
+    j["total_binds"] = cc.total_binds;
+    j["distinct_draw_calls"] = cc.distinct_draw_calls;
+    j["frequency_score"] = cc.frequency_score;
+    j["recommended_for"] = cc.recommended_for;
+    json frames = json::array();
+    for (auto f : cc.frame_indices) frames.push_back(f);
+    j["frame_indices"] = std::move(frames);
+    json draws = json::array();
+    for (const auto& dc : cc.associated_draw_calls)
+        draws.push_back(draw_call_info_to_json(dc));
+    j["associated_draw_calls"] = std::move(draws);
+    return j;
+}
+
+json hot_va_to_json(const store::hot_va_entry_t& hv)
+{
+    json j;
+    j["va"] = sa_format_address(hv.va);
+    j["slot"] = hv.slot >= 0 ? json(hv.slot) : json(nullptr);
+    j["pid"] = hv.pid;
+    j["hit_count"] = hv.hit_count;
+    j["frame_count"] = hv.frame_count;
+    j["first_seen_ms"] = hv.first_seen_ms;
+    j["last_seen_ms"] = hv.last_seen_ms;
+    j["confidence_boost"] = hv.confidence_boost;
+    return j;
+}
+
+store::draw_call_info_t extract_draw_call_info(std::uint32_t pid,
+                                               const driver_bridge::thread_context_t& ctx,
+                                               const store::dx_hook_record_t& record,
+                                               std::uint32_t frame_index,
+                                               std::uint32_t draw_ordinal)
+{
+    store::draw_call_info_t dc;
+    dc.timestamp_ms = unix_time_ms();
+    dc.frame_index = frame_index;
+    dc.draw_ordinal = draw_ordinal;
+    dc.draw_kind = record.action == "draw" ? record.api : "unknown";
+
+    if (record.action == "draw")
+    {
+        if (record.target_name == "DrawIndexed")
+        {
+            dc.index_count = static_cast<std::uint32_t>(ctx.rdx);
+            dc.start_index = static_cast<std::uint32_t>(ctx.r8);
+            dc.base_vertex = static_cast<int>(ctx.r9);
+            dc.vertex_count = 0;
+            dc.draw_kind = "DrawIndexed";
+        }
+        else if (record.target_name == "DrawInstanced")
+        {
+            dc.vertex_count = static_cast<std::uint32_t>(ctx.rdx);
+            dc.instance_count = static_cast<std::uint32_t>(ctx.r8);
+            dc.start_vertex = static_cast<std::uint32_t>(ctx.r9);
+            dc.draw_kind = "DrawInstanced";
+        }
+        else if (record.target_name == "Draw")
+        {
+            dc.vertex_count = static_cast<std::uint32_t>(ctx.rdx);
+            dc.start_vertex = static_cast<std::uint32_t>(ctx.r8);
+            dc.draw_kind = "Draw";
+        }
+        else if (record.target_name == "DrawIndexedInstanced")
+        {
+            dc.index_count = static_cast<std::uint32_t>(ctx.rdx);
+            dc.instance_count = static_cast<std::uint32_t>(ctx.r8);
+            dc.start_index = static_cast<std::uint32_t>(ctx.r9);
+            dc.base_vertex = static_cast<int>(stack_arg64(pid, ctx.rsp, 0));
+            dc.draw_kind = "DrawIndexedInstanced";
+        }
+        else
+        {
+            const std::string api = lower_ascii(record.api);
+            if (api.find("d3d11") != std::string::npos || api.find("d3d12") != std::string::npos)
+            {
+                auto mod = find_module_for_address(pid, record.target_va);
+                if (mod && mod->name.find("DrawIndexed") != std::string::npos)
+                {
+                    dc.index_count = static_cast<std::uint32_t>(ctx.rdx);
+                    dc.start_index = static_cast<std::uint32_t>(ctx.r8);
+                    dc.base_vertex = static_cast<int>(ctx.r9);
+                    dc.vertex_count = 0;
+                    dc.draw_kind = "DrawIndexed";
+                }
+                else if (mod && mod->name.find("DrawInstanced") != std::string::npos)
+                {
+                    dc.vertex_count = static_cast<std::uint32_t>(ctx.rdx);
+                    dc.instance_count = static_cast<std::uint32_t>(ctx.r8);
+                    dc.start_vertex = static_cast<std::uint32_t>(ctx.r9);
+                    dc.draw_kind = "DrawInstanced";
+                }
+                else if (mod && mod->name.find("Draw") != std::string::npos)
+                {
+                    dc.vertex_count = static_cast<std::uint32_t>(ctx.rdx);
+                    dc.start_vertex = static_cast<std::uint32_t>(ctx.r8);
+                    dc.draw_kind = "Draw";
+                }
+            }
+        }
+    }
+
+    auto& bs = per_frame_bind_state();
+    dc.preceding_cbuffer_va = bs.last_cbuffer_va.load(std::memory_order_acquire);
+    dc.preceding_cbuffer_slot = bs.last_cbuffer_slot.load(std::memory_order_acquire);
+    dc.preceding_cbuffer_timestamp_ms = bs.last_cbuffer_timestamp_ms.load(std::memory_order_acquire);
+
+    dc.likely_mesh_type = classify_mesh_type(dc.index_count, dc.vertex_count, dc.draw_kind);
+    return dc;
+}
+
+void update_hot_vas_from_frame(std::uint32_t pid, const store::frame_batch_t& batch)
+{
+    auto existing = store::list_hot_vas(pid);
+    for (const auto& [va, slot] : batch.cbuffer_binds)
+    {
+        auto it = std::find_if(existing.begin(), existing.end(), [&](const store::hot_va_entry_t& e) {
+            return e.va == va && e.slot == slot;
+        });
+        if (it != existing.end())
+        {
+            store::hot_va_entry_t updated = *it;
+            updated.hit_count++;
+            updated.frame_count++;
+            updated.last_seen_ms = batch.end_timestamp_ms;
+            updated.confidence_boost = std::min(0.20, updated.hit_count * 0.02);
+            store::update_hot_va(updated);
+        }
+        else
+        {
+            store::hot_va_entry_t entry;
+            entry.va = va;
+            entry.slot = slot;
+            entry.pid = pid;
+            entry.hit_count = 1;
+            entry.frame_count = 1;
+            entry.first_seen_ms = batch.end_timestamp_ms;
+            entry.last_seen_ms = batch.end_timestamp_ms;
+            entry.confidence_boost = 0.02;
+            store::add_hot_va(entry);
+        }
+    }
+}
+
+void on_present_hit(std::uint32_t pid, std::uint32_t /*tid*/, const driver_bridge::thread_context_t& /*ctx*/)
+{
+    auto& state = frame_tracking_state();
+    if (!state.enabled.load(std::memory_order_acquire))
+        return;
+
+    const std::uint32_t completed_frame = state.current_frame.load(std::memory_order_acquire);
+    const std::uint64_t start_ms = state.frame_start_ms.load(std::memory_order_acquire);
+
+    store::frame_batch_t batch;
+    batch.pid = pid;
+    batch.frame_index = completed_frame;
+    batch.start_timestamp_ms = start_ms;
+    batch.end_timestamp_ms = unix_time_ms();
+
+    std::vector<store::draw_call_info_t> frame_draws;
+    std::vector<std::pair<std::uint64_t, int>> frame_cbuffers;
+    for (const auto& record : store::list_dx_hooks(pid))
+    {
+        for (const auto& cap : record.captures)
+        {
+            const std::uint32_t cap_frame = cap.value("frame_index", 0u);
+            if (cap_frame != completed_frame)
+                continue;
+            if (cap.contains("draw_call_info") && cap["draw_call_info"].is_object())
+            {
+                store::draw_call_info_t dc;
+                dc.timestamp_ms = cap["draw_call_info"].value("timestamp_ms", 0ull);
+                dc.index_count = cap["draw_call_info"].value("index_count", 0u);
+                dc.vertex_count = cap["draw_call_info"].value("vertex_count", 0u);
+                dc.draw_kind = cap["draw_call_info"].value("draw_kind", std::string());
+                dc.likely_mesh_type = cap["draw_call_info"].value("likely_mesh_type", std::string());
+                dc.frame_index = completed_frame;
+                if (cap["draw_call_info"].contains("preceding_cbuffer_va"))
+                {
+                    std::uint64_t pva = 0;
+                    if (parse_u64_value(cap["draw_call_info"]["preceding_cbuffer_va"], pva))
+                        dc.preceding_cbuffer_va = pva;
+                }
+                dc.preceding_cbuffer_slot = cap["draw_call_info"].value("preceding_cbuffer_slot", -1);
+                frame_draws.push_back(dc);
+            }
+            if (cap.contains("cbuffers") && cap["cbuffers"].is_array())
+            {
+                for (const auto& cb : cap["cbuffers"])
+                {
+                    std::uint64_t va = 0;
+                    if (cb.contains("va") && parse_u64_value(cb["va"], va) && va != 0)
+                    {
+                        int slot = -1;
+                        if (cb.contains("slot") && cb["slot"].is_number_integer())
+                            slot = cb["slot"].get<int>();
+                        frame_cbuffers.push_back({va, slot});
+                    }
+                }
+            }
+        }
+    }
+
+    batch.draw_calls = std::move(frame_draws);
+    batch.cbuffer_binds = std::move(frame_cbuffers);
+    batch.total_draw_count = static_cast<std::uint32_t>(batch.draw_calls.size());
+    for (const auto& dc : batch.draw_calls)
+    {
+        if (dc.likely_mesh_type == "character") ++batch.character_draw_count;
+        else if (dc.likely_mesh_type == "weapon") ++batch.weapon_draw_count;
+        else if (dc.likely_mesh_type == "world_or_static") ++batch.world_draw_count;
+    }
+
+    store::add_frame_batch(batch);
+    update_hot_vas_from_frame(pid, batch);
+
+    state.current_frame.store(completed_frame + 1, std::memory_order_release);
+    state.current_draw_ordinal.store(0, std::memory_order_release);
+    state.frame_start_ms.store(unix_time_ms(), std::memory_order_release);
+}
+
+std::vector<store::cbuffer_classification_t> classify_cbuffers(std::uint32_t pid, std::size_t min_frames = 2)
+{
+    auto batches = store::list_frame_batches(pid);
+    if (batches.size() < min_frames)
+        return {};
+
+    struct va_accumulator_t
+    {
+        int slot = -1;
+        std::set<std::uint32_t> frames;
+        std::uint32_t total_binds = 0;
+        std::set<std::uint32_t> draw_ordinals;
+        std::vector<store::draw_call_info_t> associated_draws;
+    };
+
+    std::map<std::uint64_t, va_accumulator_t> accumulators;
+    for (const auto& batch : batches)
+    {
+        for (const auto& [va, slot] : batch.cbuffer_binds)
+        {
+            auto& acc = accumulators[va];
+            acc.slot = slot;
+            acc.frames.insert(batch.frame_index);
+            ++acc.total_binds;
+        }
+        for (const auto& dc : batch.draw_calls)
+        {
+            if (dc.preceding_cbuffer_va != 0)
+            {
+                auto& acc = accumulators[dc.preceding_cbuffer_va];
+                acc.draw_ordinals.insert(dc.draw_ordinal);
+                acc.associated_draws.push_back(dc);
+            }
+        }
+    }
+
+    std::vector<store::cbuffer_classification_t> results;
+    const std::uint32_t total_frames = static_cast<std::uint32_t>(batches.size());
+    for (auto& [va, acc] : accumulators)
+    {
+        store::cbuffer_classification_t cc;
+        cc.va = va;
+        cc.slot = acc.slot;
+        cc.pid = pid;
+        cc.frames_seen = static_cast<std::uint32_t>(acc.frames.size());
+        cc.total_binds = acc.total_binds;
+        cc.distinct_draw_calls = static_cast<std::uint32_t>(acc.draw_ordinals.size());
+        cc.frame_indices = {acc.frames.begin(), acc.frames.end()};
+        cc.associated_draw_calls = std::move(acc.associated_draws);
+
+        const double frame_ratio = static_cast<double>(cc.frames_seen) / static_cast<double>(total_frames);
+        cc.frequency_score = frame_ratio;
+
+        if (frame_ratio >= 0.8 && cc.total_binds > total_frames)
+        {
+            cc.classification = store::cbuffer_class_t::persistent;
+            cc.recommended_for = "view_matrix";
+        }
+        else if (cc.distinct_draw_calls > 0 && frame_ratio < 0.5)
+        {
+            cc.classification = store::cbuffer_class_t::per_draw;
+            cc.recommended_for = "bone_buffer";
+        }
+        else if (cc.frames_seen <= 1 && cc.total_binds <= 2)
+        {
+            cc.classification = store::cbuffer_class_t::static_bind;
+            cc.recommended_for = "material_or_texture_constants";
+        }
+        else
+        {
+            cc.classification = store::cbuffer_class_t::unknown;
+            cc.recommended_for = "unknown";
+        }
+
+        results.push_back(std::move(cc));
+    }
+
+    std::sort(results.begin(), results.end(), [](const store::cbuffer_classification_t& a, const store::cbuffer_classification_t& b) {
+        if (a.classification != b.classification)
+            return static_cast<int>(a.classification) < static_cast<int>(b.classification);
+        return a.frequency_score > b.frequency_score;
+    });
+
+    return results;
+}
+
 void append_capture(store::dx_hook_record_t record, json capture)
 {
     record.captures.push_back(std::move(capture));
@@ -3140,6 +4847,13 @@ json make_debug_capture(std::uint32_t pid,
         {"context_backend", backend}
     };
     cap["args"] = dx_args_json(pid, ctx, record);
+    const std::uint32_t fidx = current_frame_index(pid);
+    cap["frame_index"] = fidx;
+    if (record.action == "draw")
+    {
+        store::draw_call_info_t dc = extract_draw_call_info(pid, ctx, record, fidx, current_draw_ordinal(pid));
+        cap["draw_call_info"] = draw_call_info_to_json(dc);
+    }
     auto mod = find_module_for_address(pid, record.target_va);
     if (mod)
     {
@@ -3290,6 +5004,51 @@ bool capture_dx_breakpoint_hit(std::uint32_t pid, std::uint32_t tid, const drive
         if (!dx_context_matches_record(ctx, record))
             continue;
         append_capture(record, make_debug_capture(pid, tid, ctx, record, ctx.rip, "hardware_breakpoint_kernel_context"));
+        if (record.action == "present")
+            on_present_hit(pid, tid, ctx);
+        else if (record.action == "draw")
+            frame_tracking_state().current_draw_ordinal.fetch_add(1, std::memory_order_acq_rel);
+        else if (record.action == "cbuffer_bind")
+        {
+            const std::string api = lower_ascii(record.api);
+            if (api.find("d3d11") != std::string::npos)
+            {
+                auto& bs = per_frame_bind_state();
+                std::vector<std::uint8_t> ptrs;
+                if (read_bytes(pid, ctx.r9, 8, ptrs) && ptrs.size() >= 8)
+                {
+                    std::uint64_t resource = 0;
+                    std::memcpy(&resource, ptrs.data(), sizeof(resource));
+                    if (resource != 0)
+                    {
+                        std::vector<std::uint8_t> obj_bytes;
+                        if (read_bytes(pid, resource, 0x300, obj_bytes))
+                        {
+                            for (std::size_t off = 0; off + 8 <= obj_bytes.size(); off += 8)
+                            {
+                                std::uint64_t ptr = 0;
+                                std::memcpy(&ptr, obj_bytes.data() + off, sizeof(ptr));
+                                driver_bridge::memory_region_t region{};
+                                if (query_region(pid, ptr, region) && is_readable(region) && !is_executable(region))
+                                {
+                                    bs.last_cbuffer_va.store(ptr, std::memory_order_release);
+                                    bs.last_cbuffer_slot.store(static_cast<int>(ctx.rdx), std::memory_order_release);
+                                    bs.last_cbuffer_timestamp_ms.store(unix_time_ms(), std::memory_order_release);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            else if (api.find("d3d12") != std::string::npos)
+            {
+                auto& bs = per_frame_bind_state();
+                bs.last_cbuffer_va.store(ctx.r8, std::memory_order_release);
+                bs.last_cbuffer_slot.store(static_cast<int>(ctx.rdx), std::memory_order_release);
+                bs.last_cbuffer_timestamp_ms.store(unix_time_ms(), std::memory_order_release);
+            }
+        }
         matched = true;
     }
     if (matched)
@@ -3447,13 +5206,13 @@ void dx_debug_loop()
         }
         if (store::list_dx_hooks(pid).empty())
             break;
-        if ((poll_count++ % 20) == 0)
+        if ((poll_count++ % 40) == 0)
         {
             for (const auto& th : threads_for(pid))
                 arm_dx_records_for_thread(pid, th.tid);
         }
         poll_dx_thread_contexts(pid);
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     clear_dx_record_breakpoints(pid);
     state.attached.store(false, std::memory_order_release);
@@ -3511,7 +5270,375 @@ void stop_dx_debug_loop(std::uint32_t pid)
     if (state.pid.load(std::memory_order_acquire) != pid)
         return;
     state.polling.store(false, std::memory_order_release);
+    frame_tracking_state().enabled.store(false, std::memory_order_release);
     for (int i = 0; i < 80 && state.running.load(std::memory_order_acquire); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+}
+
+struct staging_watch_t
+{
+    std::uint64_t staging_va = 0;
+    std::uint64_t staging_size = 0;
+    std::uint32_t pid = 0;
+    int hw_slot = 0;
+    std::vector<std::uint32_t> tids;
+    std::vector<std::uint8_t> cleartext_snapshot;
+    std::uint64_t frame_index = 0;
+    std::uint32_t max_frames = 3;
+    std::string trace_id;
+    bool captured_write = false;
+    std::uint64_t pointer_location_va = 0;
+    bool track_reallocation = false;
+};
+
+struct staging_watch_state_t
+{
+    std::atomic<bool> active{false};
+    std::atomic<bool> polling{false};
+    std::atomic<std::uint32_t> pid{0};
+    std::mutex watch_mutex;
+    std::vector<staging_watch_t> watches;
+};
+
+staging_watch_state_t& staging_watch_state()
+{
+    static staging_watch_state_t state;
+    return state;
+}
+
+std::vector<std::uint64_t> capture_callstack(std::uint32_t pid, std::uint64_t rsp, std::size_t max_depth)
+{
+    std::vector<std::uint64_t> arr;
+    std::uint64_t cursor = rsp;
+    for (std::size_t i = 0; i < max_depth; ++i)
+    {
+        std::uint64_t ret_addr = 0;
+        if (!read_u64(pid, cursor, ret_addr) || ret_addr == 0)
+            break;
+        driver_bridge::memory_region_t region{};
+        if (query_region(pid, ret_addr, region) && is_executable(region))
+            arr.push_back(ret_addr);
+        cursor += 8;
+    }
+    return arr;
+}
+
+std::uint64_t detect_encrypted_source_va(const driver_bridge::thread_context_t& ctx,
+                                          std::uint32_t pid, std::uint64_t staging_va)
+{
+    auto try_register = [&](std::uint64_t reg_value) -> std::uint64_t {
+        if (reg_value == 0 || reg_value == staging_va)
+            return 0;
+        driver_bridge::memory_region_t region{};
+        if (query_region(pid, reg_value, region) && is_readable(region) && !is_executable(region))
+            return reg_value;
+        return 0;
+    };
+    std::uint64_t candidates[] = {ctx.rcx, ctx.rdx, ctx.r8, ctx.rsi, ctx.rdi, ctx.rbx, ctx.r9};
+    for (std::uint64_t c : candidates)
+    {
+        std::uint64_t found = try_register(c);
+        if (found)
+            return found;
+    }
+    for (int i = 0; i < 8; ++i)
+    {
+        std::uint64_t stack_val = 0;
+        if (read_u64(pid, ctx.rsp + static_cast<std::uint64_t>(0x28 + i * 8), stack_val) && stack_val != 0)
+        {
+            std::uint64_t found = try_register(stack_val);
+            if (found)
+                return found;
+        }
+    }
+    return 0;
+}
+
+bool capture_staging_write_hit(std::uint32_t pid, std::uint32_t tid,
+                                const driver_bridge::thread_context_t& ctx)
+{
+    auto& state = staging_watch_state();
+    std::lock_guard<std::mutex> lock(state.watch_mutex);
+    bool matched = false;
+    for (auto& watch : state.watches)
+    {
+        if (watch.pid != pid || watch.captured_write)
+            continue;
+        const std::uint64_t slot_address = context_dr_address(ctx, watch.hw_slot);
+        if (slot_address != watch.staging_va)
+            continue;
+        const bool dr6_hit = (ctx.dr6 & (1ull << static_cast<unsigned>(watch.hw_slot))) != 0;
+        if (!dr6_hit)
+            continue;
+
+        watch.captured_write = true;
+        matched = true;
+
+        std::uint64_t encrypted_source_va = detect_encrypted_source_va(ctx, pid, watch.staging_va);
+        const std::size_t read_size = static_cast<std::size_t>(
+            std::min<std::uint64_t>(watch.staging_size, 4096));
+        std::vector<std::uint8_t> decrypted_bytes;
+        if (read_size > 0)
+            read_bytes(pid, watch.staging_va, read_size, decrypted_bytes);
+        std::vector<std::uint8_t> encrypted_bytes;
+        if (encrypted_source_va != 0)
+            read_bytes(pid, encrypted_source_va, read_size, encrypted_bytes);
+
+        decryption_analysis_t analysis;
+        if (!encrypted_bytes.empty() && !decrypted_bytes.empty())
+            analysis = derive_decryption_from_pair(encrypted_bytes, decrypted_bytes, read_size);
+        else
+            analysis.verification_detail = encrypted_bytes.empty() ? "encrypted_source_unreadable" : "decrypted_staging_unreadable";
+
+        if (analysis.verified && !encrypted_bytes.empty() && !decrypted_bytes.empty())
+        {
+            const bool re_verified = verify_decryption(encrypted_bytes, decrypted_bytes, analysis, read_size);
+            if (!re_verified)
+            {
+                analysis.verified = false;
+                analysis.verification_detail = "re_decryption_mismatch_after_initial_match";
+            }
+        }
+
+        store::decryption_trace_record_t record;
+        record.id = watch.trace_id;
+        record.pid = pid;
+        record.staging_va = watch.staging_va;
+        record.staging_size = watch.staging_size;
+        record.decryption_func_va = ctx.rip;
+        record.encrypted_source_va = encrypted_source_va;
+        record.encrypted_source_size = encrypted_bytes.size();
+        record.algorithm_name = analysis.algorithm_name;
+        record.derived_key_bytes = analysis.derived_key_bytes;
+        record.key_length = analysis.key_length;
+        record.key_pattern = analysis.key_pattern;
+        record.verified = analysis.verified;
+        record.verification_detail = analysis.verification_detail;
+        record.caller_rip = ctx.rip;
+        record.callstack = capture_callstack(pid, ctx.rsp, 16);
+        record.register_snapshot = register_snapshot(ctx);
+        record.cleartext_sample.assign(decrypted_bytes.begin(),
+            decrypted_bytes.begin() + std::min<std::size_t>(decrypted_bytes.size(), 256));
+        record.encrypted_sample.assign(encrypted_bytes.begin(),
+            encrypted_bytes.begin() + std::min<std::size_t>(encrypted_bytes.size(), 256));
+        record.created_ms = unix_time_ms();
+        record.frame_index = watch.frame_index;
+        record.hw_slot = watch.hw_slot;
+        record.status = analysis.verified ? "verified" : "captured_unverified";
+        store::add_decryption_trace(record);
+
+        diag::log_tagged_fmt("dx_hook",
+            "staging_write_captured pid=%u tid=%u staging_va=%s rip=%s encrypted_source=%s algorithm=%s verified=%d key_len=%u elapsed_ms=%llu",
+            pid, tid,
+            sa_format_address(watch.staging_va).c_str(),
+            sa_format_address(ctx.rip).c_str(),
+            sa_format_address(encrypted_source_va).c_str(),
+            analysis.algorithm_name.c_str(),
+            analysis.verified ? 1 : 0,
+            analysis.key_length,
+            static_cast<unsigned long long>(GetTickCount64()));
+
+        if (watch.frame_index + 1 < watch.max_frames)
+        {
+            watch.captured_write = false;
+            watch.frame_index++;
+            watch.trace_id = store::next_id("dec");
+            for (auto t : watch.tids)
+                driver_bridge::set_hardware_breakpoint(t, watch.hw_slot, watch.staging_va, 1, 3);
+        }
+    }
+    if (matched)
+    {
+        driver_bridge::thread_context_t next = ctx;
+        next.rflags |= 0x10000ull;
+        next.dr6 = 0;
+        driver_bridge::set_thread_context(tid, next, (1ull << 17) | (1ull << 22));
+    }
+    return matched;
+}
+
+void staging_watch_loop()
+{
+    auto& state = staging_watch_state();
+    const std::uint32_t pid = state.pid.load(std::memory_order_acquire);
+    if (pid == 0 || !driver_bridge::using_kernel_driver())
+    {
+        state.active.store(false, std::memory_order_release);
+        state.polling.store(false, std::memory_order_release);
+        return;
+    }
+    for (const auto& th : threads_for(pid))
+    {
+        std::lock_guard<std::mutex> lock(state.watch_mutex);
+        for (auto& watch : state.watches)
+        {
+            if (watch.captured_write)
+                continue;
+            if (std::find(watch.tids.begin(), watch.tids.end(), th.tid) == watch.tids.end())
+            {
+                if (driver_bridge::set_hardware_breakpoint(th.tid, watch.hw_slot,
+                                                            watch.staging_va, 1, 3))
+                    watch.tids.push_back(th.tid);
+            }
+        }
+    }
+    std::uint64_t poll_count = 0;
+    while (state.polling.load(std::memory_order_acquire))
+    {
+        if (!driver_bridge::using_kernel_driver())
+            break;
+        if ((poll_count++ % 20) == 0)
+        {
+            for (const auto& th : threads_for(pid))
+            {
+                std::lock_guard<std::mutex> lock(state.watch_mutex);
+                for (auto& watch : state.watches)
+                {
+                    if (watch.captured_write)
+                        continue;
+                    if (std::find(watch.tids.begin(), watch.tids.end(), th.tid) == watch.tids.end())
+                    {
+                        if (driver_bridge::set_hardware_breakpoint(th.tid, watch.hw_slot,
+                                                                    watch.staging_va, 1, 3))
+                            watch.tids.push_back(th.tid);
+                    }
+                }
+            }
+        }
+        if ((poll_count % 30) == 0)
+        {
+            std::lock_guard<std::mutex> lock(state.watch_mutex);
+            for (auto& watch : state.watches)
+            {
+                if (watch.captured_write)
+                    continue;
+                if (watch.track_reallocation && watch.pointer_location_va != 0)
+                {
+                    std::uint64_t current_staging = 0;
+                    if (read_u64(pid, watch.pointer_location_va, current_staging) &&
+                        current_staging != 0 && current_staging != watch.staging_va)
+                    {
+                        for (auto t : watch.tids)
+                            driver_bridge::clear_hardware_breakpoint(t, watch.hw_slot);
+                        watch.staging_va = current_staging;
+                        watch.tids.clear();
+                        watch.captured_write = false;
+                    }
+                }
+            }
+        }
+        for (const auto tid : [&]() -> std::vector<std::uint32_t> {
+            std::lock_guard<std::mutex> lock(state.watch_mutex);
+            std::vector<std::uint32_t> tids;
+            for (const auto& w : state.watches)
+                for (auto t : w.tids)
+                    if (std::find(tids.begin(), tids.end(), t) == tids.end())
+                        tids.push_back(t);
+            return tids;
+        }())
+        {
+            driver_bridge::thread_context_t ctx{};
+            if (!driver_bridge::get_thread_context(tid, ctx))
+                continue;
+            capture_staging_write_hit(pid, tid, ctx);
+        }
+        {
+            std::lock_guard<std::mutex> lock(state.watch_mutex);
+            bool all_captured = !state.watches.empty();
+            for (const auto& w : state.watches)
+                if (!w.captured_write)
+                    all_captured = false;
+            if (all_captured)
+                break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    {
+        std::lock_guard<std::mutex> lock(state.watch_mutex);
+        for (const auto& watch : state.watches)
+            for (auto tid : watch.tids)
+                driver_bridge::clear_hardware_breakpoint(tid, watch.hw_slot);
+    }
+    state.active.store(false, std::memory_order_release);
+    state.polling.store(false, std::memory_order_release);
+    state.pid.store(0, std::memory_order_release);
+}
+
+bool start_staging_watch(std::uint32_t pid, std::uint64_t staging_va,
+                          std::uint64_t staging_size, int hw_slot,
+                          std::uint32_t max_frames,
+                          std::uint64_t pointer_location_va,
+                          std::string& error)
+{
+    auto& state = staging_watch_state();
+    if (state.active.load(std::memory_order_acquire))
+    {
+        error = "staging watch already active";
+        return false;
+    }
+    if (!driver_bridge::using_kernel_driver())
+    {
+        error = "kernel driver required for write hardware breakpoints";
+        return false;
+    }
+    store::decryption_trace_record_t trace;
+    trace.id = store::next_id("dec");
+    trace.pid = pid;
+    trace.staging_va = staging_va;
+    trace.staging_size = staging_size;
+    trace.hw_slot = hw_slot;
+    trace.created_ms = unix_time_ms();
+    trace.status = "armed_waiting_for_write";
+    store::add_decryption_trace(trace);
+
+    staging_watch_t watch;
+    watch.staging_va = staging_va;
+    watch.staging_size = staging_size;
+    watch.pid = pid;
+    watch.hw_slot = hw_slot;
+    watch.trace_id = trace.id;
+    watch.frame_index = 0;
+    watch.max_frames = max_frames;
+    watch.pointer_location_va = pointer_location_va;
+    watch.track_reallocation = pointer_location_va != 0;
+
+    std::vector<std::uint8_t> cleartext;
+    if (staging_size > 0)
+        read_bytes(pid, staging_va, static_cast<std::size_t>(std::min<std::uint64_t>(staging_size, 4096)), cleartext);
+    watch.cleartext_snapshot = std::move(cleartext);
+
+    {
+        std::lock_guard<std::mutex> lock(state.watch_mutex);
+        state.watches.clear();
+        state.watches.push_back(std::move(watch));
+    }
+    state.pid.store(pid, std::memory_order_release);
+    state.polling.store(true, std::memory_order_release);
+    state.active.store(true, std::memory_order_release);
+    if (!work_queue::post_service([]() { staging_watch_loop(); }))
+    {
+        state.polling.store(false, std::memory_order_release);
+        state.active.store(false, std::memory_order_release);
+        error = "failed to schedule staging watch loop";
+        return false;
+    }
+    for (int i = 0; i < 80; ++i)
+    {
+        if (state.active.load(std::memory_order_acquire) &&
+            state.pid.load(std::memory_order_acquire) == pid)
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    return true;
+}
+
+void stop_staging_watch(std::uint32_t pid)
+{
+    auto& state = staging_watch_state();
+    if (state.pid.load(std::memory_order_acquire) != pid)
+        return;
+    state.polling.store(false, std::memory_order_release);
+    for (int i = 0; i < 80 && state.active.load(std::memory_order_acquire); ++i)
         std::this_thread::sleep_for(std::chrono::milliseconds(25));
 }
 
@@ -3786,6 +5913,535 @@ bool write_png_file(const std::filesystem::path& path, const std::vector<std::ui
     }
     return true;
 }
+
+struct vec3_t
+{
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+};
+
+struct vec4_t
+{
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+    float w = 0.0f;
+};
+
+struct screen_point_t
+{
+    float x = 0.0f;
+    float y = 0.0f;
+    bool behind_camera = false;
+    bool valid = false;
+};
+
+struct w2s_result_t
+{
+    screen_point_t screen;
+    vec4_t clip;
+    vec3_t view_space;
+};
+
+struct mat4x4_t
+{
+    float m[16] = {};
+
+    void load_from_floats(const float* f)
+    {
+        std::memcpy(m, f, sizeof(m));
+    }
+
+    bool read_from_process(std::uint32_t pid, std::uint64_t va)
+    {
+        std::vector<std::uint8_t> bytes;
+        if (!read_bytes(pid, va, 64, bytes) || bytes.size() < 64)
+            return false;
+        std::memcpy(m, bytes.data(), sizeof(m));
+        return true;
+    }
+};
+
+bool orientation_is_row_major(const std::string& orientation)
+{
+    return orientation == "row_major" ||
+           orientation == "row_vector_viewproj_or_projection_product";
+}
+
+bool orientation_is_column_major(const std::string& orientation)
+{
+    return orientation == "column_major" ||
+           orientation == "column_vector_viewproj_or_projection_product";
+}
+
+vec4_t transform_point(const vec3_t& world, const mat4x4_t& mat, bool row_major)
+{
+    vec4_t clip;
+    if (row_major)
+    {
+        clip.x = world.x * mat.m[0]  + world.y * mat.m[4]  + world.z * mat.m[8]  + mat.m[12];
+        clip.y = world.x * mat.m[1]  + world.y * mat.m[5]  + world.z * mat.m[9]  + mat.m[13];
+        clip.z = world.x * mat.m[2]  + world.y * mat.m[6]  + world.z * mat.m[10] + mat.m[14];
+        clip.w = world.x * mat.m[3]  + world.y * mat.m[7]  + world.z * mat.m[11] + mat.m[15];
+    }
+    else
+    {
+        clip.x = mat.m[0] * world.x + mat.m[4] * world.y + mat.m[8]  * world.z + mat.m[12];
+        clip.y = mat.m[1] * world.x + mat.m[5] * world.y + mat.m[9]  * world.z + mat.m[13];
+        clip.z = mat.m[2] * world.x + mat.m[6] * world.y + mat.m[10] * world.z + mat.m[14];
+        clip.w = mat.m[3] * world.x + mat.m[7] * world.y + mat.m[11] * world.z + mat.m[15];
+    }
+    return clip;
+}
+
+w2s_result_t world_to_screen_viewproj(const vec3_t& world_pos,
+                                       const mat4x4_t& viewproj,
+                                       bool row_major,
+                                       std::uint32_t screen_w,
+                                       std::uint32_t screen_h)
+{
+    w2s_result_t result;
+    result.clip = transform_point(world_pos, viewproj, row_major);
+
+    if (result.clip.w <= 0.0001f)
+    {
+        result.screen.behind_camera = true;
+        result.screen.valid = false;
+        return result;
+    }
+
+    const float inv_w = 1.0f / result.clip.w;
+    const float ndc_x = result.clip.x * inv_w;
+    const float ndc_y = result.clip.y * inv_w;
+    const float ndc_z = result.clip.z * inv_w;
+
+    result.view_space.x = ndc_x;
+    result.view_space.y = ndc_y;
+    result.view_space.z = ndc_z;
+
+    result.screen.x = (ndc_x + 1.0f) * 0.5f * static_cast<float>(screen_w);
+    result.screen.y = (1.0f - ndc_y) * 0.5f * static_cast<float>(screen_h);
+    result.screen.behind_camera = false;
+    result.screen.valid = (ndc_x >= -1.5f && ndc_x <= 1.5f &&
+                            ndc_y >= -1.5f && ndc_y <= 1.5f &&
+                            ndc_z >= -1.0f && ndc_z <= 1.0f);
+    return result;
+}
+
+w2s_result_t world_to_screen(const vec3_t& world_pos,
+                              const mat4x4_t& view,
+                              const mat4x4_t& proj,
+                              bool row_major,
+                              std::uint32_t screen_w,
+                              std::uint32_t screen_h)
+{
+    vec4_t view_space = transform_point(world_pos, view, row_major);
+
+    if (view_space.w <= 0.0001f && view_space.w > -0.0001f)
+        view_space.w = 0.0001f;
+
+    vec3_t view_pos;
+    view_pos.x = view_space.x;
+    view_pos.y = view_space.y;
+    view_pos.z = view_space.z;
+
+    vec4_t clip = transform_point(view_pos, proj, row_major);
+
+    w2s_result_t result;
+    result.view_space = view_pos;
+    result.clip = clip;
+
+    if (clip.w <= 0.0001f)
+    {
+        result.screen.behind_camera = true;
+        result.screen.valid = false;
+        return result;
+    }
+
+    const float inv_w = 1.0f / clip.w;
+    const float ndc_x = clip.x * inv_w;
+    const float ndc_y = clip.y * inv_w;
+    const float ndc_z = clip.z * inv_w;
+
+    result.screen.x = (ndc_x + 1.0f) * 0.5f * static_cast<float>(screen_w);
+    result.screen.y = (1.0f - ndc_y) * 0.5f * static_cast<float>(screen_h);
+    result.screen.behind_camera = false;
+    result.screen.valid = (ndc_x >= -1.5f && ndc_x <= 1.5f &&
+                            ndc_y >= -1.5f && ndc_y <= 1.5f &&
+                            ndc_z >= -1.0f && ndc_z <= 1.0f);
+    return result;
+}
+
+mat4x4_t compose_viewproj(const mat4x4_t& view, const mat4x4_t& proj, bool row_major)
+{
+    mat4x4_t result;
+    if (row_major)
+    {
+        for (int i = 0; i < 4; ++i)
+        {
+            for (int j = 0; j < 4; ++j)
+            {
+                result.m[i * 4 + j] =
+                    view.m[i * 4 + 0] * proj.m[0 * 4 + j] +
+                    view.m[i * 4 + 1] * proj.m[1 * 4 + j] +
+                    view.m[i * 4 + 2] * proj.m[2 * 4 + j] +
+                    view.m[i * 4 + 3] * proj.m[3 * 4 + j];
+            }
+        }
+    }
+    else
+    {
+        for (int i = 0; i < 4; ++i)
+        {
+            for (int j = 0; j < 4; ++j)
+            {
+                result.m[i * 4 + j] =
+                    proj.m[i * 4 + 0] * view.m[0 * 4 + j] +
+                    proj.m[i * 4 + 1] * view.m[1 * 4 + j] +
+                    proj.m[i * 4 + 2] * view.m[2 * 4 + j] +
+                    proj.m[i * 4 + 3] * view.m[3 * 4 + j];
+            }
+        }
+    }
+    return result;
+}
+
+vec3_t extract_translation(const mat4x4_t& mat, bool row_major)
+{
+    vec3_t t;
+    if (row_major)
+    {
+        t.x = mat.m[12];
+        t.y = mat.m[13];
+        t.z = mat.m[14];
+    }
+    else
+    {
+        t.x = mat.m[3];
+        t.y = mat.m[7];
+        t.z = mat.m[11];
+    }
+    return t;
+}
+
+vec3_t extract_bone_position(const mat4x4_t& bone_matrix, bool row_major)
+{
+    return extract_translation(bone_matrix, row_major);
+}
+
+struct matrix_read_t
+{
+    bool ok = false;
+    mat4x4_t matrix;
+    matrix_eval_t eval;
+    std::string orientation;
+    std::uint64_t va = 0;
+};
+
+matrix_read_t read_and_evaluate_matrix(std::uint32_t pid, std::uint64_t va, double world_max)
+{
+    matrix_read_t result;
+    result.va = va;
+    if (va == 0)
+        return result;
+    std::vector<std::uint8_t> bytes;
+    if (!read_bytes(pid, va, 64, bytes) || bytes.size() < 64)
+        return result;
+    float f[16] = {};
+    std::memcpy(f, bytes.data(), 64);
+    result.matrix.load_from_floats(f);
+    result.eval = evaluate_matrix4x4(f, world_max);
+    result.orientation = result.eval.orientation;
+    result.ok = result.eval.plausible;
+    return result;
+}
+
+struct screen_dimensions_t
+{
+    bool ok = false;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    std::string source;
+    HWND hwnd = nullptr;
+};
+
+screen_dimensions_t discover_screen_dimensions(std::uint32_t pid,
+                                                std::uint32_t override_w,
+                                                std::uint32_t override_h)
+{
+    screen_dimensions_t dims;
+
+    if (override_w > 0 && override_h > 0 &&
+        override_w <= 16384 && override_h <= 16384)
+    {
+        dims.ok = true;
+        dims.width = override_w;
+        dims.height = override_h;
+        dims.source = "parameter";
+        return dims;
+    }
+
+    auto window = find_target_window(pid);
+    if (window)
+    {
+        RECT client_rect{};
+        if (GetClientRect(window->hwnd, &client_rect) &&
+            client_rect.right > client_rect.left &&
+            client_rect.bottom > client_rect.top)
+        {
+            dims.ok = true;
+            dims.width = static_cast<std::uint32_t>(client_rect.right - client_rect.left);
+            dims.height = static_cast<std::uint32_t>(client_rect.bottom - client_rect.top);
+            dims.source = "GetClientRect";
+            dims.hwnd = window->hwnd;
+            return dims;
+        }
+        dims.ok = true;
+        dims.width = static_cast<std::uint32_t>(window->rect.right - window->rect.left);
+        dims.height = static_cast<std::uint32_t>(window->rect.bottom - window->rect.top);
+        dims.source = "GetWindowRect";
+        dims.hwnd = window->hwnd;
+        return dims;
+    }
+
+    dims.ok = false;
+    dims.source = "not_found";
+    return dims;
+}
+
+struct remote_com_call_t
+{
+    std::uint32_t pid = 0;
+    std::uint64_t deadline_ms = 0;
+    std::string error;
+    std::size_t call_count = 0;
+
+    std::uint64_t read_vtable_method(std::uint64_t object_va, std::uint32_t slot)
+    {
+        if (object_va == 0)
+        {
+            error = "null object_va for vtable read";
+            return 0;
+        }
+        std::uint64_t vtable_va = 0;
+        if (!re::read_u64(pid, object_va, vtable_va) || vtable_va == 0)
+        {
+            error = "failed to read vtable pointer at " + sa_format_address(object_va);
+            return 0;
+        }
+        std::uint64_t method_va = 0;
+        const std::uint64_t slot_va = vtable_va + static_cast<std::uint64_t>(slot) * 8ull;
+        if (!re::read_u64(pid, slot_va, method_va) || method_va == 0)
+        {
+            error = "failed to read vtable slot " + std::to_string(slot) + " at " + sa_format_address(slot_va);
+            return 0;
+        }
+        return method_va;
+    }
+
+    std::uint64_t call_com_method(std::uint64_t method_va, std::uint64_t this_va,
+                                  std::uint64_t arg2 = 0, std::uint64_t arg3 = 0, std::uint64_t arg4 = 0)
+    {
+        if (method_va == 0)
+        {
+            error = "null method_va for COM call";
+            return 0;
+        }
+        if (!driver_bridge::attached_process_alive())
+        {
+            error = "target process not alive before COM call";
+            return 0;
+        }
+        const std::uint64_t call_started = GetTickCount64();
+        ++call_count;
+        diag::log_tagged_fmt("dx_hook",
+            "read_gpu_buffer com_call call=%zu method=0x%llX this=0x%llX arg2=0x%llX arg3=0x%llX arg4=0x%llX pid=%u",
+            call_count,
+            static_cast<unsigned long long>(method_va),
+            static_cast<unsigned long long>(this_va),
+            static_cast<unsigned long long>(arg2),
+            static_cast<unsigned long long>(arg3),
+            static_cast<unsigned long long>(arg4),
+            pid);
+        const std::uint64_t ret = driver_bridge::call_function(method_va, this_va, arg2, arg3, arg4);
+        const std::uint64_t elapsed = GetTickCount64() - call_started;
+        if (!driver_bridge::attached_process_alive())
+        {
+            error = "target process died during COM call (method=" + sa_format_address(method_va) + ")";
+            diag::log_tagged_fmt("dx_hook",
+                "read_gpu_buffer com_call_dead call=%zu method=0x%llX elapsed_ms=%llu pid=%u",
+                call_count,
+                static_cast<unsigned long long>(method_va),
+                static_cast<unsigned long long>(elapsed),
+                pid);
+            return ret;
+        }
+        diag::log_tagged_fmt("dx_hook",
+            "read_gpu_buffer com_call_done call=%zu method=0x%llX ret=0x%llX elapsed_ms=%llu pid=%u",
+            call_count,
+            static_cast<unsigned long long>(method_va),
+            static_cast<unsigned long long>(ret),
+            static_cast<unsigned long long>(elapsed),
+            pid);
+        return ret;
+    }
+
+    std::uint64_t call_com_method_6(std::uint64_t method_va, std::uint64_t this_va,
+                                    std::uint64_t arg1, std::uint64_t arg2,
+                                    std::uint64_t arg3, std::uint64_t arg4,
+                                    std::uint64_t arg5)
+    {
+        if (method_va == 0)
+        {
+            error = "null method_va for COM call_6";
+            return 0;
+        }
+        if (!driver_bridge::attached_process_alive())
+        {
+            error = "target process not alive before COM call_6";
+            return 0;
+        }
+        std::vector<std::uint8_t> shellcode;
+        shellcode.reserve(64);
+        auto emit = [&](const void* p, std::size_t n) {
+            const auto* b = static_cast<const std::uint8_t*>(p);
+            shellcode.insert(shellcode.end(), b, b + n);
+        };
+        auto emit_byte = [&](std::uint8_t b) { shellcode.push_back(b); };
+        auto emit_u64 = [&](std::uint64_t v) {
+            for (int i = 0; i < 8; ++i)
+                emit_byte(static_cast<std::uint8_t>(v >> (i * 8)));
+        };
+        const std::uint8_t sub_rsp_38[]   = { 0x48, 0x83, 0xEC, 0x38 };
+        const std::uint8_t mov_rax_imm[]  = { 0x48, 0xB8 };
+        const std::uint8_t mov_rsp20_rax[]= { 0x48, 0x89, 0x44, 0x24, 0x20 };
+        const std::uint8_t mov_rsp28_rax[]= { 0x48, 0x89, 0x44, 0x24, 0x28 };
+        const std::uint8_t call_rax[]     = { 0xFF, 0xD0 };
+        const std::uint8_t add_rsp_38[]   = { 0x48, 0x83, 0xC4, 0x38 };
+        const std::uint8_t ret_insn[]     = { 0xC3 };
+        emit(sub_rsp_38, sizeof(sub_rsp_38));
+        emit(mov_rax_imm, sizeof(mov_rax_imm)); emit_u64(arg4);
+        emit(mov_rsp20_rax, sizeof(mov_rsp20_rax));
+        emit(mov_rax_imm, sizeof(mov_rax_imm)); emit_u64(arg5);
+        emit(mov_rsp28_rax, sizeof(mov_rsp28_rax));
+        emit(mov_rax_imm, sizeof(mov_rax_imm)); emit_u64(method_va);
+        emit(call_rax, sizeof(call_rax));
+        emit(add_rsp_38, sizeof(add_rsp_38));
+        emit(ret_insn, sizeof(ret_insn));
+        const std::uint64_t stub_va = driver_bridge::allocate_memory_for(pid, 64);
+        if (stub_va == 0)
+        {
+            error = "allocate_memory_for failed for call_6 trampoline";
+            return 0;
+        }
+        if (!driver_bridge::write_memory_for(pid, stub_va, shellcode))
+        {
+            error = "write_memory_for failed for call_6 trampoline at " + sa_format_address(stub_va);
+            driver_bridge::free_memory_for(pid, stub_va);
+            return 0;
+        }
+        std::uint32_t old_protect = 0;
+        driver_bridge::protect_memory_for(pid, stub_va, 64, 0x40, &old_protect);
+        const std::uint64_t call_started = GetTickCount64();
+        ++call_count;
+        diag::log_tagged_fmt("dx_hook",
+            "read_gpu_buffer com_call_6 call=%zu method=0x%llX this=0x%llX a1=0x%llX a2=0x%llX a3=0x%llX a4=0x%llX a5=0x%llX stub=0x%llX pid=%u",
+            call_count,
+            static_cast<unsigned long long>(method_va),
+            static_cast<unsigned long long>(this_va),
+            static_cast<unsigned long long>(arg1),
+            static_cast<unsigned long long>(arg2),
+            static_cast<unsigned long long>(arg3),
+            static_cast<unsigned long long>(arg4),
+            static_cast<unsigned long long>(arg5),
+            static_cast<unsigned long long>(stub_va),
+            pid);
+        const std::uint64_t ret = driver_bridge::call_function(stub_va, this_va, arg1, arg2, arg3);
+        const std::uint64_t elapsed = GetTickCount64() - call_started;
+        driver_bridge::protect_memory_for(pid, stub_va, 64, 0x04, &old_protect);
+        driver_bridge::free_memory_for(pid, stub_va);
+        if (!driver_bridge::attached_process_alive())
+        {
+            error = "target process died during COM call_6 (method=" + sa_format_address(method_va) + ")";
+            diag::log_tagged_fmt("dx_hook",
+                "read_gpu_buffer com_call_6_dead call=%zu method=0x%llX elapsed_ms=%llu pid=%u",
+                call_count,
+                static_cast<unsigned long long>(method_va),
+                static_cast<unsigned long long>(elapsed),
+                pid);
+            return ret;
+        }
+        diag::log_tagged_fmt("dx_hook",
+            "read_gpu_buffer com_call_6_done call=%zu method=0x%llX ret=0x%llX elapsed_ms=%llu pid=%u",
+            call_count,
+            static_cast<unsigned long long>(method_va),
+            static_cast<unsigned long long>(ret),
+            static_cast<unsigned long long>(elapsed),
+            pid);
+        return ret;
+    }
+
+    std::uint64_t alloc(std::size_t size)
+    {
+        if (size == 0)
+        {
+            error = "alloc size is zero";
+            return 0;
+        }
+        const std::uint64_t addr = driver_bridge::allocate_memory_for(pid, size);
+        if (addr == 0)
+            error = "allocate_memory_for failed for size " + std::to_string(size);
+        return addr;
+    }
+
+    std::uint64_t alloc_and_write(const std::vector<std::uint8_t>& data)
+    {
+        const std::uint64_t addr = alloc(data.size());
+        if (addr == 0)
+            return 0;
+        if (!driver_bridge::write_memory_for(pid, addr, data))
+        {
+            error = "write_memory_for failed at " + sa_format_address(addr);
+            driver_bridge::free_memory_for(pid, addr);
+            return 0;
+        }
+        return addr;
+    }
+
+    std::uint64_t read_u64_at(std::uint64_t address)
+    {
+        std::uint64_t value = 0;
+        if (!re::read_u64(pid, address, value))
+        {
+            error = "read_u64 failed at " + sa_format_address(address);
+            return 0;
+        }
+        return value;
+    }
+
+    bool read_bytes_at(std::uint64_t address, std::size_t size, std::vector<std::uint8_t>& out)
+    {
+        if (!re::read_bytes(pid, address, size, out) || out.size() != size)
+        {
+            error = "read_bytes failed at " + sa_format_address(address) + " size=" + std::to_string(size);
+            return false;
+        }
+        return true;
+    }
+
+    bool target_alive() const
+    {
+        return driver_bridge::attached_process_alive();
+    }
+
+    bool deadline_exceeded() const
+    {
+        if (deadline_ms == 0)
+            return false;
+        return GetTickCount64() >= deadline_ms;
+    }
+};
 }
 
 tool_result_t find_device_vtable(const json& params)
@@ -3948,7 +6604,147 @@ tool_result_t hook_manage(const json& params)
         result["process_id"] = scope.pid();
         result["removed_count"] = removed;
         result["cleared_breakpoints"] = cleared;
+        frame_tracking_state().enabled.store(false, std::memory_order_release);
         return tool_result_t::ok("DX hooks removed.", result);
+    }
+
+    if (action == "full_capture")
+    {
+        if (!unsafe_confirmed(p))
+            return unsafe_required("dx_hook_manage full_capture");
+        active_process_scope_t scope(p);
+        if (!scope.ok())
+            return tool_result_t::error(scope.error());
+        const std::string api = api_param(p);
+        if (!api_supported(api, true))
+            return tool_result_t::error("Unsupported DX API value for full_capture.");
+
+        if (!driver_bridge::using_kernel_driver())
+        {
+            json result;
+            result["process_id"] = scope.pid();
+            result["capability"] = {{"available", false}, {"reason", "kernel driver required for parallel multi-target HWBP"}};
+            return tool_result_t::error("DX kernel-context hardware-breakpoint backend is unavailable.", result);
+        }
+
+        auto slots = discover_api(scope.pid(), api, true);
+        std::optional<slot_entry_t> present_target, draw_target, cbuffer_target;
+        for (const auto& s : slots)
+        {
+            if (s.target_va == 0 || !s.validated) continue;
+            if (s.role == "present" && !present_target) present_target = s;
+            if (s.role == "draw" && !draw_target)
+            {
+                if (s.name == "DrawIndexed" || s.name == "Draw" || s.name == "DrawInstanced" || s.name == "DrawIndexedInstanced")
+                    draw_target = s;
+            }
+            if (s.role == "cbuffer_bind" && !cbuffer_target)
+            {
+                if (s.name == "VSSetConstantBuffers")
+                    cbuffer_target = s;
+            }
+        }
+        if (!draw_target)
+        {
+            for (const auto& s : slots)
+            {
+                if (s.target_va == 0 || !s.validated) continue;
+                if (s.role == "draw" && !draw_target) draw_target = s;
+            }
+        }
+        if (!cbuffer_target)
+        {
+            for (const auto& s : slots)
+            {
+                if (s.target_va == 0 || !s.validated) continue;
+                if (s.role == "cbuffer_bind" && !cbuffer_target) cbuffer_target = s;
+            }
+        }
+        if (!present_target)
+        {
+            auto present_slots = discover_dxgi_present(scope.pid(), true);
+            if (!present_slots.empty())
+                present_target = present_slots[0];
+        }
+        if (!present_target || !draw_target || !cbuffer_target)
+        {
+            json result;
+            result["process_id"] = scope.pid();
+            result["resolved_targets"] = {
+                {"present", present_target ? json(sa_format_address(present_target->target_va)) : json(nullptr)},
+                {"draw", draw_target ? json(sa_format_address(draw_target->target_va)) : json(nullptr)},
+                {"cbuffer_bind", cbuffer_target ? json(sa_format_address(cbuffer_target->target_va)) : json(nullptr)}
+            };
+            result["failure_reason"] = "could_not_resolve_all_three_targets";
+            return tool_result_t::error("Could not resolve Present, Draw, and CBufferBind targets simultaneously.", result);
+        }
+
+        auto make_record = [&](const slot_entry_t& target, const std::string& act, int hw_slot) {
+            store::dx_hook_record_t rec;
+            rec.id = store::next_id("dx");
+            rec.pid = scope.pid();
+            rec.api = api == "auto" ? target.module_name : api;
+            rec.action = act;
+            rec.target_va = target.target_va;
+            rec.target_name = target.name;
+            rec.hw_slot = hw_slot;
+            rec.capture_cbuffers = (act == "cbuffer_bind");
+            rec.capture_vertex_buffers = false;
+            rec.max_captures = static_cast<std::uint32_t>(numeric_param(p, "max_captures", 32, 1, 1024));
+            rec.created_ms = unix_time_ms();
+            for (const auto& th : threads_for(scope.pid()))
+                if (driver_bridge::set_hardware_breakpoint(th.tid, hw_slot, target.target_va, 0, 0))
+                    rec.tids.push_back(th.tid);
+            return rec;
+        };
+
+        auto present_rec = make_record(*present_target, "present", 0);
+        auto draw_rec = make_record(*draw_target, "draw", 1);
+        auto cbuffer_rec = make_record(*cbuffer_target, "cbuffer_bind", 2);
+
+        if (present_rec.tids.empty() || draw_rec.tids.empty() || cbuffer_rec.tids.empty())
+        {
+            clear_dx_record_breakpoints({present_rec, draw_rec, cbuffer_rec});
+            json result;
+            result["process_id"] = scope.pid();
+            result["capability"] = {{"available", false}, {"reason", "could not arm all 3 HWBPs on any thread"}};
+            return tool_result_t::error("Parallel multi-target HWBP arming failed.", result);
+        }
+
+        std::vector<store::dx_hook_record_t> prepared_records = {present_rec, draw_rec, cbuffer_rec};
+        for (const auto& prepared : prepared_records)
+            store::add_dx_hook(prepared);
+
+        frame_tracking_state().enabled.store(true, std::memory_order_release);
+        frame_tracking_state().frame_start_ms.store(unix_time_ms(), std::memory_order_release);
+        frame_tracking_state().current_frame.store(0, std::memory_order_release);
+        frame_tracking_state().current_draw_ordinal.store(0, std::memory_order_release);
+
+        std::string debug_error;
+        bool debug_started = start_dx_debug_loop(scope.pid(), debug_error);
+        if (!debug_started)
+        {
+            for (const auto& r : prepared_records) clear_dx_record_breakpoints(r);
+            for (const auto& r : prepared_records) store::remove_dx_hook(r.id);
+            json result;
+            result["process_id"] = scope.pid();
+            result["failure_reason"] = debug_error;
+            return tool_result_t::error("DX debug loop failed to start for full_capture.", result);
+        }
+
+        json result;
+        result["process_id"] = scope.pid();
+        result["action"] = "full_capture";
+        result["capture_backend"] = "hardware_breakpoint_kernel_context";
+        result["parallel_hwbp_slots"] = {{"dr0_present", 0}, {"dr1_draw", 1}, {"dr2_cbuffer_bind", 2}};
+        result["present_hook"] = dx_record_json(present_rec);
+        result["draw_hook"] = dx_record_json(draw_rec);
+        result["cbuffer_hook"] = dx_record_json(cbuffer_rec);
+        result["frame_tracking_enabled"] = true;
+        result["armed_threads"] = present_rec.tids.size();
+        result["capture_cbuffers"] = true;
+        result["kernel_context_consumer"] = true;
+        return tool_result_t::ok("Parallel multi-target HWBP armed: Present + Draw + CBufferBind.", result);
     }
 
     if (action != "draw" && action != "present")
@@ -4183,6 +6979,7 @@ tool_result_t hook_manage(const json& params)
     record.api = api == "auto" ? target->module_name : api;
     record.action = action;
     record.target_va = target->target_va;
+    record.target_name = target->name;
     record.hw_slot = hw_slot;
     record.capture_cbuffers = capture_cbuffers;
     record.capture_vertex_buffers = capture_vertex_buffers;
@@ -4437,6 +7234,24 @@ tool_result_t hook_manage(const json& params)
 
     std::string debug_error;
     bool debug_started = start_dx_debug_loop(scope.pid(), debug_error);
+
+    bool has_present_hook = false;
+    for (const auto& prepared : prepared_records)
+    {
+        if (prepared.action == "present")
+        {
+            has_present_hook = true;
+            break;
+        }
+    }
+    if (has_present_hook && debug_started)
+    {
+        frame_tracking_state().enabled.store(true, std::memory_order_release);
+        frame_tracking_state().frame_start_ms.store(unix_time_ms(), std::memory_order_release);
+        frame_tracking_state().current_frame.store(0, std::memory_order_release);
+        frame_tracking_state().current_draw_ordinal.store(0, std::memory_order_release);
+    }
+
     for (const auto& updated : store::list_dx_hooks(scope.pid()))
     {
         if (updated.id == record.id)
@@ -4627,6 +7442,32 @@ tool_result_t list_bound_cbuffers(const json& params)
     result["include_snapshot_fallback"] = include_snapshot_fallback;
     result["capture_source"] = result["actual_bound_count"].get<std::size_t>() != 0 ? "hardware_breakpoint_bind_context" :
                                (result["fallback_count"].get<std::size_t>() != 0 ? "bounded_snapshot_or_explicit_candidate" : "none");
+
+    auto classifications = classify_cbuffers(scope.pid());
+    json class_json = json::array();
+    for (const auto& cc : classifications)
+        class_json.push_back(cbuffer_classification_to_json(cc));
+    result["cbuffer_classifications"] = std::move(class_json);
+
+    for (auto& row : result["cbuffers"])
+    {
+        std::uint64_t row_va = 0;
+        if (row.contains("va") && parse_u64_value(row["va"], row_va) && row_va != 0)
+        {
+            for (const auto& cc : classifications)
+            {
+                if (cc.va == row_va)
+                {
+                    row["classification"] = classification_to_string(cc.classification);
+                    row["recommended_for"] = cc.recommended_for;
+                    row["frequency_score"] = cc.frequency_score;
+                    row["frames_seen"] = cc.frames_seen;
+                    break;
+                }
+            }
+        }
+    }
+
     return tool_result_t::ok(result);
 }
 
@@ -4660,13 +7501,29 @@ tool_result_t identify_bone_buffer(const json& params)
             if (query_region(scope.pid(), va, region) && region.base + region.size > va)
                 size = region.base + region.size - va;
         }
-        if (size < 64ull * min_bones)
+        if (size < 28ull * min_bones)
             return;
         std::vector<std::uint8_t> bytes;
         const std::size_t read_size = static_cast<std::size_t>(std::min<std::uint64_t>(size, std::max<std::uint64_t>(64ull * max_bones + 256ull, 8192ull)));
-        if (!read_bytes(scope.pid(), va, read_size, bytes) || bytes.size() < 48ull * min_bones)
+        if (!read_bytes(scope.pid(), va, read_size, bytes) || bytes.size() < 28ull * min_bones)
             return;
-        matrix_decode_result_t decoded = best_matrix_decode_run(bytes, world_max, max_bones, 512);
+        multi_decode_result_t decoded = best_multi_decode_run(bytes, world_max, max_bones, 512);
+        if (decoded.count < min_bones)
+        {
+            matrix_decode_result_t interleaved = best_interleaved_decode_run(bytes, world_max, max_bones, 512);
+            if (interleaved.count > decoded.count)
+            {
+                decoded.algorithm = interleaved.xor_key == 0 ? decode_algorithm_t::raw_float32 : decode_algorithm_t::xor_uniform;
+                decoded.algorithm_name = interleaved.decode;
+                decoded.count = interleaved.count;
+                decoded.stride = interleaved.stride;
+                decoded.offset = interleaved.offset;
+                decoded.uniform_key = interleaved.xor_key;
+                decoded.first_eval = interleaved.first_eval;
+                decoded.format = interleaved.format;
+                decoded.entry_stride = interleaved.entry_stride;
+            }
+        }
         if (decoded.count < min_bones)
             return;
         json row;
@@ -4678,8 +7535,41 @@ tool_result_t identify_bone_buffer(const json& params)
         row["matrix_count"] = decoded.count;
         row["bone_count_semantics"] = "matrix_run_count_not_validated_skeleton_bone_count";
         row["matrix_size"] = decoded.stride;
-        row["decode"] = decoded.decode;
-        row["xor_key"] = decoded.xor_key == 0 ? json(nullptr) : json(sa_format_address(decoded.xor_key));
+        row["format"] = bone_format_name(decoded.format);
+        row["format_stride"] = decoded.stride;
+        if (decoded.entry_stride > decoded.stride)
+        {
+            row["entry_stride"] = decoded.entry_stride;
+            row["interleaved"] = true;
+            row["interleaved_gap"] = decoded.entry_stride - decoded.stride;
+        }
+        else
+        {
+            row["entry_stride"] = decoded.stride;
+            row["interleaved"] = false;
+            row["interleaved_gap"] = 0;
+        }
+        row["decode"] = decoded.algorithm_name;
+        row["algorithm"] = decoded.algorithm_name;
+        row["xor_key"] = decoded.uniform_key == 0 ? json(nullptr) : json(sa_format_address(decoded.uniform_key));
+        if (decoded.algorithm == decode_algorithm_t::xor_rolling)
+        {
+            row["rolling_seed"] = sa_format_address(decoded.rolling_seed);
+            row["rolling_multiplier"] = sa_format_address(decoded.rolling_multiplier);
+            row["rolling_increment"] = sa_format_address(decoded.rolling_increment);
+        }
+        if (decoded.algorithm == decode_algorithm_t::additive_word ||
+            decoded.algorithm == decode_algorithm_t::additive_byte)
+        {
+            row["additive_key"] = sa_format_address(decoded.additive_key);
+        }
+        if (!decoded.key_words.empty() && decoded.algorithm == decode_algorithm_t::xor_multi_key)
+        {
+            json kw = json::array();
+            for (auto k : decoded.key_words)
+                kw.push_back(sa_format_address(k));
+            row["multi_key_words"] = std::move(kw);
+        }
         row["candidate_kind"] = "matrix_run_evidence";
         row["proven_skeleton"] = false;
         row["skeleton_hierarchy_provenance"] = nullptr;
@@ -4705,13 +7595,42 @@ tool_result_t identify_bone_buffer(const json& params)
             confidence += 0.10;
         else if (source_name == "bounded_private_memory_matrix_scan")
             confidence -= 0.06;
-        if (decoded.decode == "xor32_float32")
+        if (decoded.algorithm == decode_algorithm_t::xor_uniform)
             confidence += 0.06;
+        if (decoded.algorithm == decode_algorithm_t::xor_rolling ||
+            decoded.algorithm == decode_algorithm_t::xor_multi_key ||
+            decoded.algorithm == decode_algorithm_t::additive_word ||
+            decoded.algorithm == decode_algorithm_t::additive_byte)
+            confidence += 0.08;
         if (decoded.offset != 0)
             confidence -= 0.03;
-        row["confidence"] = std::min(0.99, std::max(0.0, confidence));
+        if (decoded.format != bone_format_t::matrix4x4_64 &&
+            decoded.format != bone_format_t::matrix3x4_48 &&
+            decoded.format != bone_format_t::unknown)
+            confidence += 0.04;
+        if (decoded.entry_stride > decoded.stride)
+            confidence -= 0.02;
+
+        auto hot_vas = store::list_hot_vas(scope.pid());
+        auto hot_it = std::find_if(hot_vas.begin(), hot_vas.end(), [&](const store::hot_va_entry_t& e) {
+            return e.va == va + decoded.offset;
+        });
+        if (hot_it != hot_vas.end())
+        {
+            confidence += hot_it->confidence_boost;
+            row["hot_va_boost"] = hot_it->confidence_boost;
+            row["hot_va_hit_count"] = hot_it->hit_count;
+        }
+        confidence = std::min(0.99, std::max(0.0, confidence));
+        row["confidence"] = confidence;
         row["source"] = source_name;
         row["evidence"] = source;
+        row["toolchain_hint"] = "Use this VA as bone_buffer_va for bone projection or cross-correlation with view matrix";
+        row["next_action"] = "dx_project_bones";
+        row["next_action_params"] = json::object({
+            {"process_id", scope.pid()},
+            {"bone_buffer_va", sa_format_address(va + decoded.offset)}
+        });
         candidates.push_back(std::move(row));
     };
 
@@ -4756,8 +7675,12 @@ tool_result_t identify_bone_buffer(const json& params)
     result["finding_semantics"] = "matrix_run_candidate_only";
     result["provenance_limit"] = "no hierarchy, parent-index, bone-name, mesh, or model ownership evidence is recovered by this tool";
     result["heuristics"] = {
-        {"matrix_strides", {64, 48}},
-        {"decoders", {"raw_float32", "xor32_float32_uniform_key"}},
+        {"matrix_strides", {64, 48, 60, 52, 40, 32, 28}},
+        {"formats", {"matrix4x4_64", "matrix3x4_48", "matrix3x4_64_padded",
+                      "srt_mat3x3_60", "srt_quat_52_padded", "srt_quat_40",
+                      "dual_quat_32", "quat_pos_28"}},
+        {"interleaved_scan", true},
+        {"decoders", {"raw_float32", "xor_uniform", "xor_rolling", "xor_multi_key", "additive_byte", "additive_word32"}},
         {"memory_fallback_default", false},
         {"runtime_clear_data_limit", "buffers must be CPU-readable or captured as clear GPU-bound data; per-element encryption or shader-only decode cannot be proven externally"}
     };
@@ -5244,6 +8167,7 @@ tool_result_t dump_render_targets(const json& params)
     if (format != "png" && format != "rgba")
         return tool_result_t::error("'format' must be 'png' or 'rgba'.");
     const bool allow_window_fallback = bool_param(params, "allow_window_fallback", false);
+    std::string output_path = string_param(params, "output_path");
     std::size_t render_target_bind_captures = 0;
     for (const auto& record : store::list_dx_hooks(scope.pid()))
     {
@@ -5261,6 +8185,128 @@ tool_result_t dump_render_targets(const json& params)
         {"render_target_bind_captures", render_target_bind_captures},
         {"requires", {"in_process_capture_callback", "device_context_or_command_queue", "staging_readback_resource_or_shared_handle"}}
     };
+
+    if (allow_window_fallback)
+    {
+        auto window = find_target_window(scope.pid());
+        if (!window)
+        {
+            json result;
+            result["process_id"] = scope.pid();
+            result["format"] = format;
+            result["captured"] = false;
+            result["source"] = "window_capture_gdi";
+            result["gpu_texture_memory"] = false;
+            result["gpu_readback_capability"] = gpu_readback_capability;
+            result["allow_window_fallback"] = true;
+            result["window_fallback_available"] = false;
+            result["window_capture_backend"] = "disabled_no_visible_window";
+            result["output_path"] = nullptr;
+            result["bytes_written"] = 0;
+            result["evidence"] = {
+                {"process_window_validated", false},
+                {"bounded_file_write", false},
+                {"render_target_readback", false},
+                {"frame_capture_only", false},
+                {"window_frame_is_gpu_memory", false}
+            };
+            return tool_result_t::error("No visible window found for target process.", result);
+        }
+
+        std::vector<std::uint8_t> rgba;
+        int width = 0, height = 0;
+        std::string method, capture_error;
+        if (!capture_window_rgba(window->hwnd, rgba, width, height, method, capture_error))
+        {
+            json result;
+            result["process_id"] = scope.pid();
+            result["format"] = format;
+            result["captured"] = false;
+            result["source"] = "window_capture_gdi";
+            result["gpu_texture_memory"] = false;
+            result["gpu_readback_capability"] = gpu_readback_capability;
+            result["allow_window_fallback"] = true;
+            result["window_fallback_available"] = false;
+            result["window_capture_backend"] = "disabled_capture_failure";
+            result["output_path"] = nullptr;
+            result["bytes_written"] = 0;
+            result["window_title"] = wide_to_utf8(window->title);
+            result["window_class"] = wide_to_utf8(window->cls);
+            result["evidence"] = {
+                {"process_window_validated", true},
+                {"bounded_file_write", false},
+                {"render_target_readback", false},
+                {"frame_capture_only", false},
+                {"window_frame_is_gpu_memory", false}
+            };
+            return tool_result_t::error("Window capture failed: " + capture_error, result);
+        }
+
+        std::filesystem::path output = output_path.empty()
+            ? default_capture_path(scope.pid(), format)
+            : std::filesystem::path(output_path);
+        std::string write_error;
+        bool write_ok = false;
+        if (format == "png")
+            write_ok = write_png_file(output, rgba, width, height, write_error);
+        else
+            write_ok = write_binary_file(output, rgba, write_error);
+        if (!write_ok)
+        {
+            std::string label = format == "png" ? "PNG encode failed: " : "RGBA write failed: ";
+            json result;
+            result["process_id"] = scope.pid();
+            result["format"] = format;
+            result["captured"] = false;
+            result["source"] = "window_capture_gdi";
+            result["gpu_texture_memory"] = false;
+            result["gpu_readback_capability"] = gpu_readback_capability;
+            result["allow_window_fallback"] = true;
+            result["window_fallback_available"] = true;
+            result["window_capture_backend"] = method;
+            result["output_path"] = nullptr;
+            result["bytes_written"] = 0;
+            result["width"] = width;
+            result["height"] = height;
+            result["window_title"] = wide_to_utf8(window->title);
+            result["window_class"] = wide_to_utf8(window->cls);
+            result["evidence"] = {
+                {"process_window_validated", true},
+                {"bounded_file_write", false},
+                {"render_target_readback", false},
+                {"frame_capture_only", false},
+                {"window_frame_is_gpu_memory", false}
+            };
+            return tool_result_t::error(label + write_error, result);
+        }
+
+        json result;
+        result["process_id"] = scope.pid();
+        result["format"] = format;
+        result["captured"] = true;
+        result["source"] = "window_capture_gdi";
+        result["method"] = method;
+        result["width"] = width;
+        result["height"] = height;
+        result["output_path"] = output.string();
+        result["bytes_written"] = rgba.size();
+        result["gpu_texture_memory"] = false;
+        result["gpu_readback_capability"] = gpu_readback_capability;
+        result["allow_window_fallback"] = true;
+        result["window_fallback_available"] = true;
+        result["window_capture_backend"] = method;
+        result["window_title"] = wide_to_utf8(window->title);
+        result["window_class"] = wide_to_utf8(window->cls);
+        result["evidence"] = {
+            {"process_window_validated", true},
+            {"bounded_file_write", true},
+            {"render_target_readback", false},
+            {"frame_capture_only", true},
+            {"window_frame_is_gpu_memory", false}
+        };
+        return tool_result_t::ok("Window captured via " + method + ". This is a GDI screenshot, not GPU memory readback.", result);
+    }
+
     json result;
     result["process_id"] = scope.pid();
     result["format"] = format;
@@ -5378,6 +8424,37 @@ tool_result_t find_view_matrix(const json& params)
             confidence -= 0.08;
         if (hits > 1)
             confidence += std::min(0.18, static_cast<double>(hits) * 0.06);
+
+        auto hot_vas = store::list_hot_vas(scope.pid());
+        auto hot_it = std::find_if(hot_vas.begin(), hot_vas.end(), [&](const store::hot_va_entry_t& e) {
+            return e.va == va;
+        });
+        if (hot_it != hot_vas.end())
+        {
+            confidence += hot_it->confidence_boost;
+            row["hot_va_boost"] = hot_it->confidence_boost;
+            row["hot_va_hit_count"] = hot_it->hit_count;
+            row["hot_va_frame_count"] = hot_it->frame_count;
+        }
+        else
+        {
+            for (const auto& hv : hot_vas)
+            {
+                if (std::abs(static_cast<std::int64_t>(hv.va) - static_cast<std::int64_t>(va)) < 4096)
+                {
+                    confidence += hv.confidence_boost * 0.5;
+                    row["hot_va_proximity_boost"] = hv.confidence_boost * 0.5;
+                    break;
+                }
+            }
+        }
+
+        if (hot_it == hot_vas.end() && temporal_hits.count(va) && temporal_hits[va] <= 1)
+        {
+            confidence -= 0.05;
+            row["single_hit_penalty"] = -0.05;
+        }
+
         confidence = std::min(0.98, std::max(0.0, confidence));
         if (fallback_source)
         {
@@ -5412,6 +8489,12 @@ tool_result_t find_view_matrix(const json& params)
         row["source"] = source;
         row["region"] = region_json(region);
         row["evidence"] = candidate;
+        row["toolchain_hint"] = "Use this VA as matrix_buffer_va input to dx_identify_bone_buffer or dx_project_bones for correlation";
+        row["next_action"] = "dx_verify_view_matrix";
+        row["next_action_params"] = json::object({
+            {"process_id", scope.pid()},
+            {"matrix_va", sa_format_address(va)}
+        });
         out.push_back(std::move(row));
     };
 
@@ -5499,5 +8582,1502 @@ tool_result_t find_view_matrix(const json& params)
                          used_memory_fallback ? 1 : 0,
                          static_cast<unsigned long long>(GetTickCount64() - started_ms));
     return tool_result_t::ok(result);
+}
+
+tool_result_t verify_view_matrix(const json& params)
+{
+    const std::uint64_t started_ms = GetTickCount64();
+    active_process_scope_t scope(params);
+    if (!scope.ok())
+        return tool_result_t::error(scope.error());
+
+    std::uint64_t matrix_va = 0;
+    if (!parse_address_param(params, "matrix_va", matrix_va) &&
+        !parse_address_param(params, "view_matrix_va", matrix_va) &&
+        !parse_address_param(params, "candidate_va", matrix_va))
+        return tool_result_t::error("'matrix_va' (or 'view_matrix_va'/'candidate_va') is required.");
+    if (matrix_va == 0)
+        return tool_result_t::error("'matrix_va' is required and must be non-zero.");
+
+    const double world_max = number_param(params, "world_unit_max", 1000000.0, 1.0, 1000000000.0);
+    const std::uint32_t screen_w = static_cast<std::uint32_t>(numeric_param(params, "screen_width", 0, 0, 16384));
+    const std::uint32_t screen_h = static_cast<std::uint32_t>(numeric_param(params, "screen_height", 0, 0, 16384));
+
+    screen_dimensions_t dims = discover_screen_dimensions(scope.pid(), screen_w, screen_h);
+    if (!dims.ok)
+        return tool_result_t::error("Could not determine screen dimensions. Provide 'screen_width' and 'screen_height' parameters.", json{
+            {"process_id", scope.pid()},
+            {"matrix_va", sa_format_address(matrix_va)},
+            {"screen_dimension_source", dims.source}
+        });
+
+    matrix_read_t mat = read_and_evaluate_matrix(scope.pid(), matrix_va, world_max);
+    if (!mat.ok)
+        return tool_result_t::error("Matrix at given VA is not plausible or could not be read.", json{
+            {"process_id", scope.pid()},
+            {"matrix_va", sa_format_address(matrix_va)},
+            {"eval_reason", mat.eval.reason},
+            {"matrix_type", mat.eval.type},
+            {"screen_width", dims.width},
+            {"screen_height", dims.height}
+        });
+
+    const bool row_major = orientation_is_row_major(mat.orientation);
+    const bool col_major = orientation_is_column_major(mat.orientation);
+    const bool orientation_known = row_major || col_major;
+
+    json result;
+    result["process_id"] = scope.pid();
+    result["matrix_va"] = sa_format_address(matrix_va);
+    result["matrix_type"] = mat.eval.type;
+    result["matrix_orientation"] = mat.orientation;
+    result["determinant3x3"] = mat.eval.determinant;
+    result["orthogonality_error"] = mat.eval.orthogonality_error;
+    result["inverse_residual3x3"] = mat.eval.inverse_residual;
+    result["screen_width"] = dims.width;
+    result["screen_height"] = dims.height;
+    result["screen_dimension_source"] = dims.source;
+    json floats = json::array();
+    for (int i = 0; i < 16; ++i)
+        floats.push_back(mat.matrix.m[i]);
+    result["preview_floats"] = floats;
+
+    json projected_points = json::array();
+    if (params.contains("test_world_points") && params["test_world_points"].is_array())
+    {
+        for (const auto& pt : params["test_world_points"])
+        {
+            vec3_t world;
+            if (pt.is_array() && pt.size() >= 3)
+            {
+                world.x = pt[0].get<float>();
+                world.y = pt[1].get<float>();
+                world.z = pt[2].get<float>();
+            }
+            else if (pt.is_object() && pt.contains("x") && pt.contains("y") && pt.contains("z"))
+            {
+                world.x = pt["x"].get<float>();
+                world.y = pt["y"].get<float>();
+                world.z = pt["z"].get<float>();
+            }
+            else
+                continue;
+
+            if (!orientation_known)
+            {
+                w2s_result_t rm = world_to_screen_viewproj(world, mat.matrix, true, dims.width, dims.height);
+                w2s_result_t cm = world_to_screen_viewproj(world, mat.matrix, false, dims.width, dims.height);
+                projected_points.push_back({
+                    {"world", {{"x", world.x}, {"y", world.y}, {"z", world.z}}},
+                    {"row_major", {{"screen_x", rm.screen.x}, {"screen_y", rm.screen.y},
+                                   {"behind_camera", rm.screen.behind_camera}, {"valid", rm.screen.valid},
+                                   {"clip_w", rm.clip.w}}},
+                    {"column_major", {{"screen_x", cm.screen.x}, {"screen_y", cm.screen.y},
+                                      {"behind_camera", cm.screen.behind_camera}, {"valid", cm.screen.valid},
+                                      {"clip_w", cm.clip.w}}}
+                });
+            }
+            else
+            {
+                w2s_result_t w2s = world_to_screen_viewproj(world, mat.matrix, row_major, dims.width, dims.height);
+                projected_points.push_back({
+                    {"world", {{"x", world.x}, {"y", world.y}, {"z", world.z}}},
+                    {"screen_x", w2s.screen.x},
+                    {"screen_y", w2s.screen.y},
+                    {"behind_camera", w2s.screen.behind_camera},
+                    {"valid", w2s.screen.valid},
+                    {"clip_w", w2s.clip.w},
+                    {"ndc_x", w2s.clip.x / (w2s.clip.w != 0 ? w2s.clip.w : 1.0f)},
+                    {"ndc_y", w2s.clip.y / (w2s.clip.w != 0 ? w2s.clip.w : 1.0f)}
+                });
+            }
+        }
+    }
+    result["projected_points"] = projected_points;
+    result["projected_point_count"] = projected_points.size();
+
+    bool verified = false;
+    double confidence_adjustment = 0.0;
+    json heuristic = json::object();
+    json notes = json::array();
+
+    if (projected_points.empty())
+    {
+        const vec3_t cube_corners[8] = {
+            {-1, -1, -1}, {1, -1, -1}, {1, 1, -1}, {-1, 1, -1},
+            {-1, -1,  1}, {1, -1,  1}, {1, 1,  1}, {-1, 1,  1}
+        };
+        json cube_projections = json::array();
+        int valid_count = 0;
+        int behind_count = 0;
+        float min_screen_x = FLT_MAX, max_screen_x = -FLT_MAX;
+        float min_screen_y = FLT_MAX, max_screen_y = -FLT_MAX;
+
+        for (int i = 0; i < 8; ++i)
+        {
+            w2s_result_t w2s;
+            if (orientation_known)
+                w2s = world_to_screen_viewproj(cube_corners[i], mat.matrix, row_major, dims.width, dims.height);
+            else
+                w2s = world_to_screen_viewproj(cube_corners[i], mat.matrix, true, dims.width, dims.height);
+
+            if (w2s.screen.behind_camera)
+                ++behind_count;
+            else
+            {
+                if (w2s.screen.x < min_screen_x) min_screen_x = w2s.screen.x;
+                if (w2s.screen.x > max_screen_x) max_screen_x = w2s.screen.x;
+                if (w2s.screen.y < min_screen_y) min_screen_y = w2s.screen.y;
+                if (w2s.screen.y > max_screen_y) max_screen_y = w2s.screen.y;
+                if (w2s.screen.valid)
+                    ++valid_count;
+            }
+            cube_projections.push_back({
+                {"corner", i},
+                {"world", {{"x", cube_corners[i].x}, {"y", cube_corners[i].y}, {"z", cube_corners[i].z}}},
+                {"screen_x", w2s.screen.x},
+                {"screen_y", w2s.screen.y},
+                {"behind_camera", w2s.screen.behind_camera},
+                {"clip_w", w2s.clip.w}
+            });
+        }
+
+        heuristic["cube_corner_projections"] = cube_projections;
+        heuristic["valid_count"] = valid_count;
+        heuristic["behind_count"] = behind_count;
+
+        const bool all_behind = behind_count == 8;
+        const bool none_behind = behind_count == 0;
+        const bool some_valid = valid_count > 0;
+
+        if (all_behind)
+        {
+            notes.push_back("All 8 unit-cube corners are behind the camera. The matrix may be a view matrix with the camera at origin looking down -Z; try test world points in front of the camera.");
+            confidence_adjustment = -0.10;
+        }
+        else if (none_behind && some_valid)
+        {
+            const float span_x = max_screen_x - min_screen_x;
+            const float span_y = max_screen_y - min_screen_y;
+            heuristic["screen_span_x"] = span_x;
+            heuristic["screen_span_y"] = span_y;
+
+            const bool reasonable_span = span_x > 1.0f && span_x < static_cast<float>(dims.width) * 4.0f &&
+                                          span_y > 1.0f && span_y < static_cast<float>(dims.height) * 4.0f;
+            if (reasonable_span)
+            {
+                verified = true;
+                confidence_adjustment = 0.08;
+                notes.push_back("Unit-cube corners project to a reasonable spread of screen coordinates.");
+            }
+            else
+            {
+                notes.push_back("Unit-cube corners project but screen spread is unusual (too small or too large).");
+                confidence_adjustment = -0.05;
+            }
+        }
+        else
+        {
+            notes.push_back("Mixed projection results: some corners behind camera, some in front. This is plausible for a view matrix near the origin.");
+            confidence_adjustment = 0.0;
+        }
+
+        if (!orientation_known)
+            notes.push_back("Matrix orientation is not definitively row_major or column_major. Projection results assume row_major. Provide test_world_points for dual-orientation comparison.");
+
+        result["screen_bounds"] = {
+            {"min_x", min_screen_x == FLT_MAX ? json(nullptr) : json(min_screen_x)},
+            {"max_x", max_screen_x == -FLT_MAX ? json(nullptr) : json(max_screen_x)},
+            {"min_y", min_screen_y == FLT_MAX ? json(nullptr) : json(min_screen_y)},
+            {"max_y", max_screen_y == -FLT_MAX ? json(nullptr) : json(max_screen_y)}
+        };
+    }
+
+    result["heuristic"] = heuristic;
+    result["verified"] = verified;
+    result["confidence_adjustment"] = confidence_adjustment;
+    result["notes"] = notes;
+    result["finding_semantics"] = "projection_verification_evidence_not_camera_object";
+    result["elapsed_ms"] = GetTickCount64() - started_ms;
+
+    diag::log_tagged_fmt("dx_hook",
+                         "verify_view_matrix exit pid=%u matrix_va=%s type=%s orientation=%s verified=%d conf_adj=%f elapsed_ms=%llu",
+                         scope.pid(),
+                         sa_format_address(matrix_va).c_str(),
+                         mat.eval.type.c_str(),
+                         mat.orientation.c_str(),
+                         verified ? 1 : 0,
+                         confidence_adjustment,
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
+
+    return tool_result_t::ok("View matrix verification completed.", result);
+}
+
+tool_result_t project_bones(const json& params)
+{
+    const std::uint64_t started_ms = GetTickCount64();
+    active_process_scope_t scope(params);
+    if (!scope.ok())
+        return tool_result_t::error(scope.error());
+
+    std::uint64_t bone_buffer_va = 0;
+    if (!parse_address_param(params, "bone_buffer_va", bone_buffer_va) &&
+        !parse_address_param(params, "matrix_buffer_va", bone_buffer_va))
+        return tool_result_t::error("'bone_buffer_va' is required.");
+    if (bone_buffer_va == 0)
+        return tool_result_t::error("'bone_buffer_va' is required and must be non-zero.");
+
+    std::uint64_t view_matrix_va = 0;
+    if (!parse_address_param(params, "view_matrix_va", view_matrix_va) &&
+        !parse_address_param(params, "matrix_va", view_matrix_va))
+        return tool_result_t::error("'view_matrix_va' is required.");
+    if (view_matrix_va == 0)
+        return tool_result_t::error("'view_matrix_va' is required and must be non-zero.");
+
+    const double world_max = number_param(params, "world_unit_max", 1000000.0, 1.0, 1000000000.0);
+    const std::uint32_t screen_w = static_cast<std::uint32_t>(numeric_param(params, "screen_width", 0, 0, 16384));
+    const std::uint32_t screen_h = static_cast<std::uint32_t>(numeric_param(params, "screen_height", 0, 0, 16384));
+
+    screen_dimensions_t dims = discover_screen_dimensions(scope.pid(), screen_w, screen_h);
+    if (!dims.ok)
+        return tool_result_t::error("Could not determine screen dimensions. Provide 'screen_width' and 'screen_height' parameters.", json{
+            {"process_id", scope.pid()},
+            {"bone_buffer_va", sa_format_address(bone_buffer_va)},
+            {"view_matrix_va", sa_format_address(view_matrix_va)},
+            {"screen_dimension_source", dims.source}
+        });
+
+    matrix_read_t view_mat = read_and_evaluate_matrix(scope.pid(), view_matrix_va, world_max);
+    if (!view_mat.ok)
+        return tool_result_t::error("View matrix at given VA is not plausible or could not be read.", json{
+            {"process_id", scope.pid()},
+            {"view_matrix_va", sa_format_address(view_matrix_va)},
+            {"eval_reason", view_mat.eval.reason},
+            {"matrix_type", view_mat.eval.type}
+        });
+
+    const bool row_major = orientation_is_row_major(view_mat.orientation);
+    const bool col_major = orientation_is_column_major(view_mat.orientation);
+    const bool orientation_known = row_major || col_major;
+    const bool use_row_major = orientation_known ? row_major : true;
+
+    const std::uint32_t max_bones = static_cast<std::uint32_t>(numeric_param(params, "max_bones", 256, 1, 4096));
+    const std::size_t read_size = static_cast<std::size_t>(64ull * max_bones);
+    std::vector<std::uint8_t> bone_bytes;
+    if (!read_bytes(scope.pid(), bone_buffer_va, read_size, bone_bytes) || bone_bytes.size() < 48)
+        return tool_result_t::error("Could not read bone buffer at given VA.", json{
+            {"process_id", scope.pid()},
+            {"bone_buffer_va", sa_format_address(bone_buffer_va)},
+            {"requested_read_size", read_size},
+            {"bytes_read", bone_bytes.size()}
+        });
+
+    matrix_decode_result_t decoded = best_matrix_decode_run(bone_bytes, world_max, max_bones, 512);
+    if (decoded.count == 0)
+        return tool_result_t::error("No plausible bone matrices found in bone buffer.", json{
+            {"process_id", scope.pid()},
+            {"bone_buffer_va", sa_format_address(bone_buffer_va)},
+            {"view_matrix_va", sa_format_address(view_matrix_va)}
+        });
+
+    std::set<std::uint32_t> requested_indices;
+    if (params.contains("bone_indices") && params["bone_indices"].is_array())
+    {
+        for (const auto& idx : params["bone_indices"])
+        {
+            if (idx.is_number_integer())
+                requested_indices.insert(static_cast<std::uint32_t>(idx.get<int>()));
+        }
+    }
+
+    json bone_results = json::array();
+    std::uint32_t projected_count = 0;
+    std::uint32_t behind_camera_count = 0;
+    std::uint32_t valid_screen_count = 0;
+
+    for (std::uint32_t i = 0; i < decoded.count; ++i)
+    {
+        if (!requested_indices.empty() && requested_indices.count(i) == 0)
+            continue;
+
+        const std::size_t bone_offset = decoded.offset + i * decoded.stride;
+        float f[16] = {};
+        if (!decode_matrix_words(bone_bytes, bone_offset, decoded.stride, decoded.xor_key, f))
+            continue;
+
+        mat4x4_t bone_matrix;
+        bone_matrix.load_from_floats(f);
+
+        matrix_eval_t bone_eval = evaluate_matrix4x4(f, world_max);
+        const bool bone_row_major = orientation_is_row_major(bone_eval.orientation);
+        const bool bone_col_major = orientation_is_column_major(bone_eval.orientation);
+        const bool bone_use_row_major = bone_row_major ? true : (bone_col_major ? false : true);
+
+        vec3_t bone_pos = extract_bone_position(bone_matrix, bone_use_row_major);
+
+        w2s_result_t w2s = world_to_screen_viewproj(bone_pos, view_mat.matrix, use_row_major, dims.width, dims.height);
+
+        double confidence = 0.50;
+        if (bone_eval.plausible)
+            confidence += bone_eval.score * 0.20;
+        if (!w2s.screen.behind_camera)
+            confidence += 0.10;
+        if (w2s.screen.valid)
+            confidence += 0.05;
+
+        json bone_row;
+        bone_row["bone_index"] = i;
+        bone_row["world_pos"] = {{"x", bone_pos.x}, {"y", bone_pos.y}, {"z", bone_pos.z}};
+        bone_row["screen_x"] = w2s.screen.x;
+        bone_row["screen_y"] = w2s.screen.y;
+        bone_row["behind_camera"] = w2s.screen.behind_camera;
+        bone_row["valid"] = w2s.screen.valid;
+        bone_row["clip_w"] = w2s.clip.w;
+        bone_row["confidence"] = std::min(0.95, confidence);
+        bone_row["bone_matrix_orientation"] = bone_eval.orientation;
+        bone_row["decode"] = decoded.decode;
+
+        bone_results.push_back(std::move(bone_row));
+        ++projected_count;
+        if (w2s.screen.behind_camera)
+            ++behind_camera_count;
+        else if (w2s.screen.valid)
+            ++valid_screen_count;
+
+        if (dx_call_cancelled("project_bones_iteration", scope.pid(), started_ms))
+            break;
+    }
+
+    json result;
+    result["process_id"] = scope.pid();
+    result["bone_buffer_va"] = sa_format_address(bone_buffer_va);
+    result["view_matrix_va"] = sa_format_address(view_matrix_va);
+    result["view_matrix_type"] = view_mat.eval.type;
+    result["view_matrix_orientation"] = view_mat.orientation;
+    result["bone_count"] = decoded.count;
+    result["projected_count"] = projected_count;
+    result["behind_camera_count"] = behind_camera_count;
+    result["valid_screen_count"] = valid_screen_count;
+    result["screen_width"] = dims.width;
+    result["screen_height"] = dims.height;
+    result["screen_dimension_source"] = dims.source;
+    result["matrix_stride"] = decoded.stride;
+    result["decode"] = decoded.decode;
+    result["xor_key"] = decoded.xor_key == 0 ? json(nullptr) : json(sa_format_address(decoded.xor_key));
+    result["bones"] = std::move(bone_results);
+    result["finding_semantics"] = "bone_screen_projection_evidence";
+    result["usage_hint"] = "If projected bone screen positions form a recognizable human silhouette on screen, both the view matrix and bone buffer are confirmed correct. The AI agent can overlay these coordinates on a screen capture to visually verify.";
+    result["elapsed_ms"] = GetTickCount64() - started_ms;
+
+    diag::log_tagged_fmt("dx_hook",
+                         "project_bones exit pid=%u bone_va=%s view_va=%s bones=%u projected=%u behind=%u valid=%u elapsed_ms=%llu",
+                         scope.pid(),
+                         sa_format_address(bone_buffer_va).c_str(),
+                         sa_format_address(view_matrix_va).c_str(),
+                         decoded.count,
+                         projected_count,
+                         behind_camera_count,
+                         valid_screen_count,
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
+
+    return tool_result_t::ok("Bone positions projected to screen coordinates.", result);
+}
+
+tool_result_t trace_decryption(const json& params)
+{
+    const std::uint64_t started_ms = GetTickCount64();
+    active_process_scope_t scope(params);
+    if (!scope.ok())
+        return tool_result_t::error(scope.error());
+
+    const std::string action = compat_action_name(params);
+    const json p = compat_action_payload(params);
+
+    if (action == "list")
+    {
+        json arr = json::array();
+        for (const auto& trace : store::list_decryption_traces(scope.pid()))
+        {
+            json row;
+            row["id"] = trace.id;
+            row["process_id"] = trace.pid;
+            row["staging_va"] = sa_format_address(trace.staging_va);
+            row["staging_size"] = trace.staging_size;
+            row["decryption_func_va"] = trace.decryption_func_va ? json(sa_format_address(trace.decryption_func_va)) : json(nullptr);
+            row["encrypted_source_va"] = trace.encrypted_source_va ? json(sa_format_address(trace.encrypted_source_va)) : json(nullptr);
+            row["encrypted_source_size"] = trace.encrypted_source_size;
+            row["algorithm"] = trace.algorithm_name;
+            row["key_length"] = trace.key_length;
+            row["key_pattern"] = trace.key_pattern;
+            row["verified"] = trace.verified;
+            row["verification_detail"] = trace.verification_detail;
+            row["caller_rip"] = trace.caller_rip ? json(sa_format_address(trace.caller_rip)) : json(nullptr);
+            row["status"] = trace.status;
+            row["created_ms"] = trace.created_ms;
+            row["frame_index"] = trace.frame_index;
+            if (!trace.derived_key_bytes.empty())
+                row["key_hex"] = bytes_to_hex(trace.derived_key_bytes, 64);
+            arr.push_back(std::move(row));
+        }
+        json result;
+        result["process_id"] = scope.pid();
+        result["traces"] = std::move(arr);
+        result["count"] = result["traces"].size();
+        return tool_result_t::ok(result);
+    }
+
+    if (action == "stop")
+    {
+        if (!unsafe_confirmed(p))
+            return unsafe_required("dx_trace_decryption stop");
+        stop_staging_watch(scope.pid());
+        json result;
+        result["process_id"] = scope.pid();
+        result["stopped"] = true;
+        return tool_result_t::ok("Staging buffer watch stopped.", result);
+    }
+
+    if (action == "detail")
+    {
+        const std::string trace_id = string_param(p, "trace_id");
+        if (trace_id.empty())
+            return tool_result_t::error("'trace_id' is required for detail.");
+        store::decryption_trace_record_t trace;
+        if (!store::find_decryption_trace(trace_id, trace))
+            return tool_result_t::error("Trace not found.");
+        json result;
+        result["id"] = trace.id;
+        result["process_id"] = trace.pid;
+        result["staging_va"] = sa_format_address(trace.staging_va);
+        result["staging_size"] = trace.staging_size;
+        result["decryption_func_va"] = trace.decryption_func_va ? json(sa_format_address(trace.decryption_func_va)) : json(nullptr);
+        result["encrypted_source_va"] = trace.encrypted_source_va ? json(sa_format_address(trace.encrypted_source_va)) : json(nullptr);
+        result["encrypted_source_size"] = trace.encrypted_source_size;
+        result["algorithm"] = trace.algorithm_name;
+        result["key_length"] = trace.key_length;
+        result["key_pattern"] = trace.key_pattern;
+        result["verified"] = trace.verified;
+        result["verification_detail"] = trace.verification_detail;
+        result["caller_rip"] = trace.caller_rip ? json(sa_format_address(trace.caller_rip)) : json(nullptr);
+        result["register_snapshot"] = trace.register_snapshot;
+        result["callstack"] = json::array();
+        for (auto addr : trace.callstack)
+        {
+            json frame;
+            frame["va"] = sa_format_address(addr);
+            auto cmod = find_module_for_address(scope.pid(), addr);
+            if (cmod)
+            {
+                frame["module"] = cmod->name;
+                frame["rva"] = sa_format_address(addr - cmod->base);
+            }
+            result["callstack"].push_back(std::move(frame));
+        }
+        result["cleartext_hex"] = bytes_to_hex(trace.cleartext_sample, 256);
+        result["encrypted_hex"] = bytes_to_hex(trace.encrypted_sample, 256);
+        if (!trace.derived_key_bytes.empty())
+            result["key_hex"] = bytes_to_hex(trace.derived_key_bytes, 128);
+        result["status"] = trace.status;
+        result["created_ms"] = trace.created_ms;
+        result["frame_index"] = trace.frame_index;
+        auto mod = find_module_for_address(scope.pid(), trace.decryption_func_va);
+        if (mod)
+        {
+            result["decryption_func_module"] = mod->name;
+            result["decryption_func_rva"] = sa_format_address(trace.decryption_func_va - mod->base);
+        }
+        return tool_result_t::ok(result);
+    }
+
+    if (action == "remove")
+    {
+        if (!unsafe_confirmed(p))
+            return unsafe_required("dx_trace_decryption remove");
+        const std::string trace_id = string_param(p, "trace_id");
+        if (trace_id.empty())
+            return tool_result_t::error("'trace_id' is required for remove.");
+        store::decryption_trace_record_t removed;
+        if (!store::remove_decryption_trace(trace_id, &removed))
+            return tool_result_t::error("Trace not found.");
+        json result;
+        result["removed_id"] = trace_id;
+        return tool_result_t::ok("Trace removed.", result);
+    }
+
+    if (action != "trace")
+        return compat_unknown_action("dx_trace_decryption", action);
+
+    if (!unsafe_confirmed(p))
+        return unsafe_required("dx_trace_decryption trace");
+
+    std::uint64_t staging_va = 0;
+    if (!parse_address_param(p, "staging_va", staging_va) || staging_va == 0)
+    {
+        std::uint64_t cbuffer_va = 0;
+        if (!parse_address_param(p, "cbuffer_va", cbuffer_va) || cbuffer_va == 0)
+            return tool_result_t::error("'staging_va' (or 'cbuffer_va') is required for trace action.");
+        staging_va = cbuffer_va;
+    }
+
+    driver_bridge::memory_region_t region{};
+    if (!query_region(scope.pid(), staging_va, region) || !is_readable(region))
+        return tool_result_t::error("staging_va is not readable in target process.");
+
+    const std::uint64_t staging_size = [&]() -> std::uint64_t {
+        std::uint64_t size = 0;
+        if (parse_address_param(p, "staging_size", size) && size > 0)
+            return size;
+        const std::uint64_t region_end = region.base + region.size;
+        return region_end > staging_va ? region_end - staging_va : 4096;
+    }();
+
+    const int hw_slot = static_cast<int>(numeric_param(p, "hw_slot", 0, 0, 3));
+    const std::uint32_t max_frames = static_cast<std::uint32_t>(numeric_param(p, "max_frames", 3, 1, 16));
+    const std::uint32_t timeout_ms = static_cast<std::uint32_t>(numeric_param(p, "timeout_ms", 30000, 1000, 120000));
+
+    std::uint64_t pointer_location_va = 0;
+    parse_address_param(p, "pointer_location_va", pointer_location_va);
+
+    if (!driver_bridge::using_kernel_driver())
+        return tool_result_t::error("Kernel driver is required for write hardware breakpoints.");
+
+    diag::log_tagged_fmt("dx_hook",
+        "trace_decryption enter pid=%u staging_va=%s staging_size=%llu hw_slot=%d max_frames=%u timeout_ms=%u",
+        scope.pid(),
+        sa_format_address(staging_va).c_str(),
+        static_cast<unsigned long long>(staging_size),
+        hw_slot,
+        max_frames,
+        timeout_ms);
+
+    std::string watch_error;
+    if (!start_staging_watch(scope.pid(), staging_va, staging_size, hw_slot,
+                              max_frames, pointer_location_va, watch_error))
+        return tool_result_t::error("Failed to start staging watch: " + watch_error);
+
+    const std::uint64_t deadline = GetTickCount64() + timeout_ms;
+    while (GetTickCount64() < deadline)
+    {
+        if (dx_call_cancelled("trace_decryption_wait", scope.pid(), started_ms))
+        {
+            stop_staging_watch(scope.pid());
+            return tool_result_t::error("Trace decryption cancelled.");
+        }
+        bool all_captured = false;
+        {
+            auto& state = staging_watch_state();
+            std::lock_guard<std::mutex> lock(state.watch_mutex);
+            all_captured = !state.watches.empty();
+            for (const auto& w : state.watches)
+                if (!w.captured_write)
+                    all_captured = false;
+        }
+        if (all_captured)
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    stop_staging_watch(scope.pid());
+
+    json traces = json::array();
+    for (const auto& trace : store::list_decryption_traces(scope.pid()))
+    {
+        if (trace.staging_va != staging_va)
+            continue;
+        json row;
+        row["id"] = trace.id;
+        row["decryption_func_va"] = trace.decryption_func_va ? json(sa_format_address(trace.decryption_func_va)) : json(nullptr);
+        row["encrypted_source_va"] = trace.encrypted_source_va ? json(sa_format_address(trace.encrypted_source_va)) : json(nullptr);
+        row["algorithm"] = trace.algorithm_name;
+        row["key_length"] = trace.key_length;
+        row["key_pattern"] = trace.key_pattern;
+        row["verified"] = trace.verified;
+        row["verification_detail"] = trace.verification_detail;
+        row["caller_rip"] = trace.caller_rip ? json(sa_format_address(trace.caller_rip)) : json(nullptr);
+        row["status"] = trace.status;
+        row["frame_index"] = trace.frame_index;
+        if (!trace.derived_key_bytes.empty())
+            row["key_hex"] = bytes_to_hex(trace.derived_key_bytes, 64);
+        auto mod = find_module_for_address(scope.pid(), trace.decryption_func_va);
+        if (mod)
+        {
+            row["decryption_func_module"] = mod->name;
+            row["decryption_func_rva"] = sa_format_address(trace.decryption_func_va - mod->base);
+        }
+        traces.push_back(std::move(row));
+    }
+
+    json result;
+    result["process_id"] = scope.pid();
+    result["staging_va"] = sa_format_address(staging_va);
+    result["staging_size"] = staging_size;
+    result["traces"] = std::move(traces);
+    result["trace_count"] = result["traces"].size();
+    result["found"] = result["trace_count"].get<std::size_t>() != 0;
+    result["elapsed_ms"] = GetTickCount64() - started_ms;
+    if (result["trace_count"].get<std::size_t>() == 0)
+    {
+        result["failure_reason"] = "no_write_hit_within_timeout";
+        return tool_result_t::ok("No staging buffer write was captured within the timeout.", result);
+    }
+    result["best"] = result["traces"][0];
+    return tool_result_t::ok("Staging buffer decryption trace captured.", result);
+}
+
+tool_result_t read_gpu_buffer(const json& params)
+{
+    const std::uint64_t started_ms = GetTickCount64();
+    active_process_scope_t scope(params);
+    if (!scope.ok())
+        return tool_result_t::error(scope.error());
+    if (!unsafe_confirmed(params))
+        return unsafe_required("dx_read_gpu_buffer");
+    if (!driver_bridge::using_kernel_driver())
+        return tool_result_t::error("Kernel driver is required for remote COM method invocation.");
+
+    std::uint64_t buffer_va = 0;
+    if (!parse_address_param(params, "buffer_va", buffer_va) || buffer_va == 0)
+        return tool_result_t::error("'buffer_va' is required and must be non-zero.");
+
+    std::uint64_t device_context_va = 0;
+    parse_address_param(params, "device_context_va", device_context_va);
+
+    const std::uint64_t max_size = numeric_param(params, "max_size", 65536, 1, 1048576);
+    const bool detect_matrices = bool_param(params, "detect_matrices", true);
+
+    if (device_context_va == 0)
+    {
+        for (const auto& record : store::list_dx_hooks(scope.pid()))
+        {
+            if (lower_ascii(record.api).find("d3d11") == std::string::npos)
+                continue;
+            if (record.action != "cbuffer_bind")
+                continue;
+            for (const auto& cap : record.captures)
+            {
+                if (!cap.contains("cbuffers") || !cap["cbuffers"].is_array())
+                    continue;
+                bool found_match = false;
+                for (const auto& cb : cap["cbuffers"])
+                {
+                    std::uint64_t va = 0;
+                    if (cb.contains("va") && parse_u64_value(cb["va"], va) && va == buffer_va)
+                    {
+                        found_match = true;
+                        break;
+                    }
+                }
+                if (!found_match)
+                    continue;
+                if (cap.contains("registers") && cap["registers"].contains("rcx"))
+                {
+                    std::uint64_t rcx = 0;
+                    if (parse_u64_value(cap["registers"]["rcx"], rcx) && rcx != 0)
+                    {
+                        device_context_va = rcx;
+                        break;
+                    }
+                }
+            }
+            if (device_context_va != 0)
+                break;
+        }
+    }
+
+    if (device_context_va == 0)
+        return tool_result_t::error("'device_context_va' is required and could not be auto-detected from stored cbuffer captures. Provide the ID3D11DeviceContext* address explicitly.");
+
+    remote_com_call_t com;
+    com.pid = scope.pid();
+    com.deadline_ms = mcp_standalone::current_call_deadline_ms();
+
+    diag::log_tagged_fmt("dx_hook",
+        "read_gpu_buffer enter pid=%u buffer_va=%s device_context_va=%s max_size=%llu detect_matrices=%d",
+        scope.pid(),
+        sa_format_address(buffer_va).c_str(),
+        sa_format_address(device_context_va).c_str(),
+        static_cast<unsigned long long>(max_size),
+        detect_matrices ? 1 : 0);
+
+    driver_bridge::memory_region_t buffer_region{};
+    if (!query_region(scope.pid(), buffer_va, buffer_region) || !is_readable(buffer_region))
+        return tool_result_t::error("buffer_va is not readable in target process (cannot read vtable).");
+
+    const std::uint64_t buffer_get_desc_ptr = com.read_vtable_method(buffer_va, 10);
+    if (buffer_get_desc_ptr == 0)
+        return tool_result_t::error("Failed to read ID3D11Buffer::GetDesc vtable slot: " + com.error);
+
+    const std::uint64_t buffer_get_device_ptr = com.read_vtable_method(buffer_va, 3);
+    if (buffer_get_device_ptr == 0)
+        return tool_result_t::error("Failed to read ID3D11Buffer::GetDevice vtable slot: " + com.error);
+
+    constexpr std::size_t kBufferDescSize = 24;
+    const std::uint64_t desc_va = com.alloc(kBufferDescSize);
+    if (desc_va == 0)
+        return tool_result_t::error("Failed to allocate target memory for D3D11_BUFFER_DESC: " + com.error);
+
+    com.call_com_method(buffer_get_desc_ptr, buffer_va, desc_va);
+    if (!com.error.empty())
+    {
+        driver_bridge::free_memory_for(scope.pid(), desc_va);
+        return tool_result_t::error("ID3D11Buffer::GetDesc failed: " + com.error);
+    }
+
+    std::vector<std::uint8_t> desc_bytes;
+    if (!com.read_bytes_at(desc_va, kBufferDescSize, desc_bytes))
+    {
+        driver_bridge::free_memory_for(scope.pid(), desc_va);
+        return tool_result_t::error("Failed to read D3D11_BUFFER_DESC from target: " + com.error);
+    }
+    driver_bridge::free_memory_for(scope.pid(), desc_va);
+
+    std::uint32_t byte_width = 0;
+    std::uint32_t usage = 0;
+    std::uint32_t bind_flags = 0;
+    std::uint32_t cpu_access_flags = 0;
+    std::uint32_t misc_flags = 0;
+    std::uint32_t structure_byte_stride = 0;
+    std::memcpy(&byte_width, desc_bytes.data() + 0, 4);
+    std::memcpy(&usage, desc_bytes.data() + 4, 4);
+    std::memcpy(&bind_flags, desc_bytes.data() + 8, 4);
+    std::memcpy(&cpu_access_flags, desc_bytes.data() + 12, 4);
+    std::memcpy(&misc_flags, desc_bytes.data() + 16, 4);
+    std::memcpy(&structure_byte_stride, desc_bytes.data() + 20, 4);
+
+    if (byte_width == 0)
+        return tool_result_t::error("ID3D11Buffer::GetDesc returned ByteWidth=0.");
+
+    std::uint64_t read_size = byte_width;
+    if (read_size > max_size)
+        read_size = max_size;
+
+    diag::log_tagged_fmt("dx_hook",
+        "read_gpu_buffer desc pid=%u byte_width=%u usage=%u bind_flags=0x%X cpu_access=0x%X misc=0x%X stride=%u read_size=%llu",
+        scope.pid(),
+        byte_width,
+        usage,
+        bind_flags,
+        cpu_access_flags,
+        misc_flags,
+        structure_byte_stride,
+        static_cast<unsigned long long>(read_size));
+
+    const std::uint64_t context_get_device_ptr = com.read_vtable_method(device_context_va, 3);
+    if (context_get_device_ptr == 0)
+        return tool_result_t::error("Failed to read ID3D11DeviceContext::GetDevice vtable slot: " + com.error);
+
+    const std::uint64_t device_out_va = com.alloc(8);
+    if (device_out_va == 0)
+        return tool_result_t::error("Failed to allocate target memory for device out-param: " + com.error);
+
+    com.call_com_method(context_get_device_ptr, device_context_va, device_out_va);
+    if (!com.error.empty())
+    {
+        driver_bridge::free_memory_for(scope.pid(), device_out_va);
+        return tool_result_t::error("ID3D11DeviceContext::GetDevice failed: " + com.error);
+    }
+
+    const std::uint64_t device_va = com.read_u64_at(device_out_va);
+    driver_bridge::free_memory_for(scope.pid(), device_out_va);
+    if (device_va == 0)
+        return tool_result_t::error("ID3D11DeviceContext::GetDevice returned null device pointer.");
+
+    diag::log_tagged_fmt("dx_hook",
+        "read_gpu_buffer device_resolved pid=%u device_va=%s",
+        scope.pid(),
+        sa_format_address(device_va).c_str());
+
+    const std::uint64_t create_buffer_ptr = com.read_vtable_method(device_va, 3);
+    if (create_buffer_ptr == 0)
+        return tool_result_t::error("Failed to read ID3D11Device::CreateBuffer vtable slot: " + com.error);
+
+    std::vector<std::uint8_t> staging_desc(kBufferDescSize, 0);
+    {
+        const std::uint32_t staging_byte_width = static_cast<std::uint32_t>(read_size);
+        const std::uint32_t staging_usage = 3;
+        const std::uint32_t staging_bind = 0;
+        const std::uint32_t staging_cpu = 0x8000;
+        const std::uint32_t staging_misc = 0;
+        const std::uint32_t staging_stride = 0;
+        std::memcpy(staging_desc.data() + 0, &staging_byte_width, 4);
+        std::memcpy(staging_desc.data() + 4, &staging_usage, 4);
+        std::memcpy(staging_desc.data() + 8, &staging_bind, 4);
+        std::memcpy(staging_desc.data() + 12, &staging_cpu, 4);
+        std::memcpy(staging_desc.data() + 16, &staging_misc, 4);
+        std::memcpy(staging_desc.data() + 20, &staging_stride, 4);
+    }
+
+    const std::uint64_t staging_desc_va = com.alloc_and_write(staging_desc);
+    if (staging_desc_va == 0)
+        return tool_result_t::error("Failed to allocate/write staging D3D11_BUFFER_DESC: " + com.error);
+
+    const std::uint64_t staging_out_va = com.alloc(8);
+    if (staging_out_va == 0)
+    {
+        driver_bridge::free_memory_for(scope.pid(), staging_desc_va);
+        return tool_result_t::error("Failed to allocate target memory for staging out-param: " + com.error);
+    }
+
+    const std::uint64_t create_hr = com.call_com_method(create_buffer_ptr, device_va, staging_desc_va, 0, staging_out_va);
+    driver_bridge::free_memory_for(scope.pid(), staging_desc_va);
+
+    std::uint64_t staging_buffer_va = 0;
+    if (com.error.empty())
+        staging_buffer_va = com.read_u64_at(staging_out_va);
+    driver_bridge::free_memory_for(scope.pid(), staging_out_va);
+
+    if (!com.error.empty())
+        return tool_result_t::error("ID3D11Device::CreateBuffer failed: " + com.error);
+
+    if (staging_buffer_va == 0)
+    {
+        std::ostringstream hs;
+        hs << "0x" << std::hex << static_cast<std::uint32_t>(create_hr);
+        return tool_result_t::error("ID3D11Device::CreateBuffer returned null staging buffer. HRESULT=" + hs.str());
+    }
+
+    diag::log_tagged_fmt("dx_hook",
+        "read_gpu_buffer staging_created pid=%u staging_buffer_va=%s",
+        scope.pid(),
+        sa_format_address(staging_buffer_va).c_str());
+
+    auto release_staging = [&]() {
+        if (staging_buffer_va == 0 || !com.target_alive())
+            return;
+        const std::uint64_t r = com.read_vtable_method(staging_buffer_va, 2);
+        com.error.clear();
+        if (r != 0)
+            com.call_com_method(r, staging_buffer_va);
+        com.error.clear();
+    };
+
+    const std::uint64_t copy_resource_ptr = com.read_vtable_method(device_context_va, 44);
+    if (copy_resource_ptr == 0)
+    {
+        release_staging();
+        return tool_result_t::error("Failed to read ID3D11DeviceContext::CopyResource vtable slot: " + com.error);
+    }
+
+    com.call_com_method(copy_resource_ptr, device_context_va, staging_buffer_va, buffer_va);
+    if (!com.error.empty())
+    {
+        release_staging();
+        return tool_result_t::error("ID3D11DeviceContext::CopyResource failed: " + com.error);
+    }
+
+    const std::uint64_t map_ptr = com.read_vtable_method(device_context_va, 57);
+    if (map_ptr == 0)
+    {
+        release_staging();
+        return tool_result_t::error("Failed to read ID3D11DeviceContext::Map vtable slot: " + com.error);
+    }
+
+    constexpr std::size_t kMappedSubresourceSize = 16;
+    const std::uint64_t mapped_va = com.alloc(kMappedSubresourceSize);
+    if (mapped_va == 0)
+    {
+        release_staging();
+        return tool_result_t::error("Failed to allocate target memory for D3D11_MAPPED_SUBRESOURCE: " + com.error);
+    }
+
+    const std::uint64_t map_hr = com.call_com_method_6(map_ptr, device_context_va, staging_buffer_va, 0, 1, 0, mapped_va);
+    if (!com.error.empty())
+    {
+        driver_bridge::free_memory_for(scope.pid(), mapped_va);
+        release_staging();
+        return tool_result_t::error("ID3D11DeviceContext::Map failed: " + com.error);
+    }
+
+    const std::int32_t map_hr32 = static_cast<std::int32_t>(map_hr & 0xFFFFFFFFull);
+    if (map_hr32 < 0)
+    {
+        driver_bridge::free_memory_for(scope.pid(), mapped_va);
+        release_staging();
+        std::ostringstream hs;
+        hs << "0x" << std::hex << static_cast<std::uint32_t>(map_hr);
+        return tool_result_t::error("ID3D11DeviceContext::Map returned failure HRESULT=" + hs.str());
+    }
+
+    std::vector<std::uint8_t> mapped_bytes;
+    if (!com.read_bytes_at(mapped_va, kMappedSubresourceSize, mapped_bytes))
+    {
+        if (com.target_alive())
+        {
+            const std::uint64_t unmap_ptr = com.read_vtable_method(device_context_va, 58);
+            com.error.clear();
+            if (unmap_ptr != 0)
+                com.call_com_method(unmap_ptr, device_context_va, staging_buffer_va, 0);
+            com.error.clear();
+        }
+        driver_bridge::free_memory_for(scope.pid(), mapped_va);
+        release_staging();
+        return tool_result_t::error("Failed to read D3D11_MAPPED_SUBRESOURCE from target: " + com.error);
+    }
+    driver_bridge::free_memory_for(scope.pid(), mapped_va);
+
+    std::uint64_t mapped_data_ptr = 0;
+    std::uint32_t row_pitch = 0;
+    std::uint32_t depth_pitch = 0;
+    std::memcpy(&mapped_data_ptr, mapped_bytes.data() + 0, 8);
+    std::memcpy(&row_pitch, mapped_bytes.data() + 8, 4);
+    std::memcpy(&depth_pitch, mapped_bytes.data() + 12, 4);
+
+    if (mapped_data_ptr == 0)
+    {
+        if (com.target_alive())
+        {
+            const std::uint64_t unmap_ptr = com.read_vtable_method(device_context_va, 58);
+            com.error.clear();
+            if (unmap_ptr != 0)
+                com.call_com_method(unmap_ptr, device_context_va, staging_buffer_va, 0);
+            com.error.clear();
+        }
+        release_staging();
+        return tool_result_t::error("ID3D11DeviceContext::Map succeeded but pData is null.");
+    }
+
+    diag::log_tagged_fmt("dx_hook",
+        "read_gpu_buffer mapped pid=%u pData=%s row_pitch=%u depth_pitch=%u",
+        scope.pid(),
+        sa_format_address(mapped_data_ptr).c_str(),
+        row_pitch,
+        depth_pitch);
+
+    std::vector<std::uint8_t> buffer_data;
+    if (!com.read_bytes_at(mapped_data_ptr, static_cast<std::size_t>(read_size), buffer_data))
+    {
+        if (com.target_alive())
+        {
+            const std::uint64_t unmap_ptr = com.read_vtable_method(device_context_va, 58);
+            com.error.clear();
+            if (unmap_ptr != 0)
+                com.call_com_method(unmap_ptr, device_context_va, staging_buffer_va, 0);
+            com.error.clear();
+        }
+        release_staging();
+        return tool_result_t::error("Failed to read mapped buffer data from target: " + com.error);
+    }
+
+    if (com.target_alive())
+    {
+        const std::uint64_t unmap_ptr = com.read_vtable_method(device_context_va, 58);
+        com.error.clear();
+        if (unmap_ptr != 0)
+            com.call_com_method(unmap_ptr, device_context_va, staging_buffer_va, 0);
+        com.error.clear();
+    }
+
+    release_staging();
+
+    json result;
+    result["process_id"] = scope.pid();
+    result["buffer_va"] = sa_format_address(buffer_va);
+    result["device_context_va"] = sa_format_address(device_context_va);
+    result["device_va"] = sa_format_address(device_va);
+    result["staging_buffer_va"] = sa_format_address(staging_buffer_va);
+    result["buffer_desc"] = {
+        {"byte_width", byte_width},
+        {"usage", usage},
+        {"bind_flags", bind_flags},
+        {"cpu_access_flags", cpu_access_flags},
+        {"misc_flags", misc_flags},
+        {"structure_byte_stride", structure_byte_stride}
+    };
+    result["mapped_subresource"] = {
+        {"data_va", sa_format_address(mapped_data_ptr)},
+        {"row_pitch", row_pitch},
+        {"depth_pitch", depth_pitch}
+    };
+    result["bytes_read"] = buffer_data.size();
+    result["read_size"] = read_size;
+    result["truncated"] = read_size < static_cast<std::uint64_t>(byte_width);
+    result["com_call_count"] = com.call_count;
+    result["data_hex"] = bytes_to_hex(buffer_data, 4096);
+    result["preview_floats"] = preview_floats(buffer_data);
+
+    if (detect_matrices && !buffer_data.empty())
+    {
+        matrix_decode_result_t decoded = best_matrix_decode_run(buffer_data, 1000000.0, 256, buffer_data.size());
+        result["matrix_detection"] = {
+            {"count", decoded.count},
+            {"stride", decoded.stride},
+            {"offset", decoded.offset},
+            {"xor_key", decoded.xor_key},
+            {"decode", decoded.decode},
+            {"format", bone_format_name(decoded.format)}
+        };
+    }
+
+    result["elapsed_ms"] = GetTickCount64() - started_ms;
+    result["target_alive_after_readback"] = com.target_alive();
+
+    diag::log_tagged_fmt("dx_hook",
+        "read_gpu_buffer done pid=%u bytes_read=%zu com_calls=%zu elapsed_ms=%llu target_alive=%d",
+        scope.pid(),
+        buffer_data.size(),
+        com.call_count,
+        static_cast<unsigned long long>(GetTickCount64() - started_ms),
+        com.target_alive() ? 1 : 0);
+
+    return tool_result_t::ok("GPU buffer readback completed via remote COM method invocation.", result);
+}
+
+tool_result_t correlate_results(const json& params)
+{
+    active_process_scope_t scope(params);
+    if (!scope.ok())
+        return tool_result_t::error(scope.error());
+
+    std::uint64_t view_matrix_va = 0;
+    std::uint64_t bone_buffer_va = 0;
+    parse_address_param(params, "view_matrix_va", view_matrix_va);
+    parse_address_param(params, "bone_buffer_va", bone_buffer_va);
+
+    if (view_matrix_va == 0 && bone_buffer_va == 0)
+        return tool_result_t::error("At least one of view_matrix_va or bone_buffer_va is required.");
+
+    json result;
+    result["process_id"] = scope.pid();
+    result["view_matrix_va"] = view_matrix_va ? json(sa_format_address(view_matrix_va)) : json(nullptr);
+    result["bone_buffer_va"] = bone_buffer_va ? json(sa_format_address(bone_buffer_va)) : json(nullptr);
+
+    auto batches = store::list_frame_batches(scope.pid());
+    json frame_matches = json::array();
+
+    for (const auto& batch : batches)
+    {
+        bool has_view = false, has_bone = false;
+        for (const auto& [va, slot] : batch.cbuffer_binds)
+        {
+            if (va == view_matrix_va) has_view = true;
+            if (va == bone_buffer_va) has_bone = true;
+        }
+        if ((view_matrix_va == 0 || has_view) && (bone_buffer_va == 0 || has_bone))
+        {
+            json match;
+            match["frame_index"] = batch.frame_index;
+            match["start_timestamp_ms"] = batch.start_timestamp_ms;
+            match["end_timestamp_ms"] = batch.end_timestamp_ms;
+            match["total_draw_count"] = batch.total_draw_count;
+            match["character_draw_count"] = batch.character_draw_count;
+            match["view_matrix_present"] = has_view;
+            match["bone_buffer_present"] = has_bone;
+            json draws = json::array();
+            for (const auto& dc : batch.draw_calls)
+            {
+                json d;
+                d["draw_kind"] = dc.draw_kind;
+                d["index_count"] = dc.index_count;
+                d["vertex_count"] = dc.vertex_count;
+                d["likely_mesh_type"] = dc.likely_mesh_type;
+                d["preceding_cbuffer_va"] = dc.preceding_cbuffer_va ? json(sa_format_address(dc.preceding_cbuffer_va)) : json(nullptr);
+                d["preceding_cbuffer_slot"] = dc.preceding_cbuffer_slot;
+                draws.push_back(std::move(d));
+            }
+            match["draw_calls"] = std::move(draws);
+            frame_matches.push_back(std::move(match));
+        }
+    }
+
+    result["matching_frames"] = std::move(frame_matches);
+    result["matching_frame_count"] = result["matching_frames"].size();
+    result["same_frame"] = result["matching_frame_count"].get<std::size_t>() > 0;
+    result["correlation_strength"] = "none";
+    if (result["matching_frame_count"].get<std::size_t>() > 0)
+    {
+        const auto count = result["matching_frame_count"].get<std::size_t>();
+        if (count >= 3) result["correlation_strength"] = "strong";
+        else if (count >= 1) result["correlation_strength"] = "moderate";
+    }
+
+    auto hot_vas = store::list_hot_vas(scope.pid());
+    for (const auto& hv : hot_vas)
+    {
+        if (hv.va == view_matrix_va || hv.va == bone_buffer_va)
+        {
+            result["hot_va_evidence"] = hot_va_to_json(hv);
+            break;
+        }
+    }
+
+    return tool_result_t::ok("Cross-tool correlation complete.", result);
+}
+
+tool_result_t get_frame_summary(const json& params)
+{
+    active_process_scope_t scope(params);
+    if (!scope.ok())
+        return tool_result_t::error(scope.error());
+
+    auto batches = store::list_frame_batches(scope.pid());
+    if (batches.empty())
+    {
+        json result;
+        result["process_id"] = scope.pid();
+        result["frame_count"] = 0;
+        result["failure_reason"] = "no_frame_batches_captured";
+        result["hint"] = "Arm a Present HWBP plus draw/cbuffer HWBPs to capture frame batches";
+        return tool_result_t::ok("No frame batches captured yet.", result);
+    }
+
+    const std::uint32_t requested_frame = static_cast<std::uint32_t>(numeric_param(params, "frame_index", 0, 0, batches.size()));
+    const bool latest = bool_param(params, "latest", true);
+
+    const auto& batch = latest ? batches.back() : batches[std::min<std::size_t>(requested_frame, batches.size() - 1)];
+
+    json result = frame_batch_to_json(batch);
+    result["process_id"] = scope.pid();
+    result["frame_count"] = batches.size();
+    result["latest"] = latest;
+
+    auto classifications = classify_cbuffers(scope.pid());
+    json class_json = json::array();
+    for (const auto& cc : classifications)
+        class_json.push_back(cbuffer_classification_to_json(cc));
+    result["cbuffer_classifications"] = std::move(class_json);
+
+    auto hot_vas = store::list_hot_vas(scope.pid());
+    json hot_json = json::array();
+    for (const auto& hv : hot_vas)
+        hot_json.push_back(hot_va_to_json(hv));
+    result["hot_vas"] = std::move(hot_json);
+
+    return tool_result_t::ok("Frame summary retrieved.", result);
+}
+
+tool_result_t auto_narrow(const json& params)
+{
+    const std::uint64_t started_ms = GetTickCount64();
+    active_process_scope_t scope(params);
+    if (!scope.ok())
+        return tool_result_t::error(scope.error());
+
+    const std::uint32_t capture_frames = static_cast<std::uint32_t>(numeric_param(params, "capture_frames", 3, 1, 10));
+    const double world_max = number_param(params, "world_unit_max", 1000000.0, 1.0, 1000000000.0);
+    const std::uint32_t min_bones = static_cast<std::uint32_t>(numeric_param(params, "min_bones", 4, 1, 1024));
+    const std::uint32_t max_bones = static_cast<std::uint32_t>(numeric_param(params, "max_bones", 256, min_bones, 4096));
+    const std::string api = api_param(params);
+
+    if (!driver_bridge::using_kernel_driver())
+    {
+        json result;
+        result["process_id"] = scope.pid();
+        result["capability"] = {{"available", false}, {"reason", "kernel driver required for auto_narrow"}};
+        return tool_result_t::error("DX kernel-context backend is unavailable.", result);
+    }
+
+    for (const auto& record : store::list_dx_hooks(scope.pid()))
+    {
+        for (auto tid : record.tids)
+            driver_bridge::clear_hardware_breakpoint(tid, record.hw_slot);
+    }
+    store::remove_dx_hooks(scope.pid());
+    stop_dx_debug_loop(scope.pid());
+    store::clear_frame_batches(scope.pid());
+    store::clear_hot_vas(scope.pid());
+    store::clear_cbuffer_classifications(scope.pid());
+
+    auto slots = discover_api(scope.pid(), api, true);
+    std::optional<slot_entry_t> present_target, draw_target, cbuffer_target;
+    for (const auto& s : slots)
+    {
+        if (s.target_va == 0 || !s.validated) continue;
+        if (s.role == "present" && !present_target) present_target = s;
+        if (s.role == "draw" && !draw_target)
+        {
+            if (s.name == "DrawIndexed" || s.name == "Draw" || s.name == "DrawInstanced" || s.name == "DrawIndexedInstanced")
+                draw_target = s;
+        }
+        if (s.role == "cbuffer_bind" && !cbuffer_target)
+        {
+            if (s.name == "VSSetConstantBuffers")
+                cbuffer_target = s;
+        }
+    }
+    if (!draw_target)
+    {
+        for (const auto& s : slots)
+        {
+            if (s.target_va == 0 || !s.validated) continue;
+            if (s.role == "draw" && !draw_target) draw_target = s;
+        }
+    }
+    if (!cbuffer_target)
+    {
+        for (const auto& s : slots)
+        {
+            if (s.target_va == 0 || !s.validated) continue;
+            if (s.role == "cbuffer_bind" && !cbuffer_target) cbuffer_target = s;
+        }
+    }
+    if (!present_target)
+    {
+        auto present_slots = discover_dxgi_present(scope.pid(), true);
+        if (!present_slots.empty())
+            present_target = present_slots[0];
+    }
+
+    if (!present_target || !draw_target || !cbuffer_target)
+    {
+        json result;
+        result["process_id"] = scope.pid();
+        result["resolved_targets"] = {
+            {"present", present_target ? json(sa_format_address(present_target->target_va)) : json(nullptr)},
+            {"draw", draw_target ? json(sa_format_address(draw_target->target_va)) : json(nullptr)},
+            {"cbuffer_bind", cbuffer_target ? json(sa_format_address(cbuffer_target->target_va)) : json(nullptr)}
+        };
+        result["failure_reason"] = "could_not_resolve_all_three_targets";
+        return tool_result_t::error("Auto-narrow requires Present, Draw, and CBufferBind targets.", result);
+    }
+
+    std::vector<store::dx_hook_record_t> prepared;
+    auto arm = [&](const slot_entry_t& target, const std::string& act, int hw_slot) {
+        store::dx_hook_record_t rec;
+        rec.id = store::next_id("dx");
+        rec.pid = scope.pid();
+        rec.api = api == "auto" ? target.module_name : api;
+        rec.action = act;
+        rec.target_va = target.target_va;
+        rec.target_name = target.name;
+        rec.hw_slot = hw_slot;
+        rec.capture_cbuffers = (act == "cbuffer_bind");
+        rec.max_captures = 64;
+        rec.created_ms = unix_time_ms();
+        for (const auto& th : threads_for(scope.pid()))
+            if (driver_bridge::set_hardware_breakpoint(th.tid, hw_slot, target.target_va, 0, 0))
+                rec.tids.push_back(th.tid);
+        return rec;
+    };
+
+    auto present_rec = arm(*present_target, "present", 0);
+    auto draw_rec = arm(*draw_target, "draw", 1);
+    auto cbuffer_rec = arm(*cbuffer_target, "cbuffer_bind", 2);
+
+    if (present_rec.tids.empty() || draw_rec.tids.empty() || cbuffer_rec.tids.empty())
+    {
+        clear_dx_record_breakpoints({present_rec, draw_rec, cbuffer_rec});
+        json result;
+        result["process_id"] = scope.pid();
+        result["failure_reason"] = "hwbp_arming_failed";
+        return tool_result_t::error("Could not arm all 3 HWBPs.", result);
+    }
+
+    prepared = {present_rec, draw_rec, cbuffer_rec};
+    for (const auto& r : prepared) store::add_dx_hook(r);
+
+    frame_tracking_state().enabled.store(true, std::memory_order_release);
+    frame_tracking_state().frame_start_ms.store(unix_time_ms(), std::memory_order_release);
+    frame_tracking_state().current_frame.store(0, std::memory_order_release);
+    frame_tracking_state().current_draw_ordinal.store(0, std::memory_order_release);
+
+    std::string debug_error;
+    if (!start_dx_debug_loop(scope.pid(), debug_error))
+    {
+        for (const auto& r : prepared) { clear_dx_record_breakpoints(r); store::remove_dx_hook(r.id); }
+        json result;
+        result["process_id"] = scope.pid();
+        result["failure_reason"] = debug_error;
+        return tool_result_t::error("Debug loop failed to start.", result);
+    }
+
+    const std::uint64_t deadline_ms = started_ms + capture_frames * 2000ull + 5000ull;
+    while (store::list_frame_batches(scope.pid()).size() < capture_frames)
+    {
+        if (GetTickCount64() > deadline_ms)
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    stop_dx_debug_loop(scope.pid());
+    for (const auto& r : prepared) clear_dx_record_breakpoints(r);
+    frame_tracking_state().enabled.store(false, std::memory_order_release);
+
+    auto batches = store::list_frame_batches(scope.pid());
+    if (batches.empty())
+    {
+        json result;
+        result["process_id"] = scope.pid();
+        result["captured_frames"] = 0;
+        result["failure_reason"] = "no_frames_captured_within_timeout";
+        return tool_result_t::error("Auto-narrow captured no frames within timeout.", result);
+    }
+
+    auto classifications = classify_cbuffers(scope.pid());
+    for (auto& cc : classifications)
+    {
+        cc.pid = scope.pid();
+        store::add_cbuffer_classification(cc);
+    }
+
+    json view_matrix_candidates = json::array();
+    for (const auto& cc : classifications)
+    {
+        if (cc.classification != store::cbuffer_class_t::persistent)
+            continue;
+
+        std::vector<std::uint8_t> bytes;
+        if (!read_bytes(scope.pid(), cc.va, 64, bytes) || bytes.size() < 64)
+            continue;
+
+        float f[16] = {};
+        std::memcpy(f, bytes.data(), 64);
+        matrix_eval_t eval = evaluate_matrix4x4(f, world_max);
+        if (!eval.plausible || eval.static_null_view)
+            continue;
+
+        auto hot_vas = store::list_hot_vas(scope.pid());
+        auto hot_it = std::find_if(hot_vas.begin(), hot_vas.end(), [&](const store::hot_va_entry_t& e) { return e.va == cc.va; });
+
+        double confidence = 0.50 + eval.score * 0.35;
+        confidence += 0.18;
+        confidence += cc.frequency_score * 0.10;
+        if (hot_it != hot_vas.end()) confidence += hot_it->confidence_boost;
+        confidence = std::min(0.98, std::max(0.0, confidence));
+
+        json row;
+        row["va"] = sa_format_address(cc.va);
+        row["confidence"] = confidence;
+        row["matrix_type"] = eval.type;
+        row["matrix_orientation"] = eval.orientation;
+        row["determinant3x3"] = eval.determinant;
+        row["orthogonality_error"] = eval.orthogonality_error;
+        row["classification"] = "persistent";
+        row["frequency_score"] = cc.frequency_score;
+        row["frames_seen"] = cc.frames_seen;
+        row["preview_floats"] = preview_floats(bytes);
+        row["source"] = "auto_narrow_persistent_cbuffer";
+        if (hot_it != hot_vas.end())
+        {
+            row["hot_va_hit_count"] = hot_it->hit_count;
+            row["hot_va_frame_count"] = hot_it->frame_count;
+        }
+        view_matrix_candidates.push_back(std::move(row));
+    }
+
+    json bone_buffer_candidates = json::array();
+    for (const auto& cc : classifications)
+    {
+        if (cc.classification != store::cbuffer_class_t::per_draw)
+            continue;
+
+        driver_bridge::memory_region_t region{};
+        if (!query_region(scope.pid(), cc.va, region))
+            continue;
+        std::uint64_t size = region.base + region.size - cc.va;
+        if (size < 64ull * min_bones)
+            continue;
+
+        std::vector<std::uint8_t> bytes;
+        const std::size_t read_size = static_cast<std::size_t>(std::min<std::uint64_t>(size, std::max<std::uint64_t>(64ull * max_bones + 256ull, 8192ull)));
+        if (!read_bytes(scope.pid(), cc.va, read_size, bytes) || bytes.size() < 48ull * min_bones)
+            continue;
+
+        matrix_decode_result_t decoded = best_matrix_decode_run(bytes, world_max, max_bones, 512);
+        if (decoded.count < min_bones)
+            continue;
+
+        auto hot_vas = store::list_hot_vas(scope.pid());
+        auto hot_it = std::find_if(hot_vas.begin(), hot_vas.end(), [&](const store::hot_va_entry_t& e) { return e.va == cc.va; });
+
+        double confidence = 0.40 + static_cast<double>(decoded.count) / static_cast<double>(std::max<std::uint32_t>(max_bones, 1)) * 0.42;
+        confidence += 0.18;
+        confidence += cc.frequency_score * 0.05;
+        if (hot_it != hot_vas.end()) confidence += hot_it->confidence_boost;
+        if (decoded.decode == "xor32_float32") confidence += 0.06;
+        confidence = std::min(0.99, std::max(0.0, confidence));
+
+        json row;
+        row["va"] = sa_format_address(cc.va + decoded.offset);
+        row["base_va"] = sa_format_address(cc.va);
+        row["confidence"] = confidence;
+        row["bone_count"] = decoded.count;
+        row["matrix_size"] = decoded.stride;
+        row["decode"] = decoded.decode;
+        row["classification"] = "per_draw";
+        row["frequency_score"] = cc.frequency_score;
+        row["frames_seen"] = cc.frames_seen;
+        row["associated_draw_count"] = cc.associated_draw_calls.size();
+        row["source"] = "auto_narrow_per_draw_cbuffer";
+        if (!cc.associated_draw_calls.empty())
+        {
+            const auto& dc = cc.associated_draw_calls.front();
+            row["sample_draw_call"] = {
+                {"draw_kind", dc.draw_kind},
+                {"index_count", dc.index_count},
+                {"vertex_count", dc.vertex_count},
+                {"likely_mesh_type", dc.likely_mesh_type}
+            };
+        }
+        bone_buffer_candidates.push_back(std::move(row));
+    }
+
+    std::sort(view_matrix_candidates.begin(), view_matrix_candidates.end(), [](const json& a, const json& b) {
+        return a["confidence"].get<double>() > b["confidence"].get<double>();
+    });
+    std::sort(bone_buffer_candidates.begin(), bone_buffer_candidates.end(), [](const json& a, const json& b) {
+        return a["confidence"].get<double>() > b["confidence"].get<double>();
+    });
+
+    json result;
+    result["process_id"] = scope.pid();
+    result["captured_frames"] = batches.size();
+    result["capture_elapsed_ms"] = static_cast<unsigned long long>(GetTickCount64() - started_ms);
+
+    json frame_summaries = json::array();
+    for (const auto& batch : batches)
+    {
+        json fs;
+        fs["frame_index"] = batch.frame_index;
+        fs["total_draws"] = batch.total_draw_count;
+        fs["character_draws"] = batch.character_draw_count;
+        fs["weapon_draws"] = batch.weapon_draw_count;
+        fs["world_draws"] = batch.world_draw_count;
+        fs["cbuffer_bind_count"] = batch.cbuffer_binds.size();
+        frame_summaries.push_back(std::move(fs));
+    }
+    result["frame_summaries"] = std::move(frame_summaries);
+
+    json class_json = json::array();
+    for (const auto& cc : classifications)
+        class_json.push_back(cbuffer_classification_to_json(cc));
+    result["cbuffer_classifications"] = std::move(class_json);
+
+    result["view_matrix_candidates"] = std::move(view_matrix_candidates);
+    result["view_matrix_candidate_count"] = result["view_matrix_candidates"].size();
+    result["best_view_matrix"] = result["view_matrix_candidates"].empty() ? json(nullptr) : result["view_matrix_candidates"][0];
+
+    result["bone_buffer_candidates"] = std::move(bone_buffer_candidates);
+    result["bone_buffer_candidate_count"] = result["bone_buffer_candidates"].size();
+    result["best_bone_buffer"] = result["bone_buffer_candidates"].empty() ? json(nullptr) : result["bone_buffer_candidates"][0];
+
+    if (!result["view_matrix_candidates"].empty())
+    {
+        result["view_matrix_candidates"][0]["next_action"] = "dx_correlate_results";
+        result["view_matrix_candidates"][0]["next_action_params"] = json::object({
+            {"process_id", scope.pid()},
+            {"view_matrix_va", result["view_matrix_candidates"][0]["va"]}
+        });
+    }
+    if (!result["bone_buffer_candidates"].empty())
+    {
+        result["bone_buffer_candidates"][0]["next_action"] = "dx_correlate_results";
+        result["bone_buffer_candidates"][0]["next_action_params"] = json::object({
+            {"process_id", scope.pid()},
+            {"bone_buffer_va", result["bone_buffer_candidates"][0]["va"]}
+        });
+    }
+
+    result["found"] = !result["view_matrix_candidates"].empty() || !result["bone_buffer_candidates"].empty();
+    result["summary"] = "Auto-narrow complete: " + std::to_string(batches.size()) + " frames, " +
+                        std::to_string(result["view_matrix_candidate_count"].get<std::size_t>()) + " view matrix candidates, " +
+                        std::to_string(result["bone_buffer_candidate_count"].get<std::size_t>()) + " bone buffer candidates";
+
+    diag::log_tagged_fmt("dx_hook", "auto_narrow exit pid=%u frames=%zu vm_candidates=%zu bb_candidates=%zu elapsed_ms=%llu",
+                         scope.pid(), batches.size(),
+                         result["view_matrix_candidate_count"].get<std::size_t>(),
+                         result["bone_buffer_candidate_count"].get<std::size_t>(),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
+
+    return tool_result_t::ok(result["summary"].get<std::string>(), result);
 }
 }

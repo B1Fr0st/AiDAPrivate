@@ -211,7 +211,10 @@ You are running inside the AiDA standalone IDE â€” an IDA-Pro-class reverse
 
 ## Specialized reverse-engineering domains
 
-- dx_* - DirectX/DXGI/Vulkan vtable discovery, constant-buffer analysis, view-matrix search, and guarded draw/present capture management.
+- dx_* - DirectX/DXGI/Vulkan vtable discovery, constant-buffer analysis, view-matrix search, bone-buffer identification, draw-call-to-mesh correlation, frame-boundary grouping, automatic cbuffer classification, hot-VA tracking, cross-tool result correlation, one-shot auto-narrow pipeline, and guarded draw/present capture management.
+  - dx_auto_narrow: one-shot tool that arms parallel HWBPs, captures frames, classifies cbuffers, and returns ranked view matrix + bone buffer candidates.
+  - dx_correlate_results: cross-correlate view matrix and bone buffer VAs across frame batches.
+  - dx_get_frame_summary: get latest frame batch with draw calls, cbuffer classifications, and hot VAs.
 - vmt_* - C++ virtual table reading, signature slot lookup, object scans, and guarded VMT hook/copy management.
 - rtti_* - MSVC RTTI type scans, type lookup, hierarchy inspection, and constructor xref recovery.
 - encptr_* - encrypted pointer-chain scanning, transform detection, resolver emission, and stability checks.

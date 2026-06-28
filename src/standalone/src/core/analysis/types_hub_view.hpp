@@ -915,7 +915,8 @@ inline void start_manual_pdb_load(const std::string& pdb_path)
 
 	work_queue::post([job]() {
 		uint64_t t0 = GetTickCount64();
-		bool ok = pdb_parser::parse_pdb(job->pdb_path, std::string{}, *job->info, job->progress.get());
+		bool ok = pdb_parser::parse_pdb_bounded(job->pdb_path, std::string{}, *job->info, job->progress.get(),
+			nullptr, symbol_store::k_explicit_pdb_load_timeout_ms);
 		uint64_t elapsed_ms = GetTickCount64() - t0;
 		job->ok->store(ok, std::memory_order_release);
 		job->done->store(true, std::memory_order_release);

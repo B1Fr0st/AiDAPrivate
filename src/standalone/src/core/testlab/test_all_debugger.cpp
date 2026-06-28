@@ -3845,28 +3845,64 @@ static void test_module_view_entries(HANDLE hf, std::atomic<int>& passed, std::a
     }
 }
 
+static const char* dbg_sub_tab_label(debugger_view::sub_tab_t tab) {
+    switch (tab) {
+    case debugger_view::sub_tab_t::cpu:         return "cpu";
+    case debugger_view::sub_tab_t::breakpoints: return "breakpoints";
+    case debugger_view::sub_tab_t::memory_map:  return "memory_map";
+    case debugger_view::sub_tab_t::call_stack:  return "call_stack";
+    case debugger_view::sub_tab_t::threads:     return "threads";
+    case debugger_view::sub_tab_t::watches:     return "watches";
+    case debugger_view::sub_tab_t::handles:     return "handles";
+    case debugger_view::sub_tab_t::trace_log:   return "trace_log";
+    case debugger_view::sub_tab_t::strings:     return "strings";
+    case debugger_view::sub_tab_t::bookmarks:   return "bookmarks";
+    case debugger_view::sub_tab_t::modules:     return "modules";
+    case debugger_view::sub_tab_t::patches:     return "patches";
+    case debugger_view::sub_tab_t::seh_chain:   return "seh_chain";
+    case debugger_view::sub_tab_t::cfg:         return "cfg";
+    case debugger_view::sub_tab_t::COUNT:       break;
+    }
+    return "";
+}
+
 static void select_debugger_tab(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed,
                                 const char* tag, debugger_view::sub_tab_t value) {
-    diag::log_tagged_fmt("test_dbg_detail", "%s inputs: set active_tab=%d", tag, static_cast<int>(value));
+    auto t0 = std::chrono::steady_clock::now();
+    const debugger_view::sub_tab_t before = debugger_view::g_ui.active_tab;
     const bool visible = debugger_view::is_visible_sub_tab(value);
+    const int visible_count = debugger_view::visible_sub_tab_count();
+    const int enum_count = static_cast<int>(debugger_view::sub_tab_t::COUNT);
+    const char* before_label = dbg_sub_tab_label(before);
+    const char* target_label = dbg_sub_tab_label(value);
+    diag::log_tagged_fmt("test_dbg_detail", "%s inputs: set active_tab=%d", tag, static_cast<int>(value));
+    log_msg(hf, tag, "STATE -- before=%d label=%s target=%d target_label=%s visible=%d visible_count=%d enum_count=%d tid=%lu",
+        static_cast<int>(before), before_label,
+        static_cast<int>(value), target_label,
+        visible ? 1 : 0, visible_count, enum_count,
+        (unsigned long)GetCurrentThreadId());
     debugger_view::g_ui.active_tab = value;
-    auto read_back = debugger_view::g_ui.active_tab;
+    const debugger_view::sub_tab_t got = debugger_view::g_ui.active_tab;
+    const char* got_label = dbg_sub_tab_label(got);
+    long long us = elapsed_us_since(t0);
     diag::log_tagged_fmt("test_dbg_detail", "%s result: active_tab read_back=%d visible=%d visible_count=%d enum_count=%d",
         tag,
-        static_cast<int>(read_back),
+        static_cast<int>(got),
         visible ? 1 : 0,
-        debugger_view::visible_sub_tab_count(),
-        static_cast<int>(debugger_view::sub_tab_t::COUNT));
-    if (read_back == value && visible && debugger_view::visible_sub_tab_count() == static_cast<int>(debugger_view::sub_tab_t::COUNT)) {
-        log_msg(hf, tag, "PASS -- active_tab selected and visible (%d)", static_cast<int>(value));
+        visible_count,
+        enum_count);
+    log_msg(hf, tag, "STATE -- after=%d label=%s changed=%d elapsed_us=%lld",
+        static_cast<int>(got), got_label,
+        (before != got) ? 1 : 0, us);
+    if (got == value && visible && visible_count == enum_count) {
+        log_msg(hf, tag, "PASS -- debugger active_tab selected and visible (%d label=%s visible_count=%d elapsed_us=%lld)",
+            static_cast<int>(value), got_label, visible_count, us);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, tag, "FAIL -- active_tab visibility contract failed: set %d, read back %d, visible=%d, visible_count=%d, enum_count=%d",
-            static_cast<int>(value),
-            static_cast<int>(read_back),
-            visible ? 1 : 0,
-            debugger_view::visible_sub_tab_count(),
-            static_cast<int>(debugger_view::sub_tab_t::COUNT));
+        log_msg(hf, tag, "FAIL -- debugger active_tab set %d (%s) but read back %d (%s) visible=%d visible_count=%d enum_count=%d elapsed_us=%lld",
+            static_cast<int>(value), target_label,
+            static_cast<int>(got), got_label,
+            visible ? 1 : 0, visible_count, enum_count, us);
         failed.fetch_add(1);
     }
 }

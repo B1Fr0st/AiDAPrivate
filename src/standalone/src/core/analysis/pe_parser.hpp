@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <chrono>
 #include <limits>
@@ -96,13 +97,38 @@ inline void set_truncated(bool* truncated)
 		*truncated = true;
 }
 
+inline void log_read_mem_failure(uint64_t addr, size_t size, const char* reason)
+{
+	static std::atomic<std::int64_t> last_log_us{0};
+	const std::int64_t now_us = static_cast<std::int64_t>(
+		std::chrono::duration_cast<std::chrono::microseconds>(
+			std::chrono::steady_clock::now().time_since_epoch()).count());
+	std::int64_t prev = last_log_us.load(std::memory_order_acquire);
+	if (prev != 0 && (now_us - prev) < 1000000)
+		return;
+	if (!last_log_us.compare_exchange_strong(prev, now_us, std::memory_order_acq_rel))
+		return;
+	diag::log_tagged_fmt("pe_parse",
+		"read_mem_failed addr=0x%llX size=%zu reason=%s driver_attached_pid=%u driver_status=\"%.160s\" driver_last_error=\"%.160s\"",
+		static_cast<unsigned long long>(addr),
+		size,
+		reason ? reason : "",
+		driver_bridge::attached_pid(),
+		driver_bridge::status().c_str(),
+		driver_bridge::last_error().c_str());
+}
+
 inline bool read_mem(uint64_t addr, void* buf, size_t size)
 {
 	std::vector<uint8_t> tmp;
-	if (!driver_bridge::read_memory(addr, size, tmp))
+	if (!driver_bridge::read_memory(addr, size, tmp)) {
+		log_read_mem_failure(addr, size, "driver_bridge_read_memory_failed");
 		return false;
-	if (tmp.size() < size)
+	}
+	if (tmp.size() < size) {
+		log_read_mem_failure(addr, size, "short_read");
 		return false;
+	}
 	std::memcpy(buf, tmp.data(), size);
 	return true;
 }
@@ -112,6 +138,7 @@ inline bool read_mem_partial(uint64_t addr, void* buf, size_t size, size_t& out_
 	std::vector<uint8_t> tmp;
 	if (!driver_bridge::read_memory(addr, size, tmp)) {
 		out_read = 0;
+		log_read_mem_failure(addr, size, "driver_bridge_read_memory_failed_partial");
 		return false;
 	}
 	out_read = tmp.size();

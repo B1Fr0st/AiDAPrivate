@@ -573,8 +573,15 @@ function Invoke-FrozenMcpContractCheck {
     $hasRequestId = $stdout -match "request_id"
     $hasPageId = $stdout -match "page_id"
     $hasMarker = $stdout -match '"marker"' -or $stdout -match ",marker" -or $stdout -match "marker," -or $stdout -match "marker]"
-    if ($proc.ExitCode -ne 0 -or -not ($hasContract -and $hasRequestId -and $hasPageId -and $hasMarker)) {
-        throw "Frozen MCP contract check failed exit=$($proc.ExitCode) contract=$([int]$hasContract) request_id=$([int]$hasRequestId) page_id=$([int]$hasPageId) marker=$([int]$hasMarker) stdout=[$(ConvertTo-CompactLogText $stdout)] stderr=[$(ConvertTo-CompactLogText $stderr)]"
+    $launchBudgetOk = $stdout -match '"launch_budget_contract_ok":true'
+    $pageCreateFloorOk = $stdout -match '"page_create_floor_present":true'
+    $pageCreateCeilingOk = $stdout -match '"page_create_ceiling_present":true'
+    $pageCreateRatioOk = $stdout -match '"page_create_ratio_present":true'
+    $latePageWaitOk = $stdout -match '"late_page_wait_floor_present":true'
+    $waitForLatePageSelfPagesOk = $stdout -match '"wait_for_late_page_self_pages_present":true'
+    $primaryWaitUntilDowngradeAbsent = $stdout -match '"primary_wait_until_downgrade_absent":true'
+    if ($proc.ExitCode -ne 0 -or -not ($hasContract -and $hasRequestId -and $hasPageId -and $hasMarker -and $launchBudgetOk -and $pageCreateFloorOk -and $pageCreateCeilingOk -and $pageCreateRatioOk -and $latePageWaitOk -and $waitForLatePageSelfPagesOk -and $primaryWaitUntilDowngradeAbsent)) {
+        throw "Frozen MCP contract check failed exit=$($proc.ExitCode) contract=$([int]$hasContract) request_id=$([int]$hasRequestId) page_id=$([int]$hasPageId) marker=$([int]$hasMarker) launch_budget=$([int]$launchBudgetOk) page_create_floor=$([int]$pageCreateFloorOk) page_create_ceiling=$([int]$pageCreateCeilingOk) page_create_ratio=$([int]$pageCreateRatioOk) late_page_wait=$([int]$latePageWaitOk) wait_for_late_page_self_pages=$([int]$waitForLatePageSelfPagesOk) wait_until_downgrade_absent=$([int]$primaryWaitUntilDowngradeAbsent) stdout=[$(ConvertTo-CompactLogText $stdout)] stderr=[$(ConvertTo-CompactLogText $stderr)]"
     }
     Write-Output "frozen_mcp_contract_check=ok"
 }
@@ -639,8 +646,15 @@ function Invoke-SourceMcpContractCheck {
     $hasRequestId = $stdout -match "request_id"
     $hasPageId = $stdout -match "page_id"
     $hasMarker = $stdout -match '"marker"' -or $stdout -match ",marker" -or $stdout -match "marker," -or $stdout -match "marker]"
-    if ($proc.ExitCode -ne 0 -or -not ($hasContract -and $hasRequestId -and $hasPageId -and $hasMarker)) {
-        throw "Source MCP contract check failed exit=$($proc.ExitCode) contract=$([int]$hasContract) request_id=$([int]$hasRequestId) page_id=$([int]$hasPageId) marker=$([int]$hasMarker) stdout=[$(ConvertTo-CompactLogText $stdout)] stderr=[$(ConvertTo-CompactLogText $stderr)]"
+    $launchBudgetOk = $stdout -match '"launch_budget_contract_ok":true'
+    $pageCreateFloorOk = $stdout -match '"page_create_floor_present":true'
+    $pageCreateCeilingOk = $stdout -match '"page_create_ceiling_present":true'
+    $pageCreateRatioOk = $stdout -match '"page_create_ratio_present":true'
+    $latePageWaitOk = $stdout -match '"late_page_wait_floor_present":true'
+    $waitForLatePageSelfPagesOk = $stdout -match '"wait_for_late_page_self_pages_present":true'
+    $primaryWaitUntilDowngradeAbsent = $stdout -match '"primary_wait_until_downgrade_absent":true'
+    if ($proc.ExitCode -ne 0 -or -not ($hasContract -and $hasRequestId -and $hasPageId -and $hasMarker -and $launchBudgetOk -and $pageCreateFloorOk -and $pageCreateCeilingOk -and $pageCreateRatioOk -and $latePageWaitOk -and $waitForLatePageSelfPagesOk -and $primaryWaitUntilDowngradeAbsent)) {
+        throw "Source MCP contract check failed exit=$($proc.ExitCode) contract=$([int]$hasContract) request_id=$([int]$hasRequestId) page_id=$([int]$hasPageId) marker=$([int]$hasMarker) launch_budget=$([int]$launchBudgetOk) page_create_floor=$([int]$pageCreateFloorOk) page_create_ceiling=$([int]$pageCreateCeilingOk) page_create_ratio=$([int]$pageCreateRatioOk) late_page_wait=$([int]$latePageWaitOk) wait_for_late_page_self_pages=$([int]$waitForLatePageSelfPagesOk) wait_until_downgrade_absent=$([int]$primaryWaitUntilDowngradeAbsent) stdout=[$(ConvertTo-CompactLogText $stdout)] stderr=[$(ConvertTo-CompactLogText $stderr)]"
     }
     Write-Output "source_mcp_contract_check=ok"
 }
@@ -1033,6 +1047,7 @@ try {
 import asyncio
 import ast
 import contextlib
+import importlib
 import importlib.util
 import inspect
 import json
@@ -1088,17 +1103,328 @@ def _aida_contract_probe_from_origin(origin):
     return {"source": "ast", "ok": False, "params": [], "has_marker_constant": False, "error": "get_request_initiator_missing"}
 
 
+def _aida_const_has_string(consts, target):
+    for value in consts:
+        if value == target and isinstance(value, str):
+            return True
+        if isinstance(value, tuple):
+            for inner in value:
+                if isinstance(inner, str) and inner == target:
+                    return True
+    return False
+
+
+def _aida_const_has_float(consts, target):
+    for value in consts:
+        if isinstance(value, float) and value == target:
+            return True
+        if isinstance(value, tuple):
+            for inner in value:
+                if isinstance(inner, float) and inner == target:
+                    return True
+    return False
+
+
+def _aida_launch_co_locate_floor(launch_code):
+    if not isinstance(launch_code, types.CodeType):
+        return False, "launch_code_missing"
+    consts = tuple(launch_code.co_consts or ())
+    if not _aida_const_has_string(consts, "page_create_floor_s"):
+        return False, "marker_string_missing:page_create_floor_s"
+    if not _aida_const_has_float(consts, 25.0):
+        return False, "literal_missing:25.0"
+    if not _aida_const_has_float(consts, 12.0):
+        return False, "literal_missing:12.0_fast_probe_branch"
+    if not _aida_const_has_string(consts, "launch_budget_allocation"):
+        return False, "marker_string_missing:launch_budget_allocation"
+    if not _aida_const_has_string(consts, "fast_probe"):
+        return False, "marker_string_missing:fast_probe"
+    return True, "co_located"
+
+
+def _aida_launch_co_locate_ceiling(launch_code):
+    if not isinstance(launch_code, types.CodeType):
+        return False, "launch_code_missing"
+    consts = tuple(launch_code.co_consts or ())
+    if not _aida_const_has_string(consts, "page_create_ceiling_s"):
+        return False, "marker_string_missing:page_create_ceiling_s"
+    if not _aida_const_has_float(consts, 35.0):
+        return False, "literal_missing:35.0"
+    if not _aida_const_has_float(consts, 18.0):
+        return False, "literal_missing:18.0_fast_probe_branch"
+    if not _aida_const_has_string(consts, "launch_budget_allocation"):
+        return False, "marker_string_missing:launch_budget_allocation"
+    if not _aida_const_has_string(consts, "fast_probe"):
+        return False, "marker_string_missing:fast_probe"
+    return True, "co_located"
+
+
+def _aida_launch_co_locate_ratio(launch_code):
+    if not isinstance(launch_code, types.CodeType):
+        return False, "launch_code_missing"
+    consts = tuple(launch_code.co_consts or ())
+    if not _aida_const_has_float(consts, 0.4):
+        return False, "literal_missing:0.4_slow_ratio"
+    if not _aida_const_has_float(consts, 0.18):
+        return False, "literal_missing:0.18_fast_ratio"
+    if not _aida_const_has_string(consts, "page_create_floor_s"):
+        return False, "marker_string_missing:page_create_floor_s"
+    if not _aida_const_has_string(consts, "page_create_ceiling_s"):
+        return False, "marker_string_missing:page_create_ceiling_s"
+    if not _aida_const_has_string(consts, "page_create_timeout_s"):
+        return False, "marker_string_missing:page_create_timeout_s"
+    if not _aida_const_has_string(consts, "launch_budget_allocation"):
+        return False, "marker_string_missing:launch_budget_allocation"
+    return True, "co_located"
+
+
+def _aida_launch_co_locate_late_page(launch_code):
+    if not isinstance(launch_code, types.CodeType):
+        return False, "launch_code_missing"
+    consts = tuple(launch_code.co_consts or ())
+    if not _aida_const_has_string(consts, "late_page_wait_s"):
+        return False, "marker_string_missing:late_page_wait_s"
+    if not _aida_const_has_float(consts, 8.0):
+        return False, "literal_missing:8.0_late_page_cap"
+    if not _aida_const_has_float(consts, 0.12):
+        return False, "literal_missing:0.12_late_page_ratio"
+    if not _aida_const_has_string(consts, "launch_budget_allocation"):
+        return False, "marker_string_missing:launch_budget_allocation"
+    return True, "co_located"
+
+
+def _aida_launch_co_locate_self_pages(browser_module):
+    wait_func = getattr(getattr(browser_module, "BrowserManager", None), "_wait_for_late_page", None)
+    code = getattr(wait_func, "__code__", None)
+    if not isinstance(code, types.CodeType):
+        return False, "wait_for_late_page_code_missing"
+    if "pages" not in tuple(code.co_names or ()):
+        return False, "co_names_missing:pages"
+    return True, "co_located"
+
+
+def _aida_navigate_co_locate_downgrade(navigate_code):
+    if not isinstance(navigate_code, types.CodeType):
+        return False, "navigate_code_missing"
+    consts = tuple(navigate_code.co_consts or ())
+    varnames = tuple(getattr(navigate_code, "co_varnames", ()) or ())
+    if not _aida_const_has_string(consts, "domcontentloaded"):
+        return False, "const_missing:domcontentloaded"
+    if not _aida_const_has_string(consts, "load"):
+        return False, "const_missing:load"
+    if not _aida_const_has_string(consts, "networkidle"):
+        return False, "const_missing:networkidle"
+    if not _aida_const_has_string(consts, "commit"):
+        return False, "const_missing:commit"
+    if not _aida_const_has_string(consts, "navigate_wait_until_resolved"):
+        return False, "const_missing:navigate_wait_until_resolved_debug_marker"
+    if not _aida_const_has_string(consts, "primary"):
+        return False, "kwarg_missing:primary"
+    if "primary_wait_until" not in varnames:
+        return False, "varname_missing:primary_wait_until"
+    return True, "co_located"
+
+
+def _aida_launch_budget_contract_probe():
+    diagnostics = {
+        "browser_module": False,
+        "navigation_module": False,
+        "browser_origin": "",
+        "navigation_origin": "",
+        "page_create_floor_present": False,
+        "page_create_ceiling_present": False,
+        "page_create_ratio_present": False,
+        "primary_wait_until_downgrade_present": True,
+        "wait_for_late_page_self_pages_present": False,
+        "late_page_wait_floor_present": False,
+        "browser_probe_mode": "",
+        "navigation_probe_mode": "",
+        "browser_probe_details": {},
+        "navigation_probe_details": {},
+        "errors": [],
+    }
+    try:
+        browser_spec = importlib.util.find_spec("camoufox_reverse_mcp.browser")
+        if browser_spec and browser_spec.origin and os.path.isfile(browser_spec.origin) and browser_spec.origin.endswith(".py"):
+            diagnostics["browser_module"] = True
+            diagnostics["browser_origin"] = browser_spec.origin
+            diagnostics["browser_probe_mode"] = "source"
+            with open(browser_spec.origin, "r", encoding="utf-8") as handle:
+                browser_text = handle.read()
+            diagnostics["page_create_floor_present"] = "page_create_floor_s = 12.0 if fast_probe else 25.0" in browser_text
+            diagnostics["page_create_ceiling_present"] = "page_create_ceiling_s = 18.0 if fast_probe else 35.0" in browser_text
+            diagnostics["page_create_ratio_present"] = "launch_timeout_s * (0.18 if fast_probe else 0.40)" in browser_text
+            diagnostics["late_page_wait_floor_present"] = "late_page_wait_s = 1.0 if fast_probe else min(8.0, max(2.0, launch_timeout_s * 0.12))" in browser_text
+            tree = ast.parse(browser_text, filename=browser_spec.origin)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.AsyncFunctionDef) and node.name == "_wait_for_late_page":
+                    references = [
+                        child for child in ast.walk(node)
+                        if isinstance(child, ast.Attribute) and isinstance(child.value, ast.Name)
+                        and child.value.id == "self" and child.attr == "pages"
+                    ]
+                    diagnostics["wait_for_late_page_self_pages_present"] = bool(references)
+                    break
+        elif browser_spec and browser_spec.origin and os.path.isfile(browser_spec.origin):
+            diagnostics["browser_probe_mode"] = "code_consts"
+            diagnostics["browser_origin"] = browser_spec.origin
+            details = {
+                "floor": ("unknown", ""),
+                "ceiling": ("unknown", ""),
+                "ratio": ("unknown", ""),
+                "late_page": ("unknown", ""),
+                "self_pages": ("unknown", ""),
+                "launch_code_resolved": False,
+            }
+            try:
+                browser_module = importlib.import_module("camoufox_reverse_mcp.browser")
+                diagnostics["browser_module"] = True
+                browser_manager_cls = getattr(browser_module, "BrowserManager", None)
+                launch_attr = getattr(browser_manager_cls, "launch", None) if browser_manager_cls is not None else None
+                launch_code = getattr(launch_attr, "__code__", None)
+                if launch_code is None:
+                    diagnostics["errors"].append({"module": "browser", "error_type": "ProbeError", "error": "BrowserManager.launch code object unavailable"})
+                else:
+                    details["launch_code_resolved"] = True
+                    ok_floor, reason_floor = _aida_launch_co_locate_floor(launch_code)
+                    ok_ceiling, reason_ceiling = _aida_launch_co_locate_ceiling(launch_code)
+                    ok_ratio, reason_ratio = _aida_launch_co_locate_ratio(launch_code)
+                    ok_late, reason_late = _aida_launch_co_locate_late_page(launch_code)
+                    ok_self, reason_self = _aida_launch_co_locate_self_pages(browser_module)
+                    diagnostics["page_create_floor_present"] = ok_floor
+                    diagnostics["page_create_ceiling_present"] = ok_ceiling
+                    diagnostics["page_create_ratio_present"] = ok_ratio
+                    diagnostics["late_page_wait_floor_present"] = ok_late
+                    diagnostics["wait_for_late_page_self_pages_present"] = ok_self
+                    details["floor"] = ("pass" if ok_floor else "fail", reason_floor)
+                    details["ceiling"] = ("pass" if ok_ceiling else "fail", reason_ceiling)
+                    details["ratio"] = ("pass" if ok_ratio else "fail", reason_ratio)
+                    details["late_page"] = ("pass" if ok_late else "fail", reason_late)
+                    details["self_pages"] = ("pass" if ok_self else "fail", reason_self)
+            except Exception as inner_exc:
+                diagnostics["errors"].append({"module": "browser", "error_type": type(inner_exc).__name__, "error": str(inner_exc)[:300]})
+            diagnostics["browser_probe_details"] = details
+        else:
+            diagnostics["browser_probe_mode"] = "unavailable"
+            diagnostics["errors"].append({"module": "browser", "error_type": "ProbeError", "error": "module origin unavailable; cannot inspect contract"})
+    except Exception as exc:
+        diagnostics["errors"].append({"module": "browser", "error_type": type(exc).__name__, "error": str(exc)[:300]})
+    try:
+        navigation_spec = importlib.util.find_spec("camoufox_reverse_mcp.tools.navigation")
+        if navigation_spec and navigation_spec.origin and os.path.isfile(navigation_spec.origin) and navigation_spec.origin.endswith(".py"):
+            diagnostics["navigation_module"] = True
+            diagnostics["navigation_origin"] = navigation_spec.origin
+            diagnostics["navigation_probe_mode"] = "source"
+            with open(navigation_spec.origin, "r", encoding="utf-8") as handle:
+                navigation_text = handle.read()
+            diagnostics["primary_wait_until_downgrade_present"] = (
+                'if primary_wait_until == "load":\n            primary_wait_until = "domcontentloaded"' in navigation_text
+            )
+        elif navigation_spec and navigation_spec.origin and os.path.isfile(navigation_spec.origin):
+            diagnostics["navigation_probe_mode"] = "code_consts"
+            diagnostics["navigation_origin"] = navigation_spec.origin
+            details = {"resolver": ("unknown", ""), "navigate_code_resolved": False}
+            try:
+                navigation_module = importlib.import_module("camoufox_reverse_mcp.tools.navigation")
+                diagnostics["navigation_module"] = True
+                navigate_attr = getattr(navigation_module, "navigate", None)
+                navigate_code = getattr(navigate_attr, "__code__", None)
+                if navigate_code is None:
+                    diagnostics["errors"].append({"module": "navigation", "error_type": "ProbeError", "error": "navigate code object unavailable"})
+                    diagnostics["primary_wait_until_downgrade_present"] = True
+                else:
+                    details["navigate_code_resolved"] = True
+                    ok_resolver, reason_resolver = _aida_navigate_co_locate_downgrade(navigate_code)
+                    if ok_resolver:
+                        diagnostics["primary_wait_until_downgrade_present"] = False
+                    else:
+                        diagnostics["primary_wait_until_downgrade_present"] = True
+                        diagnostics["errors"].append({"module": "navigation", "error_type": "ProbeError", "error": f"navigate resolver verification failed: {reason_resolver}"})
+                    details["resolver"] = ("pass" if ok_resolver else "fail", reason_resolver)
+            except Exception as inner_exc:
+                diagnostics["errors"].append({"module": "navigation", "error_type": type(inner_exc).__name__, "error": str(inner_exc)[:300]})
+                diagnostics["primary_wait_until_downgrade_present"] = True
+            diagnostics["navigation_probe_details"] = details
+        else:
+            diagnostics["navigation_probe_mode"] = "unavailable"
+            diagnostics["primary_wait_until_downgrade_present"] = True
+            diagnostics["errors"].append({"module": "navigation", "error_type": "ProbeError", "error": "module origin unavailable; cannot inspect contract"})
+    except Exception as exc:
+        diagnostics["errors"].append({"module": "navigation", "error_type": type(exc).__name__, "error": str(exc)[:300]})
+        diagnostics["primary_wait_until_downgrade_present"] = True
+    ok = (
+        diagnostics["browser_module"]
+        and diagnostics["navigation_module"]
+        and diagnostics["browser_probe_mode"] in ("source", "code_consts")
+        and diagnostics["navigation_probe_mode"] in ("source", "code_consts")
+        and diagnostics["page_create_floor_present"]
+        and diagnostics["page_create_ceiling_present"]
+        and diagnostics["page_create_ratio_present"]
+        and diagnostics["late_page_wait_floor_present"]
+        and diagnostics["wait_for_late_page_self_pages_present"]
+        and not diagnostics["primary_wait_until_downgrade_present"]
+        and not diagnostics["errors"]
+    )
+    diagnostics["ok"] = ok
+    return diagnostics
+
+
 def _run_contract_check():
+    launch_budget = _aida_launch_budget_contract_probe()
+    probe_log = []
+    browser_mode = launch_budget.get("browser_probe_mode", "")
+    navigation_mode = launch_budget.get("navigation_probe_mode", "")
+    probe_log.append(f"browser_probe_mode={browser_mode or 'missing'}")
+    probe_log.append(f"navigation_probe_mode={navigation_mode or 'missing'}")
+    browser_details = launch_budget.get("browser_probe_details") or {}
+    for key in ("floor", "ceiling", "ratio", "late_page", "self_pages"):
+        entry = browser_details.get(key)
+        if isinstance(entry, (tuple, list)) and len(entry) == 2:
+            probe_log.append(f"browser_{key}={entry[0]}:{entry[1]}")
+    nav_details = launch_budget.get("navigation_probe_details") or {}
+    nav_resolver = nav_details.get("resolver")
+    if isinstance(nav_resolver, (tuple, list)) and len(nav_resolver) == 2:
+        probe_log.append(f"navigation_resolver={nav_resolver[0]}:{nav_resolver[1]}")
+    if browser_mode == "source":
+        probe_log.append(f"browser_floor={'pass' if launch_budget.get('page_create_floor_present') else 'fail'}")
+        probe_log.append(f"browser_ceiling={'pass' if launch_budget.get('page_create_ceiling_present') else 'fail'}")
+        probe_log.append(f"browser_ratio={'pass' if launch_budget.get('page_create_ratio_present') else 'fail'}")
+        probe_log.append(f"browser_late_page={'pass' if launch_budget.get('late_page_wait_floor_present') else 'fail'}")
+        probe_log.append(f"browser_self_pages={'pass' if launch_budget.get('wait_for_late_page_self_pages_present') else 'fail'}")
+    if navigation_mode == "source":
+        probe_log.append(f"navigation_downgrade_absent={'pass' if not launch_budget.get('primary_wait_until_downgrade_present', True) else 'fail'}")
+    for err in (launch_budget.get("errors") or []):
+        if isinstance(err, dict):
+            probe_log.append(f"error[{err.get('module','?')}]={err.get('error_type','?')}:{err.get('error','')}")
     payload = {
         "source": "launcher_static",
-        "ok": True,
+        "ok": bool(launch_budget.get("ok")),
         "params": ["request_id", "page_id", "marker"],
         "has_marker_constant": True,
         "contract": AIDA_INITIATOR_CONTRACT_V2,
         "required_params": ["request_id", "page_id", "marker"],
+        "launch_budget_contract": launch_budget,
+        "launch_budget_contract_ok": bool(launch_budget.get("ok")),
+        "page_create_floor_present": bool(launch_budget.get("page_create_floor_present")),
+        "page_create_ceiling_present": bool(launch_budget.get("page_create_ceiling_present")),
+        "page_create_ratio_present": bool(launch_budget.get("page_create_ratio_present")),
+        "late_page_wait_floor_present": bool(launch_budget.get("late_page_wait_floor_present")),
+        "primary_wait_until_downgrade_absent": not bool(launch_budget.get("primary_wait_until_downgrade_present", True)),
+        "wait_for_late_page_self_pages_present": bool(launch_budget.get("wait_for_late_page_self_pages_present")),
+        "probe_log": probe_log,
     }
+    for line in probe_log:
+        print(f"AIDA_CONTRACT_PROBE {line}", file=sys.stderr, flush=True)
+    if not payload["ok"]:
+        print(
+            f"AIDA_CONTRACT_PROBE result=fail browser_mode={browser_mode or 'missing'} navigation_mode={navigation_mode or 'missing'} errors={len(launch_budget.get('errors') or [])}",
+            file=sys.stderr,
+            flush=True,
+        )
+    else:
+        print("AIDA_CONTRACT_PROBE result=pass", file=sys.stderr, flush=True)
     print(json.dumps(payload, sort_keys=True, separators=(",", ":")), flush=True)
-    return 0
+    return 0 if payload["ok"] else 4
 
 
 def _env_truthy(name):

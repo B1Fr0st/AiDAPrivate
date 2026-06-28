@@ -3736,19 +3736,38 @@ tool_result_t driver_detect_integrity_checks(const json& params)
         nullptr
     };
 
+    int critical_export_count_entry = 0;
+    for (int idx = 0; critical_exports[idx]; ++idx)
+        ++critical_export_count_entry;
+    diag::log_tagged_critical_fmt("drv_tools",
+        "INTEGRITY_SCAN_ENTER ntoskrnl_base=0x%llX critical_export_count=%d session_key_present=%d device_pid=%u kernel_dtb=0x%llX",
+        static_cast<unsigned long long>(ntos_base),
+        critical_export_count_entry,
+        device->has_server_seed() ? 1 : 0,
+        device->get_process_id(),
+        static_cast<unsigned long long>(device->get_kernel_dtb()));
+
     json hooks = json::array();
     json clean = json::array();
     int checked = 0;
+    const ULONGLONG scan_entry_tick = GetTickCount64();
 
     for (int fi = 0; critical_exports[fi]; ++fi)
     {
         std::uint64_t fn = device->resolve_export(ntos_base, critical_exports[fi]);
-        if (fn == 0) continue;
+        if (fn == 0) {
+            diag::log_tagged_fmt("drv_tools",
+                "INTEGRITY_SCAN_EXPORT name=%s va=0x0 first8=0x0 classification=resolve_failed",
+                critical_exports[fi]);
+            continue;
+        }
         ++checked;
 
 
         std::uint8_t bytes[16] = {};
         device->read_kernel_raw(fn, bytes, 16);
+        std::uint64_t first8 = 0;
+        std::memcpy(&first8, bytes, sizeof(first8));
 
         std::string hook_type;
         std::uint64_t hook_target = 0;
@@ -3779,6 +3798,12 @@ tool_result_t driver_detect_integrity_checks(const json& params)
             hook_type = "int3_breakpoint";
         }
 
+        diag::log_tagged_fmt("drv_tools",
+            "INTEGRITY_SCAN_EXPORT name=%s va=0x%llX first8=0x%llX classification=%s",
+            critical_exports[fi],
+            static_cast<unsigned long long>(fn),
+            static_cast<unsigned long long>(first8),
+            hook_type.empty() ? "clean" : hook_type.c_str());
         if (!hook_type.empty())
         {
             json h;
@@ -3821,9 +3846,43 @@ tool_result_t driver_detect_integrity_checks(const json& params)
     const std::size_t clean_count = clean.size();
     const bool integrity_scan_ran = checked > 0;
     const bool zero_hooks_clean = integrity_scan_ran && hook_count == 0 && clean_count == static_cast<std::size_t>(checked);
+    int critical_export_count = 0;
+    for (int idx = 0; critical_exports[idx]; ++idx)
+        ++critical_export_count;
+    const ULONGLONG scan_elapsed_us = (GetTickCount64() - scan_entry_tick) * 1000ULL;
+    diag::log_tagged_critical_fmt("drv_tools",
+        "INTEGRITY_SCAN_EXIT functions_scanned=%d hooks_found=%zu status=0x%08lX elapsed_us=%llu critical_export_count=%d ntoskrnl_base=0x%llX",
+        checked,
+        hook_count,
+        static_cast<unsigned long>(integrity_scan_ran ? 0u : 0xC0000001u),
+        static_cast<unsigned long long>(scan_elapsed_us),
+        critical_export_count,
+        static_cast<unsigned long long>(ntos_base));
+    diag::log_tagged_critical_fmt("drv_tools",
+        "driver_detect_integrity_checks_done ntos_base=0x%llX critical_export_count=%d functions_scanned=%d hooks_found=%zu clean_count=%zu scan_ran=%d zero_hooks_clean=%d",
+        static_cast<unsigned long long>(ntos_base),
+        critical_export_count,
+        checked,
+        hook_count,
+        clean_count,
+        integrity_scan_ran ? 1 : 0,
+        zero_hooks_clean ? 1 : 0);
+    if (!integrity_scan_ran) {
+        json failure;
+        failure["ntoskrnl_base"]            = sa_format_address(static_cast<uint64_t>(ntos_base));
+        failure["functions_scanned"]        = checked;
+        failure["critical_export_count"]    = critical_export_count;
+        failure["hooks_found"]              = hook_count;
+        failure["scan_ran"]                 = false;
+        failure["module_base_diagnostics"]  = kernel_module_query_diagnostics_json(query_diag);
+        failure["reason"]                   = OBFSTR("kernel_scanner_did_not_run: zero critical exports resolved");
+        return tool_result_t::error(OBFSTR("driver_detect_integrity_checks: kernel scanner returned 0 functions_scanned (scanner did not run)"), failure);
+    }
     json result;
     result["ntoskrnl_base"]     = sa_format_address(static_cast<uint64_t>(ntos_base));
     result["functions_checked"] = checked;
+    result["functions_scanned"] = checked;
+    result["critical_export_count"] = critical_export_count;
     result["hooks_found"]       = hook_count;
     result["scan_ran"]          = integrity_scan_ran;
     result["clean_state"]       = zero_hooks_clean;

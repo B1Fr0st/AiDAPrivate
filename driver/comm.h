@@ -9,6 +9,10 @@
 #include <string_view>
 #include <memory>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <functional>
+#include <mutex>
 #include <shared_mutex>
 #include <type_traits>
 #include <string>
@@ -1496,6 +1500,129 @@ namespace voyager {
 #pragma pack(pop)
     }
 
+    namespace detail {
+        class writer_priority_shared_mutex {
+        public:
+            writer_priority_shared_mutex() = default;
+            writer_priority_shared_mutex(const writer_priority_shared_mutex&) = delete;
+            writer_priority_shared_mutex& operator=(const writer_priority_shared_mutex&) = delete;
+            writer_priority_shared_mutex(writer_priority_shared_mutex&&) = delete;
+            writer_priority_shared_mutex& operator=(writer_priority_shared_mutex&&) = delete;
+
+            void lock_shared() noexcept {
+                std::unique_lock<std::mutex> lk(mtx_);
+                cv_.wait(lk, [&] { return waiting_writers_ == 0 && !writer_owned_; });
+                ++active_readers_;
+            }
+
+            bool try_lock_shared() noexcept {
+                std::unique_lock<std::mutex> lk(mtx_, std::try_to_lock);
+                if (!lk.owns_lock())
+                    return false;
+                if (waiting_writers_ != 0 || writer_owned_)
+                    return false;
+                ++active_readers_;
+                return true;
+            }
+
+            template <typename Rep, typename Period>
+            bool try_lock_shared_for(const std::chrono::duration<Rep, Period>& dur) noexcept {
+                return try_lock_shared_until(std::chrono::steady_clock::now() + dur);
+            }
+
+            template <typename Clock, typename Duration>
+            bool try_lock_shared_until(const std::chrono::time_point<Clock, Duration>& deadline) noexcept {
+                std::unique_lock<std::mutex> lk(mtx_);
+                if (!cv_.wait_until(lk, deadline, [&] { return waiting_writers_ == 0 && !writer_owned_; }))
+                    return false;
+                ++active_readers_;
+                return true;
+            }
+
+            void unlock_shared() noexcept {
+                std::unique_lock<std::mutex> lk(mtx_);
+                if (active_readers_ > 0)
+                    --active_readers_;
+                const bool notify = active_readers_ == 0 && waiting_writers_ > 0;
+                lk.unlock();
+                if (notify)
+                    cv_.notify_all();
+            }
+
+            void lock() noexcept {
+                std::unique_lock<std::mutex> lk(mtx_);
+                ++waiting_writers_;
+                cv_.wait(lk, [&] { return active_readers_ == 0 && !writer_owned_; });
+                writer_owned_ = true;
+                --waiting_writers_;
+            }
+
+            bool try_lock() noexcept {
+                std::unique_lock<std::mutex> lk(mtx_, std::try_to_lock);
+                if (!lk.owns_lock())
+                    return false;
+                if (active_readers_ != 0 || writer_owned_)
+                    return false;
+                writer_owned_ = true;
+                return true;
+            }
+
+            template <typename Rep, typename Period>
+            bool try_lock_for(const std::chrono::duration<Rep, Period>& dur) noexcept {
+                return try_lock_until(std::chrono::steady_clock::now() + dur);
+            }
+
+            template <typename Clock, typename Duration>
+            bool try_lock_until(const std::chrono::time_point<Clock, Duration>& deadline) noexcept {
+                std::unique_lock<std::mutex> lk(mtx_);
+                ++waiting_writers_;
+                const bool acquired = cv_.wait_until(lk, deadline, [&] { return active_readers_ == 0 && !writer_owned_; });
+                if (!acquired) {
+                    --waiting_writers_;
+                    const bool notify_readers = active_readers_ == 0 && waiting_writers_ == 0 && !writer_owned_;
+                    lk.unlock();
+                    if (notify_readers)
+                        cv_.notify_all();
+                    return false;
+                }
+                writer_owned_ = true;
+                --waiting_writers_;
+                return true;
+            }
+
+            void unlock() noexcept {
+                std::unique_lock<std::mutex> lk(mtx_);
+                writer_owned_ = false;
+                lk.unlock();
+                cv_.notify_all();
+            }
+
+            std::uint32_t get_waiting_writers() const noexcept {
+                std::lock_guard<std::mutex> lk(mtx_);
+                return waiting_writers_;
+            }
+
+            std::uint32_t get_active_readers() const noexcept {
+                std::lock_guard<std::mutex> lk(mtx_);
+                return active_readers_;
+            }
+
+            bool is_writer_owned() const noexcept {
+                std::lock_guard<std::mutex> lk(mtx_);
+                return writer_owned_;
+            }
+
+        private:
+            mutable std::mutex mtx_;
+            std::condition_variable_any cv_;
+            std::uint32_t active_readers_ = 0;
+            std::uint32_t waiting_writers_ = 0;
+            bool writer_owned_ = false;
+        };
+
+        using session_relay_cache_provider_t = bool (*)(std::uint32_t* out_token_hash, std::uint64_t* out_server_nonce);
+    }
+
     namespace device_names_um {
         static const wchar_t* const g_device_bases[] = {
             L"RdpRefMp",
@@ -2261,11 +2388,43 @@ namespace voyager {
         [[nodiscard]] bool has_server_ioctl_seed() const noexcept { return server_ioctl_seed_ != 0; }
         [[nodiscard]] std::uint32_t get_server_ioctl_seed_hash() const noexcept { return server_ioctl_seed_ != 0 ? hash_build_key(server_ioctl_seed_) : 0; }
         [[nodiscard]] bool session_invalidated() const noexcept;
+        [[nodiscard]] bool is_dynamic_session_seeded() const noexcept {
+            return server_seed_ != 0 && server_ioctl_seed_ != 0 &&
+                   dynamic_key::g_server_seed != 0 && ioctl_codes::g_server_ioctl_seed != 0;
+        }
+        void set_session_relay_cache_provider(detail::session_relay_cache_provider_t cb) noexcept {
+            session_relay_cache_provider_.store(cb, std::memory_order_release);
+        }
+        [[nodiscard]] detail::session_relay_cache_provider_t get_session_relay_cache_provider() const noexcept {
+            return session_relay_cache_provider_.load(std::memory_order_acquire);
+        }
+        [[nodiscard]] std::uint32_t get_seed_rotation_waiting_writers() const noexcept {
+            return seed_rotation_mtx_.get_waiting_writers();
+        }
+        [[nodiscard]] std::uint32_t get_seed_rotation_active_readers() const noexcept {
+            return seed_rotation_mtx_.get_active_readers();
+        }
+        [[nodiscard]] std::uint32_t get_shared_send_request_inflight_count() const noexcept {
+            return shared_send_request_inflight_count_.load(std::memory_order_acquire);
+        }
+        [[nodiscard]] std::uint32_t get_seed_rotation_writer_acquiring() const noexcept {
+            return seed_rotation_writer_acquiring_.load(std::memory_order_acquire);
+        }
+        [[nodiscard]] bool is_session_pending_recovery() const noexcept {
+            return session_pending_recovery_.load(std::memory_order_acquire) != 0;
+        }
+        [[nodiscard]] std::uint32_t get_shared_lock_oldest_holder_tid() const noexcept {
+            return shared_lock_oldest_holder_tid_.load(std::memory_order_acquire);
+        }
+        bool force_post_desync_relay_v2(DWORD* out_error = nullptr) noexcept;
 
         void set_process_id(std::uint32_t pid) noexcept;
         void set_base_address(std::uint64_t base) noexcept { base_address_ = base; }
         void set_dtb(std::uint64_t dtb) noexcept { dtb_ = dtb; }
         void set_kernel_dtb(std::uint64_t dtb) noexcept { kernel_dtb_ = dtb; }
+        [[nodiscard]] std::uint64_t get_shellcode_address_diag() const noexcept { return shellcode_address_; }
+        [[nodiscard]] std::uint32_t get_shellcode_pid_diag() const noexcept { return shellcode_pid_; }
+        [[nodiscard]] std::uint64_t get_shellcode_dtb_at_alloc_diag() const noexcept { return shellcode_dtb_at_alloc_; }
         void sync_dynamic_security_state() const noexcept {
             if (dynamic_key::g_server_seed != server_seed_) {
                 dynamic_key::g_server_seed = server_seed_;
@@ -2314,19 +2473,41 @@ namespace voyager {
         mutable std::uint32_t last_heartbeat_global_ioctl_seed_present_ = 0;
         mutable std::uint32_t last_heartbeat_offset_ = 0;
         mutable detail::raw_ioctl_telemetry last_raw_ioctl_{};
-        mutable std::shared_mutex seed_rotation_mtx_;
+        mutable detail::writer_priority_shared_mutex seed_rotation_mtx_;
         mutable std::atomic<void*> inflight_capture_thread_{nullptr};
         mutable std::atomic<bool> inflight_capture_cancel_pending_{false};
 
 
         std::uint64_t ntdll_base_ = 0;
         std::uint64_t ntdll_size_ = 0;
-        mutable std::atomic<std::uint32_t> seed_rotation_writer_waiters_{0};
+        mutable std::atomic<std::uint32_t> server_token_relay_priority_request_{0};
+        mutable std::atomic<std::uint32_t> server_token_relay_priority_yields_observed_{0};
+        mutable std::atomic<std::uint32_t> last_acquiring_reader_tid_{0};
+        mutable std::atomic<std::uint32_t> last_acquiring_reader_ioctl_{0};
+        mutable std::atomic<std::uint64_t> last_acquiring_reader_tsc_{0};
+        mutable std::atomic<std::uint64_t> relay_v2_attempts_{0};
+        mutable std::atomic<std::uint64_t> relay_v2_commits_{0};
+        mutable std::atomic<std::uint64_t> relay_v2_writer_timeouts_{0};
+        mutable std::atomic<std::uint64_t> relay_v2_last_attempt_tick_{0};
+        mutable std::atomic<std::uint64_t> relay_v2_last_commit_tick_{0};
+        mutable std::atomic<std::uint64_t> relay_v2_last_writer_timeout_tick_{0};
+        mutable std::atomic<std::uint32_t> seed_rotation_writer_acquiring_{0};
+        mutable std::atomic<std::uint32_t> shared_send_request_inflight_count_{0};
+        mutable std::atomic<std::uint32_t> shared_lock_oldest_holder_tid_{0};
+        mutable std::atomic<std::uint64_t> shared_lock_oldest_holder_acquired_tsc_{0};
+        mutable std::atomic<std::uint32_t> session_pending_recovery_{0};
+        mutable std::atomic<std::uint64_t> session_pending_recovery_since_tick_{0};
+        mutable std::atomic<detail::session_relay_cache_provider_t> session_relay_cache_provider_{nullptr};
+        std::uint32_t shellcode_pid_ = 0;
+        std::uint64_t shellcode_dtb_at_alloc_ = 0;
 
         bool send_request(DWORD control_code, void* input, DWORD input_size) const noexcept;
         bool send_request_in_lock(DWORD control_code, void* input, DWORD input_size,
                                   bool predecoded_dynamic_offset_valid = false,
                                   std::uint32_t predecoded_dynamic_offset = 0) const noexcept;
+        bool force_post_desync_relay_v2_locked(DWORD* out_error) noexcept;
+        void maybe_emit_relay_v2_cadence_summary() const noexcept;
+        void record_reader_acquired_for_diag(DWORD control_code) const noexcept;
         bool send_poll_request(void* input, DWORD input_size, std::uint64_t call_id, int iteration) const noexcept;
         bool force_heartbeat() const noexcept;
         std::size_t transfer_physical_read(std::uint32_t pid, std::uint64_t dtb, std::uint64_t address,
@@ -2344,11 +2525,35 @@ namespace voyager {
 #pragma warning(push)
 #pragma warning(disable: 4485 4647 4623 4624 4625 4626)
         static_assert(offsetof(device_t, inflight_capture_thread_)
-                      < offsetof(device_t, seed_rotation_writer_waiters_),
-                      "inflight_capture_thread_ must precede seed_rotation_writer_waiters_ to prevent handle/counter aliasing across stale TUs");
+                      < offsetof(device_t, server_token_relay_priority_request_),
+                      "inflight_capture_thread_ must precede server_token_relay_priority_request_ to prevent handle/counter aliasing across stale TUs");
         static_assert(offsetof(device_t, inflight_capture_cancel_pending_)
-                      < offsetof(device_t, seed_rotation_writer_waiters_),
-                      "inflight_capture_cancel_pending_ must precede seed_rotation_writer_waiters_ to prevent layout aliasing across stale TUs");
+                      < offsetof(device_t, server_token_relay_priority_request_),
+                      "inflight_capture_cancel_pending_ must precede server_token_relay_priority_request_ to prevent layout aliasing across stale TUs");
+        static_assert(offsetof(device_t, server_token_relay_priority_request_)
+                      < offsetof(device_t, server_token_relay_priority_yields_observed_),
+                      "server_token_relay_priority_request_ must precede server_token_relay_priority_yields_observed_ to keep the relay observability slots at end-of-class");
+        static_assert(offsetof(device_t, server_token_relay_priority_yields_observed_)
+                      < offsetof(device_t, seed_rotation_writer_acquiring_),
+                      "writer-priority lock telemetry must precede the new writer-priority intent atomic");
+        static_assert(offsetof(device_t, seed_rotation_writer_acquiring_)
+                      < offsetof(device_t, shared_send_request_inflight_count_),
+                      "seed_rotation_writer_acquiring_ must precede shared_send_request_inflight_count_ for diagnostic ordering");
+        static_assert(offsetof(device_t, shared_send_request_inflight_count_)
+                      < offsetof(device_t, shared_lock_oldest_holder_tid_),
+                      "shared_send_request_inflight_count_ must precede shared_lock_oldest_holder_tid_ for diagnostic ordering");
+        static_assert(offsetof(device_t, shared_lock_oldest_holder_tid_)
+                      < offsetof(device_t, session_pending_recovery_),
+                      "shared_lock_oldest_holder_tid_ must precede session_pending_recovery_ for diagnostic ordering");
+        static_assert(offsetof(device_t, session_pending_recovery_)
+                      < offsetof(device_t, session_relay_cache_provider_),
+                      "session_pending_recovery_ must precede the session relay cache provider hook so the pending-recovery gate is below the late-bound provider pointer");
+        static_assert(offsetof(device_t, shellcode_address_) < offsetof(device_t, shellcode_pid_),
+                      "shellcode_address_ must precede shellcode_pid_ so the PID-bind companion field is added strictly after the legacy slot");
+        static_assert(offsetof(device_t, shellcode_pid_) < offsetof(device_t, shellcode_dtb_at_alloc_),
+                      "shellcode_pid_ must precede shellcode_dtb_at_alloc_ to keep the per-PID shellcode binding ABI ordered: address, pid, dtb-at-alloc");
+        static_assert(offsetof(device_t, session_relay_cache_provider_) < offsetof(device_t, shellcode_pid_),
+                      "shellcode_pid_/shellcode_dtb_at_alloc_ must live at end-of-class to preserve the existing instance layout across stale TUs");
 #pragma warning(pop)
     };
 
@@ -2368,6 +2573,12 @@ namespace voyager {
         static_assert(std::is_trivially_copyable_v<T>, "T must be trivially copyable for memory operations");
         write_raw(address, &value, sizeof(T));
     }
+
+    using kernel_demote_detected_callback_t = void(*)(const char*);
+    void install_kernel_demote_detected_callback(kernel_demote_detected_callback_t callback) noexcept;
+
+    using send_request_success_callback_t = void(*)();
+    void install_send_request_success_callback(send_request_success_callback_t callback) noexcept;
 }
 
 inline std::unique_ptr<voyager::device_t> device = std::make_unique<voyager::device_t>();

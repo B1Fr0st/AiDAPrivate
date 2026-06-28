@@ -752,13 +752,35 @@ static void ensure_pdb_event_subscriptions() {
 }
 
 static void on_attach_state_changed() {
-    xref_index::on_attach_changed();
-    function_index::on_attach_changed();
-    symbol_classifier::on_attach_changed();
     s_visible_warm_last_ns.store(0, std::memory_order_release);
     s_format_gen.fetch_add(1u, std::memory_order_release);
     instr_cache_clear_all();
     throttle_arm(120);
+
+    const auto wq_stats = work_queue::stats();
+    diag::log_tagged_critical_fmt("disasm_view",
+        "on_attach_state_changed_deferred work_pending_before=%zu work_active=%u",
+        wq_stats.pending,
+        wq_stats.active);
+    const bool posted = work_queue::post_labeled("disasm_view.on_attach_state_changed", []() {
+        diag::log_tagged_critical_fmt("disasm_view",
+            "on_attach_state_changed_worker_enter tid=%lu",
+            static_cast<unsigned long>(GetCurrentThreadId()));
+        xref_index::on_attach_changed();
+        function_index::on_attach_changed();
+        symbol_classifier::on_attach_changed();
+        diag::log_tagged_critical_fmt("disasm_view",
+            "on_attach_state_changed_worker_exit tid=%lu",
+            static_cast<unsigned long>(GetCurrentThreadId()));
+    });
+    if (!posted) {
+        diag::log_tagged_critical_fmt("disasm_view",
+            "on_attach_state_changed_post_failed fallback=inline tid=%lu",
+            static_cast<unsigned long>(GetCurrentThreadId()));
+        xref_index::on_attach_changed();
+        function_index::on_attach_changed();
+        symbol_classifier::on_attach_changed();
+    }
 }
 
 enum class layout_row_kind_t : int {
@@ -1238,14 +1260,36 @@ static void init_undecorate() {
     });
 }
 
+static std::atomic<uint64_t> s_demangle_quarantine_declines{0};
+
 static bool demangle_msvc(const std::string& mangled, std::string& out_pretty) {
     out_pretty.clear();
     if (mangled.empty()) return false;
     if (mangled[0] != '?' && mangled.compare(0, 2, "_?") != 0) return false;
+    if (pdb_parser::dbghelp_is_quarantined()) {
+        const uint64_t prev = s_demangle_quarantine_declines.fetch_add(1, std::memory_order_acq_rel);
+        if ((prev % 100ULL) == 0ULL) {
+            char sample[33] = {};
+            const size_t copy_n = mangled.size() < sizeof(sample) - 1 ? mangled.size() : sizeof(sample) - 1;
+            if (copy_n > 0) std::memcpy(sample, mangled.data(), copy_n);
+            sample[copy_n] = '\0';
+            diag::log_tagged_critical_fmt("disasm_view",
+                "demangle_msvc_quarantine_decline calls=%llu sample_input='%s'",
+                static_cast<unsigned long long>(prev + 1ULL),
+                sample);
+        }
+        return false;
+    }
     init_undecorate();
     if (!s_pfn_undecorate) return false;
-    std::unique_lock<std::mutex> dbghelp_lk(pdb_parser::g_dbghelp_call_mutex, std::try_to_lock);
-    if (!dbghelp_lk.owns_lock()) return false;
+    const uint64_t demangle_generation = static_cast<uint64_t>(GetCurrentThreadId()) |
+        (static_cast<uint64_t>(GetTickCount64()) << 32);
+    if (!pdb_parser::dbghelp_call_gate_try_acquire_nonblocking(demangle_generation, GetCurrentThreadId()))
+        return false;
+    struct demangle_gate_release_t {
+        uint64_t gen;
+        ~demangle_gate_release_t() { pdb_parser::dbghelp_call_gate_release(gen); }
+    } demangle_gate_release{demangle_generation};
     constexpr DWORD UNDNAME_COMPLETE = 0x0000;
     constexpr DWORD UNDNAME_NO_LEADING_UNDERSCORES = 0x0001;
     constexpr DWORD UNDNAME_NO_MS_KEYWORDS = 0x0002;
@@ -3278,12 +3322,24 @@ static bool try_instant_xref_lookup(uint64_t addr, uint64_t func_start)
     auto append_entries = [&](const std::vector<xref_index::annotation_t>& anns,
                               std::vector<xref_popup_entry_t>& out)
     {
+        const uint32_t attached_pid_snapshot = driver_bridge::attached_pid();
+        const bool dyn_ready_snapshot = driver_bridge::dynamic_ioctls_ready();
+        const bool session_available_snapshot = driver_bridge::kernel_session_available();
+        const bool kernel_path_ready = attached_pid_snapshot != 0 && dyn_ready_snapshot && session_available_snapshot;
+        if (!kernel_path_ready && attached_pid_snapshot != 0) {
+            diag::log_tagged_critical_fmt("disasm_view",
+                "instant_xref_kernel_path_skipped reason=session_demoted attached_pid=%u dyn_ready=%d session_available=%d entries=%zu",
+                attached_pid_snapshot,
+                dyn_ready_snapshot ? 1 : 0,
+                session_available_snapshot ? 1 : 0,
+                anns.size());
+        }
         for (const auto& ann : anns) {
             if (ann.source_addr == 0) continue;
 
             std::vector<uint8_t> bytes;
             bool got = false;
-            if (driver_bridge::attached_pid() != 0) {
+            if (kernel_path_ready) {
                 got = driver_bridge::read_memory(ann.source_addr, 16, bytes);
             }
             if (!got) {

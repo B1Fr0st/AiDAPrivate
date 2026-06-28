@@ -107,6 +107,52 @@ namespace {
         failed.fetch_add(1);
     }
 
+    static long long elapsed_us_since(std::chrono::steady_clock::time_point t0) {
+        return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+    }
+
+    static const char* network_sub_tab_label(network_view::sub_tab_t tab) {
+        switch (tab) {
+        case network_view::sub_tab_t::connections: return "connections";
+        case network_view::sub_tab_t::capture: return "capture";
+        case network_view::sub_tab_t::intercept: return "intercept";
+        case network_view::sub_tab_t::proxy: return "proxy";
+        case network_view::sub_tab_t::dns: return "dns";
+        case network_view::sub_tab_t::filters: return "filters";
+        case network_view::sub_tab_t::bandwidth: return "bandwidth";
+        case network_view::sub_tab_t::repeater: return "repeater";
+        case network_view::sub_tab_t::keylog: return "keylog";
+        case network_view::sub_tab_t::pcap_export: return "pcap_export";
+        case network_view::sub_tab_t::fuzzer: return "fuzzer";
+        case network_view::sub_tab_t::websocket: return "websocket";
+        case network_view::sub_tab_t::scripting: return "scripting";
+        case network_view::sub_tab_t::decoder: return "decoder";
+        case network_view::sub_tab_t::sitemap: return "sitemap";
+        case network_view::sub_tab_t::scope: return "scope";
+        case network_view::sub_tab_t::cookies: return "cookies";
+        case network_view::sub_tab_t::scanner: return "scanner";
+        case network_view::sub_tab_t::recon: return "recon";
+        case network_view::sub_tab_t::intruder: return "intruder";
+        case network_view::sub_tab_t::collab: return "collab";
+        case network_view::sub_tab_t::sequencer: return "sequencer";
+        case network_view::sub_tab_t::comparer: return "comparer";
+        case network_view::sub_tab_t::jwt: return "jwt";
+        case network_view::sub_tab_t::mr: return "mr";
+        case network_view::sub_tab_t::session: return "session";
+        case network_view::sub_tab_t::api: return "api";
+        case network_view::sub_tab_t::ws_edit: return "ws_edit";
+        case network_view::sub_tab_t::h2_edit: return "h2_edit";
+        case network_view::sub_tab_t::logger: return "logger";
+        case network_view::sub_tab_t::csp: return "csp";
+        case network_view::sub_tab_t::upstream: return "upstream";
+        case network_view::sub_tab_t::browser: return "browser";
+        case network_view::sub_tab_t::reports: return "reports";
+        case network_view::sub_tab_t::headless: return "headless";
+        case network_view::sub_tab_t::COUNT: break;
+        }
+        return "";
+    }
+
     const char* camoufox_install_state_name(aida::burp::camoufox::install::install_state_t state) {
         using state_t = aida::burp::camoufox::install::install_state_t;
         switch (state) {
@@ -4966,12 +5012,33 @@ namespace {
 
     static void select_network_tab(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed,
                                    const char* tag, network_view::sub_tab_t value) {
+        auto t0 = std::chrono::steady_clock::now();
+        const network_view::sub_tab_t before = network_view::g_state.active_tab;
+        const char* before_label = network_sub_tab_label(before);
+        const char* target_label = network_sub_tab_label(value);
+        log_msg(hf, tag, "STATE -- before=%d label=%s target=%d target_label=%s tid=%lu",
+            static_cast<int>(before),
+            before_label,
+            static_cast<int>(value),
+            target_label,
+            (unsigned long)GetCurrentThreadId());
         network_view::g_state.active_tab = value;
-        if (network_view::g_state.active_tab == value) {
-            log_msg(hf, tag, "PASS -- network active_tab selected (%d)", static_cast<int>(value));
+        const network_view::sub_tab_t got = network_view::g_state.active_tab;
+        const char* got_label = network_sub_tab_label(got);
+        long long us = elapsed_us_since(t0);
+        log_msg(hf, tag, "STATE -- after=%d label=%s changed=%d elapsed_us=%lld",
+            static_cast<int>(got),
+            got_label,
+            (before != got) ? 1 : 0,
+            us);
+        if (got == value && target_label[0] != '\0') {
+            log_msg(hf, tag, "PASS -- network sub_tab selected and read back (%d label=%s elapsed_us=%lld)",
+                static_cast<int>(value), got_label, us);
             passed.fetch_add(1);
         } else {
-            log_msg(hf, tag, "FAIL -- network active_tab not selected (%d)", static_cast<int>(value));
+            log_msg(hf, tag, "FAIL -- network sub_tab set %d (%s) but read back %d (%s) elapsed_us=%lld",
+                static_cast<int>(value), target_label,
+                static_cast<int>(got), got_label, us);
             failed.fetch_add(1);
         }
     }

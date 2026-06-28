@@ -609,10 +609,11 @@ struct integrity_sidecar_probe_t {
     long long elapsed_ms = 0;
 };
 
-static integrity_sidecar_probe_t probe_integrity_sidecar_remote_call(HANDLE hf, const char* tag, uint32_t pid) {
+static integrity_sidecar_probe_t probe_integrity_sidecar_remote_call(HANDLE hf, const char* tag, uint32_t pid, int attempts = 1) {
     integrity_sidecar_probe_t out;
     auto t0 = std::chrono::steady_clock::now();
     const char* modules[] = { "kernel32.dll", "kernelbase.dll" };
+    const uint32_t probe_timeout_ms = (attempts <= 1) ? 4500u : 2500u;
     for (const char* module_name : modules) {
         system_export_resolution_t resolved = resolve_attached_system_export(hf, tag, pid, module_name, "GetCurrentProcessId");
         if (resolved.address == 0) {
@@ -621,7 +622,7 @@ static integrity_sidecar_probe_t probe_integrity_sidecar_remote_call(HANDLE hf, 
             continue;
         }
         SetLastError(ERROR_SUCCESS);
-        const uint64_t result = page_guard_engine::remote_thread_call(pid, resolved.address, 0, 0, 0, 0, 2500, "testlab_integrity_sidecar_GetCurrentProcessId");
+        const uint64_t result = page_guard_engine::remote_thread_call(pid, resolved.address, 0, 0, 0, 0, probe_timeout_ms, "testlab_integrity_sidecar_GetCurrentProcessId");
         const auto remote_diag = page_guard_engine::last_driver_remote_call_diag();
         const auto lower_diag = driver_bridge::last_remote_call_execution_diag();
         const DWORD gle = result == static_cast<uint64_t>(pid) ? ERROR_SUCCESS : GetLastError();
@@ -875,7 +876,7 @@ static bool wait_integrity_hunter_sidecar_ready(HANDLE hf, const char* tag, cons
         const uint64_t kernelbase_base = selected ? remote_module_base_ci(sidecar.pid, "kernelbase") : 0;
         const DWORD elapsed = GetTickCount() - started;
         if (selected && bridge_alive && ntdll_base != 0 && kernel32_base != 0) {
-            integrity_sidecar_probe_t probe = probe_integrity_sidecar_remote_call(hf, tag, sidecar.pid);
+            integrity_sidecar_probe_t probe = probe_integrity_sidecar_remote_call(hf, tag, sidecar.pid, attempts);
             if (probe.ok) {
                 log_msg(hf, tag, "SIDE-FIXTURE-READY -- pid=%lu attempts=%d active=%u ntdll=0x%016llX kernel32=0x%016llX kernelbase=0x%016llX probe_module=%s probe_fn=0x%016llX probe_result=0x%016llX remote_call_id=%llu remote_execution_completed=%d lower_phase=%s lower_reason=%s lower_completed=%d lower_ok=%d lower_gle=%lu lower_queue_depth_submit=%u lower_inflight_after=%u bridge_code=0x%08X elapsed_ms=%lu probe_elapsed_ms=%lld",
                     static_cast<unsigned long>(sidecar.pid),
@@ -971,7 +972,8 @@ static bool wait_integrity_hunter_sidecar_ready(HANDLE hf, const char* tag, cons
                 driver_bridge::last_error().c_str());
             return false;
         }
-        Sleep(100);
+        const bool latch_set = driver_bridge::lower_remote_call_last_abandoned();
+        Sleep(latch_set ? 300 : 100);
     }
 }
 

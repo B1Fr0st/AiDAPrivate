@@ -380,6 +380,29 @@ NTSTATUS functions::handle777e(p_physical_rw request) {
                 (ULONG)walk.level,
                 walk.physical,
                 mem_guard::elapsed_us(start, freq));
+
+            const UINT64 requestor_dtb = caller_validation::g_client_cr3 & ~0xFFFULL;
+            const UINT64 requestor_pid_value = (UINT64)(ULONG_PTR)caller_validation::g_registered_client_pid;
+            mem_guard::page_walk_diag_t requestor_walk{};
+            UINT64 requestor_physical = 0;
+            if (requestor_dtb != 0 && requestor_dtb != process_dir_base) {
+                requestor_walk = mem_guard::capture_page_walk(requestor_dtb, current_virtual_address);
+                requestor_physical = requestor_walk.physical;
+            }
+            WW_LOG("PHYS_RW_CROSS_PID_PROBE pid=%lu dtb=0x%llx va=0x%llx requestor_pid=%llu requestor_dtb=0x%llx requestor_walk_present=%u requestor_walk_level=%lu requestor_walk_pa=0x%llx requestor_pml4_ok=%u requestor_pdpt_ok=%u requestor_pde_ok=%u requestor_pte_ok=%u distinct_dtb=%u",
+                (ULONG)target_pid,
+                process_dir_base,
+                current_virtual_address,
+                requestor_pid_value,
+                requestor_dtb,
+                requestor_walk.present ? 1u : 0u,
+                (ULONG)requestor_walk.level,
+                requestor_physical,
+                requestor_walk.pml4_ok ? 1u : 0u,
+                requestor_walk.pdpt_ok ? 1u : 0u,
+                requestor_walk.pde_ok ? 1u : 0u,
+                requestor_walk.pte_ok ? 1u : 0u,
+                (requestor_dtb != 0 && requestor_dtb != process_dir_base) ? 1u : 0u);
         }
 
         if (softfault_eligible &&

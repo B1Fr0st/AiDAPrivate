@@ -12,6 +12,12 @@
 #define KeMemoryBarrier() _ReadWriteBarrier()
 #endif
 
+namespace dispatcher_rekey {
+    inline volatile LONG g_session_needs_rekey = 0;
+    inline volatile LONG64 g_session_soft_demote_qpc = 0;
+    inline volatile LONG64 g_last_rekey_required_log_qpc = 0;
+}
+
 namespace dynamic_key {
     inline volatile ULONG g_cached_key = 0;
     inline volatile ULONG g_server_seed = 0;

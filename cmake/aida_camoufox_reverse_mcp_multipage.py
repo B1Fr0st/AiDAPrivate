@@ -31,6 +31,39 @@ def replace_once(text: str, old: str, new: str, label: str) -> str:
     return text.replace(old, new, 1)
 
 
+def validate_browser_launch_budget_contract(path: pathlib.Path, text: str) -> None:
+    required_markers = (
+        "page_create_floor_s = 12.0 if fast_probe else 25.0",
+        "page_create_ceiling_s = 18.0 if fast_probe else 35.0",
+        "launch_timeout_s * (0.18 if fast_probe else 0.40)",
+        "late_page_wait_s = 1.0 if fast_probe else min(8.0, max(2.0, launch_timeout_s * 0.12))",
+        "launch_budget_allocation",
+    )
+    for marker in required_markers:
+        if marker not in text:
+            fail(f"browser launch budget contract missing {marker} in {path}")
+    forbidden_markers = (
+        "page_create_timeout_s = min(18.0, max(8.0, launch_timeout_s * (0.18 if fast_probe else 0.24)), launch_timeout_s)",
+        "late_page_wait_s = 1.0 if fast_probe else min(5.0, max(1.0, launch_timeout_s * 0.08))",
+    )
+    for marker in forbidden_markers:
+        if marker in text:
+            fail(f"browser launch budget contract regression detected ({marker}) in {path}")
+    if "async def _wait_for_late_page" not in text:
+        fail(f"browser late page contract missing _wait_for_late_page in {path}")
+    late_page_start = text.find("async def _wait_for_late_page")
+    late_page_end = text.find("\n    def ", late_page_start + 1)
+    if late_page_end < 0:
+        late_page_end = text.find("\n    async def ", late_page_start + 1)
+    if late_page_end < 0:
+        late_page_end = len(text)
+    late_page_body = text[late_page_start:late_page_end]
+    if "self.pages" not in late_page_body:
+        fail(f"browser late page contract missing self.pages reference in _wait_for_late_page in {path}")
+    if 'source="self_pages"' not in late_page_body:
+        fail(f"browser late page contract missing self_pages source tag in _wait_for_late_page in {path}")
+
+
 def replace_in_function(text: str, function_name: str, old: str, new: str, label: str) -> str:
     marker = f"async def {function_name}("
     start = text.find(marker)
@@ -1770,6 +1803,7 @@ def patch_browser(path: pathlib.Path) -> None:
         updated = patch_browser_pending_activation(updated)
         updated = patch_browser_new_page_diagnostics(updated)
         updated = patch_browser_debug_helper(updated)
+        validate_browser_launch_budget_contract(path, updated)
         if updated != text:
             write_text(path, updated)
         return
@@ -1823,6 +1857,7 @@ def patch_browser(path: pathlib.Path) -> None:
         updated = patch_browser_pending_activation(updated)
         updated = patch_browser_new_page_diagnostics(updated)
         updated = patch_browser_debug_helper(updated)
+        validate_browser_launch_budget_contract(path, updated)
         if updated != text:
             write_text(path, updated)
         return
@@ -1896,6 +1931,7 @@ def patch_browser(path: pathlib.Path) -> None:
         updated = patch_browser_pending_activation(updated)
         updated = patch_browser_new_page_diagnostics(updated)
         updated = patch_browser_debug_helper(updated)
+        validate_browser_launch_budget_contract(path, updated)
         write_text(path, updated)
         return
     text = replace_once(
@@ -2419,6 +2455,7 @@ def patch_browser(path: pathlib.Path) -> None:
     for marker in ("self._aida_multipage_patch = 4", "async def list_pages", "async def resolve_page", "page_id", "active_page_id", "_pending_page_ids_by_context", "page_privacy_verified", "def _mark_page_terminal", "AIDA_CAMOUFOX_FAST_VISIBLE_FALLBACK", "aida_camoufox_bridge_20260620_crash_diag_1", "aida_bridge_patch_active", "aida_launch_policy_resolved", "context_close_event", "cmdline_sha256", "subprocess_diagnostics_installed", "stdout_capture", "stderr_capture", "exit_ts_ms", "diagnostic_original_style_bundled", "_registered_page_records"):
         if marker not in text:
             fail(f"browser validation missing {marker}")
+    validate_browser_launch_budget_contract(path, text)
     write_text(path, text)
 
 
@@ -2432,6 +2469,10 @@ def patch_navigation(path: pathlib.Path) -> None:
         for marker in ("navigation_lifecycle_degraded", "first_failure_phase", "timeout_source", "_NavigationLifecycleError", "diagnose_bloxflip_matrix", "original_style_bundled", "node_exit_code", "camoufox_child_exits", "cloudflare"):
             if marker not in text:
                 fail(f"navigation validation missing {marker}")
+        if "navigate_wait_until_resolved" not in text:
+            fail(f"navigation wait_until contract missing navigate_wait_until_resolved in {path}")
+        if 'if primary_wait_until == "load":\n            primary_wait_until = "domcontentloaded"' in text:
+            fail(f"navigation wait_until contract still downgrades load->domcontentloaded in {path}")
         write_text(path, text)
         return
     text = replace_once(
