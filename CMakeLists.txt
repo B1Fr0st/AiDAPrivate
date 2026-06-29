@@ -3260,6 +3260,9 @@ if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/standalone/test_target/CMak
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different
                     "$<TARGET_FILE:AiDA_TestTarget>"
                     "$<TARGET_FILE_DIR:AiDAStandalone>/AiDA_TestTarget.exe"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "$<TARGET_PDB_FILE:AiDA_TestTarget>"
+                    "$<TARGET_FILE_DIR:AiDAStandalone>/AiDA_TestTarget.pdb"
                 COMMENT "Staging AiDA_TestTarget beside AiDAStandalone.exe..."
                 VERBATIM
             )

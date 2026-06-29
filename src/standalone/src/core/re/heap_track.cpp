@@ -527,23 +527,6 @@ void append_event_capture(store::heap_session_t session, const pending_alloc_t& 
     store::update_heap_session(session);
 }
 
-bool arm_heap_session_for_thread(const store::heap_session_t& source_session, std::uint32_t tid)
-{
-    if (tid == 0 || source_session.hw_slot < 0 || source_session.hw_slot > 3 || source_session.rtl_allocate_heap == 0)
-        return false;
-    auto session = source_session;
-    if (driver_bridge::set_hardware_breakpoint(tid, session.hw_slot, session.rtl_allocate_heap, 0, 0))
-    {
-        if (std::find(session.tids.begin(), session.tids.end(), tid) == session.tids.end())
-        {
-            session.tids.push_back(tid);
-            store::update_heap_session(session);
-        }
-        return true;
-    }
-    return false;
-}
-
 std::size_t arm_heap_existing_threads(std::uint32_t pid)
 {
     auto session = event_session_for_pid(pid);
@@ -551,10 +534,23 @@ std::size_t arm_heap_existing_threads(std::uint32_t pid)
         return 0;
     const auto threads = threads_for(pid);
     std::size_t armed = 0;
+    std::vector<std::uint32_t> armed_tids;
     for (const auto& th : threads)
     {
-        if (arm_heap_session_for_thread(*session, th.tid))
+        if (th.tid == 0 || session->hw_slot < 0 || session->hw_slot > 3 || session->rtl_allocate_heap == 0)
+            continue;
+        if (driver_bridge::set_hardware_breakpoint(th.tid, session->hw_slot, session->rtl_allocate_heap, 0, 0))
+        {
             ++armed;
+            if (std::find(armed_tids.begin(), armed_tids.end(), th.tid) == armed_tids.end())
+                armed_tids.push_back(th.tid);
+        }
+    }
+    if (!armed_tids.empty())
+    {
+        auto updated = *session;
+        updated.tids = std::move(armed_tids);
+        store::update_heap_session(updated);
     }
     diag::log_tagged_fmt("heap_track",
         "breakpoint_arm_existing pid=%u session_id=%s thread_count=%zu armed=%zu slot=%d target=%s",
@@ -813,7 +809,42 @@ bool start_heap_debug_loop(std::uint32_t pid, std::string& error)
                 pid,
                 i,
                 static_cast<unsigned long long>(GetTickCount64() - started_ms));
-            return true;
+            const std::uint64_t tids_wait_start = GetTickCount64();
+            for (int j = 0; j < 80; ++j)
+            {
+                auto session = event_session_for_pid(pid);
+                if (session && !session->tids.empty())
+                {
+                    diag::log_tagged_fmt("heap_track",
+                        "kernel_context_start_loop tids_ready pid=%u tid_count=%zu tids_waits=%d tids_elapsed_ms=%llu total_elapsed_ms=%llu",
+                        pid,
+                        session->tids.size(),
+                        j,
+                        static_cast<unsigned long long>(GetTickCount64() - tids_wait_start),
+                        static_cast<unsigned long long>(GetTickCount64() - started_ms));
+                    return true;
+                }
+                if (!state.running.load(std::memory_order_acquire))
+                    break;
+                if (heap_call_cancelled("kernel_context_start_tids_wait", pid, started_ms))
+                {
+                    state.polling.store(false, std::memory_order_release);
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            }
+            auto session = event_session_for_pid(pid);
+            if (session && !session->tids.empty())
+                return true;
+            error = "heap kernel context attached but no threads armed within timeout";
+            diag::log_tagged_fmt("heap_track",
+                "kernel_context_start_loop tids_empty pid=%u tids_waits=%d tids_elapsed_ms=%llu total_elapsed_ms=%llu",
+                pid,
+                80,
+                static_cast<unsigned long long>(GetTickCount64() - tids_wait_start),
+                static_cast<unsigned long long>(GetTickCount64() - started_ms));
+            state.polling.store(false, std::memory_order_release);
+            return false;
         }
         if (!state.running.load(std::memory_order_acquire))
             break;

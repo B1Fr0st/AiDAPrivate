@@ -1802,7 +1802,10 @@ static void test_get_call_stack(HANDLE hf, std::atomic<int>& passed, std::atomic
         budget_majority ? 1 : 0,
         module_rva_structural_contract ? 1 : 0);
 
-    if (structural_ok && zero_address_count == 0 && blank_module_count == 0 && known_module_blank_functions == 0 && target_module_frame_count > 0 && (!budget_majority || module_rva_structural_contract)) {
+    const size_t min_expected_resolved = frames.size() / 3;
+    const bool symbol_resolution_ok = resolved_count >= min_expected_resolved || !budget_majority;
+
+    if (structural_ok && zero_address_count == 0 && blank_module_count == 0 && known_module_blank_functions == 0 && target_module_frame_count > 0 && symbol_resolution_ok && (!budget_majority || module_rva_structural_contract)) {
         log_msg(hf, "dbg_stk", "PASS -- structural frames=%zu top_addr=0x%llX resolved=%zu module_rva_fallback=%zu budget_exhausted=%zu budget_majority=%d module_rva_structural_contract=%d target_module_frames=%zu expected_structural_modules=%zu blank_modules=%zu zero_address_frames=%zu (elapsed %lld ms)",
             frames.size(), (unsigned long long)top_addr, resolved_count, module_rva_fallback_count, budget_exhausted_count, budget_majority ? 1 : 0, module_rva_structural_contract ? 1 : 0, target_module_frame_count, expected_structural_module_count, blank_module_count, zero_address_count, (long long)ms);
         passed.fetch_add(1);

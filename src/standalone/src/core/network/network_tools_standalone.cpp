@@ -4617,6 +4617,53 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                     static_cast<unsigned long long>(GetTickCount64() - op_started));
                 if (cancel_reason())
                     return cancelled_result("before_install");
+                if (driver_bridge::attached_pid() != pid) {
+                    bool already_attached = false;
+                    const auto attached = driver_bridge::attached_pids();
+                    for (uint32_t attached_pid : attached) {
+                        if (attached_pid == pid) {
+                            already_attached = true;
+                            break;
+                        }
+                    }
+                    if (already_attached) {
+                        driver_bridge::set_active_pid(pid);
+                    } else {
+                        diag::log_tagged_fmt("net_tools",
+                            "network_pg_sniff attach_pre_check pid=%u active_pid=%u action=explicit_attach",
+                            pid,
+                            driver_bridge::attached_pid());
+                        driver_bridge::attach(pid);
+                    }
+                    if (driver_bridge::attached_pid() != pid) {
+                        const uint64_t attach_wait_start = GetTickCount64();
+                        const uint64_t attach_wait_deadline = attach_wait_start + 2000;
+                        while (GetTickCount64() < attach_wait_deadline) {
+                            if (driver_bridge::attached_pid() == pid)
+                                break;
+                            Sleep(50);
+                        }
+                        diag::log_tagged_fmt("net_tools",
+                            "network_pg_sniff attach_wait pid=%u active_pid=%u elapsed_ms=%llu attached=%d",
+                            pid,
+                            driver_bridge::attached_pid(),
+                            static_cast<unsigned long long>(GetTickCount64() - attach_wait_start),
+                            driver_bridge::attached_pid() == pid ? 1 : 0);
+                    }
+                    if (driver_bridge::attached_pid() != pid) {
+                        diag::log_tagged_fmt("net_tools",
+                            "network_pg_sniff attach_failed pid=%u active_pid=%u address=0x%llX size=0x%llX",
+                            pid,
+                            driver_bridge::attached_pid(),
+                            static_cast<unsigned long long>(address),
+                            static_cast<unsigned long long>(size));
+                        json d{{"pid", pid}, {"address", hex_u64(address)}, {"size", size},
+                               {"driver_attached_pid", driver_bridge::attached_pid()},
+                               {"failure", "driver not attached to requested PID before page-guard install"}};
+                        add_page_guard_prerequisites(d, "whoswho_driver_page_guard");
+                        return tool_result_t::error("Failed to install WhosWho driver-backed PAGE_GUARD capture session.", "page_guard_attach_failed", d);
+                    }
+                }
                 const uint32_t sid = page_guard_engine::g_pg_engine.install(pid, address, size, capture_payloads, max_records, true);
                 diag::log_tagged_fmt("net_tools",
                     "network_pg_sniff install_return sid=%u pid=%u active_pid=%u address=0x%llX size=0x%llX elapsed_ms=%llu",

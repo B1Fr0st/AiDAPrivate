@@ -68,6 +68,7 @@ static constexpr uint32_t REMOTE_CALL_DEFAULT_TIMEOUT_MS = 5000;
 static constexpr uint32_t REMOTE_CALL_MAX_TIMEOUT_MS = 30000;
 static constexpr size_t INSTALL_QUARANTINE_MAX_ACTIVE = 8;
 static inline std::atomic<std::uint64_t> g_driver_remote_call_sequence{1};
+inline std::atomic<bool> g_install_ready{false};
 
 
 static constexpr size_t SHELLCODE_SIZE          = 265;
@@ -656,7 +657,8 @@ static inline uint64_t remote_thread_call(uint32_t pid,
                                           uint64_t arg3 = 0,
                                           uint64_t arg4 = 0,
                                           uint32_t timeout_ms = 0,
-                                          const char* label = "remote_call")
+                                          const char* label = "remote_call",
+                                          bool allow_zero = false)
 {
     const ULONGLONG call_start = GetTickCount64();
     const uint32_t effective_timeout = bounded_remote_call_timeout_ms(timeout_ms);
@@ -682,6 +684,7 @@ static inline uint64_t remote_thread_call(uint32_t pid,
     context.deadline_ms = deadline;
     context.cancel_token = mcp_standalone::current_cancel_token();
     context.require_deadline = true;
+    context.allow_zero_result = allow_zero;
     driver_bridge::scoped_remote_call_context_t scoped_context(context);
     diag::log_tagged_fmt("pg_sniff",
         "remote_thread_call_begin label=%s tool=%s diag_id=%s pid=%u active_pid=%u fn=0x%llX requested_timeout_ms=%u effective_timeout_ms=%u deadline_ms=%llu deadline_remaining_ms=%llu cancelled=%d",
@@ -1282,6 +1285,7 @@ public:
         const uint64_t requested_addr = target_addr;
         const uint64_t requested_size = region_size;
         const std::uint64_t install_generation = install_stop_generation_.load(std::memory_order_acquire);
+        g_install_ready.store(false, std::memory_order_release);
         clear_install_failure(pid, requested_addr, requested_size);
         auto fail_install = [&](const char* reason,
                                 const char* detail,
@@ -1291,6 +1295,7 @@ public:
                                 uint32_t attempted_protect) -> uint32_t {
             record_install_failure(reason, detail, pid, requested_addr, requested_size,
                                    guard_addr, guard_size, region, attempted_protect, GetLastError());
+            g_install_ready.store(false, std::memory_order_release);
             return 0;
         };
         auto log_install_phase = [&](const char* phase) {
@@ -2634,6 +2639,7 @@ public:
             return fail_install(reason, "page-guard install cancelled while acquiring session registration lock", &mri, target_addr, region_size, orig_protect | PAGE_GUARD);
         }
         sessions_[sid] = session;
+        g_install_ready.store(true, std::memory_order_release);
         diag::log_tagged_fmt("pg_sniff", "install_ok sid=%u pid=%u target=0x%llX size=0x%llX ring=0x%llX sc=0x%llX orig=0x%08X old_guard=0x%08X veh=0x%llX payloads=%d max_drain=%u auto_poll=%d generation=%llu elapsed_ms=%llu",
             sid,
             pid,

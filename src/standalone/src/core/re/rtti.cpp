@@ -1802,6 +1802,35 @@ scan_result_t scan_types(const json& params)
             return fail_module_selector("RTTI type_descriptor_va selector did not resolve a loaded module.", "type_descriptor_hint", exact_type_descriptor_key, exact_type_descriptor_value);
         }
     }
+    if (exact_selector_direct_hit)
+    {
+        std::set<std::uint64_t> recorded_exact_bases;
+        auto record_exact_selector_module = [&](const driver_bridge::module_info_t& mod, const char* selector_kind) {
+            if (!recorded_exact_bases.insert(mod.base).second)
+                return;
+            json em;
+            em["name"] = !mod.name.empty() ? mod.name : mod.path;
+            em["path"] = mod.path;
+            em["base"] = sa_format_address(mod.base);
+            em["size"] = mod.size;
+            em["exact_selector_hit"] = true;
+            em["selector_kind"] = selector_kind;
+            em["loaded_layout"] = false;
+            em["bytes_scanned"] = 0;
+            em["elapsed_ms"] = 0;
+            ctx.scanned_modules.push_back(std::move(em));
+            ++ctx.scanned_module_count;
+        };
+        if (has_vtable_hint && vtable_hint_va != 0)
+            if (auto m = find_module_for_address(scope.pid(), vtable_hint_va))
+                record_exact_selector_module(*m, "vtable_hint");
+        if (has_exact_col && exact_col_va != 0)
+            if (auto m = find_module_for_address(scope.pid(), exact_col_va))
+                record_exact_selector_module(*m, "complete_object_locator");
+        if (has_exact_type_descriptor && exact_type_descriptor_va != 0)
+            if (auto m = find_module_for_address(scope.pid(), exact_type_descriptor_va))
+                record_exact_selector_module(*m, "type_descriptor");
+    }
     if (!(exact_selector_fast_path && exact_selector_direct_hit) || all_by_td.empty())
     {
     for (const auto& module : modules)

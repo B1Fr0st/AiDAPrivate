@@ -2129,8 +2129,9 @@ tool_result_t bridge_result_to_tool_result(const camoufox::call_result_t& r)
     return out;
 }
 
-tool_result_t tool_camoufox_click(const json& params)
+tool_result_t tool_camoufox_click(const json& params, int timeout_ms)
 {
+    if (timeout_ms <= 0) timeout_ms = 30000;
     if (!params.is_object() || !params.contains("selector") || !params["selector"].is_string())
         return tool_result_t::error("missing_selector");
     const std::string selector = params["selector"].get<std::string>();
@@ -2138,15 +2139,16 @@ tool_result_t tool_camoufox_click(const json& params)
     const std::string page_id = json_string_param(params, "page_id", std::string());
     auto before = camoufox::get_status(session_id);
     const auto start = std::chrono::steady_clock::now();
-    diag::log_tagged_fmt("mcp_burp", "camoufox_click_direct entry selector=%s state=%s child_pid=%lu ready=%d",
+    diag::log_tagged_fmt("mcp_burp", "camoufox_click_direct entry selector=%s timeout_ms=%d state=%s child_pid=%lu ready=%d",
         selector.c_str(),
+        timeout_ms,
         state_label(before.state),
         static_cast<unsigned long>(before.child_pid),
         bridge_ready(before) ? 1 : 0);
     json args;
     args["selector"] = selector;
     if (!page_id.empty()) args["page_id"] = page_id;
-    tool_result_t out = bridge_result_to_tool_result(camoufox::call_tool("click", args, 5000, session_id));
+    tool_result_t out = bridge_result_to_tool_result(camoufox::call_tool("click", args, timeout_ms, session_id));
     auto after = camoufox::get_status(session_id);
     if (out.data.is_object())
         out.data["bridge"] = status_to_json(after);
@@ -2161,8 +2163,9 @@ tool_result_t tool_camoufox_click(const json& params)
     return out;
 }
 
-tool_result_t tool_camoufox_type_text(const json& params)
+tool_result_t tool_camoufox_type_text(const json& params, int timeout_ms)
 {
+    if (timeout_ms <= 0) timeout_ms = 30000;
     if (!params.is_object() || !params.contains("selector") || !params["selector"].is_string())
         return tool_result_t::error("missing_selector");
     if (!params.contains("text") || !params["text"].is_string())
@@ -2174,10 +2177,11 @@ tool_result_t tool_camoufox_type_text(const json& params)
     const std::string page_id = json_string_param(params, "page_id", std::string());
     auto before = camoufox::get_status(session_id);
     const auto start = std::chrono::steady_clock::now();
-    diag::log_tagged_fmt("mcp_burp", "camoufox_type_direct entry selector=%s text_len=%zu delay=%d state=%s child_pid=%lu ready=%d",
+    diag::log_tagged_fmt("mcp_burp", "camoufox_type_direct entry selector=%s text_len=%zu delay=%d timeout_ms=%d state=%s child_pid=%lu ready=%d",
         selector.c_str(),
         text.size(),
         delay,
+        timeout_ms,
         state_label(before.state),
         static_cast<unsigned long>(before.child_pid),
         bridge_ready(before) ? 1 : 0);
@@ -2186,7 +2190,7 @@ tool_result_t tool_camoufox_type_text(const json& params)
     args["text"] = text;
     args["delay"] = delay;
     if (!page_id.empty()) args["page_id"] = page_id;
-    tool_result_t out = bridge_result_to_tool_result(camoufox::call_tool("type_text", args, 5000, session_id));
+    tool_result_t out = bridge_result_to_tool_result(camoufox::call_tool("type_text", args, timeout_ms, session_id));
     auto after = camoufox::get_status(session_id);
     if (out.data.is_object())
         out.data["bridge"] = status_to_json(after);
@@ -2224,7 +2228,7 @@ tool_result_t tool_camoufox_wait_for_selector(const json& params)
     args["selector"] = selector;
     args["timeout"] = timeout_ms;
     if (!page_id.empty()) args["page_id"] = page_id;
-    tool_result_t out = bridge_result_to_tool_result(camoufox::call_tool("wait_for", args, timeout_ms + 5000, session_id));
+    tool_result_t out = bridge_result_to_tool_result(camoufox::call_tool("wait_for", args, std::max(timeout_ms + 5000, 15000), session_id));
     auto after = camoufox::get_status(session_id);
     if (out.data.is_object())
         out.data["bridge"] = status_to_json(after);
@@ -2351,9 +2355,9 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
             static_cast<unsigned long>(before.page_count), before.active_page_title.size());
     }
     if (tool_name == "click")
-        return tool_camoufox_click(params);
+        return tool_camoufox_click(params, timeout_ms);
     if (tool_name == "type_text")
-        return tool_camoufox_type_text(params);
+        return tool_camoufox_type_text(params, timeout_ms);
     if (tool_name == "wait_for" && params.is_object() && params.contains("selector") && params["selector"].is_string())
         return tool_camoufox_wait_for_selector(params);
     if (tool_name == "add_init_script")
@@ -2852,6 +2856,36 @@ tool_result_t dispatch_camoufox_browser_group(
         }
     }
 
+    if (internal_tool_name == "network_capture")
+    {
+        const std::string requested_page_id = json_string_param(forwarded, "page_id", std::string());
+        if (!requested_page_id.empty())
+        {
+            const std::string session_id = json_string_param(params, "session_id", "default");
+            auto pre_flight_status = camoufox::get_status(session_id);
+            if (!bridge_status_has_page(pre_flight_status, requested_page_id))
+            {
+                diag::log_tagged_fmt("mcp_burp", "dispatch_camoufox_browser_group network_capture_page_not_found group=%s page_id=%s active_page_id=%s generation=%llu child_pid=%lu known_pages=%s",
+                    group_name,
+                    requested_page_id.c_str(),
+                    pre_flight_status.active_page_id.c_str(),
+                    static_cast<unsigned long long>(pre_flight_status.generation),
+                    static_cast<unsigned long>(pre_flight_status.child_pid),
+                    page_ids_json(pre_flight_status).dump().c_str());
+                json err_data = json::object();
+                err_data["error"] = "browser_network_capture_page_not_found";
+                err_data["requested_page_id"] = requested_page_id;
+                err_data["available_page_ids"] = page_ids_json(pre_flight_status);
+                err_data["active_page_id"] = pre_flight_status.active_page_id;
+                err_data["bridge_generation"] = pre_flight_status.generation;
+                err_data["bridge_state"] = state_label(pre_flight_status.state);
+                tool_result_t err = tool_result_t::error("browser_network_capture_page_not_found");
+                err.data = std::move(err_data);
+                return err;
+            }
+        }
+    }
+
     tool_result_t out = tool_camoufox_passthrough(
         action_spec->internal_tool,
         forwarded,
@@ -2921,7 +2955,7 @@ tool_result_t tool_browser_state(const json& params)
         {"cookies", "cookies", 30000},
         {"storage", "get_storage", 30000},
         {"export", "export_state", 30000},
-        {"import", "import_state", 30000},
+        {"import", "import_state", 60000},
         {"reset", "reset_browser_state", 45000},
     };
     return dispatch_camoufox_browser_group(params, "browser_state",

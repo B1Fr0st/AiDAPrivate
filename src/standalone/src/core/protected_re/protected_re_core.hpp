@@ -6120,7 +6120,7 @@ inline tool_result_t drv_find_device_names(const json& params)
     auto chk = require_driver();
     if (!chk.success)
         return chk;
-    const std::uint64_t timeout_ms = std::clamp<std::uint64_t>(parse_param_u64(params, "timeout_ms").value_or(5500), 500, 30000);
+    const std::uint64_t timeout_ms = std::clamp<std::uint64_t>(parse_param_u64(params, "timeout_ms").value_or(15000), 500, 60000);
     const std::uint64_t local_deadline = started_ms > std::numeric_limits<std::uint64_t>::max() - timeout_ms ? std::numeric_limits<std::uint64_t>::max() : started_ms + timeout_ms;
     bool deadline_hit = false;
     bool cancelled = false;
@@ -6220,10 +6220,12 @@ inline tool_result_t drv_find_device_names(const json& params)
                 return tool_result_t::error(cancelled ? "Driver device-name scan cancelled." : "Driver device-name scan deadline reached.", partial_with_found());
             }
             const char* type = nullptr;
-            if (utf16_at(bytes, i, L"\\Device\\"))
-                type = "device";
-            else if (utf16_at(bytes, i, L"\\DosDevices\\") || utf16_at(bytes, i, L"\\??\\"))
-                type = "symlink";
+            if (i + 1 < bytes.size() && bytes[i] == 0x5C && bytes[i + 1] == 0x00) {
+                if (utf16_at(bytes, i, L"\\Device\\"))
+                    type = "device";
+                else if (utf16_at(bytes, i, L"\\DosDevices\\") || utf16_at(bytes, i, L"\\??\\"))
+                    type = "symlink";
+            }
             if (!type)
                 continue;
             std::string name = read_utf16_ascii(bytes, i, 260);

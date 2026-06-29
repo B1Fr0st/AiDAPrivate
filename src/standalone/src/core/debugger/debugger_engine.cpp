@@ -145,8 +145,8 @@ constexpr uint64_t k_call_stack_symbol_max_delta = 0x10000ull;
 constexpr uint32_t k_call_stack_export_max_names = 65536u;
 constexpr uint32_t k_call_stack_export_max_functions = 65536u;
 constexpr uint64_t k_call_stack_export_max_array_bytes = 1024ull * 1024ull;
-constexpr uint64_t k_call_stack_total_symbol_budget_us = 1500000ull;
-constexpr uint64_t k_call_stack_frame_symbol_budget_us = 400000ull;
+constexpr uint64_t k_call_stack_total_symbol_budget_us = 5000000ull;
+constexpr uint64_t k_call_stack_frame_symbol_budget_us = 1200000ull;
 constexpr uint64_t k_call_stack_local_image_max_module_size = 0x10000000ull;
 
 constexpr std::array<const wchar_t*, 6> k_system_export_local_modules = {
@@ -499,13 +499,31 @@ bool resolve_stack_symbol_from_local_image(const driver_bridge::module_info_t& m
 	HMODULE local_handle = GetModuleHandleW(wide_name.c_str());
 	const DWORD handle_gle = GetLastError();
 	if (local_handle == nullptr) {
-		status = "local_image_handle_missing";
-		diag::log_tagged_fmt("dbg_stack_symbol",
-			"local_image_handle_missing module=%s gle=%lu elapsed_us=%llu",
-			module.name.empty() ? "(none)" : module.name.c_str(),
-			static_cast<unsigned long>(handle_gle),
-			static_cast<unsigned long long>(resolver_elapsed_us(local_t0)));
-		return false;
+		SetLastError(0);
+		HMODULE ex_handle = nullptr;
+		if (GetModuleHandleExW(
+				GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+				reinterpret_cast<LPCWSTR>(module.base),
+				&ex_handle) && ex_handle != nullptr) {
+			local_handle = ex_handle;
+			diag::log_tagged_fmt("dbg_stack_symbol",
+				"local_image_handle_ex_fallback module=%s base=0x%llX handle=%p gle=%lu elapsed_us=%llu",
+				module.name.empty() ? "(none)" : module.name.c_str(),
+				static_cast<unsigned long long>(module.base),
+				static_cast<void*>(local_handle),
+				static_cast<unsigned long>(handle_gle),
+				static_cast<unsigned long long>(resolver_elapsed_us(local_t0)));
+		} else {
+			const DWORD ex_gle = GetLastError();
+			status = "local_image_handle_missing";
+			diag::log_tagged_fmt("dbg_stack_symbol",
+				"local_image_handle_missing module=%s gle=%lu ex_gle=%lu elapsed_us=%llu",
+				module.name.empty() ? "(none)" : module.name.c_str(),
+				static_cast<unsigned long>(handle_gle),
+				static_cast<unsigned long>(ex_gle),
+				static_cast<unsigned long long>(resolver_elapsed_us(local_t0)));
+			return false;
+		}
 	}
 
 	const uint64_t target_rva64 = address - module.base;
@@ -894,6 +912,45 @@ bool resolve_stack_symbol_from_exports(const driver_bridge::module_info_t& modul
 
 	const uint64_t export_end = static_cast<uint64_t>(export_rva) + static_cast<uint64_t>(export_size);
 	const auto t0 = std::chrono::steady_clock::now();
+	uint32_t min_name_rva = 0xFFFFFFFFu;
+	uint32_t max_name_rva = 0;
+	for (uint32_t i = 0; i < name_count; ++i) {
+		if (name_rvas[i] == 0 || name_rvas[i] >= module.size)
+			continue;
+		if (name_rvas[i] < min_name_rva)
+			min_name_rva = name_rvas[i];
+		if (name_rvas[i] > max_name_rva)
+			max_name_rva = name_rvas[i];
+	}
+	std::vector<uint8_t> name_pool;
+	if (min_name_rva != 0xFFFFFFFFu && max_name_rva >= min_name_rva) {
+		uint64_t pool_size = static_cast<uint64_t>(max_name_rva) - static_cast<uint64_t>(min_name_rva) + 512ull;
+		if (pool_size > k_call_stack_export_max_array_bytes)
+			pool_size = k_call_stack_export_max_array_bytes;
+		if (static_cast<uint64_t>(min_name_rva) + pool_size > module.size)
+			pool_size = module.size - static_cast<uint64_t>(min_name_rva);
+		if (pool_size > 0)
+			driver_bridge::read_memory(module.base + min_name_rva, static_cast<size_t>(pool_size), name_pool);
+	}
+	auto extract_name_from_pool = [&](uint32_t name_rva) -> std::string {
+		if (name_pool.empty() || name_rva < min_name_rva || min_name_rva == 0xFFFFFFFFu)
+			return {};
+		const uint32_t name_offset = name_rva - min_name_rva;
+		if (name_offset >= name_pool.size())
+			return {};
+		std::string out;
+		const size_t avail = name_pool.size() - static_cast<size_t>(name_offset);
+		const size_t max_len = (std::min)(avail, static_cast<size_t>(512));
+		for (size_t j = 0; j < max_len; ++j) {
+			const uint8_t b = name_pool[static_cast<size_t>(name_offset) + j];
+			if (b == 0)
+				break;
+			if (b < 0x20 || b > 0x7E)
+				return {};
+			out.push_back(static_cast<char>(b));
+		}
+		return out;
+	};
 	uint64_t best_delta = k_call_stack_symbol_max_delta;
 	uint32_t best_rva = 0;
 	std::string best_name;
@@ -920,7 +977,9 @@ bool resolve_stack_symbol_from_exports(const driver_bridge::module_info_t& modul
 			budget_hit = true;
 			break;
 		}
-		const std::string candidate_name = read_module_export_name(module, name_rvas[i]);
+		std::string candidate_name = extract_name_from_pool(name_rvas[i]);
+		if (candidate_name.empty())
+			candidate_name = read_module_export_name(module, name_rvas[i]);
 		if (candidate_name.empty())
 			continue;
 		best_delta = delta;

@@ -199,8 +199,111 @@ void interruptible_sleep(std::uint32_t ms)
     }
 }
 
+bool recreate_sockets() noexcept
+{
+    if (!g_wsa_started) {
+        WSADATA wsa{};
+        if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+            printf("[proto-re] recreate_sockets WSAStartup failed err=%d\n", WSAGetLastError());
+            fflush(stdout);
+            return false;
+        }
+        g_wsa_started = true;
+    }
+
+    if (g_receiver != INVALID_SOCKET) {
+        closesocket(g_receiver);
+        g_receiver = INVALID_SOCKET;
+    }
+    if (g_sender != INVALID_SOCKET) {
+        closesocket(g_sender);
+        g_sender = INVALID_SOCKET;
+    }
+
+    g_receiver = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    g_sender = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (g_receiver == INVALID_SOCKET || g_sender == INVALID_SOCKET) {
+        printf("[proto-re] recreate_sockets socket() failed receiver=%lld sender=%lld err=%d\n",
+            static_cast<long long>(g_receiver), static_cast<long long>(g_sender), WSAGetLastError());
+        fflush(stdout);
+        return false;
+    }
+
+    sockaddr_in recv_addr{};
+    recv_addr.sin_family = AF_INET;
+    recv_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    recv_addr.sin_port = 0;
+    if (bind(g_receiver, reinterpret_cast<const sockaddr*>(&recv_addr), sizeof(recv_addr)) == SOCKET_ERROR) {
+        printf("[proto-re] recreate_sockets bind receiver failed err=%d\n", WSAGetLastError());
+        fflush(stdout);
+        closesocket(g_receiver);
+        g_receiver = INVALID_SOCKET;
+        closesocket(g_sender);
+        g_sender = INVALID_SOCKET;
+        return false;
+    }
+
+    sockaddr_in actual{};
+    int actual_len = sizeof(actual);
+    if (getsockname(g_receiver, reinterpret_cast<sockaddr*>(&actual), &actual_len) == SOCKET_ERROR) {
+        printf("[proto-re] recreate_sockets getsockname receiver failed err=%d\n", WSAGetLastError());
+        fflush(stdout);
+        closesocket(g_receiver);
+        g_receiver = INVALID_SOCKET;
+        closesocket(g_sender);
+        g_sender = INVALID_SOCKET;
+        return false;
+    }
+
+    sockaddr_in send_addr{};
+    send_addr.sin_family = AF_INET;
+    send_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    send_addr.sin_port = 0;
+    if (bind(g_sender, reinterpret_cast<const sockaddr*>(&send_addr), sizeof(send_addr)) == SOCKET_ERROR) {
+        printf("[proto-re] recreate_sockets bind sender failed err=%d\n", WSAGetLastError());
+        fflush(stdout);
+        closesocket(g_receiver);
+        g_receiver = INVALID_SOCKET;
+        closesocket(g_sender);
+        g_sender = INVALID_SOCKET;
+        return false;
+    }
+
+    sockaddr_in send_actual{};
+    int send_actual_len = sizeof(send_actual);
+    if (getsockname(g_sender, reinterpret_cast<sockaddr*>(&send_actual), &send_actual_len) == SOCKET_ERROR) {
+        printf("[proto-re] recreate_sockets getsockname sender failed err=%d\n", WSAGetLastError());
+        fflush(stdout);
+        closesocket(g_receiver);
+        g_receiver = INVALID_SOCKET;
+        closesocket(g_sender);
+        g_sender = INVALID_SOCKET;
+        return false;
+    }
+
+    u_long nonblock = 1;
+    if (ioctlsocket(g_receiver, FIONBIO, &nonblock) == SOCKET_ERROR) {
+        printf("[proto-re] recreate_sockets ioctlsocket failed err=%d\n", WSAGetLastError());
+        fflush(stdout);
+        closesocket(g_receiver);
+        g_receiver = INVALID_SOCKET;
+        closesocket(g_sender);
+        g_sender = INVALID_SOCKET;
+        return false;
+    }
+
+    aida_test_proto_re_descriptor.listen_port = ntohs(actual.sin_port);
+    aida_test_proto_re_descriptor.send_port = ntohs(send_actual.sin_port);
+    printf("[proto-re] recreate_sockets success listen_port=%u send_port=%u\n",
+        aida_test_proto_re_descriptor.listen_port, aida_test_proto_re_descriptor.send_port);
+    fflush(stdout);
+    return true;
+}
+
 DWORD WINAPI worker_thread(LPVOID)
 {
+    printf("[proto-re] worker_thread start tid=%lu\n", GetCurrentThreadId());
+    fflush(stdout);
     std::uint8_t buffer[kMaxPacket] = {};
     while (running_now()) {
         std::uint32_t emitted = aida_test_proto_serialize_frame(&g_context, buffer, sizeof(buffer));
@@ -223,6 +326,11 @@ DWORD WINAPI worker_thread(LPVOID)
         interruptible_sleep(g_cfg.rate_ms);
     }
 
+    printf("[proto-re] worker_thread exit tid=%lu g_local_running=%d g_running=%p\n",
+        GetCurrentThreadId(),
+        g_local_running.load(std::memory_order_acquire) ? 1 : 0,
+        static_cast<void*>(g_running));
+    fflush(stdout);
     drain_receiver();
     return 0;
 }
@@ -278,8 +386,8 @@ void init(const config_t& cfg, std::atomic<bool>& running)
     g_cfg = cfg;
     if (g_cfg.rate_ms < 50)
         g_cfg.rate_ms = 50;
-    if (g_cfg.rate_ms > 50)
-        g_cfg.rate_ms = 50;
+    if (g_cfg.rate_ms > 2000)
+        g_cfg.rate_ms = 2000;
     g_running = &running;
     reset_descriptor();
     aida_test_proto_re_descriptor.rate_ms = g_cfg.rate_ms;
@@ -371,6 +479,11 @@ void init(const config_t& cfg, std::atomic<bool>& running)
 
 void shutdown_all()
 {
+    printf("[proto-re] shutdown_all begin g_sender=%lld g_receiver=%lld g_worker=%p worker_tid=%lu wsa_started=%d\n",
+        static_cast<long long>(g_sender), static_cast<long long>(g_receiver),
+        static_cast<void*>(g_worker), static_cast<unsigned long>(g_worker_tid),
+        g_wsa_started ? 1 : 0);
+    fflush(stdout);
     g_local_running.store(false, std::memory_order_release);
 
     if (g_worker) {
@@ -381,10 +494,14 @@ void shutdown_all()
     }
 
     if (g_receiver != INVALID_SOCKET) {
+        printf("[proto-re] shutdown_all closing receiver socket=%lld\n", static_cast<long long>(g_receiver));
+        fflush(stdout);
         closesocket(g_receiver);
         g_receiver = INVALID_SOCKET;
     }
     if (g_sender != INVALID_SOCKET) {
+        printf("[proto-re] shutdown_all closing sender socket=%lld\n", static_cast<long long>(g_sender));
+        fflush(stdout);
         closesocket(g_sender);
         g_sender = INVALID_SOCKET;
     }
@@ -404,8 +521,18 @@ std::uint32_t emit_capture_public_impl(void* ctx, std::uint8_t* buffer, std::uin
 
 std::uint32_t emit_deterministic_impl(std::uint32_t burst_count) noexcept
 {
-    if (g_sender == INVALID_SOCKET || g_receiver == INVALID_SOCKET)
-        return 0;
+    if (g_sender == INVALID_SOCKET || g_receiver == INVALID_SOCKET) {
+        printf("[proto-re] emit_deterministic early return: g_sender=%lld g_receiver=%lld burst_count=%u\n",
+            static_cast<long long>(g_sender), static_cast<long long>(g_receiver), burst_count);
+        fflush(stdout);
+        if (!recreate_sockets()) {
+            printf("[proto-re] emit_deterministic socket recreation failed, returning 0\n");
+            fflush(stdout);
+            return 0;
+        }
+        printf("[proto-re] emit_deterministic sockets recreated, proceeding with burst_count=%u\n", burst_count);
+        fflush(stdout);
+    }
     if (burst_count == 0)
         burst_count = 1;
     if (burst_count > 64)
@@ -432,10 +559,13 @@ std::uint32_t emit_deterministic_impl(std::uint32_t burst_count) noexcept
         }
         drain_receiver();
     }
+    printf("[proto-re] emit_deterministic done burst_count=%u sent_packets=%u\n", burst_count, sent_packets);
+    fflush(stdout);
     return sent_packets;
 }
 
 }
+
 }
 
 extern "C" __declspec(dllexport) test_target::protocol_re::descriptor_t aida_test_proto_re_descriptor = {

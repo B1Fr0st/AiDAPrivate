@@ -934,6 +934,23 @@ namespace
     static constexpr DWORD kLowerRemoteCallWorkerReadyWaitMs = 1000;
     static constexpr DWORD kLowerRemoteCallStartBackoffInitialMs = 500;
     static constexpr DWORD kLowerRemoteCallStartBackoffMaxMs = 10000;
+    HANDLE g_remote_call_lower_worker2_handle = nullptr;
+    unsigned g_remote_call_lower_worker2_begin_tid = 0;
+    std::atomic_bool g_remote_call_lower_worker2_started{false};
+    std::atomic_bool g_remote_call_lower_worker2_alive{false};
+    std::atomic<DWORD> g_remote_call_lower_worker2_tid{0};
+    std::atomic_bool g_remote_call_lower_worker2_loop_ready{false};
+    std::condition_variable g_remote_call_lower_start2_cv;
+    std::atomic_bool g_lower_remote_call_worker_recovering{false};
+    struct lower_worker_heartbeat_t {
+        std::atomic<uint64_t> call_id{0};
+        std::atomic<ULONGLONG> popped_at{0};
+        std::atomic<bool> executing{false};
+        std::mutex str_mutex;
+        char phase[32] = {};
+        char label[64] = {};
+    };
+    lower_worker_heartbeat_t g_lower_worker_heartbeat;
 
     struct lower_executor_start_failure_cache_t
     {
@@ -1989,8 +2006,17 @@ namespace
             item->state->executing = false;
             item->state->lower_returned = true;
         }
-        const uint32_t previous_inflight = g_remote_call_lower_inflight.fetch_sub(1, std::memory_order_acq_rel);
-        outcome.inflight_after = previous_inflight == 0 ? 0 : previous_inflight - 1;
+        if (g_lower_remote_call_worker_recovering.load(std::memory_order_acquire)) {
+            g_lower_remote_call_worker_recovering.store(false, std::memory_order_release);
+            outcome.inflight_after = g_remote_call_lower_inflight.load(std::memory_order_acquire);
+            diag::log_tagged_critical_fmt("driver",
+                "lower_remote_call_worker_recovered_skip_decrement call_id=%llu inflight_skipped=1 worker_tid=%lu",
+                static_cast<unsigned long long>(item->call_id),
+                static_cast<unsigned long>(worker_tid));
+        } else {
+            const uint32_t previous_inflight = g_remote_call_lower_inflight.fetch_sub(1, std::memory_order_acq_rel);
+            outcome.inflight_after = previous_inflight == 0 ? 0 : previous_inflight - 1;
+        }
         outcome.active_pid_after = driver_bridge::attached_pid();
         outcome.generation_after = g_active_pid_generation.load(std::memory_order_acquire);
         const ULONGLONG finish = GetTickCount64();
@@ -2066,18 +2092,25 @@ namespace
         complete_lower_remote_call_item(item, outcome);
     }
 
-    void lower_remote_call_worker_main() noexcept
+    void lower_remote_call_worker_main(int worker_index) noexcept
     {
         const DWORD worker_tid = GetCurrentThreadId();
-        g_remote_call_lower_worker_tid.store(worker_tid, std::memory_order_release);
-        g_remote_call_lower_worker_alive.store(true, std::memory_order_release);
-        g_remote_call_lower_worker_loop_ready.store(true, std::memory_order_release);
-        g_remote_call_lower_start_cv.notify_all();
+        auto& tid_atomic = worker_index == 0 ? g_remote_call_lower_worker_tid : g_remote_call_lower_worker2_tid;
+        auto& alive_atomic = worker_index == 0 ? g_remote_call_lower_worker_alive : g_remote_call_lower_worker2_alive;
+        auto& loop_ready_atomic = worker_index == 0 ? g_remote_call_lower_worker_loop_ready : g_remote_call_lower_worker2_loop_ready;
+        auto& started_atomic = worker_index == 0 ? g_remote_call_lower_worker_started : g_remote_call_lower_worker2_started;
+        auto& begin_tid_ref = worker_index == 0 ? g_remote_call_lower_worker_begin_tid : g_remote_call_lower_worker2_begin_tid;
+        auto& start_cv = worker_index == 0 ? g_remote_call_lower_start_cv : g_remote_call_lower_start2_cv;
+        tid_atomic.store(worker_tid, std::memory_order_release);
+        alive_atomic.store(true, std::memory_order_release);
+        loop_ready_atomic.store(true, std::memory_order_release);
+        start_cv.notify_all();
         const lower_executor_process_stats_t stats = capture_lower_executor_process_stats();
         diag::log_tagged_fmt("driver",
-            "call_function_lower_worker_started worker_tid=%lu begin_tid=%u queue_depth=%u inflight=%u handle_count_ok=%d handle_count=%lu thread_count=%lu memory_ok=%d private_bytes=%llu working_set=%llu commit_total=%llu commit_limit=%llu loop_ready=%d",
+            "call_function_lower_worker_started worker_tid=%lu worker_index=%d begin_tid=%u queue_depth=%u inflight=%u handle_count_ok=%d handle_count=%lu thread_count=%lu memory_ok=%d private_bytes=%llu working_set=%llu commit_total=%llu commit_limit=%llu loop_ready=%d",
             static_cast<unsigned long>(worker_tid),
-            g_remote_call_lower_worker_begin_tid,
+            worker_index,
+            begin_tid_ref,
             g_remote_call_lower_queue_depth.load(std::memory_order_acquire),
             g_remote_call_lower_inflight.load(std::memory_order_acquire),
             stats.handle_count_ok ? 1 : 0,
@@ -2088,9 +2121,38 @@ namespace
             static_cast<unsigned long long>(stats.working_set),
             static_cast<unsigned long long>(stats.commit_total),
             static_cast<unsigned long long>(stats.commit_limit),
-            g_remote_call_lower_worker_loop_ready.load(std::memory_order_acquire) ? 1 : 0);
+            loop_ready_atomic.load(std::memory_order_acquire) ? 1 : 0);
         ULONGLONG idle_zero_since = 0;
+        ULONGLONG last_heartbeat = GetTickCount64();
         for (;;) {
+            const ULONGLONG hb_check_now = GetTickCount64();
+            if (hb_check_now - last_heartbeat >= 5000) {
+                last_heartbeat = hb_check_now;
+                const uint32_t hb_inflight = g_remote_call_lower_inflight.load(std::memory_order_acquire);
+                const uint32_t hb_queue = g_remote_call_lower_queue_depth.load(std::memory_order_acquire);
+                const bool hb_executing = g_lower_worker_heartbeat.executing.load(std::memory_order_acquire);
+                const uint64_t hb_call_id = g_lower_worker_heartbeat.call_id.load(std::memory_order_acquire);
+                const ULONGLONG hb_popped_at = g_lower_worker_heartbeat.popped_at.load(std::memory_order_acquire);
+                const DWORD hb_elapsed_since_pop = (hb_executing && hb_popped_at > 0) ? static_cast<DWORD>(hb_check_now - hb_popped_at) : 0;
+                char hb_phase[32] = {};
+                char hb_label[64] = {};
+                {
+                    std::lock_guard<std::mutex> hb_lk(g_lower_worker_heartbeat.str_mutex);
+                    strncpy_s(hb_phase, sizeof(hb_phase), g_lower_worker_heartbeat.phase, _TRUNCATE);
+                    strncpy_s(hb_label, sizeof(hb_label), g_lower_worker_heartbeat.label, _TRUNCATE);
+                }
+                diag::log_tagged_fmt("driver",
+                    "lower_remote_call_worker_heartbeat worker_tid=%lu worker_index=%d inflight=%u queue_depth=%u executing=%d call_id=%llu phase=%s label=%s elapsed_since_pop_ms=%lu",
+                    static_cast<unsigned long>(worker_tid),
+                    worker_index,
+                    hb_inflight,
+                    hb_queue,
+                    hb_executing ? 1 : 0,
+                    static_cast<unsigned long long>(hb_call_id),
+                    hb_phase,
+                    hb_label,
+                    static_cast<unsigned long>(hb_elapsed_since_pop));
+            }
             std::shared_ptr<lower_remote_call_work_item_t> item;
             {
                 std::unique_lock<std::mutex> lk(g_remote_call_lower_executor_mutex);
@@ -2136,6 +2198,14 @@ namespace
                 item->state->popped = true;
                 item->state->worker_tid = worker_tid;
                 item->state->popped_at = GetTickCount64();
+            }
+            g_lower_worker_heartbeat.call_id.store(item->call_id, std::memory_order_release);
+            g_lower_worker_heartbeat.popped_at.store(item->state->popped_at, std::memory_order_release);
+            g_lower_worker_heartbeat.executing.store(true, std::memory_order_release);
+            {
+                std::lock_guard<std::mutex> hb_lk(g_lower_worker_heartbeat.str_mutex);
+                strncpy_s(g_lower_worker_heartbeat.phase, sizeof(g_lower_worker_heartbeat.phase), item->phase.c_str(), _TRUNCATE);
+                strncpy_s(g_lower_worker_heartbeat.label, sizeof(g_lower_worker_heartbeat.label), item->label.c_str(), _TRUNCATE);
             }
             try {
                 execute_lower_remote_call_item(item, worker_tid);
@@ -2209,25 +2279,35 @@ namespace
                     static_cast<unsigned long>(worker_tid),
                     static_cast<unsigned long long>(outcome.elapsed_ms));
             }
+            g_lower_worker_heartbeat.executing.store(false, std::memory_order_release);
+            g_lower_worker_heartbeat.call_id.store(0, std::memory_order_release);
+            g_lower_worker_heartbeat.popped_at.store(0, std::memory_order_release);
         }
-        g_remote_call_lower_worker_alive.store(false, std::memory_order_release);
-        g_remote_call_lower_worker_started.store(false, std::memory_order_release);
-        g_remote_call_lower_worker_loop_ready.store(false, std::memory_order_release);
-        g_remote_call_lower_worker_tid.store(0, std::memory_order_release);
-        g_remote_call_lower_start_cv.notify_all();
+        alive_atomic.store(false, std::memory_order_release);
+        started_atomic.store(false, std::memory_order_release);
+        loop_ready_atomic.store(false, std::memory_order_release);
+        tid_atomic.store(0, std::memory_order_release);
+        start_cv.notify_all();
         diag::log_tagged_fmt("driver",
-            "call_function_lower_worker_stopped worker_tid=%lu begin_tid=%u queue_depth=%u inflight=%u stop=%d loop_ready=%d",
+            "call_function_lower_worker_stopped worker_tid=%lu worker_index=%d begin_tid=%u queue_depth=%u inflight=%u stop=%d loop_ready=%d",
             static_cast<unsigned long>(worker_tid),
-            g_remote_call_lower_worker_begin_tid,
+            worker_index,
+            begin_tid_ref,
             g_remote_call_lower_queue_depth.load(std::memory_order_acquire),
             g_remote_call_lower_inflight.load(std::memory_order_acquire),
             g_remote_call_lower_executor_stop.load(std::memory_order_acquire) ? 1 : 0,
-            g_remote_call_lower_worker_loop_ready.load(std::memory_order_acquire) ? 1 : 0);
+            loop_ready_atomic.load(std::memory_order_acquire) ? 1 : 0);
     }
 
     unsigned __stdcall lower_remote_call_worker_entry(void*) noexcept
     {
-        lower_remote_call_worker_main();
+        lower_remote_call_worker_main(0);
+        return 0;
+    }
+
+    unsigned __stdcall lower_remote_call_worker2_entry(void*) noexcept
+    {
+        lower_remote_call_worker_main(1);
         return 0;
     }
 
@@ -2247,6 +2327,9 @@ namespace
         g_remote_call_lower_worker_loop_ready.store(false, std::memory_order_release);
         g_remote_call_lower_worker_tid.store(0, std::memory_order_release);
         g_remote_call_lower_worker_begin_tid = 0;
+        g_remote_call_lower_worker2_loop_ready.store(false, std::memory_order_release);
+        g_remote_call_lower_worker2_tid.store(0, std::memory_order_release);
+        g_remote_call_lower_worker2_begin_tid = 0;
 
         const lower_executor_process_stats_t stats = capture_lower_executor_process_stats();
         const uint64_t resource_signature = lower_executor_resource_signature(stats);
@@ -2565,6 +2648,64 @@ namespace
             g_remote_call_lower_queue_depth.load(std::memory_order_acquire),
             g_remote_call_lower_inflight.load(std::memory_order_acquire),
             static_cast<unsigned long long>(GetTickCount64() - call_start));
+        constexpr unsigned requested_stack_bytes2 = aida::infra::win_thread::default_stack_reserve;
+        errno = 0;
+        _set_doserrno(0);
+        SetLastError(ERROR_SUCCESS);
+        const ULONGLONG create2_start = GetTickCount64();
+        unsigned begin_tid2 = 0;
+        uintptr_t raw2 = _beginthreadex(nullptr,
+                                       requested_stack_bytes2,
+                                       &lower_remote_call_worker2_entry,
+                                       nullptr,
+                                       0,
+                                       &begin_tid2);
+        const DWORD create2_gle = GetLastError();
+        HANDLE worker2_handle = reinterpret_cast<HANDLE>(raw2);
+        if (raw2 != 0) {
+            g_remote_call_lower_worker2_handle = worker2_handle;
+            g_remote_call_lower_worker2_begin_tid = begin_tid2;
+            g_remote_call_lower_worker2_started.store(true, std::memory_order_release);
+            const ULONGLONG ready2_wait_start = GetTickCount64();
+            g_remote_call_lower_start2_cv.wait_for(lk,
+                std::chrono::milliseconds(kLowerRemoteCallWorkerReadyWaitMs),
+                []() {
+                    return g_remote_call_lower_worker2_loop_ready.load(std::memory_order_acquire) ||
+                           g_remote_call_lower_executor_stop.load(std::memory_order_acquire) ||
+                           !g_remote_call_lower_worker2_started.load(std::memory_order_acquire);
+                });
+            const bool ready2 = g_remote_call_lower_worker2_loop_ready.load(std::memory_order_acquire) ||
+                                g_remote_call_lower_worker2_alive.load(std::memory_order_acquire);
+            if (!ready2) {
+                CloseHandle(g_remote_call_lower_worker2_handle);
+                g_remote_call_lower_worker2_handle = nullptr;
+                g_remote_call_lower_worker2_begin_tid = 0;
+                g_remote_call_lower_worker2_started.store(false, std::memory_order_release);
+                diag::log_tagged_fmt("driver",
+                    "call_function_lower_worker2_create_failed_best_effort call_id=%llu reason=worker2_not_ready gle=%lu begin_tid2=%u ready_wait_ms=%llu",
+                    static_cast<unsigned long long>(call_id),
+                    static_cast<unsigned long>(create2_gle),
+                    begin_tid2,
+                    static_cast<unsigned long long>(GetTickCount64() - ready2_wait_start));
+            } else {
+                diag::log_tagged_fmt("driver",
+                    "call_function_lower_worker2_create_ok call_id=%llu handle=%p begin_tid2=%u worker2_tid=%lu worker2_alive=%d loop2_ready=%d ready_wait_ms=%llu queue_depth=%u inflight=%u",
+                    static_cast<unsigned long long>(call_id),
+                    g_remote_call_lower_worker2_handle,
+                    begin_tid2,
+                    static_cast<unsigned long>(g_remote_call_lower_worker2_tid.load(std::memory_order_acquire)),
+                    g_remote_call_lower_worker2_alive.load(std::memory_order_acquire) ? 1 : 0,
+                    g_remote_call_lower_worker2_loop_ready.load(std::memory_order_acquire) ? 1 : 0,
+                    static_cast<unsigned long long>(GetTickCount64() - ready2_wait_start),
+                    g_remote_call_lower_queue_depth.load(std::memory_order_acquire),
+                    g_remote_call_lower_inflight.load(std::memory_order_acquire));
+            }
+        } else {
+            diag::log_tagged_fmt("driver",
+                "call_function_lower_worker2_create_failed_best_effort call_id=%llu reason=_beginthreadex_failed gle=%lu",
+                static_cast<unsigned long long>(call_id),
+                static_cast<unsigned long>(create2_gle));
+        }
         return true;
     }
 
@@ -2574,11 +2715,15 @@ namespace
         std::vector<std::shared_ptr<lower_remote_call_work_item_t>> cancelled;
         const char* reason_text = reason && reason[0] ? reason : "shutdown";
         bool had_worker = false;
+        bool had_worker2 = false;
         {
             std::lock_guard<std::mutex> lk(g_remote_call_lower_executor_mutex);
             had_worker = g_remote_call_lower_worker_started.load(std::memory_order_acquire) ||
                          g_remote_call_lower_worker_alive.load(std::memory_order_acquire) ||
                          g_remote_call_lower_worker_handle != nullptr;
+            had_worker2 = g_remote_call_lower_worker2_started.load(std::memory_order_acquire) ||
+                          g_remote_call_lower_worker2_alive.load(std::memory_order_acquire) ||
+                          g_remote_call_lower_worker2_handle != nullptr;
             g_remote_call_lower_executor_stop.store(true, std::memory_order_release);
             while (!g_remote_call_lower_queue.empty()) {
                 cancelled.push_back(g_remote_call_lower_queue.front());
@@ -2591,14 +2736,19 @@ namespace
             complete_lower_remote_call_cancelled(item, "executor_shutdown", cancel_time);
         g_remote_call_lower_executor_cv.notify_all();
         diag::log_tagged_fmt("driver",
-            "call_function_lower_executor_stop_begin reason=%s had_worker=%d cancelled_queued=%zu worker_tid=%lu begin_tid=%u worker_alive=%d loop_ready=%d inflight=%u wait_ms=%lu cached_failure=%d cached_failures=%u cached_suppressed=%u cached_backoff_ms=%lu elapsed_ms=%llu",
+            "call_function_lower_executor_stop_begin reason=%s had_worker=%d had_worker2=%d cancelled_queued=%zu worker_tid=%lu begin_tid=%u worker_alive=%d loop_ready=%d worker2_tid=%lu begin_tid2=%u worker2_alive=%d loop2_ready=%d inflight=%u wait_ms=%lu cached_failure=%d cached_failures=%u cached_suppressed=%u cached_backoff_ms=%lu elapsed_ms=%llu",
             reason_text,
             had_worker ? 1 : 0,
+            had_worker2 ? 1 : 0,
             cancelled.size(),
             static_cast<unsigned long>(g_remote_call_lower_worker_tid.load(std::memory_order_acquire)),
             g_remote_call_lower_worker_begin_tid,
             g_remote_call_lower_worker_alive.load(std::memory_order_acquire) ? 1 : 0,
             g_remote_call_lower_worker_loop_ready.load(std::memory_order_acquire) ? 1 : 0,
+            static_cast<unsigned long>(g_remote_call_lower_worker2_tid.load(std::memory_order_acquire)),
+            g_remote_call_lower_worker2_begin_tid,
+            g_remote_call_lower_worker2_alive.load(std::memory_order_acquire) ? 1 : 0,
+            g_remote_call_lower_worker2_loop_ready.load(std::memory_order_acquire) ? 1 : 0,
             g_remote_call_lower_inflight.load(std::memory_order_acquire),
             static_cast<unsigned long>(wait_ms),
             g_remote_call_lower_start_failure.valid ? 1 : 0,
@@ -2606,14 +2756,17 @@ namespace
             g_remote_call_lower_start_failure.suppressed_count,
             static_cast<unsigned long>(g_remote_call_lower_start_failure.backoff_ms),
             static_cast<unsigned long long>(GetTickCount64() - stop_start));
-        if (!had_worker)
+        if (!had_worker && !had_worker2)
             return;
         const ULONGLONG deadline = stop_start + wait_ms;
-        while (g_remote_call_lower_worker_alive.load(std::memory_order_acquire) && GetTickCount64() < deadline)
+        while ((g_remote_call_lower_worker_alive.load(std::memory_order_acquire) ||
+                g_remote_call_lower_worker2_alive.load(std::memory_order_acquire)) &&
+               GetTickCount64() < deadline)
             Sleep(10);
         bool joined = false;
         bool detached = false;
         HANDLE worker_to_join = nullptr;
+        HANDLE worker2_to_join = nullptr;
         {
             std::lock_guard<std::mutex> lk(g_remote_call_lower_executor_mutex);
             if (g_remote_call_lower_worker_handle) {
@@ -2628,18 +2781,38 @@ namespace
                     detached = true;
                 }
             }
+            if (g_remote_call_lower_worker2_handle) {
+                if (!g_remote_call_lower_worker2_alive.load(std::memory_order_acquire)) {
+                    worker2_to_join = g_remote_call_lower_worker2_handle;
+                    g_remote_call_lower_worker2_handle = nullptr;
+                    g_remote_call_lower_worker2_begin_tid = 0;
+                } else {
+                    CloseHandle(g_remote_call_lower_worker2_handle);
+                    g_remote_call_lower_worker2_handle = nullptr;
+                    g_remote_call_lower_worker2_begin_tid = 0;
+                    detached = true;
+                }
+            }
         }
         if (worker_to_join) {
             WaitForSingleObject(worker_to_join, INFINITE);
             CloseHandle(worker_to_join);
             joined = true;
         }
+        if (worker2_to_join) {
+            WaitForSingleObject(worker2_to_join, INFINITE);
+            CloseHandle(worker2_to_join);
+            joined = true;
+        }
         if (!g_remote_call_lower_worker_handle &&
             !g_remote_call_lower_worker_alive.load(std::memory_order_acquire) &&
-            !g_remote_call_lower_worker_started.load(std::memory_order_acquire))
+            !g_remote_call_lower_worker_started.load(std::memory_order_acquire) &&
+            !g_remote_call_lower_worker2_handle &&
+            !g_remote_call_lower_worker2_alive.load(std::memory_order_acquire) &&
+            !g_remote_call_lower_worker2_started.load(std::memory_order_acquire))
             reset_lower_executor_start_failure_cache("executor_stopped");
         diag::log_tagged_fmt("driver",
-            "call_function_lower_executor_stop_done reason=%s joined=%d detached=%d worker_alive=%d loop_ready=%d worker_tid=%lu begin_tid=%u queue_depth=%u inflight=%u cached_failure=%d cached_failures=%u cached_suppressed=%u elapsed_ms=%llu",
+            "call_function_lower_executor_stop_done reason=%s joined=%d detached=%d worker_alive=%d loop_ready=%d worker_tid=%lu begin_tid=%u worker2_alive=%d loop2_ready=%d worker2_tid=%lu begin_tid2=%u queue_depth=%u inflight=%u cached_failure=%d cached_failures=%u cached_suppressed=%u elapsed_ms=%llu",
             reason_text,
             joined ? 1 : 0,
             detached ? 1 : 0,
@@ -2647,6 +2820,10 @@ namespace
             g_remote_call_lower_worker_loop_ready.load(std::memory_order_acquire) ? 1 : 0,
             static_cast<unsigned long>(g_remote_call_lower_worker_tid.load(std::memory_order_acquire)),
             g_remote_call_lower_worker_begin_tid,
+            g_remote_call_lower_worker2_alive.load(std::memory_order_acquire) ? 1 : 0,
+            g_remote_call_lower_worker2_loop_ready.load(std::memory_order_acquire) ? 1 : 0,
+            static_cast<unsigned long>(g_remote_call_lower_worker2_tid.load(std::memory_order_acquire)),
+            g_remote_call_lower_worker2_begin_tid,
             g_remote_call_lower_queue_depth.load(std::memory_order_acquire),
             g_remote_call_lower_inflight.load(std::memory_order_acquire),
             g_remote_call_lower_start_failure.valid ? 1 : 0,
@@ -2666,16 +2843,22 @@ namespace
                                            lower_remote_call_outcome_t& failure_outcome)
     {
         if (!g_remote_call_lower_executor_stop.load(std::memory_order_acquire) &&
-            g_remote_call_lower_worker_started.load(std::memory_order_acquire) &&
-            (g_remote_call_lower_worker_loop_ready.load(std::memory_order_acquire) ||
-             g_remote_call_lower_worker_alive.load(std::memory_order_acquire)))
+            ((g_remote_call_lower_worker_started.load(std::memory_order_acquire) &&
+              (g_remote_call_lower_worker_loop_ready.load(std::memory_order_acquire) ||
+               g_remote_call_lower_worker_alive.load(std::memory_order_acquire))) ||
+             (g_remote_call_lower_worker2_started.load(std::memory_order_acquire) &&
+              (g_remote_call_lower_worker2_loop_ready.load(std::memory_order_acquire) ||
+               g_remote_call_lower_worker2_alive.load(std::memory_order_acquire)))))
             return true;
 
         std::unique_lock<std::mutex> lk(g_remote_call_lower_executor_mutex);
         if (!g_remote_call_lower_executor_stop.load(std::memory_order_acquire) &&
-            g_remote_call_lower_worker_started.load(std::memory_order_acquire) &&
-            (g_remote_call_lower_worker_loop_ready.load(std::memory_order_acquire) ||
-             g_remote_call_lower_worker_alive.load(std::memory_order_acquire)))
+            ((g_remote_call_lower_worker_started.load(std::memory_order_acquire) &&
+              (g_remote_call_lower_worker_loop_ready.load(std::memory_order_acquire) ||
+               g_remote_call_lower_worker_alive.load(std::memory_order_acquire))) ||
+             (g_remote_call_lower_worker2_started.load(std::memory_order_acquire) &&
+              (g_remote_call_lower_worker2_loop_ready.load(std::memory_order_acquire) ||
+               g_remote_call_lower_worker2_alive.load(std::memory_order_acquire)))))
             return true;
         if (g_remote_call_lower_executor_stop.load(std::memory_order_acquire)) {
             failure_outcome.gle = ERROR_OPERATION_ABORTED;
@@ -2719,9 +2902,12 @@ namespace
             CloseHandle(previous_worker);
             lk.lock();
             if (!g_remote_call_lower_executor_stop.load(std::memory_order_acquire) &&
-                g_remote_call_lower_worker_started.load(std::memory_order_acquire) &&
-                (g_remote_call_lower_worker_loop_ready.load(std::memory_order_acquire) ||
-                 g_remote_call_lower_worker_alive.load(std::memory_order_acquire)))
+                ((g_remote_call_lower_worker_started.load(std::memory_order_acquire) &&
+                  (g_remote_call_lower_worker_loop_ready.load(std::memory_order_acquire) ||
+                   g_remote_call_lower_worker_alive.load(std::memory_order_acquire))) ||
+                 (g_remote_call_lower_worker2_started.load(std::memory_order_acquire) &&
+                  (g_remote_call_lower_worker2_loop_ready.load(std::memory_order_acquire) ||
+                   g_remote_call_lower_worker2_alive.load(std::memory_order_acquire)))))
                 return true;
             if (g_remote_call_lower_executor_stop.load(std::memory_order_acquire)) {
                 failure_outcome.gle = ERROR_OPERATION_ABORTED;
@@ -2738,6 +2924,15 @@ namespace
                 failure_outcome.completion_reason = "executor_stopping";
                 return false;
             }
+        }
+        if (g_remote_call_lower_worker2_handle) {
+            HANDLE previous_worker2 = g_remote_call_lower_worker2_handle;
+            g_remote_call_lower_worker2_handle = nullptr;
+            g_remote_call_lower_worker2_begin_tid = 0;
+            lk.unlock();
+            WaitForSingleObject(previous_worker2, INFINITE);
+            CloseHandle(previous_worker2);
+            lk.lock();
         }
         return start_lower_remote_call_executor_locked(lk,
                                                        "demand",
@@ -2771,9 +2966,12 @@ namespace
             call_ctx.context_active = false;
             std::unique_lock<std::mutex> lk(g_remote_call_lower_executor_mutex);
             if (!g_remote_call_lower_executor_stop.load(std::memory_order_acquire) &&
-                g_remote_call_lower_worker_started.load(std::memory_order_acquire) &&
-                (g_remote_call_lower_worker_loop_ready.load(std::memory_order_acquire) ||
-                 g_remote_call_lower_worker_alive.load(std::memory_order_acquire))) {
+                ((g_remote_call_lower_worker_started.load(std::memory_order_acquire) &&
+                  (g_remote_call_lower_worker_loop_ready.load(std::memory_order_acquire) ||
+                   g_remote_call_lower_worker_alive.load(std::memory_order_acquire))) ||
+                 (g_remote_call_lower_worker2_started.load(std::memory_order_acquire) &&
+                  (g_remote_call_lower_worker2_loop_ready.load(std::memory_order_acquire) ||
+                   g_remote_call_lower_worker2_alive.load(std::memory_order_acquire))))) {
                 diag::log_tagged_fmt("driver",
                     "lower_executor_prestart_skip reason=%s already_started=1 active_pid=%u generation=%llu state_mutex_held=%d worker_tid=%lu begin_tid=%u loop_ready=%d elapsed_ms=%llu",
                     reason && reason[0] ? reason : "",
@@ -2794,6 +2992,16 @@ namespace
                 lk.unlock();
                 WaitForSingleObject(previous, INFINITE);
                 CloseHandle(previous);
+                lk.lock();
+            }
+            if (g_remote_call_lower_worker2_handle &&
+                !g_remote_call_lower_worker2_alive.load(std::memory_order_acquire)) {
+                HANDLE previous2 = g_remote_call_lower_worker2_handle;
+                g_remote_call_lower_worker2_handle = nullptr;
+                g_remote_call_lower_worker2_begin_tid = 0;
+                lk.unlock();
+                WaitForSingleObject(previous2, INFINITE);
+                CloseHandle(previous2);
                 lk.lock();
             }
             const bool ok = start_lower_remote_call_executor_locked(lk,
@@ -2859,7 +3067,8 @@ namespace
     };
 
     constexpr DWORD kSetActivePidDrainTimeoutMs = 2500;
-    constexpr DWORD kAttachAdditionalDrainTimeoutMs = 9000;
+    constexpr DWORD kAttachAdditionalDrainTimeoutMs = 6000;
+    constexpr DWORD kStuckWorkerBypassMs = 3000;
 
     lower_remote_call_drain_result_t wait_lower_remote_call_drain_for_pid_switch(uint32_t from_pid,
                                                                                  uint32_t to_pid,
@@ -2868,6 +3077,7 @@ namespace
     {
         const ULONGLONG started = GetTickCount64();
         ULONGLONG zero_since = 0;
+        ULONGLONG stuck_since = 0;
         lower_remote_call_drain_result_t result{};
         for (;;) {
             const ULONGLONG now = GetTickCount64();
@@ -2903,6 +3113,31 @@ namespace
             } else {
                 zero_since = 0;
                 result.stable_zero_ms = 0;
+                if (result.inflight == 1 && result.last_abandoned == 1) {
+                    if (stuck_since == 0)
+                        stuck_since = now;
+                    const DWORD stuck_ms = static_cast<DWORD>(now - stuck_since);
+                    if (stuck_ms >= kStuckWorkerBypassMs) {
+                        g_active_pid_generation.fetch_add(1, std::memory_order_acq_rel);
+                        g_remote_call_lower_inflight.store(0, std::memory_order_release);
+                        g_lower_remote_call_worker_recovering.store(true, std::memory_order_release);
+                        g_lower_remote_call_last_abandoned.store(false, std::memory_order_release);
+                        result.drained = true;
+                        result.inflight = 0;
+                        result.last_abandoned = 0;
+                        diag::log_tagged_critical_fmt("driver",
+                            "lower_remote_call_drain_stuck_bypass phase=%s from_pid=%u to_pid=%u stuck_ms=%lu generation_bumped=1 inflight_forced=0 worker_tid=%lu elapsed_ms=%lu",
+                            phase ? phase : "",
+                            from_pid,
+                            to_pid,
+                            static_cast<unsigned long>(stuck_ms),
+                            static_cast<unsigned long>(g_remote_call_lower_worker_tid.load(std::memory_order_acquire)),
+                            static_cast<unsigned long>(result.elapsed_ms));
+                        return result;
+                    }
+                } else {
+                    stuck_since = 0;
+                }
             }
             if (result.elapsed_ms >= timeout_ms) {
                 diag::log_tagged_fmt("driver",

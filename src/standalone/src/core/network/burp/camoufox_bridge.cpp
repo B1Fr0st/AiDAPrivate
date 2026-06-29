@@ -4416,6 +4416,9 @@ call_result_t call_with_deadline(const std::string& tool_name, const nlohmann::j
         bool                             cancelled = false;
         uint64_t                         generation = 0;
         uint32_t                         child_pid = 0;
+        bool                             half_logged = false;
+        bool                             quarter_logged = false;
+        bool                             ninety_logged = false;
         mcp_client::call_result_t        result;
     };
     auto state = std::make_shared<shared_state_t>();
@@ -4667,6 +4670,36 @@ call_result_t call_with_deadline(const std::string& tool_name, const nlohmann::j
         const uint64_t elapsed = now_ms() - wait_start_ms;
         if (elapsed >= static_cast<uint64_t>(timeout_ms))
             break;
+        const uint64_t half_mark = static_cast<uint64_t>(timeout_ms) / 2;
+        const uint64_t quarter_mark = static_cast<uint64_t>(timeout_ms) * 3 / 4;
+        const uint64_t ninety_mark = static_cast<uint64_t>(timeout_ms) * 9 / 10;
+        if (!state->half_logged && elapsed >= half_mark)
+        {
+            state->half_logged = true;
+            diag::log_tagged_fmt("camoufox", "call_with_deadline progress=50pct request_id=%llu tool=%s elapsed_ms=%llu timeout_ms=%d generation=%llu child_pid=%lu done=%d",
+                static_cast<unsigned long long>(request_id), tool_name.c_str(),
+                static_cast<unsigned long long>(elapsed), timeout_ms,
+                static_cast<unsigned long long>(state->generation), static_cast<unsigned long>(state->child_pid),
+                state->done ? 1 : 0);
+        }
+        if (!state->quarter_logged && elapsed >= quarter_mark)
+        {
+            state->quarter_logged = true;
+            diag::log_tagged_fmt("camoufox", "call_with_deadline progress=75pct request_id=%llu tool=%s elapsed_ms=%llu timeout_ms=%d generation=%llu child_pid=%lu done=%d",
+                static_cast<unsigned long long>(request_id), tool_name.c_str(),
+                static_cast<unsigned long long>(elapsed), timeout_ms,
+                static_cast<unsigned long long>(state->generation), static_cast<unsigned long>(state->child_pid),
+                state->done ? 1 : 0);
+        }
+        if (!state->ninety_logged && elapsed >= ninety_mark)
+        {
+            state->ninety_logged = true;
+            diag::log_tagged_fmt("camoufox", "call_with_deadline progress=90pct request_id=%llu tool=%s elapsed_ms=%llu timeout_ms=%d generation=%llu child_pid=%lu done=%d",
+                static_cast<unsigned long long>(request_id), tool_name.c_str(),
+                static_cast<unsigned long long>(elapsed), timeout_ms,
+                static_cast<unsigned long long>(state->generation), static_cast<unsigned long>(state->child_pid),
+                state->done ? 1 : 0);
+        }
         const uint64_t remaining = static_cast<uint64_t>(timeout_ms) - elapsed;
         state->cv.wait_for(lk, std::chrono::milliseconds(static_cast<int>(std::min<uint64_t>(remaining, 250))), [&state]() { return state->done; });
     }
@@ -4725,9 +4758,143 @@ call_result_t call_with_deadline(const std::string& tool_name, const nlohmann::j
         if (timed_out_client)
             cleanup_client_reap_now_detach_disconnect(timed_out_client, timed_out_child_pid, std::string(cancelled_by_stop ? "cancel_" : "timeout_") + tool_name, timed_out_generation);
         else if (retained_timed_out_client)
+        {
             diag::log_tagged_fmt("camoufox", "call_with_deadline retained_timeout request_id=%llu tool=%s generation=%llu child_pid=%lu",
                 static_cast<unsigned long long>(request_id), tool_name.c_str(),
                 static_cast<unsigned long long>(timed_out_generation), static_cast<unsigned long>(timed_out_child_pid));
+            auto recovery_cli = cli;
+            const uint64_t recovery_generation = timed_out_generation;
+            const uint32_t recovery_child_pid = timed_out_child_pid;
+            const uint64_t recovery_request_id = request_id;
+            const std::string recovery_tool_name = tool_name;
+            post_bridge_task("camoufox.recovery", [recovery_cli, recovery_generation, recovery_child_pid, recovery_request_id, recovery_tool_name]() {
+                const uint64_t recovery_start_ms = now_ms();
+                Sleep(500);
+                bool needs_recovery = false;
+                {
+                    std::lock_guard<std::recursive_mutex> g(sg().mtx);
+                    needs_recovery = sg().state == bridge_state_t::error &&
+                                     sg().generation == recovery_generation &&
+                                     sg().client == recovery_cli &&
+                                     sg().child_pid == recovery_child_pid &&
+                                     recovery_child_pid != 0 &&
+                                     process_alive(recovery_child_pid);
+                }
+                if (!needs_recovery)
+                {
+                    diag::log_tagged_fmt("camoufox", "call_with_deadline page_crash_recovery skipped request_id=%llu tool=%s generation=%llu child_pid=%lu reason=state_changed",
+                        static_cast<unsigned long long>(recovery_request_id), recovery_tool_name.c_str(),
+                        static_cast<unsigned long long>(recovery_generation), static_cast<unsigned long>(recovery_child_pid));
+                    return;
+                }
+                diag::log_tagged_fmt("camoufox", "call_with_deadline page_crash_recovery begin request_id=%llu tool=%s generation=%llu child_pid=%lu",
+                    static_cast<unsigned long long>(recovery_request_id), recovery_tool_name.c_str(),
+                    static_cast<unsigned long long>(recovery_generation), static_cast<unsigned long>(recovery_child_pid));
+                const std::string list_tool = "list_pages";
+                const nlohmann::json list_args = nlohmann::json::object();
+                mcp_client::call_result_t list_result;
+                guarded_mcp_call_context_t list_ctx;
+                list_ctx.client = recovery_cli.get();
+                list_ctx.tool_name = &list_tool;
+                list_ctx.args = &list_args;
+                list_ctx.result = &list_result;
+                DWORD list_status = guarded_mcp_call(&list_ctx);
+                const uint64_t list_elapsed_ms = now_ms() - recovery_start_ms;
+                if (list_status != ERROR_SUCCESS || !list_result.success)
+                {
+                    diag::log_tagged_fmt("camoufox", "call_with_deadline page_crash_recovery list_pages_failed request_id=%llu tool=%s generation=%llu child_pid=%lu guard_status=0x%08lX success=%d elapsed_ms=%llu text_len=%zu",
+                        static_cast<unsigned long long>(recovery_request_id), recovery_tool_name.c_str(),
+                        static_cast<unsigned long long>(recovery_generation), static_cast<unsigned long>(recovery_child_pid),
+                        static_cast<unsigned long>(list_status), static_cast<int>(list_result.success),
+                        static_cast<unsigned long long>(list_elapsed_ms), list_result.text.size());
+                    return;
+                }
+                diag::log_tagged_fmt("camoufox", "call_with_deadline page_crash_recovery list_pages_ok request_id=%llu tool=%s generation=%llu child_pid=%lu elapsed_ms=%llu data_shape=%s",
+                    static_cast<unsigned long long>(recovery_request_id), recovery_tool_name.c_str(),
+                    static_cast<unsigned long long>(recovery_generation), static_cast<unsigned long>(recovery_child_pid),
+                    static_cast<unsigned long long>(list_elapsed_ms), json_shape(list_result.data).c_str());
+                bool has_pages = false;
+                if (list_result.data.is_object())
+                {
+                    const auto pages_it = list_result.data.find("pages");
+                    if (pages_it != list_result.data.end() && pages_it->is_array() && !pages_it->empty())
+                        has_pages = true;
+                }
+                else if (list_result.data.is_array() && !list_result.data.empty())
+                {
+                    has_pages = true;
+                }
+                if (!has_pages)
+                {
+                    diag::log_tagged_fmt("camoufox", "call_with_deadline page_crash_recovery no_pages_creating_new request_id=%llu tool=%s generation=%llu child_pid=%lu",
+                        static_cast<unsigned long long>(recovery_request_id), recovery_tool_name.c_str(),
+                        static_cast<unsigned long long>(recovery_generation), static_cast<unsigned long>(recovery_child_pid));
+                    const std::string new_page_tool = "new_page";
+                    nlohmann::json new_page_args = nlohmann::json::object();
+                    new_page_args["page_id"] = std::string("recovered_") + std::to_string(recovery_generation);
+                    mcp_client::call_result_t new_page_result;
+                    guarded_mcp_call_context_t new_page_ctx;
+                    new_page_ctx.client = recovery_cli.get();
+                    new_page_ctx.tool_name = &new_page_tool;
+                    new_page_ctx.args = &new_page_args;
+                    new_page_ctx.result = &new_page_result;
+                    DWORD new_page_status = guarded_mcp_call(&new_page_ctx);
+                    const uint64_t new_page_elapsed_ms = now_ms() - recovery_start_ms;
+                    if (new_page_status != ERROR_SUCCESS || !new_page_result.success)
+                    {
+                        diag::log_tagged_fmt("camoufox", "call_with_deadline page_crash_recovery new_page_failed request_id=%llu tool=%s generation=%llu child_pid=%lu guard_status=0x%08lX success=%d elapsed_ms=%llu text_len=%zu",
+                            static_cast<unsigned long long>(recovery_request_id), recovery_tool_name.c_str(),
+                            static_cast<unsigned long long>(recovery_generation), static_cast<unsigned long>(recovery_child_pid),
+                            static_cast<unsigned long>(new_page_status), static_cast<int>(new_page_result.success),
+                            static_cast<unsigned long long>(new_page_elapsed_ms), new_page_result.text.size());
+                        return;
+                    }
+                    diag::log_tagged_fmt("camoufox", "call_with_deadline page_crash_recovery new_page_ok request_id=%llu tool=%s generation=%llu child_pid=%lu elapsed_ms=%llu data_shape=%s",
+                        static_cast<unsigned long long>(recovery_request_id), recovery_tool_name.c_str(),
+                        static_cast<unsigned long long>(recovery_generation), static_cast<unsigned long>(recovery_child_pid),
+                        static_cast<unsigned long long>(new_page_elapsed_ms), json_shape(new_page_result.data).c_str());
+                    {
+                        std::lock_guard<std::recursive_mutex> g(sg().mtx);
+                        if (sg().generation == recovery_generation && sg().client == recovery_cli)
+                        {
+                            sg().state = bridge_state_t::ready;
+                            clear_error_locked();
+                            clear_auto_restart_block_locked("page_crash_recovery_new_page");
+                            sg().browser_open = true;
+                            sg().page_verified = true;
+                            if (!new_page_result.data.is_null())
+                                update_page_cache_from_json_locked(new_page_result.data, "page_crash_recovery_new_page");
+                            sg().last_call_ms = now_ms();
+                        }
+                    }
+                    publish_state(bridge_state_t::ready, {});
+                    diag::log_tagged_fmt("camoufox", "call_with_deadline page_crash_recovery recovered_via_new_page request_id=%llu tool=%s generation=%llu child_pid=%lu total_elapsed_ms=%llu",
+                        static_cast<unsigned long long>(recovery_request_id), recovery_tool_name.c_str(),
+                        static_cast<unsigned long long>(recovery_generation), static_cast<unsigned long>(recovery_child_pid),
+                        static_cast<unsigned long long>(now_ms() - recovery_start_ms));
+                    return;
+                }
+                {
+                    std::lock_guard<std::recursive_mutex> g(sg().mtx);
+                    if (sg().generation == recovery_generation && sg().client == recovery_cli)
+                    {
+                        sg().state = bridge_state_t::ready;
+                        clear_error_locked();
+                        clear_auto_restart_block_locked("page_crash_recovery_list_pages");
+                        sg().browser_open = true;
+                        sg().page_verified = true;
+                        if (!list_result.data.is_null())
+                            update_page_cache_from_json_locked(list_result.data, "page_crash_recovery_list_pages");
+                        sg().last_call_ms = now_ms();
+                    }
+                }
+                publish_state(bridge_state_t::ready, {});
+                diag::log_tagged_fmt("camoufox", "call_with_deadline page_crash_recovery recovered_via_list_pages request_id=%llu tool=%s generation=%llu child_pid=%lu total_elapsed_ms=%llu",
+                    static_cast<unsigned long long>(recovery_request_id), recovery_tool_name.c_str(),
+                    static_cast<unsigned long long>(recovery_generation), static_cast<unsigned long>(recovery_child_pid),
+                    static_cast<unsigned long long>(now_ms() - recovery_start_ms));
+            });
+        }
         const process_exit_snapshot_t timeout_exit = query_process_exit_snapshot(timed_out_child_pid);
         const std::vector<process_tree_entry_t> timeout_tree_after = timed_out_child_pid == 0 ? std::vector<process_tree_entry_t>() : enumerate_process_tree(timed_out_child_pid);
         const std::string call_debug_log = camoufox_debug_log_path();
