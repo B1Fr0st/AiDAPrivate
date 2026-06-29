@@ -1598,6 +1598,10 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			int wait = 0;
 			int max_wait = static_cast<int>((cfg.timeout_ms + 49) / 50);
 			while (crypto_scanner::g_state.scanning.load() && wait < max_wait) {
+				if (mcp_standalone::current_call_cancelled()) {
+					crypto_scanner::cancel();
+					break;
+				}
 				Sleep(50);
 				++wait;
 			}
@@ -1671,6 +1675,8 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 
 			int wait = 0;
 			while (aob_generator::g_state.generating.load() && wait < 100) {
+				if (mcp_standalone::current_call_cancelled())
+					return tool_result_t::error("AOB signature generation cancelled.");
 				Sleep(100);
 				++wait;
 			}
@@ -1748,6 +1754,10 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			int wait = 0;
 			int max_wait = static_cast<int>((timeout_ms + 49) / 50);
 			while (struct_recon::g_state.monitoring.load() && wait < max_wait) {
+				if (mcp_standalone::current_call_cancelled()) {
+					struct_recon::cancel();
+					break;
+				}
 				Sleep(50);
 				++wait;
 			}
@@ -1980,6 +1990,12 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			const auto install_start = std::chrono::steady_clock::now();
 			while (!integrity_hunter::install_complete_for_generation(generation) &&
 			       (integrity_hunter::g_state.hunting.load() || integrity_hunter::g_state.worker_active.load())) {
+				if (mcp_standalone::current_call_cancelled()) {
+					integrity_hunter::stop_hunt();
+					const auto idle_state = integrity_hunter::wait_until_idle_result(12000);
+					auto result = make_failure_payload("cancelled", generation, idle_state);
+					return tool_result_t::error("integrity hunter cancelled during install", result);
+				}
 				const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
 					std::chrono::steady_clock::now() - install_start).count();
 				if (elapsed >= 6500) {
@@ -2068,6 +2084,8 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 
 			const auto monitor_start = std::chrono::steady_clock::now();
 			while (integrity_hunter::g_state.hunting.load()) {
+				if (mcp_standalone::current_call_cancelled())
+					break;
 				const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
 					std::chrono::steady_clock::now() - monitor_start).count();
 				if (elapsed >= duration)

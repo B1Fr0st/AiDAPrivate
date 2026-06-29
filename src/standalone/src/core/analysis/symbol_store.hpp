@@ -12,8 +12,6 @@
 #include <memory>
 #include <mutex>
 #include <string>
-#include <system_error>
-#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -26,6 +24,7 @@
 #include "../testlab/test_all_features.hpp"
 #include "../anti-tamper/state.hpp"
 #include "../infra/critical_work_queue.hpp"
+#include "../infra/win_thread.hpp"
 #include "../../helpers/diag_log.hpp"
 
 extern settings_sa_t g_settings;
@@ -1299,7 +1298,7 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 			std::atomic<float> parse_progress{0.f};
 			std::string search_path = std::filesystem::path(path_copy).parent_path().string();
 			std::atomic<bool> parse_monitor_done{false};
-			std::unique_ptr<std::thread> parse_monitor;
+			std::unique_ptr<aida::infra::win_thread::joinable_thread_t> parse_monitor;
 			auto parse_monitor_body = [&]() {
 				uint64_t last_log_ms = 0;
 				while (!parse_monitor_done.load(std::memory_order_acquire)) {
@@ -1343,61 +1342,59 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 			};
 			constexpr int k_parse_monitor_max_attempts = 3;
 			for (int attempt = 1; attempt <= k_parse_monitor_max_attempts; ++attempt) {
-				try {
-					parse_monitor = std::make_unique<std::thread>(parse_monitor_body);
+				parse_monitor = std::make_unique<aida::infra::win_thread::joinable_thread_t>();
+				std::string mon_err;
+				if (parse_monitor->start(parse_monitor_body, &mon_err,
+					aida::infra::win_thread::fixture_stack_reserve, "pdb_parse_monitor")) {
 					parse_monitor_unavailable = false;
 					parse_monitor_error.clear();
 					break;
-				} catch (const std::system_error& ex) {
-					parse_monitor_unavailable = true;
-					parse_monitor_error = ex.what();
-					diag::log_tagged_fmt("symbol_store",
-						"explicit_pdb_parse_monitor_retry module=%s generation=%llu attempt=%d max_attempts=%d err='%s' code=%d category=%s",
-						mod_copy.c_str(),
-						static_cast<unsigned long long>(generation),
-						attempt,
-						k_parse_monitor_max_attempts,
-						ex.what(),
-						ex.code().value(),
-						ex.code().category().name());
-					if (attempt < k_parse_monitor_max_attempts) {
-						Sleep(static_cast<DWORD>(50 * attempt));
-						continue;
-					}
-					const std::string parser_diag = pdb_parser::dbghelp_load_diagnostic();
-					auto wq = work_queue::stats();
-					auto sq = work_queue::service_stats();
-					auto cq = critical_work_queue::stats();
-					{
-						std::lock_guard<std::mutex> lk(g_state.mutex);
-						auto it = g_state.modules.find(mod_copy);
-						if (it != g_state.modules.end() && it->second.load_generation == generation && it->second.loading && it->second.load_phase == "parse") {
-							auto& ms = it->second;
-							ms.parse_diagnostic = parser_diag;
-							ms.load_failure_detail = std::string("parse monitor unavailable: ") + parse_monitor_error + " | " + parser_diag;
-						}
-					}
-					diag::log_tagged_critical_fmt("symbol_store",
-						"explicit_pdb_parse_monitor_giveup module=%s generation=%llu path='%s' file_size=%llu attempts=%d err='%s' code=%d category=%s parser_diag=\"%s\" work_pending=%zu work_active=%u work_rejected=%llu service_pending=%zu service_active=%u service_rejected=%llu critical_pending=%zu critical_active=%u critical_rejected=%llu",
-						mod_copy.c_str(),
-						static_cast<unsigned long long>(generation),
-						path_copy.c_str(),
-						static_cast<unsigned long long>(file_size_copy),
-						k_parse_monitor_max_attempts,
-						ex.what(),
-						ex.code().value(),
-						ex.code().category().name(),
-						parser_diag.c_str(),
-						wq.pending,
-						wq.active,
-						static_cast<unsigned long long>(wq.rejected),
-						sq.pending,
-						sq.active,
-						static_cast<unsigned long long>(sq.rejected),
-						cq.pending,
-						cq.active,
-						static_cast<unsigned long long>(cq.rejected));
 				}
+				parse_monitor.reset();
+				parse_monitor_unavailable = true;
+				parse_monitor_error = mon_err;
+				diag::log_tagged_fmt("symbol_store",
+					"explicit_pdb_parse_monitor_retry module=%s generation=%llu attempt=%d max_attempts=%d err='%s'",
+					mod_copy.c_str(),
+					static_cast<unsigned long long>(generation),
+					attempt,
+					k_parse_monitor_max_attempts,
+					mon_err.c_str());
+				if (attempt < k_parse_monitor_max_attempts) {
+					Sleep(static_cast<DWORD>(100 * attempt * attempt));
+					continue;
+				}
+				const std::string parser_diag = pdb_parser::dbghelp_load_diagnostic();
+				auto wq = work_queue::stats();
+				auto sq = work_queue::service_stats();
+				auto cq = critical_work_queue::stats();
+				{
+					std::lock_guard<std::mutex> lk(g_state.mutex);
+					auto it = g_state.modules.find(mod_copy);
+					if (it != g_state.modules.end() && it->second.load_generation == generation && it->second.loading && it->second.load_phase == "parse") {
+						auto& ms = it->second;
+						ms.parse_diagnostic = parser_diag;
+						ms.load_failure_detail = std::string("parse monitor unavailable: ") + parse_monitor_error + " | " + parser_diag;
+					}
+				}
+				diag::log_tagged_critical_fmt("symbol_store",
+					"explicit_pdb_parse_monitor_giveup module=%s generation=%llu path='%s' file_size=%llu attempts=%d err='%s' parser_diag=\"%s\" work_pending=%zu work_active=%u work_rejected=%llu service_pending=%zu service_active=%u service_rejected=%llu critical_pending=%zu critical_active=%u critical_rejected=%llu",
+					mod_copy.c_str(),
+					static_cast<unsigned long long>(generation),
+					path_copy.c_str(),
+					static_cast<unsigned long long>(file_size_copy),
+					k_parse_monitor_max_attempts,
+					mon_err.c_str(),
+					parser_diag.c_str(),
+					wq.pending,
+					wq.active,
+					static_cast<unsigned long long>(wq.rejected),
+					sq.pending,
+					sq.active,
+					static_cast<unsigned long long>(sq.rejected),
+					cq.pending,
+					cq.active,
+					static_cast<unsigned long long>(cq.rejected));
 			}
 			auto stop_parse_monitor = [&]() {
 				parse_monitor_done.store(true, std::memory_order_release);
@@ -1406,19 +1403,14 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 			};
 			if (parse_monitor_unavailable) {
 				const std::string parser_diag = pdb_parser::dbghelp_load_diagnostic();
-				char status[768];
-				snprintf(status, sizeof(status),
-					"PDB pre-parser resource failure: parse monitor unavailable after %d attempts: %s; %s",
+				diag::log_tagged_fmt("symbol_store",
+					"explicit_pdb_parse_monitor_unavailable_proceeding module=%s generation=%llu path='%s' attempts=%d monitor_error='%s' parser_diag=\"%s\"",
+					mod_copy.c_str(),
+					static_cast<unsigned long long>(generation),
+					path_copy.c_str(),
 					k_parse_monitor_max_attempts,
 					parse_monitor_error.c_str(),
 					parser_diag.c_str());
-				std::string detail = std::string("parse_monitor_unavailable=1 attempts=") +
-					std::to_string(k_parse_monitor_max_attempts) +
-					" parser_called=0 monitor_error='" + parse_monitor_error + "' | " + parser_diag;
-				publish_failed_load_result(mod_copy, generation, status,
-					"explicit_pdb_pre_parser_resource_failure",
-					detail.c_str(), GetTickCount64() - job_start);
-				return;
 			}
 			bool parse_ok = false;
 			try {

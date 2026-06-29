@@ -1152,6 +1152,16 @@ static tool_result_t handle_pointer_scan(const json& params) {
 	const int loops = (timeout_ms + 49) / 50;
 	for (int i = 0; i < loops; ++i) {
 		if (!memory_scanner::g_state.pointer_scanning.load()) break;
+		if (mcp_standalone::current_call_cancelled()) {
+			memory_scanner::cancel_pointer_scan();
+			json result;
+			add_scanner_action_context(result, "scanner_pointer_scan");
+			result["cancelled"] = true;
+			result["target_address"] = sa_format_address(addr);
+			result["poll_iteration"] = i;
+			diag::log_tagged_fmt("scanner", "mcp pointer_scan cancelled tick=%d/%d", i + 1, loops);
+			return tool_result_t::error(OBFSTR("Pointer scan cancelled."), "cancelled", result);
+		}
 		if (i == 0 || ((i + 1) % 20) == 0) {
 			std::lock_guard<std::mutex> lk(memory_scanner::g_state.pointer_mutex);
 			diag::log_tagged_fmt("scanner", "mcp pointer_scan wait tick=%d/%d results=%zu",
@@ -1786,6 +1796,8 @@ static tool_result_t handle_assert_memory_type(const json& params) {
 	double observed_max = -std::numeric_limits<double>::infinity();
 
 	for (int i = 0; i < sample_count; ++i) {
+		if (mcp_standalone::current_call_cancelled())
+			return tool_result_t::error(OBFSTR("Memory type assertion cancelled during sampling."));
 		std::vector<uint8_t> bytes;
 		const bool read_ok = driver_bridge::read_memory(effective, read_size, bytes) && bytes.size() >= read_size;
 		json sample;

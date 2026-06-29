@@ -474,7 +474,7 @@ namespace xref_index {
 			std::unordered_map<uint64_t, std::vector<annotation_t>> map;
 			map.reserve(4096);
 
-			const size_t page_size = 4096;
+			const size_t page_size = 65536;
 			const uint64_t module_size = mod->size;
 			size_t pages_read = 0;
 			size_t pages_failed = 0;

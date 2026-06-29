@@ -1684,10 +1684,17 @@ namespace {
         ch_data[10] = 0x03;
 
         auto hello = protocol_parser::parse_client_hello(ch_data, sizeof(ch_data));
-        log_msg(hf, tag, "PASS -- parse_client_hello called, valid=%s sni=%s",
-            hello.valid ? "true" : "false",
-            hello.sni.empty() ? "(empty)" : hello.sni.c_str());
-        passed.fetch_add(1);
+        if (hello.valid) {
+            log_msg(hf, tag, "PASS -- parse_client_hello valid=%s sni=%s",
+                hello.valid ? "true" : "false",
+                hello.sni.empty() ? "(empty)" : hello.sni.c_str());
+            passed.fetch_add(1);
+        } else {
+            log_msg(hf, tag, "FAIL -- parse_client_hello invalid valid=%s sni=%s",
+                hello.valid ? "true" : "false",
+                hello.sni.empty() ? "(empty)" : hello.sni.c_str());
+            failed.fetch_add(1);
+        }
     }
 
     void test_detect_protocol(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -1827,8 +1834,15 @@ namespace {
             is_quic ? "true" : "false",
             header.valid ? "true" : "false",
             header.dcid_hex().c_str());
-        log_msg(hf, tag, "PASS -- QUIC detection executed");
-        passed.fetch_add(1);
+        if (is_quic && header.valid) {
+            log_msg(hf, tag, "PASS -- QUIC detected and header valid");
+            passed.fetch_add(1);
+        } else {
+            log_msg(hf, tag, "FAIL -- is_quic=%s header.valid=%s",
+                is_quic ? "true" : "false",
+                header.valid ? "true" : "false");
+            failed.fetch_add(1);
+        }
     }
 
     void test_http_engine_parse_request(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -1987,8 +2001,8 @@ namespace {
             log_msg(hf, tag, "PASS -- cert_generator initialized and ready");
             passed.fetch_add(1);
         } else {
-            log_msg(hf, tag, "PASS -- cert_generator init returned ok=%s ready=%s (acceptable without OpenSSL)", ok ? "true" : "false", ready ? "true" : "false");
-            passed.fetch_add(1);
+            log_msg(hf, tag, "FAIL -- cert_generator init returned ok=%s ready=%s", ok ? "true" : "false", ready ? "true" : "false");
+            failed.fetch_add(1);
         }
     }
 
@@ -2180,7 +2194,7 @@ namespace {
         const char* tag = "cert_ctx_cache";
         log_msg(hf, tag, "START -- cert_generator::clear_ssl_ctx_cache()");
         cert_generator::clear_ssl_ctx_cache();
-        log_msg(hf, tag, "PASS -- SSL CTX cache cleared");
+        log_msg(hf, tag, "SMOKE-PASS -- SSL CTX cache cleared");
         passed.fetch_add(1);
     }
 
@@ -2246,8 +2260,13 @@ namespace {
         const char* tag = "ssl_kl_find";
         log_msg(hf, tag, "START -- ssl_keylog::find_by_client_random()");
         auto results = ssl_keylog::find_by_client_random("0000000000000000000000000000000000000000000000000000000000000000");
-        log_msg(hf, tag, "PASS -- find_by_client_random returned %zu entries (expected 0)", results.size());
-        passed.fetch_add(1);
+        if (results.empty()) {
+            log_msg(hf, tag, "PASS -- find_by_client_random returned %zu entries (expected 0)", results.size());
+            passed.fetch_add(1);
+        } else {
+            log_msg(hf, tag, "FAIL -- expected 0 entries, got %zu", results.size());
+            failed.fetch_add(1);
+        }
     }
 
     void test_ssl_keylog_hex_decode(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -2317,9 +2336,15 @@ namespace {
         log_msg(hf, tag, "START -- cert_pin_bypass::is_bypass_active()");
         bool active = cert_pin_bypass::is_bypass_active();
         auto bypasses = cert_pin_bypass::get_active_bypasses();
-        log_msg(hf, tag, "PASS -- is_bypass_active=%s active_bypasses=%zu",
-            active ? "true" : "false", bypasses.size());
-        passed.fetch_add(1);
+        if (!active && bypasses.empty()) {
+            log_msg(hf, tag, "PASS -- is_bypass_active=%s active_bypasses=%zu",
+                active ? "true" : "false", bypasses.size());
+            passed.fetch_add(1);
+        } else {
+            log_msg(hf, tag, "FAIL -- expected no active bypasses, got active=%s count=%zu",
+                active ? "true" : "false", bypasses.size());
+            failed.fetch_add(1);
+        }
     }
 
     void test_cert_pin_bypass_pattern_match(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -3790,9 +3815,14 @@ namespace {
         log_msg(hf, tag, "START -- TlsKeyExtractor::instance() singleton");
         auto& ext = net_security::TlsKeyExtractor::instance();
         bool logging = ext.is_keylogging();
-        log_msg(hf, tag, "PASS -- TlsKeyExtractor instance acquired, is_keylogging=%s",
-            logging ? "true" : "false");
-        passed.fetch_add(1);
+        if (!logging) {
+            log_msg(hf, tag, "PASS -- TlsKeyExtractor instance acquired, is_keylogging=%s",
+                logging ? "true" : "false");
+            passed.fetch_add(1);
+        } else {
+            log_msg(hf, tag, "FAIL -- expected is_keylogging=false, got true");
+            failed.fetch_add(1);
+        }
     }
 
     void test_cert_injector_instance(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -3800,9 +3830,15 @@ namespace {
         log_msg(hf, tag, "START -- CertificateInjector::instance() singleton");
         auto& inj = net_security::CertificateInjector::instance();
         auto thumbprints = inj.get_injected_thumbprints();
-        log_msg(hf, tag, "PASS -- CertificateInjector instance acquired, injected=%zu",
-            thumbprints.size());
-        passed.fetch_add(1);
+        if (thumbprints.empty()) {
+            log_msg(hf, tag, "PASS -- CertificateInjector instance acquired, injected=%zu",
+                thumbprints.size());
+            passed.fetch_add(1);
+        } else {
+            log_msg(hf, tag, "FAIL -- expected 0 injected thumbprints, got %zu",
+                thumbprints.size());
+            failed.fetch_add(1);
+        }
     }
 
     void test_cert_pin_bypasser_instance(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -3836,8 +3872,16 @@ namespace {
         net_security::QuicAnalyzer::quic_header_t qh;
         uint8_t dummy[4] = { 0xC0, 0x00, 0x00, 0x01 };
         qa.parse_quic_header(dummy, sizeof(dummy), qh);
-        log_msg(hf, tag, "PASS -- QuicAnalyzer instance acquired");
-        passed.fetch_add(1);
+        if (qh.is_long_header) {
+            log_msg(hf, tag, "PASS -- QuicAnalyzer parsed long header, is_long_header=%s packet_type=%u version=0x%08X",
+                qh.is_long_header ? "true" : "false",
+                (unsigned)qh.packet_type,
+                (unsigned)qh.version);
+            passed.fetch_add(1);
+        } else {
+            log_msg(hf, tag, "FAIL -- expected is_long_header=true for 0xC0 first byte, got false");
+            failed.fetch_add(1);
+        }
     }
 
     void test_dtls_analyzer_instance(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -3847,9 +3891,15 @@ namespace {
         net_security::DtlsAnalyzer::dtls_record_t rec;
         uint8_t dtls_data[16] = { 0x16, 0xFE, 0xFD, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x01, 0x00, 0x00 };
         da.parse_dtls_record(dtls_data, sizeof(dtls_data), rec);
-        log_msg(hf, tag, "PASS -- DtlsAnalyzer instance acquired, content_type=%u",
-            (unsigned)rec.content_type);
-        passed.fetch_add(1);
+        if (rec.content_type == 0x16) {
+            log_msg(hf, tag, "PASS -- DtlsAnalyzer parsed handshake, content_type=%u",
+                (unsigned)rec.content_type);
+            passed.fetch_add(1);
+        } else {
+            log_msg(hf, tag, "FAIL -- expected content_type=0x16, got %u",
+                (unsigned)rec.content_type);
+            failed.fetch_add(1);
+        }
     }
 
     void test_network_view_state(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {

@@ -174,7 +174,7 @@ static uint64_t get_ntdll_fn(const char* name) {
     return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(fn));
 }
 
-static uint64_t alloc_target_bp_region(size_t size = 64) {
+static uint64_t alloc_target_bp_region(size_t size = 64, bool need_execute = true) {
     uint64_t addr = driver_bridge::allocate_memory(size);
     if (addr == 0) return 0;
     std::vector<uint8_t> code(size, 0x90);
@@ -198,10 +198,12 @@ static uint64_t alloc_target_bp_region(size_t size = 64) {
         driver_bridge::free_memory(addr);
         return 0;
     }
-    uint32_t old_protect = 0;
-    if (!driver_bridge::protect_memory(addr, size, PAGE_EXECUTE_READWRITE, &old_protect)) {
-        diag::log_tagged_fmt("test_dbg_detail", "alloc_target_bp_region protect_memory failed addr=0x%llX size=%zu",
-            (unsigned long long)addr, size);
+    if (need_execute) {
+        uint32_t old_protect = 0;
+        if (!driver_bridge::protect_memory(addr, size, PAGE_EXECUTE_READWRITE, &old_protect)) {
+            diag::log_tagged_fmt("test_dbg_detail", "alloc_target_bp_region protect_memory failed addr=0x%llX size=%zu",
+                (unsigned long long)addr, size);
+        }
     }
     return addr;
 }
@@ -1404,7 +1406,7 @@ static void test_add_remove_software_bp(HANDLE hf, std::atomic<int>& passed, std
     log_msg(hf, "dbg_bp", "START -- add and remove software breakpoint");
     auto t0 = std::chrono::steady_clock::now();
 
-    uint64_t addr = alloc_target_bp_region();
+    uint64_t addr = alloc_target_bp_region(64, false);
     if (addr == 0) {
         log_msg(hf, "dbg_bp", "FAIL -- alloc_target_bp_region returned 0 (no driver attach?)");
         failed.fetch_add(1); return;
@@ -1461,7 +1463,7 @@ static void test_toggle_breakpoint(HANDLE hf, std::atomic<int>& passed, std::ato
     log_msg(hf, "dbg_tog", "START -- toggle breakpoint on/off");
     auto t0 = std::chrono::steady_clock::now();
 
-    uint64_t addr = alloc_target_bp_region();
+    uint64_t addr = alloc_target_bp_region(64, false);
     if (addr == 0) { log_msg(hf, "dbg_tog", "FAIL -- alloc_target_bp_region returned 0 (no driver attach?)"); failed.fetch_add(1); return; }
     diag::log_tagged_fmt("test_dbg_detail", "dbg_tog inputs: addr=0x%llX type=software size=1 pid=%u",
         (unsigned long long)addr, (unsigned)driver_bridge::attached_pid());
@@ -1487,7 +1489,7 @@ static void test_set_breakpoint_condition(HANDLE hf, std::atomic<int>& passed, s
     log_msg(hf, "dbg_cond", "START -- set breakpoint condition");
     auto t0 = std::chrono::steady_clock::now();
 
-    uint64_t addr = alloc_target_bp_region();
+    uint64_t addr = alloc_target_bp_region(64, false);
     if (addr == 0) { log_msg(hf, "dbg_cond", "FAIL -- alloc_target_bp_region returned 0 (no driver attach?)"); failed.fetch_add(1); return; }
     diag::log_tagged_fmt("test_dbg_detail", "dbg_cond inputs: addr=0x%llX condition='rax == 0' pid=%u",
         (unsigned long long)addr, (unsigned)driver_bridge::attached_pid());
@@ -1512,7 +1514,7 @@ static void test_set_breakpoint_log(HANDLE hf, std::atomic<int>& passed, std::at
     log_msg(hf, "dbg_log", "START -- set breakpoint log message");
     auto t0 = std::chrono::steady_clock::now();
 
-    uint64_t addr = alloc_target_bp_region();
+    uint64_t addr = alloc_target_bp_region(64, false);
     if (addr == 0) { log_msg(hf, "dbg_log", "FAIL -- alloc_target_bp_region returned 0 (no driver attach?)"); failed.fetch_add(1); return; }
     diag::log_tagged_fmt("test_dbg_detail", "dbg_log inputs: addr=0x%llX log_text='hit bp' auto_continue=1 pid=%u",
         (unsigned long long)addr, (unsigned)driver_bridge::attached_pid());
@@ -1537,7 +1539,7 @@ static void test_snapshot_breakpoints(HANDLE hf, std::atomic<int>& passed, std::
     log_msg(hf, "dbg_snap", "START -- snapshot all breakpoints");
     auto t0 = std::chrono::steady_clock::now();
 
-    uint64_t addr = alloc_target_bp_region();
+    uint64_t addr = alloc_target_bp_region(64, false);
     if (addr == 0) { log_msg(hf, "dbg_snap", "FAIL -- alloc_target_bp_region returned 0 (no driver attach?)"); failed.fetch_add(1); return; }
     diag::log_tagged_fmt("test_dbg_detail", "dbg_snap inputs: addr=0x%llX type=software size=1 pid=%u",
         (unsigned long long)addr, (unsigned)driver_bridge::attached_pid());
@@ -1567,8 +1569,8 @@ static void test_clear_all_breakpoints(HANDLE hf, std::atomic<int>& passed, std:
     log_msg(hf, "dbg_clr", "START -- clear all breakpoints");
     auto t0 = std::chrono::steady_clock::now();
 
-    uint64_t a1 = alloc_target_bp_region();
-    uint64_t a2 = alloc_target_bp_region();
+    uint64_t a1 = alloc_target_bp_region(64, false);
+    uint64_t a2 = alloc_target_bp_region(64, false);
     if (a1 == 0 || a2 == 0) {
         if (a1) driver_bridge::free_memory(a1);
         if (a2) driver_bridge::free_memory(a2);
@@ -2130,19 +2132,19 @@ static void test_find_strings(HANDLE hf, std::atomic<int>& passed, std::atomic<i
 
     debugger_engine::find_strings_async(4);
 
-    for (int i = 0; i < 150; ++i) {
+    for (int i = 0; i < 80; ++i) {
         if (!debugger_engine::g_state.strings_scanning.load(std::memory_order_acquire))
             break;
-        Sleep(100);
+        Sleep(25);
     }
 
     auto& state = debugger_engine::g_state;
     if (state.strings_scanning.load(std::memory_order_acquire)) {
         debugger_engine::request_strings_cancel();
-        for (int i = 0; i < 50; ++i) {
+        for (int i = 0; i < 20; ++i) {
             if (!state.strings_scanning.load(std::memory_order_acquire))
                 break;
-            Sleep(100);
+            Sleep(25);
         }
     }
 
@@ -2377,7 +2379,7 @@ static void test_multiple_breakpoints(HANDLE hf, std::atomic<int>& passed, std::
 
     debugger_engine::clear_all_breakpoints();
 
-    uint64_t base = alloc_target_bp_region(256);
+    uint64_t base = alloc_target_bp_region(256, false);
     if (base == 0) {
         log_msg(hf, "dbg_mbp", "FAIL -- alloc_target_bp_region returned 0 (no driver attach?)");
         failed.fetch_add(1);
@@ -3380,7 +3382,7 @@ static void test_restore_breakpoints_and_watches(HANDLE hf, std::atomic<int>& pa
 
     debugger_engine::clear_breakpoints_and_watches();
 
-    uint64_t addr = alloc_target_bp_region();
+    uint64_t addr = alloc_target_bp_region(64, false);
     if (addr == 0) { log_msg(hf, "dbg_rest", "FAIL -- alloc_target_bp_region returned 0 (no driver attach?)"); failed.fetch_add(1); return; }
 
     diag::log_tagged_fmt("test_dbg_detail", "dbg_rest inputs: addr=0x%llX add 1 bp + 1 watch, snapshot, clear, restore", (unsigned long long)addr);
@@ -3419,7 +3421,7 @@ static void test_clear_breakpoints_and_watches(HANDLE hf, std::atomic<int>& pass
     log_msg(hf, "dbg_cbw", "START -- clear_breakpoints_and_watches");
     auto t0 = std::chrono::steady_clock::now();
 
-    uint64_t addr = alloc_target_bp_region();
+    uint64_t addr = alloc_target_bp_region(64, false);
     if (addr == 0) { log_msg(hf, "dbg_cbw", "FAIL -- alloc_target_bp_region returned 0 (no driver attach?)"); failed.fetch_add(1); return; }
     diag::log_tagged_fmt("test_dbg_detail", "dbg_cbw inputs: addr=0x%llX add 1 bp + 1 watch then clear_breakpoints_and_watches()", (unsigned long long)addr);
 
@@ -3634,7 +3636,6 @@ static void test_run_to_address(HANDLE hf, std::atomic<int>& passed, std::atomic
 
     bool ok = debugger_engine::run_to_address(addr, false, 100);
     std::string err = debugger_engine::last_error();
-    Sleep(150);
     uint32_t exit_code = 0;
     const bool alive_after_resume = driver_bridge::attached_process_alive(&exit_code);
     debugger_engine::clear_all_breakpoints();
@@ -3662,7 +3663,7 @@ static void test_one_shot_bp(HANDLE hf, std::atomic<int>& passed, std::atomic<in
     log_msg(hf, "dbg_1shot", "START -- add breakpoint with bp_state one_shot via toggle");
     auto t0 = std::chrono::steady_clock::now();
 
-    uint64_t addr = alloc_target_bp_region();
+    uint64_t addr = alloc_target_bp_region(64, false);
     if (addr == 0) { log_msg(hf, "dbg_1shot", "FAIL -- alloc_target_bp_region returned 0 (no driver attach?)"); failed.fetch_add(1); return; }
     diag::log_tagged_fmt("test_dbg_detail", "dbg_1shot inputs: addr=0x%llX add software bp then toggle pid=%u",
         (unsigned long long)addr, (unsigned)driver_bridge::attached_pid());

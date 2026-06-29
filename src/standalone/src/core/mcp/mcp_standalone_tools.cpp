@@ -2319,8 +2319,8 @@ tool_result_t ensure_attached()
         if (query.empty())
             return error("Provide a non-empty search query.");
         const int max_results = std::clamp(params.value("max_results", 5), 1, 20);
-        const int timeout_seconds = std::clamp(params.value("timeout", 8), 1, 60);
-        const int timeout_ms = std::clamp(timeout_seconds * 1000 + 10000, 15000, 90000);
+        const int timeout_seconds = std::clamp(params.value("timeout", 5), 1, 60);
+        const int timeout_ms = std::clamp(timeout_seconds * 1000 + 5000, 10000, 60000);
         const std::string encoded_query = web_tool_url_encode(query);
 
         const auto ready_start = std::chrono::steady_clock::now();
@@ -2813,7 +2813,7 @@ return { browser: 'camoufox', engine_url: location.href, page_title: document.ti
         const long long ready_ms = web_tool_elapsed_ms_since(ready_start);
         const auto status_ready = aida::burp::camoufox::get_status();
 
-        const int nav_timeout_ms = local_fixture ? std::min(timeout_ms, 8000) : timeout_ms;
+        const int nav_timeout_ms = local_fixture ? std::min(timeout_ms, 4000) : timeout_ms;
         diag::log_tagged_fmt("mcp_tools",
             "handle_webfetch camoufox_ready trace_id=%s ready_ms=%lld bridge_state=%d child_pid=%u child_alive=%d browser_open=%d page_verified=%d page_count=%u active_page_len=%zu active_title_len=%zu total_calls=%llu total_errors=%llu last_call_ms=%llu last_nav_ms=%llu cleanup_pending=%d",
             trace_id,

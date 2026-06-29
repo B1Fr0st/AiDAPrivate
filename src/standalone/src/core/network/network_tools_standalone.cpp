@@ -967,6 +967,8 @@ tool_result_t network_enumerate_connections(const json& params)
 tool_result_t network_start_capture(const json& params)
 {
     diag::log_tagged_fmt("net_tools", "network_start_capture entry");
+    if (mcp_standalone::current_call_cancelled())
+        return tool_result_t::error("Tool cancelled before operation.");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
 
@@ -1026,6 +1028,8 @@ tool_result_t network_stop_capture(const json&)
 tool_result_t network_get_packets(const json& params)
 {
     diag::log_tagged("net_tools", "network_get_packets entry");
+    if (mcp_standalone::current_call_cancelled())
+        return tool_result_t::error("Tool cancelled before operation.");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
@@ -1063,6 +1067,8 @@ tool_result_t network_get_packets(const json& params)
 tool_result_t network_analyze_packet(const json& params)
 {
     diag::log_tagged("net_tools", "network_analyze_packet entry");
+    if (mcp_standalone::current_call_cancelled())
+        return tool_result_t::error("Tool cancelled before operation.");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
@@ -1802,6 +1808,8 @@ static std::string format_ipv4_bytes(const std::uint8_t* ip) {
 tool_result_t network_deep_inspect(const json& params)
 {
     diag::log_tagged("net_tools", "network_deep_inspect entry");
+    if (mcp_standalone::current_call_cancelled())
+        return tool_result_t::error("Tool cancelled before operation.");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
@@ -1852,6 +1860,8 @@ tool_result_t network_deep_inspect(const json& params)
 tool_result_t network_follow_tcp_stream(const json& params)
 {
     diag::log_tagged("net_tools", "network_follow_tcp_stream entry");
+    if (mcp_standalone::current_call_cancelled())
+        return tool_result_t::error("Tool cancelled before operation.");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
     if (!params.contains("operation") || !params["operation"].is_string())
@@ -2313,6 +2323,8 @@ tool_result_t network_enumerate_interfaces(const json&)
 tool_result_t network_inject_packet(const json& params)
 {
     diag::log_tagged("net_tools", "network_inject_packet entry");
+    if (mcp_standalone::current_call_cancelled())
+        return tool_result_t::error("Tool cancelled before operation.");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
@@ -2771,6 +2783,8 @@ tool_result_t network_list_redirect_rules(const json&)
 tool_result_t network_intercept(const json& params)
 {
     diag::log_tagged("net_tools", "network_intercept entry");
+    if (mcp_standalone::current_call_cancelled())
+        return tool_result_t::error("Tool cancelled before operation.");
     if (!params.contains("operation") || !params["operation"].is_string())
         return tool_result_t::error(OBFSTR("Missing required parameter: operation ('enable' or 'disable')"));
 
@@ -2845,6 +2859,8 @@ tool_result_t network_intercept(const json& params)
         }
         std::uint32_t held_count = 0; bool active = false;
         diag::log_tagged_fmt("net_tools", "network_intercept enable pid=%u port=%u proto=%u", filter_pid, filter_port, filter_protocol);
+        if (mcp_standalone::current_call_cancelled())
+            return tool_result_t::error("Tool cancelled before operation.");
         SetLastError(ERROR_SUCCESS);
         bool ok = driver_bridge::intercept_op(0, filter_pid, filter_port, filter_protocol, 0, nullptr, 0, &held_count, &active);
         const DWORD gle = GetLastError();
@@ -3489,6 +3505,8 @@ tool_result_t network_os_fingerprint(const json& params)
 tool_result_t network_export_pcap(const json& params)
 {
     diag::log_tagged("net_tools", "network_export_pcap entry");
+    if (mcp_standalone::current_call_cancelled())
+        return tool_result_t::error("Tool cancelled before operation.");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
@@ -3553,6 +3571,8 @@ tool_result_t network_export_pcap(const json& params)
 tool_result_t api_monitor_start(const json& params)
 {
     const uint64_t handler_start_ms = GetTickCount64();
+    if (mcp_standalone::current_call_cancelled())
+        return tool_result_t::error("Tool cancelled before operation.");
     if (!params.contains("apis") || !params["apis"].is_array())
         return tool_result_t::error(OBFSTR("Missing required parameter: apis"));
 

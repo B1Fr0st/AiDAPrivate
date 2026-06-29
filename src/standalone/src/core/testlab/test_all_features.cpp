@@ -1202,6 +1202,10 @@ namespace test_all_features {
 				kMcpFeatureTests,
 				mcp_entered,
 				mcp_done);
+			g_cancel_requested.store(true, std::memory_order_release);
+			log_msg(hf, "heartbeat", "CANCEL -- full test cancellation requested after HUNG step detected step_age_ms=%llu threshold_ms=%llu",
+				static_cast<unsigned long long>(now - step_start),
+				static_cast<unsigned long long>(kFullTestHungStepMs));
 		}
 
 		int finalize_phase_ledger(HANDLE hf) {

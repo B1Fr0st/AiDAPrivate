@@ -24,7 +24,7 @@
 
 namespace critical_work_queue {
 
-inline constexpr int POOL_SIZE = 12;
+inline constexpr int POOL_SIZE = 24;
 
 namespace detail {
 
@@ -127,6 +127,60 @@ inline stats_t stats() {
         }
     }
     return s;
+}
+
+struct stuck_worker_diag_t {
+    std::uint64_t task_id = 0;
+    std::string label;
+    DWORD tid = 0;
+    std::uint64_t queued_ms = 0;
+    std::uint64_t started_ms = 0;
+    std::uint64_t active_ms = 0;
+    std::size_t worker_index = 0;
+};
+
+inline std::vector<stuck_worker_diag_t> stuck_workers(std::uint64_t threshold_ms) {
+    std::vector<stuck_worker_diag_t> result;
+    auto& p = detail::g_pool;
+    const std::uint64_t now = static_cast<std::uint64_t>(GetTickCount64());
+    std::unique_lock<std::mutex> lk(p.mtx, std::try_to_lock);
+    if (!lk.owns_lock())
+        return result;
+    for (std::size_t i = 0; i < p.active_snapshots.size(); ++i) {
+        const auto& active = p.active_snapshots[i];
+        if (active.id == 0)
+            continue;
+        const std::uint64_t age_ms = now >= active.started_ms ? now - active.started_ms : 0;
+        if (age_ms >= threshold_ms) {
+            stuck_worker_diag_t d;
+            d.task_id = active.id;
+            d.label = active.label;
+            d.tid = active.tid;
+            d.queued_ms = active.queued_ms;
+            d.started_ms = active.started_ms;
+            d.active_ms = age_ms;
+            d.worker_index = i;
+            result.push_back(std::move(d));
+        }
+    }
+    return result;
+}
+
+inline void log_stuck_workers(std::uint64_t threshold_ms) {
+    auto stuck = stuck_workers(threshold_ms);
+    if (stuck.empty())
+        return;
+    for (const auto& s : stuck) {
+        diag::log_tagged_fmt("critical_work_queue",
+            "stuck_worker task_id=%llu label=%s worker_index=%zu tid=%lu active_ms=%llu queued_ms=%llu threshold_ms=%llu",
+            static_cast<unsigned long long>(s.task_id),
+            s.label.empty() ? "<unnamed>" : s.label.c_str(),
+            s.worker_index,
+            static_cast<unsigned long>(s.tid),
+            static_cast<unsigned long long>(s.active_ms),
+            static_cast<unsigned long long>(s.queued_ms),
+            static_cast<unsigned long long>(threshold_ms));
+    }
 }
 
 inline void initialize() {

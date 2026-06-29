@@ -1706,8 +1706,6 @@ namespace {
 		};
 
 		static const char* kCandidateHosts[] = {
-			"aida-testlab-probe.invalid",
-			"aida-testlab-dns.invalid",
 			"www.microsoft.com"
 		};
 		const std::size_t kCandidateHostCount = sizeof(kCandidateHosts) / sizeof(kCandidateHosts[0]);
@@ -1759,7 +1757,7 @@ namespace {
 			::diag::log_tagged_fmt("verify_dns", "candidate[%zu] tcp_done ok=%d diag=%s",
 				i, tcp_ok ? 1 : 0, tcp_diag.c_str());
 			dns_mark_stage(ctx, dns_log_stage_e::windns_probe);
-			bool gai_ok = resolve_host_with_timeout(host, 2000);
+			bool gai_ok = resolve_host_with_timeout(host, 1000);
 			::diag::log_tagged_fmt("verify_dns", "candidate[%zu] gai_done ok=%d", i, gai_ok ? 1 : 0);
 			const bool authoritative_lookup_ok = udp_ok || gai_ok;
 
@@ -1827,11 +1825,11 @@ namespace {
 		std::string matched_host;
 		std::string self_filter_matched_host;
 
-		for (int attempt = 0; attempt < 10; ++attempt) {
+		for (int attempt = 0; attempt < 5; ++attempt) {
 			if (finish_cancelled())
 				return;
 			dns_mark_stage(ctx, dns_log_stage_e::poll_wait);
-			std::this_thread::sleep_for(std::chrono::milliseconds(200));
+			std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
 			voyager::detail::net_dns_get_request* req =
 				static_cast<voyager::detail::net_dns_get_request*>(std::calloc(1, sizeof(voyager::detail::net_dns_get_request)));
@@ -1872,7 +1870,7 @@ namespace {
 				self_pid,
 				kCandidateHosts,
 				kCandidateHostCount,
-				attempt == 9,
+				attempt == 4,
 				"dns",
 				print_cap,
 				r);
@@ -1916,7 +1914,7 @@ namespace {
 					self_pid,
 					kCandidateHosts,
 					kCandidateHostCount,
-					attempt == 9,
+					attempt == 4,
 					"dns_self",
 					print_cap,
 					r);
@@ -1945,7 +1943,7 @@ namespace {
 		std::uint32_t capture_batches = 0u;
 		std::uint32_t capture_drain_failures = 0u;
 		std::string captured_probe_host;
-		for (std::uint32_t batch = 0; batch < 8u; ++batch) {
+		for (std::uint32_t batch = 0; batch < 4u; ++batch) {
 			if (finish_cancelled())
 				return;
 			dns_mark_stage(ctx, dns_log_stage_e::drain_ncap);

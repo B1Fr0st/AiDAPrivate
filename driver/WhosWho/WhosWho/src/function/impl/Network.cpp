@@ -1872,6 +1872,7 @@ namespace net_capture {
                     strong::kmemcpy(inj_buf->src_addr, local_ip, 4);
                     strong::kmemcpy(inj_buf->dst_addr, redir_addr, 4);
                     UINT32 hdr_skip = 0;
+                    BOOLEAN raw_transport = FALSE;
                     if (protocol == 6 && pkt_len >= 20) {
                         hdr_skip = ((UINT32)(pkt_data[12] >> 4)) * 4;
                         if (hdr_skip < 20) hdr_skip = 20;
@@ -1880,16 +1881,29 @@ namespace net_capture {
                                       ((UINT32)pkt_data[6] << 8) | pkt_data[7];
                         inj_buf->tcp_ack = ((UINT32)pkt_data[8] << 24) | ((UINT32)pkt_data[9] << 16) |
                                       ((UINT32)pkt_data[10] << 8) | pkt_data[11];
-                        inj_buf->tcp_flags = pkt_data[13];
+                        inj_buf->tcp_flags = net_inject::INJECT_FLAG_RAW_TRANSPORT;
+                        inj_buf->payload_size = pkt_len;
+                        if (inj_buf->payload_size > INJECT_MAX_PAYLOAD)
+                            inj_buf->payload_size = INJECT_MAX_PAYLOAD;
+                        strong::kmemcpy(inj_buf->payload, pkt_data, inj_buf->payload_size);
+                        inj_buf->payload[2] = (UINT8)((redir_port >> 8) & 0xFF);
+                        inj_buf->payload[3] = (UINT8)(redir_port & 0xFF);
+                        raw_transport = TRUE;
                     } else if (protocol == 17 && pkt_len >= 8) {
                         hdr_skip = udp_header_skip_if_present(pkt_data, pkt_len, local_port, remote_port);
+                        inj_buf->payload_size = pkt_len - hdr_skip;
+                        if (inj_buf->payload_size > 0)
+                            strong::kmemcpy(inj_buf->payload, pkt_data + hdr_skip, inj_buf->payload_size);
+                    } else {
+                        inj_buf->payload_size = pkt_len;
+                        if (inj_buf->payload_size > INJECT_MAX_PAYLOAD)
+                            inj_buf->payload_size = INJECT_MAX_PAYLOAD;
+                        if (inj_buf->payload_size > 0)
+                            strong::kmemcpy(inj_buf->payload, pkt_data, inj_buf->payload_size);
                     }
-                    inj_buf->payload_size = pkt_len - hdr_skip;
-                    if (inj_buf->payload_size > 0)
-                        strong::kmemcpy(inj_buf->payload, pkt_data + hdr_skip, inj_buf->payload_size);
                     net_redirect::record_redirect_flow(redir_rule_id, protocol, 2, pid,
                         local_ip, local_port, remote_ip, remote_port, redir_addr, redir_port);
-                    WW_LOG("net_redirect::classify layer=out_trans direction=1 protocol=%u pid=%u rule_id=%u match_before=%ld match_after=%ld tuple_before=%u.%u.%u.%u:%u->%u.%u.%u.%u:%u tuple_after=%u.%u.%u.%u:%u->%u.%u.%u.%u:%u iface_src=%u iface_dst=%u compartment=%lu transport_len=%u hdr_skip=%u payload_size=%u decision=block_inject",
+                    WW_LOG("net_redirect::classify layer=out_trans direction=1 protocol=%u pid=%u rule_id=%u match_before=%ld match_after=%ld tuple_before=%u.%u.%u.%u:%u->%u.%u.%u.%u:%u tuple_after=%u.%u.%u.%u:%u->%u.%u.%u.%u:%u iface_src=%u iface_dst=%u compartment=%lu transport_len=%u hdr_skip=%u payload_size=%u raw_transport=%u tcp_options_size=%u decision=block_inject",
                         protocol,
                         pid,
                         redir_rule_id,
@@ -1904,7 +1918,9 @@ namespace net_capture {
                         inMetaValues->compartmentId,
                         pkt_len,
                         hdr_skip,
-                        inj_buf->payload_size);
+                        inj_buf->payload_size,
+                        raw_transport ? 1u : 0u,
+                        (hdr_skip > 20) ? (hdr_skip - 20) : 0u);
                     classifyOut->actionType = FWP_ACTION_BLOCK_;
                     classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE_;
                     net_inject::inject_metadata inject_meta = make_inject_metadata(inMetaValues);
@@ -1912,7 +1928,7 @@ namespace net_capture {
                     if (NT_SUCCESS(inject_status) && inj_buf->status == 0) {
                         classifyOut->flags |= FWPS_CLASSIFY_OUT_FLAG_ABSORB_;
                     }
-                    WW_LOG("net_redirect::inject_result layer=out_trans rule_id=%u status=0x%08X win32=%lu request_status=%u action=blocked_original direction=%u protocol=%u pid=%u dst_port_before=%u dst_port_after=%u payload_size=%u hdr_skip=%u iface_src=%u iface_dst=%u compartment=%lu",
+                    WW_LOG("net_redirect::inject_result layer=out_trans rule_id=%u status=0x%08X win32=%lu request_status=%u action=blocked_original direction=%u protocol=%u pid=%u dst_port_before=%u dst_port_after=%u payload_size=%u hdr_skip=%u raw_transport=%u iface_src=%u iface_dst=%u compartment=%lu",
                         redir_rule_id,
                         inject_status,
                         net_capture::status_to_win32(inject_status),
@@ -1924,6 +1940,7 @@ namespace net_capture {
                         redir_port,
                         inj_buf->payload_size,
                         hdr_skip,
+                        raw_transport ? 1u : 0u,
                         inMetaValues->sourceInterfaceIndex,
                         inMetaValues->destinationInterfaceIndex,
                         inMetaValues->compartmentId);
@@ -7873,6 +7890,34 @@ namespace net_inject {
                 recv_interface_index);
 
             if (request->direction == 1) {
+                if (loopback_v4 && _FwpsInjectRecv0) {
+                    WW_LOG("net_inject::loopback_redirect_recv_preferred direction=1 endpoint=0x%llX loopback=1 recv_if=%u packet_size=%u",
+                        (unsigned long long)endpoint_handle,
+                        recv_interface_index,
+                        packet_size);
+                    st = _FwpsInjectRecv0(g_inject_handle_v4, nullptr, nullptr, 0,
+                        (UINT16)request->address_family, compartment_id, recv_interface_index, recv_sub_interface_index, nbl,
+                        (PVOID)inject_completion, completion);
+                    WW_LOG("net_inject::packet transport_recv_preferred status=0x%08X win32=%lu recv_if=%u packet_size=%u",
+                        st,
+                        net_capture::status_to_win32(st),
+                        recv_interface_index,
+                        packet_size);
+                    if (NT_SUCCESS(st)) {
+                        NET_DBG("inject_packet: loopback recv inject SUCCESS st=0x%08x", st);
+                        WW_LOG("net_inject::packet SUCCESS path=transport_loopback_recv status=0x%08X win32=%lu packet_size=%u",
+                            st,
+                            net_capture::status_to_win32(st),
+                            packet_size);
+                        request->status = 0;
+                        return STATUS_SUCCESS;
+                    }
+                    WW_LOG("net_inject::loopback_redirect_recv_failed status=0x%08X win32=%lu fallback_to_send=1 endpoint=0x%llX packet_size=%u",
+                        st,
+                        net_capture::status_to_win32(st),
+                        (unsigned long long)endpoint_handle,
+                        packet_size);
+                }
                 st = _FwpsInjectSend0(g_inject_handle_v4, nullptr, endpoint_handle, 0,
                     &completion->send_args, (UINT16)request->address_family, compartment_id, nbl,
                     (PVOID)inject_completion, completion);
@@ -7881,17 +7926,6 @@ namespace net_inject {
                     net_capture::status_to_win32(st),
                     (unsigned long long)endpoint_handle,
                     packet_size);
-
-                if (!NT_SUCCESS(st) && _FwpsInjectRecv0 && loopback_v4) {
-                    st = _FwpsInjectRecv0(g_inject_handle_v4, nullptr, nullptr, 0,
-                        (UINT16)request->address_family, compartment_id, recv_interface_index, recv_sub_interface_index, nbl,
-                        (PVOID)inject_completion, completion);
-                    WW_LOG("net_inject::packet transport_recv_fallback status=0x%08X win32=%lu recv_if=%u packet_size=%u",
-                        st,
-                        net_capture::status_to_win32(st),
-                        recv_interface_index,
-                        packet_size);
-                }
             } else {
                 st = _FwpsInjectRecv0(g_inject_handle_v4, nullptr, nullptr, 0,
                     (UINT16)request->address_family, compartment_id, recv_interface_index, recv_sub_interface_index, nbl,

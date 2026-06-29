@@ -167,9 +167,15 @@ namespace {
 		const std::uint64_t timestamp = static_cast<std::uint64_t>(__rdtsc());
 		const std::uint64_t start_ms = static_cast<std::uint64_t>(GetTickCount64());
 
-		SetLastError(ERROR_SUCCESS);
-		bool ok = device->relay_server_token(token_hash, server_nonce);
-		const DWORD gle = ok ? ERROR_SUCCESS : GetLastError();
+		bool ok = false;
+		DWORD gle = ERROR_SUCCESS;
+		for (int attempt = 0; attempt < 3; ++attempt) {
+			SetLastError(ERROR_SUCCESS);
+			ok = device->relay_server_token(token_hash, server_nonce);
+			gle = ok ? ERROR_SUCCESS : GetLastError();
+			if (ok || gle != ERROR_BUSY) break;
+			Sleep(50);
+		}
 		const std::uint64_t elapsed_ms = static_cast<std::uint64_t>(GetTickCount64()) - start_ms;
 		voyager::detail::server_token_relay evidence{};
 		evidence.token_hash = token_hash;

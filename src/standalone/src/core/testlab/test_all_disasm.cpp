@@ -2292,8 +2292,8 @@ namespace {
             failed.fetch_add(1);
             return;
         }
-        constexpr uint32_t proof_timeout_ms = 2500;
-        constexpr uint32_t watchdog_timeout_ms = 4000;
+        constexpr uint32_t proof_timeout_ms = 4000;
+        constexpr uint32_t watchdog_timeout_ms = 6000;
         struct watchdog_shared_state_t {
             std::atomic<bool> finished{ false };
             std::atomic<bool> hung_logged{ false };

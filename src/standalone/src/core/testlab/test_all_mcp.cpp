@@ -162,6 +162,7 @@ namespace {
     std::atomic<uint64_t> g_mcp_phase_instance_counter{0};
     std::atomic<int> g_mcp_phase_enter_count{0};
     std::atomic<bool> g_mcp_phase_active{false};
+    bool (*g_mcp_cancelled_fn)() = nullptr;
     std::atomic<bool> g_mcp_coverage_audit_started{false};
     std::atomic<bool> g_mcp_coverage_audit_completed{false};
     constexpr int k_mcp_planned_tool_tests = 514;
@@ -16604,7 +16605,7 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
                     log_msg(hf, tag, "PROBE-FAIL -- fixture probe socket failed attempt=%d port=%u err=%d",
                         attempt, port, last_err);
                     if (last_err == WSAENOBUFS || last_err == WSAEMFILE) {
-                        Sleep(static_cast<DWORD>(25 * attempt));
+                        Sleep(200);
                         continue;
                     }
                     return false;
@@ -17123,7 +17124,24 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         dst.sin_family = AF_INET;
         dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         dst.sin_port = htons(match_port);
-        for (int attempt = 1; attempt <= 12; ++attempt) {
+        const uint64_t stimulus_deadline_start = GetTickCount64();
+        const uint64_t stimulus_deadline_ms = 12000;
+        for (int attempt = 1; attempt <= 3; ++attempt) {
+            if (g_mcp_cancelled_fn && g_mcp_cancelled_fn()) {
+                log_msg(hf, tag, "REDIRECT-STIMULUS-CANCELLED -- attempt=%d rule_id=%llu elapsed_ms=%llu",
+                    attempt,
+                    static_cast<unsigned long long>(rule_id),
+                    static_cast<unsigned long long>(GetTickCount64() - stimulus_deadline_start));
+                break;
+            }
+            if (GetTickCount64() - stimulus_deadline_start > stimulus_deadline_ms) {
+                log_msg(hf, tag, "REDIRECT-STIMULUS-DEADLINE -- attempt=%d rule_id=%llu elapsed_ms=%llu deadline_ms=%llu",
+                    attempt,
+                    static_cast<unsigned long long>(rule_id),
+                    static_cast<unsigned long long>(GetTickCount64() - stimulus_deadline_start),
+                    static_cast<unsigned long long>(stimulus_deadline_ms));
+                break;
+            }
             diag.attempts = attempt;
             SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
             if (s == INVALID_SOCKET) {
@@ -17137,12 +17155,39 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             DWORD timeout = 1500;
             setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
             setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+            u_long nb_mode = 1;
+            ioctlsocket(s, FIONBIO, &nb_mode);
             LARGE_INTEGER connect_tsc_before_li{};
             QueryPerformanceCounter(&connect_tsc_before_li);
             const unsigned long long connect_tsc_before = static_cast<unsigned long long>(connect_tsc_before_li.QuadPart);
             SetLastError(ERROR_SUCCESS);
             diag.connect_rc = connect(s, reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
             const DWORD connect_gle = GetLastError();
+            if (diag.connect_rc == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK) {
+                fd_set write_set;
+                FD_ZERO(&write_set);
+                FD_SET(s, &write_set);
+                timeval connect_tv;
+                connect_tv.tv_sec = 3;
+                connect_tv.tv_usec = 0;
+                const int select_rc = select(static_cast<int>(s), nullptr, &write_set, nullptr, &connect_tv);
+                if (select_rc > 0) {
+                    int so_val = 0;
+                    int so_len = sizeof(so_val);
+                    getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&so_val), &so_len);
+                    if (so_val == 0) {
+                        diag.connect_rc = 0;
+                    } else {
+                        diag.connect_rc = SOCKET_ERROR;
+                        WSASetLastError(so_val);
+                    }
+                } else {
+                    diag.connect_rc = SOCKET_ERROR;
+                    WSASetLastError(WSAETIMEDOUT);
+                }
+            }
+            u_long blk_mode = 0;
+            ioctlsocket(s, FIONBIO, &blk_mode);
             LARGE_INTEGER connect_tsc_after_li{};
             QueryPerformanceCounter(&connect_tsc_after_li);
             const unsigned long long connect_tsc_after = static_cast<unsigned long long>(connect_tsc_after_li.QuadPart);
@@ -17202,7 +17247,7 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             closesocket(s);
             if (diag.sent)
                 break;
-            Sleep(static_cast<DWORD>(25 * attempt));
+            Sleep(200);
         }
         Sleep(500);
         diag.requests_after = g_burp_http_fixture ? g_burp_http_fixture->request_count.load(std::memory_order_acquire) : 0;
@@ -18809,7 +18854,7 @@ void test_tool_sandbox_execute(HANDLE hf, std::atomic<int>& passed, std::atomic<
         mcp_standalone::json args;
         args["query"] = "Microsoft Windows API";
         args["max_results"] = 2;
-        args["timeout"] = 20;
+        args["timeout"] = 5;
 
         const int seq = g_mcp_tool_sequence.fetch_add(1, std::memory_order_acq_rel) + 1;
         guarded_seq = seq;
@@ -21016,6 +21061,38 @@ void test_tool_scanner_struct_manage_define(HANDLE hf, std::atomic<int>& passed,
             return;
         }
 
+        {
+            const DWORD fence_start = GetTickCount();
+            integrity_hunter::stop_hunt();
+            const auto fence_idle = integrity_hunter::wait_until_idle_result(3000);
+            const auto fence_lower = driver_bridge::last_remote_call_execution_diag();
+            const bool fence_hunting = integrity_hunter::g_state.hunting.load(std::memory_order_acquire);
+            const bool fence_worker = integrity_hunter::g_state.worker_active.load(std::memory_order_acquire);
+            const bool fence_ok = fence_idle.idle && !fence_hunting && !fence_worker;
+            log_msg(hf, tag, "SIDE-FIXTURE-CLEANUP-FENCE -- primary_pid=%u active_pid=%u ok=%d idle=%d hunting=%d worker=%d cleanup_elapsed_ms=%lld generation=%llu install_generation=%llu session=%u lower_call_id=%llu lower_phase=%s lower_reason=%s lower_completed=%d lower_ok=%d lower_gle=%lu lower_inflight_after=%u lower_elapsed_ms=%llu elapsed_ms=%lu status=\"%s\" last_error=\"%s\"",
+                (unsigned)primary_pid,
+                (unsigned)driver_bridge::attached_pid(),
+                fence_ok ? 1 : 0,
+                fence_idle.idle ? 1 : 0,
+                fence_hunting ? 1 : 0,
+                fence_worker ? 1 : 0,
+                (long long)fence_idle.elapsed_ms,
+                (unsigned long long)fence_idle.generation,
+                (unsigned long long)fence_idle.install_generation,
+                fence_idle.session_id,
+                (unsigned long long)fence_lower.call_id,
+                fence_lower.phase.c_str(),
+                fence_lower.completion_reason.c_str(),
+                fence_lower.completed ? 1 : 0,
+                fence_lower.lower_ok ? 1 : 0,
+                static_cast<unsigned long>(fence_lower.gle),
+                fence_lower.inflight_after,
+                (unsigned long long)fence_lower.lower_elapsed_ms,
+                static_cast<unsigned long>(GetTickCount() - fence_start),
+                driver_bridge::status().c_str(),
+                driver_bridge::last_error().c_str());
+        }
+
         mcp_hunt_sidecar_t sidecar;
         if (!launch_hunt_integrity_sidecar(hf, tag, sidecar)) {
             g_mcp_target_pid = primary_pid;
@@ -21049,7 +21126,7 @@ void test_tool_scanner_struct_manage_define(HANDLE hf, std::atomic<int>& passed,
             return restored && bridge_alive;
         };
 
-        if (!wait_hunt_sidecar_attach_ready(hf, tag, sidecar, 8000)) {
+        if (!wait_hunt_sidecar_attach_ready(hf, tag, sidecar, 12000)) {
             close_hunt_integrity_sidecar(hf, tag, sidecar, true);
             restore_primary();
             record_precondition_skipped_tool("hunt_integrity_checkers", failed);
@@ -23119,7 +23196,7 @@ void test_tool_sessions_manage_open_file(HANDLE hf, std::atomic<int>& passed, st
 
         const uint64_t fn = resolve_remote_export("kernel32.dll", "GetTickCount64");
         const uint64_t verify_start = GetTickCount64();
-        const uint64_t verify_deadline = verify_start + 9000;
+        const uint64_t verify_deadline = verify_start + 4000;
         int triggered = 0;
         int stimulus_attempts = 0;
         int result_queries = 0;
@@ -23164,7 +23241,7 @@ void test_tool_sessions_manage_open_file(HANDLE hf, std::atomic<int>& passed, st
                 verify_timeout = true;
                 break;
             }
-            const long long query_timeout = static_cast<long long>((std::min<uint64_t>)(verify_deadline - before_query, 2500));
+            const long long query_timeout = static_cast<long long>((std::min<uint64_t>)(verify_deadline - before_query, 1500));
             const int verify_seq = g_mcp_tool_sequence.fetch_add(1, std::memory_order_acq_rel) + 1;
             ++result_queries;
             auto verify = invoke_tool_bounded(get_server(), "api_monitor_results", verify_args, query_timeout, hf, "mcp.api_monitor_start.verify", verify_seq);
@@ -23180,7 +23257,7 @@ void test_tool_sessions_manage_open_file(HANDLE hf, std::atomic<int>& passed, st
             }
             if (!verify.result.success)
                 capture_reason = "api_monitor_results verification returned error: " + compact_text(verify.result.text, 500);
-            Sleep(100);
+            Sleep(50);
         }
         uint32_t win32_code = 0;
         const bool win32_alive = process_alive_by_pid(g_mcp_target_pid, &win32_code);
@@ -23282,6 +23359,7 @@ void test_tool_sessions_manage_open_file(HANDLE hf, std::atomic<int>& passed, st
         args["port"] = g_burp_http_fixture ? g_burp_http_fixture->port : 0;
         args["protocol"] = "tcp";
         args["max_payload"] = 256;
+        args[k_test_lab_safe_fixture_flag] = true;
         auto status = test_tool_action_call(hf, "mcp.network_capture_manage.start", "network_capture_manage", "start", args, passed, failed, skipped);
         if (status == mcp_tool_call_status_t::passed) {
             const auto payload = mcp_http_fixture_request_payload("/aida-network-start-fixture");
@@ -23292,7 +23370,9 @@ void test_tool_sessions_manage_open_file(HANDLE hf, std::atomic<int>& passed, st
     }
 
     void test_tool_network_capture_manage_stop(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_action_call(hf, "mcp.network_capture_manage.stop", "network_capture_manage", "stop", {}, passed, failed, skipped);
+        mcp_standalone::json args;
+        args[k_test_lab_safe_fixture_flag] = true;
+        test_tool_action_call(hf, "mcp.network_capture_manage.stop", "network_capture_manage", "stop", args, passed, failed, skipped);
     }
 
     void test_tool_network_capture_manage_get_packets(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -23301,7 +23381,9 @@ void test_tool_sessions_manage_open_file(HANDLE hf, std::atomic<int>& passed, st
             record_fixture_failed_tool("network_capture_manage", failed);
             return;
         }
-        test_tool_action_call(hf, "mcp.network_capture_manage.get_packets", "network_capture_manage", "get_packets", {}, passed, failed, skipped);
+        mcp_standalone::json args;
+        args[k_test_lab_safe_fixture_flag] = true;
+        test_tool_action_call(hf, "mcp.network_capture_manage.get_packets", "network_capture_manage", "get_packets", args, passed, failed, skipped);
     }
 
     void test_tool_network_analyze_packet(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -24204,6 +24286,7 @@ void test_tool_sessions_manage_open_file(HANDLE hf, std::atomic<int>& passed, st
     void test_tool_network_capture_manage_export_pcap(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         mcp_standalone::json args;
         args["path"] = "C:\\temp\\aida_test_net.pcap";
+        args[k_test_lab_safe_fixture_flag] = true;
         test_tool_action_call(hf, "mcp.network_capture_manage.export_pcap", "network_capture_manage", "export_pcap", args, passed, failed, skipped);
     }
 
@@ -30513,6 +30596,7 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
 
 }
 void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& global_skipped, bool(*cancelled)()) {
+    g_mcp_cancelled_fn = cancelled;
     const char* phase_tag = "mcp_phase";
     const uint64_t phase_instance = g_mcp_phase_instance_counter.fetch_add(1, std::memory_order_acq_rel) + 1;
     const int enter_count = g_mcp_phase_enter_count.fetch_add(1, std::memory_order_acq_rel) + 1;

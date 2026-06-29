@@ -2482,6 +2482,8 @@ static tool_result_t dbg_map_vm_handlers(const json& params)
 
     for (int i = 0; i < actual_entries; ++i)
     {
+        if (mcp_standalone::current_call_cancelled())
+            return tool_result_t::error("Tool cancelled during VM handler mapping.");
         std::uint64_t raw_value = 0;
         std::memcpy(&raw_value,
                      table_data.data() + static_cast<std::size_t>(i) * static_cast<std::size_t>(entry_size),
@@ -2651,6 +2653,8 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
          {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
         [](const json& params) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "dbg_run_to_address: entry");
+            if (mcp_standalone::current_call_cancelled())
+                return tool_result_t::error("Tool cancelled before operation.");
             if (auto err = ensure_attached(params)) return *err;
             if (!params.contains("address") || !params["address"].is_string())
                 return tool_result_t::error(OBFSTR("'address' is required."));
@@ -2680,6 +2684,8 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 static_cast<unsigned>(timeout_ms),
                 static_cast<unsigned>(driver_bridge::attached_pid()),
                 static_cast<unsigned>(debugger_engine::g_state.active_tid));
+            if (mcp_standalone::current_call_cancelled())
+                return tool_result_t::error("Tool cancelled before run_to_address.");
             bool ok = debugger_engine::run_to_address(*addr, wait, timeout_ms);
             const uint64_t elapsed_ms = GetTickCount64() - started_ms;
             const uint32_t pid_after = driver_bridge::attached_pid();
@@ -3043,6 +3049,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 seh_view::refresh();
                 for (int i = 0; i < 100; ++i) {
                     if (!seh_view::g_ui.refreshing.load()) break;
+                    if (mcp_standalone::current_call_cancelled()) break;
                     Sleep(20);
                 }
                 diag::log_tagged_fmt("dbg_tools",
@@ -3513,6 +3520,8 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
          {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
         [](const json& params) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "dbg_find_strings: entry");
+            if (mcp_standalone::current_call_cancelled())
+                return tool_result_t::error("Tool cancelled before operation.");
             if (auto err = ensure_attached(params)) return *err;
             int min_len = params.value("min_length", 4);
             diag::log_tagged_fmt("dbg_tools", "dbg_find_strings: min_length=%d", min_len);
@@ -3650,6 +3659,8 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             cfg_view::build_cfg(*addr);
             for (int i = 0; i < 300; ++i) {
                 if (!cfg_view::g_state.building.load()) break;
+                if (mcp_standalone::current_call_cancelled())
+                    return tool_result_t::error("Tool cancelled during CFG build.");
                 Sleep(10);
             }
             std::lock_guard<std::mutex> lk(cfg_view::g_state.mutex);

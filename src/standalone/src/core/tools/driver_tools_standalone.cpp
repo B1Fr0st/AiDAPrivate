@@ -828,6 +828,8 @@ static std::vector<voyager::detail::region_entry> enumerate_all_memory_regions_p
 tool_result_t driver_read_pointer_chain(const json& params)
 {
     diag::log_tagged_fmt("drv_tools", "driver_read_pointer_chain entry");
+    if (mcp_standalone::current_call_cancelled())
+        return tool_result_t::error("Tool cancelled before operation.");
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
@@ -863,6 +865,8 @@ tool_result_t driver_read_pointer_chain(const json& params)
 
     for (std::size_t i = 0; i < offsets.size(); i++)
     {
+        if (mcp_standalone::current_call_cancelled())
+            return tool_result_t::error("Tool cancelled during pointer chain traversal.");
 
         std::uint64_t ptr = device->read<std::uint64_t>(current);
         if (ptr == 0)
@@ -1900,6 +1904,8 @@ tool_result_t driver_free_memory(const json& params)
 tool_result_t driver_call_function(const json& params)
 {
     diag::log_tagged_fmt("drv_tools", "driver_call_function entry");
+    if (mcp_standalone::current_call_cancelled())
+        return tool_result_t::error("Tool cancelled before operation.");
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
@@ -3296,6 +3302,8 @@ static json sniff_captures_to_json(const std::vector<voyager::device_t::sniff_re
 tool_result_t driver_sniff_network_buffers(const json& params)
 {
     diag::log_tagged_fmt("drv_tools", "driver_sniff_network_buffers entry");
+    if (mcp_standalone::current_call_cancelled())
+        return tool_result_t::error("Tool cancelled before operation.");
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
@@ -3472,6 +3480,8 @@ static bool parse_ip_string(const std::string& ip, std::uint8_t* out16, std::uin
 tool_result_t driver_reassemble_stream(const json& params)
 {
     diag::log_tagged_fmt("drv_tools", "driver_reassemble_stream entry");
+    if (mcp_standalone::current_call_cancelled())
+        return tool_result_t::error("Tool cancelled before operation.");
     if (!device->is_connected())
         return tool_result_t::error(OBFSTR("Driver not connected"));
 
@@ -3695,6 +3705,8 @@ tool_result_t driver_enum_kernel_callbacks(const json& params)
 tool_result_t driver_detect_integrity_checks(const json& params)
 {
     diag::log_tagged_fmt("drv_tools", "driver_detect_integrity_checks entry");
+    if (mcp_standalone::current_call_cancelled())
+        return tool_result_t::error("Tool cancelled before operation.");
     if (!device->is_connected())
         return tool_result_t::error(OBFSTR("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
     if (device->get_kernel_dtb() == 0)
@@ -3754,6 +3766,8 @@ tool_result_t driver_detect_integrity_checks(const json& params)
 
     for (int fi = 0; critical_exports[fi]; ++fi)
     {
+        if (mcp_standalone::current_call_cancelled())
+            return tool_result_t::error("Tool cancelled during integrity check scan.");
         std::uint64_t fn = device->resolve_export(ntos_base, critical_exports[fi]);
         if (fn == 0) {
             diag::log_tagged_fmt("drv_tools",
@@ -3902,6 +3916,8 @@ tool_result_t driver_detect_integrity_checks(const json& params)
 tool_result_t driver_detect_ssdt_hooks(const json&)
 {
     diag::log_tagged_fmt("drv_tools", "driver_detect_ssdt_hooks entry");
+    if (mcp_standalone::current_call_cancelled())
+        return tool_result_t::error("Tool cancelled before operation.");
     if (!device->is_connected())
         return tool_result_t::error(OBFSTR("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
     if (device->get_kernel_dtb() == 0)
@@ -4113,6 +4129,8 @@ tool_result_t driver_detect_ssdt_hooks(const json&)
 tool_result_t driver_enum_minifilters(const json& params)
 {
     diag::log_tagged_fmt("drv_tools", "driver_enum_minifilters entry");
+    if (mcp_standalone::current_call_cancelled())
+        return tool_result_t::error("Tool cancelled before operation.");
     if (!device->is_connected())
         return tool_result_t::error(OBFSTR("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
     if (device->get_kernel_dtb() == 0)
@@ -4319,6 +4337,8 @@ tool_result_t driver_enum_minifilters(const json& params)
 tool_result_t driver_detect_etw_monitors(const json& params)
 {
     diag::log_tagged_fmt("drv_tools", "driver_detect_etw_monitors entry");
+    if (mcp_standalone::current_call_cancelled())
+        return tool_result_t::error("Tool cancelled before operation.");
     if (!device->is_connected())
         return tool_result_t::error(OBFSTR("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
     if (device->get_kernel_dtb() == 0)
@@ -4521,6 +4541,8 @@ tool_result_t driver_detect_etw_monitors(const json& params)
 tool_result_t driver_detect_hidden_modules(const json& params)
 {
     diag::log_tagged_fmt("drv_tools", "driver_detect_hidden_modules entry");
+    if (mcp_standalone::current_call_cancelled())
+        return tool_result_t::error("Tool cancelled before operation.");
     if (!device->is_connected())
         return tool_result_t::error(OBFSTR("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
     if (device->get_process_id() == 0)
@@ -4780,6 +4802,8 @@ tool_result_t driver_detect_hidden_modules(const json& params)
 tool_result_t driver_walk_heap(const json& params)
 {
     diag::log_tagged_fmt("drv_tools", "driver_walk_heap entry");
+    if (mcp_standalone::current_call_cancelled())
+        return tool_result_t::error("Tool cancelled before operation.");
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
@@ -5515,6 +5539,8 @@ static std::mutex s_snapshot_mutex;
 tool_result_t driver_find_references(const json& params)
 {
     diag::log_tagged_fmt("drv_tools", "driver_find_references entry");
+    if (mcp_standalone::current_call_cancelled())
+        return tool_result_t::error("Tool cancelled before operation.");
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
@@ -5543,6 +5569,8 @@ tool_result_t driver_find_references(const json& params)
     for (const auto& region : regions)
     {
         if (found >= limit) break;
+        if (mcp_standalone::current_call_cancelled())
+            return tool_result_t::error("Tool cancelled during reference scan.");
         if (region.size == 0 || region.size > 0x10000000) continue;
         if ((region.state & 0x1000) == 0) continue;
         if ((region.protect & 0x01) || (region.protect & 0x100)) continue;

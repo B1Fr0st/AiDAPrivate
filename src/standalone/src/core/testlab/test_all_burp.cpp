@@ -2406,8 +2406,13 @@ namespace {
         auto blocks = aida::burp::comparer::compute_diff(
             slots[0].id, slots[1].id, aida::burp::comparer::diff_mode_t::bytes);
         log_msg(hf, tag, "diff blocks = %zu", blocks.size());
-        log_msg(hf, tag, "PASS -- compute_diff returned %zu blocks", blocks.size());
-        passed.fetch_add(1);
+        if (!blocks.empty()) {
+            log_msg(hf, tag, "PASS -- compute_diff returned %zu blocks", blocks.size());
+            passed.fetch_add(1);
+        } else {
+            log_msg(hf, tag, "FAIL -- compute_diff returned zero blocks for different data");
+            failed.fetch_add(1);
+        }
     }
 
     void test_comparer_diff_stats(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -2425,8 +2430,13 @@ namespace {
         log_msg(hf, tag, "blocks=%zu equal=%zu insert=%zu delete=%zu replace=%zu a_size=%zu b_size=%zu",
             blocks.size(), stats.equal_runs, stats.insert_runs,
             stats.delete_runs, stats.replace_runs, stats.a_size, stats.b_size);
-        log_msg(hf, tag, "PASS -- diff_with_stats computed");
-        passed.fetch_add(1);
+        if (stats.a_size > 0 && stats.b_size > 0) {
+            log_msg(hf, tag, "PASS -- diff_with_stats computed a_size=%zu b_size=%zu", stats.a_size, stats.b_size);
+            passed.fetch_add(1);
+        } else {
+            log_msg(hf, tag, "FAIL -- diff_with_stats returned zero-size slots a_size=%zu b_size=%zu", stats.a_size, stats.b_size);
+            failed.fetch_add(1);
+        }
     }
 
     void test_comparer_list_slots(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -2438,8 +2448,13 @@ namespace {
             log_msg(hf, tag, "  [%zu] id=%llu label=%s data_size=%zu",
                 i, (unsigned long long)slots[i].id, slots[i].label.c_str(), slots[i].data.size());
         }
-        log_msg(hf, tag, "PASS -- list_slots returned %zu entries", slots.size());
-        passed.fetch_add(1);
+        if (slots.size() >= 2) {
+            log_msg(hf, tag, "PASS -- list_slots returned %zu entries", slots.size());
+            passed.fetch_add(1);
+        } else {
+            log_msg(hf, tag, "FAIL -- list_slots returned %zu entries, expected >= 2 after add_a/add_b", slots.size());
+            failed.fetch_add(1);
+        }
     }
 
     void test_comparer_clear(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -2500,14 +2515,20 @@ namespace {
         log_msg(hf, tag, "START -- analyze strict CSP");
         auto result = aida::burp::csp::analyze(
             "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; "
-            "font-src 'self'; connect-src 'self'; frame-ancestors 'none'; "
+            "font-src 'self'; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; "
             "base-uri 'none'; form-action 'self'", false);
         log_msg(hf, tag, "has_csp=%s directives=%zu findings=%zu score=%d",
             result.has_csp ? "true" : "false",
             result.directives.size(), result.findings.size(), result.score);
-        log_msg(hf, tag, "PASS -- strict CSP analyzed, score=%d findings=%zu",
-            result.score, result.findings.size());
-        passed.fetch_add(1);
+        if (result.has_csp && result.findings.empty()) {
+            log_msg(hf, tag, "PASS -- strict CSP analyzed, score=%d findings=%zu",
+                result.score, result.findings.size());
+            passed.fetch_add(1);
+        } else {
+            log_msg(hf, tag, "FAIL -- strict CSP should have has_csp=true and zero findings has_csp=%d findings=%zu",
+                result.has_csp ? 1 : 0, result.findings.size());
+            failed.fetch_add(1);
+        }
     }
 
     void test_csp_log_findings(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -2521,9 +2542,9 @@ namespace {
             log_msg(hf, tag, "PASS -- permissive CSP has >= findings than strict");
             passed.fetch_add(1);
         } else {
-            log_msg(hf, tag, "PASS -- analysis completed (finding counts: %zu vs %zu)",
+            log_msg(hf, tag, "FAIL -- permissive CSP has fewer findings than strict (finding counts: %zu vs %zu)",
                 r1.findings.size(), r2.findings.size());
-            passed.fetch_add(1);
+            failed.fetch_add(1);
         }
     }
 
@@ -3366,21 +3387,24 @@ namespace {
     void test_camoufox_get_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "cfox_status";
         log_msg(hf, tag, "START -- camoufox::get_status()");
-        bool ready_probe = false;
-        try {
-            ready_probe = aida::burp::camoufox::ensure_ready();
-        } catch (...) {
-            ready_probe = false;
+        std::string dependency_reason;
+        if (!ensure_burp_camoufox_dependencies(hf, tag, dependency_reason)) {
+            log_msg(hf, tag, "DEPENDENCY-BLOCKED -- Camoufox not ready, refusing unbounded ensure_ready() call reason=%s",
+                dependency_reason.empty() ? "<empty>" : compact_burp_text(dependency_reason, 700).c_str());
+            fail_empty_evidence(hf, tag, failed,
+                "Camoufox dependency check failed-closed; refusing unbounded ensure_ready() call reason=%s",
+                dependency_reason.empty() ? "<empty>" : compact_burp_text(dependency_reason, 700).c_str());
+            return;
         }
         auto st = aida::burp::camoufox::get_status();
         const bool live = st.state == aida::burp::camoufox::bridge_state_t::ready &&
             st.child_pid != 0 && st.child_alive && st.browser_open && st.page_verified && st.privacy_verified && !st.cleanup_pending;
-        log_msg(hf, tag, "state=%d browser_open=%s total_calls=%llu total_errors=%llu ready_probe=%d child_pid=%u child_alive=%d page_verified=%d privacy_verified=%d cleanup_pending=%d",
+        log_msg(hf, tag, "state=%d browser_open=%s total_calls=%llu total_errors=%llu child_pid=%u child_alive=%d page_verified=%d privacy_verified=%d cleanup_pending=%d",
             (int)st.state, st.browser_open ? "true" : "false",
             (unsigned long long)st.total_calls, (unsigned long long)st.total_errors,
-            ready_probe ? 1 : 0, st.child_pid, st.child_alive ? 1 : 0, st.page_verified ? 1 : 0, st.privacy_verified ? 1 : 0, st.cleanup_pending ? 1 : 0);
+            st.child_pid, st.child_alive ? 1 : 0, st.page_verified ? 1 : 0, st.privacy_verified ? 1 : 0, st.cleanup_pending ? 1 : 0);
         log_camoufox_bridge_snapshot(hf, tag, "status_bridge", st);
-        if (!ready_probe || !live) {
+        if (!live) {
             fail_empty_evidence(hf, tag, failed,
                 "Camoufox status has no same-run live bridge evidence state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d launch_diag=%s cleanup_diag=%s privacy_diag=%s",
                 camoufox_bridge_state_name(st.state),
@@ -3402,6 +3426,15 @@ namespace {
     void test_camoufox_is_ready(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "cfox_ready";
         log_msg(hf, tag, "START -- camoufox::is_ready()");
+        std::string dependency_reason;
+        if (!ensure_burp_camoufox_dependencies(hf, tag, dependency_reason)) {
+            log_msg(hf, tag, "DEPENDENCY-BLOCKED -- Camoufox not ready, refusing unbounded ensure_ready() call reason=%s",
+                dependency_reason.empty() ? "<empty>" : compact_burp_text(dependency_reason, 700).c_str());
+            fail_empty_evidence(hf, tag, failed,
+                "Camoufox dependency check failed-closed; refusing unbounded ensure_ready() call reason=%s",
+                dependency_reason.empty() ? "<empty>" : compact_burp_text(dependency_reason, 700).c_str());
+            return;
+        }
         bool ready = aida::burp::camoufox::is_ready();
         auto before = aida::burp::camoufox::get_status();
         log_msg(hf, tag, "initial_ready=%s state=%s generation=%llu child_pid=%u child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d child_processes=%u browser_processes=%u pages=%u last_error=%s",
@@ -3425,12 +3458,48 @@ namespace {
             return;
         }
         const uint64_t t0 = GetTickCount64();
-        bool recovered = false;
-        try {
-            recovered = aida::burp::camoufox::ensure_ready();
-        } catch (...) {
-            recovered = false;
+        static test_lab::bounded_runner_t relaunch_runner(1);
+        auto relaunch_state = std::make_shared<std::atomic<bool>>(false);
+        const auto relaunch_result = relaunch_runner.run(30000, [relaunch_state]() {
+            try {
+                relaunch_state->store(aida::burp::camoufox::ensure_ready(), std::memory_order_release);
+            } catch (...) {
+                relaunch_state->store(false, std::memory_order_release);
+            }
+        });
+        if (relaunch_result.status == test_lab::bounded_run_status_t::timed_out) {
+            log_msg(hf, tag, "TIMEOUT -- bounded ensure_ready() relaunch exceeded 30000ms elapsed_ms=%llu",
+                static_cast<unsigned long long>(GetTickCount64() - t0));
+            fail_empty_evidence(hf, tag, failed,
+                "Camoufox bounded ensure_ready() relaunch timed out after 30000ms state=%s child_pid=%u child_alive=%d browser_open=%d last_error=%s",
+                camoufox_bridge_state_name(before.state),
+                before.child_pid,
+                before.child_alive ? 1 : 0,
+                before.browser_open ? 1 : 0,
+                before.last_error.empty() ? "<empty>" : compact_burp_text(before.last_error, 360).c_str());
+            return;
         }
+        if (relaunch_result.status == test_lab::bounded_run_status_t::saturated) {
+            log_msg(hf, tag, "SATURATED -- bounded relaunch runner saturated");
+            fail_empty_evidence(hf, tag, failed,
+                "Camoufox bounded ensure_ready() relaunch saturated; previous timed-out workers still draining");
+            return;
+        }
+        if (relaunch_result.status == test_lab::bounded_run_status_t::exception) {
+            log_msg(hf, tag, "EXCEPTION -- bounded relaunch threw: %s",
+                relaunch_result.error.empty() ? "<unknown>" : relaunch_result.error.c_str());
+            fail_empty_evidence(hf, tag, failed,
+                "Camoufox bounded ensure_ready() relaunch threw exception: %s",
+                relaunch_result.error.empty() ? "<unknown>" : relaunch_result.error.c_str());
+            return;
+        }
+        if (relaunch_result.status == test_lab::bounded_run_status_t::post_failed) {
+            log_msg(hf, tag, "POST-FAILED -- bounded relaunch could not post to work queue");
+            fail_empty_evidence(hf, tag, failed,
+                "Camoufox bounded ensure_ready() relaunch post failed");
+            return;
+        }
+        const bool recovered = relaunch_state->load(std::memory_order_acquire);
         auto after = aida::burp::camoufox::get_status();
         const bool ready_after = aida::burp::camoufox::is_ready();
         log_msg(hf, tag, "relaunch_attempt recovered=%d ready_after=%d state=%s generation=%llu child_pid=%u child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d child_processes=%u browser_processes=%u pages=%u elapsed_ms=%llu last_error=%s",
@@ -3479,21 +3548,24 @@ namespace {
     void test_camoufox_last_error(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "cfox_err";
         log_msg(hf, tag, "START -- camoufox::last_error()");
-        std::string err = aida::burp::camoufox::last_error();
-        bool ready_probe = false;
-        try {
-            ready_probe = aida::burp::camoufox::ensure_ready();
-        } catch (...) {
-            ready_probe = false;
+        std::string dependency_reason;
+        if (!ensure_burp_camoufox_dependencies(hf, tag, dependency_reason)) {
+            log_msg(hf, tag, "DEPENDENCY-BLOCKED -- Camoufox not ready, refusing unbounded ensure_ready() call reason=%s",
+                dependency_reason.empty() ? "<empty>" : compact_burp_text(dependency_reason, 700).c_str());
+            fail_empty_evidence(hf, tag, failed,
+                "Camoufox dependency check failed-closed; refusing unbounded ensure_ready() call reason=%s",
+                dependency_reason.empty() ? "<empty>" : compact_burp_text(dependency_reason, 700).c_str());
+            return;
         }
+        std::string err = aida::burp::camoufox::last_error();
         const auto st = aida::burp::camoufox::get_status();
         const bool live = st.state == aida::burp::camoufox::bridge_state_t::ready &&
             st.child_pid != 0 && st.child_alive && st.browser_open && st.page_verified && st.privacy_verified && !st.cleanup_pending;
-        log_msg(hf, tag, "FIELD -- last_error=\"%s\" len=%zu state=%s generation=%llu ready_probe=%d child_pid=%u child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d",
+        log_msg(hf, tag, "FIELD -- last_error=\"%s\" len=%zu state=%s generation=%llu child_pid=%u child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d",
             err.c_str(), err.size(), camoufox_bridge_state_name(st.state), static_cast<unsigned long long>(st.generation),
-            ready_probe ? 1 : 0, st.child_pid, st.child_alive ? 1 : 0, st.browser_open ? 1 : 0, st.page_verified ? 1 : 0, st.privacy_verified ? 1 : 0);
+            st.child_pid, st.child_alive ? 1 : 0, st.browser_open ? 1 : 0, st.page_verified ? 1 : 0, st.privacy_verified ? 1 : 0);
         log_camoufox_bridge_snapshot(hf, tag, "last_error_bridge", st);
-        if (!ready_probe || !live) {
+        if (!live) {
             fail_empty_evidence(hf, tag, failed,
                 "camoufox last_error accessor has no same-run live bridge evidence state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d launch_diag=%s cleanup_diag=%s privacy_diag=%s",
                 camoufox_bridge_state_name(st.state),
@@ -5117,8 +5189,73 @@ namespace {
         }
     };
 
-    static void call_test(void(*fn)(HANDLE, std::atomic<int>&, std::atomic<int>&), HANDLE hf, std::atomic<int>& p, std::atomic<int>& f) {
+    static void run_burp_test_seh(void(*fn)(HANDLE, std::atomic<int>&, std::atomic<int>&), HANDLE hf, std::atomic<int>& p, std::atomic<int>& f) {
         __try { fn(hf, p, f); } __except(EXCEPTION_EXECUTE_HANDLER) { f.fetch_add(1); }
+    }
+
+    struct burp_worker_state_t {
+        std::atomic<int> passed{0};
+        std::atomic<int> failed{0};
+    };
+
+    struct burp_log_handle_t {
+        HANDLE handle = INVALID_HANDLE_VALUE;
+        explicit burp_log_handle_t(HANDLE h) : handle(h) {}
+        ~burp_log_handle_t() {
+            if (handle && handle != INVALID_HANDLE_VALUE)
+                CloseHandle(handle);
+        }
+        HANDLE get() const { return handle; }
+    };
+
+    static HANDLE duplicate_burp_log_handle(HANDLE hf) {
+        if (!hf || hf == INVALID_HANDLE_VALUE)
+            return INVALID_HANDLE_VALUE;
+        HANDLE dup = nullptr;
+        if (!DuplicateHandle(GetCurrentProcess(), hf, GetCurrentProcess(), &dup, 0, FALSE, DUPLICATE_SAME_ACCESS))
+            return INVALID_HANDLE_VALUE;
+        return dup;
+    }
+
+    static void call_test(const char* name, void(*fn)(HANDLE, std::atomic<int>&, std::atomic<int>&), HANDLE hf, std::atomic<int>& p, std::atomic<int>& f, DWORD timeout_ms = 30000) {
+        char step_label[256];
+        _snprintf_s(step_label, sizeof(step_label), _TRUNCATE, "burp test: %s", name);
+        set_progress_step(step_label);
+        static test_lab::bounded_runner_t runner(4);
+        auto state = std::make_shared<burp_worker_state_t>();
+        auto worker_log = std::make_shared<burp_log_handle_t>(duplicate_burp_log_handle(hf));
+        const uint64_t t0 = GetTickCount64();
+        const auto result = runner.run(static_cast<std::uint32_t>(timeout_ms), [worker_log, fn, state]() {
+            HANDLE log_hf = worker_log->get();
+            run_burp_test_seh(fn, log_hf, state->passed, state->failed);
+        });
+        const uint64_t elapsed = GetTickCount64() - t0;
+        if (result.status == test_lab::bounded_run_status_t::completed) {
+            p.fetch_add(state->passed.load(std::memory_order_acquire), std::memory_order_acq_rel);
+            f.fetch_add(state->failed.load(std::memory_order_acquire), std::memory_order_acq_rel);
+            return;
+        }
+        if (result.status == test_lab::bounded_run_status_t::timed_out) {
+            log_msg(hf, "burp_phase", "TIMEOUT -- %s exceeded %lu ms watchdog; bounded worker still draining elapsed_ms=%llu",
+                name, static_cast<unsigned long>(timeout_ms), static_cast<unsigned long long>(elapsed));
+            f.fetch_add(1);
+            return;
+        }
+        if (result.status == test_lab::bounded_run_status_t::saturated) {
+            log_msg(hf, "burp_phase", "SATURATED -- %s bounded runner saturated; previous timed-out workers still draining",
+                name);
+            f.fetch_add(1);
+            return;
+        }
+        if (result.status == test_lab::bounded_run_status_t::exception) {
+            log_msg(hf, "burp_phase", "EXCEPTION -- %s bounded worker escaped exception: %s",
+                name, result.error.empty() ? "<unknown>" : result.error.c_str());
+            f.fetch_add(1);
+            return;
+        }
+        log_msg(hf, "burp_phase", "POST-FAILED -- %s bounded worker post failed%s%s",
+            name, result.error.empty() ? "" : ": ", result.error.empty() ? "" : result.error.c_str());
+        f.fetch_add(1);
     }
 }
 
@@ -5128,408 +5265,408 @@ void phase_burp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fai
     burp_phase_cleanup_guard_t cleanup_guard{hf};
 
     if (cancelled && cancelled()) return;
-    call_test(test_scope_init, hf, passed, failed);
+    call_test("test_scope_init", test_scope_init, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_scope_add_include, hf, passed, failed);
+    call_test("test_scope_add_include", test_scope_add_include, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_scope_add_exclude, hf, passed, failed);
+    call_test("test_scope_add_exclude", test_scope_add_exclude, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_scope_in_scope_true, hf, passed, failed);
+    call_test("test_scope_in_scope_true", test_scope_in_scope_true, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_scope_in_scope_false, hf, passed, failed);
+    call_test("test_scope_in_scope_false", test_scope_in_scope_false, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_scope_list_rules, hf, passed, failed);
+    call_test("test_scope_list_rules", test_scope_list_rules, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_scope_remove_rule, hf, passed, failed);
+    call_test("test_scope_remove_rule", test_scope_remove_rule, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_scope_clear, hf, passed, failed);
+    call_test("test_scope_clear", test_scope_clear, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
-    call_test(test_cookie_init, hf, passed, failed);
+    call_test("test_cookie_init", test_cookie_init, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_cookie_parse, hf, passed, failed);
+    call_test("test_cookie_parse", test_cookie_parse, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_cookie_set, hf, passed, failed);
+    call_test("test_cookie_set", test_cookie_set, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_cookie_get_for_host, hf, passed, failed);
+    call_test("test_cookie_get_for_host", test_cookie_get_for_host, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_cookie_build_header, hf, passed, failed);
+    call_test("test_cookie_build_header", test_cookie_build_header, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_cookie_list_all, hf, passed, failed);
+    call_test("test_cookie_list_all", test_cookie_list_all, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_cookie_delete, hf, passed, failed);
+    call_test("test_cookie_delete", test_cookie_delete, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_cookie_clear_all, hf, passed, failed);
+    call_test("test_cookie_clear_all", test_cookie_clear_all, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
-    call_test(test_jwt_init, hf, passed, failed);
+    call_test("test_jwt_init", test_jwt_init, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_jwt_decode, hf, passed, failed);
+    call_test("test_jwt_decode", test_jwt_decode, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_jwt_verify_hmac, hf, passed, failed);
+    call_test("test_jwt_verify_hmac", test_jwt_verify_hmac, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_jwt_attack_alg_none, hf, passed, failed);
+    call_test("test_jwt_attack_alg_none", test_jwt_attack_alg_none, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_jwt_attack_sig_strip, hf, passed, failed);
+    call_test("test_jwt_attack_sig_strip", test_jwt_attack_sig_strip, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_jwt_attack_kid, hf, passed, failed);
+    call_test("test_jwt_attack_kid", test_jwt_attack_kid, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
-    call_test(test_mr_init, hf, passed, failed);
+    call_test("test_mr_init", test_mr_init, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_mr_add_rule, hf, passed, failed);
+    call_test("test_mr_add_rule", test_mr_add_rule, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_mr_apply, hf, passed, failed);
+    call_test("test_mr_apply", test_mr_apply, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_mr_test_rule, hf, passed, failed);
+    call_test("test_mr_test_rule", test_mr_test_rule, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_mr_list, hf, passed, failed);
+    call_test("test_mr_list", test_mr_list, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_mr_remove, hf, passed, failed);
+    call_test("test_mr_remove", test_mr_remove, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_mr_add_response_rule, hf, passed, failed);
+    call_test("test_mr_add_response_rule", test_mr_add_response_rule, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_mr_add_body_rule, hf, passed, failed);
+    call_test("test_mr_add_body_rule", test_mr_add_body_rule, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_mr_clear_all, hf, passed, failed);
+    call_test("test_mr_clear_all", test_mr_clear_all, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
-    call_test(test_comparer_add_a, hf, passed, failed);
+    call_test("test_comparer_add_a", test_comparer_add_a, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_comparer_add_b, hf, passed, failed);
+    call_test("test_comparer_add_b", test_comparer_add_b, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_comparer_diff, hf, passed, failed);
+    call_test("test_comparer_diff", test_comparer_diff, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_comparer_diff_stats, hf, passed, failed);
+    call_test("test_comparer_diff_stats", test_comparer_diff_stats, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_comparer_list_slots, hf, passed, failed);
+    call_test("test_comparer_list_slots", test_comparer_list_slots, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_comparer_clear, hf, passed, failed);
+    call_test("test_comparer_clear", test_comparer_clear, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
-    call_test(test_csp_init, hf, passed, failed);
+    call_test("test_csp_init", test_csp_init, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_csp_analyze_unsafe, hf, passed, failed);
+    call_test("test_csp_analyze_unsafe", test_csp_analyze_unsafe, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_csp_analyze_clean, hf, passed, failed);
+    call_test("test_csp_analyze_clean", test_csp_analyze_clean, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_csp_log_findings, hf, passed, failed);
+    call_test("test_csp_log_findings", test_csp_log_findings, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
-    call_test(test_sequencer_list, hf, passed, failed);
+    call_test("test_sequencer_list", test_sequencer_list, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_sequencer_last_error, hf, passed, failed);
+    call_test("test_sequencer_last_error", test_sequencer_last_error, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
-    call_test(test_intruder_list_jobs, hf, passed, failed);
+    call_test("test_intruder_list_jobs", test_intruder_list_jobs, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_intruder_attack_mode_names, hf, passed, failed);
+    call_test("test_intruder_attack_mode_names", test_intruder_attack_mode_names, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_intruder_engine_mode_names, hf, passed, failed);
+    call_test("test_intruder_engine_mode_names", test_intruder_engine_mode_names, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
-    call_test(test_active_scanner_init, hf, passed, failed);
+    call_test("test_active_scanner_init", test_active_scanner_init, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_passive_scanner_init, hf, passed, failed);
+    call_test("test_passive_scanner_init", test_passive_scanner_init, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_passive_scanner_enabled, hf, passed, failed);
+    call_test("test_passive_scanner_enabled", test_passive_scanner_enabled, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_passive_scanner_set_enabled, hf, passed, failed);
+    call_test("test_passive_scanner_set_enabled", test_passive_scanner_set_enabled, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_passive_scanner_stats, hf, passed, failed);
+    call_test("test_passive_scanner_stats", test_passive_scanner_stats, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_active_scanner_list_audits, hf, passed, failed);
+    call_test("test_active_scanner_list_audits", test_active_scanner_list_audits, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_active_scanner_last_error, hf, passed, failed);
+    call_test("test_active_scanner_last_error", test_active_scanner_last_error, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
-    call_test(test_crawler_init, hf, passed, failed);
+    call_test("test_crawler_init", test_crawler_init, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_crawler_list, hf, passed, failed);
+    call_test("test_crawler_list", test_crawler_list, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
-    call_test(test_sitemap_init, hf, passed, failed);
+    call_test("test_sitemap_init", test_sitemap_init, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_sitemap_list_hosts, hf, passed, failed);
+    call_test("test_sitemap_list_hosts", test_sitemap_list_hosts, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_sitemap_total_exchanges, hf, passed, failed);
+    call_test("test_sitemap_total_exchanges", test_sitemap_total_exchanges, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_sitemap_clear_check, hf, passed, failed);
+    call_test("test_sitemap_clear_check", test_sitemap_clear_check, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
-    call_test(test_report_list, hf, passed, failed);
+    call_test("test_report_list", test_report_list, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_report_format_labels, hf, passed, failed);
+    call_test("test_report_format_labels", test_report_format_labels, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_report_default_ext, hf, passed, failed);
+    call_test("test_report_default_ext", test_report_default_ext, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
-    call_test(test_bambda_compile_valid, hf, passed, failed);
+    call_test("test_bambda_compile_valid", test_bambda_compile_valid, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_bambda_compile_invalid, hf, passed, failed);
+    call_test("test_bambda_compile_invalid", test_bambda_compile_invalid, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_bambda_help, hf, passed, failed);
+    call_test("test_bambda_help", test_bambda_help, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
-    call_test(test_collaborator_is_running, hf, passed, failed);
+    call_test("test_collaborator_is_running", test_collaborator_is_running, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_collaborator_generate_token, hf, passed, failed);
+    call_test("test_collaborator_generate_token", test_collaborator_generate_token, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_collaborator_status, hf, passed, failed);
+    call_test("test_collaborator_status", test_collaborator_status, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_collaborator_list_tokens, hf, passed, failed);
+    call_test("test_collaborator_list_tokens", test_collaborator_list_tokens, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_collaborator_poll_since, hf, passed, failed);
+    call_test("test_collaborator_poll_since", test_collaborator_poll_since, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_collaborator_snapshot_all, hf, passed, failed);
+    call_test("test_collaborator_snapshot_all", test_collaborator_snapshot_all, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
-    call_test(test_ws_init, hf, passed, failed);
+    call_test("test_ws_init", test_ws_init, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_ws_list_connections, hf, passed, failed);
+    call_test("test_ws_list_connections", test_ws_list_connections, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_ws_connect_invalid, hf, passed, failed);
+    call_test("test_ws_connect_invalid", test_ws_connect_invalid, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_ws_disconnect_all, hf, passed, failed);
+    call_test("test_ws_disconnect_all", test_ws_disconnect_all, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_ws_frame_count_zero, hf, passed, failed);
+    call_test("test_ws_frame_count_zero", test_ws_frame_count_zero, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_ws_last_error, hf, passed, failed);
+    call_test("test_ws_last_error", test_ws_last_error, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
-    call_test(test_h2_encode_frame, hf, passed, failed);
+    call_test("test_h2_encode_frame", test_h2_encode_frame, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_h2_decode_frames, hf, passed, failed);
+    call_test("test_h2_decode_frames", test_h2_decode_frames, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_h2_last_error, hf, passed, failed);
+    call_test("test_h2_last_error", test_h2_last_error, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
-    call_test(test_logger_init, hf, passed, failed);
+    call_test("test_logger_init", test_logger_init, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_logger_total_rows, hf, passed, failed);
+    call_test("test_logger_total_rows", test_logger_total_rows, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_logger_query_empty, hf, passed, failed);
+    call_test("test_logger_query_empty", test_logger_query_empty, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_logger_capacity, hf, passed, failed);
+    call_test("test_logger_capacity", test_logger_capacity, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_logger_clear, hf, passed, failed);
+    call_test("test_logger_clear", test_logger_clear, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_logger_source_labels, hf, passed, failed);
+    call_test("test_logger_source_labels", test_logger_source_labels, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
-    call_test(test_upstream_init, hf, passed, failed);
+    call_test("test_upstream_init", test_upstream_init, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_upstream_add_chain, hf, passed, failed);
+    call_test("test_upstream_add_chain", test_upstream_add_chain, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_upstream_list_chains, hf, passed, failed);
+    call_test("test_upstream_list_chains", test_upstream_list_chains, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_upstream_get_chain, hf, passed, failed);
+    call_test("test_upstream_get_chain", test_upstream_get_chain, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_upstream_remove_chain, hf, passed, failed);
+    call_test("test_upstream_remove_chain", test_upstream_remove_chain, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
-    call_test(test_camoufox_get_status, hf, passed, failed);
+    call_test("test_camoufox_get_status", test_camoufox_get_status, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_camoufox_is_ready, hf, passed, failed);
+    call_test("test_camoufox_is_ready", test_camoufox_is_ready, hf, passed, failed, 45000);
     if (cancelled && cancelled()) return;
-    call_test(test_camoufox_last_error, hf, passed, failed);
+    call_test("test_camoufox_last_error", test_camoufox_last_error, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_camoufox_install_probe, hf, passed, failed);
+    call_test("test_camoufox_install_probe", test_camoufox_install_probe, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
-    call_test(test_dom_xss_init, hf, passed, failed);
+    call_test("test_dom_xss_init", test_dom_xss_init, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_dom_xss_make_sentinel, hf, passed, failed);
+    call_test("test_dom_xss_make_sentinel", test_dom_xss_make_sentinel, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_dom_xss_build_script, hf, passed, failed);
+    call_test("test_dom_xss_build_script", test_dom_xss_build_script, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_dom_xss_payload_sets, hf, passed, failed);
+    call_test("test_dom_xss_payload_sets", test_dom_xss_payload_sets, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
-    call_test(test_graphql_beautify, hf, passed, failed);
+    call_test("test_graphql_beautify", test_graphql_beautify, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_graphql_minify, hf, passed, failed);
+    call_test("test_graphql_minify", test_graphql_minify, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_graphql_build_batched, hf, passed, failed);
+    call_test("test_graphql_build_batched", test_graphql_build_batched, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_graphql_last_error, hf, passed, failed);
+    call_test("test_graphql_last_error", test_graphql_last_error, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_graphql_cache_miss, hf, passed, failed);
+    call_test("test_graphql_cache_miss", test_graphql_cache_miss, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
-    call_test(test_auth_init, hf, passed, failed);
+    call_test("test_auth_init", test_auth_init, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_auth_basic_encode, hf, passed, failed);
+    call_test("test_auth_basic_encode", test_auth_basic_encode, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_auth_basic_decode, hf, passed, failed);
+    call_test("test_auth_basic_decode", test_auth_basic_decode, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_auth_bearer, hf, passed, failed);
+    call_test("test_auth_bearer", test_auth_bearer, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_auth_digest_solve, hf, passed, failed);
+    call_test("test_auth_digest_solve", test_auth_digest_solve, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_auth_ntlm_type1, hf, passed, failed);
+    call_test("test_auth_ntlm_type1", test_auth_ntlm_type1, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_auth_oauth2_pkce, hf, passed, failed);
+    call_test("test_auth_oauth2_pkce", test_auth_oauth2_pkce, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_auth_oauth2_build_url, hf, passed, failed);
+    call_test("test_auth_oauth2_build_url", test_auth_oauth2_build_url, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_auth_b64_roundtrip, hf, passed, failed);
+    call_test("test_auth_b64_roundtrip", test_auth_b64_roundtrip, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
-    call_test(test_session_handler_init, hf, passed, failed);
+    call_test("test_session_handler_init", test_session_handler_init, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_session_handler_add_macro, hf, passed, failed);
+    call_test("test_session_handler_add_macro", test_session_handler_add_macro, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_session_handler_list_macros, hf, passed, failed);
+    call_test("test_session_handler_list_macros", test_session_handler_list_macros, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_session_handler_remove_macro, hf, passed, failed);
+    call_test("test_session_handler_remove_macro", test_session_handler_remove_macro, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_session_handler_add_rule, hf, passed, failed);
+    call_test("test_session_handler_add_rule", test_session_handler_add_rule, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_session_handler_list_rules, hf, passed, failed);
+    call_test("test_session_handler_list_rules", test_session_handler_list_rules, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_session_handler_remove_rule, hf, passed, failed);
+    call_test("test_session_handler_remove_rule", test_session_handler_remove_rule, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_session_handler_match_labels, hf, passed, failed);
+    call_test("test_session_handler_match_labels", test_session_handler_match_labels, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
-    call_test(test_content_discovery_init, hf, passed, failed);
+    call_test("test_content_discovery_init", test_content_discovery_init, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_content_discovery_list, hf, passed, failed);
+    call_test("test_content_discovery_list", test_content_discovery_list, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
-    call_test(test_subdomain_enum_init, hf, passed, failed);
+    call_test("test_subdomain_enum_init", test_subdomain_enum_init, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_subdomain_enum_list, hf, passed, failed);
+    call_test("test_subdomain_enum_list", test_subdomain_enum_list, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
-    call_test(test_tech_init, hf, passed, failed);
+    call_test("test_tech_init", test_tech_init, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_tech_fingerprint, hf, passed, failed);
+    call_test("test_tech_fingerprint", test_tech_fingerprint, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_tech_inventory, hf, passed, failed);
+    call_test("test_tech_inventory", test_tech_inventory, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_tech_clear_inventory, hf, passed, failed);
+    call_test("test_tech_clear_inventory", test_tech_clear_inventory, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
-    call_test(test_api_def_init, hf, passed, failed);
+    call_test("test_api_def_init", test_api_def_init, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_api_def_import_text, hf, passed, failed);
+    call_test("test_api_def_import_text", test_api_def_import_text, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_api_def_list_collections, hf, passed, failed);
+    call_test("test_api_def_list_collections", test_api_def_list_collections, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_api_def_collection_count, hf, passed, failed);
+    call_test("test_api_def_collection_count", test_api_def_collection_count, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_api_def_format_labels, hf, passed, failed);
+    call_test("test_api_def_format_labels", test_api_def_format_labels, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_api_def_clear_all, hf, passed, failed);
+    call_test("test_api_def_clear_all", test_api_def_clear_all, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
-    call_test(test_param_miner_list_jobs, hf, passed, failed);
+    call_test("test_param_miner_list_jobs", test_param_miner_list_jobs, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_param_miner_location_names, hf, passed, failed);
+    call_test("test_param_miner_location_names", test_param_miner_location_names, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
-    call_test(test_payloads_init, hf, passed, failed);
+    call_test("test_payloads_init", test_payloads_init, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_payloads_list_ids, hf, passed, failed);
+    call_test("test_payloads_list_ids", test_payloads_list_ids, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_payloads_list_summaries, hf, passed, failed);
+    call_test("test_payloads_list_summaries", test_payloads_list_summaries, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_payloads_add_custom, hf, passed, failed);
+    call_test("test_payloads_add_custom", test_payloads_add_custom, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_payloads_get, hf, passed, failed);
+    call_test("test_payloads_get", test_payloads_get, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_payloads_search, hf, passed, failed);
+    call_test("test_payloads_search", test_payloads_search, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_payloads_remove_custom, hf, passed, failed);
+    call_test("test_payloads_remove_custom", test_payloads_remove_custom, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
-    call_test(test_issue_store_init, hf, passed, failed);
+    call_test("test_issue_store_init", test_issue_store_init, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_issue_store_add, hf, passed, failed);
+    call_test("test_issue_store_add", test_issue_store_add, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_issue_store_count, hf, passed, failed);
+    call_test("test_issue_store_count", test_issue_store_count, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_issue_store_list, hf, passed, failed);
+    call_test("test_issue_store_list", test_issue_store_list, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_issue_store_count_by_severity, hf, passed, failed);
+    call_test("test_issue_store_count_by_severity", test_issue_store_count_by_severity, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_issue_severity_labels, hf, passed, failed);
+    call_test("test_issue_severity_labels", test_issue_severity_labels, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_issue_store_clear, hf, passed, failed);
+    call_test("test_issue_store_clear", test_issue_store_clear, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
-    call_test(test_browser_init, hf, passed, failed);
+    call_test("test_browser_init", test_browser_init, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_browser_profile_root, hf, passed, failed);
+    call_test("test_browser_profile_root", test_browser_profile_root, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_browser_command_line_certificate_strategy, hf, passed, failed);
+    call_test("test_browser_command_line_certificate_strategy", test_browser_command_line_certificate_strategy, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_browser_list_running, hf, passed, failed);
+    call_test("test_browser_list_running", test_browser_list_running, hf, passed, failed, 90000);
 
     if (cancelled && cancelled()) return;
-    call_test(test_insertion_points_url_encode, hf, passed, failed);
+    call_test("test_insertion_points_url_encode", test_insertion_points_url_encode, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_insertion_points_url_decode, hf, passed, failed);
+    call_test("test_insertion_points_url_decode", test_insertion_points_url_decode, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_insertion_points_analyze, hf, passed, failed);
+    call_test("test_insertion_points_analyze", test_insertion_points_analyze, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
-    call_test(test_scanner_module_count, hf, passed, failed);
+    call_test("test_scanner_module_count", test_scanner_module_count, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_scanner_module_all, hf, passed, failed);
+    call_test("test_scanner_module_all", test_scanner_module_all, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_scanner_random_marker, hf, passed, failed);
+    call_test("test_scanner_random_marker", test_scanner_random_marker, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
-    call_test(test_audit_http_parse_url, hf, passed, failed);
+    call_test("test_audit_http_parse_url", test_audit_http_parse_url, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_audit_http_last_error, hf, passed, failed);
+    call_test("test_audit_http_last_error", test_audit_http_last_error, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
-    call_test(test_headless_view_init, hf, passed, failed);
+    call_test("test_headless_view_init", test_headless_view_init, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_headless_view_last_error, hf, passed, failed);
+    call_test("test_headless_view_last_error", test_headless_view_last_error, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_headless_view_shutdown, hf, passed, failed);
+    call_test("test_headless_view_shutdown", test_headless_view_shutdown, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
-    call_test(test_burp_tab_repeater, hf, passed, failed);
+    call_test("test_burp_tab_repeater", test_burp_tab_repeater, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_burp_tab_fuzzer, hf, passed, failed);
+    call_test("test_burp_tab_fuzzer", test_burp_tab_fuzzer, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_burp_tab_scripting, hf, passed, failed);
+    call_test("test_burp_tab_scripting", test_burp_tab_scripting, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_burp_tab_sitemap, hf, passed, failed);
+    call_test("test_burp_tab_sitemap", test_burp_tab_sitemap, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_burp_tab_scope, hf, passed, failed);
+    call_test("test_burp_tab_scope", test_burp_tab_scope, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_burp_tab_scanner, hf, passed, failed);
+    call_test("test_burp_tab_scanner", test_burp_tab_scanner, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_burp_tab_recon, hf, passed, failed);
+    call_test("test_burp_tab_recon", test_burp_tab_recon, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_burp_tab_intruder, hf, passed, failed);
+    call_test("test_burp_tab_intruder", test_burp_tab_intruder, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_burp_tab_collab, hf, passed, failed);
+    call_test("test_burp_tab_collab", test_burp_tab_collab, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_burp_tab_sequencer, hf, passed, failed);
+    call_test("test_burp_tab_sequencer", test_burp_tab_sequencer, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_burp_tab_comparer, hf, passed, failed);
+    call_test("test_burp_tab_comparer", test_burp_tab_comparer, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_burp_tab_jwt, hf, passed, failed);
+    call_test("test_burp_tab_jwt", test_burp_tab_jwt, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_burp_tab_mr, hf, passed, failed);
+    call_test("test_burp_tab_mr", test_burp_tab_mr, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_burp_tab_session, hf, passed, failed);
+    call_test("test_burp_tab_session", test_burp_tab_session, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_burp_tab_api, hf, passed, failed);
+    call_test("test_burp_tab_api", test_burp_tab_api, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_burp_tab_reports, hf, passed, failed);
+    call_test("test_burp_tab_reports", test_burp_tab_reports, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_burp_tab_browser, hf, passed, failed);
+    call_test("test_burp_tab_browser", test_burp_tab_browser, hf, passed, failed);
     if (cancelled && cancelled()) return;
-    call_test(test_burp_tab_headless, hf, passed, failed);
+    call_test("test_burp_tab_headless", test_burp_tab_headless, hf, passed, failed);
 
     cleanup_burp_async_fixture_jobs(hf);
     cleanup_guard.disarm();

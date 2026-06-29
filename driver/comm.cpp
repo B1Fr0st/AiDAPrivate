@@ -3001,6 +3001,11 @@ std::uint64_t voyager::device_t::call_function_attempt(
                     status = thread_hijack::indirect_NtSuspendThread(th, &prev_count);
 
                     if (status >= 0) {
+                        if (prev_count > 0) {
+                            thread_hijack::indirect_NtResumeThread(th, nullptr);
+                            thread_hijack::indirect_NtClose(th);
+                            continue;
+                        }
                         CONTEXT ctx{};
                         ctx.ContextFlags = CONTEXT_FULL;
 
@@ -3026,10 +3031,7 @@ std::uint64_t voyager::device_t::call_function_attempt(
                                     priority -= 20;
                                 }
 
-
-                                if (prev_count == 0) {
-                                    priority += 5;
-                                }
+                                priority += 5;
 
                                 if (priority > best_priority) {
                                     if (best_thread) {
@@ -3234,7 +3236,25 @@ std::uint64_t voyager::device_t::call_function_attempt(
 
     thread_hijack::collect_entropy();
 
-    thread_hijack::indirect_NtResumeThread(target_thread, nullptr);
+    {
+        ULONG resume_prev = 1;
+        int resume_calls = 0;
+        while (resume_prev > 0) {
+            resume_prev = 0;
+            thread_hijack::indirect_NtResumeThread(target_thread, &resume_prev);
+            ++resume_calls;
+        }
+        if (resume_calls > 1) {
+            diag::log_tagged_fmt("comm",
+                "remote_call_um_resume_safety_net call_id=%llu attempt=%d tid=%u resume_calls=%d best_prev_count=%lu elapsed_ms=%llu",
+                static_cast<unsigned long long>(call_id),
+                attempt_index,
+                target_tid,
+                resume_calls,
+                static_cast<unsigned long>(best_prev_count),
+                static_cast<unsigned long long>(GetTickCount64() - attempt_start));
+        }
+    }
 
 
     if (is_in_ntdll) {
@@ -3243,9 +3263,10 @@ std::uint64_t voyager::device_t::call_function_attempt(
     }
 
 
-    constexpr int MAX_WAIT_ITERATIONS = 6000;
+    constexpr int MAX_WAIT_ITERATIONS = 2000;
     constexpr int FAST_POLL_THRESHOLD = 500;
     constexpr int MEDIUM_POLL_THRESHOLD = 2000;
+    constexpr ULONGLONG MAX_POLL_DURATION_MS = 15000;
 
     std::uint64_t result = 0;
     bool completed = false;
@@ -3271,6 +3292,18 @@ std::uint64_t voyager::device_t::call_function_attempt(
 
     int last_log_iteration = 0;
     for (int i = 0; i < MAX_WAIT_ITERATIONS && !completed; ++i) {
+
+        if (GetTickCount64() - attempt_start > MAX_POLL_DURATION_MS) {
+            diag::log_tagged_fmt("comm",
+                "remote_call_um_poll_deadline_exceeded call_id=%llu attempt=%d tid=%u iter=%d elapsed_ms=%llu max_poll_ms=%llu",
+                static_cast<unsigned long long>(call_id),
+                attempt_index,
+                target_tid,
+                i,
+                static_cast<unsigned long long>(GetTickCount64() - attempt_start),
+                static_cast<unsigned long long>(MAX_POLL_DURATION_MS));
+            break;
+        }
 
 
         if (i < FAST_POLL_THRESHOLD) {
@@ -3443,7 +3476,13 @@ std::uint64_t voyager::device_t::call_function_attempt(
         }
     }
 
-    thread_hijack::indirect_NtResumeThread(target_thread, nullptr);
+    {
+        ULONG cleanup_resume_prev = 1;
+        while (cleanup_resume_prev > 0) {
+            cleanup_resume_prev = 0;
+            thread_hijack::indirect_NtResumeThread(target_thread, &cleanup_resume_prev);
+        }
+    }
     thread_hijack::indirect_NtClose(target_thread);
 
     out_completed = completed;

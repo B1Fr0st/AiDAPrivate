@@ -13,7 +13,6 @@
 #include <functional>
 #include <mutex>
 #include <string>
-#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -1628,19 +1627,15 @@ inline bool load_dbghelp()
 	}
 
 	if (start_worker) {
-		try {
-			std::thread(dbghelp_load_worker, attempt, dbghelp_path, dbghelp_path_log, pid, tid).detach();
-			diag::log_tagged_fmt("pdb",
-				"load_dbghelp_worker_started attempt=%llu caller_pid=%lu caller_tid=%lu wait_timeout_ms=%llu path='%s'",
-				static_cast<unsigned long long>(attempt),
-				pid,
-				tid,
-				static_cast<unsigned long long>(k_dbghelp_load_watchdog_ms),
-				dbghelp_path_log.c_str());
-		} catch (const std::exception& ex) {
+		std::string worker_err;
+		if (!aida::infra::win_thread::start_detached(
+				[=]() { dbghelp_load_worker(attempt, dbghelp_path, dbghelp_path_log, pid, tid); },
+				&worker_err,
+				aida::infra::win_thread::fixture_stack_reserve,
+				"dbghelp_load_worker")) {
 			std::lock_guard<std::mutex> lk(g_api_mutex);
 			char detail[768];
-			std::snprintf(detail, sizeof(detail), "Failed to start DbgHelp loader worker: %s", ex.what());
+			std::snprintf(detail, sizeof(detail), "Failed to start DbgHelp loader worker: %s", worker_err.c_str());
 			set_dbghelp_terminal_locked(false, false, "worker_start_failed", dbghelp_path_log, {}, GetLastError(), nullptr, detail);
 			set_last_error_text(detail);
 			g_dbghelp_load_cv.notify_all();
@@ -1649,21 +1644,16 @@ inline bool load_dbghelp()
 				static_cast<unsigned long long>(attempt),
 				pid,
 				tid,
-				ex.what());
-			return false;
-		} catch (...) {
-			std::lock_guard<std::mutex> lk(g_api_mutex);
-			const std::string detail = "Failed to start DbgHelp loader worker: unknown exception";
-			set_dbghelp_terminal_locked(false, false, "worker_start_failed", dbghelp_path_log, {}, GetLastError(), nullptr, detail);
-			set_last_error_text(detail);
-			g_dbghelp_load_cv.notify_all();
-			diag::log_tagged_fmt("pdb",
-				"load_dbghelp_worker_start_failed attempt=%llu caller_pid=%lu caller_tid=%lu err='<unknown>'",
-				static_cast<unsigned long long>(attempt),
-				pid,
-				tid);
+				worker_err.c_str());
 			return false;
 		}
+		diag::log_tagged_fmt("pdb",
+			"load_dbghelp_worker_started attempt=%llu caller_pid=%lu caller_tid=%lu wait_timeout_ms=%llu path='%s'",
+			static_cast<unsigned long long>(attempt),
+			pid,
+			tid,
+			static_cast<unsigned long long>(k_dbghelp_load_watchdog_ms),
+			dbghelp_path_log.c_str());
 	}
 
 	std::unique_lock<std::mutex> wait_lk(g_api_mutex);

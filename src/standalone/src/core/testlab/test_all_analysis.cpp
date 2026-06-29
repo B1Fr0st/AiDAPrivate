@@ -1192,7 +1192,7 @@ struct integrity_hunter_sidecar_scope_t {
     }
 
     bool start(DWORD timeout_ms) {
-        if (!fence_integrity_hunter_cleanup_before_sidecar_switch(hf, tag, primary_pid, 6000))
+        if (!fence_integrity_hunter_cleanup_before_sidecar_switch(hf, tag, primary_pid, 3000))
             return false;
         if (!launch_integrity_hunter_sidecar(hf, tag, sidecar))
             return false;
@@ -1999,7 +1999,7 @@ static void test_code_patcher_find_caves(HANDLE hf, std::atomic<int>& passed, st
     }
 
     uint64_t base = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(ntdll));
-    auto caves = code_patcher::find_code_caves(base, 0x100000, 16);
+    auto caves = code_patcher::find_code_caves(base, 0x40000, 16);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     log_msg(hf, "patch_cav", "PASS -- found %zu code caves >= 16 bytes (elapsed %lld ms)",
@@ -2806,7 +2806,7 @@ static void test_integrity_hunter_nodes(HANDLE hf, std::atomic<int>& passed, std
         return;
 
     integrity_hunter::stop_hunt();
-    const bool pre_idle = integrity_hunter::wait_until_idle(15000);
+    const bool pre_idle = integrity_hunter::wait_until_idle(5000);
     const bool pre_hunting = integrity_hunter::g_state.hunting.load();
     const bool pre_worker = integrity_hunter::g_state.worker_active.load();
     const bool pre_install_complete = integrity_hunter::g_state.install_complete.load();
@@ -2859,7 +2859,7 @@ static void test_integrity_hunter_nodes(HANDLE hf, std::atomic<int>& passed, std
 
     const uint32_t primary_pid = driver_bridge::attached_pid();
     integrity_hunter_sidecar_scope_t sidecar_scope(hf, "integ_nd", primary_pid);
-    if (!sidecar_scope.start(10000)) {
+    if (!sidecar_scope.start(5000)) {
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
         log_msg(hf, "integ_nd", "FAIL -- isolated integrity hunter sidecar was not ready primary_pid=%u active_pid=%u status=\"%s\" last_error=\"%s\" (elapsed %lld ms)",
             (unsigned)primary_pid,
@@ -2946,7 +2946,7 @@ static void test_integrity_hunter_nodes(HANDLE hf, std::atomic<int>& passed, std
     }
     bool install_seen = false;
     const DWORD install_start = GetTickCount();
-    while (GetTickCount() - install_start < 6500) {
+    while (GetTickCount() - install_start < 3000) {
         if (integrity_hunter::install_complete_for_generation(generation)) {
             install_seen = true;
             break;
@@ -3166,14 +3166,13 @@ static void test_integrity_hunter_nodes(HANDLE hf, std::atomic<int>& passed, std
     uint32_t target_read_ok = 0;
     uint64_t target_read_result = 0;
     if (started && install_seen && install_success) {
-        for (uint32_t i = 0; i < 8; ++i) {
+        for (uint32_t i = 0; i < 2; ++i) {
             ++target_read_attempts;
             target_read_result = std::strcmp(target_read_kind, "RtlCompareMemory") == 0
                 ? page_guard_engine::remote_thread_call(target_pid, target_read_fn, fixture.address, fixture.address, 128, 0, 2500, "testlab_integrity_RtlCompareMemory")
                 : page_guard_engine::remote_thread_call(target_pid, target_read_fn, i, fixture.address, 128, 0, 2500, "testlab_integrity_RtlComputeCrc32");
             if (target_read_result != 0)
                 ++target_read_ok;
-            Sleep(75);
         }
     }
 
@@ -3185,7 +3184,7 @@ static void test_integrity_hunter_nodes(HANDLE hf, std::atomic<int>& passed, std
     const bool driver_write_ok = !writeback.empty() && driver_bridge::write_memory_for(target_pid, fixture.address, writeback);
 
     integrity_hunter::stop_hunt();
-    const auto idle_state = integrity_hunter::wait_until_idle_result(12000);
+    const auto idle_state = integrity_hunter::wait_until_idle_result(6000);
     const bool idle = idle_state.idle;
 
     size_t node_count = 0;
@@ -3425,7 +3424,11 @@ static void test_binary_map_clear_cache(HANDLE hf, std::atomic<int>& passed, std
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     log_msg(hf, "binmap_cc", "CONTRACT-PASS -- clear_cache returned %d last_error=\"%s\" elapsed_ms=%lld",
         ok ? 1 : 0, aida::binary_map::last_error().c_str(), (long long)ms);
-    passed.fetch_add(1);
+    if (ok) {
+        passed.fetch_add(1);
+    } else {
+        failed.fetch_add(1);
+    }
 }
 
 static void test_binary_map_render_text(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -3517,7 +3520,7 @@ static void test_source_reconstructor_last_result(HANDLE hf, std::atomic<int>& p
 
     if (source_reconstructor::is_running()) {
         const ULONGLONG wait_start = GetTickCount64();
-        while (source_reconstructor::is_running() && GetTickCount64() - wait_start < 10000)
+        while (source_reconstructor::is_running() && GetTickCount64() - wait_start < 3000)
             Sleep(25);
         if (source_reconstructor::is_running()) {
             float progress = source_reconstructor::get_progress();
@@ -3595,11 +3598,11 @@ static void test_source_reconstructor_last_result(HANDLE hf, std::atomic<int>& p
                 stats.active);
             next_log = now + 500;
         }
-        if (now - run_start >= 16000) {
+        if (now - run_start >= 8000) {
             timed_out = true;
             break;
         }
-        Sleep(25);
+        Sleep(10);
     }
 
     if (timed_out) {

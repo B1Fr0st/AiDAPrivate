@@ -1662,8 +1662,13 @@ void clear_all_breakpoints() {
 	diag::log_tagged_fmt("dbg_engine", "clear_all_breakpoints: entry");
 	sync_attached_state();
 
+	bool has_hw = false;
+	for (const auto& bp : st.breakpoints) {
+		if (bp.hw_slot >= 0 && bp.hw_slot < 4) { has_hw = true; break; }
+	}
+
 	std::vector<driver_bridge::thread_info_t> threads;
-	if (st.target_pid != 0)
+	if (has_hw && st.target_pid != 0)
 		threads = hardware_breakpoint_threads(st, "clear_all_breakpoints");
 
 	std::lock_guard<std::mutex> lk(st.bp_mutex);
@@ -3670,7 +3675,7 @@ void find_strings(size_t min_length) {
 	std::vector<string_ref_t> found;
 	st.strings_pages_scanned.store(0, std::memory_order_release);
 	st.strings_found_so_far.store(0, std::memory_order_release);
-	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(4500);
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
 	constexpr size_t max_strings = 10000;
 
 	auto attach_module = [&modules](string_ref_t& sr) {
