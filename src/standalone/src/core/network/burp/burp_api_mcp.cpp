@@ -856,7 +856,12 @@ tool_result_t tool_ws_send_text(const json& params)
     size_t after_recorded_count = after_available ? ws_editor::frame_count(id) : 0;
     json out = ws_send_result_to_json(id, "text", 1, msg.size(), before_available, before, before_recorded_count, after_available, after, after_recorded_count);
     diag::log_tagged_fmt("mcp_burp", "ws_send_text ok conn_id=%llu", static_cast<unsigned long long>(id));
-    return tool_result_t::ok("sent", out);
+    return tool_result_t::ok(
+        "sent text frame conn_id=" + std::to_string(id) +
+        " msg_len=" + std::to_string(msg.size()) +
+        " frames_before=" + std::to_string(before_recorded_count) +
+        " frames_after=" + std::to_string(after_recorded_count),
+        out);
 }
 
 tool_result_t tool_ws_send_binary(const json& params)
@@ -879,7 +884,12 @@ tool_result_t tool_ws_send_binary(const json& params)
     size_t after_recorded_count = after_available ? ws_editor::frame_count(id) : 0;
     json out = ws_send_result_to_json(id, "binary", 2, bin.size(), before_available, before, before_recorded_count, after_available, after, after_recorded_count);
     diag::log_tagged_fmt("mcp_burp", "ws_send_binary ok conn_id=%llu bytes=%zu", static_cast<unsigned long long>(id), bin.size());
-    return tool_result_t::ok("sent", out);
+    return tool_result_t::ok(
+        "sent binary frame conn_id=" + std::to_string(id) +
+        " data_len=" + std::to_string(bin.size()) +
+        " frames_before=" + std::to_string(before_recorded_count) +
+        " frames_after=" + std::to_string(after_recorded_count),
+        out);
 }
 
 tool_result_t tool_ws_send_raw(const json& params)
@@ -907,7 +917,12 @@ tool_result_t tool_ws_send_raw(const json& params)
     out["fin"] = fin;
     out["masked"] = masked;
     diag::log_tagged_fmt("mcp_burp", "ws_send_raw ok conn_id=%llu bytes=%zu", static_cast<unsigned long long>(id), bin.size());
-    return tool_result_t::ok("sent", out);
+    return tool_result_t::ok(
+        "sent raw frame conn_id=" + std::to_string(id) +
+        " data_len=" + std::to_string(bin.size()) +
+        " frames_before=" + std::to_string(before_recorded_count) +
+        " frames_after=" + std::to_string(after_recorded_count),
+        out);
 }
 
 tool_result_t tool_ws_list(const json& params)

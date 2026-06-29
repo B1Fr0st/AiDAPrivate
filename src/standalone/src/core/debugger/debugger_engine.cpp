@@ -2047,6 +2047,7 @@ bool spawn_and_attach_target(const run_target::launch_options_t& opts,
 		st.target_pid = lr.pid;
 		st.status.store(dbg_status_t::running);
 		sync_attached_state();
+		symbol_store::auto_load_attached_modules();
 	}
 
 	{
@@ -3260,6 +3261,47 @@ std::vector<stack_frame_t> get_call_stack() {
 		"get_call_stack: modules count=%zu elapsed_us=%llu",
 		modules.size(),
 		static_cast<unsigned long long>(resolver_elapsed_us(modules_started)));
+	if (!modules.empty()) {
+		for (const auto& m : modules) {
+			std::string lower_name = m.name;
+			std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(), ::tolower);
+			if (lower_name.find(".exe") != std::string::npos && !m.path.empty()) {
+				std::error_code path_ec;
+				auto parent_dir = std::filesystem::path(m.path).parent_path();
+				if (!parent_dir.empty()) {
+					symbol_store::add_target_module_search_path(parent_dir.string());
+				}
+				break;
+			}
+		}
+		std::vector<driver_bridge::module_info_t> modules_needing_pdb;
+		{
+			std::unique_lock<std::mutex> try_lk(symbol_store::g_state.mutex, std::try_to_lock);
+			if (try_lk.owns_lock()) {
+				for (const auto& m : modules) {
+					std::string lower_name = m.name;
+					std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(), ::tolower);
+					bool worth_loading = (lower_name.find(".exe") != std::string::npos ||
+						lower_name.find("game") != std::string::npos ||
+						lower_name.find("engine") != std::string::npos);
+					if (!worth_loading) continue;
+					auto it = symbol_store::g_state.modules.find(m.name);
+					if (it == symbol_store::g_state.modules.end()) {
+						modules_needing_pdb.push_back(m);
+					}
+				}
+			}
+		}
+		for (const auto& m : modules_needing_pdb) {
+			diag::log_tagged_fmt("dbg_engine",
+				"get_call_stack_lazy_pdb_load module=%s base=0x%llX size=0x%X path=%s",
+				m.name.c_str(),
+				static_cast<unsigned long long>(m.base),
+				m.size,
+				m.path.c_str());
+			symbol_store::load_pdb_for_module(m.name, m.base, static_cast<uint64_t>(m.size));
+		}
+	}
 	std::vector<call_stack_symbol_resolution_t> resolution_records;
 	resolution_records.reserve(65);
 	std::unordered_map<uint64_t, call_stack_symbol_resolution_t> local_resolution_cache;

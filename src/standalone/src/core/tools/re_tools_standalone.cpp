@@ -119,7 +119,7 @@ void register_re_tools(mcp_standalone::server_t& srv)
 
     register_compat(srv, {"dx_trace_decryption", "re.dx_hook",
         "Trace the decryption pipeline for a staging/cbuffer VA by setting a write hardware breakpoint, capturing the caller context, reading encrypted source vs decrypted staging, and deriving the encryption algorithm + key. Actions: trace, list, detail, stop, remove.",
-        {{"action", "string", "trace|list|detail|stop|remove", false},
+         {{"action", "string", "trace|list|detail|stop|remove", true},
          {"staging_va", "string", "Staging/cbuffer VA to watch (from identify_bone_buffer or list_bound_cbuffers)", false},
          {"cbuffer_va", "string", "Alias for staging_va", false},
          {"staging_size", "number", "Size of staging buffer to watch", false},

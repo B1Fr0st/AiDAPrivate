@@ -3257,9 +3257,17 @@ std::uint64_t voyager::device_t::call_function_attempt(
     }
 
 
-    if (is_in_ntdll) {
+    if (is_in_ntdll || is_in_target) {
         thread_hijack::force_wake_thread(target_thread);
-        RC_UM_DBG("call_function: force_wake sent to tid=%u (was in ntdll)", target_tid);
+        RC_UM_DBG("call_function: force_wake sent to tid=%u (in_ntdll=%d in_target=%d)", target_tid, is_in_ntdll ? 1 : 0, is_in_target ? 1 : 0);
+        diag::log_tagged_fmt("comm",
+            "remote_call_um_force_wake_initial call_id=%llu attempt=%d tid=%u in_ntdll=%d in_target=%d elapsed_ms=%llu",
+            static_cast<unsigned long long>(call_id),
+            attempt_index,
+            target_tid,
+            is_in_ntdll ? 1 : 0,
+            is_in_target ? 1 : 0,
+            static_cast<unsigned long long>(GetTickCount64() - attempt_start));
     }
 
 
@@ -3291,6 +3299,7 @@ std::uint64_t voyager::device_t::call_function_attempt(
     force_heartbeat();
 
     int last_log_iteration = 0;
+    bool alert_force_wake_attempted = false;
     for (int i = 0; i < MAX_WAIT_ITERATIONS && !completed; ++i) {
 
         if (GetTickCount64() - attempt_start > MAX_POLL_DURATION_MS) {
@@ -3382,8 +3391,18 @@ std::uint64_t voyager::device_t::call_function_attempt(
             refresh_heartbeat();
 
 
-            if ((i & 0xFF) == 0 && i > 0 && is_in_ntdll) {
+            if ((i & 0xFF) == 0 && i > 0) {
                 thread_hijack::force_wake_thread(target_thread);
+            }
+            if (!alert_force_wake_attempted && GetTickCount64() - attempt_start > 500) {
+                alert_force_wake_attempted = true;
+                thread_hijack::force_wake_thread(target_thread);
+                diag::log_tagged_fmt("comm",
+                    "remote_call_um_force_wake_alert call_id=%llu attempt=%d tid=%u elapsed_ms=%llu reason=poll_500ms_no_completion",
+                    static_cast<unsigned long long>(call_id),
+                    attempt_index,
+                    target_tid,
+                    static_cast<unsigned long long>(GetTickCount64() - attempt_start));
             }
         }
     }

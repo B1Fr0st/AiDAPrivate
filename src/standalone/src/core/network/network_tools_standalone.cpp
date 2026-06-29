@@ -964,6 +964,8 @@ tool_result_t network_enumerate_connections(const json& params)
         std::to_string(conns.size()) + OBFSTR(" active connections found"), arr);
 }
 
+static std::uint64_t s_capture_start_ms = 0;
+
 tool_result_t network_start_capture(const json& params)
 {
     diag::log_tagged_fmt("net_tools", "network_start_capture entry");
@@ -1000,6 +1002,8 @@ tool_result_t network_start_capture(const json& params)
     if (!ok)
         return tool_result_t::error(OBFSTR("Failed to start packet capture. Network subsystem may not be ready."));
 
+    s_capture_start_ms = static_cast<std::uint64_t>(GetTickCount64());
+
     json result;
     result["capture_active"] = true;
     if (filter_pid) result["filter_pid"] = filter_pid;
@@ -1014,15 +1018,35 @@ tool_result_t network_start_capture(const json& params)
 tool_result_t network_stop_capture(const json&)
 {
     diag::log_tagged("net_tools", "network_stop_capture entry");
-    if (!driver_bridge::using_kernel_driver())
+
+    const bool driver_connected = driver_bridge::using_kernel_driver();
+    bool was_capturing = false;
+    std::uint32_t packets_captured = 0, packets_dropped = 0;
+    if (driver_connected) {
+        driver_bridge::get_capture_status(was_capturing, packets_captured, packets_dropped);
+    }
+
+    if (!driver_connected)
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
     bool ok = driver_bridge::stop_capture();
-    diag::log_tagged_fmt("net_tools", "network_stop_capture result=%d", (int)ok);
+    diag::log_tagged_fmt("net_tools", "network_stop_capture result=%d was_capturing=%d packets_captured=%u packets_dropped=%u", (int)ok, (int)was_capturing, packets_captured, packets_dropped);
     if (!ok)
         return tool_result_t::error(OBFSTR("Failed to stop packet capture."));
 
-    return tool_result_t::ok(OBFSTR("Packet capture stopped"));
+    const std::uint64_t now_ms = static_cast<std::uint64_t>(GetTickCount64());
+    const std::uint64_t duration_ms = (s_capture_start_ms != 0 && now_ms >= s_capture_start_ms) ? (now_ms - s_capture_start_ms) : 0;
+    s_capture_start_ms = 0;
+
+    json result;
+    result["stopped"] = true;
+    result["driver_connected"] = true;
+    result["was_capturing"] = was_capturing;
+    result["packets_captured"] = static_cast<std::uint64_t>(packets_captured);
+    result["packets_dropped"] = static_cast<std::uint64_t>(packets_dropped);
+    result["capture_duration_ms"] = duration_ms;
+
+    return tool_result_t::ok(OBFSTR("Packet capture stopped"), result);
 }
 
 tool_result_t network_get_packets(const json& params)
@@ -4102,6 +4126,8 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 return network_param_error("Either 'input' or 'input_hex' required", "input", "missing_required");
             }
 
+            const size_t input_size = data.size();
+
             if (!args.contains("pipeline") || !args["pipeline"].is_array())
                 return network_param_error("'pipeline' array required", "pipeline", "missing_required");
 
@@ -4138,7 +4164,6 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 data = std::move(result.data);
             }
 
-
             bool printable = true;
             for (uint8_t b : data) {
                 if (b != '\n' && b != '\r' && b != '\t' && (b < 32 || b > 126)) {
@@ -4146,6 +4171,9 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                     break;
                 }
             }
+
+            diag::log_tagged_fmt("net_tools", "network_decode_data complete steps=%zu output_size=%zu printable=%d output_hex=%d input_size=%zu",
+                args["pipeline"].size(), data.size(), printable ? 1 : 0, !printable ? 1 : 0, input_size);
 
             json r;
             if (printable) {

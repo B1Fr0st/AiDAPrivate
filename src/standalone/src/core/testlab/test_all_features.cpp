@@ -29,6 +29,7 @@
 #include "../infra/critical_work_queue.hpp"
 #include "../infra/work_queue.hpp"
 #include "../analysis/pdb_default_skip.hpp"
+#include "../analysis/symbol_store.hpp"
 #include "../../helpers/diag_log.hpp"
 #include "../../helpers/globals.h"
 
@@ -2478,10 +2479,17 @@ namespace test_all_features {
 			if (!normalized_exe.empty())
 				exe = normalized_exe;
 
-			std::string exe_log = wide_to_log_string(exe);
-			log_msg(hf, "launch", "found: %s", exe_log.empty() ? "<unavailable>" : exe_log.c_str());
+		std::string exe_log = wide_to_log_string(exe);
+		log_msg(hf, "launch", "found: %s", exe_log.empty() ? "<unavailable>" : exe_log.c_str());
 
-			auto t0 = std::chrono::steady_clock::now();
+		{
+			auto parent_dir = std::filesystem::path(exe).parent_path();
+			if (!parent_dir.empty()) {
+				symbol_store::add_target_module_search_path(parent_dir.string());
+			}
+		}
+
+		auto t0 = std::chrono::steady_clock::now();
 
 
 			std::wstring work_dir = parent_directory_for_path(exe);

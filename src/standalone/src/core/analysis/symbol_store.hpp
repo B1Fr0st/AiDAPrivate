@@ -726,6 +726,13 @@ inline void load_pdb_for_module(const std::string& module_name, uint64_t base, u
 	if (pdb_skip_active()) {
 		const std::string pdb_name = fallback_pdb_name_for_module(module_name);
 		const std::string local_candidate = safe_find_local_pdb_for_suppression(module_name, "load_pdb_for_module");
+		if (!local_candidate.empty()) {
+			diag::log_tagged_fmt("symbol_store",
+				"load_pdb_for_module_auto_accept_local module=%s local_candidate=%s pdb_name=%s",
+				module_name.c_str(), local_candidate.c_str(), pdb_name.c_str());
+			load_pdb_from_explicit_path(module_name, base, size, local_candidate);
+			return;
+		}
 		suppress_full_test_pdb_load("load_pdb_for_module", module_name, base, size,
 			pdb_name, {}, 0, local_candidate, {}, {},
 			g_state.auto_download ? "full_test_declined_auto_symbol_server_load" : "full_test_declined_auto_local_pdb_scan");
@@ -913,6 +920,17 @@ inline void load_pdb_with_hint(const std::string& module_name, uint64_t base, ui
 			std::error_code ec;
 			if (std::filesystem::is_regular_file(cache_path, ec) && !ec)
 				local_candidate = cache_path;
+		}
+		if (local_candidate.empty()) {
+			local_candidate = safe_find_local_pdb_for_suppression(module_name, "load_pdb_with_hint");
+		}
+		if (!local_candidate.empty()) {
+			diag::log_tagged_fmt("symbol_store",
+				"load_pdb_with_hint_auto_accept_local module=%s local_candidate=%s pdb_name=%s guid=%s age=%u",
+				module_name.c_str(), local_candidate.c_str(), pdb_name.c_str(),
+				log_value(pdb_guid), static_cast<unsigned>(pdb_age));
+			load_pdb_from_explicit_path(module_name, base, size, local_candidate);
+			return;
 		}
 		suppress_full_test_pdb_load("load_pdb_with_hint", module_name, base, size,
 			pdb_name, pdb_guid, pdb_age, local_candidate, cache_path, {},
@@ -1705,9 +1723,36 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 inline void auto_load_attached_modules()
 {
 	if (pdb_skip_active()) {
-		suppress_full_test_pdb_load("auto_load_attached_modules", "<attached_modules>",
-			0, 0, "<auto>", {}, 0, {}, {}, {},
-			"full_test_declined_attached_module_auto_load", false);
+		auto skip_modules = driver_bridge::enumerate_modules();
+		bool any_loaded = false;
+		for (auto& m : skip_modules) {
+			bool already_present = false;
+			{
+				std::lock_guard<std::mutex> lk(g_state.mutex);
+				already_present = g_state.modules.find(m.name) != g_state.modules.end();
+			}
+			if (already_present) continue;
+			std::string lower_name = m.name;
+			std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(), ::tolower);
+			bool worth_loading = (lower_name.find(".exe") != std::string::npos ||
+			                      lower_name.find("game") != std::string::npos ||
+			                      lower_name.find("engine") != std::string::npos);
+			if (!worth_loading) continue;
+			const std::string local_candidate = safe_find_local_pdb_for_suppression(m.name, "auto_load_attached_modules");
+			if (!local_candidate.empty()) {
+				diag::log_tagged_fmt("symbol_store",
+					"auto_load_attached_modules_auto_accept_local module=%s local_candidate=%s base=0x%llX size=0x%X",
+					m.name.c_str(), local_candidate.c_str(),
+					static_cast<unsigned long long>(m.base), m.size);
+				load_pdb_from_explicit_path(m.name, m.base, static_cast<uint64_t>(m.size), local_candidate);
+				any_loaded = true;
+			}
+		}
+		if (!any_loaded) {
+			suppress_full_test_pdb_load("auto_load_attached_modules", "<attached_modules>",
+				0, 0, "<auto>", {}, 0, {}, {}, {},
+				"full_test_declined_attached_module_auto_load", false);
+		}
 		return;
 	}
 	auto modules = driver_bridge::enumerate_modules();
@@ -1980,6 +2025,15 @@ inline void add_search_path(const std::string& path)
 		if (p == path) return;
 	}
 	g_state.search_paths.push_back(path);
+}
+
+inline void add_target_module_search_path(const std::string& module_dir)
+{
+	if (module_dir.empty()) return;
+	add_search_path(module_dir);
+	diag::log_tagged_fmt("symbol_store",
+		"add_target_module_search_path dir=%s total_search_paths=%zu",
+		module_dir.c_str(), g_state.search_paths.size());
 }
 
 }

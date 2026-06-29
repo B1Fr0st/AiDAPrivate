@@ -342,17 +342,47 @@ tool_result_t handle_trace_serializer(const json& raw_params)
     options.max_captures = params.value("max_captures", 16u);
     options.sample_ms = params.value("sample_ms", params.value("capture_ms", 2000u));
 
+    diag::log_tagged_fmt("net_proto",
+        "net_proto_trace_serializer handler_begin pid=%u serializer_va=0x%llX buffer_reg=%s size_reg=%s sample_ms=%u max_captures=%u tid=%u driver_loaded=%d driver_connected=%d",
+        options.process_id,
+        static_cast<unsigned long long>(options.serializer_va),
+        options.buffer_reg.c_str(),
+        options.size_reg.c_str(),
+        options.sample_ms,
+        options.max_captures,
+        options.tid,
+        driver_bridge::is_loaded() ? 1 : 0,
+        driver_bridge::using_kernel_driver() ? 1 : 0);
+
     json result;
     std::string error;
     if (!net_proto_analysis::trace_serializer(options, result, error)) {
         if (!result.is_object())
             result = json::object();
+        diag::log_tagged_fmt("net_proto",
+            "net_proto_trace_serializer handler_fail pid=%u serializer_va=0x%llX sample_ms=%u capture_count=%u driver_sniff_started=%d driver_connected=%d error=%s",
+            options.process_id,
+            static_cast<unsigned long long>(options.serializer_va),
+            options.sample_ms,
+            result.value("capture_count", 0u),
+            result.value("driver_sniff_started", false) ? 1 : 0,
+            driver_bridge::using_kernel_driver() ? 1 : 0,
+            error.c_str());
         result["serializer_va_normalized"] = sa_format_address(*va);
         result["trace_runtime_status"] = net_proto_runtime_status(options.process_id, "net_proto_trace_serializer");
         attach_serializer_trace_contract(result, params, options, error);
         result["diagnostic_contract"] = "zero_capture_without_stimulus_is_not_functional_capture_evidence";
         return tool_result_t::error(error.empty() ? OBFSTR("serializer trace failed") : error, result);
     }
+    diag::log_tagged_fmt("net_proto",
+        "net_proto_trace_serializer handler_done pid=%u serializer_va=0x%llX sample_ms=%u capture_count=%u driver_sniff_started=%d backend=%s zero_capture=%d",
+        options.process_id,
+        static_cast<unsigned long long>(options.serializer_va),
+        options.sample_ms,
+        result.value("capture_count", 0u),
+        result.value("driver_sniff_started", false) ? 1 : 0,
+        result.value("backend", std::string()).c_str(),
+        result.value("capture_count", 0u) == 0 ? 1 : 0);
     result["serializer_va_normalized"] = sa_format_address(*va);
     result["trace_runtime_status"] = net_proto_runtime_status(options.process_id, "net_proto_trace_serializer");
     attach_serializer_trace_contract(result, params, options, error);
@@ -430,6 +460,18 @@ tool_result_t handle_udp_reassemble(const json& raw_params)
             options.fixture_payloads.push_back(std::move(bytes));
         }
     }
+
+    const bool has_fixture_payloads = !options.fixture_payloads.empty();
+    diag::log_tagged_fmt("net_proto",
+        "net_udp_session_reassemble handler_begin pid=%u fixture_payloads=%zu capture_ms=%u max_packets=%u max_payload=%u backend=%s driver_loaded=%d driver_connected=%d",
+        options.pid,
+        options.fixture_payloads.size(),
+        options.capture_ms,
+        options.max_packets,
+        options.max_payload,
+        has_fixture_payloads ? "provided_payload" : "driver_capture",
+        driver_bridge::is_loaded() ? 1 : 0,
+        driver_bridge::using_kernel_driver() ? 1 : 0);
 
     json result;
     std::string error;
@@ -554,6 +596,27 @@ tool_result_t handle_replay_mutate(const json& raw_params)
     options.allow_non_loopback = params.value("allow_non_loopback", false);
     options.allow_unsafe = params.value("allow_unsafe", false);
     options.confirm_unsafe = params.value("confirm_unsafe", false);
+
+    if (options.session_id.empty()) {
+        diag::log_tagged_fmt("net_proto",
+            "net_replay_mutate handler_reject session_id_empty allow_unsafe=%d confirm_unsafe=%d target_ip=%s target_port=%u",
+            options.allow_unsafe ? 1 : 0,
+            options.confirm_unsafe ? 1 : 0,
+            options.target_ip.empty() ? "<empty>" : options.target_ip.c_str(),
+            options.target_port);
+        return tool_result_t::error(OBFSTR("session_id is required."),
+            json{{"tool", "net_replay_mutate"},
+                 {"validation_code", "session_id_required"},
+                 {"guard", "session_lookup"}});
+    }
+    diag::log_tagged_fmt("net_proto",
+        "net_replay_mutate handler_begin session_id=%s target_ip=%s target_port=%u allow_unsafe=%d confirm_unsafe=%d driver_connected=%d",
+        options.session_id.c_str(),
+        options.target_ip.empty() ? "<empty>" : options.target_ip.c_str(),
+        options.target_port,
+        options.allow_unsafe ? 1 : 0,
+        options.confirm_unsafe ? 1 : 0,
+        driver_bridge::using_kernel_driver() ? 1 : 0);
 
     json result;
     std::string error;

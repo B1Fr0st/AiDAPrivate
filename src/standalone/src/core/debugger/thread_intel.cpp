@@ -6,6 +6,7 @@
 #include "../analysis/symbol_store.hpp"
 #include "../helpers/diag_log.hpp"
 #include "standalone_driver.hpp"
+#include "../mcp/mcp_standalone.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -467,6 +468,8 @@ bool classify_threads(const classify_options_t& input,
     std::uint32_t context_sample_successes = 0;
     for (std::uint32_t i = 0; i < sample_count; ++i) {
         for (auto& st : states) {
+            if (mcp_standalone::current_call_cancelled())
+                goto sampling_done;
             rip_sample_t sample;
             ++context_sample_attempts;
             if (sample_thread_rip(st.info.tid, modules, sample)) {
@@ -474,13 +477,22 @@ bool classify_threads(const classify_options_t& input,
                 ++context_sample_successes;
             }
         }
-        if (i + 1 < sample_count)
+        if (i + 1 < sample_count) {
+            if (mcp_standalone::current_call_cancelled())
+                break;
             std::this_thread::sleep_for(std::chrono::milliseconds(options.interval_ms));
+        }
     }
+    sampling_done:
 
     const auto sample_elapsed_ms_raw = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - sample_started).count());
     const std::uint64_t sample_elapsed_ms = (std::max<std::uint64_t>)(1, sample_elapsed_ms_raw);
+
+    if (mcp_standalone::current_call_cancelled()) {
+        error = "cancelled";
+        return false;
+    }
 
     for (auto& st : states) {
         const thread_timing_sample_t timing = query_thread_timing(st.info.tid);
@@ -647,11 +659,17 @@ bool watch_rip(const watch_options_t& input,
     }
 
     auto modules = driver_bridge::enumerate_modules_for(pid);
+    if (mcp_standalone::current_call_cancelled()) {
+        error = "cancelled";
+        return false;
+    }
     std::map<std::uint64_t, std::uint32_t> hits;
     std::map<std::uint64_t, rip_sample_t> descriptions;
     std::uint32_t failed_samples = 0;
 
     for (std::uint32_t i = 0; i < options.samples; ++i) {
+        if (mcp_standalone::current_call_cancelled())
+            break;
         rip_sample_t sample;
         if (sample_thread_rip(options.tid, modules, sample)) {
             ++hits[sample.rip];

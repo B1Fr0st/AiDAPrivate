@@ -46,7 +46,8 @@ namespace camoufox {
 namespace {
 
 constexpr uint32_t kMinReadyBrowserProcessCount = 2;
-constexpr uint64_t kPostNavigationStabilityMs = 4500;
+constexpr uint64_t kPostNavigationStabilityMsLocalFixture = 1500;
+constexpr uint64_t kPostNavigationStabilityMs = 3000;
 constexpr uint64_t kPostNavigationStabilityPollMs = 250;
 constexpr uint64_t kCleanupDrainWaitMs = 15000;
 constexpr uint64_t kCleanupDrainPollMs = 50;
@@ -111,6 +112,7 @@ struct singleton_t
     std::string                             cached_python_path;
     launch_config_t                         active_cfg;
     std::vector<std::shared_ptr<mcp_client::client_t>> poisoned_clients;
+    std::map<std::string, std::string>             page_url_registry;
 };
 
 inline singleton_t& sg()
@@ -2182,6 +2184,54 @@ url_log_t summarize_url_for_log(const std::string& url)
     return out;
 }
 
+bool is_local_fixture_host(const std::string& host)
+{
+    return host.empty() ||
+           host == "<relative>" ||
+           host == "localhost" ||
+           host == "127.0.0.1" ||
+           host == "[::1]" ||
+           host == "::1" ||
+           host.rfind("127.", 0) == 0;
+}
+
+uint64_t stability_budget_for_url(const url_log_t& url)
+{
+    return is_local_fixture_host(url.host)
+        ? kPostNavigationStabilityMsLocalFixture
+        : kPostNavigationStabilityMs;
+}
+
+void store_page_url_locked(const std::string& page_id, const std::string& url)
+{
+    if (page_id.empty() || url.empty()) return;
+    sg().page_url_registry[page_id] = url;
+}
+
+void clear_page_url_locked(const std::string& page_id)
+{
+    if (page_id.empty()) return;
+    sg().page_url_registry.erase(page_id);
+}
+
+std::string get_page_url_locked(const std::string& page_id)
+{
+    if (page_id.empty()) return std::string();
+    auto it = sg().page_url_registry.find(page_id);
+    if (it == sg().page_url_registry.end()) return std::string();
+    return it->second;
+}
+
+bool is_page_crash_error(const std::string& error_text)
+{
+    if (error_text.empty()) return false;
+    const std::string lower = error_text;
+    return lower.find("Page crashed") != std::string::npos ||
+           lower.find("Target crashed") != std::string::npos ||
+           lower.find("page crashed") != std::string::npos ||
+           lower.find("target crashed") != std::string::npos;
+}
+
 struct process_exit_snapshot_t
 {
     bool opened = false;
@@ -3539,6 +3589,7 @@ bool verify_default_navigation_stability(const char* source,
     const uint64_t t0 = now_ms();
     uint64_t last_log_ms = 0;
     bridge_health_snapshot_t last_health;
+    const uint64_t stability_budget = stability_budget_for_url(requested_url);
     for (;;)
     {
         bridge_state_t state = bridge_state_t::stopped;
@@ -3656,11 +3707,12 @@ bool verify_default_navigation_stability(const char* source,
                 {"query", requested_url.has_query},
                 {"url_len", requested_url.length},
                 {"stability_elapsed_ms", now_ms() - t0},
+                {"stability_budget_ms", stability_budget},
                 {"operation_elapsed_ms", now_ms() - operation_start_ms},
                 {"invalidated", invalidated}
             };
             diag::log_tagged_critical_fmt("camoufox",
-                "navigation_stability_failed source=%s request_id=%llu reason=%s invalidated=%d expected_generation=%llu generation=%llu expected_child_pid=%lu child_pid=%lu child_alive=%d child_processes=%u browser_processes=%u host=%s path=%s query=%d url_len=%zu stability_elapsed_ms=%llu operation_elapsed_ms=%llu debug_offset=%llu debug_tail_len=%zu page_crashed=%zu page_closed=%zu browser_disconnected=%zu process_tree=%s process_tree_exit=%s process_tree_delta=%s",
+                "navigation_stability_failed source=%s request_id=%llu reason=%s invalidated=%d expected_generation=%llu generation=%llu expected_child_pid=%lu child_pid=%lu child_alive=%d child_processes=%u browser_processes=%u host=%s path=%s query=%d url_len=%zu stability_elapsed_ms=%llu stability_budget_ms=%llu operation_elapsed_ms=%llu debug_offset=%llu debug_tail_len=%zu page_crashed=%zu page_closed=%zu browser_disconnected=%zu process_tree=%s process_tree_exit=%s process_tree_delta=%s",
                 safe_reason(source), static_cast<unsigned long long>(request_id), reason.c_str(), invalidated ? 1 : 0,
                 static_cast<unsigned long long>(expected_generation), static_cast<unsigned long long>(generation),
                 static_cast<unsigned long>(expected_child_pid), static_cast<unsigned long>(child_pid),
@@ -3668,6 +3720,7 @@ bool verify_default_navigation_stability(const char* source,
                 static_cast<unsigned>(last_health.browser_process_count), requested_url.host.c_str(), requested_url.path.c_str(),
                 requested_url.has_query ? 1 : 0, requested_url.length,
                 static_cast<unsigned long long>(now_ms() - t0),
+                static_cast<unsigned long long>(stability_budget),
                 static_cast<unsigned long long>(now_ms() - operation_start_ms),
                 static_cast<unsigned long long>(debug_tail_offset),
                 debug_tail.size(),
@@ -3703,16 +3756,17 @@ bool verify_default_navigation_stability(const char* source,
         }
 
         const uint64_t now = now_ms();
-        if (now - t0 >= kPostNavigationStabilityMs)
+        if (now - t0 >= stability_budget)
         {
             diag::log_tagged_fmt("camoufox",
-                "navigation_stability_ok source=%s request_id=%llu generation=%llu child_pid=%lu child_alive=%d child_processes=%u browser_processes=%u host=%s path=%s query=%d url_len=%zu stability_elapsed_ms=%llu operation_elapsed_ms=%llu process_tree=%s",
+                "navigation_stability_ok source=%s request_id=%llu generation=%llu child_pid=%lu child_alive=%d child_processes=%u browser_processes=%u host=%s path=%s query=%d url_len=%zu stability_elapsed_ms=%llu stability_budget_ms=%llu operation_elapsed_ms=%llu process_tree=%s",
                 safe_reason(source), static_cast<unsigned long long>(request_id),
                 static_cast<unsigned long long>(generation), static_cast<unsigned long>(child_pid),
                 last_health.child_alive ? 1 : 0, static_cast<unsigned>(last_health.child_process_count),
                 static_cast<unsigned>(last_health.browser_process_count), requested_url.host.c_str(), requested_url.path.c_str(),
                 requested_url.has_query ? 1 : 0, requested_url.length,
                 static_cast<unsigned long long>(now - t0),
+                static_cast<unsigned long long>(stability_budget),
                 static_cast<unsigned long long>(now - operation_start_ms),
                 last_health.process_tree.empty() ? "<empty>" : last_health.process_tree.c_str());
             return true;
@@ -3730,7 +3784,7 @@ bool verify_default_navigation_stability(const char* source,
             last_log_ms = now;
         }
         const uint64_t elapsed = now - t0;
-        const uint64_t remaining = elapsed >= kPostNavigationStabilityMs ? 0 : kPostNavigationStabilityMs - elapsed;
+        const uint64_t remaining = elapsed >= stability_budget ? 0 : stability_budget - elapsed;
         Sleep(static_cast<DWORD>((std::min)(kPostNavigationStabilityPollMs, remaining)));
     }
 }

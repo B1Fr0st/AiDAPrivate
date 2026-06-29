@@ -1342,7 +1342,7 @@ static tool_result_t handle_find_what_accesses(const json& params) {
 	std::vector<uint8_t> polling_current;
 	bool polling_delta_seen = false;
 	size_t polling_delta_offset = 0;
-	const bool polling_enabled = wanted_access == 1 && size <= 4096;
+	bool polling_enabled = wanted_access == 1 && size <= 4096;
 	auto read_watch_sample = [&](std::vector<uint8_t>& out) {
 		out.clear();
 		if (!polling_enabled)
@@ -1355,7 +1355,7 @@ static tool_result_t handle_find_what_accesses(const json& params) {
 			out.resize(static_cast<size_t>(size));
 		return true;
 	};
-	const bool polling_baseline_ok = read_watch_sample(polling_last);
+	bool polling_baseline_ok = read_watch_sample(polling_last);
 	diag::log_tagged_fmt("scanner",
 		"find_what_accesses baseline pid=%u ok=%d bytes=%zu elapsed_ms=%llu",
 		pid,
@@ -1392,6 +1392,7 @@ static tool_result_t handle_find_what_accesses(const json& params) {
 		return cancelled_result("before_install", reason, 0, false, false, 0);
 	}
 	uint32_t sid = page_guard_engine::g_pg_engine.install(pid, page_base, guard_size, true, max_records_per_drain);
+	bool pg_failed = false;
 	if (sid == 0) {
 		json failure = page_guard_install_failure_json();
 		diag::log_tagged_fmt("scanner",
@@ -1407,18 +1408,19 @@ static tool_result_t handle_find_what_accesses(const json& params) {
 			failure.value("remote_call_late_completion", false) ? 1 : 0,
 			static_cast<unsigned long long>(GetTickCount64() - started_tick),
 			driver_bridge::last_error().c_str());
-		json result;
-		result["address"] = sa_format_address(*address);
-		result["size"] = size;
-		result["type"] = type;
-		result["pid"] = pid;
-		result["active_pid"] = driver_bridge::attached_pid();
-		result["guard_base"] = sa_format_address(page_base);
-		result["guard_size"] = guard_size;
-		result["wait_ms"] = wait_ms;
-		result["elapsed_ms"] = static_cast<unsigned long long>(GetTickCount64() - started_tick);
-		result["failure"] = std::move(failure);
-		return tool_result_t::error(OBFSTR("Failed to install page-guard access monitor."), "page_guard_install_failed", result);
+		pg_failed = true;
+		polling_enabled = true;
+		polling_baseline_ok = read_watch_sample(polling_last);
+		diag::log_tagged_fmt("scanner",
+			"find_what_accesses pg_failed falling_back_to_polling pid=%u page_base=0x%llX guard_size=0x%llX wanted_access=%u polling_enabled=%d polling_baseline_ok=%d polling_baseline_size=%zu elapsed_ms=%llu",
+			pid,
+			static_cast<unsigned long long>(page_base),
+			static_cast<unsigned long long>(guard_size),
+			wanted_access,
+			polling_enabled ? 1 : 0,
+			polling_baseline_ok ? 1 : 0,
+			polling_last.size(),
+			static_cast<unsigned long long>(GetTickCount64() - started_tick));
 	}
 	diag::log_tagged_fmt("scanner",
 		"find_what_accesses install_done sid=%u pid=%u payloads=1 max_drain=%u elapsed_ms=%llu",
@@ -1469,9 +1471,12 @@ static tool_result_t handle_find_what_accesses(const json& params) {
 	const char* cancelled_phase = "";
 	const char* cancelled_reason = "";
 	diag::log_tagged_fmt("scanner",
-		"find_what_accesses loop_begin sid=%u wait_ms=%d elapsed_ms=%llu",
+		"find_what_accesses loop_begin sid=%u wait_ms=%d pg_failed=%d polling_enabled=%d polling_baseline_ok=%d elapsed_ms=%llu",
 		sid,
 		wait_ms,
+		pg_failed ? 1 : 0,
+		polling_enabled ? 1 : 0,
+		polling_baseline_ok ? 1 : 0,
 		static_cast<unsigned long long>(GetTickCount64() - started_tick));
 	do {
 		if (const char* reason = cancel_reason()) {
@@ -1648,14 +1653,16 @@ static tool_result_t handle_find_what_accesses(const json& params) {
 	result["page_guard_captures"] = captures.size();
 	result["polling_delta_captures"] = polling_delta_returned ? 1 : 0;
 	result["polling_baseline"] = polling_baseline_ok;
+	result["pg_failed"] = pg_failed;
 	result["returned"] = arr.size();
 	result["accesses"] = std::move(arr);
 	diag::log_tagged_fmt("scanner",
-		"find_what_accesses return sid=%u captures=%zu returned=%zu polling_delta_returned=%d elapsed_ms=%llu",
+		"find_what_accesses return sid=%u captures=%zu returned=%zu polling_delta_returned=%d pg_failed=%d elapsed_ms=%llu",
 		sid,
 		captures.size(),
 		result["accesses"].size(),
 		polling_delta_returned ? 1 : 0,
+		pg_failed ? 1 : 0,
 		static_cast<unsigned long long>(GetTickCount64() - started_tick));
 	return tool_result_t::ok(result);
 }

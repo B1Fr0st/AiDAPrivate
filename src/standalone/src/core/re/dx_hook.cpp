@@ -5257,6 +5257,8 @@ bool start_dx_debug_loop(std::uint32_t pid, std::string& error)
             return true;
         if (!state.running.load(std::memory_order_acquire))
             break;
+        if (mcp_standalone::current_call_cancelled())
+            break;
         std::this_thread::sleep_for(std::chrono::milliseconds(25));
     }
     const DWORD gle = state.error.load(std::memory_order_acquire);
@@ -5272,7 +5274,11 @@ void stop_dx_debug_loop(std::uint32_t pid)
     state.polling.store(false, std::memory_order_release);
     frame_tracking_state().enabled.store(false, std::memory_order_release);
     for (int i = 0; i < 80 && state.running.load(std::memory_order_acquire); ++i)
+    {
+        if (mcp_standalone::current_call_cancelled())
+            break;
         std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
 }
 
 struct staging_watch_t
@@ -5627,6 +5633,8 @@ bool start_staging_watch(std::uint32_t pid, std::uint64_t staging_va,
         if (state.active.load(std::memory_order_acquire) &&
             state.pid.load(std::memory_order_acquire) == pid)
             break;
+        if (mcp_standalone::current_call_cancelled())
+            break;
         std::this_thread::sleep_for(std::chrono::milliseconds(25));
     }
     return true;
@@ -5639,7 +5647,11 @@ void stop_staging_watch(std::uint32_t pid)
         return;
     state.polling.store(false, std::memory_order_release);
     for (int i = 0; i < 80 && state.active.load(std::memory_order_acquire); ++i)
+    {
+        if (mcp_standalone::current_call_cancelled())
+            break;
         std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
 }
 
 std::optional<slot_entry_t> choose_cbuffer_target(std::uint32_t pid, const std::string& api)
@@ -8956,6 +8968,7 @@ tool_result_t project_bones(const json& params)
     result["view_matrix_orientation"] = view_mat.orientation;
     result["bone_count"] = decoded.count;
     result["projected_count"] = projected_count;
+    result["projected"] = projected_count;
     result["behind_camera_count"] = behind_camera_count;
     result["valid_screen_count"] = valid_screen_count;
     result["screen_width"] = dims.width;
@@ -9758,6 +9771,9 @@ tool_result_t auto_narrow(const json& params)
     const std::uint32_t max_bones = static_cast<std::uint32_t>(numeric_param(params, "max_bones", 256, min_bones, 4096));
     const std::string api = api_param(params);
 
+    if (!unsafe_confirmed(params))
+        return unsafe_required("dx_auto_narrow");
+
     if (!driver_bridge::using_kernel_driver())
     {
         json result;
@@ -9880,17 +9896,52 @@ tool_result_t auto_narrow(const json& params)
         return tool_result_t::error("Debug loop failed to start.", result);
     }
 
-    const std::uint64_t deadline_ms = started_ms + capture_frames * 2000ull + 5000ull;
+    if (dx_call_cancelled("auto_narrow_post_debug_start", scope.pid(), started_ms))
+    {
+        stop_dx_debug_loop(scope.pid());
+        for (const auto& r : prepared) clear_dx_record_breakpoints(r);
+        frame_tracking_state().enabled.store(false, std::memory_order_release);
+        json result;
+        result["process_id"] = scope.pid();
+        result["cancelled"] = true;
+        return tool_result_t::error("Auto-narrow cancelled after debug loop start.", result);
+    }
+
+    const std::uint64_t frame_deadline_ms = started_ms + capture_frames * 2000ull + 5000ull;
+    bool auto_narrow_cancelled = false;
     while (store::list_frame_batches(scope.pid()).size() < capture_frames)
     {
-        if (GetTickCount64() > deadline_ms)
+        if (GetTickCount64() > frame_deadline_ms)
             break;
+        if (dx_call_cancelled("auto_narrow_frame_capture", scope.pid(), started_ms))
+        {
+            auto_narrow_cancelled = true;
+            break;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
     stop_dx_debug_loop(scope.pid());
     for (const auto& r : prepared) clear_dx_record_breakpoints(r);
     frame_tracking_state().enabled.store(false, std::memory_order_release);
+
+    if (auto_narrow_cancelled)
+    {
+        json result;
+        result["process_id"] = scope.pid();
+        result["captured_frames"] = store::list_frame_batches(scope.pid()).size();
+        result["cancelled"] = true;
+        return tool_result_t::error("Auto-narrow cancelled during frame capture.", result);
+    }
+
+    if (dx_call_cancelled("auto_narrow_post_capture", scope.pid(), started_ms))
+    {
+        json result;
+        result["process_id"] = scope.pid();
+        result["captured_frames"] = store::list_frame_batches(scope.pid()).size();
+        result["cancelled"] = true;
+        return tool_result_t::error("Auto-narrow cancelled after frame capture.", result);
+    }
 
     auto batches = store::list_frame_batches(scope.pid());
     if (batches.empty())
@@ -9910,10 +9961,20 @@ tool_result_t auto_narrow(const json& params)
     }
 
     json view_matrix_candidates = json::array();
+    std::size_t vm_eval_count = 0;
     for (const auto& cc : classifications)
     {
         if (cc.classification != store::cbuffer_class_t::persistent)
             continue;
+        if ((++vm_eval_count & 0x7u) == 0 && dx_call_cancelled("auto_narrow_vm_eval", scope.pid(), started_ms))
+        {
+            json result;
+            result["process_id"] = scope.pid();
+            result["captured_frames"] = batches.size();
+            result["cancelled"] = true;
+            result["view_matrix_candidates"] = std::move(view_matrix_candidates);
+            return tool_result_t::error("Auto-narrow cancelled during view matrix evaluation.", result);
+        }
 
         std::vector<std::uint8_t> bytes;
         if (!read_bytes(scope.pid(), cc.va, 64, bytes) || bytes.size() < 64)
@@ -9955,10 +10016,21 @@ tool_result_t auto_narrow(const json& params)
     }
 
     json bone_buffer_candidates = json::array();
+    std::size_t bb_eval_count = 0;
     for (const auto& cc : classifications)
     {
         if (cc.classification != store::cbuffer_class_t::per_draw)
             continue;
+        if ((++bb_eval_count & 0x7u) == 0 && dx_call_cancelled("auto_narrow_bb_eval", scope.pid(), started_ms))
+        {
+            json result;
+            result["process_id"] = scope.pid();
+            result["captured_frames"] = batches.size();
+            result["cancelled"] = true;
+            result["view_matrix_candidates"] = std::move(view_matrix_candidates);
+            result["bone_buffer_candidates"] = std::move(bone_buffer_candidates);
+            return tool_result_t::error("Auto-narrow cancelled during bone buffer evaluation.", result);
+        }
 
         driver_bridge::memory_region_t region{};
         if (!query_region(scope.pid(), cc.va, region))

@@ -38,7 +38,6 @@
 #include <limits>
 #include <memory>
 #include <map>
-#include <shared_mutex>
 #include <thread>
 
 namespace mcp_standalone
@@ -2066,10 +2065,133 @@ static bool is_driver_bridge_dependent_tool(const tool_def_t& tool)
     return false;
 }
 
-static std::shared_mutex& active_session_tool_mutex()
+class active_session_lease_lock_t
 {
-    static std::shared_mutex m;
-    return m;
+public:
+    active_session_lease_lock_t() = default;
+
+    bool try_acquire_exclusive(std::uint64_t token, std::uint64_t deadline_ms)
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        const std::uint64_t now = mcp_now_ms();
+        if (exclusive_owner_token_ == 0 && shared_count_ == 0)
+        {
+            exclusive_owner_token_ = token;
+            exclusive_owner_deadline_ms_ = deadline_ms;
+            return true;
+        }
+        if (exclusive_owner_token_ != 0 &&
+            exclusive_owner_deadline_ms_ != 0 &&
+            now >= exclusive_owner_deadline_ms_)
+        {
+            exclusive_owner_token_ = token;
+            exclusive_owner_deadline_ms_ = deadline_ms;
+            cv_.notify_all();
+            return true;
+        }
+        if (exclusive_owner_token_ == 0 && shared_count_ != 0)
+        {
+            bool all_shared_expired = true;
+            for (const auto& e : shared_owners_)
+            {
+                if (e.deadline_ms == 0 || now < e.deadline_ms)
+                {
+                    all_shared_expired = false;
+                    break;
+                }
+            }
+            if (all_shared_expired)
+            {
+                shared_owners_.clear();
+                shared_count_ = 0;
+                exclusive_owner_token_ = token;
+                exclusive_owner_deadline_ms_ = deadline_ms;
+                cv_.notify_all();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool try_acquire_shared(std::uint64_t token, std::uint64_t deadline_ms)
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        const std::uint64_t now = mcp_now_ms();
+        if (exclusive_owner_token_ == 0)
+        {
+            shared_owners_.push_back({token, deadline_ms});
+            ++shared_count_;
+            return true;
+        }
+        if (exclusive_owner_deadline_ms_ != 0 && now >= exclusive_owner_deadline_ms_)
+        {
+            exclusive_owner_token_ = 0;
+            exclusive_owner_deadline_ms_ = 0;
+            cv_.notify_all();
+            shared_owners_.push_back({token, deadline_ms});
+            ++shared_count_;
+            return true;
+        }
+        return false;
+    }
+
+    void release_exclusive(std::uint64_t token)
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (exclusive_owner_token_ == token)
+        {
+            exclusive_owner_token_ = 0;
+            exclusive_owner_deadline_ms_ = 0;
+            cv_.notify_all();
+        }
+    }
+
+    void release_shared(std::uint64_t token)
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        auto it = std::find_if(shared_owners_.begin(), shared_owners_.end(),
+            [token](const shared_owner_entry_t& e) { return e.token == token; });
+        if (it != shared_owners_.end())
+        {
+            shared_owners_.erase(it);
+            --shared_count_;
+            cv_.notify_all();
+        }
+    }
+
+    bool exclusive_owner_expired() const
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        return exclusive_owner_token_ != 0 &&
+               exclusive_owner_deadline_ms_ != 0 &&
+               mcp_now_ms() >= exclusive_owner_deadline_ms_;
+    }
+
+    std::uint64_t exclusive_owner_token() const
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        return exclusive_owner_token_;
+    }
+
+private:
+    struct shared_owner_entry_t
+    {
+        std::uint64_t token = 0;
+        std::uint64_t deadline_ms = 0;
+    };
+
+    mutable std::mutex mtx_;
+    std::condition_variable cv_;
+    std::uint64_t exclusive_owner_token_ = 0;
+    std::uint64_t exclusive_owner_deadline_ms_ = 0;
+    std::vector<shared_owner_entry_t> shared_owners_;
+    std::size_t shared_count_ = 0;
+};
+
+static active_session_lease_lock_t& active_session_lease_lock()
+{
+    static active_session_lease_lock_t lock;
+    return lock;
 }
 
 static std::string sanitize_owner_field(const std::string& value, std::size_t max_len = 160)
@@ -2342,16 +2464,19 @@ public:
                                  const char* lane,
                                  bool exclusive,
                                  bool read_only,
-                                 bool explicit_target)
+                                 bool explicit_target,
+                                 std::uint64_t pre_generated_token = 0,
+                                 std::uint64_t pre_generated_deadline = 0,
+                                 bool pre_generated_deadline_set = false)
         : tool_(sanitize_owner_field(tool_name))
         , lane_(sanitize_owner_field(lane ? lane : ""))
         , diag_id_(sanitize_owner_field(current_call_diag_id() ? current_call_diag_id() : ""))
         , exclusive_(exclusive)
         , read_only_(read_only)
         , explicit_target_(explicit_target)
-        , token_(active_session_owner_token_source().fetch_add(1u, std::memory_order_acq_rel) + 1u)
+        , token_(pre_generated_token != 0 ? pre_generated_token : active_session_owner_token_source().fetch_add(1u, std::memory_order_acq_rel) + 1u)
         , acquired_ms_(mcp_now_ms())
-        , deadline_ms_(current_call_deadline_ms())
+        , deadline_ms_(pre_generated_deadline_set ? pre_generated_deadline : current_call_deadline_ms())
         , pid_(GetCurrentProcessId())
         , tid_(GetCurrentThreadId())
         , cancel_token_at_acquire_(current_cancel_token())
@@ -2542,6 +2667,10 @@ public:
                 current_cancelled_flag ? 1 : 0,
                 static_cast<unsigned long long>(token_));
         }
+        if (exclusive_)
+            active_session_lease_lock().release_exclusive(token_);
+        else
+            active_session_lease_lock().release_shared(token_);
         active_ = false;
     }
 
@@ -2821,14 +2950,16 @@ static policy_lock_wait_t wait_policy_lock(Lock& lock,
     }
 }
 
-static policy_lock_wait_t acquire_policy_unique_lock(std::unique_lock<std::shared_mutex>& lock,
+static policy_lock_wait_t acquire_policy_unique_lock(active_session_lease_lock_t& lock,
                                                      const std::string& tool_name,
                                                      const char* lane,
                                                      bool read_only,
-                                                     bool explicit_target)
+                                                     bool explicit_target,
+                                                     std::uint64_t token,
+                                                     std::uint64_t deadline_ms)
 {
     return wait_policy_lock(lock,
-        [](std::unique_lock<std::shared_mutex>& l) { return l.try_lock(); },
+        [token, deadline_ms](active_session_lease_lock_t& l) { return l.try_acquire_exclusive(token, deadline_ms); },
         tool_name,
         lane,
         "exclusive",
@@ -2836,13 +2967,15 @@ static policy_lock_wait_t acquire_policy_unique_lock(std::unique_lock<std::share
         explicit_target);
 }
 
-static policy_lock_wait_t acquire_policy_shared_lock(std::shared_lock<std::shared_mutex>& lock,
+static policy_lock_wait_t acquire_policy_shared_lock(active_session_lease_lock_t& lock,
                                                      const std::string& tool_name,
                                                      const char* lane,
-                                                     bool explicit_target)
+                                                     bool explicit_target,
+                                                     std::uint64_t token,
+                                                     std::uint64_t deadline_ms)
 {
     return wait_policy_lock(lock,
-        [](std::shared_lock<std::shared_mutex>& l) { return l.try_lock(); },
+        [token, deadline_ms](active_session_lease_lock_t& l) { return l.try_acquire_shared(token, deadline_ms); },
         tool_name,
         lane,
         "shared",
@@ -3246,11 +3379,21 @@ static tool_result_t invoke_tool_with_concurrency_policy(
         return invoke_tool_handler_guarded(tool.name, arguments, handler, metrics, lane.c_str(), trusted_thread_suspension_tool);
     }
 
+    if (!session_manager && !session_independent && !explicit_target && !tool_args_have_explicit_pid(arguments)) {
+        set_tool_metrics_lane(metrics, "self_contained_unlocked", 0);
+        diag::log_tagged_fmt("mcp_srv",
+            "tool_policy_lane tool='%s' lane=self_contained_unlocked read_only=%d explicit_target=0 lock_wait_ms=0",
+            tool.name.c_str(),
+            tool.read_only ? 1 : 0);
+        return invoke_tool_handler_guarded(tool.name, arguments, handler, metrics, "self_contained_unlocked", trusted_thread_suspension_tool);
+    }
+
     if (session_manager || !tool.read_only) {
         const char* lane = session_manager ? "exclusive_session_manager" :
             (session_independent ? "exclusive_independent_mutating" : "exclusive_mutating");
-        std::unique_lock<std::shared_mutex> lk(active_session_tool_mutex(), std::defer_lock);
-        const policy_lock_wait_t wait = acquire_policy_unique_lock(lk, tool.name, lane, tool.read_only, explicit_target);
+        const std::uint64_t owner_token = active_session_owner_token_source().fetch_add(1u, std::memory_order_acq_rel) + 1u;
+        const std::uint64_t owner_deadline = current_call_deadline_ms();
+        const policy_lock_wait_t wait = acquire_policy_unique_lock(active_session_lease_lock(), tool.name, lane, tool.read_only, explicit_target, owner_token, owner_deadline);
         if (wait.status != policy_lock_status_t::acquired) {
             set_tool_metrics_lane(metrics, lane, wait.wait_ms);
             return policy_lock_error_result(tool.name, lane, wait);
@@ -3264,7 +3407,7 @@ static tool_result_t invoke_tool_with_concurrency_policy(
             tool.read_only ? 1 : 0,
             explicit_target ? 1 : 0,
             static_cast<unsigned long long>(wait_ms));
-        active_session_owner_guard_t owner_guard(tool.name, lane, true, tool.read_only, explicit_target);
+        active_session_owner_guard_t owner_guard(tool.name, lane, true, tool.read_only, explicit_target, owner_token, owner_deadline, true);
         if (!session_manager && !session_independent) {
             owner_guard.set_phase("target_resolve");
             std::string scope_err;
@@ -3281,8 +3424,9 @@ static tool_result_t invoke_tool_with_concurrency_policy(
     }
 
     if (!explicit_target) {
-        std::shared_lock<std::shared_mutex> lk(active_session_tool_mutex(), std::defer_lock);
-        const policy_lock_wait_t wait = acquire_policy_shared_lock(lk, tool.name, "shared_active", false);
+        const std::uint64_t owner_token = active_session_owner_token_source().fetch_add(1u, std::memory_order_acq_rel) + 1u;
+        const std::uint64_t owner_deadline = current_call_deadline_ms();
+        const policy_lock_wait_t wait = acquire_policy_shared_lock(active_session_lease_lock(), tool.name, "shared_active", false, owner_token, owner_deadline);
         if (wait.status != policy_lock_status_t::acquired) {
             set_tool_metrics_lane(metrics, "shared_active", wait.wait_ms);
             return policy_lock_error_result(tool.name, "shared_active", wait);
@@ -3293,7 +3437,7 @@ static tool_result_t invoke_tool_with_concurrency_policy(
             "tool_policy_lane tool='%s' lane=shared_active read_only=1 explicit_target=0 lock_wait_ms=%llu",
             tool.name.c_str(),
             static_cast<unsigned long long>(wait_ms));
-        active_session_owner_guard_t owner_guard(tool.name, "shared_active", false, true, false);
+        active_session_owner_guard_t owner_guard(tool.name, "shared_active", false, true, false, owner_token, owner_deadline, true);
         owner_guard.set_phase("target_resolve");
         std::string scope_err;
         target_scope_t scope = resolve_target(target_arguments, &scope_err);
@@ -3309,13 +3453,14 @@ static tool_result_t invoke_tool_with_concurrency_policy(
     target_probe_t probe;
     std::uint64_t probe_wait_ms = 0;
     {
-        std::shared_lock<std::shared_mutex> lk(active_session_tool_mutex(), std::defer_lock);
-        const policy_lock_wait_t wait = acquire_policy_shared_lock(lk, tool.name, "shared_target_probe", true);
+        const std::uint64_t owner_token = active_session_owner_token_source().fetch_add(1u, std::memory_order_acq_rel) + 1u;
+        const std::uint64_t owner_deadline = current_call_deadline_ms();
+        const policy_lock_wait_t wait = acquire_policy_shared_lock(active_session_lease_lock(), tool.name, "shared_target_probe", true, owner_token, owner_deadline);
         if (wait.status != policy_lock_status_t::acquired) {
             set_tool_metrics_lane(metrics, "shared_target_probe", wait.wait_ms);
             return policy_lock_error_result(tool.name, "shared_target_probe", wait);
         }
-        active_session_owner_guard_t owner_guard(tool.name, "shared_target_probe", false, true, true);
+        active_session_owner_guard_t owner_guard(tool.name, "shared_target_probe", false, true, true, owner_token, owner_deadline, true);
         owner_guard.set_phase("target_probe");
         probe_wait_ms = wait.wait_ms;
         probe = probe_target_without_switch(target_arguments);
@@ -3369,8 +3514,9 @@ static tool_result_t invoke_tool_with_concurrency_policy(
         }
     }
 
-    std::unique_lock<std::shared_mutex> lk(active_session_tool_mutex(), std::defer_lock);
-    const policy_lock_wait_t wait = acquire_policy_unique_lock(lk, tool.name, "exclusive_target_switch", true, true);
+    const std::uint64_t owner_token = active_session_owner_token_source().fetch_add(1u, std::memory_order_acq_rel) + 1u;
+    const std::uint64_t owner_deadline = current_call_deadline_ms();
+    const policy_lock_wait_t wait = acquire_policy_unique_lock(active_session_lease_lock(), tool.name, "exclusive_target_switch", true, true, owner_token, owner_deadline);
     if (wait.status != policy_lock_status_t::acquired) {
         set_tool_metrics_lane(metrics, "exclusive_target_switch", probe_wait_ms + wait.wait_ms);
         return policy_lock_error_result(tool.name, "exclusive_target_switch", wait);
@@ -3384,7 +3530,7 @@ static tool_result_t invoke_tool_with_concurrency_policy(
         static_cast<unsigned long long>(probe.target_idx),
         static_cast<unsigned long long>(probe_wait_ms),
         static_cast<unsigned long long>(wait_ms));
-    active_session_owner_guard_t owner_guard(tool.name, "exclusive_target_switch", true, true, true);
+    active_session_owner_guard_t owner_guard(tool.name, "exclusive_target_switch", true, true, true, owner_token, owner_deadline, true);
     owner_guard.set_phase("target_resolve");
     std::string scope_err;
     target_scope_t scope = resolve_target(target_arguments, &scope_err);
@@ -4285,6 +4431,24 @@ json server_t::handle_tools_call(const json& id, const json& params)
     if (wait_status != std::future_status::ready) {
         state->timed_out.store(true, std::memory_order_release);
         call_scope.cancel();
+        {
+            const active_session_owner_snapshot_t stuck_owner = active_session_owner_snapshot();
+            diag::log_tagged_fmt("mcp_srv",
+                "tool_call_timeout_lock_owner seq=%llu diag_id=%s tool='%s' owner_tool='%s' owner_lane=%s owner_diag_id=%s owner_pid=%lu owner_tid=%lu owner_age_ms=%llu owner_deadline_ms=%llu owner_cancelled=%d owner_phase=%s owner_token=%llu",
+                static_cast<unsigned long long>(seq),
+                diag_id.c_str(),
+                tool_name.c_str(),
+                stuck_owner.tool.c_str(),
+                stuck_owner.lane.c_str(),
+                stuck_owner.diag_id.c_str(),
+                static_cast<unsigned long>(stuck_owner.pid),
+                static_cast<unsigned long>(stuck_owner.tid),
+                static_cast<unsigned long long>(stuck_owner.owner_age_ms),
+                static_cast<unsigned long long>(stuck_owner.deadline_ms),
+                stuck_owner.cancelled ? 1 : 0,
+                stuck_owner.phase.c_str(),
+                static_cast<unsigned long long>(stuck_owner.token));
+        }
         {
             std::lock_guard<std::mutex> lk(state->mtx);
             dispatch_metrics = state->metrics;
