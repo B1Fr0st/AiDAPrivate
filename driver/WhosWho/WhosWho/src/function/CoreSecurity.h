@@ -380,10 +380,15 @@ namespace caller_validation {
                     reinterpret_cast<UCHAR*>(current_process) + dtb_offset);
 
                 if ((current_cr3 & ~0xFFFULL) != (g_client_cr3 & ~0xFFFULL)) {
-                    _InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_validation_failures));
-                    WW_LOG("VALIDATE_CALLER_FAIL reason=cr3_mismatch current_cr3=0x%llx registered_cr3=0x%llx failures=%lu",
-                        current_cr3, g_client_cr3, g_validation_failures);
-                    return FALSE;
+                    UINT64 prev_cr3 = _InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_client_cr3),
+                        static_cast<LONG64>(current_cr3 & ~0xFFFULL));
+                    WW_LOG("VALIDATE_CALLER_CR3_UPDATED current_cr3=0x%llx prev_cr3=0x%llx failures=%lu pid=%lu",
+                        current_cr3 & ~0xFFFULL, prev_cr3, g_validation_failures,
+                        (ULONG)(ULONG_PTR)PsGetCurrentProcessId());
+                    if (g_validation_failures > 0) {
+                        _InterlockedExchange(reinterpret_cast<volatile LONG*>(&g_validation_failures), 0);
+                    }
+                    _InterlockedExchange64(&g_first_attack_tsc, 0);
                 }
             } __except(EXCEPTION_EXECUTE_HANDLER) {
                 return FALSE;

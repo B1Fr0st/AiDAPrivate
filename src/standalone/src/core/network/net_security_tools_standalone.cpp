@@ -7,6 +7,7 @@
 
 #include "standalone_compat.hpp"
 #include "comm.h"
+#include "../runtime/standalone_driver.hpp"
 #include "net_security.hpp"
 #include "cert_generator.hpp"
 #include "mitm_proxy.hpp"
@@ -878,6 +879,15 @@ tool_result_t tls_extract_keys(const json& params) {
         diag::log_tagged("net_sec", "tls_extract_keys driver not connected");
         return tool_result_t::error(OBFSTR("Driver not connected"));
     }
+    if (driver_bridge::attached_pid() == 0) {
+        json r;
+        r["driver_connected"] = true;
+        r["driver_attached_pid"] = 0;
+        r["driver_status"] = driver_bridge::status();
+        r["driver_last_error"] = driver_bridge::last_error();
+        diag::log_tagged("net_sec", "tls_extract_keys no process attached");
+        return tool_result_t::error(OBFSTR("No process attached to driver. DTB resolution may have failed."), r);
+    }
 
     net_security::tls_key_scan_config_t config;
     config.pid = pid;
@@ -1702,6 +1712,15 @@ tool_result_t dtls_extract_keys(const json& params) {
     if (!device || !device->is_connected()) {
         diag::log_tagged("net_sec", "dtls_extract_keys driver not connected");
         return tool_result_t::error(OBFSTR("Driver not connected"));
+    }
+    if (driver_bridge::attached_pid() == 0) {
+        json r;
+        r["driver_connected"] = true;
+        r["driver_attached_pid"] = 0;
+        r["driver_status"] = driver_bridge::status();
+        r["driver_last_error"] = driver_bridge::last_error();
+        diag::log_tagged("net_sec", "dtls_extract_keys no process attached");
+        return tool_result_t::error(OBFSTR("No process attached to driver. DTB resolution may have failed."), r);
     }
 
     auto keys = net_security::TlsKeyExtractor::instance().extract_dtls_keys(pid);

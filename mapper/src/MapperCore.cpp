@@ -3,6 +3,8 @@
 #include "EmbeddedDriver.h"
 #include "../../driver/sentinel_handoff.h"
 #include <Shlwapi.h>
+#include <shlobj.h>
+#include <filesystem>
 #include <cstdio>
 #include <cstdarg>
 #include <cstring>
@@ -417,6 +419,8 @@ static void OpenMapperLog()
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "wintrust.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "ole32.lib")
 
 namespace Utils {
 
@@ -617,71 +621,23 @@ namespace Utils {
 
 
     std::wstring GetRandomSystemDirectory() {
-        WCHAR winDir[MAX_PATH] = {};
-        DWORD winLen = GetWindowsDirectoryW(winDir, MAX_PATH);
-        if (winLen == 0 || winLen >= MAX_PATH)
+        wchar_t* local = nullptr;
+        if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_CREATE, nullptr, &local)) || !local)
             return L"";
-
-        WCHAR programData[MAX_PATH] = {};
-        DWORD pdLen = GetEnvironmentVariableW(L"ProgramData", programData, MAX_PATH);
-
-
-        std::wstring candidates[12];
-        int count = 0;
-
-
-        candidates[count++] = std::wstring(winDir) + L"\\Temp";
-
-
-        candidates[count++] = std::wstring(winDir) + L"\\SoftwareDistribution\\Download";
-
-
-        candidates[count++] = std::wstring(winDir) + L"\\Prefetch";
-
-
-        candidates[count++] = std::wstring(winDir) + L"\\ServiceProfiles\\LocalService\\AppData\\Local\\Temp";
-
-
-        candidates[count++] = std::wstring(winDir) + L"\\Logs\\MoSetup";
-
-
-        candidates[count++] = std::wstring(winDir) + L"\\INF";
-
-        if (pdLen > 0 && pdLen < MAX_PATH) {
-
-            candidates[count++] = std::wstring(programData) + L"\\Microsoft\\Windows\\WER\\Temp";
-            candidates[count++] = std::wstring(programData) + L"\\Microsoft\\Windows\\Caches";
-            candidates[count++] = std::wstring(programData) + L"\\Microsoft\\Crypto\\RSA\\MachineKeys";
-            candidates[count++] = std::wstring(programData) + L"\\USOShared\\Logs";
-        }
-
-
-        static std::mt19937 rng(static_cast<unsigned int>(__rdtsc()));
-        for (int i = count - 1; i > 0; i--) {
-            std::uniform_int_distribution<int> dist(0, i);
-            int j = dist(rng);
-            std::swap(candidates[i], candidates[j]);
-        }
-
-        for (int i = 0; i < count; i++) {
-            DWORD attr = GetFileAttributesW(candidates[i].c_str());
-            if (attr == INVALID_FILE_ATTRIBUTES)
-                continue;
-            if (!(attr & FILE_ATTRIBUTE_DIRECTORY))
-                continue;
-
-
-            std::wstring probe = candidates[i] + L"\\" + GenerateRandomName(8) + L".tmp";
-            HANDLE hProbe = CreateFileW(probe.c_str(), GENERIC_WRITE, 0, nullptr,
-                CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
-            if (hProbe != INVALID_HANDLE_VALUE) {
-                CloseHandle(hProbe);
-                return candidates[i];
-            }
-        }
-
-
-        return std::wstring(winDir) + L"\\Temp";
+        std::filesystem::path p(local);
+        CoTaskMemFree(local);
+        p /= L"AiDA";
+        p /= L"Standalone";
+        p /= L"DriverRuntime";
+        std::error_code ec;
+        std::filesystem::create_directories(p, ec);
+        if (ec)
+            return L"";
+        std::wstring dir = p.wstring();
+        DWORD attr = GetFileAttributesW(dir.c_str());
+        if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY))
+            return L"";
+        return dir;
     }
 
     BOOL ForceDeleteOrRename(PCWSTR filePath) {
@@ -700,14 +656,14 @@ namespace Utils {
         if (!hideDir.empty()) {
             std::wstring newName = hideDir + L"\\" + GenerateRandomName(16) + L".tmp";
             if (MoveFileW(filePath, newName.c_str())) {
-                SetFileAttributesW(newName.c_str(), FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_TEMPORARY);
+                SetFileAttributesW(newName.c_str(), FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_TEMPORARY);
                 MoveFileExW(newName.c_str(), NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
                 return TRUE;
             }
         }
 
 
-        SetFileAttributesW(filePath, FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_TEMPORARY);
+        SetFileAttributesW(filePath, FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_TEMPORARY);
         MoveFileExW(filePath, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
         return FALSE;
     }
@@ -722,7 +678,7 @@ namespace Utils {
             return gle == ERROR_FILE_NOT_FOUND || gle == ERROR_PATH_NOT_FOUND;
         }
 
-        SetFileAttributesW(filePath, FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_TEMPORARY);
+        SetFileAttributesW(filePath, FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_TEMPORARY);
 
         std::wstring cleanupPath = filePath;
         PCWSTR lastSlash = wcsrchr(filePath, L'\\');
@@ -732,14 +688,14 @@ namespace Utils {
             if (MoveFileW(filePath, renamePath.c_str())) {
                 cleanupPath = renamePath;
                 SetFileAttributesW(cleanupPath.c_str(),
-                    FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_TEMPORARY);
+                    FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_TEMPORARY);
             }
         }
 
         BOOL scheduled = MoveFileExW(cleanupPath.c_str(), NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
         if (!scheduled) {
             SetFileAttributesW(cleanupPath.c_str(),
-                FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_TEMPORARY);
+                FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_TEMPORARY);
         }
 
         return scheduled || cleanupPath != filePath;
@@ -1620,7 +1576,7 @@ namespace MapperCore {
                 donorFound = FALSE;
             } else {
 
-                SetFileAttributesW(donorCopyPath, FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM);
+                SetFileAttributesW(donorCopyPath, FILE_ATTRIBUTE_HIDDEN);
                 MoveFileExW(donorCopyPath, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
                 wcscpy_s(g_DonorCopyPath, donorCopyPath);
             }
@@ -2364,7 +2320,7 @@ int main(int argc, char* argv[]) {
             LOG("SelfSignDriver (sentinel) OK");
         }
         SetFileAttributesW(sentinelFilePath.c_str(),
-                           FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_TEMPORARY);
+                           FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_TEMPORARY);
     }
 
     LOG("Self-signing target driver...");
@@ -2375,7 +2331,7 @@ int main(int argc, char* argv[]) {
         LOG("SelfSignDriver (target) OK");
     }
 
-    SetFileAttributesW(driverFilePath.c_str(), FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_TEMPORARY);
+    SetFileAttributesW(driverFilePath.c_str(), FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_TEMPORARY);
 
     std::wstring shadowFsFilePath;
     if (!shadowFsArg.empty()) {
@@ -2412,7 +2368,7 @@ int main(int argc, char* argv[]) {
             LOG("SelfSignDriver (shadowfs) OK");
         }
         SetFileAttributesW(shadowFsFilePath.c_str(),
-                           FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_TEMPORARY);
+                           FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_TEMPORARY);
     }
 
     LOG("=== Calling WindLoadDriver ===");

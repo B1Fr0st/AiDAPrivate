@@ -385,6 +385,130 @@ inline std::string expected_symbol_cache_path(const pdb_hint_t& hint)
 	return (cache / hint.pdb_name / (hint.pdb_guid + age_buf) / hint.pdb_name).string();
 }
 
+inline std::string module_stem_from_name(const std::string& module_name)
+{
+	std::filesystem::path p(module_name);
+	std::string stem = p.stem().string();
+	if (stem.empty()) {
+		std::string::size_type slash = module_name.find_last_of("\\/");
+		std::string leaf = (slash != std::string::npos) ? module_name.substr(slash + 1) : module_name;
+		std::string::size_type dot = leaf.find_last_of('.');
+		if (dot != std::string::npos && dot > 0) leaf = leaf.substr(0, dot);
+		stem = leaf;
+	}
+	if (stem.empty()) stem = module_name;
+	return stem;
+}
+
+inline bool repo_root_marker_present(const std::filesystem::path& dir)
+{
+	std::error_code ec;
+	if (dir.empty()) return false;
+	if (std::filesystem::is_directory(dir / "build-ninja", ec) && !ec) return true;
+	if (std::filesystem::is_regular_file(dir / "CMakePresets.json", ec) && !ec) return true;
+	if (std::filesystem::is_directory(dir / ".git", ec) && !ec) return true;
+	return false;
+}
+
+inline void collect_repo_root_candidates(std::vector<std::filesystem::path>& roots)
+{
+	auto walk_up = [](std::filesystem::path start, std::vector<std::filesystem::path>& out) {
+		std::filesystem::path cur = start;
+		for (int i = 0; i < 12 && !cur.empty(); ++i) {
+			if (repo_root_marker_present(cur)) {
+				out.push_back(cur);
+				return;
+			}
+			std::filesystem::path parent = cur.parent_path();
+			if (parent.empty() || parent == cur) break;
+			cur = parent;
+		}
+	};
+	std::error_code cwd_ec;
+	std::filesystem::path cwd = std::filesystem::current_path(cwd_ec);
+	if (!cwd_ec) walk_up(cwd, roots);
+	char mod_buf[MAX_PATH] = {};
+	DWORD mod_len = GetModuleFileNameA(nullptr, mod_buf, MAX_PATH);
+	if (mod_len > 0 && mod_len < MAX_PATH) {
+		std::filesystem::path exe_dir = std::filesystem::path(mod_buf).parent_path();
+		walk_up(exe_dir, roots);
+	}
+	{
+		std::error_code ec;
+		std::filesystem::path fallback("C:\\Users\\ruar1337\\AiDAPrivate");
+		if (std::filesystem::is_directory(fallback, ec) && !ec)
+			roots.push_back(fallback);
+	}
+	char profile[MAX_PATH] = {};
+	DWORD plen = GetEnvironmentVariableA("USERPROFILE", profile, MAX_PATH);
+	if (plen > 0 && plen < MAX_PATH) {
+		std::error_code ec;
+		std::filesystem::path candidate = std::filesystem::path(profile) / "AiDAPrivate";
+		if (std::filesystem::is_directory(candidate, ec) && !ec)
+			roots.push_back(candidate);
+		candidate = std::filesystem::path(profile) / "source" / "AiDAPrivate";
+		if (std::filesystem::is_directory(candidate, ec) && !ec)
+			roots.push_back(candidate);
+	}
+}
+
+inline bool resolve_repo_build_pdb(const std::string& module_name,
+                                   const std::string& pdb_name,
+                                   std::string& out)
+{
+	if (pdb_name.empty()) return false;
+	const std::string stem = module_stem_from_name(module_name);
+	if (stem.empty()) return false;
+
+	std::vector<std::filesystem::path> roots;
+	collect_repo_root_candidates(roots);
+
+	std::vector<std::filesystem::path> candidates;
+	auto push_sub = [&](const std::filesystem::path& base, const char* sub) {
+		if (base.empty()) return;
+		candidates.push_back(base / sub / stem / pdb_name);
+	};
+	for (const auto& root : roots) {
+		push_sub(root, "build-ninja\\test_binaries");
+		push_sub(root, "test_binaries");
+		push_sub(root, "build\\test_binaries");
+		push_sub(root, "deps\\test_binaries");
+		push_sub(root, "fixtures");
+	}
+
+	std::error_code cwd_ec;
+	std::filesystem::path cwd = std::filesystem::current_path(cwd_ec);
+	if (!cwd_ec) {
+		push_sub(cwd, "build-ninja\\test_binaries");
+		push_sub(cwd, "test_binaries");
+		push_sub(cwd, "build\\test_binaries");
+		push_sub(cwd, "deps\\test_binaries");
+		push_sub(cwd, "fixtures");
+		candidates.push_back(cwd / stem / pdb_name);
+		candidates.push_back(cwd / pdb_name);
+	}
+
+	auto lower_str = [](const std::string& s) {
+		std::string r = s;
+		for (char& c : r)
+			if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+		return r;
+	};
+	std::vector<std::string> seen;
+	for (const auto& candidate : candidates) {
+		std::error_code abs_ec;
+		std::filesystem::path abs = std::filesystem::absolute(candidate, abs_ec);
+		if (abs_ec) abs = candidate;
+		std::string key = lower_str(abs.string());
+		bool dup = false;
+		for (const auto& s : seen) if (s == key) { dup = true; break; }
+		if (dup) continue;
+		seen.push_back(key);
+		if (regular_file_candidate(abs, out)) return true;
+	}
+	return false;
+}
+
 inline full_test_pdb_policy_t resolve_full_test_pdb_policy(const std::string& binary_path,
                                                            const std::string& filename,
                                                            const pdb_hint_t* hint)
@@ -415,6 +539,14 @@ inline full_test_pdb_policy_t resolve_full_test_pdb_policy(const std::string& bi
 		policy.local_candidate = local;
 		policy.decision = "load_local";
 		policy.reason = "symbol_cache_pdb_present";
+		return policy;
+	}
+
+	if (resolve_repo_build_pdb(filename, policy.pdb_name, local)) {
+		policy.local_available = true;
+		policy.local_candidate = local;
+		policy.decision = "load_local";
+		policy.reason = "repo_build_pdb_present";
 		return policy;
 	}
 

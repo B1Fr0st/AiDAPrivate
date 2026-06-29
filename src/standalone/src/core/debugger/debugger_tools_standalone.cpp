@@ -2814,6 +2814,23 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             const int limit = int_param_clamped(params, "limit", 2048, 1, 4096);
             const bool executable_only = params.value("executable_only", false);
             auto regions = debugger_engine::get_memory_map();
+            if (regions.empty()) {
+                uint32_t exit_code = 0;
+                bool alive = driver_bridge::attached_process_alive(&exit_code);
+                if (alive) {
+                    json err;
+                    err["count"] = 0;
+                    err["regions"] = json::array();
+                    err["total_regions"] = 0;
+                    err["diagnostic"] = "Memory region enumeration returned 0 regions for a live attached process";
+                    err["attached_pid"] = driver_bridge::attached_pid();
+                    err["driver_status"] = driver_bridge::status();
+                    err["driver_last_error"] = driver_bridge::last_error();
+                    diag::log_tagged_fmt("dbg_tools", "debugger_get_memory_map: 0 regions for live process pid=%u",
+                        driver_bridge::attached_pid());
+                    return tool_result_t::error(OBFSTR("Memory map enumeration returned 0 regions for attached process"), err);
+                }
+            }
             json arr = json::array();
             bool truncated = false;
             uint64_t total_bytes = 0;
@@ -3088,10 +3105,14 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 }
             }
             {
-                std::lock_guard<std::mutex> probe_lk(seh_view::g_ui.mutex);
-                const auto probe_diag = seh_view::g_ui.diagnostics;
-                const bool teb_zero = !probe_diag.teb_query_ok || probe_diag.teb_query_returned == 0;
-                if (teb_zero) {
+                bool teb_zero_retry = false;
+                seh_diagnostics_t probe_diag_retry;
+                {
+                    std::lock_guard<std::mutex> probe_lk(seh_view::g_ui.mutex);
+                    probe_diag_retry = seh_view::g_ui.diagnostics;
+                    teb_zero_retry = !probe_diag_retry.teb_query_ok || probe_diag_retry.teb_query_returned == 0;
+                }
+                if (teb_zero_retry) {
                     refresh_and_wait("retry_1");
                     std::lock_guard<std::mutex> after_lk(seh_view::g_ui.mutex);
                     const auto after_diag = seh_view::g_ui.diagnostics;
@@ -4301,6 +4322,8 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                     imports_omitted_by_deadline ? 1 : 0,
                     module_deadline ? 1 : 0,
                     elapsed_ms());
+                if (detail_parse_incomplete && export_count_value == 0 && max_exports > 0)
+                    mj["parse_failure"] = true;
                 arr.push_back(std::move(mj));
                 if (focused_single)
                     break;

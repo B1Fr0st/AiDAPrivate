@@ -2460,11 +2460,95 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
             static_cast<unsigned long>(before.child_pid),
             before.child_alive ? 1 : 0,
             before.page_verified ? 1 : 0);
+        const bool nav_page_exists = bridge_status_has_page(before, page_id);
+        diag::log_tagged_fmt("mcp_burp", "browser_navigation page_target_select_pre_flight session_id=%s page_id=%s page_exists=%d active_page_id=%s page_count=%lu known_pages=%s generation=%llu bridge_state=%s child_pid=%lu child_alive=%d browser_open=%d page_verified=%d",
+            session_id.c_str(),
+            page_id.empty() ? "<empty>" : page_id.c_str(),
+            nav_page_exists ? 1 : 0,
+            before.active_page_id.empty() ? "<empty>" : before.active_page_id.c_str(),
+            static_cast<unsigned long>(before.page_count),
+            page_ids_json(before).dump().c_str(),
+            static_cast<unsigned long long>(before.generation),
+            state_label(before.state),
+            static_cast<unsigned long>(before.child_pid),
+            before.child_alive ? 1 : 0,
+            before.browser_open ? 1 : 0,
+            before.page_verified ? 1 : 0);
+    }
+    if (tool_name == "hook_jsvmp_interpreter")
+    {
+        const std::string jsvmp_page_id = json_string_param(args, "page_id", json_string_param(params, "page_id", std::string()));
+        if (!jsvmp_page_id.empty() && jsvmp_page_id != "default")
+        {
+            const bool jsvmp_page_exists = bridge_status_has_page(before, jsvmp_page_id);
+            if (!jsvmp_page_exists)
+            {
+                const bool jsvmp_default_exists = bridge_status_has_page(before, std::string("default"));
+                const std::string jsvmp_fallback_page_id = jsvmp_default_exists ? std::string("default") : before.active_page_id;
+                if (!jsvmp_fallback_page_id.empty() && jsvmp_fallback_page_id != jsvmp_page_id)
+                {
+                    args["page_id"] = jsvmp_fallback_page_id;
+                    diag::log_tagged_fmt("mcp_burp", "browser_instrumentation jsvmp page_fallback requested_page_id=%s fallback_page_id=%s reason=requested_page_not_found default_exists=%d active_page_id=%s page_count=%lu known_pages=%s generation=%llu bridge_state=%s child_pid=%lu child_alive=%d browser_open=%d page_verified=%d",
+                        jsvmp_page_id.c_str(),
+                        jsvmp_fallback_page_id.c_str(),
+                        jsvmp_default_exists ? 1 : 0,
+                        before.active_page_id.empty() ? "<empty>" : before.active_page_id.c_str(),
+                        static_cast<unsigned long>(before.page_count),
+                        page_ids_json(before).dump().c_str(),
+                        static_cast<unsigned long long>(before.generation),
+                        state_label(before.state),
+                        static_cast<unsigned long>(before.child_pid),
+                        before.child_alive ? 1 : 0,
+                        before.browser_open ? 1 : 0,
+                        before.page_verified ? 1 : 0);
+                }
+            }
+        }
+    }
+    int effective_rpc_timeout_ms = timeout_ms;
+    if (tool_name == "navigate" && effective_rpc_timeout_ms > 25000)
+    {
+        diag::log_tagged_fmt("mcp_burp", "browser_navigation rpc_deadline_capped session_id=%s requested_timeout_ms=%d capped_timeout_ms=%d deadline_source=navigate_watchdog_guard",
+            session_id.c_str(),
+            timeout_ms,
+            25000);
+        effective_rpc_timeout_ms = 25000;
     }
     const auto rpc_start = std::chrono::steady_clock::now();
-    camoufox::call_result_t bridge_result = camoufox::call_tool(tool_name, args, timeout_ms, session_id);
+    const uint64_t rpc_send_unix_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    if (tool_name == "navigate")
+    {
+        diag::log_tagged_fmt("mcp_burp", "browser_navigation rpc_send session_id=%s rpc_send_unix_ms=%llu rpc_timeout_ms=%d effective_rpc_timeout_ms=%d bridge_state=%s child_pid=%lu child_alive=%d",
+            session_id.c_str(),
+            static_cast<unsigned long long>(rpc_send_unix_ms),
+            timeout_ms,
+            effective_rpc_timeout_ms,
+            state_label(before.state),
+            static_cast<unsigned long>(before.child_pid),
+            before.child_alive ? 1 : 0);
+    }
+    camoufox::call_result_t bridge_result = camoufox::call_tool(tool_name, args, effective_rpc_timeout_ms, session_id);
+    const auto rpc_end = std::chrono::steady_clock::now();
+    const uint64_t rpc_recv_unix_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
     const auto rpc_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - rpc_start).count();
+        rpc_end - rpc_start).count();
+    if (tool_name == "navigate")
+    {
+        diag::log_tagged_fmt("mcp_burp", "browser_navigation rpc_recv session_id=%s rpc_send_unix_ms=%llu rpc_recv_unix_ms=%llu rpc_elapsed_ms=%lld rpc_timeout_ms=%d effective_rpc_timeout_ms=%d ok=%d error_len=%zu data_shape=%s",
+            session_id.c_str(),
+            static_cast<unsigned long long>(rpc_send_unix_ms),
+            static_cast<unsigned long long>(rpc_recv_unix_ms),
+            static_cast<long long>(rpc_elapsed_ms),
+            timeout_ms,
+            effective_rpc_timeout_ms,
+            bridge_result.ok ? 1 : 0,
+            bridge_result.error.size(),
+            json_shape(bridge_result.data).c_str());
+    }
     if (tool_name == "navigate")
     {
         const std::string page_id = json_string_param(args, "page_id", json_string_param(params, "page_id", std::string()));
@@ -2620,7 +2704,7 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
     }
     const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start).count();
-    attach_bridge_rpc_timing(out, tool_name, timeout_ms, static_cast<long long>(rpc_elapsed_ms), static_cast<long long>(elapsed_ms));
+    attach_bridge_rpc_timing(out, tool_name, effective_rpc_timeout_ms, static_cast<long long>(rpc_elapsed_ms), static_cast<long long>(elapsed_ms));
     if (tool_name == "navigate" && out.success && navigation_local_fixture && !navigation_diagnostic && !navigation_publish_to_burp)
         compact_local_fixture_navigation_success(out, session_id, static_cast<long long>(elapsed_ms));
     if (instrumentation_probe)

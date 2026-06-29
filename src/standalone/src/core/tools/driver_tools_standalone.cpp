@@ -4162,7 +4162,14 @@ tool_result_t driver_enum_minifilters(const json& params)
 
 
     uint8_t pe_hdr[0x1000];
-    device->read_kernel_raw(fltmgr_base, pe_hdr, sizeof(pe_hdr));
+    std::size_t pe_hdr_read = device->read_kernel_raw(fltmgr_base, pe_hdr, sizeof(pe_hdr));
+    if (pe_hdr_read < 0x40) {
+        json r;
+        r["fltmgr_base"] = sa_format_address(fltmgr_base);
+        r["bytes_read"] = static_cast<std::uint64_t>(pe_hdr_read);
+        r["bytes_requested"] = static_cast<std::uint64_t>(sizeof(pe_hdr));
+        return tool_result_t::error(OBFSTR("fltmgr kernel memory read failed"), r);
+    }
 
     std::uint32_t pe_off = *reinterpret_cast<std::uint32_t*>(&pe_hdr[0x3C]);
     if (pe_off + 0x18 + 0x70 > sizeof(pe_hdr))

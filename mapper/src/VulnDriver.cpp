@@ -1873,7 +1873,7 @@ namespace SignedMemory {
         targetNt->OptionalHeader.CheckSum = checksum;
 
         HANDLE hWrite = CreateFileW(targetDriverPath, GENERIC_WRITE, 0,
-            nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_TEMPORARY, nullptr);
+            nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_TEMPORARY, nullptr);
         if (hWrite == INVALID_HANDLE_VALUE) {
             VirtualFree(finalData, 0, MEM_RELEASE);
             return FALSE;

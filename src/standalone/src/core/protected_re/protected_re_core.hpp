@@ -6284,6 +6284,9 @@ inline tool_result_t drv_find_device_names(const json& params)
     out["bytes_scanned"] = bytes_scanned;
     out["string_candidates_inspected"] = string_candidates_inspected;
     out["module_diagnostics"] = module_diagnostics;
+    if (modules_scanned == 0) {
+        return tool_result_t::error("Kernel module memory read failed for all scanned modules. No device-name strings could be extracted.", out);
+    }
     return tool_result_t::ok("Driver device-name scan completed", out);
 }
 

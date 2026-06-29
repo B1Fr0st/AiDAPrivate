@@ -618,6 +618,7 @@ namespace
 
     uint32_t        g_pid = 0;
     std::atomic<uint32_t> g_pid_snapshot{0};
+    uint32_t        g_primary_pid = 0;
     std::atomic_bool g_lower_remote_call_last_abandoned{false};
     std::string     g_process_name;
     std::string     g_last_error;
@@ -4901,6 +4902,24 @@ namespace driver_bridge
                         static_cast<unsigned long long>(device->get_dtb()),
                         device->get_dtb() != 0 ? 1 : 0);
                 }
+                if (device && device->is_connected()) {
+                    const uint32_t hb_pid_before = device->get_process_id();
+                    const uint64_t hb_dtb_before = device->get_dtb();
+                    const bool hb_ok = device->send_heartbeat();
+                    const DWORD hb_err = device->get_last_heartbeat_error();
+                    const uint32_t hb_ioctl = device->get_last_heartbeat_ioctl_code();
+                    const uint64_t hb_resp = device->get_last_heartbeat_response();
+                    diag::log_tagged_critical_fmt("driver",
+                        "post_demote_reregister_heartbeat reason=%s hb_ok=%d hb_err=%lu hb_ioctl=0x%08X hb_resp=0x%llX pid=%u dtb=0x%llX dtb_after_hb=0x%llX",
+                        reason_copy.c_str(),
+                        hb_ok ? 1 : 0,
+                        static_cast<unsigned long>(hb_err),
+                        hb_ioctl,
+                        static_cast<unsigned long long>(hb_resp),
+                        hb_pid_before,
+                        static_cast<unsigned long long>(hb_dtb_before),
+                        static_cast<unsigned long long>(device->get_dtb()));
+                }
                 g_post_demote_dtb_resolve_queued.store(false, std::memory_order_release);
             });
         }
@@ -4954,6 +4973,7 @@ namespace driver_bridge
             g_has_vm_read = false;
             g_kernel_attached = false;
             g_pid = 0;
+            g_primary_pid = 0;
             g_pid_snapshot.store(0, std::memory_order_release);
             const std::uint64_t generation = g_active_pid_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
             g_process_name.clear();
@@ -5080,6 +5100,7 @@ namespace driver_bridge
                 release_ctx_handle(kv.second);
             g_processes.clear();
             g_pid = 0;
+            g_primary_pid = 0;
             g_pid_snapshot.store(0, std::memory_order_release);
             g_process_name.clear();
             g_has_vm_read = false;
@@ -5689,6 +5710,7 @@ namespace driver_bridge
         close_process_handle_locked();
         g_process = process.release();
         g_pid = pid;
+        g_primary_pid = pid;
         g_pid_snapshot.store(pid, std::memory_order_release);
         const std::uint64_t active_generation = g_active_pid_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
         g_has_vm_read = false;
@@ -5855,6 +5877,7 @@ namespace driver_bridge
         uint32_t prev_pid = g_pid;
         close_process_handle_locked();
         g_pid = 0;
+        g_primary_pid = 0;
         g_pid_snapshot.store(0, std::memory_order_release);
         const std::uint64_t active_generation = g_active_pid_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
         g_process_name.clear();
@@ -6492,15 +6515,88 @@ namespace driver_bridge
             return false;
 
         if (g_pid == pid) {
-            close_process_handle_locked();
-            g_pid = 0;
-            g_pid_snapshot.store(0, std::memory_order_release);
-            g_process_name.clear();
-            g_has_vm_read = false;
-            g_kernel_attached = false;
-            if (g_kernel_mode && device && device->is_connected()) {
-                if (!arc_bridge_clear_process_context())
-                    device->clear_process_context();
+            const bool is_secondary = (g_primary_pid != 0 && pid != g_primary_pid);
+            if (is_secondary) {
+                const uint32_t restore_pid = g_primary_pid;
+                auto primary_it = g_processes.find(restore_pid);
+                const bool primary_available = (primary_it != g_processes.end());
+                const bool kernel_ready = g_kernel_mode && device && device->is_connected();
+
+                if (primary_available && kernel_ready) {
+                    const uint64_t saved_dtb = primary_it->second.cached_dtb;
+                    const uint64_t saved_kernel_dtb = primary_it->second.cached_kernel_dtb;
+                    const uint64_t saved_image_base = primary_it->second.cached_image_base;
+                    const bool saved_kernel_attached = primary_it->second.kernel_attached;
+                    const bool saved_has_vm_read = primary_it->second.has_vm_read;
+                    const std::string saved_name = primary_it->second.name;
+                    HANDLE saved_h_process = primary_it->second.h_process;
+                    primary_it->second.h_process = nullptr;
+
+                    close_process_handle_locked();
+                    g_pid = 0;
+                    g_pid_snapshot.store(0, std::memory_order_release);
+                    g_process_name.clear();
+                    g_has_vm_read = false;
+                    g_kernel_attached = false;
+
+                    const uint32_t device_pid_before = device->get_process_id();
+                    const uint64_t device_dtb_before = device->get_dtb();
+                    const uint64_t device_shellcode_before = device->get_shellcode_address_diag();
+
+                    arc_bridge_set_process_id(restore_pid);
+                    device->set_process_id(restore_pid);
+                    device->set_dtb(saved_dtb);
+                    device->set_kernel_dtb(saved_kernel_dtb);
+                    device->set_base_address(saved_image_base);
+
+                    g_pid = restore_pid;
+                    g_pid_snapshot.store(restore_pid, std::memory_order_release);
+                    g_active_pid_generation.fetch_add(1, std::memory_order_acq_rel);
+                    g_process_name = saved_name;
+                    g_has_vm_read = saved_has_vm_read;
+                    g_kernel_attached = saved_kernel_attached;
+                    if (saved_h_process != nullptr) {
+                        g_process = saved_h_process;
+                    }
+
+                    diag::log_tagged_critical_fmt("driver",
+                        "detach_one_secondary_restore detached_pid=%u primary_pid=%u device_pid_before=%u device_dtb_before=0x%llX device_shellcode_before=0x%llX restored_dtb=0x%llX restored_kernel_dtb=0x%llX restored_base=0x%llX kernel_attached=%d has_vm_read=%d",
+                        pid, restore_pid,
+                        device_pid_before,
+                        static_cast<unsigned long long>(device_dtb_before),
+                        static_cast<unsigned long long>(device_shellcode_before),
+                        static_cast<unsigned long long>(saved_dtb),
+                        static_cast<unsigned long long>(saved_kernel_dtb),
+                        static_cast<unsigned long long>(saved_image_base),
+                        g_kernel_attached ? 1 : 0,
+                        g_has_vm_read ? 1 : 0);
+                } else {
+                    close_process_handle_locked();
+                    g_pid = 0;
+                    g_pid_snapshot.store(0, std::memory_order_release);
+                    g_process_name.clear();
+                    g_has_vm_read = false;
+                    g_kernel_attached = false;
+                    if (kernel_ready) {
+                        if (!arc_bridge_clear_process_context())
+                            device->clear_process_context();
+                    }
+                    diag::log_tagged_fmt("driver",
+                        "detach_one_secondary_fallback_clear pid=%u primary_pid=%u primary_available=%d kernel_ready=%d",
+                        pid, restore_pid, primary_available ? 1 : 0, kernel_ready ? 1 : 0);
+                }
+            } else {
+                g_primary_pid = 0;
+                close_process_handle_locked();
+                g_pid = 0;
+                g_pid_snapshot.store(0, std::memory_order_release);
+                g_process_name.clear();
+                g_has_vm_read = false;
+                g_kernel_attached = false;
+                if (g_kernel_mode && device && device->is_connected()) {
+                    if (!arc_bridge_clear_process_context())
+                        device->clear_process_context();
+                }
             }
         } else {
             release_ctx_handle(it->second);
@@ -6534,6 +6630,7 @@ namespace driver_bridge
         }
         close_process_handle_locked();
         g_pid = 0;
+        g_primary_pid = 0;
         g_pid_snapshot.store(0, std::memory_order_release);
         const std::uint64_t active_generation = g_active_pid_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
         g_process_name.clear();

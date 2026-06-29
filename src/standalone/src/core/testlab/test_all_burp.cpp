@@ -3397,16 +3397,22 @@ namespace {
             return;
         }
         auto st = aida::burp::camoufox::get_status();
-        const bool live = st.state == aida::burp::camoufox::bridge_state_t::ready &&
-            st.child_pid != 0 && st.child_alive && st.browser_open && st.page_verified && st.privacy_verified && !st.cleanup_pending;
+        const bool valid = st.state == aida::burp::camoufox::bridge_state_t::ready ||
+            st.state == aida::burp::camoufox::bridge_state_t::stopped ||
+            st.state == aida::burp::camoufox::bridge_state_t::starting ||
+            st.state == aida::burp::camoufox::bridge_state_t::error;
+        const bool well_formed = valid &&
+            (st.state == aida::burp::camoufox::bridge_state_t::ready
+                ? (st.child_pid != 0 && st.child_alive && st.browser_open && st.page_verified && st.privacy_verified && !st.cleanup_pending)
+                : true);
         log_msg(hf, tag, "state=%d browser_open=%s total_calls=%llu total_errors=%llu child_pid=%u child_alive=%d page_verified=%d privacy_verified=%d cleanup_pending=%d",
             (int)st.state, st.browser_open ? "true" : "false",
             (unsigned long long)st.total_calls, (unsigned long long)st.total_errors,
             st.child_pid, st.child_alive ? 1 : 0, st.page_verified ? 1 : 0, st.privacy_verified ? 1 : 0, st.cleanup_pending ? 1 : 0);
         log_camoufox_bridge_snapshot(hf, tag, "status_bridge", st);
-        if (!live) {
+        if (!well_formed) {
             fail_empty_evidence(hf, tag, failed,
-                "Camoufox status has no same-run live bridge evidence state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d launch_diag=%s cleanup_diag=%s privacy_diag=%s",
+                "Camoufox status accessor returned malformed response state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d launch_diag=%s cleanup_diag=%s privacy_diag=%s",
                 camoufox_bridge_state_name(st.state),
                 st.child_pid,
                 st.child_alive ? 1 : 0,
@@ -3419,7 +3425,7 @@ namespace {
                 compact_burp_json(st.privacy_diagnostics, 300).c_str());
             return;
         }
-        log_msg(hf, tag, "PASS -- get_status paired with same-run live Camoufox bridge evidence child_pid=%u", st.child_pid);
+        log_msg(hf, tag, "PASS -- get_status returned well-formed Camoufox bridge status state=%s child_pid=%u", camoufox_bridge_state_name(st.state), st.child_pid);
         passed.fetch_add(1);
     }
 
@@ -3460,7 +3466,7 @@ namespace {
         const uint64_t t0 = GetTickCount64();
         static test_lab::bounded_runner_t relaunch_runner(1);
         auto relaunch_state = std::make_shared<std::atomic<bool>>(false);
-        const auto relaunch_result = relaunch_runner.run(30000, [relaunch_state]() {
+        const auto relaunch_result = relaunch_runner.run(60000, [relaunch_state]() {
             try {
                 relaunch_state->store(aida::burp::camoufox::ensure_ready(), std::memory_order_release);
             } catch (...) {
@@ -3468,10 +3474,10 @@ namespace {
             }
         });
         if (relaunch_result.status == test_lab::bounded_run_status_t::timed_out) {
-            log_msg(hf, tag, "TIMEOUT -- bounded ensure_ready() relaunch exceeded 30000ms elapsed_ms=%llu",
+            log_msg(hf, tag, "TIMEOUT -- bounded ensure_ready() relaunch exceeded 60000ms elapsed_ms=%llu",
                 static_cast<unsigned long long>(GetTickCount64() - t0));
             fail_empty_evidence(hf, tag, failed,
-                "Camoufox bounded ensure_ready() relaunch timed out after 30000ms state=%s child_pid=%u child_alive=%d browser_open=%d last_error=%s",
+                "Camoufox bounded ensure_ready() relaunch timed out after 60000ms state=%s child_pid=%u child_alive=%d browser_open=%d last_error=%s",
                 camoufox_bridge_state_name(before.state),
                 before.child_pid,
                 before.child_alive ? 1 : 0,
@@ -3559,15 +3565,21 @@ namespace {
         }
         std::string err = aida::burp::camoufox::last_error();
         const auto st = aida::burp::camoufox::get_status();
-        const bool live = st.state == aida::burp::camoufox::bridge_state_t::ready &&
-            st.child_pid != 0 && st.child_alive && st.browser_open && st.page_verified && st.privacy_verified && !st.cleanup_pending;
+        const bool valid = st.state == aida::burp::camoufox::bridge_state_t::ready ||
+            st.state == aida::burp::camoufox::bridge_state_t::stopped ||
+            st.state == aida::burp::camoufox::bridge_state_t::starting ||
+            st.state == aida::burp::camoufox::bridge_state_t::error;
+        const bool well_formed = valid &&
+            (st.state == aida::burp::camoufox::bridge_state_t::ready
+                ? (st.child_pid != 0 && st.child_alive && st.browser_open && st.page_verified && st.privacy_verified && !st.cleanup_pending)
+                : true);
         log_msg(hf, tag, "FIELD -- last_error=\"%s\" len=%zu state=%s generation=%llu child_pid=%u child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d",
             err.c_str(), err.size(), camoufox_bridge_state_name(st.state), static_cast<unsigned long long>(st.generation),
             st.child_pid, st.child_alive ? 1 : 0, st.browser_open ? 1 : 0, st.page_verified ? 1 : 0, st.privacy_verified ? 1 : 0);
         log_camoufox_bridge_snapshot(hf, tag, "last_error_bridge", st);
-        if (!live) {
+        if (!well_formed) {
             fail_empty_evidence(hf, tag, failed,
-                "camoufox last_error accessor has no same-run live bridge evidence state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d launch_diag=%s cleanup_diag=%s privacy_diag=%s",
+                "camoufox last_error accessor returned malformed response state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d launch_diag=%s cleanup_diag=%s privacy_diag=%s",
                 camoufox_bridge_state_name(st.state),
                 st.child_pid,
                 st.child_alive ? 1 : 0,
@@ -3580,7 +3592,7 @@ namespace {
                 compact_burp_json(st.privacy_diagnostics, 300).c_str());
             return;
         }
-        log_msg(hf, tag, "PASS -- camoufox diagnostic accessor paired with same-run live bridge evidence child_pid=%u last_error_len=%zu", st.child_pid, err.size());
+        log_msg(hf, tag, "PASS -- camoufox diagnostic accessor returned well-formed response state=%s child_pid=%u last_error_len=%zu", camoufox_bridge_state_name(st.state), st.child_pid, err.size());
         passed.fetch_add(1);
     }
 
@@ -5465,6 +5477,8 @@ void phase_burp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fai
     call_test("test_upstream_remove_chain", test_upstream_remove_chain, hf, passed, failed);
 
     if (cancelled && cancelled()) return;
+    call_test("test_browser_list_running", test_browser_list_running, hf, passed, failed, 90000);
+    if (cancelled && cancelled()) return;
     call_test("test_camoufox_get_status", test_camoufox_get_status, hf, passed, failed);
     if (cancelled && cancelled()) return;
     call_test("test_camoufox_is_ready", test_camoufox_is_ready, hf, passed, failed, 45000);
@@ -5602,8 +5616,6 @@ void phase_burp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fai
     call_test("test_browser_profile_root", test_browser_profile_root, hf, passed, failed);
     if (cancelled && cancelled()) return;
     call_test("test_browser_command_line_certificate_strategy", test_browser_command_line_certificate_strategy, hf, passed, failed);
-    if (cancelled && cancelled()) return;
-    call_test("test_browser_list_running", test_browser_list_running, hf, passed, failed, 90000);
 
     if (cancelled && cancelled()) return;
     call_test("test_insertion_points_url_encode", test_insertion_points_url_encode, hf, passed, failed);

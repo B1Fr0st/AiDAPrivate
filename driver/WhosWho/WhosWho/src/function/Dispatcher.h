@@ -2492,6 +2492,23 @@ namespace dispatcher {
                     _InterlockedExchange(&g_driver_activated, 1);
                     _InterlockedExchange(reinterpret_cast<volatile LONG*>(&caller_validation::g_validation_failures), 0);
                     _InterlockedExchange64(&caller_validation::g_first_attack_tsc, 0);
+                    if (caller_validation::g_client_cr3 != 0) {
+                        PEPROCESS srv2_process = PsGetCurrentProcess();
+                        if (srv2_process && reinterpret_cast<UINT64>(srv2_process) == caller_validation::g_registered_client_eprocess) {
+                            ULONG dtb_offset = caller_validation::get_dtb_offset();
+                            __try {
+                                UINT64 fresh_cr3 = *reinterpret_cast<UINT64*>(
+                                    reinterpret_cast<UCHAR*>(srv2_process) + dtb_offset);
+                                if (fresh_cr3 != 0 && (fresh_cr3 & ~0xFFFULL) != (caller_validation::g_client_cr3 & ~0xFFFULL)) {
+                                    UINT64 prev_cr3 = _InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&caller_validation::g_client_cr3),
+                                        static_cast<LONG64>(fresh_cr3 & ~0xFFFULL));
+                                    WW_LOG("SRVT2: cr3_refreshed current_cr3=0x%llx prev_cr3=0x%llx caller_pid=%llu",
+                                        fresh_cr3 & ~0xFFFULL, prev_cr3,
+                                        handle_to_u64(PsGetCurrentProcessId()));
+                                }
+                            } __except(EXCEPTION_EXECUTE_HANDLER) {}
+                        }
+                    }
                     LONG soft_demote_prev = _InterlockedExchange(&dispatcher_rekey::g_session_needs_rekey, 0);
                     LONG64 demote_qpc_cleared = _InterlockedExchange64(&dispatcher_rekey::g_session_soft_demote_qpc, 0);
                     WW_LOG("SRVT2: accepted result=%u expected_bytes=%llu returned_bytes=%llu token_present=%u nonce_present=%u proof_set=%u session_present=%u caller_pid=%llu registered_pid=%llu action=%u server_seed_set=%u ioctl_seed_set=%u elapsed_us=%llu soft_demote_cleared=%ld demote_qpc=%lld",

@@ -2490,7 +2490,6 @@ static void test_set_register(HANDLE hf, std::atomic<int>& passed, std::atomic<i
 
 static void test_step_into(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
     log_msg(hf, "dbg_si", "START -- step_into controlled nop fixture");
-    auto t0 = std::chrono::steady_clock::now();
 
     if (!require_attached_live_target(hf, "dbg_si", failed))
         return;
@@ -2502,6 +2501,7 @@ static void test_step_into(HANDLE hf, std::atomic<int>& passed, std::atomic<int>
         return;
     }
 
+    auto t0 = std::chrono::steady_clock::now();
     auto before = debugger_engine::get_registers();
     diag::log_tagged_fmt("test_dbg_detail", "dbg_si inputs: step_into() before_rip=0x%llX expected=0x%llX attached_pid=%u tid=%u",
         (unsigned long long)before.rip,
@@ -2547,7 +2547,6 @@ static void test_step_into(HANDLE hf, std::atomic<int>& passed, std::atomic<int>
 
 static void test_step_over(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
     log_msg(hf, "dbg_so", "START -- step_over controlled nop fixture");
-    auto t0 = std::chrono::steady_clock::now();
 
     if (!require_attached_live_target(hf, "dbg_so", failed))
         return;
@@ -2559,6 +2558,7 @@ static void test_step_over(HANDLE hf, std::atomic<int>& passed, std::atomic<int>
         return;
     }
 
+    auto t0 = std::chrono::steady_clock::now();
     auto before = debugger_engine::get_registers();
     diag::log_tagged_fmt("test_dbg_detail", "dbg_so inputs: step_over() before_rip=0x%llX expected=0x%llX attached_pid=%u tid=%u",
         (unsigned long long)before.rip,
@@ -2604,7 +2604,6 @@ static void test_step_over(HANDLE hf, std::atomic<int>& passed, std::atomic<int>
 
 static void test_step_out(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
     log_msg(hf, "dbg_sout", "START -- step_out controlled return fixture");
-    auto t0 = std::chrono::steady_clock::now();
 
     if (!require_attached_live_target(hf, "dbg_sout", failed))
         return;
@@ -2616,6 +2615,7 @@ static void test_step_out(HANDLE hf, std::atomic<int>& passed, std::atomic<int>&
         return;
     }
 
+    auto t0 = std::chrono::steady_clock::now();
     auto before = debugger_engine::get_registers();
     diag::log_tagged_fmt("test_dbg_detail", "dbg_sout inputs: step_out() before_rip=0x%llX before_rsp=0x%llX expected=0x%llX attached_pid=%u tid=%u",
         (unsigned long long)before.rip,
@@ -2774,7 +2774,6 @@ static void test_trace_with_depth(HANDLE hf, std::atomic<int>& passed, std::atom
 
 static void test_trace_result_inspection(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
     log_msg(hf, "dbg_tri", "START -- trace result buffer inspection with controlled step evidence");
-    auto t0 = std::chrono::steady_clock::now();
 
     if (!require_attached_live_target(hf, "dbg_tri", failed))
         return;
@@ -2786,6 +2785,7 @@ static void test_trace_result_inspection(HANDLE hf, std::atomic<int>& passed, st
         return;
     }
 
+    auto t0 = std::chrono::steady_clock::now();
     const uint32_t active_tid = debugger_engine::g_state.active_tid;
     const uint64_t fixture_va = fixture.code;
     const uint64_t fixture_expected_rip = fixture.expected_rip;

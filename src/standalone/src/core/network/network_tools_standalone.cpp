@@ -1161,6 +1161,14 @@ tool_result_t network_dns_log(const json& params)
     diag::log_tagged("net_tools", "network_dns_log entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
+    if (driver_bridge::attached_pid() == 0) {
+        json r;
+        r["driver_connected"] = true;
+        r["driver_attached_pid"] = 0;
+        r["driver_status"] = driver_bridge::status();
+        r["driver_last_error"] = driver_bridge::last_error();
+        return tool_result_t::error(OBFSTR("No process attached to driver. DTB resolution may have failed."), r);
+    }
 
     std::uint32_t filter_pid = 0;
     if (params.contains("pid") && params["pid"].is_number())
@@ -2094,6 +2102,14 @@ tool_result_t network_enumerate_wfp_callouts(const json& params)
     diag::log_tagged("net_tools", "network_enumerate_wfp_callouts entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
+    if (driver_bridge::attached_pid() == 0) {
+        json r;
+        r["driver_connected"] = true;
+        r["driver_attached_pid"] = 0;
+        r["driver_status"] = driver_bridge::status();
+        r["driver_last_error"] = driver_bridge::last_error();
+        return tool_result_t::error(OBFSTR("No process attached to driver. DTB resolution may have failed."), r);
+    }
 
     std::string filter_module;
     if (params.contains("module") && params["module"].is_string())
@@ -2284,6 +2300,14 @@ tool_result_t network_dump_tcpip(const json& params)
     diag::log_tagged("net_tools", "network_dump_tcpip entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
+    if (driver_bridge::attached_pid() == 0) {
+        json r;
+        r["driver_connected"] = true;
+        r["driver_attached_pid"] = 0;
+        r["driver_status"] = driver_bridge::status();
+        r["driver_last_error"] = driver_bridge::last_error();
+        return tool_result_t::error(OBFSTR("No process attached to driver. DTB resolution may have failed."), r);
+    }
 
     std::uint32_t target_pid = 0, filter_protocol = 0;
     if (params.contains("pid") && params["pid"].is_number()) target_pid = params["pid"].get<std::uint32_t>();
@@ -2321,6 +2345,14 @@ tool_result_t network_enumerate_interfaces(const json&)
     diag::log_tagged("net_tools", "network_enumerate_interfaces entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
+    if (driver_bridge::attached_pid() == 0) {
+        json r;
+        r["driver_connected"] = true;
+        r["driver_attached_pid"] = 0;
+        r["driver_status"] = driver_bridge::status();
+        r["driver_last_error"] = driver_bridge::last_error();
+        return tool_result_t::error(OBFSTR("No process attached to driver. DTB resolution may have failed."), r);
+    }
 
     auto ifaces = driver_bridge::enumerate_interfaces();
     diag::log_tagged_fmt("net_tools", "network_enumerate_interfaces count=%zu", ifaces.size());
@@ -2511,6 +2543,14 @@ tool_result_t network_list_mod_rules(const json&)
     diag::log_tagged("net_tools", "network_list_mod_rules entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
+    if (driver_bridge::attached_pid() == 0) {
+        json r;
+        r["driver_connected"] = true;
+        r["driver_attached_pid"] = 0;
+        r["driver_status"] = driver_bridge::status();
+        r["driver_last_error"] = driver_bridge::last_error();
+        return tool_result_t::error(OBFSTR("No process attached to driver. DTB resolution may have failed."), r);
+    }
 
     auto rules = driver_bridge::list_packet_mod_rules();
     diag::log_tagged_fmt("net_tools", "network_list_mod_rules count=%zu", rules.size());
@@ -2782,6 +2822,17 @@ tool_result_t network_list_redirect_rules(const json&)
         r["driver_last_error"] = driver_bridge::last_error();
         r["elapsed_ms"] = static_cast<std::uint64_t>(GetTickCount64() - start_ms);
         return tool_result_t::error(OBFSTR("Driver not connected."), r);
+    }
+    if (driver_bridge::attached_pid() == 0) {
+        json r;
+        r["rules"] = json::array();
+        r["count"] = 0;
+        r["driver_connected"] = true;
+        r["driver_attached_pid"] = 0;
+        r["driver_status"] = driver_bridge::status();
+        r["driver_last_error"] = driver_bridge::last_error();
+        r["elapsed_ms"] = static_cast<std::uint64_t>(GetTickCount64() - start_ms);
+        return tool_result_t::error(OBFSTR("No process attached to driver. DTB resolution may have failed."), r);
     }
 
     auto rules = driver_bridge::list_redirect_rules();
@@ -3229,6 +3280,14 @@ tool_result_t network_list_dns_spoof_rules(const json&)
     diag::log_tagged("net_tools", "network_list_dns_spoof_rules entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
+    if (driver_bridge::attached_pid() == 0) {
+        json r;
+        r["driver_connected"] = true;
+        r["driver_attached_pid"] = 0;
+        r["driver_status"] = driver_bridge::status();
+        r["driver_last_error"] = driver_bridge::last_error();
+        return tool_result_t::error(OBFSTR("No process attached to driver. DTB resolution may have failed."), r);
+    }
 
     auto rules = driver_bridge::list_dns_spoof_rules();
     diag::log_tagged_fmt("net_tools", "network_list_dns_spoof_rules count=%zu", rules.size());
@@ -3506,6 +3565,14 @@ tool_result_t network_os_fingerprint(const json& params)
         if (!ok) return tool_result_t::error(OBFSTR("Failed to disable OS fingerprinting."));
         return tool_result_t::ok(OBFSTR("OS fingerprinting disabled"));
     } else if (op == "get") {
+        if (driver_bridge::attached_pid() == 0) {
+            json r;
+            r["driver_connected"] = true;
+            r["driver_attached_pid"] = 0;
+            r["driver_status"] = driver_bridge::status();
+            r["driver_last_error"] = driver_bridge::last_error();
+            return tool_result_t::error(OBFSTR("No process attached to driver. DTB resolution may have failed."), r);
+        }
         auto fps = driver_bridge::get_fingerprints();
         diag::log_tagged_fmt("net_tools", "network_os_fingerprint get count=%zu", fps.size());
         json arr = json::array();
