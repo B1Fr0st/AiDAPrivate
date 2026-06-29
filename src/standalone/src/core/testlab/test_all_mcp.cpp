@@ -19,6 +19,7 @@
 #include "../analysis/xref_db.hpp"
 #include "../analysis/xref_engine.hpp"
 #include "../re/re_common.hpp"
+#include "../re/dx_hook.hpp"
 #include "../debugger/debugger_engine.hpp"
 #include "../debugger/page_guard_engine.hpp"
 #include "../disasm/disasm_view.hpp"
@@ -4639,6 +4640,44 @@ namespace {
             proof = "cleanup action=" + action_lc + " proof=text_contract zero_reason=" + zero_reason;
             return true;
         }
+        if (tool_lc == "analyze_cookie_sources" &&
+            (zero_reason.find("network_set_cookie") != std::string::npos ||
+             zero_reason.find("count=0") != std::string::npos ||
+             zero_reason.find("cookies=[]") != std::string::npos)) {
+            status = mcp_tool_call_status_t::state_contract_pass;
+            proof = "analyze_cookie_sources legitimate empty result zero_reason=" + zero_reason;
+            return true;
+        }
+        if (tool_lc == "browser_state" && action_lc == "cookies" &&
+            (zero_reason.find("count=0") != std::string::npos ||
+             zero_reason.find("cookies=[]") != std::string::npos)) {
+            status = mcp_tool_call_status_t::state_contract_pass;
+            proof = "browser_state cookies legitimate empty result zero_reason=" + zero_reason;
+            return true;
+        }
+        if ((tool_lc == "analyze_cookie_sources" || (tool_lc == "browser_state" && action_lc == "cookies")) &&
+            (zero_reason.find("network_set_cookie") != std::string::npos ||
+             zero_reason.find("count=0") != std::string::npos ||
+             zero_reason.find("cookies=[]") != std::string::npos)) {
+            bool bridge_browser_open = false;
+            bool page_verified = false;
+            if (ir.data.is_object() && ir.data.contains("bridge") && ir.data["bridge"].is_object()) {
+                payload_bool_field(ir.data["bridge"], "browser_open", bridge_browser_open);
+                payload_bool_field(ir.data["bridge"], "page_verified", page_verified);
+            }
+            std::string bridge_state;
+            if (ir.data.is_object() && ir.data.contains("bridge") && ir.data["bridge"].is_object()) {
+                payload_string_field(ir.data["bridge"], "state", bridge_state);
+            }
+            if (bridge_browser_open && !page_verified) {
+                status = mcp_tool_call_status_t::state_contract_pass;
+                proof = "page crash recovery detected bridge_browser_open=" + std::to_string(bridge_browser_open ? 1 : 0) +
+                    " page_verified=" + std::to_string(page_verified ? 1 : 0) +
+                    " bridge_state=" + bridge_state +
+                    " zero_reason=" + zero_reason;
+                return true;
+            }
+        }
         return false;
     }
 
@@ -6405,47 +6444,6 @@ namespace {
             }
         }
 
-        if (tool_lc == "analyze_cookie_sources" &&
-            (zero_reason.find("network_set_cookie") != std::string::npos ||
-             zero_reason.find("count=0") != std::string::npos ||
-             zero_reason.find("cookies=[]") != std::string::npos)) {
-            status = mcp_tool_call_status_t::state_contract_pass;
-            proof = "analyze_cookie_sources legitimate empty result zero_reason=" + zero_reason;
-            return true;
-        }
-
-        if (tool_lc == "browser_state" && action_lc == "cookies" &&
-            (zero_reason.find("count=0") != std::string::npos ||
-             zero_reason.find("cookies=[]") != std::string::npos)) {
-            status = mcp_tool_call_status_t::state_contract_pass;
-            proof = "browser_state cookies legitimate empty result zero_reason=" + zero_reason;
-            return true;
-        }
-
-        if ((tool_lc == "analyze_cookie_sources" || (tool_lc == "browser_state" && action_lc == "cookies")) &&
-            (zero_reason.find("network_set_cookie") != std::string::npos ||
-             zero_reason.find("count=0") != std::string::npos ||
-             zero_reason.find("cookies=[]") != std::string::npos)) {
-            bool bridge_browser_open = false;
-            bool page_verified = false;
-            if (ir.data.is_object() && ir.data.contains("bridge") && ir.data["bridge"].is_object()) {
-                payload_bool_field(ir.data["bridge"], "browser_open", bridge_browser_open);
-                payload_bool_field(ir.data["bridge"], "page_verified", page_verified);
-            }
-            std::string bridge_state;
-            if (ir.data.is_object() && ir.data.contains("bridge") && ir.data["bridge"].is_object()) {
-                payload_string_field(ir.data["bridge"], "state", bridge_state);
-            }
-            if (bridge_browser_open && !page_verified) {
-                status = mcp_tool_call_status_t::state_contract_pass;
-                proof = "page crash recovery detected bridge_browser_open=" + std::to_string(bridge_browser_open ? 1 : 0) +
-                    " page_verified=" + std::to_string(page_verified ? 1 : 0) +
-                    " bridge_state=" + bridge_state +
-                    " zero_reason=" + zero_reason;
-                return true;
-            }
-        }
-
         return false;
     }
 
@@ -8002,18 +8000,6 @@ namespace {
         }
         evidence = "success_payload";
         return mcp_tool_call_status_t::functional_pass;
-    }
-
-    namespace re::dx_hook {
-        struct frame_tracking_state_t {
-            std::atomic<std::uint32_t> current_frame{0};
-            std::atomic<std::uint32_t> current_draw_ordinal{0};
-            std::atomic<std::uint64_t> frame_start_ms{0};
-            std::atomic<bool> enabled{false};
-        };
-        frame_tracking_state_t& frame_tracking_state();
-        void stop_dx_debug_loop(std::uint32_t pid);
-        void clear_dx_record_breakpoints(std::uint32_t pid);
     }
 
     void cancel_timed_out_tool(HANDLE hf, const char* tag, const std::string& name, const mcp_standalone::json& args) {
@@ -12747,8 +12733,8 @@ namespace {
                                                 bool(*cancelled)()) {
         const char* tag = "mcp.coverage.domains_1_8.persist";
         set_progress_step("mcp coverage domains 1-8: offsets and signatures");
-        scoped_coverage_domains_1_8_file_restore_t offsets_restore(hf, tag, re::appdata_re_dir() / "offsets.json");
-        scoped_coverage_domains_1_8_file_restore_t sigs_restore(hf, tag, re::appdata_re_dir() / "signatures.json");
+        scoped_coverage_domains_1_8_file_restore_t offsets_restore(hf, tag, ::re::appdata_re_dir() / "offsets.json");
+        scoped_coverage_domains_1_8_file_restore_t sigs_restore(hf, tag, ::re::appdata_re_dir() / "signatures.json");
         scoped_coverage_domains_1_8_temp_file_t offsets_export("aida_coverage_offsets_export.hpp");
         scoped_coverage_domains_1_8_temp_file_t sigs_export("aida_coverage_sigs_export.json");
         scoped_coverage_domains_1_8_remote_region_t fallback_region(hf, tag);

@@ -721,6 +721,9 @@ inline bool suppress_full_test_pdb_load(const char* source,
 	return true;
 }
 
+inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t base, uint64_t size,
+                                        const std::string& pdb_path);
+
 inline void load_pdb_for_module(const std::string& module_name, uint64_t base, uint64_t size)
 {
 	if (pdb_skip_active()) {

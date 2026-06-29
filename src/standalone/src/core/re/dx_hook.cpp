@@ -4377,20 +4377,6 @@ std::string classify_mesh_type(std::uint32_t index_count, std::uint32_t vertex_c
     return "unknown";
 }
 
-struct frame_tracking_state_t
-{
-    std::atomic<std::uint32_t> current_frame{0};
-    std::atomic<std::uint32_t> current_draw_ordinal{0};
-    std::atomic<std::uint64_t> frame_start_ms{0};
-    std::atomic<bool> enabled{false};
-};
-
-frame_tracking_state_t& frame_tracking_state()
-{
-    static frame_tracking_state_t state;
-    return state;
-}
-
 std::uint32_t current_frame_index(std::uint32_t /*pid*/)
 {
     return frame_tracking_state().current_frame.load(std::memory_order_acquire);
@@ -5091,15 +5077,6 @@ void arm_dx_records_for_thread(std::uint32_t pid, std::uint32_t tid)
     }
 }
 
-void clear_dx_record_breakpoints(std::uint32_t pid)
-{
-    for (const auto& record : store::list_dx_hooks(pid))
-    {
-        for (auto tid : record.tids)
-            driver_bridge::clear_hardware_breakpoint(tid, record.hw_slot);
-    }
-}
-
 void clear_dx_record_breakpoints(const store::dx_hook_record_t& record)
 {
     for (auto tid : record.tids)
@@ -5111,6 +5088,8 @@ void clear_dx_record_breakpoints(const std::vector<store::dx_hook_record_t>& rec
     for (const auto& record : records)
         clear_dx_record_breakpoints(record);
 }
+
+using ::re::dx_hook::clear_dx_record_breakpoints;
 
 std::size_t armed_thread_count_for_ids(std::uint32_t pid, const std::vector<std::string>& ids)
 {
@@ -5264,21 +5243,6 @@ bool start_dx_debug_loop(std::uint32_t pid, std::string& error)
     const DWORD gle = state.error.load(std::memory_order_acquire);
     error = "DirectX kernel context consumer failed or timed out, error=" + std::to_string(static_cast<unsigned long>(gle));
     return false;
-}
-
-void stop_dx_debug_loop(std::uint32_t pid)
-{
-    auto& state = dx_debug_state();
-    if (state.pid.load(std::memory_order_acquire) != pid)
-        return;
-    state.polling.store(false, std::memory_order_release);
-    frame_tracking_state().enabled.store(false, std::memory_order_release);
-    for (int i = 0; i < 80 && state.running.load(std::memory_order_acquire); ++i)
-    {
-        if (mcp_standalone::current_call_cancelled())
-            break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(25));
-    }
 }
 
 struct staging_watch_t
@@ -6454,6 +6418,36 @@ struct remote_com_call_t
         return GetTickCount64() >= deadline_ms;
     }
 };
+}
+
+frame_tracking_state_t& frame_tracking_state()
+{
+    static frame_tracking_state_t state;
+    return state;
+}
+
+void clear_dx_record_breakpoints(std::uint32_t pid)
+{
+    for (const auto& record : store::list_dx_hooks(pid))
+    {
+        for (auto tid : record.tids)
+            driver_bridge::clear_hardware_breakpoint(tid, record.hw_slot);
+    }
+}
+
+void stop_dx_debug_loop(std::uint32_t pid)
+{
+    auto& state = dx_debug_state();
+    if (state.pid.load(std::memory_order_acquire) != pid)
+        return;
+    state.polling.store(false, std::memory_order_release);
+    frame_tracking_state().enabled.store(false, std::memory_order_release);
+    for (int i = 0; i < 80 && state.running.load(std::memory_order_acquire); ++i)
+    {
+        if (mcp_standalone::current_call_cancelled())
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
 }
 
 tool_result_t find_device_vtable(const json& params)

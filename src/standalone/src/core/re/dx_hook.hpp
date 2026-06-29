@@ -2,8 +2,21 @@
 
 #include "re_common.hpp"
 
+#include <atomic>
+#include <cstdint>
+
 namespace re::dx_hook
 {
+struct frame_tracking_state_t {
+    std::atomic<std::uint32_t> current_frame{0};
+    std::atomic<std::uint32_t> current_draw_ordinal{0};
+    std::atomic<std::uint64_t> frame_start_ms{0};
+    std::atomic<bool> enabled{false};
+};
+frame_tracking_state_t& frame_tracking_state();
+void stop_dx_debug_loop(std::uint32_t pid);
+void clear_dx_record_breakpoints(std::uint32_t pid);
+
 tool_result_t find_device_vtable(const json& params);
 tool_result_t hook_manage(const json& params);
 tool_result_t list_bound_cbuffers(const json& params);
