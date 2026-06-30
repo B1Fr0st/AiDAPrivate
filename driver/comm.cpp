@@ -5080,7 +5080,7 @@ namespace {
         std::atomic<bool>* fired;
     };
 
-    VOID CALLBACK bounded_io_watchdog_fire(PVOID arg, BOOLEAN /*timer_or_wait_fired*/) {
+    VOID CALLBACK bounded_io_watchdog_fire(PVOID arg, BOOLEAN ) {
         auto* ctx = static_cast<bounded_io_watchdog_ctx_t*>(arg);
         if (!ctx) return;
         if (ctx->fired) ctx->fired->store(true, std::memory_order_release);
@@ -5094,7 +5094,7 @@ bool voyager::device_t::protect_memory_bounded(std::uint64_t address, std::uint6
     const ULONGLONG t0 = GetTickCount64();
     HANDLE self_thread = nullptr;
     if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(),
-            &self_thread, THREAD_TERMINATE | THREAD_SET_CONTEXT | SYNCHRONIZE | 0x0001 /*THREAD_QUERY_LIMITED_INFORMATION*/,
+            &self_thread, THREAD_TERMINATE | THREAD_SET_CONTEXT | SYNCHRONIZE | 0x0001 ,
             FALSE, 0)) {
         self_thread = nullptr;
     }

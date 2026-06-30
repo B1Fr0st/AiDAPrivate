@@ -7,7 +7,7 @@ import re
 import os
 
 WORKSPACES = [
-    r"C:\Users\ruar1337\AiDAPrivate\tools\protector",
+    r"C:\Users\ruar1337\AiDAPrivate\driver",
 ]
 
 CPP_EXTENSIONS = {'.c', '.cpp', '.h', '.hpp', '.inl', '.js'}
