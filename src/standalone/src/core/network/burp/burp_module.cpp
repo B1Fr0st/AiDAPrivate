@@ -11,6 +11,7 @@
 
 #include "payload_library.hpp"
 #include "crawler.hpp"
+#include "crawl_audit.hpp"
 #include "content_discovery.hpp"
 #include "subdomain_enum.hpp"
 
@@ -32,6 +33,9 @@
 #include "camoufox_bridge.hpp"
 #include "headless_view.hpp"
 
+#include "repeater.hpp"
+#include "decoder.hpp"
+
 #include "../../../helpers/diag_log.hpp"
 #include "../../infra/work_queue.hpp"
 
@@ -43,6 +47,12 @@ namespace burp {
 
 namespace target          { void register_target_tools(mcp_standalone::server_t&); }
 namespace collaborator_mcp{ void register_collaborator_tools(mcp_standalone::server_t&); }
+namespace crawl_audit_mcp { void register_crawl_audit_tools(mcp_standalone::server_t&); }
+namespace proxy_mcp       { void register_proxy_tools(mcp_standalone::server_t&); }
+namespace repeater_mcp    { void register_repeater_tools(mcp_standalone::server_t&); }
+namespace decoder_mcp     { void register_decoder_tools(mcp_standalone::server_t&); }
+namespace logger_mcp      { void register_logger_tools(mcp_standalone::server_t&); }
+namespace report_mcp      { void register_report_tools(mcp_standalone::server_t&); }
 namespace sequencer_mcp   { void register_sequencer_tools(mcp_standalone::server_t&); }
 namespace comparer_mcp    { void register_comparer_tools(mcp_standalone::server_t&); }
 namespace api_mcp         { void register_api_tools(mcp_standalone::server_t&); }
@@ -110,6 +120,7 @@ bool initialize()
         run_init_phase("dom_xss", []() { (void)dom_xss::initialize(); });
 
         run_init_phase("crawler", []() { (void)crawler::initialize(); });
+        run_init_phase("crawl_audit", []() { (void)crawl_audit::initialize(); });
         run_init_phase("content_discovery", []() { (void)content_discovery::initialize(); });
         run_init_phase("subdomain_enum", []() { (void)subdomain_enum::initialize(); });
 
@@ -137,6 +148,8 @@ bool initialize()
             }
         });
         run_init_phase("headless_view", []() { (void)headless_view::initialize(); });
+
+        run_init_phase("repeater", []() { (void)repeater::initialize(); });
 
         diag::log_tagged("burp_module", "initialized");
         return true;
@@ -173,6 +186,8 @@ void shutdown()
     headless_view::shutdown();
     camoufox::install::shutdown();
 
+    repeater::shutdown();
+
     upstream::shutdown();
     tech::shutdown();
     csp::shutdown();
@@ -190,6 +205,7 @@ void shutdown()
     subdomain_enum::shutdown();
     content_discovery::shutdown();
     crawler::shutdown();
+    crawl_audit::shutdown();
 
     dom_xss::shutdown();
     active_scanner::shutdown();
@@ -209,6 +225,7 @@ void register_all_tools(mcp_standalone::server_t& srv)
     register_dom_xss_tools(srv);
     register_recon_tools(srv);
     collaborator_mcp::register_collaborator_tools(srv);
+    crawl_audit_mcp::register_crawl_audit_tools(srv);
     sequencer_mcp::register_sequencer_tools(srv);
     comparer_mcp::register_comparer_tools(srv);
     register_intruder_tools(srv);
@@ -222,6 +239,11 @@ void register_all_tools(mcp_standalone::server_t& srv)
     upstream::register_upstream_tools(srv);
     tech::register_tech_tools(srv);
     register_camoufox_tools(srv);
+    proxy_mcp::register_proxy_tools(srv);
+    repeater_mcp::register_repeater_tools(srv);
+    decoder_mcp::register_decoder_tools(srv);
+    logger_mcp::register_logger_tools(srv);
+    report_mcp::register_report_tools(srv);
 }
 
 }

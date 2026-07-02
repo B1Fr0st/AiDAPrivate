@@ -6,6 +6,7 @@
 
 # Allow the specific root directories you want
 !/src/
+!/driver/
 !/server/
 !/tools/
 !/cmake/
