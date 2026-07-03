@@ -1,5 +1,44 @@
 # AiDA IDA Pro Chain Verification Engine Plan
 
+## Source Verification Status - 2026-07-03
+
+Verdict: **NOT 100% implemented. Keep this plan open.**
+
+Source evidence proves partial implementation exists:
+
+- `CMakeLists.txt` compiles chain scaffolding under `src/vuln/`: `chain_binary_corpus.cpp`, `chain_model.cpp`, `chain_report.cpp`, `chain_schema.cpp`, `chain_state.cpp`, `chain_store.cpp`, `chain_budget.cpp`, `chain_extraction.cpp`, `chain_path_trace.cpp`, `chain_side_effects.cpp`, `chain_solver.cpp`, `chain_state_contracts.cpp`, `chain_trigger_trace.cpp`, and `chain_verification_engine.cpp`.
+- `src/agent_tools.cpp` includes `vuln/chain_verification_tools.hpp` and registers `aida::vuln::chain_mcp::register_manage_tools()` during `initialize_all_tools()`.
+- `src/vuln/chain_verification_tools.hpp` registers consolidated MCP tools named `ida_chain_manage`, `ida_project_manage`, `ida_extract_manage`, `ida_report_manage`, and `ida_job_manage`.
+- `src/vuln/chain_verification_engine.cpp` implements a contract-based `aida_chain_document_v2` verifier with corpus availability checks, declared fact matching, solver obligations, boundary precondition checks, objective checks, cancellation, and optional current-IDB snapshot capture.
+- `src/vuln/chain_extraction.cpp` implements module/function extraction snapshots with `execute_sync(..., MFF_READ)`, raw instructions, xrefs, type facts, ctree, microcode status, imports, entries, and segments.
+- `src/vuln/chain_state_contracts.cpp` implements declared fact matching for value, content, alias/self-reference, object lifetime, timing, authority/control, and final objective dimensions. It blocks unproven critical facts from confirmation.
+- `src/vuln/chain_solver.cpp` evaluates explicit SMT-LIB2 obligations and maps SAT/UNSAT/UNKNOWN/TIMEOUT to chain verdicts and failure codes.
+- `src/vuln/chain_path_trace.cpp` and `src/vuln/chain_trigger_trace.cpp` provide bounded same-function path/trigger trace helpers over extracted snapshots.
+
+Source evidence also proves this plan is still incomplete:
+
+- The plan's requested MCP tool surface (`verify_vulnerability_chain`, `chain_verify_status`, `chain_verify_link`, `chain_match_boundaries`, `chain_confirm_trigger`, `chain_explain_failure`, `chain_verify_cancel`, `chain_verify_build_index`, `chain_verify_ledger_persist`) is not the registered surface. Current source registers `ida_chain_manage`, `ida_project_manage`, `ida_extract_manage`, `ida_report_manage`, and `ida_job_manage`.
+- The registered `ida_chain_manage` submit/start path in `src/vuln/chain_verification_tools.hpp` calls local `build_chain_report()` and per-link `verify_link_data()` instead of `aida::vuln::chain::engine().verify()`. The report is therefore assembled from independent link checks and boundary helpers, not from the continuous chain engine described here.
+- `build_chain_report()` can set the whole-chain verdict to `confirmed` when all independent link checks and simple boundary checks are confirmed. It does not require P0-P5/P6-style complete continuous trace proof, trigger proof, state-proven indirect calls, or collateral safety proof.
+- `ChainVerificationEngine::verify()` does not call `extract_function_snapshot()`, `trace_path_corridor()`, `trace_trigger_to_target()`, microcode transfer functions, cross-IDB peer summaries, or the MCP extraction layer. It consumes declared facts/postconditions/preconditions and explicit solver obligations from the JSON document.
+- No source file proves a full Chain IR transfer engine with instruction-by-instruction register/flag/stack/memory semantics across calls and returns. The implemented chain engine appends declared produced facts; it does not derive them from microcode execution.
+- `src/vuln/chain_path_trace.cpp` is a bounded CFG corridor over one `function_snapshot_t`; it records branch blockers and unresolved indirect edges but does not solve branch predicates or prove current-state indirect call targets.
+- `src/vuln/chain_trigger_trace.cpp` resolves trigger candidates by supplied EA/name and same-function snapshot search. It does not implement generic cross-binary API/syscall/IOCTL/callback/event/interrupt/state-machine trigger proof.
+- `src/vuln/chain_verification_engine.cpp` embeds only five synthetic regression specs in `universal_synthetic_regression_specs()`. The NTFS/ETW, AFD/_setjmp, and pvScan0 case-study gates in this plan are not encoded as complete source-level regressions.
+- The index build/status operations in `src/vuln/chain_verification_tools.hpp` mark generic indices such as functions, segments, imports, entries, and verifier status. They do not implement the plan's `chain_verification_engine` index surface.
+- `src/vuln/chain_store.cpp` implements a netnode-backed chain report store, but the registered report ledger operations in `src/vuln/chain_verification_tools.hpp` call the old `verify::engine().persist_ledger()` path, not the chain store.
+- Source search shows `src/vuln/chain_path_trace.cpp` refers to `instruction_fact` while `src/vuln/chain_extraction.hpp` declares `instruction_fact_t`; without a source-visible alias, the path tracer is not proven build-clean from source inspection alone.
+
+Remaining work required before this plan can be deleted:
+
+1. Wire the registered MCP submit/start path to the production chain engine or replace the local per-link report builder with the continuous chain verifier.
+2. Implement the full Chain IR transfer engine that derives facts from raw/microcode execution instead of trusting declared postconditions.
+3. Integrate extraction, path tracing, trigger tracing, branch SMT proof, indirect-call proof, side-effect classification, boundary matching, and objective proof into one continuous state trace.
+4. Implement cross-binary and cross-IDB module binding with stale-peer rejection and resumable peer failures.
+5. Add deterministic report/resource output for every branch, call, write, side effect, assumption gap, and solver query.
+6. Add complete regression coverage for the NTFS/ETW, AFD/_setjmp, corrected AFD address-discovery, bad pvScan0, and corrected pvScan0 cases.
+7. Ensure all chain verifier compiled sources are source-consistent and build-clean before claiming completion.
+
 ## Objective
 
 Design a production-grade core engine that verifies a vulnerability chain as one continuous execution trace across every involved binary, instead of verifying isolated links. The engine must prove or refute whether the exact state produced by link N satisfies the exact state required by link N+1, while also discovering hidden intermediate checks, branch requirements, indirect-call target mismatches, trigger gaps, and collateral side effects.

@@ -39,14 +39,19 @@ struct value_expr_t
     std::string kind = "unknown";
     std::string text;
     std::string value_origin = "unknown";
+    std::string address_expr;
+    std::string alias_class;
+    std::string type_ref;
     std::uint32_t width_bits = 0;
+    std::uint64_t provenance_ea = 0;
     address_identity_t location;
     bool concrete = false;
     std::uint64_t concrete_value = 0;
     std::string confidence = "inconclusive";
+    bool controlled_by_input = false;
 };
 
-struct side_effect_t
+struct extracted_side_effect_t
 {
     side_effect_kind_t kind = side_effect_kind_t::unknown;
     address_identity_t location;
@@ -62,11 +67,11 @@ struct side_effect_t
     std::vector<std::string> tags;
 };
 
-std::vector<side_effect_t> classify_side_effects(const function_snapshot_t& snapshot);
+std::vector<extracted_side_effect_t> classify_side_effects(const function_snapshot_t& snapshot);
 
 nlohmann::json to_json(side_effect_kind_t kind);
 nlohmann::json to_json(const value_expr_t& value);
-nlohmann::json to_json(const side_effect_t& effect);
+nlohmann::json to_json(const extracted_side_effect_t& effect);
 
 }
 }

@@ -19,7 +19,7 @@ namespace vuln
 namespace chain
 {
 
-struct corpus_record_t
+struct verification_corpus_record_t
 {
     std::string corpus_id;
     std::string kind;
@@ -30,7 +30,7 @@ struct corpus_record_t
     bool chain_critical = true;
 };
 
-struct module_snapshot_t
+struct verification_module_snapshot_t
 {
     std::string snapshot_id;
     std::string root_filename;
@@ -48,7 +48,7 @@ struct module_snapshot_t
     std::string error;
 };
 
-struct path_job_t
+struct verification_path_job_t
 {
     std::string job_id;
     std::string link_id;
@@ -59,7 +59,7 @@ struct path_job_t
     std::vector<state_contract_t> side_effect_obligations;
 };
 
-struct chain_link_t
+struct verification_chain_link_t
 {
     std::string link_id;
     std::string role;
@@ -67,25 +67,25 @@ struct chain_link_t
     std::vector<state_contract_t> preconditions;
     std::vector<chain_fact_t> produced_facts;
     std::vector<solver_obligation_t> solver_obligations;
-    path_job_t path_job;
+    verification_path_job_t path_job;
 };
 
-struct normalized_chain_document_t
+struct verification_document_t
 {
     std::string schema;
     std::string chain_id;
     std::string title;
     nlohmann::json target = nlohmann::json::object();
-    std::vector<corpus_record_t> corpus;
+    std::vector<verification_corpus_record_t> corpus;
     std::vector<chain_fact_t> initial_facts;
-    std::vector<chain_link_t> links;
+    std::vector<verification_chain_link_t> links;
     std::vector<state_contract_t> objectives;
     nlohmann::json policies = nlohmann::json::object();
     nlohmann::json raw = nlohmann::json::object();
     std::string document_hash;
 };
 
-struct chain_verification_request_t
+struct verification_request_t
 {
     nlohmann::json document = nlohmann::json::object();
     budget_limits_t limits;
@@ -94,7 +94,7 @@ struct chain_verification_request_t
     bool capture_idb_snapshot = false;
 };
 
-struct link_report_t
+struct verification_link_report_t
 {
     std::string link_id;
     chain_verdict_t verdict = chain_verdict_t::inconclusive;
@@ -108,7 +108,7 @@ struct link_report_t
     std::vector<failure_code_t> failures;
 };
 
-struct boundary_report_t
+struct verification_boundary_report_t
 {
     std::string producer_link;
     std::string consumer_link;
@@ -116,7 +116,7 @@ struct boundary_report_t
     contract_evaluation_t requirements;
 };
 
-struct objective_report_t
+struct verification_objective_report_t
 {
     std::string objective_id;
     chain_verdict_t verdict = chain_verdict_t::inconclusive;
@@ -125,7 +125,7 @@ struct objective_report_t
     nlohmann::json operation_evidence = nlohmann::json::object();
 };
 
-struct chain_report_t
+struct verification_report_t
 {
     std::string report_id;
     std::string chain_id;
@@ -133,12 +133,12 @@ struct chain_report_t
     chain_verdict_t verdict = chain_verdict_t::inconclusive;
     proof_level_t proof_level = proof_level_t::none;
     job_record_t job;
-    module_snapshot_t module_snapshot;
+    verification_module_snapshot_t module_snapshot;
     std::vector<failure_code_t> failures;
-    std::vector<link_report_t> links;
-    std::vector<boundary_report_t> boundaries;
-    std::vector<objective_report_t> objectives;
-    trace_state_t final_state;
+    std::vector<verification_link_report_t> links;
+    std::vector<verification_boundary_report_t> boundaries;
+    std::vector<verification_objective_report_t> objectives;
+    contract_trace_state_t final_state;
     nlohmann::json diagnostics = nlohmann::json::object();
 };
 
@@ -151,12 +151,12 @@ public:
     ChainVerificationEngine(const ChainVerificationEngine&) = delete;
     ChainVerificationEngine& operator=(const ChainVerificationEngine&) = delete;
 
-    chain_report_t verify(const chain_verification_request_t& request);
+    verification_report_t verify(const verification_request_t& request);
     bool normalize_document(const nlohmann::json& input,
-                            normalized_chain_document_t& out,
+                            verification_document_t& out,
                             std::vector<failure_code_t>& failures,
                             std::string& error) const;
-    module_snapshot_t capture_current_idb_snapshot() const;
+    verification_module_snapshot_t capture_current_idb_snapshot() const;
     void cancel();
     size_t solver_cache_size() const;
     void clear_solver_cache();
@@ -169,16 +169,16 @@ private:
 ChainVerificationEngine& engine();
 std::vector<nlohmann::json> universal_synthetic_regression_specs();
 
-nlohmann::json to_json(const corpus_record_t& corpus);
-nlohmann::json to_json(const module_snapshot_t& snapshot);
-nlohmann::json to_json(const path_job_t& job);
-nlohmann::json to_json(const chain_link_t& link);
-nlohmann::json to_json(const normalized_chain_document_t& document);
-nlohmann::json to_json(const chain_verification_request_t& request);
-nlohmann::json to_json(const link_report_t& report);
-nlohmann::json to_json(const boundary_report_t& report);
-nlohmann::json to_json(const objective_report_t& report);
-nlohmann::json to_json(const chain_report_t& report);
+nlohmann::json to_json(const verification_corpus_record_t& corpus);
+nlohmann::json to_json(const verification_module_snapshot_t& snapshot);
+nlohmann::json to_json(const verification_path_job_t& job);
+nlohmann::json to_json(const verification_chain_link_t& link);
+nlohmann::json to_json(const verification_document_t& document);
+nlohmann::json to_json(const verification_request_t& request);
+nlohmann::json to_json(const verification_link_report_t& report);
+nlohmann::json to_json(const verification_boundary_report_t& report);
+nlohmann::json to_json(const verification_objective_report_t& report);
+nlohmann::json to_json(const verification_report_t& report);
 
 }
 }

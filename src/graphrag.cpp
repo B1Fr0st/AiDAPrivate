@@ -131,6 +131,47 @@ static bool has_any(const std::vector<std::string>& vec, const std::set<std::str
     return false;
 }
 
+static bool rva_from_ea(ea_t addr, uint64_t& rva)
+{
+    if (addr == BADADDR)
+        return false;
+    const ea_t base = static_cast<ea_t>(get_imagebase());
+    if (base == BADADDR || base == 0 || addr < base)
+        return false;
+    rva = static_cast<uint64_t>(addr - base);
+    return true;
+}
+
+static GraphStore::addr_key_t make_addr_key(const std::string& module_key, node_type_t type, ea_t addr, bool prefer_rva, uint64_t supplied_rva)
+{
+    GraphStore::addr_key_t key;
+    key.binary_hash = module_key;
+    key.type = type;
+    key.has_rva = prefer_rva;
+    key.canonical_addr = prefer_rva ? supplied_rva : static_cast<uint64_t>(addr);
+    return key;
+}
+
+static void normalize_graph_node_identity(graph_node_t& node)
+{
+    if (node.module_id.empty())
+        node.module_id = node.binary_hash;
+    if (node.binary_hash.empty())
+        node.binary_hash = node.module_id;
+    uint64_t computed = 0;
+    if (!node.has_rva && rva_from_ea(node.address, computed))
+    {
+        node.rva = computed;
+        node.has_rva = true;
+    }
+    if (node.has_rva)
+    {
+        std::ostringstream ss;
+        ss << node.binary_hash << "+0x" << std::hex << std::nouppercase << node.rva;
+        node.address_key = ss.str();
+    }
+}
+
 
 float VectorStore::dot_product(const float* a, const float* b, int n)
 {
@@ -1259,9 +1300,15 @@ graph_node_t* GraphStore::upsert_node(graph_node_t node)
 {
     std::lock_guard<std::mutex> lk(m_mtx);
 
+    normalize_graph_node_identity(node);
 
-    addr_key_t key{node.binary_hash, node.node_type, node.address};
+    addr_key_t key = make_addr_key(node.binary_hash, node.node_type, node.address, node.has_rva, node.rva);
     auto it = m_addr_index.find(key);
+    if (it == m_addr_index.end() && node.has_rva)
+    {
+        addr_key_t legacy = make_addr_key(node.binary_hash, node.node_type, node.address, false, 0);
+        it = m_addr_index.find(legacy);
+    }
 
     uint64_t ts = now_ms();
 
@@ -1290,6 +1337,8 @@ graph_node_t* GraphStore::upsert_node(graph_node_t node)
         if (node.confidence > 0) existing.confidence = node.confidence;
         existing.is_stale = node.is_stale;
         existing.updated_at = ts;
+        normalize_graph_node_identity(existing);
+        m_addr_index[make_addr_key(existing.binary_hash, existing.node_type, existing.address, existing.has_rva, existing.rva)] = existing.id;
         index_add_node_locked(existing);
         m_dirty_nodes[existing.binary_hash].insert(existing.id);
         if (m_nodes.size() > 10000)
@@ -1321,9 +1370,14 @@ graph_node_t* GraphStore::get_node(int id)
 graph_node_t* GraphStore::get_node_by_address(const std::string& binary_hash, node_type_t type, ea_t addr)
 {
     std::lock_guard<std::mutex> lk(m_mtx);
-    addr_key_t key{binary_hash, type, addr};
+    uint64_t rva = 0;
+    const bool has_rva = rva_from_ea(addr, rva);
+    addr_key_t key = make_addr_key(binary_hash, type, addr, has_rva, rva);
     auto it = m_addr_index.find(key);
-    if (it == m_addr_index.end()) return nullptr;
+    if (it == m_addr_index.end() && has_rva)
+        it = m_addr_index.find(make_addr_key(binary_hash, type, addr, false, 0));
+    if (it == m_addr_index.end())
+        return nullptr;
     auto nit = m_nodes.find(it->second);
     return nit != m_nodes.end() ? &nit->second : nullptr;
 }
@@ -1693,8 +1747,11 @@ void GraphStore::delete_graph(const std::string& binary_hash)
         if (nit->second.binary_hash == binary_hash)
         {
             index_remove_node_locked(nit->second.id);
-            addr_key_t key{binary_hash, nit->second.node_type, nit->second.address};
+            normalize_graph_node_identity(nit->second);
+            addr_key_t key = make_addr_key(binary_hash, nit->second.node_type, nit->second.address, nit->second.has_rva, nit->second.rva);
             m_addr_index.erase(key);
+            if (nit->second.has_rva)
+                m_addr_index.erase(make_addr_key(binary_hash, nit->second.node_type, nit->second.address, false, 0));
             nit = m_nodes.erase(nit);
         }
         else ++nit;
@@ -1995,8 +2052,9 @@ bool GraphStore::load_from_file(const std::string& path)
             for (auto& nj : j["nodes"])
             {
                 graph_node_t n = nj.get<graph_node_t>();
+                normalize_graph_node_identity(n);
                 int id = n.id;
-                addr_key_t key{n.binary_hash, n.node_type, n.address};
+                addr_key_t key = make_addr_key(n.binary_hash, n.node_type, n.address, n.has_rva, n.rva);
                 m_addr_index[key] = id;
                 m_nodes[id] = std::move(n);
                 index_add_node_locked(m_nodes[id]);

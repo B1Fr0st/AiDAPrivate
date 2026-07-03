@@ -161,7 +161,7 @@ std::string fact_value_identity(const chain_fact_t& fact)
     return value_as_identity(fact.value);
 }
 
-std::string find_state_value(const trace_state_t& state,
+std::string find_state_value(const contract_trace_state_t& state,
                              const std::string& subject,
                              const std::vector<std::string>& predicates)
 {
@@ -207,7 +207,7 @@ chain_verdict_t verdict_for_budget(budget_exhaustion_t exhaustion)
 
 struct idb_snapshot_request_t : exec_request_t
 {
-    module_snapshot_t snapshot;
+    verification_module_snapshot_t snapshot;
 
     ssize_t idaapi execute() override
     {
@@ -277,7 +277,7 @@ ChainVerificationEngine::ChainVerificationEngine()
 ChainVerificationEngine::~ChainVerificationEngine() = default;
 
 bool ChainVerificationEngine::normalize_document(const nlohmann::json& input,
-                                                 normalized_chain_document_t& out,
+                                                 verification_document_t& out,
                                                  std::vector<failure_code_t>& failures,
                                                  std::string& error) const
 {
@@ -324,7 +324,7 @@ bool ChainVerificationEngine::normalize_document(const nlohmann::json& input,
     std::unordered_set<std::string> corpus_ids;
     for (const auto& item : input.at("corpus"))
     {
-        corpus_record_t corpus;
+        verification_corpus_record_t corpus;
         corpus.corpus_id = read_string(item, "corpus_id", read_string(item, "id"));
         corpus.kind = read_string(item, "kind", "binary");
         corpus.identity = item.contains("identity") ? item.at("identity") : nlohmann::json::object();
@@ -366,7 +366,7 @@ bool ChainVerificationEngine::normalize_document(const nlohmann::json& input,
             error = "each link must be an object";
             return false;
         }
-        chain_link_t link;
+        verification_chain_link_t link;
         link.raw = item;
         link.link_id = read_string(item, "link_id", read_string(item, "id"));
         if (link.link_id.empty())
@@ -409,7 +409,7 @@ bool ChainVerificationEngine::normalize_document(const nlohmann::json& input,
     return true;
 }
 
-module_snapshot_t ChainVerificationEngine::capture_current_idb_snapshot() const
+verification_module_snapshot_t ChainVerificationEngine::capture_current_idb_snapshot() const
 {
     idb_snapshot_request_t req;
     const ssize_t rc = execute_sync(req, MFF_READ);
@@ -421,9 +421,9 @@ module_snapshot_t ChainVerificationEngine::capture_current_idb_snapshot() const
 namespace
 {
 
-contract_evaluation_t evaluate_side_effects(const trace_state_t& state,
-                                            const chain_link_t& link,
-                                            link_report_t& report)
+contract_evaluation_t evaluate_side_effects(const contract_trace_state_t& state,
+                                            const verification_chain_link_t& link,
+                                            verification_link_report_t& report)
 {
     contract_evaluation_t eval = match_contracts(state, link.path_job.side_effect_obligations, proof_level_t::p2_link_obligations);
     for (const nlohmann::json& item : json_array_or_empty(link.raw, {"side_effects", "side_effect_obligations"}))
@@ -452,9 +452,9 @@ contract_evaluation_t evaluate_side_effects(const trace_state_t& state,
     return eval;
 }
 
-objective_report_t evaluate_objective(const trace_state_t& state, const state_contract_t& objective)
+verification_objective_report_t evaluate_objective(const contract_trace_state_t& state, const state_contract_t& objective)
 {
-    objective_report_t out;
+    verification_objective_report_t out;
     out.objective_id = objective.contract_id;
     out.match = match_contract(state, objective);
     out.verdict = out.match.verdict;
@@ -541,9 +541,9 @@ objective_report_t evaluate_objective(const trace_state_t& state, const state_co
     return out;
 }
 
-void seal_report_job(chain_report_t& report,
-                     const chain_verification_request_t& request,
-                     const normalized_chain_document_t& document,
+void seal_report_job(verification_report_t& report,
+                     const verification_request_t& request,
+                     const verification_document_t& document,
                      const budget_state_t& budget)
 {
     report.job.chain_id = document.chain_id;
@@ -565,13 +565,13 @@ void seal_report_job(chain_report_t& report,
 
 }
 
-chain_report_t ChainVerificationEngine::verify(const chain_verification_request_t& request)
+verification_report_t ChainVerificationEngine::verify(const verification_request_t& request)
 {
-    normalized_chain_document_t document;
+    verification_document_t document;
     std::vector<failure_code_t> normalization_failures;
     std::string normalization_error;
 
-    chain_report_t report;
+    verification_report_t report;
     report.job.started_ms = now_ms();
 
     if (!normalize_document(request.document, document, normalization_failures, normalization_error))
@@ -610,7 +610,7 @@ chain_report_t ChainVerificationEngine::verify(const chain_verification_request_
     }
 
     report.proof_level = proof_level_t::p1_corpus;
-    for (const corpus_record_t& corpus : document.corpus)
+    for (const verification_corpus_record_t& corpus : document.corpus)
     {
         if (corpus.chain_critical && !accepted_corpus_availability(corpus.availability))
         {
@@ -619,7 +619,7 @@ chain_report_t ChainVerificationEngine::verify(const chain_verification_request_
         }
     }
 
-    trace_state_t state = make_trace_state(document.initial_facts);
+    contract_trace_state_t state = make_trace_state(document.initial_facts);
     if (budget.cancelled(token))
     {
         add_failure(report.failures, failure_code_t::resource_exhausted);
@@ -639,8 +639,8 @@ chain_report_t ChainVerificationEngine::verify(const chain_verification_request_
             break;
         }
 
-        const chain_link_t& link = document.links[i];
-        link_report_t link_report;
+        const verification_chain_link_t& link = document.links[i];
+        verification_link_report_t link_report;
         link_report.link_id = link.link_id;
         link_report.proof_level = proof_level_t::p2_link_obligations;
         link_report.verdict = chain_verdict_t::confirmed;
@@ -670,7 +670,7 @@ chain_report_t ChainVerificationEngine::verify(const chain_verification_request_
 
         if (i > 0)
         {
-            boundary_report_t boundary;
+            verification_boundary_report_t boundary;
             boundary.producer_link = document.links[i - 1].link_id;
             boundary.consumer_link = link.link_id;
             boundary.requirements = link_report.preconditions;
@@ -714,7 +714,7 @@ chain_report_t ChainVerificationEngine::verify(const chain_verification_request_
     report.proof_level = proof_level_t::p4_objective_semantics;
     for (const state_contract_t& objective : document.objectives)
     {
-        objective_report_t objective_report = evaluate_objective(state, objective);
+        verification_objective_report_t objective_report = evaluate_objective(state, objective);
         report.verdict = combine_verdict(report.verdict, objective_report.verdict);
         if (objective_report.failure != failure_code_t::none)
             add_failure(report.failures, objective_report.failure);
@@ -814,7 +814,7 @@ std::vector<nlohmann::json> universal_synthetic_regression_specs()
     return specs;
 }
 
-nlohmann::json to_json(const corpus_record_t& corpus)
+nlohmann::json to_json(const verification_corpus_record_t& corpus)
 {
     return nlohmann::json{
         {"corpus_id", corpus.corpus_id},
@@ -827,7 +827,7 @@ nlohmann::json to_json(const corpus_record_t& corpus)
     };
 }
 
-nlohmann::json to_json(const module_snapshot_t& snapshot)
+nlohmann::json to_json(const verification_module_snapshot_t& snapshot)
 {
     return nlohmann::json{
         {"snapshot_id", snapshot.snapshot_id},
@@ -847,7 +847,7 @@ nlohmann::json to_json(const module_snapshot_t& snapshot)
     };
 }
 
-nlohmann::json to_json(const path_job_t& job)
+nlohmann::json to_json(const verification_path_job_t& job)
 {
     nlohmann::json branches = nlohmann::json::array();
     for (const auto& item : job.branch_obligations)
@@ -872,7 +872,7 @@ nlohmann::json to_json(const path_job_t& job)
     };
 }
 
-nlohmann::json to_json(const chain_link_t& link)
+nlohmann::json to_json(const verification_chain_link_t& link)
 {
     nlohmann::json pre = nlohmann::json::array();
     for (const auto& item : link.preconditions)
@@ -893,7 +893,7 @@ nlohmann::json to_json(const chain_link_t& link)
     };
 }
 
-nlohmann::json to_json(const normalized_chain_document_t& document)
+nlohmann::json to_json(const verification_document_t& document)
 {
     nlohmann::json corpus = nlohmann::json::array();
     for (const auto& item : document.corpus)
@@ -921,7 +921,7 @@ nlohmann::json to_json(const normalized_chain_document_t& document)
     };
 }
 
-nlohmann::json to_json(const chain_verification_request_t& request)
+nlohmann::json to_json(const verification_request_t& request)
 {
     return nlohmann::json{
         {"document", request.document},
@@ -931,7 +931,7 @@ nlohmann::json to_json(const chain_verification_request_t& request)
     };
 }
 
-nlohmann::json to_json(const link_report_t& report)
+nlohmann::json to_json(const verification_link_report_t& report)
 {
     nlohmann::json facts = nlohmann::json::array();
     for (const auto& item : report.produced_facts)
@@ -953,7 +953,7 @@ nlohmann::json to_json(const link_report_t& report)
     };
 }
 
-nlohmann::json to_json(const boundary_report_t& report)
+nlohmann::json to_json(const verification_boundary_report_t& report)
 {
     return nlohmann::json{
         {"producer_link", report.producer_link},
@@ -963,7 +963,7 @@ nlohmann::json to_json(const boundary_report_t& report)
     };
 }
 
-nlohmann::json to_json(const objective_report_t& report)
+nlohmann::json to_json(const verification_objective_report_t& report)
 {
     return nlohmann::json{
         {"objective_id", report.objective_id},
@@ -974,7 +974,7 @@ nlohmann::json to_json(const objective_report_t& report)
     };
 }
 
-nlohmann::json to_json(const chain_report_t& report)
+nlohmann::json to_json(const verification_report_t& report)
 {
     nlohmann::json failures = nlohmann::json::array();
     for (failure_code_t code : report.failures)

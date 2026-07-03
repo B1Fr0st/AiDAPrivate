@@ -2,6 +2,11 @@
 
 #include "../aida_pro.hpp"
 #include "../agent_tools.hpp"
+#include "../multibinary_index.hpp"
+#include "../multibinary_project.hpp"
+#include "chain_extraction.hpp"
+#include "chain_path_trace.hpp"
+#include "chain_verifier.hpp"
 #include "verification_engine.hpp"
 
 #include <auto.hpp>
@@ -26,6 +31,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <deque>
 #include <functional>
 #include <iomanip>
 #include <map>
@@ -35,6 +41,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -212,6 +219,16 @@ std::string basename_of(const std::string& path)
     return p == std::string::npos ? path : path.substr(p + 1);
 }
 
+std::string lowercase_ascii(std::string value)
+{
+    for (char& c : value)
+    {
+        if (c >= 'A' && c <= 'Z')
+            c = static_cast<char>(c + ('a' - 'A'));
+    }
+    return value;
+}
+
 std::string input_path()
 {
     char path[4096] = {};
@@ -278,20 +295,23 @@ std::string generation_id()
 
 json module_identity()
 {
-    const std::string in = input_path();
-    const std::string sha = input_sha256();
-    const ea_t imagebase = static_cast<ea_t>(get_imagebase());
+    aida::vuln::chain::corpus_record_t corpus = aida::vuln::chain::snapshot_current_idb_corpus();
     json m;
-    m["module_id"] = (sha.empty() ? hash_text(in) : sha) + ":" + fmt_ea(imagebase) + ":" + basename_of(in);
-    m["input_file"] = in;
-    m["input_basename"] = basename_of(in);
-    m["input_md5"] = input_md5();
-    m["input_sha256"] = sha;
-    m["imagebase"] = fmt_ea(imagebase);
-    m["min_ea"] = fmt_ea(inf_get_min_ea());
-    m["max_ea"] = fmt_ea(inf_get_max_ea());
-    m["processor"] = processor_name();
-    m["bitness"] = bitness();
+    m["module_id"] = corpus.identity.corpus_id;
+    m["corpus_id"] = corpus.identity.corpus_id;
+    m["canonical_name"] = corpus.identity.canonical_name;
+    m["input_file"] = corpus.identity.input_path;
+    m["input_path"] = corpus.identity.input_path;
+    m["input_basename"] = basename_of(corpus.identity.input_path);
+    m["idb_path"] = corpus.identity.idb_path;
+    m["input_md5"] = corpus.identity.hashes.md5;
+    m["input_sha256"] = corpus.identity.hashes.sha256;
+    m["imagebase"] = fmt_ea(static_cast<ea_t>(corpus.identity.image_base));
+    m["image_base"] = fmt_ea(static_cast<ea_t>(corpus.identity.image_base));
+    m["min_ea"] = fmt_ea(static_cast<ea_t>(corpus.identity.min_ea));
+    m["max_ea"] = fmt_ea(static_cast<ea_t>(corpus.identity.max_ea));
+    m["processor"] = corpus.identity.processor;
+    m["bitness"] = corpus.identity.bitness;
     m["address_model"] = "module_id+rva";
     m["generation"] = generation_id();
     return m;
@@ -1001,6 +1021,205 @@ json page_vector(const request_ctx_t& ctx, const std::string& op, const json& fu
     return out;
 }
 
+std::string pointer_escape(const std::string& key)
+{
+    std::string out;
+    out.reserve(key.size());
+    for (char c : key)
+    {
+        if (c == '~')
+            out += "~0";
+        else if (c == '/')
+            out += "~1";
+        else
+            out.push_back(c);
+    }
+    return out;
+}
+
+std::string hex_encode_text(const std::string& text)
+{
+    static const char* h = "0123456789abcdef";
+    std::string out;
+    out.reserve(text.size() * 2);
+    for (unsigned char c : text)
+    {
+        out.push_back(h[(c >> 4) & 0x0f]);
+        out.push_back(h[c & 0x0f]);
+    }
+    return out;
+}
+
+bool hex_decode_text(const std::string& hex, std::string& out)
+{
+    auto nibble = [](char c) -> int {
+        if (c >= '0' && c <= '9')
+            return c - '0';
+        if (c >= 'a' && c <= 'f')
+            return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F')
+            return c - 'A' + 10;
+        return -1;
+    };
+    if ((hex.size() & 1u) != 0)
+        return false;
+    out.clear();
+    out.reserve(hex.size() / 2);
+    for (std::size_t i = 0; i < hex.size(); i += 2)
+    {
+        const int hi = nibble(hex[i]);
+        const int lo = nibble(hex[i + 1]);
+        if (hi < 0 || lo < 0)
+            return false;
+        out.push_back(static_cast<char>((hi << 4) | lo));
+    }
+    return true;
+}
+
+std::string nested_cursor_for(const std::string& op, const std::string& generation, const std::string& path, size_t offset)
+{
+    return "ac2." + op + "." + generation + "." + std::to_string(offset) + "." + hex_encode_text(path);
+}
+
+bool parse_nested_cursor(const std::string& cursor, const std::string& op, const std::string& generation, std::string& path, size_t& offset)
+{
+    offset = 0;
+    path.clear();
+    const std::string prefix = "ac2." + op + "." + generation + ".";
+    if (cursor.rfind(prefix, 0) != 0)
+        return false;
+    const std::string rest = cursor.substr(prefix.size());
+    const std::size_t dot = rest.find('.');
+    if (dot == std::string::npos)
+        return false;
+    const std::string n = rest.substr(0, dot);
+    const std::string encoded = rest.substr(dot + 1);
+    char* endp = nullptr;
+    unsigned long long parsed = _strtoui64(n.c_str(), &endp, 10);
+    if (endp == n.c_str() || *endp != '\0')
+        return false;
+    offset = static_cast<size_t>(parsed);
+    return hex_decode_text(encoded, path);
+}
+
+json* json_at_pointer(json& root, const std::string& path)
+{
+    if (path.empty())
+        return nullptr;
+    try
+    {
+        return &root.at(json::json_pointer(path));
+    }
+    catch (...)
+    {
+        return nullptr;
+    }
+}
+
+json page_array_slice(const json& full, size_t offset, size_t limit)
+{
+    json out = json::array();
+    if (!full.is_array())
+        return out;
+    const size_t total = full.size();
+    const size_t end = std::min(total, offset + limit);
+    for (size_t i = offset; i < end; ++i)
+        out.push_back(full.at(i));
+    return out;
+}
+
+void cap_nested_arrays(json& node,
+                       const std::string& path,
+                       size_t limit,
+                       const std::string& op,
+                       const std::string& generation,
+                       json& nested,
+                       size_t& capped_count)
+{
+    if (node.is_array())
+    {
+        const size_t total = node.size();
+        if (total > limit)
+        {
+            node = page_array_slice(node, 0, limit);
+            nested.push_back({{"path", path},
+                              {"cursor", nullptr},
+                              {"next_cursor", nested_cursor_for(op, generation, path, limit)},
+                              {"limit", limit},
+                              {"returned", node.size()},
+                              {"total_known", total},
+                              {"truncated", true}});
+            ++capped_count;
+        }
+        for (size_t i = 0; i < node.size(); ++i)
+            cap_nested_arrays(node[i], path + "/" + std::to_string(i), limit, op, generation, nested, capped_count);
+        return;
+    }
+    if (!node.is_object())
+        return;
+    for (auto it = node.begin(); it != node.end(); ++it)
+        cap_nested_arrays(it.value(), path + "/" + pointer_escape(it.key()), limit, op, generation, nested, capped_count);
+}
+
+bool apply_nested_pagination(const request_ctx_t& ctx,
+                             const std::string& op,
+                             json& data,
+                             const std::string& default_path,
+                             json& page)
+{
+    const std::string gen = generation_id();
+    std::string path = ctx.payload.value("page_path", std::string());
+    size_t offset = 0;
+    if (!ctx.cursor.empty())
+    {
+        if (ctx.cursor.rfind("ac2.", 0) == 0)
+        {
+            if (!parse_nested_cursor(ctx.cursor, op, gen, path, offset))
+            {
+                page = json::object({{"error", "cursor_expired"}});
+                return false;
+            }
+        }
+        else if (!path.empty())
+        {
+            if (!parse_cursor(ctx.cursor, op, gen, offset))
+            {
+                page = json::object({{"error", "cursor_expired"}});
+                return false;
+            }
+        }
+    }
+    if (path.empty())
+        path = default_path;
+    if (!path.empty())
+    {
+        json* target = json_at_pointer(data, path);
+        if (target == nullptr || !target->is_array())
+        {
+            page = json::object({{"error", "bad_page_path"}, {"path", path}});
+            return false;
+        }
+        const size_t total = target->size();
+        const size_t limit = static_cast<size_t>(ctx.limit);
+        *target = page_array_slice(*target, offset, limit);
+        const bool truncated = offset + target->size() < total;
+        page = page_json(ctx.cursor, truncated ? nested_cursor_for(op, gen, path, offset + target->size()) : std::string(), ctx.limit, target->size(), truncated);
+        page["path"] = path;
+        page["total_known"] = total;
+        return true;
+    }
+    json nested = json::array();
+    size_t capped_count = 0;
+    cap_nested_arrays(data, std::string(), static_cast<size_t>(ctx.limit), op, gen, nested, capped_count);
+    page = json::object({{"cursor", ctx.cursor.empty() ? json(nullptr) : json(ctx.cursor)},
+                         {"next_cursor", nullptr},
+                         {"limit", ctx.limit},
+                         {"returned", nullptr},
+                         {"truncated", !nested.empty()},
+                         {"nested", std::move(nested)}});
+    return true;
+}
+
 agent_tools::tool_result_t invoke_registered(const std::string& tool_name, const json& params)
 {
     return agent_tools::ToolRegistry::instance().execute_tool(tool_name, params);
@@ -1565,12 +1784,23 @@ const std::vector<operation_meta_t>& project_ops()
     static const std::vector<operation_meta_t> ops = {
         {"capabilities", "Return project, corpus, and index operation schemas.", true, false, true, false, "schema", 500, 2000, {}, {}, false},
         {"inventory_current", "Return deterministic current-IDB inventory with module identity, hashes, segments, imports, entries, and counts.", true, false, true, false, "none", 500, 5000, {}, {{"include_segments", "boolean", false, {}}, {"include_imports", "boolean", false, {}}, {"include_entries", "boolean", false, {}}, {"max_rows", "number", false, {}}}, false},
-        {"inventory_all", "Return local inventory and a structured fan-out recipe for the existing query_all_instances aggregator.", true, false, false, false, "none", 1000, 30000, {}, {{"include_segments", "boolean", false, {}}, {"include_imports", "boolean", false, {}}, {"include_entries", "boolean", false, {}}, {"max_rows", "number", false, {}}}, false},
-        {"corpus_snapshot", "Return the active corpus manifest snapshot, defaulting to the current module.", true, false, true, false, "corpus", 500, 5000, {}, {}, false},
-        {"corpus_bind", "Bind supplied modules or the current module into plugin-owned corpus state.", false, false, false, false, "corpus", 1000, 10000, {}, {{"modules", "array", false, {}}, {"corpus_id", "string", false, {}}, {"role", "string", false, {}}}, false},
-        {"corpus_export", "Export the plugin-owned corpus manifest.", true, false, true, false, "corpus", 500, 5000, {}, {{"format", "string", false, {"json"}}}, false},
-        {"index_build", "Build plugin-owned index snapshots for functions, segments, imports, entries, and verifier status.", false, false, false, true, "index", 30000, 600000, {}, {{"indices", "array", false, {}}, {"force", "boolean", false, {}}}, false},
-        {"index_status", "Return index readiness, coverage, generation, and stale-state diagnostics.", true, false, false, false, "index", 500, 5000, {}, {{"indices", "array", false, {}}}, false}
+        {"inventory_all", "Merge supplied query_all_instances inventory responses when present; otherwise return local inventory plus fail-closed peer_data_missing gaps for live peers that were not supplied.", true, false, false, false, "none", 1000, 30000, {}, {{"include_segments", "boolean", false, {}}, {"include_imports", "boolean", false, {}}, {"include_entries", "boolean", false, {}}, {"max_rows", "number", false, {}}, {"fanout_result", "object", false, {}}, {"inventories", "array", false, {}}}, true},
+        {"list", "List durable multibinary projects under the IDA user directory.", true, false, true, false, "project", 500, 5000, {}, {}, false},
+        {"load", "Load one durable project manifest and module records.", true, false, true, false, "project", 500, 10000, {}, {{"project_id", "string", true, {}}}, false},
+        {"save", "Create or update a durable project from supplied module records or inventory/fanout data.", false, false, false, true, "project", 1000, 60000, {}, {{"project_id", "string", false, {}}, {"modules", "array", false, {}}, {"fanout_result", "object", false, {}}, {"inventories", "array", false, {}}, {"force_lock", "boolean", false, {}}}, true},
+        {"delete", "Delete one durable project after explicit confirmation.", false, true, false, false, "project", 1000, 30000, {}, {{"project_id", "string", true, {}}, {"confirm_destructive", "boolean", true, {}}, {"reason", "string", true, {}}}, false},
+        {"status", "Return durable project manifest, cache, generation, stale-state, and cross-edge readiness.", true, false, false, false, "project", 500, 10000, {}, {{"project_id", "string", false, {}}}, false},
+        {"corpus_snapshot", "Return a durable project manifest when project_id is supplied, otherwise the current module corpus record.", true, false, true, false, "corpus", 500, 5000, {}, {{"project_id", "string", false, {}}}, false},
+        {"corpus_bind", "Bind supplied modules, inventories, fanout responses, and the current module into a durable multibinary project.", false, false, false, false, "corpus", 1000, 60000, {}, {{"modules", "array", false, {}}, {"project_id", "string", false, {}}, {"corpus_id", "string", false, {}}, {"role", "string", false, {}}, {"fanout_result", "object", false, {}}, {"inventories", "array", false, {}}, {"force_lock", "boolean", false, {}}}, true},
+        {"corpus_export", "Export a durable project manifest or the current in-memory compatibility corpus manifest.", true, false, true, false, "corpus", 500, 5000, {}, {{"format", "string", false, {"json"}}, {"project_id", "string", false, {}}}, false},
+        {"index_build", "Build durable module identity, import/export, function, local-edge, netnode, and cross-edge indexes for the current IDB.", false, false, false, true, "index", 30000, 600000, {}, {{"project_id", "string", false, {}}, {"indices", "array", false, {}}, {"force", "boolean", false, {}}, {"max_functions", "number", false, {}}, {"max_edges", "number", false, {}}, {"max_imports", "number", false, {}}, {"max_exports", "number", false, {}}}, false},
+        {"index_status", "Return durable index readiness, generation, stale-state, and cross-edge diagnostics.", true, false, false, false, "index", 500, 5000, {}, {{"project_id", "string", false, {}}, {"indices", "array", false, {}}}, false},
+        {"index_page_status", "Return durable page manifests for function, xref, signature, dispatch, callback, global, import/export, summary, and cross-edge indexes.", true, false, false, false, "index", 500, 10000, {}, {{"project_id", "string", false, {}}, {"module_id", "string", false, {}}}, false},
+        {"index_page", "Load one durable index page by family/module/page_index or by returned cursor.", true, false, true, false, "index", 500, 30000, {}, {{"project_id", "string", false, {}}, {"module_id", "string", false, {}}, {"family", "string", false, {}}, {"cursor", "string", false, {}}, {"page_index", "number", false, {}}}, false},
+        {"resolve_cross_edges", "Resolve and persist the project cross-module import/export/forwarder graph.", false, false, false, true, "index", 1000, 120000, {}, {{"project_id", "string", false, {}}}, false},
+        {"resolve_reference", "Resolve one module/name, module/ordinal, import, or module_id+rva reference through the durable project graph.", true, false, true, false, "index", 1000, 30000, {}, {{"project_id", "string", false, {}}, {"reference", "object", true, {}}}, false},
+        {"verify_chain", "Verify a chain against durable project modules, normalized addresses, cross edges, and link boundary facts with fail-closed confirmation rules.", true, false, false, true, "project_verifier", 5000, 600000, {}, {{"project_id", "string", false, {}}, {"chain", "object", true, {}}, {"options", "object", false, {}}}, true},
+        {"case_study_regressions", "Run source-backed NTFS/AFD/pvScan0 project semantics over supplied chain/source evidence without synthetic passes.", true, false, false, true, "project_verifier", 5000, 600000, {}, {{"project_id", "string", false, {}}, {"chain", "object", false, {}}, {"source_checks", "array", false, {}}, {"options", "object", false, {}}}, true}
     };
     return ops;
 }
@@ -1589,6 +1819,16 @@ const std::vector<operation_meta_t>& extract_ops()
         {"exports", "List entry/export records with pagination.", true, false, true, false, "none", 1000, 10000, {}, {}, false},
         {"segments", "List IDA segments and permissions.", true, false, true, false, "none", 500, 5000, {}, {}, false},
         {"corpus_snapshot", "Return module and corpus identity adjacent to extraction results.", true, false, true, false, "none", 500, 5000, {}, {}, false},
+        {"extract_module_facts", "Return normalized module, segment, entry, import, function index, full mapped-item xref index, resolver index, and cache facts.", true, false, true, false, "extraction_cache", 1000, 30000, {}, {{"layers", "array", false, {}}, {"maturities", "array", false, {}}, {"force_refresh", "boolean", false, {}}, {"max_functions", "number", false, {}}, {"max_module_items", "number", false, {}}, {"max_xrefs_per_address", "number", false, {}}, {"page_path", "string", false, {}}}, true},
+        {"extract_function_facts", "Return normalized raw, CFG, xref, type, ctree, microcode, side-effect, and cache facts for one function.", true, false, true, false, "extraction_cache", 2000, 60000, {}, {{"address", "location", true, {}}, {"layers", "array", false, {}}, {"maturities", "array", false, {}}, {"force_refresh", "boolean", false, {}}, {"max_instructions", "number", false, {}}, {"max_basic_blocks", "number", false, {}}, {"max_ctree_nodes", "number", false, {}}, {"max_microcode_instructions", "number", false, {}}, {"page_path", "string", false, {}}}, true},
+        {"extract_function_batch", "Return a cancellable bounded batch of normalized function facts.", true, false, true, false, "extraction_cache", 5000, 120000, {}, {{"functions", "array", false, {}}, {"layers", "array", false, {}}, {"maturities", "array", false, {}}, {"force_refresh", "boolean", false, {}}, {"max_functions", "number", false, {}}, {"timeout_ms", "number", false, {}}, {"page_path", "string", false, {}}}, true},
+        {"extract_xref_graph", "Return normalized xref indexes and cross-function/module reachability evidence around a function or address.", true, false, true, false, "extraction_cache", 2000, 60000, {}, {{"address", "location", true, {}}, {"target", "location", false, {}}, {"layers", "array", false, {}}, {"direction", "string", false, {"to", "from", "both"}}, {"max_depth", "number", false, {}}, {"max_functions", "number", false, {}}, {"modules", "array", false, {}}, {"page_path", "string", false, {}}}, true},
+        {"extract_path_window", "Return a normalized path corridor between entry and target inside one function.", true, false, true, false, "extraction_cache", 2000, 60000, {}, {{"entry", "location", true, {}}, {"target", "location", true, {}}, {"layers", "array", false, {}}, {"max_blocks", "number", false, {}}, {"max_steps", "number", false, {}}, {"page_path", "string", false, {}}}, true},
+        {"extract_type_facts", "Return normalized function type, stack, local, argument, UDT, enum, and dependency facts.", true, false, true, false, "extraction_cache", 1000, 30000, {}, {{"address", "location", true, {}}, {"force_refresh", "boolean", false, {}}, {"page_path", "string", false, {}}}, true},
+        {"resolve_cross_binary", "Resolve a module/RVA, import/export, public symbol, thunk, or controlled target against supplied module fact stores.", true, false, true, false, "extraction_cache", 1000, 30000, {}, {{"reference", "object", true, {}}, {"modules", "array", false, {}}, {"include_current_module", "boolean", false, {}}, {"max_module_items", "number", false, {}}, {"page_path", "string", false, {}}}, true},
+        {"case_study_self_check", "Run source-backed extraction self-checks for NTFS/ETW zero-vs-copy, ETW trigger negative evidence, AFD LIST_ENTRY guard, or pvScan0 self-reference classes.", true, false, true, false, "extraction_cache", 2000, 60000, {}, {{"case_id", "string", false, {"all", "ntfs_etw_zero_vs_copy", "etw_trigger_negative", "afd_list_entry_guard", "pvscan0_self_reference"}}, {"address", "location", false, {}}, {"entry", "location", false, {}}, {"target", "location", false, {}}, {"modules", "array", false, {}}, {"max_depth", "number", false, {}}, {"max_functions", "number", false, {}}, {"page_path", "string", false, {}}}, true},
+        {"extraction_cache_status", "Return extraction cache counters and storage status.", true, false, true, false, "extraction_cache", 500, 5000, {}, {}, false},
+        {"invalidate_extraction_cache", "Clear plugin-owned extraction cache storage.", false, true, true, false, "none", 500, 10000, {}, {{"confirm_destructive", "boolean", true, {}}, {"reason", "string", true, {}}}, false},
         {"evidence_fetch", "Fetch evidence from reports or address-local function/xref context.", true, false, true, false, "report", 1000, 10000, {}, {{"report_id", "string", false, {}}, {"job_id", "string", false, {}}, {"evidence_id", "string", false, {}}, {"address", "location", false, {}}}, false}
     };
     return ops;
@@ -1890,24 +2130,124 @@ agent_tools::tool_result_t handle_project_manage(const json& params)
     request_ctx_t ctx = parse_request("ida_project_manage", params, project_ops(), failure);
     if (!failure.output.empty() || !failure.data.is_null())
         return failure;
+    auto project_result = [&](const aida::multibinary::project_io_result_t& r) -> agent_tools::tool_result_t {
+        if (r.ok)
+            return ok_envelope(ctx, r.data);
+        return error_envelope(ctx, r.error_code.empty() ? "project_error" : r.error_code,
+                              r.error_message.empty() ? "project operation failed" : r.error_message,
+                              r.data);
+    };
     if (ctx.operation == "capabilities")
         return ok_envelope(ctx, make_capabilities(ctx.tool, project_ops()));
     if (ctx.operation == "inventory_current")
-        return ok_envelope(ctx, inventory_json(ctx.payload));
+    {
+        const int max_rows = int_param(ctx.payload, "max_rows", 256, 1, 100000);
+        json inv = aida::multibinary::current_idb_inventory(ctx.payload.value("include_segments", true),
+                                                            ctx.payload.value("include_imports", true),
+                                                            ctx.payload.value("include_entries", true),
+                                                            static_cast<std::size_t>(max_rows));
+        return ok_envelope(ctx, inv);
+    }
     if (ctx.operation == "inventory_all")
     {
+        const int max_rows = int_param(ctx.payload, "max_rows", 256, 1, 100000);
+        json local = aida::multibinary::current_idb_inventory(ctx.payload.value("include_segments", true),
+                                                             ctx.payload.value("include_imports", true),
+                                                             ctx.payload.value("include_entries", true),
+                                                             static_cast<std::size_t>(max_rows));
+        json supplied = json::object();
+        if (ctx.payload.contains("fanout_result"))
+            supplied["fanout_result"] = ctx.payload["fanout_result"];
+        if (ctx.payload.contains("inventories"))
+            supplied["inventories"] = ctx.payload["inventories"];
         json d;
-        d["local"] = inventory_json(ctx.payload);
+        d["local"] = local;
+        d["merged"] = aida::multibinary::merge_inventory_documents(local, supplied);
+        std::set<std::string> supplied_instances;
+        std::function<void(const json&)> collect_instance_ids = [&](const json& node) {
+            if (node.is_object())
+            {
+                if (node.contains("instance") && node["instance"].is_object())
+                {
+                    const std::string id = node["instance"].contains("instance_id") && node["instance"]["instance_id"].is_string()
+                        ? node["instance"]["instance_id"].get<std::string>()
+                        : std::string();
+                    if (!id.empty())
+                        supplied_instances.insert(id);
+                }
+                const std::string direct = node.contains("instance_id") && node["instance_id"].is_string()
+                    ? node["instance_id"].get<std::string>()
+                    : std::string();
+                if (!direct.empty())
+                    supplied_instances.insert(direct);
+                for (auto it = node.begin(); it != node.end(); ++it)
+                    collect_instance_ids(it.value());
+            }
+            else if (node.is_array())
+            {
+                for (const json& item : node)
+                    collect_instance_ids(item);
+            }
+        };
+        collect_instance_ids(local);
+        collect_instance_ids(supplied);
+        d["peer_data_gaps"] = json::array();
+        agent_tools::tool_result_t live_instances = invoke_registered("list_ida_instances", json::object());
+        if (live_instances.success && live_instances.data.contains("instances") && live_instances.data["instances"].is_array())
+        {
+            for (const json& inst : live_instances.data["instances"])
+            {
+                const std::string id = inst.value("instance_id", std::string());
+                if (id.empty() || supplied_instances.find(id) != supplied_instances.end())
+                    continue;
+                d["peer_data_gaps"].push_back({{"kind", "peer_data_missing"}, {"instance", inst}, {"reason", "query_all_instances inventory result was not supplied to ida_project_manage"}});
+            }
+        }
+        else if (!live_instances.success)
+        {
+            d["peer_data_gaps"].push_back({{"kind", "peer_registry_unavailable"}, {"error_code", live_instances.error_code}, {"message", live_instances.output}});
+        }
         d["fanout"] = {
             {"tool", "query_all_instances"},
             {"arguments", {{"tool", "ida_project_manage"}, {"arguments", {{"operation", "inventory_current"}, {"payload", ctx.payload}}}}},
-            {"reason", "mcp_server owns peer routing; direct fan-out is exposed through the existing aggregator to avoid nested execute_sync reentry"}
+            {"reason", "query_all_instances owns network peer routing; pass its result back as payload.fanout_result to merge and persist without self-deadlock"}
         };
         d["instances_routing_compatible"] = true;
         return ok_envelope(ctx, d);
     }
+    if (ctx.operation == "list")
+        return project_result(aida::multibinary::list_projects());
+    if (ctx.operation == "load")
+        return project_result(aida::multibinary::load_project_modules(ctx.payload.value("project_id", std::string())));
+    if (ctx.operation == "save")
+    {
+        if (ctx.payload.contains("modules") && ctx.payload["modules"].is_array())
+            return project_result(aida::multibinary::save_or_update_project(ctx.payload.value("project_id", std::string()),
+                                                                            ctx.payload["modules"],
+                                                                            ctx.payload));
+        const int max_rows = int_param(ctx.payload, "max_rows", 100000, 1, 1000000);
+        json local = aida::multibinary::current_idb_inventory(true, true, true, static_cast<std::size_t>(max_rows));
+        return project_result(aida::multibinary::bind_current_inventory_to_project(ctx.payload.value("project_id", std::string()),
+                                                                                  local,
+                                                                                  ctx.payload,
+                                                                                  ctx.payload));
+    }
+    if (ctx.operation == "delete")
+    {
+        if (!ctx.payload.value("confirm_destructive", false) || ctx.payload.value("reason", std::string()).empty())
+            return error_envelope(ctx, "destructive_denied", "delete requires confirm_destructive=true and a non-empty reason");
+        return project_result(aida::multibinary::delete_project(ctx.payload.value("project_id", std::string())));
+    }
+    if (ctx.operation == "status")
+    {
+        const std::string project_id = ctx.payload.value("project_id", aida::multibinary::default_project_id_for_current_idb());
+        return project_result(aida::multibinary::index_status(project_id));
+    }
     if (ctx.operation == "corpus_snapshot")
     {
+        const std::string project_id = ctx.payload.value("project_id", std::string());
+        if (!project_id.empty())
+            return project_result(aida::multibinary::load_project_manifest(project_id));
         auto& s = state();
         std::lock_guard<std::mutex> lock(s.mutex);
         json d = s.corpus_manifest.empty() ? json::object({{"corpus_id", "current"}, {"modules", json::array({module_identity()})}, {"generation", generation_id()}}) : s.corpus_manifest;
@@ -1915,23 +2255,35 @@ agent_tools::tool_result_t handle_project_manage(const json& params)
     }
     if (ctx.operation == "corpus_bind")
     {
-        json modules = ctx.payload.contains("modules") && ctx.payload["modules"].is_array() ? ctx.payload["modules"] : json::array({module_identity()});
-        json manifest;
-        manifest["schema"] = "aida.ida.corpus_manifest.v1";
-        manifest["corpus_id"] = ctx.payload.value("corpus_id", std::string("corpus:" + generation_id()));
-        manifest["role"] = ctx.payload.value("role", std::string("primary"));
-        manifest["modules"] = modules;
-        manifest["generation"] = generation_id();
-        manifest["updated_at_ms"] = now_ms();
+        const int max_rows = int_param(ctx.payload, "max_rows", 100000, 1, 1000000);
+        aida::multibinary::project_io_result_t saved = ctx.payload.contains("modules") && ctx.payload["modules"].is_array()
+            ? aida::multibinary::save_or_update_project(ctx.payload.value("project_id", ctx.payload.value("corpus_id", std::string())),
+                                                        ctx.payload["modules"],
+                                                        ctx.payload)
+            : aida::multibinary::bind_current_inventory_to_project(ctx.payload.value("project_id", ctx.payload.value("corpus_id", std::string())),
+                                                                   aida::multibinary::current_idb_inventory(true, true, true, static_cast<std::size_t>(max_rows)),
+                                                                   ctx.payload,
+                                                                   ctx.payload);
+        if (!saved.ok)
+            return project_result(saved);
+        auto loaded = aida::multibinary::load_project_manifest(saved.data.value("project_id", ctx.payload.value("project_id", std::string())));
         auto& s = state();
         {
             std::lock_guard<std::mutex> lock(s.mutex);
-            s.corpus_manifest = manifest;
+            s.corpus_manifest = loaded.ok ? loaded.data["manifest"] : saved.data;
         }
-        return ok_envelope(ctx, manifest);
+        return ok_envelope(ctx, saved.data);
     }
     if (ctx.operation == "corpus_export")
     {
+        const std::string project_id = ctx.payload.value("project_id", std::string());
+        if (!project_id.empty())
+        {
+            auto loaded = aida::multibinary::load_project_manifest(project_id);
+            if (!loaded.ok)
+                return project_result(loaded);
+            return ok_envelope(ctx, {{"format", "json"}, {"manifest", loaded.data["manifest"]}, {"content_hash", aida::multibinary::content_hash_summary(loaded.data["manifest"])}});
+        }
         auto& s = state();
         std::lock_guard<std::mutex> lock(s.mutex);
         json manifest = s.corpus_manifest.empty() ? json::object({{"corpus_id", "current"}, {"modules", json::array({module_identity()})}, {"generation", generation_id()}}) : s.corpus_manifest;
@@ -1940,43 +2292,649 @@ agent_tools::tool_result_t handle_project_manage(const json& params)
     if (ctx.operation == "index_build")
     {
         const std::string job_id = create_job(ctx);
-        json coverage;
-        coverage["functions"] = static_cast<uint64_t>(get_func_qty());
-        coverage["segments"] = get_segm_qty();
-        coverage["imports_previewed"] = import_rows(10000).size();
-        coverage["entries"] = static_cast<uint64_t>(get_entry_qty());
-        coverage["verifier"] = verify::engine().verdict_summary();
         json indices = ctx.payload.contains("indices") && ctx.payload["indices"].is_array() ? ctx.payload["indices"] : json::array({"functions", "segments", "imports", "entries", "verifier"});
+        aida::multibinary::index_build_options_t options = aida::multibinary::index_options_from_json(ctx.payload);
+        options.force = ctx.payload.value("force", options.force);
+        aida::multibinary::project_io_result_t built = aida::multibinary::build_current_module_index(ctx.payload.value("project_id", std::string()), indices, options);
+        if (!built.ok)
         {
-            auto& s = state();
-            std::lock_guard<std::mutex> lock(s.mutex);
-            for (const auto& idx : indices)
-            {
-                const std::string name = idx.is_string() ? idx.get<std::string>() : idx.dump();
-                index_record_t rec;
-                rec.index_id = name;
-                rec.status = "ready";
-                rec.generation = generation_id();
-                rec.built_at_ms = now_ms();
-                rec.coverage = coverage;
-                s.indices[name] = rec;
-            }
+            finish_job(job_id, "failed", built.data, std::string(), built.error_code, built.error_message);
+            return project_result(built);
         }
-        json result = {{"indices", indices}, {"coverage", coverage}, {"generation", generation_id()}};
+        json result = built.data;
         finish_job(job_id, "completed", result);
         auto job = get_job(job_id);
         return ok_envelope(ctx, result, job ? job_to_json(*job) : json());
     }
     if (ctx.operation == "index_status")
     {
-        json rows = json::array();
-        auto& s = state();
-        std::lock_guard<std::mutex> lock(s.mutex);
-        for (const auto& kv : s.indices)
-            rows.push_back({{"index_id", kv.second.index_id}, {"status", kv.second.status}, {"generation", kv.second.generation}, {"built_at_ms", kv.second.built_at_ms}, {"stale", kv.second.generation != generation_id()}, {"coverage", kv.second.coverage}});
-        return ok_envelope(ctx, {{"indices", rows}, {"current_generation", generation_id()}, {"auto_analysis_ok", auto_is_ok()}});
+        const std::string project_id = ctx.payload.value("project_id", aida::multibinary::default_project_id_for_current_idb());
+        return project_result(aida::multibinary::index_status(project_id));
+    }
+    if (ctx.operation == "index_page_status")
+    {
+        const std::string project_id = ctx.payload.value("project_id", aida::multibinary::default_project_id_for_current_idb());
+        return project_result(aida::multibinary::index_page_status(project_id, ctx.payload.value("module_id", std::string())));
+    }
+    if (ctx.operation == "index_page")
+    {
+        const std::string project_id = ctx.payload.value("project_id", aida::multibinary::default_project_id_for_current_idb());
+        const std::size_t page_index = static_cast<std::size_t>(int_param(ctx.payload, "page_index", 0, 0, 1000000000));
+        return project_result(aida::multibinary::load_index_page(project_id,
+                                                                 ctx.payload.value("module_id", std::string()),
+                                                                 ctx.payload.value("family", std::string()),
+                                                                 ctx.payload.value("cursor", std::string()),
+                                                                 page_index));
+    }
+    if (ctx.operation == "resolve_cross_edges")
+    {
+        const std::string project_id = ctx.payload.value("project_id", aida::multibinary::default_project_id_for_current_idb());
+        return project_result(aida::multibinary::resolve_project_cross_edges(project_id));
+    }
+    if (ctx.operation == "resolve_reference")
+    {
+        const std::string project_id = ctx.payload.value("project_id", aida::multibinary::default_project_id_for_current_idb());
+        return project_result(aida::multibinary::resolve_project_reference(project_id, ctx.payload.value("reference", json::object())));
+    }
+    if (ctx.operation == "verify_chain")
+    {
+        const std::string project_id = ctx.payload.value("project_id", std::string());
+        return project_result(aida::vuln::chain_verifier::verify_project_chain(project_id,
+                                                                               ctx.payload.value("chain", json::object()),
+                                                                               ctx.payload.value("options", json::object())));
+    }
+    if (ctx.operation == "case_study_regressions")
+    {
+        const std::string project_id = ctx.payload.value("project_id", std::string());
+        return project_result(aida::vuln::chain_verifier::run_case_study_regressions(project_id, ctx.payload));
     }
     return error_envelope(ctx, "unknown_operation", "unhandled operation", {{"operation", ctx.operation}});
+}
+
+std::vector<std::string> strings_from_array_field(const json& payload, const char* key)
+{
+    std::vector<std::string> out;
+    if (!payload.contains(key) || !payload[key].is_array())
+        return out;
+    for (const auto& item : payload[key])
+    {
+        if (item.is_string())
+            out.push_back(item.get<std::string>());
+    }
+    return out;
+}
+
+bool contains_string(const std::vector<std::string>& values, const std::string& value)
+{
+    return std::find(values.begin(), values.end(), value) != values.end();
+}
+
+aida::vuln::chain::extraction_options_t extraction_options_from_ctx(const request_ctx_t& ctx)
+{
+    aida::vuln::chain::extraction_options_t options;
+    const std::vector<std::string> layers = strings_from_array_field(ctx.payload, "layers");
+    if (!layers.empty())
+    {
+        options.include_bytes = contains_string(layers, "raw") || contains_string(layers, "bytes") || contains_string(layers, "instructions") || contains_string(layers, "assembly");
+        options.include_xrefs = contains_string(layers, "raw") || contains_string(layers, "xrefs") || contains_string(layers, "xref_graph");
+        options.include_xref_indexes = contains_string(layers, "xrefs") || contains_string(layers, "xref_graph");
+        options.include_types = contains_string(layers, "types") || contains_string(layers, "type");
+        options.include_ctree = contains_string(layers, "ctree") || contains_string(layers, "decompiler") || contains_string(layers, "hexrays");
+        options.include_microcode = contains_string(layers, "microcode");
+        options.include_effects = contains_string(layers, "effects") || contains_string(layers, "side_effects");
+    }
+    options.force_refresh = ctx.payload.value("force_refresh", false);
+    options.max_instructions = static_cast<std::size_t>(int_param(ctx.payload, "max_instructions", static_cast<int>(options.max_instructions), 1, 200000));
+    options.max_basic_blocks = static_cast<std::size_t>(int_param(ctx.payload, "max_basic_blocks", static_cast<int>(options.max_basic_blocks), 1, 50000));
+    options.max_xrefs_per_address = static_cast<std::size_t>(int_param(ctx.payload, "max_xrefs_per_address", static_cast<int>(options.max_xrefs_per_address), 1, 10000));
+    options.max_ctree_nodes = static_cast<std::size_t>(int_param(ctx.payload, "max_ctree_nodes", static_cast<int>(options.max_ctree_nodes), 1, 200000));
+    options.max_microcode_instructions = static_cast<std::size_t>(int_param(ctx.payload, "max_microcode_instructions", static_cast<int>(options.max_microcode_instructions), 1, 200000));
+    options.max_pseudocode_lines = static_cast<std::size_t>(int_param(ctx.payload, "max_pseudocode_lines", static_cast<int>(options.max_pseudocode_lines), 1, 50000));
+    options.max_batch_functions = static_cast<std::size_t>(int_param(ctx.payload, "max_functions", static_cast<int>(options.max_batch_functions), 1, 20000));
+    options.max_module_items = static_cast<std::size_t>(int_param(ctx.payload, "max_module_items", static_cast<int>(options.max_module_items), 1, 1000000));
+    if (ctx.payload.contains("timeout_ms") || ctx.budget.contains("timeout_ms"))
+        options.timeout_ms = static_cast<std::uint64_t>(int_param(ctx.payload.contains("timeout_ms") ? ctx.payload : ctx.budget, "timeout_ms", 0, 0, 600000));
+    std::vector<std::string> maturities = strings_from_array_field(ctx.payload, "maturities");
+    if (!maturities.empty())
+        options.microcode_maturities = maturities;
+    return options;
+}
+
+std::vector<ea_t> function_locations_from_payload(const json& payload)
+{
+    std::vector<ea_t> out;
+    if (!payload.contains("functions") || !payload["functions"].is_array())
+        return out;
+    for (const auto& item : payload["functions"])
+    {
+        std::optional<ea_t> ea;
+        if (item.is_object() && item.contains("address"))
+            ea = parse_location(item["address"]);
+        else
+            ea = parse_location(item);
+        if (ea)
+            out.push_back(*ea);
+    }
+    return out;
+}
+
+struct function_start_page_t
+{
+    std::vector<ea_t> starts;
+    json page = json::object();
+    bool cursor_ok = true;
+};
+
+function_start_page_t function_start_page(const request_ctx_t& ctx, std::size_t max_functions)
+{
+    struct request_t : public exec_request_t
+    {
+        request_ctx_t ctx;
+        std::size_t max_functions = 0;
+        function_start_page_t result;
+        request_t(const request_ctx_t& c, std::size_t m) : ctx(c), max_functions(m) {}
+        ssize_t idaapi execute() override
+        {
+            size_t offset = 0;
+            if (!parse_cursor(ctx.cursor, "extract_function_batch", generation_id(), offset))
+            {
+                result.cursor_ok = false;
+                return 1;
+            }
+            const std::size_t qty = get_func_qty();
+            const std::size_t limit = std::min<std::size_t>(static_cast<std::size_t>(ctx.limit), max_functions);
+            const std::size_t end = std::min(qty, offset + limit);
+            for (std::size_t i = offset; i < end; ++i)
+            {
+                func_t* fn = getn_func(i);
+                if (fn != nullptr)
+                    result.starts.push_back(fn->start_ea);
+            }
+            const bool truncated = end < qty;
+            const std::string next = truncated ? cursor_for("extract_function_batch", generation_id(), end) : std::string();
+            result.page = page_json(ctx.cursor, next, static_cast<int>(limit), result.starts.size(), truncated);
+            return 1;
+        }
+    };
+    request_t req(ctx, max_functions);
+    if (execute_sync(req, MFF_READ) <= 0)
+    {
+        req.result.cursor_ok = false;
+        return req.result;
+    }
+    return req.result;
+}
+
+aida::vuln::chain::path_trace_options_t path_options_from_ctx(const request_ctx_t& ctx)
+{
+    aida::vuln::chain::path_trace_options_t options;
+    options.max_blocks = static_cast<std::size_t>(int_param(ctx.payload, "max_blocks", static_cast<int>(options.max_blocks), 1, 50000));
+    options.max_steps = static_cast<std::size_t>(int_param(ctx.payload, "max_steps", static_cast<int>(options.max_steps), 1, 200000));
+    options.max_unresolved_edges = static_cast<std::size_t>(int_param(ctx.payload, "max_unresolved_edges", static_cast<int>(options.max_unresolved_edges), 1, 50000));
+    return options;
+}
+
+json resolver_modules_from_ctx(const request_ctx_t& ctx, const json& current_module = json())
+{
+    json modules = json::array();
+    std::unordered_set<std::string> seen;
+    auto module_id_of = [](const json& module) {
+        if (module.contains("identity") && module["identity"].is_object())
+            return module["identity"].value("module_id", module["identity"].value("corpus_id", std::string()));
+        if (module.contains("module") && module["module"].is_object())
+            return module["module"].value("module_id", module["module"].value("corpus_id", std::string()));
+        return module.value("module_id", module.value("corpus_id", std::string()));
+    };
+    auto append = [&](const json& module) {
+        if (!module.is_object())
+            return;
+        const std::string id = module_id_of(module);
+        const std::string key = id.empty() ? hash_text(module.dump()) : id;
+        if (!seen.insert(key).second)
+            return;
+        modules.push_back(module);
+    };
+    if (!current_module.is_null() && !current_module.empty())
+        append(current_module);
+    if (ctx.payload.contains("modules") && ctx.payload["modules"].is_array())
+    {
+        for (const json& module : ctx.payload["modules"])
+            append(module);
+    }
+    if (modules.empty() || ctx.payload.value("include_current_module", true))
+    {
+        aida::vuln::chain::extraction_options_t options = extraction_options_from_ctx(ctx);
+        options.include_bytes = false;
+        options.include_types = false;
+        options.include_ctree = false;
+        options.include_microcode = false;
+        options.include_effects = false;
+        options.include_xrefs = true;
+        options.include_xref_indexes = true;
+        append(aida::vuln::chain::to_json(aida::vuln::chain::extract_module_snapshot(options)));
+    }
+    return modules;
+}
+
+bool target_reference_matches(const json& target_ref, const json& resolved)
+{
+    if (!target_ref.is_object() || !resolved.is_object() || !resolved.value("resolved", false))
+        return false;
+    const json target = resolved.value("target", json::object());
+    std::string wanted_module = target_ref.value("module_id", target_ref.value("corpus_id", std::string()));
+    if (wanted_module.empty() && target_ref.contains("module") && target_ref["module"].is_object())
+        wanted_module = target_ref["module"].value("module_id", target_ref["module"].value("corpus_id", std::string()));
+    std::string got_module = target.value("module_id", target.value("corpus_id", std::string()));
+    if (got_module.empty() && target.contains("module") && target["module"].is_object())
+        got_module = target["module"].value("module_id", target["module"].value("corpus_id", std::string()));
+    const bool wanted_has_rva = target_ref.contains("rva") && !target_ref["rva"].is_null()
+        && (!target_ref["rva"].is_string() || !target_ref["rva"].get<std::string>().empty());
+    const bool got_has_rva = target.contains("rva") && !target["rva"].is_null()
+        && (!target["rva"].is_string() || !target["rva"].get<std::string>().empty());
+    if (!wanted_module.empty() && !got_module.empty() && wanted_module != got_module)
+        return false;
+    if (wanted_has_rva && got_has_rva)
+    {
+        auto wanted_rva = agent_tools::helpers::parse_address(scalar_to_string(target_ref["rva"]));
+        auto got_rva = agent_tools::helpers::parse_address(scalar_to_string(target["rva"]));
+        if (wanted_rva && got_rva && *wanted_rva != *got_rva)
+            return false;
+    }
+    std::string wanted_symbol = target_ref.value("symbol", target_ref.value("name", std::string()));
+    std::string got_symbol = target.value("symbol", target.value("name", std::string()));
+    if (!wanted_symbol.empty() && !got_symbol.empty() && lowercase_ascii(wanted_symbol) != lowercase_ascii(got_symbol))
+        return false;
+    return !wanted_module.empty() || wanted_has_rva || !wanted_symbol.empty();
+}
+
+json cross_reachability_data(const request_ctx_t& ctx,
+                             ea_t entry_ea,
+                             const std::optional<ea_t>& local_target,
+                             const json& target_ref,
+                             const json& resolver_modules)
+{
+    json out;
+    out["schema"] = "aida_chain_cross_reachability_v1";
+    out["entry"] = fmt_ea(entry_ea);
+    out["target"] = target_ref.is_null() ? json(nullptr) : target_ref;
+    out["verdict"] = "incomplete";
+    out["reached"] = false;
+    out["negative_evidence_complete"] = false;
+    out["visited_functions"] = json::array();
+    out["visited_modules"] = json::array();
+    out["traversed_edges"] = json::array();
+    out["unresolved_edges"] = json::array();
+    out["cross_binary_resolutions"] = json::array();
+    out["cutoff_reason"] = nullptr;
+    func_t* entry_fn = get_func(entry_ea);
+    if (entry_fn == nullptr)
+    {
+        out["cutoff_reason"] = "entry_not_in_function";
+        return out;
+    }
+    ea_t target_fn_ea = BADADDR;
+    if (local_target)
+    {
+        func_t* tf = get_func(*local_target);
+        target_fn_ea = tf != nullptr ? tf->start_ea : *local_target;
+    }
+    const std::uint64_t start = now_ms();
+    const int max_depth = int_param(ctx.payload, "max_depth", 8, 1, 128);
+    const int max_functions = int_param(ctx.payload, "max_functions", 1024, 1, 100000);
+    struct node_t
+    {
+        ea_t fn = BADADDR;
+        int depth = 0;
+        std::vector<ea_t> path;
+    };
+    std::deque<node_t> queue;
+    std::set<ea_t> seen;
+    queue.push_back({entry_fn->start_ea, 0, {entry_fn->start_ea}});
+    seen.insert(entry_fn->start_ea);
+    bool unresolved = false;
+    bool cutoff = false;
+    while (!queue.empty())
+    {
+        if (seen.size() > static_cast<size_t>(max_functions))
+        {
+            cutoff = true;
+            out["cutoff_reason"] = "function_budget_exhausted";
+            break;
+        }
+        if (ctx.budget.contains("timeout_ms") && now_ms() - start >= static_cast<std::uint64_t>(int_param(ctx.budget, "timeout_ms", 0, 0, 600000)))
+        {
+            cutoff = true;
+            out["cutoff_reason"] = "timeout";
+            break;
+        }
+        if (user_cancelled())
+        {
+            cutoff = true;
+            out["cutoff_reason"] = "cancelled";
+            break;
+        }
+        node_t cur = queue.front();
+        queue.pop_front();
+        out["visited_functions"].push_back(fmt_ea(cur.fn));
+        if (cur.fn == target_fn_ea)
+        {
+            out["verdict"] = "confirmed";
+            out["reached"] = true;
+            out["path"] = json::array();
+            for (ea_t step : cur.path)
+                out["path"].push_back(fmt_ea(step));
+            return out;
+        }
+        if (cur.depth >= max_depth)
+        {
+            cutoff = true;
+            out["cutoff_reason"] = "depth_budget_exhausted";
+            continue;
+        }
+        aida::vuln::chain::extraction_options_t options = extraction_options_from_ctx(ctx);
+        options.include_bytes = false;
+        options.include_types = false;
+        options.include_ctree = false;
+        options.include_microcode = false;
+        options.include_effects = false;
+        options.include_xrefs = true;
+        options.include_xref_indexes = true;
+        aida::vuln::chain::function_snapshot_t snapshot = aida::vuln::chain::extract_function_snapshot(cur.fn, options);
+        const std::string module_id = snapshot.identity.start.module.module_id;
+        if (!module_id.empty())
+            out["visited_modules"].push_back(module_id);
+        for (const auto& call : snapshot.calls)
+        {
+            json edge;
+            edge["from_function"] = fmt_ea(cur.fn);
+            edge["callsite"] = aida::vuln::chain::to_json(call.callsite);
+            edge["kind"] = call.kind;
+            edge["callee_name"] = call.callee_name;
+            edge["resolution_quality"] = call.resolution_quality;
+            if (!call.resolved || call.kind == "indirect")
+            {
+                unresolved = true;
+                out["unresolved_edges"].push_back(edge);
+                continue;
+            }
+            edge["target"] = aida::vuln::chain::to_json(call.target);
+            out["traversed_edges"].push_back(edge);
+            if (local_target && call.target.ea == static_cast<std::uint64_t>(*local_target))
+            {
+                out["verdict"] = "confirmed";
+                out["reached"] = true;
+                out["path"] = json::array();
+                for (ea_t step : cur.path)
+                    out["path"].push_back(fmt_ea(step));
+                out["path"].push_back(fmt_ea(static_cast<ea_t>(call.target.ea)));
+                return out;
+            }
+            json ref;
+            ref["address"] = aida::vuln::chain::to_json(call.target);
+            ref["symbol"] = call.callee_name;
+            json resolved = aida::vuln::chain::resolve_cross_binary_reference(resolver_modules, ref);
+            out["cross_binary_resolutions"].push_back(resolved);
+            if (target_reference_matches(target_ref, resolved))
+            {
+                out["verdict"] = "confirmed";
+                out["reached"] = true;
+                out["path"] = json::array();
+                for (ea_t step : cur.path)
+                    out["path"].push_back(fmt_ea(step));
+                out["path"].push_back(resolved["target"]);
+                return out;
+            }
+            func_t* callee = get_func(static_cast<ea_t>(call.target.ea));
+            if (callee == nullptr)
+                continue;
+            if (!seen.insert(callee->start_ea).second)
+                continue;
+            std::vector<ea_t> next_path = cur.path;
+            next_path.push_back(callee->start_ea);
+            queue.push_back({callee->start_ea, cur.depth + 1, std::move(next_path)});
+        }
+    }
+    if (!cutoff && !unresolved)
+    {
+        out["verdict"] = "refuted";
+        out["negative_evidence_complete"] = true;
+        out["cutoff_reason"] = nullptr;
+    }
+    else
+    {
+        out["verdict"] = "incomplete";
+        if (out["cutoff_reason"].is_null())
+            out["cutoff_reason"] = unresolved ? "unresolved_indirect_or_external_edges" : "frontier_incomplete";
+    }
+    out["visited_function_count"] = seen.size();
+    return out;
+}
+
+json xref_graph_data(const request_ctx_t& ctx, const aida::vuln::chain::function_snapshot_t& snapshot, std::optional<ea_t> target)
+{
+    json data;
+    data["function"] = aida::vuln::chain::to_json(snapshot.identity);
+    data["xref_from_index"] = snapshot.xref_from_index;
+    data["xref_to_index"] = snapshot.xref_to_index;
+    data["calls"] = json::array();
+    for (const auto& call : snapshot.calls)
+        data["calls"].push_back(aida::vuln::chain::to_json(call));
+    data["branches"] = json::array();
+    for (const auto& branch : snapshot.branches)
+        data["branches"].push_back(aida::vuln::chain::to_json(branch));
+    data["reachable_evidence"] = json::object();
+    if (target)
+    {
+        aida::vuln::chain::path_trace_t trace = aida::vuln::chain::trace_path_corridor(snapshot, snapshot.identity.start.ea, static_cast<std::uint64_t>(*target), path_options_from_ctx(ctx));
+        data["reachable_evidence"] = aida::vuln::chain::to_json(trace);
+        data["reachable_evidence"]["negative_evidence_complete"] = !trace.reached && trace.complete;
+    }
+    json modules = resolver_modules_from_ctx(ctx);
+    data["corpus_reachability"] = cross_reachability_data(ctx,
+                                                         static_cast<ea_t>(snapshot.identity.start.ea),
+                                                         target,
+                                                         ctx.payload.value("target", json(nullptr)),
+                                                         modules);
+    data["resolver_index"] = aida::vuln::chain::build_cross_binary_resolver_index(modules);
+    return data;
+}
+
+bool json_text_contains(const json& value, const std::vector<std::string>& needles)
+{
+    const std::string text = lowercase_ascii(value.dump());
+    for (const std::string& needle : needles)
+    {
+        if (text.find(lowercase_ascii(needle)) != std::string::npos)
+            return true;
+    }
+    return false;
+}
+
+json zero_vs_copy_check(const aida::vuln::chain::function_snapshot_t& snapshot)
+{
+    json out;
+    out["case_id"] = "ntfs_etw_zero_vs_copy";
+    out["status"] = "unproven";
+    out["evidence"] = json::array();
+    bool zero_write = false;
+    bool copied_write = false;
+    for (const auto& effect : snapshot.effects)
+    {
+        const std::string kind = effect.value("kind", std::string());
+        const json source = effect.value("source", json::object());
+        const std::string origin = source.value("value_origin", std::string());
+        if ((kind == "memory_set" || kind == "write") && origin == "constant_zero")
+        {
+            zero_write = true;
+            out["evidence"].push_back(effect);
+        }
+        if ((kind == "memory_copy" || kind == "write") && (origin == "copied_from_memory" || origin == "copied_from_input"))
+        {
+            copied_write = true;
+            out["evidence"].push_back(effect);
+        }
+    }
+    out["zero_write_present"] = zero_write;
+    out["copied_write_present"] = copied_write;
+    if (zero_write && copied_write)
+        out["status"] = "passed";
+    else
+        out["reason"] = "function_facts_do_not_contain_both_constant_zero_and_copied_write_sources";
+    return out;
+}
+
+json afd_list_entry_guard_check(const aida::vuln::chain::function_snapshot_t& snapshot)
+{
+    json out;
+    out["case_id"] = "afd_list_entry_guard";
+    out["status"] = "unproven";
+    out["evidence"] = json::array();
+    bool has_48 = false;
+    bool has_50 = false;
+    bool has_branch = false;
+    bool has_later_indirect_call = false;
+    std::uint64_t first_branch = 0;
+    for (const auto& branch : snapshot.branches)
+    {
+        const json bj = aida::vuln::chain::to_json(branch);
+        if (json_text_contains(bj, {"0x48", "+48", " 48h", "list_entry", "flink", "blink"}))
+            has_48 = true;
+        if (json_text_contains(bj, {"0x50", "+50", " 50h", "list_entry", "flink", "blink"}))
+            has_50 = true;
+        if (json_text_contains(bj, {"0x48", "+48", "0x50", "+50", "list_entry", "flink", "blink"}))
+        {
+            has_branch = true;
+            if (first_branch == 0)
+                first_branch = branch.branch.ea;
+            out["evidence"].push_back(bj);
+        }
+    }
+    for (const auto& ins : snapshot.instructions)
+    {
+        if (!ins.is_indirect || !ins.is_call)
+            continue;
+        if (first_branch == 0 || ins.location.ea > first_branch)
+        {
+            has_later_indirect_call = true;
+            out["evidence"].push_back(aida::vuln::chain::to_json(ins));
+            break;
+        }
+    }
+    if (json_text_contains(snapshot.ctree.memory_facts, {"0x48", "+48", " 48h"}))
+        has_48 = true;
+    if (json_text_contains(snapshot.ctree.memory_facts, {"0x50", "+50", " 50h"}))
+        has_50 = true;
+    out["offset_0x48_present"] = has_48;
+    out["offset_0x50_present"] = has_50;
+    out["branch_before_indirect_call_present"] = has_branch && has_later_indirect_call;
+    if (has_48 && has_50 && has_branch && has_later_indirect_call)
+        out["status"] = "passed";
+    else
+        out["reason"] = "source_facts_do_not_prove_list_entry_offsets_and_guard_before_indirect_call";
+    return out;
+}
+
+json pvscan0_self_reference_check(const aida::vuln::chain::function_snapshot_t& snapshot)
+{
+    json out;
+    out["case_id"] = "pvscan0_self_reference";
+    out["status"] = "unproven";
+    out["evidence"] = json::array();
+    bool found = false;
+    bool preserves_destination_and_source = false;
+    for (const auto& effect : snapshot.effects)
+    {
+        const std::string kind = effect.value("kind", std::string());
+        const std::string operation = lowercase_ascii(effect.value("operation", std::string()));
+        if (operation.find("setbitmapbits") == std::string::npos && !json_text_contains(effect.value("tags", json::array()), {"pvscan0"}))
+            continue;
+        found = true;
+        const json destination = effect.value("destination", json::object());
+        const json source = effect.value("source", json::object());
+        if (!destination.value("text", std::string()).empty() && (!source.value("text", std::string()).empty() || source.value("controlled_by_input", false)))
+            preserves_destination_and_source = true;
+        if (kind == "memory_set" || kind == "memory_copy" || kind == "write")
+            out["evidence"].push_back(effect);
+    }
+    out["setbitmapbits_effect_present"] = found;
+    out["destination_and_source_preserved"] = preserves_destination_and_source;
+    if (found && preserves_destination_and_source)
+        out["status"] = "passed";
+    else
+        out["reason"] = "source_facts_do_not_preserve_setbitmapbits_destination_and_source_expressions";
+    return out;
+}
+
+json etw_trigger_negative_check(const request_ctx_t& ctx, const json& resolver_modules)
+{
+    json out;
+    out["case_id"] = "etw_trigger_negative";
+    out["status"] = "unproven";
+    auto entry = payload_location(ctx.payload, "entry");
+    std::optional<ea_t> target = payload_location(ctx.payload, "target");
+    if (!entry || (!target && !ctx.payload.contains("target")))
+    {
+        out["reason"] = "entry_and_target_are_required_for_trigger_negative_evidence";
+        return out;
+    }
+    json reach = cross_reachability_data(ctx, *entry, target, ctx.payload.value("target", json(nullptr)), resolver_modules);
+    out["evidence"] = reach;
+    if (reach.value("negative_evidence_complete", false))
+        out["status"] = "passed";
+    else
+        out["reason"] = reach.value("cutoff_reason", std::string("target_reached_or_evidence_incomplete"));
+    return out;
+}
+
+json case_study_self_check_data(const request_ctx_t& ctx)
+{
+    json out;
+    out["schema"] = "aida_chain_case_study_self_check_v1";
+    out["overall"] = "unproven";
+    out["checks"] = json::array();
+    const std::string case_id = ctx.payload.value("case_id", std::string("all"));
+    aida::vuln::chain::extraction_options_t options = extraction_options_from_ctx(ctx);
+    options.include_bytes = true;
+    options.include_xrefs = true;
+    options.include_xref_indexes = true;
+    options.include_types = true;
+    options.include_ctree = true;
+    options.include_microcode = false;
+    options.include_effects = true;
+    std::optional<ea_t> address = payload_location(ctx.payload, "address");
+    aida::vuln::chain::function_snapshot_t snapshot;
+    bool has_snapshot = false;
+    if (address)
+    {
+        snapshot = aida::vuln::chain::extract_function_snapshot(*address, options);
+        has_snapshot = snapshot.identity.start.ea != 0;
+        out["function"] = aida::vuln::chain::to_json(snapshot.identity);
+    }
+    if ((case_id == "all" || case_id == "ntfs_etw_zero_vs_copy") && has_snapshot)
+        out["checks"].push_back(zero_vs_copy_check(snapshot));
+    else if (case_id == "all" || case_id == "ntfs_etw_zero_vs_copy")
+        out["checks"].push_back({{"case_id", "ntfs_etw_zero_vs_copy"}, {"status", "unproven"}, {"reason", "address_is_required"}});
+    if (case_id == "all" || case_id == "etw_trigger_negative")
+        out["checks"].push_back(etw_trigger_negative_check(ctx, resolver_modules_from_ctx(ctx)));
+    if ((case_id == "all" || case_id == "afd_list_entry_guard") && has_snapshot)
+        out["checks"].push_back(afd_list_entry_guard_check(snapshot));
+    else if (case_id == "all" || case_id == "afd_list_entry_guard")
+        out["checks"].push_back({{"case_id", "afd_list_entry_guard"}, {"status", "unproven"}, {"reason", "address_is_required"}});
+    if ((case_id == "all" || case_id == "pvscan0_self_reference") && has_snapshot)
+        out["checks"].push_back(pvscan0_self_reference_check(snapshot));
+    else if (case_id == "all" || case_id == "pvscan0_self_reference")
+        out["checks"].push_back({{"case_id", "pvscan0_self_reference"}, {"status", "unproven"}, {"reason", "address_is_required"}});
+    bool any = false;
+    bool all_passed = true;
+    for (const auto& check : out["checks"])
+    {
+        any = true;
+        if (check.value("status", std::string()) != "passed")
+            all_passed = false;
+    }
+    if (any && all_passed)
+        out["overall"] = "passed";
+    return out;
 }
 
 agent_tools::tool_result_t handle_extract_manage(const json& params)
@@ -1987,6 +2945,166 @@ agent_tools::tool_result_t handle_extract_manage(const json& params)
         return failure;
     if (ctx.operation == "capabilities")
         return ok_envelope(ctx, make_capabilities(ctx.tool, extract_ops()));
+    if (ctx.operation == "extract_module_facts")
+    {
+        aida::vuln::chain::extraction_options_t options = extraction_options_from_ctx(ctx);
+        aida::vuln::chain::module_snapshot_t snapshot = aida::vuln::chain::extract_module_snapshot(options);
+        json data = {{"module_facts", aida::vuln::chain::to_json(snapshot)}};
+        json nested_page;
+        if (!apply_nested_pagination(ctx, "extract_module_facts", data, std::string(), nested_page))
+            return error_envelope(ctx, nested_page.value("error", std::string("bad_page_path")), "nested page path is invalid", nested_page);
+        return ok_envelope(ctx, data, json(), nested_page);
+    }
+    if (ctx.operation == "extract_function_facts")
+    {
+        auto ea = payload_location(ctx.payload, "address");
+        if (!ea)
+            return error_envelope(ctx, "bad_param", "address is invalid", {{"field", "payload.address"}});
+        aida::vuln::chain::extraction_options_t options = extraction_options_from_ctx(ctx);
+        aida::vuln::chain::function_snapshot_t snapshot = aida::vuln::chain::extract_function_snapshot(*ea, options);
+        json data = {{"function_facts", aida::vuln::chain::to_json(snapshot)}};
+        json nested_page;
+        if (!apply_nested_pagination(ctx, "extract_function_facts", data, std::string(), nested_page))
+            return error_envelope(ctx, nested_page.value("error", std::string("bad_page_path")), "nested page path is invalid", nested_page);
+        return ok_envelope(ctx, data, json(), nested_page);
+    }
+    if (ctx.operation == "extract_function_batch")
+    {
+        aida::vuln::chain::extraction_options_t options = extraction_options_from_ctx(ctx);
+        std::vector<ea_t> functions = function_locations_from_payload(ctx.payload);
+        json page;
+        if (functions.empty())
+        {
+            function_start_page_t starts = function_start_page(ctx, options.max_batch_functions);
+            if (!starts.cursor_ok)
+                return error_envelope(ctx, "cursor_expired", "cursor does not match this operation or database generation");
+            functions = std::move(starts.starts);
+            page = starts.page;
+        }
+        if (functions.empty())
+        {
+            json empty_batch;
+            empty_batch["schema"] = aida::vuln::chain::k_chain_extraction_schema;
+            empty_batch["module"] = module_identity();
+            empty_batch["functions"] = json::array();
+            empty_batch["statuses"] = json::array();
+            empty_batch["complete"] = true;
+            empty_batch["cancelled"] = false;
+            empty_batch["timeout"] = false;
+            empty_batch["reason"] = "empty_page";
+            return ok_envelope(ctx, {{"batch", empty_batch}}, json(), page);
+        }
+        options.max_batch_functions = std::min(options.max_batch_functions, functions.size());
+        aida::vuln::chain::function_batch_result_t batch = aida::vuln::chain::extract_function_batch(functions, options);
+        json data = {{"batch", aida::vuln::chain::to_json(batch)}};
+        json nested_page;
+        if (!apply_nested_pagination(ctx, "extract_function_batch", data, std::string(), nested_page))
+            return error_envelope(ctx, nested_page.value("error", std::string("bad_page_path")), "nested page path is invalid", nested_page);
+        if (!page.empty())
+            nested_page["function_page"] = page;
+        return ok_envelope(ctx, data, json(), nested_page);
+    }
+    if (ctx.operation == "extract_xref_graph")
+    {
+        auto ea = payload_location(ctx.payload, "address");
+        if (!ea)
+            return error_envelope(ctx, "bad_param", "address is invalid", {{"field", "payload.address"}});
+        aida::vuln::chain::extraction_options_t options = extraction_options_from_ctx(ctx);
+        if (!ctx.payload.contains("layers"))
+        {
+            options.include_bytes = false;
+            options.include_types = false;
+            options.include_ctree = false;
+            options.include_microcode = false;
+            options.include_effects = false;
+            options.include_xrefs = true;
+            options.include_xref_indexes = true;
+        }
+        std::optional<ea_t> target = payload_location(ctx.payload, "target");
+        aida::vuln::chain::function_snapshot_t snapshot = aida::vuln::chain::extract_function_snapshot(*ea, options);
+        json data = {{"xref_graph", xref_graph_data(ctx, snapshot, target)}};
+        json nested_page;
+        if (!apply_nested_pagination(ctx, "extract_xref_graph", data, std::string(), nested_page))
+            return error_envelope(ctx, nested_page.value("error", std::string("bad_page_path")), "nested page path is invalid", nested_page);
+        return ok_envelope(ctx, data, json(), nested_page);
+    }
+    if (ctx.operation == "extract_path_window")
+    {
+        auto entry = payload_location(ctx.payload, "entry");
+        auto target = payload_location(ctx.payload, "target");
+        if (!entry || !target)
+            return error_envelope(ctx, "bad_param", "entry and target are required", {{"required", json::array({"payload.entry", "payload.target"})}});
+        aida::vuln::chain::extraction_options_t options = extraction_options_from_ctx(ctx);
+        if (!ctx.payload.contains("layers"))
+        {
+            options.include_bytes = false;
+            options.include_types = false;
+            options.include_ctree = false;
+            options.include_microcode = false;
+            options.include_effects = true;
+            options.include_xrefs = true;
+            options.include_xref_indexes = true;
+        }
+        aida::vuln::chain::function_snapshot_t snapshot = aida::vuln::chain::extract_function_snapshot(*entry, options);
+        aida::vuln::chain::path_trace_t trace = aida::vuln::chain::trace_path_corridor(snapshot, static_cast<std::uint64_t>(*entry), static_cast<std::uint64_t>(*target), path_options_from_ctx(ctx));
+        json data = {{"function", aida::vuln::chain::to_json(snapshot.identity)}, {"path", aida::vuln::chain::to_json(trace)}, {"cache", aida::vuln::chain::to_json(snapshot.cache)}};
+        json nested_page;
+        if (!apply_nested_pagination(ctx, "extract_path_window", data, std::string(), nested_page))
+            return error_envelope(ctx, nested_page.value("error", std::string("bad_page_path")), "nested page path is invalid", nested_page);
+        return ok_envelope(ctx, data, json(), nested_page);
+    }
+    if (ctx.operation == "extract_type_facts")
+    {
+        auto ea = payload_location(ctx.payload, "address");
+        if (!ea)
+            return error_envelope(ctx, "bad_param", "address is invalid", {{"field", "payload.address"}});
+        aida::vuln::chain::extraction_options_t options;
+        options.include_bytes = false;
+        options.include_xrefs = false;
+        options.include_xref_indexes = false;
+        options.include_ctree = false;
+        options.include_microcode = false;
+        options.include_effects = false;
+        options.include_types = true;
+        options.force_refresh = ctx.payload.value("force_refresh", false);
+        aida::vuln::chain::function_snapshot_t snapshot = aida::vuln::chain::extract_function_snapshot(*ea, options);
+        json statuses = json::array();
+        for (const auto& status : snapshot.statuses)
+            statuses.push_back(aida::vuln::chain::to_json(status));
+        json data = {{"function", aida::vuln::chain::to_json(snapshot.identity)}, {"type", aida::vuln::chain::to_json(snapshot.type)}, {"statuses", statuses}, {"cache", aida::vuln::chain::to_json(snapshot.cache)}};
+        json nested_page;
+        if (!apply_nested_pagination(ctx, "extract_type_facts", data, std::string(), nested_page))
+            return error_envelope(ctx, nested_page.value("error", std::string("bad_page_path")), "nested page path is invalid", nested_page);
+        return ok_envelope(ctx, data, json(), nested_page);
+    }
+    if (ctx.operation == "resolve_cross_binary")
+    {
+        json modules = resolver_modules_from_ctx(ctx);
+        json reference = ctx.payload.value("reference", json::object());
+        json data = {{"resolver_index", aida::vuln::chain::build_cross_binary_resolver_index(modules)},
+                     {"resolution", aida::vuln::chain::resolve_cross_binary_reference(modules, reference)}};
+        json nested_page;
+        if (!apply_nested_pagination(ctx, "resolve_cross_binary", data, std::string(), nested_page))
+            return error_envelope(ctx, nested_page.value("error", std::string("bad_page_path")), "nested page path is invalid", nested_page);
+        return ok_envelope(ctx, data, json(), nested_page);
+    }
+    if (ctx.operation == "case_study_self_check")
+    {
+        json data = {{"self_check", case_study_self_check_data(ctx)}};
+        json nested_page;
+        if (!apply_nested_pagination(ctx, "case_study_self_check", data, std::string(), nested_page))
+            return error_envelope(ctx, nested_page.value("error", std::string("bad_page_path")), "nested page path is invalid", nested_page);
+        return ok_envelope(ctx, data, json(), nested_page);
+    }
+    if (ctx.operation == "extraction_cache_status")
+        return ok_envelope(ctx, {{"cache", aida::vuln::chain::extraction_cache_status()}});
+    if (ctx.operation == "invalidate_extraction_cache")
+    {
+        if (!ctx.payload.value("confirm_destructive", false) || ctx.payload.value("reason", std::string()).empty())
+            return error_envelope(ctx, "destructive_denied", "invalidate_extraction_cache requires confirm_destructive=true and a non-empty reason");
+        aida::vuln::chain::clear_extraction_cache();
+        return ok_envelope(ctx, {{"cleared", true}, {"cache", aida::vuln::chain::extraction_cache_status()}});
+    }
     if (ctx.operation == "functions")
     {
         json all = json::array();

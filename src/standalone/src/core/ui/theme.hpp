@@ -700,6 +700,10 @@ namespace aida::ui {
 		return (c & ~mask) | (((ImU32)aa) << IM_COL32_A_SHIFT);
 	}
 
+	inline ImU32 with_alpha(const ImVec4& c, float a) {
+		return with_alpha(ImGui::ColorConvertFloat4ToU32(c), a);
+	}
+
 	inline ImU32 lighten(ImU32 c, int amount) {
 		int r = (int)((c >> IM_COL32_R_SHIFT) & 0xFF) + amount;
 		int g = (int)((c >> IM_COL32_G_SHIFT) & 0xFF) + amount;

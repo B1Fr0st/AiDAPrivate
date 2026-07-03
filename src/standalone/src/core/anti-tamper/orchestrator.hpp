@@ -3635,9 +3635,13 @@ inline bool guard()
                     constexpr uint64_t kKernelDetectionSettleGraceMs = 3000;
 
                     const uint32_t flags = adbg_result.result_flags;
+                    const uint32_t soft_flags = flags & kSoftFlags;
                     const bool hard_hit  = kernel_adbg_hard_flags_present(flags);
-                    const bool two_soft  = (flags & kSoftFlags) != 0 &&
-                                           ((flags & kSoftFlags) & ((flags & kSoftFlags) - 1)) != 0;
+                    const bool two_soft  = soft_flags != 0 &&
+                                           (soft_flags & (soft_flags - 1)) != 0;
+                    const bool isolated_soft = flags == soft_flags &&
+                                               soft_flags != 0 &&
+                                               (soft_flags & (soft_flags - 1)) == 0;
 
                     uint64_t sentinel_ready_since_tsc = driver_bridge::sentinel_ready_since_tsc();
                     uint64_t now_ms = guard_now_ms();
@@ -3663,7 +3667,18 @@ inline bool guard()
                         rt.kernel_flag_persist_count = 1;
                     }
 
-                    const bool persist_hit = (rt.kernel_flag_persist_count >= 3);
+                    const bool persist_hit = (rt.kernel_flag_persist_count >= 3) && !isolated_soft;
+                    if (isolated_soft && rt.kernel_flag_persist_count >= 3)
+                    {
+                        char soft_dbg[192];
+                        _snprintf_s(soft_dbg, sizeof(soft_dbg), _TRUNCATE,
+                            "kernel_flag_isolated_soft_observed flags=0x%x persist=%u debugger_pid=%llu dr_clear=%llu",
+                            flags,
+                            rt.kernel_flag_persist_count,
+                            static_cast<unsigned long long>(adbg_result.detected_debugger_pid),
+                            static_cast<unsigned long long>(adbg_result.dr_clear_count));
+                        webhook::write_log("guard", soft_dbg);
+                    }
 
                     if (settle_active)
                     {

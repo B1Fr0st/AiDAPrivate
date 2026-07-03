@@ -420,7 +420,9 @@ namespace anti_dump_kernel {
         }
 
         status = hide_all_threads(pid);
-        if (!NT_SUCCESS(status)) {
+        if (status == STATUS_NOT_SUPPORTED) {
+            WW_LOG("anti_dump: thread hide unsupported pid=%u", pid);
+        } else if (!NT_SUCCESS(status)) {
             WW_LOG("anti_dump: thread hide failed 0x%08x", status);
         }
 

@@ -2,6 +2,47 @@
 
 Scope: AiDA IDA Pro plugin vulnerability-chain verification. This plan supersedes the chain-specific assumptions in plans 02 through 06 while preserving their useful extraction, multi-IDB, cache, and job-system architecture. The engine verifies arbitrary multi-stage chains across arbitrary binaries as one continuous trace. The `driver/PROGRESS.md` case studies are regression evidence only, not the architecture boundary.
 
+## Source Verification Status - 2026-07-03
+
+Verdict: **NOT 100% implemented. Keep this plan open.**
+
+Source evidence proves partial implementation exists:
+
+- `src/vuln/chain_model.hpp` defines `aida_chain_document_v2`, `chain_verification_report_v2`, generic fact kinds, value kinds, provenance kinds, link roles, objective kinds, trigger kinds, budgets, evidence refs, assumptions, links, objectives, target model, and verification policy.
+- `src/vuln/chain_schema.cpp` parses and validates the v2 document shape, rejects unknown fields, supports legacy v1 migration, validates corpus/link/objective references, and exposes schema/self-check helpers.
+- `src/vuln/chain_state.hpp` defines register, memory, alias, lifetime, allocator, callback, side-effect, and final-goal state structures.
+- `src/vuln/chain_report.cpp` defines the v2 report model, acceptance finalization, failure codes, and self-check behavior that blocks accepted confirmation when critical facts remain unknown.
+- `src/vuln/chain_extraction.cpp` extracts module and function snapshots with raw instruction facts, xrefs, type facts, ctree, microcode status, imports, entries, and segments under `execute_sync(..., MFF_READ)`.
+- `src/vuln/chain_solver.cpp` evaluates explicit branch/value/alias/protocol/objective SMT obligations with cache keys and maps unknown/timeout to non-confirming verdicts.
+- `src/vuln/chain_verification_engine.cpp` implements a contract-based verifier over declared facts, preconditions, postconditions, solver obligations, corpus availability, boundaries, and objectives.
+- `src/vuln/chain_verification_tools.hpp` registers consolidated MCP surfaces through `ida_chain_manage`, `ida_project_manage`, `ida_extract_manage`, `ida_report_manage`, and `ida_job_manage`, with action/operation aliases, pagination cursors, in-memory jobs, report export, and extraction operations.
+
+Source evidence also proves this plan is still incomplete:
+
+- The required MCP tool names `chain_verify_manage`, `chain_verify_query`, and `chain_extract_query` are not registered. The current registered names are `ida_chain_manage`, `ida_project_manage`, `ida_extract_manage`, `ida_report_manage`, and `ida_job_manage`.
+- The registered `ida_chain_manage` submit/start path does not call `aida::vuln::chain::engine().verify()`. It builds reports through local `build_chain_report()` and per-link `verify_link_data()`, so it is not the universal continuous-trace engine.
+- `ChainVerificationEngine::verify()` never calls the extraction service, path corridor builder, trigger tracer, side-effect classifier over live snapshots, cross-domain logic, or MCP peer routing. It consumes facts and obligations already present in the JSON document.
+- Package C is not implemented as planned: there are no `chain_transfer.*`, `chain_alias.*`, `chain_lifetime.*`, or `chain_protocol.*` files. `chain_state.*` models these domains, but there is no generic transfer engine that derives content, alias, allocator, lifetime, protocol, and poison/fatal facts from execution.
+- Package D is not implemented as planned: there are no `chain_cross_domain.*` files, and the existing `chain_path_trace.cpp`/`chain_trigger_trace.cpp` are same-function snapshot helpers, not universal cross-binary/cross-domain ABI, message, callback, interrupt, firmware, and protocol transition proof.
+- Package F is incomplete: there are no `chain_job_manager.*`, `chain_cache.*`, or `chain_recovery.*` files. The registered tools use process-local in-memory job/report maps, and report ledger operations call the old `verify::engine().persist_ledger()` path instead of the chain store.
+- Package G is incomplete: there is no `chain_mcp_tools.cpp`, no required `chain_verify_manage/query/extract_query` names, and no MCP chain resource templates. Report responses include `ida://chain/reports/...` resource descriptors with `available_via`, but `src/mcp_server.cpp` only exposes generic resource templates such as function/address/struct/import/export/xrefs.
+- Package H is incomplete: `chain_report.*` exists, but no `chain_report_view.*` source exists and the registered submit path does not emit the full `chain_report_t` model from `chain_report.cpp`.
+- Package I is incomplete: there is no `src/vuln/tests` chain test tree and no `src/vuln/tests/chain_regression_specs/*.json`; `ChainVerificationEngine::universal_synthetic_regression_specs()` embeds only five synthetic specs, not suites A through I.
+- The IDA-safety acceptance is not fully met. `chain_extraction.cpp` uses bounded `MFF_READ` slices, but `src/vuln/chain_verification_tools.hpp` also calls IDA APIs such as `get_func()`, `getn_func()`, xref enumeration, segment access, imports, entries, and byte reads directly from handlers instead of through the extraction slice layer.
+- The path trace source is not proven build-clean by inspection: `src/vuln/chain_path_trace.cpp` refers to `instruction_fact`, while `src/vuln/chain_extraction.hpp` declares `instruction_fact_t` and no source-visible alias was found.
+- The plan's strict acceptance rule is not enforced on the registered submit path. `build_chain_report()` can mark a chain `confirmed` and `accepted` from independent per-link verdict counts and simple boundary results, without requiring full P0-P6 proof completeness.
+
+Remaining work required before this plan can be deleted:
+
+1. Decide and implement the canonical MCP names, or update this plan only after the shipped API names are intentionally accepted. The current mismatch is not a completed implementation of this plan.
+2. Wire the registered submit/query/extract surface to the production `aida::vuln::chain` schema, report, extraction, solver, store, and verifier layers.
+3. Replace per-link report assembly with a single continuous trace engine that derives facts from extraction and transfer rather than declared JSON postconditions.
+4. Implement the missing transfer, alias, lifetime, protocol, cross-domain, job-manager, cache, recovery, MCP resource-template, optional report-view, and regression-test packages.
+5. Ensure every IDA SDK read in verifier/extraction paths runs through bounded `MFF_READ` slices and no raw SDK pointer escapes serialized snapshots.
+6. Implement resource-backed paginated chain reports through MCP resources/templates, not only tool-response resource hints.
+7. Encode and run suites A through I, including the PROGRESS.md cases as ordinary specs with no hardcoded exploit-family logic.
+8. Make the registered submit path enforce P0-P6 proof completeness before any `confirmed`/`accepted` verdict can be emitted.
+
 ## Required Evidence Read
 
 1. `driver/PROGRESS.md:2229-2516` documents the failure class this engine must eliminate:

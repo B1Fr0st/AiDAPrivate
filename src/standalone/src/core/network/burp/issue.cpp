@@ -655,17 +655,16 @@ bool save_to_disk()
         f.write(out.data(), static_cast<std::streamsize>(out.size()));
         f.close();
         diag::log_tagged_fmt("issue", "save_to_disk written bytes=%zu", out.size());
-        std::error_code ec;
-        std::filesystem::rename(tmp_path, path, ec);
-        if (ec) {
-            diag::log_tagged_fmt("issue", "save_to_disk rename_failed retrying ec=%s", ec.message().c_str());
-            std::filesystem::remove(path, ec);
-            std::filesystem::rename(tmp_path, path, ec);
-            if (ec) {
-                diag::log_tagged_fmt("issue", "save_to_disk rename_failed_final ec=%s", ec.message().c_str());
-                set_err("issue_store.save: rename failed");
-                return false;
-            }
+        const std::wstring tmp_w = std::filesystem::path(tmp_path).wstring();
+        const std::wstring path_w = std::filesystem::path(path).wstring();
+        if (!MoveFileExW(tmp_w.c_str(), path_w.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            const DWORD gle = GetLastError();
+            diag::log_tagged_fmt("issue", "save_to_disk replace_failed gle=%lu tmp=%s path=%s",
+                static_cast<unsigned long>(gle), tmp_path.c_str(), path.c_str());
+            set_err("issue_store.save: replace failed");
+            std::error_code ec;
+            std::filesystem::remove(tmp_path, ec);
+            return false;
         }
         diag::log_tagged_fmt("issue", "save_to_disk ok path=%s", path.c_str());
         s.last_save_ms.store(now_ms(), std::memory_order_release);
@@ -696,6 +695,7 @@ bool load_from_disk()
         return true;
     }
     std::string raw((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    f.close();
     if (raw.empty()) {
         diag::log_tagged_fmt("issue", "load_from_disk file_empty");
         return reset_store_after_load_failure(path, "empty file");

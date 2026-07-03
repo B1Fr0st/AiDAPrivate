@@ -2,6 +2,7 @@
 #include "ida_utils.hpp"
 #include "graphrag.hpp"
 #include "analysis_db.hpp"
+#include "multibinary_project.hpp"
 #include "anti_re.hpp"
 #include "vuln/vuln_tools.hpp"
 #include "vuln/verification_tools.hpp"
@@ -27,6 +28,14 @@ using json = nlohmann::json;
 
 namespace agent_tools
 {
+
+static std::string current_module_graph_key()
+{
+    aida::vuln::chain::corpus_record_t corpus = aida::vuln::chain::snapshot_current_idb_corpus();
+    if (!corpus.identity.corpus_id.empty())
+        return corpus.identity.corpus_id;
+    return aida_db::AnalysisDB::instance().get_binary_hash();
+}
 
 tool_result_t tool_result_t::ok(const std::string& msg, const json& data)
 {
@@ -852,7 +861,7 @@ tool_result_t rename_function(const json& params)
 
         auto& store = graphrag::GraphStore::instance();
         auto* node = store.get_node_by_address(
-            aida_db::AnalysisDB::instance().get_binary_hash(),
+            current_module_graph_key(),
             graphrag::node_type_t::FUNCTION, pfn->start_ea);
         if (node)
         {
@@ -2634,7 +2643,7 @@ tool_result_t search_strings(const json& params)
 
 
     {
-        std::string hash = aida_db::AnalysisDB::instance().get_binary_hash();
+        std::string hash = current_module_graph_key();
         if (!hash.empty())
         {
             auto& store = graphrag::GraphStore::instance();
@@ -2780,7 +2789,7 @@ tool_result_t find_instructions(const json& params)
 
 
     {
-        std::string hash = aida_db::AnalysisDB::instance().get_binary_hash();
+        std::string hash = current_module_graph_key();
         if (!hash.empty())
         {
             auto& store = graphrag::GraphStore::instance();
@@ -3794,7 +3803,7 @@ tool_result_t batch_rename(const json& params)
 
             auto& store = graphrag::GraphStore::instance();
             auto* node = store.get_node_by_address(
-                aida_db::AnalysisDB::instance().get_binary_hash(),
+                current_module_graph_key(),
                 graphrag::node_type_t::FUNCTION, *ea_opt);
             if (node)
             {
@@ -8119,7 +8128,7 @@ void register_tools()
 
 static std::string get_current_binary_hash()
 {
-    return aida_db::AnalysisDB::instance().get_binary_hash();
+    return current_module_graph_key();
 }
 
 namespace graphrag_tools
@@ -13086,7 +13095,7 @@ namespace
 
     std::string current_hash()
     {
-        return aida_db::AnalysisDB::instance().get_binary_hash();
+        return current_module_graph_key();
     }
 
     bool graph_indexed()

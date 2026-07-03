@@ -32,7 +32,7 @@ struct path_step_t
     std::string text;
     std::vector<branch_fact_t> branches;
     std::vector<call_fact_t> calls;
-    std::vector<side_effect_t> side_effects;
+    std::vector<extracted_side_effect_t> side_effects;
     bool before_target = true;
     bool terminal = false;
 };

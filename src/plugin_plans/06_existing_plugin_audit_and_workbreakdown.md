@@ -2,6 +2,40 @@
 
 Date: 2026-07-03
 
+## Verification Subagent 6 Status (2026-07-03)
+
+Result: NO. Leave this plan open. Source evidence proves a partial chain-verification implementation in the IDA plugin, but not the full production feature described below.
+
+Implemented source evidence:
+
+- `CMakeLists.txt:2600-2616` and `CMakeLists.txt:2651-2665` include the chain source/header set in the AiDA plugin target.
+- `src/agent_tools.cpp:12544` registers `aida::vuln::chain_mcp::register_manage_tools()`.
+- `src/vuln/chain_verification_tools.hpp:1537-1558` defines `ida_chain_manage` operations for `validate_spec`, `submit`, `start`, `status`, `cancel`, `resume`, `export`, `verify_link`, `boundary_match`, `trigger_confirm`, `get_report`, `list`, `evidence_fetch`, `explain_failure`, and `diagnostics`.
+- `src/vuln/chain_extraction.cpp:937-1090` captures function facts from IDA function boundaries, instructions, xrefs, CFG, ctree, and microcode, and `src/vuln/chain_extraction.cpp:1138-1193` wraps module/function extraction in `execute_sync(req, MFF_READ)` with exception containment.
+- `src/vuln/chain_path_trace.cpp:200-313` traces an intraprocedural corridor through a function snapshot and records steps, branches, calls, side effects, unresolved edges, and blockers.
+- `src/vuln/chain_state_contracts.cpp:590-755` implements contract matching for value, identity, content, alias-set, object-lifetime, authority-control, timing, and objective dimensions, including zero-versus-controlled content and self-reference failures.
+- `src/vuln/chain_verification_engine.cpp:568-734` verifies normalized documents through corpus checks, link preconditions, solver obligations, call/return obligations, side-effect obligations, boundaries, objectives, cancellation, and budget handling.
+- `src/vuln/chain_verification_engine.cpp:758-812` contains synthetic regression specs for controlled copy, zero-fill refutation, self-reference, and write-through mismatch.
+
+Remaining gaps proven by source evidence:
+
+- The registered MCP submit/report path does not call `aida::vuln::chain::ChainVerificationEngine::verify`. A source search finds `ChainVerificationEngine::verify` only in its declarations/definitions, while `src/vuln/chain_verification_tools.hpp:1265-1410` builds MCP reports through `build_chain_report()`, legacy `verify_taint_path`, and `boundary_match_data()`.
+- `chain_path_trace`, `chain_trigger_trace`, and `extract_function_snapshot()` are not wired into the MCP chain submit path. Their only source references are their own declarations/definitions and local helper use, so the path/trigger extraction modules are not part of the public chain-verification workflow.
+- `src/vuln/chain_verification_tools.hpp:1037-1088` implements `boundary_match_data()` as shallow JSON equality for `postconditions`/`preconditions` and `output`/`input`, optionally adding legacy wire constraints. It does not use the richer identity, alias, lifetime, timing, or authority contract matcher from `chain_state_contracts`.
+- `src/vuln/chain_verification_tools.hpp:1105-1220` implements `trigger_confirm_data()` as a current-IDB static caller/callee BFS through xrefs. It does not use `chain_trigger_trace`, path-trace branch blockers, trigger-root models, unresolved indirect-edge reports, or multi-binary trigger evidence.
+- `src/vuln/chain_store.cpp` implements durable document/report/ledger helpers, but the active MCP job/report state in `src/vuln/chain_verification_tools.hpp:93-121` and `src/vuln/chain_verification_tools.hpp:731-813` is process-local memory. MCP chain reports are not durably persisted through `chain_store` under `aida_db`.
+- A source search found no NTFS/ETW, `RemoveEntryList`, `AfdCloseConnection`, `_setjmp`, `pvScan0`, `gpHandleManager`, or `SetBitmapBits` case-study fixtures in the chain source. The current regression evidence is synthetic, not the three required PROGRESS case studies.
+- The active MCP corpus path is current-module oriented through `module_identity()` and a process-local corpus manifest. There is no completed source evidence that inactive binaries, cross-IDB dependencies, binary hash mismatch invalidation, and cross-binary path obligations are enforced in `ida_chain_manage.submit`.
+
+Remaining work:
+
+1. Wire `ida_chain_manage.validate_spec`, `submit`, `get_report`, and `export` to the `aida::vuln::chain` schema/model/store/engine/report stack instead of the shallow `build_chain_report()` path.
+2. Integrate `chain_extraction`, `chain_path_trace`, `chain_side_effects`, and `chain_trigger_trace` into link verification, boundary matching, trigger confirmation, and report evidence.
+3. Persist chain specs, jobs, reports, and ledgers through `chain_store` under `aida_db`; process-local maps may only be live runtime indexes.
+4. Add source-backed or recorded fixtures for the NTFS-to-ETW zero-fill/trigger refutation, AFD `_setjmp` LIST_ENTRY self-reference gate, and `pvScan0 = gpHandleManager` write-through contradiction.
+5. Complete multi-binary corpus binding, binary hash validation, inactive-IDB dependency reporting, cross-binary contracts, and stale-evidence invalidation in the MCP chain workflow.
+6. Re-verify no modal UI or wait-box paths exist after integration, then have the host AI run the canonical build after any source changes.
+
 This plan is an investigation deliverable only. It does not change plugin behavior, does not build AiDA, and does not deploy anything. The implementation target is a production-grade IDA Pro plugin capability that verifies complete multi-binary vulnerability chains rather than scoring isolated primitives.
 
 ## Mandatory Evidence From driver/PROGRESS.md

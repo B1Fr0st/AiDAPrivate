@@ -1,5 +1,29 @@
 # Multi-Binary Project Model Plan
 
+## Implementation Subagent D Source Update
+
+Status: **INCOMPLETE**. The plan remains open and must not be deleted.
+
+Implemented source changes now present:
+
+- Durable page roots were added for function pages, xrefs, signatures, dispatch tables, callbacks, globals, imports, exports, summaries, and cross-edge pages in `src/multibinary_project.cpp`.
+- `src/multibinary_index.hpp` and `src/multibinary_index.cpp` now expose `index_page_status` and `index_page` read APIs. `build_current_module_index` writes per-family msgpack pages and manifests with resumable `aida_idx|family|module|page` cursors in addition to the bounded compatibility catalog.
+- `src/multibinary_index.cpp` now captures bounded first-byte function signatures with `get_bytes`, captures non-flow code/data xrefs with `xrefblk_t`, derives fail-closed resolver evidence for guard dispatch imports, dispatch/IOCTL/callback naming candidates, and global pointer xrefs, and persists those as separate page families.
+- `src/multibinary_index.cpp` now resolves imports through explicit module aliases and supplied API-set maps/contracts, emits unresolved `api_set_map_missing`/`api_set_hosts_not_loaded` gaps when no source-backed API-set host exists, emits syscall/service edges only from supplied `syscall_services` evidence, and emits fail-closed CFG/XFG guard, indirect call, global function pointer, driver dispatch, IOCTL dispatch, and callback-registration edges.
+- `src/vuln/chain_verification_tools.hpp` now exposes `index_page_status` and `index_page` through `ida_project_manage`. `inventory_all` now records concrete `peer_data_missing` gaps from `list_ida_instances` when caller-supplied `query_all_instances` fanout results are absent, while still returning the safe fanout request for the MCP aggregator path.
+- `src/vuln/chain_verifier.cpp` now evaluates supplied/persisted continuous trace evidence per link: unresolved trace edges, branch blockers, unresolved or indirect call targets, cross-module ABI-transfer proof, target module live-instance bindings, unknown register/memory state, unmodeled side effects, and poison side effects all block confirmation.
+- `src/vuln/chain_verifier.cpp` now bundles NTFS/AFD/pvScan0 case-study fixture definitions and exposes them through `case_study_regressions` without synthetic passes; absent source evidence produces inconclusive fixture checks.
+
+Remaining requirements not fully implemented:
+
+1. Cross-instance fanout is not executed directly inside `ida_project_manage` because that handler runs under the normal IDA tool execution path and the local aggregator self-call can queue back to the main thread. Evidence: `src/vuln/chain_verification_tools.hpp` records `peer_data_missing` gaps and returns the safe `query_all_instances` request instead of pretending peer data exists.
+2. Syscall/API-set/dispatch/callback/global/indirect resolution is implemented only when source-backed durable evidence is present or supplied in module records/pages; it intentionally fails closed for missing API-set maps, missing syscall tables, unproven dispatch assignments, and unproven guard/indirect targets. Full Windows build-specific service-table extraction is still not implemented.
+3. Continuous verification now consumes trace evidence and blocks unknown CFG/register/memory/ABI state, but it does not yet route follow-up ABI state into remote target IDBs or synthesize new target-IDB traces through MCP. Evidence: cross-module calls without a live target binding or proven ABI transfer become `peer_data_missing`/`abi_transfer_unproven`.
+4. Deep summaries are paged as bounded summary records derived from the function catalog, signatures, xrefs, and resolver evidence. Full lazy decompiler/microcode/SMT summary generation per page is still not implemented.
+5. GraphRAG still serializes `binary_hash` for migration compatibility. New writes use corpus IDs and canonical RVAs, but old field names remain intentionally live so existing graphs can load without fabricated cross-module confidence. Evidence: `src/graphrag.hpp` and `src/graphrag.cpp` remain unchanged by this subagent.
+6. Instance registry records themselves were not expanded with index generation, image base, or min/max EA. Durable module records and page manifests capture the relevant index fields instead. Evidence: `src/instance_registry.hpp` remains unchanged.
+7. No build was run by this implementation subagent by instruction. Host verification must compile the new source and treat any compiler warning/error as open work.
+
 ## Objective
 
 Design the IDA Pro side of AiDA's production-grade multi-binary vulnerability-chain verifier. This slice owns project identity, cross-IDB indexing, cross-module edge resolution, persistence, and the state model needed for continuous chain verification across drivers, ntoskrnl, win32k, user-mode DLLs, and other loaded or required binaries.

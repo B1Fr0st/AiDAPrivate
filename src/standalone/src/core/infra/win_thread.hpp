@@ -339,8 +339,9 @@ inline bool try_beginthreadex(thread_state_t* state,
     SetLastError(0);
     DWORD t0 = GetTickCount();
     uintptr_t raw = _beginthreadex(nullptr, stack_bytes, &crt_entry, state, 0, &tid);
-    DWORD gle = GetLastError();
-    int crt = errno;
+    const bool ok = raw != 0;
+    DWORD gle = ok ? 0 : GetLastError();
+    int crt = ok ? 0 : errno;
     DWORD elapsed = GetTickCount() - t0;
     HANDLE h = reinterpret_cast<HANDLE>(raw);
     diag::log_tagged_fmt("win_thread",
@@ -356,7 +357,7 @@ inline bool try_beginthreadex(thread_state_t* state,
         static_cast<unsigned long>(GetCurrentThreadId()),
         state,
         reinterpret_cast<void*>(&crt_entry));
-    if (raw != 0) {
+    if (ok) {
         out_handle = h;
         out_tid = tid;
         return true;

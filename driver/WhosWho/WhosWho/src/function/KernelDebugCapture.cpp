@@ -385,12 +385,14 @@ namespace dbg_capture {
         }
         LARGE_INTEGER end = KeQueryPerformanceCounter(nullptr);
         result.elapsed_us = elapsed_us(start, end, freq);
-        result.ring_drop_events = static_cast<ULONG>(_InterlockedCompareExchange(&g_ring_drop_events, 0, 0));
-        result.ring_drop_bytes = static_cast<ULONG>(_InterlockedCompareExchange(&g_ring_drop_bytes, 0, 0));
-        result.flush_lost_events = static_cast<ULONG>(_InterlockedCompareExchange(&g_flush_lost_events, 0, 0));
-        result.flush_lost_bytes = static_cast<ULONG>(_InterlockedCompareExchange(&g_flush_lost_bytes, 0, 0));
-        result.immediate_failures = static_cast<ULONG>(_InterlockedCompareExchange(&g_immediate_failures, 0, 0));
-        result.immediate_last_status = static_cast<NTSTATUS>(_InterlockedCompareExchange(&g_immediate_last_status, 0, 0));
+        result.ring_drop_events = static_cast<ULONG>(_InterlockedExchange(&g_ring_drop_events, 0));
+        result.ring_drop_bytes = static_cast<ULONG>(_InterlockedExchange(&g_ring_drop_bytes, 0));
+        result.flush_lost_events = static_cast<ULONG>(_InterlockedExchange(&g_flush_lost_events, 0));
+        result.flush_lost_bytes = static_cast<ULONG>(_InterlockedExchange(&g_flush_lost_bytes, 0));
+        result.immediate_failures = static_cast<ULONG>(_InterlockedExchange(&g_immediate_failures, 0));
+        result.immediate_last_status = result.immediate_failures != 0
+            ? static_cast<NTSTATUS>(_InterlockedExchange(&g_immediate_last_status, STATUS_SUCCESS))
+            : STATUS_SUCCESS;
         return result;
     }
 
@@ -454,8 +456,8 @@ namespace dbg_capture {
             write_status = st;
         }
         if (!NT_SUCCESS(st) || !NT_SUCCESS(write_status)) {
-            _InterlockedIncrement(&g_immediate_failures);
             _InterlockedExchange(&g_immediate_last_status, static_cast<LONG>(!NT_SUCCESS(st) ? st : write_status));
+            _InterlockedIncrement(&g_immediate_failures);
         }
     }
 

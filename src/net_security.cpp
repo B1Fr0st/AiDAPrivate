@@ -23,6 +23,7 @@ extern std::unique_ptr<voyager::device_t> device;
 
 using json = nlohmann::json;
 
+namespace net_security {
 
 static std::string bytes_to_hex(const std::uint8_t* data, std::size_t len) {
     std::string result;
@@ -899,9 +900,6 @@ static bool aes_ecb_encrypt(const std::uint8_t key[16],
     BCryptCloseAlgorithmProvider(hAlg, 0);
     return ok;
 }
-
-
-namespace net_security {
 
 bool validate_tshark_display_filter(const std::string& display_filter, std::string* reason) {
     if (reason)

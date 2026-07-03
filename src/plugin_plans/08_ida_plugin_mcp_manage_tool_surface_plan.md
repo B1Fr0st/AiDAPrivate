@@ -1,5 +1,43 @@
 # AiDA IDA Plugin MCP Manage Tool Surface Plan
 
+## Verification Subagent 6 Status (2026-07-03)
+
+Result: NO. Leave this plan open. Source evidence proves a partial manage-tool layer for chain/project/extract/report/job workflows, but the full low-count public MCP surface, registry migration, wrapper migration, resource catalog, and operation-level runtime model are not complete.
+
+Implemented source evidence:
+
+- `src/vuln/chain_verification_tools.hpp:45-80` defines local `operation_meta_t` fields for per-operation read-only/destructive/deterministic/job/cache/budget/index metadata, and `src/vuln/chain_verification_tools.hpp:624-689` parses `operation`, accepts `action` as a migration alias, validates `schema_version`, flattens top-level fields into `payload`, and returns deterministic envelope errors.
+- `src/vuln/chain_verification_tools.hpp:1537-1624` defines operation catalogs for `ida_chain_manage`, `ida_project_manage`, `ida_extract_manage`, `ida_report_manage`, and `ida_job_manage`.
+- `src/vuln/chain_verification_tools.hpp:2371-2408` registers exactly those five manage tools.
+- `src/vuln/chain_verification_tools.hpp:703-813` implements process-local job/report records, report resource descriptors, and content hashes for report exports.
+- `src/vuln/chain_verification_tools.hpp:1838-1858`, `src/vuln/chain_verification_tools.hpp:1988-2134`, and `src/vuln/chain_verification_tools.hpp:2167-2182` use cursor pagination for report, extraction, and report-list outputs.
+- `src/vuln/chain_verification_tools.hpp:2192-2194` requires `confirm_destructive=true` and a non-empty `reason` for `ledger_clear`.
+- `src/mcp_server.cpp:1930-1968` preserves existing `instance_id`/`pid` routing and peer proxying for MCP `tools/call`.
+
+Remaining gaps proven by source evidence:
+
+- The plan requires eight consolidated public manage tools plus routing compatibility tools. Source registration currently has five manage tools only: `ida_chain_manage`, `ida_project_manage`, `ida_extract_manage`, `ida_report_manage`, and `ida_job_manage`. There is no `ida_discover_manage`, `ida_analysis_manage`, `ida_cache_manage`, `ida_mutation_manage`, or `ida_diagnostics_manage` registration in `src/agent_tools.cpp`, `src/mcp_server.cpp`, or `src/vuln`.
+- `src/agent_tools.hpp:66-94` still defines `tool_definition_t` with only tool-level metadata: name, category, description, parameters, handler, read-only, output schema, destructive, deterministic, and required indices. There is no registry-level `visibility` field and no first-class operation metadata on `tool_definition_t`.
+- `src/agent_tools.cpp:163-207` emits tool-level schema fields only. The operation metadata exists inside the manage tools' parameter enum/capabilities response, not in the registry's native schema as required by Package 1.
+- `src/mcp_server.cpp:1657-1660` exposes every registered non-`session` tool through MCP, and `src/mcp_server.cpp:1748-1832` builds `tools/list` from all exposed tools. Legacy one-off tools are therefore still public by default rather than hidden behind a `visibility=legacy` migration.
+- Existing one-off tools remain direct handlers, such as `rename_function` at `src/agent_tools.cpp:1129-1136`, `set_function_signature` at `src/agent_tools.cpp:1161-1168`, `patch_bytes` at `src/agent_tools.cpp:1542-1549`, and `idb_save` at `src/agent_tools.cpp:9989`. A source search finds no `deprecated_by` metadata in wrapper results.
+- `src/mcp_server.cpp:1174-1218` still executes normal MCP tools through one `execute_sync` call selected by tool-level `read_only`. Long manage-tool operations are not backed by a generic off-main-thread job runtime; `ida_chain_manage.submit` creates and completes its process-local job synchronously in `src/vuln/chain_verification_tools.hpp:1786-1811`.
+- `src/mcp_server.cpp:641-774` lists static resources, and `src/mcp_server.cpp:798-842` resolves dynamic resources only for `ida://function`, `ida://address`, `ida://struct`, `ida://import`, `ida://export`, and `ida://xrefs/from`. The `ida://chain/reports/...` URIs returned by `resource_for_report()` in `src/vuln/chain_verification_tools.hpp:816-824` are not resolvable through `resources/read`.
+- `ida_extract_manage` currently covers functions, one function, instructions, xrefs, bytes, decompile, imports, exports, segments, corpus snapshot, and evidence fetch. It does not expose the full planned type, callgraph, CFG, ctree, and microcode extraction operation set.
+- `ida_mutation_manage`, `ida_cache_manage`, and `ida_diagnostics_manage` are not implemented, so IDB mutations are not consolidated behind a single destructive manage tool, cache operations are split into `ida_project_manage` index operations only, and diagnostics are split between `ida_chain_manage.diagnostics` and `ida_job_manage.diagnostics`.
+- The chain-manage path remains incomplete for the chain-verification case studies. `src/vuln/chain_verification_tools.hpp:1265-1410` builds reports through legacy link verification and shallow boundary comparison rather than the richer chain engine and extraction/path/trigger modules.
+
+Remaining work:
+
+1. Add native registry support for `visibility` and first-class operation metadata, then make `tools/list` default to public manage tools plus routing compatibility only.
+2. Register the missing manage tools: `ida_discover_manage`, `ida_analysis_manage`, `ida_cache_manage`, `ida_mutation_manage`, and `ida_diagnostics_manage`.
+3. Convert legacy one-off tools into wrappers with `deprecated_by` metadata and hide them from default discovery while preserving compatibility.
+4. Implement a generic job runtime with persistent job IDs, events, cancellation, result pages, export resources, idempotency keys, stale-generation detection, and bounded main-thread snapshots.
+5. Add MCP resource resolution for job, module/corpus, cache, chain report, and evidence URIs, including the report URIs already emitted by `resource_for_report()`.
+6. Expand extract/analysis/chain/mutation/cache/diagnostics operations to match the operation matrix and enforce per-operation destructive confirmation, budgets, cache policy, rate policy, schemas, and result envelopes.
+7. Wire chain manage operations to the completed multi-binary chain verifier described in `06_existing_plugin_audit_and_workbreakdown.md`.
+8. After implementation, the host AI must run the canonical build and verify the public MCP catalog, wrappers, resources, cancellation, pagination, destructive confirmations, routing, and case-study reports.
+
 This plan defines the production MCP tool surface for the AiDA IDA Pro plugin. It is scoped to the IDA plugin only. Standalone MCP code is referenced only to learn the consolidated manage-tool pattern where one MCP tool exposes many operations through structured parameters.
 
 The plan supersedes the one-off tool naming model in earlier plugin plans where it conflicts with MCP-first reverse engineering workflows. The implementation goal is a low-count, high-capability, deterministic MCP surface that supports multi-IDA routing, long-running jobs, cancellation, pagination, evidence export, and strict machine-readable reports without modal UI.
@@ -1542,4 +1580,3 @@ The implementation is complete when all criteria below are satisfied:
 14. Compatibility wrappers map old tool names to manage operations and report `deprecated_by`.
 15. Case-study verification proves positive evidence and counterevidence are both represented.
 16. The host build and verification pass after implementation with zero new warnings.
-

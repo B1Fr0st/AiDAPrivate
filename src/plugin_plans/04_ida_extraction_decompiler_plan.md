@@ -6,6 +6,28 @@ This plan covers the IDA Pro plugin extraction layer for multi-binary vulnerabil
 
 This plan is intentionally read-only for IDA database state. Type application, renaming, comments, patching, and other database mutations belong to separate tools and must not run as part of chain extraction.
 
+## 2026-07-03 Subagent B Source Status
+
+Result: **INCOMPLETE: host build and runtime verification pending.** This implementation subagent was explicitly forbidden from building, so the plan must remain until the host runs the canonical build and verifies warning-clean compilation plus runtime tool behavior.
+
+Closed source gaps with direct source evidence:
+
+- Cross-binary resolver contract is implemented in `src/vuln/chain_extraction.hpp` through `build_cross_binary_resolver_index()` and `resolve_cross_binary_reference()`, and in `src/vuln/chain_extraction.cpp` with `exact`, `symbolic_exact`, `name_weak`, `controlled`, and `unresolved` resolution output over module fact stores, module/corpus ids, RVAs, import/export names, and symbols.
+- Module-level xref indexing no longer scans capped function starts only. `src/vuln/chain_extraction.cpp::scan_module_items()` walks mapped heads across every segment, records `mapped_items`, `symbol_index`, code/data item facts, function association, and both xref directions with bounded `max_module_items` and `max_xrefs_per_address`.
+- Trigger negative evidence is extended beyond one function. `src/vuln/chain_verification_tools.hpp::cross_reachability_data()` traverses call edges across reachable functions, emits visited functions/modules, unresolved edges, resolver results, cutoffs, and sets `negative_evidence_complete` only when the frontier is exhausted without unresolved edges.
+- Case-study source-backed self-checks are exposed through `ida_extract_manage.case_study_self_check`. The checks in `zero_vs_copy_check()`, `etw_trigger_negative_check()`, `afd_list_entry_guard_check()`, and `pvscan0_self_reference_check()` return `passed` only when extracted facts prove the required evidence; otherwise they return `unproven` with the exact missing evidence reason.
+- Structured nested pagination is implemented in `src/vuln/chain_verification_tools.hpp::apply_nested_pagination()`. Extraction/manage responses cap every oversized nested array by default, report per-path cursors, and accept `page_path` or returned `ac2` cursors for follow-up pages.
+- Function extraction cancellation and timeout checks are implemented between expensive raw, CFG, type, cache, ctree, each microcode maturity, and effects phases in `src/vuln/chain_extraction.cpp::extract_function_snapshot_ida()`, using `stop_state()` and structured stop statuses.
+- Diagnostics now include structured phase, operation, module, function, cache, elapsed, emitted/total, timeout/cancel state, cutoff, and failure reason via `make_status()`, `annotate_status()`, and `finalize_function_snapshot()`.
+- Raw semantics were strengthened in `src/vuln/chain_extraction.cpp::apply_raw_semantics()` with prefix normalization for `lock`/`rep` forms, string ops before generic `mov*`, conditional moves, `setcc`, bit-test/modify, division, implicit sign-extension, expanded arithmetic, and atomic handling.
+- `SetBitmapBits` is no longer modeled as a zeroing helper. `src/vuln/chain_side_effects.cpp::helper_kind()` classifies it as `memory_copy`, preserving destination/source semantics for pvScan0-style self-reference checks.
+- `src/vuln/chain_path_trace.cpp` now consistently uses the declared `basic_block_fact_t` type in the path block index.
+
+Remaining requirements:
+
+1. **Host build verification.** The host must run `.\build-host.cmd` and confirm zero compile errors and zero new warnings. This subagent did not build because the assignment explicitly forbids build, CMake, MSBuild, Ninja, vcvars, and compile/link commands.
+2. **Runtime MCP/IDA verification.** After a successful host build, exercise `ida_extract_manage` operations `extract_module_facts`, `extract_function_facts`, `extract_function_batch`, `extract_xref_graph`, `extract_path_window`, `resolve_cross_binary`, and `case_study_self_check` against fixture IDBs to prove the source-backed behavior in a live IDA process.
+
 ## Mandatory Case-Study Requirements
 
 The critical section in `driver/PROGRESS.md` defines the failure modes the extraction layer must make machine-verifiable:
@@ -22,7 +44,9 @@ The extraction layer must therefore record:
 - Logical read/write relationships, not only mechanical facts. A write effect must expose both the destination expression and the value expression so the verifier can prove whether `write([X], Y)` changes `X` itself.
 - Cross-binary address identity with module name, image base, RVA, import/export name, and symbol name so chains spanning `afd.sys`, `ntoskrnl.exe`, `win32kbase.sys`, `ntfs.sys`, and `Etw` code can be joined without losing provenance.
 
-## Current-State Findings
+## Earlier Current-State Findings
+
+This section is retained as original planning context. The 2026-07-03 source verification section above is authoritative for the current implementation state and supersedes any stale "current" wording below.
 
 Existing AiDA plugin extraction is useful but fragmented:
 
@@ -41,7 +65,7 @@ Existing AiDA plugin extraction is useful but fragmented:
 - `src/vuln/microcode_engine.cpp:1106-1248` builds use/def evidence from SDK `mlist_t` lists. This is the correct low-level source for write/read effects when available.
 - `src/vuln/symbolic_engine.cpp:602-665` collects branch predicates from microcode blocks, and `src/vuln/symbolic_engine.cpp:1085-1135` maps microcode condition opcodes into SMT AST predicates. This should consume extraction-layer facts rather than regenerate one-off local views.
 
-Current gaps:
+Earlier identified gaps:
 
 - No single canonical function fact schema. Text, xrefs, ctree scans, microcode dumps, and vulnerability scanners each create their own partial model.
 - Decompiler failures are represented as strings in user-facing output, not structured layer statuses with failure reason, confidence, and fallback facts.

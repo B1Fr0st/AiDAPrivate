@@ -1,5 +1,45 @@
 # AiDA IDA Plugin Performance And Reliability Plan
 
+## Source Verification Status
+
+Status: NO. Source audit on 2026-07-03 proves this plan is partially implemented and must remain open.
+
+Implemented source evidence:
+
+- `src/aida.cpp:1139-1143` declares the plugin with `PLUGIN_MULTI`, and `src/aida.hpp:27` makes `aida_plugin_t` a `plugmod_t`.
+- `src/agent_tools.cpp:12544` registers the consolidated chain MCP tools from `src/vuln/chain_verification_tools.hpp`.
+- `src/vuln/chain_verification_tools.hpp:1540-1624` exposes consolidated chain, project, extraction, report, and job manage operations.
+- `src/vuln/chain_verification_tools.hpp:94-139` defines in-memory job, report, and index records; `src/vuln/chain_verification_tools.hpp:733-776` creates and finishes those records.
+- `src/vuln/chain_extraction.cpp:1160-1193` harvests module and function snapshots through `execute_sync(..., MFF_READ)` and the extraction options in `src/vuln/chain_extraction.hpp:37-44` include bounded row and microcode limits.
+- `src/vuln/chain_store.cpp:29-34` and `src/vuln/chain_store.cpp:445-523` implement a chunked netnode-backed chain ledger with page limits.
+- `src/vuln/chain_state_contracts.cpp:655-678` detects controlled-content, zero-content, and self-reference contract mismatches; `src/vuln/chain_trigger_trace.cpp:180` emits `trigger_path_not_reached`.
+
+Current blockers from source evidence:
+
+- The plan's dedicated runtime files are absent or not represented by equivalent wired code: no `chain_job_manager`, `chain_snapshot`, `chain_cache`, `chain_recovery`, or `chain_status_view` source exists under `src/vuln/`.
+- `ChainVerificationEngine` is not wired into the active plugin or MCP path. `rg` finds its references only in `src/vuln/chain_verification_engine.hpp` and `src/vuln/chain_verification_engine.cpp`; the active chain MCP path delegates links to the legacy `verify_taint_path` tool at `src/vuln/chain_verification_tools.hpp:1031-1036`.
+- Chain `submit` and `start` are synchronous wrappers, not async job starts. `src/vuln/chain_verification_tools.hpp:1785-1811` creates a job, builds the whole report, stores it, marks it completed, and returns the result in the same call path.
+- There is no verifier worker pool, bounded IDA slice scheduler, pending request-id registry, `execute_ui_requests` scheduling, or `cancel_exec_request` cleanup in the chain manage implementation.
+- Active verifier code still uses modal wait boxes: `src/vuln/verification_engine.cpp:86-98` defines `wait_box_guard_t`, and `src/vuln/verification_engine.cpp:622-624` shows it during `verify_taint_path`. This violates acceptance criterion 2 for the active chain verification path.
+- Cancellation is not the deterministic plan sequence. `src/vuln/chain_verification_tools.hpp:1749-1765` and `src/vuln/chain_verification_tools.hpp:2250-2262` set job state to `cancelled` and call the legacy engine cancel flag, but no queued UI requests, worker semaphores, generation abandonment, or partial-result sealing are proven. `src/vuln/chain_verification_engine.cpp:737-739` only sets an atomic boolean.
+- IDB and Hex-Rays generation invalidation are not implemented for the verifier. `src/aida.cpp:913-917` installs Hex-Rays fixups and an `HT_UI` listener only; no verifier `HT_IDB` listener, `install_hexrays_callback`, monotonic `idb_generation`, or `hexrays_generation` hook is present. `src/vuln/chain_verification_tools.hpp:266-277` computes a hash-like generation from current IDB identity and counts instead of maintaining event-driven monotonic generations.
+- Job recovery is not deterministic across restart. The active job registry is a static in-memory map in `src/vuln/chain_verification_tools.hpp:130-139`; report/ledger operations at `src/vuln/chain_verification_tools.hpp:2183-2188` call the older `verify::VerificationEngine::persist_ledger`, not the chain ledger or a phase-boundary recovery journal.
+- No dockable AiDA Chain Verification task panel is proven. The only plugin-owned listener/member state in `src/aida.hpp:27-57` is UI listener, MCP server, timer, and background thread state; no chain panel owner or verifier manager is present.
+- Cross-IDB coordination is not implemented as a verifier coordinator. `inventory_all` reports a fan-out recipe through the existing aggregator, but source evidence does not show a `cross_idb_chain_coordinator_t`, peer snapshot exchange, signed or hashed snapshot chunks, or per-peer generation gating.
+- Memory backpressure is only partial. Extraction row limits and netnode page limits exist, but no source proves per-IDB/process snapshot-store byte reservations, worker-pool stats, solver context discard policy, or `resource_exhausted` admission failures for deep phases.
+- Case-study coverage is partial. Generic zero-content, controlled-content, self-reference, and trigger-path outcomes exist, but the exact NTFS-to-ETW, AFD-to-`_setjmp`, and `pvScan0` manifests or first-class outcome names from the plan are not present in source.
+
+Remaining implementation work:
+
+1. Wire the chain verifier into `aida_plugin_t` as a per-IDB manager with job registry, snapshot store, recovery journal, generation state, and nonmodal status panel ownership.
+2. Replace synchronous chain `submit`/`start` handling with an async job runtime that returns quickly, tracks queued main-thread request ids, runs bounded `MFF_READ`/`MFF_WRITE`/UI-only slices, and executes heavy work on cooperative workers with stats.
+3. Remove modal wait-box use from active chain verification paths and report progress, failures, completion, and cancellation through the task panel, `msg()`, MCP payloads, and breadcrumbs.
+4. Add verifier-scoped IDB and Hex-Rays event listeners that update monotonic generations, invalidate affected ranges, reject stale publication, and cancel or seal local jobs on `closebase`.
+5. Persist phase-boundary recovery records for chain jobs and validate binary hash, tool generation, snapshot content hash, and current IDB generation before resume.
+6. Implement generation-aware immutable snapshot storage, memory reservations, per-IDB/process byte budgets, paginated large results, and explicit `resource_exhausted` results.
+7. Implement cross-IDB coordination over the existing MCP mesh without raw SDK object sharing, including peer disconnect handling and per-binary phase clocks.
+8. Add first-class regression manifests for the three `driver/PROGRESS.md` case studies and ensure they refute before exhaustive SMT when the relevant evidence is present.
+
 ## Objective
 
 Design the production architecture for an IDA Pro plugin that verifies multi-binary vulnerability chains without freezing IDA, blocking a reverse engineer, or relying on isolated per-link checks. The plugin must verify end-to-end chain feasibility across binaries while keeping every IDA database responsive, recoverable, cancellable, and diagnostically transparent.
@@ -909,4 +949,3 @@ Likely existing files to update:
 11. Build and warning gate for implementers
 
    After implementation, the host AI must run the canonical AiDA build wrapper and verify zero errors and zero new warnings. Planning subagents do not build.
-

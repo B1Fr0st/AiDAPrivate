@@ -69,9 +69,9 @@ std::unordered_map<std::uint64_t, const instruction_fact_t*> instruction_index(c
     return out;
 }
 
-std::unordered_map<std::uint64_t, std::vector<side_effect_t>> effects_by_ea(const function_snapshot_t& snapshot)
+std::unordered_map<std::uint64_t, std::vector<extracted_side_effect_t>> effects_by_ea(const function_snapshot_t& snapshot)
 {
-    std::unordered_map<std::uint64_t, std::vector<side_effect_t>> out;
+    std::unordered_map<std::uint64_t, std::vector<extracted_side_effect_t>> out;
     for (auto& effect : classify_side_effects(snapshot))
         out[effect.location.ea].push_back(std::move(effect));
     return out;
@@ -149,7 +149,7 @@ std::vector<std::size_t> bfs_blocks(const function_snapshot_t& snapshot,
     return path;
 }
 
-std::string step_kind_for(const instruction_fact& ins)
+std::string step_kind_for(const instruction_fact_t& ins)
 {
     if (ins.is_return)
         return "return";
@@ -160,7 +160,7 @@ std::string step_kind_for(const instruction_fact& ins)
     return "instruction";
 }
 
-void append_unresolved_for_instruction(const instruction_fact& ins,
+void append_unresolved_for_instruction(const instruction_fact_t& ins,
                                        path_trace_t& trace,
                                        const path_trace_options_t& options)
 {
@@ -238,7 +238,7 @@ path_trace_t trace_path_corridor(const function_snapshot_t& snapshot,
     }
     const auto insn_index = instruction_index(snapshot);
     auto effect_index = effects_by_ea(snapshot);
-    std::map<std::size_t, const basic_block_fact*> block_index;
+    std::map<std::size_t, const basic_block_fact_t*> block_index;
     for (const auto& block : snapshot.basic_blocks)
         block_index.emplace(block.id, &block);
     std::uint64_t next_block_start = 0;
@@ -248,7 +248,7 @@ path_trace_t trace_path_corridor(const function_snapshot_t& snapshot,
         auto block_it = block_index.find(block_id);
         if (block_it == block_index.end() || block_it->second == nullptr)
             continue;
-        const basic_block_fact* block = block_it->second;
+        const basic_block_fact_t* block = block_it->second;
         if (path_i + 1 < trace.block_path.size())
         {
             auto next_it = block_index.find(trace.block_path[path_i + 1]);
@@ -272,7 +272,7 @@ path_trace_t trace_path_corridor(const function_snapshot_t& snapshot,
             auto ins_it = insn_index.find(ea);
             if (ins_it == insn_index.end())
                 continue;
-            const instruction_fact& ins = *ins_it->second;
+            const instruction_fact_t& ins = *ins_it->second;
             path_step_t step;
             step.index = trace.steps.size();
             step.block_id = block_id;

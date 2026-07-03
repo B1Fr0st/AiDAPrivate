@@ -52,6 +52,8 @@ constexpr uint64_t kPostNavigationStabilityPollMs = 250;
 constexpr uint64_t kCleanupDrainWaitMs = 15000;
 constexpr uint64_t kCleanupDrainPollMs = 50;
 
+std::string ascii_lower_copy(std::string text);
+
 struct singleton_t
 {
     std::string                             session_id          = "default";

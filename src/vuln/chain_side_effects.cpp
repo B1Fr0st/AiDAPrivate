@@ -37,7 +37,7 @@ bool contains_any(const std::string& s, const std::vector<std::string>& needles)
 
 bool operand_is_memory(const operand_fact_t& op)
 {
-    return op.type == "mem" || op.type == "displ" || op.type == "phrase";
+    return op.type == "mem" || op.type == "displ" || op.type == "phrase" || op.type == "far" || op.type == "near";
 }
 
 bool operand_is_immediate(const operand_fact_t& op)
@@ -50,9 +50,15 @@ value_expr_t value_from_operand(const operand_fact_t& op)
     value_expr_t out;
     out.kind = op.type.empty() ? "unknown" : op.type;
     out.text = op.text;
+    out.address_expr = op.address_expr;
+    out.alias_class = op.alias_class;
+    out.type_ref = op.type_ref;
     out.width_bits = op.width_bits;
+    out.provenance_ea = op.address_identity.ea;
     out.location = op.address_identity;
     out.confidence = op.type == "unknown" || op.type.empty() ? "inconclusive" : "exact";
+    out.controlled_by_input = contains_any(op.text + " " + op.alias_class + " " + op.type_ref,
+                                           {"input", "user", "irp", "systembuffer", "type3inputbuffer", "userbuffer", "probe"});
     if (operand_is_immediate(op))
     {
         out.concrete = true;
@@ -65,8 +71,10 @@ value_expr_t value_from_operand(const operand_fact_t& op)
     }
     else if (op.type == "reg")
     {
-        out.value_origin = "derived";
+        out.value_origin = out.controlled_by_input ? "copied_from_input" : "derived";
     }
+    if (out.controlled_by_input)
+        out.value_origin = "copied_from_input";
     return out;
 }
 
@@ -75,24 +83,27 @@ value_expr_t unknown_value(const address_identity_t& location, const std::string
     value_expr_t out;
     out.location = location;
     out.text = text;
+    out.provenance_ea = location.ea;
+    out.confidence = "inconclusive";
     return out;
 }
 
-side_effect_t make_effect(side_effect_kind_t kind,
+extracted_side_effect_t make_effect(side_effect_kind_t kind,
                           const instruction_fact_t& ins,
                           const std::string& operation,
                           const std::string& reason)
 {
-    side_effect_t effect;
+    extracted_side_effect_t effect;
     effect.kind = kind;
     effect.location = ins.location;
     effect.operation = operation;
     effect.provenance = ins.disassembly;
     effect.reason = reason;
+    effect.source_layer = "raw";
     return effect;
 }
 
-void append_read_write_effects(const instruction_fact_t& ins, std::vector<side_effect_t>& out)
+void append_read_write_effects(const instruction_fact_t& ins, std::vector<extracted_side_effect_t>& out)
 {
     const std::string mnemonic = lower_ascii(ins.mnemonic);
     if (ins.operands.empty())
@@ -101,7 +112,7 @@ void append_read_write_effects(const instruction_fact_t& ins, std::vector<side_e
     const bool load_like = contains_any(mnemonic, {"mov", "lea", "lods", "cmp", "test", "add", "sub", "and", "or", "xor"});
     if (store_like && operand_is_memory(ins.operands.front()))
     {
-        side_effect_t effect = make_effect(side_effect_kind_t::write, ins, mnemonic, "memory_destination_operand");
+        extracted_side_effect_t effect = make_effect(side_effect_kind_t::write, ins, mnemonic, "memory_destination_operand");
         effect.destination = value_from_operand(ins.operands.front());
         if (ins.operands.size() > 1)
             effect.source = value_from_operand(ins.operands[1]);
@@ -118,7 +129,7 @@ void append_read_write_effects(const instruction_fact_t& ins, std::vector<side_e
             continue;
         if (!load_like && !ins.is_call && !ins.is_branch)
             continue;
-        side_effect_t effect = make_effect(side_effect_kind_t::read, ins, mnemonic, "memory_source_operand");
+        extracted_side_effect_t effect = make_effect(side_effect_kind_t::read, ins, mnemonic, "memory_source_operand");
         effect.source = value_from_operand(op);
         out.push_back(std::move(effect));
     }
@@ -128,7 +139,7 @@ side_effect_kind_t helper_kind(const std::string& name)
 {
     if (contains_any(name, {"memset", "rtlzeromemory", "zeromemory", "bzero"}))
         return side_effect_kind_t::memory_set;
-    if (contains_any(name, {"memcpy", "memmove", "rtlmove", "rtlcopymemory", "copy_memory", "copybytes"}))
+    if (contains_any(name, {"memcpy", "memmove", "rtlmove", "rtlcopymemory", "copy_memory", "copybytes", "copyfrom", "copyto", "setbitmapbits"}))
         return side_effect_kind_t::memory_copy;
     if (contains_any(name, {"exallocate", "allocate", "malloc", "new", "heapalloc", "poolalloc"}))
         return side_effect_kind_t::allocation;
@@ -147,14 +158,15 @@ side_effect_kind_t helper_kind(const std::string& name)
     return side_effect_kind_t::direct_call;
 }
 
-void append_call_effect(const call_fact_t& call, std::vector<side_effect_t>& out)
+void append_call_effect(const call_fact_t& call, std::vector<extracted_side_effect_t>& out)
 {
-    side_effect_t effect;
+    extracted_side_effect_t effect;
     effect.kind = call.kind == "indirect" ? side_effect_kind_t::indirect_call : helper_kind(call.callee_name);
     effect.location = call.callsite;
     effect.operation = call.callee_name.empty() ? call.kind : call.callee_name;
     effect.provenance = call.callsite.symbol_name;
     effect.reason = call.resolved ? "resolved_call_target" : "unresolved_call_target";
+    effect.source_layer = "call";
     effect.unresolved = !call.resolved || call.kind == "indirect";
     effect.terminal = !call.does_return || effect.kind == side_effect_kind_t::poisoned_terminal;
     if (!call.arguments.empty())
@@ -170,31 +182,40 @@ void append_call_effect(const call_fact_t& call, std::vector<side_effect_t>& out
             effect.source.value_origin = "constant_nonzero";
     }
     if (effect.kind == side_effect_kind_t::memory_copy)
+    {
         effect.source.value_origin = "copied_from_memory";
+        if (effect.source.controlled_by_input || effect.destination.controlled_by_input)
+            effect.tags.push_back("input_buffer_memory_copy");
+        if (contains_any(call.callee_name, {"setbitmapbits"}))
+            effect.tags.push_back("case_study_pvscan0_setbitmapbits_write");
+    }
     if (effect.kind == side_effect_kind_t::indirect_call)
         effect.tags.push_back("indirect_target_required");
+    if (effect.destination.kind != "unknown" && effect.destination.alias_class.find("mem:") == 0)
+        effect.tags.push_back("write_indirect_destination_value");
     out.push_back(std::move(effect));
 }
 
-void append_branch_effect(const branch_fact_t& branch, std::vector<side_effect_t>& out)
+void append_branch_effect(const branch_fact_t& branch, std::vector<extracted_side_effect_t>& out)
 {
-    side_effect_t effect;
+    extracted_side_effect_t effect;
     effect.kind = branch.kind == "return" ? side_effect_kind_t::return_value : side_effect_kind_t::branch;
     effect.location = branch.branch;
     effect.operation = branch.kind;
     effect.provenance = branch.predicate_text;
     effect.reason = branch.conditional ? "branch_predicate" : "control_transfer";
+    effect.source_layer = "branch";
     if (branch.kind == "return")
         effect.terminal = true;
     out.push_back(std::move(effect));
 }
 
-void append_instruction_specials(const instruction_fact_t& ins, std::vector<side_effect_t>& out)
+void append_instruction_specials(const instruction_fact_t& ins, std::vector<extracted_side_effect_t>& out)
 {
     const std::string m = lower_ascii(ins.mnemonic + " " + ins.disassembly);
     if (contains_any(m, {"lock", "xadd", "cmpxchg", "xchg"}))
     {
-        side_effect_t effect = make_effect(side_effect_kind_t::interlocked, ins, ins.mnemonic, "atomic_instruction");
+        extracted_side_effect_t effect = make_effect(side_effect_kind_t::interlocked, ins, ins.mnemonic, "atomic_instruction");
         if (!ins.operands.empty())
             effect.destination = value_from_operand(ins.operands.front());
         if (ins.operands.size() > 1)
@@ -203,7 +224,7 @@ void append_instruction_specials(const instruction_fact_t& ins, std::vector<side
     }
     if (contains_any(m, {"int 29h", "__fastfail", "ud2", "int 3"}))
     {
-        side_effect_t effect = make_effect(side_effect_kind_t::poisoned_terminal, ins, ins.mnemonic, "poisoned_terminal_instruction");
+        extracted_side_effect_t effect = make_effect(side_effect_kind_t::poisoned_terminal, ins, ins.mnemonic, "poisoned_terminal_instruction");
         effect.terminal = true;
         out.push_back(std::move(effect));
     }
@@ -211,9 +232,9 @@ void append_instruction_specials(const instruction_fact_t& ins, std::vector<side
 
 }
 
-std::vector<side_effect_t> classify_side_effects(const function_snapshot_t& snapshot)
+std::vector<extracted_side_effect_t> classify_side_effects(const function_snapshot_t& snapshot)
 {
-    std::vector<side_effect_t> out;
+    std::vector<extracted_side_effect_t> out;
     std::set<std::string> seen;
     for (const instruction_fact_t& ins : snapshot.instructions)
     {
@@ -227,7 +248,7 @@ std::vector<side_effect_t> classify_side_effects(const function_snapshot_t& snap
         append_call_effect(call, out);
     for (const branch_fact_t& branch : snapshot.branches)
         append_branch_effect(branch, out);
-    std::vector<side_effect_t> deduped;
+    std::vector<extracted_side_effect_t> deduped;
     deduped.reserve(out.size());
     for (auto& effect : out)
     {
@@ -269,14 +290,19 @@ nlohmann::json to_json(const value_expr_t& value)
     return json{{"kind", value.kind},
                 {"text", value.text},
                 {"value_origin", value.value_origin},
+                {"address_expr", value.address_expr},
+                {"alias_class", value.alias_class},
+                {"type_ref", value.type_ref},
                 {"width_bits", value.width_bits},
+                {"provenance_ea", value.provenance_ea == 0 ? std::string() : std::to_string(value.provenance_ea)},
                 {"location", to_json(value.location)},
                 {"concrete", value.concrete},
                 {"concrete_value", value.concrete ? std::to_string(value.concrete_value) : std::string()},
-                {"confidence", value.confidence}};
+                {"confidence", value.confidence},
+                {"controlled_by_input", value.controlled_by_input}};
 }
 
-nlohmann::json to_json(const side_effect_t& effect)
+nlohmann::json to_json(const extracted_side_effect_t& effect)
 {
     return json{{"kind", to_json(effect.kind)},
                 {"location", to_json(effect.location)},

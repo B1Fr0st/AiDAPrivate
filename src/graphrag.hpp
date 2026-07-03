@@ -127,8 +127,12 @@ struct graph_node_t
 {
     int          id = 0;
     std::string  binary_hash;
+    std::string  module_id;
     node_type_t  node_type = node_type_t::FUNCTION;
     ea_t         address = BADADDR;
+    uint64_t     rva = 0;
+    bool         has_rva = false;
+    std::string  address_key;
     std::string  name;
     std::string  raw_code;
     std::string  llm_summary;
@@ -161,8 +165,10 @@ inline void to_json(nlohmann::json& j, const graph_node_t& n)
 {
     j = {
         {"id", n.id}, {"binary_hash", n.binary_hash},
+        {"module_id", n.module_id},
         {"node_type", node_type_str(n.node_type)},
-        {"address", n.address}, {"name", n.name},
+        {"address", n.address}, {"rva", n.rva}, {"has_rva", n.has_rva},
+        {"address_key", n.address_key}, {"name", n.name},
         {"raw_code", n.raw_code}, {"llm_summary", n.llm_summary},
         {"confidence", n.confidence},
         {"security_flags", n.security_flags}, {"network_apis", n.network_apis},
@@ -183,8 +189,14 @@ inline void from_json(const nlohmann::json& j, graph_node_t& n)
 {
     n.id = j.value("id", 0);
     n.binary_hash = j.value("binary_hash", "");
+    n.module_id = j.value("module_id", n.binary_hash);
+    if (n.binary_hash.empty())
+        n.binary_hash = n.module_id;
     n.node_type = node_type_from_str(j.value("node_type", "FUNCTION"));
     n.address = j.value("address", ea_t(BADADDR));
+    n.rva = j.value("rva", uint64_t(0));
+    n.has_rva = j.value("has_rva", false);
+    n.address_key = j.value("address_key", "");
     n.name = j.value("name", "");
     n.raw_code = j.value("raw_code", "");
     n.llm_summary = j.value("llm_summary", "");
@@ -478,15 +490,16 @@ private:
     static void vec_insert_unique(std::vector<int>& v, int id);
     static void vec_remove(std::vector<int>& v, int id);
 
-
+public:
     struct addr_key_t
     {
         std::string binary_hash;
         node_type_t type;
-        ea_t addr;
+        uint64_t canonical_addr = 0;
+        bool has_rva = false;
         bool operator==(const addr_key_t& o) const
         {
-            return binary_hash == o.binary_hash && type == o.type && addr == o.addr;
+            return binary_hash == o.binary_hash && type == o.type && canonical_addr == o.canonical_addr && has_rva == o.has_rva;
         }
     };
     struct addr_key_hash
@@ -495,10 +508,12 @@ private:
         {
             size_t h = std::hash<std::string>{}(k.binary_hash);
             h ^= std::hash<int>{}(static_cast<int>(k.type)) + 0x9e3779b9 + (h << 6) + (h >> 2);
-            h ^= std::hash<ea_t>{}(k.addr) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            h ^= std::hash<uint64_t>{}(k.canonical_addr) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            h ^= std::hash<bool>{}(k.has_rva) + 0x9e3779b9 + (h << 6) + (h >> 2);
             return h;
         }
     };
+private:
     std::unordered_map<addr_key_t, int, addr_key_hash> m_addr_index;
 
 

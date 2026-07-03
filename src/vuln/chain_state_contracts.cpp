@@ -172,7 +172,7 @@ bool fact_subject_predicate_match(const chain_fact_t& fact, const state_contract
     return true;
 }
 
-std::vector<const chain_fact_t*> candidate_facts(const trace_state_t& state, const state_contract_t& contract)
+std::vector<const chain_fact_t*> candidate_facts(const contract_trace_state_t& state, const state_contract_t& contract)
 {
     std::vector<const chain_fact_t*> out;
     for (const chain_fact_t& fact : state.facts)
@@ -183,7 +183,7 @@ std::vector<const chain_fact_t*> candidate_facts(const trace_state_t& state, con
     return out;
 }
 
-bool order_before(const trace_state_t& state, const std::string& earlier, const std::string& later)
+bool order_before(const contract_trace_state_t& state, const std::string& earlier, const std::string& later)
 {
     const auto it_a = state.phase_order.find(earlier);
     const auto it_b = state.phase_order.find(later);
@@ -469,9 +469,9 @@ std::string canonical_json_hash(const nlohmann::json& value)
     return stable_hash_hex(value.dump());
 }
 
-trace_state_t make_trace_state(const std::vector<chain_fact_t>& facts)
+contract_trace_state_t make_trace_state(const std::vector<chain_fact_t>& facts)
 {
-    trace_state_t state;
+    contract_trace_state_t state;
     state.facts = facts;
     for (size_t i = 0; i < state.facts.size(); ++i)
     {
@@ -489,7 +489,7 @@ trace_state_t make_trace_state(const std::vector<chain_fact_t>& facts)
     return state;
 }
 
-trace_state_t append_fact(const trace_state_t& state, const chain_fact_t& fact)
+contract_trace_state_t append_fact(const contract_trace_state_t& state, const chain_fact_t& fact)
 {
     std::vector<chain_fact_t> facts = state.facts;
     facts.push_back(fact);
@@ -587,7 +587,7 @@ std::vector<state_contract_t> contracts_from_json_array(const nlohmann::json& va
     return out;
 }
 
-contract_match_t match_contract(const trace_state_t& state, const state_contract_t& contract)
+contract_match_t match_contract(const contract_trace_state_t& state, const state_contract_t& contract)
 {
     if (contract.dimension == contract_dimension_t::timing)
     {
@@ -733,7 +733,7 @@ contract_match_t match_contract(const trace_state_t& state, const state_contract
     return best;
 }
 
-contract_evaluation_t match_contracts(const trace_state_t& state,
+contract_evaluation_t match_contracts(const contract_trace_state_t& state,
                                       const std::vector<state_contract_t>& contracts,
                                       proof_level_t level)
 {
@@ -834,7 +834,7 @@ nlohmann::json to_json(const contract_match_t& match)
     };
 }
 
-nlohmann::json to_json(const trace_state_t& state)
+nlohmann::json to_json(const contract_trace_state_t& state)
 {
     nlohmann::json facts = nlohmann::json::array();
     for (const chain_fact_t& fact : state.facts)

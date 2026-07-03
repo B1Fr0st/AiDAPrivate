@@ -2595,6 +2595,8 @@ set(AIDA_SOURCES
     src/instance_registry.cpp
     src/license.cpp
     src/mcp_server.cpp
+    src/multibinary_index.cpp
+    src/multibinary_project.cpp
     src/settings.cpp
     src/driver_loader.cpp
     src/vuln/chain_binary_corpus.cpp
@@ -2613,6 +2615,7 @@ set(AIDA_SOURCES
     src/vuln/chain_solver.cpp
     src/vuln/chain_state_contracts.cpp
     src/vuln/chain_trigger_trace.cpp
+    src/vuln/chain_verifier.cpp
     src/vuln/chain_verification_engine.cpp
     src/vuln/surface_engine.cpp
     src/vuln/taint_engine.cpp
@@ -2645,6 +2648,8 @@ set(AIDA_HEADERS
     src/instance_registry.hpp
     src/license.hpp
     src/mcp_server.hpp
+    src/multibinary_index.hpp
+    src/multibinary_project.hpp
     src/obfuscation.hpp
     src/settings.hpp
     src/driver_loader.hpp
@@ -2662,6 +2667,7 @@ set(AIDA_HEADERS
     src/vuln/chain_solver.hpp
     src/vuln/chain_state_contracts.hpp
     src/vuln/chain_trigger_trace.hpp
+    src/vuln/chain_verifier.hpp
     src/vuln/chain_verification_engine.hpp
     src/vuln/taint_engine.hpp
     src/vuln/vuln_common.hpp

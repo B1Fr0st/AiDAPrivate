@@ -198,7 +198,7 @@ struct contract_match_t
     nlohmann::json evidence = nlohmann::json::object();
 };
 
-struct trace_state_t
+struct contract_trace_state_t
 {
     std::vector<chain_fact_t> facts;
     std::unordered_map<std::string, size_t> fact_index;
@@ -237,8 +237,8 @@ failure_code_t parse_failure_code(const std::string& value);
 std::string stable_hash_hex(const std::string& input);
 std::string canonical_json_hash(const nlohmann::json& value);
 
-trace_state_t make_trace_state(const std::vector<chain_fact_t>& facts);
-trace_state_t append_fact(const trace_state_t& state, const chain_fact_t& fact);
+contract_trace_state_t make_trace_state(const std::vector<chain_fact_t>& facts);
+contract_trace_state_t append_fact(const contract_trace_state_t& state, const chain_fact_t& fact);
 
 chain_fact_t fact_from_json(const nlohmann::json& value,
                             const std::string& default_phase,
@@ -250,8 +250,8 @@ std::vector<state_contract_t> contracts_from_json_array(const nlohmann::json& va
                                                         const std::string& default_link_id,
                                                         contract_dimension_t default_dimension);
 
-contract_match_t match_contract(const trace_state_t& state, const state_contract_t& contract);
-contract_evaluation_t match_contracts(const trace_state_t& state,
+contract_match_t match_contract(const contract_trace_state_t& state, const state_contract_t& contract);
+contract_evaluation_t match_contracts(const contract_trace_state_t& state,
                                       const std::vector<state_contract_t>& contracts,
                                       proof_level_t level);
 
@@ -260,7 +260,7 @@ nlohmann::json to_json(const evidence_t& evidence);
 nlohmann::json to_json(const chain_fact_t& fact);
 nlohmann::json to_json(const state_contract_t& contract);
 nlohmann::json to_json(const contract_match_t& match);
-nlohmann::json to_json(const trace_state_t& state);
+nlohmann::json to_json(const contract_trace_state_t& state);
 nlohmann::json to_json(const contract_evaluation_t& evaluation);
 
 }
