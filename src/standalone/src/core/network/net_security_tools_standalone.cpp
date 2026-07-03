@@ -58,26 +58,6 @@ static std::string ns_bytes_to_hex(const std::uint8_t* data, std::size_t len) {
     return result;
 }
 
-static std::vector<std::uint8_t> ns_hex_to_bytes(const std::string& hex) {
-    std::vector<std::uint8_t> out;
-    std::string clean;
-    for (char c : hex) {
-        if (c != ' ' && c != ':' && c != '-') clean += c;
-    }
-    out.reserve(clean.size() / 2);
-    for (std::size_t i = 0; i + 1 < clean.size(); i += 2) {
-        auto nib = [](char c) -> int {
-            if (c >= '0' && c <= '9') return c - '0';
-            if (c >= 'a' && c <= 'f') return 10 + c - 'a';
-            if (c >= 'A' && c <= 'F') return 10 + c - 'A';
-            return -1;
-        };
-        int h = nib(clean[i]), l = nib(clean[i+1]);
-        if (h >= 0 && l >= 0) out.push_back(static_cast<std::uint8_t>((h << 4) | l));
-    }
-    return out;
-}
-
 static std::string ns_payload_hex_param(const json& params) {
     if (params.contains("payload_hex") && params["payload_hex"].is_string())
         return params["payload_hex"].get<std::string>();
@@ -2345,6 +2325,8 @@ tool_result_t tls_extract_keys(const json& params) {
         arr.push_back(kj);
     }
     result["keys"] = arr;
+    if (config.hint_only && (!scan_diag.hint_used || scan_diag.early_exit_reason == "hint_missing"))
+        return tool_result_t::error(OBFSTR("TLS key extraction hint range was not available"), result);
     if (keys.empty() && (scan_diag.deadline_expired || scan_diag.cancelled))
         return tool_result_t::error(scan_diag.deadline_expired ? OBFSTR("TLS key extraction exceeded scan deadline") : OBFSTR("TLS key extraction cancelled"), result);
     return tool_result_t::ok(OBFSTR("Extracted ") + std::to_string(keys.size()) + OBFSTR(" TLS session keys"), result);
@@ -2682,7 +2664,8 @@ tool_result_t cert_inject(const json& params) {
 
     if (params.contains("cert_der_hex") && params["cert_der_hex"].is_string()) {
         auto hex = params["cert_der_hex"].get<std::string>();
-        config.cert_der = ns_hex_to_bytes(hex);
+        if (!ns_hex_to_bytes_strict(hex, config.cert_der))
+            return tool_result_t::error(OBFSTR("cert_der_hex is not valid hex DER data"));
         diag::log_tagged_fmt("net_sec", "cert_inject der_hex len=%zu bytes=%zu", hex.size(), config.cert_der.size());
     }
 
@@ -2884,8 +2867,8 @@ tool_result_t quic_detect_connections(const json& params) {
     diag::log_tagged_fmt("net_sec", "quic_detect_connections entry pid=%u", pid);
     if (ns_has_payload_hex_param(params)) {
         const std::string hex = ns_payload_hex_param(params);
-        auto payload = ns_hex_to_bytes(hex);
-        if (payload.empty()) {
+        std::vector<std::uint8_t> payload;
+        if (!ns_hex_to_bytes_strict(hex, payload)) {
             json r;
             r["backend"] = "provided_payload";
             r["deterministic_input"] = true;
@@ -3007,9 +2990,10 @@ tool_result_t quic_decrypt_initial(const json& params) {
         return tool_result_t::error(OBFSTR("packet_hex is required"));
     }
 
-    auto pkt_bytes = ns_hex_to_bytes(params["packet_hex"].get<std::string>());
+    std::vector<std::uint8_t> pkt_bytes;
+    const bool packet_hex_valid = ns_hex_to_bytes_strict(params["packet_hex"].get<std::string>(), pkt_bytes);
     diag::log_tagged_fmt("net_sec", "quic_decrypt_initial packet_bytes=%zu", pkt_bytes.size());
-    if (pkt_bytes.empty()) {
+    if (!packet_hex_valid) {
         diag::log_tagged("net_sec", "quic_decrypt_initial invalid packet hex data");
         return tool_result_t::error(OBFSTR("Invalid packet hex data"));
     }
@@ -3077,6 +3061,8 @@ tool_result_t quic_extract_keys(const json& params) {
         arr.push_back(kj);
     }
     result["keys"] = arr;
+    if (config.hint_only && (!scan_diag.hint_used || scan_diag.early_exit_reason == "hint_missing"))
+        return tool_result_t::error(OBFSTR("QUIC key extraction hint range was not available"), result);
     if (keys.empty() && (scan_diag.deadline_expired || scan_diag.cancelled))
         return tool_result_t::error(scan_diag.deadline_expired ? OBFSTR("QUIC key extraction exceeded scan deadline") : OBFSTR("QUIC key extraction cancelled"), result);
     return tool_result_t::ok(OBFSTR("Extracted ") + std::to_string(keys.size()) + OBFSTR(" QUIC keys"), result);
@@ -3257,8 +3243,8 @@ tool_result_t dtls_detect_sessions(const json& params) {
     diag::log_tagged_fmt("net_sec", "dtls_detect_sessions entry pid=%u", pid);
     if (ns_has_payload_hex_param(params)) {
         const std::string hex = ns_payload_hex_param(params);
-        auto payload = ns_hex_to_bytes(hex);
-        if (payload.empty()) {
+        std::vector<std::uint8_t> payload;
+        if (!ns_hex_to_bytes_strict(hex, payload)) {
             json r;
             r["backend"] = "provided_payload";
             r["deterministic_input"] = true;
@@ -3425,6 +3411,8 @@ tool_result_t dtls_extract_keys(const json& params) {
         arr.push_back(kj);
     }
     result["keys"] = arr;
+    if (config.hint_only && (!scan_diag.hint_used || scan_diag.early_exit_reason == "hint_missing"))
+        return tool_result_t::error(OBFSTR("DTLS key extraction hint range was not available"), result);
     if (keys.empty() && (scan_diag.deadline_expired || scan_diag.cancelled))
         return tool_result_t::error(scan_diag.deadline_expired ? OBFSTR("DTLS key extraction exceeded scan deadline") : OBFSTR("DTLS key extraction cancelled"), result);
     return tool_result_t::ok(OBFSTR("Extracted ") + std::to_string(keys.size()) + OBFSTR(" DTLS keys"), result);

@@ -2129,7 +2129,7 @@ public:
         const uint32_t veh_inherited_timeout = driver_bridge::current_remote_call_timeout_ms();
         const uint32_t veh_timeout_ms = bounded_remote_call_timeout_ms((std::max<uint32_t>)(veh_inherited_timeout, 8000));
         const uint64_t veh_inherited_deadline = driver_bridge::current_remote_call_deadline_ms();
-        const uint64_t veh_deadline = saturated_remote_call_deadline_ms(veh_call_start, veh_timeout_ms);
+        const uint64_t veh_deadline = effective_remote_call_deadline_ms(veh_call_start, veh_timeout_ms);
         driver_bridge::remote_call_context_t veh_ctx{};
         veh_ctx.label = "RtlAddVectoredExceptionHandler";
         veh_ctx.tool = remote_call_tool_from_label("RtlAddVectoredExceptionHandler");

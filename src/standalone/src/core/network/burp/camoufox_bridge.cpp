@@ -2180,6 +2180,103 @@ std::string addon_cache_fingerprint_key(const addon_cache_fingerprint_t& fp)
     return oss.str();
 }
 
+struct source_bridge_file_fingerprint_t
+{
+    std::string path;
+    local_helper_file_diag_t file;
+};
+
+struct source_bridge_fingerprint_t
+{
+    std::vector<source_bridge_file_fingerprint_t> files;
+};
+
+void append_source_file_candidate(std::vector<std::wstring>& files, const std::wstring& base, const wchar_t* rel)
+{
+    if (base.empty() || rel == nullptr || rel[0] == L'\0')
+        return;
+    const std::wstring path = join_path_w(base, rel);
+    if (path_exists_w(path))
+        append_unique_path(files, path);
+}
+
+source_bridge_fingerprint_t collect_source_bridge_fingerprint(const std::string& mode, const std::string& command_path)
+{
+    source_bridge_fingerprint_t out;
+    if (mode != "python")
+        return out;
+
+    std::vector<std::wstring> bases = runtime_base_dirs();
+    const std::wstring command_w = utf8_to_wide(command_path);
+    if (!command_w.empty())
+    {
+        const std::wstring command_dir = parent_directory_w(command_w);
+        append_unique_path(bases, command_dir);
+        append_unique_path(bases, parent_dir_w(command_dir));
+        append_unique_path(bases, parent_dir_w(parent_dir_w(command_dir)));
+    }
+
+    std::vector<std::wstring> files;
+    static const wchar_t* rels[] = {
+        L"camoufox-reverse-mcp\\src\\camoufox_reverse_mcp\\browser.py",
+        L"camoufox-reverse-mcp\\src\\camoufox_reverse_mcp\\tools\\navigation.py",
+        L"deps\\camoufox-reverse-mcp\\src\\camoufox_reverse_mcp\\browser.py",
+        L"deps\\camoufox-reverse-mcp\\src\\camoufox_reverse_mcp\\tools\\navigation.py",
+        L".deps\\camoufox-reverse-mcp\\src\\camoufox_reverse_mcp\\browser.py",
+        L".deps\\camoufox-reverse-mcp\\src\\camoufox_reverse_mcp\\tools\\navigation.py",
+        L"src\\camoufox_reverse_mcp\\browser.py",
+        L"src\\camoufox_reverse_mcp\\tools\\navigation.py",
+        L"Lib\\site-packages\\camoufox_reverse_mcp\\browser.py",
+        L"Lib\\site-packages\\camoufox_reverse_mcp\\tools\\navigation.py"
+    };
+
+    for (const auto& base : bases)
+    {
+        for (const wchar_t* rel : rels)
+            append_source_file_candidate(files, base, rel);
+    }
+
+    constexpr size_t kMaxSourceFingerprintFiles = 24;
+    for (size_t i = 0; i < files.size() && i < kMaxSourceFingerprintFiles; ++i)
+    {
+        source_bridge_file_fingerprint_t item;
+        item.path = wide_to_utf8(files[i]);
+        item.file = collect_local_helper_file_diag(item.path);
+        out.files.push_back(std::move(item));
+    }
+    return out;
+}
+
+nlohmann::json source_bridge_fingerprint_json(const source_bridge_fingerprint_t& fp)
+{
+    nlohmann::json files = nlohmann::json::array();
+    for (const auto& item : fp.files)
+    {
+        files.push_back({
+            {"path", item.path},
+            {"file", local_helper_file_diag_json(item.file)}
+        });
+    }
+    return {
+        {"count", fp.files.size()},
+        {"files", std::move(files)}
+    };
+}
+
+std::string source_bridge_fingerprint_key(const source_bridge_fingerprint_t& fp)
+{
+    std::ostringstream oss;
+    oss << fp.files.size();
+    for (const auto& item : fp.files)
+    {
+        oss << '|'
+            << normalized_sticky_path_key(item.path)
+            << '='
+            << local_helper_file_diag_key(item.file);
+    }
+    return oss.str();
+}
+
 struct sticky_setup_context_t
 {
     std::string session_id;
@@ -2189,6 +2286,7 @@ struct sticky_setup_context_t
     local_helper_file_diag_t command_file;
     local_helper_file_diag_t browser_file;
     addon_cache_fingerprint_t addon_cache;
+    source_bridge_fingerprint_t source_bridge;
     std::string key;
     nlohmann::json details = nlohmann::json::object();
 };
@@ -2203,13 +2301,15 @@ sticky_setup_context_t make_sticky_setup_context(const launch_config_t& cfg, con
     ctx.command_file = collect_local_helper_file_diag(command_path);
     ctx.browser_file = collect_local_helper_file_diag(cfg.browser_executable);
     ctx.addon_cache = collect_addon_cache_fingerprint();
+    ctx.source_bridge = collect_source_bridge_fingerprint(ctx.mode, command_path);
     std::ostringstream key;
     key << "mode=" << ctx.mode
         << "|command=" << normalized_sticky_path_key(ctx.command_path)
         << "|command_file=" << local_helper_file_diag_key(ctx.command_file)
         << "|browser=" << normalized_sticky_path_key(ctx.browser_path)
         << "|browser_file=" << local_helper_file_diag_key(ctx.browser_file)
-        << "|addon=" << addon_cache_fingerprint_key(ctx.addon_cache);
+        << "|addon=" << addon_cache_fingerprint_key(ctx.addon_cache)
+        << "|source=" << source_bridge_fingerprint_key(ctx.source_bridge);
     ctx.key = key.str();
     ctx.details = {
         {"session_id", ctx.session_id},
@@ -2218,7 +2318,8 @@ sticky_setup_context_t make_sticky_setup_context(const launch_config_t& cfg, con
         {"browser_path", ctx.browser_path},
         {"command_file", local_helper_file_diag_json(ctx.command_file)},
         {"browser_file", local_helper_file_diag_json(ctx.browser_file)},
-        {"addon_cache", addon_cache_fingerprint_json(ctx.addon_cache)}
+        {"addon_cache", addon_cache_fingerprint_json(ctx.addon_cache)},
+        {"source_bridge", source_bridge_fingerprint_json(ctx.source_bridge)}
     };
     return ctx;
 }
@@ -2349,7 +2450,7 @@ nlohmann::json set_sticky_setup_failure(const sticky_setup_context_t& ctx,
     }
     const nlohmann::json sticky = sticky_setup_failure_json_from_state(snapshot);
     diag::log_tagged_fmt("camoufox",
-        "sticky_setup_failure_set generation=%llu session_id=%s category=%s child_pid=%lu elapsed_ms=%llu mode=%s command_path=%s command_exists=%d command_sha256=%s command_hash_status=%s browser_path=%s browser_exists=%d browser_sha256=%s browser_hash_status=%s addon_ubo_exists=%d addon_manifest_exists=%d debug_log=%s key_tail=%.700s summary=%.900s",
+        "sticky_setup_failure_set generation=%llu session_id=%s category=%s child_pid=%lu elapsed_ms=%llu mode=%s command_path=%s command_exists=%d command_sha256=%s command_hash_status=%s browser_path=%s browser_exists=%d browser_sha256=%s browser_hash_status=%s addon_ubo_exists=%d addon_manifest_exists=%d source_files=%zu debug_log=%s key_tail=%.700s summary=%.900s",
         static_cast<unsigned long long>(generation),
         ctx.session_id.c_str(),
         snapshot.category.c_str(),
@@ -2366,6 +2467,7 @@ nlohmann::json set_sticky_setup_failure(const sticky_setup_context_t& ctx,
         ctx.browser_file.hash_status.empty() ? "<empty>" : ctx.browser_file.hash_status.c_str(),
         ctx.addon_cache.ubo.exists ? 1 : 0,
         ctx.addon_cache.manifest.exists ? 1 : 0,
+        ctx.source_bridge.files.size(),
         debug_log.empty() ? "<empty>" : debug_log.c_str(),
         compact_child_output_tail(ctx.key, 700).c_str(),
         snapshot.summary.empty() ? "<empty>" : snapshot.summary.c_str());
@@ -2443,7 +2545,7 @@ bool sticky_setup_failure_hit_or_clear(const sticky_setup_context_t& ctx,
     out_sticky["hit_context"] = ctx.details;
     out_error = sticky_setup_failure_error_text(snapshot.category, snapshot.summary);
     diag::log_tagged_fmt("camoufox",
-        "sticky_setup_failure_hit generation=%llu original_generation=%llu session_id=%s original_session_id=%s category=%s child_pid=%lu original_child_pid=%lu elapsed_ms=%llu age_ms=%llu mode=%s command_path=%s browser_path=%s addon_ubo_exists=%d addon_manifest_exists=%d key_tail=%.700s summary=%.900s",
+        "sticky_setup_failure_hit generation=%llu original_generation=%llu session_id=%s original_session_id=%s category=%s child_pid=%lu original_child_pid=%lu elapsed_ms=%llu age_ms=%llu mode=%s command_path=%s browser_path=%s addon_ubo_exists=%d addon_manifest_exists=%d source_files=%zu key_tail=%.700s summary=%.900s",
         static_cast<unsigned long long>(generation),
         static_cast<unsigned long long>(snapshot.generation),
         ctx.session_id.c_str(),
@@ -2458,6 +2560,7 @@ bool sticky_setup_failure_hit_or_clear(const sticky_setup_context_t& ctx,
         ctx.browser_path.empty() ? "<empty>" : ctx.browser_path.c_str(),
         ctx.addon_cache.ubo.exists ? 1 : 0,
         ctx.addon_cache.manifest.exists ? 1 : 0,
+        ctx.source_bridge.files.size(),
         compact_child_output_tail(ctx.key, 700).c_str(),
         snapshot.summary.empty() ? "<empty>" : snapshot.summary.c_str());
     return true;

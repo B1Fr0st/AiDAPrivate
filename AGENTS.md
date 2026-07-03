@@ -53,6 +53,7 @@ For serious crash, hang, Test Lab, MCP startup, Runtime Integrity Lock, anti-tam
 Every session must be careful with every change. Treat the existing worktree as shared state, assume unrelated modifications are intentional, and keep edits narrowly scoped to the requested objective.
 
 - Inspect the relevant files and current worktree before editing. Do not overwrite, normalize, reformat, revert, or regenerate unrelated files.
+- **ABSOLUTE FUCKING WORKTREE RULE:** If a file is modified and the host or subagents were not explicitly tasked to work on that exact file, ignore it completely. It is always user-owned work. Do not restore it, do not clean it, do not normalize it, do not reverse-patch it, do not mention it as suspicious, and do not ask subagents to touch it. The only exception is when the user explicitly asks for that exact file to be changed.
 - Identify whether a touched path affects license, ARC, anti-tamper, driver, protector, bootstrap, MCP, auth/session state, network protocol, deployment, or generated assets before changing it.
 - For security-sensitive changes, prefer the strictest correct behavior. AiDA must maximize security even when that behavior is extremely strict, inconvenient, or likely to expose false positives during development.
 - Never replace a strict security check with a weaker convenience path. If a false positive is proven, narrow the allow rule with evidence and keep equal or stronger enforcement elsewhere.

@@ -585,8 +585,9 @@ function Invoke-FrozenMcpContractCheck {
     $addonExcludeOk = $stdout -match '"default_ubo_exclusion_present":true'
     $addonExcludeMarkerOk = $stdout -match '"exclude_addons_marker_present":true'
     $addonInvalidDiagOk = $stdout -match '"addon_invalid_diagnostic_present":true'
-    if ($proc.ExitCode -ne 0 -or -not ($hasContract -and $hasRequestId -and $hasPageId -and $hasMarker -and $launchBudgetOk -and $pageCreateFloorOk -and $pageCreateCeilingOk -and $pageCreateRatioOk -and $latePageWaitOk -and $waitForLatePageSelfPagesOk -and $primaryWaitUntilDowngradeAbsent -and $addonPolicyOk -and $addonPolicyMarkerOk -and $addonExcludeOk -and $addonExcludeMarkerOk -and $addonInvalidDiagOk)) {
-        throw "Frozen MCP contract check failed exit=$($proc.ExitCode) contract=$([int]$hasContract) request_id=$([int]$hasRequestId) page_id=$([int]$hasPageId) marker=$([int]$hasMarker) launch_budget=$([int]$launchBudgetOk) page_create_floor=$([int]$pageCreateFloorOk) page_create_ceiling=$([int]$pageCreateCeilingOk) page_create_ratio=$([int]$pageCreateRatioOk) late_page_wait=$([int]$latePageWaitOk) wait_for_late_page_self_pages=$([int]$waitForLatePageSelfPagesOk) wait_until_downgrade_absent=$([int]$primaryWaitUntilDowngradeAbsent) addon_policy=$([int]$addonPolicyOk) addon_marker=$([int]$addonPolicyMarkerOk) addon_exclude_ubo=$([int]$addonExcludeOk) addon_exclude_marker=$([int]$addonExcludeMarkerOk) addon_invalid_diag=$([int]$addonInvalidDiagOk) stdout=[$(ConvertTo-CompactLogText $stdout)] stderr=[$(ConvertTo-CompactLogText $stderr)]"
+    $addonAllLaunchScopeOk = $stdout -match '"addon_all_launch_scope_present":true'
+    if ($proc.ExitCode -ne 0 -or -not ($hasContract -and $hasRequestId -and $hasPageId -and $hasMarker -and $launchBudgetOk -and $pageCreateFloorOk -and $pageCreateCeilingOk -and $pageCreateRatioOk -and $latePageWaitOk -and $waitForLatePageSelfPagesOk -and $primaryWaitUntilDowngradeAbsent -and $addonPolicyOk -and $addonPolicyMarkerOk -and $addonExcludeOk -and $addonExcludeMarkerOk -and $addonInvalidDiagOk -and $addonAllLaunchScopeOk)) {
+        throw "Frozen MCP contract check failed exit=$($proc.ExitCode) contract=$([int]$hasContract) request_id=$([int]$hasRequestId) page_id=$([int]$hasPageId) marker=$([int]$hasMarker) launch_budget=$([int]$launchBudgetOk) page_create_floor=$([int]$pageCreateFloorOk) page_create_ceiling=$([int]$pageCreateCeilingOk) page_create_ratio=$([int]$pageCreateRatioOk) late_page_wait=$([int]$latePageWaitOk) wait_for_late_page_self_pages=$([int]$waitForLatePageSelfPagesOk) wait_until_downgrade_absent=$([int]$primaryWaitUntilDowngradeAbsent) addon_policy=$([int]$addonPolicyOk) addon_marker=$([int]$addonPolicyMarkerOk) addon_exclude_ubo=$([int]$addonExcludeOk) addon_exclude_marker=$([int]$addonExcludeMarkerOk) addon_invalid_diag=$([int]$addonInvalidDiagOk) addon_all_launch_scope=$([int]$addonAllLaunchScopeOk) stdout=[$(ConvertTo-CompactLogText $stdout)] stderr=[$(ConvertTo-CompactLogText $stderr)]"
     }
     Write-Output "frozen_mcp_contract_check=ok"
 }
@@ -620,8 +621,11 @@ function Assert-SourceAddonPolicyContract {
         "exclude_addons",
         "launch_options_addon_policy",
         "launch_options_addon_invalid",
+        "default_exclusion_scope",
+        "all_launches",
         "default_addons_excluded",
-        "explicit_addon_count"
+        "explicit_addon_count",
+        "explicit_addons_validated"
     )
     $missing = @()
     foreach ($marker in $required) {
@@ -631,6 +635,9 @@ function Assert-SourceAddonPolicyContract {
     }
     if ($missing.Count -gt 0) {
         throw "Camoufox reverse MCP source addon policy contract missing markers: $($missing -join ',') in $browserPath"
+    }
+    if ($text.Contains("if explicit_addon_count == 0:")) {
+        throw "Camoufox reverse MCP source addon policy contract has stale no-explicit-addon UBO exclusion gate in $browserPath"
     }
     Write-Output "source_addon_policy_contract=ok"
     Write-Output "source_addon_policy_contract_browser=$browserPath"
@@ -1278,6 +1285,7 @@ def _aida_launch_budget_contract_probe():
         "addon_invalid_diagnostic_present": False,
         "exclude_addons_marker_present": False,
         "default_ubo_exclusion_present": False,
+        "addon_all_launch_scope_present": False,
         "addon_policy_contract_ok": False,
         "browser_probe_mode": "",
         "navigation_probe_mode": "",
@@ -1302,6 +1310,7 @@ def _aida_launch_budget_contract_probe():
             diagnostics["addon_invalid_diagnostic_present"] = "launch_options_addon_invalid" in browser_text
             diagnostics["exclude_addons_marker_present"] = "exclude_addons" in browser_text
             diagnostics["default_ubo_exclusion_present"] = "DefaultAddons.UBO" in browser_text
+            diagnostics["addon_all_launch_scope_present"] = "default_exclusion_scope" in browser_text and "all_launches" in browser_text and "if explicit_addon_count == 0:" not in browser_text
             tree = ast.parse(browser_text, filename=browser_spec.origin)
             for node in ast.walk(tree):
                 if isinstance(node, ast.AsyncFunctionDef) and node.name == "_wait_for_late_page":
@@ -1347,6 +1356,7 @@ def _aida_launch_budget_contract_probe():
                 diagnostics["addon_invalid_diagnostic_present"] = "launch_options_addon_invalid" in addon_repr
                 diagnostics["exclude_addons_marker_present"] = "exclude_addons" in addon_repr
                 diagnostics["default_ubo_exclusion_present"] = "DefaultAddons.UBO" in addon_repr and "DefaultAddons" in addon_repr and "UBO" in addon_repr
+                diagnostics["addon_all_launch_scope_present"] = "default_exclusion_scope" in addon_repr and "all_launches" in addon_repr and "explicit_addon_count == 0" not in addon_repr
                 if launch_code is None:
                     diagnostics["errors"].append({"module": "browser", "error_type": "ProbeError", "error": "BrowserManager.launch code object unavailable"})
                 else:
@@ -1433,6 +1443,7 @@ def _aida_launch_budget_contract_probe():
         and diagnostics["addon_invalid_diagnostic_present"]
         and diagnostics["exclude_addons_marker_present"]
         and diagnostics["default_ubo_exclusion_present"]
+        and diagnostics["addon_all_launch_scope_present"]
         and not diagnostics["errors"]
     )
     diagnostics["addon_policy_contract_ok"] = (
@@ -1441,6 +1452,7 @@ def _aida_launch_budget_contract_probe():
         and diagnostics["addon_invalid_diagnostic_present"]
         and diagnostics["exclude_addons_marker_present"]
         and diagnostics["default_ubo_exclusion_present"]
+        and diagnostics["addon_all_launch_scope_present"]
     )
     diagnostics["ok"] = ok
     return diagnostics
@@ -1495,6 +1507,7 @@ def _run_contract_check():
         "addon_invalid_diagnostic_present": bool(launch_budget.get("addon_invalid_diagnostic_present")),
         "exclude_addons_marker_present": bool(launch_budget.get("exclude_addons_marker_present")),
         "default_ubo_exclusion_present": bool(launch_budget.get("default_ubo_exclusion_present")),
+        "addon_all_launch_scope_present": bool(launch_budget.get("addon_all_launch_scope_present")),
         "probe_log": probe_log,
     }
     for line in probe_log:
@@ -1602,7 +1615,7 @@ def _run_import_smoke():
             raise RuntimeError("frozen browser launch diagnostics missing")
         if "AIDA_CAMOUFOX_BRIDGE_PATCH_ID" not in launch_names:
             raise RuntimeError("frozen browser launch patch marker missing")
-        for marker in ("aida_default_addon_policy_v1", "DefaultAddons.UBO", "exclude_addons", "launch_options_addon_policy", "launch_options_addon_invalid"):
+        for marker in ("aida_default_addon_policy_v1", "DefaultAddons.UBO", "exclude_addons", "launch_options_addon_policy", "launch_options_addon_invalid", "default_exclusion_scope", "all_launches", "explicit_addons_validated"):
             if marker not in addon_policy_contract:
                 raise RuntimeError(f"frozen addon policy contract marker missing: {marker}")
         for marker in ("launch_new_page_task_result",):
@@ -1662,6 +1675,8 @@ def _run_import_smoke():
         addon_policy = dict(getattr(browser_module, "_LAST_ADDON_POLICY", {}) or {})
         if not addon_policy.get("default_addons_excluded") or not addon_policy.get("exclude_default_ubo"):
             raise RuntimeError(f"addon policy exclusion was not applied: {addon_policy}")
+        if addon_policy.get("default_exclusion_scope") != "all_launches":
+            raise RuntimeError(f"addon policy exclusion scope is stale: {addon_policy}")
         builder_addons = builder_options.get("addons") if isinstance(builder_options, dict) else []
         debug(
             "import_smoke_launch_options_ok",

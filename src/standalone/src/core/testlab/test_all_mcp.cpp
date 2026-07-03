@@ -3411,6 +3411,54 @@ namespace {
         return false;
     }
 
+    bool re_or_protected_re_tool_name(const std::string& tool_lc) {
+        for (const char* prefix : {
+                 "dx_",
+                 "rtti_",
+                 "encptr_",
+                 "struct_",
+                 "heap_track_",
+                 "drv_",
+                 "smc_",
+                 "cff_",
+                 "vmp_",
+                 "seh_"
+             }) {
+            if (tool_lc.rfind(prefix, 0) == 0)
+                return true;
+        }
+        return false;
+    }
+
+    bool re_payload_has_incomplete_bounded_evidence(const std::string& tool_lc,
+                                                    const mcp_standalone::json& obj,
+                                                    std::string& reason) {
+        if (!re_or_protected_re_tool_name(tool_lc) || !obj.is_object())
+            return false;
+        for (const char* key : {
+                 "partial",
+                 "partial_result",
+                 "deadline_hit",
+                 "deadline_expired",
+                 "cancelled",
+                 "canceled",
+                 "timed_out",
+                 "truncated",
+                 "result_truncated",
+                 "blocks_truncated",
+                 "il_truncated",
+                 "change_rows_truncated",
+                 "payload_truncated"
+             }) {
+            auto it = obj.find(key);
+            if (it != obj.end() && json_scalar_truthy(*it)) {
+                reason = std::string(key) + "=true";
+                return true;
+            }
+        }
+        return false;
+    }
+
     const mcp_standalone::json* find_payload_key_recursive(const mcp_standalone::json& value,
                                                            const char* key) {
         if (!key)
@@ -6782,6 +6830,8 @@ namespace {
             reason = "z3_requested=true_z3_used=false";
             return true;
         }
+        if (re_payload_has_incomplete_bounded_evidence(tool_lc, ir.data, reason))
+            return true;
         if (tool_lc == "burp_sequencer_manage" && action_lc == "list_collections" && g_burp_sequencer_collection_id != 0) {
             return !sequencer_list_contains_healthy_current_collection(ir.data, g_burp_sequencer_collection_id, g_burp_sequencer_target_count, reason);
         }
@@ -6796,6 +6846,8 @@ namespace {
         if (!ir.text.empty()) {
             try {
                 auto parsed = mcp_standalone::json::parse(ir.text);
+                if (re_payload_has_incomplete_bounded_evidence(tool_lc, parsed, reason))
+                    return true;
                 if (inspect_payload_object_failure(parsed, reason))
                     return true;
                 if (accept_positive_functional_payload(parsed, "text_json"))

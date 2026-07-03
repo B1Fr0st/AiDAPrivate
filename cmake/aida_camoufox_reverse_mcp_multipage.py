@@ -72,12 +72,17 @@ def validate_browser_addon_policy_contract(path: pathlib.Path, text: str) -> Non
         "exclude_addons",
         "launch_options_addon_policy",
         "launch_options_addon_invalid",
+        "default_exclusion_scope",
+        "all_launches",
         "default_addons_excluded",
         "explicit_addon_count",
+        "explicit_addons_validated",
     )
     for marker in required_markers:
         if marker not in text:
             fail(f"browser addon policy contract missing {marker} in {path}")
+    if "if explicit_addon_count == 0:" in text:
+        fail(f"browser addon policy contract has stale no-explicit-addon UBO exclusion gate in {path}")
 
 
 def replace_in_function(text: str, function_name: str, old: str, new: str, label: str) -> str:
