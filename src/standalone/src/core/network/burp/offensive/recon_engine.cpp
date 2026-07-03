@@ -536,7 +536,7 @@ json dns_txt_json(const std::string& value)
 void query_dns_type(const std::string& domain, WORD type, json& out)
 {
     DNS_RECORDA* records = nullptr;
-    DNS_STATUS st = DnsQuery_A(domain.c_str(), type, DNS_QUERY_STANDARD, nullptr, &records, nullptr);
+    DNS_STATUS st = DnsQuery_A(domain.c_str(), type, DNS_QUERY_STANDARD, nullptr, reinterpret_cast<PDNS_RECORD*>(&records), nullptr);
     if (st != 0) {
         out["errors"][std::to_string(type)] = static_cast<uint64_t>(st);
         return;

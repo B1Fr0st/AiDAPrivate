@@ -664,6 +664,49 @@ bool load_from_disk()
     return true;
 }
 
+nlohmann::json export_json()
+{
+    auto& st = s();
+    nlohmann::json arr = nlohmann::json::array();
+    std::lock_guard<std::mutex> lk(st.mtx);
+    for (const auto& r : st.rules)
+        arr.push_back(rule_to_json(r));
+    return arr;
+}
+
+bool import_json(const nlohmann::json& doc, bool replace_existing)
+{
+    nlohmann::json arr = doc;
+    if (doc.is_object())
+        arr = doc.value("rules", nlohmann::json::array());
+    if (!arr.is_array()) {
+        set_err("match_replace.import: rules must be an array");
+        return false;
+    }
+    std::vector<rule_t> parsed;
+    uint64_t max_id = 0;
+    for (const auto& item : arr) {
+        rule_t r;
+        if (!rule_from_json(item, r))
+            continue;
+        max_id = std::max(max_id, r.id);
+        parsed.push_back(std::move(r));
+    }
+    auto& st = s();
+    std::lock_guard<std::mutex> lk(st.mtx);
+    if (replace_existing)
+        st.rules.clear();
+    for (auto& r : parsed) {
+        if (r.id == 0)
+            r.id = st.next_id.fetch_add(1);
+        max_id = std::max(max_id, r.id);
+        st.rules.push_back(std::move(r));
+    }
+    if (max_id >= st.next_id.load())
+        st.next_id.store(max_id + 1, std::memory_order_release);
+    return true;
+}
+
 std::string last_error()
 {
     diag::log_tagged_fmt("match_replace", "last_error queried");

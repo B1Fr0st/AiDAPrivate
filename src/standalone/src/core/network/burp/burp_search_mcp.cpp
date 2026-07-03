@@ -2,6 +2,8 @@
 
 #include "../mitm_proxy.hpp"
 #include "burp_logger.hpp"
+#include "collaborator.hpp"
+#include "issue.hpp"
 #include "site_map.hpp"
 #include "ws_editor.hpp"
 
@@ -268,6 +270,68 @@ void search_logger(result_sink_t& sink, const matcher_t& matcher)
     }
 }
 
+void search_issues(result_sink_t& sink, const matcher_t& matcher, const std::string& search_in)
+{
+    if (!(search_in.empty() || search_in == "all" || search_in == "url" || search_in == "body"))
+        return;
+    issue_filter_t filter;
+    filter.limit = sink.limit == 0 ? 50 : sink.limit;
+    const auto issues = issue_store::list(filter);
+    for (const auto& iss : issues) {
+        if (sink.source_full("issues"))
+            return;
+        json base;
+        base["issue_id"] = iss.id;
+        base["type_key"] = iss.type_key;
+        base["name"] = iss.name;
+        base["severity"] = severity_label(iss.severity);
+        base["confidence"] = confidence_label(iss.confidence);
+        base["url"] = iss.scheme + "://" + iss.host + iss.path;
+        if (want_field(search_in, "url")) try_add_field(sink, matcher, "issues", base, "url", base["url"].get<std::string>(), false);
+        if (!(search_in.empty() || search_in == "all" || search_in == "body"))
+            continue;
+        const std::string issue_text = iss.type_key + "\n" + iss.name + "\n" + iss.description + "\n" + iss.remediation + "\n" + iss.parameter + "\n" + iss.insertion_point;
+        try_add_field(sink, matcher, "issues", base, "issue", issue_text, true);
+        for (const auto& ev : iss.evidence) {
+            if (sink.source_full("issues"))
+                return;
+            try_add_field(sink, matcher, "issues", base, "request_body", ev.request_raw, true);
+            try_add_field(sink, matcher, "issues", base, "response_body", ev.response_raw, true);
+            try_add_field(sink, matcher, "issues", base, "body", ev.marker, true);
+        }
+    }
+}
+
+void search_collaborator(result_sink_t& sink, const matcher_t& matcher, const std::string& search_in)
+{
+    if (!(search_in.empty() || search_in == "all" || search_in == "request" || search_in == "headers" || search_in == "body" || search_in == "url"))
+        return;
+    const auto interactions = collaborator::snapshot_all(sink.limit == 0 ? 50 : sink.limit);
+    for (const auto& it : interactions) {
+        if (sink.source_full("collaborator"))
+            return;
+        json base;
+        base["interaction_id"] = it.id;
+        base["kind"] = it.kind;
+        base["client_ip"] = it.client_ip;
+        base["client_port"] = it.client_port;
+        base["subdomain"] = it.subdomain;
+        base["payload_token"] = it.payload_token;
+        if (want_field(search_in, "url")) try_add_field(sink, matcher, "collaborator", base, "url", it.subdomain, false);
+        if (!(search_in.empty() || search_in == "all" || search_in == "request" || search_in == "headers" || search_in == "body"))
+            continue;
+        if (want_field(search_in, "request_headers") || want_field(search_in, "request_body")) try_add_field(sink, matcher, "collaborator", base, "request_body", it.raw, true);
+        std::string details_text;
+        for (const auto& kv : it.details) {
+            details_text += kv.first;
+            details_text += ": ";
+            details_text += kv.second;
+            details_text += "\n";
+        }
+        if (!details_text.empty()) try_add_field(sink, matcher, "collaborator", base, "body", details_text, true);
+    }
+}
+
 void search_ws(result_sink_t& sink, const matcher_t& matcher, const std::string& search_in)
 {
     if (!want_field(search_in, "ws_payload"))
@@ -317,6 +381,8 @@ tool_result_t tool_search(const json& params)
     search_proxy(sink, matcher, search_in);
     if (search_in.empty() || search_in == "all" || search_in == "url")
         search_logger(sink, matcher);
+    search_issues(sink, matcher, search_in);
+    search_collaborator(sink, matcher, search_in);
     search_ws(sink, matcher, search_in);
     json sources = json::object();
     size_t total = 0;

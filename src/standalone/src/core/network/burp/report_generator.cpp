@@ -8,6 +8,10 @@
 
 #include "report_generator.hpp"
 
+#include "audit_session.hpp"
+#include "audit_trail.hpp"
+#include "evidence_store.hpp"
+#include "findings_db.hpp"
 #include "../../../helpers/diag_log.hpp"
 
 #include <algorithm>
@@ -18,6 +22,7 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -74,6 +79,16 @@ std::string html_escape(const std::string& s)
     return out;
 }
 
+std::string safe_text(const std::string& s, size_t cap = 2048)
+{
+    return evidence_store::redact_sensitive_text(s, cap);
+}
+
+std::string safe_html(const std::string& s, size_t cap = 2048)
+{
+    return html_escape(safe_text(s, cap));
+}
+
 std::string format_ts(uint64_t ms)
 {
     time_t t = static_cast<time_t>(ms / 1000);
@@ -108,29 +123,341 @@ const char* sarif_level(severity_t s)
     return "note";
 }
 
-std::vector<issue_t> filter_issues(const report_config_t& cfg)
-{
-    issue_filter_t f;
-    auto all = issue_store::list(f);
-    if (cfg.include_issue_ids.empty()) return all;
-    std::unordered_set<uint64_t> keep(cfg.include_issue_ids.begin(), cfg.include_issue_ids.end());
-    std::vector<issue_t> filtered;
-    filtered.reserve(all.size());
-    for (auto& it : all) if (keep.count(it.id)) filtered.push_back(std::move(it));
-    return filtered;
-}
-
 std::string truncate_for_evidence(const std::string& s, size_t cap)
 {
-    if (s.size() <= cap) return s;
-    return s.substr(0, cap) + "\n...[truncated]";
+    return safe_text(s, cap);
 }
 
-std::string generate_html(const report_config_t& cfg, const std::vector<issue_t>& issues)
+std::string lower_copy(std::string value)
+{
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return value;
+}
+
+bool issue_matches_config(const issue_t& issue, const report_config_t& cfg)
+{
+    if (!cfg.include_suppressed && issue.suppressed)
+        return false;
+    if (!cfg.session_id.empty() && issue.session_id != cfg.session_id)
+        return false;
+    if (cfg.has_audit_id && issue.audit_id != cfg.audit_id)
+        return false;
+    if (cfg.has_severity_min && static_cast<int>(issue.severity) < static_cast<int>(cfg.severity_min))
+        return false;
+    if (!cfg.target_domain.empty()) {
+        const std::string want = lower_copy(cfg.target_domain);
+        const std::string host = lower_copy(issue.host);
+        if (host.find(want) == std::string::npos)
+            return false;
+    }
+    return true;
+}
+
+bool collect_issues(const report_config_t& cfg, std::vector<issue_t>& out)
+{
+    out.clear();
+    if (!findings_db::initialize() || !findings_db::mirror_issue_store(false)) {
+        set_err(findings_db::last_error().empty() ? "report.generate: findings database unavailable" : findings_db::last_error());
+        return false;
+    }
+    if (!cfg.include_issue_ids.empty()) {
+        for (uint64_t id : cfg.include_issue_ids) {
+            issue_t issue;
+            if (findings_db::get(id, issue) && issue_matches_config(issue, cfg))
+                out.push_back(std::move(issue));
+        }
+    } else {
+        findings_db::finding_filter_t filter;
+        filter.session_id = cfg.session_id;
+        filter.has_audit_id = cfg.has_audit_id;
+        filter.audit_id = cfg.audit_id;
+        filter.has_severity_min = cfg.has_severity_min;
+        filter.severity_min = cfg.severity_min;
+        filter.host_substring = cfg.target_domain;
+        filter.include_suppressed = cfg.include_suppressed;
+        filter.limit = 0;
+        out = findings_db::list(filter);
+    }
+    std::sort(out.begin(), out.end(), [](const issue_t& a, const issue_t& b) {
+        if (a.severity != b.severity) return static_cast<int>(a.severity) > static_cast<int>(b.severity);
+        if (a.confidence != b.confidence) return static_cast<int>(a.confidence) > static_cast<int>(b.confidence);
+        return a.seen_ms > b.seen_ms;
+    });
+    return true;
+}
+
+size_t severity_count(const std::vector<issue_t>& issues, severity_t severity)
+{
+    size_t count = 0;
+    for (const auto& issue : issues)
+        if (issue.severity == severity)
+            ++count;
+    return count;
+}
+
+nlohmann::json severity_counts_json(const std::vector<issue_t>& issues)
+{
+    return nlohmann::json{
+        {"critical", severity_count(issues, severity_t::critical)},
+        {"high", severity_count(issues, severity_t::high)},
+        {"medium", severity_count(issues, severity_t::medium)},
+        {"low", severity_count(issues, severity_t::low)},
+        {"info", severity_count(issues, severity_t::info)}
+    };
+}
+
+double risk_score(const std::vector<issue_t>& issues)
+{
+    double score = 0.0;
+    for (const auto& issue : issues) {
+        switch (issue.severity) {
+            case severity_t::critical: score += 20.0; break;
+            case severity_t::high: score += 12.0; break;
+            case severity_t::medium: score += 6.0; break;
+            case severity_t::low: score += 2.0; break;
+            case severity_t::info: score += 0.5; break;
+        }
+    }
+    return (std::min)(100.0, score);
+}
+
+std::string risk_posture(double score)
+{
+    if (score >= 80.0) return "critical";
+    if (score >= 50.0) return "high";
+    if (score >= 25.0) return "moderate";
+    if (score > 0.0) return "low";
+    return "clear";
+}
+
+nlohmann::json recommendations_json(const std::vector<issue_t>& issues)
+{
+    std::map<std::string, size_t> counts;
+    for (const auto& issue : issues) {
+        std::string text = issue.remediation.empty() ? std::string("Review and remediate ") + (issue.name.empty() ? issue.type_key : issue.name) : issue.remediation;
+        counts[evidence_store::redact_sensitive_text(text, 320)]++;
+    }
+    std::vector<std::pair<std::string, size_t>> rows(counts.begin(), counts.end());
+    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) {
+        if (a.second != b.second) return a.second > b.second;
+        return a.first < b.first;
+    });
+    nlohmann::json out = nlohmann::json::array();
+    for (const auto& row : rows) {
+        out.push_back({{"recommendation", row.first}, {"finding_count", row.second}});
+        if (out.size() >= 10) break;
+    }
+    return out;
+}
+
+nlohmann::json issue_to_report_json(const issue_t& issue, bool include_evidence)
+{
+    nlohmann::json j = issue_store::issue_to_json(issue);
+    j["finding_id"] = issue.id;
+    j["session_id"] = issue.session_id;
+    j["scan_id"] = issue.scan_id;
+    j["cvss_score"] = issue.cvss_score;
+    j["cvss_vector"] = evidence_store::redact_sensitive_text(issue.cvss_vector, 256);
+    j["cvss_severity"] = evidence_store::redact_sensitive_text(issue.cvss_severity, 64);
+    j["owasp_category"] = evidence_store::redact_sensitive_text(issue.owasp_category, 128);
+    j["suppressed"] = issue.suppressed;
+    if (!include_evidence)
+        j.erase("evidence");
+    else
+        j["stored_evidence"] = evidence_store::export_json(issue.id)["evidence"];
+    return evidence_store::redact_sensitive_json(j, 4096);
+}
+
+nlohmann::json audit_entries_json(const report_config_t& cfg, const std::string& tool_filter)
+{
+    audit_trail::query_filter_t filter;
+    filter.session_id = cfg.session_id;
+    filter.tool_name_substring = tool_filter;
+    filter.limit = cfg.audit_trail_limit == 0 ? 128 : cfg.audit_trail_limit;
+    nlohmann::json arr = nlohmann::json::array();
+    for (const auto& rec : audit_trail::query(filter))
+        arr.push_back(audit_trail::record_to_json(rec));
+    return evidence_store::redact_sensitive_json(arr, 2048);
+}
+
+bool run_id_selected(const nlohmann::json& record, const std::vector<std::string>& ids)
+{
+    if (ids.empty())
+        return true;
+    const std::string text = record.dump();
+    for (const auto& id : ids)
+        if (!id.empty() && text.find(id) != std::string::npos)
+            return true;
+    return false;
+}
+
+bool text_contains_ci(const std::string& text, const std::string& needle)
+{
+    if (needle.empty())
+        return true;
+    return lower_copy(text).find(lower_copy(needle)) != std::string::npos;
+}
+
+bool json_contains_text_ci(const nlohmann::json& value, const std::string& needle)
+{
+    if (needle.empty())
+        return true;
+    if (value.is_string())
+        return text_contains_ci(value.get<std::string>(), needle);
+    if (value.is_array()) {
+        for (const auto& item : value)
+            if (json_contains_text_ci(item, needle))
+                return true;
+        return false;
+    }
+    if (value.is_object()) {
+        for (auto it = value.begin(); it != value.end(); ++it)
+            if (json_contains_text_ci(it.value(), needle))
+                return true;
+        return false;
+    }
+    return false;
+}
+
+bool json_value_matches_u64(const nlohmann::json& value, uint64_t expected)
+{
+    if (value.is_number_unsigned())
+        return value.get<uint64_t>() == expected;
+    if (value.is_number_integer()) {
+        const auto signed_value = value.get<int64_t>();
+        return signed_value >= 0 && static_cast<uint64_t>(signed_value) == expected;
+    }
+    if (value.is_string()) {
+        const std::string s = value.get<std::string>();
+        if (s.empty())
+            return false;
+        try {
+            size_t idx = 0;
+            const uint64_t parsed = std::stoull(s, &idx, 10);
+            return idx == s.size() && parsed == expected;
+        } catch (...) {
+            return false;
+        }
+    }
+    return false;
+}
+
+bool json_contains_u64_key(const nlohmann::json& value, const char* key, uint64_t expected)
+{
+    if (value.is_object()) {
+        for (auto it = value.begin(); it != value.end(); ++it) {
+            if (it.key() == key && json_value_matches_u64(it.value(), expected))
+                return true;
+            if (json_contains_u64_key(it.value(), key, expected))
+                return true;
+        }
+        return false;
+    }
+    if (value.is_array()) {
+        for (const auto& item : value)
+            if (json_contains_u64_key(item, key, expected))
+                return true;
+    }
+    return false;
+}
+
+bool context_record_selected(const nlohmann::json& record, const report_config_t& cfg)
+{
+    if (!run_id_selected(record, cfg.include_offensive_run_ids))
+        return false;
+    if (cfg.has_audit_id && !json_contains_u64_key(record, "audit_id", cfg.audit_id))
+        return false;
+    if (!cfg.target_domain.empty() && !json_contains_text_ci(record, cfg.target_domain))
+        return false;
+    return true;
+}
+
+nlohmann::json offensive_context_json(const report_config_t& cfg)
+{
+    nlohmann::json out;
+    out["target_domain"] = evidence_store::redact_sensitive_text(cfg.target_domain, 256);
+    out["include_recon"] = cfg.include_recon;
+    out["requested_run_ids"] = nlohmann::json::array();
+    for (const auto& id : cfg.include_offensive_run_ids)
+        out["requested_run_ids"].push_back(evidence_store::sha256_hex(id).substr(0, 16));
+    out["source"] = "sqlite_audit_trail";
+    out["offensive_events"] = nlohmann::json::array();
+    out["recon_events"] = nlohmann::json::array();
+    auto offensive = audit_entries_json(cfg, "offensive");
+    if (offensive.is_array()) {
+        for (const auto& rec : offensive)
+            if (context_record_selected(rec, cfg))
+                out["offensive_events"].push_back(rec);
+    }
+    if (cfg.include_recon) {
+        auto recon = audit_entries_json(cfg, "recon");
+        if (recon.is_array()) {
+            for (const auto& rec : recon)
+                if (context_record_selected(rec, cfg))
+                    out["recon_events"].push_back(rec);
+        }
+    }
+    out["available"] = !out["offensive_events"].empty() || !out["recon_events"].empty();
+    return out;
+}
+
+nlohmann::json session_context_json(const report_config_t& cfg)
+{
+    if (cfg.session_id.empty() || !cfg.include_session_context)
+        return nlohmann::json::object();
+    audit_session::session_t session;
+    nlohmann::json out = nlohmann::json::object();
+    if (audit_session::get(cfg.session_id, session))
+        out["session"] = audit_session::session_to_json(session, true);
+    evidence_store::evidence_filter_t ev_filter;
+    ev_filter.session_id = cfg.session_id;
+    ev_filter.limit = 256;
+    out["evidence"] = nlohmann::json::array();
+    for (const auto& ev : evidence_store::list(ev_filter))
+        out["evidence"].push_back(evidence_store::summary_json(ev));
+    out["evidence_count"] = out["evidence"].size();
+    if (cfg.include_audit_trail) {
+        out["audit_trail"] = audit_entries_json(cfg, std::string());
+        out["audit_trail_count"] = out["audit_trail"].size();
+    }
+    return evidence_store::redact_sensitive_json(out, 4096);
+}
+
+nlohmann::json report_summary_json(const report_config_t& cfg, const std::vector<issue_t>& issues)
+{
+    const double score = risk_score(issues);
+    nlohmann::json out;
+    out["issue_count"] = issues.size();
+    out["severity_counts"] = severity_counts_json(issues);
+    out["risk_score"] = score;
+    out["risk_posture"] = risk_posture(score);
+    out["recommendations"] = recommendations_json(issues);
+    out["session_id"] = cfg.session_id;
+    out["target_domain"] = evidence_store::redact_sensitive_text(cfg.target_domain, 256);
+    return out;
+}
+
+struct report_context_t
+{
+    nlohmann::json summary = nlohmann::json::object();
+    nlohmann::json session = nlohmann::json::object();
+    nlohmann::json offensive = nlohmann::json::object();
+};
+
+report_context_t build_context(const report_config_t& cfg, const std::vector<issue_t>& issues)
+{
+    report_context_t ctx;
+    ctx.summary = report_summary_json(cfg, issues);
+    ctx.session = session_context_json(cfg);
+    ctx.offensive = offensive_context_json(cfg);
+    return ctx;
+}
+
+std::string generate_html(const report_config_t& cfg, const std::vector<issue_t>& issues, const report_context_t& ctx)
 {
     std::ostringstream os;
     os << "<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">"
-       << "<title>" << html_escape(cfg.title.empty() ? std::string("AiDA Security Report") : cfg.title) << "</title>"
+       << "<title>" << safe_html(cfg.title.empty() ? std::string("AiDA Security Report") : cfg.title, 256) << "</title>"
        << "<style>"
        << "body{font-family:'Segoe UI',Arial,sans-serif;background:#0d1117;color:#e6edf3;margin:0;padding:24px;}"
        << "h1{color:#58a6ff;border-bottom:1px solid #30363d;padding-bottom:8px;}"
@@ -153,19 +480,19 @@ std::string generate_html(const report_config_t& cfg, const std::vector<issue_t>
        << ".toc{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px;margin:16px 0;}"
        << ".toc ul{margin:0;padding-left:18px;}"
        << "</style></head><body>";
-    os << "<h1>" << html_escape(cfg.title.empty() ? std::string("AiDA Security Report") : cfg.title) << "</h1>";
-    os << "<p class=\"meta\">Client: " << html_escape(cfg.client.empty() ? std::string("N/A") : cfg.client)
+    os << "<h1>" << safe_html(cfg.title.empty() ? std::string("AiDA Security Report") : cfg.title, 256) << "</h1>";
+    os << "<p class=\"meta\">Client: " << safe_html(cfg.client.empty() ? std::string("N/A") : cfg.client, 256)
        << " &middot; Generated: " << html_escape(format_ts(now_ms()))
        << " &middot; Issues: " << issues.size() << "</p>";
     if (!cfg.scope_summary.empty())
-        os << "<p>" << html_escape(cfg.scope_summary) << "</p>";
+        os << "<p>" << safe_html(cfg.scope_summary, 2048) << "</p>";
 
     os << "<div class=\"toc\"><h2>Table of contents</h2><ul>";
     for (const auto& it : issues) {
         os << "<li><span class=\"badge " << severity_class(it.severity) << "\">"
            << severity_label(it.severity) << "</span> "
-           << "<a href=\"#iss-" << it.id << "\">" << html_escape(it.name)
-           << "</a> &mdash; " << html_escape(it.host) << it.path << "</li>";
+           << "<a href=\"#iss-" << it.id << "\">" << safe_html(it.name, 256)
+           << "</a> &mdash; " << safe_html(it.host, 256) << safe_html(it.path, 512) << "</li>";
     }
     os << "</ul></div>";
 
@@ -181,18 +508,28 @@ std::string generate_html(const report_config_t& cfg, const std::vector<issue_t>
            << "\">" << sn[i] << "</span> " << counts[i] << "</td>";
     }
     os << "</tr></table>";
+    os << "<p class=\"meta\">Risk posture: " << html_escape(ctx.summary.value("risk_posture", std::string("clear")))
+       << " &middot; Risk score: " << ctx.summary.value("risk_score", 0.0) << "/100</p>";
+    if (ctx.offensive.value("available", false)) {
+        os << "<details><summary>Recon and offensive context</summary><pre><code>"
+           << html_escape(ctx.offensive.dump(2)) << "</code></pre></details>";
+    }
+    if (!ctx.session.empty()) {
+        os << "<details><summary>Audit session context</summary><pre><code>"
+           << html_escape(ctx.session.dump(2)) << "</code></pre></details>";
+    }
 
     os << "<h2>Findings</h2>";
     for (const auto& it : issues) {
         os << "<div class=\"issue\" id=\"iss-" << it.id << "\">";
         os << "<h3><span class=\"badge " << severity_class(it.severity) << "\">"
-           << severity_label(it.severity) << "</span> " << html_escape(it.name) << "</h3>";
-        os << "<p class=\"meta\">Type: <code>" << html_escape(it.type_key) << "</code>"
+           << severity_label(it.severity) << "</span> " << safe_html(it.name, 256) << "</h3>";
+        os << "<p class=\"meta\">Type: <code>" << safe_html(it.type_key, 128) << "</code>"
            << " &middot; Confidence: " << html_escape(confidence_label(it.confidence))
-           << " &middot; Host: <code>" << html_escape(it.host) << ":" << it.port << it.path << "</code>";
-        if (!it.parameter.empty()) os << " &middot; Parameter: <code>" << html_escape(it.parameter) << "</code>";
+           << " &middot; Host: <code>" << safe_html(it.host, 256) << ":" << it.port << safe_html(it.path, 512) << "</code>";
+        if (!it.parameter.empty()) os << " &middot; Parameter: <code>" << safe_html(it.parameter, 256) << "</code>";
         os << "</p>";
-        if (!it.description.empty()) os << "<p>" << html_escape(it.description) << "</p>";
+        if (!it.description.empty()) os << "<p>" << safe_html(it.description, 4096) << "</p>";
         if (!it.cwe.empty()) {
             os << "<p class=\"kv\">CWE:";
             for (const auto& c : it.cwe) {
@@ -201,16 +538,24 @@ std::string generate_html(const report_config_t& cfg, const std::vector<issue_t>
             }
             os << "</p>";
         }
+        if (!it.owasp_category.empty() || it.cvss_score > 0.0) {
+            os << "<p class=\"kv\">";
+            if (!it.owasp_category.empty())
+                os << "OWASP: " << safe_html(it.owasp_category, 128) << " ";
+            if (it.cvss_score > 0.0)
+                os << "CVSS: " << it.cvss_score << " " << safe_html(it.cvss_severity, 64) << " " << safe_html(it.cvss_vector, 256);
+            os << "</p>";
+        }
         if (cfg.include_remediation && !it.remediation.empty()) {
             os << "<details><summary>Remediation</summary><p>"
-               << html_escape(it.remediation) << "</p></details>";
+               << safe_html(it.remediation, 4096) << "</p></details>";
         }
         if (cfg.include_evidence && !it.evidence.empty()) {
             os << "<details><summary>Evidence (" << it.evidence.size() << ")</summary>";
             for (size_t ei = 0; ei < it.evidence.size(); ++ei) {
                 const auto& e = it.evidence[ei];
                 os << "<h4>Evidence " << (ei + 1) << "</h4>";
-                if (!e.marker.empty()) os << "<p class=\"kv\">Marker: <code>" << html_escape(e.marker) << "</code></p>";
+                if (!e.marker.empty()) os << "<p class=\"kv\">Marker: <code>" << safe_html(e.marker, 512) << "</code></p>";
                 if (!e.request_raw.empty()) {
                     os << "<details open><summary>Request</summary><pre class=\"lang-http\"><code>"
                        << html_escape(truncate_for_evidence(e.request_raw, 8192)) << "</code></pre></details>";
@@ -229,36 +574,47 @@ std::string generate_html(const report_config_t& cfg, const std::vector<issue_t>
     return os.str();
 }
 
-std::string generate_markdown(const report_config_t& cfg, const std::vector<issue_t>& issues)
+std::string generate_markdown(const report_config_t& cfg, const std::vector<issue_t>& issues, const report_context_t& ctx)
 {
     std::ostringstream os;
-    os << "# " << (cfg.title.empty() ? std::string("AiDA Security Report") : cfg.title) << "\n\n";
-    os << "- **Client:** " << (cfg.client.empty() ? std::string("N/A") : cfg.client) << "\n";
+    os << "# " << safe_text(cfg.title.empty() ? std::string("AiDA Security Report") : cfg.title, 256) << "\n\n";
+    os << "- **Client:** " << safe_text(cfg.client.empty() ? std::string("N/A") : cfg.client, 256) << "\n";
     os << "- **Generated:** " << format_ts(now_ms()) << "\n";
     os << "- **Issues:** " << issues.size() << "\n\n";
-    if (!cfg.scope_summary.empty()) os << cfg.scope_summary << "\n\n";
+    os << "- **Risk posture:** " << ctx.summary.value("risk_posture", std::string("clear")) << "\n";
+    os << "- **Risk score:** " << ctx.summary.value("risk_score", 0.0) << "/100\n\n";
+    if (!cfg.scope_summary.empty()) os << safe_text(cfg.scope_summary, 2048) << "\n\n";
+
+    if (ctx.offensive.value("available", false)) {
+        os << "## Recon and Offensive Context\n\n```json\n" << ctx.offensive.dump(2) << "\n```\n\n";
+    }
+    if (!ctx.session.empty()) {
+        os << "## Audit Session Context\n\n```json\n" << ctx.session.dump(2) << "\n```\n\n";
+    }
 
     os << "## Table of contents\n\n";
     for (const auto& it : issues) {
-        os << "- [" << severity_label(it.severity) << "] [" << it.name << "](#issue-" << it.id << ") - `" << it.host << it.path << "`\n";
+        os << "- [" << severity_label(it.severity) << "] [" << safe_text(it.name, 256) << "](#issue-" << it.id << ") - `" << safe_text(it.host, 256) << safe_text(it.path, 512) << "`\n";
     }
     os << "\n## Findings\n\n";
 
     for (const auto& it : issues) {
-        os << "### <a name=\"issue-" << it.id << "\"></a>" << it.name << " (`" << severity_label(it.severity) << "`)\n\n";
-        os << "- **Type:** `" << it.type_key << "`\n";
+        os << "### <a name=\"issue-" << it.id << "\"></a>" << safe_text(it.name, 256) << " (`" << severity_label(it.severity) << "`)\n\n";
+        os << "- **Type:** `" << safe_text(it.type_key, 128) << "`\n";
         os << "- **Confidence:** " << confidence_label(it.confidence) << "\n";
-        os << "- **URL:** `" << it.host << ":" << it.port << it.path << "`\n";
-        if (!it.parameter.empty()) os << "- **Parameter:** `" << it.parameter << "`\n";
+        os << "- **URL:** `" << safe_text(it.host, 256) << ":" << it.port << safe_text(it.path, 512) << "`\n";
+        if (!it.parameter.empty()) os << "- **Parameter:** `" << safe_text(it.parameter, 256) << "`\n";
         if (!it.cwe.empty()) {
             os << "- **CWE:**";
             for (const auto& c : it.cwe) os << " [" << c << "](https://cwe.mitre.org/data/definitions/" << c << ".html)";
             os << "\n";
         }
+        if (!it.owasp_category.empty()) os << "- **OWASP:** " << safe_text(it.owasp_category, 128) << "\n";
+        if (it.cvss_score > 0.0) os << "- **CVSS:** " << it.cvss_score << " " << safe_text(it.cvss_severity, 64) << " `" << safe_text(it.cvss_vector, 256) << "`\n";
         os << "\n";
-        if (!it.description.empty()) os << it.description << "\n\n";
+        if (!it.description.empty()) os << safe_text(it.description, 4096) << "\n\n";
         if (cfg.include_remediation && !it.remediation.empty()) {
-            os << "**Remediation:** " << it.remediation << "\n\n";
+            os << "**Remediation:** " << safe_text(it.remediation, 4096) << "\n\n";
         }
         if (cfg.include_evidence && !it.evidence.empty()) {
             for (size_t ei = 0; ei < it.evidence.size(); ++ei) {
@@ -277,22 +633,26 @@ std::string generate_markdown(const report_config_t& cfg, const std::vector<issu
     return os.str();
 }
 
-std::string generate_json(const report_config_t& cfg, const std::vector<issue_t>& issues)
+std::string generate_json(const report_config_t& cfg, const std::vector<issue_t>& issues, const report_context_t& ctx)
 {
     nlohmann::json doc;
-    doc["title"]        = cfg.title;
-    doc["client"]       = cfg.client;
-    doc["scope"]        = cfg.scope_summary;
+    doc["title"]        = safe_text(cfg.title, 256);
+    doc["client"]       = safe_text(cfg.client, 256);
+    doc["scope"]        = safe_text(cfg.scope_summary, 2048);
     doc["generated_ms"] = now_ms();
+    doc["summary"]      = ctx.summary;
+    doc["session_context"] = ctx.session;
+    doc["offensive_context"] = ctx.offensive;
     nlohmann::json arr = nlohmann::json::array();
-    for (const auto& it : issues) arr.push_back(issue_store::issue_to_json(it));
+    for (const auto& it : issues) arr.push_back(issue_to_report_json(it, cfg.include_evidence));
     doc["issues"] = std::move(arr);
     return doc.dump(2);
 }
 
-std::string generate_csv(const report_config_t& cfg, const std::vector<issue_t>& issues)
+std::string generate_csv(const report_config_t& cfg, const std::vector<issue_t>& issues, const report_context_t& ctx)
 {
     (void)cfg;
+    (void)ctx;
     std::ostringstream os;
     auto quote = [](const std::string& s) {
         bool needs = false;
@@ -303,18 +663,21 @@ std::string generate_csv(const report_config_t& cfg, const std::vector<issue_t>&
         out += "\"";
         return out;
     };
-    os << "id,severity,host,port,path,type,confidence,parameter\r\n";
+    os << "id,severity,cvss_score,cvss_severity,owasp_category,host,port,path,type,confidence,parameter,suppressed\r\n";
     for (const auto& it : issues) {
         os << it.id << "," << severity_label(it.severity) << ","
-           << quote(it.host) << "," << it.port << ","
-           << quote(it.path) << "," << quote(it.type_key) << ","
+           << it.cvss_score << "," << quote(safe_text(it.cvss_severity, 64)) << ","
+           << quote(safe_text(it.owasp_category, 128)) << ","
+           << quote(safe_text(it.host, 256)) << "," << it.port << ","
+           << quote(safe_text(it.path, 512)) << "," << quote(safe_text(it.type_key, 128)) << ","
            << confidence_label(it.confidence) << ","
-           << quote(it.parameter) << "\r\n";
+           << quote(safe_text(it.parameter, 256)) << ","
+           << (it.suppressed ? "true" : "false") << "\r\n";
     }
     return os.str();
 }
 
-std::string generate_sarif(const report_config_t& cfg, const std::vector<issue_t>& issues)
+std::string generate_sarif(const report_config_t& cfg, const std::vector<issue_t>& issues, const report_context_t& ctx)
 {
     nlohmann::json doc;
     doc["$schema"] = "https://json.schemastore.org/sarif-2.1.0.json";
@@ -325,18 +688,19 @@ std::string generate_sarif(const report_config_t& cfg, const std::vector<issue_t
     for (const auto& it : issues) {
         if (rule_ids.insert(it.type_key).second) {
             nlohmann::json rule;
-            rule["id"]   = it.type_key;
-            rule["name"] = it.name;
-            rule["shortDescription"]["text"] = it.name;
-            if (!it.description.empty()) rule["fullDescription"]["text"] = it.description;
-            if (!it.remediation.empty()) rule["help"]["text"] = it.remediation;
+            rule["id"]   = safe_text(it.type_key, 128);
+            rule["name"] = safe_text(it.name, 256);
+            rule["shortDescription"]["text"] = safe_text(it.name, 256);
+            if (!it.description.empty()) rule["fullDescription"]["text"] = safe_text(it.description, 4096);
+            if (!it.remediation.empty()) rule["help"]["text"] = safe_text(it.remediation, 4096);
             if (!it.cwe.empty()) {
                 nlohmann::json tags = nlohmann::json::array();
                 for (const auto& c : it.cwe) tags.push_back(std::string("CWE-") + c);
                 rule["properties"]["tags"] = std::move(tags);
             }
             rule["properties"]["security-severity"] =
-                (it.severity == severity_t::critical) ? "9.5"
+                (it.cvss_score > 0.0) ? std::to_string(it.cvss_score)
+              : (it.severity == severity_t::critical) ? "9.5"
               : (it.severity == severity_t::high)     ? "8.0"
               : (it.severity == severity_t::medium)   ? "5.5"
               : (it.severity == severity_t::low)      ? "3.0"
@@ -348,11 +712,11 @@ std::string generate_sarif(const report_config_t& cfg, const std::vector<issue_t
     nlohmann::json results = nlohmann::json::array();
     for (const auto& it : issues) {
         nlohmann::json result;
-        result["ruleId"]        = it.type_key;
+        result["ruleId"]        = safe_text(it.type_key, 128);
         result["level"]         = sarif_level(it.severity);
-        result["message"]["text"] = it.description.empty() ? it.name : it.description;
+        result["message"]["text"] = safe_text(it.description.empty() ? it.name : it.description, 4096);
         std::string url = it.scheme.empty() ? std::string("https") : it.scheme;
-        url += "://" + it.host + ":" + std::to_string(it.port) + it.path;
+        url += "://" + safe_text(it.host, 256) + ":" + std::to_string(it.port) + safe_text(it.path, 512);
         nlohmann::json loc;
         loc["physicalLocation"]["artifactLocation"]["uri"] = url;
         result["locations"] = nlohmann::json::array({ loc });
@@ -369,11 +733,16 @@ std::string generate_sarif(const report_config_t& cfg, const std::vector<issue_t
             }
         }
         if (!it.parameter.empty()) {
-            result["properties"]["parameter"] = it.parameter;
+            result["properties"]["parameter"] = safe_text(it.parameter, 256);
         }
         result["properties"]["confidence"] = confidence_label(it.confidence);
         result["properties"]["seen_ms"]    = it.seen_ms;
         result["properties"]["audit_id"]   = it.audit_id;
+        result["properties"]["session_id"] = safe_text(it.session_id, 256);
+        result["properties"]["scan_id"] = it.scan_id;
+        result["properties"]["cvss_vector"] = evidence_store::redact_sensitive_text(it.cvss_vector, 256);
+        result["properties"]["cvss_severity"] = evidence_store::redact_sensitive_text(it.cvss_severity, 64);
+        result["properties"]["owasp_category"] = evidence_store::redact_sensitive_text(it.owasp_category, 128);
         results.push_back(std::move(result));
     }
 
@@ -382,6 +751,8 @@ std::string generate_sarif(const report_config_t& cfg, const std::vector<issue_t
     run["tool"]["driver"]["version"] = "1.0.0";
     run["tool"]["driver"]["informationUri"] = "https://aidapro.net/";
     run["tool"]["driver"]["rules"]   = std::move(rules);
+    run["properties"]["summary"] = ctx.summary;
+    run["properties"]["offensive_context"] = ctx.offensive;
     run["results"] = std::move(results);
     doc["runs"] = nlohmann::json::array({ run });
     return doc.dump(2);
@@ -446,23 +817,41 @@ const char* default_extension(report_format_t f)
 
 bool generate(const report_config_t& cfg, std::string& out_path_or_error)
 {
+    const std::string log_title = safe_text(cfg.title, 256);
     diag::log_tagged_fmt("report", "generate entry path=%s format=%s title=%s",
-        cfg.output_path.c_str(), format_label(cfg.format), cfg.title.c_str());
-    if (cfg.output_path.empty()) {
-        diag::log_tagged_fmt("report", "generate empty_output_path");
-        set_err("report.generate: empty output_path");
+        cfg.output_path.c_str(), format_label(cfg.format), log_title.c_str());
+    std::vector<issue_t> issues;
+    if (!collect_issues(cfg, issues)) {
+        diag::log_tagged_fmt("report", "generate collect_failed err=%s", err_slot().c_str());
         out_path_or_error = err_slot();
         return false;
     }
-    auto issues = filter_issues(cfg);
+    const report_context_t ctx = build_context(cfg, issues);
     diag::log_tagged_fmt("report", "generate filtered_issues=%zu format=%s", issues.size(), format_label(cfg.format));
     std::string body;
     switch (cfg.format) {
-        case report_format_t::html:      body = generate_html(cfg, issues); break;
-        case report_format_t::markdown:  body = generate_markdown(cfg, issues); break;
-        case report_format_t::json:      body = generate_json(cfg, issues); break;
-        case report_format_t::sarif_2_1: body = generate_sarif(cfg, issues); break;
-        case report_format_t::csv:       body = generate_csv(cfg, issues); break;
+        case report_format_t::html:      body = generate_html(cfg, issues, ctx); break;
+        case report_format_t::markdown:  body = generate_markdown(cfg, issues, ctx); break;
+        case report_format_t::json:      body = generate_json(cfg, issues, ctx); break;
+        case report_format_t::sarif_2_1: body = generate_sarif(cfg, issues, ctx); break;
+        case report_format_t::csv:       body = generate_csv(cfg, issues, ctx); break;
+    }
+    if (cfg.output_path.empty()) {
+        auto& h = history();
+        std::lock_guard<std::mutex> lk(h.mtx);
+        generated_report_t rec;
+        rec.id          = h.next_id.fetch_add(1);
+        rec.ts_ms       = now_ms();
+        rec.title       = safe_text(cfg.title, 256);
+        rec.output_path.clear();
+        rec.format      = cfg.format;
+        rec.issue_count = issues.size();
+        rec.inline_output = true;
+        h.items.push_back(std::move(rec));
+        out_path_or_error = std::move(body);
+        diag::log_tagged_fmt("report", "generate inline_ok format=%s issues=%zu body_len=%zu",
+            format_label(cfg.format), issues.size(), out_path_or_error.size());
+        return true;
     }
     if (!write_file(cfg.output_path, body)) {
         diag::log_tagged_fmt("report", "generate write_failed path=%s", cfg.output_path.c_str());
@@ -475,10 +864,11 @@ bool generate(const report_config_t& cfg, std::string& out_path_or_error)
         generated_report_t rec;
         rec.id          = h.next_id.fetch_add(1);
         rec.ts_ms       = now_ms();
-        rec.title       = cfg.title;
+        rec.title       = safe_text(cfg.title, 256);
         rec.output_path = cfg.output_path;
         rec.format      = cfg.format;
         rec.issue_count = issues.size();
+        rec.inline_output = false;
         h.items.push_back(std::move(rec));
     }
     diag::log_tagged_fmt("report", "generate ok path=%s format=%s issues=%zu body_len=%zu",

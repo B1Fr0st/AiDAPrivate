@@ -18,8 +18,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <memory>
+#include <nlohmann/json.hpp>
 #include <sstream>
 #include <thread>
 #include <unordered_map>
@@ -44,6 +47,14 @@ struct wsa_guard_t
 
 static wsa_guard_t s_wsa_guard;
 
+struct poll_cursor_state_t
+{
+    std::string token;
+    uint64_t    since_ms = 0;
+    uint64_t    after_id = 0;
+    uint64_t    updated_ms = 0;
+};
+
 struct state_t
 {
     std::mutex                                              mtx;
@@ -60,6 +71,9 @@ struct state_t
     std::atomic<uint64_t>                                   next_id{1};
 
     std::unordered_map<std::string, token_info_t>           tokens;
+    std::unordered_map<std::string, poll_cursor_state_t>     poll_cursors;
+    std::atomic<bool>                                       durable_loaded{false};
+    std::atomic<bool>                                       loading_durable{false};
 
     std::shared_ptr<httplib::Server>                        http_server;
     SOCKET                                                  http_socket = INVALID_SOCKET;
@@ -173,6 +187,37 @@ static uint64_t now_ms()
     return static_cast<uint64_t>(duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count());
 }
 
+using json = nlohmann::json;
+
+static std::string wide_to_utf8(const std::wstring& text)
+{
+    if (text.empty()) return {};
+    int needed = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
+    if (needed <= 0) return {};
+    std::string out(static_cast<size_t>(needed), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), out.data(), needed, nullptr, nullptr);
+    return out;
+}
+
+static std::filesystem::path default_state_path_fs()
+{
+    wchar_t buf[32768] = {};
+    const DWORD buf_count = static_cast<DWORD>(sizeof(buf) / sizeof(buf[0]));
+    DWORD len = GetEnvironmentVariableW(L"APPDATA", buf, buf_count);
+    std::filesystem::path base;
+    if (len > 0 && len < buf_count) {
+        base = std::filesystem::path(std::wstring(buf, buf + len));
+    } else {
+        base = std::filesystem::current_path();
+    }
+    return base / L"AiDA" / L"Standalone" / L"burp" / L"collaborator_state.json";
+}
+
+static std::string path_to_utf8(const std::filesystem::path& path)
+{
+    return wide_to_utf8(path.wstring());
+}
+
 static std::string lower_ascii(const std::string& s)
 {
     std::string out;
@@ -188,6 +233,463 @@ static std::string trim_ascii(const std::string& s)
     size_t b = s.size();
     while (b > a && (s[b - 1] == ' ' || s[b - 1] == '\t' || s[b - 1] == '\r' || s[b - 1] == '\n')) --b;
     return s.substr(a, b - a);
+}
+
+static std::string hex_encode(const uint8_t* data, size_t len)
+{
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string out;
+    out.resize(len * 2);
+    for (size_t i = 0; i < len; ++i) {
+        out[i * 2] = kHex[(data[i] >> 4) & 0x0f];
+        out[i * 2 + 1] = kHex[data[i] & 0x0f];
+    }
+    return out;
+}
+
+static bool hmac_sha256_hex(const std::string& secret, const std::string& body, std::string& out)
+{
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    DWORD object_len = 0;
+    DWORD hash_len = 0;
+    DWORD got = 0;
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG) < 0)
+        return false;
+    bool ok = false;
+    do {
+        if (BCryptGetProperty(alg, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&object_len), sizeof(object_len), &got, 0) < 0) break;
+        if (BCryptGetProperty(alg, BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&hash_len), sizeof(hash_len), &got, 0) < 0) break;
+        std::vector<uint8_t> object(object_len);
+        std::vector<uint8_t> digest(hash_len);
+        if (BCryptCreateHash(alg, &hash, object.data(), object_len,
+                             reinterpret_cast<PUCHAR>(const_cast<char*>(secret.data())),
+                             static_cast<ULONG>(secret.size()), 0) < 0) break;
+        if (BCryptHashData(hash, reinterpret_cast<PUCHAR>(const_cast<char*>(body.data())),
+                           static_cast<ULONG>(body.size()), 0) < 0) break;
+        if (BCryptFinishHash(hash, digest.data(), hash_len, 0) < 0) break;
+        out = hex_encode(digest.data(), digest.size());
+        ok = true;
+    } while (false);
+    if (hash) BCryptDestroyHash(hash);
+    if (alg) BCryptCloseAlgorithmProvider(alg, 0);
+    return ok;
+}
+
+struct parsed_webhook_url_t
+{
+    std::string scheme;
+    std::string host;
+    std::string origin;
+    std::string path;
+    uint16_t    port = 0;
+};
+
+static bool parse_webhook_url(const std::string& url, parsed_webhook_url_t& out)
+{
+    const std::string u = trim_ascii(url);
+    const size_t scheme_pos = u.find("://");
+    if (scheme_pos == std::string::npos)
+        return false;
+    parsed_webhook_url_t parsed;
+    parsed.scheme = lower_ascii(u.substr(0, scheme_pos));
+    if (parsed.scheme != "http" && parsed.scheme != "https")
+        return false;
+    const size_t authority_start = scheme_pos + 3;
+    const size_t path_start = u.find_first_of("/?#", authority_start);
+    const std::string authority = u.substr(authority_start, path_start == std::string::npos ? std::string::npos : path_start - authority_start);
+    if (authority.empty() || authority.find('@') != std::string::npos)
+        return false;
+    const bool https = parsed.scheme == "https";
+    if (authority.size() > 2 && authority.front() == '[') {
+        const size_t close = authority.find(']');
+        if (close == std::string::npos)
+            return false;
+        parsed.host = authority.substr(1, close - 1);
+        parsed.port = https ? 443 : 80;
+        if (close + 1 < authority.size()) {
+            if (authority[close + 1] != ':')
+                return false;
+            const std::string ps = authority.substr(close + 2);
+            if (ps.empty()) return false;
+            int v = 0;
+            for (char c : ps) {
+                if (c < '0' || c > '9') return false;
+                v = v * 10 + (c - '0');
+                if (v > 65535) return false;
+            }
+            if (v <= 0) return false;
+            parsed.port = static_cast<uint16_t>(v);
+        }
+        parsed.origin = parsed.scheme + "://[" + parsed.host + "]";
+    } else {
+        const size_t colon = authority.rfind(':');
+        parsed.host = colon == std::string::npos ? authority : authority.substr(0, colon);
+        if (parsed.host.empty())
+            return false;
+        parsed.port = https ? 443 : 80;
+        if (colon != std::string::npos) {
+            const std::string ps = authority.substr(colon + 1);
+            if (ps.empty()) return false;
+            int v = 0;
+            for (char c : ps) {
+                if (c < '0' || c > '9') return false;
+                v = v * 10 + (c - '0');
+                if (v > 65535) return false;
+            }
+            if (v <= 0) return false;
+            parsed.port = static_cast<uint16_t>(v);
+        }
+        parsed.origin = parsed.scheme + "://" + parsed.host;
+    }
+    if ((https && parsed.port != 443) || (!https && parsed.port != 80))
+        parsed.origin += ":" + std::to_string(parsed.port);
+    if (path_start == std::string::npos) {
+        parsed.path = "/";
+    } else if (u[path_start] == '/') {
+        parsed.path = u.substr(path_start);
+    } else if (u[path_start] == '?') {
+        parsed.path = "/" + u.substr(path_start);
+    } else {
+        parsed.path = "/";
+    }
+    const size_t fragment = parsed.path.find('#');
+    if (fragment != std::string::npos)
+        parsed.path.erase(fragment);
+    if (parsed.path.empty())
+        parsed.path = "/";
+    out = std::move(parsed);
+    return true;
+}
+
+static json config_to_json(const collaborator_config_t& cfg)
+{
+    return json{
+        {"bind_ip", cfg.bind_ip},
+        {"http_port", cfg.http_port},
+        {"dns_port", cfg.dns_port},
+        {"smtp_port", cfg.smtp_port},
+        {"smtps_port", cfg.smtps_port},
+        {"ldap_port", cfg.ldap_port},
+        {"enable_http", cfg.enable_http},
+        {"enable_dns", cfg.enable_dns},
+        {"enable_smtp", cfg.enable_smtp},
+        {"public_host", cfg.public_host},
+        {"public_ip", cfg.public_ip},
+        {"canned_body", cfg.canned_body},
+        {"canned_content_type", cfg.canned_content_type},
+        {"max_interactions", cfg.max_interactions},
+        {"smtp_max_message", cfg.smtp_max_message}
+    };
+}
+
+static bool config_from_json(const json& j, collaborator_config_t& cfg)
+{
+    if (!j.is_object()) return false;
+    if (j.contains("bind_ip") && j["bind_ip"].is_string()) cfg.bind_ip = j["bind_ip"].get<std::string>();
+    if (j.contains("http_port") && j["http_port"].is_number_unsigned()) cfg.http_port = static_cast<uint16_t>((std::min)(j["http_port"].get<unsigned>(), 65535u));
+    if (j.contains("dns_port") && j["dns_port"].is_number_unsigned()) cfg.dns_port = static_cast<uint16_t>((std::min)(j["dns_port"].get<unsigned>(), 65535u));
+    if (j.contains("smtp_port") && j["smtp_port"].is_number_unsigned()) cfg.smtp_port = static_cast<uint16_t>((std::min)(j["smtp_port"].get<unsigned>(), 65535u));
+    if (j.contains("smtps_port") && j["smtps_port"].is_number_unsigned()) cfg.smtps_port = static_cast<uint16_t>((std::min)(j["smtps_port"].get<unsigned>(), 65535u));
+    if (j.contains("ldap_port") && j["ldap_port"].is_number_unsigned()) cfg.ldap_port = static_cast<uint16_t>((std::min)(j["ldap_port"].get<unsigned>(), 65535u));
+    if (j.contains("enable_http") && j["enable_http"].is_boolean()) cfg.enable_http = j["enable_http"].get<bool>();
+    if (j.contains("enable_dns") && j["enable_dns"].is_boolean()) cfg.enable_dns = j["enable_dns"].get<bool>();
+    if (j.contains("enable_smtp") && j["enable_smtp"].is_boolean()) cfg.enable_smtp = j["enable_smtp"].get<bool>();
+    if (j.contains("public_host") && j["public_host"].is_string()) cfg.public_host = j["public_host"].get<std::string>();
+    if (j.contains("public_ip") && j["public_ip"].is_string()) cfg.public_ip = j["public_ip"].get<std::string>();
+    if (j.contains("canned_body") && j["canned_body"].is_string()) cfg.canned_body = j["canned_body"].get<std::string>();
+    if (j.contains("canned_content_type") && j["canned_content_type"].is_string()) cfg.canned_content_type = j["canned_content_type"].get<std::string>();
+    if (j.contains("max_interactions") && j["max_interactions"].is_number_unsigned()) cfg.max_interactions = (std::min)(j["max_interactions"].get<size_t>(), static_cast<size_t>(1048576));
+    if (j.contains("smtp_max_message") && j["smtp_max_message"].is_number_integer()) cfg.smtp_max_message = (std::max)(1, j["smtp_max_message"].get<int>());
+    return true;
+}
+
+static json interaction_to_json_locked(const interaction_t& it)
+{
+    json details = json::object();
+    for (const auto& kv : it.details) details[kv.first] = kv.second;
+    return json{
+        {"id", it.id},
+        {"timestamp_ms", it.timestamp_ms},
+        {"kind", it.kind},
+        {"client_ip", it.client_ip},
+        {"client_port", it.client_port},
+        {"subdomain", it.subdomain},
+        {"raw", it.raw},
+        {"details", std::move(details)},
+        {"payload_token", it.payload_token}
+    };
+}
+
+static bool interaction_from_json(const json& j, interaction_t& it)
+{
+    if (!j.is_object()) return false;
+    interaction_t parsed;
+    parsed.id = j.value("id", static_cast<uint64_t>(0));
+    parsed.timestamp_ms = j.value("timestamp_ms", static_cast<uint64_t>(0));
+    parsed.kind = j.value("kind", std::string());
+    parsed.client_ip = j.value("client_ip", std::string());
+    parsed.client_port = static_cast<uint16_t>((std::min)(j.value("client_port", 0), 65535));
+    parsed.subdomain = j.value("subdomain", std::string());
+    parsed.raw = j.value("raw", std::string());
+    parsed.payload_token = lower_ascii(j.value("payload_token", std::string()));
+    const json details = j.value("details", json::object());
+    if (details.is_object()) {
+        for (auto iter = details.begin(); iter != details.end(); ++iter) {
+            if (iter.value().is_string()) parsed.details[iter.key()] = iter.value().get<std::string>();
+            else parsed.details[iter.key()] = iter.value().dump();
+        }
+    }
+    if (parsed.id == 0 || parsed.kind.empty()) return false;
+    it = std::move(parsed);
+    return true;
+}
+
+static json token_to_json(const token_info_t& t)
+{
+    return json{
+        {"token", t.token},
+        {"full_domain", t.full_domain},
+        {"issued_ms", t.issued_ms},
+        {"last_seen_ms", t.last_seen_ms},
+        {"interaction_count", t.interaction_count}
+    };
+}
+
+static bool token_from_json(const json& j, token_info_t& t)
+{
+    if (!j.is_object()) return false;
+    token_info_t parsed;
+    parsed.token = lower_ascii(j.value("token", std::string()));
+    parsed.full_domain = j.value("full_domain", std::string());
+    parsed.issued_ms = j.value("issued_ms", static_cast<uint64_t>(0));
+    parsed.last_seen_ms = j.value("last_seen_ms", static_cast<uint64_t>(0));
+    parsed.interaction_count = j.value("interaction_count", static_cast<size_t>(0));
+    if (parsed.token.empty()) return false;
+    t = std::move(parsed);
+    return true;
+}
+
+static json cursor_to_json(const std::string& id, const poll_cursor_state_t& c)
+{
+    return json{
+        {"cursor", id},
+        {"token", c.token},
+        {"since_ms", c.since_ms},
+        {"after_id", c.after_id},
+        {"updated_ms", c.updated_ms}
+    };
+}
+
+static bool cursor_from_json(const json& j, std::string& id, poll_cursor_state_t& c)
+{
+    if (!j.is_object()) return false;
+    id = j.value("cursor", std::string());
+    if (id.size() < 8 || id.size() > 96) return false;
+    c.token = lower_ascii(j.value("token", std::string()));
+    c.since_ms = j.value("since_ms", static_cast<uint64_t>(0));
+    c.after_id = j.value("after_id", static_cast<uint64_t>(0));
+    c.updated_ms = j.value("updated_ms", static_cast<uint64_t>(0));
+    return true;
+}
+
+static json capabilities_json()
+{
+    return json{
+        {"supported_transports", json::array({"http", "dns", "smtp"})},
+        {"unsupported_transports", json::array({"smtps", "ldap"})},
+        {"smtps_supported", false},
+        {"ldap_supported", false},
+        {"webhook_delivery_supported", true},
+        {"webhook_signing_supported", true},
+        {"file_export_supported", true},
+        {"async_polling_supported", true},
+        {"durable_state_supported", true}
+    };
+}
+
+static json snapshot_json_locked()
+{
+    json root;
+    root["version"] = 2;
+    root["saved_ms"] = now_ms();
+    root["config"] = config_to_json(g_state.config);
+    root["started_ms"] = g_state.started_ms;
+    root["next_id"] = g_state.next_id.load(std::memory_order_acquire);
+    root["capabilities"] = capabilities_json();
+    root["tokens"] = json::array();
+    for (const auto& kv : g_state.tokens) root["tokens"].push_back(token_to_json(kv.second));
+    root["interactions"] = json::array();
+    for (const auto& it : g_state.interactions) root["interactions"].push_back(interaction_to_json_locked(it));
+    root["poll_cursors"] = json::array();
+    for (const auto& kv : g_state.poll_cursors) root["poll_cursors"].push_back(cursor_to_json(kv.first, kv.second));
+    return root;
+}
+
+static void recompute_token_counts_locked()
+{
+    for (auto& kv : g_state.tokens) {
+        kv.second.interaction_count = 0;
+        kv.second.last_seen_ms = 0;
+    }
+    for (const auto& it : g_state.interactions) {
+        if (it.payload_token.empty()) continue;
+        auto found = g_state.tokens.find(it.payload_token);
+        if (found == g_state.tokens.end()) continue;
+        found->second.interaction_count++;
+        found->second.last_seen_ms = (std::max)(found->second.last_seen_ms, it.timestamp_ms);
+    }
+}
+
+static bool import_json_locked(const json& doc, bool replace_existing)
+{
+    if (!doc.is_object() || doc.value("version", 0) < 1) {
+        set_last_error("collaborator.import: invalid schema");
+        return false;
+    }
+    if (replace_existing) {
+        g_state.interactions.clear();
+        g_state.tokens.clear();
+        g_state.poll_cursors.clear();
+        g_state.next_id.store(1, std::memory_order_release);
+    }
+    const bool running = g_state.running.load(std::memory_order_acquire);
+    if (!running && doc.contains("config")) {
+        collaborator_config_t cfg = g_state.config;
+        if (config_from_json(doc["config"], cfg))
+            g_state.config = cfg;
+    }
+    uint64_t max_id = 0;
+    if (doc.contains("tokens") && doc["tokens"].is_array()) {
+        for (const auto& jt : doc["tokens"]) {
+            token_info_t token;
+            if (token_from_json(jt, token))
+                g_state.tokens[token.token] = std::move(token);
+        }
+    }
+    if (doc.contains("interactions") && doc["interactions"].is_array()) {
+        for (const auto& ji : doc["interactions"]) {
+            interaction_t it;
+            if (!interaction_from_json(ji, it)) continue;
+            max_id = (std::max)(max_id, it.id);
+            auto existing = std::find_if(g_state.interactions.begin(), g_state.interactions.end(), [&](const interaction_t& cur) {
+                return cur.id == it.id;
+            });
+            if (existing == g_state.interactions.end())
+                g_state.interactions.push_back(std::move(it));
+            else
+                *existing = std::move(it);
+        }
+        std::sort(g_state.interactions.begin(), g_state.interactions.end(), [](const interaction_t& a, const interaction_t& b) {
+            return a.id < b.id;
+        });
+        while (g_state.interactions.size() > g_state.config.max_interactions)
+            g_state.interactions.pop_front();
+    }
+    if (doc.contains("poll_cursors") && doc["poll_cursors"].is_array()) {
+        for (const auto& jc : doc["poll_cursors"]) {
+            std::string id;
+            poll_cursor_state_t c;
+            if (cursor_from_json(jc, id, c))
+                g_state.poll_cursors[id] = std::move(c);
+        }
+    }
+    const uint64_t stored_next = doc.value("next_id", static_cast<uint64_t>(0));
+    g_state.next_id.store((std::max)(stored_next, max_id + 1), std::memory_order_release);
+    recompute_token_counts_locked();
+    set_last_error("");
+    return true;
+}
+
+static bool write_json_atomic(const std::filesystem::path& path, const json& doc)
+{
+    std::error_code ec;
+    if (!path.parent_path().empty())
+        std::filesystem::create_directories(path.parent_path(), ec);
+    if (ec) {
+        set_last_error("collaborator.save: create parent failed: " + ec.message());
+        return false;
+    }
+    const std::filesystem::path tmp(path.wstring() + L".tmp");
+    const std::string dump = doc.dump(2);
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            set_last_error("collaborator.save: open failed");
+            return false;
+        }
+        out.write(dump.data(), static_cast<std::streamsize>(dump.size()));
+        if (!out) {
+            set_last_error("collaborator.save: write failed");
+            return false;
+        }
+    }
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) {
+        std::filesystem::remove(path, ec);
+        ec.clear();
+        std::filesystem::rename(tmp, path, ec);
+    }
+    if (ec) {
+        set_last_error("collaborator.save: replace failed: " + ec.message());
+        return false;
+    }
+    return true;
+}
+
+static bool read_json_file(const std::filesystem::path& path, json& out)
+{
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        set_last_error("collaborator.load: open failed");
+        return false;
+    }
+    std::stringstream ss;
+    ss << in.rdbuf();
+    out = json::parse(ss.str(), nullptr, false);
+    if (out.is_discarded()) {
+        set_last_error("collaborator.load: parse failed");
+        return false;
+    }
+    return true;
+}
+
+static bool save_default_state_unlocked()
+{
+    if (g_state.loading_durable.load(std::memory_order_acquire)) return true;
+    json snap;
+    {
+        std::lock_guard<std::mutex> lk(g_state.mtx);
+        snap = snapshot_json_locked();
+    }
+    return write_json_atomic(default_state_path_fs(), snap);
+}
+
+static void ensure_loaded()
+{
+    bool should_load = false;
+    {
+        std::lock_guard<std::mutex> lk(g_state.mtx);
+        should_load = !g_state.durable_loaded.load(std::memory_order_acquire);
+        if (should_load) {
+            g_state.durable_loaded.store(true, std::memory_order_release);
+            g_state.loading_durable.store(true, std::memory_order_release);
+        }
+    }
+    if (!should_load) return;
+    const auto path = default_state_path_fs();
+    std::error_code ec;
+    if (std::filesystem::exists(path, ec)) {
+        json doc;
+        if (read_json_file(path, doc)) {
+            std::lock_guard<std::mutex> lk(g_state.mtx);
+            import_json_locked(doc, false);
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_state.mtx);
+        g_state.loading_durable.store(false, std::memory_order_release);
+    }
 }
 
 static bool is_lower_alpha(char c) { return c >= 'a' && c <= 'z'; }
@@ -254,22 +756,30 @@ static std::string extract_token_from_path(const std::string& path)
 
 static void append_interaction(interaction_t&& it)
 {
-    std::lock_guard<std::mutex> lk(g_state.mtx);
-    if (it.id == 0) it.id = g_state.next_id.fetch_add(1);
-    if (it.timestamp_ms == 0) it.timestamp_ms = now_ms();
+    ensure_loaded();
+    bool persist = true;
+    {
+        std::lock_guard<std::mutex> lk(g_state.mtx);
+        persist = !g_state.loading_durable.load(std::memory_order_acquire);
+        if (it.id == 0) it.id = g_state.next_id.fetch_add(1);
+        if (it.timestamp_ms == 0) it.timestamp_ms = now_ms();
 
-    if (!it.payload_token.empty()) {
-        auto found = g_state.tokens.find(it.payload_token);
-        if (found != g_state.tokens.end()) {
-            found->second.interaction_count++;
-            found->second.last_seen_ms = it.timestamp_ms;
+        if (!it.payload_token.empty()) {
+            auto found = g_state.tokens.find(it.payload_token);
+            if (found != g_state.tokens.end()) {
+                found->second.interaction_count++;
+                found->second.last_seen_ms = it.timestamp_ms;
+            }
+        }
+
+        g_state.interactions.push_back(std::move(it));
+        while (g_state.interactions.size() > g_state.config.max_interactions) {
+            g_state.interactions.pop_front();
         }
     }
-
-    g_state.interactions.push_back(std::move(it));
-    while (g_state.interactions.size() > g_state.config.max_interactions) {
-        g_state.interactions.pop_front();
-    }
+    g_state.worker_cv.notify_all();
+    if (persist)
+        save_default_state_unlocked();
 }
 
 static std::string client_ip_to_string(uint32_t ip_be)
@@ -1277,6 +1787,7 @@ static std::string generate_token_internal()
 
 bool start(const collaborator_config_t& cfg)
 {
+    ensure_loaded();
     diag::log_tagged_fmt("collaborator", "start entry http=%d dns=%d smtp=%d bind=%s http_port=%u dns_port=%u smtp_port=%u",
         static_cast<int>(cfg.enable_http), static_cast<int>(cfg.enable_dns), static_cast<int>(cfg.enable_smtp),
         cfg.bind_ip.c_str(), static_cast<unsigned>(cfg.http_port),
@@ -1604,6 +2115,7 @@ bool start(const collaborator_config_t& cfg)
         g_state.http_alive.load() ? 1 : 0,
         g_state.dns_alive.load() ? 1 : 0,
         g_state.smtp_alive.load() ? 1 : 0);
+    save_default_state_unlocked();
     return true;
 }
 
@@ -1718,10 +2230,12 @@ void stop()
 
     ::diag::log_tagged_fmt("collaborator", "stopped elapsed_ms=%llu",
         static_cast<unsigned long long>(now_ms() - t0));
+    save_default_state_unlocked();
 }
 
 bool is_running()
 {
+    ensure_loaded();
     bool r = g_state.running.load();
     ::diag::log_tagged_fmt("collaborator", "is_running result=%d", static_cast<int>(r));
     return r;
@@ -1729,21 +2243,28 @@ bool is_running()
 
 status_t status()
 {
+    ensure_loaded();
     status_t s;
     std::lock_guard<std::mutex> lk(g_state.mtx);
     s.running = g_state.running.load();
     s.http_alive = g_state.http_alive.load();
     s.dns_alive  = g_state.dns_alive.load();
     s.smtp_alive = g_state.smtp_alive.load();
+    s.smtps_supported = false;
+    s.ldap_supported = false;
     s.bind_ip   = g_state.config.bind_ip;
     s.http_port = g_state.config.http_port;
     s.dns_port  = g_state.config.dns_port;
     s.smtp_port = g_state.config.smtp_port;
+    s.smtps_port = g_state.config.smtps_port;
+    s.ldap_port = g_state.config.ldap_port;
     s.public_host = g_state.config.public_host;
     s.public_ip   = g_state.config.public_ip;
     s.interaction_count = g_state.interactions.size();
     s.token_count = g_state.tokens.size();
+    s.poll_cursor_count = g_state.poll_cursors.size();
     s.started_ms = g_state.started_ms;
+    s.durable_state_path = path_to_utf8(default_state_path_fs());
     ::diag::log_tagged_fmt("collaborator", "status running=%d http=%d dns=%d smtp=%d interactions=%zu tokens=%zu",
         static_cast<int>(s.running), static_cast<int>(s.http_alive),
         static_cast<int>(s.dns_alive), static_cast<int>(s.smtp_alive),
@@ -1753,6 +2274,7 @@ status_t status()
 
 collaborator_config_t current_config()
 {
+    ensure_loaded();
     ::diag::log_tagged_fmt("collaborator", "current_config entry");
     std::lock_guard<std::mutex> lk(g_state.mtx);
     return g_state.config;
@@ -1760,6 +2282,7 @@ collaborator_config_t current_config()
 
 std::string generate_token()
 {
+    ensure_loaded();
     std::string tok;
     std::string full;
     {
@@ -1779,11 +2302,13 @@ std::string generate_token()
     }
     ::diag::log_tagged_fmt("collaborator", "token_generated token='%s' full='%s'",
         tok.c_str(), full.c_str());
+    save_default_state_unlocked();
     return tok;
 }
 
 std::vector<token_info_t> list_tokens()
 {
+    ensure_loaded();
     ::diag::log_tagged_fmt("collaborator", "list_tokens entry");
     std::vector<token_info_t> out;
     std::lock_guard<std::mutex> lk(g_state.mtx);
@@ -1795,21 +2320,30 @@ std::vector<token_info_t> list_tokens()
 
 bool forget_token(const std::string& token)
 {
+    ensure_loaded();
     ::diag::log_tagged_fmt("collaborator", "forget_token entry token=%s", token.c_str());
     std::string norm = lower_ascii(token);
-    std::lock_guard<std::mutex> lk(g_state.mtx);
-    auto it = g_state.tokens.find(norm);
-    if (it == g_state.tokens.end()) {
-        ::diag::log_tagged_fmt("collaborator", "forget_token not_found token=%s", token.c_str());
-        return false;
+    {
+        std::lock_guard<std::mutex> lk(g_state.mtx);
+        auto it = g_state.tokens.find(norm);
+        if (it == g_state.tokens.end()) {
+            ::diag::log_tagged_fmt("collaborator", "forget_token not_found token=%s", token.c_str());
+            return false;
+        }
+        g_state.tokens.erase(it);
+        for (auto cur = g_state.poll_cursors.begin(); cur != g_state.poll_cursors.end(); ) {
+            if (cur->second.token == norm) cur = g_state.poll_cursors.erase(cur);
+            else ++cur;
+        }
     }
-    g_state.tokens.erase(it);
     ::diag::log_tagged_fmt("collaborator", "forget_token ok token=%s", token.c_str());
+    save_default_state_unlocked();
     return true;
 }
 
 std::vector<interaction_t> poll_since(uint64_t timestamp_ms_inclusive)
 {
+    ensure_loaded();
     ::diag::log_tagged_fmt("collaborator", "poll_since entry ts=%llu", static_cast<unsigned long long>(timestamp_ms_inclusive));
     std::vector<interaction_t> out;
     std::lock_guard<std::mutex> lk(g_state.mtx);
@@ -1823,6 +2357,7 @@ std::vector<interaction_t> poll_since(uint64_t timestamp_ms_inclusive)
 
 std::vector<interaction_t> poll_by_token(const std::string& token)
 {
+    ensure_loaded();
     ::diag::log_tagged_fmt("collaborator", "poll_by_token entry token=%s", token.c_str());
     std::string norm = lower_ascii(token);
     std::vector<interaction_t> out;
@@ -1836,6 +2371,7 @@ std::vector<interaction_t> poll_by_token(const std::string& token)
 
 std::vector<interaction_t> snapshot_all(size_t max_entries)
 {
+    ensure_loaded();
     ::diag::log_tagged_fmt("collaborator", "snapshot_all entry max=%zu", max_entries);
     std::vector<interaction_t> out;
     std::lock_guard<std::mutex> lk(g_state.mtx);
@@ -1852,6 +2388,7 @@ std::vector<interaction_t> snapshot_all(size_t max_entries)
 
 bool get_interaction(uint64_t id, interaction_t& out)
 {
+    ensure_loaded();
     ::diag::log_tagged_fmt("collaborator", "get_interaction entry id=%llu", static_cast<unsigned long long>(id));
     std::lock_guard<std::mutex> lk(g_state.mtx);
     for (const auto& it : g_state.interactions) {
@@ -1867,16 +2404,316 @@ bool get_interaction(uint64_t id, interaction_t& out)
 
 void clear()
 {
+    ensure_loaded();
     ::diag::log_tagged_fmt("collaborator", "clear entry");
-    std::lock_guard<std::mutex> lk(g_state.mtx);
-    size_t n = g_state.interactions.size();
-    g_state.interactions.clear();
-    for (auto& kv : g_state.tokens) {
-        kv.second.interaction_count = 0;
-        kv.second.last_seen_ms = 0;
+    size_t n = 0;
+    size_t token_count = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_state.mtx);
+        n = g_state.interactions.size();
+        g_state.interactions.clear();
+        g_state.poll_cursors.clear();
+        for (auto& kv : g_state.tokens) {
+            kv.second.interaction_count = 0;
+            kv.second.last_seen_ms = 0;
+        }
+        token_count = g_state.tokens.size();
+        g_state.next_id.store(1);
     }
-    g_state.next_id.store(1);
-    ::diag::log_tagged_fmt("collaborator", "clear done cleared_interactions=%zu tokens_reset=%zu", n, g_state.tokens.size());
+    ::diag::log_tagged_fmt("collaborator", "clear done cleared_interactions=%zu tokens_reset=%zu", n, token_count);
+    save_default_state_unlocked();
+}
+
+nlohmann::json export_json()
+{
+    ensure_loaded();
+    std::lock_guard<std::mutex> lk(g_state.mtx);
+    return snapshot_json_locked();
+}
+
+bool import_json(const nlohmann::json& doc, bool replace_existing)
+{
+    ensure_loaded();
+    bool ok = false;
+    {
+        std::lock_guard<std::mutex> lk(g_state.mtx);
+        ok = import_json_locked(doc, replace_existing);
+    }
+    if (ok) {
+        g_state.worker_cv.notify_all();
+        save_default_state_unlocked();
+    }
+    return ok;
+}
+
+static poll_result_t collect_poll_locked(const poll_request_t& request, const std::string& cursor_id)
+{
+    poll_result_t result;
+    result.cursor = cursor_id;
+    const std::string token = lower_ascii(request.token);
+    uint64_t after_id = request.after_id;
+    uint64_t since_ms = request.since_ms;
+    auto cursor_it = cursor_id.empty() ? g_state.poll_cursors.end() : g_state.poll_cursors.find(cursor_id);
+    if (cursor_it != g_state.poll_cursors.end()) {
+        if (token.empty() || token == cursor_it->second.token) {
+            after_id = (std::max)(after_id, cursor_it->second.after_id);
+            since_ms = (std::max)(since_ms, cursor_it->second.since_ms);
+        }
+    }
+    const size_t max_entries = (std::min)(request.max_entries == 0 ? static_cast<size_t>(256) : request.max_entries, static_cast<size_t>(4096));
+    for (const auto& it : g_state.interactions) {
+        if (!token.empty() && it.payload_token != token) continue;
+        if (after_id != 0 && it.id <= after_id) continue;
+        if (since_ms != 0 && it.timestamp_ms < since_ms) continue;
+        result.interactions.push_back(it);
+        result.next_after_id = (std::max)(result.next_after_id, it.id);
+        result.next_since_ms = (std::max)(result.next_since_ms, it.timestamp_ms + 1);
+        if (result.interactions.size() >= max_entries) break;
+    }
+    if (result.next_after_id == 0) result.next_after_id = after_id;
+    if (result.next_since_ms == 0) result.next_since_ms = since_ms;
+    if (!cursor_id.empty()) {
+        auto& c = g_state.poll_cursors[cursor_id];
+        c.token = token;
+        c.after_id = result.next_after_id;
+        c.since_ms = result.next_since_ms;
+        c.updated_ms = now_ms();
+    }
+    return result;
+}
+
+poll_result_t poll_async(const poll_request_t& request)
+{
+    ensure_loaded();
+    std::string cursor = request.cursor;
+    if (cursor.empty()) {
+        cursor = generate_token_internal();
+    }
+    const uint32_t wait_ms = (std::min)(request.wait_ms, static_cast<uint32_t>(30000));
+    const uint64_t deadline = now_ms() + wait_ms;
+    for (;;) {
+        poll_result_t ready;
+        bool has_ready = false;
+        bool persist_ready = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state.mtx);
+            ready = collect_poll_locked(request, cursor);
+            if (!ready.interactions.empty() || wait_ms == 0) {
+                ready.timed_out = ready.interactions.empty() && wait_ms != 0;
+                persist_ready = !g_state.loading_durable.load(std::memory_order_acquire);
+                has_ready = true;
+            }
+        }
+        if (has_ready) {
+            if (persist_ready) save_default_state_unlocked();
+            return ready;
+        }
+        const uint64_t now = now_ms();
+        if (now >= deadline) {
+            poll_result_t result;
+            bool persist_timeout = false;
+            {
+                std::lock_guard<std::mutex> lk(g_state.mtx);
+                result = collect_poll_locked(request, cursor);
+                result.timed_out = result.interactions.empty();
+                persist_timeout = !g_state.loading_durable.load(std::memory_order_acquire);
+            }
+            if (persist_timeout) save_default_state_unlocked();
+            return result;
+        }
+        std::unique_lock<std::mutex> lk(g_state.worker_mtx);
+        const uint64_t remaining = deadline > now ? deadline - now : 0;
+        g_state.worker_cv.wait_for(lk, std::chrono::milliseconds((std::min<uint64_t>)(remaining, 250)));
+    }
+}
+
+bool save_state_to_file(const std::string& path)
+{
+    ensure_loaded();
+    if (path.empty()) {
+        set_last_error("collaborator.save: empty path");
+        return false;
+    }
+    json snap;
+    {
+        std::lock_guard<std::mutex> lk(g_state.mtx);
+        snap = snapshot_json_locked();
+    }
+    const bool ok = write_json_atomic(std::filesystem::path(path), snap);
+    diag::log_tagged_fmt("collaborator", "save_state path=%s ok=%d", path.c_str(), ok ? 1 : 0);
+    return ok;
+}
+
+bool load_state_from_file(const std::string& path, bool replace_existing)
+{
+    ensure_loaded();
+    if (path.empty()) {
+        set_last_error("collaborator.load: empty path");
+        return false;
+    }
+    json doc;
+    if (!read_json_file(std::filesystem::path(path), doc))
+        return false;
+    const bool ok = import_json(doc, replace_existing);
+    diag::log_tagged_fmt("collaborator", "load_state path=%s ok=%d replace=%d", path.c_str(), ok ? 1 : 0, replace_existing ? 1 : 0);
+    return ok;
+}
+
+bool save_default_state()
+{
+    ensure_loaded();
+    const bool ok = save_default_state_unlocked();
+    diag::log_tagged_fmt("collaborator", "save_default_state path=%s ok=%d", path_to_utf8(default_state_path_fs()).c_str(), ok ? 1 : 0);
+    return ok;
+}
+
+bool load_default_state(bool replace_existing)
+{
+    const auto path = default_state_path_fs();
+    json doc;
+    if (!read_json_file(path, doc))
+        return false;
+    bool ok = false;
+    {
+        std::lock_guard<std::mutex> lk(g_state.mtx);
+        g_state.durable_loaded.store(true, std::memory_order_release);
+        g_state.loading_durable.store(true, std::memory_order_release);
+        ok = import_json_locked(doc, replace_existing);
+        g_state.loading_durable.store(false, std::memory_order_release);
+    }
+    if (ok) save_default_state_unlocked();
+    diag::log_tagged_fmt("collaborator", "load_default_state path=%s ok=%d replace=%d", path_to_utf8(path).c_str(), ok ? 1 : 0, replace_existing ? 1 : 0);
+    return ok;
+}
+
+std::string default_state_path()
+{
+    return path_to_utf8(default_state_path_fs());
+}
+
+bool export_interactions_to_file(const std::string& path,
+                                 const std::string& token,
+                                 uint64_t since_ms,
+                                 uint64_t after_id,
+                                 size_t max_entries)
+{
+    ensure_loaded();
+    if (path.empty()) {
+        set_last_error("collaborator.export: empty path");
+        return false;
+    }
+    const std::string norm = lower_ascii(token);
+    const size_t cap = (std::min)(max_entries == 0 ? static_cast<size_t>(65536) : max_entries, static_cast<size_t>(1048576));
+    json out;
+    out["version"] = 1;
+    out["exported_ms"] = now_ms();
+    out["token"] = norm;
+    out["since_ms"] = since_ms;
+    out["after_id"] = after_id;
+    out["interactions"] = json::array();
+    {
+        std::lock_guard<std::mutex> lk(g_state.mtx);
+        for (const auto& it : g_state.interactions) {
+            if (!norm.empty() && it.payload_token != norm) continue;
+            if (after_id != 0 && it.id <= after_id) continue;
+            if (since_ms != 0 && it.timestamp_ms < since_ms) continue;
+            out["interactions"].push_back(interaction_to_json_locked(it));
+            if (out["interactions"].size() >= cap) break;
+        }
+    }
+    const bool ok = write_json_atomic(std::filesystem::path(path), out);
+    diag::log_tagged_fmt("collaborator", "export_interactions path=%s count=%llu ok=%d",
+        path.c_str(),
+        static_cast<unsigned long long>(out["interactions"].size()),
+        ok ? 1 : 0);
+    return ok;
+}
+
+bool post_interactions_webhook(const std::string& url,
+                               const std::string& token,
+                               uint64_t since_ms,
+                               uint64_t after_id,
+                               size_t max_entries,
+                               const std::string& signing_secret,
+                               uint32_t timeout_ms,
+                               webhook_delivery_result_t& result)
+{
+    ensure_loaded();
+    result = webhook_delivery_result_t{};
+    parsed_webhook_url_t endpoint;
+    if (!parse_webhook_url(url, endpoint)) {
+        result.error = "collaborator.webhook: invalid http or https URL";
+        set_last_error(result.error);
+        return false;
+    }
+    const std::string norm = lower_ascii(token);
+    const size_t cap = (std::min)(max_entries == 0 ? static_cast<size_t>(4096) : max_entries, static_cast<size_t>(65536));
+    json payload;
+    payload["version"] = 1;
+    payload["exported_ms"] = now_ms();
+    payload["delivery"] = "webhook";
+    payload["token"] = norm;
+    payload["since_ms"] = since_ms;
+    payload["after_id"] = after_id;
+    payload["interactions"] = json::array();
+    {
+        std::lock_guard<std::mutex> lk(g_state.mtx);
+        for (const auto& it : g_state.interactions) {
+            if (!norm.empty() && it.payload_token != norm) continue;
+            if (after_id != 0 && it.id <= after_id) continue;
+            if (since_ms != 0 && it.timestamp_ms < since_ms) continue;
+            payload["interactions"].push_back(interaction_to_json_locked(it));
+            if (payload["interactions"].size() >= cap) break;
+        }
+    }
+    const std::string body = payload.dump();
+    const std::string timestamp = std::to_string(now_ms());
+
+    httplib::Headers headers = {
+        {"Accept", "application/json"},
+        {"User-Agent", "AiDA-Collaborator/1.0"},
+        {"X-AiDA-Collaborator-Timestamp", timestamp}
+    };
+    if (!signing_secret.empty()) {
+        std::string sig;
+        if (!hmac_sha256_hex(signing_secret, timestamp + "." + body, sig)) {
+            result.error = "collaborator.webhook: signature generation failed";
+            set_last_error(result.error);
+            return false;
+        }
+        headers.emplace("X-AiDA-Collaborator-Signature", "sha256=" + sig);
+    }
+
+    const uint32_t bounded_timeout = (std::min)(timeout_ms == 0 ? 10000u : timeout_ms, 60000u);
+    httplib::Client cli(endpoint.origin);
+    cli.set_connection_timeout(std::chrono::milliseconds(bounded_timeout));
+    cli.set_read_timeout(std::chrono::milliseconds(bounded_timeout));
+    cli.set_write_timeout(std::chrono::milliseconds(bounded_timeout));
+    cli.enable_server_certificate_verification(true);
+    cli.set_follow_location(false);
+
+    auto res = cli.Post(endpoint.path.c_str(), headers, body, "application/json");
+    result.origin = endpoint.origin;
+    result.path = endpoint.path;
+    result.interaction_count = payload["interactions"].size();
+    if (!res) {
+        result.error = "collaborator.webhook: transport failed: " + httplib::to_string(res.error());
+        set_last_error(result.error);
+        diag::log_tagged_fmt("collaborator", "webhook_export transport_failed origin=%s path_len=%zu count=%zu err=%s",
+            endpoint.origin.c_str(), endpoint.path.size(), result.interaction_count, result.error.c_str());
+        return false;
+    }
+    result.status_code = res->status;
+    result.delivered = res->status >= 200 && res->status < 300;
+    if (!result.delivered) {
+        result.error = "collaborator.webhook: HTTP " + std::to_string(res->status);
+        set_last_error(result.error);
+    } else {
+        set_last_error("");
+    }
+    diag::log_tagged_fmt("collaborator", "webhook_export origin=%s path_len=%zu status=%d delivered=%d count=%zu",
+        endpoint.origin.c_str(), endpoint.path.size(), result.status_code, result.delivered ? 1 : 0, result.interaction_count);
+    return result.delivered;
 }
 
 std::string last_error()

@@ -337,6 +337,31 @@ json bool_or_null(bool available, bool value)
     return available ? json(value) : json(nullptr);
 }
 
+bool json_u64_value(const json& value, uint64_t& out)
+{
+    if (value.is_number_unsigned()) {
+        out = value.get<uint64_t>();
+        return true;
+    }
+    if (value.is_number_integer()) {
+        const int64_t v = value.get<int64_t>();
+        if (v >= 0) {
+            out = static_cast<uint64_t>(v);
+            return true;
+        }
+    }
+    if (value.is_string()) {
+        try {
+            const std::string text = value.get<std::string>();
+            size_t used = 0;
+            out = std::stoull(text, &used);
+            return used == text.size();
+        } catch (...) {
+        }
+    }
+    return false;
+}
+
 json ws_status_or_null(bool available, const ws_editor::ws_status_t& s)
 {
     return available ? ws_status_to_json(s) : json(nullptr);
@@ -1004,115 +1029,6 @@ tool_result_t tool_ws_clear(const json& params)
     return tool_result_t::ok("cleared", out);
 }
 
-tool_result_t tool_logger_query(const json& params)
-{
-    diag::log_tagged_fmt("mcp_burp", "logger_query entry");
-    logger::log_filter_t f;
-    if (params.contains("filter") && params["filter"].is_object()) {
-        const auto& fp = params["filter"];
-        f.method     = fp.value("method", std::string());
-        f.host_regex = fp.value("host_regex", std::string());
-        f.url_regex  = fp.value("url_regex", std::string());
-        f.status_min = fp.value("status_min", 0);
-        f.status_max = fp.value("status_max", 1000);
-        f.source     = fp.value("source", std::string());
-        f.mime_type  = fp.value("mime_type", std::string());
-        f.time_from_ms = fp.value("time_from_ms", 0ull);
-        f.time_to_ms   = fp.value("time_to_ms", 0ull);
-    } else if (params.contains("filter")) {
-        return tool_result_t::error("burp_logger.query filter must be an object");
-    } else {
-        f.method     = params.value("method", std::string());
-        f.host_regex = params.value("host_regex", std::string());
-        f.url_regex  = params.value("url_regex", std::string());
-        f.status_min = params.value("status_min", 0);
-        f.status_max = params.value("status_max", 1000);
-        f.source     = params.value("source", std::string());
-        f.mime_type  = params.value("mime_type", std::string());
-    }
-    size_t limit = params.value("limit", params.contains("filter") && params["filter"].is_object() ? params["filter"].value("limit", 100u) : 100u);
-    diag::log_tagged_fmt("mcp_burp", "logger_query host_regex=%s url_regex=%s limit=%zu", f.host_regex.c_str(), f.url_regex.c_str(), limit);
-    auto rows = logger::query(f, limit);
-    json arr = json::array();
-    for (const auto& r : rows) {
-        json j;
-        j["id"]              = r.id;
-        j["ts_ms"]           = r.ts_ms;
-        j["method"]          = r.method;
-        j["url"]             = r.url;
-        j["host"]            = r.host;
-        j["port"]            = r.port;
-        j["status"]          = r.status;
-        j["request_length"]  = r.request_length;
-        j["response_length"] = r.response_length;
-        j["latency_ms"]      = r.latency_ms;
-        j["mime_type"]       = r.mime_type;
-        j["source"]          = logger::source_label(r.source);
-        j["source_label"]    = logger::source_label(r.source);
-        j["exchange_id"]     = r.exchange_id;
-        arr.push_back(std::move(j));
-    }
-    diag::log_tagged_fmt("mcp_burp", "logger_query ok rows=%zu", rows.size());
-    json out;
-    out["count"] = arr.size();
-    out["rows"]  = std::move(arr);
-    return tool_result_t::ok(out.dump(2), out);
-}
-
-tool_result_t tool_logger_total(const json& params)
-{
-    (void)params;
-    diag::log_tagged_fmt("mcp_burp", "logger_total entry");
-    const size_t total = logger::total_rows();
-    const size_t cap = logger::capacity();
-    diag::log_tagged_fmt("mcp_burp", "logger_total ok total=%zu capacity=%zu", total, cap);
-    json out;
-    out["total"] = total;
-    out["capacity"] = cap;
-    return tool_result_t::ok(out.dump(2), out);
-}
-
-tool_result_t tool_logger_clear(const json& params)
-{
-    (void)params;
-    diag::log_tagged_fmt("mcp_burp", "logger_clear entry");
-    const size_t before = logger::total_rows();
-    logger::clear();
-    const size_t after = logger::total_rows();
-    json out;
-    out["total_before"] = static_cast<uint64_t>(before);
-    out["total_after"] = static_cast<uint64_t>(after);
-    out["cleared_count"] = static_cast<uint64_t>(before >= after ? before - after : 0);
-    diag::log_tagged_fmt("mcp_burp", "logger_clear ok");
-    return tool_result_t::ok("cleared", out);
-}
-
-tool_result_t tool_logger_export_csv(const json& params)
-{
-    std::string path = params.value("path", std::string());
-    diag::log_tagged_fmt("mcp_burp", "logger_export_csv path=%s", path.c_str());
-    logger::log_filter_t f;
-    if (params.contains("filter") && params["filter"].is_object()) {
-        const auto& fp = params["filter"];
-        f.method     = fp.value("method", std::string());
-        f.host_regex = fp.value("host_regex", std::string());
-        f.url_regex  = fp.value("url_regex", std::string());
-        f.status_min = fp.value("status_min", 0);
-        f.status_max = fp.value("status_max", 1000);
-        f.source     = fp.value("source", std::string());
-        f.mime_type  = fp.value("mime_type", std::string());
-    }
-    if (!logger::export_csv(path, f))
-    {
-        diag::log_tagged_fmt("mcp_burp", "logger_export_csv failed err=%s", logger::last_error().c_str());
-        return tool_result_t::error(logger::last_error());
-    }
-    diag::log_tagged_fmt("mcp_burp", "logger_export_csv ok path=%s", path.c_str());
-    json out;
-    out["path"] = path;
-    return tool_result_t::ok(out.dump(2), out);
-}
-
 tool_result_t tool_report_generate(const json& params)
 {
     diag::log_tagged_fmt("mcp_burp", "report_generate format=%s output=%s", params.value("format", std::string("html")).c_str(), params.value("output_path", std::string()).c_str());
@@ -1123,11 +1039,38 @@ tool_result_t tool_report_generate(const json& params)
     cfg.output_path   = params.value("output_path", std::string());
     cfg.include_evidence    = params.value("include_evidence", true);
     cfg.include_remediation = params.value("include_remediation", true);
+    cfg.session_id = params.value("session_id", std::string());
+    cfg.include_session_context = params.value("include_session_context", true);
+    cfg.include_audit_trail = params.value("include_audit_trail", false);
+    cfg.audit_trail_limit = static_cast<size_t>(params.value("audit_trail_limit", 128));
+    cfg.target_domain = params.value("target_domain", params.value("host", std::string()));
+    cfg.include_recon = params.value("include_recon", true);
+    cfg.include_suppressed = params.value("include_suppressed", false);
     std::string fmt_s = params.value("format", std::string("html"));
     report::parse_format(fmt_s, cfg.format);
     if (params.contains("include_issue_ids") && params["include_issue_ids"].is_array()) {
-        for (const auto& v : params["include_issue_ids"])
-            if (v.is_number_unsigned()) cfg.include_issue_ids.push_back(v.get<uint64_t>());
+        for (const auto& v : params["include_issue_ids"]) {
+            uint64_t id = 0;
+            if (json_u64_value(v, id)) cfg.include_issue_ids.push_back(id);
+        }
+    }
+    if (params.contains("audit_id")) {
+        uint64_t audit_id = 0;
+        if (!json_u64_value(params["audit_id"], audit_id))
+            return tool_result_t::error("invalid audit_id");
+        cfg.has_audit_id = true;
+        cfg.audit_id = audit_id;
+    }
+    if (params.contains("severity_min") && params["severity_min"].is_string()) {
+        severity_t sev = severity_t::info;
+        if (!parse_severity(params["severity_min"].get<std::string>(), sev))
+            return tool_result_t::error("invalid severity_min");
+        cfg.has_severity_min = true;
+        cfg.severity_min = sev;
+    }
+    if (params.contains("include_offensive_run_ids") && params["include_offensive_run_ids"].is_array()) {
+        for (const auto& v : params["include_offensive_run_ids"])
+            if (v.is_string()) cfg.include_offensive_run_ids.push_back(v.get<std::string>());
     }
     std::string out;
     if (!report::generate(cfg, out))
@@ -1135,11 +1078,14 @@ tool_result_t tool_report_generate(const json& params)
         diag::log_tagged_fmt("mcp_burp", "report_generate failed err=%s", out.c_str());
         return tool_result_t::error(out);
     }
-    diag::log_tagged_fmt("mcp_burp", "report_generate ok path=%s format=%s", out.c_str(), fmt_s.c_str());
+    diag::log_tagged_fmt("mcp_burp", "report_generate ok output_len=%zu format=%s inline=%d", out.size(), fmt_s.c_str(), cfg.output_path.empty() ? 1 : 0);
     json j;
-    j["output_path"] = out;
+    j["output_path"] = cfg.output_path.empty() ? std::string() : out;
+    j["inline"] = cfg.output_path.empty();
+    if (cfg.output_path.empty())
+        j["content"] = out;
     j["format"]      = report::format_label(cfg.format);
-    return tool_result_t::ok(out, j);
+    return tool_result_t::ok(cfg.output_path.empty() ? std::string("report generated inline") : out, j);
 }
 
 }
@@ -1206,34 +1152,6 @@ void register_api_tools(mcp_standalone::server_t& srv)
     });
 
     srv.register_tool({
-        "burp_logger_manage",
-        "Manage the unified Burp logger ring buffer. Actions: query, total, clear, export_csv.",
-        {{"action", "string", "query|total|clear|export_csv", true},
-         {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted.", false},
-         {"filter", "object", "Optional query filter with method, host_regex, url_regex, status_min, status_max, source, mime_type, time_from_ms, time_to_ms, and limit.", false},
-         {"method", "string", "HTTP method filter for query/export_csv.", false},
-         {"host_regex", "string", "Case-insensitive host regex or substring fallback.", false},
-         {"url_regex", "string", "Case-insensitive URL regex or substring fallback.", false},
-         {"status_min", "number", "Minimum response status.", false},
-         {"status_max", "number", "Maximum response status.", false},
-         {"source", "string", "Source label such as browser, proxy, repeater, scanner, intruder, crawler, api, or fuzzer.", false},
-         {"mime_type", "string", "MIME type filter.", false},
-         {"time_from_ms", "number", "Earliest timestamp in epoch milliseconds.", false},
-         {"time_to_ms", "number", "Latest timestamp in epoch milliseconds.", false},
-         {"limit", "number", "Maximum rows to return.", false}},
-        false,
-        [](const json& params) -> tool_result_t {
-            const std::string action = compat_action_name(params);
-            const json p = compat_action_payload(params);
-            if (action == "query") return tool_logger_query(p);
-            if (action == "total") return tool_logger_total(p);
-            if (action == "clear") return tool_logger_clear(p);
-            if (action == "export_csv") return tool_logger_export_csv(p);
-            return compat_unknown_action("burp_logger_manage", action);
-        }
-    });
-
-    srv.register_tool({
         "burp_report_generate",
         "Generate a vulnerability report from issue_store. format = html|markdown|json|sarif_2_1_0|csv.",
         {
@@ -1242,9 +1160,18 @@ void register_api_tools(mcp_standalone::server_t& srv)
             {"scope_summary",        "string",  "Scope summary text.", false},
             {"include_issue_ids",    "array",   "Optional list of issue ids; empty = all issues.", false},
             {"format",               "string",  "Output format.", true},
-            {"output_path",          "string",  "Destination file path.", true},
+            {"output_path",          "string",  "Destination file path; omit for inline output.", false},
             {"include_evidence",     "boolean", "Embed request/response evidence (default true).", false},
             {"include_remediation",  "boolean", "Embed remediation text (default true).", false},
+            {"session_id",           "string",  "Audit session id filter.", false},
+            {"include_session_context","boolean","Include audit session context.", false},
+            {"include_audit_trail",   "boolean", "Include redacted audit trail context.", false},
+            {"audit_trail_limit",     "number",  "Maximum audit trail entries.", false},
+            {"severity_min",          "string",  "Minimum severity.", false},
+            {"target_domain",         "string",  "Target domain filter.", false},
+            {"audit_id",              "number",  "Scanner audit id filter.", false},
+            {"include_recon",         "boolean", "Include recon/offensive context.", false},
+            {"include_offensive_run_ids","array","Offensive run ids to include when present in redacted context.", false},
         },
         false, tool_report_generate
     });

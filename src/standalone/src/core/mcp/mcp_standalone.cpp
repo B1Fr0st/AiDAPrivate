@@ -17,6 +17,7 @@
 #include "sandbox.hpp"
 #include "../infra/critical_work_queue.hpp"
 #include "../infra/work_queue.hpp"
+#include "../network/burp/audit_trail.hpp"
 #include "../runtime/manual_map_tls.hpp"
 #include "../session/analysis_session.hpp"
 #include "../../helpers/diag_log.hpp"
@@ -1441,6 +1442,82 @@ static std::uint32_t target_pid_from_args(const json& args)
         }
     }
     return 0;
+}
+
+static std::string audit_session_id_from_args(const json& args)
+{
+    if (args.is_object() && args.contains("session_id") && args["session_id"].is_string())
+        return args["session_id"].get<std::string>();
+    return {};
+}
+
+static std::uint64_t audit_scan_id_from_args(const json& args)
+{
+    if (!args.is_object() || !args.contains("scan_id"))
+        return 0;
+    const auto& v = args["scan_id"];
+    if (v.is_number_unsigned())
+        return v.get<std::uint64_t>();
+    if (v.is_number_integer()) {
+        const auto signed_value = v.get<std::int64_t>();
+        return signed_value > 0 ? static_cast<std::uint64_t>(signed_value) : 0;
+    }
+    if (v.is_string()) {
+        try {
+            const std::string text = v.get<std::string>();
+            size_t used = 0;
+            const std::uint64_t parsed = std::stoull(text, &used);
+            return used == text.size() ? parsed : 0;
+        } catch (...) {
+        }
+    }
+    return 0;
+}
+
+static json audit_result_payload(const std::string& status,
+                                 bool success,
+                                 const json& result,
+                                 const std::string& diagnostic_id,
+                                 const std::string& request_id)
+{
+    json out = json::object();
+    out["status"] = status;
+    out["success"] = success;
+    out["diagnostic_id"] = diagnostic_id;
+    out["request_id"] = request_id;
+    if (result.is_object() || result.is_array())
+        out["result"] = result;
+    else if (!result.is_null())
+        out["result"] = result;
+    return out;
+}
+
+static void record_tool_audit_event(const std::string& tool_name,
+                                    const json& arguments,
+                                    const std::string& status,
+                                    bool success,
+                                    const json& result,
+                                    const std::string& error_message,
+                                    std::uint64_t started_ms,
+                                    const std::string& diagnostic_id,
+                                    const std::string& request_id) noexcept
+{
+    try {
+        aida::burp::audit_trail::event_t event;
+        event.session_id = audit_session_id_from_args(arguments);
+        event.scan_id = audit_scan_id_from_args(arguments);
+        event.timestamp_ms = started_ms == 0 ? mcp_now_ms() : started_ms;
+        event.tool_name = tool_name.empty() ? std::string("<unknown>") : tool_name;
+        event.parameters_json = arguments.is_object() ? arguments : json::object();
+        event.result_json = audit_result_payload(status, success, result, diagnostic_id, request_id);
+        const std::uint64_t end = mcp_now_ms();
+        event.duration_ms = end >= event.timestamp_ms ? end - event.timestamp_ms : 0;
+        event.caller = "external_mcp";
+        event.success = success;
+        event.error_message = error_message;
+        aida::burp::audit_trail::record(event, nullptr);
+    } catch (...) {
+    }
 }
 
 struct tool_timeout_resolution_t
@@ -3590,8 +3667,15 @@ bool server_t::register_tool(tool_def_t tool)
 
 tool_result_t server_t::call_registered_tool(const std::string& name, const json& arguments, bool external_visible_only)
 {
-    if (name.empty())
-        return tool_result_t::error("Missing tool name");
+    const std::uint64_t seq = g_tool_call_seq.fetch_add(1u, std::memory_order_acq_rel) + 1u;
+    const std::string request_id = "call-registered-tool-" + std::to_string(seq);
+    const std::string diag_id = request_id;
+    const std::uint64_t call_begin = mcp_now_ms();
+    if (name.empty()) {
+        auto tr = tool_result_t::error("Missing tool name");
+        record_tool_audit_event("<missing>", arguments, "rejected", false, json{{"reason", "missing_name"}}, tr.text, call_begin, diag_id, request_id);
+        return tr;
+    }
 
     tool_def_t found;
     bool found_tool = false;
@@ -3601,8 +3685,11 @@ tool_result_t server_t::call_registered_tool(const std::string& name, const json
         for (const auto& t : _tools) {
             if (t.name != name)
                 continue;
-            if (external_visible_only && !is_external_mcp_tool(t))
-                return tool_result_t::error("Unknown tool: " + name);
+            if (external_visible_only && !is_external_mcp_tool(t)) {
+                auto tr = tool_result_t::error("Unknown tool: " + name);
+                record_tool_audit_event(name, arguments, "rejected", false, json{{"reason", "not_external"}}, tr.text, call_begin, diag_id, request_id);
+                return tr;
+            }
             found = t;
             handler_copy = t.handler;
             found_tool = true;
@@ -3610,12 +3697,43 @@ tool_result_t server_t::call_registered_tool(const std::string& name, const json
         }
     }
 
-    if (!found_tool)
-        return tool_result_t::error("Unknown tool: " + name);
-    if (!handler_copy)
-        return tool_result_t::error("Tool has no handler: " + name);
+    if (!found_tool) {
+        auto tr = tool_result_t::error("Unknown tool: " + name);
+        record_tool_audit_event(name, arguments, "rejected", false, json{{"reason", "unknown_tool"}}, tr.text, call_begin, diag_id, request_id);
+        return tr;
+    }
+    if (!handler_copy) {
+        auto tr = tool_result_t::error("Tool has no handler: " + name);
+        record_tool_audit_event(name, arguments, "failed", false, json{{"reason", "handler_missing"}}, tr.text, call_begin, diag_id, request_id);
+        return tr;
+    }
     tool_invocation_metrics_t metrics;
-    return invoke_tool_with_concurrency_policy(found, arguments, handler_copy, &metrics);
+    tool_result_t tr = invoke_tool_with_concurrency_policy(found, arguments, handler_copy, &metrics);
+    json result;
+    result["success"] = tr.success;
+    if (!tr.text.empty())
+        result["text"] = tr.text;
+    if (!tr.data.is_null() && !tr.data.empty())
+        result["data"] = tr.data;
+    if (!tr.error_code.empty())
+        result["error_code"] = tr.error_code;
+    if (!tr.error_details.is_null() && !tr.error_details.empty())
+        result["error_details"] = tr.error_details;
+    result["metrics"] = {
+        {"lane", metrics.lane},
+        {"lock_wait_ms", metrics.lock_wait_ms},
+        {"handler_elapsed_ms", metrics.handler_elapsed_ms}
+    };
+    record_tool_audit_event(name,
+                            arguments,
+                            tr.success ? std::string("completed") : std::string("failed"),
+                            tr.success,
+                            result,
+                            tr.success ? std::string() : tr.text,
+                            call_begin,
+                            diag_id,
+                            request_id);
+    return tr;
 }
 
 json server_t::make_result(const json& id, const json& result)
@@ -4066,6 +4184,8 @@ json server_t::handle_tools_call(const json& id, const json& params)
             diag_id.c_str(),
             request_id.c_str(),
             payload_shape_summary(params).c_str());
+        json args = params.contains("arguments") && params["arguments"].is_object() ? params["arguments"] : json::object();
+        record_tool_audit_event("<missing>", args, "rejected", false, json{{"reason", "missing_name"}}, "Missing required field: 'name'", call_begin, diag_id, request_id);
         return make_error(id, JSONRPC_INVALID_PARAMS, "Missing required field: 'name'");
     }
 
@@ -4100,6 +4220,8 @@ json server_t::handle_tools_call(const json& id, const json& params)
                 diag_id.c_str(),
                 early_name.c_str(),
                 static_cast<unsigned long long>(mcp_now_ms() - call_begin));
+            json args = params.contains("arguments") && params["arguments"].is_object() ? params["arguments"] : json::object();
+            record_tool_audit_event(early_name, args, "rejected", false, json{{"reason", "runtime_gate"}}, error_text, call_begin, diag_id, request_id);
             return make_error(id, -32000, error_text);
         }
     }
@@ -4123,6 +4245,7 @@ json server_t::handle_tools_call(const json& id, const json& params)
             diag_id.c_str(),
             tool_name.c_str(),
             payload_shape.c_str());
+        record_tool_audit_event(tool_name, arguments, "rejected", false, json{{"reason", "not_external"}}, "Unknown tool: " + tool_name, call_begin, diag_id, request_id);
         return make_error(id, JSONRPC_INVALID_PARAMS, "Unknown tool: " + tool_name);
     }
 
@@ -4134,6 +4257,7 @@ json server_t::handle_tools_call(const json& id, const json& params)
         for (const auto& t : _tools) {
             if (t.name == tool_name) {
                 if (!is_external_mcp_tool(t)) {
+                    record_tool_audit_event(tool_name, arguments, "rejected", false, json{{"reason", "not_external"}}, "Unknown tool: " + tool_name, call_begin, diag_id, request_id);
                     return make_error(id, JSONRPC_INVALID_PARAMS, "Unknown tool: " + tool_name);
                 }
                 found = t;
@@ -4153,6 +4277,7 @@ json server_t::handle_tools_call(const json& id, const json& params)
             static_cast<unsigned long long>(seq),
             diag_id.c_str(),
             payload_shape.c_str());
+        record_tool_audit_event(tool_name, arguments, "rejected", false, json{{"reason", "unknown_tool"}}, "Unknown tool: " + tool_name, call_begin, diag_id, request_id);
         return make_error(id, JSONRPC_INVALID_PARAMS, "Unknown tool: " + tool_name);
     }
     if (!handler_copy) {
@@ -4162,6 +4287,7 @@ json server_t::handle_tools_call(const json& id, const json& params)
             static_cast<unsigned long long>(seq),
             diag_id.c_str(),
             tool_name.c_str());
+        record_tool_audit_event(tool_name, arguments, "failed", false, json{{"reason", "handler_missing"}}, "Tool has no handler: " + tool_name, call_begin, diag_id, request_id);
         return make_error(id, JSONRPC_INTERNAL_ERROR, "Tool has no handler: " + tool_name);
     }
 
@@ -4197,6 +4323,7 @@ json server_t::handle_tools_call(const json& id, const json& params)
                 {"target_pid", target_pid},
                 {"payload_shape", payload_shape}
             };
+            record_tool_audit_event(tool_name, arguments, "rejected", false, err["error"], message, call_begin, diag_id, request_id);
             return err;
         }
         dependency_status = "driver_ok";
@@ -4424,6 +4551,7 @@ json server_t::handle_tools_call(const json& id, const json& params)
             static_cast<unsigned long long>(timeout_resolution.requested_ms),
             static_cast<unsigned long long>(timeout_ms),
             static_cast<unsigned long long>(mcp_now_ms() - call_begin));
+        record_tool_audit_event(tool_name, arguments, "rejected", false, err["error"], "MCP executor queue is full; tool was not started.", call_begin, diag_id, request_id);
         return err;
     }
 
@@ -4522,6 +4650,7 @@ json server_t::handle_tools_call(const json& id, const json& params)
         }
         json err = make_error(id, -32070, "MCP tool call timed out; cancellation was signalled for cooperative drain. Diagnostic id: " + diag_id);
         err["error"]["data"] = std::move(diag);
+        record_tool_audit_event(tool_name, arguments, "timed_out", false, err["error"], "MCP tool call timed out; cancellation was signalled for cooperative drain.", call_begin, diag_id, request_id);
         return err;
     }
 
@@ -4579,6 +4708,7 @@ json server_t::handle_tools_call(const json& id, const json& params)
         });
         cancel_result["isError"] = true;
         cancel_result["_meta"]["diagnostics"] = diagnostics;
+        record_tool_audit_event(tool_name, arguments, "cancelled", false, cancel_result, "Tool call cancelled by client request.", call_begin, diag_id, request_id);
         return make_result(id, cancel_result);
     }
 
@@ -4606,6 +4736,15 @@ json server_t::handle_tools_call(const json& id, const json& params)
         }
     }
     result["_meta"]["diagnostics"] = diagnostics;
+    record_tool_audit_event(tool_name,
+                            arguments,
+                            tr.success ? std::string("completed") : std::string("failed"),
+                            tr.success,
+                            result,
+                            tr.success ? std::string() : tr.text,
+                            call_begin,
+                            diag_id,
+                            request_id);
     return make_result(id, result);
 }
 
@@ -5089,21 +5228,12 @@ bool server_t::start(int port)
         return posted;
     };
 
-    char fileless_debug_path[MAX_PATH] = {};
-    const bool fileless_host = diag::env_flag_enabled("AIDA_FILELESS_LAUNCH") ||
-        diag::env_value_present("AIDA_FILELESS_DEBUG_LOG_PATH", fileless_debug_path, static_cast<DWORD>(sizeof(fileless_debug_path)));
     std::string worker_err;
-    bool started = false;
-    if (fileless_host) {
-        diag::log_tagged_fmt("mcp_srv", "start server worker service queue selected port=%d fileless=1", port);
-        started = post_service_worker("fileless");
-    } else {
-        started = worker_lifetime->thread.start(worker_body, &worker_err, aida::infra::win_thread::default_stack_reserve, "mcp_server_worker");
-        if (!started) {
-            diag::log_tagged_fmt("mcp_srv", "start server worker native start failed err='%s'", worker_err.empty() ? "<none>" : worker_err.c_str());
-            log_work_queue_stats("start native_worker_failed");
-            started = post_service_worker("native_fallback");
-        }
+    bool started = worker_lifetime->thread.start(worker_body, &worker_err, aida::infra::win_thread::default_stack_reserve, "mcp_server_worker");
+    if (!started) {
+        diag::log_tagged_fmt("mcp_srv", "start server worker native start failed err='%s'", worker_err.empty() ? "<none>" : worker_err.c_str());
+        log_work_queue_stats("start native_worker_failed");
+        started = post_service_worker("native_fallback");
     }
     if (!started) {
         mark_server_worker_start(worker_lifetime, false);
@@ -5593,8 +5723,12 @@ void server_t::server_thread_func(int port)
 
         std::string tool_name = body.value("name", "");
         json arguments = body.value("arguments", json::object());
+        const std::uint64_t api_call_begin = mcp_now_ms();
+        const std::string api_request_id = "api-tools-call-" + std::to_string(tls_http_request_id);
+        const std::string api_diag_id = api_request_id;
 
         if (tool_name.empty()) {
+            record_tool_audit_event("<missing>", arguments, "rejected", false, json{{"reason", "missing_name"}}, "Missing 'name' field", api_call_begin, api_diag_id, api_request_id);
             res.status = 400;
             res.set_content(json_dump_safe({{"error", "Missing 'name' field"}}), "application/json");
             return;
@@ -5607,6 +5741,7 @@ void server_t::server_thread_func(int port)
           for (const auto& t : _tools) {
               if (t.name == tool_name) {
                   if (!is_external_mcp_tool(t)) {
+                      record_tool_audit_event(tool_name, arguments, "rejected", false, json{{"reason", "not_external"}}, "Unknown tool: " + tool_name, api_call_begin, api_diag_id, api_request_id);
                       res.status = 404;
                       res.set_content(json_dump_safe({{"error", "Unknown tool: " + tool_name}}), "application/json");
                       return;
@@ -5619,6 +5754,7 @@ void server_t::server_thread_func(int port)
           } }
 
         if (!found_tool) {
+            record_tool_audit_event(tool_name, arguments, "rejected", false, json{{"reason", "unknown_tool"}}, "Unknown tool: " + tool_name, api_call_begin, api_diag_id, api_request_id);
             res.status = 404;
             res.set_content(json_dump_safe({{"error", "Unknown tool: " + tool_name}}), "application/json");
             return;
@@ -5644,6 +5780,15 @@ void server_t::server_thread_func(int port)
             if (err.contains("details"))
                 resp["error_details"] = err["details"];
         }
+        record_tool_audit_event(tool_name,
+                                arguments,
+                                tr.success ? std::string("completed") : std::string("failed"),
+                                tr.success,
+                                resp,
+                                tr.success ? std::string() : tr.text,
+                                api_call_begin,
+                                api_diag_id,
+                                api_request_id);
         res.set_content(json_dump_safe(resp, 2), "application/json");
     });
 

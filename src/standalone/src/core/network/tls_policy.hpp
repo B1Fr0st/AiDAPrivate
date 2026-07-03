@@ -287,12 +287,8 @@ inline bool configure_hostname_verification(SSL* ssl, const std::string& host, c
         return false;
     if (match.matched && match.policy.ignore_cert_errors)
         return true;
-#if OPENSSL_VERSION_NUMBER >= 0x10100000L
-    return SSL_set1_host(ssl, host.c_str()) == 1;
-#else
     X509_VERIFY_PARAM* param = SSL_get0_param(ssl);
     return param && X509_VERIFY_PARAM_set1_host(param, host.c_str(), 0) == 1;
-#endif
 }
 
 inline std::string normalize_fingerprint(std::string value) {

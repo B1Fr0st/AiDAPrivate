@@ -4,6 +4,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include "../../mcp/mcp_standalone.hpp"
+
 namespace aida {
 namespace burp {
 namespace project {
@@ -15,6 +17,7 @@ bool import_json(const nlohmann::json& doc, bool replace_existing);
 bool save_to_file(const std::string& path);
 bool load_from_file(const std::string& path, bool replace_existing);
 std::string last_error();
+void register_project_tools(mcp_standalone::server_t& srv);
 
 }
 }

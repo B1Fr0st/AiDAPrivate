@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 namespace aida {
 namespace burp {
 namespace match_replace {
@@ -55,6 +57,8 @@ bool                 test_rule(const rule_t& r, const std::string& sample, std::
 bool                 save_to_disk();
 bool                 load_from_disk();
 std::string          storage_path();
+nlohmann::json       export_json();
+bool                 import_json(const nlohmann::json& doc, bool replace_existing);
 
 const char*          target_label(match_kind_t k);
 bool                 parse_target(const std::string& s, match_kind_t& out);

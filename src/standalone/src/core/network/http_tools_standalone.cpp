@@ -861,7 +861,10 @@ tool_result_t perform_http_request(const json& params, bool force_follow, bool c
     out["redirect_policy"] = redirect_policy;
     out["redirect_chain"] = chain;
     out["redirect_count"] = chain.empty() ? 0 : static_cast<int>(chain.size()) - 1;
-    out["final_url"] = chain.empty() ? json() : chain.back().value("request_url", std::string());
+    if (chain.empty())
+        out["final_url"] = nullptr;
+    else
+        out["final_url"] = chain.back().value("request_url", std::string());
     if (chain_only)
         return tool_result_t::ok("HTTP redirect chain complete.", out);
     return tool_result_t::ok("HTTP request complete.", out);
@@ -1367,17 +1370,33 @@ tool_result_t tool_repeater(const json& params)
         aida::burp::exchange_observed_t ex;
         if (!aida::burp::sitemap::find_exchange(id, ex))
             return error_result("exchange not found");
-        aida::burp::repeater::send_options_t opts;
+        if (ex.host.empty())
+            return error_result("exchange has no target host");
+        request_spec_t spec;
+        spec.method = ex.method.empty() ? "GET" : ex.method;
+        spec.parsed.scheme = lower_ascii(ex.scheme.empty() ? std::string("https") : ex.scheme);
+        spec.parsed.host = ex.host;
+        spec.parsed.port = ex.port != 0 ? ex.port : (spec.parsed.scheme == "https" ? 443 : 80);
+        spec.parsed.tls = spec.parsed.scheme == "https";
+        spec.parsed.target = ex.path.empty() ? "/" : ex.path;
+        if (!ex.query.empty())
+            spec.parsed.target += "?" + ex.query;
+        spec.headers = ex.req_headers;
+        spec.body = ex.req_body;
+        spec.body_present = !ex.req_body.empty();
+        const auto raw_request = build_raw_request(spec);
+        aida::burp::audit_http::send_options_t opts;
         opts.timeout_ms = bounded_timeout_ms(params);
         opts.follow_redirects = params.value("follow_redirects", false);
         opts.max_redirects = std::max(0, std::min(params.value("max_redirects", 3), 10));
         opts.enforce_scope = params.value("enforce_scope", false);
-        const auto sent = aida::burp::repeater::send_from_exchange(ex, opts);
-        if (!sent.success)
-            return error_result(sent.error.empty() ? aida::burp::repeater::last_error() : sent.error);
-        json out = exchange_summary_json(sent.exchange, static_cast<std::size_t>(std::max(0, std::min(params.value("body_preview_bytes", 1024), 8192))));
+        opts.publish_exchange = params.value("publish_exchange", false);
+        opts.exchange_source = "aida.http.repeater";
+        const auto sent = aida::burp::audit_http::send(raw_request, spec.parsed.host, spec.parsed.port, spec.parsed.tls, opts);
+        if (!sent.has_value())
+            return error_result(aida::burp::audit_http::last_error().empty() ? "repeater send failed" : aida::burp::audit_http::last_error());
+        json out = exchange_summary_json(*sent, static_cast<std::size_t>(std::max(0, std::min(params.value("body_preview_bytes", 1024), 8192))));
         out["source_exchange_id"] = id;
-        out["repeater_tab_id"] = static_cast<std::uint64_t>(sent.tab.id);
         return tool_result_t::ok("Repeater exchange sent.", out);
     }
     if (params.contains("raw_request") && params["raw_request"].is_string()) {
@@ -1395,16 +1414,20 @@ tool_result_t tool_repeater(const json& params)
         }
         if (host.empty() || port == 0)
             return error_result("host and port are required for raw_request repeater sends");
-        aida::burp::repeater::send_options_t opts;
+        std::vector<std::uint8_t> raw_request;
+        const std::string raw_text = params["raw_request"].get<std::string>();
+        raw_request.assign(raw_text.begin(), raw_text.end());
+        aida::burp::audit_http::send_options_t opts;
         opts.timeout_ms = bounded_timeout_ms(params);
         opts.follow_redirects = params.value("follow_redirects", false);
         opts.max_redirects = std::max(0, std::min(params.value("max_redirects", 3), 10));
         opts.enforce_scope = params.value("enforce_scope", false);
-        const auto sent = aida::burp::repeater::send_raw(host, port, use_tls, params["raw_request"].get<std::string>(), opts);
-        if (!sent.success)
-            return error_result(sent.error.empty() ? aida::burp::repeater::last_error() : sent.error);
-        json out = exchange_summary_json(sent.exchange, static_cast<std::size_t>(std::max(0, std::min(params.value("body_preview_bytes", 1024), 8192))));
-        out["repeater_tab_id"] = static_cast<std::uint64_t>(sent.tab.id);
+        opts.publish_exchange = params.value("publish_exchange", false);
+        opts.exchange_source = "aida.http.repeater";
+        const auto sent = aida::burp::audit_http::send(raw_request, host, port, use_tls, opts);
+        if (!sent.has_value())
+            return error_result(aida::burp::audit_http::last_error().empty() ? "repeater raw request failed" : aida::burp::audit_http::last_error());
+        json out = exchange_summary_json(*sent, static_cast<std::size_t>(std::max(0, std::min(params.value("body_preview_bytes", 1024), 8192))));
         return tool_result_t::ok("Repeater raw request sent.", out);
     }
     return perform_http_request(params, false, false);

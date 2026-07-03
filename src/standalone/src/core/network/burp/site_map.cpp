@@ -290,6 +290,26 @@ std::vector<exchange_observed_t> list_exchanges_for(const std::string& host, uin
     return out;
 }
 
+std::vector<exchange_observed_t> list_all_exchanges()
+{
+    auto& st = s();
+    std::vector<exchange_observed_t> out;
+    std::lock_guard<std::mutex> lk(st.mtx);
+    out.reserve(st.by_id.size());
+    for (const auto& kv : st.by_id)
+        out.push_back(kv.second);
+    return out;
+}
+
+bool import_exchanges(const std::vector<exchange_observed_t>& exchanges, bool replace_existing)
+{
+    if (replace_existing)
+        clear_all();
+    for (const auto& exchange : exchanges)
+        ingest_exchange(exchange);
+    return true;
+}
+
 std::vector<host_summary_t> list_hosts(bool scope_only)
 {
     auto& st = s();

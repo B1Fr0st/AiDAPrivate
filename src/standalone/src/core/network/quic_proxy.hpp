@@ -17,6 +17,7 @@ struct quic_proxy_config {
     size_t max_datagram_size = 65535;
     size_t max_observations = 512;
     bool fail_closed_without_tls_keys = true;
+    bool observation_only = true;
 };
 
 struct http3_frame {
@@ -53,7 +54,10 @@ struct quic_proxy_stats {
     uint64_t dropped_unsupported = 0;
     uint64_t parse_errors = 0;
     uint64_t http3_frames = 0;
+    bool observation_only = true;
+    bool mitm_supported = false;
     std::string last_error;
+    std::string contract;
     std::string last_packet_type;
     std::string last_version;
     std::string last_sni;

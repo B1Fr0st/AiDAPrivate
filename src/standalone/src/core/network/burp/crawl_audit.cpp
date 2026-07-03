@@ -12,11 +12,13 @@
 #include "helpers/diag_log.hpp"
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <memory>
 #include <mutex>
 #include <sstream>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 namespace aida {
@@ -30,6 +32,7 @@ struct pipeline_entry_t
     pipeline_status_t                  status;
     std::shared_ptr<std::atomic<bool>> cancel_flag;
     std::thread                        worker;
+    bool                               imported_snapshot = false;
 };
 
 std::mutex                                   g_mutex;
@@ -322,6 +325,104 @@ pipeline_entry_t* find_entry(uint64_t pipeline_id)
     return nullptr;
 }
 
+nlohmann::json status_to_json(const pipeline_status_t& s, bool imported_snapshot)
+{
+    nlohmann::json audit_ids = nlohmann::json::array();
+    for (uint64_t id : s.audit_ids)
+        audit_ids.push_back(id);
+
+    nlohmann::json j;
+    j["id"] = s.id;
+    j["crawl_id"] = s.crawl_id;
+    j["audit_ids"] = std::move(audit_ids);
+    j["pages_discovered"] = s.pages_discovered;
+    j["audits_started"] = s.audits_started;
+    j["issues_found"] = s.issues_found;
+    j["phase"] = s.phase;
+    j["started_ms"] = s.started_ms;
+    j["finished_ms"] = s.finished_ms;
+    j["last_error"] = s.last_error;
+    j["imported_snapshot"] = imported_snapshot;
+    return j;
+}
+
+std::vector<uint64_t> read_u64_array(const nlohmann::json& value)
+{
+    std::vector<uint64_t> out;
+    if (!value.is_array())
+        return out;
+    out.reserve(value.size());
+    for (const auto& item : value)
+    {
+        if (item.is_number_unsigned())
+            out.push_back(item.get<uint64_t>());
+        else if (item.is_number_integer() && item.get<int64_t>() >= 0)
+            out.push_back(static_cast<uint64_t>(item.get<int64_t>()));
+    }
+    return out;
+}
+
+bool parse_status_json(const nlohmann::json& value, pipeline_status_t& s)
+{
+    if (!value.is_object())
+        return false;
+
+    const uint64_t id = value.value("id", static_cast<uint64_t>(0));
+    if (id == 0)
+        return false;
+
+    s.id = id;
+    s.crawl_id = value.value("crawl_id", static_cast<uint64_t>(0));
+    s.audit_ids = read_u64_array(value.value("audit_ids", nlohmann::json::array()));
+    s.pages_discovered = value.value("pages_discovered", 0);
+    s.audits_started = value.value("audits_started", 0);
+    s.issues_found = value.value("issues_found", 0);
+    s.phase = value.value("phase", std::string("snapshot"));
+    s.started_ms = value.value("started_ms", static_cast<uint64_t>(0));
+    s.finished_ms = value.value("finished_ms", static_cast<uint64_t>(0));
+    s.last_error = value.value("last_error", std::string());
+
+    if (s.phase == "pending" || s.phase == "crawling" || s.phase == "auditing")
+    {
+        if (s.last_error.empty())
+            s.last_error = "pipeline was active when the project snapshot was saved";
+        s.phase = "imported_snapshot";
+    }
+    if (s.phase.empty())
+        s.phase = "snapshot";
+
+    return true;
+}
+
+void stop_entries(std::vector<std::unique_ptr<pipeline_entry_t>>& entries)
+{
+    for (auto& e : entries)
+    {
+        if (!e || e->imported_snapshot)
+            continue;
+        if (e->cancel_flag)
+            e->cancel_flag->store(true, std::memory_order_release);
+        if (e->status.crawl_id != 0)
+            crawler::stop(e->status.crawl_id);
+        for (uint64_t aid : e->status.audit_ids)
+            active_scanner::cancel_audit(aid);
+    }
+
+    for (auto& e : entries)
+    {
+        if (e && e->worker.joinable())
+            e->worker.join();
+    }
+}
+
+uint64_t next_import_id_locked(const std::unordered_set<uint64_t>& used)
+{
+    uint64_t candidate = g_next_id.fetch_add(1);
+    while (candidate == 0 || used.find(candidate) != used.end())
+        candidate = g_next_id.fetch_add(1);
+    return candidate;
+}
+
 }
 
 bool initialize()
@@ -345,21 +446,7 @@ void shutdown()
         g_initialized = false;
     }
 
-    for (auto& e : entries_to_join)
-    {
-        if (e->cancel_flag)
-            e->cancel_flag->store(true, std::memory_order_release);
-        if (e->crawl_id != 0)
-            crawler::stop(e->crawl_id);
-        for (uint64_t aid : e->status.audit_ids)
-            active_scanner::cancel_audit(aid);
-    }
-
-    for (auto& e : entries_to_join)
-    {
-        if (e->worker.joinable())
-            e->worker.join();
-    }
+    stop_entries(entries_to_join);
 
     diag::log_tagged_fmt("crawl_audit", "shutdown");
 }
@@ -436,9 +523,16 @@ bool stop(uint64_t pipeline_id)
             return false;
         }
         cf = e->cancel_flag;
-        crawl_id = e->crawl_id;
+        crawl_id = e->status.crawl_id;
         audit_ids = e->status.audit_ids;
         e->status.phase = "stopped";
+        if (e->imported_snapshot)
+        {
+            e->status.finished_ms = static_cast<uint64_t>(GetTickCount64());
+            diag::log_tagged_fmt("crawl_audit", "stop_imported_snapshot pipeline_id=%llu",
+                static_cast<unsigned long long>(pipeline_id));
+            return true;
+        }
     }
 
     if (cf)
@@ -469,14 +563,17 @@ pipeline_status_t status(uint64_t pipeline_id)
         return empty;
     }
 
-    int total_issues = 0;
-    for (uint64_t aid : e->status.audit_ids)
+    if (!e->imported_snapshot)
     {
-        active_scanner::audit_status_t as;
-        if (active_scanner::get_status(aid, as))
-            total_issues += static_cast<int>(as.issues_found);
+        int total_issues = 0;
+        for (uint64_t aid : e->status.audit_ids)
+        {
+            active_scanner::audit_status_t as;
+            if (active_scanner::get_status(aid, as))
+                total_issues += static_cast<int>(as.issues_found);
+        }
+        e->status.issues_found = total_issues;
     }
-    e->status.issues_found = total_issues;
 
     return e->status;
 }
@@ -489,18 +586,129 @@ std::vector<pipeline_status_t> list()
     result.reserve(g_pipelines.size());
     for (auto& e : g_pipelines)
     {
-        int total_issues = 0;
-        for (uint64_t aid : e->status.audit_ids)
+        if (!e->imported_snapshot)
         {
-            active_scanner::audit_status_t as;
-            if (active_scanner::get_status(aid, as))
-                total_issues += static_cast<int>(as.issues_found);
+            int total_issues = 0;
+            for (uint64_t aid : e->status.audit_ids)
+            {
+                active_scanner::audit_status_t as;
+                if (active_scanner::get_status(aid, as))
+                    total_issues += static_cast<int>(as.issues_found);
+            }
+            e->status.issues_found = total_issues;
         }
-        e->status.issues_found = total_issues;
         result.push_back(e->status);
     }
 
     return result;
+}
+
+nlohmann::json export_json()
+{
+    nlohmann::json pipelines = nlohmann::json::array();
+    uint64_t next_id = g_next_id.load(std::memory_order_acquire);
+
+    std::lock_guard<std::mutex> lk(g_mutex);
+    for (auto& e : g_pipelines)
+    {
+        if (!e)
+            continue;
+        if (!e->imported_snapshot)
+        {
+            int total_issues = 0;
+            for (uint64_t aid : e->status.audit_ids)
+            {
+                active_scanner::audit_status_t as;
+                if (active_scanner::get_status(aid, as))
+                    total_issues += static_cast<int>(as.issues_found);
+            }
+            e->status.issues_found = total_issues;
+        }
+        pipelines.push_back(status_to_json(e->status, e->imported_snapshot));
+    }
+
+    nlohmann::json root;
+    root["version"] = 1;
+    root["initialized"] = g_initialized;
+    root["next_id"] = next_id;
+    root["pipelines"] = std::move(pipelines);
+    return root;
+}
+
+bool import_json(const nlohmann::json& doc, bool replace_existing)
+{
+    if (!doc.is_object() || doc.value("version", 0) < 1 || !doc.contains("pipelines") || !doc["pipelines"].is_array())
+    {
+        diag::log_tagged_fmt("crawl_audit", "import_rejected_invalid_schema");
+        return false;
+    }
+
+    std::vector<std::unique_ptr<pipeline_entry_t>> imported;
+    imported.reserve(doc["pipelines"].size());
+    std::unordered_set<uint64_t> imported_ids;
+    uint64_t max_id = 0;
+
+    for (const auto& item : doc["pipelines"])
+    {
+        pipeline_status_t s;
+        if (!parse_status_json(item, s))
+        {
+            diag::log_tagged_fmt("crawl_audit", "import_rejected_invalid_pipeline");
+            return false;
+        }
+        if (imported_ids.find(s.id) != imported_ids.end())
+        {
+            diag::log_tagged_fmt("crawl_audit", "import_rejected_duplicate_pipeline id=%llu",
+                static_cast<unsigned long long>(s.id));
+            return false;
+        }
+        imported_ids.insert(s.id);
+        max_id = std::max(max_id, s.id);
+
+        auto entry = std::make_unique<pipeline_entry_t>();
+        entry->status = std::move(s);
+        entry->imported_snapshot = true;
+        imported.push_back(std::move(entry));
+    }
+
+    std::vector<std::unique_ptr<pipeline_entry_t>> entries_to_join;
+    {
+        std::lock_guard<std::mutex> lk(g_mutex);
+        if (replace_existing)
+            entries_to_join.swap(g_pipelines);
+        g_initialized = true;
+
+        std::unordered_set<uint64_t> used;
+        for (const auto& e : g_pipelines)
+        {
+            if (e)
+                used.insert(e->status.id);
+        }
+
+        for (auto& entry : imported)
+        {
+            if (!replace_existing && used.find(entry->status.id) != used.end())
+                entry->status.id = next_import_id_locked(used);
+            used.insert(entry->status.id);
+            max_id = std::max(max_id, entry->status.id);
+            g_pipelines.push_back(std::move(entry));
+        }
+
+        const uint64_t requested_next = doc.value("next_id", static_cast<uint64_t>(0));
+        uint64_t desired_next = std::max(max_id + 1, requested_next);
+        if (desired_next == 0)
+            desired_next = 1;
+        uint64_t current = g_next_id.load(std::memory_order_acquire);
+        while (current < desired_next && !g_next_id.compare_exchange_weak(current, desired_next))
+        {
+        }
+    }
+
+    stop_entries(entries_to_join);
+
+    diag::log_tagged_fmt("crawl_audit", "imported pipelines=%zu replace=%d",
+        imported_ids.size(), replace_existing ? 1 : 0);
+    return true;
 }
 
 }

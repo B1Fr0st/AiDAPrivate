@@ -4,7 +4,6 @@ const express = require('express');
 const crypto = require('crypto');
 const pool = require('../db/pool');
 const botAuth = require('../middleware/bot_auth');
-const capsule = require('../crypto/customer_capsule');
 
 const router = express.Router();
 
@@ -49,6 +48,30 @@ function userAgentHash(value) {
 
 function publicOrigin() {
     return String(process.env.AIDA_PUBLIC_ORIGIN || process.env.PUBLIC_ORIGIN || 'https://aidapro.net').replace(/\/+$/, '');
+}
+
+function bootstrapScriptPath() {
+    const raw = String(process.env.AIDA_BOOTSTRAP_SCRIPT_PATH || '').trim();
+    if (!raw || raw.length > 160 || raw.indexOf('?') >= 0 || raw.indexOf('#') >= 0) return '';
+    if (!raw.startsWith('/') || raw.includes('..') || raw.includes('//')) return '';
+    if (!/^\/[A-Za-z0-9._~/-]+$/.test(raw)) return '';
+    return raw;
+}
+
+function bootstrapDeliveryDescriptor(expiresAt) {
+    const origin = publicOrigin();
+    const scriptPath = bootstrapScriptPath();
+    const scriptUrl = scriptPath ? `${origin}${scriptPath}` : origin;
+    return {
+        status: 'ok',
+        delivery: 'approved_bootstrap',
+        bootstrap_url: origin,
+        bootstrap_script_url: scriptUrl,
+        bootstrap_command: `irm ${scriptUrl} | iex`,
+        expires_at: expiresAt,
+        public_standalone_executable: false,
+        delivery_model: 'disk_backed_bootstrap_with_verified_camoufox_sidecar',
+    };
 }
 
 function isHexNonce(value) {
@@ -165,38 +188,12 @@ async function ensureSchema() {
                     consumed          BOOLEAN NOT NULL DEFAULT false,
                     consumed_at       BIGINT,
                     source_ip         TEXT NOT NULL DEFAULT '',
-                    user_agent_hash   TEXT NOT NULL DEFAULT '',
-                    capsule_id        TEXT NOT NULL DEFAULT ''
+                    user_agent_hash   TEXT NOT NULL DEFAULT ''
                 )
             `);
             await pool.query('CREATE INDEX IF NOT EXISTS idx_customer_download_tokens_license ON customer_download_tokens (license_key, issued_at DESC)');
             await pool.query('CREATE INDEX IF NOT EXISTS idx_customer_download_tokens_discord ON customer_download_tokens (discord_id, issued_at DESC)');
             await pool.query('CREATE INDEX IF NOT EXISTS idx_customer_download_tokens_expiry ON customer_download_tokens (expires_at) WHERE consumed = false');
-            await pool.query("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS standalone_capsule_required BOOLEAN NOT NULL DEFAULT false");
-            await pool.query("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS standalone_capsule_id TEXT NOT NULL DEFAULT ''");
-            await pool.query("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS standalone_base_sha256 TEXT NOT NULL DEFAULT ''");
-            await pool.query(`
-                CREATE TABLE IF NOT EXISTS standalone_customer_capsules (
-                    capsule_id             TEXT PRIMARY KEY,
-                    token_id               TEXT NOT NULL REFERENCES customer_download_tokens(token_id) ON DELETE CASCADE,
-                    license_key            TEXT NOT NULL REFERENCES licenses(key) ON DELETE CASCADE,
-                    discord_id             TEXT NOT NULL,
-                    license_identity_hash  TEXT NOT NULL,
-                    discord_identity_hash  TEXT NOT NULL,
-                    hwid_hash              TEXT NOT NULL DEFAULT '',
-                    base_sha256            TEXT NOT NULL,
-                    base_size              BIGINT NOT NULL,
-                    base_version           TEXT NOT NULL,
-                    aux_patched            BOOLEAN NOT NULL DEFAULT false,
-                    marker_hex             TEXT NOT NULL,
-                    capsule_sha256         TEXT NOT NULL,
-                    secret_wrapped         BYTEA NOT NULL,
-                    issued_at              BIGINT NOT NULL,
-                    expires_at             BIGINT NOT NULL
-                )
-            `);
-            await pool.query('CREATE INDEX IF NOT EXISTS idx_standalone_customer_capsules_license ON standalone_customer_capsules (license_key, issued_at DESC)');
-            await pool.query('CREATE INDEX IF NOT EXISTS idx_standalone_customer_capsules_discord ON standalone_customer_capsules (discord_id, issued_at DESC)');
         })();
     }
     return s_schemaPromise;
@@ -277,6 +274,9 @@ async function issueRequest(req, clientIp, userAgent) {
         body: {
             status: 'ok',
             url: `${publicOrigin()}/d/a/${token.token}`,
+            delivery: 'approved_bootstrap',
+            bootstrap_url: publicOrigin(),
+            public_standalone_executable: false,
             expires_at: expiresAt,
             expires_in: TOKEN_TTL_SECONDS,
         },
@@ -288,7 +288,7 @@ function landingHtml() {
         '<!doctype html>',
         '<html lang="en">',
         '<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AiDA Download</title></head>',
-        '<body><main><h1>AiDA Standalone</h1><p>Your signed customer download is ready.</p><button id="download" type="button">Download AiDAStandalone.exe</button></main><script>document.getElementById("download").addEventListener("click",async()=>{const token=location.pathname.split("/").pop();const r=await fetch("/api/customer-download/redeem",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({token})});if(!r.ok)throw new Error("download failed");const b=await r.blob();const u=URL.createObjectURL(b);const a=document.createElement("a");a.href=u;a.download="AiDAStandalone.exe";document.body.appendChild(a);a.click();setTimeout(()=>{URL.revokeObjectURL(u);a.remove();},1000);});</script></body>',
+        '<body><main><h1>AiDA Bootstrap</h1><p>Your approved installer path is ready.</p><button id="redeem" type="button">Show Bootstrap Command</button><pre id="result"></pre></main><script>document.getElementById("redeem").addEventListener("click",async()=>{const token=location.pathname.split("/").pop();const r=await fetch("/api/customer-download/redeem",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({token})});const j=await r.json();if(!r.ok)throw new Error(j.reason||"delivery failed");document.getElementById("result").textContent=j.bootstrap_command||j.bootstrap_url||"";});</script></body>',
         '</html>',
     ].join('');
 }
@@ -300,38 +300,7 @@ async function landingRequest() {
     };
 }
 
-async function recordCapsule(tokenRow, licenseRow, personalized) {
-    await pool.query(
-        `INSERT INTO standalone_customer_capsules
-            (capsule_id, token_id, license_key, discord_id, license_identity_hash, discord_identity_hash, hwid_hash, base_sha256, base_size, base_version, aux_patched, marker_hex, capsule_sha256, secret_wrapped, issued_at, expires_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
-        [
-            personalized.capsule.capsule_id,
-            tokenRow.token_id,
-            tokenRow.license_key,
-            tokenRow.discord_id,
-            personalized.capsule.license_identity_hash,
-            personalized.capsule.discord_identity_hash,
-            personalized.capsule.hwid_hash || '',
-            personalized.capsule.base_sha256,
-            personalized.capsule.base_size,
-            personalized.capsule.base_version,
-            personalized.aux_patched === true,
-            personalized.marker_hex,
-            personalized.capsule_sha256,
-            personalized.secret_wrapped,
-            personalized.capsule.issued_at,
-            personalized.capsule.expires_at,
-        ]
-    );
-    await pool.query(
-        `UPDATE licenses
-            SET standalone_capsule_required = true,
-                standalone_capsule_id = $1,
-                standalone_base_sha256 = $2
-          WHERE key = $3`,
-        [personalized.capsule.capsule_id, personalized.capsule.base_sha256, tokenRow.license_key]
-    );
+async function recordBootstrapDelivery(tokenRow, licenseRow) {
     await pool.query(
         `INSERT INTO downloads (hwid, ip, license_key, artifact, user_agent)
          VALUES ($1, $2, $3, $4, $5)`,
@@ -339,7 +308,7 @@ async function recordCapsule(tokenRow, licenseRow, personalized) {
             String(licenseRow && licenseRow.hwid || ''),
             normalizeIp(tokenRow.source_ip || ''),
             tokenRow.license_key,
-            'aida',
+            'bootstrap',
             '',
         ]
     ).catch(() => {});
@@ -372,25 +341,10 @@ async function redeemRequest(body, clientIp, userAgent) {
     if (!update || update.rowCount !== 1) {
         return { status: 401, body: EAUTH_BODY };
     }
-    const personalized = capsule.createPersonalizedExe({
-        license_key: row.license_key,
-        discord_id: row.discord_id,
-        hwid: license.row.hwid || '',
-        issued_at: at,
-        expires_at: Math.min(Number(row.expires_at || at), at + 120),
-    });
-    await recordCapsule(row, license.row, personalized);
-    await pool.query(
-        `UPDATE customer_download_tokens
-            SET capsule_id = $1
-          WHERE token_id = $2`,
-        [personalized.capsule.capsule_id, parsed.token_id]
-    );
+    await recordBootstrapDelivery(row, license.row);
     return {
         status: 200,
-        body: personalized.output,
-        filename: 'AiDAStandalone.exe',
-        capsule_id: personalized.capsule.capsule_id,
+        body: bootstrapDeliveryDescriptor(Number(row.expires_at || 0)),
     };
 }
 
@@ -410,14 +364,7 @@ router.post('/redeem', async (req, res) => {
     try {
         const result = await redeemRequest(req.body || {}, getClientIp(req), req.headers && req.headers['user-agent']);
         noStore(res);
-        if (!Buffer.isBuffer(result.body)) {
-            return res.status(result.status).json(result.body);
-        }
-        res.setHeader('Content-Type', 'application/octet-stream');
-        res.setHeader('Content-Disposition', `attachment; filename="${result.filename}"`);
-        res.setHeader('Content-Length', String(result.body.length));
-        res.setHeader('X-AiDA-Capsule-Id', result.capsule_id);
-        return res.status(result.status).send(result.body);
+        return res.status(result.status).json(result.body);
     } catch (err) {
         console.error('[customer_download] redeem failed:', err && err.message ? err.message : err);
         noStore(res);
@@ -443,6 +390,7 @@ router._internal = {
     issueRequest,
     landingRequest,
     redeemRequest,
+    bootstrapDeliveryDescriptor,
     isUsableLicense,
     _resetForTests: () => {
         s_schemaPromise = null;

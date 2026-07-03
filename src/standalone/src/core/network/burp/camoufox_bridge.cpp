@@ -942,7 +942,6 @@ std::wstring current_dir_w()
 
 std::wstring normalized_lower_path(std::wstring value);
 bool path_under_root_w(const std::wstring& path, const std::wstring& root);
-bool fileless_camoufox_browser_path_allowed(const std::wstring& candidate);
 
 bool developer_repo_root_w(const std::wstring& dir)
 {
@@ -983,13 +982,9 @@ void append_developer_repo_roots(std::vector<std::wstring>& bases, const std::ws
 std::vector<std::wstring> runtime_base_dirs()
 {
     std::vector<std::wstring> bases;
-    const bool fileless = env_flag_enabled_a("AIDA_FILELESS_LAUNCH");
     std::wstring exe_dir = executable_dir_w();
-    if (!fileless)
-        append_developer_repo_roots(bases, exe_dir);
+    append_developer_repo_roots(bases, exe_dir);
     append_camoufox_sidecar_roots(bases);
-    if (fileless)
-        return bases;
     append_unique_path(bases, exe_dir);
     append_unique_path(bases, current_dir_w());
     append_unique_path(bases, parent_dir_w(exe_dir));
@@ -1007,13 +1002,9 @@ std::vector<std::wstring> runtime_base_dirs()
 std::vector<std::wstring> aida_runtime_base_dirs()
 {
     std::vector<std::wstring> bases;
-    const bool fileless = env_flag_enabled_a("AIDA_FILELESS_LAUNCH");
     std::wstring exe_dir = executable_dir_w();
-    if (!fileless)
-        append_developer_repo_roots(bases, exe_dir);
+    append_developer_repo_roots(bases, exe_dir);
     append_camoufox_sidecar_roots(bases);
-    if (fileless)
-        return bases;
     append_unique_path(bases, exe_dir);
     append_unique_path(bases, current_dir_w());
     append_unique_path(bases, parent_dir_w(exe_dir));
@@ -1059,12 +1050,6 @@ bool find_bundled_camoufox_executable(std::string& out_path)
         if (is_bundled_browser_dir(candidate_dir))
         {
             const std::wstring candidate = join_path_w(candidate_dir, L"camoufox.exe");
-            if (!fileless_camoufox_browser_path_allowed(candidate))
-            {
-                diag::log_tagged_fmt("camoufox", "bundled_browser_executable rejected_fileless_path path=%s base=%s",
-                    wide_to_utf8(candidate).c_str(), wide_to_utf8(base).c_str());
-                continue;
-            }
             out_path = wide_to_utf8(candidate);
             diag::log_tagged_fmt("camoufox", "bundled_browser_executable selected path=%s base=%s",
                 out_path.c_str(), wide_to_utf8(base).c_str());
@@ -1074,12 +1059,6 @@ bool find_bundled_camoufox_executable(std::string& out_path)
         if (is_bundled_browser_dir(candidate_dir))
         {
             const std::wstring candidate = join_path_w(candidate_dir, L"camoufox.exe");
-            if (!fileless_camoufox_browser_path_allowed(candidate))
-            {
-                diag::log_tagged_fmt("camoufox", "bundled_browser_executable rejected_fileless_path path=%s base=%s",
-                    wide_to_utf8(candidate).c_str(), wide_to_utf8(base).c_str());
-                continue;
-            }
             out_path = wide_to_utf8(candidate);
             diag::log_tagged_fmt("camoufox", "bundled_browser_executable selected path=%s base=%s",
                 out_path.c_str(), wide_to_utf8(base).c_str());
@@ -1089,12 +1068,6 @@ bool find_bundled_camoufox_executable(std::string& out_path)
         if (is_bundled_browser_dir(candidate_dir))
         {
             const std::wstring candidate = join_path_w(candidate_dir, L"camoufox.exe");
-            if (!fileless_camoufox_browser_path_allowed(candidate))
-            {
-                diag::log_tagged_fmt("camoufox", "bundled_browser_executable rejected_fileless_path path=%s base=%s",
-                    wide_to_utf8(candidate).c_str(), wide_to_utf8(base).c_str());
-                continue;
-            }
             out_path = wide_to_utf8(candidate);
             diag::log_tagged_fmt("camoufox", "bundled_browser_executable selected path=%s base=%s",
                 out_path.c_str(), wide_to_utf8(base).c_str());
@@ -1166,8 +1139,6 @@ bool resolve_reverse_mcp_executable(const launch_config_t& cfg, std::string& out
 
 bool should_prefer_developer_python_runtime(const launch_config_t& cfg)
 {
-    if (env_flag_enabled_a("AIDA_FILELESS_LAUNCH"))
-        return false;
     if (!cfg.server_executable.empty())
         return false;
     if (env_path_configured_a("AIDA_CAMOUFOX_MCP_EXECUTABLE"))
@@ -1563,35 +1534,6 @@ bool path_under_root_w(const std::wstring& path, const std::wstring& root)
     if (p.empty() || r.empty() || p.size() <= r.size())
         return false;
     return p.compare(0, r.size(), r) == 0 && p[r.size()] == L'\\';
-}
-
-bool fileless_camoufox_browser_path_allowed(const std::wstring& candidate)
-{
-    if (!env_flag_enabled_a("AIDA_FILELESS_LAUNCH"))
-        return true;
-    std::wstring aida_root = local_appdata_aida_root();
-    if (!aida_root.empty())
-    {
-        const std::wstring standalone_camoufox_root = join_path_w(join_path_w(aida_root, L"Standalone"), L"camoufox");
-        if (path_under_root_w(candidate, join_path_w(standalone_camoufox_root, L"current")) ||
-            path_under_root_w(candidate, join_path_w(standalone_camoufox_root, L"staging")) ||
-            path_under_root_w(candidate, join_path_w(standalone_camoufox_root, L"backup")))
-            return true;
-        const std::wstring legacy_camoufox_root = join_path_w(aida_root, L"camoufox");
-        if (path_under_root_w(candidate, join_path_w(legacy_camoufox_root, L"current")) ||
-            path_under_root_w(candidate, join_path_w(legacy_camoufox_root, L"staging")) ||
-            path_under_root_w(candidate, join_path_w(legacy_camoufox_root, L"backup")))
-            return true;
-    }
-    std::vector<wchar_t> temp(32768);
-    DWORD temp_len = GetTempPathW(static_cast<DWORD>(temp.size()), temp.data());
-    if (temp_len == 0 || temp_len >= static_cast<DWORD>(temp.size()))
-        return false;
-    const std::wstring temp_root(temp.data(), temp_len);
-    const std::wstring camoufox_root = join_path_w(join_path_w(temp_root, L"AiDA"), L"camoufox");
-    return path_under_root_w(candidate, join_path_w(camoufox_root, L"current")) ||
-        path_under_root_w(candidate, join_path_w(camoufox_root, L"staging")) ||
-        path_under_root_w(candidate, join_path_w(camoufox_root, L"backup"));
 }
 
 std::wstring camoufox_profile_root_w()
@@ -7308,7 +7250,6 @@ bool start_bridge(const launch_config_t& cfg)
     publish_state(bridge_state_t::starting, std::string());
 
     std::string python_path = effective_cfg.python_executable;
-    const bool fileless_launch = env_flag_enabled_a("AIDA_FILELESS_LAUNCH");
     const bool testlab_launch = test_lab_launch_fail_fast_enabled(effective_cfg);
     const bool explicit_python_cfg = !effective_cfg.python_executable.empty();
     const bool explicit_python_env = env_path_configured_a("AIDA_CAMOUFOX_PYTHON");
@@ -7324,8 +7265,7 @@ bool start_bridge(const launch_config_t& cfg)
     bool developer_python_ready = !python_path.empty();
     DWORD server_attr_gle = ERROR_SUCCESS;
     const DWORD server_attr = file_attr_for_log(server_executable, server_attr_gle);
-    diag::log_tagged_fmt("camoufox", "bridge_runtime_select phase=start_bridge fileless=%d testlab_fast_probe=%d explicit_python_cfg=%d explicit_python_env=%d force_python_env=%d explicit_server_cfg=%d explicit_server_env=%d bundled_exe_available=%d bundled_exe=%s resolved_exe_available=%d resolved_exe_attr=0x%08lX resolved_exe_gle=%lu prefer_python=%d initial_python=%s resolved_exe=%s",
-        fileless_launch ? 1 : 0,
+    diag::log_tagged_fmt("camoufox", "bridge_runtime_select phase=start_bridge testlab_fast_probe=%d explicit_python_cfg=%d explicit_python_env=%d force_python_env=%d explicit_server_cfg=%d explicit_server_env=%d bundled_exe_available=%d bundled_exe=%s resolved_exe_available=%d resolved_exe_attr=0x%08lX resolved_exe_gle=%lu prefer_python=%d initial_python=%s resolved_exe=%s",
         testlab_launch ? 1 : 0,
         explicit_python_cfg ? 1 : 0,
         explicit_python_env ? 1 : 0,
@@ -7368,10 +7308,9 @@ bool start_bridge(const launch_config_t& cfg)
         return false;
     }
 
-    diag::log_tagged_fmt("camoufox", "start_bridge server_executable_resolve final_mode=%s use_exe=%d fileless=%d testlab_fast_probe=%d prefer_python=%d python_ready=%d explicit_python_cfg=%d explicit_python_env=%d explicit_server_cfg=%d explicit_server_env=%d bundled_exe_available=%d python=%s path=%s",
+    diag::log_tagged_fmt("camoufox", "start_bridge server_executable_resolve final_mode=%s use_exe=%d testlab_fast_probe=%d prefer_python=%d python_ready=%d explicit_python_cfg=%d explicit_python_env=%d explicit_server_cfg=%d explicit_server_env=%d bundled_exe_available=%d python=%s path=%s",
         runtime_mode_name(use_server_executable),
         static_cast<int>(use_server_executable),
-        fileless_launch ? 1 : 0,
         testlab_launch ? 1 : 0,
         prefer_developer_python ? 1 : 0,
         developer_python_ready ? 1 : 0,
@@ -7383,21 +7322,12 @@ bool start_bridge(const launch_config_t& cfg)
         python_path.empty() ? "<empty>" : python_path.c_str(),
         server_executable.empty() ? "<empty>" : server_executable.c_str());
 
-    if (fileless_launch && !use_server_executable)
-    {
-        sg().last_error = "fileless Camoufox launch requires frozen reverse-MCP executable sidecar";
-        sg().state = bridge_state_t::error;
-        publish_state(bridge_state_t::error, sg().last_error);
-        diag::log_tagged_fmt("camoufox", "start_bridge fileless_missing_reverse_mcp_executable");
-        return false;
-    }
     if (!use_server_executable && !prefer_developer_python)
     {
         sg().last_error = "Camoufox reverse-MCP frozen executable is required unless Python runtime is explicitly configured";
         sg().state = bridge_state_t::error;
         publish_state(bridge_state_t::error, sg().last_error);
-        diag::log_tagged_fmt("camoufox", "start_bridge implicit_python_disabled fileless=%d bundled_exe_available=%d resolved_exe=%s",
-            fileless_launch ? 1 : 0,
+        diag::log_tagged_fmt("camoufox", "start_bridge implicit_python_disabled bundled_exe_available=%d resolved_exe=%s",
             bundled_server_available ? 1 : 0,
             server_executable.empty() ? "<empty>" : server_executable.c_str());
         return false;
@@ -7443,16 +7373,6 @@ bool start_bridge(const launch_config_t& cfg)
         std::string bundled_browser;
         if (find_bundled_camoufox_executable(bundled_browser))
             effective_cfg.browser_executable = bundled_browser;
-    }
-    if (fileless_launch && !effective_cfg.browser_executable.empty() &&
-        !fileless_camoufox_browser_path_allowed(utf8_to_wide(effective_cfg.browser_executable)))
-    {
-        sg().last_error = "fileless Camoufox launch requires the browser sidecar under %LOCALAPPDATA%\\AiDA\\Standalone\\camoufox\\current or legacy temp staging roots";
-        sg().state = bridge_state_t::error;
-        diag::log_tagged_fmt("camoufox", "start_bridge browser_rejected_fileless_path path=%s",
-            effective_cfg.browser_executable.c_str());
-        publish_state(bridge_state_t::error, sg().last_error);
-        return false;
     }
     DWORD browser_attr = INVALID_FILE_ATTRIBUTES;
     if (!effective_cfg.browser_executable.empty())
@@ -9728,7 +9648,6 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
     if (stale_reuse_client)
         stale_reuse_client->disconnect();
     std::string python_path = effective_cfg.python_executable;
-    const bool fileless_launch = env_flag_enabled_a("AIDA_FILELESS_LAUNCH");
     const bool testlab_launch = test_lab_launch_fail_fast_enabled(effective_cfg);
     const bool explicit_python_cfg = !effective_cfg.python_executable.empty();
     const bool explicit_python_env = env_path_configured_a("AIDA_CAMOUFOX_PYTHON");
@@ -9743,9 +9662,8 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
     bool developer_python_ready = !python_path.empty();
     DWORD server_attr_gle = ERROR_SUCCESS;
     const DWORD server_attr = file_attr_for_log(server_executable, server_attr_gle);
-    diag::log_tagged_fmt("camoufox", "bridge_runtime_select phase=managed_start session_id=%s fileless=%d testlab_fast_probe=%d explicit_python_cfg=%d explicit_python_env=%d force_python_env=%d explicit_server_cfg=%d explicit_server_env=%d bundled_exe_available=%d bundled_exe=%s resolved_exe_available=%d resolved_exe_attr=0x%08lX resolved_exe_gle=%lu prefer_python=%d initial_python=%s resolved_exe=%s",
+    diag::log_tagged_fmt("camoufox", "bridge_runtime_select phase=managed_start session_id=%s testlab_fast_probe=%d explicit_python_cfg=%d explicit_python_env=%d force_python_env=%d explicit_server_cfg=%d explicit_server_env=%d bundled_exe_available=%d bundled_exe=%s resolved_exe_available=%d resolved_exe_attr=0x%08lX resolved_exe_gle=%lu prefer_python=%d initial_python=%s resolved_exe=%s",
         sid.c_str(),
-        fileless_launch ? 1 : 0,
         testlab_launch ? 1 : 0,
         explicit_python_cfg ? 1 : 0,
         explicit_python_env ? 1 : 0,
@@ -9776,11 +9694,10 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
     {
         developer_python_ready = !python_path.empty();
     }
-    diag::log_tagged_fmt("camoufox", "managed_start server_executable_resolve session_id=%s final_mode=%s use_exe=%d fileless=%d testlab_fast_probe=%d prefer_python=%d python_ready=%d explicit_python_cfg=%d explicit_python_env=%d explicit_server_cfg=%d explicit_server_env=%d bundled_exe_available=%d python=%s path=%s",
+    diag::log_tagged_fmt("camoufox", "managed_start server_executable_resolve session_id=%s final_mode=%s use_exe=%d testlab_fast_probe=%d prefer_python=%d python_ready=%d explicit_python_cfg=%d explicit_python_env=%d explicit_server_cfg=%d explicit_server_env=%d bundled_exe_available=%d python=%s path=%s",
         sid.c_str(),
         runtime_mode_name(use_server_executable),
         static_cast<int>(use_server_executable),
-        fileless_launch ? 1 : 0,
         testlab_launch ? 1 : 0,
         prefer_developer_python ? 1 : 0,
         developer_python_ready ? 1 : 0,
@@ -9792,22 +9709,13 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
         python_path.empty() ? "<empty>" : python_path.c_str(),
         server_executable.empty() ? "<empty>" : server_executable.c_str());
 
-    if (fileless_launch && !use_server_executable)
-    {
-        std::lock_guard<std::recursive_mutex> lk(session->mtx);
-        session->state = bridge_state_t::error;
-        session->last_error = "fileless Camoufox launch requires frozen reverse-MCP executable sidecar";
-        diag::log_tagged_fmt("camoufox", "managed_start fileless_missing_reverse_mcp_executable session_id=%s", sid.c_str());
-        return false;
-    }
     if (!use_server_executable && !prefer_developer_python)
     {
         std::lock_guard<std::recursive_mutex> lk(session->mtx);
         session->state = bridge_state_t::error;
         session->last_error = "Camoufox reverse-MCP frozen executable is required unless Python runtime is explicitly configured";
-        diag::log_tagged_fmt("camoufox", "managed_start implicit_python_disabled session_id=%s fileless=%d bundled_exe_available=%d resolved_exe=%s",
+        diag::log_tagged_fmt("camoufox", "managed_start implicit_python_disabled session_id=%s bundled_exe_available=%d resolved_exe=%s",
             sid.c_str(),
-            fileless_launch ? 1 : 0,
             bundled_server_available ? 1 : 0,
             server_executable.empty() ? "<empty>" : server_executable.c_str());
         return false;
@@ -9863,16 +9771,6 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
         std::string bundled_browser;
         if (find_bundled_camoufox_executable(bundled_browser))
             effective_cfg.browser_executable = bundled_browser;
-    }
-    if (fileless_launch && !effective_cfg.browser_executable.empty() &&
-        !fileless_camoufox_browser_path_allowed(utf8_to_wide(effective_cfg.browser_executable)))
-    {
-        std::lock_guard<std::recursive_mutex> lk(session->mtx);
-        session->state = bridge_state_t::error;
-        session->last_error = "fileless Camoufox launch requires the browser sidecar under %LOCALAPPDATA%\\AiDA\\Standalone\\camoufox\\current or legacy temp staging roots";
-        diag::log_tagged_fmt("camoufox", "managed_start browser_rejected_fileless_path session_id=%s path=%s",
-            sid.c_str(), effective_cfg.browser_executable.c_str());
-        return false;
     }
     DWORD browser_attr = INVALID_FILE_ATTRIBUTES;
     if (!effective_cfg.browser_executable.empty())

@@ -9,6 +9,8 @@
 #include "burp_mitm_mcp.hpp"
 
 #include "../cert_generator.hpp"
+#include "../conn_pool.hpp"
+#include "../content_view.hpp"
 #include "../flow_store.hpp"
 #include "../map_resource.hpp"
 #include "../mitm_proxy.hpp"
@@ -23,7 +25,6 @@
 #include <atomic>
 #include <cctype>
 #include <cstdint>
-#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -76,6 +77,12 @@ struct sticky_session_t {
     bool auto_run_macros = true;
 };
 
+struct pac_state_t {
+    bool enabled = false;
+    std::string script;
+    bool fail_closed = true;
+};
+
 struct plan2_state_t {
     std::mutex mutex;
     std::string mode = "regular";
@@ -85,6 +92,7 @@ struct plan2_state_t {
     std::vector<listener_t> listeners;
     proxy_auth_t auth;
     sticky_session_t sticky;
+    pac_state_t pac;
     std::atomic<uint64_t> replay_batches{0};
     std::atomic<uint64_t> replay_requests{0};
     std::atomic<uint64_t> replay_success{0};
@@ -218,6 +226,17 @@ mitm_proxy::proxy_mode_t proxy_mode_from_string(const std::string& mode)
     return mitm_proxy::proxy_mode_t::regular;
 }
 
+const char* proxy_mode_to_string(mitm_proxy::proxy_mode_t mode)
+{
+    switch (mode) {
+    case mitm_proxy::proxy_mode_t::reverse: return "reverse";
+    case mitm_proxy::proxy_mode_t::transparent: return "transparent";
+    case mitm_proxy::proxy_mode_t::socks5: return "socks5";
+    case mitm_proxy::proxy_mode_t::regular: return "regular";
+    }
+    return "regular";
+}
+
 int tls_version_from_string(const std::string& v)
 {
     if (v == "tls1.0") return TLS1_VERSION;
@@ -240,16 +259,19 @@ std::string join_colon(const std::vector<std::string>& values)
     return out.str();
 }
 
-std::vector<std::string> json_string_array(const json& j)
+bool json_string_array_strict(const json& j, std::vector<std::string>& out)
 {
-    std::vector<std::string> out;
     if (!j.is_array())
-        return out;
+        return false;
+    out.clear();
     for (const auto& item : j) {
-        if (item.is_string())
-            out.push_back(item.get<std::string>());
+        if (!item.is_string())
+            return false;
+        std::string value = item.get<std::string>();
+        if (!value.empty())
+            out.push_back(std::move(value));
     }
-    return out;
+    return true;
 }
 
 std::string header_value(const std::vector<protocol_parser::http_header>& headers, const std::string& name)
@@ -262,75 +284,6 @@ std::vector<uint8_t> selected_body(const mitm_proxy::http_exchange& e, const std
     if (side == "request")
         return e.request.body;
     return e.response.body;
-}
-
-std::string selected_raw(const mitm_proxy::http_exchange& e, const std::string& side)
-{
-    const auto& bytes = (side == "request") ? e.raw_request : e.raw_response;
-    return std::string(bytes.begin(), bytes.end());
-}
-
-std::string body_as_text(const std::vector<uint8_t>& body)
-{
-    return std::string(body.begin(), body.end());
-}
-
-std::string hex_dump(const std::vector<uint8_t>& body)
-{
-    std::ostringstream out;
-    out << std::hex << std::setfill('0');
-    for (size_t i = 0; i < body.size(); i += 16) {
-        out << std::setw(8) << i << "  ";
-        for (size_t j = 0; j < 16; ++j) {
-            if (i + j < body.size())
-                out << std::setw(2) << static_cast<unsigned>(body[i + j]) << ' ';
-            else
-                out << "   ";
-        }
-        out << ' ';
-        for (size_t j = 0; j < 16 && i + j < body.size(); ++j) {
-            const uint8_t c = body[i + j];
-            out << (c >= 0x20 && c <= 0x7E ? static_cast<char>(c) : '.');
-        }
-        if (i + 16 < body.size())
-            out << '\n';
-    }
-    return out.str();
-}
-
-std::string format_xml(const std::string& text)
-{
-    std::ostringstream out;
-    int depth = 0;
-    for (size_t i = 0; i < text.size();) {
-        const size_t lt = text.find('<', i);
-        if (lt == std::string::npos) {
-            const std::string tail = text.substr(i);
-            if (!tail.empty())
-                out << std::string(static_cast<size_t>(std::max(depth, 0)) * 2, ' ') << tail;
-            break;
-        }
-        if (lt > i) {
-            const std::string value = text.substr(i, lt - i);
-            if (value.find_first_not_of(" \t\r\n") != std::string::npos)
-                out << std::string(static_cast<size_t>(std::max(depth, 0)) * 2, ' ') << value << '\n';
-        }
-        const size_t gt = text.find('>', lt);
-        if (gt == std::string::npos) {
-            out << text.substr(lt);
-            break;
-        }
-        const std::string tag = text.substr(lt, gt - lt + 1);
-        const bool closing = tag.size() > 1 && tag[1] == '/';
-        const bool self_closing = tag.size() > 2 && tag[tag.size() - 2] == '/';
-        if (closing && depth > 0)
-            --depth;
-        out << std::string(static_cast<size_t>(std::max(depth, 0)) * 2, ' ') << tag << '\n';
-        if (!closing && !self_closing && tag.size() > 1 && tag[1] != '?' && tag[1] != '!')
-            ++depth;
-        i = gt + 1;
-    }
-    return out.str();
 }
 
 std::vector<mitm_proxy::http_exchange> flows_from_params_or_file(const json& p, std::string& error)
@@ -432,6 +385,7 @@ json state_summary_unlocked()
     out["map_remote"] = std::move(remote_maps);
     out["proxy_auth"] = {{"enabled", st.auth.enabled}, {"realm", st.auth.realm}, {"username_set", !st.auth.username.empty()}, {"password_hash_set", !st.auth.password_hash.empty()}};
     out["sticky_session"] = {{"enabled", st.sticky.enabled}, {"rule_id", st.sticky.rule_id}, {"auto_run_macros", st.sticky.auto_run_macros}};
+    out["pac"] = {{"enabled", st.pac.enabled}, {"fail_closed", st.pac.fail_closed}, {"script_length", st.pac.script.size()}, {"script_sha256", sha256_hex(st.pac.script)}};
     out["replay_counters"] = {{"batches", st.replay_batches.load()}, {"requests", st.replay_requests.load()}, {"success", st.replay_success.load()}, {"errors", st.replay_errors.load()}};
     return out;
 }
@@ -478,13 +432,40 @@ tool_result_t tool_proxy_start_listener(const json& p)
         return tool_result_t::error("bind_addr_must_be_loopback");
     if (!p.contains("bind_port") || !json_u16(p["bind_port"], listener.bind_port))
         return tool_result_t::error("invalid_bind_port");
-    listener.mode = p.value("mode", std::string("regular"));
+    {
+        auto& st = state();
+        std::lock_guard<std::mutex> lock(st.mutex);
+        listener.mode = p.value("mode", st.mode);
+    }
     if (!valid_mode(listener.mode))
         return tool_result_t::error("invalid_mode");
     listener.decode_tls = p.value("decode_tls", true);
     listener.enable_h2 = p.value("enable_h2", true);
     if (p.contains("upstream") && !upstream_from_json(p["upstream"], listener.upstream))
         return tool_result_t::error("invalid_upstream");
+    pac_state_t inline_pac;
+    bool has_inline_pac_enabled = false;
+    bool has_inline_pac_script = false;
+    bool has_inline_pac_fail_closed = false;
+    if (p.contains("enable_pac")) {
+        if (!p["enable_pac"].is_boolean())
+            return tool_result_t::error("invalid_enable_pac");
+        inline_pac.enabled = p["enable_pac"].get<bool>();
+        has_inline_pac_enabled = true;
+    }
+    if (p.contains("pac_script")) {
+        if (!p["pac_script"].is_string())
+            return tool_result_t::error("invalid_pac_script");
+        inline_pac.script = p["pac_script"].get<std::string>();
+        inline_pac.enabled = true;
+        has_inline_pac_script = true;
+    }
+    if (p.contains("pac_fail_closed")) {
+        if (!p["pac_fail_closed"].is_boolean())
+            return tool_result_t::error("invalid_pac_fail_closed");
+        inline_pac.fail_closed = p["pac_fail_closed"].get<bool>();
+        has_inline_pac_fail_closed = true;
+    }
     reverse_target_t inline_reverse;
     if (listener.mode == "reverse" && p.contains("reverse_target")) {
         if (!p["reverse_target"].is_object())
@@ -510,6 +491,20 @@ tool_result_t tool_proxy_start_listener(const json& p)
         cfg.require_proxy_auth = st.auth.enabled;
         cfg.proxy_auth_username = st.auth.username;
         cfg.proxy_auth_password = st.auth.password;
+        pac_state_t pac = st.pac;
+        if (has_inline_pac_enabled)
+            pac.enabled = inline_pac.enabled;
+        if (has_inline_pac_script) {
+            pac.script = inline_pac.script;
+            pac.enabled = true;
+        }
+        if (has_inline_pac_fail_closed)
+            pac.fail_closed = inline_pac.fail_closed;
+        cfg.enable_pac = pac.enabled;
+        cfg.pac_script = pac.script;
+        cfg.pac_fail_closed = pac.fail_closed;
+        if (cfg.enable_pac && cfg.pac_script.empty())
+            return tool_result_t::error("missing_pac_script");
         if (listener.mode == "reverse") {
             cfg.reverse_target_host = inline_reverse.host.empty() ? st.reverse_target.host : inline_reverse.host;
             cfg.reverse_target_port = inline_reverse.port == 0 ? st.reverse_target.port : inline_reverse.port;
@@ -541,6 +536,88 @@ tool_result_t tool_proxy_start_listener(const json& p)
     return tool_result_t::ok(out);
 }
 
+tool_result_t tool_proxy_stop_listener(const json& p)
+{
+    uint64_t listener_id = 0;
+    if (!p.contains("listener_id") || !json_u64(p["listener_id"], listener_id) || listener_id == 0)
+        return tool_result_t::error("missing_listener_id");
+    if (!mitm_proxy::stop_listener(listener_id))
+        return tool_result_t::error("listener_stop_failed");
+    auto& st = state();
+    std::lock_guard<std::mutex> lock(st.mutex);
+    if (listener_id == 1) {
+        st.listeners.clear();
+    } else {
+        auto it = std::remove_if(st.listeners.begin(), st.listeners.end(), [listener_id](const listener_t& item) {
+            return item.id == listener_id;
+        });
+        if (it != st.listeners.end())
+            st.listeners.erase(it, st.listeners.end());
+    }
+    json out = state_summary_unlocked();
+    out["listener_id"] = listener_id;
+    out["core_proxy_running"] = mitm_proxy::is_running();
+    return tool_result_t::ok(out);
+}
+
+tool_result_t tool_proxy_list_listeners(const json&)
+{
+    json listeners = json::array();
+    for (const auto& item : mitm_proxy::get_listeners()) {
+        listeners.push_back({
+            {"id", item.id},
+            {"running", item.running},
+            {"accepted", item.accepted},
+            {"bind_addr", item.config.bind_addr},
+            {"bind_port", item.config.bind_port},
+            {"decode_tls", item.config.decode_tls},
+            {"enable_h2", item.config.enable_h2},
+            {"enable_websocket", item.config.enable_websocket},
+            {"mode", proxy_mode_to_string(item.config.mode)},
+            {"reverse_target_host", item.config.reverse_target_host},
+            {"reverse_target_port", item.config.reverse_target_port},
+            {"use_wfp_redirect", item.config.use_wfp_redirect},
+            {"proxy_auth_required", item.config.require_proxy_auth},
+            {"pac_enabled", item.config.enable_pac},
+            {"pac_fail_closed", item.config.pac_fail_closed}
+        });
+    }
+    json out = state_summary();
+    out["core_listeners"] = std::move(listeners);
+    return tool_result_t::ok(out);
+}
+
+tool_result_t tool_proxy_set_pac(const json& p)
+{
+    const bool has_enabled = p.contains("enabled");
+    const bool has_fail_closed = p.contains("fail_closed");
+    const bool has_script = p.contains("script");
+    if (has_enabled && !p["enabled"].is_boolean())
+        return tool_result_t::error("invalid_enabled");
+    if (has_fail_closed && !p["fail_closed"].is_boolean())
+        return tool_result_t::error("invalid_fail_closed");
+    if (p.contains("script")) {
+        if (!p["script"].is_string())
+            return tool_result_t::error("invalid_script");
+    }
+    auto& st = state();
+    std::lock_guard<std::mutex> lock(st.mutex);
+    pac_state_t pac = st.pac;
+    if (has_enabled)
+        pac.enabled = p["enabled"].get<bool>();
+    if (has_fail_closed)
+        pac.fail_closed = p["fail_closed"].get<bool>();
+    if (has_script)
+        pac.script = p["script"].get<std::string>();
+    if (pac.enabled && pac.script.empty())
+        return tool_result_t::error("missing_script");
+    st.pac = std::move(pac);
+    json out = state_summary_unlocked();
+    out["applies_to_new_listeners"] = true;
+    out["core_proxy_running"] = mitm_proxy::is_running();
+    return tool_result_t::ok(out);
+}
+
 tool_result_t tool_proxy_set_tls_policy(const json& p)
 {
     tls_policy::host_policy_t policy;
@@ -561,11 +638,15 @@ tool_result_t tool_proxy_set_tls_policy(const json& p)
     policy.min_tls_version = tls_version_from_string(min_version);
     policy.max_tls_version = max_version.empty() ? 0 : tls_version_from_string(max_version);
     policy.ignore_cert_errors = p.value("ignore_cert_errors", false);
-    const auto cipher_suites = p.contains("cipher_suites") ? json_string_array(p["cipher_suites"]) : std::vector<std::string>();
+    std::vector<std::string> cipher_suites;
+    if (p.contains("cipher_suites") && !json_string_array_strict(p["cipher_suites"], cipher_suites))
+        return tool_result_t::error("invalid_cipher_suites");
     policy.cipher_list = join_colon(cipher_suites);
     policy.ciphersuites = policy.cipher_list;
-    if (p.contains("upstream_cert_sha256_pins"))
-        policy.upstream_cert_sha256_pins = json_string_array(p["upstream_cert_sha256_pins"]);
+    if (p.contains("alpn_protocols") && !json_string_array_strict(p["alpn_protocols"], policy.alpn_protocols))
+        return tool_result_t::error("invalid_alpn_protocols");
+    if (p.contains("upstream_cert_sha256_pins") && !json_string_array_strict(p["upstream_cert_sha256_pins"], policy.upstream_cert_sha256_pins))
+        return tool_result_t::error("invalid_upstream_cert_sha256_pins");
     if (!tls_policy::add_policy(policy))
         return tool_result_t::error("tls_policy_rejected");
     cert_generator::clear_ssl_ctx_cache();
@@ -691,7 +772,10 @@ tool_result_t tool_server_replay_start(const json& p)
         return tool_result_t::error("selected_flows_not_found");
     server_replay::load_options options;
     options.replace_existing = true;
-    options.exact_body = match_by == "full_url";
+    options.match_method = match_by == "host_path_method" || match_by == "full_url";
+    options.match_scheme = match_by == "full_url";
+    options.match_port = match_by == "full_url";
+    options.exact_body = p.value("exact_body", false);
     const size_t added = server_replay::load_from_flows(flows, options);
     server_replay::set_enabled(added > 0);
     json out = state_summary();
@@ -786,28 +870,48 @@ tool_result_t tool_content_view_render(const json& p)
         return tool_result_t::error("flow_not_found");
     const auto& flow = flows.front();
     const auto body = selected_body(flow, side);
+    const auto& headers = side == "request" ? flow.request.headers : flow.response.headers;
+    const auto views = network_content_view::build_views(headers, body);
+    if (view != "raw" && view != "json" && view != "xml" && view != "hex" &&
+        view != "form" && view != "protobuf" && view != "image")
+        return tool_result_t::error("invalid_view");
+    auto kind_from_string = [](const std::string& value) {
+        if (value == "json") return network_content_view::view_kind_t::json;
+        if (value == "xml") return network_content_view::view_kind_t::xml;
+        if (value == "hex") return network_content_view::view_kind_t::hex;
+        if (value == "form") return network_content_view::view_kind_t::form;
+        if (value == "protobuf") return network_content_view::view_kind_t::protobuf;
+        if (value == "image") return network_content_view::view_kind_t::image;
+        return network_content_view::view_kind_t::raw;
+    };
+    const auto wanted_kind = kind_from_string(view);
     std::string rendered;
     std::string encoding = "utf-8";
-    if (view == "raw") {
-        rendered = selected_raw(flow, side);
-    } else if (view == "json") {
-        try {
-            rendered = json::parse(body_as_text(body)).dump(2);
-        } catch (const std::exception& e) {
-            return tool_result_t::error(std::string("invalid_json: ") + e.what());
+    std::string meta;
+    bool found = false;
+    for (const auto& candidate : views) {
+        if (candidate.kind != wanted_kind)
+            continue;
+        found = true;
+        rendered = candidate.text;
+        meta = candidate.meta;
+        break;
+    }
+    if (!found) {
+        if (view == "image" || view == "protobuf") {
+            rendered = base64_encode(body);
+            encoding = "base64";
+            meta = "raw";
+            found = true;
         }
-    } else if (view == "xml") {
-        rendered = format_xml(body_as_text(body));
-    } else if (view == "hex") {
-        rendered = hex_dump(body);
+    }
+    if (!found)
+        return tool_result_t::error("view_not_available");
+    if (view == "hex")
         encoding = "hex-dump";
-    } else if (view == "form") {
-        rendered = body_as_text(body);
-    } else if (view == "image" || view == "protobuf") {
+    if (view == "image") {
         rendered = base64_encode(body);
         encoding = "base64";
-    } else {
-        return tool_result_t::error("invalid_view");
     }
     json out;
     out["flow_id"] = flow_id;
@@ -817,6 +921,7 @@ tool_result_t tool_content_view_render(const json& p)
     out["length"] = rendered.size();
     out["body_length"] = body.size();
     out["content_type"] = side == "request" ? header_value(flow.request.headers, "Content-Type") : header_value(flow.response.headers, "Content-Type");
+    out["meta"] = meta;
     out["rendered"] = rendered;
     return tool_result_t::ok(out);
 }
@@ -851,6 +956,29 @@ tool_result_t tool_flow_tag(const json& p)
     out["tags"] = flows.front().tags;
     if (p.contains("color") && p["color"].is_string())
         out["color"] = p["color"].get<std::string>();
+    return tool_result_t::ok(out);
+}
+
+tool_result_t tool_flow_note(const json& p)
+{
+    uint64_t flow_id = 0;
+    if (!p.contains("flow_id") || !json_u64(p["flow_id"], flow_id) || flow_id == 0)
+        return tool_result_t::error("missing_flow_id");
+    const std::string action = p.value("action", std::string("get"));
+    if (action == "set") {
+        if (!p.contains("notes") || !p["notes"].is_string())
+            return tool_result_t::error("missing_notes");
+        if (!mitm_proxy::set_exchange_notes(flow_id, p["notes"].get<std::string>()))
+            return tool_result_t::error("flow_not_found");
+    } else if (action != "get") {
+        return tool_result_t::error("invalid_action");
+    }
+    auto flows = mitm_proxy::get_history_by_ids({flow_id});
+    if (flows.empty())
+        return tool_result_t::error("flow_not_found");
+    json out;
+    out["flow_id"] = flow_id;
+    out["notes"] = flows.front().notes;
     return tool_result_t::ok(out);
 }
 
@@ -891,6 +1019,8 @@ tool_result_t tool_connection_pool_stats(const json&)
     out["failed_reuse"] = pool.failed_reuse;
     out["tcp_reused"] = pool.tcp_reused;
     out["tls_reused"] = pool.tls_reused;
+    out["reuse_active"] = false;
+    out["pool_contract"] = "disabled_no_live_socket_reuse_until_response_ownership_is_promoted";
     out["max_idle_total"] = pool.max_idle_total;
     out["max_idle_per_key"] = pool.max_idle_per_key;
     out["idle_timeout_ms"] = pool.idle_timeout_ms;
@@ -1019,18 +1149,22 @@ void register_one(mcp_standalone::server_t& srv, tool_def_t tool)
 void register_mitm_plan2_tools(mcp_standalone::server_t& srv)
 {
     register_one(srv, make_tool("proxy_set_mode", "Switch the MITM proxy operating mode control state.", {{"mode", "string", "regular|reverse|transparent|socks5", true}, {"reverse_target", "object", "Reverse target object with host and port.", false}, {"transparent_port", "number", "Transparent redirect target port.", false}}, false, tool_proxy_set_mode));
-    register_one(srv, make_tool("proxy_start_listener", "Start or register an MITM proxy listener with independent configuration.", {{"bind_addr", "string", "Loopback bind address.", false}, {"bind_port", "number", "Bind port.", true}, {"mode", "string", "regular|reverse|transparent|socks5", false}, {"decode_tls", "boolean", "Decode TLS traffic.", false}, {"enable_h2", "boolean", "Enable HTTP/2.", false}, {"upstream", "object", "Optional upstream proxy configuration.", false}}, false, tool_proxy_start_listener));
-    register_one(srv, make_tool("proxy_set_tls_policy", "Set per-host TLS version and cipher policy for upstream connections.", {{"host_pattern", "string", "Regex host pattern.", true}, {"min_version", "string", "tls1.0|tls1.1|tls1.2|tls1.3", false}, {"max_version", "string", "Optional max TLS version.", false}, {"cipher_suites", "array", "OpenSSL cipher suite names.", false}, {"ignore_cert_errors", "boolean", "Ignore upstream certificate errors.", false}}, false, tool_proxy_set_tls_policy));
+    register_one(srv, make_tool("proxy_start_listener", "Start or register an MITM proxy listener with independent configuration.", {{"bind_addr", "string", "Loopback bind address.", false}, {"bind_port", "number", "Bind port.", true}, {"mode", "string", "regular|reverse|transparent|socks5", false}, {"decode_tls", "boolean", "Decode TLS traffic.", false}, {"enable_h2", "boolean", "Enable HTTP/2.", false}, {"upstream", "object", "Optional upstream proxy configuration.", false}, {"enable_pac", "boolean", "Enable PAC routing for this listener.", false}, {"pac_script", "string", "PAC script text with the supported bounded subset.", false}, {"pac_fail_closed", "boolean", "Fail closed when PAC resolution fails.", false}}, false, tool_proxy_start_listener));
+    register_one(srv, make_tool("proxy_stop_listener", "Stop a running MITM proxy listener by id.", {{"listener_id", "number", "Listener id returned by proxy_start_listener.", true}}, false, tool_proxy_stop_listener));
+    register_one(srv, make_tool("proxy_list_listeners", "List current MITM proxy listener snapshots.", {}, true, tool_proxy_list_listeners));
+    register_one(srv, make_tool("proxy_set_pac", "Configure bounded PAC routing control state for new MITM listeners.", {{"enabled", "boolean", "Enable PAC routing.", false}, {"script", "string", "PAC script text with supported return rules.", false}, {"fail_closed", "boolean", "Fail closed if PAC resolution cannot select a route.", false}}, false, tool_proxy_set_pac));
+    register_one(srv, make_tool("proxy_set_tls_policy", "Set per-host TLS version, ALPN, cipher, and upstream pin policy.", {{"host_pattern", "string", "Regex host pattern.", true}, {"min_version", "string", "tls1.0|tls1.1|tls1.2|tls1.3", false}, {"max_version", "string", "Optional max TLS version.", false}, {"cipher_suites", "array", "OpenSSL cipher suite names.", false}, {"alpn_protocols", "array", "Allowed ALPN protocol names.", false}, {"upstream_cert_sha256_pins", "array", "Allowed upstream leaf certificate SHA-256 fingerprints.", false}, {"ignore_cert_errors", "boolean", "Ignore upstream certificate errors.", false}}, false, tool_proxy_set_tls_policy));
     register_one(srv, make_tool("flow_save", "Save captured flows to disk.", {{"file_path", "string", "Destination file path.", true}, {"flow_ids", "array", "Optional flow ids; empty saves all history.", false}, {"format", "string", "aida|har", false}}, false, tool_flow_save));
     register_one(srv, make_tool("flow_load", "Load serialized flows into proxy history.", {{"file_path", "string", "Source file path.", true}, {"format", "string", "aida|har", false}, {"append", "boolean", "Append instead of replacing history.", false}}, false, tool_flow_load));
     register_one(srv, make_tool("client_replay", "Replay captured requests against original or overridden targets.", {{"flow_ids", "array", "Flow ids to replay.", false}, {"file_path", "string", "Flow file to replay.", false}, {"target_host", "string", "Override target host.", false}, {"target_port", "number", "Override target port.", false}, {"use_tls", "boolean", "Override TLS usage.", false}, {"concurrency", "number", "Worker count, capped at 16.", false}, {"delay_ms", "number", "Delay after each replay.", false}, {"stop_on_error", "boolean", "Stop queue on first error.", false}}, false, tool_client_replay));
-    register_one(srv, make_tool("server_replay_start", "Enable server replay control state from saved flows.", {{"flow_ids", "array", "Flow ids whose responses should be served.", true}, {"match_by", "string", "host_path|full_url|host_path_method", false}, {"allow_extra_headers", "boolean", "Allow requests with additional headers.", false}}, false, tool_server_replay_start));
+    register_one(srv, make_tool("server_replay_start", "Enable server replay control state from saved flows.", {{"flow_ids", "array", "Flow ids whose responses should be served.", true}, {"match_by", "string", "host_path|full_url|host_path_method", false}, {"exact_body", "boolean", "Require exact request body match.", false}}, false, tool_server_replay_start));
     register_one(srv, make_tool("server_replay_stop", "Disable server replay control state.", {}, false, tool_server_replay_stop));
     register_one(srv, make_tool("map_local_add", "Add a local-file URL prefix mapping rule.", {{"url_pattern", "string", "URL prefix to match.", true}, {"file_path", "string", "Local file path to serve.", true}, {"content_type", "string", "Optional content type override.", false}, {"status_code", "number", "Response status code.", false}}, false, tool_map_local_add));
     register_one(srv, make_tool("map_remote_add", "Add a remote URL prefix rewrite mapping rule.", {{"url_pattern", "string", "URL prefix to match.", true}, {"remote_url", "string", "Replacement remote URL prefix.", true}, {"preserve_host_header", "boolean", "Keep original Host header.", false}}, false, tool_map_remote_add));
     register_one(srv, make_tool("proxy_set_auth", "Configure proxy client authentication control state.", {{"enabled", "boolean", "Enable proxy authentication.", true}, {"realm", "string", "Proxy auth realm.", false}, {"username", "string", "Proxy username.", false}, {"password", "string", "Proxy password.", false}}, false, tool_proxy_set_auth));
     register_one(srv, make_tool("content_view_render", "Render request or response body in a structured content view.", {{"flow_id", "number", "Flow id.", true}, {"view", "string", "raw|json|xml|hex|image|form|protobuf", true}, {"side", "string", "request|response", true}}, true, tool_content_view_render));
     register_one(srv, make_tool("flow_tag", "Add, remove, or list tags on a captured flow.", {{"flow_id", "number", "Flow id.", true}, {"action", "string", "add|remove|list", true}, {"tag", "string", "Tag for add/remove.", false}, {"color", "string", "Optional color metadata for add responses.", false}}, false, tool_flow_tag));
+    register_one(srv, make_tool("flow_note", "Get or set notes on a captured flow.", {{"flow_id", "number", "Flow id.", true}, {"action", "string", "get|set", true}, {"notes", "string", "Replacement notes for set.", false}}, false, tool_flow_note));
     register_one(srv, make_tool("sticky_session_enable", "Configure sticky session handling control state.", {{"enabled", "boolean", "Enable sticky session handling.", true}, {"rule_id", "number", "Optional session-handler rule id.", false}, {"auto_run_macros", "boolean", "Auto-run macros.", false}}, false, tool_sticky_session_enable));
     register_one(srv, make_tool("connection_pool_stats", "Report upstream connection and replay counters.", {}, true, tool_connection_pool_stats));
     register_one(srv, make_tool("proxy_cert_status", "Report MITM CA readiness and installation status.", {}, true, tool_cert_status));

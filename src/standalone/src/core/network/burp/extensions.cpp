@@ -809,6 +809,10 @@ json snapshot_json(bool include_disabled, bool include_descriptors)
     out["last_error"] = snap.last_error;
     out["disabled_by_default"] = true;
     out["remote_loading_allowed"] = false;
+    out["descriptor_inventory_only"] = true;
+    out["execution_supported"] = false;
+    out["dynamic_mcp_registration_supported"] = false;
+    out["enable_semantics"] = "inventory_visibility_only";
     out["extensions"] = json::array();
     for (const auto& ext : snap.extensions) {
         if (!include_disabled && !ext.enabled)

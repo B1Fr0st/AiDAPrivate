@@ -1448,15 +1448,15 @@ oob_payload_t make_oob_payload(const json& params, const char* path_hint)
         return out;
     }
     try {
-        const auto info = aida::burp::collaborator::issue_token();
+        const auto token = aida::burp::collaborator::generate_token();
         const auto cfg = aida::burp::collaborator::current_config();
-        out.token = info.token;
-        out.token_hash = hash_string(info.token);
+        out.token = token;
+        out.token_hash = hash_string(token);
         if (cfg.public_host.empty()) {
             out.error = "collaborator public_host is empty";
             return out;
         }
-        std::string host = info.full_domain.empty() ? (info.token + "." + cfg.public_host) : info.full_domain;
+        std::string host = token + "." + cfg.public_host;
         out.raw_url = "http://" + host;
         if (cfg.http_port != 80 && cfg.http_port != 0)
             out.raw_url += ":" + std::to_string(cfg.http_port);

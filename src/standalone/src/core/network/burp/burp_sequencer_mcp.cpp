@@ -73,10 +73,15 @@ json analysis_to_json(const aida::burp::sequencer::analysis_result_t& a)
     };
     json out;
     out["collection_id"]        = a.collection_id;
+    out["analysis_mode"]        = a.analysis_mode;
     out["samples_count"]        = static_cast<uint64_t>(a.samples_count);
     out["token_length_mode"]    = static_cast<uint64_t>(a.token_length_mode);
+    out["min_token_length"]     = static_cast<uint64_t>(a.min_token_length);
+    out["max_token_length"]     = static_cast<uint64_t>(a.max_token_length);
+    out["alphabet_size"]        = static_cast<uint64_t>(a.alphabet_size);
     out["total_bits"]           = static_cast<uint64_t>(a.total_bits);
     out["shannon_entropy_bits"] = a.shannon_entropy_bits;
+    out["min_entropy_bits_per_symbol"] = a.min_entropy_bits_per_symbol;
     out["chi_square"]           = a.chi_square;
     out["chi_square_p_value"]   = pack_p(a.chi_square_p_value);
     out["monobit_p_value"]      = pack_p(a.monobit_p_value);
@@ -87,7 +92,13 @@ json analysis_to_json(const aida::burp::sequencer::analysis_result_t& a)
     out["long_run_p_value"]     = pack_p(a.long_run_p_value);
     out["maurer_universal"]     = pack_p(a.maurer_universal);
     out["autocorrelation"]      = pack_p(a.autocorrelation);
+    out["serial_correlation"]   = pack_p(a.serial_correlation);
+    out["compression_ratio"]    = pack_p(a.compression_ratio);
     out["passes_fips_140_2"]    = a.passes_fips_140_2;
+    out["fips_assessment"]      = a.fips_assessment;
+    out["nist_sp800_90b_assessment"] = a.nist_sp800_90b_assessment;
+    out["confidence_score"]     = a.confidence_score;
+    out["confidence_label"]     = a.confidence_label;
     out["valid"]                = a.valid;
     out["verdict"]              = a.verdict;
     out["notes"]                = a.notes;
@@ -97,6 +108,21 @@ json analysis_to_json(const aida::burp::sequencer::analysis_result_t& a)
     json bias = json::array();
     for (size_t i = 0; i < 256; ++i) bias.push_back(a.position_bias[i]);
     out["position_bias"]        = std::move(bias);
+    json positions = json::array();
+    for (const auto& ps : a.position_analysis) {
+        json item;
+        item["index"] = static_cast<uint64_t>(ps.index);
+        item["samples"] = static_cast<uint64_t>(ps.samples);
+        item["distinct_symbols"] = static_cast<uint64_t>(ps.distinct_symbols);
+        item["most_common_symbol"] = static_cast<uint32_t>(ps.most_common_symbol);
+        item["most_common_count"] = static_cast<uint64_t>(ps.most_common_count);
+        item["most_common_frequency"] = ps.most_common_frequency;
+        item["entropy_bits"] = ps.entropy_bits;
+        item["chi_square"] = ps.chi_square;
+        item["chi_square_p_value"] = pack_p(ps.chi_square_p_value);
+        positions.push_back(std::move(item));
+    }
+    out["position_analysis"] = std::move(positions);
     return out;
 }
 
@@ -266,7 +292,11 @@ tool_result_t handle_analyze(const json& p)
     }
     const uint64_t cid = p["collection_id"].get<uint64_t>();
     diag::log_tagged_fmt("mcp_burp", "sequencer_analyze collection_id=%llu", static_cast<unsigned long long>(cid));
-    auto a = aida::burp::sequencer::analyze(cid);
+    aida::burp::sequencer::analysis_config_t cfg;
+    if (p.contains("mode") && p["mode"].is_string()) cfg.mode = p["mode"].get<std::string>();
+    if (p.contains("analysis_mode") && p["analysis_mode"].is_string()) cfg.mode = p["analysis_mode"].get<std::string>();
+    if (p.contains("max_positions") && p["max_positions"].is_number_unsigned()) cfg.max_positions = p["max_positions"].get<size_t>();
+    auto a = aida::burp::sequencer::analyze(cid, cfg);
     diag::log_tagged_fmt("mcp_burp", "sequencer_analyze ok id=%llu samples=%llu verdict=%s", static_cast<unsigned long long>(cid), static_cast<unsigned long long>(a.samples_count), a.verdict.c_str());
     return tool_result_t::ok("analysis samples=" + std::to_string(a.samples_count) + " verdict=" + a.verdict, analysis_to_json(a));
 }
@@ -336,7 +366,7 @@ void register_sequencer_tools(mcp_standalone::server_t& srv)
 {
     register_compat(srv, {
         "burp_sequencer_manage", "burp",
-        "Manage Sequencer token collection and entropy analysis. Actions: start_collection, status, stop, samples, analyze, list_collections, delete.",
+        "Manage Sequencer token collection and advanced entropy analysis. Actions: start_collection, status, stop, samples, analyze, list_collections, delete. Analyze supports mode all|bit|byte|character|position and max_positions.",
         {{"action", "string", "start_collection|status|stop|samples|analyze|list_collections|delete", true},
          {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted.", false}},
         [](const json& params) -> tool_result_t {

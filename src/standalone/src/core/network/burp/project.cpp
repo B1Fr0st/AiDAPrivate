@@ -21,6 +21,7 @@
 #include "session_handler.hpp"
 #include "site_map.hpp"
 
+#include "../../settings/standalone_compat.hpp"
 #include "../../../helpers/diag_log.hpp"
 
 #include <algorithm>
@@ -394,7 +395,6 @@ bool import_json(const nlohmann::json& doc, bool replace_existing)
     }
     bool ok = true;
     if (replace_existing) {
-        crawl_audit::shutdown();
         for (const auto& audit : active_scanner::list_audits()) active_scanner::cancel_audit(audit.id);
         for (const auto& crawl : crawler::list()) crawler::stop(crawl.id);
     }
@@ -409,7 +409,11 @@ bool import_json(const nlohmann::json& doc, bool replace_existing)
     if (doc.contains("issues")) ok = issue_store::import_json(doc["issues"], replace_existing) && ok;
     if (doc.contains("site_map")) ok = import_site_map(doc["site_map"]) && ok;
     if (doc.contains("logger")) ok = import_logger(doc["logger"]) && ok;
-    if (doc.contains("crawl_audit")) ok = crawl_audit::import_json(doc["crawl_audit"], replace_existing) && ok;
+    if (doc.contains("crawl_audit")) {
+        ok = crawl_audit::import_json(doc["crawl_audit"], replace_existing) && ok;
+    } else if (replace_existing) {
+        ok = crawl_audit::import_json({{"version", 1}, {"pipelines", json::array()}}, true) && ok;
+    }
     if (doc.contains("collaborator")) ok = collaborator::import_json(doc["collaborator"], replace_existing) && ok;
     if (!ok) set_err("project.import: one or more sections failed");
     return ok;
@@ -484,6 +488,71 @@ std::string last_error()
 {
     std::lock_guard<std::mutex> lk(err_mtx());
     return err_slot();
+}
+
+void register_project_tools(mcp_standalone::server_t& srv)
+{
+    register_compat(srv, {
+        "burp_project_manage", "burp",
+        "Save, load, export, and import the Burp project model including target scope, cookies, session state, repeater tabs, issues, traffic, logger rows, crawl-audit state, and collaborator state.",
+        {{"action", "string", "export|import|save|load|status", true},
+         {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted.", false}},
+        [](const json& params) -> mcp_standalone::tool_result_t {
+            const std::string action = compat_action_name(params);
+            const json p = compat_action_payload(params);
+            if (action == "export") {
+                return mcp_standalone::tool_result_t::ok(export_json());
+            }
+            if (action == "import") {
+                if (!p.contains("project") || !p["project"].is_object())
+                    return mcp_standalone::tool_result_t::error("project object required");
+                const bool replace_existing = p.value("replace_existing", true);
+                if (!import_json(p["project"], replace_existing))
+                    return mcp_standalone::tool_result_t::error(last_error());
+                json out;
+                out["replace_existing"] = replace_existing;
+                out["status"] = "imported";
+                out["project"] = export_json();
+                return mcp_standalone::tool_result_t::ok("project imported", out);
+            }
+            if (action == "save") {
+                if (!p.contains("path") || !p["path"].is_string() || p["path"].get<std::string>().empty())
+                    return mcp_standalone::tool_result_t::error("path parameter required");
+                const std::string path = p["path"].get<std::string>();
+                if (!save_to_file(path))
+                    return mcp_standalone::tool_result_t::error(last_error());
+                json out;
+                out["path"] = path;
+                out["status"] = "saved";
+                out["saved_unix_ms"] = now_ms();
+                return mcp_standalone::tool_result_t::ok("project saved", out);
+            }
+            if (action == "load") {
+                if (!p.contains("path") || !p["path"].is_string() || p["path"].get<std::string>().empty())
+                    return mcp_standalone::tool_result_t::error("path parameter required");
+                const bool replace_existing = p.value("replace_existing", true);
+                const std::string path = p["path"].get<std::string>();
+                if (!load_from_file(path, replace_existing))
+                    return mcp_standalone::tool_result_t::error(last_error());
+                json out;
+                out["path"] = path;
+                out["replace_existing"] = replace_existing;
+                out["status"] = "loaded";
+                out["project"] = export_json();
+                return mcp_standalone::tool_result_t::ok("project loaded", out);
+            }
+            if (action == "status") {
+                json out;
+                out["version"] = 1;
+                out["last_error"] = last_error();
+                out["section_count"] = export_json().size();
+                out["collaborator_state"] = collaborator::export_json().value("capabilities", json::object());
+                return mcp_standalone::tool_result_t::ok(out);
+            }
+            return compat_unknown_action("burp_project_manage", action);
+        },
+        false
+    });
 }
 
 }

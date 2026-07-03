@@ -6,6 +6,11 @@
 #include <windows.h>
 #include <iphlpapi.h>
 #include <tlhelp32.h>
+#include <windns.h>
+
+#ifdef small
+#undef small
+#endif
 
 #include "standalone_compat.hpp"
 #include "standalone_driver.hpp"
@@ -21,6 +26,10 @@
 #include "protobuf_codec.hpp"
 #include "network_view.hpp"
 #include "mitm_proxy.hpp"
+#include "api_enum_tools_standalone.hpp"
+#include "cloud_tools_standalone.hpp"
+#include "js_analysis_tools_standalone.hpp"
+#include "web_vuln_tools_standalone.hpp"
 #include "../debugger/page_guard_engine.hpp"
 #include "../infra/work_queue.hpp"
 #include "../infra/critical_work_queue.hpp"
@@ -32,6 +41,7 @@
 #include <chrono>
 #include <climits>
 #include <cctype>
+#include <cstddef>
 #include <cstring>
 #include <cstdint>
 #include <cstdlib>
@@ -50,6 +60,9 @@ using json = nlohmann::json;
 using tool_result_t = mcp_standalone::tool_result_t;
 namespace network_tools
 {
+
+void register_http_tools(mcp_standalone::server_t& srv);
+void register_network_tool_aliases(mcp_standalone::server_t& srv);
 
 
 static std::string format_ip(const std::uint8_t* addr, std::uint32_t af) {
@@ -1154,6 +1167,1372 @@ tool_result_t network_analyze_packet(const json& params)
 
     diag::log_tagged_fmt("net_tools", "network_analyze_packet complete payload_size=%u", (unsigned)p.payload_size);
     return tool_result_t::ok(OBFSTR("Packet analysis complete"), result);
+}
+
+static constexpr std::uint16_t kDnsTypeA = 1;
+static constexpr std::uint16_t kDnsTypeNS = 2;
+static constexpr std::uint16_t kDnsTypeCNAME = 5;
+static constexpr std::uint16_t kDnsTypeSOA = 6;
+static constexpr std::uint16_t kDnsTypePTR = 12;
+static constexpr std::uint16_t kDnsTypeMX = 15;
+static constexpr std::uint16_t kDnsTypeTXT = 16;
+static constexpr std::uint16_t kDnsTypeAAAA = 28;
+static constexpr std::uint16_t kDnsTypeSRV = 33;
+static constexpr std::uint16_t kDnsTypeDS = 43;
+static constexpr std::uint16_t kDnsTypeRRSIG = 46;
+static constexpr std::uint16_t kDnsTypeNSEC = 47;
+static constexpr std::uint16_t kDnsTypeDNSKEY = 48;
+static constexpr std::uint16_t kDnsTypeNSEC3 = 50;
+static constexpr std::uint16_t kDnsTypeAXFR = 252;
+static constexpr std::uint16_t kDnsTypeCAA = 257;
+static constexpr std::uint16_t kDnsTypeOPT = 41;
+
+struct dns_rr_t {
+    std::string name;
+    std::uint16_t type = 0;
+    std::uint16_t klass = 0;
+    std::uint32_t ttl = 0;
+    json data = json::object();
+};
+
+struct dns_response_t {
+    bool received = false;
+    bool parse_ok = false;
+    bool capped = false;
+    bool wrong_id = false;
+    std::string error;
+    std::string server;
+    std::string protocol;
+    std::uint16_t id = 0;
+    std::uint16_t flags = 0;
+    std::uint16_t rcode = 0;
+    std::uint16_t qdcount = 0;
+    std::uint16_t ancount = 0;
+    std::uint16_t nscount = 0;
+    std::uint16_t arcount = 0;
+    std::uint64_t elapsed_ms = 0;
+    std::size_t bytes = 0;
+    std::vector<dns_rr_t> answers;
+    std::vector<dns_rr_t> authorities;
+    std::vector<dns_rr_t> additionals;
+};
+
+static std::string dns_lower_ascii(std::string value)
+{
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return value;
+}
+
+static std::string dns_trim_dot(std::string value)
+{
+    while (!value.empty() && value.back() == '.')
+        value.pop_back();
+    return value;
+}
+
+static bool dns_cancelled_or_deadline()
+{
+    const std::uint64_t deadline = mcp_standalone::current_call_deadline_ms();
+    return mcp_standalone::current_call_cancelled() || (deadline != 0 && GetTickCount64() >= deadline);
+}
+
+static DWORD dns_remaining_timeout_ms(DWORD requested)
+{
+    DWORD bounded = std::max<DWORD>(100, std::min<DWORD>(requested, 15000));
+    const std::uint64_t deadline = mcp_standalone::current_call_deadline_ms();
+    if (deadline == 0)
+        return bounded;
+    const std::uint64_t now = GetTickCount64();
+    if (deadline <= now)
+        return 1;
+    return std::max<DWORD>(1, static_cast<DWORD>(std::min<std::uint64_t>(bounded, deadline - now)));
+}
+
+static bool dns_valid_name(const std::string& raw)
+{
+    const std::string name = dns_trim_dot(raw);
+    if (name.empty() || name.size() > 253)
+        return false;
+    std::size_t label_len = 0;
+    bool previous_dot = true;
+    for (unsigned char c : name) {
+        if (c == '.') {
+            if (previous_dot || label_len == 0 || label_len > 63)
+                return false;
+            previous_dot = true;
+            label_len = 0;
+            continue;
+        }
+        if (!(std::isalnum(c) || c == '-' || c == '_' || c == '*'))
+            return false;
+        previous_dot = false;
+        ++label_len;
+        if (label_len > 63)
+            return false;
+    }
+    return !previous_dot && label_len <= 63;
+}
+
+static bool dns_ensure_winsock()
+{
+    static std::once_flag once;
+    static int status = WSANOTINITIALISED;
+    std::call_once(once, []() {
+        WSADATA wsa{};
+        status = WSAStartup(MAKEWORD(2, 2), &wsa);
+    });
+    return status == 0;
+}
+
+static void dns_put_u16(std::vector<std::uint8_t>& out, std::uint16_t value)
+{
+    out.push_back(static_cast<std::uint8_t>((value >> 8) & 0xff));
+    out.push_back(static_cast<std::uint8_t>(value & 0xff));
+}
+
+static void dns_put_u32(std::vector<std::uint8_t>& out, std::uint32_t value)
+{
+    out.push_back(static_cast<std::uint8_t>((value >> 24) & 0xff));
+    out.push_back(static_cast<std::uint8_t>((value >> 16) & 0xff));
+    out.push_back(static_cast<std::uint8_t>((value >> 8) & 0xff));
+    out.push_back(static_cast<std::uint8_t>(value & 0xff));
+}
+
+static std::uint16_t dns_read_u16(const std::vector<std::uint8_t>& data, std::size_t offset)
+{
+    return static_cast<std::uint16_t>((static_cast<std::uint16_t>(data[offset]) << 8) | data[offset + 1]);
+}
+
+static std::uint32_t dns_read_u32(const std::vector<std::uint8_t>& data, std::size_t offset)
+{
+    return (static_cast<std::uint32_t>(data[offset]) << 24) |
+           (static_cast<std::uint32_t>(data[offset + 1]) << 16) |
+           (static_cast<std::uint32_t>(data[offset + 2]) << 8) |
+           static_cast<std::uint32_t>(data[offset + 3]);
+}
+
+static std::string dns_hex_bytes(const std::uint8_t* data, std::size_t len, std::size_t cap = 128)
+{
+    static constexpr char kHex[] = "0123456789abcdef";
+    const std::size_t used = std::min(len, cap);
+    std::string out;
+    out.reserve(used * 2 + (len > cap ? 16 : 0));
+    for (std::size_t i = 0; i < used; ++i) {
+        out.push_back(kHex[(data[i] >> 4) & 0x0f]);
+        out.push_back(kHex[data[i] & 0x0f]);
+    }
+    if (len > cap)
+        out += "...";
+    return out;
+}
+
+static std::string dns_type_name(std::uint16_t type)
+{
+    switch (type) {
+    case kDnsTypeA: return "A";
+    case kDnsTypeNS: return "NS";
+    case kDnsTypeCNAME: return "CNAME";
+    case kDnsTypeSOA: return "SOA";
+    case kDnsTypePTR: return "PTR";
+    case kDnsTypeMX: return "MX";
+    case kDnsTypeTXT: return "TXT";
+    case kDnsTypeAAAA: return "AAAA";
+    case kDnsTypeSRV: return "SRV";
+    case kDnsTypeDS: return "DS";
+    case kDnsTypeRRSIG: return "RRSIG";
+    case kDnsTypeNSEC: return "NSEC";
+    case kDnsTypeDNSKEY: return "DNSKEY";
+    case kDnsTypeNSEC3: return "NSEC3";
+    case kDnsTypeAXFR: return "AXFR";
+    case kDnsTypeCAA: return "CAA";
+    case kDnsTypeOPT: return "OPT";
+    default: return "TYPE" + std::to_string(type);
+    }
+}
+
+static bool dns_type_from_string(std::string value, std::uint16_t& out)
+{
+    value = dns_lower_ascii(value);
+    if (value == "a") out = kDnsTypeA;
+    else if (value == "aaaa") out = kDnsTypeAAAA;
+    else if (value == "cname") out = kDnsTypeCNAME;
+    else if (value == "mx") out = kDnsTypeMX;
+    else if (value == "txt") out = kDnsTypeTXT;
+    else if (value == "ns") out = kDnsTypeNS;
+    else if (value == "soa") out = kDnsTypeSOA;
+    else if (value == "ptr") out = kDnsTypePTR;
+    else if (value == "srv") out = kDnsTypeSRV;
+    else if (value == "ds") out = kDnsTypeDS;
+    else if (value == "rrsig") out = kDnsTypeRRSIG;
+    else if (value == "dnskey") out = kDnsTypeDNSKEY;
+    else if (value == "nsec") out = kDnsTypeNSEC;
+    else if (value == "nsec3") out = kDnsTypeNSEC3;
+    else if (value == "caa") out = kDnsTypeCAA;
+    else if (value.rfind("type", 0) == 0 && value.size() > 4) {
+        char* end = nullptr;
+        const unsigned long parsed = std::strtoul(value.c_str() + 4, &end, 10);
+        if (!end || *end != '\0' || parsed > 65535)
+            return false;
+        out = static_cast<std::uint16_t>(parsed);
+    } else {
+        char* end = nullptr;
+        const unsigned long parsed = std::strtoul(value.c_str(), &end, 10);
+        if (!end || *end != '\0' || parsed > 65535)
+            return false;
+        out = static_cast<std::uint16_t>(parsed);
+    }
+    return true;
+}
+
+static bool dns_append_qname(std::vector<std::uint8_t>& out, const std::string& raw)
+{
+    const std::string name = dns_trim_dot(raw);
+    if (!dns_valid_name(name))
+        return false;
+    std::size_t start = 0;
+    while (start < name.size()) {
+        const std::size_t dot = name.find('.', start);
+        const std::size_t end = dot == std::string::npos ? name.size() : dot;
+        const std::size_t len = end - start;
+        if (len == 0 || len > 63)
+            return false;
+        out.push_back(static_cast<std::uint8_t>(len));
+        out.insert(out.end(), name.begin() + static_cast<std::ptrdiff_t>(start), name.begin() + static_cast<std::ptrdiff_t>(end));
+        if (dot == std::string::npos)
+            break;
+        start = dot + 1;
+    }
+    out.push_back(0);
+    return true;
+}
+
+static std::uint16_t dns_query_id(const std::string& name, std::uint16_t type)
+{
+    std::uint32_t h = 2166136261u;
+    for (unsigned char c : name) {
+        h ^= c;
+        h *= 16777619u;
+    }
+    h ^= type;
+    h ^= static_cast<std::uint32_t>(GetTickCount());
+    return static_cast<std::uint16_t>((h & 0xffffu) ? (h & 0xffffu) : 1u);
+}
+
+static std::vector<std::uint8_t> dns_build_query(const std::string& name,
+                                                 std::uint16_t type,
+                                                 std::uint16_t id,
+                                                 bool recursion_desired,
+                                                 bool dnssec_ok)
+{
+    std::vector<std::uint8_t> out;
+    out.reserve(512);
+    dns_put_u16(out, id);
+    dns_put_u16(out, recursion_desired ? 0x0100u : 0x0000u);
+    dns_put_u16(out, 1);
+    dns_put_u16(out, 0);
+    dns_put_u16(out, 0);
+    dns_put_u16(out, dnssec_ok ? 1 : 0);
+    dns_append_qname(out, name);
+    dns_put_u16(out, type);
+    dns_put_u16(out, 1);
+    if (dnssec_ok) {
+        out.push_back(0);
+        dns_put_u16(out, kDnsTypeOPT);
+        dns_put_u16(out, 1232);
+        out.push_back(0);
+        out.push_back(0);
+        dns_put_u16(out, 0x8000);
+        dns_put_u16(out, 0);
+    }
+    return out;
+}
+
+static bool dns_parse_name(const std::vector<std::uint8_t>& data, std::size_t& pos, std::string& out)
+{
+    std::vector<std::string> labels;
+    std::size_t p = pos;
+    bool jumped = false;
+    std::size_t jumps = 0;
+    while (true) {
+        if (p >= data.size())
+            return false;
+        const std::uint8_t len = data[p];
+        if ((len & 0xc0u) == 0xc0u) {
+            if (p + 1 >= data.size())
+                return false;
+            const std::size_t target = ((static_cast<std::size_t>(len & 0x3fu) << 8) | data[p + 1]);
+            if (target >= data.size() || ++jumps > 24)
+                return false;
+            if (!jumped) {
+                pos = p + 2;
+                jumped = true;
+            }
+            p = target;
+            continue;
+        }
+        if ((len & 0xc0u) != 0)
+            return false;
+        ++p;
+        if (len == 0)
+            break;
+        if (len > 63 || p + len > data.size())
+            return false;
+        labels.emplace_back(reinterpret_cast<const char*>(data.data() + p), reinterpret_cast<const char*>(data.data() + p + len));
+        p += len;
+    }
+    if (!jumped)
+        pos = p;
+    out.clear();
+    for (std::size_t i = 0; i < labels.size(); ++i) {
+        if (i != 0)
+            out.push_back('.');
+        out += labels[i];
+    }
+    if (out.empty())
+        out = ".";
+    return true;
+}
+
+static std::string dns_ipv4_text(const std::uint8_t* data)
+{
+    char buf[INET_ADDRSTRLEN] = {};
+    in_addr addr{};
+    std::memcpy(&addr, data, sizeof(addr));
+    InetNtopA(AF_INET, &addr, buf, sizeof(buf));
+    return std::string(buf);
+}
+
+static std::string dns_ipv6_text(const std::uint8_t* data)
+{
+    char buf[INET6_ADDRSTRLEN] = {};
+    in6_addr addr{};
+    std::memcpy(&addr, data, sizeof(addr));
+    InetNtopA(AF_INET6, &addr, buf, sizeof(buf));
+    return std::string(buf);
+}
+
+static json dns_txt_json(const std::vector<std::uint8_t>& data, std::size_t rdata, std::size_t end)
+{
+    json arr = json::array();
+    std::size_t p = rdata;
+    while (p < end) {
+        const std::size_t len = data[p++];
+        if (p + len > end)
+            break;
+        std::string s(reinterpret_cast<const char*>(data.data() + p), reinterpret_cast<const char*>(data.data() + p + len));
+        if (s.size() > 512)
+            s = s.substr(0, 512);
+        arr.push_back(s);
+        p += len;
+        if (arr.size() >= 16)
+            break;
+    }
+    return arr;
+}
+
+static bool dns_parse_rr(const std::vector<std::uint8_t>& data, std::size_t& pos, dns_rr_t& rr)
+{
+    if (!dns_parse_name(data, pos, rr.name) || pos + 10 > data.size())
+        return false;
+    rr.type = dns_read_u16(data, pos);
+    rr.klass = dns_read_u16(data, pos + 2);
+    rr.ttl = dns_read_u32(data, pos + 4);
+    const std::uint16_t rdlen = dns_read_u16(data, pos + 8);
+    pos += 10;
+    if (pos + rdlen > data.size())
+        return false;
+    const std::size_t rdata = pos;
+    const std::size_t end = pos + rdlen;
+    json d;
+    d["type_name"] = dns_type_name(rr.type);
+    d["rdata_length"] = rdlen;
+    switch (rr.type) {
+    case kDnsTypeA:
+        if (rdlen == 4)
+            d["address"] = dns_ipv4_text(data.data() + rdata);
+        break;
+    case kDnsTypeAAAA:
+        if (rdlen == 16)
+            d["address"] = dns_ipv6_text(data.data() + rdata);
+        break;
+    case kDnsTypeNS:
+    case kDnsTypeCNAME:
+    case kDnsTypePTR: {
+        std::size_t p = rdata;
+        std::string target;
+        if (dns_parse_name(data, p, target))
+            d["target"] = target;
+        break;
+    }
+    case kDnsTypeMX: {
+        if (rdlen >= 3) {
+            std::size_t p = rdata + 2;
+            std::string exchange;
+            d["preference"] = dns_read_u16(data, rdata);
+            if (dns_parse_name(data, p, exchange))
+                d["exchange"] = exchange;
+        }
+        break;
+    }
+    case kDnsTypeTXT:
+        d["strings"] = dns_txt_json(data, rdata, end);
+        break;
+    case kDnsTypeSOA: {
+        std::size_t p = rdata;
+        std::string mname;
+        std::string rname;
+        if (dns_parse_name(data, p, mname) && dns_parse_name(data, p, rname) && p + 20 <= end) {
+            d["mname"] = mname;
+            d["rname"] = rname;
+            d["serial"] = dns_read_u32(data, p);
+            d["refresh"] = dns_read_u32(data, p + 4);
+            d["retry"] = dns_read_u32(data, p + 8);
+            d["expire"] = dns_read_u32(data, p + 12);
+            d["minimum"] = dns_read_u32(data, p + 16);
+        }
+        break;
+    }
+    case kDnsTypeSRV:
+        if (rdlen >= 7) {
+            std::size_t p = rdata + 6;
+            std::string target;
+            d["priority"] = dns_read_u16(data, rdata);
+            d["weight"] = dns_read_u16(data, rdata + 2);
+            d["port"] = dns_read_u16(data, rdata + 4);
+            if (dns_parse_name(data, p, target))
+                d["target"] = target;
+        }
+        break;
+    case kDnsTypeDS:
+        if (rdlen >= 4) {
+            d["key_tag"] = dns_read_u16(data, rdata);
+            d["algorithm"] = data[rdata + 2];
+            d["digest_type"] = data[rdata + 3];
+            d["digest_hex"] = dns_hex_bytes(data.data() + rdata + 4, rdlen - 4, 96);
+        }
+        break;
+    case kDnsTypeDNSKEY:
+        if (rdlen >= 4) {
+            d["flags"] = dns_read_u16(data, rdata);
+            d["protocol"] = data[rdata + 2];
+            d["algorithm"] = data[rdata + 3];
+            d["public_key_bytes"] = rdlen - 4;
+        }
+        break;
+    case kDnsTypeRRSIG:
+        if (rdlen >= 18) {
+            std::size_t p = rdata + 18;
+            std::string signer;
+            d["type_covered"] = dns_type_name(dns_read_u16(data, rdata));
+            d["algorithm"] = data[rdata + 2];
+            d["labels"] = data[rdata + 3];
+            d["original_ttl"] = dns_read_u32(data, rdata + 4);
+            d["signature_expiration"] = dns_read_u32(data, rdata + 8);
+            d["signature_inception"] = dns_read_u32(data, rdata + 12);
+            d["key_tag"] = dns_read_u16(data, rdata + 16);
+            if (dns_parse_name(data, p, signer))
+                d["signer"] = signer;
+            if (p <= end)
+                d["signature_bytes"] = end - p;
+        }
+        break;
+    case kDnsTypeNSEC: {
+        std::size_t p = rdata;
+        std::string next;
+        if (dns_parse_name(data, p, next)) {
+            d["next_domain"] = next;
+            d["type_bitmap_bytes"] = p <= end ? end - p : 0;
+        }
+        break;
+    }
+    case kDnsTypeCAA:
+        if (rdlen >= 2) {
+            const std::uint8_t tag_len = data[rdata + 1];
+            if (rdata + 2 + tag_len <= end) {
+                d["flags"] = data[rdata];
+                d["tag"] = std::string(reinterpret_cast<const char*>(data.data() + rdata + 2), reinterpret_cast<const char*>(data.data() + rdata + 2 + tag_len));
+                d["value"] = std::string(reinterpret_cast<const char*>(data.data() + rdata + 2 + tag_len), reinterpret_cast<const char*>(data.data() + end));
+            }
+        }
+        break;
+    default:
+        d["rdata_hex"] = dns_hex_bytes(data.data() + rdata, rdlen, 128);
+        break;
+    }
+    if (!d.contains("rdata_hex") && d.size() <= 2)
+        d["rdata_hex"] = dns_hex_bytes(data.data() + rdata, rdlen, 128);
+    rr.data = std::move(d);
+    pos = end;
+    return true;
+}
+
+static bool dns_parse_response(const std::vector<std::uint8_t>& packet, std::uint16_t expected_id, std::size_t max_records, dns_response_t& out)
+{
+    out.bytes = packet.size();
+    if (packet.size() < 12) {
+        out.error = "response_too_short";
+        return false;
+    }
+    out.id = dns_read_u16(packet, 0);
+    out.flags = dns_read_u16(packet, 2);
+    out.rcode = out.flags & 0x000fu;
+    out.qdcount = dns_read_u16(packet, 4);
+    out.ancount = dns_read_u16(packet, 6);
+    out.nscount = dns_read_u16(packet, 8);
+    out.arcount = dns_read_u16(packet, 10);
+    if (expected_id != 0 && out.id != expected_id)
+        out.wrong_id = true;
+    std::size_t pos = 12;
+    for (std::uint16_t i = 0; i < out.qdcount; ++i) {
+        std::string qname;
+        if (!dns_parse_name(packet, pos, qname) || pos + 4 > packet.size()) {
+            out.error = "question_parse_failed";
+            return false;
+        }
+        pos += 4;
+    }
+    std::size_t parsed_records = 0;
+    auto parse_section = [&](std::uint16_t count, std::vector<dns_rr_t>& section) -> bool {
+        for (std::uint16_t i = 0; i < count; ++i) {
+            dns_rr_t rr;
+            if (!dns_parse_rr(packet, pos, rr)) {
+                out.error = "resource_record_parse_failed";
+                return false;
+            }
+            if (parsed_records < max_records)
+                section.push_back(std::move(rr));
+            else
+                out.capped = true;
+            ++parsed_records;
+        }
+        return true;
+    };
+    if (!parse_section(out.ancount, out.answers) || !parse_section(out.nscount, out.authorities) || !parse_section(out.arcount, out.additionals))
+        return false;
+    out.parse_ok = true;
+    return true;
+}
+
+static json dns_flags_json(const dns_response_t& r)
+{
+    return json{
+        {"qr", (r.flags & 0x8000u) != 0},
+        {"aa", (r.flags & 0x0400u) != 0},
+        {"tc", (r.flags & 0x0200u) != 0},
+        {"rd", (r.flags & 0x0100u) != 0},
+        {"ra", (r.flags & 0x0080u) != 0},
+        {"ad", (r.flags & 0x0020u) != 0},
+        {"cd", (r.flags & 0x0010u) != 0}
+    };
+}
+
+static json dns_rr_json(const dns_rr_t& rr)
+{
+    json out;
+    out["name"] = rr.name;
+    out["type"] = rr.type;
+    out["type_name"] = dns_type_name(rr.type);
+    out["class"] = rr.klass;
+    out["ttl"] = rr.ttl;
+    out["data"] = rr.data;
+    return out;
+}
+
+static json dns_response_json(const dns_response_t& r)
+{
+    json out;
+    out["server"] = r.server;
+    out["protocol"] = r.protocol;
+    out["received"] = r.received;
+    out["parse_ok"] = r.parse_ok;
+    out["elapsed_ms"] = r.elapsed_ms;
+    out["bytes"] = static_cast<std::uint64_t>(r.bytes);
+    out["id"] = r.id;
+    out["wrong_id"] = r.wrong_id;
+    out["rcode"] = r.rcode;
+    out["flags"] = dns_flags_json(r);
+    out["counts"] = {{"questions", r.qdcount}, {"answers", r.ancount}, {"authority", r.nscount}, {"additional", r.arcount}};
+    out["capped"] = r.capped;
+    if (!r.error.empty())
+        out["error"] = r.error;
+    out["answers"] = json::array();
+    out["authority"] = json::array();
+    out["additional"] = json::array();
+    for (const auto& rr : r.answers) out["answers"].push_back(dns_rr_json(rr));
+    for (const auto& rr : r.authorities) out["authority"].push_back(dns_rr_json(rr));
+    for (const auto& rr : r.additionals) out["additional"].push_back(dns_rr_json(rr));
+    return out;
+}
+
+static std::string dns_normalize_server(std::string server)
+{
+    if (server.size() >= 2 && server.front() == '[' && server.back() == ']')
+        server = server.substr(1, server.size() - 2);
+    return server;
+}
+
+static bool dns_socket_address(const std::string& server, sockaddr_storage& storage, int& len, std::string& error)
+{
+    const std::string normalized = dns_normalize_server(server);
+    std::memset(&storage, 0, sizeof(storage));
+    sockaddr_in* v4 = reinterpret_cast<sockaddr_in*>(&storage);
+    if (InetPtonA(AF_INET, normalized.c_str(), &v4->sin_addr) == 1) {
+        v4->sin_family = AF_INET;
+        v4->sin_port = htons(53);
+        len = sizeof(sockaddr_in);
+        return true;
+    }
+    sockaddr_in6* v6 = reinterpret_cast<sockaddr_in6*>(&storage);
+    if (InetPtonA(AF_INET6, normalized.c_str(), &v6->sin6_addr) == 1) {
+        v6->sin6_family = AF_INET6;
+        v6->sin6_port = htons(53);
+        len = sizeof(sockaddr_in6);
+        return true;
+    }
+    error = "dns_server_must_be_ip_literal";
+    return false;
+}
+
+static bool dns_wait_socket(SOCKET s, bool write, DWORD timeout)
+{
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(s, &fds);
+    timeval tv{static_cast<long>(timeout / 1000), static_cast<long>((timeout % 1000) * 1000)};
+    const int rc = write ? select(0, nullptr, &fds, nullptr, &tv) : select(0, &fds, nullptr, nullptr, &tv);
+    return rc > 0 && FD_ISSET(s, &fds);
+}
+
+static bool dns_udp_query(const std::string& server,
+                          const std::vector<std::uint8_t>& query,
+                          std::uint16_t expected_id,
+                          DWORD timeout,
+                          std::size_t max_records,
+                          dns_response_t& out)
+{
+    out.server = server;
+    out.protocol = "udp";
+    const std::uint64_t started = GetTickCount64();
+    if (!dns_ensure_winsock()) {
+        out.error = "winsock_unavailable";
+        return false;
+    }
+    sockaddr_storage addr{};
+    int addr_len = 0;
+    if (!dns_socket_address(server, addr, addr_len, out.error))
+        return false;
+    SOCKET s = socket(addr.ss_family, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET) {
+        out.error = "socket_failed_wsa_" + std::to_string(WSAGetLastError());
+        return false;
+    }
+    DWORD bounded = dns_remaining_timeout_ms(timeout);
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&bounded), sizeof(bounded));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&bounded), sizeof(bounded));
+    const int sent = sendto(s, reinterpret_cast<const char*>(query.data()), static_cast<int>(query.size()), 0, reinterpret_cast<sockaddr*>(&addr), addr_len);
+    if (sent != static_cast<int>(query.size())) {
+        out.error = "sendto_failed_wsa_" + std::to_string(WSAGetLastError());
+        closesocket(s);
+        return false;
+    }
+    while (!dns_cancelled_or_deadline()) {
+        bounded = dns_remaining_timeout_ms(timeout);
+        if (!dns_wait_socket(s, false, bounded)) {
+            out.error = "receive_timeout";
+            break;
+        }
+        std::vector<std::uint8_t> packet(4096);
+        sockaddr_storage from{};
+        int from_len = sizeof(from);
+        const int got = recvfrom(s, reinterpret_cast<char*>(packet.data()), static_cast<int>(packet.size()), 0, reinterpret_cast<sockaddr*>(&from), &from_len);
+        if (got <= 0) {
+            out.error = "recvfrom_failed_wsa_" + std::to_string(WSAGetLastError());
+            break;
+        }
+        packet.resize(static_cast<std::size_t>(got));
+        dns_response_t candidate;
+        candidate.server = server;
+        candidate.protocol = "udp";
+        candidate.received = true;
+        candidate.elapsed_ms = GetTickCount64() - started;
+        dns_parse_response(packet, expected_id, max_records, candidate);
+        if (!candidate.wrong_id || expected_id == 0) {
+            out = std::move(candidate);
+            closesocket(s);
+            return out.parse_ok;
+        }
+        out.wrong_id = true;
+    }
+    out.elapsed_ms = GetTickCount64() - started;
+    if (dns_cancelled_or_deadline())
+        out.error = mcp_standalone::current_call_cancelled() ? "cancelled" : "deadline_expired";
+    closesocket(s);
+    return false;
+}
+
+static bool dns_tcp_connect(const std::string& server, DWORD timeout, SOCKET& out, std::string& error)
+{
+    out = INVALID_SOCKET;
+    if (!dns_ensure_winsock()) {
+        error = "winsock_unavailable";
+        return false;
+    }
+    sockaddr_storage addr{};
+    int addr_len = 0;
+    if (!dns_socket_address(server, addr, addr_len, error))
+        return false;
+    SOCKET s = socket(addr.ss_family, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) {
+        error = "socket_failed_wsa_" + std::to_string(WSAGetLastError());
+        return false;
+    }
+    u_long nb = 1;
+    ioctlsocket(s, FIONBIO, &nb);
+    int rc = connect(s, reinterpret_cast<sockaddr*>(&addr), addr_len);
+    if (rc == SOCKET_ERROR) {
+        const int wsa = WSAGetLastError();
+        if (wsa != WSAEWOULDBLOCK && wsa != WSAEINPROGRESS && wsa != WSAEINVAL) {
+            error = "connect_failed_wsa_" + std::to_string(wsa);
+            closesocket(s);
+            return false;
+        }
+    }
+    if (!dns_wait_socket(s, true, dns_remaining_timeout_ms(timeout))) {
+        error = "connect_timeout";
+        closesocket(s);
+        return false;
+    }
+    int soerr = 0;
+    int soerr_len = sizeof(soerr);
+    getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&soerr), &soerr_len);
+    if (soerr != 0) {
+        error = "connect_failed_wsa_" + std::to_string(soerr);
+        closesocket(s);
+        return false;
+    }
+    DWORD bounded = dns_remaining_timeout_ms(timeout);
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&bounded), sizeof(bounded));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&bounded), sizeof(bounded));
+    out = s;
+    return true;
+}
+
+static bool dns_send_all(SOCKET s, const std::uint8_t* data, std::size_t len, DWORD timeout, std::string& error)
+{
+    std::size_t sent = 0;
+    while (sent < len) {
+        if (dns_cancelled_or_deadline()) {
+            error = mcp_standalone::current_call_cancelled() ? "cancelled" : "deadline_expired";
+            return false;
+        }
+        if (!dns_wait_socket(s, true, dns_remaining_timeout_ms(timeout))) {
+            error = "send_timeout";
+            return false;
+        }
+        const int n = send(s, reinterpret_cast<const char*>(data + sent), static_cast<int>(std::min<std::size_t>(len - sent, 8192)), 0);
+        if (n <= 0) {
+            error = "send_failed_wsa_" + std::to_string(WSAGetLastError());
+            return false;
+        }
+        sent += static_cast<std::size_t>(n);
+    }
+    return true;
+}
+
+static bool dns_recv_exact(SOCKET s, std::uint8_t* data, std::size_t len, DWORD timeout, std::string& error)
+{
+    std::size_t got_total = 0;
+    while (got_total < len) {
+        if (dns_cancelled_or_deadline()) {
+            error = mcp_standalone::current_call_cancelled() ? "cancelled" : "deadline_expired";
+            return false;
+        }
+        if (!dns_wait_socket(s, false, dns_remaining_timeout_ms(timeout))) {
+            error = "receive_timeout";
+            return false;
+        }
+        const int got = recv(s, reinterpret_cast<char*>(data + got_total), static_cast<int>(len - got_total), 0);
+        if (got <= 0) {
+            error = got == 0 ? "connection_closed" : "recv_failed_wsa_" + std::to_string(WSAGetLastError());
+            return false;
+        }
+        got_total += static_cast<std::size_t>(got);
+    }
+    return true;
+}
+
+static bool dns_tcp_query_once(const std::string& server,
+                               const std::vector<std::uint8_t>& query,
+                               std::uint16_t expected_id,
+                               DWORD timeout,
+                               std::size_t max_records,
+                               dns_response_t& out)
+{
+    out.server = server;
+    out.protocol = "tcp";
+    const std::uint64_t started = GetTickCount64();
+    SOCKET s = INVALID_SOCKET;
+    std::string error;
+    if (!dns_tcp_connect(server, timeout, s, error)) {
+        out.error = error;
+        out.elapsed_ms = GetTickCount64() - started;
+        return false;
+    }
+    std::vector<std::uint8_t> framed;
+    framed.reserve(query.size() + 2);
+    dns_put_u16(framed, static_cast<std::uint16_t>(query.size()));
+    framed.insert(framed.end(), query.begin(), query.end());
+    if (!dns_send_all(s, framed.data(), framed.size(), timeout, error)) {
+        out.error = error;
+        out.elapsed_ms = GetTickCount64() - started;
+        closesocket(s);
+        return false;
+    }
+    std::uint8_t len_buf[2] = {};
+    if (!dns_recv_exact(s, len_buf, sizeof(len_buf), timeout, error)) {
+        out.error = error;
+        out.elapsed_ms = GetTickCount64() - started;
+        closesocket(s);
+        return false;
+    }
+    const std::size_t msg_len = (static_cast<std::size_t>(len_buf[0]) << 8) | len_buf[1];
+    if (msg_len == 0 || msg_len > 65535) {
+        out.error = "invalid_tcp_dns_length";
+        out.elapsed_ms = GetTickCount64() - started;
+        closesocket(s);
+        return false;
+    }
+    std::vector<std::uint8_t> packet(msg_len);
+    if (!dns_recv_exact(s, packet.data(), packet.size(), timeout, error)) {
+        out.error = error;
+        out.elapsed_ms = GetTickCount64() - started;
+        closesocket(s);
+        return false;
+    }
+    out.received = true;
+    out.elapsed_ms = GetTickCount64() - started;
+    const bool ok = dns_parse_response(packet, expected_id, max_records, out);
+    closesocket(s);
+    return ok && !out.wrong_id;
+}
+
+static std::vector<std::string> dns_configured_servers()
+{
+    std::vector<std::string> servers;
+    ULONG size = 0;
+    if (GetNetworkParams(nullptr, &size) != ERROR_BUFFER_OVERFLOW || size == 0)
+        return servers;
+    std::vector<std::uint8_t> buf(size);
+    FIXED_INFO* info = reinterpret_cast<FIXED_INFO*>(buf.data());
+    if (GetNetworkParams(info, &size) != ERROR_SUCCESS)
+        return servers;
+    IP_ADDR_STRING* cur = &info->DnsServerList;
+    while (cur && cur->IpAddress.String[0] != '\0') {
+        const std::string ip = cur->IpAddress.String;
+        if (!ip.empty() && std::find(servers.begin(), servers.end(), ip) == servers.end())
+            servers.push_back(ip);
+        cur = cur->Next;
+    }
+    return servers;
+}
+
+static std::vector<std::string> dns_servers_from_params(const json& params)
+{
+    std::vector<std::string> servers;
+    auto add = [&](const std::string& value) {
+        const std::string normalized = dns_normalize_server(value);
+        if (!normalized.empty() && std::find(servers.begin(), servers.end(), normalized) == servers.end())
+            servers.push_back(normalized);
+    };
+    if (params.contains("server") && params["server"].is_string())
+        add(params["server"].get<std::string>());
+    if (params.contains("name_server") && params["name_server"].is_string())
+        add(params["name_server"].get<std::string>());
+    if (params.contains("servers") && params["servers"].is_array()) {
+        for (const auto& item : params["servers"]) {
+            if (item.is_string())
+                add(item.get<std::string>());
+            if (servers.size() >= 8)
+                break;
+        }
+    }
+    if (servers.empty())
+        servers = dns_configured_servers();
+    if (servers.size() > 8)
+        servers.resize(8);
+    return servers;
+}
+
+static std::vector<std::uint16_t> dns_record_types_from_params(const json& params, const std::vector<std::uint16_t>& fallback)
+{
+    std::vector<std::uint16_t> types;
+    auto add_type = [&](const json& value) {
+        std::uint16_t t = 0;
+        if (value.is_string() && dns_type_from_string(value.get<std::string>(), t)) {
+            if (std::find(types.begin(), types.end(), t) == types.end())
+                types.push_back(t);
+        } else if (value.is_number_unsigned()) {
+            const auto raw = value.get<std::uint64_t>();
+            if (raw <= 65535 && std::find(types.begin(), types.end(), static_cast<std::uint16_t>(raw)) == types.end())
+                types.push_back(static_cast<std::uint16_t>(raw));
+        }
+    };
+    if (params.contains("record_type"))
+        add_type(params["record_type"]);
+    if (params.contains("type"))
+        add_type(params["type"]);
+    if (params.contains("record_types")) {
+        if (params["record_types"].is_array()) {
+            for (const auto& item : params["record_types"]) {
+                add_type(item);
+                if (types.size() >= 12)
+                    break;
+            }
+        } else {
+            add_type(params["record_types"]);
+        }
+    }
+    if (types.empty())
+        types = fallback;
+    if (types.size() > 12)
+        types.resize(12);
+    return types;
+}
+
+static bool dns_response_has_type(const dns_response_t& r, std::uint16_t type)
+{
+    auto has = [&](const std::vector<dns_rr_t>& rows) {
+        return std::any_of(rows.begin(), rows.end(), [&](const dns_rr_t& rr) { return rr.type == type; });
+    };
+    return has(r.answers) || has(r.authorities) || has(r.additionals);
+}
+
+static tool_result_t aida_dns_lookup(const json& params)
+{
+    if (!params.is_object() || !params.contains("name") || !params["name"].is_string())
+        return network_param_error("name is required", "name");
+    const std::string name = dns_trim_dot(params["name"].get<std::string>());
+    if (!dns_valid_name(name))
+        return network_param_error("name is not a valid DNS name", "name");
+    const DWORD timeout = static_cast<DWORD>(std::max(100, std::min(params.value("timeout_ms", 5000), 15000)));
+    const std::size_t max_records = static_cast<std::size_t>(std::max(1, std::min(params.value("max_records", 128), 512)));
+    const bool dnssec_ok = params.value("dnssec", false);
+    const auto servers = dns_servers_from_params(params);
+    if (servers.empty()) {
+        json d{{"name", name}, {"source", "GetNetworkParams"}, {"resolver_count", 0}};
+        return tool_result_t::error("No configured DNS resolver was available; pass server as an IP literal.", "dns_resolver_unavailable", d);
+    }
+    const auto types = dns_record_types_from_params(params, {kDnsTypeA, kDnsTypeAAAA});
+    json out;
+    out["name"] = name;
+    out["resolver_source"] = params.contains("server") || params.contains("servers") || params.contains("name_server") ? "params" : "windows_network_params";
+    out["timeout_ms"] = timeout;
+    out["max_records"] = max_records;
+    out["queries"] = json::array();
+    bool any_response = false;
+    bool any_success = false;
+    for (const auto& server : servers) {
+        for (const std::uint16_t type : types) {
+            if (dns_cancelled_or_deadline()) {
+                out["cancelled"] = mcp_standalone::current_call_cancelled();
+                out["deadline_expired"] = !mcp_standalone::current_call_cancelled();
+                return tool_result_t::error("DNS lookup cancelled or deadline reached", "cancelled", out);
+            }
+            const std::uint16_t id = dns_query_id(name, type);
+            const auto query = dns_build_query(name, type, id, true, dnssec_ok);
+            dns_response_t response;
+            const bool ok = dns_udp_query(server, query, id, timeout, max_records, response);
+            if (response.received && (response.flags & 0x0200u) != 0) {
+                dns_response_t tcp_response;
+                if (dns_tcp_query_once(server, query, id, timeout, max_records, tcp_response))
+                    response = std::move(tcp_response);
+                else
+                    response.capped = true;
+            }
+            json row;
+            row["server"] = server;
+            row["type"] = type;
+            row["type_name"] = dns_type_name(type);
+            row["ok"] = ok || response.received;
+            row["response"] = dns_response_json(response);
+            out["queries"].push_back(std::move(row));
+            any_response = any_response || response.received;
+            any_success = any_success || (response.received && response.parse_ok && response.rcode == 0);
+        }
+    }
+    out["response_observed"] = any_response;
+    out["successful_answer_path"] = any_success;
+    if (!any_response)
+        return tool_result_t::error("DNS lookup did not receive any resolver response", "dns_no_response", out);
+    return tool_result_t::ok("DNS lookup complete", out);
+}
+
+static std::vector<std::string> dns_targets_from_response(const dns_response_t& r)
+{
+    std::vector<std::string> out;
+    auto collect = [&](const std::vector<dns_rr_t>& rows) {
+        for (const auto& rr : rows) {
+            if ((rr.type == kDnsTypeA || rr.type == kDnsTypeAAAA) && rr.data.contains("address") && rr.data["address"].is_string()) {
+                const std::string ip = rr.data["address"].get<std::string>();
+                if (std::find(out.begin(), out.end(), ip) == out.end())
+                    out.push_back(ip);
+            }
+            if (out.size() >= 8)
+                break;
+        }
+    };
+    collect(r.answers);
+    collect(r.additionals);
+    return out;
+}
+
+static std::vector<std::string> dns_names_from_ns_response(const dns_response_t& r)
+{
+    std::vector<std::string> out;
+    auto collect = [&](const std::vector<dns_rr_t>& rows) {
+        for (const auto& rr : rows) {
+            if (rr.type == kDnsTypeNS && rr.data.contains("target") && rr.data["target"].is_string()) {
+                const std::string ns = dns_trim_dot(rr.data["target"].get<std::string>());
+                if (dns_valid_name(ns) && std::find(out.begin(), out.end(), ns) == out.end())
+                    out.push_back(ns);
+            }
+            if (out.size() >= 8)
+                break;
+        }
+    };
+    collect(r.answers);
+    collect(r.authorities);
+    return out;
+}
+
+static std::vector<std::string> dns_discover_zone_transfer_servers(const std::string& zone, const std::vector<std::string>& resolvers, DWORD timeout, json& evidence)
+{
+    std::vector<std::string> servers;
+    evidence = json::array();
+    for (const auto& resolver : resolvers) {
+        if (dns_cancelled_or_deadline())
+            break;
+        const std::uint16_t id = dns_query_id(zone, kDnsTypeNS);
+        const auto query = dns_build_query(zone, kDnsTypeNS, id, true, false);
+        dns_response_t ns_response;
+        dns_udp_query(resolver, query, id, timeout, 64, ns_response);
+        json probe;
+        probe["resolver"] = resolver;
+        probe["ns_response"] = dns_response_json(ns_response);
+        const auto names = dns_names_from_ns_response(ns_response);
+        probe["name_servers"] = names;
+        probe["address_probes"] = json::array();
+        for (const auto& ns : names) {
+            for (const auto type : {kDnsTypeA, kDnsTypeAAAA}) {
+                if (dns_cancelled_or_deadline() || servers.size() >= 8)
+                    break;
+                const std::uint16_t aid = dns_query_id(ns, type);
+                const auto aq = dns_build_query(ns, type, aid, true, false);
+                dns_response_t addr_response;
+                dns_udp_query(resolver, aq, aid, timeout, 32, addr_response);
+                const auto ips = dns_targets_from_response(addr_response);
+                json addr_probe;
+                addr_probe["name_server"] = ns;
+                addr_probe["type"] = dns_type_name(type);
+                addr_probe["response"] = dns_response_json(addr_response);
+                addr_probe["addresses"] = ips;
+                for (const auto& ip : ips) {
+                    if (std::find(servers.begin(), servers.end(), ip) == servers.end())
+                        servers.push_back(ip);
+                    if (servers.size() >= 8)
+                        break;
+                }
+                probe["address_probes"].push_back(std::move(addr_probe));
+            }
+        }
+        evidence.push_back(std::move(probe));
+        if (!servers.empty())
+            break;
+    }
+    return servers;
+}
+
+static bool dns_tcp_zone_transfer(const std::string& server,
+                                  const std::string& zone,
+                                  DWORD timeout,
+                                  std::size_t max_records,
+                                  std::size_t max_messages,
+                                  json& out)
+{
+    const std::uint64_t started = GetTickCount64();
+    out = json::object();
+    out["server"] = server;
+    out["zone"] = zone;
+    out["protocol"] = "tcp";
+    out["max_records"] = max_records;
+    out["max_messages"] = max_messages;
+    const std::uint16_t id = dns_query_id(zone, kDnsTypeAXFR);
+    const auto query = dns_build_query(zone, kDnsTypeAXFR, id, false, false);
+    SOCKET s = INVALID_SOCKET;
+    std::string error;
+    if (!dns_tcp_connect(server, timeout, s, error)) {
+        out["error"] = error;
+        out["elapsed_ms"] = GetTickCount64() - started;
+        return false;
+    }
+    std::vector<std::uint8_t> framed;
+    dns_put_u16(framed, static_cast<std::uint16_t>(query.size()));
+    framed.insert(framed.end(), query.begin(), query.end());
+    if (!dns_send_all(s, framed.data(), framed.size(), timeout, error)) {
+        out["error"] = error;
+        out["elapsed_ms"] = GetTickCount64() - started;
+        closesocket(s);
+        return false;
+    }
+    json messages = json::array();
+    json records = json::array();
+    std::size_t soa_count = 0;
+    bool refused = false;
+    bool accepted = false;
+    bool capped = false;
+    for (std::size_t msg = 0; msg < max_messages && records.size() < max_records && !dns_cancelled_or_deadline(); ++msg) {
+        std::uint8_t len_buf[2] = {};
+        if (!dns_recv_exact(s, len_buf, sizeof(len_buf), timeout, error))
+            break;
+        const std::size_t msg_len = (static_cast<std::size_t>(len_buf[0]) << 8) | len_buf[1];
+        if (msg_len == 0 || msg_len > 65535) {
+            error = "invalid_tcp_dns_length";
+            break;
+        }
+        std::vector<std::uint8_t> packet(msg_len);
+        if (!dns_recv_exact(s, packet.data(), packet.size(), timeout, error))
+            break;
+        dns_response_t response;
+        response.server = server;
+        response.protocol = "tcp";
+        response.received = true;
+        response.elapsed_ms = GetTickCount64() - started;
+        dns_parse_response(packet, id, max_records, response);
+        json msg_json = dns_response_json(response);
+        messages.push_back(msg_json);
+        if (response.rcode == 5 || response.rcode == 9) {
+            refused = true;
+            break;
+        }
+        if (response.rcode != 0) {
+            error = "rcode_" + std::to_string(response.rcode);
+            break;
+        }
+        for (const auto& rr : response.answers) {
+            if (rr.type == kDnsTypeSOA)
+                ++soa_count;
+            if (records.size() < max_records)
+                records.push_back(dns_rr_json(rr));
+            else
+                capped = true;
+        }
+        accepted = accepted || !response.answers.empty();
+        if (soa_count >= 2)
+            break;
+    }
+    if (records.size() >= max_records)
+        capped = true;
+    if (dns_cancelled_or_deadline())
+        error = mcp_standalone::current_call_cancelled() ? "cancelled" : "deadline_expired";
+    closesocket(s);
+    out["elapsed_ms"] = GetTickCount64() - started;
+    out["messages"] = messages;
+    out["records"] = records;
+    out["record_count"] = records.size();
+    out["soa_count"] = soa_count;
+    out["accepted_evidence"] = accepted;
+    out["refused_evidence"] = refused;
+    out["capped"] = capped;
+    if (!error.empty())
+        out["error"] = error;
+    return accepted && !refused && error.empty();
+}
+
+static tool_result_t aida_dns_zone_transfer(const json& params)
+{
+    const char* key = params.contains("zone") && params["zone"].is_string() ? "zone" : "name";
+    if (!params.is_object() || !params.contains(key) || !params[key].is_string())
+        return network_param_error("zone is required", "zone");
+    const std::string zone = dns_trim_dot(params[key].get<std::string>());
+    if (!dns_valid_name(zone))
+        return network_param_error("zone is not a valid DNS name", "zone");
+    const DWORD timeout = static_cast<DWORD>(std::max(500, std::min(params.value("timeout_ms", 7000), 15000)));
+    const std::size_t max_records = static_cast<std::size_t>(std::max(1, std::min(params.value("max_records", 64), 512)));
+    const std::size_t max_messages = static_cast<std::size_t>(std::max(1, std::min(params.value("max_messages", 16), 64)));
+    std::vector<std::string> servers;
+    if (params.contains("server") && params["server"].is_string())
+        servers.push_back(dns_normalize_server(params["server"].get<std::string>()));
+    json discovery = json::array();
+    if (servers.empty()) {
+        const auto resolvers = dns_servers_from_params(params);
+        servers = dns_discover_zone_transfer_servers(zone, resolvers, timeout, discovery);
+    }
+    if (servers.empty()) {
+        json d{{"zone", zone}, {"discovery", discovery}};
+        return tool_result_t::error("No authoritative name server address was available for AXFR; pass server as an IP literal.", "dns_axfr_no_server", d);
+    }
+    if (servers.size() > 8)
+        servers.resize(8);
+    json out;
+    out["zone"] = zone;
+    out["discovery"] = discovery;
+    out["attempts"] = json::array();
+    bool accepted = false;
+    bool refused = false;
+    for (const auto& server : servers) {
+        if (dns_cancelled_or_deadline()) {
+            out["cancelled"] = mcp_standalone::current_call_cancelled();
+            out["deadline_expired"] = !mcp_standalone::current_call_cancelled();
+            return tool_result_t::error("DNS zone transfer cancelled or deadline reached", "cancelled", out);
+        }
+        json attempt;
+        const bool ok = dns_tcp_zone_transfer(server, zone, timeout, max_records, max_messages, attempt);
+        accepted = accepted || ok || attempt.value("accepted_evidence", false);
+        refused = refused || attempt.value("refused_evidence", false);
+        out["attempts"].push_back(std::move(attempt));
+        if (accepted || refused)
+            break;
+    }
+    out["accepted"] = accepted;
+    out["refused"] = refused && !accepted;
+    out["bounded"] = true;
+    if (accepted)
+        return tool_result_t::ok("DNS zone transfer accepted by at least one server; evidence was capped.", out);
+    if (refused)
+        return tool_result_t::ok("DNS zone transfer refused by the tested server.", out);
+    return tool_result_t::error("DNS zone transfer did not complete; see transport evidence.", "dns_axfr_inconclusive", out);
+}
+
+static tool_result_t aida_dns_check_dnssec(const json& params)
+{
+    const char* key = params.contains("domain") && params["domain"].is_string() ? "domain" : "name";
+    if (!params.is_object() || !params.contains(key) || !params[key].is_string())
+        return network_param_error("domain is required", "domain");
+    const std::string domain = dns_trim_dot(params[key].get<std::string>());
+    if (!dns_valid_name(domain))
+        return network_param_error("domain is not a valid DNS name", "domain");
+    const DWORD timeout = static_cast<DWORD>(std::max(500, std::min(params.value("timeout_ms", 6000), 15000)));
+    const auto servers = dns_servers_from_params(params);
+    if (servers.empty()) {
+        json d{{"domain", domain}, {"source", "GetNetworkParams"}};
+        return tool_result_t::error("No configured DNS resolver was available; pass server as an IP literal.", "dns_resolver_unavailable", d);
+    }
+    json out;
+    out["domain"] = domain;
+    out["dnssec_ok_bit_sent"] = true;
+    out["queries"] = json::array();
+    bool ds_present = false;
+    bool dnskey_present = false;
+    bool rrsig_present = false;
+    bool denial_present = false;
+    bool authenticated_data = false;
+    bool any_response = false;
+    for (const auto type : {kDnsTypeDS, kDnsTypeDNSKEY, kDnsTypeRRSIG, kDnsTypeNSEC}) {
+        if (dns_cancelled_or_deadline()) {
+            out["cancelled"] = mcp_standalone::current_call_cancelled();
+            out["deadline_expired"] = !mcp_standalone::current_call_cancelled();
+            return tool_result_t::error("DNSSEC check cancelled or deadline reached", "cancelled", out);
+        }
+        const std::uint16_t id = dns_query_id(domain, type);
+        const auto query = dns_build_query(domain, type, id, true, true);
+        dns_response_t response;
+        dns_udp_query(servers.front(), query, id, timeout, 128, response);
+        if (response.received && (response.flags & 0x0200u) != 0) {
+            dns_response_t tcp_response;
+            if (dns_tcp_query_once(servers.front(), query, id, timeout, 128, tcp_response))
+                response = std::move(tcp_response);
+        }
+        any_response = any_response || response.received;
+        ds_present = ds_present || dns_response_has_type(response, kDnsTypeDS);
+        dnskey_present = dnskey_present || dns_response_has_type(response, kDnsTypeDNSKEY);
+        rrsig_present = rrsig_present || dns_response_has_type(response, kDnsTypeRRSIG);
+        denial_present = denial_present || dns_response_has_type(response, kDnsTypeNSEC) || dns_response_has_type(response, kDnsTypeNSEC3);
+        authenticated_data = authenticated_data || ((response.flags & 0x0020u) != 0);
+        out["queries"].push_back({{"type", dns_type_name(type)}, {"response", dns_response_json(response)}});
+    }
+    out["evidence"] = {
+        {"ds_present", ds_present},
+        {"dnskey_present", dnskey_present},
+        {"rrsig_present", rrsig_present},
+        {"authenticated_data_flag", authenticated_data},
+        {"authenticated_denial_evidence", denial_present}
+    };
+    std::string status = "inconclusive";
+    if (dnskey_present && rrsig_present)
+        status = "signed_zone_evidence";
+    else if (ds_present)
+        status = "delegation_signed_evidence";
+    else if (denial_present || any_response)
+        status = "no_dnssec_signature_evidence";
+    out["status"] = status;
+    if (!any_response)
+        return tool_result_t::error("DNSSEC check did not receive a resolver response", "dns_no_response", out);
+    return tool_result_t::ok("DNSSEC evidence check complete", out);
+}
+
+static tool_result_t aida_dns_passive_history(const json& params)
+{
+    std::string domain;
+    if (params.contains("domain") && params["domain"].is_string())
+        domain = dns_lower_ascii(dns_trim_dot(params["domain"].get<std::string>()));
+    else if (params.contains("name") && params["name"].is_string())
+        domain = dns_lower_ascii(dns_trim_dot(params["name"].get<std::string>()));
+    if (!domain.empty() && !dns_valid_name(domain))
+        return network_param_error("domain is not a valid DNS name", "domain");
+    const bool suffix_match = params.value("include_subdomains", true);
+    const std::size_t limit = static_cast<std::size_t>(std::max(1, std::min(params.value("limit", 64), 256)));
+    std::uint32_t filter_pid = 0;
+    if (params.contains("pid") && params["pid"].is_number_unsigned())
+        filter_pid = params["pid"].get<std::uint32_t>();
+    json out;
+    out["source"] = "kernel_dns_query_log";
+    out["network_requests_sent"] = false;
+    out["driver_connected"] = driver_bridge::using_kernel_driver();
+    out["driver_attached_pid"] = driver_bridge::attached_pid();
+    out["filter_domain"] = domain;
+    out["include_subdomains"] = suffix_match;
+    if (!driver_bridge::using_kernel_driver() || driver_bridge::attached_pid() == 0) {
+        out["driver_status"] = driver_bridge::status();
+        out["driver_last_error"] = driver_bridge::last_error();
+        return tool_result_t::error("Passive DNS history requires the kernel DNS log to be available.", "dns_passive_source_unavailable", out);
+    }
+    auto entries = driver_bridge::get_dns_queries(filter_pid);
+    json rows = json::array();
+    for (const auto& e : entries) {
+        const std::string row_domain = dns_lower_ascii(dns_trim_dot(e.domain));
+        bool match = domain.empty() || row_domain == domain;
+        if (!match && suffix_match && row_domain.size() > domain.size() && row_domain.compare(row_domain.size() - domain.size(), domain.size(), domain) == 0) {
+            const std::size_t dot_pos = row_domain.size() - domain.size() - 1;
+            match = dot_pos < row_domain.size() && row_domain[dot_pos] == '.';
+        }
+        if (!match)
+            continue;
+        json row;
+        row["timestamp"] = e.timestamp;
+        row["pid"] = e.pid;
+        row["domain"] = e.domain;
+        row["query_type"] = e.query_type;
+        row["type_name"] = dns_type_name(static_cast<std::uint16_t>(e.query_type));
+        row["response_code"] = e.response_code;
+        row["ttl"] = e.ttl;
+        bool has_addr = false;
+        for (int i = 0; i < 16; ++i) {
+            if (e.resolved_addr[i] != 0) {
+                has_addr = true;
+                break;
+            }
+        }
+        if (has_addr)
+            row["resolved_address"] = format_ip(e.resolved_addr, (e.query_type == 28) ? 23u : 2u);
+        rows.push_back(std::move(row));
+        if (rows.size() >= limit)
+            break;
+    }
+    out["count"] = rows.size();
+    out["limit"] = limit;
+    out["entries"] = rows;
+    out["limitations"] = "Local passive history is limited to DNS queries captured by the AiDA kernel network telemetry ring.";
+    return tool_result_t::ok("Passive DNS history collected from local telemetry", out);
 }
 
 tool_result_t network_dns_log(const json& params)
@@ -3886,7 +5265,7 @@ tool_result_t api_monitor_results(const json& params)
 
 void register_network_tools(mcp_standalone::server_t& srv) {
     diag::log_tagged("net_tools", "register_network_tools entry");
-        aida::burp::register_all_tools(srv);
+    aida::burp::register_all_tools(srv);
 
     register_compat(srv, {
         OBFSTR("network_capture_manage"), OBFSTR("network"),
@@ -4146,6 +5525,54 @@ void register_network_tools(mcp_standalone::server_t& srv) {
             return compat_unknown_action("network_dns_manage", action);
         },
         false});
+
+    srv.register_tool({
+        "aida.dns.lookup",
+        "Perform bounded DNS lookups through explicit or configured resolvers and return parsed answer, authority, additional, flag, rcode, truncation, and resolver evidence.",
+        {{"name", "string", "DNS name to query.", true},
+         {"record_type", "string", "Single DNS record type such as A, AAAA, MX, TXT, NS, SOA, CAA, DS, DNSKEY, or TYPE123.", false},
+         {"record_types", "array|string", "Record type list. Defaults to A and AAAA.", false},
+         {"server", "string", "Resolver IP literal. Defaults to Windows configured DNS servers.", false},
+         {"servers", "array", "Resolver IP literal list, capped at 8.", false},
+         {"timeout_ms", "number", "Per-query timeout bounded by MCP deadline, capped at 15000.", false},
+         {"max_records", "number", "Maximum parsed records per response, capped at 512.", false},
+         {"dnssec", "boolean", "Set EDNS0 DNSSEC OK on the query.", false}},
+        false,
+        aida_dns_lookup
+    });
+
+    srv.register_tool({
+        "aida.dns.zone_transfer",
+        "Attempt a bounded TCP AXFR zone transfer against an explicit server or discovered authoritative name server and report acceptance, refusal, transport, rcode, and capped record evidence.",
+        {{"zone", "string", "DNS zone name.", true},
+         {"server", "string", "Authoritative name server IP literal. If omitted, NS records are discovered through configured resolvers.", false},
+         {"timeout_ms", "number", "Per-server timeout bounded by MCP deadline, capped at 15000.", false},
+         {"max_records", "number", "Maximum transferred records returned, capped at 512.", false},
+         {"max_messages", "number", "Maximum AXFR DNS messages read, capped at 64.", false}},
+        false,
+        aida_dns_zone_transfer
+    });
+
+    srv.register_tool({
+        "aida.dns.check_dnssec",
+        "Collect bounded DNSSEC evidence with EDNS0 DO queries for DS, DNSKEY, RRSIG, and denial records without claiming validation beyond observed resolver evidence.",
+        {{"domain", "string", "DNS name to check.", true},
+         {"server", "string", "Resolver IP literal. Defaults to Windows configured DNS servers.", false},
+         {"timeout_ms", "number", "Per-query timeout bounded by MCP deadline, capped at 15000.", false}},
+        false,
+        aida_dns_check_dnssec
+    });
+
+    srv.register_tool({
+        "aida.dns.passive_history",
+        "Return local passive DNS history from AiDA kernel DNS telemetry without sending network requests.",
+        {{"domain", "string", "Optional domain filter.", false},
+         {"include_subdomains", "boolean", "Match subdomains of domain; defaults true.", false},
+         {"pid", "number", "Optional process id filter.", false},
+         {"limit", "number", "Maximum entries returned, capped at 256.", false}},
+        true,
+        aida_dns_passive_history
+    });
 
     register_compat(srv, {
         OBFSTR("network_os_fingerprint"), OBFSTR("network"),
@@ -5323,6 +6750,13 @@ void register_network_tools(mcp_standalone::server_t& srv) {
 
 
 
+    register_http_tools(srv);
+    web_vuln_tools::register_web_vuln_tools(srv);
+    aida::network::api_enum_tools::register_api_enum_tools(srv);
+    aida::network::js_analysis_tools::register_js_analysis_tools(srv);
+    aida::cloud_tools::register_cloud_tools(srv);
+    register_network_tool_aliases(srv);
+    diag::log_tagged("net_tools", "register_network_tools complete");
 
 
 }

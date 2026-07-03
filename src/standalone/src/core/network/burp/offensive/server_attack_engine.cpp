@@ -1288,6 +1288,24 @@ std::string collaborator_url_for_token(const collaborator::token_info_t& token)
     return {};
 }
 
+std::optional<collaborator::token_info_t> issue_collaborator_token()
+{
+    const std::string token = collaborator::generate_token();
+    if (token.empty())
+        return std::nullopt;
+    for (const auto& info : collaborator::list_tokens()) {
+        if (info.token == token)
+            return info;
+    }
+    collaborator::token_info_t info;
+    info.token = token;
+    const auto cfg = collaborator::current_config();
+    if (!cfg.public_host.empty())
+        info.full_domain = token + "." + cfg.public_host;
+    info.issued_ms = now_ms();
+    return info;
+}
+
 json interactions_to_json(const std::vector<collaborator::interaction_t>& interactions)
 {
     json out = json::array();
@@ -1516,10 +1534,10 @@ action_result_t run_ssrf_like(const std::string& action, const json& payload, bo
                 auto metadata = metadata_targets_for_providers({"all"});
                 probes.insert(probes.end(), metadata.begin(), metadata.end());
             }
-            auto cloud_set = payload_entries_as_probes("ssrf/cloud", "payload-library:ssrf/cloud", 8);
+            auto cloud_set = payload_entries_as_probes("ssrf/cloud_metadata_expanded", "payload-library:ssrf/cloud_metadata_expanded", 8);
             probes.insert(probes.end(), cloud_set.begin(), cloud_set.end());
             if (json_bool_or(payload, "internal_port_scan", true)) {
-                auto loopback = payload_entries_as_probes("ssrf/loopback", "payload-library:ssrf/loopback", 8);
+                auto loopback = payload_entries_as_probes("ssrf/internal_urls", "payload-library:ssrf/internal_urls", 8);
                 probes.insert(probes.end(), loopback.begin(), loopback.end());
                 std::vector<int> common_ports = {22, 25, 80, 443, 3306, 5432, 6379, 8080, 9200, 11211, 27017};
                 const uint64_t start_port = json_u64_or(payload, "port_range_start", 1, 1, 65535);
@@ -1539,15 +1557,17 @@ action_result_t run_ssrf_like(const std::string& action, const json& payload, bo
     std::optional<collaborator::token_info_t> token;
     const bool use_collab = json_bool_or(payload, "use_collaborator", !metadata_only);
     if (use_collab && collaborator::is_running()) {
-        token = collaborator::issue_token();
-        const std::string url = collaborator_url_for_token(*token);
-        if (!url.empty()) {
+        token = issue_collaborator_token();
+        const std::string url = token.has_value() ? collaborator_url_for_token(*token) : std::string();
+        if (token.has_value() && !url.empty()) {
             scanner::probe_t p;
             p.payload = url;
             p.marker = token->token;
             p.variant = "collaborator-oob";
             probes.push_back(std::move(p));
             out["oob_token"] = collaborator_token_json(*token);
+        } else {
+            out["oob_unavailable"] = true;
         }
     } else if (use_collab) {
         out["oob_unavailable"] = true;
@@ -1663,7 +1683,14 @@ action_result_t run_ssti(const std::string& action, const json& payload)
             return lower_ascii(p.variant).find(engine) == std::string::npos;
         }), probes.end());
     }
-    auto lib = payload_entries_as_probes("ssti/all-engines", "payload-library:ssti/all-engines", 8);
+    std::string ssti_engine = engine;
+    if (ssti_engine == "jinja") ssti_engine = "jinja2";
+    if (ssti_engine == "free_marker") ssti_engine = "freemarker";
+    if (ssti_engine == "vm") ssti_engine = "velocity";
+    const std::string ssti_set = engine == "auto" ? std::string("ssti/detect") : std::string("ssti/") + ssti_engine;
+    auto lib = payload_entries_as_probes(ssti_set, "payload-library:" + ssti_set, 8);
+    if (lib.empty())
+        lib = payload_entries_as_probes("ssti/all-engines", "payload-library:ssti/all-engines", 8);
     for (auto& p : lib) {
         if (p.payload.find("7*7") != std::string::npos) {
             p.marker = "49";
@@ -1785,10 +1812,12 @@ action_result_t run_cmdi(const std::string& action, const json& payload)
     auto marker_probes = cmdi_marker_probes(ip, marker);
     probes.insert(probes.end(), marker_probes.begin(), marker_probes.end());
     if (json_bool_or(payload, "filter_bypass", false)) {
-        auto unix_adv = payload_entries_as_probes("cmdi/unix", "payload-library:cmdi/unix", 8);
-        auto win_adv = payload_entries_as_probes("cmdi/windows", "payload-library:cmdi/windows", 8);
+        auto unix_adv = payload_entries_as_probes("cmdi/unix_advanced", "payload-library:cmdi/unix_advanced", 8);
+        auto win_adv = payload_entries_as_probes("cmdi/windows_advanced", "payload-library:cmdi/windows_advanced", 8);
+        auto bypass = payload_entries_as_probes("cmdi/filter_bypass", "payload-library:cmdi/filter_bypass", 8);
         probes.insert(probes.end(), unix_adv.begin(), unix_adv.end());
         probes.insert(probes.end(), win_adv.begin(), win_adv.end());
+        probes.insert(probes.end(), bypass.begin(), bypass.end());
     }
     auto delivered = deliver_probes(ctx, ip, baseline, "cmdi", probes, limits, true, true);
     out["confirmation_attempts"] = delivered.attempts;
@@ -1872,10 +1901,12 @@ action_result_t run_traversal_like(const std::string& action, const json& payloa
             p.variant = "php-wrapper";
             probes.insert(probes.begin(), std::move(p));
         }
-        auto unix_lfi = payload_entries_as_probes("lfi/unix", "payload-library:lfi/unix", 8);
-        auto win_lfi = payload_entries_as_probes("lfi/windows", "payload-library:lfi/windows", 8);
+        auto unix_lfi = payload_entries_as_probes("path_traversal/unix_advanced", "payload-library:path_traversal/unix_advanced", 8);
+        auto win_lfi = payload_entries_as_probes("path_traversal/windows_advanced", "payload-library:path_traversal/windows_advanced", 8);
+        auto encoded_lfi = payload_entries_as_probes("path_traversal/encoding_bypass", "payload-library:path_traversal/encoding_bypass", 8);
         probes.insert(probes.end(), unix_lfi.begin(), unix_lfi.end());
         probes.insert(probes.end(), win_lfi.begin(), win_lfi.end());
+        probes.insert(probes.end(), encoded_lfi.begin(), encoded_lfi.end());
     }
     auto delivered = deliver_probes(ctx, ip, baseline, "path-traversal", probes, limits, true, true);
     out["attempts"] = delivered.attempts;
@@ -1966,8 +1997,11 @@ action_result_t run_xxe(const std::string& action, const json& payload)
     auto baseline = send_baseline(ctx, limits, out);
     std::optional<collaborator::token_info_t> token;
     if (json_bool_or(p, "use_collaborator", true) && collaborator::is_running()) {
-        token = collaborator::issue_token();
-        out["oob_token"] = collaborator_token_json(*token);
+        token = issue_collaborator_token();
+        if (token.has_value())
+            out["oob_token"] = collaborator_token_json(*token);
+        else
+            out["oob_unavailable"] = true;
     } else if (json_bool_or(p, "use_collaborator", true)) {
         out["oob_unavailable"] = true;
     }
@@ -2043,8 +2077,11 @@ action_result_t run_deserialize(const std::string& action, const json& payload)
     std::optional<collaborator::token_info_t> token;
     const std::string supplied_token = json_string_or(payload, "oob_token", "");
     if (json_bool_or(payload, "use_collaborator", true) && collaborator::is_running() && supplied_token.empty()) {
-        token = collaborator::issue_token();
-        out["oob_token"] = collaborator_token_json(*token);
+        token = issue_collaborator_token();
+        if (token.has_value())
+            out["oob_token"] = collaborator_token_json(*token);
+        else
+            out["oob_unavailable"] = true;
     }
     std::vector<scanner::probe_t> probes = scanner_module_probes("deserial", ip, ctx, baseline, limits);
     if (payload.contains("payload_b64") && payload["payload_b64"].is_string()) {
@@ -2277,7 +2314,12 @@ action_result_t run_oob_confirm(const std::string& action, const json& payload)
     }
     std::vector<collaborator::interaction_t> interactions;
     if (!token.empty()) interactions = collaborator::poll_by_token(token);
-    else interactions = collaborator::poll_after_id(json_u64_or(payload, "after_id", 0, 0, UINT64_MAX), static_cast<size_t>(json_u64_or(payload, "max_entries", 64, 1, 512)));
+    else {
+        collaborator::poll_request_t req;
+        req.after_id = json_u64_or(payload, "after_id", 0, 0, UINT64_MAX);
+        req.max_entries = static_cast<size_t>(json_u64_or(payload, "max_entries", 64, 1, 512));
+        interactions = collaborator::poll_async(req).interactions;
+    }
     out["collaborator_running"] = true;
     if (!token.empty()) {
         out["token_len"] = token.size();

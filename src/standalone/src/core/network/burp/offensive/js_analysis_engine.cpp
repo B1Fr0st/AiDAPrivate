@@ -9,6 +9,7 @@
 #include "js_analysis_engine.hpp"
 
 #include "../audit_http.hpp"
+#include "../payload_library.hpp"
 #include "../../js_analysis_tools_standalone.hpp"
 #include "../../../mcp/mcp_standalone.hpp"
 #include "../../../../helpers/diag_log.hpp"
@@ -163,6 +164,20 @@ std::string json_string(const json& params, const char* name)
     if (!params.contains(name) || !params[name].is_string())
         return {};
     return params[name].get<std::string>();
+}
+
+json secret_patterns_from_params(const json& params)
+{
+    if (params.contains("patterns"))
+        return params["patterns"];
+    payloads::initialize();
+    const auto entries = payloads::entries("js/secrets_patterns", 64);
+    json out = json::array();
+    for (const auto& entry : entries) {
+        if (!entry.empty())
+            out.push_back(entry);
+    }
+    return out;
 }
 
 std::string host_header_value(const std::string& host, uint16_t port, bool tls)
@@ -790,7 +805,7 @@ nlohmann::json extract_secrets(const nlohmann::json& params)
     json findings = json::array();
     json source_meta = json::array();
     std::set<std::string> seen;
-    const json patterns = params.contains("patterns") ? params["patterns"] : json::array();
+    const json patterns = secret_patterns_from_params(params);
     for (const auto& s : sources) {
         source_meta.push_back(source_summary(s));
         if (!s.error.empty() || s.source.empty() || call_expired())
@@ -847,7 +862,7 @@ nlohmann::json source_map_analyze(const nlohmann::json& params)
                 item["content_sha256"] = aida::network::js_analysis_tools::sha256_hex(content);
                 const std::string label = item["path"].get<std::string>();
                 json ep = aida::network::js_analysis_tools::extract_endpoints_from_source(content, label, true, max_results);
-                const json patterns = params.contains("patterns") ? params["patterns"] : json::array();
+                const json patterns = secret_patterns_from_params(params);
                 json sec = aida::network::js_analysis_tools::extract_redacted_secrets_from_source(content, label, 0.55, max_results, patterns);
                 for (const auto& v : ep) {
                     if (out["endpoints"].size() < max_results)

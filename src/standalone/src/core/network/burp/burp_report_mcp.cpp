@@ -8,6 +8,7 @@
 #include "burp_report_mcp.hpp"
 #include "report_generator.hpp"
 #include "issue.hpp"
+#include "evidence_store.hpp"
 #include "../../settings/standalone_compat.hpp"
 #include "helpers/diag_log.hpp"
 
@@ -31,6 +32,11 @@ tool_result_t error_with_data(const std::string& text, const json& data)
     return tool_result_t{false, text, data};
 }
 
+std::string safe_text(const std::string& value, size_t limit = 256)
+{
+    return evidence_store::redact_sensitive_text(value, limit);
+}
+
 json report_to_json(const report::generated_report_t& r)
 {
     json out;
@@ -38,9 +44,35 @@ json report_to_json(const report::generated_report_t& r)
     out["ts_ms"] = static_cast<uint64_t>(r.ts_ms);
     out["title"] = r.title;
     out["output_path"] = r.output_path;
+    out["inline"] = r.inline_output;
     out["format"] = report::format_label(r.format);
     out["issue_count"] = static_cast<uint64_t>(r.issue_count);
     return out;
+}
+
+bool json_u64_value(const json& value, uint64_t& out)
+{
+    if (value.is_number_unsigned()) {
+        out = value.get<uint64_t>();
+        return true;
+    }
+    if (value.is_number_integer()) {
+        const int64_t v = value.get<int64_t>();
+        if (v >= 0) {
+            out = static_cast<uint64_t>(v);
+            return true;
+        }
+    }
+    if (value.is_string()) {
+        try {
+            const std::string text = value.get<std::string>();
+            size_t used = 0;
+            out = std::stoull(text, &used);
+            return used == text.size();
+        } catch (...) {
+        }
+    }
+    return false;
 }
 
 tool_result_t handle_generate(const json& p)
@@ -72,27 +104,32 @@ tool_result_t handle_generate(const json& p)
     if (p.contains("include_evidence") && p["include_evidence"].is_boolean()) cfg.include_evidence = p["include_evidence"].get<bool>();
     if (p.contains("include_remediation") && p["include_remediation"].is_boolean()) cfg.include_remediation = p["include_remediation"].get<bool>();
     if (p.contains("output_path") && p["output_path"].is_string()) cfg.output_path = p["output_path"].get<std::string>();
+    if (p.contains("session_id") && p["session_id"].is_string()) cfg.session_id = p["session_id"].get<std::string>();
+    if (p.contains("include_session_context") && p["include_session_context"].is_boolean()) cfg.include_session_context = p["include_session_context"].get<bool>();
+    if (p.contains("include_audit_trail") && p["include_audit_trail"].is_boolean()) cfg.include_audit_trail = p["include_audit_trail"].get<bool>();
+    if (p.contains("audit_trail_limit") && p["audit_trail_limit"].is_number_unsigned()) cfg.audit_trail_limit = static_cast<size_t>(p["audit_trail_limit"].get<uint64_t>());
+    if (p.contains("target_domain") && p["target_domain"].is_string()) cfg.target_domain = p["target_domain"].get<std::string>();
+    else if (p.contains("host") && p["host"].is_string()) cfg.target_domain = p["host"].get<std::string>();
+    if (p.contains("include_recon") && p["include_recon"].is_boolean()) cfg.include_recon = p["include_recon"].get<bool>();
+    if (p.contains("include_suppressed") && p["include_suppressed"].is_boolean()) cfg.include_suppressed = p["include_suppressed"].get<bool>();
 
     if (p.contains("include_issue_ids") && p["include_issue_ids"].is_array())
     {
         for (const auto& v : p["include_issue_ids"])
         {
-            if (v.is_number()) cfg.include_issue_ids.push_back(static_cast<uint64_t>(v.get<int64_t>()));
+            uint64_t id = 0;
+            if (json_u64_value(v, id)) cfg.include_issue_ids.push_back(id);
         }
     }
 
-    if (cfg.include_issue_ids.empty() && p.contains("severity_min") && p["severity_min"].is_string())
+    if (p.contains("severity_min") && p["severity_min"].is_string())
     {
         std::string sev_str = p["severity_min"].get<std::string>();
         severity_t sev;
         if (parse_severity(sev_str, sev))
         {
-            issue_filter_t filt;
-            filt.has_severity_min = true;
-            filt.severity_min = sev;
-            auto matching = issue_store::list(filt);
-            for (const auto& iss : matching) cfg.include_issue_ids.push_back(iss.id);
-            diag::log_tagged_fmt("mcp_burp", "report_generate severity_min=%s matched=%zu", sev_str.c_str(), matching.size());
+            cfg.has_severity_min = true;
+            cfg.severity_min = sev;
         }
         else
         {
@@ -100,9 +137,21 @@ tool_result_t handle_generate(const json& p)
             return tool_result_t::error("invalid severity_min: " + sev_str + " (expected info, low, medium, high, or critical)");
         }
     }
+    if (p.contains("audit_id")) {
+        uint64_t audit_id = 0;
+        if (!json_u64_value(p["audit_id"], audit_id))
+            return tool_result_t::error("invalid audit_id");
+        cfg.has_audit_id = true;
+        cfg.audit_id = audit_id;
+    }
+    if (p.contains("include_offensive_run_ids") && p["include_offensive_run_ids"].is_array()) {
+        for (const auto& v : p["include_offensive_run_ids"])
+            if (v.is_string()) cfg.include_offensive_run_ids.push_back(v.get<std::string>());
+    }
 
+    const std::string safe_title = safe_text(cfg.title);
     diag::log_tagged_fmt("mcp_burp", "report_generate title=%s format=%s issue_ids=%zu evidence=%d remediation=%d",
-        cfg.title.c_str(), format_str.c_str(), cfg.include_issue_ids.size(), (int)cfg.include_evidence, (int)cfg.include_remediation);
+        safe_title.c_str(), format_str.c_str(), cfg.include_issue_ids.size(), (int)cfg.include_evidence, (int)cfg.include_remediation);
 
     std::string out_path_or_error;
     bool ok = report::generate(cfg, out_path_or_error);
@@ -112,19 +161,30 @@ tool_result_t handle_generate(const json& p)
         json data;
         data["error"] = out_path_or_error;
         data["status"] = "generate_failed";
-        data["title"] = cfg.title;
+        data["title"] = safe_title;
         data["format"] = format_str;
         return error_with_data("report generation failed: " + out_path_or_error, data);
     }
 
-    diag::log_tagged_fmt("mcp_burp", "report_generate ok path=%s", out_path_or_error.c_str());
+    diag::log_tagged_fmt("mcp_burp", "report_generate ok output_len=%zu inline=%d", out_path_or_error.size(), cfg.output_path.empty() ? 1 : 0);
     json result;
     result["status"] = "generated";
-    result["output_path"] = out_path_or_error;
-    result["title"] = cfg.title;
+    result["output_path"] = cfg.output_path.empty() ? std::string() : out_path_or_error;
+    result["inline"] = cfg.output_path.empty();
+    if (cfg.output_path.empty())
+        result["content"] = out_path_or_error;
+    result["title"] = safe_title;
     result["format"] = format_str;
-    result["issue_count"] = static_cast<uint64_t>(cfg.include_issue_ids.size());
-    return tool_result_t::ok("report generated: " + out_path_or_error, result);
+    size_t issue_count = 0;
+    uint64_t newest_ts = 0;
+    for (const auto& r : report::list_reports()) {
+        if (((cfg.output_path.empty() && r.inline_output) || (!cfg.output_path.empty() && r.output_path == cfg.output_path)) && r.ts_ms >= newest_ts) {
+            issue_count = r.issue_count;
+            newest_ts = r.ts_ms;
+        }
+    }
+    result["issue_count"] = static_cast<uint64_t>(issue_count);
+    return tool_result_t::ok(cfg.output_path.empty() ? std::string("report generated inline") : std::string("report generated: " + out_path_or_error), result);
 }
 
 tool_result_t handle_list(const json&)

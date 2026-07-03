@@ -384,17 +384,37 @@ static double erfc_approx(double x)
     return x >= 0.0 ? r : (2.0 - r);
 }
 
-static analysis_result_t analyze_internal(const std::vector<std::string>& tokens)
+static std::string normalize_mode(std::string mode)
+{
+    std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (mode == "bit" || mode == "bits") return "bit";
+    if (mode == "byte" || mode == "bytes") return "byte";
+    if (mode == "character" || mode == "characters" || mode == "char") return "character";
+    if (mode == "position" || mode == "positions") return "position";
+    return "all";
+}
+
+static analysis_result_t analyze_internal(const std::vector<std::string>& tokens, const analysis_config_t& config)
 {
     analysis_result_t a;
+    a.analysis_mode = normalize_mode(config.mode);
     if (tokens.empty()) {
         a.verdict = "no_samples";
+        a.confidence_label = "none";
+        a.fips_assessment = "not_evaluated_no_samples";
+        a.nist_sp800_90b_assessment = "not_evaluated_no_samples";
         return a;
     }
     a.samples_count = tokens.size();
 
     std::unordered_map<size_t, size_t> length_hist;
-    for (const auto& t : tokens) length_hist[t.size()]++;
+    a.min_token_length = tokens.front().size();
+    a.max_token_length = tokens.front().size();
+    for (const auto& t : tokens) {
+        length_hist[t.size()]++;
+        a.min_token_length = (std::min)(a.min_token_length, t.size());
+        a.max_token_length = (std::max)(a.max_token_length, t.size());
+    }
     size_t mode_len = 0;
     size_t mode_count = 0;
     for (const auto& kv : length_hist) {
@@ -411,6 +431,13 @@ static analysis_result_t analyze_internal(const std::vector<std::string>& tokens
 
     for (uint8_t b : bytes) a.byte_frequency[b]++;
     double n = static_cast<double>(bytes.size());
+    size_t max_frequency = 0;
+    for (size_t i = 0; i < 256; ++i) {
+        if (a.byte_frequency[i] != 0) {
+            ++a.alphabet_size;
+            max_frequency = (std::max)(max_frequency, a.byte_frequency[i]);
+        }
+    }
 
     double entropy = 0.0;
     for (size_t i = 0; i < 256; ++i) {
@@ -419,6 +446,10 @@ static analysis_result_t analyze_internal(const std::vector<std::string>& tokens
         entropy -= p * (std::log(p) / std::log(2.0));
     }
     a.shannon_entropy_bits = entropy;
+    if (max_frequency > 0 && n > 0.0) {
+        const double pmax = static_cast<double>(max_frequency) / n;
+        a.min_entropy_bits_per_symbol = -std::log(pmax) / std::log(2.0);
+    }
 
     double expected = n / 256.0;
     double chi = 0.0;
@@ -435,14 +466,44 @@ static analysis_result_t analyze_internal(const std::vector<std::string>& tokens
         a.chi_square_p_value = std::nan("");
     }
 
-    for (size_t i = 0; i < mode_len; ++i) {
-        if (i >= 256) break;
+    const size_t configured_positions = config.max_positions == 0 ? 128 : config.max_positions;
+    const size_t position_cap = (std::min)((std::min)(configured_positions, static_cast<size_t>(256)), a.max_token_length);
+    a.position_analysis.reserve(position_cap);
+    for (size_t i = 0; i < position_cap; ++i) {
         size_t accum = 0;
         size_t count = 0;
+        std::vector<size_t> counts(256, 0);
         for (const auto& t : tokens) {
-            if (i < t.size()) { accum += static_cast<uint8_t>(t[i]); ++count; }
+            if (i < t.size()) {
+                const uint8_t c = static_cast<uint8_t>(t[i]);
+                accum += c;
+                ++count;
+                counts[c]++;
+            }
         }
         a.position_bias[i] = count > 0 ? (static_cast<double>(accum) / static_cast<double>(count)) - 127.5 : 0.0;
+        position_stat_t ps;
+        ps.index = i;
+        ps.samples = count;
+        double expected_pos = count > 0 ? static_cast<double>(count) / 256.0 : 0.0;
+        for (size_t c = 0; c < counts.size(); ++c) {
+            const size_t value = counts[c];
+            if (value == 0) continue;
+            ++ps.distinct_symbols;
+            if (value > ps.most_common_count) {
+                ps.most_common_count = value;
+                ps.most_common_symbol = static_cast<uint8_t>(c);
+            }
+            const double p = static_cast<double>(value) / static_cast<double>(count);
+            ps.entropy_bits -= p * (std::log(p) / std::log(2.0));
+            if (expected_pos > 0.0) {
+                const double diff = static_cast<double>(value) - expected_pos;
+                ps.chi_square += diff * diff / expected_pos;
+            }
+        }
+        ps.most_common_frequency = count > 0 ? static_cast<double>(ps.most_common_count) / static_cast<double>(count) : 0.0;
+        ps.chi_square_p_value = count >= 50 ? regularized_gamma_q(255.0 / 2.0, ps.chi_square / 2.0) : std::nan("");
+        a.position_analysis.push_back(ps);
     }
 
     size_t total_bits = a.total_bits;
@@ -607,6 +668,37 @@ static analysis_result_t analyze_internal(const std::vector<std::string>& tokens
         a.autocorrelation = std::nan("");
     }
 
+    if (bytes.size() >= 2) {
+        double sx = 0.0;
+        double sy = 0.0;
+        const size_t pairs = bytes.size() - 1;
+        for (size_t i = 0; i < pairs; ++i) {
+            sx += static_cast<double>(bytes[i]);
+            sy += static_cast<double>(bytes[i + 1]);
+        }
+        const double mx = sx / static_cast<double>(pairs);
+        const double my = sy / static_cast<double>(pairs);
+        double num = 0.0;
+        double dx = 0.0;
+        double dy = 0.0;
+        for (size_t i = 0; i < pairs; ++i) {
+            const double x = static_cast<double>(bytes[i]) - mx;
+            const double y = static_cast<double>(bytes[i + 1]) - my;
+            num += x * y;
+            dx += x * x;
+            dy += y * y;
+        }
+        a.serial_correlation = (dx > 0.0 && dy > 0.0) ? num / std::sqrt(dx * dy) : 0.0;
+        size_t runs = 1;
+        for (size_t i = 1; i < bytes.size(); ++i) {
+            if (bytes[i] != bytes[i - 1]) ++runs;
+        }
+        a.compression_ratio = static_cast<double>(runs) / static_cast<double>(bytes.size());
+    } else {
+        a.serial_correlation = std::nan("");
+        a.compression_ratio = 1.0;
+    }
+
     bool fips_ok = false;
     if (total_bits >= 20000) {
         bool monobit_ok = (ones >= 9725 && ones <= 10275);
@@ -616,6 +708,20 @@ static analysis_result_t analyze_internal(const std::vector<std::string>& tokens
         fips_ok = monobit_ok && poker_ok && runs_ok && long_run_ok;
     }
     a.passes_fips_140_2 = fips_ok;
+    if (total_bits < 20000) {
+        a.fips_assessment = "legacy_fips_140_2_style_not_enough_bits";
+    } else {
+        a.fips_assessment = fips_ok ? "legacy_fips_140_2_style_pass" : "legacy_fips_140_2_style_fail";
+    }
+    if (a.samples_count < 100 || bytes.size() < 100) {
+        a.nist_sp800_90b_assessment = "sp800_90b_informational_estimators_insufficient_sample";
+    } else if (a.min_entropy_bits_per_symbol >= 6.0 && std::fabs(a.serial_correlation) < 0.15) {
+        a.nist_sp800_90b_assessment = "sp800_90b_informational_estimators_strong";
+    } else if (a.min_entropy_bits_per_symbol >= 4.0 && std::fabs(a.serial_correlation) < 0.30) {
+        a.nist_sp800_90b_assessment = "sp800_90b_informational_estimators_moderate";
+    } else {
+        a.nist_sp800_90b_assessment = "sp800_90b_informational_estimators_weak";
+    }
     a.valid = true;
 
     double score = 0.0;
@@ -626,6 +732,14 @@ static analysis_result_t analyze_internal(const std::vector<std::string>& tokens
     if (!std::isnan(a.long_run_p_value))  { score += a.long_run_p_value;  ++counted; }
     if (!std::isnan(a.chi_square_p_value)){ score += a.chi_square_p_value;++counted; }
     double avg = counted > 0 ? score / counted : 0.0;
+    const double sample_factor = (std::min)(1.0, static_cast<double>(a.samples_count) / 200.0);
+    const double entropy_factor = (std::min)(1.0, a.min_entropy_bits_per_symbol / 6.0);
+    const double correlation_factor = std::isnan(a.serial_correlation) ? 0.5 : (std::max)(0.0, 1.0 - std::fabs(a.serial_correlation));
+    a.confidence_score = (std::max)(0.0, (std::min)(1.0, (avg * 0.50) + (sample_factor * 0.25) + (entropy_factor * 0.15) + (correlation_factor * 0.10)));
+    if (a.samples_count < 50) a.confidence_label = "low_sample";
+    else if (a.confidence_score >= 0.75) a.confidence_label = "high";
+    else if (a.confidence_score >= 0.45) a.confidence_label = "medium";
+    else a.confidence_label = "low";
 
     if (a.samples_count < 50) {
         a.verdict = "Inconclusive (sample too small, collect >=200 for FIPS verdict)";
@@ -635,6 +749,7 @@ static analysis_result_t analyze_internal(const std::vector<std::string>& tokens
     else if (avg > 0.05 && fips_ok)       a.verdict = "Good";
     else if (avg > 0.01)                  a.verdict = "Adequate";
     else                                  a.verdict = "Poor";
+    a.notes = "FIPS output is a legacy 140-2-style compatibility assessment over collected bits, not a FIPS validation. NIST SP 800-90B output uses local most-common-value, entropy, and serial-correlation estimators and is informational, not a full SP 800-90B validation.";
 
     return a;
 }
@@ -779,6 +894,12 @@ std::vector<std::string> samples(uint64_t id, size_t max_count)
 
 analysis_result_t analyze(uint64_t id)
 {
+    analysis_config_t cfg;
+    return analyze(id, cfg);
+}
+
+analysis_result_t analyze(uint64_t id, const analysis_config_t& config)
+{
     diag::log_tagged_fmt("sequencer", "analyze entry id=%llu", static_cast<unsigned long long>(id));
     std::shared_ptr<collection_t> coll;
     {
@@ -798,10 +919,10 @@ analysis_result_t analyze(uint64_t id)
         snap = coll->samples;
     }
     diag::log_tagged_fmt("sequencer", "analyze analyzing id=%llu samples=%zu", static_cast<unsigned long long>(id), snap.size());
-    analysis_result_t r = analyze_internal(snap);
+    analysis_result_t r = analyze_internal(snap, config);
     r.collection_id = id;
-    diag::log_tagged_fmt("sequencer", "analyze done id=%llu verdict='%s' samples=%zu entropy=%.3f",
-        static_cast<unsigned long long>(id), r.verdict.c_str(), r.samples_count, r.shannon_entropy_bits);
+    diag::log_tagged_fmt("sequencer", "analyze done id=%llu mode=%s verdict='%s' samples=%zu entropy=%.3f confidence=%.3f",
+        static_cast<unsigned long long>(id), r.analysis_mode.c_str(), r.verdict.c_str(), r.samples_count, r.shannon_entropy_bits, r.confidence_score);
     return r;
 }
 

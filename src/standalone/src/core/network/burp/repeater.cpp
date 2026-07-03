@@ -29,6 +29,67 @@ uint64_t now_ms()
     return static_cast<uint64_t>(GetTickCount64());
 }
 
+std::string base64_encode(const std::vector<uint8_t>& data)
+{
+    static const char tbl[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve(((data.size() + 2) / 3) * 4);
+    size_t i = 0;
+    while (i + 2 < data.size()) {
+        const uint32_t v = (static_cast<uint32_t>(data[i]) << 16) | (static_cast<uint32_t>(data[i + 1]) << 8) | static_cast<uint32_t>(data[i + 2]);
+        out.push_back(tbl[(v >> 18) & 0x3f]);
+        out.push_back(tbl[(v >> 12) & 0x3f]);
+        out.push_back(tbl[(v >> 6) & 0x3f]);
+        out.push_back(tbl[v & 0x3f]);
+        i += 3;
+    }
+    if (i < data.size()) {
+        const size_t rem = data.size() - i;
+        uint32_t v = static_cast<uint32_t>(data[i]) << 16;
+        if (rem > 1)
+            v |= static_cast<uint32_t>(data[i + 1]) << 8;
+        out.push_back(tbl[(v >> 18) & 0x3f]);
+        out.push_back(tbl[(v >> 12) & 0x3f]);
+        out.push_back(rem > 1 ? tbl[(v >> 6) & 0x3f] : '=');
+        out.push_back('=');
+    }
+    return out;
+}
+
+std::vector<uint8_t> base64_decode(const std::string& s)
+{
+    static const int8_t tbl[256] = {
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
+        52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-2,-1,-1,
+        -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+        15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+        -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+        41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1
+    };
+    std::vector<uint8_t> out;
+    out.reserve(s.size() * 3 / 4);
+    uint32_t buf = 0;
+    int bits = 0;
+    for (unsigned char c : s) {
+        if (c == '\r' || c == '\n' || c == ' ' || c == '\t')
+            continue;
+        int v = tbl[c];
+        if (v == -1)
+            return {};
+        if (v == -2)
+            break;
+        buf = (buf << 6) | static_cast<uint32_t>(v);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back(static_cast<uint8_t>((buf >> bits) & 0xff));
+        }
+    }
+    return out;
+}
+
 repeater_tab_t* find_tab_locked(uint64_t tab_id)
 {
     for (auto& t : g_tabs)
@@ -277,6 +338,79 @@ void clear_all()
     size_t n = g_tabs.size();
     g_tabs.clear();
     diag::log_tagged_fmt("repeater", "clear_all cleared=%zu", n);
+}
+
+nlohmann::json export_json()
+{
+    std::lock_guard<std::mutex> lk(g_mutex);
+    nlohmann::json tabs = nlohmann::json::array();
+    for (const auto& tab : g_tabs) {
+        tabs.push_back({
+            {"id", tab.id},
+            {"name", tab.name},
+            {"host", tab.host},
+            {"port", tab.port},
+            {"use_tls", tab.use_tls},
+            {"raw_request_b64", base64_encode(tab.raw_request)},
+            {"raw_response_b64", base64_encode(tab.raw_response)},
+            {"status_code", tab.status_code},
+            {"latency_ms", tab.latency_ms},
+            {"error", tab.error},
+            {"created_ms", tab.created_ms},
+            {"last_sent_ms", tab.last_sent_ms},
+            {"has_response", tab.has_response}
+        });
+    }
+    return {{"tabs", std::move(tabs)}};
+}
+
+bool import_json(const nlohmann::json& doc, bool replace_existing)
+{
+    nlohmann::json tabs_doc = doc;
+    if (doc.is_object())
+        tabs_doc = doc.value("tabs", nlohmann::json::array());
+    if (!tabs_doc.is_array())
+        return false;
+    std::vector<repeater_tab_t> loaded;
+    uint64_t max_id = 0;
+    for (const auto& item : tabs_doc) {
+        if (!item.is_object())
+            continue;
+        repeater_tab_t tab;
+        tab.id = item.value("id", static_cast<uint64_t>(0));
+        tab.name = item.value("name", std::string());
+        tab.host = item.value("host", std::string());
+        tab.port = static_cast<uint16_t>(std::min(item.value("port", 443), 65535));
+        tab.use_tls = item.value("use_tls", true);
+        tab.raw_request = base64_decode(item.value("raw_request_b64", std::string()));
+        tab.raw_response = base64_decode(item.value("raw_response_b64", std::string()));
+        tab.status_code = item.value("status_code", 0);
+        tab.latency_ms = item.value("latency_ms", static_cast<uint64_t>(0));
+        tab.error = item.value("error", std::string());
+        tab.created_ms = item.value("created_ms", static_cast<uint64_t>(0));
+        tab.last_sent_ms = item.value("last_sent_ms", static_cast<uint64_t>(0));
+        tab.has_response = item.value("has_response", !tab.raw_response.empty());
+        if (tab.host.empty() || tab.raw_request.empty())
+            continue;
+        max_id = std::max(max_id, tab.id);
+        loaded.push_back(std::move(tab));
+    }
+    std::lock_guard<std::mutex> lk(g_mutex);
+    if (replace_existing)
+        g_tabs.clear();
+    for (auto& tab : loaded) {
+        if (tab.id == 0)
+            tab.id = g_next_id.fetch_add(1);
+        max_id = std::max(max_id, tab.id);
+        if (tab.name.empty())
+            tab.name = "Tab " + std::to_string(tab.id);
+        if (tab.created_ms == 0)
+            tab.created_ms = now_ms();
+        g_tabs.push_back(std::move(tab));
+    }
+    if (max_id >= g_next_id.load())
+        g_next_id.store(max_id + 1);
+    return true;
 }
 
 }

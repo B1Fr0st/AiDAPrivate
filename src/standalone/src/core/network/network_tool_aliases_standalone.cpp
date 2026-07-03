@@ -195,7 +195,7 @@ void register_direct_alias(mcp_standalone::server_t& srv,
         read_only,
         [&srv, target, alias](const json& args) -> tool_result_t {
             if (mcp_standalone::current_call_cancelled())
-                return tool_result_t::error(std::string(alias) + " cancelled before dispatch", "cancelled");
+                return tool_result_t::error(std::string(alias) + " cancelled before dispatch", std::string("cancelled"), json::object());
             diag::log_tagged_fmt("tool_alias", "dispatch alias=%s target=%s", alias, target);
             return sanitize_result(srv.call_registered_tool(target, args, false));
         }
@@ -215,7 +215,7 @@ void register_dispatch_alias(mcp_standalone::server_t& srv,
         read_only,
         [&srv, alias, targets = std::move(targets)](const json& args) -> tool_result_t {
             if (mcp_standalone::current_call_cancelled())
-                return tool_result_t::error(std::string(alias) + " cancelled before dispatch", "cancelled");
+                return tool_result_t::error(std::string(alias) + " cancelled before dispatch", std::string("cancelled"), json::object());
             std::string action = lower_ascii(compat_action_name(args));
             if (action.empty() && args.contains("tool") && args["tool"].is_string())
                 action = lower_ascii(args["tool"].get<std::string>());
@@ -305,11 +305,11 @@ void register_network_tool_aliases(mcp_standalone::server_t& srv)
     register_direct_alias(srv, "aida.burp.graphql", "burp_graphql_manage", "Alias for GraphQL tooling.", false);
     register_direct_alias(srv, "aida.burp.ws", "burp_ws_manage", "Alias for WebSocket tooling.", false);
     register_direct_alias(srv, "aida.burp.logger", "burp_logger_manage", "Alias for Burp logger query/export.", false);
-    register_direct_alias(srv, "aida.burp.logger_capacity", "burp_logger_capacity_manage", "Alias for Burp logger capacity controls.", false);
     register_direct_alias(srv, "aida.burp.report", "burp_report_manage", "Alias for report generation management.", false);
     register_direct_alias(srv, "aida.burp.report_generate", "burp_report_generate", "Alias for vulnerability report generation.", false);
     register_direct_alias(srv, "aida.burp.jwt", "burp_jwt_manage", "Alias for JWT lab operations.", false);
     register_direct_alias(srv, "aida.burp.upstream", "burp_upstream_manage", "Alias for upstream proxy chain management.", false);
+    register_direct_alias(srv, "aida.burp.project", "burp_project_manage", "Alias for Burp project import, export, save, and load.", false);
     register_direct_alias(srv, "aida.burp.search", "burp_global_search", "Alias for global Burp search.", true);
     register_direct_alias(srv, "aida.burp.extensions.list", "burp_extensions_list", "Alias for listing Burp extensions.", true);
     register_direct_alias(srv, "aida.burp.extensions.refresh", "burp_extensions_refresh", "Alias for refreshing Burp extensions.", false);
@@ -317,9 +317,13 @@ void register_network_tool_aliases(mcp_standalone::server_t& srv)
     register_direct_alias(srv, "aida.burp.extensions.set_enabled", "burp_extensions_set_enabled", "Alias for enabling or disabling an extension.", false);
     register_direct_alias(srv, "aida.burp.proxy.set_mode", "proxy_set_mode", "Alias for MITM proxy mode control.", false);
     register_direct_alias(srv, "aida.burp.proxy.start_listener", "proxy_start_listener", "Alias for MITM listener startup.", false);
+    register_direct_alias(srv, "aida.burp.proxy.stop_listener", "proxy_stop_listener", "Alias for MITM listener shutdown.", false);
+    register_direct_alias(srv, "aida.burp.proxy.list_listeners", "proxy_list_listeners", "Alias for MITM listener snapshots.", true);
+    register_direct_alias(srv, "aida.burp.proxy.set_pac", "proxy_set_pac", "Alias for bounded MITM PAC routing control.", false);
     register_direct_alias(srv, "aida.burp.proxy.set_tls_policy", "proxy_set_tls_policy", "Alias for MITM TLS policy control.", false);
     register_direct_alias(srv, "aida.burp.flow.save", "flow_save", "Alias for saving captured flows.", false);
     register_direct_alias(srv, "aida.burp.flow.load", "flow_load", "Alias for loading captured flows.", false);
+    register_direct_alias(srv, "aida.burp.flow.note", "flow_note", "Alias for captured flow notes.", false);
     register_direct_alias(srv, "aida.burp.client_replay", "client_replay", "Alias for client-side replay.", false);
     register_direct_alias(srv, "aida.burp.server_replay.start", "server_replay_start", "Alias for server replay startup.", false);
     register_direct_alias(srv, "aida.burp.server_replay.stop", "server_replay_stop", "Alias for server replay shutdown.", false);
@@ -377,19 +381,7 @@ void register_network_tool_aliases(mcp_standalone::server_t& srv)
     register_direct_alias(srv, "aida.browser.network", "browser_network", "Alias for Camoufox network capture and interception.", false);
     register_direct_alias(srv, "aida.browser.hooks", "browser_hooks", "Alias for Camoufox JavaScript hooks.", false);
     register_direct_alias(srv, "aida.browser.instrumentation", "browser_instrumentation", "Alias for Camoufox instrumentation.", false);
-    register_direct_alias(srv, "aida.browser.dom", "browser_dom", "Alias for Camoufox DOM inspection and mutation.", false);
-    register_direct_alias(srv, "aida.browser.interaction_ext", "browser_interaction_ext", "Alias for extended Camoufox interaction operations.", false);
-    register_direct_alias(srv, "aida.browser.storage_ops", "browser_storage_ops", "Alias for enhanced browser storage operations.", false);
-    register_direct_alias(srv, "aida.browser.indexeddb", "browser_indexeddb", "Alias for IndexedDB inspection.", false);
-    register_direct_alias(srv, "aida.browser.cache", "browser_cache", "Alias for Cache Storage inspection.", false);
-    register_direct_alias(srv, "aida.browser.performance", "browser_performance", "Alias for browser performance timing.", true);
-    register_direct_alias(srv, "aida.browser.ws_debug", "browser_ws_debug", "Alias for browser WebSocket debugging.", false);
-    register_direct_alias(srv, "aida.browser.sse", "browser_sse", "Alias for Server-Sent Events inspection.", false);
     register_direct_alias(srv, "aida.browser.service_worker", "browser_service_worker", "Alias for service worker inspection.", false);
-    register_direct_alias(srv, "aida.browser.wasm", "browser_wasm", "Alias for WebAssembly inspection.", false);
-    register_direct_alias(srv, "aida.browser.source_map", "browser_source_map", "Alias for source map reconstruction.", false);
-    register_direct_alias(srv, "aida.browser.csp", "browser_csp", "Alias for browser CSP analysis.", false);
-    register_direct_alias(srv, "aida.browser.auth_flow", "browser_auth_flow", "Alias for browser authentication flow automation.", false);
     register_direct_alias(srv, "aida.browser.fingerprint_spoof", "browser_fingerprint_spoof", "Alias for Camoufox fingerprint spoofing.", false);
     register_direct_alias(srv, "aida.browser.scripts", "scripts", "Alias for loaded browser scripts.", false);
     register_direct_alias(srv, "aida.browser.console", "get_console_logs", "Alias for browser console logs.", false);

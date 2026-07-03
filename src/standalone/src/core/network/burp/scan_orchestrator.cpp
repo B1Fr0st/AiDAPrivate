@@ -799,15 +799,20 @@ std::string crawl_phase_label(crawler::crawl_status_phase_t phase)
     return "error";
 }
 
-std::string crawl_audit_phase_label(crawl_audit::job_phase_t phase)
+std::string crawl_audit_phase_label(const std::string& phase)
 {
-    switch (phase) {
-        case crawl_audit::job_phase_t::running: return "running";
-        case crawl_audit::job_phase_t::stopping: return "stopping";
-        case crawl_audit::job_phase_t::complete: return "complete";
-        case crawl_audit::job_phase_t::error: return "error";
-    }
-    return "error";
+    return phase.empty() ? "error" : phase;
+}
+
+bool crawl_audit_phase_running(const std::string& phase)
+{
+    return phase == "pending" || phase == "crawling" || phase == "auditing";
+}
+
+bool crawl_audit_phase_terminal(const std::string& phase)
+{
+    return phase == "complete" || phase == "error" || phase == "stopped" ||
+           phase == "snapshot" || phase == "imported_snapshot";
 }
 
 bool build_get_request(const std::string& url, std::vector<uint8_t>& raw, std::string& error)
@@ -1279,8 +1284,8 @@ std::vector<uint64_t> audit_ids_for_scan_locked(const std::shared_ptr<scan_runti
     if (job->active_audit_id != 0)
         ids.push_back(job->active_audit_id);
     if (job->crawl_audit_job_id != 0) {
-        crawl_audit::job_status_t st;
-        if (crawl_audit::status(job->crawl_audit_job_id, st)) {
+        const auto st = crawl_audit::status(job->crawl_audit_job_id);
+        if (st.id != 0) {
             for (uint64_t id : st.audit_ids)
                 ids.push_back(id);
         }
@@ -1472,12 +1477,13 @@ scan_aggregate_t collect_scan_aggregate(const std::shared_ptr<scan_runtime_t>& j
         agg.active_present = true;
         agg.crawl_present = true;
         agg.crawl_audit_job_id = crawl_audit_job_id;
-        crawl_audit::job_status_t st;
-        if (crawl_audit::status(crawl_audit_job_id, st)) {
+        const auto st = crawl_audit::status(crawl_audit_job_id);
+        if (st.id != 0) {
             agg.crawl_id = st.crawl_id;
-            agg.crawl_done = st.phase == crawl_audit::job_phase_t::complete || st.phase == crawl_audit::job_phase_t::error;
-            agg.active_status = st.phase == crawl_audit::job_phase_t::running ? "running" : crawl_audit_phase_label(st.phase);
+            agg.crawl_done = crawl_audit_phase_terminal(st.phase);
+            agg.active_status = crawl_audit_phase_running(st.phase) ? "running" : crawl_audit_phase_label(st.phase);
             json audit_ids = json::array();
+            size_t completed_audits = 0;
             for (uint64_t id : st.audit_ids) {
                 audit_ids.push_back(id);
                 active_scanner::audit_status_t ast;
@@ -1489,20 +1495,27 @@ scan_aggregate_t collect_scan_aggregate(const std::shared_ptr<scan_runtime_t>& j
                     agg.in_flight += ast.in_flight_requests;
                     agg.responses_received += ast.responses_received;
                     agg.transport_failures += ast.transport_failures;
-                    if (!audit_terminal(ast))
+                    if (audit_terminal(ast))
+                        completed_audits++;
+                    else
                         agg.active_done = false;
                 }
             }
-            agg.active_done = agg.active_done && agg.crawl_done && st.pending_urls == 0;
+            const int failed_enqueue = (std::max)(0, st.pages_discovered - st.audits_started);
+            agg.active_done = agg.active_done && agg.crawl_done;
             agg.crawl = {
                 {"job_id", st.id},
                 {"crawl_id", st.crawl_id},
                 {"phase", crawl_audit_phase_label(st.phase)},
-                {"discovered_urls", st.discovered_urls},
-                {"pending_urls", st.pending_urls},
-                {"queued_audits", st.queued_audits},
-                {"completed_audits", st.completed_audits},
-                {"failed_enqueue", st.failed_enqueue},
+                {"discovered_urls", st.pages_discovered},
+                {"pages_discovered", st.pages_discovered},
+                {"pending_urls", 0},
+                {"queued_audits", st.audit_ids.size() > completed_audits ? st.audit_ids.size() - completed_audits : 0},
+                {"completed_audits", completed_audits},
+                {"audits_started", st.audits_started},
+                {"issues_found", st.issues_found},
+                {"failed_enqueue", failed_enqueue},
+                {"last_error", redact_text(st.last_error, 512)},
                 {"audit_ids", std::move(audit_ids)}
             };
         } else {
@@ -1770,7 +1783,7 @@ tool_result_t param_error(const std::string& message, const std::string& paramet
 tool_result_t tool_orchestrate(const json& params)
 {
     if (call_cancelled_or_deadline())
-        return tool_result_t::error("scan orchestration cancelled", "cancelled");
+        return tool_result_t::error("scan orchestration cancelled", std::string("cancelled"), json::object());
     std::string target_url;
     if (!json_string(params, "target_url", target_url) || trim_copy(target_url).empty())
         return param_error("missing target_url", "target_url", "missing_required");
@@ -1830,7 +1843,7 @@ tool_result_t tool_orchestrate(const json& params)
     json_string(params, "session_id", session_id);
     session_id = redact_text(safe_display_string(session_id, 128), 128);
     if (profile.module_ids.empty() && profile.defensive_checks.empty() && (!profile.crawl_first || profile.crawl_depth == 0))
-        return tool_result_t::error("selected scan profile has no active, crawl, or defensive work", "empty_scan_profile");
+        return tool_result_t::error("selected scan profile has no active, crawl, or defensive work", std::string("empty_scan_profile"), json::object());
     issue_store::initialize();
     findings_db::initialize();
     passive_scanner::initialize();
@@ -1875,27 +1888,26 @@ tool_result_t tool_orchestrate(const json& params)
         cfg.max_concurrent_explicit = max_concurrent_explicit;
         cfg.request_throttle_explicit = throttle_explicit;
         if (profile.crawl_first && profile.crawl_depth > 0) {
-            crawl_audit::job_config_t crawl_cfg;
-            crawl_cfg.crawl.start_urls.push_back(target_url);
-            crawl_cfg.crawl.max_depth = profile.crawl_depth;
-            crawl_cfg.crawl.same_host_only = true;
-            crawl_cfg.crawl.scope_only = scope_only;
-            crawl_cfg.crawl.request_timeout_ms = profile.timeout_ms;
-            crawl_cfg.crawl.max_pages = profile.id == "full" ? 500 : 200;
-            crawl_cfg.crawl.concurrency = static_cast<int>(std::min<size_t>(profile.max_concurrent_requests, 16));
-            crawl_cfg.crawl.rate_per_host = profile.request_throttle_ms == 0 ? 10 : std::max(1, static_cast<int>(1000 / std::max<size_t>(profile.request_throttle_ms, 1)));
-            crawl_cfg.audit = cfg;
-            crawl_cfg.max_audits = profile.id == "full" ? 128 : 64;
+            crawl_audit::pipeline_config_t crawl_cfg;
+            crawl_cfg.start_urls.push_back(target_url);
+            crawl_cfg.max_depth = profile.crawl_depth;
+            crawl_cfg.same_host_only = true;
+            crawl_cfg.scope_only = scope_only;
+            crawl_cfg.max_pages = profile.id == "full" ? 500 : 200;
+            crawl_cfg.max_concurrent = static_cast<int>(std::min<size_t>(profile.max_concurrent_requests, 16));
+            crawl_cfg.throttle_ms = static_cast<int>(std::min<size_t>(profile.request_throttle_ms, 60000));
+            crawl_cfg.audit_after_crawl = true;
+            crawl_cfg.enabled_modules = profile.module_ids;
             const uint64_t crawl_job_id = crawl_audit::start(crawl_cfg);
             if (crawl_job_id == 0) {
-                std::string err = redact_text(crawl_audit::last_error(), 512);
+                std::string err = "crawl audit start failed";
                 {
                     std::lock_guard<std::mutex> lk(job->mtx);
                     job->phase = scan_phase_t::error;
                     job->last_error = err;
                     job->ended_ms = unix_ms();
                 }
-                return tool_result_t::error(err.empty() ? "crawl audit start failed" : err, "crawl_audit_start_failed");
+                return tool_result_t::error(err, std::string("crawl_audit_start_failed"), json::object());
             }
             {
                 std::lock_guard<std::mutex> lk(job->mtx);
@@ -1916,7 +1928,7 @@ tool_result_t tool_orchestrate(const json& params)
                     job->last_error = err;
                     job->ended_ms = unix_ms();
                 }
-                return tool_result_t::error(err.empty() ? "active scanner enqueue failed" : err, "active_scanner_enqueue_failed");
+                return tool_result_t::error(err.empty() ? "active scanner enqueue failed" : err, std::string("active_scanner_enqueue_failed"), json::object());
             }
             {
                 std::lock_guard<std::mutex> lk(job->mtx);
@@ -1944,7 +1956,7 @@ tool_result_t tool_orchestrate(const json& params)
                 job->last_error = err;
                 job->ended_ms = unix_ms();
             }
-            return tool_result_t::error(err.empty() ? "crawler start failed" : err, "crawler_start_failed");
+            return tool_result_t::error(err.empty() ? "crawler start failed" : err, std::string("crawler_start_failed"), json::object());
         }
         {
             std::lock_guard<std::mutex> lk(job->mtx);
@@ -2050,7 +2062,7 @@ tool_result_t tool_profile_save(const json& params)
     if (!profile.run_defensive)
         profile.defensive_checks.clear();
     if (profile.module_ids.empty() && profile.defensive_checks.empty() && (!profile.crawl_first || profile.crawl_depth == 0))
-        return tool_result_t::error("profile must include active modules, defensive checks, or crawl work", "empty_profile");
+        return tool_result_t::error("profile must include active modules, defensive checks, or crawl work", std::string("empty_profile"), json::object());
     profile.builtin = false;
     {
         std::lock_guard<std::mutex> lk(state().mtx);
@@ -2080,7 +2092,7 @@ tool_result_t tool_status(const json& params)
         return param_error("missing scan_id", "scan_id", "missing_required");
     auto job = find_scan(params["scan_id"].get<uint64_t>());
     if (!job)
-        return tool_result_t::error("scan not found", "scan_not_found");
+        return tool_result_t::error("scan not found", std::string("scan_not_found"), json::object());
     json status = scan_status_json(job);
     publish_scan_completed_if_terminal(job, status);
     return tool_result_t::ok(status);
@@ -2092,7 +2104,7 @@ tool_result_t tool_cancel(const json& params)
         return param_error("missing scan_id", "scan_id", "missing_required");
     auto job = find_scan(params["scan_id"].get<uint64_t>());
     if (!job)
-        return tool_result_t::error("scan not found", "scan_not_found");
+        return tool_result_t::error("scan not found", std::string("scan_not_found"), json::object());
     std::vector<uint64_t> audit_ids;
     uint64_t crawl_audit_job_id = 0;
     uint64_t crawler_id = 0;
@@ -2254,7 +2266,7 @@ json redacted_result_json(json value)
 tool_result_t tool_deduplicate(const json& params)
 {
     if (call_cancelled_or_deadline())
-        return tool_result_t::error("deduplicate cancelled", "cancelled");
+        return tool_result_t::error("deduplicate cancelled", std::string("cancelled"), json::object());
     const bool merge_evidence = !params.contains("merge_evidence") || !params["merge_evidence"].is_boolean() || params["merge_evidence"].get<bool>();
     findings_db::finding_filter_t filter;
     std::string error;
@@ -2266,7 +2278,7 @@ tool_result_t tool_deduplicate(const json& params)
     if (!prepare_findings_database(scan_id, filter.session_id, error))
         return tool_result_t::error("findings database unavailable", "findings_db_unavailable", {{"error", redact_text(error, 512)}});
     if (call_cancelled_or_deadline())
-        return tool_result_t::error("deduplicate cancelled", "cancelled");
+        return tool_result_t::error("deduplicate cancelled", std::string("cancelled"), json::object());
     const auto result = findings_db::deduplicate(filter, merge_evidence);
     return tool_result_t::ok({
         {"before_count", result.before_count},
@@ -2281,7 +2293,7 @@ tool_result_t tool_deduplicate(const json& params)
 tool_result_t tool_correlate(const json& params)
 {
     if (call_cancelled_or_deadline())
-        return tool_result_t::error("correlation cancelled", "cancelled");
+        return tool_result_t::error("correlation cancelled", std::string("cancelled"), json::object());
     findings_db::finding_filter_t filter;
     std::string error;
     std::string parameter;
@@ -2296,7 +2308,7 @@ tool_result_t tool_correlate(const json& params)
     if (!prepare_findings_database(scan_id, filter.session_id, error))
         return tool_result_t::error("findings database unavailable", "findings_db_unavailable", {{"error", redact_text(error, 512)}});
     if (call_cancelled_or_deadline())
-        return tool_result_t::error("correlation cancelled", "cancelled");
+        return tool_result_t::error("correlation cancelled", std::string("cancelled"), json::object());
     json result = findings_db::correlate(filter, false);
     return tool_result_t::ok(redacted_result_json(std::move(result)));
 }
@@ -2304,7 +2316,7 @@ tool_result_t tool_correlate(const json& params)
 tool_result_t tool_score(const json& params)
 {
     if (call_cancelled_or_deadline())
-        return tool_result_t::error("scoring cancelled", "cancelled");
+        return tool_result_t::error("scoring cancelled", std::string("cancelled"), json::object());
     std::string override_vector;
     json_string(params, "cvss_vector_override", override_vector);
     override_vector = trim_copy(override_vector);
@@ -2328,11 +2340,11 @@ tool_result_t tool_score(const json& params)
     if (!prepare_findings_database(scan_id, filter.session_id, error))
         return tool_result_t::error("findings database unavailable", "findings_db_unavailable", {{"error", redact_text(error, 512)}});
     if (call_cancelled_or_deadline())
-        return tool_result_t::error("scoring cancelled", "cancelled");
+        return tool_result_t::error("scoring cancelled", std::string("cancelled"), json::object());
     json result = findings_db::score(filter, finding_id, override_vector, false);
     const uint64_t scored_count = json_u64_or(result, "count", 0);
     if (finding_id != 0 && scored_count == 0)
-        return tool_result_t::error("finding not found", "finding_not_found");
+        return tool_result_t::error("finding not found", std::string("finding_not_found"), json::object());
     if (filter.limit > 0)
         result["truncated"] = scored_count >= static_cast<uint64_t>(filter.limit);
     return tool_result_t::ok(redacted_result_json(std::move(result)));

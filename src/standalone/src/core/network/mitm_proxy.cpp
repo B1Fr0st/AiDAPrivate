@@ -4,12 +4,19 @@
 #include "protocol_parser.hpp"
 #include "http_parser_engine.hpp"
 #include "http2_session.hpp"
+#include "map_resource.hpp"
+#include "server_replay.hpp"
+#include "tls_policy.hpp"
+#include "pac_resolver.hpp"
+#include "conn_pool.hpp"
 #include "script_engine.hpp"
 #include "../infra/work_queue.hpp"
 #include "../infra/event_bus.hpp"
 #include "helpers/diag_log.hpp"
 #include "burp/burp_events.hpp"
+#include "burp/cookie_jar.hpp"
 #include "burp/match_replace.hpp"
+#include "burp/session_handler.hpp"
 #include "burp/upstream_chain.hpp"
 
 #include <chrono>
@@ -27,12 +34,16 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cctype>
 #include <climits>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #pragma comment(lib, "ws2_32.lib")
@@ -113,6 +124,7 @@ const char* to_string(tls_observation_kind_t kind) {
     case tls_observation_kind_t::http_tls: return "http_tls";
     case tls_observation_kind_t::client_handshake_failed: return "client_handshake_failed";
     case tls_observation_kind_t::upstream_handshake_failed: return "upstream_handshake_failed";
+    case tls_observation_kind_t::upstream_pin_mismatch: return "upstream_pin_mismatch";
     case tls_observation_kind_t::sni_authority_mismatch: return "sni_authority_mismatch";
     case tls_observation_kind_t::non_http_tls: return "non_http_tls";
     case tls_observation_kind_t::tunnel_passthrough: return "tunnel_passthrough";
@@ -229,6 +241,243 @@ static hold_outcome_t hold_until_decision(state_t& state, http_exchange exchange
 }
 
 static constexpr uint8_t kCrlfCrlf[4] = { '\r', '\n', '\r', '\n' };
+
+static std::string lower_ascii(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(::tolower(c));
+    });
+    return value;
+}
+
+static std::string trim_ascii(const std::string& value) {
+    size_t begin = 0;
+    while (begin < value.size() && std::isspace(static_cast<unsigned char>(value[begin])))
+        ++begin;
+    size_t end = value.size();
+    while (end > begin && std::isspace(static_cast<unsigned char>(value[end - 1])))
+        --end;
+    return value.substr(begin, end - begin);
+}
+
+static bool starts_with_ci(const std::string& value, const std::string& prefix) {
+    if (value.size() < prefix.size())
+        return false;
+    for (size_t i = 0; i < prefix.size(); ++i) {
+        if (::tolower(static_cast<unsigned char>(value[i])) !=
+            ::tolower(static_cast<unsigned char>(prefix[i])))
+            return false;
+    }
+    return true;
+}
+
+static bool constant_time_equal(const std::string& a, const std::string& b) {
+    const size_t n = std::max(a.size(), b.size());
+    unsigned char diff = static_cast<unsigned char>(a.size() ^ b.size());
+    for (size_t i = 0; i < n; ++i) {
+        const unsigned char av = i < a.size() ? static_cast<unsigned char>(a[i]) : 0;
+        const unsigned char bv = i < b.size() ? static_cast<unsigned char>(b[i]) : 0;
+        diff |= static_cast<unsigned char>(av ^ bv);
+    }
+    return diff == 0;
+}
+
+static std::string base64_encode_text(const std::string& value) {
+    static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string encoded;
+    encoded.reserve(((value.size() + 2) / 3) * 4);
+    for (size_t i = 0; i < value.size(); i += 3) {
+        uint32_t n = static_cast<uint32_t>(static_cast<uint8_t>(value[i])) << 16;
+        if (i + 1 < value.size()) n |= static_cast<uint32_t>(static_cast<uint8_t>(value[i + 1])) << 8;
+        if (i + 2 < value.size()) n |= static_cast<uint32_t>(static_cast<uint8_t>(value[i + 2]));
+        encoded.push_back(b64[(n >> 18) & 0x3F]);
+        encoded.push_back(b64[(n >> 12) & 0x3F]);
+        encoded.push_back((i + 1 < value.size()) ? b64[(n >> 6) & 0x3F] : '=');
+        encoded.push_back((i + 2 < value.size()) ? b64[n & 0x3F] : '=');
+    }
+    return encoded;
+}
+
+static bool proxy_authorization_valid(const protocol_parser::http_request& req, const proxy_config& config) {
+    if (!config.require_proxy_auth)
+        return true;
+    if (config.proxy_auth_username.empty() || config.proxy_auth_password.empty())
+        return false;
+    std::string value = trim_ascii(protocol_parser::find_header(req.headers, "Proxy-Authorization"));
+    if (!starts_with_ci(value, "Basic "))
+        return false;
+    value = trim_ascii(value.substr(6));
+    const std::string expected = base64_encode_text(config.proxy_auth_username + ":" + config.proxy_auth_password);
+    return constant_time_equal(value, expected);
+}
+
+static void send_proxy_auth_required(SOCKET client_sock, const proxy_config& config) {
+    std::string realm = config.proxy_auth_realm.empty() ? std::string("AiDA Proxy") : config.proxy_auth_realm;
+    for (char& c : realm) {
+        if (c == '"' || c == '\r' || c == '\n')
+            c = '_';
+    }
+    const std::string body = "Proxy authentication required";
+    std::ostringstream resp;
+    resp << "HTTP/1.1 407 Proxy Authentication Required\r\n"
+         << "Proxy-Authenticate: Basic realm=\"" << realm << "\"\r\n"
+         << "Content-Length: " << body.size() << "\r\n"
+         << "Connection: close\r\n\r\n"
+         << body;
+    const std::string bytes = resp.str();
+    send(client_sock, bytes.data(), static_cast<int>(bytes.size()), 0);
+}
+
+static size_t header_end_offset(const std::vector<uint8_t>& data) {
+    auto it = std::search(data.begin(), data.end(), kCrlfCrlf, kCrlfCrlf + 4);
+    if (it == data.end())
+        return std::string::npos;
+    return static_cast<size_t>(std::distance(data.begin(), it)) + 4;
+}
+
+static std::string origin_form_from_uri(const std::string& uri) {
+    if (uri.rfind("http://", 0) != 0 && uri.rfind("https://", 0) != 0)
+        return uri.empty() ? std::string("/") : uri;
+    const size_t scheme_end = uri.find("://");
+    const size_t path = uri.find('/', scheme_end == std::string::npos ? 0 : scheme_end + 3);
+    if (path == std::string::npos)
+        return "/";
+    return uri.substr(path);
+}
+
+static bool rewrite_request_headers(std::vector<uint8_t>& raw,
+                                    const std::map<std::string, std::string>& set_headers,
+                                    const std::unordered_set<std::string>& remove_headers,
+                                    bool normalize_absolute_uri) {
+    const size_t header_end = header_end_offset(raw);
+    if (header_end == std::string::npos)
+        return false;
+    std::string headers(raw.begin(), raw.begin() + static_cast<ptrdiff_t>(header_end));
+    const size_t line_end = headers.find("\r\n");
+    if (line_end == std::string::npos)
+        return false;
+    std::string first_line = headers.substr(0, line_end);
+    if (normalize_absolute_uri) {
+        const size_t sp1 = first_line.find(' ');
+        const size_t sp2 = sp1 == std::string::npos ? std::string::npos : first_line.find(' ', sp1 + 1);
+        if (sp1 != std::string::npos && sp2 != std::string::npos) {
+            const std::string method = first_line.substr(0, sp1);
+            const std::string uri = first_line.substr(sp1 + 1, sp2 - sp1 - 1);
+            const std::string version = first_line.substr(sp2 + 1);
+            first_line = method + " " + origin_form_from_uri(uri) + " " + version;
+        }
+    }
+    std::ostringstream out;
+    out << first_line << "\r\n";
+    std::unordered_set<std::string> emitted;
+    size_t pos = line_end + 2;
+    while (pos + 2 <= headers.size()) {
+        const size_t next = headers.find("\r\n", pos);
+        if (next == std::string::npos || next == pos)
+            break;
+        const std::string line = headers.substr(pos, next - pos);
+        const size_t colon = line.find(':');
+        if (colon != std::string::npos) {
+            const std::string name = line.substr(0, colon);
+            const std::string lname = lower_ascii(name);
+            if (remove_headers.find(lname) != remove_headers.end()) {
+                pos = next + 2;
+                continue;
+            }
+            auto sit = set_headers.find(lname);
+            if (sit != set_headers.end()) {
+                out << name << ": " << sit->second << "\r\n";
+                emitted.insert(lname);
+                pos = next + 2;
+                continue;
+            }
+        }
+        out << line << "\r\n";
+        pos = next + 2;
+    }
+    for (const auto& kv : set_headers) {
+        if (emitted.find(kv.first) == emitted.end())
+            out << kv.first << ": " << kv.second << "\r\n";
+    }
+    out << "\r\n";
+    const std::string head = out.str();
+    std::vector<uint8_t> rewritten(head.begin(), head.end());
+    rewritten.insert(rewritten.end(), raw.begin() + static_cast<ptrdiff_t>(header_end), raw.end());
+    raw.swap(rewritten);
+    return true;
+}
+
+static void remove_proxy_headers(std::vector<uint8_t>& raw) {
+    std::unordered_set<std::string> remove = {"proxy-authorization", "proxy-connection"};
+    std::map<std::string, std::string> set;
+    rewrite_request_headers(raw, set, remove, true);
+}
+
+static std::string path_from_request_uri(const std::string& uri) {
+    return origin_form_from_uri(uri.empty() ? std::string("/") : uri);
+}
+
+static std::string exchange_url_for_session(const http_exchange& exchange) {
+    std::ostringstream out;
+    out << (exchange.is_tls ? "https://" : "http://") << exchange.target_host;
+    if ((exchange.is_tls && exchange.target_port != 443) || (!exchange.is_tls && exchange.target_port != 80))
+        out << ':' << exchange.target_port;
+    const std::string path = path_from_request_uri(exchange.request.uri);
+    if (path.empty() || path[0] != '/')
+        out << '/';
+    out << path;
+    return out.str();
+}
+
+static void apply_sticky_session_request(const proxy_config& config, http_exchange& exchange, std::vector<uint8_t>& request_data) {
+    if (!config.enable_sticky_sessions)
+        return;
+    const std::string path = path_from_request_uri(exchange.request.uri);
+    const std::string cookie = aida::burp::cookie_jar::build_cookie_header(exchange.target_host, path, exchange.is_tls);
+    std::map<std::string, std::string> set;
+    if (!cookie.empty())
+        set["cookie"] = cookie;
+    std::unordered_set<std::string> remove = {"proxy-authorization", "proxy-connection"};
+    rewrite_request_headers(request_data, set, remove, true);
+    aida::burp::session_handler::apply_rules(request_data, exchange_url_for_session(exchange), 0);
+    exchange.raw_request = request_data;
+    exchange.request = protocol_parser::parse_http_request(request_data.data(), request_data.size());
+}
+
+static void apply_sticky_session_response(const proxy_config& config, const http_exchange& exchange) {
+    if (!config.enable_sticky_sessions || !exchange.response.valid)
+        return;
+    std::vector<std::pair<std::string, std::string>> headers;
+    headers.reserve(exchange.response.headers.size());
+    for (const auto& h : exchange.response.headers)
+        headers.emplace_back(h.name, h.value);
+    aida::burp::cookie_jar::ingest_set_cookie_headers(exchange.target_host, headers);
+}
+
+static void add_tags(http_exchange& exchange, const std::vector<std::string>& tags) {
+    for (const auto& tag : tags) {
+        if (!tag.empty() && std::find(exchange.tags.begin(), exchange.tags.end(), tag) == exchange.tags.end())
+            exchange.tags.push_back(tag);
+    }
+}
+
+static void record_history(state_t& state, const proxy_config& config, http_exchange exchange) {
+    publish_exchange_event(exchange);
+    std::lock_guard<std::mutex> lock(state.history_mutex);
+    state.history.push_back(std::make_shared<http_exchange>(std::move(exchange)));
+    while (state.history.size() > config.max_history)
+        state.history.pop_front();
+}
+
+static std::vector<uint8_t> build_error_response(uint16_t status, const std::string& reason, const std::string& body) {
+    std::ostringstream out;
+    out << "HTTP/1.1 " << status << ' ' << reason << "\r\n"
+        << "Content-Type: text/plain; charset=utf-8\r\n"
+        << "Content-Length: " << body.size() << "\r\n"
+        << "Connection: close\r\n\r\n"
+        << body;
+    const std::string text = out.str();
+    return std::vector<uint8_t>(text.begin(), text.end());
+}
 
 static bool recv_all(SOCKET s, std::vector<uint8_t>& out, size_t max_size, int timeout_ms = 5000) {
     fd_set fds;
@@ -868,8 +1117,73 @@ static bool http_connect_handshake(SOCKET s, const std::string& target_host, uin
     return code.size() >= 3 && code[0] == '2' && code[1] == '0' && code[2] == '0';
 }
 
-static SOCKET connect_to_target(const std::string& host, uint16_t port) {
-    const auto& upstream = g_state.config.upstream;
+static std::string proxy_url_for_pac(const std::string& host, uint16_t port, bool use_tls) {
+    std::ostringstream out;
+    out << (use_tls ? "https://" : "http://") << host;
+    if ((use_tls && port != 443) || (!use_tls && port != 80))
+        out << ':' << port;
+    out << '/';
+    return out.str();
+}
+
+static upstream_proxy_config select_upstream_proxy(const proxy_config& config,
+                                                   const std::string& host,
+                                                   uint16_t port,
+                                                   bool use_tls,
+                                                   bool& blocked,
+                                                   std::string& error) {
+    blocked = false;
+    error.clear();
+    if (!config.enable_pac || config.pac_script.empty())
+        return config.upstream;
+
+    auto resolved = pac_resolver::resolve(config.pac_script,
+                                          proxy_url_for_pac(host, port, use_tls),
+                                          host,
+                                          port,
+                                          config.pac_fail_closed);
+    if (!resolved.supported || resolved.entries.empty()) {
+        if (resolved.fail_closed) {
+            blocked = true;
+            error = resolved.error.empty() ? "pac_resolution_failed" : resolved.error;
+            return {};
+        }
+        return {};
+    }
+    for (const auto& entry : resolved.entries) {
+        if (entry.type == pac_resolver::proxy_entry_type::direct)
+            return {};
+        if (entry.type == pac_resolver::proxy_entry_type::http || entry.type == pac_resolver::proxy_entry_type::socks5) {
+            upstream_proxy_config selected;
+            selected.type = entry.type == pac_resolver::proxy_entry_type::http
+                ? upstream_proxy_config::type_t::http_connect
+                : upstream_proxy_config::type_t::socks5;
+            selected.host = entry.host;
+            selected.port = entry.port;
+            return selected;
+        }
+        if (config.pac_fail_closed) {
+            blocked = true;
+            error = "pac_socks4_unsupported";
+            return {};
+        }
+    }
+    if (config.pac_fail_closed) {
+        blocked = true;
+        error = "pac_no_supported_route";
+    }
+    return {};
+}
+
+static SOCKET connect_to_target(const std::string& host, uint16_t port, const proxy_config& config, bool use_tls = false) {
+    bool blocked = false;
+    std::string route_error;
+    const upstream_proxy_config upstream = select_upstream_proxy(config, host, port, use_tls, blocked, route_error);
+    if (blocked) {
+        diag::log_tagged_fmt("mitm", "connect_to_target blocked_by_pac host=%s port=%u err=%s",
+            host.c_str(), port, route_error.c_str());
+        return INVALID_SOCKET;
+    }
 
     if (upstream.type == upstream_proxy_config::type_t::none) {
 
@@ -923,6 +1237,135 @@ static bool ssl_handshake_with_timeout(SSL* ssl, int (*op)(SSL*), int timeout_ms
     u_long blocking = 0;
     ioctlsocket(fd, FIONBIO, &blocking);
     return success;
+}
+
+static bool verify_upstream_pin(SSL* ssl, const tls_policy::match_result_t& policy) {
+    if (!tls_policy::pins_configured(policy))
+        return true;
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+    X509* peer = SSL_get1_peer_certificate(ssl);
+#else
+    X509* peer = SSL_get_peer_certificate(ssl);
+#endif
+    if (!peer)
+        return false;
+    std::string fp = tls_policy::cert_sha256_fingerprint_hex(peer);
+    X509_free(peer);
+    return tls_policy::fingerprint_matches_pin(fp, policy);
+}
+
+static bool configure_client_tls(SSL_CTX* ctx,
+                                 SSL* ssl,
+                                 const std::string& host,
+                                 const tls_policy::match_result_t& policy,
+                                 const unsigned char* alpn,
+                                 unsigned int alpn_len) {
+    if (!tls_policy::apply_client_policy(ctx, policy))
+        return false;
+    if (!tls_policy::configure_hostname_verification(ssl, host, policy))
+        return false;
+    if (!tls_policy::apply_client_alpn(ssl, policy, alpn, alpn_len))
+        return false;
+    SSL_set_tlsext_host_name(ssl, host.c_str());
+    return true;
+}
+
+static bool response_should_stream(const std::vector<uint8_t>& headers_data) {
+    const size_t end = header_end_offset(headers_data);
+    if (end == std::string::npos)
+        return false;
+    std::string headers(headers_data.begin(), headers_data.begin() + static_cast<ptrdiff_t>(end));
+    headers = lower_ascii(headers);
+    if (headers.find("content-type: text/event-stream") != std::string::npos)
+        return true;
+    const bool has_cl = headers.find("content-length:") != std::string::npos;
+    const bool has_te = headers.find("transfer-encoding:") != std::string::npos;
+    const bool close_delimited = headers.find("connection: close") != std::string::npos;
+    return !has_cl && !has_te && close_delimited;
+}
+
+static int ssl_read_some_blocking(SSL* ssl, uint8_t* buf, int len, int timeout_ms) {
+    SOCKET fd = static_cast<SOCKET>(SSL_get_fd(ssl));
+    for (;;) {
+        int n = SSL_read(ssl, buf, len);
+        if (n > 0)
+            return n;
+        int err = SSL_get_error(ssl, n);
+        if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE)
+            return -1;
+        WSAPOLLFD pfd{};
+        pfd.fd = fd;
+        pfd.events = (err == SSL_ERROR_WANT_WRITE) ? POLLOUT : POLLIN;
+        int pr = WSAPoll(&pfd, 1, timeout_ms);
+        if (pr <= 0)
+            return 0;
+    }
+}
+
+static int socket_read_some_blocking(SOCKET sock, uint8_t* buf, int len, int timeout_ms) {
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(sock, &fds);
+    timeval tv;
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    int sel = select(0, &fds, nullptr, nullptr, &tv);
+    if (sel <= 0)
+        return 0;
+    int n = recv(sock, reinterpret_cast<char*>(buf), len, 0);
+    return n > 0 ? n : -1;
+}
+
+static bool ssl_write_all(SSL* ssl, const uint8_t* data, size_t len) {
+    size_t sent = 0;
+    while (sent < len) {
+        const size_t chunk = std::min<size_t>(len - sent, 16 * 1024);
+        int n = SSL_write(ssl, data + sent, static_cast<int>(chunk));
+        if (n <= 0)
+            return false;
+        sent += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+static bool socket_write_all(SOCKET sock, const uint8_t* data, size_t len) {
+    size_t sent = 0;
+    while (sent < len) {
+        const size_t chunk = std::min<size_t>(len - sent, 64 * 1024);
+        int n = send(sock, reinterpret_cast<const char*>(data + sent), static_cast<int>(chunk), 0);
+        if (n <= 0)
+            return false;
+        sent += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+static void capture_limited(std::vector<uint8_t>& capture, const uint8_t* data, size_t len, size_t max_size) {
+    if (capture.size() >= max_size)
+        return;
+    const size_t take = std::min(len, max_size - capture.size());
+    capture.insert(capture.end(), data, data + take);
+}
+
+template <typename ReadFn, typename WriteFn>
+static void relay_streaming_body(state_t& state,
+                                 std::vector<uint8_t>& capture,
+                                 size_t max_capture,
+                                 uint64_t& bytes_out,
+                                 ReadFn&& read_fn,
+                                 WriteFn&& write_fn) {
+    uint8_t buf[32768];
+    while (state.running.load()) {
+        int n = read_fn(buf, static_cast<int>(sizeof(buf)));
+        if (n < 0)
+            break;
+        if (n == 0)
+            continue;
+        if (!write_fn(buf, static_cast<size_t>(n)))
+            break;
+        bytes_out += static_cast<uint64_t>(n);
+        capture_limited(capture, buf, static_cast<size_t>(n), max_capture);
+    }
 }
 
 static void websocket_relay(SSL* client_ssl, SSL* target_ssl, http_exchange& exchange, state_t& state) {
@@ -1118,7 +1561,7 @@ static bool is_websocket_upgrade(const protocol_parser::http_response& resp) {
 static void handle_h2_session(SSL* client_ssl, SSL* target_ssl,
                                const std::string& target_host, uint16_t target_port,
                                const std::string& client_addr, uint16_t client_port,
-                               state_t& state) {
+                               state_t& state, const proxy_config& config) {
     diag::log_tagged_fmt("mitm", "handle_h2_session entry host=%s:%u client=%s:%u",
         target_host.c_str(), target_port, client_addr.c_str(), client_port);
     h2_session::session client_session(h2_session::session::role::server);
@@ -1176,9 +1619,7 @@ static void handle_h2_session(SSL* client_ssl, SSL* target_ssl,
             script_engine::invoke_hook(script_engine::hook_type::on_request, hook_data);
             if (hook_data.dropped) {
                 exchange.state = http_exchange::state_t::dropped;
-                publish_exchange_event(exchange);
-                std::lock_guard<std::mutex> lock(state.history_mutex);
-                state.history.push_back(std::make_shared<http_exchange>(std::move(exchange)));
+                record_history(state, config, std::move(exchange));
                 return;
             }
         }
@@ -1194,7 +1635,7 @@ static void handle_h2_session(SSL* client_ssl, SSL* target_ssl,
         publish_exchange_event(exchange);
         std::lock_guard<std::mutex> lock(state.history_mutex);
         state.history.push_back(std::make_shared<http_exchange>(std::move(exchange)));
-        while (state.history.size() > state.config.max_history)
+        while (state.history.size() > config.max_history)
             state.history.pop_front();
     });
 
@@ -1281,9 +1722,9 @@ static void handle_h2_session(SSL* client_ssl, SSL* target_ssl,
 }
 
 
-static void handle_tls_connection(SOCKET client_sock, const std::string& target_host,
+static void handle_tls_connection(SOCKET client_sock, std::string target_host,
                                    uint16_t target_port, const std::string& client_addr,
-                                   uint16_t client_port, state_t& state) {
+                                   uint16_t client_port, state_t& state, const proxy_config& config) {
     diag::log_tagged_fmt("mitm", "handle_tls_connection entry host=%s:%u client=%s:%u",
         target_host.c_str(), target_port, client_addr.c_str(), client_port);
 
@@ -1301,6 +1742,12 @@ static void handle_tls_connection(SOCKET client_sock, const std::string& target_
         return;
     }
     diag::log_tagged_fmt("mitm", "handle_tls_connection got ssl_ctx host=%s ctx=%p", target_host.c_str(), ctx);
+    const auto server_policy = tls_policy::match_host(target_host);
+    if (!tls_policy::apply_server_policy(ctx, server_policy)) {
+        diag::log_tagged_fmt("mitm", "handle_tls_connection server_tls_policy_failed host=%s", target_host.c_str());
+        close_socket(client_sock);
+        return;
+    }
 
 
     static const unsigned char alpn_h2_h1[] = {
@@ -1311,7 +1758,7 @@ static void handle_tls_connection(SOCKET client_sock, const std::string& target_
         8, 'h', 't', 't', 'p', '/', '1', '.', '1'
     };
 
-    if (state.config.enable_h2) {
+    if (config.enable_h2 && (!server_policy.matched || server_policy.policy.alpn_protocols.empty())) {
 
         SSL_CTX_set_alpn_select_cb(ctx,
             [](SSL*, const unsigned char** out, unsigned char* outlen,
@@ -1365,7 +1812,7 @@ static void handle_tls_connection(SOCKET client_sock, const std::string& target_
             "client SNI differs from CONNECT authority");
     }
 
-    SOCKET target_sock = connect_to_target(target_host, target_port);
+    SOCKET target_sock = connect_to_target(target_host, target_port, config, true);
     diag::log_tagged_fmt("mitm", "handle_tls_connection connect_to_target host=%s:%u sock=%lld",
         target_host.c_str(), target_port, (long long)target_sock);
     if (target_sock == INVALID_SOCKET) {
@@ -1387,13 +1834,7 @@ static void handle_tls_connection(SOCKET client_sock, const std::string& target_
     }
 
 
-    if (state.config.enable_h2) {
-        if (client_alpn == "h2")
-            SSL_CTX_set_alpn_protos(target_ctx, alpn_h2_h1, sizeof(alpn_h2_h1));
-        else
-            SSL_CTX_set_alpn_protos(target_ctx, alpn_h1, sizeof(alpn_h1));
-    }
-
+    const auto upstream_policy = tls_policy::match_host(target_host);
     SSL* target_ssl = SSL_new(target_ctx);
     if (!target_ssl) {
         SSL_CTX_free(target_ctx);
@@ -1404,7 +1845,27 @@ static void handle_tls_connection(SOCKET client_sock, const std::string& target_
         return;
     }
     SSL_set_fd(target_ssl, static_cast<int>(target_sock));
-    SSL_set_tlsext_host_name(target_ssl, target_host.c_str());
+    const unsigned char* fallback_alpn = nullptr;
+    unsigned int fallback_alpn_len = 0;
+    if (config.enable_h2) {
+        if (client_alpn == "h2") {
+            fallback_alpn = alpn_h2_h1;
+            fallback_alpn_len = sizeof(alpn_h2_h1);
+        } else {
+            fallback_alpn = alpn_h1;
+            fallback_alpn_len = sizeof(alpn_h1);
+        }
+    }
+    if (!configure_client_tls(target_ctx, target_ssl, target_host, upstream_policy, fallback_alpn, fallback_alpn_len)) {
+        diag::log_tagged_fmt("mitm", "handle_tls_connection client_tls_policy_failed host=%s", target_host.c_str());
+        SSL_free(target_ssl);
+        SSL_CTX_free(target_ctx);
+        close_socket(target_sock);
+        SSL_shutdown(client_ssl);
+        SSL_free(client_ssl);
+        close_socket(client_sock);
+        return;
+    }
 
     bool connect_ok = ssl_handshake_with_timeout(target_ssl, SSL_connect);
     diag::log_tagged_fmt("mitm", "handle_tls_connection SSL_connect host=%s ok=%d", target_host.c_str(), (int)connect_ok);
@@ -1414,6 +1875,31 @@ static void handle_tls_connection(SOCKET client_sock, const std::string& target_
         if (detail.empty()) detail = "upstream_tls_handshake_failed";
         record_tls_observation(state, tls_observation_kind_t::upstream_handshake_failed,
             target_host, target_port, client_addr, client_port, client_sni, client_alpn, detail);
+        SSL_free(target_ssl);
+        SSL_CTX_free(target_ctx);
+        close_socket(target_sock);
+        SSL_shutdown(client_ssl);
+        SSL_free(client_ssl);
+        close_socket(client_sock);
+        return;
+    }
+    if (SSL_get_verify_result(target_ssl) != X509_V_OK && !upstream_policy.policy.ignore_cert_errors) {
+        diag::log_tagged_fmt("mitm", "handle_tls_connection upstream_cert_verify_failed host=%s verify=%ld",
+            target_host.c_str(), SSL_get_verify_result(target_ssl));
+        record_tls_observation(state, tls_observation_kind_t::upstream_handshake_failed,
+            target_host, target_port, client_addr, client_port, client_sni, client_alpn, "upstream_certificate_verify_failed");
+        SSL_free(target_ssl);
+        SSL_CTX_free(target_ctx);
+        close_socket(target_sock);
+        SSL_shutdown(client_ssl);
+        SSL_free(client_ssl);
+        close_socket(client_sock);
+        return;
+    }
+    if (!verify_upstream_pin(target_ssl, upstream_policy)) {
+        diag::log_tagged_fmt("mitm", "handle_tls_connection upstream_pin_mismatch host=%s", target_host.c_str());
+        record_tls_observation(state, tls_observation_kind_t::upstream_pin_mismatch,
+            target_host, target_port, client_addr, client_port, client_sni, client_alpn, "upstream_certificate_pin_mismatch");
         SSL_free(target_ssl);
         SSL_CTX_free(target_ctx);
         close_socket(target_sock);
@@ -1434,11 +1920,11 @@ static void handle_tls_connection(SOCKET client_sock, const std::string& target_
         "TLS handshake completed through proxy");
 
     state.active_connections.fetch_add(1);
-    bool use_h2 = state.config.enable_h2 && client_alpn == "h2" && target_alpn == "h2";
+    bool use_h2 = config.enable_h2 && client_alpn == "h2" && target_alpn == "h2";
     diag::log_tagged_fmt("mitm", "handle_tls_connection client_alpn=%s target_alpn=%s use_h2=%d host=%s:%u",
         client_alpn.c_str(), target_alpn.c_str(), (int)use_h2, target_host.c_str(), target_port);
 
-    if (state.config.enable_h2 && client_alpn == "h2" && target_alpn != "h2") {
+    if (config.enable_h2 && client_alpn == "h2" && target_alpn != "h2") {
         diag::log_tagged_fmt("mitm", "handle_tls_connection h2 client without h2 upstream host=%s:%u", target_host.c_str(), target_port);
         goto cleanup_no_history;
     }
@@ -1446,15 +1932,15 @@ static void handle_tls_connection(SOCKET client_sock, const std::string& target_
     if (use_h2) {
         diag::log_tagged_fmt("mitm", "handle_tls_connection dispatching to handle_h2_session host=%s:%u", target_host.c_str(), target_port);
         handle_h2_session(client_ssl, target_ssl, target_host, target_port,
-                          client_addr, client_port, state);
+                          client_addr, client_port, state, config);
     }
 
     else {
         diag::log_tagged_fmt("mitm", "handle_tls_connection HTTP/1.1 path host=%s:%u", target_host.c_str(), target_port);
 
         std::vector<uint8_t> request_data;
-        if (recv_ssl_all(client_ssl, request_data, state.config.max_body_size)) {
-            read_remaining_body_ssl(client_ssl, request_data, state.config.max_body_size);
+        if (recv_ssl_all(client_ssl, request_data, config.max_body_size)) {
+            read_remaining_body_ssl(client_ssl, request_data, config.max_body_size);
 
 
             http_exchange exchange;
@@ -1479,6 +1965,15 @@ static void handle_tls_connection(SOCKET client_sock, const std::string& target_
                     "TLS payload did not parse as an HTTP request");
                 goto cleanup_no_history;
             }
+            if (!exchange.request.complete) {
+                exchange.state = http_exchange::state_t::error;
+                exchange.error_msg = "request body exceeds buffered interception limit";
+                exchange.raw_response = build_error_response(413, "Payload Too Large", exchange.error_msg);
+                exchange.response = protocol_parser::parse_http_response(exchange.raw_response.data(), exchange.raw_response.size());
+                ssl_write_all(client_ssl, exchange.raw_response.data(), exchange.raw_response.size());
+                record_history(state, config, std::move(exchange));
+                goto cleanup_no_history;
+            }
 
             state.total_requests.fetch_add(1);
             state.total_bytes_in.fetch_add(request_data.size());
@@ -1497,19 +1992,21 @@ static void handle_tls_connection(SOCKET client_sock, const std::string& target_
                 script_engine::invoke_hook(script_engine::hook_type::on_request, hook_data);
                 if (hook_data.dropped) {
                     exchange.state = http_exchange::state_t::dropped;
-                    publish_exchange_event(exchange);
-                    std::lock_guard<std::mutex> lock(state.history_mutex);
-                    state.history.push_back(std::make_shared<http_exchange>(std::move(exchange)));
+                    record_history(state, config, std::move(exchange));
                     goto cleanup;
                 }
                 if (hook_data.modified)
                     request_data = hook_data.body;
             }
 
+            apply_sticky_session_request(config, exchange, request_data);
             aida::burp::match_replace::apply_request(request_data, target_host, "https");
+            exchange.raw_request = request_data;
+            exchange.request_size = request_data.size();
+            exchange.request = protocol_parser::parse_http_request(request_data.data(), request_data.size());
 
             bool should_forward = true;
-            if (state.config.intercept_enabled) {
+            if (config.intercept_enabled) {
                 bool cb_decided = false;
                 if (state.intercept_cb) {
                     intercept_action action = state.intercept_cb(exchange);
@@ -1549,14 +2046,116 @@ static void handle_tls_connection(SOCKET client_sock, const std::string& target_
                 (int)should_forward, static_cast<unsigned long long>(exchange.id), exchange.request.method.c_str(), exchange.request.uri.c_str());
             if (should_forward) {
                 exchange.state = http_exchange::state_t::forwarding;
+                auto local = map_resource::try_local(exchange);
+                if (local.matched) {
+                    exchange.raw_response = local.raw_response.empty()
+                        ? build_error_response(502, "Bad Gateway", local.error.empty() ? "map local failed" : local.error)
+                        : local.raw_response;
+                    add_tags(exchange, local.tags);
+                    exchange.response = protocol_parser::parse_http_response(exchange.raw_response.data(), exchange.raw_response.size());
+                    exchange.response_size = exchange.raw_response.size();
+                    exchange.response_time = GetTickCount64();
+                    exchange.latency_ms = exchange.response_time - exchange.request_time;
+                    exchange.state = local.raw_response.empty() ? http_exchange::state_t::error : http_exchange::state_t::complete;
+                    if (exchange.state == http_exchange::state_t::error)
+                        exchange.error_msg = local.error;
+                    SSL_write(client_ssl, exchange.raw_response.data(), static_cast<int>(exchange.raw_response.size()));
+                    state.total_bytes_out.fetch_add(exchange.raw_response.size());
+                    apply_sticky_session_response(config, exchange);
+                    record_history(state, config, std::move(exchange));
+                    goto cleanup_no_history;
+                }
+                auto replay = server_replay::match(exchange, request_data);
+                if (replay.matched) {
+                    exchange.raw_response = replay.raw_response;
+                    add_tags(exchange, replay.tags);
+                    exchange.response = protocol_parser::parse_http_response(exchange.raw_response.data(), exchange.raw_response.size());
+                    exchange.response_size = exchange.raw_response.size();
+                    exchange.response_time = GetTickCount64();
+                    exchange.latency_ms = exchange.response_time - exchange.request_time;
+                    exchange.state = http_exchange::state_t::complete;
+                    SSL_write(client_ssl, exchange.raw_response.data(), static_cast<int>(exchange.raw_response.size()));
+                    state.total_bytes_out.fetch_add(exchange.raw_response.size());
+                    apply_sticky_session_response(config, exchange);
+                    record_history(state, config, std::move(exchange));
+                    goto cleanup_no_history;
+                }
+                auto remote = map_resource::try_remote(exchange, request_data);
+                if (remote.matched) {
+                    if (!remote.error.empty() || !remote.use_tls) {
+                        const std::string reason = !remote.error.empty() ? remote.error : "https map-remote requires an https remote URL";
+                        exchange.state = http_exchange::state_t::error;
+                        exchange.error_msg = reason;
+                        exchange.raw_response = build_error_response(502, "Bad Gateway", reason);
+                        exchange.response = protocol_parser::parse_http_response(exchange.raw_response.data(), exchange.raw_response.size());
+                        SSL_write(client_ssl, exchange.raw_response.data(), static_cast<int>(exchange.raw_response.size()));
+                        record_history(state, config, std::move(exchange));
+                        goto cleanup_no_history;
+                    }
+                    add_tags(exchange, remote.tags);
+                    SSL_shutdown(target_ssl);
+                    SSL_free(target_ssl);
+                    SSL_CTX_free(target_ctx);
+                    close_socket(target_sock);
+                    target_ssl = nullptr;
+                    target_ctx = nullptr;
+                    target_sock = INVALID_SOCKET;
+                    target_host = remote.host;
+                    target_port = remote.port;
+                    request_data = std::move(remote.raw_request);
+                    exchange.target_host = target_host;
+                    exchange.target_port = target_port;
+                    exchange.raw_request = request_data;
+                    exchange.request = protocol_parser::parse_http_request(request_data.data(), request_data.size());
+                    target_sock = connect_to_target(target_host, target_port, config, true);
+                    target_ctx = target_sock == INVALID_SOCKET ? nullptr : SSL_CTX_new(TLS_client_method());
+                    target_ssl = target_ctx ? SSL_new(target_ctx) : nullptr;
+                    const auto remap_policy = tls_policy::match_host(target_host);
+                    const bool remap_ok = target_ssl &&
+                        (SSL_set_fd(target_ssl, static_cast<int>(target_sock)), true) &&
+                        configure_client_tls(target_ctx, target_ssl, target_host, remap_policy, alpn_h1, sizeof(alpn_h1)) &&
+                        ssl_handshake_with_timeout(target_ssl, SSL_connect) &&
+                        (SSL_get_verify_result(target_ssl) == X509_V_OK || remap_policy.policy.ignore_cert_errors) &&
+                        verify_upstream_pin(target_ssl, remap_policy);
+                    if (!remap_ok) {
+                        exchange.state = http_exchange::state_t::error;
+                        exchange.error_msg = "map remote upstream TLS connection failed";
+                        exchange.raw_response = build_error_response(502, "Bad Gateway", exchange.error_msg);
+                        exchange.response = protocol_parser::parse_http_response(exchange.raw_response.data(), exchange.raw_response.size());
+                        SSL_write(client_ssl, exchange.raw_response.data(), static_cast<int>(exchange.raw_response.size()));
+                        record_history(state, config, std::move(exchange));
+                        goto cleanup_no_history;
+                    }
+                }
 
                 int sent = SSL_write(target_ssl, request_data.data(), static_cast<int>(request_data.size()));
                 diag::log_tagged_fmt("mitm", "handle_tls_connection SSL_write request sent=%d size=%zu host=%s", sent, request_data.size(), target_host.c_str());
                 if (sent > 0) {
 
                     std::vector<uint8_t> response_data;
-                    if (recv_ssl_all(target_ssl, response_data, state.config.max_body_size)) {
-                        read_remaining_body_ssl(target_ssl, response_data, state.config.max_body_size);
+                    if (recv_ssl_all(target_ssl, response_data, config.max_body_size)) {
+                        if (response_should_stream(response_data)) {
+                            exchange.raw_response = response_data;
+                            exchange.response = protocol_parser::parse_http_response(response_data.data(), response_data.size());
+                            exchange.response_time = GetTickCount64();
+                            exchange.latency_ms = exchange.response_time - exchange.request_time;
+                            exchange.state = http_exchange::state_t::complete;
+                            add_tags(exchange, {"streamed-response"});
+                            ssl_write_all(client_ssl, response_data.data(), response_data.size());
+                            uint64_t streamed = response_data.size();
+                            relay_streaming_body(state,
+                                                 exchange.raw_response,
+                                                 config.max_body_size,
+                                                 streamed,
+                                                 [&](uint8_t* buf, int len) { return ssl_read_some_blocking(target_ssl, buf, len, 1000); },
+                                                 [&](const uint8_t* buf, size_t len) { return ssl_write_all(client_ssl, buf, len); });
+                            exchange.response_size = static_cast<size_t>(streamed);
+                            state.total_bytes_out.fetch_add(streamed);
+                            apply_sticky_session_response(config, exchange);
+                            record_history(state, config, std::move(exchange));
+                            goto cleanup_no_history;
+                        }
+                        read_remaining_body_ssl(target_ssl, response_data, config.max_body_size);
 
                         exchange.raw_response = response_data;
                         exchange.response_size = response_data.size();
@@ -1590,11 +2189,15 @@ static void handle_tls_connection(SOCKET client_sock, const std::string& target_
                         }
 
                         aida::burp::match_replace::apply_response(response_data, target_host, "https");
+                        exchange.raw_response = response_data;
+                        exchange.response_size = response_data.size();
+                        exchange.response = protocol_parser::parse_http_response(response_data.data(), response_data.size());
 
                         if (exchange.state != http_exchange::state_t::dropped)
                             SSL_write(client_ssl, response_data.data(), static_cast<int>(response_data.size()));
+                        apply_sticky_session_response(config, exchange);
 
-                        if (state.config.enable_websocket && is_websocket_upgrade(exchange.response)) {
+                        if (config.enable_websocket && is_websocket_upgrade(exchange.response)) {
                             diag::log_tagged_fmt("mitm", "handle_tls_connection WebSocket upgrade detected exchange_id=%llu host=%s:%u",
                                 static_cast<unsigned long long>(exchange.id), target_host.c_str(), target_port);
                             std::shared_ptr<http_exchange> ws_exchange;
@@ -1602,7 +2205,7 @@ static void handle_tls_connection(SOCKET client_sock, const std::string& target_
                                 std::lock_guard<std::mutex> lock(state.history_mutex);
                                 ws_exchange = std::make_shared<http_exchange>(exchange);
                                 state.history.push_back(ws_exchange);
-                                while (state.history.size() > state.config.max_history)
+                                while (state.history.size() > config.max_history)
                                     state.history.pop_front();
                             }
 
@@ -1624,7 +2227,7 @@ static void handle_tls_connection(SOCKET client_sock, const std::string& target_
                 publish_exchange_event(exchange);
                 std::lock_guard<std::mutex> lock(state.history_mutex);
                 state.history.push_back(std::make_shared<http_exchange>(std::move(exchange)));
-                while (state.history.size() > state.config.max_history)
+                while (state.history.size() > config.max_history)
                     state.history.pop_front();
             }
         }
@@ -1635,29 +2238,37 @@ cleanup_no_history:
     state.active_connections.fetch_sub(1);
 
 
-    SSL_shutdown(target_ssl);
-    SSL_free(target_ssl);
-    SSL_CTX_free(target_ctx);
-    SSL_shutdown(client_ssl);
-    SSL_free(client_ssl);
+    if (target_ssl) {
+        SSL_shutdown(target_ssl);
+        SSL_free(target_ssl);
+    }
+    if (target_ctx)
+        SSL_CTX_free(target_ctx);
+    if (client_ssl) {
+        SSL_shutdown(client_ssl);
+        SSL_free(client_ssl);
+    }
     close_socket(target_sock);
     close_socket(client_sock);
 }
 
 
 static void handle_plain_connection(SOCKET client_sock, const std::string& client_addr,
-                                     uint16_t client_port, state_t& state) {
+                                     uint16_t client_port, state_t& state, const proxy_config& config,
+                                     const std::string& forced_target_host = {},
+                                     uint16_t forced_target_port = 0,
+                                     bool forced_tls = false) {
     diag::log_tagged_fmt("mitm", "handle_plain_connection entry client=%s:%u", client_addr.c_str(), client_port);
     state.active_connections.fetch_add(1);
 
     std::vector<uint8_t> request_data;
-    if (!recv_all(client_sock, request_data, state.config.max_body_size)) {
+    if (!recv_all(client_sock, request_data, config.max_body_size)) {
         diag::log_tagged_fmt("mitm", "handle_plain_connection recv_all failed client=%s:%u", client_addr.c_str(), client_port);
         state.active_connections.fetch_sub(1);
         close_socket(client_sock);
         return;
     }
-    read_remaining_body(client_sock, request_data, state.config.max_body_size);
+    read_remaining_body(client_sock, request_data, config.max_body_size);
     diag::log_tagged_fmt("mitm", "handle_plain_connection recv request_data=%zu client=%s:%u", request_data.size(), client_addr.c_str(), client_port);
 
     auto req = protocol_parser::parse_http_request(request_data.data(), request_data.size());
@@ -1668,16 +2279,53 @@ static void handle_plain_connection(SOCKET client_sock, const std::string& clien
         close_socket(client_sock);
         return;
     }
+    if (!req.complete) {
+        http_exchange exchange;
+        exchange.id = state.next_id++;
+        exchange.timestamp = GetTickCount64();
+        exchange.client_addr = client_addr;
+        exchange.client_port = client_port;
+        exchange.raw_request = request_data;
+        exchange.request = req;
+        exchange.request_size = request_data.size();
+        exchange.request_time = GetTickCount64();
+        exchange.state = http_exchange::state_t::error;
+        exchange.error_msg = "request body exceeds buffered interception limit";
+        exchange.raw_response = build_error_response(413, "Payload Too Large", exchange.error_msg);
+        exchange.response = protocol_parser::parse_http_response(exchange.raw_response.data(), exchange.raw_response.size());
+        send(client_sock, reinterpret_cast<const char*>(exchange.raw_response.data()), static_cast<int>(exchange.raw_response.size()), 0);
+        record_history(state, config, std::move(exchange));
+        state.active_connections.fetch_sub(1);
+        close_socket(client_sock);
+        return;
+    }
 
 
-    std::string target_host = protocol_parser::find_header(req.headers, "Host");
-    uint16_t target_port = 80;
-    size_t colon = target_host.rfind(':');
-    if (colon != std::string::npos) {
-        uint16_t parsed_port = 0;
-        if (parse_uint16(target_host.substr(colon + 1), parsed_port))
-            target_port = parsed_port;
-        target_host = target_host.substr(0, colon);
+    if (!proxy_authorization_valid(req, config)) {
+        diag::log_tagged_fmt("mitm", "handle_plain_connection proxy_auth_required client=%s:%u", client_addr.c_str(), client_port);
+        send_proxy_auth_required(client_sock, config);
+        state.active_connections.fetch_sub(1);
+        close_socket(client_sock);
+        return;
+    }
+    remove_proxy_headers(request_data);
+    req = protocol_parser::parse_http_request(request_data.data(), request_data.size());
+
+    std::string target_host = forced_target_host.empty() ? protocol_parser::find_header(req.headers, "Host") : forced_target_host;
+    uint16_t target_port = forced_target_port == 0 ? 80 : forced_target_port;
+    bool upstream_tls = forced_tls;
+    if (forced_target_host.empty()) {
+        if (req.uri.rfind("https://", 0) == 0) {
+            upstream_tls = true;
+            target_port = 443;
+        }
+        size_t colon = target_host.rfind(':');
+        if (colon != std::string::npos) {
+            uint16_t parsed_port = 0;
+            if (parse_uint16(target_host.substr(colon + 1), parsed_port))
+                target_port = parsed_port;
+            target_host = target_host.substr(0, colon);
+        }
     }
 
     diag::log_tagged_fmt("mitm", "handle_plain_connection target_host=%s port=%u client=%s:%u", target_host.c_str(), target_port, client_addr.c_str(), client_port);
@@ -1695,7 +2343,7 @@ static void handle_plain_connection(SOCKET client_sock, const std::string& clien
     exchange.client_port = client_port;
     exchange.target_host = target_host;
     exchange.target_port = target_port;
-    exchange.is_tls = false;
+    exchange.is_tls = upstream_tls;
     exchange.raw_request = request_data;
     exchange.request_size = request_data.size();
     exchange.request_time = GetTickCount64();
@@ -1713,7 +2361,7 @@ static void handle_plain_connection(SOCKET client_sock, const std::string& clien
         hook_data.uri = req.uri;
         hook_data.host = target_host;
         hook_data.port = target_port;
-        hook_data.is_tls = false;
+        hook_data.is_tls = upstream_tls;
         for (const auto& h : req.headers)
             hook_data.headers[h.name] = h.value;
         hook_data.body = request_data;
@@ -1734,10 +2382,14 @@ static void handle_plain_connection(SOCKET client_sock, const std::string& clien
         }
     }
 
-    aida::burp::match_replace::apply_request(request_data, target_host, "http");
+    apply_sticky_session_request(config, exchange, request_data);
+    aida::burp::match_replace::apply_request(request_data, target_host, upstream_tls ? "https" : "http");
+    exchange.raw_request = request_data;
+    exchange.request_size = request_data.size();
+    exchange.request = protocol_parser::parse_http_request(request_data.data(), request_data.size());
 
     bool should_forward = true;
-    if (state.config.intercept_enabled) {
+    if (config.intercept_enabled) {
         bool cb_decided = false;
         if (state.intercept_cb) {
             intercept_action action = state.intercept_cb(exchange);
@@ -1781,16 +2433,147 @@ static void handle_plain_connection(SOCKET client_sock, const std::string& clien
     diag::log_tagged_fmt("mitm", "handle_plain_connection should_forward=%d exchange_id=%llu", (int)should_forward, static_cast<unsigned long long>(exchange.id));
     if (should_forward) {
         exchange.state = http_exchange::state_t::forwarding;
-        SOCKET target_sock = connect_to_target(target_host, target_port);
+        auto local = map_resource::try_local(exchange);
+        if (local.matched) {
+            exchange.raw_response = local.raw_response.empty()
+                ? build_error_response(502, "Bad Gateway", local.error.empty() ? "map local failed" : local.error)
+                : local.raw_response;
+            add_tags(exchange, local.tags);
+            exchange.response = protocol_parser::parse_http_response(exchange.raw_response.data(), exchange.raw_response.size());
+            exchange.response_size = exchange.raw_response.size();
+            exchange.response_time = GetTickCount64();
+            exchange.latency_ms = exchange.response_time - exchange.request_time;
+            exchange.state = local.raw_response.empty() ? http_exchange::state_t::error : http_exchange::state_t::complete;
+            if (exchange.state == http_exchange::state_t::error)
+                exchange.error_msg = local.error;
+            send(client_sock, reinterpret_cast<const char*>(exchange.raw_response.data()), static_cast<int>(exchange.raw_response.size()), 0);
+            state.total_bytes_out.fetch_add(exchange.raw_response.size());
+            apply_sticky_session_response(config, exchange);
+            record_history(state, config, std::move(exchange));
+            state.active_connections.fetch_sub(1);
+            close_socket(client_sock);
+            return;
+        }
+        auto replay = server_replay::match(exchange, request_data);
+        if (replay.matched) {
+            exchange.raw_response = replay.raw_response;
+            add_tags(exchange, replay.tags);
+            exchange.response = protocol_parser::parse_http_response(exchange.raw_response.data(), exchange.raw_response.size());
+            exchange.response_size = exchange.raw_response.size();
+            exchange.response_time = GetTickCount64();
+            exchange.latency_ms = exchange.response_time - exchange.request_time;
+            exchange.state = http_exchange::state_t::complete;
+            send(client_sock, reinterpret_cast<const char*>(exchange.raw_response.data()), static_cast<int>(exchange.raw_response.size()), 0);
+            state.total_bytes_out.fetch_add(exchange.raw_response.size());
+            apply_sticky_session_response(config, exchange);
+            record_history(state, config, std::move(exchange));
+            state.active_connections.fetch_sub(1);
+            close_socket(client_sock);
+            return;
+        }
+        auto remote = map_resource::try_remote(exchange, request_data);
+        if (remote.matched) {
+            if (!remote.error.empty()) {
+                exchange.state = http_exchange::state_t::error;
+                exchange.error_msg = remote.error;
+                exchange.raw_response = build_error_response(502, "Bad Gateway", remote.error);
+                exchange.response = protocol_parser::parse_http_response(exchange.raw_response.data(), exchange.raw_response.size());
+                send(client_sock, reinterpret_cast<const char*>(exchange.raw_response.data()), static_cast<int>(exchange.raw_response.size()), 0);
+                record_history(state, config, std::move(exchange));
+                state.active_connections.fetch_sub(1);
+                close_socket(client_sock);
+                return;
+            }
+            add_tags(exchange, remote.tags);
+            target_host = remote.host;
+            target_port = remote.port;
+            upstream_tls = remote.use_tls;
+            request_data = std::move(remote.raw_request);
+            exchange.target_host = target_host;
+            exchange.target_port = target_port;
+            exchange.is_tls = upstream_tls;
+            exchange.raw_request = request_data;
+            exchange.request = protocol_parser::parse_http_request(request_data.data(), request_data.size());
+        }
+        SOCKET target_sock = connect_to_target(target_host, target_port, config, upstream_tls);
         diag::log_tagged_fmt("mitm", "handle_plain_connection connect_to_target host=%s port=%u result=%d exchange_id=%llu", target_host.c_str(), target_port, (target_sock != INVALID_SOCKET) ? 1 : 0, static_cast<unsigned long long>(exchange.id));
         if (target_sock != INVALID_SOCKET) {
-            int sent = send(target_sock, reinterpret_cast<const char*>(request_data.data()),
-                            static_cast<int>(request_data.size()), 0);
+            SSL_CTX* upstream_ctx = nullptr;
+            SSL* upstream_ssl = nullptr;
+            bool upstream_ready = true;
+            if (upstream_tls) {
+                const auto upstream_policy = tls_policy::match_host(target_host);
+                upstream_ctx = SSL_CTX_new(TLS_client_method());
+                upstream_ssl = upstream_ctx ? SSL_new(upstream_ctx) : nullptr;
+                if (!upstream_ssl) {
+                    upstream_ready = false;
+                } else {
+                    SSL_set_fd(upstream_ssl, static_cast<int>(target_sock));
+                    upstream_ready = configure_client_tls(upstream_ctx, upstream_ssl, target_host, upstream_policy, nullptr, 0) &&
+                                     ssl_handshake_with_timeout(upstream_ssl, SSL_connect) &&
+                                     (SSL_get_verify_result(upstream_ssl) == X509_V_OK || upstream_policy.policy.ignore_cert_errors) &&
+                                     verify_upstream_pin(upstream_ssl, upstream_policy);
+                }
+            }
+            int sent = -1;
+            if (upstream_ready) {
+                sent = upstream_tls
+                    ? SSL_write(upstream_ssl, request_data.data(), static_cast<int>(request_data.size()))
+                    : send(target_sock, reinterpret_cast<const char*>(request_data.data()), static_cast<int>(request_data.size()), 0);
+            }
             diag::log_tagged_fmt("mitm", "handle_plain_connection send_request sent=%d size=%zu exchange_id=%llu", sent, request_data.size(), static_cast<unsigned long long>(exchange.id));
             if (sent > 0) {
                 std::vector<uint8_t> response_data;
-                if (recv_all(target_sock, response_data, state.config.max_body_size)) {
-                    read_remaining_body(target_sock, response_data, state.config.max_body_size);
+                bool response_ok = false;
+                if (upstream_tls) {
+                    response_ok = recv_ssl_all(upstream_ssl, response_data, config.max_body_size);
+                } else {
+                    response_ok = recv_all(target_sock, response_data, config.max_body_size);
+                }
+                if (response_ok) {
+                    if (response_should_stream(response_data)) {
+                        exchange.raw_response = response_data;
+                        exchange.response = protocol_parser::parse_http_response(response_data.data(), response_data.size());
+                        exchange.response_time = GetTickCount64();
+                        exchange.latency_ms = exchange.response_time - exchange.request_time;
+                        exchange.state = http_exchange::state_t::complete;
+                        add_tags(exchange, {"streamed-response"});
+                        socket_write_all(client_sock, response_data.data(), response_data.size());
+                        uint64_t streamed = response_data.size();
+                        if (upstream_tls) {
+                            relay_streaming_body(state,
+                                                 exchange.raw_response,
+                                                 config.max_body_size,
+                                                 streamed,
+                                                 [&](uint8_t* buf, int len) { return ssl_read_some_blocking(upstream_ssl, buf, len, 1000); },
+                                                 [&](const uint8_t* buf, size_t len) { return socket_write_all(client_sock, buf, len); });
+                        } else {
+                            relay_streaming_body(state,
+                                                 exchange.raw_response,
+                                                 config.max_body_size,
+                                                 streamed,
+                                                 [&](uint8_t* buf, int len) { return socket_read_some_blocking(target_sock, buf, len, 1000); },
+                                                 [&](const uint8_t* buf, size_t len) { return socket_write_all(client_sock, buf, len); });
+                        }
+                        exchange.response_size = static_cast<size_t>(streamed);
+                        state.total_bytes_out.fetch_add(streamed);
+                        apply_sticky_session_response(config, exchange);
+                        record_history(state, config, std::move(exchange));
+                        if (upstream_ssl) {
+                            SSL_shutdown(upstream_ssl);
+                            SSL_free(upstream_ssl);
+                        }
+                        if (upstream_ctx)
+                            SSL_CTX_free(upstream_ctx);
+                        close_socket(target_sock);
+                        state.active_connections.fetch_sub(1);
+                        close_socket(client_sock);
+                        return;
+                    }
+                    if (upstream_tls)
+                        read_remaining_body_ssl(upstream_ssl, response_data, config.max_body_size);
+                    else
+                        read_remaining_body(target_sock, response_data, config.max_body_size);
 
                     exchange.raw_response = response_data;
                     exchange.response_size = response_data.size();
@@ -1806,7 +2589,7 @@ static void handle_plain_connection(SOCKET client_sock, const std::string& clien
                     if (script_engine::is_initialized()) {
                         script_engine::hook_response_data hook_data;
                         hook_data.status_code = exchange.response.status_code;
-                        hook_data.host = target_host;
+                            hook_data.host = target_host;
                         hook_data.port = target_port;
                         for (const auto& h : exchange.response.headers)
                             hook_data.headers[h.name] = h.value;
@@ -1821,11 +2604,15 @@ static void handle_plain_connection(SOCKET client_sock, const std::string& clien
                         }
                     }
 
-                    aida::burp::match_replace::apply_response(response_data, target_host, "http");
+                    aida::burp::match_replace::apply_response(response_data, target_host, upstream_tls ? "https" : "http");
+                    exchange.raw_response = response_data;
+                    exchange.response_size = response_data.size();
+                    exchange.response = protocol_parser::parse_http_response(response_data.data(), response_data.size());
 
                     if (exchange.state != http_exchange::state_t::dropped)
                         send(client_sock, reinterpret_cast<const char*>(response_data.data()),
                              static_cast<int>(response_data.size()), 0);
+                    apply_sticky_session_response(config, exchange);
                 } else {
                     diag::log_tagged_fmt("mitm", "handle_plain_connection recv_response_failed exchange_id=%llu", static_cast<unsigned long long>(exchange.id));
                     exchange.state = http_exchange::state_t::error;
@@ -1836,6 +2623,12 @@ static void handle_plain_connection(SOCKET client_sock, const std::string& clien
                 exchange.state = http_exchange::state_t::error;
                 exchange.error_msg = "Failed to send to target";
             }
+            if (upstream_ssl) {
+                SSL_shutdown(upstream_ssl);
+                SSL_free(upstream_ssl);
+            }
+            if (upstream_ctx)
+                SSL_CTX_free(upstream_ctx);
             close_socket(target_sock);
         } else {
             diag::log_tagged_fmt("mitm", "handle_plain_connection connect_failed host=%s port=%u exchange_id=%llu", target_host.c_str(), target_port, static_cast<unsigned long long>(exchange.id));
@@ -1848,7 +2641,7 @@ static void handle_plain_connection(SOCKET client_sock, const std::string& clien
         publish_exchange_event(exchange);
         std::lock_guard<std::mutex> lock(state.history_mutex);
         state.history.push_back(std::make_shared<http_exchange>(std::move(exchange)));
-        while (state.history.size() > state.config.max_history)
+        while (state.history.size() > config.max_history)
             state.history.pop_front();
     }
 
@@ -1857,7 +2650,94 @@ static void handle_plain_connection(SOCKET client_sock, const std::string& clien
 }
 
 
-static void handle_client(SOCKET client_sock, sockaddr_in client_addr_in, state_t& state) {
+static bool handle_socks5_client(SOCKET client_sock,
+                                 const std::string& client_addr,
+                                 uint16_t client_port,
+                                 state_t& state,
+                                 const proxy_config& config) {
+    uint8_t head[2] = {};
+    if (!recv_exact(client_sock, head, sizeof(head)) || head[0] != 0x05 || head[1] == 0)
+        return false;
+    std::vector<uint8_t> methods(head[1]);
+    if (!recv_exact(client_sock, methods.data(), methods.size()))
+        return false;
+    uint8_t selected = 0xFF;
+    if (config.require_proxy_auth) {
+        if (std::find(methods.begin(), methods.end(), 0x02) != methods.end())
+            selected = 0x02;
+    } else if (std::find(methods.begin(), methods.end(), 0x00) != methods.end()) {
+        selected = 0x00;
+    }
+    uint8_t sel_resp[2] = {0x05, selected};
+    send_exact(client_sock, sel_resp, sizeof(sel_resp));
+    if (selected == 0xFF)
+        return false;
+    if (selected == 0x02) {
+        uint8_t ah[2] = {};
+        if (!recv_exact(client_sock, ah, sizeof(ah)) || ah[0] != 0x01)
+            return false;
+        std::string user(static_cast<size_t>(ah[1]), '\0');
+        if (!user.empty() && !recv_exact(client_sock, reinterpret_cast<uint8_t*>(&user[0]), user.size()))
+            return false;
+        uint8_t plen = 0;
+        if (!recv_exact(client_sock, &plen, 1))
+            return false;
+        std::string pass(static_cast<size_t>(plen), '\0');
+        if (!pass.empty() && !recv_exact(client_sock, reinterpret_cast<uint8_t*>(&pass[0]), pass.size()))
+            return false;
+        const bool ok = constant_time_equal(user, config.proxy_auth_username) &&
+                        constant_time_equal(pass, config.proxy_auth_password);
+        uint8_t ar[2] = {0x01, static_cast<uint8_t>(ok ? 0x00 : 0x01)};
+        send_exact(client_sock, ar, sizeof(ar));
+        if (!ok)
+            return false;
+    }
+
+    uint8_t reqh[4] = {};
+    if (!recv_exact(client_sock, reqh, sizeof(reqh)) || reqh[0] != 0x05 || reqh[1] != 0x01 || reqh[2] != 0x00)
+        return false;
+    std::string target_host;
+    if (reqh[3] == 0x01) {
+        uint8_t addr[4] = {};
+        if (!recv_exact(client_sock, addr, sizeof(addr)))
+            return false;
+        char buf[INET_ADDRSTRLEN] = {};
+        inet_ntop(AF_INET, addr, buf, sizeof(buf));
+        target_host = buf;
+    } else if (reqh[3] == 0x03) {
+        uint8_t len = 0;
+        if (!recv_exact(client_sock, &len, 1) || len == 0)
+            return false;
+        target_host.assign(static_cast<size_t>(len), '\0');
+        if (!recv_exact(client_sock, reinterpret_cast<uint8_t*>(&target_host[0]), target_host.size()))
+            return false;
+    } else if (reqh[3] == 0x04) {
+        uint8_t addr[16] = {};
+        if (!recv_exact(client_sock, addr, sizeof(addr)))
+            return false;
+        char buf[INET6_ADDRSTRLEN] = {};
+        inet_ntop(AF_INET6, addr, buf, sizeof(buf));
+        target_host = buf;
+    } else {
+        return false;
+    }
+    uint8_t pbuf[2] = {};
+    if (!recv_exact(client_sock, pbuf, sizeof(pbuf)))
+        return false;
+    const uint16_t target_port = static_cast<uint16_t>((pbuf[0] << 8) | pbuf[1]);
+    uint8_t ok_resp[10] = {0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0};
+    send_exact(client_sock, ok_resp, sizeof(ok_resp));
+    diag::log_tagged_fmt("mitm", "socks5_client connect target=%s:%u client=%s:%u decode_tls=%d",
+        target_host.c_str(), target_port, client_addr.c_str(), client_port, config.decode_tls ? 1 : 0);
+    if (config.decode_tls && target_port == 443) {
+        handle_tls_connection(client_sock, target_host, target_port, client_addr, client_port, state, config);
+        return true;
+    }
+    handle_plain_connection(client_sock, client_addr, client_port, state, config, target_host, target_port, false);
+    return true;
+}
+
+static void handle_client(SOCKET client_sock, sockaddr_in client_addr_in, state_t& state, const proxy_config& config) {
     std::string client_addr = addr_to_string(client_addr_in);
     uint16_t client_port = ntohs(client_addr_in.sin_port);
     diag::log_tagged_fmt("mitm", "handle_client entry client=%s:%u", client_addr.c_str(), client_port);
@@ -1870,13 +2750,61 @@ static void handle_client(SOCKET client_sock, sockaddr_in client_addr_in, state_
         return;
     }
 
-    diag::log_tagged_fmt("mitm", "handle_client peeked=%d first_bytes=%02x%02x%02x is_connect=%d client=%s:%u", peeked, peek_buf[0], peek_buf[1], peek_buf[2], (peeked >= 7 && memcmp(peek_buf, "CONNECT", 7) == 0) ? 1 : 0, client_addr.c_str(), client_port);
+    diag::log_tagged_fmt("mitm", "handle_client peeked=%d first_bytes=%02x%02x%02x is_connect=%d mode=%d client=%s:%u", peeked, peek_buf[0], peek_buf[1], peek_buf[2], (peeked >= 7 && memcmp(peek_buf, "CONNECT", 7) == 0) ? 1 : 0, (int)config.mode, client_addr.c_str(), client_port);
+
+    if (config.mode == proxy_mode_t::socks5 || peek_buf[0] == 0x05) {
+        if (!handle_socks5_client(client_sock, client_addr, client_port, state, config))
+            close_socket(client_sock);
+        return;
+    }
+
+    if (config.mode == proxy_mode_t::reverse) {
+        if (config.reverse_target_host.empty() || config.reverse_target_port == 0) {
+            close_socket(client_sock);
+            return;
+        }
+        if (config.decode_tls && peek_buf[0] == 0x16) {
+            handle_tls_connection(client_sock, config.reverse_target_host, config.reverse_target_port, client_addr, client_port, state, config);
+        } else {
+            handle_plain_connection(client_sock, client_addr, client_port, state, config,
+                                    config.reverse_target_host, config.reverse_target_port, config.reverse_target_tls);
+        }
+        return;
+    }
+
+    if (config.mode == proxy_mode_t::transparent && config.decode_tls && peek_buf[0] == 0x16) {
+        std::vector<uint8_t> hello(4096);
+        int got = recv(client_sock, reinterpret_cast<char*>(hello.data()), static_cast<int>(hello.size()), MSG_PEEK);
+        std::string sni;
+        if (got > 0) {
+            auto parsed = protocol_parser::parse_client_hello(hello.data(), static_cast<size_t>(got));
+            if (parsed.valid)
+                sni = parsed.sni;
+        }
+        if (sni.empty()) {
+            record_tls_observation(state, tls_observation_kind_t::client_handshake_failed,
+                std::string(), config.redirect_target_port, client_addr, client_port, std::string(), std::string(),
+                "transparent_tls_missing_sni");
+            close_socket(client_sock);
+            return;
+        }
+        handle_tls_connection(client_sock, sni, config.redirect_target_port, client_addr, client_port, state, config);
+        return;
+    }
 
     if (peeked >= 7 && memcmp(peek_buf, "CONNECT", 7) == 0) {
 
         std::vector<uint8_t> connect_req;
         if (!recv_all(client_sock, connect_req, 8192)) {
             diag::log_tagged_fmt("mitm", "handle_client connect_recv_all_failed client=%s:%u", client_addr.c_str(), client_port);
+            close_socket(client_sock);
+            return;
+        }
+
+        auto connect_parsed = protocol_parser::parse_http_request(connect_req.data(), connect_req.size());
+        if (!proxy_authorization_valid(connect_parsed, config)) {
+            diag::log_tagged_fmt("mitm", "handle_client connect_proxy_auth_required client=%s:%u", client_addr.c_str(), client_port);
+            send_proxy_auth_required(client_sock, config);
             close_socket(client_sock);
             return;
         }
@@ -1898,15 +2826,15 @@ static void handle_client(SOCKET client_sock, sockaddr_in client_addr_in, state_
         const char* ok_resp = "HTTP/1.1 200 Connection Established\r\n\r\n";
         send(client_sock, ok_resp, static_cast<int>(strlen(ok_resp)), 0);
 
-        if (state.config.decode_tls) {
+        if (config.decode_tls) {
             diag::log_tagged_fmt("mitm", "handle_client dispatch_tls host=%s port=%u client=%s:%u", target_host.c_str(), target_port, client_addr.c_str(), client_port);
-            handle_tls_connection(client_sock, target_host, target_port, client_addr, client_port, state);
+            handle_tls_connection(client_sock, target_host, target_port, client_addr, client_port, state, config);
         } else {
             diag::log_tagged_fmt("mitm", "handle_client dispatch_tunnel host=%s port=%u client=%s:%u", target_host.c_str(), target_port, client_addr.c_str(), client_port);
             record_tls_observation(state, tls_observation_kind_t::tunnel_passthrough,
                 target_host, target_port, client_addr, client_port, std::string(), std::string(),
                 "CONNECT tunnel passed without TLS decoding");
-            SOCKET target_sock = connect_to_target(target_host, target_port);
+            SOCKET target_sock = connect_to_target(target_host, target_port, config, target_port == 443);
             if (target_sock == INVALID_SOCKET) {
                 diag::log_tagged_fmt("mitm", "handle_client tunnel_connect_failed host=%s port=%u client=%s:%u", target_host.c_str(), target_port, client_addr.c_str(), client_port);
                 close_socket(client_sock);
@@ -1953,7 +2881,7 @@ static void handle_client(SOCKET client_sock, sockaddr_in client_addr_in, state_
         }
     } else {
         diag::log_tagged_fmt("mitm", "handle_client dispatch_plain client=%s:%u", client_addr.c_str(), client_port);
-        handle_plain_connection(client_sock, client_addr, client_port, state);
+        handle_plain_connection(client_sock, client_addr, client_port, state, config);
     }
 }
 
@@ -1986,7 +2914,7 @@ static void worker_thread_func(state_t& state) {
             client_addr_in.sin_family = AF_INET;
             client_addr_in.sin_addr.s_addr = item.client_ip;
             client_addr_in.sin_port = htons(item.client_port);
-            handle_client(static_cast<SOCKET>(item.client_socket), client_addr_in, state);
+            handle_client(static_cast<SOCKET>(item.client_socket), client_addr_in, state, item.config);
         }
         diag::log_tagged("mitm", "worker_thread_func inner_loop_exit");
     }
@@ -2024,6 +2952,8 @@ static void listener_thread_func(state_t& state) {
             item.client_socket = static_cast<uintptr_t>(client_sock);
             item.client_ip = client_addr.sin_addr.s_addr;
             item.client_port = ntohs(client_addr.sin_port);
+            item.listener_id = 1;
+            item.config = state.config;
             char addr_buf[INET_ADDRSTRLEN] = {};
             inet_ntop(AF_INET, &client_addr.sin_addr, addr_buf, sizeof(addr_buf));
             diag::log_tagged_fmt("network", "mitm_proxy_accept client=%s:%u",
@@ -2037,10 +2967,174 @@ static void listener_thread_func(state_t& state) {
     }
 }
 
+struct extra_listener_runtime_t {
+    uint64_t id = 0;
+    proxy_config config;
+    SOCKET listen_socket = INVALID_SOCKET;
+    std::atomic<bool> running{false};
+    std::atomic<uint64_t> accepted{0};
+    std::thread thread;
+};
+
+static std::mutex g_extra_listener_mutex;
+static std::vector<std::shared_ptr<extra_listener_runtime_t>> g_extra_listeners;
+static std::atomic<uint64_t> g_next_extra_listener_id{2};
+
+static bool bind_listen_socket(const proxy_config& config, SOCKET& out_socket) {
+    SOCKET listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listen_sock == INVALID_SOCKET)
+        return false;
+    int opt = 1;
+    setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&opt), sizeof(opt));
+    sockaddr_in bind_addr = {};
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_port = htons(config.bind_port);
+    if (inet_pton(AF_INET, config.bind_addr.c_str(), &bind_addr.sin_addr) != 1) {
+        closesocket(listen_sock);
+        return false;
+    }
+    if (bind(listen_sock, reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr)) == SOCKET_ERROR) {
+        closesocket(listen_sock);
+        return false;
+    }
+    if (listen(listen_sock, SOMAXCONN) == SOCKET_ERROR) {
+        closesocket(listen_sock);
+        return false;
+    }
+    out_socket = listen_sock;
+    return true;
+}
+
+static void remove_wfp_redirect(proxy_config& config) {
+    if (config.wfp_rule_id == 0)
+        return;
+    if (driver_bridge::using_kernel_driver())
+        driver_bridge::traffic_redirect_op(1, config.wfp_rule_id);
+    config.wfp_rule_id = 0;
+}
+
+static void install_wfp_redirect(proxy_config& config) {
+    if (!config.use_wfp_redirect || config.wfp_rule_id != 0)
+        return;
+    if (!driver_bridge::using_kernel_driver())
+        return;
+    uint8_t local_addr[16] = {};
+    inet_pton(AF_INET, config.bind_addr.c_str(), local_addr);
+    uint32_t rule_id = 0;
+    uint32_t own_pid = static_cast<uint32_t>(GetCurrentProcessId());
+    bool ok = driver_bridge::traffic_redirect_op(
+        0,
+        0,
+        6,
+        config.redirect_target_port,
+        nullptr,
+        config.bind_port,
+        local_addr,
+        2,
+        &rule_id,
+        own_pid);
+    if (ok)
+        config.wfp_rule_id = rule_id;
+}
+
+static void extra_listener_loop(std::shared_ptr<extra_listener_runtime_t> rt) {
+    diag::log_tagged_fmt("network", "mitm_extra_listener_started id=%llu bind=%s:%u mode=%d",
+        static_cast<unsigned long long>(rt->id), rt->config.bind_addr.c_str(), rt->config.bind_port, (int)rt->config.mode);
+    while (rt->running.load() && g_state.proxy_alive.load()) {
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(rt->listen_socket, &fds);
+        timeval tv;
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+        int sel = select(0, &fds, nullptr, nullptr, &tv);
+        if (sel <= 0)
+            continue;
+        sockaddr_in client_addr = {};
+        int addr_len = sizeof(client_addr);
+        SOCKET client_sock = accept(rt->listen_socket, reinterpret_cast<sockaddr*>(&client_addr), &addr_len);
+        if (client_sock == INVALID_SOCKET)
+            continue;
+        work_item item;
+        item.client_socket = static_cast<uintptr_t>(client_sock);
+        item.client_ip = client_addr.sin_addr.s_addr;
+        item.client_port = ntohs(client_addr.sin_port);
+        item.listener_id = rt->id;
+        item.config = rt->config;
+        rt->accepted.fetch_add(1, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lock(g_state.work_mutex);
+            g_state.work_queue.push(item);
+        }
+        g_state.work_cv.notify_one();
+    }
+    diag::log_tagged_fmt("network", "mitm_extra_listener_stopped id=%llu", static_cast<unsigned long long>(rt->id));
+}
+
+static bool validate_listener_config(const proxy_config& config) {
+    if (config.bind_addr.empty() || config.bind_port == 0)
+        return false;
+    if (config.mode == proxy_mode_t::reverse && (config.reverse_target_host.empty() || config.reverse_target_port == 0))
+        return false;
+    if (config.require_proxy_auth && (config.proxy_auth_username.empty() || config.proxy_auth_password.empty()))
+        return false;
+    return true;
+}
+
+static bool prepare_tls_if_needed(const proxy_config& config) {
+    if (!config.decode_tls)
+        return true;
+    if (!cert_generator::is_ready() && !cert_generator::initialize())
+        return false;
+    const auto& ca = cert_generator::get_root_ca();
+    if (!ca.valid || !ca.cert)
+        return false;
+    bool installed = cert_generator::is_root_ca_installed(ca);
+    if (!installed)
+        installed = cert_generator::install_root_ca(ca);
+    return installed && cert_generator::is_root_ca_installed(ca);
+}
+
+static void configure_connection_pool(const proxy_config& config) {
+    conn_pool::connection_pool_config pool_cfg;
+    pool_cfg.max_idle_total = config.connection_pool_max_idle_total;
+    pool_cfg.max_idle_per_key = config.connection_pool_max_idle_per_key;
+    pool_cfg.idle_timeout_ms = config.connection_pool_idle_timeout_ms;
+    pool_cfg.max_age_ms = config.connection_pool_max_age_ms;
+    conn_pool::configure(pool_cfg);
+    if (!config.enable_connection_pool)
+        conn_pool::clear();
+}
+
+static void stop_extra_listeners() {
+    std::vector<std::shared_ptr<extra_listener_runtime_t>> listeners;
+    {
+        std::lock_guard<std::mutex> lock(g_extra_listener_mutex);
+        listeners.swap(g_extra_listeners);
+    }
+    for (auto& rt : listeners) {
+        if (!rt)
+            continue;
+        rt->running.store(false);
+        if (rt->listen_socket != INVALID_SOCKET) {
+            closesocket(rt->listen_socket);
+            rt->listen_socket = INVALID_SOCKET;
+        }
+        if (rt->thread.joinable())
+            rt->thread.join();
+        remove_wfp_redirect(rt->config);
+    }
+}
+
 
 bool start(const proxy_config& config) {
     if (g_state.running.load()) {
         diag::log_tagged("network", "mitm_proxy_start_skip already_running");
+        return false;
+    }
+
+    if (!validate_listener_config(config)) {
+        diag::log_tagged("network", "mitm_proxy_start_failed invalid_config");
         return false;
     }
 
@@ -2049,60 +3143,18 @@ bool start(const proxy_config& config) {
         return false;
     }
 
-    if (config.decode_tls && !cert_generator::is_ready()) {
-        if (!cert_generator::initialize()) {
-            diag::log_tagged("network", "mitm_proxy_start_failed cert_generator_init");
-            return false;
-        }
+    if (!prepare_tls_if_needed(config)) {
+        diag::log_tagged("network", "mitm_proxy_start_failed tls_not_ready");
+        return false;
     }
-
-    if (config.decode_tls) {
-        const auto& ca = cert_generator::get_root_ca();
-        if (!ca.valid || !ca.cert) {
-            diag::log_tagged("network", "mitm_proxy_start_failed ca_not_ready");
-            return false;
-        }
-        bool installed = cert_generator::is_root_ca_installed(ca);
-        if (!installed) {
-            diag::log_tagged("network", "mitm_proxy_start installing_current_user_root_ca");
-            installed = cert_generator::install_root_ca(ca);
-        }
-        if (!installed || !cert_generator::is_root_ca_installed(ca)) {
-            diag::log_tagged("network", "mitm_proxy_start_failed current_user_root_ca_not_verified");
-            return false;
-        }
-    }
+    configure_connection_pool(config);
 
     g_state.config = config;
 
 
-    SOCKET listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (listen_sock == INVALID_SOCKET) {
+    SOCKET listen_sock = INVALID_SOCKET;
+    if (!bind_listen_socket(config, listen_sock)) {
         diag::log_tagged_fmt("network", "mitm_proxy_start_failed socket_create err=%d", WSAGetLastError());
-        return false;
-    }
-
-
-    int opt = 1;
-    setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&opt), sizeof(opt));
-
-    sockaddr_in bind_addr = {};
-    bind_addr.sin_family = AF_INET;
-    bind_addr.sin_port = htons(config.bind_port);
-    inet_pton(AF_INET, config.bind_addr.c_str(), &bind_addr.sin_addr);
-
-    if (bind(listen_sock, reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr)) == SOCKET_ERROR) {
-        int err = WSAGetLastError();
-        diag::log_tagged_fmt("network", "mitm_proxy_start_failed bind_addr='%s:%u' err=%d",
-            config.bind_addr.c_str(), config.bind_port, err);
-        closesocket(listen_sock);
-        return false;
-    }
-
-    if (listen(listen_sock, SOMAXCONN) == SOCKET_ERROR) {
-        int err = WSAGetLastError();
-        diag::log_tagged_fmt("network", "mitm_proxy_start_failed listen err=%d", err);
-        closesocket(listen_sock);
         return false;
     }
 
@@ -2116,30 +3168,69 @@ bool start(const proxy_config& config) {
 
 
     if (config.use_wfp_redirect) {
-        if (driver_bridge::using_kernel_driver()) {
-            uint8_t local_addr[16] = {};
-            inet_pton(AF_INET, config.bind_addr.c_str(), local_addr);
-
-            uint32_t rule_id = 0;
-            uint32_t own_pid = static_cast<uint32_t>(GetCurrentProcessId());
-
-            bool ok = driver_bridge::traffic_redirect_op(
-                0,
-                0,
-                6,
-                config.redirect_target_port,
-                nullptr,
-                config.bind_port,
-                local_addr,
-                2,
-                &rule_id,
-                own_pid);
-            if (ok) {
-                g_state.config.wfp_rule_id = rule_id;
-            }
-        }
+        install_wfp_redirect(g_state.config);
     }
 
+    return true;
+}
+
+bool start_listener(const proxy_config& config, uint64_t* listener_id) {
+    if (!g_state.running.load()) {
+        const bool ok = start(config);
+        if (ok && listener_id)
+            *listener_id = 1;
+        return ok;
+    }
+    if (!validate_listener_config(config) || !s_wsa_guard.ok)
+        return false;
+    if (!prepare_tls_if_needed(config))
+        return false;
+    configure_connection_pool(config);
+    SOCKET listen_sock = INVALID_SOCKET;
+    if (!bind_listen_socket(config, listen_sock))
+        return false;
+    auto rt = std::make_shared<extra_listener_runtime_t>();
+    rt->id = g_next_extra_listener_id.fetch_add(1, std::memory_order_acq_rel);
+    rt->config = config;
+    rt->listen_socket = listen_sock;
+    install_wfp_redirect(rt->config);
+    rt->running.store(true);
+    rt->thread = std::thread(extra_listener_loop, rt);
+    {
+        std::lock_guard<std::mutex> lock(g_extra_listener_mutex);
+        g_extra_listeners.push_back(rt);
+    }
+    if (listener_id)
+        *listener_id = rt->id;
+    return true;
+}
+
+bool stop_listener(uint64_t listener_id) {
+    if (listener_id == 0)
+        return false;
+    if (listener_id == 1) {
+        stop();
+        return true;
+    }
+    std::shared_ptr<extra_listener_runtime_t> rt;
+    {
+        std::lock_guard<std::mutex> lock(g_extra_listener_mutex);
+        auto it = std::find_if(g_extra_listeners.begin(), g_extra_listeners.end(), [listener_id](const std::shared_ptr<extra_listener_runtime_t>& item) {
+            return item && item->id == listener_id;
+        });
+        if (it == g_extra_listeners.end())
+            return false;
+        rt = *it;
+        g_extra_listeners.erase(it);
+    }
+    rt->running.store(false);
+    if (rt->listen_socket != INVALID_SOCKET) {
+        closesocket(rt->listen_socket);
+        rt->listen_socket = INVALID_SOCKET;
+    }
+    if (rt->thread.joinable())
+        rt->thread.join();
+    remove_wfp_redirect(rt->config);
     return true;
 }
 
@@ -2149,14 +3240,9 @@ void stop() {
         g_state.held_waits.size(), g_state.history.size(),
         static_cast<unsigned long long>(g_state.total_requests.load()));
 
+    stop_extra_listeners();
 
-    if (g_state.config.wfp_rule_id != 0) {
-        if (driver_bridge::using_kernel_driver()) {
-
-            driver_bridge::traffic_redirect_op(1, g_state.config.wfp_rule_id);
-        }
-        g_state.config.wfp_rule_id = 0;
-    }
+    remove_wfp_redirect(g_state.config);
 
     g_state.running.store(false);
 
@@ -2192,6 +3278,44 @@ void stop() {
 
 bool is_running() {
     return g_state.running.load();
+}
+
+proxy_config get_config() {
+    return g_state.config;
+}
+
+bool set_config(const proxy_config& config) {
+    if (!validate_listener_config(config))
+        return false;
+    if (g_state.running.load())
+        return false;
+    g_state.config = config;
+    configure_connection_pool(config);
+    return true;
+}
+
+std::vector<listener_snapshot> get_listeners() {
+    std::vector<listener_snapshot> out;
+    if (g_state.running.load()) {
+        listener_snapshot primary;
+        primary.id = 1;
+        primary.config = g_state.config;
+        primary.running = true;
+        out.push_back(primary);
+    }
+    std::lock_guard<std::mutex> lock(g_extra_listener_mutex);
+    out.reserve(out.size() + g_extra_listeners.size());
+    for (const auto& rt : g_extra_listeners) {
+        if (!rt)
+            continue;
+        listener_snapshot snap;
+        snap.id = rt->id;
+        snap.config = rt->config;
+        snap.running = rt->running.load();
+        snap.accepted = rt->accepted.load(std::memory_order_relaxed);
+        out.push_back(std::move(snap));
+    }
+    return out;
 }
 
 void pre_initialize() {
@@ -2262,6 +3386,25 @@ std::vector<http_exchange> get_history(size_t max_count) {
     return result;
 }
 
+std::vector<http_exchange> get_history_by_ids(const std::vector<uint64_t>& ids) {
+    std::vector<http_exchange> result;
+    if (ids.empty())
+        return result;
+    std::unordered_set<uint64_t> wanted(ids.begin(), ids.end());
+    std::lock_guard<std::mutex> lock(g_state.history_mutex);
+    result.reserve(std::min(wanted.size(), g_state.history.size()));
+    for (const auto& ex_ptr : g_state.history) {
+        if (ex_ptr && wanted.find(ex_ptr->id) != wanted.end())
+            result.push_back(*ex_ptr);
+    }
+    std::sort(result.begin(), result.end(), [&ids](const http_exchange& a, const http_exchange& b) {
+        auto ia = std::find(ids.begin(), ids.end(), a.id);
+        auto ib = std::find(ids.begin(), ids.end(), b.id);
+        return ia < ib;
+    });
+    return result;
+}
+
 const http_exchange* find_exchange(uint64_t id) {
     diag::log_tagged_fmt("mitm", "find_exchange entry id=%llu", static_cast<unsigned long long>(id));
     std::lock_guard<std::mutex> lock(g_state.history_mutex);
@@ -2287,6 +3430,80 @@ void clear_history() {
 size_t history_count() {
     std::lock_guard<std::mutex> lock(g_state.history_mutex);
     return g_state.history.size();
+}
+
+bool append_history(const std::vector<http_exchange>& exchanges, bool preserve_ids) {
+    std::lock_guard<std::mutex> lock(g_state.history_mutex);
+    for (auto exchange : exchanges) {
+        if (!preserve_ids || exchange.id == 0)
+            exchange.id = g_state.next_id.fetch_add(1);
+        else {
+            uint64_t next = g_state.next_id.load(std::memory_order_acquire);
+            while (next <= exchange.id && !g_state.next_id.compare_exchange_weak(next, exchange.id + 1, std::memory_order_acq_rel)) {
+            }
+        }
+        if (exchange.timestamp == 0)
+            exchange.timestamp = exchange.request_time == 0 ? GetTickCount64() : exchange.request_time;
+        g_state.history.push_back(std::make_shared<http_exchange>(std::move(exchange)));
+        while (g_state.history.size() > g_state.config.max_history)
+            g_state.history.pop_front();
+    }
+    return true;
+}
+
+bool set_exchange_tags(uint64_t id, const std::vector<std::string>& tags) {
+    std::lock_guard<std::mutex> lock(g_state.history_mutex);
+    for (auto& ex_ptr : g_state.history) {
+        if (!ex_ptr || ex_ptr->id != id)
+            continue;
+        ex_ptr->tags.clear();
+        for (const auto& tag : tags) {
+            if (!tag.empty() && std::find(ex_ptr->tags.begin(), ex_ptr->tags.end(), tag) == ex_ptr->tags.end())
+                ex_ptr->tags.push_back(tag);
+        }
+        return true;
+    }
+    return false;
+}
+
+bool add_exchange_tag(uint64_t id, const std::string& tag) {
+    if (tag.empty())
+        return false;
+    std::lock_guard<std::mutex> lock(g_state.history_mutex);
+    for (auto& ex_ptr : g_state.history) {
+        if (!ex_ptr || ex_ptr->id != id)
+            continue;
+        if (std::find(ex_ptr->tags.begin(), ex_ptr->tags.end(), tag) == ex_ptr->tags.end())
+            ex_ptr->tags.push_back(tag);
+        return true;
+    }
+    return false;
+}
+
+bool remove_exchange_tag(uint64_t id, const std::string& tag) {
+    std::lock_guard<std::mutex> lock(g_state.history_mutex);
+    for (auto& ex_ptr : g_state.history) {
+        if (!ex_ptr || ex_ptr->id != id)
+            continue;
+        auto it = std::remove(ex_ptr->tags.begin(), ex_ptr->tags.end(), tag);
+        if (it != ex_ptr->tags.end()) {
+            ex_ptr->tags.erase(it, ex_ptr->tags.end());
+            return true;
+        }
+        return false;
+    }
+    return false;
+}
+
+bool set_exchange_notes(uint64_t id, const std::string& notes) {
+    std::lock_guard<std::mutex> lock(g_state.history_mutex);
+    for (auto& ex_ptr : g_state.history) {
+        if (!ex_ptr || ex_ptr->id != id)
+            continue;
+        ex_ptr->notes = notes;
+        return true;
+    }
+    return false;
 }
 
 std::vector<tls_observation_t> get_tls_observations(size_t max_count) {
@@ -2489,7 +3706,8 @@ repeat_result repeat_request(const std::string& host, uint16_t port, bool use_tl
         return result;
     }
 
-    SOCKET sock = connect_to_target(host, port);
+    proxy_config replay_config = g_state.config;
+    SOCKET sock = connect_to_target(host, port, replay_config, use_tls);
     if (sock == INVALID_SOCKET) {
         diag::log_tagged_fmt("mitm", "repeat_request connect_failed host=%s port=%u", host.c_str(), port);
         result.error = "Cannot connect to " + host + ":" + std::to_string(port);
@@ -2521,7 +3739,14 @@ repeat_result repeat_request(const std::string& host, uint16_t port, bool use_tl
             return result;
         }
         SSL_set_fd(ssl, static_cast<int>(sock));
-        SSL_set_tlsext_host_name(ssl, host.c_str());
+        const auto upstream_policy = tls_policy::match_host(host);
+        if (!configure_client_tls(ctx, ssl, host, upstream_policy, nullptr, 0)) {
+            SSL_free(ssl);
+            SSL_CTX_free(ctx);
+            close_socket(sock);
+            result.error = "TLS policy setup failed";
+            return result;
+        }
 
         if (!ssl_handshake_with_timeout(ssl, SSL_connect)) {
             diag::log_tagged_fmt("mitm", "repeat_request tls_handshake_failed host=%s port=%u", host.c_str(), port);
@@ -2531,13 +3756,27 @@ repeat_result repeat_request(const std::string& host, uint16_t port, bool use_tl
             result.error = "TLS handshake failed";
             return result;
         }
+        if (SSL_get_verify_result(ssl) != X509_V_OK && !upstream_policy.policy.ignore_cert_errors) {
+            SSL_free(ssl);
+            SSL_CTX_free(ctx);
+            close_socket(sock);
+            result.error = "TLS certificate verification failed";
+            return result;
+        }
+        if (!verify_upstream_pin(ssl, upstream_policy)) {
+            SSL_free(ssl);
+            SSL_CTX_free(ctx);
+            close_socket(sock);
+            result.error = "TLS certificate pin mismatch";
+            return result;
+        }
         diag::log_tagged_fmt("mitm", "repeat_request tls_handshake_ok host=%s port=%u", host.c_str(), port);
 
         SSL_write(ssl, raw_request.data(), static_cast<int>(raw_request.size()));
 
         std::vector<uint8_t> response_data;
-        if (recv_ssl_all(ssl, response_data, 16 * 1024 * 1024)) {
-            read_remaining_body_ssl(ssl, response_data, 16 * 1024 * 1024);
+        if (recv_ssl_all(ssl, response_data, replay_config.max_body_size)) {
+            read_remaining_body_ssl(ssl, response_data, replay_config.max_body_size);
             result.exchange.raw_response = response_data;
             result.exchange.response_size = response_data.size();
             result.exchange.response_time = GetTickCount64();
@@ -2559,8 +3798,8 @@ repeat_result repeat_request(const std::string& host, uint16_t port, bool use_tl
              static_cast<int>(raw_request.size()), 0);
 
         std::vector<uint8_t> response_data;
-        if (recv_all(sock, response_data, 16 * 1024 * 1024)) {
-            read_remaining_body(sock, response_data, 16 * 1024 * 1024);
+        if (recv_all(sock, response_data, replay_config.max_body_size)) {
+            read_remaining_body(sock, response_data, replay_config.max_body_size);
             result.exchange.raw_response = response_data;
             result.exchange.response_size = response_data.size();
             result.exchange.response_time = GetTickCount64();

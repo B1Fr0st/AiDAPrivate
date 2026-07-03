@@ -24,6 +24,8 @@ enum class intercept_action { forward, drop, modify };
 
 enum class hold_decision_t { pending, forward, drop, modified };
 
+enum class proxy_mode_t { regular, reverse, transparent, socks5 };
+
 struct http_exchange {
     uint64_t    id = 0;
     uint64_t    timestamp = 0;
@@ -77,12 +79,15 @@ struct http_exchange {
 
     size_t      request_size = 0;
     size_t      response_size = 0;
+    std::vector<std::string> tags;
+    std::string notes;
 };
 
 enum class tls_observation_kind_t {
     http_tls,
     client_handshake_failed,
     upstream_handshake_failed,
+    upstream_pin_mismatch,
     sni_authority_mismatch,
     non_http_tls,
     tunnel_passthrough
@@ -119,6 +124,7 @@ struct upstream_proxy_config {
 };
 
 struct proxy_config {
+    proxy_mode_t mode = proxy_mode_t::regular;
     std::string bind_addr = "127.0.0.1";
     uint16_t    bind_port = 8443;
     bool        intercept_enabled = false;
@@ -130,6 +136,28 @@ struct proxy_config {
 
 
     upstream_proxy_config upstream;
+
+    std::string reverse_target_host;
+    uint16_t    reverse_target_port = 0;
+    bool        reverse_target_tls = true;
+
+    bool        require_proxy_auth = false;
+    std::string proxy_auth_realm = "AiDA Proxy";
+    std::string proxy_auth_username;
+    std::string proxy_auth_password;
+
+    bool        enable_sticky_sessions = false;
+    uint64_t    sticky_session_rule_id = 0;
+
+    bool        enable_pac = false;
+    std::string pac_script;
+    bool        pac_fail_closed = true;
+
+    bool        enable_connection_pool = false;
+    size_t      connection_pool_max_idle_total = 32;
+    size_t      connection_pool_max_idle_per_key = 4;
+    uint64_t    connection_pool_idle_timeout_ms = 30000;
+    uint64_t    connection_pool_max_age_ms = 300000;
 
 
     bool        use_wfp_redirect = false;
@@ -160,6 +188,8 @@ struct work_item {
     uintptr_t   client_socket;
     uint32_t    client_ip;
     uint16_t    client_port;
+    uint64_t    listener_id = 0;
+    proxy_config config;
 };
 
 struct state_t {
@@ -212,15 +242,34 @@ inline state_t g_state;
 
 bool start(const proxy_config& config = {});
 void stop();
+bool start_listener(const proxy_config& config, uint64_t* listener_id = nullptr);
+bool stop_listener(uint64_t listener_id);
 void pre_initialize();
 void shutdown();
 bool is_running();
+proxy_config get_config();
+bool set_config(const proxy_config& config);
+
+struct listener_snapshot {
+    uint64_t id = 0;
+    proxy_config config;
+    bool running = false;
+    uint64_t accepted = 0;
+};
+
+std::vector<listener_snapshot> get_listeners();
 
 
 std::vector<http_exchange> get_history(size_t max_count = 0);
+std::vector<http_exchange> get_history_by_ids(const std::vector<uint64_t>& ids);
 const http_exchange* find_exchange(uint64_t id);
 void clear_history();
 size_t history_count();
+bool append_history(const std::vector<http_exchange>& exchanges, bool preserve_ids = true);
+bool set_exchange_tags(uint64_t id, const std::vector<std::string>& tags);
+bool add_exchange_tag(uint64_t id, const std::string& tag);
+bool remove_exchange_tag(uint64_t id, const std::string& tag);
+bool set_exchange_notes(uint64_t id, const std::string& notes);
 
 std::vector<tls_observation_t> get_tls_observations(size_t max_count = 0);
 void clear_tls_observations();

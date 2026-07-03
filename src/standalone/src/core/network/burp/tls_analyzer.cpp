@@ -16,6 +16,7 @@
 #include "findings_db.hpp"
 #include "issue.hpp"
 
+#include "../../mcp/mcp_standalone.hpp"
 #include "../../../helpers/diag_log.hpp"
 
 #include <algorithm>

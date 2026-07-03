@@ -60,6 +60,8 @@ void                clear_selection();
 
 bool                find_exchange(uint64_t id, exchange_observed_t& out);
 std::vector<exchange_observed_t> list_exchanges_for(const std::string& host, uint16_t port, const std::string& path);
+std::vector<exchange_observed_t> list_all_exchanges();
+bool                import_exchanges(const std::vector<exchange_observed_t>& exchanges, bool replace_existing);
 std::vector<host_summary_t>      list_hosts(bool scope_only);
 std::vector<std::string>         list_paths(const std::string& host, uint16_t port);
 

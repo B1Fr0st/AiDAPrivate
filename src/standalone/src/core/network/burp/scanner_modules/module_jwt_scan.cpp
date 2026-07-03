@@ -9,6 +9,7 @@
 #pragma comment(lib, "Bcrypt.lib")
 
 #include "../scanner_module.hpp"
+#include "../collaborator.hpp"
 #include "../../../../helpers/diag_log.hpp"
 
 #include <algorithm>
@@ -19,6 +20,7 @@
 #include <regex>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace aida {
@@ -181,6 +183,63 @@ bool try_secret(const jwt_t& j, const std::string& secret, std::string& out_toke
     return false;
 }
 
+std::string collaborator_jwks_url()
+{
+    std::string token = collaborator::generate_token();
+    auto cfg = collaborator::current_config();
+    std::string host = cfg.public_host.empty() ? std::string("aidacollab.local") : cfg.public_host;
+    if (token.empty()) token = random_marker("aidajwt");
+    return std::string("https://") + token + "." + host + "/.well-known/jwks.json";
+}
+
+std::string forged_with_header(jwt_t& j, nlohmann::json header)
+{
+    const std::string forged_header = b64url_encode_str(header.dump());
+    return forged_header + "." + j.payload_b64 + ".";
+}
+
+std::vector<std::pair<std::string, std::string>> remote_key_variants(jwt_t& j)
+{
+    std::vector<std::pair<std::string, std::string>> out;
+    nlohmann::json base = nlohmann::json::parse(j.header_json, nullptr, false);
+    if (base.is_discarded() || !base.is_object()) return out;
+    const std::string jwks_url = collaborator_jwks_url();
+    {
+        nlohmann::json hdr = base;
+        hdr["jku"] = jwks_url;
+        hdr["kid"] = "aida-collaborator-jku";
+        out.emplace_back("jku-jwks-url", forged_with_header(j, std::move(hdr)));
+    }
+    {
+        nlohmann::json hdr = base;
+        nlohmann::json jwk;
+        jwk["kty"] = "oct";
+        jwk["kid"] = "aida-inline-jwk";
+        jwk["k"] = b64url_encode_str(jwks_url);
+        hdr["jwk"] = std::move(jwk);
+        hdr["kid"] = "aida-inline-jwk";
+        out.emplace_back("inline-jwk", forged_with_header(j, std::move(hdr)));
+    }
+    {
+        nlohmann::json hdr = base;
+        hdr["x5u"] = jwks_url + "/aida.pem";
+        hdr["kid"] = "aida-x5u";
+        out.emplace_back("x5u-cert-url", forged_with_header(j, std::move(hdr)));
+    }
+    {
+        nlohmann::json hdr = base;
+        hdr["x5c"] = nlohmann::json::array({ b64url_encode_str(jwks_url) });
+        hdr["kid"] = "aida-x5c-inline";
+        out.emplace_back("x5c-inline-certificate-marker", forged_with_header(j, std::move(hdr)));
+    }
+    return out;
+}
+
+bool accepted_like_baseline(const exchange_observed_t& resp, const module_context_t& ctx)
+{
+    return resp.status_code == ctx.baseline_status_code && resp.status_code >= 200 && resp.status_code < 400;
+}
+
 void jwt_run(const insertion_point_t& ip, const module_context_t& ctx, const send_fn_t& send)
 {
     diag::log_tagged_fmt("mod_jwt_scan", "jwt_run entry ip=%s:%s host=%s", ip.kind.c_str(), ip.name.c_str(), ctx.host.c_str());
@@ -240,8 +299,7 @@ void jwt_run(const insertion_point_t& ip, const module_context_t& ctx, const sen
                 if (resp.has_value()) {
                     diag::log_tagged_fmt("mod_jwt_scan", "jwt_run alg-none response status=%d baseline=%d", resp->status_code, ctx.baseline_status_code);
                 }
-                if (resp.has_value() && resp->status_code == ctx.baseline_status_code &&
-                    resp->status_code >= 200 && resp->status_code < 400)
+                if (resp.has_value() && accepted_like_baseline(*resp, ctx))
                 {
                     diag::log_tagged_fmt("mod_jwt_scan", "jwt_run FINDING alg-none-accepted alg=%s status=%d", j.alg.c_str(), resp->status_code);
                     auto iss = make_issue("jwt.alg-none-accepted",
@@ -301,8 +359,7 @@ void jwt_run(const insertion_point_t& ip, const module_context_t& ctx, const sen
                 if (resp.has_value()) {
                     diag::log_tagged_fmt("mod_jwt_scan", "jwt_run kid-path-traversal response status=%d baseline=%d", resp->status_code, ctx.baseline_status_code);
                 }
-                if (resp.has_value() && resp->status_code == ctx.baseline_status_code &&
-                    resp->status_code >= 200 && resp->status_code < 400)
+                if (resp.has_value() && accepted_like_baseline(*resp, ctx))
                 {
                     diag::log_tagged_fmt("mod_jwt_scan", "jwt_run FINDING kid-path-traversal kid=%s", j.kid.c_str());
                     auto iss = make_issue("jwt.kid-path-traversal",
@@ -315,6 +372,33 @@ void jwt_run(const insertion_point_t& ip, const module_context_t& ctx, const sen
                     iss.cwe.push_back("CWE-345");
                     issue_store::add(std::move(iss));
                 }
+            }
+        }
+
+        auto key_variants = remote_key_variants(j);
+        for (const auto& variant : key_variants)
+        {
+            std::vector<uint8_t> raw = swap_token(ip.base_request, j.raw, variant.second);
+            probe_t p; p.payload = variant.second; p.marker = variant.first; p.variant = variant.first;
+            auto resp = send(raw, p);
+            if (resp.has_value()) {
+                diag::log_tagged_fmt("mod_jwt_scan", "jwt_run remote-key variant=%s response status=%d baseline=%d",
+                    variant.first.c_str(), resp->status_code, ctx.baseline_status_code);
+            }
+            if (resp.has_value() && accepted_like_baseline(*resp, ctx))
+            {
+                diag::log_tagged_fmt("mod_jwt_scan", "jwt_run FINDING remote-key-header-accepted variant=%s", variant.first.c_str());
+                auto iss = make_issue("jwt.remote-key-header-accepted",
+                                      "JWT remote key header accepted",
+                                      severity_t::critical, confidence_t::firm, ip, p, *resp, ctx,
+                                      std::string("accepted variant=") + variant.first);
+                iss.description = std::string("A JWT with attacker-controlled key material header '") + variant.first +
+                    "' was accepted with a baseline-equivalent response. This indicates unsafe trust in token-supplied JKU/JWKS/JWK/X5U/X5C key sources.";
+                iss.remediation = "Ignore token-supplied key URLs and inline keys unless they are pinned to an allowlisted issuer. Resolve keys only from trusted issuer metadata over pinned TLS and bind kid to issuer and alg.";
+                iss.cwe.push_back("CWE-345");
+                iss.cwe.push_back("CWE-346");
+                issue_store::add(std::move(iss));
+                break;
             }
         }
     }

@@ -883,6 +883,84 @@ bool load_from_disk()
     return true;
 }
 
+nlohmann::json export_json()
+{
+    auto& st = s();
+    nlohmann::json macros = nlohmann::json::array();
+    nlohmann::json rules = nlohmann::json::array();
+    {
+        std::lock_guard<std::mutex> lk(st.macros_mtx);
+        for (const auto& m : st.macros)
+            macros.push_back(macro_to_json(m));
+    }
+    {
+        std::lock_guard<std::mutex> lk(st.rules_mtx);
+        for (const auto& r : st.rules)
+            rules.push_back(rule_to_json(r));
+    }
+    return {{"macros", std::move(macros)}, {"rules", std::move(rules)}};
+}
+
+bool import_json(const nlohmann::json& doc, bool replace_existing)
+{
+    if (!doc.is_object()) {
+        set_err("session.import: document must be an object");
+        return false;
+    }
+    const nlohmann::json macros_doc = doc.value("macros", nlohmann::json::array());
+    const nlohmann::json rules_doc = doc.value("rules", nlohmann::json::array());
+    if (!macros_doc.is_array() || !rules_doc.is_array()) {
+        set_err("session.import: macros and rules must be arrays");
+        return false;
+    }
+    std::vector<macro_t> macros;
+    std::vector<session_rule_t> rules;
+    uint64_t max_macro_id = 0;
+    uint64_t max_rule_id = 0;
+    for (const auto& item : macros_doc) {
+        macro_t m;
+        if (!macro_from_json(item, m))
+            continue;
+        max_macro_id = std::max(max_macro_id, m.id);
+        macros.push_back(std::move(m));
+    }
+    for (const auto& item : rules_doc) {
+        session_rule_t r;
+        if (!rule_from_json(item, r))
+            continue;
+        max_rule_id = std::max(max_rule_id, r.id);
+        rules.push_back(std::move(r));
+    }
+    auto& st = s();
+    {
+        std::lock_guard<std::mutex> lk(st.macros_mtx);
+        if (replace_existing)
+            st.macros.clear();
+        for (auto& m : macros) {
+            if (m.id == 0)
+                m.id = st.next_macro_id.fetch_add(1);
+            max_macro_id = std::max(max_macro_id, m.id);
+            st.macros.push_back(std::move(m));
+        }
+        if (max_macro_id >= st.next_macro_id.load())
+            st.next_macro_id.store(max_macro_id + 1, std::memory_order_release);
+    }
+    {
+        std::lock_guard<std::mutex> lk(st.rules_mtx);
+        if (replace_existing)
+            st.rules.clear();
+        for (auto& r : rules) {
+            if (r.id == 0)
+                r.id = st.next_rule_id.fetch_add(1);
+            max_rule_id = std::max(max_rule_id, r.id);
+            st.rules.push_back(std::move(r));
+        }
+        if (max_rule_id >= st.next_rule_id.load())
+            st.next_rule_id.store(max_rule_id + 1, std::memory_order_release);
+    }
+    return true;
+}
+
 std::string last_error()
 {
     diag::log_tagged_fmt("session", "last_error queried");

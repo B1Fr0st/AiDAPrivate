@@ -28,6 +28,7 @@ enum class sub_tab_t : int {
     keylog,
     pcap_export,
     fuzzer,
+    offensive,
     websocket,
     scripting,
     decoder,
@@ -299,6 +300,23 @@ struct state_t {
     std::condition_variable       fuzz_cv;
     std::atomic<bool>             fuzz_thread_alive{false};
     int                           fuzz_selected = -1;
+
+    char                          off_target_url[1024] = {};
+    char                          off_target_param[128] = {};
+    char                          off_payload_json[8192] = "{}";
+    char                          off_raw_request[32768] = {};
+    int                           off_workflow = 0;
+    int                           off_timeout_ms = 15000;
+    int                           off_max_payloads = 16;
+    int                           off_max_requests = 32;
+    bool                          off_scope_only = true;
+    std::atomic<bool>             off_running{false};
+    std::atomic<bool>             off_cancel_requested{false};
+    std::atomic<uint64_t>         off_run_id{0};
+    std::atomic<uint64_t>         off_active_fuzz_job_id{0};
+    std::mutex                    off_mutex;
+    std::string                   off_status = "Idle";
+    std::string                   off_result;
 
 
     struct ws_frame_entry_t {

@@ -3106,7 +3106,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             }
             {
                 bool teb_zero_retry = false;
-                seh_diagnostics_t probe_diag_retry;
+                seh_view::seh_diagnostics_t probe_diag_retry;
                 {
                     std::lock_guard<std::mutex> probe_lk(seh_view::g_ui.mutex);
                     probe_diag_retry = seh_view::g_ui.diagnostics;

@@ -30,6 +30,9 @@ struct match_rule {
 
 struct load_options {
     bool replace_existing = false;
+    bool match_method = true;
+    bool match_scheme = false;
+    bool match_port = false;
     bool exact_body = false;
 };
 

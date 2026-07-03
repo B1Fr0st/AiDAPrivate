@@ -5,6 +5,8 @@
 #include <string>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 namespace aida {
 namespace burp {
 namespace session_handler {
@@ -85,6 +87,8 @@ std::string                     storage_path_macros();
 std::string                     storage_path_rules();
 bool                            save_to_disk();
 bool                            load_from_disk();
+nlohmann::json                  export_json();
+bool                            import_json(const nlohmann::json& doc, bool replace_existing);
 
 std::string                     last_error();
 

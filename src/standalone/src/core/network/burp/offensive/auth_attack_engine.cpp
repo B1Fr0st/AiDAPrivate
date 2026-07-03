@@ -951,11 +951,11 @@ std::vector<std::pair<std::string, std::string>> brute_force_pairs(const json& p
     std::vector<std::string> usernames = string_array(p, "usernames");
     std::vector<std::string> passwords = string_array(p, "passwords");
     if (usernames.empty()) {
-        const std::string id = get_string(p, "username_wordlist_id", "auth/usernames-top1000");
+        const std::string id = get_string(p, "username_wordlist_id", "auth/usernames_common_expanded");
         usernames = payload_entries_with_fallback(id, "auth/usernames-top1000", max_attempts);
     }
     if (passwords.empty()) {
-        const std::string id = get_string(p, "password_wordlist_id", "auth/passwords-top1000");
+        const std::string id = get_string(p, "password_wordlist_id", "auth/passwords_common_expanded");
         passwords = payload_entries_with_fallback(id, "auth/passwords-top1000", max_attempts);
     }
     std::vector<std::pair<std::string, std::string>> pairs;

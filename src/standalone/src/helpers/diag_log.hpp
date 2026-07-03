@@ -77,16 +77,9 @@ inline char* cached_log_source()
     return source;
 }
 
-inline bool& cached_log_fileless()
-{
-    static bool value = false;
-    return value;
-}
-
-inline void remember_log_source(const char* source, bool fileless)
+inline void remember_log_source(const char* source)
 {
     _snprintf_s(cached_log_source(), 48, _TRUNCATE, "%s", source ? source : "unknown");
-    cached_log_fileless() = fileless;
 }
 
 inline void remember_log_path(const char* path)
@@ -96,9 +89,7 @@ inline void remember_log_path(const char* path)
 
 inline bool is_debug_log_name(const char* file_name)
 {
-    return file_name &&
-        (std::strcmp(file_name, "aida_debug.log") == 0 ||
-         std::strcmp(file_name, "aida_debug_fileless.log") == 0);
+    return file_name && std::strcmp(file_name, "aida_debug.log") == 0;
 }
 
 inline const char* effective_log_file_name(const char* file_name)
@@ -126,12 +117,12 @@ inline const char* resolve_log_dir()
     static bool s_ready = false;
     if (s_ready) return s_cached;
     if (resolve_module_log_dir(s_cached, sizeof(s_cached))) {
-        remember_log_source("exe_dir", false);
+        remember_log_source("exe_dir");
         s_ready = true;
         return s_cached;
     }
     s_cached[0] = '\0';
-    remember_log_source("unresolved", false);
+    remember_log_source("unresolved");
     s_ready = true;
     return s_cached;
 }
@@ -292,18 +283,8 @@ inline void write_log_path_decision_once(HANDLE hf)
 
     char module[MAX_PATH] = {};
     char cwd[MAX_PATH] = {};
-    char debug_env[MAX_PATH] = {};
-    char bootstrap_env[MAX_PATH] = {};
-    char image_base_env[64] = {};
-    char image_size_env[64] = {};
-    char entry_rva_env[64] = {};
     GetModuleFileNameA(nullptr, module, static_cast<DWORD>(sizeof(module)));
     GetCurrentDirectoryA(static_cast<DWORD>(sizeof(cwd)), cwd);
-    env_value_present("AIDA_FILELESS_DEBUG_LOG_PATH", debug_env, static_cast<DWORD>(sizeof(debug_env)));
-    env_value_present("AIDA_FILELESS_BOOTSTRAP_LOG_PATH", bootstrap_env, static_cast<DWORD>(sizeof(bootstrap_env)));
-    env_value_present("AIDA_FILELESS_IMAGE_BASE", image_base_env, static_cast<DWORD>(sizeof(image_base_env)));
-    env_value_present("AIDA_FILELESS_IMAGE_SIZE", image_size_env, static_cast<DWORD>(sizeof(image_size_env)));
-    env_value_present("AIDA_FILELESS_ENTRY_RVA", entry_rva_env, static_cast<DWORD>(sizeof(entry_rva_env)));
 
     std::uintptr_t teb = 0;
     std::uintptr_t peb = 0;
@@ -316,8 +297,7 @@ inline void write_log_path_decision_once(HANDLE hf)
 
     char msg[2048] = {};
     _snprintf_s(msg, sizeof(msg), _TRUNCATE,
-        "log_path_decision fileless=%d source=%s path=%s pid=%lu tid=%lu module=%s cwd=%s teb=0x%016llX peb=0x%016llX tls_vector=0x%016llX fileless_debug_env=%s bootstrap_log=%s image_base_env=%s image_size_env=%s entry_rva_env=%s no_disk_write=%d",
-        cached_log_fileless() ? 1 : 0,
+        "log_path_decision source=%s path=%s pid=%lu tid=%lu module=%s cwd=%s teb=0x%016llX peb=0x%016llX tls_vector=0x%016llX",
         cached_log_source(),
         cached_log_path(),
         GetCurrentProcessId(),
@@ -326,13 +306,7 @@ inline void write_log_path_decision_once(HANDLE hf)
         cwd,
         static_cast<unsigned long long>(teb),
         static_cast<unsigned long long>(peb),
-        static_cast<unsigned long long>(tls_vector),
-        debug_env,
-        bootstrap_env,
-        image_base_env,
-        image_size_env,
-        entry_rva_env,
-        env_flag_enabled("AIDA_FILELESS_NO_DISK_WRITE") ? 1 : 0);
+        static_cast<unsigned long long>(tls_vector));
     DWORD bytes = write_tagged_line(hf, "diag", msg);
     coalesced_flush_log(hf, bytes, true);
 }

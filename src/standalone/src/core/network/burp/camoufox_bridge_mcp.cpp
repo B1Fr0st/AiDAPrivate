@@ -2033,6 +2033,8 @@ bool reverse_tool_needs_action(const std::string& tool_name)
         tool_name == "cookies" ||
         tool_name == "instrumentation" ||
         tool_name == "intercept_request" ||
+        tool_name == "browser_service_worker" ||
+        tool_name == "browser_fingerprint_spoof" ||
         tool_name == "scripts";
 }
 
@@ -2364,6 +2366,8 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
         args.erase("keep_persistent");
     if (tool_name == "remove_hooks")
         args.erase("persistent");
+    if (tool_name == "browser_service_worker" && params.is_object() && params.contains("payload") && !args.contains("payload"))
+        args["payload"] = params["payload"];
     if (tool_name == "evaluate_js")
     {
         tool_result_t validation = validate_evaluate_js_params(params);
@@ -2867,6 +2871,26 @@ void normalize_camoufox_group_payload(
     }
     if (internal == "network_capture" && (!forwarded.contains("action") || !forwarded["action"].is_string()))
         forwarded["action"] = "status";
+    if (std::string(group_name) == "browser_network" && internal == "intercept_request")
+    {
+        if (forwarded.contains("intercept_action") && forwarded["intercept_action"].is_string() &&
+            (!forwarded.contains("action") || !forwarded["action"].is_string()))
+        {
+            forwarded["action"] = forwarded["intercept_action"];
+        }
+        if (group_action == "delay" && (!forwarded.contains("action") || !forwarded["action"].is_string()))
+            forwarded["action"] = "delay";
+        else if (group_action == "conditional_intercept" && (!forwarded.contains("action") || !forwarded["action"].is_string()))
+            forwarded["action"] = "log";
+        forwarded.erase("intercept_action");
+    }
+    if (std::string(group_name) == "browser_network" && internal == "search_network_bodies")
+    {
+        if (!forwarded.contains("query") && forwarded.contains("search_query"))
+            forwarded["query"] = forwarded["search_query"];
+        if (!forwarded.contains("query") && forwarded.contains("body_search"))
+            forwarded["query"] = forwarded["body_search"];
+    }
     if (std::string(group_name) == "browser_network" && group_action == "list")
     {
         if (!forwarded.contains("limit") && !forwarded.contains("max_records"))
@@ -3055,6 +3079,10 @@ tool_result_t tool_browser_network(const json& params)
         {"get", "get_network_request", 30000},
         {"initiator", "get_request_initiator", 30000},
         {"intercept", "intercept_request", 30000},
+        {"conditional_intercept", "intercept_request", 30000},
+        {"delay", "intercept_request", 30000},
+        {"search", "search_network_bodies", 30000},
+        {"search_bodies", "search_network_bodies", 30000},
     };
     return dispatch_camoufox_browser_group(params, "browser_network",
         actions, sizeof(actions) / sizeof(actions[0]));
@@ -3181,8 +3209,8 @@ std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
              {"clear_active_routes", "boolean", "Clear instrumentation routes", false},
              {"clear_cookies", "boolean", "Clear browser cookies", false},
              {"clear_storage", "boolean", "Clear localStorage and sessionStorage", false}}, false, 45000},
-        {"browser_network", "Consolidated Camoufox network operations. Set action to capture, list, get, initiator, or intercept.",
-            {{"action", "string", "capture|list|get|initiator|intercept", true},
+        {"browser_network", "Consolidated Camoufox network operations. Set action to capture, list, get, initiator, intercept, conditional_intercept, delay, search, or search_bodies.",
+            {{"action", "string", "capture|list|get|initiator|intercept|conditional_intercept|delay|search|search_bodies", true},
              {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted; use payload.action for capture start, stop, clear, or status", false},
              {"session_id", "string", "Browser session id", false},
              {"page_id", "string", "Stable AiDA page id", false},
@@ -3192,9 +3220,31 @@ std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
              {"url_filter", "string", "Substring filter for URLs", false},
              {"url_prefix", "string", "Prefix filter for request URLs", false},
              {"url_contains_domain", "string", "Domain substring filter", false},
+             {"url_contains", "string", "Request URL substring predicate for conditional interception", false},
+             {"initiator_contains", "string", "Initiator or frame URL substring predicate for conditional interception", false},
+             {"initiator_url_contains", "string", "Alias for initiator_contains", false},
+             {"frame_url_contains", "string", "Frame URL substring predicate for conditional interception", false},
+             {"frame_url_prefix", "string", "Frame URL prefix predicate for conditional interception", false},
              {"method", "string", "HTTP method filter", false},
              {"resource_type", "string", "Resource type filter", false},
              {"status_code", "number", "HTTP status code filter", false},
+             {"conditions", "object", "Conditional interception predicates for URL, method, resource type, page, session, initiator/frame URL, headers, status, and bounded request/response body matches", false},
+             {"intercept_action", "string", "Route action for conditional_intercept: log, delay, block, modify, mock, or stop", false},
+             {"delay_ms", "number", "Bounded delay to inject before continuing or fulfilling a matched route", false},
+             {"max_delay_ms", "number", "Maximum accepted delay cap; the reverse side clamps to its hard upper bound", false},
+             {"search_query", "string", "Request/response body search query", false},
+             {"body_search", "string", "Alias for search_query", false},
+             {"body_sha256", "string", "SHA-256 digest of the bounded body prefix to match", false},
+             {"search_scope", "string", "Body search scope: request, response, or both", false},
+             {"scope", "string", "Alias for search_scope in search actions", false},
+             {"case_sensitive", "boolean", "Use case-sensitive body and header matching", false},
+             {"hash_only", "boolean", "Return only body hashes and match metadata without snippets for search actions", false},
+             {"snippet_chars", "number", "Maximum redacted snippet characters around a search hit", false},
+             {"max_matches", "number", "Maximum body-search matches to return", false},
+             {"header_contains", "object", "Request or response header substring predicates for search and interception", false},
+             {"response_header_contains", "object", "Response header substring predicates for conditional interception", false},
+             {"request_body_contains", "string", "Request body predicate for conditional interception", false},
+             {"response_body_contains", "string", "Response body predicate for conditional interception", false},
              {"limit", "number", "Maximum list results to return, default 200 and capped at 500", false},
              {"offset", "number", "Zero-based list result offset", false},
              {"max_records", "number", "Alias for limit", false},
@@ -3260,6 +3310,65 @@ std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
              {"bucket_ms", "number", "Timeline bucket size", false},
              {"collect_values", "boolean", "Collect property values", false},
              {"file_path", "string", "Trace JSONL path", false}}, false, 120000},
+        {"browser_service_worker", "Camoufox service-worker diagnostics. Set action to list, get_source, unregister, diagnostic_route, or diagnostic_post_message.",
+            {{"action", "string", "list|get_source|unregister|diagnostic_route|diagnostic_post_message", true},
+             {"session_id", "string", "Browser session id", false},
+             {"page_id", "string", "Stable AiDA page id", false},
+             {"script_url", "string", "Service-worker script URL substring or source URL", false},
+             {"url_pattern", "string", "URL glob for diagnostic page/context route", false},
+             {"intercept_action", "string", "Diagnostic route action: log, block, modify, mock, or stop", false},
+             {"modify_headers", "object", "Headers to add or override for diagnostic_route modify", false},
+             {"modify_body", "string", "Replacement request body for diagnostic_route modify", false},
+             {"mock_response", "object", "Mock response for diagnostic_route mock", false},
+             {"payload", "object", "Diagnostic postMessage payload", false},
+             {"payload_json", "object", "Alias for diagnostic postMessage payload", false}}, false, 30000},
+        {"browser_fingerprint_spoof", "Camoufox fingerprint spoofing and verification for canvas, WebGL, audio, fonts, timezone, geolocation, screen/viewport, battery, sensors, and navigator consistency.",
+            {{"action", "string", "canvas_spoof|webgl_spoof|audio_spoof|font_spoof|timezone_spoof|geolocation_spoof|screen_viewport_spoof|battery_spoof|sensors_spoof|navigator_spoof|verify", true},
+             {"session_id", "string", "Browser session id", false},
+             {"page_id", "string", "Stable AiDA page id", false},
+             {"mode", "string", "noise, block, or custom for canvas/audio spoofing", false},
+             {"noise_level", "number", "Noise level for canvas/audio spoofing", false},
+             {"renderer", "string", "Spoofed WebGL renderer", false},
+             {"vendor", "string", "Spoofed WebGL or navigator vendor", false},
+             {"unmasked_renderer", "string", "Spoofed unmasked WebGL renderer", false},
+             {"unmasked_vendor", "string", "Spoofed unmasked WebGL vendor", false},
+             {"block_fonts", "array", "Font names to block", false},
+             {"allow_fonts", "array", "Font names to allow", false},
+             {"timezone", "string", "IANA timezone identifier", false},
+             {"latitude", "number", "Spoofed geolocation latitude", false},
+             {"longitude", "number", "Spoofed geolocation longitude", false},
+             {"accuracy", "number", "Spoofed geolocation accuracy", false},
+             {"width", "number", "Screen and viewport width", false},
+             {"height", "number", "Screen and viewport height", false},
+             {"avail_width", "number", "Available screen width", false},
+             {"avail_height", "number", "Available screen height", false},
+             {"color_depth", "number", "Screen color depth", false},
+             {"pixel_depth", "number", "Screen pixel depth", false},
+             {"device_scale_factor", "number", "Device pixel ratio", false},
+             {"charging", "boolean", "Battery charging state", false},
+             {"level", "number", "Battery level between 0 and 1", false},
+             {"charging_time", "number", "Battery charging time seconds", false},
+             {"discharging_time", "number", "Battery discharging time seconds", false},
+             {"sensor_permission", "string", "Sensor permission state: granted, denied, or prompt", false},
+             {"acceleration_x", "number", "DeviceMotion acceleration X", false},
+             {"acceleration_y", "number", "DeviceMotion acceleration Y", false},
+             {"acceleration_z", "number", "DeviceMotion acceleration Z", false},
+             {"alpha", "number", "DeviceOrientation alpha", false},
+             {"beta", "number", "DeviceOrientation beta", false},
+             {"gamma", "number", "DeviceOrientation gamma", false},
+             {"languages", "array", "Navigator languages array", false},
+             {"platform", "string", "Navigator platform", false},
+             {"device_memory", "number", "Navigator deviceMemory", false},
+             {"hardware_concurrency", "number", "Navigator hardwareConcurrency", false},
+             {"plugins", "array", "Navigator plugin names", false},
+             {"mime_types", "array", "Navigator MIME types", false},
+             {"connection_type", "string", "Navigator connection type", false},
+             {"effective_type", "string", "Navigator connection effectiveType", false},
+             {"downlink", "number", "Navigator connection downlink", false},
+             {"rtt", "number", "Navigator connection RTT", false},
+             {"save_data", "boolean", "Navigator connection saveData", false},
+             {"custom", "object", "Action-specific custom spoof configuration", false},
+             {"persistent", "boolean", "Persist init script across navigations", false}}, false, 45000},
         {"get_console_logs", "Return console output collected from Camoufox pages.",
             {{"session_id", "string", "Browser session id", false},
              {"page_id", "string", "Stable AiDA page id filter", false},

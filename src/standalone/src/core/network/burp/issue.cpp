@@ -141,7 +141,11 @@ std::string normalize_case(std::string s)
 std::string build_dedupe_key(const issue_t& i)
 {
     std::string k;
-    k.reserve(i.type_key.size() + i.host.size() + i.parameter.size() + i.path.size() + 32);
+    k.reserve(i.session_id.size() + i.type_key.size() + i.host.size() + i.parameter.size() + i.path.size() + 64);
+    k += normalize_case(i.session_id);
+    k += '|';
+    k += std::to_string(i.scan_id != 0 ? i.scan_id : i.audit_id);
+    k += '|';
     k += normalize_case(i.type_key);
     k += '|';
     k += normalize_case(i.host);
@@ -253,11 +257,17 @@ nlohmann::json issue_to_json(const issue_t& i)
 {
     nlohmann::json j;
     j["id"]               = i.id;
+    j["session_id"]       = i.session_id;
+    j["scan_id"]          = i.scan_id;
     j["type_key"]         = i.type_key;
     j["name"]             = i.name;
     j["description"]      = i.description;
     j["remediation"]      = i.remediation;
     j["cwe"]              = i.cwe;
+    j["cvss_score"]       = i.cvss_score;
+    j["cvss_vector"]      = i.cvss_vector;
+    j["cvss_severity"]    = i.cvss_severity;
+    j["owasp_category"]   = i.owasp_category;
     j["severity"]         = severity_label(i.severity);
     j["confidence"]       = confidence_label(i.confidence);
     j["scheme"]           = i.scheme;
@@ -269,6 +279,10 @@ nlohmann::json issue_to_json(const issue_t& i)
     j["seen_ms"]          = i.seen_ms;
     j["src_exchange_id"]  = i.src_exchange_id;
     j["audit_id"]         = i.audit_id;
+    j["suppressed"]       = i.suppressed;
+    j["suppress_reason"]  = i.suppress_reason;
+    j["suppressed_by"]    = i.suppressed_by;
+    j["suppressed_ms"]    = i.suppressed_ms;
     nlohmann::json ev_arr = nlohmann::json::array();
     for (const auto& e : i.evidence) ev_arr.push_back(evidence_to_json(e));
     j["evidence"] = std::move(ev_arr);
@@ -410,6 +424,7 @@ std::vector<issue_t> list(const issue_filter_t& filter)
         if (filter.has_severity_min && static_cast<int>(it.severity) < static_cast<int>(filter.severity_min)) continue;
         if (filter.has_confidence_min && static_cast<int>(it.confidence) < static_cast<int>(filter.confidence_min)) continue;
         if (filter.has_audit_id && it.audit_id != filter.audit_id) continue;
+        if (!filter.include_suppressed && it.suppressed) continue;
         if (!filter.host_substring.empty()) {
             std::string lh = normalize_case(it.host);
             std::string sub = normalize_case(filter.host_substring);
@@ -443,6 +458,107 @@ nlohmann::json export_json(const issue_filter_t& filter)
     doc["issues"] = std::move(arr);
     diag::log_tagged_fmt("issue", "export_json done count=%zu", items.size());
     return doc;
+}
+
+bool import_json(const nlohmann::json& doc, bool replace_existing)
+{
+    diag::log_tagged_fmt("issue", "import_json entry replace=%d", replace_existing ? 1 : 0);
+    auto issues_doc = doc;
+    if (doc.is_object())
+        issues_doc = doc.value("issues", nlohmann::json::array());
+    if (!issues_doc.is_array()) {
+        set_err("issue_store.import: issues must be an array");
+        return false;
+    }
+    std::vector<issue_t> loaded;
+    std::unordered_set<std::string> keys;
+    uint64_t max_id = 0;
+    for (const auto& j : issues_doc) {
+        if (!j.is_object())
+            continue;
+        issue_t it;
+        if (j.contains("id") && j["id"].is_number_unsigned()) it.id = j["id"].get<uint64_t>();
+        if (j.contains("session_id") && j["session_id"].is_string()) it.session_id = j["session_id"].get<std::string>();
+        if (j.contains("scan_id") && j["scan_id"].is_number_unsigned()) it.scan_id = j["scan_id"].get<uint64_t>();
+        if (j.contains("type_key") && j["type_key"].is_string()) it.type_key = j["type_key"].get<std::string>();
+        if (j.contains("name") && j["name"].is_string()) it.name = j["name"].get<std::string>();
+        if (j.contains("description") && j["description"].is_string()) it.description = j["description"].get<std::string>();
+        if (j.contains("remediation") && j["remediation"].is_string()) it.remediation = j["remediation"].get<std::string>();
+        if (j.contains("cwe") && j["cwe"].is_array()) {
+            for (const auto& c : j["cwe"])
+                if (c.is_string())
+                    it.cwe.push_back(c.get<std::string>());
+        }
+        if (j.contains("cvss_score") && j["cvss_score"].is_number()) it.cvss_score = j["cvss_score"].get<double>();
+        if (j.contains("cvss_vector") && j["cvss_vector"].is_string()) it.cvss_vector = j["cvss_vector"].get<std::string>();
+        if (j.contains("cvss_severity") && j["cvss_severity"].is_string()) it.cvss_severity = j["cvss_severity"].get<std::string>();
+        if (j.contains("owasp_category") && j["owasp_category"].is_string()) it.owasp_category = j["owasp_category"].get<std::string>();
+        if (j.contains("severity") && j["severity"].is_string()) parse_severity(j["severity"].get<std::string>(), it.severity);
+        if (j.contains("confidence") && j["confidence"].is_string()) parse_confidence(j["confidence"].get<std::string>(), it.confidence);
+        if (j.contains("scheme") && j["scheme"].is_string()) it.scheme = j["scheme"].get<std::string>();
+        if (j.contains("host") && j["host"].is_string()) it.host = j["host"].get<std::string>();
+        if (j.contains("port") && j["port"].is_number_unsigned()) {
+            const auto port = j["port"].get<uint64_t>();
+            if (port <= 65535ull)
+                it.port = static_cast<uint16_t>(port);
+        }
+        if (j.contains("path") && j["path"].is_string()) it.path = j["path"].get<std::string>();
+        if (j.contains("parameter") && j["parameter"].is_string()) it.parameter = j["parameter"].get<std::string>();
+        if (j.contains("insertion_point") && j["insertion_point"].is_string()) it.insertion_point = j["insertion_point"].get<std::string>();
+        if (j.contains("seen_ms") && j["seen_ms"].is_number_unsigned()) it.seen_ms = j["seen_ms"].get<uint64_t>();
+        if (j.contains("src_exchange_id") && j["src_exchange_id"].is_number_unsigned()) it.src_exchange_id = j["src_exchange_id"].get<uint64_t>();
+        if (j.contains("audit_id") && j["audit_id"].is_number_unsigned()) it.audit_id = j["audit_id"].get<uint64_t>();
+        if (j.contains("suppressed") && j["suppressed"].is_boolean()) it.suppressed = j["suppressed"].get<bool>();
+        if (j.contains("suppress_reason") && j["suppress_reason"].is_string()) it.suppress_reason = j["suppress_reason"].get<std::string>();
+        if (j.contains("suppressed_by") && j["suppressed_by"].is_string()) it.suppressed_by = j["suppressed_by"].get<std::string>();
+        if (j.contains("suppressed_ms") && j["suppressed_ms"].is_number_unsigned()) it.suppressed_ms = j["suppressed_ms"].get<uint64_t>();
+        if (j.contains("evidence") && j["evidence"].is_array()) {
+            for (const auto& je : j["evidence"]) {
+                evidence_t ev;
+                if (evidence_from_json(je, ev))
+                    it.evidence.push_back(std::move(ev));
+            }
+        }
+        if (it.type_key.empty() || it.host.empty())
+            continue;
+        if (it.seen_ms == 0)
+            it.seen_ms = now_ms();
+        if (it.id > max_id)
+            max_id = it.id;
+        const std::string key = build_dedupe_key(it);
+        if (keys.insert(key).second)
+            loaded.push_back(std::move(it));
+    }
+    auto& s = state();
+    if (!s.initialized.load())
+        initialize();
+    {
+        std::lock_guard<std::mutex> lk(s.mtx);
+        if (replace_existing) {
+            s.items.clear();
+            s.dedupe_keys.clear();
+            keys.clear();
+        } else {
+            keys = s.dedupe_keys;
+        }
+        for (auto& it : loaded) {
+            const std::string key = build_dedupe_key(it);
+            if (keys.find(key) != keys.end())
+                continue;
+            if (it.id == 0)
+                it.id = s.next_id.fetch_add(1);
+            max_id = std::max(max_id, it.id);
+            keys.insert(key);
+            s.items.push_back(std::move(it));
+        }
+        s.dedupe_keys = std::move(keys);
+        if (max_id >= s.next_id.load())
+            s.next_id.store(max_id + 1);
+        s.unsaved_changes.fetch_add(1, std::memory_order_acq_rel);
+    }
+    if (s.autosave.load())
+        save_to_disk();
+    return true;
 }
 
 std::string storage_path()
@@ -548,6 +664,8 @@ bool load_from_disk()
             try {
                 issue_t it;
                 if (j.contains("id") && j["id"].is_number_unsigned()) it.id = j["id"].get<uint64_t>();
+                if (j.contains("session_id") && j["session_id"].is_string()) it.session_id = j["session_id"].get<std::string>();
+                if (j.contains("scan_id") && j["scan_id"].is_number_unsigned()) it.scan_id = j["scan_id"].get<uint64_t>();
                 if (j.contains("type_key") && j["type_key"].is_string()) it.type_key = j["type_key"].get<std::string>();
                 if (j.contains("name") && j["name"].is_string()) it.name = j["name"].get<std::string>();
                 if (j.contains("description") && j["description"].is_string()) it.description = j["description"].get<std::string>();
@@ -555,6 +673,10 @@ bool load_from_disk()
                 if (j.contains("cwe") && j["cwe"].is_array()) {
                     for (const auto& c : j["cwe"]) if (c.is_string()) it.cwe.push_back(c.get<std::string>());
                 }
+                if (j.contains("cvss_score") && j["cvss_score"].is_number()) it.cvss_score = j["cvss_score"].get<double>();
+                if (j.contains("cvss_vector") && j["cvss_vector"].is_string()) it.cvss_vector = j["cvss_vector"].get<std::string>();
+                if (j.contains("cvss_severity") && j["cvss_severity"].is_string()) it.cvss_severity = j["cvss_severity"].get<std::string>();
+                if (j.contains("owasp_category") && j["owasp_category"].is_string()) it.owasp_category = j["owasp_category"].get<std::string>();
                 if (j.contains("severity")   && j["severity"].is_string())   parse_severity(j["severity"].get<std::string>(), it.severity);
                 if (j.contains("confidence") && j["confidence"].is_string()) parse_confidence(j["confidence"].get<std::string>(), it.confidence);
                 if (j.contains("scheme") && j["scheme"].is_string()) it.scheme = j["scheme"].get<std::string>();
@@ -569,6 +691,10 @@ bool load_from_disk()
                 if (j.contains("seen_ms")         && j["seen_ms"].is_number_unsigned()) it.seen_ms        = j["seen_ms"].get<uint64_t>();
                 if (j.contains("src_exchange_id") && j["src_exchange_id"].is_number_unsigned()) it.src_exchange_id = j["src_exchange_id"].get<uint64_t>();
                 if (j.contains("audit_id")        && j["audit_id"].is_number_unsigned()) it.audit_id = j["audit_id"].get<uint64_t>();
+                if (j.contains("suppressed")      && j["suppressed"].is_boolean()) it.suppressed = j["suppressed"].get<bool>();
+                if (j.contains("suppress_reason") && j["suppress_reason"].is_string()) it.suppress_reason = j["suppress_reason"].get<std::string>();
+                if (j.contains("suppressed_by")   && j["suppressed_by"].is_string()) it.suppressed_by = j["suppressed_by"].get<std::string>();
+                if (j.contains("suppressed_ms")   && j["suppressed_ms"].is_number_unsigned()) it.suppressed_ms = j["suppressed_ms"].get<uint64_t>();
                 if (j.contains("evidence") && j["evidence"].is_array()) {
                     for (const auto& je : j["evidence"]) {
                         evidence_t ev;

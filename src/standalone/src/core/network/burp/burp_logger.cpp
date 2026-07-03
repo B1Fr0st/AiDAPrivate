@@ -310,6 +310,69 @@ std::vector<log_row_t> query(const log_filter_t& f, size_t limit)
     return out;
 }
 
+nlohmann::json row_to_json(const log_row_t& row)
+{
+    return {
+        {"id", row.id},
+        {"ts_ms", row.ts_ms},
+        {"method", row.method},
+        {"url", row.url},
+        {"host", row.host},
+        {"port", row.port},
+        {"status", row.status},
+        {"request_length", row.request_length},
+        {"response_length", row.response_length},
+        {"latency_ms", row.latency_ms},
+        {"mime_type", row.mime_type},
+        {"source", source_label(row.source)},
+        {"exchange_id", row.exchange_id}
+    };
+}
+
+bool row_from_json(const nlohmann::json& doc, log_row_t& row)
+{
+    if (!doc.is_object())
+        return false;
+    row = log_row_t{};
+    row.id = doc.value("id", static_cast<uint64_t>(0));
+    row.ts_ms = doc.value("ts_ms", static_cast<uint64_t>(0));
+    row.method = doc.value("method", std::string());
+    row.url = doc.value("url", std::string());
+    row.host = doc.value("host", std::string());
+    row.port = static_cast<uint16_t>(std::min(doc.value("port", 0), 65535));
+    row.status = doc.value("status", 0);
+    row.request_length = doc.value("request_length", static_cast<size_t>(0));
+    row.response_length = doc.value("response_length", static_cast<size_t>(0));
+    row.latency_ms = doc.value("latency_ms", static_cast<uint64_t>(0));
+    row.mime_type = doc.value("mime_type", std::string());
+    parse_source(doc.value("source", std::string("manual")), row.source);
+    row.exchange_id = doc.value("exchange_id", static_cast<uint64_t>(0));
+    return row.id != 0 || !row.url.empty() || !row.host.empty();
+}
+
+bool import_rows(const std::vector<log_row_t>& rows, bool replace_existing)
+{
+    auto& r = ring();
+    std::lock_guard<std::mutex> lk(r.mtx);
+    if (replace_existing) {
+        r.rows.clear();
+        r.write_idx = 0;
+        r.count = 0;
+    }
+    uint64_t max_id = 0;
+    for (const auto& existing : r.rows)
+        max_id = std::max(max_id, existing.id);
+    for (auto row : rows) {
+        if (row.id == 0)
+            row.id = r.next_id.fetch_add(1);
+        max_id = std::max(max_id, row.id);
+        push_locked(r, std::move(row));
+    }
+    if (max_id >= r.next_id.load())
+        r.next_id.store(max_id + 1);
+    return true;
+}
+
 size_t total_rows()
 {
     auto& r = ring();

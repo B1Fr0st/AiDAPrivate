@@ -368,14 +368,30 @@ bool create_schema(sqlite3* db)
     if (!exec_simple(db, schema)) return false;
 
     if (!ensure_column(db, "findings", "issue_store_id", "ALTER TABLE findings ADD COLUMN issue_store_id INTEGER DEFAULT 0")) return false;
+    if (!ensure_column(db, "findings", "session_id", "ALTER TABLE findings ADD COLUMN session_id TEXT DEFAULT ''")) return false;
+    if (!ensure_column(db, "findings", "scan_id", "ALTER TABLE findings ADD COLUMN scan_id INTEGER DEFAULT 0")) return false;
     if (!ensure_column(db, "findings", "audit_id", "ALTER TABLE findings ADD COLUMN audit_id INTEGER DEFAULT 0")) return false;
     if (!ensure_column(db, "findings", "dedupe_key", "ALTER TABLE findings ADD COLUMN dedupe_key TEXT DEFAULT ''")) return false;
+    if (!ensure_column(db, "findings", "cwe_json", "ALTER TABLE findings ADD COLUMN cwe_json TEXT DEFAULT '[]'")) return false;
+    if (!ensure_column(db, "findings", "cvss_score", "ALTER TABLE findings ADD COLUMN cvss_score REAL DEFAULT 0.0")) return false;
+    if (!ensure_column(db, "findings", "cvss_vector", "ALTER TABLE findings ADD COLUMN cvss_vector TEXT DEFAULT ''")) return false;
+    if (!ensure_column(db, "findings", "cvss_severity", "ALTER TABLE findings ADD COLUMN cvss_severity TEXT DEFAULT ''")) return false;
+    if (!ensure_column(db, "findings", "owasp_category", "ALTER TABLE findings ADD COLUMN owasp_category TEXT DEFAULT ''")) return false;
+    if (!ensure_column(db, "findings", "suppressed", "ALTER TABLE findings ADD COLUMN suppressed INTEGER DEFAULT 0")) return false;
+    if (!ensure_column(db, "findings", "suppress_reason", "ALTER TABLE findings ADD COLUMN suppress_reason TEXT DEFAULT ''")) return false;
+    if (!ensure_column(db, "findings", "suppressed_by", "ALTER TABLE findings ADD COLUMN suppressed_by TEXT DEFAULT ''")) return false;
+    if (!ensure_column(db, "findings", "suppressed_ms", "ALTER TABLE findings ADD COLUMN suppressed_ms INTEGER DEFAULT 0")) return false;
     if (!ensure_column(db, "evidence", "session_id", "ALTER TABLE evidence ADD COLUMN session_id TEXT DEFAULT ''")) return false;
     if (!ensure_column(db, "evidence", "scan_id", "ALTER TABLE evidence ADD COLUMN scan_id INTEGER DEFAULT 0")) return false;
     if (!ensure_column(db, "evidence", "kind", "ALTER TABLE evidence ADD COLUMN kind TEXT DEFAULT 'request_response'")) return false;
+    if (!ensure_column(db, "evidence", "screenshot_path", "ALTER TABLE evidence ADD COLUMN screenshot_path TEXT DEFAULT ''")) return false;
     if (!ensure_column(db, "evidence", "file_path", "ALTER TABLE evidence ADD COLUMN file_path TEXT DEFAULT ''")) return false;
     if (!ensure_column(db, "evidence", "content_sha256", "ALTER TABLE evidence ADD COLUMN content_sha256 TEXT DEFAULT ''")) return false;
+    if (!ensure_column(db, "evidence", "timing_json", "ALTER TABLE evidence ADD COLUMN timing_json TEXT DEFAULT '{}'")) return false;
+    if (!ensure_column(db, "evidence", "metadata_json", "ALTER TABLE evidence ADD COLUMN metadata_json TEXT DEFAULT '{}'")) return false;
+    if (!ensure_column(db, "audit_trail", "parameters_json", "ALTER TABLE audit_trail ADD COLUMN parameters_json TEXT DEFAULT '{}'")) return false;
     if (!ensure_column(db, "audit_trail", "parameters_hash", "ALTER TABLE audit_trail ADD COLUMN parameters_hash TEXT DEFAULT ''")) return false;
+    if (!ensure_column(db, "audit_trail", "result_summary_json", "ALTER TABLE audit_trail ADD COLUMN result_summary_json TEXT DEFAULT '{}'")) return false;
     if (!ensure_column(db, "audit_trail", "result_hash", "ALTER TABLE audit_trail ADD COLUMN result_hash TEXT DEFAULT ''")) return false;
     return true;
 }

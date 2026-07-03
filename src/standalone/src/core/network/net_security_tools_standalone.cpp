@@ -2,7 +2,11 @@
 
 
 #define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
+#include <bcrypt.h>
+#include <winhttp.h>
 #include <wincrypt.h>
 
 #include "standalone_compat.hpp"
@@ -11,6 +15,7 @@
 #include "net_security.hpp"
 #include "cert_generator.hpp"
 #include "mitm_proxy.hpp"
+#include "quic_proxy.hpp"
 #include "intercept/cert_profile_manager.hpp"
 #include "intercept/diagnostics.hpp"
 #include "intercept/instrumentation_provider.hpp"
@@ -22,6 +27,7 @@
 #include <atomic>
 #include <chrono>
 #include <cctype>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -761,6 +767,871 @@ static bool ns_has_any(const std::string& value, std::initializer_list<const cha
     return false;
 }
 
+static std::wstring ns_utf8_to_wide(const std::string& value)
+{
+    if (value.empty())
+        return {};
+    int needed = MultiByteToWideChar(CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()), nullptr, 0);
+    if (needed <= 0)
+        needed = MultiByteToWideChar(CP_ACP, 0, value.c_str(), static_cast<int>(value.size()), nullptr, 0);
+    if (needed <= 0)
+        return {};
+    std::wstring out(static_cast<std::size_t>(needed), L'\0');
+    if (MultiByteToWideChar(CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()), out.data(), needed) <= 0)
+        MultiByteToWideChar(CP_ACP, 0, value.c_str(), static_cast<int>(value.size()), out.data(), needed);
+    return out;
+}
+
+static std::string ns_wide_to_utf8(const std::wstring& value)
+{
+    if (value.empty())
+        return {};
+    const int needed = WideCharToMultiByte(CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
+    if (needed <= 0)
+        return {};
+    std::string out(static_cast<std::size_t>(needed), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()), out.data(), needed, nullptr, nullptr);
+    return out;
+}
+
+static bool ns_tls_valid_host(const std::string& host)
+{
+    if (host.empty() || host.size() > 253)
+        return false;
+    for (unsigned char c : host) {
+        if (std::isspace(c) || c == '/' || c == '\\' || c == '@')
+            return false;
+    }
+    return true;
+}
+
+static bool ns_json_u16_param(const json& params, const char* key, std::uint16_t& out, std::uint16_t fallback)
+{
+    out = fallback;
+    if (!params.contains(key))
+        return true;
+    if (!params[key].is_number_unsigned() && !params[key].is_number_integer())
+        return false;
+    const auto raw = params[key].get<std::int64_t>();
+    if (raw <= 0 || raw > 65535)
+        return false;
+    out = static_cast<std::uint16_t>(raw);
+    return true;
+}
+
+static bool ns_tls_cancelled_or_deadline()
+{
+    const std::uint64_t deadline = mcp_standalone::current_call_deadline_ms();
+    return mcp_standalone::current_call_cancelled() || (deadline != 0 && GetTickCount64() >= deadline);
+}
+
+static DWORD ns_tls_timeout_ms(DWORD fallback)
+{
+    const DWORD bounded = std::max<DWORD>(100, std::min<DWORD>(fallback, 15000));
+    const std::uint64_t deadline = mcp_standalone::current_call_deadline_ms();
+    if (deadline == 0)
+        return bounded;
+    const std::uint64_t now = GetTickCount64();
+    if (deadline <= now)
+        return 1;
+    return std::max<DWORD>(1, static_cast<DWORD>(std::min<std::uint64_t>(bounded, deadline - now)));
+}
+
+static std::once_flag& ns_tls_wsa_once()
+{
+    static std::once_flag flag;
+    return flag;
+}
+
+static int& ns_tls_wsa_status()
+{
+    static int status = WSANOTINITIALISED;
+    return status;
+}
+
+static bool ns_tls_ensure_winsock()
+{
+    std::call_once(ns_tls_wsa_once(), []() {
+        WSADATA wsa{};
+        ns_tls_wsa_status() = WSAStartup(MAKEWORD(2, 2), &wsa);
+    });
+    return ns_tls_wsa_status() == 0;
+}
+
+static bool ns_tls_wait_socket(SOCKET s, bool write, DWORD timeout)
+{
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(s, &fds);
+    timeval tv{static_cast<long>(timeout / 1000), static_cast<long>((timeout % 1000) * 1000)};
+    const int rc = write ? select(0, nullptr, &fds, nullptr, &tv) : select(0, &fds, nullptr, nullptr, &tv);
+    return rc > 0 && FD_ISSET(s, &fds);
+}
+
+static bool ns_tls_connect_socket(const std::string& host, std::uint16_t port, DWORD timeout, SOCKET& out_sock, std::string& error)
+{
+    out_sock = INVALID_SOCKET;
+    if (!ns_tls_ensure_winsock()) {
+        error = "WSAStartup failed " + std::to_string(ns_tls_wsa_status());
+        return false;
+    }
+    const std::wstring host_w = ns_utf8_to_wide(host);
+    const std::wstring port_w = ns_utf8_to_wide(std::to_string(port));
+    ADDRINFOEXW hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    PADDRINFOEXW resolved = nullptr;
+    timeval resolve_timeout{static_cast<long>(timeout / 1000), static_cast<long>((timeout % 1000) * 1000)};
+    const int gai = GetAddrInfoExW(host_w.c_str(), port_w.c_str(), NS_ALL, nullptr, &hints, &resolved, &resolve_timeout, nullptr, nullptr, nullptr);
+    if (gai != 0 || !resolved) {
+        error = "GetAddrInfoExW failed " + std::to_string(gai != 0 ? gai : WSAGetLastError());
+        if (resolved)
+            FreeAddrInfoExW(resolved);
+        return false;
+    }
+    for (PADDRINFOEXW ai = resolved; ai; ai = ai->ai_next) {
+        if (ns_tls_cancelled_or_deadline()) {
+            error = mcp_standalone::current_call_cancelled() ? "cancelled" : "deadline_expired";
+            break;
+        }
+        if (!ai->ai_addr || ai->ai_addrlen == 0)
+            continue;
+        SOCKET s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (s == INVALID_SOCKET)
+            continue;
+        u_long nb = 1;
+        ioctlsocket(s, FIONBIO, &nb);
+        int rc = connect(s, ai->ai_addr, static_cast<int>(ai->ai_addrlen));
+        if (rc == SOCKET_ERROR) {
+            const int wsa = WSAGetLastError();
+            if (wsa != WSAEWOULDBLOCK && wsa != WSAEINPROGRESS && wsa != WSAEINVAL) {
+                closesocket(s);
+                continue;
+            }
+        }
+        if (ns_tls_wait_socket(s, true, ns_tls_timeout_ms(timeout))) {
+            int soerr = 0;
+            int soerr_len = sizeof(soerr);
+            getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&soerr), &soerr_len);
+            if (soerr == 0) {
+                DWORD t = ns_tls_timeout_ms(timeout);
+                setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&t), sizeof(t));
+                setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&t), sizeof(t));
+                out_sock = s;
+                FreeAddrInfoExW(resolved);
+                return true;
+            }
+        }
+        closesocket(s);
+    }
+    FreeAddrInfoExW(resolved);
+    if (error.empty())
+        error = "connect timeout or refused";
+    return false;
+}
+
+static bool ns_tls_send_all(SOCKET s, const std::uint8_t* data, std::size_t len, DWORD timeout, std::string& error)
+{
+    std::size_t sent = 0;
+    while (sent < len) {
+        if (ns_tls_cancelled_or_deadline()) {
+            error = mcp_standalone::current_call_cancelled() ? "cancelled" : "deadline_expired";
+            return false;
+        }
+        if (!ns_tls_wait_socket(s, true, ns_tls_timeout_ms(timeout))) {
+            error = "send_timeout";
+            return false;
+        }
+        const int n = send(s, reinterpret_cast<const char*>(data + sent), static_cast<int>(std::min<std::size_t>(len - sent, 8192)), 0);
+        if (n <= 0) {
+            error = "send_failed_wsa_" + std::to_string(WSAGetLastError());
+            return false;
+        }
+        sent += static_cast<std::size_t>(n);
+    }
+    return true;
+}
+
+static bool ns_tls_recv_some(SOCKET s, std::vector<std::uint8_t>& out, DWORD timeout, std::size_t max_chunk, std::string& error)
+{
+    if (ns_tls_cancelled_or_deadline()) {
+        error = mcp_standalone::current_call_cancelled() ? "cancelled" : "deadline_expired";
+        return false;
+    }
+    if (!ns_tls_wait_socket(s, false, ns_tls_timeout_ms(timeout))) {
+        error = "receive_timeout";
+        return false;
+    }
+    std::vector<std::uint8_t> buf(std::min<std::size_t>(max_chunk, 8192));
+    const int n = recv(s, reinterpret_cast<char*>(buf.data()), static_cast<int>(buf.size()), 0);
+    if (n <= 0) {
+        error = n == 0 ? "connection_closed" : "recv_failed_wsa_" + std::to_string(WSAGetLastError());
+        return false;
+    }
+    out.insert(out.end(), buf.begin(), buf.begin() + n);
+    return true;
+}
+
+static void ns_tls_put_u16(std::vector<std::uint8_t>& out, std::uint16_t value)
+{
+    out.push_back(static_cast<std::uint8_t>((value >> 8) & 0xff));
+    out.push_back(static_cast<std::uint8_t>(value & 0xff));
+}
+
+static void ns_tls_put_u24(std::vector<std::uint8_t>& out, std::uint32_t value)
+{
+    out.push_back(static_cast<std::uint8_t>((value >> 16) & 0xff));
+    out.push_back(static_cast<std::uint8_t>((value >> 8) & 0xff));
+    out.push_back(static_cast<std::uint8_t>(value & 0xff));
+}
+
+static void ns_tls_random_bytes(std::vector<std::uint8_t>& out, std::size_t count, std::uint8_t seed)
+{
+    const std::size_t start = out.size();
+    out.resize(start + count);
+    if (BCryptGenRandom(nullptr, out.data() + start, static_cast<ULONG>(count), BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) {
+        for (std::size_t i = 0; i < count; ++i)
+            out[start + i] = static_cast<std::uint8_t>((i * 37u + seed) & 0xffu);
+    }
+}
+
+static std::string ns_tls_hex_u16(std::uint16_t value)
+{
+    std::ostringstream os;
+    os << std::hex << std::nouppercase << std::setw(4) << std::setfill('0') << value;
+    return os.str();
+}
+
+static std::string ns_tls_sha256_hex(const std::string& value)
+{
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    DWORD object_len = 0;
+    DWORD hash_len = 0;
+    DWORD cb = 0;
+    std::vector<std::uint8_t> object;
+    std::vector<std::uint8_t> digest;
+    std::string out;
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) >= 0) {
+        if (BCryptGetProperty(alg, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&object_len), sizeof(object_len), &cb, 0) >= 0 &&
+            BCryptGetProperty(alg, BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&hash_len), sizeof(hash_len), &cb, 0) >= 0) {
+            object.resize(object_len);
+            digest.resize(hash_len);
+            if (BCryptCreateHash(alg, &hash, object.data(), object_len, nullptr, 0, 0) >= 0 &&
+                BCryptHashData(hash, reinterpret_cast<PUCHAR>(const_cast<char*>(value.data())), static_cast<ULONG>(value.size()), 0) >= 0 &&
+                BCryptFinishHash(hash, digest.data(), hash_len, 0) >= 0) {
+                out = ns_bytes_to_hex(digest.data(), digest.size());
+                std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            }
+        }
+    }
+    if (hash)
+        BCryptDestroyHash(hash);
+    if (alg)
+        BCryptCloseAlgorithmProvider(alg, 0);
+    if (out.empty()) {
+        std::uint64_t h = 1469598103934665603ull;
+        for (unsigned char c : value) {
+            h ^= c;
+            h *= 1099511628211ull;
+        }
+        std::ostringstream os;
+        os << std::hex << std::nouppercase << std::setw(16) << std::setfill('0') << h;
+        out = os.str();
+        while (out.size() < 64)
+            out += out;
+        out.resize(64);
+    }
+    return out;
+}
+
+struct ns_tls_probe_profile_t {
+    std::string label;
+    std::uint16_t record_version = 0x0301;
+    std::uint16_t client_version = 0x0303;
+    std::vector<std::uint16_t> ciphers;
+    std::vector<std::uint16_t> supported_versions;
+    std::vector<std::uint8_t> compressions{0};
+    bool sni = true;
+    bool alpn = false;
+    bool rare_alpn = false;
+    bool heartbeat = false;
+    bool grease = false;
+    bool psk_modes = true;
+    bool key_share = true;
+    std::string alpn_order = "FORWARD";
+    std::string version_order = "FORWARD";
+};
+
+struct ns_tls_probe_result_t {
+    std::string label;
+    bool connected = false;
+    bool sent = false;
+    bool got_server_hello = false;
+    bool server_hello_done = false;
+    bool got_alert = false;
+    std::uint8_t alert_level = 0;
+    std::uint8_t alert_description = 0;
+    std::uint16_t record_version = 0;
+    std::uint16_t server_version = 0;
+    std::uint16_t selected_version = 0;
+    std::uint16_t cipher_suite = 0;
+    std::uint8_t compression = 0xff;
+    bool heartbeat_extension = false;
+    std::string alpn;
+    std::vector<std::uint16_t> extensions;
+    std::size_t bytes_received = 0;
+    std::uint64_t elapsed_ms = 0;
+    std::string error;
+};
+
+template <typename T>
+static std::vector<T> ns_tls_reorder(std::vector<T> in, const std::string& order)
+{
+    if (order == "REVERSE") {
+        std::reverse(in.begin(), in.end());
+        return in;
+    }
+    if (order == "BOTTOM_HALF") {
+        const std::size_t mid = in.size() / 2;
+        return std::vector<T>(in.begin() + static_cast<std::ptrdiff_t>(mid + (in.size() % 2)), in.end());
+    }
+    if (order == "TOP_HALF") {
+        std::vector<T> reversed = in;
+        std::reverse(reversed.begin(), reversed.end());
+        const std::size_t mid = reversed.size() / 2;
+        std::vector<T> bottom(reversed.begin() + static_cast<std::ptrdiff_t>(mid + (reversed.size() % 2)), reversed.end());
+        if (in.size() % 2)
+            bottom.insert(bottom.begin(), in[in.size() / 2]);
+        return bottom;
+    }
+    if (order == "MIDDLE_OUT") {
+        std::vector<T> out;
+        const std::size_t mid = in.size() / 2;
+        if (in.size() % 2)
+            out.push_back(in[mid]);
+        for (std::size_t i = 1; i <= mid; ++i) {
+            if (mid - 1 + i < in.size())
+                out.push_back(in[mid - 1 + i]);
+            if (mid >= i)
+                out.push_back(in[mid - i]);
+        }
+        return out;
+    }
+    return in;
+}
+
+static void ns_tls_add_extension(std::vector<std::uint8_t>& ext, std::uint16_t type, const std::vector<std::uint8_t>& data)
+{
+    ns_tls_put_u16(ext, type);
+    ns_tls_put_u16(ext, static_cast<std::uint16_t>(data.size()));
+    ext.insert(ext.end(), data.begin(), data.end());
+}
+
+static std::vector<std::uint8_t> ns_tls_alpn_payload(bool rare, const std::string& order)
+{
+    std::vector<std::string> labels = rare
+        ? std::vector<std::string>{"http/0.9", "http/1.0", "spdy/1", "spdy/2", "spdy/3", "h2c", "hq"}
+        : std::vector<std::string>{"http/0.9", "http/1.0", "http/1.1", "spdy/1", "spdy/2", "spdy/3", "h2", "h2c", "hq"};
+    labels = ns_tls_reorder(labels, order);
+    std::vector<std::uint8_t> list;
+    for (const auto& label : labels) {
+        list.push_back(static_cast<std::uint8_t>(label.size()));
+        list.insert(list.end(), label.begin(), label.end());
+    }
+    std::vector<std::uint8_t> out;
+    ns_tls_put_u16(out, static_cast<std::uint16_t>(list.size()));
+    out.insert(out.end(), list.begin(), list.end());
+    return out;
+}
+
+static std::vector<std::uint8_t> ns_tls_supported_versions_payload(std::vector<std::uint16_t> versions, const std::string& order, bool grease)
+{
+    versions = ns_tls_reorder(versions, order);
+    std::vector<std::uint8_t> out;
+    if (grease)
+        ns_tls_put_u16(out, 0x0a0a);
+    for (std::uint16_t version : versions)
+        ns_tls_put_u16(out, version);
+    std::vector<std::uint8_t> wrapped;
+    wrapped.push_back(static_cast<std::uint8_t>(out.size()));
+    wrapped.insert(wrapped.end(), out.begin(), out.end());
+    return wrapped;
+}
+
+static std::vector<std::uint8_t> ns_tls_key_share_payload(bool grease)
+{
+    std::vector<std::uint8_t> entries;
+    if (grease) {
+        ns_tls_put_u16(entries, 0x0a0a);
+        ns_tls_put_u16(entries, 1);
+        entries.push_back(0);
+    }
+    ns_tls_put_u16(entries, 0x001d);
+    ns_tls_put_u16(entries, 32);
+    ns_tls_random_bytes(entries, 32, 0x5a);
+    std::vector<std::uint8_t> out;
+    ns_tls_put_u16(out, static_cast<std::uint16_t>(entries.size()));
+    out.insert(out.end(), entries.begin(), entries.end());
+    return out;
+}
+
+static std::vector<std::uint8_t> ns_tls_build_client_hello(const std::string& host, const ns_tls_probe_profile_t& profile)
+{
+    std::vector<std::uint8_t> body;
+    ns_tls_put_u16(body, profile.client_version);
+    ns_tls_random_bytes(body, 32, static_cast<std::uint8_t>(profile.label.size()));
+    std::vector<std::uint8_t> session;
+    ns_tls_random_bytes(session, 32, 0x31);
+    body.push_back(static_cast<std::uint8_t>(session.size()));
+    body.insert(body.end(), session.begin(), session.end());
+    std::vector<std::uint16_t> ciphers = profile.ciphers.empty()
+        ? std::vector<std::uint16_t>{0x1302, 0x1301, 0x1303, 0xc02f, 0xc030, 0xcca8, 0xcca9, 0x009e, 0x009f, 0x003c, 0x003d, 0x002f, 0x0035}
+        : profile.ciphers;
+    if (profile.grease)
+        ciphers.insert(ciphers.begin(), 0x0a0a);
+    ns_tls_put_u16(body, static_cast<std::uint16_t>(ciphers.size() * 2));
+    for (std::uint16_t cipher : ciphers)
+        ns_tls_put_u16(body, cipher);
+    const auto compressions = profile.compressions.empty() ? std::vector<std::uint8_t>{0} : profile.compressions;
+    body.push_back(static_cast<std::uint8_t>(compressions.size()));
+    body.insert(body.end(), compressions.begin(), compressions.end());
+    std::vector<std::uint8_t> extensions;
+    if (profile.grease)
+        ns_tls_add_extension(extensions, 0x0a0a, {});
+    if (profile.sni && !host.empty()) {
+        std::vector<std::uint8_t> sni;
+        std::vector<std::uint8_t> hn(host.begin(), host.end());
+        ns_tls_put_u16(sni, static_cast<std::uint16_t>(hn.size() + 3));
+        sni.push_back(0);
+        ns_tls_put_u16(sni, static_cast<std::uint16_t>(hn.size()));
+        sni.insert(sni.end(), hn.begin(), hn.end());
+        ns_tls_add_extension(extensions, 0, sni);
+    }
+    ns_tls_add_extension(extensions, 23, {});
+    ns_tls_add_extension(extensions, 1, {1});
+    ns_tls_add_extension(extensions, 0xff01, {0});
+    ns_tls_add_extension(extensions, 10, {0x00, 0x08, 0x00, 0x1d, 0x00, 0x17, 0x00, 0x18, 0x00, 0x19});
+    ns_tls_add_extension(extensions, 11, {0x01, 0x00});
+    ns_tls_add_extension(extensions, 35, {});
+    if (profile.alpn)
+        ns_tls_add_extension(extensions, 16, ns_tls_alpn_payload(profile.rare_alpn, profile.alpn_order));
+    ns_tls_add_extension(extensions, 13, {0x00, 0x12, 0x04, 0x03, 0x08, 0x04, 0x04, 0x01, 0x05, 0x03, 0x08, 0x05, 0x05, 0x01, 0x08, 0x06, 0x06, 0x01, 0x02, 0x01});
+    if (profile.heartbeat)
+        ns_tls_add_extension(extensions, 15, {1});
+    if (profile.key_share)
+        ns_tls_add_extension(extensions, 51, ns_tls_key_share_payload(profile.grease));
+    if (profile.psk_modes)
+        ns_tls_add_extension(extensions, 45, {0x01, 0x01});
+    if (!profile.supported_versions.empty())
+        ns_tls_add_extension(extensions, 43, ns_tls_supported_versions_payload(profile.supported_versions, profile.version_order, profile.grease));
+    ns_tls_put_u16(body, static_cast<std::uint16_t>(extensions.size()));
+    body.insert(body.end(), extensions.begin(), extensions.end());
+    std::vector<std::uint8_t> handshake;
+    handshake.push_back(1);
+    ns_tls_put_u24(handshake, static_cast<std::uint32_t>(body.size()));
+    handshake.insert(handshake.end(), body.begin(), body.end());
+    std::vector<std::uint8_t> record;
+    record.push_back(0x16);
+    ns_tls_put_u16(record, profile.record_version);
+    ns_tls_put_u16(record, static_cast<std::uint16_t>(handshake.size()));
+    record.insert(record.end(), handshake.begin(), handshake.end());
+    return record;
+}
+
+static bool ns_tls_parse_server_hello(const std::vector<std::uint8_t>& data, std::size_t offset, std::size_t length, ns_tls_probe_result_t& result)
+{
+    if (offset + length > data.size() || length < 38)
+        return false;
+    std::size_t p = offset;
+    result.server_version = static_cast<std::uint16_t>((data[p] << 8) | data[p + 1]);
+    p += 2 + 32;
+    if (p >= offset + length)
+        return false;
+    const std::uint8_t sid_len = data[p++];
+    if (p + sid_len + 3 > offset + length)
+        return false;
+    p += sid_len;
+    result.cipher_suite = static_cast<std::uint16_t>((data[p] << 8) | data[p + 1]);
+    p += 2;
+    result.compression = data[p++];
+    if (p + 2 <= offset + length) {
+        const std::size_t ext_len = (static_cast<std::size_t>(data[p]) << 8) | data[p + 1];
+        p += 2;
+        const std::size_t ext_end = std::min<std::size_t>(offset + length, p + ext_len);
+        while (p + 4 <= ext_end) {
+            const std::uint16_t type = static_cast<std::uint16_t>((data[p] << 8) | data[p + 1]);
+            const std::size_t elen = (static_cast<std::size_t>(data[p + 2]) << 8) | data[p + 3];
+            p += 4;
+            result.extensions.push_back(type);
+            if (type == 43 && elen >= 2 && p + 2 <= ext_end)
+                result.selected_version = static_cast<std::uint16_t>((data[p] << 8) | data[p + 1]);
+            if (type == 15)
+                result.heartbeat_extension = true;
+            if (type == 16 && elen >= 3 && p + elen <= ext_end) {
+                std::size_t ap = p;
+                const std::size_t list_len = (static_cast<std::size_t>(data[ap]) << 8) | data[ap + 1];
+                ap += 2;
+                if (ap < p + elen && list_len + 2 <= elen) {
+                    const std::size_t one_len = data[ap++];
+                    if (ap + one_len <= p + elen)
+                        result.alpn.assign(reinterpret_cast<const char*>(data.data() + ap), reinterpret_cast<const char*>(data.data() + ap + one_len));
+                }
+            }
+            if (p + elen > ext_end)
+                break;
+            p += elen;
+        }
+    }
+    result.got_server_hello = true;
+    return true;
+}
+
+static void ns_tls_parse_records(const std::vector<std::uint8_t>& data, ns_tls_probe_result_t& result)
+{
+    std::size_t offset = 0;
+    while (offset + 5 <= data.size()) {
+        const std::uint8_t type = data[offset];
+        const std::uint16_t version = static_cast<std::uint16_t>((data[offset + 1] << 8) | data[offset + 2]);
+        const std::size_t length = (static_cast<std::size_t>(data[offset + 3]) << 8) | data[offset + 4];
+        offset += 5;
+        if (offset + length > data.size())
+            break;
+        result.record_version = version;
+        if (type == 21 && length >= 2) {
+            result.got_alert = true;
+            result.alert_level = data[offset];
+            result.alert_description = data[offset + 1];
+        } else if (type == 22) {
+            std::size_t hp = offset;
+            const std::size_t end = offset + length;
+            while (hp + 4 <= end) {
+                const std::uint8_t htype = data[hp++];
+                const std::size_t hlen = (static_cast<std::size_t>(data[hp]) << 16) | (static_cast<std::size_t>(data[hp + 1]) << 8) | data[hp + 2];
+                hp += 3;
+                if (hp + hlen > end)
+                    break;
+                if (htype == 2)
+                    ns_tls_parse_server_hello(data, hp, hlen, result);
+                if (htype == 14)
+                    result.server_hello_done = true;
+                hp += hlen;
+            }
+        }
+        offset += length;
+    }
+}
+
+static ns_tls_probe_result_t ns_tls_raw_probe(const std::string& host,
+                                              std::uint16_t port,
+                                              const ns_tls_probe_profile_t& profile,
+                                              DWORD timeout,
+                                              std::size_t max_bytes,
+                                              bool read_until_server_hello_done = false)
+{
+    ns_tls_probe_result_t result;
+    result.label = profile.label;
+    const std::uint64_t started = GetTickCount64();
+    SOCKET s = INVALID_SOCKET;
+    std::string error;
+    if (!ns_tls_connect_socket(host, port, timeout, s, error)) {
+        result.error = error;
+        result.elapsed_ms = GetTickCount64() - started;
+        return result;
+    }
+    result.connected = true;
+    const auto hello = ns_tls_build_client_hello(host, profile);
+    if (!ns_tls_send_all(s, hello.data(), hello.size(), timeout, error)) {
+        result.error = error;
+        result.elapsed_ms = GetTickCount64() - started;
+        closesocket(s);
+        return result;
+    }
+    result.sent = true;
+    std::vector<std::uint8_t> data;
+    while (!ns_tls_cancelled_or_deadline() && data.size() < max_bytes) {
+        std::string recv_error;
+        if (!ns_tls_recv_some(s, data, ns_tls_timeout_ms(std::min<DWORD>(timeout, 2500)), std::min<std::size_t>(8192, max_bytes - data.size()), recv_error)) {
+            if (data.empty())
+                result.error = recv_error;
+            break;
+        }
+        ns_tls_parse_records(data, result);
+        if (result.got_alert || (result.got_server_hello && (!read_until_server_hello_done || result.server_hello_done)))
+            break;
+    }
+    result.bytes_received = data.size();
+    result.elapsed_ms = GetTickCount64() - started;
+    closesocket(s);
+    return result;
+}
+
+static std::string ns_tls_version_name(std::uint16_t version)
+{
+    switch (version) {
+    case 0x0300: return "SSL 3.0";
+    case 0x0301: return "TLS 1.0";
+    case 0x0302: return "TLS 1.1";
+    case 0x0303: return "TLS 1.2";
+    case 0x0304: return "TLS 1.3";
+    default: return ns_tls_hex_u16(version);
+    }
+}
+
+static std::string ns_tls_cipher_name(std::uint16_t cipher)
+{
+    switch (cipher) {
+    case 0x1301: return "TLS_AES_128_GCM_SHA256";
+    case 0x1302: return "TLS_AES_256_GCM_SHA384";
+    case 0x1303: return "TLS_CHACHA20_POLY1305_SHA256";
+    case 0xc02b: return "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256";
+    case 0xc02c: return "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384";
+    case 0xc02f: return "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256";
+    case 0xc030: return "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384";
+    case 0xcca8: return "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256";
+    case 0xcca9: return "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256";
+    case 0x009e: return "TLS_DHE_RSA_WITH_AES_128_GCM_SHA256";
+    case 0x009f: return "TLS_DHE_RSA_WITH_AES_256_GCM_SHA384";
+    case 0x003c: return "TLS_RSA_WITH_AES_128_CBC_SHA256";
+    case 0x003d: return "TLS_RSA_WITH_AES_256_CBC_SHA256";
+    case 0x002f: return "TLS_RSA_WITH_AES_128_CBC_SHA";
+    case 0x0035: return "TLS_RSA_WITH_AES_256_CBC_SHA";
+    case 0x000a: return "TLS_RSA_WITH_3DES_EDE_CBC_SHA";
+    default: return ns_tls_hex_u16(cipher);
+    }
+}
+
+static std::string ns_tls_cipher_strength(std::uint16_t cipher)
+{
+    const std::string name = ns_lower_copy(ns_tls_cipher_name(cipher));
+    if (name.find("null") != std::string::npos || name.find("anon") != std::string::npos ||
+        name.find("export") != std::string::npos || name.find("rc4") != std::string::npos ||
+        name.find("3des") != std::string::npos)
+        return "weak";
+    if (name.find("cbc") != std::string::npos)
+        return "legacy";
+    if (name.find("gcm") != std::string::npos || name.find("chacha20") != std::string::npos)
+        return "strong";
+    return "unknown";
+}
+
+static json ns_tls_probe_json(const ns_tls_probe_result_t& result)
+{
+    json out;
+    out["label"] = result.label;
+    out["connected"] = result.connected;
+    out["sent"] = result.sent;
+    out["got_server_hello"] = result.got_server_hello;
+    out["server_hello_done"] = result.server_hello_done;
+    out["got_alert"] = result.got_alert;
+    out["bytes_received"] = static_cast<std::uint64_t>(result.bytes_received);
+    out["elapsed_ms"] = result.elapsed_ms;
+    if (!result.error.empty())
+        out["error"] = result.error;
+    if (result.got_alert) {
+        out["alert_level"] = result.alert_level;
+        out["alert_description"] = result.alert_description;
+    }
+    if (result.got_server_hello) {
+        const std::uint16_t version = result.selected_version ? result.selected_version : result.server_version;
+        out["server_version"] = ns_tls_version_name(result.server_version);
+        out["selected_version"] = ns_tls_version_name(version);
+        out["cipher_suite"] = ns_tls_cipher_name(result.cipher_suite);
+        out["cipher_suite_code"] = ns_tls_hex_u16(result.cipher_suite);
+        out["cipher_strength"] = ns_tls_cipher_strength(result.cipher_suite);
+        out["compression"] = result.compression;
+        out["heartbeat_extension"] = result.heartbeat_extension;
+        if (!result.alpn.empty())
+            out["alpn"] = result.alpn;
+        out["extensions"] = json::array();
+        for (std::uint16_t ext : result.extensions)
+            out["extensions"].push_back(ns_tls_hex_u16(ext));
+    }
+    return out;
+}
+
+static ns_tls_probe_profile_t ns_tls_assess_profile(std::string label, std::uint16_t version, std::vector<std::uint16_t> supported = {})
+{
+    ns_tls_probe_profile_t p;
+    p.label = std::move(label);
+    p.record_version = version <= 0x0301 ? 0x0301 : 0x0303;
+    p.client_version = version;
+    p.supported_versions = std::move(supported);
+    p.alpn = true;
+    p.ciphers = {0x1301, 0x1302, 0x1303, 0xc02f, 0xc030, 0xc02b, 0xc02c, 0xcca8, 0xcca9, 0x009e, 0x009f, 0x003c, 0x003d, 0x002f, 0x0035, 0x000a};
+    return p;
+}
+
+static long long ns_filetime_days_remaining(const FILETIME& ft)
+{
+    FILETIME now_ft{};
+    GetSystemTimeAsFileTime(&now_ft);
+    ULARGE_INTEGER due{};
+    ULARGE_INTEGER now{};
+    due.LowPart = ft.dwLowDateTime;
+    due.HighPart = ft.dwHighDateTime;
+    now.LowPart = now_ft.dwLowDateTime;
+    now.HighPart = now_ft.dwHighDateTime;
+    if (due.QuadPart >= now.QuadPart)
+        return static_cast<long long>((due.QuadPart - now.QuadPart) / 10000000ull) / 86400;
+    return -static_cast<long long>((now.QuadPart - due.QuadPart) / 10000000ull) / 86400;
+}
+
+static json ns_cert_context_json(PCCERT_CONTEXT cert, const std::string& host, bool check_chain)
+{
+    json out;
+    char subject[512] = {};
+    char issuer[512] = {};
+    CertGetNameStringA(cert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr, subject, static_cast<DWORD>(sizeof(subject)));
+    CertGetNameStringA(cert, CERT_NAME_SIMPLE_DISPLAY_TYPE, CERT_NAME_ISSUER_FLAG, nullptr, issuer, static_cast<DWORD>(sizeof(issuer)));
+    out["subject"] = subject;
+    out["issuer"] = issuer;
+    out["der_bytes"] = cert->cbCertEncoded;
+    out["sha256"] = ns_tls_sha256_hex(std::string(reinterpret_cast<const char*>(cert->pbCertEncoded), reinterpret_cast<const char*>(cert->pbCertEncoded + cert->cbCertEncoded)));
+    out["days_remaining"] = ns_filetime_days_remaining(cert->pCertInfo->NotAfter);
+    if (check_chain) {
+        CERT_CHAIN_PARA chain_para{};
+        chain_para.cbSize = sizeof(chain_para);
+        PCCERT_CHAIN_CONTEXT chain = nullptr;
+        DWORD chain_flags = CERT_CHAIN_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT | CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL;
+        bool chain_ok = CertGetCertificateChain(nullptr, cert, nullptr, cert->hCertStore, &chain_para, chain_flags, nullptr, &chain) && chain;
+        DWORD policy_error = 0;
+        if (chain_ok) {
+            const std::wstring whost = ns_utf8_to_wide(host);
+            SSL_EXTRA_CERT_CHAIN_POLICY_PARA ssl_para{};
+            ssl_para.cbSize = sizeof(ssl_para);
+            ssl_para.dwAuthType = AUTHTYPE_SERVER;
+            ssl_para.pwszServerName = const_cast<LPWSTR>(whost.c_str());
+            CERT_CHAIN_POLICY_PARA policy_para{};
+            policy_para.cbSize = sizeof(policy_para);
+            policy_para.pvExtraPolicyPara = &ssl_para;
+            CERT_CHAIN_POLICY_STATUS policy_status{};
+            policy_status.cbSize = sizeof(policy_status);
+            if (!CertVerifyCertificateChainPolicy(CERT_CHAIN_POLICY_SSL, chain, &policy_para, &policy_status))
+                policy_error = GetLastError();
+            else
+                policy_error = policy_status.dwError;
+            CertFreeCertificateChain(chain);
+        } else {
+            policy_error = GetLastError();
+        }
+        out["chain_checked"] = true;
+        out["chain_valid"] = chain_ok && policy_error == 0;
+        out["chain_policy_error"] = policy_error;
+    } else {
+        out["chain_checked"] = false;
+    }
+    return out;
+}
+
+static long long ns_hsts_max_age(const std::string& value)
+{
+    const std::string lower = ns_lower_copy(value);
+    const std::string marker = "max-age=";
+    const std::size_t pos = lower.find(marker);
+    if (pos == std::string::npos)
+        return -1;
+    std::size_t p = pos + marker.size();
+    long long out = 0;
+    bool any = false;
+    while (p < lower.size() && std::isdigit(static_cast<unsigned char>(lower[p]))) {
+        any = true;
+        out = out * 10 + (lower[p] - '0');
+        ++p;
+    }
+    return any ? out : -1;
+}
+
+static json ns_hsts_json(const std::string& value)
+{
+    const std::string lower = ns_lower_copy(value);
+    json out;
+    out["present"] = !value.empty();
+    if (!value.empty())
+        out["value"] = value;
+    out["max_age"] = value.empty() ? 0 : ns_hsts_max_age(value);
+    out["include_subdomains"] = lower.find("includesubdomains") != std::string::npos;
+    out["preload"] = lower.find("preload") != std::string::npos;
+    out["status"] = value.empty() ? "warn" : (out["max_age"].get<long long>() >= 31536000 && out["include_subdomains"].get<bool>() ? "pass" : "warn");
+    return out;
+}
+
+static json ns_winhttp_tls_assess(const std::string& host, std::uint16_t port, bool check_chain)
+{
+    json out;
+    out["source"] = "winhttp_certificate_context";
+    const std::wstring whost = ns_utf8_to_wide(host);
+    HINTERNET session = WinHttpOpen(L"AiDA-TLSAssess/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!session) {
+        out["error"] = "WinHttpOpen failed";
+        out["gle"] = GetLastError();
+        return out;
+    }
+    DWORD timeout = ns_tls_timeout_ms(6000);
+    WinHttpSetTimeouts(session, timeout, timeout, timeout, timeout);
+    HINTERNET connect = WinHttpConnect(session, whost.c_str(), static_cast<INTERNET_PORT>(port), 0);
+    if (!connect) {
+        out["error"] = "WinHttpConnect failed";
+        out["gle"] = GetLastError();
+        WinHttpCloseHandle(session);
+        return out;
+    }
+    HINTERNET request = WinHttpOpenRequest(connect, L"HEAD", L"/", nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    if (!request) {
+        out["error"] = "WinHttpOpenRequest failed";
+        out["gle"] = GetLastError();
+        WinHttpCloseHandle(connect);
+        WinHttpCloseHandle(session);
+        return out;
+    }
+    WinHttpSetTimeouts(request, timeout, timeout, timeout, timeout);
+    if (!WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+        !WinHttpReceiveResponse(request, nullptr)) {
+        out["error"] = "WinHttpSendRequest/ReceiveResponse failed";
+        out["gle"] = GetLastError();
+        WinHttpCloseHandle(request);
+        WinHttpCloseHandle(connect);
+        WinHttpCloseHandle(session);
+        return out;
+    }
+    DWORD status = 0;
+    DWORD status_len = sizeof(status);
+    if (WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, nullptr, &status, &status_len, nullptr))
+        out["http_status"] = status;
+    DWORD header_len = 0;
+    WinHttpQueryHeaders(request, WINHTTP_QUERY_RAW_HEADERS_CRLF, WINHTTP_HEADER_NAME_BY_INDEX, nullptr, &header_len, WINHTTP_NO_HEADER_INDEX);
+    std::string hsts;
+    if (GetLastError() == ERROR_INSUFFICIENT_BUFFER && header_len > 0 && header_len < 65536) {
+        std::wstring raw(header_len / sizeof(wchar_t), L'\0');
+        if (WinHttpQueryHeaders(request, WINHTTP_QUERY_RAW_HEADERS_CRLF, WINHTTP_HEADER_NAME_BY_INDEX, raw.data(), &header_len, WINHTTP_NO_HEADER_INDEX)) {
+            std::string headers = ns_lower_copy(ns_wide_to_utf8(raw));
+            const std::string marker = "strict-transport-security:";
+            const std::size_t pos = headers.find(marker);
+            if (pos != std::string::npos) {
+                std::size_t start = pos + marker.size();
+                while (start < headers.size() && (headers[start] == ' ' || headers[start] == '\t'))
+                    ++start;
+                const std::size_t end = headers.find_first_of("\r\n", start);
+                hsts = headers.substr(start, end == std::string::npos ? std::string::npos : end - start);
+            }
+        }
+    }
+    out["hsts"] = ns_hsts_json(hsts);
+    PCCERT_CONTEXT cert = nullptr;
+    DWORD cert_len = sizeof(cert);
+    if (WinHttpQueryOption(request, WINHTTP_OPTION_SERVER_CERT_CONTEXT, &cert, &cert_len) && cert) {
+        out["certificate"] = ns_cert_context_json(cert, host, check_chain);
+        CertFreeCertificateContext(cert);
+    } else {
+        out["certificate_error"] = GetLastError();
+    }
+    WinHttpCloseHandle(request);
+    WinHttpCloseHandle(connect);
+    WinHttpCloseHandle(session);
+    return out;
+}
+
 static void ns_apply_proxy_observations(cert_intercept::diagnostic_context_t& context) {
     auto observations = mitm_proxy::get_tls_observations(64);
     for (const auto& obs : observations) {
@@ -865,6 +1736,477 @@ static std::string ns_get_downloads_folder() {
     if (len > 0 && len < MAX_PATH)
         return std::string(buf, len) + "\\Downloads";
     return ".";
+}
+
+static tool_result_t aida_tls_assess(const json& params)
+{
+    if (!params.is_object() || !params.contains("host") || !params["host"].is_string())
+        return tool_result_t::error("host is required");
+    const std::string host = params["host"].get<std::string>();
+    if (!ns_tls_valid_host(host))
+        return tool_result_t::error("host is invalid");
+    std::uint16_t port = 443;
+    if (!ns_json_u16_param(params, "port", port, 443))
+        return tool_result_t::error("port must be 1..65535");
+    const DWORD timeout = static_cast<DWORD>(std::max(500, std::min(params.value("timeout_ms", 7000), 15000)));
+    json out;
+    out["host"] = host;
+    out["port"] = port;
+    out["bounded"] = true;
+    out["global_tls_policy_modified"] = false;
+    out["persisted_findings"] = false;
+    out["protocol_probes"] = json::array();
+    std::vector<ns_tls_probe_profile_t> profiles;
+    profiles.push_back(ns_tls_assess_profile("tls10", 0x0301));
+    profiles.push_back(ns_tls_assess_profile("tls11", 0x0302));
+    profiles.push_back(ns_tls_assess_profile("tls12", 0x0303));
+    profiles.push_back(ns_tls_assess_profile("tls13", 0x0303, {0x0304, 0x0303}));
+    bool weak_protocol = false;
+    bool modern_protocol = false;
+    bool weak_cipher = false;
+    bool legacy_cipher = false;
+    json protocols = json::array();
+    json ciphers = json::array();
+    std::set<std::uint16_t> seen_ciphers;
+    for (const auto& profile : profiles) {
+        if (ns_tls_cancelled_or_deadline()) {
+            out["cancelled"] = mcp_standalone::current_call_cancelled();
+            out["deadline_expired"] = !mcp_standalone::current_call_cancelled();
+            return tool_result_t::error("TLS assessment cancelled or deadline reached", "cancelled", out);
+        }
+        auto probe = ns_tls_raw_probe(host, port, profile, timeout, 32768);
+        out["protocol_probes"].push_back(ns_tls_probe_json(probe));
+        const std::uint16_t selected = probe.selected_version ? probe.selected_version : probe.server_version;
+        json protocol;
+        protocol["probe"] = profile.label;
+        protocol["name"] = selected ? ns_tls_version_name(selected) : ns_tls_version_name(profile.client_version);
+        protocol["enabled"] = probe.got_server_hello;
+        protocol["evidence"] = probe.got_server_hello ? "server_hello" : (probe.got_alert ? "alert" : "no_server_hello");
+        if (probe.got_server_hello) {
+            if (selected == 0x0301 || selected == 0x0302)
+                weak_protocol = true;
+            if (selected == 0x0303 || selected == 0x0304)
+                modern_protocol = true;
+            if (seen_ciphers.insert(probe.cipher_suite).second) {
+                json cipher;
+                cipher["name"] = ns_tls_cipher_name(probe.cipher_suite);
+                cipher["code"] = ns_tls_hex_u16(probe.cipher_suite);
+                cipher["strength"] = ns_tls_cipher_strength(probe.cipher_suite);
+                cipher["pfs"] = cipher["name"].get<std::string>().find("ECDHE") != std::string::npos ||
+                                cipher["name"].get<std::string>().find("DHE") != std::string::npos ||
+                                cipher["name"].get<std::string>().rfind("TLS_AES_", 0) == 0 ||
+                                cipher["name"].get<std::string>().rfind("TLS_CHACHA20_", 0) == 0;
+                ciphers.push_back(std::move(cipher));
+            }
+            const std::string strength = ns_tls_cipher_strength(probe.cipher_suite);
+            weak_cipher = weak_cipher || strength == "weak";
+            legacy_cipher = legacy_cipher || strength == "legacy";
+        }
+        protocols.push_back(std::move(protocol));
+    }
+    out["protocols"] = protocols;
+    out["cipher_suites"] = ciphers;
+    out["certificate_assessment"] = ns_winhttp_tls_assess(host, port, params.value("check_chain", true));
+    out["certificate"] = out["certificate_assessment"].value("certificate", json::object());
+    out["hsts"] = out["certificate_assessment"].value("hsts", ns_hsts_json({}));
+    json issues = json::array();
+    int score = 100;
+    if (weak_protocol) {
+        score -= 25;
+        issues.push_back({{"severity", "high"}, {"description", "TLS 1.0 or TLS 1.1 was negotiated by a bounded probe"}, {"cwe", "CWE-327"}});
+    }
+    if (!modern_protocol) {
+        score -= 20;
+        issues.push_back({{"severity", "high"}, {"description", "No TLS 1.2 or TLS 1.3 ServerHello evidence was observed"}, {"cwe", "CWE-326"}});
+    }
+    if (weak_cipher) {
+        score -= 20;
+        issues.push_back({{"severity", "high"}, {"description", "A weak cipher suite was negotiated"}, {"cwe", "CWE-327"}});
+    } else if (legacy_cipher) {
+        score -= 10;
+        issues.push_back({{"severity", "medium"}, {"description", "A legacy CBC cipher suite was negotiated"}, {"cwe", "CWE-327"}});
+    }
+    const json certificate = out["certificate"];
+    if (certificate.is_object() && !certificate.empty()) {
+        if (certificate.value("chain_valid", true) == false) {
+            score -= 20;
+            issues.push_back({{"severity", "high"}, {"description", "Certificate chain or hostname validation failed"}, {"cwe", "CWE-295"}});
+        }
+        if (certificate.value("days_remaining", 1ll) < 0) {
+            score -= 20;
+            issues.push_back({{"severity", "critical"}, {"description", "TLS certificate is expired"}, {"cwe", "CWE-298"}});
+        }
+    } else {
+        score -= 15;
+        issues.push_back({{"severity", "medium"}, {"description", "Certificate context could not be collected with WinHTTP"}, {"cwe", "CWE-295"}});
+    }
+    if (!out["hsts"].value("present", false)) {
+        score -= 5;
+        issues.push_back({{"severity", "medium"}, {"description", "HSTS header was not observed on HTTPS root"}, {"cwe", "CWE-319"}});
+    }
+    score = std::max(0, std::min(score, 100));
+    out["score"] = score;
+    out["grade"] = score >= 90 ? "A" : score >= 70 ? "B" : score >= 50 ? "C" : score >= 30 ? "D" : "F";
+    out["issues"] = issues;
+    out["assessment_limitations"] = "Protocol and cipher evidence comes from bounded raw ClientHello probes. Certificate and HSTS evidence comes from WinHTTP without disabling certificate validation.";
+    return tool_result_t::ok("TLS assessment complete", out);
+}
+
+static std::vector<std::uint16_t> ns_jarm_cipher_list(bool include_tls13)
+{
+    std::vector<std::uint16_t> ciphers = {
+        0x0016, 0x0033, 0x0067, 0xc09e, 0xc0a2, 0x009e, 0x0039, 0x006b, 0xc09f, 0xc0a3,
+        0x009f, 0x0045, 0x00be, 0x0088, 0x00c4, 0x009a, 0xc008, 0xc009, 0xc023, 0xc0ac,
+        0xc0ae, 0xc02b, 0xc00a, 0xc024, 0xc0ad, 0xc0af, 0xc02c, 0xc072, 0xc073, 0xcca9
+    };
+    if (include_tls13) {
+        ciphers.push_back(0x1302);
+        ciphers.push_back(0x1301);
+    }
+    ciphers.insert(ciphers.end(), {
+        0xcc14, 0xc007, 0xc012, 0xc013, 0xc027, 0xc02f, 0xc014, 0xc028, 0xc030, 0xc060,
+        0xc061, 0xc076, 0xc077, 0xcca8
+    });
+    if (include_tls13) {
+        ciphers.push_back(0x1305);
+        ciphers.push_back(0x1304);
+        ciphers.push_back(0x1303);
+    }
+    ciphers.insert(ciphers.end(), {
+        0xcc13, 0xc011, 0x000a, 0x002f, 0x003c, 0xc09c, 0xc0a0, 0x009c, 0x0035, 0x003d,
+        0xc09d, 0xc0a1, 0x009d, 0x0041, 0x00ba, 0x0084, 0x00c0, 0x0007, 0x0004, 0x0005
+    });
+    return ciphers;
+}
+
+static ns_tls_probe_profile_t ns_jarm_profile(std::string label,
+                                              std::uint16_t version,
+                                              bool include_tls13,
+                                              const std::string& cipher_order,
+                                              bool grease,
+                                              bool rare_alpn,
+                                              const std::string& support_mode,
+                                              const std::string& extension_order)
+{
+    ns_tls_probe_profile_t p;
+    p.label = std::move(label);
+    p.record_version = version == 0x0304 ? 0x0301 : version;
+    p.client_version = version == 0x0304 ? 0x0303 : version;
+    p.ciphers = ns_tls_reorder(ns_jarm_cipher_list(include_tls13), cipher_order);
+    p.grease = grease;
+    p.alpn = true;
+    p.rare_alpn = rare_alpn;
+    p.alpn_order = extension_order;
+    p.version_order = extension_order;
+    p.key_share = true;
+    p.psk_modes = true;
+    if (version == 0x0304)
+        p.supported_versions = {0x0301, 0x0302, 0x0303, 0x0304};
+    else if (support_mode == "1.2_SUPPORT")
+        p.supported_versions = {0x0301, 0x0302, 0x0303};
+    else
+        p.supported_versions.clear();
+    return p;
+}
+
+static std::string ns_jarm_cipher_byte(const std::string& cipher_hex)
+{
+    if (cipher_hex.empty())
+        return "00";
+    static const std::vector<std::uint16_t> order = {
+        0x0004, 0x0005, 0x0007, 0x000a, 0x0016, 0x002f, 0x0033, 0x0035, 0x0039, 0x003c,
+        0x003d, 0x0041, 0x0045, 0x0067, 0x006b, 0x0084, 0x0088, 0x009a, 0x009c, 0x009d,
+        0x009e, 0x009f, 0x00ba, 0x00be, 0x00c0, 0x00c4, 0xc007, 0xc008, 0xc009, 0xc00a,
+        0xc011, 0xc012, 0xc013, 0xc014, 0xc023, 0xc024, 0xc027, 0xc028, 0xc02b, 0xc02c,
+        0xc02f, 0xc030, 0xc060, 0xc061, 0xc072, 0xc073, 0xc076, 0xc077, 0xc09c, 0xc09d,
+        0xc09e, 0xc09f, 0xc0a0, 0xc0a1, 0xc0a2, 0xc0a3, 0xc0ac, 0xc0ad, 0xc0ae, 0xc0af,
+        0xcc13, 0xcc14, 0xcca8, 0xcca9, 0x1301, 0x1302, 0x1303, 0x1304, 0x1305
+    };
+    std::uint16_t cipher = 0;
+    try {
+        cipher = static_cast<std::uint16_t>(std::stoul(cipher_hex, nullptr, 16));
+    } catch (...) {
+        return "00";
+    }
+    auto it = std::find(order.begin(), order.end(), cipher);
+    if (it == order.end())
+        return "00";
+    const unsigned value = static_cast<unsigned>(std::distance(order.begin(), it)) + 1u;
+    std::ostringstream os;
+    os << std::hex << std::nouppercase << std::setw(2) << std::setfill('0') << value;
+    return os.str();
+}
+
+static std::string ns_jarm_version_byte(const std::string& version_hex)
+{
+    if (version_hex.size() < 4)
+        return "0";
+    const char c = version_hex[3];
+    if (c < '0' || c > '5')
+        return "0";
+    static constexpr char kOptions[] = "abcdef";
+    return std::string(1, kOptions[c - '0']);
+}
+
+static std::string ns_jarm_segment(const ns_tls_probe_result_t& result)
+{
+    if (!result.got_server_hello)
+        return "|||";
+    std::string extensions;
+    for (std::size_t i = 0; i < result.extensions.size(); ++i) {
+        if (i != 0)
+            extensions.push_back('-');
+        extensions += ns_tls_hex_u16(result.extensions[i]);
+    }
+    return ns_tls_hex_u16(result.cipher_suite) + "|" + ns_tls_hex_u16(result.server_version) + "|" + result.alpn + "|" + extensions;
+}
+
+static std::string ns_jarm_hash(const std::string& raw)
+{
+    if (raw == "|||,|||,|||,|||,|||,|||,|||,|||,|||,|||")
+        return std::string(62, '0');
+    std::vector<std::string> parts;
+    std::size_t start = 0;
+    while (start <= raw.size()) {
+        const std::size_t comma = raw.find(',', start);
+        parts.push_back(raw.substr(start, comma == std::string::npos ? std::string::npos : comma - start));
+        if (comma == std::string::npos)
+            break;
+        start = comma + 1;
+    }
+    std::string fuzzy;
+    std::string ext_material;
+    for (const auto& part : parts) {
+        std::vector<std::string> fields;
+        std::size_t p = 0;
+        while (p <= part.size()) {
+            const std::size_t pipe = part.find('|', p);
+            fields.push_back(part.substr(p, pipe == std::string::npos ? std::string::npos : pipe - p));
+            if (pipe == std::string::npos)
+                break;
+            p = pipe + 1;
+        }
+        while (fields.size() < 4)
+            fields.push_back({});
+        fuzzy += ns_jarm_cipher_byte(fields[0]);
+        fuzzy += ns_jarm_version_byte(fields[1]);
+        ext_material += fields[2];
+        ext_material += fields[3];
+    }
+    const std::string digest = ns_tls_sha256_hex(ext_material);
+    fuzzy += digest.substr(0, 32);
+    return fuzzy;
+}
+
+static tool_result_t aida_tls_jarm(const json& params)
+{
+    if (!params.is_object() || !params.contains("host") || !params["host"].is_string())
+        return tool_result_t::error("host is required");
+    const std::string host = params["host"].get<std::string>();
+    if (!ns_tls_valid_host(host))
+        return tool_result_t::error("host is invalid");
+    std::uint16_t port = 443;
+    if (!ns_json_u16_param(params, "port", port, 443))
+        return tool_result_t::error("port must be 1..65535");
+    const DWORD timeout = static_cast<DWORD>(std::max(500, std::min(params.value("timeout_ms", 6000), 15000)));
+    std::vector<ns_tls_probe_profile_t> queue;
+    queue.push_back(ns_jarm_profile("tls1_2_forward", 0x0303, true, "FORWARD", false, false, "1.2_SUPPORT", "REVERSE"));
+    queue.push_back(ns_jarm_profile("tls1_2_reverse", 0x0303, true, "REVERSE", false, false, "1.2_SUPPORT", "FORWARD"));
+    queue.push_back(ns_jarm_profile("tls1_2_top_half", 0x0303, true, "TOP_HALF", false, false, "NO_SUPPORT", "FORWARD"));
+    queue.push_back(ns_jarm_profile("tls1_2_bottom_half", 0x0303, true, "BOTTOM_HALF", false, true, "NO_SUPPORT", "FORWARD"));
+    queue.push_back(ns_jarm_profile("tls1_2_middle_out", 0x0303, true, "MIDDLE_OUT", true, true, "NO_SUPPORT", "REVERSE"));
+    queue.push_back(ns_jarm_profile("tls1_1_middle_out", 0x0302, true, "FORWARD", false, false, "NO_SUPPORT", "FORWARD"));
+    queue.push_back(ns_jarm_profile("tls1_3_forward", 0x0304, true, "FORWARD", false, false, "1.3_SUPPORT", "REVERSE"));
+    queue.push_back(ns_jarm_profile("tls1_3_reverse", 0x0304, true, "REVERSE", false, false, "1.3_SUPPORT", "FORWARD"));
+    queue.push_back(ns_jarm_profile("tls1_3_invalid", 0x0304, false, "FORWARD", false, false, "1.3_SUPPORT", "FORWARD"));
+    queue.push_back(ns_jarm_profile("tls1_3_middle_out", 0x0304, true, "MIDDLE_OUT", true, false, "1.3_SUPPORT", "REVERSE"));
+    json probes = json::array();
+    std::string raw;
+    for (std::size_t i = 0; i < queue.size(); ++i) {
+        if (ns_tls_cancelled_or_deadline()) {
+            json d{{"host", host}, {"port", port}, {"raw", raw}, {"probes", probes}};
+            d["cancelled"] = mcp_standalone::current_call_cancelled();
+            d["deadline_expired"] = !mcp_standalone::current_call_cancelled();
+            return tool_result_t::error("JARM scan cancelled or deadline reached", "cancelled", d);
+        }
+        auto probe = ns_tls_raw_probe(host, port, queue[i], timeout, 8192);
+        const std::string segment = ns_jarm_segment(probe);
+        if (i != 0)
+            raw.push_back(',');
+        raw += segment;
+        json row = ns_tls_probe_json(probe);
+        row["jarm_segment"] = segment;
+        probes.push_back(std::move(row));
+    }
+    json out;
+    out["host"] = host;
+    out["port"] = port;
+    out["jarm"] = ns_jarm_hash(raw);
+    out["raw"] = raw;
+    out["probes"] = probes;
+    out["probe_count"] = probes.size();
+    out["implementation"] = "salesforce_jarm_v1_compatible_probe_set";
+    out["bounded"] = true;
+    return tool_result_t::ok("JARM fingerprint complete", out);
+}
+
+static bool ns_tls_read_heartbeat_response(SOCKET s, DWORD timeout, json& evidence)
+{
+    std::vector<std::uint8_t> data;
+    std::string error;
+    while (!ns_tls_cancelled_or_deadline() && data.size() < 32768) {
+        if (!ns_tls_recv_some(s, data, ns_tls_timeout_ms(std::min<DWORD>(timeout, 2500)), 8192, error))
+            break;
+        std::size_t offset = 0;
+        while (offset + 5 <= data.size()) {
+            const std::uint8_t record_type = data[offset];
+            const std::uint16_t version = static_cast<std::uint16_t>((data[offset + 1] << 8) | data[offset + 2]);
+            const std::size_t len = (static_cast<std::size_t>(data[offset + 3]) << 8) | data[offset + 4];
+            offset += 5;
+            if (offset + len > data.size())
+                break;
+            if (record_type == 24 && len >= 3) {
+                const std::uint8_t hb_type = data[offset];
+                const std::uint16_t claimed = static_cast<std::uint16_t>((data[offset + 1] << 8) | data[offset + 2]);
+                evidence["record_type"] = record_type;
+                evidence["record_version"] = ns_tls_hex_u16(version);
+                evidence["heartbeat_type"] = hb_type;
+                evidence["claimed_payload_length"] = claimed;
+                evidence["record_payload_bytes"] = len;
+                evidence["bytes_received"] = data.size();
+                return hb_type == 2 && claimed > 1 && len > 20;
+            }
+            if (record_type == 21 && len >= 2) {
+                evidence["alert_level"] = data[offset];
+                evidence["alert_description"] = data[offset + 1];
+                evidence["bytes_received"] = data.size();
+                return false;
+            }
+            offset += len;
+        }
+    }
+    if (!error.empty())
+        evidence["error"] = error;
+    evidence["bytes_received"] = data.size();
+    return false;
+}
+
+static tool_result_t aida_tls_test_heartbleed(const json& params)
+{
+    if (!params.is_object() || !params.contains("host") || !params["host"].is_string())
+        return tool_result_t::error("host is required");
+    const std::string host = params["host"].get<std::string>();
+    if (!ns_tls_valid_host(host))
+        return tool_result_t::error("host is invalid");
+    std::uint16_t port = 443;
+    if (!ns_json_u16_param(params, "port", port, 443))
+        return tool_result_t::error("port must be 1..65535");
+    const DWORD timeout = static_cast<DWORD>(std::max(500, std::min(params.value("timeout_ms", 7000), 15000)));
+    ns_tls_probe_profile_t profile = ns_tls_assess_profile("heartbleed_negotiation", 0x0302);
+    profile.heartbeat = true;
+    profile.supported_versions.clear();
+    profile.ciphers = {0xc02f, 0xc030, 0xc02b, 0xc02c, 0x009e, 0x009f, 0x003c, 0x003d, 0x002f, 0x0035};
+    json out;
+    out["host"] = host;
+    out["port"] = port;
+    out["bounded"] = true;
+    out["probe_type"] = "tls_heartbeat_overread";
+    SOCKET s = INVALID_SOCKET;
+    std::string error;
+    const std::uint64_t started = GetTickCount64();
+    if (!ns_tls_connect_socket(host, port, timeout, s, error)) {
+        out["error"] = error;
+        out["elapsed_ms"] = GetTickCount64() - started;
+        return tool_result_t::error("Heartbleed probe could not connect", "tls_connect_failed", out);
+    }
+    const auto hello = ns_tls_build_client_hello(host, profile);
+    if (!ns_tls_send_all(s, hello.data(), hello.size(), timeout, error)) {
+        out["error"] = error;
+        out["elapsed_ms"] = GetTickCount64() - started;
+        closesocket(s);
+        return tool_result_t::error("Heartbleed probe failed to send ClientHello", "tls_send_failed", out);
+    }
+    std::vector<std::uint8_t> handshake;
+    ns_tls_probe_result_t negotiation;
+    negotiation.label = profile.label;
+    negotiation.connected = true;
+    negotiation.sent = true;
+    while (!ns_tls_cancelled_or_deadline() && handshake.size() < 32768) {
+        std::string recv_error;
+        if (!ns_tls_recv_some(s, handshake, ns_tls_timeout_ms(std::min<DWORD>(timeout, 2500)), 8192, recv_error)) {
+            if (negotiation.error.empty())
+                negotiation.error = recv_error;
+            break;
+        }
+        ns_tls_parse_records(handshake, negotiation);
+        if (negotiation.got_alert || negotiation.server_hello_done || negotiation.heartbeat_extension)
+            break;
+    }
+    negotiation.bytes_received = handshake.size();
+    negotiation.elapsed_ms = GetTickCount64() - started;
+    out["negotiation"] = ns_tls_probe_json(negotiation);
+    if (!negotiation.heartbeat_extension && !params.value("force_probe", false)) {
+        out["vulnerable"] = false;
+        out["status"] = "heartbeat_extension_not_negotiated";
+        out["elapsed_ms"] = GetTickCount64() - started;
+        closesocket(s);
+        return tool_result_t::ok("Heartbleed probe completed; server did not negotiate heartbeat.", out);
+    }
+    std::vector<std::uint8_t> hb;
+    hb.push_back(24);
+    ns_tls_put_u16(hb, negotiation.record_version ? negotiation.record_version : 0x0302);
+    std::vector<std::uint8_t> msg;
+    msg.push_back(1);
+    ns_tls_put_u16(msg, 0x4000);
+    msg.push_back('A');
+    for (int i = 0; i < 16; ++i)
+        msg.push_back(static_cast<std::uint8_t>(i));
+    ns_tls_put_u16(hb, static_cast<std::uint16_t>(msg.size()));
+    hb.insert(hb.end(), msg.begin(), msg.end());
+    if (!ns_tls_send_all(s, hb.data(), hb.size(), timeout, error)) {
+        out["error"] = error;
+        out["elapsed_ms"] = GetTickCount64() - started;
+        closesocket(s);
+        return tool_result_t::error("Heartbleed heartbeat request send failed", "tls_send_failed", out);
+    }
+    json hb_evidence;
+    const bool vulnerable = ns_tls_read_heartbeat_response(s, timeout, hb_evidence);
+    closesocket(s);
+    out["heartbeat_request"] = {{"declared_payload_length", 0x4000}, {"actual_payload_bytes", 1}, {"padding_bytes", 16}};
+    out["heartbeat_response"] = hb_evidence;
+    out["vulnerable"] = vulnerable;
+    out["status"] = vulnerable ? "heartbeat_overread_response_observed" : "no_overread_response_observed";
+    out["elapsed_ms"] = GetTickCount64() - started;
+    return tool_result_t::ok("Heartbleed probe complete", out);
+}
+
+static tool_result_t aida_tls_test_crime(const json& params)
+{
+    if (!params.is_object() || !params.contains("host") || !params["host"].is_string())
+        return tool_result_t::error("host is required");
+    const std::string host = params["host"].get<std::string>();
+    if (!ns_tls_valid_host(host))
+        return tool_result_t::error("host is invalid");
+    std::uint16_t port = 443;
+    if (!ns_json_u16_param(params, "port", port, 443))
+        return tool_result_t::error("port must be 1..65535");
+    const DWORD timeout = static_cast<DWORD>(std::max(500, std::min(params.value("timeout_ms", 6000), 15000)));
+    ns_tls_probe_profile_t profile = ns_tls_assess_profile("crime_tls_compression", 0x0303);
+    profile.supported_versions.clear();
+    profile.compressions = {0, 1};
+    auto probe = ns_tls_raw_probe(host, port, profile, timeout, 32768);
+    json out;
+    out["host"] = host;
+    out["port"] = port;
+    out["bounded"] = true;
+    out["probe"] = ns_tls_probe_json(probe);
+    out["offered_compression_methods"] = json::array({0, 1});
+    out["selected_compression"] = probe.got_server_hello ? json(probe.compression) : json(nullptr);
+    out["vulnerable"] = probe.got_server_hello && probe.compression != 0xff && probe.compression != 0;
+    out["status"] = !probe.got_server_hello ? "no_server_hello" : (out["vulnerable"].get<bool>() ? "tls_compression_negotiated" : "tls_compression_not_negotiated");
+    if (!probe.got_server_hello)
+        return tool_result_t::error("CRIME probe did not receive a ServerHello", "tls_no_server_hello", out);
+    return tool_result_t::ok("CRIME TLS compression probe complete", out);
 }
 
 tool_result_t tls_extract_keys(const json& params) {
@@ -1592,6 +2934,176 @@ tool_result_t quic_extract_keys(const json& params) {
     return tool_result_t::ok(OBFSTR("Extracted ") + std::to_string(keys.size()) + OBFSTR(" QUIC keys"), result);
 }
 
+json quic_observer_stats_json(const mitm_proxy::quic_proxy::quic_proxy_stats& stats) {
+    json r;
+    r["running"] = stats.running;
+    r["listener_count"] = stats.listener_count;
+    r["datagrams"] = stats.datagrams;
+    r["bytes_in"] = stats.bytes_in;
+    r["quic_packets"] = stats.quic_packets;
+    r["non_quic_packets"] = stats.non_quic_packets;
+    r["dropped_unsupported"] = stats.dropped_unsupported;
+    r["parse_errors"] = stats.parse_errors;
+    r["http3_frames"] = stats.http3_frames;
+    r["observation_only"] = stats.observation_only;
+    r["mitm_supported"] = stats.mitm_supported;
+    r["last_error"] = stats.last_error;
+    r["contract"] = stats.contract;
+    r["last_packet_type"] = stats.last_packet_type;
+    r["last_version"] = stats.last_version;
+    r["last_sni"] = stats.last_sni;
+    return r;
+}
+
+json quic_observation_json(const mitm_proxy::quic_proxy::quic_observation& obs) {
+    json r;
+    r["timestamp"] = obs.timestamp;
+    r["listener_id"] = obs.listener_id;
+    r["client_addr"] = obs.client_addr;
+    r["client_port"] = obs.client_port;
+    r["local_port"] = obs.local_port;
+    r["datagram_size"] = obs.datagram_size;
+    r["is_quic"] = obs.is_quic;
+    r["decrypted"] = obs.decrypted;
+    r["tls_client_hello_available"] = obs.tls_client_hello_available;
+    r["http3_frames_available"] = obs.http3_frames_available;
+    r["unsupported_reason"] = obs.unsupported_reason;
+    r["header"] = {
+        {"valid", obs.header.valid},
+        {"is_long_header", obs.header.is_long_header},
+        {"first_byte", obs.header.first_byte},
+        {"version", obs.header.version},
+        {"version_name", obs.header.version_name},
+        {"packet_type", obs.header.packet_type},
+        {"dcid", obs.header.dcid_hex()},
+        {"scid", obs.header.scid_hex()},
+        {"payload_offset", obs.header.payload_offset},
+        {"is_version_negotiation", obs.header.is_version_negotiation}
+    };
+    json versions = json::array();
+    for (const auto version : obs.header.supported_versions)
+        versions.push_back(version);
+    r["header"]["supported_versions"] = std::move(versions);
+    r["sni"] = obs.client_hello.sni;
+    r["alpn_protocols"] = obs.client_hello.alpn_protocols;
+    json frames = json::array();
+    for (const auto& frame : obs.http3_frames) {
+        frames.push_back({
+            {"type", frame.type},
+            {"length", frame.length},
+            {"payload_offset", frame.payload_offset},
+            {"valid", frame.valid}
+        });
+    }
+    r["http3_frames"] = std::move(frames);
+    return r;
+}
+
+tool_result_t quic_observer_start(const json& params) {
+    mitm_proxy::quic_proxy::quic_proxy_config cfg;
+    if (params.contains("bind_addr") && !params["bind_addr"].is_string())
+        return tool_result_t::error(OBFSTR("bind_addr must be a string"));
+    cfg.bind_addr = params.value("bind_addr", std::string("127.0.0.1"));
+    std::string bind_lower = cfg.bind_addr;
+    std::transform(bind_lower.begin(), bind_lower.end(), bind_lower.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (bind_lower.empty() || bind_lower == "localhost" || bind_lower == "::1" || bind_lower == "[::1]") {
+        cfg.bind_addr = "127.0.0.1";
+    } else if (bind_lower == "127.0.0.1") {
+        cfg.bind_addr = "127.0.0.1";
+    } else {
+        return tool_result_t::error(OBFSTR("QUIC observer bind address must be loopback"));
+    }
+    std::uint16_t bind_port = 8443;
+    std::uint16_t origin_port = 443;
+    if (!ns_json_u16_param(params, "bind_port", bind_port, 8443) ||
+        !ns_json_u16_param(params, "expected_origin_port", origin_port, 443))
+        return tool_result_t::error(OBFSTR("Invalid QUIC observer port"));
+    cfg.bind_port = bind_port;
+    cfg.expected_origin_port = origin_port;
+    int max_observations = 512;
+    if (params.contains("max_observations")) {
+        if (!params["max_observations"].is_number_integer() && !params["max_observations"].is_number_unsigned())
+            return tool_result_t::error(OBFSTR("max_observations must be numeric"));
+        if (params["max_observations"].is_number_unsigned()) {
+            const auto raw = params["max_observations"].get<uint64_t>();
+            max_observations = raw > 8192 ? 8192 : static_cast<int>(raw);
+        } else {
+            const auto raw = params["max_observations"].get<int64_t>();
+            if (raw <= 0)
+                return tool_result_t::error(OBFSTR("max_observations must be positive"));
+            max_observations = raw > 8192 ? 8192 : static_cast<int>(raw);
+        }
+    }
+    if (params.contains("fail_closed_without_tls_keys") && !params["fail_closed_without_tls_keys"].is_boolean())
+        return tool_result_t::error(OBFSTR("fail_closed_without_tls_keys must be boolean"));
+    if (params.contains("observation_only") && !params["observation_only"].is_boolean())
+        return tool_result_t::error(OBFSTR("observation_only must be boolean"));
+    cfg.max_observations = static_cast<size_t>(max_observations);
+    cfg.fail_closed_without_tls_keys = params.value("fail_closed_without_tls_keys", true);
+    cfg.observation_only = params.value("observation_only", true);
+    uint64_t listener_id = 0;
+    const bool ok = mitm_proxy::quic_proxy::start(cfg, &listener_id);
+    json r = quic_observer_stats_json(mitm_proxy::quic_proxy::get_stats());
+    r["listener_id"] = listener_id;
+    r["requested_observation_only"] = cfg.observation_only;
+    if (!ok)
+        return tool_result_t::error(OBFSTR("QUIC observer start failed"), r);
+    return tool_result_t::ok(OBFSTR("QUIC observer started"), r);
+}
+
+tool_result_t quic_observer_stop(const json& params) {
+    if (params.contains("listener_id")) {
+        if (!params["listener_id"].is_number_unsigned() && !params["listener_id"].is_number_integer())
+            return tool_result_t::error(OBFSTR("listener_id must be numeric"));
+        uint64_t id = 0;
+        if (params["listener_id"].is_number_unsigned()) {
+            id = params["listener_id"].get<uint64_t>();
+        } else {
+            const int64_t signed_id = params["listener_id"].get<int64_t>();
+            if (signed_id <= 0)
+                return tool_result_t::error(OBFSTR("listener_id must be non-zero"));
+            id = static_cast<uint64_t>(signed_id);
+        }
+        if (id == 0)
+            return tool_result_t::error(OBFSTR("listener_id must be non-zero"));
+        if (!mitm_proxy::quic_proxy::stop(id))
+            return tool_result_t::error(OBFSTR("QUIC observer listener not found"), quic_observer_stats_json(mitm_proxy::quic_proxy::get_stats()));
+    } else {
+        mitm_proxy::quic_proxy::stop_all();
+    }
+    return tool_result_t::ok(OBFSTR("QUIC observer stopped"), quic_observer_stats_json(mitm_proxy::quic_proxy::get_stats()));
+}
+
+tool_result_t quic_observer_stats(const json&) {
+    return tool_result_t::ok(OBFSTR("QUIC observer stats"), quic_observer_stats_json(mitm_proxy::quic_proxy::get_stats()));
+}
+
+tool_result_t quic_observer_observations(const json& params) {
+    size_t limit = 0;
+    if (params.contains("limit")) {
+        if (!params["limit"].is_number_integer() && !params["limit"].is_number_unsigned())
+            return tool_result_t::error(OBFSTR("limit must be numeric"));
+        if (params["limit"].is_number_unsigned()) {
+            limit = static_cast<size_t>(std::min<uint64_t>(params["limit"].get<uint64_t>(), 8192));
+        } else {
+            const int64_t v = params["limit"].get<int64_t>();
+            if (v < 0)
+                return tool_result_t::error(OBFSTR("limit must be non-negative"));
+            limit = static_cast<size_t>(std::min<int64_t>(v, 8192));
+        }
+    }
+    auto observations = mitm_proxy::quic_proxy::get_observations(limit);
+    json arr = json::array();
+    for (const auto& obs : observations)
+        arr.push_back(quic_observation_json(obs));
+    json r = quic_observer_stats_json(mitm_proxy::quic_proxy::get_stats());
+    r["observations"] = std::move(arr);
+    r["count"] = observations.size();
+    return tool_result_t::ok(OBFSTR("QUIC observer observations"), r);
+}
+
 tool_result_t dtls_detect_sessions(const json& params) {
     std::uint32_t pid = params.value("pid", 0u);
     diag::log_tagged_fmt("net_sec", "dtls_detect_sessions entry pid=%u", pid);
@@ -2113,6 +3625,10 @@ tool_result_t pin_bypass(const json&) { return tool_result_t::error("Not support
 tool_result_t quic_detect_connections(const json&) { return tool_result_t::error("Not supported on this platform"); }
 tool_result_t quic_decrypt_initial(const json&) { return tool_result_t::error("Not supported on this platform"); }
 tool_result_t quic_extract_keys(const json&) { return tool_result_t::error("Not supported on this platform"); }
+tool_result_t quic_observer_start(const json&) { return tool_result_t::error("Not supported on this platform"); }
+tool_result_t quic_observer_stop(const json&) { return tool_result_t::error("Not supported on this platform"); }
+tool_result_t quic_observer_stats(const json&) { return tool_result_t::error("Not supported on this platform"); }
+tool_result_t quic_observer_observations(const json&) { return tool_result_t::error("Not supported on this platform"); }
 tool_result_t dtls_detect_sessions(const json&) { return tool_result_t::error("Not supported on this platform"); }
 tool_result_t dtls_extract_keys(const json&) { return tool_result_t::error("Not supported on this platform"); }
 tool_result_t autoresponder_add_rule(const json&) { return tool_result_t::error("Not supported on this platform"); }
@@ -2124,6 +3640,10 @@ tool_result_t autoresponder_stop(const json&) { return tool_result_t::error("Not
 tool_result_t autoresponder_import_rules(const json&) { return tool_result_t::error("Not supported on this platform"); }
 tool_result_t autoresponder_export_rules(const json&) { return tool_result_t::error("Not supported on this platform"); }
 tool_result_t network_decrypt_capture(const json&) { return tool_result_t::error("Not supported on this platform"); }
+static tool_result_t aida_tls_assess(const json&) { return tool_result_t::error("Not supported on this platform"); }
+static tool_result_t aida_tls_jarm(const json&) { return tool_result_t::error("Not supported on this platform"); }
+static tool_result_t aida_tls_test_heartbleed(const json&) { return tool_result_t::error("Not supported on this platform"); }
+static tool_result_t aida_tls_test_crime(const json&) { return tool_result_t::error("Not supported on this platform"); }
 #endif
 
 void register_net_security_tools(mcp_standalone::server_t& srv) {
@@ -2144,6 +3664,48 @@ void register_net_security_tools(mcp_standalone::server_t& srv) {
             return compat_unknown_action("tls_manage", action);
         },
         false});
+
+    srv.register_tool({
+        "aida.tls.assess",
+        "Assess TLS protocol, cipher, certificate, chain, and HSTS evidence with bounded raw ClientHello probes and WinHTTP certificate collection.",
+        {{"host", "string", "TLS server hostname or address.", true},
+         {"port", "number", "TLS port, default 443.", false},
+         {"timeout_ms", "number", "Per-probe timeout bounded by MCP deadline, capped at 15000.", false},
+         {"check_chain", "boolean", "Validate certificate chain and hostname with Windows CryptoAPI cache-only revocation evidence.", false}},
+        true,
+        aida_tls_assess
+    });
+
+    srv.register_tool({
+        "aida.tls.jarm",
+        "Compute a Salesforce JARM v1-compatible active TLS server fingerprint with ten bounded ClientHello probes and per-probe evidence.",
+        {{"host", "string", "TLS server hostname or address.", true},
+         {"port", "number", "TLS port, default 443.", false},
+         {"timeout_ms", "number", "Per-probe timeout bounded by MCP deadline, capped at 15000.", false}},
+        true,
+        aida_tls_jarm
+    });
+
+    srv.register_tool({
+        "aida.tls.test_heartbleed",
+        "Run a bounded TLS heartbeat over-read probe and report negotiated heartbeat, alert, timeout, and over-read evidence without returning leaked payload bytes.",
+        {{"host", "string", "TLS server hostname or address.", true},
+         {"port", "number", "TLS port, default 443.", false},
+         {"timeout_ms", "number", "Probe timeout bounded by MCP deadline, capped at 15000.", false},
+         {"force_probe", "boolean", "Send the malformed heartbeat even if the heartbeat extension is not observed.", false}},
+        false,
+        aida_tls_test_heartbleed
+    });
+
+    srv.register_tool({
+        "aida.tls.test_crime",
+        "Probe TLS-level compression negotiation as CRIME evidence by offering null and DEFLATE compression in a bounded ClientHello.",
+        {{"host", "string", "TLS server hostname or address.", true},
+         {"port", "number", "TLS port, default 443.", false},
+         {"timeout_ms", "number", "Probe timeout bounded by MCP deadline, capped at 15000.", false}},
+        false,
+        aida_tls_test_crime
+    });
 
     register_compat(srv, {
         OBFSTR("cert_manage"), OBFSTR("network_security"),
@@ -2174,11 +3736,19 @@ void register_net_security_tools(mcp_standalone::server_t& srv) {
 
     register_compat(srv, {
         OBFSTR("quic_manage"), OBFSTR("network_security"),
-        OBFSTR("Manage QUIC analysis. Actions: detect_connections, decrypt_initial, extract_keys."),
-        {{OBFSTR("action"), OBFSTR("string"), OBFSTR("detect_connections|decrypt_initial|extract_keys"), true},
+        OBFSTR("Manage QUIC analysis and observation-only UDP listener state. Actions: detect_connections, decrypt_initial, extract_keys, start_observer, stop_observer, observer_stats, observer_observations."),
+        {{OBFSTR("action"), OBFSTR("string"), OBFSTR("detect_connections|decrypt_initial|extract_keys|start_observer|stop_observer|observer_stats|observer_observations"), true},
          {OBFSTR("pid"), OBFSTR("number"), OBFSTR("Target process ID for live detection or deterministic payload attribution."), false},
          {OBFSTR("payload_hex"), OBFSTR("string"), OBFSTR("Optional QUIC UDP payload bytes for deterministic detection without live capture."), false},
          {OBFSTR("packet_hex"), OBFSTR("string"), OBFSTR("Optional QUIC packet bytes for decrypt_initial or deterministic detection."), false},
+         {OBFSTR("bind_addr"), OBFSTR("string"), OBFSTR("Loopback bind address for start_observer."), false},
+         {OBFSTR("bind_port"), OBFSTR("number"), OBFSTR("UDP bind port for start_observer."), false},
+         {OBFSTR("expected_origin_port"), OBFSTR("number"), OBFSTR("Expected original QUIC server port for observation."), false},
+         {OBFSTR("max_observations"), OBFSTR("number"), OBFSTR("Maximum retained observer observations, capped at 8192."), false},
+         {OBFSTR("fail_closed_without_tls_keys"), OBFSTR("boolean"), OBFSTR("Mark encrypted QUIC payloads unsupported when TLS keys are unavailable."), false},
+         {OBFSTR("observation_only"), OBFSTR("boolean"), OBFSTR("Must remain true; full QUIC MITM is not claimed by this observer."), false},
+         {OBFSTR("listener_id"), OBFSTR("number"), OBFSTR("Listener id for stop_observer."), false},
+         {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Maximum observer observations to return."), false},
          {OBFSTR("local_port"), OBFSTR("number"), OBFSTR("Synthetic source port for deterministic payload detection."), false},
          {OBFSTR("remote_port"), OBFSTR("number"), OBFSTR("Synthetic destination port for deterministic payload detection."), false},
          {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
@@ -2188,6 +3758,10 @@ void register_net_security_tools(mcp_standalone::server_t& srv) {
             if (action == "detect_connections") return quic_detect_connections(p);
             if (action == "decrypt_initial") return quic_decrypt_initial(p);
             if (action == "extract_keys") return quic_extract_keys(p);
+            if (action == "start_observer") return quic_observer_start(p);
+            if (action == "stop_observer") return quic_observer_stop(p);
+            if (action == "observer_stats") return quic_observer_stats(p);
+            if (action == "observer_observations") return quic_observer_observations(p);
             return compat_unknown_action("quic_manage", action);
         },
         false});

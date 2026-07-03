@@ -185,6 +185,10 @@ test('camoufox MCP patch config is optional but fails closed when configured uns
     cfg = bootstrap.getCamoufoxMcpPatchConfig();
     assert.equal(cfg.ok, false);
     assert.equal(cfg.reason, 'camoufox_mcp_api_route_disallowed');
+    process.env.AIDA_CAMOUFOX_MCP_URL = 'https://downloads.aidapro.net/bootstrap-artifacts/AiDAStandalone.exe';
+    cfg = bootstrap.getCamoufoxMcpPatchConfig();
+    assert.equal(cfg.ok, false);
+    assert.equal(cfg.reason, 'camoufox_mcp_standalone_executable_disallowed');
     process.env.AIDA_CAMOUFOX_MCP_URL = 'https://downloads.aidapro.net/bootstrap-artifacts/camoufox-mcp.zip';
     cfg = bootstrap.getCamoufoxMcpPatchConfig();
     assert.equal(cfg.ok, false);
@@ -195,6 +199,14 @@ test('camoufox MCP patch config is optional but fails closed when configured uns
     assert.equal(cfg.ok, false);
     assert.equal(cfg.reason, 'camoufox_mcp_sha256_invalid');
     process.env.AIDA_CAMOUFOX_MCP_SHA256 = prevSha;
+});
+
+test('bootstrap artifact guard rejects standalone executable names', () => {
+    assert.equal(bootstrap.forbiddenStandaloneExecutableName('AiDAStandalone.exe'), true);
+    assert.equal(bootstrap.forbiddenStandaloneExecutableName('AiDA.exe'), true);
+    assert.equal(bootstrap.forbiddenStandaloneExecutableName('aidastandalone.exe'), true);
+    assert.equal(bootstrap.forbiddenStandaloneExecutableName('AiDA_CamoufoxReverseMcp-2026.6.10.exe'), false);
+    assert.equal(bootstrap.forbiddenStandaloneExecutableName('aida-camoufox-sidecar-2026.6.8.zip'), false);
 });
 
 test('camoufox relative paths preserve separators across slash-safe and legacy metadata', () => {

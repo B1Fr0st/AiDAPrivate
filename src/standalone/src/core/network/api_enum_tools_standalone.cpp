@@ -421,10 +421,20 @@ json candidate_fields_from_params(const json& params)
         for (const auto& v : params["candidate_fields"]) {
             if (v.is_string()) {
                 const std::string name = v.get<std::string>();
-                if (!name.empty()) custom[name] = fields.contains(name) ? fields[name] : true;
+                if (!name.empty()) {
+                    if (fields.contains(name))
+                        custom[name] = fields[name];
+                    else
+                        custom[name] = true;
+                }
             } else if (v.is_object() && v.contains("name") && v["name"].is_string()) {
                 const std::string name = v["name"].get<std::string>();
-                if (!name.empty()) custom[name] = v.contains("value") ? v["value"] : json(true);
+                if (!name.empty()) {
+                    if (v.contains("value"))
+                        custom[name] = v["value"];
+                    else
+                        custom[name] = true;
+                }
             }
         }
         if (!custom.empty()) fields = std::move(custom);

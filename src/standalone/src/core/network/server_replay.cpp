@@ -78,17 +78,20 @@ bool rule_matches(const match_rule& rule,
     return true;
 }
 
-match_rule rule_from_exchange(const mitm_proxy::http_exchange& flow, bool exact_body)
+match_rule rule_from_exchange(const mitm_proxy::http_exchange& flow, const load_options& options)
 {
     match_rule rule;
     rule.enabled = true;
     rule.label = flow.request.method + " " + flow.target_host + path_query_from_uri(flow.request.uri);
-    rule.method = flow.request.method;
-    rule.scheme = flow.is_tls ? "https" : "http";
+    if (options.match_method)
+        rule.method = flow.request.method;
+    if (options.match_scheme)
+        rule.scheme = flow.is_tls ? "https" : "http";
     rule.host = flow.target_host;
-    rule.port = flow.target_port;
+    if (options.match_port)
+        rule.port = flow.target_port;
     rule.path_query = path_query_from_uri(flow.request.uri);
-    rule.body_mode = exact_body ? body_match_mode::exact : body_match_mode::ignore;
+    rule.body_mode = options.exact_body ? body_match_mode::exact : body_match_mode::ignore;
     rule.request_body = flow.request.body;
     rule.raw_response = flow_serializer::build_raw_response(flow);
     rule.tags = flow.tags;
@@ -120,7 +123,7 @@ size_t load_from_flows(const std::vector<mitm_proxy::http_exchange>& flows, cons
     for (const auto& flow : flows) {
         if (flow.request.method.empty() || flow.target_host.empty() || flow.response.status_code <= 0)
             continue;
-        match_rule rule = rule_from_exchange(flow, options.exact_body);
+        match_rule rule = rule_from_exchange(flow, options);
         rule.id = s.next_id.fetch_add(1, std::memory_order_relaxed);
         s.rules.push_back(std::move(rule));
         ++added;

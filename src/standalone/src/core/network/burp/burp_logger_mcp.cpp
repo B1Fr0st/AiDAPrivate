@@ -49,9 +49,8 @@ json log_row_to_json(const logger::log_row_t& row)
     return out;
 }
 
-logger::log_filter_t build_filter(const json& p)
+void apply_filter(logger::log_filter_t& f, const json& p)
 {
-    logger::log_filter_t f;
     if (p.contains("method") && p["method"].is_string()) f.method = p["method"].get<std::string>();
     if (p.contains("host_regex") && p["host_regex"].is_string()) f.host_regex = p["host_regex"].get<std::string>();
     if (p.contains("url_regex") && p["url_regex"].is_string()) f.url_regex = p["url_regex"].get<std::string>();
@@ -61,6 +60,14 @@ logger::log_filter_t build_filter(const json& p)
     if (p.contains("time_from_ms") && p["time_from_ms"].is_number()) f.time_from_ms = p["time_from_ms"].get<uint64_t>();
     if (p.contains("time_to_ms") && p["time_to_ms"].is_number()) f.time_to_ms = p["time_to_ms"].get<uint64_t>();
     if (p.contains("mime_type") && p["mime_type"].is_string()) f.mime_type = p["mime_type"].get<std::string>();
+}
+
+logger::log_filter_t build_filter(const json& p)
+{
+    logger::log_filter_t f;
+    if (p.contains("filter") && p["filter"].is_object())
+        apply_filter(f, p["filter"]);
+    apply_filter(f, p);
     return f;
 }
 
@@ -68,7 +75,10 @@ tool_result_t handle_query(const json& p)
 {
     diag::log_tagged_fmt("mcp_burp", "logger_query entry");
     size_t limit = 100;
-    if (p.contains("limit") && p["limit"].is_number()) limit = static_cast<size_t>(p["limit"].get<int>());
+    if (p.contains("limit") && p["limit"].is_number())
+        limit = static_cast<size_t>(p["limit"].get<int>());
+    else if (p.contains("filter") && p["filter"].is_object() && p["filter"].contains("limit") && p["filter"]["limit"].is_number())
+        limit = static_cast<size_t>(p["filter"]["limit"].get<int>());
     auto f = build_filter(p);
     auto rows = logger::query(f, limit);
     json arr = json::array();
@@ -112,10 +122,15 @@ tool_result_t handle_export_csv(const json& p)
     diag::log_tagged_fmt("mcp_burp", "logger_export_csv entry");
     if (!p.contains("file_path") || !p["file_path"].is_string() || p["file_path"].get<std::string>().empty())
     {
-        diag::log_tagged_fmt("mcp_burp", "logger_export_csv missing_file_path");
-        return tool_result_t::error("file_path parameter required for export_csv action");
+        if (!p.contains("path") || !p["path"].is_string() || p["path"].get<std::string>().empty())
+        {
+            diag::log_tagged_fmt("mcp_burp", "logger_export_csv missing_file_path");
+            return tool_result_t::error("file_path parameter required for export_csv action");
+        }
     }
-    std::string path = p["file_path"].get<std::string>();
+    std::string path = p.contains("file_path") && p["file_path"].is_string() && !p["file_path"].get<std::string>().empty()
+        ? p["file_path"].get<std::string>()
+        : p["path"].get<std::string>();
     auto f = build_filter(p);
     diag::log_tagged_fmt("mcp_burp", "logger_export_csv path=%s", path.c_str());
     bool ok = logger::export_csv(path, f);
@@ -161,14 +176,15 @@ void register_logger_tools(mcp_standalone::server_t& srv)
 {
     register_compat(srv, {
         "burp_logger_manage", "burp",
-        "Manage the Burp-style HTTP logger. Actions: query, stats, clear, export_csv, set_capacity.",
-        {{"action", "string", "query|stats|clear|export_csv|set_capacity", true},
+        "Manage the Burp-style HTTP logger. Actions: query, stats, total, clear, export_csv, set_capacity.",
+        {{"action", "string", "query|stats|total|clear|export_csv|set_capacity", true},
          {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted.", false}},
         [](const json& params) -> tool_result_t {
             const std::string action = compat_action_name(params);
             const json p = compat_action_payload(params);
             if (action == "query") return handle_query(p);
             if (action == "stats") return handle_stats(p);
+            if (action == "total") return handle_stats(p);
             if (action == "clear") return handle_clear(p);
             if (action == "export_csv") return handle_export_csv(p);
             if (action == "set_capacity") return handle_set_capacity(p);

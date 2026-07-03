@@ -144,68 +144,6 @@ std::string response_raw_from_exchange(const exchange_observed_t& e)
     return os.str();
 }
 
-audit_session_mcp_store::evidence_record_t evidence_record_from_raw(const std::string& session_id,
-                                                          uint64_t issue_id,
-                                                          uint64_t exchange_id,
-                                                          const std::string& source,
-                                                          const std::string& category,
-                                                          const std::string& label,
-                                                          const std::string& request_raw,
-                                                          const std::string& response_raw,
-                                                          const std::string& marker)
-{
-    audit_session_mcp_store::evidence_record_t record;
-    record.session_id = session_id;
-    record.issue_id = issue_id;
-    record.exchange_id = exchange_id;
-    record.source = source.empty() ? std::string("mcp") : source;
-    record.category = category.empty() ? std::string("manual") : category;
-    record.label = label;
-    record.request_length = request_raw.size();
-    record.response_length = response_raw.size();
-    record.request_sha256 = audit_session_mcp_store::hash_for_output(request_raw);
-    record.response_sha256 = audit_session_mcp_store::hash_for_output(response_raw);
-    record.request_preview = truncate_text(audit_session_mcp_store::redact_for_output(request_raw), 4096);
-    record.response_preview = truncate_text(audit_session_mcp_store::redact_for_output(response_raw), 4096);
-    record.marker_length = marker.size();
-    record.marker_sha256 = marker.empty() ? std::string() : audit_session_mcp_store::hash_for_output(marker);
-    record.marker_preview = marker.empty() ? std::string() : truncate_text(audit_session_mcp_store::redact_for_output(marker), 256);
-    return record;
-}
-
-audit_session_mcp_store::evidence_record_t evidence_record_from_exchange(const std::string& session_id,
-                                                               uint64_t issue_id,
-                                                               const exchange_observed_t& e,
-                                                               const std::string& category,
-                                                               const std::string& label)
-{
-    audit_session_mcp_store::evidence_record_t record = evidence_record_from_raw(
-        session_id,
-        issue_id,
-        e.id,
-        e.source.empty() ? std::string("sitemap") : e.source,
-        category,
-        label,
-        request_raw_from_exchange(e),
-        response_raw_from_exchange(e),
-        std::string());
-    record.method = e.method;
-    record.host = e.host;
-    record.port = e.port;
-    record.path = e.path;
-    record.status_code = e.status_code;
-    std::string url = e.scheme.empty() ? std::string("https") : e.scheme;
-    url += "://" + e.host;
-    if (e.port != 0 && !((url.rfind("https://", 0) == 0 && e.port == 443) || (url.rfind("http://", 0) == 0 && e.port == 80)))
-        url += ":" + std::to_string(e.port);
-    url += e.path.empty() ? std::string("/") : e.path;
-    if (!e.query.empty())
-        url += "?" + e.query;
-    record.url = url;
-    record.extra = json{{"latency_ms", e.latency_ms}, {"source", e.source}, {"tls_version", e.tls_version}, {"alpn", e.alpn}};
-    return record;
-}
-
 json evidence_summary_from_issue_evidence(const evidence_t& evidence)
 {
     json out;
@@ -255,7 +193,11 @@ json issue_to_redacted_json(const issue_t& issue, const std::string& session_id,
     out["seen_ms"] = issue.seen_ms;
     out["src_exchange_id"] = issue.src_exchange_id;
     out["audit_id"] = issue.audit_id;
-    out["suppressed"] = issue.suppressed || audit_session_mcp_store::is_suppressed(issue.id, session_id);
+    out["cvss_score"] = issue.cvss_score;
+    out["cvss_vector"] = audit_session_mcp_store::redact_for_output(issue.cvss_vector);
+    out["cvss_severity"] = audit_session_mcp_store::redact_for_output(issue.cvss_severity);
+    out["owasp_category"] = audit_session_mcp_store::redact_for_output(issue.owasp_category);
+    out["suppressed"] = issue.suppressed;
     out["stored_evidence_count"] = audit_session_mcp_store::evidence_count_for_issue(session_id, issue.id);
     if (include_evidence) {
         out["issue_evidence"] = json::array();
@@ -362,12 +304,6 @@ std::vector<issue_t> filtered_issues_for_report_params(const json& params, std::
     }
     std::vector<issue_t> issues = findings_db::list(filter);
     const std::string session_id = session_id_from_params(params);
-    const bool include_suppressed = params.value("include_suppressed", false);
-    if (!include_suppressed) {
-        issues.erase(std::remove_if(issues.begin(), issues.end(), [&](const issue_t& issue) {
-            return audit_session_mcp_store::is_suppressed(issue.id, session_id);
-        }), issues.end());
-    }
     return issues;
 }
 
@@ -396,11 +332,11 @@ tool_result_t tool_findings_suppress(const json& params)
     const std::string reason = params.value("reason", std::string());
     if (reason.empty())
         return tool_result_t::error("reason is required");
-    issue_t issue;
-    if (!issue_store::get(issue_id, issue))
-        return tool_result_t::error("issue not found");
     if (!findings_db::initialize() || !findings_db::mirror_issue_store(false))
         return tool_result_t::error(findings_db::last_error().empty() ? "findings database unavailable" : findings_db::last_error());
+    issue_t issue;
+    if (!findings_db::get(issue_id, issue))
+        return tool_result_t::error("issue not found");
     findings_db::suppression_t db_suppression;
     db_suppression.finding_id = issue_id;
     db_suppression.reason = reason;
@@ -409,42 +345,67 @@ tool_result_t tool_findings_suppress(const json& params)
     db_suppression.create_rule = true;
     if (!findings_db::suppress(db_suppression))
         return tool_result_t::error(findings_db::last_error().empty() ? "finding suppression failed" : findings_db::last_error());
-    audit_session_mcp_store::suppression_t suppression;
-    suppression.session_id = session_id_from_params(params);
-    suppression.issue_id = issue_id;
-    suppression.scope = params.value("scope", std::string("finding"));
-    suppression.reason = reason;
-    suppression.actor = params.value("actor", std::string("mcp"));
-    suppression.issue_type = issue.type_key;
-    suppression.host = issue.host;
-    suppression.path = issue.path;
-    suppression.expires_ms = param_u64(params, "expires_ms");
-    const uint64_t suppression_id = audit_session_mcp_store::suppress_finding(suppression);
+    findings_db::get(issue_id, issue);
     json out;
     out["suppressed"] = true;
-    out["suppression_id"] = suppression_id;
-    out["suppression"] = audit_session_mcp_store::suppression_to_json(suppression);
-    out["suppression"]["id"] = suppression_id;
+    out["suppression_id"] = issue_id;
+    out["suppression"] = json{
+        {"id", issue_id},
+        {"session_id", session_id_from_params(params)},
+        {"issue_id", issue_id},
+        {"scope", params.value("scope", std::string("finding"))},
+        {"reason", audit_session_mcp_store::redact_for_output(reason)},
+        {"actor", audit_session_mcp_store::redact_for_output(params.value("actor", std::string("mcp")))},
+        {"issue_type", audit_session_mcp_store::redact_for_output(issue.type_key)},
+        {"host", issue.host},
+        {"path", audit_session_mcp_store::redact_url_for_output(issue.path)},
+        {"created_ms", issue.suppressed_ms},
+        {"active", issue.suppressed}
+    };
     return tool_result_t::ok(out);
 }
 
-bool persist_evidence_record(uint64_t issue_id,
-                             const std::string& session_id,
-                             uint64_t exchange_id,
-                             const std::string& request_raw,
-                             const std::string& response_raw,
-                             const std::string& marker,
-                             uint64_t marker_offset_request,
-                             uint64_t marker_offset_response,
-                             const std::string& description,
+json merged_metadata(const json& params)
+{
+    json metadata = json::object();
+    if (params.contains("metadata") && params["metadata"].is_object())
+        metadata = params["metadata"];
+    if (params.contains("request_metadata") && params["request_metadata"].is_object())
+        metadata["request"] = params["request_metadata"];
+    if (params.contains("response_metadata") && params["response_metadata"].is_object())
+        metadata["response"] = params["response_metadata"];
+    if (params.contains("exchange_metadata") && params["exchange_metadata"].is_object())
+        metadata["exchange"] = params["exchange_metadata"];
+    metadata["source"] = "aida.web.report.evidence.capture";
+    return metadata;
+}
+
+bool capture_evidence_record(const evidence_store::evidence_capture_t& capture,
+                             evidence_store::evidence_record_t& stored,
                              std::string& error)
 {
-    if (issue_id == 0)
-        return true;
     if (!findings_db::initialize() || !findings_db::mirror_issue_store(false)) {
         error = findings_db::last_error().empty() ? "findings database unavailable" : findings_db::last_error();
         return false;
     }
+    if (!evidence_store::capture(capture, stored)) {
+        error = evidence_store::last_error().empty() ? "evidence capture failed" : evidence_store::last_error();
+        return false;
+    }
+    return true;
+}
+
+evidence_store::evidence_capture_t request_response_capture(const json& params,
+                                                            uint64_t issue_id,
+                                                            const std::string& session_id,
+                                                            uint64_t exchange_id,
+                                                            const std::string& request_raw,
+                                                            const std::string& response_raw,
+                                                            const std::string& marker,
+                                                            uint64_t marker_offset_request,
+                                                            uint64_t marker_offset_response,
+                                                            const std::string& description)
+{
     evidence_store::evidence_capture_t capture;
     capture.finding_id = issue_id;
     capture.session_id = session_id;
@@ -456,13 +417,21 @@ bool persist_evidence_record(uint64_t issue_id,
     capture.marker_offset_request = marker_offset_request;
     capture.marker_offset_response = marker_offset_response;
     capture.description = description;
-    capture.metadata_json = json{{"source", "aida.web.report.evidence.capture"}};
-    evidence_store::evidence_record_t stored;
-    if (!evidence_store::capture(capture, stored)) {
-        error = evidence_store::last_error().empty() ? "evidence capture failed" : evidence_store::last_error();
-        return false;
-    }
-    return true;
+    capture.metadata_json = merged_metadata(params);
+    return capture;
+}
+
+tool_result_t captured_response(const evidence_store::evidence_record_t& stored)
+{
+    json out;
+    out["captured"] = 1;
+    out["stored"] = true;
+    out["evidence_id"] = stored.id;
+    out["finding_id"] = stored.finding_id;
+    out["issue_id"] = stored.finding_id;
+    out["captured_ms"] = stored.captured_ms;
+    out["evidence"] = json::array({evidence_store::summary_json(stored)});
+    return tool_result_t::ok(out);
 }
 
 tool_result_t capture_from_exchange(const json& params, const std::string& session_id, uint64_t issue_id, uint64_t exchange_id)
@@ -473,69 +442,47 @@ tool_result_t capture_from_exchange(const json& params, const std::string& sessi
     const std::string request_raw = request_raw_from_exchange(exchange);
     const std::string response_raw = response_raw_from_exchange(exchange);
     std::string persist_error;
-    if (!persist_evidence_record(issue_id,
-                                 session_id,
-                                 exchange_id,
-                                 request_raw,
-                                 response_raw,
-                                 std::string(),
-                                 0,
-                                 0,
-                                 params.value("label", std::string("captured exchange")),
-                                 persist_error))
+    evidence_store::evidence_record_t stored;
+    auto capture = request_response_capture(params,
+                                            issue_id,
+                                            session_id,
+                                            exchange_id,
+                                            request_raw,
+                                            response_raw,
+                                            std::string(),
+                                            0,
+                                            0,
+                                            params.value("label", std::string("captured exchange")));
+    if (!capture_evidence_record(capture, stored, persist_error))
         return tool_result_t::error(persist_error);
-    audit_session_mcp_store::evidence_record_t record = evidence_record_from_exchange(
-        session_id,
-        issue_id,
-        exchange,
-        params.value("category", std::string("exchange")),
-        params.value("label", std::string()));
-    const uint64_t id = audit_session_mcp_store::store_evidence(record);
-    record.id = id;
-    json out;
-    out["captured"] = 1;
-    out["evidence"] = json::array({audit_session_mcp_store::evidence_to_json(record)});
-    return tool_result_t::ok(out);
+    return captured_response(stored);
 }
 
 tool_result_t capture_from_issue(const json& params, const std::string& session_id, uint64_t issue_id)
 {
     issue_t issue;
-    if (!issue_store::get(issue_id, issue))
+    if (!findings_db::initialize() || !findings_db::mirror_issue_store(false))
+        return tool_result_t::error(findings_db::last_error().empty() ? "findings database unavailable" : findings_db::last_error());
+    if (!findings_db::get(issue_id, issue))
         return tool_result_t::error("issue not found");
     json records = json::array();
     size_t captured = 0;
     for (const auto& evidence : issue.evidence) {
         std::string persist_error;
-        if (!persist_evidence_record(issue_id,
-                                     session_id,
-                                     issue.src_exchange_id,
-                                     evidence.request_raw,
-                                     evidence.response_raw,
-                                     evidence.marker,
-                                     evidence.marker_offset_request,
-                                     evidence.marker_offset_response,
-                                     params.value("label", issue.name),
-                                     persist_error))
+        evidence_store::evidence_record_t stored;
+        auto capture = request_response_capture(params,
+                                                issue_id,
+                                                session_id,
+                                                issue.src_exchange_id,
+                                                evidence.request_raw,
+                                                evidence.response_raw,
+                                                evidence.marker,
+                                                evidence.marker_offset_request,
+                                                evidence.marker_offset_response,
+                                                params.value("label", issue.name));
+        if (!capture_evidence_record(capture, stored, persist_error))
             return tool_result_t::error(persist_error);
-        audit_session_mcp_store::evidence_record_t record = evidence_record_from_raw(
-            session_id,
-            issue_id,
-            issue.src_exchange_id,
-            "issue_store",
-            params.value("category", std::string("issue")),
-            params.value("label", issue.name),
-            evidence.request_raw,
-            evidence.response_raw,
-            evidence.marker);
-        record.method.clear();
-        record.host = issue.host;
-        record.port = issue.port;
-        record.path = issue.path;
-        record.url = issue_url(issue);
-        const uint64_t id = audit_session_mcp_store::store_evidence(record);
-        record.id = id;
-        records.push_back(audit_session_mcp_store::evidence_to_json(record));
+        records.push_back(evidence_store::summary_json(stored));
         ++captured;
     }
     json out;
@@ -551,39 +498,73 @@ tool_result_t capture_from_raw_params(const json& params, const std::string& ses
     if (request_raw.empty() && response_raw.empty())
         return tool_result_t::error("request_raw, response_raw, exchange_id, or issue_id evidence is required");
     std::string persist_error;
-    if (!persist_evidence_record(issue_id,
-                                 session_id,
-                                 0,
-                                 request_raw,
-                                 response_raw,
-                                 params.value("marker", std::string()),
-                                 0,
-                                 0,
-                                 params.value("label", std::string("manual evidence")),
-                                 persist_error))
+    evidence_store::evidence_record_t stored;
+    auto capture = request_response_capture(params,
+                                            issue_id,
+                                            session_id,
+                                            0,
+                                            request_raw,
+                                            response_raw,
+                                            params.value("marker", std::string()),
+                                            0,
+                                            0,
+                                            params.value("label", std::string("manual evidence")));
+    if (params.contains("url") && params["url"].is_string())
+        capture.metadata_json["url"] = audit_session_mcp_store::redact_url_for_output(params["url"].get<std::string>());
+    if (params.contains("host") && params["host"].is_string())
+        capture.metadata_json["host"] = audit_session_mcp_store::redact_for_output(params["host"].get<std::string>());
+    if (params.contains("path") && params["path"].is_string())
+        capture.metadata_json["path"] = audit_session_mcp_store::redact_url_for_output(params["path"].get<std::string>());
+    if (params.contains("method") && params["method"].is_string())
+        capture.metadata_json["method"] = audit_session_mcp_store::redact_for_output(params["method"].get<std::string>());
+    if (params.contains("status_code"))
+        capture.metadata_json["status_code"] = param_u64(params, "status_code");
+    if (!capture_evidence_record(capture, stored, persist_error))
         return tool_result_t::error(persist_error);
-    audit_session_mcp_store::evidence_record_t record = evidence_record_from_raw(
-        session_id,
-        issue_id,
-        0,
-        params.value("source", std::string("manual")),
-        params.value("category", std::string("manual")),
-        params.value("label", std::string()),
-        request_raw,
-        response_raw,
-        params.value("marker", std::string()));
-    record.url = params.value("url", std::string());
-    record.host = params.value("host", std::string());
-    record.path = params.value("path", std::string());
-    record.method = params.value("method", std::string());
-    const uint64_t status_code = param_u64(params, "status_code");
-    record.status_code = status_code <= 999 ? static_cast<int>(status_code) : 0;
-    const uint64_t id = audit_session_mcp_store::store_evidence(record);
-    record.id = id;
-    json out;
-    out["captured"] = 1;
-    out["evidence"] = json::array({audit_session_mcp_store::evidence_to_json(record)});
-    return tool_result_t::ok(out);
+    return captured_response(stored);
+}
+
+tool_result_t capture_file_like(const json& params, const std::string& session_id, uint64_t issue_id, bool screenshot)
+{
+    evidence_store::evidence_capture_t capture;
+    capture.finding_id = issue_id;
+    capture.session_id = session_id;
+    capture.kind = screenshot ? evidence_store::evidence_kind_t::screenshot : evidence_store::evidence_kind_t::file;
+    capture.description = params.value("label", screenshot ? std::string("screenshot evidence") : std::string("file evidence"));
+    capture.metadata_json = merged_metadata(params);
+    capture.source_path = screenshot
+        ? params.value("screenshot_path", std::string())
+        : params.value("file_path", params.value("source_path", std::string()));
+    capture.file_name = params.value("file_name", std::filesystem::path(capture.source_path).filename().string());
+    if (!screenshot && params.contains("file_text") && params["file_text"].is_string()) {
+        const std::string text = params["file_text"].get<std::string>();
+        capture.bytes.assign(text.begin(), text.end());
+        if (capture.file_name.empty())
+            capture.file_name = "evidence.txt";
+    }
+    std::string error;
+    evidence_store::evidence_record_t stored;
+    if (!capture_evidence_record(capture, stored, error))
+        return tool_result_t::error(error);
+    return captured_response(stored);
+}
+
+tool_result_t capture_timing_data(const json& params, const std::string& session_id, uint64_t issue_id)
+{
+    if (!params.contains("timing_data") || !params["timing_data"].is_object())
+        return tool_result_t::error("timing_data object is required");
+    evidence_store::evidence_capture_t capture;
+    capture.finding_id = issue_id;
+    capture.session_id = session_id;
+    capture.kind = evidence_store::evidence_kind_t::timing;
+    capture.timing_json = params["timing_data"];
+    capture.description = params.value("label", std::string("timing evidence"));
+    capture.metadata_json = merged_metadata(params);
+    std::string error;
+    evidence_store::evidence_record_t stored;
+    if (!capture_evidence_record(capture, stored, error))
+        return tool_result_t::error(error);
+    return captured_response(stored);
 }
 
 tool_result_t tool_evidence_capture(const json& params)
@@ -596,6 +577,14 @@ tool_result_t tool_evidence_capture(const json& params)
         return tool_result_t::error("session not found");
     const uint64_t issue_id = param_u64(params, "issue_id");
     const uint64_t exchange_id = param_u64(params, "exchange_id");
+    if (params.contains("screenshot_path") && params["screenshot_path"].is_string())
+        return capture_file_like(params, session_id, issue_id, true);
+    if ((params.contains("file_path") && params["file_path"].is_string()) ||
+        (params.contains("source_path") && params["source_path"].is_string()) ||
+        (params.contains("file_text") && params["file_text"].is_string()))
+        return capture_file_like(params, session_id, issue_id, false);
+    if (params.contains("timing_data"))
+        return capture_timing_data(params, session_id, issue_id);
     if (exchange_id != 0)
         return capture_from_exchange(params, session_id, issue_id, exchange_id);
     if (issue_id != 0)
@@ -624,13 +613,11 @@ tool_result_t tool_report_generate(const json& params)
     report::report_format_t format = report::report_format_t::html;
     if (!report::parse_format(fmt_s, format))
         return tool_result_t::error("unsupported report format; supported formats are markdown, html, json, sarif_2_1_0, and csv");
-    if (!params.contains("output_path") || !params["output_path"].is_string())
-        return tool_result_t::error("output_path is required");
     report::report_config_t cfg;
     cfg.title = params.value("title", std::string("AiDA Web Security Report"));
     cfg.client = params.value("client", std::string());
     cfg.scope_summary = params.value("scope_summary", std::string());
-    cfg.output_path = params["output_path"].get<std::string>();
+    cfg.output_path = params.value("output_path", std::string());
     cfg.format = format;
     cfg.include_evidence = params.value("include_evidence", true);
     cfg.include_remediation = params.value("include_remediation", true);
@@ -669,7 +656,8 @@ tool_result_t tool_report_generate(const json& params)
     size_t issue_count = 0;
     uint64_t newest_ts = 0;
     for (const auto& r : report::list_reports()) {
-        if (r.output_path == out_path && r.ts_ms >= newest_ts) {
+        const bool same_output = cfg.output_path.empty() ? r.inline_output : r.output_path == out_path;
+        if (same_output && r.ts_ms >= newest_ts) {
             report_id = r.id;
             issue_count = r.issue_count;
             newest_ts = r.ts_ms;
@@ -677,12 +665,19 @@ tool_result_t tool_report_generate(const json& params)
     }
     uint64_t bytes_written = 0;
     std::error_code ec;
-    const auto sz = std::filesystem::file_size(out_path, ec);
-    if (!ec)
-        bytes_written = static_cast<uint64_t>(sz);
+    if (!cfg.output_path.empty()) {
+        const auto sz = std::filesystem::file_size(out_path, ec);
+        if (!ec)
+            bytes_written = static_cast<uint64_t>(sz);
+    } else {
+        bytes_written = static_cast<uint64_t>(out_path.size());
+    }
     json out;
     out["report_id"] = report_id;
-    out["output_path"] = out_path;
+    out["output_path"] = cfg.output_path.empty() ? std::string() : out_path;
+    out["inline"] = cfg.output_path.empty();
+    if (cfg.output_path.empty())
+        out["content"] = out_path;
     out["format"] = report::format_label(cfg.format);
     out["issue_count"] = issue_count;
     out["bytes_written"] = bytes_written;
@@ -717,8 +712,80 @@ json recommendations_json(const std::vector<issue_t>& issues)
     return out;
 }
 
+double risk_score_from_counts(const json& counts)
+{
+    const double score =
+        counts.value("critical", 0ull) * 20.0 +
+        counts.value("high", 0ull) * 12.0 +
+        counts.value("medium", 0ull) * 6.0 +
+        counts.value("low", 0ull) * 2.0 +
+        counts.value("info", 0ull) * 0.5;
+    return (std::min)(100.0, score);
+}
+
+std::string risk_posture_from_score(double score)
+{
+    if (score >= 80.0)
+        return "critical";
+    if (score >= 50.0)
+        return "high";
+    if (score >= 25.0)
+        return "moderate";
+    if (score > 0.0)
+        return "low";
+    return "clear";
+}
+
+json compliance_mapping_json(const std::vector<issue_t>& issues)
+{
+    std::map<std::string, json> rows;
+    for (const auto& issue : issues) {
+        std::string key = issue.owasp_category.empty() ? category_for_issue(issue) : issue.owasp_category;
+        key = audit_session_mcp_store::redact_for_output(key.empty() ? std::string("unmapped") : key);
+        auto& row = rows[key];
+        if (row.is_null()) {
+            row = json{{"control", key}, {"finding_count", 0}, {"highest_severity", "Info"}, {"status", "observed"}};
+        }
+        row["finding_count"] = row.value("finding_count", 0ull) + 1ull;
+        severity_t existing = severity_t::info;
+        parse_severity(row.value("highest_severity", std::string("Info")), existing);
+        if (static_cast<int>(issue.severity) > static_cast<int>(existing))
+            row["highest_severity"] = severity_label(issue.severity);
+        if (issue.severity == severity_t::critical || issue.severity == severity_t::high)
+            row["status"] = "non_compliant";
+        else if (row.value("status", std::string("observed")) != "non_compliant" && issue.severity == severity_t::medium)
+            row["status"] = "needs_attention";
+    }
+    json out = json::array();
+    for (auto& row : rows)
+        out.push_back(std::move(row.second));
+    return out;
+}
+
+std::string executive_summary_text(const json& out)
+{
+    std::ostringstream os;
+    os << "Risk posture: " << out.value("risk_posture", std::string("clear"))
+       << " (" << out.value("risk_score", 0.0) << "/100). "
+       << "Findings: " << out.value("finding_count", 0ull) << ".";
+    const auto& counts = out["severity_counts"];
+    os << " Critical " << counts.value("critical", 0ull)
+       << ", High " << counts.value("high", 0ull)
+       << ", Medium " << counts.value("medium", 0ull)
+       << ", Low " << counts.value("low", 0ull)
+       << ", Info " << counts.value("info", 0ull) << ".";
+    return os.str();
+}
+
 tool_result_t tool_executive_summary(const json& params)
 {
+    if (params.value("ai_augment", false)) {
+        json data;
+        data["ai_augment"] = false;
+        data["unsupported"] = true;
+        data["reason"] = "AI augmentation is not enabled for this MCP report surface; deterministic local summary generation is available.";
+        return tool_result_t::error("ai_augment is unsupported unless an enabled AiDA AI provider path is explicitly wired for report summarization", "ai_augment_unsupported", data);
+    }
     std::string error;
     const auto issues = filtered_issues_for_report_params(params, error);
     if (!error.empty())
@@ -760,11 +827,31 @@ tool_result_t tool_executive_summary(const json& params)
     out["generated_ms"] = now_ms();
     out["deterministic"] = true;
     out["external_ai_used"] = false;
+    out["ai_augment"] = false;
     out["finding_count"] = issues.size();
     out["severity_counts"] = severity_counts_json(issues);
+    out["risk_score"] = risk_score_from_counts(out["severity_counts"]);
+    out["risk_posture"] = risk_posture_from_score(out["risk_score"].get<double>());
     out["category_counts"] = category_arr;
     out["priority_findings"] = top_arr;
     out["recommendations"] = recommendations_json(issues);
+    out["compliance_mapping"] = compliance_mapping_json(issues);
+    out["summary"] = executive_summary_text(out);
+    const std::string format = params.value("format", std::string("json"));
+    if (format == "markdown" || format == "md") {
+        std::ostringstream md;
+        md << "# Executive Summary\n\n" << out["summary"].get<std::string>() << "\n\n"
+           << "- Risk posture: " << out["risk_posture"].get<std::string>() << "\n"
+           << "- Risk score: " << out["risk_score"].get<double>() << "/100\n"
+           << "- Findings: " << issues.size() << "\n";
+        out["content"] = md.str();
+        out["format"] = "markdown";
+    } else if (format == "text") {
+        out["content"] = out["summary"];
+        out["format"] = "text";
+    } else {
+        out["format"] = "json";
+    }
     return tool_result_t::ok(out);
 }
 
@@ -785,31 +872,6 @@ tool_result_t tool_audit_trail(const json& params)
     return tool_result_t::ok(out);
 }
 
-tool_result_t audited(const std::string& name,
-                      bool read_only,
-                      const json& params,
-                      const std::function<tool_result_t(const json&)>& fn)
-{
-    const uint64_t start = now_ms();
-    tool_result_t result = fn(params);
-    audit_session_mcp_store::audit_entry_t entry;
-    entry.session_id = session_id_from_params(params);
-    entry.ts_ms = start;
-    entry.actor = params.value("actor", std::string("mcp"));
-    entry.tool = name;
-    entry.action = name;
-    entry.read_only = read_only;
-    entry.ok = result.success;
-    const uint64_t end = now_ms();
-    entry.elapsed_ms = end >= start ? end - start : 0;
-    entry.target = params.value("target_url", params.value("url", params.value("host", std::string())));
-    entry.summary = result.success ? std::string("ok") : result.text;
-    entry.params_summary = audit_session_mcp_store::redact_json_for_output(params);
-    entry.result_summary = result.data.is_null() ? json{{"text", result.text}} : audit_session_mcp_store::redact_json_for_output(result.data);
-    audit_session_mcp_store::append_audit(std::move(entry));
-    return result;
-}
-
 void register_one(mcp_standalone::server_t& srv,
                   std::string name,
                   std::string description,
@@ -822,10 +884,7 @@ void register_one(mcp_standalone::server_t& srv,
     t.description = std::move(description);
     t.params = std::move(params);
     t.read_only = read_only;
-    const std::string tool_name = t.name;
-    t.handler = [tool_name, read_only, handler = std::move(handler)](const json& params) -> tool_result_t {
-        return audited(tool_name, read_only, params, handler);
-    };
+    t.handler = std::move(handler);
     srv.register_tool(std::move(t));
 }
 
@@ -853,19 +912,29 @@ void register_web_report_tools(mcp_standalone::server_t& srv)
         p{"actor", "string", "Operator label.", false},
         p{"expires_ms", "number", "Optional expiry epoch milliseconds.", false}
     }, false, tool_findings_suppress);
-    register_one(srv, "aida.web.report.evidence.capture", "Capture redacted evidence summaries from a site-map exchange, issue evidence, or supplied raw request/response.", {
+    register_one(srv, "aida.web.report.evidence.capture", "Capture redacted evidence through the SQLite evidence store from a site-map exchange, issue evidence, screenshot, file, timing data, or supplied raw request/response.", {
         p{"session_id", "string", "Audit session id.", true},
         p{"issue_id", "number", "Optional issue id.", false},
         p{"exchange_id", "number", "Optional site-map exchange id.", false},
         p{"request_raw", "string", "Manual raw request; persisted only after redaction and returned as hash/length/preview.", false},
         p{"response_raw", "string", "Manual raw response; persisted only after redaction and returned as hash/length/preview.", false},
+        p{"screenshot_path", "string", "Local screenshot file to copy into the evidence store.", false},
+        p{"file_path", "string", "Local evidence file to copy into the evidence store.", false},
+        p{"source_path", "string", "Local evidence file path alias.", false},
+        p{"file_text", "string", "Inline textual file evidence; persisted after redaction.", false},
+        p{"file_name", "string", "Stored evidence filename hint.", false},
+        p{"timing_data", "object", "Timing evidence object.", false},
+        p{"request_metadata", "object", "Redacted request metadata.", false},
+        p{"response_metadata", "object", "Redacted response metadata.", false},
+        p{"exchange_metadata", "object", "Redacted exchange metadata.", false},
+        p{"metadata", "object", "Additional redacted evidence metadata.", false},
         p{"marker", "string", "Evidence marker.", false},
         p{"category", "string", "Evidence category.", false},
         p{"label", "string", "Evidence label.", false}
     }, false, tool_evidence_capture);
     register_one(srv, "aida.web.report.generate", "Generate a markdown, HTML, JSON, SARIF 2.1.0, or CSV web report using the existing AiDA report generator.", {
         p{"format", "string", "markdown|html|json|sarif_2_1_0|csv.", true},
-        p{"output_path", "string", "Destination file path.", true},
+        p{"output_path", "string", "Destination file path. Omit for inline content.", false},
         p{"title", "string", "Report title.", false},
         p{"client", "string", "Client name.", false},
         p{"scope_summary", "string", "Scope summary.", false},
@@ -878,15 +947,19 @@ void register_web_report_tools(mcp_standalone::server_t& srv)
         p{"severity_min", "string", "Minimum severity.", false},
         p{"target_domain", "string", "Target host/domain filter.", false},
         p{"audit_id", "number", "Scanner audit id filter.", false},
-        p{"include_issue_ids", "array", "Specific issue ids.", false}
+        p{"include_issue_ids", "array", "Specific issue ids.", false},
+        p{"include_recon", "boolean", "Include sanitized recon/offensive context from stored audit events.", false},
+        p{"include_offensive_run_ids", "array", "Offensive run ids to include when present in stored redacted context.", false}
     }, false, tool_report_generate);
-    register_one(srv, "aida.web.report.executive_summary", "Create a deterministic local executive summary from finding counts, categories, and remediation text.", {
+    register_one(srv, "aida.web.report.executive_summary", "Create a deterministic local executive summary with risk posture, compliance mapping, and recommended actions.", {
         p{"session_id", "string", "Audit session id.", false},
         p{"severity_min", "string", "Minimum severity.", false},
         p{"host", "string", "Host filter.", false},
         p{"type_key", "string", "Type-key filter.", false},
         p{"include_suppressed", "boolean", "Include suppressed findings.", false},
-        p{"limit", "number", "Maximum findings to summarize.", false}
+        p{"limit", "number", "Maximum findings to summarize.", false},
+        p{"format", "string", "json|markdown|text.", false},
+        p{"ai_augment", "boolean", "Request AI augmentation; returns explicit unsupported error unless an AI path is wired.", false}
     }, true, tool_executive_summary);
     register_one(srv, "aida.web.report.audit_trail", "Query the redacted Plan 6 audit trail.", {
         p{"session_id", "string", "Audit session id.", false},

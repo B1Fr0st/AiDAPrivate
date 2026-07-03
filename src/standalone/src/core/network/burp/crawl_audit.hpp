@@ -5,6 +5,8 @@
 #include <string>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 namespace aida {
 namespace burp {
 namespace crawl_audit {
@@ -43,6 +45,8 @@ uint64_t                      start(const pipeline_config_t& config);
 bool                          stop(uint64_t pipeline_id);
 pipeline_status_t             status(uint64_t pipeline_id);
 std::vector<pipeline_status_t> list();
+nlohmann::json                export_json();
+bool                          import_json(const nlohmann::json& doc, bool replace_existing);
 
 }
 }

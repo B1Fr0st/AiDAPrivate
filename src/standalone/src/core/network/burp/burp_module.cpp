@@ -4,6 +4,7 @@
 #include "cookie_jar.hpp"
 #include "issue.hpp"
 #include "site_map.hpp"
+#include "project.hpp"
 
 #include "passive_scanner.hpp"
 #include "active_scanner.hpp"
@@ -23,6 +24,13 @@
 #include "api_definition.hpp"
 #include "ws_editor.hpp"
 #include "burp_logger.hpp"
+#include "burp_extensions_mcp.hpp"
+#include "burp_search_mcp.hpp"
+#include "audit_session_mcp.hpp"
+#include "defensive_mcp.hpp"
+#include "scan_orchestrator.hpp"
+#include "web_report_mcp.hpp"
+#include "burp_mitm_mcp.hpp"
 
 #include "browser_launch.hpp"
 #include "csp_analyzer.hpp"
@@ -35,6 +43,17 @@
 
 #include "repeater.hpp"
 #include "decoder.hpp"
+
+#include "offensive/offensive_api_rest.hpp"
+#include "offensive/offensive_auth_attack.hpp"
+#include "offensive/offensive_business_logic.hpp"
+#include "offensive/offensive_client_attack.hpp"
+#include "offensive/offensive_fuzzing.hpp"
+#include "offensive/offensive_js_analysis.hpp"
+#include "offensive/offensive_recon.hpp"
+#include "offensive/offensive_server_attack.hpp"
+#include "offensive/offensive_sqli.hpp"
+#include "offensive/offensive_xss.hpp"
 
 #include "../../../helpers/diag_log.hpp"
 #include "../../infra/work_queue.hpp"
@@ -114,6 +133,7 @@ bool initialize()
         run_init_phase("cookie_jar", []() { (void)cookie_jar::initialize(); });
         run_init_phase("payloads", []() { (void)payloads::initialize(); });
         run_init_phase("sitemap", []() { (void)sitemap::initialize(); });
+        run_init_phase("project", []() { (void)project::initialize(); });
 
         run_init_phase("passive_scanner", []() { (void)passive_scanner::initialize(); });
         run_init_phase("active_scanner", []() { (void)active_scanner::initialize(); });
@@ -187,6 +207,7 @@ void shutdown()
     camoufox::install::shutdown();
 
     repeater::shutdown();
+    scan_orchestrator::shutdown();
 
     upstream::shutdown();
     tech::shutdown();
@@ -211,6 +232,7 @@ void shutdown()
     active_scanner::shutdown();
     passive_scanner::shutdown();
 
+    project::shutdown();
     sitemap::shutdown();
     payloads::shutdown();
     cookie_jar::shutdown();
@@ -220,10 +242,15 @@ void shutdown()
 
 void register_all_tools(mcp_standalone::server_t& srv)
 {
+    project::register_project_tools(srv);
     target::register_target_tools(srv);
     register_scanner_tools(srv);
+    defensive::register_defensive_tools(srv);
+    audit_session_mcp::register_audit_session_tools(srv);
+    register_scan_orchestrator_tools(srv);
     register_dom_xss_tools(srv);
     register_recon_tools(srv);
+    search_mcp::register_search_tools(srv);
     collaborator_mcp::register_collaborator_tools(srv);
     crawl_audit_mcp::register_crawl_audit_tools(srv);
     sequencer_mcp::register_sequencer_tools(srv);
@@ -234,16 +261,29 @@ void register_all_tools(mcp_standalone::server_t& srv)
     register_match_replace_tools(srv);
     register_session_tools(srv);
     api_mcp::register_api_tools(srv);
+    register_extension_tools(srv);
     bambda::register_bambda_tools(srv);
     csp::register_csp_tools(srv);
     upstream::register_upstream_tools(srv);
     tech::register_tech_tools(srv);
     register_camoufox_tools(srv);
     proxy_mcp::register_proxy_tools(srv);
+    mitm_mcp::register_mitm_plan2_tools(srv);
     repeater_mcp::register_repeater_tools(srv);
     decoder_mcp::register_decoder_tools(srv);
     logger_mcp::register_logger_tools(srv);
     report_mcp::register_report_tools(srv);
+    web_report_mcp::register_web_report_tools(srv);
+    offensive::register_recon_tools(srv);
+    offensive::register_xss_tools(srv);
+    offensive::register_sqli_tools(srv);
+    offensive::register_client_attack_tools(srv);
+    offensive::register_server_attack_tools(srv);
+    offensive::register_auth_attack_tools(srv);
+    offensive::register_business_logic_tools(srv);
+    offensive::register_api_security_tools(srv);
+    offensive::register_js_analysis_tools(srv);
+    offensive::register_fuzzing_tools(srv);
 }
 
 }

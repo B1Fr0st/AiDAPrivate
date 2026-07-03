@@ -13,6 +13,7 @@
 #include <cctype>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <mutex>
 #include <regex>
 #include <sstream>
@@ -214,6 +215,23 @@ bool write_bytes_file(const std::filesystem::path& path, const std::vector<uint8
     return f.good();
 }
 
+bool read_bytes_file(const std::string& path, std::vector<uint8_t>& out)
+{
+    out.clear();
+    std::error_code ec;
+    const std::filesystem::path p(path);
+    if (path.empty() || !std::filesystem::is_regular_file(p, ec))
+        return false;
+    const auto sz = std::filesystem::file_size(p, ec);
+    if (ec || sz > 64ull * 1024ull * 1024ull)
+        return false;
+    std::ifstream f(p, std::ios::binary);
+    if (!f.is_open())
+        return false;
+    out.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    return f.good() || f.eof();
+}
+
 bool bind_text(sqlite3_stmt* stmt, int idx, const std::string& s)
 {
     return sqlite3_bind_text(stmt, idx, s.c_str(), static_cast<int>(s.size()), SQLITE_TRANSIENT) == SQLITE_OK;
@@ -293,15 +311,56 @@ void shutdown()
 bool capture(const evidence_capture_t& capture, evidence_record_t& out)
 {
     if (!initialize()) return false;
-    if (capture.finding_id == 0) {
-        set_error("invalid_finding_id");
-        return false;
+    uint64_t finding_id = capture.finding_id;
+    std::string resolved_session_id = capture.session_id;
+    uint64_t resolved_scan_id = capture.scan_id;
+    if (finding_id == 0) {
+        if (capture.session_id.empty()) {
+            set_error("invalid_finding_id");
+            return false;
+        }
+        issue_t manual;
+        manual.session_id = capture.session_id;
+        manual.scan_id = capture.scan_id;
+        manual.type_key = "evidence.manual";
+        manual.name = "Manual Evidence";
+        manual.description = "Manual evidence captured for the audit session.";
+        manual.remediation = "Review the captured evidence and associate it with a validated finding when triage is complete.";
+        manual.severity = severity_t::info;
+        manual.confidence = confidence_t::tentative;
+        manual.host = "manual-evidence";
+        manual.path = "/";
+        manual.parameter = kind_to_string(capture.kind);
+        manual.src_exchange_id = capture.exchange_id;
+        manual.seen_ms = findings_db::now_ms();
+        resolved_session_id = manual.session_id;
+        resolved_scan_id = manual.scan_id;
+        finding_id = findings_db::upsert(std::move(manual));
+        if (finding_id == 0) {
+            set_error(findings_db::last_error().empty() ? "manual_evidence_finding_failed" : findings_db::last_error());
+            return false;
+        }
+    }
+    else {
+        issue_t existing;
+        if (!findings_db::get(finding_id, existing)) {
+            set_error("finding_not_found");
+            return false;
+        }
+        if (!resolved_session_id.empty() && !existing.session_id.empty() && resolved_session_id != existing.session_id) {
+            set_error("evidence_session_mismatch");
+            return false;
+        }
+        if (resolved_session_id.empty())
+            resolved_session_id = existing.session_id;
+        if (resolved_scan_id == 0)
+            resolved_scan_id = existing.scan_id;
     }
 
     evidence_record_t record;
-    record.finding_id = capture.finding_id;
-    record.session_id = capture.session_id;
-    record.scan_id = capture.scan_id;
+    record.finding_id = finding_id;
+    record.session_id = resolved_session_id;
+    record.scan_id = resolved_scan_id;
     record.kind = capture.kind;
     record.request_raw = redact_sensitive_text(capture.request_raw);
     record.response_raw = redact_sensitive_text(capture.response_raw);
@@ -315,6 +374,19 @@ bool capture(const evidence_capture_t& capture, evidence_record_t& out)
     record.metadata_json = redact_sensitive_json(capture.metadata_json);
 
     std::vector<uint8_t> bytes_to_write = capture.bytes;
+    if (bytes_to_write.empty() && !capture.source_path.empty() &&
+        (capture.kind == evidence_kind_t::file || capture.kind == evidence_kind_t::screenshot)) {
+        if (!read_bytes_file(capture.source_path, bytes_to_write)) {
+            set_error("evidence_source_read_failed");
+            return false;
+        }
+        record.metadata_json["source_path_sha256"] = sha256_hex(capture.source_path);
+        record.metadata_json["source_path_name"] = safe_filename(std::filesystem::path(capture.source_path).filename().string());
+    }
+    if (bytes_to_write.empty() && (capture.kind == evidence_kind_t::file || capture.kind == evidence_kind_t::screenshot)) {
+        set_error("evidence_file_bytes_required");
+        return false;
+    }
     if (capture.kind == evidence_kind_t::file && !bytes_to_write.empty() && looks_textual(bytes_to_write)) {
         std::string text(reinterpret_cast<const char*>(bytes_to_write.data()), bytes_to_write.size());
         text = redact_sensitive_text(text);
@@ -439,13 +511,34 @@ bool capture_timing(uint64_t finding_id, const nlohmann::json& timing_json, evid
 
 std::vector<evidence_record_t> list_for_finding(uint64_t finding_id)
 {
+    evidence_filter_t filter;
+    filter.finding_id = finding_id;
+    filter.limit = 0;
+    return list(filter);
+}
+
+std::vector<evidence_record_t> list(const evidence_filter_t& filter)
+{
     std::vector<evidence_record_t> out;
     if (!initialize()) return out;
-    findings_db::with_db("evidence_list", [&](sqlite3* db) {
-        std::string sql = "SELECT " + select_fields() + " FROM evidence WHERE finding_id=? ORDER BY captured_ms ASC,id ASC";
+    findings_db::with_db("evidence_list_filtered", [&](sqlite3* db) {
+        std::string sql = "SELECT " + select_fields() + " FROM evidence WHERE 1=1";
+        if (!filter.session_id.empty()) sql += " AND session_id=?";
+        if (filter.finding_id != 0) sql += " AND finding_id=?";
+        if (filter.exchange_id != 0) sql += " AND exchange_id=?";
+        if (filter.has_kind) sql += " AND kind=?";
+        sql += " ORDER BY captured_ms DESC,id DESC";
+        if (filter.limit > 0) sql += " LIMIT ?";
+        if (filter.offset > 0) sql += " OFFSET ?";
         sqlite3_stmt* stmt = nullptr;
         if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) return false;
-        sqlite3_bind_int64(stmt, 1, static_cast<sqlite3_int64>(finding_id));
+        int idx = 1;
+        if (!filter.session_id.empty()) bind_text(stmt, idx++, filter.session_id);
+        if (filter.finding_id != 0) sqlite3_bind_int64(stmt, idx++, static_cast<sqlite3_int64>(filter.finding_id));
+        if (filter.exchange_id != 0) sqlite3_bind_int64(stmt, idx++, static_cast<sqlite3_int64>(filter.exchange_id));
+        if (filter.has_kind) bind_text(stmt, idx++, kind_to_string(filter.kind));
+        if (filter.limit > 0) sqlite3_bind_int64(stmt, idx++, static_cast<sqlite3_int64>(filter.limit));
+        if (filter.offset > 0) sqlite3_bind_int64(stmt, idx++, static_cast<sqlite3_int64>(filter.offset));
         while (sqlite3_step(stmt) == SQLITE_ROW) out.push_back(row_to_record(stmt));
         sqlite3_finalize(stmt);
         return true;
@@ -483,6 +576,15 @@ bool get(uint64_t evidence_id, evidence_record_t& out)
 nlohmann::json summary_json(const evidence_record_t& record)
 {
     nlohmann::json j = nlohmann::json::object();
+    auto path_summary = [](const std::string& path) {
+        nlohmann::json out = nlohmann::json::object();
+        if (path.empty())
+            return out;
+        out["stored"] = true;
+        out["name"] = safe_filename(std::filesystem::path(path).filename().string());
+        out["path_sha256"] = sha256_hex(path);
+        return out;
+    };
     j["id"] = record.id;
     j["finding_id"] = record.finding_id;
     j["session_id"] = record.session_id;
@@ -493,8 +595,10 @@ nlohmann::json summary_json(const evidence_record_t& record)
     j["marker"] = redact_sensitive_text(record.marker, 512);
     j["marker_offset_request"] = record.marker_offset_request;
     j["marker_offset_response"] = record.marker_offset_response;
-    j["screenshot_path"] = record.screenshot_path;
-    j["file_path"] = record.file_path;
+    j["screenshot"] = path_summary(record.screenshot_path);
+    j["file"] = path_summary(record.file_path);
+    j["screenshot_path"] = record.screenshot_path.empty() ? std::string() : std::string("[redacted:stored_path]");
+    j["file_path"] = record.file_path.empty() ? std::string() : std::string("[redacted:stored_path]");
     j["content_sha256"] = record.content_sha256;
     j["timing"] = redact_sensitive_json(record.timing_json);
     j["description"] = redact_sensitive_text(record.description, 1024);

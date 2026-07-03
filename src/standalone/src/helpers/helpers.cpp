@@ -2160,7 +2160,6 @@ void helpers::render_title()
 
 
 		static bool initial_grow_done = false;
-		static bool fileless_initial_geometry_logged = false;
 		if (!initial_grow_done) {
 			if (globals::ui::welcome_done && runtime_ready) {
 				initial_grow_done = true;
@@ -2178,30 +2177,17 @@ void helpers::render_title()
 				globals::ui::pre_max_y = static_cast<float>(restore_y);
 				globals::ui::pre_max_w = normal_w;
 				globals::ui::pre_max_h = normal_h;
-				const bool fileless_launch = diag::env_flag_enabled("AIDA_FILELESS_LAUNCH");
 				WINDOWPLACEMENT wp = { sizeof(wp) };
 				if (::GetWindowPlacement(g_hwnd, &wp)) {
 					wp.flags = 0;
-					wp.showCmd = fileless_launch ? SW_SHOWNORMAL : SW_SHOWMAXIMIZED;
+					wp.showCmd = SW_SHOWMAXIMIZED;
 					wp.rcNormalPosition.left   = restore_x;
 					wp.rcNormalPosition.top    = restore_y;
 					wp.rcNormalPosition.right  = restore_x + static_cast<int>(normal_w);
 					wp.rcNormalPosition.bottom = restore_y + static_cast<int>(normal_h);
 					::SetWindowPlacement(g_hwnd, &wp);
 				}
-				if (fileless_launch) {
-					globals::ui::window_w = normal_w;
-					globals::ui::window_h = normal_h;
-					if (!fileless_initial_geometry_logged) {
-						fileless_initial_geometry_logged = true;
-						diag::log_tagged_critical_fmt("render",
-							"fileless_initial_ide_geometry target=%d,%d work=%d,%d maximized=0",
-							static_cast<int>(normal_w),
-							static_cast<int>(normal_h),
-							static_cast<int>(mw),
-							static_cast<int>(mh));
-					}
-				} else {
+				{
 					RECT cr{};
 					::GetClientRect(g_hwnd, &cr);
 					float cw = static_cast<float>(cr.right - cr.left);
@@ -2213,11 +2199,11 @@ void helpers::render_title()
 						globals::ui::window_w = normal_w;
 						globals::ui::window_h = normal_h;
 					}
-					static bool dev_initial_geometry_logged = false;
-					if (!dev_initial_geometry_logged) {
-						dev_initial_geometry_logged = true;
+					static bool disk_initial_geometry_logged = false;
+					if (!disk_initial_geometry_logged) {
+						disk_initial_geometry_logged = true;
 						diag::log_tagged_critical_fmt("render",
-							"dev_initial_ide_geometry target=%d,%d work=%d,%d cw=%d ch=%d maximized=1",
+							"disk_initial_ide_geometry target=%d,%d work=%d,%d cw=%d ch=%d maximized=1",
 							static_cast<int>(normal_w),
 							static_cast<int>(normal_h),
 							static_cast<int>(mw),

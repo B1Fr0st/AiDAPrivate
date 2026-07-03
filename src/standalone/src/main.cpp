@@ -557,19 +557,6 @@ static std::string sys_fonts_dir()
     return std::string(win_dir) + "\\Fonts";
 }
 
-static bool fileless_launch_active()
-{
-    char flag[16] = {};
-    if (GetEnvironmentVariableA("AIDA_FILELESS_LAUNCH", flag, static_cast<DWORD>(sizeof(flag))) > 0 &&
-        flag[0] != '\0' &&
-        std::strcmp(flag, "0") != 0) {
-        return true;
-    }
-    char path[MAX_PATH] = {};
-    return GetEnvironmentVariableA("AIDA_FILELESS_DEBUG_LOG_PATH", path, static_cast<DWORD>(sizeof(path))) > 0 &&
-        path[0] != '\0';
-}
-
 static ImFont* load_font_with_fallbacks(ImGuiIO& io,
                                          const char* embed_data, size_t embed_size,
                                          const std::vector<std::string>& candidate_paths,
@@ -640,13 +627,9 @@ static void merge_icon_font(ImGuiIO& io, float pixel_size)
     icon_cfg.PixelSnapH = true;
     icon_cfg.GlyphMinAdvanceX = pixel_size * 0.92f;
     icon_cfg.GlyphOffset = ImVec2(0.f, pixel_size * 0.05f);
-    const bool fileless = fileless_launch_active();
-    if (!fileless) {
-        icon_cfg.FontBuilderFlags = ImGuiFreeTypeBuilderFlags_LightHinting;
-    }
+    icon_cfg.FontBuilderFlags = ImGuiFreeTypeBuilderFlags_LightHinting;
     diag::log_tagged_critical_fmt("fonts",
-        "merge_icon_config fileless=%d builder_flags=0x%X",
-        fileless ? 1 : 0,
+        "merge_icon_config builder_flags=0x%X",
         icon_cfg.FontBuilderFlags);
     void* icon_data_copy = IM_ALLOC(ide_icon_font_size);
     diag::log_tagged_critical_fmt("fonts",
@@ -665,21 +648,15 @@ static void merge_icon_font(ImGuiIO& io, float pixel_size)
 static void rebuild_fonts(float dpi_scale)
 {
     ImGuiIO& io = ImGui::GetIO();
-    const bool fileless = fileless_launch_active();
     diag::log_tagged_critical_fmt("fonts",
-        "rebuild_fonts_enter dpi_scale=%.3f ctx=0x%llX atlas=0x%llX count=%d fileless=%d builder_before=0x%llX flags_before=0x%X",
+        "rebuild_fonts_enter dpi_scale=%.3f ctx=0x%llX atlas=0x%llX count=%d builder_before=0x%llX flags_before=0x%X",
         dpi_scale,
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(ImGui::GetCurrentContext())),
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(io.Fonts)),
         io.Fonts ? io.Fonts->Fonts.Size : -1,
-        fileless ? 1 : 0,
         io.Fonts ? static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(io.Fonts->FontBuilderIO)) : 0ULL,
         io.Fonts ? io.Fonts->FontBuilderFlags : 0U);
     io.Fonts->Clear();
-    if (fileless) {
-        io.Fonts->FontBuilderIO = ImFontAtlasGetBuilderForStbTruetype();
-        io.Fonts->FontBuilderFlags = 0;
-    }
     diag::log_tagged_critical_fmt("fonts",
         "rebuild_fonts_clear_post atlas=0x%llX count=%d builder=0x%llX flags=0x%X",
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(io.Fonts)),
@@ -710,10 +687,8 @@ static void rebuild_fonts(float dpi_scale)
 
     auto cfg_ui_smooth = [&](float multiply) {
         ImFontConfig c{};
-        if (!fileless) {
-            c.FontBuilderFlags = ImGuiFreeTypeBuilderFlags_NoHinting;
-            if (enable_lcd) c.FontBuilderFlags |= lcd_flag_value;
-        }
+        c.FontBuilderFlags = ImGuiFreeTypeBuilderFlags_NoHinting;
+        if (enable_lcd) c.FontBuilderFlags |= lcd_flag_value;
         c.PixelSnapH = false;
         c.OversampleH = 3;
         c.OversampleV = 1;
@@ -722,10 +697,8 @@ static void rebuild_fonts(float dpi_scale)
     };
     auto cfg_ui_hinted = [&](float multiply) {
         ImFontConfig c{};
-        if (!fileless) {
-            c.FontBuilderFlags = ImGuiFreeTypeBuilderFlags_LightHinting;
-            if (enable_lcd) c.FontBuilderFlags |= lcd_flag_value;
-        }
+        c.FontBuilderFlags = ImGuiFreeTypeBuilderFlags_LightHinting;
+        if (enable_lcd) c.FontBuilderFlags |= lcd_flag_value;
         c.PixelSnapH = false;
         c.OversampleH = 3;
         c.OversampleV = 1;
@@ -734,9 +707,7 @@ static void rebuild_fonts(float dpi_scale)
     };
     auto cfg_mono = [&](float multiply) {
         ImFontConfig c{};
-        if (!fileless) {
-            c.FontBuilderFlags = ImGuiFreeTypeBuilderFlags_LightHinting;
-        }
+        c.FontBuilderFlags = ImGuiFreeTypeBuilderFlags_LightHinting;
         c.PixelSnapH = true;
         c.OversampleH = 2;
         c.OversampleV = 1;
@@ -867,19 +838,13 @@ static void rebuild_fonts(float dpi_scale)
     if (!g_font_ui_700_xl) g_font_ui_700_xl = g_font_ui_700;
 
     io.FontDefault = g_font_ui_400;
-    if (fileless) {
-        for (int i = 0; i < io.Fonts->ConfigData.Size; ++i) {
-            io.Fonts->ConfigData[i].FontBuilderFlags = 0;
-        }
-    }
     diag::log_tagged_critical_fmt("fonts",
-        "rebuild_fonts_build_pre default=0x%llX atlas_count=%d config_count=%d builder=0x%llX flags=0x%X fileless=%d",
+        "rebuild_fonts_build_pre default=0x%llX atlas_count=%d config_count=%d builder=0x%llX flags=0x%X",
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(io.FontDefault)),
         io.Fonts ? io.Fonts->Fonts.Size : -1,
         io.Fonts ? io.Fonts->ConfigData.Size : -1,
         io.Fonts ? static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(io.Fonts->FontBuilderIO)) : 0ULL,
-        io.Fonts ? io.Fonts->FontBuilderFlags : 0U,
-        fileless ? 1 : 0);
+        io.Fonts ? io.Fonts->FontBuilderFlags : 0U);
     io.Fonts->Build();
     diag::log_tagged_critical_fmt("fonts",
         "rebuild_fonts_build_post atlas_count=%d tex_alpha=0x%llX tex_rgba=0x%llX tex_w=%d tex_h=%d use_colors=%d",
@@ -1001,95 +966,6 @@ static void startup_log_critical_fmt(const char* fmt, ...)
     _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, ap);
     va_end(ap);
     startup_log_critical(buf);
-}
-
-static void log_fileless_window_input_state(HWND hwnd, const char* phase, uint64_t frame_number)
-{
-    if (!fileless_launch_active())
-        return;
-    aida::manual_map_tls::ensure_current_thread();
-    RECT wr{};
-    BOOL rect_ok = ::GetWindowRect(hwnd, &wr);
-    DWORD rect_gle = rect_ok ? 0 : ::GetLastError();
-    POINT cursor{};
-    BOOL cursor_ok = ::GetCursorPos(&cursor);
-    DWORD cursor_gle = cursor_ok ? 0 : ::GetLastError();
-    DWORD qs = ::GetQueueStatus(QS_ALLINPUT);
-    DWORD qs_bits = static_cast<DWORD>(LOWORD(qs)) | static_cast<DWORD>(HIWORD(qs));
-    LONG_PTR style = ::GetWindowLongPtrW(hwnd, GWL_STYLE);
-    LONG_PTR exstyle = ::GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-    diag::log_tagged_critical_fmt("input",
-        "fileless_window_state phase=%s frame=%llu hwnd=0x%llX visible=%d enabled=%d iconic=%d rect_ok=%d rect=%ld,%ld,%ld,%ld rect_gle=%lu cursor_ok=%d cursor=%ld,%ld cursor_gle=%lu fg=0x%llX active=0x%llX focus=0x%llX capture=0x%llX style=0x%llX exstyle=0x%llX qs=0x%08lX bits=0x%08lX tid=%lu",
-        phase ? phase : "<null>",
-        static_cast<unsigned long long>(frame_number),
-        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
-        ::IsWindowVisible(hwnd) ? 1 : 0,
-        ::IsWindowEnabled(hwnd) ? 1 : 0,
-        ::IsIconic(hwnd) ? 1 : 0,
-        rect_ok ? 1 : 0,
-        wr.left,
-        wr.top,
-        wr.right,
-        wr.bottom,
-        static_cast<unsigned long>(rect_gle),
-        cursor_ok ? 1 : 0,
-        cursor.x,
-        cursor.y,
-        static_cast<unsigned long>(cursor_gle),
-        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(::GetForegroundWindow())),
-        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(::GetActiveWindow())),
-        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(::GetFocus())),
-        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(::GetCapture())),
-        static_cast<unsigned long long>(style),
-        static_cast<unsigned long long>(exstyle),
-        static_cast<unsigned long>(qs),
-        static_cast<unsigned long>(qs_bits),
-        ::GetCurrentThreadId());
-}
-
-static void activate_fileless_window(HWND hwnd, const char* reason, uint64_t frame_number)
-{
-    if (!fileless_launch_active() || !::IsWindow(hwnd))
-        return;
-    aida::manual_map_tls::ensure_current_thread();
-    log_fileless_window_input_state(hwnd, reason ? reason : "activate_pre", frame_number);
-    ::SetLastError(0);
-    BOOL show_ok = ::ShowWindow(hwnd, ::IsIconic(hwnd) ? SW_RESTORE : SW_SHOW);
-    DWORD show_gle = ::GetLastError();
-    ::SetLastError(0);
-    BOOL pos_ok = ::SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0,
-        SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
-    DWORD pos_gle = ::GetLastError();
-    ::SetLastError(0);
-    BOOL bring_ok = ::BringWindowToTop(hwnd);
-    DWORD bring_gle = ::GetLastError();
-    ::SetLastError(0);
-    BOOL fg_ok = ::SetForegroundWindow(hwnd);
-    DWORD fg_gle = ::GetLastError();
-    ::SetLastError(0);
-    HWND prev_active = ::SetActiveWindow(hwnd);
-    DWORD active_gle = ::GetLastError();
-    ::SetLastError(0);
-    HWND prev_focus = ::SetFocus(hwnd);
-    DWORD focus_gle = ::GetLastError();
-    diag::log_tagged_critical_fmt("input",
-        "fileless_activate_window reason=%s frame=%llu hwnd=0x%llX show_prev_visible=%d show_gle=%lu pos_ok=%d pos_gle=%lu bring_ok=%d bring_gle=%lu fg_ok=%d fg_gle=%lu prev_active=0x%llX active_gle=%lu prev_focus=0x%llX focus_gle=%lu",
-        reason ? reason : "<null>",
-        static_cast<unsigned long long>(frame_number),
-        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
-        show_ok ? 1 : 0,
-        static_cast<unsigned long>(show_gle),
-        pos_ok ? 1 : 0,
-        static_cast<unsigned long>(pos_gle),
-        bring_ok ? 1 : 0,
-        static_cast<unsigned long>(bring_gle),
-        fg_ok ? 1 : 0,
-        static_cast<unsigned long>(fg_gle),
-        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(prev_active)),
-        static_cast<unsigned long>(active_gle),
-        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(prev_focus)),
-        static_cast<unsigned long>(focus_gle));
-    log_fileless_window_input_state(hwnd, "activate_post", frame_number);
 }
 
 static HANDLE& single_instance_mutex_handle()
@@ -1251,7 +1127,6 @@ namespace aida_tracer {
     inline std::atomic<DWORD> g_peek_last_error{0};
     inline std::atomic<UINT> g_peek_remove_flags{kAidaQueuedPeekFlags};
     inline std::atomic<UINT_PTR> g_peek_filter_hwnd{0};
-    inline std::atomic<uint64_t> g_peek_fileless_send_only_defers{0};
     inline std::atomic<uint64_t> g_peek_send_only_defers{0};
     inline std::atomic<uint64_t> g_peek_send_only_flushes{0};
     inline std::atomic<const char*> g_wndproc_stage{"<idle>"};
@@ -1420,44 +1295,6 @@ namespace aida_tracer {
         g_peek_filter_hwnd.store(reinterpret_cast<UINT_PTR>(filter_hwnd), std::memory_order_release);
     }
 
-    inline bool should_log_fileless_input_message(UINT msg) {
-        if (!fileless_launch_active())
-            return false;
-        switch (msg) {
-        case WM_SETFOCUS:
-        case WM_KILLFOCUS:
-        case WM_ACTIVATE:
-        case WM_ACTIVATEAPP:
-        case WM_MOUSEACTIVATE:
-        case WM_LBUTTONDOWN:
-        case WM_LBUTTONUP:
-        case WM_LBUTTONDBLCLK:
-        case WM_NCLBUTTONDOWN:
-        case WM_NCLBUTTONUP:
-        case WM_RBUTTONDOWN:
-        case WM_RBUTTONUP:
-        case WM_MBUTTONDOWN:
-        case WM_MBUTTONUP:
-        case WM_CAPTURECHANGED:
-            return true;
-        case WM_NCHITTEST:
-        case WM_SETCURSOR:
-        {
-            static std::atomic<uint64_t> s_hit_cursor_logs{0};
-            uint64_t n = s_hit_cursor_logs.fetch_add(1, std::memory_order_acq_rel) + 1;
-            return n <= 32 || (n % 300ULL) == 0ULL;
-        }
-        case WM_MOUSEMOVE:
-        {
-            static std::atomic<uint64_t> s_mousemove_logs{0};
-            uint64_t n = s_mousemove_logs.fetch_add(1, std::memory_order_acq_rel) + 1;
-            return n <= 16 || (n % 300ULL) == 0ULL;
-        }
-        default:
-            return false;
-        }
-    }
-
     inline bool should_log_wndproc_input_message(UINT msg) {
         switch (msg) {
         case WM_MOUSEACTIVATE:
@@ -1499,7 +1336,7 @@ namespace aida_tracer {
         case WM_SETTINGCHANGE:
             return true;
         default:
-            return should_log_wndproc_input_message(msg) || should_log_fileless_input_message(msg);
+            return should_log_wndproc_input_message(msg);
         }
     }
 
@@ -2028,7 +1865,7 @@ namespace aida_tracer {
                     char stall_context[4600] = {};
                     format_message_pump_stall_context(stall_context, sizeof(stall_context));
                     diag::log_tagged_critical_fmt("tracer",
-                        "RENDER_STALL streak=%llu frame=%llu age_ms=%llu phase=%s section=%s phase_id=%llu render_tid=%lu attach=%s attach_id=%llu peek_qs=0x%08lX peek_gle=%lu peek_flags=0x%08X peek_filter=0x%llX fileless_send_defers=%llu send_only_defers=%llu send_only_flushes=%llu dispatch=%s msg=%s(0x%04X) hwnd=0x%llX wp=0x%llX lp=0x%llX wndproc=%s msg=%s(0x%04X) hwnd=0x%llX wp=0x%llX lp=0x%llX dx_frame=%llu dx_age_ms=%llu dx_dd=0x%llX dx_dev=0x%llX dx_ctx=0x%llX dx_rtv=0x%llX dx_lists=%llu dx_draw_cmds=%llu dx_vtx=%llu dx_idx=%llu dx_callbacks=%llu dx_reset_callbacks=%llu dx_first_cb=0x%llX dx_cb_data=0x%llX dx_first_tex=0x%llX dx_tex_hash=0x%016llX dx_max_elem=%llu dx_bad=0x%08lX dx_bad_at=%d,%d dx_disp1000=%d,%d dx_fb1000=%d,%d dx_removed=0x%08lX present_frame=%llu present_age_ms=%llu present_sc=0x%llX present_hr=0x%08lX tracer_tid=%lu ctx={%.3600s}",
+                        "RENDER_STALL streak=%llu frame=%llu age_ms=%llu phase=%s section=%s phase_id=%llu render_tid=%lu attach=%s attach_id=%llu peek_qs=0x%08lX peek_gle=%lu peek_flags=0x%08X peek_filter=0x%llX send_only_defers=%llu send_only_flushes=%llu dispatch=%s msg=%s(0x%04X) hwnd=0x%llX wp=0x%llX lp=0x%llX wndproc=%s msg=%s(0x%04X) hwnd=0x%llX wp=0x%llX lp=0x%llX dx_frame=%llu dx_age_ms=%llu dx_dd=0x%llX dx_dev=0x%llX dx_ctx=0x%llX dx_rtv=0x%llX dx_lists=%llu dx_draw_cmds=%llu dx_vtx=%llu dx_idx=%llu dx_callbacks=%llu dx_reset_callbacks=%llu dx_first_cb=0x%llX dx_cb_data=0x%llX dx_first_tex=0x%llX dx_tex_hash=0x%016llX dx_max_elem=%llu dx_bad=0x%08lX dx_bad_at=%d,%d dx_disp1000=%d,%d dx_fb1000=%d,%d dx_removed=0x%08lX present_frame=%llu present_age_ms=%llu present_sc=0x%llX present_hr=0x%08lX tracer_tid=%lu ctx={%.3600s}",
                         (unsigned long long)stall_streak,
                         (unsigned long long)frame,
                         (unsigned long long)age_ms,
@@ -2042,7 +1879,6 @@ namespace aida_tracer {
                         static_cast<unsigned long>(peek_error),
                         g_peek_remove_flags.load(std::memory_order_acquire),
                         static_cast<unsigned long long>(g_peek_filter_hwnd.load(std::memory_order_acquire)),
-                        static_cast<unsigned long long>(g_peek_fileless_send_only_defers.load(std::memory_order_acquire)),
                         static_cast<unsigned long long>(g_peek_send_only_defers.load(std::memory_order_acquire)),
                         static_cast<unsigned long long>(g_peek_send_only_flushes.load(std::memory_order_acquire)),
                         dispatch_stage ? dispatch_stage : "<null>",
@@ -3747,32 +3583,16 @@ static LONG CALLBACK aida_diagnostic_veh(EXCEPTION_POINTERS* ep)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-static void log_fileless_startup_state(const char* phase)
+static void log_disk_backed_startup_state(const char* phase)
 {
     char module[MAX_PATH] = {};
     char cwd[MAX_PATH] = {};
-    char debug_log[MAX_PATH] = {};
-    char bootstrap_log[MAX_PATH] = {};
-    char mapped_base[64] = {};
-    char mapped_size[64] = {};
-    char entry_rva[64] = {};
-    char fileless[32] = {};
-    char no_disk[32] = {};
-    char payload_trace[32] = {};
     char camoufox_exe[MAX_PATH] = {};
     char camoufox_mcp[MAX_PATH] = {};
     char camoufox_python[MAX_PATH] = {};
     char camoufox_setup[32] = {};
     GetModuleFileNameA(nullptr, module, static_cast<DWORD>(sizeof(module)));
     GetCurrentDirectoryA(static_cast<DWORD>(sizeof(cwd)), cwd);
-    GetEnvironmentVariableA("AIDA_FILELESS_LAUNCH", fileless, static_cast<DWORD>(sizeof(fileless)));
-    GetEnvironmentVariableA("AIDA_FILELESS_NO_DISK_WRITE", no_disk, static_cast<DWORD>(sizeof(no_disk)));
-    GetEnvironmentVariableA("AIDA_PAYLOAD_TRACE", payload_trace, static_cast<DWORD>(sizeof(payload_trace)));
-    GetEnvironmentVariableA("AIDA_FILELESS_DEBUG_LOG_PATH", debug_log, static_cast<DWORD>(sizeof(debug_log)));
-    GetEnvironmentVariableA("AIDA_FILELESS_BOOTSTRAP_LOG_PATH", bootstrap_log, static_cast<DWORD>(sizeof(bootstrap_log)));
-    GetEnvironmentVariableA("AIDA_FILELESS_IMAGE_BASE", mapped_base, static_cast<DWORD>(sizeof(mapped_base)));
-    GetEnvironmentVariableA("AIDA_FILELESS_IMAGE_SIZE", mapped_size, static_cast<DWORD>(sizeof(mapped_size)));
-    GetEnvironmentVariableA("AIDA_FILELESS_ENTRY_RVA", entry_rva, static_cast<DWORD>(sizeof(entry_rva)));
     GetEnvironmentVariableA("AIDA_CAMOUFOX_EXECUTABLE", camoufox_exe, static_cast<DWORD>(sizeof(camoufox_exe)));
     GetEnvironmentVariableA("AIDA_CAMOUFOX_MCP_EXECUTABLE", camoufox_mcp, static_cast<DWORD>(sizeof(camoufox_mcp)));
     GetEnvironmentVariableA("AIDA_CAMOUFOX_PYTHON", camoufox_python, static_cast<DWORD>(sizeof(camoufox_python)));
@@ -3796,20 +3616,12 @@ static void log_fileless_startup_state(const char* phase)
         VirtualQuery(image, &mbi, sizeof(mbi));
 
     diag::log_tagged_critical_fmt("main",
-        "fileless_startup_state phase=%s pid=%lu tid=%lu fileless=%s no_disk_write=%s payload_trace=%s module=%s cwd=%s debug_log=%s bootstrap_log=%s mapped_base_env=%s mapped_size_env=%s entry_rva_env=%s camoufox_exe=%s camoufox_mcp=%s camoufox_python=%s camoufox_setup=%s image_base=0x%016llX alloc_base=0x%016llX mbi_base=0x%016llX mbi_size=0x%llX mbi_state=0x%08lX mbi_protect=0x%08lX teb=0x%016llX peb=0x%016llX tls_vector=0x%016llX tls_slot51=0x%016llX",
+        "disk_backed_startup_state phase=%s pid=%lu tid=%lu module=%s cwd=%s camoufox_exe=%s camoufox_mcp=%s camoufox_python=%s camoufox_setup=%s image_base=0x%016llX alloc_base=0x%016llX mbi_base=0x%016llX mbi_size=0x%llX mbi_state=0x%08lX mbi_protect=0x%08lX teb=0x%016llX peb=0x%016llX tls_vector=0x%016llX tls_slot51=0x%016llX",
         phase ? phase : "",
         GetCurrentProcessId(),
         GetCurrentThreadId(),
-        fileless,
-        no_disk,
-        payload_trace,
         module,
         cwd,
-        debug_log,
-        bootstrap_log,
-        mapped_base,
-        mapped_size,
-        entry_rva,
         camoufox_exe,
         camoufox_mcp,
         camoufox_python,
@@ -3851,8 +3663,8 @@ int main(int, char**)
         GetCurrentThreadId(),
         static_cast<unsigned long long>(GetTickCount64()));
     aida_early_startup::mark_normal_diagnostics_reached();
-    aida_early_startup::mark("fileless_startup_state_pre");
-    log_fileless_startup_state("post_veh");
+    aida_early_startup::mark("disk_backed_startup_state_pre");
+    log_disk_backed_startup_state("post_veh");
     aida_early_startup::mark("normal_startup_state_logged");
     aida_early_startup::mark("single_instance_gate_pre");
     if (!acquire_single_instance_gate()) {
@@ -4356,7 +4168,6 @@ int main(int, char**)
         kAidaFullTestHotkeyId,
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
         static_cast<unsigned long>(GetLastError()));
-    activate_fileless_window(hwnd, "post_show_window", 0);
     crash_log_write("window_shown_acrylic_set");
 
     {
@@ -4889,7 +4700,6 @@ int main(int, char**)
     bool done = false;
     static int prev_state = -1;
     static uint64_t frame_number = 0;
-    const bool fileless_customer_launch = fileless_launch_active();
     while (!done)
     {
         const uint64_t frame_start_tick_ms = static_cast<uint64_t>(GetTickCount64());
@@ -5033,8 +4843,7 @@ int main(int, char**)
                 msg.message == WM_NCDESTROY || msg.message == WM_QUIT ||
                 msg.message == WM_SYSCOMMAND || msg.message == WM_LBUTTONDOWN ||
                 msg.message == WM_LBUTTONUP || msg.message == WM_NCLBUTTONDOWN ||
-                msg.message == WM_NCLBUTTONUP || msg.message == WM_MOUSEACTIVATE ||
-                aida_tracer::should_log_fileless_input_message(msg.message);
+                msg.message == WM_NCLBUTTONUP || msg.message == WM_MOUSEACTIVATE;
             if (close_related_msg) {
                 POINT cursor{};
                 GetCursorPos(&cursor);
@@ -5164,20 +4973,6 @@ int main(int, char**)
         if (globals::ui::welcome_done && license_ready) cur_state = 3;
         bool state_changed = (cur_state != prev_state);
         if (state_changed) prev_state = cur_state;
-        static uint64_t fileless_ide_first_frame = 0;
-        static bool fileless_services_deferred_logged = false;
-        if (fileless_customer_launch && cur_state == 3 && fileless_ide_first_frame == 0) {
-            fileless_ide_first_frame = frame_number;
-            diag::log_tagged_critical_fmt("render",
-                "fileless_ide_first_frame frame=%llu w=%d h=%d prev_w=%d prev_h=%d",
-                (unsigned long long)frame_number,
-                iw,
-                ih,
-                prev_w,
-                prev_h);
-        }
-        const bool fileless_ide_settled = !fileless_customer_launch ||
-            (fileless_ide_first_frame != 0 && frame_number >= fileless_ide_first_frame + 18ULL);
 
         static bool s_arc_startup_gate_passed = false;
         if (!s_arc_startup_gate_passed && cur_state == 3 && standalone_license::is_arc_loaded())
@@ -5218,16 +5013,7 @@ int main(int, char**)
             s_arc_startup_gate_passed = true;
             globals::ui::arc_unseal_phase.store(2, std::memory_order_release);
         }
-        if (s_arc_startup_gate_passed && license_ready && !fileless_ide_settled && !fileless_services_deferred_logged) {
-            fileless_services_deferred_logged = true;
-            startup_log_critical_fmt("fileless_authorized_services_deferred first_frame=%llu frame=%llu settle_frames=18 pid=%lu tid=%lu tick=%llu",
-                static_cast<unsigned long long>(fileless_ide_first_frame),
-                static_cast<unsigned long long>(frame_number),
-                GetCurrentProcessId(),
-                GetCurrentThreadId(),
-                static_cast<unsigned long long>(GetTickCount64()));
-        }
-        if (s_arc_startup_gate_passed && license_ready && fileless_ide_settled) {
+        if (s_arc_startup_gate_passed && license_ready) {
             if (!g_authorized_features_initialized.load(std::memory_order_acquire) &&
                 !g_authorized_features_posted.exchange(true, std::memory_order_acq_rel))
             {
@@ -5288,15 +5074,8 @@ int main(int, char**)
             }
         }
 
-        static bool fileless_ide_region_applied = false;
-        static bool fileless_ide_region_defer_logged = false;
-        static bool fileless_ide_activation_done = false;
         if (iw != prev_w || ih != prev_h)
         {
-            const bool defer_fileless_ide_region = fileless_customer_launch &&
-                cur_state == 3 &&
-                !fileless_ide_region_applied &&
-                !fileless_ide_settled;
             diag::log_tagged_critical_fmt("render",
                 "second_resize_pre iw=%d ih=%d prev_w=%d prev_h=%d cur_state=%d ide_resize_applied=%d frame=%llu",
                 iw, ih, prev_w, prev_h, cur_state, ide_resize_applied ? 1 : 0,
@@ -5311,38 +5090,18 @@ int main(int, char**)
 
                     int cx = (screen_w - iw) / 2;
                     int cy = (screen_h - ih) / 2;
-                    UINT flags = SWP_NOZORDER;
-                    if (fileless_customer_launch)
-                        flags |= SWP_NOACTIVATE;
-                    SetWindowPos(hwnd, nullptr, cx, cy, iw, ih, flags);
+                    SetWindowPos(hwnd, nullptr, cx, cy, iw, ih, SWP_NOZORDER);
                 } else {
 
-                    UINT flags = SWP_NOZORDER | SWP_NOMOVE;
-                    if (fileless_customer_launch)
-                        flags |= SWP_NOACTIVATE;
-                    SetWindowPos(hwnd, nullptr, 0, 0, iw, ih, flags);
+                    SetWindowPos(hwnd, nullptr, 0, 0, iw, ih, SWP_NOZORDER | SWP_NOMOVE);
                 }
             }
             if (cur_state == 3 && ((iw >= 1000 && ih >= 600) || (globals::ui::welcome_done && license::runtime_ready(anti_tamper::state::get().violation_latched.load(std::memory_order_acquire), test_all_features::is_running()))))
                 ide_resize_applied = true;
 
-            if (defer_fileless_ide_region) {
-                ::SetWindowRgn(hwnd, nullptr, TRUE);
-                if (!fileless_ide_region_defer_logged) {
-                    fileless_ide_region_defer_logged = true;
-                    diag::log_tagged_critical_fmt("render",
-                        "fileless_ide_region_deferred frame=%llu iw=%d ih=%d settled=0",
-                        (unsigned long long)frame_number,
-                        iw,
-                        ih);
-                }
-            } else {
-                ::SetWindowRgn(hwnd, nullptr, TRUE);
-                DWM_WINDOW_CORNER_PREFERENCE cp = globals::ui::maximized ? DWMWCP_DONOTROUND : DWMWCP_ROUND;
-                DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cp, sizeof(cp));
-            }
-            if (!defer_fileless_ide_region && fileless_customer_launch && cur_state == 3)
-                fileless_ide_region_applied = true;
+            ::SetWindowRgn(hwnd, nullptr, TRUE);
+            DWM_WINDOW_CORNER_PREFERENCE cp = globals::ui::maximized ? DWMWCP_DONOTROUND : DWMWCP_ROUND;
+            DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cp, sizeof(cp));
             CleanupRenderTarget();
             HRESULT resize_hr = S_OK;
             DWORD resize_seh = seh_resize_buffers(g_pSwapChain, static_cast<UINT>(iw), static_cast<UINT>(ih), &resize_hr, frame_number, "layout_size_change");
@@ -5363,33 +5122,6 @@ int main(int, char**)
             prev_w = iw;
             prev_h = ih;
             diag::log_tagged_critical("render", "second_resize_post");
-        }
-
-        {
-            if (fileless_customer_launch &&
-                cur_state == 3 &&
-                ide_resize_applied &&
-                fileless_ide_settled &&
-                !fileless_ide_region_applied) {
-                ::SetWindowRgn(hwnd, nullptr, TRUE);
-                DWM_WINDOW_CORNER_PREFERENCE cp = globals::ui::maximized ? DWMWCP_DONOTROUND : DWMWCP_ROUND;
-                DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cp, sizeof(cp));
-                fileless_ide_region_applied = true;
-                diag::log_tagged_critical_fmt("render",
-                    "fileless_ide_region_late_applied frame=%llu iw=%d ih=%d maximized=%d",
-                    (unsigned long long)frame_number,
-                    iw,
-                    ih,
-                    globals::ui::maximized ? 1 : 0);
-            }
-        }
-
-        if (fileless_customer_launch &&
-            cur_state == 3 &&
-            fileless_ide_region_applied &&
-            !fileless_ide_activation_done) {
-            fileless_ide_activation_done = true;
-            activate_fileless_window(hwnd, "fileless_ide_region_ready", frame_number);
         }
 
         if (frame_number < 5)

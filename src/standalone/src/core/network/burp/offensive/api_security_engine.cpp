@@ -526,7 +526,10 @@ json candidate_mass_fields(const json& params)
         for (const auto& item : params["inject_fields"]) {
             if (item.is_string()) {
                 const std::string name = item.get<std::string>();
-                selected[name] = fields.contains(name) ? fields[name] : true;
+                if (fields.contains(name))
+                    selected[name] = fields[name];
+                else
+                    selected[name] = json(true);
             } else if (item.is_object() && item.contains("name") && item["name"].is_string()) {
                 const std::string name = item["name"].get<std::string>();
                 selected[name] = item.contains("value") ? item["value"] : json(true);

@@ -60,6 +60,17 @@ struct evidence_record_t
     nlohmann::json metadata_json = nlohmann::json::object();
 };
 
+struct evidence_filter_t
+{
+    std::string session_id;
+    uint64_t    finding_id = 0;
+    uint64_t    exchange_id = 0;
+    evidence_kind_t kind = evidence_kind_t::request_response;
+    bool        has_kind = false;
+    size_t      limit = 128;
+    size_t      offset = 0;
+};
+
 bool                   initialize();
 void                   shutdown();
 bool                   capture(const evidence_capture_t& capture, evidence_record_t& out);
@@ -68,6 +79,7 @@ bool                   capture_screenshot(uint64_t finding_id, const std::vector
 bool                   capture_file(uint64_t finding_id, const std::vector<uint8_t>& file_bytes, const std::string& file_name, evidence_record_t& out, const std::string& session_id = std::string());
 bool                   capture_timing(uint64_t finding_id, const nlohmann::json& timing_json, evidence_record_t& out, const std::string& session_id = std::string());
 std::vector<evidence_record_t> list_for_finding(uint64_t finding_id);
+std::vector<evidence_record_t> list(const evidence_filter_t& filter);
 bool                   get(uint64_t evidence_id, evidence_record_t& out);
 nlohmann::json         summary_json(const evidence_record_t& record);
 nlohmann::json         export_json(uint64_t finding_id);

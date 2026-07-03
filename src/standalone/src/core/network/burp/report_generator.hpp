@@ -7,6 +7,8 @@
 
 #include "issue.hpp"
 
+#include <nlohmann/json.hpp>
+
 namespace aida {
 namespace burp {
 namespace report {
@@ -30,6 +32,18 @@ struct report_config_t
     bool                         include_remediation = true;
     std::string                  output_path;
     report_format_t              format = report_format_t::html;
+    std::string                  session_id;
+    bool                         include_session_context = true;
+    bool                         include_audit_trail = false;
+    size_t                       audit_trail_limit = 128;
+    bool                         has_audit_id = false;
+    uint64_t                     audit_id = 0;
+    bool                         has_severity_min = false;
+    severity_t                   severity_min = severity_t::info;
+    std::string                  target_domain;
+    bool                         include_recon = true;
+    std::vector<std::string>     include_offensive_run_ids;
+    bool                         include_suppressed = false;
 };
 
 struct generated_report_t
@@ -40,6 +54,7 @@ struct generated_report_t
     std::string     output_path;
     report_format_t format = report_format_t::html;
     size_t          issue_count = 0;
+    bool            inline_output = false;
 };
 
 bool                generate(const report_config_t& cfg, std::string& out_path_or_error);

@@ -120,6 +120,8 @@ void listener_loop(std::shared_ptr<listener_runtime> rt)
         obs.local_port = rt->config.bind_port;
         if (obs.is_quic && rt->config.fail_closed_without_tls_keys && obs.unsupported_reason.empty())
             obs.unsupported_reason = "quic_payload_encrypted_tls_keys_unavailable";
+        obs.decrypted = false;
+        obs.http3_frames_available = false;
         record_observation(obs, rt->config.max_observations == 0 ? 512 : rt->config.max_observations);
         diag::log_tagged_fmt("quic_proxy", "datagram id=%llu client=%s:%u bytes=%zu is_quic=%d type=%s version=%s decrypted=%d unsupported=%s",
             static_cast<unsigned long long>(rt->id),
@@ -206,6 +208,14 @@ quic_observation classify_datagram(const uint8_t* data,
 
 bool start(const quic_proxy_config& config, uint64_t* listener_id)
 {
+    if (!config.observation_only) {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_stats.last_error = "quic_full_mitm_not_supported_observation_only";
+        g_stats.observation_only = true;
+        g_stats.mitm_supported = false;
+        g_stats.contract = "observation_only_no_decryption_no_forwarding_no_modification";
+        return false;
+    }
     SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (s == INVALID_SOCKET) {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -245,6 +255,9 @@ bool start(const quic_proxy_config& config, uint64_t* listener_id)
         g_listeners.push_back(rt);
         g_stats.running = true;
         g_stats.listener_count = g_listeners.size();
+        g_stats.observation_only = true;
+        g_stats.mitm_supported = false;
+        g_stats.contract = "observation_only_no_decryption_no_forwarding_no_modification";
         if (listener_id)
             *listener_id = rt->id;
     }
@@ -304,6 +317,10 @@ quic_proxy_stats get_stats()
     quic_proxy_stats out = g_stats;
     out.listener_count = g_listeners.size();
     out.running = !g_listeners.empty();
+    out.observation_only = true;
+    out.mitm_supported = false;
+    if (out.contract.empty())
+        out.contract = "observation_only_no_decryption_no_forwarding_no_modification";
     return out;
 }
 

@@ -357,45 +357,12 @@ void append_developer_repo_roots(std::vector<std::wstring>& bases, const std::ws
         append_developer_repo_candidate(bases, join_path_w(home_drive + home_path, L"AiDAPrivate"));
 }
 
-bool fileless_camoufox_browser_path_allowed(const std::wstring& candidate)
-{
-    if (!env_flag_enabled(L"AIDA_FILELESS_LAUNCH"))
-        return true;
-    std::wstring aida_root = local_appdata_aida_root();
-    if (!aida_root.empty())
-    {
-        const std::wstring standalone_camoufox_root = join_path_w(join_path_w(aida_root, L"Standalone"), L"camoufox");
-        if (path_under_root_w(candidate, join_path_w(standalone_camoufox_root, L"current")) ||
-            path_under_root_w(candidate, join_path_w(standalone_camoufox_root, L"staging")) ||
-            path_under_root_w(candidate, join_path_w(standalone_camoufox_root, L"backup")))
-            return true;
-        const std::wstring legacy_camoufox_root = join_path_w(aida_root, L"camoufox");
-        if (path_under_root_w(candidate, join_path_w(legacy_camoufox_root, L"current")) ||
-            path_under_root_w(candidate, join_path_w(legacy_camoufox_root, L"staging")) ||
-            path_under_root_w(candidate, join_path_w(legacy_camoufox_root, L"backup")))
-            return true;
-    }
-    std::vector<wchar_t> temp(32768);
-    DWORD temp_len = GetTempPathW(static_cast<DWORD>(temp.size()), temp.data());
-    if (temp_len == 0 || temp_len >= static_cast<DWORD>(temp.size()))
-        return false;
-    const std::wstring temp_root(temp.data(), temp_len);
-    const std::wstring camoufox_root = join_path_w(join_path_w(temp_root, L"AiDA"), L"camoufox");
-    return path_under_root_w(candidate, join_path_w(camoufox_root, L"current")) ||
-        path_under_root_w(candidate, join_path_w(camoufox_root, L"staging")) ||
-        path_under_root_w(candidate, join_path_w(camoufox_root, L"backup"));
-}
-
 std::vector<std::wstring> runtime_base_dirs()
 {
     std::vector<std::wstring> bases;
-    const bool fileless = env_flag_enabled(L"AIDA_FILELESS_LAUNCH");
     std::wstring exe_dir = executable_dir_w();
-    if (!fileless)
-        append_developer_repo_roots(bases, exe_dir);
+    append_developer_repo_roots(bases, exe_dir);
     append_camoufox_sidecar_roots(bases);
-    if (fileless)
-        return bases;
     append_unique_path(bases, exe_dir);
     append_unique_path(bases, current_dir_w());
     append_unique_path(bases, parent_dir_w(exe_dir));
@@ -420,13 +387,9 @@ bool is_bundled_browser_dir(const std::wstring& dir)
 std::vector<std::wstring> aida_runtime_base_dirs()
 {
     std::vector<std::wstring> bases;
-    const bool fileless = env_flag_enabled(L"AIDA_FILELESS_LAUNCH");
     std::wstring exe_dir = executable_dir_w();
-    if (!fileless)
-        append_developer_repo_roots(bases, exe_dir);
+    append_developer_repo_roots(bases, exe_dir);
     append_camoufox_sidecar_roots(bases);
-    if (fileless)
-        return bases;
     append_unique_path(bases, exe_dir);
     append_unique_path(bases, current_dir_w());
     append_unique_path(bases, parent_dir_w(exe_dir));
@@ -472,12 +435,6 @@ bool discover_bundled_browser_dir(std::wstring& out_dir)
         std::wstring candidate = base;
         if (is_bundled_browser_dir(candidate))
         {
-            if (!fileless_camoufox_browser_path_allowed(join_path_w(candidate, L"camoufox.exe")))
-            {
-                diag::log_tagged_fmt("camoufox_install", "bundled_browser rejected_fileless_path path=%s base=%s",
-                    wide_to_utf8(candidate).c_str(), wide_to_utf8(base).c_str());
-                continue;
-            }
             out_dir = candidate;
             SetEnvironmentVariableW(L"AIDA_CAMOUFOX_EXECUTABLE", join_path_w(candidate, L"camoufox.exe").c_str());
             diag::log_tagged_fmt("camoufox_install", "bundled_browser selected path=%s base=%s",
@@ -487,12 +444,6 @@ bool discover_bundled_browser_dir(std::wstring& out_dir)
         candidate = join_path_w(join_path_w(base, L"deps"), name);
         if (is_bundled_browser_dir(candidate))
         {
-            if (!fileless_camoufox_browser_path_allowed(join_path_w(candidate, L"camoufox.exe")))
-            {
-                diag::log_tagged_fmt("camoufox_install", "bundled_browser rejected_fileless_path path=%s base=%s",
-                    wide_to_utf8(candidate).c_str(), wide_to_utf8(base).c_str());
-                continue;
-            }
             out_dir = candidate;
             SetEnvironmentVariableW(L"AIDA_CAMOUFOX_EXECUTABLE", join_path_w(candidate, L"camoufox.exe").c_str());
             diag::log_tagged_fmt("camoufox_install", "bundled_browser selected path=%s base=%s",
@@ -502,12 +453,6 @@ bool discover_bundled_browser_dir(std::wstring& out_dir)
         candidate = join_path_w(base, name);
         if (is_bundled_browser_dir(candidate))
         {
-            if (!fileless_camoufox_browser_path_allowed(join_path_w(candidate, L"camoufox.exe")))
-            {
-                diag::log_tagged_fmt("camoufox_install", "bundled_browser rejected_fileless_path path=%s base=%s",
-                    wide_to_utf8(candidate).c_str(), wide_to_utf8(base).c_str());
-                continue;
-            }
             out_dir = candidate;
             SetEnvironmentVariableW(L"AIDA_CAMOUFOX_EXECUTABLE", join_path_w(candidate, L"camoufox.exe").c_str());
             diag::log_tagged_fmt("camoufox_install", "bundled_browser selected path=%s base=%s",
@@ -632,12 +577,6 @@ bool discover_configured_browser_executable(std::wstring& out_path)
     {
         diag::log_tagged_fmt("camoufox_install", "configured_browser rejected path=%s leaf=%s",
             wide_to_utf8(candidate).c_str(), wide_to_utf8(leaf).c_str());
-        return false;
-    }
-    if (!fileless_camoufox_browser_path_allowed(candidate))
-    {
-        diag::log_tagged_fmt("camoufox_install", "configured_browser rejected_fileless_path path=%s",
-            wide_to_utf8(candidate).c_str());
         return false;
     }
     out_path = candidate;

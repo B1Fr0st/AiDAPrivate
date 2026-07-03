@@ -46,6 +46,7 @@ namespace anti_debug {
 
     inline volatile UCHAR g_kd_baseline = 0;
     inline volatile LONG  g_kd_baseline_captured = 0;
+    inline volatile LONG  g_kd_state_log = -1;
 
     typedef struct _ADBG_SYSTEM_PROCESS_INFORMATION {
         ULONG NextEntryOffset;
@@ -178,6 +179,18 @@ namespace anti_debug {
         return *kud;
     }
 
+    __forceinline BOOLEAN kd_shared_enabled(UCHAR value) {
+        return (value & 0x1u) != 0 ? TRUE : FALSE;
+    }
+
+    __forceinline BOOLEAN kd_shared_not_present(UCHAR value) {
+        return (value & 0x2u) != 0 ? TRUE : FALSE;
+    }
+
+    __forceinline BOOLEAN kd_shared_active(UCHAR value) {
+        return (kd_shared_enabled(value) && !kd_shared_not_present(value)) ? TRUE : FALSE;
+    }
+
     __forceinline void initialize_kd_baseline() {
         if (_InterlockedCompareExchange(&g_kd_baseline_captured, 1, 0) == 0) {
             g_kd_baseline = read_kd_shared_byte();
@@ -190,7 +203,7 @@ namespace anti_debug {
         }
         UCHAR current = read_kd_shared_byte();
         UCHAR baseline = g_kd_baseline;
-        return (current != 0) && (baseline == 0);
+        return kd_shared_active(current) && !kd_shared_active(baseline);
     }
 
     __forceinline void acquire_lock() {
@@ -207,25 +220,50 @@ namespace anti_debug {
 
     __forceinline BOOLEAN check_kernel_debugger() {
         __try {
-            if (KD_DEBUGGER_ENABLED) {
-                return TRUE;
+            if (_KdRefreshDebuggerNotPresent) {
+                _KdRefreshDebuggerNotPresent();
             }
 
-            if (!KD_DEBUGGER_NOT_PRESENT) {
-                return TRUE;
-            }
+            const BOOLEAN kd_enabled = KD_DEBUGGER_ENABLED ? TRUE : FALSE;
+            const BOOLEAN kd_not_present = KD_DEBUGGER_NOT_PRESENT ? TRUE : FALSE;
+            UCHAR shared_state = 0;
 
             PKUSER_SHARED_DATA shared_data = reinterpret_cast<PKUSER_SHARED_DATA>(0xFFFFF78000000000ULL);
             if (shared_data && _MmIsAddressValid(shared_data)) {
-                if (shared_data->KdDebuggerEnabled) {
-                    return TRUE;
-                }
+                shared_state = shared_data->KdDebuggerEnabled;
             }
+
+            const BOOLEAN macro_active = (kd_enabled && !kd_not_present) ? TRUE : FALSE;
+            const BOOLEAN shared_active = kd_shared_active(shared_state);
+            const BOOLEAN active = (macro_active || shared_active) ? TRUE : FALSE;
+            const LONG packed_state =
+                (kd_enabled ? 0x1L : 0L) |
+                (kd_not_present ? 0x2L : 0L) |
+                (kd_shared_enabled(shared_state) ? 0x4L : 0L) |
+                (kd_shared_not_present(shared_state) ? 0x8L : 0L) |
+                (macro_active ? 0x10L : 0L) |
+                (shared_active ? 0x20L : 0L) |
+                (active ? 0x40L : 0L);
+            const LONG previous_state = _InterlockedExchange(&g_kd_state_log, packed_state);
+            if (active || previous_state != packed_state) {
+                WW_LOG("[ADBG] kernel_debugger_state kd_enabled=%u kd_not_present=%u shared_state=0x%02x shared_enabled=%u shared_not_present=%u macro_active=%u shared_active=%u active=%u previous=0x%lx current=0x%lx",
+                    kd_enabled ? 1u : 0u,
+                    kd_not_present ? 1u : 0u,
+                    static_cast<unsigned>(shared_state),
+                    kd_shared_enabled(shared_state) ? 1u : 0u,
+                    kd_shared_not_present(shared_state) ? 1u : 0u,
+                    macro_active ? 1u : 0u,
+                    shared_active ? 1u : 0u,
+                    active ? 1u : 0u,
+                    previous_state,
+                    packed_state);
+            }
+
+            return active;
         } __except(EXCEPTION_EXECUTE_HANDLER) {
+            WW_LOG("[ADBG] kernel_debugger_state_exception active=1");
             return TRUE;
         }
-
-        return FALSE;
     }
 
     __forceinline BOOLEAN check_hypervisor() {

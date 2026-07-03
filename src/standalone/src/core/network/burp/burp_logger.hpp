@@ -5,6 +5,8 @@
 #include <string>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 #include "burp_events.hpp"
 
 namespace aida {
@@ -64,6 +66,9 @@ std::vector<log_row_t>   query(const log_filter_t& f, size_t limit);
 size_t              total_rows();
 void                clear();
 bool                export_csv(const std::string& path, const log_filter_t& f);
+nlohmann::json      row_to_json(const log_row_t& row);
+bool                row_from_json(const nlohmann::json& doc, log_row_t& row);
+bool                import_rows(const std::vector<log_row_t>& rows, bool replace_existing);
 
 void                set_capacity(size_t rows);
 size_t              capacity();

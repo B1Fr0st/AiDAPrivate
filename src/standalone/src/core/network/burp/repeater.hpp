@@ -7,6 +7,8 @@
 #include <utility>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 #include "burp_events.hpp"
 
 namespace aida {
@@ -57,6 +59,8 @@ bool update_tab_target(uint64_t tab_id, const std::string& host, uint16_t port, 
 
 size_t tab_count();
 void clear_all();
+nlohmann::json export_json();
+bool import_json(const nlohmann::json& doc, bool replace_existing);
 
 }
 }

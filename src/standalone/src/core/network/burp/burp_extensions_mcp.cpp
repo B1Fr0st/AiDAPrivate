@@ -92,7 +92,7 @@ void register_extension_tools(mcp_standalone::server_t& srv)
 {
     srv.register_tool({
         "burp_extensions_list",
-        "List validated local Burp extension manifests and tool descriptors from the approved AiDA extension directory.",
+        "List validated local Burp extension manifests and tool descriptors from the approved AiDA extension directory. This is descriptor inventory only and never executes extension code.",
         {
             {"include_disabled", "boolean", "Include disabled extensions. Default true.", false},
             {"include_descriptors", "boolean", "Include input schemas and descriptor metadata. Default true.", false}
@@ -111,7 +111,7 @@ void register_extension_tools(mcp_standalone::server_t& srv)
 
     srv.register_tool({
         "burp_extensions_get",
-        "Return one validated local Burp extension record by id.",
+        "Return one validated local Burp extension record by id without executing extension code.",
         {
             {"id", "string", "Extension id", true}
         },
@@ -121,7 +121,7 @@ void register_extension_tools(mcp_standalone::server_t& srv)
 
     srv.register_tool({
         "burp_extensions_set_enabled",
-        "Enable or disable a validated local Burp extension descriptor set without executing extension code.",
+        "Toggle descriptor inventory visibility for a validated local Burp extension. This does not register or execute extension tools.",
         {
             {"id", "string", "Extension id", true},
             {"enabled", "boolean", "Explicit enabled state", true}

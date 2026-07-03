@@ -3,7 +3,6 @@
 #include <windows.h>
 #include <intrin.h>
 #include <psapi.h>
-#include <tlhelp32.h>
 
 #include <atomic>
 #include <chrono>
@@ -259,30 +258,49 @@ namespace detail {
         return value;
     }
 
-    inline bool contains_ci(const std::string& value, const char* needle)
+    struct native_kd_state_t
     {
-        if (!needle || !*needle)
-            return false;
-        return lower_path_copy(value).find(lower_path_copy(std::string(needle))) != std::string::npos;
-    }
+        bool query_ok = false;
+        bool active = false;
+        BOOLEAN enabled = 0;
+        BOOLEAN not_present = 1;
+        LONG status = 0;
+        ULONG returned = 0;
+    };
 
-    inline bool ends_with_ci(const std::string& value, const char* suffix)
+    inline native_kd_state_t query_native_kernel_debugger_state()
     {
-        if (!suffix || !*suffix)
-            return false;
-        const std::string v = lower_path_copy(value);
-        const std::string s = lower_path_copy(std::string(suffix));
-        return s.size() <= v.size() && v.compare(v.size() - s.size(), s.size(), s) == 0;
-    }
-
-    inline bool processes_share_session(DWORD a, DWORD b)
-    {
-        DWORD sa = 0;
-        DWORD sb = 0;
-        return a != 0 && b != 0 &&
-            ProcessIdToSessionId(a, &sa) &&
-            ProcessIdToSessionId(b, &sb) &&
-            sa == sb;
+        native_kd_state_t state{};
+        using nt_query_system_information_t = LONG(NTAPI*)(ULONG, PVOID, ULONG, PULONG);
+        HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+        if (!nt)
+        {
+            state.status = static_cast<LONG>(0xC0000135u);
+            return state;
+        }
+        auto query = reinterpret_cast<nt_query_system_information_t>(
+            GetProcAddress(nt, "NtQuerySystemInformation"));
+        if (!query)
+        {
+            state.status = static_cast<LONG>(0xC0000139u);
+            return state;
+        }
+        struct kernel_debugger_information_t
+        {
+            BOOLEAN KernelDebuggerEnabled;
+            BOOLEAN KernelDebuggerNotPresent;
+        } kdi{};
+        ULONG returned = 0;
+        LONG status = query(35, &kdi, sizeof(kdi), &returned);
+        state.status = status;
+        state.returned = returned;
+        if (status < 0)
+            return state;
+        state.query_ok = true;
+        state.enabled = kdi.KernelDebuggerEnabled;
+        state.not_present = kdi.KernelDebuggerNotPresent;
+        state.active = kdi.KernelDebuggerEnabled != 0 && kdi.KernelDebuggerNotPresent == 0;
+        return state;
     }
 
     inline bool trusted_windows_system_owner(const foreign_handle_observation_t& obs)
@@ -340,158 +358,6 @@ namespace detail {
         return flags.empty() ? "none" : flags;
     }
 
-    inline bool env_flag_enabled_a(const char* name)
-    {
-        char value[16] = {};
-        DWORD n = GetEnvironmentVariableA(name, value, static_cast<DWORD>(sizeof(value)));
-        if (n == 0 || n >= static_cast<DWORD>(sizeof(value)))
-            return false;
-        return !(value[0] == '0' && (value[1] == '\0' || value[1] == ' ' || value[1] == '\t'));
-    }
-
-    inline bool env_value_present_a(const char* name)
-    {
-        char value[MAX_PATH] = {};
-        DWORD n = GetEnvironmentVariableA(name, value, static_cast<DWORD>(sizeof(value)));
-        return n > 0 && n < static_cast<DWORD>(sizeof(value));
-    }
-
-    inline bool env_u64_a(const char* name, uint64_t& out)
-    {
-        out = 0;
-        char value[64] = {};
-        DWORD n = GetEnvironmentVariableA(name, value, static_cast<DWORD>(sizeof(value)));
-        if (n == 0 || n >= static_cast<DWORD>(sizeof(value)))
-            return false;
-        char* end = nullptr;
-        unsigned long long parsed = std::strtoull(value, &end, 0);
-        if (end == value || parsed == 0)
-            return false;
-        while (end && (*end == ' ' || *end == '\t'))
-            ++end;
-        if (end && *end != '\0')
-            return false;
-        out = static_cast<uint64_t>(parsed);
-        return true;
-    }
-
-    inline DWORD current_parent_pid()
-    {
-        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if (snap == INVALID_HANDLE_VALUE)
-            return 0;
-        DWORD self = GetCurrentProcessId();
-        DWORD parent = 0;
-        PROCESSENTRY32W pe = {};
-        pe.dwSize = sizeof(pe);
-        for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe))
-        {
-            if (pe.th32ProcessID == self)
-            {
-                parent = pe.th32ParentProcessID;
-                break;
-            }
-        }
-        CloseHandle(snap);
-        return parent;
-    }
-
-    inline bool current_module_is_fileless_host()
-    {
-        char path[MAX_PATH] = {};
-        DWORD got = GetModuleFileNameA(nullptr, path, static_cast<DWORD>(sizeof(path)));
-        if (got == 0 || got >= static_cast<DWORD>(sizeof(path)))
-            return false;
-        std::string image = basename_from_path(path);
-        return streq_ci(image.c_str(), "powershell.exe") ||
-            streq_ci(image.c_str(), "pwsh.exe");
-    }
-
-    inline bool fileless_image_base_matches_current_module()
-    {
-        uint64_t mapped_base = 0;
-        if (!env_u64_a("AIDA_FILELESS_IMAGE_BASE", mapped_base))
-            return false;
-        return mapped_base == reinterpret_cast<uint64_t>(&__ImageBase);
-    }
-
-    inline bool fileless_bootstrap_context_active()
-    {
-        static std::atomic<bool> s_fileless_context_seen{false};
-        if (s_fileless_context_seen.load(std::memory_order_acquire))
-            return true;
-        const bool env_ok = env_flag_enabled_a("AIDA_FILELESS_LAUNCH") &&
-            env_flag_enabled_a("AIDA_FILELESS_NO_DISK_WRITE") &&
-            env_value_present_a("AIDA_FILELESS_DEBUG_LOG_PATH") &&
-            env_value_present_a("AIDA_FILELESS_BOOTSTRAP_LOG_PATH") &&
-            env_value_present_a("AIDA_FILELESS_IMAGE_BASE") &&
-            env_value_present_a("AIDA_FILELESS_IMAGE_SIZE") &&
-            env_value_present_a("AIDA_FILELESS_ENTRY_RVA");
-        const bool active = env_ok &&
-            (current_module_is_fileless_host() || fileless_image_base_matches_current_module());
-        if (active)
-            s_fileless_context_seen.store(true, std::memory_order_release);
-        return active;
-    }
-
-    inline bool fileless_bootstrap_parent_owner(DWORD owner_pid,
-                                                DWORD parent_pid,
-                                                const std::string& owner_image,
-                                                const std::string& owner_path)
-    {
-        if (owner_pid == 0)
-            return false;
-        if (!fileless_bootstrap_context_active())
-            return false;
-        if (owner_path.empty() || owner_path == "?")
-            return false;
-        const bool terminal_image = streq_ci(owner_image.c_str(), "windowsterminal.exe") ||
-            streq_ci(owner_image.c_str(), "wt.exe") ||
-            streq_ci(owner_image.c_str(), "conhost.exe") ||
-            streq_ci(owner_image.c_str(), "openconsole.exe");
-        if (!terminal_image)
-            return false;
-        const bool windows_terminal_package =
-            contains_ci(owner_path, "\\program files\\windowsapps\\microsoft.windowsterminal_") ||
-            contains_ci(owner_path, "\\appdata\\local\\microsoft\\windowsapps\\microsoft.windowsterminal_");
-        const bool trusted_path =
-            (streq_ci(owner_image.c_str(), "windowsterminal.exe") && windows_terminal_package) ||
-            (streq_ci(owner_image.c_str(), "wt.exe") &&
-                (windows_terminal_package || ends_with_ci(owner_path, "\\appdata\\local\\microsoft\\windowsapps\\wt.exe"))) ||
-            (streq_ci(owner_image.c_str(), "openconsole.exe") &&
-                (windows_terminal_package ||
-                 ends_with_ci(owner_path, "\\windows\\system32\\openconsole.exe") ||
-                 ends_with_ci(owner_path, "\\windows\\syswow64\\openconsole.exe"))) ||
-            (streq_ci(owner_image.c_str(), "conhost.exe") &&
-                (ends_with_ci(owner_path, "\\windows\\system32\\conhost.exe") ||
-                 ends_with_ci(owner_path, "\\windows\\syswow64\\conhost.exe")));
-        if (!trusted_path)
-            return false;
-        return owner_pid == parent_pid || processes_share_session(owner_pid, GetCurrentProcessId());
-    }
-
-    inline void log_fileless_bootstrap_parent_handle_ignored(DWORD owner_pid,
-                                                            DWORD parent_pid,
-                                                            ULONG_PTR handle_value,
-                                                            ACCESS_MASK access,
-                                                            const std::string& owner_path,
-                                                            const std::string& owner_image)
-    {
-        const std::string flags = format_handle_access_flags(access);
-        char buf[768];
-        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-            "foreign_handle_fileless_parent_ignored self_pid=%lu owner_pid=%lu parent_pid=%lu owner=%s owner_path='%s' handle=0x%llX access=0x%08lX access_flags=%s",
-            static_cast<unsigned long>(GetCurrentProcessId()),
-            static_cast<unsigned long>(owner_pid),
-            static_cast<unsigned long>(parent_pid),
-            owner_image.c_str(),
-            owner_path.c_str(),
-            static_cast<unsigned long long>(handle_value),
-            static_cast<unsigned long>(access),
-            flags.c_str());
-        webhook::write_log("re_handle_probe", buf);
-    }
-
     inline void log_foreign_handle_observation(DWORD owner_pid,
                                                ULONG_PTR handle_value,
                                                ACCESS_MASK access,
@@ -525,7 +391,6 @@ namespace detail {
     inline bool detect_foreign_vm_write_handle()
     {
         DWORD my_pid = GetCurrentProcessId();
-        DWORD fileless_parent_pid = fileless_bootstrap_context_active() ? current_parent_pid() : 0;
         ULONG buf_size = 1024 * 1024;
         std::vector<uint8_t> buf(buf_size);
         ULONG ret_len = 0;
@@ -594,21 +459,6 @@ namespace detail {
             if (target_pid == my_pid) {
                 std::string owner_path = process_image_path_for_log(static_cast<DWORD>(h.UniqueProcessId));
                 std::string owner_image = owner_path == "?" ? "?" : basename_from_path(owner_path);
-                if (fileless_bootstrap_parent_owner(
-                        static_cast<DWORD>(h.UniqueProcessId),
-                        fileless_parent_pid,
-                        owner_image,
-                        owner_path))
-                {
-                    log_fileless_bootstrap_parent_handle_ignored(
-                        static_cast<DWORD>(h.UniqueProcessId),
-                        fileless_parent_pid,
-                        h.HandleValue,
-                        h.GrantedAccess,
-                        owner_path,
-                        owner_image);
-                    continue;
-                }
                 const bool high_risk = (h.GrantedAccess & HIGH_RISK) != 0;
                 log_foreign_handle_observation(
                     static_cast<DWORD>(h.UniqueProcessId),
@@ -1285,8 +1135,25 @@ namespace detail {
         if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver() && driver_bridge::dynamic_ioctls_ready()) {
             driver_bridge::anti_debug_result_t ar{};
             if (driver_bridge::kernel_anti_debug_query(ar)) {
-                if ((ar.result_flags & 0x1u) != 0)
-                    mask |= SIGNAL_KERNEL_DEBUG;
+                if ((ar.result_flags & 0x1u) != 0) {
+                    const native_kd_state_t kd = query_native_kernel_debugger_state();
+                    if (!kd.query_ok || kd.active) {
+                        mask |= SIGNAL_KERNEL_DEBUG;
+                    } else {
+                        char buf[320];
+                        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                            "kernel_debugger_driver_flag_suppressed driver_flags=0x%08X native_ok=%d native_enabled=%u native_not_present=%u native_active=%d native_status=0x%08lX native_returned=%lu debugger_pid=%llu",
+                            ar.result_flags,
+                            kd.query_ok ? 1 : 0,
+                            static_cast<unsigned>(kd.enabled),
+                            static_cast<unsigned>(kd.not_present),
+                            kd.active ? 1 : 0,
+                            static_cast<unsigned long>(kd.status),
+                            static_cast<unsigned long>(kd.returned),
+                            static_cast<unsigned long long>(ar.detected_debugger_pid));
+                        webhook::write_log("re_tick", buf);
+                    }
+                }
             }
         }
 
@@ -1407,28 +1274,18 @@ namespace detail {
                 (((query.result_flags & hard_kernel_flags) != 0) || query.detected_debugger_pid != 0);
         }
 
-        const DWORD fileless_parent_pid = fileless_bootstrap_context_active() ? current_parent_pid() : 0;
-        const bool trusted_fileless_terminal =
-            obs.valid &&
-            fileless_bootstrap_parent_owner(obs.owner_pid,
-                fileless_parent_pid,
-                obs.owner_image,
-                obs.owner_path);
         const bool suppress_unconfirmed_system =
             !confirmed && trusted_system && passive_system_access;
-        const bool suppress_unconfirmed_fileless_terminal =
-            !confirmed && trusted_fileless_terminal;
         const bool enforce = confirmed;
         const char* decision = confirmed ? "enforce_confirmed_kernel_evidence" :
             (suppress_unconfirmed_system ? "suppress_unconfirmed_trusted_system_handle" :
-             (suppress_unconfirmed_fileless_terminal ? "suppress_unconfirmed_fileless_terminal_handle" :
-              (kernel_ready && query_ok && scan_ok ? "suppress_unconfirmed_kernel_clean_foreign_handle" :
-               "suppress_unconfirmed_foreign_handle")));
+             (kernel_ready && query_ok && scan_ok ? "suppress_unconfirmed_kernel_clean_foreign_handle" :
+              "suppress_unconfirmed_foreign_handle"));
         const std::string flags = obs.valid ? format_handle_access_flags(obs.access) : "none";
 
         char buf[1152];
         _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-            "foreign_handle_decision path=%s decision=%s should_bsod=%d kernel_ready=%d confirmed=%d query_ok=%d query_flags=0x%08X query_pid=%llu scan_ok=%d scan_pid=%llu owner_valid=%d self_pid=%lu owner_pid=%lu owner=%s owner_path='%s' handle=0x%llX access=0x%08lX access_flags=%s high_risk=%d trusted_system_owner=%d passive_system_access=%d trusted_fileless_terminal=%d fileless_parent_pid=%lu ordinal=%u %s",
+            "foreign_handle_decision path=%s decision=%s should_bsod=%d kernel_ready=%d confirmed=%d query_ok=%d query_flags=0x%08X query_pid=%llu scan_ok=%d scan_pid=%llu owner_valid=%d self_pid=%lu owner_pid=%lu owner=%s owner_path='%s' handle=0x%llX access=0x%08lX access_flags=%s high_risk=%d trusted_system_owner=%d passive_system_access=%d ordinal=%u %s",
             path ? path : "re_detect",
             decision,
             enforce ? 1 : 0,
@@ -1450,8 +1307,6 @@ namespace detail {
             obs.valid && obs.high_risk ? 1 : 0,
             trusted_system ? 1 : 0,
             passive_system_access ? 1 : 0,
-            trusted_fileless_terminal ? 1 : 0,
-            static_cast<unsigned long>(fileless_parent_pid),
             obs.valid ? obs.ordinal : 0,
             detail_str.c_str());
         webhook::write_log(path ? path : "re_detect", buf);

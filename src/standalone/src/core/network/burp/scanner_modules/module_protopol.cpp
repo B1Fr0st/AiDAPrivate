@@ -1,4 +1,5 @@
 #include "../scanner_module.hpp"
+#include "module_http_util.hpp"
 
 #include "../../../../helpers/diag_log.hpp"
 
@@ -7,6 +8,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace aida {
@@ -43,8 +45,29 @@ std::optional<issue_t> protopol_detect(const insertion_point_t& ip, const probe_
     if (probe.marker.empty()) return std::nullopt;
     bool key_in_response = body_contains(resp, probe.marker);
     bool value_in_response = body_contains(resp, std::string("polluted_") + probe.marker);
+    const std::string body_lc = module_http::lower(module_http::body_text(resp));
+    const bool gadget_signal = key_in_response &&
+        (body_lc.find("object.prototype") != std::string::npos ||
+         body_lc.find("constructor.prototype") != std::string::npos ||
+         body_lc.find("__proto__") != std::string::npos ||
+         body_lc.find("lodash") != std::string::npos ||
+         body_lc.find("jquery.extend") != std::string::npos ||
+         body_lc.find("<script") != std::string::npos ||
+         body_lc.find("innerhtml") != std::string::npos);
     diag::log_tagged_fmt("mod_proto", "protopol_detect key_in_resp=%d value_in_resp=%d variant=%s",
                          key_in_response ? 1 : 0, value_in_response ? 1 : 0, probe.variant.c_str());
+    if (gadget_signal)
+    {
+        auto iss = make_issue("proto-pol.client-gadget-signal",
+                              "Prototype Pollution: client-side gadget signal",
+                              severity_t::high, confidence_t::tentative, ip, probe, resp, ctx,
+                              std::string("marker=") + probe.marker + "; gadget indicators found in reflected script-capable response");
+        iss.description = "The prototype-pollution canary was reflected in a response containing client-side gadget indicators such as prototype access, merge libraries, script sinks, or DOM assignment sinks.";
+        iss.remediation = "Sanitize prototype keys server-side, encode reflected input, and audit client code for Object.prototype, constructor.prototype, merge, extend, innerHTML, and location-based gadget use.";
+        iss.cwe.push_back("CWE-1321");
+        iss.cwe.push_back("CWE-79");
+        return iss;
+    }
     if (!key_in_response || !value_in_response)
     {
         if (resp.status_code >= 500 && ctx.baseline_status_code < 500)
@@ -78,6 +101,38 @@ std::optional<issue_t> protopol_detect(const insertion_point_t& ip, const probe_
     return iss;
 }
 
+void protopol_custom_run(const insertion_point_t& ip, const module_context_t& ctx, const send_fn_t& send)
+{
+    if (ctx.cancelled && ctx.cancelled()) return;
+    if (ip.kind != "query" && ip.kind != "body" && ip.kind != "json") return;
+    if (!ip.build) return;
+    const std::string canary = random_marker("aidapersistproto");
+    const std::string value = "polluted_" + canary;
+    probe_t pollution;
+    pollution.marker = canary;
+    pollution.variant = "persistent-gadget-validation";
+    pollution.payload = ip.kind == "json"
+        ? std::string("{\"__proto__\":{\"") + canary + "\":\"" + value + "\",\"isAdmin\":true},\"constructor\":{\"prototype\":{\"" + canary + "\":\"" + value + "\"}}}"
+        : std::string("__proto__[") + canary + "]=" + value + "&constructor[prototype][" + canary + "]=" + value;
+    auto polluted = send(ip.build(pollution.payload), pollution);
+    if (!polluted.has_value()) return;
+    if (ctx.cancelled && ctx.cancelled()) return;
+    auto follow = send(std::vector<uint8_t>(ip.base_request.begin(), ip.base_request.end()), pollution);
+    if (!follow.has_value()) return;
+    const bool persistent_value = body_contains(*follow, value);
+    const bool persistent_key = body_contains(*follow, canary);
+    if (!persistent_value && !persistent_key) return;
+    auto iss = make_issue("proto-pol.persistent-state",
+                          "Prototype Pollution: persistent canary observed",
+                          severity_t::critical, confidence_t::firm, ip, pollution, *follow, ctx,
+                          std::string("persistent marker=") + canary);
+    iss.description = "A prototype-pollution canary injected in one request was observed in a subsequent response, indicating persisted or process-global polluted object state.";
+    iss.remediation = "Reject __proto__, constructor, and prototype keys before recursive merge or deserialization, restart polluted worker processes, and verify object containers are created with Object.create(null).";
+    iss.cwe.push_back("CWE-1321");
+    iss.cwe.push_back("CWE-915");
+    issue_store::add(std::move(iss));
+}
+
 bool register_self()
 {
     module_t m;
@@ -85,6 +140,7 @@ bool register_self()
     m.name = "Prototype Pollution";
     m.category = "Injection";
     m.max_probes_per_point = 6;
+    m.custom_run = protopol_custom_run;
     m.probes = protopol_probes;
     m.detect = protopol_detect;
     return register_module(std::move(m));

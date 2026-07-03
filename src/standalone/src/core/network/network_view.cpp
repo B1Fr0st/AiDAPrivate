@@ -51,6 +51,16 @@
 #include "burp/browser_launch.hpp"
 #include "burp/report_view.hpp"
 #include "burp/headless_view.hpp"
+#include "burp/offensive/api_security_engine.hpp"
+#include "burp/offensive/auth_attack_engine.hpp"
+#include "burp/offensive/business_logic_engine.hpp"
+#include "burp/offensive/client_attack_engine.hpp"
+#include "burp/offensive/fuzzing_engine.hpp"
+#include "burp/offensive/js_analysis_engine.hpp"
+#include "burp/offensive/recon_engine.hpp"
+#include "burp/offensive/server_attack_engine.hpp"
+#include "burp/offensive/sqli_engine.hpp"
+#include "burp/offensive/xss_engine.hpp"
 #include "intercept/cert_profile_manager.hpp"
 #include "intercept/diagnostics.hpp"
 #include "intercept/instrumentation_provider.hpp"
@@ -88,6 +98,7 @@
 
 namespace network_view {
 
+using json = nlohmann::json;
 
 static aida::ui::pill_kind_t tcp_state_to_pill(uint8_t st) {
     switch (st) {
@@ -1113,7 +1124,7 @@ void shutdown() {
 static const char* tab_names[] = {
     "Connections", "Capture", "Intercept", "Proxy",
     "DNS", "Filters", "Bandwidth", "Repeater", "KeyLog",
-    "PCAP", "Fuzzer", "WebSocket", "Scripting", "Decoder",
+    "PCAP", "Fuzzer", "Offensive", "WebSocket", "Scripting", "Decoder",
     "Site Map", "Scope", "Cookies", "Scanner", "Recon",
     "Intruder", "Collaborator", "Sequencer", "Comparer",
     "JWT Lab", "Match/Replace", "Session", "API",
@@ -1124,7 +1135,7 @@ static const char* tab_names[] = {
 static const char* tab_short_names[] = {
     "Conn", "Cap", "Int", "Prx",
     "DNS", "Filt", "BW", "Rep", "KL",
-    "PCAP", "Fuz", "WS", "Scr", "Dec",
+    "PCAP", "Fuz", "Off", "WS", "Scr", "Dec",
     "Site", "Scope", "Cook", "Scan", "Recon",
     "Intr", "Collab", "Seq", "Cmp",
     "JWT", "M/R", "Sess", "API",
@@ -1169,6 +1180,7 @@ static const sub_tab_t k_api_tabs[] = {
 static const sub_tab_t k_attack_tabs[] = {
     sub_tab_t::intruder,
     sub_tab_t::fuzzer,
+    sub_tab_t::offensive,
     sub_tab_t::jwt,
     sub_tab_t::mr,
     sub_tab_t::session,
@@ -5274,6 +5286,587 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
     ImGui::EndChild();
 }
 
+enum class offensive_workflow_kind_t : int {
+    sqli_detect,
+    sqli_fingerprint,
+    xss_detect,
+    xss_dom,
+    auth_bruteforce,
+    auth_idor,
+    server_ssrf,
+    server_ssti,
+    server_cmdi,
+    server_traversal,
+    server_xxe,
+    server_smuggle,
+    api_param_fuzz,
+    api_authz_matrix,
+    client_cors,
+    client_csrf,
+    client_postmessage,
+    business_race,
+    fuzz_start,
+    fuzz_mutate,
+    js_secrets,
+    js_endpoints,
+    recon_fingerprint,
+    recon_waf
+};
+
+struct offensive_workflow_t {
+    const char* label;
+    offensive_workflow_kind_t kind;
+};
+
+static const offensive_workflow_t k_offensive_workflows[] = {
+    { "SQLi Detect", offensive_workflow_kind_t::sqli_detect },
+    { "SQLi Fingerprint", offensive_workflow_kind_t::sqli_fingerprint },
+    { "XSS Detect", offensive_workflow_kind_t::xss_detect },
+    { "XSS DOM", offensive_workflow_kind_t::xss_dom },
+    { "Auth Brute Force", offensive_workflow_kind_t::auth_bruteforce },
+    { "Auth IDOR", offensive_workflow_kind_t::auth_idor },
+    { "SSRF", offensive_workflow_kind_t::server_ssrf },
+    { "SSTI", offensive_workflow_kind_t::server_ssti },
+    { "CMDi", offensive_workflow_kind_t::server_cmdi },
+    { "Path Traversal", offensive_workflow_kind_t::server_traversal },
+    { "XXE", offensive_workflow_kind_t::server_xxe },
+    { "Request Smuggling", offensive_workflow_kind_t::server_smuggle },
+    { "API Param Fuzz", offensive_workflow_kind_t::api_param_fuzz },
+    { "API Auth Matrix", offensive_workflow_kind_t::api_authz_matrix },
+    { "Client CORS", offensive_workflow_kind_t::client_cors },
+    { "Client CSRF", offensive_workflow_kind_t::client_csrf },
+    { "Client PostMessage", offensive_workflow_kind_t::client_postmessage },
+    { "Business Race", offensive_workflow_kind_t::business_race },
+    { "Fuzz Start", offensive_workflow_kind_t::fuzz_start },
+    { "Fuzz Mutate", offensive_workflow_kind_t::fuzz_mutate },
+    { "JS Secrets", offensive_workflow_kind_t::js_secrets },
+    { "JS Endpoints", offensive_workflow_kind_t::js_endpoints },
+    { "Recon Fingerprint", offensive_workflow_kind_t::recon_fingerprint },
+    { "Recon WAF", offensive_workflow_kind_t::recon_waf }
+};
+
+struct offensive_run_result_t {
+    bool success = false;
+    std::string message;
+    std::string code;
+    json data = json::object();
+};
+
+static int offensive_workflow_count() {
+    return static_cast<int>(sizeof(k_offensive_workflows) / sizeof(k_offensive_workflows[0]));
+}
+
+static int clamp_offensive_workflow_index(int idx) {
+    return std::max(0, std::min(idx, offensive_workflow_count() - 1));
+}
+
+static const offensive_workflow_t& offensive_workflow_at(int idx) {
+    return k_offensive_workflows[clamp_offensive_workflow_index(idx)];
+}
+
+static std::string lower_ascii_copy(std::string s) {
+    for (char& c : s)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+static bool offensive_sensitive_key(const std::string& key) {
+    const std::string k = lower_ascii_copy(key);
+    return k.find("password") != std::string::npos ||
+           k.find("passwd") != std::string::npos ||
+           k.find("pwd") != std::string::npos ||
+           k.find("token") != std::string::npos ||
+           k.find("secret") != std::string::npos ||
+           k.find("cookie") != std::string::npos ||
+           k.find("authorization") != std::string::npos ||
+           k.find("api_key") != std::string::npos ||
+           k.find("apikey") != std::string::npos ||
+           k.find("private_key") != std::string::npos ||
+           k.find("session") != std::string::npos ||
+           k.find("credential") != std::string::npos ||
+           k.find("bearer") != std::string::npos ||
+           k == "jwt";
+}
+
+static json offensive_redact_json(const json& src) {
+    if (src.is_object()) {
+        json out = json::object();
+        std::string named_value_key;
+        if (src.contains("name") && src["name"].is_string())
+            named_value_key = src["name"].get<std::string>();
+        for (auto it = src.begin(); it != src.end(); ++it) {
+            if (offensive_sensitive_key(it.key()) || (it.key() == "value" && offensive_sensitive_key(named_value_key)))
+                out[it.key()] = "[redacted]";
+            else
+                out[it.key()] = offensive_redact_json(it.value());
+        }
+        return out;
+    }
+    if (src.is_array()) {
+        json out = json::array();
+        for (const auto& item : src)
+            out.push_back(offensive_redact_json(item));
+        return out;
+    }
+    return src;
+}
+
+static bool offensive_parse_json_object(const char* text, json& out, std::string& err) {
+    std::string raw = text ? std::string(text) : std::string();
+    if (raw.empty()) {
+        out = json::object();
+        return true;
+    }
+    bool all_space = true;
+    for (char c : raw) {
+        if (!std::isspace(static_cast<unsigned char>(c))) {
+            all_space = false;
+            break;
+        }
+    }
+    if (all_space) {
+        out = json::object();
+        return true;
+    }
+    json parsed = json::parse(raw, nullptr, false);
+    if (parsed.is_discarded() || !parsed.is_object()) {
+        err = "Payload JSON must be an object";
+        return false;
+    }
+    out = std::move(parsed);
+    return true;
+}
+
+static void offensive_apply_base_payload(state_t& state, json& payload) {
+    const int timeout_ms = std::max(1000, std::min(state.off_timeout_ms, 120000));
+    const int max_payloads = std::max(1, std::min(state.off_max_payloads, 256));
+    const int max_requests = std::max(1, std::min(state.off_max_requests, 1000));
+    state.off_timeout_ms = timeout_ms;
+    state.off_max_payloads = max_payloads;
+    state.off_max_requests = max_requests;
+    if (state.off_target_url[0] != '\0') {
+        payload["url"] = state.off_target_url;
+        if (!payload.contains("base_url"))
+            payload["base_url"] = state.off_target_url;
+    }
+    if (state.off_target_param[0] != '\0') {
+        payload["param"] = state.off_target_param;
+        payload["param_target"] = state.off_target_param;
+        payload["param_name"] = state.off_target_param;
+    }
+    if (state.off_raw_request[0] != '\0' && !payload.contains("raw_request"))
+        payload["raw_request"] = state.off_raw_request;
+    payload["scope_only"] = state.off_scope_only;
+    payload["enforce_scope"] = state.off_scope_only;
+    payload["timeout_ms"] = timeout_ms;
+    payload["max_payloads"] = max_payloads;
+    payload["max_requests"] = max_requests;
+    if (!payload.contains("max_attempts"))
+        payload["max_attempts"] = max_requests;
+    if (!payload.contains("request_count"))
+        payload["request_count"] = max_requests;
+    if (!payload.contains("max_params"))
+        payload["max_params"] = max_payloads;
+    if (!payload.contains("max_variants"))
+        payload["max_variants"] = max_payloads;
+    if (!payload.contains("max_payloads_per_set"))
+        payload["max_payloads_per_set"] = max_payloads;
+}
+
+static bool offensive_json_bool(const json& obj, const char* primary, const char* secondary, bool fallback) {
+    if (obj.is_object() && obj.contains(primary) && obj[primary].is_boolean())
+        return obj[primary].get<bool>();
+    if (obj.is_object() && obj.contains(secondary) && obj[secondary].is_boolean())
+        return obj[secondary].get<bool>();
+    return fallback;
+}
+
+static offensive_run_result_t offensive_from_tool_result(const mcp_standalone::tool_result_t& tr) {
+    offensive_run_result_t out;
+    out.success = tr.success;
+    out.message = tr.text;
+    out.code = tr.error_code;
+    if (!tr.data.is_null() && !(tr.data.is_object() && tr.data.empty()))
+        out.data = tr.data;
+    else if (!tr.error_details.is_null() && !(tr.error_details.is_object() && tr.error_details.empty()))
+        out.data = tr.error_details;
+    else
+        out.data = json{{"text", tr.text}};
+    return out;
+}
+
+static offensive_run_result_t offensive_from_json_result(const json& result, const std::string& fallback_message) {
+    offensive_run_result_t out;
+    out.data = result;
+    out.success = offensive_json_bool(result, "ok", "success", true);
+    out.message = result.is_object() && result.contains("message") && result["message"].is_string()
+        ? result["message"].get<std::string>() : fallback_message;
+    out.code = result.is_object() && result.contains("error_code") && result["error_code"].is_string()
+        ? result["error_code"].get<std::string>() : std::string();
+    if (out.code.empty() && result.is_object() && result.contains("code") && result["code"].is_string())
+        out.code = result["code"].get<std::string>();
+    return out;
+}
+
+static offensive_run_result_t offensive_from_auth_result(const aida::burp::offensive::auth_attack::result_t& r) {
+    return offensive_run_result_t{r.success, r.message, r.error_code, r.data};
+}
+
+static offensive_run_result_t offensive_from_business_result(const aida::burp::offensive::business_logic::result_t& r) {
+    return offensive_run_result_t{r.success, r.message, r.error_code, r.data};
+}
+
+static offensive_run_result_t offensive_from_server_result(const aida::burp::offensive::server_attack::action_result_t& r) {
+    return offensive_run_result_t{r.success, r.message, r.code, r.data};
+}
+
+static offensive_run_result_t offensive_from_sqli_result(const aida::burp::offensive::sqli::engine_result_t& r) {
+    return offensive_run_result_t{r.ok, r.message, r.code, r.data};
+}
+
+static offensive_run_result_t offensive_from_xss_result(const aida::burp::offensive::xss::engine_result_t& r) {
+    return offensive_run_result_t{r.ok, r.message, r.code, r.data};
+}
+
+static offensive_run_result_t offensive_dispatch(const offensive_workflow_t& workflow, json payload) {
+    using namespace aida::burp::offensive;
+    switch (workflow.kind) {
+        case offensive_workflow_kind_t::sqli_detect:
+            return offensive_from_sqli_result(sqli::detect(payload));
+        case offensive_workflow_kind_t::sqli_fingerprint:
+            return offensive_from_sqli_result(sqli::fingerprint_db(payload));
+        case offensive_workflow_kind_t::xss_detect:
+            return offensive_from_xss_result(xss::detect(payload));
+        case offensive_workflow_kind_t::xss_dom:
+            return offensive_from_xss_result(xss::dom_analyze(payload));
+        case offensive_workflow_kind_t::auth_bruteforce:
+            return offensive_from_auth_result(auth_attack::handle_action("brute_force", payload));
+        case offensive_workflow_kind_t::auth_idor:
+            return offensive_from_auth_result(auth_attack::handle_action("idor_test", payload));
+        case offensive_workflow_kind_t::server_ssrf:
+            return offensive_from_server_result(server_attack::handle_action("ssrf_exploit", payload));
+        case offensive_workflow_kind_t::server_ssti:
+            return offensive_from_server_result(server_attack::handle_action("ssti_exploit", payload));
+        case offensive_workflow_kind_t::server_cmdi:
+            return offensive_from_server_result(server_attack::handle_action("cmdi_exploit", payload));
+        case offensive_workflow_kind_t::server_traversal:
+            return offensive_from_server_result(server_attack::handle_action("path_traversal_exploit", payload));
+        case offensive_workflow_kind_t::server_xxe:
+            return offensive_from_server_result(server_attack::handle_action("xxe_exploit", payload));
+        case offensive_workflow_kind_t::server_smuggle:
+            return offensive_from_server_result(server_attack::handle_action("smuggle_exploit", payload));
+        case offensive_workflow_kind_t::api_param_fuzz:
+            return offensive_from_tool_result(api_security::param_fuzz(payload));
+        case offensive_workflow_kind_t::api_authz_matrix:
+            return offensive_from_tool_result(api_security::authz_matrix(payload));
+        case offensive_workflow_kind_t::client_cors:
+            return offensive_from_tool_result(client_attack::cors_exploit(payload));
+        case offensive_workflow_kind_t::client_csrf:
+            return offensive_from_tool_result(client_attack::csrf_test(payload));
+        case offensive_workflow_kind_t::client_postmessage:
+            return offensive_from_tool_result(client_attack::postmessage_scan(payload));
+        case offensive_workflow_kind_t::business_race:
+            return offensive_from_business_result(business_logic::handle_action("race_test", payload));
+        case offensive_workflow_kind_t::fuzz_start:
+            return offensive_from_tool_result(fuzzing::start(payload));
+        case offensive_workflow_kind_t::fuzz_mutate:
+            return offensive_from_tool_result(fuzzing::mutate(payload));
+        case offensive_workflow_kind_t::js_secrets:
+            return offensive_from_json_result(js_analysis::extract_secrets(payload), "JavaScript secret extraction completed");
+        case offensive_workflow_kind_t::js_endpoints:
+            return offensive_from_json_result(js_analysis::extract_endpoints(payload), "JavaScript endpoint extraction completed");
+        case offensive_workflow_kind_t::recon_fingerprint:
+            return offensive_from_json_result(recon::fingerprint(payload), "Recon fingerprint completed");
+        case offensive_workflow_kind_t::recon_waf:
+            return offensive_from_json_result(recon::waf_detect(payload), "Recon WAF detection completed");
+    }
+    return offensive_run_result_t{false, "Unsupported offensive workflow", "unsupported_workflow", json::object()};
+}
+
+static void collect_offensive_issue_ids(const json& node, std::vector<uint64_t>& ids) {
+    if (node.is_object()) {
+        for (auto it = node.begin(); it != node.end(); ++it) {
+            const std::string key = lower_ascii_copy(it.key());
+            if ((key == "issue_id" || key == "issue" || key == "id") && it.value().is_number_unsigned()) {
+                const uint64_t id = it.value().get<uint64_t>();
+                if (id != 0 && std::find(ids.begin(), ids.end(), id) == ids.end())
+                    ids.push_back(id);
+            }
+            collect_offensive_issue_ids(it.value(), ids);
+        }
+    } else if (node.is_array()) {
+        for (const auto& item : node)
+            collect_offensive_issue_ids(item, ids);
+    }
+}
+
+static void render_offensive_issue_links(state_t& state, const std::string& result, float alpha) {
+    json parsed = json::parse(result, nullptr, false);
+    if (parsed.is_discarded())
+        return;
+    std::vector<uint64_t> ids;
+    collect_offensive_issue_ids(parsed, ids);
+    if (ids.empty())
+        return;
+    const auto& th = aida::ui::resolved();
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)), "Issues:");
+    ImGui::SameLine();
+    for (size_t i = 0; i < ids.size() && i < 8; ++i) {
+        if (i > 0) ImGui::SameLine();
+        char label[48];
+        snprintf(label, sizeof(label), "#%llu##off_issue_%zu", static_cast<unsigned long long>(ids[i]), i);
+        if (aida::ui::button(label, aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm))
+            state.active_tab = sub_tab_t::scanner;
+    }
+}
+
+static bool start_offensive_workflow(state_t& state, const offensive_workflow_t& workflow) {
+    json payload;
+    std::string err;
+    if (!offensive_parse_json_object(state.off_payload_json, payload, err)) {
+        std::lock_guard<std::mutex> lk(state.off_mutex);
+        state.off_status = err;
+        state.off_result = json{{"success", false}, {"error", err}}.dump(2);
+        return false;
+    }
+    offensive_apply_base_payload(state, payload);
+    const uint64_t run_id = state.off_run_id.fetch_add(1, std::memory_order_acq_rel) + 1;
+    state.off_cancel_requested.store(false, std::memory_order_release);
+    state.off_running.store(true, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lk(state.off_mutex);
+        state.off_status = std::string("Running ") + workflow.label;
+        state.off_result.clear();
+    }
+    const int workflow_index = clamp_offensive_workflow_index(state.off_workflow);
+    const bool posted = post_network_task("offensive_workflow", [payload = std::move(payload), workflow_index, run_id]() mutable {
+        const offensive_workflow_t workflow_copy = offensive_workflow_at(workflow_index);
+        offensive_run_result_t result;
+        const uint64_t begin = static_cast<uint64_t>(GetTickCount64());
+        if (g_state.off_cancel_requested.load(std::memory_order_acquire)) {
+            result.success = false;
+            result.message = "Cancelled before dispatch";
+            result.code = "cancelled";
+            result.data = json::object();
+        } else {
+            try {
+                result = offensive_dispatch(workflow_copy, std::move(payload));
+            } catch (const std::exception& e) {
+                result.success = false;
+                result.message = "Offensive workflow failed";
+                result.code = "exception";
+                result.data = json{{"exception_len", std::string(e.what()).size()}};
+            } catch (...) {
+                result.success = false;
+                result.message = "Offensive workflow failed";
+                result.code = "unknown_exception";
+                result.data = json::object();
+            }
+        }
+        const uint64_t elapsed_ms = static_cast<uint64_t>(GetTickCount64()) - begin;
+        if (g_state.off_cancel_requested.load(std::memory_order_acquire) && result.success) {
+            result.success = false;
+            result.message = "Cancelled";
+            result.code = "cancelled";
+        }
+        json out;
+        out["run_id"] = run_id;
+        out["workflow"] = workflow_copy.label;
+        out["success"] = result.success;
+        out["message"] = result.message;
+        out["code"] = result.code;
+        out["elapsed_ms"] = elapsed_ms;
+        out["data"] = offensive_redact_json(result.data);
+        if (workflow_copy.kind == offensive_workflow_kind_t::fuzz_start && result.success && result.data.is_object()) {
+            uint64_t job_id = 0;
+            if (result.data.contains("job_id") && result.data["job_id"].is_number_unsigned())
+                job_id = result.data["job_id"].get<uint64_t>();
+            if (job_id != 0)
+                g_state.off_active_fuzz_job_id.store(job_id, std::memory_order_release);
+        }
+        {
+            std::lock_guard<std::mutex> lk(g_state.off_mutex);
+            g_state.off_status = result.message.empty() ? (result.success ? "Completed" : "Failed") : result.message;
+            g_state.off_result = out.dump(2);
+        }
+        g_state.off_running.store(false, std::memory_order_release);
+        g_state.off_cancel_requested.store(false, std::memory_order_release);
+    });
+    if (!posted) {
+        state.off_running.store(false, std::memory_order_release);
+        std::lock_guard<std::mutex> lk(state.off_mutex);
+        state.off_status = "Network work queue unavailable";
+        state.off_result = json{{"success", false}, {"error", "network_work_queue_unavailable"}}.dump(2);
+        return false;
+    }
+    return true;
+}
+
+static void stop_offensive_fuzz_job(state_t& state) {
+    const uint64_t job_id = state.off_active_fuzz_job_id.exchange(0, std::memory_order_acq_rel);
+    if (job_id == 0)
+        return;
+    {
+        std::lock_guard<std::mutex> lk(state.off_mutex);
+        state.off_status = "Stopping fuzz job";
+    }
+    const bool posted = post_network_task("offensive_fuzz_stop", [job_id]() {
+        auto result = aida::burp::offensive::fuzzing::stop(json{{"job_id", job_id}});
+        json out;
+        out["workflow"] = "Fuzz Stop";
+        out["success"] = result.success;
+        out["message"] = result.text;
+        out["data"] = offensive_redact_json(result.data);
+        std::lock_guard<std::mutex> lk(g_state.off_mutex);
+        g_state.off_status = result.success ? "Fuzz job stopped" : result.text;
+        g_state.off_result = out.dump(2);
+    });
+    if (!posted) {
+        std::lock_guard<std::mutex> lk(state.off_mutex);
+        state.off_status = "Network work queue unavailable";
+    }
+}
+
+static void render_offensive(state_t& state, float x, float y, float w, float h,
+                             float alpha, float ar, float ag, float ab) {
+    (void)ar; (void)ag; (void)ab;
+    const auto& th = aida::ui::resolved();
+    ImGui::SetCursorPos(ImVec2(x, y));
+    ImGui::BeginChild("##net_offensive", ImVec2(w, h), false, ImGuiWindowFlags_NoBackground);
+
+    const offensive_workflow_t& wf = offensive_workflow_at(state.off_workflow);
+    const bool compact_controls = w < 1120.f;
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)), "Workflow:");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(std::min(260.f, std::max(160.f, w * 0.28f)));
+    if (ImGui::BeginCombo("##off_workflow", wf.label)) {
+        for (int i = 0; i < offensive_workflow_count(); ++i) {
+            const bool selected = state.off_workflow == i;
+            if (ImGui::Selectable(k_offensive_workflows[i].label, selected))
+                state.off_workflow = i;
+            if (selected)
+                ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::SameLine();
+    aida::ui::toggle_switch("##off_scope", &state.off_scope_only);
+    ImGui::SameLine();
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)), "Scope");
+    if (compact_controls)
+        ImGui::Spacing();
+    else
+        ImGui::SameLine();
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)), "Timeout:");
+    ImGui::SameLine();
+    aida::ui::input_int("##off_timeout", &state.off_timeout_ms, ImVec2(100.f, 28.f));
+    state.off_timeout_ms = std::max(1000, std::min(state.off_timeout_ms, 120000));
+    ImGui::SameLine();
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)), "Payloads:");
+    ImGui::SameLine();
+    aida::ui::input_int("##off_payloads", &state.off_max_payloads, ImVec2(86.f, 28.f));
+    state.off_max_payloads = std::max(1, std::min(state.off_max_payloads, 256));
+    ImGui::SameLine();
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)), "Requests:");
+    ImGui::SameLine();
+    aida::ui::input_int("##off_requests", &state.off_max_requests, ImVec2(86.f, 28.f));
+    state.off_max_requests = std::max(1, std::min(state.off_max_requests, 1000));
+
+    ImGui::Spacing();
+    const bool compact_target = w < 760.f;
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)), "Target:");
+    ImGui::SameLine();
+    const float target_w = compact_target ? std::max(180.f, w - 92.f) : std::max(180.f, std::min(520.f, w - 260.f));
+    aida::ui::input_text("##off_url", state.off_target_url, sizeof(state.off_target_url),
+                         "https://target.example/path?name=value", false, ImVec2(target_w, 28.f));
+    if (compact_target)
+        ImGui::Spacing();
+    else
+        ImGui::SameLine();
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)), "Param:");
+    ImGui::SameLine();
+    aida::ui::input_text("##off_param", state.off_target_param, sizeof(state.off_target_param),
+                         "name", false, ImVec2(150.f, 28.f));
+
+    ImGui::Spacing();
+    const float split_gap = 10.f;
+    const bool stacked = w < 940.f;
+    const float pane_w = stacked ? std::max(220.f, w - 6.f) : std::max(220.f, (w - split_gap - 6.f) * 0.5f);
+    const float editor_h = std::max(110.f, std::min(220.f, h * 0.26f));
+    ImGui::BeginChild("##off_payload_pane", ImVec2(pane_w, editor_h + 26.f), false, ImGuiWindowFlags_NoBackground);
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.accent_u32, alpha)), "Payload JSON");
+    ImGui::InputTextMultiline("##off_payload_json", state.off_payload_json, sizeof(state.off_payload_json),
+                              ImVec2(pane_w - 4.f, editor_h), ImGuiInputTextFlags_AllowTabInput);
+    ImGui::EndChild();
+    if (stacked)
+        ImGui::Dummy(ImVec2(0.f, 8.f));
+    else
+        ImGui::SameLine(0.f, split_gap);
+    ImGui::BeginChild("##off_raw_pane", ImVec2(pane_w, editor_h + 26.f), false, ImGuiWindowFlags_NoBackground);
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.accent_u32, alpha)), "Raw Request");
+    ImGui::InputTextMultiline("##off_raw", state.off_raw_request, sizeof(state.off_raw_request),
+                              ImVec2(pane_w - 4.f, editor_h), ImGuiInputTextFlags_AllowTabInput);
+    ImGui::EndChild();
+
+    ImGui::Spacing();
+    const bool running = state.off_running.load(std::memory_order_acquire);
+    const uint64_t fuzz_job = state.off_active_fuzz_job_id.load(std::memory_order_acquire);
+    if (!running) {
+        if (aida::ui::button("Run", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm)) {
+            const offensive_workflow_t& run_wf = offensive_workflow_at(state.off_workflow);
+            diag::log_tagged_fmt("network", "offensive_run_clicked workflow=%s scope_only=%d timeout_ms=%d max_payloads=%d max_requests=%d url_len=%zu raw_len=%zu",
+                run_wf.label, state.off_scope_only ? 1 : 0, state.off_timeout_ms, state.off_max_payloads, state.off_max_requests,
+                strlen(state.off_target_url), strlen(state.off_raw_request));
+            start_offensive_workflow(state, run_wf);
+        }
+        ImGui::SameLine();
+        if (aida::ui::button("Clear", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
+            std::lock_guard<std::mutex> lk(state.off_mutex);
+            state.off_status = "Idle";
+            state.off_result.clear();
+        }
+        if (fuzz_job != 0) {
+            ImGui::SameLine();
+            if (aida::ui::button("Stop Job", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm))
+                stop_offensive_fuzz_job(state);
+        }
+    } else {
+        aida::ui::pill_kind("Running", aida::ui::pill_kind_t::accent, aida::ui::size_t_::sm, true);
+        ImGui::SameLine();
+        if (aida::ui::button("Cancel", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
+            state.off_cancel_requested.store(true, std::memory_order_release);
+            if (fuzz_job != 0)
+                stop_offensive_fuzz_job(state);
+            std::lock_guard<std::mutex> lk(state.off_mutex);
+            state.off_status = "Cancellation requested";
+        }
+    }
+
+    std::string status;
+    std::string result;
+    {
+        std::lock_guard<std::mutex> lk(state.off_mutex);
+        status = state.off_status;
+        result = state.off_result;
+    }
+    ImGui::SameLine();
+    aida::ui::pill_kind(status.c_str(), running ? aida::ui::pill_kind_t::accent : aida::ui::pill_kind_t::neutral,
+                        aida::ui::size_t_::sm, true);
+
+    ImGui::Spacing();
+    if (!result.empty())
+        render_offensive_issue_links(state, result, alpha);
+    const float result_h = std::max(120.f, h - ImGui::GetCursorPosY() + y - 10.f);
+    static char empty_result[1] = {};
+    char* result_buf = result.empty() ? empty_result : result.data();
+    ImGui::InputTextMultiline("##off_result", result_buf,
+                              result.empty() ? 1 : result.size() + 1,
+                              ImVec2(w - 6.f, result_h), ImGuiInputTextFlags_ReadOnly);
+    ImGui::EndChild();
+}
+
 static void render_websocket(state_t& state, float x, float y, float w, float h,
                               float alpha, float ar, float ag, float ab) {
     (void)ar; (void)ag; (void)ab;
@@ -6442,6 +7035,9 @@ void render(float pos_x, float pos_y, float width, float height,
             break;
         case sub_tab_t::fuzzer:
             render_fuzzer(g_state, pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            break;
+        case sub_tab_t::offensive:
+            render_offensive(g_state, pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::websocket:
             render_websocket(g_state, pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
